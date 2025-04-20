@@ -66,47 +66,50 @@ func (m *BlockWalk) SlotsAvailable() (total uint64) {
 
 // Next seeks to the next slot.
 func (m *BlockWalk) Next() (meta *SlotMeta, ok bool) {
-	if len(m.handles) == 0 {
-		return nil, false
+	for {
+		if len(m.handles) == 0 {
+			return nil, false
+		}
+		h := m.handles[0]
+		if m.root == nil {
+			// Open Next database
+			m.root = h.DB.DB.NewIteratorCF(grocksdb.NewDefaultReadOptions(), h.DB.CfRoot)
+			key := MakeSlotKey(h.Start)
+			m.root.Seek(key[:])
+		}
+		if !m.root.Valid() {
+			// Close current DB and go to Next
+			m.pop()
+			continue
+		}
+	
+		// Get key at current position.
+		slot, ok := ParseSlotKey(m.root.Key().Data())
+		if !ok {
+			klog.Exitf("Invalid slot key: %x", m.root.Key().Data())
+		}
+		if slot > h.Stop {
+			m.pop()
+			continue
+		}
+		h.Start = slot
+	
+		// Get value at current position.
+		var err error
+		meta, err = h.DB.GetSlotMeta(slot)
+		if err != nil {
+			// Invalid slot metas are irrecoverable.
+			// The CAR generation process must stop here.
+			klog.Errorf("FATAL: invalid slot meta at slot %d, aborting CAR generation: %s", slot, err)
+			return nil, false
+		}
+	
+		// Seek iterator to Next entry.
+		m.root.Next()
+	
+		return meta, true
 	}
-	h := m.handles[0]
-	if m.root == nil {
-		// Open Next database
-		m.root = h.DB.DB.NewIteratorCF(grocksdb.NewDefaultReadOptions(), h.DB.CfRoot)
-		key := MakeSlotKey(h.Start)
-		m.root.Seek(key[:])
-	}
-	if !m.root.Valid() {
-		// Close current DB and go to Next
-		m.pop()
-		return m.Next() // TODO tail recursion optimization?
-	}
-
-	// Get key at current position.
-	slot, ok := ParseSlotKey(m.root.Key().Data())
-	if !ok {
-		klog.Exitf("Invalid slot key: %x", m.root.Key().Data())
-	}
-	if slot > h.Stop {
-		m.pop()
-		return m.Next()
-	}
-	h.Start = slot
-
-	// Get value at current position.
-	var err error
-	meta, err = h.DB.GetSlotMeta(slot)
-	if err != nil {
-		// Invalid slot metas are irrecoverable.
-		// The CAR generation process must stop here.
-		klog.Errorf("FATAL: invalid slot meta at slot %d, aborting CAR generation: %s", slot, err)
-		return nil, false
-	}
-
-	// Seek iterator to Next entry.
-	m.root.Next()
-
-	return meta, true
+	
 }
 
 // Entries returns the entries at the current cursor.
