@@ -14,10 +14,11 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/sbpf"
 	"github.com/Overclock-Validator/mithril/pkg/util"
 	"github.com/Overclock-Validator/sniper"
-	"github.com/Overclock-Validator/sniper/options"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 	"github.com/maypok86/otter"
+	"runtime"
+	"runtime/debug"
 )
 
 type AccountsDb struct {
@@ -31,107 +32,77 @@ type AccountsDb struct {
 	ProgramCache    otter.Cache[solana.PublicKey, *sbpf.Program]
 }
 
-var (
-	ErrNoAccount = errors.New("ErrNoAccount")
-)
+var ErrNoAccount = errors.New("ErrNoAccount")
 
-func OpenDb(accountsDbDir string) (*AccountsDb, error) {
-	// check for existence of the 'accounts' directory, which holds the appendvecs
-	appendVecsDir := fmt.Sprintf("%s/accounts", accountsDbDir)
-	_, err := os.Stat(appendVecsDir)
-	if err != nil {
+// -----------------------------------------------------------------------------
+// Open existing AccountsDB
+// -----------------------------------------------------------------------------
+func OpenDb(dir string) (*AccountsDb, error) {
+	// ensure append‑vec folder exists
+	avecs := fmt.Sprintf("%s/accounts", dir)
+	if _, err := os.Stat(avecs); err != nil {
 		return nil, err
 	}
 
-	// attempt to open largest_file_id file
-	largestFileIdFn := fmt.Sprintf("%s/largest_file_id", accountsDbDir)
-	lfi, err := os.Open(largestFileIdFn)
-	if err != nil {
-		mlog.Log.Infof("failed to open %s\n", largestFileIdFn)
-		return nil, err
+	// read largest_file_id
+	lfiPath := fmt.Sprintf("%s/largest_file_id", dir)
+	lfi, err := os.ReadFile(lfiPath)
+	if err != nil || len(lfi) != 8 {
+		return nil, fmt.Errorf("cannot read %s: %v", lfiPath, err)
+	}
+	largest := binary.LittleEndian.Uint64(lfi)
+
+	// read bank_hash
+	bhPath := fmt.Sprintf("%s/bank_hash", dir)
+	bh, err := os.ReadFile(bhPath)
+	if err != nil || len(bh) != 32 {
+		return nil, fmt.Errorf("cannot read %s: %v", bhPath, err)
 	}
 
-	largestFileIdBytes := make([]byte, 8)
-	bytesRead, err := lfi.Read(largestFileIdBytes)
-	if err != nil {
-		mlog.Log.Infof("error reading %s: %s\n", largestFileIdFn, err)
-		return nil, err
-	} else if bytesRead != 8 {
-		mlog.Log.Infof("error reading %s: expected 8 bytes, got %d\n", largestFileIdFn, bytesRead)
-		return nil, fmt.Errorf("only got %d bytes", bytesRead)
-	}
-
-	largestFileId := binary.LittleEndian.Uint64(largestFileIdBytes)
-
-	// attempt to open bank_hash file
-	bankHashFn := fmt.Sprintf("%s/bank_hash", accountsDbDir)
-	bhf, err := os.Open(bankHashFn)
-	if err != nil {
-		mlog.Log.Infof("failed to open %s\n", bankHashFn)
-		return nil, err
-	}
-
-	bankHashBytes := make([]byte, 32)
-	bytesRead, err = bhf.Read(bankHashBytes)
-	if err != nil {
-		mlog.Log.Infof("error reading %s: %s\n", bankHashFn, err)
-		return nil, err
-	} else if bytesRead != 32 {
-		mlog.Log.Infof("error reading %s: expected 32 bytes, got %d\n", bankHashFn, bytesRead)
-		return nil, fmt.Errorf("only got %d bytes", bytesRead)
-	}
-
-	// configure Sniper options to reduce heap usage
-	indexDir := fmt.Sprintf("%s/index", accountsDbDir)
-	opts := options.DefaultOptions
-	opts.ReadOnlyMMap = false                // avoid loading all SSTs into Go heap
-	opts.TableLoadingMode = options.LoadToDisk // read-on-demand from disk (or use LoadToRAM)
-	opts.TableMaxOpenFiles = 4               // limit number of open SST files
-
-	// open the index kv store with tuned options
+	// open sniper index – default options
+	indexDir := fmt.Sprintf("%s/index", dir)
 	db, err := sniper.Open(
 		sniper.Dir(indexDir),
 		sniper.ChunksCollision(32),
-		opts,
 	)
 	if err != nil {
-		mlog.Log.Infof("failed to open sniper store: %s\n", err)
-		return nil, err
+		return nil, fmt.Errorf("sniper.Open: %w", err)
 	}
 
-	accountsDb := &AccountsDb{IndexDb: db, AcctsDir: appendVecsDir, IndexDir: indexDir}
-	accountsDb.LargestFileId.Store(largestFileId)
-	copy(accountsDb.BankHashBytes[:], bankHashBytes)
+	// ---- GC away Sniper chunk structs --------------------------------------
+	runtime.GC()         // sweep now‑unreferenced chunks
+	debug.FreeOSMemory() // madvise; RSS drops immediately
+	// ------------------------------------------------------------------------
 
-	return accountsDb, nil
+	adb := &AccountsDb{
+		IndexDb:  db,
+		AcctsDir: avecs,
+		IndexDir: indexDir,
+	}
+	adb.LargestFileId.Store(largest)
+	copy(adb.BankHashBytes[:], bh)
+	return adb, nil
 }
 
-func (accountsDb *AccountsDb) CloseDb() {
-	accountsDb.IndexDb.Close()
-}
+func (a *AccountsDb) CloseDb() { a.IndexDb.Close() }
 
-func (accountsDb *AccountsDb) InitCaches() {
-	var err error
-	accountsDb.VoteAcctCache, err = otter.MustBuilder[solana.PublicKey, *accounts.Account](10_000).
-		Cost(func(key solana.PublicKey, acct *accounts.Account) uint32 { return 1 }).
-		Build()
-	if err != nil {
-		panic(err)
+// -----------------------------------------------------------------------------
+// Caches
+// -----------------------------------------------------------------------------
+func (a *AccountsDb) InitCaches() {
+	buildAcct := func(cap int) otter.Cache[solana.PublicKey, *accounts.Account] {
+		c, err := otter.MustBuilder[solana.PublicKey, *accounts.Account](cap).
+			Cost(func(_ solana.PublicKey, _ *accounts.Account) uint32 { return 1 }).Build()
+		if err != nil { panic(err) }
+		return c
 	}
+	a.VoteAcctCache   = buildAcct(4_000)
+	a.CommonAcctCache = buildAcct(250_000)
 
-	accountsDb.ProgramCache, err = otter.MustBuilder[solana.PublicKey, *sbpf.Program](10_000).
-		Cost(func(key solana.PublicKey, prog *sbpf.Program) uint32 { return 1 }).
-		Build()
-	if err != nil {
-		panic(err)
-	}
-
-	accountsDb.CommonAcctCache, err = otter.MustBuilder[solana.PublicKey, *accounts.Account](250_000).
-		Cost(func(key solana.PublicKey, acct *accounts.Account) uint32 { return 1 }).
-		Build()
-	if err != nil {
-		panic(err)
-	}
+	p, err := otter.MustBuilder[solana.PublicKey, *sbpf.Program](10_000).
+		Cost(func(_ solana.PublicKey, _ *sbpf.Program) uint32 { return 1 }).Build()
+	if err != nil { panic(err) }
+	a.ProgramCache = p
 }
 
 func (accountsDb *AccountsDb) MaybeGetProgramFromCache(pubkey solana.PublicKey) (*sbpf.Program, bool) {
