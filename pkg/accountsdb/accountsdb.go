@@ -63,6 +63,7 @@ func OpenDb(accountsDbDir string) (*AccountsDb, error) {
 
 	largestFileId := binary.LittleEndian.Uint64(largestFileIdBytes)
 
+	// attempt to open bank_hash file
 	bankHashFn := fmt.Sprintf("%s/bank_hash", accountsDbDir)
 	bhf, err := os.Open(bankHashFn)
 	if err != nil {
@@ -76,22 +77,25 @@ func OpenDb(accountsDbDir string) (*AccountsDb, error) {
 		mlog.Log.Infof("error reading %s: %s\n", bankHashFn, err)
 		return nil, err
 	} else if bytesRead != 32 {
-		mlog.Log.Infof("error reading %s: expected 8 bytes, got %d\n", bankHashFn, bytesRead)
+		mlog.Log.Infof("error reading %s: expected 32 bytes, got %d\n", bankHashFn, bytesRead)
 		return nil, fmt.Errorf("only got %d bytes", bytesRead)
 	}
 
-	// configure Sniper to avoid huge chunk init in Go heap
+	// configure Sniper options to reduce heap usage
 	indexDir := fmt.Sprintf("%s/index", accountsDbDir)
-	// start from default options and tweak
 	opts := options.DefaultOptions
-	opts.ReadOnlyMMap = false               // keep index in OS, not Go heap
-	opts.TableLoadingMode = options.LoadToDisk // on-demand disk reads
-	opts.TableMaxOpenFiles = 4              // cap open SSTs
+	opts.ReadOnlyMMap = false                // avoid loading all SSTs into Go heap
+	opts.TableLoadingMode = options.LoadToDisk // read-on-demand from disk (or use LoadToRAM)
+	opts.TableMaxOpenFiles = 4               // limit number of open SST files
 
 	// open the index kv store with tuned options
-	db, err := sniper.Open(sniper.Dir(indexDir), sniper.ChunksCollision(32), opts)
+	db, err := sniper.Open(
+		sniper.Dir(indexDir),
+		sniper.ChunksCollision(32),
+		opts,
+	)
 	if err != nil {
-		mlog.Log.Infof("failed to open database: %s\n", err)
+		mlog.Log.Infof("failed to open sniper store: %s\n", err)
 		return nil, err
 	}
 
@@ -109,29 +113,21 @@ func (accountsDb *AccountsDb) CloseDb() {
 func (accountsDb *AccountsDb) InitCaches() {
 	var err error
 	accountsDb.VoteAcctCache, err = otter.MustBuilder[solana.PublicKey, *accounts.Account](10_000).
-		Cost(func(key solana.PublicKey, acct *accounts.Account) uint32 {
-			return 1
-		}).
+		Cost(func(key solana.PublicKey, acct *accounts.Account) uint32 { return 1 }).
 		Build()
 	if err != nil {
 		panic(err)
 	}
 
-	// TODO: review size of program cache
 	accountsDb.ProgramCache, err = otter.MustBuilder[solana.PublicKey, *sbpf.Program](10_000).
-		Cost(func(key solana.PublicKey, prog *sbpf.Program) uint32 {
-			return 1
-		}).
+		Cost(func(key solana.PublicKey, prog *sbpf.Program) uint32 { return 1 }).
 		Build()
 	if err != nil {
 		panic(err)
 	}
 
-	// TODO: review size of common accounts cache
 	accountsDb.CommonAcctCache, err = otter.MustBuilder[solana.PublicKey, *accounts.Account](250_000).
-		Cost(func(key solana.PublicKey, acct *accounts.Account) uint32 {
-			return 1
-		}).
+		Cost(func(key solana.PublicKey, acct *accounts.Account) uint32 { return 1 }).
 		Build()
 	if err != nil {
 		panic(err)
@@ -147,101 +143,107 @@ func (accountsDb *AccountsDb) AddProgramToCache(pubkey solana.PublicKey, program
 }
 
 func (accountsDb *AccountsDb) GetAccount(slot uint64, pubkey solana.PublicKey) (*accounts.Account, error) {
-	cachedAcct, hasAcct := accountsDb.VoteAcctCache.Get(pubkey)
-	if hasAcct {
-		return cachedAcct, nil
+	if acct, ok := accountsDb.VoteAcctCache.Get(pubkey); ok {
+		return acct, nil
+	}
+	if acct, ok := accountsDb.CommonAcctCache.Get(pubkey); ok {
+		return acct, nil
 	}
 
-	cachedAcct, hasAcct = accountsDb.CommonAcctCache.Get(pubkey)
-	if hasAcct {
-		return cachedAcct, nil
-	}
-
-	acctIdxEntryBytes, err := accountsDb.IndexDb.Get(pubkey[:])
+	entryBytes, err := accountsDb.IndexDb.Get(pubkey[:])
 	if err != nil {
-		mlog.Log.Debugf("no account found in accountsdb for pubkey %s: %s", pubkey, err)
+		mlog.Log.Debugf("no account in index for %s: %v", pubkey, err)
 		return nil, ErrNoAccount
 	}
-
-	acctIdxEntry, err := unmarshalAcctIdxEntry(acctIdxEntryBytes)
+	idxEntry, err := unmarshalAcctIdxEntry(entryBytes)
 	if err != nil {
-		panic("failed to unmarshal AccountIndexEntry from index kv database")
+		panic("invalid account index entry")
 	}
 
-	appendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, acctIdxEntry.Slot, acctIdxEntry.FileId)
-	appendVecFile, err := os.Open(appendVecFileName)
+	fileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, idxEntry.Slot, idxEntry.FileId)
+	f, err := os.Open(fileName)
 	if err != nil {
-		mlog.Log.Debugf("failed to open appendvec file %s", appendVecFileName)
 		return nil, err
 	}
+	defer f.Close()
 
-	offset, err := appendVecFile.Seek(int64(acctIdxEntry.Offset), 0)
+	if _, err := f.Seek(int64(idxEntry.Offset), 0); err != nil {
+		panic(err)
+	}
+	acct, err := unmarshalAcctFromAppendVecAcctHeader(f)
 	if err != nil {
-		panic(fmt.Sprintf("file seek failed: %s\n", err))
+		panic(err)
 	}
-	if offset != int64(acctIdxEntry.Offset) {
-		panic(fmt.Sprintf("file seek gave wrong idx (%d)\n", offset))
-	}
-
-	acct, err := unmarshalAcctFromAppendVecAcctHeader(appendVecFile)
-	if err != nil {
-		panic(fmt.Sprintf("failed to unmarshal account from appendvec file %s: %s", appendVecFileName, err))
-	}
+	acct.Slot = idxEntry.Slot
 
 	if acct.Key != pubkey {
-		panic(fmt.Sprintf("account unmarshaled from appendvec file %s has the wrong pubkey", appendVecFileName))
+		panic("pubkey mismatch after unmarshal")
 	}
-
-	acct.Slot = acctIdxEntry.Slot
-
-	msg := util.PrettyPrintAcct(acct)
-	mlog.Log.Debugf("SLOT %d - accountsdb.Get() found acct in %s for %s: %s", slot, appendVecFileName, pubkey, msg)
-
-	appendVecFile.Close()
-
-	return acct, err
+	return acct, nil
 }
 
 var voteAcct = solana.MustPublicKeyFromBase58("Vote111111111111111111111111111111111111111")
 
 func (accountsDb *AccountsDb) StoreAccounts(accts []*accounts.Account, slot uint64) error {
 	fileId := accountsDb.LargestFileId.Add(1)
-
-	appendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, slot, fileId)
-	appendVecFile, err := os.OpenFile(appendVecFileName, os.O_RDWR|os.O_CREATE, 0666)
-	if err != nil {
-		mlog.Log.Debugf("unable to open appendvec file %s for writing to accountsdb", appendVecFileName)
-		return err
-	}
-	defer appendVecFile.Close()
-
-	appendVecAcctsBuf := new(bytes.Buffer)
-	writer := new(bytes.Buffer)
-
+	buf := new(bytes.Buffer)
 	for _, acct := range accts {
 		acct.Slot = slot
-
-		// if vote account, do not serialize up and write into accountsdb - just save it in cache.
 		if solana.PublicKeyFromBytes(acct.Owner[:]) == voteAcct {
 			accountsDb.VoteAcctCache.Set(acct.Key, acct)
 			continue
 		}
-
 		accountsDb.CommonAcctCache.Set(acct.Key, acct)
 
-		// create index entry, encode it and write it to the index kv store
-		// offset field is specified as the current num of bytes written to the appendvec buffer.
-		writer.Reset()
-		encoder := bin.NewBinEncoder(writer)
+		// index entry
+		buf.Reset()
+		enc := bin.NewBinEncoder(buf)
+		entry := AccountIndexEntry{Slot: slot, FileId: fileId, Offset: uint64(buf.Len())}
+		entry.MarshalWithEncoder(enc)
+		accountsDb.IndexDb.SetIfSlotHigher(acct.Key[:], buf.Bytes(), 0)
 
-		indexEntry := AccountIndexEntry{Slot: slot, FileId: fileId, Offset: uint64(appendVecAcctsBuf.Len())}
-
-		err = indexEntry.MarshalWithEncoder(encoder)
-		if err != nil {
-			mlog.Log.Debugf("error marshaling in Set on accountsdb for pubkey %s", acct.Key)
-			return err
+		// appendvec
+		raw := AppendVecAccount{
+			DataLen:   uint64(len(acct.Data)),
+			Pubkey:    acct.Key,
+			Lamports:  acct.Lamports,
+			RentEpoch: acct.RentEpoch,
+			Owner:     acct.Owner,
+			Executable: acct.Executable,
+			Data:      acct.Data,
 		}
+		raw.Marshal(buf)
+	}
 
-		err = accountsDb.IndexDb.SetIfSlotHigher(acct.Key[:], writer.Bytes(), 0)
-		if err != nil {
-			mlog.Log.Debugf("error calling SetIfSlotHigher on accountsdb for pubkey %s", acct.Key)
+	outFile := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, slot, fileId)
+	f, err := os.OpenFile(outFile, os.O_CREATE|os.O_WRONLY, 0o666)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.Write(buf.Bytes()); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (accountsDb *AccountsDb) KeysBetweenPrefixes(startPrefix uint64, endPrefix uint64) []solana.PublicKey {
+	keys := accountsDb.IndexDb.KeysBetweenPrefixes(startPrefix, endPrefix)
+	out := make([]solana.PublicKey, len(keys))
+	for i, k := range keys {
+		out[i] = solana.PublicKeyFromBytes(k)
+	}
+	return out
+}
+
+func (accountsDb *AccountsDb) AllKeys() [][]byte {
+	keys := accountsDb.IndexDb.AllKeys()
+	sort.Slice(keys, func(i, j int) bool {
+		return util.PubkeyCmpByteSlice(keys[i], keys[j])
+	})
+	return keys
+}
+
+func (accountsDb *AccountsDb) BankHash() [32]byte {
+	return accountsDb.BankHashBytes
+}
