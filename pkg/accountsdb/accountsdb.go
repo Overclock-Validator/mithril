@@ -14,6 +14,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/sbpf"
 	"github.com/Overclock-Validator/mithril/pkg/util"
 	"github.com/Overclock-Validator/sniper"
+	"github.com/Overclock-Validator/sniper/options"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 	"github.com/maypok86/otter"
@@ -79,9 +80,16 @@ func OpenDb(accountsDbDir string) (*AccountsDb, error) {
 		return nil, fmt.Errorf("only got %d bytes", bytesRead)
 	}
 
-	// attempt to open the index kv store
+	// configure Sniper to avoid huge chunk init in Go heap
 	indexDir := fmt.Sprintf("%s/index", accountsDbDir)
-	db, err := sniper.Open(sniper.Dir(indexDir), sniper.ChunksCollision(32))
+	// start from default options and tweak
+	opts := options.DefaultOptions
+	opts.ReadOnlyMMap = false               // keep index in OS, not Go heap
+	opts.TableLoadingMode = options.LoadToDisk // on-demand disk reads
+	opts.TableMaxOpenFiles = 4              // cap open SSTs
+
+	// open the index kv store with tuned options
+	db, err := sniper.Open(sniper.Dir(indexDir), sniper.ChunksCollision(32), opts)
 	if err != nil {
 		mlog.Log.Infof("failed to open database: %s\n", err)
 		return nil, err
@@ -163,7 +171,7 @@ func (accountsDb *AccountsDb) GetAccount(slot uint64, pubkey solana.PublicKey) (
 	appendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, acctIdxEntry.Slot, acctIdxEntry.FileId)
 	appendVecFile, err := os.Open(appendVecFileName)
 	if err != nil {
-		mlog.Log.Debugf("failed to open appendvec file %s")
+		mlog.Log.Debugf("failed to open appendvec file %s", appendVecFileName)
 		return nil, err
 	}
 
@@ -237,54 +245,3 @@ func (accountsDb *AccountsDb) StoreAccounts(accts []*accounts.Account, slot uint
 		err = accountsDb.IndexDb.SetIfSlotHigher(acct.Key[:], writer.Bytes(), 0)
 		if err != nil {
 			mlog.Log.Debugf("error calling SetIfSlotHigher on accountsdb for pubkey %s", acct.Key)
-			return err
-		}
-
-		msg := util.PrettyPrintAcct(acct)
-		mlog.Log.Debugf("SLOT %d - wrote account %s to %s in StoreAccounts: %s", slot, acct.Key, appendVecFileName, msg)
-
-		// marshal up the account as an appendvec style account and write it to the buffer
-		appendVecAcct := AppendVecAccount{DataLen: uint64(len(acct.Data)), Pubkey: acct.Key, Lamports: acct.Lamports,
-			RentEpoch: acct.RentEpoch, Owner: acct.Owner, Executable: acct.Executable, Data: acct.Data}
-
-		err = appendVecAcct.Marshal(appendVecAcctsBuf)
-		if err != nil {
-			return err
-		}
-	}
-
-	// write the appendvecs data into the file
-	n, err := appendVecFile.Write(appendVecAcctsBuf.Bytes())
-	if err != nil {
-		return err
-	} else if n != appendVecAcctsBuf.Len() {
-		return fmt.Errorf("only wrote %d appendvec account bytes, rather than %d", n, appendVecAcctsBuf.Len())
-	}
-
-	return nil
-}
-
-func (accountsDb *AccountsDb) KeysBetweenPrefixes(startPrefix uint64, endPrefix uint64) []solana.PublicKey {
-	keys := accountsDb.IndexDb.KeysBetweenPrefixes(startPrefix, endPrefix)
-
-	keyObjs := make([]solana.PublicKey, 0)
-	for _, key := range keys {
-		keyObject := solana.PublicKeyFromBytes(key)
-		keyObjs = append(keyObjs, keyObject)
-	}
-
-	return keyObjs
-}
-
-func (accountsDb *AccountsDb) AllKeys() [][]byte {
-	keys := accountsDb.IndexDb.AllKeys()
-	sort.SliceStable(keys, func(i, j int) bool {
-		return util.PubkeyCmpByteSlice(keys[i], keys[j])
-	})
-
-	return keys
-}
-
-func (accountsDb *AccountsDb) BankHash() [32]byte {
-	return accountsDb.BankHashBytes
-}
