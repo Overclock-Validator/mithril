@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"flag"
+	"net/http"          // ← added
+	_ "net/http/pprof"  // ← added
 	"os"
 	"os/signal"
 
@@ -33,6 +35,15 @@ func init() {
 
 func main() {
 	mlog.Log.Infof("mithril verifying node\n")
+
+	// --- start pprof server on localhost:6060 ---
+	go func() {
+		if err := http.ListenAndServe("localhost:6060", nil); err != nil {
+			mlog.Log.Infof("pprof server stopped: %v", err) // changed Warnf → Infof
+		}
+	}()
+	// --------------------------------------------
+
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 	cobra.CheckErr(cmd.ExecuteContext(ctx))
