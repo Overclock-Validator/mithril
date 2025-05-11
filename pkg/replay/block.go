@@ -9,7 +9,6 @@ import (
 	//"runtime/pprof"
 	"time"
 
-	"github.com/DataDog/datadog-go/statsd"
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/base58"
@@ -21,11 +20,11 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/rpcclient"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/snapshot"
+	"github.com/Overclock-Validator/mithril/pkg/statsd"
 	"github.com/Overclock-Validator/mithril/pkg/util"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
-	"k8s.io/klog/v2"
 )
 
 type BlockRewardsInfo struct {
@@ -62,17 +61,6 @@ type Block struct {
 	PartitionedRewardsInfo *rewards.PartitionedRewardDistributionInfo
 	Rewards                []rpc.BlockReward
 	NumRewardPartitions    uint64
-}
-
-var statsdClient *statsd.Client
-
-func init() {
-	var err error
-	statsdClient, err = statsd.New("127.0.0.1:8125")
-	if err != nil {
-		klog.Errorf("couldn't start statsdClient: %v", err)
-	}
-	statsdClient.Namespace = "mithril."
 }
 
 func resolveAddrTableLookups(accountsDb *accountsdb.AccountsDb, block *Block) error {
@@ -629,13 +617,11 @@ func ReplayBlocks(acctsDb *accountsdb.AccountsDb, acctsDbPath string, snapshotMa
 
 		slotReplayDuration := time.Since(start)
 		mlog.Log.Infof("replayed slot %d - bankhash: %s  (slot replay time: %fs)", block.Slot, base58.Encode(lastSlotCtx.FinalBankhash), slotReplayDuration.Seconds())
-		if statsdClient != nil {
-			statsdClient.Count("slot_replays", 1, nil, 1)
-			statsdClient.Distribution("slot_replay_duration_ms.distribution", float64(slotReplayDuration.Nanoseconds())/1e6, nil, 1)
-			statsdClient.Gauge("epoch", float64(block.Epoch), nil, 1)
-			statsdClient.Gauge("slot", float64(block.Slot), nil, 1)
-			statsdClient.Distribution("txs_per_block", float64(len(block.Transactions)), nil, 1)
-		}
+		statsd.Count("slot_replays", 1, nil, 1)
+		statsd.Distribution("slot_replay_duration_ms.distribution", float64(slotReplayDuration.Nanoseconds())/1e6, nil, 1)
+		statsd.Gauge("epoch", float64(block.Epoch), nil, 1)
+		statsd.Gauge("slot", float64(block.Slot), nil, 1)
+		statsd.Distribution("txs_per_block", float64(len(block.Transactions)), nil, 1)
 		if !justCrossedEpochBoundary {
 			statsCounter++
 			timeAccumulator += slotReplayDuration.Seconds()

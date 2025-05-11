@@ -18,6 +18,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/Overclock-Validator/mithril/pkg/statsd"
 	"github.com/Overclock-Validator/sniper"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
@@ -101,6 +102,10 @@ type indexEntryCommitterTask struct {
 const (
 	snapshotTypeZst = iota
 	snapshotTypeLz4
+)
+
+var (
+	tarBufferBytes = &atomic.Int64{}
 )
 
 func readerForCompressionType(snapshotType int, file *os.File) (io.Reader, error) {
@@ -204,6 +209,8 @@ func BuildAccountsIndexFromSnapshot(snapshotFile string, accountsDbDir string) (
 			mlog.Log.Errorf("%s\n", err)
 			return
 		}
+		totalTarBytes := tarBufferBytes.Add(-int64(len(task.Data)))
+		statsd.Gauge("accounts_index.tar_buffer_bytes", float64(totalTarBytes), nil, 1)
 
 		commitTask := indexEntryCommitterTask{IndexEntries: entries, Pubkeys: pubkeys}
 		wg.Add(1)
@@ -292,11 +299,13 @@ func BuildAccountsIndexFromSnapshot(snapshotFile string, accountsDbDir string) (
 		}
 
 		writer := new(bytes.Buffer)
-		_, err = io.Copy(writer, tarReader)
+		tarBytes, err := io.Copy(writer, tarReader)
 		if err != nil {
 			mlog.Log.Errorf("err copying data to reader: %s\n", err)
 			return nil, nil, err
 		}
+		totalTarBytes := tarBufferBytes.Add(tarBytes)
+		statsd.Gauge("accounts_index.tar_buffer_bytes", float64(totalTarBytes), nil, 1)
 
 		task := appendVecCopyingTask{TarBuffer: writer, Filename: header.Name}
 		wg.Add(1)

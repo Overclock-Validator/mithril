@@ -4,6 +4,9 @@ package node
 
 import (
 	"fmt"
+	"net/http"
+
+	_ "net/http/pprof"
 
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
@@ -28,6 +31,7 @@ var (
 	rpcEndpoint        string
 	startSlot          int64
 	endSlot            int64
+	pprofPort          int64
 )
 
 func init() {
@@ -39,10 +43,17 @@ func init() {
 	Cmd.Flags().StringVarP(&rpcEndpoint, "rpc", "r", "", "URL for RPC endpoint")
 	Cmd.Flags().Int64VarP(&startSlot, "startslot", "b", -1, "Block at which to begin replaying")
 	Cmd.Flags().Int64VarP(&endSlot, "endslot", "e", -1, "Block at which to stop replaying, inclusive")
-
+	Cmd.Flags().Int64Var(&pprofPort, "pprofport", -1, "Port to serve HTTP pprof endpoint")
 }
 
 func run(c *cobra.Command, args []string) {
+	if pprofPort != -1 {
+		pprofAddr := fmt.Sprintf("localhost:%d", pprofPort)
+		mlog.Log.Infof("Starting HTTP server for pprof on %s", pprofAddr)
+		go func() {
+			mlog.Log.Errorf("HTTP pprof server exited: %v", http.ListenAndServe(pprofAddr, nil))
+		}()
+	}
 
 	if !loadFromSnapshot && !loadFromAccountsDb {
 		klog.Errorf("must specify either to load from a snapshot or from an existing AccountsDB")
