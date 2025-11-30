@@ -40,3 +40,25 @@ func (s *GrpcServer) GracefulStop() {
 	s.server.GracefulStop()
 }
 
+// GetUpdateChannel returns the channel where SubscribeUpdate messages can be sent.
+// External packages can send messages to this channel, and they will be filtered and forwarded to clients.
+//
+// Example usage from another package:
+//
+//	server := grpc.NewGrpcServer(50051, nil)
+//	updateChan := server.GetUpdateChannel()
+//	
+//	// Send a block update
+//	update := &pb.SubscribeUpdate{
+//		UpdateOneof: &pb.SubscribeUpdate_Block{
+//			Block: &pb.SubscribeUpdateBlock{
+//				Slot: 12345,
+//				Blockhash: "abc123...",
+//			},
+//		},
+//	}
+//	updateChan <- update
+func (s *GrpcServer) GetUpdateChannel() chan<- *pb.SubscribeUpdate {
+	return s.geyserService.GetUpdateChannel()
+}
+
