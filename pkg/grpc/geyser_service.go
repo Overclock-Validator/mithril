@@ -6,26 +6,29 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/grpc/pb"
 	"google.golang.org/grpc"
+
+	b "github.com/Overclock-Validator/mithril/pkg/block"
+	"github.com/gagliardetto/solana-go"
 )
 
 type GeyserService struct {
 	pb.UnimplementedGeyserServer
-	
-	// Channel for receiving SubscribeUpdate messages that need to be filtered and sent
-	updateChan chan *pb.SubscribeUpdate
+
+	// Channel for sending Blocks to client 
+	blockChan chan *b.Block
 }
 
 
 func NewGeyserService() *GeyserService {
 	return &GeyserService{
-		updateChan: make(chan *pb.SubscribeUpdate, 100),
+		blockChan: make(chan *b.Block, 100),
 	}
 }
 
-// GetUpdateChannel returns the channel where SubscribeUpdate messages can be sent
-// External code can send messages to this channel, and they will be filtered and forwarded
-func (s *GeyserService) GetUpdateChannel() chan<- *pb.SubscribeUpdate {
-	return s.updateChan
+// GetBlockChannel returns the channel where Block messages can be sent
+// External code can send blocks to this channel, and they will be filtered and forwarded to clients
+func (s *GeyserService) GetBlockChannel() chan<- *b.Block {
+	return s.blockChan
 }
 
 func (s *GeyserService) Ping(ctx context.Context, req *pb.PingRequest) (*pb.PongResponse, error) {
@@ -88,34 +91,27 @@ func (s *GeyserService) Subscribe(stream grpc.BidiStreamingServer[pb.SubscribeRe
 			
 			// Handle ping/pong
 			if req.Ping != nil {
-				filterIDs := s.extractFilterIDs(activeRequest)
 				pong := &pb.SubscribeUpdate{
-					Filters: filterIDs,
 					UpdateOneof: &pb.SubscribeUpdate_Pong{
 						Pong: &pb.SubscribeUpdatePong{
 							Id: req.Ping.Id,
 						},
 					},
 				}
-				select {
-				case updateChan <- pong:
-				case <-ctx.Done():
-					return ctx.Err()
+				if err := s.sendUpdate(pong, activeRequest, updateChan, ctx); err != nil {
+					return err
 				}
 				continue
 			}
 			
 			activeRequest = req
 			
-		case update := <-s.updateChan:
-			if s.shouldSendUpdate(update, activeRequest) {
-				if activeRequest != nil {
-					update.Filters = s.extractFilterIDs(activeRequest)
-				}
-				select {
-				case updateChan <- update:
-				case <-ctx.Done():
-					return ctx.Err()
+		case block := <-s.blockChan:
+			// Filter block first, then convert if it passes
+			if s.shouldSendBlock(block, activeRequest) {
+				update := s.convertBlockToSubscribeUpdate(block)
+				if err := s.sendUpdate(update, activeRequest, updateChan, ctx); err != nil {
+					return err
 				}
 			}
 			
@@ -140,41 +136,115 @@ func (s *GeyserService) extractFilterIDs(req *pb.SubscribeRequest) []string {
 	return filterIDs
 }
 
-func (s *GeyserService) shouldSendUpdate(update *pb.SubscribeUpdate, req *pb.SubscribeRequest) bool {
+// sendUpdate sends an update to the client channel with proper error handling
+func (s *GeyserService) sendUpdate(update *pb.SubscribeUpdate, req *pb.SubscribeRequest, updateChan chan<- *pb.SubscribeUpdate, ctx context.Context) error {
+	if req != nil {
+		update.Filters = s.extractFilterIDs(req)
+	}
+	select {
+	case updateChan <- update:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// shouldSendBlock checks if a Block should be sent based on the active request filters
+// This filters the block BEFORE converting to SubscribeUpdate for better performance
+func (s *GeyserService) shouldSendBlock(block *b.Block, req *pb.SubscribeRequest) bool {
 	if req == nil {
 		return true
 	}
 	
-	// Always send ping/pong messages
-	switch update.UpdateOneof.(type) {
-	case *pb.SubscribeUpdate_Ping, *pb.SubscribeUpdate_Pong:
-		return true
-	case *pb.SubscribeUpdate_Block:
-		return s.matchesBlockFilter(update.GetBlock(), req)
-	default:
-		return false
-	}
-}
-
-func (s *GeyserService) matchesBlockFilter(block *pb.SubscribeUpdateBlock, req *pb.SubscribeRequest) bool {
 	if len(req.Blocks) == 0 {
 		return false
 	}
 	
+	return s.matchesBlockFilterForBlock(block, req)
+}
+
+// matchesBlockFilterForBlock checks if a Block matches the request filters
+func (s *GeyserService) matchesBlockFilterForBlock(block *b.Block, req *pb.SubscribeRequest) bool {
 	for _, filter := range req.Blocks {
 		if len(filter.AccountInclude) > 0 {
-			accounts := block.GetAccounts()
-
-			for _, account := range accounts {
-				if slices.Contains(filter.AccountInclude, string(account.Pubkey)) {
+			// Check if any account in block.UpdatedAccts matches
+			for _, pubkey := range block.UpdatedAccts {
+				pubkeyStr := pubkey.String()
+				if slices.Contains(filter.AccountInclude, pubkeyStr) {
 					return true
 				}
 			}
+			
+			// Check EpochUpdatedAccts if available
+			for _, account := range block.EpochUpdatedAccts {
+				if account != nil {
+					pubkeyStr := account.Key.String()
+					if slices.Contains(filter.AccountInclude, pubkeyStr) {
+						return true
+					}
+				}
+			}
+			
+			// Check ParentEpochUpdatedAccts if available
+			for _, account := range block.ParentEpochUpdatedAccts {
+				if account != nil {
+					pubkeyStr := account.Key.String()
+					if slices.Contains(filter.AccountInclude, pubkeyStr) {
+						return true
+					}
+				}
+			}
 
-			// TODO build other filters here
+			// If account_include filter exists but no match found, don't send
 			return false
 		}
+		
+		// If no specific filters, match all blocks
+		return true
 	}
 
 	return true
+}
+
+// convertBlockToSubscribeUpdate converts a Block to SubscribeUpdate with Block update
+func (s *GeyserService) convertBlockToSubscribeUpdate(block *b.Block) *pb.SubscribeUpdate {
+	blockUpdate := &pb.SubscribeUpdateBlock{
+		Slot:                     block.Slot,
+		Blockhash:                solana.Hash(block.Blockhash).String(),
+		ParentSlot:               block.ParentSlot,
+		ParentBlockhash:          solana.Hash(block.LastBlockhash).String(),
+		ExecutedTransactionCount: uint64(len(block.Transactions)),
+		UpdatedAccountCount:      uint64(len(block.UpdatedAccts)),
+		EntriesCount:             uint64(len(block.Entries)),
+	}
+
+	// Set block height if available
+	if block.BlockHeight > 0 {
+		blockUpdate.BlockHeight = &pb.BlockHeight{
+			BlockHeight: block.BlockHeight,
+		}
+	}
+
+	// Set block time if available
+	if block.UnixTimestamp > 0 {
+		blockUpdate.BlockTime = &pb.UnixTimestamp{
+			Timestamp: block.UnixTimestamp,
+		}
+	}
+
+	// Convert accounts if available (from UpdatedAccts or EpochUpdatedAccts)
+	// Note: This is a simplified conversion - you may need to fetch full account data
+	accounts := make([]*pb.SubscribeUpdateAccountInfo, 0, len(block.UpdatedAccts))
+	for _, pubkey := range block.UpdatedAccts {
+		accounts = append(accounts, &pb.SubscribeUpdateAccountInfo{
+			Pubkey: pubkey[:],
+		})
+	}
+	blockUpdate.Accounts = accounts
+
+	return &pb.SubscribeUpdate{
+		UpdateOneof: &pb.SubscribeUpdate_Block{
+			Block: blockUpdate,
+		},
+	}
 }

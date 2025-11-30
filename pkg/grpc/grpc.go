@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 
+	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/grpc/pb"
 	"google.golang.org/grpc"
 )
@@ -40,25 +41,22 @@ func (s *GrpcServer) GracefulStop() {
 	s.server.GracefulStop()
 }
 
-// GetUpdateChannel returns the channel where SubscribeUpdate messages can be sent.
-// External packages can send messages to this channel, and they will be filtered and forwarded to clients.
+// GetBlockChannel returns the channel where Block messages can be sent.
+// External packages can send blocks to this channel, and they will be filtered and forwarded to clients.
 //
 // Example usage from another package:
 //
 //	server := grpc.NewGrpcServer(50051, nil)
-//	updateChan := server.GetUpdateChannel()
+//	blockChan := server.GetBlockChannel()
 //	
-//	// Send a block update
-//	update := &pb.SubscribeUpdate{
-//		UpdateOneof: &pb.SubscribeUpdate_Block{
-//			Block: &pb.SubscribeUpdateBlock{
-//				Slot: 12345,
-//				Blockhash: "abc123...",
-//			},
-//		},
+//	// Send a block (will be converted to SubscribeUpdate and filtered)
+//	block := &block.Block{
+//		Slot: 12345,
+//		Blockhash: [32]byte{...},
+//		// ... other fields
 //	}
-//	updateChan <- update
-func (s *GrpcServer) GetUpdateChannel() chan<- *pb.SubscribeUpdate {
-	return s.geyserService.GetUpdateChannel()
+//	blockChan <- block
+func (s *GrpcServer) GetBlockChannel() chan<- *b.Block {
+	return s.geyserService.GetBlockChannel()
 }
 
