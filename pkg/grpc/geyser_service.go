@@ -49,6 +49,8 @@ func (s *GeyserService) Subscribe(stream grpc.BidiStreamingServer[pb.SubscribeRe
 	// Channel to signal when we're done
 	done := make(chan error, 1)
 	
+		// Main loop: process requests and filter updates
+	var activeRequest *pb.SubscribeRequest
 	// Goroutine to receive SubscribeRequest messages from the client
 	go func() {
 		for {
@@ -78,14 +80,32 @@ func (s *GeyserService) Subscribe(stream grpc.BidiStreamingServer[pb.SubscribeRe
 		}
 	}()
 	
-	// Main loop: process requests and filter updates
-	var activeRequest *pb.SubscribeRequest
+	// Goroutine to send blocks to the client
+	go func() {
+		for {
+			select {
+			case req, ok := <-s.blockChan:
+				if !ok {
+					return
+				}
+				block := s.convertBlockToSubscribeUpdate(req)
+				if err := s.sendUpdate(block, activeRequest, updateChan, ctx); err != nil {
+					done <- err
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+
+
 	
-	for {
+ for {
 		select {
 		case req, ok := <-requestChan:
 			if !ok {
-				// Client closed the request stream
 				return nil
 			}
 			
@@ -106,14 +126,6 @@ func (s *GeyserService) Subscribe(stream grpc.BidiStreamingServer[pb.SubscribeRe
 			
 			activeRequest = req
 			
-		case block := <-s.blockChan:
-			// Filter block first, then convert if it passes
-			if s.shouldSendBlock(block, activeRequest) {
-				update := s.convertBlockToSubscribeUpdate(block)
-				if err := s.sendUpdate(update, activeRequest, updateChan, ctx); err != nil {
-					return err
-				}
-			}
 			
 		case err := <-done:
 			return err
@@ -122,6 +134,7 @@ func (s *GeyserService) Subscribe(stream grpc.BidiStreamingServer[pb.SubscribeRe
 			return ctx.Err()
 		}
 	}
+
 }
 
 func (s *GeyserService) extractFilterIDs(req *pb.SubscribeRequest) []string {
