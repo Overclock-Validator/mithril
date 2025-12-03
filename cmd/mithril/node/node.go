@@ -88,6 +88,10 @@ var (
 	borrowedAccountArenaSize uint64
 
 	rpcPort int
+
+	// grpc flags
+	grpcPort int
+	enableGrpc bool
 )
 
 func init() {
@@ -114,6 +118,8 @@ func init() {
 	Verifier.Flags().BoolVar(&sbpf.UsePool, "use-pool", true, "Disable to allocate fresh slices")
 	Verifier.Flags().StringVar(&snapshotDlPath, "download-snapshot", "", "Path to download snapshot to")
 	Verifier.Flags().IntVar(&rpcPort, "rpc-server-port", 0, "RPC server port. Default off.")
+	Verifier.Flags().BoolVar(&enableGrpc, "enable-grpc", false, "Enable gRPC server. Default off.")
+	Verifier.Flags().IntVar(&grpcPort, "grpc-port", 50051, "gRPC server port. Default 50051.")
 
 	// flags for RPC catchup mode
 	CatchupRpc.Flags().StringVarP(&outputDir, "out", "o", "", "Output path for writing AccountsDB data to")
@@ -132,6 +138,8 @@ func init() {
 	CatchupRpc.Flags().StringVar(&blockDir, "blockdir", "/tmp/blocks", "Path containing slot.json files")
 	CatchupRpc.Flags().StringVar(&scratchDir, "scratchdir", "/tmp", "Path for downloads (e.g. snapshots) and other temp state")
 	CatchupRpc.Flags().IntVar(&rpcPort, "rpc-server-port", 0, "RPC server port. Default off.")
+	CatchupRpc.Flags().BoolVar(&enableGrpc, "enable-grpc", false, "Enable gRPC server. Default off.")
+	CatchupRpc.Flags().IntVar(&grpcPort, "grpc-port", 50051, "gRPC server port. Default 50051.")
 
 	// flags for Overcast catchup mode
 	CatchupOvercast.Flags().StringVarP(&outputDir, "out", "o", "", "Output path for writing AccountsDB data to")
@@ -151,6 +159,8 @@ func init() {
 	CatchupOvercast.Flags().StringVar(&blockDir, "blockdir", "/tmp/blocks", "Path containing slot.json files")
 	CatchupOvercast.Flags().StringVar(&scratchDir, "scratchdir", "/tmp", "Path for downloads (e.g. snapshots) and other temp state")
 	CatchupOvercast.Flags().IntVar(&rpcPort, "rpc-server-port", 0, "RPC server port. Default off.")
+	CatchupOvercast.Flags().BoolVar(&enableGrpc, "enable-grpc", false, "Enable gRPC server. Default off.")
+	CatchupOvercast.Flags().IntVar(&grpcPort, "grpc-port", 50051, "gRPC server port. Default 50051.")
 }
 
 func runVerifier(c *cobra.Command, args []string) {
@@ -164,7 +174,6 @@ func runVerifier(c *cobra.Command, args []string) {
 	if !loadFromSnapshot && !loadFromAccountsDb && snapshotDlPath == "" {
 		klog.Fatalf("must specify either to load from a snapshot, or load from an existing AccountsDB, or download a snapshot.")
 	}
-
 	var err error
 	var accountsDbDir string
 	var accountsDb *accountsdb.AccountsDb
@@ -184,6 +193,7 @@ func runVerifier(c *cobra.Command, args []string) {
 		pprof.StartCPUProfile(cpuprofWriter)
 		defer pprof.StopCPUProfile()
 	}
+
 
 	if rpcEndpoint == "" {
 		rpcEndpoint = "https://api.mainnet-beta.solana.com"
