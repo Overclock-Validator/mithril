@@ -4,10 +4,11 @@ import (
 	"context"
 	"slices"
 
-	"github.com/Overclock-Validator/mithril/pkg/grpc/pb"
 	"google.golang.org/grpc"
 
 	b "github.com/Overclock-Validator/mithril/pkg/block"
+	pb "github.com/rpcpool/yellowstone-grpc/examples/golang/proto"
+
 	"github.com/gagliardetto/solana-go"
 )
 

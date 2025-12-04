@@ -18,6 +18,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/arena"
+	"github.com/Overclock-Validator/mithril/pkg/grpc"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/replay"
 	"github.com/Overclock-Validator/mithril/pkg/rpcserver"
@@ -299,6 +300,19 @@ func runVerifier(c *cobra.Command, args []string) {
 		rpcServer.Start()
 		mlog.Log.Infof("started RPC server on port %d", rpcPort)
 	}
+	if enableGrpc {
+		
+		if grpcPort == 0 || grpcPort > 65535 || grpcPort < 0 {
+			grpcPort = 50051
+		}
+		
+		grpcServer := grpc.NewGrpcServer(uint16(grpcPort), nil)
+		err := grpcServer.Start()
+		if err != nil {
+			klog.Fatalf("failed to start gRPC server: %v", err)
+		}
+		mlog.Log.Infof("started gRPC server on port %d", grpcPort)
+	}
 
 	replay.ReplayBlocks(c.Context(), accountsDb, accountsDbDir, manifest, uint64(startSlot), uint64(endSlot), rpcEndpoint, blockDir, int(txParallelism), false, false, dbgOpts, metricsWriter, rpcServer)
 	mlog.Log.Infof("done replaying, closing DB")
@@ -377,6 +391,20 @@ func runRpcCatchup(c *cobra.Command, args []string) {
 		rpcServer = rpcserver.NewRpcServer(accountsDb, uint16(rpcPort))
 		rpcServer.Start()
 		mlog.Log.Infof("started RPC server on port %d", rpcPort)
+	}
+
+	if enableGrpc {
+		
+		if grpcPort == 0 || grpcPort > 65535 || grpcPort < 0 {
+			grpcPort = 50051
+		}
+		
+		grpcServer := grpc.NewGrpcServer(uint16(grpcPort), nil)
+		err := grpcServer.Start()
+		if err != nil {
+			klog.Fatalf("failed to start gRPC server: %v", err)
+		}
+		mlog.Log.Infof("started gRPC server on port %d", grpcPort)
 	}
 
 	replay.ReplayBlocks(c.Context(), accountsDb, outputDir, manifest, uint64(startSlot), uint64(endSlot), rpcEndpoint, blockDir, int(txParallelism), true, false, dbgOpts, metricsWriter, rpcServer)
@@ -461,6 +489,21 @@ func runOvercastCatchup(c *cobra.Command, args []string) {
 		rpcServer.Start()
 		mlog.Log.Infof("started RPC server on port %d", rpcPort)
 	}
+
+	if enableGrpc {
+		
+		if grpcPort == 0 || grpcPort > 65535 || grpcPort < 0 {
+			grpcPort = 50051
+		}
+
+		grpcServer := grpc.NewGrpcServer(uint16(grpcPort), nil)
+		err := grpcServer.Start()
+		if err != nil {
+			klog.Fatalf("failed to start gRPC server: %v", err)
+		}
+		mlog.Log.Infof("started gRPC server on port %d", grpcPort)
+	}
+
 
 	replay.ReplayBlocks(c.Context(), accountsDb, outputDir, manifest, uint64(startSlot), uint64(endSlot), rpcEndpoint, blockDir, int(txParallelism), true, true, dbgOpts, metricsWriter, rpcServer)
 	mlog.Log.Infof("done replaying, closing DB")

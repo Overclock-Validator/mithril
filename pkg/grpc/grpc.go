@@ -6,7 +6,7 @@ import (
 	"net"
 
 	b "github.com/Overclock-Validator/mithril/pkg/block"
-	"github.com/Overclock-Validator/mithril/pkg/grpc/pb"
+	pb "github.com/rpcpool/yellowstone-grpc/examples/golang/proto"
 	"google.golang.org/grpc"
 )
 

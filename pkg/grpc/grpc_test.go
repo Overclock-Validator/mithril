@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Overclock-Validator/mithril/pkg/grpc/pb"
+	pb "github.com/rpcpool/yellowstone-grpc/examples/golang/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
