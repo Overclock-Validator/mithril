@@ -1,18 +1,22 @@
 package block
 
 import (
-	//laserstream "github.com/helius-labs/laserstream-sdk/go"
+	"context"
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
-	"github.com/Overclock-Validator/mithril/pkg/rpcclient"
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
 	"github.com/rpcpool/yellowstone-grpc/examples/golang/proto"
 )
 
-func FromLaserStream(lsBlock *proto.SubscribeUpdateBlock, rpcc *rpcclient.RpcClient) *Block {
+type LeaderFetcher interface {
+	GetLeaderForSlot(slot uint64) (solana.PublicKey, error)
+}
+
+func FromLaserStream(lsBlock *proto.SubscribeUpdateBlock, rpcc LeaderFetcher) *Block {
 	block := &Block{}
 
 	block.Slot = lsBlock.GetSlot()
@@ -31,7 +35,6 @@ func FromLaserStream(lsBlock *proto.SubscribeUpdateBlock, rpcc *rpcclient.RpcCli
 	block.UnixTimestamp = lsBlock.BlockTime.Timestamp
 	block.BlockHeight = lsBlock.BlockHeight.BlockHeight
 
-	// rewards
 	for _, r := range lsBlock.Rewards.Rewards {
 		convertedReward := lsBlockRewardToBlockReward(r)
 		block.Rewards = append(block.Rewards, convertedReward)
@@ -48,13 +51,20 @@ func FromLaserStream(lsBlock *proto.SubscribeUpdateBlock, rpcc *rpcclient.RpcCli
 		block.BlockReward = &BlockRewardsInfo{Leader: blockReward.Pubkey, Lamports: uint64(blockReward.Lamports), PostBalance: blockReward.PostBalance}
 	} else {
 		if rpcc != nil {
-			mlog.Log.Infof("calling into rpc for leader info")
-			leaderForSlot, err := rpcc.GetLeaderForSlot(lsBlock.Slot)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			result, err := RetryWithExponentialBackoff(ctx, maxRetriesGetLeaderForSlot, func(retryCtx context.Context) (interface{}, error) {
+				return rpcc.GetLeaderForSlot(lsBlock.Slot)
+			})
+
 			if err != nil {
-				panic(fmt.Sprintf("unable to get blockreward for slot %d", lsBlock.Slot))
-			} else {
-				block.BlockReward = &BlockRewardsInfo{Leader: leaderForSlot}
+				mlog.Log.Errorf("failed to get leader for slot %d after %d retries: %v", lsBlock.Slot, maxRetriesGetLeaderForSlot, err)
+				panic(fmt.Sprintf("unable to get blockreward for slot %d after %d attempts: %v", lsBlock.Slot, maxRetriesGetLeaderForSlot, err))
 			}
+
+			leaderForSlot := result.(solana.PublicKey)
+			block.BlockReward = &BlockRewardsInfo{Leader: leaderForSlot}
 		}
 	}
 
