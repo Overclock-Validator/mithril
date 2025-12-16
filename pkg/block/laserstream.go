@@ -1,9 +1,9 @@
 package block
 
 import (
-	"context"
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
@@ -49,15 +49,20 @@ func FromLaserStream(lsBlock *proto.SubscribeUpdateBlock, rpcc LeaderFetcher) *B
 		block.BlockReward = &BlockRewardsInfo{Leader: blockReward.Pubkey, Lamports: uint64(blockReward.Lamports), PostBalance: blockReward.PostBalance}
 	} else {
 		if rpcc != nil {
-			result, err := RetryWithExponentialBackoff(context.Background(), maxRetriesGetLeaderForSlot, func(retryCtx context.Context) (interface{}, error) {
-				return rpcc.GetLeaderForSlot(lsBlock.Slot)
-			})
-
+			var leaderForSlot solana.PublicKey
+			var err error
+			for attempt := 0; attempt < maxRetriesGetLeaderForSlot; attempt++ {
+				leaderForSlot, err = rpcc.GetLeaderForSlot(lsBlock.Slot)
+				if err == nil {
+					break
+				}
+				if attempt < maxRetriesGetLeaderForSlot-1 {
+					time.Sleep(time.Duration(attempt+1) * time.Duration(baseBackoffMs) * time.Millisecond)
+				}
+			}
 			if err != nil {
 				panic(fmt.Sprintf("unable to get blockreward for slot %d after %d attempts: %v", lsBlock.Slot, maxRetriesGetLeaderForSlot, err))
 			}
-
-			leaderForSlot := result.(solana.PublicKey)
 			block.BlockReward = &BlockRewardsInfo{Leader: leaderForSlot}
 		}
 	}
