@@ -4,9 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"time"
 
-	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
 	"github.com/rpcpool/yellowstone-grpc/examples/golang/proto"
@@ -51,15 +49,11 @@ func FromLaserStream(lsBlock *proto.SubscribeUpdateBlock, rpcc LeaderFetcher) *B
 		block.BlockReward = &BlockRewardsInfo{Leader: blockReward.Pubkey, Lamports: uint64(blockReward.Lamports), PostBalance: blockReward.PostBalance}
 	} else {
 		if rpcc != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-
-			result, err := RetryWithExponentialBackoff(ctx, maxRetriesGetLeaderForSlot, func(retryCtx context.Context) (interface{}, error) {
+			result, err := RetryWithExponentialBackoff(context.Background(), maxRetriesGetLeaderForSlot, func(retryCtx context.Context) (interface{}, error) {
 				return rpcc.GetLeaderForSlot(lsBlock.Slot)
 			})
 
 			if err != nil {
-				mlog.Log.Errorf("failed to get leader for slot %d after %d retries: %v", lsBlock.Slot, maxRetriesGetLeaderForSlot, err)
 				panic(fmt.Sprintf("unable to get blockreward for slot %d after %d attempts: %v", lsBlock.Slot, maxRetriesGetLeaderForSlot, err))
 			}
 
