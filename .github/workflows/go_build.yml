@@ -13,16 +13,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v4
         with:
-          go-version: 1.20.5
-
-      - name: Fetch deps
-        run: |
-          # Hosted with Git LFS.  See ./contrib/deps-bundle.sh
-          wget -q https://github.com/firedancer-io/radiance/raw/deps/deps-bundle.tar.zst
-          tar -I zstd -xf deps-bundle.tar.zst
-
-      - name: Vet
-        run: source activate-opt && go vet ./...
+          go-version: 1.25.5
 
       - name: Build
-        run: source activate-opt && go build -v ./cmd/radiance
+        run: go build -v ./cmd/mithril
