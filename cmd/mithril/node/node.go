@@ -34,7 +34,7 @@ var (
 		Use:   "verify-range",
 		Short: "Verify a range of slots from snapshot",
 		PreRunE: func(cmd *cobra.Command, args []string) error {
-			return initConfigAndBindFlags(cmd)
+			return initConfigAndBindFlags(cmd, false)
 		},
 		Run: func(cmd *cobra.Command, args []string) {
 			runVerifyRange(cmd, args)
@@ -45,7 +45,7 @@ var (
 		Use:   "verify-live",
 		Short: "Catchup and verify live blocks",
 		PreRunE: func(cmd *cobra.Command, args []string) error {
-			return initConfigAndBindFlags(cmd)
+			return initConfigAndBindFlags(cmd, true)
 		},
 		Run: func(cmd *cobra.Command, args []string) {
 			runVerifyLive(cmd, args)
@@ -159,7 +159,7 @@ func init() {
 // initConfigAndBindFlags loads TOML config file (if specified) and binds flags to viper.
 // After this runs, config values can be read from either CLI flags or config file,
 // with CLI flags taking precedence.
-func initConfigAndBindFlags(cmd *cobra.Command) error {
+func initConfigAndBindFlags(cmd *cobra.Command, live bool) error {
 	// Initialize config from file (do NOT bind flags - we handle precedence manually)
 	if err := config.InitConfig(); err != nil {
 		return err
@@ -297,7 +297,7 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	if blockSource == "" {
 		blockSource = "rpc" // default
 	}
-	if blockSource == "rpc" && len(rpcEndpoints) == 0 {
+	if blockSource == "rpc" && len(rpcEndpoints) == 0 && live {
 		return fmt.Errorf("blockSource=rpc but no endpoints were provided")
 	}
 	overcastEndpoint = getString("overcast-endpoint", "block.overcast_endpoint")
