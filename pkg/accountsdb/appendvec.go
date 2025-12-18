@@ -30,7 +30,7 @@ const (
 )
 
 type appendVecParser struct {
-	Buf      []byte
+	Reader   io.Reader
 	FileSize uint64
 	Offset   uint64
 
@@ -40,20 +40,41 @@ type appendVecParser struct {
 
 func (parser *appendVecParser) ParseNextAcct(pk *solana.PublicKey, a *AccountIndexEntry) error {
 	if parser.Offset+hdrLen > parser.FileSize {
-		return fmt.Errorf("overflow")
+		return io.EOF
 	}
 
-	dataLen := binary.LittleEndian.Uint64(parser.Buf[parser.Offset+dataLenOffset : parser.Offset+dataLenOffset+8])
+	var hdr [hdrLen]byte
+	if _, err := io.ReadFull(parser.Reader, hdr[:]); err != nil {
+		if err == io.EOF {
+			return err
+		}
+		return fmt.Errorf("reading header: %w", err)
+	}
 
-	*pk = solana.PublicKeyFromBytes(parser.Buf[parser.Offset+pubkeyOffset : parser.Offset+pubkeyOffset+32])
+	dataLen := binary.LittleEndian.Uint64(hdr[dataLenOffset : dataLenOffset+8])
+
+	*pk = solana.PublicKeyFromBytes(hdr[pubkeyOffset : pubkeyOffset+32])
 	a.Slot = parser.Slot
 	a.FileId = parser.FileId
 	a.Offset = parser.Offset
 
 	parser.Offset += hdrLen
 
+	alignedLen := util.AlignUp(dataLen, 8)
+
 	if parser.Offset+dataLen > parser.FileSize {
 		return fmt.Errorf("overflow")
+	}
+	if alignedLen > 0 {
+		if seeker, ok := parser.Reader.(io.Seeker); ok {
+			if _, err := seeker.Seek(int64(alignedLen), io.SeekCurrent); err != nil {
+				return fmt.Errorf("seeking data: %w", err)
+			}
+		} else {
+			if _, err := io.CopyN(io.Discard, parser.Reader, int64(alignedLen)); err != nil {
+				return fmt.Errorf("discarding data: %w", err)
+			}
+		}
 	}
 
 	parser.Offset += util.AlignUp(dataLen, 8)

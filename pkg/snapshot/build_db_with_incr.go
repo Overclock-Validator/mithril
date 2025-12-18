@@ -92,7 +92,16 @@ func BuildAccountsDbWithIncr(
 		start := time.Now()
 		defer wg.Done()
 		task := i.(indexEntryBuilderTask)
-		pubkeys, entries, err := accountsdb.BuildIndexEntriesFromAppendVecs(task.Data, task.FileSize, task.Slot, task.FileId)
+
+		f, err := os.Open(task.FilePath)
+		if err != nil {
+			mlog.Log.Errorf("failed to open appendvec file %s: %s", task.FilePath, err)
+			indexEntryBuilderInProgress.Add(-1)
+			return
+		}
+		defer f.Close()
+
+		pubkeys, entries, err := accountsdb.BuildIndexEntriesFromAppendVecs(f, task.FileSize, task.Slot, task.FileId)
 		if err != nil {
 			mlog.Log.Errorf("%s\n", err)
 			return
@@ -181,7 +190,7 @@ func BuildAccountsDbWithIncr(
 		}
 
 		appendVecCopyingInProgress.Add(-1)
-		nextTask := indexEntryBuilderTask{Data: appendVecBytes, FileSize: fileSize, Slot: slot, FileId: fileId}
+		nextTask := indexEntryBuilderTask{FilePath: cleanPath, FileSize: fileSize, Slot: slot, FileId: fileId}
 		wg.Add(1)
 		statsd.Timing(statsd.TasksAppendVecCopyingLatency, uint64(time.Since(start)), nil)
 		err = indexEntryBuilderPool.Invoke(nextTask)

@@ -73,7 +73,7 @@ type appendVecCopyingTask struct {
 }
 
 type indexEntryBuilderTask struct {
-	Data     []byte
+	FilePath string
 	FileSize uint64
 	Slot     uint64
 	FileId   uint64

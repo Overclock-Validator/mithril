@@ -3,6 +3,7 @@ package accountsdb
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 
 	"github.com/gagliardetto/solana-go"
 )
@@ -34,12 +35,12 @@ func unmarshalAcctIdxEntry(data []byte) (*AccountIndexEntry, error) {
 	return out, nil
 }
 
-func BuildIndexEntriesFromAppendVecs(data []byte, fileSize uint64, slot uint64, fileId uint64) ([]solana.PublicKey, []AccountIndexEntry, error) {
+func BuildIndexEntriesFromAppendVecs(reader io.Reader, fileSize uint64, slot uint64, fileId uint64) ([]solana.PublicKey, []AccountIndexEntry, error) {
 	pubkeys := make([]solana.PublicKey, 0, 20000)
 	acctIdxEntries := make([]AccountIndexEntry, 0, 20000)
 	var err error
 
-	parser := &appendVecParser{Buf: data, FileSize: fileSize, FileId: fileId, Slot: slot}
+	parser := &appendVecParser{Reader: reader, FileSize: fileSize, FileId: fileId, Slot: slot}
 
 	for {
 		pubkeys = append(pubkeys, solana.PublicKey{})
@@ -50,5 +51,10 @@ func BuildIndexEntriesFromAppendVecs(data []byte, fileSize uint64, slot uint64, 
 		}
 	}
 
-	return pubkeys, acctIdxEntries, nil
+	if err != io.EOF {
+		return nil, nil, err
+	}
+
+	// Remove the last empty entry added before loop break
+	return pubkeys[:len(pubkeys)-1], acctIdxEntries[:len(acctIdxEntries)-1], nil
 }
