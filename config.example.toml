@@ -168,6 +168,11 @@ name = "mithril"
     # Enable/disable pool allocator for slices
     use_pool = true
 
+    # Persist compiled program cache across restarts
+    # When enabled, compiled SBPF programs are saved to disk on shutdown
+    # and reloaded on startup, speeding up replay warmup.
+    persist_program_cache = false
+
     # [tuning.pprof] - CPU/Memory Profiling
     [tuning.pprof]
         # Port to serve HTTP pprof endpoint (-1 to disable)

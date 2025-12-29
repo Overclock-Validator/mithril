@@ -50,6 +50,7 @@ type DevelopmentConfig struct {
 	ParamArenaSizeMB         uint64      `toml:"param_arena_size_mb" mapstructure:"param_arena_size_mb"`               // was: param-arena-size-mb
 	BorrowedAccountArenaSize uint64      `toml:"borrowed_account_arena_size" mapstructure:"borrowed_account_arena_size"` // was: borrowed-account-arena-size
 	UsePool                  bool        `toml:"use_pool" mapstructure:"use_pool"`                                     // was: use-pool
+	PersistProgramCache      bool        `toml:"persist_program_cache" mapstructure:"persist_program_cache"`           // Persist compiled program cache across restarts
 	Pprof                    PprofConfig `toml:"pprof" mapstructure:"pprof"`
 	Debug                    DebugConfig `toml:"debug" mapstructure:"debug"`
 }

@@ -116,7 +116,7 @@ func (accountsDb *AccountsDb) CloseDb() {
 
 func (accountsDb *AccountsDb) InitCaches() {
 	var err error
-	accountsDb.VoteAcctCache, err = otter.MustBuilder[solana.PublicKey, *accounts.Account](5000).
+	accountsDb.VoteAcctCache, err = otter.MustBuilder[solana.PublicKey, *accounts.Account](2000).
 		Cost(func(key solana.PublicKey, acct *accounts.Account) uint32 {
 			return 1
 		}).

@@ -99,6 +99,7 @@ var (
 
 	paramArenaSizeMB         uint64
 	borrowedAccountArenaSize uint64
+	persistProgramCache      bool
 
 	rpcPort int
 )
@@ -414,6 +415,13 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		sbpf.UsePool = config.GetBool("development.use_pool")
 	}
 
+	// Read persist_program_cache setting (try tuning.*, fallback to development.*)
+	if config.IsSet("tuning.persist_program_cache") {
+		persistProgramCache = config.GetBool("tuning.persist_program_cache")
+	} else if config.IsSet("development.persist_program_cache") {
+		persistProgramCache = config.GetBool("development.persist_program_cache")
+	}
+
 	return nil
 }
 
@@ -610,6 +618,11 @@ func runVerifyRange(c *cobra.Command, args []string) {
 
 	mlog.Log.Infof("initializing caches")
 	accountsDb.InitCaches()
+	if persistProgramCache {
+		if err := accountsDb.LoadProgramCache(); err != nil {
+			mlog.Log.Infof("warning: failed to load program cache: %v", err)
+		}
+	}
 
 	metricsWriter, metricsWriterCleanup, err := createBufWriter(metricsPath)
 	if err != nil {
@@ -638,6 +651,11 @@ func runVerifyRange(c *cobra.Command, args []string) {
 
 	replay.ReplayBlocks(ctx, accountsDb, accountsDbDir, manifest, uint64(startSlot), uint64(endSlot), rpcEndpoints[0], ledgerPath, int(txParallelism), false, false, dbgOpts, metricsWriter, rpcServer)
 	mlog.Log.Infof("done replaying, closing DB")
+	if persistProgramCache {
+		if err := accountsDb.SaveProgramCache(); err != nil {
+			mlog.Log.Infof("warning: failed to save program cache: %v", err)
+		}
+	}
 	accountsDb.CloseDb()
 }
 
@@ -781,6 +799,11 @@ func runLive(c *cobra.Command, args []string) {
 
 	mlog.Log.Infof("initializing caches")
 	accountsDb.InitCaches()
+	if persistProgramCache {
+		if err := accountsDb.LoadProgramCache(); err != nil {
+			mlog.Log.Infof("warning: failed to load program cache: %v", err)
+		}
+	}
 
 	metricsWriter, metricsWriterCleanup, err := createBufWriter(metricsPath)
 	if err != nil {
@@ -809,6 +832,11 @@ func runLive(c *cobra.Command, args []string) {
 
 	replay.ReplayBlocks(ctx, accountsDb, accountsPath, manifest, uint64(startSlot), liveEndSlot, rpcEndpoints[0], ledgerPath, int(txParallelism), true, useOvercast, dbgOpts, metricsWriter, rpcServer)
 	mlog.Log.Infof("done replaying, closing DB")
+	if persistProgramCache {
+		if err := accountsDb.SaveProgramCache(); err != nil {
+			mlog.Log.Infof("warning: failed to save program cache: %v", err)
+		}
+	}
 	accountsDb.CloseDb()
 }
 
