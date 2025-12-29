@@ -99,7 +99,10 @@ var (
 
 	paramArenaSizeMB         uint64
 	borrowedAccountArenaSize uint64
-	persistProgramCache      bool
+	persistProgramCache      bool = true
+	voteCacheSize            int
+	programCacheSize         int
+	commonCacheSize          int
 
 	rpcPort int
 )
@@ -129,6 +132,9 @@ func init() {
 	VerifyRange.Flags().IntVar(&snapshot.ZstdDecoderConcurrency, "zstd-decoder-concurrency", runtime.NumCPU(), "Zstd decoder concurrency")
 	VerifyRange.Flags().IntVar(&snapshot.MaxConcurrentFlushers, "max-concurrent-flushers", 16, "Bound for number of log shards to flush to Accounts DB Index at once.")
 	VerifyRange.Flags().BoolVar(&sbpf.UsePool, "use-pool", true, "Disable to allocate fresh slices")
+	VerifyRange.Flags().IntVar(&voteCacheSize, "vote-cache-size", 2000, "Max vote accounts to cache")
+	VerifyRange.Flags().IntVar(&programCacheSize, "program-cache-size", 5000, "Max compiled programs to cache")
+	VerifyRange.Flags().IntVar(&commonCacheSize, "common-cache-size", 10000, "Max common accounts to cache")
 
 	// [tuning.pprof] section flags
 	VerifyRange.Flags().Int64Var(&pprofPort, "pprof-port", -1, "Port to serve HTTP pprof endpoint")
@@ -165,6 +171,9 @@ func init() {
 	Run.Flags().IntVar(&snapshot.ZstdDecoderConcurrency, "zstd-decoder-concurrency", runtime.NumCPU(), "Zstd decoder concurrency")
 	Run.Flags().IntVar(&snapshot.MaxConcurrentFlushers, "max-concurrent-flushers", 16, "Bound for number of log shards to flush to Accounts DB Index at once.")
 	Run.Flags().BoolVar(&sbpf.UsePool, "use-pool", true, "Disable to allocate fresh slices")
+	Run.Flags().IntVar(&voteCacheSize, "vote-cache-size", 2000, "Max vote accounts to cache")
+	Run.Flags().IntVar(&programCacheSize, "program-cache-size", 5000, "Max compiled programs to cache")
+	Run.Flags().IntVar(&commonCacheSize, "common-cache-size", 10000, "Max common accounts to cache")
 
 	// [tuning.pprof] section flags
 	Run.Flags().StringVar(&cpuprofPath, "cpu-profile-path", "", "Filename to write CPU profile")
@@ -422,6 +431,29 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		persistProgramCache = config.GetBool("development.persist_program_cache")
 	}
 
+	// Read cache size settings (CLI flags take precedence, then tuning.*, then development.*)
+	if !flagChanged("vote-cache-size") {
+		if config.IsSet("tuning.vote_cache_size") {
+			voteCacheSize = config.GetInt("tuning.vote_cache_size")
+		} else if config.IsSet("development.vote_cache_size") {
+			voteCacheSize = config.GetInt("development.vote_cache_size")
+		}
+	}
+	if !flagChanged("program-cache-size") {
+		if config.IsSet("tuning.program_cache_size") {
+			programCacheSize = config.GetInt("tuning.program_cache_size")
+		} else if config.IsSet("development.program_cache_size") {
+			programCacheSize = config.GetInt("development.program_cache_size")
+		}
+	}
+	if !flagChanged("common-cache-size") {
+		if config.IsSet("tuning.common_cache_size") {
+			commonCacheSize = config.GetInt("tuning.common_cache_size")
+		} else if config.IsSet("development.common_cache_size") {
+			commonCacheSize = config.GetInt("development.common_cache_size")
+		}
+	}
+
 	return nil
 }
 
@@ -617,7 +649,11 @@ func runVerifyRange(c *cobra.Command, args []string) {
 	mlog.Log.Infof("will replay startSlot=%d endSlot=%d", startSlot, endSlot)
 
 	mlog.Log.Infof("initializing caches")
-	accountsDb.InitCaches()
+	accountsDb.InitCachesWithConfig(accountsdb.CacheConfig{
+		VoteCacheSize:    voteCacheSize,
+		ProgramCacheSize: programCacheSize,
+		CommonCacheSize:  commonCacheSize,
+	})
 	if persistProgramCache {
 		if err := accountsDb.LoadProgramCache(); err != nil {
 			mlog.Log.Infof("warning: failed to load program cache: %v", err)
@@ -798,7 +834,11 @@ func runLive(c *cobra.Command, args []string) {
 	mlog.Log.Infof("starting replay from slot %d", startSlot)
 
 	mlog.Log.Infof("initializing caches")
-	accountsDb.InitCaches()
+	accountsDb.InitCachesWithConfig(accountsdb.CacheConfig{
+		VoteCacheSize:    voteCacheSize,
+		ProgramCacheSize: programCacheSize,
+		CommonCacheSize:  commonCacheSize,
+	})
 	if persistProgramCache {
 		if err := accountsDb.LoadProgramCache(); err != nil {
 			mlog.Log.Infof("warning: failed to load program cache: %v", err)

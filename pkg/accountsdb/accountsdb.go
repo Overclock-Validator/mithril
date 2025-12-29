@@ -14,7 +14,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/sbpf"
 	"github.com/gagliardetto/solana-go"
-	"github.com/maypok86/otter"
+	"github.com/maypok86/otter/v2"
 )
 
 type AccountsDb struct {
@@ -23,9 +23,9 @@ type AccountsDb struct {
 	AcctsDir         string
 	LargestFileId    atomic.Uint64
 	BankHashBytes    [32]byte
-	VoteAcctCache    otter.Cache[solana.PublicKey, *accounts.Account]
-	CommonAcctsCache otter.Cache[solana.PublicKey, *accounts.Account]
-	ProgramCache     otter.Cache[solana.PublicKey, *ProgramCacheEntry]
+	VoteAcctCache    *otter.Cache[solana.PublicKey, *accounts.Account]
+	CommonAcctsCache *otter.Cache[solana.PublicKey, *accounts.Account]
+	ProgramCache     *otter.Cache[solana.PublicKey, *ProgramCacheEntry]
 }
 
 var (
@@ -114,34 +114,41 @@ func (accountsDb *AccountsDb) CloseDb() {
 	accountsDb.Index.Close()
 }
 
+// CacheConfig holds configuration for all in-memory caches
+type CacheConfig struct {
+	VoteCacheSize    int // Number of vote accounts to cache (default: 2000)
+	ProgramCacheSize int // Number of compiled programs to cache (default: 5000)
+	CommonCacheSize  int // Number of common accounts to cache (default: 10000)
+}
+
+// DefaultCacheConfig returns sensible defaults for cache sizes
+func DefaultCacheConfig() CacheConfig {
+	return CacheConfig{
+		VoteCacheSize:    2000,
+		ProgramCacheSize: 5000,
+		CommonCacheSize:  10000,
+	}
+}
+
 func (accountsDb *AccountsDb) InitCaches() {
-	var err error
-	accountsDb.VoteAcctCache, err = otter.MustBuilder[solana.PublicKey, *accounts.Account](2000).
-		Cost(func(key solana.PublicKey, acct *accounts.Account) uint32 {
-			return 1
-		}).
-		Build()
-	if err != nil {
-		panic(err)
-	}
+	accountsDb.InitCachesWithConfig(DefaultCacheConfig())
+}
 
-	accountsDb.ProgramCache, err = otter.MustBuilder[solana.PublicKey, *ProgramCacheEntry](5000).
-		Cost(func(key solana.PublicKey, progEntry *ProgramCacheEntry) uint32 {
-			return 1
-		}).
-		Build()
-	if err != nil {
-		panic(err)
-	}
+func (accountsDb *AccountsDb) InitCachesWithConfig(cfg CacheConfig) {
+	// Vote account cache - count-based eviction using otter v2 MaximumSize
+	accountsDb.VoteAcctCache = otter.Must(&otter.Options[solana.PublicKey, *accounts.Account]{
+		MaximumSize: cfg.VoteCacheSize,
+	})
 
-	accountsDb.CommonAcctsCache, err = otter.MustBuilder[solana.PublicKey, *accounts.Account](10000).
-		Cost(func(key solana.PublicKey, acct *accounts.Account) uint32 {
-			return 1
-		}).
-		Build()
-	if err != nil {
-		panic(err)
-	}
+	// Program cache - count-based eviction for compiled SBPF programs
+	accountsDb.ProgramCache = otter.Must(&otter.Options[solana.PublicKey, *ProgramCacheEntry]{
+		MaximumSize: cfg.ProgramCacheSize,
+	})
+
+	// Common accounts cache - count-based eviction
+	accountsDb.CommonAcctsCache = otter.Must(&otter.Options[solana.PublicKey, *accounts.Account]{
+		MaximumSize: cfg.CommonCacheSize,
+	})
 }
 
 type ProgramCacheEntry struct {
@@ -150,7 +157,7 @@ type ProgramCacheEntry struct {
 }
 
 func (accountsDb *AccountsDb) MaybeGetProgramFromCache(pubkey solana.PublicKey) (*ProgramCacheEntry, bool) {
-	return accountsDb.ProgramCache.Get(pubkey)
+	return accountsDb.ProgramCache.GetIfPresent(pubkey)
 }
 
 func (accountsDb *AccountsDb) AddProgramToCache(pubkey solana.PublicKey, programEntry *ProgramCacheEntry) {
@@ -158,16 +165,16 @@ func (accountsDb *AccountsDb) AddProgramToCache(pubkey solana.PublicKey, program
 }
 
 func (accountsDb *AccountsDb) RemoveProgramFromCache(pubkey solana.PublicKey) {
-	accountsDb.ProgramCache.Delete(pubkey)
+	accountsDb.ProgramCache.Invalidate(pubkey)
 }
 
 func (accountsDb *AccountsDb) GetAccount(slot uint64, pubkey solana.PublicKey) (*accounts.Account, error) {
-	cachedAcct, hasAcct := accountsDb.VoteAcctCache.Get(pubkey)
+	cachedAcct, hasAcct := accountsDb.VoteAcctCache.GetIfPresent(pubkey)
 	if hasAcct {
 		return cachedAcct, nil
 	}
 
-	cachedAcct, hasAcct = accountsDb.CommonAcctsCache.Get(pubkey)
+	cachedAcct, hasAcct = accountsDb.CommonAcctsCache.GetIfPresent(pubkey)
 	if hasAcct {
 		return cachedAcct, nil
 	}

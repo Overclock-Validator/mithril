@@ -86,18 +86,14 @@ func fromSerializable(entry SerializableProgramCacheEntry) *ProgramCacheEntry {
 func (accountsDb *AccountsDb) SaveProgramCache() error {
 	cacheFile := filepath.Join(filepath.Dir(accountsDb.AcctsDir), programCacheFilename)
 
-	// Collect all entries from the otter cache
+	// Collect all entries from the otter cache using v2's All() iterator
 	cache := SerializableProgramCache{
 		Entries: make(map[solana.PublicKey]SerializableProgramCacheEntry),
 	}
 
-	// Iterate over the cache - otter doesn't have a Range method,
-	// so we need to track keys separately or use a different approach
-	// For now, we'll save what we can access
-	accountsDb.ProgramCache.Range(func(key solana.PublicKey, entry *ProgramCacheEntry) bool {
+	for key, entry := range accountsDb.ProgramCache.All() {
 		cache.Entries[key] = toSerializable(entry)
-		return true
-	})
+	}
 
 	if len(cache.Entries) == 0 {
 		mlog.Log.Debugf("program cache is empty, skipping save")

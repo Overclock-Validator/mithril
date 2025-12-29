@@ -45,12 +45,15 @@ type DebugConfig struct {
 
 // DevelopmentConfig holds development/tuning configuration (matches Firedancer [development] section)
 type DevelopmentConfig struct {
-	ZstdDecoderConcurrency   int         `toml:"zstd_decoder_concurrency" mapstructure:"zstd_decoder_concurrency"`     // was: zstd-decoder-concurrency
-	MaxConcurrentFlushers    int         `toml:"max_concurrent_flushers" mapstructure:"max_concurrent_flushers"`       // was: max-concurrent-flushers
-	ParamArenaSizeMB         uint64      `toml:"param_arena_size_mb" mapstructure:"param_arena_size_mb"`               // was: param-arena-size-mb
+	ZstdDecoderConcurrency   int         `toml:"zstd_decoder_concurrency" mapstructure:"zstd_decoder_concurrency"`       // was: zstd-decoder-concurrency
+	MaxConcurrentFlushers    int         `toml:"max_concurrent_flushers" mapstructure:"max_concurrent_flushers"`         // was: max-concurrent-flushers
+	ParamArenaSizeMB         uint64      `toml:"param_arena_size_mb" mapstructure:"param_arena_size_mb"`                 // was: param-arena-size-mb
 	BorrowedAccountArenaSize uint64      `toml:"borrowed_account_arena_size" mapstructure:"borrowed_account_arena_size"` // was: borrowed-account-arena-size
-	UsePool                  bool        `toml:"use_pool" mapstructure:"use_pool"`                                     // was: use-pool
-	PersistProgramCache      bool        `toml:"persist_program_cache" mapstructure:"persist_program_cache"`           // Persist compiled program cache across restarts
+	UsePool                  bool        `toml:"use_pool" mapstructure:"use_pool"`                                       // was: use-pool
+	PersistProgramCache      bool        `toml:"persist_program_cache" mapstructure:"persist_program_cache"`             // Persist compiled program cache across restarts
+	VoteCacheSize            int         `toml:"vote_cache_size" mapstructure:"vote_cache_size"`                         // Max vote accounts to cache (default: 2000)
+	ProgramCacheSize         int         `toml:"program_cache_size" mapstructure:"program_cache_size"`                   // Max compiled programs to cache (default: 5000)
+	CommonCacheSize          int         `toml:"common_cache_size" mapstructure:"common_cache_size"`                     // Max common accounts to cache (default: 10000)
 	Pprof                    PprofConfig `toml:"pprof" mapstructure:"pprof"`
 	Debug                    DebugConfig `toml:"debug" mapstructure:"debug"`
 }

@@ -171,7 +171,23 @@ name = "mithril"
     # Persist compiled program cache across restarts
     # When enabled, compiled SBPF programs are saved to disk on shutdown
     # and reloaded on startup, speeding up replay warmup.
-    persist_program_cache = false
+    persist_program_cache = true
+
+    # -------------------------------------------------------------------------
+    # In-Memory Cache Sizes
+    # -------------------------------------------------------------------------
+    # These caches speed up block replay by avoiding repeated disk reads
+    # and program compilation. Uses otter's S3-FIFO eviction algorithm.
+
+    # Max vote accounts to cache (there are ~600 validators currently)
+    vote_cache_size = 2000
+
+    # Max compiled SBPF programs to cache
+    # The hot set is ~100-200 programs (DEXes, token program, etc.)
+    program_cache_size = 5000
+
+    # Max common (non-vote) accounts to cache
+    common_cache_size = 10000
 
     # [tuning.pprof] - CPU/Memory Profiling
     [tuning.pprof]
