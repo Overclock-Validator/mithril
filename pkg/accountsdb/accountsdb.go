@@ -117,7 +117,7 @@ func (accountsDb *AccountsDb) CloseDb() {
 // CacheConfig holds configuration for all in-memory caches
 type CacheConfig struct {
 	VoteCacheSize    int // Number of vote accounts to cache (default: 2000)
-	ProgramCacheSize int // Number of compiled programs to cache (default: 5000)
+	ProgramCacheSize int // Number of compiled programs to cache (default: 3000)
 	CommonCacheSize  int // Number of common accounts to cache (default: 10000)
 }
 
@@ -125,7 +125,7 @@ type CacheConfig struct {
 func DefaultCacheConfig() CacheConfig {
 	return CacheConfig{
 		VoteCacheSize:    2000,
-		ProgramCacheSize: 5000,
+		ProgramCacheSize: 3000,
 		CommonCacheSize:  10000,
 	}
 }
