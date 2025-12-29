@@ -32,7 +32,8 @@ type SerializableProgramCacheEntry struct {
 
 // SerializableProgramCache holds all cache entries for serialization
 type SerializableProgramCache struct {
-	Entries map[solana.PublicKey]SerializableProgramCacheEntry
+	SnapshotSlot uint64 // The snapshot slot this cache was built from
+	Entries      map[solana.PublicKey]SerializableProgramCacheEntry
 }
 
 func init() {
@@ -83,12 +84,13 @@ func fromSerializable(entry SerializableProgramCacheEntry) *ProgramCacheEntry {
 }
 
 // SaveProgramCache saves the program cache to disk
-func (accountsDb *AccountsDb) SaveProgramCache() error {
+func (accountsDb *AccountsDb) SaveProgramCache(snapshotSlot uint64) error {
 	cacheFile := filepath.Join(filepath.Dir(accountsDb.AcctsDir), programCacheFilename)
 
 	// Collect all entries from the otter cache using v2's All() iterator
 	cache := SerializableProgramCache{
-		Entries: make(map[solana.PublicKey]SerializableProgramCacheEntry),
+		SnapshotSlot: snapshotSlot,
+		Entries:      make(map[solana.PublicKey]SerializableProgramCacheEntry),
 	}
 
 	for key, entry := range accountsDb.ProgramCache.All() {
@@ -115,8 +117,10 @@ func (accountsDb *AccountsDb) SaveProgramCache() error {
 	return nil
 }
 
-// LoadProgramCache loads the program cache from disk
-func (accountsDb *AccountsDb) LoadProgramCache() error {
+// LoadProgramCache loads the program cache from disk.
+// expectedSnapshotSlot is the snapshot slot the current AccountsDB was built from.
+// If the cache was built from a different snapshot, it will be discarded.
+func (accountsDb *AccountsDb) LoadProgramCache(expectedSnapshotSlot uint64) error {
 	cacheFile := filepath.Join(filepath.Dir(accountsDb.AcctsDir), programCacheFilename)
 
 	file, err := os.Open(cacheFile)
@@ -133,6 +137,13 @@ func (accountsDb *AccountsDb) LoadProgramCache() error {
 	decoder := gob.NewDecoder(file)
 	if err := decoder.Decode(&cache); err != nil {
 		mlog.Log.Infof("failed to decode program cache (may be from incompatible version), starting fresh: %v", err)
+		return nil
+	}
+
+	// Validate that the cache was built from the same snapshot
+	if cache.SnapshotSlot != 0 && cache.SnapshotSlot != expectedSnapshotSlot {
+		mlog.Log.Infof("program cache was built from snapshot slot %d, but current AccountsDB is from slot %d; discarding cache",
+			cache.SnapshotSlot, expectedSnapshotSlot)
 		return nil
 	}
 

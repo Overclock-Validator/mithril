@@ -655,7 +655,7 @@ func runVerifyRange(c *cobra.Command, args []string) {
 		CommonCacheSize:  commonCacheSize,
 	})
 	if persistProgramCache {
-		if err := accountsDb.LoadProgramCache(); err != nil {
+		if err := accountsDb.LoadProgramCache(manifest.Bank.Slot); err != nil {
 			mlog.Log.Infof("warning: failed to load program cache: %v", err)
 		}
 	}
@@ -688,7 +688,7 @@ func runVerifyRange(c *cobra.Command, args []string) {
 	replay.ReplayBlocks(ctx, accountsDb, accountsDbDir, manifest, uint64(startSlot), uint64(endSlot), rpcEndpoints[0], ledgerPath, int(txParallelism), false, false, dbgOpts, metricsWriter, rpcServer)
 	mlog.Log.Infof("done replaying, closing DB")
 	if persistProgramCache {
-		if err := accountsDb.SaveProgramCache(); err != nil {
+		if err := accountsDb.SaveProgramCache(manifest.Bank.Slot); err != nil {
 			mlog.Log.Infof("warning: failed to save program cache: %v", err)
 		}
 	}
@@ -840,7 +840,7 @@ func runLive(c *cobra.Command, args []string) {
 		CommonCacheSize:  commonCacheSize,
 	})
 	if persistProgramCache {
-		if err := accountsDb.LoadProgramCache(); err != nil {
+		if err := accountsDb.LoadProgramCache(manifest.Bank.Slot); err != nil {
 			mlog.Log.Infof("warning: failed to load program cache: %v", err)
 		}
 	}
@@ -873,7 +873,7 @@ func runLive(c *cobra.Command, args []string) {
 	replay.ReplayBlocks(ctx, accountsDb, accountsPath, manifest, uint64(startSlot), liveEndSlot, rpcEndpoints[0], ledgerPath, int(txParallelism), true, useOvercast, dbgOpts, metricsWriter, rpcServer)
 	mlog.Log.Infof("done replaying, closing DB")
 	if persistProgramCache {
-		if err := accountsDb.SaveProgramCache(); err != nil {
+		if err := accountsDb.SaveProgramCache(manifest.Bank.Slot); err != nil {
 			mlog.Log.Infof("warning: failed to save program cache: %v", err)
 		}
 	}
