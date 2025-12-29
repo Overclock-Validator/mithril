@@ -42,6 +42,7 @@ func CleanAccountsDbDir(accountsDbDir string) {
 		"largest_file_id",
 		"bank_hash",
 		"manifest",
+		"program_cache.gob", // Persistent program cache
 	}
 	for _, artifact := range artifacts {
 		path := filepath.Join(accountsDbDir, artifact)
