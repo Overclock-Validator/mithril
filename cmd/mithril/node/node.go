@@ -648,7 +648,7 @@ func runVerifyRange(c *cobra.Command, args []string) {
 	}
 	mlog.Log.Infof("will replay startSlot=%d endSlot=%d", startSlot, endSlot)
 
-	mlog.Log.Infof("initializing caches")
+	mlog.Log.Infof("initializing caches (program cache persistence: %v)", persistProgramCache)
 	accountsDb.InitCachesWithConfig(accountsdb.CacheConfig{
 		VoteCacheSize:    voteCacheSize,
 		ProgramCacheSize: programCacheSize,
@@ -833,7 +833,7 @@ func runLive(c *cobra.Command, args []string) {
 
 	mlog.Log.Infof("starting replay from slot %d", startSlot)
 
-	mlog.Log.Infof("initializing caches")
+	mlog.Log.Infof("initializing caches (program cache persistence: %v)", persistProgramCache)
 	accountsDb.InitCachesWithConfig(accountsdb.CacheConfig{
 		VoteCacheSize:    voteCacheSize,
 		ProgramCacheSize: programCacheSize,
