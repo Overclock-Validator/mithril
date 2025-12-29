@@ -25,12 +25,23 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// fmtDuration formats a duration to 3 decimal places in the most appropriate unit
+// fmtDuration formats a duration in a human-readable format (e.g., "19m30s")
 func fmtDuration(d time.Duration) string {
 	if d < time.Second {
 		return fmt.Sprintf("%.3fms", float64(d.Microseconds())/1000)
 	}
-	return fmt.Sprintf("%.3fs", d.Seconds())
+	if d < time.Minute {
+		return fmt.Sprintf("%.1fs", d.Seconds())
+	}
+	if d < time.Hour {
+		mins := int(d.Minutes())
+		secs := int(d.Seconds()) % 60
+		return fmt.Sprintf("%dm%ds", mins, secs)
+	}
+	hours := int(d.Hours())
+	mins := int(d.Minutes()) % 60
+	secs := int(d.Seconds()) % 60
+	return fmt.Sprintf("%dh%dm%ds", hours, mins, secs)
 }
 
 func BuildAccountsDbWithIncr(
