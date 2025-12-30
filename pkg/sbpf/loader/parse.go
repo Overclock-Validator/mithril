@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"debug/elf"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -291,26 +292,63 @@ func (l *Loader) readSectionHeaderTable() error {
 	return iter.Err()
 }
 
+// Query a single string from a section which is marked as SHT_STRTAB
+//
+// See https://github.com/anza-xyz/sbpf/blob/main/src/elf_parser/mod.rs#L468
 func (l *Loader) getString(strtab *elf.Section64, stroff uint32, maxLen uint16) (string, error) {
 	if elf.SectionType(strtab.Type) != elf.SHT_STRTAB {
-		return "", fmt.Errorf("invalid strtab")
+		return "", ErrInvalidSectionHeader
 	}
-	offset := strtab.Off + uint64(stroff)
-	if offset > l.fileSize || offset+uint64(maxLen) > l.fileSize {
-		return "", io.ErrUnexpectedEOF
+
+	offset, carry := bits.Add64(strtab.Off, uint64(stroff), 0)
+	if carry != 0 {
+		return "", ErrOutOfBounds
 	}
-	rd := bufio.NewReader(io.NewSectionReader(l.rd, int64(offset), int64(maxLen)))
+
+	sectionEnd, carry := bits.Add64(strtab.Off, strtab.Size, 0)
+	if carry != 0 {
+		return "", ErrOutOfBounds
+	}
+
+	maxEnd, carry := bits.Add64(offset, uint64(maxLen), 0)
+	if carry != 0 {
+		return "", ErrOutOfBounds
+	}
+
+	if sectionEnd < maxEnd {
+		maxEnd = sectionEnd
+	}
+
+	if offset > l.fileSize {
+		return "", ErrOutOfBounds
+	}
+
+	readLen := maxEnd - offset
+	if maxEnd > l.fileSize {
+		readLen = l.fileSize - offset
+	}
+	if readLen == 0 {
+		return "", ErrOutOfBounds
+	}
+
+	rd := bufio.NewReader(io.NewSectionReader(l.rd, int64(offset), int64(readLen)))
 	var builder strings.Builder
 	for {
 		b, err := rd.ReadByte()
 		if err != nil {
-			return "", err
+			switch {
+			case errors.Is(err, io.EOF):
+				return "", &ErrStringTooLong{Name: builder.String(), Len: readLen}
+			default:
+				return "", err
+			}
 		}
-		if b == 0 {
+		if b == 0x00 {
 			break
 		}
 		builder.WriteByte(b)
 	}
+
 	return builder.String(), nil
 }
 

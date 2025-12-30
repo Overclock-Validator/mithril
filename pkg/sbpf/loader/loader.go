@@ -17,6 +17,16 @@ import (
 )
 
 var ErrOutOfBounds = errors.New("value out of bounds")
+var ErrInvalidSectionHeader = errors.New("invalid section header")
+
+type ErrStringTooLong struct {
+	Name string
+	Len  uint64
+}
+
+func (e *ErrStringTooLong) Error() string {
+	return fmt.Sprintf("Section or symbol name `%s` is longer than `%d` bytes", e.Name, e.Len)
+}
 
 // TODO Fuzz
 // TODO Differential fuzz against rbpf
