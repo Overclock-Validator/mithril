@@ -3,6 +3,8 @@ package loader
 import (
 	"debug/elf"
 	"testing"
+
+	"github.com/Overclock-Validator/mithril/pkg/sbpf"
 )
 
 func TestLoader_getString(t *testing.T) {
@@ -28,7 +30,7 @@ func TestLoader_getString(t *testing.T) {
 			stroff:  0,
 			maxLen:  16,
 			want:    "",
-			wantErr: ErrInvalidSectionHeader,
+			wantErr: sbpf.ErrInvalidSectionHeader,
 		},
 		"out of bounds": {
 			buf:     []byte(".text\x00"),
@@ -36,7 +38,7 @@ func TestLoader_getString(t *testing.T) {
 			stroff:  0,
 			maxLen:  16,
 			want:    "",
-			wantErr: ErrOutOfBounds,
+			wantErr: sbpf.ErrOutOfBounds,
 		},
 		"section header too long": {
 			buf:     []byte(".data.rel.ro\x00"),
@@ -44,7 +46,7 @@ func TestLoader_getString(t *testing.T) {
 			stroff:  0,
 			maxLen:  16,
 			want:    "",
-			wantErr: &ErrStringTooLong{Name: ".data.", Len: 6},
+			wantErr: &sbpf.ErrStringTooLong{Name: ".data.", Len: 6},
 		},
 	}
 	for name, tt := range tests {

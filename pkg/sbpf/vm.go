@@ -1,7 +1,6 @@
 package sbpf
 
 import (
-	"errors"
 	"fmt"
 
 	"github.com/Overclock-Validator/mithril/pkg/cu"
@@ -67,17 +66,6 @@ func (e *Exception) Error() string {
 func (e *Exception) Unwrap() error {
 	return e.Detail
 }
-
-// Exception codes.
-var (
-	ExcDivideByZero   = errors.New("divide by zero at BPF instruction")
-	ExcDivideOverflow = errors.New("divide overflow")
-	ExcOutOfCU        = errors.New("compute unit overrun")
-	ExcCallDepth      = errors.New("call depth exceeded")
-	ExcInvalidInstr   = errors.New("invalid instruction - feature not enabled")
-
-	ExcUnsupportedInstruction = errors.New("unsupported BPF instruction")
-)
 
 type ExcBadAccess struct {
 	Addr   uint64

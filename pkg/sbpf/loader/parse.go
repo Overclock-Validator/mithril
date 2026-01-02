@@ -11,6 +11,7 @@ import (
 	"math/bits"
 	"strings"
 
+	"github.com/Overclock-Validator/mithril/pkg/sbpf"
 	"github.com/Overclock-Validator/mithril/pkg/sbpf/sbpfver"
 )
 
@@ -91,7 +92,7 @@ func (l *Loader) newSymTableIter(sh *elf.Section64) (*symTableIter, error) {
 
 func (l *Loader) readHeader() error {
 	if l.fileSize < ehLen {
-		return ErrOutOfBounds
+		return sbpf.ErrOutOfBounds
 	}
 
 	var hdrBuf [ehLen]byte
@@ -297,22 +298,22 @@ func (l *Loader) readSectionHeaderTable() error {
 // See https://github.com/anza-xyz/sbpf/blob/main/src/elf_parser/mod.rs#L468
 func (l *Loader) getString(strtab *elf.Section64, stroff uint32, maxLen uint16) (string, error) {
 	if elf.SectionType(strtab.Type) != elf.SHT_STRTAB {
-		return "", ErrInvalidSectionHeader
+		return "", sbpf.ErrInvalidSectionHeader
 	}
 
 	offset, carry := bits.Add64(strtab.Off, uint64(stroff), 0)
 	if carry != 0 {
-		return "", ErrOutOfBounds
+		return "", sbpf.ErrOutOfBounds
 	}
 
 	sectionEnd, carry := bits.Add64(strtab.Off, strtab.Size, 0)
 	if carry != 0 {
-		return "", ErrOutOfBounds
+		return "", sbpf.ErrOutOfBounds
 	}
 
 	maxEnd, carry := bits.Add64(offset, uint64(maxLen), 0)
 	if carry != 0 {
-		return "", ErrOutOfBounds
+		return "", sbpf.ErrOutOfBounds
 	}
 
 	if sectionEnd < maxEnd {
@@ -320,7 +321,7 @@ func (l *Loader) getString(strtab *elf.Section64, stroff uint32, maxLen uint16) 
 	}
 
 	if offset > l.fileSize {
-		return "", ErrOutOfBounds
+		return "", sbpf.ErrOutOfBounds
 	}
 
 	readLen := maxEnd - offset
@@ -328,7 +329,7 @@ func (l *Loader) getString(strtab *elf.Section64, stroff uint32, maxLen uint16) 
 		readLen = l.fileSize - offset
 	}
 	if readLen == 0 {
-		return "", ErrOutOfBounds
+		return "", sbpf.ErrOutOfBounds
 	}
 
 	rd := bufio.NewReader(io.NewSectionReader(l.rd, int64(offset), int64(readLen)))
@@ -338,7 +339,7 @@ func (l *Loader) getString(strtab *elf.Section64, stroff uint32, maxLen uint16) 
 		if err != nil {
 			switch {
 			case errors.Is(err, io.EOF):
-				return "", &ErrStringTooLong{Name: builder.String(), Len: readLen}
+				return "", &sbpf.ErrStringTooLong{Name: builder.String(), Len: readLen}
 			default:
 				return "", err
 			}

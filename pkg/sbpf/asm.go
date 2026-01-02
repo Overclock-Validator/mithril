@@ -148,15 +148,15 @@ func (ip *Interpreter) disassemble(slot Slot, slot2 Slot) string {
 	case OpLe, OpBe:
 		return fmt.Sprintf("%s%d r%d", mnemonic, slot.Uimm(), slot.Dst())
 	case OpJa:
-		return fmt.Sprintf("ja")
+		return "ja"
 	case OpJeqImm, OpJgtImm, OpJgeImm, OpJltImm, OpJleImm, OpJsetImm, OpJneImm, OpJsgtImm, OpJsgeImm, OpJsltImm, OpJsleImm:
 		return fmt.Sprintf("%s r%d, %d", mnemonic, slot.Dst(), int64(slot.Imm()))
 	case OpJeqReg, OpJgtReg, OpJgeReg, OpJltReg, OpJleReg, OpJsetReg, OpJneReg, OpJsgtReg, OpJsgeReg, OpJsltReg, OpJsleReg:
 		return fmt.Sprintf("%s r%d, r%d", mnemonic, slot.Dst(), slot.Src())
 	case OpCall:
-		return fmt.Sprintf("call")
+		return "call"
 	case OpCallx:
-		return fmt.Sprintf("callx")
+		return "callx"
 	case OpExit:
 		return "exit"
 	default:
