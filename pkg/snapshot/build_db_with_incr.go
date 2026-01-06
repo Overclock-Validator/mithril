@@ -11,12 +11,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Overclock-Validator/fastcache"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/progress"
 	"github.com/Overclock-Validator/mithril/pkg/rpcclient"
 	"github.com/Overclock-Validator/mithril/pkg/snapshotdl"
+	"github.com/cockroachdb/pebble"
 	"github.com/panjf2000/ants/v2"
 	"k8s.io/klog/v2"
 )
@@ -226,18 +226,13 @@ func BuildAccountsDbWithIncr(
 
 	accountsDb := &accountsdb.AccountsDb{Index: index, AcctsDir: appendVecsOutputDir}
 	accountsDb.LargestFileId.Store(largestFileId.Load())
-	copy(accountsDb.BankHashBytes[:], manifest.Bank.Hash[:])
 
-	bankHashDbFn := fmt.Sprintf("%s/bankhash_db", accountsDbDir)
-	accountsDb.BankHashStore, err = fastcache.NewCache(fastcache.MB*128, &fastcache.Config{
-		Shards: 256,
-		//MaxElementLen: 2000000000,
-		MemoryType: fastcache.MMAP,
-		MemoryKey:  bankHashDbFn,
-	})
+	bankhashDir := filepath.Join(accountsDbDir, "bankhash_db")
+	bankhashDb, err := pebble.Open(bankhashDir, &pebble.Options{})
 	if err != nil {
-		panic(err)
+		return nil, nil, fmt.Errorf("opening bankhashDir=%s: %w", bankhashDir, err)
 	}
+	accountsDb.BankHashStore = bankhashDb
 
 	rpcClient := rpcclient.NewRpcClient(rpcEndpoints[0])
 	latestSlot, err := rpcClient.GetSlot()

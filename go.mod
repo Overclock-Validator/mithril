@@ -9,7 +9,6 @@ replace github.com/gagliardetto/solana-go => github.com/palmerlao/solana-go v0.0
 replace github.com/gagliardetto/binary => github.com/palmerlao/binary v0.0.0-20250617062159-3054b4d33aed
 
 require (
-	github.com/Overclock-Validator/fastcache v0.0.0-20250516085958-ebf01de4f1f5
 	github.com/VividCortex/ewma v1.2.0
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/charmbracelet/bubbles v0.21.0
@@ -64,7 +63,6 @@ require (
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/prometheus/common v0.67.4 // indirect
 	github.com/rogpeppe/go-internal v1.12.0 // indirect
-	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	github.com/zeebo/assert v1.3.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.3 // indirect
@@ -78,13 +76,11 @@ require (
 	github.com/Overclock-Validator/weightedrand v0.0.0-20251113203832-5ac028321d0a
 	github.com/aead/chacha20 v0.0.0-20180709150244-8b13a72661da // indirect
 	github.com/bits-and-blooms/bitset v1.22.0 // indirect
-	github.com/cespare/xxhash v1.1.0
 	github.com/consensys/bavard v0.1.31-0.20250406004941-2db259e4b582 // indirect
 	github.com/dchest/blake2b v1.0.0 // indirect
 	github.com/decred/dcrd/crypto/blake256 v1.0.1 // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.0.1 // indirect
 	github.com/dolthub/maphash v0.1.0 // indirect
-	github.com/edsrzf/mmap-go v1.1.0 // indirect
 	github.com/fsnotify/fsnotify v1.7.0 // indirect
 	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
 	github.com/google/uuid v1.6.0 // indirect
@@ -92,7 +88,6 @@ require (
 	github.com/hashicorp/hcl v1.0.0 // indirect
 	github.com/holiman/uint256 v1.3.2 // indirect
 	github.com/ipfs/go-log/v2 v2.5.1 // indirect
-	github.com/leslie-fei/memcore v0.0.0-20240611074219-2f13777e1d72 // indirect
 	github.com/magiconair/properties v1.8.7 // indirect
 	github.com/mimoo/StrobeGo v0.0.0-20181016162300-f8f6d4d2b643 // indirect
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
@@ -171,7 +166,7 @@ require (
 	go.uber.org/ratelimit v0.2.0 // indirect
 	go.uber.org/zap v1.24.0 // indirect
 	golang.org/x/crypto v0.43.0
-	golang.org/x/exp v0.0.0-20240904232852-e7e105dedf7e // indirect
+	golang.org/x/exp v0.0.0-20240904232852-e7e105dedf7e
 	golang.org/x/net v0.46.0 // indirect
 	golang.org/x/term v0.38.0
 	golang.org/x/time v0.9.0

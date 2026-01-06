@@ -14,7 +14,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Overclock-Validator/fastcache"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/progress"
@@ -40,7 +39,6 @@ func CleanAccountsDbDir(accountsDbDir string) {
 		"mithril_db_log_shards",
 		"bankhash_db",
 		"largest_file_id",
-		"bank_hash",
 		"manifest",
 		"mithril_state.json", // State file for tracking valid builds and replay progress
 	}
@@ -263,18 +261,13 @@ func BuildAccountsDb(
 
 	accountsDb := &accountsdb.AccountsDb{Index: index, AcctsDir: appendVecsOutputDir}
 	accountsDb.LargestFileId.Store(largestFileId.Load())
-	copy(accountsDb.BankHashBytes[:], manifest.Bank.Hash[:])
 
-	bankHashDbFn := fmt.Sprintf("%s/bankhash_db", accountsDbDir)
-	accountsDb.BankHashStore, err = fastcache.NewCache(fastcache.MB*128, &fastcache.Config{
-		Shards: 256,
-		//MaxElementLen: 2000000000,
-		MemoryType: fastcache.MMAP,
-		MemoryKey:  bankHashDbFn,
-	})
+	bankhashDir := filepath.Join(accountsDbDir, "bankhash_db")
+	bankhashDb, err := pebble.Open(bankhashDir, &pebble.Options{})
 	if err != nil {
-		panic(err)
+		return nil, nil, fmt.Errorf("opening bankhashDir=%s: %w", bankhashDir, err)
 	}
+	accountsDb.BankHashStore = bankhashDb
 
 	if incrementalManifest != nil {
 		return accountsDb, incrementalManifest, nil

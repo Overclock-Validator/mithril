@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"sync/atomic"
 
-	"github.com/Overclock-Validator/fastcache"
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
@@ -21,10 +20,9 @@ import (
 
 type AccountsDb struct {
 	Index            *pebble.DB
-	BankHashStore    fastcache.Cache
+	BankHashStore    *pebble.DB
 	AcctsDir         string
 	LargestFileId    atomic.Uint64
-	BankHashBytes    [32]byte
 	VoteAcctCache    otter.Cache[solana.PublicKey, *accounts.Account]
 	CommonAcctsCache otter.Cache[solana.PublicKey, *accounts.Account]
 	ProgramCache     otter.Cache[solana.PublicKey, *ProgramCacheEntry]
@@ -63,45 +61,20 @@ func OpenDb(accountsDbDir string) (*AccountsDb, error) {
 	largestFileId := binary.LittleEndian.Uint64(largestFileIdBytes)
 	mlog.Log.Infof("accountsdb.OpenDb: largestFileId=%d", largestFileId)
 
-	bankHashFn := fmt.Sprintf("%s/bank_hash", accountsDbDir)
-	bhf, err := os.Open(bankHashFn)
-	if err != nil {
-		mlog.Log.Infof("failed to open %s\n", bankHashFn)
-		return nil, err
-	}
-
-	bankHashBytes := make([]byte, 32)
-	bytesRead, err = bhf.Read(bankHashBytes)
-	if err != nil {
-		mlog.Log.Infof("error reading %s: %s\n", bankHashFn, err)
-		return nil, err
-	} else if bytesRead != 32 {
-		mlog.Log.Infof("error reading %s: expected 8 bytes, got %d\n", bankHashFn, bytesRead)
-		return nil, fmt.Errorf("only got %d bytes", bytesRead)
-	}
-	mlog.Log.Infof("accountsdb.OpenDb: bankHashBytes=%x", bankHashBytes)
-
 	indexDir := filepath.Join(accountsDbDir, "mithril_db")
 	db, err := pebble.Open(indexDir, &pebble.Options{})
 	if err != nil {
 		return nil, fmt.Errorf("opening indexDir=%s: %w", indexDir, err)
 	}
 
-	// attempt to open the index kv store
-	bankHashDbFn := fmt.Sprintf("%s/bankhash_db", accountsDbDir)
-	bankhashDb, err := fastcache.NewCache(fastcache.MB*128, &fastcache.Config{
-		Shards: 256,
-		//MaxElementLen: 2000000000,
-		MemoryType: fastcache.MMAP,
-		MemoryKey:  bankHashDbFn,
-	})
+	bankhashDir := filepath.Join(accountsDbDir, "bankhash_db")
+	bankhashDb, err := pebble.Open(bankhashDir, &pebble.Options{})
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("opening bankhashDir=%s: %w", bankhashDir, err)
 	}
 
 	accountsDb := &AccountsDb{Index: db, BankHashStore: bankhashDb, AcctsDir: appendVecsDir}
 	accountsDb.LargestFileId.Store(largestFileId)
-	copy(accountsDb.BankHashBytes[:], bankHashBytes)
 
 	return accountsDb, nil
 }
@@ -349,13 +322,20 @@ func (accountsDb *AccountsDb) storeAccountsInternal(accts []*accounts.Account, s
 func (accountsDb *AccountsDb) GetBankHashForSlot(slot uint64) ([]byte, error) {
 	var slotBytes [8]byte
 	binary.LittleEndian.PutUint64(slotBytes[:], slot)
-	return accountsDb.BankHashStore.Get(slotBytes[:])
+	bh, c, err := accountsDb.BankHashStore.Get(slotBytes[:])
+	if err != nil {
+		return nil, fmt.Errorf("GetBankHashForSlot slot=%d: %w", slot, err)
+	}
+	out := make([]byte, len(bh))
+	copy(out, bh)
+	c.Close()
+	return out, nil
 }
 
 func (accountsDb *AccountsDb) StoreBankHashForSlot(slot uint64, bankHash []byte) error {
 	var slotBytes [8]byte
 	binary.LittleEndian.PutUint64(slotBytes[:], slot)
-	return accountsDb.BankHashStore.Set(slotBytes[:], bankHash)
+	return accountsDb.BankHashStore.Set(slotBytes[:], bankHash, &pebble.WriteOptions{})
 }
 
 func (accountsDb *AccountsDb) KeysBetweenPrefixes(startPrefix uint64, endPrefix uint64) []solana.PublicKey {
@@ -373,8 +353,4 @@ func (accountsDb *AccountsDb) KeysBetweenPrefixes(startPrefix uint64, endPrefix 
 
 func (accountsDb *AccountsDb) AllKeys() [][]byte {
 	return nil
-}
-
-func (accountsDb *AccountsDb) BankHash() [32]byte {
-	return accountsDb.BankHashBytes
 }
