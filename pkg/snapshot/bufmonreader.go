@@ -55,8 +55,14 @@ func NewBufMonReaderHTTP(ctx context.Context, url string) (*bufmonreader, error)
 	return NewBufMonReaderHTTPWithSave(ctx, url, "")
 }
 
+// PartialSuffix is appended to snapshot files during download to mark them as incomplete.
+// Once download completes successfully, the file is atomically renamed to remove this suffix.
+const PartialSuffix = ".partial"
+
 // NewBufMonReaderHTTPWithSave streams from HTTP URL and optionally saves to disk.
 // If savePath is non-empty, the data will be written to disk while streaming.
+// The file is initially written with a .partial suffix for safety - use FinalizePartialDownload
+// after successful processing to rename it to the final path.
 // Returns: (*bufmonreader, error)
 func NewBufMonReaderHTTPWithSave(ctx context.Context, url string, savePath string) (*bufmonreader, error) {
 	resp, err := http.Head(url)
@@ -85,12 +91,14 @@ func NewBufMonReaderHTTPWithSave(ctx context.Context, url string, savePath strin
 	var closer io.Closer = resp.Body
 
 	// If savePath is provided, use TeeReader to write to disk while streaming
+	// Write to .partial file first for crash safety
 	if savePath != "" {
+		partialPath := savePath + PartialSuffix
 		// Note: Don't log here - caller logs before progress bar starts to avoid breaking cursor positioning
-		outFile, err := os.Create(savePath)
+		outFile, err := os.Create(partialPath)
 		if err != nil {
 			resp.Body.Close()
-			return nil, fmt.Errorf("creating save file %s: %v", savePath, err)
+			return nil, fmt.Errorf("creating save file %s: %v", partialPath, err)
 		}
 
 		// TeeReader splits the stream: data goes to both the tar reader AND the file
@@ -107,6 +115,45 @@ func NewBufMonReaderHTTPWithSave(ctx context.Context, url string, savePath strin
 		totalSize: totalSize,
 		startTime: time.Now(),
 	}, nil
+}
+
+// FinalizePartialDownload atomically renames a completed .partial file to its final name.
+// This should be called after successfully processing a snapshot that was saved with
+// NewBufMonReaderHTTPWithSave. If savePath is empty, this is a no-op.
+func FinalizePartialDownload(savePath string) error {
+	if savePath == "" {
+		return nil
+	}
+	partialPath := savePath + PartialSuffix
+	if _, err := os.Stat(partialPath); os.IsNotExist(err) {
+		// No partial file exists (maybe wasn't saving, or already finalized)
+		return nil
+	}
+	// Sync the file to ensure all data is flushed to disk before rename
+	f, err := os.Open(partialPath)
+	if err == nil {
+		f.Sync()
+		f.Close()
+	}
+	// Atomic rename
+	if err := os.Rename(partialPath, savePath); err != nil {
+		return fmt.Errorf("failed to finalize snapshot %s: %w", savePath, err)
+	}
+	mlog.Log.Infof("Finalized snapshot download: %s", savePath)
+	return nil
+}
+
+// CleanupPartialDownload removes a .partial file if it exists.
+// This should be called on error/cancellation to clean up incomplete downloads.
+func CleanupPartialDownload(savePath string) {
+	if savePath == "" {
+		return
+	}
+	partialPath := savePath + PartialSuffix
+	if _, err := os.Stat(partialPath); err == nil {
+		mlog.Log.Infof("Cleaning up partial download: %s", partialPath)
+		os.Remove(partialPath)
+	}
 }
 
 // multiCloser closes multiple io.Closers

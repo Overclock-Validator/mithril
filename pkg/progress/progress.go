@@ -248,6 +248,13 @@ type DualProgress struct {
 	output        io.Writer
 	useColor      bool
 	downloadTotal int64 // cached download total for ratio calculation
+
+	// Source switching support
+	sourceSwitchEnabled bool
+	sourceInfo          string // e.g., "Source 1/5: 192.168.1.1"
+	onSourceSwitch      func() // callback when user requests source switch
+	keyboardStopCh      chan struct{}
+	oldTermState        *term.State // saved terminal state for raw mode
 }
 
 // NewDualProgress creates a new dual progress display
@@ -310,6 +317,7 @@ func (d *DualProgress) Start() {
 		return
 	}
 	d.started = true
+	sourceEnabled := d.sourceSwitchEnabled
 	d.mu.Unlock()
 
 	// Print pipeline description using stages (same stage = parallel)
@@ -321,6 +329,11 @@ func (d *DualProgress) Start() {
 	fmt.Fprintln(d.output, "  [3] Download Incremental + Process → [4] Fetch Blocks → Replay")
 	if d.useColor {
 		fmt.Fprintf(d.output, "%s", colorReset)
+	}
+
+	// Print source info if enabled (above the progress bars)
+	if sourceEnabled {
+		d.printSourceInfo()
 	}
 
 	// Print initial empty lines for progress bars (2 bars)
@@ -356,13 +369,11 @@ func (d *DualProgress) updateLoop() {
 
 // render updates the display with both bars
 func (d *DualProgress) render() {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
 	downloadLine := d.Download.Render(d.useColor)
 	extractLine := d.Extract.Render(d.useColor)
 
 	if d.useColor {
+		// Always use 2-line mode (source info was printed once above, if enabled)
 		// Single atomic write to avoid terminal buffering issues:
 		// \r - carriage return to start of line (ensures clean positioning)
 		// \x1b[2A - move cursor up 2 lines
@@ -388,6 +399,9 @@ func (d *DualProgress) Stop() {
 	}
 	d.done = true
 	d.mu.Unlock()
+
+	// Disable source switching and restore terminal
+	d.DisableSourceSwitching()
 
 	close(d.stopCh)
 	<-d.doneCh
@@ -420,6 +434,156 @@ func (d *DualProgress) IsInterrupted() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.interrupted
+}
+
+// EnableSourceSwitching enables keyboard-based source switching during download.
+// The onSwitch callback is called when the user presses 'n' or 's' to switch sources.
+// sourceInfo is displayed ONCE above the progress bars (e.g., "Source 1/5: 192.168.1.1").
+// If called before Start(), the source info will be printed when Start() is called.
+// If called after Start(), the source info is printed immediately above the progress bars.
+func (d *DualProgress) EnableSourceSwitching(sourceInfo string, onSwitch func()) {
+	d.mu.Lock()
+
+	alreadyStarted := d.started
+
+	d.sourceSwitchEnabled = true
+	d.sourceInfo = sourceInfo
+	d.onSourceSwitch = onSwitch
+	d.keyboardStopCh = make(chan struct{})
+	d.mu.Unlock()
+
+	// If already started, print the source info line now (above the progress bars)
+	// This requires moving cursor up, printing, and adjusting
+	if alreadyStarted {
+		d.printSourceInfo()
+	}
+	// If not started yet, Start() will print the source info
+
+	// Start keyboard listener if terminal supports it
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		go d.keyboardListener()
+	}
+}
+
+// printSourceInfo prints the source info line once
+func (d *DualProgress) printSourceInfo() {
+	d.mu.Lock()
+	sourceInfo := d.sourceInfo
+	d.mu.Unlock()
+
+	if sourceInfo == "" {
+		return
+	}
+
+	if d.useColor {
+		hint := fmt.Sprintf("%s[Press 'n' for next source, Ctrl+C to exit]%s", colorDim, colorReset)
+		sourceLine := fmt.Sprintf("%s%s%s  %s", colorTeal, sourceInfo, colorReset, hint)
+		fmt.Fprintf(d.output, "%s\n", sourceLine)
+	} else {
+		fmt.Fprintf(d.output, "%s  [Press 'n' for next source, Ctrl+C to exit]\n", sourceInfo)
+	}
+}
+
+// UpdateSourceInfo updates the source info displayed during download
+func (d *DualProgress) UpdateSourceInfo(sourceInfo string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.sourceInfo = sourceInfo
+}
+
+// DisableSourceSwitching stops the keyboard listener and restores terminal state
+func (d *DualProgress) DisableSourceSwitching() {
+	d.mu.Lock()
+	if !d.sourceSwitchEnabled {
+		d.mu.Unlock()
+		return
+	}
+	d.sourceSwitchEnabled = false
+	keyboardStopCh := d.keyboardStopCh
+	oldState := d.oldTermState
+	d.mu.Unlock()
+
+	// Stop keyboard listener
+	if keyboardStopCh != nil {
+		close(keyboardStopCh)
+	}
+
+	// Restore terminal state
+	if oldState != nil {
+		term.Restore(int(os.Stdin.Fd()), oldState)
+	}
+}
+
+// keyboardListener runs in the background listening for keypresses
+func (d *DualProgress) keyboardListener() {
+	// Set terminal to raw mode to read individual keypresses
+	fd := int(os.Stdin.Fd())
+	oldState, err := term.MakeRaw(fd)
+	if err != nil {
+		// Can't set raw mode, skip keyboard listening
+		return
+	}
+
+	d.mu.Lock()
+	d.oldTermState = oldState
+	d.mu.Unlock()
+
+	// Restore terminal on exit
+	defer term.Restore(fd, oldState)
+
+	// Create a single reader goroutine that sends keypresses on a channel
+	// This avoids spawning new goroutines for each read attempt
+	keyCh := make(chan byte, 8)
+	readerDone := make(chan struct{})
+
+	go func() {
+		defer close(readerDone)
+		buf := make([]byte, 1)
+		for {
+			n, err := os.Stdin.Read(buf)
+			if err != nil {
+				return
+			}
+			if n > 0 {
+				select {
+				case keyCh <- buf[0]:
+				default:
+					// Channel full, drop the key
+				}
+			}
+		}
+	}()
+
+	// Process keypresses until stopped
+	for {
+		select {
+		case <-d.keyboardStopCh:
+			// Cleanup: we can't easily interrupt the blocked Read,
+			// but at least we stop processing and the goroutine will
+			// naturally exit when stdin is closed or on next keypress
+			return
+		case key := <-keyCh:
+			// Check for switch keys: 'n', 's', or space
+			if key == 'n' || key == 'N' || key == 's' || key == 'S' || key == ' ' {
+				d.mu.Lock()
+				onSwitch := d.onSourceSwitch
+				d.mu.Unlock()
+				if onSwitch != nil {
+					onSwitch()
+				}
+			}
+			// Check for Ctrl+C (0x03)
+			if key == 0x03 {
+				// In raw mode, Ctrl+C is captured as byte 0x03 instead of triggering SIGINT.
+				// We need to restore the terminal and send SIGINT ourselves so the normal
+				// signal handler (signal.NotifyContext) can process it.
+				term.Restore(fd, oldState)
+				// Send SIGINT to self - this will trigger context cancellation
+				syscall.Kill(syscall.Getpid(), syscall.SIGINT)
+				return
+			}
+		}
+	}
 }
 
 // IndexingProgress tracks shard flush progress

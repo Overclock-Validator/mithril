@@ -54,6 +54,8 @@ func CleanAccountsDbDir(accountsDbDir string) {
 // maxSnapshots controls how many snapshots to keep:
 //   - 0 = delete all snapshots (stream-only mode, used by new-snapshot bootstrap)
 //   - N > 0 = keep N newest snapshots, delete the rest
+//
+// This function also always cleans up any .partial files (incomplete downloads from crashes).
 func CleanSnapshotDownloadDir(downloadPath string, maxSnapshots int) {
 	if downloadPath == "" || maxSnapshots < 0 {
 		return
@@ -61,6 +63,24 @@ func CleanSnapshotDownloadDir(downloadPath string, maxSnapshots int) {
 	entries, err := os.ReadDir(downloadPath)
 	if err != nil {
 		return // Directory may not exist yet
+	}
+
+	// Always clean up partial downloads first (crash recovery)
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasSuffix(name, PartialSuffix) {
+			path := filepath.Join(downloadPath, name)
+			mlog.Log.Infof("Cleaning up incomplete download from previous run: %s", name)
+			if err := os.Remove(path); err != nil {
+				mlog.Log.Errorf("Failed to remove partial download %s: %v", name, err)
+			}
+		}
+	}
+
+	// Re-read entries after cleaning partials (in case we removed any)
+	entries, err = os.ReadDir(downloadPath)
+	if err != nil {
+		return
 	}
 
 	// Collect snapshot files with their info
@@ -318,12 +338,8 @@ func readTar(
 	// cleanupPartial deletes the partial download file if it exists
 	cleanupPartial := func(reason string) {
 		if savePath != "" {
-			if _, statErr := os.Stat(savePath); statErr == nil {
-				mlog.Log.Infof("Deleting partial download %s (%s)", savePath, reason)
-				if rmErr := os.Remove(savePath); rmErr != nil {
-					mlog.Log.Errorf("Failed to delete partial download %s: %v", savePath, rmErr)
-				}
-			}
+			mlog.Log.Infof("Cleaning up partial download (%s)", reason)
+			CleanupPartialDownload(savePath)
 		}
 	}
 
@@ -368,6 +384,13 @@ func readTar(
 			cleanupPartial("pool error")
 			return err
 		}
+	}
+
+	// Successfully processed the entire tar - finalize the download by renaming from .partial
+	if err := FinalizePartialDownload(savePath); err != nil {
+		mlog.Log.Errorf("Failed to finalize snapshot download: %v", err)
+		// Don't return error here - the snapshot was processed successfully,
+		// the finalization failure just means we won't be able to reuse it
 	}
 
 	return nil

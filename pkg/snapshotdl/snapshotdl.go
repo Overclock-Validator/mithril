@@ -84,7 +84,8 @@ type SnapshotConfig struct {
 	MinIncrementalSpeedMBs float64 // Minimum speed for incremental sources (MB/s, 0 = no minimum)
 
 	// Logging
-	LogDir string // Directory for snapshot finder logs (default: /mnt/mithril-logs/snapshot-finder)
+	LogDir string // Directory for snapshot finder logs (default: /mnt/mithril-logs)
+	RunID  string // Mithril run ID for log file naming
 }
 
 // DefaultSnapshotConfig returns production-ready defaults matching solana-snapshot-finder-go
@@ -137,7 +138,8 @@ func DefaultSnapshotConfig() SnapshotConfig {
 		MinIncrementalSpeedMBs: 2.0, // Minimum 2 MB/s for incrementals (~8min for 1GB)
 
 		// Logging
-		LogDir: "/mnt/mithril-logs/snapshot-finder",
+		LogDir: "/mnt/mithril-logs",
+		RunID:  "", // Set by caller
 	}
 }
 
