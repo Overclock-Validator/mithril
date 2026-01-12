@@ -1436,8 +1436,10 @@ func (bs *BlockSource) getRetrySlots() []uint64 {
 // slot_not_available are cleared from tracking without being marked done,
 // allowing normal scheduling to pick them up when we reach that slot.
 func (bs *BlockSource) maybeProbeAhead() {
-	// Cooldown: only probe at most once per second to avoid starving the waiting slot
-	const probeCooldown = 1 * time.Second
+	// Cooldown: probe at roughly Solana slot interval (~400ms) to balance
+	// discovery speed with RPS budget. Too fast starves the waiting slot,
+	// too slow delays skip range detection.
+	const probeCooldown = 400 * time.Millisecond
 	lastProbe := time.Unix(bs.lastProbeTime.Load(), 0)
 	if time.Since(lastProbe) < probeCooldown {
 		return
