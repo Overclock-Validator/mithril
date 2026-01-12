@@ -683,7 +683,7 @@ func scanAndEnableFeatures(acctsDb *accountsdb.AccountsDb, slot uint64, startOfE
 // This ensures the stake cache reflects the actual on-chain state, not potentially outdated
 // manifest data. Fatal error if index file is missing - indicates corrupt/incomplete AccountsDB.
 func setupInitialVoteAcctsAndStakeAccts(acctsDb *accountsdb.AccountsDb, block *b.Block, snapshotManifest *snapshot.SnapshotManifest) {
-	mlog.Log.Infof("loading vote and stake accounts from AccountsDB...")
+	mlog.Log.Infof("Loading vote and stake accounts from AccountsDB...")
 	block.VoteTimestamps = make(map[solana.PublicKey]sealevel.BlockTimestamp)
 	block.EpochStakesPerVoteAcct = make(map[solana.PublicKey]uint64)
 
@@ -707,7 +707,7 @@ func setupInitialVoteAcctsAndStakeAccts(acctsDb *accountsdb.AccountsDb, block *b
 		mlog.Log.Errorf("=======================================================")
 		os.Exit(1)
 	}
-	mlog.Log.Infof("loading stake cache from index (%d pubkeys)", len(stakePubkeys))
+	mlog.Log.Infof("Loading stake cache from index (%d pubkeys)", len(stakePubkeys))
 
 	var wg sync.WaitGroup
 	voteAcctWorkerPool, _ := ants.NewPoolWithFunc(1024, func(i interface{}) {
@@ -1227,7 +1227,12 @@ func ReplayBlocks(
 	}
 	go blockStream.Start()
 
-	var skippedSlotsCount int // Track skipped slots for 100-slot summary
+	var skippedSlotsCount int  // Track skipped slots for 100-slot summary
+	var totalSlotsReplayed int // Cumulative slots replayed in this run
+
+	mlog.Log.InfofPrecise("")
+	mlog.Log.InfofPrecise("=== Start Replay ===")
+	mlog.Log.InfofPrecise("")
 
 	for {
 		// Start stall monitor goroutine (only after first block to avoid startup false positives)
@@ -1516,6 +1521,7 @@ func ReplayBlocks(
 
 		if !justCrossedEpochBoundary {
 			statsCounter++
+			totalSlotsReplayed++
 			execTimes = append(execTimes, slotReplayDuration.Seconds())
 			waitTimes = append(waitTimes, waitTime.Seconds())
 			cuValues = append(cuValues, totalCU)
@@ -1659,7 +1665,7 @@ func ReplayBlocks(
 
 				// Print summary in reorganized format
 				mlog.Log.InfofPrecise("")
-				mlog.Log.InfofPrecise("=== 100 Slot Summary ===")
+				mlog.Log.InfofPrecise("=== 100 Slot Summary (%d slots replayed) ===", totalSlotsReplayed)
 
 				// Line 1: Mode, blocks/sec, skipped slots, tip distance
 				modeStr := "catchup"

@@ -1230,7 +1230,8 @@ func (bs *BlockSource) emitOrderedBlocks() {
 			delete(bs.slotState, result.slot)
 			delete(bs.inflightStart, result.slot)
 			bs.slotStateMu.Unlock()
-			// Continue without adding to retry queue or marking done
+			// CRITICAL: Must unlock reorderMu before continue (locked at top of loop)
+			bs.reorderMu.Unlock()
 			continue
 		}
 
@@ -1436,7 +1437,7 @@ func (bs *BlockSource) getRetrySlots() []uint64 {
 // Example: stuck on slot 100, slot 104 has parentSlot=99 (lastExecutedSlot),
 // so we know slots 100-103 are all skipped.
 //
-// The retryCount threshold (3 retries = 600ms+) ensures we wait long enough for
+// The retryCount threshold (6 retries = 1200ms) ensures we wait long enough for
 // a block to be produced before probing. Solana slots are ~400ms apart.
 //
 // Probes are explicitly tracked in bs.probeSlots so the emitter can distinguish

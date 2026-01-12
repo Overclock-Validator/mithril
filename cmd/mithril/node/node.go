@@ -879,7 +879,7 @@ func runVerifyRange(c *cobra.Command, args []string) {
 	} else if rpcPort != 0 {
 		rpcServer = rpcserver.NewRpcServer(accountsDb, uint16(rpcPort))
 		rpcServer.Start()
-		mlog.Log.Infof("started RPC server on port %d", rpcPort)
+		mlog.Log.Infof("Started RPC server on port %d", rpcPort)
 	}
 
 	replayStartTime := time.Now()
@@ -1142,7 +1142,7 @@ func runLive(c *cobra.Command, args []string) {
 			}
 			// If state has no genesis hash (older version), set it now
 			if mithrilState.GenesisHash == "" {
-				mlog.Log.Infof("Updating state file with cluster=%s genesis=%s", cluster, genesisHash[:12]+"...")
+				mlog.Log.Infof("Updating state file: cluster=%s genesis=%s", cluster, genesisHash[:12]+"...")
 				mithrilState.SetClusterInfo(cluster, genesisHash)
 				if err := mithrilState.Save(accountsPath); err != nil {
 					mlog.Log.Infof("WARNING: failed to update state file with cluster info: %v", err)
@@ -1212,7 +1212,7 @@ func runLive(c *cobra.Command, args []string) {
 		if !hasValidState {
 			mlog.Log.Infof("WARNING: no state file found, AccountsDB may be from incomplete build")
 		}
-		mlog.Log.Infof("resuming from existing AccountsDB at slot %d", accountsDBSlot)
+		mlog.Log.Infof("Resuming from existing AccountsDB at slot %d", accountsDBSlot)
 		accountsDb, err = accountsdb.OpenDb(accountsPath)
 		if err != nil {
 			klog.Fatalf("failed to open AccountsDB at %s: %v", accountsPath, err)
@@ -1634,7 +1634,7 @@ postBootstrap:
 	} else if rpcPort != 0 {
 		rpcServer = rpcserver.NewRpcServer(accountsDb, uint16(rpcPort))
 		rpcServer.Start()
-		mlog.Log.Infof("started RPC server on port %d", rpcPort)
+		mlog.Log.Infof("Started RPC server on port %d", rpcPort)
 	}
 
 	replayStartTime := time.Now()
