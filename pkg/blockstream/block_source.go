@@ -384,19 +384,33 @@ func NewBlockSource(opts *BlockSourceOpts) *BlockSource {
 
 // updateMode checks the gap to tip and switches between catchup and near-tip mode.
 // Uses hysteresis to avoid flapping: enter near-tip at <=32 slots, exit at >=64 slots.
+//
+// IMPORTANT: Uses nextSlotToSend (not lastExecutedSlot) for gap calculation.
+// This ensures skip-heavy stretches are counted as progress toward tip.
+// lastExecutedSlot only advances on real blocks, so using it would make the gap
+// appear larger than reality during skip streaks, keeping us in catchup mode
+// longer than necessary.
 func (bs *BlockSource) updateMode() {
 	tip := bs.confirmedTip.Load()
-	lastExecuted := bs.lastExecutedSlot.Load()
 
-	// Can't determine mode without tip
-	if tip == 0 || lastExecuted == 0 {
+	// Get last processed slot (the slot before the one we're waiting to emit)
+	// This advances on both real blocks AND skipped slots.
+	bs.reorderMu.Lock()
+	nextToSend := bs.nextSlotToSend
+	bs.reorderMu.Unlock()
+
+	// Can't determine mode without tip or progress
+	if tip == 0 || nextToSend == 0 {
 		return
 	}
 
-	// Calculate gap (tip should always be >= lastExecuted, but handle wrap)
+	// lastProcessed = the slot we just emitted (either real or skipped)
+	lastProcessed := nextToSend - 1
+
+	// Calculate gap (tip should always be >= lastProcessed, but handle wrap)
 	var gap uint64
-	if tip > lastExecuted {
-		gap = tip - lastExecuted
+	if tip > lastProcessed {
+		gap = tip - lastProcessed
 	} else {
 		gap = 0
 	}
@@ -407,15 +421,15 @@ func (bs *BlockSource) updateMode() {
 		// Currently in near-tip mode - switch to catchup if gap exceeds threshold
 		if gap >= bs.catchupThreshold {
 			bs.isNearTip.Store(false)
-			mlog.Log.Infof("MODE SWITCH: near-tip → CATCHUP | gap=%d (threshold=%d) | exec_slot=%d | tip=%d",
-				gap, bs.catchupThreshold, lastExecuted, tip)
+			mlog.Log.Infof("MODE SWITCH: near-tip → CATCHUP | gap=%d (threshold=%d) | processed_slot=%d | tip=%d",
+				gap, bs.catchupThreshold, lastProcessed, tip)
 		}
 	} else {
 		// Currently in catchup mode - switch to near-tip if gap is small
 		if gap <= bs.nearTipThreshold {
 			bs.isNearTip.Store(true)
-			mlog.Log.Infof("MODE SWITCH: catchup → NEAR-TIP | gap=%d (threshold=%d) | exec_slot=%d | tip=%d",
-				gap, bs.nearTipThreshold, lastExecuted, tip)
+			mlog.Log.Infof("MODE SWITCH: catchup → NEAR-TIP | gap=%d (threshold=%d) | processed_slot=%d | tip=%d",
+				gap, bs.nearTipThreshold, lastProcessed, tip)
 		}
 	}
 }
