@@ -1690,6 +1690,9 @@ func (bs *BlockSource) scheduler() {
 	// Track which slots we've already sent backup requests for
 	backupSent := make(map[uint64]bool)
 
+	// Tick counter for throttling priority slot retries
+	var retryTickCount uint64
+
 	for {
 		// Check for shutdown
 		if bs.stopped.Load() {
@@ -1764,13 +1767,32 @@ func (bs *BlockSource) scheduler() {
 			// be allowed to schedule, even if buffer is full. Otherwise we deadlock:
 			// buffer fills with N+1..N+100, slot N keeps failing, can't reschedule N
 			// because buffer is full, buffer can't drain because waiting for N.
+			retryTickCount++
+
 			bs.reorderMu.Lock()
 			waitingSlot := bs.nextSlotToSend
 			bs.reorderMu.Unlock()
 
+			// Check if priority slot should be throttled (after 5 retries, only every 400ms)
+			// First 5 retries at 200ms = 1 second of fast retries before throttling
+			bs.waitingSlotErrorsMu.Lock()
+			priorityRetryCount := 0
+			if info := bs.waitingSlotErrors[waitingSlot]; info != nil {
+				priorityRetryCount = info.retryCount
+			}
+			bs.waitingSlotErrorsMu.Unlock()
+			throttlePriority := priorityRetryCount > 5 && retryTickCount%2 == 1 // Skip odd ticks
+
 			for _, slot := range bs.getRetrySlots() {
 				// Always allow scheduling the slot we're waiting for (breaks deadlock)
 				isPrioritySlot := slot == waitingSlot
+
+				// Throttle priority slot after 5 retries to conserve RPS (400ms instead of 200ms)
+				if isPrioritySlot && throttlePriority {
+					bs.scheduleRetry(slot) // Put back, will retry next tick
+					continue
+				}
+
 				if isPrioritySlot || bs.canScheduleMore(slot) {
 					if isPrioritySlot && !bs.canScheduleMore(slot) {
 						// Log when deadlock prevention kicks in (Debugf to avoid noise)
