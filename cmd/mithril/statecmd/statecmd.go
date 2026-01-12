@@ -228,9 +228,9 @@ func runStateShow(cmd *cobra.Command) {
 		fmt.Println()
 	}
 
-	// Full details (resume context)
-	if fullOutput && s.HasResumeContext() {
-		fmt.Println("Resume Context:")
+	// Full details (resume data)
+	if fullOutput && s.HasResumeData() {
+		fmt.Println("Resume Data:")
 		fmt.Printf("  AcctsLtHash: %s...\n", truncate(s.LastAcctsLtHash, 20))
 		fmt.Printf("  LamportsPerSig: %d\n", s.LastLamportsPerSignature)
 		fmt.Printf("  NumSignatures: %d\n", s.LastNumSignatures)

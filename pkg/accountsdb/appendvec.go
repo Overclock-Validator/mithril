@@ -27,6 +27,7 @@ const (
 	hdrLen        = 136
 	dataLenOffset = 8
 	pubkeyOffset  = 16
+	ownerOffset   = 64
 )
 
 type appendVecParser struct {
@@ -46,6 +47,33 @@ func (parser *appendVecParser) ParseNextAcct(pk *solana.PublicKey, a *AccountInd
 	dataLen := binary.LittleEndian.Uint64(parser.Buf[parser.Offset+dataLenOffset : parser.Offset+dataLenOffset+8])
 
 	*pk = solana.PublicKeyFromBytes(parser.Buf[parser.Offset+pubkeyOffset : parser.Offset+pubkeyOffset+32])
+	a.Slot = parser.Slot
+	a.FileId = parser.FileId
+	a.Offset = parser.Offset
+
+	parser.Offset += hdrLen
+
+	if parser.Offset+dataLen > parser.FileSize {
+		return fmt.Errorf("overflow")
+	}
+
+	parser.Offset += util.AlignUp(dataLen, 8)
+
+	return nil
+}
+
+// ParseNextAcctWithOwner parses the next account from the appendvec, extracting
+// pubkey, index entry, and owner. Used for building stake pubkey index during
+// snapshot processing.
+func (parser *appendVecParser) ParseNextAcctWithOwner(pk *solana.PublicKey, a *AccountIndexEntry, owner *solana.PublicKey) error {
+	if parser.Offset+hdrLen > parser.FileSize {
+		return fmt.Errorf("overflow")
+	}
+
+	dataLen := binary.LittleEndian.Uint64(parser.Buf[parser.Offset+dataLenOffset : parser.Offset+dataLenOffset+8])
+
+	*pk = solana.PublicKeyFromBytes(parser.Buf[parser.Offset+pubkeyOffset : parser.Offset+pubkeyOffset+32])
+	*owner = solana.PublicKeyFromBytes(parser.Buf[parser.Offset+ownerOffset : parser.Offset+ownerOffset+32])
 	a.Slot = parser.Slot
 	a.FileId = parser.FileId
 	a.Offset = parser.Offset

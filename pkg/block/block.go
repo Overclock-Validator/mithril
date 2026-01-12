@@ -33,7 +33,7 @@ type Block struct {
 	BlockReward                         *BlockRewardsInfo
 	LastBlockhash                       [32]byte
 	UnixTimestamp                       int64
-	VoteAccts                           map[solana.PublicKey]uint64
+	EpochStakesPerVoteAcct              map[solana.PublicKey]uint64
 	VoteTimestamps                      map[solana.PublicKey]sealevel.BlockTimestamp
 	TotalEpochStake                     uint64
 	Features                            *features.Features

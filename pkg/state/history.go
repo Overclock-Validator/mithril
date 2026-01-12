@@ -10,7 +10,7 @@ import (
 )
 
 // MaxHistoryEntries is the maximum number of history entries to retain.
-const MaxHistoryEntries = 100
+const MaxHistoryEntries = 500
 
 // HistoryEvent represents the type of state change event.
 type HistoryEvent string
@@ -32,6 +32,7 @@ type StateHistoryEntry struct {
 	RunID     string       `json:"run_id,omitempty"`
 	Version   string       `json:"version,omitempty"`
 	Commit    string       `json:"commit,omitempty"`
+	Branch    string       `json:"branch,omitempty"` // git branch name (may be empty)
 	Reason    string       `json:"reason,omitempty"` // shutdown reason or corruption reason
 }
 
@@ -171,7 +172,7 @@ func GetRecentHistory(accountsDbDir string, n int) ([]StateHistoryEntry, error) 
 }
 
 // RecordBootstrap records a bootstrap event in the history.
-func RecordBootstrap(accountsDbDir string, slot uint64, bankhash, runID, version, commit string) error {
+func RecordBootstrap(accountsDbDir string, slot uint64, bankhash, runID, version, commit, branch string) error {
 	return AppendHistory(accountsDbDir, StateHistoryEntry{
 		Event:    HistoryEventBootstrap,
 		Slot:     slot,
@@ -179,11 +180,12 @@ func RecordBootstrap(accountsDbDir string, slot uint64, bankhash, runID, version
 		RunID:    runID,
 		Version:  version,
 		Commit:   commit,
+		Branch:   branch,
 	})
 }
 
 // RecordShutdown records a shutdown event in the history.
-func RecordShutdown(accountsDbDir string, slot uint64, bankhash, runID, version, commit, reason string) error {
+func RecordShutdown(accountsDbDir string, slot uint64, bankhash, runID, version, commit, branch, reason string) error {
 	return AppendHistory(accountsDbDir, StateHistoryEntry{
 		Event:    HistoryEventShutdown,
 		Slot:     slot,
@@ -191,12 +193,13 @@ func RecordShutdown(accountsDbDir string, slot uint64, bankhash, runID, version,
 		RunID:    runID,
 		Version:  version,
 		Commit:   commit,
+		Branch:   branch,
 		Reason:   reason,
 	})
 }
 
 // RecordCorrupted records a corruption event in the history.
-func RecordCorrupted(accountsDbDir string, slot uint64, bankhash, runID, version, commit, reason string) error {
+func RecordCorrupted(accountsDbDir string, slot uint64, bankhash, runID, version, commit, branch, reason string) error {
 	return AppendHistory(accountsDbDir, StateHistoryEntry{
 		Event:    HistoryEventCorrupted,
 		Slot:     slot,
@@ -204,12 +207,13 @@ func RecordCorrupted(accountsDbDir string, slot uint64, bankhash, runID, version
 		RunID:    runID,
 		Version:  version,
 		Commit:   commit,
+		Branch:   branch,
 		Reason:   reason,
 	})
 }
 
 // RecordResume records a resume event in the history.
-func RecordResume(accountsDbDir string, slot uint64, bankhash, runID, version, commit string) error {
+func RecordResume(accountsDbDir string, slot uint64, bankhash, runID, version, commit, branch string) error {
 	return AppendHistory(accountsDbDir, StateHistoryEntry{
 		Event:    HistoryEventResume,
 		Slot:     slot,
@@ -217,18 +221,20 @@ func RecordResume(accountsDbDir string, slot uint64, bankhash, runID, version, c
 		RunID:    runID,
 		Version:  version,
 		Commit:   commit,
+		Branch:   branch,
 	})
 }
 
 // RecordRebuild records when AccountsDB is about to be cleaned/rebuilt.
 // This should be called BEFORE CleanAccountsDbDir to preserve the history.
-func RecordRebuild(accountsDbDir string, slot uint64, bankhash, version, commit, reason string) error {
+func RecordRebuild(accountsDbDir string, slot uint64, bankhash, version, commit, branch, reason string) error {
 	return AppendHistory(accountsDbDir, StateHistoryEntry{
 		Event:    HistoryEventRebuild,
 		Slot:     slot,
 		Bankhash: bankhash,
 		Version:  version,
 		Commit:   commit,
+		Branch:   branch,
 		Reason:   reason, // e.g., "new-snapshot", "snapshot mode", "user requested rebuild"
 	})
 }

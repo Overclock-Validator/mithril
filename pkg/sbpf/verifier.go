@@ -101,6 +101,13 @@ func (v *Verifier) VerifyProgram() error {
 				}
 			}
 
+		case verifyCheckSh32:
+			{
+				if ins.Imm() >= 32 {
+					return fmt.Errorf("sh overflow")
+				}
+			}
+
 		case verifyCheckSh64:
 			{
 				if ins.Imm() >= 64 {

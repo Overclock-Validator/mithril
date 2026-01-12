@@ -78,7 +78,7 @@ Before speed testing, nodes are filtered by:
 - **Version**: `min_node_version` (default: "3.0.0"), `allowed_node_versions` (optional whitelist)
 - **RTT**: `max_rtt_ms` (default: 200 ms)
 - **TCP Connectivity**: `tcp_timeout_ms` (default: 1000 ms)
-- **Snapshot Age**: `full_threshold` (default: 100000 slots), `incremental_threshold` (default: 200 slots)
+- **Snapshot Age**: `full_threshold` (default: 100000 slots), `incremental_threshold` (default: 1000 slots)
 
 ## Full Snapshot Selection Flow
 
@@ -242,7 +242,7 @@ All configuration options can be set in `config.toml` under the `[snapshot]` sec
     # full_threshold = 100000
 
     # Maximum age for incremental snapshots (slots)
-    # incremental_threshold = 200
+    # incremental_threshold = 1000
 
     # Safety margin - warn if snapshot is this close to expiration (slots)
     # safety_margin_slots = 5000
@@ -295,7 +295,7 @@ All configuration options can be set in `config.toml` under the `[snapshot]` sec
 | `tcp_timeout_ms` | `1000` | 1 second TCP check |
 | `min_node_version` | `"3.0.0"` | Minimum Agave 3.0.0 |
 | `full_threshold` | `100000` | ~11 hours old |
-| `incremental_threshold` | `200` | ~80 seconds old |
+| `incremental_threshold` | `1000` | ~7 minutes old |
 | `safety_margin_slots` | `5000` | Warn if close to expiration |
 | `worker_count` | `100` | 100 concurrent workers |
 | `max_snapshot_url_attempts` | `3` | Try top 3 nodes |

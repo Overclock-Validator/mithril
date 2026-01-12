@@ -202,19 +202,6 @@ name = "mithril"
     txpar = 24
 
     # -------------------------------------------------------------------------
-    # Leader Schedule Validation (for developers)
-    # -------------------------------------------------------------------------
-    # Validate leader schedule by computing locally and comparing to RPC.
-    # Mismatches are logged to [log].dir/leader_schedule_mismatch.log
-    # Does NOT affect block replay - local schedule is source of truth.
-    # validate_leader_schedule = false
-
-    # Dump first 1000 slots of leader schedule to file for manual comparison.
-    # File: [log].dir/leader_schedule_dump_epoch<N>.txt
-    # Format: slot_offset,absolute_slot,leader_pubkey
-    # dump_leader_schedule = false
-
-    # -------------------------------------------------------------------------
     # Advanced: verify-range settings (for developers)
     # -------------------------------------------------------------------------
     # These settings are only used with 'mithril verify-range', not 'mithril run'.
@@ -336,7 +323,7 @@ name = "mithril"
 
     # Maximum age for incremental snapshots (slots)
     # Incrementals are always downloaded (they're small and provide latest state)
-    incremental_threshold = 200
+    incremental_threshold = 1000
 
     # Safety margin - warn if snapshot is this close to expiration (slots)
     safety_margin_slots = 5000

@@ -1,9 +1,11 @@
 package accountsdb
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 
+	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -34,23 +36,33 @@ func unmarshalAcctIdxEntry(data []byte) (*AccountIndexEntry, error) {
 	return out, nil
 }
 
-func BuildIndexEntriesFromAppendVecs(data []byte, fileSize uint64, slot uint64, fileId uint64) ([]solana.PublicKey, []AccountIndexEntry, error) {
+// BuildIndexEntriesFromAppendVecs parses an appendvec and returns:
+// - pubkeys: all account pubkeys
+// - acctIdxEntries: index entries for each account
+// - stakePubkeys: pubkeys of accounts owned by the stake program
+func BuildIndexEntriesFromAppendVecs(data []byte, fileSize uint64, slot uint64, fileId uint64) ([]solana.PublicKey, []AccountIndexEntry, []solana.PublicKey, error) {
 	pubkeys := make([]solana.PublicKey, 0, 20000)
 	acctIdxEntries := make([]AccountIndexEntry, 0, 20000)
+	stakePubkeys := make([]solana.PublicKey, 0, 1000)
 	var err error
 
 	parser := &appendVecParser{Buf: data, FileSize: fileSize, FileId: fileId, Slot: slot}
 
+	var owner solana.PublicKey
 	for {
 		pubkeys = append(pubkeys, solana.PublicKey{})
 		acctIdxEntries = append(acctIdxEntries, AccountIndexEntry{})
-		err = parser.ParseNextAcct(&pubkeys[len(pubkeys)-1], &acctIdxEntries[len(acctIdxEntries)-1])
+		err = parser.ParseNextAcctWithOwner(&pubkeys[len(pubkeys)-1], &acctIdxEntries[len(acctIdxEntries)-1], &owner)
 		if err != nil {
 			pubkeys = pubkeys[:len(pubkeys)-1]
 			acctIdxEntries = acctIdxEntries[:len(acctIdxEntries)-1]
 			break
 		}
+		// Collect stake account pubkeys for building stake index
+		if bytes.Equal(owner[:], addresses.StakeProgramAddr[:]) {
+			stakePubkeys = append(stakePubkeys, pubkeys[len(pubkeys)-1])
+		}
 	}
 
-	return pubkeys, acctIdxEntries, nil
+	return pubkeys, acctIdxEntries, stakePubkeys, nil
 }

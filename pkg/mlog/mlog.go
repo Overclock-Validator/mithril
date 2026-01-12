@@ -218,6 +218,12 @@ func (l *logger) flush() {
 	}
 }
 
+// Flush flushes the log buffer to ensure all pending messages are written.
+// Call this before starting progress bars or other terminal output that depends on cursor position.
+func Flush() {
+	Log.flush()
+}
+
 // flushAndSync flushes and syncs to disk
 func (l *logger) flushAndSync() {
 	l.mu.Lock()

@@ -1377,12 +1377,8 @@ func (voteStateVersions *VoteStateVersions) LastTimestamp() *BlockTimestamp {
 	}
 }
 
-// unknownVoteStateVersionOnce ensures we only log unknown version warning once
 var unknownVoteStateVersionOnce sync.Once
 
-// NodePubkey returns the validator identity pubkey from the vote state.
-// Returns zero pubkey if the receiver is nil or has an unknown version type.
-// Callers should count zero returns as "missing" for divergence debugging.
 func (voteStateVersions *VoteStateVersions) NodePubkey() solana.PublicKey {
 	if voteStateVersions == nil {
 		return solana.PublicKey{}

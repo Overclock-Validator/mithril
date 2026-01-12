@@ -237,11 +237,11 @@ func sortStakes(stakes []pubkeyAndStakePair) []pubkeyAndStakePair {
 
 // TieBreakEntry represents an entry in a tie-break group for debugging
 type TieBreakEntry struct {
-	Rank      int
-	NodePk    solana.PublicKey
-	Stake     uint64
-	RawBytes  []byte // First 8 bytes of pubkey for comparison
-	BytesCmp  int    // Comparison result vs previous entry
+	Rank     int
+	NodePk   solana.PublicKey
+	Stake    uint64
+	RawBytes []byte // First 8 bytes of pubkey for comparison
+	BytesCmp int    // Comparison result vs previous entry
 }
 
 // GetSortedStakesDebug returns sorted stakes with tie-break debugging info.

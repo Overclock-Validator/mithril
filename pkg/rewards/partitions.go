@@ -33,6 +33,10 @@ func (partitions Partitions) Partition(partitionIdx uint64) *Partition {
 	return partitions[partitionIdx]
 }
 
+func (partitions Partitions) NumPartitions() uint64 {
+	return uint64(len(partitions))
+}
+
 func (partition *Partition) NumPubkeys() uint64 {
 	return uint64(len(partition.pubkeys))
 }

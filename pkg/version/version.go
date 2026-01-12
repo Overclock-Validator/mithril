@@ -11,6 +11,9 @@ var (
 	// GitCommit is the git commit hash
 	GitCommit = "unknown"
 
+	// GitBranch is the git branch name
+	GitBranch = "unknown"
+
 	// BuildDate is the build timestamp
 	BuildDate = "unknown"
 )

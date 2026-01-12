@@ -59,7 +59,6 @@ require (
 	github.com/muesli/cancelreader v0.2.2 // indirect
 	github.com/muesli/termenv v0.16.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
-	github.com/nixberg/chacha-rng-go v0.1.0 // indirect
 	github.com/onsi/gomega v1.27.6 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/prometheus/common v0.67.4 // indirect
@@ -72,10 +71,7 @@ require (
 require (
 	github.com/DataDog/zstd v1.5.7
 	github.com/Overclock-Validator/crypto v0.0.0-20250307094320-aaf52fac5261 // indirect
-	github.com/Overclock-Validator/frand v0.0.0-20251113191226-96ce04ddc1a8 // indirect
 	github.com/Overclock-Validator/gnark-crypto v0.0.0-20250309203346-2a67ed08a105
-	github.com/Overclock-Validator/weightedrand v0.0.0-20251113203832-5ac028321d0a
-	github.com/aead/chacha20 v0.0.0-20180709150244-8b13a72661da // indirect
 	github.com/bits-and-blooms/bitset v1.22.0 // indirect
 	github.com/consensys/bavard v0.1.31-0.20250406004941-2db259e4b582 // indirect
 	github.com/dchest/blake2b v1.0.0 // indirect
@@ -150,6 +146,7 @@ require (
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/mostynb/zstdpool-freelist v0.0.0-20201229113212-927304c0c3b1 // indirect
+	github.com/nixberg/chacha-rng-go v0.1.0
 	github.com/oasisprotocol/curve25519-voi v0.0.0-20230904125328-1f23a7beb09a
 	github.com/panjf2000/ants/v2 v2.10.0
 	github.com/pierrec/lz4/v4 v4.1.22

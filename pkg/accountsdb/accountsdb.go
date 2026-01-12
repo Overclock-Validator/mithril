@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -27,6 +28,13 @@ type AccountsDb struct {
 	CommonAcctsCache otter.Cache[solana.PublicKey, *accounts.Account]
 	ProgramCache     otter.Cache[solana.PublicKey, *ProgramCacheEntry]
 }
+
+// silentLogger implements pebble.Logger but discards all messages.
+// This suppresses verbose WAL recovery messages on startup.
+type silentLogger struct{}
+
+func (silentLogger) Infof(format string, args ...interface{})  {}
+func (silentLogger) Fatalf(format string, args ...interface{}) { log.Fatalf(format, args...) }
 
 var (
 	ErrNoAccount = errors.New("ErrNoAccount")
@@ -59,16 +67,15 @@ func OpenDb(accountsDbDir string) (*AccountsDb, error) {
 	}
 
 	largestFileId := binary.LittleEndian.Uint64(largestFileIdBytes)
-	mlog.Log.Infof("accountsdb.OpenDb: largestFileId=%d", largestFileId)
 
 	indexDir := filepath.Join(accountsDbDir, "mithril_db")
-	db, err := pebble.Open(indexDir, &pebble.Options{})
+	db, err := pebble.Open(indexDir, &pebble.Options{Logger: silentLogger{}})
 	if err != nil {
 		return nil, fmt.Errorf("opening indexDir=%s: %w", indexDir, err)
 	}
 
 	bankhashDir := filepath.Join(accountsDbDir, "bankhash_db")
-	bankhashDb, err := pebble.Open(bankhashDir, &pebble.Options{})
+	bankhashDb, err := pebble.Open(bankhashDir, &pebble.Options{Logger: silentLogger{}})
 	if err != nil {
 		return nil, fmt.Errorf("opening bankhashDir=%s: %w", bankhashDir, err)
 	}

@@ -9,6 +9,8 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -22,7 +24,6 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/base58"
 	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/blockstream"
-	"github.com/Overclock-Validator/mithril/pkg/config"
 	"github.com/Overclock-Validator/mithril/pkg/epochstakes"
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/fees"
@@ -118,6 +119,16 @@ type ReplayResult struct {
 	// SlotHashes context - same issue, vote program needs accurate slot→hash mappings
 	LastSlotHashes *sealevel.SysvarSlotHashes
 
+	// ReplayCtx fields - for resume independence from stale manifest
+	LastCapitalization uint64
+	LastSlotsPerYear   float64
+	LastInflation      rewards.Inflation
+
+	// ComputedEpochStakes contains epoch stakes computed at boundaries during this run.
+	// Key: epoch number (the leader schedule epoch), Value: serialized JSON
+	// This must be persisted to state file for correct resume across epoch boundaries.
+	ComputedEpochStakes map[uint64][]byte
+
 	// StateWrittenOnCancel indicates that the state file was already written during
 	// cancellation handling, so the caller should skip the final write
 	StateWrittenOnCancel bool
@@ -150,6 +161,40 @@ type ResumeState struct {
 
 	// SlotHashes context - vote program needs accurate slot→hash mappings
 	SlotHashes *sealevel.SysvarSlotHashes
+
+	// ReplayCtx fields - so resume uses fresh values instead of stale manifest
+	Capitalization          uint64
+	SlotsPerYear            float64
+	InflationInitial        float64
+	InflationTerminal       float64
+	InflationTaper          float64
+	InflationFoundation     float64
+	InflationFoundationTerm float64
+
+	// ComputedEpochStakes contains epoch stakes computed at boundaries.
+	// Key: epoch number (the leader schedule epoch), Value: serialized JSON
+	// Required for correct leader schedule computation on resume.
+	ComputedEpochStakes map[uint64][]byte
+}
+
+// serializeAllEpochStakes serializes all epoch stakes in the global cache.
+// Returns a map of epoch -> serialized JSON bytes.
+func serializeAllEpochStakes() map[uint64][]byte {
+	epochs := global.GetAllCachedEpochs()
+	if len(epochs) == 0 {
+		return nil
+	}
+
+	result := make(map[uint64][]byte, len(epochs))
+	for _, epoch := range epochs {
+		data, err := global.SerializeEpochStakes(epoch)
+		if err != nil {
+			mlog.Log.Warnf("Failed to serialize epoch %d stakes: %v", epoch, err)
+			continue
+		}
+		result[epoch] = data
+	}
+	return result
 }
 
 func resolveAddrTableLookups(accountsDb *accountsdb.AccountsDb, block *b.Block) error {
@@ -391,11 +436,6 @@ func loadBlockAccountsAndUpdateSysvars(accountsDb *accountsdb.AccountsDb, block 
 					panic("unable to unmarshal slothashes sysvar")
 				}
 
-				// Debug: log the slot hash range on first load
-				if len(slotHashes) > 0 {
-					mlog.Log.Infof("loaded SlotHashes sysvar: %d entries, newest slot=%d, oldest slot=%d",
-						len(slotHashes), slotHashes[0].Slot, slotHashes[len(slotHashes)-1].Slot)
-				}
 			} else {
 				// SysvarCache already populated (either from resume state file or from previous slot).
 				// The account data from AccountsDB may be stale (appendvec writes are not fsynced),
@@ -632,10 +672,42 @@ func scanAndEnableFeatures(acctsDb *accountsdb.AccountsDb, slot uint64, startOfE
 	return f, newlyActivatedFeatureAccts, parentNewlyActivatedFeatureAccts
 }
 
+// setupInitialVoteAcctsAndStakeAccts populates the vote and stake caches at startup.
+//
+// For stake accounts, we read ALL delegation fields from AccountsDB rather than trusting
+// the manifest's delegation list (which can be stale/incomplete per Firedancer). The flow:
+//   1. Load stake pubkeys from stake_pubkeys.idx (built during snapshot processing)
+//   2. For each pubkey, read the full stake state from AccountsDB
+//   3. Extract delegation fields (VoterPubkey, StakeLamports, epochs, etc.) from AccountsDB
+//
+// This ensures the stake cache reflects the actual on-chain state, not potentially outdated
+// manifest data. Fatal error if index file is missing - indicates corrupt/incomplete AccountsDB.
 func setupInitialVoteAcctsAndStakeAccts(acctsDb *accountsdb.AccountsDb, block *b.Block, snapshotManifest *snapshot.SnapshotManifest) {
 	mlog.Log.Infof("loading vote and stake accounts from AccountsDB...")
 	block.VoteTimestamps = make(map[solana.PublicKey]sealevel.BlockTimestamp)
-	block.VoteAccts = make(map[solana.PublicKey]uint64)
+	block.EpochStakesPerVoteAcct = make(map[solana.PublicKey]uint64)
+
+	// Load stake pubkeys from index file built during snapshot processing
+	// The index is in the accountsDbDir which is parent of AcctsDir
+	acctsDbDir := filepath.Join(acctsDb.AcctsDir, "..")
+	stakePubkeys, err := global.LoadStakePubkeyIndex(acctsDbDir)
+	if err != nil {
+		// Fatal error - stake index is required for resume and must exist
+		mlog.Log.Errorf("=======================================================")
+		mlog.Log.Errorf("FATAL: stake_pubkeys.idx missing or corrupt: %v", err)
+		mlog.Log.Errorf("=======================================================")
+		mlog.Log.Errorf("")
+		mlog.Log.Errorf("This file is required when resuming from existing AccountsDB.")
+		mlog.Log.Errorf("If this is a fresh start, the index should have been created during snapshot loading.")
+		mlog.Log.Errorf("")
+		mlog.Log.Errorf("To fix, delete AccountsDB and restart from snapshot:")
+		mlog.Log.Errorf("  rm -rf %s", acctsDbDir)
+		mlog.Log.Errorf("")
+		mlog.Log.Errorf("Then set bootstrap.mode = 'new-snapshot' in config.toml")
+		mlog.Log.Errorf("=======================================================")
+		os.Exit(1)
+	}
+	mlog.Log.Infof("loading stake cache from index (%d pubkeys)", len(stakePubkeys))
 
 	var wg sync.WaitGroup
 	voteAcctWorkerPool, _ := ants.NewPoolWithFunc(1024, func(i interface{}) {
@@ -651,27 +723,43 @@ func setupInitialVoteAcctsAndStakeAccts(acctsDb *accountsdb.AccountsDb, block *b
 		}
 	})
 
-	stakeAcctWorkerPool, _ := ants.NewPoolWithFunc(1024, func(i interface{}) {
+	// Stake worker pool reads ALL delegation fields from AccountsDB (not manifest)
+	// Uses batched processing to reduce wg.Add/Invoke overhead (1M pubkeys → ~1K batches)
+	const stakeBatchSize = 1000
+	stakeAcctWorkerPool, _ := ants.NewPoolWithFunc(runtime.NumCPU()*2, func(i interface{}) {
 		defer wg.Done()
 
-		sa := i.(snapshot.DelegationPair)
-		var creditsObserved uint64
-
-		stakeAcct, err := acctsDb.GetAccount(block.Slot, sa.Account)
-		if err == nil {
-			stakeState, err := sealevel.UnmarshalStakeState(stakeAcct.Data)
-			if err == nil {
-				creditsObserved = stakeState.Stake.Stake.CreditsObserved
+		batch := i.([]solana.PublicKey)
+		for _, pk := range batch {
+			// Read from AccountsDB - ALL fields, not manifest
+			stakeAcct, err := acctsDb.GetAccount(block.Slot, pk)
+			if err != nil {
+				continue // Account not found or closed
 			}
-		}
-		global.PutStakeCacheItem(sa.Account,
-			&sealevel.Delegation{VoterPubkey: sa.Delegation.VoterPubkey,
-				StakeLamports:      sa.Delegation.Stake,
-				ActivationEpoch:    sa.Delegation.ActivationEpoch,
-				DeactivationEpoch:  sa.Delegation.DeactivationEpoch,
-				WarmupCooldownRate: sa.Delegation.WarmupCooldownRate,
-				CreditsObserved:    creditsObserved})
 
+			stakeState, err := sealevel.UnmarshalStakeState(stakeAcct.Data)
+			if err != nil {
+				continue // Invalid stake state
+			}
+
+			// Only cache if this is a delegated stake account (status must be "Stake")
+			if stakeState.Status != sealevel.StakeStateV2StatusStake {
+				continue
+			}
+
+			// Use delegation from AccountsDB, not manifest
+			// Use Bulk variant for startup loading - doesn't track as "new" for index append
+			delegation := stakeState.Stake.Stake.Delegation
+			global.PutStakeCacheItemBulk(pk,
+				&sealevel.Delegation{
+					VoterPubkey:        delegation.VoterPubkey,
+					StakeLamports:      delegation.StakeLamports,
+					ActivationEpoch:    delegation.ActivationEpoch,
+					DeactivationEpoch:  delegation.DeactivationEpoch,
+					WarmupCooldownRate: delegation.WarmupCooldownRate,
+					CreditsObserved:    stakeState.Stake.Stake.CreditsObserved,
+				})
+		}
 	})
 
 	wg.Add(1)
@@ -680,7 +768,7 @@ func setupInitialVoteAcctsAndStakeAccts(acctsDb *accountsdb.AccountsDb, block *b
 		for _, va := range snapshotManifest.Bank.Stakes.VoteAccounts {
 			ts := sealevel.BlockTimestamp{Slot: va.Value.LastTimestampSlot, Timestamp: va.Value.LastTimestampTs}
 			block.VoteTimestamps[va.Key] = ts
-			block.VoteAccts[va.Key] = va.Stake
+			block.EpochStakesPerVoteAcct[va.Key] = va.Stake
 			block.TotalEpochStake += va.Stake
 
 			wg.Add(1)
@@ -688,18 +776,27 @@ func setupInitialVoteAcctsAndStakeAccts(acctsDb *accountsdb.AccountsDb, block *b
 		}
 	}()
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for _, sa := range snapshotManifest.Bank.Stakes.Delegations {
-			wg.Add(1)
-			stakeAcctWorkerPool.Invoke(sa)
-		}
-	}()
+	// Submit stake pubkeys in batches (reduces wg.Add/Invoke calls from ~1M to ~1K)
+	numBatches := (len(stakePubkeys) + stakeBatchSize - 1) / stakeBatchSize
+	wg.Add(numBatches)
+	for i := 0; i < len(stakePubkeys); i += stakeBatchSize {
+		end := min(i+stakeBatchSize, len(stakePubkeys))
+		stakeAcctWorkerPool.Invoke(stakePubkeys[i:end])
+	}
 
 	wg.Wait()
 	stakeAcctWorkerPool.Release()
-	ants.Release()
+	voteAcctWorkerPool.Release()
+
+	// After both caches are loaded, ensure vote cache has ALL vote accounts
+	// referenced by stake cache (catches any vote accounts not in manifest)
+	voteAcctStakes := make(map[solana.PublicKey]uint64)
+	for _, delegation := range global.StakeCache() {
+		voteAcctStakes[delegation.VoterPubkey] += delegation.StakeLamports
+	}
+	if err := RebuildVoteCacheFromAccountsDB(acctsDb, block.Slot, voteAcctStakes, 0); err != nil {
+		mlog.Log.Warnf("vote cache rebuild had errors: %v", err)
+	}
 }
 
 func configureInitialBlock(acctsDb *accountsdb.AccountsDb,
@@ -722,40 +819,15 @@ func configureInitialBlock(acctsDb *accountsdb.AccountsDb,
 	configureGlobalCtx(block)
 
 	if global.ManageLeaderSchedule() {
-		logsDir := config.GetString("log.dir")
-		if logsDir == "" {
-			logsDir = "/mnt/mithril-logs"
-		}
-
-		// Build leader schedule from local state (source of truth)
-		localSummary, err := PrepareLeaderScheduleLocal(block.Epoch, epochSchedule, logsDir)
+		_, err := PrepareLeaderScheduleLocal(block.Epoch, epochSchedule, "")
 		if err != nil {
-			return fmt.Errorf("failed to build leader schedule: %w", err)
+			panic(err)
 		}
-
-		// Background RPC validation - always runs for debugging
-		localSchedule := global.LeaderSchedule()
-		go func() {
-			rpcSchedule, rpcErr := fetchLeaderScheduleFromRPC(block.Epoch, epochSchedule, rpcClient, auxBackupEndpoints)
-			if rpcErr != nil {
-				mlog.Log.Debugf("RPC leader schedule fetch failed (for validation only): %v", rpcErr)
-				return
-			}
-			BackgroundValidateAgainstRPC(block.Epoch, epochSchedule, localSchedule, rpcSchedule, localSummary, logsDir)
-		}()
 
 		var exists bool
 		block.Leader, exists = global.LeaderForSlot(block.Slot)
 		if !exists {
-			// Log schedule context for debugging
-			firstSlot := epochSchedule.FirstSlotInEpoch(block.Epoch)
-			numSlots := epochSchedule.SlotsInEpoch(block.Epoch)
-			lastSlot := firstSlot + numSlots - 1
-			hash := scheduleFullHash(global.LeaderSchedule(), firstSlot, numSlots)
-			mlog.Log.Errorf("LeaderForSlot failed: slot=%d epoch=%d first_slot=%d last_slot=%d hash=%s",
-				block.Slot, block.Epoch, firstSlot, lastSlot, hash)
-			return fmt.Errorf("unable to find leader for slot %d (epoch=%d range=[%d,%d])",
-				block.Slot, block.Epoch, firstSlot, lastSlot)
+			return fmt.Errorf("unable to find leader for slot %d", block.Slot)
 		}
 	}
 
@@ -785,7 +857,7 @@ func configureBlock(block *b.Block,
 	copy(block.ParentBankhash[:], lastSlotCtx.FinalBankhash)
 	block.AcctsLtHash = lastSlotCtx.AcctsLtHash
 	block.VoteTimestamps = lastSlotCtx.VoteTimestamps
-	block.VoteAccts = lastSlotCtx.VoteAccts
+	block.EpochStakesPerVoteAcct = lastSlotCtx.VoteAccts
 	block.ParentSlot = lastSlotCtx.Slot
 	block.LatestEvictedBlockhash = lastSlotCtx.LatestEvictedBlockhash
 	block.EpochAcctsHash = epochCtx.EpochAcctsHash
@@ -800,33 +872,48 @@ func configureBlock(block *b.Block,
 	configureGlobalCtx(block)
 
 	if global.ManageLeaderSchedule() {
-		// NOTE: At epoch boundary, schedule building is deferred to AFTER handleEpochTransition
-		// runs in the main loop. This ensures we have the correct stakes for the new epoch.
-		// The schedule is built and block.Leader is set in the epoch boundary handling code.
-		if epochSchedule.GetEpoch(block.Slot) != lastSlotCtx.Epoch {
-			// Epoch boundary - schedule will be built after handleEpochTransition
-			// Don't look up leader here; it will be set after schedule is built
-			return nil
-		}
-		// Same epoch - use existing schedule
-		var exists bool
-		block.Leader, exists = global.LeaderForSlot(block.Slot)
-		if !exists {
-			// Log schedule context for debugging
-			firstSlot := epochSchedule.FirstSlotInEpoch(block.Epoch)
-			numSlots := epochSchedule.SlotsInEpoch(block.Epoch)
-			lastSlot := firstSlot + numSlots - 1
-			hash := scheduleFullHash(global.LeaderSchedule(), firstSlot, numSlots)
-			mlog.Log.Errorf("LeaderForSlot failed: slot=%d epoch=%d first_slot=%d last_slot=%d hash=%s",
-				block.Slot, block.Epoch, firstSlot, lastSlot, hash)
-			return fmt.Errorf("unable to find leader for slot %d (epoch=%d range=[%d,%d])",
-				block.Slot, block.Epoch, firstSlot, lastSlot)
+		// epoch boundary. do not set leader
+		if epochSchedule.GetEpoch(block.Slot) == lastSlotCtx.Epoch {
+			var hasLeader bool
+			block.Leader, hasLeader = global.LeaderForSlot(block.Slot)
+			if !hasLeader {
+				panic(fmt.Sprintf("couldn't find leader for slot %d at epoch boundary", block.Slot))
+			}
+			var exists bool
+			block.Leader, exists = global.LeaderForSlot(block.Slot)
+			if !exists {
+				return fmt.Errorf("unable to find leader for slot %d", block.Slot)
+			}
 		}
 	}
 
 	if global.ManageBlockHeight() {
 		block.BlockHeight = global.BlockHeight()
 	}
+	return nil
+}
+
+// ensureStakeHistorySysvarCached loads StakeHistory sysvar from AccountsDB into cache if not already cached.
+// Required on resume because updateEpochStakesAndRefreshVoteCache reads SysvarCache.StakeHistory.Sysvar
+// before the first block is processed (which is when sysvars are normally loaded).
+func ensureStakeHistorySysvarCached(acctsDb *accountsdb.AccountsDb, slot uint64) error {
+	if sealevel.SysvarCache.StakeHistory.Sysvar != nil {
+		return nil // Already cached
+	}
+
+	stakeHistoryAcct, err := acctsDb.GetAccount(slot, sealevel.SysvarStakeHistoryAddr)
+	if err != nil {
+		return fmt.Errorf("failed to load StakeHistory sysvar from AccountsDB: %w", err)
+	}
+
+	decoder := bin.NewBinDecoder(stakeHistoryAcct.Data)
+	var stakeHistory sealevel.SysvarStakeHistory
+	stakeHistory.MustUnmarshalWithDecoder(decoder)
+
+	sealevel.SysvarCache.StakeHistory.Sysvar = &stakeHistory
+	sealevel.SysvarCache.StakeHistory.Acct = stakeHistoryAcct
+
+	mlog.Log.Debugf("loaded StakeHistory sysvar from AccountsDB for resume (slot %d)", slot)
 	return nil
 }
 
@@ -861,42 +948,23 @@ func configureInitialBlockFromResume(acctsDb *accountsdb.AccountsDb,
 	setupInitialVoteAcctsAndStakeAccts(acctsDb, block, snapshotManifest)
 	configureGlobalCtx(block)
 
+	// On resume, epoch stakes will be loaded from the persisted state file (not manifest or AccountsDB).
+	// The actual loading happens in ReplayBlocks after this function returns.
+	// We just need to ensure StakeHistory sysvar is cached for potential epoch boundary handling.
+	if err := ensureStakeHistorySysvarCached(acctsDb, block.Slot); err != nil {
+		return fmt.Errorf("failed to ensure stake history sysvar cached: %w", err)
+	}
+
 	// Handle leader schedule
 	if global.ManageLeaderSchedule() {
-		logsDir := config.GetString("log.dir")
-		if logsDir == "" {
-			logsDir = "/mnt/mithril-logs"
-		}
-
-		// Build leader schedule from local state (source of truth)
-		localSummary, err := PrepareLeaderScheduleLocal(block.Epoch, epochSchedule, logsDir)
+		_, err := PrepareLeaderScheduleLocal(block.Epoch, epochSchedule, "")
 		if err != nil {
-			return fmt.Errorf("failed to build leader schedule: %w", err)
+			panic(err)
 		}
-
-		// Background RPC validation - always runs for debugging
-		localSchedule := global.LeaderSchedule()
-		go func() {
-			rpcSchedule, rpcErr := fetchLeaderScheduleFromRPC(block.Epoch, epochSchedule, rpcClient, auxBackupEndpoints)
-			if rpcErr != nil {
-				mlog.Log.Debugf("RPC leader schedule fetch failed (for validation only): %v", rpcErr)
-				return
-			}
-			BackgroundValidateAgainstRPC(block.Epoch, epochSchedule, localSchedule, rpcSchedule, localSummary, logsDir)
-		}()
-
 		var exists bool
 		block.Leader, exists = global.LeaderForSlot(block.Slot)
 		if !exists {
-			// Log schedule context for debugging
-			firstSlot := epochSchedule.FirstSlotInEpoch(block.Epoch)
-			numSlots := epochSchedule.SlotsInEpoch(block.Epoch)
-			lastSlot := firstSlot + numSlots - 1
-			hash := scheduleFullHash(global.LeaderSchedule(), firstSlot, numSlots)
-			mlog.Log.Errorf("LeaderForSlot failed: slot=%d epoch=%d first_slot=%d last_slot=%d hash=%s",
-				block.Slot, block.Epoch, firstSlot, lastSlot, hash)
-			return fmt.Errorf("unable to find leader for slot %d (epoch=%d range=[%d,%d])",
-				block.Slot, block.Epoch, firstSlot, lastSlot)
+			return fmt.Errorf("unable to find leader for slot %d", block.Slot)
 		}
 	}
 
@@ -928,7 +996,6 @@ func configureInitialBlockFromResume(acctsDb *accountsdb.AccountsDb,
 		// Restore SysvarCache.SlotHashes from state file (vote program needs accurate slot→hash mappings)
 		if resumeState.SlotHashes != nil {
 			sealevel.SysvarCache.SlotHashes.Sysvar = resumeState.SlotHashes
-			mlog.Log.Infof("restored SlotHashes sysvar cache with %d entries from state file\n", len(*resumeState.SlotHashes))
 		}
 	} else {
 		// No blockhash context in state file - this should not happen with new state files,
@@ -955,8 +1022,16 @@ func configureGlobalCtx(block *b.Block) {
 	global.SetBlockHeight(block.BlockHeight)
 }
 
-func buildInitialEpochStakesCache(snapshotManifest *snapshot.SnapshotManifest) {
+// buildInitialEpochStakesCache seeds the epoch stakes cache from manifest.
+// If persistedEpochs is non-nil, skips epochs already loaded from the state file.
+func buildInitialEpochStakesCache(snapshotManifest *snapshot.SnapshotManifest, persistedEpochs map[uint64]bool) {
 	for _, epochStake := range snapshotManifest.VersionedEpochStakes {
+		// Skip epochs already loaded from persisted state file
+		if persistedEpochs != nil && persistedEpochs[epochStake.Epoch] {
+			mlog.Log.Debugf("skipping epoch %d stakes from manifest (already loaded from state file)", epochStake.Epoch)
+			continue
+		}
+
 		if epochStake.Epoch == snapshotManifest.Bank.Epoch {
 			for _, entry := range epochStake.Val.EpochAuthorizedVoters {
 				global.PutEpochAuthorizedVoter(entry.Key, entry.Val)
@@ -974,6 +1049,7 @@ func buildInitialEpochStakesCache(snapshotManifest *snapshot.SnapshotManifest) {
 				RentEpoch:         entry.Value.RentEpoch}
 			global.PutEpochStakesEntry(epochStake.Epoch, entry.Key, entry.Stake, voteAcct)
 		}
+		mlog.Log.Debugf("loaded epoch %d stakes from manifest", epochStake.Epoch)
 	}
 }
 
@@ -1030,10 +1106,7 @@ func ReplayBlocks(
 
 	global.SetCalcUnixTimeForClockSysvar(true)
 	global.SetManageBlockHeight(true)
-
-	if isLive {
-		global.SetManageLeaderSchedule(true)
-	}
+	global.SetManageLeaderSchedule(true)
 
 	var err error
 	var currentSlot uint64
@@ -1044,20 +1117,58 @@ func ReplayBlocks(
 	var featuresActivatedInFirstSlot []*accounts.Account
 	var parentFeaturesActivatedInFirstSlot []*accounts.Account
 
-	replayCtx := newReplayCtx(snapshotManifest)
+	// Pass resumeState if resuming, so ReplayCtx uses fresh values instead of stale manifest
+	replayCtx := newReplayCtx(snapshotManifest, resumeState)
 
 	global.IncrTransactionCount(snapshotManifest.Bank.TransactionCount)
 	isFirstSlotInEpoch := epochSchedule.FirstSlotInEpoch(currentEpoch) == startSlot
 	replayCtx.CurrentFeatures, featuresActivatedInFirstSlot, parentFeaturesActivatedInFirstSlot = scanAndEnableFeatures(acctsDb, startSlot, isFirstSlotInEpoch)
 	partitionedEpochRewardsEnabled = replayCtx.CurrentFeatures.IsActive(features.EnablePartitionedEpochReward) || replayCtx.CurrentFeatures.IsActive(features.EnablePartitionedEpochRewardsSuperfeature)
 
-	buildInitialEpochStakesCache(snapshotManifest)
+	// Load epoch stakes - persisted stakes on resume, manifest on fresh start
+	snapshotEpoch := epochSchedule.GetEpoch(snapshotManifest.Bank.Slot)
+	if resumeState != nil {
+		// Resume case - check if we've crossed epoch boundaries since snapshot
+		epochsCrossed := currentEpoch > snapshotEpoch
+		if epochsCrossed && len(resumeState.ComputedEpochStakes) == 0 {
+			// Crossed epoch boundary but no persisted stakes - data loss (crash before persist)
+			mlog.Log.Errorf("Resume at epoch %d (snapshot epoch %d) but no persisted epoch stakes found - cannot use stale manifest stakes (need fresh snapshot)", currentEpoch, snapshotEpoch)
+			result.Error = fmt.Errorf("resume at epoch %d (snapshot epoch %d) but no persisted epoch stakes found - cannot use stale manifest stakes (need fresh snapshot)", currentEpoch, snapshotEpoch)
+			return result
+		}
+		if len(resumeState.ComputedEpochStakes) > 0 {
+			// Load ONLY persisted epoch stakes from state file (NO manifest fallback)
+			// This ensures we use the exact stakes computed at prior epoch boundaries
+			for epoch, data := range resumeState.ComputedEpochStakes {
+				if loadedEpoch, err := global.DeserializeAndLoadEpochStakes(data); err != nil {
+					mlog.Log.Errorf("Failed to load persisted epoch %d stakes: %v", epoch, err)
+					result.Error = fmt.Errorf("failed to load persisted epoch %d stakes: %w", epoch, err)
+					return result
+				} else {
+					mlog.Log.Debugf("Loaded persisted epoch stakes for epoch %d from state file", loadedEpoch)
+				}
+			}
+			// Validate current epoch stakes exist (we build schedules for block.Epoch)
+			// Note: Don't validate leaderScheduleEpoch here - it can point to E+1 in second
+			// half of epoch E with non-standard slot offsets, causing false failures
+			if !global.HasEpochStakes(currentEpoch) {
+				mlog.Log.Errorf("Missing required epoch stakes for current epoch %d - cannot resume (need fresh snapshot)", currentEpoch)
+				result.Error = fmt.Errorf("missing required epoch stakes for current epoch %d - cannot resume (need fresh snapshot)", currentEpoch)
+				return result
+			}
+		} else {
+			// Resume in same epoch as snapshot, no boundaries crossed - manifest is still valid
+			buildInitialEpochStakesCache(snapshotManifest, nil)
+		}
+	} else {
+		// Fresh start: load all epochs from manifest
+		buildInitialEpochStakesCache(snapshotManifest, nil)
+	}
 	//forkChoice, err := forkchoice.NewForkChoiceService(currentEpoch, global.EpochStakes(currentEpoch), global.EpochTotalStake(currentEpoch), global.EpochAuthorizedVoters(), 4)
 	//forkChoice.Start()
 	//global.SetForkChoice(forkChoice)
 
 	var statsCounter int
-	var totalSlotsReplayed int   // cumulative slots replayed this run (for summary display)
 	var execTimes []float64      // seconds per block
 	var waitTimes []float64      // seconds per block
 	var cuValues []uint64        // CU per block
@@ -1118,10 +1229,6 @@ func ReplayBlocks(
 
 	var skippedSlotsCount int // Track skipped slots for 100-slot summary
 
-	// Print replay start marker for clear log separation
-	mlog.Log.InfofPrecise("")
-	mlog.Log.InfofPrecise("=== Replay Start ===")
-
 	for {
 		// Start stall monitor goroutine (only after first block to avoid startup false positives)
 		// Logs to file every second while waiting for a block
@@ -1177,7 +1284,6 @@ func ReplayBlocks(
 			mlog.Log.InfofPrecise("slot %-10d | leader: %-44s | cu: N/A        | txns: N/A              | exec: N/A | total: %.3fs (skipped)",
 				block.Slot, leaderStr, waitTime.Seconds())
 			skippedSlotsCount++
-			totalSlotsReplayed++
 			continue // Skip all execution - no state changes for skipped slots
 		}
 
@@ -1218,18 +1324,12 @@ func ReplayBlocks(
 
 		// epoch boundary
 		if block.Epoch != currentEpoch {
-			mlog.Log.Infof("")
-			mlog.Log.Infof("=== Epoch Boundary: %d -> %d ===", currentEpoch, currentEpoch+1)
-			mlog.Log.Infof("  first_slot_new_epoch=%d num_reward_partitions=%d", block.Slot, block.NumRewardPartitions)
+			mlog.Log.Infof("epoch boundary, %d -> %d", currentEpoch, currentEpoch+1)
 
 			var newlyActivatedFeatures, parentNewlyActivatedFeatures []*accounts.Account
 			replayCtx.CurrentFeatures, newlyActivatedFeatures, parentNewlyActivatedFeatures = scanAndEnableFeatures(acctsDb, currentSlot, true)
 			partitionedEpochRewardsEnabled = replayCtx.CurrentFeatures.IsActive(features.EnablePartitionedEpochReward) || replayCtx.CurrentFeatures.IsActive(features.EnablePartitionedEpochRewardsSuperfeature)
-
-			// Step 1: Compute stakes for the new epoch (BEFORE leader schedule and rewards)
-			epochTransitionCtx := prepareEpochStakes(acctsDb, lastSlotCtx, epochSchedule, replayCtx.CurrentFeatures, block, currentEpoch)
-			mlog.Log.Infof("  stake_computation: vote_accts=%d total_stake=%d", len(block.VoteAccts), block.TotalEpochStake)
-
+			partitionedRewardsInfo = handleEpochTransition(acctsDb, rpcc, rpcBackups, partitionedEpochRewardsEnabled, lastSlotCtx, replayCtx, epochSchedule, replayCtx.CurrentFeatures, block, currentEpoch)
 			currentEpoch = block.Epoch
 			justCrossedEpochBoundary = true
 			if len(newlyActivatedFeatures) != 0 {
@@ -1242,94 +1342,31 @@ func ReplayBlocks(
 				featuresActivatedInFirstSlot = nil
 				parentFeaturesActivatedInFirstSlot = nil
 			}
-
-			// Step 2: Build leader schedule BEFORE rewards distribution.
-			// This ensures schedule verification works even if rewards distribution crashes.
-			if global.ManageLeaderSchedule() {
-				logsDir := config.GetString("log.dir")
-				if logsDir == "" {
-					logsDir = "/mnt/mithril-logs"
-				}
-
-				// NOTE: LeaderScheduleEpoch(slot) returns the epoch whose STAKES are used for the schedule,
-				// which is typically epoch+1 due to LeaderScheduleSlotOffset. But the RNG SEED should be
-				// the TARGET epoch (block.Epoch) - Agave seeds ChaCha20 with the epoch number directly.
-				// We use block.Epoch for both stake lookup and RNG seed, which matches network behavior.
-				scheduleEpoch := epochSchedule.LeaderScheduleEpoch(block.Slot)
-				if scheduleEpoch != block.Epoch {
-					mlog.Log.Warnf("schedule epoch mismatch: LeaderScheduleEpoch(%d)=%d but block.Epoch=%d (warmup/non-mainnet?)",
-						block.Slot, scheduleEpoch, block.Epoch)
-				}
-
-				// Rebuild VoteCache from AccountsDB to ensure correctness.
-				// Use block.VoteAccts (the complete stake map from prepareEpochStakes)
-				// NOT global.EpochStakes which may be incomplete if VoteCache was stale.
-				// This reads the canonical state at the end of the previous epoch (lastSlotCtx.Slot)
-				// and guarantees that all vote accounts in the stake map have valid NodePubkeys.
-				if err := RebuildVoteCacheFromAccountsDB(acctsDb, lastSlotCtx.Slot, block.VoteAccts, 0); err != nil {
-					mlog.Log.Errorf("FATAL: vote cache rebuild failed at epoch boundary: %v", err)
-					result.Error = fmt.Errorf("vote cache rebuild failed: %w", err)
-					break
-				}
-
-				// Refresh global.EpochStakes now that VoteCache is complete
-				cacheEpochStakesForValidation(block.Epoch, block.VoteAccts, block.TotalEpochStake)
-
-				// Build schedule from VoteCache (now guaranteed complete from AccountsDB rebuild)
-				localSummary, err := PrepareLeaderScheduleLocalFromVoteCache(block.Epoch, epochSchedule, logsDir)
-				if err != nil {
-					mlog.Log.Errorf("FATAL: failed to build leader schedule at epoch boundary: %v", err)
-					result.Error = fmt.Errorf("failed to build leader schedule: %w", err)
-					break
-				}
-
-				// Set block.Leader for this block (was deferred in configureBlock)
-				var exists bool
-				block.Leader, exists = global.LeaderForSlot(block.Slot)
-				if !exists {
-					firstSlot := epochSchedule.FirstSlotInEpoch(block.Epoch)
-					numSlots := epochSchedule.SlotsInEpoch(block.Epoch)
-					lastSlot := firstSlot + numSlots - 1
-					hash := scheduleFullHash(global.LeaderSchedule(), firstSlot, numSlots)
-					mlog.Log.Errorf("LeaderForSlot failed at epoch boundary: slot=%d epoch=%d first_slot=%d last_slot=%d hash=%s",
-						block.Slot, block.Epoch, firstSlot, lastSlot, hash)
-					result.Error = fmt.Errorf("unable to find leader for slot %d at epoch boundary (epoch=%d range=[%d,%d])",
-						block.Slot, block.Epoch, firstSlot, lastSlot)
-					break
-				}
-
-				// Background RPC validation - always runs for debugging
-				localSchedule := global.LeaderSchedule()
-				go func() {
-					rpcSchedule, rpcErr := fetchLeaderScheduleFromRPC(block.Epoch, epochSchedule, rpcc, rpcBackups)
-					if rpcErr != nil {
-						mlog.Log.Debugf("RPC leader schedule fetch failed (for validation only): %v", rpcErr)
-						return
-					}
-					BackgroundValidateAgainstRPC(block.Epoch, epochSchedule, localSchedule, rpcSchedule, localSummary, logsDir)
-				}()
-			}
-
-			// Step 3: Distribute rewards and update stake history AFTER leader schedule.
-			// If this crashes, we still have leader schedule logs for debugging.
-			partitionedRewardsInfo = handleEpochRewards(acctsDb, rpcc, rpcBackups, partitionedEpochRewardsEnabled, lastSlotCtx, replayCtx, epochSchedule, replayCtx.CurrentFeatures, block, currentEpoch-1, epochTransitionCtx)
-
-			// Set block height (was deferred in configureBlock's early return at epoch boundary)
-			if global.ManageBlockHeight() {
-				block.BlockHeight = global.BlockHeight()
-			}
 		} else if lastSlotCtx == nil && partitionedEpochRewardsEnabled {
 			// First block being processed - check if we're in rewards period
 			// (uses lastSlotCtx == nil to detect first block, handles skipped startSlot)
 			if rewards.IsWithinRewardsPeriod(block.Epoch, currentSlot, epochSchedule) {
-				panic("bootstrapping during epoch rewards period is currently unsupported.")
+				mlog.Log.Errorf("=======================================================")
+				mlog.Log.Errorf("RESUME DURING REWARDS PERIOD NOT YET SUPPORTED")
+				mlog.Log.Errorf("=======================================================")
+				mlog.Log.Errorf("You stopped during the epoch reward distribution period")
+				mlog.Log.Errorf("(first ~243 slots after epoch boundary).")
+				mlog.Log.Errorf("")
+				mlog.Log.Errorf("This will be supported in a future release.")
+				mlog.Log.Errorf("")
+				mlog.Log.Errorf("Workaround: Delete AccountsDB and restart from snapshot:")
+				mlog.Log.Errorf("  rm -rf <accountsdb_dir>")
+				mlog.Log.Errorf("  Set bootstrap.mode = 'new-snapshot' in config.toml")
+				mlog.Log.Errorf("=======================================================")
+				os.Exit(1)
 			}
 		}
 
 		block.Features = replayCtx.CurrentFeatures
 
-		if len(block.Rewards) > 1 && partitionedEpochRewardsEnabled && currentSlot >= partitionedRewardsInfo.FirstStakingRewardSlot && currentSlot <= partitionedRewardsInfo.LastStakingRewardSlot {
-			distributedAccts, parentDistributedAccts := distributePartitionedEpochRewardsForSlot(acctsDb, replayCtx, partitionedRewardsInfo, currentSlot, block.BlockHeight, partitionedRewardsInfo.LastStakingRewardSlot)
+		// post-epoch boundary rewards distribution
+		if partitionedEpochRewardsEnabled && partitionedRewardsInfo != nil && currentSlot >= partitionedRewardsInfo.FirstStakingRewardSlot && partitionedRewardsInfo.NumRewardPartitionsRemaining > 0 {
+			distributedAccts, parentDistributedAccts := distributePartitionedEpochRewardsForSlot(acctsDb, replayCtx, partitionedRewardsInfo, currentSlot, block.BlockHeight)
 			block.EpochUpdatedAccts = append(block.EpochUpdatedAccts, distributedAccts...)
 			block.ParentEpochUpdatedAccts = append(block.ParentEpochUpdatedAccts, parentDistributedAccts...)
 		}
@@ -1367,6 +1404,8 @@ func ReplayBlocks(
 		if err != nil {
 			mlog.Log.Errorf("error encountered during block replay: %s\n", err)
 			result.Error = err
+			// Clear any pending stake pubkeys from this failed block
+			global.ClearPendingStakePubkeys()
 			break
 		}
 
@@ -1376,11 +1415,24 @@ func ReplayBlocks(
 		lastPersistedSlot = block.Slot
 		lastPersistedBankhash = lastSlotCtx.FinalBankhash
 
+		// Flush any new stake pubkeys discovered during this block to the index file.
+		// This must happen BEFORE we update the state file - crash recovery depends on
+		// the index being at least as current as the state.
+		// CRITICAL: If flush fails, we must NOT continue - the index would fall behind
+		// the state file, causing missing stake accounts on resume.
+		if flushed, err := global.FlushPendingStakePubkeys(acctsDbPath); err != nil {
+			mlog.Log.Errorf("CRITICAL: failed to flush stake pubkey index: %v", err)
+			result.Error = fmt.Errorf("stake index flush failed: %w", err)
+			break
+		} else if flushed > 0 {
+			mlog.Log.Debugf("flushed %d new stake pubkeys to index", flushed)
+		}
+
 		// Check for cancellation immediately after block completes.
 		// This minimizes the window between bankhash persistence and state file update,
 		// preventing false "corruption" detection on graceful shutdown.
 		if ctx.Err() != nil {
-			mlog.Log.Infof("context cancelled after slot %d, exiting replay loop", block.Slot)
+			mlog.Log.Infof("Context cancelled after slot %d, exiting replay loop", block.Slot)
 			result.WasCancelled = true
 
 			// Populate result immediately for state write
@@ -1400,6 +1452,14 @@ func ReplayBlocks(
 				result.LastBlockhash = lastSlotCtx.Blockhash
 				result.LastSlotHashes = sealevel.SysvarCache.SlotHashes.Sysvar
 			}
+
+			// Capture ReplayCtx fields for resume independence from stale manifest
+			result.LastCapitalization = replayCtx.Capitalization
+			result.LastSlotsPerYear = replayCtx.SlotsPerYear
+			result.LastInflation = replayCtx.Inflation
+
+			// Serialize all epoch stakes for persistence
+			result.ComputedEpochStakes = serializeAllEpochStakes()
 
 			// Write state immediately via callback (eliminates timing window for hard kills)
 			if onCancelWriteState != nil {
@@ -1453,9 +1513,6 @@ func ReplayBlocks(
 
 		// Track last executed slot for accurate tip distance calculation and mode switching
 		blockStream.SetLastExecutedSlot(block.Slot)
-
-		// Increment cumulative slot counter (for all slots, including epoch boundaries)
-		totalSlotsReplayed++
 
 		if !justCrossedEpochBoundary {
 			statsCounter++
@@ -1602,7 +1659,7 @@ func ReplayBlocks(
 
 				// Print summary in reorganized format
 				mlog.Log.InfofPrecise("")
-				mlog.Log.InfofPrecise("=== 100 Slot Summary (%d slots replayed) ===", totalSlotsReplayed)
+				mlog.Log.InfofPrecise("=== 100 Slot Summary ===")
 
 				// Line 1: Mode, blocks/sec, skipped slots, tip distance
 				modeStr := "catchup"
@@ -1697,6 +1754,14 @@ func ReplayBlocks(
 		result.LastSlotHashes = sealevel.SysvarCache.SlotHashes.Sysvar
 	}
 
+	// Capture ReplayCtx fields for resume independence from stale manifest
+	result.LastCapitalization = replayCtx.Capitalization
+	result.LastSlotsPerYear = replayCtx.SlotsPerYear
+	result.LastInflation = replayCtx.Inflation
+
+	// Serialize all epoch stakes for persistence
+	result.ComputedEpochStakes = serializeAllEpochStakes()
+
 	return result
 }
 
@@ -1779,7 +1844,7 @@ func newSlotCtx(block *b.Block, accts accounts.Accounts, parentAccts accounts.Ac
 		Features:               block.Features,
 		AcctsLtHash:            block.AcctsLtHash,
 
-		VoteAccts:       block.VoteAccts,
+		VoteAccts:       block.EpochStakesPerVoteAcct,
 		VoteTimestampMu: &sync.Mutex{},
 		VoteTimestamps:  block.VoteTimestamps,
 		TotalEpochStake: block.TotalEpochStake,

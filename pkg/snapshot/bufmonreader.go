@@ -7,9 +7,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"time"
-
-	"github.com/Overclock-Validator/mithril/pkg/mlog"
 )
 
 // ProgressCallback is called with (bytesRead, totalBytes) to report download progress
@@ -21,18 +18,14 @@ type bufmonreader struct {
 	c          io.Closer
 	bytesRead  int64
 	totalSize  int64
-	startTime  time.Time
 	onProgress ProgressCallback
 }
-
-const gib = 1 << 30
 
 func NewBufMonReader(name string, r io.ReadCloser, totalSize int64) *bufmonreader {
 	return &bufmonreader{
 		name:      name,
 		b:         r,
 		totalSize: totalSize,
-		startTime: time.Now(),
 	}
 }
 
@@ -47,7 +40,6 @@ func NewBufMonReaderFromFile(file *os.File) (*bufmonreader, error) {
 		b:         bufio.NewReader(file),
 		c:         file,
 		totalSize: info.Size(),
-		startTime: time.Now(),
 	}, nil
 }
 
@@ -105,7 +97,6 @@ func NewBufMonReaderHTTPWithSave(ctx context.Context, url string, savePath strin
 		b:         reader,
 		c:         closer,
 		totalSize: totalSize,
-		startTime: time.Now(),
 	}, nil
 }
 
@@ -137,30 +128,11 @@ func (x *bufmonreader) TotalSize() int64 {
 
 func (x *bufmonreader) Read(p []byte) (int, error) {
 	n, err := x.b.Read(p)
-	before := x.bytesRead
 	x.bytesRead += int64(n)
 
 	// Call progress callback if set
 	if x.onProgress != nil {
 		x.onProgress(x.bytesRead, x.totalSize)
-	} else if (x.bytesRead / gib) > (before / gib) {
-		// Fallback to logging every GiB if no callback is set
-		percentComplete := float64(x.bytesRead) / float64(x.totalSize) * 100
-
-		elapsed := time.Since(x.startTime)
-		var remaining time.Duration
-		if x.bytesRead > 0 {
-			bytesPerSec := float64(x.bytesRead) / elapsed.Seconds()
-			remainingSecs := float64(x.totalSize-x.bytesRead) / bytesPerSec
-			remaining = time.Duration(remainingSecs * float64(time.Second))
-		}
-
-		mlog.Log.Infof("Processed %.2f of %.2f GiB (%.1f%%) of %s. Est. remaining: %s",
-			float64(x.bytesRead)/float64(gib),
-			float64(x.totalSize)/float64(gib),
-			percentComplete,
-			x.name,
-			remaining.Round(time.Second))
 	}
 	return n, err
 }

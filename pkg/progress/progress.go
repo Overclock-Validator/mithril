@@ -322,6 +322,7 @@ func (d *DualProgress) Start() {
 	if d.useColor {
 		fmt.Fprintf(d.output, "%s", colorReset)
 	}
+	fmt.Fprintln(d.output) // blank line before progress bars
 
 	// Print initial empty lines for progress bars (2 bars)
 	fmt.Fprintln(d.output)
@@ -452,7 +453,7 @@ func (p *IndexingProgress) Start(total int) {
 	p.total = total
 	p.started = true
 	p.startTime = time.Now()
-	fmt.Fprintln(p.output) // Reserve line for progress
+	// Don't reserve a line here - first Update will render in place
 }
 
 // Update updates progress and re-renders
@@ -464,12 +465,16 @@ func (p *IndexingProgress) Update(completed, total int) {
 		return
 	}
 
-	p.completed.Store(int32(completed))
+	prevCompleted := p.completed.Swap(int32(completed))
 	p.total = total
 
-	// Move up and clear line
+	// On first update (prevCompleted was 0), just clear current line
+	// On subsequent updates, move up first then clear
 	if p.useColor {
-		fmt.Fprint(p.output, moveUp+clearLine)
+		if prevCompleted > 0 {
+			fmt.Fprint(p.output, moveUp)
+		}
+		fmt.Fprint(p.output, clearLine)
 	}
 
 	percent := float64(completed) / float64(total) * 100
@@ -590,7 +595,6 @@ func PrintSnapshotSourceSummary(nodeIP string, slot int, referenceSlot int, node
 		rttStr = "N/A"
 	}
 
-	fmt.Println()
 	fmt.Printf("%s┌──────────────────────────────────────────────────────────────────────────────┐%s\n", c, r)
 	fmt.Printf("%s│%s FULL SNAPSHOT SOURCE SELECTED                                                %s│%s\n", c, r, c, r)
 	fmt.Printf("%s├──────────────────────────────────────────────────────────────────────────────┤%s\n", c, r)
@@ -645,7 +649,7 @@ func PrintShutdownSummary(info ShutdownInfo) {
 
 	fmt.Println()
 	fmt.Printf("%s┌──────────────────────────────────────────────────────────────────────────────┐%s\n", c, r)
-	fmt.Printf("%s│%s REPLAY STOPPED                                                               %s│%s\n", c, r, c, r)
+	fmt.Printf("%s│%s%-78s%s│%s\n", c, r, " REPLAY STOPPED", c, r)
 	fmt.Printf("%s├──────────────────────────────────────────────────────────────────────────────┤%s\n", c, r)
 	fmt.Printf("%s│%s %-20s%-57s%s│%s\n", c, r, "Run ID:", info.RunID, c, r)
 	fmt.Printf("%s│%s %-20s%-57s%s│%s\n", c, r, "Last replayed slot:", fmt.Sprintf("%s (epoch %d)", formatSlots(info.LastSlot), info.Epoch), c, r)
@@ -654,20 +658,20 @@ func PrintShutdownSummary(info ShutdownInfo) {
 	fmt.Printf("%s│%s %-20s%-57s%s│%s\n", c, r, "Slots replayed:", fmt.Sprintf("%s (from snapshot slot %s, epoch %d)", formatSlots(uint64(slotsReplayed)), formatSlots(info.SnapshotBaseSlot), info.SnapshotEpoch), c, r)
 	fmt.Printf("%s│%s %-20s%-57s%s│%s\n", c, r, "Total replay time:", durationStr, c, r)
 	fmt.Printf("%s├──────────────────────────────────────────────────────────────────────────────┤%s\n", c, r)
-	fmt.Printf("%s│%s RESTART OPTIONS:                                                             %s│%s\n", c, r, c, r)
-	fmt.Printf("%s│%s                                                                              %s│%s\n", c, r, c, r)
+	fmt.Printf("%s│%s%-78s%s│%s\n", c, r, " RESTART OPTIONS:", c, r)
+	fmt.Printf("%s│%s%-78s%s│%s\n", c, r, "", c, r)
 	resumeStr := fmt.Sprintf("   Resume from slot %s:", formatSlots(nextSlot))
 	fmt.Printf("%s│%s%-78s%s│%s\n", c, r, resumeStr, c, r)
-	fmt.Printf("%s│%s     mithril run --bootstrap-mode=accountsdb                                  %s│%s\n", c, r, c, r)
-	fmt.Printf("%s│%s                                                                              %s│%s\n", c, r, c, r)
+	fmt.Printf("%s│%s%-78s%s│%s\n", c, r, "     mithril run --bootstrap accountsdb", c, r)
+	fmt.Printf("%s│%s%-78s%s│%s\n", c, r, "", c, r)
 	snapshotStr := fmt.Sprintf("   Rebuild from existing snapshot (slot %s):", formatSlots(info.SnapshotBaseSlot))
 	fmt.Printf("%s│%s%-78s%s│%s\n", c, r, snapshotStr, c, r)
-	fmt.Printf("%s│%s     mithril run --bootstrap-mode=snapshot                                    %s│%s\n", c, r, c, r)
-	fmt.Printf("%s│%s                                                                              %s│%s\n", c, r, c, r)
-	fmt.Printf("%s│%s   Download fresh snapshot and rebuild:                                       %s│%s\n", c, r, c, r)
-	fmt.Printf("%s│%s     mithril run --bootstrap-mode=new-snapshot                                %s│%s\n", c, r, c, r)
-	fmt.Printf("%s│%s                                                                              %s│%s\n", c, r, c, r)
-	fmt.Printf("%s│%s State saved to: mithril_state.json                                           %s│%s\n", c, r, c, r)
+	fmt.Printf("%s│%s%-78s%s│%s\n", c, r, "     mithril run --bootstrap snapshot", c, r)
+	fmt.Printf("%s│%s%-78s%s│%s\n", c, r, "", c, r)
+	fmt.Printf("%s│%s%-78s%s│%s\n", c, r, "   Download fresh snapshot and rebuild:", c, r)
+	fmt.Printf("%s│%s%-78s%s│%s\n", c, r, "     mithril run --bootstrap new-snapshot", c, r)
+	fmt.Printf("%s│%s%-78s%s│%s\n", c, r, "", c, r)
+	fmt.Printf("%s│%s%-78s%s│%s\n", c, r, " State saved to: mithril_state.json", c, r)
 	fmt.Printf("%s└──────────────────────────────────────────────────────────────────────────────┘%s\n", c, r)
 	fmt.Println()
 }
@@ -692,23 +696,23 @@ func PrintBuildInterrupted(info BuildInterruptInfo) {
 
 	fmt.Println()
 	fmt.Printf("%s┌──────────────────────────────────────────────────────────────────────────────┐%s\n", c, r)
-	fmt.Printf("%s│%s BUILD INTERRUPTED                                                            %s│%s\n", c, r, c, r)
+	fmt.Printf("%s│%s%-78s%s│%s\n", c, r, " BUILD INTERRUPTED", c, r)
 	fmt.Printf("%s├──────────────────────────────────────────────────────────────────────────────┤%s\n", c, r)
 	fmt.Printf("%s│%s %-20s%-57s%s│%s\n", c, r, "Stage:", info.Stage, c, r)
 	if info.SnapshotSlot > 0 {
 		fmt.Printf("%s│%s %-20s%-57s%s│%s\n", c, r, "Snapshot slot:", formatSlots(info.SnapshotSlot), c, r)
 	}
 	fmt.Printf("%s├──────────────────────────────────────────────────────────────────────────────┤%s\n", c, r)
-	fmt.Printf("%s│%s RESTART OPTIONS:                                                             %s│%s\n", c, r, c, r)
-	fmt.Printf("%s│%s                                                                              %s│%s\n", c, r, c, r)
+	fmt.Printf("%s│%s%-78s%s│%s\n", c, r, " RESTART OPTIONS:", c, r)
+	fmt.Printf("%s│%s%-78s%s│%s\n", c, r, "", c, r)
 	if info.SnapshotPath != "" {
-		fmt.Printf("%s│%s   Rebuild from existing snapshot (already downloaded):                       %s│%s\n", c, r, c, r)
-		fmt.Printf("%s│%s     mithril run --bootstrap-mode=snapshot                                    %s│%s\n", c, r, c, r)
-		fmt.Printf("%s│%s                                                                              %s│%s\n", c, r, c, r)
+		fmt.Printf("%s│%s%-78s%s│%s\n", c, r, "   Rebuild from existing snapshot (already downloaded):", c, r)
+		fmt.Printf("%s│%s%-78s%s│%s\n", c, r, "     mithril run --bootstrap snapshot", c, r)
+		fmt.Printf("%s│%s%-78s%s│%s\n", c, r, "", c, r)
 	}
-	fmt.Printf("%s│%s   Download fresh snapshot and rebuild:                                       %s│%s\n", c, r, c, r)
-	fmt.Printf("%s│%s     mithril run --bootstrap-mode=new-snapshot                                %s│%s\n", c, r, c, r)
-	fmt.Printf("%s│%s                                                                              %s│%s\n", c, r, c, r)
+	fmt.Printf("%s│%s%-78s%s│%s\n", c, r, "   Download fresh snapshot and rebuild:", c, r)
+	fmt.Printf("%s│%s%-78s%s│%s\n", c, r, "     mithril run --bootstrap new-snapshot", c, r)
+	fmt.Printf("%s│%s%-78s%s│%s\n", c, r, "", c, r)
 	if info.SnapshotPath != "" {
 		// Truncate path if too long
 		pathDisplay := info.SnapshotPath
@@ -1079,7 +1083,7 @@ func PrintDownloadInterrupted(info DownloadInterruptInfo) {
 
 	fmt.Println()
 	fmt.Printf("%s┌──────────────────────────────────────────────────────────────────────────────┐%s\n", c, r)
-	fmt.Printf("%s│%s DOWNLOAD INTERRUPTED                                                         %s│%s\n", c, r, c, r)
+	fmt.Printf("%s│%s%-78s%s│%s\n", c, r, " DOWNLOAD INTERRUPTED", c, r)
 	fmt.Printf("%s├──────────────────────────────────────────────────────────────────────────────┤%s\n", c, r)
 	fmt.Printf("%s│%s %-20s%-57s%s│%s\n", c, r, "Stage:", info.Stage, c, r)
 	if info.SourceHost != "" {
@@ -1087,12 +1091,12 @@ func PrintDownloadInterrupted(info DownloadInterruptInfo) {
 	}
 	fmt.Printf("%s│%s %-20s%-57s%s│%s\n", c, r, "Progress:", progressStr, c, r)
 	fmt.Printf("%s├──────────────────────────────────────────────────────────────────────────────┤%s\n", c, r)
-	fmt.Printf("%s│%s TO RESTART:                                                                  %s│%s\n", c, r, c, r)
-	fmt.Printf("%s│%s                                                                              %s│%s\n", c, r, c, r)
-	fmt.Printf("%s│%s   Download will resume from the beginning:                                   %s│%s\n", c, r, c, r)
-	fmt.Printf("%s│%s     mithril run --bootstrap-mode=snapshot                                    %s│%s\n", c, r, c, r)
-	fmt.Printf("%s│%s                                                                              %s│%s\n", c, r, c, r)
-	fmt.Printf("%s│%s Note: Partial download has been cleaned up.                                  %s│%s\n", c, r, c, r)
+	fmt.Printf("%s│%s%-78s%s│%s\n", c, r, " TO RESTART:", c, r)
+	fmt.Printf("%s│%s%-78s%s│%s\n", c, r, "", c, r)
+	fmt.Printf("%s│%s%-78s%s│%s\n", c, r, "   Download will resume from the beginning:", c, r)
+	fmt.Printf("%s│%s%-78s%s│%s\n", c, r, "     mithril run --bootstrap snapshot", c, r)
+	fmt.Printf("%s│%s%-78s%s│%s\n", c, r, "", c, r)
+	fmt.Printf("%s│%s%-78s%s│%s\n", c, r, " Note: Partial download has been cleaned up.", c, r)
 	fmt.Printf("%s└──────────────────────────────────────────────────────────────────────────────┘%s\n", c, r)
 	fmt.Println()
 }

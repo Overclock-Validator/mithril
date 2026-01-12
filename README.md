@@ -111,8 +111,10 @@ go version
 **Step 5: Build Mithril**
 
 ```bash
-go build -o mithril ./cmd/mithril
+make build
 ```
+
+This builds the `mithril` binary with version, commit, and branch information embedded. Alternatively, you can use `make release` for a smaller binary with debug symbols stripped.
 
 ### Configuration
 
@@ -234,7 +236,7 @@ To update Mithril to a newer version:
 # Pull latest changes and rebuild
 cd mithril
 git pull
-go build -o mithril ./cmd/mithril
+make build
 
 # Restart
 ./mithril run --config config.toml

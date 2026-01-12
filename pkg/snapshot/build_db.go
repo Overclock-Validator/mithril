@@ -1,10 +1,10 @@
 package snapshot
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -19,6 +19,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/progress"
 	"github.com/Overclock-Validator/mithril/pkg/statsd"
 	"github.com/cockroachdb/pebble"
+	"github.com/gagliardetto/solana-go"
 	"github.com/panjf2000/ants/v2"
 )
 
@@ -153,28 +154,31 @@ var (
 	appendVecCopyingInProgress    = &atomic.Int64{}
 )
 
-func BuildAccountsDb(
+func BuildAccountsDbPaths(
 	ctx context.Context,
 	snapshotFile string,
 	incrementalSnapshotFile string,
 	accountsDbDir string,
+	dp *progress.DualProgress,
 ) (*accountsdb.AccountsDb, *SnapshotManifest, error) {
 	// Clean any leftover artifacts from previous incomplete runs (e.g., Ctrl+C)
 	CleanAccountsDbDir(accountsDbDir)
 
+	mlog.Log.Infof("Parsing manifest from %s", snapshotFile)
 	manifest, err := UnmarshalManifestFromSnapshot(ctx, snapshotFile, accountsDbDir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("reading snapshot manifest: %v", err)
 	}
-	mlog.Log.Infof("parsed manifest from snapshotFile=%s", snapshotFile)
+	mlog.Log.Infof("Parsed manifest from full snapshot")
 
 	var incrementalManifest *SnapshotManifest
 	if incrementalSnapshotFile != "" {
+		mlog.Log.Infof("Parsing manifest from %s", incrementalSnapshotFile)
 		incrementalManifest, err = UnmarshalManifestFromSnapshot(ctx, incrementalSnapshotFile, accountsDbDir)
 		if err != nil {
 			return nil, nil, fmt.Errorf("reading incremental snapshot manifest: %v", err)
 		}
-		mlog.Log.Infof("parsed manifest from incrementalSnapshotFile=%s", incrementalSnapshotFile)
+		mlog.Log.Infof("Parsed manifest from incremental snapshot")
 	}
 
 	start := time.Now()
@@ -196,36 +200,60 @@ func BuildAccountsDb(
 	numShards := 256
 	sl := NewShardLogger(numShards, logsDir)
 
-	pools, err := initWorkerPools(wg, sl, manifest, incrementalManifest, accountsDbDir, &largestFileId)
+	// Create stake pubkey collector for building stake index during appendvec processing
+	stakeCollector := &stakeIndexCollector{
+		pubkeys: make([]solana.PublicKey, 0, 1000000), // Pre-allocate for ~1M stake accounts
+	}
+
+	pools, err := initWorkerPools(wg, sl, manifest, incrementalManifest, accountsDbDir, &largestFileId, stakeCollector)
 	if err != nil {
 		return nil, nil, fmt.Errorf("initializing worker pools: %w", err)
 	}
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		err = readTar(ctx, wg, snapshotFile, pools.appendVecCopying, readTarOptions{})
-	}()
-
-	var incrementalErr error
-	if incrementalSnapshotFile != "" {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			start := time.Now()
-			incrementalErr = readTar(ctx, wg, incrementalSnapshotFile, pools.appendVecCopying, readTarOptions{isIncremental: true})
-			mlog.Log.Infof("finished reading %s in %s", incrementalSnapshotFile, fmtDuration(time.Since(start)))
-		}()
+	// Start progress display if provided
+	if dp != nil {
+		// Flush mlog's buffered writer AND OS buffers before starting progress bars
+		// This prevents late-flushing logs from breaking cursor positioning
+		mlog.Flush()
+		os.Stdout.Sync()
+		os.Stderr.Sync()
+		dp.Start()
 	}
 
+	// Process snapshots sequentially for better performance (less lock contention)
+	// Full snapshot first
+	err = readTar(ctx, wg, snapshotFile, pools.appendVecCopying, readTarOptions{progress: dp})
+
+	// Wait for ALL worker tasks from full snapshot to complete before starting incremental
 	wg.Wait()
-	if err := errors.Join(err, incrementalErr); err != nil {
-		mlog.Log.Errorf("failed while processing snapshots: %v", err)
+
+	// Stop progress display after full snapshot
+	if dp != nil {
+		if err != nil {
+			dp.Interrupt(err)
+		} else {
+			dp.Stop()
+		}
+	}
+
+	if err != nil {
 		return nil, nil, err
 	}
-	mlog.Log.Infof("Done unpacking and sharding snapshot in %s, closing shard logger", fmtDuration(time.Since(start)))
 
-	// Show indexing progress for shard flush
+	// Process incremental snapshot (if provided)
+	if incrementalSnapshotFile != "" {
+		err = readTar(ctx, wg, incrementalSnapshotFile, pools.appendVecCopying,
+			readTarOptions{isIncremental: true})
+		if err != nil {
+			return nil, nil, err
+		}
+		// Wait for all incremental worker tasks to complete
+		wg.Wait()
+	}
+
+	mlog.Log.Debugf("done processing snapshots in %s.", fmtDuration(time.Since(start)))
+
+	// Show indexing progress for shard flush (no gap between DualProgress and this)
 	indexProgress := progress.NewIndexingProgress("Flush (shard logs)")
 	indexProgress.Start(numShards)
 	err = sl.CloseWithProgress(ctx, func(completed, total int) {
@@ -259,6 +287,13 @@ func BuildAccountsDb(
 
 	pools.Release()
 
+	// Write stake pubkey index file
+	stakeIndexPath := filepath.Join(accountsDbDir, "stake_pubkeys.idx")
+	if err := WriteStakePubkeyIndex(stakeIndexPath, stakeCollector.pubkeys); err != nil {
+		return nil, nil, fmt.Errorf("writing stake pubkey index: %w", err)
+	}
+	mlog.Log.Infof("wrote %d stake pubkeys to index", len(stakeCollector.pubkeys))
+
 	accountsDb := &accountsdb.AccountsDb{Index: index, AcctsDir: appendVecsOutputDir}
 	accountsDb.LargestFileId.Store(largestFileId.Load())
 
@@ -284,7 +319,7 @@ func isAppendVec(filename string) bool {
 type readTarOptions struct {
 	// Saves snapshot to a file if non-empty.
 	savePath string
-	// Update a progress bar if Progress is non-nil. If nil, will update via log.
+	// Update a progress bar if Progress is non-nil.
 	progress *progress.DualProgress
 	// True if the tar file is incremental or false if it's a full snapshot.
 	isIncremental bool
@@ -379,6 +414,32 @@ type snapshotWorkerPools struct {
 	indexEntryCommitter *ants.PoolWithFunc
 }
 
+// stakeIndexCollector aggregates stake account pubkeys from multiple worker goroutines
+// during appendvec processing. Used to build the stake pubkey index file.
+//
+// WHY: The manifest's delegation list can be stale/incomplete (Firedancer notes:
+// "the cache in the manifest is partially incomplete"). Instead of trusting manifest
+// data, we:
+//   1. Collect stake pubkeys during appendvec parsing (by checking owner == StakeProgramAddr)
+//   2. Write them to stake_pubkeys.idx after snapshot processing
+//   3. At startup, load pubkeys from index and read ALL delegation fields from AccountsDB
+//
+// This ensures stake cache contains fresh data from AccountsDB, not potentially stale
+// manifest data.
+type stakeIndexCollector struct {
+	mu      sync.Mutex
+	pubkeys []solana.PublicKey
+}
+
+func (c *stakeIndexCollector) Add(pks []solana.PublicKey) {
+	if len(pks) == 0 {
+		return
+	}
+	c.mu.Lock()
+	c.pubkeys = append(c.pubkeys, pks...)
+	c.mu.Unlock()
+}
+
 func initWorkerPools(
 	wg *sync.WaitGroup,
 	sl *ShardLogger,
@@ -386,6 +447,7 @@ func initWorkerPools(
 	incrementalManifest *SnapshotManifest,
 	accountsDbDir string,
 	largestFileId *atomic.Uint64,
+	stakeCollector *stakeIndexCollector,
 ) (*snapshotWorkerPools, error) {
 	indexEntryCommitterPool, err := ants.NewPoolWithFunc(maxIndexEntryCommitter, func(i any) {
 		tasks := indexEntryCommitterInProgress.Add(1)
@@ -410,11 +472,14 @@ func initWorkerPools(
 		start := time.Now()
 		defer wg.Done()
 		task := i.(indexEntryBuilderTask)
-		pubkeys, entries, err := accountsdb.BuildIndexEntriesFromAppendVecs(task.Data, task.FileSize, task.Slot, task.FileId)
+		pubkeys, entries, stakePubkeys, err := accountsdb.BuildIndexEntriesFromAppendVecs(task.Data, task.FileSize, task.Slot, task.FileId)
 		if err != nil {
 			mlog.Log.Errorf("BuildIndexEntriesFromAppendVecs: %v", err)
 			return
 		}
+
+		// Collect stake pubkeys for building stake index
+		stakeCollector.Add(stakePubkeys)
 
 		indexEntryBuilderInProgress.Add(-1)
 		commitTask := indexEntryCommitterTask{IndexEntries: entries, Pubkeys: pubkeys}
@@ -549,4 +614,37 @@ func ingestSSTFiles(indexDir, logsDir string) (*pebble.DB, error) {
 		return nil, fmt.Errorf("ingesting SSTs: %w", err)
 	}
 	return db, nil
+}
+
+// WriteStakePubkeyIndex writes stake pubkeys to a binary index file.
+// Format: 32-byte pubkeys appended sequentially, no header.
+func WriteStakePubkeyIndex(path string, pubkeys []solana.PublicKey) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	buf := bufio.NewWriter(f)
+	for _, pk := range pubkeys {
+		if _, err := buf.Write(pk[:]); err != nil {
+			return err
+		}
+	}
+	return buf.Flush()
+}
+
+// LoadStakePubkeyIndex reads stake pubkeys from a binary index file.
+func LoadStakePubkeyIndex(path string) ([]solana.PublicKey, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	count := len(data) / 32
+	pubkeys := make([]solana.PublicKey, count)
+	for i := 0; i < count; i++ {
+		copy(pubkeys[i][:], data[i*32:(i+1)*32])
+	}
+	return pubkeys, nil
 }

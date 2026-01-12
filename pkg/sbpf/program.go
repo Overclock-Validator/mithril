@@ -16,6 +16,5 @@ type Program struct {
 
 // Verify runs the static bytecode verifier.
 func (p *Program) Verify() error {
-	return nil
-	//return NewVerifier(p).VerifyProgram()
+	return NewVerifier(p).VerifyProgram()
 }

@@ -22,64 +22,89 @@ const CurrentStateSchemaVersion uint32 = 1
 // The state file serves as an atomic marker of validity - AccountsDB is valid
 // if and only if this file exists with Stage == "ready".
 type MithrilState struct {
-	// Schema version for state file format migrations
+	// =========================================================================
+	// Schema & Run Lineage
+	// =========================================================================
 	StateSchemaVersion uint32 `json:"state_schema_version"`
+	// Run lineage - tracks the chain of sessions that have used this AccountsDB
+	RootRunID    string `json:"root_run_id,omitempty"`    // Run that built AccountsDB from snapshot (never changes)
+	ParentRunID  string `json:"parent_run_id,omitempty"`  // Run we resumed from (empty if fresh start)
+	CurrentRunID string `json:"current_run_id,omitempty"` // Run that last wrote this file
 
-	Stage          string        `json:"stage"` // "ready", "downloading", "building", "corrupted"
-	SnapshotSlot   uint64        `json:"snapshot_slot"`
-	SnapshotEpoch  uint64        `json:"snapshot_epoch,omitempty"`
-	LastSlot       uint64        `json:"last_slot,omitempty"`
-	LastEpoch      uint64        `json:"last_epoch,omitempty"`
-	LastBankhash   string        `json:"last_bankhash,omitempty"`
-	FullSnapshot   *SnapshotInfo `json:"full_snapshot,omitempty"`
-	IncrSnapshot   *SnapshotInfo `json:"incr_snapshot,omitempty"`
-	BuildCompleted time.Time     `json:"build_completed_at,omitempty"`
+	// =========================================================================
+	// Writer Metadata (who last wrote this file and why they stopped)
+	// =========================================================================
+	LastWriterVersion  string    `json:"last_writer_version,omitempty"`  // Semver tag (e.g., "v0.1.0" or "dev")
+	LastWriterCommit   string    `json:"last_writer_commit,omitempty"`   // Git commit hash of writer binary
+	LastWriterBranch   string    `json:"last_writer_branch,omitempty"`   // Git branch name (may be empty)
+	LastShutdownReason string    `json:"last_shutdown_reason,omitempty"` // human-readable reason
+	LastShutdownAt     time.Time `json:"last_shutdown_at,omitempty"`     // when shutdown occurred
 
-	// Build metadata - tracks how and when AccountsDB was built
-	BuildStartedAt time.Time `json:"build_started_at,omitempty"` // When bootstrap started
-	BuildMode      string    `json:"build_mode,omitempty"`       // "auto", "snapshot", "new-snapshot", "accountsdb"
-
-	// Cluster safety - prevents mainnet/testnet mixups
-	Cluster     string `json:"cluster,omitempty"`      // "mainnet-beta", "testnet", "devnet"
-	GenesisHash string `json:"genesis_hash,omitempty"` // Base58 genesis hash from RPC
+	// =========================================================================
+	// AccountsDB Origin (snapshot info - set once, never changes)
+	// =========================================================================
+	Stage          string        `json:"stage"`                       // "ready", "downloading", "building", "corrupted"
+	SnapshotSlot   uint64        `json:"snapshot_slot"`               // Slot of the snapshot used to build AccountsDB
+	SnapshotEpoch  uint64        `json:"snapshot_epoch,omitempty"`    // Epoch of the snapshot
+	FullSnapshot   *SnapshotInfo `json:"full_snapshot,omitempty"`     // Full snapshot file info
+	IncrSnapshot   *SnapshotInfo `json:"incr_snapshot,omitempty"`     // Incremental snapshot file info
+	BuildCompleted time.Time     `json:"build_completed_at,omitempty"` // When AccountsDB build finished
+	BuildStartedAt time.Time     `json:"build_started_at,omitempty"`  // When bootstrap started
+	BuildMode      string        `json:"build_mode,omitempty"`        // "auto", "snapshot", "new-snapshot", "accountsdb"
+	Cluster        string        `json:"cluster,omitempty"`           // "mainnet-beta", "testnet", "devnet"
+	GenesisHash    string        `json:"genesis_hash,omitempty"`      // Base58 genesis hash from RPC
 
 	// Corruption tracking - set when integrity check fails
 	CorruptionReason     string    `json:"corruption_reason,omitempty"`
 	CorruptionDetectedAt time.Time `json:"corruption_detected_at,omitempty"`
 
-	// Resume context - stored on shutdown to properly configure first block on resume
-	// These fields capture the state at the end of the last successfully replayed slot
-	LastAcctsLtHash          string `json:"last_accts_lt_hash,omitempty"`           // base64 encoded LtHash
-	LastLamportsPerSignature uint64 `json:"last_lamports_per_sig,omitempty"`        // FeeRateGovernor.LamportsPerSignature
-	LastPrevLamportsPerSig   uint64 `json:"last_prev_lamports_per_sig,omitempty"`   // FeeRateGovernor.PrevLamportsPerSignature
-	LastNumSignatures        uint64 `json:"last_num_signatures,omitempty"`          // SlotCtx.NumSignatures
+	// =========================================================================
+	// Current Position (where we left off)
+	// =========================================================================
+	LastSlot     uint64 `json:"last_slot,omitempty"`     // Last successfully replayed slot
+	LastEpoch    uint64 `json:"last_epoch,omitempty"`    // Epoch of last replayed slot
+	LastBankhash string `json:"last_bankhash,omitempty"` // Bankhash of last replayed slot (base58)
 
-	// Blockhash context - required because appendvec file writes are not fsynced,
-	// so RecentBlockhashes sysvar data in AccountsDB may be stale after restart.
-	// These are all base58 encoded.
+	// =========================================================================
+	// Resume Context (everything needed to continue replay from LastSlot)
+	// These fields capture state at the end of the last successfully replayed slot
+	// =========================================================================
+
+	// LtHash and fee state
+	LastAcctsLtHash          string `json:"last_accts_lt_hash,omitempty"`         // base64 encoded cumulative LtHash
+	LastLamportsPerSignature uint64 `json:"last_lamports_per_sig,omitempty"`      // FeeRateGovernor.LamportsPerSignature
+	LastPrevLamportsPerSig   uint64 `json:"last_prev_lamports_per_sig,omitempty"` // FeeRateGovernor.PrevLamportsPerSignature
+	LastNumSignatures        uint64 `json:"last_num_signatures,omitempty"`        // SlotCtx.NumSignatures
+
+	// Blockhash context - required because appendvec writes are not fsynced
 	LastRecentBlockhashes []BlockhashEntry `json:"last_recent_blockhashes,omitempty"` // 150 entries, newest first
-	LastEvictedBlockhash  string           `json:"last_evicted_blockhash,omitempty"`  // 151st blockhash
-	LastBlockhash         string           `json:"last_blockhash,omitempty"`          // blockhash of last replayed slot (parent for next)
+	LastEvictedBlockhash  string           `json:"last_evicted_blockhash,omitempty"`  // 151st blockhash (base58)
+	LastBlockhash         string           `json:"last_blockhash,omitempty"`          // Blockhash of last slot (base58)
 
-	// SlotHashes context - same issue as RecentBlockhashes, appendvec writes not fsynced.
-	// SlotHashes is used by vote program to verify vote slot→hash mappings.
+	// SlotHashes context - vote program needs accurate slot→hash mappings
 	LastSlotHashes []SlotHashEntry `json:"last_slot_hashes,omitempty"` // up to 512 entries, newest first
 
-	// Run tracking - for correlating logs with state
-	LastRunID string    `json:"last_run_id,omitempty"` // Run ID from last replay session
-	LastRunAt time.Time `json:"last_run_at,omitempty"` // When last replay session started
+	// ReplayCtx fields - so resume uses fresh values instead of stale manifest
+	LastCapitalization          uint64  `json:"last_capitalization,omitempty"`           // Total lamports in circulation
+	LastSlotsPerYear            float64 `json:"last_slots_per_year,omitempty"`           // Slots per year for inflation calc
+	LastInflationInitial        float64 `json:"last_inflation_initial,omitempty"`        // Inflation parameters
+	LastInflationTerminal       float64 `json:"last_inflation_terminal,omitempty"`
+	LastInflationTaper          float64 `json:"last_inflation_taper,omitempty"`
+	LastInflationFoundation     float64 `json:"last_inflation_foundation,omitempty"`
+	LastInflationFoundationTerm float64 `json:"last_inflation_foundation_term,omitempty"`
 
-	// Writer info - tracks which binary version last wrote to this state
-	LastWriterVersion string `json:"last_writer_version,omitempty"` // Semver tag (e.g., "v0.1.0" or "dev")
-	LastWriterCommit  string `json:"last_writer_commit,omitempty"`  // Git commit hash of writer binary
+	// EpochStakes - computed at epoch boundaries, required for leader schedule on resume
+	// Key: epoch number (leader schedule epoch), Value: JSON-serialized epoch stakes
+	// These are NOT loaded from manifest - they are computed during replay and persisted.
+	ComputedEpochStakes map[uint64]string `json:"computed_epoch_stakes,omitempty"`
 
-	// Legacy field name - kept for backwards compatibility during migration
+	// =========================================================================
+	// Legacy fields - kept for backwards compatibility
+	// =========================================================================
 	// TODO: Remove after v1.0 release
-	LastCommit string `json:"last_commit,omitempty"` // Deprecated: use last_writer_commit
-
-	// Shutdown tracking - records why the last session ended
-	LastShutdownReason string    `json:"last_shutdown_reason,omitempty"` // human-readable reason
-	LastShutdownAt     time.Time `json:"last_shutdown_at,omitempty"`     // when shutdown occurred
+	LastCommit string    `json:"last_commit,omitempty"`  // Deprecated: use last_writer_commit
+	LastRunID  string    `json:"last_run_id,omitempty"`  // Deprecated: use current_run_id
+	LastRunAt  time.Time `json:"last_run_at,omitempty"`  // Deprecated: tracked via last_shutdown_at
 }
 
 // Shutdown reason constants - these are stored in the state file and should be
@@ -186,13 +211,28 @@ func (s *MithrilState) MarkCorrupted(accountsDbDir string, reason string) error 
 	return s.Save(accountsDbDir)
 }
 
-// ResumeContext contains the context needed to properly resume replay from a saved state.
-type ResumeContext struct {
+// ShutdownContext contains the data to persist on graceful shutdown.
+// This is passed to UpdateOnShutdown to save the current session state.
+type ShutdownContext struct {
+	// Current session's run ID (becomes CurrentRunID in state file)
+	RunID string
+
+	// Writer info
+	WriterVersion string // Semver tag (e.g., "v0.1.0" or "dev")
+	WriterCommit  string // Git commit hash
+	WriterBranch  string // Git branch name (may be empty if not available)
+
+	// Shutdown reason
+	ShutdownReason string // Why the session ended (see ShutdownReason* constants)
+
+	// Epoch of the last replayed slot
+	Epoch uint64
+
+	// LtHash and fee state
 	AcctsLtHash          string // base64 encoded
 	LamportsPerSignature uint64
 	PrevLamportsPerSig   uint64
 	NumSignatures        uint64
-	Epoch                uint64 // epoch of the last replayed slot
 
 	// Blockhash context
 	RecentBlockhashes []BlockhashEntry // 150 entries, newest first
@@ -202,16 +242,18 @@ type ResumeContext struct {
 	// SlotHashes context - vote program uses this to verify slot→hash mappings
 	SlotHashes []SlotHashEntry // up to 512 entries, newest first
 
-	// Run tracking
-	RunID        string    // Run ID for log correlation
-	RunStartedAt time.Time // When this replay session started
+	// ReplayCtx fields - so resume uses fresh values instead of stale manifest
+	Capitalization          uint64  // Total lamports in circulation
+	SlotsPerYear            float64 // Slots per year for inflation calc
+	InflationInitial        float64
+	InflationTerminal       float64
+	InflationTaper          float64
+	InflationFoundation     float64
+	InflationFoundationTerm float64
 
-	// Writer info
-	WriterVersion string // Semver tag (e.g., "v0.1.0" or "dev")
-	WriterCommit  string // Git commit hash
-
-	// Shutdown tracking
-	ShutdownReason string // Why the session ended (see ShutdownReason* constants)
+	// EpochStakes - computed at epoch boundaries, required for leader schedule on resume
+	// Key: epoch number, Value: JSON-serialized epoch stakes (as []byte)
+	ComputedEpochStakes map[uint64][]byte
 }
 
 // UpdateLastSlot updates the last slot and bankhash in the state file.
@@ -222,41 +264,76 @@ func (s *MithrilState) UpdateLastSlot(accountsDbDir string, slot uint64, bankhas
 	return s.Save(accountsDbDir)
 }
 
-// UpdateLastSlotWithContext updates the last slot, bankhash, and resume context in the state file.
-// This should be called on graceful shutdown to preserve the full context needed for resume.
-func (s *MithrilState) UpdateLastSlotWithContext(accountsDbDir string, slot uint64, bankhash []byte, ctx *ResumeContext) error {
+// UpdateOnShutdown updates the state file with full shutdown context.
+// This handles the run lineage: the current session's RunID becomes CurrentRunID,
+// and if this is a resume, the previous CurrentRunID becomes ParentRunID.
+func (s *MithrilState) UpdateOnShutdown(accountsDbDir string, slot uint64, bankhash []byte, ctx *ShutdownContext) error {
 	s.LastSlot = slot
 	s.LastBankhash = base58.Encode(bankhash)
+
 	if ctx != nil {
-		s.LastAcctsLtHash = ctx.AcctsLtHash
-		s.LastLamportsPerSignature = ctx.LamportsPerSignature
-		s.LastPrevLamportsPerSig = ctx.PrevLamportsPerSig
-		s.LastNumSignatures = ctx.NumSignatures
-		s.LastEpoch = ctx.Epoch
-
-		// Blockhash context - required because appendvec writes are not fsynced
-		s.LastRecentBlockhashes = ctx.RecentBlockhashes
-		s.LastEvictedBlockhash = ctx.EvictedBlockhash
-		s.LastBlockhash = ctx.LastBlockhash
-
-		// SlotHashes context - same issue, vote program needs accurate slot→hash mappings
-		s.LastSlotHashes = ctx.SlotHashes
-
-		// Run tracking - for correlating logs with state
-		s.LastRunID = ctx.RunID
-		s.LastRunAt = ctx.RunStartedAt
+		// Update run lineage:
+		// - If this is first run (RootRunID empty), set RootRunID = CurrentRunID = ctx.RunID
+		// - If resuming, ParentRunID = old CurrentRunID, CurrentRunID = ctx.RunID
+		if s.RootRunID == "" {
+			// First run - this session built AccountsDB from snapshot
+			s.RootRunID = ctx.RunID
+		}
+		if s.CurrentRunID != "" && s.CurrentRunID != ctx.RunID {
+			// We're a new session resuming from a previous one
+			s.ParentRunID = s.CurrentRunID
+		}
+		s.CurrentRunID = ctx.RunID
 
 		// Writer info
 		s.LastWriterVersion = ctx.WriterVersion
 		s.LastWriterCommit = ctx.WriterCommit
-		// Also set legacy field for backwards compatibility
-		s.LastCommit = ctx.WriterCommit
+		s.LastWriterBranch = ctx.WriterBranch
+		s.LastCommit = ctx.WriterCommit // Legacy field
 
 		// Shutdown tracking
 		if ctx.ShutdownReason != "" {
 			s.LastShutdownReason = ctx.ShutdownReason
 			s.LastShutdownAt = time.Now()
 		}
+
+		// Position and epoch
+		s.LastEpoch = ctx.Epoch
+
+		// Resume context - LtHash and fee state
+		s.LastAcctsLtHash = ctx.AcctsLtHash
+		s.LastLamportsPerSignature = ctx.LamportsPerSignature
+		s.LastPrevLamportsPerSig = ctx.PrevLamportsPerSig
+		s.LastNumSignatures = ctx.NumSignatures
+
+		// Blockhash context
+		s.LastRecentBlockhashes = ctx.RecentBlockhashes
+		s.LastEvictedBlockhash = ctx.EvictedBlockhash
+		s.LastBlockhash = ctx.LastBlockhash
+
+		// SlotHashes context
+		s.LastSlotHashes = ctx.SlotHashes
+
+		// ReplayCtx fields
+		s.LastCapitalization = ctx.Capitalization
+		s.LastSlotsPerYear = ctx.SlotsPerYear
+		s.LastInflationInitial = ctx.InflationInitial
+		s.LastInflationTerminal = ctx.InflationTerminal
+		s.LastInflationTaper = ctx.InflationTaper
+		s.LastInflationFoundation = ctx.InflationFoundation
+		s.LastInflationFoundationTerm = ctx.InflationFoundationTerm
+
+		// EpochStakes - convert []byte values to string for JSON storage
+		if len(ctx.ComputedEpochStakes) > 0 {
+			s.ComputedEpochStakes = make(map[uint64]string, len(ctx.ComputedEpochStakes))
+			for epoch, data := range ctx.ComputedEpochStakes {
+				s.ComputedEpochStakes[epoch] = string(data)
+			}
+		}
+
+		// Also update legacy fields for backwards compatibility
+		s.LastRunID = ctx.RunID
+		s.LastRunAt = time.Now()
 	}
 
 	// Ensure schema version is set
@@ -265,40 +342,10 @@ func (s *MithrilState) UpdateLastSlotWithContext(accountsDbDir string, slot uint
 	return s.Save(accountsDbDir)
 }
 
-// HasResumeContext returns true if the state has resume context stored.
+// HasResumeData returns true if the state has resume context stored.
 // This indicates the state was saved during a graceful shutdown with full context.
-func (s *MithrilState) HasResumeContext() bool {
+func (s *MithrilState) HasResumeData() bool {
 	return s != nil && s.LastSlot > 0 && s.LastAcctsLtHash != ""
-}
-
-// GetResumeContext returns the stored resume context, or nil if not present.
-func (s *MithrilState) GetResumeContext() *ResumeContext {
-	if !s.HasResumeContext() {
-		return nil
-	}
-	return &ResumeContext{
-		AcctsLtHash:          s.LastAcctsLtHash,
-		LamportsPerSignature: s.LastLamportsPerSignature,
-		PrevLamportsPerSig:   s.LastPrevLamportsPerSig,
-		NumSignatures:        s.LastNumSignatures,
-		Epoch:                s.LastEpoch,
-
-		// Blockhash context
-		RecentBlockhashes: s.LastRecentBlockhashes,
-		EvictedBlockhash:  s.LastEvictedBlockhash,
-		LastBlockhash:     s.LastBlockhash,
-
-		// SlotHashes context
-		SlotHashes: s.LastSlotHashes,
-
-		// Run tracking (from previous session)
-		RunID:        s.LastRunID,
-		RunStartedAt: s.LastRunAt,
-
-		// Writer info (from previous session)
-		WriterVersion: s.LastWriterVersion,
-		WriterCommit:  s.getWriterCommit(),
-	}
 }
 
 // getWriterCommit returns the writer commit, preferring the new field but falling back to legacy.

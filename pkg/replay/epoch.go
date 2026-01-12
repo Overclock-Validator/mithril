@@ -3,6 +3,7 @@ package replay
 import (
 	"bytes"
 	"fmt"
+	"maps"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -32,11 +33,28 @@ type ReplayCtx struct {
 	HasEpochAcctsHash bool
 }
 
-func newReplayCtx(snapshotManifest *snapshot.SnapshotManifest) *ReplayCtx {
+// newReplayCtx creates a new ReplayCtx, preferring values from resumeState if available.
+// This ensures resume uses fresh values instead of potentially stale manifest data.
+func newReplayCtx(snapshotManifest *snapshot.SnapshotManifest, resumeState *ResumeState) *ReplayCtx {
 	epochCtx := new(ReplayCtx)
-	epochCtx.Capitalization = snapshotManifest.Bank.Capitalization
-	epochCtx.Inflation = snapshotManifest.Bank.Inflation
-	epochCtx.SlotsPerYear = snapshotManifest.Bank.SlotsPerYear
+
+	// Prefer resume state if available (has non-zero capitalization)
+	if resumeState != nil && resumeState.Capitalization > 0 {
+		epochCtx.Capitalization = resumeState.Capitalization
+		epochCtx.SlotsPerYear = resumeState.SlotsPerYear
+		epochCtx.Inflation = rewards.Inflation{
+			Initial:        resumeState.InflationInitial,
+			Terminal:       resumeState.InflationTerminal,
+			Taper:          resumeState.InflationTaper,
+			FoundationVal:  resumeState.InflationFoundation,
+			FoundationTerm: resumeState.InflationFoundationTerm,
+		}
+	} else {
+		// Fallback to manifest (fresh start)
+		epochCtx.Capitalization = snapshotManifest.Bank.Capitalization
+		epochCtx.Inflation = snapshotManifest.Bank.Inflation
+		epochCtx.SlotsPerYear = snapshotManifest.Bank.SlotsPerYear
+	}
 
 	if snapshotManifest.EpochAccountHash != [32]byte{} {
 		epochCtx.HasEpochAcctsHash = true
@@ -112,55 +130,7 @@ func updateStakeHistorySysvar(acctsDb *accountsdb.AccountsDb, block *block.Block
 	return &stakeHistory
 }
 
-func refreshVoteAcctsCache(prevSlotCtx *sealevel.SlotCtx, acctsDb *accountsdb.AccountsDb, stakeHistory *sealevel.SysvarStakeHistory, newEpoch uint64, newRateActivationEpoch *uint64) map[solana.PublicKey]uint64 {
-	voteAcctStakes := make(map[solana.PublicKey]uint64)
-
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-
-	workerPool, _ := ants.NewPoolWithFunc(runtime.GOMAXPROCS(0)*8, func(i interface{}) {
-		defer wg.Done()
-
-		delegation := i.(*sealevel.Delegation)
-		votePk := delegation.VoterPubkey
-		stakeLamports := delegation.Stake(newEpoch, stakeHistory, newRateActivationEpoch)
-
-		mu.Lock()
-		voteAcctStakes[votePk] += stakeLamports
-		mu.Unlock()
-	})
-
-	for _, delegation := range global.StakeCache() {
-		wg.Add(1)
-		workerPool.Invoke(delegation)
-	}
-
-	wg.Wait()
-	workerPool.Release()
-	ants.Release()
-
-	// Return full stake map - don't filter by previous epoch's vote accounts.
-	// New vote accounts can appear during an epoch (via CreateAccount + Initialize),
-	// and their stake should be included in the next epoch's leader schedule.
-	// The old filtering logic would drop any vote accounts that didn't exist
-	// in prevSlotCtx.VoteAccts, causing missing stake in the schedule.
-	return voteAcctStakes
-}
-
-// EpochTransitionContext holds the intermediate state needed between stake computation
-// and rewards distribution. This allows leader schedule to be built in between,
-// so schedule verification works even if rewards distribution crashes.
-type EpochTransitionContext struct {
-	StakeHistory               *sealevel.SysvarStakeHistory
-	NewEpoch                   uint64
-	FirstSlotInEpoch           uint64
-	NewWarmupCooldownRateEpoch *uint64
-}
-
-// prepareEpochStakes computes the stake distribution for the new epoch.
-// This must be called BEFORE leader schedule computation and rewards distribution.
-// Returns the context needed by handleEpochRewards.
-func prepareEpochStakes(acctsDb *accountsdb.AccountsDb, prevSlotCtx *sealevel.SlotCtx, epochSchedule *sealevel.SysvarEpochSchedule, f *features.Features, block *block.Block, epoch uint64) *EpochTransitionContext {
+func handleEpochTransition(acctsDb *accountsdb.AccountsDb, rpcc *rpcclient.RpcClient, rpcBackups []string, partitionedEpochRewards bool, prevSlotCtx *sealevel.SlotCtx, replayCtx *ReplayCtx, epochSchedule *sealevel.SysvarEpochSchedule, f *features.Features, block *block.Block, epoch uint64) *rewards.PartitionedRewardDistributionInfo {
 	var stakeHistory sealevel.SysvarStakeHistory
 	stakeHistoryAcct, err := prevSlotCtx.GetAccount(sealevel.SysvarStakeHistoryAddr)
 	if err != nil {
@@ -172,122 +142,120 @@ func prepareEpochStakes(acctsDb *accountsdb.AccountsDb, prevSlotCtx *sealevel.Sl
 	decoder := bin.NewBinDecoder(stakeHistoryAcct.Data)
 	stakeHistory.MustUnmarshalWithDecoder(decoder)
 
+	var partitionedRewardsInfo *rewards.PartitionedRewardDistributionInfo
 	newEpoch := epoch + 1
 	firstSlotInEpoch := epochSchedule.FirstSlotInEpoch(newEpoch)
-	newWarmupCooldownRateEpoch := newWarmupCooldownRateEpoch(epochSchedule, f)
 
-	block.VoteAccts = refreshVoteAcctsCache(prevSlotCtx, acctsDb, &stakeHistory, newEpoch, newWarmupCooldownRateEpoch)
-	block.TotalEpochStake = 0
-	for _, stake := range block.VoteAccts {
-		block.TotalEpochStake += stake
+	leaderScheduleEpoch := epochSchedule.LeaderScheduleEpoch(block.Slot)
+	updateEpochStakesAndRefreshVoteCache(leaderScheduleEpoch, block, epochSchedule, f, acctsDb, prevSlotCtx.Slot)
+
+	if global.ManageLeaderSchedule() {
+		_, err = PrepareLeaderScheduleLocalFromVoteCache(newEpoch, epochSchedule, "")
+		if err != nil {
+			panic(err)
+		}
+
+		var hasLeader bool
+		block.Leader, hasLeader = global.LeaderForSlot(block.Slot)
+		if !hasLeader {
+			panic(fmt.Sprintf("couldn't find leader for slot %d at epoch boundary", block.Slot))
+		}
 	}
-
-	return &EpochTransitionContext{
-		StakeHistory:               &stakeHistory,
-		NewEpoch:                   newEpoch,
-		FirstSlotInEpoch:           firstSlotInEpoch,
-		NewWarmupCooldownRateEpoch: newWarmupCooldownRateEpoch,
-	}
-}
-
-// handleEpochRewards distributes rewards and updates stake history.
-// This should be called AFTER leader schedule computation to ensure schedule
-// verification works even if rewards distribution crashes.
-func handleEpochRewards(acctsDb *accountsdb.AccountsDb, rpcc *rpcclient.RpcClient, rpcBackups []string, partitionedEpochRewards bool, prevSlotCtx *sealevel.SlotCtx, replayCtx *ReplayCtx, epochSchedule *sealevel.SysvarEpochSchedule, f *features.Features, block *block.Block, epoch uint64, ctx *EpochTransitionContext) *rewards.PartitionedRewardDistributionInfo {
-	var partitionedRewardsInfo *rewards.PartitionedRewardDistributionInfo
 
 	if partitionedEpochRewards {
-		partitionedRewardsInfo, block.EpochUpdatedAccts, block.ParentEpochUpdatedAccts = beginPartitionedEpochRewardsDistribution(acctsDb, prevSlotCtx, ctx.StakeHistory, replayCtx, epochSchedule, rpcc, rpcBackups, block, f, ctx.NewEpoch, ctx.FirstSlotInEpoch)
+		partitionedRewardsInfo, block.EpochUpdatedAccts, block.ParentEpochUpdatedAccts = beginPartitionedEpochRewardsDistribution(acctsDb, prevSlotCtx, &stakeHistory, replayCtx, epochSchedule, rpcc, rpcBackups, block, f, newEpoch, firstSlotInEpoch)
 	} else {
 		panic("only partitioned rewards supported")
 	}
 
 	updateStakeHistorySysvar(acctsDb, block, prevSlotCtx, epoch, epochSchedule, f)
-
-	mlog.Log.Infof("epoch transition %d -> %d done.", epoch, ctx.NewEpoch)
+	mlog.Log.Infof("epoch transition %d -> %d done.", epoch, newEpoch)
 
 	return partitionedRewardsInfo
 }
 
-// handleEpochTransition is the legacy function that bundles stake computation and rewards.
-// Prefer using prepareEpochStakes + handleEpochRewards separately to allow leader schedule
-// computation between them.
-func handleEpochTransition(acctsDb *accountsdb.AccountsDb, rpcc *rpcclient.RpcClient, rpcBackups []string, partitionedEpochRewards bool, prevSlotCtx *sealevel.SlotCtx, replayCtx *ReplayCtx, epochSchedule *sealevel.SysvarEpochSchedule, f *features.Features, block *block.Block, epoch uint64) *rewards.PartitionedRewardDistributionInfo {
-	ctx := prepareEpochStakes(acctsDb, prevSlotCtx, epochSchedule, f, block, epoch)
-	return handleEpochRewards(acctsDb, rpcc, rpcBackups, partitionedEpochRewards, prevSlotCtx, replayCtx, epochSchedule, f, block, epoch, ctx)
+type epochStakesVoteAcctData struct {
+	nodePubkey solana.PublicKey
+	stake      atomic.Uint64
 }
 
-// cacheEpochStakesForValidation populates global.EpochStakes with stake data
-// computed during epoch transition. This enables leader schedule validation
-// for epochs beyond the initial snapshot.
-func cacheEpochStakesForValidation(epoch uint64, voteAcctStakes map[solana.PublicKey]uint64, totalStake uint64) {
+type epochStakesBuilder struct {
+	mu             sync.Mutex
+	epoch          uint64
+	epochStakesMap map[solana.PublicKey]*epochStakesVoteAcctData
+	totalStake     atomic.Uint64
+}
+
+func newEpochStakesBuilder(epoch uint64, voteCache map[solana.PublicKey]*sealevel.VoteStateVersions) *epochStakesBuilder {
+	epochStakesMap := make(map[solana.PublicKey]*epochStakesVoteAcctData, len(voteCache))
+	for votePk, voteAcct := range voteCache {
+		epochStakesMap[votePk] = &epochStakesVoteAcctData{nodePubkey: voteAcct.NodePubkey()}
+	}
+	return &epochStakesBuilder{epoch: epoch, epochStakesMap: epochStakesMap}
+}
+
+func (esb *epochStakesBuilder) AddStakeForVoteAcct(voteAcct solana.PublicKey, stake uint64) {
+	info := esb.epochStakesMap[voteAcct]
+	info.stake.Add(stake)
+	esb.totalStake.Add(stake)
+}
+
+func (esb *epochStakesBuilder) Finish() {
+	for voterPubkey, entry := range esb.epochStakesMap {
+		global.PutEpochStakesEntry(esb.epoch, voterPubkey, entry.stake.Load(), &epochstakes.VoteAccount{NodePubkey: entry.nodePubkey})
+	}
+	global.PutEpochTotalStake(esb.epoch, esb.totalStake.Load())
+}
+
+func (esb *epochStakesBuilder) TotalEpochStake() uint64 {
+	return esb.totalStake.Load()
+}
+
+func updateEpochStakesAndRefreshVoteCache(leaderScheduleEpoch uint64, b *block.Block, epochSchedule *sealevel.SysvarEpochSchedule, f *features.Features, acctsDb *accountsdb.AccountsDb, slot uint64) {
+	stakes := global.StakeCache()
+	newRateActivationEpoch := newWarmupCooldownRateEpoch(epochSchedule, f)
+
+	// Build vote pubkey set for vote cache refresh (only needs pubkeys, not effective stakes)
+	voteAcctStakes := make(map[solana.PublicKey]uint64)
+	for _, delegation := range stakes {
+		voteAcctStakes[delegation.VoterPubkey] += delegation.StakeLamports
+	}
+
+	// ALWAYS refresh vote cache from AccountsDB, even if HasEpochStakes is true
+	// This ensures the vote cache has fresh NodePubkey for leader schedule
+	if err := RebuildVoteCacheFromAccountsDB(acctsDb, slot, voteAcctStakes, 0); err != nil {
+		mlog.Log.Errorf("failed to rebuild vote cache at epoch boundary: %v", err)
+	}
+
+	// Skip epoch stakes calculation if already cached (resume)
+	hasEpochStakes := global.HasEpochStakes(leaderScheduleEpoch)
+	if hasEpochStakes {
+		mlog.Log.Infof("already had EpochStakes for epoch %d", leaderScheduleEpoch)
+		return
+	}
+
 	voteCache := global.VoteCache()
-	cachedCount := 0
-	skippedZeroStake := 0
-	skippedMissingVoteCache := 0
-	skippedZeroNodePk := 0
-	missingVoteCacheStake := uint64(0) // Track stake of validators we couldn't cache
-	missingNodePkStake := uint64(0)    // Track stake of validators with zero nodePk
+	esb := newEpochStakesBuilder(leaderScheduleEpoch, voteCache)
+	var wg sync.WaitGroup
 
-	for votePk, stake := range voteAcctStakes {
-		if stake == 0 {
-			skippedZeroStake++
-			continue
-		}
+	workerPool, _ := ants.NewPoolWithFunc(runtime.GOMAXPROCS(0)*8, func(i interface{}) {
+		defer wg.Done()
 
-		// Get NodePubkey from vote cache
-		vs := voteCache[votePk]
-		if vs == nil {
-			skippedMissingVoteCache++
-			missingVoteCacheStake += stake
-			continue
+		delegation := i.(*sealevel.Delegation)
+		_, exists := voteCache[delegation.VoterPubkey]
+		if exists {
+			effectiveStake := delegation.Stake(esb.epoch, sealevel.SysvarCache.StakeHistory.Sysvar, newRateActivationEpoch)
+			esb.AddStakeForVoteAcct(delegation.VoterPubkey, effectiveStake)
 		}
+	})
 
-		nodePk := vs.NodePubkey()
-		var zeroPk solana.PublicKey
-		if nodePk == zeroPk {
-			skippedZeroNodePk++
-			missingNodePkStake += stake
-			continue
-		}
-
-		// Create VoteAccount entry with NodePubkey for leader schedule computation
-		voteAcct := &epochstakes.VoteAccount{
-			NodePubkey: nodePk,
-		}
-		global.PutEpochStakesEntry(epoch, votePk, stake, voteAcct)
-		cachedCount++
+	for _, entry := range stakes {
+		wg.Add(1)
+		workerPool.Invoke(entry)
 	}
+	wg.Wait()
+	esb.Finish()
 
-	global.PutEpochTotalStake(epoch, totalStake)
-
-	// Calculate total missing stake (both missing vote cache AND zero nodePk)
-	totalMissingStake := missingVoteCacheStake + missingNodePkStake
-	hasIssues := skippedMissingVoteCache > 0 || skippedZeroNodePk > 0
-
-	// Log at Debug level if no issues, Info if there are skips
-	if hasIssues {
-		mlog.Log.Infof("cached epoch stakes: epoch=%d cached=%d/%d total_stake=%d",
-			epoch, cachedCount, len(voteAcctStakes), totalStake)
-		mlog.Log.Infof("  skipped: zero_stake=%d missing_vote_cache=%d(%d) zero_nodepk=%d(%d)",
-			skippedZeroStake, skippedMissingVoteCache, missingVoteCacheStake, skippedZeroNodePk, missingNodePkStake)
-	} else {
-		mlog.Log.Debugf("cached epoch stakes: epoch=%d cached=%d total_stake=%d",
-			epoch, cachedCount, totalStake)
-	}
-
-	// Warn if significant stake is missing (>1% of total)
-	if totalMissingStake > 0 && totalStake > 0 {
-		missingPct := float64(totalMissingStake) / float64(totalStake) * 100
-		if missingPct > 1.0 {
-			mlog.Log.Warnf("leader schedule: %.2f%% of stake (%d) missing for epoch %d (vote_cache=%d nodepk=%d)",
-				missingPct, totalMissingStake, epoch, missingVoteCacheStake, missingNodePkStake)
-		}
-	}
-
-	// Fatal warning if no validators could be cached
-	if cachedCount == 0 && len(voteAcctStakes) > 0 {
-		mlog.Log.Errorf("leader schedule: FATAL - no validators cached for epoch %d (vote_accts=%d)",
-			epoch, len(voteAcctStakes))
-	}
+	maps.Copy(b.EpochStakesPerVoteAcct, global.EpochStakes(leaderScheduleEpoch))
+	b.TotalEpochStake = esb.TotalEpochStake()
 }
