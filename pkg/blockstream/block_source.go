@@ -1307,6 +1307,50 @@ func (bs *BlockSource) getRetrySlots() []uint64 {
 	return slots
 }
 
+// forceScheduleWaitingSlot is a safety net that ensures the waiting slot
+// can never fall out of the pipeline. Called during retry ticks.
+// This handles edge cases where a slot might not be in slotState, retrySlots,
+// reorderBuffer, or skippedSlots - effectively "lost" from the pipeline.
+func (bs *BlockSource) forceScheduleWaitingSlot() {
+	// What slot are we waiting to emit?
+	bs.reorderMu.Lock()
+	waiting := bs.nextSlotToSend
+	alreadyHave := bs.reorderBuffer[waiting] != nil || bs.skippedSlots[waiting]
+	bs.reorderMu.Unlock()
+	if alreadyHave {
+		return
+	}
+
+	// If tracked in slotState, it's being handled
+	bs.slotStateMu.Lock()
+	_, exists := bs.slotState[waiting]
+	bs.slotStateMu.Unlock()
+	if exists {
+		return
+	}
+
+	// Check if it's in retry queue
+	bs.retryMu.Lock()
+	inRetry := false
+	for _, s := range bs.retrySlots {
+		if s == waiting {
+			inRetry = true
+			break
+		}
+	}
+	bs.retryMu.Unlock()
+	if inRetry {
+		return
+	}
+
+	// Slot is truly lost - force schedule it
+	mlog.Log.Warnf("safety net: forcing reschedule of lost waiting slot %d", waiting)
+	if !bs.scheduleSlot(waiting) {
+		// If scheduleSlot can't enqueue (slot already in slotState from race), put in retry
+		bs.scheduleRetry(waiting)
+	}
+}
+
 // canScheduleMore returns true if we can schedule the given slot.
 // In catchup mode: gate on buffer size (up to defaultMaxPending).
 // In near-tip mode: allow scheduling a small lookahead (bs.nearTipLookahead slots)
@@ -1568,6 +1612,9 @@ func (bs *BlockSource) scheduler() {
 				}
 			}
 			bs.slotStateMu.Unlock()
+
+			// Safety net: ensure waiting slot can't fall out of pipeline
+			bs.forceScheduleWaitingSlot()
 		default:
 		}
 
