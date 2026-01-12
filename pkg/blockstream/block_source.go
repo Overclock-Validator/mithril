@@ -1226,6 +1226,32 @@ func (bs *BlockSource) emitOrderedBlocks() {
 				bs.tipAtSlot.Store(bs.lastExecutedSlot.Load())
 				bs.lastTipUpdate.Store(time.Now().Unix())
 			}
+
+			// Probe-ahead skip flush: if this block's parentSlot equals our last executed slot,
+			// and the block is ahead of what we're waiting for, all intermediate slots are skipped.
+			// This handles the case where we probed ahead and found a block that proves
+			// multiple consecutive slots were skipped.
+			parentSlot := result.block.ParentSlot
+			lastExec := bs.lastExecutedSlot.Load()
+			if parentSlot == lastExec && result.slot > bs.nextSlotToSend {
+				skippedCount := uint64(0)
+				for skipSlot := bs.nextSlotToSend; skipSlot < result.slot; skipSlot++ {
+					// Safety: don't mark if we already have a block there (would be a conflict)
+					if bs.reorderBuffer[skipSlot] != nil {
+						mlog.Log.Warnf("probe-ahead: conflict - have block at %d but block %d has parentSlot %d",
+							skipSlot, result.slot, parentSlot)
+						break
+					}
+					if !bs.skippedSlots[skipSlot] {
+						bs.skippedSlots[skipSlot] = true
+						skippedCount++
+					}
+				}
+				if skippedCount > 0 {
+					mlog.Log.Infof("probe-ahead: flushed %d skipped slots (%d-%d) via parentSlot chain (block %d, parent %d, lastExec %d)",
+						skippedCount, bs.nextSlotToSend, result.slot-1, result.slot, parentSlot, lastExec)
+				}
+			}
 		} else if isRetriable {
 			// All non-skip errors are retriable - schedule retry
 			bs.stats.FetchRetries.Add(1)
@@ -1319,6 +1345,64 @@ func (bs *BlockSource) getRetrySlots() []uint64 {
 	bs.retrySlots = nil
 	bs.retryMu.Unlock()
 	return slots
+}
+
+// maybeProbeAhead schedules probe fetches when the waiting slot is stuck on
+// "slot_not_available" errors. By probing ahead, we can discover the next real
+// block and use its parentSlot to flush the skipped slot range.
+//
+// This handles the common case where a range of consecutive slots are skipped:
+// if we're stuck on slot 100 and slot 105 has parentSlot=99 (our lastExecutedSlot),
+// we know slots 100-104 are all skipped.
+func (bs *BlockSource) maybeProbeAhead() {
+	bs.reorderMu.Lock()
+	waitingSlot := bs.nextSlotToSend
+	bs.reorderMu.Unlock()
+
+	// Check if waiting slot is stuck on slot_not_available
+	bs.waitingSlotErrorsMu.Lock()
+	info := bs.waitingSlotErrors[waitingSlot]
+	bs.waitingSlotErrorsMu.Unlock()
+
+	// Only probe if we've retried several times with slot_not_available
+	if info == nil || info.retryCount < 3 || info.lastErrorClass != "slot_not_available" {
+		return
+	}
+
+	// Schedule probes for a few slots ahead
+	// These will either return blocks (letting us flush skips) or slot_not_available
+	const probeAhead = 5
+	probesScheduled := 0
+
+	for offset := uint64(1); offset <= probeAhead; offset++ {
+		probeSlot := waitingSlot + offset
+
+		// Skip if we already have result
+		bs.reorderMu.Lock()
+		alreadyHave := bs.reorderBuffer[probeSlot] != nil || bs.skippedSlots[probeSlot]
+		bs.reorderMu.Unlock()
+		if alreadyHave {
+			continue
+		}
+
+		// Skip if already scheduled/inflight
+		bs.slotStateMu.Lock()
+		_, exists := bs.slotState[probeSlot]
+		bs.slotStateMu.Unlock()
+		if exists {
+			continue
+		}
+
+		// Schedule this probe slot
+		if bs.scheduleSlot(probeSlot) {
+			probesScheduled++
+		}
+	}
+
+	if probesScheduled > 0 {
+		mlog.Log.Debugf("probe-ahead: scheduled %d probes ahead of stuck slot %d (retries=%d)",
+			probesScheduled, waitingSlot, info.retryCount)
+	}
 }
 
 // forceScheduleWaitingSlot is a safety net that ensures the waiting slot
@@ -1629,6 +1713,9 @@ func (bs *BlockSource) scheduler() {
 
 			// Safety net: ensure waiting slot can't fall out of pipeline
 			bs.forceScheduleWaitingSlot()
+
+			// Probe ahead when stuck on slot_not_available to discover skip ranges
+			bs.maybeProbeAhead()
 		default:
 		}
 
