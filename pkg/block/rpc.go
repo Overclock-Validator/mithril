@@ -26,6 +26,7 @@ func FromBlockResult(blockResult *rpc.GetBlockResult, slot uint64, rpcc *rpcclie
 
 	block.Blockhash = blockResult.Blockhash
 	block.LastBlockhash = blockResult.PreviousBlockhash
+	block.ParentSlot = blockResult.ParentSlot
 
 	if blockResult.BlockTime == nil {
 		mlog.Log.Infof("slot %d had nil BlockTime field", slot)
