@@ -229,6 +229,14 @@ type BlockSource struct {
 	isNearTip        atomic.Bool // True when close to confirmed tip
 	catchupTipSafety uint64      // Original tip safety margin for catchup mode
 
+	// Probe-ahead tracking: slots scheduled by maybeProbeAhead (vs normal prefetch)
+	// Probes get special handling: if they return slot_not_available, they're
+	// cleared from tracking (not marked done, not retried) so they don't block
+	// normal scheduling when we reach them.
+	probeMu       sync.Mutex
+	probeSlots    map[uint64]bool
+	lastProbeTime atomic.Int64 // Unix timestamp of last probe-ahead (cooldown)
+
 	// Configurable mode thresholds
 	nearTipThreshold    uint64        // Enter near-tip when gap <= this
 	catchupThreshold    uint64        // Exit near-tip when gap >= this
@@ -365,6 +373,9 @@ func NewBlockSource(opts *BlockSourceOpts) *BlockSource {
 
 		// Stall diagnostics
 		waitingSlotErrors: make(map[uint64]*slotErrorInfo),
+
+		// Probe-ahead tracking
+		probeSlots: make(map[uint64]bool),
 	}
 
 	// Initialize lastProgress to now (first block hasn't been fetched yet)
@@ -1197,16 +1208,30 @@ func (bs *BlockSource) emitOrderedBlocks() {
 		// CRITICAL: All errors except SlotSkipped are retriable for the waiting slot.
 		// Never skip a non-skipped slot - that causes silent state divergence.
 		// If we truly can't fetch a block, we'll stall and eventually timeout.
-		//
-		// EXCEPTION: Probe slots (ahead of nextSlotToSend) that return slot_not_available
-		// are NOT retried - they're marked done and maybeProbeAhead will re-probe on the
-		// next tick if needed. This prevents probe slots from eating RPS budget indefinitely.
 		isRetriable := result.err != nil && !result.skipped
 
-		// Don't retry probe slots that return slot_not_available
-		// A "probe slot" is any slot ahead of what we're waiting to emit
-		if isRetriable && isSlotNotAvailableErr(result.err) && result.slot > bs.nextSlotToSend {
-			isRetriable = false // Let it be marked done; maybeProbeAhead will reschedule if needed
+		// Check if this is an explicit probe slot (scheduled by maybeProbeAhead)
+		// vs normal prefetch (N+1, N+2 scheduled by scheduler).
+		// IMPORTANT: Only use explicit tracking - checking slot > nextSlotToSend
+		// would incorrectly treat normal prefetch as probes!
+		bs.probeMu.Lock()
+		isProbeSlot := bs.probeSlots[result.slot]
+		if isProbeSlot {
+			delete(bs.probeSlots, result.slot) // Clean up tracking
+		}
+		bs.probeMu.Unlock()
+
+		// SPECIAL HANDLING FOR PROBE SLOTS that return slot_not_available:
+		// Clear from tracking (slotState/inflightStart) but DON'T mark done.
+		// This allows normal scheduling to pick them up when we reach them.
+		// Also don't retry - maybeProbeAhead will re-probe on next tick if needed.
+		if isProbeSlot && isRetriable && isSlotNotAvailableErr(result.err) {
+			bs.slotStateMu.Lock()
+			delete(bs.slotState, result.slot)
+			delete(bs.inflightStart, result.slot)
+			bs.slotStateMu.Unlock()
+			// Continue without adding to retry queue or marking done
+			continue
 		}
 
 		// Track error for stall diagnostics
@@ -1291,6 +1316,13 @@ func (bs *BlockSource) emitOrderedBlocks() {
 						delete(bs.waitingSlotErrors, skipSlot)
 					}
 					bs.waitingSlotErrorsMu.Unlock()
+
+					// Clear probe tracking for flushed slots
+					bs.probeMu.Lock()
+					for _, skipSlot := range flushedSlots {
+						delete(bs.probeSlots, skipSlot)
+					}
+					bs.probeMu.Unlock()
 
 					mlog.Log.Infof("probe-ahead: flushed %d skipped slots (%d-%d) via parentSlot chain (block %d, parent %d, lastExec %d)",
 						skippedCount, bs.nextSlotToSend, result.slot-1, result.slot, parentSlot, lastExec)
@@ -1398,7 +1430,19 @@ func (bs *BlockSource) getRetrySlots() []uint64 {
 // This handles the common case where a range of consecutive slots are skipped:
 // if we're stuck on slot 100 and slot 105 has parentSlot=99 (our lastExecutedSlot),
 // we know slots 100-104 are all skipped.
+//
+// IMPORTANT: Probes are explicitly tracked in bs.probeSlots so the emitter can
+// distinguish them from normal prefetch slots (N+1, N+2). Probes that return
+// slot_not_available are cleared from tracking without being marked done,
+// allowing normal scheduling to pick them up when we reach that slot.
 func (bs *BlockSource) maybeProbeAhead() {
+	// Cooldown: only probe at most once per second to avoid starving the waiting slot
+	const probeCooldown = 1 * time.Second
+	lastProbe := time.Unix(bs.lastProbeTime.Load(), 0)
+	if time.Since(lastProbe) < probeCooldown {
+		return
+	}
+
 	bs.reorderMu.Lock()
 	waitingSlot := bs.nextSlotToSend
 	bs.reorderMu.Unlock()
@@ -1417,12 +1461,13 @@ func (bs *BlockSource) maybeProbeAhead() {
 	tip := bs.confirmedTip.Load()
 	endSlot := bs.endSlot
 
-	// Schedule probes for slots ahead - use larger window to handle longer skip streaks
-	// Probes that return slot_not_available won't be retried (see isProbeSlot check in emitter)
-	const probeAhead = 20
+	// Schedule a few probes (not many - we have limited RPS budget)
+	// Strategy: probe at exponentially increasing offsets to find the next real block
+	// with minimal RPS usage: +1, +2, +4, +8, +16 covers up to 31 skipped slots
+	probeOffsets := []uint64{1, 2, 4, 8, 16}
 	probesScheduled := 0
 
-	for offset := uint64(1); offset <= probeAhead; offset++ {
+	for _, offset := range probeOffsets {
 		probeSlot := waitingSlot + offset
 
 		// Respect boundaries
@@ -1438,7 +1483,7 @@ func (bs *BlockSource) maybeProbeAhead() {
 			continue
 		}
 
-		// Skip if already scheduled/inflight
+		// Skip if already scheduled/inflight or already a pending probe
 		bs.slotStateMu.Lock()
 		_, exists := bs.slotState[probeSlot]
 		bs.slotStateMu.Unlock()
@@ -1446,13 +1491,24 @@ func (bs *BlockSource) maybeProbeAhead() {
 			continue
 		}
 
-		// Schedule this probe slot
+		bs.probeMu.Lock()
+		alreadyProbe := bs.probeSlots[probeSlot]
+		bs.probeMu.Unlock()
+		if alreadyProbe {
+			continue
+		}
+
+		// Schedule this probe slot and mark it as a probe
 		if bs.scheduleSlot(probeSlot) {
+			bs.probeMu.Lock()
+			bs.probeSlots[probeSlot] = true
+			bs.probeMu.Unlock()
 			probesScheduled++
 		}
 	}
 
 	if probesScheduled > 0 {
+		bs.lastProbeTime.Store(time.Now().Unix())
 		mlog.Log.Debugf("probe-ahead: scheduled %d probes ahead of stuck slot %d (retries=%d, tip=%d)",
 			probesScheduled, waitingSlot, info.retryCount, tip)
 	}
