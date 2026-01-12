@@ -1472,12 +1472,12 @@ func (bs *BlockSource) maybeProbeAhead() {
 	// - 6 retries (1200ms) → slot +3 should exist → probe +3
 	// - 9 retries (1800ms) → slot +4 should exist → probe +4
 	// - 12 retries (2400ms) → slot +5 should exist → probe +5
-	// Formula: probeOffset = 3 + (retryCount - 6) / 3, capped at 10
+	// Formula: probeOffset = 3 + (retryCount - 6) / 3, capped at 32
 	// Only probe ONE slot per tick to avoid RPS starvation.
-	const minRetries = 6             // Wait 1200ms before probing (slot +3 exists)
-	const retriesPerSlot = 3         // Move to next probe slot every 600ms (~1.5 slots)
-	const minProbeOffset = uint64(3) // Start beyond prefetch window (nearTipLookahead=2)
-	const maxProbeOffset = uint64(10) // Cap probe distance - beyond this it's likely not a skip issue
+	const minRetries = 6              // Wait 1200ms before probing (slot +3 exists)
+	const retriesPerSlot = 3          // Move to next probe slot every 600ms (~1.5 slots)
+	const minProbeOffset = uint64(3)  // Start beyond prefetch window (nearTipLookahead=2)
+	const maxProbeOffset = uint64(32) // Cap probe distance - handles long skip streaks (~13s)
 
 	if info == nil || info.retryCount < minRetries || info.lastErrorClass != "slot_not_available" {
 		return
