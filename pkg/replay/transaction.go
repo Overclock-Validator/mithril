@@ -184,7 +184,6 @@ func recordStakeDelegation(acct *accounts.Account) {
 	if isEmpty || isUninitialized {
 		global.DeleteStakeCacheItem(acct.Key)
 	} else {
-		//mlog.Log.Debugf("added stake delegation record for %s: %v", acct.Key, acct)
 		stakeState, err := sealevel.UnmarshalStakeState(acct.Data)
 		if err == nil {
 			delegation := stakeState.Stake.Stake.Delegation

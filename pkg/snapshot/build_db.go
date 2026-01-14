@@ -164,21 +164,21 @@ func BuildAccountsDbPaths(
 	// Clean any leftover artifacts from previous incomplete runs (e.g., Ctrl+C)
 	CleanAccountsDbDir(accountsDbDir)
 
-	mlog.Log.Infof("Parsing manifest from %s", snapshotFile)
+	mlog.Log.Infof("Parsing full snapshot manifest...")
 	manifest, err := UnmarshalManifestFromSnapshot(ctx, snapshotFile, accountsDbDir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("reading snapshot manifest: %v", err)
 	}
-	mlog.Log.Infof("Parsed manifest from full snapshot")
+	mlog.Log.Infof("Parsed full snapshot manifest")
 
 	var incrementalManifest *SnapshotManifest
 	if incrementalSnapshotFile != "" {
-		mlog.Log.Infof("Parsing manifest from %s", incrementalSnapshotFile)
+		mlog.Log.Infof("Parsing incremental snapshot manifest...")
 		incrementalManifest, err = UnmarshalManifestFromSnapshot(ctx, incrementalSnapshotFile, accountsDbDir)
 		if err != nil {
 			return nil, nil, fmt.Errorf("reading incremental snapshot manifest: %v", err)
 		}
-		mlog.Log.Infof("Parsed manifest from incremental snapshot")
+		mlog.Log.Infof("Parsed incremental snapshot manifest")
 	}
 
 	start := time.Now()

@@ -3,6 +3,7 @@ package node
 import (
 	"fmt"
 	"net/http"
+	_ "net/http/pprof" // registers /debug/pprof/* handlers
 	"runtime"
 	"strconv"
 	"time"

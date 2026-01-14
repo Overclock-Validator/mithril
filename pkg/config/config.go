@@ -43,6 +43,20 @@ type DebugConfig struct {
 	AccountWrites         []string `toml:"account_writes" mapstructure:"account_writes"`                 // was: debugacctwrites
 }
 
+// CacheConfig holds LRU cache sizing for AccountsDB
+// These are DIFFERENT from the global vote/stake caches used for leader schedule -
+// those are unbounded maps holding vote state and delegation info.
+// These LRU caches store full account data for fast reads during replay.
+type CacheConfig struct {
+	VoteAcctLRU          int `toml:"vote_acct_lru" mapstructure:"vote_acct_lru"`                     // Vote account data (default: 5000)
+	StakeAcctLRU         int `toml:"stake_acct_lru" mapstructure:"stake_acct_lru"`                   // Stake account data (default: 2000)
+	SmallAcctLRU         int `toml:"small_acct_lru" mapstructure:"small_acct_lru"`                   // Small accounts ≤512 bytes (default: 50000)
+	MediumAcctLRU        int `toml:"medium_acct_lru" mapstructure:"medium_acct_lru"`                 // Medium accounts 512-64KB (default: 20000)
+	HugeAcctLRU          int `toml:"huge_acct_lru" mapstructure:"huge_acct_lru"`                     // Huge accounts >64KB (default: 500)
+	ProgramLRU           int `toml:"program_lru" mapstructure:"program_lru"`                         // Compiled BPF programs (default: 5000)
+	SeenOnceFilterSize   int `toml:"seen_once_filter_size" mapstructure:"seen_once_filter_size"`     // Admit-on-second-hit LRU capacity (0=disabled, default: 0)
+}
+
 // DevelopmentConfig holds development/tuning configuration (matches Firedancer [development] section)
 type DevelopmentConfig struct {
 	ZstdDecoderConcurrency   int         `toml:"zstd_decoder_concurrency" mapstructure:"zstd_decoder_concurrency"`     // was: zstd-decoder-concurrency
@@ -52,6 +66,7 @@ type DevelopmentConfig struct {
 	UsePool                  bool        `toml:"use_pool" mapstructure:"use_pool"`                                     // was: use-pool
 	Pprof                    PprofConfig `toml:"pprof" mapstructure:"pprof"`
 	Debug                    DebugConfig `toml:"debug" mapstructure:"debug"`
+	Cache                    CacheConfig `toml:"cache" mapstructure:"cache"`
 }
 
 // ReportingConfig holds metrics/reporting configuration (matches Firedancer [reporting] section)

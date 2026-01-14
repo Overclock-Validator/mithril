@@ -50,12 +50,12 @@ func BuildAccountsDbAuto(
 	// Clean any leftover artifacts from previous incomplete runs (e.g., Ctrl+C)
 	CleanAccountsDbDir(accountsDbDir)
 
-	mlog.Log.Infof("Parsing manifest from %s", fullSnapshotFile)
+	mlog.Log.Infof("Parsing full snapshot manifest...")
 	manifest, err := UnmarshalManifestFromSnapshot(ctx, fullSnapshotFile, accountsDbDir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("reading snapshot manifest: %v", err)
 	}
-	mlog.Log.Infof("Parsed manifest from full snapshot")
+	mlog.Log.Infof("Parsed full snapshot manifest")
 
 	start := time.Now()
 
@@ -171,7 +171,7 @@ func BuildAccountsDbAuto(
 		}
 
 		incrSnapshotStart := time.Now()
-		mlog.Log.Infof("Parsing manifest from %s", incrementalSnapshotPath)
+		mlog.Log.Infof("Parsing incremental snapshot manifest...")
 		incrementalManifestCopy, err := UnmarshalManifestFromSnapshot(ctx, incrementalSnapshotPath, accountsDbDir)
 		if err != nil {
 			mlog.Log.Errorf("reading incremental snapshot manifest: %v", err)
@@ -179,7 +179,7 @@ func BuildAccountsDbAuto(
 		}
 		// Copy the manifest so the worker pool's pointer has the value.
 		*incrementalManifest = *incrementalManifestCopy
-		mlog.Log.Infof("Parsed manifest from incremental snapshot")
+		mlog.Log.Infof("Parsed incremental snapshot manifest")
 
 		// Determine save path for incremental snapshot if streaming from HTTP
 		var incrSavePath string

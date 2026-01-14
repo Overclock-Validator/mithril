@@ -150,7 +150,12 @@ func handleEpochTransition(acctsDb *accountsdb.AccountsDb, rpcc *rpcclient.RpcCl
 	updateEpochStakesAndRefreshVoteCache(leaderScheduleEpoch, block, epochSchedule, f, acctsDb, prevSlotCtx.Slot)
 
 	if global.ManageLeaderSchedule() {
-		_, err = PrepareLeaderScheduleLocalFromVoteCache(newEpoch, epochSchedule, "")
+		if len(global.EpochStakesVoteAccts(newEpoch)) > 0 {
+			_, err = PrepareLeaderScheduleLocal(newEpoch, epochSchedule, "")
+		} else {
+			_, err = PrepareLeaderScheduleLocalFromVoteCache(newEpoch, epochSchedule, "")
+		}
+
 		if err != nil {
 			panic(err)
 		}

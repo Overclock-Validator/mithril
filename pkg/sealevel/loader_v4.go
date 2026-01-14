@@ -305,6 +305,7 @@ func LoaderV4Execute(execCtx *ExecutionCtx) error {
 			}
 
 			programBytes = programDataAcct.Data[loaderV4ProgramDataOffset:]
+			accountsdb.RecordProgramCacheMissSize(uint64(len(programBytes)))
 		}
 
 		syscallRegistry := sbpf.SyscallRegistry(func(u uint32) (sbpf.Syscall, bool) {

@@ -219,11 +219,16 @@ func loadAndValidateTxAcctsSimd186(slotCtx *sealevel.SlotCtx, acctMetasPerInstr 
 		return nil, err
 	}
 
-	for _, pubkey := range acctKeys {
+	// Memoize accounts loaded in Pass 1 to avoid re-cloning in Pass 2
+	// Use slice indexed by account position (same ordering as txAcctMetas)
+	acctCache := make([]*accounts.Account, len(acctKeys))
+
+	for i, pubkey := range acctKeys {
 		acct, err := slotCtx.GetAccount(pubkey)
 		if err != nil {
 			panic("should be impossible - programming error")
 		}
+		acctCache[i] = acct // Cache by index for reuse in Pass 2
 		err = accumulator.collectAcct(acct)
 		if err != nil {
 			return nil, err
@@ -235,11 +240,15 @@ func loadAndValidateTxAcctsSimd186(slotCtx *sealevel.SlotCtx, acctMetasPerInstr 
 		return nil, err
 	}
 
-	var programIdIdxs []uint64
+	// Use boolean mask for O(1) program index lookup
+	isProgramIdx := make([]bool, len(acctKeys))
 	instructionAcctPubkeys := make(map[solana.PublicKey]struct{})
 
 	for instrIdx, instr := range tx.Message.Instructions {
-		programIdIdxs = append(programIdIdxs, uint64(instr.ProgramIDIndex))
+		i := int(instr.ProgramIDIndex)
+		if i >= 0 && i < len(isProgramIdx) {
+			isProgramIdx[i] = true
+		}
 		ias := acctMetasPerInstr[instrIdx]
 		for _, ia := range ias {
 			instructionAcctPubkeys[ia.Pubkey] = struct{}{}
@@ -251,21 +260,17 @@ func loadAndValidateTxAcctsSimd186(slotCtx *sealevel.SlotCtx, acctMetasPerInstr 
 
 	for idx, acctMeta := range txAcctMetas {
 		var acct *accounts.Account
+		cached := acctCache[idx] // Reuse account from Pass 1
 
 		_, instrContainsAcctMeta := instructionAcctPubkeys[acctMeta.PublicKey]
 		if acctMeta.PublicKey == sealevel.SysvarInstructionsAddr {
 			acct = instrsAcct
-		} else if !slotCtx.Features.IsActive(features.DisableAccountLoaderSpecialCase) && slices.Contains(programIdIdxs, uint64(idx)) && !acctMeta.IsWritable && !instrContainsAcctMeta {
-			tmp, err := slotCtx.GetAccount(acctMeta.PublicKey)
-			if err != nil {
-				return nil, err
-			}
-			acct = &accounts.Account{Key: acctMeta.PublicKey, Owner: tmp.Owner, Executable: true, IsDummy: true}
+		} else if !slotCtx.Features.IsActive(features.DisableAccountLoaderSpecialCase) && isProgramIdx[idx] && !acctMeta.IsWritable && !instrContainsAcctMeta {
+			// Dummy account case - only need owner from cached account
+			acct = &accounts.Account{Key: acctMeta.PublicKey, Owner: cached.Owner, Executable: true, IsDummy: true}
 		} else {
-			acct, err = slotCtx.GetAccount(acctMeta.PublicKey)
-			if err != nil {
-				return nil, err
-			}
+			// Normal case - use cached account directly
+			acct = cached
 		}
 
 		acctsForTx = append(acctsForTx, *acct)
@@ -278,16 +283,24 @@ func loadAndValidateTxAcctsSimd186(slotCtx *sealevel.SlotCtx, acctMetasPerInstr 
 
 	removeAcctsExecutableFlagChecks := slotCtx.Features.IsActive(features.RemoveAccountsExecutableFlagChecks)
 
-	for _, instr := range instrs {
+	for instrIdx, instr := range instrs {
 		if instr.ProgramId == addresses.NativeLoaderAddr {
 			continue
 		}
 
-		programAcct, err := slotCtx.GetAccount(instr.ProgramId)
-		if err != nil {
-			programAcct, err = slotCtx.GetAccountFromAccountsDb(instr.ProgramId)
+		// Use cached account via ProgramIDIndex from tx.Message
+		programIdx := int(tx.Message.Instructions[instrIdx].ProgramIDIndex)
+		programAcct := acctCache[programIdx]
+
+		// Fallback if not in cache (shouldn't happen for valid txs)
+		if programAcct == nil {
+			var err error
+			programAcct, err = slotCtx.GetAccount(instr.ProgramId)
 			if err != nil {
-				return nil, TxErrProgramAccountNotFound
+				programAcct, err = slotCtx.GetAccountFromAccountsDb(instr.ProgramId)
+				if err != nil {
+					return nil, TxErrProgramAccountNotFound
+				}
 			}
 		}
 

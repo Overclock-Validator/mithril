@@ -1175,6 +1175,12 @@ func ReplayBlocks(
 	var nonVoteTxCounts []uint64 // non-vote txns per block
 	var justCrossedEpochBoundary bool
 
+	// Memory stats tracking for delta calculations
+	var lastMemStats runtime.MemStats
+	var lastSummaryTime time.Time
+	runtime.ReadMemStats(&lastMemStats)
+	lastSummaryTime = time.Now()
+
 	// Preallocate slices for 100 blocks
 	const summaryInterval = 100
 	execTimes = make([]float64, 0, summaryInterval)
@@ -1690,7 +1696,72 @@ func ReplayBlocks(
 				mlog.Log.InfofPrecise("  execution: median %.3fs, min %.3fs, max %.3fs | wait: median %.3fs, min %.3fs, max %.3fs | replay total: median %.3fs",
 					medExec, minExec, maxExec, medWait, minWait, maxWait, medTotal)
 
-				// Line 4: RPC/fetch debugging info
+				// Line 4: Cache hit/miss stats
+				cs := accountsdb.GetAndResetCacheStats()
+				totalHits := cs.SmallHits + cs.MediumHits + cs.HugeHits + cs.StakeHits + cs.VoteHits
+				totalMiss := cs.SmallMisses + cs.MediumMisses + cs.HugeMisses + cs.StakeMisses + cs.VoteMisses
+				if totalHits+totalMiss > 0 {
+					hitRate := float64(totalHits) / float64(totalHits+totalMiss) * 100
+					// Show hits and misses per cache, with granular breakdown for huge (>64KB)
+					mlog.Log.InfofPrecise("  cache: %.1f%% hit | hits: small %d, medium %d, huge %d, stake %d, vote %d | miss: small %d, medium %d, huge %d [64K-256K:%d 256K-1M:%d >1M:%d], stake %d, vote %d",
+						hitRate, cs.SmallHits, cs.MediumHits, cs.HugeHits, cs.StakeHits, cs.VoteHits,
+						cs.SmallMisses, cs.MediumMisses, cs.HugeMisses, cs.HugeMiss64Kto256K, cs.HugeMiss256Kto1M, cs.HugeMissOver1M,
+						cs.StakeMisses, cs.VoteMisses)
+
+					// Program cache stats (compiled BPF programs)
+					if cs.ProgramHits+cs.ProgramMisses > 0 {
+						progHitRate := float64(cs.ProgramHits) / float64(cs.ProgramHits+cs.ProgramMisses) * 100
+						mlog.Log.InfofPrecise("  program cache: %.1f%% hit (%d/%d) | miss by size: <1M:%d ≥1M:%d",
+							progHitRate, cs.ProgramHits, cs.ProgramHits+cs.ProgramMisses,
+							cs.ProgramMissUnder1M, cs.ProgramMissOver1M)
+					}
+
+					// Cache fill stats
+					cf := acctsDb.GetCacheFillStats()
+					mlog.Log.InfofPrecise("  cache fill: small %d/%d (%.0f%%), medium %d/%d (%.0f%%), huge %d/%d (%.0f%%), stake %d/%d, vote %d/%d, program %d/%d (%.0f%%)",
+						cf.SmallSize, cf.SmallCap, float64(cf.SmallSize)/float64(cf.SmallCap)*100,
+						cf.MediumSize, cf.MediumCap, float64(cf.MediumSize)/float64(cf.MediumCap)*100,
+						cf.HugeSize, cf.HugeCap, float64(cf.HugeSize)/float64(cf.HugeCap)*100,
+						cf.StakeSize, cf.StakeCap, cf.VoteSize, cf.VoteCap,
+						cf.ProgramSize, cf.ProgramCap, float64(cf.ProgramSize)/float64(cf.ProgramCap)*100)
+
+					// Seen-once filter stats (only show if filter is active)
+					if cs.SeenOnceFiltered > 0 || cs.SeenOnceAdmitted > 0 {
+						total := cs.SeenOnceFiltered + cs.SeenOnceAdmitted
+						admitRate := float64(cs.SeenOnceAdmitted) / float64(total) * 100
+						mlog.Log.InfofPrecise("  seen-once filter: %.1f%% admitted (%d/%d) | filtered %d",
+							admitRate, cs.SeenOnceAdmitted, total, cs.SeenOnceFiltered)
+					}
+				}
+
+				// Memory stats for GC pressure monitoring (with deltas)
+				var m runtime.MemStats
+				runtime.ReadMemStats(&m)
+				elapsed := time.Since(lastSummaryTime).Seconds()
+				if elapsed < 0.001 {
+					elapsed = 0.001 // Avoid division by zero
+				}
+
+				// Calculate deltas
+				deltaGC := m.NumGC - lastMemStats.NumGC
+				deltaPauseMs := float64(m.PauseTotalNs-lastMemStats.PauseTotalNs) / 1e6
+				deltaAllocMB := float64(m.TotalAlloc-lastMemStats.TotalAlloc) / 1024 / 1024
+				allocPerSec := deltaAllocMB / elapsed
+				deltaHeapMB := float64(m.HeapAlloc) - float64(lastMemStats.HeapAlloc)
+				deltaHeapMB = deltaHeapMB / 1024 / 1024
+
+				mlog.Log.InfofPrecise("  mem: heap %.1fMB (Δ%+.1fMB) | alloc %.1fMB/s | gc %d (Δ%d, Δ%.1fms) | sys %.1fMB | goroutines %d",
+					float64(m.HeapAlloc)/1024/1024, deltaHeapMB,
+					allocPerSec,
+					m.NumGC, deltaGC, deltaPauseMs,
+					float64(m.Sys)/1024/1024,
+					runtime.NumGoroutine())
+
+				// Update tracking for next interval
+				lastMemStats = m
+				lastSummaryTime = time.Now()
+
+				// Line 5: RPC/fetch debugging info
 				if fetchStats.Attempts > 0 {
 					retryRate := float64(fetchStats.Retries) / float64(fetchStats.Attempts) * 100
 					prefetch := fetchStats.BufferDepth + fetchStats.ReorderBufLen

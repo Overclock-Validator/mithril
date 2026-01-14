@@ -193,6 +193,7 @@ func init() {
 	Run.Flags().BoolVar(&sbpf.UsePool, "use-pool", true, "Disable to allocate fresh slices")
 
 	// [tuning.pprof] section flags
+	Run.Flags().Int64Var(&pprofPort, "pprof-port", -1, "Port to serve HTTP pprof endpoint")
 	Run.Flags().StringVar(&cpuprofPath, "cpu-profile-path", "", "Filename to write CPU profile")
 
 	// [debug] section flags
@@ -855,7 +856,15 @@ func runVerifyRange(c *cobra.Command, args []string) {
 		klog.Fatalf("end slot cannot be lower than start slot")
 	}
 	mlog.Log.Infof("will replay startSlot=%d endSlot=%d", startSlot, endSlot)
-	accountsDb.InitCaches()
+	accountsDb.InitCaches(
+		config.GetInt("tuning.cache.vote_acct_lru"),
+		config.GetInt("tuning.cache.stake_acct_lru"),
+		config.GetInt("tuning.cache.small_acct_lru"),
+		config.GetInt("tuning.cache.medium_acct_lru"),
+		config.GetInt("tuning.cache.huge_acct_lru"),
+		config.GetInt("tuning.cache.program_lru"),
+		config.GetInt("tuning.cache.seen_once_filter_size"),
+	)
 
 	metricsWriter, metricsWriterCleanup, err := createBufWriter(metricsPath)
 	if err != nil {
@@ -1075,6 +1084,11 @@ func runLive(c *cobra.Command, args []string) {
 	// Now start the metrics server (after banner so errors don't appear first)
 	statsd.StartMetricsServer()
 
+	// Start pprof HTTP server if configured
+	if pprofPort != -1 {
+		startPprofHandlers(int(pprofPort))
+	}
+
 	// Determine if using Lightbringer based on block source
 	// NOTE: Lightbringer mode is TEMPORARILY DISABLED. The background block downloader that
 	// wrote Lightbringer blocks to disk was removed due to reliability issues (panics, race conditions).
@@ -1160,7 +1174,7 @@ func runLive(c *cobra.Command, args []string) {
 
 	// Handle explicit --snapshot flag (bypasses all auto-discovery, does NOT delete snapshot files)
 	if snapshotArchivePath != "" {
-		mlog.Log.Infof("Using snapshot file: %s", snapshotArchivePath)
+		mlog.Log.Infof("Using full snapshot: %s", snapshotArchivePath)
 
 		// Parse full snapshot slot from filename for validation
 		fullSnapshotSlot := parseSlotFromSnapshotName(filepath.Base(snapshotArchivePath))
@@ -1610,7 +1624,15 @@ postBootstrap:
 	}
 
 	liveEndSlot := uint64(math.MaxUint64)
-	accountsDb.InitCaches()
+	accountsDb.InitCaches(
+		config.GetInt("tuning.cache.vote_acct_lru"),
+		config.GetInt("tuning.cache.stake_acct_lru"),
+		config.GetInt("tuning.cache.small_acct_lru"),
+		config.GetInt("tuning.cache.medium_acct_lru"),
+		config.GetInt("tuning.cache.huge_acct_lru"),
+		config.GetInt("tuning.cache.program_lru"),
+		config.GetInt("tuning.cache.seen_once_filter_size"),
+	)
 
 	metricsWriter, metricsWriterCleanup, err := createBufWriter(metricsPath)
 	if err != nil {

@@ -218,7 +218,19 @@ func distributePartitionedEpochRewardsForSlot(acctsDb *accountsdb.AccountsDb, ep
 	epochRewards.MustUnmarshalWithDecoder(decoder)
 
 	partitionIdx := currentBlockHeight - epochRewards.DistributionStartingBlockHeight
-	distributedAccts, parentDistributedAccts, distributedLamports := rewards.DistributeStakingRewardsForPartition(acctsDb, partitionedEpochRewardsInfo.RewardPartitions.Partition(partitionIdx), partitionedEpochRewardsInfo.StakingRewards, currentSlot)
+
+	// Initialize shared worker pool on first partition (reused across all 243 partitions)
+	if partitionedEpochRewardsInfo.WorkerPool == nil {
+		if err := partitionedEpochRewardsInfo.InitWorkerPool(); err != nil {
+			panic(fmt.Sprintf("unable to initialize reward distribution worker pool: %s", err))
+		}
+	}
+
+	// During reward distribution, don't add new stake accounts to cache (prevents thrash).
+	// Only existing hot entries are updated.
+	acctsDb.InRewardsWindow = true
+	distributedAccts, parentDistributedAccts, distributedLamports := rewards.DistributeStakingRewardsForPartition(acctsDb, partitionedEpochRewardsInfo.RewardPartitions.Partition(partitionIdx), partitionedEpochRewardsInfo.StakingRewards, currentSlot, partitionedEpochRewardsInfo.WorkerPool)
+	acctsDb.InRewardsWindow = false
 	parentDistributedAccts = append(parentDistributedAccts, epochRewardsAcct.Clone())
 
 	epochRewards.Distribute(distributedLamports)
@@ -226,6 +238,7 @@ func distributePartitionedEpochRewardsForSlot(acctsDb *accountsdb.AccountsDb, ep
 
 	if partitionedEpochRewardsInfo.NumRewardPartitionsRemaining == 0 {
 		epochRewards.Active = false
+		partitionedEpochRewardsInfo.ReleaseWorkerPool()
 	}
 
 	writer := new(bytes.Buffer)

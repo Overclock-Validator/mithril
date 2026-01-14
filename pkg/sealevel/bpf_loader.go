@@ -1169,6 +1169,7 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 				programBytes = programAcct.Data()
 			}
 			programAcctKey = programAcct.Key()
+			accountsdb.RecordProgramCacheMissSize(uint64(len(programBytes)))
 		}
 	} else if programOwner == a.BpfLoaderUpgradeableAddr {
 		var programAcctState *UpgradeableLoaderState
@@ -1236,6 +1237,7 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 			programAcctKey = programAcctState.Program.ProgramDataAddress
 			programBytes = programDataAcct.Data[upgradeableLoaderSizeOfProgramDataMetaData:]
 			metrics.GlobalBlockReplay.GetProgramDataUncachedMarshal.AddTimingSince(start)
+			accountsdb.RecordProgramCacheMissSize(uint64(len(programBytes)))
 		}
 	} else {
 		return InstrErrUnsupportedProgramId

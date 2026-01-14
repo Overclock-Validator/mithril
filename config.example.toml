@@ -232,13 +232,13 @@ name = "mithril"
     port = 8899
 
 # ============================================================================
-# [tuning] - Performance Tuning & Profiling
+# [development] - Performance Tuning & Profiling
 # ============================================================================
 #
 # Advanced settings for optimizing Mithril's performance.
 # The defaults work well for most deployments.
 
-[tuning]
+[development]
     # Zstd decoder concurrency (defaults to NumCPU)
     # zstd_decoder_concurrency = 16
 
@@ -254,14 +254,56 @@ name = "mithril"
     # Enable/disable pool allocator for slices
     use_pool = true
 
-    # [tuning.pprof] - CPU/Memory Profiling
-    [tuning.pprof]
+    # [development.pprof] - CPU/Memory Profiling
+    [development.pprof]
         # Port to serve HTTP pprof endpoint (-1 to disable)
         # Access at http://localhost:PORT/debug/pprof/
         # port = 6060
 
         # Filename to write CPU profile (for offline analysis)
         # cpu_profile_path = "/tmp/cpuprof.pprof"
+
+    # [development.cache] - AccountsDB LRU Cache Sizes
+    #
+    # These control the LRU caches for fast account data reads during replay.
+    # Values are NUMBER OF ENTRIES, not bytes.
+    #
+    # NOTE: These are DIFFERENT from the global vote/stake caches used for
+    # leader schedule building. Those are unbounded maps that store vote STATE
+    # (voting history, credits) and stake DELEGATIONS. These LRU caches store
+    # full ACCOUNT data for frequently-accessed accounts.
+    #
+    # Larger caches = fewer disk reads, but more memory usage.
+    # Memory per entry is ~200-1000 bytes depending on account data size.
+    [development.cache]
+        # Vote account data cache - number of entries (frequently accessed during replay)
+        vote_acct_lru = 5000
+
+        # Stake account data cache - number of entries (separated to avoid evicting
+        # hot accounts during epoch rewards when ~1.25M stake accounts are touched once each)
+        stake_acct_lru = 2000
+
+        # Small account data cache - accounts ≤512 bytes (token accounts, etc.)
+        small_acct_lru = 50000
+
+        # Medium account data cache - accounts 512-64KB
+        medium_acct_lru = 20000
+
+        # Huge account data cache - accounts >64KB (mostly programs)
+        huge_acct_lru = 500
+
+        # Compiled BPF program cache - number of entries
+        program_lru = 5000
+
+        # Admit-on-second-hit LRU filter for common accounts (small/medium/huge)
+        # Only caches accounts seen twice within the filter window, filtering one-shot reads.
+        #   0 = disabled (cache everything immediately, like traditional LRU)
+        #   >0 = enable filtering with LRU of this capacity
+        # Recommended: 50000 (roughly 0.5-1x of small+medium+huge total)
+        # Monitor SeenOnceAdmitted/SeenOnceFiltered ratio to tune:
+        #   <5-10% admitted = too strict (filter too small)
+        #   >40-50% admitted = too lenient (filter too large or most accesses are hot)
+        seen_once_filter_size = 0
 
 # ============================================================================
 # [debug] - Debug Logging

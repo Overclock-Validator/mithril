@@ -2,6 +2,7 @@ package sealevel
 
 import (
 	"bytes"
+	"fmt"
 	"math"
 
 	"github.com/Overclock-Validator/mithril/pkg/features"
@@ -763,6 +764,31 @@ func MarshalStakeStake(state *StakeStateV2) ([]byte, error) {
 	} else {
 		return buffer.Bytes(), nil
 	}
+}
+
+// fixedSliceWriter implements io.Writer over a fixed-size byte slice,
+// avoiding allocation during serialization.
+type fixedSliceWriter struct {
+	buf []byte
+	pos int
+}
+
+func (w *fixedSliceWriter) Write(p []byte) (int, error) {
+	if w.pos+len(p) > len(w.buf) {
+		return 0, fmt.Errorf("write exceeds buffer: pos=%d, write=%d, cap=%d", w.pos, len(p), len(w.buf))
+	}
+	copy(w.buf[w.pos:], p)
+	w.pos += len(p)
+	return len(p), nil
+}
+
+// MarshalStakeStakeInto writes the stake state directly into dst, avoiding allocation.
+// dst should be at least StakeStateV2Size (200) bytes for valid stake accounts.
+func MarshalStakeStakeInto(state *StakeStateV2, dst []byte) error {
+	writer := &fixedSliceWriter{buf: dst, pos: 0}
+	encoder := bin.NewBinEncoder(writer)
+
+	return state.MarshalWithEncoder(encoder)
 }
 
 func setStakeAccountState(acct *BorrowedAccount, stakeState *StakeStateV2, f features.Features) error {

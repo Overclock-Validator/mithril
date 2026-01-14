@@ -11,6 +11,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/features"
+	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/rpcclient"
 	"github.com/Overclock-Validator/mithril/pkg/safemath"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
@@ -35,6 +36,87 @@ type PartitionedRewardDistributionInfo struct {
 	Credits                      map[solana.PublicKey]CalculatedStakePoints
 	RewardPartitions             Partitions
 	StakingRewards               map[solana.PublicKey]*CalculatedStakeRewards
+	WorkerPool                   *ants.PoolWithFunc
+}
+
+// rewardDistributionTask carries all context needed for processing one stake account.
+// Used with the shared worker pool to avoid per-partition pool creation overhead.
+type rewardDistributionTask struct {
+	acctsDb             *accountsdb.AccountsDb
+	slot                uint64
+	stakingRewards      map[solana.PublicKey]*CalculatedStakeRewards
+	accts               []*accounts.Account
+	parentAccts         []*accounts.Account
+	distributedLamports *atomic.Uint64
+	wg                  *sync.WaitGroup
+	idx                 int
+	pubkey              solana.PublicKey
+}
+
+// rewardDistributionWorker is the shared worker function for stake reward distribution.
+func rewardDistributionWorker(i interface{}) {
+	task := i.(*rewardDistributionTask)
+	defer task.wg.Done()
+
+	reward, ok := task.stakingRewards[task.pubkey]
+	if !ok {
+		return
+	}
+
+	stakeAcct, err := task.acctsDb.GetAccount(task.slot, task.pubkey)
+	if err != nil {
+		panic(fmt.Sprintf("unable to get acct %s from acctsdb for partitioned epoch rewards distribution in slot %d", task.pubkey, task.slot))
+	}
+	task.parentAccts[task.idx] = stakeAcct.Clone()
+
+	stakeState, err := sealevel.UnmarshalStakeState(stakeAcct.Data)
+	if err != nil {
+		return
+	}
+
+	stakeState.Stake.Stake.CreditsObserved = reward.NewCreditsObserved
+	stakeState.Stake.Stake.Delegation.StakeLamports = safemath.SaturatingAddU64(stakeState.Stake.Stake.Delegation.StakeLamports, uint64(reward.StakerRewards))
+
+	err = sealevel.MarshalStakeStakeInto(stakeState, stakeAcct.Data)
+	if err != nil {
+		panic(fmt.Sprintf("unable to serialize new stake account state in distributing partitioned rewards: %s", err))
+	}
+
+	stakeAcct.Lamports, err = safemath.CheckedAddU64(stakeAcct.Lamports, uint64(reward.StakerRewards))
+	if err != nil {
+		panic(fmt.Sprintf("overflow in partitioned epoch rewards distribution in slot %d to acct %s: %s", task.slot, task.pubkey, err))
+	}
+
+	task.accts[task.idx] = stakeAcct
+	task.distributedLamports.Add(reward.StakerRewards)
+
+	// update the stake cache
+	delegationToCache := stakeState.Stake.Stake.Delegation
+	delegationToCache.CreditsObserved = stakeState.Stake.Stake.CreditsObserved
+	global.PutStakeCacheItem(task.pubkey, &delegationToCache)
+}
+
+// InitWorkerPool creates the shared worker pool for reward distribution.
+// Call once at the start of partitioned rewards, before processing any partition.
+func (info *PartitionedRewardDistributionInfo) InitWorkerPool() error {
+	if info.WorkerPool != nil {
+		return nil
+	}
+	size := runtime.GOMAXPROCS(0) * 8
+	pool, err := ants.NewPoolWithFunc(size, rewardDistributionWorker)
+	if err != nil {
+		return err
+	}
+	info.WorkerPool = pool
+	return nil
+}
+
+// ReleaseWorkerPool releases the shared pool. Call when NumRewardPartitionsRemaining == 0.
+func (info *PartitionedRewardDistributionInfo) ReleaseWorkerPool() {
+	if info.WorkerPool != nil {
+		info.WorkerPool.Release()
+		info.WorkerPool = nil
+	}
 }
 
 type CalculatedStakePoints struct {
@@ -162,7 +244,6 @@ func DistributeVotingRewards(acctsDb *accountsdb.AccountsDb, validatorRewards ma
 
 	wg.Wait()
 	workerPool.Release()
-	ants.Release()
 
 	err := acctsDb.StoreAccounts(updatedAccts, slot)
 	if err != nil {
@@ -172,71 +253,29 @@ func DistributeVotingRewards(acctsDb *accountsdb.AccountsDb, validatorRewards ma
 	return updatedAccts, parentUpdatedAccts, totalVotingRewards.Load()
 }
 
-type idxAndPubkey struct {
-	idx    int
-	pubkey solana.PublicKey
-}
-
-func DistributeStakingRewardsForPartition(acctsDb *accountsdb.AccountsDb, partition *Partition, stakingRewards map[solana.PublicKey]*CalculatedStakeRewards, slot uint64) ([]*accounts.Account, []*accounts.Account, uint64) {
+func DistributeStakingRewardsForPartition(acctsDb *accountsdb.AccountsDb, partition *Partition, stakingRewards map[solana.PublicKey]*CalculatedStakeRewards, slot uint64, workerPool *ants.PoolWithFunc) ([]*accounts.Account, []*accounts.Account, uint64) {
 	var distributedLamports atomic.Uint64
 	accts := make([]*accounts.Account, partition.NumPubkeys())
 	parentAccts := make([]*accounts.Account, partition.NumPubkeys())
 
 	var wg sync.WaitGroup
 
-	size := runtime.GOMAXPROCS(0) * 8
-	workerPool, _ := ants.NewPoolWithFunc(size, func(i interface{}) {
-		defer wg.Done()
-
-		ip := i.(idxAndPubkey)
-		idx := ip.idx
-		stakePk := ip.pubkey
-
-		reward, ok := stakingRewards[stakePk]
-		if !ok {
-			return
-		}
-
-		stakeAcct, err := acctsDb.GetAccount(slot, stakePk)
-		if err != nil {
-			panic(fmt.Sprintf("unable to get acct %s from acctsdb for partitioned epoch rewards distribution in slot %d", stakePk, slot))
-		}
-		parentAccts[idx] = stakeAcct.Clone()
-
-		// update the delegation in the stake account state
-		stakeState, err := sealevel.UnmarshalStakeState(stakeAcct.Data)
-		if err != nil {
-			return
-		}
-
-		stakeState.Stake.Stake.CreditsObserved = reward.NewCreditsObserved
-		stakeState.Stake.Stake.Delegation.StakeLamports = safemath.SaturatingAddU64(stakeState.Stake.Stake.Delegation.StakeLamports, uint64(reward.StakerRewards))
-
-		newStakeStateBytes, err := sealevel.MarshalStakeStake(stakeState)
-		if err != nil {
-			panic(fmt.Sprintf("unable to serialize new stake account state in distributing partitioned rewards: %s", err))
-		}
-		copy(stakeAcct.Data, newStakeStateBytes)
-
-		// update lamports in stake account
-		stakeAcct.Lamports, err = safemath.CheckedAddU64(stakeAcct.Lamports, uint64(reward.StakerRewards))
-		if err != nil {
-			panic(fmt.Sprintf("overflow in partitioned epoch rewards distribution in slot %d to acct %s: %s", slot, stakePk, err))
-		}
-
-		accts[idx] = stakeAcct
-		distributedLamports.Add(reward.StakerRewards)
-	})
-
 	for idx, stakePk := range partition.Pubkeys() {
-		ip := idxAndPubkey{idx: idx, pubkey: stakePk}
+		task := &rewardDistributionTask{
+			acctsDb:             acctsDb,
+			slot:                slot,
+			stakingRewards:      stakingRewards,
+			accts:               accts,
+			parentAccts:         parentAccts,
+			distributedLamports: &distributedLamports,
+			wg:                  &wg,
+			idx:                 idx,
+			pubkey:              stakePk,
+		}
 		wg.Add(1)
-		workerPool.Invoke(ip)
+		workerPool.Invoke(task)
 	}
 	wg.Wait()
-
-	workerPool.Release()
-	ants.Release()
 
 	err := acctsDb.StoreAccounts(accts, slot)
 	if err != nil {
@@ -350,7 +389,6 @@ func CalculateStakeRewardsAndPartitions(pointsPerStakeAcct map[solana.PublicKey]
 	}
 	wg.Wait()
 	partitionCalcWorkerPool.Release()
-	ants.Release()
 
 	return stakeInfoResults, validatorRewards, partitions
 }
@@ -497,7 +535,6 @@ func CalculateStakePoints(
 
 	wg.Wait()
 	workerPool.Release()
-	ants.Release()
 
 	return pointsAccum.CalculatedStakePoints(), pointsAccum.TotalPoints()
 }
