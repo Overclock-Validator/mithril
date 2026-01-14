@@ -124,19 +124,6 @@ func fixupInstructionsSysvarAcct(execCtx *sealevel.ExecutionCtx, instrIdx uint16
 	return nil
 }
 
-var newReservedAcctsSet = map[solana.PublicKey]struct{}{
-	a.AddressLookupTableAddr:        {},
-	a.ComputeBudgetProgramAddr:      {},
-	a.Ed25519PrecompileAddr:         {},
-	a.LoaderV4Addr:                  {},
-	a.Secp256kPrecompileAddr:        {},
-	a.ZkElgamalProofProgramAddr:     {},
-	a.ZkTokenProofProgramAddr:       {},
-	sealevel.SysvarEpochRewardsAddr: {},
-	sealevel.SysvarLastRestartSlotAddr: {},
-	a.SysvarOwnerAddr:               {},
-}
-
 func isWritable(am *solana.AccountMeta, f *features.Features, programIDSet map[solana.PublicKey]struct{}) bool {
 	if !am.IsWritable {
 		return false
@@ -147,7 +134,7 @@ func isWritable(am *solana.AccountMeta, f *features.Features, programIDSet map[s
 	}
 
 	if f.IsActive(features.AddNewReservedAccountKeys) {
-		if _, isReserved := newReservedAcctsSet[am.PublicKey]; isReserved {
+		if _, isReserved := sealevel.NewReservedAcctsSet[am.PublicKey]; isReserved {
 			return false
 		}
 	}
@@ -530,7 +517,10 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 	}
 
 	// Build programIDSet once for O(1) lookup in isWritable
-	programIDs, _ := tx.GetProgramIDs()
+	programIDs, err := tx.GetProgramIDs()
+	if err != nil {
+		panic(err)
+	}
 	programIDSet := make(map[solana.PublicKey]struct{}, len(programIDs))
 	for _, pid := range programIDs {
 		programIDSet[pid] = struct{}{}

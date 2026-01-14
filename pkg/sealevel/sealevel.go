@@ -44,7 +44,7 @@ func IsWritable(am *AccountMeta, f *features.Features, programIDSet map[solana.P
 	}
 
 	if f.IsActive(features.AddNewReservedAccountKeys) {
-		if _, isReserved := newReservedAcctsSet[am.Pubkey]; isReserved {
+		if _, isReserved := NewReservedAcctsSet[am.Pubkey]; isReserved {
 			return false
 		}
 	}
@@ -62,7 +62,9 @@ func IsWritable(am *AccountMeta, f *features.Features, programIDSet map[solana.P
 	return true
 }
 
-var newReservedAcctsSet = map[solana.PublicKey]struct{}{
+// NewReservedAcctsSet contains reserved account addresses that should not be writable.
+// Exported so transaction.go can use the same set (avoiding duplication/drift).
+var NewReservedAcctsSet = map[solana.PublicKey]struct{}{
 	a.AddressLookupTableAddr:    {},
 	a.ComputeBudgetProgramAddr:  {},
 	a.Ed25519PrecompileAddr:     {},

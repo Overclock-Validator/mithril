@@ -47,7 +47,10 @@ func NewRentStateInfo(rent *sealevel.SysvarRent, txCtx *sealevel.TransactionCtx,
 	acctsMetas := txCtx.Accounts.AcctMetas
 
 	// Build programIDSet once per tx for O(1) lookup in IsWritable
-	programIDs, _ := tx.GetProgramIDs()
+	programIDs, err := tx.GetProgramIDs()
+	if err != nil {
+		panic(err)
+	}
 	programIDSet := make(map[solana.PublicKey]struct{}, len(programIDs))
 	for _, pid := range programIDs {
 		programIDSet[pid] = struct{}{}
