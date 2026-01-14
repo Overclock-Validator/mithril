@@ -1787,7 +1787,7 @@ func runIncinerator(slotCtx *sealevel.SlotCtx) {
 func compileWritableAndModifiedAccts(slotCtx *sealevel.SlotCtx, block *b.Block, rentAccts []*accounts.Account) ([]*accounts.Account, []*accounts.Account) {
 	writableAccts := make([]*accounts.Account, 0, len(slotCtx.WritableAccts)+len(block.UpdatedAccts)+len(rentAccts)+4)
 	modifiedAccts := make([]*accounts.Account, 0, len(slotCtx.ModifiedAccts)+len(block.UpdatedAccts)+len(rentAccts)+4)
-	alreadyAdded := make(map[solana.PublicKey]bool)
+	alreadyAdded := make(map[solana.PublicKey]bool, len(slotCtx.WritableAccts))
 
 	for pk := range slotCtx.WritableAccts {
 		acct, _ := slotCtx.GetAccount(pk)

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math"
 	"runtime/trace"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -67,13 +66,23 @@ func newExecCtx(slotCtx *sealevel.SlotCtx, transactionAccts *sealevel.Transactio
 	execCtx.Accounts = accounts.NewMemAccounts()
 	execCtx.SlotCtx = slotCtx
 	execCtx.TransactionContext.ComputeBudgetLimits = computeBudgetLimits
-	execCtx.ModifiedVoteStates = make(map[solana.PublicKey]*sealevel.VoteStateVersions)
+	execCtx.ModifiedVoteStates = make(map[solana.PublicKey]*sealevel.VoteStateVersions, 8)
 	return execCtx
 }
 
 func instrsAndAcctMetasFromTx(tx *solana.Transaction, f *features.Features) ([]sealevel.Instruction, [][]sealevel.AccountMeta, error) {
 	instrs := make([]sealevel.Instruction, 0, len(tx.Message.Instructions))
 	acctMetasPerInstr := make([][]sealevel.AccountMeta, 0, len(tx.Message.Instructions))
+
+	// Build programIDSet once per tx for O(1) lookup in isWritable
+	programIDs, err := tx.GetProgramIDs()
+	if err != nil {
+		return nil, nil, err
+	}
+	programIDSet := make(map[solana.PublicKey]struct{}, len(programIDs))
+	for _, pid := range programIDs {
+		programIDSet[pid] = struct{}{}
+	}
 
 	for _, compiledInstr := range tx.Message.Instructions {
 		programId, err := tx.ResolveProgramIDIndex(compiledInstr.ProgramIDIndex)
@@ -88,7 +97,7 @@ func instrsAndAcctMetasFromTx(tx *solana.Transaction, f *features.Features) ([]s
 
 		var acctMetas []sealevel.AccountMeta
 		for _, am := range ams {
-			acctMeta := sealevel.AccountMeta{Pubkey: am.PublicKey, IsSigner: am.IsSigner, IsWritable: isWritable(tx, am, f)}
+			acctMeta := sealevel.AccountMeta{Pubkey: am.PublicKey, IsSigner: am.IsSigner, IsWritable: isWritable(am, f, programIDSet)}
 			acctMetas = append(acctMetas, acctMeta)
 		}
 
@@ -115,11 +124,20 @@ func fixupInstructionsSysvarAcct(execCtx *sealevel.ExecutionCtx, instrIdx uint16
 	return nil
 }
 
-var newReservedAccts = []solana.PublicKey{a.AddressLookupTableAddr, a.ComputeBudgetProgramAddr,
-	a.Ed25519PrecompileAddr, a.LoaderV4Addr, a.Secp256kPrecompileAddr, a.ZkElgamalProofProgramAddr,
-	a.ZkTokenProofProgramAddr, sealevel.SysvarEpochRewardsAddr, sealevel.SysvarLastRestartSlotAddr, a.SysvarOwnerAddr}
+var newReservedAcctsSet = map[solana.PublicKey]struct{}{
+	a.AddressLookupTableAddr:        {},
+	a.ComputeBudgetProgramAddr:      {},
+	a.Ed25519PrecompileAddr:         {},
+	a.LoaderV4Addr:                  {},
+	a.Secp256kPrecompileAddr:        {},
+	a.ZkElgamalProofProgramAddr:     {},
+	a.ZkTokenProofProgramAddr:       {},
+	sealevel.SysvarEpochRewardsAddr: {},
+	sealevel.SysvarLastRestartSlotAddr: {},
+	a.SysvarOwnerAddr:               {},
+}
 
-func isWritable(tx *solana.Transaction, am *solana.AccountMeta, f *features.Features) bool {
+func isWritable(am *solana.AccountMeta, f *features.Features, programIDSet map[solana.PublicKey]struct{}) bool {
 	if !am.IsWritable {
 		return false
 	}
@@ -129,7 +147,7 @@ func isWritable(tx *solana.Transaction, am *solana.AccountMeta, f *features.Feat
 	}
 
 	if f.IsActive(features.AddNewReservedAccountKeys) {
-		if slices.Contains(newReservedAccts, am.PublicKey) {
+		if _, isReserved := newReservedAcctsSet[am.PublicKey]; isReserved {
 			return false
 		}
 	}
@@ -140,15 +158,8 @@ func isWritable(tx *solana.Transaction, am *solana.AccountMeta, f *features.Feat
 		}
 	}
 
-	programIds, err := tx.GetProgramIDs()
-	if err != nil {
-		panic(err)
-	}
-
-	for _, programId := range programIds {
-		if am.PublicKey == programId {
-			return false
-		}
+	if _, isProgramID := programIDSet[am.PublicKey]; isProgramID {
+		return false
 	}
 
 	return true
@@ -221,11 +232,11 @@ func recordVoteTimestampAndSlot(slotCtx *sealevel.SlotCtx, acct *accounts.Accoun
 	slotCtx.VoteTimestamps[acct.Key] = timestamp
 }
 
-func recordStakeAndVoteAccounts(slotCtx *sealevel.SlotCtx, execCtx *sealevel.ExecutionCtx, writablePubkeys []solana.PublicKey) {
+func recordStakeAndVoteAccounts(slotCtx *sealevel.SlotCtx, execCtx *sealevel.ExecutionCtx, writablePubkeySet map[solana.PublicKey]struct{}) {
 	modifiedVoteAccts := execCtx.TransactionContext.ModifiedVoteAccts
 
 	for _, acct := range execCtx.TransactionContext.Accounts.Accounts {
-		if !slices.Contains(writablePubkeys, acct.Key) {
+		if _, isWritable := writablePubkeySet[acct.Key]; !isWritable {
 			continue
 		}
 
@@ -518,14 +529,18 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 		return handleFailedTx(slotCtx, tx, instrs, computeBudgetLimits, instrErr, rentStateErr)
 	}
 
-	txAcctMetas, err := tx.AccountMetaList()
-	if err != nil {
-		panic(err)
+	// Build programIDSet once for O(1) lookup in isWritable
+	programIDs, _ := tx.GetProgramIDs()
+	programIDSet := make(map[solana.PublicKey]struct{}, len(programIDs))
+	for _, pid := range programIDs {
+		programIDSet[pid] = struct{}{}
 	}
 
-	for _, txAcctMeta := range txAcctMetas {
-		if isWritable(tx, txAcctMeta, &execCtx.Features) {
-			writablePubkeys = append(writablePubkeys, txAcctMeta.PublicKey)
+	// Reuse AcctMetas already built during account loading (avoids second AccountMetaList call)
+	for _, acctMeta := range execCtx.TransactionContext.Accounts.AcctMetas {
+		solanaAcctMeta := &solana.AccountMeta{PublicKey: acctMeta.Pubkey, IsSigner: acctMeta.IsSigner, IsWritable: acctMeta.IsWritable}
+		if isWritable(solanaAcctMeta, &execCtx.Features, programIDSet) {
+			writablePubkeys = append(writablePubkeys, acctMeta.Pubkey)
 		}
 	}
 
@@ -534,8 +549,14 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 	}
 
 	handleModifiedAccounts(slotCtx, execCtx)
+
+	// Build writablePubkeySet for O(1) lookup in recordStakeAndVoteAccounts
 	writablePubkeys = append(writablePubkeys, payerAcct.Key)
-	recordStakeAndVoteAccounts(slotCtx, execCtx, writablePubkeys)
+	writablePubkeySet := make(map[solana.PublicKey]struct{}, len(writablePubkeys))
+	for _, pk := range writablePubkeys {
+		writablePubkeySet[pk] = struct{}{}
+	}
+	recordStakeAndVoteAccounts(slotCtx, execCtx, writablePubkeySet)
 	metrics.GlobalBlockReplay.TxUpdateAccounts.AddTimingSince(start)
 
 	return txFeeInfo, nil

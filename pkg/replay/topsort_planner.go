@@ -64,8 +64,9 @@ func getWritableAccounts(t *solana.Transaction, tm *rpc.TransactionMeta) []solan
 func blockToDependencyGraph(b *block.Block) (adjacencyList [][]tx, inDegree []int) {
 	//start := time.Now()
 	// Map between pubkeys and account indices
+	// Estimate ~4 unique accounts per tx to reduce map rehashing
 	var acctToPk []solana.PublicKey
-	pkToAcct := make(map[solana.PublicKey]acct)
+	pkToAcct := make(map[solana.PublicKey]acct, len(b.TxMetas)*4)
 
 	for i, txMeta := range b.TxMetas {
 		tx := b.Transactions[i]

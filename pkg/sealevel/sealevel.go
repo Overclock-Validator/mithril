@@ -2,7 +2,6 @@ package sealevel
 
 import (
 	"bytes"
-	"slices"
 
 	a "github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/features"
@@ -35,7 +34,7 @@ func (t *TransactionCtx) newVMOpts(params *Params) *sbpf.VMOpts {
 	}
 }
 
-func IsWritable(tx *solana.Transaction, am *AccountMeta, f *features.Features) bool {
+func IsWritable(am *AccountMeta, f *features.Features, programIDSet map[solana.PublicKey]struct{}) bool {
 	if !am.IsWritable {
 		return false
 	}
@@ -45,7 +44,7 @@ func IsWritable(tx *solana.Transaction, am *AccountMeta, f *features.Features) b
 	}
 
 	if f.IsActive(features.AddNewReservedAccountKeys) {
-		if slices.Contains(newReservedAccts, am.Pubkey) {
+		if _, isReserved := newReservedAcctsSet[am.Pubkey]; isReserved {
 			return false
 		}
 	}
@@ -56,23 +55,25 @@ func IsWritable(tx *solana.Transaction, am *AccountMeta, f *features.Features) b
 		}
 	}
 
-	programIds, err := tx.GetProgramIDs()
-	if err != nil {
-		panic(err)
-	}
-
-	for _, programId := range programIds {
-		if am.Pubkey == programId {
-			return false
-		}
+	if _, isProgramID := programIDSet[am.Pubkey]; isProgramID {
+		return false
 	}
 
 	return true
 }
 
-var newReservedAccts = []solana.PublicKey{a.AddressLookupTableAddr, a.ComputeBudgetProgramAddr,
-	a.Ed25519PrecompileAddr, a.LoaderV4Addr, a.Secp256kPrecompileAddr, a.ZkElgamalProofProgramAddr,
-	a.ZkTokenProofProgramAddr, SysvarEpochRewardsAddr, SysvarLastRestartSlotAddr, a.SysvarOwnerAddr}
+var newReservedAcctsSet = map[solana.PublicKey]struct{}{
+	a.AddressLookupTableAddr:    {},
+	a.ComputeBudgetProgramAddr:  {},
+	a.Ed25519PrecompileAddr:     {},
+	a.LoaderV4Addr:              {},
+	a.Secp256kPrecompileAddr:    {},
+	a.ZkElgamalProofProgramAddr: {},
+	a.ZkTokenProofProgramAddr:   {},
+	SysvarEpochRewardsAddr:      {},
+	SysvarLastRestartSlotAddr:   {},
+	a.SysvarOwnerAddr:           {},
+}
 
 func IsSysvar(pubkey solana.PublicKey) bool {
 	if pubkey == SysvarClockAddr || pubkey == SysvarEpochScheduleAddr ||

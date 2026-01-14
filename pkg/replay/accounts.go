@@ -18,7 +18,7 @@ func loadAndValidateTxAccts(slotCtx *sealevel.SlotCtx, acctMetasPerInstr [][]sea
 	}
 
 	var programIdIdxs []uint64
-	instructionAcctPubkeys := make(map[solana.PublicKey]struct{})
+	instructionAcctPubkeys := make(map[solana.PublicKey]struct{}, len(tx.Message.AccountKeys))
 
 	for instrIdx, instr := range tx.Message.Instructions {
 		programIdIdxs = append(programIdIdxs, uint64(instr.ProgramIDIndex))
@@ -69,7 +69,7 @@ func loadAndValidateTxAccts(slotCtx *sealevel.SlotCtx, acctMetasPerInstr [][]sea
 	transactionAccts.AcctMetas = convertedAcctMetas
 
 	removeAcctsExecutableFlagChecks := slotCtx.Features.IsActive(features.RemoveAccountsExecutableFlagChecks)
-	validatedLoaders := make(map[solana.PublicKey]struct{})
+	validatedLoaders := make(map[solana.PublicKey]struct{}, 4) // Usually ≤4 loaders
 
 	for _, instr := range instrs {
 		if instr.ProgramId == addresses.NativeLoaderAddr {
@@ -242,7 +242,7 @@ func loadAndValidateTxAcctsSimd186(slotCtx *sealevel.SlotCtx, acctMetasPerInstr 
 
 	// Use boolean mask for O(1) program index lookup
 	isProgramIdx := make([]bool, len(acctKeys))
-	instructionAcctPubkeys := make(map[solana.PublicKey]struct{})
+	instructionAcctPubkeys := make(map[solana.PublicKey]struct{}, len(acctKeys))
 
 	for instrIdx, instr := range tx.Message.Instructions {
 		i := int(instr.ProgramIDIndex)
