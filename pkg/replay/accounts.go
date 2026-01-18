@@ -290,9 +290,12 @@ func loadAndValidateTxAcctsSimd186(slotCtx *sealevel.SlotCtx, acctMetasPerInstr 
 
 		// Use cached account via ProgramIDIndex from tx.Message
 		programIdx := int(tx.Message.Instructions[instrIdx].ProgramIDIndex)
-		programAcct := acctCache[programIdx]
+		var programAcct *accounts.Account
+		if programIdx >= 0 && programIdx < len(acctCache) {
+			programAcct = acctCache[programIdx]
+		}
 
-		// Fallback if not in cache (shouldn't happen for valid txs)
+		// Fallback if not in cache or out of bounds
 		if programAcct == nil {
 			var err error
 			programAcct, err = slotCtx.GetAccount(instr.ProgramId)
