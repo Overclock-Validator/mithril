@@ -1222,6 +1222,7 @@ func ReplayBlocks(
 	}
 	go blockStream.Start()
 
+	storeAcctsDbWg := &sync.WaitGroup{}
 	var loader accountLoader
 	if UseAccountPrefetcher {
 		mlog.Log.Infof("Using account prefetcher")
@@ -1347,6 +1348,9 @@ func ReplayBlocks(
 
 		// epoch boundary
 		if block.Epoch != currentEpoch {
+			// Async stores can occur between (accountLoader).NextBlock() and ProcessBlock.
+			// Wait for any outstanding stores to finish before reading acctsDb.
+			storeAcctsDbWg.Wait()
 			mlog.Log.Infof("epoch boundary, %d -> %d", currentEpoch, currentEpoch+1)
 
 			var newlyActivatedFeatures, parentNewlyActivatedFeatures []*accounts.Account
@@ -1423,7 +1427,7 @@ func ReplayBlocks(
 		*/
 		metrics.GlobalBlockReplay.PreprocessBlock.AddTimingSince(start)
 
-		lastSlotCtx, err = ProcessBlock(loader, acctsDb, block, loadedAccts, txParallelism, dbgOpts, pt)
+		lastSlotCtx, err = ProcessBlock(loader, storeAcctsDbWg, acctsDb, block, loadedAccts, txParallelism, dbgOpts, pt)
 		if err != nil {
 			mlog.Log.Errorf("error encountered during block replay: %s\n", err)
 			result.Error = err
@@ -2042,6 +2046,7 @@ func prepareAccountsAndSysvars(
 
 func ProcessBlock(
 	loader accountLoader,
+	storeAcctsDbWg *sync.WaitGroup,
 	acctsDb *accountsdb.AccountsDb,
 	block *b.Block,
 	loadedAccts map[solana.PublicKey]*accounts.Account,
@@ -2154,8 +2159,10 @@ func ProcessBlock(
 		// Exit critical commit window - AccountsDB is now consistent
 		commitInProgress.Store(false)
 		commitSlot.Store(0)
+		storeAcctsDbWg.Done()
 	}
 
+	storeAcctsDbWg.Add(1)
 	storeAcctsRegion := trace.StartRegion(ctx, "StoreAccounts")
 	err := loader.StoreAccounts(modifiedAccts, slotCtx.Slot, afterStoreAccounts)
 	if err != nil {
