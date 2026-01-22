@@ -39,6 +39,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/snapshot"
 	"github.com/Overclock-Validator/mithril/pkg/statsd"
+	"github.com/Overclock-Validator/mithril/pkg/util"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
@@ -600,7 +601,12 @@ func updateAndCacheSysvars(
 	}
 }
 
-func scanAndEnableFeatures(acctsDb *accountsdb.AccountsDb, slot uint64, startOfEpoch bool) (*features.Features, []*accounts.Account, []*accounts.Account) {
+func scanAndEnableFeatures(
+	loadedAccts map[solana.PublicKey]*accounts.Account,
+	acctsDb *accountsdb.AccountsDb,
+	slot uint64,
+	startOfEpoch bool,
+) (*features.Features, []*accounts.Account, []*accounts.Account) {
 	parentNewlyActivatedFeatureAccts := make([]*accounts.Account, 0)
 	newlyActivatedFeatureAccts := make([]*accounts.Account, 0)
 
@@ -637,6 +643,7 @@ func scanAndEnableFeatures(acctsDb *accountsdb.AccountsDb, slot uint64, startOfE
 	}
 
 	if len(newlyActivatedFeatureAccts) != 0 {
+		util.UpdateLoadedAccounts(loadedAccts, newlyActivatedFeatureAccts)
 		err := acctsDb.StoreAccounts(newlyActivatedFeatureAccts, slot)
 		if err != nil {
 			panic(err)
@@ -1117,7 +1124,7 @@ func ReplayBlocks(
 
 	global.IncrTransactionCount(snapshotManifest.Bank.TransactionCount)
 	isFirstSlotInEpoch := epochSchedule.FirstSlotInEpoch(currentEpoch) == startSlot
-	replayCtx.CurrentFeatures, featuresActivatedInFirstSlot, parentFeaturesActivatedInFirstSlot = scanAndEnableFeatures(acctsDb, startSlot, isFirstSlotInEpoch)
+	replayCtx.CurrentFeatures, featuresActivatedInFirstSlot, parentFeaturesActivatedInFirstSlot = scanAndEnableFeatures(nil, acctsDb, startSlot, isFirstSlotInEpoch)
 	partitionedEpochRewardsEnabled = replayCtx.CurrentFeatures.IsActive(features.EnablePartitionedEpochReward) || replayCtx.CurrentFeatures.IsActive(features.EnablePartitionedEpochRewardsSuperfeature)
 
 	// Load epoch stakes - persisted stakes on resume, manifest on fresh start
@@ -1354,9 +1361,9 @@ func ReplayBlocks(
 			mlog.Log.Infof("epoch boundary, %d -> %d", currentEpoch, currentEpoch+1)
 
 			var newlyActivatedFeatures, parentNewlyActivatedFeatures []*accounts.Account
-			replayCtx.CurrentFeatures, newlyActivatedFeatures, parentNewlyActivatedFeatures = scanAndEnableFeatures(acctsDb, currentSlot, true)
+			replayCtx.CurrentFeatures, newlyActivatedFeatures, parentNewlyActivatedFeatures = scanAndEnableFeatures(loadedAccts, acctsDb, currentSlot, true)
 			partitionedEpochRewardsEnabled = replayCtx.CurrentFeatures.IsActive(features.EnablePartitionedEpochReward) || replayCtx.CurrentFeatures.IsActive(features.EnablePartitionedEpochRewardsSuperfeature)
-			partitionedRewardsInfo = handleEpochTransition(acctsDb, rpcc, rpcBackups, partitionedEpochRewardsEnabled, lastSlotCtx, replayCtx, epochSchedule, replayCtx.CurrentFeatures, block, currentEpoch)
+			partitionedRewardsInfo = handleEpochTransition(loadedAccts, acctsDb, rpcc, rpcBackups, partitionedEpochRewardsEnabled, lastSlotCtx, replayCtx, epochSchedule, replayCtx.CurrentFeatures, block, currentEpoch)
 			currentEpoch = block.Epoch
 			justCrossedEpochBoundary = true
 			if len(newlyActivatedFeatures) != 0 {
@@ -1393,7 +1400,7 @@ func ReplayBlocks(
 
 		// post-epoch boundary rewards distribution
 		if partitionedEpochRewardsEnabled && partitionedRewardsInfo != nil && currentSlot >= partitionedRewardsInfo.FirstStakingRewardSlot && partitionedRewardsInfo.NumRewardPartitionsRemaining > 0 {
-			distributedAccts, parentDistributedAccts := distributePartitionedEpochRewardsForSlot(acctsDb, replayCtx, partitionedRewardsInfo, currentSlot, block.BlockHeight)
+			distributedAccts, parentDistributedAccts := distributePartitionedEpochRewardsForSlot(loadedAccts, acctsDb, replayCtx, partitionedRewardsInfo, currentSlot, block.BlockHeight)
 			block.EpochUpdatedAccts = append(block.EpochUpdatedAccts, distributedAccts...)
 			block.ParentEpochUpdatedAccts = append(block.ParentEpochUpdatedAccts, parentDistributedAccts...)
 		}

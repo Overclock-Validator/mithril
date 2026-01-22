@@ -126,3 +126,21 @@ func ReverseBytes(s []byte) []byte {
 	slices.Reverse(newBytes)
 	return newBytes
 }
+
+// Some parts of epoch transition handling make StoreAccounts calls directly to
+// accountsDb before ProcessBlock. updateLoadedAccounts helps mirror those
+// changes to the result of the account loader.
+func UpdateLoadedAccounts(
+	loadedAccts map[solana.PublicKey]*accounts.Account,
+	storeAccounts []*accounts.Account,
+) {
+	if loadedAccts == nil {
+		return
+	}
+	for _, a := range storeAccounts {
+		if a == nil {
+			continue
+		}
+		loadedAccts[a.Key] = a
+	}
+}

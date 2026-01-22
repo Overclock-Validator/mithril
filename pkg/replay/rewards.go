@@ -17,6 +17,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/rewards"
 	"github.com/Overclock-Validator/mithril/pkg/rpcclient"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
+	"github.com/Overclock-Validator/mithril/pkg/util"
 	"github.com/Overclock-Validator/wide"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
@@ -161,7 +162,20 @@ func fnv1a64AddUint64(h uint64, v uint64) uint64 {
 	return h
 }
 
-func beginPartitionedEpochRewardsDistribution(acctsDb *accountsdb.AccountsDb, slotCtx *sealevel.SlotCtx, stakeHistory *sealevel.SysvarStakeHistory, epochCtx *ReplayCtx, epochSchedule *sealevel.SysvarEpochSchedule, rpcc *rpcclient.RpcClient, rpcBackups []string, block *block.Block, f *features.Features, epoch uint64, slot uint64) (*rewards.PartitionedRewardDistributionInfo, []*accounts.Account, []*accounts.Account) {
+func beginPartitionedEpochRewardsDistribution(
+	loadedAccts map[solana.PublicKey]*accounts.Account,
+	acctsDb *accountsdb.AccountsDb,
+	slotCtx *sealevel.SlotCtx,
+	stakeHistory *sealevel.SysvarStakeHistory,
+	epochCtx *ReplayCtx,
+	epochSchedule *sealevel.SysvarEpochSchedule,
+	rpcc *rpcclient.RpcClient,
+	rpcBackups []string,
+	block *block.Block,
+	f *features.Features,
+	epoch uint64,
+	slot uint64,
+) (*rewards.PartitionedRewardDistributionInfo, []*accounts.Account, []*accounts.Account) {
 	partitionedRewardsInfo := rewards.DeterminePartitionedStakingRewardsInfo(rpcc, rpcBackups, epochSchedule, &epochCtx.Inflation, epochCtx.Capitalization, epoch, epoch-1, slot, epochCtx.SlotsPerYear, f)
 	totalRewards := partitionedRewardsInfo.TotalStakingRewards
 
@@ -171,12 +185,12 @@ func beginPartitionedEpochRewardsDistribution(acctsDb *accountsdb.AccountsDb, sl
 	stakeCacheSnapshot := global.StakeCacheSnapshot()
 	voteCacheSnapshot := global.VoteCacheSnapshot()
 
-	pointsPerStakeAcct, points = rewards.CalculateStakePoints(acctsDb, slotCtx, slot, stakeHistory, newWarmupCooldownRateEpoch, stakeCacheSnapshot, voteCacheSnapshot)
+	pointsPerStakeAcct, points = rewards.CalculateStakePoints(slotCtx, slot, stakeHistory, newWarmupCooldownRateEpoch, stakeCacheSnapshot, voteCacheSnapshot)
 	pointValue := rewards.PointValue{Rewards: totalRewards, Points: points}
 
 	var validatorRewards map[solana.PublicKey]*atomic.Uint64
 	partitionedRewardsInfo.StakingRewards, validatorRewards, partitionedRewardsInfo.RewardPartitions = rewards.CalculateStakeRewardsAndPartitions(pointsPerStakeAcct, slotCtx, stakeHistory, slot, epoch-1, pointValue, newWarmupCooldownRateEpoch, slotCtx.Features, stakeCacheSnapshot, voteCacheSnapshot)
-	updatedAccts, parentUpdatedAccts, voteRewardsDistributed := rewards.DistributeVotingRewards(acctsDb, validatorRewards, slot)
+	updatedAccts, parentUpdatedAccts, voteRewardsDistributed := rewards.DistributeVotingRewards(loadedAccts, acctsDb, validatorRewards, slot)
 	partitionedRewardsInfo.NumRewardPartitionsRemaining = partitionedRewardsInfo.RewardPartitions.NumPartitions()
 
 	newEpochRewards := sealevel.SysvarEpochRewards{DistributionStartingBlockHeight: block.BlockHeight + 1,
@@ -194,7 +208,9 @@ func beginPartitionedEpochRewardsDistribution(acctsDb *accountsdb.AccountsDb, sl
 	newEpochRewards.MustMarshalWithEncoder(encoder)
 	copy(epochRewardsAcct.Data, writer.Bytes())
 
-	err = acctsDb.StoreAccounts([]*accounts.Account{epochRewardsAcct}, slot)
+	storeAccts := []*accounts.Account{epochRewardsAcct}
+	util.UpdateLoadedAccounts(loadedAccts, storeAccts)
+	err = acctsDb.StoreAccounts(storeAccts, slot)
 	if err != nil {
 		panic(fmt.Sprintf("unable to update EpochRewards sysvar to acctsdb: %s", err))
 	}
@@ -207,7 +223,14 @@ func beginPartitionedEpochRewardsDistribution(acctsDb *accountsdb.AccountsDb, sl
 	return partitionedRewardsInfo, updatedAccts, parentUpdatedAccts
 }
 
-func distributePartitionedEpochRewardsForSlot(acctsDb *accountsdb.AccountsDb, epochCtx *ReplayCtx, partitionedEpochRewardsInfo *rewards.PartitionedRewardDistributionInfo, currentSlot uint64, currentBlockHeight uint64) ([]*accounts.Account, []*accounts.Account) {
+func distributePartitionedEpochRewardsForSlot(
+	loadedAccts map[solana.PublicKey]*accounts.Account,
+	acctsDb *accountsdb.AccountsDb,
+	epochCtx *ReplayCtx,
+	partitionedEpochRewardsInfo *rewards.PartitionedRewardDistributionInfo,
+	currentSlot uint64,
+	currentBlockHeight uint64,
+) ([]*accounts.Account, []*accounts.Account) {
 	epochRewardsAcct, err := acctsDb.GetAccount(currentSlot, sealevel.SysvarEpochRewardsAddr)
 	if err != nil {
 		panic(fmt.Sprintf("unable to get EpochRewards from acctsdb: %s", err))
@@ -233,7 +256,9 @@ func distributePartitionedEpochRewardsForSlot(acctsDb *accountsdb.AccountsDb, ep
 	epochRewards.MustMarshalWithEncoder(encoder)
 	copy(epochRewardsAcct.Data, writer.Bytes())
 
-	err = acctsDb.StoreAccounts([]*accounts.Account{epochRewardsAcct}, currentSlot)
+	storeAccts := []*accounts.Account{epochRewardsAcct}
+	util.UpdateLoadedAccounts(loadedAccts, storeAccts)
+	err = acctsDb.StoreAccounts(storeAccts, currentSlot)
 	if err != nil {
 		panic(fmt.Sprintf("unable to update EpochRewards sysvar to acctsdb: %s", err))
 	}

@@ -19,6 +19,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/rpcclient"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/snapshot"
+	"github.com/Overclock-Validator/mithril/pkg/util"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 	"github.com/panjf2000/ants/v2"
@@ -64,7 +65,15 @@ func newReplayCtx(snapshotManifest *snapshot.SnapshotManifest, resumeState *Resu
 	return epochCtx
 }
 
-func updateStakeHistorySysvar(acctsDb *accountsdb.AccountsDb, block *block.Block, prevSlotCtx *sealevel.SlotCtx, targetEpoch uint64, epochSchedule *sealevel.SysvarEpochSchedule, f *features.Features) *sealevel.SysvarStakeHistory {
+func updateStakeHistorySysvar(
+	loadedAccts map[solana.PublicKey]*accounts.Account,
+	acctsDb *accountsdb.AccountsDb,
+	block *block.Block,
+	prevSlotCtx *sealevel.SlotCtx,
+	targetEpoch uint64,
+	epochSchedule *sealevel.SysvarEpochSchedule,
+	f *features.Features,
+) *sealevel.SysvarStakeHistory {
 	stakeHistoryAcct, err := prevSlotCtx.GetAccount(sealevel.SysvarStakeHistoryAddr)
 	if err != nil {
 		stakeHistoryAcct, err = acctsDb.GetAccount(prevSlotCtx.Slot, sealevel.SysvarStakeHistoryAddr)
@@ -121,7 +130,9 @@ func updateStakeHistorySysvar(acctsDb *accountsdb.AccountsDb, block *block.Block
 	newStakeHistoryBytes := buf.Bytes()
 	copy(stakeHistoryAcct.Data, newStakeHistoryBytes)
 
-	err = acctsDb.StoreAccounts([]*accounts.Account{stakeHistoryAcct}, prevSlotCtx.Slot)
+	storeAccounts := []*accounts.Account{stakeHistoryAcct}
+	util.UpdateLoadedAccounts(loadedAccts, storeAccounts)
+	err = acctsDb.StoreAccounts(storeAccounts, prevSlotCtx.Slot)
 	if err != nil {
 		panic(fmt.Sprintf("error storing new StakeHistory sysvar to accountsdb: %s", err))
 	}
@@ -130,7 +141,19 @@ func updateStakeHistorySysvar(acctsDb *accountsdb.AccountsDb, block *block.Block
 	return &stakeHistory
 }
 
-func handleEpochTransition(acctsDb *accountsdb.AccountsDb, rpcc *rpcclient.RpcClient, rpcBackups []string, partitionedEpochRewards bool, prevSlotCtx *sealevel.SlotCtx, replayCtx *ReplayCtx, epochSchedule *sealevel.SysvarEpochSchedule, f *features.Features, block *block.Block, epoch uint64) *rewards.PartitionedRewardDistributionInfo {
+func handleEpochTransition(
+	loadedAccts map[solana.PublicKey]*accounts.Account,
+	acctsDb *accountsdb.AccountsDb,
+	rpcc *rpcclient.RpcClient,
+	rpcBackups []string,
+	partitionedEpochRewards bool,
+	prevSlotCtx *sealevel.SlotCtx,
+	replayCtx *ReplayCtx,
+	epochSchedule *sealevel.SysvarEpochSchedule,
+	f *features.Features,
+	block *block.Block,
+	epoch uint64,
+) *rewards.PartitionedRewardDistributionInfo {
 	var stakeHistory sealevel.SysvarStakeHistory
 	stakeHistoryAcct, err := prevSlotCtx.GetAccount(sealevel.SysvarStakeHistoryAddr)
 	if err != nil {
@@ -168,12 +191,12 @@ func handleEpochTransition(acctsDb *accountsdb.AccountsDb, rpcc *rpcclient.RpcCl
 	}
 
 	if partitionedEpochRewards {
-		partitionedRewardsInfo, block.EpochUpdatedAccts, block.ParentEpochUpdatedAccts = beginPartitionedEpochRewardsDistribution(acctsDb, prevSlotCtx, &stakeHistory, replayCtx, epochSchedule, rpcc, rpcBackups, block, f, newEpoch, firstSlotInEpoch)
+		partitionedRewardsInfo, block.EpochUpdatedAccts, block.ParentEpochUpdatedAccts = beginPartitionedEpochRewardsDistribution(loadedAccts, acctsDb, prevSlotCtx, &stakeHistory, replayCtx, epochSchedule, rpcc, rpcBackups, block, f, newEpoch, firstSlotInEpoch)
 	} else {
 		panic("only partitioned rewards supported")
 	}
 
-	updateStakeHistorySysvar(acctsDb, block, prevSlotCtx, epoch, epochSchedule, f)
+	updateStakeHistorySysvar(loadedAccts, acctsDb, block, prevSlotCtx, epoch, epochSchedule, f)
 	mlog.Log.Infof("epoch transition %d -> %d done.", epoch, newEpoch)
 
 	return partitionedRewardsInfo

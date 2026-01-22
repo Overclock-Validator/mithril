@@ -15,6 +15,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/rpcclient"
 	"github.com/Overclock-Validator/mithril/pkg/safemath"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
+	"github.com/Overclock-Validator/mithril/pkg/util"
 	"github.com/Overclock-Validator/wide"
 	"github.com/dgryski/go-sip13"
 	"github.com/gagliardetto/solana-go"
@@ -117,7 +118,7 @@ type idxAndRewardNew struct {
 	voterPk solana.PublicKey
 }
 
-func DistributeVotingRewards(acctsDb *accountsdb.AccountsDb, validatorRewards map[solana.PublicKey]*atomic.Uint64, slot uint64) ([]*accounts.Account, []*accounts.Account, uint64) {
+func DistributeVotingRewards(loadedAccts map[solana.PublicKey]*accounts.Account, acctsDb *accountsdb.AccountsDb, validatorRewards map[solana.PublicKey]*atomic.Uint64, slot uint64) ([]*accounts.Account, []*accounts.Account, uint64) {
 	var totalVotingRewards atomic.Uint64
 
 	updatedAccts := make([]*accounts.Account, len(validatorRewards))
@@ -165,6 +166,7 @@ func DistributeVotingRewards(acctsDb *accountsdb.AccountsDb, validatorRewards ma
 	workerPool.Release()
 	ants.Release()
 
+	util.UpdateLoadedAccounts(loadedAccts, updatedAccts)
 	err := acctsDb.StoreAccounts(updatedAccts, slot)
 	if err != nil {
 		panic(fmt.Sprintf("error updating accounts for voting rewards in slot %d: %s", slot, err))
@@ -457,7 +459,6 @@ type delegationAndPubkey struct {
 }
 
 func CalculateStakePoints(
-	acctsDb *accountsdb.AccountsDb,
 	slotCtx *sealevel.SlotCtx,
 	slot uint64,
 	stakeHistory *sealevel.SysvarStakeHistory,
