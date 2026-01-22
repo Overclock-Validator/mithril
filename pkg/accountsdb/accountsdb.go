@@ -42,7 +42,8 @@ func (silentLogger) Fatalf(format string, args ...interface{}) { log.Fatalf(form
 var (
 	ErrNoAccount = errors.New("ErrNoAccount")
 
-	StoreAccountsWorkers = 128
+	StoreAccountsWorkers        = 128
+	OverwriteSameLengthAccounts = true
 )
 
 func OpenDb(accountsDbDir string) (*AccountsDb, error) {
@@ -294,7 +295,7 @@ func (accountsDb *AccountsDb) storeAccountsInternal(accts []*accounts.Account, s
 				panic(fmt.Sprintf("failed to unmarshal account from appendvec file %s: %s", existingAppendVecFileName, err))
 			}
 
-			if len(acct.Data) == len(existingAcct.Data) {
+			if OverwriteSameLengthAccounts && len(acct.Data) == len(existingAcct.Data) {
 				newAppendVecAcct := AppendVecAccount{DataLen: uint64(len(acct.Data)), Pubkey: acct.Key, Lamports: acct.Lamports,
 					RentEpoch: acct.RentEpoch, Owner: acct.Owner, Executable: acct.Executable, Data: acct.Data}
 
@@ -367,7 +368,7 @@ func (accountsDb *AccountsDb) parallelStoreAccounts(n int, accts []*accounts.Acc
 				}
 				err := func(a *accounts.Account) error {
 					existingacctIdxEntryBuf, c, err := accountsDb.Index.Get(a.Key[:])
-					if errors.Is(err, pebble.ErrNotFound) {
+					if (!OverwriteSameLengthAccounts) || errors.Is(err, pebble.ErrNotFound) {
 						lengthChangedAccounts <- a
 						return nil
 					}

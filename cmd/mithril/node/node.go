@@ -186,6 +186,7 @@ func init() {
 	Run.Flags().IntVar(&snapshot.MaxConcurrentFlushers, "max-concurrent-flushers", 16, "Bound for number of log shards to flush to Accounts DB Index at once.")
 	Run.Flags().BoolVar(&sbpf.UsePool, "use-pool", true, "Disable to allocate fresh slices")
 	Run.Flags().IntVar(&accountsdb.StoreAccountsWorkers, "store-accounts-workers", 128, "Number of workers to write account updates")
+	Run.Flags().BoolVar(&accountsdb.OverwriteSameLengthAccounts, "overwrite-same-length-accounts", true, "Overwrite accounts in appendvecs when length is unchanged")
 	Run.Flags().BoolVar(&replay.UseAccountPrefetcher, "use-account-prefetcher", false, "Prefetch accounts")
 
 	// [tuning.pprof] section flags
@@ -551,6 +552,11 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		replay.UseAccountPrefetcher = config.GetBool("use-account-prefetcher")
 	} else if config.IsSet("tuning.use_account_prefetcher") {
 		replay.UseAccountPrefetcher = config.GetBool("tuning.use_account_prefetcher")
+	}
+	if flagChanged("overwrite-same-length-accounts") {
+		accountsdb.OverwriteSameLengthAccounts = config.GetBool("overwrite-same-length-accounts")
+	} else if config.IsSet("development.overwrite_same_length_accounts") {
+		accountsdb.OverwriteSameLengthAccounts = config.GetBool("development.overwrite_same_length_accounts")
 	}
 
 	return nil
