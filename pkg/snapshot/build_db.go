@@ -267,6 +267,7 @@ func BuildAccountsDbPaths(
 	if err != nil {
 		return nil, nil, fmt.Errorf("initializing pebble from SST files: %w", err)
 	}
+	index.Close()
 
 	mlog.Log.Infof("Snapshot processed in %s.", fmtDuration(time.Since(start)))
 
@@ -293,15 +294,17 @@ func BuildAccountsDbPaths(
 		return nil, nil, fmt.Errorf("writing stake pubkey index: %w", err)
 	}
 
-	accountsDb := &accountsdb.AccountsDb{Index: index, AcctsDir: appendVecsOutputDir}
-	accountsDb.LargestFileId.Store(largestFileId.Load())
-
 	bankhashDir := filepath.Join(accountsDbDir, "bankhash_db")
 	bankhashDb, err := pebble.Open(bankhashDir, &pebble.Options{})
 	if err != nil {
 		return nil, nil, fmt.Errorf("opening bankhashDir=%s: %w", bankhashDir, err)
 	}
-	accountsDb.BankHashStore = bankhashDb
+	bankhashDb.Close()
+
+	accountsDb, err := accountsdb.OpenDb(accountsDbDir)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	if incrementalManifest != nil {
 		return accountsDb, incrementalManifest, nil
@@ -419,9 +422,9 @@ type snapshotWorkerPools struct {
 // WHY: The manifest's delegation list can be stale/incomplete (Firedancer notes:
 // "the cache in the manifest is partially incomplete"). Instead of trusting manifest
 // data, we:
-//   1. Collect stake pubkeys during appendvec parsing (by checking owner == StakeProgramAddr)
-//   2. Write them to stake_pubkeys.idx after snapshot processing
-//   3. At startup, load pubkeys from index and read ALL delegation fields from AccountsDB
+//  1. Collect stake pubkeys during appendvec parsing (by checking owner == StakeProgramAddr)
+//  2. Write them to stake_pubkeys.idx after snapshot processing
+//  3. At startup, load pubkeys from index and read ALL delegation fields from AccountsDB
 //
 // This ensures stake cache contains fresh data from AccountsDB, not potentially stale
 // manifest data.

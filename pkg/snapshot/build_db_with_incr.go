@@ -220,6 +220,7 @@ func BuildAccountsDbAuto(
 	if err != nil {
 		return nil, nil, fmt.Errorf("initializing pebble from SST files: %w", err)
 	}
+	index.Close()
 
 	var largestFileIdBytes [8]byte
 	binary.LittleEndian.PutUint64(largestFileIdBytes[:], largestFileId.Load())
@@ -244,15 +245,17 @@ func BuildAccountsDbAuto(
 		return nil, nil, fmt.Errorf("writing stake pubkey index: %w", err)
 	}
 
-	accountsDb := &accountsdb.AccountsDb{Index: index, AcctsDir: appendVecsOutputDir}
-	accountsDb.LargestFileId.Store(largestFileId.Load())
-
 	bankhashDir := filepath.Join(accountsDbDir, "bankhash_db")
 	bankhashDb, err := pebble.Open(bankhashDir, &pebble.Options{})
 	if err != nil {
 		return nil, nil, fmt.Errorf("opening bankhashDir=%s: %w", bankhashDir, err)
 	}
-	accountsDb.BankHashStore = bankhashDb
+	bankhashDb.Close()
+
+	accountsDb, err := accountsdb.OpenDb(accountsDbDir)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	rpcClient := rpcclient.NewRpcClient(rpcEndpoints[0])
 	latestSlot, err := rpcClient.GetSlot()

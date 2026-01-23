@@ -17,7 +17,12 @@ func (db *AccountsDb) GetAccountsBatch(ctx context.Context, slot uint64, pks []s
 	if n == 0 {
 		return nil, nil
 	}
-	out := make([]*accounts.Account, n)
+	var out []*accounts.Account
+	if StoreAsync {
+		out = db.getStoreInProgressAccounts(pks)
+	} else {
+		out = make([]*accounts.Account, n)
+	}
 
 	// Use a bounded semaphore so we don’t spawn unbounded I/O.
 	maxWorkers := runtime.NumCPU() * 2
@@ -28,6 +33,9 @@ func (db *AccountsDb) GetAccountsBatch(ctx context.Context, slot uint64, pks []s
 	errCh := make(chan error, 1)
 
 	for i, pk := range pks {
+		if out[i] != nil {
+			continue
+		}
 		wg.Add(1)
 		go func(idx int, key solana.PublicKey) {
 			defer wg.Done()
@@ -41,7 +49,7 @@ func (db *AccountsDb) GetAccountsBatch(ctx context.Context, slot uint64, pks []s
 			default:
 			}
 
-			acct, err := db.GetAccount(slot, key)
+			acct, err := db.getStoredAccount(slot, key)
 			if err != nil && err != ErrNoAccount {
 				select {
 				case errCh <- err:

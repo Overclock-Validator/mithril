@@ -165,7 +165,7 @@ func DistributeVotingRewards(acctsDb *accountsdb.AccountsDb, validatorRewards ma
 	workerPool.Release()
 	ants.Release()
 
-	err := acctsDb.StoreAccounts(updatedAccts, slot)
+	err := acctsDb.StoreAccounts(updatedAccts, slot, nil)
 	if err != nil {
 		panic(fmt.Sprintf("error updating accounts for voting rewards in slot %d: %s", slot, err))
 	}
@@ -244,7 +244,7 @@ func DistributeStakingRewardsForPartition(acctsDb *accountsdb.AccountsDb, partit
 	workerPool.Release()
 	ants.Release()
 
-	err := acctsDb.StoreAccounts(accts, slot)
+	err := acctsDb.StoreAccounts(accts, slot, nil)
 	if err != nil {
 		panic(fmt.Sprintf("error updating accounts for partitioned epoch rewards in slot %d: %s", slot, err))
 	}

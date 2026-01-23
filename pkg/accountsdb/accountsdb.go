@@ -3,6 +3,7 @@ package accountsdb
 import (
 	"bufio"
 	"bytes"
+	"container/list"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -10,6 +11,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime/trace"
+	"sync"
 	"sync/atomic"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
@@ -30,19 +33,34 @@ type AccountsDb struct {
 	VoteAcctCache    otter.Cache[solana.PublicKey, *accounts.Account]
 	CommonAcctsCache otter.Cache[solana.PublicKey, *accounts.Account]
 	ProgramCache     otter.Cache[solana.PublicKey, *ProgramCacheEntry]
+
+	// A list of store requests. They are added to the back as they arrive and
+	// removed from the front as they are persisted.
+	inProgressStoreRequestsMu sync.Mutex
+	inProgressStoreRequests   *list.List
+	storeRequestChan          chan *list.Element
+	storeWorkerDone           chan struct{}
+}
+
+type storeRequest struct {
+	accts []*accounts.Account
+	slot  uint64
+	m     map[solana.PublicKey]*accounts.Account
+	cb    func()
 }
 
 // silentLogger implements pebble.Logger but discards all messages.
 // This suppresses verbose WAL recovery messages on startup.
 type silentLogger struct{}
 
-func (silentLogger) Infof(format string, args ...interface{})  {}
-func (silentLogger) Fatalf(format string, args ...interface{}) { log.Fatalf(format, args...) }
+func (silentLogger) Infof(format string, args ...any)  {}
+func (silentLogger) Fatalf(format string, args ...any) { log.Fatalf(format, args...) }
 
 var (
 	ErrNoAccount = errors.New("ErrNoAccount")
 
 	StoreAccountsWorkers = 128
+	StoreAsync           = false
 )
 
 func OpenDb(accountsDbDir string) (*AccountsDb, error) {
@@ -88,10 +106,35 @@ func OpenDb(accountsDbDir string) (*AccountsDb, error) {
 	accountsDb := &AccountsDb{Index: db, BankHashStore: bankhashDb, AcctsDir: appendVecsDir}
 	accountsDb.LargestFileId.Store(largestFileId)
 
+	mlog.Log.Infof("StoreAsync=%t", StoreAsync)
+	if StoreAsync {
+		accountsDb.inProgressStoreRequests = list.New()
+		accountsDb.storeRequestChan = make(chan *list.Element)
+		accountsDb.storeWorkerDone = make(chan struct{})
+		go accountsDb.storeWorker()
+	}
+
 	return accountsDb, nil
 }
 
+// Turns down the store worker. AccountsDb cannot accept writes after this if StoreAsync.
+// Should not be called concurrently.
+func (accountsDb *AccountsDb) WaitForStoreWorker() {
+	if !StoreAsync {
+		return
+	}
+	if accountsDb.storeWorkerDone == nil {
+		mlog.Log.Infof("AccountsDb: async store worker already done.")
+		return
+	}
+	mlog.Log.Infof("AccountsDb: waiting for async store worker...")
+	close(accountsDb.storeRequestChan)
+	<-accountsDb.storeWorkerDone
+	accountsDb.storeWorkerDone = nil
+}
+
 func (accountsDb *AccountsDb) CloseDb() {
+	accountsDb.WaitForStoreWorker()
 	mlog.Log.Infof("CloseDb: syncing and closing Index...")
 	if err := accountsDb.Index.Close(); err != nil {
 		mlog.Log.Errorf("CloseDb: Index.Close() error: %v", err)
@@ -151,6 +194,16 @@ func (accountsDb *AccountsDb) RemoveProgramFromCache(pubkey solana.PublicKey) {
 }
 
 func (accountsDb *AccountsDb) GetAccount(slot uint64, pubkey solana.PublicKey) (*accounts.Account, error) {
+	if StoreAsync {
+		accts := accountsDb.getStoreInProgressAccounts([]solana.PublicKey{pubkey})
+		if accts[0] != nil {
+			return accts[0], nil
+		}
+	}
+	return accountsDb.getStoredAccount(slot, pubkey)
+}
+
+func (accountsDb *AccountsDb) getStoredAccount(slot uint64, pubkey solana.PublicKey) (*accounts.Account, error) {
 	cachedAcct, hasAcct := accountsDb.VoteAcctCache.Get(pubkey)
 	if hasAcct {
 		return cachedAcct, nil
@@ -210,7 +263,32 @@ func (accountsDb *AccountsDb) GetAccount(slot uint64, pubkey solana.PublicKey) (
 	return acct, err
 }
 
-func (accountsDb *AccountsDb) StoreAccounts(accts []*accounts.Account, slot uint64) error {
+// Returns a slice of the same length as the input with results matching indexes, nil if not found.
+// Returns clones to avoid data races with the store worker.
+func (accountsDb *AccountsDb) getStoreInProgressAccounts(pks []solana.PublicKey) []*accounts.Account {
+	out := make([]*accounts.Account, len(pks))
+	accountsDb.inProgressStoreRequestsMu.Lock()
+	defer accountsDb.inProgressStoreRequestsMu.Unlock()
+	// Start with newest first.
+	for e := accountsDb.inProgressStoreRequests.Back(); e != nil; e = e.Prev() {
+		sr := e.Value.(storeRequest)
+		for i := range len(pks) {
+			if out[i] != nil {
+				continue // Already found.
+			}
+			if acct := sr.m[pks[i]]; acct != nil {
+				out[i] = acct.Clone()
+			}
+		}
+	}
+	return out
+}
+
+func (accountsDb *AccountsDb) StoreAccounts(
+	accts []*accounts.Account,
+	slot uint64,
+	cb func(),
+) error {
 	for _, acct := range accts {
 		if acct == nil {
 			continue
@@ -218,6 +296,31 @@ func (accountsDb *AccountsDb) StoreAccounts(accts []*accounts.Account, slot uint
 		acct.Slot = slot
 	}
 
+	if StoreAsync {
+		m := make(map[solana.PublicKey]*accounts.Account, len(accts))
+		for _, a := range accts {
+			if a == nil {
+				continue
+			}
+			m[a.Key] = a
+		}
+		// Must not hold lock during channel send to avoid deadlock with storeWorker.
+		accountsDb.inProgressStoreRequestsMu.Lock()
+		element := accountsDb.inProgressStoreRequests.PushBack(storeRequest{accts, slot, m, cb})
+		accountsDb.inProgressStoreRequestsMu.Unlock()
+		accountsDb.storeRequestChan <- element
+		return nil
+	} else {
+		accountsDb.storeAccountsSync(accts, slot)
+		if cb != nil {
+			cb()
+		}
+		return nil
+	}
+}
+
+func (accountsDb *AccountsDb) storeAccountsSync(accts []*accounts.Account, slot uint64) {
+	defer trace.StartRegion(context.Background(), "StoreAccounts").End()
 	if StoreAccountsWorkers == 1 {
 		accountsDb.storeAccountsInternal(accts, slot)
 	} else {
@@ -235,8 +338,20 @@ func (accountsDb *AccountsDb) StoreAccounts(accts []*accounts.Account, slot uint
 			accountsDb.CommonAcctsCache.Set(acct.Key, acct)
 		}
 	}
+}
 
-	return nil
+func (accountsDb *AccountsDb) storeWorker() {
+	defer close(accountsDb.storeWorkerDone)
+	for elt := range accountsDb.storeRequestChan {
+		sr := elt.Value.(storeRequest)
+		accountsDb.storeAccountsSync(sr.accts, sr.slot)
+		accountsDb.inProgressStoreRequestsMu.Lock()
+		accountsDb.inProgressStoreRequests.Remove(elt)
+		accountsDb.inProgressStoreRequestsMu.Unlock()
+		if sr.cb != nil {
+			sr.cb()
+		}
+	}
 }
 
 func (accountsDb *AccountsDb) storeAccountsInternal(accts []*accounts.Account, slot uint64) {

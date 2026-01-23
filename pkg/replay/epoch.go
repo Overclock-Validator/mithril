@@ -121,7 +121,7 @@ func updateStakeHistorySysvar(acctsDb *accountsdb.AccountsDb, block *block.Block
 	newStakeHistoryBytes := buf.Bytes()
 	copy(stakeHistoryAcct.Data, newStakeHistoryBytes)
 
-	err = acctsDb.StoreAccounts([]*accounts.Account{stakeHistoryAcct}, prevSlotCtx.Slot)
+	err = acctsDb.StoreAccounts([]*accounts.Account{stakeHistoryAcct}, prevSlotCtx.Slot, nil)
 	if err != nil {
 		panic(fmt.Sprintf("error storing new StakeHistory sysvar to accountsdb: %s", err))
 	}

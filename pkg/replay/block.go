@@ -664,7 +664,7 @@ func scanAndEnableFeatures(acctsDb *accountsdb.AccountsDb, slot uint64, startOfE
 	}
 
 	if len(newlyActivatedFeatureAccts) != 0 {
-		err := acctsDb.StoreAccounts(newlyActivatedFeatureAccts, slot)
+		err := acctsDb.StoreAccounts(newlyActivatedFeatureAccts, slot, nil)
 		if err != nil {
 			panic(err)
 		}
@@ -1053,6 +1053,29 @@ func buildInitialEpochStakesCache(snapshotManifest *snapshot.SnapshotManifest, p
 	}
 }
 
+type persistedTracker struct {
+	mu       sync.Mutex
+	slot     uint64
+	bankhash []byte
+}
+
+func (t *persistedTracker) Set(slot uint64, hash []byte) {
+	t.mu.Lock()
+	t.slot = slot
+	t.bankhash = make([]byte, len(hash))
+	copy(t.bankhash, hash)
+	t.mu.Unlock()
+}
+
+func (t *persistedTracker) Get() (uint64, []byte) {
+	t.mu.Lock()
+	slot := t.slot
+	out := make([]byte, len(t.bankhash))
+	copy(out, t.bankhash)
+	t.mu.Unlock()
+	return slot, out
+}
+
 func ReplayBlocks(
 	ctx context.Context,
 	acctsDb *accountsdb.AccountsDb,
@@ -1090,8 +1113,7 @@ func ReplayBlocks(
 	}
 
 	// Track last successfully persisted slot for checkpoint/resume
-	var lastPersistedSlot uint64
-	var lastPersistedBankhash []byte
+	pt := &persistedTracker{}
 
 	// RPC client - for all cluster access (blocks, leader schedule, tip polling)
 	// First endpoint is primary, rest are backups for failover
@@ -1408,7 +1430,7 @@ func ReplayBlocks(
 		*/
 		metrics.GlobalBlockReplay.PreprocessBlock.AddTimingSince(start)
 
-		lastSlotCtx, err = ProcessBlock(acctsDb, block, txParallelism, dbgOpts)
+		lastSlotCtx, err = ProcessBlock(acctsDb, block, txParallelism, dbgOpts, pt)
 		if err != nil {
 			mlog.Log.Errorf("error encountered during block replay: %s\n", err)
 			result.Error = err
@@ -1419,23 +1441,6 @@ func ReplayBlocks(
 
 		replayCtx.Capitalization -= lastSlotCtx.LamportsBurnt
 
-		// Track last successfully persisted slot for checkpoint/resume
-		lastPersistedSlot = block.Slot
-		lastPersistedBankhash = lastSlotCtx.FinalBankhash
-
-		// Flush any new stake pubkeys discovered during this block to the index file.
-		// This must happen BEFORE we update the state file - crash recovery depends on
-		// the index being at least as current as the state.
-		// CRITICAL: If flush fails, we must NOT continue - the index would fall behind
-		// the state file, causing missing stake accounts on resume.
-		if flushed, err := global.FlushPendingStakePubkeys(acctsDbPath); err != nil {
-			mlog.Log.Errorf("CRITICAL: failed to flush stake pubkey index: %v", err)
-			result.Error = fmt.Errorf("stake index flush failed: %w", err)
-			break
-		} else if flushed > 0 {
-			mlog.Log.Debugf("flushed %d new stake pubkeys to index", flushed)
-		}
-
 		// Check for cancellation immediately after block completes.
 		// This minimizes the window between bankhash persistence and state file update,
 		// preventing false "corruption" detection on graceful shutdown.
@@ -1443,9 +1448,9 @@ func ReplayBlocks(
 			mlog.Log.Infof("Context cancelled after slot %d, exiting replay loop", block.Slot)
 			result.WasCancelled = true
 
+			acctsDb.WaitForStoreWorker()
 			// Populate result immediately for state write
-			result.LastPersistedSlot = lastPersistedSlot
-			result.LastPersistedBankhash = lastPersistedBankhash
+			result.LastPersistedSlot, result.LastPersistedBankhash = pt.Get()
 
 			// Capture resume context from the last slot context
 			if lastSlotCtx != nil {
@@ -1741,8 +1746,7 @@ func ReplayBlocks(
 		result.Error = fmt.Errorf("block fetch stalled - no progress for %v", blockStream.StallTimeout())
 	}
 
-	result.LastPersistedSlot = lastPersistedSlot
-	result.LastPersistedBankhash = lastPersistedBankhash
+	result.LastPersistedSlot, result.LastPersistedBankhash = pt.Get()
 
 	// Capture resume context from the last slot context (if available)
 	// This enables proper resume from Ctrl+C shutdown
@@ -1982,7 +1986,15 @@ func parallelTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, bloc
 	return txFeeAccumulator
 }
 
-func ProcessBlock(acctsDb *accountsdb.AccountsDb, block *b.Block, txParallelism int, dbgOpts *DebugOptions) (*sealevel.SlotCtx, error) {
+func ProcessBlock(
+	acctsDb *accountsdb.AccountsDb,
+	block *b.Block,
+	txParallelism int,
+	dbgOpts *DebugOptions,
+	// pt is updated after StoreAccounts completes through a callback.
+	// Must be non-nil.
+	pt *persistedTracker,
+) (*sealevel.SlotCtx, error) {
 	ctx, task := trace.NewTask(context.Background(), "ProcessBlock")
 	defer task.End()
 	trace.Log(ctx, "slot", fmt.Sprintf("%d", block.Slot))
@@ -2074,30 +2086,41 @@ func ProcessBlock(acctsDb *accountsdb.AccountsDb, block *b.Block, txParallelism 
 	// Enter critical commit window - panics here may leave AccountsDB inconsistent
 	commitSlot.Store(slotCtx.Slot)
 	commitInProgress.Store(true)
+	start = time.Now()
+	afterStoreAccounts := func() {
+		metrics.GlobalBlockReplay.BlockUpdateAccounts.AddTimingSince(start)
+		err := acctsDb.StoreBankHashForSlot(slotCtx.Slot, slotCtx.FinalBankhash)
+		if err != nil {
+			mlog.Log.Infof("unable to store bankhash for slot %d", slotCtx.Slot)
+		}
+		flushed, err := global.FlushPendingStakePubkeys(acctsDb.AcctsDir)
+		if err != nil {
+			mlog.Log.Errorf("failed to flush stake pubkey index: %v", err)
+		} else if flushed > 0 {
+			mlog.Log.Debugf("flushed %d new stake pubkeys to index", flushed)
+		}
 
-	if len(modifiedAccts) > 0 {
-		storeAcctsRegion := trace.StartRegion(ctx, "StoreAccounts")
-		err = acctsDb.StoreAccounts(modifiedAccts, slotCtx.Slot)
-		storeAcctsRegion.End()
-	}
-	metrics.GlobalBlockReplay.BlockUpdateAccounts.AddTimingSince(start)
+		pt.Set(block.Slot, slotCtx.FinalBankhash)
 
-	// EAH workaround - see comment at top of replay loop for details
-	if slotCtx.HasEahWorkaround {
-		slotCtx.FinalBankhash = slotCtx.EahWorkaroundBankhash
+		// Exit critical commit window - AccountsDB is now consistent
 		commitInProgress.Store(false)
 		commitSlot.Store(0)
-		return slotCtx, err
 	}
 
-	err = acctsDb.StoreBankHashForSlot(slotCtx.Slot, slotCtx.FinalBankhash)
-	if err != nil {
-		mlog.Log.Infof("unable to store bankhash for slot %d", slotCtx.Slot)
+	if len(modifiedAccts) > 0 {
+		err = acctsDb.StoreAccounts(modifiedAccts, slotCtx.Slot, afterStoreAccounts)
 	}
 
-	// Exit critical commit window - AccountsDB is now consistent
-	commitInProgress.Store(false)
-	commitSlot.Store(0)
+	/*
+		// EAH workaround - see comment at top of replay loop for details
+		// Commented since it seems to be disabled but preserved for the curious?
+		if slotCtx.HasEahWorkaround {
+			slotCtx.FinalBankhash = slotCtx.EahWorkaroundBankhash
+			commitInProgress.Store(false)
+			commitSlot.Store(0)
+			return slotCtx, err
+		}
+	*/
 
 	global.IncrTransactionCount(uint64(len(block.Transactions)))
 	return slotCtx, err
