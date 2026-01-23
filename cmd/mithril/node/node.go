@@ -520,38 +520,11 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		borrowedAccountArenaSize = getUint64("borrowed-account-arena-size", "development.borrowed_account_arena_size")
 	}
 
-	// Handle external package variables (try tuning.* first, fallback to development.*)
-	if flagChanged("zstd-decoder-concurrency") {
-		snapshot.ZstdDecoderConcurrency = config.GetInt("zstd-decoder-concurrency")
-	} else if config.IsSet("tuning.zstd_decoder_concurrency") {
-		snapshot.ZstdDecoderConcurrency = config.GetInt("tuning.zstd_decoder_concurrency")
-	} else if config.IsSet("development.zstd_decoder_concurrency") {
-		snapshot.ZstdDecoderConcurrency = config.GetInt("development.zstd_decoder_concurrency")
-	}
-	if flagChanged("max-concurrent-flushers") {
-		snapshot.MaxConcurrentFlushers = config.GetInt("max-concurrent-flushers")
-	} else if config.IsSet("tuning.max_concurrent_flushers") {
-		snapshot.MaxConcurrentFlushers = config.GetInt("tuning.max_concurrent_flushers")
-	} else if config.IsSet("development.max_concurrent_flushers") {
-		snapshot.MaxConcurrentFlushers = config.GetInt("development.max_concurrent_flushers")
-	}
-	if flagChanged("use-pool") {
-		sbpf.UsePool = config.GetBool("use-pool")
-	} else if config.IsSet("tuning.use_pool") {
-		sbpf.UsePool = config.GetBool("tuning.use_pool")
-	} else if config.IsSet("development.use_pool") {
-		sbpf.UsePool = config.GetBool("development.use_pool")
-	}
-	if flagChanged("store-accounts-workers") {
-		accountsdb.StoreAccountsWorkers = config.GetInt("store-accounts-workers")
-	} else if config.IsSet("tuning.store_accounts_workers") {
-		accountsdb.StoreAccountsWorkers = config.GetInt("tuning.store_accounts_workers")
-	}
-	if flagChanged("store-async") {
-		accountsdb.StoreAsync = config.GetBool("store-async")
-	} else if config.IsSet("tuning.store_async") {
-		accountsdb.StoreAsync = config.GetBool("tuning.store_async")
-	}
+	snapshot.ZstdDecoderConcurrency = getInt("zstd-decoder-concurrency", "tuning.zstd_decoder_concurrency")
+	snapshot.MaxConcurrentFlushers = getInt("max-concurrent-flushers", "tuning.max_concurrent_flushers")
+	sbpf.UsePool = getBool("use-pool", "tuning.use_pool")
+	accountsdb.StoreAccountsWorkers = getInt("store-accounts-workers", "tuning.store_accounts_workers")
+	accountsdb.StoreAsync = getBool("store-async", "tuning.store_async")
 
 	return nil
 }
