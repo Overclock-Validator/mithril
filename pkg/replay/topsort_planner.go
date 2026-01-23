@@ -6,22 +6,59 @@ import (
 
 	//"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/block"
+	"github.com/Overclock-Validator/mithril/pkg/util"
 	"github.com/gagliardetto/solana-go"
+	"github.com/gagliardetto/solana-go/rpc"
 )
 
 // Type wrappers around indices.
 type acct int
 type tx int
 
-func mustAccountMetaList(t *solana.Transaction) []*solana.AccountMeta {
-	if t.Message.IsVersioned() && !t.Message.IsResolved() {
-		panic(fmt.Sprintf("topsort planner: assumes versioned (IsVersioned was %t) txs are resolved (IsResolved was %t)", t.Message.IsVersioned(), t.Message.IsResolved()))
+func getAllAccounts(t *solana.Transaction, tm *rpc.TransactionMeta) []solana.PublicKey {
+	accounts := make([]solana.PublicKey, 0, len(t.Message.AccountKeys)+len(tm.LoadedAddresses.ReadOnly)+len(tm.LoadedAddresses.Writable))
+	accounts = append(accounts, t.Message.AccountKeys...)
+	accounts = append(accounts, tm.LoadedAddresses.ReadOnly...)
+	accounts = append(accounts, tm.LoadedAddresses.Writable...)
+	return util.DedupePubkeys(accounts)
+}
+
+func getReadonlyAccounts(t *solana.Transaction, tm *rpc.TransactionMeta) []solana.PublicKey {
+	if t.Message.IsResolved() {
+		panic("account calculations assume tx is unresolved, and use txmeta for lookup table addresses")
 	}
-	ams, err := t.AccountMetaList()
-	if err != nil {
-		panic(fmt.Sprintf("topsort planner: AccountMetaList failed: %v", err))
+	msg := t.Message
+	hdr := msg.Header
+	numReadonly := len(tm.LoadedAddresses.ReadOnly)
+	signedReadonly := int(hdr.NumReadonlySignedAccounts)
+	numReadonly += signedReadonly
+	unsignedReadonly := int(hdr.NumReadonlyUnsignedAccounts)
+	numReadonly += unsignedReadonly
+	accounts := make([]solana.PublicKey, 0, numReadonly)
+
+	accounts = append(accounts, msg.AccountKeys[int(hdr.NumRequiredSignatures)-signedReadonly:hdr.NumRequiredSignatures]...)
+	accounts = append(accounts, msg.AccountKeys[len(msg.AccountKeys)-unsignedReadonly:len(msg.AccountKeys)]...)
+	accounts = append(accounts, tm.LoadedAddresses.ReadOnly...)
+	return util.DedupePubkeys(accounts)
+}
+
+func getWritableAccounts(t *solana.Transaction, tm *rpc.TransactionMeta) []solana.PublicKey {
+	if t.Message.IsResolved() {
+		panic("account calculations assume tx is unresolved, and use txmeta for lookup table addresses")
 	}
-	return ams
+	msg := t.Message
+	hdr := msg.Header
+	numWritable := len(tm.LoadedAddresses.Writable)
+	signedWritable := int(hdr.NumRequiredSignatures) - int(hdr.NumReadonlySignedAccounts)
+	numWritable += signedWritable
+	unsignedWritable := len(msg.AccountKeys) - int(hdr.NumRequiredSignatures) - int(hdr.NumReadonlyUnsignedAccounts)
+	numWritable += unsignedWritable
+	accounts := make([]solana.PublicKey, 0, numWritable)
+
+	accounts = append(accounts, msg.AccountKeys[0:signedWritable]...)
+	accounts = append(accounts, msg.AccountKeys[int(hdr.NumRequiredSignatures):int(hdr.NumRequiredSignatures)+unsignedWritable]...)
+	accounts = append(accounts, tm.LoadedAddresses.Writable...)
+	return util.DedupePubkeys(accounts)
 }
 
 func blockToDependencyGraph(b *block.Block) (adjacencyList [][]tx, inDegree []int) {
@@ -30,13 +67,13 @@ func blockToDependencyGraph(b *block.Block) (adjacencyList [][]tx, inDegree []in
 	var acctToPk []solana.PublicKey
 	pkToAcct := make(map[solana.PublicKey]acct)
 
-	for i := range b.Transactions {
+	for i, txMeta := range b.TxMetas {
 		tx := b.Transactions[i]
-		ams := mustAccountMetaList(tx)
-		for _, am := range ams {
-			if _, exists := pkToAcct[am.PublicKey]; !exists {
-				pkToAcct[am.PublicKey] = acct(len(acctToPk))
-				acctToPk = append(acctToPk, am.PublicKey)
+		accounts := getAllAccounts(tx, txMeta)
+		for _, acctPk := range accounts {
+			if _, exists := pkToAcct[acctPk]; !exists {
+				pkToAcct[acctPk] = acct(len(acctToPk))
+				acctToPk = append(acctToPk, acctPk)
 			}
 		}
 	}
@@ -45,7 +82,7 @@ func blockToDependencyGraph(b *block.Block) (adjacencyList [][]tx, inDegree []in
 	acctToWriterTxs := make(map[acct][]tx, len(acctToPk))
 	adjacencyList = make([][]tx, len(b.TxMetas))
 	inDegree = make([]int, len(b.TxMetas))
-	for txIdx := range b.Transactions {
+	for txIdx, txMeta := range b.TxMetas {
 		/* Given S < T (S occurs before T) in a sequential execution, we
 		   use these restrictions on the parallel execution to reproduce
 		   the sequential execution
@@ -60,29 +97,8 @@ func blockToDependencyGraph(b *block.Block) (adjacencyList [][]tx, inDegree []in
 
 		//txSig := b.Transactions[txIdx].Signatures[0]
 		////mlog.Log.Debugf("printing input accounts for txIdx=%d txSig=%s", txIdx, txSig)
-		txn := b.Transactions[txIdx]
-		var readonlyAccts, writableAccts []solana.PublicKey
-		{
-			ams := mustAccountMetaList(txn)
-			var rs, ws int
-			for _, am := range ams {
-				if am.IsWritable {
-					ws++
-				} else {
-					rs++
-				}
-			}
-			readonlyAccts, writableAccts = make([]solana.PublicKey, 0, rs), make([]solana.PublicKey, 0, ws)
-			for _, am := range ams {
-				if am.IsWritable {
-					writableAccts = append(writableAccts, am.PublicKey)
-				} else {
-					readonlyAccts = append(readonlyAccts, am.PublicKey)
-				}
-			}
-		}
-
-		for _, roAcct := range readonlyAccts {
+		readonlyAccounts := getReadonlyAccounts(b.Transactions[txIdx], txMeta)
+		for _, roAcct := range readonlyAccounts {
 			////mlog.Log.Debugf("- roAcct=%s", roAcct.String())
 			acct, exists := pkToAcct[roAcct]
 			if !exists {
@@ -104,6 +120,7 @@ func blockToDependencyGraph(b *block.Block) (adjacencyList [][]tx, inDegree []in
 			acctToReaderTxs[acct] = append(acctToReaderTxs[acct], t)
 		}
 
+		writableAccts := getWritableAccounts(b.Transactions[txIdx], txMeta)
 		for _, writeAcct := range writableAccts {
 			////mlog.Log.Debugf("- writeAcct=%s", writeAcct.String())
 			acct, exists := pkToAcct[writeAcct]

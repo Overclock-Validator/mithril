@@ -2,7 +2,6 @@ package accountsdb
 
 import (
 	"context"
-	"fmt"
 	"math"
 	"runtime"
 	"sync"
@@ -65,9 +64,6 @@ func (db *AccountsDb) GetAccountsBatch(ctx context.Context, slot uint64, pks []s
 
 	if err, ok := <-errCh; ok && err != nil {
 		return nil, err
-	}
-	if ctx.Err() != nil {
-		return nil, fmt.Errorf("GetAccountsBatch: %w", ctx.Err())
 	}
 	return out, nil
 }

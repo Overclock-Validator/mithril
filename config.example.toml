@@ -256,11 +256,6 @@ name = "mithril"
     # Number of goroutines to store modified accounts at the end of each block
     store_accounts_workers = 128
 
-    # true to attempt to prefetch accounts for next block while
-    # current block is executing or false to load accounts, execute
-    # transactions, store accounts serially
-    use_account_prefetcher = true
-
     # [tuning.pprof] - CPU/Memory Profiling
     #
     # Usage (assuming port = 6060):
