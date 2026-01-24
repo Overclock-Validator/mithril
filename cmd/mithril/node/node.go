@@ -87,18 +87,18 @@ var (
 	accountsPath                string
 	scratchDirectory            string
 	rpcEndpoints                []string
-	cluster                     string   // "mainnet-beta", "testnet", "devnet"
-	blockSource                 string   // "rpc" or "lightbringer"
+	cluster                     string // "mainnet-beta", "testnet", "devnet"
+	blockSource                 string // "rpc" or "lightbringer"
 	lightbringerEndpoint        string
-	blockMaxRPS                 int      // Rate limit for block fetching
-	blockMaxInflight            int    // Max concurrent block fetch workers
-	blockTipPollIntervalMs      int    // Tip poll interval in milliseconds
-	blockTipSafetyMargin        int    // Don't fetch within N slots of tip
+	blockMaxRPS                 int // Rate limit for block fetching
+	blockMaxInflight            int // Max concurrent block fetch workers
+	blockTipPollIntervalMs      int // Tip poll interval in milliseconds
+	blockTipSafetyMargin        int // Don't fetch within N slots of tip
 
 	// Mode thresholds
-	blockNearTipThreshold       int    // Enter near-tip when gap <= this
-	blockCatchupThreshold       int    // Exit near-tip when gap >= this
-	blockCatchupTipGateThreshold int   // Only apply safety margin when gap > this
+	blockNearTipThreshold        int // Enter near-tip when gap <= this
+	blockCatchupThreshold        int // Exit near-tip when gap >= this
+	blockCatchupTipGateThreshold int // Only apply safety margin when gap > this
 
 	// Near-tip tuning
 	blockNearTipPollMs    int // Faster poll in near-tip mode
@@ -106,11 +106,11 @@ var (
 
 	snapshotDlPath string
 	logDir         string
-	numReplaySlots              int64
-	endSlot                     int64
-	pprofPort                   int64
-	blockstorePath              string
-	txParallelism               int64
+	numReplaySlots int64
+	endSlot        int64
+	pprofPort      int64
+	blockstorePath string
+	txParallelism  int64
 
 	debugTxs        []string
 	debugAcctWrites []string
