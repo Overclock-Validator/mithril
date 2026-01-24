@@ -1746,6 +1746,7 @@ func ReplayBlocks(
 		result.Error = fmt.Errorf("block fetch stalled - no progress for %v", blockStream.StallTimeout())
 	}
 
+	acctsDb.WaitForStoreWorker()
 	result.LastPersistedSlot, result.LastPersistedBankhash = pt.Get()
 
 	// Capture resume context from the last slot context (if available)
