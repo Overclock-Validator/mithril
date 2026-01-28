@@ -34,8 +34,12 @@ type AccountsDb struct {
 	CommonAcctsCache otter.Cache[solana.PublicKey, *accounts.Account]
 	ProgramCache     otter.Cache[solana.PublicKey, *ProgramCacheEntry]
 
-	// A list of store requests. They are added to the back as they arrive and
-	// removed from the front as they are persisted.
+	// A list of storeRequest | prefetchRequest. They are added to the back as
+	// they arrive and removed from the front as they are persisted. AccountsDb
+	// readers should check storeRequests for the latest account states.
+	// prefetchRequests don't modify disk state, but the store worker processes
+	// both types of requests serially to avoid difficulties in keeping disk
+	// and cache in sync.
 	inProgressStoreRequestsMu sync.Mutex
 	inProgressStoreRequests   *list.List
 	storeRequestChan          chan *list.Element
@@ -53,6 +57,10 @@ type storeRequest struct {
 	slot  uint64
 	m     map[solana.PublicKey]*accounts.Account
 	cb    func()
+}
+
+type prefetchRequest struct {
+	keys map[solana.PublicKey]struct{}
 }
 
 // silentLogger implements pebble.Logger but discards all messages.
@@ -115,7 +123,7 @@ func OpenDb(accountsDbDir string) (*AccountsDb, error) {
 	mlog.Log.Infof("StoreAsync=%t", StoreAsync)
 	if StoreAsync {
 		accountsDb.inProgressStoreRequests = list.New()
-		accountsDb.storeRequestChan = make(chan *list.Element)
+		accountsDb.storeRequestChan = make(chan *list.Element, 1)
 		accountsDb.storeWorkerDone = make(chan struct{})
 		go accountsDb.storeWorker()
 	}
@@ -206,10 +214,10 @@ func (accountsDb *AccountsDb) GetAccount(slot uint64, pubkey solana.PublicKey) (
 			return accts[0], nil
 		}
 	}
-	return accountsDb.getStoredAccount(slot, pubkey)
+	return accountsDb.getStoredAccount(pubkey)
 }
 
-func (accountsDb *AccountsDb) getStoredAccount(slot uint64, pubkey solana.PublicKey) (*accounts.Account, error) {
+func (accountsDb *AccountsDb) getStoredAccount(pubkey solana.PublicKey) (*accounts.Account, error) {
 	r := trace.StartRegion(context.Background(), "GetStoredAccountCache")
 	cachedAcct, hasAcct := accountsDb.VoteAcctCache.Get(pubkey)
 	if hasAcct {
@@ -287,7 +295,10 @@ func (accountsDb *AccountsDb) getStoreInProgressAccounts(pks []solana.PublicKey)
 	defer accountsDb.inProgressStoreRequestsMu.Unlock()
 	// Start with newest first.
 	for e := accountsDb.inProgressStoreRequests.Back(); e != nil; e = e.Prev() {
-		sr := e.Value.(storeRequest)
+		sr, ok := e.Value.(storeRequest)
+		if !ok {
+			continue
+		}
 		for i := range len(pks) {
 			if out[i] != nil {
 				continue // Already found.
@@ -363,13 +374,27 @@ func (accountsDb *AccountsDb) storeAccountsSync(accts []*accounts.Account, slot 
 func (accountsDb *AccountsDb) storeWorker() {
 	defer close(accountsDb.storeWorkerDone)
 	for elt := range accountsDb.storeRequestChan {
-		sr := elt.Value.(storeRequest)
-		accountsDb.storeAccountsSync(sr.accts, sr.slot)
-		accountsDb.inProgressStoreRequestsMu.Lock()
-		accountsDb.inProgressStoreRequests.Remove(elt)
-		accountsDb.inProgressStoreRequestsMu.Unlock()
-		if sr.cb != nil {
-			sr.cb()
+		switch v := elt.Value.(type) {
+		case storeRequest:
+			accountsDb.storeAccountsSync(v.accts, v.slot)
+			accountsDb.inProgressStoreRequestsMu.Lock()
+			accountsDb.inProgressStoreRequests.Remove(elt)
+			accountsDb.inProgressStoreRequestsMu.Unlock()
+			if v.cb != nil {
+				v.cb()
+			}
+
+		case prefetchRequest:
+			accountsDb.prefetchSync(v.keys)
+			accountsDb.inProgressStoreRequestsMu.Lock()
+			accountsDb.inProgressStoreRequests.Remove(elt)
+			accountsDb.inProgressStoreRequestsMu.Unlock()
+
+		default:
+			mlog.Log.Errorf("storeWorker: unknown request type %T", elt.Value)
+			accountsDb.inProgressStoreRequestsMu.Lock()
+			accountsDb.inProgressStoreRequests.Remove(elt)
+			accountsDb.inProgressStoreRequestsMu.Unlock()
 		}
 	}
 }
@@ -606,6 +631,26 @@ func (accountsDb *AccountsDb) parallelStoreAccounts(n int, accts []*accounts.Acc
 	if err := errors.Join(e1, e2); err != nil {
 		panic(err)
 	}
+}
+
+func (accountsDb *AccountsDb) Prefetch(keys map[solana.PublicKey]struct{}) {
+	if StoreAsync {
+		accountsDb.inProgressStoreRequestsMu.Lock()
+		element := accountsDb.inProgressStoreRequests.PushBack(prefetchRequest{keys})
+		accountsDb.inProgressStoreRequestsMu.Unlock()
+		accountsDb.storeRequestChan <- element
+	} else {
+		accountsDb.prefetchSync(keys)
+	}
+}
+
+func (accountsDb *AccountsDb) prefetchSync(keys map[solana.PublicKey]struct{}) {
+	defer trace.StartRegion(context.Background(), "Prefetch").End()
+	keySlice := make([]solana.PublicKey, 0, len(keys))
+	for k := range keys {
+		keySlice = append(keySlice, k)
+	}
+	accountsDb.GetAccountsBatch(context.Background(), keySlice)
 }
 
 func (accountsDb *AccountsDb) GetBankHashForSlot(slot uint64) ([]byte, error) {

@@ -74,6 +74,8 @@ var commitSlot atomic.Uint64 // The slot currently being committed (for error me
 // CurrentRunID is a unique identifier for this replay session, used to correlate logs
 var CurrentRunID string
 
+var EnablePrefetcher bool = false
+
 // GenerateRunID creates a short random hex string for log correlation
 func GenerateRunID() string {
 	b := make([]byte, 4) // 8 hex chars
@@ -215,12 +217,15 @@ func resolveAddrTableLookups(accountsDb *accountsdb.AccountsDb, block *b.Block) 
 	for t := range tables {
 		tablesSlice = append(tablesSlice, t)
 	}
-	accts, err := accountsDb.GetAccountsBatch(context.Background(), block.Slot, tablesSlice)
+	accts, err := accountsDb.GetAccountsBatch(context.Background(), tablesSlice)
 	if err != nil {
 		return err
 	}
 
 	for i := range tablesSlice {
+		if accts[i] == nil {
+			continue
+		}
 		addrLookupTable, err := sealevel.UnmarshalAddressLookupTable(accts[i].Data)
 		if err != nil {
 			return err
@@ -232,6 +237,18 @@ func resolveAddrTableLookups(accountsDb *accountsdb.AccountsDb, block *b.Block) 
 		if !tx.Message.IsVersioned() || tx.Message.AddressTableLookups.NumLookups() == 0 {
 			continue
 		}
+
+		skipLookup := false
+		for _, addrTableKey := range tx.Message.GetAddressTableLookups().GetTableIDs() {
+			if tables[addrTableKey] == nil {
+				skipLookup = true
+				break
+			}
+		}
+		if skipLookup {
+			continue
+		}
+
 		err := tx.Message.SetAddressTables(tables)
 		if err != nil {
 			return err
@@ -247,25 +264,7 @@ func resolveAddrTableLookups(accountsDb *accountsdb.AccountsDb, block *b.Block) 
 }
 
 func extractAndDedupeBlockAccts(block *b.Block) []solana.PublicKey {
-	var numPubkeys int
-	for _, tx := range block.Transactions {
-		numPubkeys += len(tx.Message.AccountKeys)
-	}
-
-	numPubkeys += len(block.UpdatedAccts)
-
-	pubkeyMap := make(map[solana.PublicKey]struct{}, numPubkeys)
-
-	for _, tx := range block.Transactions {
-		for _, pk := range tx.Message.AccountKeys {
-			pubkeyMap[pk] = struct{}{}
-		}
-	}
-
-	for _, pk := range block.UpdatedAccts {
-		pubkeyMap[pk] = struct{}{}
-	}
-
+	pubkeyMap := block.UniqueAccounts()
 	pubkeys := make([]solana.PublicKey, len(pubkeyMap))
 	i := 0
 	for pk := range pubkeyMap {
@@ -359,7 +358,7 @@ func loadBlockAccountsAndUpdateSysvars(accountsDb *accountsdb.AccountsDb, block 
 
 	dedupedAccts := extractAndDedupeBlockAccts(block)
 	ctx := context.Background()
-	slotAccts, err := accountsDb.GetAccountsBatch(ctx, block.Slot, dedupedAccts)
+	slotAccts, err := accountsDb.GetAccountsBatch(ctx, dedupedAccts)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1256,6 +1255,11 @@ func ReplayBlocks(
 		}
 	}
 	blockStream := blockstream.NewBlockSource(opts)
+	var prefetcher *blockstream.Prefetcher
+	mlog.Log.Infof("EnablePrefetcher=%t", EnablePrefetcher)
+	if EnablePrefetcher {
+		prefetcher = blockstream.NewPrefetcher(ctx, blockStream, acctsDb)
+	}
 
 	if !isLive {
 		blockStream.DownloadInitialBlocks()
@@ -1296,7 +1300,12 @@ func ReplayBlocks(
 		}
 
 		waitStart := time.Now()
-		block := blockStream.NextBlock()
+		var block *b.Block
+		if EnablePrefetcher {
+			block = prefetcher.NextBlock()
+		} else {
+			block = blockStream.NextBlock()
+		}
 		waitTime := time.Since(waitStart)
 
 		// Stop stall monitor

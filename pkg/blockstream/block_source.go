@@ -11,7 +11,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Overclock-Validator/mithril/pkg/block"
 	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/rpcclient"
@@ -30,9 +29,9 @@ const (
 type BlockSourceOpts struct {
 	RpcClient  *rpcclient.RpcClient // Primary RPC for block fetching (getBlock)
 	SourceType BlockSourceType
-	StartSlot    uint64
-	EndSlot      uint64
-	BlockDir     string
+	StartSlot  uint64
+	EndSlot    uint64
+	BlockDir   string
 
 	// Backup RPC endpoints for failover (optional)
 	// These are tried in order if the primary fails with hard connectivity errors
@@ -161,35 +160,35 @@ type BlockSourceStats struct {
 }
 
 type BlockSource struct {
-	rpcClients []*rpcclient.RpcClient // All RPC clients for block fetching (index 0 = primary)
-	streamChan chan *b.Block
-	startSlot    uint64
-	endSlot      uint64
-	currentSlot  uint64
-	blockDir     string
-	sourceType   BlockSourceType
+	rpcClients  []*rpcclient.RpcClient // All RPC clients for block fetching (index 0 = primary)
+	streamChan  chan *b.Block
+	startSlot   uint64
+	endSlot     uint64
+	currentSlot uint64
+	blockDir    string
+	sourceType  BlockSourceType
 
 	// RPC failover tracking
-	activeRpcIdx         atomic.Int32  // Currently active RPC index (0 = primary)
-	slotsSinceFailover   atomic.Uint64 // Slots emitted since failover (for retry timing)
-	failoverCount        atomic.Uint64 // Total failovers (for stats)
-	hardErrCount         atomic.Uint64 // Consecutive hard connectivity errors (reset on success)
-	lastHardErrTime      atomic.Int64  // Unix timestamp of last hard error (for time-windowing)
+	activeRpcIdx       atomic.Int32  // Currently active RPC index (0 = primary)
+	slotsSinceFailover atomic.Uint64 // Slots emitted since failover (for retry timing)
+	failoverCount      atomic.Uint64 // Total failovers (for stats)
+	hardErrCount       atomic.Uint64 // Consecutive hard connectivity errors (reset on success)
+	lastHardErrTime    atomic.Int64  // Unix timestamp of last hard error (for time-windowing)
 
 	// Rate limiting
 	rateLimiter *rate.Limiter
 	maxInflight int
 
 	// Tip tracking
-	confirmedTip        atomic.Uint64
-	processedTip        atomic.Uint64 // Processed commitment tip (super tip)
-	tipAtSlot           atomic.Uint64 // What slot we had executed when tip was measured
-	lastExecutedSlot    atomic.Uint64 // Last slot fully executed by replay (set by SetLastExecutedSlot)
-	tipSafetyMargin     uint64
-	tipPollInterval     time.Duration
-	lastTipUpdate       atomic.Int64  // Unix timestamp of last successful tip poll
-	tipPollFailures     atomic.Uint64 // Consecutive tip poll failures
-	totalTipPollFails   atomic.Uint64 // Total tip poll failures (for stats)
+	confirmedTip      atomic.Uint64
+	processedTip      atomic.Uint64 // Processed commitment tip (super tip)
+	tipAtSlot         atomic.Uint64 // What slot we had executed when tip was measured
+	lastExecutedSlot  atomic.Uint64 // Last slot fully executed by replay (set by SetLastExecutedSlot)
+	tipSafetyMargin   uint64
+	tipPollInterval   time.Duration
+	lastTipUpdate     atomic.Int64  // Unix timestamp of last successful tip poll
+	tipPollFailures   atomic.Uint64 // Consecutive tip poll failures
+	totalTipPollFails atomic.Uint64 // Total tip poll failures (for stats)
 
 	// Reorder buffer
 	reorderMu      sync.Mutex
@@ -219,11 +218,11 @@ type BlockSource struct {
 	stallError   atomic.Bool // Set when stall timeout triggers
 
 	// Stall diagnostics
-	waitingSlotErrorsMu     sync.Mutex
-	waitingSlotErrors       map[uint64]*slotErrorInfo // Per-slot error tracking
-	lastStallHeartbeat      atomic.Int64              // Unix timestamp of last stall heartbeat log
-	lastFailoverTime        atomic.Int64              // Unix timestamp of last RPC failover
-	lastPriorityBlockedLog  atomic.Int64              // Unix timestamp of last "priority slot blocked" log
+	waitingSlotErrorsMu    sync.Mutex
+	waitingSlotErrors      map[uint64]*slotErrorInfo // Per-slot error tracking
+	lastStallHeartbeat     atomic.Int64              // Unix timestamp of last stall heartbeat log
+	lastFailoverTime       atomic.Int64              // Unix timestamp of last RPC failover
+	lastPriorityBlockedLog atomic.Int64              // Unix timestamp of last "priority slot blocked" log
 
 	// Near-tip mode tracking
 	isNearTip        atomic.Bool // True when close to confirmed tip
@@ -333,23 +332,23 @@ func NewBlockSource(opts *BlockSourceOpts) *BlockSource {
 	}
 
 	bs := &BlockSource{
-		rpcClients: rpcClients,
-		streamChan: make(chan *b.Block, streamChanBuffer),
-		startSlot:       opts.StartSlot,
-		endSlot:         opts.EndSlot,
-		currentSlot:     opts.StartSlot,
-		blockDir:        opts.BlockDir,
-		sourceType:      opts.SourceType,
-		rateLimiter:     rate.NewLimiter(rate.Limit(maxRPS), maxRPS),
-		maxInflight:     maxInflight,
-		tipSafetyMargin: tipSafetyMargin,
-		tipPollInterval: time.Duration(tipPollMs) * time.Millisecond,
-		reorderBuffer:   make(map[uint64]*b.Block),
-		skippedSlots:    make(map[uint64]bool),
-		nextSlotToSend:  opts.StartSlot,
-		maxPending:      defaultMaxPending,
-		slotState:       make(map[uint64]slotStatus),
-		inflightStart:   make(map[uint64]time.Time),
+		rpcClients:       rpcClients,
+		streamChan:       make(chan *b.Block, streamChanBuffer),
+		startSlot:        opts.StartSlot,
+		endSlot:          opts.EndSlot,
+		currentSlot:      opts.StartSlot,
+		blockDir:         opts.BlockDir,
+		sourceType:       opts.SourceType,
+		rateLimiter:      rate.NewLimiter(rate.Limit(maxRPS), maxRPS),
+		maxInflight:      maxInflight,
+		tipSafetyMargin:  tipSafetyMargin,
+		tipPollInterval:  time.Duration(tipPollMs) * time.Millisecond,
+		reorderBuffer:    make(map[uint64]*b.Block),
+		skippedSlots:     make(map[uint64]bool),
+		nextSlotToSend:   opts.StartSlot,
+		maxPending:       defaultMaxPending,
+		slotState:        make(map[uint64]slotStatus),
+		inflightStart:    make(map[uint64]time.Time),
 		workQueue:        make(chan uint64, maxInflight*2),
 		resultQueue:      make(chan fetchResult, maxInflight*2),
 		stopChan:         make(chan struct{}),
@@ -653,7 +652,7 @@ func (bs *BlockSource) logStallDiagnostics(prefix string) {
 	mlog.Log.Errorf("=== End %s ===", prefix)
 }
 
-func (bs *BlockSource) tryGetBlockFromFile(slot uint64) (*block.Block, error) {
+func (bs *BlockSource) tryGetBlockFromFile(slot uint64) (*b.Block, error) {
 	if bs.blockDir == "" {
 		return nil, fmt.Errorf("no block directory specified")
 	}
@@ -664,7 +663,7 @@ func (bs *BlockSource) tryGetBlockFromFile(slot uint64) (*block.Block, error) {
 	}
 
 	decoder := json.NewDecoder(file)
-	out := &block.Block{}
+	out := &b.Block{}
 
 	err = decoder.Decode(out)
 	if err != nil {
@@ -785,7 +784,7 @@ func (bs *BlockSource) fetchBlockOnce(slot uint64, rpcIdx int32) (*b.Block, erro
 		return nil, err
 	}
 
-	return block.FromBlockResult(blockResult, slot, rpc), nil
+	return b.FromBlockResult(blockResult, slot, rpc), nil
 }
 
 // pollTip periodically updates the confirmed tip by querying all configured RPCs
@@ -1193,13 +1192,13 @@ func (bs *BlockSource) emitOrderedBlocks() {
 		if result.skipped {
 			bs.stats.FetchSkipped.Add(1)
 			bs.skippedSlots[result.slot] = true
-			bs.hardErrCount.Store(0) // Reset on progress
+			bs.hardErrCount.Store(0)        // Reset on progress
 			bs.clearSlotErrors(result.slot) // Clear stall diagnostics for this slot
 		} else if result.block != nil {
 			// Success! This takes priority over any pending error results.
 			bs.stats.FetchSuccesses.Add(1)
 			bs.reorderBuffer[result.slot] = result.block
-			bs.hardErrCount.Store(0) // Reset error count on success
+			bs.hardErrCount.Store(0)        // Reset error count on success
 			bs.clearSlotErrors(result.slot) // Clear stall diagnostics for this slot
 			// Track max buffered slot
 			if result.slot > bs.stats.MaxBufferedSlot.Load() {
@@ -1671,7 +1670,7 @@ func (bs *BlockSource) fetchAndParseBlockSequential(slot uint64) (*b.Block, erro
 					return nil, fmt.Errorf("error fetching block: %w", err)
 				}
 			}
-			blk = block.FromBlockResult(blockResult, slot, rpc)
+			blk = b.FromBlockResult(blockResult, slot, rpc)
 		}
 	} else if bs.sourceType == BlockSourceLightbringer {
 		// NOTE: BlockSourceLightbringer is TEMPORARILY NON-FUNCTIONAL.

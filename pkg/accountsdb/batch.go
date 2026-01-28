@@ -12,7 +12,7 @@ import (
 
 var systemProgramAddr [32]byte
 
-func (db *AccountsDb) GetAccountsBatch(ctx context.Context, slot uint64, pks []solana.PublicKey) ([]*accounts.Account, error) {
+func (db *AccountsDb) GetAccountsBatch(ctx context.Context, pks []solana.PublicKey) ([]*accounts.Account, error) {
 	n := len(pks)
 	if n == 0 {
 		return nil, nil
@@ -49,7 +49,7 @@ func (db *AccountsDb) GetAccountsBatch(ctx context.Context, slot uint64, pks []s
 			default:
 			}
 
-			acct, err := db.getStoredAccount(slot, key)
+			acct, err := db.getStoredAccount(key)
 			if err != nil && err != ErrNoAccount {
 				select {
 				case errCh <- err:

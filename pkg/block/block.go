@@ -69,3 +69,25 @@ type BlockRewardsInfo struct {
 	Lamports    uint64
 	PostBalance uint64
 }
+
+func (b *Block) UniqueAccounts() map[solana.PublicKey]struct{} {
+	numPubkeys := 0
+	for _, tx := range b.Transactions {
+		numPubkeys += len(tx.Message.AccountKeys)
+	}
+
+	numPubkeys += len(b.UpdatedAccts)
+
+	pubkeyMap := make(map[solana.PublicKey]struct{}, numPubkeys)
+
+	for _, tx := range b.Transactions {
+		for _, pk := range tx.Message.AccountKeys {
+			pubkeyMap[pk] = struct{}{}
+		}
+	}
+
+	for _, pk := range b.UpdatedAccts {
+		pubkeyMap[pk] = struct{}{}
+	}
+	return pubkeyMap
+}
