@@ -206,30 +206,32 @@ func resolveAddrTableLookups(accountsDb *accountsdb.AccountsDb, block *b.Block) 
 			continue
 		}
 
-		var skipLookup bool
 		for _, addrTableKey := range tx.Message.GetAddressTableLookups().GetTableIDs() {
-			if _, alreadyLoaded := tables[addrTableKey]; alreadyLoaded {
-				continue
-			}
-
-			acct, err := accountsDb.GetAccount(block.Slot, addrTableKey)
-			if err != nil {
-				skipLookup = true
-				break
-			}
-
-			addrLookupTable, err := sealevel.UnmarshalAddressLookupTable(acct.Data)
-			if err != nil {
-				return err
-			}
-
-			tables[addrTableKey] = addrLookupTable.Addresses
+			tables[addrTableKey] = nil
 		}
+	}
 
-		if skipLookup {
+	tablesSlice := make([]solana.PublicKey, 0, len(tables))
+	for t := range tables {
+		tablesSlice = append(tablesSlice, t)
+	}
+	accts, err := accountsDb.GetAccountsBatch(context.Background(), block.Slot, tablesSlice)
+	if err != nil {
+		return err
+	}
+
+	for i := range tablesSlice {
+		addrLookupTable, err := sealevel.UnmarshalAddressLookupTable(accts[i].Data)
+		if err != nil {
+			return err
+		}
+		tables[tablesSlice[i]] = addrLookupTable.Addresses
+	}
+
+	for _, tx := range block.Transactions {
+		if !tx.Message.IsVersioned() || tx.Message.AddressTableLookups.NumLookups() == 0 {
 			continue
 		}
-
 		err := tx.Message.SetAddressTables(tables)
 		if err != nil {
 			return err
