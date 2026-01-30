@@ -349,6 +349,7 @@ func cacheConstantSysvars(acctsDb *accountsdb.AccountsDb) {
 }
 
 func loadBlockAccountsAndUpdateSysvars(accountsDb *accountsdb.AccountsDb, block *b.Block) (accounts.Accounts, accounts.Accounts, error) {
+	start := time.Now()
 	err := resolveAddrTableLookups(accountsDb, block)
 	if err != nil {
 		return nil, nil, err
@@ -360,6 +361,8 @@ func loadBlockAccountsAndUpdateSysvars(accountsDb *accountsdb.AccountsDb, block 
 	if err != nil {
 		return nil, nil, err
 	}
+
+	mlog.Log.Infof("resolveAndLoadAccountsMs=%f", time.Since(start).Seconds()*1000)
 
 	numAccts := uint64(len(slotAccts))
 	accts := accounts.NewMemAccountsWithLen(numAccts)
