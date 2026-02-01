@@ -16,7 +16,7 @@ const HistoryFileName = "mithril_state.history.jsonl"
 
 // CurrentStateSchemaVersion is the current version of the state file format.
 // Increment this when making breaking changes to the state file structure.
-const CurrentStateSchemaVersion uint32 = 1
+const CurrentStateSchemaVersion uint32 = 2
 
 // MithrilState tracks the current state of the mithril node.
 // The state file serves as an atomic marker of validity - AccountsDB is valid
@@ -57,6 +57,52 @@ type MithrilState struct {
 	// Corruption tracking - set when integrity check fails
 	CorruptionReason     string    `json:"corruption_reason,omitempty"`
 	CorruptionDetectedAt time.Time `json:"corruption_detected_at,omitempty"`
+
+	// =========================================================================
+	// Manifest Seed Data (copied from manifest at snapshot build time)
+	// Used ONLY for fresh-start replay. Resume uses Last* fields instead.
+	// =========================================================================
+
+	// Block configuration seed
+	ManifestParentSlot     uint64 `json:"manifest_parent_slot,omitempty"`
+	ManifestParentBankhash string `json:"manifest_parent_bankhash,omitempty"` // base58
+	ManifestAcctsLtHash    string `json:"manifest_accts_lt_hash,omitempty"`   // base64
+
+	// Fee rate governor seed (static fields only)
+	ManifestFeeRateGovernor *ManifestFeeRateGovernorSeed `json:"manifest_fee_rate_governor,omitempty"`
+
+	// Signature/fee state at snapshot
+	ManifestSignatureCount       uint64 `json:"manifest_signature_count,omitempty"`
+	ManifestLamportsPerSignature uint64 `json:"manifest_lamports_per_sig,omitempty"`
+
+	// Blockhash context (150 recent + 1 evicted)
+	ManifestRecentBlockhashes []BlockhashEntry `json:"manifest_recent_blockhashes,omitempty"`
+	ManifestEvictedBlockhash  string           `json:"manifest_evicted_blockhash,omitempty"` // base58
+
+	// ReplayCtx seed (inflation/capitalization at snapshot)
+	ManifestCapitalization          uint64  `json:"manifest_capitalization,omitempty"`
+	ManifestSlotsPerYear            float64 `json:"manifest_slots_per_year,omitempty"`
+	ManifestInflationInitial        float64 `json:"manifest_inflation_initial,omitempty"`
+	ManifestInflationTerminal       float64 `json:"manifest_inflation_terminal,omitempty"`
+	ManifestInflationTaper          float64 `json:"manifest_inflation_taper,omitempty"`
+	ManifestInflationFoundation     float64 `json:"manifest_inflation_foundation,omitempty"`
+	ManifestInflationFoundationTerm float64 `json:"manifest_inflation_foundation_term,omitempty"`
+
+	// Epoch account hash (base64 for consistency with LtHash)
+	ManifestEpochAcctsHash string `json:"manifest_epoch_accts_hash,omitempty"` // base64
+
+	// Transaction count at snapshot slot
+	ManifestTransactionCount uint64 `json:"manifest_transaction_count,omitempty"`
+
+	// Epoch authorized voters (for current epoch only)
+	// Maps vote account pubkey (base58) -> list of authorized voter pubkeys (base58)
+	// Multiple authorized voters per vote account are supported (matches original manifest behavior)
+	ManifestEpochAuthorizedVoters map[string][]string `json:"manifest_epoch_authorized_voters,omitempty"`
+
+	// Epoch stakes seed - AGGREGATED vote-account stakes only (NOT full VersionedEpochStakes)
+	// Same format as ComputedEpochStakes (PersistedEpochStakes JSON)
+	// Cleared after first replayed slot to save space.
+	ManifestEpochStakes map[uint64]string `json:"manifest_epoch_stakes,omitempty"`
 
 	// =========================================================================
 	// Current Position (where we left off)
@@ -123,6 +169,17 @@ type BlockhashEntry struct {
 	LamportsPerSignature uint64 `json:"lamports_per_sig"`
 }
 
+// ManifestFeeRateGovernorSeed contains the static fields from FeeRateGovernor
+// that do not change during replay. Dynamic fields (LamportsPerSignature,
+// PrevLamportsPerSignature) are stored separately and updated on resume.
+type ManifestFeeRateGovernorSeed struct {
+	TargetLamportsPerSignature uint64 `json:"target_lamports_per_sig"`
+	TargetSignaturesPerSlot    uint64 `json:"target_sigs_per_slot"`
+	MinLamportsPerSignature    uint64 `json:"min_lamports_per_sig"`
+	MaxLamportsPerSignature    uint64 `json:"max_lamports_per_sig"`
+	BurnPercent                byte   `json:"burn_percent"`
+}
+
 // SlotHashEntry represents a single entry in the SlotHashes sysvar
 type SlotHashEntry struct {
 	Slot uint64 `json:"slot"`
@@ -155,15 +212,9 @@ func LoadState(accountsDbDir string) (*MithrilState, error) {
 		return nil, fmt.Errorf("failed to parse state file: %w", err)
 	}
 
-	// Migrate from older schema versions
-	if state.StateSchemaVersion == 0 {
-		// Version 0 → 1 migration:
-		// - Migrate LastCommit to LastWriterCommit
-		if state.LastCommit != "" && state.LastWriterCommit == "" {
-			state.LastWriterCommit = state.LastCommit
-		}
-		state.StateSchemaVersion = 1
-		// Note: We don't save here - the state will be saved on next update
+	// Require schema version 2 - no migration from older versions
+	if state.StateSchemaVersion != CurrentStateSchemaVersion {
+		return nil, fmt.Errorf("state file schema version %d is not supported (requires v%d). Delete AccountsDB and rebuild from snapshot", state.StateSchemaVersion, CurrentStateSchemaVersion)
 	}
 
 	return &state, nil
@@ -346,6 +397,12 @@ func (s *MithrilState) UpdateOnShutdown(accountsDbDir string, slot uint64, bankh
 // This indicates the state was saved during a graceful shutdown with full context.
 func (s *MithrilState) HasResumeData() bool {
 	return s != nil && s.LastSlot > 0 && s.LastAcctsLtHash != ""
+}
+
+// ClearManifestEpochStakes removes the manifest epoch stakes after they're no longer needed.
+// This should be called after the first slot is replayed past the snapshot slot.
+func (s *MithrilState) ClearManifestEpochStakes() {
+	s.ManifestEpochStakes = nil
 }
 
 // getWriterCommit returns the writer commit, preferring the new field but falling back to legacy.

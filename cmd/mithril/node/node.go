@@ -809,6 +809,8 @@ func runVerifyRange(c *cobra.Command, args []string) {
 			snapshotEpoch = sealevel.SysvarCache.EpochSchedule.Sysvar.GetEpoch(manifest.Bank.Slot)
 		}
 		mithrilState = state.NewReadyState(manifest.Bank.Slot, snapshotEpoch, "", "", 0, 0)
+		// Populate manifest seed data so replay doesn't need manifest at runtime
+		snapshot.PopulateManifestSeed(mithrilState, manifest)
 		if err := mithrilState.Save(accountsDbDir); err != nil {
 			mlog.Log.Errorf("failed to save state file: %v", err)
 		}
@@ -1175,6 +1177,8 @@ func runLive(c *cobra.Command, args []string) {
 			snapshotEpoch = sealevel.SysvarCache.EpochSchedule.Sysvar.GetEpoch(manifest.Bank.Slot)
 		}
 		mithrilState = state.NewReadyState(manifest.Bank.Slot, snapshotEpoch, "", "", 0, 0)
+		// Populate manifest seed data so replay doesn't need manifest at runtime
+		snapshot.PopulateManifestSeed(mithrilState, manifest)
 		if err := mithrilState.Save(accountsPath); err != nil {
 			mlog.Log.Errorf("failed to save state file: %v", err)
 		}
@@ -1243,6 +1247,8 @@ func runLive(c *cobra.Command, args []string) {
 			snapshotEpoch = sealevel.SysvarCache.EpochSchedule.Sysvar.GetEpoch(manifest.Bank.Slot)
 		}
 		mithrilState = state.NewReadyState(manifest.Bank.Slot, snapshotEpoch, "", "", 0, 0)
+		// Populate manifest seed data so replay doesn't need manifest at runtime
+		snapshot.PopulateManifestSeed(mithrilState, manifest)
 		if err := mithrilState.Save(accountsPath); err != nil {
 			mlog.Log.Errorf("failed to save state file: %v", err)
 		}
@@ -1299,6 +1305,8 @@ func runLive(c *cobra.Command, args []string) {
 			snapshotEpoch = sealevel.SysvarCache.EpochSchedule.Sysvar.GetEpoch(manifest.Bank.Slot)
 		}
 		mithrilState = state.NewReadyState(manifest.Bank.Slot, snapshotEpoch, "", "", 0, 0)
+		// Populate manifest seed data so replay doesn't need manifest at runtime
+		snapshot.PopulateManifestSeed(mithrilState, manifest)
 		if err := mithrilState.Save(accountsPath); err != nil {
 			mlog.Log.Errorf("failed to save state file: %v", err)
 		}
@@ -1369,6 +1377,8 @@ func runLive(c *cobra.Command, args []string) {
 						snapshotEpoch = sealevel.SysvarCache.EpochSchedule.Sysvar.GetEpoch(manifest.Bank.Slot)
 					}
 					mithrilState = state.NewReadyState(manifest.Bank.Slot, snapshotEpoch, "", "", 0, 0)
+					// Populate manifest seed data so replay doesn't need manifest at runtime
+					snapshot.PopulateManifestSeed(mithrilState, manifest)
 					if err := mithrilState.Save(accountsPath); err != nil {
 						mlog.Log.Errorf("failed to save state file: %v", err)
 					}
@@ -1471,6 +1481,8 @@ func runLive(c *cobra.Command, args []string) {
 				WriterVersion: getVersion(),
 				WriterCommit:  getCommit(),
 			})
+			// Populate manifest seed data so replay doesn't need manifest at runtime
+			snapshot.PopulateManifestSeed(mithrilState, manifest)
 			if err := mithrilState.Save(accountsPath); err != nil {
 				mlog.Log.Errorf("failed to save state file: %v", err)
 			}
@@ -1582,6 +1594,8 @@ postBootstrap:
 			snapshotEpoch = sealevel.SysvarCache.EpochSchedule.Sysvar.GetEpoch(manifest.Bank.Slot)
 		}
 		mithrilState = state.NewReadyState(manifest.Bank.Slot, snapshotEpoch, "", "", 0, 0)
+		// Populate manifest seed data so replay doesn't need manifest at runtime
+		snapshot.PopulateManifestSeed(mithrilState, manifest)
 		if err := mithrilState.Save(accountsPath); err != nil {
 			mlog.Log.Errorf("failed to save state file: %v", err)
 		}
@@ -2604,6 +2618,6 @@ func runReplayWithRecovery(
 		}
 	}()
 
-	result = replay.ReplayBlocks(ctx, accountsDb, accountsDbPath, manifest, resumeState, startSlot, endSlot, rpcEndpoints, blockDir, txParallelism, isLive, useLightbringer, dbgOpts, metricsWriter, rpcServer, blockFetchOpts, onCancelWriteState)
+	result = replay.ReplayBlocks(ctx, accountsDb, accountsDbPath, mithrilState, resumeState, startSlot, endSlot, rpcEndpoints, blockDir, txParallelism, isLive, useLightbringer, dbgOpts, metricsWriter, rpcServer, blockFetchOpts, onCancelWriteState)
 	return result
 }

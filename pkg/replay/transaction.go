@@ -190,14 +190,16 @@ func recordStakeDelegation(acct *accounts.Account) {
 	}
 
 	if isEmpty || isUninitialized {
-		global.DeleteStakeCacheItem(acct.Key)
-	} else {
-		stakeState, err := sealevel.UnmarshalStakeState(acct.Data)
-		if err == nil {
-			delegation := stakeState.Stake.Stake.Delegation
-			delegation.CreditsObserved = stakeState.Stake.Stake.CreditsObserved
-			global.PutStakeCacheItem(acct.Key, &delegation)
-		}
+		// Account closed or uninitialized - no need to track
+		// (stake cache is not used with streaming rewards)
+		return
+	}
+
+	// Only track new stake pubkeys for index append
+	// We no longer populate the full stake cache since streaming reads from AccountsDB directly
+	stakeState, err := sealevel.UnmarshalStakeState(acct.Data)
+	if err == nil && stakeState.Status == sealevel.StakeStateV2StatusStake {
+		global.TrackNewStakePubkey(acct.Key)
 	}
 }
 
