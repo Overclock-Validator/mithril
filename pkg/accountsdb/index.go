@@ -6,7 +6,15 @@ import (
 	"fmt"
 
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
+	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/sstable"
 	"github.com/gagliardetto/solana-go"
+)
+
+// Prefixes to separate keyspaces within the same pebble.DB
+var (
+	accountPrefix      = []byte{0x00}
+	slotBankhashPrefix = []byte{0x01}
 )
 
 type AccountIndexEntry struct {
@@ -65,4 +73,59 @@ func BuildIndexEntriesFromAppendVecs(data []byte, fileSize uint64, slot uint64, 
 	}
 
 	return pubkeys, acctIdxEntries, stakePubkeys, nil
+}
+
+func getAccountIndexEntry(index *pebble.DB, k solana.PublicKey) (*AccountIndexEntry, error) {
+	var prefixedK [33]byte
+	copy(prefixedK[:len(accountPrefix)], accountPrefix)
+	copy(prefixedK[len(accountPrefix):], k[:])
+	v, c, err := index.Get(prefixedK[:])
+	if err != nil {
+		return nil, fmt.Errorf("getting account index entry for k=%s: %w", k, err)
+	}
+	defer c.Close()
+	a, err := unmarshalAcctIdxEntry(v)
+	if err != nil {
+		return nil, fmt.Errorf("parsing account index entry for k=%s v=%x: %w", k, v, err)
+	}
+	return a, nil
+}
+
+func setAccountIndexEntry(index pebble.Writer, k solana.PublicKey, a AccountIndexEntry) error {
+	var prefixedK [33]byte
+	copy(prefixedK[:len(accountPrefix)], accountPrefix)
+	copy(prefixedK[len(accountPrefix):], k[:])
+	var buf [24]byte
+	a.Marshal(&buf)
+	return index.Set(prefixedK[:], buf[:], &pebble.WriteOptions{})
+}
+
+func SSTSetAccountIndexEntry(sst *sstable.Writer, k solana.PublicKey, a AccountIndexEntry) error {
+	var prefixedK [33]byte
+	copy(prefixedK[:len(accountPrefix)], accountPrefix)
+	copy(prefixedK[len(accountPrefix):], k[:])
+	var buf [24]byte
+	a.Marshal(&buf)
+	return sst.Set(prefixedK[:], buf[:])
+}
+
+func getBankhashForSlot(index *pebble.DB, slot uint64) ([]byte, error) {
+	var prefixedSlot [9]byte
+	copy(prefixedSlot[:len(slotBankhashPrefix)], slotBankhashPrefix)
+	binary.LittleEndian.PutUint64(prefixedSlot[len(slotBankhashPrefix):], slot)
+	bh, c, err := index.Get(prefixedSlot[:])
+	if err != nil {
+		return nil, fmt.Errorf("GetBankHashForSlot slot=%d: %w", slot, err)
+	}
+	out := make([]byte, len(bh))
+	copy(out, bh)
+	c.Close()
+	return out, nil
+}
+
+func setBankhashForSlot(index pebble.Writer, slot uint64, bh []byte) error {
+	var prefixedSlot [9]byte
+	copy(prefixedSlot[:len(slotBankhashPrefix)], slotBankhashPrefix)
+	binary.LittleEndian.PutUint64(prefixedSlot[len(slotBankhashPrefix):], slot)
+	return index.Set(prefixedSlot[:], bh, &pebble.WriteOptions{})
 }

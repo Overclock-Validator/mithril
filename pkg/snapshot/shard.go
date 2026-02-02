@@ -228,7 +228,6 @@ func (s *shard) logToSST(ctx context.Context) error {
 			return 1
 		}
 	})
-	var vBytes [vlen]byte
 	// Write to SST
 	sstFilename := fmt.Sprintf("%s.sst", filename)
 	sstFile, err := vfs.Default.Create(sstFilename)
@@ -243,8 +242,7 @@ func (s *shard) logToSST(ctx context.Context) error {
 		if lastWritten >= 0 && bytes.Equal(kv.k[:], pairs[lastWritten].k[:]) {
 			continue
 		}
-		kv.v.Marshal(&vBytes)
-		if err := w.Set(kv.k[:], vBytes[:]); err != nil {
+		if err := accountsdb.SSTSetAccountIndexEntry(w, kv.k, kv.v); err != nil {
 			return fmt.Errorf("writing to SST: %w", err)
 		}
 		lastWritten = i
