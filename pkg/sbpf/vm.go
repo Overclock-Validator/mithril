@@ -57,6 +57,7 @@ type VMOpts struct {
 
 type Exception struct {
 	PC     int64
+	R      [11]uint64
 	Detail error
 }
 
@@ -77,6 +78,7 @@ var (
 	ExcInvalidInstr   = errors.New("invalid instruction - feature not enabled")
 
 	ExcUnsupportedInstruction = errors.New("unsupported BPF instruction")
+	ExcCallOutsideTextSegment = errors.New("call outside text segment")
 )
 
 type ExcBadAccess struct {

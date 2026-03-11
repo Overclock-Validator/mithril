@@ -519,8 +519,9 @@ mainLoop:
 			}
 			if int32(r[ins.Dst()]) == math.MinInt32 && ins.Imm() == -1 {
 				err = ExcDivideOverflow
+			} else {
+				r[ins.Dst()] = uint64(uint32(int32(r[ins.Dst()]) / ins.Imm()))
 			}
-			r[ins.Dst()] = uint64(uint32(int32(r[ins.Dst()]) / ins.Imm()))
 			pc++
 		case OpSdiv32Reg:
 			if !ip.sbpfVersion.EnablePqr() {
@@ -530,8 +531,9 @@ mainLoop:
 			if src := int32(r[ins.Src()]); src != 0 {
 				if int32(r[ins.Dst()]) == math.MinInt32 && src == -1 {
 					err = ExcDivideOverflow
+				} else {
+					r[ins.Dst()] = uint64(uint32(int32(r[ins.Dst()]) / src))
 				}
-				r[ins.Dst()] = uint64(uint32(int32(r[ins.Dst()]) / src))
 			} else {
 				err = ExcDivideByZero
 			}
@@ -543,8 +545,9 @@ mainLoop:
 			}
 			if int64(r[ins.Dst()]) == math.MinInt64 && ins.Imm() == -1 {
 				err = ExcDivideOverflow
+			} else {
+				r[ins.Dst()] = uint64(int64(r[ins.Dst()]) / int64(ins.Imm()))
 			}
-			r[ins.Dst()] = uint64(int64(r[ins.Dst()]) / int64(ins.Imm()))
 			pc++
 		case OpSdiv64Reg:
 			if !ip.sbpfVersion.EnablePqr() {
@@ -554,8 +557,9 @@ mainLoop:
 			if src := int64(r[ins.Src()]); src != 0 {
 				if int64(r[ins.Dst()]) == math.MinInt64 && src == -1 {
 					err = ExcDivideOverflow
+				} else {
+					r[ins.Dst()] = uint64(int64(r[ins.Dst()]) / src)
 				}
-				r[ins.Dst()] = uint64(int64(r[ins.Dst()]) / src)
 			} else {
 				err = ExcDivideByZero
 			}
@@ -567,8 +571,9 @@ mainLoop:
 			}
 			if int32(r[ins.Dst()]) == math.MinInt32 && ins.Imm() == -1 {
 				err = ExcDivideOverflow
+			} else {
+				r[ins.Dst()] = uint64(uint32(int32(r[ins.Dst()]) % ins.Imm()))
 			}
-			r[ins.Dst()] = uint64(uint32(int32(r[ins.Dst()]) % ins.Imm()))
 			pc++
 		case OpSrem32Reg:
 			if !ip.sbpfVersion.EnablePqr() {
@@ -578,8 +583,9 @@ mainLoop:
 			if src := int32(r[ins.Src()]); src != 0 {
 				if int32(r[ins.Dst()]) == math.MinInt32 && src == -1 {
 					err = ExcDivideOverflow
+				} else {
+					r[ins.Dst()] = uint64(uint32(int32(r[ins.Dst()]) % int32(r[ins.Src()])))
 				}
-				r[ins.Dst()] = uint64(uint32(int32(r[ins.Dst()]) % int32(r[ins.Src()])))
 			} else {
 				err = ExcDivideByZero
 			}
@@ -591,8 +597,9 @@ mainLoop:
 			}
 			if int64(r[ins.Dst()]) == math.MinInt64 && ins.Imm() == -1 {
 				err = ExcDivideOverflow
+			} else {
+				r[ins.Dst()] = uint64(int64(r[ins.Dst()]) % int64(ins.Imm()))
 			}
-			r[ins.Dst()] = uint64(int64(r[ins.Dst()]) % int64(ins.Imm()))
 			pc++
 		case OpSrem64Reg:
 			if !ip.sbpfVersion.EnablePqr() {
@@ -602,8 +609,9 @@ mainLoop:
 			if src := int64(r[ins.Src()]); src != 0 {
 				if int64(r[ins.Dst()]) == math.MinInt64 && src == -1 {
 					err = ExcDivideOverflow
+				} else {
+					r[ins.Dst()] = uint64(int64(r[ins.Dst()]) % int64(r[ins.Src()]))
 				}
-				r[ins.Dst()] = uint64(int64(r[ins.Dst()]) % int64(r[ins.Src()]))
 			} else {
 				err = ExcDivideByZero
 			}
@@ -916,11 +924,12 @@ mainLoop:
 				r[0], err = sc.Invoke(ip, r[1], r[2], r[3], r[4], r[5])
 				pc++
 			} else if target, ok := ip.funcs[ins.Uimm()]; ok {
-				ok = ip.stack.Push(r[:], pc+1)
-				if !ok {
+				pushed := ip.stack.Push(r[:], pc+1)
+				if !pushed {
 					err = ExcCallDepth
+				} else {
+					pc = target
 				}
-				pc = target
 			} else {
 				err = ExcCallDest{ins.Uimm()}
 			}
@@ -933,15 +942,16 @@ mainLoop:
 			}
 			target &= ^(uint64(0x7))
 
-			var ok bool
-			ok = ip.stack.Push(r[:], pc+1)
-			if !ok {
+			pushed := ip.stack.Push(r[:], pc+1)
+			if !pushed {
 				err = ExcCallDepth
+			} else {
+				if target < ip.textVA || target >= VaddrStack || target >= ip.textVA+uint64(len(ip.text)*8) {
+					err = ExcCallOutsideTextSegment
+				} else {
+					pc = int64((target - ip.textVA) / 8)
+				}
 			}
-			if target < ip.textVA || target >= VaddrStack || target >= ip.textVA+uint64(len(ip.text)*8) {
-				err = NewExcBadAccess(target, 8, false, "jump out-of-bounds")
-			}
-			pc = int64((target - ip.textVA) / 8)
 		case OpExit:
 			var ok bool
 			pc, ok = ip.stack.Pop(r[:])
@@ -962,7 +972,8 @@ mainLoop:
 		if err != nil {
 			exc := &Exception{
 				PC:     pc,
-				Detail: fmt.Errorf("tx: %s, programId: %s - %s:", ip.txSignature, ip.programId, err),
+				R:      r,
+				Detail: fmt.Errorf("tx: %s, programId: %s - %w:", ip.txSignature, ip.programId, err),
 			}
 			if IsLongIns(ins.Op()) {
 				exc.PC-- // fix reported PC
