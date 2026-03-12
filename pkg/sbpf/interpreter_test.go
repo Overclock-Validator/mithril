@@ -116,6 +116,47 @@ func TestCallErrors(t *testing.T) {
 	}
 }
 
+func TestOpExitTopLevel(t *testing.T) {
+	v0 := sbpfver.SbpfVersion{Version: sbpfver.SbpfVersionV0}
+
+	tests := []struct {
+		name   string
+		text   []Slot
+		wantR0 uint64
+	}{
+		{
+			name: "SingleExit",
+			text: []Slot{
+				makeSlot(OpMov64Imm, 0, 0, 0, 42),
+				makeSlot(OpExit, 0, 0, 0, 0),
+			},
+			wantR0: 42,
+		},
+		{
+			name: "ExitAtPC4",
+			text: []Slot{
+				makeSlot(OpMov64Imm, 0, 0, 0, 1),
+				makeSlot(OpAdd64Imm, 0, 0, 0, 2),
+				makeSlot(OpAdd64Imm, 0, 0, 0, 3),
+				makeSlot(OpAdd64Imm, 0, 0, 0, 4),
+				makeSlot(OpExit, 0, 0, 0, 0),
+			},
+			wantR0: 10,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ip := newTestInterpreter(tc.text, map[uint32]int64{}, v0)
+			defer ip.Finish()
+
+			ret, _, err := ip.Run()
+			require.NoError(t, err)
+			require.Equal(t, tc.wantR0, ret)
+		})
+	}
+}
+
 func TestSignedDivOverflow(t *testing.T) {
 	v2 := sbpfver.SbpfVersion{Version: sbpfver.SbpfVersionV2}
 

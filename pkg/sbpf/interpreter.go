@@ -953,10 +953,12 @@ mainLoop:
 				}
 			}
 		case OpExit:
+			exitPC := pc
 			var ok bool
 			pc, ok = ip.stack.Pop(r[:])
 			if !ok {
 				ret = r[0]
+				pc = exitPC
 				break mainLoop
 			}
 		default:
