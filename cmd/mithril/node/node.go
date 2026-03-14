@@ -89,6 +89,9 @@ var (
 	debugAcctWrites []string
 	cpuprofPath     string
 
+	bankhashVerifyEndpoint string // URL of a reference mithril node for bankhash verification
+	bankhashVerifyMode     string // "warn" or "panic"
+
 	paramArenaSizeMB         uint64
 	borrowedAccountArenaSize uint64
 
@@ -133,6 +136,8 @@ func init() {
 	// [debug] section flags
 	Run.Flags().StringSliceVar(&debugTxs, "transaction-signatures", []string{}, "Pass tx signature strings to enable debug logging during that transaction's execution")
 	Run.Flags().StringSliceVar(&debugAcctWrites, "account-writes", []string{}, "Pass account pubkeys to enable debug logging of transactions that modify the account")
+	Run.Flags().StringVar(&bankhashVerifyEndpoint, "bankhash-verify-endpoint", "", "URL of a reference mithril node for bankhash verification (e.g. http://reference-node:8899)")
+	Run.Flags().StringVar(&bankhashVerifyMode, "bankhash-verify-mode", "warn", "Bankhash verification mode: 'warn' (log mismatch) or 'panic' (halt on mismatch)")
 
 	// Top-level flags
 	Run.Flags().StringVar(&scratchDirectory, "scratch-directory", "/tmp", "Path for downloads (e.g. snapshots) and other temp state")
@@ -442,6 +447,10 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	debugAcctWrites = getStringSlice("account-writes", "debug.account_writes")
 	if len(debugAcctWrites) == 0 {
 		debugAcctWrites = getStringSlice("account-writes", "development.debug.account_writes")
+	}
+	bankhashVerifyEndpoint = getString("bankhash-verify-endpoint", "debug.bankhash_verify_endpoint")
+	if v := getString("bankhash-verify-mode", "debug.bankhash_verify_mode"); v != "" {
+		bankhashVerifyMode = v
 	}
 
 	// [tuning] section (with fallback to legacy [development])
@@ -2210,6 +2219,17 @@ func runReplayWithRecovery(
 		}
 	}()
 
-	result = replay.ReplayBlocks(ctx, accountsDb, accountsDbPath, mithrilState, resumeState, startSlot, endSlot, rpcEndpoints, blockDir, txParallelism, isLive, useLightbringer, dbgOpts, metricsWriter, rpcServer, blockFetchOpts, onCancelWriteState)
+	// Create bankhash verifier if configured
+	var bhVerifier *replay.BankhashVerifier
+	if bankhashVerifyEndpoint != "" {
+		mode := replay.BankhashVerifyWarn
+		if bankhashVerifyMode == "panic" {
+			mode = replay.BankhashVerifyPanic
+		}
+		bhVerifier = replay.NewBankhashVerifier(bankhashVerifyEndpoint, mode)
+		mlog.Log.Infof("Bankhash verification enabled: endpoint=%s mode=%s", bankhashVerifyEndpoint, bankhashVerifyMode)
+	}
+
+	result = replay.ReplayBlocks(ctx, accountsDb, accountsDbPath, mithrilState, resumeState, startSlot, endSlot, rpcEndpoints, blockDir, txParallelism, isLive, useLightbringer, dbgOpts, metricsWriter, rpcServer, blockFetchOpts, onCancelWriteState, bhVerifier)
 	return result
 }

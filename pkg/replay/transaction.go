@@ -419,7 +419,7 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 	start = time.Now()
 	txFeeInfo, _, err := fees.CalculateAndDeductTxFees(tx, txMeta, instrs, &execCtx.TransactionContext.Accounts, computeBudgetLimits, slotCtx.Features)
 	if err != nil {
-		return txFeeInfo, nil
+		return &fees.TxFeeInfo{}, nil
 	}
 
 	metrics.GlobalBlockReplay.CalcAndDeductFees.AddTimingSince(start)
@@ -495,7 +495,7 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 	}
 
 	// check for CU consumed divergences
-	if instrErr == nil && *txMeta.ComputeUnitsConsumed != execCtx.ComputeMeter.Used() {
+	if instrErr == nil && txMeta != nil && txMeta.ComputeUnitsConsumed != nil && *txMeta.ComputeUnitsConsumed != execCtx.ComputeMeter.Used() {
 		discrepancy := max(execCtx.ComputeMeter.Used(), *txMeta.ComputeUnitsConsumed) - min(execCtx.ComputeMeter.Used(), *txMeta.ComputeUnitsConsumed)
 		var sign byte
 		if execCtx.ComputeMeter.Used() > *txMeta.ComputeUnitsConsumed {

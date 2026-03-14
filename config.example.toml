@@ -290,6 +290,16 @@ name = "mithril"
     # Account pubkeys to enable debug logging of transactions that modify them
     # account_writes = ["pubkey1", "pubkey2"]
 
+    # Bankhash verification: compare computed bankhashes against a reference
+    # mithril node to detect state divergences early. The reference node must
+    # have its RPC server enabled (see [rpc] section).
+
+    # Endpoint of a trusted reference mithril node (empty = disabled)
+    # bankhash_verify_endpoint = "http://reference-node:8899"
+
+    # What to do on mismatch: "warn" (log and continue) or "panic" (halt)
+    # bankhash_verify_mode = "warn"
+
 # ============================================================================
 # [reporting] - Metrics & Reporting
 # ============================================================================
