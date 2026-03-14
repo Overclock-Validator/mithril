@@ -1189,7 +1189,7 @@ func ReplayBlocks(
 	acctsDb *accountsdb.AccountsDb,
 	acctsDbPath string,
 	mithrilState *state.MithrilState, // State file with manifest_* seed fields
-	resumeState *ResumeState,         // nil if not resuming, contains parent slot info when resuming
+	resumeState *ResumeState, // nil if not resuming, contains parent slot info when resuming
 	startSlot, endSlot uint64,
 	rpcEndpoints []string, // RPC endpoints in priority order (first = primary, rest = fallbacks)
 	blockDir string,
@@ -1201,6 +1201,7 @@ func ReplayBlocks(
 	rpcServer *rpcserver.RpcServer,
 	blockFetchOpts *BlockFetchOpts,
 	onCancelWriteState OnCancelWriteState, // callback to write state immediately on cancellation (can be nil)
+	bankhashVerifier *BankhashVerifier, // optional bankhash verifier (nil to disable)
 ) *ReplayResult {
 	result := &ReplayResult{}
 
@@ -1648,6 +1649,11 @@ func ReplayBlocks(
 			fmt.Fprintf(bankhashLogFile, "%d %s\n", block.Slot, base58.Encode(lastSlotCtx.FinalBankhash))
 		}
 
+		// Verify bankhash against reference node (async, non-blocking)
+		if bankhashVerifier != nil {
+			bankhashVerifier.Submit(block.Slot, lastSlotCtx.FinalBankhash)
+		}
+
 		statsd.Count(statsd.SlotReplays, 1, nil)
 		statsd.Timing(statsd.SlotReplayDurationMs, uint64(slotReplayDuration.Nanoseconds())/1e6, nil)
 		statsd.Gauge(statsd.Epoch, float64(block.Epoch), nil)
@@ -1918,6 +1924,11 @@ func ReplayBlocks(
 	// Serialize all epoch stakes for persistence
 	result.ComputedEpochStakes = serializeAllEpochStakes()
 
+	// Stop bankhash verifier and log summary
+	if bankhashVerifier != nil {
+		bankhashVerifier.Stop()
+	}
+
 	return result
 }
 
@@ -2026,7 +2037,7 @@ func sequentialTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, bl
 		}
 		txFeeInfo, txErr := ProcessTransaction(slotCtx, sigverifyWg, tx, txMeta, dbgOpts, nil)
 
-		if txErr != nil {
+		if txMeta != nil && txErr != nil {
 			if txMeta.Err == nil && tx.IsVote() {
 				mlog.Log.Errorf("[run:%s] DIVERGENCE in slot %d: vote tx %s failed locally but succeeded onchain => bankhash mismatch at parent slot %d",
 					CurrentRunID, block.Slot, tx.Signatures[0], block.ParentSlot)
@@ -2035,11 +2046,11 @@ func sequentialTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, bl
 		}
 
 		// check for success-failure return value divergences
-		if txErr == nil && txMeta.Err != nil {
+		if txMeta != nil && txErr == nil && txMeta.Err != nil {
 			mlog.Log.Errorf("[run:%s] DIVERGENCE in slot %d: tx %s succeeded locally but failed onchain: %+v",
 				CurrentRunID, block.Slot, tx.Signatures[0], block.TxMetas[idx].Err)
 			panic(fmt.Sprintf("tx %s return value divergence: txErr was nil, but onchain err was %+v", tx.Signatures[0], block.TxMetas[idx].Err))
-		} else if txErr != nil && txMeta.Err == nil {
+		} else if txMeta != nil && txErr != nil && txMeta.Err == nil {
 			mlog.Log.Errorf("[run:%s] DIVERGENCE in slot %d: tx %s failed locally (%v) but succeeded onchain",
 				CurrentRunID, block.Slot, tx.Signatures[0], txErr)
 			panic(fmt.Sprintf("tx %s return value divergence: txErr was %+v (%s), but onchain err was nil", tx.Signatures[0], txErr, txErr))
@@ -2058,11 +2069,14 @@ func parallelTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, bloc
 
 	if rblock.FromLightbringer {
 		wg := &sync.WaitGroup{}
-		workerPool, _ := ants.NewPoolWithFunc(txParallelism, func(i interface{}) {
+		workerPool, poolErr := ants.NewPoolWithFunc(txParallelism, func(i interface{}) {
 			defer wg.Done()
 			idx := i.(uint64)
 			txFeeInfos[idx], errs[idx] = ProcessTransaction(slotCtx, sigverifyWg, rblock.Transactions[idx], nil, dbgOpts, nil)
 		})
+		if poolErr != nil {
+			panic(fmt.Sprintf("failed to create worker pool: %s", poolErr))
+		}
 
 		for _, entry := range rblock.Entries {
 			for _, txIdx := range entry.Indices {
@@ -2157,7 +2171,7 @@ func ProcessBlock(
 	for i := range block.Transactions {
 		unresolvedBlock.Transactions[i] = &solana.Transaction{}
 		*(unresolvedBlock.Transactions[i]) = *block.Transactions[i]
-		if unresolvedBlock.TxMetas != nil && !block.FromLightbringer {
+		if block.TxMetas != nil && !block.FromLightbringer {
 			unresolvedBlock.TxMetas[i] = &rpc.TransactionMeta{}
 			*(unresolvedBlock.TxMetas[i]) = *block.TxMetas[i]
 		}
