@@ -1235,7 +1235,40 @@ postBootstrap:
 		NearTipPollMs:    blockNearTipPollMs,
 		NearTipLookahead: blockNearTipLookahead,
 	}
-	result := runReplayWithRecovery(ctx, accountsDb, accountsPath, manifest, resumeState, uint64(startSlot), liveEndSlot, rpcEndpoints, blockstorePath, int(txParallelism), true, useLightbringer, dbgOpts, metricsWriter, rpcServer, mithrilState, blockFetchOpts, replayStartTime)
+	// Build consensus options from config
+	consensusMaxDepth := config.GetInt("consensus.skip_path_max_depth")
+	if consensusMaxDepth <= 0 {
+		consensusMaxDepth = 64
+	}
+	consensusPolicy := config.GetString("consensus.unresolved_policy")
+	if consensusPolicy == "" {
+		consensusPolicy = "halt"
+	}
+	switch consensusPolicy {
+	case "halt", "warn":
+		// valid
+	default:
+		mlog.Log.Errorf("invalid consensus.unresolved_policy %q (must be \"halt\" or \"warn\"), defaulting to \"halt\"", consensusPolicy)
+		consensusPolicy = "halt"
+	}
+	consensusEnforceSource := config.GetString("consensus.enforce_on_source")
+	if consensusEnforceSource == "" {
+		consensusEnforceSource = "lightbringer"
+	}
+	switch consensusEnforceSource {
+	case "lightbringer", "all":
+		// valid
+	default:
+		mlog.Log.Errorf("invalid consensus.enforce_on_source %q (must be \"lightbringer\" or \"all\"), defaulting to \"lightbringer\"", consensusEnforceSource)
+		consensusEnforceSource = "lightbringer"
+	}
+	consensusOpts := &replay.ConsensusOpts{
+		SkipPathMaxDepth: consensusMaxDepth,
+		UnresolvedPolicy: consensusPolicy,
+		EnforceOnSource:  consensusEnforceSource,
+	}
+
+	result := runReplayWithRecovery(ctx, accountsDb, accountsPath, manifest, resumeState, uint64(startSlot), liveEndSlot, rpcEndpoints, blockstorePath, int(txParallelism), true, useLightbringer, dbgOpts, metricsWriter, rpcServer, mithrilState, blockFetchOpts, consensusOpts, replayStartTime)
 
 	// Update state file with last persisted slot and shutdown context
 	// Skip if already written during cancellation (eliminates timing window)
@@ -2099,6 +2132,7 @@ func runReplayWithRecovery(
 	rpcServer *rpcserver.RpcServer,
 	mithrilState *state.MithrilState,
 	blockFetchOpts *replay.BlockFetchOpts,
+	consensusOpts *replay.ConsensusOpts,
 	replayStartTime time.Time, // Start time for resume context
 ) *replay.ReplayResult {
 	var result *replay.ReplayResult
@@ -2210,6 +2244,6 @@ func runReplayWithRecovery(
 		}
 	}()
 
-	result = replay.ReplayBlocks(ctx, accountsDb, accountsDbPath, mithrilState, resumeState, startSlot, endSlot, rpcEndpoints, blockDir, txParallelism, isLive, useLightbringer, dbgOpts, metricsWriter, rpcServer, blockFetchOpts, onCancelWriteState)
+	result = replay.ReplayBlocks(ctx, accountsDb, accountsDbPath, mithrilState, resumeState, startSlot, endSlot, rpcEndpoints, blockDir, txParallelism, isLive, useLightbringer, dbgOpts, metricsWriter, rpcServer, blockFetchOpts, consensusOpts, onCancelWriteState)
 	return result
 }

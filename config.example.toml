@@ -209,6 +209,35 @@ name = "mithril"
     # end_slot = -1
 
 # ============================================================================
+# [consensus] - Vote-Anchored Consensus
+# ============================================================================
+#
+# Controls how Mithril uses on-chain vote data to verify block correctness.
+# The fork choice service accumulates vote stake per slot and determines
+# which bank hash has reached 2/3 supermajority.
+#
+# When using Lightbringer as the block source, the consensus coordinator
+# resolves ambiguous slot ranges by finding a valid skip path that chains
+# to the vote-confirmed hash. If no valid path exists, the configured
+# policy determines behavior.
+
+[consensus]
+    # Maximum depth (number of slots) the skip-path solver will explore.
+    # Longer ranges take more memory. 64 covers ~26 seconds of slots.
+    skip_path_max_depth = 64
+
+    # What to do when a Lightbringer slot range cannot be resolved:
+    #   "halt" - Graceful shutdown, write diagnostic artifact (recommended)
+    #   "warn" - Log warning and continue (use only for debugging)
+    unresolved_policy = "halt"
+
+    # Which block source to enforce consensus on:
+    #   "lightbringer" - Only enforce on Lightbringer blocks (RPC blocks are trusted)
+    #   "all"          - Enforce on all block sources (not yet implemented)
+    enforce_on_source = "lightbringer"
+
+
+# ============================================================================
 # [rpc] - Mithril RPC Server
 # ============================================================================
 #

@@ -71,11 +71,15 @@ func SetForkChoice(forkChoice *forkchoice.ForkChoiceService) {
 	instance.forkChoice = forkChoice
 }
 
+func HasForkChoice() bool {
+	return instance.forkChoice != nil
+}
+
 func SubmitBlockToForkChoiceService(slot uint64, txs []*solana.Transaction) {
 	instance.forkChoice.SubmitBlock(slot, txs)
 }
 
-func BankhashConfirmedForSlot(slot uint64, bankHash solana.Hash) int {
+func BankhashConfirmedForSlot(slot uint64, bankHash solana.Hash) forkchoice.BankhashResult {
 	return instance.forkChoice.IsBankhashCorrect(slot, bankHash)
 }
 
@@ -101,6 +105,12 @@ func PutEpochAuthorizedVoter(voteAcct solana.PublicKey, authorizedVoter solana.P
 
 func EpochAuthorizedVoters() *epochstakes.EpochAuthorizedVotersCache {
 	return instance.epochAuthorizedVoters
+}
+
+// SetEpochAuthorizedVoters replaces the entire authorized voters cache.
+// Called at epoch boundaries after rebuilding from vote accounts.
+func SetEpochAuthorizedVoters(cache *epochstakes.EpochAuthorizedVotersCache) {
+	instance.epochAuthorizedVoters = cache
 }
 
 func PutSlotConfirmed(slot uint64) {

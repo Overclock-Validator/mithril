@@ -24,3 +24,13 @@ func (cache *EpochAuthorizedVotersCache) IsAuthorizedVoter(voteAcct solana.Publi
 	}
 	return false
 }
+
+// Entries returns the underlying map for serialization/persistence.
+func (cache *EpochAuthorizedVotersCache) Entries() map[solana.PublicKey][]solana.PublicKey {
+	return cache.authorizedVoters
+}
+
+// Len returns the number of vote accounts in the cache.
+func (cache *EpochAuthorizedVotersCache) Len() int {
+	return len(cache.authorizedVoters)
+}

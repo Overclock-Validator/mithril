@@ -141,6 +141,13 @@ type LogConfig struct {
 	MaxBackups int    `toml:"max_backups" mapstructure:"max_backups"` // Keep up to N old log files
 }
 
+// ConsensusConfig holds vote-anchored consensus configuration
+type ConsensusConfig struct {
+	SkipPathMaxDepth int    `toml:"skip_path_max_depth" mapstructure:"skip_path_max_depth"` // Max slots the skip-path solver explores (default: 64)
+	UnresolvedPolicy string `toml:"unresolved_policy" mapstructure:"unresolved_policy"`     // "halt" or "warn" (default: "halt")
+	EnforceOnSource  string `toml:"enforce_on_source" mapstructure:"enforce_on_source"`     // "lightbringer" or "all" (default: "lightbringer")
+}
+
 // Config holds all configuration options for Mithril (Firedancer-style hierarchy)
 type Config struct {
 	// Top-level (matches Firedancer style)
@@ -152,6 +159,7 @@ type Config struct {
 	Rpc         RpcConfig         `toml:"rpc" mapstructure:"rpc"`
 	Replay      ReplayConfig      `toml:"replay" mapstructure:"replay"`
 	Block       BlockConfig       `toml:"block" mapstructure:"block"`
+	Consensus   ConsensusConfig   `toml:"consensus" mapstructure:"consensus"`
 	Snapshot    SnapshotConfig    `toml:"snapshot" mapstructure:"snapshot"`
 	Development DevelopmentConfig `toml:"development" mapstructure:"development"`
 	Reporting   ReportingConfig   `toml:"reporting" mapstructure:"reporting"`

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -29,6 +30,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/blockstream"
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/fees"
+	"github.com/Overclock-Validator/mithril/pkg/forkchoice"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/lthash"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
@@ -61,6 +63,14 @@ type BlockFetchOpts struct {
 	// Near-tip tuning
 	NearTipPollMs    int // Faster poll interval in near-tip, 0 = use default
 	NearTipLookahead int // Slots ahead to schedule in near-tip, 0 = use default
+}
+
+// ConsensusOpts contains vote-anchored consensus configuration.
+// Nil means use defaults (max_depth=64, policy="halt").
+type ConsensusOpts struct {
+	SkipPathMaxDepth int    // Max slots for skip-path solver (default: 64)
+	UnresolvedPolicy string // "halt" or "warn" (default: "halt")
+	EnforceOnSource  string // "lightbringer" or "all" (default: "lightbringer")
 }
 
 var SerializedParameterArena *arena.Arena[byte]
@@ -1200,6 +1210,7 @@ func ReplayBlocks(
 	metricsWriter io.Writer,
 	rpcServer *rpcserver.RpcServer,
 	blockFetchOpts *BlockFetchOpts,
+	consensusOpts *ConsensusOpts, // nil = use defaults (max_depth=64, policy="halt")
 	onCancelWriteState OnCancelWriteState, // callback to write state immediately on cancellation (can be nil)
 ) *ReplayResult {
 	result := &ReplayResult{}
@@ -1291,6 +1302,25 @@ func ReplayBlocks(
 				result.Error = fmt.Errorf("missing required epoch stakes for current epoch %d - cannot resume (need fresh snapshot)", currentEpoch)
 				return result
 			}
+			// Load EpochAuthorizedVoters from state file (required for forkchoice vote parsing).
+			// buildInitialEpochStakesCache loads these, but this path skips that function.
+			if len(mithrilState.ManifestEpochAuthorizedVoters) > 0 {
+				for voteAcctStr, authorizedVoterStrs := range mithrilState.ManifestEpochAuthorizedVoters {
+					voteAcct, vErr := base58.DecodeFromString(voteAcctStr)
+					if vErr != nil {
+						result.Error = fmt.Errorf("corrupted state file: failed to decode epoch_authorized_voters key %s: %w", voteAcctStr, vErr)
+						return result
+					}
+					for _, authorizedVoterStr := range authorizedVoterStrs {
+						authorizedVoter, vErr := base58.DecodeFromString(authorizedVoterStr)
+						if vErr != nil {
+							result.Error = fmt.Errorf("corrupted state file: failed to decode epoch_authorized_voters value %s: %w", authorizedVoterStr, vErr)
+							return result
+						}
+						global.PutEpochAuthorizedVoter(voteAcct, authorizedVoter)
+					}
+				}
+			}
 		} else {
 			// Resume in same epoch as snapshot, no boundaries crossed - state file epoch stakes still valid
 			if err := buildInitialEpochStakesCache(mithrilState); err != nil {
@@ -1305,9 +1335,46 @@ func ReplayBlocks(
 			return result
 		}
 	}
-	//forkChoice, err := forkchoice.NewForkChoiceService(currentEpoch, global.EpochStakes(currentEpoch), global.EpochTotalStake(currentEpoch), global.EpochAuthorizedVoters(), 4)
-	//forkChoice.Start()
-	//global.SetForkChoice(forkChoice)
+	// Resolve consensus config defaults before forkchoice init so we can
+	// check whether enforcement requires authorized voters.
+	consensusMaxDepth := 64
+	consensusPolicy := "halt"
+	consensusEnforceSource := "lightbringer"
+	if consensusOpts != nil {
+		if consensusOpts.SkipPathMaxDepth > 0 {
+			consensusMaxDepth = consensusOpts.SkipPathMaxDepth
+		}
+		if consensusOpts.UnresolvedPolicy != "" {
+			consensusPolicy = consensusOpts.UnresolvedPolicy
+		}
+		if consensusOpts.EnforceOnSource != "" {
+			consensusEnforceSource = consensusOpts.EnforceOnSource
+		}
+	}
+
+	// Determine whether consensus enforcement is active for this block source.
+	// "lightbringer" = only enforce on Lightbringer blocks; "all" = enforce on all sources.
+	consensusEnforceActive := (consensusEnforceSource == "all") || (consensusEnforceSource == "lightbringer" && useLightbringer)
+
+	epochAuthVoters := global.EpochAuthorizedVoters()
+	if epochAuthVoters == nil {
+		// Without authorized voters, forkchoice can't parse votes → no supermajority → enforcement is blind.
+		// If consensus enforcement is active, this is a fatal misconfiguration.
+		if consensusEnforceActive && consensusPolicy == "halt" {
+			result.Error = fmt.Errorf("forkchoice: EpochAuthorizedVoters is nil — cannot enforce consensus without vote parsing (check snapshot/state file)")
+			return result
+		}
+		mlog.Log.Warnf("forkchoice: EpochAuthorizedVoters is nil — vote parsing will be skipped until populated")
+	}
+	forkChoice := forkchoice.NewForkChoiceService(currentEpoch, global.EpochStakes(currentEpoch), global.EpochTotalStake(currentEpoch), epochAuthVoters)
+	forkChoice.Start()
+	global.SetForkChoice(forkChoice)
+	defer forkChoice.Stop()
+
+	// Instantiate the consensus coordinator for skip-path resolution and policy.
+	// The coordinator drives halt/warn policy and will be used for Lightbringer batch
+	// range resolution when that mode is fully activated.
+	consensusCoordinator := forkchoice.NewConsensusCoordinator(forkChoice, consensusMaxDepth, consensusPolicy)
 
 	var statsCounter int
 	var execTimes []float64      // seconds per block
@@ -1324,6 +1391,18 @@ func ReplayBlocks(
 	cuValues = make([]uint64, 0, summaryInterval)
 	voteTxCounts = make([]uint64, 0, summaryInterval)
 	nonVoteTxCounts = make([]uint64, 0, summaryInterval)
+
+	// Skip-path chain verification state: tracks processed blocks as candidates so that
+	// ResolveRange can retroactively verify the bankhash chain when supermajority confirms a slot.
+	// The "Blockhash" in candidates is the computed bankhash (not PoH blockhash), and
+	// "LastBlockhash" is the parent bankhash — bankhashes chain correctly through blocks.
+	var candidateBlocks map[uint64]*forkchoice.SlotCandidate
+	var chainAnchorSlot uint64
+	var chainAnchorHash solana.Hash
+	var chainAnchorSet bool
+	if consensusEnforceActive {
+		candidateBlocks = make(map[uint64]*forkchoice.SlotCandidate)
+	}
 
 	var opts *blockstream.BlockSourceOpts
 	if useLightbringer {
@@ -1370,6 +1449,40 @@ func ReplayBlocks(
 
 	var skippedSlotsCount int // Track skipped slots for 100-slot summary
 	replayStartLogged := false
+
+	// writeConsensusArtifact writes a best-effort JSON diagnostic artifact to the
+	// per-run consensus subdirectory. If the log dir is empty or any step fails,
+	// it logs a warning and continues — artifact failure must not crash replay.
+	writeConsensusArtifact := func(filename string, data map[string]interface{}) {
+		logDir := mlog.GetLogDir()
+		if logDir == "" {
+			return
+		}
+		dir := filepath.Join(logDir, "consensus")
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			mlog.Log.Warnf("consensus artifact: failed to create directory %s: %v", dir, err)
+			return
+		}
+		artifactPath := filepath.Join(dir, filename)
+		artifactJSON, jsonErr := json.MarshalIndent(data, "", "  ")
+		if jsonErr != nil {
+			mlog.Log.Warnf("consensus artifact: failed to marshal JSON for %s: %v", filename, jsonErr)
+			return
+		}
+		if writeErr := os.WriteFile(artifactPath, artifactJSON, 0644); writeErr != nil {
+			mlog.Log.Warnf("consensus artifact: failed to write %s: %v", artifactPath, writeErr)
+			return
+		}
+		mlog.Log.FileOnlyf("consensus artifact written: %s", artifactPath)
+	}
+
+	// Forkchoice Lightbringer enforcement: track slots whose bankhash verification
+	// is deferred (votes haven't landed yet). Swept each iteration.
+	type pendingBankhashCheck struct {
+		slot     uint64
+		bankhash solana.Hash
+	}
+	var pendingBankhashChecks []pendingBankhashCheck
 
 	for {
 		// Start stall monitor goroutine (only after first block to avoid startup false positives)
@@ -1483,6 +1596,30 @@ func ReplayBlocks(
 			partitionedRewardsInfo = handleEpochTransition(acctsDb, partitionedEpochRewardsEnabled, lastSlotCtx, replayCtx, epochSchedule, replayCtx.CurrentFeatures, block, currentEpoch)
 			currentEpoch = block.Epoch
 			justCrossedEpochBoundary = true
+
+			// Refresh forkchoice with new epoch's stake weights and authorized voters
+			if global.HasForkChoice() {
+				forkChoice.UpdateEpoch(
+					currentEpoch,
+					global.EpochStakes(currentEpoch),
+					global.EpochTotalStake(currentEpoch),
+					global.EpochAuthorizedVoters(),
+				)
+			}
+
+			// Persist rebuilt authorized voters to state file so resume loads fresh data
+			if cache := global.EpochAuthorizedVoters(); cache != nil && mithrilState != nil {
+				updatedVoters := make(map[string][]string, cache.Len())
+				for voteAcct, voters := range cache.Entries() {
+					voterStrs := make([]string, len(voters))
+					for i, v := range voters {
+						voterStrs[i] = base58.Encode(v[:])
+					}
+					updatedVoters[base58.Encode(voteAcct[:])] = voterStrs
+				}
+				mithrilState.ManifestEpochAuthorizedVoters = updatedVoters
+			}
+
 			if len(newlyActivatedFeatures) != 0 {
 				block.EpochUpdatedAccts = append(block.EpochUpdatedAccts, newlyActivatedFeatures...)
 				block.ParentEpochUpdatedAccts = append(block.ParentEpochUpdatedAccts, parentNewlyActivatedFeatures...)
@@ -1558,6 +1695,180 @@ func ReplayBlocks(
 			// Clear any pending stake pubkeys from this failed block
 			global.ClearPendingStakePubkeys()
 			break
+		}
+
+		// Submit block to fork choice service for vote accumulation
+		if global.HasForkChoice() {
+			global.SubmitBlockToForkChoiceService(block.Slot, block.Transactions)
+		}
+
+		// Track processed blocks as candidates for skip-path chain verification.
+		// Uses bankhashes (not PoH hashes): Blockhash = our computed bankhash,
+		// LastBlockhash = parent bankhash. Skipped slots are omitted (solver handles gaps).
+		if candidateBlocks != nil {
+			candidateBlocks[block.Slot] = &forkchoice.SlotCandidate{
+				Slot:          block.Slot,
+				HasBlock:      true,
+				Blockhash:     solana.HashFromBytes(lastSlotCtx.FinalBankhash),
+				LastBlockhash: solana.Hash(block.ParentBankhash),
+			}
+			if !chainAnchorSet {
+				chainAnchorSlot = block.ParentSlot
+				chainAnchorHash = solana.Hash(block.ParentBankhash)
+				chainAnchorSet = true
+			}
+		}
+
+		// Consensus enforcement: verify bankhashes against vote-confirmed hashes.
+		// Slots with observed supermajority are confirmed immediately; the 32-slot
+		// timeout only applies to unresolved slots (no winner yet).
+		// Enforcement scope is controlled by consensus.enforce_on_source config.
+		if consensusEnforceActive && global.HasForkChoice() {
+			pendingBankhashChecks = append(pendingBankhashChecks, pendingBankhashCheck{
+				slot:     block.Slot,
+				bankhash: solana.HashFromBytes(lastSlotCtx.FinalBankhash),
+			})
+
+			// TTL: slots pending longer than 2x the confirmation timeout are definitively unresolvable.
+			const pendingTTLSlots = 2 * forkchoice.VoteConfirmationTimeoutSlots
+
+			// Track latest confirmed slot in this sweep for chain verification.
+			var latestConfirmedSlot uint64
+			var latestConfirmedHash solana.Hash
+
+			var remaining []pendingBankhashCheck
+			for _, pc := range pendingBankhashChecks {
+				confirmed := global.BankhashConfirmedForSlot(pc.slot, pc.bankhash)
+				switch confirmed.Status {
+				case forkchoice.BankhashHasSupermajority:
+					mlog.Log.Debugf("forkchoice: slot %d bankhash confirmed by supermajority", pc.slot)
+					if pc.slot > latestConfirmedSlot {
+						latestConfirmedSlot = pc.slot
+						latestConfirmedHash = confirmed.WinningHash
+					}
+
+				case forkchoice.BankhashNeedWait:
+					remaining = append(remaining, pc)
+
+				case forkchoice.BankhashNoSupermajority:
+					if confirmed.WinningHash != (solana.Hash{}) && confirmed.WinningHash != pc.bankhash {
+						// Our bankhash lost to a different supermajority hash — fork mismatch.
+						mlog.Log.Errorf("CONSENSUS MISMATCH: checked_slot=%d replay_slot=%d our=%s winning=%s (our_stake=%d winning_stake=%d/%d threshold=%d)",
+							pc.slot,
+							block.Slot,
+							base58.Encode(pc.bankhash[:]),
+							base58.Encode(confirmed.WinningHash[:]),
+							confirmed.StakeForHash,
+							confirmed.WinningStake,
+							confirmed.TotalEpochStake,
+							confirmed.ThresholdStake,
+						)
+
+						writeConsensusArtifact(
+							fmt.Sprintf("bankhash_mismatch_slot_%d.json", pc.slot),
+							map[string]interface{}{
+								"type":                          "bankhash_mismatch",
+								"checked_slot":                  pc.slot,
+								"observed_while_replaying_slot": block.Slot,
+								"our_bankhash":                  base58.Encode(pc.bankhash[:]),
+								"winning_bankhash":              base58.Encode(confirmed.WinningHash[:]),
+								"our_stake":                     confirmed.StakeForHash,
+								"winning_stake":                 confirmed.WinningStake,
+								"total_epoch_stake":             confirmed.TotalEpochStake,
+								"threshold_stake":               confirmed.ThresholdStake,
+								"confirmation_status":           confirmed.Status.String(),
+								"policy":                        consensusCoordinator.Policy(),
+								"pending_age_slots":             block.Slot - pc.slot,
+								"confirmation_timeout_slots":    forkchoice.VoteConfirmationTimeoutSlots,
+								"chain_anchor_slot":             chainAnchorSlot,
+								"chain_anchor_hash":             base58.Encode(chainAnchorHash[:]),
+								"run_id":                        CurrentRunID,
+							},
+						)
+
+						if consensusCoordinator.Policy() == "halt" {
+							result.Error = fmt.Errorf("consensus halt: slot %d bankhash mismatch (our=%s winning=%s)",
+								pc.slot, base58.Encode(pc.bankhash[:]), base58.Encode(confirmed.WinningHash[:]))
+							break
+						}
+						// policy == "warn": log already emitted, continue
+					} else if block.Slot > pc.slot+pendingTTLSlots {
+						// TTL expired — no supermajority emerged. Not a fork issue, just low participation.
+						mlog.Log.Debugf("forkchoice: slot %d no supermajority after TTL (our_stake=%d/%d)", pc.slot, confirmed.StakeForHash, confirmed.TotalEpochStake)
+					} else {
+						// No definitive result yet — keep checking.
+						remaining = append(remaining, pc)
+					}
+				}
+				if result.Error != nil {
+					break
+				}
+			}
+			pendingBankhashChecks = remaining
+
+			if result.Error != nil {
+				mlog.Log.Errorf("Triggering graceful shutdown due to consensus mismatch")
+				break
+			}
+
+			// Chain verification: use the skip-path solver to verify the bankhash chain
+			// from the last verified anchor to the latest confirmed slot. This validates
+			// that processed blocks chain correctly through parent bankhashes.
+			if candidateBlocks != nil && chainAnchorSet && latestConfirmedSlot > chainAnchorSlot {
+				_, resolveErr := consensusCoordinator.ResolveRange(
+					chainAnchorSlot+1, latestConfirmedSlot, chainAnchorHash, candidateBlocks)
+				if resolveErr != nil {
+					if errors.Is(resolveErr, forkchoice.ErrNoPath) {
+						mlog.Log.Errorf("CHAIN VERIFICATION FAILED: no valid bankhash chain from slot %d to %d (while replaying slot %d)",
+							chainAnchorSlot+1, latestConfirmedSlot, block.Slot)
+						writeConsensusArtifact(
+							fmt.Sprintf("chain_verification_failure_%d_%d.json", chainAnchorSlot+1, latestConfirmedSlot),
+							map[string]interface{}{
+								"type":                          "chain_verification_failure",
+								"start_slot":                    chainAnchorSlot + 1,
+								"end_slot":                      latestConfirmedSlot,
+								"anchor_slot":                   chainAnchorSlot,
+								"anchor_hash":                   base58.Encode(chainAnchorHash[:]),
+								"target_slot":                   latestConfirmedSlot,
+								"target_hash":                   base58.Encode(latestConfirmedHash[:]),
+								"observed_while_replaying_slot": block.Slot,
+								"reason":                        "no_path",
+								"policy":                        consensusCoordinator.Policy(),
+								"candidate_count":               len(candidateBlocks),
+								"run_id":                        CurrentRunID,
+							},
+						)
+						if consensusCoordinator.Policy() == "halt" {
+							result.Error = fmt.Errorf("consensus halt: chain verification failed (slots %d-%d)",
+								chainAnchorSlot+1, latestConfirmedSlot)
+						}
+					} else if errors.Is(resolveErr, forkchoice.ErrDepthExceeded) {
+						// Range too large for solver — not a chain error, just advance the anchor.
+						mlog.Log.Debugf("forkchoice: chain verification skipped (depth exceeded for slots %d-%d), advancing anchor",
+							chainAnchorSlot+1, latestConfirmedSlot)
+					} else {
+						mlog.Log.Debugf("forkchoice: chain verification deferred for slots %d-%d: %v",
+							chainAnchorSlot+1, latestConfirmedSlot, resolveErr)
+					}
+				} else {
+					mlog.Log.Debugf("forkchoice: chain verified slots %d-%d via skip-path solver",
+						chainAnchorSlot+1, latestConfirmedSlot)
+				}
+				// Advance anchor regardless — verified or not, we won't re-check this range.
+				chainAnchorSlot = latestConfirmedSlot
+				chainAnchorHash = latestConfirmedHash
+				// Clean up old candidates to bound memory usage.
+				for slot := range candidateBlocks {
+					if slot <= latestConfirmedSlot {
+						delete(candidateBlocks, slot)
+					}
+				}
+
+				if result.Error != nil {
+					mlog.Log.Errorf("Triggering graceful shutdown due to chain verification failure")
+					break
+				}
+			}
 		}
 
 		replayCtx.Capitalization -= lastSlotCtx.LamportsBurnt
@@ -2216,15 +2527,9 @@ func ProcessBlock(
 	slotCtx.FinalBankhash = bankhash.CalculateBankHash(slotCtx, writableAccts, modifiedAccts, block.ParentBankhash, block.NumSignatures, block.Blockhash)
 	metrics.GlobalBlockReplay.BankHash.AddTimingSince(start)
 
-	/*confirmed := global.BankhashConfirmedForSlot(slotCtx.Slot, solana.HashFromBytes(slotCtx.FinalBankhash))
-	for confirmed == forkchoice.BankhashNeedWait {
-		confirmed = global.BankhashConfirmedForSlot(slotCtx.Slot, solana.HashFromBytes(slotCtx.FinalBankhash))
-	}*/
-
-	// this slot should be skipped.
-	/*if confirmed == forkchoice.BankhashNoSupermajority {
-		// TODO: return signal that slot should be skipped
-	}*/
+	// Bankhash consensus enforcement is handled in the replay loop (not here)
+	// because forkchoice is fed after ProcessBlock returns — checking here would
+	// never see votes from recently submitted blocks and could deadlock.
 
 	// Enter critical commit window - panics here may leave AccountsDB inconsistent
 	commitSlot.Store(slotCtx.Slot)
