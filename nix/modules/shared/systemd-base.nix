@@ -53,7 +53,6 @@ in {
         StateDirectory = "mithril";
         CacheDirectory = "mithril";
         RuntimeDirectory = "mithril";
-        CredentialsDirectory = "mithril";
         ReadWritePaths = rwPaths;
       }
       // lib.optionalAttrs fileLoggingEnabled {
