@@ -512,28 +512,33 @@
         description = "Log level.";
       };
 
-      logToStdout = lib.mkOption {
-        type = lib.types.bool;
-        default = true;
-        description = "Log to stdout.";
+      logTarget = lib.mkOption {
+        type = lib.types.enum ["file" "journald" "both"];
+        default = "both";
+        description = ''
+          Where to send logs.
+          - "file": write log files only (no stdout).
+          - "journald": log to stdout only (captured by journald on NixOS, system log on macOS).
+          - "both": log to both stdout and files.
+        '';
       };
 
       logMaxSizeMb = lib.mkOption {
         type = lib.types.int;
         default = 100;
-        description = "Max log file size (MB).";
+        description = "Max log file size (MB). Only applies when logTarget includes file logging.";
       };
 
       logMaxAgeDays = lib.mkOption {
         type = lib.types.int;
         default = 30;
-        description = "Max log file age (days).";
+        description = "Max log file age (days). Only applies when logTarget includes file logging.";
       };
 
       logMaxBackups = lib.mkOption {
         type = lib.types.int;
         default = 100;
-        description = "Max log backups (0 = unlimited).";
+        description = "Max log backups (0 = unlimited). Only applies when logTarget includes file logging.";
       };
     };
 

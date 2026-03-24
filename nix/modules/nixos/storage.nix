@@ -24,6 +24,18 @@
     if cfg.storage.singleDisk.mountPoint != null
     then "${escapeSystemdPath cfg.storage.singleDisk.mountPoint}.mount"
     else null;
+  singleDeviceUnit =
+    if cfg.storage.singleDisk.device != null
+    then "${escapeSystemdPath cfg.storage.singleDisk.device}.device"
+    else null;
+  accountsDeviceUnit =
+    if cfg.storage.accounts.device != null
+    then "${escapeSystemdPath cfg.storage.accounts.device}.device"
+    else null;
+  blocksDeviceUnit =
+    if cfg.storage.blocks.device != null
+    then "${escapeSystemdPath cfg.storage.blocks.device}.device"
+    else null;
 in {
   config = lib.mkIf cfg.enable {
     assertions = [
@@ -102,139 +114,124 @@ in {
       })
     ];
 
-    systemd.services = lib.mkMerge [
-      (lib.mkIf (cfg.storage.singleDisk.enable && cfg.storage.singleDisk.format.enable) {
-        mithril-format-single = {
-          description = "Format Mithril single disk if needed";
-          before = [singleMountUnit];
-          requiredBy = [singleMountUnit];
-          serviceConfig = {
-            Type = "oneshot";
-            RemainAfterExit = true;
-          };
-          path = [
-            pkgs.util-linux
-            pkgs.e2fsprogs
-            pkgs.xfsprogs
-            pkgs.f2fs-tools
-          ];
-          script = ''
-            set -euo pipefail
-            device="${cfg.storage.singleDisk.device}"
-            fstype="${cfg.storage.singleDisk.fsType}"
-            label="${cfg.storage.singleDisk.format.label}"
-            existing="$(blkid -o value -s TYPE "$device" || true)"
-            if [ -n "$existing" ] && [ "${
-              if cfg.storage.singleDisk.format.force
-              then "true"
-              else "false"
-            }" != "true" ]; then
-              echo "Single disk already formatted as $existing. Skipping."
+    systemd.services = let
+      # blkid exit codes: 0 = found, 2 = no filesystem, anything else = error.
+      # The old script used `|| true` which swallowed all errors, so if blkid
+      # failed (device not ready, permission denied, etc.) the script would
+      # see an empty $existing and reformat the drive on every boot.
+      mkFormatScript = {
+        device,
+        fsType,
+        label,
+        force,
+        diskLabel,
+      }: ''
+        set -euo pipefail
+        device="${device}"
+        fstype="${fsType}"
+        label="${label}"
+
+        if [ ! -b "$device" ]; then
+          echo "${diskLabel}: device $device not found, refusing to format" >&2
+          exit 1
+        fi
+
+        rc=0
+        existing="$(blkid -o value -s TYPE "$device")" || rc=$?
+        if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
+          echo "${diskLabel}: blkid failed (exit $rc), refusing to format" >&2
+          exit 1
+        fi
+
+        ${
+          if force
+          then ''
+            if [ -n "$existing" ]; then
+              echo "${diskLabel}: wiping existing $existing filesystem (force=true)"
+              wipefs -a "$device"
+            fi
+          ''
+          else ''
+            if [ -n "$existing" ]; then
+              echo "${diskLabel}: already formatted as $existing. Skipping."
               exit 0
             fi
-            if [ "${
-              if cfg.storage.singleDisk.format.force
-              then "true"
-              else "false"
-            }" = "true" ]; then
-              wipefs -a "$device" || true
-            fi
-            case "$fstype" in
-              ext4) mkfs.ext4 -F -L "$label" "$device" ;;
-              xfs)  mkfs.xfs -f -L "$label" "$device" ;;
-              f2fs) mkfs.f2fs -f -l "$label" "$device" ;;
-            esac
-          '';
-        };
-      })
-      (lib.mkIf (cfg.storage.accounts.device != null && cfg.storage.accounts.format.enable) {
-        mithril-format-accounts = {
-          description = "Format Mithril AccountsDB disk if needed";
-          before = [accountsMountUnit];
-          requiredBy = [accountsMountUnit];
-          serviceConfig = {
-            Type = "oneshot";
-            RemainAfterExit = true;
+          ''
+        }
+
+        echo "${diskLabel}: formatting $device as $fstype (label=$label)"
+        case "$fstype" in
+          ext4) mkfs.ext4 -F -L "$label" "$device" ;;
+          xfs)  mkfs.xfs -f -L "$label" "$device" ;;
+          f2fs) mkfs.f2fs -f -l "$label" "$device" ;;
+        esac
+      '';
+      formatServiceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+      };
+      formatPath = [
+        pkgs.util-linux
+        pkgs.e2fsprogs
+        pkgs.xfsprogs
+        pkgs.f2fs-tools
+      ];
+    in
+      lib.mkMerge [
+        (lib.mkIf (cfg.storage.singleDisk.enable && cfg.storage.singleDisk.format.enable) {
+          mithril-format-single = {
+            description = "Format Mithril single disk if needed";
+            after = [singleDeviceUnit];
+            requires = [singleDeviceUnit];
+            before = [singleMountUnit];
+            requiredBy = [singleMountUnit];
+            serviceConfig = formatServiceConfig;
+            path = formatPath;
+            script = mkFormatScript {
+              device = cfg.storage.singleDisk.device;
+              fsType = cfg.storage.singleDisk.fsType;
+              label = cfg.storage.singleDisk.format.label;
+              force = cfg.storage.singleDisk.format.force;
+              diskLabel = "single-disk";
+            };
           };
-          path = [
-            pkgs.util-linux
-            pkgs.e2fsprogs
-            pkgs.xfsprogs
-            pkgs.f2fs-tools
-          ];
-          script = ''
-            set -euo pipefail
-            device="${cfg.storage.accounts.device}"
-            fstype="${cfg.storage.accounts.fsType}"
-            label="${cfg.storage.accounts.format.label}"
-            existing="$(blkid -o value -s TYPE "$device" || true)"
-            if [ -n "$existing" ] && [ "${
-              if cfg.storage.accounts.format.force
-              then "true"
-              else "false"
-            }" != "true" ]; then
-              echo "Accounts disk already formatted as $existing. Skipping."
-              exit 0
-            fi
-            if [ "${
-              if cfg.storage.accounts.format.force
-              then "true"
-              else "false"
-            }" = "true" ]; then
-              wipefs -a "$device" || true
-            fi
-            case "$fstype" in
-              ext4) mkfs.ext4 -F -L "$label" "$device" ;;
-              xfs)  mkfs.xfs -f -L "$label" "$device" ;;
-              f2fs) mkfs.f2fs -f -l "$label" "$device" ;;
-            esac
-          '';
-        };
-      })
-      (lib.mkIf (cfg.storage.blocks.device != null && cfg.storage.blocks.format.enable) {
-        mithril-format-blocks = {
-          description = "Format Mithril blocks disk if needed";
-          before = [blocksMountUnit];
-          requiredBy = [blocksMountUnit];
-          serviceConfig = {
-            Type = "oneshot";
-            RemainAfterExit = true;
+        })
+        (lib.mkIf (cfg.storage.accounts.device != null && cfg.storage.accounts.format.enable) {
+          mithril-format-accounts = {
+            description = "Format Mithril AccountsDB disk if needed";
+            after = [accountsDeviceUnit];
+            requires = [accountsDeviceUnit];
+            before = [accountsMountUnit];
+            requiredBy = [accountsMountUnit];
+            serviceConfig = formatServiceConfig;
+            path = formatPath;
+            script = mkFormatScript {
+              device = cfg.storage.accounts.device;
+              fsType = cfg.storage.accounts.fsType;
+              label = cfg.storage.accounts.format.label;
+              force = cfg.storage.accounts.format.force;
+              diskLabel = "accounts";
+            };
           };
-          path = [
-            pkgs.util-linux
-            pkgs.e2fsprogs
-            pkgs.xfsprogs
-            pkgs.f2fs-tools
-          ];
-          script = ''
-            set -euo pipefail
-            device="${cfg.storage.blocks.device}"
-            fstype="${cfg.storage.blocks.fsType}"
-            label="${cfg.storage.blocks.format.label}"
-            existing="$(blkid -o value -s TYPE "$device" || true)"
-            if [ -n "$existing" ] && [ "${
-              if cfg.storage.blocks.format.force
-              then "true"
-              else "false"
-            }" != "true" ]; then
-              echo "Blocks disk already formatted as $existing. Skipping."
-              exit 0
-            fi
-            if [ "${
-              if cfg.storage.blocks.format.force
-              then "true"
-              else "false"
-            }" = "true" ]; then
-              wipefs -a "$device" || true
-            fi
-            case "$fstype" in
-              ext4) mkfs.ext4 -F -L "$label" "$device" ;;
-              xfs)  mkfs.xfs -f -L "$label" "$device" ;;
-              f2fs) mkfs.f2fs -f -l "$label" "$device" ;;
-            esac
-          '';
-        };
-      })
-    ];
+        })
+        (lib.mkIf (cfg.storage.blocks.device != null && cfg.storage.blocks.format.enable) {
+          mithril-format-blocks = {
+            description = "Format Mithril blocks disk if needed";
+            after = [blocksDeviceUnit];
+            requires = [blocksDeviceUnit];
+            before = [blocksMountUnit];
+            requiredBy = [blocksMountUnit];
+            serviceConfig = formatServiceConfig;
+            path = formatPath;
+            script = mkFormatScript {
+              device = cfg.storage.blocks.device;
+              fsType = cfg.storage.blocks.fsType;
+              label = cfg.storage.blocks.format.label;
+              force = cfg.storage.blocks.format.force;
+              diskLabel = "blocks";
+            };
+          };
+        })
+      ];
   };
 }

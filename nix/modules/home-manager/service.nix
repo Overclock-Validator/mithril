@@ -20,8 +20,11 @@
     if pkgs.stdenv.isDarwin && cfg.darwin.paths.blocksRoot != null
     then cfg.darwin.paths.blocksRoot
     else "${stateDir}/blocks";
+  fileLoggingEnabled = cfg.configSchema.logTarget == "file" || cfg.configSchema.logTarget == "both";
   logsPath =
-    if pkgs.stdenv.isDarwin && cfg.darwin.paths.logsDir != null
+    if !fileLoggingEnabled
+    then null
+    else if pkgs.stdenv.isDarwin && cfg.darwin.paths.logsDir != null
     then cfg.darwin.paths.logsDir
     else cfg.configSchema.storageLogs;
   shared = import ../shared/lib.nix {inherit lib pkgs;};
@@ -29,7 +32,10 @@
     inherit cfg;
     accountsPath = "@STATE_DIRECTORY@/accounts";
     blocksRoot = "@STATE_DIRECTORY@/blocks";
-    logsPath = "@LOGS_DIRECTORY@";
+    logsPath =
+      if fileLoggingEnabled
+      then "@LOGS_DIRECTORY@"
+      else null;
   };
   configInitScript = pkgs.writeShellScript "mithril-generate-config-user" ''
     set -euo pipefail
@@ -132,12 +138,9 @@ in {
   config = lib.mkIf cfg.enable (
     lib.mkMerge [
       {
-        assertions = [
-          {
-            assertion = !(cfg.configFile != null && cfg.environmentFile != null);
-            message = "services.mithril.configFile and services.mithril.environmentFile cannot both be set.";
-          }
-        ];
+        warnings =
+          lib.optional (cfg.configFile != null && cfg.environmentFile != null)
+          (builtins.throw "services.mithril.configFile and services.mithril.environmentFile cannot both be set.");
       }
       (lib.mkIf (effectiveGenerate && pkgs.stdenv.isDarwin) {
         xdg.configFile."mithril/config.toml".source = shared.mkConfigToml {

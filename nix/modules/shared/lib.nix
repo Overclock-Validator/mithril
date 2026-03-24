@@ -21,8 +21,11 @@
       if cfg.configSchema.storageSnapshots != null
       then cfg.configSchema.storageSnapshots
       else "${blocksRoot}/snapshots";
+    fileLoggingEnabled = cfg.configSchema.logTarget == "file" || cfg.configSchema.logTarget == "both";
     storageLogs =
-      if cfg.configSchema.storageLogs != null
+      if !fileLoggingEnabled
+      then null
+      else if cfg.configSchema.storageLogs != null
       then cfg.configSchema.storageLogs
       else logsPath;
     baseConfig = {
@@ -99,12 +102,24 @@
         max_snapshot_url_attempts = cfg.configSchema.snapshotMaxSnapshotUrlAttempts;
         min_incremental_speed_mbs = cfg.configSchema.snapshotMinIncrementalSpeedMbs;
       };
-      log = {
+      log = let
+        fileEnabled = cfg.configSchema.logTarget == "file" || cfg.configSchema.logTarget == "both";
+        stdoutEnabled = cfg.configSchema.logTarget == "journald" || cfg.configSchema.logTarget == "both";
+      in {
         level = cfg.configSchema.logLevel;
-        to_stdout = cfg.configSchema.logToStdout;
-        max_size_mb = cfg.configSchema.logMaxSizeMb;
-        max_age_days = cfg.configSchema.logMaxAgeDays;
-        max_backups = cfg.configSchema.logMaxBackups;
+        to_stdout = stdoutEnabled;
+        max_size_mb =
+          if fileEnabled
+          then cfg.configSchema.logMaxSizeMb
+          else null;
+        max_age_days =
+          if fileEnabled
+          then cfg.configSchema.logMaxAgeDays
+          else null;
+        max_backups =
+          if fileEnabled
+          then cfg.configSchema.logMaxBackups
+          else null;
       };
     };
     finalConfig = removeNulls (lib.recursiveUpdate baseConfig cfg.config.settings);

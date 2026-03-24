@@ -25,6 +25,7 @@
         "-c"
         "${cfg.package}/bin/mithril run --config \"${configPath}\""
       ];
+  fileLoggingEnabled = cfg.configSchema.logTarget == "file" || cfg.configSchema.logTarget == "both";
   rwPaths =
     lib.filter (p: p != null) (
       if cfg.storage.singleDisk.enable
@@ -34,7 +35,7 @@
         cfg.storage.blocks.mountPoint
       ]
     )
-    ++ lib.optional (cfg.configSchema.storageLogs != null) cfg.configSchema.storageLogs;
+    ++ lib.optional (fileLoggingEnabled && cfg.configSchema.storageLogs != null) cfg.configSchema.storageLogs;
 in {
   baseUnit = {
     unitConfig = {
@@ -53,8 +54,10 @@ in {
         CacheDirectory = "mithril";
         RuntimeDirectory = "mithril";
         CredentialsDirectory = "mithril";
-        LogsDirectory = "mithril";
         ReadWritePaths = rwPaths;
+      }
+      // lib.optionalAttrs fileLoggingEnabled {
+        LogsDirectory = "mithril";
       }
       // lib.optionalAttrs (cfg.environmentFile != null) {
         EnvironmentFile = [cfg.environmentFile];

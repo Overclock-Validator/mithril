@@ -23,12 +23,16 @@
     if cfg.storage.singleDisk.mountPoint != null
     then "${escapeSystemdPath cfg.storage.singleDisk.mountPoint}.mount"
     else null;
+  fileLoggingEnabled = cfg.configSchema.logTarget == "file" || cfg.configSchema.logTarget == "both";
   shared = import ../shared/lib.nix {inherit lib pkgs;};
   configTemplate = shared.mkConfigTomlTemplate {
     inherit cfg;
     accountsPath = "@STATE_DIRECTORY@/accounts";
     blocksRoot = "@STATE_DIRECTORY@/blocks";
-    logsPath = "@LOGS_DIRECTORY@";
+    logsPath =
+      if fileLoggingEnabled
+      then "@LOGS_DIRECTORY@"
+      else null;
   };
   mkdirsScript = pkgs.writeShellScript "mithril-mkdirs" ''
     set -euo pipefail
@@ -99,7 +103,7 @@
     then cfg.storage.blocks.mountPoint
     else "";
   logsMountPoint =
-    if cfg.configSchema.storageLogs != null
+    if fileLoggingEnabled && cfg.configSchema.storageLogs != null
     then cfg.configSchema.storageLogs
     else "";
 in {
