@@ -41,7 +41,7 @@
     set -euo pipefail
     config_dir="$CONFIGURATION_DIRECTORY"
     state_dir="$STATE_DIRECTORY"
-    logs_dir="$LOGS_DIRECTORY"
+    logs_dir="''${LOGS_DIRECTORY:-}"
     runtime_dir="$RUNTIME_DIRECTORY"
     mkdir -p "$config_dir"
     mkdir -p "$runtime_dir"
