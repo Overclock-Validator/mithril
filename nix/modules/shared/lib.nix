@@ -23,9 +23,7 @@
       else "${blocksRoot}/snapshots";
     fileLoggingEnabled = cfg.configSchema.logTarget == "file" || cfg.configSchema.logTarget == "both";
     storageLogs =
-      if !fileLoggingEnabled
-      then null
-      else if cfg.configSchema.storageLogs != null
+      if cfg.configSchema.storageLogs != null
       then cfg.configSchema.storageLogs
       else logsPath;
     baseConfig = {

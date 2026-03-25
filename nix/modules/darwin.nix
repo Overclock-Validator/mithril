@@ -27,11 +27,11 @@
     else "${stateDir}/blocks";
   fileLoggingEnabled = cfg.configSchema.logTarget == "file" || cfg.configSchema.logTarget == "both";
   logsPath =
-    if !fileLoggingEnabled
-    then null
-    else if cfg.darwin.paths.logsDir != null
+    if cfg.darwin.paths.logsDir != null
     then cfg.darwin.paths.logsDir
-    else defaultLogsPath;
+    else if fileLoggingEnabled
+    then defaultLogsPath
+    else "${stateDir}/logs";
   configSource = shared.mkConfigToml {
     inherit cfg;
     inherit accountsPath;

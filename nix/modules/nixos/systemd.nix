@@ -12,22 +12,13 @@
   };
 in {
   config = lib.mkIf (cfg.enable && !pkgs.stdenv.isDarwin) {
-    users.users.${cfg.user} = lib.mkIf (cfg.user != null) {
-      isSystemUser = true;
-      group = cfg.group;
-    };
-    users.groups.${cfg.group} = lib.mkIf (cfg.group != null) {};
-
     systemd.services.mithril =
       baseUnit
       // {
         serviceConfig =
           baseUnit.serviceConfig
           // {
-            User = cfg.user;
-            Group = cfg.group;
-            DynamicUser = false;
-            PermissionsStartOnly = true;
+            DynamicUser = true;
           };
         wantedBy = ["multi-user.target"];
       };

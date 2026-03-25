@@ -35,7 +35,7 @@
     logsPath =
       if fileLoggingEnabled
       then "@LOGS_DIRECTORY@"
-      else null;
+      else "@STATE_DIRECTORY@/logs";
   };
   configInitScript = pkgs.writeShellScript "mithril-generate-config-user" ''
     set -euo pipefail

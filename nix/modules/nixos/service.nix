@@ -32,18 +32,18 @@
     logsPath =
       if fileLoggingEnabled
       then "@LOGS_DIRECTORY@"
-      else null;
+      else "@STATE_DIRECTORY@/logs";
   };
   mkdirsScript = pkgs.writeShellScript "mithril-mkdirs" ''
     set -euo pipefail
     if [ -n "${accountsMountPoint}" ]; then
-      install -d -m 0755 -o ${cfg.user} -g ${cfg.group} "${accountsMountPoint}"
+      install -d -m 0755 "${accountsMountPoint}"
     fi
     if [ -n "${blocksMountPoint}" ]; then
-      install -d -m 0755 -o ${cfg.user} -g ${cfg.group} "${blocksMountPoint}"
+      install -d -m 0755 "${blocksMountPoint}"
     fi
     if [ -n "${logsMountPoint}" ]; then
-      install -d -m 0755 -o ${cfg.user} -g ${cfg.group} "${logsMountPoint}"
+      install -d -m 0755 "${logsMountPoint}"
     fi
   '';
   configInitScript = pkgs.writeShellScript "mithril-generate-config" ''
@@ -135,8 +135,8 @@ in {
           ++ lib.optional (cfg.storage.blocks.device != null && blocksMountUnit != null) blocksMountUnit;
 
         serviceConfig.ExecStartPre =
-          [mkdirsScript]
-          ++ lib.optionals (effectiveGenerate && cfg.configFile == null) [configInitScript];
+          ["+${mkdirsScript}"]
+          ++ lib.optionals (effectiveGenerate && cfg.configFile == null) ["+${configInitScript}"];
       };
 
       mithril-thp = lib.mkIf cfg.performance.enable {

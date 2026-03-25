@@ -49,6 +49,7 @@ in {
         Restart = "on-failure";
         RestartSec = "5s";
         Environment = environmentList;
+        WorkingDirectory = "%S/mithril";
         ConfigurationDirectory = "mithril";
         StateDirectory = "mithril";
         CacheDirectory = "mithril";
