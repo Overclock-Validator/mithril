@@ -24,11 +24,21 @@
     then "${escapeSystemdPath cfg.storage.singleDisk.mountPoint}.mount"
     else null;
   fileLoggingEnabled = cfg.configSchema.logTarget == "file" || cfg.configSchema.logTarget == "both";
+  hasExternalStorage =
+    cfg.storage.singleDisk.enable
+    || cfg.storage.accounts.device != null
+    || cfg.storage.blocks.device != null;
   shared = import ../shared/lib.nix {inherit lib pkgs;};
   configTemplate = shared.mkConfigTomlTemplate {
     inherit cfg;
-    accountsPath = "@STATE_DIRECTORY@/accounts";
-    blocksRoot = "@STATE_DIRECTORY@/blocks";
+    accountsPath =
+      if cfg.storage.accounts.mountPoint != null
+      then cfg.storage.accounts.mountPoint
+      else "@STATE_DIRECTORY@/accounts";
+    blocksRoot =
+      if cfg.storage.blocks.mountPoint != null
+      then cfg.storage.blocks.mountPoint
+      else "@STATE_DIRECTORY@/blocks";
     logsPath =
       if fileLoggingEnabled
       then "@LOGS_DIRECTORY@"
@@ -36,14 +46,31 @@
   };
   mkdirsScript = pkgs.writeShellScript "mithril-mkdirs" ''
     set -euo pipefail
+    ${lib.optionalString hasExternalStorage ''
+      # External storage mounts are root-owned after mkfs.
+      # Chown mount point roots so the DynamicUser can write.
+      if [ -n "${singleDiskMountPoint}" ]; then
+        chown "${cfg.user}:${cfg.group}" "${singleDiskMountPoint}"
+      fi
+      ${lib.optionalString (cfg.storage.accounts.device != null) ''
+        if [ -n "${accountsMountPoint}" ]; then
+          chown "${cfg.user}:${cfg.group}" "${accountsMountPoint}"
+        fi
+      ''}
+      ${lib.optionalString (cfg.storage.blocks.device != null) ''
+        if [ -n "${blocksMountPoint}" ]; then
+          chown "${cfg.user}:${cfg.group}" "${blocksMountPoint}"
+        fi
+      ''}
+    ''}
     if [ -n "${accountsMountPoint}" ]; then
-      install -d -m 0755 "${accountsMountPoint}"
+      install -d -m 0755 ${lib.optionalString hasExternalStorage "-o ${cfg.user} -g ${cfg.group}"} "${accountsMountPoint}"
     fi
     if [ -n "${blocksMountPoint}" ]; then
-      install -d -m 0755 "${blocksMountPoint}"
+      install -d -m 0755 ${lib.optionalString hasExternalStorage "-o ${cfg.user} -g ${cfg.group}"} "${blocksMountPoint}"
     fi
     if [ -n "${logsMountPoint}" ]; then
-      install -d -m 0755 "${logsMountPoint}"
+      install -d -m 0755 ${lib.optionalString hasExternalStorage "-o ${cfg.user} -g ${cfg.group}"} "${logsMountPoint}"
     fi
   '';
   configInitScript = pkgs.writeShellScript "mithril-generate-config" ''
@@ -94,6 +121,10 @@
     ' "$config_dir/config.toml" > "$runtime_dir/config.toml.tmp"
     mv "$runtime_dir/config.toml.tmp" "$config_dir/config.toml"
   '';
+  singleDiskMountPoint =
+    if cfg.storage.singleDisk.mountPoint != null
+    then cfg.storage.singleDisk.mountPoint
+    else "";
   accountsMountPoint =
     if cfg.storage.accounts.mountPoint != null
     then cfg.storage.accounts.mountPoint

@@ -10,8 +10,7 @@
     escaped = lib.replaceStrings ["-"] ["\\x2d"] stripped;
   in
     lib.replaceStrings ["/"] ["-"] escaped;
-  dirName = "mithril";
-  stateDir = "/var/lib/${dirName}";
+  dataDir = cfg.storage.dataDir;
   accountsMountUnit =
     if cfg.storage.accounts.mountPoint != null
     then "${escapeSystemdPath cfg.storage.accounts.mountPoint}.mount"
@@ -63,21 +62,25 @@ in {
         assertion = !(cfg.storage.blocks.device != null && cfg.storage.blocks.mountPoint == null);
         message = "services.mithril.storage.blocks.device requires storage.blocks.mountPoint.";
       }
+      {
+        assertion = !lib.hasPrefix "/var/lib/mithril" cfg.storage.dataDir;
+        message = "services.mithril.storage.dataDir must not be under /var/lib/mithril — it conflicts with the systemd StateDirectory used by DynamicUser.";
+      }
     ];
 
     services.mithril.storage = {
       singleDisk.mountPoint = lib.mkIf cfg.storage.singleDisk.enable (
-        lib.mkDefault stateDir
+        lib.mkDefault dataDir
       );
       accounts.mountPoint = lib.mkDefault (
         if cfg.storage.singleDisk.enable
         then "${cfg.storage.singleDisk.mountPoint}/accounts"
-        else "${stateDir}/accounts"
+        else "${dataDir}/accounts"
       );
       blocks.mountPoint = lib.mkDefault (
         if cfg.storage.singleDisk.enable
         then "${cfg.storage.singleDisk.mountPoint}/blocks"
-        else "${stateDir}/blocks"
+        else "${dataDir}/blocks"
       );
     };
 

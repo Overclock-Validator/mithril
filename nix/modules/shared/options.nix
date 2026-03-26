@@ -19,6 +19,12 @@
     };
 
     storage = {
+      dataDir = lib.mkOption {
+        type = lib.types.str;
+        default = "/var/mithril";
+        description = "Base directory for Mithril data when using external storage.";
+      };
+
       singleDisk = {
         enable = lib.mkOption {
           type = lib.types.bool;
