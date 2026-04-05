@@ -11,6 +11,7 @@ import (
 type Accounts interface {
 	GetAccount(pubkey *[32]byte) (*Account, error)
 	SetAccount(pubkey *[32]byte, acc *Account) error
+	SetAccounts(accts []*Account) error
 	AllAccounts() []*Account
 	SetAccountWithoutLock(pubkey solana.PublicKey, acc *Account) error
 	GetAccountWithoutLock(pubkey solana.PublicKey) (*Account, error)
@@ -25,6 +26,15 @@ type Account struct {
 	Executable bool
 	RentEpoch  uint64
 	IsDummy    bool
+	storage    storageInfo
+}
+
+type storageInfo struct {
+	Slot    uint64
+	FileId  uint64
+	Offset  uint64
+	DataLen uint64
+	Valid   bool
 }
 
 const NativeLoaderAddrStr = "NativeLoader1111111111111111111111111111111"
@@ -77,7 +87,30 @@ func (a *Account) Clone() *Account {
 	return &newCopy
 }
 
+func (a *Account) StorageInfo() (slot uint64, fileId uint64, offset uint64, dataLen uint64, ok bool) {
+	if !a.storage.Valid {
+		return 0, 0, 0, 0, false
+	}
+	return a.storage.Slot, a.storage.FileId, a.storage.Offset, a.storage.DataLen, true
+}
+
+func (a *Account) SetStorageInfo(slot uint64, fileId uint64, offset uint64, dataLen uint64) {
+	a.storage = storageInfo{
+		Slot:    slot,
+		FileId:  fileId,
+		Offset:  offset,
+		DataLen: dataLen,
+		Valid:   true,
+	}
+}
+
+func (a *Account) ClearStorageInfo() {
+	a.storage = storageInfo{}
+}
+
 func (a *Account) UnmarshalWithDecoder(decoder *bin.Decoder) (err error) {
+	a.ClearStorageInfo()
+
 	a.Slot, err = decoder.ReadUint64(bin.LE)
 	if err != nil {
 		return err

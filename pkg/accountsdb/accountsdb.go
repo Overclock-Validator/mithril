@@ -2,7 +2,6 @@ package accountsdb
 
 import (
 	"bufio"
-	"bytes"
 	"container/list"
 	"context"
 	"encoding/binary"
@@ -30,6 +29,7 @@ type AccountsDb struct {
 	BankHashStore    *pebble.DB
 	AcctsDir         string
 	LargestFileId    atomic.Uint64
+	AppendVecFiles   *appendVecFileCache
 	VoteAcctCache    otter.Cache[solana.PublicKey, *accounts.Account]
 	CommonAcctsCache otter.Cache[solana.PublicKey, *accounts.Account]
 	ProgramCache     otter.Cache[solana.PublicKey, *ProgramCacheEntry]
@@ -69,6 +69,13 @@ var (
 	ErrNoAccount = errors.New("ErrNoAccount")
 
 	StoreAccountsWorkers = 128
+)
+
+const (
+	voteAccountCacheCapacityBytes   = 128 << 20
+	commonAccountCacheCapacityBytes = 512 << 20
+	programCacheCapacityEntries     = 2000
+	accountCacheEntryOverheadBytes  = 128
 )
 
 func OpenDb(accountsDbDir string) (*AccountsDb, error) {
@@ -111,7 +118,12 @@ func OpenDb(accountsDbDir string) (*AccountsDb, error) {
 		return nil, fmt.Errorf("opening bankhashDir=%s: %w", bankhashDir, err)
 	}
 
-	accountsDb := &AccountsDb{Index: db, BankHashStore: bankhashDb, AcctsDir: appendVecsDir}
+	accountsDb := &AccountsDb{
+		Index:          db,
+		BankHashStore:  bankhashDb,
+		AcctsDir:       appendVecsDir,
+		AppendVecFiles: newAppendVecFileCache(defaultAppendVecFileCacheCapacity),
+	}
 	accountsDb.LargestFileId.Store(largestFileId)
 
 	accountsDb.inProgressStoreRequests = list.New()
@@ -137,6 +149,11 @@ func (accountsDb *AccountsDb) WaitForStoreWorker() {
 
 func (accountsDb *AccountsDb) CloseDb() {
 	accountsDb.WaitForStoreWorker()
+	if accountsDb.AppendVecFiles != nil {
+		if err := accountsDb.AppendVecFiles.Close(); err != nil {
+			mlog.Log.Errorf("CloseDb: AppendVecFiles.Close() error: %v", err)
+		}
+	}
 	mlog.Log.Infof("CloseDb: syncing and closing Index...")
 	if err := accountsDb.Index.Close(); err != nil {
 		mlog.Log.Errorf("CloseDb: Index.Close() error: %v", err)
@@ -150,16 +167,14 @@ func (accountsDb *AccountsDb) CloseDb() {
 
 func (accountsDb *AccountsDb) InitCaches() {
 	var err error
-	accountsDb.VoteAcctCache, err = otter.MustBuilder[solana.PublicKey, *accounts.Account](2500).
-		Cost(func(key solana.PublicKey, acct *accounts.Account) uint32 {
-			return 1
-		}).
+	accountsDb.VoteAcctCache, err = otter.MustBuilder[solana.PublicKey, *accounts.Account](voteAccountCacheCapacityBytes).
+		Cost(accountCacheCost).
 		Build()
 	if err != nil {
 		panic(err)
 	}
 
-	accountsDb.ProgramCache, err = otter.MustBuilder[solana.PublicKey, *ProgramCacheEntry](2000).
+	accountsDb.ProgramCache, err = otter.MustBuilder[solana.PublicKey, *ProgramCacheEntry](programCacheCapacityEntries).
 		Cost(func(key solana.PublicKey, progEntry *ProgramCacheEntry) uint32 {
 			return 1
 		}).
@@ -168,14 +183,27 @@ func (accountsDb *AccountsDb) InitCaches() {
 		panic(err)
 	}
 
-	accountsDb.CommonAcctsCache, err = otter.MustBuilder[solana.PublicKey, *accounts.Account](5000).
-		Cost(func(key solana.PublicKey, acct *accounts.Account) uint32 {
-			return 1
-		}).
+	accountsDb.CommonAcctsCache, err = otter.MustBuilder[solana.PublicKey, *accounts.Account](commonAccountCacheCapacityBytes).
+		Cost(accountCacheCost).
 		Build()
 	if err != nil {
 		panic(err)
 	}
+}
+
+func accountCacheCost(_ solana.PublicKey, acct *accounts.Account) uint32 {
+	if acct == nil {
+		return 1
+	}
+
+	size := uint64(accountCacheEntryOverheadBytes) + uint64(len(acct.Data))
+	if size == 0 {
+		return 1
+	}
+	if size > uint64(^uint32(0)) {
+		return ^uint32(0)
+	}
+	return uint32(size)
 }
 
 type ProgramCacheEntry struct {
@@ -231,24 +259,14 @@ func (accountsDb *AccountsDb) getStoredAccount(slot uint64, pubkey solana.Public
 	}
 	c.Close()
 
-	appendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, acctIdxEntry.Slot, acctIdxEntry.FileId)
-
-	appendVecFile, err := os.Open(appendVecFileName)
+	appendVecFileName := accountsDb.appendVecFileName(acctIdxEntry.Slot, acctIdxEntry.FileId)
+	appendVecFile, release, err := accountsDb.AppendVecFiles.Acquire(appendVecFileName)
 	if err != nil {
-		//mlog.Log.Debugf("failed to open appendvec file %s")
 		return nil, err
 	}
-	defer appendVecFile.Close()
+	defer release()
 
-	offset, err := appendVecFile.Seek(int64(acctIdxEntry.Offset), 0)
-	if err != nil {
-		panic(fmt.Sprintf("file seek failed: %s\n", err))
-	}
-	if offset != int64(acctIdxEntry.Offset) {
-		panic(fmt.Sprintf("file seek gave wrong idx (%d)\n", offset))
-	}
-
-	acct, err := unmarshalAcctFromAppendVecAcctHeader(appendVecFile)
+	acct, err := readAppendVecAccountAt(appendVecFile, acctIdxEntry.Offset)
 	if err != nil {
 		panic(fmt.Sprintf("failed to unmarshal account from appendvec file %s: %s", appendVecFileName, err))
 	}
@@ -258,6 +276,7 @@ func (accountsDb *AccountsDb) getStoredAccount(slot uint64, pubkey solana.Public
 	}
 
 	acct.Slot = acctIdxEntry.Slot
+	acct.SetStorageInfo(acctIdxEntry.Slot, acctIdxEntry.FileId, acctIdxEntry.Offset, uint64(len(acct.Data)))
 
 	owner := solana.PublicKeyFromBytes(acct.Owner[:])
 	if owner == addresses.VoteProgramAddr {
@@ -267,6 +286,28 @@ func (accountsDb *AccountsDb) getStoredAccount(slot uint64, pubkey solana.Public
 	}
 
 	return acct, err
+}
+
+func (accountsDb *AccountsDb) tryFastOverwriteStoredAccount(acct *accounts.Account) (bool, error) {
+	storedSlot, storedFileId, storedOffset, storedDataLen, ok := acct.StorageInfo()
+	if !ok || uint64(len(acct.Data)) != storedDataLen {
+		return false, nil
+	}
+
+	appendVecFileName := accountsDb.appendVecFileName(storedSlot, storedFileId)
+	appendVecFile, release, err := accountsDb.AppendVecFiles.Acquire(appendVecFileName)
+	if err != nil {
+		return false, err
+	}
+	defer release()
+
+	err = writeAppendVecAccountAt(appendVecFile, storedOffset, appendVecAccountFromAccount(acct))
+	if err != nil {
+		return false, err
+	}
+
+	acct.SetStorageInfo(storedSlot, storedFileId, storedOffset, storedDataLen)
+	return true, nil
 }
 
 // Returns a slice of the same length as the input with results matching indexes, nil if not found.
@@ -355,17 +396,24 @@ func (accountsDb *AccountsDb) storeWorker() {
 }
 
 func (accountsDb *AccountsDb) storeAccountsInternal(accts []*accounts.Account, slot uint64) {
-	fileId := accountsDb.LargestFileId.Add(1)
-	appendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, slot, fileId)
-	appendVecFile, err := os.OpenFile(appendVecFileName, os.O_RDWR|os.O_CREATE, 0666)
-	if err != nil {
-		//mlog.Log.Debugf("unable to open appendvec file %s for writing to accountsdb", appendVecFileName)
-		panic(err)
-	}
-	defer appendVecFile.Close()
-
-	appendVecAcctsBuf := new(bytes.Buffer)
-	writer := new(bytes.Buffer)
+	var (
+		fileId              uint64
+		appendVecFile       *os.File
+		appendVecAcctsBuf   *bufio.Writer
+		appendVecFileOffset uint64
+	)
+	defer func() {
+		if appendVecAcctsBuf != nil {
+			if err := appendVecAcctsBuf.Flush(); err != nil {
+				panic(err)
+			}
+		}
+		if appendVecFile != nil {
+			if err := appendVecFile.Close(); err != nil {
+				panic(err)
+			}
+		}
+	}()
 	var acctIdxEntryBuf [24]byte
 
 	for _, acct := range accts {
@@ -373,12 +421,13 @@ func (accountsDb *AccountsDb) storeAccountsInternal(accts []*accounts.Account, s
 			continue
 		}
 
-		// create index entry, encode it and write it to the index kv store
-		// offset field is specified as the current num of bytes written to the appendvec buffer.
-		writer.Reset()
-
-		indexEntry := AccountIndexEntry{Slot: slot, FileId: fileId, Offset: uint64(appendVecAcctsBuf.Len())}
-		indexEntry.Marshal(&acctIdxEntryBuf)
+		ok, err := accountsDb.tryFastOverwriteStoredAccount(acct)
+		if err != nil {
+			panic(err)
+		}
+		if ok {
+			continue
+		}
 
 		// if an entry already existed in the index for this account, very often we can simply make the state update
 		// in-place, i.e. into the account's existing appendvec blob.
@@ -393,40 +442,43 @@ func (accountsDb *AccountsDb) storeAccountsInternal(accts []*accounts.Account, s
 			}
 			c.Close()
 
-			existingAppendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, acctIdxEntry.Slot, acctIdxEntry.FileId)
-			existingAppendVecFile, err := os.OpenFile(existingAppendVecFileName, os.O_RDWR, 0666)
+			existingAppendVecFileName := accountsDb.appendVecFileName(acctIdxEntry.Slot, acctIdxEntry.FileId)
+			existingAppendVecFile, release, err := accountsDb.AppendVecFiles.Acquire(existingAppendVecFileName)
 			if err != nil {
 				panic(err)
 			}
-
-			_, err = existingAppendVecFile.Seek(int64(acctIdxEntry.Offset), 0)
+			existingDataLen, err := GetAppendVecDataLen(existingAppendVecFile, acctIdxEntry.Offset)
 			if err != nil {
-				panic(err)
+				release()
+				panic(fmt.Sprintf("failed to read appendvec data len from %s: %s", existingAppendVecFileName, err))
 			}
 
-			existingAcct, err := unmarshalAcctFromAppendVecAcctHeader(existingAppendVecFile)
-			if err != nil {
-				panic(fmt.Sprintf("failed to unmarshal account from appendvec file %s: %s", existingAppendVecFileName, err))
-			}
-
-			if len(acct.Data) == len(existingAcct.Data) {
-				newAppendVecAcct := AppendVecAccount{DataLen: uint64(len(acct.Data)), Pubkey: acct.Key, Lamports: acct.Lamports,
-					RentEpoch: acct.RentEpoch, Owner: acct.Owner, Executable: acct.Executable, Data: acct.Data}
-
-				_, err = existingAppendVecFile.Seek(int64(acctIdxEntry.Offset), 0)
-				if err != nil {
-					panic(err)
-				}
-
-				err = newAppendVecAcct.Marshal(existingAppendVecFile)
+			if uint64(len(acct.Data)) == existingDataLen {
+				err = writeAppendVecAccountAt(existingAppendVecFile, acctIdxEntry.Offset, appendVecAccountFromAccount(acct))
+				release()
 				if err != nil {
 					panic(fmt.Sprintf("error marshaling appendvec for storage: %s", err))
 				}
-
-				existingAppendVecFile.Close()
+				acct.SetStorageInfo(acctIdxEntry.Slot, acctIdxEntry.FileId, acctIdxEntry.Offset, existingDataLen)
 				continue
 			}
+			release()
 		}
+
+		if appendVecAcctsBuf == nil {
+			fileId = accountsDb.LargestFileId.Add(1)
+			appendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, slot, fileId)
+			appendVecFile, err = os.OpenFile(appendVecFileName, os.O_RDWR|os.O_CREATE, 0666)
+			if err != nil {
+				panic(err)
+			}
+			appendVecAcctsBuf = bufio.NewWriter(appendVecFile)
+		}
+
+		// create index entry, encode it and write it to the index kv store
+		// offset field is specified as the current num of bytes written to the appendvec buffer.
+		indexEntry := AccountIndexEntry{Slot: slot, FileId: fileId, Offset: appendVecFileOffset}
+		indexEntry.Marshal(&acctIdxEntryBuf)
 
 		err = accountsDb.Index.Set(acct.Key[:], acctIdxEntryBuf[:], &pebble.WriteOptions{})
 		if err != nil {
@@ -434,19 +486,13 @@ func (accountsDb *AccountsDb) storeAccountsInternal(accts []*accounts.Account, s
 		}
 
 		// marshal up the account as an appendvec style account and write it to the buffer
-		appendVecAcct := AppendVecAccount{DataLen: uint64(len(acct.Data)), Pubkey: acct.Key, Lamports: acct.Lamports,
-			RentEpoch: acct.RentEpoch, Owner: acct.Owner, Executable: acct.Executable, Data: acct.Data}
-
-		err = appendVecAcct.Marshal(appendVecAcctsBuf)
+		appendVecAcct := appendVecAccountFromAccount(acct)
+		l, err := appendVecAcct.MarshalReturningLength(appendVecAcctsBuf)
 		if err != nil {
 			panic(fmt.Sprintf("unable to add acct for %s to acctsdb: %v", acct.Key, err))
 		}
-	}
-
-	// write the appendvecs data into the file
-	_, err = appendVecFile.Write(appendVecAcctsBuf.Bytes())
-	if err != nil {
-		panic(err)
+		acct.SetStorageInfo(slot, fileId, appendVecFileOffset, uint64(len(acct.Data)))
+		appendVecFileOffset += uint64(l)
 	}
 }
 
@@ -481,6 +527,14 @@ func (accountsDb *AccountsDb) parallelStoreAccounts(n int, accts []*accounts.Acc
 					return ctx.Err()
 				}
 				err := func(a *accounts.Account) error {
+					ok, err := accountsDb.tryFastOverwriteStoredAccount(a)
+					if err != nil {
+						return err
+					}
+					if ok {
+						return nil
+					}
+
 					existingacctIdxEntryBuf, c, err := accountsDb.Index.Get(a.Key[:])
 					if errors.Is(err, pebble.ErrNotFound) {
 						lengthChangedAccounts <- a
@@ -495,40 +549,30 @@ func (accountsDb *AccountsDb) parallelStoreAccounts(n int, accts []*accounts.Acc
 						return fmt.Errorf("unmarshaling index entry: %w", err)
 					}
 
-					existingAppendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, existingIdxEntry.Slot, existingIdxEntry.FileId)
-					existingAppendVecFile, err := os.OpenFile(existingAppendVecFileName, os.O_RDWR, 0666)
+					existingAppendVecFileName := accountsDb.appendVecFileName(existingIdxEntry.Slot, existingIdxEntry.FileId)
+					existingAppendVecFile, release, err := accountsDb.AppendVecFiles.Acquire(existingAppendVecFileName)
 					if err != nil {
 						return fmt.Errorf("open %s: %w", existingAppendVecFileName, err)
 					}
-					defer existingAppendVecFile.Close()
 
 					existingDataLen, err := GetAppendVecDataLen(existingAppendVecFile, existingIdxEntry.Offset)
 					if err != nil {
+						release()
 						return fmt.Errorf("GetAppendVecDataLen %s: %w", existingAppendVecFileName, err)
 					}
 
 					if uint64(len(a.Data)) != existingDataLen {
+						release()
 						lengthChangedAccounts <- a
 						return nil
 					}
 
-					_, err = existingAppendVecFile.Seek(int64(existingIdxEntry.Offset), 0)
-					if err != nil {
-						return fmt.Errorf("seek %s %d: %w", existingAppendVecFileName, existingIdxEntry.Offset, err)
-					}
-					newAppendVecAcct := AppendVecAccount{
-						DataLen:    uint64(len(a.Data)),
-						Pubkey:     a.Key,
-						Lamports:   a.Lamports,
-						RentEpoch:  a.RentEpoch,
-						Owner:      a.Owner,
-						Executable: a.Executable,
-						Data:       a.Data,
-					}
-					err = newAppendVecAcct.Marshal(existingAppendVecFile)
+					err = writeAppendVecAccountAt(existingAppendVecFile, existingIdxEntry.Offset, appendVecAccountFromAccount(a))
+					release()
 					if err != nil {
 						return fmt.Errorf("marshaling appendvec: %w", err)
 					}
+					a.SetStorageInfo(existingIdxEntry.Slot, existingIdxEntry.FileId, existingIdxEntry.Offset, existingDataLen)
 					return nil
 				}(acct)
 				if err != nil {
@@ -540,40 +584,52 @@ func (accountsDb *AccountsDb) parallelStoreAccounts(n int, accts []*accounts.Acc
 	}
 	newAppendVecGroup := errgroup.Group{}
 	newAppendVecGroup.Go(func() error {
-		fileId := accountsDb.LargestFileId.Add(1)
-		appendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, slot, fileId)
-		appendVecFile, err := os.OpenFile(appendVecFileName, os.O_RDWR|os.O_CREATE, 0666)
-		if err != nil {
-			return err
-		}
-		defer appendVecFile.Close()
-		appendVecWriter := bufio.NewWriter(appendVecFile)
-		defer appendVecWriter.Flush()
-
-		appendVecFileOffset := uint64(0)
+		var (
+			fileId              uint64
+			appendVecFile       *os.File
+			appendVecWriter     *bufio.Writer
+			appendVecFileOffset uint64
+		)
+		defer func() {
+			if appendVecWriter != nil {
+				if err := appendVecWriter.Flush(); err != nil {
+					panic(err)
+				}
+			}
+			if appendVecFile != nil {
+				if err := appendVecFile.Close(); err != nil {
+					panic(err)
+				}
+			}
+		}()
 		var acctIdxEntryBuf [24]byte
 
 		for acct := range lengthChangedAccounts {
+			if appendVecWriter == nil {
+				fileId = accountsDb.LargestFileId.Add(1)
+				appendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, slot, fileId)
+				var err error
+				appendVecFile, err = os.OpenFile(appendVecFileName, os.O_RDWR|os.O_CREATE, 0666)
+				if err != nil {
+					return err
+				}
+				appendVecWriter = bufio.NewWriter(appendVecFile)
+			}
+
 			indexEntry := AccountIndexEntry{Slot: slot, FileId: fileId, Offset: appendVecFileOffset}
 			indexEntry.Marshal(&acctIdxEntryBuf)
+			var err error
 			err = accountsDb.Index.Set(acct.Key[:], acctIdxEntryBuf[:], &pebble.WriteOptions{})
 			if err != nil {
 				return fmt.Errorf("unable to add acct for %s to acctsdb: %v", acct.Key, err)
 			}
 
-			appendVecAcct := AppendVecAccount{
-				DataLen:    uint64(len(acct.Data)),
-				Pubkey:     acct.Key,
-				Lamports:   acct.Lamports,
-				RentEpoch:  acct.RentEpoch,
-				Owner:      acct.Owner,
-				Executable: acct.Executable,
-				Data:       acct.Data,
-			}
+			appendVecAcct := appendVecAccountFromAccount(acct)
 			l, err := appendVecAcct.MarshalReturningLength(appendVecWriter)
 			if err != nil {
 				return fmt.Errorf("unable to add acct for %s to acctsdb: %v", acct.Key, err)
 			}
+			acct.SetStorageInfo(slot, fileId, appendVecFileOffset, uint64(len(acct.Data)))
 			appendVecFileOffset += uint64(l)
 		}
 
@@ -618,6 +674,10 @@ func (accountsDb *AccountsDb) KeysBetweenPrefixes(startPrefix uint64, endPrefix 
 	}
 
 	return keyObjs*/
+}
+
+func (accountsDb *AccountsDb) appendVecFileName(slot uint64, fileId uint64) string {
+	return fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, slot, fileId)
 }
 
 func (accountsDb *AccountsDb) AllKeys() [][]byte {

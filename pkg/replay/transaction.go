@@ -165,6 +165,8 @@ func isWritableForInstr(am *solana.AccountMeta, programIDSet map[solana.PublicKe
 func handleModifiedAccounts(slotCtx *sealevel.SlotCtx, execCtx *sealevel.ExecutionCtx) {
 	// update account states in slotCtx for all accounts 'touched' during the tx's execution
 	var touchedCount, touchedBytes uint64
+	modifiedAccts := make([]*accounts.Account, 0, 8)
+	modifiedPubkeys := make([]solana.PublicKey, 0, 8)
 	for idx, newAcctState := range execCtx.TransactionContext.Accounts.Accounts {
 		if execCtx.TransactionContext.Accounts.Touched[idx] {
 			// Track touched account stats for profiling
@@ -173,16 +175,25 @@ func handleModifiedAccounts(slotCtx *sealevel.SlotCtx, execCtx *sealevel.Executi
 
 			// clean up accounts closed during the tx (garbage collection)
 			if newAcctState.Lamports == 0 {
-				newAcctState = &accounts.Account{Key: newAcctState.Key, RentEpoch: math.MaxUint64}
+				closedAcct := &accounts.Account{Key: newAcctState.Key, RentEpoch: math.MaxUint64}
+				if slot, fileID, offset, dataLen, ok := newAcctState.StorageInfo(); ok {
+					closedAcct.SetStorageInfo(slot, fileID, offset, dataLen)
+				}
+				newAcctState = closedAcct
 			}
 
-			err := slotCtx.SetAccount(newAcctState.Key, newAcctState)
-			if err != nil {
-				panic(fmt.Sprintf("unable to set slot account for %s to update state: %s", newAcctState.Key, err))
-			}
-			slotCtx.RecordModifiedAcct(newAcctState.Key)
+			modifiedAccts = append(modifiedAccts, newAcctState)
+			modifiedPubkeys = append(modifiedPubkeys, newAcctState.Key)
 			//mlog.Log.Debugf("modified account %s after tx", newAcctState.Key)
 		}
+	}
+
+	if len(modifiedAccts) > 0 {
+		err := slotCtx.SetAccounts(modifiedAccts)
+		if err != nil {
+			panic(fmt.Sprintf("unable to batch update %d slot accounts: %s", len(modifiedAccts), err))
+		}
+		slotCtx.RecordModifiedAccts(modifiedPubkeys)
 	}
 
 	// Record touched stats for clone optimization profiling
@@ -414,24 +425,6 @@ func verifySignatures(snapshot *sigverifySnapshot, sigverifyWg *sync.WaitGroup) 
 	metrics.GlobalBlockReplay.Sigverify.AddTimingSince(start)
 }
 
-func cloneTransaction(tx *solana.Transaction) (*solana.Transaction, error) {
-	if tx == nil {
-		return nil, nil
-	}
-
-	raw, err := tx.MarshalBinary()
-	if err != nil {
-		return nil, err
-	}
-
-	cloned, err := solana.TransactionFromBytes(raw)
-	if err != nil {
-		return nil, err
-	}
-
-	return cloned, nil
-}
-
 func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, tx *solana.Transaction, txMeta *rpc.TransactionMeta, dbgOpts *DebugOptions, arena *arena.Arena[sealevel.BorrowedAccount]) (*fees.TxFeeInfo, error) {
 	if trace.IsEnabled() && slotCtx.TraceCtx != nil {
 		regionType := "ProcessTransaction"
@@ -571,7 +564,7 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 	metrics.GlobalBlockReplay.PreTxRentStates.AddTimingSince(start)
 
 	var instrErr error
-	writablePubkeys := make([]solana.PublicKey, 0, 64)
+	writablePubkeySet := make(map[solana.PublicKey]struct{}, len(tx.Message.AccountKeys))
 
 	start = time.Now()
 	for instrIdx, instr := range tx.Message.Instructions {
@@ -584,7 +577,7 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 
 		ixStart = time.Now()
 		acctMetas := acctMetasPerInstr[instrIdx]
-		instructionAccts := sealevel.InstructionAcctsFromAccountMetas(acctMetas, *transactionAccts)
+		instructionAccts := execCtx.TransactionContext.InstructionAcctsFromAccountMetas(acctMetas)
 		metrics.GlobalBlockReplay.InstructionAccountsFromAccountMetas.AddTimingSince(ixStart)
 
 		programId := tx.Message.AccountKeys[instr.ProgramIDIndex]
@@ -602,7 +595,7 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 		if err == nil {
 			for _, am := range acctMetas {
 				if am.IsWritable {
-					writablePubkeys = append(writablePubkeys, am.Pubkey)
+					writablePubkeySet[am.Pubkey] = struct{}{}
 				}
 			}
 			if isMigrating {
@@ -676,21 +669,19 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 	}
 
 	// Reuse txAcctMetas from loadAndValidateTxAccts* (already built once per tx)
-	// Build writablePubkeySet inline to avoid second loop
-	writablePubkeySet := make(map[solana.PublicKey]struct{}, len(txAcctMetas))
 	for _, txAcctMeta := range txAcctMetas {
 		if isWritable(txAcctMeta, &execCtx.Features) {
-			writablePubkeys = append(writablePubkeys, txAcctMeta.PublicKey)
 			writablePubkeySet[txAcctMeta.PublicKey] = struct{}{}
 		}
 	}
 
-	for _, pk := range writablePubkeys {
-		slotCtx.RecordWritableAcct(pk)
+	writablePubkeys := make([]solana.PublicKey, 0, len(writablePubkeySet))
+	for pk := range writablePubkeySet {
+		writablePubkeys = append(writablePubkeys, pk)
 	}
+	slotCtx.RecordWritableAccts(writablePubkeys)
 
 	handleModifiedAccounts(slotCtx, execCtx)
-	writablePubkeys = append(writablePubkeys, payerAcct.Key)
 	writablePubkeySet[payerAcct.Key] = struct{}{}
 	recordStakeAndVoteAccounts(slotCtx, execCtx, writablePubkeySet)
 	metrics.GlobalBlockReplay.TxUpdateAccounts.AddTimingSince(start)

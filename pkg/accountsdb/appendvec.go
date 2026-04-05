@@ -1,9 +1,11 @@
 package accountsdb
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"os"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
@@ -184,6 +186,50 @@ func (appendVecAcct *AppendVecAccount) ToAccount() *accounts.Account {
 		Data: appendVecAcct.Data}
 
 	return acct
+}
+
+func appendVecAccountFromAccount(acct *accounts.Account) AppendVecAccount {
+	return AppendVecAccount{
+		DataLen:    uint64(len(acct.Data)),
+		Pubkey:     acct.Key,
+		Lamports:   acct.Lamports,
+		RentEpoch:  acct.RentEpoch,
+		Owner:      acct.Owner,
+		Executable: acct.Executable,
+		Data:       acct.Data,
+	}
+}
+
+func marshalAppendVecAccount(acct AppendVecAccount) ([]byte, error) {
+	dataLenAligned := util.AlignUp(acct.DataLen, 8)
+	buf := bytes.NewBuffer(make([]byte, 0, hdrLen+int(dataLenAligned)))
+	err := acct.Marshal(buf)
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func readAppendVecAccountAt(f *os.File, offset uint64) (*accounts.Account, error) {
+	reader := io.NewSectionReader(f, int64(offset), math.MaxInt64-int64(offset))
+	return unmarshalAcctFromAppendVecAcctHeader(reader)
+}
+
+func writeAppendVecAccountAt(f *os.File, offset uint64, acct AppendVecAccount) error {
+	encoded, err := marshalAppendVecAccount(acct)
+	if err != nil {
+		return err
+	}
+
+	n, err := f.WriteAt(encoded, int64(offset))
+	if err != nil {
+		return err
+	}
+	if n != len(encoded) {
+		return io.ErrShortWrite
+	}
+
+	return nil
 }
 
 func unmarshalAcctFromAppendVecAcctHeader(buf io.Reader) (*accounts.Account, error) {

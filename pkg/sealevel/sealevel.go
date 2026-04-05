@@ -97,35 +97,36 @@ func IsNativeProgram(pubkey solana.PublicKey) bool {
 }
 
 func InstructionAcctsFromAccountMetas(instrAcctMetas []AccountMeta, txAccounts TransactionAccounts) []InstructionAccount {
-	var instrAccts []InstructionAccount
+	acctIndexLookup := make(map[solana.PublicKey]uint64, len(txAccounts.Accounts))
+	for idx, acct := range txAccounts.Accounts {
+		if _, exists := acctIndexLookup[acct.Key]; !exists {
+			acctIndexLookup[acct.Key] = uint64(idx)
+		}
+	}
+
+	instrAccts := make([]InstructionAccount, 0, len(instrAcctMetas))
+	idxInCalleeByTxIndex := make(map[uint64]uint64, len(instrAcctMetas))
+	missingIndex := uint64(len(txAccounts.Accounts))
 
 	for instrAcctIdx, accountMeta := range instrAcctMetas {
-		idxInTx := -1
-		for pos, acct := range txAccounts.Accounts {
-			a := *acct
-			if a.Key == accountMeta.Pubkey {
-				idxInTx = pos
-				break
-			}
-		}
-		if idxInTx == -1 {
-			idxInTx = len(txAccounts.Accounts)
+		idxInTx, exists := acctIndexLookup[accountMeta.Pubkey]
+		if !exists {
+			idxInTx = missingIndex
 		}
 
-		accts := instrAccts[:instrAcctIdx]
-		idxInCallee := -1
-		for pos, instrAcct := range accts {
-			if instrAcct.IndexInTransaction == uint64(idxInTx) {
-				idxInCallee = pos
-				break
-			}
-		}
-		if idxInCallee == -1 {
-			idxInCallee = instrAcctIdx
+		idxInCallee, exists := idxInCalleeByTxIndex[idxInTx]
+		if !exists {
+			idxInCallee = uint64(instrAcctIdx)
+			idxInCalleeByTxIndex[idxInTx] = idxInCallee
 		}
 
-		newInstrAcct := InstructionAccount{IndexInTransaction: uint64(idxInTx), IndexInCaller: uint64(idxInTx), IndexInCallee: uint64(idxInCallee), IsSigner: accountMeta.IsSigner, IsWritable: accountMeta.IsWritable}
-		instrAccts = append(instrAccts, newInstrAcct)
+		instrAccts = append(instrAccts, InstructionAccount{
+			IndexInTransaction: idxInTx,
+			IndexInCaller:      idxInTx,
+			IndexInCallee:      idxInCallee,
+			IsSigner:           accountMeta.IsSigner,
+			IsWritable:         accountMeta.IsWritable,
+		})
 	}
 
 	return instrAccts

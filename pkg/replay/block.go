@@ -2474,21 +2474,16 @@ func sequentialTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, bl
 	return txFeeAccumulator
 }
 
-func parallelTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, block *b.Block, rblock *b.Block, txParallelism int, dbgOpts *DebugOptions) fees.TxFeeInfoAccumulator {
+func parallelTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, block *b.Block, txParallelism int, dbgOpts *DebugOptions) fees.TxFeeInfoAccumulator {
 	var txFeeAccumulator fees.TxFeeInfoAccumulator
 	txFeeInfos := make([]*fees.TxFeeInfo, len(block.Transactions))
 	errs := make([]error, len(block.Transactions))
 	txDurations := make([]time.Duration, txParallelism)
 
-	plannerBlock := block
-	if rblock.FromLightbringer {
-		plannerBlock = rblock
-	}
-
-	if canUseDependencyPlanner(plannerBlock) {
+	if canUseDependencyPlanner(block) {
 		do := make(chan int, len(block.Transactions))
 		done := make(chan int, len(block.Transactions))
-		go TopsortPlannerStream(plannerBlock, do, done)
+		go TopsortPlannerStream(block, do, done)
 
 		wg := &sync.WaitGroup{}
 		wg.Add(txParallelism)
@@ -2499,10 +2494,10 @@ func parallelTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, bloc
 					txStart := time.Now()
 					tx := block.Transactions[idx]
 					var txMeta *rpc.TransactionMeta
-					if idx < len(rblock.TxMetas) {
-						txMeta = rblock.TxMetas[idx]
+					if idx < len(block.TxMetas) {
+						txMeta = block.TxMetas[idx]
 					}
-					txFeeInfos[idx], errs[idx] = ProcessTransaction(slotCtx, sigverifyWg, rblock.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[i])
+					txFeeInfos[idx], errs[idx] = ProcessTransaction(slotCtx, sigverifyWg, block.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[i])
 					txErr := errs[idx]
 					// check for success-failure return value divergences
 					if txMeta != nil && txErr == nil && txMeta.Err != nil {
@@ -2523,15 +2518,15 @@ func parallelTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, bloc
 
 		wg.Wait()
 		close(done)
-	} else if rblock.FromLightbringer {
+	} else if block.FromLightbringer {
 		wg := &sync.WaitGroup{}
 		workerPool, _ := ants.NewPoolWithFunc(txParallelism, func(i interface{}) {
 			defer wg.Done()
 			idx := i.(uint64)
-			txFeeInfos[idx], errs[idx] = ProcessTransaction(slotCtx, sigverifyWg, rblock.Transactions[idx], nil, dbgOpts, nil)
+			txFeeInfos[idx], errs[idx] = ProcessTransaction(slotCtx, sigverifyWg, block.Transactions[idx], nil, dbgOpts, nil)
 		})
 
-		for _, entry := range rblock.Entries {
+		for _, entry := range block.Entries {
 			for _, txIdx := range entry.Indices {
 				wg.Add(1)
 				workerPool.Invoke(txIdx)
@@ -2584,7 +2579,7 @@ func ProcessBlock(
 		replayStage.Store(stage)
 		replayStageSince.Store(time.Now().UnixNano())
 	}
-	setReplayStage("clone_transactions")
+	setReplayStage("load_accounts")
 
 	replayWatchdogDone := make(chan struct{})
 	go func() {
@@ -2630,24 +2625,6 @@ func ProcessBlock(
 	var sigverifyWg sync.WaitGroup
 	defer sigverifyWg.Wait()
 	start := time.Now()
-	unresolvedBlock := &b.Block{
-		Transactions: make([]*solana.Transaction, len(block.Transactions)),
-		TxMetas:      make([]*rpc.TransactionMeta, len(block.TxMetas)),
-	}
-	for i := range block.Transactions {
-		clonedTx, cloneErr := cloneTransaction(block.Transactions[i])
-		if cloneErr != nil {
-			panic(fmt.Sprintf("unable to clone tx %s for unresolved block copy in slot %d: %v", block.Transactions[i].Signatures[0], block.Slot, cloneErr))
-		}
-		unresolvedBlock.Transactions[i] = clonedTx
-		if unresolvedBlock.TxMetas != nil && !block.FromLightbringer {
-			unresolvedBlock.TxMetas[i] = &rpc.TransactionMeta{}
-			*(unresolvedBlock.TxMetas[i]) = *block.TxMetas[i]
-		}
-	}
-
-	start = time.Now()
-	setReplayStage("load_accounts")
 	loadAcctsRegion := trace.StartRegion(ctx, "LoadBlockAccounts")
 	accts, parentAccts, err := loadBlockAccountsAndUpdateSysvars(acctsDb, block)
 	loadAcctsRegion.End()
@@ -2664,7 +2641,7 @@ func ProcessBlock(
 	setReplayStage("tx_loop")
 	txLoopRegion := trace.StartRegion(ctx, "TxLoop")
 	if txParallelism > 0 {
-		txFeeAccumulator = parallelTxLoop(slotCtx, &sigverifyWg, unresolvedBlock, block, txParallelism, dbgOpts)
+		txFeeAccumulator = parallelTxLoop(slotCtx, &sigverifyWg, block, txParallelism, dbgOpts)
 	} else {
 		txFeeAccumulator = sequentialTxLoop(slotCtx, &sigverifyWg, block, dbgOpts)
 	}

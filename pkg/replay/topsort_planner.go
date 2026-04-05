@@ -72,7 +72,7 @@ func messageReadonlyAccounts(msg *solana.Message) []solana.PublicKey {
 }
 
 func getAllAccounts(t *solana.Transaction, tm *rpc.TransactionMeta) []solana.PublicKey {
-	if tm == nil && canDeriveAccountsFromMessage(t) {
+	if canDeriveAccountsFromMessage(t) {
 		return util.DedupePubkeys(append([]solana.PublicKey(nil), t.Message.AccountKeys...))
 	}
 	if tm == nil {
@@ -87,7 +87,7 @@ func getAllAccounts(t *solana.Transaction, tm *rpc.TransactionMeta) []solana.Pub
 }
 
 func getReadonlyAccounts(t *solana.Transaction, tm *rpc.TransactionMeta) []solana.PublicKey {
-	if tm == nil && canDeriveAccountsFromMessage(t) {
+	if canDeriveAccountsFromMessage(t) {
 		return messageReadonlyAccounts(&t.Message)
 	}
 	if tm == nil {
@@ -109,7 +109,7 @@ func getReadonlyAccounts(t *solana.Transaction, tm *rpc.TransactionMeta) []solan
 }
 
 func getWritableAccounts(t *solana.Transaction, tm *rpc.TransactionMeta) []solana.PublicKey {
-	if tm == nil && canDeriveAccountsFromMessage(t) {
+	if canDeriveAccountsFromMessage(t) {
 		return messageWritableAccounts(&t.Message)
 	}
 	if tm == nil {

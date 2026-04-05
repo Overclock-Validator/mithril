@@ -30,6 +30,7 @@ type TransactionCtx struct {
 	InstructionStack         []uint64
 	RetData                  TxReturnData
 	AccountKeys              []solana.PublicKey
+	AccountIndexLookup       map[solana.PublicKey]uint64
 	Accounts                 TransactionAccounts
 	ExecutableAccounts       []BorrowedAccount
 	InstructionTraceCapacity uint64
@@ -86,8 +87,12 @@ func NewTransactionCtx(txAccts TransactionAccounts, instrStackCapacity uint64, i
 	txCtx.HeapSize = 32 * 1024
 
 	txCtx.AccountKeys = make([]solana.PublicKey, 0, len(txAccts.Accounts))
-	for _, acct := range txAccts.Accounts {
+	txCtx.AccountIndexLookup = make(map[solana.PublicKey]uint64, len(txAccts.Accounts))
+	for idx, acct := range txAccts.Accounts {
 		txCtx.AccountKeys = append(txCtx.AccountKeys, acct.Key)
+		if _, exists := txCtx.AccountIndexLookup[acct.Key]; !exists {
+			txCtx.AccountIndexLookup[acct.Key] = uint64(idx)
+		}
 	}
 
 	return txCtx
@@ -127,12 +132,39 @@ func (txCtx *TransactionCtx) SetReturnData(programId solana.PublicKey, data []by
 }
 
 func (txCtx *TransactionCtx) IndexOfAccount(pubkey solana.PublicKey) (uint64, error) {
-	for index, acctKey := range txCtx.AccountKeys {
-		if acctKey == pubkey {
-			return uint64(index), nil
-		}
+	if index, exists := txCtx.AccountIndexLookup[pubkey]; exists {
+		return index, nil
 	}
 	return 0, InstrErrMissingAccount
+}
+
+func (txCtx *TransactionCtx) InstructionAcctsFromAccountMetas(instrAcctMetas []AccountMeta) []InstructionAccount {
+	instrAccts := make([]InstructionAccount, 0, len(instrAcctMetas))
+	idxInCalleeByTxIndex := make(map[uint64]uint64, len(instrAcctMetas))
+	missingIndex := uint64(len(txCtx.Accounts.Accounts))
+
+	for instrAcctIdx, accountMeta := range instrAcctMetas {
+		idxInTx, exists := txCtx.AccountIndexLookup[accountMeta.Pubkey]
+		if !exists {
+			idxInTx = missingIndex
+		}
+
+		idxInCallee, exists := idxInCalleeByTxIndex[idxInTx]
+		if !exists {
+			idxInCallee = uint64(instrAcctIdx)
+			idxInCalleeByTxIndex[idxInTx] = idxInCallee
+		}
+
+		instrAccts = append(instrAccts, InstructionAccount{
+			IndexInTransaction: idxInTx,
+			IndexInCaller:      idxInTx,
+			IndexInCallee:      idxInCallee,
+			IsSigner:           accountMeta.IsSigner,
+			IsWritable:         accountMeta.IsWritable,
+		})
+	}
+
+	return instrAccts
 }
 
 func (txCtx *TransactionCtx) NextInstructionCtx() (*InstructionCtx, error) {

@@ -226,6 +226,48 @@ func TestTopsort(t *testing.T) {
 	}
 }
 
+func TestTopsortResolvedTxsIgnoreTxMetaLoadedAddresses(t *testing.T) {
+	sharedReadonly := testPk(42)
+	addressTable := testPk(99)
+
+	mkResolvedLookupTx := func(sigbyte byte) *solana.Transaction {
+		tx := testTx(sigbyte)
+		tx.Message.SetVersion(solana.MessageVersionV0)
+		tx.Message.AccountKeys = []solana.PublicKey{testPk(sigbyte + 100)}
+		tx.Message.Header.NumRequiredSignatures = 1
+		tx.Message.SetAddressTableLookups([]solana.MessageAddressTableLookup{{
+			AccountKey:      addressTable,
+			ReadonlyIndexes: []uint8{0},
+		}})
+		if err := tx.Message.SetAddressTables(map[solana.PublicKey]solana.PublicKeySlice{
+			addressTable: {sharedReadonly},
+		}); err != nil {
+			t.Fatalf("SetAddressTables: %v", err)
+		}
+		if err := tx.Message.ResolveLookups(); err != nil {
+			t.Fatalf("ResolveLookups: %v", err)
+		}
+		return tx
+	}
+
+	b := &block.Block{
+		Transactions: []*solana.Transaction{
+			mkResolvedLookupTx(1),
+			mkResolvedLookupTx(2),
+		},
+		TxMetas: []*rpc.TransactionMeta{
+			testTxMeta([]byte{42}, nil),
+			testTxMeta([]byte{42}, nil),
+		},
+	}
+
+	got := TopsortPlanner(b)
+	want := [][]int{{0, 1}}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Fatalf("-want +got:\n%s", diff)
+	}
+}
+
 func mustMarshal(b *block.Block) []byte {
 	bBytes, err := json.Marshal(b)
 	if err != nil {
