@@ -69,6 +69,8 @@ var (
 	ErrNoAccount = errors.New("ErrNoAccount")
 
 	StoreAccountsWorkers = 128
+
+	beforeRelocatedIndexBatchCommitHook func()
 )
 
 const (
@@ -310,6 +312,47 @@ func (accountsDb *AccountsDb) tryFastOverwriteStoredAccount(acct *accounts.Accou
 	return true, nil
 }
 
+func flushAndCloseAppendVecFile(f *os.File, w *bufio.Writer) error {
+	if w != nil {
+		if err := w.Flush(); err != nil {
+			return err
+		}
+	}
+	if f != nil {
+		if err := f.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func queueRelocatedAccountIndexUpdate(
+	indexBatch *pebble.Batch,
+	acct *accounts.Account,
+	entry AccountIndexEntry,
+	acctIdxEntryBuf *[24]byte,
+) error {
+	entry.Marshal(acctIdxEntryBuf)
+	err := indexBatch.Set(acct.Key[:], acctIdxEntryBuf[:], nil)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func commitRelocatedAccountIndexUpdates(indexBatch *pebble.Batch) error {
+	if indexBatch == nil {
+		return nil
+	}
+	if beforeRelocatedIndexBatchCommitHook != nil {
+		beforeRelocatedIndexBatchCommitHook()
+	}
+	if err := indexBatch.Commit(nil); err != nil {
+		return err
+	}
+	return nil
+}
+
 // Returns a slice of the same length as the input with results matching indexes, nil if not found.
 // Returns clones to avoid data races with the store worker.
 func (accountsDb *AccountsDb) getStoreInProgressAccounts(pks []solana.PublicKey) []*accounts.Account {
@@ -401,17 +444,11 @@ func (accountsDb *AccountsDb) storeAccountsInternal(accts []*accounts.Account, s
 		appendVecFile       *os.File
 		appendVecAcctsBuf   *bufio.Writer
 		appendVecFileOffset uint64
+		indexBatch          *pebble.Batch
 	)
 	defer func() {
-		if appendVecAcctsBuf != nil {
-			if err := appendVecAcctsBuf.Flush(); err != nil {
-				panic(err)
-			}
-		}
-		if appendVecFile != nil {
-			if err := appendVecFile.Close(); err != nil {
-				panic(err)
-			}
+		if indexBatch != nil {
+			_ = indexBatch.Close()
 		}
 	}()
 	var acctIdxEntryBuf [24]byte
@@ -478,9 +515,10 @@ func (accountsDb *AccountsDb) storeAccountsInternal(accts []*accounts.Account, s
 		// create index entry, encode it and write it to the index kv store
 		// offset field is specified as the current num of bytes written to the appendvec buffer.
 		indexEntry := AccountIndexEntry{Slot: slot, FileId: fileId, Offset: appendVecFileOffset}
-		indexEntry.Marshal(&acctIdxEntryBuf)
-
-		err = accountsDb.Index.Set(acct.Key[:], acctIdxEntryBuf[:], &pebble.WriteOptions{})
+		if indexBatch == nil {
+			indexBatch = accountsDb.Index.NewBatch()
+		}
+		err = queueRelocatedAccountIndexUpdate(indexBatch, acct, indexEntry, &acctIdxEntryBuf)
 		if err != nil {
 			panic(fmt.Sprintf("unable to add acct for %s to acctsdb: %v", acct.Key, err))
 		}
@@ -493,6 +531,17 @@ func (accountsDb *AccountsDb) storeAccountsInternal(accts []*accounts.Account, s
 		}
 		acct.SetStorageInfo(slot, fileId, appendVecFileOffset, uint64(len(acct.Data)))
 		appendVecFileOffset += uint64(l)
+	}
+
+	err := flushAndCloseAppendVecFile(appendVecFile, appendVecAcctsBuf)
+	appendVecFile = nil
+	appendVecAcctsBuf = nil
+	if err != nil {
+		panic(err)
+	}
+	err = commitRelocatedAccountIndexUpdates(indexBatch)
+	if err != nil {
+		panic(err)
 	}
 }
 
@@ -589,17 +638,11 @@ func (accountsDb *AccountsDb) parallelStoreAccounts(n int, accts []*accounts.Acc
 			appendVecFile       *os.File
 			appendVecWriter     *bufio.Writer
 			appendVecFileOffset uint64
+			indexBatch          *pebble.Batch
 		)
 		defer func() {
-			if appendVecWriter != nil {
-				if err := appendVecWriter.Flush(); err != nil {
-					panic(err)
-				}
-			}
-			if appendVecFile != nil {
-				if err := appendVecFile.Close(); err != nil {
-					panic(err)
-				}
+			if indexBatch != nil {
+				_ = indexBatch.Close()
 			}
 		}()
 		var acctIdxEntryBuf [24]byte
@@ -617,9 +660,10 @@ func (accountsDb *AccountsDb) parallelStoreAccounts(n int, accts []*accounts.Acc
 			}
 
 			indexEntry := AccountIndexEntry{Slot: slot, FileId: fileId, Offset: appendVecFileOffset}
-			indexEntry.Marshal(&acctIdxEntryBuf)
-			var err error
-			err = accountsDb.Index.Set(acct.Key[:], acctIdxEntryBuf[:], &pebble.WriteOptions{})
+			if indexBatch == nil {
+				indexBatch = accountsDb.Index.NewBatch()
+			}
+			err := queueRelocatedAccountIndexUpdate(indexBatch, acct, indexEntry, &acctIdxEntryBuf)
 			if err != nil {
 				return fmt.Errorf("unable to add acct for %s to acctsdb: %v", acct.Key, err)
 			}
@@ -633,7 +677,13 @@ func (accountsDb *AccountsDb) parallelStoreAccounts(n int, accts []*accounts.Acc
 			appendVecFileOffset += uint64(l)
 		}
 
-		return nil
+		err := flushAndCloseAppendVecFile(appendVecFile, appendVecWriter)
+		appendVecFile = nil
+		appendVecWriter = nil
+		if err != nil {
+			return err
+		}
+		return commitRelocatedAccountIndexUpdates(indexBatch)
 	})
 
 	e1 := overwriteOrPassGroup.Wait()
