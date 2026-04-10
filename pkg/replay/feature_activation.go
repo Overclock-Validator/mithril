@@ -48,14 +48,19 @@ func scanAndEnableFeatures(acctsDb *accountsdb.AccountsDb, replayCtx *ReplayCtx,
 			continue
 		}
 
-		parentAccts = append(parentAccts, acct.Clone())
 		featureAcct := features.UnmarshalFeatureAcct(acct.Data)
 
+		// feature already activated. set it as activated on new features object.
 		if featureAcct.ActivatedAt != nil && slot >= *featureAcct.ActivatedAt {
 			f.EnableFeature(featureGate, *featureAcct.ActivatedAt)
 		}
 
+		// the feature needs activating, so marshal up the feature account state as
+		// activated, store the parent account and modified account, and enable the
+		// feature on the new features object.
 		if featureAcct.ActivatedAt == nil && startOfEpoch {
+			parentAccts = append(parentAccts, acct.Clone())
+
 			newFeatureAcct := &features.FeatureAcct{ActivatedAt: &slot}
 			newFeatureAcctBytes, err := features.MarshalFeatureAcct(newFeatureAcct)
 			if err != nil {
@@ -65,6 +70,8 @@ func scanAndEnableFeatures(acctsDb *accountsdb.AccountsDb, replayCtx *ReplayCtx,
 			acct.Data = newFeatureAcctBytes
 			modifiedAccts = append(modifiedAccts, acct)
 			f.EnableFeature(featureGate, slot)
+
+			mlog.Log.Infof("Activated new feature %s at slot %d", featureGate.Name, slot)
 		}
 	}
 
