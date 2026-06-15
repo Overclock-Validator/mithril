@@ -258,6 +258,17 @@ func BuildAccountsDbAuto(
 		return nil, nil, err
 	}
 
+	// Verify snapshot integrity by re-computing the LtHash from all accounts
+	// and comparing against the manifest. Detects tampered snapshots from
+	// untrusted RPC nodes before proceeding to replay.
+	// NOTE: We use the INCREMENTAL manifest's LtHash because the pebble index
+	// at this point contains accounts from BOTH full and incremental snapshots.
+	// The incremental manifest's LtHash reflects the final combined state.
+	if err := VerifySnapshotLtHash(accountsDb, incrementalManifest.LtHash); err != nil {
+		accountsDb.CloseDb()
+		return nil, nil, fmt.Errorf("snapshot verification failed: %w", err)
+	}
+
 	rpcClient := rpcclient.NewRpcClient(rpcEndpoints[0])
 	latestSlot, err := rpcClient.GetSlot()
 	_, incrSlot = snapshotdl.ExtractIncrementalSnapshotSlots(incrementalSnapshotPath)
