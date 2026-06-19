@@ -166,6 +166,9 @@ type LightbringerConfig struct {
 	RpcAddr          string `toml:"rpc_addr" mapstructure:"rpc_addr"`                   // Debug HTTP endpoint
 	GrpcAddr         string `toml:"grpc_addr" mapstructure:"grpc_addr"`                 // gRPC stream endpoint (auto-synced to block.lightbringer_endpoint)
 	ConfigDir        string `toml:"config_dir" mapstructure:"config_dir"`               // Directory to write Lightbringer.toml
+	GossipPort       int    `toml:"gossip_port" mapstructure:"gossip_port"`             // Public Solana gossip UDP port
+	PortRangeStart   int    `toml:"port_range_start" mapstructure:"port_range_start"`   // Start of public Solana UDP repair/TVU port range
+	PortRangeEnd     int    `toml:"port_range_end" mapstructure:"port_range_end"`       // End of public Solana UDP repair/TVU port range
 
 	// Optional: InfluxDB metrics — written as [influxdb] section in generated Lightbringer.toml
 	InfluxdbHost     string `toml:"influxdb_host" mapstructure:"influxdb_host"`

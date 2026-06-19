@@ -3,8 +3,12 @@ package dashboardcmd
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
+	"time"
+	"unicode/utf8"
 
+	"github.com/Overclock-Validator/mithril/pkg/config"
 	"github.com/Overclock-Validator/mithril/pkg/tui"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -17,6 +21,8 @@ func (m model) renderRightPane() string {
 	switch m.screen {
 	case screenOverview:
 		return m.renderOverview()
+	case screenProcess:
+		return m.renderProcessView()
 	case screenConfig:
 		return m.renderConfigView()
 	case screenEdit:
@@ -59,6 +65,11 @@ func (m model) renderOverview() string {
 	value := lipgloss.NewStyle().Foreground(tui.ColorTextPrimary)
 	header := lipgloss.NewStyle().Foreground(tui.MithrilTeal).Bold(true)
 
+	// Running-state badge, shown before the health summary.
+	if m.proc.detection != nil {
+		b.WriteString("  " + renderProcessHeadline(*m.proc.detection, m.proc.inFlightOp) + "\n\n")
+	}
+
 	// Health summary
 	passed := 0
 	total := len(m.checks)
@@ -92,7 +103,7 @@ func (m model) renderOverview() string {
 				dot = pass.Render("●")
 				status = pass.Render("up")
 			}
-			b.WriteString("  " + dot + " " + value.Render(fmt.Sprintf("%-14s", svc.name)) + label.Render(fmt.Sprintf("%-20s", svc.addr)) + status + "\n")
+			b.WriteString("  " + dot + " " + value.Render(fmt.Sprintf("%-14s", svc.name)) + label.Render(fmt.Sprintf("%-20s", displayServiceAddr(svc.addr))) + status + "\n")
 		}
 		b.WriteString("\n")
 	}
@@ -100,36 +111,41 @@ func (m model) renderOverview() string {
 	// Node state
 	if m.state != nil && m.state.LastSlot > 0 {
 		b.WriteString(header.Render("Node State") + "\n\n")
-		b.WriteString(label.Render("  Slot        ") + value.Render(formatNumber(m.state.LastSlot)) + "\n")
-		b.WriteString(label.Render("  Epoch       ") + value.Render(fmt.Sprintf("%d", m.state.LastEpoch)) + "\n")
-		if m.state.LastBankhash != "" {
-			short := m.state.LastBankhash
-			if len(short) > 12 {
-				short = short[:12] + "..."
-			}
-			b.WriteString(label.Render("  Bankhash    ") + value.Render(short) + "\n")
+		// Prefer live replay slot; state file slot is frozen between checkpoints.
+		slotVal, epochVal := m.state.LastSlot, m.state.LastEpoch
+		liveTag := ""
+		if s, e, ok := m.liveNodeSlot(); ok {
+			slotVal, epochVal = s, e
+			liveTag = lipgloss.NewStyle().Foreground(tui.ColorSuccess).Render("  ● live")
 		}
+		b.WriteString(label.Render("  Slot        ") + value.Render(formatNumber(slotVal)) + liveTag + "\n")
+		b.WriteString(label.Render("  Epoch       ") + value.Render(fmt.Sprintf("%d", epochVal)) + "\n")
 		if m.state.SnapshotSlot > 0 {
 			b.WriteString(label.Render("  Snapshot    ") + value.Render(formatNumber(m.state.SnapshotSlot)) + "\n")
 		}
-		if m.state.LastShutdownReason != "" {
+		// Only show last shutdown when not running; otherwise it's a prior run's exit.
+		if m.state.LastShutdownReason != "" && !m.isNodeRunning() {
 			reason := value.Render(m.state.LastShutdownReason)
 			if m.state.LastShutdownAt != "" {
-				reason += label.Render("  at ") + value.Render(m.state.LastShutdownAt)
+				when := m.state.LastShutdownAt
+				if t, perr := time.Parse(time.RFC3339Nano, m.state.LastShutdownAt); perr == nil {
+					when = humanizeAge(t)
+				}
+				reason += label.Render("  ") + value.Render(when)
 			}
 			b.WriteString(label.Render("  Shutdown    ") + reason + "\n")
 		}
 		if m.state.Stage != "" {
 			b.WriteString(label.Render("  Stage       ") + value.Render(m.state.Stage) + "\n")
 		}
-		if m.state.LastWriterVersion != "" {
-			ver := value.Render(m.state.LastWriterVersion)
-			if m.state.LastWriterCommit != "" {
-				short := m.state.LastWriterCommit
-				if len(short) > 8 {
-					short = short[:8]
+		// Build version that last wrote this state; skipped for dev/unknown builds.
+		if v := m.state.LastWriterVersion; v != "" && v != "dev" && v != "unknown" {
+			ver := value.Render(v)
+			if c := m.state.LastWriterCommit; c != "" && c != "unknown" {
+				if len(c) > 8 {
+					c = c[:8]
 				}
-				ver += label.Render(" (") + value.Render(short) + label.Render(")")
+				ver += label.Render(" (") + value.Render(c) + label.Render(")")
 			}
 			b.WriteString(label.Render("  Writer      ") + ver + "\n")
 		}
@@ -143,8 +159,7 @@ func (m model) renderOverview() string {
 		b.WriteString(label.Render("  Node has not been started yet.") + "\n\n")
 		b.WriteString(label.Render("  1. Review your config       ") + cmd.Render("← Config") + "\n")
 		b.WriteString(label.Render("  2. Run health checks        ") + cmd.Render("← Doctor") + "\n")
-		b.WriteString(label.Render("  3. Start the node:") + "\n")
-		b.WriteString(cmd.Render("     $ mithril run --config "+m.configFile) + "\n")
+		b.WriteString(label.Render("  3. Start the node           ") + cmd.Render("← Run Node, choose Start, Enter") + "\n")
 	}
 
 	return b.String()
@@ -172,8 +187,8 @@ func (m model) renderConfigView() string {
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
-		if strings.HasPrefix(trimmed, "[") && !strings.HasPrefix(trimmed, "[[") {
-			sections = append(sections, configSection{name: strings.Trim(trimmed, "[] ")})
+		if sectionName, ok := tomlSectionName(trimmed); ok {
+			sections = append(sections, configSection{name: sectionName})
 			continue
 		}
 		if len(sections) > 0 {
@@ -193,26 +208,151 @@ func (m model) renderConfigView() string {
 	valStyle := lipgloss.NewStyle().Foreground(tui.ColorTextPrimary)
 	hintStyle := lipgloss.NewStyle().Foreground(tui.ColorTextDisabled)
 
-	// Count total lines needed for single-column display
-	totalLines := 0
-	for _, s := range sections {
-		totalLines += 1 + len(s.keys) // header + kvs
-	}
-	totalLines += len(sections) - 1 // blank lines between sections
-
-	// Estimate available height in right pane
-	availHeight := m.height - 18
+	// Pack sections into columns that fit the visible height so the whole config
+	// shows without pgdn (-19 leaves room for the blank/hint/trailing rows).
+	availHeight := m.height - 19
 	if availHeight < 10 {
 		availHeight = 10
 	}
+	paneWidth := m.rightPaneContentWidth()
+	return renderConfigColumns(sections, paneWidth, availHeight, sectionStyle, keyStyle, valStyle, hintStyle)
+}
 
-	// If it fits in one column, render single column
-	if totalLines <= availHeight {
-		return m.renderConfigSingleColumn(sections, sectionStyle, keyStyle, valStyle, hintStyle)
+// stackedHeight is a column's line count: header + kvs per section, plus a
+// blank line between sections.
+func stackedHeight(secs []configSection) int {
+	h := 0
+	for i, s := range secs {
+		if i > 0 {
+			h++
+		}
+		h += 1 + len(s.keys)
+	}
+	return h
+}
+
+// packConfigColumns greedily distributes sections into n balanced columns,
+// keeping each section intact (never split across a column boundary).
+func packConfigColumns(sections []configSection, n int) [][]configSection {
+	if n <= 1 {
+		return [][]configSection{sections}
+	}
+	target := (stackedHeight(sections) + n - 1) / n
+	var cols [][]configSection
+	var cur []configSection
+	curLines := 0
+	for _, s := range sections {
+		sl := 1 + len(s.keys)
+		sep := 0
+		if curLines > 0 {
+			sep = 1
+		}
+		if curLines > 0 && curLines+sep+sl > target && len(cols) < n-1 {
+			cols = append(cols, cur)
+			cur, curLines, sep = nil, 0, 0
+		}
+		cur = append(cur, s)
+		curLines += sep + sl
+	}
+	if len(cur) > 0 {
+		cols = append(cols, cur)
+	}
+	return cols
+}
+
+// fillColumns packs sections top-to-bottom, starting a new column only when the
+// current one would exceed maxHeight (fills left-first, doesn't balance).
+func fillColumns(sections []configSection, maxHeight int) [][]configSection {
+	var cols [][]configSection
+	var cur []configSection
+	curLines := 0
+	for _, s := range sections {
+		sl := 1 + len(s.keys)
+		sep := 0
+		if curLines > 0 {
+			sep = 1
+		}
+		if curLines > 0 && curLines+sep+sl > maxHeight {
+			cols = append(cols, cur)
+			cur, curLines, sep = nil, 0, 0
+		}
+		cur = append(cur, s)
+		curLines += sep + sl
+	}
+	if len(cur) > 0 {
+		cols = append(cols, cur)
+	}
+	return cols
+}
+
+// renderConfigColumns lays sections into as many side-by-side columns as fit
+// paneWidth (up to availHeight); never splits a section, falls back to one column.
+func renderConfigColumns(sections []configSection, paneWidth, availHeight int, sectionStyle, keyStyle, valStyle, hintStyle lipgloss.Style) string {
+	const gap = 3
+	// Min column width — small enough that 2-3 columns engage at normal widths.
+	const minCol = 24
+
+	maxCols := (paneWidth + gap) / (minCol + gap)
+	if maxCols > len(sections) {
+		maxCols = len(sections)
+	}
+	if maxCols < 1 {
+		maxCols = 1
+	}
+	// Fill columns top-to-bottom up to availHeight before spilling right.
+	cols := fillColumns(sections, availHeight)
+	if len(cols) > maxCols {
+		// Too tall to fit the width at this height; pack into the columns the
+		// width allows (the only case that can still scroll).
+		cols = packConfigColumns(sections, maxCols)
+	}
+	n := len(cols)
+	if n < 1 {
+		n = 1
+	}
+	colWidth := (paneWidth - gap*(n-1)) / n
+	if colWidth < 1 {
+		colWidth = paneWidth
 	}
 
-	// Otherwise split into two columns side by side
-	return m.renderConfigTwoColumns(sections, sectionStyle, keyStyle, valStyle, hintStyle)
+	rendered := make([][]string, n)
+	colW := make([]int, n) // each column's natural width (its longest line), so columns pack flush
+	rows := 0
+	for i := range cols {
+		rendered[i] = renderConfigColumn(cols[i], colWidth, sectionStyle, keyStyle, valStyle)
+		for _, ln := range rendered[i] {
+			if w := lipgloss.Width(ln); w > colW[i] {
+				colW[i] = w
+			}
+		}
+		if len(rendered[i]) > rows {
+			rows = len(rendered[i])
+		}
+	}
+
+	gapStr := strings.Repeat(" ", gap)
+	var b strings.Builder
+	for r := 0; r < rows; r++ {
+		var row strings.Builder
+		for i := 0; i < n; i++ {
+			cell := ""
+			if r < len(rendered[i]) {
+				cell = rendered[i][r] // already truncated to <= colWidth, never exceeds the pane
+			}
+			if i < n-1 { // pad to THIS column's natural width so the next column sits flush, no wide gap
+				if pad := colW[i] - lipgloss.Width(cell); pad > 0 {
+					cell += strings.Repeat(" ", pad)
+				}
+				cell += gapStr
+			}
+			row.WriteString(cell)
+		}
+		b.WriteString(strings.TrimRight(row.String(), " ") + "\n")
+	}
+	b.WriteString("\n")
+	ks := lipgloss.NewStyle().Foreground(tui.MithrilTeal)
+	b.WriteString("  " + ks.Render("e") + hintStyle.Render(" edit") + "  " + ks.Render("r") + hintStyle.Render(" refresh") + "\n")
+	return b.String()
 }
 
 // renderConfigColumn renders sections as lines for a single column.
@@ -246,17 +386,20 @@ func renderConfigColumn(secs []configSection, colWidth int, sectionStyle, keySty
 		lines = append(lines, sectionStyle.Render(s.name))
 		for j := range s.keys {
 			v := s.vals[j]
+			v = displayConfigValue(s.name, s.keys[j], v)
 			// Mask sensitive values (tokens, secrets, passwords)
 			k := strings.ToLower(s.keys[j])
 			if strings.Contains(k, "token") || strings.Contains(k, "secret") || strings.Contains(k, "password") {
-				if len(v) > 4 {
-					v = v[:2] + strings.Repeat("*", len(v)-4) + v[len(v)-2:]
-				} else if len(v) > 0 {
+				// Rune-safe: byte slicing could split a multibyte rune in a
+				// pasted token and emit invalid UTF-8.
+				if rv := []rune(v); len(rv) > 4 {
+					v = string(rv[:2]) + strings.Repeat("*", len(rv)-4) + string(rv[len(rv)-2:])
+				} else if len(rv) > 0 {
 					v = "****"
 				}
 			}
-			if len(v) > maxVal {
-				v = v[:maxVal-3] + "..."
+			if rv := []rune(v); len(rv) > maxVal {
+				v = string(rv[:maxVal-1]) + "…" // rune-safe, single-char ellipsis
 			}
 			lines = append(lines, "  "+keyStyle.Render(fmt.Sprintf("%-*s ", keyPad, s.keys[j]))+valStyle.Render(v))
 		}
@@ -264,76 +407,44 @@ func renderConfigColumn(secs []configSection, colWidth int, sectionStyle, keySty
 	return lines
 }
 
-func (m model) renderConfigSingleColumn(sections []configSection, sectionStyle, keyStyle, valStyle, hintStyle lipgloss.Style) string {
-	rightPaneWidth := (m.width - 3) * 78 / 100
-	lines := renderConfigColumn(sections, rightPaneWidth, sectionStyle, keyStyle, valStyle)
-
-	var b strings.Builder
-	for _, l := range lines {
-		b.WriteString(l + "\n")
+func displayConfigValue(section, key, value string) string {
+	if !shouldRedactFieldValue(section, key) {
+		return value
 	}
-	b.WriteString("\n")
-	ks := lipgloss.NewStyle().Foreground(tui.MithrilTeal)
-	b.WriteString("  " + ks.Render("e") + hintStyle.Render(" edit") + "  " + ks.Render("r") + hintStyle.Render(" refresh") + "\n")
-	return b.String()
+	fullKey := strings.ToLower(section + "." + key)
+	switch {
+	case fullKey == "network.rpc":
+		return redactEndpointListForDisplay(value)
+	case strings.Contains(fullKey, "endpoint"):
+		return redactEndpointListForDisplay(value)
+	case strings.Contains(fullKey, "rpc") && strings.Contains(value, "://"):
+		return redactEndpointListForDisplay(value)
+	default:
+		return value
+	}
 }
 
-func (m model) renderConfigTwoColumns(sections []configSection, sectionStyle, keyStyle, valStyle, hintStyle lipgloss.Style) string {
-	// Split sections into two groups by total line count (balanced)
-	totalLines := 0
-	for _, s := range sections {
-		totalLines += 2 + len(s.keys) // header + kvs + spacing
-	}
-	midpoint := totalLines / 2
+func displayServiceAddr(addr string) string {
+	return config.RedactSecretsInText(config.RedactEndpointForDisplay(addr))
+}
 
-	lineCount := 0
-	splitIdx := len(sections)
-	for i, s := range sections {
-		sLines := 2 + len(s.keys)
-		if lineCount+sLines > midpoint && lineCount > 0 {
-			splitIdx = i
-			break
+func shouldRedactFieldValue(section, key string) bool {
+	fullKey := strings.ToLower(section + "." + key)
+	return fullKey == "network.rpc" ||
+		strings.Contains(fullKey, "endpoint") ||
+		strings.Contains(fullKey, "rpc")
+}
+
+func redactEndpointListForDisplay(value string) string {
+	parts := strings.Split(value, ",")
+	for i, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			continue
 		}
-		lineCount += sLines
+		parts[i] = strings.Replace(part, trimmed, config.RedactEndpointForDisplay(trimmed), 1)
 	}
-
-	// Column sizing: right pane width → two columns with clean gap
-	rightPaneWidth := (m.width - 3) * 78 / 100
-	colGap := 4
-	colWidth := (rightPaneWidth - colGap) / 2
-
-	leftLines := renderConfigColumn(sections[:splitIdx], colWidth, sectionStyle, keyStyle, valStyle)
-	rightLines := renderConfigColumn(sections[splitIdx:], colWidth, sectionStyle, keyStyle, valStyle)
-
-	maxRows := len(leftLines)
-	if len(rightLines) > maxRows {
-		maxRows = len(rightLines)
-	}
-
-	gap := strings.Repeat(" ", colGap)
-	truncStyle := lipgloss.NewStyle().MaxWidth(colWidth)
-
-	var b strings.Builder
-	for i := 0; i < maxRows; i++ {
-		left := ""
-		right := ""
-		if i < len(leftLines) {
-			left = truncStyle.Render(leftLines[i])
-		}
-		if i < len(rightLines) {
-			right = rightLines[i]
-		}
-		leftPad := colWidth - lipgloss.Width(left)
-		if leftPad > 0 {
-			left += strings.Repeat(" ", leftPad)
-		}
-		b.WriteString(left + gap + right + "\n")
-	}
-
-	b.WriteString("\n")
-	ks := lipgloss.NewStyle().Foreground(tui.MithrilTeal)
-	b.WriteString("  " + ks.Render("e") + hintStyle.Render(" edit") + "  " + ks.Render("r") + hintStyle.Render(" refresh") + "\n")
-	return b.String()
+	return strings.Join(parts, ",")
 }
 
 // stripInlineComment removes the inline comment from a TOML value.
@@ -392,6 +503,70 @@ func (m model) renderEditView() string {
 	return m.renderEditList()
 }
 
+// fieldHelp returns a one-line plain-language explanation of a config field,
+// shown while editing and under the highlighted list row.
+func fieldHelp(section, key string) string {
+	switch section + "." + key {
+	case "network.cluster":
+		return "Which Solana network to follow: mainnet-beta, devnet, or testnet."
+	case "network.rpc":
+		return "URL of a Solana RPC provider used to fetch blocks. Paste your provider's URL."
+	case "storage.accounts":
+		return "Folder for the account database (large — put it on your fastest disk)."
+	case "storage.snapshots":
+		return "Folder for downloaded snapshot files used to bootstrap a fresh start."
+	case "storage.shredstore":
+		return "Folder where raw block data (shreds) is stored."
+	case "storage.logs":
+		return "Folder where log files are written."
+	case "block.source":
+		return "Where blocks come from: 'rpc' (an RPC provider) or 'lightbringer' (peer-to-peer sidecar)."
+	case "block.turbine_bind_addr":
+		return "Local UDP address to receive blocks directly from the network (turbine mode)."
+	case "turbine.gossip_entrypoint":
+		return "host:port of a known Solana node used to join the network (turbine mode)."
+	case "turbine.gossip_bind_addr":
+		return "Local UDP address for network gossip traffic (turbine mode)."
+	case "turbine.advertised_ip":
+		return "Your machine's public IP so peers can reach you (turbine mode)."
+	case "turbine.shred_version":
+		return "Network data-format version. Leave 0 to auto-detect."
+	case "block.lightbringer_endpoint":
+		return "host:port of an already-running external Lightbringer sidecar."
+	case "block.max_rps":
+		return "Max requests per second to the RPC provider (lower it to avoid rate limits)."
+	case "block.max_inflight":
+		return "How many blocks to fetch in parallel."
+	case "lightbringer.enabled":
+		return "Let Mithril start and manage a Lightbringer sidecar for you."
+	case "lightbringer.binary_path":
+		return "Path to the lightbringer program file."
+	case "lightbringer.config_dir":
+		return "Folder where Mithril writes Lightbringer's config and data."
+	case "lightbringer.gossip_entrypoint":
+		return "host:port of a Solana node for Lightbringer to join the network."
+	case "lightbringer.gossip_port":
+		return "Inbound UDP port for Lightbringer gossip — open this in your firewall."
+	case "lightbringer.port_range_start", "lightbringer.port_range_end":
+		return "Inbound UDP port range for Lightbringer — open this range in your firewall."
+	case "lightbringer.grpc_addr":
+		return "Local address where Mithril reads blocks from Lightbringer."
+	case "lightbringer.rpc_addr":
+		return "Local address for Lightbringer's HTTP interface."
+	case "lightbringer.quiet":
+		return "Hide Lightbringer's detailed logs (less noise)."
+	case "tuning.txpar":
+		return "Parallel workers for replaying blocks. Empty = sequential (slower, simplest)."
+	case "rpc.port":
+		return "Port for Mithril's own RPC server. It listens on all interfaces — firewall it if public."
+	case "log.level":
+		return "How much detail to log: info, debug, warn, or error."
+	case "bootstrap.mode":
+		return "How to start: 'auto' reuses local data, or downloads a snapshot if needed."
+	}
+	return ""
+}
+
 // renderEditList shows all fields in a compact scrollable list.
 func (m model) renderEditList() string {
 	label := lipgloss.NewStyle().Foreground(tui.ColorTextMuted)
@@ -413,12 +588,15 @@ func (m model) renderEditList() string {
 
 		// Auto-detect indicator for unset txpar
 		displayVal := val
+		if displayVal != "" {
+			displayVal = displayConfigValue(f.section, f.key, displayVal)
+		}
 		isAuto := val == "" && f.section == "tuning" && f.key == "txpar"
 		if isAuto {
 			displayVal = "not set (sequential)"
 		}
-		if len(displayVal) > 35 {
-			displayVal = displayVal[:32] + "..."
+		if rv := []rune(displayVal); len(rv) > 35 {
+			displayVal = string(rv[:32]) + "..." // rune-safe truncation
 		}
 
 		if isSelected {
@@ -442,28 +620,87 @@ func (m model) renderEditList() string {
 	if maxVisible < 10 {
 		maxVisible = 10
 	}
+	scrollStart := 0
 	if len(lines) > maxVisible {
-		start := selectedStart - maxVisible/3
-		if start < 0 {
-			start = 0
+		scrollStart = selectedStart - maxVisible/3
+		if scrollStart < 0 {
+			scrollStart = 0
 		}
-		end := start + maxVisible
+		end := scrollStart + maxVisible
 		if end > len(lines) {
 			end = len(lines)
-			start = end - maxVisible
-			if start < 0 {
-				start = 0
+			scrollStart = end - maxVisible
+			if scrollStart < 0 {
+				scrollStart = 0
 			}
 		}
-		lines = lines[start:end]
+		lines = lines[scrollStart:end]
+	}
+	// Row of the selected field within the now-visible window.
+	selectedRow := selectedStart - scrollStart
+
+	// Wide panes pair the highlighted field with a details column; narrow panes
+	// just show the list.
+	rightPaneWidth := (m.width - 3) * 78 / 100
+	detailW := rightPaneWidth / 3
+	if detailW > 32 {
+		detailW = 32
+	}
+	if rightPaneWidth < 70 || detailW < 20 {
+		return strings.Join(lines, "\n") + "\n"
+	}
+	colGap := 3
+	listW := rightPaneWidth - detailW - colGap
+
+	var right []string
+	if m.editIdx >= 0 && m.editIdx < len(m.editFields) {
+		f := m.editFields[m.editIdx]
+		detail := []string{active.Render(f.label), ""}
+		if h := fieldHelp(f.section, f.key); h != "" {
+			for _, ln := range wrapRunDetailLines([]string{h}, detailW) {
+				detail = append(detail, hint.Render(ln))
+			}
+		}
+		// Align the detail with the selected row, clamped to the visible height.
+		top := selectedRow
+		if top+len(detail) > len(lines) {
+			top = len(lines) - len(detail)
+		}
+		if top < 0 {
+			top = 0
+		}
+		right = make([]string, top)
+		right = append(right, detail...)
 	}
 
-	return strings.Join(lines, "\n") + "\n"
+	maxRows := len(lines)
+	if len(right) > maxRows {
+		maxRows = len(right)
+	}
+	trunc := lipgloss.NewStyle().MaxWidth(listW)
+	gap := strings.Repeat(" ", colGap)
+	var b strings.Builder
+	for i := 0; i < maxRows; i++ {
+		l := ""
+		if i < len(lines) {
+			l = trunc.Render(lines[i])
+		}
+		r := ""
+		if i < len(right) {
+			r = right[i]
+		}
+		if pad := listW - lipgloss.Width(l); pad > 0 {
+			l += strings.Repeat(" ", pad)
+		}
+		b.WriteString(l + gap + r + "\n")
+	}
+	return b.String()
 }
 
 // renderEditFocused shows a single field's edit UI in the full right pane.
 func (m model) renderEditFocused() string {
 	f := m.editFields[m.editIdx]
+	redactValue := shouldRedactFieldValue(f.section, f.key)
 	titleStyle := lipgloss.NewStyle().Foreground(tui.MithrilTeal).Bold(true)
 	subtitleStyle := lipgloss.NewStyle().Foreground(tui.ColorTextMuted)
 	valueStyle := lipgloss.NewStyle().Foreground(tui.ColorTextPrimary)
@@ -478,6 +715,9 @@ func (m model) renderEditFocused() string {
 	b.WriteString("\n")
 	b.WriteString("  " + titleStyle.Render(f.label) + "\n")
 	b.WriteString("  " + subtitleStyle.Render(f.section+"."+f.key) + "\n")
+	if h := fieldHelp(f.section, f.key); h != "" {
+		b.WriteString("  " + hintStyle.Render(h) + "\n")
+	}
 	b.WriteString("\n")
 
 	if m.editMode == editMenu {
@@ -523,19 +763,27 @@ func (m model) renderEditFocused() string {
 		if isAuto {
 			b.WriteString("  " + subtitleStyle.Render("Current: ") + hintStyle.Render("not set (sequential)") + "\n")
 		} else if currentVal != "" {
+			if redactValue {
+				currentVal = displayConfigValue(f.section, f.key, currentVal)
+			}
 			b.WriteString("  " + subtitleStyle.Render("Current: ") + valueStyle.Render(currentVal) + "\n")
 		}
 		b.WriteString("\n")
 
 		// ── Input field ──
 		text := m.editValue
-		if m.editCursor >= 0 && m.editCursor <= len(text) {
+		if redactValue {
+			text = displayConfigValue(f.section, f.key, text)
+		} else if m.editCursor >= 0 && m.editCursor <= len(text) {
 			before := text[:m.editCursor]
 			after := text[m.editCursor:]
 			cur := lipgloss.NewStyle().Background(tui.MithrilTeal).Foreground(lipgloss.Color("#000000")).Render(" ")
 			if m.editCursor < len(text) {
-				cur = lipgloss.NewStyle().Background(tui.MithrilTeal).Foreground(lipgloss.Color("#000000")).Render(string(after[0]))
-				after = after[1:]
+				// Decode a full rune under the cursor, not a single byte, so a
+				// multibyte character isn't split into mojibake.
+				r, sz := utf8.DecodeRuneInString(after)
+				cur = lipgloss.NewStyle().Background(tui.MithrilTeal).Foreground(lipgloss.Color("#000000")).Render(string(r))
+				after = after[sz:]
 			}
 			text = before + cur + after
 		}
@@ -552,6 +800,9 @@ func (m model) renderEditFocused() string {
 		// ── Contextual hint ──
 		if isAuto && m.editValue == "" {
 			b.WriteString("\n  " + hintStyle.Render("Leave empty for sequential mode (0), or set worker count") + "\n")
+		}
+		if redactValue {
+			b.WriteString("\n  " + hintStyle.Render("Sensitive URL values are hidden while editing; saving preserves the full value.") + "\n")
 		}
 
 		b.WriteString("\n")
@@ -612,76 +863,79 @@ func (m model) renderDoctorView() string {
 // ── Logs View ───────────────────────────────────────────────────────────
 
 func (m model) renderLogsView() string {
+	if m.logRawMode || !m.hasLightbringerLogPane() || m.rightPaneContentWidth() < 88 {
+		return m.renderRawLogsView()
+	}
 	if len(m.mithrilLines) == 0 && len(m.lbLines) == 0 {
 		mutedStyle := lipgloss.NewStyle().Foreground(tui.ColorTextMuted)
 		cmdStyle := lipgloss.NewStyle().Foreground(tui.ColorTextSecondary)
-		return mutedStyle.Render("  Logs will appear here after starting the node.") + "\n\n" +
-			cmdStyle.Render("    $ mithril run --config "+m.configFile) + "\n"
+		controls := m.renderLogControlsLine()
+		if controls != "" {
+			controls += "\n\n"
+		}
+		return controls + mutedStyle.Render("  Logs will appear here after starting the node.") + "\n\n" +
+			cmdStyle.Render("    Open Run Node, choose Start, then press Enter.") + "\n"
 	}
 
 	titleStyle := lipgloss.NewStyle().Foreground(tui.MithrilTeal).Bold(true)
-	mutedStyle := lipgloss.NewStyle().Foreground(tui.ColorTextMuted)
 	hintStyle := lipgloss.NewStyle().Foreground(tui.ColorTextDisabled)
 
 	// Calculate column widths
-	rightPaneWidth := (m.width - 3) * 78 / 100
+	rightPaneWidth := m.rightPaneContentWidth()
 	colGap := 3
 	colWidth := (rightPaneWidth - colGap) / 2
-
-	// Wrap long lines within column width so full messages are readable
-	mLines := wrapLogLines(m.mithrilLines, colWidth)
-	lLines := wrapLogLines(m.lbLines, colWidth)
-	if m.logFocused && m.logScroll > 0 {
-		if m.logPane == logPaneMithril {
-			if m.logScroll < len(mLines) {
-				mLines = mLines[m.logScroll:]
-			} else {
-				mLines = nil
-			}
-		} else {
-			if m.logScroll < len(lLines) {
-				lLines = lLines[m.logScroll:]
-			} else {
-				lLines = nil
-			}
-		}
+	if colWidth < 24 {
+		return m.renderRawLogsView()
 	}
 
-	// Render log lines with color coding
-	colorLine := func(line string) string {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			return ""
-		}
-		switch {
-		case strings.Contains(line, " WARN ") || strings.HasPrefix(trimmed, "WARN"):
-			return lipgloss.NewStyle().Foreground(tui.ColorWarn).Render(line)
-		case strings.Contains(line, " ERROR ") || strings.HasPrefix(trimmed, "ERROR") || strings.Contains(line, "FATAL"):
-			return lipgloss.NewStyle().Foreground(tui.ColorError).Render(line)
-		default:
-			return mutedStyle.Render(line)
-		}
+	// Full-width snapshot-download bar. When shown, drop the raw progress
+	// samples from the mithril column so they don't duplicate it.
+	downloadBlock := renderDownloadProgress(m.mithrilLines, rightPaneWidth)
+	mithrilSrc := m.mithrilLines
+	if downloadBlock != "" {
+		mithrilSrc = filterDownloadProgressLines(m.mithrilLines)
 	}
 
-	// Build side-by-side output with divider
+	// Redact before wrapping so a long URL can't split a secret across lines.
+	mLines := wrapLogLines(redactLogLines(mithrilSrc), colWidth)
+	lLines := wrapLogLines(redactLogLines(m.lbLines), colWidth)
 	maxRows := len(mLines)
 	if len(lLines) > maxRows {
 		maxRows = len(lLines)
 	}
 	availHeight := m.height - 22
+	if downloadBlock != "" {
+		// Reserve rows for the bar so the log area shrinks instead of overflowing.
+		availHeight -= strings.Count(downloadBlock, "\n")
+	}
 	if availHeight < 5 {
 		availHeight = 5
 	}
 	if maxRows > availHeight {
 		maxRows = availHeight
 	}
+	mScroll, lScroll := 0, 0
+	if m.logFocused {
+		if m.logPane == logPaneMithril {
+			mScroll = m.logScroll
+		} else {
+			lScroll = m.logScroll
+		}
+	}
+	mLines = visibleLogWindow(mLines, maxRows, mScroll)
+	lLines = visibleLogWindow(lLines, maxRows, lScroll)
 
 	divStyle := lipgloss.NewStyle().Foreground(tui.ColorBorder)
 	div := divStyle.Render("│")
-	truncStyle := lipgloss.NewStyle().MaxWidth(colWidth)
 
 	// Headers — underline the focused pane title
 	var b strings.Builder
+	if controls := m.renderLogControlsLine(); controls != "" {
+		b.WriteString(controls + "\n\n")
+	}
+	if downloadBlock != "" {
+		b.WriteString(downloadBlock + "\n")
+	}
 	var mTitle, lTitle string
 	mTitleStyle := titleStyle
 	lTitleStyle := titleStyle
@@ -691,14 +945,9 @@ func (m model) renderLogsView() string {
 		lTitleStyle = lipgloss.NewStyle().Foreground(tui.MithrilTeal).Bold(true).Underline(true)
 	}
 	mTitle = mTitleStyle.Render("mithril")
-	lTitle = lTitleStyle.Render("lightbringer")
+	lTitle = lTitleStyle.Render(m.lightbringerLogTitle())
 
-	b.WriteString(mTitle)
-	leftPad := colWidth - lipgloss.Width(mTitle)
-	if leftPad > 0 {
-		b.WriteString(strings.Repeat(" ", leftPad))
-	}
-	b.WriteString(" " + div + " " + lTitle + "\n")
+	b.WriteString(padStyledLine(mTitle, colWidth) + " " + div + " " + padStyledLine(lTitle, colWidth) + "\n")
 
 	// Divider line under headers
 	b.WriteString(divStyle.Render(strings.Repeat("─", colWidth)) + " " + div + " " + divStyle.Render(strings.Repeat("─", colWidth)) + "\n")
@@ -713,31 +962,486 @@ func (m model) renderLogsView() string {
 		if i < len(mLines) {
 			if m.logFocused && m.logPane == logPaneMithril {
 				// Active pane: brighter text
-				left = truncStyle.Render(activeLineStyle.Render(mLines[i]))
+				left = activeLineStyle.Render(redactLogLine(mLines[i]))
 			} else {
-				left = truncStyle.Render(colorLine(mLines[i]))
+				left = colorLogLine(mLines[i])
 			}
 		}
 		if i < len(lLines) {
 			if m.logFocused && m.logPane == logPaneLightbringer {
-				right = truncStyle.Render(activeLineStyle.Render(lLines[i]))
+				right = activeLineStyle.Render(redactLogLine(lLines[i]))
 			} else {
-				right = truncStyle.Render(colorLine(lLines[i]))
+				right = colorLogLine(lLines[i])
 			}
 		}
 
-		lPad := colWidth - lipgloss.Width(left)
-		if lPad > 0 {
-			left += strings.Repeat(" ", lPad)
-		}
+		left = padStyledLine(left, colWidth)
+		right = padStyledLine(right, colWidth)
 		b.WriteString(left + " " + div + " " + right + "\n")
 	}
 
 	if m.logFocused {
-		b.WriteString("\n" + hintStyle.Render("  ↑↓ scroll  ←→ switch  esc back") + "\n")
+		b.WriteString("\n" + hintStyle.Render("  ↑↓ scroll  ←→ switch  t full-width  esc menu  q quit") + "\n")
 	}
 
 	return b.String()
+}
+
+func (m model) renderRawLogsView() string {
+	return m.renderRawLogsViewWith(m.rightPaneContentWidth(), m.rawLogRows(false))
+}
+
+func (m model) renderRawLogsViewWith(contentWidth, logRows int) string {
+	titleStyle := lipgloss.NewStyle().Foreground(tui.MithrilTeal).Bold(true)
+	mutedStyle := lipgloss.NewStyle().Foreground(tui.ColorTextMuted)
+	hintStyle := lipgloss.NewStyle().Foreground(tui.ColorTextDisabled)
+	divStyle := lipgloss.NewStyle().Foreground(tui.ColorBorder)
+
+	if contentWidth < 10 {
+		contentWidth = 10
+	}
+	if logRows < 5 {
+		logRows = 5
+	}
+
+	// Snapshot-download progress bar above the tail; reserve rows for it and
+	// strip the raw progress samples from the scrolling text.
+	downloadBlock := renderDownloadProgress(m.mithrilLines, contentWidth)
+	rawSrc := m.combinedRawLogLines()
+	if downloadBlock != "" {
+		rawSrc = filterDownloadProgressLines(rawSrc)
+		logRows -= strings.Count(downloadBlock, "\n")
+		if logRows < 5 {
+			logRows = 5
+		}
+	}
+	lines := dashboardRawLogLines(redactLogLines(rawSrc), contentWidth)
+	lines = visibleLogWindow(lines, logRows, m.logScroll)
+
+	var b strings.Builder
+	subtitle := "  Mithril live tail"
+	if m.hasLightbringerLogPane() {
+		subtitle = "  same run, grouped by source"
+	}
+	b.WriteString(titleStyle.Render("terminal logs") + mutedStyle.Render(subtitle) + "\n")
+	if controls := m.renderLogControlsLine(); controls != "" {
+		b.WriteString(controls + "\n")
+	}
+	if downloadBlock != "" {
+		b.WriteString(downloadBlock + "\n")
+	}
+	b.WriteString(divStyle.Render(strings.Repeat("─", contentWidth)) + "\n")
+	for _, line := range lines {
+		b.WriteString(padStyledLine(colorLogLine(line), contentWidth) + "\n")
+	}
+	tHint := "t full-width"
+	if m.logRawMode {
+		tHint = "t exit full-width"
+	}
+	scrollHint := "enter scroll"
+	if m.logFocused {
+		scrollHint = "↑↓ scroll"
+	}
+	b.WriteString("\n" + hintStyle.Render("  "+scrollHint+"  "+tHint+"  esc menu  q quit") + "\n")
+	return b.String()
+}
+
+func (m model) renderLogControlsLine() string {
+	if !m.logsStopShortcutAvailable() {
+		return ""
+	}
+	keyStyle := lipgloss.NewStyle().Foreground(tui.MithrilTeal).Bold(true)
+	hintStyle := lipgloss.NewStyle().Foreground(tui.ColorTextDisabled)
+	parts := []string{keyStyle.Render("x") + hintStyle.Render(" stop safely")}
+	if m.hasLightbringerLogPane() {
+		viewHint := "terminal view"
+		if m.logRawMode {
+			viewHint = "split view"
+		}
+		parts = append(parts, keyStyle.Render("t")+hintStyle.Render(" "+viewHint))
+	}
+	return "  " + strings.Join(parts, hintStyle.Render("   "))
+}
+
+func (m model) combinedRawLogLines() []string {
+	showSources := m.hasLightbringerLogPane()
+	if showSources {
+		combined := interleavedSourceLogLines(m.mithrilLines, m.lbLines)
+		if len(combined) == 0 {
+			return []string{"(no log lines yet)"}
+		}
+		return combined
+	}
+
+	var combined []string
+	for _, line := range m.mithrilLines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		combined = append(combined, line)
+	}
+	if len(combined) == 0 {
+		return []string{"(no log lines yet)"}
+	}
+	return combined
+}
+
+func interleavedSourceLogLines(mithrilLines, lbLines []string) []string {
+	mLines := nonEmptyLogLines(mithrilLines)
+	lLines := nonEmptyLogLines(lbLines)
+	maxLen := len(mLines)
+	if len(lLines) > maxLen {
+		maxLen = len(lLines)
+	}
+	if maxLen == 0 {
+		return nil
+	}
+
+	combined := make([]string, 0, len(mLines)+len(lLines))
+	mStart := maxLen - len(mLines)
+	lStart := maxLen - len(lLines)
+	for i := 0; i < maxLen; i++ {
+		if i >= mStart {
+			combined = append(combined, "[mithril] "+mLines[i-mStart])
+		}
+		if i >= lStart {
+			combined = append(combined, "[lightbringer] "+lLines[i-lStart])
+		}
+	}
+	return combined
+}
+
+func nonEmptyLogLines(lines []string) []string {
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+func visibleLogWindow(lines []string, height int, scrollBack int) []string {
+	if height <= 0 || len(lines) == 0 {
+		return nil
+	}
+	if len(lines) <= height {
+		return lines
+	}
+	maxStart := len(lines) - height
+	if scrollBack < 0 {
+		scrollBack = 0
+	}
+	start := maxStart - scrollBack
+	if start < 0 {
+		start = 0
+	}
+	end := start + height
+	if end > len(lines) {
+		end = len(lines)
+	}
+	return lines[start:end]
+}
+
+func (m model) maxLogScroll() int {
+	lineCount := m.currentLogLineCount()
+	_, logRows := m.rawLogLayout()
+	if lineCount <= logRows {
+		return 0
+	}
+	return lineCount - logRows
+}
+
+func (m model) currentLogLineCount() int {
+	width, _ := m.rawLogLayout()
+	var lines []string
+	if m.logRawMode || !m.hasLightbringerLogPane() || width < 88 {
+		lines = dashboardRawLogLines(redactLogLines(m.combinedRawLogLines()), width)
+	} else {
+		colWidth := (width - 3) / 2
+		if colWidth < 24 {
+			lines = dashboardRawLogLines(redactLogLines(m.combinedRawLogLines()), width)
+		} else if m.logPane == logPaneLightbringer {
+			lines = wrapLogLines(redactLogLines(m.lbLines), colWidth)
+		} else {
+			lines = wrapLogLines(redactLogLines(m.mithrilLines), colWidth)
+		}
+	}
+	return len(lines)
+}
+
+func (m model) rawLogLayout() (int, int) {
+	if m.fullWidthRawLogs() {
+		return m.fullPaneContentWidth(), m.rawLogRows(true)
+	}
+	return m.rightPaneContentWidth(), m.rawLogRows(false)
+}
+
+func (m model) rawLogRows(fullWidth bool) int {
+	rows := m.height - 22
+	if fullWidth {
+		rows = m.height - 21
+	}
+	if rows < 5 {
+		return 5
+	}
+	return rows
+}
+
+func (m model) hasLightbringerLogPane() bool {
+	if m.cfg == nil {
+		return false
+	}
+	return m.cfg.lbEnabled || (m.cfg.blockSource == "lightbringer" && m.cfg.lbExternalEndpoint != "")
+}
+
+func (m model) rightPaneContentWidth() int {
+	if m.width <= 0 {
+		return 80
+	}
+	if m.width < 60 {
+		width := m.width - 2
+		if width < 10 {
+			return 10
+		}
+		return width
+	}
+	innerWidth := m.width - 3
+	leftWidth := innerWidth * 22 / 100
+	rightWidth := innerWidth - leftWidth
+	if rightWidth < 10 {
+		return 10
+	}
+	return rightWidth
+}
+
+func (m model) fullPaneContentWidth() int {
+	width := m.width - 4
+	if width < 10 {
+		return 10
+	}
+	return width
+}
+
+func (m model) fullWidthRawLogs() bool {
+	return m.mode == modeDashboard &&
+		m.screen == screenLogs &&
+		m.logRawMode &&
+		!m.startFlow.active &&
+		!m.confirmActive
+}
+
+func colorLogLine(line string) string {
+	line = redactLogLine(line)
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return ""
+	}
+	switch {
+	case strings.Contains(line, " WARN ") || strings.Contains(line, " warn ") || strings.HasPrefix(trimmed, "WARN"):
+		return lipgloss.NewStyle().Foreground(tui.ColorWarn).Render(line)
+	case strings.Contains(line, " ERROR ") || strings.Contains(line, " error ") || strings.HasPrefix(trimmed, "ERROR") || strings.Contains(line, "FATAL"):
+		return lipgloss.NewStyle().Foreground(tui.ColorError).Render(line)
+	default:
+		return lipgloss.NewStyle().Foreground(tui.ColorTextMuted).Render(line)
+	}
+}
+
+func redactLogLine(line string) string {
+	return config.RedactSecretsInText(sanitizeTerminalLogLine(line))
+}
+
+func redactLogLines(lines []string) []string {
+	if len(lines) == 0 {
+		return nil
+	}
+	redacted := make([]string, len(lines))
+	for i, line := range lines {
+		redacted[i] = redactLogLine(line)
+	}
+	return redacted
+}
+
+func dashboardRawLogLines(lines []string, width int) []string {
+	if width < 10 {
+		width = 10
+	}
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = compactReplaySlotLogLine(line, width)
+		out = append(out, wrapLogLines([]string{line}, width)...)
+	}
+	return out
+}
+
+func compactReplaySlotLogLine(line string, width int) string {
+	source, rest := splitKnownLogSource(line)
+	if !strings.Contains(rest, " slot ") || !strings.Contains(rest, "| leader:") || !strings.Contains(rest, "| txns:") {
+		return line
+	}
+
+	parts := strings.Split(rest, "|")
+	if len(parts) < 5 {
+		return line
+	}
+
+	ts, slot, ok := parseSlotLogHead(parts[0])
+	if !ok {
+		return line
+	}
+
+	txns := ""
+	cu := ""
+	exec := ""
+	for _, part := range parts[1:] {
+		part = strings.TrimSpace(part)
+		switch {
+		case strings.HasPrefix(part, "txns:"):
+			txns = compactTxnsField(part)
+		case strings.HasPrefix(part, "cu:"):
+			cu = compactCUField(part)
+		case strings.HasPrefix(part, "exec:"):
+			exec = compactValueField(part)
+		}
+	}
+	if txns == "" || exec == "" {
+		return line
+	}
+
+	prefix := source
+	if width < 90 {
+		prefix = compactLogSource(source)
+	}
+	head := strings.TrimSpace(prefix + ts)
+	candidates := [][]string{
+		{compactSlotHead(head, formatSlotForDisplay(slot)), txns, exec, cu},
+		{compactSlotHead(head, slot), txns, exec, cu},
+		{compactSlotHead(head, slot), txns, exec},
+		{"slot " + slot, txns, exec},
+	}
+	for _, candidate := range candidates {
+		candidate = nonEmptyLogLines(candidate)
+		joined := strings.Join(candidate, " | ")
+		if lipgloss.Width(joined) <= width {
+			return joined
+		}
+	}
+	return strings.Join(nonEmptyLogLines([]string{"slot " + slot, txns, exec}), " | ")
+}
+
+func compactSlotHead(head, slot string) string {
+	if head == "" {
+		return "slot " + slot
+	}
+	return head + " slot " + slot
+}
+
+func splitKnownLogSource(line string) (string, string) {
+	for _, source := range []string{"[mithril] ", "[lightbringer] "} {
+		if strings.HasPrefix(line, source) {
+			return source, strings.TrimSpace(strings.TrimPrefix(line, source))
+		}
+	}
+	return "", line
+}
+
+func compactLogSource(source string) string {
+	switch source {
+	case "[mithril] ":
+		return "[m] "
+	case "[lightbringer] ":
+		return "[lb] "
+	default:
+		return source
+	}
+}
+
+func parseSlotLogHead(head string) (timestamp, slot string, ok bool) {
+	head = strings.TrimSpace(head)
+	slotIdx := strings.Index(head, "slot ")
+	if slotIdx < 0 {
+		return "", "", false
+	}
+	timestamp = strings.Join(strings.Fields(strings.TrimSpace(head[:slotIdx])), "")
+	fields := strings.Fields(head[slotIdx:])
+	if len(fields) < 2 {
+		return "", "", false
+	}
+	slot = fields[1]
+	return timestamp, slot, true
+}
+
+func compactTxnsField(field string) string {
+	vote := ""
+	nonVote := ""
+	for _, part := range strings.Fields(field) {
+		switch {
+		case strings.HasPrefix(part, "v:"):
+			vote = strings.TrimPrefix(part, "v:")
+		case strings.HasPrefix(part, "nv:"):
+			nonVote = strings.TrimPrefix(part, "nv:")
+		}
+	}
+	if vote == "" && nonVote == "" {
+		return ""
+	}
+	if vote == "" {
+		return "txns nv" + nonVote
+	}
+	if nonVote == "" {
+		return "txns v" + vote
+	}
+	return "txns v" + vote + "/nv" + nonVote
+}
+
+func compactCUField(field string) string {
+	value := strings.TrimSpace(strings.TrimPrefix(field, "cu:"))
+	n, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return "cu " + value
+	}
+	if n >= 1_000_000 {
+		return fmt.Sprintf("cu %.1fM", n/1_000_000)
+	}
+	return "cu " + strconv.FormatFloat(n, 'f', 0, 64)
+}
+
+func compactValueField(field string) string {
+	fields := strings.Fields(field)
+	if len(fields) < 2 {
+		return strings.TrimSuffix(field, ":")
+	}
+	return strings.TrimSuffix(fields[0], ":") + " " + fields[1]
+}
+
+func formatSlotForDisplay(slot string) string {
+	n, err := strconv.ParseInt(slot, 10, 64)
+	if err != nil {
+		return slot
+	}
+	raw := strconv.FormatInt(n, 10)
+	var b strings.Builder
+	for i, r := range raw {
+		if i > 0 && (len(raw)-i)%3 == 0 {
+			b.WriteByte(',')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+func (m model) lightbringerLogTitle() string {
+	if m.cfg == nil {
+		return "lightbringer"
+	}
+	if m.cfg.blockSource == "lightbringer" && m.cfg.lbExternalEndpoint != "" && !m.cfg.lbEnabled {
+		return "lightbringer (external)"
+	}
+	if m.cfg.lbEnabled {
+		return "lightbringer (managed)"
+	}
+	return "lightbringer"
 }
 
 // wrapLogLines wraps each line to fit within the given width.
@@ -748,24 +1452,57 @@ func wrapLogLines(lines []string, width int) []string {
 	}
 	var result []string
 	for _, line := range lines {
-		if len(line) <= width {
+		if lipgloss.Width(line) <= width {
 			result = append(result, line)
 			continue
 		}
 		// First chunk at full width, continuations indented
-		result = append(result, line[:width])
-		remaining := line[width:]
+		chunk, remaining := splitDisplayWidth(line, width)
+		result = append(result, chunk)
 		contWidth := width - 2 // indent continuation
 		for len(remaining) > 0 {
-			if len(remaining) <= contWidth {
+			if lipgloss.Width(remaining) <= contWidth {
 				result = append(result, "  "+remaining)
 				break
 			}
-			result = append(result, "  "+remaining[:contWidth])
-			remaining = remaining[contWidth:]
+			chunk, remaining = splitDisplayWidth(remaining, contWidth)
+			result = append(result, "  "+chunk)
 		}
 	}
 	return result
+}
+
+func splitDisplayWidth(s string, width int) (string, string) {
+	if width <= 0 || s == "" {
+		return "", s
+	}
+	used := 0
+	cut := 0
+	lastSpaceCut := 0
+	lastSpaceWidth := 0
+	for i, r := range s {
+		rw := lipgloss.Width(string(r))
+		if used+rw > width {
+			break
+		}
+		used += rw
+		cut = i + utf8.RuneLen(r)
+		if r == ' ' || r == '\t' {
+			lastSpaceCut = cut
+			lastSpaceWidth = used
+		}
+	}
+	if cut <= 0 {
+		_, size := utf8.DecodeRuneInString(s)
+		if size <= 0 {
+			return "", ""
+		}
+		cut = size
+	}
+	if cut < len(s) && lastSpaceCut > 0 && lastSpaceWidth >= width/2 {
+		return strings.TrimRight(s[:lastSpaceCut], " \t"), strings.TrimLeft(s[lastSpaceCut:], " \t")
+	}
+	return s[:cut], s[cut:]
 }
 
 // ── Disk View ───────────────────────────────────────────────────────────

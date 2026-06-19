@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -459,6 +460,14 @@ func readTar(
 		if err == io.EOF {
 			break
 		} else if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil || errors.Is(err, context.Canceled) {
+				if ctxErr == nil {
+					ctxErr = err
+				}
+				mlog.Log.Infof("Snapshot unpack stopped during shutdown: %v", ctxErr)
+				cleanupPartial("canceled")
+				return ctxErr
+			}
 			mlog.Log.Errorf("reading next tar: %s\n", err)
 			cleanupPartial("read error")
 			return err
@@ -471,6 +480,14 @@ func readTar(
 		writer := bytes.NewBuffer(make([]byte, 0, header.Size))
 		tarBytesRead, err := io.Copy(writer, tarReader)
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil || errors.Is(err, context.Canceled) {
+				if ctxErr == nil {
+					ctxErr = err
+				}
+				mlog.Log.Infof("Snapshot unpack stopped during shutdown: %v", ctxErr)
+				cleanupPartial("canceled")
+				return ctxErr
+			}
 			mlog.Log.Errorf("err copying data to reader: %s\n", err)
 			cleanupPartial("copy error")
 			return err

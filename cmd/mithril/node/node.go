@@ -2,14 +2,13 @@ package node
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
@@ -26,6 +25,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/lightbringer"
 	"github.com/Overclock-Validator/mithril/pkg/lthash"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/Overclock-Validator/mithril/pkg/procctl"
 	"github.com/Overclock-Validator/mithril/pkg/progress"
 	"github.com/Overclock-Validator/mithril/pkg/replay"
 	"github.com/Overclock-Validator/mithril/pkg/rpcserver"
@@ -105,6 +105,9 @@ var (
 	lightbringerRpcAddr          string
 	lightbringerGrpcAddr         string
 	lightbringerConfigDir        string
+	lightbringerGossipPort       int
+	lightbringerPortRangeStart   int
+	lightbringerPortRangeEnd     int
 	lightbringerInfluxdbHost     string
 	lightbringerInfluxdbDatabase string
 	lightbringerInfluxdbToken    string
@@ -261,6 +264,9 @@ func init() {
 	Run.Flags().IntVar(&blockMaxInflight, "block-max-inflight", 0, "Max concurrent block fetch workers (0 = use default)")
 	Run.Flags().IntVar(&blockTipPollIntervalMs, "block-tip-poll-ms", 0, "Tip poll interval in milliseconds (0 = use default)")
 	Run.Flags().IntVar(&blockTipSafetyMargin, "block-tip-safety-margin", 0, "Don't fetch within N slots of tip (0 = use default)")
+	Run.Flags().IntVar(&lightbringerGossipPort, "lightbringer-gossip-port", 0, "Managed Lightbringer public Solana gossip UDP port (0 = Lightbringer default)")
+	Run.Flags().IntVar(&lightbringerPortRangeStart, "lightbringer-port-range-start", 0, "Managed Lightbringer public Solana UDP port range start (0 = Lightbringer default)")
+	Run.Flags().IntVar(&lightbringerPortRangeEnd, "lightbringer-port-range-end", 0, "Managed Lightbringer public Solana UDP port range end (0 = Lightbringer default)")
 
 }
 
@@ -529,6 +535,9 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	if lightbringerConfigDir == "" {
 		lightbringerConfigDir = "."
 	}
+	lightbringerGossipPort = getInt("lightbringer-gossip-port", "lightbringer.gossip_port")
+	lightbringerPortRangeStart = getInt("lightbringer-port-range-start", "lightbringer.port_range_start")
+	lightbringerPortRangeEnd = getInt("lightbringer-port-range-end", "lightbringer.port_range_end")
 	lightbringerInfluxdbHost = config.GetString("lightbringer.influxdb_host")
 	lightbringerInfluxdbDatabase = config.GetString("lightbringer.influxdb_database")
 	lightbringerInfluxdbToken = config.GetString("lightbringer.influxdb_token")
@@ -554,6 +563,7 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 			mlog.Log.Warnf("lightbringer.grpc_addr (%s) differs from block.lightbringer_endpoint (%s) — using block.lightbringer_endpoint",
 				lightbringerGrpcAddr, lightbringerEndpoint)
 		}
+		mlog.Log.Warnf("managed Lightbringer opens public Solana UDP gossip/repair sockets; ensure firewall rules match lightbringer.gossip_port and lightbringer.port_range_*")
 	}
 
 	// Validate block source requirements
@@ -785,6 +795,15 @@ func buildSnapshotConfig(rpcEndpoints []string) snapshotdl.SnapshotConfig {
 	return cfg
 }
 
+func spawnedByForRun() string {
+	switch v := os.Getenv(procctl.SpawnedByEnv); v {
+	case "dashboard", "external", "cli":
+		return v
+	default:
+		return "cli"
+	}
+}
+
 func runLive(c *cobra.Command, args []string) {
 	if pprofPort != -1 {
 		startPprofHandlers(int(pprofPort))
@@ -796,6 +815,127 @@ func runLive(c *cobra.Command, args []string) {
 
 	// Generate run ID early so it's available for logging and state tracking
 	replay.CurrentRunID = replay.GenerateRunID()
+
+	// Acquire single-instance lock + PID file before any state mutation to avoid concurrent-run corruption.
+	execPath, _ := os.Executable()
+	runHandle, err := procctl.AcquireForRun(procctl.RunOpts{
+		PidPath:    procctl.DefaultPidFile(),
+		LockPath:   procctl.DefaultLockFile(),
+		RunID:      replay.CurrentRunID,
+		BinaryPath: execPath,
+		ConfigPath: config.ConfigFile,
+		SpawnedBy:  spawnedByForRun(),
+	})
+	if err != nil {
+		if errors.Is(err, procctl.ErrLocked) {
+			// Read the existing PID file (if any) so we can show a helpful
+			// message about which mithril is already running.
+			fmt.Fprintln(os.Stderr)
+			fmt.Fprintln(os.Stderr, "E_ALREADY_RUNNING: another mithril is already running on this host.")
+			if info, rerr := procctl.ReadPidFile(procctl.DefaultPidFile()); rerr == nil {
+				fmt.Fprintf(os.Stderr, "  PID:        %d\n", info.Pid)
+				fmt.Fprintf(os.Stderr, "  Run ID:     %s\n", info.RunID)
+				fmt.Fprintf(os.Stderr, "  Started by: %s\n", info.SpawnedBy)
+				if info.BinaryPath != "" {
+					fmt.Fprintf(os.Stderr, "  Binary:     %s\n", info.BinaryPath)
+				}
+			}
+			fmt.Fprintln(os.Stderr)
+			fmt.Fprintln(os.Stderr, "To stop it cleanly:   mithril stop")
+			fmt.Fprintln(os.Stderr)
+			os.Exit(2)
+		}
+		klog.Fatalf("failed to acquire mithril single-instance lock: %v", err)
+	}
+	defer runHandle.Close()
+	var runProgress *runProgressEvents
+	emitProgress := func(phase, status, message string, fields map[string]any) {
+		if runProgress != nil {
+			runProgress.Emit(phase, status, message, fields)
+		}
+	}
+	replayStarted := false
+	recordStartupFailure := func(reason string) {
+		if replayStarted || accountsPath == "" {
+			return
+		}
+		st, err := state.LoadState(accountsPath)
+		if err != nil || st == nil || !st.IsReady() {
+			return
+		}
+		st.CurrentSessionStartedAt = time.Now()
+		reason = strings.Join(strings.Fields(config.RedactSecretsInText(reason)), " ")
+		shutdownReason := state.ShutdownReasonStartupFailed
+		if reason != "" {
+			shutdownReason += ": " + reason
+		}
+		shutdownCtx := &state.ShutdownContext{
+			RunID:          replay.CurrentRunID,
+			WriterVersion:  getVersion(),
+			WriterCommit:   getCommit(),
+			WriterBranch:   getBranch(),
+			ShutdownReason: shutdownReason,
+		}
+		if err := st.RecordSessionShutdown(accountsPath, shutdownCtx); err != nil {
+			mlog.Log.Errorf("failed to record startup failure: %v", err)
+			return
+		}
+		state.RecordShutdown(accountsPath, st.GetCurrentSlot(), st.LastBankhash, replay.CurrentRunID, getVersion(), getCommit(), getBranch(), shutdownReason)
+	}
+	// Declared early so runFatalf can stop the sidecar (klog.Fatalf skips defers; no Pdeathsig on non-Linux).
+	var lbManager *lightbringer.Manager
+	runFatalf := func(format string, args ...interface{}) {
+		// klog.Fatalf calls os.Exit, so deferred runHandle.Close will not run.
+		// Remove only the PID file here; keep the flock held until process exit.
+		emitProgress("error", "error", fmt.Sprintf(format, args...), nil)
+		if runProgress != nil {
+			runProgress.Close()
+		}
+		// Best-effort stop of the managed sidecar so we don't orphan it.
+		if lbManager != nil {
+			_ = lbManager.Stop(5 * time.Second)
+		}
+		_ = procctl.RemovePidFile(procctl.DefaultPidFile())
+		klog.Fatalf(format, args...)
+	}
+	runStartupFatalf := func(format string, args ...interface{}) {
+		recordStartupFailure(fmt.Sprintf(format, args...))
+		runFatalf(format, args...)
+	}
+	bootstrapStartedAt := time.Now()
+	stopIfBootstrapCancelled := func(err error, scope string) bool {
+		if err == nil {
+			return false
+		}
+		if ctx.Err() == nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			return false
+		}
+		emitProgress("shutdown", "ok", "Mithril stopped cleanly", nil)
+		mlog.Log.Infof("%s cancelled during shutdown: %v", scope, err)
+		if accountsPath != "" {
+			st := &state.MithrilState{
+				StateSchemaVersion:      state.CurrentStateSchemaVersion,
+				CurrentRunID:            replay.CurrentRunID,
+				LastWriterVersion:       getVersion(),
+				LastWriterCommit:        getCommit(),
+				LastWriterBranch:        getBranch(),
+				LastCommit:              getCommit(),
+				LastShutdownReason:      state.ShutdownReasonNormal,
+				LastShutdownAt:          time.Now(),
+				CurrentSessionStartedAt: bootstrapStartedAt,
+				Stage:                   "building",
+				BuildStartedAt:          bootstrapStartedAt,
+				BuildMode:               bootstrapMode,
+				Cluster:                 cluster,
+			}
+			if err := st.Save(accountsPath); err != nil {
+				mlog.Log.Errorf("failed to record clean bootstrap shutdown: %v", err)
+			} else {
+				state.RecordShutdown(accountsPath, 0, "", replay.CurrentRunID, getVersion(), getCommit(), getBranch(), state.ShutdownReasonNormal)
+			}
+		}
+		return true
+	}
 
 	// Initialize file logging with defaults
 	// Use config.IsSet() to allow explicit empty/zero values:
@@ -810,6 +950,8 @@ func runLive(c *cobra.Command, args []string) {
 	// Dir: default to /mnt/mithril-logs, but "" disables file logging
 	if config.IsSet("storage.logs") {
 		logCfg.Dir = config.GetString("storage.logs")
+	} else if config.IsSet("log.dir") {
+		logCfg.Dir = config.GetString("log.dir")
 	} else {
 		logCfg.Dir = "/mnt/mithril-logs"
 	}
@@ -854,12 +996,21 @@ func runLive(c *cobra.Command, args []string) {
 		// Non-fatal, continue with stdout-only logging
 		fmt.Fprintf(os.Stderr, "warning: failed to initialize file logging: %v\n", err)
 	}
+	if logDir := mlog.GetLogDir(); logDir != "" {
+		if err := procctl.UpdatePidLogDir(procctl.DefaultPidFile(), logDir); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to update pid log dir: %v\n", err)
+		}
+	}
+	runProgress = newRunProgressEvents()
+	defer runProgress.Close()
+	emitProgress("starting", "running", "Mithril process started", map[string]any{
+		"run_id":     replay.CurrentRunID,
+		"spawned_by": spawnedByForRun(),
+	})
 	defer mlog.Shutdown()
 
-	// Kill any existing mithril processes to prevent zombie accumulation
-	if killed := killExistingMithrilProcesses(); killed > 0 {
-		fmt.Printf("  ⚠ Killed %d existing mithril process(es)\n\n", killed)
-	}
+	// Single-instance enforcement is done above via procctl.AcquireForRun
+	// before any AccountsDB state is mutated or service ports are bound.
 
 	// Override bootstrap mode display when explicit snapshot paths are provided
 	if snapshotArchivePath != "" {
@@ -872,13 +1023,17 @@ func runLive(c *cobra.Command, args []string) {
 	// Now start the metrics server (after banner so errors don't appear first)
 	statsd.StartMetricsServer()
 
-	// Lightbringer sidecar management
-	var lbManager *lightbringer.Manager
+	// Lightbringer sidecar management (lbManager is declared above so runFatalf
+	// can stop it on a fatal abort).
 	useLightbringer := blockSource == "lightbringer"
 	useTurbine := blockSource == "turbine"
 
 	if lightbringerEnabled {
 		lbLogWriter := mlog.Log.CreateSubprocessWriter("lightbringer")
+		emitProgress("lightbringer_config", "running", "Preparing managed Lightbringer", map[string]any{
+			"grpc_addr": lightbringerGrpcAddr,
+			"rpc_addr":  lightbringerRpcAddr,
+		})
 
 		lbManager = lightbringer.NewManager(lightbringer.ManagerConfig{
 			BinaryPath: lightbringerBinaryPath,
@@ -889,6 +1044,9 @@ func runLive(c *cobra.Command, args []string) {
 				Storage:             lightbringerStorage,
 				RpcAddr:             lightbringerRpcAddr,
 				GrpcAddr:            lightbringerGrpcAddr,
+				GossipPort:          lightbringerGossipPort,
+				PortRangeStart:      lightbringerPortRangeStart,
+				PortRangeEnd:        lightbringerPortRangeEnd,
 				InfluxdbHost:        lightbringerInfluxdbHost,
 				InfluxdbDatabase:    lightbringerInfluxdbDatabase,
 				InfluxdbToken:       lightbringerInfluxdbToken,
@@ -901,32 +1059,38 @@ func runLive(c *cobra.Command, args []string) {
 
 		configPath, err := lbManager.WriteConfig()
 		if err != nil {
-			klog.Fatalf("failed to write Lightbringer config: %v", err)
+			runStartupFatalf("failed to write Lightbringer config: %v", err)
 		}
 		mlog.Log.Infof("lightbringer: wrote config to %s", configPath)
 
 		if err := lbManager.Start(); err != nil {
+			emitProgress("lightbringer_fallback", "warn", "Lightbringer failed to start; using RPC fallback", nil)
 			mlog.Log.Warnf("lightbringer: failed to start: %v — falling back to RPC", err)
 			useLightbringer = false
 			if len(rpcEndpoints) == 0 {
-				klog.Fatalf("lightbringer failed to start and no RPC endpoints configured for fallback (set network.rpc)")
+				runStartupFatalf("lightbringer failed to start and no RPC endpoints configured for fallback (set network.rpc)")
 			}
 		} else {
+			emitProgress("lightbringer_starting", "running", "Waiting for Lightbringer stream service", nil)
 			defer func() {
 				if err := lbManager.Stop(10 * time.Second); err != nil {
 					mlog.Log.Warnf("lightbringer: shutdown error: %v", err)
 				}
 			}()
 
-			// Monitor for crashes and auto-restart in background.
-			// Use sync.Once for safe channel close from both the fallback path and the defer.
+			// Auto-restart on crash. sync.Once guards the close (fallback path + defer).
 			lbStopMonitor := make(chan struct{})
 			var lbStopOnce sync.Once
 			stopMonitor := func() { lbStopOnce.Do(func() { close(lbStopMonitor) }) }
 			go lbManager.MonitorAndRestart(lbStopMonitor, 5)
 			defer stopMonitor()
 
-			if err := lbManager.WaitReady(30 * time.Second); err != nil {
+			if err := lbManager.WaitReadyContext(ctx, 30*time.Second); err != nil {
+				if ctx.Err() != nil {
+					mlog.Log.Infof("shutdown requested while waiting for Lightbringer readiness")
+					return
+				}
+				emitProgress("lightbringer_fallback", "warn", "Lightbringer was not ready; using RPC fallback", nil)
 				mlog.Log.Warnf("lightbringer: %v — falling back to RPC", err)
 				useLightbringer = false
 				// Stop the monitor and Lightbringer immediately so they don't run unused during replay.
@@ -935,13 +1099,20 @@ func runLive(c *cobra.Command, args []string) {
 					mlog.Log.Warnf("lightbringer: stop on fallback: %v", stopErr)
 				}
 				if len(rpcEndpoints) == 0 {
-					klog.Fatalf("lightbringer not ready and no RPC endpoints configured for fallback (set network.rpc)")
+					runStartupFatalf("lightbringer not ready and no RPC endpoints configured for fallback (set network.rpc)")
 				}
+			} else {
+				emitProgress("lightbringer_ready", "ok", "Lightbringer is ready", map[string]any{
+					"grpc_addr": lightbringerGrpcAddr,
+				})
 			}
 		}
 	} else if useLightbringer {
 		// block.source=lightbringer but lightbringer.enabled=false — standalone Lightbringer mode
-		mlog.Log.Infof("block.source=lightbringer with external Lightbringer at %s", lightbringerEndpoint)
+		emitProgress("lightbringer_external", "ok", "Using external Lightbringer endpoint", map[string]any{
+			"endpoint": lightbringerEndpoint,
+		})
+		mlog.Log.Infof("block.source=lightbringer with external Lightbringer at %s", config.RedactEndpointForDisplay(lightbringerEndpoint))
 	} else if useTurbine {
 		mlog.Log.Infof("block.source=turbine with native turbine receiver on %s", turbineBindAddr)
 		if turbineGossipEntrypoint != "" {
@@ -953,12 +1124,12 @@ func runLive(c *cobra.Command, args []string) {
 
 	dbgOpts, err := replay.NewDebugOptions(debugTxs, debugAcctWrites, debugDumpEpochVotingRewardDiff)
 	if err != nil {
-		klog.Fatalf("failed to parse --transaction-signatures or --account-writes values: %v", err)
+		runStartupFatalf("failed to parse --transaction-signatures or --account-writes values: %v", err)
 	}
 
 	cpuprofWriter, cpuprofCleanup, err := createBufWriter(cpuprofPath)
 	if err != nil {
-		klog.Fatalf("unable to create cpuprof writer to filename=%s: %v", cpuprofPath, err)
+		runStartupFatalf("unable to create cpuprof writer to filename=%s: %v", cpuprofPath, err)
 	}
 	defer cpuprofCleanup()
 	if cpuprofWriter != nil {
@@ -967,7 +1138,7 @@ func runLive(c *cobra.Command, args []string) {
 	}
 
 	if len(rpcEndpoints) == 0 {
-		rpcEndpoints = []string{"https://api.mainnet-beta.solana.com"}
+		runStartupFatalf("no RPC endpoints configured (set network.rpc)")
 	}
 
 	// Bootstrap: determine how to initialize AccountsDB based on mode
@@ -976,6 +1147,9 @@ func runLive(c *cobra.Command, args []string) {
 	var mithrilState *state.MithrilState
 	// Use configured snapshot directory (storage.snapshots / snapshot.download_path), not scratch
 	snapshotDownloadPath := snapshotDlPath
+	emitProgress("bootstrap_checking", "running", "Checking local AccountsDB and snapshot state", map[string]any{
+		"mode": bootstrapMode,
+	})
 
 	// Prune old history entries if needed (keeps last 100)
 	if accountsPath != "" {
@@ -993,7 +1167,7 @@ func runLive(c *cobra.Command, args []string) {
 		genesisHash := fetchGenesisHash(ctx)
 		if genesisHash != "" {
 			if err := mithrilState.ValidateGenesisHash(genesisHash); err != nil {
-				klog.Fatalf("FATAL: %v\nThis AccountsDB was built for a different cluster. Use --bootstrap snapshot to rebuild.", err)
+				runStartupFatalf("FATAL: %v\nThis AccountsDB was built for a different cluster. Use --bootstrap snapshot to rebuild.", err)
 			}
 			// If state has no genesis hash (older version), set it now
 			if mithrilState.GenesisHash == "" {
@@ -1003,6 +1177,10 @@ func runLive(c *cobra.Command, args []string) {
 					mlog.Log.Infof("WARNING: failed to update state file with cluster info: %v", err)
 				}
 			}
+		}
+		// Stamp session start so a crash this session isn't mistaken for a prior clean exit.
+		if err := mithrilState.StartSession(accountsPath); err != nil {
+			mlog.Log.Infof("WARNING: failed to stamp session start in state file: %v", err)
 		}
 	}
 
@@ -1016,11 +1194,14 @@ func runLive(c *cobra.Command, args []string) {
 	// Handle explicit --snapshot flag (bypasses all auto-discovery, does NOT delete snapshot files)
 	if snapshotArchivePath != "" {
 		mlog.Log.Infof("Using full snapshot: %s", snapshotArchivePath)
+		emitProgress("bootstrap_snapshot", "running", "Building AccountsDB from selected snapshot files", map[string]any{
+			"mode": "explicit",
+		})
 
 		// Parse full snapshot slot from filename for validation
 		fullSnapshotSlot := parseSlotFromSnapshotName(filepath.Base(snapshotArchivePath))
 		if fullSnapshotSlot == 0 {
-			klog.Fatalf("could not parse slot from snapshot filename: %s", snapshotArchivePath)
+			runStartupFatalf("could not parse slot from snapshot filename: %s", snapshotArchivePath)
 		}
 
 		if incrementalSnapshotFilename != "" {
@@ -1029,10 +1210,10 @@ func runLive(c *cobra.Command, args []string) {
 			// Validate incremental base matches full snapshot slot
 			incrBase, incrEnd := parseSlotsFromIncrementalName(filepath.Base(incrementalSnapshotFilename))
 			if incrBase == 0 {
-				klog.Fatalf("could not parse base slot from incremental snapshot filename: %s", incrementalSnapshotFilename)
+				runStartupFatalf("could not parse base slot from incremental snapshot filename: %s", incrementalSnapshotFilename)
 			}
 			if incrBase != fullSnapshotSlot {
-				klog.Fatalf("Incremental base slot %d does not match full snapshot slot %d", incrBase, fullSnapshotSlot)
+				runStartupFatalf("Incremental base slot %d does not match full snapshot slot %d", incrBase, fullSnapshotSlot)
 			}
 			mlog.Log.Infof("Incremental snapshot: base=%d end=%d (validated)", incrBase, incrEnd)
 		}
@@ -1042,7 +1223,10 @@ func runLive(c *cobra.Command, args []string) {
 		dp := progress.NewDualProgress()
 		accountsDb, manifest, err = snapshot.BuildAccountsDbPaths(ctx, snapshotArchivePath, incrementalSnapshotFilename, accountsPath, dp)
 		if err != nil {
-			klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
+			if stopIfBootstrapCancelled(err, "snapshot bootstrap") {
+				return
+			}
+			runFatalf("failed to build AccountsDB from snapshot: %v", err)
 		}
 
 		// Write state file
@@ -1061,19 +1245,22 @@ func runLive(c *cobra.Command, args []string) {
 	case "accountsdb":
 		// Mode: Require existing AccountsDB, never download
 		if !hasValidState && !hasAccountsDB {
-			klog.Fatalf("mode=accountsdb requires existing AccountsDB at %s", accountsPath)
+			runStartupFatalf("mode=accountsdb requires existing AccountsDB at %s", accountsPath)
 		}
+		emitProgress("bootstrap_resume", "running", "Opening existing AccountsDB", map[string]any{
+			"slot": accountsDBSlot,
+		})
 		if !hasValidState {
 			mlog.Log.Infof("WARNING: no state file found, AccountsDB may be from incomplete build")
 		}
 		mlog.Log.Infof("Resuming from existing AccountsDB at slot %d", accountsDBSlot)
 		accountsDb, err = accountsdb.OpenDb(accountsPath)
 		if err != nil {
-			klog.Fatalf("failed to open AccountsDB at %s: %v", accountsPath, err)
+			runFatalf("failed to open AccountsDB at %s: %v", accountsPath, err)
 		}
 		manifest, err = snapshot.LoadManifestFromFile(filepath.Join(accountsPath, "manifest"))
 		if err != nil {
-			klog.Fatalf("failed to load manifest: %v", err)
+			runFatalf("failed to load manifest: %v", err)
 		}
 		refreshManifestSeedFromManifest(accountsPath, mithrilState, manifest)
 		// Run integrity check if we have a state file (warn only, don't fail - user chose force mode)
@@ -1087,8 +1274,11 @@ func runLive(c *cobra.Command, args []string) {
 	case "new-snapshot":
 		// Mode: Always download fresh snapshot, clean everything
 		if snapshotDownloadPath == "" {
-			klog.Fatalf("mode=new-snapshot requires a snapshot directory (set storage.snapshots or snapshot.download_path in config)")
+			runStartupFatalf("mode=new-snapshot requires a snapshot directory (set storage.snapshots or snapshot.download_path in config)")
 		}
+		emitProgress("bootstrap_snapshot", "running", "Downloading fresh snapshot and rebuilding AccountsDB", map[string]any{
+			"mode": "new-snapshot",
+		})
 		mlog.Log.Infof("mode=new-snapshot: Downloading fresh snapshot")
 		if accountsPath != "" {
 			// Record rebuild in history before cleanup (history file is preserved)
@@ -1111,7 +1301,10 @@ func runLive(c *cobra.Command, args []string) {
 		}
 		accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPath, blockstorePath)
 		if err != nil {
-			klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
+			if stopIfBootstrapCancelled(err, "snapshot bootstrap") {
+				return
+			}
+			runFatalf("failed to build AccountsDB from snapshot: %v", err)
 		}
 		// Write state file to mark build as complete
 		snapshotEpoch := snapshotEpochForState(manifest)
@@ -1127,8 +1320,11 @@ func runLive(c *cobra.Command, args []string) {
 	case "snapshot":
 		// Mode: Rebuild AccountsDB from snapshot, reuse existing snapshot file if fresh enough
 		if snapshotDownloadPath == "" {
-			klog.Fatalf("mode=snapshot requires a snapshot directory (set storage.snapshots or snapshot.download_path in config)")
+			runStartupFatalf("mode=snapshot requires a snapshot directory (set storage.snapshots or snapshot.download_path in config)")
 		}
+		emitProgress("bootstrap_snapshot", "running", "Preparing snapshot rebuild", map[string]any{
+			"mode": "snapshot",
+		})
 		mlog.Log.Infof("mode=snapshot: Will rebuild AccountsDB from snapshot")
 		if accountsPath != "" {
 			// Record rebuild in history before cleanup (history file is preserved)
@@ -1150,10 +1346,14 @@ func runLive(c *cobra.Command, args []string) {
 
 		if existingSnap != nil {
 			// Reuse existing snapshot
+			emitProgress("bootstrap_snapshot", "running", "Building AccountsDB from existing snapshot", map[string]any{
+				"slot": existingSnap.slot,
+			})
 			mlog.Log.Infof("Reusing existing snapshot file at slot %d", existingSnap.slot)
 			accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPath, blockstorePath, rpcEndpoints)
 		} else {
 			// Download fresh
+			emitProgress("bootstrap_snapshot", "running", "Downloading snapshot and building AccountsDB", nil)
 			mlog.Log.Infof("no fresh snapshot file found, downloading new one")
 			// Clean up old snapshot files based on retention settings
 			if snapshotDownloadPath != "" {
@@ -1166,7 +1366,10 @@ func runLive(c *cobra.Command, args []string) {
 			accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPath, blockstorePath)
 		}
 		if err != nil {
-			klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
+			if stopIfBootstrapCancelled(err, "snapshot bootstrap") {
+				return
+			}
+			runFatalf("failed to build AccountsDB from snapshot: %v", err)
 		}
 		// Write state file to mark build as complete
 		snapshotEpoch := snapshotEpochForState(manifest)
@@ -1209,8 +1412,11 @@ func runLive(c *cobra.Command, args []string) {
 				if choice == 2 {
 					// User chose to start fresh from snapshot
 					if snapshotDownloadPath == "" {
-						klog.Fatalf("cannot rebuild from snapshot: no snapshot directory configured (set storage.snapshots or snapshot.download_path in config)")
+						runStartupFatalf("cannot rebuild from snapshot: no snapshot directory configured (set storage.snapshots or snapshot.download_path in config)")
 					}
+					emitProgress("bootstrap_snapshot", "running", "Rebuilding stale AccountsDB from snapshot", map[string]any{
+						"slots_behind": slotsBehind,
+					})
 					mlog.Log.Infof("User chose to rebuild from latest snapshot")
 					if accountsPath != "" {
 						// Record rebuild in history before cleanup (history file is preserved)
@@ -1222,10 +1428,14 @@ func runLive(c *cobra.Command, args []string) {
 					// Check for existing fresh snapshot
 					existingSnap := detectFreshSnapshot(snapshotDownloadPath, fullThreshold, rpcEndpoints, ctx)
 					if existingSnap != nil {
+						emitProgress("bootstrap_snapshot", "running", "Building AccountsDB from existing snapshot", map[string]any{
+							"slot": existingSnap.slot,
+						})
 						mlog.Log.Infof("Reusing existing snapshot file at slot %d", existingSnap.slot)
 						accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPath, blockstorePath, rpcEndpoints)
 					} else {
 						// Clean up old snapshot files
+						emitProgress("bootstrap_snapshot", "running", "Downloading snapshot and building AccountsDB", nil)
 						if snapshotDownloadPath != "" {
 							maxSnapshots := config.GetInt("snapshot.max_full_snapshots")
 							if maxSnapshots == 0 {
@@ -1236,7 +1446,10 @@ func runLive(c *cobra.Command, args []string) {
 						accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPath, blockstorePath)
 					}
 					if err != nil {
-						klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
+						if stopIfBootstrapCancelled(err, "snapshot bootstrap") {
+							return
+						}
+						runFatalf("failed to build AccountsDB from snapshot: %v", err)
 					}
 					snapshotEpoch := snapshotEpochForState(manifest)
 					mithrilState = state.NewReadyState(manifest.Bank.Slot, snapshotEpoch, "", "", 0, 0)
@@ -1253,15 +1466,18 @@ func runLive(c *cobra.Command, args []string) {
 			}
 
 			mlog.Log.Infof("mode=auto: Resuming from existing AccountsDB at slot %d", accountsDBSlot)
+			emitProgress("bootstrap_resume", "running", "Opening existing AccountsDB", map[string]any{
+				"slot": accountsDBSlot,
+			})
 			// Record resume in history
 			state.RecordResume(accountsPath, mithrilState.LastSlot, mithrilState.LastBankhash, replay.CurrentRunID, getVersion(), getCommit(), getBranch())
 			accountsDb, err = accountsdb.OpenDb(accountsPath)
 			if err != nil {
-				klog.Fatalf("failed to open AccountsDB at %s: %v", accountsPath, err)
+				runFatalf("failed to open AccountsDB at %s: %v", accountsPath, err)
 			}
 			manifest, err = snapshot.LoadManifestFromFile(filepath.Join(accountsPath, "manifest"))
 			if err != nil {
-				klog.Fatalf("failed to load manifest: %v", err)
+				runFatalf("failed to load manifest: %v", err)
 			}
 			refreshManifestSeedFromManifest(accountsPath, mithrilState, manifest)
 
@@ -1284,18 +1500,21 @@ func runLive(c *cobra.Command, args []string) {
 				accountsDb.CloseDb()
 
 				mlog.Log.Infof("restart mithril to automatically rebuild from snapshot")
-				klog.Fatalf("AccountsDB corrupted - restart to rebuild")
+				runFatalf("AccountsDB corrupted - restart to rebuild")
 			}
 		} else {
 			// No valid state - need to clean and rebuild from snapshot
 			if snapshotDownloadPath == "" {
-				klog.Fatalf("mode=auto requires a snapshot directory to rebuild (set storage.snapshots or snapshot.download_path in config)")
+				runStartupFatalf("mode=auto requires a snapshot directory to rebuild (set storage.snapshots or snapshot.download_path in config)")
 			}
 			if hasAccountsDB {
 				mlog.Log.Infof("mode=auto: AccountsDB exists but state invalid, rebuilding from snapshot")
 			} else {
 				mlog.Log.Infof("mode=auto: No existing AccountsDB, will download snapshot")
 			}
+			emitProgress("bootstrap_snapshot", "running", "Building AccountsDB from snapshot", map[string]any{
+				"mode": "auto",
+			})
 			if accountsPath != "" {
 				// Record rebuild in history before cleanup (history file is preserved)
 				// Try to load any existing state (even invalid) to capture slot info
@@ -1317,10 +1536,14 @@ func runLive(c *cobra.Command, args []string) {
 			// Check for existing fresh snapshot
 			existingSnap := detectFreshSnapshot(snapshotDownloadPath, fullThreshold, rpcEndpoints, ctx)
 			if existingSnap != nil {
+				emitProgress("bootstrap_snapshot", "running", "Building AccountsDB from existing snapshot", map[string]any{
+					"slot": existingSnap.slot,
+				})
 				mlog.Log.Infof("Reusing existing snapshot file at slot %d", existingSnap.slot)
 				accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPath, blockstorePath, rpcEndpoints)
 			} else {
 				// Clean up old snapshot files based on retention settings
+				emitProgress("bootstrap_snapshot", "running", "Downloading snapshot and building AccountsDB", nil)
 				maxSnapshots := config.GetInt("snapshot.max_full_snapshots")
 				if maxSnapshots == 0 {
 					maxSnapshots = 1 // default: keep 1 snapshot
@@ -1329,7 +1552,10 @@ func runLive(c *cobra.Command, args []string) {
 				accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPath, blockstorePath)
 			}
 			if err != nil {
-				klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
+				if stopIfBootstrapCancelled(err, "snapshot bootstrap") {
+					return
+				}
+				runFatalf("failed to build AccountsDB from snapshot: %v", err)
 			}
 			// Write state file to mark build as complete
 			snapshotEpoch := snapshotEpochForState(manifest)
@@ -1461,10 +1687,14 @@ postBootstrap:
 		// Record bootstrap in history
 		state.RecordBootstrap(accountsPath, manifest.Bank.Slot, "", replay.CurrentRunID, getVersion(), getCommit(), getBranch())
 	}
+	emitProgress("bootstrap_ready", "ok", "AccountsDB is ready", map[string]any{
+		"snapshot_slot": snapshotBaseSlot,
+		"start_slot":    startSlot,
+	})
 
 	// Support finite replay: --end-slot or --num-slots
 	if endSlot != -1 && numReplaySlots != 0 {
-		klog.Fatalf("specify at most one of --end-slot and --num-slots")
+		runStartupFatalf("specify at most one of --end-slot and --num-slots")
 	}
 	liveEndSlot := uint64(math.MaxUint64)
 	if endSlot != -1 {
@@ -1481,7 +1711,7 @@ postBootstrap:
 	replayTimingsPath := filepath.Join(mlog.GetLogDir(), "replay_timings.jsonl")
 	metricsWriter, metricsWriterCleanup, err := createBufWriter(replayTimingsPath)
 	if err != nil {
-		klog.Fatalf("unable to create replay timings writer: %v", err)
+		runStartupFatalf("unable to create replay timings writer: %v", err)
 	}
 	defer metricsWriterCleanup()
 
@@ -1497,7 +1727,7 @@ postBootstrap:
 
 	var rpcServer *rpcserver.RpcServer
 	if rpcPort < 0 || rpcPort > 65535 {
-		klog.Fatalf("invalid port: %d", rpcPort)
+		runStartupFatalf("invalid port: %d", rpcPort)
 	} else if rpcPort != 0 {
 		rpcServer = rpcserver.NewRpcServer(accountsDb, uint16(rpcPort), epochScheduleFromState(mithrilState))
 		rpcServer.Start()
@@ -1557,7 +1787,31 @@ postBootstrap:
 	if rpcServer != nil {
 		slotCtxSetter = rpcServer
 	}
+	replayStarted = true
+	emitProgress("replay_starting", "running", "Starting block replay", map[string]any{
+		"start_slot":         startSlot,
+		"end_slot":           liveEndSlot,
+		"block_source":       blockSource,
+		"use_lightbringer":   useLightbringer,
+		"tx_parallelism":     txParallelism,
+		"rpc_server_enabled": rpcServer != nil,
+	})
 	result := runReplayWithRecovery(ctx, accountsDb, accountsPath, manifest, resumeState, uint64(startSlot), liveEndSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, uint16(turbineShredVersion), blockstorePath, int(txParallelism), true, useLightbringer, useTurbine, dbgOpts, metricsWriter, slotCtxSetter, mithrilState, blockFetchOpts, consensusOpts, replayStartTime)
+	switch {
+	case result.Error != nil:
+		emitProgress("replay_stopped", "error", "Replay stopped with an error", map[string]any{
+			"last_persisted_slot": result.LastPersistedSlot,
+			"error":               result.Error.Error(),
+		})
+	case result.WasCancelled:
+		emitProgress("shutdown", "ok", "Mithril stopped cleanly", map[string]any{
+			"last_persisted_slot": result.LastPersistedSlot,
+		})
+	default:
+		emitProgress("completed", "ok", "Replay completed", map[string]any{
+			"last_persisted_slot": result.LastPersistedSlot,
+		})
+	}
 
 	if result.Error != nil {
 		if result.LastPersistedSlot == 0 {
@@ -1634,6 +1888,20 @@ postBootstrap:
 			if err := mithrilState.UpdateOnShutdown(accountsPath, result.LastPersistedSlot, result.LastPersistedBankhash, shutdownCtx); err != nil {
 				mlog.Log.Errorf("failed to update state file: %v", err)
 			}
+		}
+	}
+	if result.LastPersistedSlot == 0 && result.WasCancelled && mithrilState != nil && !result.StateWrittenOnCancel {
+		shutdownCtx := &state.ShutdownContext{
+			RunID:          replay.CurrentRunID,
+			WriterVersion:  getVersion(),
+			WriterCommit:   getCommit(),
+			WriterBranch:   getBranch(),
+			ShutdownReason: state.ShutdownReasonNormal,
+		}
+		if err := mithrilState.RecordSessionShutdown(accountsPath, shutdownCtx); err != nil {
+			mlog.Log.Errorf("failed to record clean shutdown without replay progress: %v", err)
+		} else {
+			state.RecordShutdown(accountsPath, mithrilState.GetCurrentSlot(), mithrilState.LastBankhash, replay.CurrentRunID, getVersion(), getCommit(), getBranch(), state.ShutdownReasonNormal)
 		}
 	}
 
@@ -1962,9 +2230,9 @@ func printStartupInfo(commandName string) {
 
 	// RPC endpoints - show auxiliary (network.rpc) endpoints
 	if len(rpcEndpoints) > 0 {
-		fmt.Printf("  RPC:          %s%s%s (primary)\n", gold, rpcEndpoints[0], reset)
+		fmt.Printf("  RPC:          %s%s%s (primary)\n", gold, config.RedactEndpointForDisplay(rpcEndpoints[0]), reset)
 		for _, ep := range rpcEndpoints[1:] {
-			fmt.Printf("                %s%s%s (fallback)\n", gold, ep, reset)
+			fmt.Printf("                %s%s%s (fallback)\n", gold, config.RedactEndpointForDisplay(ep), reset)
 		}
 	}
 	if blockSource == "lightbringer" && lightbringerEndpoint != "" {
@@ -1982,8 +2250,29 @@ func printStartupInfo(commandName string) {
 	if blockSource == "turbine" && turbineAdvertisedIP != "" {
 		fmt.Printf("  Advertised:   %s%s%s\n", gold, turbineAdvertisedIP, reset)
 	}
+	if lightbringerEnabled {
+		gossipPort, portRangeStart, portRangeEnd := effectiveLightbringerGossipPorts()
+		fmt.Printf("  LB gossip:    %sUDP %d, range %d-%d%s %s(public Solana gossip/repair)%s\n",
+			gold, gossipPort, portRangeStart, portRangeEnd, reset, dim, reset)
+	}
 
 	fmt.Println()
+}
+
+func effectiveLightbringerGossipPorts() (int, int, int) {
+	gossipPort := lightbringerGossipPort
+	if gossipPort == 0 {
+		gossipPort = 65400
+	}
+	portRangeStart := lightbringerPortRangeStart
+	if portRangeStart == 0 {
+		portRangeStart = 65401
+	}
+	portRangeEnd := lightbringerPortRangeEnd
+	if portRangeEnd == 0 {
+		portRangeEnd = 65500
+	}
+	return gossipPort, portRangeStart, portRangeEnd
 }
 
 // snapshotInfo holds information about a detected snapshot file
@@ -2221,8 +2510,20 @@ func queryLatestSnapshotSlot(ctx context.Context, rpcEndpoints []string) (uint64
 	return uint64(info.Slot), nil
 }
 
+// ensureDiskSpaceForBuild fails fast if accountsPath/snapshotDir can't hold the AccountsDB.
+func ensureDiskSpaceForBuild(accountsPath, snapshotDir string) error {
+	c := config.CheckBuildSpace(config.GetString("network.cluster"), accountsPath, snapshotDir)
+	if !c.Determined || c.OK {
+		return nil // unknown free space — don't block; or there's room
+	}
+	return errors.New(c.Reason)
+}
+
 // buildFromExistingSnapshot builds AccountsDB from an existing downloaded snapshot file.
 func buildFromExistingSnapshot(ctx context.Context, snap *snapshotInfo, snapshotDir, accountsPath, blockstorePath string, rpcEndpoints []string) (*accountsdb.AccountsDb, *snapshot.SnapshotManifest, error) {
+	if err := ensureDiskSpaceForBuild(accountsPath, snapshotDir); err != nil {
+		return nil, nil, err
+	}
 	snapCfg := buildSnapshotConfig(rpcEndpoints)
 
 	// Construct full path to snapshot file
@@ -2243,6 +2544,9 @@ func buildFromExistingSnapshot(ctx context.Context, snap *snapshotInfo, snapshot
 
 // downloadAndBuildFromSnapshot finds, downloads, and builds AccountsDB from a snapshot
 func downloadAndBuildFromSnapshot(ctx context.Context, rpcEndpoints []string, snapshotDownloadPath, accountsPath, blockstorePath string) (*accountsdb.AccountsDb, *snapshot.SnapshotManifest, error) {
+	if err := ensureDiskSpaceForBuild(accountsPath, snapshotDownloadPath); err != nil {
+		return nil, nil, err
+	}
 	snapCfg := buildSnapshotConfig(rpcEndpoints)
 	fullSnapshotDlStart := time.Now()
 	fullSnapshotInfo, err := snapshotdl.GetSnapshotURLWithInfo(ctx, snapCfg)
@@ -2273,56 +2577,6 @@ func downloadAndBuildFromSnapshot(ctx context.Context, rpcEndpoints []string, sn
 	mlog.Log.Infof("Finished building AccountsDB")
 
 	return accountsDb, manifest, nil
-}
-
-// killExistingMithrilProcesses finds and kills any other running mithril processes.
-// This prevents zombie processes from accumulating and holding disk space.
-// Returns the number of processes killed.
-func killExistingMithrilProcesses() int {
-	myPID := os.Getpid()
-	myPPID := os.Getppid()
-
-	// Use pgrep to find mithril processes by executable name (not full command line)
-	// This avoids matching sudo or shell processes that have "mithril" in args
-	cmd := exec.Command("pgrep", "-x", "mithril")
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	err := cmd.Run()
-	if err != nil {
-		// No processes found or pgrep not available
-		return 0
-	}
-
-	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
-	killed := 0
-
-	for _, line := range lines {
-		if line == "" {
-			continue
-		}
-		pid, err := strconv.Atoi(strings.TrimSpace(line))
-		if err != nil {
-			continue
-		}
-
-		// Don't kill ourselves or our parent (sudo)
-		if pid == myPID || pid == myPPID {
-			continue
-		}
-
-		// Try to kill the process
-		proc, err := os.FindProcess(pid)
-		if err != nil {
-			continue
-		}
-
-		// Send SIGKILL
-		if err := proc.Signal(syscall.SIGKILL); err == nil {
-			killed++
-		}
-	}
-
-	return killed
 }
 
 // decodeRecentBlockhashes converts state.BlockhashEntry list to sealevel.SysvarRecentBlockhashes

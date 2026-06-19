@@ -150,12 +150,9 @@ func Initialize(cfg LogConfig, runID string) error {
 		Log.writer = nil
 	}
 
-	// Create symlink to latest run directory
-	symlinkPath := filepath.Join(cfg.Dir, "latest")
-	os.Remove(symlinkPath) // Ignore error if doesn't exist
-	if err := os.Symlink(runDirName, symlinkPath); err != nil {
-		// Non-fatal, just log to stdout
-		fmt.Fprintf(os.Stderr, "warning: failed to create symlink %s: %v\n", symlinkPath, err)
+	// Point "latest" at this run dir (atomic; non-fatal on failure).
+	if err := swapLatestSymlink(cfg.Dir, runDirName, shortRunID); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: %v\n", err)
 	}
 
 	// Append to runs.log at the base directory level (tracks all runs)
@@ -165,9 +162,26 @@ func Initialize(cfg LogConfig, runID string) error {
 	// Start background flush goroutine
 	Log.stopCh = make(chan struct{})
 	Log.wg.Add(1)
-	go Log.flushLoop()
+	go Log.flushLoop(Log.stopCh)
 
 	Log.initialized = true
+	return nil
+}
+
+// swapLatestSymlink atomically repoints baseDir/latest via Symlink(tmp)+Rename
+// (atomic on POSIX). Failure is non-fatal.
+func swapLatestSymlink(baseDir, runDirName, shortRunID string) error {
+	latestPath := filepath.Join(baseDir, "latest")
+	tmpName := latestPath + ".tmp." + shortRunID
+	_ = os.Remove(tmpName) // best-effort: prior crash may have left it
+
+	if err := os.Symlink(runDirName, tmpName); err != nil {
+		return fmt.Errorf("create temp symlink %s: %w", tmpName, err)
+	}
+	if err := os.Rename(tmpName, latestPath); err != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("rename %s -> %s: %w", tmpName, latestPath, err)
+	}
 	return nil
 }
 
@@ -187,11 +201,8 @@ func appendRunsLogEntry(runsLogPath string, ts time.Time, runID, commit, runDir 
 	}
 }
 
-// CreateSubprocessWriter returns a writer for a named subprocess (e.g. "lightbringer")
-// that routes output to a dedicated log file in the current run directory. Subprocess
-// output is not mirrored to the terminal, keeping Mithril's own output readable.
-// When file logging is not initialized, output falls back to stderr with a
-// "[name] " prefix so developers running without a log directory can still see it.
+// CreateSubprocessWriter routes a subprocess's output to its own log file in the
+// run directory (not the terminal). Falls back to prefixed stderr when no run dir.
 func (l *logger) CreateSubprocessWriter(name string) io.Writer {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -210,8 +221,7 @@ func (l *logger) CreateSubprocessWriter(name string) io.Writer {
 	}
 }
 
-// prefixWriter wraps an io.Writer and prepends a prefix to each line.
-// Used only as a fallback when subprocess file logging is not available.
+// prefixWriter prepends a prefix to each line. Fallback for subprocess stderr.
 type prefixWriter struct {
 	w      io.Writer
 	prefix string
@@ -224,7 +234,7 @@ func newPrefixWriter(w io.Writer, prefix string) *prefixWriter {
 func (pw *prefixWriter) Write(p []byte) (int, error) {
 	lines := bytes.Split(p, []byte("\n"))
 	for i, line := range lines {
-		// Skip the trailing empty element produced by bytes.Split when input ends in '\n'.
+		// Skip trailing empty element from a final '\n'.
 		if len(line) == 0 && i == len(lines)-1 {
 			continue
 		}
@@ -236,7 +246,7 @@ func (pw *prefixWriter) Write(p []byte) (int, error) {
 }
 
 // flushLoop periodically flushes the buffer and syncs to disk
-func (l *logger) flushLoop() {
+func (l *logger) flushLoop(stopCh chan struct{}) {
 	defer l.wg.Done()
 
 	flushTicker := time.NewTicker(2 * time.Second)
@@ -246,7 +256,7 @@ func (l *logger) flushLoop() {
 
 	for {
 		select {
-		case <-l.stopCh:
+		case <-stopCh:
 			return
 		case <-flushTicker.C:
 			l.flush()
@@ -256,9 +266,23 @@ func (l *logger) flushLoop() {
 	}
 }
 
+// flushLocked drains and writes the buffer; caller must hold fileMu.
+// Lock order: fileMu (outer) -> mu (inner), never reversed.
+func (l *logger) flushLocked() {
+	pending := l.drainPending()
+	if len(pending) == 0 || l.fileWriter == nil {
+		return
+	}
+	if _, err := l.fileWriter.Write(pending); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to write mithril log: %v\n", err)
+	}
+}
+
 // flush flushes the buffer without syncing
 func (l *logger) flush() {
-	l.writePending(l.drainPending())
+	l.fileMu.Lock()
+	defer l.fileMu.Unlock()
+	l.flushLocked()
 }
 
 // Flush flushes the log buffer to ensure all pending messages are written.
@@ -269,7 +293,9 @@ func Flush() {
 
 // flushAndSync flushes and syncs to disk
 func (l *logger) flushAndSync() {
-	l.writePending(l.drainPending())
+	l.fileMu.Lock()
+	defer l.fileMu.Unlock()
+	l.flushLocked()
 	// lumberjack doesn't expose Sync, but draining the in-memory buffer is
 	// sufficient for most cases.
 }
@@ -292,9 +318,10 @@ func Shutdown() {
 		Log.wg.Wait()
 	}
 
-	Log.writePending(Log.drainPending())
-
+	// Drain+write+close under fileMu so a concurrent flush can't write after
+	// (or interleave with) the final drain.
 	Log.fileMu.Lock()
+	Log.flushLocked()
 	if Log.fileWriter != nil {
 		Log.fileWriter.Close()
 	}
@@ -345,7 +372,7 @@ func SaveRunConfig(configContent []byte) error {
 	}
 
 	configPath := filepath.Join(runDir, "config.toml")
-	if err := os.WriteFile(configPath, configContent, 0644); err != nil {
+	if err := os.WriteFile(configPath, configContent, 0600); err != nil {
 		return fmt.Errorf("failed to save config to run directory: %w", err)
 	}
 	return nil
@@ -476,17 +503,6 @@ func (l *logger) drainPendingLocked() []byte {
 	return pending
 }
 
-func (l *logger) writePending(pending []byte) {
-	if len(pending) == 0 || l.fileWriter == nil {
-		return
-	}
-	l.fileMu.Lock()
-	defer l.fileMu.Unlock()
-	if _, err := l.fileWriter.Write(pending); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: failed to write mithril log: %v\n", err)
-	}
-}
-
 func (l *logger) Debugf(format string, args ...interface{}) {
 	if l.level > LevelDebug && !l.enableVerbose.Load() {
 		return
@@ -533,7 +549,10 @@ func (l *logger) Warnf(format string, args ...interface{}) {
 
 func (l *logger) Errorf(format string, args ...interface{}) {
 	msg := fmt.Sprintf("%sERROR: %s\n", relativePrefix(), fmt.Sprintf(format, args...))
-	l.writeImmediate(msg) // Errors always flush immediately
+	l.writeImmediate(msg)
+	// Error lines often precede fatal returns or panics. Persist them now so a
+	// process-wide crash in another goroutine does not leave only stdout/stderr.
+	l.flush()
 }
 
 func (l *logger) EnableInfLogging() {

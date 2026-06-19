@@ -8,10 +8,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Overclock-Validator/mithril/cmd/mithril/setupcmd"
+	"github.com/Overclock-Validator/mithril/pkg/config"
+	"github.com/Overclock-Validator/mithril/pkg/procctl"
 	"github.com/Overclock-Validator/mithril/pkg/tui"
-	"github.com/Overclock-Validator/mithril/pkg/version"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
@@ -36,6 +38,7 @@ func init() {
 
 const (
 	screenOverview = iota
+	screenProcess  // guided run/stop flow backed by procctl process controls
 	screenConfig
 	screenEdit // inline config editing
 	screenDoctor
@@ -80,13 +83,29 @@ type dataRefreshedMsg struct {
 	checks       []checkResult
 	mithrilLines []string
 	lbLines      []string
+	progress     []progressEvent
+	snapshot     snapshotActivity
+	accounts     accountsActivity
+	preflightErr string
 }
 
 type diskRefreshedMsg struct {
 	disks []diskUsage
 }
 
-func fetchDataCmd(cfgFile string) tea.Cmd {
+// procDetectedMsg carries a procctl.Detect result. err set = render error;
+// det nil and err empty = not yet fetched.
+type procDetectedMsg struct {
+	det *procctl.Detection
+	err string
+}
+
+type configFixResultMsg struct {
+	summary string
+	err     string
+}
+
+func fetchDataCmd(cfgFile string, spawnLogs dashboardSpawnLogs) tea.Cmd {
 	return func() tea.Msg {
 		var cfg *configData
 		var state *nodeState
@@ -105,9 +124,17 @@ func fetchDataCmd(cfgFile string) tea.Cmd {
 		checks := runDoctorChecks(cfgFile, cfg)
 
 		var mithrilLines, lbLines []string
+		var progressEvents []progressEvent
+		var snapshot snapshotActivity
+		var accounts accountsActivity
+		var preflightErr string
 		if cfg != nil {
-			mithrilLines = readLogTail(cfg.logsPath, "mithril.log", 50)
-			lbLines = readLogTail(cfg.logsPath, "lightbringer.log", 50)
+			mithrilLines = mithrilLogLines(cfg.logsPath, 50, spawnLogs)
+			lbLines = lightbringerLogLines(cfg, 50)
+			progressEvents = readProgressEvents(cfg.logsPath, 12)
+			snapshot = readSnapshotActivity(cfg.snapshotsPath)
+			accounts = readAccountsActivity(cfg.accountsPath)
+			preflightErr = preflightCheck(cfg, cfg.accountsPath)
 		}
 
 		return dataRefreshedMsg{
@@ -118,8 +145,16 @@ func fetchDataCmd(cfgFile string) tea.Cmd {
 			checks:       checks,
 			mithrilLines: mithrilLines,
 			lbLines:      lbLines,
+			progress:     progressEvents,
+			snapshot:     snapshot,
+			accounts:     accounts,
+			preflightErr: preflightErr,
 		}
 	}
+}
+
+func (m model) fetchDataCmd() tea.Cmd {
+	return fetchDataCmd(m.configFile, m.lastSpawnLogs)
 }
 
 func fetchDiskCmd(cfg *configData) tea.Cmd {
@@ -128,12 +163,34 @@ func fetchDiskCmd(cfg *configData) tea.Cmd {
 	}
 }
 
+// fetchProcessCmd runs procctl.Detect and returns a procDetectedMsg.
+// Serialize via proc.inflight so a tick racing a refresh can't stack calls.
+func fetchProcessCmd(accountsDir string) tea.Cmd {
+	return func() tea.Msg {
+		det, err := procctl.Detect(procctl.DefaultPidFile(), procctl.DefaultLockFile(), accountsDir)
+		if err != nil {
+			return procDetectedMsg{err: err.Error()}
+		}
+		return procDetectedMsg{det: det}
+	}
+}
+
+// triggerProcessFetch fetches process state, or returns nil if a fetch is
+// already in flight. Sets the inflight gate, so needs a pointer receiver.
+func (m *model) triggerProcessFetch() tea.Cmd {
+	if m.proc.inflight {
+		return nil
+	}
+	m.proc.inflight = true
+	return fetchProcessCmd(m.procAccountsDir())
+}
+
 func tickCmd() tea.Cmd {
 	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
 func slowTickCmd() tea.Cmd {
-	return tea.Tick(30*time.Second, func(t time.Time) tea.Msg { return slowTickMsg(t) })
+	return tea.Tick(10*time.Second, func(t time.Time) tea.Msg { return slowTickMsg(t) })
 }
 
 type tickMsg time.Time
@@ -174,20 +231,79 @@ type model struct {
 	rightScroll int
 
 	// Data
-	cfg          *configData
-	state        *nodeState
-	services     []serviceStatus
-	disks        []diskUsage
-	checks       []checkResult
-	mithrilLines []string
-	lbLines      []string
-	logScroll    int  // scroll offset for focused log pane
-	logFocused   bool // true when user is scrolling logs with ↑↓
-	logPane      int  // 0=mithril (left), 1=lightbringer (right)
-	disksLoaded  bool // true after first disk fetch completes
+	cfg           *configData
+	state         *nodeState
+	services      []serviceStatus
+	disks         []diskUsage
+	checks        []checkResult
+	mithrilLines  []string
+	lbLines       []string
+	progress      []progressEvent
+	snapshot      snapshotActivity
+	accounts      accountsActivity
+	logScroll     int  // scroll offset for focused log pane
+	logFocused    bool // true when user is scrolling logs with ↑↓
+	logPane       int  // 0=mithril (left), 1=lightbringer (right)
+	logRawMode    bool // true renders a full-width terminal log tail
+	lastSpawnLogs dashboardSpawnLogs
+	disksLoaded   bool // true after first disk fetch completes
+	runFocused    bool // true when the Run Node action list owns arrow/enter
+	runActionIdx  int  // selected action in the Run Node right pane
+	startFlow     startFlowState
+
+	// proc holds process state plus in-flight Start/Stop/Restart action state.
+	proc procState
+
+	// Confirmation modal over the right pane. onYes runs on confirm.
+	confirmActive bool
+	confirmTitle  string
+	confirmBody   string
+	confirmOnYes  func(*model) tea.Cmd
 
 	// Menu
 	items []menuItem
+}
+
+// procState groups everything the dashboard knows about the mithril process.
+type procState struct {
+	// Last Detect result; preserved across error refreshes so the badge
+	// doesn't flicker on a transient PID-file read failure.
+	detection *procctl.Detection
+
+	// fetchedAt: last detect (ok or err). lastOkAt: last successful detect —
+	// the split lets the error view show "last good check N seconds ago".
+	fetchedAt time.Time
+	lastOkAt  time.Time
+
+	// Last detect error, or empty. String, not error, since it crosses goroutines.
+	fetchErr string
+
+	// True while a fetchProcessCmd is running, to gate parallel Detect calls.
+	inflight bool
+
+	// Active user action: "", "starting", "stopping", or "restarting". Set on
+	// confirm, cleared by actionResultMsg. A second action press while set is rejected.
+	inFlightOp  string
+	opStartedAt time.Time
+	opErr       string // last action error (or empty)
+
+	// Ring buffer of status lines for the active action, capped at 8.
+	progressLines []string
+
+	// Tail of the spawned mithril's stderr when Start fails early; shown verbatim.
+	startFailStderr string
+
+	// Set when a Stop times out; surfaces [f] Force Stop. Cleared on next non-running detect.
+	stuck bool
+
+	// preflightErr: Start blocked before spawn (supervisor conflict, unsafe lock,
+	// ownership, unwritable logs, incompatible AccountsDB). preflightInfo: fix success msg.
+	preflightErr  string
+	preflightInfo string
+
+	// Result of a failed guided fix. Separate field because preflightErr is
+	// overwritten each data tick, which would wipe it before the user sees it.
+	configFixErr string
 }
 
 func newModel(cf string) model {
@@ -196,6 +312,7 @@ func newModel(cf string) model {
 		screen:     screenOverview,
 		items: []menuItem{
 			{label: "Overview", value: "overview"},
+			{label: "Run Node", value: "process"},
 			{label: "Config", value: "config"},
 			{label: "Edit Config", value: "edit"},
 			{label: "Doctor", value: "doctor"},
@@ -219,11 +336,17 @@ func newModel(cf string) model {
 			{section: "turbine", key: "gossip_bind_addr", label: "Gossip UDP"},
 			{section: "turbine", key: "advertised_ip", label: "Advertised IP"},
 			{section: "turbine", key: "shred_version", label: "Shred Version"},
+			{section: "block", key: "lightbringer_endpoint", label: "External LB Endpoint"},
 			{section: "block", key: "max_rps", label: "Block Max RPS"},
 			{section: "block", key: "max_inflight", label: "Block Max Inflight"},
 			{isSep: true},
 			{section: "lightbringer", key: "enabled", label: "Lightbringer"},
+			{section: "lightbringer", key: "binary_path", label: "LB Binary Path"},
+			{section: "lightbringer", key: "config_dir", label: "LB Config Dir"},
 			{section: "lightbringer", key: "gossip_entrypoint", label: "Gossip Entrypoint"},
+			{section: "lightbringer", key: "gossip_port", label: "LB Gossip UDP Port"},
+			{section: "lightbringer", key: "port_range_start", label: "LB UDP Range Start"},
+			{section: "lightbringer", key: "port_range_end", label: "LB UDP Range End"},
 			{section: "lightbringer", key: "grpc_addr", label: "LB gRPC Address"},
 			{section: "lightbringer", key: "rpc_addr", label: "LB HTTP Address"},
 			{section: "lightbringer", key: "quiet", label: "LB Quiet Logs"},
@@ -238,12 +361,32 @@ func newModel(cf string) model {
 }
 
 func (m model) Init() tea.Cmd {
-	// Non-blocking: fetch data asynchronously on startup
+	// No process detect here: cfg isn't loaded, so an empty accountsDir would
+	// flicker Stopped->Crashed. First tick handles it once cfg is set.
 	return tea.Batch(
-		fetchDataCmd(m.configFile),
+		m.fetchDataCmd(),
 		tickCmd(),
 		slowTickCmd(),
 	)
+}
+
+// procAccountsDir returns the AccountsDB path, or "" if no config yet.
+// Detect uses it to classify Crashed vs Stopped; "" skips that.
+func (m model) procAccountsDir() string {
+	if m.cfg == nil {
+		return ""
+	}
+	return m.cfg.accountsPath
+}
+
+func (m *model) rememberSpawnLogs(det *procctl.Detection) {
+	if det == nil || (det.StdoutPath == "" && det.StderrPath == "") {
+		return
+	}
+	m.lastSpawnLogs = dashboardSpawnLogs{
+		stdoutPath: det.StdoutPath,
+		stderrPath: det.StderrPath,
+	}
 }
 
 // ── Update ──────────────────────────────────────────────────────────────
@@ -258,7 +401,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.childM = nil
 				return m, nil
 			}
-			// Esc on the wizard's first screen (mode selection) exits back to dashboard
+			// Esc on the setup TUI's first screen (mode selection) exits back to dashboard
 			if keyMsg.String() == "esc" && setupcmd.SetupIsFirstScreen(m.childM) {
 				m.mode = modeDashboard
 				m.childM = nil
@@ -280,7 +423,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.mode = modeDashboard
 					m.childM = nil
 					return m, tea.Batch(
-						fetchDataCmd(m.configFile),
+						m.fetchDataCmd(),
 						fetchDiskCmd(m.cfg),
 					)
 				}
@@ -308,9 +451,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		if m.screen == screenLogs {
+			m.logScroll = 0
+			m.rightScroll = 0
+		}
 		return m, nil
 
 	case dataRefreshedMsg:
+		oldLogLineCount := 0
+		if m.logFocused && m.logScroll > 0 {
+			oldLogLineCount = m.currentLogLineCount()
+		}
 		m.hasConfig = msg.hasConfig
 		m.cfg = msg.cfg
 		m.state = msg.state
@@ -318,6 +469,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.checks = msg.checks
 		m.mithrilLines = msg.mithrilLines
 		m.lbLines = msg.lbLines
+		m.progress = msg.progress
+		m.snapshot = msg.snapshot
+		m.accounts = msg.accounts
+		if oldLogLineCount > 0 {
+			if newLogLineCount := m.currentLogLineCount(); newLogLineCount > oldLogLineCount {
+				m.logScroll += newLogLineCount - oldLogLineCount
+			}
+			if maxScroll := m.maxLogScroll(); m.logScroll > maxScroll {
+				m.logScroll = maxScroll
+			}
+		}
+		if m.proc.inFlightOp == "" {
+			m.proc.preflightErr = msg.preflightErr
+			if msg.preflightErr != "" {
+				m.proc.preflightInfo = ""
+			}
+		}
 		// Trigger disk fetch once config is loaded (first time only)
 		if !m.disksLoaded && m.cfg != nil {
 			return m, fetchDiskCmd(m.cfg)
@@ -332,42 +500,227 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case procDetectedMsg:
+		// Always release the inflight gate so the next tick can fetch.
+		m.proc.inflight = false
+		m.proc.fetchedAt = time.Now()
+		m.proc.fetchErr = msg.err
+		// Keep the last-good detection on transient errors so the badge
+		// doesn't flicker on a single fetch hiccup; next success replaces it.
+		if msg.det != nil {
+			m.proc.detection = msg.det
+			m.rememberSpawnLogs(msg.det)
+			m.proc.lastOkAt = m.proc.fetchedAt
+			m.clampRunActionCursor()
+			// Process gone: a prior Stop timeout finished on its own, clear Stuck.
+			if msg.det.Status != procctl.StatusRunning {
+				m.proc.stuck = false
+			}
+		}
+		return m, nil
+
+	case actionResultMsg:
+		// Action finished: clear the gate and surface the result.
+		m.proc.inFlightOp = ""
+		if msg.det != nil {
+			m.proc.fetchErr = ""
+			m.proc.fetchedAt = time.Now()
+			m.proc.detection = msg.det
+			m.rememberSpawnLogs(msg.det)
+			m.proc.lastOkAt = m.proc.fetchedAt
+			m.clampRunActionCursor()
+			if msg.det.Status != procctl.StatusRunning {
+				m.proc.stuck = false
+			}
+		}
+		if msg.result != "ok" {
+			m.proc.opErr = msg.err
+		}
+		if msg.stderr != "" {
+			m.proc.startFailStderr = msg.stderr
+			m.mithrilLines = dashboardSpawnTextLines(msg.stderr, 50)
+		}
+		if msg.spawnLogs.stdoutPath != "" || msg.spawnLogs.stderrPath != "" {
+			m.lastSpawnLogs = msg.spawnLogs
+		}
+		// Final progress line so the outcome shows even if the user navigates away.
+		switch msg.result {
+		case "ok":
+			m.proc.progressLines = append(m.proc.progressLines, "Done.")
+			// Process cleared; clear Stuck if set from a prior timeout.
+			if msg.op == opStop || msg.op == opForceStop || msg.op == opRestart {
+				m.proc.stuck = false
+			}
+			if msg.op == opStop || msg.op == opForceStop {
+				m.runActionIdx = 0
+			}
+			if msg.op == opStart || msg.op == opRestart {
+				m.cancelStartFlow()
+				m.openLogs(false)
+			}
+		case "timeout":
+			m.proc.progressLines = append(m.proc.progressLines, "Timed out waiting for clean exit.")
+			// Only Stop/Restart can time out; set Stuck to surface [f] Force Stop.
+			if msg.op == opStop || msg.op == opRestart {
+				m.proc.stuck = true
+			}
+		default:
+			m.proc.progressLines = append(m.proc.progressLines, "Action failed: "+msg.err)
+		}
+		// Re-detect now so the badge updates without waiting for the next tick.
+		// On successful start/restart also refresh logs (the view switches there).
+		cmds := []tea.Cmd{}
+		if procFetch := m.triggerProcessFetch(); procFetch != nil {
+			cmds = append(cmds, procFetch)
+		}
+		if msg.result == "ok" && (msg.op == opStart || msg.op == opRestart) {
+			cmds = append(cmds, m.fetchDataCmd())
+		}
+		return m, tea.Batch(cmds...)
+
+	case configFixResultMsg:
+		if msg.err != "" {
+			// Use the tick-proof field so the next data refresh can't wipe it.
+			m.proc.preflightInfo = ""
+			m.proc.configFixErr = msg.err
+			return m, nil
+		}
+		m.proc.configFixErr = ""
+		m.proc.preflightInfo = msg.summary
+		cmds := []tea.Cmd{m.fetchDataCmd(), fetchDiskCmd(m.cfg)}
+		if procFetch := m.triggerProcessFetch(); procFetch != nil {
+			cmds = append(cmds, procFetch)
+		}
+		return m, tea.Batch(cmds...)
+
 	case childExitMsg:
 		m.mode = modeDashboard
 		m.childM = nil
 		return m, tea.Batch(
-			fetchDataCmd(m.configFile),
+			m.fetchDataCmd(),
 			fetchDiskCmd(m.cfg),
 		)
 
 	case tickMsg:
-		return m, tea.Batch(tickCmd(), fetchDataCmd(m.configFile))
+		// Gate the process fetch so a slow Detect can't stack across ticks.
+		batch := []tea.Cmd{tickCmd(), m.fetchDataCmd()}
+		if procFetch := m.triggerProcessFetch(); procFetch != nil {
+			batch = append(batch, procFetch)
+		}
+		return m, tea.Batch(batch...)
 
 	case slowTickMsg:
 		return m, tea.Batch(slowTickCmd(), fetchDiskCmd(m.cfg))
 
 	case tea.KeyMsg:
+		if m.startFlow.active {
+			switch msg.String() {
+			case "enter":
+				if cmd := m.advanceStartFlow(); cmd != nil {
+					return m, cmd
+				}
+				return m, nil
+			case "esc", "ctrl+c":
+				m.cancelStartFlow()
+				return m, nil
+			default:
+				return m, nil
+			}
+		}
+		// Modal takes priority: only y/n/esc act, other keys are no-ops so a
+		// stray 'q' can't fall through to the underlying view and quit.
+		if m.confirmActive {
+			switch msg.String() {
+			case "y", "Y", "enter":
+				onYes := m.confirmOnYes
+				m.confirmActive = false
+				m.confirmOnYes = nil
+				if onYes != nil {
+					return m, onYes(&m)
+				}
+				return m, nil
+			case "n", "N", "esc", "ctrl+c":
+				m.confirmActive = false
+				m.confirmOnYes = nil
+				return m, nil
+			default:
+				return m, nil
+			}
+		}
+		if m.editMode == editText {
+			// KeyRunes covers typed chars and pastes. Sanitize to strip
+			// control chars/newlines/ESC so a paste can't inject TOML or escapes.
+			if msg.Type == tea.KeyRunes && len(msg.Runes) > 0 {
+				text := config.SanitizeUserInput(string(msg.Runes))
+				if text != "" {
+					m.editValue = m.editValue[:m.editCursor] + text + m.editValue[m.editCursor:]
+					m.editCursor += len(text)
+				}
+				return m, nil
+			}
+			switch msg.String() {
+			case "enter":
+				m.applyEditField()
+				return m, nil
+			case "esc":
+				m.editMode = editNone
+				return m, nil
+			case "ctrl+c":
+				return m, tea.Quit
+			case "backspace":
+				if m.editCursor > 0 {
+					_, size := utf8.DecodeLastRuneInString(m.editValue[:m.editCursor])
+					m.editValue = m.editValue[:m.editCursor-size] + m.editValue[m.editCursor:]
+					m.editCursor -= size
+				}
+				return m, nil
+			case "left":
+				if m.editCursor > 0 {
+					_, size := utf8.DecodeLastRuneInString(m.editValue[:m.editCursor])
+					m.editCursor -= size
+				}
+				return m, nil
+			case "right":
+				if m.editCursor < len(m.editValue) {
+					_, size := utf8.DecodeRuneInString(m.editValue[m.editCursor:])
+					m.editCursor += size
+				}
+				return m, nil
+			default:
+				ch := msg.String()
+				if len(ch) == 1 && ch[0] >= 32 {
+					m.editValue = m.editValue[:m.editCursor] + ch + m.editValue[m.editCursor:]
+					m.editCursor++
+				}
+				return m, nil
+			}
+		}
 		switch msg.String() {
 		case "q":
 			if m.editMode == editNone && !m.logFocused {
 				return m, tea.Quit
-			}
-			// In text edit mode, insert 'q' as a character
-			if m.editMode == editText {
-				m.editValue = m.editValue[:m.editCursor] + "q" + m.editValue[m.editCursor:]
-				m.editCursor++
-				return m, nil
 			}
 			// In editMenu or logFocused: ignore q (use esc to exit first)
 		case "ctrl+c":
 			return m, tea.Quit
 
 		case "up", "k":
-			if m.logFocused {
-				m.logScroll--
-				if m.logScroll < 0 {
-					m.logScroll = 0
+			if m.fullWidthRawLogs() {
+				maxScroll := m.maxLogScroll()
+				if m.logScroll < maxScroll {
+					m.logScroll++
 				}
+				return m, nil
+			}
+			if m.logFocused {
+				maxScroll := m.maxLogScroll()
+				if m.logScroll < maxScroll {
+					m.logScroll++
+				}
+				return m, nil
+			}
+			if m.screen == screenProcess && m.runFocused {
+				m.moveRunAction(-1)
 				return m, nil
 			}
 			if m.screen == screenEdit && m.editMode == editMenu {
@@ -382,15 +735,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "down", "j":
+			if m.fullWidthRawLogs() {
+				if m.logScroll > 0 {
+					m.logScroll--
+				}
+				return m, nil
+			}
 			if m.logFocused {
-				// Cap scroll — use a generous limit since wrapped lines expand count
-				maxScroll := len(m.mithrilLines) * 3 // approximate: up to 3x after wrapping
-				if m.logPane == logPaneLightbringer {
-					maxScroll = len(m.lbLines) * 3
+				if m.logScroll > 0 {
+					m.logScroll--
 				}
-				if m.logScroll < maxScroll {
-					m.logScroll++
-				}
+				return m, nil
+			}
+			if m.screen == screenProcess && m.runFocused {
+				m.moveRunAction(1)
 				return m, nil
 			}
 			if m.screen == screenEdit && m.editMode == editMenu {
@@ -405,16 +763,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "enter":
+			if m.fullWidthRawLogs() {
+				return m, nil
+			}
 			if m.screen == screenEdit && m.editMode == editNone {
 				m.startEditField()
 				return m, nil
 			}
-			if m.screen == screenEdit && m.editMode == editText {
-				m.applyEditField()
-				return m, nil
-			}
 			if m.screen == screenEdit && m.editMode == editMenu {
 				m.applyMenuSelection()
+				return m, nil
+			}
+			if m.screen == screenProcess && m.runFocused {
+				if cmd := m.activateRunAction(); cmd != nil {
+					return m, cmd
+				}
 				return m, nil
 			}
 			if cmd := m.selectCurrent(); cmd != nil {
@@ -422,8 +785,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "esc":
+			if m.fullWidthRawLogs() {
+				m.screen = screenProcess
+				m.runFocused = true
+				m.logFocused = false
+				m.logScroll = 0
+				m.setMenuCursor("process")
+				return m, nil
+			}
 			if m.logFocused {
 				m.logFocused = false
+				return m, nil
+			}
+			if m.screen == screenProcess && m.runFocused {
+				m.runFocused = false
 				return m, nil
 			}
 			if m.editMode != editNone {
@@ -436,10 +811,56 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "r":
+			// Action shortcuts only fire with action-list focus; otherwise r refreshes.
+			if m.screen == screenProcess && m.runFocused {
+				if cmd := m.handleRestartKey(); cmd != nil {
+					return m, cmd
+				}
+				return m, nil
+			}
 			return m, tea.Batch(
-				fetchDataCmd(m.configFile),
+				m.fetchDataCmd(),
 				fetchDiskCmd(m.cfg),
 			)
+
+		case "t":
+			if m.screen == screenLogs {
+				// Toggle full-width logs; the menu is always recoverable.
+				m.logRawMode = !m.logRawMode
+				m.logScroll = 0
+				m.logFocused = false
+				return m, nil
+			}
+
+		case "s":
+			if m.screen == screenProcess && m.runFocused {
+				if cmd := m.handleStartKey(); cmd != nil {
+					return m, cmd
+				}
+				return m, nil
+			}
+
+		case "x":
+			if m.screen == screenLogs {
+				if cmd := m.handleStopFromLogsKey(); cmd != nil {
+					return m, cmd
+				}
+				return m, nil
+			}
+			if m.screen == screenProcess && m.runFocused {
+				if cmd := m.handleStopKey(); cmd != nil {
+					return m, cmd
+				}
+				return m, nil
+			}
+
+		case "f":
+			if m.screen == screenProcess && m.runFocused {
+				if cmd := m.handleForceStopKey(); cmd != nil {
+					return m, cmd
+				}
+				return m, nil
+			}
 
 		case "e":
 			if m.hasConfig && (m.screen == screenConfig || m.screen == screenOverview) {
@@ -455,32 +876,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
-		case "backspace":
-			if m.editMode == editText && m.editCursor > 0 {
-				m.editValue = m.editValue[:m.editCursor-1] + m.editValue[m.editCursor:]
-				m.editCursor--
-				return m, nil
-			}
-
 		case "left":
 			if m.logFocused {
+				if m.logRawMode {
+					return m, nil
+				}
 				m.logPane = logPaneMithril
 				m.logScroll = 0
 				return m, nil
 			}
-			if m.editMode == editText && m.editCursor > 0 {
-				m.editCursor--
+			if m.screen == screenProcess && m.runFocused {
+				m.runFocused = false
 				return m, nil
 			}
 
 		case "right":
 			if m.logFocused {
+				if m.logRawMode {
+					return m, nil
+				}
 				m.logPane = logPaneLightbringer
 				m.logScroll = 0
 				return m, nil
 			}
-			if m.editMode == editText && m.editCursor < len(m.editValue) {
-				m.editCursor++
+			if m.screen == screenProcess {
+				m.runFocused = true
+				m.clampRunActionCursor()
 				return m, nil
 			}
 
@@ -495,16 +916,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.rightScroll = 0
 			}
 
-		default:
-			// Text input for inline editing
-			if m.editMode == editText {
-				ch := msg.String()
-				if len(ch) == 1 && ch[0] >= 32 {
-					m.editValue = m.editValue[:m.editCursor] + ch + m.editValue[m.editCursor:]
-					m.editCursor++
-					return m, nil
-				}
-			}
 		}
 	}
 	return m, nil
@@ -534,11 +945,25 @@ func (m *model) selectCurrent() tea.Cmd {
 	item := m.items[m.cursor]
 	m.rightScroll = 0
 	m.logFocused = false
+	m.runFocused = false
+	m.cancelStartFlow()
 	m.logScroll = 0
 	m.editMode = editNone
+	// With no config, only "Create Config" is actionable; keep others on the
+	// overview helper so arrow keys still navigate the menu.
+	if !m.hasConfig && item.value != "setup" {
+		m.screen = screenOverview
+		return nil
+	}
 	switch item.value {
 	case "overview":
 		m.screen = screenOverview
+	case "process":
+		m.screen = screenProcess
+		m.runFocused = true
+		m.runActionIdx = 0
+		// Detect now (via the inflight gate) so the view isn't blank for up to 2s.
+		return m.triggerProcessFetch()
 	case "config":
 		m.screen = screenConfig
 	case "doctor":
@@ -549,7 +974,7 @@ func (m *model) selectCurrent() tea.Cmd {
 			m.logFocused = !m.logFocused
 			return nil
 		}
-		m.screen = screenLogs
+		m.openLogs(false)
 	case "disk":
 		m.screen = screenDisk
 		// Fetch disk data immediately when navigating to Disk screen
@@ -566,6 +991,33 @@ func (m *model) selectCurrent() tea.Cmd {
 		return m.childM.Init()
 	}
 	return nil
+}
+
+func (m *model) openLogs(raw bool) {
+	m.screen = screenLogs
+	m.runFocused = false
+	m.logFocused = false
+	// Default keeps the menu visible; full-width logs are opt-in (raw / "t" toggle).
+	m.logRawMode = raw
+	m.logPane = logPaneMithril
+	m.logScroll = 0
+	m.rightScroll = 0
+	m.setMenuCursor("logs")
+}
+
+func (m model) logsStopShortcutAvailable() bool {
+	return m.proc.detection != nil &&
+		m.proc.detection.Status == procctl.StatusRunning &&
+		m.proc.inFlightOp == ""
+}
+
+func (m *model) setMenuCursor(value string) {
+	for i, item := range m.items {
+		if item.value == value {
+			m.cursor = i
+			return
+		}
+	}
 }
 
 // ── View ────────────────────────────────────────────────────────────────
@@ -587,11 +1039,14 @@ func (m model) View() string {
 		sbCfg.slot = m.state.LastSlot
 		sbCfg.epoch = m.state.LastEpoch
 	}
-	for _, svc := range m.services {
-		if svc.up {
-			sbCfg.online = true
-			break
-		}
+	// State file slot is frozen at bootstrap; prefer the live slot from the log tail.
+	if s, e, ok := m.liveNodeSlot(); ok {
+		sbCfg.slot = s
+		sbCfg.epoch = e
+	}
+	// Header status uses the same process source as the body so they can't contradict.
+	if m.proc.detection != nil {
+		sbCfg.runStatus = m.proc.detection.Status
 	}
 	statusBar := renderStatusBar(sbCfg, m.width)
 
@@ -606,15 +1061,42 @@ func (m model) View() string {
 		contentHeight = 6
 	}
 
+	if m.fullWidthRawLogs() {
+		logRows := contentHeight - 5
+		if logRows < 5 {
+			logRows = 5
+		}
+		content := renderSinglePane(singlePaneConfig{
+			title:   m.rightPaneTitle(),
+			content: m.renderRawLogsViewWith(m.fullPaneContentWidth(), logRows),
+			focus:   true,
+		}, m.width, contentHeight)
+		help := renderHelpBar(m.helpItems(), m.width)
+		footer := renderFooter(footerConfig{configFile: m.configFile}, m.width)
+		return fitTerminalFrame(lipgloss.JoinVertical(lipgloss.Left,
+			logo,
+			statusBar,
+			"",
+			content,
+			help,
+			footer,
+		), m.width, m.height)
+	}
+
 	// Left pane: menu (pass width for full-row highlight)
 	leftPaneWidth := (m.width - 3) * 22 / 100
 	leftContent := renderLeftMenu(m.items, m.cursor, leftPaneWidth)
 
-	// Right pane: child TUI (setup) or screen-specific content
+	// Right pane: confirm modal (highest priority), child TUI, or screen content.
 	var rightContent string
-	if m.mode != modeDashboard && m.childM != nil {
+	switch {
+	case m.startFlow.active:
+		rightContent = m.renderStartFlow()
+	case m.confirmActive:
+		rightContent = renderConfirmModal(m.confirmTitle, m.confirmBody, m.rightPaneContentWidth())
+	case m.mode != modeDashboard && m.childM != nil:
 		rightContent = m.childM.View()
-	} else {
+	default:
 		rightContent = m.renderRightPane()
 	}
 
@@ -635,6 +1117,7 @@ func (m model) View() string {
 	// Add scroll indicators when content overflows
 	scrollHint := lipgloss.NewStyle().Foreground(tui.ColorTextDisabled)
 	if len(rightLines) > contentHeight && contentHeight > 2 {
+		rightLines = rightLines[:contentHeight]
 		rightLines[contentHeight-1] = scrollHint.Render("  ▼ pgdn for more")
 	}
 	if m.rightScroll > 0 && len(rightLines) > 0 {
@@ -649,7 +1132,7 @@ func (m model) View() string {
 		leftContent:  leftContent,
 		rightTitle:   m.rightPaneTitle(),
 		rightContent: rightContent,
-		focusLeft:    true,
+		focusLeft:    !m.rightPaneFocused(),
 	}
 	content := renderSplitView(splitCfg, m.width, contentHeight)
 
@@ -658,20 +1141,16 @@ func (m model) View() string {
 	help := renderHelpBar(helpItems, m.width)
 
 	// Footer
-	fCfg := footerConfig{
-		version:    version.Version,
-		configFile: m.configFile,
-	}
-	footer := renderFooter(fCfg, m.width)
+	footer := renderFooter(footerConfig{configFile: m.configFile}, m.width)
 
-	return lipgloss.JoinVertical(lipgloss.Left,
+	return fitTerminalFrame(lipgloss.JoinVertical(lipgloss.Left,
 		logo,
 		statusBar,
 		"",
 		content,
 		help,
 		footer,
-	)
+	), m.width, m.height)
 }
 
 // moveEditCursor moves the edit field cursor, skipping separators.
@@ -729,6 +1208,8 @@ func (m model) getFieldValue(f editFieldDef) string {
 		return m.cfg.turbineAdvertisedIP
 	case "turbine.shred_version":
 		return m.cfg.turbineShredVersion
+	case "block.lightbringer_endpoint":
+		return m.cfg.lbExternalEndpoint
 	case "block.max_rps":
 		return m.cfg.blockMaxRPS
 	case "block.max_inflight":
@@ -738,8 +1219,18 @@ func (m model) getFieldValue(f editFieldDef) string {
 			return "true"
 		}
 		return "false"
+	case "lightbringer.binary_path":
+		return m.cfg.lbBinaryPath
+	case "lightbringer.config_dir":
+		return m.cfg.lbConfigDir
 	case "lightbringer.gossip_entrypoint":
 		return m.cfg.lbGossip
+	case "lightbringer.gossip_port":
+		return m.cfg.lbGossipPort
+	case "lightbringer.port_range_start":
+		return m.cfg.lbPortRangeStart
+	case "lightbringer.port_range_end":
+		return m.cfg.lbPortRangeEnd
 	case "lightbringer.grpc_addr":
 		return m.cfg.lbGrpcAddr
 	case "lightbringer.rpc_addr":
@@ -868,6 +1359,8 @@ func (m *model) applyMenuSelection() {
 	} else if fullKey == "block.source" {
 		if value == "lightbringer" && !hasExternalEndpoint {
 			_ = saveConfigValue(m.configFile, "lightbringer", "enabled", "true")
+		} else if value == "rpc" {
+			_ = saveConfigValue(m.configFile, "lightbringer", "enabled", "false")
 		}
 	}
 
@@ -943,13 +1436,31 @@ func (m *model) applyEditField() {
 			m.editErr = "Must be a port number (0-65535)"
 			return
 		}
-	case f.section == "storage":
+	case key == "lightbringer.gossip_port" || key == "lightbringer.port_range_start" ||
+		key == "lightbringer.port_range_end":
+		gossipPort := m.cfg.lbGossipPort
+		rangeStart := m.cfg.lbPortRangeStart
+		rangeEnd := m.cfg.lbPortRangeEnd
+		switch key {
+		case "lightbringer.gossip_port":
+			gossipPort = value
+		case "lightbringer.port_range_start":
+			rangeStart = value
+		case "lightbringer.port_range_end":
+			rangeEnd = value
+		}
+		if _, _, _, err := parseLightbringerGossipPorts(gossipPort, rangeStart, rangeEnd); err != nil {
+			m.editErr = err.Error()
+			return
+		}
+	case f.section == "storage" || key == "lightbringer.binary_path" || key == "lightbringer.config_dir":
 		if value == "" {
 			m.editErr = "Path is required"
 			return
 		}
 		value = filepath.Clean(value)
-	case key == "lightbringer.gossip_entrypoint" || key == "lightbringer.grpc_addr" || key == "lightbringer.rpc_addr":
+	case key == "lightbringer.gossip_entrypoint" || key == "lightbringer.grpc_addr" ||
+		key == "lightbringer.rpc_addr" || key == "block.lightbringer_endpoint":
 		if value != "" {
 			host, portStr, err := net.SplitHostPort(value)
 			if err != nil || host == "" {
@@ -977,10 +1488,34 @@ func (m *model) applyEditField() {
 		m.cfg = readConfig(m.configFile)
 		return
 	}
+	if (key == "lightbringer.gossip_port" || key == "lightbringer.port_range_start" ||
+		key == "lightbringer.port_range_end") && value == "" {
+		_ = removeConfigKey(m.configFile, f.section, f.key)
+		m.editMode = editNone
+		m.cfg = readConfig(m.configFile)
+		return
+	}
 
 	if err := saveConfigValue(m.configFile, f.section, f.key, value); err != nil {
 		m.editErr = "Save failed: " + err.Error()
 		return
+	}
+	if key == "storage.accounts" {
+		_ = removeConfigKey(m.configFile, "ledger", "accounts_path")
+	} else if key == "storage.snapshots" {
+		_ = removeConfigKey(m.configFile, "snapshot", "download_path")
+	} else if key == "storage.shredstore" {
+		_ = removeConfigKey(m.configFile, "storage", "blockstore")
+		_ = removeConfigKey(m.configFile, "ledger", "path")
+		_ = removeConfigKey(m.configFile, "lightbringer", "storage")
+	}
+	if key == "block.lightbringer_endpoint" {
+		if value != "" {
+			_ = saveConfigValue(m.configFile, "block", "source", "lightbringer")
+			_ = saveConfigValue(m.configFile, "lightbringer", "enabled", "false")
+		} else if m.cfg != nil && !m.cfg.lbEnabled {
+			_ = saveConfigValue(m.configFile, "block", "source", "rpc")
+		}
 	}
 
 	m.editMode = editNone
@@ -988,9 +1523,14 @@ func (m *model) applyEditField() {
 }
 
 func (m model) rightPaneTitle() string {
+	if m.mode == modeSetup {
+		return "Create Config"
+	}
 	switch m.screen {
 	case screenOverview:
 		return "Overview"
+	case screenProcess:
+		return "Run Node"
 	case screenConfig:
 		return "Configuration"
 	case screenEdit:
@@ -1001,6 +1541,9 @@ func (m model) rightPaneTitle() string {
 	case screenDoctor:
 		return "Health Check"
 	case screenLogs:
+		if m.logRawMode {
+			return "Terminal Logs"
+		}
 		return "Logs"
 	case screenDisk:
 		return "Disk Usage"
@@ -1008,7 +1551,35 @@ func (m model) rightPaneTitle() string {
 	return ""
 }
 
+func (m model) rightPaneFocused() bool {
+	if m.confirmActive {
+		return true
+	}
+	if m.startFlow.active {
+		return true
+	}
+	if m.screen == screenProcess && m.runFocused {
+		return true
+	}
+	if m.screen == screenLogs && m.logFocused {
+		return true
+	}
+	return false
+}
+
 func (m model) helpItems() []helpItem {
+	if m.mode == modeSetup {
+		// The embedded setup TUI draws its own help; no footer needed.
+		return nil
+	}
+	if m.startFlow.active {
+		// Single confirm card — one Enter starts.
+		return []helpItem{
+			{key: "⏎", desc: "start"},
+			{key: "esc", desc: "cancel"},
+		}
+	}
+
 	base := []helpItem{
 		{key: "↑↓", desc: "navigate"},
 		{key: "⏎", desc: "select"},
@@ -1016,20 +1587,71 @@ func (m model) helpItems() []helpItem {
 	}
 
 	switch m.screen {
-	case screenLogs:
-		if m.logFocused {
-			pane := "mithril"
-			if m.logPane == logPaneLightbringer {
-				pane = "lightbringer"
-			}
+	case screenProcess:
+		if m.runFocused {
 			return []helpItem{
-				{key: "↑↓", desc: "scroll"},
-				{key: "←→", desc: "switch pane"},
-				{key: "esc", desc: "back"},
-				{key: "", desc: "(" + pane + ")"},
+				{key: "↑↓", desc: "choose"},
+				{key: "⏎", desc: "run action"},
+				{key: "esc", desc: "menu"},
+				{key: "q", desc: "quit"},
 			}
 		}
+		return []helpItem{
+			{key: "→", desc: "actions"},
+			{key: "⏎", desc: "select menu"},
+			{key: "r", desc: "refresh"},
+			{key: "q", desc: "quit"},
+		}
+	case screenLogs:
+		if m.fullWidthRawLogs() {
+			items := []helpItem{
+				{key: "↑↓", desc: "scroll"},
+				{key: "esc", desc: "run node"},
+				{key: "r", desc: "refresh"},
+			}
+			if m.hasLightbringerLogPane() {
+				items = append(items, helpItem{key: "t", desc: "split"})
+			}
+			if m.logsStopShortcutAvailable() {
+				items = append(items, helpItem{key: "x", desc: "stop safely"})
+			}
+			items = append(items, helpItem{key: "q", desc: "quit"})
+			return items
+		}
+		if m.logFocused {
+			pane := "mithril"
+			if m.logRawMode {
+				pane = "raw"
+			} else if m.logPane == logPaneLightbringer {
+				pane = "lightbringer"
+			}
+			items := []helpItem{{key: "↑↓", desc: "scroll"}}
+			if m.hasLightbringerLogPane() {
+				if m.logRawMode {
+					items = append(items, helpItem{key: "t", desc: "split"})
+				} else {
+					items = append(items,
+						helpItem{key: "t", desc: "terminal"},
+						helpItem{key: "←→", desc: "switch pane"},
+					)
+				}
+			}
+			items = append(items,
+				helpItem{key: "esc", desc: "back"},
+				helpItem{key: "mode", desc: pane},
+			)
+			if m.logsStopShortcutAvailable() {
+				items = append(items, helpItem{key: "x", desc: "stop safely"})
+			}
+			return items
+		}
 		base = append(base, helpItem{key: "⏎", desc: "scroll logs"})
+		if m.hasLightbringerLogPane() {
+			base = append(base, helpItem{key: "t", desc: "toggle logs"})
+		}
+		if m.logsStopShortcutAvailable() {
+			base = append(base, helpItem{key: "x", desc: "stop safely"})
+		}
 	case screenConfig:
 		base = append(base, helpItem{key: "e", desc: "edit"}, helpItem{key: "pgdn", desc: "scroll"})
 	case screenOverview:

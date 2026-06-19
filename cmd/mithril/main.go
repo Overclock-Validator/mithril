@@ -13,6 +13,7 @@ import (
 	"github.com/Overclock-Validator/mithril/cmd/mithril/setupcmd"
 	"github.com/Overclock-Validator/mithril/cmd/mithril/statecmd"
 	"github.com/Overclock-Validator/mithril/cmd/mithril/statuscmd"
+	"github.com/Overclock-Validator/mithril/cmd/mithril/stopcmd"
 	"github.com/Overclock-Validator/mithril/pkg/config"
 	"github.com/spf13/cobra"
 	"k8s.io/klog/v2"
@@ -50,13 +51,14 @@ func init() {
 	cmd.PersistentFlags().StringVar(&config.ConfigFile, "config", "", "Path to TOML config file")
 
 	cmd.AddCommand(
-		&node.Run,                    // Primary command for running Mithril
-		&configcmd.ConfigCmd,         // Config management (init, etc.)
-		&statecmd.StateCmd,           // State file inspection and management
-		&setupcmd.SetupCmd,           // Interactive setup wizard
-		&setupcmd.DoctorCmd,          // System health check
-		&statuscmd.StatusCmd,         // Node status
-		&dashboardcmd.DashboardCmd,   // Interactive dashboard
+		&node.Run,                  // Primary command for running Mithril
+		&stopcmd.StopCmd,           // Stop a running Mithril (safe SIGTERM + wait)
+		&configcmd.ConfigCmd,       // Config management (init, etc.)
+		&statecmd.StateCmd,         // State file inspection and management
+		&setupcmd.SetupCmd,         // Interactive setup TUI
+		&setupcmd.DoctorCmd,        // System health check
+		&statuscmd.StatusCmd,       // Node status
+		&dashboardcmd.DashboardCmd, // Interactive dashboard
 	)
 }
 

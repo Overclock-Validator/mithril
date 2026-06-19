@@ -3,6 +3,7 @@ package lightbringer
 import (
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -11,6 +12,14 @@ import (
 
 const configFileName = "Lightbringer.toml"
 
+const (
+	defaultGossipPort       = 65400
+	defaultPortRangeStart   = 65401
+	defaultPortRangeEnd     = 65500
+	minValidatorPortWidth   = 25
+	validatorQUICPortOffset = 6
+)
+
 // LightbringerTOML represents the Lightbringer.toml structure that Lightbringer expects.
 // This mirrors the Rust ConfigRaw struct in the Lightbringer source.
 type LightbringerTOML struct {
@@ -18,6 +27,9 @@ type LightbringerTOML struct {
 	Storage          string
 	RpcAddr          string
 	GrpcAddr         string
+	GossipPort       int
+	PortRangeStart   int
+	PortRangeEnd     int
 
 	// Optional sections
 	InfluxdbHost     string
@@ -50,6 +62,15 @@ func (c *LightbringerTOML) Validate() error {
 			return err
 		}
 	}
+	if err := validateGossipPorts(c.GossipPort, c.PortRangeStart, c.PortRangeEnd); err != nil {
+		return err
+	}
+	if err := validateInfluxDB(c.InfluxdbHost, c.InfluxdbDatabase, c.InfluxdbToken); err != nil {
+		return err
+	}
+	if err := validateBlockConfirmation(c.BlockConfirmRpcHTTP, c.BlockConfirmRpcWS); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -72,6 +93,105 @@ func validateHostPort(addr, field string) error {
 	return nil
 }
 
+func effectiveGossipPorts(gossipPort, portRangeStart, portRangeEnd int) (int, int, int) {
+	if gossipPort == 0 {
+		gossipPort = defaultGossipPort
+	}
+	if portRangeStart == 0 {
+		portRangeStart = defaultPortRangeStart
+	}
+	if portRangeEnd == 0 {
+		portRangeEnd = defaultPortRangeEnd
+	}
+	return gossipPort, portRangeStart, portRangeEnd
+}
+
+func validateGossipPorts(gossipPort, portRangeStart, portRangeEnd int) error {
+	effectiveGossipPort, effectiveRangeStart, effectiveRangeEnd := effectiveGossipPorts(gossipPort, portRangeStart, portRangeEnd)
+	values := []struct {
+		field string
+		value int
+	}{
+		{"gossip.gossip_port", effectiveGossipPort},
+		{"gossip.port_range_start", effectiveRangeStart},
+		{"gossip.port_range_end", effectiveRangeEnd},
+	}
+	for _, item := range values {
+		if item.value < 1 || item.value > 65535 {
+			return fmt.Errorf("%s %d is out of range 1-65535", item.field, item.value)
+		}
+	}
+	if effectiveRangeStart > effectiveRangeEnd {
+		return fmt.Errorf("gossip.port_range_start must be <= gossip.port_range_end")
+	}
+	if effectiveRangeEnd-effectiveRangeStart < minValidatorPortWidth {
+		return fmt.Errorf("gossip.port_range_end - gossip.port_range_start must be at least %d", minValidatorPortWidth)
+	}
+	if effectiveRangeEnd+validatorQUICPortOffset > 65535 {
+		return fmt.Errorf("gossip.port_range_end + %d must fit in 65535", validatorQUICPortOffset)
+	}
+	if effectiveGossipPort >= effectiveRangeStart && effectiveGossipPort <= effectiveRangeEnd {
+		return fmt.Errorf("gossip.gossip_port must not overlap gossip.port_range_start..=gossip.port_range_end")
+	}
+	return nil
+}
+
+func validateInfluxDB(host, database, token string) error {
+	host = strings.TrimSpace(host)
+	database = strings.TrimSpace(database)
+	token = strings.TrimSpace(token)
+	if host == "" && database == "" && token == "" {
+		return nil
+	}
+	if host == "" {
+		return fmt.Errorf("influxdb.host is required when InfluxDB is configured")
+	}
+	if database == "" {
+		return fmt.Errorf("influxdb.database is required when InfluxDB is configured")
+	}
+	if token == "" {
+		return fmt.Errorf("influxdb.token is required when InfluxDB is configured")
+	}
+	if err := validateURLWithSchemes(host, "influxdb.host", "http", "https"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateBlockConfirmation(rpcHTTP, rpcWS string) error {
+	rpcHTTP = strings.TrimSpace(rpcHTTP)
+	rpcWS = strings.TrimSpace(rpcWS)
+	if rpcHTTP == "" && rpcWS == "" {
+		return nil
+	}
+	if rpcHTTP == "" {
+		return fmt.Errorf("block_confirmation.rpc_http is required when block confirmation is configured")
+	}
+	if rpcWS == "" {
+		return fmt.Errorf("block_confirmation.rpc_websocket is required when block confirmation is configured")
+	}
+	if err := validateURLWithSchemes(rpcHTTP, "block_confirmation.rpc_http", "http", "https"); err != nil {
+		return err
+	}
+	if err := validateURLWithSchemes(rpcWS, "block_confirmation.rpc_websocket", "ws", "wss"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateURLWithSchemes(raw, field string, allowedSchemes ...string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return fmt.Errorf("%s %q is not a valid URL", field, raw)
+	}
+	for _, scheme := range allowedSchemes {
+		if parsed.Scheme == scheme {
+			return nil
+		}
+	}
+	return fmt.Errorf("%s must use one of: %s", field, strings.Join(allowedSchemes, ", "))
+}
+
 // GenerateTOML produces a valid Lightbringer.toml string from the config.
 func (c *LightbringerTOML) GenerateTOML() string {
 	var b strings.Builder
@@ -81,17 +201,31 @@ func (c *LightbringerTOML) GenerateTOML() string {
 	fmt.Fprintf(&b, "rpc_addr = %q\n", c.RpcAddr)
 	fmt.Fprintf(&b, "grpc_addr = %q\n", c.GrpcAddr)
 
-	if c.InfluxdbHost != "" {
-		b.WriteString("\n[influxdb]\n")
-		fmt.Fprintf(&b, "host = %q\n", c.InfluxdbHost)
-		fmt.Fprintf(&b, "database = %q\n", c.InfluxdbDatabase)
-		fmt.Fprintf(&b, "token = %q\n", c.InfluxdbToken)
+	if c.GossipPort != 0 || c.PortRangeStart != 0 || c.PortRangeEnd != 0 {
+		b.WriteString("\n[gossip]\n")
+		if c.GossipPort != 0 {
+			fmt.Fprintf(&b, "gossip_port = %d\n", c.GossipPort)
+		}
+		if c.PortRangeStart != 0 {
+			fmt.Fprintf(&b, "port_range_start = %d\n", c.PortRangeStart)
+		}
+		if c.PortRangeEnd != 0 {
+			fmt.Fprintf(&b, "port_range_end = %d\n", c.PortRangeEnd)
+		}
 	}
 
-	if c.BlockConfirmRpcHTTP != "" {
+	// Trim to match Validate(): blank means unconfigured; padded values would emit invalid TOML strings.
+	if host := strings.TrimSpace(c.InfluxdbHost); host != "" {
+		b.WriteString("\n[influxdb]\n")
+		fmt.Fprintf(&b, "host = %q\n", host)
+		fmt.Fprintf(&b, "database = %q\n", strings.TrimSpace(c.InfluxdbDatabase))
+		fmt.Fprintf(&b, "token = %q\n", strings.TrimSpace(c.InfluxdbToken))
+	}
+
+	if rpcHTTP := strings.TrimSpace(c.BlockConfirmRpcHTTP); rpcHTTP != "" {
 		b.WriteString("\n[block_confirmation]\n")
-		fmt.Fprintf(&b, "rpc_http = %q\n", c.BlockConfirmRpcHTTP)
-		fmt.Fprintf(&b, "rpc_websocket = %q\n", c.BlockConfirmRpcWS)
+		fmt.Fprintf(&b, "rpc_http = %q\n", rpcHTTP)
+		fmt.Fprintf(&b, "rpc_websocket = %q\n", strings.TrimSpace(c.BlockConfirmRpcWS))
 	}
 
 	// Emit [log] section only when quiet mode is enabled.

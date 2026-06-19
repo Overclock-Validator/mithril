@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
@@ -22,27 +23,24 @@ const CurrentStateSchemaVersion uint32 = 2
 // The state file serves as an atomic marker of validity - AccountsDB is valid
 // if and only if this file exists with Stage == "ready".
 type MithrilState struct {
-	// =========================================================================
-	// Schema & Run Lineage
-	// =========================================================================
+	// Schema and run lineage.
 	StateSchemaVersion uint32 `json:"state_schema_version"`
 	// Run lineage - tracks the chain of sessions that have used this AccountsDB
 	RootRunID    string `json:"root_run_id,omitempty"`    // Run that built AccountsDB from snapshot (never changes)
 	ParentRunID  string `json:"parent_run_id,omitempty"`  // Run we resumed from (empty if fresh start)
 	CurrentRunID string `json:"current_run_id,omitempty"` // Run that last wrote this file
 
-	// =========================================================================
-	// Writer Metadata (who last wrote this file and why they stopped)
-	// =========================================================================
+	// Writer metadata: who last wrote this file and why they stopped.
 	LastWriterVersion  string    `json:"last_writer_version,omitempty"`  // Semver tag (e.g., "v0.1.0" or "dev")
 	LastWriterCommit   string    `json:"last_writer_commit,omitempty"`   // Git commit hash of writer binary
 	LastWriterBranch   string    `json:"last_writer_branch,omitempty"`   // Git branch name (may be empty)
 	LastShutdownReason string    `json:"last_shutdown_reason,omitempty"` // human-readable reason
 	LastShutdownAt     time.Time `json:"last_shutdown_at,omitempty"`     // when shutdown occurred
 
-	// =========================================================================
-	// AccountsDB Origin (snapshot info - set once, never changes)
-	// =========================================================================
+	// Anchors clean-exit detection. Zero means legacy file (see WasCleanExit).
+	CurrentSessionStartedAt time.Time `json:"current_session_started_at,omitempty"`
+
+	// AccountsDB origin: snapshot info set once and never changed.
 	Stage          string        `json:"stage"`                        // "ready", "downloading", "building", "corrupted"
 	SnapshotSlot   uint64        `json:"snapshot_slot"`                // Slot of the snapshot used to build AccountsDB
 	SnapshotEpoch  uint64        `json:"snapshot_epoch,omitempty"`     // Epoch of the snapshot
@@ -58,11 +56,8 @@ type MithrilState struct {
 	CorruptionReason     string    `json:"corruption_reason,omitempty"`
 	CorruptionDetectedAt time.Time `json:"corruption_detected_at,omitempty"`
 
-	// =========================================================================
-	// Manifest Seed Data (copied from manifest at snapshot build time)
-	// Used ONLY for fresh-start replay. Resume uses Last* fields instead.
-	// =========================================================================
-
+	// Manifest seed data is copied at snapshot build time. Fresh-start replay
+	// uses these fields; resume uses the Last* fields instead.
 	// Block configuration seed
 	ManifestParentSlot     uint64 `json:"manifest_parent_slot,omitempty"`
 	ManifestParentBankhash string `json:"manifest_parent_bankhash,omitempty"` // base58
@@ -106,18 +101,13 @@ type MithrilState struct {
 	// Cleared after first replayed slot to save space.
 	ManifestEpochStakes map[uint64]string `json:"manifest_epoch_stakes,omitempty"`
 
-	// =========================================================================
-	// Current Position (where we left off)
-	// =========================================================================
+	// Current position: where replay left off.
 	LastSlot        uint64 `json:"last_slot,omitempty"`         // Last successfully replayed slot
 	LastEpoch       uint64 `json:"last_epoch,omitempty"`        // Epoch of last replayed slot
 	LastBankhash    string `json:"last_bankhash,omitempty"`     // Bankhash of last replayed slot (base58)
 	LastBlockHeight uint64 `json:"last_block_height,omitempty"` // Block height of last replayed slot
 
-	// =========================================================================
-	// Resume Context (everything needed to continue replay from LastSlot)
-	// These fields capture state at the end of the last successfully replayed slot
-	// =========================================================================
+	// Resume context captured at the end of the last successfully replayed slot.
 
 	// LtHash and fee state
 	LastAcctsLtHash          string `json:"last_accts_lt_hash,omitempty"`         // base64 encoded cumulative LtHash
@@ -147,10 +137,7 @@ type MithrilState struct {
 	// These are NOT loaded from manifest - they are computed during replay and persisted.
 	ComputedEpochStakes map[uint64]string `json:"computed_epoch_stakes,omitempty"`
 
-	// =========================================================================
-	// Legacy fields - kept for backwards compatibility
-	// =========================================================================
-	// TODO: Remove after v1.0 release
+	// Legacy fields kept for backwards compatibility.
 	LastCommit string    `json:"last_commit,omitempty"` // Deprecated: use last_writer_commit
 	LastRunID  string    `json:"last_run_id,omitempty"` // Deprecated: use current_run_id
 	LastRunAt  time.Time `json:"last_run_at,omitempty"` // Deprecated: tracked via last_shutdown_at
@@ -164,6 +151,7 @@ const (
 	ShutdownReasonLeaderSchedule = "leader schedule fetch failed from all RPC endpoints"
 	ShutdownReasonError          = "replay error" // Will be suffixed with actual error
 	ShutdownReasonCompleted      = "replay completed - reached end slot"
+	ShutdownReasonStartupFailed  = "startup failed before replay"
 )
 
 // BlockhashEntry represents a single entry in the RecentBlockhashes sysvar
@@ -183,9 +171,8 @@ type ManifestFeeRateGovernorSeed struct {
 	BurnPercent                byte   `json:"burn_percent"`
 }
 
-// ManifestEpochScheduleSeed contains the bank epoch schedule serialized in the
-// snapshot manifest. Some clusters can expose a divergent EpochSchedule sysvar
-// account, so replay uses this bank schedule for epoch/leader/rewards logic.
+// ManifestEpochScheduleSeed is the bank epoch schedule from the snapshot manifest.
+// Replay uses it (not the sysvar account, which can diverge) for epoch/leader/rewards.
 type ManifestEpochScheduleSeed struct {
 	SlotsPerEpoch            uint64 `json:"slots_per_epoch"`
 	LeaderScheduleSlotOffset uint64 `json:"leader_schedule_slot_offset"`
@@ -245,7 +232,7 @@ func (s *MithrilState) Save(accountsDbDir string) error {
 
 	// Write to temp file first, then rename for atomicity
 	tmpFile := stateFile + ".tmp"
-	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+	if err := os.WriteFile(tmpFile, data, 0600); err != nil {
 		return fmt.Errorf("failed to write state file: %w", err)
 	}
 
@@ -265,6 +252,43 @@ func (s *MithrilState) IsReady() bool {
 // IsCorrupted returns true if the state indicates AccountsDB is corrupted.
 func (s *MithrilState) IsCorrupted() bool {
 	return s != nil && s.Stage == "corrupted"
+}
+
+// StartSession stamps CurrentSessionStartedAt and persists. Called once at
+// startup (runLive, after LoadState) so WasCleanExit only trusts a shutdown
+// recorded after this session began.
+func (s *MithrilState) StartSession(accountsDbDir string) error {
+	s.CurrentSessionStartedAt = time.Now()
+	return s.Save(accountsDbDir)
+}
+
+// WasCleanExit reports (clean, reason) for the prior shutdown; legacy files (zero start time) trust the reason directly.
+func WasCleanExit(s *MithrilState) (bool, string) {
+	if s == nil {
+		return false, "no state file"
+	}
+	if s.CurrentSessionStartedAt.IsZero() {
+		if s.LastShutdownReason == "" {
+			return false, "legacy state file: no shutdown reason recorded"
+		}
+		return isCleanShutdownReason(s.LastShutdownReason),
+			"legacy state file: " + s.LastShutdownReason
+	}
+	if s.LastShutdownAt.IsZero() || s.LastShutdownAt.Before(s.CurrentSessionStartedAt) {
+		return false, "session crashed (no shutdown recorded after start)"
+	}
+	if s.LastShutdownReason == "" {
+		return false, "shutdown recorded without reason"
+	}
+	return isCleanShutdownReason(s.LastShutdownReason), s.LastShutdownReason
+}
+
+// isCleanShutdownReason returns true when reason matches a constant that
+// represents an orderly exit (no AccountsDB rebuild required).
+func isCleanShutdownReason(reason string) bool {
+	return reason == ShutdownReasonNormal ||
+		reason == ShutdownReasonCompleted ||
+		strings.HasPrefix(reason, ShutdownReasonStartupFailed)
 }
 
 // MarkCorrupted updates the state file to indicate AccountsDB is corrupted.
@@ -413,6 +437,36 @@ func (s *MithrilState) UpdateOnShutdown(accountsDbDir string, slot uint64, bankh
 	return s.Save(accountsDbDir)
 }
 
+// RecordSessionShutdown records a shutdown for a session that never persisted a
+// new replay slot (stopped during startup/catchup). It leaves the prior replay
+// position intact while marking the session so it isn't misread as a crash.
+func (s *MithrilState) RecordSessionShutdown(accountsDbDir string, ctx *ShutdownContext) error {
+	if s == nil {
+		return fmt.Errorf("nil state")
+	}
+	if ctx != nil {
+		if s.RootRunID == "" {
+			s.RootRunID = ctx.RunID
+		}
+		if s.CurrentRunID != "" && s.CurrentRunID != ctx.RunID {
+			s.ParentRunID = s.CurrentRunID
+		}
+		s.CurrentRunID = ctx.RunID
+		s.LastWriterVersion = ctx.WriterVersion
+		s.LastWriterCommit = ctx.WriterCommit
+		s.LastWriterBranch = ctx.WriterBranch
+		s.LastCommit = ctx.WriterCommit
+		if ctx.ShutdownReason != "" {
+			s.LastShutdownReason = ctx.ShutdownReason
+			s.LastShutdownAt = time.Now()
+		}
+		s.LastRunID = ctx.RunID
+		s.LastRunAt = time.Now()
+	}
+	s.StateSchemaVersion = CurrentStateSchemaVersion
+	return s.Save(accountsDbDir)
+}
+
 // HasResumeData returns true if the state has resume context stored.
 // This indicates the state was saved during a graceful shutdown with full context.
 func (s *MithrilState) HasResumeData() bool {
@@ -526,18 +580,19 @@ func NewReadyState(snapshotSlot uint64, snapshotEpoch uint64, fullSnapshotPath s
 // NewReadyStateWithOpts creates a new state with full options including cluster and version info.
 func NewReadyStateWithOpts(opts NewReadyStateOpts) *MithrilState {
 	state := &MithrilState{
-		StateSchemaVersion: CurrentStateSchemaVersion,
-		Stage:              "ready",
-		SnapshotSlot:       opts.SnapshotSlot,
-		SnapshotEpoch:      opts.SnapshotEpoch,
-		BuildCompleted:     time.Now(),
-		BuildStartedAt:     opts.BuildStartedAt,
-		BuildMode:          opts.BuildMode,
-		Cluster:            opts.Cluster,
-		GenesisHash:        opts.GenesisHash,
-		LastWriterVersion:  opts.WriterVersion,
-		LastWriterCommit:   opts.WriterCommit,
-		LastCommit:         opts.WriterCommit, // Also set legacy field
+		StateSchemaVersion:      CurrentStateSchemaVersion,
+		Stage:                   "ready",
+		SnapshotSlot:            opts.SnapshotSlot,
+		SnapshotEpoch:           opts.SnapshotEpoch,
+		BuildCompleted:          time.Now(),
+		BuildStartedAt:          opts.BuildStartedAt,
+		BuildMode:               opts.BuildMode,
+		Cluster:                 opts.Cluster,
+		GenesisHash:             opts.GenesisHash,
+		LastWriterVersion:       opts.WriterVersion,
+		LastWriterCommit:        opts.WriterCommit,
+		LastCommit:              opts.WriterCommit, // Also set legacy field
+		CurrentSessionStartedAt: time.Now(),        // session that built this state
 	}
 
 	if opts.FullSnapshotPath != "" {
