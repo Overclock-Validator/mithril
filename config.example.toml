@@ -278,8 +278,14 @@ name = "mithril"
     binary_path = "./lightbringer"
 
     # Solana gossip entrypoint (REQUIRED when enabled)
-    # This is the IP:port of a Solana validator or RPC node running gossip.
-    # gossip_entrypoint = "1.2.3.4:8000"
+    # This is the host:port of a Solana validator or RPC node running gossip.
+    # gossip_entrypoint = "entrypoint.mainnet-beta.solana.com:8001"
+
+    # Managed Lightbringer joins Solana gossip and opens public UDP gossip/repair sockets.
+    # Keep these aligned with firewall/security-group rules, especially for mainnet.
+    gossip_port = 65400
+    port_range_start = 65401
+    port_range_end = 65500
 
     # Lightbringer's debug HTTP endpoint (for inspecting stored shreds)
     rpc_addr = "127.0.0.1:3000"

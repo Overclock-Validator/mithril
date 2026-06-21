@@ -3,6 +3,7 @@ package lightbringer
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -48,6 +49,190 @@ func TestValidate_RequiredFields(t *testing.T) {
 	}
 }
 
+func TestValidate_GossipPorts(t *testing.T) {
+	base := LightbringerTOML{
+		GossipEntrypoint: "1.2.3.4:8000",
+		Storage:          "/data/shreds",
+		RpcAddr:          "127.0.0.1:3000",
+		GrpcAddr:         "127.0.0.1:3001",
+		GossipPort:       55000,
+		PortRangeStart:   55001,
+		PortRangeEnd:     55100,
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(*LightbringerTOML)
+		wantErr string
+	}{
+		{name: "valid explicit ports"},
+		{
+			name: "narrow range",
+			mutate: func(cfg *LightbringerTOML) {
+				cfg.PortRangeEnd = 55010
+			},
+			wantErr: "at least 25",
+		},
+		{
+			name: "overlap",
+			mutate: func(cfg *LightbringerTOML) {
+				cfg.GossipPort = 55010
+			},
+			wantErr: "must not overlap",
+		},
+		{
+			name: "quic overflow",
+			mutate: func(cfg *LightbringerTOML) {
+				cfg.PortRangeStart = 65500
+				cfg.PortRangeEnd = 65535
+			},
+			wantErr: "must fit",
+		},
+		{
+			name: "zero values use lightbringer defaults",
+			mutate: func(cfg *LightbringerTOML) {
+				cfg.GossipPort = 0
+				cfg.PortRangeStart = 0
+				cfg.PortRangeEnd = 0
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := base
+			if tt.mutate != nil {
+				tt.mutate(&cfg)
+			}
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.ErrorContains(t, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidate_InfluxDBRequiresCompleteSection(t *testing.T) {
+	base := LightbringerTOML{
+		GossipEntrypoint: "1.2.3.4:8000",
+		Storage:          "/data/shreds",
+		RpcAddr:          "127.0.0.1:3000",
+		GrpcAddr:         "127.0.0.1:3001",
+		InfluxdbHost:     "http://127.0.0.1:18181",
+		InfluxdbDatabase: "lightbringer",
+		InfluxdbToken:    "token",
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(*LightbringerTOML)
+		wantErr string
+	}{
+		{name: "complete section"},
+		{
+			name: "host only",
+			mutate: func(cfg *LightbringerTOML) {
+				cfg.InfluxdbDatabase = ""
+				cfg.InfluxdbToken = ""
+			},
+			wantErr: "influxdb.database is required",
+		},
+		{
+			name: "missing token",
+			mutate: func(cfg *LightbringerTOML) {
+				cfg.InfluxdbToken = ""
+			},
+			wantErr: "influxdb.token is required",
+		},
+		{
+			name: "wrong host scheme",
+			mutate: func(cfg *LightbringerTOML) {
+				cfg.InfluxdbHost = "ws://127.0.0.1:18181"
+			},
+			wantErr: "influxdb.host must use one of",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := base
+			if tt.mutate != nil {
+				tt.mutate(&cfg)
+			}
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.ErrorContains(t, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidate_BlockConfirmationRequiresCompleteSection(t *testing.T) {
+	base := LightbringerTOML{
+		GossipEntrypoint:    "1.2.3.4:8000",
+		Storage:             "/data/shreds",
+		RpcAddr:             "127.0.0.1:3000",
+		GrpcAddr:            "127.0.0.1:3001",
+		BlockConfirmRpcHTTP: "http://127.0.0.1:8900",
+		BlockConfirmRpcWS:   "ws://127.0.0.1:8900",
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(*LightbringerTOML)
+		wantErr string
+	}{
+		{name: "complete section"},
+		{
+			name: "missing websocket",
+			mutate: func(cfg *LightbringerTOML) {
+				cfg.BlockConfirmRpcWS = ""
+			},
+			wantErr: "block_confirmation.rpc_websocket is required",
+		},
+		{
+			name: "missing http",
+			mutate: func(cfg *LightbringerTOML) {
+				cfg.BlockConfirmRpcHTTP = ""
+			},
+			wantErr: "block_confirmation.rpc_http is required",
+		},
+		{
+			name: "http field uses ws scheme",
+			mutate: func(cfg *LightbringerTOML) {
+				cfg.BlockConfirmRpcHTTP = "ws://127.0.0.1:8900"
+			},
+			wantErr: "block_confirmation.rpc_http must use one of",
+		},
+		{
+			name: "websocket field uses http scheme",
+			mutate: func(cfg *LightbringerTOML) {
+				cfg.BlockConfirmRpcWS = "http://127.0.0.1:8900"
+			},
+			wantErr: "block_confirmation.rpc_websocket must use one of",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := base
+			if tt.mutate != nil {
+				tt.mutate(&cfg)
+			}
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.ErrorContains(t, err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestGenerateTOML_RequiredFieldsOnly(t *testing.T) {
 	cfg := LightbringerTOML{
 		GossipEntrypoint: "1.2.3.4:8000",
@@ -64,6 +249,25 @@ func TestGenerateTOML_RequiredFieldsOnly(t *testing.T) {
 	assert.Contains(t, toml, `grpc_addr = "127.0.0.1:3001"`)
 	assert.NotContains(t, toml, "[influxdb]")
 	assert.NotContains(t, toml, "[block_confirmation]")
+}
+
+func TestGenerateTOML_WithGossipConfig(t *testing.T) {
+	cfg := LightbringerTOML{
+		GossipEntrypoint: "1.2.3.4:8000",
+		Storage:          "/data/shreds",
+		RpcAddr:          "127.0.0.1:3000",
+		GrpcAddr:         "127.0.0.1:3001",
+		GossipPort:       55000,
+		PortRangeStart:   55001,
+		PortRangeEnd:     55100,
+	}
+
+	toml := cfg.GenerateTOML()
+
+	assert.Contains(t, toml, "[gossip]")
+	assert.Contains(t, toml, "gossip_port = 55000")
+	assert.Contains(t, toml, "port_range_start = 55001")
+	assert.Contains(t, toml, "port_range_end = 55100")
 }
 
 func TestGenerateTOML_WithInfluxDB(t *testing.T) {
@@ -214,6 +418,15 @@ func TestWriteConfigFile_CreatesValidFile(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(content), `gossip_entrypoint = "10.0.0.1:8000"`)
 	assert.Contains(t, string(content), `grpc_addr = "0.0.0.0:3001"`)
+
+	// The config can carry an InfluxDB token, so the file must be private
+	// (0600). Permission bits aren't meaningful on Windows.
+	if runtime.GOOS != "windows" {
+		info, statErr := os.Stat(path)
+		require.NoError(t, statErr)
+		assert.Equal(t, os.FileMode(0600), info.Mode().Perm(),
+			"Lightbringer config may hold a secret token; must not be group/world-readable")
+	}
 }
 
 func TestWriteConfigFile_OverwritesExisting(t *testing.T) {
@@ -264,4 +477,12 @@ func TestWriteConfigFile_NoTempFileLeftOnSuccess(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, entries, 1)
 	assert.Equal(t, "Lightbringer.toml", entries[0].Name())
+}
+
+// The exported wrapper (used by doctor) must enforce the same rules as runtime.
+func TestValidateGossipPorts_ExportedWrapper(t *testing.T) {
+	require.NoError(t, ValidateGossipPorts(55000, 55001, 55100))
+	require.ErrorContains(t, ValidateGossipPorts(55010, 55001, 55100), "must not overlap")
+	require.ErrorContains(t, ValidateGossipPorts(55000, 55001, 55010), "at least 25")
+	require.ErrorContains(t, ValidateGossipPorts(70000, 55001, 55100), "out of range")
 }

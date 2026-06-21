@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Overclock-Validator/mithril/pkg/config"
 	"github.com/Overclock-Validator/mithril/pkg/tui"
@@ -50,6 +51,9 @@ const (
 	edScrRPC
 	edScrLightbringer
 	edScrGossip
+	edScrLBGossipPort
+	edScrLBPortRangeStart
+	edScrLBPortRangeEnd
 	edScrLightbringerQuiet
 	edScrStorage
 	edScrAccountsPath
@@ -91,6 +95,9 @@ type editModel struct {
 	rpcEndpoint   string
 	lbEnabled     bool
 	gossipEntry   string
+	lbGossipPort  string
+	lbRangeStart  string
+	lbRangeEnd    string
 	lbQuiet       bool
 	accountsPath  string
 	snapshotsPath string
@@ -98,6 +105,8 @@ type editModel struct {
 	txpar         string
 	blockMaxRPS   string
 	blockInflight string
+	blockSource   string
+	lbEndpoint    string
 	rpcPort       string
 	logLevel      string
 	bootstrapMode string
@@ -120,6 +129,9 @@ func newEditModel(cf string, v *viper.Viper) editModel {
 		cluster = "mainnet-beta"
 	}
 	rpcSlice := v.GetStringSlice("network.rpc")
+	if len(rpcSlice) == 0 {
+		rpcSlice = v.GetStringSlice("rpc.rpc")
+	}
 	rpcEndpoint := ""
 	if len(rpcSlice) > 0 {
 		rpcEndpoint = rpcSlice[0]
@@ -154,6 +166,14 @@ func newEditModel(cf string, v *viper.Viper) editModel {
 	if logsPath == "" {
 		logsPath = v.GetString("log.dir")
 	}
+	accountsPath := v.GetString("storage.accounts")
+	if accountsPath == "" {
+		accountsPath = v.GetString("ledger.accounts_path")
+	}
+	snapshotsPath := v.GetString("snapshot.download_path")
+	if snapshotsPath == "" {
+		snapshotsPath = v.GetString("storage.snapshots")
+	}
 
 	return editModel{
 		configFile:    cf,
@@ -165,9 +185,14 @@ func newEditModel(cf string, v *viper.Viper) editModel {
 		txparWasSet:   txparWasSet,
 		lbEnabled:     v.GetBool("lightbringer.enabled"),
 		gossipEntry:   v.GetString("lightbringer.gossip_entrypoint"),
+		lbGossipPort:  v.GetString("lightbringer.gossip_port"),
+		lbRangeStart:  v.GetString("lightbringer.port_range_start"),
+		lbRangeEnd:    v.GetString("lightbringer.port_range_end"),
 		lbQuiet:       v.GetBool("lightbringer.quiet"),
-		accountsPath:  v.GetString("storage.accounts"),
-		snapshotsPath: v.GetString("storage.snapshots"),
+		blockSource:   v.GetString("block.source"),
+		lbEndpoint:    v.GetString("block.lightbringer_endpoint"),
+		accountsPath:  accountsPath,
+		snapshotsPath: snapshotsPath,
 		logsPath:      logsPath,
 		txpar:         txpar,
 		blockMaxRPS:   blockMaxRPS,
@@ -219,6 +244,7 @@ func (m *editModel) goBack() {
 func (m editModel) isInputScreen(scr int) bool {
 	switch scr {
 	case edScrRPC, edScrGossip, edScrAccountsPath, edScrSnapshotsPath,
+		edScrLBGossipPort, edScrLBPortRangeStart, edScrLBPortRangeEnd,
 		edScrLogsPath, edScrTuning, edScrBlockRPS, edScrBlockInflight, edScrRPCPort:
 		return true
 	}
@@ -231,6 +257,12 @@ func (m editModel) inputValueForScreen(scr int) string {
 		return m.rpcEndpoint
 	case edScrGossip:
 		return m.gossipEntry
+	case edScrLBGossipPort:
+		return m.lbGossipPort
+	case edScrLBPortRangeStart:
+		return m.lbRangeStart
+	case edScrLBPortRangeEnd:
+		return m.lbRangeEnd
 	case edScrAccountsPath:
 		return m.accountsPath
 	case edScrSnapshotsPath:
@@ -260,9 +292,11 @@ func (m editModel) currentItems() []edItem {
 			if m.lbQuiet {
 				lbStatus += ", quiet"
 			}
+		} else if m.blockSource == "lightbringer" && m.lbEndpoint != "" {
+			lbStatus = "external: " + truncate(config.RedactEndpointForDisplay(m.lbEndpoint), 28)
 		}
 		return []edItem{
-			{label: "Network", value: "network", desc: fmt.Sprintf("cluster=%s  rpc=%s", m.cluster, truncate(m.rpcEndpoint, 35))},
+			{label: "Network", value: "network", desc: fmt.Sprintf("cluster=%s  rpc=%s", m.cluster, truncate(config.RedactEndpointForDisplay(m.rpcEndpoint), 35))},
 			{label: "Lightbringer", value: "lightbringer", desc: lbStatus},
 			{label: "Storage", value: "storage", desc: truncate(m.accountsPath, 30)},
 			{label: "Tuning", value: "tuning", desc: fmt.Sprintf("txpar=%s", m.txpar)},
@@ -282,8 +316,12 @@ func (m editModel) currentItems() []edItem {
 			{label: "← Back", value: "_back"},
 		}
 	case edScrLightbringer:
+		disableDesc := "Use RPC only"
+		if m.blockSource == "lightbringer" && m.lbEndpoint != "" {
+			disableDesc = "Disable managed sidecar; keep external endpoint"
+		}
 		items := []edItem{
-			{label: "Disable", value: "disable", desc: "Use RPC only"},
+			{label: "Disable", value: "disable", desc: disableDesc},
 			{label: "Enable", value: "enable", desc: "Sidecar for lower-latency block streaming"},
 		}
 		if m.lbEnabled {
@@ -291,6 +329,24 @@ func (m editModel) currentItems() []edItem {
 			if m.lbQuiet {
 				quietDesc = "on (only warn/error in lightbringer.log)"
 			}
+			gossipPort := m.lbGossipPort
+			if gossipPort == "" {
+				gossipPort = "65400 default"
+			}
+			rangeStart := m.lbRangeStart
+			if rangeStart == "" {
+				rangeStart = "65401 default"
+			}
+			rangeEnd := m.lbRangeEnd
+			if rangeEnd == "" {
+				rangeEnd = "65500 default"
+			}
+			items = append(items,
+				edItem{label: "Gossip entrypoint", value: "gossip", desc: truncate(m.gossipEntry, 30)},
+				edItem{label: "Gossip UDP port", value: "gossip_port", desc: gossipPort},
+				edItem{label: "UDP range start", value: "range_start", desc: rangeStart},
+				edItem{label: "UDP range end", value: "range_end", desc: rangeEnd},
+			)
 			items = append(items, edItem{label: "Quiet logs", value: "quiet", desc: quietDesc})
 		}
 		items = append(items, edItem{isSep: true}, edItem{label: "← Back", value: "_back"})
@@ -439,11 +495,28 @@ func (m *editModel) handleSelect(value string) {
 		switch value {
 		case "enable":
 			m.lbEnabled = true
+			if m.lbGossipPort == "" {
+				m.lbGossipPort = "65400"
+			}
+			if m.lbRangeStart == "" {
+				m.lbRangeStart = "65401"
+			}
+			if m.lbRangeEnd == "" {
+				m.lbRangeEnd = "65500"
+			}
 			m.pushInput(edScrGossip)
 		case "disable":
 			m.lbEnabled = false
 			m.lbQuiet = config.LightbringerQuietDefault // Reset dependent state so disable→re-enable starts clean.
 			m.goBack()
+		case "gossip":
+			m.pushInput(edScrGossip)
+		case "gossip_port":
+			m.pushInput(edScrLBGossipPort)
+		case "range_start":
+			m.pushInput(edScrLBPortRangeStart)
+		case "range_end":
+			m.pushInput(edScrLBPortRangeEnd)
 		case "quiet":
 			m.pushMenu(edScrLightbringerQuiet)
 		}
@@ -473,6 +546,15 @@ func (m *editModel) handleSelect(value string) {
 }
 
 func (m editModel) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Sanitize pasted/typed runes (strip control chars, newlines, ESC) to block TOML + terminal-escape injection.
+	if msg.Type == tea.KeyRunes && len(msg.Runes) > 0 {
+		text := config.SanitizeUserInput(string(msg.Runes))
+		if text != "" {
+			m.inputVal = m.inputVal[:m.inputCur] + text + m.inputVal[m.inputCur:]
+			m.inputCur += len(text)
+		}
+		return m, nil
+	}
 	switch msg.String() {
 	case "esc":
 		m.goBack()
@@ -484,16 +566,19 @@ func (m editModel) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "backspace":
 		if m.inputCur > 0 {
-			m.inputVal = m.inputVal[:m.inputCur-1] + m.inputVal[m.inputCur:]
-			m.inputCur--
+			_, size := utf8.DecodeLastRuneInString(m.inputVal[:m.inputCur])
+			m.inputVal = m.inputVal[:m.inputCur-size] + m.inputVal[m.inputCur:]
+			m.inputCur -= size
 		}
 	case "left":
 		if m.inputCur > 0 {
-			m.inputCur--
+			_, size := utf8.DecodeLastRuneInString(m.inputVal[:m.inputCur])
+			m.inputCur -= size
 		}
 	case "right":
 		if m.inputCur < len(m.inputVal) {
-			m.inputCur++
+			_, size := utf8.DecodeRuneInString(m.inputVal[m.inputCur:])
+			m.inputCur += size
 		}
 	case "ctrl+a":
 		m.inputCur = 0
@@ -522,12 +607,12 @@ func (m *editModel) validateAndApplyInput() bool {
 
 	case edScrGossip:
 		if val == "" {
-			m.inputErr = "Format: IP:port (e.g., 1.2.3.4:8000)"
+			m.inputErr = "Format: host:port (e.g., entrypoint.mainnet-beta.solana.com:8001)"
 			return false
 		}
 		host, portStr, err := net.SplitHostPort(val)
 		if err != nil || host == "" {
-			m.inputErr = "Format: IP:port (e.g., 1.2.3.4:8000)"
+			m.inputErr = "Format: host:port (e.g., entrypoint.mainnet-beta.solana.com:8001)"
 			return false
 		}
 		if p, perr := strconv.Atoi(portStr); perr != nil || p < 1 || p > 65535 {
@@ -535,6 +620,26 @@ func (m *editModel) validateAndApplyInput() bool {
 			return false
 		}
 		m.gossipEntry = val
+
+	case edScrLBGossipPort, edScrLBPortRangeStart, edScrLBPortRangeEnd:
+		gossipPort := m.lbGossipPort
+		rangeStart := m.lbRangeStart
+		rangeEnd := m.lbRangeEnd
+		switch m.screen {
+		case edScrLBGossipPort:
+			gossipPort = val
+		case edScrLBPortRangeStart:
+			rangeStart = val
+		case edScrLBPortRangeEnd:
+			rangeEnd = val
+		}
+		if err := validateLightbringerUDPPorts(gossipPort, rangeStart, rangeEnd); err != nil {
+			m.inputErr = err.Error()
+			return false
+		}
+		m.lbGossipPort = gossipPort
+		m.lbRangeStart = rangeStart
+		m.lbRangeEnd = rangeEnd
 
 	case edScrAccountsPath:
 		if val == "" {
@@ -558,9 +663,14 @@ func (m *editModel) validateAndApplyInput() bool {
 		m.logsPath = filepath.Clean(val)
 
 	case edScrTuning:
+		if val == "" {
+			m.txpar = ""
+			m.txparWasSet = true
+			return true
+		}
 		n, err := strconv.Atoi(val)
 		if err != nil || n < 0 {
-			m.inputErr = "Must be 0 (sequential) or a positive integer"
+			m.inputErr = "Must be empty, 0 (sequential), or a positive integer"
 			return false
 		}
 		m.txpar = val
@@ -595,14 +705,56 @@ func (m *editModel) validateAndApplyInput() bool {
 	return true
 }
 
+func validateLightbringerUDPPorts(gossipPortRaw, rangeStartRaw, rangeEndRaw string) error {
+	gossipPort, err := parseLightbringerUDPPort(gossipPortRaw, "gossip_port", 65400)
+	if err != nil {
+		return err
+	}
+	rangeStart, err := parseLightbringerUDPPort(rangeStartRaw, "port_range_start", 65401)
+	if err != nil {
+		return err
+	}
+	rangeEnd, err := parseLightbringerUDPPort(rangeEndRaw, "port_range_end", 65500)
+	if err != nil {
+		return err
+	}
+	if rangeStart > rangeEnd {
+		return fmt.Errorf("port_range_start must be <= port_range_end")
+	}
+	if rangeEnd-rangeStart < 25 {
+		return fmt.Errorf("port range must be at least 25 ports wide")
+	}
+	if rangeEnd+6 > 65535 {
+		return fmt.Errorf("port_range_end must be <= 65529")
+	}
+	if gossipPort >= rangeStart && gossipPort <= rangeEnd {
+		return fmt.Errorf("gossip_port must not overlap port_range_start..port_range_end")
+	}
+	return nil
+}
+
+func parseLightbringerUDPPort(raw, field string, fallback int) (int, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 1 || value > 65535 {
+		return 0, fmt.Errorf("%s must be 1-65535", field)
+	}
+	return value, nil
+}
+
 func (m *editModel) advanceFromInput() {
 	switch m.screen {
 	case edScrRPC:
 		m.goBack() // back to sections
 		m.goBack() // pop cluster too
 	case edScrGossip:
-		m.goBack() // back to sections
-		m.goBack() // pop lightbringer too
+		// Single goBack returns to Lightbringer menu for both the enable flow and standalone gossip edit.
+		m.goBack()
+	case edScrLBGossipPort, edScrLBPortRangeStart, edScrLBPortRangeEnd:
+		m.goBack() // back to lightbringer
 	case edScrAccountsPath, edScrSnapshotsPath, edScrLogsPath:
 		m.goBack() // back to storage
 	case edScrTuning:
@@ -628,8 +780,9 @@ func (m *editModel) saveConfig() {
 
 	content := string(data)
 	content = setTomlValue(content, "network", "cluster", fmt.Sprintf("%q", m.cluster))
-	// Preserve failover RPC endpoints — update first, keep rest
-	rpcArray := m.rpcFull
+	// Preserve failover RPC endpoints — update first, keep rest.
+	// Copy so we don't mutate m.rpcFull's backing array in place.
+	rpcArray := append([]string(nil), m.rpcFull...)
 	if len(rpcArray) > 0 {
 		rpcArray[0] = m.rpcEndpoint
 	} else {
@@ -642,44 +795,60 @@ func (m *editModel) saveConfig() {
 	content = setTomlValue(content, "network", "rpc", "["+strings.Join(rpcParts, ", ")+"]")
 	if m.accountsPath != "" {
 		content = setTomlValue(content, "storage", "accounts", fmt.Sprintf("%q", filepath.Clean(m.accountsPath)))
+		content = removeTomlValue(content, "ledger", "accounts_path")
 	}
 	if m.snapshotsPath != "" {
 		content = setTomlValue(content, "storage", "snapshots", fmt.Sprintf("%q", filepath.Clean(m.snapshotsPath)))
+		content = removeTomlValue(content, "snapshot", "download_path")
 	}
 	content = setTomlValue(content, "block", "max_rps", m.blockMaxRPS)
 	content = setTomlValue(content, "block", "max_inflight", m.blockInflight)
-	// Only write txpar if it was originally in the config or user explicitly set a value
-	if m.txparWasSet && m.txpar != "" {
-		content = setTomlValue(content, "tuning", "txpar", m.txpar)
+	// Empty txpar means sequential runtime mode; remove both canonical and
+	// legacy keys so a pinned worker count can be cleared.
+	if m.txparWasSet {
+		if m.txpar == "" {
+			content = removeTomlValue(content, "tuning", "txpar")
+			content = removeTomlValue(content, "replay", "txpar")
+		} else {
+			content = setTomlValue(content, "tuning", "txpar", m.txpar)
+			content = removeTomlValue(content, "replay", "txpar")
+		}
 	}
 	content = setTomlValue(content, "rpc", "port", m.rpcPort)
 	content = setTomlValue(content, "log", "level", fmt.Sprintf("%q", m.logLevel))
 	content = setTomlValue(content, "bootstrap", "mode", fmt.Sprintf("%q", m.bootstrapMode))
 
 	if m.lbEnabled {
+		if err := validateLightbringerUDPPorts(m.lbGossipPort, m.lbRangeStart, m.lbRangeEnd); err != nil {
+			m.err = err
+			return
+		}
 		content = setTomlValue(content, "block", "source", "\"lightbringer\"")
 		// Clear stale external endpoint so runtime uses managed sidecar's grpc_addr
 		content = setTomlValue(content, "block", "lightbringer_endpoint", "\"\"")
-		if !strings.Contains(content, "[lightbringer]") {
-			content += fmt.Sprintf("\n[lightbringer]\nenabled = true\nbinary_path = \"./lightbringer\"\ngossip_entrypoint = %q\ngrpc_addr = \"127.0.0.1:3001\"\nrpc_addr = \"127.0.0.1:3000\"\n", m.gossipEntry)
+		if !hasTomlSection(content, "lightbringer") {
+			content += fmt.Sprintf("\n[lightbringer]\nenabled = true\nbinary_path = \"./lightbringer\"\ngossip_entrypoint = %q\ngossip_port = %s\nport_range_start = %s\nport_range_end = %s\ngrpc_addr = \"127.0.0.1:3001\"\nrpc_addr = \"127.0.0.1:3000\"\n", m.gossipEntry, defaultString(m.lbGossipPort, "65400"), defaultString(m.lbRangeStart, "65401"), defaultString(m.lbRangeEnd, "65500"))
 		} else {
 			content = setTomlValue(content, "lightbringer", "enabled", "true")
 			if m.gossipEntry != "" {
 				content = setTomlValue(content, "lightbringer", "gossip_entrypoint", fmt.Sprintf("%q", m.gossipEntry))
 			}
 		}
+		content = setTomlValue(content, "lightbringer", "gossip_port", defaultString(m.lbGossipPort, "65400"))
+		content = setTomlValue(content, "lightbringer", "port_range_start", defaultString(m.lbRangeStart, "65401"))
+		content = setTomlValue(content, "lightbringer", "port_range_end", defaultString(m.lbRangeEnd, "65500"))
 		if m.lbQuiet {
 			content = setTomlValue(content, "lightbringer", "quiet", "true")
 		} else {
 			content = setTomlValue(content, "lightbringer", "quiet", "false")
 		}
 	} else {
-		// Only force block.source="rpc" if no external lightbringer_endpoint is configured.
-		// External LB mode (enabled=false + endpoint set) is a valid runtime config.
-		if m.v.GetString("block.lightbringer_endpoint") == "" {
+		// Fall back to rpc only when leaving lightbringer mode — never clobber a
+		// "turbine" (or other) source. External LB mode (endpoint set) stays as-is.
+		if m.v.GetString("block.lightbringer_endpoint") == "" && m.blockSource == "lightbringer" {
 			content = setTomlValue(content, "block", "source", "\"rpc\"")
 		}
-		if strings.Contains(content, "[lightbringer]") {
+		if hasTomlSection(content, "lightbringer") {
 			content = setTomlValue(content, "lightbringer", "enabled", "false")
 		}
 	}
@@ -745,7 +914,13 @@ func (m editModel) inputTitleDesc() (string, string) {
 	case edScrRPC:
 		return "RPC Endpoint", "Primary Solana RPC endpoint URL"
 	case edScrGossip:
-		return "Gossip Entrypoint", "IP:port of a Solana validator running gossip"
+		return "Gossip Entrypoint", "Host:port of a Solana gossip entrypoint"
+	case edScrLBGossipPort:
+		return "Lightbringer Gossip UDP Port", "Public UDP gossip port. Firewall must allow inbound/outbound traffic for mainnet use."
+	case edScrLBPortRangeStart:
+		return "Lightbringer UDP Range Start", "Start of public Solana repair/TVU UDP range."
+	case edScrLBPortRangeEnd:
+		return "Lightbringer UDP Range End", "End of public Solana repair/TVU UDP range."
 	case edScrAccountsPath:
 		return "AccountsDB Path", "Path for AccountsDB storage (~500GB, fastest NVMe)"
 	case edScrSnapshotsPath:
@@ -867,8 +1042,10 @@ func edRenderInput(title, description, value, errMsg string, cursorPos int) stri
 		after := text[cursorPos:]
 		cursor := lipgloss.NewStyle().Background(edTeal).Foreground(lipgloss.Color("#000000")).Render(" ")
 		if cursorPos < len(text) {
-			cursor = lipgloss.NewStyle().Background(edTeal).Foreground(lipgloss.Color("#000000")).Render(string(after[0]))
-			after = after[1:]
+			// Step a full rune so multibyte input doesn't render a lone lead byte as mojibake.
+			_, size := utf8.DecodeRuneInString(after)
+			cursor = lipgloss.NewStyle().Background(edTeal).Foreground(lipgloss.Color("#000000")).Render(after[:size])
+			after = after[size:]
 		}
 		text = before + cursor + after
 	}
@@ -928,7 +1105,7 @@ func setTomlValue(content, section, key, value string) string {
 	inSection := false
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "[") && !strings.HasPrefix(trimmed, "[[") {
+		if sectionName, ok := tomlSectionName(trimmed); ok {
 			if inSection {
 				// Section found but key missing — insert before next section header
 				result := make([]string, 0, len(lines)+1)
@@ -937,7 +1114,6 @@ func setTomlValue(content, section, key, value string) string {
 				result = append(result, lines[i:]...)
 				return strings.Join(result, "\n")
 			}
-			sectionName := strings.Trim(trimmed, "[] ")
 			inSection = sectionName == section
 			continue
 		}
@@ -964,9 +1140,63 @@ func setTomlValue(content, section, key, value string) string {
 	return strings.Join(lines, "\n")
 }
 
+func removeTomlValue(content, section, key string) string {
+	lines := strings.Split(content, "\n")
+	inSection := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if sectionName, ok := tomlSectionName(trimmed); ok {
+			inSection = sectionName == section
+			continue
+		}
+		if inSection && (strings.HasPrefix(trimmed, key+" ") || strings.HasPrefix(trimmed, key+"=")) {
+			lines[i] = "# " + line
+			return strings.Join(lines, "\n")
+		}
+	}
+	return content
+}
+
 func truncate(s string, max int) string {
-	if len(s) <= max {
+	// Slice on runes, not bytes, to avoid splitting multibyte chars.
+	r := []rune(s)
+	if len(r) <= max {
 		return s
 	}
-	return s[:max-3] + "..."
+	if max < 3 {
+		return string(r[:max])
+	}
+	return string(r[:max-3]) + "..."
+}
+
+func defaultString(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
+
+func hasTomlSection(content, section string) bool {
+	for _, line := range strings.Split(content, "\n") {
+		if sectionName, ok := tomlSectionName(line); ok && sectionName == section {
+			return true
+		}
+	}
+	return false
+}
+
+func tomlSectionName(line string) (string, bool) {
+	trimmed := strings.TrimSpace(line)
+	if strings.HasPrefix(trimmed, "#") || !strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "[[") {
+		return "", false
+	}
+	end := strings.Index(trimmed, "]")
+	if end <= 1 {
+		return "", false
+	}
+	tail := strings.TrimSpace(trimmed[end+1:])
+	if tail != "" && !strings.HasPrefix(tail, "#") {
+		return "", false
+	}
+	return strings.TrimSpace(trimmed[1:end]), true
 }

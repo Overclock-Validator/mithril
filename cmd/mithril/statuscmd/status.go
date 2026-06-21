@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/config"
+	"github.com/Overclock-Validator/mithril/pkg/procctl"
+	statepkg "github.com/Overclock-Validator/mithril/pkg/state"
 	"github.com/Overclock-Validator/mithril/pkg/tui"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
@@ -53,59 +55,58 @@ func runStatus() {
 	fmt.Println(titleStyle.Render("◎ Mithril Status"))
 	fmt.Println()
 
-	// Try to find state file
-	stateFound := false
-	searchPaths := []string{accountsPath}
-	if accountsPath == "" {
-		searchPaths = []string{
-			config.DefaultStoragePaths().Accounts,
-			"./data/accounts",
-			".",
-		}
+	// Load config before state discovery so status follows the same storage
+	// path runtime uses when --accounts is not provided.
+	configErr := config.InitConfig()
+
+	configuredAccounts := ""
+	legacyAccounts := ""
+	if configErr == nil {
+		configuredAccounts = config.GetString("storage.accounts")
+		legacyAccounts = config.GetString("ledger.accounts_path")
 	}
 
-	var state mithrilState
-	var statePath string
-	for _, dir := range searchPaths {
-		p := filepath.Join(dir, "mithril_state.json")
-		data, err := os.ReadFile(p)
-		if err != nil {
-			continue
-		}
-		if err := json.Unmarshal(data, &state); err != nil {
-			continue
-		}
-		statePath = p
-		stateFound = true
-		break
-	}
+	process, processErr := procctl.Detect(
+		procctl.DefaultPidFile(),
+		procctl.DefaultLockFile(),
+		statusDetectionAccountsPath(accountsPath, configuredAccounts, legacyAccounts),
+	)
+
+	nodeState, statePath, stateFound := loadStatusState(statusStateSearchPaths(
+		accountsPath,
+		configuredAccounts,
+		legacyAccounts,
+	))
+
+	printProcessStatus(process, processErr)
 
 	if stateFound {
 		fmt.Printf("  %s State file: %s\n", successStyle.Render("✓"), dimStyle.Render(statePath))
-		fmt.Printf("  %s Last slot:  %s\n", successStyle.Render("✓"), valueStyle.Render(fmt.Sprintf("%d", state.LastSlot)))
-		if state.SnapshotSlot > 0 {
-			fmt.Printf("  %s Snapshot:   %s\n", dimStyle.Render("-"), valueStyle.Render(fmt.Sprintf("slot %d", state.SnapshotSlot)))
+		fmt.Printf("  %s Last slot:  %s\n", successStyle.Render("✓"), valueStyle.Render(fmt.Sprintf("%d", nodeState.LastSlot)))
+		if nodeState.SnapshotSlot > 0 {
+			fmt.Printf("  %s Snapshot:   %s\n", dimStyle.Render("-"), valueStyle.Render(fmt.Sprintf("slot %d", nodeState.SnapshotSlot)))
 		}
-		if state.ShutdownReason != "" {
-			fmt.Printf("  %s Last stop:  %s\n", dimStyle.Render("-"), valueStyle.Render(state.ShutdownReason))
+		if nodeState.ShutdownReason != "" {
+			fmt.Printf("  %s Last stop:  %s\n", dimStyle.Render("-"), valueStyle.Render(nodeState.ShutdownReason))
 		}
-		if state.LastBankhash != "" {
-			short := state.LastBankhash
+		if nodeState.LastBankhash != "" {
+			short := nodeState.LastBankhash
 			if len(short) > 12 {
 				short = short[:12] + "..."
 			}
 			fmt.Printf("  %s Bankhash:   %s\n", dimStyle.Render("-"), dimStyle.Render(short))
 		}
 	} else {
-		fmt.Printf("  %s No state file found\n", warnStyle.Render("~"))
-		fmt.Printf("    %s Mithril hasn't run yet, or --accounts path is wrong\n", dimStyle.Render(""))
+		headline, detail := missingStateStatusText(processRunning(process))
+		fmt.Printf("  %s %s\n", warnStyle.Render("~"), headline)
+		fmt.Printf("    %s %s\n", dimStyle.Render(""), detail)
 	}
 
 	fmt.Println()
 
 	// Read service addresses from config (fall back to defaults)
-	if err := config.InitConfig(); err != nil {
-		fmt.Printf("  %s Failed to read config: %v\n", warnStyle.Render("~"), err)
+	if configErr != nil {
+		fmt.Printf("  %s Failed to read config: %v\n", warnStyle.Render("~"), configErr)
 		fmt.Println("  Using default service addresses")
 	}
 	rpcAddr := "127.0.0.1:8899"
@@ -146,9 +147,9 @@ func runStatus() {
 		conn, err := net.DialTimeout("tcp", rpcAddr, 2*time.Second)
 		if err == nil {
 			conn.Close()
-			fmt.Printf("  %s Mithril RPC responding on %s\n", successStyle.Render("✓"), rpcAddr)
+			fmt.Printf("  %s Mithril RPC responding on %s\n", successStyle.Render("✓"), redactedStatusAddr(rpcAddr))
 		} else {
-			fmt.Printf("  %s Mithril RPC not responding on %s\n", dimStyle.Render("-"), rpcAddr)
+			fmt.Printf("  %s Mithril RPC not responding on %s\n", dimStyle.Render("-"), redactedStatusAddr(rpcAddr))
 		}
 	}
 
@@ -157,9 +158,9 @@ func runStatus() {
 		conn, err := net.DialTimeout("tcp", lbAddr, 2*time.Second)
 		if err == nil {
 			conn.Close()
-			fmt.Printf("  %s Lightbringer gRPC responding on %s\n", successStyle.Render("✓"), lbAddr)
+			fmt.Printf("  %s Lightbringer gRPC responding on %s\n", successStyle.Render("✓"), redactedStatusAddr(lbAddr))
 		} else {
-			fmt.Printf("  %s Lightbringer gRPC not responding on %s\n", dimStyle.Render("-"), lbAddr)
+			fmt.Printf("  %s Lightbringer gRPC not responding on %s\n", dimStyle.Render("-"), redactedStatusAddr(lbAddr))
 		}
 
 		// Only probe HTTP when using managed sidecar (not external)
@@ -167,9 +168,9 @@ func runStatus() {
 			conn, err = net.DialTimeout("tcp", lbHTTP, 2*time.Second)
 			if err == nil {
 				conn.Close()
-				fmt.Printf("  %s Lightbringer HTTP responding on %s\n", successStyle.Render("✓"), lbHTTP)
+				fmt.Printf("  %s Lightbringer HTTP responding on %s\n", successStyle.Render("✓"), redactedStatusAddr(lbHTTP))
 			} else {
-				fmt.Printf("  %s Lightbringer HTTP not responding on %s\n", dimStyle.Render("-"), lbHTTP)
+				fmt.Printf("  %s Lightbringer HTTP not responding on %s\n", dimStyle.Render("-"), redactedStatusAddr(lbHTTP))
 			}
 			if config.GetBool("lightbringer.quiet") {
 				fmt.Printf("  %s Lightbringer quiet mode: enabled (warn/error only)\n", dimStyle.Render("·"))
@@ -178,4 +179,100 @@ func runStatus() {
 	}
 
 	fmt.Println()
+}
+
+func redactedStatusAddr(addr string) string {
+	return config.RedactSecretsInText(config.RedactEndpointForDisplay(addr))
+}
+
+func printProcessStatus(process *procctl.Detection, err error) {
+	if err != nil {
+		fmt.Printf("  %s Process state unavailable: %v\n", warnStyle.Render("~"), err)
+		return
+	}
+	if process == nil {
+		return
+	}
+
+	switch process.Status {
+	case procctl.StatusRunning:
+		fmt.Printf("  %s Process: running (pid %d)\n", successStyle.Render("✓"), process.Pid)
+		if process.SpawnedBy != "" {
+			fmt.Printf("  %s Started by: %s\n", dimStyle.Render("-"), valueStyle.Render(process.SpawnedBy))
+		}
+		if process.LogDir != "" {
+			fmt.Printf("  %s Logs:       %s\n", dimStyle.Render("-"), dimStyle.Render(process.LogDir))
+		}
+	case procctl.StatusCrashed:
+		fmt.Printf("  %s Process: not running (previous run may need attention)\n", warnStyle.Render("~"))
+		if process.LastShutdownReason != "" {
+			fmt.Printf("  %s Last stop:  %s\n", dimStyle.Render("-"), valueStyle.Render(process.LastShutdownReason))
+		}
+	}
+}
+
+func processRunning(process *procctl.Detection) bool {
+	return process != nil && process.Status == procctl.StatusRunning
+}
+
+func missingStateStatusText(running bool) (string, string) {
+	if running {
+		return "State file: not ready yet", "Mithril is running; AccountsDB has not produced a ready state yet (bootstrap/build in progress)"
+	}
+	return "No state file found", "Mithril hasn't run yet, or --accounts path is wrong"
+}
+
+func statusDetectionAccountsPath(cliAccountsPath, configuredAccountsPath, legacyAccountsPath string) string {
+	if cliAccountsPath != "" {
+		return cliAccountsPath
+	}
+	if configuredAccountsPath != "" {
+		return configuredAccountsPath
+	}
+	if legacyAccountsPath != "" {
+		return legacyAccountsPath
+	}
+	return config.DefaultStoragePaths().Accounts
+}
+
+func statusStateSearchPaths(cliAccountsPath, configuredAccountsPath, legacyAccountsPath string) []string {
+	if cliAccountsPath != "" {
+		return []string{cliAccountsPath}
+	}
+
+	paths := make([]string, 0, 5)
+	paths = appendUniquePath(paths, configuredAccountsPath)
+	paths = appendUniquePath(paths, legacyAccountsPath)
+	paths = appendUniquePath(paths, config.DefaultStoragePaths().Accounts)
+	paths = appendUniquePath(paths, "./data/accounts")
+	paths = appendUniquePath(paths, ".")
+	return paths
+}
+
+func appendUniquePath(paths []string, path string) []string {
+	if path == "" {
+		return paths
+	}
+	for _, existing := range paths {
+		if existing == path {
+			return paths
+		}
+	}
+	return append(paths, path)
+}
+
+func loadStatusState(searchPaths []string) (mithrilState, string, bool) {
+	for _, dir := range searchPaths {
+		p := filepath.Join(dir, statepkg.StateFileName)
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var nodeState mithrilState
+		if err := json.Unmarshal(data, &nodeState); err != nil {
+			continue
+		}
+		return nodeState, p, true
+	}
+	return mithrilState{}, "", false
 }

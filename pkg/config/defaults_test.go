@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -64,19 +63,19 @@ func TestDefaultStoragePaths_AllFieldsPopulated(t *testing.T) {
 	assert.NotEmpty(t, p.Shredstore)
 }
 
-func TestDefaultStoragePaths_AllOrNothingRoot(t *testing.T) {
+func TestDefaultStoragePaths_PerPathFallback(t *testing.T) {
 	p := DefaultStoragePaths()
-	// Either all paths are under /mnt (production) or all are under HOME
-	// (fallback). We never mix to avoid configs that span multiple roots.
-	allMnt := strings.HasPrefix(p.Accounts, "/mnt/") &&
-		strings.HasPrefix(p.Snapshots, "/mnt/") &&
-		strings.HasPrefix(p.Logs, "/mnt/") &&
-		strings.HasPrefix(p.Shredstore, "/mnt/")
-	allHome := strings.Contains(p.Accounts, ".mithril") &&
-		strings.Contains(p.Snapshots, ".mithril") &&
-		strings.Contains(p.Logs, ".mithril") &&
-		strings.Contains(p.Shredstore, ".mithril")
-	assert.True(t, allMnt || allHome, "paths should be all /mnt or all under .mithril, got %+v", p)
+	prod := productionStoragePaths()
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		home = "."
+	}
+	base := filepath.Join(home, ".mithril")
+	// Each field: its production path or its own home-dir fallback.
+	assert.Contains(t, []string{prod.Accounts, filepath.Join(base, "accounts")}, p.Accounts)
+	assert.Contains(t, []string{prod.Snapshots, filepath.Join(base, "snapshots")}, p.Snapshots)
+	assert.Contains(t, []string{prod.Logs, filepath.Join(base, "logs")}, p.Logs)
+	assert.Contains(t, []string{prod.Shredstore, filepath.Join(base, "shredstore")}, p.Shredstore)
 }
 
 func TestIsProductionLayout(t *testing.T) {

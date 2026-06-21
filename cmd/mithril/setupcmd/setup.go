@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -138,12 +139,14 @@ type setupModel struct {
 func newSetupModel() setupModel {
 	absPath, _ := filepath.Abs(outputPath)
 	storage := config.DefaultStoragePaths()
+	cluster := "mainnet-beta"
 	return setupModel{
 		screen:          scrMode,
 		cpuCores:        runtime.NumCPU(),
 		disks:           DetectDisks(),
-		cluster:         "mainnet-beta",
+		cluster:         cluster,
 		rpcEndpoint:     "https://api.mainnet-beta.solana.com",
+		gossipEntry:     defaultGossipEntrypoint(cluster),
 		lbQuiet:         config.LightbringerQuietDefault,
 		accountsPath:    storage.Accounts,
 		snapshotsPath:   storage.Snapshots,
@@ -162,6 +165,39 @@ func newSetupModel() setupModel {
 }
 
 func (m setupModel) Init() tea.Cmd { return nil }
+
+func defaultGossipEntrypoint(cluster string) string {
+	switch cluster {
+	case "mainnet-beta":
+		return "entrypoint.mainnet-beta.solana.com:8001"
+	case "testnet":
+		return "entrypoint.testnet.solana.com:8001"
+	case "devnet":
+		return "entrypoint.devnet.solana.com:8001"
+	default:
+		return ""
+	}
+}
+
+// defaultLightbringerBinary returns the first built lightbringer binary found
+// in the usual locations, else a PATH lookup, else "./lightbringer".
+func defaultLightbringerBinary() string {
+	candidates := []string{
+		"/mnt/mithril-ledger/lightbringer/target/release/lightbringer",
+		"lightbringer/target/release/lightbringer",
+		"target/release/lightbringer",
+		"./lightbringer",
+	}
+	for _, c := range candidates {
+		if info, err := os.Stat(c); err == nil && !info.IsDir() {
+			return c
+		}
+	}
+	if p, err := exec.LookPath("lightbringer"); err == nil {
+		return p
+	}
+	return "./lightbringer"
+}
 
 // ── Navigation helpers ──────────────────────────────────────────────────
 
@@ -399,6 +435,7 @@ func (m setupModel) handleSelect(value string) (tea.Model, tea.Cmd) {
 		case "devnet":
 			m.rpcEndpoint = "https://api.devnet.solana.com"
 		}
+		m.gossipEntry = defaultGossipEntrypoint(value)
 		m.pushInput(scrRPC)
 
 	case scrLightbringer:
@@ -445,8 +482,7 @@ func (m setupModel) handleSelect(value string) (tea.Model, tea.Cmd) {
 	case scrOverwrite:
 		switch value {
 		case "overwrite":
-			// User confirmed — proceed with save (scrOverwrite is set, so the
-			// existence check in generateConfig/generateManual will be skipped)
+			// confirmed overwrite
 			if m.mode == "manual" {
 				return m.generateManual()
 			}
@@ -495,10 +531,17 @@ func (m setupModel) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+e":
 		m.inputCur = len(m.inputVal)
 	default:
-		ch := msg.String()
-		if len(ch) == 1 && ch[0] >= 32 {
-			m.inputVal = m.inputVal[:m.inputCur] + ch + m.inputVal[m.inputCur:]
-			m.inputCur++
+		// ASCII-only insert keeps the byte-indexed cursor correct
+		var ins []rune
+		for _, r := range msg.Runes {
+			if r >= 32 && r < 127 {
+				ins = append(ins, r)
+			}
+		}
+		if len(ins) > 0 {
+			s := string(ins)
+			m.inputVal = m.inputVal[:m.inputCur] + s + m.inputVal[m.inputCur:]
+			m.inputCur += len(s)
 		}
 	}
 	m.inputErr = ""
@@ -553,7 +596,7 @@ func (m *setupModel) validateAndApplyInput() bool {
 		}
 		host, portStr, err := net.SplitHostPort(val)
 		if err != nil || host == "" {
-			m.inputErr = "must be IP:port (e.g., 1.2.3.4:8000)"
+			m.inputErr = "must be host:port (e.g., entrypoint.mainnet-beta.solana.com:8001)"
 			return false
 		}
 		if p, perr := strconv.Atoi(portStr); perr != nil || p < 1 || p > 65535 {
@@ -649,6 +692,15 @@ func (m *setupModel) advanceFromInput() {
 // ── View ────────────────────────────────────────────────────────────────
 
 func (m setupModel) View() string {
+	out := m.viewBody()
+	// When embedded, drop leading blank lines so the view top-anchors.
+	if m.embedded {
+		out = strings.TrimLeft(out, "\n")
+	}
+	return out
+}
+
+func (m setupModel) viewBody() string {
 	// Skip logo when embedded in dashboard right pane
 	banner := ""
 	if !m.embedded {
@@ -672,27 +724,22 @@ func (m setupModel) View() string {
 
 	case scrGossip:
 		return banner + "\n" + renderInput("Gossip Entrypoint",
-			"IP:port of a Solana validator running gossip\n"+
-				"Used to receive shreds from the network",
+			"Host:port of a Solana gossip entrypoint\n"+
+				"Default uses the official DNS entrypoint for your selected cluster",
 			m.inputVal, m.inputErr, m.inputCur)
 
 	case scrStorage:
 		desc := "AccountsDB stores all ~500M on-chain accounts · needs fastest NVMe\n" +
 			"Heavy random I/O — put this on your best drive"
-		if config.IsProductionLayout(config.StoragePaths{
-			Accounts:   m.accountsPath,
-			Snapshots:  m.snapshotsPath,
-			Logs:       m.logsPath,
-			Shredstore: m.shredstorePath,
-		}) {
-			desc += "\nDefault: production /mnt/* paths (run scripts/disk-setup.sh first)"
+		// Hint off the accounts path itself (per-path defaults can mix /mnt and home).
+		if strings.HasPrefix(m.accountsPath, "/mnt/") {
+			desc += "\nDefault: production NVMe (" + m.accountsPath + ")"
 		} else {
 			desc += "\nDefault: home directory (no /mnt setup detected) — see scripts/disk-setup.sh for production NVMe layout"
 		}
 		if len(m.disks) > 0 {
-			desc += "\n"
 			for _, d := range m.disks {
-				desc += "› " + d.FormatDiskOption()
+				desc += "\n› " + d.FormatDiskOption()
 			}
 		}
 		return banner + "\n" + renderInput("AccountsDB Path", desc, m.inputVal, m.inputErr, m.inputCur)
@@ -737,7 +784,7 @@ func (m setupModel) View() string {
 	case scrReview:
 		rows := [][]string{
 			{"Cluster", m.cluster},
-			{"RPC", m.rpcEndpoint},
+			{"RPC", config.RedactEndpointForDisplay(m.rpcEndpoint)},
 		}
 		if m.enableLB {
 			summary := "enabled (gossip: " + m.gossipEntry + ")"
@@ -853,8 +900,13 @@ func (m setupModel) generateConfig() (tea.Model, tea.Cmd) {
 	if m.enableLB {
 		cfg.WriteString("[lightbringer]\n")
 		cfg.WriteString("enabled = true\n")
-		cfg.WriteString("binary_path = \"./lightbringer\"\n")
+		fmt.Fprintf(&cfg, "binary_path = %q\n", defaultLightbringerBinary())
 		fmt.Fprintf(&cfg, "gossip_entrypoint = %q\n", m.gossipEntry)
+		cfg.WriteString("# Managed Lightbringer opens public Solana UDP gossip/repair sockets.\n")
+		cfg.WriteString("# Keep these aligned with your firewall/security-group rules.\n")
+		cfg.WriteString("gossip_port = 65400\n")
+		cfg.WriteString("port_range_start = 65401\n")
+		cfg.WriteString("port_range_end = 65500\n")
 		cfg.WriteString("grpc_addr = \"127.0.0.1:3001\"\n")
 		cfg.WriteString("rpc_addr = \"127.0.0.1:3000\"\n")
 		fmt.Fprintf(&cfg, "quiet = %t\n", m.lbQuiet)
@@ -932,7 +984,10 @@ max_inflight = 8
 # [lightbringer]
 # enabled = false
 # binary_path = "./lightbringer"
-# gossip_entrypoint = "1.2.3.4:8000"
+# gossip_entrypoint = "entrypoint.mainnet-beta.solana.com:8001"
+# gossip_port = 65400          # Public Solana gossip UDP port
+# port_range_start = 65401     # Public Solana repair/TVU UDP range
+# port_range_end = 65500
 # shredstore stored in [storage] section above
 # rpc_addr = "127.0.0.1:3000"
 # grpc_addr = "127.0.0.1:3001"
@@ -997,7 +1052,7 @@ func SetupIsDone(m tea.Model) bool {
 	return false
 }
 
-// SetupIsFirstScreen returns true if the setup wizard is on the initial mode selection screen.
+// SetupIsFirstScreen returns true if the setup TUI is on the initial mode selection screen.
 func SetupIsFirstScreen(m tea.Model) bool {
 	if sm, ok := m.(setupModel); ok {
 		return sm.screen == scrMode

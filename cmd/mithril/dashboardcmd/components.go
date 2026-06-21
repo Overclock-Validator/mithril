@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/Overclock-Validator/mithril/pkg/procctl"
 	"github.com/Overclock-Validator/mithril/pkg/tui"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -35,7 +36,7 @@ type statusBarConfig struct {
 	cluster   string
 	slot      uint64
 	epoch     uint64
-	online    bool // at least one service responding
+	runStatus procctl.Status
 	hasConfig bool
 }
 
@@ -51,11 +52,14 @@ func renderStatusBar(cfg statusBarConfig, width int) string {
 		if cfg.slot > 0 {
 			parts = append(parts, label.Render("slot ")+value.Render(formatNumber(cfg.slot)))
 			parts = append(parts, label.Render("epoch ")+value.Render(fmt.Sprintf("%d", cfg.epoch)))
-			// Only show Online/Offline when node has actually produced state
-			if cfg.online {
-				parts = append(parts, lipgloss.NewStyle().Foreground(tui.ColorSuccess).Render("● Online"))
-			} else {
-				parts = append(parts, lipgloss.NewStyle().Foreground(tui.ColorError).Render("● Offline"))
+			// Match the body's Running/Stopped/Crashed wording; Stopped is muted, not an error.
+			switch cfg.runStatus {
+			case procctl.StatusRunning:
+				parts = append(parts, lipgloss.NewStyle().Foreground(tui.ColorSuccess).Render("● Running"))
+			case procctl.StatusCrashed:
+				parts = append(parts, lipgloss.NewStyle().Foreground(tui.ColorError).Render("✕ Crashed"))
+			default:
+				parts = append(parts, lipgloss.NewStyle().Foreground(tui.ColorTextMuted).Render("○ Stopped"))
 			}
 		}
 	} else {
@@ -67,7 +71,7 @@ func renderStatusBar(cfg statusBarConfig, width int) string {
 	border := lipgloss.NewStyle().
 		BorderStyle(lipgloss.NormalBorder()).
 		BorderForeground(tui.ColorBorder).
-		Width(width - 2).
+		Width(width-2).
 		Padding(0, 1)
 
 	return border.Render(line)
@@ -76,7 +80,6 @@ func renderStatusBar(cfg statusBarConfig, width int) string {
 // ── Footer Bar ──────────────────────────────────────────────────────────
 
 type footerConfig struct {
-	version    string
 	configFile string
 }
 
@@ -86,9 +89,6 @@ func renderFooter(cfg footerConfig, width int) string {
 
 	parts := []string{
 		lipgloss.NewStyle().Foreground(tui.MithrilTeal).Bold(true).Render(" ◎ Mithril"),
-	}
-	if cfg.version != "" {
-		parts = append(parts, value.Render(cfg.version))
 	}
 	if cfg.configFile != "" {
 		parts = append(parts, value.Render(cfg.configFile))
@@ -105,6 +105,45 @@ type splitViewConfig struct {
 	rightTitle   string
 	rightContent string
 	focusLeft    bool
+}
+
+type singlePaneConfig struct {
+	title   string
+	content string
+	focus   bool
+}
+
+func renderSinglePane(cfg singlePaneConfig, width, height int) string {
+	if width < 10 || height < 3 {
+		return "Terminal too small"
+	}
+	innerWidth := width - 2
+	contentWidth := width - 4
+
+	borderStyle := lipgloss.NewStyle().Foreground(tui.ColorBorder)
+	titleStyle := lipgloss.NewStyle().Foreground(tui.ColorTextMuted)
+	indicator := "── "
+	if cfg.focus {
+		borderStyle = lipgloss.NewStyle().Foreground(tui.MithrilTeal)
+		titleStyle = lipgloss.NewStyle().Foreground(tui.MithrilTeal).Bold(true)
+		indicator = "─► "
+	}
+
+	title := borderStyle.Render(indicator) + titleStyle.Render(cfg.title) + borderStyle.Render(" ")
+	titlePad := innerWidth - lipgloss.Width(title)
+	if titlePad < 0 {
+		titlePad = 0
+	}
+
+	top := borderStyle.Render("┌") + title + borderStyle.Render(strings.Repeat("─", titlePad)) + borderStyle.Render("┐")
+	contentLines := padLines(cfg.content, contentWidth, height)
+
+	rows := []string{top}
+	for _, line := range contentLines {
+		rows = append(rows, borderStyle.Render("│")+" "+line+" "+borderStyle.Render("│"))
+	}
+	rows = append(rows, borderStyle.Render("└")+borderStyle.Render(strings.Repeat("─", innerWidth))+borderStyle.Render("┘"))
+	return strings.Join(rows, "\n")
 }
 
 func renderSplitView(cfg splitViewConfig, width, height int) string {
@@ -234,20 +273,43 @@ func renderStackedView(cfg splitViewConfig, width, height int) string {
 func padLines(content string, width, height int) []string {
 	lines := strings.Split(content, "\n")
 	result := make([]string, height)
-	truncStyle := lipgloss.NewStyle().MaxWidth(width)
 	for i := 0; i < height; i++ {
 		if i < len(lines) {
-			line := truncStyle.Render(lines[i])
-			pad := width - lipgloss.Width(line)
-			if pad > 0 {
-				line += strings.Repeat(" ", pad)
-			}
-			result[i] = line
+			result[i] = padStyledLine(lines[i], width)
 		} else {
 			result[i] = strings.Repeat(" ", width)
 		}
 	}
 	return result
+}
+
+func fitTerminalFrame(content string, width, height int) string {
+	if width <= 0 || height <= 0 {
+		return content
+	}
+	lines := strings.Split(content, "\n")
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	for i, line := range lines {
+		lines[i] = padStyledLine(line, width)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func padStyledLine(line string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	line = strings.ReplaceAll(line, "\n", " ")
+	line = lipgloss.NewStyle().Inline(true).MaxWidth(width).Render(line)
+	if pad := width - lipgloss.Width(line); pad > 0 {
+		line += strings.Repeat(" ", pad)
+	}
+	return line
 }
 
 // ── Menu rendering for left pane ────────────────────────────────────────

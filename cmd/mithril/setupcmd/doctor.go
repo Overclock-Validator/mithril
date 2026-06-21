@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/config"
+	"github.com/Overclock-Validator/mithril/pkg/lightbringer"
 )
 
 func runDoctor() {
@@ -28,12 +29,22 @@ func runDoctor() {
 		fmt.Printf("  %s Config file found (%s)\n", successStyle.Render("✓"), configPath)
 		passed++
 
-		// Check if config needs migration (missing new sections)
-		data, _ := os.ReadFile(configPath)
-		content := string(data)
-		if !strings.Contains(content, "[lightbringer]") || !strings.Contains(content, "[consensus]") {
-			fmt.Printf("  %s Config is missing new sections (lightbringer/consensus)\n", warnStyle.Render("~"))
-			fmt.Printf("    %s Run: mithril doctor --migrate to add them\n", dimStyle.Render("→"))
+		// Can't read config; skip migration check.
+		if data, readErr := os.ReadFile(configPath); readErr != nil {
+			fmt.Printf("  %s Could not read config for migration check: %v\n", warnStyle.Render("~"), readErr)
+		} else {
+			content := string(data)
+			var missingSections []string
+			if !hasTomlSection(content, "lightbringer") {
+				missingSections = append(missingSections, "lightbringer")
+			}
+			if !hasTomlSection(content, "consensus") {
+				missingSections = append(missingSections, "consensus")
+			}
+			if len(missingSections) > 0 {
+				fmt.Printf("  %s Config is missing new section(s): %s\n", warnStyle.Render("~"), strings.Join(missingSections, ", "))
+				fmt.Printf("    %s Run: mithril doctor --migrate to add them\n", dimStyle.Render("→"))
+			}
 		}
 	} else {
 		fmt.Printf("  %s Config file not found (%s)\n", errorStyle.Render("✗"), configPath)
@@ -42,8 +53,9 @@ func runDoctor() {
 
 	// Load config for further checks
 	if err := config.InitConfig(); err != nil {
+		total++ // count the parse attempt as a check
 		fmt.Printf("  %s Failed to parse config: %v\n", errorStyle.Render("✗"), err)
-		fmt.Printf("\n  %d/%d checks passed\n", passed, total)
+		fmt.Printf("\n  %s\n", warnStyle.Render(fmt.Sprintf("%d/%d checks passed", passed, total)))
 		return
 	}
 
@@ -62,8 +74,11 @@ func runDoctor() {
 	// 3. RPC endpoint
 	total++
 	rpcEndpoints := config.GetStringSlice("network.rpc")
+	if len(rpcEndpoints) == 0 {
+		rpcEndpoints = config.GetStringSlice("rpc.rpc")
+	}
 	if len(rpcEndpoints) > 0 {
-		ep := rpcEndpoints[0]
+		ep := config.RedactEndpointForDisplay(rpcEndpoints[0])
 		fmt.Printf("  %s RPC endpoint configured (%s)\n", successStyle.Render("✓"), ep)
 		passed++
 	} else {
@@ -74,11 +89,19 @@ func runDoctor() {
 	// 4. Storage paths
 	total++
 	accountsPath := config.GetString("storage.accounts")
+	if accountsPath == "" {
+		accountsPath = config.GetString("ledger.accounts_path")
+	}
 	if accountsPath != "" {
-		if info, err := os.Stat(accountsPath); err == nil && info.IsDir() {
+		info, err := os.Stat(accountsPath)
+		switch {
+		case err == nil && info.IsDir():
 			fmt.Printf("  %s AccountsDB path exists (%s)\n", successStyle.Render("✓"), accountsPath)
 			passed++
-		} else if accountsPath != "" {
+		case err == nil && !info.IsDir():
+			// path is a file, not a usable AccountsDB dir
+			fmt.Printf("  %s storage.accounts exists but is not a directory (%s)\n", errorStyle.Render("✗"), accountsPath)
+		default:
 			fmt.Printf("  %s AccountsDB path: %s (will be created)\n", warnStyle.Render("~"), accountsPath)
 			passed++
 		}
@@ -114,6 +137,27 @@ func runDoctor() {
 			fmt.Printf("  %s lightbringer.gossip_entrypoint not set\n", errorStyle.Render("✗"))
 		}
 
+		gossipPort := config.GetInt("lightbringer.gossip_port")
+		if gossipPort == 0 {
+			gossipPort = 65400
+		}
+		portRangeStart := config.GetInt("lightbringer.port_range_start")
+		if portRangeStart == 0 {
+			portRangeStart = 65401
+		}
+		portRangeEnd := config.GetInt("lightbringer.port_range_end")
+		if portRangeEnd == 0 {
+			portRangeEnd = 65500
+		}
+		total++
+		if err := lightbringer.ValidateGossipPorts(gossipPort, portRangeStart, portRangeEnd); err != nil {
+			fmt.Printf("  %s Lightbringer gossip/repair ports invalid: %v\n", errorStyle.Render("✗"), err)
+		} else {
+			fmt.Printf("  %s Lightbringer opens public Solana UDP gossip/repair ports: %d, %d-%d\n",
+				warnStyle.Render("~"), gossipPort, portRangeStart, portRangeEnd)
+			passed++
+		}
+
 		total++
 		grpcAddr := config.GetString("lightbringer.grpc_addr")
 		if grpcAddr == "" {
@@ -134,7 +178,7 @@ func runDoctor() {
 		blockSource := config.GetString("block.source")
 		lbEndpoint := config.GetString("block.lightbringer_endpoint")
 		if blockSource == "lightbringer" && lbEndpoint != "" {
-			fmt.Printf("  %s Lightbringer: external at %s\n", successStyle.Render("✓"), lbEndpoint)
+			fmt.Printf("  %s Lightbringer: external at %s\n", successStyle.Render("✓"), config.RedactEndpointForDisplay(lbEndpoint))
 			passed++
 			total++
 		} else if blockSource == "lightbringer" {
@@ -144,7 +188,6 @@ func runDoctor() {
 			fmt.Printf("  %s Lightbringer: disabled\n", dimStyle.Render("-"))
 		}
 	}
-
 	// 6. Logs directory
 	total++
 	logsDir := config.GetString("storage.logs")
@@ -152,8 +195,17 @@ func runDoctor() {
 		logsDir = config.GetString("log.dir")
 	}
 	if logsDir != "" {
-		fmt.Printf("  %s Log directory: %s\n", successStyle.Render("✓"), logsDir)
-		passed++
+		info, err := os.Stat(logsDir)
+		switch {
+		case err == nil && info.IsDir():
+			fmt.Printf("  %s Log directory: %s\n", successStyle.Render("✓"), logsDir)
+			passed++
+		case err == nil && !info.IsDir():
+			fmt.Printf("  %s storage.logs exists but is not a directory (%s)\n", errorStyle.Render("✗"), logsDir)
+		default:
+			fmt.Printf("  %s Log directory: %s (will be created)\n", warnStyle.Render("~"), logsDir)
+			passed++
+		}
 	} else {
 		fmt.Printf("  %s No log directory configured (logs go to stderr only)\n", warnStyle.Render("~"))
 		passed++ // Not critical
@@ -167,4 +219,29 @@ func runDoctor() {
 		fmt.Printf("  %s\n", warnStyle.Render(fmt.Sprintf("%d/%d checks passed", passed, total)))
 	}
 	fmt.Println()
+}
+
+func hasTomlSection(content, section string) bool {
+	for _, line := range strings.Split(content, "\n") {
+		if sectionName, ok := tomlSectionName(line); ok && sectionName == section {
+			return true
+		}
+	}
+	return false
+}
+
+func tomlSectionName(line string) (string, bool) {
+	trimmed := strings.TrimSpace(line)
+	if strings.HasPrefix(trimmed, "#") || !strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "[[") {
+		return "", false
+	}
+	end := strings.Index(trimmed, "]")
+	if end <= 1 {
+		return "", false
+	}
+	tail := strings.TrimSpace(trimmed[end+1:])
+	if tail != "" && !strings.HasPrefix(tail, "#") {
+		return "", false
+	}
+	return strings.TrimSpace(trimmed[1:end]), true
 }

@@ -2,9 +2,9 @@ package lightbringer
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +15,10 @@ import (
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/Overclock-Validator/mithril/pkg/overcast"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Manager handles the lifecycle of a Lightbringer child process:
@@ -134,6 +138,7 @@ func (m *Manager) Start() error {
 			return
 		}
 
+		m.running.Store(true)
 		resultCh <- startResult{cmd: cmd, stdout: stdout, stderr: stderr}
 
 		// Block this goroutine (and its locked thread) until the child exits.
@@ -142,7 +147,10 @@ func (m *Manager) Start() error {
 
 		// Signal exit to the manager
 		m.running.Store(false)
-		if waitErr != nil {
+		deliberateStop := m.stopping.Load()
+		if waitErr != nil && deliberateStop {
+			mlog.Log.Infof("lightbringer: process exited after stop: %v", waitErr)
+		} else if waitErr != nil {
 			mlog.Log.Warnf("lightbringer: process exited with error: %v", waitErr)
 		} else {
 			mlog.Log.Infof("lightbringer: process exited cleanly")
@@ -159,7 +167,6 @@ func (m *Manager) Start() error {
 
 	m.cmd = res.cmd
 	m.done = done
-	m.running.Store(true)
 
 	mlog.Log.Infof("lightbringer: started process (pid=%d, binary=%s)",
 		res.cmd.Process.Pid, m.binaryPath)
@@ -170,34 +177,102 @@ func (m *Manager) Start() error {
 	return nil
 }
 
-// WaitReady polls the gRPC endpoint until it accepts a TCP connection,
-// or the timeout expires.
+// WaitReady polls the gRPC slot-stream service until the real Lightbringer
+// protocol responds, or the timeout expires.
 func (m *Manager) WaitReady(timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
+	return m.WaitReadyContext(context.Background(), timeout)
+}
+
+// WaitReadyContext polls the gRPC slot-stream service until the real
+// Lightbringer protocol responds, the timeout expires, or ctx is cancelled.
+func (m *Manager) WaitReadyContext(ctx context.Context, timeout time.Duration) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	pollInterval := 500 * time.Millisecond
 
-	for time.Now().Before(deadline) {
+	for {
+		select {
+		case <-waitCtx.Done():
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("gRPC endpoint %s not ready after %s", m.grpcAddr, timeout)
+		default:
+		}
+
 		if !m.running.Load() {
 			return fmt.Errorf("process exited before becoming ready")
 		}
 
-		remaining := time.Until(deadline)
 		dialTimeout := 2 * time.Second
-		if remaining < dialTimeout {
-			dialTimeout = remaining
+		if deadline, ok := waitCtx.Deadline(); ok {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return fmt.Errorf("gRPC endpoint %s not ready after %s", m.grpcAddr, timeout)
+			}
+			if remaining < dialTimeout {
+				dialTimeout = remaining
+			}
 		}
 
-		conn, err := net.DialTimeout("tcp", m.grpcAddr, dialTimeout)
-		if err == nil {
-			_ = conn.Close()
-			mlog.Log.Infof("lightbringer: gRPC endpoint ready at %s", m.grpcAddr)
+		if err := probeSlotStreamContext(waitCtx, m.grpcAddr, dialTimeout); err == nil {
+			mlog.Log.Infof("lightbringer: gRPC slot stream ready at %s", m.grpcAddr)
 			return nil
 		}
 
-		time.Sleep(pollInterval)
+		timer := time.NewTimer(pollInterval)
+		select {
+		case <-waitCtx.Done():
+			timer.Stop()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("gRPC endpoint %s not ready after %s", m.grpcAddr, timeout)
+		case <-timer.C:
+		}
 	}
+}
 
-	return fmt.Errorf("gRPC endpoint %s not ready after %s", m.grpcAddr, timeout)
+func probeSlotStreamContext(parent context.Context, addr string, timeout time.Duration) error {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+
+	conn, err := grpc.NewClient(addr, grpc.WithInsecure())
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	client := overcast.NewSlotStreamClient(conn)
+	return probeSlotStreamClient(ctx, client)
+}
+
+func probeSlotStreamClient(ctx context.Context, client overcast.SlotStreamClient) error {
+	stream, err := client.StreamSlots(ctx, &overcast.SlotStreamRequest{})
+	if err != nil {
+		return err
+	}
+	_, err = stream.Recv()
+	if err == nil {
+		return nil
+	}
+	switch status.Code(err) {
+	case codes.DeadlineExceeded:
+		// The service accepted the SlotStream method but did not have a slot
+		// ready before the probe timeout. That is still a valid readiness
+		// signal: the target is Lightbringer, not an arbitrary TCP listener or
+		// unrelated gRPC service.
+		return nil
+	default:
+		return err
+	}
 }
 
 // captureOutput reads from a pipe line-by-line and writes to the log writer.
@@ -282,9 +357,13 @@ func (m *Manager) Pid() int {
 // with exponential backoff. Stops monitoring when stopCh is closed.
 // maxRetries=0 means unlimited retries. Returns when stopped or max retries exceeded.
 func (m *Manager) MonitorAndRestart(stopCh <-chan struct{}, maxRetries int) {
-	backoff := 2 * time.Second
+	const initialBackoff = 2 * time.Second
+	// Uptime past this counts as a healthy run, not a crash loop.
+	const stabilityWindow = 60 * time.Second
+	backoff := initialBackoff
 	maxBackoff := 60 * time.Second
 	retries := 0
+	lastStartAt := time.Now() // the caller already Start()ed the process we monitor
 
 	for {
 		done := m.Done()
@@ -296,6 +375,12 @@ func (m *Manager) MonitorAndRestart(stopCh <-chan struct{}, maxRetries int) {
 		case <-stopCh:
 			return
 		case <-done:
+		}
+
+		// Reset crash-loop counter/backoff after a healthy run so an isolated crash gets the full retry budget.
+		if time.Since(lastStartAt) >= stabilityWindow {
+			retries = 0
+			backoff = initialBackoff
 		}
 
 		// Process exited — wait for running flag to be cleared
@@ -314,36 +399,44 @@ func (m *Manager) MonitorAndRestart(stopCh <-chan struct{}, maxRetries int) {
 		default:
 		}
 
-		retries++
-		if maxRetries > 0 && retries > maxRetries {
-			mlog.Log.Errorf("lightbringer: exceeded %d restart attempts, giving up", maxRetries)
-			return
-		}
+		// Retry transient WriteConfig/Start failures within the backoff+maxRetries budget. m.done is refreshed only on successful Start, so don't wait on it after a failed start.
+		for {
+			retries++
+			if maxRetries > 0 && retries > maxRetries {
+				mlog.Log.Errorf("lightbringer: exceeded %d restart attempts, giving up", maxRetries)
+				return
+			}
 
-		mlog.Log.Warnf("lightbringer: process exited unexpectedly, restarting in %s (attempt %d)", backoff, retries)
+			mlog.Log.Warnf("lightbringer: not running; restart attempt %d scheduled after %s", retries, backoff)
+			select {
+			case <-stopCh:
+				mlog.Log.Infof("lightbringer: restart attempt %d cancelled", retries)
+				return
+			case <-time.After(backoff):
+			}
 
-		select {
-		case <-stopCh:
-			return
-		case <-time.After(backoff):
-		}
+			// Exponential backoff for the next attempt.
+			backoff = backoff * 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
 
-		// Exponential backoff for next attempt
-		backoff = backoff * 2
-		if backoff > maxBackoff {
-			backoff = maxBackoff
-		}
+			if m.stopping.Load() {
+				return
+			}
 
-		if _, err := m.WriteConfig(); err != nil {
-			mlog.Log.Errorf("lightbringer: failed to write config for restart: %v", err)
-			return
-		}
+			if _, err := m.WriteConfig(); err != nil {
+				mlog.Log.Errorf("lightbringer: failed to write config for restart (attempt %d): %v", retries, err)
+				continue // transient — retry within budget
+			}
+			if err := m.Start(); err != nil {
+				mlog.Log.Errorf("lightbringer: failed to restart (attempt %d): %v", retries, err)
+				continue // transient — retry within budget
+			}
 
-		if err := m.Start(); err != nil {
-			mlog.Log.Errorf("lightbringer: failed to restart: %v — giving up", err)
-			return
+			lastStartAt = time.Now()
+			mlog.Log.Infof("lightbringer: restarted successfully (attempt %d)", retries)
+			break // success
 		}
-		mlog.Log.Infof("lightbringer: restarted successfully (attempt %d)", retries)
-		continue // re-fetch new done channel at top of loop
 	}
 }

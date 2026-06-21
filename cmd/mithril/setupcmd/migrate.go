@@ -13,12 +13,14 @@ import (
 func MigrateConfig(configPath string) bool {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
+		// don't treat a read failure as up-to-date
+		fmt.Printf("  %s Failed to read config: %v\n", errorStyle.Render("✗"), err)
 		return false
 	}
 
 	content := string(data)
-	hasLB := strings.Contains(content, "[lightbringer]")
-	hasConsensus := strings.Contains(content, "[consensus]")
+	hasLB := hasTomlSection(content, "lightbringer")
+	hasConsensus := hasTomlSection(content, "consensus")
 
 	if hasLB && hasConsensus {
 		return false // already up to date
@@ -31,10 +33,10 @@ func MigrateConfig(configPath string) bool {
 # ============================================================================
 # [consensus] - Vote-Anchored Consensus (added by mithril setup --migrate)
 # ============================================================================
-# [consensus]
-# skip_path_max_depth = 64
-# unresolved_policy = "halt"
-# enforce_on_source = "stream"
+[consensus]
+skip_path_max_depth = 64
+unresolved_policy = "halt"
+enforce_on_source = "stream"
 `
 	}
 
@@ -43,15 +45,16 @@ func MigrateConfig(configPath string) bool {
 # ============================================================================
 # [lightbringer] - Lightbringer Sidecar (added by mithril setup --migrate)
 # ============================================================================
-# Enable to manage Lightbringer from Mithril. See config.example.toml for details.
-#
-# [lightbringer]
-# enabled = false
-# binary_path = "./lightbringer"
-# gossip_entrypoint = ""
+[lightbringer]
+enabled = false
+binary_path = "./lightbringer"
+gossip_entrypoint = ""
+gossip_port = 65400
+port_range_start = 65401
+port_range_end = 65500
 # shredstore path is in [storage] section (storage.shredstore)
-# rpc_addr = "127.0.0.1:3000"
-# grpc_addr = "127.0.0.1:3001"
+rpc_addr = "127.0.0.1:3000"
+grpc_addr = "127.0.0.1:3001"
 `
 	}
 

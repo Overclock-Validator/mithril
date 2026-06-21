@@ -23,23 +23,27 @@ func productionStoragePaths() StoragePaths {
 	}
 }
 
-// DefaultStoragePaths returns /mnt/mithril-* when /mnt/mithril-accounts is
-// writable, otherwise ~/.mithril/*. Detection is all-or-nothing on the
-// /mnt/mithril-accounts probe so path roots are never mixed.
+// DefaultStoragePaths picks each /mnt/mithril-* path that's creatable, else the
+// ~/.mithril/* fallback for that folder (production dirs live on different mounts).
 func DefaultStoragePaths() StoragePaths {
-	if isWritable("/mnt/mithril-accounts") {
-		return productionStoragePaths()
-	}
+	prod := productionStoragePaths()
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		home = "."
 	}
 	base := filepath.Join(home, ".mithril")
+
+	pick := func(prodPath, name string) string {
+		if isWritable(prodPath) {
+			return prodPath
+		}
+		return filepath.Join(base, name)
+	}
 	return StoragePaths{
-		Accounts:   filepath.Join(base, "accounts"),
-		Snapshots:  filepath.Join(base, "snapshots"),
-		Logs:       filepath.Join(base, "logs"),
-		Shredstore: filepath.Join(base, "shredstore"),
+		Accounts:   pick(prod.Accounts, "accounts"),
+		Snapshots:  pick(prod.Snapshots, "snapshots"),
+		Logs:       pick(prod.Logs, "logs"),
+		Shredstore: pick(prod.Shredstore, "shredstore"),
 	}
 }
 
