@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/config"
+	"github.com/Overclock-Validator/mithril/pkg/lightbringer"
 )
 
 func runDoctor() {
@@ -148,8 +149,14 @@ func runDoctor() {
 		if portRangeEnd == 0 {
 			portRangeEnd = 65500
 		}
-		fmt.Printf("  %s Lightbringer opens public Solana UDP gossip/repair ports: %d, %d-%d\n",
-			warnStyle.Render("~"), gossipPort, portRangeStart, portRangeEnd)
+		total++
+		if err := lightbringer.ValidateGossipPorts(gossipPort, portRangeStart, portRangeEnd); err != nil {
+			fmt.Printf("  %s Lightbringer gossip/repair ports invalid: %v\n", errorStyle.Render("✗"), err)
+		} else {
+			fmt.Printf("  %s Lightbringer opens public Solana UDP gossip/repair ports: %d, %d-%d\n",
+				warnStyle.Render("~"), gossipPort, portRangeStart, portRangeEnd)
+			passed++
+		}
 
 		total++
 		grpcAddr := config.GetString("lightbringer.grpc_addr")

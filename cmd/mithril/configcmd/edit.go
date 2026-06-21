@@ -843,9 +843,9 @@ func (m *editModel) saveConfig() {
 			content = setTomlValue(content, "lightbringer", "quiet", "false")
 		}
 	} else {
-		// Only force block.source="rpc" if no external lightbringer_endpoint is configured.
-		// External LB mode (enabled=false + endpoint set) is a valid runtime config.
-		if m.v.GetString("block.lightbringer_endpoint") == "" {
+		// Fall back to rpc only when leaving lightbringer mode — never clobber a
+		// "turbine" (or other) source. External LB mode (endpoint set) stays as-is.
+		if m.v.GetString("block.lightbringer_endpoint") == "" && m.blockSource == "lightbringer" {
 			content = setTomlValue(content, "block", "source", "\"rpc\"")
 		}
 		if hasTomlSection(content, "lightbringer") {

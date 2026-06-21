@@ -224,3 +224,31 @@ func TestDetect_StaleStopInProgress_NotShown(t *testing.T) {
 	assert.Equal(t, StatusRunning, det.Status)
 	assert.Equal(t, 0, det.StopInProgressBy, "stale stop_in_progress_by must be cleared")
 }
+
+// bank_hash and mithril_state.history.jsonl aren't removed by a clean rebuild, so a
+// dir holding only those (no state file) is a cleanly-cleaned AccountsDB, not a crash.
+func TestDetect_HistoryAndBankHashOnly_IsStopped(t *testing.T) {
+	dir := t.TempDir()
+	pidPath := filepath.Join(dir, "mithril.pid")
+	lockPath := filepath.Join(dir, "mithril.lock")
+	require.NoError(t, os.WriteFile(filepath.Join(dir, state.HistoryFileName), []byte("{}\n"), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "bank_hash"), []byte("x"), 0600))
+
+	det, err := Detect(pidPath, lockPath, dir)
+	require.NoError(t, err)
+	assert.Equal(t, StatusStopped, det.Status)
+}
+
+// A leftover index-shard staging dir (removed by CleanAccountsDbDir) with no state
+// file means a genuinely interrupted build.
+func TestDetect_LogShardsArtifact_IsCrashed(t *testing.T) {
+	dir := t.TempDir()
+	pidPath := filepath.Join(dir, "mithril.pid")
+	lockPath := filepath.Join(dir, "mithril.lock")
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "mithril_db_log_shards"), 0700))
+
+	det, err := Detect(pidPath, lockPath, dir)
+	require.NoError(t, err)
+	assert.Equal(t, StatusCrashed, det.Status)
+	assert.Contains(t, det.LastShutdownReason, "incomplete AccountsDB")
+}

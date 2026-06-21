@@ -253,3 +253,77 @@ mode = "auto"
 	assert.Contains(t, updated, `snapshots = "/new/snapshots"`)
 	assert.Contains(t, updated, `# download_path = "/old/download-path"`)
 }
+
+// Saving with Lightbringer disabled must not rewrite a turbine block source to rpc.
+func TestSaveConfig_PreservesTurbineSource(t *testing.T) {
+	path := t.TempDir() + "/config.toml"
+	content := `
+[network]
+cluster = "mainnet-beta"
+rpc = ["https://rpc.example.invalid"]
+
+[block]
+source = "turbine"
+
+[lightbringer]
+enabled = false
+`
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	v := viper.New()
+	config.ApplyDefaults(v)
+	v.SetConfigFile(path)
+	if err := v.ReadInConfig(); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newEditModel(path, v)
+	m.saveConfig()
+	if m.err != nil {
+		t.Fatal(m.err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := string(data)
+	assert.Contains(t, updated, `source = "turbine"`, "turbine source must survive a save with Lightbringer disabled")
+	assert.NotContains(t, updated, `source = "rpc"`)
+}
+
+// Positive path: disabling Lightbringer while source was "lightbringer" must fall back to rpc.
+func TestSaveConfig_DisablingLBFromLightbringerLeavesRPC(t *testing.T) {
+	path := t.TempDir() + "/config.toml"
+	content := `
+[network]
+cluster = "mainnet-beta"
+rpc = ["https://rpc.example.invalid"]
+
+[block]
+source = "lightbringer"
+
+[lightbringer]
+enabled = false
+`
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	v := viper.New()
+	config.ApplyDefaults(v)
+	v.SetConfigFile(path)
+	if err := v.ReadInConfig(); err != nil {
+		t.Fatal(err)
+	}
+	m := newEditModel(path, v)
+	m.saveConfig()
+	if m.err != nil {
+		t.Fatal(m.err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assert.Contains(t, string(data), `source = "rpc"`, "disabling LB from lightbringer mode must fall back to rpc")
+}

@@ -1352,14 +1352,16 @@ func (m *model) applyMenuSelection() {
 			if hasExternalEndpoint {
 				_ = saveConfigValue(m.configFile, "block", "lightbringer_endpoint", "")
 			}
-		} else if !hasExternalEndpoint {
-			// Only force rpc when no external endpoint
+		} else if !hasExternalEndpoint && m.cfg != nil && m.cfg.blockSource == "lightbringer" {
+			// Leaving lightbringer mode → rpc; never clobber a turbine/other source.
 			_ = saveConfigValue(m.configFile, "block", "source", "rpc")
 		}
 	} else if fullKey == "block.source" {
 		if value == "lightbringer" && !hasExternalEndpoint {
 			_ = saveConfigValue(m.configFile, "lightbringer", "enabled", "true")
-		} else if value == "rpc" {
+		} else if value == "rpc" || value == "turbine" {
+			// Any non-lightbringer source disables the managed sidecar so it
+			// doesn't spawn (and open public UDP ports) unused.
 			_ = saveConfigValue(m.configFile, "lightbringer", "enabled", "false")
 		}
 	}
@@ -1513,7 +1515,8 @@ func (m *model) applyEditField() {
 		if value != "" {
 			_ = saveConfigValue(m.configFile, "block", "source", "lightbringer")
 			_ = saveConfigValue(m.configFile, "lightbringer", "enabled", "false")
-		} else if m.cfg != nil && !m.cfg.lbEnabled {
+		} else if m.cfg != nil && !m.cfg.lbEnabled && m.cfg.blockSource == "lightbringer" {
+			// Leaving lightbringer mode → rpc; never clobber a turbine/other source.
 			_ = saveConfigValue(m.configFile, "block", "source", "rpc")
 		}
 	}

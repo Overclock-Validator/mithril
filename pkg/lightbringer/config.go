@@ -106,6 +106,12 @@ func effectiveGossipPorts(gossipPort, portRangeStart, portRangeEnd int) (int, in
 	return gossipPort, portRangeStart, portRangeEnd
 }
 
+// ValidateGossipPorts exposes the runtime gossip-port validation so doctor
+// enforces the exact same rules the node applies at startup.
+func ValidateGossipPorts(gossipPort, portRangeStart, portRangeEnd int) error {
+	return validateGossipPorts(gossipPort, portRangeStart, portRangeEnd)
+}
+
 func validateGossipPorts(gossipPort, portRangeStart, portRangeEnd int) error {
 	effectiveGossipPort, effectiveRangeStart, effectiveRangeEnd := effectiveGossipPorts(gossipPort, portRangeStart, portRangeEnd)
 	values := []struct {

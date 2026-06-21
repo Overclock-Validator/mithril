@@ -913,6 +913,140 @@ enabled = false
 	assert.False(t, strings.Contains(body, `source = "lightbringer"`))
 }
 
+// Negative path: clearing the LB endpoint must NOT rewrite a turbine source to rpc.
+func TestApplyEditField_ClearingEndpointPreservesTurbineSource(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+[block]
+source = "turbine"
+lightbringer_endpoint = "127.0.0.1:3001"
+
+[lightbringer]
+enabled = false
+`), 0600))
+
+	m := newModel(path)
+	m.cfg = readConfig(path)
+	for i, field := range m.editFields {
+		if field.section == "block" && field.key == "lightbringer_endpoint" {
+			m.editIdx = i
+			break
+		}
+	}
+	m.editValue = ""
+	m.applyEditField()
+
+	content, err := os.ReadFile(path)
+	require.NoError(t, err)
+	body := string(content)
+	assert.Contains(t, body, `source = "turbine"`, "turbine source must survive clearing the LB endpoint")
+	assert.False(t, strings.Contains(body, `source = "rpc"`))
+}
+
+// Selecting block.source=turbine must disable the managed Lightbringer so an
+// unused sidecar doesn't spawn and open public UDP ports.
+func TestApplyMenuSelection_TurbineSourceDisablesLightbringer(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+[block]
+source = "lightbringer"
+
+[lightbringer]
+enabled = true
+`), 0600))
+
+	m := newModel(path)
+	m.cfg = readConfig(path)
+	for i, f := range m.editFields {
+		if f.section == "block" && f.key == "source" {
+			m.editIdx = i
+			break
+		}
+	}
+	m.editOptions = menuOptionsFor("block", "source")
+	for i, o := range m.editOptions {
+		if o.value == "turbine" {
+			m.editOptCursor = i
+			break
+		}
+	}
+	m.applyMenuSelection()
+
+	content, err := os.ReadFile(path)
+	require.NoError(t, err)
+	body := string(content)
+	assert.Contains(t, body, `source = "turbine"`)
+	assert.Contains(t, body, `enabled = false`, "selecting turbine must disable the managed Lightbringer")
+}
+
+// Disabling the managed Lightbringer via the enabled toggle must not clobber a turbine source.
+func TestApplyMenuSelection_DisablingLBPreservesTurbineSource(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+[block]
+source = "turbine"
+
+[lightbringer]
+enabled = true
+`), 0600))
+
+	m := newModel(path)
+	m.cfg = readConfig(path)
+	for i, f := range m.editFields {
+		if f.section == "lightbringer" && f.key == "enabled" {
+			m.editIdx = i
+			break
+		}
+	}
+	m.editOptions = menuOptionsFor("lightbringer", "enabled")
+	for i, o := range m.editOptions {
+		if o.value == "false" {
+			m.editOptCursor = i
+			break
+		}
+	}
+	m.applyMenuSelection()
+
+	content, err := os.ReadFile(path)
+	require.NoError(t, err)
+	body := string(content)
+	assert.Contains(t, body, `source = "turbine"`, "disabling LB must not clobber a turbine source")
+	assert.False(t, strings.Contains(body, `source = "rpc"`))
+}
+
+// Positive path: disabling LB while source was "lightbringer" must fall back to rpc.
+func TestApplyMenuSelection_DisablingLBFromLightbringerSetsRPC(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+[block]
+source = "lightbringer"
+
+[lightbringer]
+enabled = true
+`), 0600))
+
+	m := newModel(path)
+	m.cfg = readConfig(path)
+	for i, f := range m.editFields {
+		if f.section == "lightbringer" && f.key == "enabled" {
+			m.editIdx = i
+			break
+		}
+	}
+	m.editOptions = menuOptionsFor("lightbringer", "enabled")
+	for i, o := range m.editOptions {
+		if o.value == "false" {
+			m.editOptCursor = i
+			break
+		}
+	}
+	m.applyMenuSelection()
+
+	content, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Contains(t, string(content), `source = "rpc"`, "disabling LB from lightbringer mode must fall back to rpc")
+}
+
 func TestApplyEditField_SnapshotsPathClearsShadowingDownloadPath(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	require.NoError(t, os.WriteFile(path, []byte(`

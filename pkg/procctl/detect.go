@@ -141,14 +141,16 @@ func Detect(pidPath, lockPath, accountsDbDir string) (*Detection, error) {
 }
 
 func accountsDbArtifactsExist(accountsDbDir string) bool {
+	// AccountsDB build artifacts that CleanAccountsDbDir removes — present with no
+	// state file, they mean an interrupted build. Stays a subset of that list:
+	// bank_hash and mithril_state.history.jsonl aren't removed, so they don't count.
 	for _, name := range []string{
 		"mithril_db",
 		"bankhash_db",
 		"accounts",
 		"largest_file_id",
-		"bank_hash",
 		"manifest",
-		state.HistoryFileName,
+		"mithril_db_log_shards",
 	} {
 		if _, err := os.Stat(filepath.Join(accountsDbDir, name)); err == nil {
 			return true

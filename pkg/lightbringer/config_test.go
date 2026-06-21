@@ -478,3 +478,11 @@ func TestWriteConfigFile_NoTempFileLeftOnSuccess(t *testing.T) {
 	assert.Len(t, entries, 1)
 	assert.Equal(t, "Lightbringer.toml", entries[0].Name())
 }
+
+// The exported wrapper (used by doctor) must enforce the same rules as runtime.
+func TestValidateGossipPorts_ExportedWrapper(t *testing.T) {
+	require.NoError(t, ValidateGossipPorts(55000, 55001, 55100))
+	require.ErrorContains(t, ValidateGossipPorts(55010, 55001, 55100), "must not overlap")
+	require.ErrorContains(t, ValidateGossipPorts(55000, 55001, 55010), "at least 25")
+	require.ErrorContains(t, ValidateGossipPorts(70000, 55001, 55100), "out of range")
+}
