@@ -23,10 +23,25 @@ func IsValidHostname(hostname string) bool {
 	return validHostnameRegexp.MatchString(hostname)
 }
 
-func AlignUp(unaligned uint64, align uint64) uint64 {
+// integer constrains the alignment helpers to integer types so they can serve
+// both the uint64 callers (appendvec/account padding) and the int callers
+// (O_DIRECT page alignment) without casts.
+type integer interface {
+	~int | ~int8 | ~int16 | ~int32 | ~int64 |
+		~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 | ~uintptr
+}
+
+// AlignUp rounds unaligned up to the next multiple of align, which must be a
+// power of two. Defined for non-negative values.
+func AlignUp[T integer](unaligned T, align T) T {
 	mask := align - 1
-	alignedVal := unaligned + (-unaligned & mask)
-	return alignedVal
+	return unaligned + (-unaligned & mask)
+}
+
+// AlignDown rounds unaligned down to a multiple of align, which must be a power
+// of two. Defined for non-negative values.
+func AlignDown[T integer](unaligned T, align T) T {
+	return unaligned &^ (align - 1)
 }
 
 func PubkeyCmp(a solana.PublicKey, b solana.PublicKey) bool {
