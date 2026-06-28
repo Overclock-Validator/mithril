@@ -11,6 +11,23 @@ import (
 	"github.com/gagliardetto/solana-go"
 )
 
+const (
+	// Sentinel FileId values for the big snapshot files. Accounts loaded from the
+	// full snapshot have FileId=SnapshotFileId and point into accounts/snapshot.dat;
+	// accounts loaded from the incremental snapshot have FileId=IncrementalFileId and
+	// point into accounts/incremental.dat. The Offset field of such index entries is
+	// the global byte offset within that big file. All other FileIds (>= FirstReplayFileId)
+	// are individual appendvec files (accounts/SLOT.FILEID) created during replay.
+	SnapshotFileId    = uint64(0)
+	IncrementalFileId = uint64(1)
+	FirstReplayFileId = uint64(2)
+)
+
+// IsSnapshotFile returns true if the FileId refers to one of the big snapshot files.
+func IsSnapshotFile(fileId uint64) bool {
+	return fileId == SnapshotFileId || fileId == IncrementalFileId
+}
+
 type AccountIndexEntry struct {
 	Slot   uint64
 	FileId uint64
@@ -90,7 +107,12 @@ func WriteStakePubkeyIndex(path string, entries []StakeIndexEntry) error {
 // - pubkeys: all account pubkeys
 // - acctIdxEntries: index entries for each account
 // - stakeEntries: stake account pubkeys with their appendvec location hints
-func BuildIndexEntriesFromAppendVecs(data []byte, fileSize uint64, slot uint64, fileId uint64) ([]solana.PublicKey, []AccountIndexEntry, []StakeIndexEntry, error) {
+//
+// fileId is the FileId recorded in every produced index entry (a big-file
+// sentinel such as SnapshotFileId/IncrementalFileId). baseOffset is added to
+// each account's in-appendvec offset so the recorded Offset is the global byte
+// offset within the big file that the appendvec was concatenated into.
+func BuildIndexEntriesFromAppendVecs(data []byte, fileSize uint64, slot uint64, fileId uint64, baseOffset uint64) ([]solana.PublicKey, []AccountIndexEntry, []StakeIndexEntry, error) {
 	pubkeys := make([]solana.PublicKey, 0, 20000)
 	acctIdxEntries := make([]AccountIndexEntry, 0, 20000)
 	stakeEntries := make([]StakeIndexEntry, 0, 1000)
@@ -102,17 +124,20 @@ func BuildIndexEntriesFromAppendVecs(data []byte, fileSize uint64, slot uint64, 
 	for {
 		pubkeys = append(pubkeys, solana.PublicKey{})
 		acctIdxEntries = append(acctIdxEntries, AccountIndexEntry{})
-		err = parser.ParseNextAcctWithOwner(&pubkeys[len(pubkeys)-1], &acctIdxEntries[len(acctIdxEntries)-1], &owner)
+		idx := len(acctIdxEntries) - 1
+		err = parser.ParseNextAcctWithOwner(&pubkeys[idx], &acctIdxEntries[idx], &owner)
 		if err != nil {
-			pubkeys = pubkeys[:len(pubkeys)-1]
-			acctIdxEntries = acctIdxEntries[:len(acctIdxEntries)-1]
+			pubkeys = pubkeys[:idx]
+			acctIdxEntries = acctIdxEntries[:idx]
 			break
 		}
+		// Translate the in-appendvec offset to a global big-file offset.
+		acctIdxEntries[idx].Offset += baseOffset
+
 		// Collect stake account entries with appendvec location hints
 		if bytes.Equal(owner[:], addresses.StakeProgramAddr[:]) {
-			idx := len(acctIdxEntries) - 1
 			stakeEntries = append(stakeEntries, StakeIndexEntry{
-				Pubkey: pubkeys[len(pubkeys)-1],
+				Pubkey: pubkeys[idx],
 				FileId: acctIdxEntries[idx].FileId,
 				Offset: acctIdxEntries[idx].Offset,
 			})
