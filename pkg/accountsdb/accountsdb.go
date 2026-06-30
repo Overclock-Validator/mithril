@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -33,6 +34,14 @@ type AccountsDb struct {
 	VoteAcctCache    otter.Cache[solana.PublicKey, *accounts.Account]
 	CommonAcctsCache otter.Cache[solana.PublicKey, *accounts.Account]
 	ProgramCache     otter.Cache[solana.PublicKey, *ProgramCacheEntry]
+
+	// Cached file descriptors for the big snapshot files (accounts/snapshot.dat,
+	// accounts/incremental.dat). Opened once for the lifetime of the AccountsDb and
+	// shared across goroutines (reads use ReadAt/SectionReader, in-place updates use
+	// WriteAt, both of which are safe for concurrent use on a shared *os.File).
+	// nil if the corresponding file does not exist.
+	snapshotFile    *os.File
+	incrementalFile *os.File
 
 	// A list of store requests. They are added to the back as they arrive and
 	// removed from the front as they are persisted.
@@ -130,6 +139,15 @@ func OpenDb(accountsDbDir string) (*AccountsDb, error) {
 	accountsDb := &AccountsDb{Index: db, BankHashStore: bankhashDb, AcctsDir: appendVecsDir}
 	accountsDb.LargestFileId.Store(largestFileId)
 
+	// Open cached FDs for the big snapshot files (if present) with O_RDWR so that
+	// in-place account updates can write back into them.
+	if f, err := os.OpenFile(filepath.Join(appendVecsDir, "snapshot.dat"), os.O_RDWR, 0666); err == nil {
+		accountsDb.snapshotFile = f
+	}
+	if f, err := os.OpenFile(filepath.Join(appendVecsDir, "incremental.dat"), os.O_RDWR, 0666); err == nil {
+		accountsDb.incrementalFile = f
+	}
+
 	accountsDb.inProgressStoreRequests = list.New()
 	accountsDb.storeRequestChan = make(chan *list.Element)
 	accountsDb.storeWorkerDone = make(chan struct{})
@@ -160,6 +178,12 @@ func (accountsDb *AccountsDb) CloseDb() {
 	mlog.Log.Infof("CloseDb: syncing and closing BankHashStore...")
 	if err := accountsDb.BankHashStore.Close(); err != nil {
 		mlog.Log.Errorf("CloseDb: BankHashStore.Close() error: %v", err)
+	}
+	if accountsDb.snapshotFile != nil {
+		accountsDb.snapshotFile.Close()
+	}
+	if accountsDb.incrementalFile != nil {
+		accountsDb.incrementalFile.Close()
 	}
 	mlog.Log.Infof("CloseDb: done\n") // extra newline for spacing after close
 }
@@ -251,6 +275,37 @@ func (accountsDb *AccountsDb) GetAccount(slot uint64, pubkey solana.PublicKey) (
 	return accountsDb.getStoredAccount(slot, pubkey)
 }
 
+// maxAccountSectionLen bounds the SectionReader window for an account in a big
+// snapshot file. It must exceed the largest possible appendvec account (header +
+// up to ~10MB of data); the reader only consumes the bytes it actually needs.
+const maxAccountSectionLen = 1 << 30
+
+// bigSnapshotFile returns the cached *os.File for a big-file sentinel FileId,
+// or nil if fileId is not a big-file sentinel (or the file is not open).
+func (accountsDb *AccountsDb) bigSnapshotFile(fileId uint64) *os.File {
+	switch fileId {
+	case SnapshotFileId:
+		return accountsDb.snapshotFile
+	case IncrementalFileId:
+		return accountsDb.incrementalFile
+	default:
+		return nil
+	}
+}
+
+// bigFileName returns a human-readable name for a big-file sentinel FileId, for
+// use in error/log messages.
+func bigFileName(fileId uint64) string {
+	switch fileId {
+	case SnapshotFileId:
+		return "snapshot.dat"
+	case IncrementalFileId:
+		return "incremental.dat"
+	default:
+		return fmt.Sprintf("<fileId=%d>", fileId)
+	}
+}
+
 func (accountsDb *AccountsDb) getStoredAccount(slot uint64, pubkey solana.PublicKey) (*accounts.Account, error) {
 	if accountsDb.Index == nil {
 		return nil, ErrNoAccount
@@ -282,24 +337,36 @@ func (accountsDb *AccountsDb) getStoredAccount(slot uint64, pubkey solana.Public
 	}
 	c.Close()
 
-	appendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, acctIdxEntry.Slot, acctIdxEntry.FileId)
+	var reader io.Reader
+	var appendVecFileName string
+	if IsSnapshotFile(acctIdxEntry.FileId) {
+		fd := accountsDb.bigSnapshotFile(acctIdxEntry.FileId)
+		if fd == nil {
+			return nil, fmt.Errorf("index references big-file FileId=%d but its file is not open", acctIdxEntry.FileId)
+		}
+		appendVecFileName = bigFileName(acctIdxEntry.FileId)
+		// ReadAt-based reader: safe for concurrent use on the shared FD (no seek race).
+		reader = io.NewSectionReader(fd, int64(acctIdxEntry.Offset), maxAccountSectionLen)
+	} else {
+		appendVecFileName = fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, acctIdxEntry.Slot, acctIdxEntry.FileId)
+		appendVecFile, err := os.Open(appendVecFileName)
+		if err != nil {
+			//mlog.Log.Debugf("failed to open appendvec file %s")
+			return nil, err
+		}
+		defer appendVecFile.Close()
 
-	appendVecFile, err := os.Open(appendVecFileName)
-	if err != nil {
-		//mlog.Log.Debugf("failed to open appendvec file %s")
-		return nil, err
-	}
-	defer appendVecFile.Close()
-
-	offset, err := appendVecFile.Seek(int64(acctIdxEntry.Offset), 0)
-	if err != nil {
-		panic(fmt.Sprintf("file seek failed: %s\n", err))
-	}
-	if offset != int64(acctIdxEntry.Offset) {
-		panic(fmt.Sprintf("file seek gave wrong idx (%d)\n", offset))
+		offset, err := appendVecFile.Seek(int64(acctIdxEntry.Offset), 0)
+		if err != nil {
+			panic(fmt.Sprintf("file seek failed: %s\n", err))
+		}
+		if offset != int64(acctIdxEntry.Offset) {
+			panic(fmt.Sprintf("file seek gave wrong idx (%d)\n", offset))
+		}
+		reader = appendVecFile
 	}
 
-	acct, err := unmarshalAcctFromAppendVecAcctHeader(appendVecFile)
+	acct, err := unmarshalAcctFromAppendVecAcctHeader(reader)
 	if err != nil {
 		panic(fmt.Sprintf("failed to unmarshal account from appendvec file %s: %s", appendVecFileName, err))
 	}
@@ -459,38 +526,58 @@ func (accountsDb *AccountsDb) storeAccountsInternal(accts []*accounts.Account, s
 			}
 			c.Close()
 
-			existingAppendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, acctIdxEntry.Slot, acctIdxEntry.FileId)
-			existingAppendVecFile, err := os.OpenFile(existingAppendVecFileName, os.O_RDWR, 0666)
-			if err != nil {
-				panic(err)
-			}
-
-			_, err = existingAppendVecFile.Seek(int64(acctIdxEntry.Offset), 0)
-			if err != nil {
-				panic(err)
-			}
-
-			existingAcct, err := unmarshalAcctFromAppendVecAcctHeader(existingAppendVecFile)
-			if err != nil {
-				panic(fmt.Sprintf("failed to unmarshal account from appendvec file %s: %s", existingAppendVecFileName, err))
-			}
-
-			if len(acct.Data) == len(existingAcct.Data) {
-				newAppendVecAcct := AppendVecAccount{DataLen: uint64(len(acct.Data)), Pubkey: acct.Key, Lamports: acct.Lamports,
-					RentEpoch: acct.RentEpoch, Owner: acct.Owner, Executable: acct.Executable, Data: acct.Data}
-
-				_, err = existingAppendVecFile.Seek(int64(acctIdxEntry.Offset), 0)
+			var existingAppendVecFile *os.File
+			var existingAppendVecFileName string
+			var needClose bool
+			if IsSnapshotFile(acctIdxEntry.FileId) {
+				existingAppendVecFile = accountsDb.bigSnapshotFile(acctIdxEntry.FileId)
+				existingAppendVecFileName = bigFileName(acctIdxEntry.FileId)
+				if existingAppendVecFile == nil {
+					panic(fmt.Sprintf("index references big-file FileId=%d but its file is not open", acctIdxEntry.FileId))
+				}
+			} else {
+				existingAppendVecFileName = fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, acctIdxEntry.Slot, acctIdxEntry.FileId)
+				existingAppendVecFile, err = os.OpenFile(existingAppendVecFileName, os.O_RDWR, 0666)
 				if err != nil {
 					panic(err)
 				}
+				needClose = true
+			}
 
-				err = newAppendVecAcct.Marshal(existingAppendVecFile)
-				if err != nil {
-					panic(fmt.Sprintf("error marshaling appendvec for storage: %s", err))
+			existingDataLen, err := GetAppendVecDataLen(existingAppendVecFile, acctIdxEntry.Offset)
+			if err != nil {
+				panic(fmt.Sprintf("failed to read data len from appendvec file %s: %s", existingAppendVecFileName, err))
+			}
+
+			if uint64(len(acct.Data)) == existingDataLen {
+				newAppendVecAcct := AppendVecAccount{DataLen: uint64(len(acct.Data)), Pubkey: acct.Key, Lamports: acct.Lamports,
+					RentEpoch: acct.RentEpoch, Owner: acct.Owner, Executable: acct.Executable, Data: acct.Data}
+
+				if IsSnapshotFile(acctIdxEntry.FileId) {
+					// Big file is shared across goroutines; use WriteAt (no seek race).
+					var marshalBuf bytes.Buffer
+					if err := newAppendVecAcct.Marshal(&marshalBuf); err != nil {
+						panic(fmt.Sprintf("error marshaling appendvec for storage: %s", err))
+					}
+					if _, err := existingAppendVecFile.WriteAt(marshalBuf.Bytes(), int64(acctIdxEntry.Offset)); err != nil {
+						panic(fmt.Sprintf("error writing appendvec to %s: %s", existingAppendVecFileName, err))
+					}
+				} else {
+					if _, err := existingAppendVecFile.Seek(int64(acctIdxEntry.Offset), 0); err != nil {
+						panic(err)
+					}
+					if err := newAppendVecAcct.Marshal(existingAppendVecFile); err != nil {
+						panic(fmt.Sprintf("error marshaling appendvec for storage: %s", err))
+					}
 				}
 
-				existingAppendVecFile.Close()
+				if needClose {
+					existingAppendVecFile.Close()
+				}
 				continue
+			}
+			if needClose {
+				existingAppendVecFile.Close()
 			}
 		}
 
@@ -561,12 +648,26 @@ func (accountsDb *AccountsDb) parallelStoreAccounts(n int, accts []*accounts.Acc
 						return fmt.Errorf("unmarshaling index entry: %w", err)
 					}
 
-					existingAppendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, existingIdxEntry.Slot, existingIdxEntry.FileId)
-					existingAppendVecFile, err := os.OpenFile(existingAppendVecFileName, os.O_RDWR, 0666)
-					if err != nil {
-						return fmt.Errorf("open %s: %w", existingAppendVecFileName, err)
+					var existingAppendVecFile *os.File
+					var existingAppendVecFileName string
+					var needClose bool
+					if IsSnapshotFile(existingIdxEntry.FileId) {
+						existingAppendVecFile = accountsDb.bigSnapshotFile(existingIdxEntry.FileId)
+						existingAppendVecFileName = bigFileName(existingIdxEntry.FileId)
+						if existingAppendVecFile == nil {
+							return fmt.Errorf("index references big-file FileId=%d but its file is not open", existingIdxEntry.FileId)
+						}
+					} else {
+						existingAppendVecFileName = fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, existingIdxEntry.Slot, existingIdxEntry.FileId)
+						existingAppendVecFile, err = os.OpenFile(existingAppendVecFileName, os.O_RDWR, 0666)
+						if err != nil {
+							return fmt.Errorf("open %s: %w", existingAppendVecFileName, err)
+						}
+						needClose = true
 					}
-					defer existingAppendVecFile.Close()
+					if needClose {
+						defer existingAppendVecFile.Close()
+					}
 
 					existingDataLen, err := GetAppendVecDataLen(existingAppendVecFile, existingIdxEntry.Offset)
 					if err != nil {
@@ -578,10 +679,6 @@ func (accountsDb *AccountsDb) parallelStoreAccounts(n int, accts []*accounts.Acc
 						return nil
 					}
 
-					_, err = existingAppendVecFile.Seek(int64(existingIdxEntry.Offset), 0)
-					if err != nil {
-						return fmt.Errorf("seek %s %d: %w", existingAppendVecFileName, existingIdxEntry.Offset, err)
-					}
 					newAppendVecAcct := AppendVecAccount{
 						DataLen:    uint64(len(a.Data)),
 						Pubkey:     a.Key,
@@ -591,9 +688,22 @@ func (accountsDb *AccountsDb) parallelStoreAccounts(n int, accts []*accounts.Acc
 						Executable: a.Executable,
 						Data:       a.Data,
 					}
-					err = newAppendVecAcct.Marshal(existingAppendVecFile)
-					if err != nil {
-						return fmt.Errorf("marshaling appendvec: %w", err)
+					if IsSnapshotFile(existingIdxEntry.FileId) {
+						// Big file is shared across goroutines; use WriteAt (no seek race).
+						var marshalBuf bytes.Buffer
+						if err := newAppendVecAcct.Marshal(&marshalBuf); err != nil {
+							return fmt.Errorf("marshaling appendvec: %w", err)
+						}
+						if _, err := existingAppendVecFile.WriteAt(marshalBuf.Bytes(), int64(existingIdxEntry.Offset)); err != nil {
+							return fmt.Errorf("WriteAt %s offset=%d: %w", existingAppendVecFileName, existingIdxEntry.Offset, err)
+						}
+					} else {
+						if _, err := existingAppendVecFile.Seek(int64(existingIdxEntry.Offset), 0); err != nil {
+							return fmt.Errorf("seek %s %d: %w", existingAppendVecFileName, existingIdxEntry.Offset, err)
+						}
+						if err := newAppendVecAcct.Marshal(existingAppendVecFile); err != nil {
+							return fmt.Errorf("marshaling appendvec: %w", err)
+						}
 					}
 					return nil
 				}(acct)

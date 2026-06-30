@@ -230,7 +230,7 @@ func init() {
 	Run.Flags().IntVar(&snapshot.MaxConcurrentFlushers, "max-concurrent-flushers", snapshot.DefaultSnapshotMaxConcurrentFlushers, "Bound for number of log shards to flush to Accounts DB Index at once")
 	Run.Flags().BoolVar(&snapshot.SnapshotDirectIO, "snapshot-direct-io", false, "Use O_DIRECT for big snapshot file writes during bootstrap (Linux only)")
 	Run.Flags().IntVar(&snapshot.SnapshotBufCount, "snapshot-buf-count", snapshot.DefaultSnapshotBufCount, "Number of in-flight buffers for snapshot bootstrap big-file writes")
-	Run.Flags().IntVar(&snapshot.SnapshotWriteWorkers, "snapshot-write-workers", snapshot.DefaultSnapshotWriteWorkers, "Concurrent pwrites each big-file buffer is split into (queue depth to the RAID)")
+	Run.Flags().IntVar(&snapshot.SnapshotWriteWorkers, "snapshot-write-workers", snapshot.DefaultSnapshotWriteWorkers, "Concurrent WriteAt each big-file buffer is split into")
 	Run.Flags().IntVar(&snapshot.SnapshotIndexEntryBuilderWorkers, "snapshot-index-builder-workers", snapshot.DefaultSnapshotIndexEntryBuilderWorkers, "Snapshot bootstrap account-index parser workers")
 	Run.Flags().IntVar(&snapshot.SnapshotIndexEntryCommitterWorkers, "snapshot-index-committer-workers", snapshot.DefaultSnapshotIndexEntryCommitterWorkers, "Snapshot bootstrap account-index shard enqueue workers")
 	Run.Flags().IntVar(&snapshot.SnapshotIndexShards, "snapshot-index-shards", snapshot.DefaultSnapshotIndexShards, "Snapshot bootstrap account-index shard count")
@@ -683,6 +683,9 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	snapshot.SnapshotIndexTempDir = getString("snapshot-index-temp-dir", "tuning.snapshot_index_temp_dir")
 	if snapshot.MaxConcurrentFlushers <= 0 {
 		return fmt.Errorf("tuning.max_concurrent_flushers must be > 0")
+	}
+	if snapshot.SnapshotBufCount <= 0 {
+		return fmt.Errorf("tuning.snapshot_buf_count must be > 0")
 	}
 	if snapshot.SnapshotIndexEntryBuilderWorkers <= 0 {
 		return fmt.Errorf("tuning.snapshot_index_builder_workers must be > 0")
