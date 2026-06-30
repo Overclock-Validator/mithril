@@ -228,7 +228,9 @@ func init() {
 	Run.Flags().Uint64Var(&borrowedAccountArenaSize, "borrowed-account-arena-size", 1024, "Number of borrowed accounts to preallocate in arena (0 to disable)")
 	Run.Flags().IntVar(&snapshot.ZstdDecoderConcurrency, "zstd-decoder-concurrency", runtime.NumCPU(), "Zstd decoder concurrency")
 	Run.Flags().IntVar(&snapshot.MaxConcurrentFlushers, "max-concurrent-flushers", snapshot.DefaultSnapshotMaxConcurrentFlushers, "Bound for number of log shards to flush to Accounts DB Index at once")
-	Run.Flags().IntVar(&snapshot.SnapshotAppendVecCopyingWorkers, "snapshot-append-vec-workers", snapshot.DefaultSnapshotAppendVecCopyingWorkers, "Snapshot bootstrap appendvec write workers")
+	Run.Flags().BoolVar(&snapshot.SnapshotDirectIO, "snapshot-direct-io", false, "Use O_DIRECT for big snapshot file writes during bootstrap (Linux only)")
+	Run.Flags().IntVar(&snapshot.SnapshotBufCount, "snapshot-buf-count", snapshot.DefaultSnapshotBufCount, "Number of in-flight buffers for snapshot bootstrap big-file writes")
+	Run.Flags().IntVar(&snapshot.SnapshotWriteWorkers, "snapshot-write-workers", snapshot.DefaultSnapshotWriteWorkers, "Concurrent pwrites each big-file buffer is split into (queue depth to the RAID)")
 	Run.Flags().IntVar(&snapshot.SnapshotIndexEntryBuilderWorkers, "snapshot-index-builder-workers", snapshot.DefaultSnapshotIndexEntryBuilderWorkers, "Snapshot bootstrap account-index parser workers")
 	Run.Flags().IntVar(&snapshot.SnapshotIndexEntryCommitterWorkers, "snapshot-index-committer-workers", snapshot.DefaultSnapshotIndexEntryCommitterWorkers, "Snapshot bootstrap account-index shard enqueue workers")
 	Run.Flags().IntVar(&snapshot.SnapshotIndexShards, "snapshot-index-shards", snapshot.DefaultSnapshotIndexShards, "Snapshot bootstrap account-index shard count")
@@ -672,16 +674,15 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 
 	snapshot.ZstdDecoderConcurrency = getInt("zstd-decoder-concurrency", "tuning.zstd_decoder_concurrency")
 	snapshot.MaxConcurrentFlushers = getInt("max-concurrent-flushers", "tuning.max_concurrent_flushers")
-	snapshot.SnapshotAppendVecCopyingWorkers = getInt("snapshot-append-vec-workers", "tuning.snapshot_append_vec_workers")
+	snapshot.SnapshotDirectIO = getBool("snapshot-direct-io", "tuning.snapshot_direct_io")
+	snapshot.SnapshotBufCount = getInt("snapshot-buf-count", "tuning.snapshot_buf_count")
+	snapshot.SnapshotWriteWorkers = getInt("snapshot-write-workers", "tuning.snapshot_write_workers")
 	snapshot.SnapshotIndexEntryBuilderWorkers = getInt("snapshot-index-builder-workers", "tuning.snapshot_index_builder_workers")
 	snapshot.SnapshotIndexEntryCommitterWorkers = getInt("snapshot-index-committer-workers", "tuning.snapshot_index_committer_workers")
 	snapshot.SnapshotIndexShards = getInt("snapshot-index-shards", "tuning.snapshot_index_shards")
 	snapshot.SnapshotIndexTempDir = getString("snapshot-index-temp-dir", "tuning.snapshot_index_temp_dir")
 	if snapshot.MaxConcurrentFlushers <= 0 {
 		return fmt.Errorf("tuning.max_concurrent_flushers must be > 0")
-	}
-	if snapshot.SnapshotAppendVecCopyingWorkers <= 0 {
-		return fmt.Errorf("tuning.snapshot_append_vec_workers must be > 0")
 	}
 	if snapshot.SnapshotIndexEntryBuilderWorkers <= 0 {
 		return fmt.Errorf("tuning.snapshot_index_builder_workers must be > 0")
