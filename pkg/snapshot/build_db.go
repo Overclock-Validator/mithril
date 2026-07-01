@@ -311,10 +311,27 @@ func BuildAccountsDbPaths(
 
 	// Process snapshots sequentially for better performance (less lock contention)
 	// Full snapshot first
+	fullStart := time.Now()
 	err = readTar(ctx, wg, snapshotFile, pools.appendVecCopying, readTarOptions{progress: dp})
 
 	// Wait for ALL worker tasks from full snapshot to complete before starting incremental
 	wg.Wait()
+
+	{
+		var fullBytes uint64
+		for _, sav := range manifest.AccountsDb.Storages {
+			for _, av := range sav.AcctVecs {
+				fullBytes += av.FileSize
+			}
+		}
+		el := time.Since(fullStart).Seconds()
+		var mibps float64
+		if el > 0 {
+			mibps = float64(fullBytes) / (1024 * 1024) / el
+		}
+		mlog.Log.Infof("readTar timing (baseline): bytesOut=%dMB elapsed=%.1fs avgMiBps=%.0f",
+			fullBytes/(1024*1024), el, mibps)
+	}
 
 	// Stop progress display after full snapshot
 	if dp != nil {
