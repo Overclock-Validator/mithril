@@ -2,13 +2,11 @@ package snapshot
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
@@ -40,14 +38,19 @@ func BuildAccountsDbAuto(
 	snapshotDownloadPath string,
 	fullSnapshotSlot int,
 	referenceSlot int,
-	accountsDbDir string,
+	accountsPaths []string,
 	rpcEndpoints []string,
 	blockDir string,
 	snapCfg snapshotdl.SnapshotConfig,
 	dp *progress.DualProgress,
 ) (*accountsdb.AccountsDb, *SnapshotManifest, error) {
+	if len(accountsPaths) == 0 {
+		return nil, nil, fmt.Errorf("no accounts paths configured")
+	}
+	// The first path holds all metadata; every path holds a shard's accounts dir.
+	accountsDbDir := accountsPaths[0]
 	// Clean any leftover artifacts from previous incomplete runs (e.g., Ctrl+C)
-	CleanAccountsDbDir(accountsDbDir)
+	CleanAccountsDbDir(accountsPaths)
 
 	mlog.Log.Infof("Parsing full snapshot manifest...")
 	manifest, err := UnmarshalManifestFromSnapshot(ctx, fullSnapshotFile, accountsDbDir)
@@ -58,16 +61,22 @@ func BuildAccountsDbAuto(
 
 	start := time.Now()
 
-	appendVecsOutputDir := filepath.Join(accountsDbDir, "accounts")
-	if err = os.MkdirAll(appendVecsOutputDir, 0775); err != nil {
-		return nil, nil, err
+	shardDirs := make([]string, len(accountsPaths))
+	for i, p := range accountsPaths {
+		shardDirs[i] = filepath.Join(p, "accounts")
+		if err = os.MkdirAll(shardDirs[i], 0775); err != nil {
+			return nil, nil, err
+		}
+	}
+	shardFiles, err := openShardBigFiles(shardDirs)
+	if err != nil {
+		return nil, nil, fmt.Errorf("opening shard big files: %w", err)
 	}
 	logSnapshotBootstrapTuning()
 
 	defer ants.Release()
 
 	incrementalManifest := &SnapshotManifest{}
-	var largestFileId atomic.Uint64
 	wg := &sync.WaitGroup{}
 
 	numShards := snapshotIndexShards()
@@ -83,7 +92,7 @@ func BuildAccountsDbAuto(
 		entries: make([]accountsdb.StakeIndexEntry, 0, 1000000), // Pre-allocate for ~1M stake accounts
 	}
 
-	pools, err := initWorkerPools(wg, sl, manifest, incrementalManifest, accountsDbDir, &largestFileId, stakeCollector)
+	pools, err := initWorkerPools(wg, sl, manifest, incrementalManifest, shardFiles, stakeCollector)
 	if err != nil {
 		return nil, nil, fmt.Errorf("initializing worker pools: %w", err)
 	}
@@ -114,7 +123,7 @@ func BuildAccountsDbAuto(
 		dp.Start()
 	}
 
-	err = readTar(ctx, wg, fullSnapshotFile, pools.appendVecCopying, readTarOptions{savePath: fullSavePath, progress: dp})
+	err = readTar(ctx, wg, fullSnapshotFile, pools.appendVecCopying, pools.tarBufs, readTarOptions{savePath: fullSavePath, progress: dp})
 	if err != nil {
 		if dp != nil {
 			dp.Interrupt(err)
@@ -197,7 +206,7 @@ func BuildAccountsDbAuto(
 			}
 		}
 
-		err = readTar(ctx, wg, incrementalSnapshotPath, pools.appendVecCopying, readTarOptions{savePath: incrSavePath, isIncremental: true})
+		err = readTar(ctx, wg, incrementalSnapshotPath, pools.appendVecCopying, pools.tarBufs, readTarOptions{savePath: incrSavePath, isIncremental: true})
 		wg.Wait()
 		// Check if we should retry
 		if err == nil {
@@ -208,6 +217,11 @@ func BuildAccountsDbAuto(
 	}
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// flush and close every shard's big file now that all appends are done
+	if err := shardFiles.close(); err != nil {
+		return nil, nil, fmt.Errorf("closing shard big files: %w", err)
 	}
 
 	// Show indexing progress for shard flush
@@ -223,12 +237,7 @@ func BuildAccountsDbAuto(
 	}
 	index.Close()
 
-	var largestFileIdBytes [8]byte
-	binary.LittleEndian.PutUint64(largestFileIdBytes[:], largestFileId.Load())
-
-	path := filepath.Join(accountsDbDir, "largest_file_id")
-	if err := os.WriteFile(path, largestFileIdBytes[:], 0644); err != nil {
-		mlog.Log.Errorf("error while writing largest file ID=%d to %s: %s", largestFileId.Load(), path, err)
+	if err := writeShardMetadata(accountsDbDir, len(shardDirs)); err != nil {
 		return nil, nil, err
 	}
 
@@ -253,7 +262,7 @@ func BuildAccountsDbAuto(
 	}
 	bankhashDb.Close()
 
-	accountsDb, err := accountsdb.OpenDb(accountsDbDir)
+	accountsDb, err := accountsdb.OpenDb(accountsPaths)
 	if err != nil {
 		return nil, nil, err
 	}

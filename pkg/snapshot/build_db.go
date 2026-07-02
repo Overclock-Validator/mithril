@@ -1,9 +1,7 @@
 package snapshot
 
 import (
-	"bytes"
 	"context"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -27,6 +25,9 @@ const (
 	DefaultSnapshotAppendVecCopyingWorkers    = 32
 	DefaultSnapshotIndexShards                = 64
 	DefaultSnapshotMaxConcurrentFlushers      = 8
+	// DefaultSnapshotDirectIO keeps O_DIRECT big-file writes off by default;
+	// buffered is the safe default and O_DIRECT is an opt-in tuning knob.
+	DefaultSnapshotDirectIO = false
 )
 
 var (
@@ -34,13 +35,17 @@ var (
 	SnapshotIndexEntryBuilderWorkers   = DefaultSnapshotIndexEntryBuilderWorkers
 	SnapshotAppendVecCopyingWorkers    = DefaultSnapshotAppendVecCopyingWorkers
 	SnapshotIndexShards                = DefaultSnapshotIndexShards
+	SnapshotDirectIO                   = DefaultSnapshotDirectIO
 	SnapshotIndexTempDir               string
 )
 
 // CleanAccountsDbDir removes all artifacts from a previous incomplete snapshot run.
 // This prevents corruption from Ctrl+C or partial downloads.
 // Exported so it can be called early in startup before any failures.
-func CleanAccountsDbDir(accountsDbDir string) {
+func CleanAccountsDbDir(accountsPaths []string) {
+	if len(accountsPaths) == 0 {
+		return
+	}
 	// List of all files/directories that may be left from a previous incomplete run
 	artifacts := []string{
 		"accounts",
@@ -48,11 +53,19 @@ func CleanAccountsDbDir(accountsDbDir string) {
 		"mithril_db_log_shards",
 		"bankhash_db",
 		"largest_file_id",
+		"num_shards",
 		"manifest",
 		"mithril_state.json", // State file for tracking valid builds and replay progress
 	}
 	for _, artifact := range artifacts {
-		path := filepath.Join(accountsDbDir, artifact)
+		path := filepath.Join(accountsPaths[0], artifact)
+		if err := os.RemoveAll(path); err != nil {
+			mlog.Log.Errorf("failed to remove %s: %v", path, err)
+		}
+	}
+	// remove the accounts dir on the other shard disks too
+	for _, p := range accountsPaths[1:] {
+		path := filepath.Join(p, "accounts")
 		if err := os.RemoveAll(path); err != nil {
 			mlog.Log.Errorf("failed to remove %s: %v", path, err)
 		}
@@ -205,12 +218,13 @@ func logSnapshotBootstrapTuning() {
 	if indexTempDir == "" {
 		indexTempDir = "(accountsdb)"
 	}
-	mlog.Log.Infof("Snapshot bootstrap tuning: append_vec_workers=%d index_builder_workers=%d index_committer_workers=%d index_shards=%d max_concurrent_flushers=%d zstd_decoder_concurrency=%d index_temp_dir=%s",
+	mlog.Log.Infof("Snapshot bootstrap tuning: append_vec_workers=%d index_builder_workers=%d index_committer_workers=%d index_shards=%d max_concurrent_flushers=%d directio=%v zstd_decoder_concurrency=%d index_temp_dir=%s",
 		snapshotAppendVecCopyingWorkers(),
 		snapshotIndexEntryBuilderWorkers(),
 		snapshotIndexEntryCommitterWorkers(),
 		snapshotIndexShards(),
 		snapshotMaxConcurrentFlushers(),
+		SnapshotDirectIO,
 		ZstdDecoderConcurrency,
 		indexTempDir)
 }
@@ -245,11 +259,16 @@ func BuildAccountsDbPaths(
 	ctx context.Context,
 	snapshotFile string,
 	incrementalSnapshotFile string,
-	accountsDbDir string,
+	accountsPaths []string,
 	dp *progress.DualProgress,
 ) (*accountsdb.AccountsDb, *SnapshotManifest, error) {
+	if len(accountsPaths) == 0 {
+		return nil, nil, fmt.Errorf("no accounts paths configured")
+	}
+	// The first path holds all metadata; every path holds a shard's accounts dir.
+	accountsDbDir := accountsPaths[0]
 	// Clean any leftover artifacts from previous incomplete runs (e.g., Ctrl+C)
-	CleanAccountsDbDir(accountsDbDir)
+	CleanAccountsDbDir(accountsPaths)
 
 	mlog.Log.Infof("Parsing full snapshot manifest...")
 	manifest, err := UnmarshalManifestFromSnapshot(ctx, snapshotFile, accountsDbDir)
@@ -270,15 +289,21 @@ func BuildAccountsDbPaths(
 
 	start := time.Now()
 
-	appendVecsOutputDir := filepath.Join(accountsDbDir, "accounts")
-	if err = os.MkdirAll(appendVecsOutputDir, 0775); err != nil {
-		return nil, nil, err
+	shardDirs := make([]string, len(accountsPaths))
+	for i, p := range accountsPaths {
+		shardDirs[i] = filepath.Join(p, "accounts")
+		if err = os.MkdirAll(shardDirs[i], 0775); err != nil {
+			return nil, nil, err
+		}
+	}
+	shardFiles, err := openShardBigFiles(shardDirs)
+	if err != nil {
+		return nil, nil, fmt.Errorf("opening shard big files: %w", err)
 	}
 	logSnapshotBootstrapTuning()
 
 	defer ants.Release()
 
-	var largestFileId atomic.Uint64
 	wg := &sync.WaitGroup{}
 
 	logsDir, cleanupIndexWorkDir, err := prepareSnapshotIndexWorkDir(accountsDbDir)
@@ -294,7 +319,7 @@ func BuildAccountsDbPaths(
 		entries: make([]accountsdb.StakeIndexEntry, 0, 1000000), // Pre-allocate for ~1M stake accounts
 	}
 
-	pools, err := initWorkerPools(wg, sl, manifest, incrementalManifest, accountsDbDir, &largestFileId, stakeCollector)
+	pools, err := initWorkerPools(wg, sl, manifest, incrementalManifest, shardFiles, stakeCollector)
 	if err != nil {
 		return nil, nil, fmt.Errorf("initializing worker pools: %w", err)
 	}
@@ -311,7 +336,7 @@ func BuildAccountsDbPaths(
 
 	// Process snapshots sequentially for better performance (less lock contention)
 	// Full snapshot first
-	err = readTar(ctx, wg, snapshotFile, pools.appendVecCopying, readTarOptions{progress: dp})
+	err = readTar(ctx, wg, snapshotFile, pools.appendVecCopying, pools.tarBufs, readTarOptions{progress: dp})
 
 	// Wait for ALL worker tasks from full snapshot to complete before starting incremental
 	wg.Wait()
@@ -331,13 +356,18 @@ func BuildAccountsDbPaths(
 
 	// Process incremental snapshot (if provided)
 	if incrementalSnapshotFile != "" {
-		err = readTar(ctx, wg, incrementalSnapshotFile, pools.appendVecCopying,
+		err = readTar(ctx, wg, incrementalSnapshotFile, pools.appendVecCopying, pools.tarBufs,
 			readTarOptions{isIncremental: true})
 		if err != nil {
 			return nil, nil, err
 		}
 		// Wait for all incremental worker tasks to complete
 		wg.Wait()
+	}
+
+	// flush and close every shard's big file now that all appends are done
+	if err := shardFiles.close(); err != nil {
+		return nil, nil, fmt.Errorf("closing shard big files: %w", err)
 	}
 
 	mlog.Log.Debugf("done processing snapshots in %s.", fmtDuration(time.Since(start)))
@@ -360,12 +390,7 @@ func BuildAccountsDbPaths(
 
 	mlog.Log.Infof("Snapshot processed in %s.", fmtDuration(time.Since(start)))
 
-	var largestFileIdBytes [8]byte
-	binary.LittleEndian.PutUint64(largestFileIdBytes[:], largestFileId.Load())
-
-	path := filepath.Join(accountsDbDir, "largest_file_id")
-	if err := os.WriteFile(path, largestFileIdBytes[:], 0644); err != nil {
-		mlog.Log.Errorf("error while writing largest file ID=%d to %s: %s", largestFileId.Load(), path, err)
+	if err := writeShardMetadata(accountsDbDir, len(shardDirs)); err != nil {
 		return nil, nil, err
 	}
 
@@ -390,7 +415,7 @@ func BuildAccountsDbPaths(
 	}
 	bankhashDb.Close()
 
-	accountsDb, err := accountsdb.OpenDb(accountsDbDir)
+	accountsDb, err := accountsdb.OpenDb(accountsPaths)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -416,11 +441,38 @@ type readTarOptions struct {
 	isIncremental bool
 }
 
+// tarBufPool recycles the byte buffers that appendvec data is read into, saving
+// ~420k allocations totalling ~470 GB. A buffer returns to the pool once the index
+// builder is done reading it. Owned by snapshotWorkerPools so it may be GCed after
+// snapshot unpacking.
+type tarBufPool struct{ sync.Pool }
+
+func newTarBufPool() *tarBufPool {
+	return &tarBufPool{Pool: sync.Pool{New: func() any { b := []byte(nil); return &b }}}
+}
+
+func (p *tarBufPool) get(size int) *[]byte {
+	bp := p.Get().(*[]byte)
+	if cap(*bp) < size {
+		*bp = make([]byte, size)
+	} else {
+		*bp = (*bp)[:size]
+	}
+	return bp
+}
+
+func (p *tarBufPool) put(bp *[]byte) {
+	if bp != nil {
+		p.Put(bp)
+	}
+}
+
 func readTar(
 	ctx context.Context,
 	wg *sync.WaitGroup,
 	filename string,
 	appendVecCopyingPool *ants.PoolWithFunc,
+	bufs *tarBufPool,
 	options readTarOptions,
 ) error {
 	dp := options.progress
@@ -449,13 +501,19 @@ func readTar(
 		}
 	}
 
+	var totalTarNext, totalReadCopy, totalDispatch time.Duration
+	var entryCount int
+	var bytesOut int64
+	readTarStart := time.Now()
 	for {
 		if ctx.Err() != nil {
 			mlog.Log.Infof("Context cancelled, stopping snapshot unpack: %v", ctx.Err())
 			cleanupPartial("cancelled")
 			return ctx.Err()
 		}
+		t0 := time.Now()
 		header, err := tarReader.Next()
+		totalTarNext += time.Since(t0)
 		if err == io.EOF {
 			break
 		} else if err != nil {
@@ -468,29 +526,45 @@ func readTar(
 			continue
 		}
 
-		writer := bytes.NewBuffer(make([]byte, 0, header.Size))
-		tarBytesRead, err := io.Copy(writer, tarReader)
+		t1 := time.Now()
+		bp := bufs.get(int(header.Size))
+		_, err = io.ReadFull(tarReader, *bp)
+		totalReadCopy += time.Since(t1)
 		if err != nil {
-			mlog.Log.Errorf("err copying data to reader: %s\n", err)
-			cleanupPartial("copy error")
+			mlog.Log.Errorf("err reading tar entry data: %s\n", err)
+			cleanupPartial("read error")
+			bufs.put(bp)
 			return err
 		}
-		statsd.Count(statsd.SnapshotTarBytesRead, tarBytesRead, nil)
+		entryCount++
+		bytesOut += header.Size
+		statsd.Count(statsd.SnapshotTarBytesRead, header.Size, nil)
 
 		// Update extract progress
 		if dp != nil {
-			dp.Extract.Add(tarBytesRead)
+			dp.Extract.Add(header.Size)
 		}
 
-		task := appendVecCopyingTask{TarBuffer: writer, Filename: header.Name, FromIncrementalSnapshot: options.isIncremental}
+		task := appendVecCopyingTask{Buf: *bp, BufRef: bp, Filename: header.Name, FromIncrementalSnapshot: options.isIncremental}
 		wg.Add(1)
+		t2 := time.Now()
 		err = appendVecCopyingPool.Invoke(task)
+		totalDispatch += time.Since(t2)
 		if err != nil {
 			mlog.Log.Errorf("error calling appendVecCopyingPool.Invoke: %v", err)
 			cleanupPartial("pool error")
 			return err
 		}
 	}
+
+	elapsed := time.Since(readTarStart)
+	mibps := 0.0
+	if elapsed > 0 {
+		mibps = float64(bytesOut) / (1 << 20) / elapsed.Seconds()
+	}
+	mlog.Log.Infof("readTar timing: entries=%d bytesOut=%dMB elapsed=%s avgMiBps=%.0f tarNext=%s readCopy=%s dispatch=%s",
+		entryCount, bytesOut/(1<<20), fmtDuration(elapsed), mibps,
+		fmtDuration(totalTarNext), fmtDuration(totalReadCopy), fmtDuration(totalDispatch))
 
 	// Successfully processed the entire tar — finalize by renaming from .partial
 	if err := FinalizePartialDownload(savePath); err != nil {
@@ -506,6 +580,7 @@ type snapshotWorkerPools struct {
 	appendVecCopying    *ants.PoolWithFunc
 	indexEntryBuilder   *ants.PoolWithFunc
 	indexEntryCommitter *ants.PoolWithFunc
+	tarBufs             *tarBufPool
 }
 
 // stakeIndexCollector aggregates stake account pubkeys from multiple worker goroutines
@@ -539,13 +614,13 @@ func initWorkerPools(
 	sl *ShardLogger,
 	manifest *SnapshotManifest,
 	incrementalManifest *SnapshotManifest,
-	accountsDbDir string,
-	largestFileId *atomic.Uint64,
+	shardFiles *shardBigFiles,
 	stakeCollector *stakeIndexCollector,
 ) (*snapshotWorkerPools, error) {
 	indexEntryCommitterWorkers := snapshotIndexEntryCommitterWorkers()
 	indexEntryBuilderWorkers := snapshotIndexEntryBuilderWorkers()
 	appendVecCopyingWorkers := snapshotAppendVecCopyingWorkers()
+	tarBufs := newTarBufPool()
 
 	indexEntryCommitterPool, err := ants.NewPoolWithFunc(indexEntryCommitterWorkers, func(i any) {
 		tasks := indexEntryCommitterInProgress.Add(1)
@@ -570,7 +645,8 @@ func initWorkerPools(
 		start := time.Now()
 		defer wg.Done()
 		task := i.(indexEntryBuilderTask)
-		pubkeys, entries, stakeEntries, err := accountsdb.BuildIndexEntriesFromAppendVecs(task.Data, task.FileSize, task.Slot, task.FileId)
+		pubkeys, entries, stakeEntries, err := accountsdb.BuildIndexEntriesFromAppendVecs(task.Data, task.FileSize, task.Slot, task.FileId, task.BaseOffset)
+		tarBufs.put(task.BufRef) // done reading task.Data; recycle the buffer
 		if err != nil {
 			mlog.Log.Errorf("BuildIndexEntriesFromAppendVecs: %v", err)
 			return
@@ -599,40 +675,15 @@ func initWorkerPools(
 		defer wg.Done()
 		task := i.(appendVecCopyingTask)
 		filename := task.Filename
-		writer := task.TarBuffer
+		appendVecBytes := task.Buf
 
-		outFilename := filepath.Join(accountsDbDir, filename)
-
-		// validate that the path doesn't escape accountsDbDir (via '../' sequences)
-		cleanPath := filepath.Clean(outFilename)
-		if !strings.HasPrefix(cleanPath, filepath.Clean(accountsDbDir)+string(os.PathSeparator)) {
-			panic(fmt.Sprintf("invalid path in tar archive: %s", filename))
-		}
-
-		appendVecBytes := writer.Bytes()
-		err := os.WriteFile(cleanPath, appendVecBytes, 0644)
-		if err != nil {
-			mlog.Log.Errorf("err writing new file=%s: %v", cleanPath, err)
-			appendVecCopyingInProgress.Add(-1)
-			return
-		}
-
-		var slot, fileId uint64
-		if n, err := fmt.Sscanf(filepath.Base(filename), "%d.%d", &slot, &fileId); n != 2 || err != nil {
+		// origFileId is the snapshot's id, used only to look up the valid data
+		// length in the manifest
+		var slot, origFileId uint64
+		if n, err := fmt.Sscanf(filepath.Base(filename), "%d.%d", &slot, &origFileId); n != 2 || err != nil {
 			panic(fmt.Sprintf(
 				"failed to parse slot and file from filename=%s basename=%s; parsed n=%d arguments (expected 2) and had err=%v",
 				filename, filepath.Base(filename), n, err))
-		}
-
-		for {
-			prevLargestFileId := largestFileId.Load()
-			if fileId <= prevLargestFileId {
-				break
-			}
-			swapped := largestFileId.CompareAndSwap(prevLargestFileId, fileId)
-			if swapped {
-				break
-			}
 		}
 
 		// find the relevant appendvec storage info. use the info from the incremental
@@ -644,7 +695,7 @@ func initWorkerPools(
 				panic("tried to process incremental snapshot without having parsed incremental snapshot manifest first!")
 			}
 			for _, av := range incrementalManifest.AccountsDb.Storages[slot].AcctVecs {
-				if av.Id == fileId {
+				if av.Id == origFileId {
 					fileSize = av.FileSize
 					usedIncrementalSnapshotVal = true
 					break
@@ -654,7 +705,7 @@ func initWorkerPools(
 
 		if !usedIncrementalSnapshotVal {
 			for _, av := range manifest.AccountsDb.Storages[slot].AcctVecs {
-				if av.Id == fileId {
+				if av.Id == origFileId {
 					fileSize = av.FileSize
 					break
 				}
@@ -664,9 +715,20 @@ func initWorkerPools(
 		if fileSize == 0 {
 			panic("programming error - fileSize for appendvec was 0")
 		}
+		if uint64(len(appendVecBytes)) < fileSize {
+			panic(fmt.Sprintf("appendvec blob (%d bytes) shorter than manifest fileSize (%d)", len(appendVecBytes), fileSize))
+		}
+
+		fileId, base, err := shardFiles.write(appendVecBytes[:fileSize])
+		if err != nil {
+			mlog.Log.Errorf("err writing appendvec to shard big file: %v", err)
+			appendVecCopyingInProgress.Add(-1)
+			tarBufs.put(task.BufRef)
+			return
+		}
 
 		appendVecCopyingInProgress.Add(-1)
-		nextTask := indexEntryBuilderTask{Data: appendVecBytes, FileSize: fileSize, Slot: slot, FileId: fileId}
+		nextTask := indexEntryBuilderTask{Data: appendVecBytes, FileSize: fileSize, Slot: slot, FileId: fileId, BaseOffset: base, BufRef: task.BufRef}
 		wg.Add(1)
 		statsd.Timing(statsd.TasksAppendVecCopyingLatency, uint64(time.Since(start)), nil)
 		err = indexEntryBuilderPool.Invoke(nextTask)
@@ -679,9 +741,10 @@ func initWorkerPools(
 	}
 
 	return &snapshotWorkerPools{
-		appendVecCopyingPool,
-		indexEntryBuilderPool,
-		indexEntryCommitterPool,
+		appendVecCopying:    appendVecCopyingPool,
+		indexEntryBuilder:   indexEntryBuilderPool,
+		indexEntryCommitter: indexEntryCommitterPool,
+		tarBufs:             tarBufs,
 	}, nil
 }
 
