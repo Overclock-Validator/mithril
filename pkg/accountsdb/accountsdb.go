@@ -29,7 +29,8 @@ import (
 type AccountsDb struct {
 	Index            *pebble.DB
 	BankHashStore    *pebble.DB
-	AcctsDir         string
+	AcctsDir         string // primary shard's accounts dir; its parent is the metadata dir
+	Shards           *Shards
 	LargestFileId    atomic.Uint64
 	VoteAcctCache    otter.Cache[solana.PublicKey, *accounts.Account]
 	CommonAcctsCache otter.Cache[solana.PublicKey, *accounts.Account]
@@ -137,32 +138,46 @@ func NewAccountsIndexPebbleOptions(logger pebble.Logger) *pebble.Options {
 }
 
 func OpenDb(accountsDbDir string) (*AccountsDb, error) {
-	// check for existence of the 'accounts' directory, which holds the appendvecs
-	appendVecsDir := fmt.Sprintf("%s/accounts", accountsDbDir)
-	_, err := os.Stat(appendVecsDir)
+	return OpenDbPaths([]string{accountsDbDir})
+}
+
+func OpenDbPaths(accountsPaths []string) (*AccountsDb, error) {
+	if len(accountsPaths) == 0 {
+		return nil, fmt.Errorf("OpenDb: no accounts paths configured")
+	}
+	// The first path holds all metadata (index, manifest, state); every path
+	// holds an "accounts" dir with that disk's shard data.
+	accountsDbDir := accountsPaths[0]
+
+	// num_shards records the shard count the DB was built with.
+	b, err := os.ReadFile(filepath.Join(accountsDbDir, "num_shards"))
+	legacy := os.IsNotExist(err) && len(accountsPaths) == 1
+	if legacy {
+		b = make([]byte, 8)
+		binary.LittleEndian.PutUint64(b, 1)
+		err = nil
+	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("reading num_shards: %w", err)
+	}
+	if len(b) != 8 {
+		return nil, fmt.Errorf("num_shards: expected 8 bytes, got %d", len(b))
+	}
+	numShards := int(binary.LittleEndian.Uint64(b))
+	if numShards != len(accountsPaths) {
+		return nil, fmt.Errorf("configured %d accounts dir(s) but AccountsDB was built with %d shard(s); rebuild required", len(accountsPaths), numShards)
 	}
 
-	// attempt to open largest_file_id file
-	largestFileIdFn := fmt.Sprintf("%s/largest_file_id", accountsDbDir)
-	lfi, err := os.Open(largestFileIdFn)
-	if err != nil {
-		mlog.Log.Infof("failed to open %s\n", largestFileIdFn)
-		return nil, err
+	shardDirs := make([]string, len(accountsPaths))
+	for i, p := range accountsPaths {
+		shardDirs[i] = filepath.Join(p, "accounts")
 	}
 
-	largestFileIdBytes := make([]byte, 8)
-	bytesRead, err := lfi.Read(largestFileIdBytes)
-	if err != nil {
-		mlog.Log.Infof("error reading %s: %s\n", largestFileIdFn, err)
+	// check for existence of the primary 'accounts' directory, which holds the appendvecs
+	appendVecsDir := shardDirs[0]
+	if _, err := os.Stat(appendVecsDir); err != nil {
 		return nil, err
-	} else if bytesRead != 8 {
-		mlog.Log.Infof("error reading %s: expected 8 bytes, got %d\n", largestFileIdFn, bytesRead)
-		return nil, fmt.Errorf("only got %d bytes", bytesRead)
 	}
-
-	largestFileId := binary.LittleEndian.Uint64(largestFileIdBytes)
 
 	indexDir := filepath.Join(accountsDbDir, "mithril_db")
 	db, err := pebble.Open(indexDir, NewAccountsIndexPebbleOptions(silentLogger{}))
@@ -178,7 +193,16 @@ func OpenDb(accountsDbDir string) (*AccountsDb, error) {
 
 	accountsDb := &AccountsDb{
 		IndexWALDisabled: DisableIndexWAL, Index: db, BankHashStore: bankhashDb, AcctsDir: appendVecsDir}
-	accountsDb.LargestFileId.Store(largestFileId)
+	if !legacy {
+		accountsDb.Shards = newShards(shardDirs)
+	}
+	largestBytes, err := os.ReadFile(filepath.Join(accountsDbDir, "largest_file_id"))
+	if err != nil || len(largestBytes) != 8 {
+		bankhashDb.Close()
+		db.Close()
+		return nil, fmt.Errorf("reading largest_file_id: expected 8 bytes: %v", err)
+	}
+	accountsDb.LargestFileId.Store(binary.LittleEndian.Uint64(largestBytes))
 
 	accountsDb.inProgressStoreRequests = list.New()
 	accountsDb.storeRequestChan = make(chan *list.Element)
@@ -579,7 +603,7 @@ func (accountsDb *AccountsDb) readIndexedAccount(pubkey solana.PublicKey) (*acco
 		return nil, fmt.Errorf("unmarshal index entry: %w", err)
 	}
 
-	appendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, acctIdxEntry.Slot, acctIdxEntry.FileId)
+	appendVecFileName := accountsDb.appendVecPath(acctIdxEntry.Slot, acctIdxEntry.FileId)
 
 	appendVecFile, err := os.Open(appendVecFileName)
 	if err != nil {
@@ -746,8 +770,8 @@ func (accountsDb *AccountsDb) storeWorker() {
 }
 
 func (accountsDb *AccountsDb) storeAccountsInternal(accts []*accounts.Account, slot uint64) {
-	fileId := accountsDb.LargestFileId.Add(1)
-	appendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, slot, fileId)
+	fileId := accountsDb.nextFileId(accountsDb.chooseShard())
+	appendVecFileName := accountsDb.appendVecPath(slot, fileId)
 	appendVecFile, err := os.OpenFile(appendVecFileName, os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
 		//mlog.Log.Debugf("unable to open appendvec file %s for writing to accountsdb", appendVecFileName)
@@ -784,7 +808,7 @@ func (accountsDb *AccountsDb) storeAccountsInternal(accts []*accounts.Account, s
 			}
 			c.Close()
 
-			existingAppendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, acctIdxEntry.Slot, acctIdxEntry.FileId)
+			existingAppendVecFileName := accountsDb.appendVecPath(acctIdxEntry.Slot, acctIdxEntry.FileId)
 			existingAppendVecFile, err := os.OpenFile(existingAppendVecFileName, os.O_RDWR, 0666)
 			if err != nil {
 				panic(err)
@@ -886,7 +910,7 @@ func (accountsDb *AccountsDb) parallelStoreAccounts(n int, accts []*accounts.Acc
 						return fmt.Errorf("unmarshaling index entry: %w", err)
 					}
 
-					existingAppendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, existingIdxEntry.Slot, existingIdxEntry.FileId)
+					existingAppendVecFileName := accountsDb.appendVecPath(existingIdxEntry.Slot, existingIdxEntry.FileId)
 					existingAppendVecFile, err := os.OpenFile(existingAppendVecFileName, os.O_RDWR, 0666)
 					if err != nil {
 						return fmt.Errorf("open %s: %w", existingAppendVecFileName, err)
@@ -931,8 +955,8 @@ func (accountsDb *AccountsDb) parallelStoreAccounts(n int, accts []*accounts.Acc
 	}
 	newAppendVecGroup := errgroup.Group{}
 	newAppendVecGroup.Go(func() error {
-		fileId := accountsDb.LargestFileId.Add(1)
-		appendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, slot, fileId)
+		fileId := accountsDb.nextFileId(accountsDb.chooseShard())
+		appendVecFileName := accountsDb.appendVecPath(slot, fileId)
 		appendVecFile, err := os.OpenFile(appendVecFileName, os.O_RDWR|os.O_CREATE, 0666)
 		if err != nil {
 			return err

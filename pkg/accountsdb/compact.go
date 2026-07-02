@@ -268,7 +268,7 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 		return false, 0, err
 	}
 
-	pubkeys, idxEntries, _, err := BuildIndexEntriesFromAppendVecs(data, uint64(len(data)), c.slot, c.fileId)
+	pubkeys, idxEntries, _, err := BuildIndexEntriesFromAppendVecs(data, uint64(len(data)), c.slot, c.fileId, 0)
 	if err != nil {
 		return false, 0, err
 	}
@@ -317,7 +317,7 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 
 	// Allocate the output fileId, persisting the high-water mark before the
 	// first data byte (I7 — a crash must never lead to fileId reuse).
-	newFileId := db.LargestFileId.Add(1)
+	newFileId := db.nextFileId(0)
 	if err := db.persistLargestFileId(); err != nil {
 		return false, 0, err
 	}

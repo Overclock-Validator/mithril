@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
@@ -51,22 +50,24 @@ func TestSnapshotWorkerParseFailurePropagatesAfterDrain(t *testing.T) {
 	manifest.AccountsDb.Storages = map[uint64]SlotAcctVecs{
 		slot: {Slot: slot, AcctVecs: []AcctVec{{Id: fileID, FileSize: uint64(len(malformed))}}},
 	}
+	shardFiles, err := openShardBigFiles([]string{filepath.Join(accountsDir, "accounts")})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, shardFiles.close()) })
 	wg := &sync.WaitGroup{}
 	pools, err := initWorkerPools(
 		wg,
 		shardLogger,
 		manifest,
 		nil,
-		accountsDir,
-		&atomic.Uint64{},
+		shardFiles,
 		&stakeIndexCollector{},
 	)
 	require.NoError(t, err)
 	t.Cleanup(pools.Release)
 
 	err = invokeSnapshotTask(wg, pools.appendVecCopying, appendVecCopyingTask{
-		Filename:  "accounts/20.21",
-		TarBuffer: bytes.NewBuffer(malformed),
+		Filename: "accounts/20.21",
+		Buf:      malformed,
 	})
 	require.NoError(t, err)
 	require.ErrorContains(t, waitForSnapshotWorkers(wg, pools), "truncated appendvec account data")

@@ -94,6 +94,18 @@ name = "mithril"
     # Put this on your fastest NVMe due to heavy random I/O.
     accounts = "/mnt/mithril-accounts"
 
+    # For multi-disk setups, accounts may instead be a list of directories, one
+    # per physical disk. The snapshot unpack shards append-vecs across them so
+    # aggregate write throughput approaches the sum of the disks. The first entry
+    # also holds the shared metadata (account index, manifest, state); the others
+    # hold only their disk's shard of the account data. The number of directories
+    # is fixed at build time - changing it requires rebuilding the AccountsDB.
+    #   accounts = [
+    #       "/mnt/nvme0/mithril-accounts",  # primary: metadata + shard 0
+    #       "/mnt/nvme1/mithril-accounts",  # shard 1
+    #       "/mnt/nvme2/mithril-accounts",  # shard 2
+    #   ]
+
     # Fold batch size K: rooted (finalized+verified) slots fold to disk K at a
     # time as ONE union-deduped sequential segment with ONE fsync. Larger K =
     # fewer, larger writes (less NVMe wear: hot accounts written once per K
@@ -517,6 +529,14 @@ name = "mithril"
 
     # Bound for number of index shards to convert to SSTs at once.
     max_concurrent_flushers = 8
+
+    # Write the snapshot append-vec big files with O_DIRECT, bypassing the OS page
+    # cache. On a ~460GB unpack the buffered path churns hundreds of GB of dirty
+    # pages, which evicts the zstd-decode working set; O_DIRECT avoids that and
+    # gives a modest (~6%) unpack speedup that grows on low-RAM boxes. Off by
+    # default (buffered is the safe choice). Requires a filesystem that supports
+    # O_DIRECT (ext4/xfs; not tmpfs).
+    # snapshot_directio = false
 
     # Size in MB for serialized parameter arena (0 to disable)
     param_arena_size_mb = 512
