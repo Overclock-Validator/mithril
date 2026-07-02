@@ -100,7 +100,10 @@ func WriteStakePubkeyIndex(path string, entries []StakeIndexEntry) error {
 // - pubkeys: all account pubkeys
 // - acctIdxEntries: index entries for each account
 // - stakeEntries: stake account pubkeys with their appendvec location hints
-func BuildIndexEntriesFromAppendVecs(data []byte, fileSize uint64, slot uint64, fileId uint64) ([]solana.PublicKey, []AccountIndexEntry, []StakeIndexEntry, error) {
+// baseOffset is added to every account offset so that, when append-vecs are
+// coalesced into a shard's big file, the stored offsets are absolute within that
+// file. Pass 0 for a stand-alone (one-file-per-append-vec) layout.
+func BuildIndexEntriesFromAppendVecs(data []byte, fileSize uint64, slot uint64, fileId uint64, baseOffset uint64) ([]solana.PublicKey, []AccountIndexEntry, []StakeIndexEntry, error) {
 	pubkeys := make([]solana.PublicKey, 0, 20000)
 	acctIdxEntries := make([]AccountIndexEntry, 0, 20000)
 	stakeEntries := make([]StakeIndexEntry, 0, 1000)
@@ -119,6 +122,8 @@ func BuildIndexEntriesFromAppendVecs(data []byte, fileSize uint64, slot uint64, 
 			}
 			return nil, nil, nil, fmt.Errorf("parse appendvec slot=%d file_id=%d: %w", slot, fileId, err)
 		}
+		// make the offset absolute within the (possibly coalesced) big file
+		acctIdxEntries[len(acctIdxEntries)-1].Offset += baseOffset
 		// Collect stake account entries with appendvec location hints
 		if bytes.Equal(owner[:], addresses.StakeProgramAddr[:]) {
 			idx := len(acctIdxEntries) - 1
