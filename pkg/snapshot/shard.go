@@ -10,7 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"slices"
+	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -31,20 +31,12 @@ type shardRequest struct {
 	v accountsdb.AccountIndexEntry
 }
 
-// ShardProgressCallback is called with (bytesDone, totalBytes) to report shard flush progress
-type ShardProgressCallback func(bytesDone, totalBytes int64)
-
 // ShardLogger manages multiple sharded log files
 type ShardLogger struct {
 	shards     []*shard
 	filePrefix string
 	wg         *sync.WaitGroup
 	flushSem   *semaphore.Weighted
-
-	// Progress tracking
-	totalBytes atomic.Int64 // total bytes written to shard logs
-	bytesDone  atomic.Int64 // bytes flushed to cache
-	onProgress ShardProgressCallback
 
 	// closed flag to prevent sends after Close is called (defensive)
 	closed atomic.Bool
@@ -57,7 +49,6 @@ type shard struct {
 	file     *os.File
 	requests chan shardRequest
 	logSize  int
-	flushSem *semaphore.Weighted
 	parent   *ShardLogger // parent for progress reporting
 }
 
@@ -81,31 +72,15 @@ func NewShardLogger(numShards int, filePrefix string) *ShardLogger {
 
 	sl.wg.Add(numShards)
 	for i := range numShards {
-		sl.shards[i] = newShard(i, filePrefix, sl.flushSem, sl)
+		sl.shards[i] = newShard(i, filePrefix, sl)
 		go sl.shards[i].processRequests(sl.wg)
 	}
 
 	return sl
 }
 
-// SetProgressCallback sets a callback to receive progress updates during shard flushes.
-// The callback receives (bytesDone, totalBytes) and is called as bytes are flushed to cache.
-func (sl *ShardLogger) SetProgressCallback(cb ShardProgressCallback) {
-	sl.onProgress = cb
-}
-
-// TotalBytes returns the total bytes written to shard logs
-func (sl *ShardLogger) TotalBytes() int64 {
-	return sl.totalBytes.Load()
-}
-
-// BytesDone returns the bytes that have been flushed to cache
-func (sl *ShardLogger) BytesDone() int64 {
-	return sl.bytesDone.Load()
-}
-
 // newShard creates a new shard with the given ID
-func newShard(id int, filePrefix string, flushSem *semaphore.Weighted, parent *ShardLogger) *shard {
+func newShard(id int, filePrefix string, parent *ShardLogger) *shard {
 	filename := filepath.Join(filePrefix, fmt.Sprintf("%03d", id))
 	file, err := os.Create(filename)
 	if err != nil {
@@ -117,7 +92,6 @@ func newShard(id int, filePrefix string, flushSem *semaphore.Weighted, parent *S
 		writer:   bufio.NewWriter(file),
 		file:     file,
 		requests: make(chan shardRequest, 100),
-		flushSem: flushSem,
 		parent:   parent,
 	}
 
@@ -136,105 +110,78 @@ func (s *shard) processRequests(wg *sync.WaitGroup) {
 		s.writer.Write(kBytes[:])
 		req.v.Marshal(&vBytes)
 		s.writer.Write(vBytes[:24])
-
-		bytesWritten := int64(len(req.k) + vlen)
-		s.logSize += int(bytesWritten)
-
-		// Track total bytes for progress reporting and notify callback
-		if s.parent != nil {
-			total := s.parent.totalBytes.Add(bytesWritten)
-			if s.parent.onProgress != nil {
-				// Notify with bytesDone=0 during streaming (before flush)
-				// The callback can use totalBytes to show indexing progress
-				s.parent.onProgress(0, total)
-			}
-		}
+		s.logSize += len(req.k) + vlen
 	}
 }
 
-func (s *shard) logToSST(ctx context.Context) error {
-	err := s.flushSem.Acquire(ctx, 1)
-	if err != nil {
-		return fmt.Errorf("acquiring flush semaphore: %w", err)
-	}
-	defer s.flushSem.Release(1)
-	// Close/flush
+const recordSize = 32 + vlen
+
+// readLog flushes and closes the shard's log, then reads it fully back into a
+// pairs slice.
+func (s *shard) readLog() ([]shardRequest, error) {
 	if err := s.writer.Flush(); err != nil {
-		return fmt.Errorf("failed to flush writer: %w", err)
+		return nil, fmt.Errorf("failed to flush writer: %w", err)
 	}
 	filename := s.file.Name()
 	if err := s.file.Close(); err != nil {
-		return fmt.Errorf("failed to close file: %w", err)
+		return nil, fmt.Errorf("failed to close file: %w", err)
 	}
 
-	// Read contents from log
 	file, err := os.Open(filename)
 	if err != nil {
-		return fmt.Errorf("failed to reopen file for reading: %w", err)
+		return nil, fmt.Errorf("failed to reopen file for reading: %w", err)
 	}
 	defer file.Close()
 	fileInfo, err := file.Stat()
 	if err != nil {
-		return fmt.Errorf("stat %s: %w", filename, err)
+		return nil, fmt.Errorf("stat %s: %w", filename, err)
 	}
 	size := fileInfo.Size()
 
-	const recordSize = int64(32 + vlen)
 	if rem := size % recordSize; rem != 0 {
-		return fmt.Errorf("filename=%s had (size=%d) %% (recordSize=%d) = %d", filename, size, recordSize, rem)
+		return nil, fmt.Errorf("filename=%s had (size=%d) %% (recordSize=%d) = %d", filename, size, recordSize, rem)
 	}
-	i := 0
 	pairs := make([]shardRequest, size/recordSize)
 
 	reader := bufio.NewReader(file)
-	var buf [32 + vlen]byte
-	for {
-		_, err := io.ReadFull(reader, buf[:32+vlen])
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("logToSST read loop: %v", err)
+	var buf [recordSize]byte
+	for i := range pairs {
+		if _, err := io.ReadFull(reader, buf[:]); err != nil {
+			return nil, fmt.Errorf("readLog read loop: %w", err)
 		}
 		pairs[i].k = solana.PublicKey(buf[:32])
 		pairs[i].v.Unmarshal((*[24]byte)(buf[32:56]))
-		i++
-
-		// Track progress
-		if s.parent != nil {
-			done := s.parent.bytesDone.Add(recordSize)
-			if s.parent.onProgress != nil {
-				s.parent.onProgress(done, s.parent.totalBytes.Load())
-			}
-		}
 	}
 
-	// Truncate file and replace file/writer pointers
-	newFile, err := os.Create(filename)
-	if err != nil {
-		return fmt.Errorf("failed to truncate file: %w", err)
+	if err := os.Remove(filename); err != nil {
+		return nil, fmt.Errorf("removing read log %s: %w", filename, err)
 	}
-	s.file = newFile
-	s.writer = bufio.NewWriter(newFile)
-	s.logSize = 0
+	return pairs, nil
+}
 
-	// Sort
-	slices.SortFunc(pairs, func(a, b shardRequest) int {
-		if c := bytes.Compare(a.k[:], b.k[:]); c != 0 {
-			return c
-		}
-		// Make the bigger slot appear first.
-		if a.v.Slot > b.v.Slot {
-			return -1
-		} else if a.v.Slot == b.v.Slot {
-			return 0
-		} else {
-			return 1
-		}
-	})
-	var vBytes [vlen]byte
-	// Write to SST
-	sstFilename := fmt.Sprintf("%s.sst", filename)
+// byKeySlotDesc sorts entries by pubkey ascending, then by slot descending so the
+// first occurrence of each key is its highest slot (which writeSST keeps). It uses
+// sort.Interface (index-based Less) rather than slices.SortFunc so the comparator
+// indexes into the slice instead of receiving 56-byte shardRequest values by copy.
+type byKeySlotDesc []shardRequest
+
+func (p byKeySlotDesc) Len() int      { return len(p) }
+func (p byKeySlotDesc) Swap(i, j int) { p[i], p[j] = p[j], p[i] }
+func (p byKeySlotDesc) Less(i, j int) bool {
+	if c := bytes.Compare(p[i].k[:], p[j].k[:]); c != 0 {
+		return c < 0
+	}
+	return p[i].v.Slot > p[j].v.Slot // bigger slot first
+}
+
+func sortPairs(pairs []shardRequest) {
+	sort.Sort(byKeySlotDesc(pairs))
+}
+
+// writeSST writes the (already sorted) pairs to the shard's SST file, keeping the
+// first entry per key (highest slot) and skipping duplicates.
+func (s *shard) writeSST(pairs []shardRequest) error {
+	sstFilename := fmt.Sprintf("%s.sst", s.file.Name())
 	sstFile, err := vfs.Default.Create(sstFilename)
 	if err != nil {
 		return fmt.Errorf("create %s: %w", sstFilename, err)
@@ -242,18 +189,21 @@ func (s *shard) logToSST(ctx context.Context) error {
 	defer sstFile.Close()
 	w := sstable.NewWriter(objstorageprovider.NewFileWritable(sstFile), sstable.WriterOptions{})
 	defer w.Close()
-	lastWritten := -1
-	for i, kv := range pairs {
-		if lastWritten >= 0 && bytes.Equal(kv.k[:], pairs[lastWritten].k[:]) {
+	var vBytes [vlen]byte
+	var lastKey solana.PublicKey
+	wrote := false
+	for i := range pairs {
+		kv := &pairs[i]
+		if wrote && kv.k == lastKey {
 			continue
 		}
 		kv.v.Marshal(&vBytes)
 		if err := w.Set(kv.k[:], vBytes[:]); err != nil {
 			return fmt.Errorf("writing to SST: %w", err)
 		}
-		lastWritten = i
+		lastKey = kv.k
+		wrote = true
 	}
-
 	return nil
 }
 
@@ -277,8 +227,16 @@ func (sl *ShardLogger) Close(ctx context.Context) error {
 	return sl.CloseWithProgress(ctx, nil)
 }
 
+// flushJob carries a shard and its read-back log buffer through the flush pipeline.
+type flushJob struct {
+	s     *shard
+	pairs []shardRequest
+}
+
 // CloseWithProgress closes all shards with optional progress callback.
 // The callback is called after each shard flush completes with (completed, total) counts.
+//
+// The flush runs as a 3-stage pipeline (read log, sort, write SST).
 func (sl *ShardLogger) CloseWithProgress(ctx context.Context, onProgress func(completed, total int)) error {
 	// Mark as closed before closing channels to prevent late sends
 	sl.closed.Store(true)
@@ -291,15 +249,82 @@ func (sl *ShardLogger) CloseWithProgress(ctx context.Context, onProgress func(co
 	total := len(sl.shards)
 	var completed atomic.Int32
 
-	flushWg := &errgroup.Group{}
+	// Channels are sized to hold every shard, so a job never blocks on send and the
+	// only thing bounding in-flight memory is the flushSem buffer-slot semaphore.
+	sortCh := make(chan flushJob, total)
+	writeCh := make(chan flushJob, total)
+
+	g, gctx := errgroup.WithContext(ctx)
+
+	// Read stage: a shard buffer is only allocated once a slot is free.
+	shardCh := make(chan *shard, total)
 	for _, s := range sl.shards {
-		flushWg.Go(func() error {
-			err := s.logToSST(ctx)
-			if onProgress != nil {
-				onProgress(int(completed.Add(1)), total)
+		shardCh <- s
+	}
+	close(shardCh)
+
+	ioWorkers := snapshotMaxConcurrentFlushers()
+	var readWg sync.WaitGroup
+	for range ioWorkers {
+		readWg.Add(1)
+		g.Go(func() error {
+			defer readWg.Done()
+			for s := range shardCh {
+				if err := sl.flushSem.Acquire(gctx, 1); err != nil {
+					return err
+				}
+				pairs, err := s.readLog()
+				if err != nil {
+					sl.flushSem.Release(1)
+					return err
+				}
+				sortCh <- flushJob{s, pairs}
 			}
-			return err
+			return nil
 		})
 	}
-	return flushWg.Wait()
+	go func() {
+		readWg.Wait()
+		close(sortCh)
+	}()
+
+	// Sort stage: CPU-bound. The number of sort workers is tunable (
+	// flush-sort-workers, default NumCPU); the effective concurrency
+	// is still bounded by the live-buffer count (flushSem), so to
+	// sort more shards at once raise max-concurrent-flushers too.
+	var sortWg sync.WaitGroup
+	for range snapshotFlushSortWorkers() {
+		sortWg.Add(1)
+		g.Go(func() error {
+			defer sortWg.Done()
+			for job := range sortCh {
+				sortPairs(job.pairs)
+				writeCh <- job
+			}
+			return nil
+		})
+	}
+	go func() {
+		sortWg.Wait()
+		close(writeCh)
+	}()
+
+	// Write the SST and release the buffer slot.
+	for range ioWorkers {
+		g.Go(func() error {
+			for job := range writeCh {
+				err := job.s.writeSST(job.pairs)
+				sl.flushSem.Release(1)
+				if err != nil {
+					return err
+				}
+				if onProgress != nil {
+					onProgress(int(completed.Add(1)), total)
+				}
+			}
+			return nil
+		})
+	}
+
+	return g.Wait()
 }
