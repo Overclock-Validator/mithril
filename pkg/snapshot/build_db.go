@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,6 +28,8 @@ const (
 	DefaultSnapshotAppendVecCopyingWorkers    = 32
 	DefaultSnapshotIndexShards                = 64
 	DefaultSnapshotMaxConcurrentFlushers      = 8
+	// DefaultSnapshotFlushSortWorkers == 0 means "auto": use runtime.NumCPU().
+	DefaultSnapshotFlushSortWorkers = 0
 	// DefaultSnapshotDirectIO keeps O_DIRECT big-file writes off by default;
 	// buffered is the safe default and O_DIRECT is an opt-in tuning knob.
 	DefaultSnapshotDirectIO = false
@@ -37,6 +40,7 @@ var (
 	SnapshotIndexEntryBuilderWorkers   = DefaultSnapshotIndexEntryBuilderWorkers
 	SnapshotAppendVecCopyingWorkers    = DefaultSnapshotAppendVecCopyingWorkers
 	SnapshotIndexShards                = DefaultSnapshotIndexShards
+	SnapshotFlushSortWorkers           = DefaultSnapshotFlushSortWorkers
 	SnapshotDirectIO                   = DefaultSnapshotDirectIO
 	SnapshotIndexTempDir               string
 )
@@ -230,17 +234,27 @@ func snapshotMaxConcurrentFlushers() int {
 	return positiveOrDefault(MaxConcurrentFlushers, DefaultSnapshotMaxConcurrentFlushers)
 }
 
+// snapshotFlushSortWorkers is how many shard buffers may be sorted concurrently
+// during the index flush. 0 (the default) means auto: one per logical CPU.
+func snapshotFlushSortWorkers() int {
+	if SnapshotFlushSortWorkers > 0 {
+		return SnapshotFlushSortWorkers
+	}
+	return runtime.NumCPU()
+}
+
 func logSnapshotBootstrapTuning() {
 	indexTempDir := SnapshotIndexTempDir
 	if indexTempDir == "" {
 		indexTempDir = "(accountsdb)"
 	}
-	mlog.Log.Infof("Snapshot bootstrap tuning: append_vec_workers=%d index_builder_workers=%d index_committer_workers=%d index_shards=%d max_concurrent_flushers=%d directio=%v zstd_decoder_concurrency=%d index_temp_dir=%s",
+	mlog.Log.Infof("Snapshot bootstrap tuning: append_vec_workers=%d index_builder_workers=%d index_committer_workers=%d index_shards=%d max_concurrent_flushers=%d flush_sort_workers=%d directio=%v zstd_decoder_concurrency=%d index_temp_dir=%s",
 		snapshotAppendVecCopyingWorkers(),
 		snapshotIndexEntryBuilderWorkers(),
 		snapshotIndexEntryCommitterWorkers(),
 		snapshotIndexShards(),
 		snapshotMaxConcurrentFlushers(),
+		snapshotFlushSortWorkers(),
 		SnapshotDirectIO,
 		ZstdDecoderConcurrency,
 		indexTempDir)
