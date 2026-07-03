@@ -229,6 +229,7 @@ func init() {
 	Run.Flags().Uint64Var(&borrowedAccountArenaSize, "borrowed-account-arena-size", 1024, "Number of borrowed accounts to preallocate in arena (0 to disable)")
 	Run.Flags().IntVar(&snapshot.ZstdDecoderConcurrency, "zstd-decoder-concurrency", runtime.NumCPU(), "Zstd decoder concurrency")
 	Run.Flags().IntVar(&snapshot.MaxConcurrentFlushers, "max-concurrent-flushers", snapshot.DefaultSnapshotMaxConcurrentFlushers, "Bound for number of log shards to flush to Accounts DB Index at once")
+	Run.Flags().IntVar(&snapshot.SnapshotFlushSortWorkers, "flush-sort-workers", snapshot.DefaultSnapshotFlushSortWorkers, "Snapshot index-flush concurrent sort workers (0 = one per CPU)")
 	Run.Flags().BoolVar(&snapshot.SnapshotDirectIO, "snapshot-directio", snapshot.DefaultSnapshotDirectIO, "Write snapshot big files with O_DIRECT (bypasses the page cache; helps decode throughput on low-RAM boxes)")
 	Run.Flags().IntVar(&snapshot.SnapshotAppendVecCopyingWorkers, "snapshot-append-vec-workers", snapshot.DefaultSnapshotAppendVecCopyingWorkers, "Snapshot bootstrap appendvec write workers")
 	Run.Flags().IntVar(&snapshot.SnapshotIndexEntryBuilderWorkers, "snapshot-index-builder-workers", snapshot.DefaultSnapshotIndexEntryBuilderWorkers, "Snapshot bootstrap account-index parser workers")
@@ -683,6 +684,7 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 
 	snapshot.ZstdDecoderConcurrency = getInt("zstd-decoder-concurrency", "tuning.zstd_decoder_concurrency")
 	snapshot.MaxConcurrentFlushers = getInt("max-concurrent-flushers", "tuning.max_concurrent_flushers")
+	snapshot.SnapshotFlushSortWorkers = getInt("flush-sort-workers", "tuning.flush_sort_workers")
 	snapshot.SnapshotDirectIO = getBool("snapshot-directio", "tuning.snapshot_directio")
 	snapshot.SnapshotAppendVecCopyingWorkers = getInt("snapshot-append-vec-workers", "tuning.snapshot_append_vec_workers")
 	snapshot.SnapshotIndexEntryBuilderWorkers = getInt("snapshot-index-builder-workers", "tuning.snapshot_index_builder_workers")
