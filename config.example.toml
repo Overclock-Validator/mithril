@@ -530,6 +530,10 @@ name = "mithril"
     # Bound for number of index shards to convert to SSTs at once.
     max_concurrent_flushers = 8
 
+    # Concurrent sort workers used during the index flush.
+    # 0 (default) = one per CPU.
+    # flush_sort_workers = 0
+
     # Write the snapshot append-vec big files with O_DIRECT, bypassing the OS page
     # cache. On a ~460GB unpack the buffered path churns hundreds of GB of dirty
     # pages, which evicts the zstd-decode working set; O_DIRECT avoids that and
