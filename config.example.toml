@@ -8,6 +8,31 @@
 #   3. Run: mithril run --config config.toml
 #
 # Everything else has sensible defaults.
+#
+# ----------------------------------------------------------------------------
+# Alpenglow turbine node — the settings that matter for a live deployment.
+# Each has a --flag equivalent; a config file replaces the long CLI. Setting
+# them here is the same as running:
+#
+#   mithril run --config config.toml
+#
+# instead of passing --cluster / --block-source / --turbine-bind-addr /
+# --turbine-gossip-entrypoint / --alpenglow-observer-bind-addr /
+# --identity-keypair / --rpc on the command line.
+#
+#   [network]   cluster = "alpenglow"   +   rpc = ["https://your-rpc"]
+#   [block]     source  = "turbine"     +   turbine_bind_addr = "0.0.0.0:8001"
+#   [turbine]   gossip_entrypoint = "<cluster gossip host:port>"   (REQUIRED)
+#   [consensus] alpenglow_observer_bind_addr = "0.0.0.0:8010"      (Votor QUIC)
+#   [validator] identity_keypair = "/path/to/validator-keypair.json"
+#
+# NOTE: this build is Alpenglow-only. [consensus].mode selects the node type:
+# "verifying" (default; non-voting) or "validator" (enforces the full voting
+# deployment shape — identity + vote-account keypairs, turbine + gossip
+# entrypoint, Votor QUIC listener — but the voting engine has not landed yet,
+# so it runs verify-only and casts NO votes). Both share the same fork choice.
+# Generate a per-type starter config: mithril config init [--validator]
+# ----------------------------------------------------------------------------
 
 # ============================================================================
 # GENERAL SETTINGS
@@ -71,6 +96,39 @@ name = "mithril"
     # Put this on your fastest NVMe due to heavy random I/O.
     accounts = "/mnt/mithril-accounts"
 
+    # Fold batch size K: rooted (finalized+verified) slots fold to disk K at a
+    # time as ONE union-deduped sequential segment with ONE fsync. Larger K =
+    # fewer, larger writes (less NVMe wear: hot accounts written once per K
+    # slots instead of once per slot) but more RAM for the unrooted tail and a
+    # longer bounded re-execution window after a hard crash. Range 32..512.
+    fold_batch_slots = 128
+
+    # Account-index Pebble WAL. Set false to remove the WAL write stream
+    # entirely: fold manifests then serve as the index redo log and recovery
+    # replays them. Keep true until the deployment has soaked.
+    index_wal = true
+
+    # Rewind horizon: how many fold batches of undo pointers stay actionable.
+    # Within the horizon, --rewind-to-slot (or the automatic late-divergence
+    # recovery) can restore durable state to any retained fold boundary without
+    # re-bootstrapping from a snapshot. Also pins those batches' files against
+    # compaction. At K=128 slots/batch, 64 batches =~ 55 minutes of chain.
+    rewind_horizon_batches = 64
+
+    # Background compaction: reclaims dead bytes from out-of-horizon segments
+    # and bootstrap appendvecs (folds never overwrite, so superseded account
+    # versions accumulate). OFF by default until soaked — each cycle holds the
+    # store's fold lock while it works, so on a latency-sensitive validator keep
+    # the per-cycle budgets small (defaults below) to avoid stalling folds.
+    #[storage.compact]
+    #    enabled = false
+    #    # Move a file's live records only once at least this fraction is dead.
+    #    min_dead_fraction = 0.7
+    #    # Per-cycle caps on live bytes moved / bytes scanned (MiB). Smaller =
+    #    # shorter fold-lock hold per cycle.
+    #    max_move_mb = 64
+    #    max_scan_mb = 256
+
     # Shredstore - Lightbringer stores received shreds here
     # Used for block streaming and potential repair serving.
     shredstore = "/mnt/mithril-ledger/shredstore"
@@ -95,19 +153,21 @@ name = "mithril"
 # probes the primary and restores to it when healthy.
 
 [network]
-    # Solana cluster (required): "mainnet-beta", "testnet", "devnet", or "alpenglow"
-    # This is validated against the RPC's genesis hash to prevent accidentally
-    # running mainnet state against testnet, or vice versa.
-    cluster = "mainnet-beta"
+    # Solana cluster. Defaults to "alpenglow" — the only cluster this build
+    # boots: replay applies Alpenglow clock/feature semantics unconditionally.
+    # "mainnet-beta"/"testnet"/"devnet" currently need a mithril build from the
+    # dev branch (TowerBFT) and will be usable here once those clusters upgrade
+    # to Alpenglow.
+    cluster = "alpenglow"
 
     # RPC endpoints in priority order (first = primary, rest = fallbacks)
     #
     # Example with primary + fallback:
     #   rpc = [
-    #       "https://your-rpc.example.com",        # Primary
-    #       "https://api.mainnet-beta.solana.com"  # Fallback
+    #       "https://your-primary-alpenglow-rpc.example.com",  # Primary
+    #       "https://your-fallback-alpenglow-rpc.example.com"  # Fallback
     #   ]
-    rpc = ["https://api.mainnet-beta.solana.com"]
+    rpc = ["https://alpenglow.rpcpool.com"]
 
 # ============================================================================
 # [block] - Block Source & Streaming
@@ -116,20 +176,32 @@ name = "mithril"
 # Block source configuration. See also [lightbringer] below for sidecar settings.
 
 [block]
-    # Where to stream new blocks from:
-    #   "rpc"          - Fetch blocks via getBlock RPC calls
+    # Where to stream new blocks from (default: "turbine"):
+    #   "turbine"      - Native UDP turbine shred receiver (the LIVE mode, and
+    #                    the DEFAULT). Uses RPC for catchup, hands off to
+    #                    reconstructed shreds near tip. Shreds carry the
+    #                    Alpenglow block ids and footer certificates that gate
+    #                    durable state.
+    #   "rpc"          - Fetch blocks via getBlock RPC calls. CATCH-UP/DEBUG
+    #                    ONLY on Alpenglow: RPC blocks carry no block ids or
+    #                    footer certificates, so near-tip identity cannot be
+    #                    adjudicated and durable folds stall unless certificates
+    #                    arrive via the Votor QUIC listener ([consensus]).
     #   "lightbringer" - Stream via Lightbringer sidecar (see [lightbringer] section)
     #                    Uses RPC for catchup, hands off to live stream near tip.
-    #   "turbine"      - Native UDP turbine shred receiver.
-    #                    Uses RPC for catchup, hands off to reconstructed shreds near tip.
-    source = "rpc"
+    source = "turbine"
 
     # Lightbringer endpoint address (only used when source = "lightbringer")
     # lightbringer_endpoint = "localhost:9000"
 
-    # Native turbine UDP bind address (only used when source = "turbine").
-    # turbine_bind_addr = "0.0.0.0:8001"
-    # Gossip settings for native turbine live under [turbine].
+    # Native turbine UDP bind address — the port this node receives shreds on
+    # (only used when source = "turbine"). Defaults to 0.0.0.0:8001 when unset
+    # (or use the [turbine].bind_addr equivalent). Must be reachable from the
+    # cluster.
+    turbine_bind_addr = "0.0.0.0:8001"
+    # Cluster-join / gossip settings for native turbine live under [turbine];
+    # [turbine].gossip_entrypoint is also required to discover the shred version
+    # and advertise this node into the turbine tree.
 
     # =========================================================================
     # Global Fetch Tuning
@@ -194,40 +266,54 @@ name = "mithril"
 # [validator] - Optional Validator Identity
 # ============================================================================
 #
-# These keys are not used for signing votes in classic or alpenglow-observer
-# mode. The identity keypair is used by native turbine gossip, which is required
-# for staked Alpenglow observer nodes to receive Votor traffic.
+# In verifying mode nothing here is required: the identity keypair, if set, is
+# used by native turbine gossip to advertise this node's turbine/TVU and
+# observer sockets into the cluster (set it so a staked node joins the turbine
+# tree and receives shreds plus Votor traffic).
+#
+# In validator mode ([consensus].mode = "validator") the identity AND
+# vote-account keypairs are REQUIRED — the node refuses to start without them.
+# The authorized withdrawer keypair is NOT needed at runtime: keep it OFFLINE.
 
 [validator]
+    # identity_keypair = "/path/to/validator-keypair.json"
     identity_keypair = ""
+    # vote_account_keypair = "/path/to/vote-account-keypair.json"
     vote_account_keypair = ""
+    # authorized_withdrawer_keypair = "/path/to/authorized-withdrawer-keypair.json"
     authorized_withdrawer_keypair = ""
 
 # ============================================================================
-# [consensus] - Vote-Anchored Consensus
+# [consensus] - Alpenglow Consensus
 # ============================================================================
 #
-# Controls how Mithril uses on-chain vote data to verify block correctness.
-# The fork choice service accumulates vote stake per slot and determines
-# which bank hash has reached 2/3 supermajority.
-#
-# When using Lightbringer as the block source, the consensus coordinator
-# resolves ambiguous slot ranges by finding a valid skip path that chains
-# to the vote-confirmed hash. If no valid path exists, the configured
-# policy determines behavior.
+# This build is Alpenglow-only: blocks execute immediately on receipt, and
+# Alpenglow certificates (block / skip / finalize / conflict) are the source
+# of truth for fork choice and durable-state promotion.
 
 [consensus]
-    # Consensus engine:
-    #   "classic"            - Current Solana vote-anchored consensus checks
-    #   "alpenglow-observer" - Passive Alpenglow observer hooks; no votes are signed
-    #   "alpenglow"          - Reserved for future Alpenglow voting mode
-    mode = "classic"
+    # Node mode:
+    #   "verifying" - DEFAULT. Non-voting: observe, execute, and verify the
+    #                 cluster. Fork choice is identical to validator mode
+    #                 (there is exactly one fork-choice algorithm).
+    #   "validator" - Enforces the full voting-deployment shape at startup:
+    #                 validator.identity_keypair, validator.vote_account_keypair,
+    #                 block.source = "turbine", turbine.gossip_entrypoint, and
+    #                 consensus.alpenglow_observer_bind_addr are all REQUIRED.
+    #                 The voting engine (Votor event loop, BLS vote signing,
+    #                 durable vote history) has NOT landed yet: a validator-mode
+    #                 node runs the same verifying pipeline and casts no votes —
+    #                 select it now so the deployment is provisioned and its
+    #                 config stays valid when voting activates.
+    mode = "verifying"
 
-    # Optional passive Alpenglow Votor QUIC listener for observer mode.
+    # Passive Alpenglow Votor QUIC listener (e.g. "0.0.0.0:8010").
     # Agave advertises this as the gossip "alpenglow" socket and sends
     # wincode ConsensusMessage payloads over Solana QUIC ("solana-tpu" ALPN).
     # When native turbine gossip is enabled, Mithril advertises this socket
-    # in CRDS so Alpenglow peers can discover it. Leave empty to disable.
+    # in CRDS so Alpenglow peers can discover it. This is the low-latency cert
+    # feed; leave empty to disable and rely only on footer certs carried in
+    # shreds (durable folds then lag until those arrive).
     alpenglow_observer_bind_addr = ""
     alpenglow_max_message_bytes = 0
 
@@ -236,22 +322,6 @@ name = "mithril"
     # SSWU_RO_NUL_, 3.2.0 uses SSWU_POP_, 3.3.0 uses SSWU_RO_POP_). Empty uses the
     # built-in default. Wrong value = every signature verification fails.
     alpenglow_bls_dst = ""
-
-    # Maximum depth (number of slots) the skip-path solver will explore.
-    # Longer ranges take more memory. 64 covers ~26 seconds of slots.
-    skip_path_max_depth = 64
-
-    # What to do when a Lightbringer slot range cannot be resolved:
-    #   "halt" - Graceful shutdown, write diagnostic artifact (recommended)
-    #   "warn" - Log warning and continue (use only for debugging)
-    unresolved_policy = "halt"
-
-    # Which block source to enforce consensus on:
-    #   "lightbringer" - Only enforce on Lightbringer blocks (RPC blocks are trusted)
-    #   "turbine"      - Only enforce on native turbine blocks
-    #   "stream"       - Enforce on any live shred-stream path
-    #   "all"          - Enforce on all block sources (not yet implemented)
-    enforce_on_source = "stream"
 
 
 # ============================================================================
@@ -262,12 +332,17 @@ name = "mithril"
 # RPC remains configured for catchup, tip polling, and repair/fallback paths.
 
 [turbine]
-    # UDP address where Mithril listens for turbine shreds.
-    # bind_addr = "0.0.0.0:8001"
+    # Solana gossip entrypoint of your Alpenglow cluster (host:port). REQUIRED
+    # for a live turbine deployment: Mithril contacts it to discover the shred
+    # version and to advertise its turbine/TVU + observer sockets into the
+    # turbine tree. Without it the node cannot join the tree and will not
+    # receive shreds. Example:
+    # gossip_entrypoint = "1.2.3.4:9000"
+    gossip_entrypoint = ""
 
-    # Solana gossip entrypoint used to discover the cluster shred version and
-    # advertise Mithril's turbine/TVU socket into the turbine tree.
-    # gossip_entrypoint = "1.2.3.4:8000"
+    # UDP address where Mithril listens for turbine shreds. Equivalent to
+    # [block].turbine_bind_addr; set either one (this key takes precedence).
+    # bind_addr = "0.0.0.0:8001"
 
     # UDP address where Mithril listens for gossip traffic. Leave empty to let
     # the OS choose an available port. Set a fixed port if your firewall/NAT
@@ -561,9 +636,10 @@ name = "mithril"
     # TCP connection timeout for pre-check (milliseconds)
     tcp_timeout_ms = 1000
 
-    # Minimum Solana version required (e.g., "3.0.0", empty = no filter).
-    # Defaults to "3.0.0" on classic clusters and "0.3.0" on alpenglow.
-    # min_node_version = "3.0.0"
+    # Minimum Solana version required (e.g., "0.3.0", empty = no filter).
+    # Defaults to "0.3.0": the Alpenglow test cluster advertises Agave/Votor
+    # node versions in the 0.x series.
+    # min_node_version = "0.3.0"
 
     # Allowed Solana versions (empty = all versions allowed)
     # Example: allowed_node_versions = ["2.2.0", "3.0.0"]
@@ -623,8 +699,39 @@ name = "mithril"
     # Maximum log file size in MB before rotation (0 = no limit)
     max_size_mb = 100
 
-    # Delete log files older than this many days (0 = never delete)
-    max_age_days = 30
+    # Delete log files older than this many days (0 = never delete, the
+    # default). Retention is otherwise bounded by max_size_mb x max_backups.
+    max_age_days = 0
 
     # Maximum number of old log files to keep (0 = unlimited)
     max_backups = 100
+
+# ============================================================================
+# [verifier] - Trailing Execution Verifier
+# ============================================================================
+#
+# Alpenglow certificates attest a block's DATA (block id), never the results
+# of executing it. The trailing verifier is the execution-correctness oracle:
+# it re-derives each executed slot's per-transaction results (fee, status,
+# pre/post balances) from RPC getBlock metadata at finalized commitment and
+# compares them against what replay produced. Durable folds gate on
+# min(certificate finality, verified watermark) — nothing reaches disk
+# unverified. On a confirmed mismatch the node halts and records evidence;
+# restarts refuse to fold past the disputed slot until the evidence is
+# cleared after triage.
+
+[verifier]
+    enabled = true
+
+    # Gate folds on the verified watermark. false = advisory only (folds gate
+    # on certificate finality alone — an execution divergence would reach disk
+    # undetected; use only for debugging).
+    required = true
+
+    # Verify slots this far behind the executed tip (lets the RPC's finalized
+    # view catch up before the first attempt).
+    lag_slots = 32
+
+    # The verifier's own RPC request budget (it never shares the block-fetch
+    # budget). 8 rps is ~3x steady-state block production.
+    max_rps = 8

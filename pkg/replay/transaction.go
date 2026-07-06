@@ -189,7 +189,7 @@ func handleModifiedAccounts(slotCtx *sealevel.SlotCtx, execCtx *sealevel.Executi
 	TxAcctsTouchedBytes.Add(touchedBytes)
 }
 
-func recordStakeDelegation(acct *accounts.Account) {
+func recordStakeDelegation(slot uint64, acct *accounts.Account) {
 	isEmpty := acct.Lamports == 0
 	isUninitialized := true
 
@@ -199,8 +199,10 @@ func recordStakeDelegation(acct *accounts.Account) {
 	}
 
 	if !isEmpty && !isUninitialized {
-		// Enqueue pubkey for index append so StreamStakeAccounts sees new stake accounts
-		global.EnqueuePendingStakePubkey(acct.Key)
+		// Slot-keyed enqueue: the entry reaches the durable index only when
+		// this slot folds; an unwound wrong-fork slot drops it. Scans see it
+		// from RAM meanwhile (StreamStakeAccounts merges pending entries).
+		global.EnqueuePendingStakePubkey(slot, acct.Key)
 	}
 }
 
@@ -245,6 +247,7 @@ func recordStakeAndVoteAccounts(slotCtx *sealevel.SlotCtx, execCtx *sealevel.Exe
 		if acct.Lamports == 0 || acct.Owner != a.VoteProgramAddr {
 			if global.VoteCacheItem(acct.Key) != nil {
 				global.DeleteVoteCacheItem(acct.Key)
+				markVoteStakeDirty(slotCtx.Slot) // global cache mutated — gates in-loop unwind
 			}
 		} else if modifiedVoteAccts {
 			recordVoteTimestampAndSlot(slotCtx, acct)
@@ -252,10 +255,12 @@ func recordStakeAndVoteAccounts(slotCtx *sealevel.SlotCtx, execCtx *sealevel.Exe
 			if wasModified {
 				global.PutVoteCacheItem(acct.Key, newVersionedVoteState)
 			}
+			markVoteStakeDirty(slotCtx.Slot)
 		}
 
 		if acct.Owner == a.StakeProgramAddr {
-			recordStakeDelegation(acct)
+			recordStakeDelegation(slotCtx.Slot, acct)
+			markVoteStakeDirty(slotCtx.Slot)
 		}
 	}
 }
@@ -515,6 +520,22 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 	// Handle transaction errors from the pure function
 	if output.ProcessingResult.TransactionError != nil {
 		txErr := output.ProcessingResult.TransactionError
+		// Trailing-verifier capture (failed tx): fee + status + pre-balances.
+		// Post-balances are never compared for failed txs (mirrors the
+		// RPC-mode checks, which only compare post on success). Capture is a
+		// replay-side observation; the execution context is not modified.
+		if txCaptureActive() && len(tx.Signatures) > 0 {
+			var fee uint64
+			if output.FeeInfo != nil {
+				fee = output.FeeInfo.TotalFee
+			}
+			recordTxExecCapture(slotCtx.Slot, tx.Signatures[0], &txExecRecord{
+				Fee:      fee,
+				Failed:   true,
+				Pre:      output.PreBalances,
+				SkipMask: txComparabilityMask(execCtx, len(output.PreBalances)),
+			})
+		}
 		if dbgOpts.IsDebugTx(tx.Signatures[0]) && execCtx != nil {
 			if logRecorder, ok := execCtx.Log.(*sealevel.LogRecorder); ok {
 				for _, l := range logRecorder.Logs {
@@ -615,6 +636,33 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 	}
 	metrics.GlobalBlockReplay.PostBalanceDivergenceCheck.AddTimingSince(start)
 
+	// Trailing-verifier capture (successful tx): fee + status + pre AND post
+	// balances, with the native/dummy comparability mask. Read-only walk;
+	// the execution context is not modified.
+	if txCaptureActive() && len(tx.Signatures) > 0 {
+		n := len(tx.Message.AccountKeys)
+		post := make([]uint64, n)
+		for count := 0; count < n; count++ {
+			txAcct, aerr := execCtx.TransactionContext.Accounts.GetAccount(uint64(count))
+			if aerr != nil {
+				continue
+			}
+			post[count] = txAcct.Lamports
+			execCtx.TransactionContext.Accounts.Unlock(uint64(count))
+		}
+		var fee uint64
+		if txFeeInfo != nil {
+			fee = txFeeInfo.TotalFee
+		}
+		recordTxExecCapture(slotCtx.Slot, tx.Signatures[0], &txExecRecord{
+			Fee:      fee,
+			Failed:   false,
+			Pre:      output.PreBalances,
+			Post:     post,
+			SkipMask: txComparabilityMask(execCtx, n),
+		})
+	}
+
 	// Apply state changes to slotCtx
 	start = time.Now()
 	writablePubkeys := output.ExecutionResult.WritableAccounts
@@ -629,4 +677,29 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 	metrics.GlobalBlockReplay.TxUpdateAccounts.AddTimingSince(start)
 
 	return txFeeInfo, processTransactionComputeUnits(execCtx), nil
+}
+
+// txComparabilityMask marks account indices the trailing verifier must not
+// compare: native programs (mithril models their account bodies differently)
+// and dummy placeholders for accounts that did not exist. Mirrors the skip
+// rules of the RPC-mode pre/post-balance divergence checks.
+func txComparabilityMask(execCtx *sealevel.ExecutionCtx, numAccts int) []byte {
+	mask := make([]byte, (numAccts+7)/8)
+	if execCtx == nil {
+		for i := range mask {
+			mask[i] = 0xFF
+		}
+		return mask
+	}
+	accts := execCtx.TransactionContext.Accounts.Accounts
+	for i := 0; i < numAccts; i++ {
+		if i >= len(accts) || accts[i] == nil {
+			setMaskBit(mask, i)
+			continue
+		}
+		if isNativeProgram(accts[i].Key) || accts[i].IsDummy {
+			setMaskBit(mask, i)
+		}
+	}
+	return mask
 }

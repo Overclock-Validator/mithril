@@ -103,6 +103,18 @@ func (r *UDPReceiver) ResetSlot(slot uint64) {
 	r.assembler.ResetSlot(slot)
 }
 
+// ShredEdges reports the monotonic shred frontier from the assembler: highest
+// slot with any accepted shred, and highest slot that became full.
+func (r *UDPReceiver) ShredEdges() (latestShredSlot, highestFullSlot uint64) {
+	return r.assembler.ShredEdges()
+}
+
+// ShredObservation reports partial shred arrivals for a slot that never
+// became full (skip observability).
+func (r *UDPReceiver) ShredObservation(slot uint64) (PartialShredObservation, bool) {
+	return r.assembler.ShredObservation(slot)
+}
+
 func (r *UDPReceiver) PrioritizeRepairSlot(slot uint64) {
 	if r == nil || r.assembler == nil {
 		return
@@ -228,7 +240,14 @@ func (r *UDPReceiver) Run(ctx context.Context) error {
 		switch shred.Type {
 		case ShredTypeData:
 			r.dataShreds.Add(1)
-			r.lastDataSlot.Store(shred.Slot)
+			// Monotonic max: out-of-order packets must not move the reported
+			// latest-shred edge backward.
+			for {
+				cur := r.lastDataSlot.Load()
+				if shred.Slot <= cur || r.lastDataSlot.CompareAndSwap(cur, shred.Slot) {
+					break
+				}
+			}
 		case ShredTypeCode:
 			r.codingShreds.Add(1)
 		}
@@ -251,10 +270,11 @@ func (r *UDPReceiver) Run(ctx context.Context) error {
 				continue
 			}
 		}
+		fromRepair := false
 		if r.repairClient != nil {
-			r.repairClient.observeShredResponse(conn, packet, addr, shred)
+			fromRepair = r.repairClient.observeShredResponse(conn, packet, addr, shred)
 		}
-		blk, err := r.assembler.AddShred(shred)
+		blk, err := r.assembler.AddShredFrom(shred, fromRepair)
 		if err != nil {
 			if errors.Is(err, ErrDuplicateShred) {
 				continue

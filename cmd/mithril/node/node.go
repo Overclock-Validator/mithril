@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -67,14 +68,15 @@ var (
 	accountsPath                string
 	scratchDirectory            string
 	rpcEndpoints                []string
-	cluster                     string // "mainnet-beta", "testnet", "devnet"
-	blockSource                 string // "rpc", "lightbringer", or "turbine"
+	cluster                     string // "alpenglow" (the only cluster this build boots)
+	blockSource                 string // "turbine" (default), "rpc", or "lightbringer"
 	lightbringerEndpoint        string
-	blockMaxRPS                 int // Rate limit for block fetching
-	blockMaxInflight            int // Max concurrent block fetch workers
-	blockTipPollIntervalMs      int // Tip poll interval in milliseconds
-	blockTipSafetyMargin        int // Don't fetch within N slots of tip
-	consensusMode               string
+	blockMaxRPS                 int    // Rate limit for block fetching
+	blockMaxInflight            int    // Max concurrent block fetch workers
+	blockTipPollIntervalMs      int    // Tip poll interval in milliseconds
+	blockTipSafetyMargin        int    // Don't fetch within N slots of tip
+	consensusModeFlag           string // raw --consensus-mode value (cobra binding)
+	consensusMode               string // resolved: "verifying" (default) or "validator"
 	alpenglowObserverBindAddr   string
 	alpenglowMaxMessageBytes    int64
 	alpenglowBLSDST             string
@@ -95,6 +97,7 @@ var (
 	logDir         string
 	numReplaySlots int64
 	endSlot        int64
+	rewindToSlot   int64 // --rewind-to-slot: restore durable state to a fold batch boundary at startup
 	pprofPort      int64
 	blockstorePath string
 	txParallelism  int64
@@ -169,10 +172,10 @@ func epochForStateSlot(s *state.MithrilState, slot uint64) uint64 {
 }
 
 // alpenglowAddrForGossip returns the Votor QUIC address to advertise in gossip,
-// or "" when not in observer mode or the bind address has no fixed port.
-func alpenglowAddrForGossip(mode consensusengine.Mode, bindAddr string) string {
+// or "" when the bind address is empty or has no fixed port.
+func alpenglowAddrForGossip(bindAddr string) string {
 	bindAddr = strings.TrimSpace(bindAddr)
-	if mode != consensusengine.ModeAlpenglowObserver || bindAddr == "" {
+	if bindAddr == "" {
 		return ""
 	}
 	_, portRaw, err := net.SplitHostPort(bindAddr)
@@ -273,7 +276,7 @@ func init() {
 
 	// [network] section flags
 	Run.Flags().StringSliceVarP(&rpcEndpoints, "rpc", "r", []string{}, "URL(s) for RPC endpoint(s) - can specify multiple")
-	Run.Flags().StringVar(&cluster, "cluster", "", "Solana cluster: 'mainnet-beta', 'testnet', or 'devnet'")
+	Run.Flags().StringVar(&cluster, "cluster", "alpenglow", "Solana cluster: 'alpenglow' (default; the only cluster this build boots — 'mainnet-beta'/'testnet'/'devnet' need a dev-branch TowerBFT build until they upgrade to Alpenglow)")
 
 	// [rpc] section flags (Mithril's RPC server)
 	Run.Flags().IntVar(&rpcPort, "rpc-port", 0, "RPC server port. Default off.")
@@ -284,8 +287,8 @@ func init() {
 	Run.Flags().Int64VarP(&endSlot, "end-slot", "e", -1, "Block at which to stop replaying, inclusive (-1 = run continuously)")
 
 	// [consensus] section flags
-	Run.Flags().StringVar(&consensusMode, "consensus-mode", string(consensusengine.ModeClassic), "Consensus mode: 'classic', 'alpenglow-observer', or 'alpenglow'")
-	Run.Flags().StringVar(&alpenglowObserverBindAddr, "alpenglow-observer-bind-addr", "", "Passive Alpenglow Votor QUIC listener address for consensus-mode=alpenglow-observer")
+	Run.Flags().StringVar(&consensusModeFlag, "consensus-mode", "verifying", "Node mode: 'verifying' (default; non-voting — observe, execute, and verify) or 'validator' (requires identity + vote-account keypairs, turbine source, gossip entrypoint, and the Votor QUIC listener; voting engine not yet active)")
+	Run.Flags().StringVar(&alpenglowObserverBindAddr, "alpenglow-observer-bind-addr", "", "Passive Alpenglow Votor QUIC listener address")
 	Run.Flags().StringVar(&alpenglowBLSDST, "alpenglow-bls-dst", "", "BLS hash-to-curve DST override (must match cluster's solana-bls version; empty = default)")
 	Run.Flags().Int64Var(&alpenglowMaxMessageBytes, "alpenglow-max-message-bytes", 0, "Maximum Alpenglow Votor QUIC stream payload size (0 = default)")
 	Run.Flags().StringVar(&validatorIdentityKeypair, "identity-keypair", "", "Validator identity keypair for native turbine gossip (Solana keygen JSON)")
@@ -305,6 +308,7 @@ func init() {
 	Run.Flags().BoolVar(&sbpf.UsePool, "use-pool", true, "Disable to allocate fresh slices")
 	Run.Flags().IntVar(&accountsdb.StoreAccountsWorkers, "store-accounts-workers", 128, "Number of workers to write account updates")
 	Run.Flags().IntVar(&accountsdb.ProgramCacheMaxMB, "program-cache-max-mb", accountsdb.DefaultProgramCacheMaxMB, "Maximum approximate SBPF program cache size in MiB")
+	Run.Flags().Int64Var(&rewindToSlot, "rewind-to-slot", 0, "Rewind durable account state to the fold batch boundary at this slot before replaying (must be a retained boundary; run once to list boundaries on mismatch)")
 
 	// [tuning.pprof] section flags
 	Run.Flags().Int64Var(&pprofPort, "pprof-port", -1, "Port to serve HTTP pprof endpoint")
@@ -319,7 +323,7 @@ func init() {
 	Run.Flags().StringVar(&scratchDirectory, "scratch-directory", "/tmp", "Path for downloads (e.g. snapshots) and other temp state")
 
 	// [block] section flags
-	Run.Flags().StringVar(&blockSource, "block-source", "rpc", "Block source: 'rpc', 'lightbringer', or 'turbine'")
+	Run.Flags().StringVar(&blockSource, "block-source", "turbine", "Block source: 'turbine' (default, live), 'rpc' (catch-up/debug), or 'lightbringer'")
 	Run.Flags().StringVar(&lightbringerEndpoint, "lightbringer-endpoint", "", "Address for Lightbringer endpoint (only used when block-source=lightbringer)")
 	Run.Flags().StringVar(&turbineBindAddr, "turbine-bind-addr", "", "UDP address for native turbine shred receiver (only used when block-source=turbine)")
 	Run.Flags().StringVar(&turbineGossipEntrypoint, "turbine-gossip-entrypoint", "", "Solana gossip entrypoint for native turbine tree joining")
@@ -537,17 +541,24 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		rpcEndpoints = getStringSlice("rpc", "rpc.rpc")
 	}
 
-	// Cluster is required for safety (prevents mainnet/testnet mixups)
+	// Cluster is required for safety (prevents mainnet/testnet mixups).
+	// This build is Alpenglow-only: replay applies Alpenglow clock/feature
+	// semantics unconditionally, which would diverge the bankhash on a
+	// TowerBFT cluster. Refuse anything except an Alpenglow cluster.
 	cluster = getString("cluster", "network.cluster")
 	if cluster == "" {
-		return fmt.Errorf("network.cluster is required - set to 'mainnet-beta', 'testnet', 'devnet', or 'alpenglow'")
+		cluster = "alpenglow" // the only cluster this build boots
+		mlog.Log.Infof("network.cluster not set; defaulting to %q", cluster)
 	}
-	// Validate cluster value
-	switch cluster {
-	case "mainnet-beta", "testnet", "devnet", "alpenglow":
-		// Valid
-	default:
-		return fmt.Errorf("invalid network.cluster %q - must be 'mainnet-beta', 'testnet', 'devnet', or 'alpenglow'", cluster)
+	if cluster != "alpenglow" {
+		return fmt.Errorf("network.cluster %q is not supported by this Alpenglow-only build (TowerBFT clusters need a mithril build from the dev branch until they upgrade to Alpenglow)", cluster)
+	}
+
+	// Must be decided before any OpenDb call: with the WAL off, the fold
+	// manifests are the index redo log (recovery replays them).
+	if config.IsSet("storage.index_wal") && !config.GetBool("storage.index_wal") {
+		accountsdb.DisableIndexWAL = true
+		mlog.Log.Warnf("storage.index_wal=false: account index runs without a Pebble WAL; fold manifests serve as the index redo log")
 	}
 
 	// [rpc] section - Mithril's RPC server
@@ -556,16 +567,20 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	// Top-level
 	scratchDirectory = getString("scratch-directory", "scratch_directory")
 
-	// [consensus] mode + [validator] keypairs
-	rawConsensusMode := getString("consensus-mode", "consensus.mode")
-	normalizedConsensusMode, err := consensusengine.NormalizeMode(rawConsensusMode)
-	if err != nil {
-		return err
+	// [consensus] + [validator] keypairs
+	consensusMode = getString("consensus-mode", "consensus.mode")
+	switch consensusMode {
+	case "", "verifying":
+		consensusMode = "verifying"
+	case "validator":
+		// Selectable now so validator deployments (keypairs, sockets, gossip)
+		// are provisioned and validated ahead of the voting engine landing.
+		// Requirements are enforced below once the block/turbine settings are
+		// resolved; until the engine ships the node runs the same verifying
+		// pipeline and casts no votes (warned loudly at startup).
+	default:
+		return fmt.Errorf("unknown consensus.mode %q (valid: \"verifying\", \"validator\")", consensusMode)
 	}
-	if strings.EqualFold(strings.TrimSpace(rawConsensusMode), "legacy") {
-		mlog.Log.Warnf("config: consensus.mode=\"legacy\" is accepted as an alias; prefer \"classic\"")
-	}
-	consensusMode = string(normalizedConsensusMode)
 	alpenglowObserverBindAddr = getString("alpenglow-observer-bind-addr", "consensus.alpenglow_observer_bind_addr")
 	alpenglowMaxMessageBytes = getInt64("alpenglow-max-message-bytes", "consensus.alpenglow_max_message_bytes")
 	alpenglowBLSDST = getString("alpenglow-bls-dst", "consensus.alpenglow_bls_dst")
@@ -575,8 +590,20 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 
 	// [block] section
 	blockSource = getString("block-source", "block.source")
+	blockSourceExplicit := blockSource != "" // operator chose (flag or config) vs defaulted
 	if blockSource == "" {
-		blockSource = "rpc" // default
+		blockSource = "turbine" // default: native turbine is the live Alpenglow source
+	}
+	// RPC is a catch-up/debug source on Alpenglow, not a live one: RPC blocks
+	// carry no Alpenglow block ids or footer certificates, so certificate
+	// gating cannot adjudicate their identity near tip, and durable folds only
+	// advance if certificates arrive some other way (the Votor QUIC listener).
+	if blockSource == "rpc" {
+		if alpenglowObserverBindAddr == "" {
+			mlog.Log.Warnf("block source \"rpc\" with no consensus.alpenglow_observer_bind_addr: no certificate feed exists, so durable folds will NOT advance (fail-closed halt once the in-RAM tail fills); use block source \"turbine\" for live operation")
+		} else {
+			mlog.Log.Warnf("block source \"rpc\" is catch-up/debug only on Alpenglow (RPC blocks carry no block ids or footer certificates); live near-tip operation should use \"turbine\"")
+		}
 	}
 	lightbringerEndpoint = getString("lightbringer-endpoint", "block.lightbringer_endpoint")
 	turbineBindAddr = getString("turbine-bind-addr", "block.turbine_bind_addr")
@@ -628,10 +655,10 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 			return fmt.Errorf("lightbringer.enabled=true but lightbringer.gossip_entrypoint is empty")
 		}
 		// Default block.source to "lightbringer" if not explicitly configured
-		if blockSource == "rpc" && !flagChanged("block-source") {
+		if !blockSourceExplicit {
 			blockSource = "lightbringer"
-		} else if blockSource == "rpc" && flagChanged("block-source") {
-			mlog.Log.Warnf("lightbringer.enabled=true but --block-source=rpc was set explicitly; sidecar will start but will not be used for block delivery")
+		} else if blockSource != "lightbringer" {
+			mlog.Log.Warnf("lightbringer.enabled=true but block source %q was set explicitly; sidecar will start but will not be used for block delivery", blockSource)
 		}
 		// Auto-sync grpc_addr to lightbringer_endpoint
 		if lightbringerEndpoint == "" {
@@ -657,7 +684,8 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		}
 	case "turbine":
 		if turbineBindAddr == "" {
-			return fmt.Errorf("block.source=turbine requires block.turbine_bind_addr or turbine.bind_addr")
+			turbineBindAddr = "0.0.0.0:8001" // documented default shred port
+			mlog.Log.Infof("turbine bind address not set; defaulting to %s", turbineBindAddr)
 		}
 		if turbineShredVersion < 0 || turbineShredVersion > 0xffff {
 			return fmt.Errorf("turbine.shred_version must be between 0 and 65535")
@@ -667,6 +695,34 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		}
 	default:
 		return fmt.Errorf("invalid block.source %q - must be 'rpc', 'lightbringer', or 'turbine'", blockSource)
+	}
+
+	// Validator mode: enforce the deployment shape a voting node needs, even
+	// though the voting engine has not landed yet — operators provision once
+	// and the config stays valid when voting activates.
+	if consensusMode == "validator" {
+		var missing []string
+		if validatorIdentityKeypair == "" {
+			missing = append(missing, "validator.identity_keypair (signs gossip/turbine identity and, later, votes)")
+		}
+		if validatorVoteAccountKeypair == "" {
+			missing = append(missing, "validator.vote_account_keypair (the vote account votes are cast for)")
+		}
+		if blockSource != "turbine" {
+			missing = append(missing, fmt.Sprintf("block.source=turbine (a validator cannot run off %q)", blockSource))
+		}
+		if turbineGossipEntrypoint == "" {
+			missing = append(missing, "turbine.gossip_entrypoint (join the cluster's turbine tree)")
+		}
+		if alpenglowObserverBindAddr == "" {
+			missing = append(missing, "consensus.alpenglow_observer_bind_addr (receive Votor vote/cert traffic)")
+		}
+		if len(missing) > 0 {
+			return fmt.Errorf("consensus.mode=validator requires:\n  - %s", strings.Join(missing, "\n  - "))
+		}
+		// The authorized withdrawer is deliberately NOT required at runtime —
+		// best practice keeps it offline.
+		mlog.Log.Warnf("consensus.mode=validator: the voting engine is not implemented yet in this build — running the verifying pipeline, NO votes will be cast")
 	}
 
 	blockMaxRPS = getInt("block-max-rps", "block.max_rps")
@@ -923,11 +979,12 @@ func runLive(c *cobra.Command, args []string) {
 		logCfg.MaxSizeMB = 100
 	}
 
-	// MaxAgeDays: default 7, but 0 means never delete
+	// MaxAgeDays: default 0 = never delete by age (retention is bounded by
+	// max_size_mb per file x max_backups). Set >0 to also prune by age.
 	if config.IsSet("log.max_age_days") {
 		logCfg.MaxAgeDays = config.GetInt("log.max_age_days")
 	} else {
-		logCfg.MaxAgeDays = 7
+		logCfg.MaxAgeDays = 0
 	}
 
 	// MaxBackups: default 10, but 0 means unlimited
@@ -986,7 +1043,7 @@ func runLive(c *cobra.Command, args []string) {
 	}
 	if validatorIdentityPubkey != "" {
 		mlog.Log.Infof("validator identity configured for native gossip: %s", validatorIdentityPubkey)
-	} else if useTurbine && consensusMode == string(consensusengine.ModeAlpenglowObserver) && alpenglowObserverBindAddr != "" {
+	} else if useTurbine && alpenglowObserverBindAddr != "" {
 		mlog.Log.Warnf("ALPENGLOW observer: no validator.identity_keypair configured; native gossip will use an ephemeral identity and may not receive staked Votor traffic")
 	}
 
@@ -1087,6 +1144,14 @@ func runLive(c *cobra.Command, args []string) {
 	var accountsDb *accountsdb.AccountsDb
 	var manifest *snapshot.SnapshotManifest
 	var mithrilState *state.MithrilState
+
+	// Fold recovery runs once on existing-DB startup, BEFORE
+	// ValidateAgainstBankhashDB, because it restores the index tail and the
+	// NoSync bankhash rows from the manifests — validating first could falsely
+	// condemn a healthy store whose R bankhash row was dropped by a hard kill.
+	// The result is memoized and reused for the state-watermark reconcile below.
+	var foldRecovery accountsdb.RecoveryResult
+	foldRecovered := false
 	// Use configured snapshot directory (storage.snapshots / snapshot.download_path), not scratch
 	snapshotDownloadPath := snapshotDlPath
 
@@ -1189,6 +1254,10 @@ func runLive(c *cobra.Command, args []string) {
 			klog.Fatalf("failed to load manifest: %v", err)
 		}
 		refreshManifestSeedFromManifest(accountsPath, mithrilState, manifest)
+		// Restore the durable fold frontier (index tail + NoSync bankhash rows)
+		// from the manifests before the integrity check reads those rows.
+		foldRecovery = mustRecoverFoldState(accountsDb)
+		foldRecovered = true
 		// Run integrity check if we have a state file (warn only, don't fail - user chose force mode)
 		if hasValidState {
 			if err := mithrilState.ValidateAgainstBankhashDB(accountsDb); err != nil {
@@ -1378,6 +1447,13 @@ func runLive(c *cobra.Command, args []string) {
 			}
 			refreshManifestSeedFromManifest(accountsPath, mithrilState, manifest)
 
+			// Restore the durable fold frontier (index tail + NoSync bankhash
+			// rows) from the manifests BEFORE the integrity check reads those
+			// rows — otherwise a hard kill that dropped a NoSync bankhash row
+			// would falsely condemn a healthy store and force a re-bootstrap.
+			foldRecovery = mustRecoverFoldState(accountsDb)
+			foldRecovered = true
+
 			// Validate state file matches AccountsDB (detect Ctrl+Z / kill -9 corruption)
 			if err := mithrilState.ValidateAgainstBankhashDB(accountsDb); err != nil {
 				mlog.Log.Errorf("INTEGRITY CHECK FAILED: %v", err)
@@ -1497,7 +1573,7 @@ postBootstrap:
 	if mithrilState != nil && mithrilState.LastRootedContext != nil {
 		// Rooted-durable resume: build from the context as of the last rooted slot
 		// (durable), not the Last* fields at the replayed tip (lost in RAM on restart).
-		rs, err := resumeStateFromRootedContext(mithrilState.LastRootedContext, mithrilState.ComputedEpochStakes)
+		rs, err := replay.ResumeStateFromRootedContext(mithrilState.LastRootedContext, mithrilState.ComputedEpochStakes)
 		if err != nil {
 			mlog.Log.Errorf("failed to build rooted-durable resume state: %v; will start fresh from snapshot", err)
 			mithrilState = nil
@@ -1543,7 +1619,7 @@ postBootstrap:
 
 				// Decode blockhash context
 				if mithrilState.LastRecentBlockhashes != nil && len(mithrilState.LastRecentBlockhashes) > 0 {
-					recentBlockhashes := decodeRecentBlockhashes(mithrilState.LastRecentBlockhashes)
+					recentBlockhashes := replay.DecodeRecentBlockhashes(mithrilState.LastRecentBlockhashes)
 					resumeState.RecentBlockhashes = &recentBlockhashes
 
 					if mithrilState.LastEvictedBlockhash != "" {
@@ -1563,7 +1639,7 @@ postBootstrap:
 
 				// Decode SlotHashes context (vote program needs accurate slot→hash mappings)
 				if mithrilState.LastSlotHashes != nil && len(mithrilState.LastSlotHashes) > 0 {
-					slotHashes := decodeSlotHashes(mithrilState.LastSlotHashes)
+					slotHashes := replay.DecodeSlotHashes(mithrilState.LastSlotHashes)
 					resumeState.SlotHashes = &slotHashes
 				}
 
@@ -1606,64 +1682,140 @@ postBootstrap:
 	}
 	accountsDb.InitCaches()
 
-	// Crash-safe durable commit (storage.durable_commit) and rooted-durable mode
-	// (storage.rooted_durable, keeps the store rooted-only, needs durable_commit).
-	accountsDb.DurableCommit = config.GetBool("storage.durable_commit")
-	accountsDb.RootedDurable = config.GetBool("storage.rooted_durable")
-	if accountsDb.RootedDurable && !accountsDb.DurableCommit {
-		klog.Fatalf("storage.rooted_durable requires storage.durable_commit=true (promotion uses the crash-safe commit path)")
+	// Alpenglow-only build: rooted-durable is the ONLY storage mode. Durable
+	// state holds finalized slots exclusively; replayed slots buffer in RAM and
+	// fold to disk in batches (storage.fold_batch_slots) once rooted.
+	if config.IsSet("storage.durable_commit") {
+		klog.Fatalf("storage.durable_commit was removed: batch folds replaced the per-slot redo-log commit path — delete the key (rooted-durable batching is always on)")
 	}
-	accountsDb.ForkAware = config.GetBool("storage.fork_aware")
-	if accountsDb.ForkAware && !accountsDb.RootedDurable {
-		klog.Fatalf("storage.fork_aware requires storage.rooted_durable=true (the branch tree buffers over the rooted-only store)")
+	if config.IsSet("storage.rooted_durable") && !config.GetBool("storage.rooted_durable") {
+		klog.Fatalf("storage.rooted_durable=false is not supported by this build (durable state is rooted-only by design) — delete the key")
 	}
-	if accountsDb.ForkAware && config.GetString("consensus.unresolved_policy") == "warn" {
-		klog.Fatalf("storage.fork_aware requires consensus.unresolved_policy=halt (warn would keep replaying a divergent chain)")
+	accountsDb.RootedDurable = true
+	if config.IsSet("storage.fork_aware") {
+		mlog.Log.Warnf("storage.fork_aware was removed: the working-set suffix engine handles fork switches via unwind+re-execute — delete the key")
 	}
-	if accountsDb.ForkAware && config.GetString("consensus.enforce_on_source") != "all" {
-		klog.Fatalf("storage.fork_aware requires consensus.enforce_on_source=all (promotion folds only vote-verified slots; without it rooting stalls)")
+	// [verifier]: the trailing execution verifier (dual-watermark second leg).
+	vcfg := replay.TrailingVerifierDefaults()
+	if config.IsSet("verifier.enabled") {
+		vcfg.Enabled = config.GetBool("verifier.enabled")
 	}
-	if consensusMode == string(consensusengine.ModeAlpenglowObserver) && !accountsDb.RootedDurable {
-		mlog.Log.Warnf("alpenglow-observer without storage.rooted_durable: every slot is written durably UNGATED — the finality promotion gate and dump-then-repair only protect rooted-durable runs")
+	if config.IsSet("verifier.required") {
+		vcfg.Required = config.GetBool("verifier.required")
+	}
+	if v := config.GetInt("verifier.lag_slots"); v > 0 {
+		vcfg.LagSlots = uint64(v)
+	}
+	if v := config.GetInt("verifier.max_rps"); v > 0 {
+		vcfg.MaxRPS = v
+	}
+	replay.TrailingVerifierCfg = vcfg
+
+	if foldBatch := config.GetInt("storage.fold_batch_slots"); foldBatch > 0 {
+		replay.FoldBatchSlots = min(max(foldBatch, 32), 512)
+		if replay.FoldBatchSlots != foldBatch {
+			mlog.Log.Warnf("storage.fold_batch_slots=%d clamped to %d (allowed range 32..512)", foldBatch, replay.FoldBatchSlots)
+		}
 	}
 
-	// Crash recovery: roll forward any interrupted commit up to the DURABLE
-	// high-water (the last rooted slot in rooted-durable mode). Using the replayed tip
-	// would mishandle redos for the un-durable in-RAM slots above the last rooted slot.
-	if accountsDb.DurableCommit && mithrilState != nil {
-		recovered, rerr := accountsDb.ApplyPendingCommits(mithrilState.DurableHighWater())
+	// [storage] rewind horizon + compaction. The horizon bounds how far back
+	// RewindToBatchBoundary can restore durable state AND pins the files the
+	// compactor must not reclaim (undo-pointer targets stay alive inside it).
+	// Per-cycle work is deliberately small: CompactOnce holds the store's fold
+	// lock for a cycle, so large scan/move budgets could stall fold/promotion/
+	// rewind — keep validator-safe defaults, overridable once soaked.
+	compactCfg := accountsdb.CompactionConfig{
+		RewindHorizonBatches: 64,
+		MaxMoveBytesPerCycle: 64 << 20,  // 64 MiB moved per cycle
+		MaxScanBytesPerCycle: 256 << 20, // 256 MiB scanned per cycle
+	}
+	if v := config.GetInt("storage.rewind_horizon_batches"); v > 0 {
+		compactCfg.RewindHorizonBatches = uint64(v)
+	}
+	if v := config.GetFloat64("storage.compact.min_dead_fraction"); v > 0 {
+		compactCfg.MinDeadFraction = v
+	}
+	if v := config.GetInt("storage.compact.max_move_mb"); v > 0 {
+		compactCfg.MaxMoveBytesPerCycle = int64(v) << 20
+	}
+	if v := config.GetInt("storage.compact.max_scan_mb"); v > 0 {
+		compactCfg.MaxScanBytesPerCycle = int64(v) << 20
+	}
+	// Background compaction is OFF by default until soaked (it holds the store's
+	// fold lock during each cycle); operators opt in via storage.compact.enabled.
+	compactEnabled := false
+	if config.IsSet("storage.compact.enabled") {
+		compactEnabled = config.GetBool("storage.compact.enabled")
+	}
+
+	// Crash recovery reconcile: the durable fold frontier (recovered above from
+	// the store's manifests + index meta — the state file is written only on
+	// graceful shutdown and is stale after a hard kill) is reconciled against
+	// the in-memory state watermark. Fresh-build paths fall through to the
+	// recovery call here, which is a no-op on a store with no manifests.
+	if mithrilState != nil {
+		if !foldRecovered {
+			foldRecovery = mustRecoverFoldState(accountsDb)
+			foldRecovered = true
+		}
+		rec := foldRecovery
+		switch {
+		case rec.RewindInProgress:
+			// An interrupted --rewind-to-slot left parked ".rewound" manifests.
+			// Complete it uniformly — regardless of whether the crash landed before
+			// or after the atomic meta rollback — by rewinding to the highest
+			// retained boundary below the parked suffix, then adopt that boundary.
+			completeInterruptedRewind(accountsDb, mithrilState)
+		case rec.DurableThrough > mithrilState.LastRootedSlot:
+			// Store is ahead of the (stale) state file: adopt the manifest-carried
+			// watermark + resume context.
+			var ctx state.ResumeContext
+			if len(rec.ResumeCtx) == 0 {
+				klog.Fatalf("store is durably folded through slot %d but state file says %d and the fold manifest carries no resume context; re-bootstrap with --bootstrap snapshot",
+					rec.DurableThrough, mithrilState.LastRootedSlot)
+			}
+			if jerr := json.Unmarshal(rec.ResumeCtx, &ctx); jerr != nil {
+				klog.Fatalf("fold manifest resume context for slot %d is unreadable: %v; re-bootstrap with --bootstrap snapshot", rec.DurableThrough, jerr)
+			}
+			mlog.Log.Infof("fold recovery advanced rooted watermark R from %d to %d (manifest-carried context)", mithrilState.LastRootedSlot, rec.DurableThrough)
+			mithrilState.LastRootedSlot = rec.DurableThrough
+			mithrilState.LastRootedBankhash = ctx.Bankhash
+			mithrilState.LastRootedContext = &ctx
+			if mithrilState.LastSlot < rec.DurableThrough {
+				mithrilState.LastSlot = rec.DurableThrough
+			}
+		case rec.DurableThrough < mithrilState.LastRootedSlot:
+			// State file claims MORE durable progress than the store holds: the
+			// disk lost committed writes (or the wrong data dir is mounted).
+			klog.Fatalf("state file shows last_rooted_slot=%d but the store is only durably folded through %d — disk lost committed state; re-bootstrap with --bootstrap snapshot",
+				mithrilState.LastRootedSlot, rec.DurableThrough)
+		}
+	}
+
+	// --rewind-to-slot: operator-directed restore of durable state to a retained
+	// fold batch boundary (e.g. a divergence whose root cause predates the slot
+	// the verifier halted at). Runs after fold recovery so the boundary set is
+	// authoritative; replay then re-executes forward from the boundary.
+	if rewindToSlot > 0 {
+		if mithrilState == nil {
+			klog.Fatalf("--rewind-to-slot=%d: no state file to reconcile (fresh bootstrap has nothing to rewind)", rewindToSlot)
+		}
+		res, rerr := accountsDb.RewindToBatchBoundary(uint64(rewindToSlot))
 		if rerr != nil {
-			klog.Fatalf("durable-commit recovery failed: %v", rerr)
+			points, _ := accountsDb.ListRewindPoints()
+			klog.Fatalf("--rewind-to-slot=%d failed: %v\navailable fold boundaries: %s", rewindToSlot, rerr, formatRewindPoints(points))
 		}
-		for _, s := range recovered {
-			if derr := accountsdb.DeleteRedo(accountsDb.AcctsDir, s); derr != nil {
-				mlog.Log.Errorf("failed to delete recovered redo for slot %d: %v", s, derr)
-			}
+		if err := adoptRewindResult(mithrilState, res); err != nil {
+			klog.Fatalf("--rewind-to-slot=%d: %v; re-bootstrap with --bootstrap snapshot", rewindToSlot, err)
 		}
-		if len(recovered) > 0 {
-			mlog.Log.Infof("durable-commit recovery re-applied %d pending slot(s): %v", len(recovered), recovered)
-			// Rooted-durable: a rolled-forward promotion makes those slots durable,
-			// so advance the rooted watermark to the highest re-applied slot.
-			if accountsDb.RootedDurable {
-				maxR := mithrilState.LastRootedSlot
-				for _, s := range recovered {
-					if s > maxR {
-						maxR = s
-					}
-				}
-				if maxR > mithrilState.LastRootedSlot {
-					mlog.Log.Infof("rooted-durable recovery advanced rooted watermark R from %d to %d", mithrilState.LastRootedSlot, maxR)
-					mithrilState.LastRootedSlot = maxR
-				}
-			}
-		}
+		mlog.Log.Warnf("rewound durable state to fold boundary at slot %d (%d batches / %d keys undone); replay resumes from slot %d",
+			res.NewThrough, res.UndoneBatches, res.UndoneKeys, mithrilState.GetResumeSlot())
 	}
 
-	// Rooted-durable resume requires a context at the last rooted slot matching
-	// LastRootedSlot. If a prior run left state without one (crashed before promotion,
-	// or recovery rolled the last rooted slot forward past it), refuse to resume;
-	// re-bootstrap with --bootstrap snapshot.
-	if accountsDb.RootedDurable && mithrilState != nil && mithrilState.LastSlot > 0 {
+	// Rooted-durable resume needs a context at the last rooted slot. The fold
+	// manifest is the primary source (handled above); the state file is the
+	// fallback for stores from before the first fold.
+	if mithrilState != nil && mithrilState.LastSlot > 0 && mithrilState.LastRootedSlot > 0 {
 		if mithrilState.LastRootedContext == nil || mithrilState.LastRootedContext.Slot != mithrilState.LastRootedSlot {
 			ctxSlot := uint64(0)
 			if mithrilState.LastRootedContext != nil {
@@ -1717,12 +1869,8 @@ postBootstrap:
 		NearTipPollMs:    blockNearTipPollMs,
 		NearTipLookahead: blockNearTipLookahead,
 	}
-	// Build consensus options from config
-	engineMode, err := consensusengine.NormalizeMode(consensusMode)
-	if err != nil {
-		klog.Fatalf("%v", err)
-	}
-	consensusEngine, err := consensusengine.NewEngineWithConfig(engineMode, consensusengine.Config{
+	// Alpenglow-only: the observer engine is the only consensus engine.
+	consensusEngine, err := consensusengine.NewEngine(consensusengine.Config{
 		AlpenglowObserverBindAddr: alpenglowObserverBindAddr,
 		AlpenglowMaxMessageBytes:  alpenglowMaxMessageBytes,
 		AlpenglowBLSDST:           alpenglowBLSDST,
@@ -1739,45 +1887,37 @@ postBootstrap:
 		}
 	}()
 
-	consensusMaxDepth := config.GetInt("consensus.skip_path_max_depth")
-	if consensusMaxDepth <= 0 {
-		consensusMaxDepth = 64
-	}
-	consensusPolicy := config.GetString("consensus.unresolved_policy")
-	if consensusPolicy == "" {
-		consensusPolicy = "halt"
-	}
-	switch consensusPolicy {
-	case "halt", "warn":
-		// valid
-	default:
-		mlog.Log.Errorf("invalid consensus.unresolved_policy %q (must be \"halt\" or \"warn\"), defaulting to \"halt\"", consensusPolicy)
-		consensusPolicy = "halt"
-	}
-	consensusEnforceSource := config.GetString("consensus.enforce_on_source")
-	if consensusEnforceSource == "" {
-		consensusEnforceSource = "stream"
-	}
-	switch consensusEnforceSource {
-	case "lightbringer", "turbine", "stream", "all":
-		// valid
-	default:
-		mlog.Log.Errorf("invalid consensus.enforce_on_source %q (must be \"lightbringer\", \"turbine\", \"stream\", or \"all\"), defaulting to \"stream\"", consensusEnforceSource)
-		consensusEnforceSource = "stream"
-	}
 	consensusOpts := &replay.ConsensusOpts{
-		SkipPathMaxDepth: consensusMaxDepth,
-		UnresolvedPolicy: consensusPolicy,
-		EnforceOnSource:  consensusEnforceSource,
-		Mode:             consensusEngine.Name(),
-		Engine:           consensusEngine,
+		Engine: consensusEngine,
 	}
 
 	var slotCtxSetter replay.SlotCtxSetter
 	if rpcServer != nil {
 		slotCtxSetter = rpcServer
 	}
-	turbineAlpenglowAddr := alpenglowAddrForGossip(engineMode, alpenglowObserverBindAddr)
+
+	// Background compaction: folds never overwrite, so dead bytes accumulate in
+	// out-of-horizon segments and bootstrap appendvecs. Each cycle is bounded
+	// (move + scan budgets) and serialized against folds via the store's
+	// internal lock; the rewind horizon pins are what it must never touch.
+	if compactEnabled {
+		go func() {
+			ticker := time.NewTicker(10 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if _, cerr := accountsDb.CompactOnce(compactCfg); cerr != nil {
+						mlog.Log.Warnf("compaction cycle failed: %v", cerr)
+					}
+				}
+			}
+		}()
+	}
+
+	turbineAlpenglowAddr := alpenglowAddrForGossip(alpenglowObserverBindAddr)
 	result := runReplayWithRecovery(ctx, accountsDb, accountsPath, manifest, resumeState, uint64(startSlot), liveEndSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, uint16(turbineShredVersion), turbineAlpenglowAddr, validatorIdentity, blockstorePath, int(txParallelism), true, useLightbringer, useTurbine, dbgOpts, metricsWriter, slotCtxSetter, mithrilState, blockFetchOpts, consensusOpts, replayStartTime)
 
 	if result.Error != nil {
@@ -2206,10 +2346,12 @@ func printStartupInfo(commandName string) {
 	if validatorIdentityKeypair != "" {
 		fmt.Printf("  Identity key: %s%s%s\n", gold, validatorIdentityKeypair, reset)
 	}
-	if consensusMode != "" {
-		fmt.Printf("  Consensus:    %s%s%s\n", gold, consensusMode, reset)
+	consensusLabel := "verifying (non-voting)"
+	if consensusMode == "validator" {
+		consensusLabel = "validator (voting engine not yet active)"
 	}
-	if consensusMode == string(consensusengine.ModeAlpenglowObserver) && alpenglowObserverBindAddr != "" {
+	fmt.Printf("  Consensus:    %s%s%s\n", gold, consensusLabel, reset)
+	if alpenglowObserverBindAddr != "" {
 		fmt.Printf("  Votor QUIC:   %s%s%s\n", gold, alpenglowObserverBindAddr, reset)
 	}
 
@@ -2556,117 +2698,6 @@ func killExistingMithrilProcesses() int {
 }
 
 // decodeRecentBlockhashes converts state.BlockhashEntry list to sealevel.SysvarRecentBlockhashes
-func decodeRecentBlockhashes(entries []state.BlockhashEntry) sealevel.SysvarRecentBlockhashes {
-	result := make(sealevel.SysvarRecentBlockhashes, 0, len(entries))
-	dropped := 0
-	for _, entry := range entries {
-		hashBytes, err := base58.Decode(entry.Blockhash)
-		if err != nil || len(hashBytes) != 32 {
-			dropped++
-			continue
-		}
-		var blockhash [32]byte
-		copy(blockhash[:], hashBytes)
-		result = append(result, sealevel.RecentBlockHashesEntry{
-			Blockhash:     blockhash,
-			FeeCalculator: sealevel.FeeCalculator{LamportsPerSignature: entry.LamportsPerSignature},
-		})
-	}
-	if dropped > 0 {
-		mlog.Log.Errorf("dropped %d/%d RecentBlockhashes entries due to invalid base58 - state file may be corrupted", dropped, len(entries))
-	}
-	return result
-}
-
-// decodeSlotHashes converts state.SlotHashEntry list to sealevel.SysvarSlotHashes
-func decodeSlotHashes(entries []state.SlotHashEntry) sealevel.SysvarSlotHashes {
-	result := make(sealevel.SysvarSlotHashes, 0, len(entries))
-	dropped := 0
-	for _, entry := range entries {
-		hashBytes, err := base58.Decode(entry.Hash)
-		if err != nil || len(hashBytes) != 32 {
-			dropped++
-			continue
-		}
-		var hash [32]byte
-		copy(hash[:], hashBytes)
-		result = append(result, sealevel.SlotHash{
-			Slot: entry.Slot,
-			Hash: hash,
-		})
-	}
-	if dropped > 0 {
-		mlog.Log.Errorf("dropped %d/%d SlotHashes entries due to invalid base58 - state file may be corrupted", dropped, len(entries))
-	}
-	return result
-}
-
-// resumeStateFromRootedContext builds a replay.ResumeState from the context
-// captured at promotion (as of the last rooted slot); the next block is the slot
-// after the last rooted slot, whose parent is the last rooted slot.
-func resumeStateFromRootedContext(rc *state.ResumeContext, epochStakes map[uint64]string) (*replay.ResumeState, error) {
-	parentBankhash, err := base58.Decode(rc.Bankhash)
-	if err != nil {
-		return nil, fmt.Errorf("decode rooted bankhash: %w", err)
-	}
-	ltHashBytes, err := base64.StdEncoding.DecodeString(rc.AcctsLtHash)
-	if err != nil {
-		return nil, fmt.Errorf("decode rooted accts_lt_hash: %w", err)
-	}
-	ltHash := &lthash.LtHash{}
-	ltHash.InitWithHash(ltHashBytes)
-
-	rs := &replay.ResumeState{
-		ParentSlot:               rc.Slot,
-		ParentBlockHeight:        rc.BlockHeight,
-		ParentBankhash:           parentBankhash,
-		AcctsLtHash:              ltHash,
-		LamportsPerSignature:     rc.LamportsPerSignature,
-		PrevLamportsPerSignature: rc.PrevLamportsPerSig,
-		NumSignatures:            rc.NumSignatures,
-		Capitalization:           rc.Capitalization,
-		SlotsPerYear:             rc.SlotsPerYear,
-		InflationInitial:         rc.InflationInitial,
-		InflationTerminal:        rc.InflationTerminal,
-		InflationTaper:           rc.InflationTaper,
-		InflationFoundation:      rc.InflationFoundation,
-		InflationFoundationTerm:  rc.InflationFoundationTerm,
-	}
-
-	if len(rc.RecentBlockhashes) > 0 {
-		recentBlockhashes := decodeRecentBlockhashes(rc.RecentBlockhashes)
-		rs.RecentBlockhashes = &recentBlockhashes
-		if rc.EvictedBlockhash != "" {
-			if evb, err := base58.Decode(rc.EvictedBlockhash); err == nil && len(evb) == 32 {
-				copy(rs.EvictedBlockhash[:], evb)
-			}
-		}
-		if rc.Blockhash != "" {
-			if bb, err := base58.Decode(rc.Blockhash); err == nil && len(bb) == 32 {
-				copy(rs.LastBlockhash[:], bb)
-			}
-		}
-	}
-	if len(rc.SlotHashes) > 0 {
-		slotHashes := decodeSlotHashes(rc.SlotHashes)
-		rs.SlotHashes = &slotHashes
-	}
-	if rc.Clock != "" {
-		clockData, err := base64.StdEncoding.DecodeString(rc.Clock)
-		if err != nil {
-			return nil, fmt.Errorf("decode rooted clock sysvar: %w", err)
-		}
-		rs.Clock = clockData
-	}
-	if len(epochStakes) > 0 {
-		rs.ComputedEpochStakes = make(map[uint64][]byte, len(epochStakes))
-		for epoch, data := range epochStakes {
-			rs.ComputedEpochStakes[epoch] = []byte(data)
-		}
-	}
-	return rs, nil
-}
-
 func createBufWriter(filename string) (io.Writer, func(), error) {
 	if filename == "" {
 		return nil, func() {}, nil
@@ -2685,6 +2716,125 @@ func createBufWriter(filename string) (io.Writer, func(), error) {
 	}
 
 	return writer, cleanup, nil
+}
+
+// mustRecoverFoldState derives the durable fold frontier from the store
+// (manifests + index meta), restoring the index tail and the NoSync bankhash
+// rows, and fatals on error. Safe on a freshly built store (no manifests ->
+// empty result). Callers run it before ValidateAgainstBankhashDB so the
+// integrity check observes the manifest-restored bankhash rows.
+func mustRecoverFoldState(accountsDb *accountsdb.AccountsDb) accountsdb.RecoveryResult {
+	rec, rerr := accountsDb.RecoverFoldState()
+	if rerr != nil {
+		klog.Fatalf("fold recovery failed: %v", rerr)
+	}
+	if len(rec.ReplayedBatches) > 0 {
+		mlog.Log.Infof("fold recovery completed %d decided batch(es) from manifests: %v", len(rec.ReplayedBatches), rec.ReplayedBatches)
+	}
+	if len(rec.OrphansRemoved) > 0 {
+		mlog.Log.Infof("fold recovery removed %d undecided orphan file(s)", len(rec.OrphansRemoved))
+	}
+	return rec
+}
+
+// formatRewindPoints renders the retained fold boundaries for operator messages.
+func formatRewindPoints(points []accountsdb.RewindPoint) string {
+	if len(points) == 0 {
+		return "(none retained — horizon empty or store never folded)"
+	}
+	slots := make([]string, 0, len(points))
+	for _, p := range points {
+		slots = append(slots, strconv.FormatUint(p.ThroughSlot, 10))
+	}
+	return strings.Join(slots, ", ")
+}
+
+// adoptRewindResult reconciles the in-memory state with a completed store
+// rewind: the manifest-carried context at the boundary becomes the rooted
+// checkpoint and everything above it is forgotten (replay re-executes it).
+func adoptRewindResult(s *state.MithrilState, res accountsdb.RewindResult) error {
+	if len(res.ResumeCtx) == 0 {
+		if res.NewThrough == s.LastRootedSlot && s.LastRootedContext != nil && s.LastRootedContext.Slot == res.NewThrough {
+			return nil // no-op rewind to the current boundary; state already consistent
+		}
+		return fmt.Errorf("rewound to slot %d but its fold manifest carries no resume context", res.NewThrough)
+	}
+	var rctx state.ResumeContext
+	if err := json.Unmarshal(res.ResumeCtx, &rctx); err != nil {
+		return fmt.Errorf("resume context at rewound boundary %d is unreadable: %w", res.NewThrough, err)
+	}
+	if rctx.Slot != res.NewThrough {
+		return fmt.Errorf("resume context at rewound boundary %d names slot %d", res.NewThrough, rctx.Slot)
+	}
+	s.LastRootedSlot = res.NewThrough
+	s.LastRootedBankhash = rctx.Bankhash
+	s.LastRootedContext = &rctx
+	if s.LastSlot > res.NewThrough {
+		s.LastSlot = res.NewThrough
+	}
+	return nil
+}
+
+// completeInterruptedRewind finishes a rewind that crashed mid-flight (parked
+// ".rewound" manifests remain). It rewinds to the highest retained boundary
+// below the parked suffix — RewindToBatchBoundary is idempotent, so this works
+// whether the crash landed before the meta rollback (does the full rewind now)
+// or after it (a no-op that just finalizes the leftovers) — and adopts that
+// boundary as the rooted checkpoint. Fatals only when nothing is left to finish
+// the rewind with.
+func completeInterruptedRewind(accountsDb *accountsdb.AccountsDb, mithrilState *state.MithrilState) {
+	points, err := accountsDb.ListRewindPoints()
+	if err != nil || len(points) == 0 {
+		klog.Fatalf("interrupted rewind detected but no retained fold boundary remains to complete it; re-bootstrap with --bootstrap snapshot")
+	}
+	// The rewind parks every batch above its target, so the highest still-present
+	// (non-parked) boundary IS the target.
+	target := points[len(points)-1].ThroughSlot
+	oldRooted := mithrilState.LastRootedSlot
+	res, rerr := accountsDb.RewindToBatchBoundary(target)
+	if rerr != nil {
+		klog.Fatalf("could not complete interrupted rewind to slot %d: %v; re-run --rewind-to-slot=%d", target, rerr, target)
+	}
+	if aerr := adoptRewindResult(mithrilState, res); aerr != nil {
+		klog.Fatalf("interrupted rewind at slot %d: %v; re-run --rewind-to-slot=%d", res.NewThrough, aerr, target)
+	}
+	mlog.Log.Warnf("completed interrupted rewind: durable state at fold boundary %d (state file said %d)", res.NewThrough, oldRooted)
+}
+
+// rewindStoreBelowDivergence rewinds durable state to the newest retained fold
+// boundary strictly below divSlot and adopts that boundary's context as the
+// rooted checkpoint. Returns false (caller halts) when no boundary below the
+// divergence is retained or the rewind/reconcile fails.
+func rewindStoreBelowDivergence(accountsDb *accountsdb.AccountsDb, s *state.MithrilState, divSlot uint64) bool {
+	points, err := accountsDb.ListRewindPoints()
+	if err != nil {
+		mlog.Log.Errorf("fork switch: cannot list rewind boundaries: %v; halting", err)
+		return false
+	}
+	target, found := uint64(0), false
+	for _, p := range points { // ascending; keep the newest boundary below divSlot
+		if p.ThroughSlot < divSlot {
+			target, found = p.ThroughSlot, true
+		}
+	}
+	if !found {
+		mlog.Log.Errorf("fork switch: divergence at slot %d is at/below the durable watermark %d and no fold boundary below it is retained (rewind horizon exceeded) — re-bootstrap with --bootstrap snapshot; halting",
+			divSlot, s.LastRootedSlot)
+		return false
+	}
+	oldRooted := s.LastRootedSlot
+	res, err := accountsDb.RewindToBatchBoundary(target)
+	if err != nil {
+		mlog.Log.Errorf("fork switch: rewind to boundary %d failed: %v; halting", target, err)
+		return false
+	}
+	if err := adoptRewindResult(s, res); err != nil {
+		mlog.Log.Errorf("fork switch: %v; halting", err)
+		return false
+	}
+	mlog.Log.Warnf("fork switch: divergence at slot %d was already folded (R=%d); rewound durable state to boundary %d (%d batches / %d keys undone)",
+		divSlot, oldRooted, res.NewThrough, res.UndoneBatches, res.UndoneKeys)
+	return true
 }
 
 // maxForkSwitchRetries bounds fork-aware dump-then-repair re-replays per run.
@@ -2851,12 +3001,14 @@ func runReplayWithRecovery(
 		}
 		var divSlot uint64
 		var key string
-		var div *replay.ConfirmedDivergence
+		var certSwitch *replay.CertifiedSwitch
 		var finMismatch *replay.AlpenglowFinalityMismatch
 		switch {
-		case errors.As(result.Error, &div):
-			divSlot = div.Slot
-			key = fmt.Sprintf("%d/%x/%x", div.Slot, div.Ours, div.Confirmed)
+		case errors.As(result.Error, &certSwitch):
+			// Execute-on-receipt ran the wrong sibling (or a certified-skipped
+			// slot); the certified version replays from the rooted checkpoint.
+			divSlot = certSwitch.Slot
+			key = fmt.Sprintf("sw:%d/%x/%x/%v", certSwitch.Slot, certSwitch.Executed, certSwitch.Certified, certSwitch.Skip)
 		case errors.As(result.Error, &finMismatch):
 			if finMismatch.Conflict {
 				// Conflict-shaped (equivocation evidence, not a wrong local block):
@@ -2875,7 +3027,22 @@ func runReplayWithRecovery(
 			break
 		}
 		seenDiv[key] = true
-		if mithrilState == nil || mithrilState.LastRootedContext == nil {
+		if mithrilState == nil {
+			mlog.Log.Errorf("fork switch: no state to re-replay from; halting")
+			break
+		}
+		// Late-detected divergence: the contradicted slot is at/below the durable
+		// watermark, so it is already folded into the store — re-replaying from
+		// the rooted checkpoint would rebuild on corrupted ground. Rewind the
+		// store to the newest retained fold boundary BELOW the divergence first
+		// (this is exactly why durable state deliberately lags and undo pointers
+		// are retained for a horizon). Beyond the horizon -> fail closed.
+		if divSlot <= mithrilState.LastRootedSlot {
+			if !rewindStoreBelowDivergence(accountsDb, mithrilState, divSlot) {
+				break
+			}
+		}
+		if mithrilState.LastRootedContext == nil {
 			mlog.Log.Errorf("fork switch: no rooted checkpoint context to re-replay from; halting")
 			break
 		}
@@ -2895,16 +3062,19 @@ func runReplayWithRecovery(
 			mlog.Log.Errorf("fork switch: divergent span %d..%d crosses an epoch boundary; halting (restart to recover)", retryStart, divSlot)
 			break
 		}
-		// Prefer the failed attempt's epoch stakes: the in-memory state file copy is
-		// only refreshed on shutdown and can be empty on a fresh bootstrap.
+		// Prefer the failed attempt's epoch stakes: the in-memory state file copy
+		// can lag (it refreshes at boundaries and on shutdown) and can be empty
+		// on a fresh bootstrap. The serialized form is raw PersistedEpochStakes
+		// JSON — pass it through verbatim (string(b), NOT base64: the consumer
+		// json.Unmarshals it directly, matching the state-file convention).
 		stakes := mithrilState.ComputedEpochStakes
 		if len(result.ComputedEpochStakes) > 0 {
 			stakes = make(map[uint64]string, len(result.ComputedEpochStakes))
 			for e, b := range result.ComputedEpochStakes {
-				stakes[e] = base64.StdEncoding.EncodeToString(b)
+				stakes[e] = string(b)
 			}
 		}
-		rs, err := resumeStateFromRootedContext(mithrilState.LastRootedContext, stakes)
+		rs, err := replay.ResumeStateFromRootedContext(mithrilState.LastRootedContext, stakes)
 		if err != nil {
 			mlog.Log.Errorf("fork switch: cannot rebuild resume context: %v; halting", err)
 			break

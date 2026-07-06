@@ -212,6 +212,34 @@ func TestChainTrackerFastFinalizationDerivesOmittedSkips(t *testing.T) {
 	}
 }
 
+// The decision version advances on cert acceptance AND on a replay observation
+// that derives new decisiveness (here: the parent link that produces the
+// omitted indirect skips) — the exact case the switch sweep would otherwise
+// miss when gated on certificate count alone.
+func TestChainTrackerDecisionVersionAdvancesOnReplayDerivation(t *testing.T) {
+	tracker := NewChainTracker()
+	blockID := BlockID{Slot: 15, Hash: chainTestHash(15)}
+
+	v0 := tracker.DecisionVersion()
+	if _, err := tracker.ObserveCertificate(Certificate{
+		Type: CertificateFinalizeFast, Slot: blockID.Slot, BlockHash: blockID.Hash, SignatureVerified: true,
+	}); err != nil {
+		t.Fatalf("observe cert: %v", err)
+	}
+	v1 := tracker.DecisionVersion()
+	if v1 <= v0 {
+		t.Fatalf("cert acceptance must advance the decision version (%d -> %d)", v0, v1)
+	}
+
+	// The replay observation supplies the parent link that derives the omitted
+	// skips (13, 14) — a decisiveness change with NO new certificate.
+	tracker.ObserveReplayBlock(ReplayBlockObservation{Block: blockID, ParentSlot: 12, ParentHash: chainTestHash(12)})
+	v2 := tracker.DecisionVersion()
+	if v2 <= v1 {
+		t.Fatalf("replay-derived indirect skips must advance the decision version (%d -> %d)", v1, v2)
+	}
+}
+
 func TestChainTrackerSlowFinalizationRequiresNotarizationCertificate(t *testing.T) {
 	tracker := NewChainTracker()
 	blockID := BlockID{Slot: 15, Hash: chainTestHash(15)}

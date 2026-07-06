@@ -83,64 +83,11 @@ func PopulateManifestSeed(s *state.MithrilState, m *SnapshotManifest) {
 	// Transaction count at snapshot
 	s.ManifestTransactionCount = m.Bank.TransactionCount
 
-	// Epoch authorized voters (for snapshot epoch only)
-	// Supports multiple authorized voters per vote account (matches original manifest behavior)
-	snapshotEpoch := manifestSeedAuthorizedVotersEpoch(s, m)
-	s.ManifestEpochAuthorizedVoters = make(map[string][]string)
-	for _, epochStake := range m.VersionedEpochStakes {
-		if epochStake.Epoch == snapshotEpoch {
-			for _, entry := range epochStake.Val.EpochAuthorizedVoters {
-				voteAcctStr := base58.Encode(entry.Key[:])
-				authorizedVoterStr := base58.Encode(entry.Val[:])
-				s.ManifestEpochAuthorizedVoters[voteAcctStr] = append(s.ManifestEpochAuthorizedVoters[voteAcctStr], authorizedVoterStr)
-			}
-		}
-	}
-
 	// Epoch stakes: convert VersionedEpochStakes to PersistedEpochStakes format
 	// This stores ONLY vote-account aggregates, NOT full stake account data
 	s.ManifestEpochStakes = convertVersionedEpochStakesToPersisted(m.VersionedEpochStakes)
 }
 
-func manifestSeedAuthorizedVotersEpoch(s *state.MithrilState, m *SnapshotManifest) uint64 {
-	if m == nil || m.Bank == nil {
-		return 0
-	}
-	if manifestEpochHasAuthorizedVoters(m, m.Bank.Epoch) {
-		return m.Bank.Epoch
-	}
-	if s != nil && s.SnapshotEpoch != 0 {
-		if manifestEpochHasAuthorizedVoters(m, s.SnapshotEpoch) {
-			return s.SnapshotEpoch
-		}
-	}
-	if m.Bank.EpochSchedule.SlotsPerEpoch != 0 {
-		scheduleEpoch := m.Bank.EpochSchedule.GetEpoch(m.Bank.Slot)
-		if manifestEpochHasAuthorizedVoters(m, scheduleEpoch) {
-			return scheduleEpoch
-		}
-	}
-	if s != nil && s.SnapshotEpoch != 0 {
-		return s.SnapshotEpoch
-	}
-	return m.Bank.Epoch
-}
-
-func manifestEpochHasAuthorizedVoters(m *SnapshotManifest, epoch uint64) bool {
-	if m == nil {
-		return false
-	}
-	for _, epochStake := range m.VersionedEpochStakes {
-		if epochStake.Epoch == epoch && len(epochStake.Val.EpochAuthorizedVoters) > 0 {
-			return true
-		}
-	}
-	return false
-}
-
-// convertVersionedEpochStakesToPersisted converts manifest epoch stakes to
-// the same PersistedEpochStakes JSON format used by ComputedEpochStakes.
-// Only stores vote-account stakes (aggregated), NOT full stake account data.
 func convertVersionedEpochStakesToPersisted(stakes []VersionedEpochStakesPair) map[uint64]string {
 	result := make(map[uint64]string, len(stakes))
 

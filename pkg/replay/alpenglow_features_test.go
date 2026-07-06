@@ -34,27 +34,6 @@ func TestAlpenglowClockFeatureRequiresAgaveFeatureGate(t *testing.T) {
 	require.True(t, alpenglowClockFeatureActive(ft))
 }
 
-func TestAlpenglowReplayModeForcesAlpenglowClockSemantics(t *testing.T) {
-	ft := features.NewFeaturesDefault()
-
-	require.False(t, alpenglowClockFeatureActive(ft))
-	require.False(t, useAlpenglowClockSemantics(false, ft))
-	require.True(t, useAlpenglowClockSemantics(true, ft))
-}
-
-// nil features must be treated as "gate inactive", never panic.
 func TestAlpenglowClockFeatureActiveNilFeaturesIsFalse(t *testing.T) {
 	require.False(t, alpenglowClockFeatureActive(nil))
-	require.False(t, useAlpenglowClockSemantics(false, nil))
-	require.True(t, useAlpenglowClockSemantics(true, nil))
-}
-
-// Without replay mode, the Agave feature gate alone must switch on Alpenglow
-// clock semantics.
-func TestUseAlpenglowClockSemanticsFromFeatureGateWithoutReplayMode(t *testing.T) {
-	ft := features.NewFeaturesDefault()
-
-	require.False(t, useAlpenglowClockSemantics(false, ft))
-	ft.EnableFeature(features.Alpenglow, 42)
-	require.True(t, useAlpenglowClockSemantics(false, ft))
 }

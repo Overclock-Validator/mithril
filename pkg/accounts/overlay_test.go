@@ -140,10 +140,10 @@ func TestOverlayWithoutLockVariants(t *testing.T) {
 	assert.Equal(t, uint64(10), pGot.Lamports) // parent untouched
 }
 
-// UnrootedOverlay: added slots shadow the durable store; newest slot wins.
-func TestUnrootedOverlayAddAndRead(t *testing.T) {
+// WorkingSet: added slots shadow the durable store; newest slot wins.
+func TestWorkingSetAddAndRead(t *testing.T) {
 	durable := baseWith(&Account{Key: pk(1), Lamports: 10})
-	u := NewUnrootedOverlay()
+	u := NewWorkingSet()
 
 	u.Add(101, []*Account{{Key: pk(1), Lamports: 11}, {Key: pk(2), Lamports: 20}, nil})
 
@@ -162,10 +162,10 @@ func TestUnrootedOverlayAddAndRead(t *testing.T) {
 	assert.Equal(t, 2, u.HeldSlots())
 }
 
-// UnrootedOverlay: keys never written unrooted fall through to the durable store.
-func TestUnrootedOverlayFallsThroughToDurable(t *testing.T) {
+// WorkingSet: keys never written unrooted fall through to the durable store.
+func TestWorkingSetFallsThroughToDurable(t *testing.T) {
 	durable := baseWith(&Account{Key: pk(5), Lamports: 50})
-	u := NewUnrootedOverlay()
+	u := NewWorkingSet()
 	u.Add(101, []*Account{{Key: pk(1), Lamports: 11}})
 
 	g, err := uoRead(u, durable, 5)
@@ -174,8 +174,8 @@ func TestUnrootedOverlayFallsThroughToDurable(t *testing.T) {
 }
 
 // Concurrent locked reads racing Add/PromotePrefix/EvictFrom must be race-free.
-func TestUnrootedOverlayConcurrentStress(t *testing.T) {
-	u := NewUnrootedOverlay()
+func TestWorkingSetConcurrentStress(t *testing.T) {
+	u := NewWorkingSet()
 	var wg sync.WaitGroup
 
 	wg.Add(1)
@@ -209,7 +209,7 @@ func uoAcct(b byte, lamports uint64) *Account { return &Account{Key: pk(b), Lamp
 
 // uoRead mirrors the production read composition: unrooted Lookup first, else
 // fall through to the durable store.
-func uoRead(u *UnrootedOverlay, durable Accounts, b byte) (*Account, error) {
+func uoRead(u *WorkingSet, durable Accounts, b byte) (*Account, error) {
 	if a, ok := u.Lookup([32]byte(pk(b))); ok {
 		return a, nil
 	}
@@ -219,9 +219,9 @@ func uoRead(u *UnrootedOverlay, durable Accounts, b byte) (*Account, error) {
 
 // PromotePrefix TRAP: a key written in both the dropped prefix AND a newer held
 // slot must keep the newer held value, not fall through to the promoted one.
-func TestUnrootedOverlayPromoteKeepsNewerHeld(t *testing.T) {
+func TestWorkingSetPromoteKeepsNewerHeld(t *testing.T) {
 	durable := baseWith()
-	u := NewUnrootedOverlay()
+	u := NewWorkingSet()
 	u.Add(5, []*Account{uoAcct(1, 5)})
 	u.Add(7, []*Account{uoAcct(1, 7)})
 	require.NoError(t, durable.SetAccountWithoutLock(pk(1), uoAcct(1, 5))) // caller commits slot 5
@@ -233,9 +233,9 @@ func TestUnrootedOverlayPromoteKeepsNewerHeld(t *testing.T) {
 }
 
 // PromotePrefix mixed: promoted key -> durable; key with a held tip -> tip; held-only -> held.
-func TestUnrootedOverlayPromoteMixed(t *testing.T) {
+func TestWorkingSetPromoteMixed(t *testing.T) {
 	durable := baseWith()
-	u := NewUnrootedOverlay()
+	u := NewWorkingSet()
 	u.Add(5, []*Account{uoAcct(1, 51), uoAcct(2, 52)})
 	u.Add(7, []*Account{uoAcct(2, 72), uoAcct(3, 73)})
 	require.NoError(t, durable.SetAccountWithoutLock(pk(1), uoAcct(1, 51)))
@@ -252,8 +252,8 @@ func TestUnrootedOverlayPromoteMixed(t *testing.T) {
 
 // PromotionPrefix returns held slots <= through, ascending, each carrying that
 // slot's writes — and excludes slots above through.
-func TestUnrootedOverlayPromotionPrefixContents(t *testing.T) {
-	u := NewUnrootedOverlay()
+func TestWorkingSetPromotionPrefixContents(t *testing.T) {
+	u := NewWorkingSet()
 	u.Add(5, []*Account{uoAcct(1, 51), uoAcct(2, 52)})
 	u.Add(7, []*Account{uoAcct(2, 72)})
 	u.Add(9, []*Account{uoAcct(3, 93)}) // above through, must be excluded
@@ -269,14 +269,14 @@ func TestUnrootedOverlayPromotionPrefixContents(t *testing.T) {
 // Full driver flow: commit the promotion batch to durable in slot order, then
 // PromotePrefix. A key whose only writer was promoted reads from durable; a key
 // with a newer still-held writer keeps the held value.
-func TestUnrootedOverlayPromotionPrefixDriverFlow(t *testing.T) {
+func TestWorkingSetPromotionPrefixDriverFlow(t *testing.T) {
 	durable := baseWith()
-	u := NewUnrootedOverlay()
+	u := NewWorkingSet()
 	u.Add(5, []*Account{uoAcct(1, 51), uoAcct(2, 52)})
 	u.Add(7, []*Account{uoAcct(2, 72)}) // key 2 rewritten at tip
 	u.Add(9, []*Account{uoAcct(3, 93)})
 
-	// Driver: commit each prefix slot's delta to durable (simulates CommitSlotAtomic).
+	// Driver: commit each prefix slot's delta to durable (simulates a fold).
 	for _, sd := range u.PromotionPrefix(7) {
 		for _, a := range sd.Delta {
 			require.NoError(t, durable.SetAccountWithoutLock(a.Key, a))
@@ -295,8 +295,8 @@ func TestUnrootedOverlayPromotionPrefixDriverFlow(t *testing.T) {
 
 // Lookup returns the newest held value without durable fall-through; misses
 // report (nil,false) so the composing reader knows to consult durable.
-func TestUnrootedOverlayLookup(t *testing.T) {
-	u := NewUnrootedOverlay()
+func TestWorkingSetLookup(t *testing.T) {
+	u := NewWorkingSet()
 	u.Add(5, []*Account{uoAcct(1, 51)})
 	u.Add(7, []*Account{uoAcct(1, 71), uoAcct(2, 72)}) // key 1 rewritten newer
 
@@ -319,9 +319,9 @@ func TestUnrootedOverlayLookup(t *testing.T) {
 
 // EvictFrom TRAP: revert to the newest SURVIVING held value (newest-first), not
 // the durable value and not the oldest held.
-func TestUnrootedOverlayEvictRevertsNewestSurviving(t *testing.T) {
+func TestWorkingSetEvictRevertsNewestSurviving(t *testing.T) {
 	durable := baseWith(uoAcct(1, 100))
-	u := NewUnrootedOverlay()
+	u := NewWorkingSet()
 	u.Add(10, []*Account{uoAcct(1, 10)})
 	u.Add(12, []*Account{uoAcct(1, 12)})
 	u.Add(15, []*Account{uoAcct(1, 15)})
@@ -333,9 +333,9 @@ func TestUnrootedOverlayEvictRevertsNewestSurviving(t *testing.T) {
 }
 
 // EvictFrom with no surviving held writer reverts to durable.
-func TestUnrootedOverlayEvictToDurable(t *testing.T) {
+func TestWorkingSetEvictToDurable(t *testing.T) {
 	durable := baseWith(uoAcct(1, 100))
-	u := NewUnrootedOverlay()
+	u := NewWorkingSet()
 	u.Add(10, []*Account{uoAcct(1, 10)})
 	u.EvictFrom(10)
 
@@ -345,9 +345,9 @@ func TestUnrootedOverlayEvictToDurable(t *testing.T) {
 }
 
 // Owner slot is the LAYER slot, not the account's payload Slot field.
-func TestUnrootedOverlayOwnerIsLayerSlotNotPayload(t *testing.T) {
+func TestWorkingSetOwnerIsLayerSlotNotPayload(t *testing.T) {
 	durable := baseWith()
-	u := NewUnrootedOverlay()
+	u := NewWorkingSet()
 	u.Add(3, []*Account{{Key: pk(1), Lamports: 33, Slot: 3}})
 	u.Add(8, []*Account{{Key: pk(1), Lamports: 88, Slot: 3}}) // payload Slot=3, layer slot=8
 	require.NoError(t, durable.SetAccountWithoutLock(pk(1), uoAcct(1, 33)))
@@ -358,9 +358,9 @@ func TestUnrootedOverlayOwnerIsLayerSlotNotPayload(t *testing.T) {
 }
 
 // A zero-lamport (deleted) unrooted write shadows durable (tombstone); eviction reverts.
-func TestUnrootedOverlayTombstoneShadowsThenReverts(t *testing.T) {
+func TestWorkingSetTombstoneShadowsThenReverts(t *testing.T) {
 	durable := baseWith(uoAcct(1, 100))
-	u := NewUnrootedOverlay()
+	u := NewWorkingSet()
 	u.Add(7, []*Account{uoAcct(1, 0)})
 
 	g, _ := uoRead(u, durable, 1)
@@ -371,9 +371,9 @@ func TestUnrootedOverlayTombstoneShadowsThenReverts(t *testing.T) {
 }
 
 // EvictFrom dedups a key present in multiple removed layers.
-func TestUnrootedOverlayEvictDedup(t *testing.T) {
+func TestWorkingSetEvictDedup(t *testing.T) {
 	durable := baseWith()
-	u := NewUnrootedOverlay()
+	u := NewWorkingSet()
 	u.Add(10, []*Account{uoAcct(1, 10)})
 	u.Add(12, []*Account{uoAcct(1, 12)})
 	u.Add(14, []*Account{uoAcct(1, 14)})
@@ -384,9 +384,9 @@ func TestUnrootedOverlayEvictDedup(t *testing.T) {
 }
 
 // No-op edges and full drain.
-func TestUnrootedOverlayNoopsAndDrain(t *testing.T) {
+func TestWorkingSetNoopsAndDrain(t *testing.T) {
 	durable := baseWith()
-	u := NewUnrootedOverlay()
+	u := NewWorkingSet()
 	u.Add(5, []*Account{uoAcct(2, 5)})
 	u.EvictFrom(99)    // nothing >= 99
 	u.PromotePrefix(0) // nothing <= 0

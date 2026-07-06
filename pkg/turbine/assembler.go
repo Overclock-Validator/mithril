@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/gagliardetto/solana-go"
@@ -38,7 +39,9 @@ type SlotAssembler struct {
 	priorityRepairSlots  map[uint64]struct{}
 	priorityRepairOrder  []uint64
 	encoders             map[fecLayout]reedsolomon.Encoder
+	partialShredObs      map[uint64]PartialShredObservation // shreds seen for slots that never became full (retained for skip observability)
 	maxObservedSlot      uint64
+	highestFullSlot      uint64 // monotonic: highest slot reconstructed from shreds ("full", Agave SlotMeta/is_full sense)
 	recoveredDataShreds  uint64
 	nonCanonicalBlockIDs uint64
 	lastNonCanonicalSlot uint64
@@ -55,6 +58,15 @@ type SlotRepairRequest struct {
 	HighestDataShredIndex uint32
 }
 
+// PartialShredObservation records what arrived for a slot that never became
+// full — the operator signal distinguishing "leader sent some shreds then
+// stopped" from "leader never transmitted" when a slot ends up skipped.
+type PartialShredObservation struct {
+	DataShreds     int   // distinct data shreds received
+	RepairedShreds int   // of those, delivered via repair
+	FirstNanos     int64 // wall clock (unix nanos) of the first accepted shred
+}
+
 type slotState struct {
 	slot        uint64
 	parentSlot  uint64
@@ -64,6 +76,11 @@ type slotState struct {
 	haveLast    bool
 	shredVer    uint16
 	firstParent bool
+
+	// Observability: when the slot's first shred was accepted, and how many of
+	// its shreds arrived via repair rather than turbine.
+	firstShredAt   time.Time
+	repairedShreds int
 }
 
 type fecLayout struct {
@@ -91,8 +108,40 @@ func NewSlotAssembler() *SlotAssembler {
 		completedSlots:      make(map[uint64]struct{}),
 		knownBlockIDs:       make(map[uint64]solana.Hash),
 		priorityRepairSlots: make(map[uint64]struct{}),
+		partialShredObs:     make(map[uint64]PartialShredObservation),
 		encoders:            make(map[fecLayout]reedsolomon.Encoder),
 	}
+}
+
+// recordPartialObsLocked snapshots a never-completed slot's shred arrivals
+// before its state is dropped (reset or pruned), so skip reporting can still
+// say what the leader managed to send.
+func (a *SlotAssembler) recordPartialObsLocked(state *slotState) {
+	if state == nil || len(state.shreds) == 0 {
+		return
+	}
+	a.partialShredObs[state.slot] = PartialShredObservation{
+		DataShreds:     len(state.shreds),
+		RepairedShreds: state.repairedShreds,
+		FirstNanos:     state.firstShredAt.UnixNano(),
+	}
+}
+
+// ShredObservation reports what has been seen for a slot that did not (or has
+// not yet) become full: live partial state first, then retained observations
+// from reset/pruned slots. ok is false when no shred was ever accepted.
+func (a *SlotAssembler) ShredObservation(slot uint64) (PartialShredObservation, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if state := a.slots[slot]; state != nil && len(state.shreds) > 0 {
+		return PartialShredObservation{
+			DataShreds:     len(state.shreds),
+			RepairedShreds: state.repairedShreds,
+			FirstNanos:     state.firstShredAt.UnixNano(),
+		}, true
+	}
+	obs, ok := a.partialShredObs[slot]
+	return obs, ok
 }
 
 func (a *SlotAssembler) AddPacket(packet []byte) (*block.Block, error) {
@@ -107,6 +156,12 @@ func (a *SlotAssembler) AddPacket(packet []byte) (*block.Block, error) {
 }
 
 func (a *SlotAssembler) AddShred(shred *Shred) (*block.Block, error) {
+	return a.AddShredFrom(shred, false)
+}
+
+// AddShredFrom ingests a shred, recording whether it arrived via repair (for
+// per-slot observability) rather than turbine.
+func (a *SlotAssembler) AddShredFrom(shred *Shred, fromRepair bool) (*block.Block, error) {
 	if shred == nil {
 		return nil, nil
 	}
@@ -127,6 +182,9 @@ func (a *SlotAssembler) AddShred(shred *Shred) (*block.Block, error) {
 	}
 
 	state := a.slotState(shred.Slot, shred.Version)
+	if fromRepair {
+		state.repairedShreds++
+	}
 	var err error
 	switch shred.Type {
 	case ShredTypeData:
@@ -168,13 +226,33 @@ func (a *SlotAssembler) AddShred(shred *Shred) (*block.Block, error) {
 	}
 	if !a.acceptAlpenglowBlockIDLocked(blk) {
 		a.trackNonCanonicalBlockIDLocked(blk)
+		a.recordPartialObsLocked(state) // shreds DID arrive; useful if the slot ends up skipped
 		delete(a.slots, shred.Slot)
 		return nil, nil
 	}
 	delete(a.slots, shred.Slot)
 	a.completedSlots[shred.Slot] = struct{}{}
 	a.trackBlockIDLocked(blk)
+	// Shred-path observability: stamp when the slot's shreds started arriving
+	// and when it became full ("full" = reconstructable, Agave is_full sense).
+	if !state.firstShredAt.IsZero() {
+		blk.ShredFirstNanos = state.firstShredAt.UnixNano()
+	}
+	blk.ShredFullNanos = time.Now().UnixNano()
+	blk.RepairedShreds = state.repairedShreds
+	if shred.Slot > a.highestFullSlot {
+		a.highestFullSlot = shred.Slot
+	}
 	return blk, nil
+}
+
+// ShredEdges reports the monotonic shred frontier: the highest slot any
+// accepted shred has been seen for, and the highest slot that became full
+// (reconstructable). Both only ever advance.
+func (a *SlotAssembler) ShredEdges() (latestShredSlot, highestFullSlot uint64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.maxObservedSlot, a.highestFullSlot
 }
 
 func (a *SlotAssembler) SetKnownAlpenglowBlockID(slot uint64, blockID solana.Hash) {
@@ -188,6 +266,7 @@ func (a *SlotAssembler) ResetSlot(slot uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	a.recordPartialObsLocked(a.slots[slot])
 	delete(a.slots, slot)
 	delete(a.completedSlots, slot)
 }
@@ -230,11 +309,12 @@ func (a *SlotAssembler) slotState(slot uint64, version uint16) *slotState {
 		return state
 	}
 	state = &slotState{
-		slot:      slot,
-		shreds:    make(map[uint32]*Shred),
-		fecSets:   make(map[uint32]*fecState),
-		shredVer:  version,
-		lastIndex: ^uint32(0),
+		slot:         slot,
+		shreds:       make(map[uint32]*Shred),
+		fecSets:      make(map[uint32]*fecState),
+		shredVer:     version,
+		lastIndex:    ^uint32(0),
+		firstShredAt: time.Now(),
 	}
 	a.slots[slot] = state
 	return state
@@ -250,8 +330,9 @@ func (a *SlotAssembler) slotTooOldLocked(slot uint64) bool {
 func (a *SlotAssembler) pruneOldSlotsLocked() {
 	if len(a.slots) > 0 && a.maxObservedSlot > maxRetainedIncompleteSlotLag {
 		minSlot := a.maxObservedSlot - maxRetainedIncompleteSlotLag
-		for slot := range a.slots {
+		for slot, state := range a.slots {
 			if slot < minSlot {
+				a.recordPartialObsLocked(state)
 				delete(a.slots, slot)
 				a.evictedSlots++
 			}
@@ -267,6 +348,11 @@ func (a *SlotAssembler) pruneOldSlotsLocked() {
 		for slot := range a.knownBlockIDs {
 			if slot < minSlot {
 				delete(a.knownBlockIDs, slot)
+			}
+		}
+		for slot := range a.partialShredObs {
+			if slot < minSlot {
+				delete(a.partialShredObs, slot)
 			}
 		}
 	}
@@ -287,6 +373,7 @@ func (a *SlotAssembler) pruneOldSlotsLocked() {
 		if first {
 			return
 		}
+		a.recordPartialObsLocked(a.slots[oldest])
 		delete(a.slots, oldest)
 		a.evictedSlots++
 	}

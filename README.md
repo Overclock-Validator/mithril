@@ -17,7 +17,9 @@ Use **alpha** for reliability; use **dev** if you want the newest changes and ca
 
 ## Running Mithril
 
-The `run` command starts Mithril as a live full node - it bootstraps from a Solana snapshot and continuously verifies new blocks as they are produced on mainnet-beta.
+The `run` command starts Mithril as a live full node - it bootstraps from a Solana snapshot and continuously verifies new blocks as they are produced.
+
+**This branch builds an Alpenglow-only node.** It boots against Alpenglow clusters (`network.cluster = "alpenglow"`, the default), streams live blocks from native turbine shreds by default, and uses Alpenglow certificates as the source of truth for fork choice and durable state. TowerBFT clusters (`mainnet-beta`/`testnet`/`devnet`) need a build from the `dev` branch until those clusters upgrade to Alpenglow.
 
 ### Nix (NixOS / nix-darwin / Home Manager)
 
@@ -122,25 +124,40 @@ This builds the `mithril` binary with version, commit, and branch information em
 
 ### Configuration
 
-Generate a starter config with sensible defaults:
+Mithril runs as one of two node types, selected by `[consensus].mode`:
+
+- **Verifying node** (`mode = "verifying"`, the default) — non-voting: observes, executes, and verifies the cluster. No keypairs required.
+- **Validator** (`mode = "validator"`) — enforces the full voting-deployment shape at startup: identity + vote-account keypairs, the turbine block source with a gossip entrypoint, and the Votor QUIC listener. The voting engine has not landed yet, so a validator-mode node runs the same verifying pipeline and casts **no votes** — but selecting it now means the deployment is provisioned and the config stays valid when voting activates. Both node types share the same fork choice.
+
+Generate a starter config for your node type:
 
 ```bash
+# Verifying node (default)
 ./mithril config init
+
+# Validator (keypair/socket fields laid out and required)
+./mithril config init --validator
 ```
 
-This creates `config.toml`. **We strongly recommend reviewing [`config.example.toml`](config.example.toml)** for all available options and detailed documentation.
+This creates `config.toml`. **We strongly recommend reviewing [`config.example.toml`](config.example.toml)** for all available options and detailed documentation. At minimum, set:
+
+- `[network].rpc` — RPC endpoint(s), used for catchup, tip polling, and execution verification
+- `[turbine].gossip_entrypoint` — a gossip entrypoint of your Alpenglow cluster. **Required for the default turbine block source**: without it the node cannot join the shred tree.
+- Validator profile only: the `[validator]` identity and vote-account keypair paths. Keep the authorized-withdrawer keypair **offline** — it is not needed at runtime.
+
+There is also an interactive wizard (`./mithril setup`) that asks for the node type first and generates the matching config, and `./mithril doctor` validates an existing one.
 
 **Important: RPC Configuration**
 
-The default config uses `api.mainnet-beta.solana.com` as the RPC endpoint, but this public endpoint has low rate limits and is not suitable for getting blocks. For reliable operation, add a dedicated RPC provider (Helius, Triton, etc.) as the primary endpoint:
+Public RPC endpoints have low rate limits. For reliable operation, use a dedicated RPC endpoint for your Alpenglow cluster as the primary:
 
 ```toml
 [network]
-    # Primary RPC first, public endpoint as fallback
-    rpc = ["https://your-rpc-provider.com", "https://api.mainnet-beta.solana.com"]
+    # Primary RPC first, fallbacks after
+    rpc = ["https://your-rpc-provider.example.com", "https://public-fallback.example.com"]
 ```
 
-Mithril will use the first endpoint for block fetching and fall back to others if needed.
+Mithril uses the first endpoint and fails over to the others if needed.
 
 ### Running Mithril
 
@@ -164,11 +181,11 @@ You can also specify a config file explicitly:
 **Note:** Do not run Mithril with `sudo`. The setup scripts automatically configure directory permissions for your user.
 
 **What happens:**
-1. Mithril queries the Solana cluster to find reliable snapshot sources
+1. Mithril queries the cluster to find reliable snapshot sources
 2. The full snapshot is streamed and processed (optionally saved to disk for faster restarts)
 3. An incremental snapshot is fetched to bring the state closer to the tip
-4. Mithril block execution (aka replay) is initiated and blocks are retrieved with RPC `getBlock` calls and verified
-5. Mithril keeps up very close to the tip of the chain with recommended hardware specs
+4. Replay catches up toward the tip with RPC `getBlock` calls, then hands off to live blocks reconstructed from native turbine shreds (which carry the Alpenglow block ids and footer certificates)
+5. Blocks execute the moment they are assembled; Alpenglow certificates drive fork choice and gate what is promoted to durable storage, and a trailing verifier cross-checks execution results against finalized RPC blocks
 
 ### Mithril's Simple RPC Server
 
@@ -206,15 +223,14 @@ We're actively expanding RPC method coverage. Upcoming methods include transacti
 
 ### Current Limitations
 
-- **Block Catchup**: Mithril currently relies on `getBlock` RPC calls to catch up to the tip of mainnet-beta. This dependency is temporary — we are actively working on direct shred replay, which will eliminate the need for external RPC sources entirely.
+- **RPC still required**: live near-tip blocks stream from turbine shreds, but RPC `getBlock` is still used for catchup and by the trailing execution verifier (Alpenglow certificates attest block *data*, not execution results, so an external oracle cross-checks execution until peer bankhash cross-checking lands).
+- **Voting engine not yet active**: validator mode provisions and enforces the full voting deployment shape, but the node runs verify-only until the voting engine lands. Block production, repair serving, and Rotor relay duty are also future work.
 
 ### RPC Sources
 
-Mithril fetches blocks via `getBlock` RPC calls during catchup. For **short-term testing**, most free Solana RPC plans are sufficient to try out Mithril.
+Mithril fetches blocks via `getBlock` RPC calls during catchup and uses RPC for trailing execution verification. For **short-term testing**, most free Solana RPC plans are sufficient to try out Mithril.
 
 For **extended testing** or if you'd like to help with longer-running nodes, reach out to us on the [Overclock Validator Discord](https://discord.gg/overclock) — we can provide access to our RPC endpoints.
-
-Once direct shred replay is implemented, external RPC sources will no longer be required for block fetching.
 
 ### Updating Mithril
 
@@ -267,15 +283,15 @@ See [COMPATIBILITY.md](COMPATIBILITY.md) for supported networks and feature gate
 ### Milestone 3 (In Progress): Alpha Release and System Optimization
 - First formal audit (https://runtimeverification.com/ team is nearing end of audit). Includes development and intensive use of a robust and comprehensive 'conformance suite' for verification of compliance of the VM, interpreter, and runtime as a complete unit. Differential fuzzing will be used to detect differences versus relevant versions of the Labs client, and guided fuzzing will be used generally to uncover security and loss-of-availability issues. Any bugs identified during this phase will be remediated.
 - Thorough optimization work on entire system, including on components such as the Virtual Machine and AccountsDB.
-- Consensus verification implementation.
-- Direct shred replay support (alternative to RPC-based block fetching and requires consensus implementation).
+- Consensus verification implementation (landed on this branch: the Alpenglow certificate engine drives fork choice and durable-state promotion).
+- Direct shred replay support (landed on this branch: native turbine shred streaming is the default block source).
 - Achieve multi-epoch runs without bugs (e.g. bankhash mismatches with mainnet)
 - Transaction simulation and transaction sending
 - Earlier testing on testnet environments.
 - **Target**: More polished release midway through Q1 2026.
 
 ### Future Directions
-- Implement Alpenglow consensus verification.
+- Complete Alpenglow validator mode: the voting engine (Votor event loop, BLS vote signing, durable vote history) on top of the existing fork choice, plus block production, repair serving, and Rotor relay duty.
 - Add Agave ledger-tool type features for Mithril
 - gRPC interface support.
 - Expanded RPC feature set.

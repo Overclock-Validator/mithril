@@ -96,11 +96,6 @@ type MithrilState struct {
 	// Transaction count at snapshot slot
 	ManifestTransactionCount uint64 `json:"manifest_transaction_count,omitempty"`
 
-	// Epoch authorized voters (for current epoch only)
-	// Maps vote account pubkey (base58) -> list of authorized voter pubkeys (base58)
-	// Multiple authorized voters per vote account are supported (matches original manifest behavior)
-	ManifestEpochAuthorizedVoters map[string][]string `json:"manifest_epoch_authorized_voters,omitempty"`
-
 	// Epoch stakes seed - AGGREGATED vote-account stakes only (NOT full VersionedEpochStakes)
 	// Same format as ComputedEpochStakes (PersistedEpochStakes JSON)
 	// Cleared after first replayed slot to save space.
@@ -128,6 +123,12 @@ type MithrilState struct {
 	// clears when its slot promotes with a matching identity; conflict entries (zero
 	// hashes) block promotion until removed by an operator.
 	AlpenglowEvidence []AlpenglowFinalityEvidence `json:"alpenglow_finality_evidence,omitempty"`
+
+	// ReplayDivergenceEvidence records trailing-verifier execution mismatches
+	// (replayed results vs RPC metadata). Deterministic divergence is not
+	// self-healing: while evidence is present the node refuses to fold at or
+	// past the disputed slot; the operator clears it after triage.
+	ReplayDivergenceEvidence []ReplayDivergenceRecord `json:"replay_divergence_evidence,omitempty"`
 
 	// =========================================================================
 	// Resume Context (everything needed to continue replay from LastSlot)
@@ -228,6 +229,16 @@ type AlpenglowFinalityEvidence struct {
 	Conflict  bool   `json:"conflict,omitempty"`
 }
 
+// ReplayDivergenceRecord is one trailing-verifier execution mismatch.
+type ReplayDivergenceRecord struct {
+	Slot        uint64 `json:"slot"`
+	TxIndex     int    `json:"tx_index"`
+	TxSignature string `json:"tx_signature,omitempty"`
+	Kind        string `json:"kind"`
+	Detail      string `json:"detail"`
+	RecordedAt  string `json:"recorded_at"`
+}
+
 type ResumeContext struct {
 	Slot                    uint64           `json:"slot"`
 	Bankhash                string           `json:"bankhash"` // base58
@@ -249,6 +260,13 @@ type ResumeContext struct {
 	InflationTaper          float64          `json:"inflation_taper"`
 	InflationFoundation     float64          `json:"inflation_foundation"`
 	InflationFoundationTerm float64          `json:"inflation_foundation_term"`
+	// TransactionCount is the running chain transaction count as of this slot, so
+	// resume and the in-loop fork-switch unwind restore it exactly (getEpochInfo
+	// and future bank metadata must not carry a discarded fork's transactions).
+	// A pointer so presence is explicit: nil = context predates the field
+	// (callers fall back to the snapshot-manifest count and flag the count as
+	// approximate); non-nil is exact even when the value is zero (dev genesis).
+	TransactionCount *uint64 `json:"transaction_count,omitempty"`
 }
 
 // SnapshotInfo contains metadata about a downloaded snapshot file.
@@ -294,15 +312,45 @@ func (s *MithrilState) Save(accountsDbDir string) error {
 		return fmt.Errorf("failed to marshal state: %w", err)
 	}
 
-	// Write to temp file first, then rename for atomicity
+	// Full-durability write: tmp + fsync + rename + dir fsync. Atomicity alone
+	// (tmp+rename) survives process crashes but a power cut can lose the
+	// un-synced rename and revert to the old file. Most state fields self-heal
+	// from the fsynced fold manifests at startup, but the epoch stakes saved at
+	// an epoch boundary have no other durable home — losing that save would
+	// force a snapshot re-bootstrap. Save is called only at rare moments
+	// (bootstrap, epoch boundary, shutdown, halt evidence), so the fsyncs are
+	// free.
 	tmpFile := stateFile + ".tmp"
-	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+	f, err := os.OpenFile(tmpFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to create state tmp file: %w", err)
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmpFile)
 		return fmt.Errorf("failed to write state file: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmpFile)
+		return fmt.Errorf("failed to fsync state file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmpFile)
+		return fmt.Errorf("failed to close state tmp file: %w", err)
 	}
 
 	if err := os.Rename(tmpFile, stateFile); err != nil {
 		os.Remove(tmpFile)
 		return fmt.Errorf("failed to rename state file: %w", err)
+	}
+	// Make the rename itself durable.
+	if dir, err := os.Open(accountsDbDir); err == nil {
+		syncErr := dir.Sync()
+		dir.Close()
+		if syncErr != nil {
+			return fmt.Errorf("failed to fsync state directory: %w", syncErr)
+		}
 	}
 
 	return nil
@@ -530,13 +578,12 @@ type BankhashGetter interface {
 // This detects cases where the process was killed (Ctrl+Z, kill -9) without
 // updating the state file, leaving AccountsDB in an inconsistent state.
 func (s *MithrilState) ValidateAgainstBankhashDB(bankhashDb BankhashGetter) error {
-	// Rooted-durable: bankhash_db must end exactly at the last rooted slot (the in-RAM
-	// slots above it were never written); a bankhash beyond it = a torn durable write.
+	// Rooted-durable: the fold meta + manifests are the commit authority (see
+	// accountsdb.RecoverFoldState, which reconciles R before this runs).
+	// Bankhash rows BEYOND R are legal: fold bankhashes are written NoSync and
+	// batches can carry rows for slots above a partially-advanced state file.
+	// The only hard check left is that R itself matches.
 	if s.LastRootedSlot > 0 {
-		checkSlot := s.LastRootedSlot + 1
-		if bankhash, err := bankhashDb.GetBankHashForSlot(checkSlot); err == nil && len(bankhash) > 0 {
-			return fmt.Errorf("state file shows last_rooted_slot=%d, but bankhash_db has entry for slot %d - torn durable commit", s.LastRootedSlot, checkSlot)
-		}
 		rootedBankhash, err := bankhashDb.GetBankHashForSlot(s.LastRootedSlot)
 		if err != nil || len(rootedBankhash) == 0 {
 			return fmt.Errorf("state file shows last_rooted_slot=%d, but no bankhash found in bankhash_db", s.LastRootedSlot)

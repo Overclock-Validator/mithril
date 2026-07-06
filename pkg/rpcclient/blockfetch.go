@@ -56,6 +56,35 @@ func (fetcher *RpcClient) GetBlockConfirmed(slot uint64) (*rpc.GetBlockResult, e
 
 var SlotSkipped = errors.New("slot skipped")
 
+// GetBlockFinalizedOnce fetches a block at FINALIZED commitment with a single
+// attempt and a hard timeout. Used by the trailing verifier, which does its
+// own scheduling/backoff and must never block the caller for long.
+func (fetcher *RpcClient) GetBlockFinalizedOnce(slot uint64) (*rpc.GetBlockResult, error) {
+	includeRewards := false
+	maxSupportedTxVer := uint64(0)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	result, err := fetcher.client.GetBlockWithOpts(
+		ctx,
+		slot,
+		&rpc.GetBlockOpts{
+			MaxSupportedTransactionVersion: &maxSupportedTxVer,
+			Commitment:                     rpc.CommitmentFinalized,
+			TransactionDetails:             rpc.TransactionDetailsFull,
+			Rewards:                        &includeRewards,
+		},
+	)
+	if err != nil {
+		if strings.Contains(err.Error(), fmt.Sprintf("Slot %d was skipped", slot)) {
+			return nil, SlotSkipped
+		}
+		return nil, err
+	}
+	return result, nil
+}
+
 // GetBlockConfirmedOnce fetches a block with a single RPC attempt (no internal retry).
 // Use this with rate-limited parallel fetching where the scheduler handles retries.
 // Uses a 30-second timeout to prevent worker stalls on hung RPC connections.

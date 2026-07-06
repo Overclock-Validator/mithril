@@ -52,6 +52,14 @@ type Block struct {
 	FeeRateGovernor                     *sealevel.FeeRateGovernor
 	FromLightbringer                    bool
 	IsSkipped                           bool // True for slots that were skipped by the leader
+
+	// Shred-path observability (zero when the block did not come from shreds —
+	// RPC/file blocks must not fabricate these). "Full" follows Agave's
+	// SlotMeta/is_full language: all data shreds present, block reconstructable
+	// — NOT finalized/consensus-safe.
+	ShredFirstNanos int64 // wall clock (unix nanos) of the first accepted shred for the slot
+	ShredFullNanos  int64 // wall clock (unix nanos) when the slot became full
+	RepairedShreds  int   // data shreds obtained via repair rather than turbine
 }
 
 func (b *Block) FixupTxVersions() {

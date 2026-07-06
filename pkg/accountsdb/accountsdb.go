@@ -34,18 +34,23 @@ type AccountsDb struct {
 	CommonAcctsCache otter.Cache[solana.PublicKey, *accounts.Account]
 	ProgramCache     otter.Cache[solana.PublicKey, *ProgramCacheEntry]
 
-	// DurableCommit routes block commits through the crash-safe CommitSlotAtomic
-	// path (redo + append-only + fsync) instead of the unsynced store. Off by default.
-	DurableCommit bool
-
-	// RootedDurable keeps the canonical store rooted-only: replayed slots buffer in
-	// an in-RAM overlay, folded to disk via CommitSlotAtomic once rooted. Requires
-	// consensus + DurableCommit. Off by default.
+	// RootedDurable keeps the canonical store rooted-only: replayed slots buffer
+	// in an in-RAM working set (pkg/accounts) and fold to disk via CommitBatch
+	// once finalized+verified. The Alpenglow node forces this on at startup.
 	RootedDurable bool
 
-	// ForkAware selects the branch-tree speculative engine (fork handling) over the
-	// linear tail. Requires RootedDurable. Off by default.
-	ForkAware bool
+	// IndexWALDisabled runs the Pebble index without a WAL; the fold manifests
+	// are the index redo log (recovery replays the contiguous manifest run
+	// above the committed fold meta). Off by default until soaked.
+	IndexWALDisabled bool
+
+	// Batch-fold state (segment.go/fold.go/recovery.go). foldMu serializes
+	// CommitBatch, recovery, rewind, and compaction.
+	foldMu         sync.Mutex
+	lastBatchSeq   uint64        // guarded by foldMu; seeded by RecoverFoldState
+	durableThrough atomic.Uint64 // observability: highest durably folded slot
+	foldHooks      foldTestHooks // test-only crash injection
+	compactCursor  string        // guarded by foldMu; scan resume point across CompactOnce cycles
 
 	// A list of store requests. They are added to the back as they arrive and
 	// removed from the front as they are persisted.
@@ -56,12 +61,10 @@ type AccountsDb struct {
 }
 
 type storeRequest struct {
-	accts    []*accounts.Account
-	slot     uint64
-	m        map[solana.PublicKey]*accounts.Account
-	cb       func()
-	durable  bool   // route through CommitSlotAtomic (crash-safe) instead of the unsynced store
-	bankhash []byte // committed bankhash, for the durable redo record
+	accts []*accounts.Account
+	slot  uint64
+	m     map[solana.PublicKey]*accounts.Account
+	cb    func()
 }
 
 func (accountsDb *AccountsDb) StoreQueueLen() int {
@@ -94,11 +97,18 @@ const (
 	programCacheCostUnitBytes              = 1 << 20
 )
 
+// DisableIndexWAL (storage.index_wal=false) runs the account index without a
+// Pebble WAL: the fold manifests are the index redo log, and recovery replays
+// the contiguous manifest run above the committed fold meta. Set before
+// OpenDb. Default false (WAL on) until soaked.
+var DisableIndexWAL bool
+
 func NewAccountsIndexPebbleOptions(logger pebble.Logger) *pebble.Options {
 	return &pebble.Options{
 		Logger:                      logger,
 		MemTableSize:                indexPebbleMemTableSize,
 		MemTableStopWritesThreshold: indexPebbleMemTableStopWritesThreshold,
+		DisableWAL:                  DisableIndexWAL,
 	}
 }
 
@@ -142,7 +152,8 @@ func OpenDb(accountsDbDir string) (*AccountsDb, error) {
 		return nil, fmt.Errorf("opening bankhashDir=%s: %w", bankhashDir, err)
 	}
 
-	accountsDb := &AccountsDb{Index: db, BankHashStore: bankhashDb, AcctsDir: appendVecsDir}
+	accountsDb := &AccountsDb{
+		IndexWALDisabled: DisableIndexWAL, Index: db, BankHashStore: bankhashDb, AcctsDir: appendVecsDir}
 	accountsDb.LargestFileId.Store(largestFileId)
 
 	accountsDb.inProgressStoreRequests = list.New()
@@ -285,45 +296,24 @@ func (accountsDb *AccountsDb) getStoredAccount(slot uint64, pubkey solana.Public
 	r.End()
 
 	defer trace.StartRegion(context.Background(), "GetStoredAccountDisk").End()
-	acctIdxEntryBytes, c, err := accountsDb.Index.Get(pubkey[:])
-	if err != nil {
-		//mlog.Log.Debugf("no account found in accountsdb for pubkey %s: %s", pubkey, err)
+
+	// One-shot retry: between fetching the index entry and reading the file,
+	// a compaction cycle may move the record and unlink its old file (ENOENT,
+	// or in pathological interleavings a wrong-pubkey/short read). Re-fetching
+	// the index entry observes the moved location. Failing twice means real
+	// corruption and surfaces as an error rather than a panic.
+	acct, err := accountsDb.readIndexedAccount(pubkey)
+	if err == ErrNoAccount {
 		return nil, ErrNoAccount
 	}
-
-	acctIdxEntry, err := UnmarshalAcctIdxEntry(acctIdxEntryBytes)
 	if err != nil {
-		panic("failed to unmarshal AccountIndexEntry from index kv database")
+		if acct, err = accountsDb.readIndexedAccount(pubkey); err != nil {
+			if err == ErrNoAccount {
+				return nil, ErrNoAccount
+			}
+			return nil, fmt.Errorf("accountsdb: read %s failed after retry: %w", pubkey, err)
+		}
 	}
-	c.Close()
-
-	appendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, acctIdxEntry.Slot, acctIdxEntry.FileId)
-
-	appendVecFile, err := os.Open(appendVecFileName)
-	if err != nil {
-		//mlog.Log.Debugf("failed to open appendvec file %s")
-		return nil, err
-	}
-	defer appendVecFile.Close()
-
-	offset, err := appendVecFile.Seek(int64(acctIdxEntry.Offset), 0)
-	if err != nil {
-		panic(fmt.Sprintf("file seek failed: %s\n", err))
-	}
-	if offset != int64(acctIdxEntry.Offset) {
-		panic(fmt.Sprintf("file seek gave wrong idx (%d)\n", offset))
-	}
-
-	acct, err := unmarshalAcctFromAppendVecAcctHeader(appendVecFile)
-	if err != nil {
-		panic(fmt.Sprintf("failed to unmarshal account from appendvec file %s: %s", appendVecFileName, err))
-	}
-
-	if acct.Key != pubkey {
-		panic(fmt.Sprintf("account unmarshaled from appendvec file %s has the wrong pubkey", appendVecFileName))
-	}
-
-	acct.Slot = acctIdxEntry.Slot
 
 	owner := solana.PublicKeyFromBytes(acct.Owner[:])
 	if owner == addresses.VoteProgramAddr {
@@ -332,7 +322,47 @@ func (accountsDb *AccountsDb) getStoredAccount(slot uint64, pubkey solana.Public
 		accountsDb.CommonAcctsCache.Set(pubkey, acct)
 	}
 
-	return acct, err
+	return acct, nil
+}
+
+// readIndexedAccount performs one index-fetch + file-read attempt.
+func (accountsDb *AccountsDb) readIndexedAccount(pubkey solana.PublicKey) (*accounts.Account, error) {
+	acctIdxEntryBytes, c, err := accountsDb.Index.Get(pubkey[:])
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, ErrNoAccount
+		}
+		return nil, fmt.Errorf("index get: %w", err)
+	}
+
+	acctIdxEntry, err := UnmarshalAcctIdxEntry(acctIdxEntryBytes)
+	c.Close()
+	if err != nil {
+		return nil, fmt.Errorf("unmarshal index entry: %w", err)
+	}
+
+	appendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, acctIdxEntry.Slot, acctIdxEntry.FileId)
+
+	appendVecFile, err := os.Open(appendVecFileName)
+	if err != nil {
+		return nil, err
+	}
+	defer appendVecFile.Close()
+
+	if _, err := appendVecFile.Seek(int64(acctIdxEntry.Offset), 0); err != nil {
+		return nil, fmt.Errorf("seek %s@%d: %w", appendVecFileName, acctIdxEntry.Offset, err)
+	}
+
+	acct, err := unmarshalAcctFromAppendVecAcctHeader(appendVecFile)
+	if err != nil {
+		return nil, fmt.Errorf("unmarshal account at %s@%d: %w", appendVecFileName, acctIdxEntry.Offset, err)
+	}
+	if acct.Key != pubkey {
+		return nil, fmt.Errorf("record at %s@%d holds %s (stale index entry)", appendVecFileName, acctIdxEntry.Offset, acct.Key)
+	}
+
+	acct.Slot = acctIdxEntry.Slot
+	return acct, nil
 }
 
 // Returns a slice of the same length as the input with results matching indexes, nil if not found.
@@ -362,6 +392,18 @@ func (accountsDb *AccountsDb) StoreAccounts(
 	slot uint64,
 	cb func(),
 ) error {
+	// Rooted-durable (the only mode of the Alpenglow-only build): direct stores
+	// are no-ops. Every write reaches disk exclusively via the fold path
+	// (CommitBatch) once finalized+verified — epoch-boundary code that still
+	// calls StoreAccounts directly is redundant with the slot delta it also
+	// feeds (block.EpochUpdatedAccts), and writing here would violate
+	// "durable state is rooted-only".
+	if accountsDb.RootedDurable {
+		if cb != nil {
+			cb()
+		}
+		return nil
+	}
 	for _, acct := range accts {
 		if acct == nil {
 			continue
@@ -379,28 +421,6 @@ func (accountsDb *AccountsDb) StoreAccounts(
 	// Must not hold lock during channel send to avoid deadlock with storeWorker.
 	accountsDb.inProgressStoreRequestsMu.Lock()
 	element := accountsDb.inProgressStoreRequests.PushBack(storeRequest{accts: accts, slot: slot, m: m, cb: cb})
-	accountsDb.inProgressStoreRequestsMu.Unlock()
-	accountsDb.storeRequestChan <- element
-	return nil
-}
-
-// StoreAccountsDurable enqueues a CRASH-SAFE commit of a slot's accounts + bankhash
-// on the same single storeWorker as StoreAccounts (single-writer/FIFO), routed
-// through CommitSlotAtomic. The callback runs after the commit; it should DeleteRedo.
-func (accountsDb *AccountsDb) StoreAccountsDurable(accts []*accounts.Account, slot uint64, bankhash []byte, cb func()) error {
-	for _, acct := range accts {
-		if acct != nil {
-			acct.Slot = slot
-		}
-	}
-	m := make(map[solana.PublicKey]*accounts.Account, len(accts))
-	for _, a := range accts {
-		if a != nil {
-			m[a.Key] = a
-		}
-	}
-	accountsDb.inProgressStoreRequestsMu.Lock()
-	element := accountsDb.inProgressStoreRequests.PushBack(storeRequest{accts: accts, slot: slot, m: m, cb: cb, durable: true, bankhash: bankhash})
 	accountsDb.inProgressStoreRequestsMu.Unlock()
 	accountsDb.storeRequestChan <- element
 	return nil
@@ -444,16 +464,7 @@ func (accountsDb *AccountsDb) storeWorker() {
 	defer close(accountsDb.storeWorkerDone)
 	for elt := range accountsDb.storeRequestChan {
 		sr := elt.Value.(storeRequest)
-		if sr.durable {
-			// Panic on error (like storeAccountsSync) so cb does NOT run: the redo is
-			// preserved for recovery. Running cb would DeleteRedo + advance as committed,
-			// silently losing the slot.
-			if err := accountsDb.CommitSlotAtomic(sr.accts, sr.slot, sr.bankhash); err != nil {
-				panic(fmt.Sprintf("durable commit failed for slot %d: %v", sr.slot, err))
-			}
-		} else {
-			accountsDb.storeAccountsSync(sr.accts, sr.slot)
-		}
+		accountsDb.storeAccountsSync(sr.accts, sr.slot)
 		if sr.cb != nil {
 			sr.cb()
 		}

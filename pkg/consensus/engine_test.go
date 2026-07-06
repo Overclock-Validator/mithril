@@ -2,7 +2,6 @@ package consensus
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math/big"
 	"testing"
@@ -13,51 +12,8 @@ import (
 	"github.com/gagliardetto/solana-go"
 )
 
-func TestNormalizeMode(t *testing.T) {
-	tests := []struct {
-		name string
-		raw  string
-		want Mode
-	}{
-		{name: "empty defaults classic", raw: "", want: ModeClassic},
-		{name: "classic", raw: "classic", want: ModeClassic},
-		{name: "legacy alias", raw: "legacy", want: ModeClassic},
-		{name: "observer", raw: "alpenglow-observer", want: ModeAlpenglowObserver},
-		{name: "alpenglow", raw: "alpenglow", want: ModeAlpenglow},
-		{name: "trim lowercase", raw: "  CLASSIC  ", want: ModeClassic},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := NormalizeMode(tt.raw)
-			if err != nil {
-				t.Fatalf("NormalizeMode(%q) returned error: %v", tt.raw, err)
-			}
-			if got != tt.want {
-				t.Fatalf("NormalizeMode(%q)=%q, want %q", tt.raw, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestNormalizeModeRejectsUnknown(t *testing.T) {
-	if _, err := NormalizeMode("tower"); err == nil {
-		t.Fatalf("expected invalid mode error")
-	}
-}
-
-func TestAlpenglowVotingModeFailsFast(t *testing.T) {
-	engine, err := NewEngine(ModeAlpenglow)
-	if err != nil {
-		t.Fatalf("NewEngine returned error: %v", err)
-	}
-	if err := engine.Start(context.Background()); !errors.Is(err, ErrAlpenglowVotingNotImplemented) {
-		t.Fatalf("Start error = %v, want %v", err, ErrAlpenglowVotingNotImplemented)
-	}
-}
-
 func TestAlpenglowObserverTracksReplayInSnapshot(t *testing.T) {
-	engine, err := NewEngine(ModeAlpenglowObserver)
+	engine, err := NewEngine(Config{})
 	if err != nil {
 		t.Fatalf("NewEngine returned error: %v", err)
 	}
@@ -107,11 +63,11 @@ func TestAlpenglowObserverTracksReplayInSnapshot(t *testing.T) {
 // deferred and replayed once the stakes land — otherwise the cert is lost and that
 // slot's decision stalls.
 func TestAlpenglowDefersCertUntilStakesInstall(t *testing.T) {
-	engine, err := NewEngine(ModeAlpenglowObserver)
+	engine, err := NewEngine(Config{})
 	if err != nil {
 		t.Fatalf("NewEngine returned error: %v", err)
 	}
-	observer := engine.(*AlpenglowObserverEngine)
+	observer := engine
 	set := testAlpenglowValidatorSet()
 	observer.SetAlpenglowEpochLookup(func(slot uint64) uint64 { return set.Epoch })
 
@@ -141,11 +97,11 @@ func TestAlpenglowDefersCertUntilStakesInstall(t *testing.T) {
 // Deferred certs carry network-controlled slots, so the pending buffer must bound the
 // number of distinct epoch buckets (an attacker could otherwise feed far-future slots).
 func TestAlpenglowPendingCertEpochCap(t *testing.T) {
-	engine, err := NewEngine(ModeAlpenglowObserver)
+	engine, err := NewEngine(Config{})
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
-	observer := engine.(*AlpenglowObserverEngine)
+	observer := engine
 	observer.SetAlpenglowEpochLookup(func(slot uint64) uint64 { return slot }) // slot == epoch
 
 	noSet := fmt.Errorf("alpenglow verifier: no validator set for epoch")
@@ -170,11 +126,11 @@ func TestAlpenglowPendingCertEpochCap(t *testing.T) {
 // Finalize cert on the slow path — the replay loop captures these for the
 // promotion gate.
 func TestObserveFooterCertificatesReturnsFinalizedBlocks(t *testing.T) {
-	engine, err := NewEngine(ModeAlpenglowObserver)
+	engine, err := NewEngine(Config{})
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
-	observer := engine.(*AlpenglowObserverEngine)
+	observer := engine
 	if err := observer.SetAlpenglowValidatorSet(testAlpenglowValidatorSet()); err != nil {
 		t.Fatalf("SetAlpenglowValidatorSet: %v", err)
 	}
@@ -210,11 +166,11 @@ func TestObserveFooterCertificatesReturnsFinalizedBlocks(t *testing.T) {
 // Once a validator set is installed, deferral only accepts epochs near it — a cert
 // with a far-off epoch can never verify soon and must not occupy buckets.
 func TestAlpenglowDeferRejectsFarOffEpochs(t *testing.T) {
-	engine, err := NewEngine(ModeAlpenglowObserver)
+	engine, err := NewEngine(Config{})
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
-	observer := engine.(*AlpenglowObserverEngine)
+	observer := engine
 	if err := observer.SetAlpenglowValidatorSet(testAlpenglowValidatorSet()); err != nil { // epoch 1
 		t.Fatalf("SetAlpenglowValidatorSet: %v", err)
 	}
@@ -235,11 +191,11 @@ func TestAlpenglowDeferRejectsFarOffEpochs(t *testing.T) {
 }
 
 func TestAlpenglowObserverFeedsCertifiedDecisionResolver(t *testing.T) {
-	engine, err := NewEngine(ModeAlpenglowObserver)
+	engine, err := NewEngine(Config{})
 	if err != nil {
 		t.Fatalf("NewEngine returned error: %v", err)
 	}
-	observer := engine.(*AlpenglowObserverEngine)
+	observer := engine
 	if err := observer.SetAlpenglowValidatorSet(testAlpenglowValidatorSet()); err != nil {
 		t.Fatalf("SetAlpenglowValidatorSet returned error: %v", err)
 	}
@@ -269,11 +225,11 @@ func TestAlpenglowObserverFeedsCertifiedDecisionResolver(t *testing.T) {
 }
 
 func TestAlpenglowObserverCandidateBlockEnablesIndirectSkipDecision(t *testing.T) {
-	engine, err := NewEngine(ModeAlpenglowObserver)
+	engine, err := NewEngine(Config{})
 	if err != nil {
 		t.Fatalf("NewEngine returned error: %v", err)
 	}
-	observer := engine.(*AlpenglowObserverEngine)
+	observer := engine
 	if err := observer.SetAlpenglowValidatorSet(testAlpenglowValidatorSet()); err != nil {
 		t.Fatalf("SetAlpenglowValidatorSet returned error: %v", err)
 	}
@@ -390,5 +346,20 @@ func testAlpenglowCertificateVote(t *testing.T, cert alpenglow.Certificate) alpe
 	default:
 		t.Fatalf("unsupported certificate type %q", cert.Type)
 		return alpenglow.Vote{}
+	}
+}
+
+// The Alpenglow-only build has exactly one engine: NewEngine must always
+// yield the observer engine regardless of configuration.
+func TestNewEngineYieldsObserver(t *testing.T) {
+	engine, err := NewEngine(Config{})
+	if err != nil {
+		t.Fatalf("NewEngine returned error: %v", err)
+	}
+	if engine == nil {
+		t.Fatal("NewEngine returned nil engine")
+	}
+	if got := engine.Name(); got != "alpenglow-observer" {
+		t.Fatalf("engine.Name()=%q, want %q", got, "alpenglow-observer")
 	}
 }

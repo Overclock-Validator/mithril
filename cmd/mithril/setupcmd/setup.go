@@ -70,11 +70,14 @@ func runMigrate() {
 type screen int
 
 const (
-	scrMode screen = iota
+	scrMode     screen = iota
+	scrNodeType        // verifying node vs validator
 	scrCluster
 	scrRPC
 	scrLightbringer
 	scrGossip
+	scrIdentityKey       // validator identity keypair path (validator mode)
+	scrVoteKey           // vote account keypair path (validator mode)
 	scrLightbringerQuiet // log verbosity for managed Lightbringer (only shown when Lightbringer enabled)
 	scrStorage           // accountsPath
 	scrStorageSnap       // snapshotsPath
@@ -83,7 +86,6 @@ const (
 	scrBlockTuning   // maxRPS
 	scrBlockInflight // maxInflight
 	scrReplay
-	scrConsensus
 	scrSnapshot
 	scrLogLevel
 	scrRPCPort
@@ -108,24 +110,26 @@ type setupModel struct {
 	inputErr string
 
 	// Config values
-	mode            string // quick, full, manual
-	cluster         string
-	rpcEndpoint     string
-	enableLB        bool
-	gossipEntry     string
-	lbQuiet         bool // suppress Lightbringer info/debug logs
-	accountsPath    string
-	snapshotsPath   string
-	logsPath        string
-	shredstorePath  string
-	bootstrapMode   string
-	blockMaxRPS     string
-	blockInflight   string
-	txpar           string
-	consensusPolicy string
-	snapshotKeep    string
-	logLevel        string
-	rpcPort         string
+	mode           string // quick, full, manual
+	nodeType       string // "verifying" (non-voting) or "validator"
+	cluster        string
+	rpcEndpoint    string
+	enableLB       bool
+	gossipEntry    string
+	identityKey    string // validator identity keypair path (validator mode)
+	voteKey        string // vote account keypair path (validator mode)
+	lbQuiet        bool   // suppress Lightbringer info/debug logs
+	accountsPath   string
+	snapshotsPath  string
+	logsPath       string
+	shredstorePath string
+	bootstrapMode  string
+	blockMaxRPS    string
+	blockInflight  string
+	txpar          string
+	snapshotKeep   string
+	logLevel       string
+	rpcPort        string
 
 	// System
 	cpuCores   int
@@ -139,25 +143,24 @@ func newSetupModel() setupModel {
 	absPath, _ := filepath.Abs(outputPath)
 	storage := config.DefaultStoragePaths()
 	return setupModel{
-		screen:          scrMode,
-		cpuCores:        runtime.NumCPU(),
-		disks:           DetectDisks(),
-		cluster:         "mainnet-beta",
-		rpcEndpoint:     "https://api.mainnet-beta.solana.com",
-		lbQuiet:         config.LightbringerQuietDefault,
-		accountsPath:    storage.Accounts,
-		snapshotsPath:   storage.Snapshots,
-		logsPath:        storage.Logs,
-		shredstorePath:  storage.Shredstore,
-		bootstrapMode:   "auto",
-		blockMaxRPS:     "8",
-		blockInflight:   "8",
-		txpar:           fmt.Sprintf("%d", runtime.NumCPU()*2),
-		consensusPolicy: "halt",
-		snapshotKeep:    "1",
-		logLevel:        "info",
-		rpcPort:         "8899",
-		configPath:      absPath,
+		screen:         scrMode,
+		cpuCores:       runtime.NumCPU(),
+		disks:          DetectDisks(),
+		cluster:        "alpenglow",
+		rpcEndpoint:    "https://alpenglow.rpcpool.com",
+		lbQuiet:        config.LightbringerQuietDefault,
+		accountsPath:   storage.Accounts,
+		snapshotsPath:  storage.Snapshots,
+		logsPath:       storage.Logs,
+		shredstorePath: storage.Shredstore,
+		bootstrapMode:  "auto",
+		blockMaxRPS:    "8",
+		blockInflight:  "8",
+		txpar:          fmt.Sprintf("%d", runtime.NumCPU()*2),
+		snapshotKeep:   "1",
+		logLevel:       "info",
+		rpcPort:        "8899",
+		configPath:     absPath,
 	}
 }
 
@@ -173,6 +176,10 @@ func (m *setupModel) inputValueForScreen(scr screen) (string, bool) {
 		return m.rpcEndpoint, true
 	case scrGossip:
 		return m.gossipEntry, true
+	case scrIdentityKey:
+		return m.identityKey, true
+	case scrVoteKey:
+		return m.voteKey, true
 	case scrStorage:
 		return m.accountsPath, true
 	case scrStorageSnap:
@@ -242,12 +249,19 @@ func (m setupModel) currentItems() []menuItem {
 			menuOptionDesc("Full Config", "full", "Customize every setting with explanations"),
 			menuOptionDesc("Manual", "manual", "Generate config.toml template for editing"),
 		}
+	case scrNodeType:
+		return []menuItem{
+			menuOptionDesc("Verifying node", "verifying", "Non-voting: observe, execute, and verify the cluster"),
+			menuOptionDesc("Validator", "validator", "Requires identity + vote-account keypairs; voting engine not yet active (runs verify-only until it lands)"),
+			menuSeparator(),
+			menuBack(),
+		}
 	case scrCluster:
 		return []menuItem{
-			menuOptionDesc("mainnet-beta", "mainnet-beta", "Production Solana network"),
-			menuOptionDesc("testnet", "testnet", "Test network (more stable)"),
-			menuOptionDesc("devnet", "devnet", "Development network (frequent resets)"),
-			menuOptionDesc("alpenglow", "alpenglow", "Public Alpenglow test cluster"),
+			menuOptionDesc("alpenglow", "alpenglow", "Alpenglow test cluster (the only cluster this build boots)"),
+			menuOptionDesc("mainnet-beta", "mainnet-beta", "Requires a dev-branch (TowerBFT) build"),
+			menuOptionDesc("testnet", "testnet", "Requires a dev-branch (TowerBFT) build"),
+			menuOptionDesc("devnet", "devnet", "Requires a dev-branch (TowerBFT) build"),
 			menuSeparator(),
 			menuBack(),
 		}
@@ -264,13 +278,6 @@ func (m setupModel) currentItems() []menuItem {
 			menuOptionDesc("snapshot", "snapshot", "Rebuild from snapshot"),
 			menuOptionDesc("new-snapshot", "new-snapshot", "Always download fresh"),
 			menuOptionDesc("accountsdb", "accountsdb", "Require existing data, fail if missing"),
-			menuSeparator(),
-			menuBack(),
-		}
-	case scrConsensus:
-		return []menuItem{
-			menuOptionDesc("halt", "halt", "Stop and write diagnostic (recommended)"),
-			menuOptionDesc("warn", "warn", "Log warning and continue (debug only)"),
 			menuSeparator(),
 			menuBack(),
 		}
@@ -388,6 +395,13 @@ func (m setupModel) handleSelect(value string) (tea.Model, tea.Cmd) {
 		if value == "manual" {
 			return m.generateManual()
 		}
+		m.pushMenu(scrNodeType)
+
+	case scrNodeType:
+		m.nodeType = value
+		if value == "validator" {
+			m.enableLB = false // a validator runs the native turbine source
+		}
 		m.pushMenu(scrCluster)
 
 	case scrCluster:
@@ -409,21 +423,13 @@ func (m setupModel) handleSelect(value string) (tea.Model, tea.Cmd) {
 		if !m.enableLB {
 			m.lbQuiet = config.LightbringerQuietDefault // Reset dependent state so disable→re-enable starts clean.
 		}
-		if m.enableLB {
-			m.pushInput(scrGossip)
-		} else if m.mode == "quick" {
-			m.pushMenu(scrReview)
-		} else {
-			m.pushInput(scrStorage)
-		}
+		// Both paths need a gossip entrypoint: lightbringer for its sidecar,
+		// turbine (the default source) to join the shred tree.
+		m.pushInput(scrGossip)
 
 	case scrBootstrap:
 		m.bootstrapMode = value
 		m.pushInput(scrBlockTuning)
-
-	case scrConsensus:
-		m.consensusPolicy = value
-		m.pushMenu(scrSnapshot)
 
 	case scrSnapshot:
 		m.snapshotKeep = value
@@ -565,6 +571,18 @@ func (m *setupModel) validateAndApplyInput() bool {
 		}
 		m.gossipEntry = val
 
+	case scrIdentityKey:
+		if !m.requireNonEmpty(val) {
+			return false
+		}
+		m.identityKey = val
+
+	case scrVoteKey:
+		if !m.requireNonEmpty(val) {
+			return false
+		}
+		m.voteKey = val
+
 	case scrStorage:
 		if !m.requireNonEmpty(val) {
 			return false
@@ -621,16 +639,31 @@ func (m *setupModel) validateAndApplyInput() bool {
 func (m *setupModel) advanceFromInput() {
 	switch m.screen {
 	case scrRPC:
-		if m.mode == "quick" {
-			m.pushMenu(scrReview) // Quick Start skips Lightbringer (disabled by default)
+		if m.mode == "quick" || m.nodeType == "validator" {
+			// Turbine (the default source, and the only valid one for a
+			// validator) needs a gossip entrypoint; validators never use the
+			// Lightbringer sidecar.
+			m.pushInput(scrGossip)
 		} else {
-			m.pushMenu(scrLightbringer) // Full Config lets user enable it
+			m.pushMenu(scrLightbringer) // Full Config lets user enable the sidecar
 		}
 	case scrGossip:
+		if m.nodeType == "validator" {
+			m.pushInput(scrIdentityKey)
+		} else if m.mode == "quick" {
+			m.pushMenu(scrReview)
+		} else if m.enableLB {
+			m.pushMenu(scrLightbringerQuiet)
+		} else {
+			m.pushInput(scrStorage)
+		}
+	case scrIdentityKey:
+		m.pushInput(scrVoteKey)
+	case scrVoteKey:
 		if m.mode == "quick" {
 			m.pushMenu(scrReview)
 		} else {
-			m.pushMenu(scrLightbringerQuiet)
+			m.pushInput(scrStorage)
 		}
 	case scrStorage:
 		m.pushInput(scrStorageSnap)
@@ -643,7 +676,7 @@ func (m *setupModel) advanceFromInput() {
 	case scrBlockInflight:
 		m.pushInput(scrReplay)
 	case scrReplay:
-		m.pushMenu(scrConsensus)
+		m.pushMenu(scrSnapshot)
 	case scrRPCPort:
 		m.pushMenu(scrReview)
 	}
@@ -677,6 +710,18 @@ func (m setupModel) View() string {
 		return banner + "\n" + renderInput("Gossip Entrypoint",
 			"IP:port of a Solana validator running gossip\n"+
 				"Used to receive shreds from the network",
+			m.inputVal, m.inputErr, m.inputCur)
+
+	case scrIdentityKey:
+		return banner + "\n" + renderInput("Validator Identity Keypair",
+			"Path to the validator identity keypair (Solana keygen JSON)\n"+
+				"Signs gossip/turbine identity and, once voting activates, votes",
+			m.inputVal, m.inputErr, m.inputCur)
+
+	case scrVoteKey:
+		return banner + "\n" + renderInput("Vote Account Keypair",
+			"Path to the vote account keypair (Solana keygen JSON)\n"+
+				"The vote account votes are cast for · keep the WITHDRAWER keypair offline",
 			m.inputVal, m.inputErr, m.inputCur)
 
 	case scrStorage:
@@ -738,9 +783,24 @@ func (m setupModel) View() string {
 			m.inputVal, m.inputErr, m.inputCur)
 
 	case scrReview:
+		nodeType := m.nodeType
+		if nodeType == "" {
+			nodeType = "verifying"
+		}
+		nodeTypeLabel := "verifying (non-voting)"
+		if nodeType == "validator" {
+			nodeTypeLabel = "validator (voting engine not yet active)"
+		}
 		rows := [][]string{
+			{"Node type", nodeTypeLabel},
 			{"Cluster", m.cluster},
 			{"RPC", m.rpcEndpoint},
+		}
+		if nodeType == "validator" {
+			rows = append(rows,
+				[]string{"Identity key", m.identityKey},
+				[]string{"Vote key", m.voteKey},
+			)
 		}
 		if m.enableLB {
 			summary := "enabled (gossip: " + m.gossipEntry + ")"
@@ -749,7 +809,7 @@ func (m setupModel) View() string {
 			}
 			rows = append(rows, []string{"Lightbringer", summary})
 		} else {
-			rows = append(rows, []string{"Lightbringer", "disabled"})
+			rows = append(rows, []string{"Block source", "turbine (gossip: " + m.gossipEntry + ")"})
 		}
 		if m.mode == "quick" {
 			rows = append(rows, []string{"AccountsDB", m.accountsPath + " (default)"})
@@ -766,7 +826,6 @@ func (m setupModel) View() string {
 			rows = append(rows, []string{"Block RPS", m.blockMaxRPS})
 			rows = append(rows, []string{"Inflight", m.blockInflight})
 			rows = append(rows, []string{"RPC Port", m.rpcPort})
-			rows = append(rows, []string{"Consensus", m.consensusPolicy})
 			rows = append(rows, []string{"Snapshot keep", m.snapshotKeep})
 			rows = append(rows, []string{"Log Level", m.logLevel})
 		}
@@ -802,9 +861,6 @@ func (m setupModel) View() string {
 		case scrBootstrap:
 			title = "Bootstrap Mode"
 			desc = "How Mithril initializes on startup."
-		case scrConsensus:
-			title = "Consensus Policy"
-			desc = "Action when blocks can't be verified via votes."
 		case scrSnapshot:
 			title = "Snapshot Storage"
 			desc = "How many downloaded snapshots to keep."
@@ -848,10 +904,15 @@ func (m setupModel) generateConfig() (tea.Model, tea.Cmd) {
 	if m.enableLB {
 		cfg.WriteString("source = \"lightbringer\"\n")
 	} else {
-		cfg.WriteString("source = \"rpc\"\n")
+		cfg.WriteString("source = \"turbine\"\n")
+		cfg.WriteString("turbine_bind_addr = \"0.0.0.0:8001\"\n")
 	}
 	fmt.Fprintf(&cfg, "max_rps = %s\n", m.blockMaxRPS)
 	fmt.Fprintf(&cfg, "max_inflight = %s\n\n", m.blockInflight)
+	if !m.enableLB {
+		cfg.WriteString("[turbine]\n")
+		fmt.Fprintf(&cfg, "gossip_entrypoint = %q\n\n", m.gossipEntry)
+	}
 
 	if m.enableLB {
 		cfg.WriteString("[lightbringer]\n")
@@ -867,18 +928,31 @@ func (m setupModel) generateConfig() (tea.Model, tea.Cmd) {
 	cfg.WriteString("[tuning]\n")
 	fmt.Fprintf(&cfg, "txpar = %s\n\n", m.txpar)
 
-	cfg.WriteString("[validator]\n")
-	cfg.WriteString("identity_keypair = \"\"\n")
-	cfg.WriteString("vote_account_keypair = \"\"\n")
-	cfg.WriteString("authorized_withdrawer_keypair = \"\"\n\n")
+	if m.nodeType == "validator" {
+		cfg.WriteString("[validator]\n")
+		fmt.Fprintf(&cfg, "identity_keypair = %q\n", m.identityKey)
+		fmt.Fprintf(&cfg, "vote_account_keypair = %q\n", m.voteKey)
+		cfg.WriteString("# Keep the authorized withdrawer keypair OFFLINE — not needed at runtime.\n")
+		cfg.WriteString("authorized_withdrawer_keypair = \"\"\n\n")
 
-	cfg.WriteString("[consensus]\n")
-	cfg.WriteString("mode = \"classic\"\n")
-	cfg.WriteString("alpenglow_observer_bind_addr = \"\"\n")
-	cfg.WriteString("alpenglow_max_message_bytes = 0\n")
-	fmt.Fprintf(&cfg, "unresolved_policy = %q\n", m.consensusPolicy)
-	cfg.WriteString("skip_path_max_depth = 64\n")
-	cfg.WriteString("enforce_on_source = \"stream\"\n\n")
+		cfg.WriteString("[consensus]\n")
+		cfg.WriteString("# Validator mode: voting engine not yet active — runs verify-only until it lands.\n")
+		cfg.WriteString("mode = \"validator\"\n")
+		cfg.WriteString("alpenglow_observer_bind_addr = \"0.0.0.0:8010\" # REQUIRED: Votor QUIC vote/cert listener\n")
+		cfg.WriteString("alpenglow_max_message_bytes = 0\n")
+		cfg.WriteString("alpenglow_bls_dst = \"\"\n\n")
+	} else {
+		cfg.WriteString("[validator]\n")
+		cfg.WriteString("identity_keypair = \"\"\n")
+		cfg.WriteString("vote_account_keypair = \"\"\n")
+		cfg.WriteString("authorized_withdrawer_keypair = \"\"\n\n")
+
+		cfg.WriteString("[consensus]\n")
+		cfg.WriteString("mode = \"verifying\"\n")
+		cfg.WriteString("alpenglow_observer_bind_addr = \"\"\n")
+		cfg.WriteString("alpenglow_max_message_bytes = 0\n")
+		cfg.WriteString("alpenglow_bls_dst = \"\"\n\n")
+	}
 
 	cfg.WriteString("[snapshot]\n")
 	fmt.Fprintf(&cfg, "max_full_snapshots = %s\n\n", m.snapshotKeep)
@@ -891,7 +965,6 @@ func (m setupModel) generateConfig() (tea.Model, tea.Cmd) {
 	fmt.Fprintf(&cfg, "level = %q\n", m.logLevel)
 	cfg.WriteString("to_stdout = true\n")
 	cfg.WriteString("max_size_mb = 100\n")
-	cfg.WriteString("max_age_days = 7\n")
 
 	if err := tui.AtomicWriteFile(m.configPath, []byte(cfg.String()), 0600); err != nil {
 		m.err = err
@@ -923,19 +996,20 @@ snapshots = "/mnt/mithril-ledger/snapshots"   # ~100GB for full + incremental
 logs = "/mnt/mithril-logs"                    # Log files (created if missing)
 
 [network]
-cluster = "mainnet-beta"  # Required: "mainnet-beta" | "testnet" | "devnet" | "alpenglow"
-rpc = ["https://api.mainnet-beta.solana.com"]
+cluster = "alpenglow"  # This build boots Alpenglow only (TowerBFT clusters need a dev-branch build)
+rpc = ["https://alpenglow.rpcpool.com"]
 
 [block]
-source = "rpc"   # "rpc" | "lightbringer" | "turbine"
-# turbine_bind_addr = "0.0.0.0:8001"
+# "turbine" is the live mode: shreds carry the Alpenglow block ids and footer
+# certificates that gate durable state. "rpc" is catch-up/debug only.
+source = "turbine"   # "turbine" (live) | "rpc" (catch-up/debug) | "lightbringer"
+turbine_bind_addr = "0.0.0.0:8001"
 # lightbringer_endpoint = "localhost:9000"
 max_rps = 8
 max_inflight = 8
 
-# [turbine]
-# bind_addr = "0.0.0.0:8001"
-# gossip_entrypoint = "1.2.3.4:8000"
+[turbine]
+gossip_entrypoint = ""     # REQUIRED for turbine: a gossip entrypoint of your Alpenglow cluster
 # gossip_bind_addr = "0.0.0.0:65401"
 # advertised_ip = "203.0.113.10"
 # shred_version = 0
@@ -958,12 +1032,10 @@ vote_account_keypair = ""          # Optional vote account keypair path for diag
 authorized_withdrawer_keypair = "" # Optional authorized withdrawer keypair path for diagnostics
 
 [consensus]
-mode = "classic"           # "classic" | "alpenglow-observer" | "alpenglow"
-alpenglow_observer_bind_addr = "" # Optional Votor QUIC listener for observer mode
+mode = "verifying"                # "verifying" (default, non-voting) | "validator" (requires keypairs + Votor listener; voting engine not yet active)
+alpenglow_observer_bind_addr = "" # Optional Votor QUIC listener (raw-vote cert feed)
 alpenglow_max_message_bytes = 0   # 0 = default
-unresolved_policy = "halt"   # "halt" | "warn"
-skip_path_max_depth = 64
-enforce_on_source = "stream"
+alpenglow_bls_dst = ""            # BLS DST override (must match cluster solana-bls version)
 
 [snapshot]
 max_full_snapshots = 1   # 0 = stream only, saves disk
@@ -976,7 +1048,7 @@ dir = "/mnt/mithril-logs"  # Log files (created if missing)
 level = "info"             # "debug" | "info" | "warn" | "error"
 to_stdout = true           # Also write to stdout
 max_size_mb = 100          # Max log file size before rotation
-max_age_days = 7           # Delete logs older than this
+# max_age_days = 0         # Delete logs older than N days (0/unset = never delete by age)
 
 # Advanced options (defaults work well for most setups)
 # See config.example.toml for: [tuning], [debug], [snapshot] tuning, [reporting]

@@ -2,7 +2,6 @@ package consensus
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -14,16 +13,6 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/gagliardetto/solana-go"
 )
-
-type Mode string
-
-const (
-	ModeClassic           Mode = "classic"
-	ModeAlpenglowObserver Mode = "alpenglow-observer"
-	ModeAlpenglow         Mode = "alpenglow"
-)
-
-var ErrAlpenglowVotingNotImplemented = errors.New("alpenglow voting mode is not implemented yet; use consensus.mode=\"alpenglow-observer\"")
 
 const (
 	maxRecentAlpenglowBlockIDs          = 8192
@@ -80,8 +69,33 @@ type AlpenglowEpochLookupSink interface {
 	SetAlpenglowEpochLookup(fn func(slot uint64) uint64)
 }
 
+// AlpenglowPruneSink lets replay prune consensus bookkeeping as slots fold.
+type AlpenglowPruneSink interface {
+	PruneAlpenglowBefore(slot uint64)
+}
+
+// AlpenglowChainQuery answers the switch sweep's decisive-certificate
+// questions (unique-strength or finalized block per slot; certified skips).
+type AlpenglowChainQuery interface {
+	CertifiedBlockAt(slot uint64) (alpenglow.BlockID, alpenglow.CertificateType, bool)
+	SkipCertifiedAt(slot uint64) bool
+	// ChainDecisionVersion gates the sweep: it advances on ANY decision-relevant
+	// change (cert acceptance, replay-derived parent links, finalized ancestry,
+	// indirect skips, conflicts), not only on new certificates — so a
+	// contradiction that arises without a new cert is never missed.
+	ChainDecisionVersion() uint64
+}
+
+// AlpenglowWantedBlocksSource surfaces certified-but-unobserved blocks so the
+// block source can steer turbine/repair toward data the cluster has already
+// voted real (cert-driven repair).
+type AlpenglowWantedBlocksSource interface {
+	AlpenglowWantedBlocks(afterSlot uint64, max int) []alpenglow.WantedBlock
+	SkipCertifiedAt(slot uint64) bool
+}
+
 type Snapshot struct {
-	Mode           Mode                     `json:"mode"`
+	Mode           string                   `json:"mode"`
 	ObservedBlocks uint64                   `json:"observed_blocks"`
 	ReplayedSlots  uint64                   `json:"replayed_slots"`
 	Alpenglow      *alpenglow.Snapshot      `json:"alpenglow,omitempty"`
@@ -104,88 +118,36 @@ type Config struct {
 	AlpenglowBLSDST           string // BLS hash-to-curve DST; empty keeps the default (must match cluster's solana-bls version)
 }
 
-func NormalizeMode(raw string) (Mode, error) {
-	mode := Mode(strings.ToLower(strings.TrimSpace(raw)))
-	if mode == "" {
-		return ModeClassic, nil
-	}
-	if mode == "legacy" {
-		return ModeClassic, nil
-	}
-
-	switch mode {
-	case ModeClassic, ModeAlpenglowObserver, ModeAlpenglow:
-		return mode, nil
-	default:
-		return "", fmt.Errorf("invalid consensus.mode %q (must be \"classic\", \"alpenglow-observer\", or \"alpenglow\")", raw)
-	}
-}
-
-func NewEngine(mode Mode) (Engine, error) {
-	return NewEngineWithConfig(mode, Config{})
-}
-
-func NewEngineWithConfig(mode Mode, cfg Config) (Engine, error) {
+// NewEngine constructs the Alpenglow observer engine — the only consensus
+// engine in this Alpenglow-only build.
+func NewEngine(cfg Config) (*AlpenglowObserverEngine, error) {
 	alpenglow.SetHashToPointDST(strings.TrimSpace(cfg.AlpenglowBLSDST))
-	switch mode {
-	case ModeClassic:
-		return &ClassicEngine{}, nil
-	case ModeAlpenglowObserver:
-		return &AlpenglowObserverEngine{
-			observer:                alpenglow.NewObserver(),
-			chain:                   newAlpenglowObserverChainTracker(),
-			verifier:                alpenglow.NewCertificateVerifier(),
-			receiverBindAddr:        strings.TrimSpace(cfg.AlpenglowObserverBindAddr),
-			receiverMaxMessageBytes: cfg.AlpenglowMaxMessageBytes,
-			recentBlockIDs:          make(map[uint64]solana.Hash),
-		}, nil
-	case ModeAlpenglow:
-		return &AlpenglowEngine{}, nil
-	default:
-		return nil, fmt.Errorf("unsupported consensus mode %q", mode)
+	e := &AlpenglowObserverEngine{
+		observer:                alpenglow.NewObserver(),
+		chain:                   newAlpenglowObserverChainTracker(),
+		verifier:                alpenglow.NewCertificateVerifier(),
+		receiverBindAddr:        strings.TrimSpace(cfg.AlpenglowObserverBindAddr),
+		receiverMaxMessageBytes: cfg.AlpenglowMaxMessageBytes,
+		recentBlockIDs:          make(map[uint64]solana.Hash),
 	}
+	// The cert pool assembles certificates locally from raw Votor votes;
+	// pool-assembled certs are fully stake+signature verified and enter the
+	// chain tracker exactly like verified wire certs.
+	e.certPool = alpenglow.NewCertPool(alpenglow.DefaultCertPoolConfig(), e.verifier, func(cert alpenglow.Certificate) {
+		if _, err := e.ensureChain().ObserveCertificate(cert); err != nil {
+			mlog.Log.FileOnlyf("ALPENGLOW observer: pool-assembled certificate rejected by tracker: %v", err)
+			return
+		}
+		e.observeVotorBlockID(alpenglow.Message{Certificate: &cert})
+	})
+	return e, nil
 }
-
-type ClassicEngine struct {
-	observedBlocks atomic.Uint64
-	replayedSlots  atomic.Uint64
-}
-
-func (e *ClassicEngine) Name() string { return string(ModeClassic) }
-
-func (e *ClassicEngine) Start(context.Context) error {
-	mlog.Log.Infof("Consensus engine started: %s", e.Name())
-	return nil
-}
-
-func (e *ClassicEngine) ObserveBlock(_ context.Context, obs BlockObservation) error {
-	if obs.Block != nil {
-		e.observedBlocks.Add(1)
-	}
-	return nil
-}
-
-func (e *ClassicEngine) OnReplayResult(_ context.Context, result SlotReplayResult) error {
-	if result.Slot != 0 {
-		e.replayedSlots.Add(1)
-	}
-	return nil
-}
-
-func (e *ClassicEngine) Snapshot() Snapshot {
-	return Snapshot{
-		Mode:           ModeClassic,
-		ObservedBlocks: e.observedBlocks.Load(),
-		ReplayedSlots:  e.replayedSlots.Load(),
-	}
-}
-
-func (e *ClassicEngine) Close() error { return nil }
 
 type AlpenglowObserverEngine struct {
 	observedBlocks          atomic.Uint64
 	replayedSlots           atomic.Uint64
 	observer                *alpenglow.Observer
+	certPool                *alpenglow.CertPool
 	chain                   *alpenglow.ChainTracker
 	verifier                *alpenglow.CertificateVerifier
 	receiverBindAddr        string
@@ -214,7 +176,7 @@ type AlpenglowObserverEngine struct {
 	lastVoteVerifyErr       string
 }
 
-func (e *AlpenglowObserverEngine) Name() string { return string(ModeAlpenglowObserver) }
+func (e *AlpenglowObserverEngine) Name() string { return "alpenglow-observer" }
 
 func (e *AlpenglowObserverEngine) Start(ctx context.Context) error {
 	observer := e.ensureObserver()
@@ -281,13 +243,18 @@ func (e *AlpenglowObserverEngine) OnReplayResult(_ context.Context, result SlotR
 			Source:   result.Source,
 			At:       result.At,
 		})
+		// Anchor the cert pool's vote window to execution-proven progress — a
+		// trusted signal an attacker cannot advance (unlike raw vote slots).
+		if e.certPool != nil {
+			e.certPool.NoteLiveSlot(result.Slot)
+		}
 	}
 	return nil
 }
 
 func (e *AlpenglowObserverEngine) Snapshot() Snapshot {
 	snapshot := Snapshot{
-		Mode:           ModeAlpenglowObserver,
+		Mode:           "alpenglow-observer",
 		ObservedBlocks: e.observedBlocks.Load(),
 		ReplayedSlots:  e.replayedSlots.Load(),
 	}
@@ -330,7 +297,9 @@ func (e *AlpenglowObserverEngine) SetAlpenglowBlockIDSink(sink AlpenglowBlockIDS
 
 func (e *AlpenglowObserverEngine) observeVotorMessage(msg alpenglow.Message) {
 	if msg.Vote != nil {
-		e.sampleVoteVerification(*msg.Vote)
+		// The cert pool owns vote verification now (lazy, batched); the old
+		// per-window sampling verifier is redundant with it.
+		e.certPool.AddVote(*msg.Vote)
 	}
 	if msg.Certificate != nil {
 		verified, result, err := e.verifyCertificate(*msg.Certificate)
@@ -518,13 +487,55 @@ func (e *AlpenglowObserverEngine) SetAlpenglowValidatorSet(set alpenglow.Validat
 	}
 	mlog.Log.FileOnlyf("ALPENGLOW observer: installed validator set for epoch %d (validators=%d total_stake=%d)", set.Epoch, len(set.Validators), set.TotalStake)
 	e.replayPendingCertsForEpoch(set.Epoch)
+	if e.certPool != nil {
+		e.certPool.OnValidatorSetInstalled(set.Epoch)
+	}
 	return nil
+}
+
+// CertifiedBlockAt exposes the tracker's decisive block for the switch sweep.
+func (e *AlpenglowObserverEngine) CertifiedBlockAt(slot uint64) (alpenglow.BlockID, alpenglow.CertificateType, bool) {
+	return e.ensureChain().CertifiedBlockAt(slot)
+}
+
+// SkipCertifiedAt exposes certified skips for the switch sweep.
+func (e *AlpenglowObserverEngine) SkipCertifiedAt(slot uint64) bool {
+	return e.ensureChain().SkipCertifiedAt(slot)
+}
+
+// ChainDecisionVersion gates the sweep: it re-walks executed slots whenever the
+// tracker became more decisive, including replay-derived changes that land
+// without a new certificate.
+func (e *AlpenglowObserverEngine) ChainDecisionVersion() uint64 {
+	return e.ensureChain().DecisionVersion()
+}
+
+// AlpenglowWantedBlocks lists certified-but-unobserved blocks for cert-driven
+// repair (ascending, capped).
+func (e *AlpenglowObserverEngine) AlpenglowWantedBlocks(afterSlot uint64, max int) []alpenglow.WantedBlock {
+	return e.ensureChain().WantedBlocks(afterSlot, max)
 }
 
 func (e *AlpenglowObserverEngine) SetAlpenglowEpochLookup(fn func(slot uint64) uint64) {
 	e.epochLookupMu.Lock()
 	e.epochForSlot = fn
 	e.epochLookupMu.Unlock()
+	if e.certPool != nil {
+		e.certPool.SetEpochLookup(fn)
+	}
+}
+
+// PruneAlpenglowBefore drops consensus bookkeeping for slots at or below the
+// durably-folded watermark: chain-tracker state and cert-pool tallies.
+// Equivocation and conflict evidence survive pruning by design.
+func (e *AlpenglowObserverEngine) PruneAlpenglowBefore(slot uint64) {
+	if slot == 0 {
+		return
+	}
+	e.ensureChain().PruneBeforeSlot(slot)
+	if e.certPool != nil {
+		e.certPool.ObserveFloor(slot)
+	}
 }
 
 func (e *AlpenglowObserverEngine) Close() error {
@@ -778,21 +789,3 @@ func parentBlockIDOrZero(block *block.Block) solana.Hash {
 	}
 	return solana.Hash(block.AlpenglowParentBlockID)
 }
-
-type AlpenglowEngine struct{}
-
-func (e *AlpenglowEngine) Name() string { return string(ModeAlpenglow) }
-
-func (e *AlpenglowEngine) Start(context.Context) error {
-	return ErrAlpenglowVotingNotImplemented
-}
-
-func (e *AlpenglowEngine) ObserveBlock(context.Context, BlockObservation) error { return nil }
-
-func (e *AlpenglowEngine) OnReplayResult(context.Context, SlotReplayResult) error { return nil }
-
-func (e *AlpenglowEngine) Snapshot() Snapshot {
-	return Snapshot{Mode: ModeAlpenglow}
-}
-
-func (e *AlpenglowEngine) Close() error { return nil }

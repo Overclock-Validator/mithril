@@ -3,6 +3,8 @@ package state
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -126,9 +128,9 @@ func TestDurableHighWater(t *testing.T) {
 }
 
 // In rooted mode, ValidateAgainstBankhashDB must assert the durable high-water
-// is exactly R: bankhash_db has an entry at R (matching LastRootedBankhash) and
-// NOTHING beyond R. A bankhash beyond R = a torn durable write (process killed
-// after CommitSlotAtomic wrote the next slot.s bankhash but before the state file recorded it).
+// is exactly R: bankhash_db has an entry at R (matching LastRootedBankhash).
+// Rows beyond R are tolerated now (fold bankhashes are written NoSync and a
+// batch can carry rows for slots above a partially-advanced state file).
 func TestValidateAgainstBankhashDB_RootedMode(t *testing.T) {
 	t.Run("clean: db high-water == R", func(t *testing.T) {
 		s := &MithrilState{LastSlot: 110, LastRootedSlot: 100, LastRootedBankhash: base58.Encode(bh(0xAA))}
@@ -138,11 +140,14 @@ func TestValidateAgainstBankhashDB_RootedMode(t *testing.T) {
 		}
 	})
 
-	t.Run("torn: bankhash beyond R", func(t *testing.T) {
+	t.Run("bankhash beyond R is tolerated (NoSync fold rows)", func(t *testing.T) {
+		// Batch folds write bankhash rows NoSync and RecoverFoldState is the
+		// commit authority — rows beyond the state file's R are expected after
+		// a hard kill, not evidence of a torn write.
 		s := &MithrilState{LastSlot: 110, LastRootedSlot: 100, LastRootedBankhash: base58.Encode(bh(0xAA))}
 		db := &mockBankhashDb{hashes: map[uint64][]byte{100: bh(0xAA), 101: bh(0xBB)}}
-		if err := s.ValidateAgainstBankhashDB(db); err == nil {
-			t.Fatal("expected error for bankhash beyond R, got nil")
+		if err := s.ValidateAgainstBankhashDB(db); err != nil {
+			t.Fatalf("bankhash rows beyond R must be tolerated, got: %v", err)
 		}
 	})
 
@@ -181,4 +186,33 @@ func TestValidateAgainstBankhashDB_LegacyUnchanged(t *testing.T) {
 			t.Fatal("expected error for bankhash beyond LastSlot, got nil")
 		}
 	})
+}
+
+// Older state files carry manifest_epoch_authorized_voters (removed in the
+// Alpenglow-only build). Loading such a file must succeed — unknown JSON
+// fields are ignored — so upgrades don't force a re-bootstrap.
+func TestStateFileWithRemovedAuthorizedVotersFieldStillLoads(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, StateFileName)
+	legacy := fmt.Sprintf(`{
+		"state_schema_version": %d,
+		"stage": "ready",
+		"last_slot": 123,
+		"manifest_epoch_authorized_voters": {
+			"Vote111111111111111111111111111111111111111": ["Voter11111111111111111111111111111111111111"]
+		}
+	}`, CurrentStateSchemaVersion)
+	if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
+		t.Fatalf("write legacy state file: %v", err)
+	}
+	st, err := LoadState(dir)
+	if err != nil {
+		t.Fatalf("LoadState returned error for legacy state file: %v", err)
+	}
+	if st == nil {
+		t.Fatal("LoadState returned nil state")
+	}
+	if st.LastSlot != 123 {
+		t.Fatalf("LastSlot = %d, want 123", st.LastSlot)
+	}
 }

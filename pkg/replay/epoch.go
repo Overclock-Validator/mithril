@@ -186,13 +186,10 @@ func updateStakeHistorySysvar(acctsDb *accountsdb.AccountsDb, block *block.Block
 }
 
 func handleEpochTransition(acctsDb *accountsdb.AccountsDb, partitionedEpochRewards bool, prevSlotCtx *sealevel.SlotCtx, replayCtx *ReplayCtx, epochSchedule *sealevel.SysvarEpochSchedule, f *features.Features, block *block.Block, epoch uint64, rpcc *rpcclient.RpcClient, dbgOpts *DebugOptions) *rewards.PartitionedRewardDistributionInfo {
-	// Flush any pending stake pubkeys to the index file before scanning.
-	// The async StoreAccounts callback from the previous block may not have
-	// run yet, so flush here to ensure the index is complete for the scan.
-	acctsDbDir := filepath.Join(acctsDb.AcctsDir, "..")
-	if _, err := global.FlushPendingStakePubkeys(acctsDbDir); err != nil {
-		mlog.Log.Errorf("failed to flush stake pubkeys before epoch scan: %v", err)
-	}
+	// No pre-scan index flush: StreamStakeAccounts merges the RAM-pending
+	// stake entries (slots not yet folded) with the file-backed index, so the
+	// scan is complete without durably writing entries for slots a fork
+	// switch could still unwind. Entries reach the file only at fold time.
 
 	// Load stake history (used by both scan and rewards)
 	var stakeHistory sealevel.SysvarStakeHistory
@@ -250,7 +247,9 @@ func handleEpochTransition(acctsDb *accountsdb.AccountsDb, partitionedEpochRewar
 	t5 := time.Now()
 
 	// Compact stake index at epoch boundary — removes duplicates from appends
-	if err := global.CompactStakePubkeyIndex(acctsDbDir); err != nil {
+	// (rewrites from the file-backed cache only; RAM-pending entries for
+	// unfolded slots are untouched and flush at their own fold).
+	if err := global.CompactStakePubkeyIndex(filepath.Join(acctsDb.AcctsDir, "..")); err != nil {
 		mlog.Log.Errorf("failed to compact stake pubkey index: %v", err)
 	}
 
@@ -274,11 +273,6 @@ func updateEpochStakesAndRefreshVoteCache(leaderScheduleEpoch uint64, b *block.B
 		mlog.Log.Errorf("failed to rebuild vote cache at epoch boundary: %v", err)
 	}
 
-	// Rebuild authorized voters cache from vote accounts for the new epoch.
-	// This ensures forkchoice vote parsing uses current authorities, not stale manifest data.
-	newEpoch := b.Epoch
-	rebuildAuthorizedVotersFromVoteCache(newEpoch)
-
 	// Skip epoch stakes storage if already cached (resume)
 	if hasEpochStakes {
 		mlog.Log.Infof("already had EpochStakes for epoch %d", leaderScheduleEpoch)
@@ -300,41 +294,4 @@ func updateEpochStakesAndRefreshVoteCache(leaderScheduleEpoch uint64, b *block.B
 
 	maps.Copy(b.EpochStakesPerVoteAcct, global.EpochStakes(leaderScheduleEpoch))
 	b.TotalEpochStake = scanResult.TotalEffectiveStake
-}
-
-// rebuildAuthorizedVotersFromVoteCache rebuilds the epoch authorized voters cache
-// using vote states already loaded in the global VoteCache. This avoids re-reading
-// AccountsDB since RebuildVoteCacheFromAccountsDB already populated the cache.
-func rebuildAuthorizedVotersFromVoteCache(epoch uint64) {
-	voteCache := global.VoteCache()
-	newCache := epochstakes.NewEpochAuthorizedVotersCache()
-
-	for voteAcct, voteState := range voteCache {
-		if voteState == nil {
-			continue
-		}
-		switch voteState.Type {
-		case sealevel.VoteStateVersionV0_23_5:
-			// V0_23_5 has a single authorized voter
-			newCache.PutEntry(voteAcct, voteState.V0_23_5.AuthorizedVoter)
-		case sealevel.VoteStateVersionV1_14_11:
-			voter, _, err := voteState.V1_14_11.AuthorizedVoters.GetOrCalculateAuthorizedVoterForEpoch(epoch)
-			if err == nil {
-				newCache.PutEntry(voteAcct, voter)
-			}
-		case sealevel.VoteStateVersionCurrent:
-			voter, _, err := voteState.Current.AuthorizedVoters.GetOrCalculateAuthorizedVoterForEpoch(epoch)
-			if err == nil {
-				newCache.PutEntry(voteAcct, voter)
-			}
-		case sealevel.VoteStateVersionV4:
-			voter, _, err := voteState.V4.AuthorizedVoters.GetOrCalculateAuthorizedVoterForEpoch(epoch)
-			if err == nil {
-				newCache.PutEntry(voteAcct, voter)
-			}
-		}
-	}
-
-	global.SetEpochAuthorizedVoters(newCache)
-	mlog.Log.Infof("forkchoice: rebuilt authorized voters cache for epoch %d (%d entries)", epoch, newCache.Len())
 }

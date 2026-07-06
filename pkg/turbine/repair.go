@@ -177,17 +177,21 @@ func (c *repairClient) handleRepairPing(conn *net.UDPConn, packet []byte, from *
 	return true
 }
 
-func (c *repairClient) observeShredResponse(conn *net.UDPConn, packet []byte, from *net.UDPAddr, shred *Shred) {
+// observeShredResponse matches an incoming packet against outstanding repair
+// requests (responder address + nonce). Returns true when the shred was
+// delivered BY REPAIR — it answers one of our requests — so the caller can
+// attribute it in per-slot repair accounting.
+func (c *repairClient) observeShredResponse(conn *net.UDPConn, packet []byte, from *net.UDPAddr, shred *Shred) bool {
 	if from == nil || shred == nil {
-		return
+		return false
 	}
 	nonce, ok := repairproto.ResponseNonce(packet)
 	if !ok {
-		return
+		return false
 	}
 	addrKey, ok := repairAddressKeyFromUDP(from)
 	if !ok {
-		return
+		return false
 	}
 	responseKey := repairResponseKey{addr: addrKey, nonce: nonce}
 
@@ -195,7 +199,7 @@ func (c *repairClient) observeShredResponse(conn *net.UDPConn, packet []byte, fr
 	reqKey, ok := c.byResponse[responseKey]
 	if !ok {
 		c.mu.Unlock()
-		return
+		return false
 	}
 	outstanding := c.outstanding[reqKey]
 	delete(c.byResponse, responseKey)
@@ -203,16 +207,16 @@ func (c *repairClient) observeShredResponse(conn *net.UDPConn, packet []byte, fr
 	c.mu.Unlock()
 
 	if outstanding.key.slot != shred.Slot {
-		return
+		return false
 	}
 	c.responses.Add(1)
 	if outstanding.key.kind != repairRequestHighestWindowIndex || shred.Type != ShredTypeData {
-		return
+		return true
 	}
 
 	peers := c.peerSnapshot(time.Now())
 	if len(peers) == 0 {
-		return
+		return true
 	}
 	start := outstanding.key.index
 	followups := 0
@@ -224,6 +228,7 @@ func (c *repairClient) observeShredResponse(conn *net.UDPConn, packet []byte, fr
 	if !shred.LastInSlot() && followups < repairMaxFollowupRequests && shred.Index < maxDataShredsPerSlot-1 {
 		c.sendRequest(conn, peers, repairRequestHighestWindowIndex, shred.Slot, shred.Index+1)
 	}
+	return true
 }
 
 func (c *repairClient) sendRequest(conn *net.UDPConn, peers []gossip.RepairPeer, kind repairRequestKind, slot uint64, index uint32) bool {

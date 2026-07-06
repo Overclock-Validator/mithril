@@ -57,13 +57,17 @@ type BlockSourceOpts struct {
 	LeaderForSlot                func(slot uint64) (solana.PublicKey, bool)
 	AlpenglowDecisionSource      func(anchorSlot uint64) (alpenglow.ChainDecision, bool)
 	AlpenglowCandidateBlockSink  func(alpenglow.ReplayBlockObservation)
-	StartSlot                    uint64
-	EndSlot                      uint64
-	BlockDir                     string
+	// Cert-driven repair feed: certified-but-unobserved blocks the repair loop
+	// steers turbine toward, and the skip oracle that cancels shred state for
+	// certificate-skipped slots.
+	AlpenglowWantedBlocks  func(afterSlot uint64, max int) []alpenglow.WantedBlock
+	AlpenglowSkipCertified func(slot uint64) bool
+	StartSlot              uint64
+	EndSlot                uint64
+	BlockDir               string
 	// When enabled, an active near-tip Lightbringer stream is delivered to replay
 	// as an observation feed for consensus buffering instead of requiring the
 	// block source to resolve every local gap before delivery.
-	ConsensusManagedLightbringer bool
 
 	// Backup RPC endpoints for failover (optional)
 	// These are tried in order if the primary fails with hard connectivity errors
@@ -322,13 +326,14 @@ type BlockSource struct {
 	lightbringerBufferMu           sync.Mutex
 	lightbringerBuffer             map[uint64]*b.Block
 	lightbringerBufferOrder        []uint64
-	consensusManagedLightbringer   bool
 	alpenglowMu                    sync.Mutex
 	knownAlpenglowBlockIDs         map[uint64]solana.Hash
 	knownAlpenglowBlockIDOrder     []uint64
 	activeTurbineReceiver          *turbine.UDPReceiver
 	alpenglowDecisionSource        func(anchorSlot uint64) (alpenglow.ChainDecision, bool)
 	alpenglowCandidateBlockSink    func(alpenglow.ReplayBlockObservation)
+	alpenglowWantedBlocksFn        func(afterSlot uint64, max int) []alpenglow.WantedBlock
+	alpenglowSkipCertifiedFn       func(slot uint64) bool
 
 	// Stats tracking
 	stats          BlockSourceStats
@@ -501,8 +506,9 @@ func NewBlockSource(opts *BlockSourceOpts) *BlockSource {
 		leaderForSlot:                opts.LeaderForSlot,
 		alpenglowDecisionSource:      opts.AlpenglowDecisionSource,
 		alpenglowCandidateBlockSink:  opts.AlpenglowCandidateBlockSink,
+		alpenglowWantedBlocksFn:      opts.AlpenglowWantedBlocks,
+		alpenglowSkipCertifiedFn:     opts.AlpenglowSkipCertified,
 		lightbringerBuffer:           make(map[uint64]*b.Block),
-		consensusManagedLightbringer: opts.ConsensusManagedLightbringer,
 		knownAlpenglowBlockIDs:       make(map[uint64]solana.Hash),
 
 		// Configurable mode thresholds
@@ -592,6 +598,38 @@ func (bs *BlockSource) resetTurbineSlotForAlpenglowBlock(slot uint64, blockID so
 	}
 }
 
+// TurbineShredEdges reports the monotonic shred frontier (latest shred slot,
+// highest full slot) from the active turbine receiver. ok is false when no
+// receiver is active (RPC-only / pre-handoff) — callers must not fabricate
+// shred stats then.
+func (bs *BlockSource) TurbineShredEdges() (latestShredSlot, highestFullSlot uint64, ok bool) {
+	bs.alpenglowMu.Lock()
+	receiver := bs.activeTurbineReceiver
+	bs.alpenglowMu.Unlock()
+	if receiver == nil {
+		return 0, 0, false
+	}
+	latest, full := receiver.ShredEdges()
+	return latest, full, true
+}
+
+// TurbineShredObservation reports partial shred arrivals for a slot that never
+// became full — "the leader sent SOMETHING" skip observability. ok is false
+// when no receiver is active or no shred was ever accepted for the slot.
+func (bs *BlockSource) TurbineShredObservation(slot uint64) (dataShreds, repairedShreds int, firstNanos int64, ok bool) {
+	bs.alpenglowMu.Lock()
+	receiver := bs.activeTurbineReceiver
+	bs.alpenglowMu.Unlock()
+	if receiver == nil {
+		return 0, 0, 0, false
+	}
+	obs, found := receiver.ShredObservation(slot)
+	if !found {
+		return 0, 0, 0, false
+	}
+	return obs.DataShreds, obs.RepairedShreds, obs.FirstNanos, true
+}
+
 func (bs *BlockSource) prioritizeTurbineRepairRange(start, end uint64) {
 	if bs.sourceType != BlockSourceTurbine || !bs.turbineAlpenglowBlockIDHints || start == 0 {
 		return
@@ -614,6 +652,126 @@ func (bs *BlockSource) prioritizeTurbineRepairForLiveGap(waitingSlot, firstBuffe
 		end = firstBufferedParentSlot
 	}
 	bs.prioritizeTurbineRepairRange(waitingSlot, end)
+}
+
+// Cert-driven repair. Certificates prove which block data the cluster voted
+// real BEFORE turbine finishes delivering it here: a certified-but-unobserved
+// block means we are missing (or mis-assembled) data the chain has already
+// settled on. The repair loop closes that gap continuously instead of waiting
+// for the emission frontier to stall on it:
+//
+//   - certified block not yet observed  -> pin the assembler to the certified
+//     block id and pull repair for the slot
+//   - buffered pre-emission candidate carrying a DIFFERENT id -> provably
+//     non-canonical; discard it and re-arm the slot for the certified version
+//     (the post-emission case is the replay switch sweep's job)
+//   - certificate-skipped slot -> drop its partial shred state so the
+//     receiver stops assembling and repairing data the chain discarded
+//
+// This also services the switch sweep: after a wrong-sibling unwind the
+// certified sibling stays "wanted" until observed, so the hints re-fire every
+// nudge interval until the data lands.
+const (
+	alpenglowRepairTick       = 250 * time.Millisecond
+	alpenglowRepairMaxWanted  = 32
+	alpenglowRepairNudgePause = time.Second // at most one nudge per slot per second
+)
+
+func (bs *BlockSource) alpenglowRepairLoop() {
+	ticker := time.NewTicker(alpenglowRepairTick)
+	defer ticker.Stop()
+	nudged := make(map[uint64]time.Time) // loop-local: single-goroutine rate limiter
+	for {
+		select {
+		case <-bs.stopChan:
+			return
+		case <-ticker.C:
+			bs.serviceAlpenglowWantedBlocks(nudged, time.Now())
+		}
+	}
+}
+
+// serviceAlpenglowWantedBlocks runs one repair pass. nudged is the per-slot
+// rate limiter (owned by the calling goroutine); entries at or below the
+// emission frontier are pruned as it advances.
+func (bs *BlockSource) serviceAlpenglowWantedBlocks(nudged map[uint64]time.Time, now time.Time) {
+	if bs.alpenglowWantedBlocksFn == nil || bs.sourceType != BlockSourceTurbine || !bs.turbineAlpenglowBlockIDHints {
+		return
+	}
+	if !bs.isNearTip.Load() {
+		return // catch-up fills gaps via ordinary backfill; hints would be noise
+	}
+
+	bs.reorderMu.Lock()
+	waiting := bs.nextSlotToSend
+	bs.reorderMu.Unlock()
+	if waiting == 0 {
+		return
+	}
+	after := waiting - 1
+
+	for slot := range nudged {
+		if slot <= after {
+			delete(nudged, slot)
+		}
+	}
+
+	for _, w := range bs.alpenglowWantedBlocksFn(after, alpenglowRepairMaxWanted) {
+		slot := w.Block.Slot
+		if last, ok := nudged[slot]; ok && now.Sub(last) < alpenglowRepairNudgePause {
+			continue
+		}
+
+		bs.reorderMu.Lock()
+		blk := bs.reorderBuffer[slot]
+		haveCertified := blk != nil && blk.HasAlpenglowBlockID && solana.Hash(blk.AlpenglowBlockID) == w.Block.Hash
+		mismatch := blk != nil && blk.HasAlpenglowBlockID && !haveCertified
+		if mismatch {
+			delete(bs.reorderBuffer, slot)
+			bs.slotStateMu.Lock()
+			delete(bs.slotState, slot)
+			delete(bs.inflightStart, slot)
+			bs.slotStateMu.Unlock()
+		}
+		bs.reorderMu.Unlock()
+
+		if haveCertified {
+			continue // assembled and waiting its emission turn; nothing to repair
+		}
+		nudged[slot] = now
+		if mismatch {
+			bs.clearSlotErrors(slot)
+			bs.resetTurbineSlotForAlpenglowBlock(slot, w.Block.Hash)
+			mlog.Log.Warnf("ALPENGLOW repair: discarded buffered non-certified candidate at slot %d; repairing toward certified block %s",
+				slot, w.Block.Hash)
+			continue
+		}
+		bs.SetKnownAlpenglowBlockID(slot, w.Block.Hash)
+		bs.prioritizeTurbineRepairRange(slot, slot)
+	}
+
+	// Skip-cancel: certificate-skipped slots ahead of the frontier stop
+	// accumulating shred state and stop generating repair requests. Slots with
+	// a finalized block over a skip never reach here — the wanted-block nudge
+	// above refreshes their limiter entry first (finality outranks a skip).
+	if bs.alpenglowSkipCertifiedFn == nil {
+		return
+	}
+	for slot := after + 1; slot <= after+alpenglowRepairMaxWanted; slot++ {
+		if last, ok := nudged[slot]; ok && now.Sub(last) < alpenglowRepairNudgePause {
+			continue
+		}
+		if !bs.alpenglowSkipCertifiedFn(slot) {
+			continue
+		}
+		nudged[slot] = now
+		bs.alpenglowMu.Lock()
+		receiver := bs.activeTurbineReceiver
+		bs.alpenglowMu.Unlock()
+		if receiver != nil {
+			receiver.ResetSlot(slot)
+		}
+	}
 }
 
 func (bs *BlockSource) attachAlpenglowBlockIDHintsToReceiver(receiver *turbine.UDPReceiver) {
@@ -725,9 +883,6 @@ func (bs *BlockSource) updateMode() {
 	if wasNearTip {
 		// Currently in near-tip mode - switch to catchup if gap exceeds threshold
 		if gap >= bs.catchupThreshold {
-			if bs.shouldDeferCatchupForConsensusBufferedLightbringer(gap, lastExecuted, tip) {
-				return
-			}
 			bs.isNearTip.Store(false)
 			mlog.Log.Infof("MODE SWITCH: near-tip → CATCHUP | gap=%d (threshold=%d) | exec_slot=%d | tip=%d",
 				gap, bs.catchupThreshold, lastExecuted, tip)
@@ -751,60 +906,6 @@ func (bs *BlockSource) updateMode() {
 	}
 }
 
-func (bs *BlockSource) consensusBufferedLightbringerMaxReplayGap() uint64 {
-	if bs.catchupThreshold == 0 {
-		return 0
-	}
-	if bs.catchupThreshold > math.MaxUint64/2 {
-		return math.MaxUint64
-	}
-	return bs.catchupThreshold * 2
-}
-
-func (bs *BlockSource) consensusBufferedLightbringerMaxSourceGap() uint64 {
-	maxGap := bs.nearTipThreshold
-	if maxGap == 0 || (bs.catchupThreshold > 0 && maxGap > bs.catchupThreshold) {
-		maxGap = bs.catchupThreshold
-	}
-	return maxGap
-}
-
-func (bs *BlockSource) shouldDeferCatchupForConsensusBufferedLightbringer(gap uint64, lastExecuted uint64, tip uint64) bool {
-	if !bs.usesLiveShredStream() {
-		return false
-	}
-	if !bs.consensusManagedLightbringer || !bs.lightbringerActive.Load() || !bs.lightbringerConnected.Load() {
-		return false
-	}
-	if maxReplayGap := bs.consensusBufferedLightbringerMaxReplayGap(); maxReplayGap != 0 && gap > maxReplayGap {
-		return false
-	}
-
-	latestStreamed := bs.lightbringerLastStreamSlot.Load()
-	if latestStreamed <= lastExecuted {
-		return false
-	}
-	if tip > latestStreamed {
-		sourceGap := tip - latestStreamed
-		if maxSourceGap := bs.consensusBufferedLightbringerMaxSourceGap(); maxSourceGap != 0 && sourceGap > maxSourceGap {
-			return false
-		}
-	}
-
-	lastRecvUnix := bs.lightbringerLastRecvUnix.Load()
-	if lastRecvUnix == 0 || time.Since(time.Unix(lastRecvUnix, 0)) >= lightbringerIdleReconnect {
-		return false
-	}
-	lastProgressUnix := bs.lastProgress.Load()
-	if lastProgressUnix != 0 && time.Since(time.Unix(lastProgressUnix, 0)) >= lightbringerNoEmitReconnect {
-		return false
-	}
-
-	return true
-}
-
-// effectiveTipSafetyMargin returns the tip safety margin for the current mode.
-// In near-tip mode, we return 0 (no margin) - we rely on fast retries instead.
 func (bs *BlockSource) effectiveTipSafetyMargin() uint64 {
 	if bs.isNearTip.Load() {
 		return 0 // Near-tip mode: no safety margin, rely on retries
@@ -894,7 +995,7 @@ func (bs *BlockSource) forceRPCForCatchupWithReason(gap uint64, reason string) {
 		}
 		bs.slotStateMu.Unlock()
 	}
-	if bs.consensusManagedLightbringer || rewoundEmissionFrontier {
+	if rewoundEmissionFrontier {
 		bs.slotStateMu.Lock()
 		for slot := range bs.slotState {
 			if slot >= waitingSlot {
@@ -1088,9 +1189,6 @@ func (bs *BlockSource) shouldPreferIncomingLightbringerBlockLocked(existing, inc
 }
 
 func (bs *BlockSource) waitingLightbringerParentMismatchLocked() (waitingSlot uint64, observedParentSlot uint64, expectedParentSlot uint64, mismatch bool) {
-	if bs.consensusManagedLightbringer && bs.lightbringerActive.Load() {
-		return 0, 0, 0, false
-	}
 	blk := bs.reorderBuffer[bs.nextSlotToSend]
 	if blk == nil || !blk.FromLightbringer {
 		return 0, 0, 0, false
@@ -1490,7 +1588,7 @@ func (bs *BlockSource) lightbringerLiveEdgeHandoffMaxLag() uint64 {
 }
 
 func (bs *BlockSource) allowsLiveEdgeHandoff() bool {
-	return bs.consensusManagedLightbringer || bs.sourceType == BlockSourceTurbine
+	return bs.sourceType == BlockSourceTurbine
 }
 
 func (bs *BlockSource) lightbringerHandoffRequiredLastSlot(waitingSlot uint64) uint64 {
@@ -1826,9 +1924,6 @@ func (bs *BlockSource) shouldDiscardLiveStreamResult(slot uint64, generation uin
 	if !bs.isNearTip.Load() {
 		return true
 	}
-	if bs.consensusManagedLightbringer && bs.lightbringerActive.Load() {
-		return false
-	}
 
 	handoffSlot := bs.lightbringerHandoffSlot.Load()
 	return handoffSlot == 0 || slot < handoffSlot
@@ -1860,10 +1955,51 @@ func (bs *BlockSource) inspectLaterLightbringerBlocksLocked(waitingSlot uint64) 
 	return firstBufferedSlot, firstBufferedParentSlot, bufferedCount, firstConnectedSlot, firstConnectedParentSlot, foundConnected
 }
 
+// applyAlpenglowCertifiedSkipLocked marks the waiting slot skipped when the
+// consensus decision source certifies it skipped — in ANY block-source mode
+// (RPC catchup / pre-handoff included). A certified skip is a consensus fact,
+// so applying it early is always safe; it keeps a certified-skipped slot from
+// being re-fetched/re-run and makes the skip decision survive block-source
+// recreation on a post-switch re-replay. The emit loop then advances the
+// frontier for the marked skip mode-independently. Returns true if it newly
+// marked the slot.
+func (bs *BlockSource) applyAlpenglowCertifiedSkipLocked() bool {
+	if bs.alpenglowDecisionSource == nil {
+		return false
+	}
+	waitingSlot := bs.nextSlotToSend
+	if waitingSlot == 0 || bs.skippedSlots[waitingSlot] {
+		return false
+	}
+	decision, ok := bs.alpenglowDecisionSource(waitingSlot - 1)
+	if !ok || decision.Slot != waitingSlot || decision.Kind != alpenglow.ChainDecisionKindSkip {
+		return false
+	}
+	delete(bs.reorderBuffer, waitingSlot)
+	bs.skippedSlots[waitingSlot] = true
+	bs.alpenglowCertifiedSkips[waitingSlot] = true
+	delete(bs.lightbringerSynthesizedSkips, waitingSlot)
+	bs.slotStateMu.Lock()
+	bs.slotState[waitingSlot] = slotDone
+	delete(bs.inflightStart, waitingSlot)
+	bs.slotStateMu.Unlock()
+	bs.clearSlotErrors(waitingSlot)
+	bs.stats.FetchSkipped.Add(1)
+	mlog.Log.FileOnlyf("ALPENGLOW consensus decision: slot %d certified-skipped (mode-independent)", waitingSlot)
+	return true
+}
+
 func (bs *BlockSource) applyAlpenglowDecisionLocked() bool {
 	if bs.alpenglowDecisionSource == nil || bs.sourceType != BlockSourceTurbine || !bs.turbineAlpenglowBlockIDHints {
 		return false
 	}
+	// Certified skips are consensus facts — apply them regardless of mode so a
+	// certified-skipped slot is never re-run and the decision survives source
+	// recreation. The marked skip advances via the normal emit path.
+	if bs.applyAlpenglowCertifiedSkipLocked() {
+		return false
+	}
+	// Buffered-candidate block steering needs an active near-tip Turbine stream.
 	if !bs.lightbringerActive.Load() || !bs.isNearTip.Load() {
 		return false
 	}
@@ -2523,11 +2659,6 @@ func (bs *BlockSource) detectLightbringerGapLocked() (waitingSlot uint64, firstB
 		bs.clearLightbringerGapWatch()
 		return 0, 0, 0, 0, false
 	}
-	if bs.consensusManagedLightbringer && lightbringerActive {
-		bs.clearLightbringerGapWatch()
-		return 0, 0, 0, 0, false
-	}
-
 	waitingSlot = bs.nextSlotToSend
 	if !lightbringerActive && handoffSlot != 0 && waitingSlot < handoffSlot {
 		// RPC still owns slots before the pending handoff boundary. Buffered
@@ -2584,26 +2715,6 @@ func (bs *BlockSource) detectLightbringerGapLocked() (waitingSlot uint64, firstB
 	return waitingSlot, firstBufferedSlot, firstBufferedParentSlot, bufferedCount, true
 }
 
-func (bs *BlockSource) shouldDeliverLightbringerObservationDirectLocked(slot uint64, blk *b.Block) bool {
-	if !bs.consensusManagedLightbringer || !bs.usesLiveShredStream() {
-		return false
-	}
-	if blk == nil || !blk.FromLightbringer {
-		return false
-	}
-	if !bs.isNearTip.Load() || !bs.lightbringerActive.Load() {
-		return false
-	}
-	if bs.lightbringerForceRPCUntil.Load() != 0 {
-		return false
-	}
-	if slot < bs.nextSlotToSend {
-		return false
-	}
-	return true
-}
-
-// classifyError returns a string classification for an error
 func classifyError(err error) string {
 	if err == nil {
 		return "success"
@@ -3112,6 +3223,69 @@ func (bs *BlockSource) pollTip() {
 // In near-tip mode, this also:
 // - Schedules N+2 (prefetch while N+1 executes)
 // - Immediately retries N+1 if it failed (don't wait for 200ms ticker)
+// RewindForAlpenglowSwitch rewinds the emission frontier to re-serve `slot`
+// after certificates named a different outcome than the executed one (wrong
+// sibling or certificate-skipped). Buffered and in-flight state at or above
+// the slot is dropped, live-stream results are invalidated, and the certified
+// block id (zero for a skip) narrows the turbine assembler + prioritizes
+// repair so the certified version arrives fast.
+func (bs *BlockSource) RewindForAlpenglowSwitch(slot uint64, certified solana.Hash) {
+	if slot == 0 {
+		return
+	}
+	bs.reorderMu.Lock()
+	if bs.nextSlotToSend > slot {
+		bs.nextSlotToSend = slot
+	}
+	if bs.lastEmittedBlockSlot >= slot {
+		bs.lastEmittedBlockSlot = slot - 1
+	}
+	for bufferedSlot := range bs.reorderBuffer {
+		if bufferedSlot >= slot {
+			delete(bs.reorderBuffer, bufferedSlot)
+		}
+	}
+	for skippedSlot := range bs.skippedSlots {
+		if skippedSlot >= slot {
+			delete(bs.skippedSlots, skippedSlot)
+			delete(bs.lightbringerSynthesizedSkips, skippedSlot)
+			delete(bs.alpenglowCertifiedSkips, skippedSlot)
+		}
+	}
+	bs.reorderMu.Unlock()
+
+	bs.slotStateMu.Lock()
+	for trackedSlot := range bs.slotState {
+		if trackedSlot >= slot {
+			delete(bs.slotState, trackedSlot)
+			delete(bs.inflightStart, trackedSlot)
+		}
+	}
+	bs.slotStateMu.Unlock()
+
+	bs.retryMu.Lock()
+	if len(bs.retrySlots) > 0 {
+		filtered := bs.retrySlots[:0]
+		for _, retrySlot := range bs.retrySlots {
+			if retrySlot < slot {
+				filtered = append(filtered, retrySlot)
+			}
+		}
+		bs.retrySlots = filtered
+	}
+	bs.retryMu.Unlock()
+
+	// Drop prefetched live-stream blocks for the rewound range and invalidate
+	// in-flight results so stale emissions can't race the re-serve.
+	bs.invalidateLightbringerResults()
+
+	if certified != (solana.Hash{}) {
+		bs.SetKnownAlpenglowBlockID(slot, certified)
+		bs.resetTurbineSlotForAlpenglowBlock(slot, certified)
+	}
+	mlog.Log.Warnf("BLOCK SOURCE REWIND: re-serving slot %d after certificate switch (certified=%s)", slot, certified)
+}
+
 func (bs *BlockSource) SetLastExecutedSlot(slot uint64) {
 	bs.lastExecutedSlot.Store(slot)
 
@@ -3479,7 +3653,6 @@ func (bs *BlockSource) emitOrderedBlocks() {
 		var gapFirstBufferedParentSlot uint64
 		var gapBufferedCount int
 		var shouldFallbackToRPC bool
-		var emitObservationDirect bool
 
 		if result.slot < bs.nextSlotToSend {
 			bs.slotStateMu.Lock()
@@ -3626,10 +3799,7 @@ func (bs *BlockSource) emitOrderedBlocks() {
 			if !result.block.FromLightbringer {
 				bs.stats.FetchSuccesses.Add(1)
 			}
-			emitObservationDirect = bs.shouldDeliverLightbringerObservationDirectLocked(result.slot, result.block)
-			if !emitObservationDirect {
-				bs.reorderBuffer[result.slot] = result.block
-			}
+			bs.reorderBuffer[result.slot] = result.block
 			bs.hardErrCount.Store(0)        // Reset error count on success
 			bs.clearSlotErrors(result.slot) // Clear stall diagnostics for this slot
 			// Track max buffered slot
@@ -3666,14 +3836,6 @@ func (bs *BlockSource) emitOrderedBlocks() {
 			bs.slotState[result.slot] = slotDone
 			delete(bs.inflightStart, result.slot) // Clean up timing data
 			bs.slotStateMu.Unlock()
-		}
-
-		if emitObservationDirect {
-			blk := result.block
-			bs.reorderMu.Unlock()
-			bs.streamChan <- blk
-			bs.lastProgress.Store(time.Now().Unix())
-			bs.reorderMu.Lock()
 		}
 
 		// Emit consecutive blocks
@@ -4207,6 +4369,11 @@ func (bs *BlockSource) Start() {
 
 	// Start tip poller
 	go bs.pollTip()
+
+	// Cert-driven repair: steer turbine toward certified-but-unobserved blocks.
+	if bs.sourceType == BlockSourceTurbine && bs.turbineAlpenglowBlockIDHints && bs.alpenglowWantedBlocksFn != nil {
+		go bs.alpenglowRepairLoop()
+	}
 
 	// Wait for initial tip
 	time.Sleep(100 * time.Millisecond)

@@ -16,7 +16,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/trace"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,7 +31,6 @@ import (
 	consensusengine "github.com/Overclock-Validator/mithril/pkg/consensus"
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/fees"
-	"github.com/Overclock-Validator/mithril/pkg/forkchoice"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/lthash"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
@@ -195,6 +193,9 @@ type ResumeState struct {
 	InflationTaper          float64
 	InflationFoundation     float64
 	InflationFoundationTerm float64
+	// TransactionCount as of the resume slot. nil = the source context predates
+	// the field (seed from the snapshot manifest, approximate); non-nil is exact.
+	TransactionCount *uint64
 
 	// ComputedEpochStakes contains epoch stakes computed at boundaries.
 	// Key: epoch number (the leader schedule epoch), Value: serialized JSON
@@ -798,7 +799,6 @@ func setupInitialVoteAcctsAndStakeAccts(acctsDb *accountsdb.AccountsDb, block *b
 	if err := RebuildVoteCacheFromAccountsDB(acctsDb, block.Slot, voteAcctStakes, 0); err != nil {
 		mlog.Log.Warnf("vote cache rebuild had errors: %v", err)
 	}
-	rebuildAuthorizedVotersFromVoteCache(block.Epoch)
 
 	// Seed EpochStakesPerVoteAcct and TotalEpochStake from the epoch stakes cache,
 	// loaded by buildInitialEpochStakesCache() from the manifest. These are
@@ -1165,25 +1165,6 @@ func buildInitialEpochStakesCache(mithrilState *state.MithrilState, currentEpoch
 		}
 	}
 
-	// Load EpochAuthorizedVoters from state file (required)
-	// Supports multiple authorized voters per vote account (matches original manifest behavior)
-	if len(mithrilState.ManifestEpochAuthorizedVoters) == 0 {
-		return fmt.Errorf("state file missing manifest_epoch_authorized_voters - delete AccountsDB and rebuild from snapshot")
-	}
-	for voteAcctStr, authorizedVoterStrs := range mithrilState.ManifestEpochAuthorizedVoters {
-		voteAcct, err := base58.DecodeFromString(voteAcctStr)
-		if err != nil {
-			return fmt.Errorf("corrupted state file: failed to decode epoch_authorized_voters key %s: %w", voteAcctStr, err)
-		}
-		for _, authorizedVoterStr := range authorizedVoterStrs {
-			authorizedVoter, err := base58.DecodeFromString(authorizedVoterStr)
-			if err != nil {
-				return fmt.Errorf("corrupted state file: failed to decode epoch_authorized_voters value %s: %w", authorizedVoterStr, err)
-			}
-			global.PutEpochAuthorizedVoter(voteAcct, authorizedVoter)
-		}
-	}
-
 	return nil
 }
 
@@ -1244,6 +1225,8 @@ func ReplayBlocks(
 	if CurrentRunID == "" {
 		CurrentRunID = GenerateRunID()
 	}
+	// Fresh vote/stake dirty watermark for this run (gates the in-loop unwind).
+	resetVoteStakeDirty()
 	// Create bankhash log file
 	bankhashLogPath := fmt.Sprintf("%s/bankhash.log", acctsDbPath)
 	bankhashLogFile, bankhashLogErr := os.OpenFile(bankhashLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -1298,18 +1281,25 @@ func ReplayBlocks(
 		return result
 	}
 
-	// Use state file for transaction count (required)
-	global.IncrTransactionCount(mithrilState.ManifestTransactionCount)
-	isFirstSlotInEpoch := epochSchedule.FirstSlotInEpoch(currentEpoch) == startSlot
-	// alpenglowReplayMode switches replay to Alpenglow clock/feature/finality
-	// semantics; computed here so feature overrides apply before the first block.
-	// Driven by consensus.mode ONLY (NOT useTurbine) — our turbine path also serves
-	// mainnet TowerBFT, where forcing alpenglow features would diverge the bankhash.
-	alpenglowReplayMode := isAlpenglowReplayMode(consensusOpts)
-	replayCtx.CurrentFeatures, featuresActivatedInFirstSlot, parentFeaturesActivatedInFirstSlot = scanAndEnableFeatures(acctsDb, replayCtx, startSlot, isFirstSlotInEpoch)
-	if alpenglowReplayMode {
-		applyAlpenglowRuntimeFeatureOverrides(replayCtx.CurrentFeatures, startSlot)
+	// Seed the running transaction count. On resume, the checkpoint carries the
+	// exact count as of the last rooted slot; on a fresh start use the snapshot
+	// manifest. Set (not increment) so a re-replay in the same process never
+	// double-counts. A checkpoint from before the field existed can only be
+	// seeded approximately (the folded snapshot→root span is unrecorded) —
+	// warn rather than fail: the count is RPC/metadata, not consensus.
+	{
+		txCount, exact := resolveInitialTransactionCount(resumeState, mithrilState.ManifestTransactionCount)
+		global.SetTransactionCount(txCount)
+		if !exact && mithrilState.LastRootedSlot > mithrilState.SnapshotSlot {
+			mlog.Log.Warnf("resume checkpoint at slot %d predates transaction-count tracking: transactionCount seeded from the snapshot (slot %d) and will read LOW by the folded span until the next re-bootstrap",
+				mithrilState.LastRootedSlot, mithrilState.SnapshotSlot)
+		}
 	}
+	isFirstSlotInEpoch := epochSchedule.FirstSlotInEpoch(currentEpoch) == startSlot
+	// Alpenglow-only node: Alpenglow clock/feature/finality semantics apply
+	// unconditionally (this binary targets Alpenglow clusters exclusively).
+	replayCtx.CurrentFeatures, featuresActivatedInFirstSlot, parentFeaturesActivatedInFirstSlot = scanAndEnableFeatures(acctsDb, replayCtx, startSlot, isFirstSlotInEpoch)
+	applyAlpenglowRuntimeFeatureOverrides(replayCtx.CurrentFeatures, startSlot)
 	partitionedEpochRewardsEnabled = replayCtx.CurrentFeatures.IsActive(features.EnablePartitionedEpochReward) || replayCtx.CurrentFeatures.IsActive(features.EnablePartitionedEpochRewardsSuperfeature)
 
 	// Load epoch stakes - persisted stakes on resume, state file on fresh start
@@ -1343,25 +1333,6 @@ func ReplayBlocks(
 				result.Error = fmt.Errorf("missing required epoch stakes for current epoch %d - cannot resume (need fresh snapshot)", currentEpoch)
 				return result
 			}
-			// Load EpochAuthorizedVoters from state file (required for forkchoice vote parsing).
-			// buildInitialEpochStakesCache loads these, but this path skips that function.
-			if len(mithrilState.ManifestEpochAuthorizedVoters) > 0 {
-				for voteAcctStr, authorizedVoterStrs := range mithrilState.ManifestEpochAuthorizedVoters {
-					voteAcct, vErr := base58.DecodeFromString(voteAcctStr)
-					if vErr != nil {
-						result.Error = fmt.Errorf("corrupted state file: failed to decode epoch_authorized_voters key %s: %w", voteAcctStr, vErr)
-						return result
-					}
-					for _, authorizedVoterStr := range authorizedVoterStrs {
-						authorizedVoter, vErr := base58.DecodeFromString(authorizedVoterStr)
-						if vErr != nil {
-							result.Error = fmt.Errorf("corrupted state file: failed to decode epoch_authorized_voters value %s: %w", authorizedVoterStr, vErr)
-							return result
-						}
-						global.PutEpochAuthorizedVoter(voteAcct, authorizedVoter)
-					}
-				}
-			}
 		} else {
 			// Resume in same epoch as snapshot, no boundaries crossed - state file epoch stakes still valid
 			if err := buildInitialEpochStakesCache(mithrilState, currentEpoch, snapshotEpoch); err != nil {
@@ -1380,40 +1351,13 @@ func ReplayBlocks(
 		result.Error = err
 		return result
 	}
-	// Resolve consensus config defaults before forkchoice init so we can
-	// check whether enforcement requires authorized voters.
-	useLiveShredStream := useLightbringer || useTurbine
-	consensusCfg := resolveConsensusConfig(consensusOpts, useLightbringer, useTurbine, isLive)
-	consensusManagedLiveStream := consensusCfg.enforceActive &&
-		isLive &&
-		consensusManagesLiveShredStream(consensusCfg.enforceSource, useLightbringer, useTurbine)
-
-	// Alpenglow: the consensus engine (nil-safe; ClassicEngine in classic mode is a
-	// no-op). alpenglowReplayMode switches replay to Alpenglow clock/finality semantics.
+	// Alpenglow consensus engine (certificate-driven finality; nil-safe).
 	var consensusEngine consensusengine.Engine
 	if consensusOpts != nil {
 		consensusEngine = consensusOpts.Engine
 	}
-	consensusLiveStreamName := "Lightbringer"
-	if useTurbine {
-		consensusLiveStreamName = "TURBINE"
-	}
 
-	epochAuthVoters := global.EpochAuthorizedVoters()
-	if epochAuthVoters == nil {
-		// Without authorized voters, forkchoice can't parse votes → no supermajority → enforcement is blind.
-		// If consensus enforcement is active, this is a fatal misconfiguration.
-		if consensusCfg.enforceActive && consensusCfg.policy == "halt" {
-			result.Error = fmt.Errorf("forkchoice: EpochAuthorizedVoters is nil — cannot enforce consensus without vote parsing (check snapshot/state file)")
-			return result
-		}
-		mlog.Log.Warnf("forkchoice: EpochAuthorizedVoters is nil — vote parsing will be skipped until populated")
-	}
-	forkChoice := forkchoice.NewForkChoiceService(currentEpoch, global.EpochStakes(currentEpoch), global.EpochTotalStake(currentEpoch), epochAuthVoters)
-	forkChoice.Start()
-	defer forkChoice.Stop()
-
-	if alpenglowReplayMode && consensusEngine != nil {
+	if consensusEngine != nil {
 		// Certs must verify against their own epoch's validator set; without the
 		// lookup the engine falls back to the latest set and cross-epoch certs
 		// silently fail BLS (and the deferred-cert replay never triggers).
@@ -1422,34 +1366,41 @@ func ReplayBlocks(
 		}
 		installCachedAlpenglowValidatorSets(consensusEngine, currentEpoch)
 	}
-	global.SetForkChoice(forkChoice)
 
-	// Instantiate the consensus coordinator for skip-path resolution and policy.
-	// In Lightbringer mode this now resolves a pre-execution block/skip path from
-	// the current anchor to a vote-confirmed leaf.
-	consensusCoordinator := forkchoice.NewConsensusCoordinator(forkChoice, consensusCfg.maxDepth, consensusCfg.policy)
-	consensusBufferedExecutionActive := consensusCfg.bufferedExecutionActive
-
+	// 100-slot summary window collectors ("full" = reconstructable-from-shreds,
+	// Agave SlotMeta/is_full sense; detailed debugging stays in file logs).
 	var statsCounter int
-	var execTimes []float64      // seconds per block
-	var waitTimes []float64      // seconds per block
-	var cuValues []uint64        // CU per block
-	var voteTxCounts []uint64    // vote txns per block
-	var nonVoteTxCounts []uint64 // non-vote txns per block
+	var execTimes []float64 // seconds per executed block
+	var cuValues []uint64   // CU per executed block
+	var txnCounts []uint64  // transactions per executed block
+	var shredSamples []shredSample
+	var windowRepairedShreds int
+	var windowRepairedSlots int
+	var windowEmptyBlocks int
+	var windowSkippedWithShreds int // skipped slots where the leader sent partial shreds
+	var windowSwitches int          // certificate switches detected this window
+	var windowSwitchInRAM int       // switches resolved by the in-RAM unwind
+	var windowSwitchFallback int    // switches that fell back to rooted-checkpoint re-replay
+	switchFallbackReasons := make(map[string]int)
+	var promotionHolds int // iterations promotion was fully stalled while finality ran a chunk ahead
+	windowStart := time.Now()
+	var lastGCCount uint32
 	var justCrossedEpochBoundary bool
 
 	// Preallocate slices for 100 blocks
 	const summaryInterval = 100
 	execTimes = make([]float64, 0, summaryInterval)
-	waitTimes = make([]float64, 0, summaryInterval)
 	cuValues = make([]uint64, 0, summaryInterval)
-	voteTxCounts = make([]uint64, 0, summaryInterval)
-	nonVoteTxCounts = make([]uint64, 0, summaryInterval)
+	txnCounts = make([]uint64, 0, summaryInterval)
+	shredSamples = make([]shredSample, 0, summaryInterval)
 
-	var readyConsensusPath *pendingConsensusPath
-	observedConsensusBlocks := make(map[uint64]*b.Block)
-	var lastRootedWatermark uint64  // diagnostics: highest explicit-root finality slot seen
-	var lastVerifiedLeafSlot uint64 // highest slot whose leaf bankhash matched the confirmed one
+	var lastRootedWatermark uint64 // highest certificate/delegated finality slot seen
+	var highestExecutedSlot uint64 // highest slot ProcessBlock has executed; bounds the promotion-gate walk
+	// While partitioned rewards distribute, promotion holds below the boundary
+	// block so a crash-resume always re-runs it (the distribution bookkeeping is
+	// RAM-only and not reconstructible mid-window). Self-clears when the window
+	// completes (NumRewardPartitionsRemaining reaches 0).
+	var rewardsHoldBelowSlot uint64
 	// Alpenglow finality identities captured at observe/ingest time for the promotion
 	// gate (the tracker's own state may be pruned by promotion time). Pruned as slots
 	// promote; bounded by the unrooted tail cap.
@@ -1480,47 +1431,264 @@ func ReplayBlocks(
 	var delegatedFinalizedSlot uint64
 	var delegatedFinalizedAt time.Time
 
-	// unrootedTailState holds the in-RAM speculative state in rooted-durable mode;
-	// nil in legacy mode. When enabled, acctsDb serves durable reads + CommitSlotAtomic.
-	// fork_aware selects the branch-tree engine (forkCoordinator) over the linear tail.
-	var unrootedTailState unrootedState
+	// unrootedTailState holds the in-RAM speculative state — the working set plus
+	// its per-slot undo journal — in rooted-durable mode (the only mode of the
+	// Alpenglow build). It buffers replayed slots and folds them to disk via
+	// CommitBatch once rooted; block reads resolve through it.
+	var unrootedTailState *unrootedTail
+	var promoter *asyncPromoter
+	var applyFoldOutcome func(res *foldResult) // assigned below, used by the exit drain
 	if acctsDb.RootedDurable {
-		if acctsDb.ForkAware {
-			unrootedTailState = newForkTail(acctsDb, acctsDb, unrootedTailHaltCap)
-			mlog.Log.Infof("fork-aware mode: replayed slots buffer in a branch tree until rooted (halt cap %d branches)", unrootedTailHaltCap)
-		} else {
-			unrootedTailState = newUnrootedTail(acctsDb, acctsDb, unrootedTailHaltCap)
-			mlog.Log.Infof("rooted-durable mode: canonical store stays rooted-only; replayed slots buffer in RAM until rooted (halt cap %d slots)", unrootedTailHaltCap)
+		unrootedTailState = newUnrootedTail(acctsDb, acctsDb, unrootedTailHaltCap, FoldBatchSlots, filepath.Join(acctsDb.AcctsDir, ".."))
+		// Folds run on a worker goroutine so replay never stalls on the
+		// segment write + fsync; the loop builds jobs and applies completions.
+		promoter = newAsyncPromoter(acctsDb)
+		defer func() {
+			// Settle the worker on ANY exit: apply a completed fold so the
+			// in-process recovery retry resumes from the true durable frontier
+			// instead of re-folding it (a discarded-but-committed fold is
+			// still safe — RecoverFoldState reconciles — just wasteful).
+			if applyFoldOutcome != nil {
+				applyFoldOutcome(promoter.drain())
+			}
+			promoter.stop()
+		}()
+		mlog.Log.Infof("rooted-durable mode: canonical store stays rooted-only; replayed slots buffer in RAM until rooted (halt cap %d slots); folds run async off the replay loop", unrootedTailHaltCap)
+	}
+	// Any stake-index entries still pending from a previous in-process replay
+	// attempt (rooted-checkpoint re-replay after a fork switch or finality
+	// mismatch) belong to slots this run re-executes — or to a discarded wrong
+	// fork. Either way they re-enqueue if real; stale ones must not leak.
+	global.ClearPendingStakePubkeys()
+
+	// Trailing execution verifier: the dual-watermark's second leg. Runs on
+	// its own RPC client + budget so it never competes with block fetch.
+	var trailingVerifier *TrailingVerifier
+	replayDivergenceFloor := uint64(0)
+	for _, ev := range mithrilState.ReplayDivergenceEvidence {
+		if replayDivergenceFloor == 0 || ev.Slot < replayDivergenceFloor {
+			replayDivergenceFloor = ev.Slot
 		}
+	}
+	if replayDivergenceFloor > 0 {
+		mlog.Log.Warnf("replay divergence evidence present (earliest slot %d): folds are blocked at that slot until the evidence is cleared after triage", replayDivergenceFloor)
+	}
+	// Switch sweep: detects executed slots contradicted by later decisive
+	// certificates (wrong sibling / certified skip) under execute-on-receipt.
+	switchSweeper := newAlpenglowSwitchSweeper(consensusEngine)
+
+	if TrailingVerifierCfg.Enabled && unrootedTailState != nil {
+		trailingVerifier = newTrailingVerifier(&rpcVerificationSource{rpcc: rpcclient.NewRpcClient(rpcEndpoints[0])}, TrailingVerifierCfg)
+		go trailingVerifier.Run(ctx)
+		// Publish a run-local tx-capture registry for the verifier's lifetime and
+		// unpublish it on return, so no other run (a later re-replay, a test, a
+		// sim) shares or inherits this run's capture state.
+		stopCapture := beginTxCapture()
+		defer stopCapture()
+		if !TrailingVerifierCfg.Required {
+			mlog.Log.Warnf("trailing verifier running in ADVISORY mode (verifier.required=false): folds are NOT gated on execution verification")
+		}
+		mlog.Log.Infof("trailing verifier active: lag=%d slots, budget=%d rps — folds gate on min(finality, verified)", TrailingVerifierCfg.LagSlots, TrailingVerifierCfg.MaxRPS)
+	} else if unrootedTailState != nil {
+		mlog.Log.Warnf("trailing verifier DISABLED: folds gate on certificate finality only — certificates attest block data, not execution; a mithril-side execution divergence would fold to disk undetected")
+	}
+
+	// applyPromotionBookkeeping advances the durable watermark and prunes every
+	// per-slot structure bounded by it. Shared by async fold application, the
+	// shutdown flush, and nothing else — it is the ONLY place LastRootedSlot
+	// advances during replay.
+	applyPromotionBookkeeping := func(promotedThrough uint64, rootedCtx *state.ResumeContext) {
+		mithrilState.LastRootedSlot = promotedThrough
+		mithrilState.LastRootedBankhash = rootedCtx.Bankhash
+		mithrilState.LastRootedContext = rootedCtx
+		for slot := range alpenglowFooterFinalized {
+			if slot <= promotedThrough {
+				delete(alpenglowFooterFinalized, slot)
+			}
+		}
+		for slot := range alpenglowExecutedBlockIDs {
+			if slot <= promotedThrough {
+				delete(alpenglowExecutedBlockIDs, slot)
+			}
+		}
+		if trailingVerifier != nil {
+			trailingVerifier.PruneThrough(promotedThrough)
+		}
+		if pruner, ok := consensusEngine.(consensusengine.AlpenglowPruneSink); ok {
+			pruner.PruneAlpenglowBefore(promotedThrough)
+		}
+		// Disputed slots that promoted passed the exact-match requirement —
+		// the evidence is satisfied.
+		for slot := range alpenglowForced {
+			if slot <= promotedThrough {
+				delete(alpenglowForced, slot)
+				clearAlpenglowEvidence(mithrilState, slot)
+			}
+		}
+	}
+
+	// applyFoldOutcome applies a completed async fold on the loop thread. A
+	// failed fold only logs: LastRootedSlot did not advance, so the next
+	// iteration rebuilds the same chunk (natural retry); a permanently broken
+	// store surfaces as the OverCap halt (fail-closed).
+	applyFoldOutcome = func(res *foldResult) {
+		if res == nil {
+			return
+		}
+		if res.err != nil {
+			mlog.Log.Errorf("rooted-durable: async fold failed: %v", res.err)
+			return
+		}
+		rootedCtx := unrootedTailState.applyFoldJob(res.job)
+		if rootedCtx == nil {
+			mlog.Log.Errorf("rooted-durable: fold through slot %d returned no resume context; watermark held back", res.job.through)
+			return
+		}
+		applyPromotionBookkeeping(res.job.through, rootedCtx)
+	}
+
+	// foldRootedPrefix folds the rooted RAM prefix onto disk up to the SAFE
+	// target = min(certificate finality, trailing-verification watermark), after
+	// the persisted-divergence floor and the Alpenglow exact-block-id gate. It is
+	// the SINGLE fold path shared by in-loop promotion and the graceful-shutdown
+	// flush, so shutdown can never fold a slot the loop would refuse. It runs on
+	// every loop iteration (not only when finality advances) so verified progress
+	// alone can advance the watermark, and it checks the verifier for a divergence
+	// unconditionally so a failure halts even while finality is flat. Returns true
+	// when the caller must halt (result.Error is already set). force=true
+	// force-folds the trailing partial chunk (shutdown); force=false folds full
+	// chunks only.
+	foldRootedPrefix := func(force bool) (halt bool) {
+		if unrootedTailState == nil {
+			return false
+		}
+		// Apply any completed async fold first so the gates below see the
+		// current durable frontier.
+		applyFoldOutcome(promoter.poll())
+		if lastRootedWatermark == 0 {
+			return false
+		}
+		// The trailing verifier is the only execution-correctness oracle; a
+		// divergence halts regardless of finality progress.
+		if trailingVerifier != nil {
+			if div := trailingVerifier.Failure(); div != nil {
+				recordReplayDivergenceEvidence(mithrilState, div)
+				if result.Error == nil {
+					result.Error = fmt.Errorf("REPLAY DIVERGENCE (verified vs RPC): %w; halting — durable state remains at slot %d", div, mithrilState.LastRootedSlot)
+				}
+				mlog.Log.Errorf("REPLAY DIVERGENCE (verified vs RPC): %v; durable state remains at slot %d", div, mithrilState.LastRootedSlot)
+				return true
+			}
+		}
+		// Dual watermark: nothing folds unless BOTH certificate finality AND the
+		// trailing verifier cover it (certificates attest block data, not
+		// execution), and never at or past a persisted-divergence floor.
+		verifierRequired := trailingVerifier != nil && TrailingVerifierCfg.Required
+		verifiedWM := uint64(0)
+		if verifierRequired {
+			verifiedWM = trailingVerifier.VerifiedWatermark()
+		}
+		promoteThrough := safePromoteTarget(lastRootedWatermark, verifierRequired, verifiedWM, replayDivergenceFloor)
+		// Partitioned-rewards window: hold promotion below the boundary block
+		// until every partition distributes, so a crash-resume re-runs the
+		// boundary and rebuilds the RAM-only distribution bookkeeping.
+		if rewardsHoldBelowSlot > 0 && partitionedRewardsInfo != nil && partitionedRewardsInfo.NumRewardPartitionsRemaining > 0 {
+			if promoteThrough >= rewardsHoldBelowSlot {
+				promoteThrough = rewardsHoldBelowSlot - 1
+			}
+		}
+		if promoteThrough <= mithrilState.LastRootedSlot {
+			// Operator signal: promotion is fully stalled (verifier lag,
+			// divergence floor, or rewards hold) while finality has run at
+			// least a whole fold chunk ahead. Healthy steady state stays 0.
+			if lastRootedWatermark >= mithrilState.LastRootedSlot+uint64(FoldBatchSlots) {
+				promotionHolds++
+			}
+			return false // nothing new is both final and verified
+		}
+		// Alpenglow: never fold a slot whose executed block contradicts certificate
+		// finality (prefix-stop; equivocation fails closed).
+		if consensusEngine != nil {
+			gated, gerr := alpenglowPromotionGate(consensusEngine,
+				alpenglowFooterFinalized, alpenglowExecutedBlockIDs, alpenglowForced,
+				mithrilState.LastRootedSlot, promoteThrough, highestExecutedSlot, &gateStats)
+			promoteThrough = gated
+			if gerr != nil {
+				var mismatch *AlpenglowFinalityMismatch
+				if errors.As(gerr, &mismatch) {
+					recordAlpenglowEvidence(mithrilState, mismatch)
+				}
+				if result.Error == nil {
+					result.Error = fmt.Errorf("ALPENGLOW SAFETY: %w; halting before folding slot %d", gerr, gated+1)
+				}
+				mlog.Log.Errorf("ALPENGLOW SAFETY: %v; halting before folding slot %d", gerr, gated+1)
+				return true
+			}
+			mlog.Log.FileOnlyf("alpenglow gate: checked=%d matched=%d no_finality=%d no_local_id=%d",
+				gateStats.checked, gateStats.matched, gateStats.noFinality, gateStats.noLocalID)
+		}
+		if promoteThrough <= mithrilState.LastRootedSlot {
+			return false
+		}
+
+		if force {
+			// Shutdown flush: settle the worker first, then fold everything
+			// (including the trailing partial chunk) synchronously through the
+			// SAME gate-derived target — shutdown can never fold a slot the
+			// loop would refuse.
+			if res := promoter.drain(); res != nil {
+				applyFoldOutcome(res)
+			}
+			promotedThrough, rootedCtx, perr := unrootedTailState.flush(promoteThrough)
+			if perr != nil {
+				mlog.Log.Errorf("rooted-durable: shutdown flush stopped at slot %d: %v", promotedThrough, perr)
+			}
+			if promotedThrough > mithrilState.LastRootedSlot && rootedCtx != nil {
+				applyPromotionBookkeeping(promotedThrough, rootedCtx)
+			}
+			return false
+		}
+		// Async: one chunk in flight at a time. Enqueue the next chunk only
+		// when idle; completions are applied at the top of this function on a
+		// later iteration.
+		if !promoter.inFlight {
+			job, jerr := unrootedTailState.buildFoldJob(promoteThrough, false)
+			if jerr != nil {
+				mlog.Log.Errorf("rooted-durable: %v; watermark held back", jerr)
+				return false
+			}
+			if job != nil {
+				promoter.enqueue(job)
+			}
+		}
+		return false
 	}
 
 	var opts *blockstream.BlockSourceOpts
 	if useLightbringer {
 		opts = &blockstream.BlockSourceOpts{
-			SourceType:                   blockstream.BlockSourceLightbringer,
-			RpcClient:                    rpcc,
-			LightbringerEndpoint:         lightbringerEndpoint,
-			BackupRpcEndpoints:           rpcBackups,
-			StartSlot:                    startSlot,
-			EndSlot:                      endSlot,
-			BlockDir:                     blockDir,
-			ConsensusManagedLightbringer: consensusManagedLiveStream,
+			SourceType:           blockstream.BlockSourceLightbringer,
+			RpcClient:            rpcc,
+			LightbringerEndpoint: lightbringerEndpoint,
+			BackupRpcEndpoints:   rpcBackups,
+			StartSlot:            startSlot,
+			EndSlot:              endSlot,
+			BlockDir:             blockDir,
 		}
 	} else if useTurbine {
 		opts = &blockstream.BlockSourceOpts{
-			SourceType:                   blockstream.BlockSourceTurbine,
-			RpcClient:                    rpcc,
-			TurbineBindAddr:              turbineBindAddr,
-			TurbineGossipEntrypoint:      turbineGossipEntrypoint,
-			TurbineGossipBindAddr:        turbineGossipBindAddr,
-			TurbineAdvertisedIP:          turbineAdvertisedIP,
-			TurbineShredVersion:          turbineShredVersion,
-			LeaderForSlot:                global.LeaderForSlot,
-			BackupRpcEndpoints:           rpcBackups,
-			StartSlot:                    startSlot,
-			EndSlot:                      endSlot,
-			BlockDir:                     blockDir,
-			ConsensusManagedLightbringer: consensusManagedLiveStream,
+			SourceType:              blockstream.BlockSourceTurbine,
+			RpcClient:               rpcc,
+			TurbineBindAddr:         turbineBindAddr,
+			TurbineGossipEntrypoint: turbineGossipEntrypoint,
+			TurbineGossipBindAddr:   turbineGossipBindAddr,
+			TurbineAdvertisedIP:     turbineAdvertisedIP,
+			TurbineShredVersion:     turbineShredVersion,
+			LeaderForSlot:           global.LeaderForSlot,
+			BackupRpcEndpoints:      rpcBackups,
+			StartSlot:               startSlot,
+			EndSlot:                 endSlot,
+			BlockDir:                blockDir,
 		}
 	} else {
 		opts = &blockstream.BlockSourceOpts{
@@ -1536,7 +1704,7 @@ func ReplayBlocks(
 	// Alpenglow: drive cert-based block/skip selection at the block source from the
 	// engine's ChainTracker when running native turbine in observer mode. Without this
 	// the decision source is nil and applyAlpenglowDecisionLocked is a no-op.
-	if useTurbine && alpenglowReplayMode && consensusEngine != nil {
+	if useTurbine && consensusEngine != nil {
 		if ds, ok := consensusEngine.(consensusengine.AlpenglowDecisionSource); ok {
 			opts.TurbineAlpenglowBlockIDHints = true
 			opts.AlpenglowDecisionSource = ds.NextAlpenglowDecision
@@ -1545,6 +1713,13 @@ func ReplayBlocks(
 		// ancestry and duplicate accounting before emission.
 		if co, ok := consensusEngine.(consensusengine.AlpenglowCandidateBlockObserver); ok {
 			opts.AlpenglowCandidateBlockSink = co.ObserveAlpenglowCandidateBlock
+		}
+		// Cert-driven repair: the source's repair loop steers turbine toward
+		// certified-but-unobserved blocks and cancels shred state for
+		// certificate-skipped slots.
+		if wb, ok := consensusEngine.(consensusengine.AlpenglowWantedBlocksSource); ok {
+			opts.AlpenglowWantedBlocks = wb.AlpenglowWantedBlocks
+			opts.AlpenglowSkipCertified = wb.SkipCertifiedAt
 		}
 	}
 
@@ -1574,7 +1749,7 @@ func ReplayBlocks(
 	var skippedSlotsCount int // Track skipped slots for 100-slot summary
 	replayStartLogged := false
 
-	currentConsensusAnchorSlot := func() uint64 {
+	currentExecutedAnchorSlot := func() uint64 {
 		if lastSlotCtx != nil {
 			return lastSlotCtx.Slot
 		}
@@ -1584,115 +1759,6 @@ func ReplayBlocks(
 		return mithrilState.ManifestParentSlot
 	}
 
-	observeConsensusAnchor := func() {
-		if lastSlotCtx != nil {
-			forkChoice.ObserveExecutionAnchor(lastSlotCtx.Slot, solana.Hash(lastSlotCtx.Blockhash))
-			return
-		}
-		if resumeState != nil && resumeState.LastBlockhash != ([32]byte{}) {
-			forkChoice.ObserveExecutionAnchor(resumeState.ParentSlot, solana.Hash(resumeState.LastBlockhash))
-			return
-		}
-		if mithrilState != nil && len(mithrilState.ManifestRecentBlockhashes) > 0 {
-			// Fresh snapshot start: seed the snapshot slot's PoH blockhash (newest
-			// recent blockhash), NOT the bank hash — RPC children carry the parent's
-			// PoH blockhash to recover their parent; the bank hash never matches.
-			manifestParentBlockhash, err := base58.DecodeFromString(mithrilState.ManifestRecentBlockhashes[0].Blockhash)
-			if err != nil {
-				mlog.Log.Warnf("forkchoice: failed to decode manifest parent blockhash for anchor seeding: %v", err)
-				return
-			}
-			forkChoice.ObserveExecutionAnchor(mithrilState.ManifestParentSlot, solana.Hash(manifestParentBlockhash))
-		}
-	}
-
-	syncConsensusBufferedExecutionMode := func(triggerSlot uint64) {
-		if !consensusManagedLiveStream {
-			return
-		}
-
-		stats := blockStream.GetFetchStats()
-		if consensusBufferedExecutionActive && !stats.IsNearTip {
-			anchorSlot := currentConsensusAnchorSlot()
-			discardedObservedBlocks := len(observedConsensusBlocks)
-			readyDecisionCount := 0
-			if readyConsensusPath != nil {
-				readyDecisionCount = len(readyConsensusPath.decisions)
-			}
-
-			consensusBufferedExecutionActive = false
-			readyConsensusPath = nil
-			clearObservedConsensusBlocks(observedConsensusBlocks)
-			observeConsensusAnchor()
-			mlog.Log.Warnf("forkchoice: suspending buffered execution at slot %d because block source left near-tip mode; RPC catchup will continue from anchor %d (discarded_observed_blocks=%d discarded_ready_decisions=%d next_emitted_slot=%d)",
-				triggerSlot, anchorSlot, discardedObservedBlocks, readyDecisionCount, stats.NextSlot)
-		}
-	}
-
-	observeBlockForConsensus := func(block *b.Block) error {
-		if !consensusCfg.enforceActive {
-			return nil
-		}
-
-		if !consensusBufferedExecutionActive && consensusManagedLiveStream {
-			if block == nil || !block.FromLightbringer {
-				// Live catchup (RPC blocks while the managed stream is suspended):
-				// keep vote observation alive so the explicit-root watermark advances
-				// and rooted-durable promotion can drain the RAM tail.
-				if unrootedTailState != nil && block != nil && !block.IsSkipped {
-					forkChoice.ObserveVotesOnly(block.Slot, block.Transactions)
-					if block.Slot > 2*uint64(unrootedTailHaltCap) {
-						forkChoice.PruneBeforeSlot(block.Slot - 2*uint64(unrootedTailHaltCap))
-					}
-				}
-				return nil
-			}
-			consensusBufferedExecutionActive = true
-			readyConsensusPath = nil
-			observeConsensusAnchor()
-			pruneObservedConsensusBlocks(observedConsensusBlocks, currentConsensusAnchorSlot())
-			mlog.Log.Warnf("forkchoice: enabling buffered execution at slot %d after block source switched to %s", block.Slot, consensusLiveStreamName)
-		}
-
-		if !consensusBufferedExecutionActive {
-			// Live catchup: block registration/path resolution stay suspended, but
-			// keep VOTE observation alive so the explicit-root finality watermark
-			// advances and rooted-durable promotion can drain the RAM tail. Prune
-			// so per-slot vote state stays bounded across a long catchup.
-			if unrootedTailState != nil && !block.IsSkipped {
-				forkChoice.ObserveVotesOnly(block.Slot, block.Transactions)
-				if block.Slot > 2*uint64(unrootedTailHaltCap) {
-					forkChoice.PruneBeforeSlot(block.Slot - 2*uint64(unrootedTailHaltCap))
-				}
-			}
-			return nil
-		}
-
-		if block.IsSkipped {
-			forkChoice.ObserveSkippedSlot(block.Slot)
-			return nil
-		}
-
-		meta := forkchoice.ObservedBlockMeta{
-			Slot:            block.Slot,
-			Blockhash:       solana.Hash(block.Blockhash),
-			ParentSlot:      block.SourceParentSlot,
-			ParentSlotKnown: block.FromLightbringer && block.SourceParentSlot != 0,
-			ParentBlockhash: solana.Hash(block.LastBlockhash),
-		}
-
-		if err := forkChoice.ObserveBlock(meta, block.Transactions); err != nil {
-			return err
-		}
-
-		if consensusBufferedExecutionActive {
-			observedConsensusBlocks[block.Slot] = block
-		}
-		return nil
-	}
-
-	observeConsensusAnchor()
-
 	for {
 		if ctx.Err() != nil {
 			mlog.Log.Infof("context cancelled, stopping replay: %v", ctx.Err())
@@ -1700,32 +1766,13 @@ func ReplayBlocks(
 			break
 		}
 
-		syncConsensusBufferedExecutionMode(currentConsensusAnchorSlot())
-
 		var (
 			block    *b.Block
 			waitTime time.Duration
+			neededAt time.Time // when replay asked the source for this slot
 		)
 
-		if consensusBufferedExecutionActive && readyConsensusPath != nil && len(readyConsensusPath.decisions) > 0 {
-			nextDecision := readyConsensusPath.decisions[0]
-			readyConsensusPath.decisions = readyConsensusPath.decisions[1:]
-
-			if nextDecision.UseBlock {
-				var exists bool
-				block, exists = observedConsensusBlocks[nextDecision.Slot]
-				if !exists {
-					result.Error = fmt.Errorf("forkchoice: missing observed block for resolved slot %d", nextDecision.Slot)
-					break
-				}
-				delete(observedConsensusBlocks, nextDecision.Slot)
-			} else {
-				delete(observedConsensusBlocks, nextDecision.Slot)
-				mlog.Log.Infof("forkchoice: resolved slot %d as skipped on path to confirmed leaf %d",
-					nextDecision.Slot, readyConsensusPath.leafSlot)
-				block = &b.Block{Slot: nextDecision.Slot, IsSkipped: true}
-			}
-		} else {
+		{
 			// Start stall monitor goroutine (only after first block to avoid startup false positives)
 			// Logs to file every second while waiting for a block
 			var stallDone chan struct{}
@@ -1755,9 +1802,9 @@ func ReplayBlocks(
 				}()
 			}
 
-			waitStart := time.Now()
+			neededAt = time.Now()
 			block = blockStream.NextBlock()
-			waitTime = time.Since(waitStart)
+			waitTime = time.Since(neededAt)
 
 			if stallDone != nil {
 				close(stallDone)
@@ -1775,7 +1822,7 @@ func ReplayBlocks(
 				break
 			}
 
-			if anchorSlot := currentConsensusAnchorSlot(); anchorSlot != 0 && block.Slot <= anchorSlot {
+			if anchorSlot := currentExecutedAnchorSlot(); anchorSlot != 0 && block.Slot <= anchorSlot {
 				mlog.Log.Warnf("replay: discarding stale block source emission for slot %d; already executed through slot %d",
 					block.Slot, anchorSlot)
 				continue
@@ -1783,7 +1830,7 @@ func ReplayBlocks(
 
 			// Alpenglow: feed the observed block to the consensus engine. Observer
 			// telemetry must never break replay, so log-and-continue on error.
-			if alpenglowReplayMode && consensusEngine != nil {
+			if consensusEngine != nil {
 				if err := consensusEngine.ObserveBlock(ctx, consensusengine.BlockObservation{
 					Block:  block,
 					Source: blockStream.GetFetchStats().CurrentSource,
@@ -1801,192 +1848,100 @@ func ReplayBlocks(
 				}
 			}
 
-			syncConsensusBufferedExecutionMode(block.Slot)
-
-			if block.FromLightbringer {
-				stats := blockStream.GetFetchStats()
-				if shouldDiscardLightbringerObservationAfterFallback(isLive, useLiveShredStream, block, stats) {
-					modeStr := "catchup"
-					if stats.IsNearTip {
-						modeStr = "near-tip"
-					}
-					mlog.Log.Warnf("forkchoice: discarding stale %s observation for slot %d after source fallback (mode=%s current_source=%s anchor=%d next_emitted_slot=%d)",
-						consensusLiveStreamName, block.Slot, modeStr, stats.CurrentSource, currentConsensusAnchorSlot(), stats.NextSlot)
-					continue
-				}
-			}
-
-			if err := observeBlockForConsensus(block); err != nil {
-				if errors.Is(err, forkchoice.ErrEquivocation) {
-					if acctsDb.ForkAware {
-						// Fork-aware: keep the version we hold and let the confirmed-leaf
-						// bankhash check adjudicate — a wrong version triggers
-						// dump-then-repair (self-healing) instead of a manual-restart halt.
-						mlog.Log.Warnf("forkchoice: equivocation observed at slot %d; continuing with held version (leaf check adjudicates)", block.Slot)
-					} else {
-						result.Error = fmt.Errorf("forkchoice: equivocation detected at slot %d", block.Slot)
+			// Execute-on-receipt correction: certificates arriving after a slot
+			// executed can name a different outcome. The sweep reports the first
+			// contradiction. The COMMON path resolves it in RAM: evict the wrong
+			// suffix from the WorkingSet, rebuild execution state from the
+			// retained parent context, and continue the loop. Guarded cases
+			// (reasons below) surface a typed error instead and the node-level
+			// recovery loop re-replays from the rooted checkpoint (repair
+			// re-fetches the certified version either way).
+			if unrootedTailState != nil {
+				if sw := switchSweeper.sweep(alpenglowExecutedBlockIDs, mithrilState.LastRootedSlot, currentExecutedAnchorSlot()); sw != nil {
+					windowSwitches++
+					blockStream.RewindForAlpenglowSwitch(sw.Slot, sw.Certified)
+					// Settle the in-flight fold before touching the overlay: the
+					// worker reads chunk layers the unwind would evict. If the
+					// applied fold moved the durable frontier past the switch
+					// slot, the contradiction is now at/below durable state —
+					// that is the node-level rewind/recovery path, not an
+					// in-RAM unwind.
+					applyFoldOutcome(promoter.drain())
+					if sw.Slot <= mithrilState.LastRootedSlot {
+						windowSwitchFallback++
+						switchFallbackReasons["durable-overlap"]++
+						result.Error = sw
+						mlog.Log.Warnf("%v — switch slot is at/below the durable watermark %d after settling the in-flight fold; deferring to the recovery loop", sw, mithrilState.LastRootedSlot)
 						break
 					}
-				} else {
-					result.Error = err
+					rs, fallbackReason := tryInLoopUnwind(sw, unrootedTailState, mithrilState, epochSchedule, currentEpoch, partitionedRewardsInfo)
+					if rs != nil {
+						// In-RAM unwind: drop the wrong suffix, rebuild execution state
+						// from the retained parent context, and let the certified
+						// version re-execute — no process restart, cost = the unwound
+						// blocks' re-execution.
+						for slot := range alpenglowExecutedBlockIDs {
+							if slot >= sw.Slot {
+								delete(alpenglowExecutedBlockIDs, slot)
+							}
+						}
+						resumeState = rs
+						lastSlotCtx = nil // next block configures from the rebuilt resume context
+						replayCtx.Capitalization = rs.Capitalization
+						global.SetBlockHeight(rs.ParentBlockHeight)
+						if rs.TransactionCount != nil {
+							global.SetTransactionCount(*rs.TransactionCount) // drop the discarded fork's txs
+						}
+						blockStream.SetLastExecutedSlot(sw.Slot - 1)
+						windowSwitchInRAM++
+						mlog.Log.Warnf("%v — unwound in RAM to slot %d; re-executing the certified chain (in-RAM switches this window: %d)", sw, sw.Slot-1, windowSwitchInRAM)
+						continue
+					}
+					// Guarded out: fall back to the rooted-checkpoint re-replay,
+					// recording WHY (the signal for whether the in-RAM engine
+					// suffices or FD-style branching is actually needed).
+					windowSwitchFallback++
+					switchFallbackReasons[fallbackReason]++
+					result.Error = sw
+					mlog.Log.Warnf("%v — in-RAM unwind unavailable (%s); re-replaying the certified chain from the rooted checkpoint", sw, fallbackReason)
 					break
 				}
 			}
 
-			// Advance the finality watermark, then fold the now-rooted RAM prefix onto
-			// disk (irreversible). Finality source is mode-switched: classic uses the
-			// TowerBFT 2/3-vote-root; alpenglow uses the certificate-finalized slot.
-			// In alpenglow mode the promotion gate below verifies executed-vs-certified
-			// block identity per slot; once competing forks execute as side branches,
-			// promotion will also resolve the winning branch path.
+			// Advance the certificate-finality watermark. Prefer engine
+			// cert-finality; fall back to the RPC-attested finalized slot
+			// (delegated) since an unstaked observer gets no certs. Poll
+			// throttled (the RPC round-trip is slow).
 			{
-				rooted, ok := forkChoice.HighestRootedSlot()
-				if alpenglowReplayMode {
-					// Alpenglow finality never uses the TowerBFT vote-root; start clean.
-					// Prefer engine cert-finality; fall back to RPC-attested finalized
-					// slot (delegated) since an unstaked observer gets no certs. Poll
-					// throttled (RPC round-trip is slow); promote() bounds the rooting.
-					rooted, ok = 0, false
-					if certRooted, certOk := alpenglowRootedSlot(consensusEngine); certOk {
-						rooted, ok = certRooted, true
-					} else {
-						if time.Since(delegatedFinalizedAt) > 2*time.Second {
-							// Record the attempt time regardless of outcome, so an RPC
-							// outage doesn't re-issue a blocking poll on every block.
-							delegatedFinalizedAt = time.Now()
-							if fin, err := rpcc.GetSlotWithTimeoutAndCommitment(15*time.Second, rpc.CommitmentFinalized); err == nil {
-								delegatedFinalizedSlot = fin
-							}
+				rooted, ok := uint64(0), false
+				if certRooted, certOk := alpenglowRootedSlot(consensusEngine); certOk {
+					rooted, ok = certRooted, true
+				} else {
+					if time.Since(delegatedFinalizedAt) > 2*time.Second {
+						// Record the attempt time regardless of outcome, so an RPC
+						// outage doesn't re-issue a blocking poll on every block.
+						delegatedFinalizedAt = time.Now()
+						if fin, err := rpcc.GetSlotWithTimeoutAndCommitment(15*time.Second, rpc.CommitmentFinalized); err == nil {
+							delegatedFinalizedSlot = fin
 						}
-						if delegatedFinalizedSlot > 0 {
-							rooted, ok = delegatedFinalizedSlot, true
-						}
+					}
+					if delegatedFinalizedSlot > 0 {
+						rooted, ok = delegatedFinalizedSlot, true
 					}
 				}
 				if ok && rooted > lastRootedWatermark {
 					lastRootedWatermark = rooted
 					mlog.Log.Infof("forkchoice: rooted watermark advanced to slot %d", rooted)
-
-					// Rooted-durable: fold the now-rooted prefix into the canonical store,
-					// advance the last rooted slot, and persist the resume context as of that slot.
-					if unrootedTailState != nil {
-						promoteThrough := rooted
-						// Fork-aware near-tip: only fold slots covered by a passed leaf
-						// bankhash check (chaining verifies all executed ancestors).
-						// During suspended catchup no leaf checks exist — promote on the
-						// raw 2/3-vote-root watermark (catchup blocks are sequential
-						// cluster-final data; same trust as bootstrap itself).
-						if acctsDb.ForkAware && consensusBufferedExecutionActive && promoteThrough > lastVerifiedLeafSlot {
-							promoteThrough = lastVerifiedLeafSlot
-						}
-						// Alpenglow: never fold a slot whose executed block contradicts
-						// certificate finality (prefix-stop; equivocation fails closed).
-						if alpenglowReplayMode && consensusEngine != nil {
-							gated, gerr := alpenglowPromotionGate(consensusEngine,
-								alpenglowFooterFinalized, alpenglowExecutedBlockIDs, alpenglowForced,
-								mithrilState.LastRootedSlot, promoteThrough, block.Slot, &gateStats)
-							promoteThrough = gated
-							if gerr != nil {
-								var mismatch *AlpenglowFinalityMismatch
-								if errors.As(gerr, &mismatch) {
-									recordAlpenglowEvidence(mithrilState, mismatch)
-								}
-								result.Error = fmt.Errorf("ALPENGLOW SAFETY: %w; halting before folding slot %d", gerr, gated+1)
-								mlog.Log.Errorf("%v", result.Error)
-								break
-							}
-							mlog.Log.FileOnlyf("alpenglow gate: checked=%d matched=%d no_finality=%d no_local_id=%d",
-								gateStats.checked, gateStats.matched, gateStats.noFinality, gateStats.noLocalID)
-						}
-						if promoteThrough > 0 {
-							promotedThrough, rootedCtx, perr := unrootedTailState.promote(promoteThrough)
-							if perr != nil {
-								mlog.Log.Errorf("rooted-durable: promotion stopped at slot %d: %v", promotedThrough, perr)
-							}
-							if promotedThrough > mithrilState.LastRootedSlot {
-								if rootedCtx == nil {
-									mlog.Log.Errorf("rooted-durable: promoted through slot %d with no resume context; watermark held back", promotedThrough)
-								} else {
-									mithrilState.LastRootedSlot = promotedThrough
-									mithrilState.LastRootedBankhash = rootedCtx.Bankhash
-									mithrilState.LastRootedContext = rootedCtx
-									for slot := range alpenglowFooterFinalized {
-										if slot <= promotedThrough {
-											delete(alpenglowFooterFinalized, slot)
-										}
-									}
-									for slot := range alpenglowExecutedBlockIDs {
-										if slot <= promotedThrough {
-											delete(alpenglowExecutedBlockIDs, slot)
-										}
-									}
-									// Disputed slots that promoted passed the exact-match
-									// requirement — the evidence is satisfied.
-									for slot := range alpenglowForced {
-										if slot <= promotedThrough {
-											delete(alpenglowForced, slot)
-											clearAlpenglowEvidence(mithrilState, slot)
-										}
-									}
-								}
-							}
-						}
-					}
 				}
 			}
-
-			if consensusBufferedExecutionActive {
-				resolvedPath, err := consensusCoordinator.ResolveFromAnchor(currentConsensusAnchorSlot())
-				if err != nil {
-					switch {
-					case errors.Is(err, forkchoice.ErrNeedWait), errors.Is(err, forkchoice.ErrPathIncomplete):
-						continue
-					case errors.Is(err, forkchoice.ErrDepthExceeded):
-						if consensusManagedLiveStream && isLive && useLiveShredStream {
-							anchorSlot := currentConsensusAnchorSlot()
-							discardedObservedBlocks := len(observedConsensusBlocks)
-							readyDecisionCount := 0
-							if readyConsensusPath != nil {
-								readyDecisionCount = len(readyConsensusPath.decisions)
-							}
-							mlog.Log.Warnf("forkchoice: unable to resolve %s consensus path within %d slots from anchor %d after observing slot %d; falling back to RPC catchup (discarded_observed_blocks=%d discarded_ready_decisions=%d)",
-								consensusLiveStreamName, consensusCfg.maxDepth, anchorSlot, block.Slot, discardedObservedBlocks, readyDecisionCount)
-							consensusBufferedExecutionActive = false
-							readyConsensusPath = nil
-							clearObservedConsensusBlocks(observedConsensusBlocks)
-							observeConsensusAnchor()
-							blockStream.ForceRPCFallback("consensus_depth_exceeded")
-							continue
-						}
-						if consensusCoordinator.Policy() == "halt" {
-							result.Error = fmt.Errorf("forkchoice: unable to resolve a confirmed path within %d slots from anchor %d",
-								consensusCfg.maxDepth, currentConsensusAnchorSlot())
-							break
-						}
-						mlog.Log.Warnf("forkchoice: path resolution exceeded max depth from anchor %d", currentConsensusAnchorSlot())
-						continue
-					default:
-						if acctsDb.ForkAware && errors.Is(err, forkchoice.ErrEquivocation) {
-							// Fork-aware: an equivocated slot on the path is adjudicated by
-							// the leaf bankhash check + dump-then-repair; wait for more votes.
-							mlog.Log.Warnf("forkchoice: equivocation on path from anchor %d; waiting for confirmation to adjudicate", currentConsensusAnchorSlot())
-							continue
-						}
-						mlog.Log.Warnf("forkchoice: failed to resolve a confirmed path from anchor %d after observing slot %d: %v",
-							currentConsensusAnchorSlot(), block.Slot, err)
-						result.Error = err
-					}
-				}
-				if result.Error != nil {
-					break
-				}
-				if resolvedPath == nil || len(resolvedPath.SlotDecisions) == 0 {
-					continue
-				}
-
-				readyConsensusPath = newPendingConsensusPath(currentConsensusAnchorSlot(), resolvedPath)
-				continue
+			// Fold the rooted RAM prefix onto disk (irreversible) through the
+			// shared dual-watermark + Alpenglow gate. Runs every iteration so
+			// verified progress alone advances the watermark and a verifier
+			// divergence halts promptly even while finality is flat.
+			if foldRootedPrefix(false) {
+				break
 			}
+
 		}
 
 		if block == nil {
@@ -2000,11 +1955,19 @@ func ReplayBlocks(
 			if leader, exists := global.LeaderForSlot(block.Slot); exists {
 				leaderStr = leader.String()
 			}
-			// Log skipped slot in same format as regular blocks (with N/A for missing values)
-			// Padding: cu=10 chars, txns fields, exec/wait/total=%7.3fs = 8 chars (7 for number + 's')
-			mlog.Log.InfofPrecise("slot %-10d | leader: %-44s | txns: N/A              | cu: N/A        | exec:     N/A | wait:%7.3fs | total:%7.3fs (skip)",
-				block.Slot, leaderStr, waitTime.Seconds(), waitTime.Seconds())
+			// Terminal: aligned skipped-slot line, reporting any PARTIAL shred
+			// arrivals (leader sent something but the slot never became full).
+			// Full detail (wait) stays in logs.
+			partialShreds, repairedShreds, _, _ := blockStream.TurbineShredObservation(block.Slot)
+			mlog.Log.InfofPrecise("%s", buildSkippedStatsLine(block.Slot, leaderStr, partialShreds, repairedShreds))
+			if partialShreds > 0 {
+				windowSkippedWithShreds++
+			}
+			mlog.Log.FileOnlyf("slot %d skipped | leader %s | wait %.3fs | partial shreds %d (repair %d)", block.Slot, leaderStr, waitTime.Seconds(), partialShreds, repairedShreds)
 			skippedSlotsCount++
+			if trailingVerifier != nil {
+				trailingVerifier.RecordSkip(block.Slot)
+			}
 			// A resolved skip still advances replay progress for near-tip mode and
 			// consensus-managed Lightbringer delivery.
 			blockStream.SetLastExecutedSlot(block.Slot)
@@ -2046,19 +2009,6 @@ func ReplayBlocks(
 			result.Error = configErr
 			break
 		}
-		if initialBlockConfigured {
-			// Initial block configuration rebuilds VoteCache and EpochAuthorizedVoters
-			// from AccountsDB. Forkchoice is created before that happens, so refresh
-			// its epoch view here to avoid using stale manifest voters after resume or
-			// an epoch boundary.
-			forkChoice.UpdateEpoch(
-				block.Epoch,
-				global.EpochStakes(block.Epoch),
-				global.EpochTotalStake(block.Epoch),
-				global.EpochAuthorizedVoters(),
-			)
-		}
-
 		// Log replay start message once, after initial configuration completes
 		if !replayStartLogged {
 			fmt.Println()
@@ -2074,38 +2024,50 @@ func ReplayBlocks(
 
 			var newlyActivatedFeatures, parentNewlyActivatedFeatures []*accounts.Account
 			replayCtx.CurrentFeatures, newlyActivatedFeatures, parentNewlyActivatedFeatures = scanAndEnableFeatures(acctsDb, replayCtx, currentSlot, true)
-			if alpenglowReplayMode {
-				applyAlpenglowRuntimeFeatureOverrides(replayCtx.CurrentFeatures, currentSlot)
-			}
+			applyAlpenglowRuntimeFeatureOverrides(replayCtx.CurrentFeatures, currentSlot)
 			partitionedEpochRewardsEnabled = replayCtx.CurrentFeatures.IsActive(features.EnablePartitionedEpochReward) || replayCtx.CurrentFeatures.IsActive(features.EnablePartitionedEpochRewardsSuperfeature)
 			partitionedRewardsInfo = handleEpochTransition(acctsDb, partitionedEpochRewardsEnabled, lastSlotCtx, replayCtx, epochSchedule, replayCtx.CurrentFeatures, block, currentEpoch, rpcc, dbgOpts)
 			currentEpoch = block.Epoch
 			justCrossedEpochBoundary = true
-
-			// Refresh forkchoice with new epoch's stake weights and authorized voters
-			forkChoice.UpdateEpoch(
-				currentEpoch,
-				global.EpochStakes(currentEpoch),
-				global.EpochTotalStake(currentEpoch),
-				global.EpochAuthorizedVoters(),
-			)
-
-			// Alpenglow: reinstall the BLS validator set for the new epoch.
-			if alpenglowReplayMode && consensusEngine != nil {
-				installAlpenglowValidatorSet(consensusEngine, currentEpoch)
+			// While partitioned rewards are distributing, hold durable promotion
+			// BELOW the boundary block: the distribution bookkeeping exists only
+			// in RAM, so if the rooted watermark landed inside the window a crash
+			// would resume past the boundary with no way to rebuild it — the
+			// remaining partitions would be silently skipped and the first
+			// re-executed distribution slot would diverge. Holding keeps the
+			// boundary in the re-execution window so a resume rebuilds the
+			// bookkeeping by re-running it. Costs tail RAM for the window length
+			// (bounded by the OverCap halt if a huge stake count exceeds it —
+			// fail-closed; reconstructing from the EpochRewards sysvar is the
+			// eventual lift for mainnet-scale partition counts).
+			if partitionedRewardsInfo != nil && partitionedRewardsInfo.NumRewardPartitionsRemaining > 0 {
+				rewardsHoldBelowSlot = block.Slot
+				mlog.Log.Infof("epoch boundary: holding durable promotion below slot %d until %d reward partitions distribute",
+					block.Slot, partitionedRewardsInfo.NumRewardPartitionsRemaining)
 			}
 
-			// Persist rebuilt authorized voters to state file so resume loads fresh data
-			if cache := global.EpochAuthorizedVoters(); cache != nil && mithrilState != nil {
-				updatedVoters := make(map[string][]string, cache.Len())
-				for voteAcct, voters := range cache.Entries() {
-					voterStrs := make([]string, len(voters))
-					for i, v := range voters {
-						voterStrs[i] = base58.Encode(v[:])
+			// Persist the freshly computed epoch stakes NOW: the state file is
+			// otherwise written only on graceful shutdown, so a hard crash any
+			// time after the boundary would resume at R+1 in the new epoch with
+			// no stakes for it — forcing a snapshot re-bootstrap and defeating
+			// the manifest-recovery design. Once per epoch; atomic tmp+rename.
+			if mithrilState != nil {
+				if all := serializeAllEpochStakes(); len(all) > 0 {
+					if mithrilState.ComputedEpochStakes == nil {
+						mithrilState.ComputedEpochStakes = make(map[uint64]string, len(all))
 					}
-					updatedVoters[base58.Encode(voteAcct[:])] = voterStrs
+					for e, b := range all {
+						mithrilState.ComputedEpochStakes[e] = string(b)
+					}
+					if serr := mithrilState.Save(acctsDbPath); serr != nil {
+						mlog.Log.Errorf("failed to persist epoch %d stakes at the boundary (crash before next save would force re-bootstrap): %v", currentEpoch, serr)
+					}
 				}
-				mithrilState.ManifestEpochAuthorizedVoters = updatedVoters
+			}
+
+			// Alpenglow: reinstall the BLS validator set for the new epoch.
+			if consensusEngine != nil {
+				installAlpenglowValidatorSet(consensusEngine, currentEpoch)
 			}
 
 			if len(newlyActivatedFeatures) != 0 {
@@ -2149,7 +2111,7 @@ func ReplayBlocks(
 
 		metrics.GlobalBlockReplay.PreprocessBlock.AddTimingSince(start)
 
-		alpenglowClock := useAlpenglowClockSemantics(alpenglowReplayMode, replayCtx.CurrentFeatures)
+		alpenglowClock := true // Alpenglow-only node: footer-clock semantics always on
 		lastSlotCtx, err = ProcessBlock(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, unrootedTailState, alpenglowClock)
 		if err != nil {
 			mlog.Log.Errorf("error encountered during block replay: %s\n", err)
@@ -2167,10 +2129,16 @@ func ReplayBlocks(
 			break
 		}
 		global.SetBlockHeight(block.BlockHeight)
+		if trailingVerifier != nil {
+			trailingVerifier.Record(buildSlotDigest(block))
+		}
+		if block.Slot > highestExecutedSlot {
+			highestExecutedSlot = block.Slot // bounds the promotion-gate walk (shared fold path)
+		}
 
 		// Alpenglow: report the replayed slot's bankhash to the engine (drives cert
 		// replay reconciliation). Log-and-continue — never break replay on telemetry.
-		if alpenglowReplayMode && consensusEngine != nil && lastSlotCtx != nil {
+		if consensusEngine != nil && lastSlotCtx != nil {
 			// Record the executed identity here — execution is proven (a block
 			// captured at observe time can still be discarded before it runs).
 			if block.HasAlpenglowBlockID && unrootedTailState != nil {
@@ -2190,62 +2158,13 @@ func ReplayBlocks(
 			rpcServer.SetSlotCtx(lastSlotCtx)
 		}
 
-		if consensusBufferedExecutionActive {
-			if readyConsensusPath != nil && block.Slot == readyConsensusPath.leafSlot {
-				actualBankhash := solana.HashFromBytes(lastSlotCtx.FinalBankhash)
-				if actualBankhash == readyConsensusPath.leafBankhash {
-					// Bankhash chaining: a matching leaf verifies every executed ancestor.
-					lastVerifiedLeafSlot = block.Slot
-				}
-				if actualBankhash != readyConsensusPath.leafBankhash {
-					mlog.Log.Errorf("CONSENSUS MISMATCH: replayed leaf slot %d to bankhash %s, but votes confirmed %s",
-						block.Slot,
-						base58.Encode(actualBankhash[:]),
-						base58.Encode(readyConsensusPath.leafBankhash[:]),
-					)
-					writeConsensusArtifact(
-						fmt.Sprintf("bankhash_mismatch_slot_%d.json", block.Slot),
-						buildConsensusMismatchArtifact(
-							block,
-							lastSlotCtx,
-							readyConsensusPath,
-							actualBankhash,
-							blockStream.GetFetchStats(),
-							forkChoice,
-							consensusCoordinator.Policy(),
-							observedConsensusBlocks,
-							currentConsensusAnchorSlot(),
-						),
-					)
-					if consensusCoordinator.Policy() == "halt" {
-						if acctsDb.ForkAware {
-							// Fork-aware: typed error triggers dump-then-repair in the
-							// caller (drop RAM tail, re-replay the confirmed chain from
-							// the rooted checkpoint). An identical repeat fails closed.
-							result.Error = &ConfirmedDivergence{
-								Slot:      block.Slot,
-								Ours:      actualBankhash,
-								Confirmed: readyConsensusPath.leafBankhash,
-							}
-							break
-						}
-						result.Error = fmt.Errorf("consensus halt: slot %d bankhash mismatch (our=%s winning=%s)",
-							block.Slot, base58.Encode(actualBankhash[:]), base58.Encode(readyConsensusPath.leafBankhash[:]))
-						break
-					}
-				}
-				readyConsensusPath = nil
-			}
-			observeConsensusAnchor()
-			pruneObservedConsensusBlocks(observedConsensusBlocks, currentConsensusAnchorSlot())
-		}
-
 		replayCtx.Capitalization -= lastSlotCtx.LamportsBurnt
 
 		// Rooted-durable: capture this slot's end-of-slot resume context (deep-copied,
 		// no pointers into the global SysvarCache) and retain it in the tail until
 		// promotion, so resume restarts from the last rooted slot not the lost in-RAM replayed tip.
 		if unrootedTailState != nil && lastSlotCtx != nil {
+			txCountAtSlot := global.TransactionCount() // ProcessBlock already added this block's txs
 			resumeCtx := &state.ResumeContext{
 				Slot:                    block.Slot,
 				Bankhash:                base58.Encode(lastSlotCtx.FinalBankhash),
@@ -2263,6 +2182,7 @@ func ReplayBlocks(
 				InflationTaper:          replayCtx.Inflation.Taper,
 				InflationFoundation:     replayCtx.Inflation.FoundationVal,
 				InflationFoundationTerm: replayCtx.Inflation.FoundationTerm,
+				TransactionCount:        &txCountAtSlot,
 			}
 			if lastSlotCtx.AcctsLtHash != nil {
 				resumeCtx.AcctsLtHash = base64.StdEncoding.EncodeToString(lastSlotCtx.AcctsLtHash.Hash())
@@ -2335,15 +2255,7 @@ func ReplayBlocks(
 
 		slotReplayDuration := time.Since(start)
 
-		// Calculate slot stats: vote/non-vote tx counts and locally replayed CU.
-		var voteTxCount, nonVoteTxCount int
-		for _, tx := range block.Transactions {
-			if tx.IsVote() {
-				voteTxCount++
-			} else {
-				nonVoteTxCount++
-			}
-		}
+		txnCount := len(block.Transactions)
 		totalCU := lastSlotCtx.TotalComputeUnitsConsumed
 
 		// Get leader from block (set by configureBlock in live mode, or by block source in verify mode)
@@ -2352,11 +2264,27 @@ func ReplayBlocks(
 			leaderStr = block.Leader.String()
 		}
 
-		// Fixed-width format for consistent alignment (use precise timing for block replay)
-		// exec/wait/total use 7 char width to handle times up to 99.999s without breaking alignment
-		totalSlotTime := waitTime + slotReplayDuration
-		mlog.Log.InfofPrecise("slot %-10d | leader: %-44s | txns: v:%-5d nv:%-5d | cu: %-10d | exec:%7.3fs | wait:%7.3fs | total:%7.3fs",
-			block.Slot, leaderStr, voteTxCount, nonVoteTxCount, totalCU, slotReplayDuration.Seconds(), waitTime.Seconds(), totalSlotTime.Seconds())
+		// Terminal: concise per-slot line. Shred timings only for shred-sourced
+		// blocks (never fabricated for RPC/file). ready = assembly completion
+		// minus when replay asked for the slot (negative: ready that long
+		// early; positive: replay waited); asm = first shred -> full.
+		execMsLine := slotReplayDuration.Seconds() * 1000
+		hasShreds := block.ShredFirstNanos > 0 && block.ShredFullNanos > 0
+		var readySecsLine, asmSecsLine float64
+		if hasShreds {
+			readySecsLine = float64(block.ShredFullNanos-neededAt.UnixNano()) / 1e9
+			asmSecsLine = float64(block.ShredFullNanos-block.ShredFirstNanos) / 1e9
+		}
+		mlog.Log.InfofPrecise("%s", buildSlotStatsLine(block.Slot, leaderStr, txnCount, totalCU, execMsLine, hasShreds, readySecsLine, asmSecsLine, block.RepairedShreds))
+		// Full detail (wait, vote split) stays in file logs for debugging.
+		var voteTxCount int
+		for _, tx := range block.Transactions {
+			if tx.IsVote() {
+				voteTxCount++
+			}
+		}
+		mlog.Log.FileOnlyf("slot %d detail | leader %s | txns v:%d nv:%d | exec %.3fs | wait %.3fs | total %.3fs",
+			block.Slot, leaderStr, voteTxCount, txnCount-voteTxCount, slotReplayDuration.Seconds(), waitTime.Seconds(), (waitTime + slotReplayDuration).Seconds())
 
 		// Write bankhash to log file
 		if bankhashLogFile != nil {
@@ -2375,10 +2303,18 @@ func ReplayBlocks(
 		if !justCrossedEpochBoundary {
 			statsCounter++
 			execTimes = append(execTimes, slotReplayDuration.Seconds())
-			waitTimes = append(waitTimes, waitTime.Seconds())
 			cuValues = append(cuValues, totalCU)
-			voteTxCounts = append(voteTxCounts, uint64(voteTxCount))
-			nonVoteTxCounts = append(nonVoteTxCounts, uint64(nonVoteTxCount))
+			txnCounts = append(txnCounts, uint64(txnCount))
+			if txnCount == 0 {
+				windowEmptyBlocks++
+			}
+			if hasShreds {
+				shredSamples = append(shredSamples, shredSample{readySecs: readySecsLine, asmSecs: asmSecsLine})
+				if block.RepairedShreds > 0 {
+					windowRepairedSlots++
+					windowRepairedShreds += block.RepairedShreds
+				}
+			}
 
 			// Trigger async tip refresh 5 slots before summary so it's fresh when we print
 			if statsCounter == summaryInterval-5 {
@@ -2386,229 +2322,158 @@ func ReplayBlocks(
 			}
 
 			if statsCounter == summaryInterval {
-				// Calculate statistics for float64 slices
-				medianFloat := func(vals []float64) float64 {
-					if len(vals) == 0 {
-						return 0
-					}
-					sorted := make([]float64, len(vals))
-					copy(sorted, vals)
-					sort.Float64s(sorted)
-					n := len(sorted)
-					if n%2 == 0 {
-						return (sorted[n/2-1] + sorted[n/2]) / 2
-					}
-					return sorted[n/2]
-				}
-				minFloat := func(vals []float64) float64 {
-					if len(vals) == 0 {
-						return 0
-					}
-					m := vals[0]
-					for _, v := range vals[1:] {
-						if v < m {
-							m = v
-						}
-					}
-					return m
-				}
-				maxFloat := func(vals []float64) float64 {
-					if len(vals) == 0 {
-						return 0
-					}
-					m := vals[0]
-					for _, v := range vals[1:] {
-						if v > m {
-							m = v
-						}
-					}
-					return m
-				}
-
-				// Calculate statistics for uint64 slices
-				medianUint := func(vals []uint64) uint64 {
-					if len(vals) == 0 {
-						return 0
-					}
-					sorted := make([]uint64, len(vals))
-					copy(sorted, vals)
-					sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
-					n := len(sorted)
-					if n%2 == 0 {
-						return (sorted[n/2-1] + sorted[n/2]) / 2
-					}
-					return sorted[n/2]
-				}
-				minUint := func(vals []uint64) uint64 {
-					if len(vals) == 0 {
-						return 0
-					}
-					m := vals[0]
-					for _, v := range vals[1:] {
-						if v < m {
-							m = v
-						}
-					}
-					return m
-				}
-				maxUint := func(vals []uint64) uint64 {
-					if len(vals) == 0 {
-						return 0
-					}
-					m := vals[0]
-					for _, v := range vals[1:] {
-						if v > m {
-							m = v
-						}
-					}
-					return m
-				}
-
-				// Compute total times (exec + wait for each block)
-				totalTimes := make([]float64, len(execTimes))
-				for i := range execTimes {
-					totalTimes[i] = execTimes[i] + waitTimes[i]
-				}
-
-				// Execution stats
-				medExec := medianFloat(execTimes)
-				minExec := minFloat(execTimes)
-				maxExec := maxFloat(execTimes)
-
-				// Wait stats
-				medWait := medianFloat(waitTimes)
-				minWait := minFloat(waitTimes)
-				maxWait := maxFloat(waitTimes)
-
-				// Total stats (only median needed - min/max can be inferred from execution + wait)
-				medTotal := medianFloat(totalTimes)
-
-				// CU stats
-				medCU := medianUint(cuValues)
-				minCU := minUint(cuValues)
-				maxCU := maxUint(cuValues)
-
-				// Txn stats
-				medVoteTx := medianUint(voteTxCounts)
-				medNonVoteTx := medianUint(nonVoteTxCounts)
-
-				// Blocks per second based on median total time
-				var blocksPerSec float64
-				if medTotal > 0 {
-					blocksPerSec = 1.0 / medTotal
-				}
-
-				// Get fetch stats (includes tip snapshot - refreshed at slot 95)
 				fetchStats := blockStream.GetFetchStats()
-
-				// Calculate distance from tip using current slot (more accurate than TipAtSlot)
-				// TipAtSlot is when we started the refresh, but block.Slot is what we just executed
-				var tipDistanceStr string
-				currentSlotForTip := block.Slot
-				if fetchStats.ConfirmedTip > 0 {
-					var behindConfirmed uint64
-					if currentSlotForTip < fetchStats.ConfirmedTip {
-						behindConfirmed = fetchStats.ConfirmedTip - currentSlotForTip
-					}
-					tipDistanceStr = fmt.Sprintf("%d slots behind confirmed", behindConfirmed)
-				} else {
-					tipDistanceStr = "tip unknown"
+				elapsed := time.Since(windowStart).Seconds()
+				slotsPerSec := 0.0
+				if elapsed > 0 {
+					slotsPerSec = float64(statsCounter+skippedSlotsCount) / elapsed
 				}
 
-				// Print summary in reorganized format
+				execMs := make([]float64, len(execTimes))
+				slowBlocks := 0
+				for i, secs := range execTimes {
+					execMs[i] = secs * 1000
+					if execMs[i] > 200 {
+						slowBlocks++
+					}
+				}
+				effVals := make([]float64, 0, len(execMs))
+				cuPerTx := make([]float64, 0, len(execMs))
+				txF := make([]float64, 0, len(txnCounts))
+				cuF := make([]float64, 0, len(cuValues))
+				for i := range cuValues {
+					cuF = append(cuF, float64(cuValues[i]))
+					txF = append(txF, float64(txnCounts[i]))
+					if cuValues[i] > 0 {
+						effVals = append(effVals, execMs[i]/(float64(cuValues[i])/1e6))
+					}
+					if txnCounts[i] > 0 {
+						cuPerTx = append(cuPerTx, float64(cuValues[i])/float64(txnCounts[i]))
+					}
+				}
+
 				mlog.Log.InfofPrecise("")
 				mlog.Log.InfofPrecise("=== 100 Slot Summary ===")
+				mlog.Log.InfofPrecise("  source: %s", fetchStats.CurrentSource)
 
-				// Line 1: Mode, blocks/sec, skipped slots, tip distance
-				modeStr := "catchup"
-				if fetchStats.IsNearTip {
-					modeStr = "near-tip"
-				}
-				if skippedSlotsCount > 0 {
-					mlog.Log.InfofPrecise("  mode: %s | %.1f blocks/sec | %d skipped | %s",
-						modeStr, blocksPerSec, skippedSlotsCount, tipDistanceStr)
-				} else {
-					mlog.Log.InfofPrecise("  mode: %s | %.1f blocks/sec | %s",
-						modeStr, blocksPerSec, tipDistanceStr)
-				}
-
-				// Line 2: Current block source
-				mlog.Log.InfofPrecise("  block source: %s", formatBlockSourceStatus(fetchStats))
-				if consensusBufferedExecutionActive {
-					readyDecisionCount := 0
-					readyLeafSlot := uint64(0)
-					if readyConsensusPath != nil {
-						readyDecisionCount = len(readyConsensusPath.decisions)
-						readyLeafSlot = readyConsensusPath.leafSlot
+				// Shred gaps only when a turbine receiver is live — never fabricated
+				// for RPC-only operation.
+				progress := fmt.Sprintf("  progress: %.1f slots/sec", slotsPerSec)
+				if latestShred, highestFull, edgesOK := blockStream.TurbineShredEdges(); edgesOK && latestShred > 0 {
+					replayGap := int64(latestShred) - int64(block.Slot)
+					fullGap := int64(latestShred) - int64(highestFull)
+					if replayGap < 0 {
+						replayGap = 0
 					}
-					mlog.Log.InfofPrecise("  consensus buffer: observed=%d ready_decisions=%d anchor=%d ready_leaf=%d",
-						len(observedConsensusBlocks), readyDecisionCount, currentConsensusAnchorSlot(), readyLeafSlot)
+					if fullGap < 0 {
+						fullGap = 0
+					}
+					progress += fmt.Sprintf(" | behind latest shred: replay %d, full %d", replayGap, fullGap)
+				}
+				if windowSkippedWithShreds > 0 {
+					progress += fmt.Sprintf(" | skipped %d (%d with shreds) | empty blocks %d", skippedSlotsCount, windowSkippedWithShreds, windowEmptyBlocks)
+				} else {
+					progress += fmt.Sprintf(" | skipped %d | empty blocks %d", skippedSlotsCount, windowEmptyBlocks)
+				}
+				mlog.Log.InfofPrecise("%s", progress)
+
+				finalizedStr := "--"
+				if lastRootedWatermark > 0 {
+					finalizedStr = fmt.Sprintf("%d", lastRootedWatermark)
+				}
+				if windowSwitches > 0 {
+					mlog.Log.InfofPrecise("  consensus: finalized slot %s | switches %d (in-RAM %d, fallback %d)", finalizedStr, windowSwitches, windowSwitchInRAM, windowSwitchFallback)
+					if len(switchFallbackReasons) > 0 {
+						mlog.Log.FileOnlyf("switch fallback reasons this window: %v", switchFallbackReasons)
+					}
+				} else {
+					mlog.Log.InfofPrecise("  consensus: finalized slot %s | switches 0", finalizedStr)
 				}
 
-				// Line 3: CU and transaction stats (median/min/max)
-				mlog.Log.InfofPrecise("  cu: median %d, min %d, max %d | txns: median vote %d, median non-vote %d",
-					medCU, minCU, maxCU, medVoteTx, medNonVoteTx)
+				checkedStr := "--"
+				if trailingVerifier != nil {
+					if vw := trailingVerifier.VerifiedWatermark(); vw > 0 {
+						checkedStr = fmt.Sprintf("%d", vw)
+					}
+				}
+				mlog.Log.InfofPrecise("  safety: exec checked slot %s | holds %d", checkedStr, promotionHolds)
 
-				// Line 4: Execution stats (median/min/max for execution, wait; median for replay total)
-				mlog.Log.InfofPrecise("  execution: median %.3fs, min %.3fs, max %.3fs | wait: median %.3fs, min %.3fs, max %.3fs | replay total: median %.3fs",
-					medExec, minExec, maxExec, medWait, minWait, maxWait, medTotal)
+				if len(shredSamples) > 0 {
+					ready := make([]float64, 0, len(shredSamples))
+					asm := make([]float64, 0, len(shredSamples))
+					for _, s := range shredSamples {
+						ready = append(ready, s.readySecs)
+						asm = append(asm, s.asmSecs)
+					}
+					mlog.Log.InfofPrecise("  shreds: ready median %+.1fs, worst %+.1fs (neg = assembled before replay needed it) | asm median %.1fs, max %.1fs",
+						medianF(ready), maxF(ready), medianF(asm), maxF(asm))
+					mlog.Log.InfofPrecise("  repair: %d slots, %d shreds", windowRepairedSlots, windowRepairedShreds)
+				}
 
-				// Account clone stats for copy-on-write optimization profiling
+				mlog.Log.InfofPrecise("  txns: median %.0f | p90 %.0f | max %.0f | cu/tx median %s | p90 %s",
+					medianF(txF), percentileF(txF, 90), maxF(txF), fmtK(medianF(cuPerTx)), fmtK(percentileF(cuPerTx, 90)))
+				mlog.Log.InfofPrecise("  cu: median %s | p90 %s | max %s",
+					fmtMcu(uint64(medianF(cuF))), fmtMcu(uint64(percentileF(cuF, 90))), fmtMcu(uint64(maxF(cuF))))
+				mlog.Log.InfofPrecise("  execution: median %.0fms | p95 %.0fms | max %.0fms | >200ms %d",
+					medianF(execMs), percentileF(execMs, 95), maxF(execMs), slowBlocks)
+				mlog.Log.InfofPrecise("  efficiency: median %.1fms/Mcu | p95 %.1fms/Mcu | max %.1fms/Mcu",
+					medianF(effVals), percentileF(effVals, 95), maxF(effVals))
+
+				var mem runtime.MemStats
+				runtime.ReadMemStats(&mem)
+				const gib = 1024 * 1024 * 1024
+				gcDelta := mem.NumGC - lastGCCount
+				lastGCCount = mem.NumGC
+				resLine := "  resources:"
+				if rss := processRSSBytes(); rss > 0 {
+					resLine += fmt.Sprintf(" rss %.1fGiB |", float64(rss)/gib)
+				}
+				resLine += fmt.Sprintf(" heap %.1fGiB | heap inuse %.1fGiB | gc %d",
+					float64(mem.HeapAlloc)/gib, float64(mem.HeapInuse)/gib, gcDelta)
+				mlog.Log.InfofPrecise("%s", resLine)
+				mlog.Log.InfofPrecise("")
+
+				// Detailed debugging stays in file logs.
 				cloneStats := GetAndResetCloneStats()
 				if cloneStats.TxCount > 0 {
 					var cloneRatio float64
 					if cloneStats.AcctsLoaded > 0 {
 						cloneRatio = float64(cloneStats.AcctsCloned) / float64(cloneStats.AcctsLoaded) * 100
 					}
-					avgLoadedPerTx := float64(cloneStats.AcctsLoaded) / float64(cloneStats.TxCount)
-					avgClonedPerTx := float64(cloneStats.AcctsCloned) / float64(cloneStats.TxCount)
-					avgTouchedPerTx := float64(cloneStats.AcctsTouched) / float64(cloneStats.TxCount)
-					loadedMB := float64(cloneStats.AcctsLoadedBytes) / 1024 / 1024
-					clonedMB := float64(cloneStats.AcctsClonedBytes) / 1024 / 1024
-					touchedMB := float64(cloneStats.AcctsTouchedBytes) / 1024 / 1024
-					mlog.Log.InfofPrecise("  account COW: %.1f%% cloned on write (%d/%d accts) | %.1fMB loaded, %.1fMB cloned, %.1fMB modified | avg/tx: %.1f loaded, %.1f cloned, %.1f modified",
+					mlog.Log.FileOnlyf("account COW: %.1f%% cloned (%d/%d accts) | %.1fMB loaded, %.1fMB cloned, %.1fMB modified",
 						cloneRatio, cloneStats.AcctsCloned, cloneStats.AcctsLoaded,
-						loadedMB, clonedMB, touchedMB, avgLoadedPerTx, avgClonedPerTx, avgTouchedPerTx)
+						float64(cloneStats.AcctsLoadedBytes)/1024/1024, float64(cloneStats.AcctsClonedBytes)/1024/1024, float64(cloneStats.AcctsTouchedBytes)/1024/1024)
 				}
-
-				var mem runtime.MemStats
-				runtime.ReadMemStats(&mem)
-				const gib = 1024 * 1024 * 1024
-				mlog.Log.InfofPrecise("  memory: alloc %.1fGiB | inuse %.1fGiB | idle %.1fGiB | released %.1fGiB | next_gc %.1fGiB | objs %d | gc %d | queue=%d",
-					float64(mem.HeapAlloc)/gib,
-					float64(mem.HeapInuse)/gib,
-					float64(mem.HeapIdle)/gib,
-					float64(mem.HeapReleased)/gib,
-					float64(mem.NextGC)/gib,
-					mem.HeapObjects,
-					mem.NumGC,
-					acctsDb.StoreQueueLen(),
-				)
-
-				// Line 5: RPC/fetch debugging info
+				mlog.Log.FileOnlyf("memory detail: alloc %.1fGiB | inuse %.1fGiB | idle %.1fGiB | released %.1fGiB | next_gc %.1fGiB | objs %d | gc_total %d | store_queue %d",
+					float64(mem.HeapAlloc)/gib, float64(mem.HeapInuse)/gib, float64(mem.HeapIdle)/gib,
+					float64(mem.HeapReleased)/gib, float64(mem.NextGC)/gib, mem.HeapObjects, mem.NumGC, acctsDb.StoreQueueLen())
 				if fetchStats.Attempts > 0 {
 					retryRate := float64(fetchStats.Retries) / float64(fetchStats.Attempts) * 100
-					prefetch := fetchStats.BufferDepth + fetchStats.ReorderBufLen
-					mlog.Log.InfofPrecise("  getBlock fetch: %.1f rps (%d calls) | avg %.0fms | %.0f%% success | retries %.1f%% | buf %d (stream:%d ro:%d) | wq %d | errs: na:%d rl:%d bt:%d tr:%d",
-						fetchStats.GetBlockRPS, fetchStats.Attempts, fetchStats.AvgLatencyMs, fetchStats.SuccessRate, retryRate, prefetch, fetchStats.BufferDepth, fetchStats.ReorderBufLen,
-						fetchStats.WorkQueueLen, fetchStats.ErrNotAvail, fetchStats.ErrRateLimit, fetchStats.ErrBeyondTip, fetchStats.ErrTransient)
-
-					// Surface tip poll issues (only show if there are problems)
+					mlog.Log.FileOnlyf("getBlock fetch: %.1f rps (%d calls) | avg %.0fms | %.0f%% success | retries %.1f%% | errs: na:%d rl:%d bt:%d tr:%d",
+						fetchStats.GetBlockRPS, fetchStats.Attempts, fetchStats.AvgLatencyMs, fetchStats.SuccessRate, retryRate,
+						fetchStats.ErrNotAvail, fetchStats.ErrRateLimit, fetchStats.ErrBeyondTip, fetchStats.ErrTransient)
 					if fetchStats.TipStaleSecs > 30 || fetchStats.TotalTipPollFails > 0 {
 						mlog.Log.InfofPrecise("  WARNING: tip stale %ds | tip poll fails: %d (consecutive: %d)",
 							fetchStats.TipStaleSecs, fetchStats.TotalTipPollFails, fetchStats.TipPollFailures)
 					}
-
 					blockStream.ResetStats()
 				}
-				mlog.Log.InfofPrecise("")
 
-				// Reset slices (reuse capacity)
+				// Reset window collectors (reuse capacity)
 				execTimes = execTimes[:0]
-				waitTimes = waitTimes[:0]
 				cuValues = cuValues[:0]
-				voteTxCounts = voteTxCounts[:0]
-				nonVoteTxCounts = nonVoteTxCounts[:0]
+				txnCounts = txnCounts[:0]
+				shredSamples = shredSamples[:0]
+				windowRepairedShreds = 0
+				windowRepairedSlots = 0
+				windowEmptyBlocks = 0
+				windowSkippedWithShreds = 0
+				windowSwitches = 0
+				windowSwitchInRAM = 0
+				windowSwitchFallback = 0
+				clear(switchFallbackReasons)
+				promotionHolds = 0
+				windowStart = time.Now()
 				statsCounter = 0
 				skippedSlotsCount = 0
 			}
@@ -2633,6 +2498,25 @@ func ReplayBlocks(
 	// Check if block source stalled (this provides explicit error info)
 	if blockStream.Stalled() && result.Error == nil {
 		result.Error = fmt.Errorf("block fetch stalled - no progress for %v", blockStream.StallTimeout())
+	}
+
+	// Graceful shutdown: force-fold the trailing partial chunk of the rooted
+	// prefix through the SAME dual-watermark + Alpenglow gate as the in-loop
+	// path, so a Ctrl+C can never fold a slot normal promotion would refuse.
+	// Bounds restart re-execution to the chunk size instead of chunk size plus
+	// however long the partial ran.
+	if unrootedTailState != nil {
+		preFlushRooted := mithrilState.LastRootedSlot
+		foldRootedPrefix(true)
+		// The cancel-path state save ran BEFORE this flush; if the flush
+		// advanced the watermark, re-save so the state file matches the store
+		// exactly. (Without this, startup's store-ahead reconcile still adopts
+		// the manifest context — this just keeps the file authoritative.)
+		if result.StateWrittenOnCancel && onCancelWriteState != nil && mithrilState.LastRootedSlot > preFlushRooted {
+			if err := onCancelWriteState(result); err != nil {
+				mlog.Log.Errorf("failed to re-write state after shutdown flush (recovery reconcile will cover it): %v", err)
+			}
+		}
 	}
 
 	acctsDb.WaitForStoreWorker()
@@ -2791,7 +2675,6 @@ func newSlotCtx(block *b.Block, accts accounts.Accounts, parentAccts accounts.Ac
 
 		SerializedParameterArena: SerializedParameterArena,
 	}
-
 	// Guard: a nil *unrootedTail stored in the AccountReader interface would be a
 	// non-nil typed-nil and break the nil check in GetAccountFromAccountsDb.
 	if tail != nil {
@@ -3054,8 +2937,9 @@ func ProcessBlock(
 	// persistedHashes is updated after StoreAccounts completes through a callback.
 	// Must be non-nil.
 	persistedHashes *persistedTracker,
-	// tail is the in-RAM unrooted overlay in rooted-durable mode; nil in legacy
-	// mode. When set, block reads resolve through it and commits buffer into it.
+	// tail is the in-RAM working set in rooted-durable mode; nil when rooted-
+	// durable is off. When set, block reads resolve through it and commits
+	// buffer into it.
 	tail unrootedState,
 	alpenglowClock bool,
 ) (*sealevel.SlotCtx, error) {
@@ -3226,22 +3110,22 @@ func ProcessBlock(
 		if tail != nil {
 			// Rooted-durable: accounts + bankhash are buffered in the overlay and
 			// become durable only on promotion; nothing written here (rooted-only).
-		} else if acctsDb.DurableCommit {
-			// CommitSlotAtomic already stored accounts + bankhash durably; finalize
-			// the crash-safe commit by removing its redo record.
-			if derr := accountsdb.DeleteRedo(acctsDb.AcctsDir, persistedSlot); derr != nil {
-				mlog.Log.Errorf("failed to delete redo for slot %d: %v", persistedSlot, derr)
-			}
 		} else {
 			if berr := acctsDb.StoreBankHashForSlot(persistedSlot, persistedBankhash); berr != nil {
 				mlog.Log.Infof("unable to store bankhash for slot %d", persistedSlot)
 			}
 		}
-		flushed, err := global.FlushPendingStakePubkeys(stakeIndexDir)
-		if err != nil {
-			mlog.Log.Errorf("failed to flush stake pubkey index: %v", err)
-		} else if flushed > 0 {
-			mlog.Log.Debugf("flushed %d new stake pubkeys to index", flushed)
+		if tail == nil {
+			// Legacy/verify modes (no fork ambiguity): flush per block as before.
+			// Rooted-durable replay flushes at FOLD time instead — entries stay
+			// slot-scoped in RAM so a fork unwind can drop them, and scans merge
+			// the pending set (StreamStakeAccounts) for completeness meanwhile.
+			flushed, err := global.FlushPendingStakePubkeys(stakeIndexDir)
+			if err != nil {
+				mlog.Log.Errorf("failed to flush stake pubkey index: %v", err)
+			} else if flushed > 0 {
+				mlog.Log.Debugf("flushed %d new stake pubkeys to index", flushed)
+			}
 		}
 
 		persistedHashes.Set(persistedBlockSlot, persistedBankhash)
@@ -3256,10 +3140,6 @@ func ProcessBlock(
 		// (always, even when empty, so the bankhash is recorded); no durable write.
 		tail.Add(slotCtx.Slot, modifiedAccts, persistedBankhash)
 		afterStoreAccounts()
-	} else if acctsDb.DurableCommit {
-		// Always enqueue (even with no modified accounts) so the commit window is
-		// always closed and the bankhash recorded — avoids the empty-block hang.
-		err = acctsDb.StoreAccountsDurable(modifiedAccts, slotCtx.Slot, persistedBankhash, afterStoreAccounts)
 	} else if len(modifiedAccts) > 0 {
 		err = acctsDb.StoreAccounts(modifiedAccts, slotCtx.Slot, afterStoreAccounts)
 	}

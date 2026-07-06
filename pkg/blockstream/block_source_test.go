@@ -125,6 +125,42 @@ func TestApplyAlpenglowDecisionLockedMarksCertifiedSkip(t *testing.T) {
 	}
 }
 
+// A certified skip applies even OUTSIDE active near-tip Turbine (RPC catchup /
+// pre-handoff), so a certified-skipped slot is not re-run after block-source
+// recreation on the post-switch re-replay.
+func TestApplyAlpenglowCertifiedSkipModeIndependent(t *testing.T) {
+	bs := NewBlockSource(&BlockSourceOpts{
+		SourceType:                   BlockSourceTurbine,
+		TurbineBindAddr:              "127.0.0.1:0",
+		TurbineAlpenglowBlockIDHints: true,
+		StartSlot:                    151,
+		EndSlot:                      200,
+		AlpenglowDecisionSource: func(anchorSlot uint64) (alpenglow.ChainDecision, bool) {
+			return alpenglow.ChainDecision{Slot: 151, Kind: alpenglow.ChainDecisionKindSkip}, true
+		},
+	})
+	// NOT near-tip and NOT lightbringer-active: the pre-handoff / RPC-catchup
+	// case that the near-tip gate would otherwise skip.
+	bs.isNearTip.Store(false)
+	bs.lightbringerActive.Store(false)
+
+	bs.reorderMu.Lock()
+	changed := bs.applyAlpenglowDecisionLocked()
+	skipped := bs.skippedSlots[151]
+	certSkip := bs.alpenglowCertifiedSkips[151]
+	bs.reorderMu.Unlock()
+
+	if changed {
+		t.Fatal("skip marking returns false; the frontier advances via the normal skip path")
+	}
+	if !skipped || !certSkip {
+		t.Fatalf("certified skip must be marked outside near-tip: skipped=%v cert=%v", skipped, certSkip)
+	}
+	if got := bs.stats.FetchSkipped.Load(); got != 1 {
+		t.Fatalf("FetchSkipped = %d, want 1", got)
+	}
+}
+
 func TestApplyAlpenglowDecisionLockedLeavesMatchingCertifiedBlock(t *testing.T) {
 	blockID := solana.Hash{1}
 	bs := NewBlockSource(&BlockSourceOpts{
@@ -492,41 +528,6 @@ func TestPrepareLightbringerHandoffRequiresMinimumRunway(t *testing.T) {
 	}
 }
 
-func TestPrepareLightbringerHandoffAllowsLiveEdgeRunwayAtTip(t *testing.T) {
-	bs := NewBlockSource(&BlockSourceOpts{
-		SourceType:                   BlockSourceLightbringer,
-		LightbringerEndpoint:         "127.0.0.1:50051",
-		StartSlot:                    100,
-		EndSlot:                      200,
-		ConsensusManagedLightbringer: true,
-	})
-
-	bs.isNearTip.Store(true)
-	bs.lightbringerConnected.Store(true)
-	bs.lastExecutedSlot.Store(150)
-	bs.confirmedTip.Store(151)
-	bs.lightbringerLastStreamSlot.Store(151)
-	bs.lastEmittedBlockSlot = 150
-	bs.lightbringerBuffer[151] = &b.Block{Slot: 151, FromLightbringer: true, SourceParentSlot: 150}
-	bs.lightbringerBufferOrder = append(bs.lightbringerBufferOrder, 151)
-
-	reason := bs.lightbringerHandoffWaitReason(151, 150)
-	if !strings.Contains(reason, "handoff-ready runway buffered through slot 151") {
-		t.Fatalf("expected live-edge runway to be handoff-ready, got %q", reason)
-	}
-
-	blocks, handoffSlot, prepared := bs.prepareLightbringerHandoff(151, 150)
-	if !prepared {
-		t.Fatalf("expected consensus-managed handoff to prepare at the live edge")
-	}
-	if handoffSlot != 151 {
-		t.Fatalf("expected handoff slot 151, got %d", handoffSlot)
-	}
-	if len(blocks) != 1 || blocks[0].Slot != 151 {
-		t.Fatalf("expected single live-edge Lightbringer block to be enqueued, got %+v", blocks)
-	}
-}
-
 func TestPrepareTurbineHandoffAllowsLiveEdgeRunwayAtTipWithoutConsensusBuffering(t *testing.T) {
 	bs := NewBlockSource(&BlockSourceOpts{
 		SourceType:      BlockSourceTurbine,
@@ -563,11 +564,10 @@ func TestPrepareTurbineHandoffAllowsLiveEdgeRunwayAtTipWithoutConsensusBuffering
 
 func TestPrepareLightbringerHandoffKeepsMinimumRunwayWhenLightbringerLagsTip(t *testing.T) {
 	bs := NewBlockSource(&BlockSourceOpts{
-		SourceType:                   BlockSourceLightbringer,
-		LightbringerEndpoint:         "127.0.0.1:50051",
-		StartSlot:                    100,
-		EndSlot:                      200,
-		ConsensusManagedLightbringer: true,
+		SourceType:           BlockSourceLightbringer,
+		LightbringerEndpoint: "127.0.0.1:50051",
+		StartSlot:            100,
+		EndSlot:              200,
 	})
 
 	bs.isNearTip.Store(true)
@@ -810,77 +810,6 @@ func TestShouldDecodeLightbringerSlotDoesNotStageWhenReplayGapTooLarge(t *testin
 	}
 }
 
-func TestUpdateModeDefersCatchupWhileConsensusManagedLightbringerIsLive(t *testing.T) {
-	bs := NewBlockSource(&BlockSourceOpts{
-		SourceType:                   BlockSourceLightbringer,
-		LightbringerEndpoint:         "127.0.0.1:50051",
-		StartSlot:                    100,
-		EndSlot:                      300,
-		ConsensusManagedLightbringer: true,
-	})
-
-	bs.lightbringerStarted.Store(true)
-	bs.isNearTip.Store(true)
-	bs.lightbringerActive.Store(true)
-	bs.lightbringerConnected.Store(true)
-	bs.lightbringerHandoffSlot.Store(101)
-	bs.lastExecutedSlot.Store(100)
-	bs.confirmedTip.Store(165)
-	bs.lightbringerLastStreamSlot.Store(164)
-	bs.lightbringerLastRecvUnix.Store(time.Now().Unix())
-	bs.lastProgress.Store(time.Now().Unix())
-	bs.nextSlotToSend = 101
-
-	bs.updateMode()
-
-	if !bs.isNearTip.Load() {
-		t.Fatalf("expected near-tip mode to remain active while Lightbringer observations are fresh")
-	}
-	if !bs.lightbringerActive.Load() {
-		t.Fatalf("expected Lightbringer to stay active during consensus buffering")
-	}
-	if bs.lightbringerNeedRPCResume.Load() {
-		t.Fatalf("expected RPC resume flag to stay clear while deferring catchup")
-	}
-}
-
-func TestUpdateModeFallsBackWhenConsensusManagedLightbringerReplayGapExceedsGrace(t *testing.T) {
-	bs := NewBlockSource(&BlockSourceOpts{
-		SourceType:                   BlockSourceLightbringer,
-		LightbringerEndpoint:         "127.0.0.1:50051",
-		StartSlot:                    100,
-		EndSlot:                      300,
-		ConsensusManagedLightbringer: true,
-	})
-
-	bs.lightbringerStarted.Store(true)
-	bs.isNearTip.Store(true)
-	bs.lightbringerActive.Store(true)
-	bs.lightbringerConnected.Store(true)
-	bs.lightbringerHandoffSlot.Store(101)
-	bs.lastExecutedSlot.Store(100)
-	bs.confirmedTip.Store(229)
-	bs.lightbringerLastStreamSlot.Store(229)
-	bs.lightbringerLastRecvUnix.Store(time.Now().Unix())
-	bs.lastProgress.Store(time.Now().Unix())
-	bs.nextSlotToSend = 150
-
-	bs.updateMode()
-
-	if bs.isNearTip.Load() {
-		t.Fatalf("expected near-tip mode to fall back once replay gap exceeds consensus buffering grace")
-	}
-	if bs.lightbringerActive.Load() {
-		t.Fatalf("expected Lightbringer to be marked inactive after fallback")
-	}
-	if !bs.lightbringerNeedRPCResume.Load() {
-		t.Fatalf("expected RPC resume flag to be raised after fallback")
-	}
-	if got := bs.nextSlotToSend; got != 101 {
-		t.Fatalf("expected consensus-managed fallback to rewind emission frontier to replay next slot 101, got %d", got)
-	}
-}
-
 func TestShouldPreferIncomingLightbringerBlockLockedPrefersConnectedSameSlotBlock(t *testing.T) {
 	bs := NewBlockSource(&BlockSourceOpts{
 		SourceType:           BlockSourceLightbringer,
@@ -924,30 +853,6 @@ func TestWaitingLightbringerParentMismatchLockedDetectsDisconnectedBufferedSlot(
 	if waitingSlot != 151 || observedParent != 149 || expectedParent != 150 {
 		t.Fatalf("expected mismatch details slot=151 observed_parent=149 expected_parent=150, got slot=%d observed=%d expected=%d",
 			waitingSlot, observedParent, expectedParent)
-	}
-}
-
-func TestWaitingLightbringerParentMismatchLockedDefersWhenConsensusManaged(t *testing.T) {
-	bs := NewBlockSource(&BlockSourceOpts{
-		SourceType:                   BlockSourceLightbringer,
-		LightbringerEndpoint:         "127.0.0.1:50051",
-		StartSlot:                    100,
-		EndSlot:                      200,
-		ConsensusManagedLightbringer: true,
-	})
-
-	bs.lightbringerActive.Store(true)
-	bs.lastEmittedBlockSlot = 150
-	bs.nextSlotToSend = 151
-	bs.reorderBuffer[151] = &b.Block{Slot: 151, FromLightbringer: true, SourceParentSlot: 149}
-
-	bs.reorderMu.Lock()
-	waitingSlot, observedParent, expectedParent, mismatch := bs.waitingLightbringerParentMismatchLocked()
-	bs.reorderMu.Unlock()
-
-	if mismatch || waitingSlot != 0 || observedParent != 0 || expectedParent != 0 {
-		t.Fatalf("expected consensus-managed Lightbringer to defer parent mismatch handling, got mismatch=%v slot=%d observed=%d expected=%d",
-			mismatch, waitingSlot, observedParent, expectedParent)
 	}
 }
 
@@ -1157,32 +1062,6 @@ func TestDetectLightbringerGapWaitsForConfiguredFallbackDelay(t *testing.T) {
 	}
 }
 
-func TestDetectLightbringerGapDefersWhenConsensusManaged(t *testing.T) {
-	bs := NewBlockSource(&BlockSourceOpts{
-		SourceType:                   BlockSourceLightbringer,
-		LightbringerEndpoint:         "127.0.0.1:50051",
-		StartSlot:                    100,
-		EndSlot:                      200,
-		ConsensusManagedLightbringer: true,
-	})
-
-	bs.lightbringerActive.Store(true)
-	bs.nextSlotToSend = 120
-	bs.reorderBuffer[121] = &b.Block{Slot: 121, FromLightbringer: true, SourceParentSlot: 120}
-	bs.reorderBuffer[122] = &b.Block{Slot: 122, FromLightbringer: true, SourceParentSlot: 121}
-	bs.lightbringerGapSlot.Store(120)
-	bs.lightbringerGapSinceUnix.Store(time.Now().Add(-time.Minute).UnixNano())
-
-	waitingSlot, firstBufferedSlot, firstBufferedParentSlot, bufferedCount, shouldFallback := bs.detectLightbringerGapLocked()
-	if waitingSlot != 0 || firstBufferedSlot != 0 || firstBufferedParentSlot != 0 || bufferedCount != 0 || shouldFallback {
-		t.Fatalf("expected consensus-managed Lightbringer to defer gap fallback, got waiting=%d first=%d parent=%d buffered=%d fallback=%v",
-			waitingSlot, firstBufferedSlot, firstBufferedParentSlot, bufferedCount, shouldFallback)
-	}
-	if got := bs.lightbringerGapSlot.Load(); got != 0 {
-		t.Fatalf("expected deferred gap tracking to clear the active gap watch, got slot %d", got)
-	}
-}
-
 func TestSetLastExecutedSlotClearsRecoveryWindowImmediatelyWhenDisabled(t *testing.T) {
 	bs := NewBlockSource(&BlockSourceOpts{
 		SourceType:           BlockSourceLightbringer,
@@ -1207,11 +1086,10 @@ func TestSetLastExecutedSlotClearsRecoveryWindowImmediatelyWhenDisabled(t *testi
 
 func TestSetLastExecutedSlotAdvancesDeferredLightbringerFrontier(t *testing.T) {
 	bs := NewBlockSource(&BlockSourceOpts{
-		SourceType:                   BlockSourceLightbringer,
-		LightbringerEndpoint:         "127.0.0.1:50051",
-		StartSlot:                    100,
-		EndSlot:                      200,
-		ConsensusManagedLightbringer: true,
+		SourceType:           BlockSourceLightbringer,
+		LightbringerEndpoint: "127.0.0.1:50051",
+		StartSlot:            100,
+		EndSlot:              200,
 	})
 
 	bs.nextSlotToSend = 151
@@ -1257,11 +1135,10 @@ func TestSetLastExecutedSlotAdvancesDeferredLightbringerFrontier(t *testing.T) {
 
 func TestForceRPCForCatchupRewindsConsensusManagedFrontier(t *testing.T) {
 	bs := NewBlockSource(&BlockSourceOpts{
-		SourceType:                   BlockSourceLightbringer,
-		LightbringerEndpoint:         "127.0.0.1:50051",
-		StartSlot:                    100,
-		EndSlot:                      200,
-		ConsensusManagedLightbringer: true,
+		SourceType:           BlockSourceLightbringer,
+		LightbringerEndpoint: "127.0.0.1:50051",
+		StartSlot:            100,
+		EndSlot:              200,
 	})
 
 	bs.lightbringerActive.Store(true)
@@ -1311,11 +1188,10 @@ func TestForceRPCForCatchupRewindsConsensusManagedFrontier(t *testing.T) {
 
 func TestForceRPCFallbackRewindsConsensusManagedTurbineFrontier(t *testing.T) {
 	bs := NewBlockSource(&BlockSourceOpts{
-		SourceType:                   BlockSourceTurbine,
-		TurbineBindAddr:              "127.0.0.1:8001",
-		StartSlot:                    100,
-		EndSlot:                      200,
-		ConsensusManagedLightbringer: true,
+		SourceType:      BlockSourceTurbine,
+		TurbineBindAddr: "127.0.0.1:8001",
+		StartSlot:       100,
+		EndSlot:         200,
 	})
 
 	bs.lightbringerActive.Store(true)
@@ -1413,11 +1289,10 @@ func TestForceRPCFallbackRewindsActiveTurbineFrontierToReplayProgress(t *testing
 
 func TestForceRPCForCatchupKeepsPendingHandoffEmissionFrontier(t *testing.T) {
 	bs := NewBlockSource(&BlockSourceOpts{
-		SourceType:                   BlockSourceLightbringer,
-		LightbringerEndpoint:         "127.0.0.1:50051",
-		StartSlot:                    100,
-		EndSlot:                      200,
-		ConsensusManagedLightbringer: true,
+		SourceType:           BlockSourceLightbringer,
+		LightbringerEndpoint: "127.0.0.1:50051",
+		StartSlot:            100,
+		EndSlot:              200,
 	})
 
 	bs.lightbringerHandoffSlot.Store(121)
@@ -1444,45 +1319,6 @@ func TestForceRPCForCatchupKeepsPendingHandoffEmissionFrontier(t *testing.T) {
 	}
 	if _, exists := bs.reorderBuffer[151]; !exists {
 		t.Fatalf("expected buffered RPC slot 151 to remain")
-	}
-}
-
-func TestEmitOrderedBlocksDirectlyStreamsConsensusManagedLightbringerObservations(t *testing.T) {
-	bs := NewBlockSource(&BlockSourceOpts{
-		SourceType:                   BlockSourceLightbringer,
-		LightbringerEndpoint:         "127.0.0.1:50051",
-		StartSlot:                    100,
-		EndSlot:                      200,
-		ConsensusManagedLightbringer: true,
-	})
-
-	bs.isNearTip.Store(true)
-	bs.lightbringerActive.Store(true)
-	bs.nextSlotToSend = 101
-
-	done := make(chan struct{})
-	go func() {
-		bs.emitOrderedBlocks()
-		close(done)
-	}()
-
-	bs.resultQueue <- fetchResult{
-		slot:  105,
-		block: &b.Block{Slot: 105, FromLightbringer: true, SourceParentSlot: 104},
-	}
-	close(bs.resultQueue)
-
-	blk := bs.NextBlock()
-	<-done
-
-	if blk == nil || blk.Slot != 105 || !blk.FromLightbringer {
-		t.Fatalf("expected direct Lightbringer observation for slot 105, got %+v", blk)
-	}
-	if _, exists := bs.reorderBuffer[105]; exists {
-		t.Fatalf("expected direct observation to bypass the reorder buffer")
-	}
-	if got := bs.nextSlotToSend; got != 101 {
-		t.Fatalf("expected direct observation to leave nextSlotToSend at 101 until replay resolves it, got %d", got)
 	}
 }
 

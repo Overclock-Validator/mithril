@@ -47,16 +47,51 @@ func runDoctor() {
 		return
 	}
 
-	// 2. Cluster
+	// 2. Cluster — this build boots Alpenglow only.
 	total++
 	cluster := config.GetString("network.cluster")
-	if cluster == "mainnet-beta" || cluster == "testnet" || cluster == "devnet" || cluster == "alpenglow" {
+	if cluster == "alpenglow" {
 		fmt.Printf("  %s Network: %s\n", successStyle.Render("✓"), cluster)
 		passed++
 	} else if cluster == "" {
-		fmt.Printf("  %s network.cluster not set\n", errorStyle.Render("✗"))
+		fmt.Printf("  %s Network: alpenglow (default; network.cluster not set)\n", successStyle.Render("✓"))
+		passed++
+	} else if cluster == "mainnet-beta" || cluster == "testnet" || cluster == "devnet" {
+		fmt.Printf("  %s Cluster %q needs a dev-branch (TowerBFT) build until it upgrades to Alpenglow — this build boots \"alpenglow\" only\n", errorStyle.Render("✗"), cluster)
 	} else {
 		fmt.Printf("  %s Invalid cluster: %s\n", errorStyle.Render("✗"), cluster)
+	}
+
+	// 2b. Node mode — "verifying" (non-voting) is the default; "validator"
+	// enforces the voting-deployment shape (keypairs, turbine, Votor listener).
+	total++
+	consensusMode := config.GetString("consensus.mode")
+	switch consensusMode {
+	case "", "verifying":
+		fmt.Printf("  %s Node mode: verifying (non-voting)\n", successStyle.Render("✓"))
+		passed++
+	case "validator":
+		var missing []string
+		if config.GetString("validator.identity_keypair") == "" {
+			missing = append(missing, "validator.identity_keypair")
+		}
+		if config.GetString("validator.vote_account_keypair") == "" {
+			missing = append(missing, "validator.vote_account_keypair")
+		}
+		if config.GetString("turbine.gossip_entrypoint") == "" {
+			missing = append(missing, "turbine.gossip_entrypoint")
+		}
+		if config.GetString("consensus.alpenglow_observer_bind_addr") == "" {
+			missing = append(missing, "consensus.alpenglow_observer_bind_addr")
+		}
+		if len(missing) == 0 {
+			fmt.Printf("  %s Node mode: validator (voting engine not yet active — runs verify-only)\n", successStyle.Render("✓"))
+			passed++
+		} else {
+			fmt.Printf("  %s validator mode is missing: %s\n", errorStyle.Render("✗"), strings.Join(missing, ", "))
+		}
+	default:
+		fmt.Printf("  %s Invalid consensus.mode: %q (valid: \"verifying\", \"validator\")\n", errorStyle.Render("✗"), consensusMode)
 	}
 
 	// 3. RPC endpoint

@@ -18,19 +18,6 @@ import (
 	"github.com/gagliardetto/solana-go"
 )
 
-// isAlpenglowReplayMode reports whether the consensus engine runs Alpenglow
-// (observer or full), which switches replay to Alpenglow clock + finality semantics.
-func isAlpenglowReplayMode(consensusOpts *ConsensusOpts) bool {
-	if consensusOpts == nil || consensusOpts.Mode == "" {
-		return false
-	}
-	mode, err := consensusengine.NormalizeMode(consensusOpts.Mode)
-	if err != nil {
-		return false
-	}
-	return mode == consensusengine.ModeAlpenglowObserver || mode == consensusengine.ModeAlpenglow
-}
-
 // alpenglowRootedSlot returns the highest slot the engine has seen a finalization
 // certificate for — the Alpenglow finality watermark that drives promotion, the
 // certificate-based counterpart to TowerBFT's HighestRootedSlot.

@@ -209,6 +209,15 @@ func BuildValidatorSet(epoch uint64, stakes map[solana.PublicKey]uint64, voteAcc
 	return ValidatorSet{Epoch: epoch, Validators: entries, TotalStake: totalStake}, nil
 }
 
+// ValidatorSetForEpoch returns the installed validator set for epoch (copy of
+// the header; the validator slice is shared read-only).
+func (v *CertificateVerifier) ValidatorSetForEpoch(epoch uint64) (ValidatorSet, bool) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	set, ok := v.sets[epoch]
+	return set, ok
+}
+
 // LatestEpoch returns the newest epoch with an installed validator set (0 if none).
 func (v *CertificateVerifier) LatestEpoch() uint64 {
 	v.mu.RLock()
@@ -866,6 +875,53 @@ func DecodeSignerStoreBitmap(data []byte, maxLen int) (SignerBitmap, error) {
 		return decodeSignerStoreBase3(payload, totalBits)
 	default:
 		return SignerBitmap{}, fmt.Errorf("alpenglow verifier: unsupported signer bitmap version %d", data[0])
+	}
+}
+
+// EncodeSignerStoreBitmap is the exact inverse of DecodeSignerStoreBitmap:
+// header [version][u16 len LE], then base2 bit-packed bools (LSB-first) or
+// base3 symbols (0/1/2 = none/base/fallback, 5 per byte). Base3 requires
+// disjoint base/fallback sets.
+func EncodeSignerStoreBitmap(b SignerBitmap) ([]byte, error) {
+	if b.Length < 0 || b.Length > MaximumValidators {
+		return nil, fmt.Errorf("alpenglow verifier: invalid bitmap length %d", b.Length)
+	}
+	out := []byte{0, byte(b.Length), byte(b.Length >> 8)}
+	switch b.Encoding {
+	case SignerBitmapBase2:
+		out[0] = signerStoreVersionBase2
+		payload := make([]byte, (b.Length+7)/8)
+		for i := 0; i < b.Length; i++ {
+			if i < len(b.Base) && b.Base[i] {
+				payload[i/8] |= 1 << uint(i%8)
+			}
+		}
+		return append(out, payload...), nil
+	case SignerBitmapBase3:
+		out[0] = signerStoreVersionBase3
+		if err := b.CheckDisjoint(); err != nil {
+			return nil, err
+		}
+		payload := make([]byte, (b.Length+base3SymbolsPerByte-1)/base3SymbolsPerByte)
+		for chunk := range payload {
+			start := chunk * base3SymbolsPerByte
+			end := min(start+base3SymbolsPerByte, b.Length)
+			var blockNum, mult byte = 0, 1
+			for bit := start; bit < end; bit++ {
+				var sym byte
+				if bit < len(b.Base) && b.Base[bit] {
+					sym = 1
+				} else if bit < len(b.Fallback) && b.Fallback[bit] {
+					sym = 2
+				}
+				blockNum += sym * mult
+				mult *= 3
+			}
+			payload[chunk] = blockNum
+		}
+		return append(out, payload...), nil
+	default:
+		return nil, fmt.Errorf("alpenglow verifier: unsupported bitmap encoding %q", b.Encoding)
 	}
 }
 

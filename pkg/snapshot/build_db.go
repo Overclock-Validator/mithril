@@ -369,6 +369,15 @@ func BuildAccountsDbPaths(
 		return nil, nil, err
 	}
 
+	// bootstrap_high_file_id: write-once record of the highest fileId produced
+	// by snapshot bootstrap. The batch-fold engine uses it to classify data
+	// files: anything newer without a manifest is an undecided orphan.
+	bootstrapHighPath := filepath.Join(accountsDbDir, "bootstrap_high_file_id")
+	if err := os.WriteFile(bootstrapHighPath, largestFileIdBytes[:], 0644); err != nil {
+		mlog.Log.Errorf("error while writing bootstrap high file ID to %s: %s", bootstrapHighPath, err)
+		return nil, nil, err
+	}
+
 	bankHashOutputFileName := filepath.Join(accountsDbDir, "bank_hash")
 	if err := os.WriteFile(bankHashOutputFileName, manifest.Bank.Hash[:], 0644); err != nil {
 		mlog.Log.Errorf("error writing bank hash=%x to file=%s: %s", manifest.Bank.Hash, bankHashOutputFileName, err)

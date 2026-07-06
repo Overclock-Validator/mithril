@@ -117,7 +117,7 @@ type editModel struct {
 func newEditModel(cf string, v *viper.Viper) editModel {
 	cluster := v.GetString("network.cluster")
 	if cluster == "" {
-		cluster = "mainnet-beta"
+		cluster = "alpenglow" // the only cluster this build boots
 	}
 	rpcSlice := v.GetStringSlice("network.rpc")
 	rpcEndpoint := ""
@@ -275,10 +275,10 @@ func (m editModel) currentItems() []edItem {
 		}
 	case edScrCluster:
 		return []edItem{
-			{label: "mainnet-beta", value: "mainnet-beta"},
-			{label: "testnet", value: "testnet"},
-			{label: "devnet", value: "devnet"},
-			{label: "alpenglow", value: "alpenglow"},
+			{label: "alpenglow", value: "alpenglow", desc: "The only cluster this build boots"},
+			{label: "mainnet-beta", value: "mainnet-beta", desc: "Requires a dev-branch (TowerBFT) build"},
+			{label: "testnet", value: "testnet", desc: "Requires a dev-branch (TowerBFT) build"},
+			{label: "devnet", value: "devnet", desc: "Requires a dev-branch (TowerBFT) build"},
 			{isSep: true},
 			{label: "← Back", value: "_back"},
 		}
@@ -675,10 +675,11 @@ func (m *editModel) saveConfig() {
 			content = setTomlValue(content, "lightbringer", "quiet", "false")
 		}
 	} else {
-		// Only force block.source="rpc" if no external lightbringer_endpoint is configured.
-		// External LB mode (enabled=false + endpoint set) is a valid runtime config.
+		// Only force a source change if no external lightbringer_endpoint is
+		// configured. External LB mode (enabled=false + endpoint set) is a valid
+		// runtime config. Turbine is the default live Alpenglow source.
 		if m.v.GetString("block.lightbringer_endpoint") == "" {
-			content = setTomlValue(content, "block", "source", "\"rpc\"")
+			content = setTomlValue(content, "block", "source", "\"turbine\"")
 		}
 		if strings.Contains(content, "[lightbringer]") {
 			content = setTomlValue(content, "lightbringer", "enabled", "false")

@@ -363,17 +363,13 @@ func runDoctorChecks(configFile string, cfg *configData) []checkResult {
 		results = append(results, checkResult{"RPC endpoint", "fail", "no RPC endpoints configured"})
 	}
 
-	consensusMode := cfg.consensusMode
-	if consensusMode == "" {
-		consensusMode = "classic"
-	}
-	switch strings.ToLower(strings.TrimSpace(consensusMode)) {
-	case "classic", "legacy", "alpenglow-observer":
-		results = append(results, checkResult{"Consensus", "pass", consensusMode})
-	case "alpenglow":
-		results = append(results, checkResult{"Consensus", "warn", "alpenglow voting mode is not implemented yet"})
+	switch cfg.consensusMode {
+	case "", "verifying":
+		results = append(results, checkResult{"Node mode", "pass", "verifying (non-voting)"})
+	case "validator":
+		results = append(results, checkResult{"Node mode", "pass", "validator (voting engine not yet active)"})
 	default:
-		results = append(results, checkResult{"Consensus", "fail", "invalid mode: " + consensusMode})
+		results = append(results, checkResult{"Node mode", "fail", "invalid consensus.mode: " + cfg.consensusMode})
 	}
 	if cfg.alpenglowBindAddr != "" {
 		if _, _, err := net.SplitHostPort(cfg.alpenglowBindAddr); err != nil {

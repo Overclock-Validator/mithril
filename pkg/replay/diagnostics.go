@@ -6,16 +6,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
-	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/base58"
 	b "github.com/Overclock-Validator/mithril/pkg/block"
-	"github.com/Overclock-Validator/mithril/pkg/blockstream"
-	"github.com/Overclock-Validator/mithril/pkg/forkchoice"
 	"github.com/Overclock-Validator/mithril/pkg/lthash"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
-	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
 )
@@ -230,41 +225,6 @@ func consensusBlockDiagnostic(block *b.Block) map[string]any {
 	}
 }
 
-func consensusObservedBlocksDiagnostic(blocks map[uint64]*b.Block) []map[string]any {
-	slots := make([]uint64, 0, len(blocks))
-	for slot := range blocks {
-		slots = append(slots, slot)
-	}
-	sort.Slice(slots, func(i, j int) bool { return slots[i] < slots[j] })
-
-	out := make([]map[string]any, 0, len(slots))
-	for _, slot := range slots {
-		block := blocks[slot]
-		out = append(out, map[string]any{
-			"slot":               block.Slot,
-			"source_parent_slot": block.SourceParentSlot,
-			"from_lightbringer":  block.FromLightbringer,
-			"is_skipped":         block.IsSkipped,
-			"blockhash":          consensusHashString(block.Blockhash),
-			"last_blockhash":     consensusHashString(block.LastBlockhash),
-			"tx_count":           len(block.Transactions),
-			"entry_count":        len(block.Entries),
-		})
-	}
-	return out
-}
-
-func consensusDecisionDiagnostics(decisions []forkchoice.SlotDecision) []map[string]any {
-	out := make([]map[string]any, 0, len(decisions))
-	for _, decision := range decisions {
-		out = append(out, map[string]any{
-			"slot":      decision.Slot,
-			"use_block": decision.UseBlock,
-		})
-	}
-	return out
-}
-
 // writeConsensusArtifact writes a best-effort JSON diagnostic artifact to the
 // per-run consensus subdirectory. If the log dir is empty or any step fails,
 // it logs a warning and continues; artifact failure must not crash replay.
@@ -289,73 +249,4 @@ func writeConsensusArtifact(filename string, data map[string]interface{}) {
 		return
 	}
 	mlog.Log.FileOnlyf("consensus artifact written: %s", artifactPath)
-}
-
-func buildConsensusMismatchArtifact(
-	block *b.Block,
-	slotCtx *sealevel.SlotCtx,
-	path *pendingConsensusPath,
-	actualBankhash solana.Hash,
-	fetchStats blockstream.FetchStatsSnapshot,
-	forkChoice *forkchoice.ForkChoiceService,
-	consensusPolicy string,
-	observedConsensusBlocks map[uint64]*b.Block,
-	executionAnchorAfterReplay uint64,
-) map[string]interface{} {
-	artifact := map[string]interface{}{
-		"type":                          "bankhash_mismatch",
-		"checked_slot":                  block.Slot,
-		"our_bankhash":                  base58.Encode(actualBankhash[:]),
-		"winning_bankhash":              base58.Encode(path.leafBankhash[:]),
-		"policy":                        consensusPolicy,
-		"run_id":                        CurrentRunID,
-		"created_at":                    time.Now().UTC().Format(time.RFC3339Nano),
-		"path_anchor_slot":              path.anchorSlot,
-		"execution_anchor_after_replay": executionAnchorAfterReplay,
-		"source": map[string]interface{}{
-			"current_source":       fetchStats.CurrentSource,
-			"source_status":        fetchStats.SourceStatus,
-			"is_near_tip":          fetchStats.IsNearTip,
-			"next_slot":            fetchStats.NextSlot,
-			"confirmed_tip":        fetchStats.ConfirmedTip,
-			"processed_tip":        fetchStats.ProcessedTip,
-			"handoff_slot":         fetchStats.HandoffSlot,
-			"waiting_slot_state":   fetchStats.WaitingSlotState,
-			"waiting_slot_retries": fetchStats.WaitingSlotRetries,
-			"inflight":             fetchStats.InflightCount,
-			"retry_queue_len":      fetchStats.RetryQueueLen,
-			"stream_buffer_depth":  fetchStats.BufferDepth,
-			"reorder_buffer_len":   fetchStats.ReorderBufLen,
-		},
-		"block":                     consensusBlockDiagnostic(block),
-		"forkchoice_vote_summary":   forkChoice.SlotVoteDiagnostics(path.leafSlot),
-		"parent_vote_summary":       forkChoice.SlotVoteDiagnostics(block.ParentSlot),
-		"observed_consensus_blocks": consensusObservedBlocksDiagnostic(observedConsensusBlocks),
-		"resolved_path": map[string]interface{}{
-			"anchor_slot":         path.anchorSlot,
-			"leaf_slot":           path.leafSlot,
-			"leaf_bankhash":       base58.Encode(path.leafBankhash[:]),
-			"remaining_decisions": consensusDecisionDiagnostics(path.decisions),
-			"original_decisions":  consensusDecisionDiagnostics(path.originalDecisions),
-		},
-	}
-	if slotCtx != nil {
-		artifact["slot_context"] = map[string]interface{}{
-			"slot":                         slotCtx.Slot,
-			"parent_slot":                  slotCtx.ParentSlot,
-			"epoch":                        slotCtx.Epoch,
-			"blockhash":                    consensusHashString(slotCtx.Blockhash),
-			"last_blockhash":               consensusHashString(slotCtx.LastBlockhash),
-			"latest_evicted_blockhash":     consensusHashString(slotCtx.LatestEvictedBlockhash),
-			"final_bankhash":               consensusByteHashString(slotCtx.FinalBankhash),
-			"accts_lthash_checksum":        consensusLtHashChecksum(slotCtx.AcctsLtHash),
-			"num_signatures":               slotCtx.NumSignatures,
-			"lamports_burnt":               slotCtx.LamportsBurnt,
-			"total_compute_units_consumed": slotCtx.TotalComputeUnitsConsumed,
-			"modified_account_count":       len(slotCtx.ModifiedAccts),
-			"writable_account_count":       len(slotCtx.WritableAccts),
-			"total_epoch_stake":            slotCtx.TotalEpochStake,
-		}
-	}
-	return artifact
 }

@@ -5,6 +5,7 @@ package global
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -14,7 +15,6 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/epochstakes"
-	"github.com/Overclock-Validator/mithril/pkg/forkchoice"
 	"github.com/Overclock-Validator/mithril/pkg/leaderschedule"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
@@ -31,14 +31,12 @@ type GlobalCtx struct {
 	slot                       uint64
 	epoch                      uint64
 	transactionCount           uint64
-	pendingNewStakePubkeys     []accountsdb.StakeIndexEntry // New stake entries to append to index after block commit
-	cachedStakeEntries         []accountsdb.StakeIndexEntry // Parsed+sorted index, populated on first load
-	entriesFlushedSinceCompact int                          // Appended entries since last compaction
+	pendingStakeBySlot         map[uint64][]accountsdb.StakeIndexEntry // New stake entries keyed by the slot that created them; flushed to the index file only when that slot FOLDS (branch-safe: unwound slots drop their entries), merged into stake scans from RAM meanwhile
+	cachedStakeEntries         []accountsdb.StakeIndexEntry            // Parsed+sorted index, populated on first load
+	entriesFlushedSinceCompact int                                     // Appended entries since last compaction
 	voteCache                  map[solana.PublicKey]*sealevel.VoteStateVersions
 	epochVoteStateSnapshots    map[uint64]map[solana.PublicKey]*sealevel.VoteStateVersions
 	epochStakes                *epochstakes.EpochStakesCache
-	epochAuthorizedVoters      *epochstakes.EpochAuthorizedVotersCache
-	forkChoice                 *forkchoice.ForkChoiceService
 	slotsConfirmed             map[uint64]struct{}
 	leaderSchedule             *leaderschedule.LeaderSchedule
 	calcUnixTimeForClockSysvar bool
@@ -67,56 +65,56 @@ func SetEpoch(epoch uint64) {
 	instance.SetEpoch(epoch)
 }
 
-func SetForkChoice(forkChoice *forkchoice.ForkChoiceService) {
-	instance.forkChoice = forkChoice
-}
-
-func HasForkChoice() bool {
-	return instance.forkChoice != nil
-}
-
-func SubmitBlockToForkChoiceService(slot uint64, txs []*solana.Transaction) {
-	if instance.forkChoice == nil {
-		return
-	}
-	instance.forkChoice.SubmitBlock(slot, txs)
-}
-
-func BankhashConfirmedForSlot(slot uint64, bankHash solana.Hash) int {
-	if instance.forkChoice == nil {
-		return 0
-	}
-	return int(instance.forkChoice.IsBankhashCorrect(slot, bankHash).Status)
-}
-
 func IncrTransactionCount(num uint64) {
 	instance.IncrTransactionCount(num)
 }
 
-// EnqueuePendingStakePubkey records a stake pubkey for later append to the index file.
-// Called during tx processing when a stake account is created or modified.
-// Deduplication happens at index load time (LoadStakePubkeyIndex keeps last occurrence).
-func EnqueuePendingStakePubkey(pubkey solana.PublicKey) {
+func SetTransactionCount(num uint64) {
+	instance.SetTransactionCount(num)
+}
+
+// EnqueuePendingStakePubkey records a stake pubkey created/modified while
+// executing `slot`, for later append to the index file. Entries stay in RAM,
+// keyed by slot, until that slot FOLDS to durable storage — so a wrong-fork
+// block's entries are dropped by the unwind instead of leaking into the file
+// — and are merged into stake scans from RAM in the meantime. Deduplication
+// happens at scan/load time (last occurrence wins).
+func EnqueuePendingStakePubkey(slot uint64, pubkey solana.PublicKey) {
 	instance.pendingStakeMutex.Lock()
 	defer instance.pendingStakeMutex.Unlock()
-	instance.pendingNewStakePubkeys = append(instance.pendingNewStakePubkeys, accountsdb.StakeIndexEntry{Pubkey: pubkey})
-}
-
-func PutEpochAuthorizedVoter(voteAcct solana.PublicKey, authorizedVoter solana.PublicKey) {
-	if instance.epochAuthorizedVoters == nil {
-		instance.epochAuthorizedVoters = epochstakes.NewEpochAuthorizedVotersCache()
+	if instance.pendingStakeBySlot == nil {
+		instance.pendingStakeBySlot = make(map[uint64][]accountsdb.StakeIndexEntry)
 	}
-	instance.epochAuthorizedVoters.PutEntry(voteAcct, authorizedVoter)
+	instance.pendingStakeBySlot[slot] = append(instance.pendingStakeBySlot[slot], accountsdb.StakeIndexEntry{Pubkey: pubkey})
 }
 
-func EpochAuthorizedVoters() *epochstakes.EpochAuthorizedVotersCache {
-	return instance.epochAuthorizedVoters
+// PendingStakeEntriesSnapshot returns a copy of all not-yet-flushed stake
+// entries (any slot). Stake scans merge these with the file-backed index so
+// the index file itself only ever needs entries for FOLDED slots.
+func PendingStakeEntriesSnapshot() []accountsdb.StakeIndexEntry {
+	instance.pendingStakeMutex.Lock()
+	defer instance.pendingStakeMutex.Unlock()
+	var out []accountsdb.StakeIndexEntry
+	for _, entries := range instance.pendingStakeBySlot {
+		out = append(out, entries...)
+	}
+	return out
 }
 
-// SetEpochAuthorizedVoters replaces the entire authorized voters cache.
-// Called at epoch boundaries after rebuilding from vote accounts.
-func SetEpochAuthorizedVoters(cache *epochstakes.EpochAuthorizedVotersCache) {
-	instance.epochAuthorizedVoters = cache
+// DropPendingStakePubkeysFrom discards pending entries for slots >= fromSlot.
+// Called by the fork-switch unwind so wrong-fork stake entries never reach the
+// durable index. Returns the number of entries dropped.
+func DropPendingStakePubkeysFrom(fromSlot uint64) int {
+	instance.pendingStakeMutex.Lock()
+	defer instance.pendingStakeMutex.Unlock()
+	dropped := 0
+	for slot, entries := range instance.pendingStakeBySlot {
+		if slot >= fromSlot {
+			dropped += len(entries)
+			delete(instance.pendingStakeBySlot, slot)
+		}
+	}
+	return dropped
 }
 
 func PutSlotConfirmed(slot uint64) {
@@ -364,6 +362,15 @@ func (globctx *GlobalCtx) IncrTransactionCount(num uint64) {
 	globctx.transactionCount += num
 }
 
+// SetTransactionCount overwrites the running transaction count — used to seed it
+// from a resume checkpoint and to restore it after an in-loop fork-switch unwind
+// (so a discarded fork's transactions do not linger in the count).
+func (globctx *GlobalCtx) SetTransactionCount(num uint64) {
+	globctx.mu.Lock()
+	defer globctx.mu.Unlock()
+	globctx.transactionCount = num
+}
+
 func (globctx *GlobalCtx) LatestBlockhash() [32]byte {
 	globctx.mu.Lock()
 	defer globctx.mu.Unlock()
@@ -394,20 +401,35 @@ func (globctx *GlobalCtx) TransactionCount() uint64 {
 	return globctx.transactionCount
 }
 
-// FlushPendingStakePubkeys appends any new stake entries discovered during replay
-// to the stake pubkey index file. Called after each block commit.
-// Writes 48-byte records to match the header written at snapshot time.
-// Returns the number of entries flushed.
+// FlushPendingStakePubkeys appends ALL pending stake entries to the index
+// file regardless of slot. Only correct where forks are impossible (legacy /
+// verify replay modes); the rooted-durable live path must use
+// FlushPendingStakePubkeysThrough at fold time instead.
 func FlushPendingStakePubkeys(accountsDbDir string) (int, error) {
+	return FlushPendingStakePubkeysThrough(accountsDbDir, math.MaxUint64)
+}
+
+// FlushPendingStakePubkeysThrough appends pending stake entries for slots <=
+// through to the index file and fsyncs. Called at FOLD time, BEFORE the batch
+// commit that makes those slots durable: on the index side a crash can then
+// only leave a harmless SUPERSET (re-executed slots re-enqueue; dedup at scan
+// time), never a subset — the index feeding epoch-stakes enumeration must
+// never miss a folded slot's stake accounts. Entries for slots > through stay
+// in RAM (merged into scans) until their own fold or unwind decides them.
+// Returns the number of entries flushed.
+func FlushPendingStakePubkeysThrough(accountsDbDir string, through uint64) (int, error) {
 	instance.pendingStakeMutex.Lock()
-	if len(instance.pendingNewStakePubkeys) == 0 {
+	var pending []accountsdb.StakeIndexEntry
+	for slot, entries := range instance.pendingStakeBySlot {
+		if slot <= through {
+			pending = append(pending, entries...)
+			delete(instance.pendingStakeBySlot, slot)
+		}
+	}
+	if len(pending) == 0 {
 		instance.pendingStakeMutex.Unlock()
 		return 0, nil
 	}
-	// Copy pending slice, clear it, and invalidate cache while holding lock
-	pending := make([]accountsdb.StakeIndexEntry, len(instance.pendingNewStakePubkeys))
-	copy(pending, instance.pendingNewStakePubkeys)
-	instance.pendingNewStakePubkeys = nil
 	instance.cachedStakeEntries = nil // file is changing, invalidate cache
 	instance.pendingStakeMutex.Unlock()
 
@@ -461,7 +483,7 @@ func FlushPendingStakePubkeys(accountsDbDir string) (int, error) {
 func ClearPendingStakePubkeys() {
 	instance.pendingStakeMutex.Lock()
 	defer instance.pendingStakeMutex.Unlock()
-	instance.pendingNewStakePubkeys = nil
+	instance.pendingStakeBySlot = nil
 }
 
 // compactThreshold is the minimum number of appended entries before compaction triggers.
@@ -620,6 +642,33 @@ func StreamStakeAccounts(
 	stakeEntries, err := LoadStakePubkeyIndex(acctsDbDir)
 	if err != nil {
 		return 0, fmt.Errorf("loading stake pubkey index: %w", err)
+	}
+	// Merge stake accounts created by not-yet-folded slots: their entries live
+	// only in RAM (flushed to the file at fold time; dropped on unwind), so the
+	// scan must union them in for completeness at epoch boundaries. File
+	// entries win on duplicates — they carry location hints; the entry is just
+	// a pointer, the delegation itself is read from the account.
+	if pending := PendingStakeEntriesSnapshot(); len(pending) > 0 {
+		inFile := make(map[solana.PublicKey]struct{}, len(stakeEntries))
+		for _, e := range stakeEntries {
+			inFile[e.Pubkey] = struct{}{}
+		}
+		merged := stakeEntries
+		appended := false
+		for _, e := range pending {
+			if _, dup := inFile[e.Pubkey]; dup {
+				continue
+			}
+			if !appended {
+				// Copy-on-write: LoadStakePubkeyIndex's slice is shared/cached.
+				merged = append(append([]accountsdb.StakeIndexEntry(nil), stakeEntries...), e)
+				appended = true
+			} else {
+				merged = append(merged, e)
+			}
+			inFile[e.Pubkey] = struct{}{}
+		}
+		stakeEntries = merged
 	}
 
 	var processedCount atomic.Int64

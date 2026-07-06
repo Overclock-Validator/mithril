@@ -31,15 +31,12 @@ func MigrateConfig(configPath string) bool {
 	if !hasConsensus {
 		additions += `
 # ============================================================================
-# [consensus] - Vote-Anchored Consensus (added by mithril setup --migrate)
+# [consensus] - Alpenglow Observer (added by mithril setup --migrate)
 # ============================================================================
 # [consensus]
-# mode = "classic"
-# alpenglow_observer_bind_addr = ""
+# alpenglow_observer_bind_addr = ""  # Optional Votor QUIC listener (raw-vote cert feed)
 # alpenglow_max_message_bytes = 0
-# skip_path_max_depth = 64
-# unresolved_policy = "halt"
-# enforce_on_source = "stream"
+# alpenglow_bls_dst = ""
 `
 	}
 
@@ -49,7 +46,7 @@ func MigrateConfig(configPath string) bool {
 # [validator] - Optional Validator Identity (added by mithril setup --migrate)
 # ============================================================================
 # identity_keypair is used by native turbine gossip. Set it to a staked
-# validator identity when running consensus.mode="alpenglow-observer".
+# validator identity for better turbine tree positioning.
 #
 # [validator]
 # identity_keypair = ""

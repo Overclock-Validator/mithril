@@ -32,7 +32,3 @@ func alpenglowClockFeatureActive(f *features.Features) bool {
 	}
 	return f.IsActive(features.Alpenglow) || f.IsActive(features.AlpenglowDevContext)
 }
-
-func useAlpenglowClockSemantics(alpenglowReplayMode bool, f *features.Features) bool {
-	return alpenglowReplayMode || alpenglowClockFeatureActive(f)
-}

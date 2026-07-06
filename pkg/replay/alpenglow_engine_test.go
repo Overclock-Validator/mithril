@@ -35,7 +35,7 @@ func TestAlpenglowRootedSlot(t *testing.T) {
 	}
 
 	// engine with no alpenglow chain yet
-	noChain := &fakeEngine{snap: consensusengine.Snapshot{Mode: consensusengine.ModeAlpenglowObserver}}
+	noChain := &fakeEngine{snap: consensusengine.Snapshot{Mode: "alpenglow-observer"}}
 	if slot, ok := alpenglowRootedSlot(noChain); ok || slot != 0 {
 		t.Fatalf("nil chain: got (%d,%v), want (0,false)", slot, ok)
 	}
@@ -54,39 +54,5 @@ func TestAlpenglowRootedSlot(t *testing.T) {
 	}}
 	if slot, ok := alpenglowRootedSlot(fin); !ok || slot != 430276100 {
 		t.Fatalf("finalized: got (%d,%v), want (430276100,true)", slot, ok)
-	}
-}
-
-// isAlpenglowReplayMode gates ALL alpenglow replay behavior (clock, feature
-// overrides, watermark source). Getting this wrong = mainnet bankhash divergence,
-// so pin every case.
-func TestIsAlpenglowReplayMode(t *testing.T) {
-	cases := []struct {
-		name string
-		opts *ConsensusOpts
-		want bool
-	}{
-		{"nil opts", nil, false},
-		{"empty mode", &ConsensusOpts{}, false},
-		{"classic", &ConsensusOpts{Mode: "classic"}, false},
-		{"observer", &ConsensusOpts{Mode: "alpenglow-observer"}, true},
-		{"full alpenglow", &ConsensusOpts{Mode: "alpenglow"}, true},
-		{"invalid mode", &ConsensusOpts{Mode: "nonsense"}, false},
-	}
-	for _, c := range cases {
-		if got := isAlpenglowReplayMode(c.opts); got != c.want {
-			t.Errorf("%s: isAlpenglowReplayMode=%v, want %v", c.name, got, c.want)
-		}
-	}
-}
-
-// The watermark must be classic (TowerBFT) whenever mode is not alpenglow — the
-// mode-switch must never accidentally consult the alpenglow chain in classic mode.
-func TestModeGatesWatermarkSource(t *testing.T) {
-	if isAlpenglowReplayMode(&ConsensusOpts{Mode: "classic"}) {
-		t.Fatal("classic mode must not select the alpenglow watermark")
-	}
-	if !isAlpenglowReplayMode(&ConsensusOpts{Mode: "alpenglow-observer"}) {
-		t.Fatal("observer mode must select the alpenglow watermark")
 	}
 }
