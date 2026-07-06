@@ -366,3 +366,61 @@ func boolBit(b bool) byte {
 	}
 	return 0
 }
+
+// push emits push reg.
+func (a *asm) push(reg uint8) {
+	if reg >= 8 {
+		a.byte(0x41)
+	}
+	a.byte(0x50 + reg&7)
+}
+
+// pop emits pop reg.
+func (a *asm) pop(reg uint8) {
+	if reg >= 8 {
+		a.byte(0x41)
+	}
+	a.byte(0x58 + reg&7)
+}
+
+// call emits CALL rel32 with a placeholder; returns the fixup site.
+func (a *asm) call() int32 {
+	a.byte(0xE8)
+	site := a.here()
+	a.u32(0)
+	return site
+}
+
+// incCtx emits inc qword [rbp+disp].
+func (a *asm) incCtx(disp int32) {
+	a.rex(true, 0, rbp)
+	a.byte(0xFF)
+	a.modrmMemBP(0, disp)
+}
+
+// decCtx emits dec qword [rbp+disp].
+func (a *asm) decCtx(disp int32) {
+	a.rex(true, 1, rbp)
+	a.byte(0xFF)
+	a.modrmMemBP(1, disp)
+}
+
+// cmpCtxImm32 emits cmp qword [rbp+disp], imm32.
+func (a *asm) cmpCtxImm32(disp int32, imm int32) {
+	a.rex(true, 0, rbp)
+	a.byte(0x81)
+	a.modrmMemBP(extCmp, disp)
+	a.u32(uint32(imm))
+}
+
+// loadCtxToSP emits mov rsp, [rbp+disp].
+func (a *asm) loadCtxToSP(disp int32) {
+	a.rex(true, rsp, rbp)
+	a.byte(0x8B)
+	a.modrmMemBP(rsp, disp)
+}
+
+// subSPImm8 emits sub rsp, imm8.
+func (a *asm) subSPImm8(imm byte) {
+	a.byte(0x48, 0x83, 0xEC, imm)
+}

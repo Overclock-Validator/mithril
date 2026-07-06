@@ -37,6 +37,9 @@ func ins(op uint8, dst, src uint8, off int16, imm uint32) sbpf.Slot {
 
 var v0 = sbpfver.SbpfVersion{Version: sbpfver.SbpfVersionV0}
 
+// testFuncs is set per-test for programs that use OpCall.
+var testFuncs map[uint32]int64
+
 // runInterpreter executes text with the given budget and input region.
 // Stack frame gaps are disabled to match the JIT configuration.
 func runInterpreter(text []sbpf.Slot, budget uint64, input []byte) (uint64, uint64, error) {
@@ -44,6 +47,7 @@ func runInterpreter(text []sbpf.Slot, budget uint64, input []byte) (uint64, uint
 		Text:        text,
 		TextVA:      sbpf.VaddrProgram,
 		Entrypoint:  0,
+		Funcs:       testFuncs,
 		SbpfVersion: v0,
 	}
 	meter := cu.NewComputeMeter(budget)
@@ -61,7 +65,7 @@ func runInterpreter(text []sbpf.Slot, budget uint64, input []byte) (uint64, uint
 // runJIT compiles and executes text with the given budget and input.
 func runJIT(t *testing.T, text []sbpf.Slot, budget uint64, input []byte) (uint64, uint64, error) {
 	t.Helper()
-	compiled, err := Compile(text, v0, 0, false)
+	compiled, err := Compile(text, v0, 0, false, testFuncs)
 	require.NoError(t, err)
 	defer compiled.Free()
 	meter := cu.NewComputeMeter(budget)
@@ -91,6 +95,9 @@ func errClass(err error) string {
 		var bad sbpf.ExcBadAccess
 		if errors.As(exc.Detail, &bad) {
 			return "badaccess"
+		}
+		if errors.Is(exc.Detail, sbpf.ExcCallDepth) {
+			return "calldepth"
 		}
 		return "exception:" + exc.Detail.Error()
 	}
@@ -400,7 +407,7 @@ func BenchmarkInterpreterLoop(b *testing.B) {
 }
 
 func BenchmarkJITLoop(b *testing.B) {
-	compiled, err := Compile(benchLoop, v0, 0, false)
+	compiled, err := Compile(benchLoop, v0, 0, false, nil)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -465,4 +472,66 @@ func TestJITRandomMemory(t *testing.T) {
 		text = append(text, ins(sbpf.OpMov64Reg, 0, 3, 0, 0), ins(sbpf.OpExit, 0, 0, 0, 0))
 		diffIn(t, text, 10000, input)
 	}
+}
+
+// hashOf is an arbitrary distinct key for a test function-table entry.
+func hashOf(pc int) uint32 { return uint32(0x1000 + pc) }
+
+func TestJITSimpleCall(t *testing.T) {
+	// main: r0 = f(); exit. f: r0 = 42; exit.
+	testFuncs = map[uint32]int64{hashOf(3): 3}
+	defer func() { testFuncs = nil }()
+	diff(t, []sbpf.Slot{
+		ins(sbpf.OpCall, 0, 0, 0, hashOf(3)), // 0: call f
+		ins(sbpf.OpMov64Imm, 1, 0, 0, 99),    // 1: r1=99 (clobber, must survive? r1 caller-saved)
+		ins(sbpf.OpExit, 0, 0, 0, 0),         // 2: exit -> return r0
+		ins(sbpf.OpMov64Imm, 0, 0, 0, 42),    // 3: f: r0=42
+		ins(sbpf.OpExit, 0, 0, 0, 0),         // 4: return
+	}, 100)
+}
+
+func TestJITCalleeSavedRegs(t *testing.T) {
+	// r6 must be preserved across a call that clobbers it.
+	testFuncs = map[uint32]int64{hashOf(4): 4}
+	defer func() { testFuncs = nil }()
+	diff(t, []sbpf.Slot{
+		ins(sbpf.OpMov64Imm, 6, 0, 0, 7), // 0: r6=7
+		ins(sbpf.OpCall, 0, 0, 0, hashOf(4)),
+		ins(sbpf.OpMov64Reg, 0, 6, 0, 0),   // 2: r0=r6 (should be 7)
+		ins(sbpf.OpExit, 0, 0, 0, 0),       // 3
+		ins(sbpf.OpMov64Imm, 6, 0, 0, 123), // 4: f clobbers r6
+		ins(sbpf.OpExit, 0, 0, 0, 0),       // 5
+	}, 100)
+}
+
+func TestJITRecursiveFactorial(t *testing.T) {
+	// r1 = n; fact(n): if n<=1 return 1 else return n*fact(n-1).
+	testFuncs = map[uint32]int64{hashOf(2): 2}
+	defer func() { testFuncs = nil }()
+	text := []sbpf.Slot{
+		ins(sbpf.OpMov64Imm, 1, 0, 0, 8),     // 0: r1 = 8
+		ins(sbpf.OpCall, 0, 0, 0, hashOf(2)), // 1: call fact
+		ins(sbpf.OpJgtImm, 1, 0, 2, 1),       // 2: fact: if r1 > 1 goto 5
+		ins(sbpf.OpMov64Imm, 0, 0, 0, 1),     // 3: r0 = 1
+		ins(sbpf.OpExit, 0, 0, 0, 0),         // 4: return
+		ins(sbpf.OpMov64Reg, 6, 1, 0, 0),     // 5: r6 = r1 (save n across call)
+		ins(sbpf.OpSub64Imm, 1, 0, 0, 1),     // 6: r1 = n-1
+		ins(sbpf.OpCall, 0, 0, 0, hashOf(2)), // 7: r0 = fact(n-1)
+		ins(sbpf.OpMul64Reg, 0, 6, 0, 0),     // 8: r0 = r0 * r6
+		ins(sbpf.OpExit, 0, 0, 0, 0),         // 9: return
+	}
+	diff(t, text, 100000)
+	// Also the top-level exit is instruction 1's return point + an exit;
+	// add an explicit final exit path.
+}
+
+func TestJITCallDepthOverflow(t *testing.T) {
+	// Unbounded recursion must fault with CallDepth on both engines.
+	testFuncs = map[uint32]int64{hashOf(1): 1}
+	defer func() { testFuncs = nil }()
+	diff(t, []sbpf.Slot{
+		ins(sbpf.OpCall, 0, 0, 0, hashOf(1)), // 0: call self-ish
+		ins(sbpf.OpCall, 0, 0, 0, hashOf(1)), // 1: recurse forever
+		ins(sbpf.OpExit, 0, 0, 0, 0),         // 2
+	}, 1000000)
 }

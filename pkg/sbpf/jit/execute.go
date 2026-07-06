@@ -42,6 +42,7 @@ func (c *Compiled) Run(meter *cu.ComputeMeter, mem *Memory) (ret uint64, cuConsu
 	// Register setup matches the interpreter for a v0 program.
 	ctx.Regs[1] = sbpf.VaddrInput
 	ctx.Regs[10] = sbpf.VaddrStack + sbpf.StackFrameSize
+	ctx.CallDepth = 1 // entry frame
 
 	initial := meter.Remaining()
 	if meter.Disabled() {
@@ -79,6 +80,12 @@ func (c *Compiled) Run(meter *cu.ComputeMeter, mem *Memory) (ret uint64, cuConsu
 		return 0, 0, &sbpf.Exception{
 			PC:     int64(ctx.ExitPC),
 			Detail: fmt.Errorf("%w:", sbpf.ExcExecutionOverrun),
+		}
+	case exitCallDepth:
+		meter.Consume(ctx.CuDue - uint64(c.refundAfter[ctx.ExitPC]))
+		return 0, 0, &sbpf.Exception{
+			PC:     int64(ctx.ExitPC),
+			Detail: fmt.Errorf("%w:", sbpf.ExcCallDepth),
 		}
 	default:
 		panic(fmt.Sprintf("jit: unknown exit reason %d", ctx.ExitReason))

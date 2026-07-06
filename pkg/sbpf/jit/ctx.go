@@ -20,6 +20,7 @@ const (
 	exitDivZero   = 2 // division by zero at ExitPC
 	exitOverrun   = 3 // execution ran off the end of text
 	exitBadAccess = 4 // out-of-bounds or wrong-permission memory access
+	exitCallDepth = 5 // SBF call stack exceeded 64 frames
 )
 
 // ExecContext is the shared state between Go and compiled code. Field
@@ -55,6 +56,10 @@ type ExecContext struct {
 	InputBase uint64 // 0xf0
 	InputLen  uint64 // 0xf8
 
+	// CallDepth mirrors the interpreter's shadow-stack depth: it starts
+	// at 1 (the entry frame) and a call is refused once it reaches 64.
+	CallDepth uint64 // 0x100
+
 	// Go-side only (offsets below are never touched by native code).
 	nativeStack []byte
 	meter       *cu.ComputeMeter
@@ -65,19 +70,21 @@ type ExecContext struct {
 
 // Context field offsets used by the emitter.
 const (
-	offRegs       = 0x00
-	offExitReason = 0xa0
-	offExitPC     = 0xa8
-	offCuDue      = 0xb0
-	offCuLeft     = 0xb8
-	offRoBase     = 0xc0
-	offRoLen      = 0xc8
-	offStackBase  = 0xd0
-	offStackLen   = 0xd8
-	offHeapBase   = 0xe0
-	offHeapLen    = 0xe8
-	offInputBase  = 0xf0
-	offInputLen   = 0xf8
+	offRegs           = 0x00
+	offExitReason     = 0xa0
+	offExitPC         = 0xa8
+	offCuDue          = 0xb0
+	offCuLeft         = 0xb8
+	offRoBase         = 0xc0
+	offRoLen          = 0xc8
+	offStackBase      = 0xd0
+	offStackLen       = 0xd8
+	offHeapBase       = 0xe0
+	offHeapLen        = 0xe8
+	offInputBase      = 0xf0
+	offInputLen       = 0xf8
+	offCallDepth      = 0x100
+	offNativeStackTop = 0x90
 )
 
 const nativeStackSize = 64 << 10

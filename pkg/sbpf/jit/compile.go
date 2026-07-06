@@ -39,7 +39,8 @@ type compiler struct {
 	blockLen  map[int]uint32 // leader pc -> instruction count
 	leaders   map[int]bool
 	lddwSlot2 map[int]bool
-	stackGaps bool // when set, memory ops are unsupported (can't prove region)
+	stackGaps bool             // when set, memory/call ops are unsupported
+	funcs     map[uint32]int64 // program function table (PCHash -> pc)
 }
 
 type jumpFixup struct {
@@ -53,6 +54,7 @@ const (
 	stubDiv0
 	stubOverrun
 	stubBadAccess
+	stubCallDepth
 )
 
 // Compile lowers a verified SBPF v0 program to amd64 code. Programs
@@ -60,7 +62,7 @@ const (
 // reports whether the runtime maps the stack with frame gaps (v0
 // default); when set, memory instructions are unsupported because their
 // region cannot be proven at compile time.
-func Compile(text []sbpf.Slot, ver sbpfver.SbpfVersion, entry uint64, stackGaps bool) (*Compiled, error) {
+func Compile(text []sbpf.Slot, ver sbpfver.SbpfVersion, entry uint64, stackGaps bool, funcs map[uint32]int64) (*Compiled, error) {
 	if ver.Version != sbpfver.SbpfVersionV0 {
 		return nil, ErrUnsupported
 	}
@@ -76,6 +78,7 @@ func Compile(text []sbpf.Slot, ver sbpfver.SbpfVersion, entry uint64, stackGaps 
 		leaders:   map[int]bool{},
 		lddwSlot2: map[int]bool{},
 		stackGaps: stackGaps,
+		funcs:     funcs,
 	}
 
 	if err := c.analyze(int(entry)); err != nil {
@@ -143,8 +146,29 @@ func (c *compiler) analyze(entry int) error {
 		if ins.Op() == sbpf.OpExit && pc+1 < len(c.text) {
 			c.leaders[pc+1] = true
 		}
+		if ins.Op() == sbpf.OpCall {
+			target, ok := c.callTarget(ins)
+			if !ok {
+				return ErrUnsupported // syscall or unknown destination
+			}
+			c.leaders[target] = true
+			if pc+1 < len(c.text) {
+				c.leaders[pc+1] = true // return lands here, new block
+			}
+		}
 	}
 	return nil
+}
+
+// callTarget resolves a v0 OpCall to a local function pc. Returns false
+// for syscalls (imm not in the function table), which are not yet
+// compiled.
+func (c *compiler) callTarget(ins sbpf.Slot) (int, bool) {
+	target, ok := c.funcs[ins.Uimm()]
+	if !ok || target < 0 || target >= int64(len(c.text)) || c.lddwSlot2[int(target)] {
+		return 0, false
+	}
+	return int(target), true
 }
 
 // computeRefunds derives per-block instruction counts and the per-pc
@@ -224,6 +248,15 @@ func (c *compiler) supported(ins sbpf.Slot) bool {
 	if isMemOp(op) {
 		return !c.stackGaps
 	}
+	if op == sbpf.OpCall {
+		// Local calls only, and not under stack-frame gaps (frame-pointer
+		// advance differs).
+		if c.stackGaps {
+			return false
+		}
+		_, ok := c.callTarget(ins)
+		return ok
+	}
 	switch op {
 	case sbpf.OpAdd32Imm, sbpf.OpAdd32Reg, sbpf.OpAdd64Imm, sbpf.OpAdd64Reg,
 		sbpf.OpSub32Imm, sbpf.OpSub32Reg, sbpf.OpSub64Imm, sbpf.OpSub64Reg,
@@ -290,19 +323,29 @@ func (c *compiler) emit() error {
 	// Fall off the end of text: execution overrun.
 	c.fault(stubOverrun, len(c.text))
 
-	// Stubs.
+	// Stubs. Each resets RSP to the trampoline frame before returning,
+	// because a fault or exhaustion may fire with SBF call frames still
+	// on the native stack.
+	retToGo := func() {
+		a.loadCtxToSP(offNativeStackTop)
+		a.subSPImm8(8)
+		a.ret()
+	}
 	stubOff := map[int]int32{}
 	stubOff[stubExit] = a.here()
 	a.storeCtxImm32(offExitReason, exitExited)
-	a.ret()
+	retToGo()
 	for _, s := range []struct {
 		id     int
 		reason int32
-	}{{stubOOCU, exitOOCU}, {stubDiv0, exitDivZero}, {stubOverrun, exitOverrun}, {stubBadAccess, exitBadAccess}} {
+	}{
+		{stubOOCU, exitOOCU}, {stubDiv0, exitDivZero}, {stubOverrun, exitOverrun},
+		{stubBadAccess, exitBadAccess}, {stubCallDepth, exitCallDepth},
+	} {
 		stubOff[s.id] = a.here()
 		a.storeCtx(offExitPC, rax)
 		a.storeCtxImm32(offExitReason, s.reason)
-		a.ret()
+		retToGo()
 	}
 
 	for stub, sites := range c.stubFix {
@@ -504,7 +547,38 @@ func (c *compiler) emitIns(pc int) error {
 		a.aluRegReg(aluTest, true, src, dst)
 		c.jumpFix = append(c.jumpFix, jumpFixup{a.jcc(ccNE), pc + int(ins.Off()) + 1})
 
+	case sbpf.OpCall:
+		target, _ := c.callTarget(ins)
+		// Depth check (interpreter refuses once the shadow stack is full).
+		a.cmpCtxImm32(offCallDepth, 64)
+		okDepth := a.jcc(ccB)
+		c.fault(stubCallDepth, pc)
+		a.patch(okDepth, a.here())
+		a.incCtx(offCallDepth)
+		// Save caller r6..r9 and the frame pointer (r10), advance the
+		// frame pointer, then call.
+		fp := sbfToX86[10]
+		a.push(sbfToX86[6])
+		a.push(sbfToX86[7])
+		a.push(sbfToX86[8])
+		a.push(sbfToX86[9])
+		a.push(fp)
+		a.aluImm(extAdd, true, fp, int32(sbpf.StackFrameSize))
+		c.jumpFix = append(c.jumpFix, jumpFixup{a.call(), target})
+		// Return lands here: restore and unwind.
+		a.pop(fp)
+		a.pop(sbfToX86[9])
+		a.pop(sbfToX86[8])
+		a.pop(sbfToX86[7])
+		a.pop(sbfToX86[6])
+		a.decCtx(offCallDepth)
+
 	case sbpf.OpExit:
+		// Top-level exit returns to Go; a nested exit returns to caller.
+		a.cmpCtxImm32(offCallDepth, 1)
+		top := a.jcc(ccBE)
+		a.ret()
+		a.patch(top, a.here())
 		c.stubJump(stubExit)
 
 	default:
