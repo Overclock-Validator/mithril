@@ -239,6 +239,8 @@ func init() {
 	Run.Flags().BoolVar(&sbpf.UsePool, "use-pool", true, "Disable to allocate fresh slices")
 	Run.Flags().IntVar(&accountsdb.StoreAccountsWorkers, "store-accounts-workers", 128, "Number of workers to write account updates")
 	Run.Flags().IntVar(&accountsdb.ProgramCacheMaxMB, "program-cache-max-mb", accountsdb.DefaultProgramCacheMaxMB, "Maximum approximate SBPF program cache size in MiB")
+	Run.Flags().BoolVar(&sealevel.EnableJIT, "jit", false, "Compile hot SBF programs to native code")
+	Run.Flags().Uint64Var(&sealevel.JITThreshold, "jit-threshold", sealevel.JITThreshold, "Execution count at which a program is compiled")
 
 	// [tuning.pprof] section flags
 	Run.Flags().Int64Var(&pprofPort, "pprof-port", -1, "Port to serve HTTP pprof endpoint")
@@ -711,6 +713,10 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	accountsdb.ProgramCacheMaxMB = getInt("program-cache-max-mb", "tuning.program_cache_max_mb")
 	if accountsdb.ProgramCacheMaxMB <= 0 {
 		return fmt.Errorf("tuning.program_cache_max_mb must be > 0")
+	}
+	sealevel.EnableJIT = getBool("jit", "tuning.jit")
+	if t := getUint64("jit-threshold", "tuning.jit_threshold"); t > 0 {
+		sealevel.JITThreshold = t
 	}
 
 	return nil

@@ -64,6 +64,8 @@ type DevelopmentConfig struct {
 	UsePool                       bool        `toml:"use_pool" mapstructure:"use_pool"`                                                 // was: use-pool
 	Pprof                         PprofConfig `toml:"pprof" mapstructure:"pprof"`
 	ProgramCacheMaxMB             int         `toml:"program_cache_max_mb" mapstructure:"program_cache_max_mb"` // Approximate SBPF program cache size in MiB
+	Jit                           bool        `toml:"jit" mapstructure:"jit"`                                    // Compile hot SBF programs to native code
+	JitThreshold                  uint64      `toml:"jit_threshold" mapstructure:"jit_threshold"`                // Execution count at which a program is compiled
 	Debug                         DebugConfig `toml:"debug" mapstructure:"debug"`
 }
 
