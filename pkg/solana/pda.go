@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"filippo.io/edwards25519"
+	"github.com/maypok86/otter"
 )
 
 const MaxSeeds = 16
@@ -46,9 +47,30 @@ func CreateProgramAddressBytes(seeds [][]byte, programID []byte) ([]byte, error)
 	return hash[:], nil
 }
 
+// onCurveCache memoizes IsOnCurve results. PDA derivation re-checks the
+// same candidate addresses constantly across transactions (token vaults,
+// metadata accounts), and point decompression dwarfs the sha256 that
+// produces the candidate.
+var onCurveCache = func() otter.Cache[[32]byte, bool] {
+	c, err := otter.MustBuilder[[32]byte, bool](1 << 18).Build()
+	if err != nil {
+		panic(err)
+	}
+	return c
+}()
+
 // IsOnCurve checks if 'b' is on the ed25519 curve
 func IsOnCurve(b []byte) bool {
+	if len(b) == 32 {
+		key := [32]byte(b)
+		if onCurve, ok := onCurveCache.Get(key); ok {
+			return onCurve
+		}
+		_, err := new(edwards25519.Point).SetBytes(b)
+		onCurve := err == nil
+		onCurveCache.Set(key, onCurve)
+		return onCurve
+	}
 	_, err := new(edwards25519.Point).SetBytes(b)
-	onCurve := err == nil
-	return onCurve
+	return err == nil
 }
