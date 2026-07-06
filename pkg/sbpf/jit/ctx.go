@@ -67,6 +67,22 @@ type ExecContext struct {
 	SyscallHash uint64 // 0x108
 	ResumeOff   uint64 // 0x110
 
+	// EnterSP is the RSP the trampoline installs before CALLing Resume.
+	// A fresh Run starts it at NativeStackTop; a syscall yield stores its
+	// mid-execution RSP here so the resume re-enters with the nested
+	// native call frames intact (the resume point starts with add rsp,8
+	// to drop the re-entry CALL's return address; exits to Go always
+	// return through the original one at NativeStackTop-8).
+	EnterSP uint64 // 0x118
+
+	// CallxTable points at a per-pc table of packed uint64s for OpCallx
+	// dispatch: low 32 bits the native code offset (0xFFFFFFFF for a pc
+	// with no code, i.e. an lddw immediate slot), high 32 bits the
+	// compute charge for entering mid-block at that pc. CodeBase is the
+	// executable mapping's base address.
+	CallxTable uint64 // 0x120
+	CodeBase   uint64 // 0x128
+
 	// Go-side only (offsets below are never touched by native code).
 	nativeStack []byte
 	meter       *cu.ComputeMeter
@@ -93,6 +109,9 @@ const (
 	offCallDepth      = 0x100
 	offSyscallHash    = 0x108
 	offResumeOff      = 0x110
+	offEnterSP        = 0x118
+	offCallxTable     = 0x120
+	offCodeBase       = 0x128
 	offNativeStackTop = 0x90
 )
 

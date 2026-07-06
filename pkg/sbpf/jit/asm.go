@@ -424,3 +424,8 @@ func (a *asm) loadCtxToSP(disp int32) {
 func (a *asm) subSPImm8(imm byte) {
 	a.byte(0x48, 0x83, 0xEC, imm)
 }
+
+// addSPImm8 emits add rsp, imm8.
+func (a *asm) addSPImm8(imm byte) {
+	a.byte(0x48, 0x83, 0xC4, imm)
+}

@@ -56,6 +56,7 @@ func (c *Compiled) Run(meter *cu.ComputeMeter, mem *Memory, registry sbpf.Syscal
 	}
 	refreshBudget()
 	ctx.Resume = c.mem.addr(c.entryOff)
+	ctx.EnterSP = ctx.NativeStackTop // syscall yields overwrite with their RSP
 
 	for {
 		enter(ctx)

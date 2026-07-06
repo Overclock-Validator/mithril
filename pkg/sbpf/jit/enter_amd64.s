@@ -18,8 +18,10 @@ TEXT ·enter(SB), NOSPLIT|NOFRAME, $0-8
 	MOVQ R14, 0x80(AX)
 	MOVQ R15, 0x88(AX)
 
-	// Switch stacks and make BP the context pointer.
-	MOVQ 0x90(AX), SP
+	// Switch stacks and make BP the context pointer. EnterSP is the
+	// native stack top on a fresh entry and the yield-time RSP on a
+	// syscall resume.
+	MOVQ 0x118(AX), SP
 	MOVQ AX, BP
 
 	// Load SBF r0..r10.

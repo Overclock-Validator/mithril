@@ -28,6 +28,9 @@ func TestExecContextLayout(t *testing.T) {
 	require.Equal(t, uintptr(offExitPC), unsafe.Offsetof(ctx.ExitPC))
 	require.Equal(t, uintptr(offCuDue), unsafe.Offsetof(ctx.CuDue))
 	require.Equal(t, uintptr(offCuLeft), unsafe.Offsetof(ctx.CuLeft))
+	require.Equal(t, uintptr(offEnterSP), unsafe.Offsetof(ctx.EnterSP))
+	require.Equal(t, uintptr(offCallxTable), unsafe.Offsetof(ctx.CallxTable))
+	require.Equal(t, uintptr(offCodeBase), unsafe.Offsetof(ctx.CodeBase))
 }
 
 func ins(op uint8, dst, src uint8, off int16, imm uint32) sbpf.Slot {
@@ -660,6 +663,76 @@ func TestJITUnknownSyscall(t *testing.T) {
 		ins(sbpf.OpExit, 0, 0, 0, 0),
 	}, v0, 0, false, nil, nil)
 	require.ErrorIs(t, err, ErrUnsupported)
+}
+
+func TestJITSyscallInCall(t *testing.T) {
+	// A syscall inside a local function: the yield and resume must
+	// preserve the native call frame so f's return still works.
+	h := sbpf.SymbolHash("sum5")
+	setSyscall(t, h, cuSyscall(2))
+	testFuncs = map[uint32]int64{hashOf(4): 4}
+	defer func() { testFuncs = nil }()
+	diff(t, []sbpf.Slot{
+		ins(sbpf.OpMov64Imm, 6, 0, 0, 500),   // 0: r6 = 500
+		ins(sbpf.OpCall, 0, 0, 0, hashOf(4)), // 1: r0 = f()
+		ins(sbpf.OpAdd64Reg, 0, 6, 0, 0),     // 2: r0 += r6
+		ins(sbpf.OpExit, 0, 0, 0, 0),         // 3
+		ins(sbpf.OpMov64Imm, 1, 0, 0, 7),     // 4: f: r1 = 7
+		ins(sbpf.OpCall, 0, 0, 0, h),         // 5: r0 = sum5 = 7
+		ins(sbpf.OpAdd64Imm, 0, 0, 0, 1),     // 6: r0 = 8
+		ins(sbpf.OpExit, 0, 0, 0, 0),         // 7: return
+	}, 1000)
+}
+
+func TestJITSyscallInNestedCalls(t *testing.T) {
+	// Syscalls at depth 1, 2 and after returning; exercises repeated
+	// yields with live native frames above and below.
+	h := sbpf.SymbolHash("sum5")
+	setSyscall(t, h, cuSyscall(3))
+	testFuncs = map[uint32]int64{hashOf(6): 6, hashOf(12): 12}
+	defer func() { testFuncs = nil }()
+	diff(t, []sbpf.Slot{
+		ins(sbpf.OpMov64Imm, 6, 0, 0, 1000),  // 0
+		ins(sbpf.OpCall, 0, 0, 0, hashOf(6)), // 1: r0 = f()
+		ins(sbpf.OpMov64Imm, 1, 0, 0, 1),     // 2: r1 = 1
+		ins(sbpf.OpCall, 0, 0, 0, h),         // 3: top-level syscall
+		ins(sbpf.OpAdd64Reg, 0, 6, 0, 0),     // 4: r0 += r6
+		ins(sbpf.OpExit, 0, 0, 0, 0),         // 5
+		ins(sbpf.OpMov64Imm, 7, 0, 0, 30),     // 6: f: r7 = 30
+		ins(sbpf.OpCall, 0, 0, 0, hashOf(12)), // 7: r0 = g()
+		ins(sbpf.OpMov64Reg, 1, 0, 0, 0),      // 8: r1 = r0
+		ins(sbpf.OpCall, 0, 0, 0, h),          // 9: syscall at depth 1
+		ins(sbpf.OpAdd64Reg, 0, 7, 0, 0),      // 10: r0 += r7
+		ins(sbpf.OpExit, 0, 0, 0, 0),          // 11: return
+		ins(sbpf.OpMov64Imm, 1, 0, 0, 5), // 12: g: r1 = 5
+		ins(sbpf.OpMov64Imm, 2, 0, 0, 6), // 13: r2 = 6
+		ins(sbpf.OpCall, 0, 0, 0, h),     // 14: syscall at depth 2
+		ins(sbpf.OpExit, 0, 0, 0, 0),     // 15: return r0 = 11
+	}, 1000)
+}
+
+func TestJITSyscallInRecursion(t *testing.T) {
+	// fact-with-syscall: each level syscalls before recursing.
+	h := sbpf.SymbolHash("sum5")
+	setSyscall(t, h, cuSyscall(1))
+	testFuncs = map[uint32]int64{hashOf(2): 2}
+	defer func() { testFuncs = nil }()
+	diff(t, []sbpf.Slot{
+		ins(sbpf.OpMov64Imm, 1, 0, 0, 6),     // 0: r1 = 6
+		ins(sbpf.OpCall, 0, 0, 0, hashOf(2)), // 1: r0 = fact(6)
+		ins(sbpf.OpMov64Reg, 6, 1, 0, 0),     // 2: fact: r6 = n
+		ins(sbpf.OpCall, 0, 0, 0, h),         // 3: r0 = sum5(n,..) = n
+		ins(sbpf.OpJgtImm, 6, 0, 3, 1),       // 4: if n > 1 goto 8
+		ins(sbpf.OpMov64Imm, 0, 0, 0, 1),     // 5: r0 = 1
+		ins(sbpf.OpMov64Reg, 1, 6, 0, 0),     // 6: r1 = n (restore)
+		ins(sbpf.OpExit, 0, 0, 0, 0),         // 7: return
+		ins(sbpf.OpMov64Reg, 1, 6, 0, 0),     // 8: r1 = n
+		ins(sbpf.OpSub64Imm, 1, 0, 0, 1),     // 9: r1 = n-1
+		ins(sbpf.OpCall, 0, 0, 0, hashOf(2)), // 10: r0 = fact(n-1)
+		ins(sbpf.OpMul64Reg, 0, 6, 0, 0),     // 11: r0 *= n
+		ins(sbpf.OpMov64Reg, 1, 6, 0, 0),     // 12: r1 = n
+		ins(sbpf.OpExit, 0, 0, 0, 0),         // 13: return
+	}, 100000)
 }
 
 func TestJITSyscallInLoop(t *testing.T) {

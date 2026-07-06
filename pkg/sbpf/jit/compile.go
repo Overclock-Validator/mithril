@@ -43,14 +43,6 @@ type compiler struct {
 	stackGaps bool             // when set, memory/call ops are unsupported
 	funcs     map[uint32]int64 // program function table (PCHash -> pc)
 	isSyscall func(uint32) bool
-	resumeFix []resumeFixup
-}
-
-// resumeFixup records a syscall's ResumeOff imm32 to patch with the
-// native offset of the following instruction once it is known.
-type resumeFixup struct {
-	site     int32
-	resumePC int
 }
 
 type jumpFixup struct {
@@ -140,7 +132,7 @@ func (c *compiler) analyze(entry int) error {
 		}
 		ins := c.text[pc]
 		if !c.supported(ins) {
-			return ErrUnsupported
+			return fmt.Errorf("%w: op %#x at pc %d", ErrUnsupported, ins.Op(), pc)
 		}
 		if op := ins.Op(); isJump(op) {
 			if op != sbpf.OpJa {
@@ -383,10 +375,6 @@ func (c *compiler) emit() error {
 	for _, f := range c.jumpFix {
 		a.patch(f.site, c.insnOff[f.targetPC])
 	}
-	// Resume offsets are absolute code offsets, not rel32 displacements.
-	for _, f := range c.resumeFix {
-		binary.LittleEndian.PutUint32(a.buf[f.site:], uint32(c.insnOff[f.resumePC]))
-	}
 	return nil
 }
 
@@ -580,17 +568,24 @@ func (c *compiler) emitIns(pc int) error {
 
 	case sbpf.OpCall:
 		if c.isSyscall(ins.Uimm()) {
-			// Yield to Go: record the syscall and where to resume.
+			// Yield to Go: record the syscall, where to resume, and the
+			// current RSP so nested native call frames survive the yield.
 			a.storeCtxImm32(offExitPC, int32(pc))
 			a.storeCtxImm32(offSyscallHash, int32(ins.Uimm()))
+			a.storeCtx(offEnterSP, rsp)
 			a.rex(true, 0, rbp)
 			a.byte(0xC7)
 			a.modrmMemBP(0, offResumeOff)
 			site := a.here()
-			a.u32(0) // patched with insnOff[pc+1]
-			c.resumeFix = append(c.resumeFix, resumeFixup{site: site, resumePC: pc + 1})
+			a.u32(0) // patched with the resume thunk offset below
 			a.storeCtxImm32(offExitReason, exitSyscall)
 			c.stubJump(stubReturn)
+			// Resume thunk: the trampoline re-enters here with a CALL at
+			// the yield-time RSP; drop its return address and fall through
+			// to pc+1. Exits to Go return through the original address at
+			// NativeStackTop-8, which pushes never reach.
+			binary.LittleEndian.PutUint32(a.buf[site:], uint32(a.here()))
+			a.addSPImm8(8)
 			break
 		}
 		target, _ := c.callTarget(ins)
