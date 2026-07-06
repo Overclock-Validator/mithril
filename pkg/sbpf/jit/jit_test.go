@@ -37,8 +37,9 @@ func ins(op uint8, dst, src uint8, off int16, imm uint32) sbpf.Slot {
 
 var v0 = sbpfver.SbpfVersion{Version: sbpfver.SbpfVersionV0}
 
-// runInterpreter executes text on the interpreter with the given budget.
-func runInterpreter(text []sbpf.Slot, budget uint64) (uint64, uint64, error) {
+// runInterpreter executes text with the given budget and input region.
+// Stack frame gaps are disabled to match the JIT configuration.
+func runInterpreter(text []sbpf.Slot, budget uint64, input []byte) (uint64, uint64, error) {
 	prog := &sbpf.Program{
 		Text:        text,
 		TextVA:      sbpf.VaddrProgram,
@@ -47,22 +48,28 @@ func runInterpreter(text []sbpf.Slot, budget uint64) (uint64, uint64, error) {
 	}
 	meter := cu.NewComputeMeter(budget)
 	interp := sbpf.NewInterpreter(prog, &sbpf.VMOpts{
-		HeapMax:      1024,
-		Syscalls:     func(uint32) (sbpf.Syscall, bool) { return nil, false },
-		ComputeMeter: &meter,
+		HeapMax:               4096,
+		Input:                 input,
+		Syscalls:              func(uint32) (sbpf.Syscall, bool) { return nil, false },
+		ComputeMeter:          &meter,
+		DisableStackFrameGaps: true,
 	})
 	defer interp.Finish()
 	return interp.Run()
 }
 
-// runJIT compiles and executes text with the given budget.
-func runJIT(t *testing.T, text []sbpf.Slot, budget uint64) (uint64, uint64, error) {
+// runJIT compiles and executes text with the given budget and input.
+func runJIT(t *testing.T, text []sbpf.Slot, budget uint64, input []byte) (uint64, uint64, error) {
 	t.Helper()
-	compiled, err := Compile(text, v0, 0)
+	compiled, err := Compile(text, v0, 0, false)
 	require.NoError(t, err)
 	defer compiled.Free()
 	meter := cu.NewComputeMeter(budget)
-	return compiled.Run(&meter)
+	return compiled.Run(&meter, &Memory{
+		Stack: make([]byte, sbpf.StackMax),
+		Heap:  make([]byte, 4096),
+		Input: input,
+	})
 }
 
 // errClass folds errors into comparable categories.
@@ -81,6 +88,10 @@ func errClass(err error) string {
 		case errors.Is(exc.Detail, sbpf.ExcExecutionOverrun):
 			return "overrun"
 		}
+		var bad sbpf.ExcBadAccess
+		if errors.As(exc.Detail, &bad) {
+			return "badaccess"
+		}
 		return "exception:" + exc.Detail.Error()
 	}
 	return err.Error()
@@ -89,13 +100,24 @@ func errClass(err error) string {
 // diff runs text through both engines and requires identical results.
 func diff(t *testing.T, text []sbpf.Slot, budget uint64) {
 	t.Helper()
-	iRet, iCU, iErr := runInterpreter(text, budget)
-	jRet, jCU, jErr := runJIT(t, text, budget)
+	diffIn(t, text, budget, nil)
+}
+
+func diffIn(t *testing.T, text []sbpf.Slot, budget uint64, input []byte) {
+	t.Helper()
+	// Each engine gets its own input copy: a program may write to the
+	// input region, and a shared slice would leak the first run's
+	// mutations into the second.
+	iInput := append([]byte(nil), input...)
+	jInput := append([]byte(nil), input...)
+	iRet, iCU, iErr := runInterpreter(text, budget, iInput)
+	jRet, jCU, jErr := runJIT(t, text, budget, jInput)
 	require.Equal(t, errClass(iErr), errClass(jErr), "error mismatch")
 	require.Equal(t, iCU, jCU, "cu mismatch")
 	if iErr == nil {
 		require.Equal(t, iRet, jRet, "result mismatch")
 	}
+	require.Equal(t, iInput, jInput, "input region mismatch after execution")
 }
 
 func TestJITBasicALU(t *testing.T) {
@@ -214,6 +236,73 @@ func TestJITByteSwap(t *testing.T) {
 	}
 }
 
+func TestJITStackRoundTrip(t *testing.T) {
+	// Store a 64-bit value below the frame pointer, read it back.
+	diff(t, []sbpf.Slot{
+		ins(sbpf.OpLddw, 1, 0, 0, 0x01020304),
+		ins(0, 0, 0, 0, 0x05060708),
+		ins(sbpf.OpStxdw, 10, 1, -8, 0),
+		ins(sbpf.OpLdxdw, 0, 10, -8, 0),
+		ins(sbpf.OpExit, 0, 0, 0, 0),
+	}, 100)
+}
+
+func TestJITHeapSizes(t *testing.T) {
+	// r1 = heap base vaddr.
+	base := func() []sbpf.Slot {
+		return []sbpf.Slot{
+			ins(sbpf.OpLddw, 1, 0, 0, uint32(sbpf.VaddrHeap&0xffffffff)),
+			ins(0, 0, 0, 0, uint32(sbpf.VaddrHeap>>32) /*=3*/),
+		}
+	}
+	// Store imm then load with each width.
+	for _, st := range []struct {
+		stOp, ldOp uint8
+	}{
+		{sbpf.OpStb, sbpf.OpLdxb}, {sbpf.OpSth, sbpf.OpLdxh},
+		{sbpf.OpStw, sbpf.OpLdxw}, {sbpf.OpStdw, sbpf.OpLdxdw},
+	} {
+		text := append(base(),
+			ins(st.stOp, 1, 0, 16, 0xdeadbeef),
+			ins(st.ldOp, 0, 1, 16, 0),
+			ins(sbpf.OpExit, 0, 0, 0, 0),
+		)
+		diff(t, text, 100)
+	}
+}
+
+func TestJITInputRead(t *testing.T) {
+	input := make([]byte, 64)
+	for i := range input {
+		input[i] = byte(i * 7)
+	}
+	text := []sbpf.Slot{
+		ins(sbpf.OpMov64Reg, 1, 1, 0, 0), // r1 already = VaddrInput
+		ins(sbpf.OpLdxdw, 0, 1, 8, 0),
+		ins(sbpf.OpLdxb, 2, 1, 40, 0),
+		ins(sbpf.OpAdd64Reg, 0, 2, 0, 0),
+		ins(sbpf.OpExit, 0, 0, 0, 0),
+	}
+	diffIn(t, text, 100, input)
+}
+
+func TestJITBadAccess(t *testing.T) {
+	// Load from an unmapped region (hi=5).
+	diff(t, []sbpf.Slot{
+		ins(sbpf.OpLddw, 1, 0, 0, 0),
+		ins(0, 0, 0, 0, 5),
+		ins(sbpf.OpLdxdw, 0, 1, 0, 0),
+		ins(sbpf.OpExit, 0, 0, 0, 0),
+	}, 100)
+	// Store past the end of the heap.
+	diff(t, []sbpf.Slot{
+		ins(sbpf.OpLddw, 1, 0, 0, uint32(sbpf.VaddrHeap&0xffffffff)),
+		ins(0, 0, 0, 0, uint32(sbpf.VaddrHeap>>32) /*=3*/),
+		ins(sbpf.OpStdw, 1, 0, 8192, 0),
+		ins(sbpf.OpExit, 0, 0, 0, 0),
+	}, 100)
+}
+
 // aluFuzzOps are (op, usesSrc) pairs for random straightline programs.
 var aluFuzzOps = []struct {
 	op      uint8
@@ -280,6 +369,8 @@ func TestJITRandomALU(t *testing.T) {
 }
 
 // benchLoop is a 10M-instruction counting loop.
+var benchMem = Memory{Stack: make([]byte, sbpf.StackMax), Heap: make([]byte, 4096)}
+
 var benchLoop = []sbpf.Slot{
 	ins(sbpf.OpMov64Imm, 0, 0, 0, 0),
 	ins(sbpf.OpMov64Imm, 1, 0, 0, 1),
@@ -309,17 +400,69 @@ func BenchmarkInterpreterLoop(b *testing.B) {
 }
 
 func BenchmarkJITLoop(b *testing.B) {
-	compiled, err := Compile(benchLoop, v0, 0)
+	compiled, err := Compile(benchLoop, v0, 0, false)
 	if err != nil {
 		b.Fatal(err)
 	}
 	defer compiled.Free()
 	for i := 0; i < b.N; i++ {
 		meter := cu.NewComputeMeter(100000000)
-		_, cuUsed, err := compiled.Run(&meter)
+		_, cuUsed, err := compiled.Run(&meter, &benchMem)
 		if err != nil {
 			b.Fatal(err)
 		}
 		b.ReportMetric(float64(cuUsed), "insns")
+	}
+}
+
+// TestJITRandomMemory fuzzes loads and stores across all regions with a
+// mix of in-bounds and out-of-bounds offsets, comparing both engines.
+func TestJITRandomMemory(t *testing.T) {
+	rng := rand.New(rand.NewSource(99))
+	memOps := []struct {
+		st, ld uint8
+		size   int16
+	}{
+		{sbpf.OpStxb, sbpf.OpLdxb, 1},
+		{sbpf.OpStxh, sbpf.OpLdxh, 2},
+		{sbpf.OpStxw, sbpf.OpLdxw, 4},
+		{sbpf.OpStxdw, sbpf.OpLdxdw, 8},
+	}
+	for round := 0; round < 300; round++ {
+		input := make([]byte, 128)
+		for i := range input {
+			input[i] = byte(rng.Intn(256))
+		}
+		var text []sbpf.Slot
+		// r1=heap, r2=input (already VaddrInput but reset explicitly), r10=stack fp.
+		text = append(text,
+			ins(sbpf.OpLddw, 1, 0, 0, uint32(sbpf.VaddrHeap&0xffffffff)),
+			ins(0, 0, 0, 0, uint32(sbpf.VaddrHeap>>32)),
+			ins(sbpf.OpLddw, 2, 0, 0, uint32(sbpf.VaddrInput&0xffffffff)),
+			ins(0, 0, 0, 0, uint32(sbpf.VaddrInput>>32)),
+			ins(sbpf.OpLddw, 3, 0, 0, rng.Uint32()),
+			ins(0, 0, 0, 0, rng.Uint32()),
+		)
+		for i := 0; i < 20; i++ {
+			mo := memOps[rng.Intn(len(memOps))]
+			base := uint8([]int{1, 2, 10}[rng.Intn(3)])
+			// Mostly small in-bounds offsets; occasionally wild.
+			var off int16
+			if rng.Intn(6) == 0 {
+				off = int16(rng.Intn(70000) - 35000)
+			} else {
+				off = int16(rng.Intn(64))
+				if base == 10 {
+					off = -off - int16(mo.size) // below frame pointer
+				}
+			}
+			if rng.Intn(2) == 0 {
+				text = append(text, ins(mo.st, base, 3, off, 0))
+			} else {
+				text = append(text, ins(mo.ld, 3, base, off, 0))
+			}
+		}
+		text = append(text, ins(sbpf.OpMov64Reg, 0, 3, 0, 0), ins(sbpf.OpExit, 0, 0, 0, 0))
+		diffIn(t, text, 10000, input)
 	}
 }

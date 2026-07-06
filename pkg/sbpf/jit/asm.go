@@ -284,3 +284,85 @@ func (a *asm) movzxReg16(dst, src uint8) {
 	a.rex(true, dst, src)
 	a.byte(0x0F, 0xB7, modrmReg(dst, src))
 }
+
+// modrmMemRAX emits a [RAX] memory operand for the given reg field.
+func (a *asm) modrmMemRAX(reg uint8) { a.byte((reg&7)<<3 | rax) }
+
+// loadZX emits a zero-extending load of `size` bytes from [RAX] into
+// dst (full 64-bit dst).
+func (a *asm) loadZX(dst uint8, size int) {
+	switch size {
+	case 1:
+		a.rex(true, dst, rax)
+		a.byte(0x0F, 0xB6)
+		a.modrmMemRAX(dst)
+	case 2:
+		a.rex(true, dst, rax)
+		a.byte(0x0F, 0xB7)
+		a.modrmMemRAX(dst)
+	case 4:
+		a.rex32(dst, rax) // mov r32,[rax] zero-extends to 64
+		a.byte(0x8B)
+		a.modrmMemRAX(dst)
+	case 8:
+		a.rex(true, dst, rax)
+		a.byte(0x8B)
+		a.modrmMemRAX(dst)
+	}
+}
+
+// storeReg emits a store of the low `size` bytes of src to [RAX].
+func (a *asm) storeReg(src uint8, size int) {
+	switch size {
+	case 1:
+		// REX (even if 0x40) forces spl/bpl/sil/dil low-byte encoding;
+		// REX.R (0x04) extends the src reg field.
+		a.byte(0x40 | boolBit(src >= 8)*4)
+		a.byte(0x88)
+		a.modrmMemRAX(src)
+	case 2:
+		a.byte(0x66)
+		a.rex32(src, rax)
+		a.byte(0x89)
+		a.modrmMemRAX(src)
+	case 4:
+		a.rex32(src, rax)
+		a.byte(0x89)
+		a.modrmMemRAX(src)
+	case 8:
+		a.rex(true, src, rax)
+		a.byte(0x89)
+		a.modrmMemRAX(src)
+	}
+}
+
+// storeImm emits a store of imm (low `size` bytes; 64-bit uses the
+// sign-extended imm32) to [RAX].
+func (a *asm) storeImm(size int, imm int32) {
+	switch size {
+	case 1:
+		a.byte(0xC6)
+		a.modrmMemRAX(0)
+		a.byte(byte(imm))
+	case 2:
+		a.byte(0x66, 0xC7)
+		a.modrmMemRAX(0)
+		a.byte(byte(imm), byte(imm>>8))
+	case 4:
+		a.byte(0xC7)
+		a.modrmMemRAX(0)
+		a.u32(uint32(imm))
+	case 8:
+		a.rex(true, 0, rax)
+		a.byte(0xC7)
+		a.modrmMemRAX(0)
+		a.u32(uint32(imm))
+	}
+}
+
+func boolBit(b bool) byte {
+	if b {
+		return 1
+	}
+	return 0
+}

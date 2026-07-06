@@ -39,6 +39,7 @@ type compiler struct {
 	blockLen  map[int]uint32 // leader pc -> instruction count
 	leaders   map[int]bool
 	lddwSlot2 map[int]bool
+	stackGaps bool // when set, memory ops are unsupported (can't prove region)
 }
 
 type jumpFixup struct {
@@ -51,11 +52,15 @@ const (
 	stubOOCU
 	stubDiv0
 	stubOverrun
+	stubBadAccess
 )
 
 // Compile lowers a verified SBPF v0 program to amd64 code. Programs
-// using unsupported instructions return ErrUnsupported.
-func Compile(text []sbpf.Slot, ver sbpfver.SbpfVersion, entry uint64) (*Compiled, error) {
+// using unsupported instructions return ErrUnsupported. stackGaps
+// reports whether the runtime maps the stack with frame gaps (v0
+// default); when set, memory instructions are unsupported because their
+// region cannot be proven at compile time.
+func Compile(text []sbpf.Slot, ver sbpfver.SbpfVersion, entry uint64, stackGaps bool) (*Compiled, error) {
 	if ver.Version != sbpfver.SbpfVersionV0 {
 		return nil, ErrUnsupported
 	}
@@ -70,6 +75,7 @@ func Compile(text []sbpf.Slot, ver sbpfver.SbpfVersion, entry uint64) (*Compiled
 		blockLen:  map[int]uint32{},
 		leaders:   map[int]bool{},
 		lddwSlot2: map[int]bool{},
+		stackGaps: stackGaps,
 	}
 
 	if err := c.analyze(int(entry)); err != nil {
@@ -187,10 +193,36 @@ func isJump(op uint8) bool {
 	return false
 }
 
+func isMemOp(op uint8) bool {
+	switch op {
+	case sbpf.OpLdxb, sbpf.OpLdxh, sbpf.OpLdxw, sbpf.OpLdxdw,
+		sbpf.OpStb, sbpf.OpSth, sbpf.OpStw, sbpf.OpStdw,
+		sbpf.OpStxb, sbpf.OpStxh, sbpf.OpStxw, sbpf.OpStxdw:
+		return true
+	}
+	return false
+}
+
+func memSize(op uint8) int {
+	switch op {
+	case sbpf.OpLdxb, sbpf.OpStb, sbpf.OpStxb:
+		return 1
+	case sbpf.OpLdxh, sbpf.OpSth, sbpf.OpStxh:
+		return 2
+	case sbpf.OpLdxw, sbpf.OpStw, sbpf.OpStxw:
+		return 4
+	default:
+		return 8
+	}
+}
+
 func (c *compiler) supported(ins sbpf.Slot) bool {
 	op := ins.Op()
 	if isJump(op) || op == sbpf.OpExit || op == sbpf.OpLddw {
 		return true
+	}
+	if isMemOp(op) {
+		return !c.stackGaps
 	}
 	switch op {
 	case sbpf.OpAdd32Imm, sbpf.OpAdd32Reg, sbpf.OpAdd64Imm, sbpf.OpAdd64Reg,
@@ -266,7 +298,7 @@ func (c *compiler) emit() error {
 	for _, s := range []struct {
 		id     int
 		reason int32
-	}{{stubOOCU, exitOOCU}, {stubDiv0, exitDivZero}, {stubOverrun, exitOverrun}} {
+	}{{stubOOCU, exitOOCU}, {stubDiv0, exitDivZero}, {stubOverrun, exitOverrun}, {stubBadAccess, exitBadAccess}} {
 		stubOff[s.id] = a.here()
 		a.storeCtx(offExitPC, rax)
 		a.storeCtxImm32(offExitReason, s.reason)
@@ -298,6 +330,13 @@ func (c *compiler) emitIns(pc int) error {
 	imm := ins.Imm()
 
 	switch op {
+	case sbpf.OpLdxb, sbpf.OpLdxh, sbpf.OpLdxw, sbpf.OpLdxdw:
+		c.emitLoad(dst, src, ins.Off(), memSize(op), pc)
+	case sbpf.OpStxb, sbpf.OpStxh, sbpf.OpStxw, sbpf.OpStxdw:
+		c.emitStoreReg(dst, src, ins.Off(), memSize(op), pc)
+	case sbpf.OpStb, sbpf.OpSth, sbpf.OpStw, sbpf.OpStdw:
+		c.emitStoreImm(dst, ins.Off(), imm, memSize(op), pc)
+
 	case sbpf.OpAdd32Imm:
 		a.aluImm(extAdd, false, dst, imm)
 		a.movsxd(dst, dst)
