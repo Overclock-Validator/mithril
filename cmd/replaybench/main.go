@@ -137,21 +137,33 @@ func runRun(args []string) {
 		fmt.Println()
 		fmt.Printf("=== per-program interpreter time (%d programs, VM self-time %.3fs, %d insns) ===\n",
 			len(stats), totalSelf.Seconds(), totalInsns)
-		fmt.Printf("%4s %6s %6s %9s %12s %14s  %s\n", "rank", "cum%", "self%", "execs", "insns(M)", "self", "program")
+		fmt.Printf("%4s %6s %6s %4s %9s %12s %14s  %s\n", "rank", "cum%", "self%", "sbpf", "execs", "insns(M)", "self", "program")
+		byVersion := map[uint32]time.Duration{}
+		for _, st := range stats {
+			byVersion[st.SbpfVersion] += st.SelfTime
+		}
 		var cum time.Duration
 		for i, st := range stats {
 			if i >= 40 {
 				break
 			}
 			cum += st.SelfTime
-			fmt.Printf("%4d %5.1f%% %5.1f%% %9d %12.1f %14s  %s\n",
+			fmt.Printf("%4d %5.1f%% %5.1f%% %4d %9d %12.1f %14s  %s\n",
 				i+1,
 				100*float64(cum)/float64(totalSelf),
 				100*float64(st.SelfTime)/float64(totalSelf),
+				st.SbpfVersion,
 				st.Executions,
 				float64(st.Insns)/1e6,
 				st.SelfTime.Round(time.Millisecond),
 				st.ProgramId)
+		}
+		fmt.Println()
+		fmt.Println("VM self-time by SBPF version:")
+		for v := uint32(0); v <= 3; v++ {
+			if d := byVersion[v]; d > 0 {
+				fmt.Printf("  v%d: %.3fs (%.1f%%)\n", v, d.Seconds(), 100*float64(d)/float64(totalSelf))
+			}
 		}
 	}
 }

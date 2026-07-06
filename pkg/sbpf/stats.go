@@ -9,10 +9,11 @@ import (
 
 // ProgramStat aggregates interpreter activity for one program id.
 type ProgramStat struct {
-	ProgramId  solana.PublicKey
-	Executions uint64
-	Insns      uint64        // interpreted instructions (what a JIT would absorb)
-	SelfTime   time.Duration // time in Run excluding nested CPI executions
+	ProgramId   solana.PublicKey
+	SbpfVersion uint32
+	Executions  uint64
+	Insns       uint64        // interpreted instructions (what a JIT would absorb)
+	SelfTime    time.Duration // time in Run excluding nested CPI executions
 }
 
 // StatsCollector attributes interpreter time to program ids, subtracting
@@ -39,7 +40,7 @@ func (s *StatsCollector) enter() {
 	s.stack = append(s.stack, statsFrame{start: time.Now()})
 }
 
-func (s *StatsCollector) exit(programId solana.PublicKey, insns uint64) {
+func (s *StatsCollector) exit(programId solana.PublicKey, version uint32, insns uint64) {
 	frame := s.stack[len(s.stack)-1]
 	s.stack = s.stack[:len(s.stack)-1]
 	elapsed := time.Since(frame.start)
@@ -50,7 +51,7 @@ func (s *StatsCollector) exit(programId solana.PublicKey, insns uint64) {
 
 	st := s.agg[programId]
 	if st == nil {
-		st = &ProgramStat{ProgramId: programId}
+		st = &ProgramStat{ProgramId: programId, SbpfVersion: version}
 		s.agg[programId] = st
 	}
 	st.Executions++

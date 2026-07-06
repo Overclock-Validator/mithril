@@ -243,7 +243,7 @@ func (ip *Interpreter) Run() (ret uint64, cuConsumed uint64, err error) {
 	var insnCount int64
 	if Stats != nil {
 		Stats.enter()
-		defer func() { Stats.exit(ip.programId, uint64(insnCount)) }()
+		defer func() { Stats.exit(ip.programId, ip.sbpfVersion.Version, uint64(insnCount)) }()
 	}
 
 mainLoop:
