@@ -35,7 +35,8 @@ func regionAddr(ctx *ExecContext, b []byte) uint64 {
 // memory effects are visible to compiled code. Return values mirror
 // Interpreter.Run.
 func (c *Compiled) Run(meter *cu.ComputeMeter, mem *Memory, registry sbpf.SyscallRegistry, vm sbpf.VM) (ret uint64, cuConsumed uint64, err error) {
-	ctx := newExecContext()
+	ctx := getExecContext()
+	defer putExecContext(ctx)
 	ctx.meter = meter
 
 	ctx.RoBase, ctx.RoLen = regionAddr(ctx, mem.Ro), uint64(len(mem.Ro))

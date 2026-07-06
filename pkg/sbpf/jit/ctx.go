@@ -8,6 +8,7 @@
 package jit
 
 import (
+	"sync"
 	"unsafe"
 
 	"github.com/Overclock-Validator/mithril/pkg/cu"
@@ -123,4 +124,39 @@ func newExecContext() *ExecContext {
 	base := uintptr(unsafe.Pointer(&ctx.nativeStack[0]))
 	ctx.NativeStackTop = uint64((base + nativeStackSize) &^ 15)
 	return ctx
+}
+
+// Contexts are pooled: the 64K native stack dominates a fresh
+// allocation, and replay runs hundreds of thousands of programs.
+// Nested (CPI) executions each take their own context.
+var ctxPool = sync.Pool{New: func() any { return newExecContext() }}
+
+func getExecContext() *ExecContext {
+	ctx := ctxPool.Get().(*ExecContext)
+	// Zero everything a Run reads or native code may act on before
+	// writing; the native stack, its top, and the host register save
+	// area need no clearing.
+	ctx.Regs = [11]uint64{}
+	ctx.Resume = 0
+	ctx.ExitReason = 0
+	ctx.ExitPC = 0
+	ctx.CuDue = 0
+	ctx.CuLeft = 0
+	ctx.RoBase, ctx.RoLen = 0, 0
+	ctx.StackBase, ctx.StackLen = 0, 0
+	ctx.HeapBase, ctx.HeapLen = 0, 0
+	ctx.InputBase, ctx.InputLen = 0, 0
+	ctx.CallDepth = 0
+	ctx.SyscallHash = 0
+	ctx.ResumeOff = 0
+	ctx.EnterSP = 0
+	ctx.CallxTable = 0
+	ctx.CodeBase = 0
+	ctx.meter = nil
+	ctx.keepalive = ctx.keepalive[:0]
+	return ctx
+}
+
+func putExecContext(ctx *ExecContext) {
+	ctxPool.Put(ctx)
 }
