@@ -37,8 +37,55 @@ func ins(op uint8, dst, src uint8, off int16, imm uint32) sbpf.Slot {
 
 var v0 = sbpfver.SbpfVersion{Version: sbpfver.SbpfVersionV0}
 
-// testFuncs is set per-test for programs that use OpCall.
+// testFuncs is set per-test for programs that use local OpCall.
 var testFuncs map[uint32]int64
+
+// testRegistry / testIsSyscall are set per-test for programs that call
+// syscalls; nil means no syscalls.
+var testRegistry sbpf.SyscallRegistry
+
+// meterVM is a minimal sbpf.VM exposing a compute meter; the memory-less
+// test syscalls use only ComputeMeter.
+type meterVM struct{ m *cu.ComputeMeter }
+
+func (v *meterVM) VMContext() any                                 { return nil }
+func (v *meterVM) HeapMax() uint64                                { return 0 }
+func (v *meterVM) HeapSize() uint64                               { return 0 }
+func (v *meterVM) UpdateHeapSize(uint64)                          {}
+func (v *meterVM) Translate(uint64, uint64, bool) ([]byte, error) { return nil, nil }
+func (v *meterVM) DueInstrCount() uint64                          { return 0 }
+func (v *meterVM) PrevInstrMeter() uint64                         { return 0 }
+func (v *meterVM) SetPrevInstrMeter(uint64)                       {}
+func (v *meterVM) ComputeMeter() *cu.ComputeMeter                 { return v.m }
+func (v *meterVM) Read(uint64, []byte) error                      { return nil }
+func (v *meterVM) Read8(uint64) (uint8, error)                    { return 0, nil }
+func (v *meterVM) Read16(uint64) (uint16, error)                  { return 0, nil }
+func (v *meterVM) Read32(uint64) (uint32, error)                  { return 0, nil }
+func (v *meterVM) Read64(uint64) (uint64, error)                  { return 0, nil }
+func (v *meterVM) Write(uint64, []byte) error                     { return nil }
+func (v *meterVM) Write8(uint64, uint8) error                     { return nil }
+func (v *meterVM) Write16(uint64, uint16) error                   { return nil }
+func (v *meterVM) Write32(uint64, uint32) error                   { return nil }
+func (v *meterVM) Write64(uint64, uint64) error                   { return nil }
+
+func testInterpRegistry() sbpf.SyscallRegistry {
+	if testRegistry != nil {
+		return testRegistry
+	}
+	return func(uint32) (sbpf.Syscall, bool) { return nil, false }
+}
+
+func testIsSyscall(h uint32) bool {
+	if testRegistry == nil {
+		return false
+	}
+	_, ok := testRegistry(h)
+	return ok
+}
+
+func memWith(input []byte) *Memory {
+	return &Memory{Stack: make([]byte, sbpf.StackMax), Heap: make([]byte, 4096), Input: input}
+}
 
 // runInterpreter executes text with the given budget and input region.
 // Stack frame gaps are disabled to match the JIT configuration.
@@ -54,7 +101,7 @@ func runInterpreter(text []sbpf.Slot, budget uint64, input []byte) (uint64, uint
 	interp := sbpf.NewInterpreter(prog, &sbpf.VMOpts{
 		HeapMax:               4096,
 		Input:                 input,
-		Syscalls:              func(uint32) (sbpf.Syscall, bool) { return nil, false },
+		Syscalls:              testInterpRegistry(),
 		ComputeMeter:          &meter,
 		DisableStackFrameGaps: true,
 	})
@@ -65,15 +112,11 @@ func runInterpreter(text []sbpf.Slot, budget uint64, input []byte) (uint64, uint
 // runJIT compiles and executes text with the given budget and input.
 func runJIT(t *testing.T, text []sbpf.Slot, budget uint64, input []byte) (uint64, uint64, error) {
 	t.Helper()
-	compiled, err := Compile(text, v0, 0, false, testFuncs)
+	compiled, err := Compile(text, v0, 0, false, testFuncs, testIsSyscall)
 	require.NoError(t, err)
 	defer compiled.Free()
 	meter := cu.NewComputeMeter(budget)
-	return compiled.Run(&meter, &Memory{
-		Stack: make([]byte, sbpf.StackMax),
-		Heap:  make([]byte, 4096),
-		Input: input,
-	})
+	return compiled.Run(&meter, memWith(input), testRegistry, &meterVM{&meter})
 }
 
 // errClass folds errors into comparable categories.
@@ -98,6 +141,14 @@ func errClass(err error) string {
 		}
 		if errors.Is(exc.Detail, sbpf.ExcCallDepth) {
 			return "calldepth"
+		}
+		var cd sbpf.ExcCallDest
+		if errors.As(exc.Detail, &cd) {
+			return "calldest"
+		}
+		var se sbpf.ExcSyscallError
+		if errors.As(exc.Detail, &se) {
+			return "syscallerr:" + se.Err.Error()
 		}
 		return "exception:" + exc.Detail.Error()
 	}
@@ -407,14 +458,14 @@ func BenchmarkInterpreterLoop(b *testing.B) {
 }
 
 func BenchmarkJITLoop(b *testing.B) {
-	compiled, err := Compile(benchLoop, v0, 0, false, nil)
+	compiled, err := Compile(benchLoop, v0, 0, false, nil, nil)
 	if err != nil {
 		b.Fatal(err)
 	}
 	defer compiled.Free()
 	for i := 0; i < b.N; i++ {
 		meter := cu.NewComputeMeter(100000000)
-		_, cuUsed, err := compiled.Run(&meter, &benchMem)
+		_, cuUsed, err := compiled.Run(&meter, &benchMem, testRegistry, &meterVM{&meter})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -534,4 +585,97 @@ func TestJITCallDepthOverflow(t *testing.T) {
 		ins(sbpf.OpCall, 0, 0, 0, hashOf(1)), // 1: recurse forever
 		ins(sbpf.OpExit, 0, 0, 0, 0),         // 2
 	}, 1000000)
+}
+
+// cuSyscall is a syscall that consumes `cost` compute units and returns
+// the sum of its five arguments. It ignores the VM.
+func cuSyscall(cost uint64) sbpf.Syscall {
+	return sbpf.SyscallFunc5(func(vm sbpf.VM, r1, r2, r3, r4, r5 uint64) (uint64, error) {
+		if vm != nil {
+			if err := vm.ComputeMeter().Consume(cost); err != nil {
+				return 0, err
+			}
+		}
+		return r1 + r2 + r3 + r4 + r5, nil
+	})
+}
+
+func setSyscall(t *testing.T, hash uint32, sc sbpf.Syscall) {
+	t.Helper()
+	testRegistry = func(h uint32) (sbpf.Syscall, bool) {
+		if h == hash {
+			return sc, true
+		}
+		return nil, false
+	}
+	t.Cleanup(func() { testRegistry = nil })
+}
+
+func TestJITSyscallArgsAndReturn(t *testing.T) {
+	h := sbpf.SymbolHash("sum5")
+	setSyscall(t, h, cuSyscall(0))
+	diff(t, []sbpf.Slot{
+		ins(sbpf.OpMov64Imm, 1, 0, 0, 10),
+		ins(sbpf.OpMov64Imm, 2, 0, 0, 20),
+		ins(sbpf.OpMov64Imm, 3, 0, 0, 30),
+		ins(sbpf.OpMov64Imm, 4, 0, 0, 40),
+		ins(sbpf.OpMov64Imm, 5, 0, 0, 50),
+		ins(sbpf.OpCall, 0, 0, 0, h), // r0 = 150
+		ins(sbpf.OpExit, 0, 0, 0, 0),
+	}, 100)
+}
+
+func TestJITSyscallPreservesRegs(t *testing.T) {
+	// r6 (callee-saved) and r1 must survive a syscall; only r0 changes.
+	h := sbpf.SymbolHash("sum5")
+	setSyscall(t, h, cuSyscall(0))
+	diff(t, []sbpf.Slot{
+		ins(sbpf.OpMov64Imm, 6, 0, 0, 777),
+		ins(sbpf.OpMov64Imm, 1, 0, 0, 1),
+		ins(sbpf.OpCall, 0, 0, 0, h),
+		ins(sbpf.OpAdd64Reg, 0, 6, 0, 0), // r0 += 777
+		ins(sbpf.OpExit, 0, 0, 0, 0),
+	}, 100)
+}
+
+func TestJITSyscallComputeCost(t *testing.T) {
+	h := sbpf.SymbolHash("expensive")
+	setSyscall(t, h, cuSyscall(30))
+	// Budget lets the syscall run once but not twice.
+	for _, budget := range []uint64{5, 35, 40, 70, 100} {
+		diff(t, []sbpf.Slot{
+			ins(sbpf.OpMov64Imm, 1, 0, 0, 1),
+			ins(sbpf.OpCall, 0, 0, 0, h),
+			ins(sbpf.OpCall, 0, 0, 0, h),
+			ins(sbpf.OpExit, 0, 0, 0, 0),
+		}, budget)
+	}
+}
+
+func TestJITUnknownSyscall(t *testing.T) {
+	// A call whose imm is neither a function nor (at JIT time) a syscall
+	// stays on the interpreter; verify Compile refuses it.
+	_, err := Compile([]sbpf.Slot{
+		ins(sbpf.OpCall, 0, 0, 0, 0xdeadbeef),
+		ins(sbpf.OpExit, 0, 0, 0, 0),
+	}, v0, 0, false, nil, nil)
+	require.ErrorIs(t, err, ErrUnsupported)
+}
+
+func TestJITSyscallInLoop(t *testing.T) {
+	h := sbpf.SymbolHash("sum5")
+	setSyscall(t, h, cuSyscall(2))
+	// Call the syscall 5 times accumulating into r6.
+	diff(t, []sbpf.Slot{
+		ins(sbpf.OpMov64Imm, 6, 0, 0, 0), // 0: acc=0
+		ins(sbpf.OpMov64Imm, 7, 0, 0, 5), // 1: count=5
+		ins(sbpf.OpJeqImm, 7, 0, 5, 0),   // 2: if count==0 goto 8
+		ins(sbpf.OpMov64Imm, 1, 0, 0, 3), // 3: arg
+		ins(sbpf.OpCall, 0, 0, 0, h),     // 4: r0 = 3
+		ins(sbpf.OpAdd64Reg, 6, 0, 0, 0), // 5: acc += r0
+		ins(sbpf.OpSub64Imm, 7, 0, 0, 1), // 6: count--
+		ins(sbpf.OpJa, 0, 0, -5, 0),      // 7: goto 2
+		ins(sbpf.OpMov64Reg, 0, 6, 0, 0), // 8: r0 = acc
+		ins(sbpf.OpExit, 0, 0, 0, 0),     // 9
+	}, 1000)
 }

@@ -1,6 +1,7 @@
 package jit
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 
@@ -41,6 +42,15 @@ type compiler struct {
 	lddwSlot2 map[int]bool
 	stackGaps bool             // when set, memory/call ops are unsupported
 	funcs     map[uint32]int64 // program function table (PCHash -> pc)
+	isSyscall func(uint32) bool
+	resumeFix []resumeFixup
+}
+
+// resumeFixup records a syscall's ResumeOff imm32 to patch with the
+// native offset of the following instruction once it is known.
+type resumeFixup struct {
+	site     int32
+	resumePC int
 }
 
 type jumpFixup struct {
@@ -55,6 +65,7 @@ const (
 	stubOverrun
 	stubBadAccess
 	stubCallDepth
+	stubReturn
 )
 
 // Compile lowers a verified SBPF v0 program to amd64 code. Programs
@@ -62,12 +73,15 @@ const (
 // reports whether the runtime maps the stack with frame gaps (v0
 // default); when set, memory instructions are unsupported because their
 // region cannot be proven at compile time.
-func Compile(text []sbpf.Slot, ver sbpfver.SbpfVersion, entry uint64, stackGaps bool, funcs map[uint32]int64) (*Compiled, error) {
+func Compile(text []sbpf.Slot, ver sbpfver.SbpfVersion, entry uint64, stackGaps bool, funcs map[uint32]int64, isSyscall func(uint32) bool) (*Compiled, error) {
 	if ver.Version != sbpfver.SbpfVersionV0 {
 		return nil, ErrUnsupported
 	}
 	if len(text) == 0 || entry >= uint64(len(text)) {
 		return nil, ErrUnsupported
+	}
+	if isSyscall == nil {
+		isSyscall = func(uint32) bool { return false }
 	}
 
 	c := &compiler{
@@ -79,6 +93,7 @@ func Compile(text []sbpf.Slot, ver sbpfver.SbpfVersion, entry uint64, stackGaps 
 		lddwSlot2: map[int]bool{},
 		stackGaps: stackGaps,
 		funcs:     funcs,
+		isSyscall: isSyscall,
 	}
 
 	if err := c.analyze(int(entry)); err != nil {
@@ -147,9 +162,15 @@ func (c *compiler) analyze(entry int) error {
 			c.leaders[pc+1] = true
 		}
 		if ins.Op() == sbpf.OpCall {
+			if c.isSyscall(ins.Uimm()) {
+				if pc+1 < len(c.text) {
+					c.leaders[pc+1] = true // resume lands here, new block
+				}
+				continue
+			}
 			target, ok := c.callTarget(ins)
 			if !ok {
-				return ErrUnsupported // syscall or unknown destination
+				return ErrUnsupported // unknown destination
 			}
 			c.leaders[target] = true
 			if pc+1 < len(c.text) {
@@ -249,6 +270,9 @@ func (c *compiler) supported(ins sbpf.Slot) bool {
 		return !c.stackGaps
 	}
 	if op == sbpf.OpCall {
+		if c.isSyscall(ins.Uimm()) {
+			return true
+		}
 		// Local calls only, and not under stack-frame gaps (frame-pointer
 		// advance differs).
 		if c.stackGaps {
@@ -332,6 +356,9 @@ func (c *compiler) emit() error {
 		a.ret()
 	}
 	stubOff := map[int]int32{}
+	// stubReturn: exit reason already stored by the caller.
+	stubOff[stubReturn] = a.here()
+	retToGo()
 	stubOff[stubExit] = a.here()
 	a.storeCtxImm32(offExitReason, exitExited)
 	retToGo()
@@ -355,6 +382,10 @@ func (c *compiler) emit() error {
 	}
 	for _, f := range c.jumpFix {
 		a.patch(f.site, c.insnOff[f.targetPC])
+	}
+	// Resume offsets are absolute code offsets, not rel32 displacements.
+	for _, f := range c.resumeFix {
+		binary.LittleEndian.PutUint32(a.buf[f.site:], uint32(c.insnOff[f.resumePC]))
 	}
 	return nil
 }
@@ -548,6 +579,20 @@ func (c *compiler) emitIns(pc int) error {
 		c.jumpFix = append(c.jumpFix, jumpFixup{a.jcc(ccNE), pc + int(ins.Off()) + 1})
 
 	case sbpf.OpCall:
+		if c.isSyscall(ins.Uimm()) {
+			// Yield to Go: record the syscall and where to resume.
+			a.storeCtxImm32(offExitPC, int32(pc))
+			a.storeCtxImm32(offSyscallHash, int32(ins.Uimm()))
+			a.rex(true, 0, rbp)
+			a.byte(0xC7)
+			a.modrmMemBP(0, offResumeOff)
+			site := a.here()
+			a.u32(0) // patched with insnOff[pc+1]
+			c.resumeFix = append(c.resumeFix, resumeFixup{site: site, resumePC: pc + 1})
+			a.storeCtxImm32(offExitReason, exitSyscall)
+			c.stubJump(stubReturn)
+			break
+		}
 		target, _ := c.callTarget(ins)
 		// Depth check (interpreter refuses once the shadow stack is full).
 		a.cmpCtxImm32(offCallDepth, 64)

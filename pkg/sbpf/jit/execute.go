@@ -28,9 +28,11 @@ func regionAddr(ctx *ExecContext, b []byte) uint64 {
 }
 
 // Run executes the compiled program with interpreter-equivalent
-// register setup and compute accounting. Return values mirror
+// register setup and compute accounting. registry and vm resolve and
+// service syscalls; vm must share mem's backing buffers so syscall
+// memory effects are visible to compiled code. Return values mirror
 // Interpreter.Run.
-func (c *Compiled) Run(meter *cu.ComputeMeter, mem *Memory) (ret uint64, cuConsumed uint64, err error) {
+func (c *Compiled) Run(meter *cu.ComputeMeter, mem *Memory, registry sbpf.SyscallRegistry, vm sbpf.VM) (ret uint64, cuConsumed uint64, err error) {
 	ctx := newExecContext()
 	ctx.meter = meter
 
@@ -45,14 +47,43 @@ func (c *Compiled) Run(meter *cu.ComputeMeter, mem *Memory) (ret uint64, cuConsu
 	ctx.CallDepth = 1 // entry frame
 
 	initial := meter.Remaining()
-	if meter.Disabled() {
-		ctx.CuLeft = math.MaxUint64
-	} else {
-		ctx.CuLeft = initial
+	refreshBudget := func() {
+		if meter.Disabled() {
+			ctx.CuLeft = math.MaxUint64
+		} else {
+			ctx.CuLeft = meter.Remaining()
+		}
 	}
+	refreshBudget()
 	ctx.Resume = c.mem.addr(c.entryOff)
 
-	enter(ctx)
+	for {
+		enter(ctx)
+		if ctx.ExitReason != exitSyscall {
+			break
+		}
+		// Settle the block's compute charge before the syscall consumes
+		// its own, mirroring the interpreter.
+		meter.Consume(ctx.CuDue)
+		ctx.CuDue = 0
+		sc, ok := registry(uint32(ctx.SyscallHash))
+		if !ok {
+			return 0, 0, &sbpf.Exception{
+				PC:     int64(ctx.ExitPC),
+				Detail: fmt.Errorf("%w:", sbpf.ExcCallDest{Imm: uint32(ctx.SyscallHash)}),
+			}
+		}
+		r0, serr := sc.Invoke(vm, ctx.Regs[1], ctx.Regs[2], ctx.Regs[3], ctx.Regs[4], ctx.Regs[5])
+		if serr != nil {
+			return 0, 0, &sbpf.Exception{
+				PC:     int64(ctx.ExitPC),
+				Detail: fmt.Errorf("%w:", sbpf.ExcSyscallError{Err: serr}),
+			}
+		}
+		ctx.Regs[0] = r0
+		refreshBudget()
+		ctx.Resume = c.mem.addr(int32(ctx.ResumeOff))
+	}
 
 	switch ctx.ExitReason {
 	case exitExited:

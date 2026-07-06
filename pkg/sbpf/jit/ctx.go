@@ -21,6 +21,7 @@ const (
 	exitOverrun   = 3 // execution ran off the end of text
 	exitBadAccess = 4 // out-of-bounds or wrong-permission memory access
 	exitCallDepth = 5 // SBF call stack exceeded 64 frames
+	exitSyscall   = 6 // yield to Go to run a syscall, then resume
 )
 
 // ExecContext is the shared state between Go and compiled code. Field
@@ -60,6 +61,12 @@ type ExecContext struct {
 	// at 1 (the entry frame) and a call is refused once it reaches 64.
 	CallDepth uint64 // 0x100
 
+	// SyscallHash and ResumeOff are written at a syscall exit: the hash
+	// selects the syscall, ResumeOff is the native code offset to resume
+	// at once Go has run it.
+	SyscallHash uint64 // 0x108
+	ResumeOff   uint64 // 0x110
+
 	// Go-side only (offsets below are never touched by native code).
 	nativeStack []byte
 	meter       *cu.ComputeMeter
@@ -84,6 +91,8 @@ const (
 	offInputBase      = 0xf0
 	offInputLen       = 0xf8
 	offCallDepth      = 0x100
+	offSyscallHash    = 0x108
+	offResumeOff      = 0x110
 	offNativeStackTop = 0x90
 )
 
