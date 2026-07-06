@@ -41,6 +41,10 @@ func (cm *ComputeMeter) Remaining() uint64 {
 	return cm.computeMeter
 }
 
+func (cm *ComputeMeter) Disabled() bool {
+	return cm.disable
+}
+
 func (cm *ComputeMeter) Disable() {
 	cm.disable = true
 }

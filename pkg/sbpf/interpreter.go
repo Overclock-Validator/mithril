@@ -216,16 +216,34 @@ func (ip *Interpreter) Run() (ret uint64, cuConsumed uint64, err error) {
 	// initialize pc to program entry point
 	pc := int64(ip.entry)
 
+	// CU accounting runs on a local countdown and is settled into the
+	// shared meter at sync points (syscalls, errors, exit) so the hot
+	// loop avoids a meter call per instruction. cuDue counts executed
+	// instructions since the last sync; the invariant cuDue <= cuLeft
+	// means settling can never fail.
+	text := ip.text
+	meter := ip.computeMeter
+	enableJmp32 := ip.sbpfVersion.EnableJmp32()
+	remainingCU := func() uint64 {
+		if meter.Disabled() {
+			return math.MaxUint64
+		}
+		return meter.Remaining()
+	}
+	cuLeft := remainingCU()
+	var cuDue uint64
+
 mainLoop:
 	for i := 0; true; i++ {
 		// Fetch
-		if pc < 0 || pc >= int64(len(ip.text)) {
+		if pc < 0 || pc >= int64(len(text)) {
+			meter.Consume(cuDue)
 			return 0, 0, &Exception{
 				PC:     pc,
 				Detail: fmt.Errorf("tx: %s, programId: %s - %w:", ip.txSignature, ip.programId, ExcExecutionOverrun),
 			}
 		}
-		ins := ip.getSlot(pc)
+		ins := text[pc]
 		if ip.enableTracing {
 			regsDump := fmt.Sprintf("%016x, %016x, %016x, %016x, %016x, %016x, %016x, %016x, %016x, %016x, %016x",
 				r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10])
@@ -233,13 +251,17 @@ mainLoop:
 				i, strings.ToUpper(regsDump), ip.disassemble(ins, 0))
 		}
 
-		err = ip.computeMeter.Consume(1)
-		if err != nil {
+		cuDue++
+		if cuDue > cuLeft {
+			// This instruction exceeds the budget: bill everything, which
+			// zeroes the meter and yields ErrComputeExceeded.
+			err = meter.Consume(cuDue)
+			cuDue = 0
 			break mainLoop
 		}
 
 		// Execute
-		if ip.sbpfVersion.EnableJmp32() && ins.Op()&0x07 == ClassPqr {
+		if enableJmp32 && ins.Op()&0x07 == ClassPqr {
 			pc, err = ip.executeJmp32(ins, pc, &r)
 			goto postExecute
 		}
@@ -908,7 +930,7 @@ mainLoop:
 				err = ExcInvalidInstr
 				break
 			}
-			r[ins.Dst()] = uint64(ins.Uimm()) | (uint64(ip.getSlot(pc+1).Uimm()) << 32)
+			r[ins.Dst()] = uint64(ins.Uimm()) | (uint64(text[pc+1].Uimm()) << 32)
 			pc += 2
 		case OpJa:
 			pc += int64(ins.Off())
@@ -1031,7 +1053,12 @@ mainLoop:
 						err = ExcCallDest{ins.Uimm()}
 						break
 					}
+					// Syscalls consume from the shared meter: settle first,
+					// re-read after.
+					meter.Consume(cuDue)
+					cuDue = 0
 					r[0], err = sc.Invoke(ip, r[1], r[2], r[3], r[4], r[5])
+					cuLeft = remainingCU()
 					if err != nil {
 						err = ExcSyscallError{Err: err}
 					}
@@ -1051,7 +1078,10 @@ mainLoop:
 				}
 			} else {
 				if sc, ok := ip.syscalls(ins.Uimm()); ok {
+					meter.Consume(cuDue)
+					cuDue = 0
 					r[0], err = sc.Invoke(ip, r[1], r[2], r[3], r[4], r[5])
+					cuLeft = remainingCU()
 					if err != nil {
 						err = ExcSyscallError{Err: err}
 					}
@@ -1095,6 +1125,7 @@ mainLoop:
 			}
 		default:
 			err = ExcUnsupportedInstruction
+			meter.Consume(cuDue)
 			return
 		}
 
@@ -1105,6 +1136,7 @@ mainLoop:
 		}
 
 		if err != nil {
+			meter.Consume(cuDue)
 			exc := &Exception{
 				PC:     pc,
 				Detail: fmt.Errorf("tx: %s, programId: %s - %w:", ip.txSignature, ip.programId, err),
@@ -1117,6 +1149,7 @@ mainLoop:
 		}
 	}
 
+	meter.Consume(cuDue)
 	cuConsumed = ip.initialInstrMeter - ip.computeMeter.Remaining()
 
 	return
