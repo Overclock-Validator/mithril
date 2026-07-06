@@ -1184,6 +1184,12 @@ func (ip *Interpreter) VMContext() any {
 	return ip.vmContext
 }
 
+// StackMem and HeapMem expose the flat backing buffers so a native
+// executor can share this interpreter's address space; syscalls it
+// forwards here then see the same memory.
+func (ip *Interpreter) StackMem() []byte { return ip.stack.mem }
+func (ip *Interpreter) HeapMem() []byte  { return ip.heap }
+
 func (ip *Interpreter) HeapMax() uint64 {
 	return uint64(len(ip.heap))
 }

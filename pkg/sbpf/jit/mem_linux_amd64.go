@@ -2,6 +2,7 @@ package jit
 
 import (
 	"fmt"
+	"runtime"
 
 	"golang.org/x/sys/unix"
 )
@@ -24,7 +25,11 @@ func newExecMem(code []byte) (*execMem, error) {
 		unix.Munmap(mem)
 		return nil, fmt.Errorf("jit: mprotect: %w", err)
 	}
-	return &execMem{code: mem}, nil
+	m := &execMem{code: mem}
+	// Compiled programs cached on evictable entries are dropped by the
+	// GC; unmap the code with them.
+	runtime.SetFinalizer(m, (*execMem).free)
+	return m, nil
 }
 
 func (m *execMem) addr(off int32) uint64 {

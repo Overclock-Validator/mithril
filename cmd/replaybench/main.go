@@ -12,6 +12,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/replay"
 	"github.com/Overclock-Validator/mithril/pkg/sbpf"
+	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 )
 
 func usage() {
@@ -60,6 +61,8 @@ func runRun(args []string) {
 	db := fs.String("db", "", "scratch accountsdb directory (wiped each run)")
 	parallelism := fs.Int("tx-parallelism", 0, "parallel tx workers (0 = sequential)")
 	programStats := fs.Bool("program-stats", false, "report per-program interpreter time (sequential runs only)")
+	useJit := fs.Bool("jit", false, "compile hot SBF programs to native code")
+	jitThreshold := fs.Uint64("jit-threshold", 2, "execution count at which a program is compiled")
 	cpuProfile := fs.String("cpuprofile", "", "write a CPU profile of the replay loop to this file")
 	memProfile := fs.String("memprofile", "", "write a heap profile after the replay loop to this file")
 	fs.Parse(args)
@@ -76,6 +79,11 @@ func runRun(args []string) {
 			os.Exit(2)
 		}
 		sbpf.Stats = sbpf.NewStatsCollector()
+	}
+
+	if *useJit {
+		sealevel.EnableJIT = true
+		sealevel.JITThreshold = *jitThreshold
 	}
 
 	if *cpuProfile != "" {
@@ -125,6 +133,10 @@ func runRun(args []string) {
 	fmt.Printf("txs/sec:         %.0f\n", float64(result.TotalTxs)/result.TotalExec.Seconds())
 	fmt.Printf("blocks/sec:      %.2f\n", float64(len(result.Blocks))/result.TotalExec.Seconds())
 	fmt.Printf("final bankhash:  %s\n", result.FinalBankhash)
+	if *useJit {
+		fmt.Printf("jit:             %d programs compiled, %d native execs, %d interpreted\n",
+			sealevel.JITCompiled.Load(), sealevel.JITExecs.Load(), sealevel.JITInterpExecs.Load())
+	}
 
 	if sbpf.Stats != nil {
 		stats := sbpf.Stats.Results()

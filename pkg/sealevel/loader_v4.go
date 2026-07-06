@@ -316,7 +316,7 @@ func LoaderV4Execute(execCtx *ExecutionCtx) error {
 		// two cases here: we're either executing from the program cache, so from a pre-parsed/loaded program, or from bytes if
 		// the the program was not found in the cache.
 		if hasLoadedProgram {
-			err = executeLoadedProgram(execCtx, loadedProgram, syscallRegistry)
+			err = executeLoadedProgram(execCtx, loadedProgram, syscallRegistry, programCacheEntry)
 		} else {
 			err = executeProgramFromBytes(execCtx, program.Key(), programBytes, syscallRegistry)
 		}

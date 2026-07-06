@@ -35,17 +35,19 @@ func (c *Compiled) Free() {
 	}
 }
 
-// compiler carries per-compilation state.
+// compiler carries per-compilation state. The per-pc tables are slices,
+// not maps: compilation runs on the execution path and large programs
+// have hundreds of thousands of instructions.
 type compiler struct {
 	asm       asm
 	text      []sbpf.Slot
 	textVA    uint64
 	insnOff   []int32 // sbf pc -> native offset; -1 for lddw's second slot
-	stubFix   map[int][]int32
+	stubFix   [numStubs][]int32
 	jumpFix   []jumpFixup
-	blockLen  map[int]uint32 // leader pc -> instruction count
-	leaders   map[int]bool
-	lddwSlot2 map[int]bool
+	blockLen  []uint32 // leader pc -> instruction count
+	leaders   []bool
+	lddwSlot2 []bool
 	stackGaps bool             // frame gaps on: stack remap + 2-page frames
 	funcs     map[uint32]int64 // program function table (PCHash -> pc)
 	isSyscall func(uint32) bool
@@ -66,6 +68,7 @@ const (
 	stubCallDepth
 	stubReturn
 	stubBadCallx
+	numStubs
 )
 
 // Compile lowers a verified SBPF v0 program to amd64 code. Programs
@@ -88,14 +91,14 @@ func Compile(prog *sbpf.Program, stackGaps bool, isSyscall func(uint32) bool) (*
 		text:      text,
 		textVA:    prog.TextVA,
 		insnOff:   make([]int32, len(text)),
-		stubFix:   map[int][]int32{},
-		blockLen:  map[int]uint32{},
-		leaders:   map[int]bool{},
-		lddwSlot2: map[int]bool{},
+		blockLen:  make([]uint32, len(text)),
+		leaders:   make([]bool, len(text)),
+		lddwSlot2: make([]bool, len(text)),
 		stackGaps: stackGaps,
 		funcs:     prog.Funcs,
 		isSyscall: isSyscall,
 	}
+	c.asm.buf = make([]byte, 0, 24*len(text)+512)
 
 	if err := c.analyze(int(entry)); err != nil {
 		return nil, err

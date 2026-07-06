@@ -17,6 +17,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/safemath"
 	"github.com/Overclock-Validator/mithril/pkg/sbpf"
+	"github.com/Overclock-Validator/mithril/pkg/sbpf/jit"
 	"github.com/Overclock-Validator/mithril/pkg/sbpf/loader"
 	"github.com/Overclock-Validator/mithril/pkg/util"
 	bin "github.com/gagliardetto/binary"
@@ -1235,7 +1236,7 @@ func deserializeParametersUnaligned(execCtx *ExecutionCtx, parameterBytes []byte
 	return nil
 }
 
-func executeLoadedProgram(execCtx *ExecutionCtx, program *sbpf.Program, syscallRegistry sbpf.SyscallRegistry) error {
+func executeLoadedProgram(execCtx *ExecutionCtx, program *sbpf.Program, syscallRegistry sbpf.SyscallRegistry, cacheEntry *accountsdb.ProgramCacheEntry) error {
 	txCtx := execCtx.TransactionContext
 	instrCtx, err := txCtx.CurrentInstructionCtx()
 	if err != nil {
@@ -1305,7 +1306,25 @@ func executeLoadedProgram(execCtx *ExecutionCtx, program *sbpf.Program, syscallR
 	defer interpreter.Finish()
 	metrics.GlobalBlockReplay.SbpfInterpreterNew.AddTimingSince(start)
 	start = time.Now()
-	ret, _, runErr := interpreter.Run()
+	var ret uint64
+	var runErr error
+	if compiled := maybeJITProgram(cacheEntry, program, syscallRegistry, opts); compiled != nil {
+		// Compiled code shares the interpreter's buffers, so syscalls
+		// dispatched to it (including CPI) see the same address space.
+		JITExecs.Add(1)
+		ret, _, runErr = compiled.Run(&execCtx.ComputeMeter, &jit.Memory{
+			Ro:             program.RO,
+			Stack:          interpreter.StackMem(),
+			Heap:           interpreter.HeapMem(),
+			Input:          parameterBytes,
+			InputDataVaddr: inputDataVaddr,
+		}, syscallRegistry, interpreter)
+	} else {
+		if EnableJIT {
+			JITInterpExecs.Add(1)
+		}
+		ret, _, runErr = interpreter.Run()
+	}
 	metrics.GlobalBlockReplay.SbpfInterpreterRun.AddTimingSince(start)
 
 	if execCtx.Features.IsActive(features.VirtualAddressSpaceAdjustments) {
@@ -1358,7 +1377,7 @@ func executeProgramFromBytes(execCtx *ExecutionCtx, programAddr solana.PublicKey
 
 	metrics.GlobalBlockReplay.AddProgramToCache.AddTimingSince(start)
 
-	return executeLoadedProgram(execCtx, program, syscallRegistry)
+	return executeLoadedProgram(execCtx, program, syscallRegistry, entry)
 }
 
 func addProgramToCache(execCtx *ExecutionCtx, programAddr solana.PublicKey, entry *accountsdb.ProgramCacheEntry) {
@@ -1489,6 +1508,7 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 	var loadedProgram *sbpf.Program
 	var hasLoadedProgram bool
 	var programAcctKey solana.PublicKey
+	var loadedProgramEntry *accountsdb.ProgramCacheEntry
 
 	programOwner := programAcct.Owner()
 
@@ -1498,6 +1518,7 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 		if hasLoadedProgram {
 			programAcctKey = programAcct.Key()
 			loadedProgram = programCacheEntry.Program
+			loadedProgramEntry = programCacheEntry
 		} else { // program is not cached
 			if len(programAcct.Data()) == 0 {
 				var paTmp *accounts.Account
@@ -1551,6 +1572,7 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 			}
 			programAcctKey = programAcctState.Program.ProgramDataAddress
 			loadedProgram = programCacheEntry.Program
+			loadedProgramEntry = programCacheEntry
 			metrics.GlobalBlockReplay.GetProgramDataCached.AddTimingSince(start)
 		} else { // program is not cached
 			programDataAcct, err := execCtx.SlotCtx.GetAccount(programAcctState.Program.ProgramDataAddress)
@@ -1599,7 +1621,7 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 	// two cases here: we're either executing from the program cache, so from a pre-parsed/loaded program, or from bytes if
 	// the the program was not found in the cache.
 	if hasLoadedProgram {
-		err = executeLoadedProgram(execCtx, loadedProgram, syscallRegistry)
+		err = executeLoadedProgram(execCtx, loadedProgram, syscallRegistry, loadedProgramEntry)
 	} else {
 		err = executeProgramFromBytes(execCtx, programAcctKey, programBytes, syscallRegistry)
 	}

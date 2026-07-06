@@ -11,12 +11,14 @@ import (
 
 // Memory supplies the host buffers backing a program's virtual address
 // regions. Stack must be sbpf.StackMax bytes. A nil region faults on
-// access.
+// access. InputDataVaddr, when set, seeds r2 with the instruction-data
+// address (SIMD-0321), matching the interpreter.
 type Memory struct {
-	Ro    []byte
-	Stack []byte
-	Heap  []byte
-	Input []byte
+	Ro             []byte
+	Stack          []byte
+	Heap           []byte
+	Input          []byte
+	InputDataVaddr uint64
 }
 
 func regionAddr(ctx *ExecContext, b []byte) uint64 {
@@ -43,6 +45,7 @@ func (c *Compiled) Run(meter *cu.ComputeMeter, mem *Memory, registry sbpf.Syscal
 
 	// Register setup matches the interpreter for a v0 program.
 	ctx.Regs[1] = sbpf.VaddrInput
+	ctx.Regs[2] = mem.InputDataVaddr
 	ctx.Regs[10] = sbpf.VaddrStack + sbpf.StackFrameSize
 	ctx.CallDepth = 1 // entry frame
 

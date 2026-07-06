@@ -13,11 +13,13 @@ import (
 	"path/filepath"
 	"runtime/trace"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/sbpf"
+	"github.com/Overclock-Validator/mithril/pkg/sbpf/jit"
 	"github.com/cockroachdb/pebble"
 	"github.com/gagliardetto/solana-go"
 	"github.com/maypok86/otter"
@@ -205,6 +207,14 @@ func (accountsDb *AccountsDb) InitCaches() {
 type ProgramCacheEntry struct {
 	Program        *sbpf.Program
 	DeploymentSlot uint64
+
+	// JIT tier state, managed by pkg/sealevel: executions to date, the
+	// compiled code once the program crosses the threshold, and a sticky
+	// refusal for programs the compiler does not support. Evicting the
+	// entry drops the compiled code with it.
+	JitExecs  atomic.Uint64
+	Jit       atomic.Pointer[jit.Compiled]
+	JitFailed atomic.Bool
 }
 
 func programCacheCapacityUnits() int {
