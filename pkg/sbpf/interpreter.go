@@ -240,8 +240,14 @@ func (ip *Interpreter) Run() (ret uint64, cuConsumed uint64, err error) {
 	cuLeft := remainingCU()
 	var cuDue uint64
 
+	var insnCount int64
+	if Stats != nil {
+		Stats.enter()
+		defer func() { Stats.exit(ip.programId, uint64(insnCount)) }()
+	}
+
 mainLoop:
-	for i := 0; true; i++ {
+	for ; true; insnCount++ {
 		// Fetch
 		if pc < 0 || pc >= int64(len(text)) {
 			meter.Consume(cuDue)
@@ -255,7 +261,7 @@ mainLoop:
 			regsDump := fmt.Sprintf("%016x, %016x, %016x, %016x, %016x, %016x, %016x, %016x, %016x, %016x, %016x",
 				r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10])
 			fmt.Printf("% 5d [%s]: %s\n",
-				i, strings.ToUpper(regsDump), ip.disassemble(ins, 0))
+				insnCount, strings.ToUpper(regsDump), ip.disassemble(ins, 0))
 		}
 
 		cuDue++

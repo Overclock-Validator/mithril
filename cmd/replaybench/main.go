@@ -8,7 +8,10 @@ import (
 	"runtime/pprof"
 	"strings"
 
+	"time"
+
 	"github.com/Overclock-Validator/mithril/pkg/replay"
+	"github.com/Overclock-Validator/mithril/pkg/sbpf"
 )
 
 func usage() {
@@ -56,6 +59,7 @@ func runRun(args []string) {
 	bundle := fs.String("bundle", "", "bundle directory")
 	db := fs.String("db", "", "scratch accountsdb directory (wiped each run)")
 	parallelism := fs.Int("tx-parallelism", 0, "parallel tx workers (0 = sequential)")
+	programStats := fs.Bool("program-stats", false, "report per-program interpreter time (sequential runs only)")
 	cpuProfile := fs.String("cpuprofile", "", "write a CPU profile of the replay loop to this file")
 	memProfile := fs.String("memprofile", "", "write a heap profile after the replay loop to this file")
 	fs.Parse(args)
@@ -64,6 +68,14 @@ func runRun(args []string) {
 		fmt.Fprintln(os.Stderr, "run: -bundle and -db are required")
 		fs.Usage()
 		os.Exit(2)
+	}
+
+	if *programStats {
+		if *parallelism > 0 {
+			fmt.Fprintln(os.Stderr, "run: -program-stats requires sequential execution (-tx-parallelism 0)")
+			os.Exit(2)
+		}
+		sbpf.Stats = sbpf.NewStatsCollector()
 	}
 
 	if *cpuProfile != "" {
@@ -113,6 +125,35 @@ func runRun(args []string) {
 	fmt.Printf("txs/sec:         %.0f\n", float64(result.TotalTxs)/result.TotalExec.Seconds())
 	fmt.Printf("blocks/sec:      %.2f\n", float64(len(result.Blocks))/result.TotalExec.Seconds())
 	fmt.Printf("final bankhash:  %s\n", result.FinalBankhash)
+
+	if sbpf.Stats != nil {
+		stats := sbpf.Stats.Results()
+		var totalSelf time.Duration
+		var totalInsns uint64
+		for _, st := range stats {
+			totalSelf += st.SelfTime
+			totalInsns += st.Insns
+		}
+		fmt.Println()
+		fmt.Printf("=== per-program interpreter time (%d programs, VM self-time %.3fs, %d insns) ===\n",
+			len(stats), totalSelf.Seconds(), totalInsns)
+		fmt.Printf("%4s %6s %6s %9s %12s %14s  %s\n", "rank", "cum%", "self%", "execs", "insns(M)", "self", "program")
+		var cum time.Duration
+		for i, st := range stats {
+			if i >= 40 {
+				break
+			}
+			cum += st.SelfTime
+			fmt.Printf("%4d %5.1f%% %5.1f%% %9d %12.1f %14s  %s\n",
+				i+1,
+				100*float64(cum)/float64(totalSelf),
+				100*float64(st.SelfTime)/float64(totalSelf),
+				st.Executions,
+				float64(st.Insns)/1e6,
+				st.SelfTime.Round(time.Millisecond),
+				st.ProgramId)
+		}
+	}
 }
 
 func main() {
