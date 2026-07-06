@@ -395,7 +395,6 @@ func LoadAndExecuteTransaction(input LoadAndExecuteTransactionInput) LoadAndExec
 
 	// Build loaded transaction
 	loadedTransaction := LoadedTransaction{
-		Accounts:               convertToKeyedAccountSharedData(transactionAccts.Accounts),
 		ProgramIndices:         []uint16{},
 		FeeDetails:             *txFeeInfo,
 		ComputeBudget:          computeBudget,
@@ -518,27 +517,3 @@ func collectAccountUpdates(execCtx *sealevel.ExecutionCtx) []AccountUpdate {
 	return updates
 }
 
-// convertToKeyedAccountSharedData converts accounts to KeyedAccountSharedData
-func convertToKeyedAccountSharedData(accts []*accounts.Account) []KeyedAccountSharedData {
-	result := make([]KeyedAccountSharedData, len(accts))
-	for i, acct := range accts {
-		result[i] = KeyedAccountSharedData{
-			Pubkey:      acct.Key,
-			AccountData: accountToSharedData(acct),
-		}
-	}
-	return result
-}
-
-// accountToSharedData converts an Account to AccountSharedData
-func accountToSharedData(acct *accounts.Account) AccountSharedData {
-	data := make([]byte, len(acct.Data))
-	copy(data, acct.Data)
-	return AccountSharedData{
-		Lamports:   acct.Lamports,
-		Data:       data,
-		Owner:      acct.Owner,
-		Executable: acct.Executable,
-		RentEpoch:  acct.RentEpoch,
-	}
-}

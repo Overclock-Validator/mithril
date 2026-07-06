@@ -264,8 +264,6 @@ type FeesOnlyTransaction struct {
 
 // LoadedTransaction contains all the accounts and metadata loaded for a transaction
 type LoadedTransaction struct {
-	// Accounts contains all the accounts loaded for this transaction with their public keys
-	Accounts []KeyedAccountSharedData
 	// ProgramIndices contains the indices of program accounts in the Accounts array
 	ProgramIndices []uint16
 	// FeeDetails contains the fee calculation for this transaction
