@@ -707,6 +707,129 @@ func TestJITCallDepthOverflow(t *testing.T) {
 	}, 1000000)
 }
 
+// callxTo builds `r9 = textVA + 8*pc + skew; callx r9` as two slots.
+func callxTo(pc int, skew uint32) []sbpf.Slot {
+	target := uint64(sbpf.VaddrProgram) + 8*uint64(pc) + uint64(skew)
+	return []sbpf.Slot{
+		ins(sbpf.OpLddw, 9, 0, 0, uint32(target)),
+		sbpf.Slot(target >> 32 << 32),
+		ins(sbpf.OpCallx, 0, 0, 0, 9), // v0: imm names the register
+	}
+}
+
+func TestJITCallxBasic(t *testing.T) {
+	// main: r0 = f() via callx; exit. f at pc 5.
+	text := append(callxTo(5, 0),
+		ins(sbpf.OpAdd64Imm, 0, 0, 0, 1), // 3: r0 = 43
+		ins(sbpf.OpExit, 0, 0, 0, 0),     // 4
+		ins(sbpf.OpMov64Imm, 0, 0, 0, 42), // 5: f
+		ins(sbpf.OpExit, 0, 0, 0, 0),      // 6
+	)
+	diff(t, text, 100)
+	diffGaps(t, text, 100)
+}
+
+func TestJITCallxUnaligned(t *testing.T) {
+	// An unaligned target rounds down to the containing instruction.
+	for _, skew := range []uint32{1, 3, 7} {
+		text := append(callxTo(5, skew),
+			ins(sbpf.OpAdd64Imm, 0, 0, 0, 1),
+			ins(sbpf.OpExit, 0, 0, 0, 0),
+			ins(sbpf.OpMov64Imm, 0, 0, 0, 42), // 5: f
+			ins(sbpf.OpExit, 0, 0, 0, 0),
+		)
+		diff(t, text, 100)
+	}
+}
+
+func TestJITCallxMidBlock(t *testing.T) {
+	// Landing mid-block must charge exactly the remaining instructions
+	// of the entered block; probe budgets around the boundary.
+	text := append(callxTo(5, 0),
+		ins(sbpf.OpMov64Reg, 0, 6, 0, 0), // 3: r0 = r6
+		ins(sbpf.OpExit, 0, 0, 0, 0),     // 4
+		ins(sbpf.OpMov64Imm, 6, 0, 0, 1), // 5: block start (skipped)
+		ins(sbpf.OpAdd64Imm, 6, 0, 0, 2), // 6: callx lands here
+		ins(sbpf.OpAdd64Imm, 6, 0, 0, 3), // 7
+		ins(sbpf.OpExit, 0, 0, 0, 0),     // 8
+	)
+	entered := append(callxTo(6, 0), text[3:]...)
+	for budget := uint64(1); budget < 12; budget++ {
+		diff(t, text, budget)
+		diff(t, entered, budget)
+	}
+}
+
+func TestJITCallxOutOfBounds(t *testing.T) {
+	// Below text, past the end, and far out: all must be bad accesses.
+	for _, target := range []uint64{
+		0, uint64(sbpf.VaddrProgram) - 8, uint64(sbpf.VaddrProgram) + 8*100,
+		uint64(sbpf.VaddrStack), uint64(sbpf.VaddrStack) + 1, ^uint64(0),
+	} {
+		text := []sbpf.Slot{
+			ins(sbpf.OpLddw, 9, 0, 0, uint32(target)),
+			sbpf.Slot(target >> 32 << 32),
+			ins(sbpf.OpCallx, 0, 0, 0, 9),
+			ins(sbpf.OpExit, 0, 0, 0, 0),
+		}
+		diff(t, text, 100)
+	}
+}
+
+func TestJITCallxDepthOverflow(t *testing.T) {
+	// callx recursing into itself must hit the depth limit exactly.
+	text := append(callxTo(0, 0),
+		ins(sbpf.OpExit, 0, 0, 0, 0),
+	)
+	diff(t, text, 1000000)
+	diffGaps(t, text, 1000000)
+}
+
+func TestJITCallxIntoLddwImmediate(t *testing.T) {
+	// pc 1 is lddw's second slot: the interpreter decodes the raw
+	// immediate; the JIT deliberately refuses. Only the JIT side is
+	// asserted — this is a documented divergence.
+	text := append(callxTo(1, 0),
+		ins(sbpf.OpExit, 0, 0, 0, 0),
+	)
+	_, _, err := runJIT(t, text, 100, nil)
+	require.ErrorIs(t, err, sbpf.ExcUnsupportedInstruction)
+}
+
+func TestJITCallxPreservesRegs(t *testing.T) {
+	// Callee-saved registers must survive a callx like a static call.
+	text := []sbpf.Slot{
+		ins(sbpf.OpMov64Imm, 6, 0, 0, 7),  // 0
+		ins(sbpf.OpMov64Imm, 7, 0, 0, 11), // 1
+		ins(sbpf.OpLddw, 9, 0, 0, uint32((uint64(sbpf.VaddrProgram)+8*8)&0xFFFFFFFF)), // 2
+		sbpf.Slot((uint64(sbpf.VaddrProgram) + 8*8) >> 32 << 32),                     // 3
+		ins(sbpf.OpCallx, 0, 0, 0, 9),                                                // 4
+		ins(sbpf.OpAdd64Reg, 0, 6, 0, 0),                                 // 5: r0 += 7
+		ins(sbpf.OpAdd64Reg, 0, 7, 0, 0),                                 // 6: r0 += 11
+		ins(sbpf.OpExit, 0, 0, 0, 0),                                     // 7
+		ins(sbpf.OpMov64Imm, 6, 0, 0, 100), // 8: f clobbers r6/r7
+		ins(sbpf.OpMov64Imm, 7, 0, 0, 200), // 9
+		ins(sbpf.OpMov64Imm, 0, 0, 0, 1),   // 10
+		ins(sbpf.OpExit, 0, 0, 0, 0),       // 11
+	}
+	diff(t, text, 100)
+}
+
+func TestJITCallxSyscallInCallee(t *testing.T) {
+	// A syscall inside a callx-reached function: exercises the resume
+	// path with a dynamic call frame live.
+	h := sbpf.SymbolHash("sum5")
+	setSyscall(t, h, cuSyscall(2))
+	text := append(callxTo(5, 0),
+		ins(sbpf.OpAdd64Imm, 0, 0, 0, 1), // 3
+		ins(sbpf.OpExit, 0, 0, 0, 0),     // 4
+		ins(sbpf.OpMov64Imm, 1, 0, 0, 9), // 5: f
+		ins(sbpf.OpCall, 0, 0, 0, h),     // 6: r0 = 9
+		ins(sbpf.OpExit, 0, 0, 0, 0),     // 7
+	)
+	diff(t, text, 1000)
+}
+
 // cuSyscall is a syscall that consumes `cost` compute units and returns
 // the sum of its five arguments. It ignores the VM.
 func cuSyscall(cost uint64) sbpf.Syscall {

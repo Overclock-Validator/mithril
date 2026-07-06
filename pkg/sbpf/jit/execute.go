@@ -57,6 +57,10 @@ func (c *Compiled) Run(meter *cu.ComputeMeter, mem *Memory, registry sbpf.Syscal
 	refreshBudget()
 	ctx.Resume = c.mem.addr(c.entryOff)
 	ctx.EnterSP = ctx.NativeStackTop // syscall yields overwrite with their RSP
+	ctx.CodeBase = c.mem.addr(0)
+	if c.callx != nil {
+		ctx.CallxTable = uint64(uintptr(unsafe.Pointer(&c.callx[0])))
+	}
 
 	for {
 		enter(ctx)
@@ -118,6 +122,15 @@ func (c *Compiled) Run(meter *cu.ComputeMeter, mem *Memory, registry sbpf.Syscal
 		return 0, 0, &sbpf.Exception{
 			PC:     int64(ctx.ExitPC),
 			Detail: fmt.Errorf("%w:", sbpf.ExcCallDepth),
+		}
+	case exitBadCallx:
+		// The interpreter would decode the lddw immediate as an
+		// instruction; there is no compiled code to match that, so this
+		// is a deliberate (detectable) divergence.
+		meter.Consume(ctx.CuDue - uint64(c.refundAfter[ctx.ExitPC]))
+		return 0, 0, &sbpf.Exception{
+			PC:     int64(ctx.ExitPC),
+			Detail: fmt.Errorf("%w: callx into an lddw immediate", sbpf.ExcUnsupportedInstruction),
 		}
 	default:
 		panic(fmt.Sprintf("jit: unknown exit reason %d", ctx.ExitReason))

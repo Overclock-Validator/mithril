@@ -22,6 +22,11 @@ type Compiled struct {
 	// fault at pc refunds this many instructions.
 	refundAfter []uint32
 	textLen     int
+	// callx is the runtime dispatch table for OpCallx, or nil if the
+	// program has none: per pc, the native code offset in the low 32
+	// bits (0xFFFFFFFF for an lddw immediate slot) and the compute
+	// charge for entering pc's block mid-way in the high 32.
+	callx []uint64
 }
 
 func (c *Compiled) Free() {
@@ -41,9 +46,10 @@ type compiler struct {
 	blockLen  map[int]uint32 // leader pc -> instruction count
 	leaders   map[int]bool
 	lddwSlot2 map[int]bool
-	stackGaps bool             // when set, memory/call ops are unsupported
+	stackGaps bool             // frame gaps on: stack remap + 2-page frames
 	funcs     map[uint32]int64 // program function table (PCHash -> pc)
 	isSyscall func(uint32) bool
+	hasCallx  bool
 }
 
 type jumpFixup struct {
@@ -59,6 +65,7 @@ const (
 	stubBadAccess
 	stubCallDepth
 	stubReturn
+	stubBadCallx
 )
 
 // Compile lowers a verified SBPF v0 program to amd64 code. Programs
@@ -103,11 +110,31 @@ func Compile(prog *sbpf.Program, stackGaps bool, isSyscall func(uint32) bool) (*
 	if err != nil {
 		return nil, err
 	}
+	var callx []uint64
+	if c.hasCallx {
+		// A callx target may be any pc, including one mid-block: entering
+		// there must charge the block's remaining instructions, which is
+		// refundAfter[pc]+1; a leader charges itself through its block
+		// prologue instead.
+		callx = make([]uint64, len(text))
+		for pc := range text {
+			if c.insnOff[pc] < 0 {
+				callx[pc] = 0xFFFFFFFF
+				continue
+			}
+			var pre uint64
+			if !c.leaders[pc] {
+				pre = uint64(refund[pc]) + 1
+			}
+			callx[pc] = uint64(uint32(c.insnOff[pc])) | pre<<32
+		}
+	}
 	return &Compiled{
 		mem:         mem,
 		entryOff:    c.insnOff[entry],
 		refundAfter: refund,
 		textLen:     len(text),
+		callx:       callx,
 	}, nil
 }
 
@@ -171,8 +198,23 @@ func (c *compiler) analyze(entry int) error {
 				c.leaders[pc+1] = true // return lands here, new block
 			}
 		}
+		if ins.Op() == sbpf.OpCallx {
+			c.hasCallx = true
+			if pc+1 < len(c.text) {
+				c.leaders[pc+1] = true // return lands here, new block
+			}
+		}
 	}
 	return nil
+}
+
+// callxReg is the register holding a v0 callx target: the immediate is
+// a register index.
+func callxReg(ins sbpf.Slot) (uint8, bool) {
+	if ins.Uimm() > 10 {
+		return 0, false
+	}
+	return uint8(ins.Uimm()), true
 }
 
 // callTarget resolves a v0 OpCall to a local function pc. Returns false
@@ -270,6 +312,15 @@ func (c *compiler) supported(ins sbpf.Slot) bool {
 		_, ok := c.callTarget(ins)
 		return ok
 	}
+	if op == sbpf.OpCallx {
+		// The pc bound check below subsumes the interpreter's separate
+		// target < VaddrStack check only while text ends below the stack.
+		if c.textVA+8*uint64(len(c.text)) > sbpf.VaddrStack {
+			return false
+		}
+		_, ok := callxReg(ins)
+		return ok
+	}
 	switch op {
 	case sbpf.OpAdd32Imm, sbpf.OpAdd32Reg, sbpf.OpAdd64Imm, sbpf.OpAdd64Reg,
 		sbpf.OpSub32Imm, sbpf.OpSub32Reg, sbpf.OpSub64Imm, sbpf.OpSub64Reg,
@@ -357,6 +408,7 @@ func (c *compiler) emit() error {
 	}{
 		{stubOOCU, exitOOCU}, {stubDiv0, exitDivZero}, {stubOverrun, exitOverrun},
 		{stubBadAccess, exitBadAccess}, {stubCallDepth, exitCallDepth},
+		{stubBadCallx, exitBadCallx},
 	} {
 		stubOff[s.id] = a.here()
 		a.storeCtx(offExitPC, rax)
@@ -604,6 +656,62 @@ func (c *compiler) emitIns(pc int) error {
 		c.jumpFix = append(c.jumpFix, jumpFixup{a.call(), target})
 		// Return lands here: restore and unwind.
 		a.pop(fp)
+		a.pop(sbfToX86[9])
+		a.pop(sbfToX86[8])
+		a.pop(sbfToX86[7])
+		a.pop(sbfToX86[6])
+		a.decCtx(offCallDepth)
+
+	case sbpf.OpCallx:
+		regIdx, _ := callxReg(ins)
+		// Target pc: (r[reg] - textVA) / 8, faulting outside the text.
+		a.movRegReg64(rax, sbfToX86[regIdx])
+		a.movRegImm64(rdx, c.textVA)
+		a.aluRegReg(aluSub, true, rdx, rax)
+		below := a.jcc(ccB)
+		a.shiftImm(shrExt, true, rax, 3)
+		a.aluImm(extCmp, true, rax, int32(len(c.text)))
+		inRange := a.jcc(ccB)
+		a.patch(below, a.here())
+		c.fault(stubBadAccess, pc)
+		a.patch(inRange, a.here())
+		// Load the dispatch entry; 0xFFFFFFFF marks a pc with no code
+		// (an lddw immediate slot), which the interpreter would decode
+		// as a raw instruction — refuse instead.
+		a.loadCtx(rdx, offCallxTable)
+		a.loadIndexed8(rdx, rdx, rax)
+		a.aluImm(extCmp, false, rdx, -1)
+		codeOK := a.jcc(ccNE)
+		c.fault(stubBadCallx, pc)
+		a.patch(codeOK, a.here())
+		// Depth check after the bounds checks, matching the interpreter.
+		a.cmpCtxImm32(offCallDepth, 64)
+		okDepth := a.jcc(ccB)
+		c.fault(stubCallDepth, pc)
+		a.patch(okDepth, a.here())
+		a.incCtx(offCallDepth)
+		// Charge a mid-block entry and check the budget.
+		a.movRegReg64(r15, rdx)
+		a.shiftImm(shrExt, true, r15, 32)
+		a.addCtxReg(offCuDue, r15)
+		a.loadCtx(rax, offCuDue)
+		a.cmpRegCtx(rax, offCuLeft)
+		okCU := a.jcc(ccBE)
+		c.fault(stubOOCU, pc)
+		a.patch(okCU, a.here())
+		// Save the caller frame and call codeBase+offset.
+		a.movRegReg32(rax, rdx)
+		a.loadCtx(r15, offCodeBase)
+		a.aluRegReg(aluAdd, true, r15, rax)
+		fpx := sbfToX86[10]
+		a.push(sbfToX86[6])
+		a.push(sbfToX86[7])
+		a.push(sbfToX86[8])
+		a.push(sbfToX86[9])
+		a.push(fpx)
+		a.aluImm(extAdd, true, fpx, c.frameAdvance())
+		a.callReg(rax)
+		a.pop(fpx)
 		a.pop(sbfToX86[9])
 		a.pop(sbfToX86[8])
 		a.pop(sbfToX86[7])

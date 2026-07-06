@@ -429,3 +429,34 @@ func (a *asm) subSPImm8(imm byte) {
 func (a *asm) addSPImm8(imm byte) {
 	a.byte(0x48, 0x83, 0xC4, imm)
 }
+
+// addCtxReg emits add qword [rbp+disp], src.
+func (a *asm) addCtxReg(disp int32, src uint8) {
+	a.rex(true, src, rbp)
+	a.byte(0x01)
+	a.modrmMemBP(src, disp)
+}
+
+// loadIndexed8 emits mov dst, [base + index*8]. base must not be RBP
+// or R13 (mod=00 quirk).
+func (a *asm) loadIndexed8(dst, base, index uint8) {
+	rex := byte(0x48)
+	if dst >= 8 {
+		rex |= 4
+	}
+	if index >= 8 {
+		rex |= 2
+	}
+	if base >= 8 {
+		rex |= 1
+	}
+	a.byte(rex, 0x8B, (dst&7)<<3|0x04, 0xC0|(index&7)<<3|base&7)
+}
+
+// callReg emits call reg.
+func (a *asm) callReg(reg uint8) {
+	if reg >= 8 {
+		a.byte(0x41)
+	}
+	a.byte(0xFF, modrmReg(2, reg))
+}

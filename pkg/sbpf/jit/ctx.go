@@ -22,6 +22,7 @@ const (
 	exitBadAccess = 4 // out-of-bounds or wrong-permission memory access
 	exitCallDepth = 5 // SBF call stack exceeded 64 frames
 	exitSyscall   = 6 // yield to Go to run a syscall, then resume
+	exitBadCallx  = 7 // callx into an lddw immediate slot (no compiled code)
 )
 
 // ExecContext is the shared state between Go and compiled code. Field
