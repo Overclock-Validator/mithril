@@ -4,6 +4,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime"
+	"runtime/pprof"
 	"strings"
 
 	"github.com/Overclock-Validator/mithril/pkg/replay"
@@ -54,12 +56,28 @@ func runRun(args []string) {
 	bundle := fs.String("bundle", "", "bundle directory")
 	db := fs.String("db", "", "scratch accountsdb directory (wiped each run)")
 	parallelism := fs.Int("tx-parallelism", 0, "parallel tx workers (0 = sequential)")
+	cpuProfile := fs.String("cpuprofile", "", "write a CPU profile of the replay loop to this file")
+	memProfile := fs.String("memprofile", "", "write a heap profile after the replay loop to this file")
 	fs.Parse(args)
 
 	if *bundle == "" || *db == "" {
 		fmt.Fprintln(os.Stderr, "run: -bundle and -db are required")
 		fs.Usage()
 		os.Exit(2)
+	}
+
+	if *cpuProfile != "" {
+		f, err := os.Create(*cpuProfile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "creating cpu profile: %v\n", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			fmt.Fprintf(os.Stderr, "starting cpu profile: %v\n", err)
+			os.Exit(1)
+		}
+		defer pprof.StopCPUProfile()
 	}
 
 	result, err := replay.RunBenchBundle(replay.BenchRunOpts{
@@ -70,6 +88,20 @@ func runRun(args []string) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "bench run failed: %v\n", err)
 		os.Exit(1)
+	}
+
+	if *memProfile != "" {
+		f, err := os.Create(*memProfile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "creating heap profile: %v\n", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		runtime.GC()
+		if err := pprof.WriteHeapProfile(f); err != nil {
+			fmt.Fprintf(os.Stderr, "writing heap profile: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	fmt.Println()
