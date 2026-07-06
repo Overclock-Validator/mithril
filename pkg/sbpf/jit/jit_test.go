@@ -47,6 +47,9 @@ var testFuncs map[uint32]int64
 // syscalls; nil means no syscalls.
 var testRegistry sbpf.SyscallRegistry
 
+// testGaps runs both engines with v0 stack-frame gaps enabled.
+var testGaps bool
+
 // meterVM is a minimal sbpf.VM exposing a compute meter; the memory-less
 // test syscalls use only ComputeMeter.
 type meterVM struct{ m *cu.ComputeMeter }
@@ -91,22 +94,14 @@ func memWith(input []byte) *Memory {
 }
 
 // runInterpreter executes text with the given budget and input region.
-// Stack frame gaps are disabled to match the JIT configuration.
 func runInterpreter(text []sbpf.Slot, budget uint64, input []byte) (uint64, uint64, error) {
-	prog := &sbpf.Program{
-		Text:        text,
-		TextVA:      sbpf.VaddrProgram,
-		Entrypoint:  0,
-		Funcs:       testFuncs,
-		SbpfVersion: v0,
-	}
 	meter := cu.NewComputeMeter(budget)
-	interp := sbpf.NewInterpreter(prog, &sbpf.VMOpts{
+	interp := sbpf.NewInterpreter(testProg(text), &sbpf.VMOpts{
 		HeapMax:               4096,
 		Input:                 input,
 		Syscalls:              testInterpRegistry(),
 		ComputeMeter:          &meter,
-		DisableStackFrameGaps: true,
+		DisableStackFrameGaps: !testGaps,
 	})
 	defer interp.Finish()
 	return interp.Run()
@@ -126,11 +121,19 @@ func testProg(text []sbpf.Slot) *sbpf.Program {
 // runJIT compiles and executes text with the given budget and input.
 func runJIT(t *testing.T, text []sbpf.Slot, budget uint64, input []byte) (uint64, uint64, error) {
 	t.Helper()
-	compiled, err := Compile(testProg(text), false, testIsSyscall)
+	compiled, err := Compile(testProg(text), testGaps, testIsSyscall)
 	require.NoError(t, err)
 	defer compiled.Free()
 	meter := cu.NewComputeMeter(budget)
 	return compiled.Run(&meter, memWith(input), testRegistry, &meterVM{&meter})
+}
+
+// diffGaps is diff with v0 stack-frame gaps enabled in both engines.
+func diffGaps(t *testing.T, text []sbpf.Slot, budget uint64) {
+	t.Helper()
+	testGaps = true
+	defer func() { testGaps = false }()
+	diffIn(t, text, budget, nil)
 }
 
 // errClass folds errors into comparable categories.
@@ -541,6 +544,109 @@ func TestJITRandomMemory(t *testing.T) {
 
 // hashOf is an arbitrary distinct key for a test function-table entry.
 func hashOf(pc int) uint32 { return uint32(0x1000 + pc) }
+
+func TestJITGappedStackRoundTrip(t *testing.T) {
+	// Store/load through r10 with frame gaps on: the vaddr page must be
+	// squeezed onto the flat backing identically in both engines.
+	diffGaps(t, []sbpf.Slot{
+		ins(sbpf.OpMov64Imm, 1, 0, 0, 0x1234),
+		ins(sbpf.OpStxdw, 10, 1, -8, 0),
+		ins(sbpf.OpLdxdw, 0, 10, -8, 0),
+		ins(sbpf.OpExit, 0, 0, 0, 0),
+	}, 100)
+}
+
+func TestJITGappedStackGapAccess(t *testing.T) {
+	// r10 starts at VaddrStack+0x1000, the first gap page: a direct load
+	// there faults on both engines, as does any odd page.
+	for _, off := range []int16{0, 8, 0x7f8} {
+		diffGaps(t, []sbpf.Slot{
+			ins(sbpf.OpLdxdw, 0, 10, off, 0),
+			ins(sbpf.OpExit, 0, 0, 0, 0),
+		}, 100)
+	}
+}
+
+func TestJITGappedStackPageSpan(t *testing.T) {
+	// An 8-byte access starting in a frame page and running past its end
+	// reads physically contiguous bytes in the interpreter; the JIT must
+	// do the same rather than fault.
+	diffGaps(t, []sbpf.Slot{
+		ins(sbpf.OpMov64Imm, 1, 0, 0, 0xfffffff1),
+		ins(sbpf.OpStxdw, 10, 1, -4, 0), // spans 0xffc..0x1004
+		ins(sbpf.OpLdxdw, 0, 10, -4, 0),
+		ins(sbpf.OpLdxw, 6, 10, -4, 0), // re-read halves
+		ins(sbpf.OpAdd64Reg, 0, 6, 0, 0),
+		ins(sbpf.OpExit, 0, 0, 0, 0),
+	}, 100)
+}
+
+func TestJITGappedStackCallFrames(t *testing.T) {
+	// With gaps the frame pointer advances two pages per call. The callee
+	// writes its own frame and reads the caller's through a passed
+	// pointer; the caller checks its locals survive.
+	testFuncs = map[uint32]int64{hashOf(6): 6}
+	defer func() { testFuncs = nil }()
+	diffGaps(t, []sbpf.Slot{
+		ins(sbpf.OpMov64Imm, 1, 0, 0, 111), // 0
+		ins(sbpf.OpStxdw, 10, 1, -8, 0),    // 1: caller local
+		ins(sbpf.OpMov64Reg, 1, 10, 0, 0),  // 2: r1 = caller fp
+		ins(sbpf.OpCall, 0, 0, 0, hashOf(6)),
+		ins(sbpf.OpLdxdw, 6, 10, -8, 0), // 4: reload caller local
+		ins(sbpf.OpAdd64Reg, 0, 6, 0, 0),
+		ins(sbpf.OpMov64Imm, 2, 0, 0, 222), // 6: callee
+		ins(sbpf.OpStxdw, 10, 2, -8, 0),    // 7: callee local (new frame)
+		ins(sbpf.OpLdxdw, 0, 1, -8, 0),     // 8: read caller's local via r1
+		ins(sbpf.OpLdxdw, 3, 10, -8, 0),    // 9: reload own local
+		ins(sbpf.OpAdd64Reg, 0, 3, 0, 0),   // 10: r0 = 111 + 222
+		ins(sbpf.OpExit, 0, 0, 0, 0),       // 11: return
+		ins(sbpf.OpExit, 0, 0, 0, 0),       // 12: (unreached)
+	}, 1000)
+}
+
+func TestJITGappedStackDepth(t *testing.T) {
+	// Recursion under gaps advances fp by 0x2000 each level; the 64th
+	// frame ends exactly at the top of the doubled address space.
+	testFuncs = map[uint32]int64{hashOf(1): 1}
+	defer func() { testFuncs = nil }()
+	diffGaps(t, []sbpf.Slot{
+		ins(sbpf.OpCall, 0, 0, 0, hashOf(1)), // 0
+		ins(sbpf.OpStxdw, 10, 1, -8, 0),      // 1: touch each frame
+		ins(sbpf.OpCall, 0, 0, 0, hashOf(1)), // 2: recurse to depth fault
+		ins(sbpf.OpExit, 0, 0, 0, 0),         // 3
+	}, 1000000)
+}
+
+func TestJITGappedStackRandom(t *testing.T) {
+	// Random offsets and widths around page boundaries, compared exactly
+	// (values, faults and CU) against the interpreter.
+	rng := rand.New(rand.NewSource(7))
+	ops := []struct {
+		st, ld uint8
+		size   int
+	}{
+		{sbpf.OpStxb, sbpf.OpLdxb, 1},
+		{sbpf.OpStxh, sbpf.OpLdxh, 2},
+		{sbpf.OpStxw, sbpf.OpLdxw, 4},
+		{sbpf.OpStxdw, sbpf.OpLdxdw, 8},
+	}
+	for round := 0; round < 200; round++ {
+		op := ops[rng.Intn(len(ops))]
+		// Bias offsets toward page edges. r10-relative, so negative
+		// offsets land in frame 0 and positive ones probe the gap.
+		off := int16(rng.Intn(0x1100) - 0x1000)
+		if rng.Intn(2) == 0 {
+			off = int16(rng.Intn(16) - 8)
+		}
+		text := []sbpf.Slot{
+			ins(sbpf.OpMov64Imm, 1, 0, 0, uint32(rng.Uint64())),
+			ins(op.st, 10, 1, off, 0),
+			ins(op.ld, 0, 10, off, 0),
+			ins(sbpf.OpExit, 0, 0, 0, 0),
+		}
+		diffGaps(t, text, 100)
+	}
+}
 
 func TestJITSimpleCall(t *testing.T) {
 	// main: r0 = f(); exit. f: r0 = 42; exit.

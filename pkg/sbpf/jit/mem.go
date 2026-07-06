@@ -7,10 +7,9 @@ import "github.com/Overclock-Validator/mithril/pkg/sbpf"
 // Any out-of-bounds or wrong-permission access jumps to a fault block
 // that records pc and exits. Clobbers RAX, RDX, R15.
 //
-// Only the four v0 regions with linear host mappings are handled:
-// program rodata (read-only, hi=1), stack (hi=2), heap (hi=3) and a
-// single input region (hi=4). Programs needing stack-frame gaps or
-// multiple input regions are rejected at compile time.
+// Only the four v0 regions are handled: program rodata (read-only,
+// hi=1), stack (hi=2), heap (hi=3) and a single input region (hi=4).
+// Programs needing multiple input regions are rejected at compile time.
 func (c *compiler) emitTranslate(size int, write bool, pc int) {
 	a := &c.asm
 
@@ -52,7 +51,20 @@ func (c *compiler) emitTranslate(size int, write bool, pc int) {
 	dInput := a.jmp()
 
 	a.patch(jStack, a.here())
-	// Stack is a fixed StackMax window (gaps rejected at compile time).
+	if c.stackGaps {
+		// Every odd 4K page is an unaddressable gap; even pages map
+		// linearly onto the backing with the gap bit squeezed out:
+		// phys = ((off &^ 0xFFF) >> 1) | (off & 0xFFF). An access
+		// running past its page reads the physically adjacent bytes,
+		// exactly like the interpreter's GetFrame slice.
+		a.testImm(r15, 0x1000)
+		a.patch(a.jcc(ccNE), fault)
+		a.movRegReg64(rax, r15)
+		a.aluImm(extAnd, true, rax, 0xFFF)
+		a.aluImm(extAnd, true, r15, ^0xFFF)
+		a.shiftImm(shrExt, true, r15, 1)
+		a.aluRegReg(aluOr, true, rax, r15)
+	}
 	a.movRegReg64(rax, r15)
 	a.aluImm(extAdd, true, rax, int32(size))
 	a.aluImm(extCmp, true, rax, int32(sbpf.StackMax))

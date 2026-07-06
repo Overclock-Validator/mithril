@@ -261,16 +261,11 @@ func (c *compiler) supported(ins sbpf.Slot) bool {
 		return true
 	}
 	if isMemOp(op) {
-		return !c.stackGaps
+		return true
 	}
 	if op == sbpf.OpCall {
 		if c.isSyscall(ins.Uimm()) {
 			return true
-		}
-		// Local calls only, and not under stack-frame gaps (frame-pointer
-		// advance differs).
-		if c.stackGaps {
-			return false
 		}
 		_, ok := c.callTarget(ins)
 		return ok
@@ -605,7 +600,7 @@ func (c *compiler) emitIns(pc int) error {
 		a.push(sbfToX86[8])
 		a.push(sbfToX86[9])
 		a.push(fp)
-		a.aluImm(extAdd, true, fp, int32(sbpf.StackFrameSize))
+		a.aluImm(extAdd, true, fp, c.frameAdvance())
 		c.jumpFix = append(c.jumpFix, jumpFixup{a.call(), target})
 		// Return lands here: restore and unwind.
 		a.pop(fp)
@@ -658,6 +653,15 @@ func jumpCC(op uint8) byte {
 		return ccLE
 	}
 	panic("not a conditional jump")
+}
+
+// frameAdvance is the frame-pointer increment for a call: each frame is
+// followed by a same-sized gap when frame gaps are on.
+func (c *compiler) frameAdvance() int32 {
+	if c.stackGaps {
+		return 2 * sbpf.StackFrameSize
+	}
+	return sbpf.StackFrameSize
 }
 
 // shiftReg emits a shift of dst by the count in src. clamp caps the
