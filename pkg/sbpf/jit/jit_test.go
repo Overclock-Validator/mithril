@@ -112,10 +112,21 @@ func runInterpreter(text []sbpf.Slot, budget uint64, input []byte) (uint64, uint
 	return interp.Run()
 }
 
+// testProg wraps raw text in a Program the way the loader would.
+func testProg(text []sbpf.Slot) *sbpf.Program {
+	return &sbpf.Program{
+		Text:        text,
+		TextVA:      sbpf.VaddrProgram,
+		Entrypoint:  0,
+		Funcs:       testFuncs,
+		SbpfVersion: v0,
+	}
+}
+
 // runJIT compiles and executes text with the given budget and input.
 func runJIT(t *testing.T, text []sbpf.Slot, budget uint64, input []byte) (uint64, uint64, error) {
 	t.Helper()
-	compiled, err := Compile(text, v0, 0, false, testFuncs, testIsSyscall)
+	compiled, err := Compile(testProg(text), false, testIsSyscall)
 	require.NoError(t, err)
 	defer compiled.Free()
 	meter := cu.NewComputeMeter(budget)
@@ -461,7 +472,7 @@ func BenchmarkInterpreterLoop(b *testing.B) {
 }
 
 func BenchmarkJITLoop(b *testing.B) {
-	compiled, err := Compile(benchLoop, v0, 0, false, nil, nil)
+	compiled, err := Compile(testProg(benchLoop), false, nil)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -658,10 +669,10 @@ func TestJITSyscallComputeCost(t *testing.T) {
 func TestJITUnknownSyscall(t *testing.T) {
 	// A call whose imm is neither a function nor (at JIT time) a syscall
 	// stays on the interpreter; verify Compile refuses it.
-	_, err := Compile([]sbpf.Slot{
+	_, err := Compile(testProg([]sbpf.Slot{
 		ins(sbpf.OpCall, 0, 0, 0, 0xdeadbeef),
 		ins(sbpf.OpExit, 0, 0, 0, 0),
-	}, v0, 0, false, nil, nil)
+	}), false, nil)
 	require.ErrorIs(t, err, ErrUnsupported)
 }
 

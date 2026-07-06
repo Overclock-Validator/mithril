@@ -34,6 +34,7 @@ func (c *Compiled) Free() {
 type compiler struct {
 	asm       asm
 	text      []sbpf.Slot
+	textVA    uint64
 	insnOff   []int32 // sbf pc -> native offset; -1 for lddw's second slot
 	stubFix   map[int][]int32
 	jumpFix   []jumpFixup
@@ -63,12 +64,12 @@ const (
 // Compile lowers a verified SBPF v0 program to amd64 code. Programs
 // using unsupported instructions return ErrUnsupported. stackGaps
 // reports whether the runtime maps the stack with frame gaps (v0
-// default); when set, memory instructions are unsupported because their
-// region cannot be proven at compile time.
-func Compile(text []sbpf.Slot, ver sbpfver.SbpfVersion, entry uint64, stackGaps bool, funcs map[uint32]int64, isSyscall func(uint32) bool) (*Compiled, error) {
-	if ver.Version != sbpfver.SbpfVersionV0 {
+// default).
+func Compile(prog *sbpf.Program, stackGaps bool, isSyscall func(uint32) bool) (*Compiled, error) {
+	if prog.SbpfVersion.Version != sbpfver.SbpfVersionV0 {
 		return nil, ErrUnsupported
 	}
+	text, entry := prog.Text, prog.Entrypoint
 	if len(text) == 0 || entry >= uint64(len(text)) {
 		return nil, ErrUnsupported
 	}
@@ -78,13 +79,14 @@ func Compile(text []sbpf.Slot, ver sbpfver.SbpfVersion, entry uint64, stackGaps 
 
 	c := &compiler{
 		text:      text,
+		textVA:    prog.TextVA,
 		insnOff:   make([]int32, len(text)),
 		stubFix:   map[int][]int32{},
 		blockLen:  map[int]uint32{},
 		leaders:   map[int]bool{},
 		lddwSlot2: map[int]bool{},
 		stackGaps: stackGaps,
-		funcs:     funcs,
+		funcs:     prog.Funcs,
 		isSyscall: isSyscall,
 	}
 
