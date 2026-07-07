@@ -1,6 +1,7 @@
 package replay
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -368,6 +369,7 @@ func buildSigverifySnapshot(tx *solana.Transaction, slot uint64) (*sigverifySnap
 
 func verifySignatures(snapshot *sigverifySnapshot, sigverifyWg *sync.WaitGroup) {
 	defer sigverifyWg.Done()
+	defer trace.StartRegion(context.Background(), "Sigverify").End()
 	start := time.Now()
 
 	if len(snapshot.signers) != len(snapshot.signatures) {

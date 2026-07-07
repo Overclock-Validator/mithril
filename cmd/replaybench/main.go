@@ -65,6 +65,7 @@ func runRun(args []string) {
 	jitThreshold := fs.Uint64("jit-threshold", 2, "execution count at which a program is compiled")
 	cpuProfile := fs.String("cpuprofile", "", "write a CPU profile of the replay loop to this file")
 	memProfile := fs.String("memprofile", "", "write a heap profile after the replay loop to this file")
+	traceFile := fs.String("trace", "", "write a Go execution trace of the replay loop to this file")
 	fs.Parse(args)
 
 	if *bundle == "" || *db == "" {
@@ -104,6 +105,7 @@ func runRun(args []string) {
 		BundleDir:     *bundle,
 		DbDir:         *db,
 		TxParallelism: *parallelism,
+		TraceFile:     *traceFile,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "bench run failed: %v\n", err)

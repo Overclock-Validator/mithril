@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strings"
 
 	pb "github.com/Overclock-Validator/mithril/cmd/trace2perfetto/proto"
 	exptrace "golang.org/x/exp/trace"
@@ -108,10 +109,12 @@ type goroutineState struct {
 	reason string
 }
 
-// Transaction region names we care about
-var txRegions = map[string]bool{
+// Goroutines that open one of these regions get scheduler-state
+// (WAITING/RUNNABLE) slices in addition to their region slices.
+var stateTrackedRegions = map[string]bool{
 	"ProcessVote":        true,
 	"ProcessTransaction": true,
+	"Sigverify":          true,
 }
 
 func convertTrace(r *exptrace.Reader) (*pb.Trace, error) {
@@ -135,7 +138,7 @@ func convertTrace(r *exptrace.Reader) (*pb.Trace, error) {
 	a := newGoroutineTrackAllocator()
 
 	waitOrSchedGoroutineStates := make(map[exptrace.GoID]*goroutineState)
-	isTxWorker := make(map[exptrace.GoID]bool)
+	stateTracked := make(map[exptrace.GoID]bool)
 	txLoopOpen := false
 
 	for {
@@ -164,9 +167,21 @@ func convertTrace(r *exptrace.Reader) (*pb.Trace, error) {
 			if to == exptrace.GoNotExist {
 				a.releaseGoroutine(gid)
 				delete(waitOrSchedGoroutineStates, gid)
+				delete(stateTracked, gid)
 				continue
 			}
-			if !isTxWorker[gid] || !txLoopOpen {
+			// A goroutine created to run verifySignatures is classified at
+			// birth from its start frame, so its first RUNNABLE wait (the
+			// queue delay before it ever runs) is captured too.
+			if _, from := st.Goroutine(); from == exptrace.GoNotExist {
+				for f := range st.Stack.Frames() {
+					if strings.Contains(f.Func, "verifySignatures") {
+						stateTracked[gid] = true
+					}
+					break
+				}
+			}
+			if !stateTracked[gid] || !txLoopOpen {
 				continue
 			}
 
@@ -218,8 +233,8 @@ func convertTrace(r *exptrace.Reader) (*pb.Trace, error) {
 			eventType = pb.TrackEvent_TYPE_SLICE_BEGIN
 			sliceName = ev.Region().Type
 			category = "region"
-			if txRegions[sliceName] {
-				isTxWorker[gid] = true
+			if stateTrackedRegions[sliceName] {
+				stateTracked[gid] = true
 			} else if sliceName == "TxLoop" {
 				txLoopOpen = true
 			}

@@ -7,6 +7,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"runtime/trace"
 	"sort"
 	"time"
 
@@ -25,6 +26,9 @@ type BenchRunOpts struct {
 	BundleDir     string
 	DbDir         string // scratch accountsdb dir, created fresh (wiped if it exists)
 	TxParallelism int    // 0 = sequential tx loop
+
+	// TraceFile, when set, writes a Go execution trace of the replay loop.
+	TraceFile string
 }
 
 type BenchBlockStat struct {
@@ -282,6 +286,20 @@ func RunBenchBundle(opts BenchRunOpts) (*BenchRunResult, error) {
 	pt := &persistedTracker{}
 	var lastSlotCtx *sealevel.SlotCtx
 	lastSlot := manifest.ParentSlot
+
+	if opts.TraceFile != "" {
+		f, err := os.Create(opts.TraceFile)
+		if err != nil {
+			return nil, fmt.Errorf("creating trace file: %w", err)
+		}
+		if err := trace.Start(f); err != nil {
+			return nil, fmt.Errorf("starting trace: %w", err)
+		}
+		defer func() {
+			trace.Stop()
+			f.Close()
+		}()
+	}
 
 	for _, path := range blockPaths {
 		block, err := loadBenchBlock(path)
