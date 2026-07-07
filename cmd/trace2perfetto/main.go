@@ -16,6 +16,8 @@ import (
 func main() {
 	inputFile := flag.String("input", "", "input Go trace file")
 	outputFile := flag.String("output", "", "output Perfetto proto file")
+	startBlock := flag.Int("start-block", 0, "skip events before the Nth ProcessBlock task")
+	numBlocks := flag.Int("num-blocks", 0, "convert this many blocks (0 = to the end)")
 	flag.Parse()
 
 	if *inputFile == "" {
@@ -36,7 +38,7 @@ func main() {
 		log.Fatalf("Failed to parse trace: %v", err)
 	}
 
-	trace, err := convertTrace(r)
+	trace, err := convertTrace(r, *startBlock, *numBlocks)
 	if err != nil {
 		log.Fatalf("Failed to convert trace: %v", err)
 	}
@@ -117,7 +119,7 @@ var stateTrackedRegions = map[string]bool{
 	"Sigverify":          true,
 }
 
-func convertTrace(r *exptrace.Reader) (*pb.Trace, error) {
+func convertTrace(r *exptrace.Reader, startBlock, numBlocks int) (*pb.Trace, error) {
 	trace := &pb.Trace{}
 
 	p := uint64(1)
@@ -140,6 +142,7 @@ func convertTrace(r *exptrace.Reader) (*pb.Trace, error) {
 	waitOrSchedGoroutineStates := make(map[exptrace.GoID]*goroutineState)
 	stateTracked := make(map[exptrace.GoID]bool)
 	txLoopOpen := false
+	blockCount := 0
 
 	for {
 		ev, err := r.ReadEvent()
@@ -148,6 +151,27 @@ func convertTrace(r *exptrace.Reader) (*pb.Trace, error) {
 		}
 		if err != nil {
 			return nil, fmt.Errorf("ReadEvent: %w", err)
+		}
+		// Window by ProcessBlock task count. Classification still runs on
+		// skipped events so goroutines entering the window keep their
+		// identity; only packet emission is suppressed.
+		if ev.Kind() == exptrace.EventTaskBegin && ev.Task().Type == "ProcessBlock" {
+			blockCount++
+		}
+		if blockCount <= startBlock && startBlock > 0 {
+			if ev.Kind() == exptrace.EventRegionBegin {
+				if stateTrackedRegions[ev.Region().Type] {
+					stateTracked[ev.Goroutine()] = true
+				} else if ev.Region().Type == "TxLoop" {
+					txLoopOpen = true
+				}
+			} else if ev.Kind() == exptrace.EventRegionEnd && ev.Region().Type == "TxLoop" {
+				txLoopOpen = false
+			}
+			continue
+		}
+		if numBlocks > 0 && blockCount > startBlock+numBlocks {
+			break
 		}
 		var eventType pb.TrackEvent_Type
 		var sliceName string
@@ -170,12 +194,13 @@ func convertTrace(r *exptrace.Reader) (*pb.Trace, error) {
 				delete(stateTracked, gid)
 				continue
 			}
-			// A goroutine created to run verifySignatures is classified at
-			// birth from its start frame, so its first RUNNABLE wait (the
-			// queue delay before it ever runs) is captured too.
+			// A sigverify goroutine is classified at birth from its start
+			// frame, so its first RUNNABLE wait (the queue delay before it
+			// ever runs) is captured too.
 			if _, from := st.Goroutine(); from == exptrace.GoNotExist {
 				for f := range st.Stack.Frames() {
-					if strings.Contains(f.Func, "verifySignatures") {
+					if strings.Contains(f.Func, "verifySignatures") ||
+						strings.Contains(f.Func, "newSigverifyPool") {
 						stateTracked[gid] = true
 					}
 					break

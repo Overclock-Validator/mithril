@@ -2400,7 +2400,7 @@ func newSlotCtx(block *b.Block, accts accounts.Accounts, parentAccts accounts.Ac
 	return slotCtx
 }
 
-func sequentialTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, block *b.Block, dbgOpts *DebugOptions) (fees.TxFeeInfoAccumulator, uint64) {
+func sequentialTxLoop(slotCtx *sealevel.SlotCtx, sigverify *sigverifyPool, block *b.Block, dbgOpts *DebugOptions) (fees.TxFeeInfoAccumulator, uint64) {
 	var txFeeAccumulator fees.TxFeeInfoAccumulator
 	var totalComputeUnitsConsumed uint64
 	// process & execute each transaction in turn
@@ -2409,7 +2409,7 @@ func sequentialTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, bl
 		if block.TxMetas != nil {
 			txMeta = block.TxMetas[idx]
 		}
-		txFeeInfo, txComputeUnitsConsumed, txErr := ProcessTransaction(slotCtx, sigverifyWg, tx, txMeta, dbgOpts, nil)
+		txFeeInfo, txComputeUnitsConsumed, txErr := ProcessTransaction(slotCtx, sigverify, tx, txMeta, dbgOpts, nil)
 		totalComputeUnitsConsumed += txComputeUnitsConsumed
 
 		if txMeta == nil {
@@ -2520,7 +2520,7 @@ func lightbringerEntryExecutionBatches(transactions []*solana.Transaction, entry
 	return batches
 }
 
-func parallelTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, block *b.Block, rblock *b.Block, txParallelism int, dbgOpts *DebugOptions) (fees.TxFeeInfoAccumulator, uint64) {
+func parallelTxLoop(slotCtx *sealevel.SlotCtx, sigverify *sigverifyPool, block *b.Block, rblock *b.Block, txParallelism int, dbgOpts *DebugOptions) (fees.TxFeeInfoAccumulator, uint64) {
 	var txFeeAccumulator fees.TxFeeInfoAccumulator
 	txFeeInfos := make([]*fees.TxFeeInfo, len(block.Transactions))
 	txComputeUnitsConsumed := make([]uint64, len(block.Transactions))
@@ -2549,7 +2549,7 @@ func parallelTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, bloc
 					if idx < len(rblock.TxMetas) {
 						txMeta = rblock.TxMetas[idx]
 					}
-					txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = ProcessTransaction(slotCtx, sigverifyWg, rblock.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[i])
+					txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = ProcessTransaction(slotCtx, sigverify, rblock.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[i])
 					txErr := errs[idx]
 					// check for success-failure return value divergences
 					if txMeta != nil && txErr == nil && txMeta.Err != nil {
@@ -2585,7 +2585,7 @@ func parallelTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, bloc
 					if int(idx) < len(rblock.TxMetas) {
 						txMeta = rblock.TxMetas[idx]
 					}
-					txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = ProcessTransaction(slotCtx, sigverifyWg, rblock.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[workerIdx])
+					txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = ProcessTransaction(slotCtx, sigverify, rblock.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[workerIdx])
 					txErr := errs[idx]
 					if txMeta != nil && txErr == nil && txMeta.Err != nil {
 						mlog.Log.Errorf("[run:%s] DIVERGENCE in slot %d: tx %s succeeded locally but failed onchain: %+v",
@@ -2708,8 +2708,8 @@ func ProcessBlock(
 		SerializedParameterArena.Reset()
 	}
 
-	var sigverifyWg sync.WaitGroup
-	defer sigverifyWg.Wait()
+	sigverify := newSigverifyPool()
+	defer sigverify.wait()
 	start := time.Now()
 	unresolvedBlock := &b.Block{
 		Transactions: make([]*solana.Transaction, len(block.Transactions)),
@@ -2748,9 +2748,9 @@ func ProcessBlock(
 	setReplayStage("tx_loop")
 	txLoopRegion := trace.StartRegion(ctx, "TxLoop")
 	if txParallelism > 0 {
-		txFeeAccumulator, totalComputeUnitsConsumed = parallelTxLoop(slotCtx, &sigverifyWg, unresolvedBlock, block, txParallelism, dbgOpts)
+		txFeeAccumulator, totalComputeUnitsConsumed = parallelTxLoop(slotCtx, sigverify, unresolvedBlock, block, txParallelism, dbgOpts)
 	} else {
-		txFeeAccumulator, totalComputeUnitsConsumed = sequentialTxLoop(slotCtx, &sigverifyWg, block, dbgOpts)
+		txFeeAccumulator, totalComputeUnitsConsumed = sequentialTxLoop(slotCtx, sigverify, block, dbgOpts)
 	}
 	slotCtx.TotalComputeUnitsConsumed = totalComputeUnitsConsumed
 	txLoopRegion.End()

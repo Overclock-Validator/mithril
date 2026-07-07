@@ -367,8 +367,45 @@ func buildSigverifySnapshot(tx *solana.Transaction, slot uint64) (*sigverifySnap
 	return snapshot, nil
 }
 
-func verifySignatures(snapshot *sigverifySnapshot, sigverifyWg *sync.WaitGroup) {
-	defer sigverifyWg.Done()
+// sigverifyPool verifies transaction signatures on a small fixed set of
+// worker goroutines. Spawning a goroutine per transaction from the
+// execution workers put each verification into the spawning P's runnext
+// slot, displacing the worker and flooding the scheduler with thousands
+// of short-lived runnable goroutines per block; a pool drains the same
+// work from a channel with no per-transaction goroutine churn.
+type sigverifyPool struct {
+	ch chan *sigverifySnapshot
+	wg sync.WaitGroup
+}
+
+// SigverifyWorkers is the number of signature-verification goroutines
+// serving a block.
+var SigverifyWorkers = 3
+
+func newSigverifyPool() *sigverifyPool {
+	p := &sigverifyPool{ch: make(chan *sigverifySnapshot, 8192)}
+	p.wg.Add(SigverifyWorkers)
+	for range SigverifyWorkers {
+		go func() {
+			defer p.wg.Done()
+			for snapshot := range p.ch {
+				verifySignatures(snapshot)
+			}
+		}()
+	}
+	return p
+}
+
+func (p *sigverifyPool) submit(s *sigverifySnapshot) { p.ch <- s }
+
+// wait closes the queue and blocks until every submitted verification
+// has completed. The pool cannot be reused after wait.
+func (p *sigverifyPool) wait() {
+	close(p.ch)
+	p.wg.Wait()
+}
+
+func verifySignatures(snapshot *sigverifySnapshot) {
 	defer trace.StartRegion(context.Background(), "Sigverify").End()
 	start := time.Now()
 
@@ -440,7 +477,7 @@ func processTransactionComputeUnits(execCtx *sealevel.ExecutionCtx) uint64 {
 	return execCtx.ComputeMeter.Used()
 }
 
-func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, tx *solana.Transaction, txMeta *rpc.TransactionMeta, dbgOpts *DebugOptions, arena *arena.Arena[sealevel.BorrowedAccount]) (*fees.TxFeeInfo, uint64, error) {
+func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverify *sigverifyPool, tx *solana.Transaction, txMeta *rpc.TransactionMeta, dbgOpts *DebugOptions, arena *arena.Arena[sealevel.BorrowedAccount]) (*fees.TxFeeInfo, uint64, error) {
 	if trace.IsEnabled() && slotCtx.TraceCtx != nil {
 		regionType := "ProcessTransaction"
 		if tx.IsVote() {
@@ -471,8 +508,7 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 	if err != nil {
 		return nil, 0, err
 	}
-	sigverifyWg.Add(1)
-	go verifySignatures(sigverifySnapshot, sigverifyWg)
+	sigverify.submit(sigverifySnapshot)
 
 	if len(tx.Signatures) > 0 && dbgOpts.IsDebugTx(tx.Signatures[0]) {
 		mlog.Log.Infof("Turning on debug logs while executing tx %s", tx.Signatures[0])
