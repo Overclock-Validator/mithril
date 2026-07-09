@@ -15,6 +15,7 @@ import (
 	a "github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/arena"
 	"github.com/Overclock-Validator/mithril/pkg/cu"
+	"github.com/Overclock-Validator/mithril/pkg/ed25519fast"
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/fees"
 	"github.com/Overclock-Validator/mithril/pkg/global"
@@ -382,6 +383,11 @@ type sigverifyPool struct {
 // serving a block.
 var SigverifyWorkers = 3
 
+// sigverifyKeyCache holds per-pubkey verification tables. Signers
+// recur heavily across blocks — vote authorities sign every slot — so
+// most verifications take the precomputed fast path.
+var sigverifyKeyCache = &ed25519fast.Cache{}
+
 func newSigverifyPool() *sigverifyPool {
 	p := &sigverifyPool{ch: make(chan *sigverifySnapshot, 8192)}
 	p.wg.Add(SigverifyWorkers)
@@ -429,7 +435,7 @@ func verifySignatures(snapshot *sigverifySnapshot) {
 	}
 
 	for i, sig := range snapshot.signatures {
-		if snapshot.signers[i].Verify(snapshot.message, sig) {
+		if sigverifyKeyCache.Verify((*[32]byte)(&snapshot.signers[i]), snapshot.message, sig[:]) {
 			continue
 		}
 		mlog.Log.Errorf("sigverify context: slot=%d tx=%s version=%d resolved=%t required_sigs=%d readonly_signed=%d readonly_unsigned=%d static_keys=%d total_keys=%d lookups=%d signers=%v first_keys=%v",
