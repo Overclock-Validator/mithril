@@ -32,11 +32,11 @@ import (
 	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/blockstream"
 	consensusengine "github.com/Overclock-Validator/mithril/pkg/consensus"
-	"github.com/Overclock-Validator/mithril/pkg/gossip"
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/fees"
 	"github.com/Overclock-Validator/mithril/pkg/forkchoice"
 	"github.com/Overclock-Validator/mithril/pkg/global"
+	"github.com/Overclock-Validator/mithril/pkg/gossip"
 	"github.com/Overclock-Validator/mithril/pkg/lthash"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
@@ -183,10 +183,18 @@ type OnCancelWriteState func(result *ReplayResult) error
 type ResumeState struct {
 	// ParentSlot is the slot of the last successfully replayed block (= state.LastSlot)
 	ParentSlot uint64
+	// ParentEpoch is the epoch containing ParentSlot. It is required when a
+	// speculative fork switch restores the durable restart boundary.
+	ParentEpoch uint64
 	// ParentBlockHeight is the block height of the last successfully replayed block.
 	ParentBlockHeight uint64
 	// ParentBankhash is the bankhash of the parent slot
 	ParentBankhash []byte
+	// Alpenglow block identity and chained root are a coherent pair needed to
+	// extend the finalized parent after a rooted-durable restart.
+	HasAlpenglowIdentity bool
+	AlpenglowBlockID     solana.Hash
+	AlpenglowChainedRoot solana.Hash
 	// AcctsLtHash is the cumulative LtHash at the end of the parent slot
 	AcctsLtHash *lthash.LtHash
 	// LamportsPerSignature for reconstructing FeeRateGovernor
@@ -212,6 +220,8 @@ type ResumeState struct {
 	InflationTaper          float64
 	InflationFoundation     float64
 	InflationFoundationTerm float64
+	// TransactionCount is exact when non-nil, including an explicit zero.
+	TransactionCount *uint64
 
 	// ComputedEpochStakes contains epoch stakes computed at boundaries.
 	// Key: epoch number (the leader schedule epoch), Value: serialized JSON
@@ -955,12 +965,23 @@ func configureInitialBlock(acctsDb *accountsdb.AccountsDb,
 	}
 	block.ParentBankhash = parentBankhash
 	block.ParentSlot = mithrilState.ManifestParentSlot
+	if mithrilState.ManifestLastBlockhash == "" {
+		return fmt.Errorf("state file missing manifest_last_blockhash - delete AccountsDB and rebuild from snapshot")
+	}
+	manifestLastBlockhash, err := base58.DecodeFromString(mithrilState.ManifestLastBlockhash)
+	if err != nil {
+		return fmt.Errorf("corrupted state file: failed to decode manifest_last_blockhash: %w", err)
+	}
+	block.LastBlockhash = manifestLastBlockhash
 
 	// LtHash: decode base64, restore with InitWithHash
 	if mithrilState.ManifestAcctsLtHash != "" {
 		ltHashBytes, err := base64.StdEncoding.DecodeString(mithrilState.ManifestAcctsLtHash)
 		if err != nil {
 			return fmt.Errorf("corrupted state file: failed to decode manifest_accts_lt_hash: %w", err)
+		}
+		if len(ltHashBytes) != lthash.HashByteLen {
+			return fmt.Errorf("corrupted state file: manifest_accts_lt_hash is %d bytes, want %d", len(ltHashBytes), lthash.HashByteLen)
 		}
 		block.AcctsLtHash = new(lthash.LtHash).InitWithHash(ltHashBytes)
 	}
@@ -987,11 +1008,6 @@ func configureInitialBlock(acctsDb *accountsdb.AccountsDb,
 			return fmt.Errorf("decode manifest RecentBlockhashes: %w", err)
 		}
 		SeedRecentBlockhashesCache(recent)
-		chainTipHash, err := base58.DecodeFromString(mithrilState.ManifestRecentBlockhashes[0].Blockhash)
-		if err != nil {
-			return fmt.Errorf("decode manifest chain tip blockhash: %w", err)
-		}
-		block.LastBlockhash = chainTipHash
 	}
 
 	setupInitialVoteAcctsAndStakeAccts(acctsDb, block)
@@ -1396,8 +1412,13 @@ func ReplayBlocks(
 		return result
 	}
 
-	// Use state file for transaction count (required)
-	global.IncrTransactionCount(mithrilState.ManifestTransactionCount)
+	// Replays may restart in-process after a fork switch, so assign rather than
+	// increment. A rooted checkpoint carries the exact count for its branch.
+	if resumeState != nil && resumeState.TransactionCount != nil {
+		global.SetTransactionCount(*resumeState.TransactionCount)
+	} else {
+		global.SetTransactionCount(mithrilState.ManifestTransactionCount)
+	}
 	isFirstSlotInEpoch := epochSchedule.FirstSlotInEpoch(currentEpoch) == startSlot
 	alpenglowReplayMode := isAlpenglowReplayMode(consensusOpts) || useTurbine
 	replayCtx.CurrentFeatures, featuresActivatedInFirstSlot, parentFeaturesActivatedInFirstSlot = scanAndEnableFeatures(acctsDb, replayCtx, startSlot, isFirstSlotInEpoch)
@@ -1409,12 +1430,22 @@ func ReplayBlocks(
 		mlog.Log.Infof("Alpenglow mode: Alpenglow feature gate is not active; forcing Alpenglow bank clock semantics")
 	}
 	partitionedEpochRewardsEnabled = replayCtx.CurrentFeatures.IsActive(features.EnablePartitionedEpochReward) || replayCtx.CurrentFeatures.IsActive(features.EnablePartitionedEpochRewardsSuperfeature)
+	if partitionedEpochRewardsEnabled &&
+		sealevel.SysvarCache.EpochRewards.Sysvar != nil &&
+		sealevel.SysvarCache.EpochRewards.Sysvar.Active {
+		parentSlot := mithrilState.ManifestParentSlot
+		if resumeState != nil {
+			parentSlot = resumeState.ParentSlot
+		}
+		result.Error = fmt.Errorf("startup state at slot %d is inside an active partitioned-rewards distribution; resume from the durable boundary before this epoch transition", parentSlot)
+		return result
+	}
 
 	var chainTipAcctsLtHash *lthash.LtHash
 	if resumeState != nil && resumeState.AcctsLtHash != nil {
 		chainTipAcctsLtHash = resumeState.AcctsLtHash
 	} else if mithrilState != nil && mithrilState.ManifestAcctsLtHash != "" {
-		if ltHashBytes, err := base64.StdEncoding.DecodeString(mithrilState.ManifestAcctsLtHash); err == nil {
+		if ltHashBytes, err := base64.StdEncoding.DecodeString(mithrilState.ManifestAcctsLtHash); err == nil && len(ltHashBytes) == lthash.HashByteLen {
 			chainTipAcctsLtHash = new(lthash.LtHash).InitWithHash(ltHashBytes)
 		}
 	}
@@ -1427,8 +1458,8 @@ func ReplayBlocks(
 	var chainTipLastEntryHash solana.Hash
 	if resumeState != nil && resumeState.LastBlockhash != ([32]byte{}) {
 		chainTipLastEntryHash = solana.Hash(resumeState.LastBlockhash)
-	} else if mithrilState != nil && len(mithrilState.ManifestRecentBlockhashes) > 0 {
-		if hash, err := base58.DecodeFromString(mithrilState.ManifestRecentBlockhashes[0].Blockhash); err == nil {
+	} else if mithrilState != nil && mithrilState.ManifestLastBlockhash != "" {
+		if hash, err := base58.DecodeFromString(mithrilState.ManifestLastBlockhash); err == nil {
 			chainTipLastEntryHash = solana.Hash(hash)
 		}
 	}
@@ -1663,13 +1694,90 @@ func ReplayBlocks(
 	SetLocalLeaderCommitNotifier(blockStream.NotifyLocalLeaderCommit)
 	defer ClearLocalLeaderCommitNotifier()
 
+	captureReplayAux := func() ReplayAuxState {
+		aux := ReplayAuxState{
+			PartitionedEpochRewardsEnabled: partitionedEpochRewardsEnabled,
+		}
+		if partitionedRewardsInfo != nil {
+			info := *partitionedRewardsInfo
+			aux.PartitionedRewardsInfo = &info
+		}
+		return aux
+	}
+	restoreReplayAux := func(snapshot *ReplayHeadSnapshot) error {
+		if snapshot == nil {
+			return fmt.Errorf("nil replay head snapshot")
+		}
+		previousEpoch := currentEpoch
+		currentEpoch = snapshot.Epoch
+		partitionedEpochRewardsEnabled = snapshot.Aux.PartitionedEpochRewardsEnabled
+		partitionedRewardsInfo = nil
+		if snapshot.Aux.PartitionedRewardsInfo != nil {
+			info := *snapshot.Aux.PartitionedRewardsInfo
+			partitionedRewardsInfo = &info
+		}
+		justCrossedEpochBoundary = false
+		alpenglowClock = useAlpenglowClockSemantics(alpenglowReplayMode, replayCtx.CurrentFeatures)
+
+		if previousEpoch != currentEpoch {
+			// A losing epoch-boundary branch may have populated the next consensus
+			// snapshot and the following epoch's rank/leader tables. Keep the valid
+			// one-epoch lookahead and discard everything derived beyond it.
+			global.DropEpochVoteStateSnapshotsAfter(currentEpoch)
+			maxStakeEpoch := currentEpoch
+			if currentEpoch != ^uint64(0) {
+				maxStakeEpoch++
+			}
+			global.ClearEpochStakesAfter(maxStakeEpoch)
+		}
+		stakes := global.EpochStakes(currentEpoch)
+		if len(stakes) == 0 {
+			return fmt.Errorf("no epoch stakes available for rollback epoch %d", currentEpoch)
+		}
+		global.ResetVoteCache()
+		if err := RebuildVoteCacheFromAccountsDB(acctsDb, snapshot.Slot, stakes, 0); err != nil {
+			return fmt.Errorf("rebuild vote cache for rollback epoch %d: %w", currentEpoch, err)
+		}
+		if snapshot.EpochAuthorizedVoters == nil {
+			rebuildAuthorizedVotersFromVoteCache(currentEpoch)
+		}
+		if previousEpoch == currentEpoch {
+			return nil
+		}
+		if global.ManageLeaderSchedule() {
+			if _, err := PrepareLeaderScheduleLocal(currentEpoch, epochSchedule, ""); err != nil {
+				return fmt.Errorf("restore leader schedule for epoch %d: %w", currentEpoch, err)
+			}
+		}
+		forkChoice.UpdateEpoch(
+			currentEpoch,
+			global.EpochStakes(currentEpoch),
+			global.EpochTotalStake(currentEpoch),
+			global.EpochAuthorizedVoters(),
+		)
+		if consensusEngine != nil {
+			if err := consensusengine.RefreshAlpenglowValidatorSet(consensusEngine, currentEpoch); err != nil {
+				return fmt.Errorf("restore Alpenglow validator set for epoch %d: %w", currentEpoch, err)
+			}
+		}
+		return nil
+	}
+
 	speculative := NewSpeculativeReplay()
 	var alpenglowNextDecision func(anchorSlot uint64) (alpenglow.ChainDecision, bool)
-	speculativeEnabled := useTurbine && turbAlpenglowBind != "" && blockFetchOpts != nil && blockFetchOpts.TurbineRepairOnly
+	speculativeEnabled := useTurbine && turbAlpenglowBind != ""
 	if speculativeEnabled {
 		if decisionSource, ok := consensusEngine.(consensusengine.AlpenglowDecisionSource); ok {
 			alpenglowNextDecision = decisionSource.NextAlpenglowDecision
 			speculative.Enable()
+			acctsDb.RootedDurable = true
+			speculative.ConfigureDurable(acctsDb, mithrilState, filepath.Join(acctsDb.AcctsDir, ".."), FoldBatchSlots)
+			defer speculative.Close()
+			if rootSink, ok := consensusEngine.(consensusengine.AlpenglowRootSink); ok {
+				speculative.SetRootSink(rootSink.SetAlpenglowRoot)
+			}
+			stopActiveSpeculative := publishActiveSpeculativeReplay(speculative)
+			defer stopActiveSpeculative()
 			blockStream.SetParentMismatchHandler(func(waitingSlot, observedParent, expectedParent uint64) bool {
 				return speculative.HandleParentMismatch(waitingSlot, observedParent, expectedParent, SpeculativeRollbackParams{
 					AcctsDb:     acctsDb,
@@ -1679,11 +1787,35 @@ func ReplayBlocks(
 					BlockStream: blockStream,
 					ForkChoice:  forkChoice,
 					RPCServer:   rpcServer,
+					RestoreAux:  restoreReplayAux,
 				})
+			})
+			blockStream.SetParentIdentityMismatchHandler(func(
+				waitingSlot, parentSlot uint64,
+				observedParentID, executedParentID solana.Hash,
+			) bool {
+				return speculative.HandleParentIdentityMismatch(
+					waitingSlot, parentSlot, observedParentID, executedParentID,
+					SpeculativeRollbackParams{
+						AcctsDb:     acctsDb,
+						PT:          pt,
+						ReplayCtx:   replayCtx,
+						LastSlotCtx: &lastSlotCtx,
+						BlockStream: blockStream,
+						ForkChoice:  forkChoice,
+						RPCServer:   rpcServer,
+						RestoreAux:  restoreReplayAux,
+					},
+				)
 			})
 			mlog.Log.Infof("speculative replay enabled: deferring AccountsDB persistence until Alpenglow finalizes turbine blocks")
 			if resumeState == nil {
 				speculative.SeedFromManifest(mithrilState, replayCtx)
+			} else {
+				speculative.SeedFromResume(resumeState, replayCtx)
+			}
+			if durableSlot, durableBankhash := speculative.DurableHead(); durableSlot > 0 {
+				pt.Set(durableSlot, durableBankhash)
 			}
 		} else {
 			speculativeEnabled = false
@@ -1723,13 +1855,13 @@ func ReplayBlocks(
 			forkChoice.ObserveExecutionAnchor(resumeState.ParentSlot, solana.Hash(resumeState.LastBlockhash))
 			return
 		}
-		if mithrilState != nil && mithrilState.ManifestParentBankhash != "" {
-			manifestParentBlockhash, err := base58.DecodeFromString(mithrilState.ManifestParentBankhash)
+		if mithrilState != nil && mithrilState.ManifestLastBlockhash != "" {
+			manifestLastBlockhash, err := base58.DecodeFromString(mithrilState.ManifestLastBlockhash)
 			if err != nil {
-				mlog.Log.Warnf("forkchoice: failed to decode manifest parent blockhash for anchor seeding: %v", err)
+				mlog.Log.Warnf("forkchoice: failed to decode manifest PoH blockhash for anchor seeding: %v", err)
 				return
 			}
-			forkChoice.ObserveExecutionAnchor(mithrilState.ManifestParentSlot, solana.Hash(manifestParentBlockhash))
+			forkChoice.ObserveExecutionAnchor(mithrilState.ManifestParentSlot, solana.Hash(manifestLastBlockhash))
 		}
 	}
 
@@ -1874,6 +2006,8 @@ func ReplayBlocks(
 			if block == nil {
 				if result.Error == nil {
 					switch {
+					case blockStream.Err() != nil:
+						result.Error = blockStream.Err()
 					case blockStream.Stalled():
 						result.Error = fmt.Errorf("block fetch stalled - no progress for %v", blockStream.StallTimeout())
 					case isLive && !blockStream.Completed():
@@ -1903,6 +2037,10 @@ func ReplayBlocks(
 
 			if speculativeEnabled && alpenglowNextDecision != nil {
 				speculative.TryFlushPending(acctsDb, pt, replayCtx, alpenglowNextDecision)
+				if err := speculative.Err(); err != nil {
+					result.Error = err
+					break
+				}
 			}
 
 			syncConsensusBufferedExecutionMode(block.Slot)
@@ -1985,6 +2123,39 @@ func ReplayBlocks(
 		if block.IsSkipped {
 			if commit, ok := TakeLocalLeaderCommit(block.Slot); ok && commit.SlotCtx != nil {
 				lastSlotCtx = commit.SlotCtx
+				if speculativeEnabled && commit.Block != nil {
+					replayCtx.Capitalization -= lastSlotCtx.LamportsBurnt
+					if err := speculative.FinalizePendingSnapshot(block.Slot, replayCtx, captureReplayAux()); err != nil {
+						result.Error = fmt.Errorf("local leader slot %d: %w", block.Slot, err)
+						break
+					}
+					if consensusEngine != nil {
+						if err := consensusEngine.ObserveBlock(ctx, consensusengine.BlockObservation{
+							Block:  commit.Block,
+							Source: "local-leader",
+							At:     time.Now(),
+						}); err != nil {
+							result.Error = fmt.Errorf("consensus engine observe local leader block: %w", err)
+							break
+						}
+						var bankhash [32]byte
+						copy(bankhash[:], lastSlotCtx.FinalBankhash)
+						if err := consensusEngine.OnReplayResult(ctx, consensusengine.SlotReplayResult{
+							Slot:     block.Slot,
+							Bankhash: bankhash,
+							Source:   "local-leader",
+							At:       time.Now(),
+						}); err != nil {
+							result.Error = fmt.Errorf("consensus engine local leader result: %w", err)
+							break
+						}
+					}
+					speculative.TryCommitPending(acctsDb, pt, commit.Block, commit.Block.BlockHeight, replayCtx, alpenglowNextDecision)
+					if err := speculative.Err(); err != nil {
+						result.Error = err
+						break
+					}
+				}
 				UpdateChainTipFromSlotCtx(lastSlotCtx, replayCtx.CurrentFeatures)
 				blockStream.SetLastExecutedSlot(block.Slot)
 				leaderStr := "unknown"
@@ -2107,16 +2278,18 @@ func ReplayBlocks(
 			}
 
 			// Persist rebuilt authorized voters to state file so resume loads fresh data
-			if cache := global.EpochAuthorizedVoters(); cache != nil && mithrilState != nil {
-				updatedVoters := make(map[string][]string, cache.Len())
-				for voteAcct, voters := range cache.Entries() {
-					voterStrs := make([]string, len(voters))
-					for i, v := range voters {
-						voterStrs[i] = base58.Encode(v[:])
+			if !speculativeEnabled {
+				if cache := global.EpochAuthorizedVoters(); cache != nil && mithrilState != nil {
+					updatedVoters := make(map[string][]string, cache.Len())
+					for voteAcct, voters := range cache.Entries() {
+						voterStrs := make([]string, len(voters))
+						for i, v := range voters {
+							voterStrs[i] = base58.Encode(v[:])
+						}
+						updatedVoters[base58.Encode(voteAcct[:])] = voterStrs
 					}
-					updatedVoters[base58.Encode(voteAcct[:])] = voterStrs
+					mithrilState.ManifestEpochAuthorizedVoters = updatedVoters
 				}
-				mithrilState.ManifestEpochAuthorizedVoters = updatedVoters
 			}
 
 			if len(newlyActivatedFeatures) != 0 {
@@ -2128,24 +2301,6 @@ func ReplayBlocks(
 				block.ParentEpochUpdatedAccts = append(block.ParentEpochUpdatedAccts, parentFeaturesActivatedInFirstSlot...)
 				featuresActivatedInFirstSlot = nil
 				parentFeaturesActivatedInFirstSlot = nil
-			}
-		} else if lastSlotCtx == nil && partitionedEpochRewardsEnabled {
-			// First block being processed - check if we're in rewards period
-			// (uses lastSlotCtx == nil to detect first block, handles skipped startSlot)
-			if rewards.IsWithinRewardsPeriod(block.Epoch, currentSlot, epochSchedule) {
-				mlog.Log.Errorf("=======================================================")
-				mlog.Log.Errorf("RESUME DURING REWARDS PERIOD NOT YET SUPPORTED")
-				mlog.Log.Errorf("=======================================================")
-				mlog.Log.Errorf("You stopped during the epoch reward distribution period")
-				mlog.Log.Errorf("(first ~243 slots after epoch boundary).")
-				mlog.Log.Errorf("")
-				mlog.Log.Errorf("This will be supported in a future release.")
-				mlog.Log.Errorf("")
-				mlog.Log.Errorf("Workaround: Delete AccountsDB and restart from snapshot:")
-				mlog.Log.Errorf("  rm -rf <accountsdb_dir>")
-				mlog.Log.Errorf("  Set bootstrap.mode = 'new-snapshot' in config.toml")
-				mlog.Log.Errorf("=======================================================")
-				os.Exit(1)
 			}
 		}
 
@@ -2160,7 +2315,7 @@ func ReplayBlocks(
 
 		metrics.GlobalBlockReplay.PreprocessBlock.AddTimingSince(start)
 
-		deferPersist := speculativeEnabled && block.FromLightbringer
+		deferPersist := speculativeEnabled
 		var deferred *DeferredBlockCommit
 		lastSlotCtx, deferred, err = ProcessBlock(acctsDb, block, epochSchedule, txParallelism, dbgOpts, pt, alpenglowClock, deferPersist, speculative, turbineShredVersion)
 		if err != nil {
@@ -2169,14 +2324,6 @@ func ReplayBlocks(
 			// Clear any pending stake pubkeys from this failed block
 			global.ClearPendingStakePubkeys()
 			break
-		}
-		if deferred != nil {
-			speculative.TrackPending(deferred)
-			if speculative.TryCommitPending(acctsDb, pt, block, block.BlockHeight, replayCtx, alpenglowNextDecision) {
-				deferred = nil
-			}
-		} else {
-			speculative.UpdateCommittedHead(lastSlotCtx, replayCtx, block.BlockHeight)
 		}
 		UpdateChainTipFromSlotCtx(lastSlotCtx, replayCtx.CurrentFeatures)
 		global.SetBlockHeight(block.BlockHeight)
@@ -2237,6 +2384,21 @@ func ReplayBlocks(
 		}
 
 		replayCtx.Capitalization -= lastSlotCtx.LamportsBurnt
+		if deferred != nil {
+			if err := speculative.TrackPending(deferred, replayCtx, captureReplayAux()); err != nil {
+				result.Error = fmt.Errorf("speculative replay slot %d: %w", block.Slot, err)
+				break
+			}
+			if speculative.TryCommitPending(acctsDb, pt, block, block.BlockHeight, replayCtx, alpenglowNextDecision) {
+				deferred = nil
+			}
+			if err := speculative.Err(); err != nil {
+				result.Error = err
+				break
+			}
+		} else {
+			speculative.UpdateCommittedHead(lastSlotCtx, replayCtx, block.BlockHeight)
+		}
 
 		// Clear ManifestEpochStakes after first replayed slot past snapshot
 		// This frees memory and ensures we don't use stale manifest data on restart
@@ -2252,6 +2414,11 @@ func ReplayBlocks(
 			mlog.Log.Infof("Context cancelled after slot %d, exiting replay loop", block.Slot)
 			result.WasCancelled = true
 
+			if speculativeEnabled {
+				if err := speculative.FlushFinalized(pt, alpenglowNextDecision); err != nil {
+					mlog.Log.Errorf("rooted-durable shutdown fold: %v", err)
+				}
+			}
 			acctsDb.WaitForStoreWorker()
 
 			// Populate result immediately for state write
@@ -2279,6 +2446,9 @@ func ReplayBlocks(
 
 			// Serialize all epoch stakes for persistence
 			result.ComputedEpochStakes = serializeAllEpochStakes()
+			if speculativeEnabled {
+				speculative.PopulateDurableResult(result)
+			}
 
 			// Write state immediately via callback (eliminates timing window for hard kills)
 			if onCancelWriteState != nil {
@@ -2598,6 +2768,11 @@ func ReplayBlocks(
 	if blockStream.Stalled() && result.Error == nil {
 		result.Error = fmt.Errorf("block fetch stalled - no progress for %v", blockStream.StallTimeout())
 	}
+	if speculativeEnabled {
+		if err := speculative.FlushFinalized(pt, alpenglowNextDecision); err != nil && result.Error == nil {
+			result.Error = err
+		}
+	}
 
 	acctsDb.WaitForStoreWorker()
 	result.LastPersistedSlot, result.LastPersistedBankhash = pt.Get()
@@ -2629,6 +2804,9 @@ func ReplayBlocks(
 
 	// Serialize all epoch stakes for persistence
 	result.ComputedEpochStakes = serializeAllEpochStakes()
+	if speculativeEnabled {
+		speculative.PopulateDurableResult(result)
+	}
 
 	return result
 }
@@ -3176,13 +3354,15 @@ func ProcessBlock(
 		global.IncrTransactionCount(uint64(len(block.Transactions)))
 		setReplayStage("done")
 		return slotCtx, &DeferredBlockCommit{
-			SlotCtx:             slotCtx,
-			ModifiedAccts:       modifiedAccts,
-			BlockSlot:           block.Slot,
-			BlockHeight:         block.BlockHeight,
-			Bankhash:              append([]byte(nil), slotCtx.FinalBankhash...),
-			HasAlpenglowBlockID:   block.HasAlpenglowBlockID,
-			AlpenglowBlockID:      solana.Hash(block.AlpenglowBlockID),
+			SlotCtx:                 slotCtx,
+			ModifiedAccts:           modifiedAccts,
+			BlockSlot:               block.Slot,
+			BlockHeight:             block.BlockHeight,
+			Bankhash:                append([]byte(nil), slotCtx.FinalBankhash...),
+			HasAlpenglowBlockID:     block.HasAlpenglowBlockID,
+			AlpenglowBlockID:        solana.Hash(block.AlpenglowBlockID),
+			HasAlpenglowChainedRoot: block.HasAlpenglowLastChainedRoot,
+			AlpenglowChainedRoot:    solana.Hash(block.AlpenglowLastChainedRoot),
 		}, nil
 	}
 
@@ -3217,6 +3397,12 @@ func ProcessBlock(
 
 	if len(modifiedAccts) > 0 {
 		err = acctsDb.StoreAccounts(modifiedAccts, slotCtx.Slot, afterStoreAccounts)
+		if err != nil {
+			commitInProgress.Store(false)
+			commitSlot.Store(0)
+		}
+	} else {
+		afterStoreAccounts()
 	}
 
 	global.IncrTransactionCount(uint64(len(block.Transactions)))

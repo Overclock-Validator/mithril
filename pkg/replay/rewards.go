@@ -431,6 +431,7 @@ func beginPartitionedEpochRewardsDistribution(acctsDb *accountsdb.AccountsDb, sl
 
 	partitionedRewardsInfo.SpoolDir = streamResult.SpoolDir
 	partitionedRewardsInfo.SpoolSlot = streamResult.SpoolSlot
+	partitionedRewardsInfo.NumRewardPartitions = streamResult.NumPartitions
 	partitionedRewardsInfo.NumRewardPartitionsRemaining = streamResult.NumPartitions
 
 	maybeDumpEpochCalculatedRewards(dbgOpts, epoch, slot, streamResult)
@@ -453,9 +454,11 @@ func beginPartitionedEpochRewardsDistribution(acctsDb *accountsdb.AccountsDb, sl
 	newEpochRewards.MustMarshalWithEncoder(encoder)
 	copy(epochRewardsAcct.Data, writer.Bytes())
 
-	err = acctsDb.StoreAccounts([]*accounts.Account{epochRewardsAcct}, slot, nil)
-	if err != nil {
-		panic(fmt.Sprintf("unable to update EpochRewards sysvar to acctsdb: %s", err))
+	if !acctsDb.RootedDurable {
+		err = acctsDb.StoreAccounts([]*accounts.Account{epochRewardsAcct}, slot, nil)
+		if err != nil {
+			panic(fmt.Sprintf("unable to update EpochRewards sysvar to acctsdb: %s", err))
+		}
 	}
 	sealevel.SysvarCache.EpochRewards.Acct = epochRewardsAcct
 	sealevel.SysvarCache.EpochRewards.Sysvar = &newEpochRewards
@@ -488,7 +491,12 @@ func distributePartitionedEpochRewardsForSlot(acctsDb *accountsdb.AccountsDb, ep
 
 	if partitionedEpochRewardsInfo.NumRewardPartitionsRemaining == 0 {
 		epochRewards.Active = false
-		rewards.CleanupPartitionedSpoolFiles(partitionedEpochRewardsInfo.SpoolDir, partitionedEpochRewardsInfo.SpoolSlot, epochRewards.NumPartitions)
+		// A speculative branch may still unwind after consuming the final
+		// partition. Rooted-durable mode removes the spool only after this state
+		// has been included in a successful finalized fold.
+		if !acctsDb.RootedDurable {
+			rewards.CleanupPartitionedSpoolFiles(partitionedEpochRewardsInfo.SpoolDir, partitionedEpochRewardsInfo.SpoolSlot, epochRewards.NumPartitions)
+		}
 	}
 
 	writer := new(bytes.Buffer)
@@ -496,9 +504,11 @@ func distributePartitionedEpochRewardsForSlot(acctsDb *accountsdb.AccountsDb, ep
 	epochRewards.MustMarshalWithEncoder(encoder)
 	copy(epochRewardsAcct.Data, writer.Bytes())
 
-	err = acctsDb.StoreAccounts([]*accounts.Account{epochRewardsAcct}, currentSlot, nil)
-	if err != nil {
-		panic(fmt.Sprintf("unable to update EpochRewards sysvar to acctsdb: %s", err))
+	if !acctsDb.RootedDurable {
+		err = acctsDb.StoreAccounts([]*accounts.Account{epochRewardsAcct}, currentSlot, nil)
+		if err != nil {
+			panic(fmt.Sprintf("unable to update EpochRewards sysvar to acctsdb: %s", err))
+		}
 	}
 	sealevel.SysvarCache.EpochRewards.Acct = epochRewardsAcct
 	sealevel.SysvarCache.EpochRewards.Sysvar = &epochRewards

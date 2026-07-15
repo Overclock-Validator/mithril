@@ -87,7 +87,7 @@ func TestLeaderLoopDoesNotAttemptLeaderUntilOtherParentReplayed(t *testing.T) {
 				return solana.PublicKey{}, false
 			}
 		},
-		ParentContext: func(uint64) ParentContext {
+		ParentContext: func(uint64, uint64) ParentContext {
 			return ParentContext{ParentBankhash: solana.Hash{2}}
 		},
 		ParentBlockID: func(slot uint64) (solana.Hash, bool) {

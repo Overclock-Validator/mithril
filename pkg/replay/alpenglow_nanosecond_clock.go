@@ -5,12 +5,13 @@ import (
 	"fmt"
 	"math"
 
-	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	a "github.com/Overclock-Validator/mithril/pkg/addresses"
+	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	bin "github.com/gagliardetto/binary"
+	"github.com/gagliardetto/solana-go"
 )
 
 const nanosecondClockDataLen = 8
@@ -60,12 +61,30 @@ func ReadNanosecondClockAt(acctsDb *accountsdb.AccountsDb, slot uint64) (int64, 
 	if acctsDb == nil {
 		return 0, false
 	}
-	if acct, err := acctsDb.GetAccount(slot, NanosecondClockAccountAddr()); err == nil &&
+	return readNanosecondClock(func(pubkey solana.PublicKey) (*accounts.Account, error) {
+		return acctsDb.GetAccount(slot, pubkey)
+	})
+}
+
+// ReadResolvedNanosecondClockAt reads through the active speculative overlay
+// before falling back to durable AccountsDB. Local production must use this
+// path because the selected parent is normally newer than the durable root.
+func ReadResolvedNanosecondClockAt(acctsDb *accountsdb.AccountsDb, slot uint64) (int64, bool) {
+	return readNanosecondClock(func(pubkey solana.PublicKey) (*accounts.Account, error) {
+		return ResolveActiveAccount(acctsDb, slot, pubkey)
+	})
+}
+
+func readNanosecondClock(load func(solana.PublicKey) (*accounts.Account, error)) (int64, bool) {
+	if load == nil {
+		return 0, false
+	}
+	if acct, err := load(NanosecondClockAccountAddr()); err == nil &&
 		acct != nil && len(acct.Data) >= nanosecondClockDataLen {
 		return int64(binary.LittleEndian.Uint64(acct.Data[:nanosecondClockDataLen])), true
 	}
 
-	clockAcct, err := acctsDb.GetAccount(slot, sealevel.SysvarClockAddr)
+	clockAcct, err := load(sealevel.SysvarClockAddr)
 	if err != nil || clockAcct == nil {
 		return 0, false
 	}

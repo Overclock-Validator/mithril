@@ -76,7 +76,7 @@ func scanAndEnableFeatures(acctsDb *accountsdb.AccountsDb, replayCtx *ReplayCtx,
 		}
 	}
 
-	if len(modifiedAccts) != 0 {
+	if len(modifiedAccts) != 0 && !acctsDb.RootedDurable {
 		if err := acctsDb.StoreAccounts(modifiedAccts, slot, nil); err != nil {
 			panic(err)
 		}
@@ -133,8 +133,10 @@ func applyDeprecateRentExemptionThresholdActivation(acctsDb *accountsdb.Accounts
 
 	newRentSysvarBytes := rentSysvar.MustMarshal()
 	copy(rentAcct.Data, newRentSysvarBytes)
-	if err := acctsDb.StoreAccounts([]*accounts.Account{rentAcct}, slot, nil); err != nil {
-		return nil, nil, err
+	if !acctsDb.RootedDurable {
+		if err := acctsDb.StoreAccounts([]*accounts.Account{rentAcct}, slot, nil); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	sealevel.SysvarCache.Rent.Sysvar = &rentSysvar
@@ -507,8 +509,10 @@ func applyReplaceSplTokenWithPTokenActivation(
 
 	acctsDb.RemoveProgramFromCache(splTokenProgramID)
 
-	if err := acctsDb.StoreAccounts(migration.modifiedAccts, slot, nil); err != nil {
-		return nil, nil, err
+	if !acctsDb.RootedDurable {
+		if err := acctsDb.StoreAccounts(migration.modifiedAccts, slot, nil); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	return migration.modifiedAccts, migration.parentAccts, nil
@@ -565,8 +569,10 @@ func applyUpgradeBpfStakeProgramToV5Activation(
 
 	acctsDb.RemoveProgramFromCache(programDataAddress)
 
-	if err := acctsDb.StoreAccounts(migration.modifiedAccts, slot, nil); err != nil {
-		return nil, nil, err
+	if !acctsDb.RootedDurable {
+		if err := acctsDb.StoreAccounts(migration.modifiedAccts, slot, nil); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	return migration.modifiedAccts, migration.parentAccts, nil

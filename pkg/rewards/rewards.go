@@ -34,6 +34,7 @@ const (
 type PartitionedRewardDistributionInfo struct {
 	TotalStakingRewards          uint64
 	FirstStakingRewardSlot       uint64
+	NumRewardPartitions          uint64
 	NumRewardPartitionsRemaining uint64
 	SpoolDir                     string
 	SpoolSlot                    uint64
@@ -159,9 +160,11 @@ func DistributeVotingRewards(acctsDb *accountsdb.AccountsDb, validatorRewards ma
 	wg.Wait()
 	workerPool.Release()
 
-	err := acctsDb.StoreAccounts(updatedAccts, slot, nil)
-	if err != nil {
-		panic(fmt.Sprintf("error updating accounts for voting rewards in slot %d: %s", slot, err))
+	if !acctsDb.RootedDurable {
+		err := acctsDb.StoreAccounts(updatedAccts, slot, nil)
+		if err != nil {
+			panic(fmt.Sprintf("error updating accounts for voting rewards in slot %d: %s", slot, err))
+		}
 	}
 
 	return updatedAccts, parentUpdatedAccts, totalVotingRewards.Load()
@@ -275,7 +278,7 @@ func DistributeStakingRewardsFromSpool(acctsDb *accountsdb.AccountsDb, spoolDir 
 		}
 	}
 
-	if len(filteredAccts) > 0 {
+	if len(filteredAccts) > 0 && !acctsDb.RootedDurable {
 		err = acctsDb.StoreAccounts(filteredAccts, currentSlot, nil)
 		if err != nil {
 			panic(fmt.Sprintf("error updating accounts for spool distribution in slot %d: %s", currentSlot, err))

@@ -5,9 +5,9 @@ import (
 	"math"
 	"sort"
 
-	a "github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
+	a "github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/epochstakes"
 	"github.com/Overclock-Validator/mithril/pkg/features"
@@ -75,7 +75,6 @@ func hasNonZeroBLSPubkey(voteState *sealevel.VoteStateVersions) bool {
 	var zero [48]byte
 	return *bls != zero
 }
-
 
 func filterVoteAccountsForVAT(
 	acctsDb *accountsdb.AccountsDb,
@@ -212,8 +211,10 @@ func burnAlpenglowVAT(
 	parentUpdated = append(parentUpdated, parentIncinerator)
 	updated = append(updated, newIncinerator)
 
-	if err := acctsDb.StoreAccounts(updated, slot, nil); err != nil {
-		return nil, nil, 0, fmt.Errorf("store VAT burn accounts: %w", err)
+	if !acctsDb.RootedDurable {
+		if err := acctsDb.StoreAccounts(updated, slot, nil); err != nil {
+			return nil, nil, 0, fmt.Errorf("store VAT burn accounts: %w", err)
+		}
 	}
 
 	return updated, parentUpdated, totalBurned, nil

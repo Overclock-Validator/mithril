@@ -16,7 +16,7 @@ const HistoryFileName = "mithril_state.history.jsonl"
 
 // CurrentStateSchemaVersion is the current version of the state file format.
 // Increment this when making breaking changes to the state file structure.
-const CurrentStateSchemaVersion uint32 = 2
+const CurrentStateSchemaVersion uint32 = 3
 
 // MithrilState tracks the current state of the mithril node.
 // The state file serves as an atomic marker of validity - AccountsDB is valid
@@ -66,6 +66,7 @@ type MithrilState struct {
 	// Block configuration seed
 	ManifestParentSlot     uint64 `json:"manifest_parent_slot,omitempty"`
 	ManifestParentBankhash string `json:"manifest_parent_bankhash,omitempty"` // base58
+	ManifestLastBlockhash  string `json:"manifest_last_blockhash,omitempty"`  // snapshot PoH blockhash, base58
 	ManifestBlockHeight    uint64 `json:"manifest_block_height,omitempty"`
 	ManifestAcctsLtHash    string `json:"manifest_accts_lt_hash,omitempty"` // base64
 
@@ -113,6 +114,13 @@ type MithrilState struct {
 	LastEpoch       uint64 `json:"last_epoch,omitempty"`        // Epoch of last replayed slot
 	LastBankhash    string `json:"last_bankhash,omitempty"`     // Bankhash of last replayed slot (base58)
 	LastBlockHeight uint64 `json:"last_block_height,omitempty"` // Block height of last replayed slot
+
+	// Rooted-durable mode executes ahead in RAM while AccountsDB contains only
+	// the finalized prefix through this watermark. The full context is also
+	// carried by the fold manifest so a hard crash can repair a stale state file.
+	LastRootedSlot     uint64         `json:"last_rooted_slot,omitempty"`
+	LastRootedBankhash string         `json:"last_rooted_bankhash,omitempty"`
+	LastRootedContext  *ResumeContext `json:"last_rooted_context,omitempty"`
 
 	// =========================================================================
 	// Resume Context (everything needed to continue replay from LastSlot)
@@ -200,6 +208,40 @@ type SlotHashEntry struct {
 	Hash string `json:"hash"` // base58 encoded
 }
 
+// ResumeContext is the complete end-of-slot state required to resume from a
+// durable fold boundary, including the epoch consensus metadata needed when a
+// hard crash follows an epoch-crossing fold.
+type ResumeContext struct {
+	Slot                    uint64           `json:"slot"`
+	Bankhash                string           `json:"bankhash"`
+	AlpenglowBlockID        string           `json:"alpenglow_block_id,omitempty"`
+	AlpenglowChainedRoot    string           `json:"alpenglow_chained_root,omitempty"`
+	BlockHeight             uint64           `json:"block_height"`
+	Epoch                   uint64           `json:"epoch"`
+	AcctsLtHash             string           `json:"accts_lt_hash"`
+	LamportsPerSignature    uint64           `json:"lamports_per_sig"`
+	PrevLamportsPerSig      uint64           `json:"prev_lamports_per_sig"`
+	NumSignatures           uint64           `json:"num_signatures"`
+	RecentBlockhashes       []BlockhashEntry `json:"recent_blockhashes"`
+	EvictedBlockhash        string           `json:"evicted_blockhash"`
+	Blockhash               string           `json:"blockhash"`
+	SlotHashes              []SlotHashEntry  `json:"slot_hashes"`
+	Clock                   string           `json:"clock"`
+	Capitalization          uint64           `json:"capitalization"`
+	SlotsPerYear            float64          `json:"slots_per_year"`
+	InflationInitial        float64          `json:"inflation_initial"`
+	InflationTerminal       float64          `json:"inflation_terminal"`
+	InflationTaper          float64          `json:"inflation_taper"`
+	InflationFoundation     float64          `json:"inflation_foundation"`
+	InflationFoundationTerm float64          `json:"inflation_foundation_term"`
+	TransactionCount        *uint64          `json:"transaction_count,omitempty"`
+	// Epoch consensus metadata is carried by every durable fold boundary so a
+	// hard crash immediately after an epoch-crossing fold does not depend on a
+	// stale graceful-shutdown state file.
+	ComputedEpochStakes   map[uint64]string   `json:"computed_epoch_stakes,omitempty"`
+	EpochAuthorizedVoters map[string][]string `json:"epoch_authorized_voters,omitempty"`
+}
+
 // SnapshotInfo contains metadata about a downloaded snapshot file.
 type SnapshotInfo struct {
 	Path     string `json:"path"`
@@ -226,7 +268,8 @@ func LoadState(accountsDbDir string) (*MithrilState, error) {
 		return nil, fmt.Errorf("failed to parse state file: %w", err)
 	}
 
-	// Require schema version 2 - no migration from older versions
+	// Rooted-durable state and its Alpenglow identity are a coherent v3
+	// checkpoint. Older files must be rebuilt rather than partially seeded.
 	if state.StateSchemaVersion != CurrentStateSchemaVersion {
 		return nil, fmt.Errorf("state file schema version %d is not supported (requires v%d). Delete AccountsDB and rebuild from snapshot", state.StateSchemaVersion, CurrentStateSchemaVersion)
 	}
@@ -243,15 +286,38 @@ func (s *MithrilState) Save(accountsDbDir string) error {
 		return fmt.Errorf("failed to marshal state: %w", err)
 	}
 
-	// Write to temp file first, then rename for atomicity
+	// Write, fsync, and atomically rename. Fold recovery repairs stale state
+	// after process crashes; the directory sync also covers sudden power loss.
 	tmpFile := stateFile + ".tmp"
-	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+	f, err := os.OpenFile(tmpFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to create state temp file: %w", err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpFile)
 		return fmt.Errorf("failed to write state file: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpFile)
+		return fmt.Errorf("failed to fsync state file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpFile)
+		return fmt.Errorf("failed to close state file: %w", err)
 	}
 
 	if err := os.Rename(tmpFile, stateFile); err != nil {
-		os.Remove(tmpFile)
+		_ = os.Remove(tmpFile)
 		return fmt.Errorf("failed to rename state file: %w", err)
+	}
+	if dir, err := os.Open(accountsDbDir); err == nil {
+		syncErr := dir.Sync()
+		_ = dir.Close()
+		if syncErr != nil {
+			return fmt.Errorf("failed to fsync state directory: %w", syncErr)
+		}
 	}
 
 	return nil
@@ -436,10 +502,21 @@ func (s *MithrilState) getWriterCommit() string {
 // GetResumeSlot returns the slot to resume from.
 // Returns LastSlot + 1 if replay has happened, otherwise SnapshotSlot + 1.
 func (s *MithrilState) GetResumeSlot() uint64 {
+	if s.LastRootedSlot > 0 {
+		return s.LastRootedSlot + 1
+	}
 	if s.LastSlot > 0 {
 		return s.LastSlot + 1
 	}
 	return s.SnapshotSlot + 1
+}
+
+// DurableHighWater reports the last account state known to be on disk.
+func (s *MithrilState) DurableHighWater() uint64 {
+	if s.LastRootedSlot > 0 {
+		return s.LastRootedSlot
+	}
+	return s.GetCurrentSlot()
 }
 
 // GetCurrentSlot returns the most recent slot (LastSlot if replayed, else SnapshotSlot).
@@ -466,6 +543,17 @@ type BankhashGetter interface {
 // This detects cases where the process was killed (Ctrl+Z, kill -9) without
 // updating the state file, leaving AccountsDB in an inconsistent state.
 func (s *MithrilState) ValidateAgainstBankhashDB(bankhashDb BankhashGetter) error {
+	if s.LastRootedSlot > 0 {
+		bankhash, err := bankhashDb.GetBankHashForSlot(s.LastRootedSlot)
+		if err != nil || len(bankhash) == 0 {
+			return fmt.Errorf("state file shows last_rooted_slot=%d, but no bankhash was found", s.LastRootedSlot)
+		}
+		if s.LastRootedBankhash != "" && base58.Encode(bankhash) != s.LastRootedBankhash {
+			return fmt.Errorf("rooted bankhash mismatch for slot %d: state file has %s, bankhash_db has %s",
+				s.LastRootedSlot, s.LastRootedBankhash, base58.Encode(bankhash))
+		}
+		return nil
+	}
 	if s.LastSlot == 0 {
 		// No replay happened according to state file
 		// Check if bankhash exists for snapshot_slot + 1

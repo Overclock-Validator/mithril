@@ -25,7 +25,7 @@ func TestLeaderLoopHoldsSlotUntilWallAdvances(t *testing.T) {
 		LeaderForSlot: func(s uint64) (solana.PublicKey, bool) {
 			return leader, s == 42 || s == 43
 		},
-		ParentContext: func(uint64) ParentContext {
+		ParentContext: func(uint64, uint64) ParentContext {
 			return ParentContext{ParentBankhash: solana.Hash{1}}
 		},
 		ParentBlockID: func(slot uint64) (solana.Hash, bool) {
@@ -70,7 +70,7 @@ func TestLeaderLoopDoesNotRestartFinishedWallSlot(t *testing.T) {
 		LeaderForSlot: func(s uint64) (solana.PublicKey, bool) {
 			return leader, s == 42
 		},
-		ParentContext: func(uint64) ParentContext {
+		ParentContext: func(uint64, uint64) ParentContext {
 			return ParentContext{ParentBankhash: solana.Hash{1}}
 		},
 		ParentBlockID: func(uint64) (solana.Hash, bool) {

@@ -70,6 +70,27 @@ func (cache *EpochStakesCache) ClearEpochStakes(epoch uint64) {
 	delete(cache.totalStakeCache, epoch)
 }
 
+// ClearAfter drops tables derived for epochs above maxEpoch. A speculative
+// epoch transition can populate future stake/rank maps before its branch wins;
+// rollback must not leave those losing-branch tables available to consensus.
+func (cache *EpochStakesCache) ClearAfter(maxEpoch uint64) {
+	for epoch := range cache.stakeCache {
+		if epoch > maxEpoch {
+			delete(cache.stakeCache, epoch)
+		}
+	}
+	for epoch := range cache.voteAcctCache {
+		if epoch > maxEpoch {
+			delete(cache.voteAcctCache, epoch)
+		}
+	}
+	for epoch := range cache.totalStakeCache {
+		if epoch > maxEpoch {
+			delete(cache.totalStakeCache, epoch)
+		}
+	}
+}
+
 // PersistedEpochStakes is the JSON-serializable format for epoch stakes.
 type PersistedEpochStakes struct {
 	Epoch      uint64                      `json:"epoch"`

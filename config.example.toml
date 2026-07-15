@@ -244,7 +244,7 @@ name = "mithril"
     #   "lightbringer" - Only enforce on Lightbringer blocks (RPC blocks are trusted)
     #   "turbine"      - Only enforce on native turbine blocks
     #   "stream"       - Enforce on any live shred-stream path
-    #   "all"          - Enforce on all block sources (not yet implemented)
+    #   "all"          - Enforce on all block sources linked by parent slot or blockhash
     enforce_on_source = "stream"
 
 

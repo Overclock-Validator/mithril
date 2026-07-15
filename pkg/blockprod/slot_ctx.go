@@ -8,18 +8,19 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/lthash"
+	"github.com/Overclock-Validator/mithril/pkg/replay"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/gagliardetto/solana-go"
 )
 
 // ParentContext carries the parent bank metadata needed to commit a leader slot.
 type ParentContext struct {
-	ParentBankhash    solana.Hash
+	ParentBankhash      solana.Hash
 	ParentLastEntryHash solana.Hash
-	PrevNumSigs       uint64
-	PrevFeeGovernor   *sealevel.FeeRateGovernor
-	AcctsLtHash       *lthash.LtHash
-	Features          *features.Features
+	PrevNumSigs         uint64
+	PrevFeeGovernor     *sealevel.FeeRateGovernor
+	AcctsLtHash         *lthash.LtHash
+	Features            *features.Features
 }
 
 // NewLeaderSlotCtx builds a forge-ready slot context at the chain tip.
@@ -42,11 +43,14 @@ func NewLeaderSlotCtx(slot, parentSlot uint64, acctsDb *accountsdb.AccountsDb, p
 	}
 
 	slotCtx := &sealevel.SlotCtx{
-		Slot:            slot,
-		ParentSlot:      parentSlot,
-		Epoch:           epoch,
-		Accounts:        accounts.NewMemAccounts(),
-		AccountsDb:      acctsDb,
+		Slot:       slot,
+		ParentSlot: parentSlot,
+		Epoch:      epoch,
+		Accounts:   accounts.NewMemAccounts(),
+		AccountsDb: acctsDb,
+		AccountLoader: func(parent uint64, pubkey solana.PublicKey) (*accounts.Account, error) {
+			return replay.ResolveActiveAccount(acctsDb, parent, pubkey)
+		},
 		Features:        feats,
 		FeeRateGovernor: feeGovernor,
 		LastBlockhash:   lastBlockhash,

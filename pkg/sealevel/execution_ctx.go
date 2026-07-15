@@ -61,23 +61,26 @@ type SlotBank struct {
 }
 
 type SlotCtx struct {
-	Accounts        accounts.Accounts
-	ParentAccts     accounts.Accounts
-	AccountsDb      *accountsdb.AccountsDb
-	FeeRateGovernor *FeeRateGovernor
-	Slot            uint64
-	ParentSlot      uint64
-	Epoch           uint64
-	AcctMapsMu      *sync.Mutex // AcctMapsMu protects the next 2 maps
-	ModifiedAccts     map[solana.PublicKey]bool
-	WritableAccts     map[solana.PublicKey]bool
+	Accounts    accounts.Accounts
+	ParentAccts accounts.Accounts
+	AccountsDb  *accountsdb.AccountsDb
+	// AccountLoader resolves parent state for branch-aware callers. Nil keeps
+	// the legacy direct AccountsDB path.
+	AccountLoader      func(slot uint64, pubkey solana.PublicKey) (*accounts.Account, error)
+	FeeRateGovernor    *FeeRateGovernor
+	Slot               uint64
+	ParentSlot         uint64
+	Epoch              uint64
+	AcctMapsMu         *sync.Mutex // AcctMapsMu protects the next 2 maps
+	ModifiedAccts      map[solana.PublicKey]bool
+	WritableAccts      map[solana.PublicKey]bool
 	LtHashAppliedAccts map[solana.PublicKey]bool
-	NumSignatures   uint64
-	Blockhash       [32]byte
-	LastBlockhash   [32]byte
-	SlotBank        SlotBank
-	Features        *features.Features
-	VoteTimestampMu *sync.Mutex
+	NumSignatures      uint64
+	Blockhash          [32]byte
+	LastBlockhash      [32]byte
+	SlotBank           SlotBank
+	Features           *features.Features
+	VoteTimestampMu    *sync.Mutex
 	// VoteTimestampsMu protects VoteTimestamps
 	VoteTimestamps            map[solana.PublicKey]BlockTimestamp
 	VoteAccts                 map[solana.PublicKey]uint64
@@ -439,6 +442,9 @@ func (slotCtx *SlotCtx) GetParentAccount(pubkey solana.PublicKey) (*accounts.Acc
 }
 
 func (slotCtx *SlotCtx) GetAccountFromAccountsDb(pubkey solana.PublicKey) (*accounts.Account, error) {
+	if slotCtx.AccountLoader != nil {
+		return slotCtx.AccountLoader(slotCtx.ParentSlot, pubkey)
+	}
 	acct, err := slotCtx.AccountsDb.GetAccount(slotCtx.Slot, pubkey)
 	if err != nil {
 		return nil, err

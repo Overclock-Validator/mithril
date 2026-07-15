@@ -38,6 +38,144 @@ func TestLightbringerBlockConnectsLocked(t *testing.T) {
 	}
 }
 
+func TestWaitingLightbringerParentIdentityMismatchLocked(t *testing.T) {
+	bs := NewBlockSource(&BlockSourceOpts{
+		SourceType:                   BlockSourceTurbine,
+		TurbineBindAddr:              "127.0.0.1:0",
+		TurbineAlpenglowBlockIDHints: true,
+		StartSlot:                    100,
+		EndSlot:                      200,
+	})
+	executedID := solana.Hash{1}
+	observedID := solana.Hash{2}
+	bs.lastEmittedBlockSlot = 150
+	bs.lastEmittedBlockID = executedID
+	bs.hasLastEmittedBlockID = true
+	bs.nextSlotToSend = 151
+	bs.reorderBuffer[151] = &b.Block{
+		Slot:                      151,
+		FromLightbringer:          true,
+		SourceParentSlot:          150,
+		HasAlpenglowParentBlockID: true,
+		AlpenglowParentBlockID:    observedID,
+	}
+
+	waiting, parent, observed, executed, mismatch := bs.waitingLightbringerParentIdentityMismatchLocked()
+	if !mismatch || waiting != 151 || parent != 150 || observed != observedID || executed != executedID {
+		t.Fatalf("unexpected identity mismatch: waiting=%d parent=%d observed=%s executed=%s mismatch=%v",
+			waiting, parent, observed, executed, mismatch)
+	}
+	if bs.lightbringerBlockConnectsLocked(bs.reorderBuffer[151]) {
+		t.Fatal("same-slot child with a different parent block ID must not connect")
+	}
+}
+
+func TestNextBlockSerializesParentIdentityControlAfterEmittedBlocks(t *testing.T) {
+	bs := NewBlockSource(&BlockSourceOpts{
+		SourceType:                   BlockSourceTurbine,
+		TurbineBindAddr:              "127.0.0.1:0",
+		TurbineAlpenglowBlockIDHints: true,
+		TurbineRepairOnly:            true,
+		StartSlot:                    100,
+		EndSlot:                      200,
+	})
+	executedID := solana.Hash{1}
+	selectedID := solana.Hash{2}
+	bs.streamChan <- &b.Block{Slot: 150, HasAlpenglowBlockID: true, AlpenglowBlockID: executedID}
+	bs.controlPending = true
+	bs.controlChan <- blockSourceControl{
+		kind:             blockSourceControlParentIdentityMismatch,
+		waitingSlot:      151,
+		parentSlot:       150,
+		observedParentID: selectedID,
+		executedParentID: executedID,
+	}
+
+	called := false
+	bs.SetParentIdentityMismatchHandler(func(waitingSlot, parentSlot uint64, observedParentID, executedParentID solana.Hash) bool {
+		called = true
+		bs.RewindAlpenglowFork(149, solana.Hash{9}, alpenglow.BlockID{Slot: parentSlot, Hash: observedParentID})
+		bs.streamChan <- &b.Block{Slot: parentSlot, HasAlpenglowBlockID: true, AlpenglowBlockID: observedParentID}
+		return true
+	})
+
+	first := bs.NextBlock()
+	if first == nil || first.Slot != 150 || solana.Hash(first.AlpenglowBlockID) != executedID {
+		t.Fatalf("expected already-emitted block before control, got %+v", first)
+	}
+	if called {
+		t.Fatal("fork control ran before replay consumed the preceding block")
+	}
+
+	replacement := bs.NextBlock()
+	if !called {
+		t.Fatal("expected fork control to run on the NextBlock caller")
+	}
+	if replacement == nil || replacement.Slot != 150 || solana.Hash(replacement.AlpenglowBlockID) != selectedID {
+		t.Fatalf("expected replacement branch block after rewind, got %+v", replacement)
+	}
+}
+
+func TestNextBlockFailsClosedWhenParentIdentitySwitchUnavailable(t *testing.T) {
+	bs := NewBlockSource(&BlockSourceOpts{
+		SourceType:      BlockSourceTurbine,
+		TurbineBindAddr: "127.0.0.1:0",
+		StartSlot:       100,
+		EndSlot:         200,
+	})
+	bs.controlPending = true
+	bs.controlChan <- blockSourceControl{
+		kind:             blockSourceControlParentIdentityMismatch,
+		waitingSlot:      151,
+		parentSlot:       150,
+		observedParentID: solana.Hash{2},
+		executedParentID: solana.Hash{1},
+	}
+
+	if block := bs.NextBlock(); block != nil {
+		t.Fatalf("expected unavailable fork switch to stop delivery, got %+v", block)
+	}
+	if err := bs.Err(); err == nil {
+		t.Fatal("expected an explicit safety error")
+	}
+	if got := bs.StopReason(); !strings.Contains(got, "fork switch unavailable") {
+		t.Fatalf("unexpected stop reason: %s", got)
+	}
+}
+
+func TestRewindAlpenglowForkClearsSpeculativeDeliverySuffix(t *testing.T) {
+	bs := NewBlockSource(&BlockSourceOpts{
+		SourceType:                   BlockSourceTurbine,
+		TurbineBindAddr:              "127.0.0.1:0",
+		TurbineAlpenglowBlockIDHints: true,
+		TurbineRepairOnly:            true,
+		StartSlot:                    100,
+		EndSlot:                      200,
+	})
+	anchorID := solana.Hash{3}
+	targetID := solana.Hash{4}
+	bs.lastEmittedBlockSlot = 105
+	bs.lastEmittedBlockID = solana.Hash{9}
+	bs.hasLastEmittedBlockID = true
+	bs.nextSlotToSend = 106
+	bs.reorderBuffer[106] = &b.Block{Slot: 106}
+	bs.skippedSlots[107] = true
+	bs.slotState[106] = slotDone
+
+	bs.RewindAlpenglowFork(104, anchorID, alpenglow.BlockID{Slot: 106, Hash: targetID})
+
+	if bs.nextSlotToSend != 105 || bs.lastEmittedBlockSlot != 104 || bs.lastEmittedBlockID != anchorID {
+		t.Fatalf("unexpected rewound frontier: next=%d last=%d id=%s", bs.nextSlotToSend, bs.lastEmittedBlockSlot, bs.lastEmittedBlockID)
+	}
+	if len(bs.reorderBuffer) != 0 || len(bs.skippedSlots) != 0 || len(bs.slotState) != 0 {
+		t.Fatalf("speculative delivery suffix survived rewind: buffered=%d skipped=%d states=%d",
+			len(bs.reorderBuffer), len(bs.skippedSlots), len(bs.slotState))
+	}
+	if got := bs.knownAlpenglowBlockIDs[106]; got != targetID {
+		t.Fatalf("target block id = %s, want %s", got, targetID)
+	}
+}
+
 func TestCurrentSourceSnapshotUsesTurbineSourceName(t *testing.T) {
 	bs := NewBlockSource(&BlockSourceOpts{
 		SourceType:      BlockSourceTurbine,
@@ -313,7 +451,7 @@ func TestRollbackEmissionFrontierMarksSkippedRange(t *testing.T) {
 	}
 }
 
-func TestForceRPCForLightbringerParentMismatchRepairOnlyUsesHandler(t *testing.T) {
+func TestNextBlockParentMismatchRepairOnlyUsesHandler(t *testing.T) {
 	bs := NewBlockSource(&BlockSourceOpts{
 		SourceType:                   BlockSourceTurbine,
 		TurbineBindAddr:              "127.0.0.1:0",
@@ -330,6 +468,13 @@ func TestForceRPCForLightbringerParentMismatchRepairOnlyUsesHandler(t *testing.T
 		FromLightbringer: true,
 		SourceParentSlot: 6378241,
 	}
+	bs.controlPending = true
+	bs.controlChan <- blockSourceControl{
+		kind:               blockSourceControlParentMismatch,
+		waitingSlot:        6378244,
+		observedParentSlot: 6378241,
+		expectedParentSlot: 6378242,
+	}
 
 	handled := false
 	bs.SetParentMismatchHandler(func(waiting, observed, expected uint64) bool {
@@ -338,13 +483,17 @@ func TestForceRPCForLightbringerParentMismatchRepairOnlyUsesHandler(t *testing.T
 		}
 		bs.RollbackEmissionFrontier(observed, waiting-1)
 		handled = true
+		bs.streamChan <- bs.reorderBuffer[waiting]
 		return true
 	})
 
-	bs.forceRPCForLightbringerParentMismatch(6378244, 6378241, 6378242)
+	replacement := bs.NextBlock()
 
 	if !handled {
 		t.Fatalf("expected parent mismatch handler to run")
+	}
+	if replacement == nil || replacement.Slot != 6378244 {
+		t.Fatalf("expected replacement block 6378244 after rollback, got %+v", replacement)
 	}
 	if _, exists := bs.reorderBuffer[6378244]; !exists {
 		t.Fatalf("expected handler rollback to keep waiting block 6378244")
@@ -691,10 +840,10 @@ func TestPrepareTurbineHandoffAllowsLiveEdgeRunwayAtTipWithoutConsensusBuffering
 
 func TestTurbineHandoffMaxReplayGapUsesFullNearTipWindow(t *testing.T) {
 	turbine := NewBlockSource(&BlockSourceOpts{
-		SourceType:      BlockSourceTurbine,
-		TurbineBindAddr: "127.0.0.1:8001",
-		StartSlot:       100,
-		EndSlot:         200,
+		SourceType:       BlockSourceTurbine,
+		TurbineBindAddr:  "127.0.0.1:8001",
+		StartSlot:        100,
+		EndSlot:          200,
 		NearTipThreshold: 32,
 		CatchupThreshold: 64,
 	})

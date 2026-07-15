@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"path/filepath"
 
-	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/bankhash"
+	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/fees"
 	"github.com/Overclock-Validator/mithril/pkg/global"
@@ -20,19 +20,30 @@ import (
 
 // CommitLeaderInput finalizes a locally forged leader slot into AccountsDB.
 type CommitLeaderInput struct {
-	AcctsDb          *accountsdb.AccountsDb
-	SlotCtx          *sealevel.SlotCtx
-	Block            *b.Block
-	EpochSchedule    *sealevel.SysvarEpochSchedule
-	TxFeeAccumulator fees.TxFeeInfoAccumulator
+	AcctsDb                 *accountsdb.AccountsDb
+	SlotCtx                 *sealevel.SlotCtx
+	Block                   *b.Block
+	EpochSchedule           *sealevel.SysvarEpochSchedule
+	TxFeeAccumulator        fees.TxFeeInfoAccumulator
 	AlpenglowClock          bool
 	AlpenglowShredVersion   uint16
 	FooterTimestamp         int64
 	FooterProducerTimeNanos uint64
 }
 
-// CommitLeaderSlot persists forged leader execution without re-running the tx loop.
-func CommitLeaderSlot(in CommitLeaderInput) (*sealevel.SlotCtx, error) {
+// PreparedLeaderCommit is a fully executed local slot that has not yet been
+// published into replay. Publication waits until its footer/ending tick was
+// successfully broadcast and therefore its Alpenglow block ID is known.
+type PreparedLeaderCommit struct {
+	AcctsDb       *accountsdb.AccountsDb
+	SlotCtx       *sealevel.SlotCtx
+	Block         *b.Block
+	ModifiedAccts []*accounts.Account
+}
+
+// CommitLeaderSlot completes forged leader execution without making the state
+// durable or visible to replay yet.
+func CommitLeaderSlot(in CommitLeaderInput) (*PreparedLeaderCommit, error) {
 	if in.AcctsDb == nil || in.SlotCtx == nil || in.Block == nil || in.EpochSchedule == nil {
 		return nil, fmt.Errorf("missing commit input")
 	}
@@ -62,7 +73,10 @@ func CommitLeaderSlot(in CommitLeaderInput) (*sealevel.SlotCtx, error) {
 	}
 
 	if len(block.Transactions) > 0 {
-		feeDist := fees.DistributeTxFeesToSlotLeader(in.AcctsDb, slotCtx, block.Leader, &in.TxFeeAccumulator, nil)
+		loadParent := func(pk solana.PublicKey) (*accounts.Account, error) {
+			return slotCtx.GetAccountFromAccountsDb(pk)
+		}
+		feeDist := fees.DistributeTxFeesToSlotLeader(in.AcctsDb, slotCtx, block.Leader, &in.TxFeeAccumulator, loadParent)
 		slotCtx.LamportsBurnt = feeDist.LamportsBurnt
 		if !feeDist.FeeCollector.IsZero() {
 			slotCtx.RecordModifiedAcct(feeDist.FeeCollector)
@@ -98,46 +112,90 @@ func CommitLeaderSlot(in CommitLeaderInput) (*sealevel.SlotCtx, error) {
 		mlog.Log.Warnf("leader slot %d bank hash details: %v", slotCtx.Slot, err)
 	}
 
-	commitSlot.Store(slotCtx.Slot)
-	commitInProgress.Store(true)
-	persistedSlot := slotCtx.Slot
-	persistedBankhash := append([]byte(nil), slotCtx.FinalBankhash...)
-	stakeIndexDir := filepath.Join(in.AcctsDb.AcctsDir, "..")
-
-	var storeErr error
-	afterStoreAccounts := func() {
-		if err := in.AcctsDb.StoreBankHashForSlot(persistedSlot, persistedBankhash); err != nil {
-			mlog.Log.Infof("unable to store bankhash for leader slot %d: %v", persistedSlot, err)
-		}
-		if flushed, err := global.FlushPendingStakePubkeys(stakeIndexDir); err != nil {
-			mlog.Log.Errorf("failed to flush stake pubkey index: %v", err)
-		} else if flushed > 0 {
-			mlog.Log.Debugf("flushed %d new stake pubkeys to index", flushed)
-		}
-		commitInProgress.Store(false)
-		commitSlot.Store(0)
-	}
-
-	if len(modifiedAccts) > 0 {
-		storeErr = in.AcctsDb.StoreAccounts(modifiedAccts, slotCtx.Slot, afterStoreAccounts)
-	} else {
-		afterStoreAccounts()
-	}
-	if storeErr != nil {
-		commitInProgress.Store(false)
-		commitSlot.Store(0)
-		return nil, storeErr
-	}
-
 	slotCtx.Blockhash = block.Blockhash
 	slotCtx.NumSignatures = block.NumSignatures
+	return &PreparedLeaderCommit{
+		AcctsDb:       in.AcctsDb,
+		SlotCtx:       slotCtx,
+		Block:         block,
+		ModifiedAccts: modifiedAccts,
+	}, nil
+}
+
+// FinalizeLeaderCommit publishes a locally produced block into the same
+// speculative/finality path as a turbine-received block. Legacy modes retain
+// the direct StoreAccounts behavior.
+func FinalizeLeaderCommit(prepared *PreparedLeaderCommit, blockID solana.Hash) error {
+	if prepared == nil || prepared.AcctsDb == nil || prepared.SlotCtx == nil || prepared.Block == nil {
+		return fmt.Errorf("incomplete prepared leader commit")
+	}
+	slotCtx := prepared.SlotCtx
+	block := prepared.Block
+	block.HasAlpenglowBlockID = blockID != (solana.Hash{})
+	block.AlpenglowBlockID = blockID
+	chainedRoot, hasChainedRoot := global.AlpenglowChainedMerkleRoot(block.Slot)
+	block.HasAlpenglowLastChainedRoot = hasChainedRoot
+	block.AlpenglowLastChainedRoot = chainedRoot
+
+	if prepared.AcctsDb.RootedDurable {
+		if !block.HasAlpenglowBlockID {
+			return fmt.Errorf("leader slot %d has no Alpenglow block ID", block.Slot)
+		}
+		if !block.HasAlpenglowLastChainedRoot {
+			return fmt.Errorf("leader slot %d has no Alpenglow chained root", block.Slot)
+		}
+		if err := stageActiveSpeculativeCommit(&DeferredBlockCommit{
+			SlotCtx:                 slotCtx,
+			ModifiedAccts:           prepared.ModifiedAccts,
+			BlockSlot:               block.Slot,
+			BlockHeight:             block.BlockHeight,
+			Bankhash:                append([]byte(nil), slotCtx.FinalBankhash...),
+			HasAlpenglowBlockID:     true,
+			AlpenglowBlockID:        blockID,
+			HasAlpenglowChainedRoot: true,
+			AlpenglowChainedRoot:    chainedRoot,
+		}); err != nil {
+			return fmt.Errorf("stage local leader slot %d: %w", block.Slot, err)
+		}
+	} else {
+		commitSlot.Store(slotCtx.Slot)
+		commitInProgress.Store(true)
+		persistedBankhash := append([]byte(nil), slotCtx.FinalBankhash...)
+		stakeIndexDir := filepath.Join(prepared.AcctsDb.AcctsDir, "..")
+		afterStoreAccounts := func() {
+			if err := prepared.AcctsDb.StoreBankHashForSlot(slotCtx.Slot, persistedBankhash); err != nil {
+				mlog.Log.Infof("unable to store bankhash for leader slot %d: %v", slotCtx.Slot, err)
+			}
+			if flushed, err := global.FlushPendingStakePubkeys(stakeIndexDir); err != nil {
+				mlog.Log.Errorf("failed to flush stake pubkey index: %v", err)
+			} else if flushed > 0 {
+				mlog.Log.Debugf("flushed %d new stake pubkeys to index", flushed)
+			}
+			commitInProgress.Store(false)
+			commitSlot.Store(0)
+		}
+		if len(prepared.ModifiedAccts) > 0 {
+			if err := prepared.AcctsDb.StoreAccounts(prepared.ModifiedAccts, slotCtx.Slot, afterStoreAccounts); err != nil {
+				commitInProgress.Store(false)
+				commitSlot.Store(0)
+				return err
+			}
+		} else {
+			afterStoreAccounts()
+		}
+	}
+
 	global.IncrTransactionCount(uint64(len(block.Transactions)))
 	global.SetSlot(block.Slot)
 	global.SetEpoch(block.Epoch)
 	global.SetLatestBlockHash(block.Blockhash)
 	global.SetBlockHeight(block.BlockHeight)
-	RegisterLocalLeaderCommit(slotCtx)
-	return slotCtx, nil
+	RegisterLocalLeaderCommitDetails(LocalLeaderCommit{
+		SlotCtx:       slotCtx,
+		Block:         block,
+		ModifiedAccts: prepared.ModifiedAccts,
+	})
+	return nil
 }
 
 func footerProducerTimeNanosPtr(nanos uint64) *uint64 {
@@ -192,7 +250,7 @@ func applyAlpenglowFooterClock(slotCtx *sealevel.SlotCtx, block *b.Block, epochS
 }
 
 func updateLeaderSysvars(acctsDb *accountsdb.AccountsDb, slotCtx *sealevel.SlotCtx, block *b.Block, epochSchedule *sealevel.SysvarEpochSchedule, alpenglowClock bool, footerTimestamp int64) error {
-	clockAcct, err := acctsDb.GetAccount(block.Slot, sealevel.SysvarClockAddr)
+	clockAcct, err := slotCtx.GetAccountFromAccountsDb(sealevel.SysvarClockAddr)
 	if err != nil {
 		return fmt.Errorf("load clock sysvar: %w", err)
 	}
@@ -224,7 +282,7 @@ func updateLeaderSysvars(acctsDb *accountsdb.AccountsDb, slotCtx *sealevel.SlotC
 	sealevel.SysvarCache.Clock.Sysvar = &clock
 	sealevel.SysvarCache.Clock.Acct = clockAcct
 
-	slotHashesAcct, err := acctsDb.GetAccount(block.Slot, sealevel.SysvarSlotHashesAddr)
+	slotHashesAcct, err := slotCtx.GetAccountFromAccountsDb(sealevel.SysvarSlotHashesAddr)
 	if err != nil {
 		return fmt.Errorf("load slothashes sysvar: %w", err)
 	}
@@ -248,7 +306,7 @@ func updateLeaderSysvars(acctsDb *accountsdb.AccountsDb, slotCtx *sealevel.SlotC
 		return fmt.Errorf("leader commit: entry blockhash missing for slot %d", block.Slot)
 	}
 
-	recentAcct, err := acctsDb.GetAccount(block.Slot, sealevel.SysvarRecentBlockHashesAddr)
+	recentAcct, err := slotCtx.GetAccountFromAccountsDb(sealevel.SysvarRecentBlockHashesAddr)
 	if err != nil {
 		return fmt.Errorf("load recent blockhashes sysvar: %w", err)
 	}
@@ -266,7 +324,7 @@ func updateLeaderSysvars(acctsDb *accountsdb.AccountsDb, slotCtx *sealevel.SlotC
 	sealevel.SysvarCache.RecentBlockHashes.Sysvar = &recent
 	sealevel.SysvarCache.RecentBlockHashes.Acct = recentAcct
 
-	slotHistoryAcct, err := acctsDb.GetAccount(block.Slot, sealevel.SysvarSlotHistoryAddr)
+	slotHistoryAcct, err := slotCtx.GetAccountFromAccountsDb(sealevel.SysvarSlotHistoryAddr)
 	if err != nil {
 		return fmt.Errorf("load slot history sysvar: %w", err)
 	}
@@ -320,7 +378,13 @@ func ensureParentAcctsForModified(acctsDb *accountsdb.AccountsDb, slotCtx *seale
 		if _, err := slotCtx.GetParentAccount(pk); err == nil {
 			continue
 		}
-		acct, err := loadAccountForBlockReplay(acctsDb, spec, slotCtx.ParentSlot, slotCtx.Slot, pk)
+		var acct *accounts.Account
+		var err error
+		if spec != nil {
+			acct, err = loadAccountForBlockReplay(acctsDb, spec, slotCtx.ParentSlot, slotCtx.Slot, pk)
+		} else {
+			acct, err = slotCtx.GetAccountFromAccountsDb(pk)
+		}
 		if err != nil {
 			return fmt.Errorf("load parent acct %s for slot %d: %w", pk, slotCtx.Slot, err)
 		}

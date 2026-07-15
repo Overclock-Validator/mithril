@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"runtime/debug"
 	"runtime/pprof"
@@ -32,7 +34,6 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
 	"github.com/Overclock-Validator/mithril/pkg/lightbringer"
-	"github.com/Overclock-Validator/mithril/pkg/lthash"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/progress"
 	"github.com/Overclock-Validator/mithril/pkg/replay"
@@ -1053,6 +1054,8 @@ func runLive(c *cobra.Command, args []string) {
 	var accountsDb *accountsdb.AccountsDb
 	var manifest *snapshot.SnapshotManifest
 	var mithrilState *state.MithrilState
+	var foldRecovery accountsdb.RecoveryResult
+	var foldRecovered bool
 	// Use configured snapshot directory (storage.snapshots / snapshot.download_path), not scratch
 	snapshotDownloadPath := snapshotDlPath
 
@@ -1155,6 +1158,17 @@ func runLive(c *cobra.Command, args []string) {
 			klog.Fatalf("failed to load manifest: %v", err)
 		}
 		refreshManifestSeedFromManifest(accountsPath, mithrilState, manifest)
+		foldRecovery = mustRecoverFoldState(accountsDb)
+		foldRecovered = true
+		if mithrilState != nil {
+			if changed, err := reconcileFoldRecovery(mithrilState, foldRecovery); err != nil {
+				klog.Fatalf("fold recovery reconcile: %v", err)
+			} else if changed {
+				if err := mithrilState.Save(accountsPath); err != nil {
+					klog.Fatalf("save recovered fold state: %v", err)
+				}
+			}
+		}
 		// Run integrity check if we have a state file (warn only, don't fail - user chose force mode)
 		if hasValidState {
 			if err := mithrilState.ValidateAgainstBankhashDB(accountsDb); err != nil {
@@ -1343,6 +1357,15 @@ func runLive(c *cobra.Command, args []string) {
 				klog.Fatalf("failed to load manifest: %v", err)
 			}
 			refreshManifestSeedFromManifest(accountsPath, mithrilState, manifest)
+			foldRecovery = mustRecoverFoldState(accountsDb)
+			foldRecovered = true
+			if changed, err := reconcileFoldRecovery(mithrilState, foldRecovery); err != nil {
+				klog.Fatalf("fold recovery reconcile: %v", err)
+			} else if changed {
+				if err := mithrilState.Save(accountsPath); err != nil {
+					klog.Fatalf("save recovered fold state: %v", err)
+				}
+			}
 
 			// Validate state file matches AccountsDB (detect Ctrl+Z / kill -9 corruption)
 			if err := mithrilState.ValidateAgainstBankhashDB(accountsDb); err != nil {
@@ -1432,6 +1455,19 @@ func runLive(c *cobra.Command, args []string) {
 	}
 
 postBootstrap:
+	if !foldRecovered {
+		foldRecovery = mustRecoverFoldState(accountsDb)
+		foldRecovered = true
+		if mithrilState != nil {
+			if changed, err := reconcileFoldRecovery(mithrilState, foldRecovery); err != nil {
+				klog.Fatalf("fold recovery reconcile: %v", err)
+			} else if changed {
+				if err := mithrilState.Save(accountsPath); err != nil {
+					klog.Fatalf("save recovered fold state: %v", err)
+				}
+			}
+		}
+	}
 	// Determine start slot from state file or manifest
 	var snapshotBaseSlot = manifest.Bank.Slot
 	startSlot := int64(manifest.Bank.Slot + 1)
@@ -1441,6 +1477,8 @@ postBootstrap:
 			mlog.Log.Infof("state file snapshot_slot (%d) doesn't match manifest (%d), ignoring state file",
 				mithrilState.SnapshotSlot, manifest.Bank.Slot)
 			mithrilState = nil
+		} else if mithrilState.LastRootedContext != nil {
+			startSlot = int64(mithrilState.GetResumeSlot())
 		} else if mithrilState.LastSlot > 0 {
 			// Validate last_slot is reasonable
 			if mithrilState.LastSlot < manifest.Bank.Slot {
@@ -1455,77 +1493,21 @@ postBootstrap:
 
 	// Create ResumeState if we have resume context from state file
 	var resumeState *replay.ResumeState
-	if mithrilState != nil && mithrilState.HasResumeData() {
-		// Decode parent bankhash
-		parentBankhash, err := base58.Decode(mithrilState.LastBankhash)
+	if mithrilState != nil && mithrilState.LastRootedContext != nil {
+		resumeState, err = replay.ResumeStateFromRootedContext(mithrilState.LastRootedContext, mithrilState.ComputedEpochStakes)
 		if err != nil {
-			mlog.Log.Errorf("failed to decode last_bankhash from state file: %v", err)
-			mlog.Log.Infof("will start fresh from snapshot")
-			mithrilState = nil
-		} else {
-			// Decode AcctsLtHash
-			ltHashBytes, err := base64.StdEncoding.DecodeString(mithrilState.LastAcctsLtHash)
-			if err != nil {
-				mlog.Log.Errorf("failed to decode accts_lt_hash from state file: %v", err)
-				mlog.Log.Infof("will start fresh from snapshot")
-				mithrilState = nil
-			} else {
-				ltHash := &lthash.LtHash{}
-				ltHash.InitWithHash(ltHashBytes)
-
-				resumeState = &replay.ResumeState{
-					ParentSlot:               mithrilState.LastSlot,
-					ParentBlockHeight:        mithrilState.LastBlockHeight,
-					ParentBankhash:           parentBankhash,
-					AcctsLtHash:              ltHash,
-					LamportsPerSignature:     mithrilState.LastLamportsPerSignature,
-					PrevLamportsPerSignature: mithrilState.LastPrevLamportsPerSig,
-					NumSignatures:            mithrilState.LastNumSignatures,
-					// ReplayCtx fields
-					Capitalization:          mithrilState.LastCapitalization,
-					SlotsPerYear:            mithrilState.LastSlotsPerYear,
-					InflationInitial:        mithrilState.LastInflationInitial,
-					InflationTerminal:       mithrilState.LastInflationTerminal,
-					InflationTaper:          mithrilState.LastInflationTaper,
-					InflationFoundation:     mithrilState.LastInflationFoundation,
-					InflationFoundationTerm: mithrilState.LastInflationFoundationTerm,
-				}
-
-				// Decode blockhash context
-				if mithrilState.LastRecentBlockhashes != nil && len(mithrilState.LastRecentBlockhashes) > 0 {
-					recentBlockhashes := decodeRecentBlockhashes(mithrilState.LastRecentBlockhashes)
-					resumeState.RecentBlockhashes = &recentBlockhashes
-
-					if mithrilState.LastEvictedBlockhash != "" {
-						evictedBytes, err := base58.Decode(mithrilState.LastEvictedBlockhash)
-						if err == nil && len(evictedBytes) == 32 {
-							copy(resumeState.EvictedBlockhash[:], evictedBytes)
-						}
-					}
-
-					if mithrilState.LastBlockhash != "" {
-						lastBhBytes, err := base58.Decode(mithrilState.LastBlockhash)
-						if err == nil && len(lastBhBytes) == 32 {
-							copy(resumeState.LastBlockhash[:], lastBhBytes)
-						}
-					}
-				}
-
-				// Decode SlotHashes context (vote program needs accurate slot→hash mappings)
-				if mithrilState.LastSlotHashes != nil && len(mithrilState.LastSlotHashes) > 0 {
-					slotHashes := decodeSlotHashes(mithrilState.LastSlotHashes)
-					resumeState.SlotHashes = &slotHashes
-				}
-
-				// Load persisted epoch stakes - required for correct leader schedule
-				if mithrilState.ComputedEpochStakes != nil && len(mithrilState.ComputedEpochStakes) > 0 {
-					resumeState.ComputedEpochStakes = make(map[uint64][]byte, len(mithrilState.ComputedEpochStakes))
-					for epoch, data := range mithrilState.ComputedEpochStakes {
-						resumeState.ComputedEpochStakes[epoch] = []byte(data)
-					}
-				}
-			}
+			klog.Fatalf("build rooted resume state at slot %d: %v", mithrilState.LastRootedSlot, err)
 		}
+		mlog.Log.Infof("rooted-durable resume: continuing from finalized slot %d", mithrilState.LastRootedSlot)
+	} else if mithrilState != nil && mithrilState.LastSlot > 0 {
+		resumeState, err = replay.ResumeStateFromCheckpoint(mithrilState)
+		if err != nil {
+			klog.Fatalf("invalid resume checkpoint at slot %d: %v", mithrilState.LastSlot, err)
+		}
+	}
+	if resumeState != nil && resumeState.HasAlpenglowIdentity {
+		global.SetAlpenglowBlockID(resumeState.ParentSlot, resumeState.AlpenglowBlockID)
+		global.SetAlpenglowChainedMerkleRoot(resumeState.ParentSlot, resumeState.AlpenglowChainedRoot)
 	}
 
 	if mithrilState == nil {
@@ -1555,6 +1537,20 @@ postBootstrap:
 		mlog.Log.Infof("finite replay: startSlot=%d endSlot=%d", startSlot, liveEndSlot)
 	}
 	accountsDb.InitCaches()
+	rootedDurableMode := useTurbine && strings.TrimSpace(alpenglowObserverBindAddr) != ""
+	if rootedDurableMode {
+		accountsDb.RootedDurable = true
+		if configured := config.GetInt("storage.fold_batch_slots"); configured > 0 {
+			replay.FoldBatchSlots = min(max(configured, 32), 512)
+			if replay.FoldBatchSlots != configured {
+				mlog.Log.Warnf("storage.fold_batch_slots=%d clamped to %d (allowed range 32..512)",
+					configured, replay.FoldBatchSlots)
+			}
+		}
+	}
+	if enableBlockProduction && !rootedDurableMode {
+		klog.Fatalf("Alpenglow block production requires turbine plus consensus.alpenglow_observer_bind_addr so local slots use verified fork choice and rooted-durable state")
+	}
 
 	// Write replay timings to run-specific log directory
 	replayTimingsPath := filepath.Join(mlog.GetLogDir(), "replay_timings.jsonl")
@@ -1641,16 +1637,13 @@ postBootstrap:
 		if err := engine.Start(ctx); err != nil {
 			klog.Fatalf("start consensus engine: %v", err)
 		}
-		if publisher, ok := engine.(consensusengine.AlpenglowBlockIDPublisher); ok {
-			publisher.SetAlpenglowBlockIDSink(global.SetAlpenglowBlockID)
-		}
 		if epochSink, ok := engine.(consensusengine.AlpenglowEpochLookupSink); ok {
 			if schedule := epochScheduleFromState(mithrilState); schedule != nil {
 				epochSink.SetAlpenglowEpochLookup(schedule.GetEpoch)
 			}
 		}
 		if rootSink, ok := engine.(consensusengine.AlpenglowRootSink); ok && mithrilState != nil {
-			rootSlot := mithrilState.GetCurrentSlot()
+			rootSlot := mithrilState.DurableHighWater()
 			rootBlock := alpenglow.BlockID{Slot: rootSlot}
 			if blockID, exists := global.AlpenglowBlockID(rootSlot); exists {
 				rootBlock.Hash = blockID
@@ -1761,11 +1754,7 @@ postBootstrap:
 			ShredVersion:   uint16(turbineShredVersion),
 			EpochSchedule:  epochScheduleFromState(mithrilState),
 			AlpenglowClock: useTurbine,
-			ParentContext: func(slot uint64) blockprod.ParentContext {
-				parentSlot := slot
-				if slot > 0 {
-					parentSlot = slot - 1
-				}
+			ParentContext: func(slot, parentSlot uint64) blockprod.ParentContext {
 				chainTip := replay.ChainTipParentContext()
 				// Prefer the parent slot's fully-populated derived fee rate governor carried
 				// through the chain tip; a partial fallback (zeroed Target* fields) would derive
@@ -1785,10 +1774,16 @@ postBootstrap:
 					Features:            chainTip.Features,
 					ParentLastEntryHash: chainTip.LastEntryHash,
 				}
-				if bh, err := accountsDb.GetBankHashForSlot(parentSlot); err == nil && len(bh) == 32 {
-					copy(ctx.ParentBankhash[:], bh)
+				if bankhash, ok := replay.ResolveActiveBankhash(accountsDb, parentSlot); ok {
+					ctx.ParentBankhash = bankhash
 				}
 				return ctx
+			},
+			ProductionParent: func(slot uint64) alpenglow.BlockProductionParent {
+				if source, ok := alpenglowConsensusEngine.(consensusengine.AlpenglowParentSource); ok {
+					return source.AlpenglowBlockProductionParent(slot)
+				}
+				return alpenglow.BlockProductionParent{Kind: alpenglow.BlockProductionParentNotReady}
 			},
 			CurrentSlot:   global.WallClockSlot,
 			LeaderForSlot: global.LeaderForSlot,
@@ -2760,6 +2755,98 @@ func createBufWriter(filename string) (io.Writer, func(), error) {
 	}
 
 	return writer, cleanup, nil
+}
+
+// mustRecoverFoldState derives the durable frontier from manifests and repairs
+// any decided index tail before state-file integrity checks inspect it.
+func mustRecoverFoldState(accountsDb *accountsdb.AccountsDb) accountsdb.RecoveryResult {
+	recovered, err := accountsDb.RecoverFoldState()
+	if err != nil {
+		klog.Fatalf("fold recovery failed: %v", err)
+	}
+	if recovered.RewindInProgress {
+		mlog.Log.Warnf("fold recovery found an interrupted durable rewind; adopting the store's last complete batch boundary")
+	}
+	if len(recovered.ReplayedBatches) > 0 {
+		mlog.Log.Infof("fold recovery completed %d decided batch(es) from manifests", len(recovered.ReplayedBatches))
+	}
+	if len(recovered.OrphansRemoved) > 0 {
+		mlog.Log.Infof("fold recovery removed %d undecided orphan file(s)", len(recovered.OrphansRemoved))
+	}
+	return recovered
+}
+
+// reconcileFoldRecovery makes the store-derived watermark authoritative. A
+// store ahead of the state file is the normal hard-crash case; a store behind
+// an already-recorded rooted watermark is data loss and fails closed.
+func reconcileFoldRecovery(s *state.MithrilState, recovered accountsdb.RecoveryResult) (bool, error) {
+	if s == nil {
+		return false, nil
+	}
+	if recovered.DurableThrough == 0 {
+		if s.LastRootedSlot > 0 {
+			return false, fmt.Errorf("state records rooted slot %d but the store has no durable fold watermark", s.LastRootedSlot)
+		}
+		return false, nil
+	}
+	if recovered.DurableThrough < s.LastRootedSlot && !recovered.RewindInProgress {
+		return false, fmt.Errorf("durable store ends at slot %d behind state rooted slot %d", recovered.DurableThrough, s.LastRootedSlot)
+	}
+	if len(recovered.ResumeCtx) == 0 {
+		return false, fmt.Errorf("durable store reaches slot %d but its fold manifest has no resume context", recovered.DurableThrough)
+	}
+	var resume state.ResumeContext
+	if err := json.Unmarshal(recovered.ResumeCtx, &resume); err != nil {
+		return false, fmt.Errorf("decode fold resume context at slot %d: %w", recovered.DurableThrough, err)
+	}
+	if resume.Slot != recovered.DurableThrough {
+		return false, fmt.Errorf("fold resume context names slot %d, want %d", resume.Slot, recovered.DurableThrough)
+	}
+	var zero [32]byte
+	if recovered.RootedBankhash != zero && resume.Bankhash != base58.Encode(recovered.RootedBankhash[:]) {
+		return false, fmt.Errorf("fold resume bankhash does not match manifest bankhash at slot %d", recovered.DurableThrough)
+	}
+	if recovered.DurableThrough == s.LastRootedSlot && s.LastRootedContext != nil {
+		if s.LastRootedContext.Slot != recovered.DurableThrough {
+			return false, fmt.Errorf("rooted context names slot %d, want %d", s.LastRootedContext.Slot, recovered.DurableThrough)
+		}
+		if recovered.RootedBankhash != zero {
+			recoveredBankhash := base58.Encode(recovered.RootedBankhash[:])
+			if s.LastRootedContext.Bankhash != recoveredBankhash {
+				return false, fmt.Errorf("state rooted bankhash does not match durable manifest at slot %d", recovered.DurableThrough)
+			}
+		}
+	}
+	changed := s.LastRootedSlot != recovered.DurableThrough ||
+		s.LastSlot != recovered.DurableThrough ||
+		s.LastRootedBankhash != resume.Bankhash ||
+		s.LastBankhash != resume.Bankhash ||
+		s.LastBlockHeight != resume.BlockHeight ||
+		s.LastEpoch != resume.Epoch ||
+		(len(resume.ComputedEpochStakes) != 0 && !reflect.DeepEqual(s.ComputedEpochStakes, resume.ComputedEpochStakes)) ||
+		(len(resume.EpochAuthorizedVoters) != 0 && !reflect.DeepEqual(s.ManifestEpochAuthorizedVoters, resume.EpochAuthorizedVoters)) ||
+		!reflect.DeepEqual(s.LastRootedContext, &resume)
+	s.LastRootedSlot = recovered.DurableThrough
+	s.LastRootedBankhash = resume.Bankhash
+	s.LastRootedContext = &resume
+	// The speculative suffix is process-local and disappeared in the crash.
+	s.LastSlot = recovered.DurableThrough
+	s.LastBankhash = resume.Bankhash
+	s.LastBlockHeight = resume.BlockHeight
+	s.LastEpoch = resume.Epoch
+	if len(resume.ComputedEpochStakes) != 0 {
+		s.ComputedEpochStakes = make(map[uint64]string, len(resume.ComputedEpochStakes))
+		for epoch, encoded := range resume.ComputedEpochStakes {
+			s.ComputedEpochStakes[epoch] = encoded
+		}
+	}
+	if len(resume.EpochAuthorizedVoters) != 0 {
+		s.ManifestEpochAuthorizedVoters = make(map[string][]string, len(resume.EpochAuthorizedVoters))
+		for voteAcct, authorized := range resume.EpochAuthorizedVoters {
+			s.ManifestEpochAuthorizedVoters[voteAcct] = append([]string(nil), authorized...)
+		}
+	}
+	return changed, nil
 }
 
 // runReplayWithRecovery wraps replay.ReplayBlocks with panic recovery.

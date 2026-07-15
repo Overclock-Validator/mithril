@@ -4,11 +4,61 @@ import (
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/alpenglow"
+	"github.com/Overclock-Validator/mithril/pkg/base58"
 	b "github.com/Overclock-Validator/mithril/pkg/block"
+	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/lthash"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
+	"github.com/Overclock-Validator/mithril/pkg/state"
 	"github.com/gagliardetto/solana-go"
 )
+
+func TestActiveExecutedIdentityDoesNotUseObservedCandidateFallback(t *testing.T) {
+	const slot = uint64(9_000_000_001)
+	global.SetAlpenglowBlockID(slot, solana.Hash{1})
+	global.SetAlpenglowChainedMerkleRoot(slot, solana.Hash{2})
+
+	sr := NewSpeculativeReplay()
+	sr.Enable()
+	cleanup := publishActiveSpeculativeReplay(sr)
+	defer cleanup()
+
+	if _, _, ok := ResolveActiveAlpenglowIdentity(slot); ok {
+		t.Fatal("active executed identity resolved an observed but unexecuted candidate")
+	}
+}
+
+func TestSeedFromManifestUsesPoHLastBlockhash(t *testing.T) {
+	lastHash := solana.Hash{7}
+	sr := NewSpeculativeReplay()
+	sr.Enable()
+	sr.SeedFromManifest(&state.MithrilState{
+		ManifestParentSlot:    41,
+		ManifestLastBlockhash: base58.Encode(lastHash[:]),
+		SnapshotEpoch:         7,
+	}, &ReplayCtx{})
+
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	if sr.headSnapshot == nil || solana.Hash(sr.headSnapshot.Blockhash) != lastHash {
+		t.Fatalf("manifest PoH blockhash was not installed: %+v", sr.headSnapshot)
+	}
+	if sr.headSnapshot.Epoch != 7 {
+		t.Fatalf("manifest parent epoch = %d, want 7", sr.headSnapshot.Epoch)
+	}
+}
+
+func TestSeedFromResumeRetainsDurableParentEpoch(t *testing.T) {
+	sr := NewSpeculativeReplay()
+	sr.Enable()
+	sr.SeedFromResume(&ResumeState{ParentSlot: 41, ParentEpoch: 7}, &ReplayCtx{})
+
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	if sr.headSnapshot == nil || sr.headSnapshot.Epoch != 7 {
+		t.Fatalf("resume parent epoch was not retained: %+v", sr.headSnapshot)
+	}
+}
 
 func TestAlpenglowCertConfirmsPersist(t *testing.T) {
 	if !alpenglowCertConfirmsPersist(alpenglow.CertificateFinalizeFast) {
@@ -25,11 +75,11 @@ func TestAlpenglowCertConfirmsPersist(t *testing.T) {
 func TestCaptureHeadSnapshotRoundTrip(t *testing.T) {
 	replayCtx := &ReplayCtx{Capitalization: 123}
 	slotCtx := &sealevel.SlotCtx{
-		Slot:           6404034,
-		ParentSlot:     6404033,
-		FinalBankhash:  []byte{1, 2, 3},
-		Blockhash:      [32]byte{9},
-		NumSignatures:  42,
+		Slot:            6404034,
+		ParentSlot:      6404033,
+		FinalBankhash:   []byte{1, 2, 3},
+		Blockhash:       [32]byte{9},
+		NumSignatures:   42,
 		AcctsLtHash:     &lthash.LtHash{},
 		FeeRateGovernor: &sealevel.FeeRateGovernor{LamportsPerSignature: 5000},
 	}

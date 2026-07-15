@@ -12,6 +12,10 @@ import (
 
 const numElements = 1024
 
+// HashByteLen is the serialized size of an LtHash accumulator. LtHash is a
+// homomorphic 1024-element uint16 vector, not a conventional 32-byte digest.
+const HashByteLen = numElements * 2
+
 type LtHash struct {
 	value [numElements]uint16
 }
@@ -34,7 +38,7 @@ func (ltHash *LtHash) calculateAcctHash(acct *accounts.Account) []byte {
 	_, _ = hasher.Write(acct.Owner[:])
 	_, _ = hasher.Write(acct.Key[:])
 
-	var data [2048]byte
+	var data [HashByteLen]byte
 	digest := hasher.Digest()
 	digest.Read(data[:])
 
@@ -58,7 +62,7 @@ func (ltHash *LtHash) InitWithBytes(data []byte) *LtHash {
 	hasher := blake3.New()
 	hasher.Write(data)
 
-	var output [2048]byte
+	var output [HashByteLen]byte
 	digest := hasher.Digest()
 	digest.Read(output[:])
 
@@ -71,7 +75,7 @@ func (ltHash *LtHash) InitWithBytes(data []byte) *LtHash {
 }
 
 func (ltHash *LtHash) InitWithHash(data []byte) *LtHash {
-	if len(data) != numElements*2 {
+	if len(data) != HashByteLen {
 		panic(fmt.Sprintf("wrong len of input data (%d)", len(data)))
 	}
 

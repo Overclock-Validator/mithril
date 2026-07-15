@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"fmt"
 
-	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/base58"
+	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 )
@@ -26,8 +26,13 @@ func requireAlpenglowBlockFooter(block *b.Block, slotCtx *sealevel.SlotCtx, alpe
 // verifyAlpenglowBlockFooter enforces footer presence on Alpenglow turbine blocks and
 // compares the footer bank hash to the locally computed hash when present.
 func verifyAlpenglowBlockFooter(slotCtx *sealevel.SlotCtx, block *b.Block, alpenglowClock bool) error {
-	if requireAlpenglowBlockFooter(block, slotCtx, alpenglowClock) && !block.HasAlpenglowFooter {
-		return fmt.Errorf("slot %d missing block footer", block.Slot)
+	if requireAlpenglowBlockFooter(block, slotCtx, alpenglowClock) {
+		if !block.HasAlpenglowFooter {
+			return fmt.Errorf("slot %d missing block footer", block.Slot)
+		}
+		if !block.HasExpectedBankhash {
+			return fmt.Errorf("slot %d block footer has no bank hash", block.Slot)
+		}
 	}
 	return verifyFooterBankHash(slotCtx, block)
 }

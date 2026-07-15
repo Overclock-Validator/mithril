@@ -232,10 +232,6 @@ func (bs *BlockSource) applyAlpenglowDecisionLocked() bool {
 	if bs.alpenglowDecisionSource == nil || bs.sourceType != BlockSourceTurbine || !bs.turbineAlpenglowBlockIDHints {
 		return false
 	}
-	if !bs.lightbringerActive.Load() || !bs.isNearTip.Load() {
-		return false
-	}
-
 	waitingSlot := bs.nextSlotToSend
 	if waitingSlot == 0 {
 		return false

@@ -99,9 +99,60 @@ func TestSpeculativeStorePruneLayersAbove(t *testing.T) {
 	store.layers[101] = &SpeculativeLayer{Slot: 101, ParentSlot: 100}
 	store.layers[102] = &SpeculativeLayer{Slot: 102, ParentSlot: 101}
 	store.layers[103] = &SpeculativeLayer{Slot: 103, ParentSlot: 102}
+	store.order = []uint64{101, 102, 103}
 
 	store.PruneLayersAbove(101)
 	if len(store.layers) != 1 || store.layers[101] == nil {
 		t.Fatalf("expected only layer 101 to remain, got %d layers", len(store.layers))
+	}
+}
+
+func TestSpeculativeStoreFlatLookupAndUndo(t *testing.T) {
+	store := newSpeculativeStore()
+	store.SetFinalizedSlot(100)
+	pkA := solana.PublicKey{1}
+	pkB := solana.PublicKey{2}
+	recordSpeculativeLayer(t, store, 101, 100, &accounts.Account{Key: pkA, Lamports: 11})
+	recordSpeculativeLayer(t, store, 102, 101,
+		&accounts.Account{Key: pkA, Lamports: 22},
+		&accounts.Account{Key: pkB, Lamports: 33},
+	)
+
+	acct, err := store.Resolve(102, pkA, nil)
+	if err != nil || acct.Lamports != 22 {
+		t.Fatalf("flat resolve = %+v, %v", acct, err)
+	}
+	store.PruneLayersAbove(101)
+	acct, err = store.Resolve(101, pkA, nil)
+	if err != nil || acct.Lamports != 11 {
+		t.Fatalf("resolve after unwind = %+v, %v", acct, err)
+	}
+	if err := store.CheckInvariants(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSpeculativeStorePromotionRebasesSurvivingUndo(t *testing.T) {
+	store := newSpeculativeStore()
+	store.SetFinalizedSlot(100)
+	pk := solana.PublicKey{1}
+	recordSpeculativeLayer(t, store, 101, 100, &accounts.Account{Key: pk, Lamports: 11})
+	recordSpeculativeLayer(t, store, 102, 101, &accounts.Account{Key: pk, Lamports: 22})
+	store.SetFinalizedSlot(101)
+	store.PruneLayersThrough(101)
+	if err := store.CheckInvariants(); err != nil {
+		t.Fatal(err)
+	}
+	store.PruneLayersAbove(101)
+	if len(store.flat) != 0 || len(store.layers) != 0 {
+		t.Fatalf("unwind after promotion left flat=%d layers=%d", len(store.flat), len(store.layers))
+	}
+}
+
+func recordSpeculativeLayer(t *testing.T, store *SpeculativeStore, slot, parent uint64, accts ...*accounts.Account) {
+	t.Helper()
+	ctx := &sealevel.SlotCtx{Slot: slot, ParentSlot: parent, AcctMapsMu: new(sync.Mutex)}
+	if err := store.RecordLayer(slot, parent, ctx, accts); err != nil {
+		t.Fatalf("record layer %d: %v", slot, err)
 	}
 }

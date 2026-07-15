@@ -52,12 +52,14 @@ func TestLeaderLoopActivatesAndFinishesSlot(t *testing.T) {
 			}
 			return solana.PublicKey{}, false
 		},
-		ParentContext: func(uint64) ParentContext {
+		ParentContext: func(uint64, uint64) ParentContext {
 			return ParentContext{ParentBankhash: solana.Hash{1}}
 		},
-		ParentBlockID: func(uint64) (solana.Hash, bool) { return solana.Hash{1}, true },
-		BankHash:      DefaultBankHash,
-		PollInterval:  5 * time.Millisecond,
+		ParentBlockID: func(slot uint64) (solana.Hash, bool) {
+			return global.AlpenglowBlockID(slot - 1)
+		},
+		BankHash:     DefaultBankHash,
+		PollInterval: 5 * time.Millisecond,
 	})
 
 	stop := make(chan struct{})
@@ -92,7 +94,7 @@ func TestLeaderLoopProducesMissedLeaderSlotAfterWallClockPasses(t *testing.T) {
 			}
 			return solana.PublicKey{}, false
 		},
-		ParentContext: func(uint64) ParentContext {
+		ParentContext: func(uint64, uint64) ParentContext {
 			return ParentContext{ParentBankhash: solana.Hash{1}}
 		},
 		ParentBlockID: func(uint64) (solana.Hash, bool) { return solana.Hash{1}, true },

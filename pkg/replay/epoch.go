@@ -176,9 +176,11 @@ func updateStakeHistorySysvar(acctsDb *accountsdb.AccountsDb, block *block.Block
 	newStakeHistoryBytes := buf.Bytes()
 	copy(stakeHistoryAcct.Data, newStakeHistoryBytes)
 
-	err = acctsDb.StoreAccounts([]*accounts.Account{stakeHistoryAcct}, prevSlotCtx.Slot, nil)
-	if err != nil {
-		panic(fmt.Sprintf("error storing new StakeHistory sysvar to accountsdb: %s", err))
+	if !acctsDb.RootedDurable {
+		err = acctsDb.StoreAccounts([]*accounts.Account{stakeHistoryAcct}, prevSlotCtx.Slot, nil)
+		if err != nil {
+			panic(fmt.Sprintf("error storing new StakeHistory sysvar to accountsdb: %s", err))
+		}
 	}
 	block.EpochUpdatedAccts = append(block.EpochUpdatedAccts, stakeHistoryAcct.Clone())
 
@@ -186,12 +188,14 @@ func updateStakeHistorySysvar(acctsDb *accountsdb.AccountsDb, block *block.Block
 }
 
 func handleEpochTransition(acctsDb *accountsdb.AccountsDb, partitionedEpochRewards bool, prevSlotCtx *sealevel.SlotCtx, replayCtx *ReplayCtx, epochSchedule *sealevel.SysvarEpochSchedule, f *features.Features, block *block.Block, epoch uint64, rpcc *rpcclient.RpcClient, dbgOpts *DebugOptions, alpenglowReplayMode bool) *rewards.PartitionedRewardDistributionInfo {
-	// Flush any pending stake pubkeys to the index file before scanning.
-	// The async StoreAccounts callback from the previous block may not have
-	// run yet, so flush here to ensure the index is complete for the scan.
+	// Linear mode flushes pending stake pubkeys before scanning. Rooted-durable
+	// mode merges its RAM entries in LoadStakePubkeyIndex and persists only when
+	// the corresponding account delta is folded.
 	acctsDbDir := filepath.Join(acctsDb.AcctsDir, "..")
-	if _, err := global.FlushPendingStakePubkeys(acctsDbDir); err != nil {
-		mlog.Log.Errorf("failed to flush stake pubkeys before epoch scan: %v", err)
+	if !acctsDb.RootedDurable {
+		if _, err := global.FlushPendingStakePubkeys(acctsDbDir); err != nil {
+			mlog.Log.Errorf("failed to flush stake pubkeys before epoch scan: %v", err)
+		}
 	}
 
 	// Load stake history (used by both scan and rewards)
@@ -272,8 +276,10 @@ func handleEpochTransition(acctsDb *accountsdb.AccountsDb, partitionedEpochRewar
 	t5 := time.Now()
 
 	// Compact stake index at epoch boundary — removes duplicates from appends
-	if err := global.CompactStakePubkeyIndex(acctsDbDir); err != nil {
-		mlog.Log.Errorf("failed to compact stake pubkey index: %v", err)
+	if !acctsDb.RootedDurable {
+		if err := global.CompactStakePubkeyIndex(acctsDbDir); err != nil {
+			mlog.Log.Errorf("failed to compact stake pubkey index: %v", err)
+		}
 	}
 
 	mlog.Log.Infof("Timing: scan=%.1fs epochStakes=%.1fs leaderSched=%.1fs rewards=%.1fs stakeHistory=%.1fs total=%.1fs",

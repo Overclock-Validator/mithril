@@ -52,6 +52,29 @@ func TestPopulateManifestSeedKeepsManifestEpochFrame(t *testing.T) {
 	}
 }
 
+func TestPopulateManifestSeedStoresBlockhashQueueLastHash(t *testing.T) {
+	lastHash := [32]byte{7}
+	newestRecent := [32]byte{8}
+	manifest := &SnapshotManifest{
+		Bank: &DeserializableVersionedBank{
+			Slot: 99,
+			BlockhashQueue: BlockHashVec{
+				LastHash: &lastHash,
+				HashAndAge: []HashAgePair{{
+					Key: newestRecent,
+					Val: HashAge{HashIndex: 10},
+				}},
+			},
+		},
+	}
+	mithrilState := state.NewReadyState(manifest.Bank.Slot, 0, "", "", 0, 0)
+
+	PopulateManifestSeed(mithrilState, manifest)
+
+	require.Equal(t, base58.Encode(lastHash[:]), mithrilState.ManifestLastBlockhash)
+	require.NotEqual(t, mithrilState.ManifestRecentBlockhashes[0].Blockhash, mithrilState.ManifestLastBlockhash)
+}
+
 func TestPopulateManifestSeedUsesSnapshotEpochForAuthorizedVoters(t *testing.T) {
 	var voteAcct solana.PublicKey
 	var authorizedVoter solana.PublicKey

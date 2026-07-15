@@ -4,12 +4,12 @@ import (
 	"fmt"
 	"math"
 
-	a "github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
+	a "github.com/Overclock-Validator/mithril/pkg/addresses"
+	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/rewards"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
-	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/wincode"
 )
 
@@ -245,8 +245,10 @@ func newEpochUpdateEpochInflationAccount(
 		replayCtx.Capitalization -= parentAcct.Lamports - lamports
 	}
 
-	if err := acctsDb.StoreAccounts([]*accounts.Account{acct}, prevSlotCtx.Slot, nil); err != nil {
-		panic(fmt.Sprintf("store vote reward account at slot %d: %s", prevSlotCtx.Slot, err))
+	if !acctsDb.RootedDurable {
+		if err := acctsDb.StoreAccounts([]*accounts.Account{acct}, prevSlotCtx.Slot, nil); err != nil {
+			panic(fmt.Sprintf("store vote reward account at slot %d: %s", prevSlotCtx.Slot, err))
+		}
 	}
 
 	return []*accounts.Account{acct.Clone()}, []*accounts.Account{parentAcct}

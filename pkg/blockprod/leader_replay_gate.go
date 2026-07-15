@@ -3,7 +3,9 @@ package blockprod
 import (
 	"fmt"
 
+	"github.com/Overclock-Validator/mithril/pkg/alpenglow"
 	"github.com/Overclock-Validator/mithril/pkg/global"
+	"github.com/Overclock-Validator/mithril/pkg/replay"
 )
 
 // pocLeaderSlotReplayReady reports whether replay has advanced far enough to start
@@ -19,38 +21,63 @@ func (l *LeaderLoop) pocLeaderSlotReplayReady(leaderSlot uint64) (bool, error) {
 	if leaderSlot == 0 {
 		return true, nil
 	}
-
-	parentSlot := leaderSlot - 1
+	parent, err := l.resolveProductionParent(leaderSlot)
+	if err != nil {
+		return false, err
+	}
+	parentSlot := parent.Slot
+	if l.epochSchedule != nil && l.epochSchedule.GetEpoch(parentSlot) != l.epochSchedule.GetEpoch(leaderSlot) {
+		return false, fmt.Errorf("%w: local production for slot %d crosses an epoch boundary from parent %d; replay epoch-transition preparation is required before forging",
+			errParentNotReady, leaderSlot, parentSlot)
+	}
 	replaySlot := global.Slot()
-	self := l.identity.PublicKey()
-
-	parentLeader, ok := l.leaderForSlot(parentSlot)
-	parentIsUs := ok && parentLeader == self
-
-	if parentIsUs {
-		if replaySlot >= parentSlot || l.isLeaderSlotFinished(parentSlot) {
-			return l.parentAlpenglowInputsReady(parentSlot)
-		}
-		return false, fmt.Errorf("%w: POC replay at %d waiting for own parent slot %d (local finish pending replay)",
-			errParentNotReady, replaySlot, parentSlot)
+	if replaySlot != parentSlot && !l.isLeaderSlotFinished(parentSlot) {
+		return false, fmt.Errorf("%w: replay head %d does not match Alpenglow parent %d for leader slot %d",
+			errParentNotReady, replaySlot, parentSlot, leaderSlot)
 	}
-
-	// POC: parent belonged to another validator — require their block in replay first.
-	if replaySlot >= parentSlot {
-		return l.parentAlpenglowInputsReady(parentSlot)
-	}
-	return false, fmt.Errorf("%w: POC replay at %d need >= parent slot %d (other leader %s)",
-		errParentNotReady, replaySlot, parentSlot, parentLeader)
+	return l.parentAlpenglowInputsReady(parent)
 }
 
-func (l *LeaderLoop) parentAlpenglowInputsReady(parentSlot uint64) (bool, error) {
-	if _, ok := global.AlpenglowBlockID(parentSlot); !ok {
-		return false, fmt.Errorf("%w: alpenglow block id missing for parent slot %d",
+func (l *LeaderLoop) resolveProductionParent(leaderSlot uint64) (alpenglow.BlockID, error) {
+	if leaderSlot == 0 {
+		return alpenglow.BlockID{}, nil
+	}
+	if leaderSlot%alpenglow.LeaderWindowSlots == 0 && l.productionParent != nil {
+		parent := l.productionParent(leaderSlot)
+		switch parent.Kind {
+		case alpenglow.BlockProductionParentReady:
+			if parent.Parent.IsZero() || !parent.Parent.HasHash() || parent.Parent.Slot >= leaderSlot {
+				return alpenglow.BlockID{}, fmt.Errorf("%w: invalid ParentReady value for leader slot %d", errParentNotReady, leaderSlot)
+			}
+			return parent.Parent, nil
+		case alpenglow.BlockProductionParentMissedWindow:
+			return alpenglow.BlockID{}, fmt.Errorf("%w: ParentReady arrived after leader window %d", errParentNotReady, leaderSlot)
+		default:
+			return alpenglow.BlockID{}, fmt.Errorf("%w: no verified ParentReady for leader window %d", errParentNotReady, leaderSlot)
+		}
+	}
+
+	parentSlot := leaderSlot - 1
+	parentHash, _, ok := replay.ResolveActiveAlpenglowIdentity(parentSlot)
+	if !ok && l.parentBlockID != nil {
+		parentHash, ok = l.parentBlockID(leaderSlot)
+	}
+	if !ok {
+		return alpenglow.BlockID{}, fmt.Errorf("%w: alpenglow block id missing for parent slot %d",
 			errParentNotReady, parentSlot)
 	}
-	if _, ok := global.AlpenglowChainedMerkleRoot(parentSlot); !ok {
-		return false, fmt.Errorf("%w: chained merkle root missing for parent slot %d",
-			errParentNotReady, parentSlot)
+	return alpenglow.BlockID{Slot: parentSlot, Hash: parentHash}, nil
+}
+
+func (l *LeaderLoop) parentAlpenglowInputsReady(parent alpenglow.BlockID) (bool, error) {
+	blockID, _, ok := replay.ResolveActiveAlpenglowIdentity(parent.Slot)
+	if !ok {
+		return false, fmt.Errorf("%w: executed Alpenglow identity missing for parent slot %d",
+			errParentNotReady, parent.Slot)
+	}
+	if blockID != parent.Hash {
+		return false, fmt.Errorf("%w: executed block %s does not match selected parent %s at slot %d",
+			errParentNotReady, blockID, parent.Hash, parent.Slot)
 	}
 	return true, nil
 }

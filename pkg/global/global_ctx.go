@@ -5,6 +5,7 @@ package global
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -31,9 +32,9 @@ type GlobalCtx struct {
 	slot                       uint64
 	epoch                      uint64
 	transactionCount           uint64
-	pendingNewStakePubkeys     []accountsdb.StakeIndexEntry // New stake entries to append to index after block commit
-	cachedStakeEntries         []accountsdb.StakeIndexEntry // Parsed+sorted index, populated on first load
-	entriesFlushedSinceCompact int                          // Appended entries since last compaction
+	pendingStakeBySlot         map[uint64][]accountsdb.StakeIndexEntry // Speculative stake entries, grouped by producing slot
+	cachedStakeEntries         []accountsdb.StakeIndexEntry            // Parsed+sorted index, populated on first load
+	entriesFlushedSinceCompact int                                     // Appended entries since last compaction
 	voteCache                  map[solana.PublicKey]*sealevel.VoteStateVersions
 	epochVoteStateSnapshots    map[uint64]map[solana.PublicKey]*sealevel.VoteStateVersions
 	epochStakes                *epochstakes.EpochStakesCache
@@ -44,7 +45,7 @@ type GlobalCtx struct {
 	nextLeaderSchedule         *leaderschedule.LeaderSchedule
 	calcUnixTimeForClockSysvar bool
 	manageLeaderSchedule       bool
-	pendingStakeMutex          sync.Mutex // Protects pendingNewStakePubkeys
+	pendingStakeMutex          sync.Mutex // Protects pendingStakeBySlot and cachedStakeEntries
 	voteCacheMutex             sync.RWMutex
 	slotsConfirmedMutex        sync.Mutex
 	mu                         sync.Mutex
@@ -95,13 +96,20 @@ func IncrTransactionCount(num uint64) {
 	instance.IncrTransactionCount(num)
 }
 
+func SetTransactionCount(num uint64) {
+	instance.SetTransactionCount(num)
+}
+
 // EnqueuePendingStakePubkey records a stake pubkey for later append to the index file.
 // Called during tx processing when a stake account is created or modified.
 // Deduplication happens at index load time (LoadStakePubkeyIndex keeps last occurrence).
-func EnqueuePendingStakePubkey(pubkey solana.PublicKey) {
+func EnqueuePendingStakePubkey(slot uint64, pubkey solana.PublicKey) {
 	instance.pendingStakeMutex.Lock()
 	defer instance.pendingStakeMutex.Unlock()
-	instance.pendingNewStakePubkeys = append(instance.pendingNewStakePubkeys, accountsdb.StakeIndexEntry{Pubkey: pubkey})
+	if instance.pendingStakeBySlot == nil {
+		instance.pendingStakeBySlot = make(map[uint64][]accountsdb.StakeIndexEntry)
+	}
+	instance.pendingStakeBySlot[slot] = append(instance.pendingStakeBySlot[slot], accountsdb.StakeIndexEntry{Pubkey: pubkey})
 }
 
 func PutEpochAuthorizedVoter(voteAcct solana.PublicKey, authorizedVoter solana.PublicKey) {
@@ -177,6 +185,15 @@ func VoteCacheSnapshot() map[solana.PublicKey]*sealevel.VoteStateVersions {
 	return snapshot
 }
 
+// ResetVoteCache clears the current epoch's derived vote-state cache before a
+// branch-aware rebuild. Epoch stake tables remain untouched because they are
+// keyed by epoch and derived from the prior epoch's rooted state.
+func ResetVoteCache() {
+	instance.voteCacheMutex.Lock()
+	instance.voteCache = make(map[solana.PublicKey]*sealevel.VoteStateVersions)
+	instance.voteCacheMutex.Unlock()
+}
+
 func PutEpochVoteStateSnapshot(epoch uint64, snapshot map[solana.PublicKey]*sealevel.VoteStateVersions) {
 	instance.voteCacheMutex.Lock()
 	defer instance.voteCacheMutex.Unlock()
@@ -221,6 +238,18 @@ func ClearEpochVoteStateSnapshots() {
 	instance.epochVoteStateSnapshots = nil
 }
 
+// DropEpochVoteStateSnapshotsAfter removes snapshots produced by speculative
+// epoch transitions above the selected rollback epoch.
+func DropEpochVoteStateSnapshotsAfter(epoch uint64) {
+	instance.voteCacheMutex.Lock()
+	defer instance.voteCacheMutex.Unlock()
+	for cachedEpoch := range instance.epochVoteStateSnapshots {
+		if cachedEpoch > epoch {
+			delete(instance.epochVoteStateSnapshots, cachedEpoch)
+		}
+	}
+}
+
 func PutEpochStakesEntry(epoch uint64, pubkey solana.PublicKey, stake uint64, voteAcct *epochstakes.VoteAccount) {
 	if instance.epochStakes == nil {
 		instance.epochStakes = epochstakes.NewEpochStakesCache()
@@ -261,6 +290,14 @@ func EpochStakesVoteAccts(epoch uint64) map[solana.PublicKey]*epochstakes.VoteAc
 func ClearEpochStakes(epoch uint64) {
 	if instance.epochStakes != nil {
 		instance.epochStakes.ClearEpochStakes(epoch)
+	}
+}
+
+// ClearEpochStakesAfter removes future tables derived by a losing speculative
+// epoch transition while retaining the selected epoch and its valid lookahead.
+func ClearEpochStakesAfter(maxEpoch uint64) {
+	if instance.epochStakes != nil {
+		instance.epochStakes.ClearAfter(maxEpoch)
 	}
 }
 
@@ -389,6 +426,12 @@ func (globctx *GlobalCtx) IncrTransactionCount(num uint64) {
 	globctx.transactionCount += num
 }
 
+func (globctx *GlobalCtx) SetTransactionCount(num uint64) {
+	globctx.mu.Lock()
+	globctx.transactionCount = num
+	globctx.mu.Unlock()
+}
+
 func (globctx *GlobalCtx) LatestBlockhash() [32]byte {
 	globctx.mu.Lock()
 	defer globctx.mu.Unlock()
@@ -419,34 +462,86 @@ func (globctx *GlobalCtx) TransactionCount() uint64 {
 	return globctx.transactionCount
 }
 
-// FlushPendingStakePubkeys appends any new stake entries discovered during replay
-// to the stake pubkey index file. Called after each block commit.
+// PendingStakeEntriesSnapshot returns every speculative stake-index entry. The
+// returned slice is detached from global state and ordered by producing slot.
+func PendingStakeEntriesSnapshot() []accountsdb.StakeIndexEntry {
+	instance.pendingStakeMutex.Lock()
+	defer instance.pendingStakeMutex.Unlock()
+	return pendingStakeEntriesLocked(math.MaxUint64)
+}
+
+func pendingStakeEntriesLocked(through uint64) []accountsdb.StakeIndexEntry {
+	slots := make([]uint64, 0, len(instance.pendingStakeBySlot))
+	for slot := range instance.pendingStakeBySlot {
+		if slot <= through {
+			slots = append(slots, slot)
+		}
+	}
+	slices.Sort(slots)
+	var pending []accountsdb.StakeIndexEntry
+	for _, slot := range slots {
+		pending = append(pending, instance.pendingStakeBySlot[slot]...)
+	}
+	return pending
+}
+
+// FlushPendingStakePubkeys appends every pending stake entry. Non-speculative
+// callers retain the legacy all-through behavior.
 // Writes 48-byte records to match the header written at snapshot time.
 // Returns the number of entries flushed.
 func FlushPendingStakePubkeys(accountsDbDir string) (int, error) {
+	return FlushPendingStakePubkeysThrough(accountsDbDir, math.MaxUint64)
+}
+
+// FlushPendingStakePubkeysThrough persists only entries produced at or below
+// through. Entries above the durable watermark remain branch-local in memory.
+func FlushPendingStakePubkeysThrough(accountsDbDir string, through uint64) (int, error) {
 	instance.pendingStakeMutex.Lock()
-	if len(instance.pendingNewStakePubkeys) == 0 {
+	pending := pendingStakeEntriesLocked(through)
+	if len(pending) == 0 {
 		instance.pendingStakeMutex.Unlock()
 		return 0, nil
 	}
-	// Copy pending slice, clear it, and invalidate cache while holding lock
-	pending := make([]accountsdb.StakeIndexEntry, len(instance.pendingNewStakePubkeys))
-	copy(pending, instance.pendingNewStakePubkeys)
-	instance.pendingNewStakePubkeys = nil
+	removed := make(map[uint64][]accountsdb.StakeIndexEntry)
+	for slot, entries := range instance.pendingStakeBySlot {
+		if slot <= through {
+			removed[slot] = entries
+			delete(instance.pendingStakeBySlot, slot)
+		}
+	}
 	instance.cachedStakeEntries = nil // file is changing, invalidate cache
 	instance.pendingStakeMutex.Unlock()
+	restore := func() {
+		instance.pendingStakeMutex.Lock()
+		defer instance.pendingStakeMutex.Unlock()
+		if instance.pendingStakeBySlot == nil {
+			instance.pendingStakeBySlot = make(map[uint64][]accountsdb.StakeIndexEntry)
+		}
+		for slot, entries := range removed {
+			// A retry may duplicate a partially appended record. The index format is
+			// explicitly last-wins, so retaining the full retry set is safe.
+			instance.pendingStakeBySlot[slot] = append(entries, instance.pendingStakeBySlot[slot]...)
+		}
+	}
 
 	// Append to index file (don't hold lock during I/O)
 	indexPath := filepath.Join(accountsDbDir, StakePubkeyIndexFileName)
 	f, err := os.OpenFile(indexPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
+		restore()
 		return 0, fmt.Errorf("opening stake pubkey index for append: %w", err)
 	}
-	defer f.Close()
+	closed := false
+	defer func() {
+		if !closed {
+			_ = f.Close()
+		}
+	}()
 
 	// If file is empty/new, write header first to avoid a headerless file
 	info, err := f.Stat()
 	if err != nil {
+		restore()
 		return 0, fmt.Errorf("stat stake pubkey index: %w", err)
 	}
 	if info.Size() == 0 {
@@ -454,6 +549,7 @@ func FlushPendingStakePubkeys(accountsDbDir string) (int, error) {
 		copy(header[0:4], accountsdb.StakeIndexMagic[:])
 		binary.LittleEndian.PutUint32(header[4:8], accountsdb.StakeIndexVersion)
 		if _, err := f.Write(header[:]); err != nil {
+			restore()
 			return 0, fmt.Errorf("writing stake index header: %w", err)
 		}
 	}
@@ -464,6 +560,7 @@ func FlushPendingStakePubkeys(accountsDbDir string) (int, error) {
 		binary.LittleEndian.PutUint64(record[32:40], e.FileId)
 		binary.LittleEndian.PutUint64(record[40:48], e.Offset)
 		if _, err := f.Write(record[:]); err != nil {
+			restore()
 			return 0, fmt.Errorf("writing stake index entry: %w", err)
 		}
 	}
@@ -471,8 +568,14 @@ func FlushPendingStakePubkeys(accountsDbDir string) (int, error) {
 	// Ensure data is flushed to disk before returning.
 	// This is critical: the index must be at least as current as the state file.
 	if err := f.Sync(); err != nil {
+		restore()
 		return 0, fmt.Errorf("syncing stake pubkey index: %w", err)
 	}
+	if err := f.Close(); err != nil {
+		restore()
+		return 0, fmt.Errorf("closing stake pubkey index: %w", err)
+	}
+	closed = true
 
 	instance.pendingStakeMutex.Lock()
 	instance.entriesFlushedSinceCompact += len(pending)
@@ -486,7 +589,22 @@ func FlushPendingStakePubkeys(accountsDbDir string) (int, error) {
 func ClearPendingStakePubkeys() {
 	instance.pendingStakeMutex.Lock()
 	defer instance.pendingStakeMutex.Unlock()
-	instance.pendingNewStakePubkeys = nil
+	instance.pendingStakeBySlot = nil
+}
+
+// DropPendingStakePubkeysFrom discards speculative index entries at and above
+// fromSlot while preserving entries belonging to an earlier surviving branch.
+func DropPendingStakePubkeysFrom(fromSlot uint64) int {
+	instance.pendingStakeMutex.Lock()
+	defer instance.pendingStakeMutex.Unlock()
+	dropped := 0
+	for slot, entries := range instance.pendingStakeBySlot {
+		if slot >= fromSlot {
+			dropped += len(entries)
+			delete(instance.pendingStakeBySlot, slot)
+		}
+	}
+	return dropped
 }
 
 // compactThreshold is the minimum number of appended entries before compaction triggers.
@@ -533,9 +651,10 @@ func CompactStakePubkeyIndex(accountsDbDir string) error {
 func LoadStakePubkeyIndex(accountsDbDir string) ([]accountsdb.StakeIndexEntry, error) {
 	instance.pendingStakeMutex.Lock()
 	if instance.cachedStakeEntries != nil {
-		cached := instance.cachedStakeEntries
+		cached := append([]accountsdb.StakeIndexEntry(nil), instance.cachedStakeEntries...)
+		pending := pendingStakeEntriesLocked(math.MaxUint64)
 		instance.pendingStakeMutex.Unlock()
-		return cached, nil
+		return dedupeAndSortStakeEntries(append(cached, pending...)), nil
 	}
 	instance.pendingStakeMutex.Unlock()
 
@@ -561,7 +680,20 @@ func LoadStakePubkeyIndex(accountsDbDir string) ([]accountsdb.StakeIndexEntry, e
 		return nil, fmt.Errorf("stake pubkey index file is empty (0 entries) - indicates corrupt or incomplete AccountsDB")
 	}
 
-	// Deduplicate by pubkey (keep last occurrence = freshest location hint)
+	deduped := dedupeAndSortStakeEntries(entries)
+
+	// Cache only the durable file view. Speculative additions are merged into a
+	// detached result on every call so branch unwind never contaminates the cache.
+	instance.pendingStakeMutex.Lock()
+	instance.cachedStakeEntries = deduped
+	pending := pendingStakeEntriesLocked(math.MaxUint64)
+	instance.pendingStakeMutex.Unlock()
+
+	return dedupeAndSortStakeEntries(append(append([]accountsdb.StakeIndexEntry(nil), deduped...), pending...)), nil
+}
+
+func dedupeAndSortStakeEntries(entries []accountsdb.StakeIndexEntry) []accountsdb.StakeIndexEntry {
+	// Deduplicate by pubkey (keep last occurrence = freshest location hint).
 	seen := make(map[solana.PublicKey]int, len(entries))
 	deduped := make([]accountsdb.StakeIndexEntry, 0, len(entries))
 	for _, e := range entries {
@@ -590,12 +722,7 @@ func LoadStakePubkeyIndex(accountsDbDir string) ([]accountsdb.StakeIndexEntry, e
 		return 0
 	})
 
-	// Cache for subsequent calls
-	instance.pendingStakeMutex.Lock()
-	instance.cachedStakeEntries = deduped
-	instance.pendingStakeMutex.Unlock()
-
-	return deduped, nil
+	return deduped
 }
 
 func loadStakePubkeyIndexLegacy(data []byte) ([]accountsdb.StakeIndexEntry, error) {

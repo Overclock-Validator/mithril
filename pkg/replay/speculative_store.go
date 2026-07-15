@@ -10,25 +10,40 @@ import (
 	"github.com/gagliardetto/solana-go"
 )
 
-const maxSpeculativeLayers = 64
+const maxSpeculativeLayers = 512
 
 // SpeculativeLayer holds post-slot account state for keys modified during speculative execution.
 type SpeculativeLayer struct {
 	Slot       uint64
 	ParentSlot uint64
 	Deltas     map[solana.PublicKey]*accounts.Account
+	undo       []speculativeUndo
+}
+
+type speculativeUndo struct {
+	key      solana.PublicKey
+	prevSlot uint64
+	existed  bool
+}
+
+type speculativeFlatEntry struct {
+	slot uint64
+	acct *accounts.Account
 }
 
 // SpeculativeStore resolves account state by walking parent layers back to the finalized slot.
 type SpeculativeStore struct {
-	mu             sync.RWMutex
-	finalizedSlot  uint64
-	layers         map[uint64]*SpeculativeLayer
+	mu            sync.RWMutex
+	finalizedSlot uint64
+	layers        map[uint64]*SpeculativeLayer
+	order         []uint64
+	flat          map[solana.PublicKey]speculativeFlatEntry
 }
 
 func newSpeculativeStore() *SpeculativeStore {
 	return &SpeculativeStore{
 		layers: make(map[uint64]*SpeculativeLayer),
+		flat:   make(map[solana.PublicKey]speculativeFlatEntry),
 	}
 }
 
@@ -56,37 +71,65 @@ func (st *SpeculativeStore) LayerCount() int {
 	return len(st.layers)
 }
 
-// Resolve returns the account state at the end of endSlot by walking local layers to finalizedSlot.
+// PromotionPrefix snapshots the oldest active layers through the finalized
+// watermark. Account pointers are immutable layer-owned clones; the caller
+// must settle the fold before pruning or unwinding these layers.
+func (st *SpeculativeStore) PromotionPrefix(through uint64, maxSlots int) []accounts.SlotDelta {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	out := make([]accounts.SlotDelta, 0, min(len(st.order), maxSlots))
+	for _, slot := range st.order {
+		if slot > through || (maxSlots > 0 && len(out) >= maxSlots) {
+			break
+		}
+		layer := st.layers[slot]
+		if layer == nil {
+			break
+		}
+		delta := make([]*accounts.Account, 0, len(layer.Deltas))
+		for _, acct := range layer.Deltas {
+			delta = append(delta, acct)
+		}
+		out = append(out, accounts.SlotDelta{Slot: slot, Delta: delta})
+	}
+	return out
+}
+
+// Resolve returns account state at endSlot. The active tip normally resolves
+// from flat in O(1); historical views fall back to the bounded parent walk.
 func (st *SpeculativeStore) Resolve(endSlot uint64, pk solana.PublicKey, db *accountsdb.AccountsDb) (*accounts.Account, error) {
 	st.mu.RLock()
 	finalized := st.finalizedSlot
+	if endSlot > finalized {
+		if entry, ok := st.flat[pk]; ok && entry.slot <= endSlot {
+			acct := entry.acct.Clone()
+			st.mu.RUnlock()
+			return acct, nil
+		}
+		slot := endSlot
+		for slot > finalized {
+			layer, ok := st.layers[slot]
+			if !ok {
+				st.mu.RUnlock()
+				return nil, fmt.Errorf("speculative store: missing layer for slot %d while resolving %s", slot, pk)
+			}
+			if acct, ok := layer.Deltas[pk]; ok {
+				acct = acct.Clone()
+				st.mu.RUnlock()
+				return acct, nil
+			}
+			slot = layer.ParentSlot
+		}
+	}
 	st.mu.RUnlock()
-
-	if endSlot <= finalized {
-		if db == nil {
-			return nil, fmt.Errorf("speculative store: nil accounts db")
-		}
-		return db.GetAccount(endSlot, pk)
-	}
-
-	st.mu.RLock()
-	defer st.mu.RUnlock()
-
-	slot := endSlot
-	for slot > finalized {
-		layer, ok := st.layers[slot]
-		if !ok {
-			return nil, fmt.Errorf("speculative store: missing layer for slot %d while resolving %s", slot, pk)
-		}
-		if acct, ok := layer.Deltas[pk]; ok {
-			return acct.Clone(), nil
-		}
-		slot = layer.ParentSlot
-	}
 	if db == nil {
 		return nil, fmt.Errorf("speculative store: nil accounts db")
 	}
-	return db.GetAccount(finalized, pk)
+	acct, err := db.GetAccountDurable(finalized, pk)
+	if err != nil {
+		return nil, err
+	}
+	return acct.Clone(), nil
 }
 
 // RecordLayer stores post-slot account state for deferred replay. snapshotAccts is the
@@ -132,29 +175,92 @@ func (st *SpeculativeStore) RecordLayer(slot, parentSlot uint64, slotCtx *sealev
 
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if len(st.layers) >= maxSpeculativeLayers && st.layers[slot] == nil {
+	if _, exists := st.layers[slot]; exists {
+		return fmt.Errorf("speculative store: duplicate layer for slot %d", slot)
+	}
+	if len(st.layers) >= maxSpeculativeLayers {
 		return fmt.Errorf("speculative store: layer limit %d exceeded", maxSpeculativeLayers)
 	}
+	if len(st.order) > 0 && slot <= st.order[len(st.order)-1] {
+		return fmt.Errorf("speculative store: out-of-order layer %d after %d", slot, st.order[len(st.order)-1])
+	}
+	expectedParent := st.finalizedSlot
+	if len(st.order) > 0 {
+		expectedParent = st.order[len(st.order)-1]
+	}
+	if parentSlot != expectedParent {
+		return fmt.Errorf("speculative store: slot %d parent %d does not extend active tip %d", slot, parentSlot, expectedParent)
+	}
+	for key, acct := range layer.Deltas {
+		if previous, exists := st.flat[key]; exists {
+			layer.undo = append(layer.undo, speculativeUndo{key: key, prevSlot: previous.slot, existed: true})
+		} else {
+			layer.undo = append(layer.undo, speculativeUndo{key: key})
+		}
+		st.flat[key] = speculativeFlatEntry{slot: slot, acct: acct}
+	}
 	st.layers[slot] = layer
+	st.order = append(st.order, slot)
 	return nil
 }
 
 func (st *SpeculativeStore) PruneLayersAbove(anchorSlot uint64) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	for slot := range st.layers {
+	cut := len(st.order)
+	for index, slot := range st.order {
 		if slot > anchorSlot {
-			delete(st.layers, slot)
+			cut = index
+			break
 		}
 	}
+	suffix := st.order[cut:]
+	for index := len(suffix) - 1; index >= 0; index-- {
+		layer := st.layers[suffix[index]]
+		for _, undo := range layer.undo {
+			if !undo.existed {
+				delete(st.flat, undo.key)
+				continue
+			}
+			if previous := st.layers[undo.prevSlot]; previous != nil && undo.prevSlot <= anchorSlot {
+				if acct, exists := previous.Deltas[undo.key]; exists {
+					st.flat[undo.key] = speculativeFlatEntry{slot: undo.prevSlot, acct: acct}
+					continue
+				}
+			}
+			delete(st.flat, undo.key)
+		}
+	}
+	for _, slot := range suffix {
+		delete(st.layers, slot)
+	}
+	st.order = st.order[:cut]
 }
 
 func (st *SpeculativeStore) PruneLayersThrough(committedSlot uint64) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	for slot := range st.layers {
-		if slot <= committedSlot {
-			delete(st.layers, slot)
+	kept := st.order[:0]
+	for _, slot := range st.order {
+		if slot > committedSlot {
+			kept = append(kept, slot)
+			continue
+		}
+		for key := range st.layers[slot].Deltas {
+			if entry, exists := st.flat[key]; exists && entry.slot <= committedSlot {
+				delete(st.flat, key)
+			}
+		}
+		delete(st.layers, slot)
+	}
+	st.order = kept
+	for _, slot := range st.order {
+		for index := range st.layers[slot].undo {
+			undo := &st.layers[slot].undo[index]
+			if undo.existed && undo.prevSlot <= committedSlot {
+				undo.existed = false
+				undo.prevSlot = 0
+			}
 		}
 	}
 }
@@ -163,4 +269,31 @@ func (st *SpeculativeStore) Clear() {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.layers = make(map[uint64]*SpeculativeLayer)
+	st.order = nil
+	st.flat = make(map[solana.PublicKey]speculativeFlatEntry)
+}
+
+func (st *SpeculativeStore) CheckInvariants() error {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	want := make(map[solana.PublicKey]speculativeFlatEntry)
+	for _, slot := range st.order {
+		layer := st.layers[slot]
+		if layer == nil {
+			return fmt.Errorf("speculative store: ordered slot %d has no layer", slot)
+		}
+		for key, acct := range layer.Deltas {
+			want[key] = speculativeFlatEntry{slot: slot, acct: acct}
+		}
+	}
+	if len(want) != len(st.flat) {
+		return fmt.Errorf("speculative store: flat size %d, want %d", len(st.flat), len(want))
+	}
+	for key, expected := range want {
+		actual, exists := st.flat[key]
+		if !exists || actual.slot != expected.slot || actual.acct != expected.acct {
+			return fmt.Errorf("speculative store: flat entry mismatch for %s", key)
+		}
+	}
+	return nil
 }

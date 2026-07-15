@@ -33,6 +33,21 @@ type AccountsDb struct {
 	VoteAcctCache    otter.Cache[solana.PublicKey, *accounts.Account]
 	CommonAcctsCache otter.Cache[solana.PublicKey, *accounts.Account]
 	ProgramCache     otter.Cache[solana.PublicKey, *ProgramCacheEntry]
+	// RootedDurable disables direct StoreAccounts writes. Replay enables it only
+	// when every slot write is captured by the finalized batch-fold path.
+	RootedDurable bool
+	resolverMu    sync.RWMutex
+	resolver      *accountResolverRegistration
+
+	// IndexWALDisabled permits the fold manifests to serve as the account-index
+	// redo log. It remains off by default until the WAL-less mode is soaked.
+	IndexWALDisabled bool
+
+	// Batch fold state. foldMu serializes fold commits and recovery.
+	foldMu         sync.Mutex
+	lastBatchSeq   uint64
+	durableThrough atomic.Uint64
+	foldHooks      foldTestHooks
 
 	// A list of store requests. They are added to the back as they arrive and
 	// removed from the front as they are persisted.
@@ -40,6 +55,12 @@ type AccountsDb struct {
 	inProgressStoreRequests   *list.List
 	storeRequestChan          chan *list.Element
 	storeWorkerDone           chan struct{}
+}
+
+type AccountResolver func(slot uint64, pubkey solana.PublicKey) (*accounts.Account, error)
+
+type accountResolverRegistration struct {
+	load AccountResolver
 }
 
 type storeRequest struct {
@@ -66,11 +87,14 @@ func (silentLogger) Infof(format string, args ...any)  {}
 func (silentLogger) Fatalf(format string, args ...any) { log.Fatalf(format, args...) }
 
 var (
-	ErrNoAccount = errors.New("ErrNoAccount")
+	ErrNoAccount         = errors.New("ErrNoAccount")
+	ErrRootedDirectWrite = errors.New("direct StoreAccounts is disabled in rooted-durable mode")
 
 	StoreAccountsWorkers = 128
 	ProgramCacheMaxMB    = DefaultProgramCacheMaxMB
 )
+
+var DisableIndexWAL bool
 
 const (
 	indexPebbleMemTableSize                = 64 << 20
@@ -84,6 +108,7 @@ func NewAccountsIndexPebbleOptions(logger pebble.Logger) *pebble.Options {
 		Logger:                      logger,
 		MemTableSize:                indexPebbleMemTableSize,
 		MemTableStopWritesThreshold: indexPebbleMemTableStopWritesThreshold,
+		DisableWAL:                  DisableIndexWAL,
 	}
 }
 
@@ -127,7 +152,7 @@ func OpenDb(accountsDbDir string) (*AccountsDb, error) {
 		return nil, fmt.Errorf("opening bankhashDir=%s: %w", bankhashDir, err)
 	}
 
-	accountsDb := &AccountsDb{Index: db, BankHashStore: bankhashDb, AcctsDir: appendVecsDir}
+	accountsDb := &AccountsDb{IndexWALDisabled: DisableIndexWAL, Index: db, BankHashStore: bankhashDb, AcctsDir: appendVecsDir}
 	accountsDb.LargestFileId.Store(largestFileId)
 
 	accountsDb.inProgressStoreRequests = list.New()
@@ -240,7 +265,54 @@ func (accountsDb *AccountsDb) RemoveProgramFromCache(pubkey solana.PublicKey) {
 	accountsDb.ProgramCache.Delete(pubkey)
 }
 
+// ClearProgramCache drops compiled programs whose backing account version may
+// have come from a discarded speculative branch. Programs are loaded lazily
+// from the selected account view on their next invocation.
+func (accountsDb *AccountsDb) ClearProgramCache() {
+	if accountsDb == nil {
+		return
+	}
+	accountsDb.ProgramCache.Clear()
+}
+
 func (accountsDb *AccountsDb) GetAccount(slot uint64, pubkey solana.PublicKey) (*accounts.Account, error) {
+	if accountsDb == nil {
+		return nil, ErrNoAccount
+	}
+	accountsDb.resolverMu.RLock()
+	registration := accountsDb.resolver
+	accountsDb.resolverMu.RUnlock()
+	if registration != nil && registration.load != nil {
+		return registration.load(slot, pubkey)
+	}
+	acct, err := accountsDb.GetAccountDurable(slot, pubkey)
+	if err == nil && acct != nil && accountsDb.RootedDurable {
+		return acct.Clone(), nil
+	}
+	return acct, err
+}
+
+// InstallAccountResolver publishes a unified branch-aware read path. Cleanup
+// removes only this registration, so a newer replay run cannot be clobbered by
+// an older run shutting down.
+func (accountsDb *AccountsDb) InstallAccountResolver(load AccountResolver) func() {
+	registration := &accountResolverRegistration{load: load}
+	accountsDb.resolverMu.Lock()
+	accountsDb.resolver = registration
+	accountsDb.resolverMu.Unlock()
+	return func() {
+		accountsDb.resolverMu.Lock()
+		if accountsDb.resolver == registration {
+			accountsDb.resolver = nil
+		}
+		accountsDb.resolverMu.Unlock()
+	}
+}
+
+// GetAccountDurable bypasses the speculative resolver and reads the current
+// AccountsDB root. Storage/fold code and resolver fallbacks use this to avoid
+// recursion.
+func (accountsDb *AccountsDb) GetAccountDurable(slot uint64, pubkey solana.PublicKey) (*accounts.Account, error) {
 	if accountsDb == nil {
 		return nil, ErrNoAccount
 	}
@@ -347,6 +419,9 @@ func (accountsDb *AccountsDb) StoreAccounts(
 	slot uint64,
 	cb func(),
 ) error {
+	if accountsDb.RootedDurable {
+		return ErrRootedDirectWrite
+	}
 	for _, acct := range accts {
 		if acct == nil {
 			continue
@@ -377,6 +452,10 @@ func (accountsDb *AccountsDb) storeAccountsSync(accts []*accounts.Account, slot 
 		accountsDb.parallelStoreAccounts(StoreAccountsWorkers, accts, slot)
 	}
 
+	accountsDb.refreshReadCaches(accts)
+}
+
+func (accountsDb *AccountsDb) refreshReadCaches(accts []*accounts.Account) {
 	for _, acct := range accts {
 		if acct == nil {
 			continue
