@@ -333,33 +333,47 @@ func TestFoldResumeContextCarriesEpochConsensusMetadata(t *testing.T) {
 }
 
 func TestFoldWaitsForLocalReplaySnapshot(t *testing.T) {
-	sr := NewSpeculativeReplay()
-	sr.Enable()
-	sr.foldBatchSlots = 128
-	sr.committedSlot = 10
-	sr.finalityCursor = 12
-	sr.store.SetFinalizedSlot(10)
-	recordSpeculativeLayer(t, sr.store, 11, 10, &accounts.Account{Key: solana.PublicKey{1}, Lamports: 1})
-	recordSpeculativeLayer(t, sr.store, 12, 11, &accounts.Account{Key: solana.PublicKey{2}, Lamports: 2})
-	sr.pending[11] = &DeferredBlockCommit{BlockSlot: 11, SlotCtx: &sealevel.SlotCtx{Slot: 11}, Bankhash: make([]byte, 32)}
-	sr.pending[12] = &DeferredBlockCommit{
-		BlockSlot: 12, SlotCtx: &sealevel.SlotCtx{Slot: 12}, Bankhash: make([]byte, 32),
-		AwaitingReplaySnapshot: true,
-	}
-	sr.snapshots[11] = &ReplayHeadSnapshot{Slot: 11}
+	committer := &testFoldCommitter{}
+	sr := newFoldTestReplay(t, committer, 1)
+	blockID := addFoldTestPending(t, sr, 11, 10)
+	sr.mu.Lock()
+	sr.pending[11].AwaitingReplaySnapshot = true
+	sr.pending[11].CapturedSnapshot = sr.snapshots[11]
+	sr.mu.Unlock()
 
-	prefix, err := sr.selectFoldPrefixLocked(false)
-	if err != nil {
+	decisionSource := func(anchor uint64) (alpenglow.ChainDecision, bool) {
+		if anchor != 10 {
+			return alpenglow.ChainDecision{}, false
+		}
+		return alpenglow.ChainDecision{
+			Slot:            11,
+			Kind:            alpenglow.ChainDecisionKindBlock,
+			Block:           alpenglow.BlockID{Slot: 11, Hash: blockID},
+			CertificateType: alpenglow.CertificateFinalizeFast,
+		}, true
+	}
+
+	sr.TryFlushPending(nil, &persistedTracker{}, nil, decisionSource)
+	if err := sr.Err(); err != nil {
+		t.Fatalf("early finalization made fold unhealthy: %v", err)
+	}
+	committer.mu.Lock()
+	commitsBeforeSnapshot := len(committer.through)
+	committer.mu.Unlock()
+	if commitsBeforeSnapshot != 0 {
+		t.Fatalf("fold committed before local replay snapshot: %d", commitsBeforeSnapshot)
+	}
+
+	if err := sr.FinalizePendingSnapshot(11, &ReplayCtx{Capitalization: 1}); err != nil {
 		t.Fatal(err)
 	}
-	if len(prefix) != 0 {
-		t.Fatalf("normal fold crossed local snapshot barrier: %+v", prefix)
-	}
-	prefix, err = sr.selectFoldPrefixLocked(true)
-	if err != nil {
+	if err := sr.FlushFinalized(&persistedTracker{}, decisionSource); err != nil {
 		t.Fatal(err)
 	}
-	if len(prefix) != 1 || prefix[0].Slot != 11 {
-		t.Fatalf("forced fold prefix = %+v, want slot 11 only", prefix)
+	committer.mu.Lock()
+	committed := append([]uint64(nil), committer.through...)
+	committer.mu.Unlock()
+	if len(committed) != 1 || committed[0] != 11 {
+		t.Fatalf("commits after local replay snapshot = %v, want [11]", committed)
 	}
 }

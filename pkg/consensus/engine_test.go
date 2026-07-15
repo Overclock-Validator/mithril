@@ -217,6 +217,28 @@ func TestAlpenglowObserverSafetyFaultFailsClosed(t *testing.T) {
 	}
 }
 
+func TestAlpenglowObserverHaltsOnConflictingReplayParentLink(t *testing.T) {
+	engine := &AlpenglowObserverEngine{
+		chain: newAlpenglowObserverChainTracker(),
+		pool:  alpenglow.NewConsensusPool(alpenglow.DefaultConsensusPoolConfig()),
+	}
+	block := alpenglow.BlockID{Slot: 12, Hash: solana.Hash{12}}
+	engine.ObserveAlpenglowCandidateBlock(alpenglow.ReplayBlockObservation{
+		Block: block, ParentSlot: 11, ParentHash: solana.Hash{11},
+	})
+	engine.ObserveAlpenglowCandidateBlock(alpenglow.ReplayBlockObservation{
+		Block: block, ParentSlot: 11, ParentHash: solana.Hash{10},
+	})
+
+	if err := engine.safetyError(); err == nil {
+		t.Fatal("conflicting parent linkage did not latch engine safety fault")
+	}
+	decision, ok := engine.NextAlpenglowDecision(11)
+	if !ok || decision.Kind != alpenglow.ChainDecisionKindConflict {
+		t.Fatalf("safety-fault decision = %+v (ok=%v)", decision, ok)
+	}
+}
+
 func TestAlpenglowObserverCandidateBlockEnablesIndirectSkipDecision(t *testing.T) {
 	engine, err := NewEngine(ModeAlpenglowObserver)
 	if err != nil {

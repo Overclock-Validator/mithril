@@ -636,6 +636,63 @@ func TestChainTrackerFinalizedAncestryCannotOverwriteTwin(t *testing.T) {
 	}
 }
 
+func TestChainTrackerRejectsConflictingParentLinkForBlockIdentity(t *testing.T) {
+	tracker := NewChainTracker()
+	block := BlockID{Slot: 12, Hash: chainTestHash(12)}
+	if _, err := tracker.ObserveCertificate(Certificate{
+		Type: CertificateNotarize, Slot: block.Slot, BlockHash: block.Hash, SignatureVerified: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	firstParent := chainTestHash(11)
+	tracker.ObserveReplayBlock(ReplayBlockObservation{Block: block, ParentSlot: 11, ParentHash: firstParent})
+
+	update := tracker.ObserveReplayBlock(ReplayBlockObservation{
+		Block: block, ParentSlot: 11, ParentHash: chainTestHash(10),
+	})
+	if !update.Conflict || update.ConflictSlot != block.Slot {
+		t.Fatalf("conflicting parent update = %+v", update)
+	}
+	state := tracker.blocks[block]
+	if state == nil || state.parentSlot != 11 || state.parentHash != firstParent {
+		t.Fatalf("conflicting observation rewrote parent linkage: %+v", state)
+	}
+	decision, ok := tracker.NextDecision(11)
+	if !ok || decision.Kind != ChainDecisionKindConflict {
+		t.Fatalf("parent-link conflict did not fail closed: %+v (ok=%v)", decision, ok)
+	}
+}
+
+func TestChainTrackerRejectsFinalizedAncestryAcrossPrunedRoot(t *testing.T) {
+	tracker := NewChainTracker()
+	tracker.PruneBeforeSlot(20)
+	tip := BlockID{Slot: 21, Hash: chainTestHash(21)}
+	tracker.ObserveReplayBlock(ReplayBlockObservation{
+		Block: tip, ParentSlot: 19, ParentHash: chainTestHash(19),
+	})
+	if _, err := tracker.ObserveCertificate(Certificate{
+		Type: CertificateFinalizeFast, Slot: tip.Slot, BlockHash: tip.Hash, SignatureVerified: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tracker.ObserveFinalized(tip, CertificateFinalizeFast); err == nil {
+		t.Fatal("finalized branch crossing the durable root was accepted")
+	}
+	if !tracker.FinalityConflictAt(20) {
+		t.Fatal("durable-root crossing did not latch a conflict")
+	}
+	for slot := range tracker.finalizedAncestors {
+		if slot < 20 {
+			t.Fatalf("finalized ancestry regrew below prune boundary at slot %d", slot)
+		}
+	}
+	for slot := range tracker.indirectSkips {
+		if slot < 20 {
+			t.Fatalf("indirect skip regrew below prune boundary at slot %d", slot)
+		}
+	}
+}
+
 func TestChainTrackerDoesNotRegrowPrunedHistory(t *testing.T) {
 	tracker := NewChainTracker()
 	tracker.PruneBeforeSlot(20)

@@ -673,7 +673,13 @@ func (e *AlpenglowObserverEngine) ObserveAlpenglowCandidateBlock(obs alpenglow.R
 }
 
 func (e *AlpenglowObserverEngine) observeChainReplayBlock(obs alpenglow.ReplayBlockObservation) {
-	e.ensureChain().ObserveReplayBlock(obs)
+	update := e.ensureChain().ObserveReplayBlock(obs)
+	if !update.Conflict {
+		return
+	}
+	fault := fmt.Errorf("chain tracker detected replay-link conflict at slot %d: %s", update.ConflictSlot, update.ConflictReason)
+	e.latchSafetyError(fault)
+	mlog.Log.Errorf("ALPENGLOW SAFETY: %v", fault)
 }
 
 func (e *AlpenglowObserverEngine) enrichReplayBlockObservation(obs *alpenglow.ReplayBlockObservation) {

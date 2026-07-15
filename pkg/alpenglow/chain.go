@@ -124,8 +124,11 @@ type ChainCertificateUpdate struct {
 }
 
 type ChainReplayBlockUpdate struct {
-	New      bool          `json:"new"`
-	Snapshot ChainSnapshot `json:"snapshot"`
+	New            bool          `json:"new"`
+	Conflict       bool          `json:"conflict,omitempty"`
+	ConflictSlot   uint64        `json:"conflict_slot,omitempty"`
+	ConflictReason string        `json:"conflict_reason,omitempty"`
+	Snapshot       ChainSnapshot `json:"snapshot"`
 }
 
 type ChainTracker struct {
@@ -330,11 +333,19 @@ func (t *ChainTracker) ObserveReplayBlock(obs ReplayBlockObservation) ChainRepla
 
 	state := t.ensureBlockStateLocked(obs.Block)
 	wasObserved := state.observed
+	conflictsBefore := len(t.conflicts)
 	state.observed = true
 	if obs.ParentSlot != 0 {
-		if state.parentSlot != 0 && state.parentSlot != obs.ParentSlot {
-			// Never pair a parent hash learned for one slot with another slot.
-			state.parentHash = solana.Hash{}
+		switch {
+		case obs.ParentSlot >= obs.Block.Slot:
+			t.recordConflictLocked(obs.Block.Slot, "replayed block has a non-ancestor parent slot")
+			return t.replayBlockUpdateLocked(wasObserved, conflictsBefore, obs.Block.Slot)
+		case state.parentSlot != 0 && state.parentSlot != obs.ParentSlot:
+			t.recordConflictLocked(obs.Block.Slot, "replayed block identity has conflicting parent slots")
+			return t.replayBlockUpdateLocked(wasObserved, conflictsBefore, obs.Block.Slot)
+		case state.parentHash != (solana.Hash{}) && obs.ParentHash != (solana.Hash{}) && state.parentHash != obs.ParentHash:
+			t.recordConflictLocked(obs.Block.Slot, "replayed block identity has conflicting parent block IDs")
+			return t.replayBlockUpdateLocked(wasObserved, conflictsBefore, obs.Block.Slot)
 		}
 		state.parentSlot = obs.ParentSlot
 		if obs.ParentHash != (solana.Hash{}) {
@@ -357,7 +368,31 @@ func (t *ChainTracker) ObserveReplayBlock(obs ReplayBlockObservation) ChainRepla
 	}
 	t.retryObservedFinalizedAncestryWalksFromSlotLocked(retryFrom)
 
-	return ChainReplayBlockUpdate{New: !wasObserved, Snapshot: t.snapshotLocked()}
+	return t.replayBlockUpdateLocked(wasObserved, conflictsBefore, obs.Block.Slot)
+}
+
+func (t *ChainTracker) replayBlockUpdateLocked(wasObserved bool, conflictsBefore int, preferredSlot uint64) ChainReplayBlockUpdate {
+	update := ChainReplayBlockUpdate{New: !wasObserved, Snapshot: t.snapshotLocked()}
+	if conflict, ok := t.conflicts[preferredSlot]; ok {
+		update.Conflict = true
+		update.ConflictSlot = preferredSlot
+		update.ConflictReason = conflict.reason
+		return update
+	}
+	if len(t.conflicts) <= conflictsBefore {
+		return update
+	}
+	// An ancestry walk can expose a conflict below the observed block. Select
+	// the lowest conflicting slot deterministically; the engine will latch the
+	// first safety fault and stop all irreversible decisions.
+	for slot, conflict := range t.conflicts {
+		if !update.Conflict || slot < update.ConflictSlot {
+			update.Conflict = true
+			update.ConflictSlot = slot
+			update.ConflictReason = conflict.reason
+		}
+	}
+	return update
 }
 
 // KnownBlockAtSlot returns a block identity only when Alpenglow makes it
@@ -671,12 +706,22 @@ func (t *ChainTracker) walkFinalizedAncestryLocked(start BlockID, certType Certi
 		if _, conflicted := t.conflicts[cur.Slot]; conflicted {
 			return
 		}
+		if t.prunedBeforeSlot != 0 && cur.Slot <= t.prunedBeforeSlot {
+			return
+		}
 		state := t.blocks[cur]
 		if state == nil || !state.observed {
 			return
 		}
+		if state.parentSlot == 0 || state.parentSlot >= cur.Slot {
+			return
+		}
+		if t.prunedBeforeSlot != 0 && state.parentSlot < t.prunedBeforeSlot {
+			t.recordConflictLocked(t.prunedBeforeSlot, "finalized ancestry crosses the durable root")
+			return
+		}
 		t.deriveIndirectSkipsLocked(cur, certType)
-		if state.parentSlot == 0 || state.parentSlot >= cur.Slot || state.parentHash == (solana.Hash{}) {
+		if state.parentHash == (solana.Hash{}) {
 			return
 		}
 		parent := BlockID{Slot: state.parentSlot, Hash: state.parentHash}
