@@ -197,6 +197,74 @@ func TestAlpenglowObserverPublishesCertificateBlockIDsOnly(t *testing.T) {
 	}
 }
 
+func TestAlpenglowObserverDeliversOnlyVerifiedVotesToConsumers(t *testing.T) {
+	engine, err := NewEngine(ModeAlpenglowObserver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer := engine.(*AlpenglowObserverEngine)
+	if err := observer.SetAlpenglowValidatorSet(testAlpenglowValidatorSet()); err != nil {
+		t.Fatal(err)
+	}
+	observer.SetAlpenglowEpochLookup(func(uint64) uint64 { return 1 })
+	var delivered int
+	observer.SetVotorMessageHook(func(msg alpenglow.Message) {
+		if msg.Vote != nil {
+			delivered++
+		}
+	})
+
+	vote := alpenglow.NewSkipVote(50)
+	valid := alpenglow.VoteMessage{Vote: vote, Signature: testAlpenglowVoteSignature(t, vote), Rank: 0}
+	observer.observeVotorMessage(alpenglow.Message{Vote: &valid})
+	invalid := valid
+	invalid.Vote = alpenglow.NewSkipVote(51)
+	observer.observeVotorMessage(alpenglow.Message{Vote: &invalid})
+
+	if delivered != 1 {
+		t.Fatalf("verified hook deliveries = %d, want 1", delivered)
+	}
+	snapshot := observer.Snapshot()
+	if snapshot.Alpenglow == nil || snapshot.Alpenglow.VotesObserved != 1 {
+		t.Fatalf("verified observer snapshot = %+v", snapshot.Alpenglow)
+	}
+	if snapshot.AlpenglowPool == nil || snapshot.AlpenglowPool.VerifiedVotes != 1 {
+		t.Fatalf("consensus pool snapshot = %+v", snapshot.AlpenglowPool)
+	}
+}
+
+func TestAlpenglowObserverEmitsParentReadyFromVerifiedCertificates(t *testing.T) {
+	engine, err := NewEngine(ModeAlpenglowObserver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer := engine.(*AlpenglowObserverEngine)
+	if err := observer.SetAlpenglowValidatorSet(testAlpenglowValidatorSet()); err != nil {
+		t.Fatal(err)
+	}
+	observer.SetAlpenglowEpochLookup(func(uint64) uint64 { return 1 })
+	var events []alpenglow.ConsensusEvent
+	observer.SetAlpenglowEventSink(func(event alpenglow.ConsensusEvent) { events = append(events, event) })
+
+	var blockHash solana.Hash
+	blockHash[0] = 8
+	certs := []alpenglow.Certificate{
+		{Type: alpenglow.CertificateNotarize, Slot: 1, BlockHash: blockHash, Bitmap: testAlpenglowSignerBitmap()},
+		{Type: alpenglow.CertificateSkip, Slot: 2, Bitmap: testAlpenglowSignerBitmap()},
+		{Type: alpenglow.CertificateSkip, Slot: 3, Bitmap: testAlpenglowSignerBitmap()},
+	}
+	for i := range certs {
+		certs[i].Signature = testAlpenglowCertificateSignature(t, certs[i])
+		observer.observeVotorMessage(alpenglow.NewCertificateMessage(certs[i]))
+	}
+	for _, event := range events {
+		if event.Kind == alpenglow.ConsensusEventParentReady && event.Slot == 4 && event.Block == (alpenglow.BlockID{Slot: 1, Hash: blockHash}) {
+			return
+		}
+	}
+	t.Fatalf("missing parent-ready event: %+v", events)
+}
+
 func testAlpenglowValidatorSet() alpenglow.ValidatorSet {
 	key := testAlpenglowBLSKey()
 	var pubkey bls12381.G1Affine
@@ -236,6 +304,22 @@ func testAlpenglowCertificateSignature(t *testing.T, cert alpenglow.Certificate)
 	message, err := bls12381.HashToG2(payload, []byte("BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_"))
 	if err != nil {
 		t.Fatalf("hash certificate vote: %v", err)
+	}
+	var signature bls12381.G2Affine
+	signature.ScalarMultiplication(&message, testAlpenglowBLSKey())
+	raw := signature.RawBytes()
+	return raw[:]
+}
+
+func testAlpenglowVoteSignature(t *testing.T, vote alpenglow.Vote) []byte {
+	t.Helper()
+	payload, err := alpenglow.EncodeVotePayloadToSign(vote, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := bls12381.HashToG2(payload, []byte("BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_"))
+	if err != nil {
+		t.Fatal(err)
 	}
 	var signature bls12381.G2Affine
 	signature.ScalarMultiplication(&message, testAlpenglowBLSKey())

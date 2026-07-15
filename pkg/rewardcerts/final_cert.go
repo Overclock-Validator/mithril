@@ -23,8 +23,10 @@ type VotesAggregateWire struct {
 
 // ValidatedFinalCert holds BLS-verified finalization signers from a footer final cert.
 type ValidatedFinalCert struct {
-	FinalSlot uint64
-	Signers   map[solana.PublicKey]struct{}
+	FinalSlot    uint64
+	Block        alpenglow.BlockID
+	Certificates []alpenglow.Certificate
+	Signers      map[solana.PublicKey]struct{}
 }
 
 func DecodeFinalCertificate(raw []byte) (FinalCertificate, error) {
@@ -104,6 +106,7 @@ func ValidateBlockFinalCertificate(
 	verifier.SetShredVersion(shredVersion)
 
 	signers := make(map[solana.PublicKey]struct{})
+	var certificates []alpenglow.Certificate
 	if fc.NotarAggregate != nil {
 		notarSig, err := decompressRewardCertSignature(fc.NotarAggregate.Signature)
 		if err != nil {
@@ -126,11 +129,20 @@ func ValidateBlockFinalCertificate(
 			Signature: finalizeSig,
 			Bitmap:    fc.FinalAggregate.Bitmap,
 		}
-		if _, _, err := verifier.VerifyCertificateForEpoch(validatorSet.Epoch, notarCert); err != nil {
+		verifiedNotar, _, err := verifier.VerifyCertificateForEpoch(validatorSet.Epoch, notarCert)
+		if err != nil {
 			return nil, fmt.Errorf("verify notarize final cert: %w", err)
 		}
-		if _, _, err := verifier.VerifyCertificateForEpoch(validatorSet.Epoch, finalizeCert); err != nil {
+		verifiedFinalize, _, err := verifier.VerifyCertificateForEpoch(validatorSet.Epoch, finalizeCert)
+		if err != nil {
 			return nil, fmt.Errorf("verify finalize final cert: %w", err)
+		}
+		certificates = append(certificates, verifiedNotar, verifiedFinalize)
+		// Slow finalization rewards the union of notarize and finalize
+		// signers. Agave v4.2.0-beta.0 accidentally retained only finalize
+		// signers; 461671daf4 corrected this after the beta tag.
+		if err := collectFinalCertSigners(validatorSet, notarCert, signers); err != nil {
+			return nil, err
 		}
 		if err := collectFinalCertSigners(validatorSet, finalizeCert, signers); err != nil {
 			return nil, err
@@ -147,9 +159,11 @@ func ValidateBlockFinalCertificate(
 			Signature: finalizeSig,
 			Bitmap:    fc.FinalAggregate.Bitmap,
 		}
-		if _, _, err := verifier.VerifyCertificateForEpoch(validatorSet.Epoch, fastCert); err != nil {
+		verifiedFast, _, err := verifier.VerifyCertificateForEpoch(validatorSet.Epoch, fastCert)
+		if err != nil {
 			return nil, fmt.Errorf("verify fast finalize final cert: %w", err)
 		}
+		certificates = append(certificates, verifiedFast)
 		if err := collectFinalCertSigners(validatorSet, fastCert, signers); err != nil {
 			return nil, err
 		}
@@ -158,8 +172,10 @@ func ValidateBlockFinalCertificate(
 		return nil, fmt.Errorf("final certificate for slot %d has no signers", fc.Slot)
 	}
 	return &ValidatedFinalCert{
-		FinalSlot: fc.Slot,
-		Signers:   signers,
+		FinalSlot:    fc.Slot,
+		Block:        alpenglow.BlockID{Slot: fc.Slot, Hash: fc.BlockID},
+		Certificates: certificates,
+		Signers:      signers,
 	}, nil
 }
 

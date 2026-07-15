@@ -21,7 +21,9 @@ import (
 	"syscall"
 	"time"
 
+	"crypto/ed25519"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
+	"github.com/Overclock-Validator/mithril/pkg/alpenglow"
 	"github.com/Overclock-Validator/mithril/pkg/arena"
 	"github.com/Overclock-Validator/mithril/pkg/blockprod"
 	"github.com/Overclock-Validator/mithril/pkg/config"
@@ -29,12 +31,12 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/forge"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
-	"github.com/Overclock-Validator/mithril/pkg/rewardcerts"
 	"github.com/Overclock-Validator/mithril/pkg/lightbringer"
 	"github.com/Overclock-Validator/mithril/pkg/lthash"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/progress"
 	"github.com/Overclock-Validator/mithril/pkg/replay"
+	"github.com/Overclock-Validator/mithril/pkg/rewardcerts"
 	"github.com/Overclock-Validator/mithril/pkg/rpcserver"
 	"github.com/Overclock-Validator/mithril/pkg/sbpf"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
@@ -45,9 +47,8 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/tpu"
 	"github.com/Overclock-Validator/mithril/pkg/turbine"
 	"github.com/Overclock-Validator/mithril/pkg/version"
-	"crypto/ed25519"
-	solrpc "github.com/gagliardetto/solana-go/rpc"
 	"github.com/gagliardetto/solana-go"
+	solrpc "github.com/gagliardetto/solana-go/rpc"
 	"github.com/mr-tron/base58"
 	"github.com/spf13/cobra"
 	"k8s.io/klog/v2"
@@ -132,10 +133,10 @@ var (
 	turbineRepairOnly       bool
 
 	// Block production / TPU ingress
-	enableBlockProduction         bool
-	blockProductionIdentityPath   string
-	blockProductionTPUQUICBind    string
-	blockProductionAdvertisedIP   string
+	enableBlockProduction           bool
+	blockProductionIdentityPath     string
+	blockProductionTPUQUICBind      string
+	blockProductionAdvertisedIP     string
 	blockProductionSigverifyWorkers int
 	blockProductionVotorBindAddr    string
 
@@ -1632,6 +1633,7 @@ postBootstrap:
 		engine, err := consensusengine.NewEngineWithConfig(mode, consensusengine.Config{
 			AlpenglowObserverBindAddr: alpenglowObserverBindAddr,
 			AlpenglowMaxMessageBytes:  int64(config.GetInt("consensus.alpenglow_max_message_bytes")),
+			AlpenglowShredVersion:     uint16(turbineShredVersion),
 		})
 		if err != nil {
 			klog.Fatalf("consensus engine: %v", err)
@@ -1646,6 +1648,14 @@ postBootstrap:
 			if schedule := epochScheduleFromState(mithrilState); schedule != nil {
 				epochSink.SetAlpenglowEpochLookup(schedule.GetEpoch)
 			}
+		}
+		if rootSink, ok := engine.(consensusengine.AlpenglowRootSink); ok && mithrilState != nil {
+			rootSlot := mithrilState.GetCurrentSlot()
+			rootBlock := alpenglow.BlockID{Slot: rootSlot}
+			if blockID, exists := global.AlpenglowBlockID(rootSlot); exists {
+				rootBlock.Hash = blockID
+			}
+			rootSink.SetAlpenglowRoot(rootBlock)
 		}
 		defer func() {
 			if err := engine.Close(); err != nil {
@@ -1736,21 +1746,12 @@ postBootstrap:
 				}
 			}
 		}
-		votorBind := blockProductionVotorBindAddr
-		if !rewardCertVotorActive && strings.TrimSpace(votorBind) != "" {
-			maxVotorMsg := int64(config.GetInt("consensus.alpenglow_max_message_bytes"))
-			votorListener, err := rewardcerts.StartVotorListener(ctx, rewardCertBuilder, votorBind, maxVotorMsg)
-			if err != nil {
-				klog.Fatalf("block production Votor listener: %v", err)
+		if !rewardCertVotorActive {
+			if strings.TrimSpace(blockProductionVotorBindAddr) != "" {
+				mlog.Log.Warnf("block production direct Votor listener is disabled because it cannot safely feed unverified votes; configure consensus.alpenglow_observer_bind_addr so the shared BLS verifier supplies reward votes")
+			} else {
+				mlog.Log.Warnf("block production has no verified Votor vote source; footer reward certificates will be empty until the Alpenglow observer is configured")
 			}
-			defer func() {
-				if err := votorListener.Close(); err != nil {
-					mlog.Log.Warnf("block production Votor listener shutdown: %v", err)
-				}
-			}()
-			rewardCertVotorActive = true
-		} else if !rewardCertVotorActive {
-			mlog.Log.Warnf("block production has no Votor vote source; footer reward certificates will be empty until Votor votes are received")
 		}
 		leaderLoop := blockprod.NewLeaderLoop(blockprod.LeaderLoopConfig{
 			Controller:     blockProdController,
@@ -1836,8 +1837,8 @@ postBootstrap:
 		CatchupTipGateThreshold: blockCatchupTipGateThreshold,
 
 		// Near-tip tuning
-		NearTipPollMs:    blockNearTipPollMs,
-		NearTipLookahead: blockNearTipLookahead,
+		NearTipPollMs:            blockNearTipPollMs,
+		NearTipLookahead:         blockNearTipLookahead,
 		TPUQUICAdvertise:         tpuAdvertise,
 		GossipIdentity:           gossipIdentity,
 		GossipClient:             sharedGossip,

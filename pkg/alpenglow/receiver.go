@@ -32,6 +32,10 @@ type ReceiverConfig struct {
 	Decode          DecodeOptions
 	LogInterval     time.Duration
 	OnMessage       func(Message)
+	// SkipObserver prevents decoded-but-unverified network messages from being
+	// retained by Observer. Consensus ingress sets this and observes only after
+	// BLS/stake verification; standalone diagnostic receivers may leave it off.
+	SkipObserver bool
 }
 
 func DefaultReceiverConfig() ReceiverConfig {
@@ -210,9 +214,11 @@ func (r *Receiver) handleStream(stream *quic.ReceiveStream) {
 		r.recordDecodeError()
 		return
 	}
-	if _, err := r.observer.ObserveMessage(msg); err != nil {
-		r.recordDecodeError()
-		return
+	if !r.cfg.SkipObserver {
+		if _, err := r.observer.ObserveMessage(msg); err != nil {
+			r.recordDecodeError()
+			return
+		}
 	}
 	if r.cfg.OnMessage != nil {
 		r.cfg.OnMessage(msg)

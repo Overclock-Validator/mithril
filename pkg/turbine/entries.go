@@ -95,9 +95,7 @@ func DecodeEntriesAndAlpenglowMarkersFromDataShreds(shreds []*Shred) ([]Entry, *
 		return shreds[i].Index < shreds[j].Index
 	})
 
-	var entries []Entry
-	var parentInfo *AlpenglowParentInfo
-	var blockFooter *BlockFooter
+	var decoded []decodedSlotComponent
 	var batchBytes []byte
 	var batchStart uint32
 	var haveBatch bool
@@ -113,36 +111,37 @@ func DecodeEntriesAndAlpenglowMarkersFromDataShreds(shreds []*Shred) ([]Entry, *
 		if !shred.DataComplete() {
 			continue
 		}
-		if parent, footer, ok, err := decodeAlpenglowMarker(batchBytes, batchStart); err != nil {
-			return nil, nil, nil, fmt.Errorf("decode alpenglow block marker ending at shred %d: %w", shred.Index, err)
-		} else if ok {
-			if parent != nil {
-				parentInfo, err = mergeAlpenglowParentInfo(parentInfo, parent)
-				if err != nil {
-					return nil, nil, nil, fmt.Errorf("merge alpenglow parent marker ending at shred %d: %w", shred.Index, err)
-				}
-			}
-			if footer != nil {
-				blockFooter = footer
-			}
-			batchBytes = nil
-			haveBatch = false
-			continue
-		}
-		batchEntries, err := decodeEntryBatch(batchBytes)
+		component, err := UnmarshalBlockComponent(batchBytes)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("decode entry batch ending at shred %d: %w", shred.Index, err)
+			return nil, nil, nil, fmt.Errorf("decode block component ending at shred %d: %w", shred.Index, err)
 		}
-		entries = append(entries, batchEntries...)
-		// Decoded transactions retain slices into the batch buffer for instruction data.
-		// Keep the backing array alive instead of reusing and overwriting it.
+		decoded = append(decoded, decodedSlotComponent{component: component, batchStart: batchStart})
 		batchBytes = nil
 		haveBatch = false
 	}
 	if len(batchBytes) != 0 {
 		return nil, nil, nil, fmt.Errorf("slot ended with %d undecoded entry bytes", len(batchBytes))
 	}
-	return entries, parentInfo, blockFooter, nil
+
+	var slot, parentSlot uint64
+	for _, shred := range shreds {
+		if shred == nil || shred.Type != ShredTypeData {
+			continue
+		}
+		slot = shred.Slot
+		parentSlot = shred.ParentSlot()
+		break
+	}
+	processor := componentStreamProcessor{slot: slot, shredParentSlot: parentSlot}
+	for index, component := range decoded {
+		if err := processor.consume(component, index == len(decoded)-1); err != nil {
+			return nil, nil, nil, fmt.Errorf("slot %d component %d: %w", slot, index, err)
+		}
+	}
+	if err := processor.finish(); err != nil {
+		return nil, nil, nil, fmt.Errorf("slot %d component stream: %w", slot, err)
+	}
+	return processor.entries, processor.parent, processor.footer, nil
 }
 
 func decodeEntryBatch(data []byte) ([]Entry, error) {

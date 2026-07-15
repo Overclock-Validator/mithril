@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,6 +14,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/Overclock-Validator/mithril/pkg/rewardcerts"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -72,13 +74,28 @@ type AlpenglowEpochLookupSink interface {
 	SetAlpenglowEpochLookup(fn func(slot uint64) uint64)
 }
 
+type AlpenglowRootSink interface {
+	SetAlpenglowRoot(block alpenglow.BlockID)
+}
+
+type AlpenglowEventSink func(alpenglow.ConsensusEvent)
+
+type AlpenglowEventPublisher interface {
+	SetAlpenglowEventSink(sink AlpenglowEventSink)
+}
+
+type AlpenglowParentSource interface {
+	AlpenglowBlockProductionParent(slot uint64) alpenglow.BlockProductionParent
+}
+
 type Snapshot struct {
-	Mode           Mode                     `json:"mode"`
-	ObservedBlocks uint64                   `json:"observed_blocks"`
-	ReplayedSlots  uint64                   `json:"replayed_slots"`
-	Alpenglow      *alpenglow.Snapshot      `json:"alpenglow,omitempty"`
-	AlpenglowChain *alpenglow.ChainSnapshot `json:"alpenglow_chain,omitempty"`
-	Receiver       *alpenglow.ReceiverStats `json:"receiver,omitempty"`
+	Mode           Mode                             `json:"mode"`
+	ObservedBlocks uint64                           `json:"observed_blocks"`
+	ReplayedSlots  uint64                           `json:"replayed_slots"`
+	Alpenglow      *alpenglow.Snapshot              `json:"alpenglow,omitempty"`
+	AlpenglowChain *alpenglow.ChainSnapshot         `json:"alpenglow_chain,omitempty"`
+	AlpenglowPool  *alpenglow.ConsensusPoolSnapshot `json:"alpenglow_pool,omitempty"`
+	Receiver       *alpenglow.ReceiverStats         `json:"receiver,omitempty"`
 }
 
 type Engine interface {
@@ -91,8 +108,11 @@ type Engine interface {
 }
 
 type Config struct {
-	AlpenglowObserverBindAddr string
-	AlpenglowMaxMessageBytes  int64
+	AlpenglowObserverBindAddr  string
+	AlpenglowMaxMessageBytes   int64
+	AlpenglowVoteVerifyWorkers int
+	AlpenglowVoteVerifyQueue   int
+	AlpenglowShredVersion      uint16
 }
 
 func NormalizeMode(raw string) (Mode, error) {
@@ -121,14 +141,20 @@ func NewEngineWithConfig(mode Mode, cfg Config) (Engine, error) {
 	case ModeClassic:
 		return &ClassicEngine{}, nil
 	case ModeAlpenglowObserver:
-		return &AlpenglowObserverEngine{
+		verifier := alpenglow.NewCertificateVerifier()
+		verifier.SetShredVersion(cfg.AlpenglowShredVersion)
+		engine := &AlpenglowObserverEngine{
 			observer:                alpenglow.NewObserver(),
 			chain:                   newAlpenglowObserverChainTracker(),
-			verifier:                alpenglow.NewCertificateVerifier(),
+			verifier:                verifier,
 			receiverBindAddr:        strings.TrimSpace(cfg.AlpenglowObserverBindAddr),
 			receiverMaxMessageBytes: cfg.AlpenglowMaxMessageBytes,
 			recentBlockIDs:          make(map[uint64]solana.Hash),
-		}, nil
+			voteVerifyWorkers:       cfg.AlpenglowVoteVerifyWorkers,
+			voteVerifyQueueSize:     cfg.AlpenglowVoteVerifyQueue,
+		}
+		engine.pool = alpenglow.NewConsensusPool(alpenglow.DefaultConsensusPoolConfig())
+		return engine, nil
 	case ModeAlpenglow:
 		return &AlpenglowEngine{}, nil
 	default:
@@ -178,6 +204,7 @@ type AlpenglowObserverEngine struct {
 	observer                *alpenglow.Observer
 	chain                   *alpenglow.ChainTracker
 	verifier                *alpenglow.CertificateVerifier
+	pool                    *alpenglow.ConsensusPool
 	receiverBindAddr        string
 	receiverMaxMessageBytes int64
 	receiver                *alpenglow.Receiver
@@ -204,15 +231,31 @@ type AlpenglowObserverEngine struct {
 	lastVoteVerifyErr       string
 	votorMessageHookMu      sync.RWMutex
 	votorMessageHook        func(alpenglow.Message)
+	eventSinkMu             sync.RWMutex
+	eventSink               AlpenglowEventSink
+	voteVerifyWorkers       int
+	voteVerifyQueueSize     int
+	voteVerifyQueue         chan alpenglow.VoteMessage
+	voteVerifyCancel        context.CancelFunc
+	voteVerifyWG            sync.WaitGroup
+	voteVerifyDropped       atomic.Uint64
+	footerFinalMu           sync.Mutex
+	pendingFooterFinals     map[uint64][]byte
 }
 
-// SetVotorMessageHook registers an additional handler for inbound Votor QUIC
-// messages. Block production uses this to accumulate skip/notar votes for footer
-// reward certificates without opening a second QUIC listener.
+// SetVotorMessageHook registers a handler for verified Votor messages. Raw
+// network input is never delivered to this hook. Block production uses it to
+// accumulate skip/notar votes for footer reward certificates.
 func (e *AlpenglowObserverEngine) SetVotorMessageHook(fn func(alpenglow.Message)) {
 	e.votorMessageHookMu.Lock()
 	e.votorMessageHook = fn
 	e.votorMessageHookMu.Unlock()
+}
+
+func (e *AlpenglowObserverEngine) SetAlpenglowEventSink(sink AlpenglowEventSink) {
+	e.eventSinkMu.Lock()
+	e.eventSink = sink
+	e.eventSinkMu.Unlock()
 }
 
 func (e *AlpenglowObserverEngine) Name() string { return string(ModeAlpenglowObserver) }
@@ -221,17 +264,20 @@ func (e *AlpenglowObserverEngine) Start(ctx context.Context) error {
 	observer := e.ensureObserver()
 	e.ensureChain()
 	e.ensureVerifier()
+	e.ensurePool()
 	mlog.Log.Infof("Consensus engine started: %s (passive; no votes will be signed)", e.Name())
 	mlog.Log.FileOnlyf("ALPENGLOW observer: certified path resolver requires stake and aggregate BLS signature verified certificates")
 	if e.receiverBindAddr == "" {
 		mlog.Log.FileOnlyf("ALPENGLOW observer: Votor receiver disabled; set consensus.alpenglow_observer_bind_addr to listen for Votor QUIC messages")
 		return nil
 	}
+	e.startVoteVerifier(ctx)
 
 	receiver, err := alpenglow.NewReceiver(alpenglow.ReceiverConfig{
 		BindAddr:        e.receiverBindAddr,
 		MaxMessageBytes: e.receiverMaxMessageBytes,
 		OnMessage:       e.observeVotorMessage,
+		SkipObserver:    true,
 	}, observer)
 	if err != nil {
 		return err
@@ -247,6 +293,7 @@ func (e *AlpenglowObserverEngine) Start(ctx context.Context) error {
 
 func (e *AlpenglowObserverEngine) ObserveBlock(_ context.Context, obs BlockObservation) error {
 	if obs.Block != nil {
+		e.ensurePool().NoteLiveSlot(obs.Block.Slot)
 		if e.observedBlocks.Add(1) == 1 {
 			mlog.Log.Infof("ALPENGLOW observer: first replay block observed at slot %d (source=%s, alpenglow_block_id=%t)", obs.Block.Slot, obs.Source, obs.Block.HasAlpenglowBlockID)
 		}
@@ -267,12 +314,14 @@ func (e *AlpenglowObserverEngine) ObserveBlock(_ context.Context, obs BlockObser
 			e.observeChainReplayBlock(replayObs)
 			e.rememberRecentAlpenglowBlockID(blockID.Slot, blockID.Hash)
 		}
+		e.observeFooterFinalCertificate(obs.Block)
 	}
 	return nil
 }
 
 func (e *AlpenglowObserverEngine) OnReplayResult(_ context.Context, result SlotReplayResult) error {
 	if result.Slot != 0 {
+		e.ensurePool().NoteLiveSlot(result.Slot)
 		if e.replayedSlots.Add(1) == 1 {
 			mlog.Log.Infof("ALPENGLOW observer: first replay result at slot %d", result.Slot)
 		}
@@ -303,6 +352,10 @@ func (e *AlpenglowObserverEngine) Snapshot() Snapshot {
 	if e.chain != nil {
 		chainSnapshot := e.chain.Snapshot()
 		snapshot.AlpenglowChain = &chainSnapshot
+	}
+	if e.pool != nil {
+		poolSnapshot := e.pool.Snapshot()
+		snapshot.AlpenglowPool = &poolSnapshot
 	}
 	return snapshot
 }
@@ -336,28 +389,102 @@ func (e *AlpenglowObserverEngine) SetAlpenglowRepairPrioritySink(sink AlpenglowR
 }
 
 func (e *AlpenglowObserverEngine) observeVotorMessage(msg alpenglow.Message) {
+	if msg.Vote != nil {
+		if e.voteVerifyQueue != nil {
+			select {
+			case e.voteVerifyQueue <- *msg.Vote:
+			default:
+				e.voteVerifyDropped.Add(1)
+			}
+			return
+		}
+		e.processVotorVote(*msg.Vote)
+		return
+	}
+	if msg.Certificate != nil {
+		e.processVotorCertificate(*msg.Certificate)
+	}
+}
+
+func (e *AlpenglowObserverEngine) processVotorVote(msg alpenglow.VoteMessage) {
+	result, err := e.verifyVoteMessage(msg)
+	e.recordVoteVerification(msg, result, err)
+	if err != nil {
+		return
+	}
+	if _, err := e.ensureObserver().ObserveVote(msg); err != nil {
+		mlog.Log.FileOnlyf("ALPENGLOW observer: ignored verified vote: %v", err)
+		return
+	}
+	update, err := e.ensurePool().AddVerifiedVote(alpenglow.VerifiedVote{Message: msg, Result: result})
+	if err != nil {
+		mlog.Log.FileOnlyf("ALPENGLOW observer: verified vote rejected by consensus pool: %v", err)
+		return
+	}
+	e.handleConsensusUpdate(update)
+	e.deliverVerifiedVotorMessage(alpenglow.Message{Vote: &msg})
+}
+
+func (e *AlpenglowObserverEngine) processVotorCertificate(cert alpenglow.Certificate) {
+	verified, result, err := e.verifyCertificate(cert)
+	if err != nil {
+		e.logCertificateVerifyDrop(cert, result, err)
+		return
+	}
+	e.acceptVerifiedCertificate(verified)
+}
+
+func (e *AlpenglowObserverEngine) acceptVerifiedCertificate(verified alpenglow.Certificate) {
+	if _, err := e.ensureObserver().ObserveCertificate(verified); err != nil {
+		mlog.Log.FileOnlyf("ALPENGLOW observer: ignored verified certificate: %v", err)
+		return
+	}
+	if _, err := e.ensureChain().ObserveCertificate(verified); err != nil {
+		mlog.Log.FileOnlyf("ALPENGLOW observer: ignored invalid certificate: %v", err)
+		return
+	}
+	update, err := e.ensurePool().AddVerifiedCertificate(verified)
+	if err != nil {
+		mlog.Log.FileOnlyf("ALPENGLOW observer: verified certificate rejected by consensus pool: %v", err)
+		return
+	}
+	e.observeVotorBlockID(alpenglow.NewCertificateMessage(verified))
+	e.handleConsensusUpdate(update)
+	e.deliverVerifiedVotorMessage(alpenglow.NewCertificateMessage(verified))
+}
+
+func (e *AlpenglowObserverEngine) handleConsensusUpdate(update alpenglow.ConsensusUpdate) {
+	for _, cert := range update.Certificates {
+		if _, err := e.ensureObserver().ObserveCertificate(cert); err != nil {
+			mlog.Log.FileOnlyf("ALPENGLOW observer: local certificate observer rejected %s@%d: %v", cert.Type, cert.Slot, err)
+			continue
+		}
+		if _, err := e.ensureChain().ObserveCertificate(cert); err != nil {
+			mlog.Log.FileOnlyf("ALPENGLOW observer: local certificate chain rejected %s@%d: %v", cert.Type, cert.Slot, err)
+			continue
+		}
+		e.observeVotorBlockID(alpenglow.NewCertificateMessage(cert))
+	}
+	for _, event := range update.Events {
+		if event.Kind == alpenglow.ConsensusEventParentReady && event.Block.Slot != 0 {
+			e.prioritizeRepairSlot(event.Block.Slot)
+		}
+		e.eventSinkMu.RLock()
+		sink := e.eventSink
+		e.eventSinkMu.RUnlock()
+		if sink != nil {
+			sink(event)
+		}
+	}
+}
+
+func (e *AlpenglowObserverEngine) deliverVerifiedVotorMessage(msg alpenglow.Message) {
 	e.votorMessageHookMu.RLock()
 	hook := e.votorMessageHook
 	e.votorMessageHookMu.RUnlock()
 	if hook != nil {
 		hook(msg)
 	}
-
-	if msg.Vote != nil {
-		e.sampleVoteVerification(*msg.Vote)
-	}
-	if msg.Certificate != nil {
-		verified, result, err := e.verifyCertificate(*msg.Certificate)
-		if err != nil {
-			e.logCertificateVerifyDrop(*msg.Certificate, result, err)
-			return
-		} else if _, err := e.ensureChain().ObserveCertificate(verified); err != nil {
-			mlog.Log.FileOnlyf("ALPENGLOW observer: ignored invalid certificate: %v", err)
-			return
-		}
-		msg.Certificate = &verified
-	}
-	e.observeVotorBlockID(msg)
 }
 
 func (e *AlpenglowObserverEngine) observeVotorBlockID(msg alpenglow.Message) {
@@ -411,6 +538,14 @@ func (e *AlpenglowObserverEngine) observeVotorBlockID(msg alpenglow.Message) {
 
 func (e *AlpenglowObserverEngine) NextAlpenglowDecision(anchorSlot uint64) (alpenglow.ChainDecision, bool) {
 	return e.ensureChain().NextDecision(anchorSlot)
+}
+
+func (e *AlpenglowObserverEngine) SetAlpenglowRoot(block alpenglow.BlockID) {
+	e.ensurePool().SetRoot(block)
+}
+
+func (e *AlpenglowObserverEngine) AlpenglowBlockProductionParent(slot uint64) alpenglow.BlockProductionParent {
+	return e.ensurePool().BlockProductionParent(slot)
 }
 
 func (e *AlpenglowObserverEngine) prioritizeRepairSlot(slot uint64) {
@@ -509,9 +644,76 @@ func (e *AlpenglowObserverEngine) SetAlpenglowValidatorSet(set alpenglow.Validat
 	if err := e.ensureVerifier().SetValidatorSet(set); err != nil {
 		return err
 	}
+	e.retryFooterFinalCertificates(set.Epoch)
 	mlog.Log.Infof("ALPENGLOW observer: installed validator set for epoch %d (validators=%d total_stake=%d)",
 		set.Epoch, len(set.Validators), set.TotalStake)
 	return nil
+}
+
+func (e *AlpenglowObserverEngine) observeFooterFinalCertificate(block *block.Block) {
+	if block == nil || len(block.BlockFinalCert) == 0 {
+		return
+	}
+	decoded, err := rewardcerts.DecodeFinalCertificate(block.BlockFinalCert)
+	if err != nil {
+		mlog.Log.FileOnlyf("ALPENGLOW observer: slot %d footer final certificate decode failed: %v", block.Slot, err)
+		return
+	}
+	epoch, ok := e.alpenglowEpochForSlot(decoded.Slot)
+	if !ok {
+		e.deferFooterFinalCertificate(decoded.Slot, block.BlockFinalCert)
+		return
+	}
+	set, ok := e.ensureVerifier().ValidatorSetForEpoch(epoch)
+	if !ok {
+		e.deferFooterFinalCertificate(decoded.Slot, block.BlockFinalCert)
+		return
+	}
+	validated, err := rewardcerts.ValidateBlockFinalCertificate(block.BlockFinalCert, set, e.ensureVerifier().ShredVersion())
+	if err != nil {
+		mlog.Log.FileOnlyf("ALPENGLOW observer: slot %d footer final certificate rejected: %v", block.Slot, err)
+		return
+	}
+	for _, cert := range validated.Certificates {
+		e.acceptVerifiedCertificate(cert)
+	}
+}
+
+func (e *AlpenglowObserverEngine) deferFooterFinalCertificate(slot uint64, raw []byte) {
+	e.footerFinalMu.Lock()
+	if e.pendingFooterFinals == nil {
+		e.pendingFooterFinals = make(map[uint64][]byte)
+	}
+	if len(e.pendingFooterFinals) < 4096 {
+		e.pendingFooterFinals[slot] = append([]byte(nil), raw...)
+	}
+	e.footerFinalMu.Unlock()
+}
+
+func (e *AlpenglowObserverEngine) retryFooterFinalCertificates(epoch uint64) {
+	e.footerFinalMu.Lock()
+	var pending [][]byte
+	for slot, raw := range e.pendingFooterFinals {
+		if resolved, ok := e.alpenglowEpochForSlot(slot); ok && resolved == epoch {
+			pending = append(pending, raw)
+			delete(e.pendingFooterFinals, slot)
+		}
+	}
+	e.footerFinalMu.Unlock()
+	set, ok := e.ensureVerifier().ValidatorSetForEpoch(epoch)
+	if !ok {
+		return
+	}
+	for _, raw := range pending {
+		validated, err := rewardcerts.ValidateBlockFinalCertificate(raw, set, e.ensureVerifier().ShredVersion())
+		if err != nil {
+			mlog.Log.FileOnlyf("ALPENGLOW observer: deferred footer final certificate rejected: %v", err)
+			continue
+		}
+		for _, cert := range validated.Certificates {
+			e.acceptVerifiedCertificate(cert)
+		}
+	}
 }
 
 func (e *AlpenglowObserverEngine) SetAlpenglowEpochLookup(fn func(slot uint64) uint64) {
@@ -521,10 +723,15 @@ func (e *AlpenglowObserverEngine) SetAlpenglowEpochLookup(fn func(slot uint64) u
 }
 
 func (e *AlpenglowObserverEngine) Close() error {
+	var receiverErr error
 	if e.receiver != nil {
-		return e.receiver.Close()
+		receiverErr = e.receiver.Close()
 	}
-	return nil
+	if e.voteVerifyCancel != nil {
+		e.voteVerifyCancel()
+	}
+	e.voteVerifyWG.Wait()
+	return receiverErr
 }
 
 func (e *AlpenglowObserverEngine) ensureObserver() *alpenglow.Observer {
@@ -546,6 +753,51 @@ func (e *AlpenglowObserverEngine) ensureVerifier() *alpenglow.CertificateVerifie
 		e.verifier = alpenglow.NewCertificateVerifier()
 	}
 	return e.verifier
+}
+
+func (e *AlpenglowObserverEngine) ensurePool() *alpenglow.ConsensusPool {
+	if e.pool == nil {
+		e.pool = alpenglow.NewConsensusPool(alpenglow.DefaultConsensusPoolConfig())
+	}
+	return e.pool
+}
+
+func (e *AlpenglowObserverEngine) startVoteVerifier(parent context.Context) {
+	if e.voteVerifyQueue != nil {
+		return
+	}
+	workers := e.voteVerifyWorkers
+	if workers <= 0 {
+		workers = runtime.GOMAXPROCS(0) / 4
+		if workers < 2 {
+			workers = 2
+		}
+		if workers > 8 {
+			workers = 8
+		}
+	}
+	queueSize := e.voteVerifyQueueSize
+	if queueSize <= 0 {
+		queueSize = 8192
+	}
+	ctx, cancel := context.WithCancel(parent)
+	e.voteVerifyCancel = cancel
+	e.voteVerifyQueue = make(chan alpenglow.VoteMessage, queueSize)
+	for range workers {
+		e.voteVerifyWG.Add(1)
+		go func() {
+			defer e.voteVerifyWG.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case vote := <-e.voteVerifyQueue:
+					e.processVotorVote(vote)
+				}
+			}
+		}()
+	}
+	mlog.Log.FileOnlyf("ALPENGLOW observer: vote BLS verifier workers=%d queue=%d", workers, queueSize)
 }
 
 func (e *AlpenglowObserverEngine) verifyCertificate(cert alpenglow.Certificate) (alpenglow.Certificate, alpenglow.CertificateVerifyResult, error) {
@@ -624,6 +876,42 @@ func (e *AlpenglowObserverEngine) logCertificateVerifyDrop(cert alpenglow.Certif
 		formatSignerSamples(diag.SignerSamples),
 		diag.BitmapError,
 	)
+}
+
+func (e *AlpenglowObserverEngine) recordVoteVerification(msg alpenglow.VoteMessage, result alpenglow.VoteVerifyResult, err error) {
+	now := time.Now()
+	e.voteVerifyLogMu.Lock()
+	e.voteVerifyChecked++
+	switch {
+	case err == nil:
+		e.voteVerifyOK++
+	case strings.Contains(err.Error(), "no validator set"):
+		e.voteVerifyNoSet++
+		e.lastVoteVerifyErr = err.Error()
+	default:
+		e.voteVerifyFailed++
+		e.lastVoteVerifyErr = err.Error()
+	}
+	shouldLog := e.lastVoteVerifyLog.IsZero() || now.Sub(e.lastVoteVerifyLog) >= 10*time.Second
+	if shouldLog {
+		e.lastVoteVerifyLog = now
+	}
+	checked := e.voteVerifyChecked
+	ok := e.voteVerifyOK
+	failed := e.voteVerifyFailed
+	noSet := e.voteVerifyNoSet
+	dropped := e.voteVerifyDropped.Load()
+	e.voteVerifyLogMu.Unlock()
+	if !shouldLog {
+		return
+	}
+	if err != nil {
+		mlog.Log.FileOnlyf("ALPENGLOW observer: vote BLS verification rejected: checked=%d ok=%d failed=%d no_set=%d queue_dropped=%d vote=%s slot=%d rank=%d err=%v",
+			checked, ok, failed, noSet, dropped, msg.Vote.Type, msg.Vote.Slot, msg.Rank, err)
+		return
+	}
+	mlog.Log.FileOnlyf("ALPENGLOW observer: vote BLS verification: checked=%d ok=%d failed=%d no_set=%d queue_dropped=%d latest_vote=%s slot=%d rank=%d epoch=%d stake=%d/%d",
+		checked, ok, failed, noSet, dropped, msg.Vote.Type, msg.Vote.Slot, msg.Rank, result.Epoch, result.Stake, result.TotalStake)
 }
 
 func (e *AlpenglowObserverEngine) sampleVoteVerification(msg alpenglow.VoteMessage) {

@@ -124,10 +124,10 @@ type CertificateDiagnostics struct {
 }
 
 type CertificateVerifier struct {
-	mu            sync.RWMutex
-	sets          map[uint64]ValidatorSet
-	latestEpoch   uint64
-	maxValidators int
+	mu                  sync.RWMutex
+	sets                map[uint64]ValidatorSet
+	latestEpoch         uint64
+	maxValidators       int
 	clusterShredVersion uint16
 }
 
@@ -152,6 +152,15 @@ func (v *CertificateVerifier) shredVersion() uint16 {
 	version := v.clusterShredVersion
 	v.mu.RUnlock()
 	return version
+}
+
+func (v *CertificateVerifier) ShredVersion() uint16 { return v.shredVersion() }
+
+func (v *CertificateVerifier) ValidatorSetForEpoch(epoch uint64) (ValidatorSet, bool) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	set, ok := v.sets[epoch]
+	return set, ok
 }
 
 func votePayloadBytes(shredVersion uint16, vote Vote) ([]byte, error) {
