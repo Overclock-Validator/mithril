@@ -36,6 +36,8 @@ type DeferredBlockCommit struct {
 	AlpenglowBlockID        solana.Hash
 	HasAlpenglowChainedRoot bool
 	AlpenglowChainedRoot    solana.Hash
+	AwaitingReplaySnapshot  bool
+	CapturedSnapshot        *ReplayHeadSnapshot
 }
 
 // ReplayAuxState contains replay-loop state that is not represented by account
@@ -119,6 +121,7 @@ type SpeculativeReplay struct {
 	foldClosed          bool
 	foldErr             error
 	rootSink            func(alpenglow.BlockID)
+	durableRootSink     func(uint64)
 	cleanedRewardSpools map[uint64]struct{}
 	epochResumeByEpoch  map[uint64]*EpochResumeMetadata
 }
@@ -194,28 +197,39 @@ func (sr *SpeculativeReplay) SetRootSink(sink func(alpenglow.BlockID)) {
 	sr.mu.Unlock()
 }
 
+func (sr *SpeculativeReplay) SetDurableRootSink(sink func(uint64)) {
+	sr.mu.Lock()
+	sr.durableRootSink = sink
+	sr.mu.Unlock()
+}
+
 func CaptureHeadSnapshot(slotCtx *sealevel.SlotCtx, replayCtx *ReplayCtx, blockHeight uint64) *ReplayHeadSnapshot {
 	if slotCtx == nil || replayCtx == nil {
 		return nil
 	}
+	snapshot := captureSlotStateSnapshot(slotCtx, blockHeight, global.TransactionCount())
+	applyReplayContext(snapshot, replayCtx)
+	return snapshot
+}
+
+// captureSlotStateSnapshot copies state that can change when a consecutive
+// local leader slot starts. It must run on the producer path before that next
+// slot can mutate the global sysvar caches.
+func captureSlotStateSnapshot(slotCtx *sealevel.SlotCtx, blockHeight, transactionCount uint64) *ReplayHeadSnapshot {
+	if slotCtx == nil {
+		return nil
+	}
 	snapshot := &ReplayHeadSnapshot{
-		Slot:                    slotCtx.Slot,
-		ParentSlot:              slotCtx.ParentSlot,
-		BlockHeight:             blockHeight,
-		Epoch:                   slotCtx.Epoch,
-		FinalBankhash:           append([]byte(nil), slotCtx.FinalBankhash...),
-		Blockhash:               slotCtx.Blockhash,
-		LatestEvictedBlockhash:  slotCtx.LatestEvictedBlockhash,
-		NumSignatures:           slotCtx.NumSignatures,
-		Capitalization:          replayCtx.Capitalization,
-		SlotsPerYear:            replayCtx.SlotsPerYear,
-		InflationInitial:        replayCtx.Inflation.Initial,
-		InflationTerminal:       replayCtx.Inflation.Terminal,
-		InflationTaper:          replayCtx.Inflation.Taper,
-		InflationFoundation:     replayCtx.Inflation.FoundationVal,
-		InflationFoundationTerm: replayCtx.Inflation.FoundationTerm,
-		TransactionCount:        global.TransactionCount(),
-		EpochAuthorizedVoters:   global.EpochAuthorizedVoters(),
+		Slot:                   slotCtx.Slot,
+		ParentSlot:             slotCtx.ParentSlot,
+		BlockHeight:            blockHeight,
+		Epoch:                  slotCtx.Epoch,
+		FinalBankhash:          append([]byte(nil), slotCtx.FinalBankhash...),
+		Blockhash:              slotCtx.Blockhash,
+		LatestEvictedBlockhash: slotCtx.LatestEvictedBlockhash,
+		NumSignatures:          slotCtx.NumSignatures,
+		TransactionCount:       transactionCount,
+		EpochAuthorizedVoters:  global.EpochAuthorizedVoters(),
 	}
 	if slotCtx.AcctsLtHash != nil {
 		snapshot.AcctsLtHash = slotCtx.AcctsLtHash.Clone()
@@ -240,6 +254,19 @@ func CaptureHeadSnapshot(slotCtx *sealevel.SlotCtx, replayCtx *ReplayCtx, blockH
 		snapshot.RecentBlockhashes = &recent
 	}
 	return snapshot
+}
+
+func applyReplayContext(snapshot *ReplayHeadSnapshot, replayCtx *ReplayCtx) {
+	if snapshot == nil || replayCtx == nil {
+		return
+	}
+	snapshot.Capitalization = replayCtx.Capitalization
+	snapshot.SlotsPerYear = replayCtx.SlotsPerYear
+	snapshot.InflationInitial = replayCtx.Inflation.Initial
+	snapshot.InflationTerminal = replayCtx.Inflation.Terminal
+	snapshot.InflationTaper = replayCtx.Inflation.Taper
+	snapshot.InflationFoundation = replayCtx.Inflation.FoundationVal
+	snapshot.InflationFoundationTerm = replayCtx.Inflation.FoundationTerm
 }
 
 func (sr *SpeculativeReplay) FinalizedSlot() uint64 {
@@ -497,6 +524,14 @@ func (sr *SpeculativeReplay) stagePendingLocked(deferred *DeferredBlockCommit) e
 		}
 		return nil
 	}
+	if snapshot := deferred.CapturedSnapshot; snapshot != nil {
+		if snapshot.Slot != deferred.BlockSlot || snapshot.ParentSlot != deferred.SlotCtx.ParentSlot {
+			return fmt.Errorf("slot %d captured replay snapshot names slot/parent %d/%d", deferred.BlockSlot, snapshot.Slot, snapshot.ParentSlot)
+		}
+		if err := sr.attachEpochResumeLocked(snapshot); err != nil {
+			return fmt.Errorf("slot %d epoch resume metadata: %w", deferred.BlockSlot, err)
+		}
+	}
 	if err := sr.store.RecordLayer(deferred.BlockSlot, deferred.SlotCtx.ParentSlot, deferred.SlotCtx, deferred.ModifiedAccts); err != nil {
 		return err
 	}
@@ -504,6 +539,9 @@ func (sr *SpeculativeReplay) stagePendingLocked(deferred *DeferredBlockCommit) e
 		sr.snapshots = make(map[uint64]*ReplayHeadSnapshot)
 	}
 	sr.pending[deferred.BlockSlot] = deferred
+	if deferred.CapturedSnapshot != nil {
+		sr.snapshots[deferred.BlockSlot] = deferred.CapturedSnapshot
+	}
 	return nil
 }
 
@@ -514,7 +552,15 @@ func (sr *SpeculativeReplay) FinalizePendingSnapshot(slot uint64, replayCtx *Rep
 	if pending == nil {
 		return fmt.Errorf("slot %d is not staged in speculative replay", slot)
 	}
-	snapshot := capturePendingSnapshot(pending, replayCtx, aux...)
+	snapshot := pending.CapturedSnapshot
+	if snapshot != nil {
+		applyReplayContext(snapshot, replayCtx)
+		if len(aux) != 0 {
+			snapshot.Aux = aux[0].clone()
+		}
+	} else {
+		snapshot = capturePendingSnapshot(pending, replayCtx, aux...)
+	}
 	if snapshot == nil {
 		return fmt.Errorf("slot %d produced no replay snapshot", slot)
 	}
@@ -522,6 +568,7 @@ func (sr *SpeculativeReplay) FinalizePendingSnapshot(slot uint64, replayCtx *Rep
 		return fmt.Errorf("slot %d epoch resume metadata: %w", slot, err)
 	}
 	sr.snapshots[slot] = snapshot
+	pending.AwaitingReplaySnapshot = false
 	return nil
 }
 
@@ -604,6 +651,116 @@ type SpeculativeRollbackParams struct {
 	RestoreAux     func(*ReplayHeadSnapshot) error
 }
 
+// ReconcileCertifiedTail compares already executed RAM layers with the latest
+// certified path. A late skip or alternate block certificate must discard the
+// losing suffix before finality is allowed to promote any of it.
+func (sr *SpeculativeReplay) ReconcileCertifiedTail(
+	decisionSource func(anchorSlot uint64) (alpenglow.ChainDecision, bool),
+	params SpeculativeRollbackParams,
+) (bool, error) {
+	if decisionSource == nil {
+		return false, nil
+	}
+
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	if !sr.enabled || len(sr.pending) == 0 {
+		return false, nil
+	}
+	sr.finishFoldLocked(params.PT)
+	if sr.foldErr != nil {
+		return false, fmt.Errorf("cannot reconcile certified tail while durable fold is unhealthy: %w", sr.foldErr)
+	}
+
+	tip := sr.committedSlot
+	for slot := range sr.pending {
+		if slot > tip {
+			tip = slot
+		}
+	}
+	decisionAnchor := sr.committedSlot
+	executedAnchor := sr.committedSlot
+	examined := 0
+	for ; examined < maxSpeculativeLayers*2 && decisionAnchor < tip; examined++ {
+		decision, ok := decisionSource(decisionAnchor)
+		if !ok || decision.Slot > tip {
+			return false, nil
+		}
+		if decision.Slot <= decisionAnchor {
+			return false, fmt.Errorf("Alpenglow decision did not advance while reconciling tail: anchor=%d decision=%d", decisionAnchor, decision.Slot)
+		}
+
+		switch decision.Kind {
+		case alpenglow.ChainDecisionKindConflict:
+			return false, fmt.Errorf("ALPENGLOW SAFETY: conflicting certified decisions at slot %d: %s", decision.Slot, decision.Reason)
+		case alpenglow.ChainDecisionKindSkip:
+			if pending := sr.pending[decision.Slot]; pending != nil {
+				anchor := pending.SlotCtx.ParentSlot
+				return sr.switchCertifiedTailLocked(anchor, alpenglow.BlockID{}, decision, params)
+			}
+			decisionAnchor = decision.Slot
+		case alpenglow.ChainDecisionKindBlock:
+			pending := sr.pending[decision.Slot]
+			if pending == nil {
+				return sr.switchCertifiedTailLocked(executedAnchor, decision.Block, decision, params)
+			}
+			if !pending.HasAlpenglowBlockID {
+				return false, fmt.Errorf("ALPENGLOW SAFETY: replayed slot %d has no block identity", decision.Slot)
+			}
+			if pending.AlpenglowBlockID != decision.Block.Hash {
+				return sr.switchCertifiedTailLocked(pending.SlotCtx.ParentSlot, decision.Block, decision, params)
+			}
+			decisionAnchor = decision.Slot
+			executedAnchor = decision.Slot
+		default:
+			return false, fmt.Errorf("unknown Alpenglow decision %q at slot %d", decision.Kind, decision.Slot)
+		}
+	}
+	if decisionAnchor < tip {
+		return false, fmt.Errorf("ALPENGLOW SAFETY: certified-tail scan exceeded %d decisions before executed tip %d (reached %d)",
+			examined, tip, decisionAnchor)
+	}
+	return false, nil
+}
+
+func (sr *SpeculativeReplay) switchCertifiedTailLocked(
+	anchor uint64,
+	target alpenglow.BlockID,
+	decision alpenglow.ChainDecision,
+	params SpeculativeRollbackParams,
+) (bool, error) {
+	if params.BlockStream == nil || params.ReplayCtx == nil || params.LastSlotCtx == nil {
+		return false, fmt.Errorf("incomplete rollback context for certified decision at slot %d", decision.Slot)
+	}
+	if sr.finalityCursor > anchor {
+		return false, fmt.Errorf("ALPENGLOW SAFETY: certified switch at slot %d crosses finalized watermark %d (anchor %d)",
+			decision.Slot, sr.finalityCursor, anchor)
+	}
+	if err := sr.rollbackToLocked(anchor, params); err != nil {
+		return false, fmt.Errorf("certified-tail rollback to slot %d: %w", anchor, err)
+	}
+
+	anchorID := sr.executedBlockIDLocked(anchor)
+	params.BlockStream.RewindAlpenglowFork(anchor, anchorID, target)
+	if decision.Kind == alpenglow.ChainDecisionKindSkip {
+		mlog.Log.Warnf("speculative replay: certified skip replaced executed slot %d; dropped RAM tail to slot %d", decision.Slot, anchor)
+	} else {
+		mlog.Log.Warnf("speculative replay: certified block %s replaced executed branch at slot %d; dropped RAM tail to slot %d",
+			decision.Block.Hash, decision.Slot, anchor)
+	}
+	return true, nil
+}
+
+func (sr *SpeculativeReplay) executedBlockIDLocked(slot uint64) solana.Hash {
+	if snapshot := sr.snapshots[slot]; snapshot != nil && snapshot.HasAlpenglowIdentity {
+		return snapshot.AlpenglowBlockID
+	}
+	if snapshot := sr.headSnapshot; snapshot != nil && snapshot.Slot == slot && snapshot.HasAlpenglowIdentity {
+		return snapshot.AlpenglowBlockID
+	}
+	return solana.Hash{}
+}
+
 // HandleParentMismatch rolls back speculative execution when a waiting block's parent
 // does not connect to the last emitted slot.
 func (sr *SpeculativeReplay) HandleParentMismatch(
@@ -620,9 +777,9 @@ func (sr *SpeculativeReplay) HandleParentMismatch(
 		mlog.Log.Errorf("speculative replay: cannot unwind while durable fold is unhealthy: %v", sr.foldErr)
 		return false
 	}
-	if sr.committedSlot > observedParent {
-		mlog.Log.Errorf("speculative replay: cannot rollback to slot %d; already persisted through %d",
-			observedParent, sr.committedSlot)
+	if sr.finalityCursor > observedParent {
+		mlog.Log.Errorf("ALPENGLOW SAFETY: cannot rollback to slot %d; already finalized through %d",
+			observedParent, sr.finalityCursor)
 		return false
 	}
 
@@ -665,9 +822,9 @@ func (sr *SpeculativeReplay) HandleParentIdentityMismatch(
 		return false
 	}
 	anchor := activeParent.SlotCtx.ParentSlot
-	if sr.committedSlot > anchor {
-		mlog.Log.Errorf("ALPENGLOW SAFETY: fork switch at slot %d would cross durable root %d (common parent %d)",
-			parentSlot, sr.committedSlot, anchor)
+	if sr.finalityCursor > anchor {
+		mlog.Log.Errorf("ALPENGLOW SAFETY: fork switch at slot %d would cross finalized watermark %d (common parent %d)",
+			parentSlot, sr.finalityCursor, anchor)
 		return false
 	}
 	if err := sr.rollbackToLocked(anchor, params); err != nil {
@@ -675,12 +832,7 @@ func (sr *SpeculativeReplay) HandleParentIdentityMismatch(
 		return false
 	}
 
-	var anchorID solana.Hash
-	if snapshot := sr.headSnapshot; snapshot != nil && snapshot.Slot == anchor && snapshot.HasAlpenglowIdentity {
-		anchorID = snapshot.AlpenglowBlockID
-	} else if snapshot := sr.snapshots[anchor]; snapshot != nil && snapshot.HasAlpenglowIdentity {
-		anchorID = snapshot.AlpenglowBlockID
-	}
+	anchorID := sr.executedBlockIDLocked(anchor)
 	params.BlockStream.RewindAlpenglowFork(anchor, anchorID, alpenglow.BlockID{Slot: parentSlot, Hash: observedParentID})
 	mlog.Log.Warnf("speculative replay: switched fork for parent slot %d (executed=%s selected=%s); dropped RAM tail to slot %d",
 		parentSlot, executedParentID, observedParentID, anchor)
@@ -688,6 +840,12 @@ func (sr *SpeculativeReplay) HandleParentIdentityMismatch(
 }
 
 func (sr *SpeculativeReplay) rollbackToLocked(anchor uint64, params SpeculativeRollbackParams) error {
+	if sr.finalityCursor > anchor {
+		// Callers must normally reject this before rollback. Keep the cursor
+		// coherent defensively so a future caller cannot leave it pointing above
+		// state that was just discarded.
+		sr.finalityCursor = anchor
+	}
 	global.DropPendingStakePubkeysFrom(anchor + 1)
 	for slot := range sr.pending {
 		if slot > anchor {

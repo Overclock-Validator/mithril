@@ -136,6 +136,87 @@ func TestAlpenglowObserverFeedsCertifiedDecisionResolver(t *testing.T) {
 	}
 }
 
+func TestPoolRejectedCertificateDoesNotReachChainOrConsumers(t *testing.T) {
+	observer := &AlpenglowObserverEngine{
+		pool: alpenglow.NewConsensusPool(alpenglow.ConsensusPoolConfig{
+			RootBlock: alpenglow.BlockID{Slot: 10, Hash: solana.Hash{1}},
+		}),
+	}
+	var delivered int
+	observer.SetVotorMessageHook(func(alpenglow.Message) { delivered++ })
+	observer.acceptVerifiedCertificate(alpenglow.Certificate{
+		Type:              alpenglow.CertificateSkip,
+		Slot:              9,
+		SignatureVerified: true,
+		StakeVerified:     true,
+	})
+	if snapshot := observer.ensureChain().Snapshot(); snapshot.CertificatesObserved != 0 {
+		t.Fatalf("pool-rejected certificate reached chain tracker: %+v", snapshot)
+	}
+	if delivered != 0 {
+		t.Fatalf("pool-rejected certificate reached verified consumer hook")
+	}
+}
+
+func TestVerifiedCertificatePoolInvariantFailureHaltsEngine(t *testing.T) {
+	observer := &AlpenglowObserverEngine{
+		pool: alpenglow.NewConsensusPool(alpenglow.DefaultConsensusPoolConfig()),
+	}
+	for seed := byte(1); seed <= 8; seed++ {
+		observer.acceptVerifiedCertificate(alpenglow.Certificate{
+			Type:              alpenglow.CertificateNotarizeFallback,
+			Slot:              11,
+			BlockHash:         solana.Hash{seed},
+			SignatureVerified: true,
+			StakeVerified:     true,
+		})
+	}
+	decision, ok := observer.NextAlpenglowDecision(10)
+	if !ok || decision.Kind != alpenglow.ChainDecisionKindConflict {
+		t.Fatalf("verified pool invariant failure did not halt decisions: %+v (ok=%v)", decision, ok)
+	}
+	if err := observer.OnReplayResult(context.Background(), SlotReplayResult{Slot: 11}); err == nil {
+		t.Fatal("replay continued after verified pool invariant failure")
+	}
+}
+
+func TestAcceptedStrongCertificateConflictHaltsEngine(t *testing.T) {
+	observer := &AlpenglowObserverEngine{
+		pool: alpenglow.NewConsensusPool(alpenglow.DefaultConsensusPoolConfig()),
+	}
+	for seed := byte(1); seed <= 2; seed++ {
+		observer.acceptVerifiedCertificate(alpenglow.Certificate{
+			Type:              alpenglow.CertificateNotarize,
+			Slot:              11,
+			BlockHash:         solana.Hash{seed},
+			SignatureVerified: true,
+			StakeVerified:     true,
+		})
+	}
+	decision, ok := observer.NextAlpenglowDecision(10)
+	if !ok || decision.Kind != alpenglow.ChainDecisionKindConflict {
+		t.Fatalf("strong-certificate conflict did not halt decisions: %+v (ok=%v)", decision, ok)
+	}
+	if err := observer.OnReplayResult(context.Background(), SlotReplayResult{Slot: 11}); err == nil {
+		t.Fatal("replay continued after strong-certificate conflict")
+	}
+}
+
+func TestAlpenglowObserverSafetyFaultFailsClosed(t *testing.T) {
+	observer := &AlpenglowObserverEngine{}
+	observer.latchSafetyError(errors.New("injected downstream rejection"))
+	decision, ok := observer.NextAlpenglowDecision(41)
+	if !ok || decision.Kind != alpenglow.ChainDecisionKindConflict || decision.Slot != 42 {
+		t.Fatalf("safety decision = %+v (ok=%v)", decision, ok)
+	}
+	if err := observer.OnReplayResult(context.Background(), SlotReplayResult{Slot: 41}); err == nil {
+		t.Fatal("replay continued after consensus safety fault")
+	}
+	if parent := observer.AlpenglowBlockProductionParent(44); parent.Kind != alpenglow.BlockProductionParentNotReady {
+		t.Fatalf("block production parent after safety fault = %+v", parent)
+	}
+}
+
 func TestAlpenglowObserverCandidateBlockEnablesIndirectSkipDecision(t *testing.T) {
 	engine, err := NewEngine(ModeAlpenglowObserver)
 	if err != nil {
@@ -184,16 +265,70 @@ func TestAlpenglowObserverPublishesCertificateBlockIDsOnly(t *testing.T) {
 	if len(published) != 0 {
 		t.Fatalf("vote block ID was published as a certified hint: %+v", published)
 	}
+	var fallbackBlockID solana.Hash
+	fallbackBlockID[0] = 3
+	fallback := alpenglow.Certificate{
+		Type: alpenglow.CertificateNotarizeFallback, Slot: 9, BlockHash: fallbackBlockID,
+		SignatureVerified: true, StakeVerified: true,
+	}
+	if _, err := observer.ensureChain().ObserveCertificate(fallback); err != nil {
+		t.Fatal(err)
+	}
+	observer.observeVotorBlockID(alpenglow.NewCertificateMessage(fallback))
+	if len(published) != 0 {
+		t.Fatalf("fallback-only block ID became an assembler filter: %+v", published)
+	}
 
 	var certBlockID solana.Hash
 	certBlockID[0] = 2
-	observer.observeVotorBlockID(alpenglow.NewCertificateMessage(alpenglow.Certificate{
-		Type:      alpenglow.CertificateNotarize,
-		Slot:      10,
-		BlockHash: certBlockID,
-	}))
+	cert := alpenglow.Certificate{
+		Type:              alpenglow.CertificateNotarize,
+		Slot:              10,
+		BlockHash:         certBlockID,
+		SignatureVerified: true,
+		StakeVerified:     true,
+	}
+	if _, err := observer.ensureChain().ObserveCertificate(cert); err != nil {
+		t.Fatal(err)
+	}
+	observer.observeVotorBlockID(alpenglow.NewCertificateMessage(cert))
 	if len(published) != 1 || published[0] != (alpenglow.BlockID{Slot: 10, Hash: certBlockID}) {
 		t.Fatalf("published block IDs = %+v, want certified block ID", published)
+	}
+}
+
+func TestAlpenglowObserverDoesNotInferParentFromFallbackHint(t *testing.T) {
+	observer := &AlpenglowObserverEngine{recentBlockIDs: make(map[uint64]solana.Hash)}
+	parent := alpenglow.BlockID{Slot: 10, Hash: solana.Hash{1}}
+	if _, err := observer.ensureChain().ObserveCertificate(alpenglow.Certificate{
+		Type:              alpenglow.CertificateNotarizeFallback,
+		Slot:              parent.Slot,
+		BlockHash:         parent.Hash,
+		SignatureVerified: true,
+		StakeVerified:     true,
+	}); err != nil {
+		t.Fatalf("observe fallback parent: %v", err)
+	}
+	observer.rememberRecentAlpenglowBlockID(parent.Slot, parent.Hash)
+
+	obs := alpenglow.ReplayBlockObservation{Block: alpenglow.BlockID{Slot: 11, Hash: solana.Hash{2}}, ParentSlot: parent.Slot}
+	observer.enrichReplayBlockObservation(&obs)
+	if obs.ParentHash != (solana.Hash{}) {
+		t.Fatalf("arrival-order fallback hint was used as parent: %s", obs.ParentHash)
+	}
+
+	if _, err := observer.ensureChain().ObserveCertificate(alpenglow.Certificate{
+		Type:              alpenglow.CertificateNotarize,
+		Slot:              parent.Slot,
+		BlockHash:         parent.Hash,
+		SignatureVerified: true,
+		StakeVerified:     true,
+	}); err != nil {
+		t.Fatalf("observe decisive parent: %v", err)
+	}
+	observer.enrichReplayBlockObservation(&obs)
+	if obs.ParentHash != parent.Hash {
+		t.Fatalf("decisive parent was not inferred: %s", obs.ParentHash)
 	}
 }
 
@@ -233,6 +368,32 @@ func TestAlpenglowObserverDeliversOnlyVerifiedVotesToConsumers(t *testing.T) {
 	}
 }
 
+func TestAlpenglowObserverDoesNotDeliverDuplicateVoteToConsumers(t *testing.T) {
+	engine, err := NewEngine(ModeAlpenglowObserver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer := engine.(*AlpenglowObserverEngine)
+	if err := observer.SetAlpenglowValidatorSet(testAlpenglowValidatorSet()); err != nil {
+		t.Fatal(err)
+	}
+	observer.SetAlpenglowEpochLookup(func(uint64) uint64 { return 1 })
+	var delivered int
+	observer.SetVotorMessageHook(func(msg alpenglow.Message) {
+		if msg.Vote != nil {
+			delivered++
+		}
+	})
+
+	vote := alpenglow.NewSkipVote(50)
+	message := alpenglow.VoteMessage{Vote: vote, Signature: testAlpenglowVoteSignature(t, vote), Rank: 0}
+	observer.observeVotorMessage(alpenglow.Message{Vote: &message})
+	observer.observeVotorMessage(alpenglow.Message{Vote: &message})
+	if delivered != 1 {
+		t.Fatalf("consumer deliveries = %d, want one accepted vote", delivered)
+	}
+}
+
 func TestAlpenglowObserverEmitsParentReadyFromVerifiedCertificates(t *testing.T) {
 	engine, err := NewEngine(ModeAlpenglowObserver)
 	if err != nil {
@@ -263,6 +424,33 @@ func TestAlpenglowObserverEmitsParentReadyFromVerifiedCertificates(t *testing.T)
 		}
 	}
 	t.Fatalf("missing parent-ready event: %+v", events)
+}
+
+func TestSetAlpenglowRootRestoresStartupParentReady(t *testing.T) {
+	engine := &AlpenglowObserverEngine{pool: alpenglow.NewConsensusPool(alpenglow.DefaultConsensusPoolConfig())}
+	root := alpenglow.BlockID{Slot: 208, Hash: solana.Hash{7}}
+	engine.SetAlpenglowRoot(root)
+	parent := engine.AlpenglowBlockProductionParent(209)
+	if parent.Kind != alpenglow.BlockProductionParentReady || parent.Parent != root {
+		t.Fatalf("startup ParentReady = %+v, want root %+v", parent, root)
+	}
+}
+
+func TestChainHistoryPrunesAtDurableNotConsensusRoot(t *testing.T) {
+	engine := &AlpenglowObserverEngine{}
+	if _, err := engine.ensureChain().ObserveCertificate(alpenglow.Certificate{
+		Type: alpenglow.CertificateSkip, Slot: 10, SignatureVerified: true, StakeVerified: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	engine.SetAlpenglowRoot(alpenglow.BlockID{Slot: 20, Hash: solana.Hash{2}})
+	if got := engine.ensureChain().Snapshot().CertificatesObserved; got != 1 {
+		t.Fatalf("consensus root pruned decision history: certificates=%d", got)
+	}
+	engine.SetAlpenglowDurableRoot(20)
+	if got := engine.ensureChain().Snapshot().CertifiedSkips; got != 0 {
+		t.Fatalf("durable root did not prune old decisions: skips=%d", got)
+	}
 }
 
 func testAlpenglowValidatorSet() alpenglow.ValidatorSet {

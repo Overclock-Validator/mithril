@@ -98,6 +98,64 @@ func TestVerifyCertificateSignatureBase2(t *testing.T) {
 	}
 }
 
+func TestVerifyCertificateAcceptsAgaveBitmapZeroTail(t *testing.T) {
+	set, keys := testBLSValidatorSet(100, 40, 35, 25)
+	var blockHash solana.Hash
+	blockHash[0] = 10
+	base := make([]bool, 3000)
+	base[0] = true
+	base[1] = true
+	bitmap, err := EncodeSignerStoreBitmap(SignerBitmap{
+		Encoding: SignerBitmapBase2,
+		Length:   len(base),
+		Base:     base,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert := Certificate{
+		Type:      CertificateNotarize,
+		Slot:      78,
+		BlockHash: blockHash,
+		Bitmap:    bitmap,
+		Signature: testBLSSignature(t, []testBLSVoteSignature{
+			{Vote: NewNotarizationVote(78, blockHash), Key: keys[0]},
+			{Vote: NewNotarizationVote(78, blockHash), Key: keys[1]},
+		}),
+	}
+
+	verified, result, err := verifyCertificateWithSet(set, cert, true, testBLSVerificationShredVersion)
+	if err != nil {
+		t.Fatalf("verify certificate with zero bitmap tail: %v", err)
+	}
+	if !verified.StakeVerified || !verified.SignatureVerified || result.IncludedStake != 75 {
+		t.Fatalf("unexpected verified certificate: verified=%+v result=%+v", verified, result)
+	}
+}
+
+func TestVerifyCertificateRejectsSetBitOutsideValidatorSet(t *testing.T) {
+	set := testValidatorSet(100, 100)
+	base := make([]bool, 3000)
+	base[0] = true
+	base[2500] = true
+	bitmap, err := EncodeSignerStoreBitmap(SignerBitmap{
+		Encoding: SignerBitmapBase2,
+		Length:   len(base),
+		Base:     base,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = verifyCertificateWithSet(set, Certificate{
+		Type:   CertificateSkip,
+		Slot:   78,
+		Bitmap: bitmap,
+	}, false, testBLSVerificationShredVersion)
+	if err == nil {
+		t.Fatal("certificate with out-of-set signer bit was accepted")
+	}
+}
+
 func TestVerifyRewardCertificateAllowsLowStakeFraction(t *testing.T) {
 	set, keys := testBLSValidatorSet(100, 40, 35, 25)
 	cert := Certificate{

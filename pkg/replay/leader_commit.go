@@ -35,10 +35,11 @@ type CommitLeaderInput struct {
 // published into replay. Publication waits until its footer/ending tick was
 // successfully broadcast and therefore its Alpenglow block ID is known.
 type PreparedLeaderCommit struct {
-	AcctsDb       *accountsdb.AccountsDb
-	SlotCtx       *sealevel.SlotCtx
-	Block         *b.Block
-	ModifiedAccts []*accounts.Account
+	AcctsDb        *accountsdb.AccountsDb
+	SlotCtx        *sealevel.SlotCtx
+	Block          *b.Block
+	ModifiedAccts  []*accounts.Account
+	ReplaySnapshot *ReplayHeadSnapshot
 }
 
 // CommitLeaderSlot completes forged leader execution without making the state
@@ -119,6 +120,11 @@ func CommitLeaderSlot(in CommitLeaderInput) (*PreparedLeaderCommit, error) {
 		SlotCtx:       slotCtx,
 		Block:         block,
 		ModifiedAccts: modifiedAccts,
+		ReplaySnapshot: captureSlotStateSnapshot(
+			slotCtx,
+			block.BlockHeight,
+			global.TransactionCount()+uint64(len(block.Transactions)),
+		),
 	}, nil
 }
 
@@ -144,6 +150,12 @@ func FinalizeLeaderCommit(prepared *PreparedLeaderCommit, blockID solana.Hash) e
 		if !block.HasAlpenglowLastChainedRoot {
 			return fmt.Errorf("leader slot %d has no Alpenglow chained root", block.Slot)
 		}
+		if prepared.ReplaySnapshot == nil {
+			return fmt.Errorf("leader slot %d has no captured replay snapshot", block.Slot)
+		}
+		prepared.ReplaySnapshot.HasAlpenglowIdentity = true
+		prepared.ReplaySnapshot.AlpenglowBlockID = blockID
+		prepared.ReplaySnapshot.AlpenglowChainedRoot = chainedRoot
 		if err := stageActiveSpeculativeCommit(&DeferredBlockCommit{
 			SlotCtx:                 slotCtx,
 			ModifiedAccts:           prepared.ModifiedAccts,
@@ -154,6 +166,8 @@ func FinalizeLeaderCommit(prepared *PreparedLeaderCommit, blockID solana.Hash) e
 			AlpenglowBlockID:        blockID,
 			HasAlpenglowChainedRoot: true,
 			AlpenglowChainedRoot:    chainedRoot,
+			AwaitingReplaySnapshot:  true,
+			CapturedSnapshot:        prepared.ReplaySnapshot,
 		}); err != nil {
 			return fmt.Errorf("stage local leader slot %d: %w", block.Slot, err)
 		}

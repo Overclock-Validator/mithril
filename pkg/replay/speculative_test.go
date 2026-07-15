@@ -1,6 +1,7 @@
 package replay
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/alpenglow"
@@ -94,6 +95,72 @@ func TestCaptureHeadSnapshotRoundTrip(t *testing.T) {
 	restored := slotCtxFromSnapshot(snapshot)
 	if restored.Slot != 6404034 || restored.NumSignatures != 42 {
 		t.Fatalf("unexpected restored slot ctx: %+v", restored)
+	}
+}
+
+func TestFinalizePendingSnapshotUsesProducerCapturedState(t *testing.T) {
+	oldClock := sealevel.SysvarCache.Clock
+	oldSlotHashes := sealevel.SysvarCache.SlotHashes
+	oldRecent := sealevel.SysvarCache.RecentBlockHashes
+	oldTransactionCount := global.TransactionCount()
+	t.Cleanup(func() {
+		sealevel.SysvarCache.Clock = oldClock
+		sealevel.SysvarCache.SlotHashes = oldSlotHashes
+		sealevel.SysvarCache.RecentBlockHashes = oldRecent
+		global.SetTransactionCount(oldTransactionCount)
+	})
+
+	const slot = uint64(11)
+	clock := sealevel.SysvarClock{Slot: slot, Epoch: 1}
+	slotHashes := sealevel.SysvarSlotHashes{{Slot: slot, Hash: solana.Hash{1}}}
+	recent := sealevel.SysvarRecentBlockhashes{{Blockhash: solana.Hash{2}}}
+	sealevel.SysvarCache.Clock.Sysvar = &clock
+	sealevel.SysvarCache.SlotHashes.Sysvar = &slotHashes
+	sealevel.SysvarCache.RecentBlockHashes.Sysvar = &recent
+	global.SetTransactionCount(100)
+
+	slotCtx := &sealevel.SlotCtx{
+		Slot: slot, ParentSlot: slot - 1, Epoch: 1, Blockhash: solana.Hash{3},
+		FinalBankhash: make([]byte, 32), AcctsLtHash: &lthash.LtHash{}, AcctMapsMu: &sync.Mutex{},
+	}
+	captured := captureSlotStateSnapshot(slotCtx, slot, 105)
+	captured.HasAlpenglowIdentity = true
+	captured.AlpenglowBlockID = solana.Hash{4}
+	captured.AlpenglowChainedRoot = solana.Hash{5}
+
+	sr := NewSpeculativeReplay()
+	sr.Enable()
+	sr.committedSlot = slot - 1
+	sr.finalityCursor = slot - 1
+	sr.store.SetFinalizedSlot(slot - 1)
+	if err := sr.StagePending(&DeferredBlockCommit{
+		SlotCtx: slotCtx, BlockSlot: slot, BlockHeight: slot, Bankhash: make([]byte, 32),
+		HasAlpenglowBlockID: true, AlpenglowBlockID: captured.AlpenglowBlockID,
+		HasAlpenglowChainedRoot: true, AlpenglowChainedRoot: captured.AlpenglowChainedRoot,
+		AwaitingReplaySnapshot: true, CapturedSnapshot: captured,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	nextClock := sealevel.SysvarClock{Slot: slot + 1, Epoch: 1}
+	nextSlotHashes := sealevel.SysvarSlotHashes{{Slot: slot + 1, Hash: solana.Hash{6}}}
+	nextRecent := sealevel.SysvarRecentBlockhashes{{Blockhash: solana.Hash{7}}}
+	sealevel.SysvarCache.Clock.Sysvar = &nextClock
+	sealevel.SysvarCache.SlotHashes.Sysvar = &nextSlotHashes
+	sealevel.SysvarCache.RecentBlockHashes.Sysvar = &nextRecent
+	global.SetTransactionCount(999)
+
+	if err := sr.FinalizePendingSnapshot(slot, &ReplayCtx{Capitalization: 123}); err != nil {
+		t.Fatal(err)
+	}
+	sr.mu.Lock()
+	snapshot := sr.snapshots[slot]
+	sr.mu.Unlock()
+	if snapshot.Clock == nil || snapshot.Clock.Slot != slot ||
+		snapshot.SlotHashes == nil || (*snapshot.SlotHashes)[0].Slot != slot ||
+		snapshot.RecentBlockhashes == nil || (*snapshot.RecentBlockhashes)[0].Blockhash != (solana.Hash{2}) ||
+		snapshot.TransactionCount != 105 || snapshot.Capitalization != 123 {
+		t.Fatalf("captured slot state was replaced by later globals: %+v", snapshot)
 	}
 }
 

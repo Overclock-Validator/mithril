@@ -249,7 +249,7 @@ func serializeAllEpochStakes() map[uint64][]byte {
 	return result
 }
 
-func resolveAddrTableLookups(accountsDb *accountsdb.AccountsDb, block *b.Block) error {
+func resolveAddrTableLookups(accountsDb *accountsdb.AccountsDb, block *b.Block, spec *SpeculativeReplay) error {
 	tables := make(map[solana.PublicKey]solana.PublicKeySlice)
 
 	for _, tx := range block.Transactions {
@@ -266,13 +266,17 @@ func resolveAddrTableLookups(accountsDb *accountsdb.AccountsDb, block *b.Block) 
 	for t := range tables {
 		tablesSlice = append(tablesSlice, t)
 	}
-	accts, err := accountsDb.GetAccountsBatch(context.Background(), block.Slot, tablesSlice)
-	if err != nil {
-		return err
+	accts := make([]*accounts.Account, len(tablesSlice))
+	for i, table := range tablesSlice {
+		acct, err := loadAccountForBlockReplay(accountsDb, spec, block.ParentSlot, block.Slot, table)
+		if err != nil {
+			return err
+		}
+		accts[i] = acct
 	}
 
 	for i := range tablesSlice {
-		if len(accts[i].Data) == 0 {
+		if accts[i] == nil || len(accts[i].Data) == 0 {
 			delete(tables, tablesSlice[i])
 			continue
 		}
@@ -319,9 +323,16 @@ func ResolveAddrTableLookupsForTx(ctx context.Context, accountsDb *accountsdb.Ac
 	}
 
 	tableIDs := tx.Message.GetAddressTableLookups().GetTableIDs()
-	accts, err := accountsDb.GetAccountsBatch(ctx, slot, tableIDs)
-	if err != nil {
-		return err
+	accts := make([]*accounts.Account, len(tableIDs))
+	for i, tableID := range tableIDs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		acct, err := ResolveActiveAccount(accountsDb, slot, tableID)
+		if err != nil {
+			return err
+		}
+		accts[i] = acct
 	}
 
 	tables := make(map[solana.PublicKey]solana.PublicKeySlice, len(tableIDs))
@@ -450,7 +461,7 @@ func loadAccountForBlockReplay(
 	if spec != nil && spec.UseStoreForParent(parentSlot) {
 		return spec.Resolve(parentSlot, pk, accountsDb)
 	}
-	return accountsDb.GetAccount(blockSlot, pk)
+	return accountsDb.GetAccountDurable(parentSlot, pk)
 }
 
 // loadAccountLiveOrParentForReplay returns the in-slot working account when present,
@@ -494,7 +505,7 @@ func loadBlockAccountsAndUpdateSysvars(
 	alpenglowClock bool,
 	spec *SpeculativeReplay,
 ) (accounts.Accounts, accounts.Accounts, error) {
-	err := resolveAddrTableLookups(accountsDb, block)
+	err := resolveAddrTableLookups(accountsDb, block, spec)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -718,7 +729,7 @@ func loadBlockAccountsAndUpdateSysvars(
 
 		// cache StakeHistory sysvar
 		{
-			stakeHistoryAcct, err := accountsDb.GetAccount(block.Slot, sealevel.SysvarStakeHistoryAddr)
+			stakeHistoryAcct, err := loadAccountForBlockReplay(accountsDb, spec, block.ParentSlot, block.Slot, sealevel.SysvarStakeHistoryAddr)
 			if err != nil {
 				panic("unable to get stakehistory")
 			}
@@ -759,7 +770,7 @@ func loadBlockAccountsAndUpdateSysvars(
 
 		// cache LastRestartSlot sysvar
 		{
-			lastRestartSlotAcct, err := accountsDb.GetAccount(block.Slot, sealevel.SysvarLastRestartSlotAddr)
+			lastRestartSlotAcct, err := loadAccountForBlockReplay(accountsDb, spec, block.ParentSlot, block.Slot, sealevel.SysvarLastRestartSlotAddr)
 			if err != nil {
 				panic("unable to get last restart slot sysvar acct")
 			}
@@ -1762,6 +1773,18 @@ func ReplayBlocks(
 		}
 		return nil
 	}
+	rollbackParams := func() SpeculativeRollbackParams {
+		return SpeculativeRollbackParams{
+			AcctsDb:     acctsDb,
+			PT:          pt,
+			ReplayCtx:   replayCtx,
+			LastSlotCtx: &lastSlotCtx,
+			BlockStream: blockStream,
+			ForkChoice:  forkChoice,
+			RPCServer:   rpcServer,
+			RestoreAux:  restoreReplayAux,
+		}
+	}
 
 	speculative := NewSpeculativeReplay()
 	var alpenglowNextDecision func(anchorSlot uint64) (alpenglow.ChainDecision, bool)
@@ -1776,19 +1799,13 @@ func ReplayBlocks(
 			if rootSink, ok := consensusEngine.(consensusengine.AlpenglowRootSink); ok {
 				speculative.SetRootSink(rootSink.SetAlpenglowRoot)
 			}
+			if durableRootSink, ok := consensusEngine.(consensusengine.AlpenglowDurableRootSink); ok {
+				speculative.SetDurableRootSink(durableRootSink.SetAlpenglowDurableRoot)
+			}
 			stopActiveSpeculative := publishActiveSpeculativeReplay(speculative)
 			defer stopActiveSpeculative()
 			blockStream.SetParentMismatchHandler(func(waitingSlot, observedParent, expectedParent uint64) bool {
-				return speculative.HandleParentMismatch(waitingSlot, observedParent, expectedParent, SpeculativeRollbackParams{
-					AcctsDb:     acctsDb,
-					PT:          pt,
-					ReplayCtx:   replayCtx,
-					LastSlotCtx: &lastSlotCtx,
-					BlockStream: blockStream,
-					ForkChoice:  forkChoice,
-					RPCServer:   rpcServer,
-					RestoreAux:  restoreReplayAux,
-				})
+				return speculative.HandleParentMismatch(waitingSlot, observedParent, expectedParent, rollbackParams())
 			})
 			blockStream.SetParentIdentityMismatchHandler(func(
 				waitingSlot, parentSlot uint64,
@@ -1796,16 +1813,7 @@ func ReplayBlocks(
 			) bool {
 				return speculative.HandleParentIdentityMismatch(
 					waitingSlot, parentSlot, observedParentID, executedParentID,
-					SpeculativeRollbackParams{
-						AcctsDb:     acctsDb,
-						PT:          pt,
-						ReplayCtx:   replayCtx,
-						LastSlotCtx: &lastSlotCtx,
-						BlockStream: blockStream,
-						ForkChoice:  forkChoice,
-						RPCServer:   rpcServer,
-						RestoreAux:  restoreReplayAux,
-					},
+					rollbackParams(),
 				)
 			})
 			mlog.Log.Infof("speculative replay enabled: deferring AccountsDB persistence until Alpenglow finalizes turbine blocks")
@@ -2023,6 +2031,17 @@ func ReplayBlocks(
 				continue
 			}
 
+			if speculativeEnabled && alpenglowNextDecision != nil {
+				switched, err := speculative.ReconcileCertifiedTail(alpenglowNextDecision, rollbackParams())
+				if err != nil {
+					result.Error = err
+					break
+				}
+				if switched {
+					continue
+				}
+			}
+
 			if consensusEngine != nil {
 				stats := blockStream.GetFetchStats()
 				if err := consensusEngine.ObserveBlock(ctx, consensusengine.BlockObservation{
@@ -2149,6 +2168,12 @@ func ReplayBlocks(
 							result.Error = fmt.Errorf("consensus engine local leader result: %w", err)
 							break
 						}
+					}
+					if switched, err := speculative.ReconcileCertifiedTail(alpenglowNextDecision, rollbackParams()); err != nil {
+						result.Error = err
+						break
+					} else if switched {
+						continue
 					}
 					speculative.TryCommitPending(acctsDb, pt, commit.Block, commit.Block.BlockHeight, replayCtx, alpenglowNextDecision)
 					if err := speculative.Err(); err != nil {
@@ -2321,8 +2346,9 @@ func ReplayBlocks(
 		if err != nil {
 			mlog.Log.Errorf("error encountered during block replay: %s\n", err)
 			result.Error = err
-			// Clear any pending stake pubkeys from this failed block
-			global.ClearPendingStakePubkeys()
+			// Preserve entries from earlier finalized-but-unfolded slots. Only the
+			// failing slot and its speculative suffix are invalid.
+			global.DropPendingStakePubkeysFrom(block.Slot)
 			break
 		}
 		UpdateChainTipFromSlotCtx(lastSlotCtx, replayCtx.CurrentFeatures)
@@ -2343,7 +2369,7 @@ func ReplayBlocks(
 				At:       time.Now(),
 			}); err != nil {
 				result.Error = fmt.Errorf("consensus engine replay result: %w", err)
-				global.ClearPendingStakePubkeys()
+				global.DropPendingStakePubkeysFrom(block.Slot)
 				break
 			}
 		}
@@ -2389,6 +2415,13 @@ func ReplayBlocks(
 				result.Error = fmt.Errorf("speculative replay slot %d: %w", block.Slot, err)
 				break
 			}
+			if switched, err := speculative.ReconcileCertifiedTail(alpenglowNextDecision, rollbackParams()); err != nil {
+				result.Error = err
+				break
+			} else if switched {
+				deferred = nil
+				continue
+			}
 			if speculative.TryCommitPending(acctsDb, pt, block, block.BlockHeight, replayCtx, alpenglowNextDecision) {
 				deferred = nil
 			}
@@ -2413,8 +2446,15 @@ func ReplayBlocks(
 		if ctx.Err() != nil {
 			mlog.Log.Infof("Context cancelled after slot %d, exiting replay loop", block.Slot)
 			result.WasCancelled = true
+			if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.Canceled) {
+				result.WasCancelled = false
+				result.Error = fmt.Errorf("validator safety halt: %w", cause)
+			}
 
 			if speculativeEnabled {
+				if _, err := speculative.ReconcileCertifiedTail(alpenglowNextDecision, rollbackParams()); err != nil {
+					mlog.Log.Errorf("rooted-durable shutdown reconciliation: %v", err)
+				}
 				if err := speculative.FlushFinalized(pt, alpenglowNextDecision); err != nil {
 					mlog.Log.Errorf("rooted-durable shutdown fold: %v", err)
 				}
@@ -2764,11 +2804,19 @@ func ReplayBlocks(
 
 	}
 
+	if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.Canceled) && result.Error == nil {
+		result.WasCancelled = false
+		result.Error = fmt.Errorf("validator safety halt: %w", cause)
+	}
+
 	// Check if block source stalled (this provides explicit error info)
 	if blockStream.Stalled() && result.Error == nil {
 		result.Error = fmt.Errorf("block fetch stalled - no progress for %v", blockStream.StallTimeout())
 	}
 	if speculativeEnabled {
+		if _, err := speculative.ReconcileCertifiedTail(alpenglowNextDecision, rollbackParams()); err != nil && result.Error == nil {
+			result.Error = err
+		}
 		if err := speculative.FlushFinalized(pt, alpenglowNextDecision); err != nil && result.Error == nil {
 			result.Error = err
 		}
@@ -3269,6 +3317,9 @@ func ProcessBlock(
 	metrics.GlobalBlockReplay.LoadBlockAccounts.AddTimingSince(start)
 
 	slotCtx := newSlotCtx(block, accts, parentAccts, acctsDb)
+	slotCtx.AccountLoader = func(parentSlot uint64, pubkey solana.PublicKey) (*accounts.Account, error) {
+		return loadAccountForBlockReplay(acctsDb, spec, parentSlot, block.Slot, pubkey)
+	}
 	slotCtx.TraceCtx = ctx
 	var txFeeAccumulator fees.TxFeeInfoAccumulator
 	var totalComputeUnitsConsumed uint64

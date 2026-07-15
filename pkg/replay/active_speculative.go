@@ -15,6 +15,15 @@ var activeSpeculative struct {
 	replay *SpeculativeReplay
 }
 
+// ActiveSpeculativeReady reports whether replay has published the branch-aware
+// state engine. Local production must not complete a block before this is true.
+func ActiveSpeculativeReady() bool {
+	activeSpeculative.RLock()
+	ready := activeSpeculative.replay != nil && activeSpeculative.replay.Enabled()
+	activeSpeculative.RUnlock()
+	return ready
+}
+
 func publishActiveSpeculativeReplay(sr *SpeculativeReplay) func() {
 	stopResolver := func() {}
 	if sr != nil && sr.accountsDb != nil {

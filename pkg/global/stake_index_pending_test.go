@@ -1,6 +1,7 @@
 package global
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -88,5 +89,86 @@ func TestPendingStakeIndexIsSlotScoped(t *testing.T) {
 	}
 	if len(entries) != 2 {
 		t.Fatalf("durable entries after fold = %d, want 2", len(entries))
+	}
+}
+
+func TestCompactStakePubkeyIndexLoadsFreshDurableView(t *testing.T) {
+	resetStakeIndexTestState(t)
+	dir := t.TempDir()
+	first := testStakeKey(1)
+	second := testStakeKey(2)
+	if err := accountsdb.WriteStakePubkeyIndex(
+		filepath.Join(dir, StakePubkeyIndexFileName),
+		[]accountsdb.StakeIndexEntry{
+			{Pubkey: first, FileId: 1, Offset: 1},
+			{Pubkey: second, FileId: 2, Offset: 2},
+			{Pubkey: first, FileId: 3, Offset: 3},
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	instance.pendingStakeMutex.Lock()
+	instance.cachedStakeEntries = nil
+	instance.entriesFlushedSinceCompact = compactThreshold
+	instance.pendingStakeMutex.Unlock()
+
+	if err := CompactStakePubkeyIndex(dir); err != nil {
+		t.Fatal(err)
+	}
+	instance.pendingStakeMutex.Lock()
+	instance.cachedStakeEntries = nil
+	flushed := instance.entriesFlushedSinceCompact
+	instance.pendingStakeMutex.Unlock()
+	if flushed != 0 {
+		t.Fatalf("entries flushed since compaction = %d", flushed)
+	}
+	entries, err := LoadStakePubkeyIndex(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("compacted entries = %d, want 2", len(entries))
+	}
+}
+
+func TestLoadStakePubkeyIndexRepairsInterruptedAppend(t *testing.T) {
+	resetStakeIndexTestState(t)
+	dir := t.TempDir()
+	indexPath := filepath.Join(dir, StakePubkeyIndexFileName)
+	durable := testStakeKey(1)
+	if err := accountsdb.WriteStakePubkeyIndex(indexPath, []accountsdb.StakeIndexEntry{{
+		Pubkey: durable,
+		FileId: 7,
+		Offset: 9,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := os.OpenFile(indexPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(make([]byte, 17)); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := LoadStakePubkeyIndex(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Pubkey != durable {
+		t.Fatalf("recovered entries = %+v, want only durable entry", entries)
+	}
+	info, err := os.Stat(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSize := int64(8 + accountsdb.StakeIndexRecordSize)
+	if info.Size() != wantSize {
+		t.Fatalf("repaired index size = %d, want %d", info.Size(), wantSize)
 	}
 }

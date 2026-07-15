@@ -16,20 +16,19 @@ type LeaderBlockInput struct {
 	PrevNumSigs      uint64
 	PrevFeeGovernor  *sealevel.FeeRateGovernor
 	EntryBlockhash   solana.Hash
+	ParentBlockID    solana.Hash
 	TxFeeAccumulator fees.TxFeeInfoAccumulator
 }
 
 func BuildLeaderBlock(in LeaderBlockInput) *b.Block {
 	bank := in.Bank
 	slot := bank.Slot()
-	parentSlot := slot
-	if slot > 0 {
-		parentSlot = slot - 1
-	}
+	parentSlot := bank.SlotCtx().ParentSlot
 
 	block := &b.Block{
 		Slot:                slot,
 		ParentSlot:          parentSlot,
+		SourceParentSlot:    parentSlot,
 		Leader:              bank.Leader(),
 		Transactions:        bank.ForgedTransactions(),
 		Epoch:               in.EpochSchedule.GetEpoch(slot),
@@ -39,6 +38,10 @@ func BuildLeaderBlock(in LeaderBlockInput) *b.Block {
 		PrevFeeRateGovernor: in.PrevFeeGovernor,
 		LastBlockhash:       global.LatestBlockHash(),
 		Blockhash:           in.EntryBlockhash,
+	}
+	if in.ParentBlockID != (solana.Hash{}) {
+		block.HasAlpenglowParentBlockID = true
+		block.AlpenglowParentBlockID = in.ParentBlockID
 	}
 	copy(block.ParentBankhash[:], in.ParentBankhash[:])
 	block.FeeRateGovernor = sealevel.NewFeeRateGovernorDerived(block.PrevFeeRateGovernor, block.PrevNumSignatures)

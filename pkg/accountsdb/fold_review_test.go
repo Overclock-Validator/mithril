@@ -1,11 +1,13 @@
 package accountsdb
 
 import (
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
+	"github.com/cockroachdb/pebble"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -117,4 +119,29 @@ func TestRecoveryRemovesStaleTmpManifest(t *testing.T) {
 	// The committed batch is untouched.
 	assert.Equal(t, uint64(110), rec.DurableThrough)
 	assert.Equal(t, uint64(100), mustColdRead(t, db, 110, solana.PublicKey{1}).Lamports)
+}
+
+func TestRecoveryRestoresBankhashesWithoutIndexReplay(t *testing.T) {
+	db, dir := newFoldTestDb(t)
+	commitTestBatch(t, db, 105, foldAcct(1, 100, []byte("v1")))
+	commitTestBatch(t, db, 110, foldAcct(1, 200, []byte("v2")))
+
+	db = reopenFoldTestDb(t, db, dir)
+	defer db.CloseDb()
+	for _, slot := range []uint64{105, 110} {
+		var slotBytes [8]byte
+		binary.LittleEndian.PutUint64(slotBytes[:], slot)
+		require.NoError(t, db.BankHashStore.Delete(slotBytes[:], pebble.Sync))
+	}
+
+	recovered, err := db.RecoverFoldState()
+	require.NoError(t, err)
+	assert.Empty(t, recovered.ReplayedBatches, "index meta was already committed")
+	assert.Equal(t, uint64(110), recovered.DurableThrough)
+	for _, slot := range []uint64{105, 110} {
+		got, err := db.GetBankHashForSlot(slot)
+		require.NoError(t, err)
+		want := bh(slot)
+		assert.Equal(t, want[:], got)
+	}
 }

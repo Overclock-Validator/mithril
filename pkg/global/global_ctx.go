@@ -46,6 +46,7 @@ type GlobalCtx struct {
 	calcUnixTimeForClockSysvar bool
 	manageLeaderSchedule       bool
 	pendingStakeMutex          sync.Mutex // Protects pendingStakeBySlot and cachedStakeEntries
+	stakeIndexIOMutex          sync.Mutex // Serializes stake-index reads, appends, and rewrites
 	voteCacheMutex             sync.RWMutex
 	slotsConfirmedMutex        sync.Mutex
 	mu                         sync.Mutex
@@ -495,7 +496,14 @@ func FlushPendingStakePubkeys(accountsDbDir string) (int, error) {
 
 // FlushPendingStakePubkeysThrough persists only entries produced at or below
 // through. Entries above the durable watermark remain branch-local in memory.
+// The stake index is intentionally flushed before the matching AccountsDB fold:
+// a crash may leave complete extra pubkeys in this index, but account lookup
+// filters those harmless false positives. Flushing after the fold could instead
+// omit a committed stake account permanently.
 func FlushPendingStakePubkeysThrough(accountsDbDir string, through uint64) (int, error) {
+	instance.stakeIndexIOMutex.Lock()
+	defer instance.stakeIndexIOMutex.Unlock()
+
 	instance.pendingStakeMutex.Lock()
 	pending := pendingStakeEntriesLocked(through)
 	if len(pending) == 0 {
@@ -523,7 +531,6 @@ func FlushPendingStakePubkeysThrough(accountsDbDir string, through uint64) (int,
 			instance.pendingStakeBySlot[slot] = append(entries, instance.pendingStakeBySlot[slot]...)
 		}
 	}
-
 	// Append to index file (don't hold lock during I/O)
 	indexPath := filepath.Join(accountsDbDir, StakePubkeyIndexFileName)
 	f, err := os.OpenFile(indexPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -584,14 +591,6 @@ func FlushPendingStakePubkeysThrough(accountsDbDir string, through uint64) (int,
 	return len(pending), nil
 }
 
-// ClearPendingStakePubkeys discards any pending stake pubkeys without writing them.
-// Used for rollback on failed block replay.
-func ClearPendingStakePubkeys() {
-	instance.pendingStakeMutex.Lock()
-	defer instance.pendingStakeMutex.Unlock()
-	instance.pendingStakeBySlot = nil
-}
-
 // DropPendingStakePubkeysFrom discards speculative index entries at and above
 // fromSlot while preserving entries belonging to an earlier surviving branch.
 func DropPendingStakePubkeysFrom(fromSlot uint64) int {
@@ -612,21 +611,38 @@ func DropPendingStakePubkeysFrom(fromSlot uint64) int {
 // 1000 keeps the file clean without rewriting 24MB every boundary when only a handful changed.
 const compactThreshold = 1000
 
-// CompactStakePubkeyIndex rewrites the index file from the cached deduplicated entries.
-// Only triggers when at least compactThreshold entries have been appended since last compaction.
-// Should be called at epoch boundary when the cache is already populated.
+// CompactStakePubkeyIndex atomically rewrites the index from its durable,
+// deduplicated view. It only runs after compactThreshold appended entries.
 func CompactStakePubkeyIndex(accountsDbDir string) error {
 	instance.pendingStakeMutex.Lock()
 	flushed := instance.entriesFlushedSinceCompact
-	cached := instance.cachedStakeEntries
 	instance.pendingStakeMutex.Unlock()
 
 	if flushed < compactThreshold {
 		return nil // Not enough new entries to justify rewrite
 	}
+	instance.stakeIndexIOMutex.Lock()
+	defer instance.stakeIndexIOMutex.Unlock()
 
-	if cached == nil || len(cached) == 0 {
-		return nil // Nothing to compact
+	// Recheck after acquiring the I/O lock; another compactor may have consumed
+	// the threshold while this call was waiting.
+	instance.pendingStakeMutex.Lock()
+	flushed = instance.entriesFlushedSinceCompact
+	cached := append([]accountsdb.StakeIndexEntry(nil), instance.cachedStakeEntries...)
+	instance.pendingStakeMutex.Unlock()
+	if flushed < compactThreshold {
+		return nil
+	}
+
+	if len(cached) == 0 {
+		var err error
+		cached, err = readDurableStakePubkeyIndex(accountsDbDir)
+		if err != nil {
+			return err
+		}
+		if len(cached) == 0 {
+			return nil
+		}
 	}
 
 	indexPath := filepath.Join(accountsDbDir, StakePubkeyIndexFileName)
@@ -635,6 +651,7 @@ func CompactStakePubkeyIndex(accountsDbDir string) error {
 	}
 
 	instance.pendingStakeMutex.Lock()
+	instance.cachedStakeEntries = cached
 	instance.entriesFlushedSinceCompact = 0
 	instance.pendingStakeMutex.Unlock()
 
@@ -644,8 +661,7 @@ func CompactStakePubkeyIndex(accountsDbDir string) error {
 
 // LoadStakePubkeyIndex reads the stake pubkey index file, auto-detecting format.
 // Returns deduplicated entries sorted by (FileId, Offset) for sequential I/O.
-// Results are cached after first load; subsequent calls return the cached slice.
-// IMPORTANT: The returned slice is shared — callers must NOT mutate it.
+// Results are cached after first load; every call returns a detached slice.
 // Legacy format: 32-byte pubkeys with no location hints (FileId=0, Offset=0).
 // Current format: 8-byte header ("STKI" + version) + 48-byte records (pubkey + fileId + offset).
 func LoadStakePubkeyIndex(accountsDbDir string) ([]accountsdb.StakeIndexEntry, error) {
@@ -657,7 +673,39 @@ func LoadStakePubkeyIndex(accountsDbDir string) ([]accountsdb.StakeIndexEntry, e
 		return dedupeAndSortStakeEntries(append(cached, pending...)), nil
 	}
 	instance.pendingStakeMutex.Unlock()
+	instance.stakeIndexIOMutex.Lock()
+	defer instance.stakeIndexIOMutex.Unlock()
 
+	// Another reader or compactor may have populated the cache while this call
+	// waited for the file lock.
+	instance.pendingStakeMutex.Lock()
+	if instance.cachedStakeEntries != nil {
+		cached := append([]accountsdb.StakeIndexEntry(nil), instance.cachedStakeEntries...)
+		pending := pendingStakeEntriesLocked(math.MaxUint64)
+		instance.pendingStakeMutex.Unlock()
+		return dedupeAndSortStakeEntries(append(cached, pending...)), nil
+	}
+	instance.pendingStakeMutex.Unlock()
+
+	deduped, err := readDurableStakePubkeyIndex(accountsDbDir)
+	if err != nil {
+		return nil, err
+	}
+	if len(deduped) == 0 {
+		return nil, fmt.Errorf("stake pubkey index file is empty (0 entries) - indicates corrupt or incomplete AccountsDB")
+	}
+
+	// Cache only the durable file view. Speculative additions are merged into a
+	// detached result on every call so branch unwind never contaminates the cache.
+	instance.pendingStakeMutex.Lock()
+	instance.cachedStakeEntries = deduped
+	pending := pendingStakeEntriesLocked(math.MaxUint64)
+	instance.pendingStakeMutex.Unlock()
+
+	return dedupeAndSortStakeEntries(append(append([]accountsdb.StakeIndexEntry(nil), deduped...), pending...)), nil
+}
+
+func readDurableStakePubkeyIndex(accountsDbDir string) ([]accountsdb.StakeIndexEntry, error) {
 	indexPath := filepath.Join(accountsDbDir, StakePubkeyIndexFileName)
 	data, err := os.ReadFile(indexPath)
 	if err != nil {
@@ -668,6 +716,20 @@ func LoadStakePubkeyIndex(accountsDbDir string) ([]accountsdb.StakeIndexEntry, e
 
 	// Detect format: current format starts with "STKI" magic
 	if len(data) >= 8 && string(data[0:4]) == "STKI" {
+		if version := binary.LittleEndian.Uint32(data[4:8]); version != accountsdb.StakeIndexVersion {
+			return nil, fmt.Errorf("stake pubkey index: unsupported version %d", version)
+		}
+		if remainder := (len(data) - 8) % accountsdb.StakeIndexRecordSize; remainder != 0 {
+			// Append happens before the AccountsDB fold commit. Therefore an
+			// incomplete trailing record can only describe an undecided fold and is
+			// safe to discard. Complete records remain as a harmless index superset.
+			completeLen := len(data) - remainder
+			if err := truncateInterruptedStakeIndexAppend(indexPath, int64(completeLen)); err != nil {
+				return nil, err
+			}
+			mlog.Log.Warnf("stake pubkey index: discarded %d-byte interrupted append tail", remainder)
+			data = data[:completeLen]
+		}
 		entries, err = loadStakePubkeyIndexCurrent(data)
 	} else {
 		entries, err = loadStakePubkeyIndexLegacy(data)
@@ -676,20 +738,22 @@ func LoadStakePubkeyIndex(accountsDbDir string) ([]accountsdb.StakeIndexEntry, e
 		return nil, err
 	}
 
-	if len(entries) == 0 {
-		return nil, fmt.Errorf("stake pubkey index file is empty (0 entries) - indicates corrupt or incomplete AccountsDB")
+	return dedupeAndSortStakeEntries(entries), nil
+}
+
+func truncateInterruptedStakeIndexAppend(path string, size int64) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("opening stake pubkey index to repair interrupted append: %w", err)
 	}
-
-	deduped := dedupeAndSortStakeEntries(entries)
-
-	// Cache only the durable file view. Speculative additions are merged into a
-	// detached result on every call so branch unwind never contaminates the cache.
-	instance.pendingStakeMutex.Lock()
-	instance.cachedStakeEntries = deduped
-	pending := pendingStakeEntriesLocked(math.MaxUint64)
-	instance.pendingStakeMutex.Unlock()
-
-	return dedupeAndSortStakeEntries(append(append([]accountsdb.StakeIndexEntry(nil), deduped...), pending...)), nil
+	defer f.Close()
+	if err := f.Truncate(size); err != nil {
+		return fmt.Errorf("truncating interrupted stake pubkey index append: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("syncing repaired stake pubkey index: %w", err)
+	}
+	return nil
 }
 
 func dedupeAndSortStakeEntries(entries []accountsdb.StakeIndexEntry) []accountsdb.StakeIndexEntry {

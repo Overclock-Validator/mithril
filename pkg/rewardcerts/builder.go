@@ -12,7 +12,7 @@ type BuilderConfig struct {
 }
 
 func DefaultBuilderConfig() BuilderConfig {
-	return BuilderConfig{MaxValidators: alpenglow.MaximumValidators}
+	return BuilderConfig{MaxValidators: alpenglow.CertificateBitmapCapacity}
 }
 
 // Builder accumulates skip/notar votes and produces footer reward certificates.
@@ -27,7 +27,7 @@ type Builder struct {
 func NewBuilder(cfg BuilderConfig) *Builder {
 	maxValidators := cfg.MaxValidators
 	if maxValidators <= 0 {
-		maxValidators = alpenglow.MaximumValidators
+		maxValidators = alpenglow.CertificateBitmapCapacity
 	}
 	return &Builder{
 		maxValidators: maxValidators,

@@ -1,17 +1,82 @@
 package blockprod
 
 import (
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/alpenglow"
 	"github.com/Overclock-Validator/mithril/pkg/global"
+	"github.com/Overclock-Validator/mithril/pkg/replay"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/txfixture"
+	"github.com/Overclock-Validator/mithril/pkg/turbine"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestBuildLeaderBlockCarriesSelectedSkippedParent(t *testing.T) {
+	parentID := solana.Hash{9}
+	bank := NewWorkingBank(BankConfig{
+		Slot:    212,
+		SlotCtx: &sealevel.SlotCtx{Slot: 212, ParentSlot: 208},
+	})
+	block := BuildLeaderBlock(LeaderBlockInput{
+		Bank: bank,
+		EpochSchedule: &sealevel.SysvarEpochSchedule{
+			SlotsPerEpoch: 32, FirstNormalEpoch: 0, FirstNormalSlot: 0,
+		},
+		PrevFeeGovernor: &sealevel.FeeRateGovernor{TargetLamportsPerSignature: 5000},
+		ParentBlockID:   parentID,
+	})
+	if block.ParentSlot != 208 || block.SourceParentSlot != 208 {
+		t.Fatalf("leader parent slots = parent %d source %d, want 208", block.ParentSlot, block.SourceParentSlot)
+	}
+	if !block.HasAlpenglowParentBlockID || solana.Hash(block.AlpenglowParentBlockID) != parentID {
+		t.Fatalf("leader parent block id = %v present=%v", block.AlpenglowParentBlockID, block.HasAlpenglowParentBlockID)
+	}
+}
+
+func TestLeaderPreparationFailureDoesNotCompleteBroadcast(t *testing.T) {
+	bc := &captureBroadcaster{}
+	identity := txfixture.PayerPrivateKey()
+	session := turbine.NewBroadcastSession(turbine.BroadcastSessionConfig{
+		Leader: identity, Slot: 212, ParentSlot: 208,
+		ParentBlockID: solana.Hash{1}, ParentChainedMerkleRoot: solana.Hash{2},
+		Broadcaster: bc,
+	})
+	if err := session.BroadcastHeader(solana.Hash{1}); err != nil {
+		t.Fatal(err)
+	}
+	before := bc.count()
+	var fatalErr error
+	loop := NewLeaderLoop(LeaderLoopConfig{
+		Controller:    NewController(),
+		AccountsDb:    &accountsdb.AccountsDb{},
+		EpochSchedule: &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 32},
+		PrepareCommit: func(replay.CommitLeaderInput) (*replay.PreparedLeaderCommit, error) {
+			return nil, errors.New("injected preparation failure")
+		},
+		OnFatal: func(err error) { fatalErr = err },
+	})
+	loop.activeSlot = 212
+	loop.activeParentID = solana.Hash{1}
+	loop.parentCtx = ParentContext{PrevFeeGovernor: &sealevel.FeeRateGovernor{TargetLamportsPerSignature: 5000}}
+	loop.activeSess = session
+	loop.activeBank = NewWorkingBank(BankConfig{
+		Slot: 212, SlotCtx: &sealevel.SlotCtx{Slot: 212, ParentSlot: 208},
+	})
+	loop.finishActiveSlotLocked()
+
+	if got := bc.count(); got != before {
+		t.Fatalf("preparation failure broadcast %d additional packets", got-before)
+	}
+	if !loop.halted || fatalErr == nil || loop.activeBank != nil {
+		t.Fatalf("leader halt state: halted=%v fatal=%v active=%v", loop.halted, fatalErr, loop.activeBank)
+	}
+}
 
 func TestLeaderWindowUsesVerifiedParentReady(t *testing.T) {
 	const leaderSlot = uint64(212)

@@ -8,6 +8,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
+	"github.com/Overclock-Validator/mithril/pkg/alpenglow"
 	"github.com/Overclock-Validator/mithril/pkg/blockstream"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/lthash"
@@ -209,4 +210,200 @@ func TestParentIdentityMismatchDropsSpeculativeTail(t *testing.T) {
 		restoredAux.PartitionedRewardsInfo.NumRewardPartitionsRemaining != 7 {
 		t.Fatalf("replay auxiliary state was not restored: %+v", restoredAux)
 	}
+}
+
+func TestForkSwitchRefusedBelowFinalityCursor(t *testing.T) {
+	executedID := solana.Hash{3}
+	selectedID := solana.Hash{4}
+	sr, stream, lastSlotCtx := speculativeTailForDecisionTest(t, executedID)
+	sr.mu.Lock()
+	sr.finalityCursor = 11
+	sr.mu.Unlock()
+
+	handled := sr.HandleParentIdentityMismatch(
+		12,
+		11,
+		selectedID,
+		executedID,
+		SpeculativeRollbackParams{
+			ReplayCtx:      &ReplayCtx{},
+			LastSlotCtx:    lastSlotCtx,
+			BlockStream:    stream,
+			RestoreSysvars: func(*ReplayHeadSnapshot) error { return nil },
+			RestoreAux:     func(*ReplayHeadSnapshot) error { return nil },
+		},
+	)
+	if handled {
+		t.Fatal("fork switch crossed finalized watermark")
+	}
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	if sr.finalityCursor != 11 || sr.pending[11] == nil || sr.store.LayerCount() != 1 {
+		t.Fatalf("finalized tail changed: cursor=%d pending=%v layers=%d", sr.finalityCursor, sr.pending[11] != nil, sr.store.LayerCount())
+	}
+}
+
+func TestForkSwitchRefusalPreservesFinalizedBlockForFold(t *testing.T) {
+	committer := &testFoldCommitter{}
+	sr := newFoldTestReplay(t, committer, 128)
+	executedID := addFoldTestPending(t, sr, 11, 10)
+	selectedID := solana.Hash{99}
+	sr.mu.Lock()
+	sr.finalityCursor = 11
+	sr.mu.Unlock()
+
+	stream := blockstream.NewBlockSource(&blockstream.BlockSourceOpts{
+		SourceType:                   blockstream.BlockSourceTurbine,
+		TurbineBindAddr:              "127.0.0.1:0",
+		TurbineAlpenglowBlockIDHints: true,
+		TurbineRepairOnly:            true,
+		StartSlot:                    11,
+		EndSlot:                      20,
+	})
+	var lastSlotCtx *sealevel.SlotCtx
+	if sr.HandleParentIdentityMismatch(
+		12,
+		11,
+		selectedID,
+		executedID,
+		SpeculativeRollbackParams{
+			ReplayCtx:      &ReplayCtx{},
+			LastSlotCtx:    &lastSlotCtx,
+			BlockStream:    stream,
+			RestoreSysvars: func(*ReplayHeadSnapshot) error { return nil },
+			RestoreAux:     func(*ReplayHeadSnapshot) error { return nil },
+		},
+	) {
+		t.Fatal("fork switch crossed finalized watermark")
+	}
+	committer.mu.Lock()
+	commitsBeforeFlush := len(committer.through)
+	committer.mu.Unlock()
+	if commitsBeforeFlush != 0 {
+		t.Fatalf("durable writes before forced fold = %d, want 0", commitsBeforeFlush)
+	}
+
+	decisionSource := func(anchor uint64) (alpenglow.ChainDecision, bool) {
+		if anchor != 10 {
+			return alpenglow.ChainDecision{}, false
+		}
+		return alpenglow.ChainDecision{
+			Slot:            11,
+			Kind:            alpenglow.ChainDecisionKindBlock,
+			Block:           alpenglow.BlockID{Slot: 11, Hash: executedID},
+			CertificateType: alpenglow.CertificateFinalizeFast,
+		}, true
+	}
+	if err := sr.FlushFinalized(&persistedTracker{}, decisionSource); err != nil {
+		t.Fatal(err)
+	}
+
+	committer.mu.Lock()
+	committedThrough := append([]uint64(nil), committer.through...)
+	committer.mu.Unlock()
+	if len(committedThrough) != 1 || committedThrough[0] != 11 {
+		t.Fatalf("durable commits = %v, want [11]", committedThrough)
+	}
+	sr.mu.Lock()
+	durable := sr.headSnapshot
+	sr.mu.Unlock()
+	if durable == nil || durable.Slot != 11 || durable.AlpenglowBlockID != executedID {
+		t.Fatalf("durable identity = %+v, want finalized block %s at slot 11", durable, executedID)
+	}
+}
+
+func TestCertifiedSkipDropsExecutedTailBeforePromotion(t *testing.T) {
+	sr, stream, lastSlotCtx := speculativeTailForDecisionTest(t, solana.Hash{3})
+	decisionSource := func(anchor uint64) (alpenglow.ChainDecision, bool) {
+		if anchor != 10 {
+			return alpenglow.ChainDecision{}, false
+		}
+		return alpenglow.ChainDecision{Slot: 11, Kind: alpenglow.ChainDecisionKindSkip}, true
+	}
+
+	switched, err := sr.ReconcileCertifiedTail(decisionSource, SpeculativeRollbackParams{
+		ReplayCtx:      &ReplayCtx{},
+		LastSlotCtx:    lastSlotCtx,
+		BlockStream:    stream,
+		RestoreSysvars: func(*ReplayHeadSnapshot) error { return nil },
+		RestoreAux:     func(*ReplayHeadSnapshot) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !switched || sr.LayerCount() != 0 || (*lastSlotCtx).Slot != 10 {
+		t.Fatalf("skip reconciliation switched=%v layers=%d head=%v", switched, sr.LayerCount(), *lastSlotCtx)
+	}
+
+	sr.mu.Lock()
+	err = sr.advanceFinalityLocked(decisionSource)
+	prefix := sr.store.PromotionPrefix(sr.finalityCursor, 0)
+	sr.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prefix) != 0 {
+		t.Fatalf("certified skip left %d account layers eligible for promotion", len(prefix))
+	}
+}
+
+func TestCertifiedAlternateBlockDropsExecutedTail(t *testing.T) {
+	executedID := solana.Hash{3}
+	selectedID := solana.Hash{4}
+	sr, stream, lastSlotCtx := speculativeTailForDecisionTest(t, executedID)
+	decisionSource := func(anchor uint64) (alpenglow.ChainDecision, bool) {
+		if anchor != 10 {
+			return alpenglow.ChainDecision{}, false
+		}
+		return alpenglow.ChainDecision{
+			Slot:  11,
+			Kind:  alpenglow.ChainDecisionKindBlock,
+			Block: alpenglow.BlockID{Slot: 11, Hash: selectedID},
+		}, true
+	}
+
+	switched, err := sr.ReconcileCertifiedTail(decisionSource, SpeculativeRollbackParams{
+		ReplayCtx:      &ReplayCtx{},
+		LastSlotCtx:    lastSlotCtx,
+		BlockStream:    stream,
+		RestoreSysvars: func(*ReplayHeadSnapshot) error { return nil },
+		RestoreAux:     func(*ReplayHeadSnapshot) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !switched || sr.LayerCount() != 0 || (*lastSlotCtx).Slot != 10 {
+		t.Fatalf("block reconciliation switched=%v layers=%d head=%v", switched, sr.LayerCount(), *lastSlotCtx)
+	}
+}
+
+func speculativeTailForDecisionTest(t *testing.T, executedID solana.Hash) (*SpeculativeReplay, *blockstream.BlockSource, **sealevel.SlotCtx) {
+	t.Helper()
+	sr := NewSpeculativeReplay()
+	sr.Enable()
+	sr.mu.Lock()
+	sr.committedSlot = 10
+	sr.finalityCursor = 10
+	sr.headSnapshot = &ReplayHeadSnapshot{
+		Slot: 10, ParentSlot: 9, FinalBankhash: make([]byte, 32), AcctsLtHash: &lthash.LtHash{},
+		HasAlpenglowIdentity: true, AlpenglowBlockID: solana.Hash{1}, AlpenglowChainedRoot: solana.Hash{2},
+	}
+	sr.store.SetFinalizedSlot(10)
+	sr.mu.Unlock()
+
+	slotCtx := &sealevel.SlotCtx{Slot: 11, ParentSlot: 10, FinalBankhash: make([]byte, 32), AcctsLtHash: &lthash.LtHash{}, AcctMapsMu: &sync.Mutex{}}
+	if err := sr.TrackPending(&DeferredBlockCommit{
+		SlotCtx: slotCtx, BlockSlot: 11, BlockHeight: 11, Bankhash: make([]byte, 32),
+		HasAlpenglowBlockID: true, AlpenglowBlockID: executedID,
+		HasAlpenglowChainedRoot: true, AlpenglowChainedRoot: solana.Hash{5},
+		ModifiedAccts: []*accounts.Account{{Key: solana.PublicKey{6}, Lamports: 1}},
+	}, &ReplayCtx{}); err != nil {
+		t.Fatal(err)
+	}
+	stream := blockstream.NewBlockSource(&blockstream.BlockSourceOpts{
+		SourceType: blockstream.BlockSourceTurbine, TurbineBindAddr: "127.0.0.1:0",
+		TurbineAlpenglowBlockIDHints: true, TurbineRepairOnly: true, StartSlot: 11, EndSlot: 20,
+	})
+	var lastSlotCtx *sealevel.SlotCtx
+	return sr, stream, &lastSlotCtx
 }

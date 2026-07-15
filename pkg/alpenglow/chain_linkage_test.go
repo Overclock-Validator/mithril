@@ -22,8 +22,18 @@ func TestChainTrackerRefreshParentLinkagesFromSlot(t *testing.T) {
 
 	tracker.RefreshParentLinkagesFromSlot(102, block102.Hash)
 	state = tracker.blocks[block103]
+	if state == nil || state.parentHash != (solana.Hash{}) {
+		t.Fatalf("ambiguous parent identity must not be backfilled, got %+v", state)
+	}
+	if _, err := tracker.ObserveCertificate(Certificate{
+		Type: CertificateNotarize, Slot: block102.Slot, BlockHash: block102.Hash, SignatureVerified: true,
+	}); err != nil {
+		t.Fatalf("observe decisive parent certificate: %v", err)
+	}
+	tracker.RefreshParentLinkagesFromSlot(102, block102.Hash)
+	state = tracker.blocks[block103]
 	if state == nil || state.parentHash != block102.Hash {
-		t.Fatalf("expected parent hash backfill for slot 102, got %+v", state)
+		t.Fatalf("expected decisive parent hash backfill for slot 102, got %+v", state)
 	}
 }
 
@@ -49,6 +59,7 @@ func TestChainTrackerRetryWalkAfterParentAlreadyFinalizedAncestor(t *testing.T) 
 	}); err != nil {
 		t.Fatalf("observe fast finalization certificate: %v", err)
 	}
+	requireChainFinalized(t, tracker, block103, CertificateFinalizeFast)
 
 	if _, ok := tracker.NextDecision(100); ok {
 		t.Fatalf("expected no indirect skip before parent linkage")

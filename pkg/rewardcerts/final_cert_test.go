@@ -42,7 +42,7 @@ func buildTestFinalCertWire(t *testing.T) []byte {
 	return out
 }
 
-func TestValidateSlowFinalCertificateUnionsNotarizeAndFinalizeSigners(t *testing.T) {
+func TestValidateSlowFinalCertificateMatchesAgaveBeta1FinalizeSigners(t *testing.T) {
 	keys := []*big.Int{big.NewInt(3), big.NewInt(4), big.NewInt(5)}
 	validators := make([]alpenglow.ValidatorStake, len(keys))
 	for rank, key := range keys {
@@ -80,11 +80,14 @@ func TestValidateSlowFinalCertificateUnionsNotarizeAndFinalizeSigners(t *testing
 
 	validated, err := ValidateBlockFinalCertificate(raw, set, 0)
 	require.NoError(t, err)
-	require.Len(t, validated.Signers, 3)
-	for _, validator := range validators {
-		_, ok := validated.Signers[validator.VoteAccount]
-		require.True(t, ok, "missing union signer %s", validator.VoteAccount)
-	}
+	require.Len(t, validated.Signers, 2)
+	require.NotContains(t, validated.Signers, validators[0].VoteAccount)
+	require.Contains(t, validated.Signers, validators[1].VoteAccount)
+	require.Contains(t, validated.Signers, validators[2].VoteAccount)
+
+	union, err := ValidateBlockFinalCertificateWithPolicy(raw, set, 0, SlowFinalSignersUnion)
+	require.NoError(t, err)
+	require.Len(t, union.Signers, 3)
 }
 
 func compressedAggregateSignature(t *testing.T, vote alpenglow.Vote, keys ...*big.Int) [96]byte {

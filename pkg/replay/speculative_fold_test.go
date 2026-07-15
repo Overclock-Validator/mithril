@@ -104,12 +104,26 @@ func addFoldTestPending(t *testing.T, sr *SpeculativeReplay, slot, parent uint64
 	}, &ReplayCtx{Capitalization: 1}); err != nil {
 		t.Fatal(err)
 	}
+	sr.mu.Lock()
+	snapshot := sr.snapshots[slot]
+	clock := sealevel.SysvarClock{Slot: slot, Epoch: 1}
+	recent := sealevel.SysvarRecentBlockhashes{{
+		Blockhash:     bankhash,
+		FeeCalculator: sealevel.FeeCalculator{LamportsPerSignature: 5_000},
+	}}
+	slotHashes := sealevel.SysvarSlotHashes{{Slot: slot, Hash: bankhash}}
+	snapshot.Clock = &clock
+	snapshot.RecentBlockhashes = &recent
+	snapshot.SlotHashes = &slotHashes
+	sr.mu.Unlock()
 	return blockID
 }
 
 func TestAsyncFoldRetainsOverlayUntilCommitCompletes(t *testing.T) {
 	committer := &testFoldCommitter{started: make(chan struct{}), release: make(chan struct{})}
 	sr := newFoldTestReplay(t, committer, 2)
+	var durableRoots []uint64
+	sr.SetDurableRootSink(func(slot uint64) { durableRoots = append(durableRoots, slot) })
 	id11 := addFoldTestPending(t, sr, 11, 10)
 	id12 := addFoldTestPending(t, sr, 12, 11)
 	decisions := map[uint64]alpenglow.ChainDecision{
@@ -133,6 +147,9 @@ func TestAsyncFoldRetainsOverlayUntilCommitCompletes(t *testing.T) {
 	if got, _ := sr.DurableHead(); got != 10 {
 		t.Fatalf("durable slot advanced before commit: %d", got)
 	}
+	if len(durableRoots) != 0 {
+		t.Fatalf("durable root published before commit: %v", durableRoots)
+	}
 
 	close(committer.release)
 	pt := &persistedTracker{}
@@ -147,6 +164,9 @@ func TestAsyncFoldRetainsOverlayUntilCommitCompletes(t *testing.T) {
 	}
 	if slot, _ := pt.Get(); slot != 12 {
 		t.Fatalf("persisted tracker slot = %d, want 12", slot)
+	}
+	if len(durableRoots) != 1 || durableRoots[0] != 12 {
+		t.Fatalf("durable roots after commit = %v, want [12]", durableRoots)
 	}
 }
 
@@ -309,5 +329,37 @@ func TestFoldResumeContextCarriesEpochConsensusMetadata(t *testing.T) {
 	}
 	if resume.ComputedEpochStakes[7] != "stakes" || len(resume.EpochAuthorizedVoters["vote"]) != 1 {
 		t.Fatalf("epoch metadata missing from fold context: %+v", resume)
+	}
+}
+
+func TestFoldWaitsForLocalReplaySnapshot(t *testing.T) {
+	sr := NewSpeculativeReplay()
+	sr.Enable()
+	sr.foldBatchSlots = 128
+	sr.committedSlot = 10
+	sr.finalityCursor = 12
+	sr.store.SetFinalizedSlot(10)
+	recordSpeculativeLayer(t, sr.store, 11, 10, &accounts.Account{Key: solana.PublicKey{1}, Lamports: 1})
+	recordSpeculativeLayer(t, sr.store, 12, 11, &accounts.Account{Key: solana.PublicKey{2}, Lamports: 2})
+	sr.pending[11] = &DeferredBlockCommit{BlockSlot: 11, SlotCtx: &sealevel.SlotCtx{Slot: 11}, Bankhash: make([]byte, 32)}
+	sr.pending[12] = &DeferredBlockCommit{
+		BlockSlot: 12, SlotCtx: &sealevel.SlotCtx{Slot: 12}, Bankhash: make([]byte, 32),
+		AwaitingReplaySnapshot: true,
+	}
+	sr.snapshots[11] = &ReplayHeadSnapshot{Slot: 11}
+
+	prefix, err := sr.selectFoldPrefixLocked(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prefix) != 0 {
+		t.Fatalf("normal fold crossed local snapshot barrier: %+v", prefix)
+	}
+	prefix, err = sr.selectFoldPrefixLocked(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prefix) != 1 || prefix[0].Slot != 11 {
+		t.Fatalf("forced fold prefix = %+v, want slot 11 only", prefix)
 	}
 }

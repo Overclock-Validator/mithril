@@ -65,7 +65,7 @@ func (p *componentStreamProcessor) consume(decoded decodedSlotComponent, final b
 		if p.stage != componentStagePreParent || decoded.batchStart != 0 {
 			return fmt.Errorf("%w: header at shred %d", ErrInvalidBlockComponent, decoded.batchStart)
 		}
-		if p.shredParentSlot != 0 && marker.Header.ParentSlot != p.shredParentSlot {
+		if marker.Header.ParentSlot != p.shredParentSlot {
 			return fmt.Errorf("%w: header parent %d, shred parent %d", ErrHeaderParentSlotMismatch, marker.Header.ParentSlot, p.shredParentSlot)
 		}
 		p.sawHeader = true

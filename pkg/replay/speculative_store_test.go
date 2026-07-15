@@ -48,6 +48,23 @@ func TestSpeculativeStoreResolveWalksParentChain(t *testing.T) {
 	}
 }
 
+func TestSpeculativeStoreResolveCurrentOrSkippedSlotUsesExecutedAncestor(t *testing.T) {
+	store := newSpeculativeStore()
+	store.SetFinalizedSlot(100)
+	pk := solana.PublicKey{3}
+	recordSpeculativeLayer(t, store, 104, 100, &accounts.Account{Key: pk, Lamports: 44})
+
+	for _, requested := range []uint64{105, 108} {
+		acct, err := store.Resolve(requested, pk, nil)
+		if err != nil {
+			t.Fatalf("resolve slot %d through executed ancestor: %v", requested, err)
+		}
+		if acct.Lamports != 44 {
+			t.Fatalf("slot %d lamports = %d, want 44", requested, acct.Lamports)
+		}
+	}
+}
+
 func TestSpeculativeStoreRecordLayerCapturesBankHashSnapshot(t *testing.T) {
 	store := newSpeculativeStore()
 	store.SetFinalizedSlot(100)

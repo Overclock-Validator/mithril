@@ -29,6 +29,19 @@ type ValidatedFinalCert struct {
 	Signers      map[solana.PublicKey]struct{}
 }
 
+type SlowFinalSignerPolicy uint8
+
+const (
+	// SlowFinalSignersFinalizeOnly matches Agave v4.2.0-beta.1
+	// (802264fcc0). Only the finalize certificate signers receive the final-slot
+	// update.
+	SlowFinalSignersFinalizeOnly SlowFinalSignerPolicy = iota
+	// SlowFinalSignersUnion matches post-tag Agave commit 461671daf4.
+	SlowFinalSignersUnion
+
+	DefaultSlowFinalSignerPolicy = SlowFinalSignersFinalizeOnly
+)
+
 func DecodeFinalCertificate(raw []byte) (FinalCertificate, error) {
 	if len(raw) < 8+32+blsSignatureCompressedSize+2+1 {
 		return FinalCertificate{}, fmt.Errorf("decode final certificate: too short (%d bytes)", len(raw))
@@ -91,6 +104,20 @@ func ValidateBlockFinalCertificate(
 	validatorSet alpenglow.ValidatorSet,
 	shredVersion uint16,
 ) (*ValidatedFinalCert, error) {
+	return ValidateBlockFinalCertificateWithPolicy(
+		finalCertRaw,
+		validatorSet,
+		shredVersion,
+		DefaultSlowFinalSignerPolicy,
+	)
+}
+
+func ValidateBlockFinalCertificateWithPolicy(
+	finalCertRaw []byte,
+	validatorSet alpenglow.ValidatorSet,
+	shredVersion uint16,
+	slowFinalSignerPolicy SlowFinalSignerPolicy,
+) (*ValidatedFinalCert, error) {
 	if len(finalCertRaw) == 0 {
 		return nil, nil
 	}
@@ -138,11 +165,12 @@ func ValidateBlockFinalCertificate(
 			return nil, fmt.Errorf("verify finalize final cert: %w", err)
 		}
 		certificates = append(certificates, verifiedNotar, verifiedFinalize)
-		// Slow finalization rewards the union of notarize and finalize
-		// signers. Agave v4.2.0-beta.0 accidentally retained only finalize
-		// signers; 461671daf4 corrected this after the beta tag.
-		if err := collectFinalCertSigners(validatorSet, notarCert, signers); err != nil {
-			return nil, err
+		if slowFinalSignerPolicy == SlowFinalSignersUnion {
+			if err := collectFinalCertSigners(validatorSet, notarCert, signers); err != nil {
+				return nil, err
+			}
+		} else if slowFinalSignerPolicy != SlowFinalSignersFinalizeOnly {
+			return nil, fmt.Errorf("unsupported slow-final signer policy %d", slowFinalSignerPolicy)
 		}
 		if err := collectFinalCertSigners(validatorSet, finalizeCert, signers); err != nil {
 			return nil, err
@@ -180,7 +208,7 @@ func ValidateBlockFinalCertificate(
 }
 
 func collectFinalCertSigners(set alpenglow.ValidatorSet, cert alpenglow.Certificate, signers map[solana.PublicKey]struct{}) error {
-	bitmap, err := alpenglow.DecodeSignerStoreBitmap(cert.Bitmap, len(set.Validators))
+	bitmap, err := alpenglow.DecodeSignerStoreBitmap(cert.Bitmap, alpenglow.CertificateBitmapCapacity)
 	if err != nil {
 		return err
 	}

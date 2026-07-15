@@ -115,7 +115,7 @@ func verifyAndCollectRewardCert(verifier *alpenglow.CertificateVerifier, set alp
 	if err := verifier.VerifyRewardCertificateForEpoch(set.Epoch, cert); err != nil {
 		return err
 	}
-	bitmap, err := alpenglow.DecodeSignerStoreBitmap(cert.Bitmap, len(set.Validators))
+	bitmap, err := alpenglow.DecodeSignerStoreBitmap(cert.Bitmap, alpenglow.CertificateBitmapCapacity)
 	if err != nil {
 		return err
 	}

@@ -64,6 +64,10 @@ type LeaderLoop struct {
 	alpenglowClock   bool
 	parentContext    func(slot, parentSlot uint64) ParentContext
 	productionParent func(slot uint64) alpenglow.BlockProductionParent
+	replayReady      func() bool
+	onFatal          func(error)
+	prepareCommit    func(replay.CommitLeaderInput) (*replay.PreparedLeaderCommit, error)
+	finalizeCommit   func(*replay.PreparedLeaderCommit, solana.Hash) error
 
 	currentSlot   func() uint64
 	leaderForSlot func(uint64) (solana.PublicKey, bool)
@@ -79,6 +83,8 @@ type LeaderLoop struct {
 	parentCtx           ParentContext
 	activeParentID      solana.Hash
 	finishedLeaderSlots map[uint64]struct{}
+	halted              bool
+	fatalOnce           sync.Once
 }
 
 type LeaderLoopConfig struct {
@@ -92,6 +98,10 @@ type LeaderLoopConfig struct {
 	AlpenglowClock   bool
 	ParentContext    func(slot, parentSlot uint64) ParentContext
 	ProductionParent func(slot uint64) alpenglow.BlockProductionParent
+	ReplayReady      func() bool
+	OnFatal          func(error)
+	PrepareCommit    func(replay.CommitLeaderInput) (*replay.PreparedLeaderCommit, error)
+	FinalizeCommit   func(*replay.PreparedLeaderCommit, solana.Hash) error
 	CurrentSlot      func() uint64
 	LeaderForSlot    func(uint64) (solana.PublicKey, bool)
 	ParentBlockID    func(slot uint64) (solana.Hash, bool)
@@ -107,6 +117,12 @@ func NewLeaderLoop(cfg LeaderLoopConfig) *LeaderLoop {
 	if cfg.UserAgent == nil {
 		cfg.UserAgent = []byte("mithril")
 	}
+	if cfg.PrepareCommit == nil {
+		cfg.PrepareCommit = replay.CommitLeaderSlot
+	}
+	if cfg.FinalizeCommit == nil {
+		cfg.FinalizeCommit = replay.FinalizeLeaderCommit
+	}
 	return &LeaderLoop{
 		controller:          cfg.Controller,
 		identity:            cfg.Identity,
@@ -118,6 +134,10 @@ func NewLeaderLoop(cfg LeaderLoopConfig) *LeaderLoop {
 		alpenglowClock:      cfg.AlpenglowClock,
 		parentContext:       cfg.ParentContext,
 		productionParent:    cfg.ProductionParent,
+		replayReady:         cfg.ReplayReady,
+		onFatal:             cfg.OnFatal,
+		prepareCommit:       cfg.PrepareCommit,
+		finalizeCommit:      cfg.FinalizeCommit,
 		currentSlot:         cfg.CurrentSlot,
 		leaderForSlot:       cfg.LeaderForSlot,
 		parentBlockID:       cfg.ParentBlockID,
@@ -150,6 +170,9 @@ func (l *LeaderLoop) tick() {
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.halted {
+		return
+	}
 
 	for {
 		wallSlot := l.currentSlot()
@@ -288,6 +311,8 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 	}
 
 	var prepared *replay.PreparedLeaderCommit
+	var prepareErr error
+	commitRequired := l.accountsDb != nil && l.epochSchedule != nil
 	if l.accountsDb != nil && l.epochSchedule != nil {
 		block := BuildLeaderBlock(LeaderBlockInput{
 			Bank:             l.activeBank,
@@ -296,14 +321,14 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 			PrevNumSigs:      l.parentCtx.PrevNumSigs,
 			PrevFeeGovernor:  l.parentCtx.PrevFeeGovernor,
 			EntryBlockhash:   tickHash,
+			ParentBlockID:    l.activeParentID,
 			TxFeeAccumulator: l.activeBank.TxFeeAccumulator(),
 		})
 		block.SkipRewardCert = append([]byte(nil), footerRewards.Skip...)
 		block.NotarRewardCert = append([]byte(nil), footerRewards.Notar...)
 		block.FooterProducerTimeNanos = producerTimeNanos
 
-		var err error
-		prepared, err = replay.CommitLeaderSlot(replay.CommitLeaderInput{
+		prepared, prepareErr = l.prepareCommit(replay.CommitLeaderInput{
 			AcctsDb:                 l.accountsDb,
 			SlotCtx:                 l.activeBank.SlotCtx(),
 			Block:                   block,
@@ -314,10 +339,19 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 			FooterTimestamp:         footerTimestamp,
 			FooterProducerTimeNanos: producerTimeNanos,
 		})
-		if err != nil {
-			mlog.Log.Errorf("leader slot %d commit failed: %v", slot, err)
+		if prepareErr != nil {
+			mlog.Log.Errorf("leader slot %d commit failed: %v", slot, prepareErr)
 			prepared = nil
 		}
+	}
+	if commitRequired && prepared == nil {
+		if prepareErr == nil {
+			prepareErr = errors.New("commit preparation returned no state")
+		}
+		l.haltLocked(fmt.Errorf("leader slot %d state preparation failed: %w", slot, prepareErr))
+		l.markLeaderSlotFinished(slot)
+		l.clearActiveSlotLocked()
+		return
 	}
 
 	var blockID solana.Hash
@@ -338,21 +372,45 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 		}
 	}
 	if prepared != nil && broadcastComplete {
-		if err := replay.FinalizeLeaderCommit(prepared, blockID); err != nil {
-			mlog.Log.Errorf("leader slot %d publication failed: %v", slot, err)
+		if err := l.finalizeCommit(prepared, blockID); err != nil {
+			l.haltLocked(fmt.Errorf("leader slot %d was broadcast but could not enter replay: %w", slot, err))
 		}
+	} else if commitRequired && !broadcastComplete {
+		l.haltLocked(fmt.Errorf("leader slot %d state was prepared but block broadcast did not complete", slot))
 	}
 
 	l.markLeaderSlotFinished(slot)
 
-	l.controller.ClearWorkingBank()
+	l.clearActiveSlotLocked()
+}
+
+func (l *LeaderLoop) clearActiveSlotLocked() {
+	if l.controller != nil {
+		l.controller.ClearWorkingBank()
+	}
 	l.activeBank = nil
 	l.activeSess = nil
 	l.activeSlot = 0
 	l.activeParentID = solana.Hash{}
 }
 
+func (l *LeaderLoop) haltLocked(err error) {
+	if err == nil {
+		return
+	}
+	l.halted = true
+	mlog.Log.Errorf("ALPENGLOW VALIDATOR SAFETY HALT: %v", err)
+	l.fatalOnce.Do(func() {
+		if l.onFatal != nil {
+			l.onFatal(err)
+		}
+	})
+}
+
 func (l *LeaderLoop) startSlotLocked(slot uint64) error {
+	if l.replayReady != nil && !l.replayReady() {
+		return fmt.Errorf("%w: speculative replay is not ready", errParentNotReady)
+	}
 	parent, err := l.resolveProductionParent(slot)
 	if err != nil {
 		return err

@@ -2,6 +2,7 @@ package replay
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
@@ -106,12 +107,34 @@ func (st *SpeculativeStore) Resolve(endSlot uint64, pk solana.PublicKey, db *acc
 			st.mu.RUnlock()
 			return acct, nil
 		}
+		// Replay callers sometimes name the slot being built, and skipped slots
+		// have no layer of their own. Resolve both against the newest executed
+		// ancestor at or before endSlot instead of requiring an exact layer.
 		slot := endSlot
+		if _, exact := st.layers[slot]; !exact {
+			index := sort.Search(len(st.order), func(i int) bool { return st.order[i] > endSlot }) - 1
+			if index >= 0 {
+				slot = st.order[index]
+			} else {
+				slot = finalized
+			}
+		}
+		if slot <= finalized {
+			st.mu.RUnlock()
+			if db == nil {
+				return nil, fmt.Errorf("speculative store: nil accounts db")
+			}
+			acct, err := db.GetAccountDurable(finalized, pk)
+			if err != nil {
+				return nil, err
+			}
+			return acct.Clone(), nil
+		}
 		for slot > finalized {
 			layer, ok := st.layers[slot]
 			if !ok {
 				st.mu.RUnlock()
-				return nil, fmt.Errorf("speculative store: missing layer for slot %d while resolving %s", slot, pk)
+				return nil, fmt.Errorf("speculative store: missing ancestor layer for slot %d while resolving %s", slot, pk)
 			}
 			if acct, ok := layer.Deltas[pk]; ok {
 				acct = acct.Clone()

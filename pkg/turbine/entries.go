@@ -17,6 +17,9 @@ const (
 	blockMarkerVariantHeader       = 1
 	blockMarkerVariantUpdateParent = 2
 	versionedParentInfoV1          = 1
+	// A minimally encoded legacy transaction has a compact signature count,
+	// three header bytes, compact account/instruction counts, and a blockhash.
+	minimumTransactionWireSize = 1 + 3 + 1 + 32 + 1
 )
 
 type Entry struct {
@@ -44,34 +47,13 @@ func (e *Entry) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 	if err != nil {
 		return fmt.Errorf("read transaction count: %w", err)
 	}
-	if numTxns > uint64(decoder.Remaining()) {
+	if numTxns > uint64(decoder.Remaining()/minimumTransactionWireSize) {
 		return fmt.Errorf("transaction count %d exceeds remaining bytes %d", numTxns, decoder.Remaining())
 	}
 	e.Txns = make([]solana.Transaction, numTxns)
 	for i := uint64(0); i < numTxns; i++ {
 		if err = e.Txns[i].UnmarshalWithDecoder(decoder); err != nil {
 			return fmt.Errorf("read transaction %d: %w", i, err)
-		}
-	}
-	return nil
-}
-
-type entryBatch struct {
-	Entries []Entry
-}
-
-func (b *entryBatch) UnmarshalWithDecoder(decoder *bin.Decoder) error {
-	numEntries, err := decoder.ReadUint64(bin.LE)
-	if err != nil {
-		return fmt.Errorf("read entry count: %w", err)
-	}
-	if numEntries > uint64(decoder.Remaining()) {
-		return fmt.Errorf("entry count %d exceeds remaining bytes %d", numEntries, decoder.Remaining())
-	}
-	b.Entries = make([]Entry, numEntries)
-	for i := uint64(0); i < numEntries; i++ {
-		if err = b.Entries[i].UnmarshalWithDecoder(decoder); err != nil {
-			return fmt.Errorf("read entry %d: %w", i, err)
 		}
 	}
 	return nil
@@ -142,17 +124,6 @@ func DecodeEntriesAndAlpenglowMarkersFromDataShreds(shreds []*Shred) ([]Entry, *
 		return nil, nil, nil, fmt.Errorf("slot %d component stream: %w", slot, err)
 	}
 	return processor.entries, processor.parent, processor.footer, nil
-}
-
-func decodeEntryBatch(data []byte) ([]Entry, error) {
-	var decoder bin.Decoder
-	decoder.SetEncoding(bin.EncodingBin)
-	decoder.Reset(data)
-	var batch entryBatch
-	if err := batch.UnmarshalWithDecoder(&decoder); err != nil {
-		return nil, err
-	}
-	return batch.Entries, nil
 }
 
 func decodeAlpenglowMarker(data []byte, batchStart uint32) (*AlpenglowParentInfo, *BlockFooter, bool, error) {

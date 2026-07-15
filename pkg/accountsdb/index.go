@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/gagliardetto/solana-go"
@@ -56,11 +57,22 @@ const StakeIndexRecordSize = 48 // 32-byte pubkey + 8-byte fileId + 8-byte offse
 // WriteStakePubkeyIndex writes stake index entries.
 // Format: 8-byte header ("STKI" + version uint32 LE) + N × 48-byte records.
 func WriteStakePubkeyIndex(path string, entries []StakeIndexEntry) error {
-	f, err := os.Create(path)
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-")
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	tmpPath := f.Name()
+	committed := false
+	defer func() {
+		_ = f.Close()
+		if !committed {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := f.Chmod(0644); err != nil {
+		return fmt.Errorf("setting stake index permissions: %w", err)
+	}
 
 	buf := bufio.NewWriterSize(f, 1<<20)
 
@@ -83,7 +95,29 @@ func WriteStakePubkeyIndex(path string, entries []StakeIndexEntry) error {
 		}
 	}
 
-	return buf.Flush()
+	if err := buf.Flush(); err != nil {
+		return fmt.Errorf("flushing stake index: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("syncing stake index: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("closing stake index: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("installing stake index: %w", err)
+	}
+	committed = true
+
+	dirHandle, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("opening stake index directory: %w", err)
+	}
+	defer dirHandle.Close()
+	if err := dirHandle.Sync(); err != nil {
+		return fmt.Errorf("syncing stake index directory: %w", err)
+	}
+	return nil
 }
 
 // BuildIndexEntriesFromAppendVecs parses an appendvec and returns:

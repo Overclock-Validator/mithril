@@ -44,7 +44,7 @@ func main() {
 	var sanityCheck []int
 	for level, txs := range topSortLevels {
 		mlog.Log.Infof("level=%d len(txs)=%d", level, len(txs))
-		mlog.Log.Infof("txs=%s", txs)
+		mlog.Log.Infof("txs=%v", txs)
 		sanityCheck = append(sanityCheck, txs...)
 	}
 	slices.Sort(sanityCheck)

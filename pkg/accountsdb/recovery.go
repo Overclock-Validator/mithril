@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/cockroachdb/pebble"
 )
 
 // RecoveryResult reports the durable fold state derived from the store itself
@@ -98,7 +99,6 @@ func (db *AccountsDb) RecoverFoldState() (RecoveryResult, error) {
 		if err := db.applyManifestToIndex(manifest); err != nil {
 			return res, fmt.Errorf("accountsdb: replay fold manifest seq %d: %w", seq, err)
 		}
-		db.storeManifestBankhashes(manifest)
 		res.ReplayedBatches = append(res.ReplayedBatches, seq)
 		stopSeq = seq
 	}
@@ -132,6 +132,14 @@ func (db *AccountsDb) RecoverFoldState() (RecoveryResult, error) {
 		return res, err
 	}
 	res.OrphansRemoved = append(res.OrphansRemoved, tmps...)
+
+	// Bankhash rows are advisory writes during CommitBatch and intentionally do
+	// not add another fsync to the fold hot path. Rebuild every retained,
+	// committed row here in one synced batch, including the case where the index
+	// meta already contained the final fold and no manifest replay was needed.
+	if err := db.restoreCommittedManifestBankhashes(bySeq, stopSeq); err != nil {
+		return res, err
+	}
 
 	// Resolve the final frontier's manifest for bankhash + resume context.
 	if stopSeq > 0 {
@@ -191,14 +199,38 @@ func (db *AccountsDb) verifyAndReadManifest(hdr ManifestHeader) (*SegmentManifes
 	return manifest, nil
 }
 
-func (db *AccountsDb) storeManifestBankhashes(m *SegmentManifest) {
-	for _, bh := range m.Bankhashes {
-		var slotBytes [8]byte
-		binary.LittleEndian.PutUint64(slotBytes[:], bh.Slot)
-		if err := db.BankHashStore.Set(slotBytes[:], bh.Bankhash[:], nil); err != nil {
-			mlog.Log.Warnf("accountsdb: recovery bankhash store slot %d: %v", bh.Slot, err)
+func (db *AccountsDb) restoreCommittedManifestBankhashes(bySeq map[uint64]ManifestHeader, stopSeq uint64) error {
+	batch := db.BankHashStore.NewBatch()
+	defer batch.Close()
+	writes := 0
+	for seq, header := range bySeq {
+		if seq > stopSeq {
+			continue
+		}
+		manifest, err := ReadSegmentManifest(header.Path)
+		if err != nil {
+			// The frontier manifest is checked again below and will leave resume
+			// unavailable, which makes node startup fail closed. Older corrupt
+			// manifests cannot be used to reconstruct their advisory rows.
+			mlog.Log.Warnf("accountsdb: cannot restore bankhashes from fold manifest seq %d: %v", seq, err)
+			continue
+		}
+		for _, bankhash := range manifest.Bankhashes {
+			var slotBytes [8]byte
+			binary.LittleEndian.PutUint64(slotBytes[:], bankhash.Slot)
+			if err := batch.Set(slotBytes[:], bankhash.Bankhash[:], nil); err != nil {
+				return fmt.Errorf("accountsdb: restore bankhash slot %d: %w", bankhash.Slot, err)
+			}
+			writes++
 		}
 	}
+	if writes == 0 {
+		return nil
+	}
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return fmt.Errorf("accountsdb: sync recovered bankhashes: %w", err)
+	}
+	return nil
 }
 
 // bootstrapHighFileId reads the write-once sidecar recorded by snapshot build.

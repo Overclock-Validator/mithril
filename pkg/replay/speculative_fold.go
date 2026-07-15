@@ -101,12 +101,23 @@ func (sr *SpeculativeReplay) runFoldWorker() {
 
 func runSpeculativeFold(committer batchCommitter, job *speculativeFoldJob) error {
 	if job.stakeIdxDir != "" {
+		// Persist this auxiliary index first. It is safe for the index to be a
+		// superset of AccountsDB because readers validate every pubkey against the
+		// canonical account store; the opposite ordering could commit an account
+		// fold while permanently omitting its stake pubkey.
 		if _, err := global.FlushPendingStakePubkeysThrough(job.stakeIdxDir, job.through); err != nil {
 			return fmt.Errorf("fold through slot %d: flush stake index: %w", job.through, err)
 		}
 	}
 	if _, err := committer.CommitBatch(job.deltas, job.through, job.bankhashes, job.resumeJSON); err != nil {
 		return fmt.Errorf("fold through slot %d: %w", job.through, err)
+	}
+	if job.stakeIdxDir != "" {
+		if err := global.CompactStakePubkeyIndex(job.stakeIdxDir); err != nil {
+			// The durable commit already succeeded. Compaction is maintenance,
+			// so report it without making in-memory durability lag the manifest.
+			mlog.Log.Warnf("fold through slot %d: compact stake index: %v", job.through, err)
+		}
 	}
 	return nil
 }
@@ -226,6 +237,9 @@ func (sr *SpeculativeReplay) advanceFinalityLocked(
 		case alpenglow.ChainDecisionKindConflict:
 			return fmt.Errorf("ALPENGLOW SAFETY: conflicting certified decisions at slot %d: %s", decision.Slot, decision.Reason)
 		case alpenglow.ChainDecisionKindSkip:
+			if pending := sr.pending[decision.Slot]; pending != nil {
+				return fmt.Errorf("ALPENGLOW SAFETY: certified skip at slot %d still has executed block state", decision.Slot)
+			}
 			cursor = decision.Slot
 		case alpenglow.ChainDecisionKindBlock:
 			if !alpenglowCertConfirmsPersist(decision.CertificateType) {
@@ -276,6 +290,9 @@ func (sr *SpeculativeReplay) buildFoldJobLocked(force bool) (*speculativeFoldJob
 	if err != nil {
 		return nil, fmt.Errorf("fold through slot %d: %w", through, err)
 	}
+	if err := ValidateRootedResumeContext(resume); err != nil {
+		return nil, fmt.Errorf("fold through slot %d produced invalid resume context: %w", through, err)
+	}
 	resumeJSON, err := json.Marshal(resume)
 	if err != nil {
 		return nil, fmt.Errorf("fold through slot %d: marshal resume context: %w", through, err)
@@ -317,6 +334,12 @@ func (sr *SpeculativeReplay) selectFoldPrefixLocked(force bool) ([]accounts.Slot
 
 	firstActive := -1
 	for i, delta := range prefix {
+		if pending := sr.pending[delta.Slot]; pending != nil && pending.AwaitingReplaySnapshot {
+			if force && i > 0 {
+				return prefix[:i], nil
+			}
+			return nil, nil
+		}
 		snapshot := sr.snapshots[delta.Slot]
 		if snapshot == nil {
 			return nil, fmt.Errorf("fold slot %d has no replay resume snapshot", delta.Slot)
@@ -477,6 +500,9 @@ func (sr *SpeculativeReplay) applyFoldResultLocked(pt *persistedTracker, result 
 	}
 	if pt != nil {
 		pt.Set(job.through, job.bankhash)
+	}
+	if sr.durableRootSink != nil {
+		sr.durableRootSink(job.through)
 	}
 	if sr.mithrilState != nil {
 		sr.mithrilState.LastRootedSlot = job.through

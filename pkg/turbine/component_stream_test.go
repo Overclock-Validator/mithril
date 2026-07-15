@@ -1,11 +1,55 @@
 package turbine
 
 import (
+	"encoding/binary"
 	"errors"
 	"testing"
 
 	"github.com/gagliardetto/solana-go"
 )
+
+func TestUnmarshalEntryBatchRejectsOversizedCount(t *testing.T) {
+	data := make([]byte, 16)
+	binary.LittleEndian.PutUint64(data, 1<<32)
+	if _, err := unmarshalEntryBatch(data); !errors.Is(err, ErrInvalidBlockComponent) {
+		t.Fatalf("error = %v, want %v", err, ErrInvalidBlockComponent)
+	}
+}
+
+func TestUnmarshalEntryBatchRejectsImpossibleTransactionCount(t *testing.T) {
+	data := make([]byte, 8+minimumEntryWireSize)
+	binary.LittleEndian.PutUint64(data, 1)
+	binary.LittleEndian.PutUint64(data[8+8+32:], 2)
+	if _, err := unmarshalEntryBatch(data); err == nil {
+		t.Fatal("impossible transaction count was accepted")
+	}
+}
+
+func FuzzUnmarshalBlockComponent(f *testing.F) {
+	f.Add([]byte{1})
+	oversized := make([]byte, 16)
+	binary.LittleEndian.PutUint64(oversized, 1<<32)
+	f.Add(oversized)
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_, _ = UnmarshalBlockComponent(data)
+	})
+}
+
+func TestGenesisCertificateBitmapIsBounded(t *testing.T) {
+	data := make([]byte, 240+513)
+	binary.LittleEndian.PutUint64(data[232:240], 513)
+	if _, err := unmarshalGenesisCert(data); !errors.Is(err, ErrInvalidBlockComponent) {
+		t.Fatalf("error = %v, want %v", err, ErrInvalidBlockComponent)
+	}
+}
+
+func TestComponentStreamChecksGenesisParentSlot(t *testing.T) {
+	processor := componentStreamProcessor{slot: 1, shredParentSlot: 0}
+	err := processor.consume(decodedSlotComponent{component: NewBlockHeader(7, componentHash(1))}, false)
+	if !errors.Is(err, ErrHeaderParentSlotMismatch) {
+		t.Fatalf("error = %v, want %v", err, ErrHeaderParentSlotMismatch)
+	}
+}
 
 func TestComponentStreamRequiresFooterThenFinalAlpentick(t *testing.T) {
 	processor := componentStreamProcessor{slot: 8, shredParentSlot: 7}

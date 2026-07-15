@@ -6,6 +6,13 @@ import (
 	"github.com/gagliardetto/solana-go"
 )
 
+func requireChainFinalized(t *testing.T, tracker *ChainTracker, block BlockID, certType CertificateType) {
+	t.Helper()
+	if err := tracker.ObserveFinalized(block, certType); err != nil {
+		t.Fatalf("observe %s finalization for %s: %v", certType, block, err)
+	}
+}
+
 func TestChainTrackerRequiresVerifiedCertificatesByDefault(t *testing.T) {
 	tracker := NewChainTracker()
 
@@ -81,6 +88,30 @@ func TestChainTrackerCanRequireStakeVerifiedCertificates(t *testing.T) {
 	}
 }
 
+func TestChainTrackerAppliesCertificateAfterDeferredVerification(t *testing.T) {
+	tracker := NewChainTrackerWithConfig(ChainConfig{
+		RequireVerifiedCertificates:      true,
+		RequireStakeVerifiedCertificates: true,
+	})
+	cert := Certificate{Type: CertificateSkip, Slot: 11}
+	if _, err := tracker.ObserveCertificate(cert); err != nil {
+		t.Fatalf("observe pending certificate: %v", err)
+	}
+	cert.SignatureVerified = true
+	cert.StakeVerified = true
+	update, err := tracker.ObserveCertificate(cert)
+	if err != nil {
+		t.Fatalf("observe verified certificate: %v", err)
+	}
+	if update.New || !update.Trusted {
+		t.Fatalf("verified retry update = %+v", update)
+	}
+	decision, ok := tracker.NextDecision(10)
+	if !ok || decision.Kind != ChainDecisionKindSkip {
+		t.Fatalf("verified retry was not applied: %+v (ok=%v)", decision, ok)
+	}
+}
+
 func TestChainTrackerResolvesCertifiedBlock(t *testing.T) {
 	tracker := NewChainTracker()
 	blockID := BlockID{Slot: 11, Hash: chainTestHash(1)}
@@ -146,7 +177,7 @@ func TestChainTrackerDetectsCertifiedBlockConflict(t *testing.T) {
 	}
 }
 
-func TestChainTrackerDetectsBlockAndSkipConflict(t *testing.T) {
+func TestChainTrackerNotarizeAndSkipResolvesToSkip(t *testing.T) {
 	tracker := NewChainTracker()
 
 	_, err := tracker.ObserveCertificate(Certificate{
@@ -169,10 +200,79 @@ func TestChainTrackerDetectsBlockAndSkipConflict(t *testing.T) {
 
 	decision, ok := tracker.NextDecision(10)
 	if !ok {
-		t.Fatalf("expected conflict decision")
+		t.Fatalf("expected skip decision")
 	}
-	if decision.Kind != ChainDecisionKindConflict || decision.Reason == "" {
-		t.Fatalf("unexpected conflict decision: %+v", decision)
+	if decision.Kind != ChainDecisionKindSkip {
+		t.Fatalf("unexpected decision: %+v", decision)
+	}
+	if snap := tracker.Snapshot(); snap.ConflictingSlots != 0 {
+		t.Fatalf("pre-finality notarize+skip is legal, got snapshot %+v", snap)
+	}
+}
+
+func TestChainTrackerFinalizedBlockAndSkipConflicts(t *testing.T) {
+	tracker := NewChainTracker()
+	block := BlockID{Slot: 11, Hash: chainTestHash(1)}
+	fast := Certificate{Type: CertificateFinalizeFast, Slot: block.Slot, BlockHash: block.Hash, SignatureVerified: true}
+	if _, err := tracker.ObserveCertificate(fast); err != nil {
+		t.Fatalf("observe %s: %v", fast.Type, err)
+	}
+	requireChainFinalized(t, tracker, block, CertificateFinalizeFast)
+	if _, err := tracker.ObserveCertificate(Certificate{Type: CertificateSkip, Slot: block.Slot, SignatureVerified: true}); err != nil {
+		t.Fatalf("observe skip: %v", err)
+	}
+
+	decision, ok := tracker.NextDecision(10)
+	if !ok || decision.Kind != ChainDecisionKindConflict {
+		t.Fatalf("expected finalized/skip conflict, got %+v (ok=%v)", decision, ok)
+	}
+	if tracker.SkipCertifiedAt(11) {
+		t.Fatalf("conflicted skip must fail closed")
+	}
+	if _, _, ok := tracker.CertifiedBlockAt(11); ok {
+		t.Fatalf("conflicted block must fail closed")
+	}
+}
+
+func TestChainTrackerFallbackSiblingsAreLegalAndNonDecisive(t *testing.T) {
+	tracker := NewChainTracker()
+	for seed := byte(1); seed <= 2; seed++ {
+		if _, err := tracker.ObserveCertificate(Certificate{
+			Type: CertificateNotarizeFallback, Slot: 11, BlockHash: chainTestHash(seed), SignatureVerified: true,
+		}); err != nil {
+			t.Fatalf("observe fallback %d: %v", seed, err)
+		}
+	}
+	if decision, ok := tracker.NextDecision(10); ok {
+		t.Fatalf("fallback-only siblings must wait, got %+v", decision)
+	}
+	if _, ok := tracker.KnownBlockAtSlot(11); ok {
+		t.Fatalf("fallback-only parent identity must remain ambiguous")
+	}
+	if tracker.FinalityConflictAt(11) {
+		t.Fatalf("legal fallback siblings were marked conflicted")
+	}
+}
+
+func TestChainTrackerEnforcesCertifiedBlockProtocolBound(t *testing.T) {
+	tracker := NewChainTracker()
+	for seed := byte(1); seed <= maxCertifiedBlocksPerSlot; seed++ {
+		if _, err := tracker.ObserveCertificate(Certificate{
+			Type: CertificateNotarizeFallback, Slot: 11, BlockHash: chainTestHash(seed), SignatureVerified: true,
+		}); err != nil {
+			t.Fatalf("observe legal fallback %d: %v", seed, err)
+		}
+	}
+	if tracker.FinalityConflictAt(11) {
+		t.Fatalf("protocol permits %d fallback blocks", maxCertifiedBlocksPerSlot)
+	}
+	if _, err := tracker.ObserveCertificate(Certificate{
+		Type: CertificateNotarizeFallback, Slot: 11, BlockHash: chainTestHash(8), SignatureVerified: true,
+	}); err != nil {
+		t.Fatalf("observe over-bound fallback: %v", err)
+	}
+	if !tracker.FinalityConflictAt(11) {
+		t.Fatalf("expected over-bound fallback set to fail closed")
 	}
 }
 
@@ -189,6 +289,7 @@ func TestChainTrackerFastFinalizationDerivesOmittedSkips(t *testing.T) {
 	if err != nil {
 		t.Fatalf("observe fast finalization certificate: %v", err)
 	}
+	requireChainFinalized(t, tracker, blockID, CertificateFinalizeFast)
 	tracker.ObserveReplayBlock(ReplayBlockObservation{
 		Block:      blockID,
 		ParentSlot: 12,
@@ -242,6 +343,10 @@ func TestChainTrackerSlowFinalizationRequiresNotarizationCertificate(t *testing.
 	if err != nil {
 		t.Fatalf("observe notarization certificate: %v", err)
 	}
+	if snap := tracker.Snapshot(); snap.DirectFinalizedBlocks != 0 {
+		t.Fatalf("certificate pair bypassed pool finalization: %+v", snap)
+	}
+	requireChainFinalized(t, tracker, blockID, CertificateFinalize)
 
 	path := tracker.ResolvePath(12, 4)
 	if len(path.Decisions) != 3 {
@@ -280,6 +385,7 @@ func TestChainTrackerFinalizedAncestryWalkDerivesDeepSkips(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("observe fast finalization certificate: %v", err)
 	}
+	requireChainFinalized(t, tracker, block20, CertificateFinalizeFast)
 
 	tracker.ObserveReplayBlock(ReplayBlockObservation{Block: block20, ParentSlot: 19, ParentHash: block19.Hash})
 	tracker.ObserveReplayBlock(ReplayBlockObservation{Block: block19, ParentSlot: 18, ParentHash: block18.Hash})
@@ -334,6 +440,7 @@ func TestChainTrackerFinalizedAncestryWalkHandlesInOrderObservation(t *testing.T
 	}); err != nil {
 		t.Fatalf("observe fast finalization certificate: %v", err)
 	}
+	requireChainFinalized(t, tracker, block20, CertificateFinalizeFast)
 
 	// Gap 13-16 below ancestor 17, plus gap 19 between 18 and 20.
 	for _, slot := range []uint64{13, 14, 15, 16, 19} {
@@ -402,6 +509,7 @@ func TestChainTrackerFinalizedAncestorUsesFinalizationCertType(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("observe fast finalization certificate: %v", err)
 	}
+	requireChainFinalized(t, tracker, tip, CertificateFinalizeFast)
 
 	for _, slot := range []uint64{11, 12, 13} {
 		decision, ok := tracker.NextDecision(slot - 1)
@@ -436,6 +544,7 @@ func TestChainTrackerFinalizedAncestorWithoutNotarizeCert(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("observe fast finalization certificate: %v", err)
 	}
+	requireChainFinalized(t, tracker, block13, CertificateFinalizeFast)
 
 	for _, slot := range []uint64{11, 12} {
 		decision, ok := tracker.NextDecision(slot - 1)
@@ -448,6 +557,100 @@ func TestChainTrackerFinalizedAncestorWithoutNotarizeCert(t *testing.T) {
 		if decision.CertificateType != CertificateFinalizeFast {
 			t.Fatalf("slot %d cert type = %q, want %q", slot, decision.CertificateType, CertificateFinalizeFast)
 		}
+	}
+}
+
+func TestChainTrackerDoesNotInferHashlessParentFromFallback(t *testing.T) {
+	tracker := NewChainTracker()
+	parent := BlockID{Slot: 11, Hash: chainTestHash(11)}
+	child := BlockID{Slot: 12, Hash: chainTestHash(12)}
+
+	tracker.ObserveReplayBlock(ReplayBlockObservation{Block: child, ParentSlot: parent.Slot})
+	if _, err := tracker.ObserveCertificate(Certificate{
+		Type: CertificateNotarize, Slot: child.Slot, BlockHash: child.Hash, SignatureVerified: true,
+	}); err != nil {
+		t.Fatalf("observe child notarize: %v", err)
+	}
+	if _, err := tracker.ObserveCertificate(Certificate{
+		Type: CertificateNotarizeFallback, Slot: parent.Slot, BlockHash: parent.Hash, SignatureVerified: true,
+	}); err != nil {
+		t.Fatalf("observe parent fallback: %v", err)
+	}
+	tracker.RefreshParentLinkagesFromSlot(parent.Slot, parent.Hash)
+
+	decision, ok := tracker.NextDecision(parent.Slot)
+	if !ok || decision.Block != child {
+		t.Fatalf("expected child decision, got %+v (ok=%v)", decision, ok)
+	}
+	if decision.ParentHash != (solana.Hash{}) {
+		t.Fatalf("fallback-only parent was unsafely inferred: %s", decision.ParentHash)
+	}
+
+	if _, err := tracker.ObserveCertificate(Certificate{
+		Type: CertificateNotarize, Slot: parent.Slot, BlockHash: parent.Hash, SignatureVerified: true,
+	}); err != nil {
+		t.Fatalf("observe decisive parent notarize: %v", err)
+	}
+	tracker.RefreshParentLinkagesFromSlot(parent.Slot, parent.Hash)
+	decision, ok = tracker.NextDecision(parent.Slot)
+	if !ok || decision.ParentHash != parent.Hash {
+		t.Fatalf("decisive parent was not linked: %+v (ok=%v)", decision, ok)
+	}
+}
+
+func TestChainTrackerFinalizedAncestryCannotOverwriteTwin(t *testing.T) {
+	tracker := NewChainTracker()
+	finalizedTwin := BlockID{Slot: 11, Hash: chainTestHash(1)}
+	ancestryTwin := BlockID{Slot: 11, Hash: chainTestHash(2)}
+	tip := BlockID{Slot: 12, Hash: chainTestHash(12)}
+
+	if _, err := tracker.ObserveCertificate(Certificate{
+		Type: CertificateFinalizeFast, Slot: finalizedTwin.Slot, BlockHash: finalizedTwin.Hash, SignatureVerified: true,
+	}); err != nil {
+		t.Fatalf("observe finalized twin: %v", err)
+	}
+	requireChainFinalized(t, tracker, finalizedTwin, CertificateFinalizeFast)
+	tracker.ObserveReplayBlock(ReplayBlockObservation{Block: ancestryTwin, ParentSlot: 10, ParentHash: chainTestHash(10)})
+	tracker.ObserveReplayBlock(ReplayBlockObservation{Block: tip, ParentSlot: ancestryTwin.Slot, ParentHash: ancestryTwin.Hash})
+	if _, err := tracker.ObserveCertificate(Certificate{
+		Type: CertificateFinalizeFast, Slot: tip.Slot, BlockHash: tip.Hash, SignatureVerified: true,
+	}); err != nil {
+		t.Fatalf("observe finalized tip: %v", err)
+	}
+	if err := tracker.ObserveFinalized(tip, CertificateFinalizeFast); err == nil {
+		t.Fatal("conflicting finalized ancestry was accepted")
+	}
+
+	decision, ok := tracker.NextDecision(10)
+	if !ok || decision.Kind != ChainDecisionKindConflict {
+		t.Fatalf("expected finalized ancestry conflict, got %+v (ok=%v)", decision, ok)
+	}
+	if _, ok := tracker.FinalizedBlockAt(11); ok {
+		t.Fatalf("ambiguous finalized slot must fail closed")
+	}
+
+	tracker.PruneBeforeSlot(12)
+	decision, ok = tracker.NextDecision(10)
+	if !ok || decision.Kind != ChainDecisionKindConflict {
+		t.Fatalf("pruning erased conflict evidence: %+v (ok=%v)", decision, ok)
+	}
+}
+
+func TestChainTrackerDoesNotRegrowPrunedHistory(t *testing.T) {
+	tracker := NewChainTracker()
+	tracker.PruneBeforeSlot(20)
+	update, err := tracker.ObserveCertificate(Certificate{
+		Type: CertificateSkip, Slot: 10, SignatureVerified: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if update.New || update.Trusted {
+		t.Fatalf("old certificate update = %+v", update)
+	}
+	tracker.ObserveReplayBlock(ReplayBlockObservation{Block: BlockID{Slot: 10, Hash: chainTestHash(10)}})
+	if snapshot := tracker.Snapshot(); snapshot.CertificatesObserved != 0 || snapshot.ReplayBlocksObserved != 0 || snapshot.CertifiedSkips != 0 {
+		t.Fatalf("pruned history regrew: %+v", snapshot)
 	}
 }
 

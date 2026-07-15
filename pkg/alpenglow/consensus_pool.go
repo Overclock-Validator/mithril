@@ -19,6 +19,7 @@ const (
 	ConsensusEventFinalized      ConsensusEventKind = "finalized"
 	ConsensusEventSafeToNotar    ConsensusEventKind = "safe-to-notar"
 	ConsensusEventSafeToSkip     ConsensusEventKind = "safe-to-skip"
+	ConsensusEventConflict       ConsensusEventKind = "conflict"
 )
 
 type ConsensusEvent struct {
@@ -27,6 +28,7 @@ type ConsensusEvent struct {
 	Block           BlockID
 	Fast            bool
 	CertificateType CertificateType
+	Reason          string
 }
 
 type ConsensusPoolConfig struct {
@@ -55,6 +57,7 @@ type VerifiedVote struct {
 type ConsensusUpdate struct {
 	Certificates []Certificate
 	Events       []ConsensusEvent
+	VoteAccepted bool
 }
 
 type VoteEvidence struct {
@@ -77,6 +80,7 @@ type ConsensusPoolSnapshot struct {
 	Certificates     int
 	FinalizedBlocks  int
 	Equivocations    int
+	ConflictingSlots int
 }
 
 type consensusTallyKey struct {
@@ -119,6 +123,11 @@ type ConsensusPool struct {
 	finalized   map[BlockID]bool
 	parentReady *ParentReadyTracker
 	evidence    []VoteEvidence
+	conflicts   map[uint64]string
+	// Intrawindow SafeToNotar events require parent certification and block
+	// availability checks in the consensus service. Keep them pending here,
+	// matching Agave, instead of issuing an unsafe immediate event.
+	pendingSafeToNotar []BlockID
 
 	verifiedVotes    int
 	verifiedTotal    uint64
@@ -148,6 +157,7 @@ func NewConsensusPool(cfg ConsensusPoolConfig) *ConsensusPool {
 		completed:   make(map[CertificateKey]Certificate),
 		finalized:   make(map[BlockID]bool),
 		parentReady: NewParentReadyTracker(cfg.RootBlock),
+		conflicts:   make(map[uint64]string),
 	}
 }
 
@@ -181,6 +191,17 @@ func (p *ConsensusPool) SetRoot(root BlockID) {
 			delete(p.completed, key)
 		}
 	}
+	for block := range p.finalized {
+		if block.Slot < root.Slot {
+			delete(p.finalized, block)
+		}
+	}
+	for slot := range p.conflicts {
+		if slot < root.Slot {
+			delete(p.conflicts, slot)
+		}
+	}
+	p.pendingSafeToNotar = filterBlocksAtOrAbove(p.pendingSafeToNotar, root.Slot)
 }
 
 func (p *ConsensusPool) RestoreParentReady(slot uint64, parent BlockID) {
@@ -263,7 +284,7 @@ func (p *ConsensusPool) AddVerifiedVote(v VerifiedVote) (ConsensusUpdate, error)
 		state.localFirstVote = &vote
 	}
 
-	update := ConsensusUpdate{}
+	update := ConsensusUpdate{VoteAccepted: true}
 	update.Events = append(update.Events, p.safeEventsLocked(slot, state)...)
 	certs, events, err := p.assembleCertificatesLocked(slot, state)
 	if err != nil {
@@ -283,8 +304,20 @@ func (p *ConsensusPool) AddVerifiedCertificate(cert Certificate) (ConsensusUpdat
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	events, _, err := p.insertCertificateLocked(cert)
-	return ConsensusUpdate{Events: events}, err
+	if cert.Slot < p.root.Slot {
+		return ConsensusUpdate{}, nil
+	}
+	events, inserted, err := p.insertCertificateLocked(cert)
+	if err != nil {
+		return ConsensusUpdate{}, err
+	}
+	update := ConsensusUpdate{Events: events}
+	if inserted {
+		// Certificates is the pool's accepted-output stream. Downstream chain
+		// rooting must consume this list rather than transport input directly.
+		update.Certificates = []Certificate{cert}
+	}
+	return update, nil
 }
 
 func (p *ConsensusPool) BlockProductionParent(slot uint64) BlockProductionParent {
@@ -297,6 +330,30 @@ func (p *ConsensusPool) HasNotarFallbackOrStronger(block BlockID) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.parentReady.HasNotarFallbackOrStronger(block)
+}
+
+// TakePendingSafeToNotar transfers intrawindow candidates to the consensus
+// service, which must verify parent certification and local block availability
+// before emitting SafeToNotar.
+func (p *ConsensusPool) TakePendingSafeToNotar() []BlockID {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	pending := append([]BlockID(nil), p.pendingSafeToNotar...)
+	p.pendingSafeToNotar = nil
+	return pending
+}
+
+// RequeuePendingSafeToNotar returns a candidate that the consensus service
+// could not yet resolve (for example, because its block or parent is missing).
+// This mirrors Agave's pool/service handoff without letting the pool guess
+// block ancestry from arrival order.
+func (p *ConsensusPool) RequeuePendingSafeToNotar(block BlockID) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if block.Slot < p.root.Slot || containsBlock(p.pendingSafeToNotar, block) {
+		return
+	}
+	p.pendingSafeToNotar = append(p.pendingSafeToNotar, block)
 }
 
 func (p *ConsensusPool) Snapshot() ConsensusPoolSnapshot {
@@ -313,6 +370,7 @@ func (p *ConsensusPool) Snapshot() ConsensusPoolSnapshot {
 		Certificates:     len(p.completed),
 		FinalizedBlocks:  len(p.finalized),
 		Equivocations:    len(p.evidence),
+		ConflictingSlots: len(p.conflicts),
 	}
 }
 
@@ -383,15 +441,15 @@ func conflictingVerifiedVote(rankVotes map[VoteType][]solana.Hash, vote Vote) (V
 func conflictingVoteTypes(voteType VoteType) []VoteType {
 	switch voteType {
 	case VoteTypeFinalize:
-		return []VoteType{VoteTypeNotarizeFallback, VoteTypeSkip}
+		return []VoteType{VoteTypeNotarizeFallback, VoteTypeSkip, VoteTypeSkipFallback, VoteTypeGenesis}
 	case VoteTypeNotarize:
-		return []VoteType{VoteTypeSkip, VoteTypeNotarizeFallback}
+		return []VoteType{VoteTypeSkip, VoteTypeNotarizeFallback, VoteTypeGenesis}
 	case VoteTypeNotarizeFallback:
-		return []VoteType{VoteTypeFinalize, VoteTypeNotarize}
+		return []VoteType{VoteTypeFinalize, VoteTypeNotarize, VoteTypeGenesis}
 	case VoteTypeSkip:
-		return []VoteType{VoteTypeFinalize, VoteTypeNotarize, VoteTypeSkipFallback}
+		return []VoteType{VoteTypeFinalize, VoteTypeNotarize, VoteTypeSkipFallback, VoteTypeGenesis}
 	case VoteTypeSkipFallback:
-		return []VoteType{VoteTypeSkip}
+		return []VoteType{VoteTypeSkip, VoteTypeFinalize, VoteTypeGenesis}
 	case VoteTypeGenesis:
 		return []VoteType{VoteTypeFinalize, VoteTypeNotarize, VoteTypeNotarizeFallback, VoteTypeSkip, VoteTypeSkipFallback}
 	default:
@@ -440,7 +498,12 @@ func (p *ConsensusPool) safeEventsLocked(slot uint64, state *slotConsensusState)
 		if fractionMeets(40, tally.stake, state.totalStake) ||
 			(fractionMeets(20, tally.stake, state.totalStake) && fractionMeets(60, tally.stake+skipStake, state.totalStake)) {
 			state.safeNotarSent[key.block] = struct{}{}
-			events = append(events, ConsensusEvent{Kind: ConsensusEventSafeToNotar, Slot: slot, Block: BlockID{Slot: slot, Hash: key.block}})
+			block := BlockID{Slot: slot, Hash: key.block}
+			if slot == 1 || isLeaderWindowStart(slot) {
+				events = append(events, ConsensusEvent{Kind: ConsensusEventSafeToNotar, Slot: slot, Block: block})
+			} else if !containsBlock(p.pendingSafeToNotar, block) {
+				p.pendingSafeToNotar = append(p.pendingSafeToNotar, block)
+			}
 		}
 	}
 	if !state.safeSkipSent && state.localFirstVote.Type == VoteTypeNotarize {
@@ -538,6 +601,12 @@ func (p *ConsensusPool) insertCertificateLocked(cert Certificate) ([]ConsensusEv
 		return nil, false, nil
 	}
 	p.completed[key] = cert
+	inserted := false
+	defer func() {
+		if !inserted {
+			delete(p.completed, key)
+		}
+	}()
 	var events []ConsensusEvent
 	switch cert.Type {
 	case CertificateNotarize:
@@ -548,7 +617,11 @@ func (p *ConsensusPool) insertCertificateLocked(cert Certificate) ([]ConsensusEv
 			return nil, false, err
 		}
 		events = append(events, parentEvents...)
-		events = append(events, p.maybeSlowFinalizeLocked(cert.Slot)...)
+		finalized, err := p.maybeSlowFinalizeLocked(cert.Slot)
+		if err != nil {
+			return nil, false, err
+		}
+		events = append(events, finalized...)
 	case CertificateNotarizeFallback:
 		block, _ := cert.Block()
 		parentEvents, err := p.parentReady.AddNotarFallbackOrStronger(block)
@@ -557,7 +630,11 @@ func (p *ConsensusPool) insertCertificateLocked(cert Certificate) ([]ConsensusEv
 		}
 		events = append(events, parentEvents...)
 	case CertificateFinalize:
-		events = append(events, p.maybeSlowFinalizeLocked(cert.Slot)...)
+		finalized, err := p.maybeSlowFinalizeLocked(cert.Slot)
+		if err != nil {
+			return nil, false, err
+		}
+		events = append(events, finalized...)
 	case CertificateFinalizeFast:
 		block, _ := cert.Block()
 		parentEvents, err := p.parentReady.AddNotarFallbackOrStronger(block)
@@ -579,25 +656,56 @@ func (p *ConsensusPool) insertCertificateLocked(cert Certificate) ([]ConsensusEv
 		}
 		events = append(events, parentEvents...)
 	}
+	inserted = true
 	return events, true, nil
 }
 
-func (p *ConsensusPool) maybeSlowFinalizeLocked(slot uint64) []ConsensusEvent {
+func (p *ConsensusPool) maybeSlowFinalizeLocked(slot uint64) ([]ConsensusEvent, error) {
 	if _, ok := p.completed[CertificateKey{Type: CertificateFinalize, Slot: slot}]; !ok {
-		return nil
+		return nil, nil
 	}
+	var notarized []BlockID
 	for key := range p.completed {
 		if key.Slot != slot || key.Type != CertificateNotarize {
 			continue
 		}
-		block := BlockID{Slot: slot, Hash: key.BlockHash}
-		if p.finalized[block] {
-			return nil
-		}
-		p.finalized[block] = false
-		return []ConsensusEvent{{Kind: ConsensusEventFinalized, Slot: slot, Block: block, CertificateType: CertificateFinalize}}
+		notarized = append(notarized, BlockID{Slot: slot, Hash: key.BlockHash})
 	}
-	return nil
+	if len(notarized) == 0 {
+		return nil, nil
+	}
+	if len(notarized) > 1 {
+		if _, exists := p.conflicts[slot]; exists {
+			return nil, nil
+		}
+		reason := fmt.Sprintf("slot %d has %d notarize certificates during slow finalization", slot, len(notarized))
+		p.conflicts[slot] = reason
+		for block := range p.finalized {
+			if block.Slot == slot {
+				delete(p.finalized, block)
+			}
+		}
+		return []ConsensusEvent{{Kind: ConsensusEventConflict, Slot: slot, Reason: reason}}, nil
+	}
+	if _, conflicted := p.conflicts[slot]; conflicted {
+		return nil, nil
+	}
+	block := notarized[0]
+	if p.finalized[block] {
+		return nil, nil
+	}
+	p.finalized[block] = true
+	return []ConsensusEvent{{Kind: ConsensusEventFinalized, Slot: slot, Block: block, CertificateType: CertificateFinalize}}, nil
+}
+
+func filterBlocksAtOrAbove(blocks []BlockID, root uint64) []BlockID {
+	kept := blocks[:0]
+	for _, block := range blocks {
+		if block.Slot >= root {
+			kept = append(kept, block)
+		}
+	}
+	return kept
 }
 
 func buildVerifiedCertificate(slot uint64, target certificateTarget, base, fallback *consensusTally, totalStake uint64) (Certificate, error) {
@@ -681,7 +789,7 @@ func addVoteSignature(aggregate *bls12381.G2Affine, raw []byte) error {
 }
 
 func EncodeSignerStoreBitmap(bitmap SignerBitmap) ([]byte, error) {
-	if bitmap.Length < 0 || bitmap.Length > MaximumValidators || bitmap.Length > int(^uint16(0)) {
+	if bitmap.Length < 0 || bitmap.Length > CertificateBitmapCapacity || bitmap.Length > int(^uint16(0)) {
 		return nil, fmt.Errorf("invalid signer bitmap length %d", bitmap.Length)
 	}
 	if len(bitmap.Base) < bitmap.Length {

@@ -865,7 +865,8 @@ func runLive(c *cobra.Command, args []string) {
 	if pprofPort != -1 {
 		startPprofHandlers(int(pprofPort))
 	}
-	ctx := c.Context()
+	ctx, cancelNode := context.WithCancelCause(c.Context())
+	defer cancelNode(nil)
 
 	// Print the Mithril banner first, before any other output
 	progress.PrintBanner()
@@ -1539,6 +1540,10 @@ postBootstrap:
 	accountsDb.InitCaches()
 	rootedDurableMode := useTurbine && strings.TrimSpace(alpenglowObserverBindAddr) != ""
 	if rootedDurableMode {
+		mode, err := consensusengine.NormalizeMode(consensusMode)
+		if err != nil || mode != consensusengine.ModeAlpenglowObserver {
+			klog.Fatalf("rooted-durable Alpenglow replay requires consensus.mode=\"alpenglow-observer\" with a verified decision engine")
+		}
 		accountsDb.RootedDurable = true
 		if configured := config.GetInt("storage.fold_batch_slots"); configured > 0 {
 			replay.FoldBatchSlots = min(max(configured, 32), 512)
@@ -1649,6 +1654,9 @@ postBootstrap:
 				rootBlock.Hash = blockID
 			}
 			rootSink.SetAlpenglowRoot(rootBlock)
+			if durableRootSink, ok := engine.(consensusengine.AlpenglowDurableRootSink); ok {
+				durableRootSink.SetAlpenglowDurableRoot(rootSlot)
+			}
 		}
 		defer func() {
 			if err := engine.Close(); err != nil {
@@ -1785,6 +1793,8 @@ postBootstrap:
 				}
 				return alpenglow.BlockProductionParent{Kind: alpenglow.BlockProductionParentNotReady}
 			},
+			ReplayReady:   replay.ActiveSpeculativeReady,
+			OnFatal:       cancelNode,
 			CurrentSlot:   global.WallClockSlot,
 			LeaderForSlot: global.LeaderForSlot,
 			ParentBlockID: func(slot uint64) (solana.Hash, bool) {
@@ -2893,6 +2903,11 @@ func runReplayWithRecovery(
 		// Calculate epoch for the last persisted slot
 		lastEpoch := epochForStateSlot(mithrilState, r.LastPersistedSlot)
 
+		shutdownReason := state.ShutdownReasonNormal
+		if r.Error != nil {
+			shutdownReason = fmt.Sprintf("%s: %v", state.ShutdownReasonError, r.Error)
+		}
+
 		// Build shutdown context
 		var shutdownCtx *state.ShutdownContext
 		if r.LastAcctsLtHash != nil {
@@ -2901,7 +2916,7 @@ func runReplayWithRecovery(
 				WriterVersion:  getVersion(),
 				WriterCommit:   getCommit(),
 				WriterBranch:   getBranch(),
-				ShutdownReason: state.ShutdownReasonNormal, // This is always a cancel (Ctrl+C)
+				ShutdownReason: shutdownReason,
 				Epoch:          lastEpoch,
 				BlockHeight:    r.LastBlockHeight,
 
@@ -2939,7 +2954,7 @@ func runReplayWithRecovery(
 		}
 
 		// Record shutdown in history
-		state.RecordShutdown(accountsDbPath, r.LastPersistedSlot, base58.Encode(r.LastPersistedBankhash), replay.CurrentRunID, getVersion(), getCommit(), getBranch(), state.ShutdownReasonNormal)
+		state.RecordShutdown(accountsDbPath, r.LastPersistedSlot, base58.Encode(r.LastPersistedBankhash), replay.CurrentRunID, getVersion(), getCommit(), getBranch(), shutdownReason)
 
 		mlog.Log.Infof("State saved to %s/mithril_state.json at slot %d", accountsDbPath, r.LastPersistedSlot)
 		return nil

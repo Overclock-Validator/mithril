@@ -12,6 +12,9 @@ import (
 const (
 	versionedMarkerTagV1 = uint16(1)
 	versionedInnerTagV1  = uint8(1)
+	// An entry always contains num_hashes, a 32-byte hash, and a transaction
+	// count before any transaction bytes.
+	minimumEntryWireSize = 8 + 32 + 8
 )
 
 // MarshalBlockComponent serializes a component using the Alpenglow wincode layout.
@@ -72,6 +75,9 @@ func unmarshalEntryBatch(data []byte) ([]Entry, error) {
 	numEntries, err := dec.ReadUint64(bin.LE)
 	if err != nil {
 		return nil, err
+	}
+	if numEntries > uint64(dec.Remaining()/minimumEntryWireSize) {
+		return nil, fmt.Errorf("%w: entry count %d exceeds remaining bytes %d", ErrInvalidBlockComponent, numEntries, dec.Remaining())
 	}
 	entries := make([]Entry, numEntries)
 	for i := uint64(0); i < numEntries; i++ {
@@ -317,6 +323,9 @@ func unmarshalGenesisCert(data []byte) (*GenesisCertMarker, error) {
 	copy(cert.BlockID[:], data[8:40])
 	copy(cert.BLSSignature[:], data[40:232])
 	bitmapLen := binary.LittleEndian.Uint64(data[232:240])
+	if bitmapLen > 512 {
+		return nil, fmt.Errorf("%w: genesis cert bitmap length %d exceeds 512", ErrInvalidBlockComponent, bitmapLen)
+	}
 	if bitmapLen > uint64(len(data)-240) || 240+int(bitmapLen) != len(data) {
 		return nil, fmt.Errorf("%w: genesis cert bitmap length %d does not match remaining %d", ErrInvalidBlockComponent, bitmapLen, len(data)-240)
 	}
