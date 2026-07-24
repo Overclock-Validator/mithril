@@ -44,6 +44,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/rpcserver"
 	"github.com/Overclock-Validator/mithril/pkg/sbpf"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
+	"github.com/Overclock-Validator/mithril/pkg/sigverifytelemetry"
 	"github.com/Overclock-Validator/mithril/pkg/snapshot"
 	"github.com/Overclock-Validator/mithril/pkg/snapshotdl"
 	"github.com/Overclock-Validator/mithril/pkg/state"
@@ -1109,6 +1110,21 @@ func runLive(c *cobra.Command, args []string) {
 		fmt.Fprintf(os.Stderr, "warning: failed to initialize file logging: %v\n", err)
 	}
 	defer mlog.Shutdown()
+	if tracePath := sigverifytelemetry.ConfiguredOutputPath(); tracePath != "" {
+		defer func() {
+			if err := sigverifytelemetry.WriteJSONLFile(tracePath); err != nil {
+				mlog.Log.Errorf("sigverify telemetry: failed to write %s: %v", tracePath, err)
+				return
+			}
+			mlog.Log.Infof("sigverify telemetry: wrote retained exact trace to %s", tracePath)
+		}()
+	}
+	switch mode := sigverifytelemetry.CurrentMode(); mode {
+	case sigverifytelemetry.CollectionPassive:
+		mlog.Log.Infof("sigverify telemetry: passive exact tracing enabled")
+	case sigverifytelemetry.CollectionSchedulingSimulation:
+		mlog.Log.Warnf("sigverify telemetry: scheduling simulation enabled; worker ownership and queue timing are intentionally perturbed")
+	}
 
 	// Kill any existing mithril processes to prevent zombie accumulation
 	if killed := killExistingMithrilProcesses(); killed > 0 {

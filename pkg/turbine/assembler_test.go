@@ -14,6 +14,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/fixtures"
 	"github.com/Overclock-Validator/mithril/pkg/block"
+	"github.com/Overclock-Validator/mithril/pkg/sigverifytelemetry"
 	"github.com/Overclock-Validator/mithril/pkg/txverify"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
@@ -295,9 +296,64 @@ func TestValidateBlockTransactionsRejectsInvalidSignature(t *testing.T) {
 		t.Fatalf("assembler did not emit a block with transactions")
 	}
 
+	sigverifytelemetry.Enable(8)
+	t.Cleanup(sigverifytelemetry.Disable)
 	blk.Transactions[0].Message.RecentBlockhash[0] ^= 0xff
 	if err := validateBlockTransactions(blk); err == nil {
 		t.Fatalf("validateBlockTransactions accepted a mutated transaction")
+	}
+	trace := sigverifytelemetry.Current().VerificationTrace
+	if len(trace) == 0 || trace[len(trace)-1].Source != sigverifytelemetry.SourceTurbine || trace[len(trace)-1].Outcome != sigverifytelemetry.VerificationOutcomeInvalid {
+		t.Fatalf("invalid turbine trace = %+v", trace)
+	}
+}
+
+func TestValidateBlockTransactionsRecordsTurbineVerification(t *testing.T) {
+	sigverifytelemetry.Enable(8)
+	t.Cleanup(sigverifytelemetry.Disable)
+
+	tx := mustParseTransferTx(t, 991)
+	blk := &block.Block{Slot: 991, Transactions: []*solana.Transaction{&tx}}
+	if err := validateBlockTransactions(blk); err != nil {
+		t.Fatalf("validateBlockTransactions: %v", err)
+	}
+
+	message, err := txverify.MessageBytes(&tx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signers := tx.Message.Signers()
+	if len(signers) != len(tx.Signatures) || len(signers) == 0 {
+		t.Fatalf("signers=%d signatures=%d", len(signers), len(tx.Signatures))
+	}
+
+	s := sigverifytelemetry.Current()
+	if s.Transactions != 1 || s.Signatures != uint64(len(tx.Signatures)) || s.VerificationAttempts != uint64(len(tx.Signatures)) {
+		t.Fatalf("turbine telemetry totals = %+v", s)
+	}
+	if len(s.VerificationTrace) != len(tx.Signatures) {
+		t.Fatalf("trace length = %d, want %d", len(s.VerificationTrace), len(tx.Signatures))
+	}
+	for i, entry := range s.VerificationTrace {
+		if entry.Source != sigverifytelemetry.SourceTurbine || entry.PublicKey != [32]byte(signers[i]) || entry.Signature != [64]byte(tx.Signatures[i]) || string(entry.Message) != string(message) || entry.Outcome != sigverifytelemetry.VerificationOutcomeValid {
+			t.Fatalf("trace[%d] = %+v", i, entry)
+		}
+	}
+
+	// The same exact verification reaching replay later must hit the shared
+	// process-wide history established by initial turbine validation.
+	duplicate, distance, reused := sigverifytelemetry.RecordVerification(
+		sigverifytelemetry.SourceReplay,
+		[32]byte(signers[0]),
+		[64]byte(tx.Signatures[0]),
+		message,
+	)
+	if !duplicate || !reused || distance != uint64(len(tx.Signatures)) {
+		t.Fatalf("turbine->replay recurrence: duplicate=%v reused=%v distance=%d", duplicate, reused, distance)
+	}
+	trace := sigverifytelemetry.Current().VerificationTrace
+	if got := trace[len(trace)-1].Source; got != sigverifytelemetry.SourceReplay {
+		t.Fatalf("final trace source = %q", got)
 	}
 }
 

@@ -4,6 +4,8 @@ import (
 	"encoding/hex"
 	"strings"
 	"testing"
+
+	"github.com/Overclock-Validator/mithril/pkg/sigverifytelemetry"
 )
 
 const breakTx = `
@@ -144,6 +146,47 @@ func TestVerifyTxSig(t *testing.T) {
 	}
 }
 
+func TestVerifyTxSigTelemetryPreservesVerdict(t *testing.T) {
+	tx, err := ParseTx(parseHexdump(tpuTx))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sigverifytelemetry.Enable(8)
+	t.Cleanup(sigverifytelemetry.Disable)
+
+	if !VerifyTxSig(tx) || !VerifyTxSig(tx) {
+		t.Fatal("telemetry changed a valid transaction verdict")
+	}
+	s := sigverifytelemetry.Current()
+	wantSignatures := uint64(len(tx.Signatures) * 2)
+	if s.Transactions != 2 || s.Signatures != wantSignatures || s.VerificationAttempts != wantSignatures || s.ExactDuplicateHits != uint64(len(tx.Signatures)) {
+		t.Fatalf("telemetry snapshot = %+v", s)
+	}
+	for i, entry := range s.VerificationTrace {
+		if entry.Outcome != sigverifytelemetry.VerificationOutcomeValid {
+			t.Fatalf("trace[%d] outcome = %v", i, entry.Outcome)
+		}
+	}
+}
+
+func TestVerifyTxSigTelemetryRecordsInvalidOutcome(t *testing.T) {
+	tx, err := ParseTx(parseHexdump(tpuTx))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx.Signatures[0][0] ^= 1
+	sigverifytelemetry.Enable(8)
+	t.Cleanup(sigverifytelemetry.Disable)
+
+	if VerifyTxSig(tx) {
+		t.Fatal("mutated signature verified")
+	}
+	trace := sigverifytelemetry.Current().VerificationTrace
+	if len(trace) != 1 || trace[0].Outcome != sigverifytelemetry.VerificationOutcomeInvalid {
+		t.Fatalf("invalid trace = %+v", trace)
+	}
+}
+
 func BenchmarkVerifyTxSig(b *testing.B) {
 	tx, err := ParseTx(parseHexdump(tpuTx))
 	if err != nil {
@@ -155,5 +198,36 @@ func BenchmarkVerifyTxSig(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		VerifyTxSig(tx)
+	}
+}
+
+func BenchmarkVerifyTxSigTelemetry(b *testing.B) {
+	tx, err := ParseTx(parseHexdump(tpuTx))
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		enabled bool
+	}{
+		{name: "disabled"},
+		{name: "enabled", enabled: true},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			if tc.enabled {
+				sigverifytelemetry.Enable(65536)
+			} else {
+				sigverifytelemetry.Disable()
+			}
+			defer sigverifytelemetry.Disable()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if !VerifyTxSig(tx) {
+					b.Fatal("transaction failed verification")
+				}
+			}
+		})
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 
+	"github.com/Overclock-Validator/mithril/pkg/sigverifytelemetry"
 	"github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 )
@@ -40,8 +41,25 @@ func VerifyTxSig(tx *solana.Transaction) (ok bool) {
 		return false
 	}
 
+	telemetryEnabled := sigverifytelemetry.Enabled()
+	if telemetryEnabled {
+		sigverifytelemetry.RecordTransaction(sigverifytelemetry.SourceTPU, len(tx.Signatures), len(msg))
+	}
 	for i, sig := range tx.Signatures {
-		if !ed25519.Verify(signers[i][:], msg, sig[:]) {
+		var observation sigverifytelemetry.VerificationAttempt
+		if telemetryEnabled {
+			observation, _, _, _ = sigverifytelemetry.BeginVerification(
+				sigverifytelemetry.SourceTPU,
+				[32]byte(signers[i]),
+				[64]byte(sig),
+				msg,
+			)
+		}
+		valid := ed25519.Verify(signers[i][:], msg, sig[:])
+		if telemetryEnabled {
+			observation.RecordResult(valid)
+		}
+		if !valid {
 			return false
 		}
 	}

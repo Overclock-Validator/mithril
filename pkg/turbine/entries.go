@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	"github.com/Overclock-Validator/mithril/pkg/block"
+	"github.com/Overclock-Validator/mithril/pkg/sigverifytelemetry"
 	"github.com/Overclock-Validator/mithril/pkg/txverify"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
@@ -321,11 +322,18 @@ func validateBlockTransactions(blk *block.Block) error {
 	if blk == nil {
 		return nil
 	}
+	telemetryEnabled := sigverifytelemetry.Enabled()
 	for txIdx, tx := range blk.Transactions {
 		if tx == nil {
 			return fmt.Errorf("slot %d transaction %d is nil", blk.Slot, txIdx)
 		}
-		if err := txverify.VerifyTransaction(tx); err != nil {
+		var err error
+		if telemetryEnabled {
+			err = txverify.VerifyTransactionWithObserver(tx, turbineVerificationObserver{})
+		} else {
+			err = txverify.VerifyTransaction(tx)
+		}
+		if err != nil {
 			txSig := "<missing>"
 			if len(tx.Signatures) > 0 {
 				txSig = tx.Signatures[0].String()
@@ -334,4 +342,20 @@ func validateBlockTransactions(blk *block.Block) error {
 		}
 	}
 	return nil
+}
+
+type turbineVerificationObserver struct{}
+
+func (turbineVerificationObserver) ObserveTransaction(signatures, messageBytes int) {
+	sigverifytelemetry.RecordTransaction(sigverifytelemetry.SourceTurbine, signatures, messageBytes)
+}
+
+func (turbineVerificationObserver) BeginVerification(publicKey solana.PublicKey, signature solana.Signature, message []byte) txverify.VerificationObservation {
+	attempt, _, _, _ := sigverifytelemetry.BeginVerification(
+		sigverifytelemetry.SourceTurbine,
+		[32]byte(publicKey),
+		[64]byte(signature),
+		message,
+	)
+	return attempt
 }

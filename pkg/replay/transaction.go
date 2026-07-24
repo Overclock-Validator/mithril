@@ -20,6 +20,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
+	"github.com/Overclock-Validator/mithril/pkg/sigverifytelemetry"
 	"github.com/Overclock-Validator/mithril/pkg/txverify"
 	"github.com/Overclock-Validator/mithril/pkg/util"
 	bin "github.com/gagliardetto/binary"
@@ -381,6 +382,10 @@ func (s *sigverifySnapshot) diagContext() string {
 }
 
 func verifySignatures(snapshot *sigverifySnapshot, sigverifyWg *sync.WaitGroup) {
+	verifySignaturesInDispatch(snapshot, sigverifyWg, sigverifytelemetry.DispatchJob{})
+}
+
+func verifySignaturesInDispatch(snapshot *sigverifySnapshot, sigverifyWg *sync.WaitGroup, dispatch sigverifytelemetry.DispatchJob) {
 	defer sigverifyWg.Done()
 	start := time.Now()
 
@@ -390,8 +395,27 @@ func verifySignatures(snapshot *sigverifySnapshot, sigverifyWg *sync.WaitGroup) 
 			snapshot.txSigString(), snapshot.version, len(snapshot.signers), len(snapshot.signatures)))
 	}
 
+	telemetryEnabled := sigverifytelemetry.Enabled()
+	if telemetryEnabled {
+		sigverifytelemetry.RecordTransaction(sigverifytelemetry.SourceReplay, len(snapshot.signatures), len(snapshot.message))
+	}
 	for i, sig := range snapshot.signatures {
-		if snapshot.signers[i].Verify(snapshot.message, sig) {
+		var observation sigverifytelemetry.VerificationAttempt
+		if telemetryEnabled {
+			observation, _, _, _ = sigverifytelemetry.BeginVerificationInDispatch(
+				sigverifytelemetry.SourceReplay,
+				dispatch,
+				i,
+				[32]byte(snapshot.signers[i]),
+				[64]byte(sig),
+				snapshot.message,
+			)
+		}
+		valid := snapshot.signers[i].Verify(snapshot.message, sig)
+		if telemetryEnabled {
+			observation.RecordResult(valid)
+		}
+		if valid {
 			continue
 		}
 		mlog.Log.Errorf("sigverify context: %s", snapshot.diagContext())

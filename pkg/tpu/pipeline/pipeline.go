@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/Overclock-Validator/mithril/pkg/sigverifytelemetry"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/dedup"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/packet"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/sink"
@@ -65,6 +66,10 @@ type SigverifyStats struct {
 	VerifiedBytes    uint64
 	DroppedSigverify uint64
 }
+
+const (
+	telemetryDispatchMaxPackets = 64
+)
 
 // Pipeline funnels QUIC ingress through dedup/sanitize, sigverify workers, and a sink.
 type Pipeline struct {
@@ -188,19 +193,104 @@ func runSigverifyWorker(
 	out chan<- packet.Packet,
 	stats *SigverifyStats,
 ) {
-	for pkt := range in {
-		data := pkt.Data()
-		atomic.AddUint64(&stats.InPackets, 1)
-		atomic.AddUint64(&stats.InBytes, uint64(len(data)))
-
-		if !verifyPacket(data) {
-			atomic.AddUint64(&stats.DroppedSigverify, 1)
-			pkt.Release()
+	for {
+		pkt, ok := <-in
+		if !ok {
+			return
+		}
+		mode := sigverifytelemetry.CurrentMode()
+		if mode == sigverifytelemetry.CollectionDisabled {
+			processSigverifyPacket(pkt, out, stats)
+			continue
+		}
+		if mode == sigverifytelemetry.CollectionPassive {
+			queued := len(in)
+			dispatch := sigverifytelemetry.ReserveSignatureDispatch(sigverifytelemetry.SourceTPU, queued, queued, 1)
+			prepared := prepareTelemetrySigverifyPacket(pkt)
+			counts := [1]uint16{prepared.signatures}
+			dispatch.Ready(counts[:])
+			processTelemetrySigverifyPacket(prepared, dispatch.Job(0), out, stats)
 			continue
 		}
 
-		atomic.AddUint64(&stats.VerifiedPackets, 1)
-		atomic.AddUint64(&stats.VerifiedBytes, uint64(len(data)))
-		out <- pkt
+		rawPackets, queuedBefore, queuedAfter, inputClosed := collectSigverifyTelemetryBatch(pkt, in)
+		dispatch := sigverifytelemetry.ReserveSignatureDispatch(
+			sigverifytelemetry.SourceTPU,
+			queuedBefore,
+			queuedAfter,
+			len(rawPackets),
+		)
+		packets := make([]telemetrySigverifyPacket, len(rawPackets))
+		signatureCounts := make([]uint16, len(rawPackets))
+		for i, raw := range rawPackets {
+			packets[i] = prepareTelemetrySigverifyPacket(raw)
+			signatureCounts[i] = packets[i].signatures
+		}
+		dispatch.Ready(signatureCounts)
+		for i, claimed := range packets {
+			processTelemetrySigverifyPacket(claimed, dispatch.Job(i), out, stats)
+		}
+		if inputClosed {
+			return
+		}
 	}
+}
+
+func processTelemetrySigverifyPacket(prepared telemetrySigverifyPacket, dispatch sigverifytelemetry.DispatchJob, out chan<- packet.Packet, stats *SigverifyStats) {
+	data := prepared.packet.Data()
+	atomic.AddUint64(&stats.InPackets, 1)
+	atomic.AddUint64(&stats.InBytes, uint64(len(data)))
+
+	if !verifyTelemetrySigverifyPacket(prepared, dispatch) {
+		atomic.AddUint64(&stats.DroppedSigverify, 1)
+		prepared.packet.Release()
+		return
+	}
+
+	atomic.AddUint64(&stats.VerifiedPackets, 1)
+	atomic.AddUint64(&stats.VerifiedBytes, uint64(len(data)))
+	out <- prepared.packet
+}
+
+func processSigverifyPacket(pkt packet.Packet, out chan<- packet.Packet, stats *SigverifyStats) {
+	data := pkt.Data()
+	atomic.AddUint64(&stats.InPackets, 1)
+	atomic.AddUint64(&stats.InBytes, uint64(len(data)))
+
+	if !verifyPacket(data) {
+		atomic.AddUint64(&stats.DroppedSigverify, 1)
+		pkt.Release()
+		return
+	}
+
+	atomic.AddUint64(&stats.VerifiedPackets, 1)
+	atomic.AddUint64(&stats.VerifiedBytes, uint64(len(data)))
+	out <- pkt
+}
+
+// collectSigverifyTelemetryBatch is used only by explicit scheduling
+// simulation. It claims packets that are already visible and stops at the
+// profiling cap without waiting. Parsing happens only after the dispatch claim
+// has been reserved in the shared event timeline.
+func collectSigverifyTelemetryBatch(first packet.Packet, in <-chan packet.Packet) ([]packet.Packet, int, int, bool) {
+	rawPackets := make([]packet.Packet, 0, telemetryDispatchMaxPackets)
+	rawPackets = append(rawPackets, first)
+	queuedBefore := len(in)
+	inputClosed := false
+
+collect:
+	for len(rawPackets) < telemetryDispatchMaxPackets {
+		select {
+		case pkt, ok := <-in:
+			if !ok {
+				inputClosed = true
+				break collect
+			}
+			rawPackets = append(rawPackets, pkt)
+		default:
+			break collect
+		}
+	}
+	queuedAfter := len(in)
+	return rawPackets, queuedBefore, queuedAfter, inputClosed
 }
