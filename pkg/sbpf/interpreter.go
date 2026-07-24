@@ -46,6 +46,11 @@ type Interpreter struct {
 	sbpfVersion       sbpfver.SbpfVersion
 	programId         solana.PublicKey
 	txSignature       solana.Signature
+
+	// heapDirtyEnd is the write high-water mark into heap for this execution;
+	// Finish zeroes only heap[:heapDirtyEnd] before returning it to the pool.
+	// See the heapPool invariant.
+	heapDirtyEnd uint64
 }
 
 type TraceSink interface {
@@ -57,6 +62,13 @@ func newHeap() []byte {
 }
 
 var (
+	// heapPool invariant: every []byte in this pool is fully zero across its
+	// entire capacity. Established by pool.New (zeroed alloc) and preserved
+	// because every guest-visible heap write flows through translateInternal
+	// (recording heapDirtyEnd) and Finish zeroes exactly heap[:heapDirtyEnd]
+	// before Put. NewInterpreter therefore does not re-zero on Get. Any write
+	// into heap that bypasses translateInternal breaks this and must update
+	// heapDirtyEnd itself.
 	heapPool = &sync.Pool{
 		New: func() interface{} {
 			return newHeap()
@@ -73,10 +85,12 @@ func NewInterpreter(p *Program, opts *VMOpts) *Interpreter {
 	if UsePool {
 		heap = heapPool.Get().([]byte)
 		if len(heap) < opts.HeapMax {
+			// slices.Grow copies into a fresh (zero-tailed) array when it must
+			// reallocate; the copied prefix is zero by the pool invariant, so
+			// the whole slice remains zero. No clear needed on Get.
 			heap = slices.Grow(heap, opts.HeapMax-len(heap))
 		}
 		heap = heap[:opts.HeapMax]
-		clear(heap)
 	} else {
 		heap = newHeap()
 	}
@@ -108,6 +122,12 @@ func NewInterpreter(p *Program, opts *VMOpts) *Interpreter {
 
 func (ip *Interpreter) Finish() {
 	if UsePool {
+		// Zero only the touched prefix; the remainder is already zero (see the
+		// heapPool invariant), restoring the full-zero contract before Put.
+		if ip.heapDirtyEnd > uint64(len(ip.heap)) {
+			ip.heapDirtyEnd = uint64(len(ip.heap))
+		}
+		clear(ip.heap[:ip.heapDirtyEnd])
 		heapPool.Put(ip.heap)
 	}
 	ip.stack.Finish()
@@ -1191,12 +1211,19 @@ func (ip *Interpreter) translateInternal(addr uint64, size uint64, write bool) (
 		}
 		return unsafe.Pointer(&ip.ro[lo]), nil
 	case VaddrStack >> 32:
-		mem := ip.stack.GetFrame(uint32(addr))
+		if size == 0 {
+			return emptySlice, nil
+		}
+		off, ok := ip.stack.frameOffset(uint32(addr))
+		if !ok {
+			return nil, NewExcBadAccess(addr, size, write, "out-of-bounds stack access")
+		}
+		mem := ip.stack.mem[off:]
 		if size > uint64(len(mem)) {
 			return nil, NewExcBadAccess(addr, size, write, "out-of-bounds stack access")
 		}
-		if size == 0 {
-			return emptySlice, nil
+		if write {
+			ip.stack.dirtyEnd = max(ip.stack.dirtyEnd, off+size)
 		}
 		return unsafe.Pointer(&mem[0]), nil
 	case VaddrHeap >> 32:
@@ -1205,6 +1232,9 @@ func (ip *Interpreter) translateInternal(addr uint64, size uint64, write bool) (
 		}
 		if lo+size > uint64(len(ip.heap)) {
 			return nil, NewExcBadAccess(addr, size, write, "out-of-bounds heap access")
+		}
+		if write {
+			ip.heapDirtyEnd = max(ip.heapDirtyEnd, lo+size)
 		}
 		return unsafe.Pointer(&ip.heap[lo]), nil
 	case VaddrInput >> 32:

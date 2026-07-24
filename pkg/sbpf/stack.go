@@ -36,6 +36,14 @@ type Stack struct {
 	shadow             []Frame
 	dynamicStackFrames bool
 	stackFrameGaps     bool
+
+	// dirtyEnd is the high-water mark (physical offset into mem, past gap
+	// compression) of any write performed during this execution. Finish only
+	// needs to zero mem[:dirtyEnd] before returning it to the pool, since the
+	// remainder of the backing array is already zero (see the pool invariant
+	// documented at stackMemPool). maxDepth is the analogous peak for shadow.
+	dirtyEnd uint64
+	maxDepth int
 }
 
 // Frame is an entry on the shadow stack.
@@ -71,6 +79,14 @@ var (
 	// Also applies to interpreter heap.
 	UsePool = true
 
+	// stackMemPool invariant: every []byte in this pool is fully zero across
+	// its entire capacity (StackMax). This holds because pool.New allocates a
+	// zeroed slice, every guest-visible stack write flows through
+	// Interpreter.translateInternal (which records the write high-water mark in
+	// Stack.dirtyEnd), and Finish zeroes exactly mem[:dirtyEnd] before Put.
+	// Callers therefore may skip re-zeroing on Get. Any new code path that
+	// writes into stack memory WITHOUT going through translateInternal breaks
+	// this invariant and must update dirtyEnd itself.
 	stackMemPool = &sync.Pool{New: func() interface{} {
 		return newStackMem()
 	}}
@@ -109,15 +125,24 @@ func NewStack(sbpfVer sbpfver.SbpfVersion, disableStackFrameGaps bool) Stack {
 	s.shadow[0] = Frame{
 		FramePtr: VaddrStack + sz,
 	}
+	s.maxDepth = 1
 	return s
 }
 
 func (s *Stack) Finish() {
 	if UsePool {
-		s.mem = s.mem[:StackMax]
-		clear(s.mem)
+		// Zero only the touched prefix; the rest of mem is already zero (see
+		// the stackMemPool invariant), so this restores the full-zero contract.
+		if s.dirtyEnd > StackMax {
+			s.dirtyEnd = StackMax
+		}
+		clear(s.mem[:s.dirtyEnd])
 		stackMemPool.Put(s.mem)
-		s.shadow = s.shadow[:StackDepth]
+
+		if s.maxDepth > StackDepth {
+			s.maxDepth = StackDepth
+		}
+		s.shadow = s.shadow[:s.maxDepth]
 		clear(s.shadow)
 		s.shadow = s.shadow[:1]
 		stackShadowPool.Put(s.shadow)
@@ -129,16 +154,18 @@ func (s *Stack) GetFramePtr() uint64 {
 	return s.shadow[len(s.shadow)-1].FramePtr
 }
 
-// GetFrame returns underlying memory as a slice for a given stack address
-func (s *Stack) GetFrame(addr uint32) []byte {
-	off := uint64(addr & math.MaxUint32)
+// frameOffset maps a stack virtual address (low 32 bits) to a physical offset
+// into the backing memory, applying gap compression for gapped-frame versions.
+// ok is false if the address lands in a gap or is out of range.
+func (s *Stack) frameOffset(addr uint32) (off uint64, ok bool) {
+	off = uint64(addr & math.MaxUint32)
 
 	if !s.dynamicStackFrames {
 		if s.stackFrameGaps {
 			// disallow addressing a gap
 			hi := addr / StackFrameSize
 			if hi%2 == 1 {
-				return nil
+				return 0, false
 			}
 
 			// account for gapping in virtual addr space but not in the underlying memory
@@ -147,10 +174,18 @@ func (s *Stack) GetFrame(addr uint32) []byte {
 	}
 
 	if off > StackMax {
-		return nil
-	} else {
-		return s.mem[off:]
+		return 0, false
 	}
+	return off, true
+}
+
+// GetFrame returns underlying memory as a slice for a given stack address
+func (s *Stack) GetFrame(addr uint32) []byte {
+	off, ok := s.frameOffset(addr)
+	if !ok {
+		return nil
+	}
+	return s.mem[off:]
 }
 
 // Push allocates a new call frame.
@@ -168,6 +203,9 @@ func (s *Stack) Push(regs []uint64, ret int64) bool {
 	frame.FramePtr = regs[10]
 
 	s.shadow = append(s.shadow, frame)
+	if len(s.shadow) > s.maxDepth {
+		s.maxDepth = len(s.shadow)
+	}
 
 	if !s.dynamicStackFrames {
 		if s.stackFrameGaps {
