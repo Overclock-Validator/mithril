@@ -2,6 +2,7 @@ package sealevel
 
 import (
 	"encoding/binary"
+	"math/bits"
 
 	//"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/cu"
@@ -15,14 +16,27 @@ func MemOpConsume(execCtx *ExecutionCtx, n uint64) error {
 	return execCtx.ComputeMeter.Consume(cost)
 }
 
-func memmoveImplInternal(vm sbpf.VM, dst, src, n uint64) (err error) {
-	srcBuf := make([]byte, n)
-	err = vm.Read(src, srcBuf)
+// memmoveImplInternal copies n bytes from src to dst within VM memory.
+//
+// Translation order matches Agave (mem_ops.rs memmove): the destination is
+// translated first (AccessType::Store — this triggers any copy-on-write /
+// direct-mapping materialization and, when both operands are invalid, produces
+// a Store fault at dst rather than a Load fault at src), then the source. This
+// intentionally differs from the previous implementation, which translated src
+// first. Because dst is materialized before src is read, there is no stale-src
+// hazard. copy() has memmove semantics, so overlapping src/dst is handled
+// correctly (used by sol_memmove_; sol_memcpy_ rejects overlap before calling).
+func memmoveImplInternal(vm sbpf.VM, dst, src, n uint64) error {
+	dstBuf, err := vm.Translate(dst, n, true)
 	if err != nil {
-		return
+		return err
 	}
-	err = vm.Write(dst, srcBuf)
-	return
+	srcBuf, err := vm.Translate(src, n, false)
+	if err != nil {
+		return err
+	}
+	copy(dstBuf, srcBuf)
+	return nil
 }
 
 // SyscallMemcpyImpl is the implementation of the memcpy (sol_memcpy_) syscall.
@@ -96,15 +110,7 @@ func SyscallMemcmpImpl(vm sbpf.VM, addr1, addr2, n, resultAddr uint64) (uint64, 
 		return syscallErr(err)
 	}
 
-	cmpResult := int32(0)
-	for count := uint64(0); count < n; count++ {
-		b1 := slice1[count]
-		b2 := slice2[count]
-		if b1 != b2 {
-			cmpResult = int32(b1) - int32(b2)
-			break
-		}
-	}
+	cmpResult := memcmpBytes(slice1, slice2, n)
 
 	resultSlice, err := vm.Translate(resultAddr, 4, true)
 	if err != nil {
@@ -133,11 +139,63 @@ func SyscallMemsetImpl(vm sbpf.VM, dst, c, n uint64) (uint64, error) {
 		return syscallErr(err)
 	}
 
-	for i := uint64(0); i < n; i++ {
-		mem[i] = byte(c)
-	}
+	fillBytes(mem, byte(c))
 
 	return syscallSuccess(0)
+}
+
+// memsetDoublingThreshold is the buffer size above which fillBytes switches
+// from a simple byte loop to a doubling copy. Below it the loop wins (no call /
+// setup overhead); above it copy() (which the runtime lowers to a vectorized
+// memmove) dominates.
+const memsetDoublingThreshold = 32
+
+// fillBytes sets every byte of dst to v. Equivalent to a byte loop but much
+// faster for large buffers: it seeds one byte then repeatedly doubles the
+// filled region with copy(), which the Go runtime implements as a vectorized
+// memmove. v==0 uses the runtime's optimized memclr.
+func fillBytes(dst []byte, v byte) {
+	if len(dst) == 0 {
+		return
+	}
+	if v == 0 {
+		clear(dst)
+		return
+	}
+	if len(dst) <= memsetDoublingThreshold {
+		for i := range dst {
+			dst[i] = v
+		}
+		return
+	}
+	dst[0] = v
+	for filled := 1; filled < len(dst); {
+		filled += copy(dst[filled:], dst[:filled])
+	}
+}
+
+// memcmpBytes compares the first n bytes of a and b, returning
+// int32(a[i]) - int32(b[i]) at the first differing byte i (matching Agave's
+// memcmp result), or 0 if equal. It compares 8 bytes at a time and locates the
+// first differing byte within a mismatching word via the low set bit of the
+// XOR (little-endian byte order), then falls back to a byte loop for the tail.
+// a and b must each have at least n bytes.
+func memcmpBytes(a, b []byte, n uint64) int32 {
+	i := uint64(0)
+	for ; i+8 <= n; i += 8 {
+		x := binary.LittleEndian.Uint64(a[i:])
+		y := binary.LittleEndian.Uint64(b[i:])
+		if x != y {
+			j := i + uint64(bits.TrailingZeros64(x^y)>>3)
+			return int32(a[j]) - int32(b[j])
+		}
+	}
+	for ; i < n; i++ {
+		if a[i] != b[i] {
+			return int32(a[i]) - int32(b[i])
+		}
+	}
+	return 0
 }
 
 var SyscallMemset = sbpf.SyscallFunc3(SyscallMemsetImpl)
