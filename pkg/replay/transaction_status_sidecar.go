@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/state"
 )
 
@@ -32,13 +33,13 @@ const (
 )
 
 // PrepareTransactionStatusCheckpoint durably installs an immutable checkpoint
-// before the AccountsDB fold manifest that will reference it. The returned ref
-// is only PREPARED: the fold manifest remains the sole commit selector.
+// before the rooted fold manifest or classic state file that will reference it.
+// The returned ref is only prepared; the durable record is the commit selector.
 //
 // Installation is temp-write + file fsync + hard-link-without-replacement +
 // directory fsync. A retry for identical bytes is idempotent. A crash before
-// the fold manifest commits can leave an unreferenced final file; startup GC may
-// remove it after collecting refs from committed manifests.
+// the durable record commits can leave an unreferenced final file; cleanup may
+// remove it after collecting refs from committed records.
 func PrepareTransactionStatusCheckpoint(accountsDBRoot string, root uint64, payload []byte) (*state.TransactionStatusCheckpointRef, error) {
 	if len(payload) == 0 {
 		return nil, errors.New("prepare transaction status checkpoint: empty payload")
@@ -317,6 +318,105 @@ func parseTransactionStatusCheckpointBasename(name string) (*state.TransactionSt
 		return nil, false
 	}
 	return &state.TransactionStatusCheckpointRef{Root: root, File: name, SHA256: digest}, true
+}
+
+// ClassicStatusCheckpointForRoot resolves which sidecar describes root: rooted
+// context, then the state file's reference, then a sidecar recovered from disk.
+// Collection and resume must agree, or collection deletes what resume wants.
+func ClassicStatusCheckpointForRoot(st *state.MithrilState, root uint64, accountsDBRoot string) *state.TransactionStatusCheckpointRef {
+	if st == nil {
+		return nil
+	}
+	if rooted := st.LastRootedContext; rooted != nil && rooted.Slot == root && rooted.TransactionStatusCheckpoint != nil {
+		return rooted.TransactionStatusCheckpoint
+	}
+	// Validate before returning: collection re-validates every keep reference and
+	// aborts wholesale on a bad one, so handing back a malformed reference here
+	// would leave the directory uncollectable on every future start.
+	if ref := st.LastTransactionStatusCheckpoint; ref != nil && ref.Root == root &&
+		ValidateTransactionStatusCheckpointRef(ref, root) == nil {
+		return ref
+	}
+	// Below the snapshot root the Agave seed is authoritative and no sidecar is
+	// expected, so a stray file there is collectible rather than recoverable.
+	if root <= st.SnapshotSlot {
+		return nil
+	}
+	recovered, err := RecoverTransactionStatusCheckpoint(accountsDBRoot, root)
+	if err != nil {
+		mlog.Log.Warnf("transaction status checkpoint recovery scan failed for slot %d: %v", root, err)
+		return nil
+	}
+	return recovered
+}
+
+// scanTransactionStatusCheckpoints yields every sidecar whose content-addressed
+// name claims root, contents unread. A stat failure leaves Size 0, which every
+// caller's validation then rejects.
+func scanTransactionStatusCheckpoints(accountsDBRoot string, root uint64) ([]*state.TransactionStatusCheckpointRef, error) {
+	dir, err := transactionStatusCheckpointDir(accountsDBRoot)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read transaction status checkpoint directory: %w", err)
+	}
+	var out []*state.TransactionStatusCheckpointRef
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		ref, ok := parseTransactionStatusCheckpointBasename(entry.Name())
+		if !ok || ref.Root != root {
+			continue
+		}
+		ref.Version = TransactionStatusCheckpointVersion
+		if info, statErr := entry.Info(); statErr == nil {
+			ref.Size = uint64(info.Size())
+		}
+		out = append(out, ref)
+	}
+	return out, nil
+}
+
+// TransactionStatusCheckpointCandidates lists sidecars that could describe root.
+// Retention uses this rather than the verified lookup: verification can fail for
+// reasons that say nothing about the file, and collection is irreversible.
+func TransactionStatusCheckpointCandidates(accountsDBRoot string, root uint64) ([]*state.TransactionStatusCheckpointRef, error) {
+	refs, err := scanTransactionStatusCheckpoints(accountsDBRoot, root)
+	if err != nil {
+		return nil, err
+	}
+	var out []*state.TransactionStatusCheckpointRef
+	for _, ref := range refs {
+		if ValidateTransactionStatusCheckpointRef(ref, root) != nil {
+			continue
+		}
+		out = append(out, ref)
+	}
+	return out, nil
+}
+
+// RecoverTransactionStatusCheckpoint rebuilds a lost reference from disk. The
+// filename is content-addressed, so root and digest survive a state file that no
+// longer names them — what an older binary leaves behind. Verified before trust.
+func RecoverTransactionStatusCheckpoint(accountsDBRoot string, expectedRoot uint64) (*state.TransactionStatusCheckpointRef, error) {
+	refs, err := scanTransactionStatusCheckpoints(accountsDBRoot, expectedRoot)
+	if err != nil {
+		return nil, err
+	}
+	for _, ref := range refs {
+		if err := VerifyTransactionStatusCheckpoint(accountsDBRoot, ref, expectedRoot); err != nil {
+			mlog.Log.Warnf("transaction status checkpoint %s matches root %d but failed verification: %v", ref.File, expectedRoot, err)
+			continue
+		}
+		return ref, nil
+	}
+	return nil, nil
 }
 
 func syncTransactionStatusDirectory(path string) error {

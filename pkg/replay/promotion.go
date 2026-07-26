@@ -101,22 +101,6 @@ func getAccountsBatchSharedWithStats(ctx context.Context, source blockAccountSou
 	return out, accountsdb.BatchReadStats{RequestedKeys: uint64(len(pks)), DurableKeys: uint64(len(pks))}, err
 }
 
-// unrootedState is the in-RAM speculative-state engine the replay loop drives in
-// rooted-durable mode: reads resolve speculative→durable, commits buffer in RAM,
-// rooted slots promote to disk. Implemented by unrootedTail (linear) and forkTail
-// (fork-aware, over forkCoordinator).
-type unrootedState interface {
-	blockAccountSource
-	Add(slot uint64, delta []*accounts.Account, bankhash []byte)
-	SetContext(slot uint64, ctx *state.ResumeContext)
-	promote(through uint64) (uint64, *state.ResumeContext, error)
-	// flush force-folds the trailing partial chunk <= through. Epoch-boundary
-	// scans use it to settle the durable AccountsDB view; graceful shutdown uses
-	// it so restart re-execution is bounded by the fold batch size.
-	flush(through uint64) (uint64, *state.ResumeContext, error)
-	OverCap() bool
-}
-
 // unrootedTail layers an in-RAM UnrootedOverlay over the durable store: reads
 // resolve overlay→durable, commits buffer until rooted slots promote out.
 type unrootedTail struct {

@@ -2023,6 +2023,16 @@ postBootstrap:
 		}
 	}
 
+	// Past the snapshot with no resume context, replay would configure the first
+	// slot from the manifest and execute against snapshot-era accounts. Refuse
+	// instead: the state file names a durable slot it cannot describe.
+	if !alpenglowMode && mithrilState != nil && resumeState == nil &&
+		mithrilState.LastSlot > mithrilState.SnapshotSlot {
+		klog.Fatalf("state file reports slot %d past snapshot slot %d but carries no usable resume context "+
+			"(context slot %d); re-bootstrap from a fresh snapshot",
+			mithrilState.LastSlot, mithrilState.SnapshotSlot, mithrilState.LastContextSlot)
+	}
+
 	if mithrilState == nil {
 		// Initialize state for this session
 		snapshotEpoch := snapshotEpochForState(manifest)
@@ -2243,6 +2253,22 @@ postBootstrap:
 			mlog.Log.Warnf("transaction-status checkpoint startup cleanup failed: %v", gerr)
 		} else if len(removed) > 0 {
 			mlog.Log.Infof("transaction-status checkpoint startup cleanup removed %d unreferenced file(s)", len(removed))
+		}
+	} else if mithrilState != nil && mithrilState.LastSlot > 0 {
+		// Classic keeps exactly one sidecar, the one describing LastSlot; the rest
+		// are orphans. Slot 0 means the state file was rejected or freshly seeded,
+		// where "nothing is current" would delete a sidecar still needed.
+		keep, retainErr := classicCheckpointKeepSet(mithrilState, accountsPath)
+		switch {
+		case retainErr != nil:
+			// Could not establish what to keep, so keep everything.
+			mlog.Log.Warnf("classic transaction-status checkpoint retention scan failed, skipping cleanup: %v", retainErr)
+		default:
+			if removed, gerr := replay.CleanupTransactionStatusCheckpoints(accountsPath, keep); gerr != nil {
+				mlog.Log.Warnf("classic transaction-status checkpoint startup cleanup failed: %v", gerr)
+			} else if len(removed) > 0 {
+				mlog.Log.Infof("classic transaction-status checkpoint startup cleanup removed %d unreferenced file(s)", len(removed))
+			}
 		}
 	}
 
@@ -2638,6 +2664,25 @@ postBootstrap:
 	}
 	result := runReplayWithRecovery(ctx, accountsDb, accountsPath, manifest, resumeState, uint64(startSlot), liveEndSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, uint16(turbineShredVersion), turbineAlpenglowAddr, validatorIdentity, blockstorePath, int(txParallelism), true, useLightbringer, useTurbine, dbgOpts, metricsWriter, slotCtxSetter, mithrilState, blockFetchOpts, consensusOpts, compactCfg.RewindHorizonBatches, replayStartTime)
 
+	// An unusable checkpoint must not be recorded, but the slot the store reached
+	// still must be. Dropping the whole write would leave LastSlot behind the
+	// durable index with nothing to reconcile them, so resume would re-execute
+	// slots already applied; dropping only the reference makes resume fail closed.
+	if !alpenglowMode && mithrilState != nil && result.LastPersistedSlot > mithrilState.SnapshotSlot {
+		if err := replay.VerifyTransactionStatusCheckpoint(
+			accountsPath, result.TransactionStatusCheckpoint, result.LastPersistedSlot,
+		); err != nil {
+			result.TransactionStatusCheckpoint = nil
+			checkpointErr := fmt.Errorf("classic transaction-status checkpoint at slot %d is unusable, recording the slot without it: %w",
+				result.LastPersistedSlot, err)
+			if result.Error == nil {
+				result.Error = checkpointErr
+			} else {
+				result.Error = errors.Join(result.Error, checkpointErr)
+			}
+		}
+	}
+
 	if result.Error != nil {
 		if result.LastPersistedSlot == 0 {
 			mlog.Log.Errorf("Replay stopped before persisting the first post-start slot: %v", result.Error)
@@ -2691,6 +2736,8 @@ postBootstrap:
 				// SlotHashes context
 				SlotHashes: replay.EncodeSlotHashes(result.LastSlotHashes),
 
+				TransactionStatusCheckpoint: result.TransactionStatusCheckpoint,
+
 				// ReplayCtx fields
 				Capitalization:          result.LastCapitalization,
 				SlotsPerYear:            result.LastSlotsPerYear,
@@ -2706,6 +2753,12 @@ postBootstrap:
 			// Record shutdown in history (must be inside this block where shutdownReason is defined)
 			if err := mithrilState.UpdateOnShutdown(accountsPath, result.LastPersistedSlot, result.LastPersistedBankhash, shutdownCtx); err != nil {
 				mlog.Log.Errorf("failed to update state file: %v", err)
+			} else if !alpenglowMode && mithrilState.LastTransactionStatusCheckpoint != nil {
+				if _, err := replay.CleanupTransactionStatusCheckpoints(
+					accountsPath, []*state.TransactionStatusCheckpointRef{mithrilState.LastTransactionStatusCheckpoint},
+				); err != nil {
+					mlog.Log.Warnf("classic transaction-status checkpoint cleanup failed: %v", err)
+				}
 			}
 			state.RecordShutdown(accountsPath, result.LastPersistedSlot, base58.Encode(result.LastPersistedBankhash), replay.CurrentRunID, getVersion(), getCommit(), getBranch(), shutdownReason)
 		} else {
@@ -3915,6 +3968,35 @@ func retainedTransactionStatusCheckpointRefs(accountsDb *accountsdb.AccountsDb, 
 	return refs, nil
 }
 
+// classicCheckpointKeepSet names the sidecars a classic start must not collect.
+// An error means "cannot establish what is current" and the caller collects
+// nothing, because deletion cannot be undone and a resume failure can.
+func classicCheckpointKeepSet(st *state.MithrilState, accountsPath string) ([]*state.TransactionStatusCheckpointRef, error) {
+	if st == nil || st.LastSlot == 0 {
+		return nil, errors.New("no durable slot recorded; refusing to collect")
+	}
+	// At or below the snapshot root the Agave seed is authoritative and no
+	// sidecar is expected, so anything present is a stray and collectible.
+	if st.LastSlot <= st.SnapshotSlot {
+		return nil, nil
+	}
+	if current := replay.ClassicStatusCheckpointForRoot(st, st.LastSlot, accountsPath); current != nil {
+		return []*state.TransactionStatusCheckpointRef{current}, nil
+	}
+	// Past the snapshot root a sidecar is expected. Finding none means the
+	// state file and the directory disagree — which is exactly the state a
+	// failed checkpoint leaves behind — so retain whatever is named for this
+	// slot, and if there is nothing, refuse rather than empty the directory.
+	candidates, err := replay.TransactionStatusCheckpointCandidates(accountsPath, st.LastSlot)
+	if err != nil {
+		return nil, err
+	}
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("no sidecar retained for durable slot %d; refusing to collect", st.LastSlot)
+	}
+	return candidates, nil
+}
+
 func cleanupRetainedTransactionStatusCheckpoints(accountsDbPath string, accountsDb *accountsdb.AccountsDb, horizon uint64, current *state.TransactionStatusCheckpointRef) ([]string, error) {
 	keep, err := retainedTransactionStatusCheckpointRefs(accountsDb, horizon, current)
 	if err != nil {
@@ -4082,9 +4164,25 @@ func runReplayWithRecovery(
 		// Calculate epoch for the last persisted slot
 		lastEpoch := epochForStateSlot(mithrilState, r.LastPersistedSlot)
 
+		// Record the checkpoint only once it is durable. This path exists to close
+		// the hard-kill window, so an unverified reference here is exactly what
+		// resume would trust; drop it instead and let resume fail closed.
+		checkpointRef := r.TransactionStatusCheckpoint
+
 		// Build shutdown context
 		var shutdownCtx *state.ShutdownContext
 		if r.LastAcctsLtHash != nil {
+			// Verify only here: this is the sole path that records the reference,
+			// and verifying elsewhere warns about one that is never written.
+			if consensusOpts != nil && !consensusOpts.Alpenglow && r.LastPersistedSlot > mithrilState.SnapshotSlot {
+				if err := replay.VerifyTransactionStatusCheckpoint(
+					accountsDbPath, checkpointRef, r.LastPersistedSlot,
+				); err != nil {
+					mlog.Log.Warnf("classic transaction-status checkpoint at slot %d could not be verified, omitting from state: %v",
+						r.LastPersistedSlot, err)
+					checkpointRef = nil
+				}
+			}
 			shutdownCtx = &state.ShutdownContext{
 				RunID:          replay.CurrentRunID,
 				WriterVersion:  getVersion(),
@@ -4108,6 +4206,8 @@ func runReplayWithRecovery(
 				// SlotHashes context
 				SlotHashes: replay.EncodeSlotHashes(r.LastSlotHashes),
 
+				TransactionStatusCheckpoint: checkpointRef,
+
 				// ReplayCtx fields
 				Capitalization:          r.LastCapitalization,
 				SlotsPerYear:            r.LastSlotsPerYear,
@@ -4125,6 +4225,15 @@ func runReplayWithRecovery(
 		// Write state immediately
 		if err := mithrilState.UpdateOnShutdown(accountsDbPath, r.LastPersistedSlot, r.LastPersistedBankhash, shutdownCtx); err != nil {
 			return err
+		}
+		// Prune against the reference the saved state actually holds, not the one
+		// this run produced: they differ when no shutdown context was written.
+		if consensusOpts != nil && !consensusOpts.Alpenglow && mithrilState.LastTransactionStatusCheckpoint != nil {
+			if _, err := replay.CleanupTransactionStatusCheckpoints(
+				accountsDbPath, []*state.TransactionStatusCheckpointRef{mithrilState.LastTransactionStatusCheckpoint},
+			); err != nil {
+				mlog.Log.Warnf("classic transaction-status checkpoint cleanup failed: %v", err)
+			}
 		}
 
 		// Record shutdown in history

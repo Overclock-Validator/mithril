@@ -18,6 +18,11 @@ const HistoryFileName = "mithril_state.history.jsonl"
 // Increment this when making breaking changes to the state file structure.
 // Version 3 requires computed epoch-stake metadata to retain vote-account
 // balances; older checkpoints cannot prove SIMD-0357 VAT admission on resume.
+// Optional fields are added without a bump: CheckAndLoadValidState turns a
+// version rejection into "no state file" and reseeds a manifest-only one,
+// discarding the whole resume context, whereas an older binary reading a
+// same-version file just drops the field it does not understand. Downgrading
+// is still unsupported; this only bounds the damage.
 const CurrentStateSchemaVersion uint32 = 3
 
 // MithrilState tracks the current state of the mithril node.
@@ -110,6 +115,10 @@ type MithrilState struct {
 	LastEpoch       uint64 `json:"last_epoch,omitempty"`        // Epoch of last replayed slot
 	LastBankhash    string `json:"last_bankhash,omitempty"`     // Bankhash of last replayed slot (base58)
 	LastBlockHeight uint64 `json:"last_block_height,omitempty"` // Block height of last replayed slot
+	// Slot the resume context below describes. LastSlot advances on a shutdown
+	// that carries no context, so the two diverge and the context goes stale.
+	// Zero means a file written before this field existed.
+	LastContextSlot uint64 `json:"last_context_slot,omitempty"`
 
 	// Rooted-durable watermark: the canonical store holds only rooted (finalized) slots
 	// through here while replay runs ahead in RAM. Resume starts at the next slot. Zero = legacy.
@@ -150,6 +159,10 @@ type MithrilState struct {
 
 	// SlotHashes context - vote program needs accurate slot→hash mappings
 	LastSlotHashes []SlotHashEntry `json:"last_slot_hashes,omitempty"` // up to 512 entries, newest first
+
+	// Classic clusters persist every replayed slot. This sidecar keeps the
+	// AlreadyProcessed window aligned with LastSlot across restarts.
+	LastTransactionStatusCheckpoint *TransactionStatusCheckpointRef `json:"last_transaction_status_checkpoint,omitempty"`
 
 	// ReplayCtx fields - so resume uses fresh values instead of stale manifest
 	LastCapitalization          uint64  `json:"last_capitalization,omitempty"`    // Total lamports in circulation
@@ -247,9 +260,9 @@ type ReplayDivergenceRecord struct {
 // tens of megabytes, while every retained fold manifest needs only this small
 // reference in order to recover or rewind safely.
 //
-// The fold manifest carrying this reference is the commit selector. A sidecar
-// may be prepared before that manifest is durable, but it is not current until
-// a committed manifest references it.
+// A rooted fold manifest or classic-mode state file is the commit selector. A
+// sidecar may be prepared first, but it is not current until one of those
+// durable records references it.
 type TransactionStatusCheckpointRef struct {
 	Version uint32 `json:"version"`
 	Root    uint64 `json:"root"`
@@ -433,6 +446,9 @@ type ShutdownContext struct {
 	// SlotHashes context - vote program uses this to verify slot→hash mappings
 	SlotHashes []SlotHashEntry // up to 512 entries, newest first
 
+	// Reference to the status-cache sidecar for the classic durable tip.
+	TransactionStatusCheckpoint *TransactionStatusCheckpointRef
+
 	// ReplayCtx fields - so resume uses fresh values instead of stale manifest
 	Capitalization          uint64  // Total lamports in circulation
 	SlotsPerYear            float64 // Slots per year for inflation calc
@@ -463,6 +479,17 @@ func (s *MithrilState) UpdateOnShutdown(accountsDbDir string, slot uint64, bankh
 	s.LastBankhash = base58.Encode(bankhash)
 	if ctx != nil {
 		s.LastBlockHeight = ctx.BlockHeight
+	}
+
+	// The checkpoint reference tracks LastSlot unconditionally. LastSlot advances
+	// even without a shutdown context, so leaving a previous run's reference in
+	// place would describe a slot the state file no longer claims, and cleanup
+	// would then retain that stale sidecar and delete the current one.
+	if ctx != nil && ctx.TransactionStatusCheckpoint != nil {
+		ref := *ctx.TransactionStatusCheckpoint
+		s.LastTransactionStatusCheckpoint = &ref
+	} else {
+		s.LastTransactionStatusCheckpoint = nil
 	}
 
 	if ctx != nil {
@@ -496,6 +523,7 @@ func (s *MithrilState) UpdateOnShutdown(accountsDbDir string, slot uint64, bankh
 		s.LastBlockHeight = ctx.BlockHeight
 
 		// Resume context - LtHash and fee state
+		s.LastContextSlot = slot
 		s.LastAcctsLtHash = ctx.AcctsLtHash
 		s.LastLamportsPerSignature = ctx.LamportsPerSignature
 		s.LastPrevLamportsPerSig = ctx.PrevLamportsPerSig
@@ -539,8 +567,14 @@ func (s *MithrilState) UpdateOnShutdown(accountsDbDir string, slot uint64, bankh
 
 // HasResumeData returns true if the state has resume context stored.
 // This indicates the state was saved during a graceful shutdown with full context.
+// A context captured at an earlier slot than LastSlot is refused: replaying from
+// LastSlot+1 against it would execute on accounts that many slots stale. A zero
+// LastContextSlot means a file written before the field existed, accepted as-is.
 func (s *MithrilState) HasResumeData() bool {
-	return s != nil && s.LastSlot > 0 && s.LastAcctsLtHash != ""
+	if s == nil || s.LastSlot == 0 || s.LastAcctsLtHash == "" {
+		return false
+	}
+	return s.LastContextSlot == 0 || s.LastContextSlot == s.LastSlot
 }
 
 // ClearManifestEpochStakes removes the manifest epoch stakes after they're no longer needed.

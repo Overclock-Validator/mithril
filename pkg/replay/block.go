@@ -139,6 +139,9 @@ type ReplayResult struct {
 	LastPersistedBankhash []byte
 	// LastBlockHeight is the block height of the last persisted slot.
 	LastBlockHeight uint64
+	// TransactionStatusCheckpoint references the classic status-cache sidecar for
+	// LastPersistedSlot. Rooted-durable mode commits its checkpoint in folds.
+	TransactionStatusCheckpoint *state.TransactionStatusCheckpointRef
 	// WasCancelled indicates whether replay was interrupted by context cancellation
 	WasCancelled bool
 	// Error contains any error that occurred during replay
@@ -1008,6 +1011,34 @@ func setupInitialVoteAcctsAndStakeAccts(acctsDb *accountsdb.AccountsDb, block *b
 	}
 }
 
+// checkStatusCacheCoversRoot rejects a payload that would stop short of the root
+// it is named for: the bank hash is published before the status cache commits, so
+// a commit failure leaves the persisted slot ahead of the tip. A tip past root is
+// fine — SnapshotThrough truncates.
+func checkStatusCacheCoversRoot(cache *TransactionStatusCache, root uint64) error {
+	tip, ok := cache.TipSlot()
+	if !ok {
+		return fmt.Errorf("classic transaction status cache is empty and cannot cover persisted slot %d", root)
+	}
+	if tip < root {
+		return fmt.Errorf("classic transaction status cache tip %d does not cover persisted slot %d", tip, root)
+	}
+	return nil
+}
+
+// seedInitialBlockhashContext primes the RecentBlockhashes sysvar cache from the
+// manifest window and returns the parent hash for the first replayed block. The
+// seed is a no-op once the cache is populated, so this must run before anything
+// else touches it.
+func seedInitialBlockhashContext(entries []state.BlockhashEntry) ([32]byte, error) {
+	recent, err := RecentBlockhashesFromState(entries)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("decode manifest RecentBlockhashes: %w", err)
+	}
+	SeedRecentBlockhashesCache(recent)
+	return recent[0].Blockhash, nil
+}
+
 func configureInitialBlock(acctsDb *accountsdb.AccountsDb,
 	block *b.Block,
 	mithrilState *state.MithrilState,
@@ -1049,6 +1080,12 @@ func configureInitialBlock(acctsDb *accountsdb.AccountsDb,
 		return fmt.Errorf("corrupted state file: failed to decode manifest_evicted_blockhash: %w", err)
 	}
 	block.LatestEvictedBlockhash = evictedHash
+
+	lastBlockhash, err := seedInitialBlockhashContext(mithrilState.ManifestRecentBlockhashes)
+	if err != nil {
+		return err
+	}
+	block.LastBlockhash = lastBlockhash
 
 	setupInitialVoteAcctsAndStakeAccts(acctsDb, block)
 	configureGlobalCtx(block)
@@ -1491,8 +1528,17 @@ func ReplayBlocks(
 		expectedStatusRoot = resumeState.ParentSlot
 		statusParentBlockID = resumeState.ParentAlpenglowBlockID
 		hasStatusParentBlockID = resumeState.HasParentAlpenglowBlockID
-		if rootedCtx := mithrilState.LastRootedContext; rootedCtx != nil && rootedCtx.Slot == expectedStatusRoot {
-			statusCheckpoint = rootedCtx.TransactionStatusCheckpoint
+		if alpenglowMode {
+			if rootedCtx := mithrilState.LastRootedContext; rootedCtx != nil && rootedCtx.Slot == expectedStatusRoot {
+				statusCheckpoint = rootedCtx.TransactionStatusCheckpoint
+			}
+		} else {
+			// Same resolution the startup collector uses, so it cannot delete the
+			// sidecar this path is about to read.
+			statusCheckpoint = ClassicStatusCheckpointForRoot(mithrilState, expectedStatusRoot, acctsDbPath)
+			if statusCheckpoint != nil && mithrilState.LastTransactionStatusCheckpoint == nil {
+				mlog.Log.Infof("recovered transaction status checkpoint for slot %d from %s", expectedStatusRoot, statusCheckpoint.File)
+			}
 		}
 	}
 	transactionStatuses, err := loadTransactionStatusCacheForReplay(
@@ -1506,6 +1552,24 @@ func ReplayBlocks(
 	if err != nil {
 		result.Error = fmt.Errorf("initialize transaction AlreadyProcessed status cache: %w", err)
 		return result
+	}
+	prepareClassicStatusCheckpoint := func(root uint64) error {
+		if alpenglowMode || root <= mithrilState.SnapshotSlot {
+			return nil
+		}
+		if err := checkStatusCacheCoversRoot(transactionStatuses, root); err != nil {
+			return err
+		}
+		payload, err := transactionStatuses.SnapshotThrough(root)
+		if err != nil {
+			return fmt.Errorf("snapshot classic transaction status cache at slot %d: %w", root, err)
+		}
+		ref, err := PrepareTransactionStatusCheckpoint(acctsDbPath, root, payload)
+		if err != nil {
+			return fmt.Errorf("prepare classic transaction-status checkpoint at slot %d: %w", root, err)
+		}
+		result.TransactionStatusCheckpoint = ref
+		return nil
 	}
 
 	// Seed the running transaction count. On resume, the checkpoint carries the
@@ -2687,7 +2751,15 @@ func ReplayBlocks(
 		processBlockStart := time.Now()
 		metrics.GlobalBlockReplay.PreprocessBlock.AddTiming(processBlockStart.Sub(start))
 		alpenglowClock := alpenglowMode
-		lastSlotCtx, err = ProcessBlock(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, unrootedTailState, transactionStatuses, alpenglowClock)
+		// Keep the last successful slot's context on failure. A failed block
+		// leaves the durable position at the slot before it, and discarding that
+		// context would advance LastSlot with nothing describing it, which resume
+		// refuses — turning one bad block into a re-bootstrap.
+		processedCtx, processErr := ProcessBlock(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, unrootedTailState, transactionStatuses, alpenglowClock)
+		if processErr == nil {
+			lastSlotCtx = processedCtx
+		}
+		err = processErr
 		processBlockEnd := time.Now()
 		metrics.GlobalBlockReplay.ProcessBlock.AddTiming(processBlockEnd.Sub(processBlockStart))
 		if err != nil {
@@ -2868,6 +2940,19 @@ func ReplayBlocks(
 
 			// Serialize all epoch stakes for persistence
 			result.ComputedEpochStakes = serializeAllEpochStakes()
+
+			if err := prepareClassicStatusCheckpoint(result.LastPersistedSlot); err != nil {
+				if result.Error == nil {
+					result.Error = err
+				} else {
+					result.Error = errors.Join(result.Error, err)
+				}
+				// Record the slot without a reference: leaving LastSlot behind an
+				// advanced store makes restart re-execute applied slots, and classic
+				// never reconciles the two. Resume then fails closed.
+				mlog.Log.Errorf("classic transaction-status checkpoint failed; recording slot %d without one, resume fails closed unless a verifiable sidecar for that slot is already on disk: %v",
+					result.LastPersistedSlot, err)
+			}
 
 			// Write state immediately via callback (eliminates timing window for hard kills)
 			if onCancelWriteState != nil {
@@ -3160,10 +3245,27 @@ func ReplayBlocks(
 	acctsDb.WaitForStoreWorker()
 	result.LastPersistedSlot, result.LastPersistedBankhash = persistedHashes.Get()
 	result.LastBlockHeight = global.BlockHeight()
+	// Only mint for a slot the run can also describe. A failed ProcessBlock
+	// leaves lastSlotCtx nil, so the state write below carries no context and
+	// LastSlot advances past the one it still holds; a sidecar there would let
+	// resume load a status cache for a slot whose accounts are stale.
+	if result.TransactionStatusCheckpoint == nil && lastSlotCtx != nil {
+		if err := prepareClassicStatusCheckpoint(result.LastPersistedSlot); err != nil {
+			checkpointErr := fmt.Errorf("persist classic replay resume checkpoint: %w", err)
+			if result.Error == nil {
+				result.Error = checkpointErr
+			} else {
+				result.Error = errors.Join(result.Error, checkpointErr)
+			}
+		}
+	}
 
 	// Capture resume context from the last slot context (if available)
-	// This enables proper resume from Ctrl+C shutdown
-	if lastSlotCtx != nil {
+	// This enables proper resume from Ctrl+C shutdown.
+	// Only when it describes the persisted slot: a status-commit failure leaves
+	// the store a slot ahead of the last good context, and publishing it there
+	// would record a context for a slot it does not describe.
+	if lastSlotCtx != nil && lastSlotCtx.Slot == result.LastPersistedSlot {
 		result.LastAcctsLtHash = lastSlotCtx.AcctsLtHash
 		if lastSlotCtx.FeeRateGovernor != nil {
 			result.LastLamportsPerSignature = lastSlotCtx.FeeRateGovernor.LamportsPerSignature
@@ -3294,7 +3396,7 @@ func EncodeSlotHashes(sysvar *sealevel.SysvarSlotHashes) []state.SlotHashEntry {
 	return result
 }
 
-func newSlotCtx(block *b.Block, accts accounts.Accounts, parentAccts accounts.Accounts, acctsDb *accountsdb.AccountsDb, tail unrootedState, accountMapCapacity int) *sealevel.SlotCtx {
+func newSlotCtx(block *b.Block, accts accounts.Accounts, parentAccts accounts.Accounts, acctsDb *accountsdb.AccountsDb, tail *unrootedTail, accountMapCapacity int) *sealevel.SlotCtx {
 	writableMapCapacity := accountMapCapacity
 	if block.Features != nil && block.Features.IsActive(features.RemoveAccountsDeltaHash) {
 		writableMapCapacity = 0
@@ -3745,7 +3847,7 @@ func ProcessBlock(
 	// tail is the in-RAM working set in rooted-durable mode; nil when rooted-
 	// durable is off. When set, block reads resolve through it and commits
 	// buffer into it.
-	tail unrootedState,
+	tail *unrootedTail,
 	transactionStatuses *TransactionStatusCache,
 	alpenglowClock bool,
 ) (*sealevel.SlotCtx, error) {
