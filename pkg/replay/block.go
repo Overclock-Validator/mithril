@@ -530,12 +530,27 @@ func recordSysvarAccountReadStats(dst *metrics.AccountLoader, src accountsdb.Acc
 	}
 }
 
-func loadBlockAccountsAndUpdateSysvars(accountsDb blockAccountSource, block *b.Block, epochSchedule *sealevel.SysvarEpochSchedule, alpenglowClock bool) (accounts.Accounts, accounts.Accounts, int, error) {
+func loadBlockAccountsAndUpdateSysvars(
+	accountsDb blockAccountSource,
+	block *b.Block,
+	epochSchedule *sealevel.SysvarEpochSchedule,
+	alpenglowClock bool,
+	planner *preparedDependencyPlanner,
+) (accounts.Accounts, accounts.Accounts, int, error) {
 	phaseStart := time.Now()
 	err := resolveAddrTableLookups(accountsDb, block)
 	metrics.GlobalBlockReplay.AccountLoader.AddressTableLookups.AddTimingSince(phaseStart)
 	if err != nil {
 		return nil, nil, 0, err
+	}
+
+	// Live ALT transactions have no RPC metadata, so their account accesses are
+	// knowable only after lookup resolution. Extract their compact accesses and
+	// build the graph concurrently with account loading and sysvar updates. For
+	// RPC blocks this is a no-op because preparation began safely from static
+	// keys plus TransactionMeta before resolution mutated the execution messages.
+	if planner != nil {
+		planner.tryStartResolved(block)
 	}
 
 	phaseStart = time.Now()
@@ -3522,10 +3537,14 @@ func lightbringerEntryExecutionBatches(transactions []*solana.Transaction, entry
 			}
 			segmentBatches[batchIdx] = append(segmentBatches[batchIdx], txIdx)
 			for _, roAcct := range readonlyAccounts {
-				lastReadBatch[roAcct] = batchIdx
+				if previous, exists := lastReadBatch[roAcct]; !exists || batchIdx > previous {
+					lastReadBatch[roAcct] = batchIdx
+				}
 			}
 			for _, writeAcct := range writableAccounts {
-				lastWriteBatch[writeAcct] = batchIdx
+				if previous, exists := lastWriteBatch[writeAcct]; !exists || batchIdx > previous {
+					lastWriteBatch[writeAcct] = batchIdx
+				}
 			}
 		}
 		*batches = append(*batches, segmentBatches...)
@@ -3551,28 +3570,35 @@ func lightbringerEntryExecutionBatches(transactions []*solana.Transaction, entry
 	return batches
 }
 
-func parallelTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, block *b.Block, rblock *b.Block, executionPlan blockTransactionExecutionPlan, txParallelism int, dbgOpts *DebugOptions, shouldVerifySignatures bool) (fees.TxFeeInfoAccumulator, uint64) {
+func parallelTxLoop(
+	slotCtx *sealevel.SlotCtx,
+	sigverifyWg *sync.WaitGroup,
+	planner *preparedDependencyPlanner,
+	block *b.Block,
+	executionPlan blockTransactionExecutionPlan,
+	txParallelism int,
+	dbgOpts *DebugOptions,
+	shouldVerifySignatures bool,
+) (fees.TxFeeInfoAccumulator, uint64) {
 	var txFeeAccumulator fees.TxFeeInfoAccumulator
 	txFeeInfos := make([]*fees.TxFeeInfo, len(block.Transactions))
 	txComputeUnitsConsumed := make([]uint64, len(block.Transactions))
 	errs := make([]error, len(block.Transactions))
 
-	plannerBlock := block
-	if rblock.FromLiveStream {
-		plannerBlock = rblock
-	}
-
-	if canUseDependencyPlanner(plannerBlock) {
+	plannerWaitStart := time.Now()
+	dependencyPlan, plannerBuildDuration, plannerAvailable := planner.wait()
+	metrics.GlobalBlockReplay.DependencyPlannerWait.AddTimingSince(plannerWaitStart)
+	if plannerAvailable {
+		metrics.GlobalBlockReplay.DependencyPlannerPrepared = 1
+		metrics.GlobalBlockReplay.DependencyPlannerBuild.AddTiming(plannerBuildDuration)
 		do := make(chan int, len(block.Transactions))
 		done := make(chan int, len(block.Transactions))
 		plannerDone := make(chan struct{})
 		go func() {
 			defer close(plannerDone)
-			plannerStart := time.Now()
-			topsortPlannerStream(plannerBlock, do, done, func() {
-				metrics.GlobalBlockReplay.DependencyPlannerBuild.AddTimingSince(plannerStart)
-			})
-			metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTimingSince(plannerStart)
+			plannerDispatchStart := time.Now()
+			dispatchDependencyPlan(dependencyPlan, do, done)
+			metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTimingSince(plannerDispatchStart)
 		}()
 
 		wg := &sync.WaitGroup{}
@@ -3587,10 +3613,10 @@ func parallelTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, bloc
 					}
 					tx := block.Transactions[idx]
 					var txMeta *rpc.TransactionMeta
-					if idx < len(rblock.TxMetas) {
-						txMeta = rblock.TxMetas[idx]
+					if idx < len(block.TxMetas) {
+						txMeta = block.TxMetas[idx]
 					}
-					txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = ProcessTransaction(slotCtx, sigverifyWg, rblock.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[i], shouldVerifySignatures)
+					txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = ProcessTransaction(slotCtx, sigverifyWg, block.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[i], shouldVerifySignatures)
 					txErr := errs[idx]
 					// check for success-failure return value divergences
 					if txMeta != nil && txErr == nil && txMeta.Err != nil {
@@ -3611,12 +3637,29 @@ func parallelTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, bloc
 		wg.Wait()
 		close(done)
 		<-plannerDone
-	} else if rblock.FromLiveStream {
-		plannerDispatchStart := time.Now()
-		var plannerBuildDuration time.Duration
+	} else if block.FromLiveStream {
+		metrics.GlobalBlockReplay.DependencyPlannerFallback = 1
+		// Include any unsuccessful prepared-planner attempt in the total planner
+		// work, then build all fallback batches before timing dispatch. This
+		// keeps Build and Dispatch comparable across the two planner modes.
+		fallbackBuildStart := time.Now()
+		var executionBatches [][]uint64
+		relaxIntraBatchAccountLocks := block.Features != nil &&
+			block.Features.IsActive(features.RelaxIntraBatchAccountLocks)
+		for _, entry := range block.Entries {
+			executionBatches = append(
+				executionBatches,
+				lightbringerEntryExecutionBatches(block.Transactions, entry, relaxIntraBatchAccountLocks)...,
+			)
+		}
+		plannerBuildDuration += time.Since(fallbackBuildStart)
+		metrics.GlobalBlockReplay.DependencyPlannerBuild.AddTiming(plannerBuildDuration)
+
 		batchWg := &sync.WaitGroup{}
 		workersWg := &sync.WaitGroup{}
-		do := make(chan uint64, txParallelism)
+		// The full-block buffer makes final-wave enqueue non-blocking, matching
+		// the prepared CSR dispatch timer's end boundary.
+		do := make(chan uint64, len(block.Transactions))
 		workersWg.Add(txParallelism)
 		for i := range txParallelism {
 			go func(workerIdx int) {
@@ -3624,10 +3667,10 @@ func parallelTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, bloc
 				for idx := range do {
 					tx := block.Transactions[idx]
 					var txMeta *rpc.TransactionMeta
-					if int(idx) < len(rblock.TxMetas) {
-						txMeta = rblock.TxMetas[idx]
+					if int(idx) < len(block.TxMetas) {
+						txMeta = block.TxMetas[idx]
 					}
-					txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = ProcessTransaction(slotCtx, sigverifyWg, rblock.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[workerIdx], shouldVerifySignatures)
+					txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = ProcessTransaction(slotCtx, sigverifyWg, block.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[workerIdx], shouldVerifySignatures)
 					txErr := errs[idx]
 					if txMeta != nil && txErr == nil && txMeta.Err != nil {
 						mlog.Log.Errorf("[run:%s] DIVERGENCE in slot %d: tx %s succeeded locally but failed onchain: %+v",
@@ -3643,32 +3686,30 @@ func parallelTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, bloc
 			}(i)
 		}
 
-		relaxIntraBatchAccountLocks := rblock.Features != nil &&
-			rblock.Features.IsActive(features.RelaxIntraBatchAccountLocks)
-		for _, entry := range rblock.Entries {
-			plannerBuildStart := time.Now()
-			batches := lightbringerEntryExecutionBatches(rblock.Transactions, entry, relaxIntraBatchAccountLocks)
-			plannerBuildDuration += time.Since(plannerBuildStart)
-			for _, batch := range batches {
-				executable := 0
-				for _, txIdx := range batch {
-					if executionPlan.execute[txIdx] {
-						executable++
-					}
+		plannerDispatchStart := time.Now()
+		for batchIdx, batch := range executionBatches {
+			executable := 0
+			for _, txIdx := range batch {
+				if executionPlan.execute[txIdx] {
+					executable++
 				}
-				batchWg.Add(executable)
-				for _, txIdx := range batch {
-					if executionPlan.execute[txIdx] {
-						do <- txIdx
-					}
-				}
-				batchWg.Wait()
 			}
+			batchWg.Add(executable)
+			for _, txIdx := range batch {
+				if executionPlan.execute[txIdx] {
+					do <- txIdx
+				}
+			}
+			if batchIdx == len(executionBatches)-1 {
+				metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTimingSince(plannerDispatchStart)
+			}
+			batchWg.Wait()
+		}
+		if len(executionBatches) == 0 {
+			metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTimingSince(plannerDispatchStart)
 		}
 		close(do)
 		workersWg.Wait()
-		metrics.GlobalBlockReplay.DependencyPlannerBuild.AddTiming(plannerBuildDuration)
-		metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTimingSince(plannerDispatchStart)
 	} else {
 		panic("dependency planner unavailable for non-Lightbringer block")
 	}
@@ -3698,39 +3739,6 @@ func parallelTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, bloc
 	}
 
 	return txFeeAccumulator, totalComputeUnitsConsumed
-}
-
-// prepareDependencyPlannerBlock preserves unresolved transaction account keys
-// only when the dependency planner needs them. Live replay explicitly plans
-// from the execution block after address-table resolution, and sequential
-// replay has no planner, so cloning either kind would be pure overhead.
-func prepareDependencyPlannerBlock(block *b.Block, txParallelism int) (*b.Block, error) {
-	if block == nil {
-		return nil, errors.New("nil block")
-	}
-	if txParallelism <= 0 || block.FromLiveStream {
-		return block, nil
-	}
-
-	unresolvedBlock := &b.Block{
-		Transactions: make([]*solana.Transaction, len(block.Transactions)),
-		TxMetas:      make([]*rpc.TransactionMeta, len(block.TxMetas)),
-		Slot:         block.Slot,
-		ParentSlot:   block.ParentSlot,
-	}
-	for i := range block.Transactions {
-		clonedTx, err := cloneTransaction(block.Transactions[i])
-		if err != nil {
-			return nil, fmt.Errorf("clone transaction %d in slot %d: %w", i, block.Slot, err)
-		}
-		unresolvedBlock.Transactions[i] = clonedTx
-		if i < len(block.TxMetas) && block.TxMetas[i] != nil {
-			unresolvedBlock.TxMetas[i] = &rpc.TransactionMeta{}
-			*unresolvedBlock.TxMetas[i] = *block.TxMetas[i]
-		}
-	}
-
-	return unresolvedBlock, nil
 }
 
 func ProcessBlock(
@@ -3775,7 +3783,7 @@ func ProcessBlock(
 		replayStage.Store(stage)
 		replayStageSince.Store(time.Now().UnixNano())
 	}
-	setReplayStage("clone_transactions")
+	setReplayStage("prepare_dependency_planner")
 
 	replayWatchdogDone := make(chan struct{})
 	go func() {
@@ -3825,11 +3833,15 @@ func ProcessBlock(
 		metrics.GlobalBlockReplay.SignatureVerificationJoin.AddTimingSince(sigverifyJoinStart)
 	}()
 	plannerPreparationStart := time.Now()
-	plannerBlock, err := prepareDependencyPlannerBlock(block, txParallelism)
-	metrics.GlobalBlockReplay.DependencyPlannerPreparation.AddTimingSince(plannerPreparationStart)
-	if err != nil {
-		panic(fmt.Sprintf("unable to prepare dependency planner block for slot %d: %v", block.Slot, err))
+	var planner *preparedDependencyPlanner
+	if txParallelism > 0 {
+		planner = newPreparedDependencyPlanner()
+		// RPC metadata makes unresolved ALT accesses available before lookup
+		// resolution. Live blocks without metadata start preparation immediately
+		// after resolution in loadBlockAccountsAndUpdateSysvars.
+		planner.tryStart(block)
 	}
+	metrics.GlobalBlockReplay.DependencyPlannerPreparation.AddTimingSince(plannerPreparationStart)
 
 	start := time.Now()
 	setReplayStage("load_accounts")
@@ -3840,7 +3852,7 @@ func ProcessBlock(
 	if tail != nil {
 		blockSrc = tail
 	}
-	accts, parentAccts, accountMapCapacity, err := loadBlockAccountsAndUpdateSysvars(blockSrc, block, epochSchedule, alpenglowClock)
+	accts, parentAccts, accountMapCapacity, err := loadBlockAccountsAndUpdateSysvars(blockSrc, block, epochSchedule, alpenglowClock, planner)
 	loadAcctsRegion.End()
 	if err != nil {
 		panic(fmt.Sprintf("unable to load slot accounts and update sysvars: %s", err))
@@ -3860,7 +3872,7 @@ func ProcessBlock(
 	txLoopRegion := trace.StartRegion(ctx, "TxLoop")
 	shouldVerifySignatures := !block.TransactionSignaturesVerified()
 	if txParallelism > 0 {
-		txFeeAccumulator, totalComputeUnitsConsumed = parallelTxLoop(slotCtx, &sigverifyWg, plannerBlock, block, executionPlan, txParallelism, dbgOpts, shouldVerifySignatures)
+		txFeeAccumulator, totalComputeUnitsConsumed = parallelTxLoop(slotCtx, &sigverifyWg, planner, block, executionPlan, txParallelism, dbgOpts, shouldVerifySignatures)
 	} else {
 		txFeeAccumulator, totalComputeUnitsConsumed = sequentialTxLoop(slotCtx, &sigverifyWg, block, executionPlan, dbgOpts, shouldVerifySignatures)
 	}

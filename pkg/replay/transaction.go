@@ -512,24 +512,6 @@ func verifySignatures(snapshot *sigverifySnapshot, sigverifyWg *sync.WaitGroup) 
 	metrics.GlobalBlockReplay.Sigverify.AddTimingSince(start)
 }
 
-func cloneTransaction(tx *solana.Transaction) (*solana.Transaction, error) {
-	if tx == nil {
-		return nil, nil
-	}
-
-	raw, err := tx.MarshalBinary()
-	if err != nil {
-		return nil, err
-	}
-
-	cloned, err := solana.TransactionFromBytes(raw)
-	if err != nil {
-		return nil, err
-	}
-
-	return cloned, nil
-}
-
 func processTransactionComputeUnits(execCtx *sealevel.ExecutionCtx) uint64 {
 	if execCtx == nil {
 		return 0
