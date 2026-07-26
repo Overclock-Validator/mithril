@@ -45,15 +45,30 @@ const (
 	BackendStdlib = "stdlib"
 )
 
-// Config selects the verification backend. It is deliberately tiny: the
-// library's own defaults are good, and every knob here is a consensus-visible
-// or performance-visible choice that an operator should have to state.
+// Config selects the verification backend and the group widths the pipelines
+// aim for. It is deliberately tiny: the library's own defaults are good, and
+// every knob here is a consensus-visible or performance-visible choice that an
+// operator should have to state.
 type Config struct {
 	Backend string
+
+	// BatchTarget is how many items a producer hands one worker, and the cap on
+	// what a turbine worker coalesces. See BatchTarget.
+	BatchTarget int
+
+	// MaxDrain caps how many items a replay or TPU worker coalesces into one
+	// batch. See MaxDrain.
+	MaxDrain int
 }
 
 // Defaults returns the configuration used when the operator sets nothing.
-func Defaults() Config { return Config{Backend: BackendAuto} }
+func Defaults() Config {
+	return Config{
+		Backend:     BackendAuto,
+		BatchTarget: DefaultBatchTarget,
+		MaxDrain:    DefaultMaxDrain,
+	}
+}
 
 // Cfg is the live configuration, set once by Configure during startup and
 // read-only afterwards. It follows the same shape as replay.TrailingVerifierCfg.
@@ -77,7 +92,18 @@ func Configure(cfg Config) (string, error) {
 	if cfg.Backend == "" {
 		cfg.Backend = Defaults().Backend
 	}
+	if cfg.BatchTarget == 0 {
+		cfg.BatchTarget = Defaults().BatchTarget
+	}
+	if cfg.MaxDrain == 0 {
+		cfg.MaxDrain = Defaults().MaxDrain
+	}
+	if err := validateWidths(cfg); err != nil {
+		return "", err
+	}
 	Cfg = cfg
+	batchTarget.Store(int64(cfg.BatchTarget))
+	maxDrain.Store(int64(cfg.MaxDrain))
 
 	// The strict predicate is not optional and not configurable: it is what
 	// mainnet does. Set it before selecting a backend so no window exists in
@@ -112,6 +138,32 @@ func Configure(cfg Config) (string, error) {
 			"sigverify.backend must be one of %q, %q, %q, %q; got %q",
 			BackendAuto, BackendR51, BackendGeneric, BackendStdlib, cfg.Backend)
 	}
+}
+
+// validateWidths rejects group widths that would break the drain policy rather
+// than merely tune it. A width below one would make FairShare's floor the only
+// thing keeping a worker from returning the item it already holds, and a
+// MaxDrain below BatchTarget would make the target unreachable by construction:
+// the producer hands out BatchTarget items per worker and the consumer would
+// refuse to take them.
+func validateWidths(cfg Config) error {
+	if cfg.BatchTarget < 1 {
+		return fmt.Errorf("sigverify.batch_target must be >= 1; got %d", cfg.BatchTarget)
+	}
+	if cfg.MaxDrain < 1 {
+		return fmt.Errorf("sigverify.max_drain must be >= 1; got %d", cfg.MaxDrain)
+	}
+	if cfg.MaxDrain < cfg.BatchTarget {
+		return fmt.Errorf(
+			"sigverify.max_drain (%d) must be >= sigverify.batch_target (%d), or workers would refuse groups the producer hands them",
+			cfg.MaxDrain, cfg.BatchTarget)
+	}
+	if cfg.BatchTarget > MaxConfigurableDrain || cfg.MaxDrain > MaxConfigurableDrain {
+		return fmt.Errorf(
+			"sigverify group widths must be <= %d; got batch_target=%d max_drain=%d",
+			MaxConfigurableDrain, cfg.BatchTarget, cfg.MaxDrain)
+	}
+	return nil
 }
 
 // Backend reports the backend in use, for metrics and diagnostics.

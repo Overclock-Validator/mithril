@@ -8,6 +8,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestInitializeStatsdMetrics(t *testing.T) {
@@ -252,4 +253,74 @@ func TestBlockReplayMetrics(t *testing.T) {
 	blockReplay.TxLoop.AddTiming(time.Millisecond * 300)
 	// Sanity test to ensure that the function completes without error
 	SendBlockReplayMetrics(*blockReplay)
+}
+
+func TestObserveRecordsIntoCustomBuckets(t *testing.T) {
+	histogram, ok := metricsCollection.histograms[ReplaySigverifyGroupWidth]
+	require.True(t, ok, "the width histogram must be registered")
+	collector, err := histogram.GetMetricWithLabelValues()
+	require.NoError(t, err)
+
+	before := &dto.Metric{}
+	require.NoError(t, collector.(prometheus.Metric).Write(before))
+
+	require.NoError(t, Observe(ReplaySigverifyGroupWidth, 1, nil))
+	require.NoError(t, Observe(ReplaySigverifyGroupWidth, 8, nil))
+	require.NoError(t, Observe(ReplaySigverifyGroupWidth, 700, nil))
+
+	after := &dto.Metric{}
+	require.NoError(t, collector.(prometheus.Metric).Write(after))
+
+	assert.Equal(t, before.GetHistogram().GetSampleCount()+3, after.GetHistogram().GetSampleCount())
+	assert.InDelta(t, 709.0,
+		after.GetHistogram().GetSampleSum()-before.GetHistogram().GetSampleSum(), 1e-9,
+		"Observe must record the raw value, not a unit conversion")
+
+	// The distribution is the point: buckets that saturated below the width a
+	// deeper kernel needs could not answer whether such widths ever occur.
+	delta := func(bound float64) uint64 {
+		var beforeCount, afterCount uint64
+		for _, b := range before.GetHistogram().GetBucket() {
+			if b.GetUpperBound() == bound {
+				beforeCount = b.GetCumulativeCount()
+			}
+		}
+		for _, b := range after.GetHistogram().GetBucket() {
+			if b.GetUpperBound() == bound {
+				afterCount = b.GetCumulativeCount()
+			}
+		}
+		return afterCount - beforeCount
+	}
+	assert.Equal(t, uint64(2), delta(8), "1 and 8 are at or below the 8 boundary")
+	assert.Equal(t, uint64(2), delta(512), "700 is above the 512 boundary")
+	assert.Equal(t, uint64(3), delta(1024), "700 is below the 1024 boundary")
+}
+
+// Observe and Duration must not be interchangeable. A width recorded into a
+// _seconds series, or a duration into a unitless one, would be silently wrong
+// on a dashboard rather than loudly wrong at the call site.
+func TestObserveAndDurationRejectEachOthersMetrics(t *testing.T) {
+	err := Observe(ReplaySigverifyGroup, 8, nil)
+	require.Error(t, err, "a _seconds histogram must not accept a raw observation")
+	assert.Contains(t, err.Error(), "non-histogram type")
+
+	err = Duration(ReplaySigverifyGroupWidth, time.Second, nil)
+	require.Error(t, err, "a unitless histogram must not accept a duration")
+	assert.Contains(t, err.Error(), "non-histogram type")
+
+	err = Observe(SlotReplays, 8, nil)
+	require.Error(t, err, "a counter must not accept a histogram observation")
+}
+
+func TestSigverifyGroupWidthBucketsSpanTheDecisionRange(t *testing.T) {
+	buckets := MetricToBuckets[ReplaySigverifyGroupWidth]
+	require.NotEmpty(t, buckets, "a histogram of a non-duration needs explicit buckets")
+	assert.Equal(t, 1.0, buckets[0],
+		"the bottom boundary must be 1: whether anything batched at all is the first question")
+	assert.GreaterOrEqual(t, buckets[len(buckets)-1], 1024.0,
+		"the top boundary must reach past the width a multi-scalar kernel would need")
+	for i := 1; i < len(buckets); i++ {
+		assert.Greater(t, buckets[i], buckets[i-1], "buckets must be strictly increasing")
+	}
 }

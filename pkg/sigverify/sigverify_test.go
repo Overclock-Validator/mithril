@@ -182,7 +182,7 @@ func TestBatchResetRetainsCapacityAndClearsVerdicts(t *testing.T) {
 // covered by its own suite.
 func TestBatchAccumulationAllocatesNothingAfterWarmup(t *testing.T) {
 	var batch Batch
-	items := make([]signedMessage, MaxDrain)
+	items := make([]signedMessage, MaxDrain())
 	for i := range items {
 		items[i] = makeSigned(t, i, true)
 	}
@@ -215,7 +215,7 @@ func TestDrainTakesWhatIsReadyAndNeverBlocks(t *testing.T) {
 		ch <- i
 	}
 
-	got := Drain(nil, 1, ch, MaxDrain)
+	got := Drain(nil, 1, ch, MaxDrain())
 	assert.Equal(t, []int{1, 2, 3, 4, 5}, got,
 		"Drain must take the queued items and return rather than wait for more")
 }
@@ -232,7 +232,7 @@ func TestDrainStopsAtMax(t *testing.T) {
 
 func TestDrainOnEmptyChannelReturnsJustTheFirstItem(t *testing.T) {
 	ch := make(chan int)
-	got := Drain(nil, 42, ch, MaxDrain)
+	got := Drain(nil, 42, ch, MaxDrain())
 	assert.Equal(t, []int{42}, got)
 }
 
@@ -240,19 +240,19 @@ func TestDrainHandlesClosedChannel(t *testing.T) {
 	ch := make(chan int, 2)
 	ch <- 2
 	close(ch)
-	got := Drain(nil, 1, ch, MaxDrain)
+	got := Drain(nil, 1, ch, MaxDrain())
 	assert.Equal(t, []int{1, 2}, got, "a closed channel must terminate the drain, not spin")
 }
 
 func TestDrainReusesTheDestinationSlice(t *testing.T) {
 	ch := make(chan int, 8)
-	dst := make([]int, 0, MaxDrain)
+	dst := make([]int, 0, MaxDrain())
 	for round := 0; round < 3; round++ {
 		ch <- round*10 + 1
-		dst = Drain(dst, round*10, ch, MaxDrain)
+		dst = Drain(dst, round*10, ch, MaxDrain())
 		require.Len(t, dst, 2)
 		assert.Equal(t, round*10, dst[0])
-		assert.Equal(t, MaxDrain, cap(dst), "Drain must not reallocate a sufficient buffer")
+		assert.Equal(t, MaxDrain(), cap(dst), "Drain must not reallocate a sufficient buffer")
 	}
 }
 
@@ -262,7 +262,7 @@ func TestDrainReusesTheDestinationSlice(t *testing.T) {
 func TestFairShareNeverStrandsTheItemInHand(t *testing.T) {
 	for _, queued := range []int{0, 1, 7, 100, 100000} {
 		for _, workers := range []int{-1, 0, 1, 8, 1000} {
-			for _, max := range []int{1, BatchTarget, MaxDrain} {
+			for _, max := range []int{1, BatchTarget(), MaxDrain()} {
 				got := FairShare(queued, workers, max)
 				assert.GreaterOrEqual(t, got, 1,
 					"queued=%d workers=%d max=%d", queued, workers, max)
@@ -277,14 +277,145 @@ func TestFairShareNeverStrandsTheItemInHand(t *testing.T) {
 // Eight workers facing eight items should take one each: one group of eight on
 // a single core is slower in wall-clock than eight singles on eight cores.
 func TestFairShareSpreadsShallowQueues(t *testing.T) {
-	assert.Equal(t, 1, FairShare(7, 8, MaxDrain), "8 workers, 8 items total -> one each")
-	assert.Equal(t, 1, FairShare(0, 8, MaxDrain), "nothing behind us -> just the item in hand")
-	assert.Equal(t, 2, FairShare(8, 8, MaxDrain), "one spare each")
+	assert.Equal(t, 1, FairShare(7, 8, MaxDrain()), "8 workers, 8 items total -> one each")
+	assert.Equal(t, 1, FairShare(0, 8, MaxDrain()), "nothing behind us -> just the item in hand")
+	assert.Equal(t, 2, FairShare(8, 8, MaxDrain()), "one spare each")
 }
 
 // A deep queue means every worker is saturated regardless, so each may take a
 // full group.
 func TestFairShareGivesFullGroupsOnDeepQueues(t *testing.T) {
-	assert.Equal(t, BatchTarget, FairShare(8192, 8, BatchTarget))
-	assert.Equal(t, MaxDrain, FairShare(8192, 8, MaxDrain))
+	assert.Equal(t, BatchTarget(), FairShare(8192, 8, BatchTarget()))
+	assert.Equal(t, MaxDrain(), FairShare(8192, 8, MaxDrain()))
+}
+
+// ── configurable group widths ────────────────────────────────────────────────
+
+// withWidths runs fn with the given group widths installed, restoring whatever
+// was configured before. Tests manipulate the atomics directly rather than
+// through Configure because Configure also pins the arithmetic backend, which
+// is process-wide and must not be re-selected per test.
+func withWidths(t *testing.T, target, max int, fn func()) {
+	t.Helper()
+	priorTarget, priorMax := BatchTarget(), MaxDrain()
+	batchTarget.Store(int64(target))
+	maxDrain.Store(int64(max))
+	defer func() {
+		batchTarget.Store(int64(priorTarget))
+		maxDrain.Store(int64(priorMax))
+	}()
+	fn()
+}
+
+func TestConfigureRejectsWidthsThatBreakTheDrainPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cfg    Config
+		reason string
+	}{
+		{"negative target", Config{BatchTarget: -1, MaxDrain: 64}, "batch_target"},
+		{"negative drain", Config{BatchTarget: 8, MaxDrain: -1}, "max_drain"},
+		{
+			// The producer hands out BatchTarget items per worker; a consumer
+			// that refuses to take that many makes the target unreachable by
+			// construction rather than merely unlikely.
+			"drain below target", Config{BatchTarget: 64, MaxDrain: 8}, "must be >=",
+		},
+		{"target past the ceiling", Config{BatchTarget: MaxConfigurableDrain + 1, MaxDrain: MaxConfigurableDrain + 1}, "<="},
+		{"drain past the ceiling", Config{BatchTarget: 8, MaxDrain: MaxConfigurableDrain + 1}, "<="},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateWidths(tc.cfg)
+			require.Error(t, err, "these widths must not be accepted")
+			assert.Contains(t, err.Error(), tc.reason)
+		})
+	}
+}
+
+func TestConfigureAcceptsDeepWidths(t *testing.T) {
+	// The widths a multi-scalar kernel would want. Nothing about the drain
+	// policy depends on the numbers, so these must simply be accepted.
+	for _, target := range []int{1, 8, 64, 512, 1024, MaxConfigurableDrain} {
+		assert.NoError(t, validateWidths(Config{BatchTarget: target, MaxDrain: MaxConfigurableDrain}),
+			"batch_target=%d", target)
+	}
+}
+
+func TestUnsetWidthsFallBackToDefaults(t *testing.T) {
+	assert.Equal(t, DefaultBatchTarget, Defaults().BatchTarget)
+	assert.Equal(t, DefaultMaxDrain, Defaults().MaxDrain)
+	// A Config with zero widths is what an operator who set neither key
+	// produces; it must not be rejected as "below 1".
+	cfg := Config{Backend: BackendAuto}
+	if cfg.BatchTarget == 0 {
+		cfg.BatchTarget = Defaults().BatchTarget
+	}
+	if cfg.MaxDrain == 0 {
+		cfg.MaxDrain = Defaults().MaxDrain
+	}
+	assert.NoError(t, validateWidths(cfg))
+}
+
+// The property that must survive any width: a worker never gives back the item
+// in hand, and never takes more than the cap. Raising the widths must not
+// create a state in which work can sit in a partial group.
+func TestFairShareNeverStrandsAtAnyConfiguredWidth(t *testing.T) {
+	for _, max := range []int{1, 8, 64, 512, 1024, MaxConfigurableDrain} {
+		for _, queued := range []int{0, 1, 7, 63, 511, 100000} {
+			for _, workers := range []int{1, 8, 64} {
+				got := FairShare(queued, workers, max)
+				assert.GreaterOrEqual(t, got, 1, "max=%d queued=%d workers=%d", max, queued, workers)
+				assert.LessOrEqual(t, got, max, "max=%d queued=%d workers=%d", max, queued, workers)
+			}
+		}
+	}
+}
+
+// Deep widths must still spread a shallow queue. A worker that grabbed 512
+// items because the cap allows it, when only a handful are queued, would idle
+// its peers exactly when latency matters most.
+func TestDeepWidthsStillSpreadShallowQueues(t *testing.T) {
+	withWidths(t, 512, 1024, func() {
+		assert.Equal(t, 1, FairShare(7, 8, MaxDrain()),
+			"a shallow queue must spread regardless of how deep the cap is")
+		assert.Equal(t, 2, FairShare(8, 8, MaxDrain()))
+		assert.Equal(t, MaxDrain(), FairShare(1<<20, 8, MaxDrain()),
+			"a genuinely deep queue may fill the configured group")
+	})
+}
+
+// Drain must deliver every queued item at a deep width, including counts that
+// divide badly into groups. A count one past a group boundary is the shape that
+// exposes a former which drops or holds a partial tail.
+func TestDrainDeliversEverythingAtDeepWidths(t *testing.T) {
+	for _, count := range []int{1, 7, 65, 511, 512, 513, 1025} {
+		t.Run(fmt.Sprintf("count=%d", count), func(t *testing.T) {
+			ch := make(chan int, count)
+			for i := 1; i < count; i++ {
+				ch <- i
+			}
+			var seen []int
+			var dst []int
+			first := 0
+			for {
+				dst = Drain(dst, first, ch, 512)
+				seen = append(seen, dst...)
+				select {
+				case next := <-ch:
+					first = next
+				default:
+					// Nothing left queued: everything must have been delivered,
+					// with no item held back in a partial group.
+					require.Len(t, seen, count,
+						"every item must be delivered, not stranded in a partial group")
+					want := make([]int, count)
+					for i := range want {
+						want[i] = i
+					}
+					assert.Equal(t, want, seen)
+					return
+				}
+			}
+		})
+	}
 }

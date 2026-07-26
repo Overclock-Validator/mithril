@@ -63,7 +63,7 @@ func enqueueSigverify(snapshot *sigverifySnapshot, wg *sync.WaitGroup) {
 				)
 				for job := range sigverifyQueue {
 					group = sigverify.Drain(group, job, sigverifyQueue,
-						sigverify.FairShare(len(sigverifyQueue), sigverifyWorkers, sigverify.MaxDrain))
+						sigverify.FairShare(len(sigverifyQueue), sigverifyWorkers, sigverify.MaxDrain()))
 					verifySignatureBatch(group, &batch)
 				}
 			}()

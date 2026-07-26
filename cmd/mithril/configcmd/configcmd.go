@@ -261,6 +261,8 @@ max_rps = 8               # Verifier's own RPC budget (never shares the block-fe
 [tuning]
 txpar = 24                # Validator auto-defaults to 2x CPU cores only when unset; explicit 0 = sequential
 sigverify_backend = "auto" # auto|r51|generic|stdlib; stdlib is a rollback that weakens the predicate
+sigverify_batch_target = 8 # Signatures handed to one verification worker per wave
+sigverify_max_drain = 64  # Most signatures one worker coalesces into a batch (>= batch_target)
 
 # ── Mithril's RPC server ─────────────────────────────────────────────────
 [rpc]

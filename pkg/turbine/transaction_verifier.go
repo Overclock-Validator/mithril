@@ -25,7 +25,7 @@ type transactionVerifier struct {
 	verify  func(*solana.Transaction) error
 	workers int
 	// wave is how many transactions verifyBlockContext admits at once. It is
-	// workers * sigverify.BatchTarget so each worker can actually accumulate a
+	// workers * sigverify.BatchTarget() so each worker can actually accumulate a
 	// full vector group rather than being handed one transaction at a time.
 	wave  int
 	close sync.Once
@@ -37,7 +37,7 @@ func newTransactionVerifier(workers, queueDepth int, verify func(*solana.Transac
 	if workers < 1 {
 		workers = 1
 	}
-	wave := workers * sigverify.BatchTarget
+	wave := workers * sigverify.BatchTarget()
 	if queueDepth < 1 {
 		queueDepth = 1
 	}
@@ -58,7 +58,7 @@ func newTransactionVerifier(workers, queueDepth int, verify func(*solana.Transac
 			)
 			for job := range v.jobs {
 				group = sigverify.Drain(group, job, v.jobs,
-					sigverify.FairShare(len(v.jobs), v.workers, sigverify.BatchTarget))
+					sigverify.FairShare(len(v.jobs), v.workers, sigverify.BatchTarget()))
 				v.verifyGroup(group, &scr)
 				// Do not keep finished jobs reachable through the scratch.
 				clear(group)
@@ -229,7 +229,7 @@ var (
 func validateBlockTransactionsContext(ctx context.Context, blk *block.Block) error {
 	defaultTransactionVerifierOnce.Do(func() {
 		workers := max(1, (runtime.GOMAXPROCS(0)+1)/2)
-		defaultTransactionVerifier = newTransactionVerifier(workers, 2*workers*sigverify.BatchTarget, nil)
+		defaultTransactionVerifier = newTransactionVerifier(workers, 2*workers*sigverify.BatchTarget(), nil)
 	})
 	return defaultTransactionVerifier.verifyBlockContext(ctx, blk)
 }

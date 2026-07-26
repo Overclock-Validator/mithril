@@ -19,6 +19,12 @@ const (
 	TimingT metricType = iota
 	CountT
 	GaugeT
+	// HistogramT is a histogram of a quantity that is not a duration. It
+	// registers exactly like TimingT but is observed through Observe rather
+	// than Duration, so a unitless value cannot be recorded into a _seconds
+	// series or vice versa. Buckets are mandatory: the Prometheus defaults are
+	// duration-shaped and meaningless for anything else.
+	HistogramT
 )
 
 // SAFE METRIC TYPE
@@ -124,13 +130,23 @@ var (
 	TurbineBlockDecode                          = Metric{"turbine_block_decode_duration_seconds"}
 	TurbineTransactionParse                     = Metric{"turbine_transaction_parse_duration_seconds"}
 	TurbineTransactionSigverify                 = Metric{"turbine_transaction_sigverify_duration_seconds"}
-	// ReplaySigverifyGroup times one drained group of transaction signatures
-	// and ReplaySigverifyGroupSignatures counts how many signatures were in it.
-	// The pair is what tells an operator whether batching is actually happening:
-	// a group width stuck near one means work is arriving too thinly to fill a
+	// ReplaySigverifyGroup times one drained group of transaction signatures,
+	// ReplaySigverifyGroupSignatures counts how many signatures were in it, and
+	// ReplaySigverifyGroupWidth records the distribution of those widths.
+	//
+	// Together they tell an operator whether batching is actually happening: a
+	// group width stuck near one means work is arriving too thinly to fill a
 	// vector group, which is a throughput ceiling no backend choice can lift.
+	//
+	// The width histogram is not redundant with the counter. Dividing the
+	// counter by the duration histogram's count gives the MEAN width, and the
+	// mean cannot distinguish "always eight" from "mostly singletons with an
+	// occasional group of hundreds" — two distributions that imply opposite
+	// answers about whether a deeper-batching kernel could ever be fed. Only
+	// the distribution answers that.
 	ReplaySigverifyGroup           = Metric{"replay_sigverify_group_duration_seconds"}
 	ReplaySigverifyGroupSignatures = Metric{"replay_sigverify_group_signatures_total"}
+	ReplaySigverifyGroupWidth      = Metric{"replay_sigverify_group_width"}
 	TurbineReplayAdmission         = Metric{"turbine_replay_admission_duration_seconds"}
 
 	SnapshotWorkerPoolUtilization = Metric{"snapshot_worker_pool_utilization"}
@@ -247,6 +263,7 @@ var MetricToType = map[Metric]metricType{
 	TurbineTransactionSigverify:                 TimingT,
 	ReplaySigverifyGroup:                        TimingT,
 	ReplaySigverifyGroupSignatures:              CountT,
+	ReplaySigverifyGroupWidth:                   HistogramT,
 	TurbineReplayAdmission:                      TimingT,
 
 	TestCount: CountT,
@@ -355,6 +372,7 @@ var MetricToLabels = map[Metric][]string{
 	TurbineTransactionSigverify:                 {},
 	ReplaySigverifyGroup:                        {},
 	ReplaySigverifyGroupSignatures:              {},
+	ReplaySigverifyGroupWidth:                   {},
 	TurbineReplayAdmission:                      {},
 
 	SnapshotWorkerPoolUtilization: {"task"},
@@ -368,6 +386,16 @@ var MetricToLabels = map[Metric][]string{
 var blockProductionDurationBuckets = []float64{
 	0.0005, 0.001, 0.0025, 0.005, 0.010, 0.025, 0.050, 0.075,
 	0.100, 0.125, 0.150, 0.200, 0.400, 0.800, 1.600, 3.200,
+}
+
+// sigverifyGroupWidthBuckets are signature counts, not seconds. The lower
+// boundaries are exact small integers because the interesting question at the
+// bottom is "did anything batch at all", where the difference between one and
+// two is the whole answer. The upper boundaries reach past 512 because that is
+// where a multi-scalar formulation would start to pay, and a histogram that
+// saturated below it could not show whether such widths ever occur.
+var sigverifyGroupWidthBuckets = []float64{
+	1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128, 256, 512, 1024, 4096,
 }
 
 var turbinePipelineDurationBuckets = []float64{
@@ -391,6 +419,7 @@ var MetricToBuckets = map[Metric][]float64{
 	TurbineTransactionParse:                     turbinePipelineDurationBuckets,
 	TurbineTransactionSigverify:                 turbinePipelineDurationBuckets,
 	ReplaySigverifyGroup:                        turbinePipelineDurationBuckets,
+	ReplaySigverifyGroupWidth:                   sigverifyGroupWidthBuckets,
 	TurbineReplayAdmission:                      turbinePipelineDurationBuckets,
 	AlpenglowVoteRewards:                        turbinePipelineDurationBuckets,
 	VoteRewardValidatorPreparation:              turbinePipelineDurationBuckets,
@@ -449,7 +478,7 @@ func initializeStatsdMetrics() Prometheusmetrics {
 		labelNames := MetricToLabels[m]
 
 		switch t {
-		case TimingT:
+		case TimingT, HistogramT:
 			opts := prometheus.HistogramOpts{
 				Name: m.name,
 				Help: fmt.Sprintf("Histogram for %s", m.name),
@@ -498,6 +527,35 @@ func Timing(m Metric, nanos uint64, labels []string) error {
 		labels = []string{}
 	}
 	metricsCollection.histograms[m].WithLabelValues(labels...).Observe(float64(nanos))
+	return nil
+}
+
+// Observe records one sample of a non-duration quantity. Use it with HistogramT
+// metrics, whose buckets must be declared in MetricToBuckets; Duration is the
+// counterpart for anything measured in seconds.
+func Observe(m Metric, value float64, labels []string) error {
+	metricType, registered := MetricToType[m]
+	if !registered {
+		return fmt.Errorf("histogram metric %s is not registered", m)
+	}
+	if metricType != HistogramT {
+		return fmt.Errorf("histogram metric %s has non-histogram type %d", m, metricType)
+	}
+	if _, ok := MetricToBuckets[m]; !ok {
+		return fmt.Errorf("metric %s is not registered for histogram observations", m)
+	}
+	histogram, ok := metricsCollection.histograms[m]
+	if !ok || histogram == nil {
+		return fmt.Errorf("histogram metric %s has no initialized histogram", m)
+	}
+	if labels == nil {
+		labels = []string{}
+	}
+	observer, err := histogram.GetMetricWithLabelValues(labels...)
+	if err != nil {
+		return fmt.Errorf("histogram metric %s labels: %w", m, err)
+	}
+	observer.Observe(value)
 	return nil
 }
 

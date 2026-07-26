@@ -18,10 +18,10 @@ import (
 // The bad job is placed at the front, the back, and the interior of a full
 // group so a verdict written to the wrong lane cannot pass by symmetry.
 func TestVerifySignatureBatchNamesTheFailingSigner(t *testing.T) {
-	for _, badIndex := range []int{0, 1, 7, 8, 31, sigverify.MaxDrain - 1} {
+	for _, badIndex := range []int{0, 1, 7, 8, 31, sigverify.MaxDrain() - 1} {
 		t.Run(fmt.Sprintf("badIndex=%d", badIndex), func(t *testing.T) {
 			var wg sync.WaitGroup
-			group := make([]sigverifyJob, sigverify.MaxDrain)
+			group := make([]sigverifyJob, sigverify.MaxDrain())
 			for i := range group {
 				wg.Add(1)
 				group[i] = sigverifyJob{snapshot: signedTestSnapshot(t, i == badIndex), wg: &wg}

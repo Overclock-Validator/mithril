@@ -424,6 +424,10 @@ func init() {
 	Run.Flags().StringVar(&snapshot.SnapshotIndexTempDir, "snapshot-index-temp-dir", "", "Optional directory for snapshot index shard logs/SST staging")
 	Run.Flags().StringVar(&sigverify.Cfg.Backend, "sigverify-backend", sigverify.Defaults().Backend,
 		"ed25519 verification backend: auto|r51|generic|stdlib (stdlib is a rollback that restores the pre-strict predicate)")
+	Run.Flags().IntVar(&sigverify.Cfg.BatchTarget, "sigverify-batch-target", sigverify.Defaults().BatchTarget,
+		"Signatures a producer hands one verification worker per wave")
+	Run.Flags().IntVar(&sigverify.Cfg.MaxDrain, "sigverify-max-drain", sigverify.Defaults().MaxDrain,
+		"Maximum signatures a verification worker coalesces into one batch")
 	Run.Flags().BoolVar(&sbpf.UsePool, "use-pool", true, "Disable to allocate fresh slices")
 	Run.Flags().IntVar(&accountsdb.StoreAccountsWorkers, "store-accounts-workers", 128, "Number of workers to write account updates")
 	Run.Flags().IntVar(&accountsdb.ProgramCacheMaxMB, "program-cache-max-mb", accountsdb.DefaultProgramCacheMaxMB, "Maximum approximate SBPF program cache size in MiB")
@@ -986,9 +990,11 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	// doubles as a startup health check, so a machine that cannot run the
 	// requested backend fails now instead of at the first block.
 	sigverify.Cfg.Backend = getString("sigverify-backend", "tuning.sigverify_backend")
+	sigverify.Cfg.BatchTarget = getInt("sigverify-batch-target", "tuning.sigverify_batch_target")
+	sigverify.Cfg.MaxDrain = getInt("sigverify-max-drain", "tuning.sigverify_max_drain")
 	resolved, err := sigverify.Configure(sigverify.Cfg)
 	if err != nil {
-		return fmt.Errorf("tuning.sigverify_backend: %w", err)
+		return fmt.Errorf("tuning sigverify: %w", err)
 	}
 	resolvedSigverifyBackend = resolved
 	sbpf.UsePool = getBool("use-pool", "tuning.use_pool")
@@ -2958,6 +2964,14 @@ func printStartupInfo(commandName string) {
 		}
 		fmt.Printf("  Sigverify:    %s%s%s %s(%s)%s\n",
 			green, resolvedSigverifyBackend, reset, dim, sigverifyDesc, reset)
+		// Only worth a line when it is not the default: the widths are what
+		// determine whether the accelerated backend is reachable at all, so a
+		// non-default value should be visible rather than buried in the TOML.
+		if sigverify.BatchTarget() != sigverify.DefaultBatchTarget || sigverify.MaxDrain() != sigverify.DefaultMaxDrain {
+			fmt.Printf("  Batch width:  %s%d per worker, %d max%s %s(default %d/%d)%s\n",
+				green, sigverify.BatchTarget(), sigverify.MaxDrain(), reset,
+				dim, sigverify.DefaultBatchTarget, sigverify.DefaultMaxDrain, reset)
+		}
 	}
 
 	// Load state file for detailed info (only show for modes that use existing AccountsDB)

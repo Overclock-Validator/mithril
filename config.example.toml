@@ -529,6 +529,25 @@ name = "mithril"
     #             that Solana mainnet rejects. Diagnostic use only.
     sigverify_backend = "auto"
 
+    # Signature-verification group widths.
+    #
+    # The accelerated backend verifies eight signatures per AVX-512 group, so
+    # the defaults are one full group per worker and eight groups per batch.
+    # Neither is a threshold: a worker never waits to fill a group, it takes
+    # whatever is already queued, so raising these cannot add latency when work
+    # is scarce and cannot strand a partial group.
+    #
+    # Raise them only to follow a kernel whose crossover is deeper, and read
+    # replay_sigverify_group_width first. That histogram is the distribution of
+    # group widths actually achieved: if it piles up at 1 the queue is too
+    # shallow for wider groups to be reachable at all, and no width setting
+    # here will change that. Prefer it to the mean, which cannot tell a steady
+    # eight from a flood of singletons with occasional large groups.
+    #
+    # max_drain must be >= batch_target.
+    sigverify_batch_target = 8
+    sigverify_max_drain = 64
+
     # Enable/disable pool allocator for slices
     use_pool = true
 

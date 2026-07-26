@@ -207,7 +207,7 @@ func runSigverifyWorker(
 	)
 	for pkt := range in {
 		group = sigverify.Drain(group, pkt, in,
-			sigverify.FairShare(len(in), workers, sigverify.MaxDrain))
+			sigverify.FairShare(len(in), workers, sigverify.MaxDrain()))
 
 		payloads = payloads[:0]
 		for _, p := range group {

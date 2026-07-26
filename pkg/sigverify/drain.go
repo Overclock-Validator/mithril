@@ -1,24 +1,54 @@
 package sigverify
 
-// BatchTarget is the group width worth aiming for: the vectorized backend
-// verifies eight signatures per AVX-512 group, so eight is the point at which
-// every lane is busy and the per-signature cost stops falling steeply.
+import "sync/atomic"
+
+// The default group widths. They are the widths that suit the current
+// verification kernel: the vectorized backend verifies eight signatures per
+// AVX-512 group, so eight is where every lane is busy and per-signature cost
+// stops falling steeply, and 64 is eight full groups.
+//
+// They are defaults rather than constants because the width that pays is a
+// property of the kernel, not of this pipeline, and the kernel is expected to
+// change. A multi-scalar formulation amortizes one doubling chain across the
+// whole group, which does not pay at eight and pays substantially at several
+// hundred. Nothing else about the drain policy depends on the numbers, so
+// following the kernel is a configuration change and not a rewrite.
+const (
+	DefaultBatchTarget = 8
+	DefaultMaxDrain    = 64
+
+	// MaxConfigurableDrain is a typo guard, not a tuning limit. FairShare
+	// already prevents a worker from taking a large group unless the queue is
+	// genuinely that deep, so the ceiling exists only to reject an operator
+	// value that is obviously a mistake.
+	MaxConfigurableDrain = 4096
+)
+
+// Group widths are read on every drain by worker goroutines while Configure
+// writes them during startup, so they are atomics rather than plain ints for
+// the same reason bypass is.
+var (
+	batchTarget atomic.Int64
+	maxDrain    atomic.Int64
+)
+
+func init() {
+	batchTarget.Store(DefaultBatchTarget)
+	maxDrain.Store(DefaultMaxDrain)
+}
+
+// BatchTarget is the group width worth aiming for.
 //
 // It is a TARGET, never a threshold. Nothing in this package waits to reach it.
 // A producer that meters work out to its workers should hand over roughly this
 // many per worker so a group is reachable at all; a consumer should take
 // whatever is actually queued.
-const BatchTarget = 8
+func BatchTarget() int { return int(batchTarget.Load()) }
 
 // MaxDrain is how many work items a verification worker will coalesce into one
-// batch.
-//
-// The accelerated backend verifies eight signatures per AVX-512 group, so any
-// multiple of eight keeps every lane busy. 64 is eight full groups: large
-// enough that per-batch overhead is negligible, small enough that one worker
-// cannot monopolise a shared queue while its peers idle, and small enough that
-// the scratch a worker holds stays in cache.
-const MaxDrain = 64
+// batch. It bounds how long a worker can be busy on one group, and how much
+// scratch that worker holds.
+func MaxDrain() int { return int(maxDrain.Load()) }
 
 // FairShare reports how many items one worker may take in a single pass,
 // given how many are queued behind it and how many workers share the queue.

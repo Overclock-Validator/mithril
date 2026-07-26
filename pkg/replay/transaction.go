@@ -564,8 +564,14 @@ func verifySignatureBatch(group []sigverifyJob, batch *sigverify.Batch) {
 	// the one worth watching: it is the difference between paying for a vector
 	// group and using it, and no backend setting can compensate for work that
 	// arrives too thinly to fill one.
+	//
+	// The width goes out as a distribution as well as a total. The total over
+	// the duration histogram's count is only the mean, and the mean cannot tell
+	// a steady eight from a flood of singletons punctuated by large groups —
+	// which is exactly the question a deeper-batching kernel would turn on.
 	_ = statsd.Duration(statsd.ReplaySigverifyGroup, elapsed, nil)
 	statsd.Count(statsd.ReplaySigverifyGroupSignatures, int64(batch.Len()), nil)
+	_ = statsd.Observe(statsd.ReplaySigverifyGroupWidth, float64(batch.Len()), nil)
 }
 
 func cloneTransaction(tx *solana.Transaction) (*solana.Transaction, error) {
