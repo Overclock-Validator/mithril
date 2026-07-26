@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"os"
 	"testing"
+
+	"github.com/Overclock-Validator/mithril/pkg/wincode"
 )
 
 func TestDecodeAgaveSnapshot(t *testing.T) {
@@ -21,9 +23,14 @@ func TestDecodeAgaveSnapshot(t *testing.T) {
 	}
 
 	ok := encU32(0)
-	duplicateInstruction := append(append(encU32(1), encU32(29)...), byte(7))
+	accountDataLimit := append(encU32(1), encU32(29)...)
+	duplicateInstruction := append(append(encU32(1), encU32(30)...), byte(7))
+	insufficientFundsForRent := append(append(encU32(1), encU32(31)...), byte(8))
+	resanitizationNeeded := append(encU32(1), encU32(34)...)
+	programExecutionRestricted := append(append(encU32(1), encU32(35)...), byte(9))
 	customInstruction := append(append(append(append(encU32(1), encU32(8)...), byte(2)), encU32(25)...), encU32(0xdecafbad)...)
-	borshInstruction := append(append(append(append(encU32(1), encU32(8)...), byte(3)), encU32(44)...), encString("io")...)
+	// BorshIoError (44) is a unit variant since SDK v3: no trailing string.
+	borshInstruction := append(append(append(encU32(1), encU32(8)...), byte(3)), encU32(44)...)
 	unitError := append(encU32(1), encU32(6)...)
 
 	data := encU64(2)
@@ -32,11 +39,15 @@ func TestDecodeAgaveSnapshot(t *testing.T) {
 	data = append(data, encU64(2)...)
 	data = appendStatus(data, hashA, 3, []encodedKey{
 		{key(1), ok},
-		{key(2), duplicateInstruction},
-		{key(3), customInstruction},
-		{key(4), borshInstruction},
+		{key(2), accountDataLimit},
+		{key(3), duplicateInstruction},
+		{key(4), insufficientFundsForRent},
+		{key(5), resanitizationNeeded},
+		{key(6), programExecutionRestricted},
+		{key(7), customInstruction},
+		{key(8), borshInstruction},
 	})
-	data = appendStatus(data, hashB, MaxCachedKeyIndex, []encodedKey{{key(5), unitError}})
+	data = appendStatus(data, hashB, MaxCachedKeyIndex, []encodedKey{{key(9), unitError}})
 	data = append(data, encU64(45)...)
 	data = append(data, 0)
 	data = append(data, encU64(0)...)
@@ -51,11 +62,11 @@ func TestDecodeAgaveSnapshot(t *testing.T) {
 	if deltas[0].Slot != 42 || !deltas[0].IsRoot || len(deltas[0].Statuses) != 2 {
 		t.Fatalf("unexpected first delta: %+v", deltas[0])
 	}
-	if deltas[0].Statuses[0].RecentBlockhash != hashA || deltas[0].Statuses[0].KeyIndex != 3 || len(deltas[0].Statuses[0].Keys) != 4 {
+	if deltas[0].Statuses[0].RecentBlockhash != hashA || deltas[0].Statuses[0].KeyIndex != 3 || len(deltas[0].Statuses[0].Keys) != 8 {
 		t.Fatalf("unexpected first status: %+v", deltas[0].Statuses[0])
 	}
-	if got := deltas[0].Statuses[0].Keys[3]; got != key(4) {
-		t.Fatalf("decoded key %x, want %x", got, key(4))
+	if got := deltas[0].Statuses[0].Keys[7]; got != key(8) {
+		t.Fatalf("decoded key %x, want %x", got, key(8))
 	}
 	if deltas[1].Slot != 45 || deltas[1].IsRoot || len(deltas[1].Statuses) != 0 {
 		t.Fatalf("unexpected second delta: %+v", deltas[1])
@@ -143,14 +154,61 @@ func appendStatus(dst []byte, hash [32]byte, keyIndex uint64, keys []encodedKey)
 	return dst
 }
 
-func encString(s string) []byte {
-	return append(encU64(uint64(len(s))), []byte(s)...)
-}
-
 func encU32(v uint32) []byte {
 	return binary.LittleEndian.AppendUint32(nil, v)
 }
 
 func encU64(v uint64) []byte {
 	return binary.LittleEndian.AppendUint64(nil, v)
+}
+
+// The payload arity per TransactionError tag is the whole decode contract: a
+// tag treated as a unit variant when it carries a u8 leaves that byte in the
+// stream and desyncs everything after it. Drive the decoder per tag rather
+// than restating the case list, so a shifted discriminant fails here.
+func TestSkipTransactionErrorPayloadArity(t *testing.T) {
+	const sentinel = 0x5A
+	for _, tc := range []struct {
+		name    string
+		tag     uint32
+		payload int // bytes the variant carries after the tag
+	}{
+		{"WouldExceedAccountDataTotalLimit", 29, 0},
+		{"DuplicateInstruction", 30, 1},
+		{"InsufficientFundsForRent", 31, 1},
+		{"ResanitizationNeeded", 34, 0},
+		{"ProgramExecutionTemporarilyRestricted", 35, 1},
+		{"CommitCancelled", 38, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf []byte
+			buf = binary.LittleEndian.AppendUint32(buf, tc.tag)
+			buf = append(buf, make([]byte, tc.payload)...)
+			buf = append(buf, sentinel)
+
+			r := wincode.NewReader(buf)
+			if err := skipTransactionError(r); err != nil {
+				t.Fatalf("tag %d: %v", tc.tag, err)
+			}
+			// Exactly the payload must be consumed: the sentinel is what the
+			// next field would read, and it has to still be there.
+			next, err := r.ReadU8()
+			if err != nil {
+				t.Fatalf("tag %d: decoder overran the variant: %v", tc.tag, err)
+			}
+			if next != sentinel {
+				t.Fatalf("tag %d: consumed the wrong number of payload bytes (next byte %#x, want %#x)",
+					tc.tag, next, sentinel)
+			}
+		})
+	}
+}
+
+// Beyond the known variants the decoder must refuse rather than guess.
+func TestSkipTransactionErrorRejectsUnknownTag(t *testing.T) {
+	var buf []byte
+	buf = binary.LittleEndian.AppendUint32(buf, 39)
+	if err := skipTransactionError(wincode.NewReader(buf)); err == nil {
+		t.Fatal("tag 39 is past CommitCancelled and must be rejected")
+	}
 }

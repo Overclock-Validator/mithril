@@ -157,16 +157,16 @@ func skipTransactionError(r *wincode.Reader) error {
 			return fmt.Errorf("read instruction index: %w", err)
 		}
 		return skipInstructionError(r)
-	case 29, // DuplicateInstruction(u8)
-		30, // InsufficientFundsForRent { account_index: u8 }
-		34: // ProgramExecutionTemporarilyRestricted { account_index: u8 }
+	case 30, // DuplicateInstruction(u8)
+		31, // InsufficientFundsForRent { account_index: u8 }
+		35: // ProgramExecutionTemporarilyRestricted { account_index: u8 }
 		if _, err := r.ReadU8(); err != nil {
 			return fmt.Errorf("read transaction error %d payload: %w", tag, err)
 		}
 		return nil
 	default:
 		// All remaining v4.2 variants are unit variants. The highest is
-		// InstructionsSysvarOverflow (38).
+		// CommitCancelled (38).
 		if tag <= 38 {
 			return nil
 		}
@@ -185,18 +185,10 @@ func skipInstructionError(r *wincode.Reader) error {
 			return fmt.Errorf("read custom instruction error: %w", err)
 		}
 		return nil
-	case 44: // BorshIoError(String)
-		n, err := readCount(r, "BorshIoError string", 1)
-		if err != nil {
-			return err
-		}
-		if _, err := r.ReadBytes(n); err != nil {
-			return fmt.Errorf("read BorshIoError string: %w", err)
-		}
-		return nil
 	default:
-		// All remaining v4.2 variants are unit variants. The highest is
-		// BuiltinProgramsMustConsumeComputeUnits (53).
+		// Custom(u32) is the only payload variant: BorshIoError (44) lost its
+		// String in SDK v3. All remaining v4.2 variants are unit variants. The
+		// highest is BuiltinProgramsMustConsumeComputeUnits (53).
 		if tag <= 53 {
 			return nil
 		}
