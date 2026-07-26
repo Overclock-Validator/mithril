@@ -37,6 +37,51 @@ func TestTransactionStatusCheckpointPrepareReadAndIdempotence(t *testing.T) {
 	require.Equal(t, ref.File, entries[0].Name())
 }
 
+// An older binary rewrites the state file without the checkpoint reference,
+// leaving a usable sidecar that nothing names. Recovery must rebuild the exact
+// reference from the filename so resume does not demand a re-bootstrap.
+func TestTransactionStatusCheckpointRecoversReferenceFromDisk(t *testing.T) {
+	rootDir := t.TempDir()
+	payload := bytes.Repeat([]byte{0x17, 0x3c}, 8192)
+
+	original, err := PrepareTransactionStatusCheckpoint(rootDir, 991122, payload)
+	require.NoError(t, err)
+
+	recovered, err := RecoverTransactionStatusCheckpoint(rootDir, 991122)
+	require.NoError(t, err)
+	require.NotNil(t, recovered, "a verified sidecar for the expected root must be recoverable")
+	require.Equal(t, original, recovered)
+
+	got, err := ReadTransactionStatusCheckpoint(rootDir, recovered)
+	require.NoError(t, err)
+	require.Equal(t, payload, got)
+}
+
+func TestTransactionStatusCheckpointRecoveryIsFailClosed(t *testing.T) {
+	rootDir := t.TempDir()
+	ref, err := PrepareTransactionStatusCheckpoint(rootDir, 550000, bytes.Repeat([]byte{0x5a}, 2048))
+	require.NoError(t, err)
+
+	// A sidecar for a different root is never substituted.
+	other, err := RecoverTransactionStatusCheckpoint(rootDir, 550001)
+	require.NoError(t, err)
+	require.Nil(t, other)
+
+	// An empty directory yields no reference rather than an error.
+	empty, err := RecoverTransactionStatusCheckpoint(t.TempDir(), 550000)
+	require.NoError(t, err)
+	require.Nil(t, empty)
+
+	// Content that no longer matches the digest in its own name is rejected:
+	// the filename alone must never be enough to resurrect a corrupt payload.
+	path := filepath.Join(rootDir, TransactionStatusCheckpointDirectory, ref.File)
+	require.NoError(t, os.Chmod(path, 0o600))
+	require.NoError(t, os.WriteFile(path, bytes.Repeat([]byte{0x00}, 2048), 0o600))
+	corrupt, err := RecoverTransactionStatusCheckpoint(rootDir, 550000)
+	require.NoError(t, err)
+	require.Nil(t, corrupt, "a tampered sidecar must not be recovered")
+}
+
 func TestTransactionStatusCheckpointRejectsTraversalTamperAndSymlink(t *testing.T) {
 	rootDir := t.TempDir()
 	ref, err := PrepareTransactionStatusCheckpoint(rootDir, 91, []byte("authoritative-status-window"))

@@ -10,6 +10,35 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestClassicTransactionStatusCheckpointRestoresPostSnapshotTip(t *testing.T) {
+	cache := NewTransactionStatusCache()
+	first := statusCacheTestBlock(1, statusCacheTestTransaction(1, 2, 3))
+	second := statusCacheTestBlock(2, statusCacheTestTransaction(2, 3, 4))
+	require.NoError(t, cache.CommitBlock(first))
+	require.NoError(t, cache.CommitBlock(second))
+
+	payload, err := cache.SnapshotThrough(second.Slot)
+	require.NoError(t, err)
+
+	root := t.TempDir()
+	_, err = loadTransactionStatusCacheForReplay(
+		root, second.Slot, 0, nil, solana.Hash{}, false,
+	)
+	require.ErrorContains(t, err, "checkpoint reference is missing")
+
+	ref, err := PrepareTransactionStatusCheckpoint(root, second.Slot, payload)
+	require.NoError(t, err)
+	restored, err := loadTransactionStatusCacheForReplay(
+		root, second.Slot, 0, ref, solana.Hash{}, false,
+	)
+	require.NoError(t, err)
+	require.True(t, restored.CoverageComplete())
+	require.Equal(t, second.Slot, restored.RootedThrough())
+	tip, ok := restored.TipSlot()
+	require.True(t, ok)
+	require.Equal(t, second.Slot, tip)
+}
+
 func statusCacheTestTransaction(blockhashByte, messageByte, signatureByte byte) *solana.Transaction {
 	return &solana.Transaction{
 		Signatures: []solana.Signature{{signatureByte}},

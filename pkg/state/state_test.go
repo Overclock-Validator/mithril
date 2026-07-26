@@ -11,8 +11,7 @@ import (
 	"github.com/mr-tron/base58"
 )
 
-// LastRootedContext (the resume bundle as of the last rooted slot) must survive a JSON round-trip
-// through the state file unchanged.
+// Both durable resume checkpoint selectors must survive a state JSON round-trip.
 func TestResumeContextRoundTrip(t *testing.T) {
 	orig := &MithrilState{
 		StateSchemaVersion: CurrentStateSchemaVersion,
@@ -51,6 +50,13 @@ func TestResumeContextRoundTrip(t *testing.T) {
 				SHA256:  "deadbeef",
 			},
 		},
+		LastTransactionStatusCheckpoint: &TransactionStatusCheckpointRef{
+			Version: 1,
+			Root:    110,
+			File:    "checkpoint-110-cafebabe.bin",
+			Size:    5678,
+			SHA256:  "cafebabe",
+		},
 	}
 
 	data, err := json.Marshal(orig)
@@ -63,6 +69,10 @@ func TestResumeContextRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(orig.LastRootedContext, got.LastRootedContext) {
 		t.Fatalf("LastRootedContext round-trip mismatch:\n orig=%+v\n got=%+v", orig.LastRootedContext, got.LastRootedContext)
+	}
+	if !reflect.DeepEqual(orig.LastTransactionStatusCheckpoint, got.LastTransactionStatusCheckpoint) {
+		t.Fatalf("classic checkpoint round-trip mismatch:\n orig=%+v\n got=%+v",
+			orig.LastTransactionStatusCheckpoint, got.LastTransactionStatusCheckpoint)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
+	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/state"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/assert"
@@ -222,6 +223,14 @@ func TestPromoteRootedMissingContextFailsClosed(t *testing.T) {
 	require.ErrorContains(t, err, "no resume context")
 	assert.Equal(t, uint64(5), promoted, "advance only through the last chunk that had a context")
 	assert.Equal(t, []uint64{5}, fc.committed, "context-less chunk never committed")
+}
+
+func TestNewSlotCtxOmitsNilUnrootedTail(t *testing.T) {
+	var tail *unrootedTail
+	slotCtx := newSlotCtx(&b.Block{}, nil, nil, nil, tail, 0)
+	if slotCtx.UnrootedRead != nil {
+		t.Fatalf("nil tail stored as non-nil account reader: %T", slotCtx.UnrootedRead)
+	}
 }
 
 // Tail reads: overlay value wins; misses fall through to durable.
