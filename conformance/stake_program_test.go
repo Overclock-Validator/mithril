@@ -12,8 +12,7 @@ import (
 
 func TestConformance_Stake_Program(t *testing.T) {
 	basePath := "test-vectors/instr/fixtures/stake"
-	fileInfos, err := ioutil.ReadDir(basePath)
-	assert.NoError(t, err)
+	fileInfos := readFixtureDirOrSkip(t, basePath)
 
 	var fnames []string
 	for _, fileInfo := range fileInfos {
@@ -95,10 +94,7 @@ func TestConformance_Stake_Program_Single_Testcase(t *testing.T) {
 
 	fname := fmt.Sprintf("%s/%s", basePath, fn)
 
-	in, err := ioutil.ReadFile(fname)
-	if err != nil {
-		log.Fatalln("Error reading file:", err)
-	}
+	in := readFixtureOrSkip(t, fname)
 
 	fixture := &InstrFixture{}
 	if err := proto.Unmarshal(in, fixture); err != nil {
@@ -109,7 +105,7 @@ func TestConformance_Stake_Program_Single_Testcase(t *testing.T) {
 
 	printFixtureInfo(fixture)
 
-	err = execCtx.ProcessInstruction(fixture.Input.Data, instrAccts, []uint64{0})
+	err := execCtx.ProcessInstruction(fixture.Input.Data, instrAccts, []uint64{0})
 
 	instrCode := instrCodeFromFixtureInstrData(fixture)
 

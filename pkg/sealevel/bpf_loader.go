@@ -1368,6 +1368,19 @@ func addProgramToCache(execCtx *ExecutionCtx, programAddr solana.PublicKey, entr
 	execCtx.SlotCtx.AccountsDb.AddProgramToCache(programAddr, entry)
 }
 
+// removeProgramFromCache is the eviction counterpart of addProgramToCache and
+// carries the same guard. Eviction is a cache-coherence concern, not part of
+// the instruction's state transition, so an execution context with no slot
+// context -- a conformance fixture, or any other harness that drives the
+// runtime without an AccountsDb -- simply has nothing to evict. Calling through
+// unconditionally panicked instead.
+func removeProgramFromCache(execCtx *ExecutionCtx, programAddr solana.PublicKey) {
+	if execCtx.SlotCtx == nil || execCtx.SlotCtx.AccountsDb == nil {
+		return
+	}
+	execCtx.SlotCtx.AccountsDb.RemoveProgramFromCache(programAddr)
+}
+
 func mapVirtualAddressSpaceRunErr(execCtx *ExecutionCtx, err error, inputRegions []sbpf.InputRegion) error {
 	if err == nil {
 		return nil
@@ -2718,7 +2731,7 @@ func UpgradeableLoaderClose(execCtx *ExecutionCtx, txCtx *TransactionCtx, instrC
 					if err != nil {
 						return err
 					}
-					execCtx.SlotCtx.AccountsDb.RemoveProgramFromCache(closeKey)
+					removeProgramFromCache(execCtx, closeKey)
 				}
 
 			default:

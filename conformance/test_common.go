@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io/ioutil"
 	"math"
 	"os"
 	"testing"
@@ -29,6 +30,39 @@ func fixtureAcctStateToAccount(acctState *AcctState) accounts.Account {
 	acct.Executable = acctState.Executable
 	copy(acct.Owner[:], acctState.Owner)
 	return acct
+}
+
+// readFixtureDirOrSkip lists a fixture directory, skipping the test when the
+// pinned corpus does not carry that set.
+//
+// Upstream removed the native address-lookup-table, config and stake fixtures;
+// those programs are BPF-migrated on mainnet and their coverage now lives in
+// unit tests. The suites that read them asserted the directory existed, so they
+// failed permanently against any corpus revision that no longer ships it. A
+// missing fixture set is a property of the pinned revision, not a defect in
+// Mithril, so skipping is the accurate signal.
+func readFixtureDirOrSkip(t *testing.T, basePath string) []os.FileInfo {
+	t.Helper()
+	fileInfos, err := ioutil.ReadDir(basePath)
+	if err != nil {
+		t.Skipf("fixture set %q not present in the pinned corpus: %v", basePath, err)
+	}
+	return fileInfos
+}
+
+// readFixtureOrSkip reads a single fixture, skipping when it is absent.
+//
+// The single-testcase variants previously called log.Fatalln here, which exits
+// the process rather than failing the test: one missing fixture killed the
+// whole binary and every test after it silently never ran. That is the same
+// failure mode that once hid 19 BPF-loader failures behind a panicking test.
+func readFixtureOrSkip(t *testing.T, fname string) []byte {
+	t.Helper()
+	in, err := ioutil.ReadFile(fname)
+	if err != nil {
+		t.Skipf("fixture %q not present in the pinned corpus: %v", fname, err)
+	}
+	return in
 }
 
 func createProgramAcct(programId []byte) accounts.Account {
