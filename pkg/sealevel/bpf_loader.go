@@ -1799,6 +1799,24 @@ func UpgradeableLoaderDeployWithMaxDataLen(execCtx *ExecutionCtx, txCtx *Transac
 	}
 	defer buffer.Drop()
 
+	// Agave checks writability and ownership of the buffer before it looks at
+	// the buffer's state, and the order is observable: a non-loader-owned
+	// account whose data happens to deserialize as a Buffer would otherwise
+	// reach the authority comparison and report IncorrectAuthority instead of
+	// IncorrectProgramId. See agave/programs/bpf_loader/src/lib.rs:234-243
+	// (v4.2.0-rc.0, the Alpenglow release).
+	if !buffer.IsWritable() {
+		return InstrErrInvalidArgument
+	}
+
+	loaderProgramId, err := instrCtx.LastProgramKey(txCtx)
+	if err != nil {
+		return err
+	}
+	if buffer.Owner() != loaderProgramId {
+		return InstrErrIncorrectProgramId
+	}
+
 	bufferAcctState, err := UnmarshalUpgradeableLoaderState(buffer.Data())
 	if err != nil {
 		return err

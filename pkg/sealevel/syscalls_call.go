@@ -53,11 +53,19 @@ func SyscallGetReturnDataImpl(vm sbpf.VM, returnDataAddr, length, programIdAddr 
 			return syscallErr(err)
 		}
 
-		if len(returnData) != len(returnDataResult) {
+		// Compare against the clamped prefix, not the whole return data.
+		// Agave slices first -- from_slice = return_data.get(..length) -- so its
+		// two sides are equal by construction and the check only guards the
+		// translation. Comparing the full return data here rejected every call
+		// that asked for fewer bytes than were available, which is the ordinary
+		// case for a program reading a fixed-size header out of a longer
+		// result.
+		fromSlice := returnData[:length]
+		if len(fromSlice) != len(returnDataResult) {
 			return syscallErr(SyscallErrInvalidLength)
 		}
 
-		copy(returnDataResult, returnData)
+		copy(returnDataResult, fromSlice)
 
 		var programIdResult []byte
 		programIdResult, err = vm.Translate(programIdAddr, solana.PublicKeyLength, true)
