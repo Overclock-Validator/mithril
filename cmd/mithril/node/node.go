@@ -1177,6 +1177,7 @@ func runLive(c *cobra.Command, args []string) {
 
 	// Now start the metrics server (after banner so errors don't appear first)
 	statsd.StartMetricsServer()
+	statsd.PublishBuildInfo()
 
 	// Lightbringer sidecar management
 	var lbManager *lightbringer.Manager

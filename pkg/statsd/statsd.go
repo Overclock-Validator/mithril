@@ -11,6 +11,7 @@ import (
 
 	mithrilmetrics "github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/Overclock-Validator/mithril/pkg/version"
 )
 
 type metricType int
@@ -131,6 +132,12 @@ var (
 	Epoch                         = Metric{"epoch"}
 	Slot                          = Metric{"slot"}
 
+	// BuildInfo is the standard Prometheus build-identification pattern: a
+	// gauge fixed at 1 whose labels carry the identity. It exists so a scrape
+	// answers "what is this node running" without anyone having to ask the
+	// operator, which is the only way that question gets answered reliably.
+	BuildInfo = Metric{"build_info"}
+
 	TestCount = Metric{"test_count"} // used for testing purposes, not a real metric
 )
 
@@ -245,6 +252,7 @@ var MetricToType = map[Metric]metricType{
 	SnapshotWorkerPoolUtilization: GaugeT,
 	TasksSetIfSlotHigherQueueSize: GaugeT,
 	Epoch:                         GaugeT,
+	BuildInfo:                     GaugeT,
 	Slot:                          GaugeT,
 }
 var MetricToLabels = map[Metric][]string{
@@ -349,6 +357,7 @@ var MetricToLabels = map[Metric][]string{
 	SnapshotWorkerPoolUtilization: {"task"},
 	TasksSetIfSlotHigherQueueSize: {},
 	Epoch:                         {},
+	BuildInfo:                     {"version", "commit", "branch", "modified"},
 	Slot:                          {},
 
 	TestCount: {"test"}, // used for testing purposes, not a real metric
@@ -425,6 +434,21 @@ func StartMetricsServer() {
 			mlog.Log.Errorf("Prometheus metrics server failed: %v", err)
 		}
 	}()
+}
+
+// PublishBuildInfo emits the build_info gauge once, so a scrape of this node
+// reports its own identity. Called at startup; the value is always 1 and the
+// labels carry the payload, which is the conventional Prometheus shape for
+// identity metrics because it lets you group and diff by label.
+func PublishBuildInfo() {
+	id := version.Resolve()
+	modified := "false"
+	if id.Modified {
+		modified = "true"
+	}
+	if err := Gauge(BuildInfo, 1, []string{id.Version, id.Commit, id.Branch, modified}); err != nil {
+		mlog.Log.Errorf("failed to publish build_info metric: %v", err)
+	}
 }
 
 func initializeStatsdMetrics() Prometheusmetrics {
