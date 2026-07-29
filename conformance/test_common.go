@@ -40,15 +40,59 @@ func createProgramAcct(programId []byte) accounts.Account {
 	return programAcct
 }
 
+// fixtureDemotesProgramID reports whether a key called as this fixture's
+// program must be demoted to read-only.
+//
+// Agave's harness does not apply this itself — it builds an Instruction from
+// the fixture's raw flags (svm/src/conformance/instr/context.rs). The demotion
+// happens downstream: execute_instr_with_callback obtains a sanitized_message
+// from prepare_invoke_context_fields, and process_message ->
+// prepare_top_level_instructions builds each InstructionAccount with
+// message.is_writable(index), whose cache applies
+//
+//	is_program_id_write_demoted = is_key_called_as_program(..)
+//	                              && !is_upgradeable_loader_present(account_keys)
+//
+// (solana-message 4.2.3, src/lib.rs:198-203).
+//
+// Mithril reaches the runtime without a message layer here, so the rule has to
+// be applied where the instruction accounts are built. pkg/replay already
+// implements the identical rule for the production path
+// (pkg/replay/transaction.go:114 and isWritableForInstr at :195); this keeps
+// the conformance harness consistent with it.
+//
+// Verified against Agave v4.2.0-rc.0 (the Alpenglow cluster release) by running
+// fixture 008b7940dedeec1f02b4c38e6f1b1c4be741e7c6_3491250 through Agave's own
+// harness with the privilege loop instrumented. Agave reported
+// caller(writable=false) for the program account where Mithril reported true,
+// which is exactly this demotion.
+func fixtureDemotesProgramID(fixture *InstrFixture) bool {
+	for _, acct := range fixture.Input.Accounts {
+		if bytes.Equal(acct.Address, a.BpfLoaderUpgradeableAddr[:]) {
+			return false
+		}
+	}
+	return true
+}
+
 func instructionAcctsFromFixture(fixture *InstrFixture, transactionAccts sealevel.TransactionAccounts) []sealevel.InstructionAccount {
 	accts := fixture.Input.Accounts
 	fixtureInstrAccts := fixture.Input.InstrAccounts
+
+	programID := fixture.Input.ProgramId
+	demoteProgramID := fixtureDemotesProgramID(fixture)
 
 	acctMetas := make([]sealevel.AccountMeta, 0)
 	for count := 0; count < len(fixtureInstrAccts); count++ {
 		thisInstrAcct := fixtureInstrAccts[count]
 		acctKey := accts[thisInstrAcct.Index].Address
-		acctMeta := sealevel.AccountMeta{Pubkey: solana.PublicKeyFromBytes(acctKey), IsSigner: fixtureInstrAccts[count].IsSigner, IsWritable: fixtureInstrAccts[count].IsWritable}
+
+		isWritable := fixtureInstrAccts[count].IsWritable
+		if demoteProgramID && bytes.Equal(acctKey, programID) {
+			isWritable = false
+		}
+
+		acctMeta := sealevel.AccountMeta{Pubkey: solana.PublicKeyFromBytes(acctKey), IsSigner: fixtureInstrAccts[count].IsSigner, IsWritable: isWritable}
 		acctMetas = append(acctMetas, acctMeta)
 	}
 
