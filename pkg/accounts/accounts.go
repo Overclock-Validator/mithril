@@ -110,8 +110,19 @@ func (a *Account) Resize(newLen uint64, fillVal byte) {
 	if newLen > currentDataLen { // extend, copy existing data, and fill the new excess with fillVal
 		newData := make([]byte, newLen)
 		copy(newData, a.Data)
-		for count := uint64(currentDataLen); count < newLen; count++ {
-			newData[count] = fillVal
+		// make already returns zeroed memory, so a zero fill needs no second
+		// pass. Both callers pass 0, and account data runs to
+		// MAX_PERMITTED_DATA_LENGTH, so the previous byte-at-a-time loop could
+		// rewrite ten megabytes of already-zero bytes on a single allocate.
+		//
+		// The non-zero path uses `for i := range tail` because that shape is
+		// what the compiler recognises and lowers to a memset; the original
+		// indexed loop over an offset range is not.
+		if fillVal != 0 {
+			tail := newData[currentDataLen:]
+			for i := range tail {
+				tail[i] = fillVal
+			}
 		}
 		a.Data = newData
 	} else { // truncate
