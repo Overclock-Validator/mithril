@@ -426,7 +426,11 @@ func (voteState *VoteState0_23_5) UnmarshalWithDecoder(decoder *bin.Decoder) err
 	}
 
 	voteState.Votes.Clear()
-	voteState.Votes.SetBaseCap(int(numLockouts))
+	baseCap, err := boundedElementCount(numLockouts, decoder, InstrErrInvalidAccountData)
+	if err != nil {
+		return err
+	}
+	voteState.Votes.SetBaseCap(baseCap)
 	for count := uint64(0); count < numLockouts; count++ {
 		var lockout VoteLockout
 		err = lockout.UnmarshalWithDecoder(decoder)
@@ -749,7 +753,11 @@ func (voteState *VoteState1_14_11) UnmarshalWithDecoder(decoder *bin.Decoder) er
 	}
 
 	voteState.Votes.Clear()
-	voteState.Votes.SetBaseCap(int(numLockouts))
+	baseCap, err := boundedElementCount(numLockouts, decoder, InstrErrInvalidAccountData)
+	if err != nil {
+		return err
+	}
+	voteState.Votes.SetBaseCap(baseCap)
 	for count := uint64(0); count < numLockouts; count++ {
 		var lockout VoteLockout
 		err = lockout.UnmarshalWithDecoder(decoder)
@@ -872,6 +880,29 @@ func (voteState *VoteState1_14_11) MarshalWithEncoder(encoder *bin.Encoder) erro
 	return err
 }
 
+// boundedElementCount rejects a decoded element count that the remaining
+// buffer cannot possibly contain.
+//
+// These counts are read straight out of account or instruction data, which is
+// attacker-influenceable, and were passed to allocators unchecked. That
+// panicked two ways: int(n) is negative for any value above MaxInt64, which
+// makes slices.Grow panic with "cannot be negative" and deque SetBaseCap panic
+// with "makeslice: len out of range"; and a merely large value asks for an
+// enormous allocation. Every element costs at least one byte on the wire, so
+// a count exceeding the bytes left is malformed by construction -- a
+// deliberately loose bound, chosen because it cannot be wrong for any element
+// type, where a per-type size could drift out of sync with the struct.
+//
+// Turning these into decode errors matters beyond tidiness: a panic here is
+// reachable from account data and takes the process down rather than rejecting
+// one instruction.
+func boundedElementCount(n uint64, decoder *bin.Decoder, malformed error) (int, error) {
+	if n > uint64(decoder.Remaining()) {
+		return 0, malformed
+	}
+	return int(n), nil
+}
+
 func (voteState *VoteState) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 	nodePk, err := decoder.ReadBytes(solana.PublicKeyLength)
 	if err != nil {
@@ -896,7 +927,11 @@ func (voteState *VoteState) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 	}
 
 	voteState.Votes.Clear()
-	voteState.Votes.SetBaseCap(int(numLockouts))
+	baseCap, err := boundedElementCount(numLockouts, decoder, InstrErrInvalidAccountData)
+	if err != nil {
+		return err
+	}
+	voteState.Votes.SetBaseCap(baseCap)
 	for count := uint64(0); count < numLockouts; count++ {
 		var landedVote LandedVote
 		err = landedVote.UnmarshalWithDecoder(decoder)
@@ -934,7 +969,11 @@ func (voteState *VoteState) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 		return err
 	}
 
-	voteState.EpochCredits = slices.Grow(voteState.EpochCredits, int(numEpochCredits))
+	growBy, err := boundedElementCount(numEpochCredits, decoder, InstrErrInvalidAccountData)
+	if err != nil {
+		return err
+	}
+	voteState.EpochCredits = slices.Grow(voteState.EpochCredits, growBy)
 	for count := uint64(0); count < numEpochCredits; count++ {
 		var epochCredits EpochCredits
 		err = epochCredits.UnmarshalWithDecoder(decoder)
@@ -1083,7 +1122,11 @@ func (voteState *VoteState4) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 	}
 
 	voteState.Votes.Clear()
-	voteState.Votes.SetBaseCap(int(numLockouts))
+	baseCap, err := boundedElementCount(numLockouts, decoder, InstrErrInvalidAccountData)
+	if err != nil {
+		return err
+	}
+	voteState.Votes.SetBaseCap(baseCap)
 	for count := uint64(0); count < numLockouts; count++ {
 		var landedVote LandedVote
 		err = landedVote.UnmarshalWithDecoder(decoder)
@@ -1116,7 +1159,11 @@ func (voteState *VoteState4) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 		return err
 	}
 
-	voteState.EpochCredits = slices.Grow(voteState.EpochCredits, int(numEpochCredits))
+	growBy, err := boundedElementCount(numEpochCredits, decoder, InstrErrInvalidAccountData)
+	if err != nil {
+		return err
+	}
+	voteState.EpochCredits = slices.Grow(voteState.EpochCredits, growBy)
 	for count := uint64(0); count < numEpochCredits; count++ {
 		var epochCredits EpochCredits
 		err = epochCredits.UnmarshalWithDecoder(decoder)

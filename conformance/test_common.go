@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"math"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
@@ -342,8 +343,45 @@ func newExecCtxAndInstrAcctsFromFixture(fixture *InstrFixture) (*sealevel.Execut
 	execCtx.Accounts = accounts.NewMemAccounts()
 	configureSysvars(&execCtx, fixture)
 	parseAndConfigureFeatures(&execCtx, fixture)
+	// After configureSysvars: the slot context's blockhash is read out of the
+	// RecentBlockhashes sysvar, which has to be populated first.
+	configureInstrSlotCtx(&execCtx)
 
 	return &execCtx, instrAccts
+}
+
+// configureInstrSlotCtx gives the instruction harness a slot context.
+//
+// Without one, any handler reaching execCtx.SlotCtx panicked on a nil
+// dereference -- SystemProgramInitializeNonceAccount at
+// pkg/sealevel/system_program.go:1371 reads SlotCtx.LastBlockhash, and
+// blockhash_nonce.go does the same in two more places. A panic here is worse
+// than a wrong answer: it takes the whole test binary down and hides every
+// fixture after it.
+//
+// LastBlockhash is taken from the last entry of the RecentBlockhashes sysvar,
+// mirroring Agave's harness, which derives the same value via
+// recent_blockhash(sysvar_cache) -> get_recent_blockhashes().last()
+// (agave/svm/src/conformance/setup.rs:143-150). Taking it from the sysvar
+// rather than leaving it zero matters: the durable nonce is derived from this
+// blockhash, so a zero value would produce a wrong nonce rather than no nonce.
+func configureInstrSlotCtx(execCtx *sealevel.ExecutionCtx) {
+	slotCtx := &sealevel.SlotCtx{
+		Accounts:      accounts.NewMemAccounts(),
+		ParentAccts:   accounts.NewMemAccounts(),
+		AcctMapsMu:    &sync.Mutex{},
+		ModifiedAccts: make(map[solana.PublicKey]bool),
+		WritableAccts: make(map[solana.PublicKey]bool),
+		Features:      &execCtx.Features,
+	}
+
+	if entries, err := sealevel.ReadRecentBlockHashesSysvar(execCtx); err == nil && len(entries) > 0 {
+		last := entries[len(entries)-1]
+		slotCtx.LastBlockhash = last.Blockhash
+		slotCtx.Blockhash = last.Blockhash
+	}
+
+	execCtx.SlotCtx = slotCtx
 }
 
 func returnValueIsExpectedValue(fixture *InstrFixture, err error) bool {
