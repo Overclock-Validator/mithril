@@ -361,6 +361,17 @@ func setUpgradeableLoaderAccountState(acct *BorrowedAccount, state *UpgradeableL
 		return err
 	}
 
+	// Reject a state that does not fit rather than writing a prefix of it.
+	// Agave's BorrowedAccount::set_state compares the serialized size against
+	// the account's data length and returns AccountDataTooSmall
+	// (transaction-context/src/instruction_accounts.rs:259-268). Go's copy
+	// silently truncates to the shorter operand, so without this check a
+	// too-small account received a partial state and the instruction reported
+	// success.
+	if len(acctStateBytes) > len(acct.Data()) {
+		return InstrErrAccountDataTooSmall
+	}
+
 	newStateBytes := make([]byte, len(acct.Data()))
 	copy(newStateBytes, acct.Data())
 	copy(newStateBytes, acctStateBytes)
