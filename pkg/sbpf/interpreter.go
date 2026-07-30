@@ -232,7 +232,12 @@ mainLoop:
 		// mainnet gave them. Neither verifier requires the last instruction to
 		// be exit -- Agave's only rejects a truncated lddw (verifier.rs:416) --
 		// so a one-instruction program reaches this.
-		err = ip.computeMeter.Consume(1)
+		// ConsumeOne rather than Consume(1) so this inlines. Run is a "big"
+		// function in the inliner's model, which caps callees at cost 20;
+		// Consume is 22, so this call was real, and it spilled pc and the
+		// instruction counter around itself every iteration. See ConsumeOne's
+		// comment for why the two are equivalent.
+		err = ip.computeMeter.ConsumeOne()
 		if err != nil {
 			break mainLoop
 		}
