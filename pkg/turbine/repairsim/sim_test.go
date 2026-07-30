@@ -118,6 +118,10 @@ func TestCompleteDeliveryEstablishesZeroRepairBaseline(t *testing.T) {
 	if result.RepairRequests != 0 || result.LocallyRecoveredDataShreds != 0 {
 		t.Fatalf("baseline requests=%d recovered=%d, want zero", result.RepairRequests, result.LocallyRecoveredDataShreds)
 	}
+	if result.ShredEd25519Verifications != 4 || result.ShredSignatureCacheHits != 124 {
+		t.Fatalf("signature cache verifies=%d hits=%d, want 4/124 for four FEC roots",
+			result.ShredEd25519Verifications, result.ShredSignatureCacheHits)
+	}
 }
 
 func TestDeepCatchupMixedUsesThresholdRecovery(t *testing.T) {

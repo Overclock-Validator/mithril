@@ -124,6 +124,8 @@ type Result struct {
 	CanceledOrLateResponses    uint64                   `json:"canceled_or_late_responses"`
 	LostResponses              uint64                   `json:"lost_responses"`
 	RejectedCorruptResponses   uint64                   `json:"rejected_corrupt_responses"`
+	ShredSignatureCacheHits    uint64                   `json:"shred_signature_cache_hits"`
+	ShredEd25519Verifications  uint64                   `json:"shred_ed25519_verifications"`
 	QueueHighWater             int                      `json:"queue_high_water"`
 	SpoolBytes                 int64                    `json:"spool_bytes"`
 	SpoolCompleteSlots         int                      `json:"spool_complete_slots"`
@@ -231,6 +233,7 @@ func Run(ledger *Ledger, cfg Config) (Result, error) {
 	result.Allocations = memAfter.Mallocs - memBefore.Mallocs
 	result.StageCPU = s.stageCPU
 	result.Trace = s.trace
+	result.ShredSignatureCacheHits, result.ShredEd25519Verifications = s.shredVerifier.Stats()
 	result.Limitations = []string{
 		"remote peers and latency are simulated in process; no UDP/IP stack is measured",
 		"synthetic entries contain no transactions, so transaction execution is not measured",
@@ -261,6 +264,7 @@ type simulation struct {
 	ledger         *Ledger
 	cfg            Config
 	assembler      *turbine.SlotAssembler
+	shredVerifier  turbine.ShredSignatureVerifier
 	spool          *turbine.ShredSpool
 	rng            *rand.Rand
 	now            time.Duration
@@ -523,7 +527,7 @@ func (s *simulation) ingest(packet Packet, fromRepair, corrupt bool) error {
 		return err
 	}
 	started = time.Now()
-	err = shred.VerifySignature(s.ledger.LeaderPub)
+	err = s.shredVerifier.Verify(shred, s.ledger.LeaderPub)
 	s.stageCPU["shred_validation"] += time.Since(started)
 	if err != nil {
 		return err
