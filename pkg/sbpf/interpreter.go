@@ -200,6 +200,9 @@ func (ip *Interpreter) executeJmp32(ins Slot, pc int64, r *[11]uint64) (int64, e
 //
 // This function may panic given code that doesn't pass the static verifier.
 func (ip *Interpreter) Run() (ret uint64, cuConsumed uint64, err error) {
+	if sbpfProfileEnabled {
+		defer profileRun(profileNow())
+	}
 	var r [11]uint64
 	r[1] = VaddrInput
 	r[2] = ip.inputDataVaddr
@@ -250,6 +253,9 @@ mainLoop:
 			}
 		}
 		ins := ip.getSlot(pc)
+		if sbpfProfileEnabled {
+			profileInstruction(ins.Op())
+		}
 		if ip.enableTracing {
 			regsDump := fmt.Sprintf("%016x, %016x, %016x, %016x, %016x, %016x, %016x, %016x, %016x, %016x, %016x",
 				r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10])
@@ -1050,7 +1056,11 @@ mainLoop:
 						err = ExcCallDest{ins.Uimm()}
 						break
 					}
+					scStart := profileNow()
 					r[0], err = sc.Invoke(ip, r[1], r[2], r[3], r[4], r[5])
+					if sbpfProfileEnabled {
+						profileSyscall(ins.Uimm(), scStart)
+					}
 					if err != nil {
 						err = ExcSyscallError{Err: err}
 					}
@@ -1070,7 +1080,11 @@ mainLoop:
 				}
 			} else {
 				if sc, ok := ip.syscalls(ins.Uimm()); ok {
+					scStart := profileNow()
 					r[0], err = sc.Invoke(ip, r[1], r[2], r[3], r[4], r[5])
+					if sbpfProfileEnabled {
+						profileSyscall(ins.Uimm(), scStart)
+					}
 					if err != nil {
 						err = ExcSyscallError{Err: err}
 					}
