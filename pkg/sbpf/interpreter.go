@@ -218,6 +218,25 @@ func (ip *Interpreter) Run() (ret uint64, cuConsumed uint64, err error) {
 
 mainLoop:
 	for i := 0; true; i++ {
+		// Charge before fetching, matching Agave solana-sbpf 0.21.1
+		// interpreter.rs:188-193, which tests the instruction meter and only
+		// then bounds-checks pc. Two observables depend on this order:
+		//
+		//   - the instruction that runs off the end of the text section is
+		//     still charged. Agave increments due_insn_count at :191 and
+		//     throws ExecutionOverrun at :193, so it bills that step;
+		//   - an exhausted meter takes precedence over the overrun.
+		//
+		// Checking pc first billed one CU less for every overrun, which left
+		// later instructions in the same transaction a larger budget than
+		// mainnet gave them. Neither verifier requires the last instruction to
+		// be exit -- Agave's only rejects a truncated lddw (verifier.rs:416) --
+		// so a one-instruction program reaches this.
+		err = ip.computeMeter.Consume(1)
+		if err != nil {
+			break mainLoop
+		}
+
 		// Fetch
 		if pc < 0 || pc >= int64(len(ip.text)) {
 			return 0, 0, &Exception{
@@ -231,11 +250,6 @@ mainLoop:
 				r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10])
 			fmt.Printf("% 5d [%s]: %s\n",
 				i, strings.ToUpper(regsDump), ip.disassemble(ins, 0))
-		}
-
-		err = ip.computeMeter.Consume(1)
-		if err != nil {
-			break mainLoop
 		}
 
 		// Execute
