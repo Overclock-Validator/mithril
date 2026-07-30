@@ -113,7 +113,7 @@ func (ip *Interpreter) Finish() {
 	ip.stack.Finish()
 }
 
-func (ip *Interpreter) executeJmp32(ins Slot, pc int64, r *[11]uint64) (int64, error) {
+func (ip *Interpreter) executeJmp32(ins Slot, pc int64, r *[16]uint64) (int64, error) {
 	var taken bool
 	dst := uint32(r[ins.Dst()])
 	src := uint32(r[ins.Src()])
@@ -203,7 +203,7 @@ func (ip *Interpreter) Run() (ret uint64, cuConsumed uint64, err error) {
 	if sbpfProfileEnabled {
 		defer profileRun(profileNow())
 	}
-	var r [11]uint64
+	var r [16]uint64
 	r[1] = VaddrInput
 	r[2] = ip.inputDataVaddr
 
