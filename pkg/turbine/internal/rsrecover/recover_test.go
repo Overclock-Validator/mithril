@@ -145,6 +145,13 @@ func TestRecoverOneDataAllPositionsAndCodingRows(t *testing.T) {
 			if !bytes.Equal(dst, original[missing]) {
 				t.Fatalf("missing=%d coding=%d: recovered bytes differ", missing, coding)
 			}
+			fastDst := bytes.Repeat([]byte{0x5a}, len(original[missing]))
+			if err := RecoverOneData(presence, missing, available, fastDst); err != nil {
+				t.Fatalf("fast missing=%d coding=%d: %v", missing, coding, err)
+			}
+			if !bytes.Equal(fastDst, dst) {
+				t.Fatalf("fast missing=%d coding=%d: direct rows differ", missing, coding)
+			}
 			if coding == 0 {
 				reference = append([]byte(nil), dst...)
 			} else if !bytes.Equal(dst, reference) {
@@ -175,6 +182,14 @@ func TestRecoverOneDataRejectsUnsafePatternsAtomically(t *testing.T) {
 	}
 	if !bytes.Equal(dst, want) {
 		t.Fatal("destination changed after a validation error")
+	}
+	fastDst := bytes.Repeat([]byte{0x4e}, len(original[0]))
+	fastWant := append([]byte(nil), fastDst...)
+	if err := RecoverOneData(presence, 7, changed, fastDst); !errors.Is(err, ErrPatternChanged) {
+		t.Fatalf("fast changed pattern error = %v, want ErrPatternChanged", err)
+	}
+	if !bytes.Equal(fastDst, fastWant) {
+		t.Fatal("fast destination changed after a validation error")
 	}
 
 	insufficient := availableFixture(original, []int{7, 8}, []int{3})

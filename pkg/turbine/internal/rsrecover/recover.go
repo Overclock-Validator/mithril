@@ -3,6 +3,7 @@ package rsrecover
 import (
 	"errors"
 	"fmt"
+	"math/bits"
 	"sync"
 
 	"github.com/klauspost/reedsolomon"
@@ -27,6 +28,12 @@ var (
 	allCodingEncoderOnce sync.Once
 	allCodingEncoder     reedsolomon.Encoder
 	allCodingEncoderErr  error
+
+	// oneDataCoefficientRows[missing][coding] contains one coefficient for
+	// each data input followed by the selected coding input. Every one of the
+	// fixed 32x32 rows is exhaustively differential-tested against the general
+	// Reed-Solomon decoder.
+	oneDataCoefficientRows [DataShards][CodingShards][DataShards + 1]byte
 )
 
 func init() {
@@ -41,6 +48,22 @@ func init() {
 	}
 	for exponent := 255; exponent < len(gfExp); exponent++ {
 		gfExp[exponent] = gfExp[exponent-255]
+	}
+	for missing := 0; missing < DataShards; missing++ {
+		for coding := 0; coding < CodingShards; coding++ {
+			// If c = sum(a_i*d_i), then the missing d_m is
+			// inv(a_m) * (c + sum(i != m, a_i*d_i)) over GF(2^8).
+			coefficientInv := reedsolomon.Inv(codingCoefficient(coding, missing))
+			for data := 0; data < DataShards; data++ {
+				if data != missing {
+					oneDataCoefficientRows[missing][coding][data] = gfMul(
+						coefficientInv,
+						codingCoefficient(coding, data),
+					)
+				}
+			}
+			oneDataCoefficientRows[missing][coding][DataShards] = coefficientInv
+		}
 	}
 }
 
@@ -172,6 +195,52 @@ func (plan *OneDataPlan) Recover(shards [][]byte, dst []byte) error {
 	if first {
 		clear(dst)
 	}
+	return nil
+}
+
+// RecoverOneData uses a process-wide table of coefficient rows that are
+// exhaustively differential-tested against the general decoder.
+// for the fixed 32+32 matrix. It is the setup-free counterpart to
+// PrepareRecoverOneData for a changing stream of one-missing FEC patterns.
+// Validation completes before dst is modified.
+func RecoverOneData(presence uint64, missingDataIndex int, shards [][]byte, dst []byte) error {
+	if missingDataIndex < 0 || missingDataIndex >= DataShards {
+		return fmt.Errorf("%w: missing data index %d", ErrInvalidPattern, missingDataIndex)
+	}
+	const dataMask = uint64(1)<<DataShards - 1
+	wantData := dataMask &^ (uint64(1) << missingDataIndex)
+	if presence&dataMask != wantData {
+		return fmt.Errorf("%w: data presence %#08x, want %#08x", ErrInvalidPattern, presence&dataMask, wantData)
+	}
+	codingMask := uint32(presence >> DataShards)
+	if codingMask == 0 {
+		return fmt.Errorf("%w: no coding shard is available", ErrInvalidPattern)
+	}
+	shardSize, err := validateExecution(presence, shards, [][]byte{dst})
+	if err != nil {
+		return err
+	}
+	if len(dst) != shardSize {
+		return fmt.Errorf("%w: destination has %d bytes, want %d", ErrInvalidBuffers, len(dst), shardSize)
+	}
+
+	codingPosition := bits.TrailingZeros32(codingMask)
+	row := &oneDataCoefficientRows[missingDataIndex][codingPosition]
+	var lowLevel reedsolomon.LowLevel
+	first := true
+	for dataIndex := 0; dataIndex < DataShards; dataIndex++ {
+		coefficient := row[dataIndex]
+		if coefficient == 0 {
+			continue
+		}
+		if first {
+			lowLevel.GalMulSlice(coefficient, shards[dataIndex], dst)
+			first = false
+		} else {
+			lowLevel.GalMulSliceXor(coefficient, shards[dataIndex], dst)
+		}
+	}
+	lowLevel.GalMulSliceXor(row[DataShards], shards[DataShards+codingPosition], dst)
 	return nil
 }
 

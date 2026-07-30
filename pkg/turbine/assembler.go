@@ -10,6 +10,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/statsd"
+	"github.com/Overclock-Validator/mithril/pkg/turbine/internal/rsrecover"
 	"github.com/gagliardetto/solana-go"
 	"github.com/klauspost/reedsolomon"
 )
@@ -1300,20 +1301,42 @@ func (a *SlotAssembler) recoverFEC(state *slotState, fecSetIndex uint32) ([]*Shr
 		}
 		shards[int(layout.dataShreds)+int(pos)] = shard
 	}
-	encoder, err := a.fecEncoder(layout)
-	if err != nil {
-		return nil, err
-	}
-	required := make([]bool, int(layout.dataShreds)+int(layout.codingShreds))
 	var missingData int
+	missingDataIndex := -1
 	for idx := 0; idx < int(layout.dataShreds); idx++ {
 		if fec.data[uint32(idx)] == nil {
-			required[idx] = true
 			missingData++
+			missingDataIndex = idx
 		}
 	}
 	if missingData == 0 {
 		return nil, nil
+	}
+	if missingData == 1 &&
+		layout.dataShreds == rsrecover.DataShards &&
+		layout.codingShreds == rsrecover.CodingShards {
+		presence, err := rsrecover.Presence(shards)
+		if err != nil {
+			return nil, err
+		}
+		dst := make([]byte, layout.shardSize)
+		if err := rsrecover.RecoverOneData(presence, missingDataIndex, shards, dst); err != nil {
+			return nil, fmt.Errorf("recover one FEC data shred slot %d fec_set=%d: %w", state.slot, fecSetIndex, err)
+		}
+		shred, err := fec.recoveredDataShred(uint32(missingDataIndex), dst)
+		if err != nil {
+			return nil, err
+		}
+		return []*Shred{shred}, nil
+	}
+
+	required := make([]bool, int(layout.dataShreds)+int(layout.codingShreds))
+	for idx := 0; idx < int(layout.dataShreds); idx++ {
+		required[idx] = fec.data[uint32(idx)] == nil
+	}
+	encoder, err := a.fecEncoder(layout)
+	if err != nil {
+		return nil, err
 	}
 	if err := encoder.ReconstructSome(shards, required); err != nil {
 		if errors.Is(err, reedsolomon.ErrTooFewShards) {
