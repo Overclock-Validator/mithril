@@ -18,5 +18,5 @@ Also report:
 - queue high-water mark;
 - spool bytes and complete slots;
 - allocations;
+- shred-signature cache hits and actual Ed25519 verifications;
 - every limitation emitted in the JSON result.
-

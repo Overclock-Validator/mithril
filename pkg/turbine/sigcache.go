@@ -20,7 +20,13 @@ import (
 // hit reproduces exactly the result of re-running it on the same inputs.
 // Tampered content can never hit — different bytes yield a different root,
 // hence a different key. Failures are never cached.
-type shredSigCache struct {
+// ShredSignatureVerifier authenticates Merkle shreds with the same bounded,
+// per-root result cache used by UDPReceiver. The cache never stores failures;
+// each packet's Merkle proof is still evaluated before a cache lookup.
+//
+// It is exported so deterministic and loopback ingress harnesses can exercise
+// production validation without constructing a UDPReceiver.
+type ShredSignatureVerifier struct {
 	mu   sync.Mutex
 	cur  map[shredSigCacheKey]struct{}
 	prev map[shredSigCacheKey]struct{}
@@ -28,6 +34,10 @@ type shredSigCache struct {
 	hits     atomic.Uint64
 	verifies atomic.Uint64
 }
+
+// Keep the internal receiver/test name as an alias; there is one
+// implementation and one cache contract.
+type shredSigCache = ShredSignatureVerifier
 
 type shredSigCacheKey struct {
 	leader solana.PublicKey
@@ -42,7 +52,7 @@ const shredSigCacheGenCap = 4096
 
 // verifyShred authenticates a shred exactly like Shred.VerifySignature, with
 // the per-root ed25519 result cached.
-func (c *shredSigCache) verifyShred(s *Shred, leader solana.PublicKey) error {
+func (c *ShredSignatureVerifier) verifyShred(s *Shred, leader solana.PublicKey) error {
 	root, err := s.MerkleRoot()
 	if err != nil {
 		return err
@@ -74,7 +84,13 @@ func (c *shredSigCache) verifyShred(s *Shred, leader solana.PublicKey) error {
 	return nil
 }
 
-func (c *shredSigCache) addLocked(key shredSigCacheKey) {
+// Verify authenticates one shred and retains successful root/signature tuples
+// for sibling shreds in the same FEC set.
+func (c *ShredSignatureVerifier) Verify(s *Shred, leader solana.PublicKey) error {
+	return c.verifyShred(s, leader)
+}
+
+func (c *ShredSignatureVerifier) addLocked(key shredSigCacheKey) {
 	if c.cur == nil {
 		c.cur = make(map[shredSigCacheKey]struct{}, shredSigCacheGenCap)
 	}
@@ -85,6 +101,11 @@ func (c *shredSigCache) addLocked(key shredSigCacheKey) {
 	c.cur[key] = struct{}{}
 }
 
-func (c *shredSigCache) stats() (hits, verifies uint64) {
+func (c *ShredSignatureVerifier) stats() (hits, verifies uint64) {
 	return c.hits.Load(), c.verifies.Load()
+}
+
+// Stats reports cache hits and actual Ed25519 verifications.
+func (c *ShredSignatureVerifier) Stats() (hits, verifies uint64) {
+	return c.stats()
 }

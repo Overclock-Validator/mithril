@@ -47,6 +47,7 @@ func main() {
 		corrupt      = flag.Int("corrupt-responses", 0, "corrupt the first N repair responses")
 		naturalLate  = flag.Bool("natural-late", true, "schedule selected late live shreds during repair")
 		spoolDir     = flag.String("spool-dir", "", "persistent shred-spool directory (empty uses a temporary directory)")
+		cpuLabel     = flag.String("cpu-label", "", "explicit CPU label when platform discovery is unavailable")
 		output       = flag.String("output", "", "write JSON to this file instead of stdout")
 		includeTrace = flag.Bool("trace", true, "include the logical event trace in JSON")
 	)
@@ -90,8 +91,12 @@ func main() {
 	if err != nil {
 		fatalf("run simulation: %v", err)
 	}
+	cpu := *cpuLabel
+	if cpu == "" {
+		cpu = cpuModel()
+	}
 	report := report{
-		Environment: environment{GoVersion: runtime.Version(), GOOS: runtime.GOOS, GOARCH: runtime.GOARCH, CPU: cpuModel()},
+		Environment: environment{GoVersion: runtime.Version(), GOOS: runtime.GOOS, GOARCH: runtime.GOARCH, CPU: cpu},
 		Ledger:      ledger.Config, Network: network, LedgerGenerationWall: generationWall, Result: result,
 	}
 	encoded, err := json.MarshalIndent(report, "", "  ")

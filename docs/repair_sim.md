@@ -18,7 +18,7 @@ network realism or alternative scheduling policies are introduced.
 | block-component serialization | production `turbine.MarshalBlockComponent` |
 | 32+32 FEC generation and Merkle signing | production `turbine.Shredder` |
 | missing-shred selection | production `SlotAssembler.RepairRequests` |
-| packet parsing and Merkle/signature validation | production `ParseShred` and `VerifySignature` |
+| packet parsing and Merkle/signature validation | production `ParseShred` and `ShredSignatureVerifier` (the receiver's per-root cache) |
 | verified-shred insertion | production `ShredSpool` |
 | threshold detection and Reed-Solomon recovery | production `SlotAssembler.AddShredFrom` |
 | component decode and transaction-signature gate | production slot completion path |
@@ -64,6 +64,7 @@ go run ./cmd/repair-sim \
   -slots=200 \
   -fec-sets=4 \
   -seed=1 \
+  -cpu-label='Ryzen 7 9700X' \
   -output=/tmp/repair-near.json
 
 go run ./cmd/repair-sim \
@@ -146,4 +147,3 @@ local spool already holds most FEC thresholds.
 4. Run replay execution against a reusable synthetic bank fixture.
 5. Compare ordinary requests with explicit test-only threshold-acquisition and
    earliest-blocked-slot policies.
-
