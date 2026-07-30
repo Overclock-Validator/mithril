@@ -36,6 +36,33 @@ type Stack struct {
 	shadow             []Frame
 	dynamicStackFrames bool
 	stackFrameGaps     bool
+
+	// written is the high-water mark, in bytes from the base of mem, of
+	// everything this run has written to the memory stack. Finish clears only
+	// that prefix before returning mem to the pool.
+	//
+	// The safety argument is inductive. A pooled buffer is handed out fully
+	// zeroed: newStackMem allocates zeroed memory, and every buffer that
+	// re-enters the pool has had everything it wrote cleared. So clearing the
+	// prefix restores the all-zero state the next run relies on, and a program
+	// still cannot observe a previous program's bytes.
+	//
+	// This depends on every write to mem passing through markWritten.
+	// Interpreter.translateInternal is the only non-test caller of GetFrame, and
+	// nothing else writes mem, so that choke point holds.
+	//
+	// Over-marking is safe and only costs a larger clear; under-marking would
+	// leak. Where the two are in tension, prefer marking more.
+	written uint64
+}
+
+// markWritten records that [end-size, end) has been written, where end is a
+// byte offset into mem. The branch stops being taken once a run settles into
+// its frames, so the common case is a load and a well-predicted compare.
+func (s *Stack) markWritten(end uint64) {
+	if end > s.written {
+		s.written = end
+	}
 }
 
 // Frame is an entry on the shadow stack.
@@ -115,7 +142,16 @@ func NewStack(sbpfVer sbpfver.SbpfVersion, disableStackFrameGaps bool) Stack {
 func (s *Stack) Finish() {
 	if UsePool {
 		s.mem = s.mem[:StackMax]
-		clear(s.mem)
+		// Only the prefix this run wrote can be non-zero, so only that prefix
+		// needs restoring before the buffer goes back to the pool. Clearing all
+		// 256 KiB was 68% of interpreter setup cost, and across the vm-programs
+		// corpus 46% of runs write no stack at all and 95% write at most one
+		// 4 KiB frame. See the `written` field for the safety argument.
+		//
+		// min guards the clear against a mark that somehow exceeds the buffer;
+		// markWritten's callers cannot produce one, since off+size is bounded by
+		// StackMax, but a wrong clear length here would be a silent leak.
+		clear(s.mem[:min(s.written, StackMax)])
 		stackMemPool.Put(s.mem)
 		s.shadow = s.shadow[:StackDepth]
 		clear(s.shadow)

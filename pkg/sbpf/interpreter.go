@@ -1217,6 +1217,13 @@ func (ip *Interpreter) translateInternal(addr uint64, size uint64, write bool) (
 		if size == 0 {
 			return emptySlice, nil
 		}
+		if write {
+			// The only place stack memory is handed out for writing, which is
+			// what lets Stack.Finish clear a prefix instead of all 256 KiB.
+			// GetFrame returns mem[off:], so off is StackMax-len(mem) -- already
+			// gap-remapped, so this is the physical offset into the buffer.
+			ip.stack.markWritten(StackMax - uint64(len(mem)) + size)
+		}
 		return unsafe.Pointer(&mem[0]), nil
 	case VaddrHeap >> 32:
 		if size == 0 {
