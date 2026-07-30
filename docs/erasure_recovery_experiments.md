@@ -1,6 +1,8 @@
 # Erasure recovery experiments
 
-Status: experimental; no production `SlotAssembler` dispatch uses these paths.
+Status: `SlotAssembler` dispatches the fixed 32+32, exactly-one-missing-data
+case to the direct recovery path. Reduced multi-missing and all-coding paths
+remain experimental and are not used by production dispatch.
 
 The end-to-end deterministic harness that drives production repair selection,
 assembly, storage, and completion is documented in [repair_sim.md](repair_sim.md).
@@ -68,6 +70,11 @@ D_m = C[r,m]^-1 * P_r
 This prepares one 32-source coefficient row and writes one destination. It does
 not construct or invert a general 32x32 matrix.
 
+Production uses a process-wide table containing every missing-data and
+coding-row combination. This removes per-call plan construction while keeping
+the same equation. The table is exhaustively differential-tested against the
+general decoder across all 32 x 32 combinations.
+
 ### Catch up: reduced missing-data system
 
 For missing data columns `M` and selected coding rows `R`, substitute every
@@ -130,6 +137,24 @@ Benchmark result interpretation must keep these cases separate:
 No production dispatch threshold should be chosen from an Apple benchmark.
 Final crossover decisions require the pinned amd64 target and synthetic arrival
 traces for progressing, stalled, and bursty slots.
+
+## Zen 5 production gate
+
+The direct one-data path was measured on a Ryzen 7 9700X with Go 1.26.4,
+`GOMAXPROCS=1`, and one pinned physical core. Medians below are from seven
+sequential one-second samples unless otherwise noted.
+
+| Benchmark | General path | Direct one-data path | Change |
+| --- | ---: | ---: | ---: |
+| one-missing `SlotAssembler` boundary | 10.73 us/FEC | 2.82 us/FEC | -73.7% (3.8x) |
+| near-tip repair simulation | 3.0295 ms/op | 2.8659 ms/op | -5.40% |
+| deep-mixed repair simulation | 4.0343 ms/op | 4.0240 ms/op | -0.26% |
+| deep-sparse repair simulation | 10.8489 ms/op | 10.8327 ms/op | -0.15% |
+
+The production dispatch is intentionally narrow. The deep scenarios do not
+enter it and remain effectively neutral, while the near-tip workload benefits
+from repeated exactly-one-missing recoveries. The one-missing boundary also
+dropped from 144 to 5 allocations per operation.
 
 ## Preliminary Apple M4 Pro diagnostic
 
