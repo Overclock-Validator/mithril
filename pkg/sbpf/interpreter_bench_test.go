@@ -34,13 +34,31 @@ const benchProgramLength = 100_000
 // than intended. runBenchProgram asserts the program ran to completion.
 const benchComputeBudget = uint64(benchProgramLength * 4)
 
+// benchProgram compiles the text once, outside the timed region.
+//
+// testV3Program serialises every slot into a fresh TextBytes buffer, which for
+// a 100,000-instruction body is 800 KB of allocation and copying. Doing that
+// per iteration put ~923 KB/op and its GC pressure inside the measurement,
+// enough to bury the few-percent dispatch changes these benchmarks exist to
+// detect. Reusing one Program also matches production, which caches Programs in
+// accountsdb.ProgramCacheEntry and replays them; the interpreter treats text
+// and rodata as read-only and keeps its mutable state in the heap, stack and
+// input regions it allocates per run.
+func benchProgram(tb testing.TB, text []Slot) *Program {
+	tb.Helper()
+	program := testV3Program(text, nil)
+	if err := program.Verify(); err != nil {
+		tb.Fatalf("benchmark program fails verification: %v", err)
+	}
+	return program
+}
+
 // runBenchProgram executes one program and fails the benchmark if it did not
 // terminate normally. A benchmark whose program aborts early still produces a
 // plausible-looking ns/op, so the error check is load-bearing rather than
 // decorative.
-func runBenchProgram(b *testing.B, text []Slot, syscalls SyscallRegistry) {
+func runBenchProgram(b *testing.B, program *Program, syscalls SyscallRegistry) {
 	b.Helper()
-	program := testV3Program(text, nil)
 	meter := cu.NewComputeMeter(benchComputeBudget)
 	interpreter := NewInterpreter(program, &VMOpts{
 		HeapMax:      1024,
@@ -125,11 +143,12 @@ func benchLoadStoreProgram(pairs int) []Slot {
 // are hoisted into locals.
 func BenchmarkInterpreterALUDispatch(b *testing.B) {
 	text := benchALUProgram(benchProgramLength)
+	program := benchProgram(b, text)
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		runBenchProgram(b, text, noSyscalls())
+		runBenchProgram(b, program, noSyscalls())
 	}
 	reportPerInstruction(b, benchProgramLength)
 }
@@ -144,11 +163,12 @@ func BenchmarkInterpreterLoadStore(b *testing.B) {
 	const pairs = benchProgramLength / 2
 
 	text := benchLoadStoreProgram(pairs)
+	program := benchProgram(b, text)
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		runBenchProgram(b, text, noSyscalls())
+		runBenchProgram(b, program, noSyscalls())
 	}
 	reportPerInstruction(b, pairs*2)
 }
@@ -224,12 +244,13 @@ func benchSyscallProgram() []Slot { return benchSyscallProgramN(benchSyscallCoun
 // described at benchMappedAddr.
 func BenchmarkInterpreterSyscallTranslateMapped(b *testing.B) {
 	text := benchSyscallProgram()
+	program := benchProgram(b, text)
 	syscalls := translateSyscall(benchMappedAddr)
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		runBenchProgram(b, text, syscalls)
+		runBenchProgram(b, program, syscalls)
 	}
 	reportPerInstruction(b, benchSyscallCount)
 }
@@ -244,6 +265,7 @@ func BenchmarkInterpreterSyscallTranslateMapped(b *testing.B) {
 // single compute unit as an add.
 func BenchmarkInterpreterSyscallTranslateUnmapped(b *testing.B) {
 	text := benchSyscallProgram()
+	program := benchProgram(b, text)
 	// Far above every mapped region, so translateInternal rejects it on the
 	// region switch rather than on a bounds check inside a region.
 	syscalls := translateSyscall(benchUnmappedAddr)
@@ -251,7 +273,7 @@ func BenchmarkInterpreterSyscallTranslateUnmapped(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		runBenchProgram(b, text, syscalls)
+		runBenchProgram(b, program, syscalls)
 	}
 	reportPerInstruction(b, benchSyscallCount)
 }
@@ -290,11 +312,12 @@ func BenchmarkInterpreterCallReturn(b *testing.B) {
 	const calls = benchProgramLength / 4
 
 	text := benchCallReturnProgram(calls)
+	program := benchProgram(b, text)
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		runBenchProgram(b, text, noSyscalls())
+		runBenchProgram(b, program, noSyscalls())
 	}
 	reportPerInstruction(b, calls*2)
 }
@@ -379,11 +402,12 @@ func BenchmarkTranslateInternalUnmappedDirect(b *testing.B) {
 // so.
 func BenchmarkInterpreterSetupOverhead(b *testing.B) {
 	text := []Slot{testSlot(OpExit, 0, 0, 0, 0)}
+	program := benchProgram(b, text)
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		runBenchProgram(b, text, noSyscalls())
+		runBenchProgram(b, program, noSyscalls())
 	}
 }
 
