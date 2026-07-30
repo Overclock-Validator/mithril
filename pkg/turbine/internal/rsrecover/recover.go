@@ -3,6 +3,7 @@ package rsrecover
 import (
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/klauspost/reedsolomon"
 )
@@ -22,6 +23,10 @@ var (
 
 	gfLog [256]byte
 	gfExp [512]byte
+
+	allCodingEncoderOnce sync.Once
+	allCodingEncoder     reedsolomon.Encoder
+	allCodingEncoderErr  error
 )
 
 func init() {
@@ -58,6 +63,14 @@ type DataSubsetPlan struct {
 	missing  []uint8
 	sources  [DataShards]uint8
 	weights  [][]byte
+}
+
+// AllCodingPlan recovers all 32 data rows from all 32 coding rows. For the
+// fixed Solana matrix C*C=I, so the package's optimized encoder can apply C a
+// second time instead of constructing a decode matrix.
+type AllCodingPlan struct {
+	presence uint64
+	encoder  reedsolomon.Encoder
 }
 
 // Presence reports which of the 64 input shards are non-empty. A zero-length
@@ -225,6 +238,47 @@ func PrepareRecoverDataSubset(presence uint64) (DataSubsetPlan, error) {
 		}
 	}
 	return plan, nil
+}
+
+// PrepareRecoverAllDataFromCoding accepts the single coding-only threshold
+// pattern: no data rows and all coding rows. Encoder construction is shared
+// process-wide because the 32+32 matrix is immutable.
+func PrepareRecoverAllDataFromCoding(presence uint64) (AllCodingPlan, error) {
+	want := uint64(0xffffffff) << DataShards
+	if presence != want {
+		return AllCodingPlan{}, fmt.Errorf("%w: all-coding recovery requires presence %#016x, got %#016x", ErrInvalidPattern, want, presence)
+	}
+	allCodingEncoderOnce.Do(func() {
+		allCodingEncoder, allCodingEncoderErr = reedsolomon.New(DataShards, CodingShards)
+	})
+	if allCodingEncoderErr != nil {
+		return AllCodingPlan{}, allCodingEncoderErr
+	}
+	return AllCodingPlan{presence: presence, encoder: allCodingEncoder}, nil
+}
+
+// Recover writes all 32 data destinations by applying the coding matrix to
+// the 32 coding inputs. Validation completes before Encode writes any output.
+func (plan *AllCodingPlan) Recover(shards, destinations [][]byte) error {
+	shardSize, err := validateExecution(plan.presence, shards, destinations)
+	if err != nil {
+		return err
+	}
+	if len(destinations) != DataShards {
+		return fmt.Errorf("%w: got %d destinations, want %d", ErrInvalidBuffers, len(destinations), DataShards)
+	}
+	var work [TotalShards][]byte
+	for index := 0; index < DataShards; index++ {
+		if len(destinations[index]) != shardSize {
+			return fmt.Errorf("%w: destination %d has %d bytes, want %d", ErrInvalidBuffers, index, len(destinations[index]), shardSize)
+		}
+		work[index] = shards[DataShards+index]
+		work[DataShards+index] = destinations[index]
+	}
+	if err := plan.encoder.Encode(work[:]); err != nil {
+		return fmt.Errorf("recover all data from coding: %w", err)
+	}
+	return nil
 }
 
 func subsetWeights(knownData, selectedCoding []uint8, inverse [][]byte) [][]byte {

@@ -310,3 +310,51 @@ func TestRecoverDataSubsetThresholdAndBufferFailures(t *testing.T) {
 		}
 	}
 }
+
+func TestRecoverAllDataFromCoding(t *testing.T) {
+	original := encodedFixture(t, 987)
+	available := availableFixture(original, makeRange(DataShards), makeRange(CodingShards))
+	presence, err := Presence(available)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := PrepareRecoverAllDataFromCoding(presence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := make([][]byte, DataShards)
+	for index := range dst {
+		dst[index] = make([]byte, len(original[index]))
+	}
+	if err := plan.Recover(available, dst); err != nil {
+		t.Fatal(err)
+	}
+	for index := range dst {
+		if !bytes.Equal(dst[index], original[index]) {
+			t.Fatalf("recovered data shard %d differs", index)
+		}
+	}
+
+	changed := append([][]byte(nil), available...)
+	changed[0] = original[0]
+	if _, err := PrepareRecoverAllDataFromCoding(mustPresence(t, changed)); !errors.Is(err, ErrInvalidPattern) {
+		t.Fatalf("non-coding-only pattern error = %v, want ErrInvalidPattern", err)
+	}
+}
+
+func makeRange(count int) []int {
+	result := make([]int, count)
+	for index := range result {
+		result[index] = index
+	}
+	return result
+}
+
+func mustPresence(t testing.TB, shards [][]byte) uint64 {
+	t.Helper()
+	presence, err := Presence(shards)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return presence
+}
