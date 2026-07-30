@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -68,6 +69,35 @@ func cuEffLimit() int {
 		return 0
 	}
 	return n
+}
+
+// cuEffSuites selects which suites to measure, from a comma-separated
+// MITHRIL_CU_EFFICIENCY_SUITES. Empty means all of them.
+//
+// This exists because the aggregate is a poor A/B instrument when a change
+// only touches one suite. Measuring an sBPF interpreter change over all four
+// suites dilutes it against native-program handlers that cannot have moved, and
+// the untouched suites still contribute their own run-to-run variance to the
+// total -- so the number gets both smaller and noisier than the real effect.
+// Selecting the affected suite gives attribution the whole-corpus total cannot.
+//
+// It does not replace the full run. Use the whole corpus to find what is slow;
+// use one suite to measure whether a change to it worked.
+func cuEffSuites() map[string]bool {
+	raw := strings.TrimSpace(os.Getenv("MITHRIL_CU_EFFICIENCY_SUITES"))
+	if raw == "" {
+		return nil
+	}
+	selected := make(map[string]bool)
+	for _, name := range strings.Split(raw, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			selected[name] = true
+		}
+	}
+	if len(selected) == 0 {
+		return nil
+	}
+	return selected
 }
 
 type cuEffSample struct {
@@ -311,9 +341,27 @@ func TestCUEfficiency(t *testing.T) {
 		{"vote", "test-vectors/instr/fixtures/vote", runInstrFixture},
 	}
 
+	selected := cuEffSuites()
+	if selected != nil {
+		known := make(map[string]bool, len(suites))
+		for _, s := range suites {
+			known[s.name] = true
+		}
+		for name := range selected {
+			if !known[name] {
+				t.Fatalf("unknown suite %q in MITHRIL_CU_EFFICIENCY_SUITES; known: vm-programs, bpf-loader-v3, system, vote", name)
+			}
+		}
+	}
+
 	var all []cuEffSample
 	var allPanics []cuEffPanic
+	var ran []string
 	for _, s := range suites {
+		if selected != nil && !selected[s.name] {
+			continue
+		}
+		ran = append(ran, s.name)
 		samples, panics := collectCUEffSamples(t, s.name, s.path, s.run)
 		all = append(all, samples...)
 		allPanics = append(allPanics, panics...)
@@ -334,6 +382,9 @@ func TestCUEfficiency(t *testing.T) {
 	t.Logf("=== corpus baseline ===")
 	if n := cuEffLimit(); n > 0 {
 		t.Logf("LIMITED RUN: at most %d fixtures per suite; totals are not corpus-wide", n)
+	}
+	if selected != nil {
+		t.Logf("SUITE SUBSET: %s only; totals cover these suites, not the corpus", strings.Join(ran, ", "))
 	}
 	t.Logf("%d fixtures, %.3f ms total execution, %d CU total", len(all), float64(corpusNS)/1e6, corpusCU)
 	t.Logf("baseline: %.1f ns/CU", baseline)
