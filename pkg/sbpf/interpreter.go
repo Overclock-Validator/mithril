@@ -1375,8 +1375,17 @@ func (ip *Interpreter) Translate(addr uint64, size uint64, write bool) ([]byte, 
 
 	ptr, err := ip.translateInternal(addr, size, write)
 	if err != nil {
-		pc, filename, line, _ := runtime.Caller(1)
-		mlog.Log.Debugf("[error] in %s[%s:%d] %v. calling translate on addr = %x, size = %d", runtime.FuncForPC(pc).Name(), filename, line, err, addr, size)
+		// Guarded because the arguments, not the logging, are the cost here:
+		// runtime.Caller unwinds the stack and FuncForPC does a symbol-table
+		// lookup, and Go evaluates both before Debugf can decide to discard
+		// them. A node runs at error level, so this ran on every failed
+		// translate and produced nothing. Failed translates are ordinary
+		// traffic -- CPI argument translation probes addresses that legitimately
+		// do not resolve -- so this is a live path, not just a crash path.
+		if mlog.Log.DebugEnabled() {
+			pc, filename, line, _ := runtime.Caller(1)
+			mlog.Log.Debugf("[error] in %s[%s:%d] %v. calling translate on addr = %x, size = %d", runtime.FuncForPC(pc).Name(), filename, line, err, addr, size)
+		}
 		return nil, err
 	}
 

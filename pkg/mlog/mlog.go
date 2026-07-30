@@ -533,8 +533,18 @@ func (l *logger) writePending(pending []byte) {
 	}
 }
 
+// DebugEnabled reports whether Debugf would emit anything.
+//
+// Debugf discards below its level, but Go evaluates a call's arguments first, so
+// that check comes too late for arguments that are expensive to build. Callers
+// computing one -- a stack unwind, a symbol lookup, a large Sprintf -- should
+// guard the whole call with this instead of relying on Debugf to drop it.
+func (l *logger) DebugEnabled() bool {
+	return l.level <= LevelDebug || l.enableVerbose.Load()
+}
+
 func (l *logger) Debugf(format string, args ...interface{}) {
-	if l.level > LevelDebug && !l.enableVerbose.Load() {
+	if !l.DebugEnabled() {
 		return
 	}
 	msg := fmt.Sprintf("%s%s\n", relativePrefix(), fmt.Sprintf(format, args...))
