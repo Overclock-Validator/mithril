@@ -84,6 +84,14 @@ The byte kernel is intentionally portable and uses `reedsolomon.LowLevel`.
 This isolates algorithm and plan costs; it is not evidence that a portable
 kernel will beat the dependency's generated AVX2/GFNI kernels on amd64.
 
+### Catch up edge: all coding rows
+
+When all data rows are missing and every coding row is present, `C*C=I` means
+the existing optimized encoder can apply `C` to the coding rows and recover the
+data directly. This is kept as a separate synthetic arm. It is simpler than a
+general decoder, but a cached reduced-system plan may still have a faster byte
+kernel; hardware decides between them.
+
 ## Synthetic coverage
 
 The tests cover:
@@ -119,3 +127,31 @@ Benchmark result interpretation must keep these cases separate:
 No production dispatch threshold should be chosen from an Apple benchmark.
 Final crossover decisions require the pinned amd64 target and synthetic arrival
 traces for progressing, stalled, and bursty slots.
+
+## Preliminary Apple M4 Pro diagnostic
+
+These single-sample medians use 987-byte shards and exist only to reject or
+retain candidates before the amd64 gate. Times are microseconds per FEC set.
+
+| Missing data | Specialized first use | Specialized prepared | General uncached | General cached |
+|---:|---:|---:|---:|---:|
+| 1 | 1.97 | 1.07 | 8.36 | 2.31 |
+| 2 | 4.19 | 2.10 | 10.78 | 3.39 |
+| 4 | 8.84 | 4.19 | 17.00 | 5.91 |
+| 8 | 18.94 | 8.24 | 25.54 | 10.06 |
+| 16 | 39.90 | 16.44 | 44.93 | 19.78 |
+| 24 | 62.14 | 24.71 | 63.43 | 28.55 |
+| 32 | 79.50 | 32.76 | 89.53 | 37.53 |
+
+The all-coding involution arm measured approximately 36.5 microseconds,
+compared with 82.7 microseconds for an uncached general decode and 37.5
+microseconds for its cached form. Its main possible value is avoiding plan
+setup; the prepared reduced-system byte path was faster on this machine.
+
+The current interpretation is deliberately conditional:
+
+- direct one-data recovery is strong enough to require an amd64 prototype;
+- reduced-system first use wins through most of the tested range, but the
+  24-missing crossover is within noise on this machine;
+- prepared reduced-system execution wins at every tested width;
+- none of these figures establishes a production policy or Zen 5 result.

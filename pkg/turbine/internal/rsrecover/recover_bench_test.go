@@ -150,6 +150,30 @@ func BenchmarkRecoverDataSubset(b *testing.B) {
 	}
 }
 
+func BenchmarkRecoverAllDataFromCoding(b *testing.B) {
+	fixture := makeRecoveryBenchmarkFixture(b, DataShards)
+	plan, err := PrepareRecoverAllDataFromCoding(fixture.presence)
+	if err != nil {
+		b.Fatal(err)
+	}
+	dst := make([][]byte, DataShards)
+	for index := range dst {
+		dst[index] = make([]byte, len(fixture.original[0]))
+	}
+	b.Run("coding-involution/execute", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(DataShards * len(fixture.original[0])))
+		for b.Loop() {
+			if err := plan.Recover(fixture.available, dst); err != nil {
+				b.Fatal(err)
+			}
+			benchmarkBytesSink = dst[0]
+		}
+	})
+	benchmarkGeneralRecovery(b, fixture, false)
+	benchmarkGeneralRecovery(b, fixture, true)
+}
+
 func benchmarkGeneralRecovery(b *testing.B, fixture recoveryBenchmarkFixture, inversionCache bool) {
 	name := "general/cache-off"
 	if inversionCache {
