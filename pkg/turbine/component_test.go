@@ -131,6 +131,36 @@ func TestShredEntryBatchRoundTrip(t *testing.T) {
 	require.Equal(t, entry.NumHashes, components[0].EntryBatch[0].NumHashes)
 }
 
+func TestShredMultiFECEntryBatchRoundTrip(t *testing.T) {
+	leader := testLeader(t)
+	entries := make([]turbine.Entry, 1300)
+	for i := range entries {
+		entries[i] = turbine.Entry{NumHashes: 1, Hash: solana.Hash{byte(i), byte(i >> 8)}}
+	}
+	component, err := turbine.NewEntryBatch(entries)
+	require.NoError(t, err)
+
+	shredder := turbine.Shredder{Slot: 100, ParentSlot: 99, Version: 42, ReferenceTick: 63}
+	batch, _, _, err := shredder.MakeMerkleShredsFromComponent(
+		leader, component, true, solana.Hash{}, 0, 0,
+	)
+	require.NoError(t, err)
+	require.Greater(t, len(batch.DataShreds), 32)
+	for i, shred := range batch.DataShreds[:len(batch.DataShreds)-1] {
+		require.False(t, shred.DataComplete(), "intermediate data shred %d ended the component", i)
+	}
+	require.True(t, batch.DataShreds[len(batch.DataShreds)-1].DataComplete())
+	require.True(t, batch.DataShreds[len(batch.DataShreds)-1].LastInSlot())
+
+	components, err := turbine.DecodeComponentsFromDataShreds(batch.DataShreds)
+	require.NoError(t, err)
+	require.Len(t, components, 1)
+	require.Len(t, components[0].EntryBatch, len(entries))
+	for i := range entries {
+		require.Equal(t, entries[i].Hash, components[0].EntryBatch[i].Hash)
+	}
+}
+
 func TestShredBlockHeaderMarkerRoundTrip(t *testing.T) {
 	leader := testLeader(t)
 	parentID := solana.Hash{8}

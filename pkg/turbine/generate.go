@@ -123,7 +123,11 @@ func (g *ShredGenerator) MakeShredsFromData(
 	for len(unsignedData) >= unsignedBatch {
 		batch := unsignedData[:unsignedBatch]
 		unsignedData = unsignedData[unsignedBatch:]
-		batchPackets, root, err := g.makeFECBatch(encoder, leader, batch, unsignedCap, proofSize, false, parentOffset, flags, false, chainedRoot, dataIndex, codeIndex)
+		// DATA_COMPLETE marks the end of the serialized component, not the end
+		// of every FEC set. A full unsigned batch is complete only when no
+		// unsigned remainder or signed-last batch follows it.
+		dataComplete := len(unsignedData) == 0 && len(signedData) == 0
+		batchPackets, root, err := g.makeFECBatch(encoder, leader, batch, unsignedCap, proofSize, false, parentOffset, flags, dataComplete, false, chainedRoot, dataIndex, codeIndex)
 		if err != nil {
 			return nil, solana.Hash{}, dataIndex, codeIndex, err
 		}
@@ -134,7 +138,8 @@ func (g *ShredGenerator) MakeShredsFromData(
 	}
 
 	if len(unsignedData) > 0 || (len(packets) == 0 && !isLastInSlot) {
-		batchPackets, root, err := g.makeFECBatch(encoder, leader, unsignedData, unsignedCap, proofSize, false, parentOffset, flags, false, chainedRoot, dataIndex, codeIndex)
+		dataComplete := len(signedData) == 0
+		batchPackets, root, err := g.makeFECBatch(encoder, leader, unsignedData, unsignedCap, proofSize, false, parentOffset, flags, dataComplete, false, chainedRoot, dataIndex, codeIndex)
 		if err != nil {
 			return nil, solana.Hash{}, dataIndex, codeIndex, err
 		}
@@ -145,7 +150,7 @@ func (g *ShredGenerator) MakeShredsFromData(
 	}
 
 	if len(signedData) > 0 || (len(packets) == 0 && isLastInSlot) {
-		batchPackets, root, err := g.makeFECBatch(encoder, leader, signedData, signedCap, proofSize, true, parentOffset, flags, isLastInSlot, chainedRoot, dataIndex, codeIndex)
+		batchPackets, root, err := g.makeFECBatch(encoder, leader, signedData, signedCap, proofSize, true, parentOffset, flags, true, isLastInSlot, chainedRoot, dataIndex, codeIndex)
 		if err != nil {
 			return nil, solana.Hash{}, dataIndex, codeIndex, err
 		}
@@ -167,6 +172,7 @@ func (g *ShredGenerator) makeFECBatch(
 	resigned bool,
 	parentOffset uint16,
 	flags byte,
+	dataComplete bool,
 	isLastInSlot bool,
 	chainedMerkleRoot solana.Hash,
 	dataIndex uint32,
@@ -221,7 +227,7 @@ func (g *ShredGenerator) makeFECBatch(
 			dataPackets[i][dataFlagsOffset] |= shredFlagLastShredInSlot
 			break
 		}
-	} else if len(dataPackets) > 0 {
+	} else if dataComplete && len(dataPackets) > 0 {
 		dataPackets[len(dataPackets)-1][dataFlagsOffset] |= shredFlagDataComplete
 	}
 
