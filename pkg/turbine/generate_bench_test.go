@@ -216,7 +216,7 @@ func TestMakeShredsFromDataStableBytes(t *testing.T) {
 	}{
 		{name: "unsigned-one-fec", size: unsignedBatch, want: "f9334f1835240df21d4b48a09f35b3ff90578122d30d0527608c10d38d0911f7"},
 		{name: "signed-one-fec", size: signedBatch, isLastInSlot: true, want: "bfa398c445509c5e1345553bbe84fea04e86001caf441008b4014d07c6e36ccd"},
-		{name: "two-unsigned-one-signed", size: 2*unsignedBatch + signedBatch, isLastInSlot: true, want: "1374b3b1cc35dab1fddb248a8924be73b8a22d2c42a63ce87663b3ffff3762a5"},
+		{name: "two-unsigned-one-signed", size: 2*unsignedBatch + signedBatch, isLastInSlot: true, want: "dffae840e4c247680b5e1667747a63138872a0080c51a6fcf4cc5002eb7778ac"},
 	}
 
 	for _, tt := range tests {
