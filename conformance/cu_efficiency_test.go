@@ -325,6 +325,41 @@ func collectCUEffSamples(t *testing.T, suite, basePath string, run cuEffRunner) 
 	return samples, panics
 }
 
+// cuEffDump writes every sample to MITHRIL_CU_EFFICIENCY_DUMP as TSV so two
+// runs can be paired by (suite, fixture) offline.
+//
+// Why bother, when the report already prints a corpus total. Comparing two
+// builds by their totals throws away almost all the data: one run yields a
+// single number, so separating a few-percent change takes many repeated pairs,
+// and the run-to-run spread it fights is dominated by fixtures being wildly
+// different sizes rather than by the change under test.
+//
+// Pairing per fixture removes that. Every fixture is compared against itself
+// under the other build, so fixture-size variation cancels instead of being
+// averaged over, and one pair of runs yields thousands of paired observations
+// instead of one. Take the median of the per-fixture relative deltas and a
+// distribution-free interval around it -- a sign test or a bootstrap over
+// fixtures -- rather than a mean, which the long tail would dominate.
+//
+// Filter to fixtures worth timing before drawing conclusions: below roughly
+// cuEffMinCU the per-fixture number is mostly timer granularity, and including
+// those adds noise without adding signal.
+func cuEffDump(t *testing.T, samples []cuEffSample) {
+	path := strings.TrimSpace(os.Getenv("MITHRIL_CU_EFFICIENCY_DUMP"))
+	if path == "" {
+		return
+	}
+	var b strings.Builder
+	b.WriteString("suite\tfixture\tinstr\tns\tcu\n")
+	for _, s := range samples {
+		fmt.Fprintf(&b, "%s\t%s\t%d\t%d\t%d\n", s.suite, s.fixture, s.instrCode, s.ns, s.cu)
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		t.Fatalf("cu efficiency dump: %v", err)
+	}
+	t.Logf("wrote %d samples to %s", len(samples), path)
+}
+
 func TestCUEfficiency(t *testing.T) {
 	if os.Getenv("MITHRIL_CU_EFFICIENCY") == "" {
 		t.Skip("set MITHRIL_CU_EFFICIENCY=1 to run the compute-unit efficiency measurement")
@@ -369,6 +404,8 @@ func TestCUEfficiency(t *testing.T) {
 	if len(all) == 0 {
 		t.Skip("no fixtures measured; run `make conformance-vectors` first")
 	}
+
+	cuEffDump(t, all)
 
 	var corpusNS int64
 	var corpusCU uint64
