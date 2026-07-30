@@ -2,6 +2,9 @@
 
 Status: experimental; no production `SlotAssembler` dispatch uses these paths.
 
+The end-to-end deterministic harness that drives production repair selection,
+assembly, storage, and completion is documented in [repair_sim.md](repair_sim.md).
+
 This document separates two repair regimes that have different objectives. It
 also records the fixed 32 data + 32 coding Reed-Solomon contract used by the
 synthetic implementation in `pkg/turbine/internal/rsrecover`.
