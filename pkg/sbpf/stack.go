@@ -165,6 +165,32 @@ func (s *Stack) GetFramePtr() uint64 {
 	return s.shadow[len(s.shadow)-1].FramePtr
 }
 
+// frameOffset resolves a stack virtual address to a physical offset into mem,
+// without materialising a slice. GetFrame is the slice-returning form kept for
+// callers that want one; the interpreter's translate path uses this instead,
+// because building a slice header per memory access -- 30.6% of instructions on
+// real mainnet traffic -- only to take the address of its first byte is pure
+// overhead.
+//
+// ok is false for an unmapped address: a gap under frame-gap addressing, or an
+// offset past the end of the stack. The returned offset is already gap-remapped
+// so it indexes mem directly.
+func (s *Stack) frameOffset(addr uint32) (uint64, bool) {
+	off := uint64(addr & math.MaxUint32)
+
+	if !s.dynamicStackFrames && s.stackFrameGaps {
+		if (addr/StackFrameSize)%2 == 1 {
+			return 0, false
+		}
+		off = ((off & GapMask) >> 1) | (off & ^GapMask)
+	}
+
+	if off > StackMax {
+		return 0, false
+	}
+	return off, true
+}
+
 // GetFrame returns underlying memory as a slice for a given stack address
 func (s *Stack) GetFrame(addr uint32) []byte {
 	off := uint64(addr & math.MaxUint32)
