@@ -1224,8 +1224,8 @@ func (ip *Interpreter) translateInternal(addr uint64, size uint64, write bool) (
 		}
 		return unsafe.Pointer(&ip.ro[lo]), nil
 	case VaddrStack >> 32:
-		off, ok := ip.stack.frameOffset(uint32(addr))
-		if !ok || size > StackMax-off {
+		mem := ip.stack.GetFrame(uint32(addr))
+		if size > uint64(len(mem)) {
 			return nil, NewExcBadAccess(addr, size, write, "out-of-bounds stack access")
 		}
 		if size == 0 {
@@ -1234,12 +1234,11 @@ func (ip *Interpreter) translateInternal(addr uint64, size uint64, write bool) (
 		if write {
 			// The only place stack memory is handed out for writing, which is
 			// what lets Stack.Finish clear a prefix instead of all 256 KiB.
-			// frameOffset already gap-remapped off, so it indexes mem directly.
-			ip.stack.markWritten(off + size)
+			// GetFrame returns mem[off:], so off is StackMax-len(mem) -- already
+			// gap-remapped, so this is the physical offset into the buffer.
+			ip.stack.markWritten(StackMax - uint64(len(mem)) + size)
 		}
-		// off < StackMax here: size >= 1 and the bound above rejected
-		// off+size > StackMax, so this index is always valid.
-		return unsafe.Pointer(&ip.stack.mem[off]), nil
+		return unsafe.Pointer(&mem[0]), nil
 	case VaddrHeap >> 32:
 		if size == 0 {
 			return emptySlice, nil
