@@ -17,6 +17,10 @@ func profileInstruction(uint8) {}
 
 func profileRun(int64) {}
 
+func profileRunEnter() int { return 0 }
+
+func profileRunAt(int, int64) {}
+
 func profileSyscall(uint32, int64) {}
 
 func profileNow() int64 { return 0 }

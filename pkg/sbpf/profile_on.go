@@ -35,13 +35,30 @@ var prof struct {
 	runNanos int64
 	opcodes  [256]uint64
 	syscalls map[uint32]*syscallStat
-	started  time.Time
+	// topRunNanos counts only outermost Run calls, so it excludes children
+	// re-entered through CPI; runNanos counts every Run at every depth.
+	topRunNanos int64
+	nestedRuns  uint64
+	started     time.Time
 }
 
 type syscallStat struct {
 	calls uint64
 	nanos int64
 }
+
+// runDepth splits Run time into top-level program execution and execution
+// nested inside a CPI. CPI syscalls are 19.9% of block execution, but their
+// measured time includes the whole child invocation, so without this split
+// there is no way to tell CPI plumbing -- argument translation, account
+// serialisation, permission checks -- from the child program simply running.
+//
+// Deliberately a plain counter, not goroutine-local: it is only meaningful on a
+// single-threaded replay (txpar=1), which is the configuration this split is
+// measured in, because that is also the only configuration where run time and
+// block wall-clock are directly comparable. Under concurrency it is noise, and
+// the report says so.
+var runDepth int
 
 func profileNow() int64 { return time.Now().UnixNano() }
 
@@ -55,11 +72,27 @@ func profileInstruction(op uint8) {
 	prof.instrs++
 }
 
-func profileRun(startNanos int64) {
+func profileRunEnter() int {
+	prof.mu.Lock()
+	runDepth++
+	d := runDepth
+	prof.mu.Unlock()
+	return d
+}
+
+func profileRun(startNanos int64) { profileRunAt(1, startNanos) }
+
+func profileRunAt(depth int, startNanos int64) {
 	elapsed := time.Now().UnixNano() - startNanos
 	prof.mu.Lock()
+	runDepth--
 	prof.runs++
 	prof.runNanos += elapsed
+	if depth == 1 {
+		prof.topRunNanos += elapsed
+	} else {
+		prof.nestedRuns++
+	}
 	prof.mu.Unlock()
 }
 
@@ -101,6 +134,7 @@ func init() {
 func writeProfile(path string) error {
 	prof.mu.Lock()
 	runs, instrs, runNanos := prof.runs, prof.instrs, prof.runNanos
+	topRunNanos, nestedRuns := prof.topRunNanos, prof.nestedRuns
 	ops := prof.opcodes
 	sys := make(map[uint32]syscallStat, len(prof.syscalls))
 	for k, v := range prof.syscalls {
@@ -129,6 +163,10 @@ func writeProfile(path string) error {
 	add("run_ms               %.1f\n", float64(runNanos)/1e6)
 	add("syscall_ms           %.1f\n", float64(sysNanos)/1e6)
 	add("syscall_calls        %d\n", sysCalls)
+	add("top_level_run_ms     %.1f\n", float64(topRunNanos)/1e6)
+	add("nested_runs          %d\n", nestedRuns)
+	// Only meaningful single-threaded; see runDepth.
+	add("nested_run_ms        %.1f\n", float64(runNanos-topRunNanos)/1e6)
 	// The headline: how much of the interpreter's own time is spent
 	// interpreting, versus inside native syscall bodies it merely calls.
 	if runNanos > 0 {

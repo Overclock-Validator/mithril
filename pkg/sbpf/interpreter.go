@@ -201,7 +201,7 @@ func (ip *Interpreter) executeJmp32(ins Slot, pc int64, r *[11]uint64) (int64, e
 // This function may panic given code that doesn't pass the static verifier.
 func (ip *Interpreter) Run() (ret uint64, cuConsumed uint64, err error) {
 	if sbpfProfileEnabled {
-		defer profileRun(profileNow())
+		defer profileRunAt(profileRunEnter(), profileNow())
 	}
 	var r [11]uint64
 	r[1] = VaddrInput
