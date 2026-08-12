@@ -142,11 +142,19 @@ type BlockReplay struct {
 	DependencyPlannerPreparation Timing
 	LoadBlockAccounts            Timing
 	SlotCtxSetup                 Timing
-	// DependencyPlannerBuild is the graph/batch construction time nested
-	// within TxLoop. DependencyPlannerDispatch is the scheduler's wall-clock
-	// lifetime, including dependency waits, and is also nested within TxLoop.
+	// DependencyPlannerBuild is measured account-extraction plus graph/batch
+	// construction work, independent of which planner route a block uses and
+	// excluding goroutine scheduling delay. On the prepared route some or all
+	// of it overlaps LoadBlockAccounts and it is therefore not a top-level
+	// additive phase. DependencyPlannerWait is the residual join nested within
+	// TxLoop. DependencyPlannerDispatch runs from a ready plan until its final
+	// transaction wave is enqueued, excluding the final wave's execution, and
+	// is also nested within TxLoop.
 	DependencyPlannerBuild          Timing
+	DependencyPlannerWait           Timing
 	DependencyPlannerDispatch       Timing
+	DependencyPlannerPrepared       uint64
+	DependencyPlannerFallback       uint64
 	TxLoop                          Timing
 	Reward                          Timing
 	Rent                            Timing
