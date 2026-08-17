@@ -1,6 +1,7 @@
 package turbine
 
 import (
+	"container/list"
 	"context"
 	"crypto/ed25519"
 	"encoding/binary"
@@ -92,6 +93,84 @@ func (l *serveRepairPeerLimit) allow(now time.Time) bool {
 	return true
 }
 
+type serveRepairRateLimitEntry struct {
+	addr  netip.AddrPort
+	limit serveRepairPeerLimit
+}
+
+// serveRepairRateLimits is an LRU-bounded per-peer limiter. A full table
+// replaces its least-recently-used entry instead of rejecting every new peer;
+// otherwise a spray of one packet per source address can turn the memory bound
+// into a persistent admission lockout.
+type serveRepairRateLimits struct {
+	maxPeers    int
+	peers       map[netip.AddrPort]*list.Element
+	order       list.List
+	lastCleanup time.Time
+}
+
+func newServeRepairRateLimits(maxPeers int, now time.Time) *serveRepairRateLimits {
+	if maxPeers < 1 {
+		maxPeers = 1
+	}
+	return &serveRepairRateLimits{
+		maxPeers:    maxPeers,
+		peers:       make(map[netip.AddrPort]*list.Element, maxPeers),
+		lastCleanup: now,
+	}
+}
+
+func (r *serveRepairRateLimits) allow(addr netip.AddrPort, now time.Time) bool {
+	r.cleanup(now)
+	if element := r.peers[addr]; element != nil {
+		entry := element.Value.(*serveRepairRateLimitEntry)
+		allowed := entry.limit.allow(now)
+		r.order.MoveToBack(element)
+		return allowed
+	}
+
+	if len(r.peers) >= r.maxPeers {
+		// Reuse the oldest entry and list node. Once the table is warm, source
+		// churn therefore cannot turn the bounded live set into allocation churn.
+		element := r.order.Front()
+		entry := element.Value.(*serveRepairRateLimitEntry)
+		delete(r.peers, entry.addr)
+		entry.addr = addr
+		entry.limit = serveRepairPeerLimit{}
+		allowed := entry.limit.allow(now)
+		r.peers[addr] = element
+		r.order.MoveToBack(element)
+		return allowed
+	}
+	entry := &serveRepairRateLimitEntry{addr: addr}
+	allowed := entry.limit.allow(now)
+	r.peers[addr] = r.order.PushBack(entry)
+	return allowed
+}
+
+func (r *serveRepairRateLimits) cleanup(now time.Time) {
+	if now.Sub(r.lastCleanup) < serveRepairRateLimitCleanup && !now.Before(r.lastCleanup) {
+		return
+	}
+	for element := r.order.Front(); element != nil; element = r.order.Front() {
+		entry := element.Value.(*serveRepairRateLimitEntry)
+		if !now.Before(entry.limit.lastSeen) && now.Sub(entry.limit.lastSeen) < serveRepairRateLimitIdle {
+			break
+		}
+		r.remove(element)
+	}
+	r.lastCleanup = now
+}
+
+func (r *serveRepairRateLimits) remove(element *list.Element) {
+	if element == nil {
+		return
+	}
+	entry := element.Value.(*serveRepairRateLimitEntry)
+	delete(r.peers, entry.addr)
+	r.order.Remove(element)
+}
+
 type serveRepairWork struct {
 	packet   [repairproto.RequestPacketSize]byte
 	signable [repairproto.RequestSignableSize]byte
@@ -113,10 +192,9 @@ type ServeRepairServer struct {
 	self     gossip.Pubkey
 	store    *ShredSpool
 
-	limits      map[netip.AddrPort]*serveRepairPeerLimit
-	lastCleanup time.Time
-	now         func() time.Time
-	counters    serveRepairCounters
+	limits   *serveRepairRateLimits
+	now      func() time.Time
+	counters serveRepairCounters
 
 	closeOnce         sync.Once
 	nextStoreErrorLog atomic.Int64
@@ -149,13 +227,12 @@ func NewServeRepairServer(cfg ServeRepairConfig) (*ServeRepairServer, error) {
 	copy(self[:], pub)
 	now := time.Now()
 	return &ServeRepairServer{
-		conn:        conn,
-		identity:    identity,
-		self:        self,
-		store:       cfg.Store,
-		limits:      make(map[netip.AddrPort]*serveRepairPeerLimit),
-		lastCleanup: now,
-		now:         time.Now,
+		conn:     conn,
+		identity: identity,
+		self:     self,
+		store:    cfg.Store,
+		limits:   newServeRepairRateLimits(serveRepairMaxTrackedPeers, now),
+		now:      time.Now,
 	}, nil
 }
 
@@ -225,21 +302,8 @@ func (s *ServeRepairServer) Run(ctx context.Context) error {
 
 func (s *ServeRepairServer) handlePacket(packet []byte, addr netip.AddrPort, work chan<- serveRepairWork) {
 	now := s.now()
-	s.cleanupRateLimits(now)
-	limit := s.limits[addr]
-	if limit == nil {
-		if len(s.limits) >= serveRepairMaxTrackedPeers {
-			s.counters.rateLimited.Add(1)
-			return
-		}
-		limit = &serveRepairPeerLimit{}
-		s.limits[addr] = limit
-	}
-	if !limit.allow(now) {
-		s.counters.rateLimited.Add(1)
-		return
-	}
-
+	// Solana repair pings are liveness challenges, not shred requests. The
+	// reference server answers a verified ping before applying request limits.
 	if ping, ok := repairproto.DecodePing(packet); ok {
 		s.counters.pings.Add(1)
 		pong, err := repairproto.BuildPong(s.identity, ping)
@@ -255,6 +319,10 @@ func (s *ServeRepairServer) handlePacket(packet []byte, addr netip.AddrPort, wor
 		return
 	}
 	if repairproto.IsPong(packet) {
+		if !s.limits.allow(addr, now) {
+			s.counters.rateLimited.Add(1)
+			return
+		}
 		s.counters.pongs.Add(1)
 		return
 	}
@@ -264,17 +332,16 @@ func (s *ServeRepairServer) handlePacket(packet []byte, addr netip.AddrPort, wor
 		s.counters.dropMalformed.Add(1)
 		return
 	}
-	s.counters.requests.Add(1)
-	switch request.Kind {
-	case repairproto.RequestWindowIndex:
-		s.counters.windowIndex.Add(1)
-	case repairproto.RequestHighestWindowIndex:
-		s.counters.highestWindowIndex.Add(1)
-	}
 	if !s.validHeader(request, now) {
+		s.countRequest(request)
 		s.counters.dropHeaderInvalid.Add(1)
 		return
 	}
+	if !s.limits.allow(addr, now) {
+		s.counters.rateLimited.Add(1)
+		return
+	}
+	s.countRequest(request)
 
 	var item serveRepairWork
 	copy(item.packet[:], packet)
@@ -291,6 +358,16 @@ func (s *ServeRepairServer) handlePacket(packet []byte, addr netip.AddrPort, wor
 	}
 }
 
+func (s *ServeRepairServer) countRequest(request repairproto.Request) {
+	s.counters.requests.Add(1)
+	switch request.Kind {
+	case repairproto.RequestWindowIndex:
+		s.counters.windowIndex.Add(1)
+	case repairproto.RequestHighestWindowIndex:
+		s.counters.highestWindowIndex.Add(1)
+	}
+}
+
 func (s *ServeRepairServer) validHeader(request repairproto.Request, now time.Time) bool {
 	if request.Sender == s.self || request.Recipient != s.self {
 		return false
@@ -304,18 +381,6 @@ func (s *ServeRepairServer) validHeader(request repairproto.Request, now time.Ti
 		return request.Timestamp-current <= uint64(serveRepairTimestampTolerance/time.Millisecond)
 	}
 	return current-request.Timestamp <= uint64(serveRepairTimestampTolerance/time.Millisecond)
-}
-
-func (s *ServeRepairServer) cleanupRateLimits(now time.Time) {
-	if now.Sub(s.lastCleanup) < serveRepairRateLimitCleanup && !now.Before(s.lastCleanup) {
-		return
-	}
-	for addr, limit := range s.limits {
-		if now.Sub(limit.lastSeen) >= serveRepairRateLimitIdle || now.Before(limit.lastSeen) {
-			delete(s.limits, addr)
-		}
-	}
-	s.lastCleanup = now
 }
 
 func (s *ServeRepairServer) runWorker(ctx context.Context, work <-chan serveRepairWork, workers int) {

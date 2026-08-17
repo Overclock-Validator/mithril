@@ -168,6 +168,33 @@ func TestShredSpoolIndexesCanonicalDataShreds(t *testing.T) {
 	}
 }
 
+func TestShredSpoolMissingLookupsDoNotCacheEmptyIndexes(t *testing.T) {
+	spool, err := OpenShredSpool(t.TempDir(), 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer spool.Close()
+
+	const misses = 10_000
+	for slot := uint64(1); slot <= misses; slot++ {
+		if _, ok, err := spool.GetDataShred(slot, 0); err != nil || ok {
+			t.Fatalf("GetDataShred(%d) = ok %v, err %v", slot, ok, err)
+		}
+		if _, ok, err := spool.GetHighestDataShredFrom(slot, 0); err != nil || ok {
+			t.Fatalf("GetHighestDataShredFrom(%d) = ok %v, err %v", slot, ok, err)
+		}
+	}
+
+	spool.mu.Lock()
+	defer spool.mu.Unlock()
+	if len(spool.dataIndex) != 0 {
+		t.Fatalf("missing lookups retained %d empty data indexes", len(spool.dataIndex))
+	}
+	if len(spool.sizes) != 0 {
+		t.Fatalf("missing lookups created %d spool slots", len(spool.sizes))
+	}
+}
+
 // A restart adopts leftover slot files: they hydrate instead of re-repairing.
 func TestShredSpoolAdoptsExistingFiles(t *testing.T) {
 	dir := t.TempDir()

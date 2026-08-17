@@ -563,9 +563,12 @@ func (s *ShredSpool) GetDataShred(slot uint64, index uint64) ([]byte, bool, erro
 	if s.closed {
 		return nil, false, fmt.Errorf("shred spool is closed")
 	}
-	data, err := s.ensureDataIndexLocked(slot)
+	data, exists, err := s.ensureDataIndexLocked(slot)
 	if err != nil {
 		return nil, false, err
+	}
+	if !exists {
+		return nil, false, nil
 	}
 	record, ok := data.records[uint32(index)]
 	if !ok {
@@ -586,9 +589,12 @@ func (s *ShredSpool) GetHighestDataShredFrom(slot uint64, minIndex uint64) ([]by
 	if s.closed {
 		return nil, false, fmt.Errorf("shred spool is closed")
 	}
-	data, err := s.ensureDataIndexLocked(slot)
+	data, exists, err := s.ensureDataIndexLocked(slot)
 	if err != nil {
 		return nil, false, err
+	}
+	if !exists {
+		return nil, false, nil
 	}
 	minimum := uint32(minIndex)
 	if !data.haveHighest || data.highest < minimum {
@@ -603,24 +609,28 @@ func (s *ShredSpool) GetHighestDataShredFrom(slot uint64, minIndex uint64) ([]by
 	return packet, err == nil, err
 }
 
-func (s *ShredSpool) ensureDataIndexLocked(slot uint64) (*spoolDataIndex, error) {
+func (s *ShredSpool) ensureDataIndexLocked(slot uint64) (*spoolDataIndex, bool, error) {
+	size, exists := s.sizes[slot]
+	if !exists || slot < s.floor {
+		return nil, false, nil
+	}
 	if data := s.dataIndex[slot]; data != nil {
-		return data, nil
+		return data, true, nil
 	}
 	dataIndex := &spoolDataIndex{records: make(map[uint32]spoolRecordRef)}
-	if s.sizes[slot] <= int64(len(spoolFileMagic)) {
+	if size <= int64(len(spoolFileMagic)) {
 		s.dataIndex[slot] = dataIndex
-		return dataIndex, nil
+		return dataIndex, true, nil
 	}
 
 	s.closeSlotLocked(slot)
 	data, err := os.ReadFile(s.pathFor(slot))
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if len(data) < len(spoolFileMagic) || string(data[:len(spoolFileMagic)]) != string(spoolFileMagic[:]) {
 		s.dropSlotLocked(slot)
-		return nil, fmt.Errorf("invalid shred spool header for slot %d", slot)
+		return nil, false, fmt.Errorf("invalid shred spool header for slot %d", slot)
 	}
 
 	validEnd := len(spoolFileMagic)
@@ -670,7 +680,7 @@ func (s *ShredSpool) ensureDataIndexLocked(slot uint64) (*spoolDataIndex, error)
 	}
 	if validEnd != len(data) {
 		if err := os.Truncate(s.pathFor(slot), int64(validEnd)); err != nil {
-			return nil, fmt.Errorf("truncate corrupt shred spool tail for slot %d: %w", slot, err)
+			return nil, false, fmt.Errorf("truncate corrupt shred spool tail for slot %d: %w", slot, err)
 		}
 		oldSize := s.sizes[slot]
 		s.sizes[slot] = int64(validEnd)
@@ -682,7 +692,7 @@ func (s *ShredSpool) ensureDataIndexLocked(slot uint64) (*spoolDataIndex, error)
 	}
 	s.validated[slot] = true
 	s.dataIndex[slot] = dataIndex
-	return dataIndex, nil
+	return dataIndex, true, nil
 }
 
 func (s *ShredSpool) readRecordLocked(slot uint64, record spoolRecordRef) ([]byte, error) {

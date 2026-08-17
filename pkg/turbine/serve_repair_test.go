@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -27,6 +28,67 @@ func TestServeRepairPeerRateLimit(t *testing.T) {
 	}
 	if !limit.allow(now.Add(serveRepairRateLimitWindow)) {
 		t.Fatal("new rate-limit window did not admit a request")
+	}
+}
+
+func TestServeRepairRateLimitTableEvictsOldestAtCapacity(t *testing.T) {
+	now := time.Unix(100, 0)
+	limits := newServeRepairRateLimits(2, now)
+	a := netip.MustParseAddrPort("192.0.2.1:1001")
+	b := netip.MustParseAddrPort("192.0.2.2:1002")
+	c := netip.MustParseAddrPort("192.0.2.3:1003")
+
+	if !limits.allow(a, now) || !limits.allow(b, now.Add(time.Nanosecond)) {
+		t.Fatal("fresh peers were rate limited")
+	}
+	if !limits.allow(c, now.Add(2*time.Nanosecond)) {
+		t.Fatal("new peer was rejected at the table capacity")
+	}
+	if len(limits.peers) != 2 {
+		t.Fatalf("tracked peers = %d, want 2", len(limits.peers))
+	}
+	if limits.peers[a] != nil || limits.peers[b] == nil || limits.peers[c] == nil {
+		t.Fatal("capacity did not evict the least-recently-used peer")
+	}
+	if !limits.allow(a, now.Add(3*time.Nanosecond)) {
+		t.Fatal("an evicted peer could not re-enter the bounded table")
+	}
+}
+
+func TestServeRepairInvalidPacketsDoNotConsumePeerLimits(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	server := &ServeRepairServer{
+		self:   gossip.Pubkey{1},
+		limits: newServeRepairRateLimits(2, now),
+		now:    func() time.Time { return now },
+	}
+	work := make(chan serveRepairWork, 1)
+	for i := 0; i < 100; i++ {
+		addr := netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(1000+i))
+		server.handlePacket([]byte{0xff}, addr, work)
+	}
+	if len(server.limits.peers) != 0 {
+		t.Fatalf("malformed packets created %d peer limit entries", len(server.limits.peers))
+	}
+
+	_, clientIdentity, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey client: %v", err)
+	}
+	wrongRecipient, err := repairproto.BuildWindowIndexRequest(clientIdentity, gossip.Pubkey{}, 1, 0, 1)
+	if err != nil {
+		t.Fatalf("BuildWindowIndexRequest: %v", err)
+	}
+	for i := 0; i < 100; i++ {
+		addr := netip.AddrPortFrom(netip.MustParseAddr("198.51.100.1"), uint16(1000+i))
+		server.handlePacket(wrongRecipient, addr, work)
+	}
+	if len(server.limits.peers) != 0 {
+		t.Fatalf("header-invalid packets created %d peer limit entries", len(server.limits.peers))
+	}
+	stats := server.Stats()
+	if stats.DropMalformed != 100 || stats.DropHeaderInvalid != 100 {
+		t.Fatalf("invalid packet stats = malformed %d header %d", stats.DropMalformed, stats.DropHeaderInvalid)
 	}
 }
 
@@ -167,10 +229,7 @@ func TestServeRepairWindowHighestAndPing(t *testing.T) {
 	for i := range token {
 		token[i] = byte(i + 1)
 	}
-	ping := binary.LittleEndian.AppendUint32(nil, 0)
-	ping = append(ping, clientPub...)
-	ping = append(ping, token[:]...)
-	ping = append(ping, ed25519.Sign(clientIdentity, token[:])...)
+	ping := buildRepairPing(clientPub, clientIdentity, token)
 	pong := sendRepairRequest(t, client, server.Addr(), ping)
 	if len(pong) != 132 || binary.LittleEndian.Uint32(pong[:4]) != 7 {
 		t.Fatalf("pong shape = %d bytes variant %d", len(pong), binary.LittleEndian.Uint32(pong[:4]))
@@ -203,6 +262,81 @@ func TestServeRepairWindowHighestAndPing(t *testing.T) {
 	if stats.WindowIndex != 3 || stats.HighestWindowIndex != 1 {
 		t.Fatalf("request-kind stats = window %d highest %d", stats.WindowIndex, stats.HighestWindowIndex)
 	}
+}
+
+func TestServeRepairPingBypassesRequestRateLimit(t *testing.T) {
+	serverPub, serverIdentity, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey server: %v", err)
+	}
+	clientPub, clientIdentity, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey client: %v", err)
+	}
+	var serverKey gossip.Pubkey
+	copy(serverKey[:], serverPub)
+
+	spool, err := OpenShredSpool(t.TempDir(), 0)
+	if err != nil {
+		t.Fatalf("OpenShredSpool: %v", err)
+	}
+	defer spool.Close()
+	server, err := NewServeRepairServer(ServeRepairConfig{
+		Addr:     "127.0.0.1:0",
+		Identity: serverIdentity,
+		Store:    spool,
+	})
+	if err != nil {
+		t.Fatalf("NewServeRepairServer: %v", err)
+	}
+	defer server.Close()
+
+	client, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP client: %v", err)
+	}
+	defer client.Close()
+	clientAddr := client.LocalAddr().(*net.UDPAddr).AddrPort()
+
+	request, err := repairproto.BuildWindowIndexRequest(clientIdentity, serverKey, 1, 0, 1)
+	if err != nil {
+		t.Fatalf("BuildWindowIndexRequest: %v", err)
+	}
+	work := make(chan serveRepairWork, serveRepairMaxRequestsPerSecond)
+	for i := 0; i < serveRepairMaxRequestsPerSecond; i++ {
+		server.handlePacket(request, clientAddr, work)
+	}
+	if len(work) != serveRepairMaxRequestsPerSecond {
+		t.Fatalf("queued requests = %d, want %d", len(work), serveRepairMaxRequestsPerSecond)
+	}
+
+	var token [32]byte
+	for i := range token {
+		token[i] = byte(i + 1)
+	}
+	server.handlePacket(buildRepairPing(clientPub, clientIdentity, token), clientAddr, work)
+	if err := client.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	buf := make([]byte, packetDataSize)
+	n, _, err := client.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("ReadFromUDP pong: %v", err)
+	}
+	if n != 132 || binary.LittleEndian.Uint32(buf[:4]) != 7 {
+		t.Fatalf("pong shape = %d bytes variant %d", n, binary.LittleEndian.Uint32(buf[:4]))
+	}
+	stats := server.Stats()
+	if stats.Pings != 1 || stats.Pongs != 1 || stats.RateLimited != 0 {
+		t.Fatalf("ping stats after saturated request limit: %+v", stats)
+	}
+}
+
+func buildRepairPing(pub ed25519.PublicKey, identity ed25519.PrivateKey, token [32]byte) []byte {
+	packet := binary.LittleEndian.AppendUint32(nil, 0)
+	packet = append(packet, pub...)
+	packet = append(packet, token[:]...)
+	return append(packet, ed25519.Sign(identity, token[:])...)
 }
 
 func sendRepairRequest(t *testing.T, conn *net.UDPConn, addr *net.UDPAddr, packet []byte) []byte {
