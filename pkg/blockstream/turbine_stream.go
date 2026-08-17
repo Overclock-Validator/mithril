@@ -315,14 +315,15 @@ func (bs *BlockSource) runTurbineStream() {
 			gossipClient = bs.gossipClient
 		} else if bs.turbineGossipEntrypoint != "" {
 			gossipCfg := gossipclient.Config{
-				Entrypoint:    bs.turbineGossipEntrypoint,
-				BindAddr:      bs.turbineGossipBindAddr,
-				TVUAddr:       bs.turbineBindAddr,
-				AlpenglowAddr: bs.turbineAlpenglowAddr,
-				AdvertisedIP:  bs.turbineAdvertisedIP,
-				ShredVersion:  bs.turbineShredVersion,
-				Identity:      bs.turbineIdentity,
-				Name:          gossipclient.ClientName,
+				Entrypoint:      bs.turbineGossipEntrypoint,
+				BindAddr:        bs.turbineGossipBindAddr,
+				TVUAddr:         bs.turbineBindAddr,
+				ServeRepairAddr: bs.turbineServeRepairAddr,
+				AlpenglowAddr:   bs.turbineAlpenglowAddr,
+				AdvertisedIP:    bs.turbineAdvertisedIP,
+				ShredVersion:    bs.turbineShredVersion,
+				Identity:        bs.turbineIdentity,
+				Name:            gossipclient.ClientName,
 			}
 			client, err := gossipclient.NewClient(gossipCfg)
 			if err != nil {
@@ -347,13 +348,48 @@ func (bs *BlockSource) runTurbineStream() {
 		receiver.SetFirstShredSink(bs.alpenglowFirstShredSink)
 		if bs.shredSpoolDir != "" {
 			if spool, serr := turbine.OpenShredSpool(bs.shredSpoolDir, shredSpoolMaxBytes); serr != nil {
+				if bs.turbineServeRepairAddr != "" {
+					cancelStream()
+					bs.handleLiveShredStreamClosed(fmt.Sprintf("serve-repair shred store unavailable (%s): %v", bs.shredSpoolDir, serr))
+					if bs.waitForStopOrTimeout(backoff) {
+						return
+					}
+					continue
+				}
 				mlog.Log.Warnf("shred spool disabled (%s): %v", bs.shredSpoolDir, serr)
 			} else {
 				receiver.SetShredSpool(spool)
+				if bs.turbineServeRepairAddr != "" {
+					if gossipClient == nil {
+						spool.Close()
+						cancelStream()
+						bs.handleLiveShredStreamClosed("native turbine serve repair requires gossip identity")
+						if bs.waitForStopOrTimeout(backoff) {
+							return
+						}
+						continue
+					}
+					if err := receiver.SetServeRepair(bs.turbineServeRepairAddr, gossipClient.Identity()); err != nil {
+						spool.Close()
+						cancelStream()
+						bs.handleLiveShredStreamClosed(fmt.Sprintf("native turbine serve repair setup failed: %v", err))
+						if bs.waitForStopOrTimeout(backoff) {
+							return
+						}
+						continue
+					}
+				}
 				if slots, bytes := spool.Stats(); slots > 0 {
 					mlog.Log.Infof("shred spool: adopted %d spooled slots (%d proven complete, %.1f MiB) from a previous run — complete slots need zero network", slots, spool.CompleteSlots(), float64(bytes)/(1<<20))
 				}
 			}
+		} else if bs.turbineServeRepairAddr != "" {
+			cancelStream()
+			bs.handleLiveShredStreamClosed("native turbine serve repair requires a shred spool directory")
+			if bs.waitForStopOrTimeout(backoff) {
+				return
+			}
+			continue
 		}
 		// Apply hard invalid identities only after the spool is attached, so
 		// RejectAlpenglowBlockIDAndDiscardSlot removes adopted poisoned files
@@ -426,7 +462,11 @@ func (bs *BlockSource) runTurbineStream() {
 			return
 		}
 
-		mlog.Log.Infof("Native turbine receiver listening on %s", bs.turbineBindAddr)
+		if bs.turbineServeRepairAddr != "" {
+			mlog.Log.Infof("Native turbine receiver listening on %s; serve repair on %s", bs.turbineBindAddr, bs.turbineServeRepairAddr)
+		} else {
+			mlog.Log.Infof("Native turbine receiver listening on %s", bs.turbineBindAddr)
+		}
 		bs.liveStreamConnected.Store(true)
 		bs.liveLastRecvUnix.Store(time.Now().Unix())
 		backoff = liveRetryBackoff
@@ -525,6 +565,13 @@ func (bs *BlockSource) runTurbineStream() {
 					stats.Retransmit.ExhaustedSendBatches, stats.Retransmit.SendDiagnosticSamples, sendDiagnostic, parentDiagnostic, stats.ShredVersionMismatch,
 					stats.ParseErrors, stats.SignatureErrors, stats.MissingLeaders, stats.AssemblyErrors,
 					lastPacketAge, stats.LastDataSlot, stats.LastBlockSlot)
+				if bs.turbineServeRepairAddr != "" {
+					served := stats.ServeRepair
+					mlog.Log.FileOnlyf("serve repair stats: requests=%d window_index=%d highest_window_index=%d served=%d dropped=%d rate_limited=%d queue_drops=%d pings=%d pongs=%d malformed=%d header_invalid=%d signature_invalid=%d not_found=%d store_errors=%d oversized=%d send_errors=%d",
+						served.Requests, served.WindowIndex, served.HighestWindowIndex, served.Served, served.Dropped(), served.RateLimited,
+						served.QueueDrops, served.Pings, served.Pongs, served.DropMalformed, served.DropHeaderInvalid, served.DropSignature,
+						served.DropNotFound, served.DropStoreError, served.DropOversized, served.SendErrors)
+				}
 			case err := <-streamDone:
 				streamErr = err
 				streamDoneConsumed = true

@@ -151,11 +151,12 @@ var (
 	lightbringerQuiet            bool
 
 	// Native turbine receiver config
-	turbineBindAddr         string
-	turbineGossipEntrypoint string
-	turbineGossipBindAddr   string
-	turbineAdvertisedIP     string
-	turbineShredVersion     int
+	turbineBindAddr            string
+	turbineServeRepairBindAddr string
+	turbineGossipEntrypoint    string
+	turbineGossipBindAddr      string
+	turbineAdvertisedIP        string
+	turbineShredVersion        int
 )
 
 func snapshotEpochForState(manifest *snapshot.SnapshotManifest) uint64 {
@@ -581,6 +582,7 @@ func init() {
 	Run.Flags().StringVar(&blockSource, "block-source", "", "Block source: 'turbine', 'rpc', or 'lightbringer' (default: turbine for Alpenglow, rpc otherwise)")
 	Run.Flags().StringVar(&lightbringerEndpoint, "lightbringer-endpoint", "", "Address for Lightbringer endpoint (only used when block-source=lightbringer)")
 	Run.Flags().StringVar(&turbineBindAddr, "turbine-bind-addr", "", "UDP address for native turbine shred receiver (only used when block-source=turbine)")
+	Run.Flags().StringVar(&turbineServeRepairBindAddr, "turbine-serve-repair-bind-addr", "", "UDP address for inbound Solana repair requests (defaults to 0.0.0.0:8003 with gossip; explicit empty disables)")
 	Run.Flags().StringVar(&turbineGossipEntrypoint, "turbine-gossip-entrypoint", "", "Solana gossip entrypoint for native turbine tree joining")
 	Run.Flags().StringVar(&turbineGossipBindAddr, "turbine-gossip-bind-addr", "", "UDP address for native turbine gossip traffic (only used when block-source=turbine)")
 	Run.Flags().IntVar(&repairCatchupMaxGapSlots, "repair-catchup-max-gap-slots", 8192, "Fill resume gaps up to this many slots via turbine repair instead of RPC getBlock (0 = always RPC catchup)")
@@ -885,6 +887,8 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	if turbineBindAddr == "" {
 		turbineBindAddr = config.GetString("turbine.bind_addr")
 	}
+	turbineServeRepairExplicit := flagChanged("turbine-serve-repair-bind-addr") || config.IsSet("turbine.serve_repair_bind_addr")
+	turbineServeRepairBindAddr = getString("turbine-serve-repair-bind-addr", "turbine.serve_repair_bind_addr")
 	turbineGossipEntrypoint = getString("turbine-gossip-entrypoint", "turbine.gossip_entrypoint")
 	turbineGossipBindAddr = getString("turbine-gossip-bind-addr", "turbine.gossip_bind_addr")
 	turbineAdvertisedIP = getString("turbine-advertised-ip", "turbine.advertised_ip")
@@ -970,6 +974,13 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		if turbineBindAddr == "" {
 			turbineBindAddr = "0.0.0.0:8001" // documented default shred port
 			mlog.Log.Infof("turbine bind address not set; defaulting to %s", turbineBindAddr)
+		}
+		if turbineGossipEntrypoint != "" && turbineServeRepairBindAddr == "" && !turbineServeRepairExplicit {
+			turbineServeRepairBindAddr = "0.0.0.0:8003"
+			mlog.Log.Infof("serve repair bind address not set; defaulting to %s", turbineServeRepairBindAddr)
+		}
+		if turbineServeRepairBindAddr != "" && turbineGossipEntrypoint == "" {
+			return fmt.Errorf("turbine.serve_repair_bind_addr requires turbine.gossip_entrypoint so the repair socket has an advertised validator identity")
 		}
 		if turbineShredVersion < 0 || turbineShredVersion > 0xffff {
 			return fmt.Errorf("turbine.shred_version must be between 0 and 65535")
@@ -1474,6 +1485,7 @@ func runLive(c *cobra.Command, args []string) {
 			}
 			pw, err := blockstream.StartTurbinePrewarm(blockstream.TurbinePrewarmConfig{
 				BindAddr:                   turbineBindAddr,
+				ServeRepairBindAddr:        turbineServeRepairBindAddr,
 				GossipEntrypoint:           turbineGossipEntrypoint,
 				GossipBindAddr:             turbineGossipBindAddr,
 				AdvertisedIP:               turbineAdvertisedIP,
@@ -2588,14 +2600,15 @@ postBootstrap:
 			advertisedIP = turbineAdvertisedIP
 		}
 		sharedGossip, err = gossip.NewClient(gossip.Config{
-			Entrypoint:    turbineGossipEntrypoint,
-			BindAddr:      turbineGossipBindAddr,
-			TVUAddr:       turbineBindAddr,
-			AlpenglowAddr: alpenglowAddrForGossip(alpenglowObserverBindAddr),
-			AdvertisedIP:  advertisedIP,
-			ShredVersion:  uint16(turbineShredVersion),
-			Identity:      validatorIdentity,
-			Name:          gossip.ClientName,
+			Entrypoint:      turbineGossipEntrypoint,
+			BindAddr:        turbineGossipBindAddr,
+			TVUAddr:         turbineBindAddr,
+			ServeRepairAddr: turbineServeRepairBindAddr,
+			AlpenglowAddr:   alpenglowAddrForGossip(alpenglowObserverBindAddr),
+			AdvertisedIP:    advertisedIP,
+			ShredVersion:    uint16(turbineShredVersion),
+			Identity:        validatorIdentity,
+			Name:            gossip.ClientName,
 		})
 		if err != nil {
 			klog.Fatalf("validator gossip client: %v", err)
@@ -2800,6 +2813,7 @@ postBootstrap:
 		NearTipLookahead:           blockNearTipLookahead,
 		RepairCatchupMaxGapSlots:   uint64(repairCatchupMaxGapSlots),
 		RepairMaxRequestsPerSecond: repairMaxRequestsPerSecond,
+		TurbineServeRepairAddr:     turbineServeRepairBindAddr,
 		DisableRPCBlockFetch:       !blockRPCFallback,
 		TurbinePrewarm:             turbinePrewarm,
 		PrewarmBlocks:              validatorPrewarmBlocks,
@@ -3333,6 +3347,9 @@ func printStartupInfo(commandName string) {
 	}
 	if blockSource == "turbine" && turbineBindAddr != "" {
 		fmt.Printf("  Turbine UDP:  %s%s%s\n", gold, turbineBindAddr, reset)
+	}
+	if blockSource == "turbine" && turbineServeRepairBindAddr != "" {
+		fmt.Printf("  Repair UDP:   %s%s%s\n", gold, turbineServeRepairBindAddr, reset)
 	}
 	if blockSource == "turbine" && turbineGossipEntrypoint != "" {
 		fmt.Printf("  Gossip:       %s%s%s\n", gold, turbineGossipEntrypoint, reset)

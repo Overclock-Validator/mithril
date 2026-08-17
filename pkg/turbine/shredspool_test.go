@@ -115,6 +115,59 @@ func TestShredSpoolDeduplicatesAndRejectsOverCapFutureWithoutChurn(t *testing.T)
 	}
 }
 
+func TestShredSpoolIndexesCanonicalDataShreds(t *testing.T) {
+	dir := t.TempDir()
+	shreds := generatedAlpenglowDataShreds(t)
+	if len(shreds) < 2 {
+		t.Fatalf("generated %d data shreds, want at least two", len(shreds))
+	}
+	first := shreds[0]
+	last := shreds[len(shreds)-1]
+
+	spool, err := OpenShredSpool(dir, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	for i, shred := range shreds {
+		packet := append([]byte(nil), shred.Payload...)
+		if i == 0 {
+			// A repair response appends its nonce to the canonical shred.
+			packet = binary.LittleEndian.AppendUint32(packet, 0xdecafbad)
+		}
+		if !spool.AppendShred(shred, packet) {
+			t.Fatalf("AppendShred(%d) returned false", shred.Index)
+		}
+	}
+
+	got, ok, err := spool.GetDataShred(first.Slot, uint64(first.Index))
+	if err != nil || !ok {
+		t.Fatalf("GetDataShred = ok %v, err %v", ok, err)
+	}
+	if string(got) != string(first.Payload) {
+		t.Fatalf("exact lookup retained a repair nonce: got %d bytes, want %d", len(got), len(first.Payload))
+	}
+	got, ok, err = spool.GetHighestDataShredFrom(first.Slot, 0)
+	if err != nil || !ok || string(got) != string(last.Payload) {
+		t.Fatalf("GetHighestDataShredFrom = %d bytes, ok %v, err %v; want index %d", len(got), ok, err, last.Index)
+	}
+	if _, ok, err := spool.GetDataShred(first.Slot, uint64(last.Index)+1); err != nil || ok {
+		t.Fatalf("missing exact lookup = ok %v, err %v", ok, err)
+	}
+	spool.Close()
+
+	// A fresh process has no in-memory index; the first request reconstructs it
+	// from checksummed slot records.
+	reopened, err := OpenShredSpool(dir, 0)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	got, ok, err = reopened.GetDataShred(first.Slot, uint64(first.Index))
+	if err != nil || !ok || string(got) != string(first.Payload) {
+		t.Fatalf("adopted exact lookup = %d bytes, ok %v, err %v", len(got), ok, err)
+	}
+}
+
 // A restart adopts leftover slot files: they hydrate instead of re-repairing.
 func TestShredSpoolAdoptsExistingFiles(t *testing.T) {
 	dir := t.TempDir()

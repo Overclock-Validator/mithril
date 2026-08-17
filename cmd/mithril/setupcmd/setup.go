@@ -950,7 +950,8 @@ func (m setupModel) generateConfig() (tea.Model, tea.Cmd) {
 	fmt.Fprintf(&cfg, "max_inflight = %s\n\n", m.blockInflight)
 	if !m.enableLB && m.cluster == "alpenglow" {
 		cfg.WriteString("[turbine]\n")
-		fmt.Fprintf(&cfg, "gossip_entrypoint = %q\n\n", m.gossipEntry)
+		fmt.Fprintf(&cfg, "gossip_entrypoint = %q\n", m.gossipEntry)
+		cfg.WriteString("serve_repair_bind_addr = \"0.0.0.0:8003\"\n\n")
 	}
 
 	if m.enableLB {
@@ -1039,7 +1040,7 @@ mode = "auto"   # "auto" | "snapshot" | "new-snapshot" | "accountsdb"
 
 [storage]
 accounts = "/mnt/mithril-accounts"            # AccountsDB (~500GB, use fastest NVMe)
-shredstore = "/mnt/mithril-ledger/shredstore" # Lightbringer shred storage
+shredstore = "/mnt/mithril-ledger/shredstore" # Received-shred storage
 snapshots = "/mnt/mithril-ledger/snapshots"   # ~100GB for full + incremental
 logs = "/mnt/mithril-logs"                    # Log files (created if missing)
 
@@ -1059,6 +1060,7 @@ max_inflight = 8
 
 [turbine]
 gossip_entrypoint = ""     # REQUIRED for turbine: a gossip entrypoint of your Alpenglow cluster
+serve_repair_bind_addr = "0.0.0.0:8003" # Solana repair service backed by storage.shredstore (open inbound UDP)
 # gossip_bind_addr = "0.0.0.0:65401"
 # advertised_ip = "203.0.113.10"
 # shred_version = 0

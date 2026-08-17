@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -38,6 +39,7 @@ type ShredSpool struct {
 	sizes       map[uint64]int64                      // per-slot bytes on disk (open writers included)
 	seen        map[uint64]map[spoolShredKey]struct{} // distinct shreds appended this run
 	validated   map[uint64]bool                       // adopted files whose record tail was checked this run
+	dataIndex   map[uint64]*spoolDataIndex            // lazily-built exact data-shred record offsets
 	complete    map[uint64]SpoolSlotMeta
 	journal     *os.File // append-only completeness journal (complete.idx)
 	bytes       int64
@@ -50,9 +52,10 @@ type ShredSpool struct {
 
 // SpoolSlotMeta records a slot proven FULLY assembled: every data shred
 // 0..LastIndex was held when the assembler completed it. The completeness
-// index is what turns the spool from a byte cache into the seed of a
-// repair-serving shredstore: complete slots need zero network on restart,
-// answer HighestWindowIndex honestly, and define the serving/retention set.
+// index turns the spool from a byte cache into the seed of a repair-serving
+// shredstore and defines its retention set. Serve-repair itself indexes only
+// canonical raw data shreds present in the spool; FEC-reconstructed data is not
+// persisted without a complete, independently verifiable wire payload.
 type SpoolSlotMeta struct {
 	LastIndex uint32
 	Shreds    uint32
@@ -68,6 +71,19 @@ const spoolRecordHeaderSize = 4 + 4 // packet length + CRC32
 type spoolFile struct {
 	f *os.File
 	w *bufio.Writer
+}
+
+type spoolRecordRef struct {
+	offset       int64
+	storedLength uint32
+	packetLength uint32
+	crc          uint32
+}
+
+type spoolDataIndex struct {
+	records     map[uint32]spoolRecordRef
+	highest     uint32
+	haveHighest bool
 }
 
 type spoolShredKey struct {
@@ -100,6 +116,7 @@ func OpenShredSpool(dir string, maxBytes int64) (*ShredSpool, error) {
 		sizes:     make(map[uint64]int64),
 		seen:      make(map[uint64]map[spoolShredKey]struct{}),
 		validated: make(map[uint64]bool),
+		dataIndex: make(map[uint64]*spoolDataIndex),
 		complete:  make(map[uint64]SpoolSlotMeta),
 		maxBytes:  maxBytes,
 	}
@@ -239,7 +256,7 @@ func (s *ShredSpool) Append(slot uint64, packet []byte) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.appendLocked(slot, packet)
+	_, _ = s.appendLocked(slot, packet)
 }
 
 // AppendShred stores a verified shred only once per process run. Network
@@ -264,32 +281,42 @@ func (s *ShredSpool) AppendShred(shred *Shred, packet []byte) bool {
 			return false
 		}
 	}
-	if !s.appendLocked(shred.Slot, packet) {
+	// ParseShred exposes the canonical payload length. Repair responses carry a
+	// trailing nonce which belongs to the response envelope, not the stored
+	// shred; never persist it or a later serve-repair response would nest nonces.
+	if len(shred.Payload) > 0 && len(shred.Payload) < len(packet) {
+		packet = packet[:len(shred.Payload)]
+	}
+	record, ok := s.appendLocked(shred.Slot, packet)
+	if !ok {
 		return false
 	}
 	if s.seen[shred.Slot] == nil {
 		s.seen[shred.Slot] = make(map[spoolShredKey]struct{})
 	}
 	s.seen[shred.Slot][key] = struct{}{}
+	if shred.Type == ShredTypeData && isMerkleVariant(shred.Variant) {
+		s.indexDataShredLocked(shred.Slot, shred.Index, record)
+	}
 	return true
 }
 
-func (s *ShredSpool) appendLocked(slot uint64, packet []byte) bool {
+func (s *ShredSpool) appendLocked(slot uint64, packet []byte) (spoolRecordRef, bool) {
 	if s.closed || slot < s.floor {
-		return false
+		return spoolRecordRef{}, false
 	}
 	additional := int64(spoolRecordHeaderSize + len(packet))
 	if s.sizes[slot] == 0 {
 		additional += int64(len(spoolFileMagic))
 	}
 	if !s.ensureRoomLocked(slot, additional) {
-		return false
+		return spoolRecordRef{}, false
 	}
 	sf := s.open[slot]
 	if sf == nil {
 		if s.sizes[slot] > 0 && !s.validated[slot] {
 			if _, err := s.readSlotLocked(slot); err != nil {
-				return false
+				return spoolRecordRef{}, false
 			}
 		}
 		if len(s.open) >= spoolOpenFilesCap {
@@ -297,7 +324,7 @@ func (s *ShredSpool) appendLocked(slot uint64, packet []byte) bool {
 		}
 		f, err := os.OpenFile(s.pathFor(slot), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 		if err != nil {
-			return false // disposable cache: failures degrade to repair
+			return spoolRecordRef{}, false // disposable cache: failures degrade to repair
 		}
 		sf = &spoolFile{f: f, w: bufio.NewWriterSize(f, 64<<10)}
 		s.open[slot] = sf
@@ -305,7 +332,7 @@ func (s *ShredSpool) appendLocked(slot uint64, packet []byte) bool {
 			if _, err := sf.w.Write(spoolFileMagic[:]); err != nil {
 				s.closeSlotLocked(slot)
 				_ = os.Remove(s.pathFor(slot))
-				return false
+				return spoolRecordRef{}, false
 			}
 			s.sizes[slot] = int64(len(spoolFileMagic))
 			s.bytes += int64(len(spoolFileMagic))
@@ -315,19 +342,42 @@ func (s *ShredSpool) appendLocked(slot uint64, packet []byte) bool {
 			}
 		}
 	}
+	packetOffset := s.sizes[slot] + spoolRecordHeaderSize
+	packetCRC := crc32.ChecksumIEEE(packet)
 	var hdr [spoolRecordHeaderSize]byte
 	binary.LittleEndian.PutUint32(hdr[:], uint32(len(packet)))
-	binary.LittleEndian.PutUint32(hdr[4:], crc32.ChecksumIEEE(packet))
+	binary.LittleEndian.PutUint32(hdr[4:], packetCRC)
 	if _, err := sf.w.Write(hdr[:]); err != nil {
-		return false
+		return spoolRecordRef{}, false
 	}
 	if _, err := sf.w.Write(packet); err != nil {
-		return false
+		return spoolRecordRef{}, false
 	}
 	written := int64(spoolRecordHeaderSize + len(packet))
 	s.sizes[slot] += written
 	s.bytes += written
-	return true
+	return spoolRecordRef{
+		offset:       packetOffset,
+		storedLength: uint32(len(packet)),
+		packetLength: uint32(len(packet)),
+		crc:          packetCRC,
+	}, true
+}
+
+func (s *ShredSpool) indexDataShredLocked(slot uint64, index uint32, record spoolRecordRef) {
+	data := s.dataIndex[slot]
+	if data == nil {
+		data = &spoolDataIndex{records: make(map[uint32]spoolRecordRef)}
+		s.dataIndex[slot] = data
+	}
+	if _, exists := data.records[index]; exists {
+		return
+	}
+	data.records[index] = record
+	if !data.haveHighest || index > data.highest {
+		data.highest = index
+		data.haveHighest = true
+	}
 }
 
 // closeOldestLocked flushes and closes one open handle (lowest slot: it is
@@ -382,6 +432,7 @@ func (s *ShredSpool) dropSlotLocked(slot uint64) {
 	delete(s.sizes, slot)
 	delete(s.seen, slot)
 	delete(s.validated, slot)
+	delete(s.dataIndex, slot)
 	delete(s.complete, slot)
 	_ = os.Remove(s.pathFor(slot))
 	if s.journal != nil {
@@ -490,12 +541,176 @@ func (s *ShredSpool) readSlotLocked(slot uint64) ([][]byte, error) {
 		s.sizes[slot] = int64(validEnd)
 		s.bytes += int64(validEnd) - oldSize
 		delete(s.complete, slot)
+		delete(s.dataIndex, slot)
 		if s.journal != nil {
 			s.journal.Write(spoolJournalRecord(slot, SpoolSlotMeta{}))
 		}
 	}
 	s.validated[slot] = true
 	return packets, nil
+}
+
+// GetDataShred returns the canonical data-shred packet for an exact index.
+// The on-disk record index is built lazily for adopted slot files and updated
+// incrementally for new appends, so serving does not rescan a whole slot per
+// request.
+func (s *ShredSpool) GetDataShred(slot uint64, index uint64) ([]byte, bool, error) {
+	if index > math.MaxUint32 {
+		return nil, false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, false, fmt.Errorf("shred spool is closed")
+	}
+	data, err := s.ensureDataIndexLocked(slot)
+	if err != nil {
+		return nil, false, err
+	}
+	record, ok := data.records[uint32(index)]
+	if !ok {
+		return nil, false, nil
+	}
+	packet, err := s.readRecordLocked(slot, record)
+	return packet, err == nil, err
+}
+
+// GetHighestDataShredFrom returns the stored data shred with the highest
+// index greater than or equal to minIndex.
+func (s *ShredSpool) GetHighestDataShredFrom(slot uint64, minIndex uint64) ([]byte, bool, error) {
+	if minIndex > math.MaxUint32 {
+		return nil, false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, false, fmt.Errorf("shred spool is closed")
+	}
+	data, err := s.ensureDataIndexLocked(slot)
+	if err != nil {
+		return nil, false, err
+	}
+	minimum := uint32(minIndex)
+	if !data.haveHighest || data.highest < minimum {
+		return nil, false, nil
+	}
+	record, ok := data.records[data.highest]
+	if !ok {
+		delete(s.dataIndex, slot)
+		return nil, false, fmt.Errorf("shred spool data index lost highest shred %d for slot %d", data.highest, slot)
+	}
+	packet, err := s.readRecordLocked(slot, record)
+	return packet, err == nil, err
+}
+
+func (s *ShredSpool) ensureDataIndexLocked(slot uint64) (*spoolDataIndex, error) {
+	if data := s.dataIndex[slot]; data != nil {
+		return data, nil
+	}
+	dataIndex := &spoolDataIndex{records: make(map[uint32]spoolRecordRef)}
+	if s.sizes[slot] <= int64(len(spoolFileMagic)) {
+		s.dataIndex[slot] = dataIndex
+		return dataIndex, nil
+	}
+
+	s.closeSlotLocked(slot)
+	data, err := os.ReadFile(s.pathFor(slot))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) < len(spoolFileMagic) || string(data[:len(spoolFileMagic)]) != string(spoolFileMagic[:]) {
+		s.dropSlotLocked(slot)
+		return nil, fmt.Errorf("invalid shred spool header for slot %d", slot)
+	}
+
+	validEnd := len(spoolFileMagic)
+	for off := validEnd; off < len(data); {
+		if off+spoolRecordHeaderSize > len(data) {
+			break
+		}
+		storedLength := int(binary.LittleEndian.Uint32(data[off : off+4]))
+		wantCRC := binary.LittleEndian.Uint32(data[off+4 : off+spoolRecordHeaderSize])
+		packetStart := off + spoolRecordHeaderSize
+		packetEnd := packetStart + storedLength
+		if storedLength <= 0 || packetEnd < packetStart || packetEnd > len(data) {
+			break
+		}
+		packet := data[packetStart:packetEnd]
+		if crc32.ChecksumIEEE(packet) != wantCRC {
+			break
+		}
+		if len(packet) > shredFECSetIndexOffset+3 {
+			shredType, classifyErr := classifyVariant(packet[shredVariantOffset])
+			packetSlot := binary.LittleEndian.Uint64(packet[shredSlotOffset : shredSlotOffset+8])
+			if classifyErr == nil && shredType == ShredTypeData && isMerkleVariant(packet[shredVariantOffset]) && packetSlot == slot {
+				index := binary.LittleEndian.Uint32(packet[shredIndexOffset : shredIndexOffset+4])
+				packetLength := storedLength
+				// Merkle data shreds have a fixed canonical payload. Older spool
+				// files may contain the four-byte repair nonce after it.
+				if packetLength > dataPayloadSize {
+					packetLength = dataPayloadSize
+				}
+				record := spoolRecordRef{
+					offset:       int64(packetStart),
+					storedLength: uint32(storedLength),
+					packetLength: uint32(packetLength),
+					crc:          wantCRC,
+				}
+				if _, exists := dataIndex.records[index]; !exists {
+					dataIndex.records[index] = record
+				}
+				if !dataIndex.haveHighest || index > dataIndex.highest {
+					dataIndex.highest = index
+					dataIndex.haveHighest = true
+				}
+			}
+		}
+		off = packetEnd
+		validEnd = packetEnd
+	}
+	if validEnd != len(data) {
+		if err := os.Truncate(s.pathFor(slot), int64(validEnd)); err != nil {
+			return nil, fmt.Errorf("truncate corrupt shred spool tail for slot %d: %w", slot, err)
+		}
+		oldSize := s.sizes[slot]
+		s.sizes[slot] = int64(validEnd)
+		s.bytes += int64(validEnd) - oldSize
+		delete(s.complete, slot)
+		if s.journal != nil {
+			s.journal.Write(spoolJournalRecord(slot, SpoolSlotMeta{}))
+		}
+	}
+	s.validated[slot] = true
+	s.dataIndex[slot] = dataIndex
+	return dataIndex, nil
+}
+
+func (s *ShredSpool) readRecordLocked(slot uint64, record spoolRecordRef) ([]byte, error) {
+	// A just-appended record may still live in the per-slot bufio writer. Flush
+	// it before opening a separate read handle; keep the append handle open so a
+	// busy repair service does not turn every response into an open/close cycle.
+	if sf := s.open[slot]; sf != nil {
+		if err := sf.w.Flush(); err != nil {
+			return nil, err
+		}
+	}
+	f, err := os.Open(s.pathFor(slot))
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	stored := make([]byte, int(record.storedLength))
+	if _, err := f.ReadAt(stored, record.offset); err != nil {
+		return nil, err
+	}
+	if crc32.ChecksumIEEE(stored) != record.crc {
+		delete(s.dataIndex, slot)
+		return nil, fmt.Errorf("shred spool record checksum mismatch for slot %d", slot)
+	}
+	if record.packetLength > record.storedLength {
+		return nil, fmt.Errorf("invalid shred spool record length %d/%d for slot %d", record.packetLength, record.storedLength, slot)
+	}
+	return stored[:record.packetLength], nil
 }
 
 // SetFloor advances the retention floor, deleting slot files strictly below
