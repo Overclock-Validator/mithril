@@ -481,6 +481,83 @@ func relaxedSnapshotProbeConfig(cfg config.Config) config.Config {
 	return relaxed
 }
 
+func saturatingDoublePositiveInt(value int) int {
+	if value <= 0 {
+		return value
+	}
+	maxInt := int(^uint(0) >> 1)
+	if value > maxInt/2 {
+		return maxInt
+	}
+	return value * 2
+}
+
+// relaxedIncrementalSnapshotProbeConfig combines the general network-probe
+// fallback with the incremental selector's existing two-pass age policy. The
+// max preserves relaxedSnapshotProbeConfig's 10k floor for unusually strict
+// configurations while retaining the normal threshold-doubling behaviour.
+func relaxedIncrementalSnapshotProbeConfig(cfg config.Config) config.Config {
+	relaxed := relaxedSnapshotProbeConfig(cfg)
+	doubledThreshold := saturatingDoublePositiveInt(cfg.IncrementalThreshold)
+	if doubledThreshold > relaxed.IncrementalThreshold {
+		relaxed.IncrementalThreshold = doubledThreshold
+	}
+	return relaxed
+}
+
+type incrementalSnapshotNodeSorter func(
+	[]rpc.NodeResult,
+	config.Config,
+	*rpc.ProbeStats,
+	int64,
+	int,
+) ([]string, []rpc.RankedNode)
+
+// rankIncrementalSnapshotNodes runs the normal source ranking first, then a
+// deliberately more tolerant network probe if the strict pass produces no
+// usable candidate. ProbeStats is mandatory in snapshot-finder, so each pass
+// always receives a non-nil instance; keeping the instances separate also
+// preserves the strict pass's diagnostic counters.
+func rankIncrementalSnapshotNodes(
+	results []rpc.NodeResult,
+	cfg config.Config,
+	stats *rpc.ProbeStats,
+	fullSnapshotSlot int,
+	referenceSlot int,
+	sorter incrementalSnapshotNodeSorter,
+) ([]string, []rpc.RankedNode) {
+	if stats == nil {
+		stats = rpc.NewProbeStats()
+	}
+
+	bestNodes, rankedNodes := sorter(
+		results, cfg, stats, int64(fullSnapshotSlot), referenceSlot)
+	if len(bestNodes) > 0 && len(rankedNodes) > 0 {
+		return bestNodes, rankedNodes
+	}
+	if cfg.IncrementalThreshold <= 0 {
+		return bestNodes, rankedNodes
+	}
+
+	relaxedCfg := relaxedIncrementalSnapshotProbeConfig(cfg)
+	mlog.Log.Warnf("Strict incremental snapshot source probe found no usable nodes; retrying with relaxed probe filters (rtt=%dms->%dms, full_threshold=%d->%d, inc_threshold=%d->%d, stage1_timeout=%dms->%dms, stage1_sample=%d+%dx%dKiB->%d+%dx%dKiB, stage2_min_ratio=%.2f->%.2f)",
+		cfg.MaxRTTMs, relaxedCfg.MaxRTTMs,
+		cfg.FullThreshold, relaxedCfg.FullThreshold,
+		cfg.IncrementalThreshold, relaxedCfg.IncrementalThreshold,
+		cfg.Stage1TimeoutMS, relaxedCfg.Stage1TimeoutMS,
+		cfg.Stage1WarmKiB, cfg.Stage1Windows, cfg.Stage1WindowKiB,
+		relaxedCfg.Stage1WarmKiB, relaxedCfg.Stage1Windows, relaxedCfg.Stage1WindowKiB,
+		cfg.Stage2MinRatio, relaxedCfg.Stage2MinRatio)
+
+	relaxedStats := rpc.NewProbeStats()
+	bestNodes, rankedNodes = sorter(
+		results, relaxedCfg, relaxedStats, int64(fullSnapshotSlot), referenceSlot)
+	if len(bestNodes) > 0 && len(rankedNodes) > 0 {
+		mlog.Log.Infof("Relaxed incremental snapshot probe selected %d candidate(s)", len(bestNodes))
+	}
+	return bestNodes, rankedNodes
+}
+
 func snapshotProbeConfigChanged(a config.Config, b config.Config) bool {
 	return a.MaxRTTMs != b.MaxRTTMs ||
 		a.FullThreshold != b.FullThreshold ||
@@ -1175,24 +1252,14 @@ func DownloadIncrementalSnapshotWithConfig(path string, referenceSlot int, fullS
 		return "", 0, 0, fmt.Errorf("no nodes found with incremental base slot %d", fullSnapshotSlot)
 	}
 
-	// Step 3.5: Apply threshold filtering with two-pass approach
-	bestNodes, rankedNodes := rpc.SortBestRPCsFilteredBySlot(
-		baseMatchingResults, cfg, stats, int64(fullSnapshotSlot), referenceSlot)
+	// Step 3.5: Rank with strict filters, then retry with the shared relaxed
+	// network-probe policy when strict sampling produces no usable candidates.
+	bestNodes, rankedNodes := rankIncrementalSnapshotNodes(
+		baseMatchingResults, cfg, stats, fullSnapshotSlot, referenceSlot,
+		rpc.SortBestRPCsFilteredBySlot)
 
-	// Pass 2: If no matches, relax incremental threshold
-	if len(bestNodes) == 0 && cfg.IncrementalThreshold > 0 {
-		relaxedThreshold := cfg.IncrementalThreshold * 2
-		mlog.Log.Infof("Pass 1 found no matches within threshold %d, trying relaxed threshold %d...",
-			cfg.IncrementalThreshold, relaxedThreshold)
-
-		relaxedCfg := cfg
-		relaxedCfg.IncrementalThreshold = relaxedThreshold
-		bestNodes, rankedNodes = rpc.SortBestRPCsFilteredBySlot(
-			baseMatchingResults, relaxedCfg, nil, int64(fullSnapshotSlot), referenceSlot)
-	}
-
-	if len(bestNodes) == 0 {
-		return "", 0, 0, fmt.Errorf("no nodes found with snapshots >= slot %d within threshold", fullSnapshotSlot)
+	if len(bestNodes) == 0 || len(rankedNodes) == 0 {
+		return "", 0, 0, fmt.Errorf("no usable nodes found with incremental base slot %d", fullSnapshotSlot)
 	}
 
 	mlog.Log.Infof("Found %d nodes with matching incremental", len(bestNodes))
@@ -1451,40 +1518,14 @@ func GetIncrementalSnapshotURL(fullSnapshotURL string, referenceSlot int, fullSn
 	// THEN let speed rank them. Applies to both threshold passes below.
 	baseMatchingResults = restrictToFreshestIncrementals(baseMatchingResults, incrementalFreshnessBandSlots)
 
-	// Step 2.2: Two-pass filtering - try strict threshold first, then relaxed
-	var matchingNodes []rpc.RankedNode
+	// Step 2.2: Rank with strict filters, then retry with the shared relaxed
+	// network-probe policy when strict sampling produces no usable candidates.
+	bestNodes, matchingNodes := rankIncrementalSnapshotNodes(
+		baseMatchingResults, cfg, stats, fullSnapshotSlot, referenceSlot,
+		rpc.SortBestRPCsFilteredBySlot)
 
-	// Pass 1: Apply normal incremental threshold
-	_, rankedNodes := rpc.SortBestRPCsFilteredBySlot(
-		baseMatchingResults, cfg, stats, int64(fullSnapshotSlot), referenceSlot)
-	for _, node := range rankedNodes {
-		matchingNodes = append(matchingNodes, node)
-	}
-
-	// Pass 2: If no matches found, relax incremental threshold and retry
-	if len(matchingNodes) == 0 && cfg.IncrementalThreshold > 0 {
-		relaxedThreshold := cfg.IncrementalThreshold * 2
-		mlog.Log.Infof("Pass 1 found no matches within threshold %d, trying relaxed threshold %d...",
-			cfg.IncrementalThreshold, relaxedThreshold)
-
-		// Create a config with relaxed threshold
-		relaxedCfg := cfg
-		relaxedCfg.IncrementalThreshold = relaxedThreshold
-
-		_, rankedNodesRelaxed := rpc.SortBestRPCsFilteredBySlot(
-			baseMatchingResults, relaxedCfg, nil, int64(fullSnapshotSlot), referenceSlot)
-		for _, node := range rankedNodesRelaxed {
-			matchingNodes = append(matchingNodes, node)
-		}
-
-		if len(matchingNodes) > 0 {
-			mlog.Log.Infof("Pass 2 (relaxed threshold) found %d matching nodes", len(matchingNodes))
-		}
-	}
-
-	if len(matchingNodes) == 0 {
-		return "", 0, 0, fmt.Errorf("no nodes found with incremental base slot %d within threshold (strict: %d, relaxed: %d)",
-			fullSnapshotSlot, cfg.IncrementalThreshold, cfg.IncrementalThreshold*2)
+	if len(bestNodes) == 0 || len(matchingNodes) == 0 {
+		return "", 0, 0, fmt.Errorf("no usable nodes found with incremental base slot %d", fullSnapshotSlot)
 	}
 
 	// Filter out nodes that are too slow (incrementals are ~1GB, don't want 15min downloads)

@@ -3,6 +3,7 @@ package snapshotdl
 import (
 	"testing"
 
+	snapconfig "github.com/Overclock-Validator/solana-snapshot-finder-go/pkg/config"
 	snaprpc "github.com/Overclock-Validator/solana-snapshot-finder-go/pkg/rpc"
 )
 
@@ -162,5 +163,208 @@ func TestRelaxedSnapshotProbeConfigUsesTinyStage1Sample(t *testing.T) {
 	}
 	if relaxed.Stage1Windows != 1 {
 		t.Fatalf("Stage1Windows = %d, want 1", relaxed.Stage1Windows)
+	}
+}
+
+func TestRelaxedIncrementalSnapshotProbeConfigThreshold(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	tests := []struct {
+		name string
+		in   int
+		want int
+	}{
+		{name: "ten thousand floor", in: 2_000, want: 10_000},
+		{name: "observed production threshold", in: 10_000, want: 20_000},
+		{name: "larger custom threshold", in: 20_000, want: 40_000},
+		{name: "overflow saturates", in: maxInt, want: maxInt},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultSnapshotConfig().toInternalConfig("")
+			cfg.IncrementalThreshold = tt.in
+			cfg.Stage1Concurrency = 37
+			cfg.TCPTimeoutMs = 1_234
+
+			relaxed := relaxedIncrementalSnapshotProbeConfig(cfg)
+			if relaxed.IncrementalThreshold != tt.want {
+				t.Fatalf("IncrementalThreshold = %d, want %d", relaxed.IncrementalThreshold, tt.want)
+			}
+			if relaxed.Stage1Concurrency != cfg.Stage1Concurrency {
+				t.Fatalf("Stage1Concurrency = %d, want preserved value %d", relaxed.Stage1Concurrency, cfg.Stage1Concurrency)
+			}
+			if relaxed.TCPTimeoutMs != cfg.TCPTimeoutMs {
+				t.Fatalf("TCPTimeoutMs = %d, want preserved value %d", relaxed.TCPTimeoutMs, cfg.TCPTimeoutMs)
+			}
+			if cfg.IncrementalThreshold != tt.in {
+				t.Fatalf("input config mutated: IncrementalThreshold = %d, want %d", cfg.IncrementalThreshold, tt.in)
+			}
+		})
+	}
+}
+
+func TestRankIncrementalSnapshotNodesStrictSuccessDoesNotRetry(t *testing.T) {
+	cfg := DefaultSnapshotConfig().toInternalConfig("")
+	cfg.IncrementalThreshold = 10_000
+	stats := snaprpc.NewProbeStats()
+	results := []snaprpc.NodeResult{{
+		RPC:      "http://snapshot.example.com:8899",
+		FullSlot: 408_345,
+		HasInc:   true,
+		IncBase:  408_345,
+		IncSlot:  420_408,
+	}}
+	wantBest := []string{results[0].RPC}
+	wantRanked := []snaprpc.RankedNode{{Result: results[0]}}
+	calls := 0
+
+	best, ranked := rankIncrementalSnapshotNodes(
+		results, cfg, stats, 408_345, 420_660,
+		func(
+			gotResults []snaprpc.NodeResult,
+			gotCfg snapconfig.Config,
+			gotStats *snaprpc.ProbeStats,
+			minSlot int64,
+			referenceSlot int,
+		) ([]string, []snaprpc.RankedNode) {
+			calls++
+			if gotStats != stats {
+				t.Fatalf("strict stats pointer changed")
+			}
+			if gotCfg.IncrementalThreshold != cfg.IncrementalThreshold {
+				t.Fatalf("strict IncrementalThreshold = %d, want %d", gotCfg.IncrementalThreshold, cfg.IncrementalThreshold)
+			}
+			if minSlot != 408_345 || referenceSlot != 420_660 {
+				t.Fatalf("slot arguments = (%d, %d), want (408345, 420660)", minSlot, referenceSlot)
+			}
+			if len(gotResults) != 1 || gotResults[0].RPC != results[0].RPC {
+				t.Fatalf("unexpected ranking results input: %+v", gotResults)
+			}
+			return wantBest, wantRanked
+		},
+	)
+
+	if calls != 1 {
+		t.Fatalf("sorter calls = %d, want 1", calls)
+	}
+	if len(best) != 1 || best[0] != wantBest[0] {
+		t.Fatalf("best nodes = %v, want %v", best, wantBest)
+	}
+	if len(ranked) != 1 || ranked[0].Result.RPC != wantRanked[0].Result.RPC {
+		t.Fatalf("ranked nodes = %+v, want %+v", ranked, wantRanked)
+	}
+}
+
+func TestRankIncrementalSnapshotNodesStrictFailureRelaxedSuccess(t *testing.T) {
+	cfg := DefaultSnapshotConfig().toInternalConfig("")
+	cfg.MaxRTTMs = 200
+	cfg.FullThreshold = 150_000
+	cfg.IncrementalThreshold = 10_000
+	cfg.Stage1TimeoutMS = 3_000
+	cfg.Stage1WarmKiB = 512
+	cfg.Stage1WindowKiB = 512
+	cfg.Stage1Windows = 4
+	cfg.Stage1Concurrency = 37
+	cfg.Stage2TopK = 8
+	cfg.Stage2MinRatio = 0.6
+	cfg.TCPTimeoutMs = 1_234
+	strictStats := snaprpc.NewProbeStats()
+	results := []snaprpc.NodeResult{{
+		RPC:      "http://snapshot.example.com:8899",
+		FullSlot: 408_345,
+		HasInc:   true,
+		IncBase:  408_345,
+		IncSlot:  420_408,
+	}}
+	wantBest := []string{results[0].RPC}
+	wantRanked := []snaprpc.RankedNode{{Result: results[0]}}
+	calls := 0
+
+	best, ranked := rankIncrementalSnapshotNodes(
+		results, cfg, strictStats, 408_345, 420_660,
+		func(
+			_ []snaprpc.NodeResult,
+			gotCfg snapconfig.Config,
+			gotStats *snaprpc.ProbeStats,
+			_ int64,
+			_ int,
+		) ([]string, []snaprpc.RankedNode) {
+			calls++
+			switch calls {
+			case 1:
+				if gotStats != strictStats {
+					t.Fatalf("strict stats pointer changed")
+				}
+				if gotCfg.IncrementalThreshold != 10_000 || gotCfg.MaxRTTMs != 200 {
+					t.Fatalf("strict config was unexpectedly relaxed: %+v", gotCfg)
+				}
+				return nil, nil
+			case 2:
+				if gotStats == nil {
+					t.Fatal("relaxed stats is nil")
+				}
+				if gotStats == strictStats {
+					t.Fatal("relaxed pass reused strict stats")
+				}
+				if gotCfg.MaxRTTMs != 1_000 || gotCfg.FullThreshold != 1_000_000 || gotCfg.IncrementalThreshold != 20_000 {
+					t.Fatalf("relaxed filters = rtt:%d full:%d incremental:%d, want 1000/1000000/20000",
+						gotCfg.MaxRTTMs, gotCfg.FullThreshold, gotCfg.IncrementalThreshold)
+				}
+				if gotCfg.Stage1TimeoutMS != 8_000 || gotCfg.Stage1WarmKiB != 0 || gotCfg.Stage1WindowKiB != 64 || gotCfg.Stage1Windows != 1 {
+					t.Fatalf("relaxed Stage 1 = timeout:%d sample:%d+%dx%dKiB, want 8000 and 0+1x64KiB",
+						gotCfg.Stage1TimeoutMS, gotCfg.Stage1WarmKiB, gotCfg.Stage1Windows, gotCfg.Stage1WindowKiB)
+				}
+				if gotCfg.Stage2TopK != 16 || gotCfg.Stage2MinRatio != 0 {
+					t.Fatalf("relaxed Stage 2 = top-k:%d min-ratio:%f, want 16/0", gotCfg.Stage2TopK, gotCfg.Stage2MinRatio)
+				}
+				if gotCfg.Stage1Concurrency != cfg.Stage1Concurrency || gotCfg.TCPTimeoutMs != cfg.TCPTimeoutMs {
+					t.Fatalf("unrelated settings changed: concurrency=%d tcp-timeout=%d", gotCfg.Stage1Concurrency, gotCfg.TCPTimeoutMs)
+				}
+				return wantBest, wantRanked
+			default:
+				t.Fatalf("unexpected sorter call %d", calls)
+				return nil, nil
+			}
+		},
+	)
+
+	if calls != 2 {
+		t.Fatalf("sorter calls = %d, want 2", calls)
+	}
+	if len(best) != 1 || best[0] != wantBest[0] {
+		t.Fatalf("best nodes = %v, want %v", best, wantBest)
+	}
+	if len(ranked) != 1 || ranked[0].Result.RPC != wantRanked[0].Result.RPC {
+		t.Fatalf("ranked nodes = %+v, want %+v", ranked, wantRanked)
+	}
+	if cfg.IncrementalThreshold != 10_000 || cfg.MaxRTTMs != 200 {
+		t.Fatalf("input config was mutated: %+v", cfg)
+	}
+}
+
+func TestRankIncrementalSnapshotNodesNormalizesNilStrictStats(t *testing.T) {
+	cfg := DefaultSnapshotConfig().toInternalConfig("")
+	results := []snaprpc.NodeResult{{RPC: "http://snapshot.example.com:8899"}}
+	calls := 0
+
+	best, ranked := rankIncrementalSnapshotNodes(
+		results, cfg, nil, 1, 2,
+		func(
+			_ []snaprpc.NodeResult,
+			_ snapconfig.Config,
+			gotStats *snaprpc.ProbeStats,
+			_ int64,
+			_ int,
+		) ([]string, []snaprpc.RankedNode) {
+			calls++
+			if gotStats == nil {
+				t.Fatal("strict stats is nil")
+			}
+			return []string{results[0].RPC}, []snaprpc.RankedNode{{Result: results[0]}}
+		},
+	)
+
+	if calls != 1 || len(best) != 1 || len(ranked) != 1 {
+		t.Fatalf("calls/best/ranked = %d/%d/%d, want 1/1/1", calls, len(best), len(ranked))
 	}
 }
