@@ -223,6 +223,7 @@ func BuildAccountsDbAuto(
 	pinnedIncrementalSlot := incrSlot
 	var pinnedIncrementalManifestHash [sha256.Size]byte
 	havePinnedIncrementalManifestHash := false
+	var incrementalManifestCopy *SnapshotManifest
 
 	// Retry loop for incremental snapshot download
 	// If download fails mid-way (not context cancellation), re-discover mirrors
@@ -259,7 +260,7 @@ func BuildAccountsDbAuto(
 		}
 
 		mlog.Log.FileOnlyf("Parsing incremental snapshot manifest...")
-		incrementalManifestCopy, err := UnmarshalManifestFromSnapshot(ctx, incrementalSnapshotPath, accountsDbDir)
+		incrementalManifestCopy, err = UnmarshalManifestFromSnapshot(ctx, incrementalSnapshotPath, accountsDbDir)
 		if err != nil {
 			mlog.Log.Errorf("reading incremental snapshot manifest: %v", err)
 			continue

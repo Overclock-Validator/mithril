@@ -108,9 +108,11 @@ func TestReadTarRejectsArchiveMissingManifestAppendVec(t *testing.T) {
 	writeStatusCacheArchive(t, archive, []byte("status-cache"), 1)
 	pools := &snapshotWorkerPools{
 		errors: &snapshotWorkerErrors{},
-		manifest: &SnapshotManifest{AccountsDb: &AccountsDbFields{Storages: map[uint64]SlotAcctVecs{
-			7: {Slot: 7, AcctVecs: []AcctVec{{Id: 9, FileSize: 123}}},
-		}}},
+		manifest: &SnapshotManifest{
+			Bank: &DeserializableVersionedBank{Slot: 7},
+			AccountsDb: &AccountsDbFields{Slot: 7, Storages: map[uint64]SlotAcctVecs{
+				7: {Slot: 7, AcctVecs: []AcctVec{{Id: 9, FileSize: 123}}},
+			}}},
 	}
 	destination := filepath.Join(dir, "status-cache")
 
@@ -129,7 +131,8 @@ func TestReadTarBindsManifestPassAndRequiresSupportedVersion(t *testing.T) {
 	dir := t.TempDir()
 	expectedManifest := []byte("manifest-selected-on-first-pass")
 	manifest := &SnapshotManifest{
-		AccountsDb:   &AccountsDbFields{Storages: map[uint64]SlotAcctVecs{}},
+		Bank:         &DeserializableVersionedBank{Slot: 7},
+		AccountsDb:   &AccountsDbFields{Slot: 7, Storages: map[uint64]SlotAcctVecs{}},
 		rawDigest:    sha256.Sum256(expectedManifest),
 		hasRawDigest: true,
 	}

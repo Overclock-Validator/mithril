@@ -27,11 +27,19 @@ type snapshotAppendVecKey struct {
 	fileID uint64
 }
 
-// expectedSnapshotAppendVecs turns the manifest's AccountsDB storage table
-// into the exact set of appendvec members that the corresponding archive must
-// contain.  Building this once also prevents an incremental archive from
-// falling back to a same-named file in the full manifest.
+// expectedSnapshotAppendVecs validates and flattens a manifest's AccountsDB
+// storage table.  A full snapshot archive contains this entire set.  An
+// incremental manifest may also describe inherited storages from the full
+// snapshot, so callers handling an incremental archive must additionally apply
+// the base-slot rule in expectedIncrementalSnapshotAppendVecs.
 func expectedSnapshotAppendVecs(manifest *SnapshotManifest) (map[snapshotAppendVecKey]uint64, error) {
+	return expectedSnapshotAppendVecsMatching(manifest, nil)
+}
+
+func expectedSnapshotAppendVecsMatching(
+	manifest *SnapshotManifest,
+	include func(storageSlot uint64) bool,
+) (map[snapshotAppendVecKey]uint64, error) {
 	if manifest == nil || manifest.AccountsDb == nil {
 		return nil, errors.New("snapshot manifest has no AccountsDB storage table")
 	}
@@ -43,6 +51,9 @@ func expectedSnapshotAppendVecs(manifest *SnapshotManifest) (map[snapshotAppendV
 				"snapshot manifest storage key %d does not match embedded slot %d",
 				storageSlot, storage.Slot,
 			)
+		}
+		if include != nil && !include(storageSlot) {
+			continue
 		}
 		// Modern Agave snapshot restore requires exactly one storage entry for
 		// every slot represented in this table.  Accepting several appendvecs
@@ -82,6 +93,63 @@ func expectedSnapshotAppendVecs(manifest *SnapshotManifest) (map[snapshotAppendV
 	return expected, nil
 }
 
+// expectedFullSnapshotAppendVecs returns the complete physical storage set for
+// a full archive and rejects slots that an Agave full snapshot cannot contain.
+func expectedFullSnapshotAppendVecs(full *SnapshotManifest) (map[snapshotAppendVecKey]uint64, error) {
+	if full == nil || full.Bank == nil {
+		return nil, errors.New("full snapshot manifest has no bank")
+	}
+	expected, err := expectedSnapshotAppendVecs(full)
+	if err != nil {
+		return nil, err
+	}
+	for key := range expected {
+		if key.slot > full.Bank.Slot {
+			return nil, fmt.Errorf(
+				"full snapshot storage slot %d is newer than bank slot %d",
+				key.slot, full.Bank.Slot,
+			)
+		}
+	}
+	return expected, nil
+}
+
+// expectedIncrementalSnapshotAppendVecs returns the appendvecs that must be
+// physically present in an incremental archive.  Agave serializes the bank
+// snapshot before pruning the archive's storage list, so a production
+// incremental manifest can contain the complete current storage inventory.
+// The archive itself contains only storages newer than the selected full
+// snapshot's base slot (the same set Agave restores as incremental_storage).
+//
+// Inherited manifest rows are deliberately ignored here.  They are not
+// physical members of the incremental archive and Agave reconstructs those
+// storages from the full archive.
+func expectedIncrementalSnapshotAppendVecs(
+	full *SnapshotManifest,
+	incremental *SnapshotManifest,
+) (map[snapshotAppendVecKey]uint64, error) {
+	if err := validateSnapshotManifestPair(full, incremental); err != nil {
+		return nil, err
+	}
+
+	baseSlot := full.Bank.Slot
+	expected, err := expectedSnapshotAppendVecsMatching(incremental, func(storageSlot uint64) bool {
+		return storageSlot > baseSlot
+	})
+	if err != nil {
+		return nil, err
+	}
+	for key := range expected {
+		if key.slot > incremental.Bank.Slot {
+			return nil, fmt.Errorf(
+				"incremental snapshot storage slot %d is newer than bank slot %d",
+				key.slot, incremental.Bank.Slot,
+			)
+		}
+	}
+	return expected, nil
+}
+
 // snapshotVerificationAppendVecs returns the complete physical input set for
 // independently verifying the final state of a full snapshot, optionally
 // overlaid by its incremental snapshot.  The returned order is deterministic
@@ -90,24 +158,28 @@ func snapshotVerificationAppendVecs(
 	full *SnapshotManifest,
 	incremental *SnapshotManifest,
 ) ([]accountsdb.SnapshotAppendVecSpec, error) {
-	type manifestRole struct {
+	type archiveRole struct {
 		name     string
-		manifest *SnapshotManifest
+		expected map[snapshotAppendVecKey]uint64
 	}
-	roles := []manifestRole{{name: "full", manifest: full}}
+	fullExpected, err := expectedFullSnapshotAppendVecs(full)
+	if err != nil {
+		return nil, fmt.Errorf("validate full snapshot storage table: %w", err)
+	}
+	roles := []archiveRole{{name: "full", expected: fullExpected}}
 	if incremental != nil {
-		roles = append(roles, manifestRole{name: "incremental", manifest: incremental})
+		incrementalExpected, err := expectedIncrementalSnapshotAppendVecs(full, incremental)
+		if err != nil {
+			return nil, fmt.Errorf("validate incremental snapshot storage table: %w", err)
+		}
+		roles = append(roles, archiveRole{name: "incremental", expected: incrementalExpected})
 	}
 
 	var specs []accountsdb.SnapshotAppendVecSpec
 	seenSlots := make(map[uint64]string)
 	seenFileIDs := make(map[uint64]snapshotAppendVecKey)
 	for _, role := range roles {
-		expected, err := expectedSnapshotAppendVecs(role.manifest)
-		if err != nil {
-			return nil, fmt.Errorf("validate %s snapshot storage table: %w", role.name, err)
-		}
-		for key, fileSize := range expected {
+		for key, fileSize := range role.expected {
 			if previousRole, exists := seenSlots[key.slot]; exists {
 				return nil, fmt.Errorf(
 					"snapshot pair represents storage slot %d in both %s and %s manifests",

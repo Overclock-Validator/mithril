@@ -651,8 +651,13 @@ func readTar(
 		manifest := pools.manifest
 		if options.isIncremental {
 			manifest = pools.incrementalManifest
+			expectedAppendVecs, err = expectedIncrementalSnapshotAppendVecs(
+				pools.manifest,
+				pools.incrementalManifest,
+			)
+		} else {
+			expectedAppendVecs, err = expectedFullSnapshotAppendVecs(manifest)
 		}
-		expectedAppendVecs, err = expectedSnapshotAppendVecs(manifest)
 		if err != nil {
 			return fmt.Errorf("validate snapshot appendvec manifest: %w", err)
 		}

@@ -247,7 +247,11 @@ base58 snapshot hash are bound to the decoded manifest, incremental archives
 are bound to their selected full snapshot, and the manifest bytes seen during
 extraction must exactly match the first pass. Appendvecs are streamed to
 no-replace temporary files, synced, atomically published and checked against
-the manifest's exact member set and sizes.
+the exact physical member set and sizes. Full archives contain their complete
+manifest storage set. Agave incremental manifests may repeat inherited storage
+metadata, but their archives contain exactly the manifest storages whose slots
+are newer than the selected full snapshot; inherited rows are resolved from
+the full archive and never treated as incremental members.
 
 Alpenglow replay restores the snapshot manifest's exact block ID, persists it
 as the fresh-replay parent anchor, and never substitutes the PoH bank hash.
@@ -255,13 +259,14 @@ After a rooted fold, the rooted resume context supersedes that snapshot seed.
 A missing, zero, malformed or noncanonical manifest/rooted block ID fails
 closed before replay rather than fabricating chain identity.
 
-Before the snapshot is accepted, AccountsDB sequentially scans every declared
-appendvec in bounded batches, asks the newly built immutable index which exact
-location wins for every full public key, and recomputes both capitalization and
-AccountsLtHash from those selected records. The calculated values, selected-key
-count and filename snapshot hash must all match the manifest. Missing, extra,
-malformed, replaced or symlinked appendvecs fail bootstrap while the exclusive
-guard remains held.
+Before the snapshot is accepted, AccountsDB sequentially scans every physical
+full-snapshot appendvec plus every post-base incremental appendvec in bounded
+batches, asks the newly built immutable index which exact location wins for
+every full public key, and recomputes both capitalization and AccountsLtHash
+from those selected records. The calculated values, selected-key count and
+filename snapshot hash must all match the manifest. Missing, extra, malformed,
+replaced or symlinked appendvecs fail bootstrap while the exclusive guard
+remains held.
 
 The verifier retains that fully opened immutable generation for the final
 AccountsDB handoff; it does not start the mutable writer or any maintenance

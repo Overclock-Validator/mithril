@@ -120,14 +120,30 @@ func TestExpectedSnapshotAppendVecsRequiresExactUniqueStorageTable(t *testing.T)
 	require.ErrorContains(t, err, "does not match embedded slot")
 }
 
+func TestExpectedFullSnapshotAppendVecsRejectsStorageNewerThanBank(t *testing.T) {
+	manifest := &SnapshotManifest{
+		Bank: &DeserializableVersionedBank{Slot: 100},
+		AccountsDb: &AccountsDbFields{Slot: 100, Storages: map[uint64]SlotAcctVecs{
+			101: {Slot: 101, AcctVecs: []AcctVec{{Id: 2, FileSize: 10}}},
+		}},
+	}
+
+	_, err := expectedFullSnapshotAppendVecs(manifest)
+	require.ErrorContains(t, err, "storage slot 101 is newer than bank slot 100")
+}
+
 func TestSnapshotVerificationAppendVecsCombinesAndSortsExactPair(t *testing.T) {
-	full := &SnapshotManifest{AccountsDb: &AccountsDbFields{Storages: map[uint64]SlotAcctVecs{
-		9: {Slot: 9, AcctVecs: []AcctVec{{Id: 90, FileSize: 900}}},
-		2: {Slot: 2, AcctVecs: []AcctVec{{Id: 20, FileSize: 200}}},
-	}}}
-	incremental := &SnapshotManifest{AccountsDb: &AccountsDbFields{Storages: map[uint64]SlotAcctVecs{
-		12: {Slot: 12, AcctVecs: []AcctVec{{Id: 120, FileSize: 1200}}},
-	}}}
+	full := &SnapshotManifest{
+		Bank: &DeserializableVersionedBank{Slot: 9},
+		AccountsDb: &AccountsDbFields{Slot: 9, Storages: map[uint64]SlotAcctVecs{
+			9: {Slot: 9, AcctVecs: []AcctVec{{Id: 90, FileSize: 900}}},
+			2: {Slot: 2, AcctVecs: []AcctVec{{Id: 20, FileSize: 200}}},
+		}}}
+	incremental := &SnapshotManifest{
+		Bank: &DeserializableVersionedBank{Slot: 12},
+		AccountsDb: &AccountsDbFields{Slot: 12, Storages: map[uint64]SlotAcctVecs{
+			12: {Slot: 12, AcctVecs: []AcctVec{{Id: 120, FileSize: 1200}}},
+		}}}
 
 	specs, err := snapshotVerificationAppendVecs(full, incremental)
 	require.NoError(t, err)
@@ -140,8 +156,13 @@ func TestSnapshotVerificationAppendVecsCombinesAndSortsExactPair(t *testing.T) {
 	incremental.AccountsDb.Storages[9] = SlotAcctVecs{
 		Slot: 9, AcctVecs: []AcctVec{{Id: 91, FileSize: 901}},
 	}
-	_, err = snapshotVerificationAppendVecs(full, incremental)
-	require.ErrorContains(t, err, "storage slot 9")
+	specs, err = snapshotVerificationAppendVecs(full, incremental)
+	require.NoError(t, err)
+	require.Equal(t, []accountsdb.SnapshotAppendVecSpec{
+		{Slot: 2, FileID: 20, FileSize: 200},
+		{Slot: 9, FileID: 90, FileSize: 900},
+		{Slot: 12, FileID: 120, FileSize: 1200},
+	}, specs, "inherited incremental rows are not physical archive members")
 	delete(incremental.AccountsDb.Storages, 9)
 
 	incremental.AccountsDb.Storages[12] = SlotAcctVecs{
