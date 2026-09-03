@@ -21,7 +21,7 @@ func (t *Timing) AddTimingSince(start time.Time) {
 
 // AccountLoader is the per-slot decomposition of LoadBlockAccounts. Counters
 // describe logical loader work; allocation counters cover objects/data created
-// directly by the batch loader rather than runtime or Pebble internals.
+// directly by the batch loader rather than runtime or storage internals.
 type AccountLoader struct {
 	AddressTableLookups Timing
 	DedupeBlockAccounts Timing
@@ -58,22 +58,38 @@ type AccountLoader struct {
 	SysvarCachePublicationWait  Timing
 	SysvarCachePublication      Timing
 
-	RequestedKeys  uint64
-	DurableKeys    uint64
-	ParentAccounts uint64
+	RequestedKeys     uint64
+	UniqueKeys        uint64
+	DuplicateKeys     uint64
+	DurableKeys       uint64
+	UniqueDurableKeys uint64
+	ParentAccounts    uint64
 
-	WorkingSetHits    uint64
-	InProgressHits    uint64
-	PendingFoldHits   uint64
-	CacheHits         uint64
-	IndexHits         uint64
-	IndexMisses       uint64
-	UniqueAppendVecs  uint64
-	AppendVecChunks   uint64
-	AppendVecAccounts uint64
-	OpenFailures      uint64
-	ReadFailures      uint64
-	RetryAccounts     uint64
+	WorkingSetHits          uint64
+	InProgressHits          uint64
+	PendingFoldHits         uint64
+	CacheHits               uint64
+	IndexHits               uint64
+	IndexMisses             uint64
+	DeltaIndexProbes        uint64
+	DeltaIndexHits          uint64
+	DeltaIndexTombstones    uint64
+	BaseIndexProbes         uint64
+	BaseIndexCandidates     uint64
+	BaseIndexHits           uint64
+	BaseIndexFalsePositives uint64
+	UniqueAppendVecs        uint64
+	AppendVecChunks         uint64
+	AppendVecAccounts       uint64
+	OpenFailures            uint64
+	ReadFailures            uint64
+	RetryAccounts           uint64
+	AppendVecReadRanges     uint64
+	AppendVecPreadCalls     uint64
+	AppendVecRequestedBytes uint64
+	// AppendVecPhysicalReadBytes includes bounded coalescing gap over-read and
+	// therefore exposes userspace read amplification against RequestedBytes.
+	AppendVecPhysicalReadBytes uint64
 
 	CommonCacheAdmissions        uint64
 	CommonCacheAdmissionsSkipped uint64
@@ -92,6 +108,59 @@ type AccountLoader struct {
 	SysvarCacheHits                    uint64
 	SysvarDurableReads                 uint64
 	SysvarCachePublicationEpochRejects uint64
+}
+
+// AccountIndex is one compact per-slot snapshot of the production AccountsDB
+// index. It deliberately contains no shard list, artifact paths, or root
+// lineage identifier, so replay_timings.jsonl remains bounded and comparable.
+type AccountIndex struct {
+	Enabled                          bool
+	RootGeneration                   uint64
+	MinimumCoveredSequence           uint64
+	BaseKeys                         uint64
+	BaseArtifactBytes                uint64
+	ExtentCatalogEntries             uint64
+	ExtentCatalogCapacity            uint64
+	ExtentCatalogRemaining           uint64
+	DeltaKeys                        uint64
+	DeltaArtifactBytes               uint64
+	CheckpointSelectedBytes          uint64
+	CheckpointBuildReservedBytes     uint64
+	CheckpointObsoleteBytes          uint64
+	CheckpointPhysicalBytes          uint64
+	MaxCheckpointSelectedBytes       uint64
+	MaxCheckpointPhysicalBytes       uint64
+	CheckpointSelectedHighWaterBytes uint64
+	CheckpointBuildHighWaterBytes    uint64
+	CheckpointObsoleteHighWaterBytes uint64
+	CheckpointPhysicalHighWaterBytes uint64
+	CheckpointReservationRejects     uint64
+	CheckpointPressureRebases        uint64
+	HotKeys                          uint64
+	HotBytes                         uint64
+	WALSequence                      uint64
+	WALBytes                         uint64
+	SealCount                        uint64
+	RebaseCount                      uint64
+	RewriteCount                     uint64
+	SealsInProgress                  uint64
+	RebasesInProgress                uint64
+	ObsoleteBaseGenerationsPending   uint64
+	SealRetriesPending               uint64
+	RebaseRetriesPending             uint64
+	RewriteInProgress                bool
+	MaintenanceErrors                uint64
+	FoldCommits                      uint64
+	FoldWALFrames                    uint64
+	OversizedFoldCommits             uint64
+	LargestFoldKeys                  uint64
+	WorkingSetHeldSlots              uint64
+	WorkingSetRetainedBytes          uint64
+	WorkingSetHighWaterBytes         uint64
+	WorkingSetMaxRetainedBytes       uint64
+	WorkingSetLargestSlotBytes       uint64
+	WorkingSetHighWaterOverageBytes  uint64
+	FatalError                       bool
 }
 
 // TurbineIngress is the exact per-slot pre-replay pipeline decomposition.
@@ -128,6 +197,7 @@ type VoteRewardDetails struct {
 type BlockReplay struct {
 	Slot           uint64
 	AccountLoader  AccountLoader
+	AccountIndex   AccountIndex
 	TurbineIngress TurbineIngress
 
 	// Exact slot wall-clock closure: SlotReplay equals the sum of the disjoint

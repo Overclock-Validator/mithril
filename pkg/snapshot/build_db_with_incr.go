@@ -2,7 +2,8 @@ package snapshot
 
 import (
 	"context"
-	"encoding/binary"
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,7 +17,6 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/progress"
 	"github.com/Overclock-Validator/mithril/pkg/rpcclient"
 	"github.com/Overclock-Validator/mithril/pkg/snapshotdl"
-	"github.com/cockroachdb/pebble"
 	"github.com/panjf2000/ants/v2"
 )
 
@@ -45,16 +45,41 @@ func BuildAccountsDbAuto(
 	blockDir string,
 	snapCfg snapshotdl.SnapshotConfig,
 	dp *progress.DualProgress,
-) (*accountsdb.AccountsDb, *SnapshotManifest, error) {
+) (_ *accountsdb.AccountsDb, _ *SnapshotManifest, retErr error) {
 	// Clean any leftover artifacts from previous incomplete runs (e.g., Ctrl+C)
-	CleanAccountsDbDir(accountsDbDir)
+	storeGuard, err := beginSnapshotBootstrap(accountsDbDir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("clean previous AccountsDB: %w", err)
+	}
+	storeGuardTransferred := false
+	defer func() {
+		// The root remains private only while this guard is live. Remove every
+		// incomplete/unverified bootstrap artifact before unlocking on failure,
+		// rather than exposing a structurally valid but untrusted V2 selector.
+		if retErr != nil && !storeGuardTransferred {
+			retErr = errors.Join(retErr, cleanAccountsDbDirLocked(accountsDbDir))
+		}
+		retErr = errors.Join(retErr, storeGuard.Close())
+	}()
 
 	mlog.Log.Infof("Parsing full snapshot manifest...")
 	manifest, err := UnmarshalManifestFromSnapshot(ctx, fullSnapshotFile, accountsDbDir)
 	if err != nil {
-		return nil, nil, fmt.Errorf("reading snapshot manifest: %v", err)
+		return nil, nil, fmt.Errorf("reading snapshot manifest: %w", err)
 	}
 	mlog.Log.Infof("Parsed full snapshot manifest")
+	if err := validateSnapshotManifestPair(manifest, nil); err != nil {
+		return nil, nil, fmt.Errorf("validate full snapshot role: %w", err)
+	}
+	if err := validateSnapshotArchiveManifestSlots(fullSnapshotFile, manifest, "", nil); err != nil {
+		return nil, nil, fmt.Errorf("validate full snapshot archive identity: %w", err)
+	}
+	if fullSnapshotSlot < 0 || manifest.Bank.Slot != uint64(fullSnapshotSlot) {
+		return nil, nil, fmt.Errorf(
+			"selected full snapshot slot %d does not match manifest bank slot %d",
+			fullSnapshotSlot, manifest.Bank.Slot,
+		)
+	}
 	if OnFullSnapshotManifestParsed != nil {
 		OnFullSnapshotManifestParsed(manifest)
 	}
@@ -79,7 +104,15 @@ func BuildAccountsDbAuto(
 		return nil, nil, err
 	}
 	defer cleanupIndexWorkDir()
-	sl := NewShardLogger(numShards, logsDir)
+	sl, err := NewShardLogger(numShards, logsDir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("creating snapshot shard logger: %w", err)
+	}
+	defer func() {
+		if abortErr := sl.Abort(); abortErr != nil {
+			mlog.Log.Warnf("failed to abort snapshot shard logger: %v", abortErr)
+		}
+	}()
 
 	// Create stake pubkey collector for building stake index during appendvec processing
 	stakeCollector := &stakeIndexCollector{
@@ -100,9 +133,12 @@ func BuildAccountsDbAuto(
 			if err := os.MkdirAll(snapshotDownloadPath, 0o755); err != nil {
 				return nil, nil, fmt.Errorf("failed to create snapshot download directory %s: %w", snapshotDownloadPath, err)
 			}
-			// Extract filename from URL and create save path
-			urlParts := strings.Split(fullSnapshotFile, "/")
-			filename := urlParts[len(urlParts)-1]
+			// Parse only the URL path basename: query credentials must never
+			// become part of a local filename.
+			filename, identityErr := snapshotArchiveIdentity(fullSnapshotFile)
+			if identityErr != nil {
+				return nil, nil, fmt.Errorf("identify full snapshot cache filename: %w", identityErr)
+			}
 			fullSavePath = filepath.Join(snapshotDownloadPath, filename)
 			mlog.Log.Infof("Will save full snapshot to %s while streaming", fullSavePath)
 		}
@@ -180,9 +216,19 @@ func BuildAccountsDbAuto(
 		return nil, nil, fmt.Errorf("%s", errMsg)
 	}
 	mlog.Log.Debugf("found incremental snapshot URL in %s: %s", fmtDuration(time.Since(incrSnapshotDlStart)), incrementalSnapshotPath)
+	pinnedIncrementalIdentity, err := snapshotArchiveIdentity(incrementalSnapshotPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("identify incremental snapshot: %w", err)
+	}
+	pinnedIncrementalSlot := incrSlot
+	var pinnedIncrementalManifestHash [sha256.Size]byte
+	havePinnedIncrementalManifestHash := false
 
 	// Retry loop for incremental snapshot download
-	// If download fails mid-way (not context cancellation), re-discover sources and retry
+	// If download fails mid-way (not context cancellation), re-discover mirrors
+	// of the exact same archive and retry. Switching to a different archive here
+	// would mix already-published appendvecs and index-log entries from two
+	// independently valid snapshots.
 	maxIncrRetries := 3
 	for incrAttempt := range maxIncrRetries {
 		if ctx.Err() != nil {
@@ -191,11 +237,24 @@ func BuildAccountsDbAuto(
 		if incrAttempt > 0 {
 			// Re-discover incremental snapshot URL (sources may have changed)
 			mlog.Log.Infof("Incremental download failed, re-discovering sources (attempt %d/%d)...", incrAttempt+1, maxIncrRetries)
-			incrementalSnapshotPath, _, incrSlot, err = snapshotdl.GetIncrementalSnapshotURL(fullSnapshotFile, referenceSlot, fullSnapshotSlot, snapCfg)
+			candidatePath, _, candidateSlot, rediscoverErr := snapshotdl.GetIncrementalSnapshotURL(fullSnapshotFile, referenceSlot, fullSnapshotSlot, snapCfg)
+			err = rediscoverErr
 			if err != nil {
 				mlog.Log.Errorf("Failed to re-discover incremental snapshot: %v", err)
 				continue
 			}
+			candidateIdentity, identityErr := snapshotArchiveIdentity(candidatePath)
+			if identityErr != nil {
+				return nil, nil, fmt.Errorf("identify re-discovered incremental snapshot: %w", identityErr)
+			}
+			if candidateSlot != pinnedIncrementalSlot || candidateIdentity != pinnedIncrementalIdentity {
+				return nil, nil, fmt.Errorf(
+					"incremental retry would mix snapshot %q at slot %d with %q at slot %d",
+					pinnedIncrementalIdentity, pinnedIncrementalSlot, candidateIdentity, candidateSlot,
+				)
+			}
+			incrementalSnapshotPath = candidatePath
+			incrSlot = candidateSlot
 			mlog.Log.Infof("Found new incremental snapshot URL: %s (slot %d)", incrementalSnapshotPath, incrSlot)
 		}
 
@@ -204,6 +263,33 @@ func BuildAccountsDbAuto(
 		if err != nil {
 			mlog.Log.Errorf("reading incremental snapshot manifest: %v", err)
 			continue
+		}
+		manifestBytes, manifestReadErr := readManifestFile(filepath.Join(accountsDbDir, "manifest"))
+		if manifestReadErr != nil {
+			return nil, nil, fmt.Errorf("read published incremental manifest for retry validation: %w", manifestReadErr)
+		}
+		manifestHash := sha256.Sum256(manifestBytes)
+		if havePinnedIncrementalManifestHash && manifestHash != pinnedIncrementalManifestHash {
+			return nil, nil, fmt.Errorf(
+				"incremental snapshot %q returned different manifest bytes across retries",
+				pinnedIncrementalIdentity,
+			)
+		}
+		pinnedIncrementalManifestHash = manifestHash
+		havePinnedIncrementalManifestHash = true
+		if err := validateSnapshotManifestPair(manifest, incrementalManifestCopy); err != nil {
+			return nil, nil, fmt.Errorf("validate full/incremental snapshot pairing: %w", err)
+		}
+		if err := validateSnapshotArchiveManifestSlots(
+			fullSnapshotFile, manifest, incrementalSnapshotPath, incrementalManifestCopy,
+		); err != nil {
+			return nil, nil, fmt.Errorf("validate incremental snapshot archive identity: %w", err)
+		}
+		if incrSlot < 0 || incrementalManifestCopy.Bank.Slot != uint64(incrSlot) {
+			return nil, nil, fmt.Errorf(
+				"selected incremental snapshot slot %d does not match manifest bank slot %d",
+				incrSlot, incrementalManifestCopy.Bank.Slot,
+			)
 		}
 		// Copy the manifest so the worker pool's pointer has the value.
 		*incrementalManifest = *incrementalManifestCopy
@@ -221,9 +307,7 @@ func BuildAccountsDbAuto(
 					return nil, nil, fmt.Errorf("failed to create snapshot download directory %s: %w", snapshotDownloadPath, err)
 				}
 				// Extract filename from URL and create save path
-				urlParts := strings.Split(incrementalSnapshotPath, "/")
-				filename := urlParts[len(urlParts)-1]
-				incrSavePath = filepath.Join(snapshotDownloadPath, filename)
+				incrSavePath = filepath.Join(snapshotDownloadPath, pinnedIncrementalIdentity)
 				mlog.Log.FileOnlyf("Will save incremental snapshot to %s while streaming", incrSavePath)
 			}
 		}
@@ -247,67 +331,56 @@ func BuildAccountsDbAuto(
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := syncDirectory(appendVecsOutputDir); err != nil {
+		return nil, nil, fmt.Errorf("persist snapshot appendvec publications: %w", err)
+	}
 
 	// Show indexing progress for shard flush
 	indexProgress := progress.NewIndexingProgress("Flush (shard logs)")
 	indexProgress.Start(numShards)
-	sl.CloseWithProgress(ctx, func(completed, total int) {
+	err = sl.CloseWithProgress(ctx, func(completed, total int) {
 		indexProgress.Update(completed, total)
 	})
-	indexDir := filepath.Join(accountsDbDir, "mithril_db")
-	index, err := ingestSSTFiles(indexDir, logsDir)
 	if err != nil {
-		return nil, nil, fmt.Errorf("initializing pebble from SST files: %w", err)
+		return nil, nil, fmt.Errorf("closing shard logger: %w", err)
 	}
-	index.Close()
-
-	var largestFileIdBytes [8]byte
-	binary.LittleEndian.PutUint64(largestFileIdBytes[:], largestFileId.Load())
-
-	path := filepath.Join(accountsDbDir, "largest_file_id")
-	if err := os.WriteFile(path, largestFileIdBytes[:], 0644); err != nil {
-		mlog.Log.Errorf("error while writing largest file ID=%d to %s: %s", largestFileId.Load(), path, err)
+	if err := buildSnapshotAccountsIndex(ctx, accountsDbDir, logsDir, storeGuard); err != nil {
 		return nil, nil, err
 	}
-
-	// bootstrap_high_file_id: write-once record of the highest fileId produced
-	// by snapshot bootstrap. The batch-fold engine uses it to classify data
-	// files: anything newer without a manifest is an undecided orphan.
-	bootstrapHighPath := filepath.Join(accountsDbDir, "bootstrap_high_file_id")
-	if err := os.WriteFile(bootstrapHighPath, largestFileIdBytes[:], 0644); err != nil {
-		mlog.Log.Errorf("error while writing bootstrap high file ID to %s: %s", bootstrapHighPath, err)
-		return nil, nil, err
-	}
-
-	bankHashOutputFileName := filepath.Join(accountsDbDir, "bank_hash")
-	if err := os.WriteFile(bankHashOutputFileName, manifest.Bank.Hash[:], 0644); err != nil {
-		mlog.Log.Errorf("error writing bank hash=%x to file=%s: %s", manifest.Bank.Hash, bankHashOutputFileName, err)
-		return nil, nil, err
-	}
-
-	// Write stake pubkey index file (with appendvec location hints)
-	stakeIndexPath := filepath.Join(accountsDbDir, "stake_pubkeys.idx")
-	if err := accountsdb.WriteStakePubkeyIndex(stakeIndexPath, stakeCollector.entries); err != nil {
-		return nil, nil, fmt.Errorf("writing stake pubkey index: %w", err)
-	}
-
-	bankhashDir := filepath.Join(accountsDbDir, "bankhash_db")
-	bankhashDb, err := pebble.Open(bankhashDir, &pebble.Options{})
-	if err != nil {
-		return nil, nil, fmt.Errorf("opening bankhashDir=%s: %w", bankhashDir, err)
-	}
-	bankhashDb.Close()
-
-	accountsDb, err := accountsdb.OpenDb(accountsDbDir)
+	preparedIndex, err := verifyBuiltSnapshotAccountsState(
+		ctx, accountsDbDir, manifest, incrementalManifest, incrementalManifest, storeGuard,
+	)
 	if err != nil {
 		return nil, nil, err
 	}
+	defer func() {
+		retErr = errors.Join(retErr, preparedIndex.Close())
+	}()
 
-	rpcClient := rpcclient.NewRpcClient(rpcEndpoints[0])
-	latestSlot, err := rpcClient.GetSlot()
-	_, incrSlot = snapshotdl.ExtractIncrementalSnapshotSlots(incrementalSnapshotPath)
+	if err := finalizeSnapshotBootstrapArtifacts(
+		accountsDbDir,
+		largestFileId.Load(),
+		incrementalManifest.Bank.Hash,
+		stakeCollector.entries,
+	); err != nil {
+		return nil, nil, err
+	}
 
-	if err != nil || latestSlot == 0 {
+	accountsDb, err := accountsdb.OpenDbWithPreparedSnapshotAccountIndexAndStoreGuard(
+		accountsDbDir, preparedIndex, storeGuard,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	storeGuardTransferred = true
+
+	var latestSlot uint64
+	if len(rpcEndpoints) != 0 {
+		rpcClient := rpcclient.NewRpcClient(rpcEndpoints[0])
+		latestSlot, err = rpcClient.GetSlot()
+	}
+
+	if len(rpcEndpoints) == 0 || err != nil || latestSlot == 0 {
 		mlog.Log.Infof("Node currently at slot %d (unable to fetch chain tip)", incrSlot)
 	} else if latestSlot > uint64(incrSlot) {
 		mlog.Log.Infof("Node currently at slot %d, chain tip at slot %d (%d slots behind)", incrSlot, latestSlot, latestSlot-uint64(incrSlot))

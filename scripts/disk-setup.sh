@@ -1494,6 +1494,88 @@ find_mithril_dirs() {
     printf '%s\n' "${dirs[@]}"
 }
 
+# Release AccountsDB store locks acquired by acquire_accounts_store_locks.
+# The stable lock inode is deliberately left in place: unlinking it could let a
+# running process and a cleaner lock two different inodes for the same store.
+release_accounts_store_locks() {
+    local lock_fd
+
+    for lock_fd in "$@"; do
+        flock -u "$lock_fd" 2>/dev/null || true
+        exec {lock_fd}>&- 2>/dev/null || true
+    done
+}
+
+# Conservatively lock every non-OS Mithril data root before a destructive
+# command enumerates it. Accounts artifacts have historically been allowed at
+# any discovered Mithril root, so deciding which roots to lock by inspecting
+# their contents would itself race a running node.
+#
+# The caller must keep the returned descriptors open for the complete scan and
+# deletion. clean_accounts and clean_all run in subshells as a final safety net,
+# so Bash also closes every held descriptor on return, error, interrupt, or exit.
+acquire_accounts_store_locks() {
+    local held_fds_name="$1"
+    shift
+    local -n held_fds="$held_fds_name"
+    local accounts_root lock_path lock_fd fd_path
+
+    if ! command -v flock >/dev/null 2>&1; then
+        warn "Cannot safely clean AccountsDB data: required command 'flock' is not installed"
+        return 1
+    fi
+
+    for accounts_root in "$@"; do
+        # These roots are not deletion targets because of the existing OS-disk
+        # guard, so do not create a lockfile in them either.
+        if path_on_root_disk "$accounts_root"; then
+            continue
+        fi
+        if [[ -L "$accounts_root" || ! -d "$accounts_root" ]]; then
+            warn "Cannot safely lock AccountsDB root: $accounts_root is not a real directory"
+            release_accounts_store_locks "${held_fds[@]}"
+            held_fds=()
+            return 1
+        fi
+
+        lock_path="$accounts_root/accounts_index_v2.lock"
+        if [[ -L "$lock_path" ]]; then
+            warn "Cannot safely lock AccountsDB root: $lock_path is a symbolic link"
+            release_accounts_store_locks "${held_fds[@]}"
+            held_fds=()
+            return 1
+        fi
+
+        lock_fd=""
+        if ! exec {lock_fd}<>"$lock_path"; then
+            warn "Cannot open AccountsDB store lock: $lock_path"
+            release_accounts_store_locks "${held_fds[@]}"
+            held_fds=()
+            return 1
+        fi
+        if ! flock -xn "$lock_fd"; then
+            warn "Refusing to clean $accounts_root: its AccountsDB store is in use"
+            exec {lock_fd}>&- 2>/dev/null || true
+            release_accounts_store_locks "${held_fds[@]}"
+            held_fds=()
+            return 1
+        fi
+
+        # Match the runtime's no-follow/same-inode checks. A replaced lock path
+        # must fail closed, otherwise two processes could each hold a different
+        # inode and both believe they have exclusive access to the store.
+        fd_path="/proc/$BASHPID/fd/$lock_fd"
+        if [[ -L "$lock_path" || ! -f "$lock_path" || ! "$lock_path" -ef "$fd_path" ]]; then
+            warn "Cannot safely clean $accounts_root: its store lock path changed while locking"
+            exec {lock_fd}>&- 2>/dev/null || true
+            release_accounts_store_locks "${held_fds[@]}"
+            held_fds=()
+            return 1
+        fi
+        held_fds+=("$lock_fd")
+    done
+}
+
 dir_size() {
     local dir="$1"
     if [[ -d "$dir" ]]; then
@@ -1660,12 +1742,12 @@ clean_subdir() {
     show_disk_space_summary "$mount_point" "$before_used" "$before_free" "$after_used" "$after_free" "$before_total" "$fstype"
 }
 
-clean_accounts() {
+clean_accounts() (
     info "CLEANING Accounts data"
     echo ""
 
     # Accounts artifacts (stored directly in mount point, not a subdirectory)
-    local artifacts=("accounts" "mithril_db" "mithril_db_log_shards" "bankhash_db" "largest_file_id" "bank_hash" "manifest" "mithril_state.json")
+    local artifacts=("accounts" "accounts_index.root" "accounts_delta_v2.journal" "accounts_delta_v2.journal.rewrite.partial" "accounts_delta_shards" "accounts_index.stmh" "accounts_index.stmh.partial" "accounts_index.manifest" "accounts_index.manifest.tmp" "accounts_delta.journal" "accounts_delta.journal.rewrite.partial" "accounts_index_runs" "mithril_db" "mithril_db_build" "mithril_db_log_shards" "bankhash_db" "largest_file_id" "bootstrap_high_file_id" "bank_hash" "stake_pubkeys.idx" "manifest" "mithril_state.json")
 
     # Find Mithril directories
     mapfile -t mithril_dirs < <(find_mithril_dirs)
@@ -1674,6 +1756,13 @@ clean_accounts() {
         warn "No Mithril data directories found"
         echo ""
         echo "  Checked: /mnt/mithril-accounts, /mnt/mithril-ledger"
+        return 1
+    fi
+
+    # Hold all possible AccountsDB roots before inspecting any account
+    # artifact. The descriptors remain live through the complete deletion.
+    local account_store_lock_fds=()
+    if ! acquire_accounts_store_locks account_store_lock_fds "${mithril_dirs[@]}"; then
         return 1
     fi
 
@@ -1699,10 +1788,50 @@ clean_accounts() {
                 echo "    $mithril_dir/$artifact  ($size)"
             fi
         done
+        while IFS= read -r -d '' parts_dir; do
+            if path_on_root_disk "$parts_dir"; then
+                warn "SKIPPING $parts_dir - on OS disk (safety protection)"
+                continue
+            fi
+            local size
+            size=$(dir_size "$parts_dir")
+            paths_to_clean+=("$parts_dir")
+            [[ -z "$primary_dir" ]] && primary_dir="$mithril_dir"
+            echo "    $parts_dir  ($size)"
+        done < <(find "$mithril_dir" -maxdepth 1 -type d -name 'streamhash-parts-*' -print0 2>/dev/null)
+        while IFS= read -r -d '' checkpoint_artifact; do
+            if path_on_root_disk "$checkpoint_artifact"; then
+                warn "SKIPPING $checkpoint_artifact - on OS disk (safety protection)"
+                continue
+            fi
+            local size
+            size=$(dir_size "$checkpoint_artifact")
+            paths_to_clean+=("$checkpoint_artifact")
+            [[ -z "$primary_dir" ]] && primary_dir="$mithril_dir"
+            echo "    $checkpoint_artifact  ($size)"
+        done < <(find "$mithril_dir" -maxdepth 1 \( -type f -name 'accounts_delta_checkpoint.*' -o -type d -name '.delta-checkpoint-build-*' \) -print0 2>/dev/null)
+        while IFS= read -r -d '' v2_artifact; do
+            local v2_name
+            v2_name=$(basename "$v2_artifact")
+            if [[ ! "$v2_name" =~ ^accounts-index-v2-g[0-9]{20}-[0-9a-f]{32}$ &&
+                  ! "$v2_name" =~ ^accounts_index\.root\.tmp-[A-Za-z0-9]+$ ]]; then
+                continue
+            fi
+            if path_on_root_disk "$v2_artifact"; then
+                warn "SKIPPING $v2_artifact - on OS disk (safety protection)"
+                continue
+            fi
+            local size
+            size=$(dir_size "$v2_artifact")
+            paths_to_clean+=("$v2_artifact")
+            [[ -z "$primary_dir" ]] && primary_dir="$mithril_dir"
+            echo "    $v2_artifact  ($size)"
+        done < <(find "$mithril_dir" -maxdepth 1 \( -type d -name 'accounts-index-v2-g*' -o -type f -name 'accounts_index.root.tmp-*' \) -print0 2>/dev/null)
     done
 
     if [[ ${#paths_to_clean[@]} -eq 0 ]]; then
         echo "  No accounts artifacts found to delete."
+        release_accounts_store_locks "${account_store_lock_fds[@]}"
         return 0
     fi
 
@@ -1738,7 +1867,8 @@ clean_accounts() {
 
     echo ""
     echo "  On next run, Mithril will rebuild accounts from a fresh snapshot."
-}
+    release_accounts_store_locks "${account_store_lock_fds[@]}"
+)
 
 clean_snapshots() {
     info "CLEANING Snapshots"
@@ -1951,20 +2081,28 @@ clean_ledger() {
     echo "  On next run, Mithril will download fresh snapshots and rebuild blockstore."
 }
 
-clean_all() {
+clean_all() (
     info "CLEANING ALL MITHRIL DATA"
     echo ""
     echo "  This will delete Accounts, Snapshots, AND Blockstore."
     echo ""
 
     # Accounts artifacts (stored directly in mount point)
-    local accounts_artifacts=("accounts" "mithril_db" "mithril_db_log_shards" "bankhash_db" "largest_file_id" "bank_hash" "manifest" "mithril_state.json")
+    local accounts_artifacts=("accounts" "accounts_index.root" "accounts_delta_v2.journal" "accounts_delta_v2.journal.rewrite.partial" "accounts_delta_shards" "accounts_index.stmh" "accounts_index.stmh.partial" "accounts_index.manifest" "accounts_index.manifest.tmp" "accounts_delta.journal" "accounts_delta.journal.rewrite.partial" "accounts_index_runs" "mithril_db" "mithril_db_build" "mithril_db_log_shards" "bankhash_db" "largest_file_id" "bootstrap_high_file_id" "bank_hash" "stake_pubkeys.idx" "manifest" "mithril_state.json")
 
     # Find Mithril directories
     mapfile -t mithril_dirs < <(find_mithril_dirs)
 
     if [[ ${#mithril_dirs[@]} -eq 0 ]]; then
         warn "No Mithril data directories found"
+        return 1
+    fi
+
+    # Lock before enumerating either AccountsDB or colocated ledger artifacts.
+    # The persistent lockfiles themselves are intentionally never deletion
+    # targets and remain held until every selected path has been cleaned.
+    local account_store_lock_fds=()
+    if ! acquire_accounts_store_locks account_store_lock_fds "${mithril_dirs[@]}"; then
         return 1
     fi
 
@@ -1993,6 +2131,30 @@ clean_all() {
                 echo "      $artifact  ($size)"
             fi
         done
+        while IFS= read -r -d '' parts_dir; do
+            local size
+            size=$(dir_size "$parts_dir")
+            paths_to_clean+=("$parts_dir")
+            echo "      $(basename "$parts_dir")/  ($size)"
+        done < <(find "$mithril_dir" -maxdepth 1 -type d -name 'streamhash-parts-*' -print0 2>/dev/null)
+        while IFS= read -r -d '' checkpoint_artifact; do
+            local size
+            size=$(dir_size "$checkpoint_artifact")
+            paths_to_clean+=("$checkpoint_artifact")
+            echo "      $(basename "$checkpoint_artifact")  ($size)"
+        done < <(find "$mithril_dir" -maxdepth 1 \( -type f -name 'accounts_delta_checkpoint.*' -o -type d -name '.delta-checkpoint-build-*' \) -print0 2>/dev/null)
+        while IFS= read -r -d '' v2_artifact; do
+            local v2_name
+            v2_name=$(basename "$v2_artifact")
+            if [[ ! "$v2_name" =~ ^accounts-index-v2-g[0-9]{20}-[0-9a-f]{32}$ &&
+                  ! "$v2_name" =~ ^accounts_index\.root\.tmp-[A-Za-z0-9]+$ ]]; then
+                continue
+            fi
+            local size
+            size=$(dir_size "$v2_artifact")
+            paths_to_clean+=("$v2_artifact")
+            echo "      $v2_name  ($size)"
+        done < <(find "$mithril_dir" -maxdepth 1 \( -type d -name 'accounts-index-v2-g*' -o -type f -name 'accounts_index.root.tmp-*' \) -print0 2>/dev/null)
 
         # Check for subdirectories (snapshots, blockstore)
         for subdir in snapshots blockstore; do
@@ -2082,7 +2244,8 @@ clean_all() {
 
     echo ""
     echo "  On next run, Mithril will start completely fresh."
-}
+    release_accounts_store_locks "${account_store_lock_fds[@]}"
+)
 
 # ------------------------------------------------------------------------------
 # Reset (Nuclear Option)
@@ -2420,7 +2583,7 @@ show_disk_summary() {
         echo "  Run 'sudo ./scripts/disk-setup.sh --setup' to configure storage."
     else
         # Accounts artifacts
-        local accounts_artifacts=("accounts" "mithril_db" "mithril_db_log_shards" "bankhash_db" "largest_file_id" "bank_hash" "manifest")
+        local accounts_artifacts=("accounts" "accounts_index.root" "accounts_delta_v2.journal" "accounts_delta_v2.journal.rewrite.partial" "accounts_delta_shards" "accounts_index.stmh" "accounts_index.stmh.partial" "accounts_index.manifest" "accounts_index.manifest.tmp" "accounts_delta.journal" "accounts_delta.journal.rewrite.partial" "accounts_index_runs" "mithril_db" "mithril_db_build" "mithril_db_log_shards" "bankhash_db" "largest_file_id" "bootstrap_high_file_id" "bank_hash" "stake_pubkeys.idx" "manifest")
 
         for mithril_dir in "${mithril_dirs[@]}"; do
             # Get mount point info for this directory
@@ -2452,6 +2615,12 @@ show_disk_summary() {
                     break
                 fi
             done
+            if find "$mithril_dir" -maxdepth 1 \( -type f -name 'accounts_delta_checkpoint.*' -o -type d -name '.delta-checkpoint-build-*' \) -print -quit 2>/dev/null | grep -q .; then
+                has_accounts=true
+            fi
+            if find "$mithril_dir" -maxdepth 1 \( -type d -name 'accounts-index-v2-g*' -o -type f -name 'accounts_index.root.tmp-*' \) -print -quit 2>/dev/null | grep -q .; then
+                has_accounts=true
+            fi
 
             if $has_accounts; then
                 echo "    AccountsDB artifacts:"
@@ -2462,6 +2631,22 @@ show_disk_summary() {
                         printf "      %-30s  %10s\n" "$artifact" "$size"
                     fi
                 done
+                while IFS= read -r -d '' checkpoint_artifact; do
+                    local size
+                    size=$(dir_size "$checkpoint_artifact")
+                    printf "      %-30s  %10s\n" "$(basename "$checkpoint_artifact")" "$size"
+                done < <(find "$mithril_dir" -maxdepth 1 \( -type f -name 'accounts_delta_checkpoint.*' -o -type d -name '.delta-checkpoint-build-*' \) -print0 2>/dev/null)
+                while IFS= read -r -d '' v2_artifact; do
+                    local v2_name
+                    v2_name=$(basename "$v2_artifact")
+                    if [[ ! "$v2_name" =~ ^accounts-index-v2-g[0-9]{20}-[0-9a-f]{32}$ &&
+                          ! "$v2_name" =~ ^accounts_index\.root\.tmp-[A-Za-z0-9]+$ ]]; then
+                        continue
+                    fi
+                    local size
+                    size=$(dir_size "$v2_artifact")
+                    printf "      %-30s  %10s\n" "$v2_name" "$size"
+                done < <(find "$mithril_dir" -maxdepth 1 \( -type d -name 'accounts-index-v2-g*' -o -type f -name 'accounts_index.root.tmp-*' \) -print0 2>/dev/null)
                 echo ""
             fi
 

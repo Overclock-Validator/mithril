@@ -32,12 +32,19 @@ func decodeEpochRewardsForTest(t *testing.T, data []byte) sealevel.SysvarEpochRe
 func TestSameBankRewardPartitionWaitsForStartingBlockHeight(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "accounts"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "largest_file_id"), make([]byte, 8), 0o644))
+	require.NoError(t, accountsdb.WriteLargestFileID(dir, 0))
+	require.NoError(t, accountsdb.WriteBootstrapHighFileID(dir, 0))
 
-	db, err := accountsdb.OpenDb(dir)
+	indexConfig := accountsdb.DefaultProductionAccountIndexConfig()
+	indexConfig.ShardCount = 1
+	indexConfig.CheckpointWorkers = 1
+	indexConfig.MaxConcurrentSeals = 1
+	require.NoError(t, accountsdb.InitializeEmptyProductionAccountIndex(t.Context(), dir, indexConfig))
+	db, err := accountsdb.OpenDbWithProductionAccountIndexConfig(dir, indexConfig)
 	require.NoError(t, err)
 	db.InitCaches()
-	t.Cleanup(db.CloseDb)
+	db.RootedDurable = true
+	t.Cleanup(func() { require.NoError(t, db.CloseDb()) })
 
 	previousCacheAcct := sealevel.SysvarCache.EpochRewards.Acct
 	previousCacheSysvar := sealevel.SysvarCache.EpochRewards.Sysvar
@@ -69,9 +76,8 @@ func TestSameBankRewardPartitionWaitsForStartingBlockHeight(t *testing.T) {
 	stale.Active = false
 	staleAccount := activeAccount.Clone()
 	staleAccount.Data = encodeEpochRewardsForTest(t, stale)
-	stored := make(chan struct{})
-	require.NoError(t, db.StoreAccounts([]*accounts.Account{staleAccount}, 10, func() { close(stored) }))
-	<-stored
+	_, err = db.CommitBatch([]accounts.SlotDelta{{Slot: 10, Delta: []*accounts.Account{staleAccount}}}, 10, nil, nil)
+	require.NoError(t, err)
 
 	distribution := &rewards.PartitionedRewardDistributionInfo{
 		SpoolDir:                     dir,

@@ -29,7 +29,8 @@ func TestSnapshotWorkerParseFailurePropagatesAfterDrain(t *testing.T) {
 
 	accountsDir := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(accountsDir, "accounts"), 0o755))
-	shardLogger := NewShardLogger(1, t.TempDir())
+	shardLogger, err := NewShardLogger(1, t.TempDir())
+	require.NoError(t, err)
 	t.Cleanup(func() {
 		require.NoError(t, shardLogger.Close(context.Background()))
 	})
@@ -65,8 +66,10 @@ func TestSnapshotWorkerParseFailurePropagatesAfterDrain(t *testing.T) {
 	t.Cleanup(pools.Release)
 
 	err = invokeSnapshotTask(wg, pools.appendVecCopying, appendVecCopyingTask{
-		Filename:  "accounts/20.21",
-		TarBuffer: bytes.NewBuffer(malformed),
+		Data:     malformed,
+		Slot:     slot,
+		FileID:   fileID,
+		FileSize: uint64(len(malformed)),
 	})
 	require.NoError(t, err)
 	require.ErrorContains(t, waitForSnapshotWorkers(wg, pools), "truncated appendvec account data")

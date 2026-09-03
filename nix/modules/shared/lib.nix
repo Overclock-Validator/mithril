@@ -30,9 +30,21 @@
       bootstrap.mode = cfg.configSchema.bootstrapMode;
       storage = {
         accounts = storageAccounts;
-        blockstore = storageBlockstore;
+        shredstore = storageBlockstore;
         snapshots = storageSnapshots;
         logs = storageLogs;
+        compact = {
+          enabled = cfg.configSchema.storageCompactEnabled;
+          enforce_disk_reserve = cfg.configSchema.storageCompactEnforceDiskReserve;
+          interval_seconds = cfg.configSchema.storageCompactIntervalSeconds;
+          min_free_mb = cfg.configSchema.storageCompactMinFreeMb;
+          target_free_mb = cfg.configSchema.storageCompactTargetFreeMb;
+          min_dead_fraction = cfg.configSchema.storageCompactMinDeadFraction;
+          emergency_min_dead_fraction = cfg.configSchema.storageCompactEmergencyMinDeadFraction;
+          max_move_mb = cfg.configSchema.storageCompactMaxMoveMb;
+          max_scan_mb = cfg.configSchema.storageCompactMaxScanMb;
+          max_source_mb = cfg.configSchema.storageCompactMaxSourceMb;
+        };
       };
       network = {
         cluster = cfg.configSchema.networkCluster;
@@ -72,6 +84,7 @@
         use_pool = cfg.configSchema.tuningUsePool;
         store_accounts_workers = cfg.configSchema.tuningStoreAccountsWorkers;
         program_cache_max_mb = cfg.configSchema.tuningProgramCacheMaxMb;
+        working_set_max_mb = cfg.configSchema.tuningWorkingSetMaxMb;
         pprof = {
           port = cfg.configSchema.tuningPprofPort;
           cpu_profile_path = cfg.configSchema.tuningPprofCpuProfilePath;

@@ -316,9 +316,9 @@ func runStateValidate(cmd *cobra.Command) {
 		os.Exit(1)
 	}
 
-	// Check artifacts exist
+	// Validate the complete root-selected V2 account index and generic files.
 	if err := state.ValidateAccountsDbArtifacts(accountsPath); err != nil {
-		fmt.Printf("  Status: ARTIFACTS MISSING\n")
+		fmt.Printf("  Status: ARTIFACTS INVALID\n")
 		fmt.Printf("  Error: %v\n", err)
 		os.Exit(1)
 	}
@@ -329,8 +329,8 @@ func runStateValidate(cmd *cobra.Command) {
 		fmt.Printf("  Last slot: %d (epoch %d)\n", s.LastSlot, s.LastEpoch)
 	}
 
-	// Note: Full bankhash validation requires opening the AccountsDB
-	// which is expensive. For now, just validate artifacts exist.
+	// The V2 account index was fully checked above. Semantic bankhash
+	// validation still requires opening AccountsDB.
 	fmt.Println("\nNote: Use 'mithril run' to perform full bankhash validation.")
 }
 

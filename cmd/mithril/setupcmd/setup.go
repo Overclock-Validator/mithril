@@ -270,9 +270,6 @@ func (m setupModel) currentItems() []menuItem {
 		}
 		return []menuItem{
 			menuOptionDesc("alpenglow", "alpenglow", "Certificate fork choice and speculative replay"),
-			menuOptionDesc("mainnet-beta", "mainnet-beta", "Classic verifying-only RPC replay"),
-			menuOptionDesc("testnet", "testnet", "Classic verifying-only RPC replay"),
-			menuOptionDesc("devnet", "devnet", "Classic verifying-only RPC replay"),
 			menuSeparator(),
 			menuBack(),
 		}
@@ -670,7 +667,7 @@ func (m *setupModel) advanceFromInput() {
 			// Lightbringer sidecar.
 			m.pushInput(scrGossip)
 		} else if m.mode == "quick" {
-			m.pushMenu(scrReview) // classic quick-start defaults to RPC
+			m.pushMenu(scrReview) // Legacy classic choice; V2 runtime rejects it.
 		} else {
 			m.pushMenu(scrLightbringer) // Full Config lets user enable the sidecar
 		}
@@ -1044,7 +1041,7 @@ snapshots = "/mnt/mithril-ledger/snapshots"   # ~100GB for full + incremental
 logs = "/mnt/mithril-logs"                    # Log files (created if missing)
 
 [network]
-cluster = "alpenglow"  # mainnet-beta/testnet/devnet use classic verifying-only RPC replay
+cluster = "alpenglow"  # Required by this V2 runtime; use dev for classic clusters
 rpc = ["https://rpc.ag.validator1.net"]
 
 [block]

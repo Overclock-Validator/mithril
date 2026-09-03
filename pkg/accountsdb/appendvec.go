@@ -25,11 +25,12 @@ type AppendVecAccount struct {
 }
 
 const (
-	hdrLen         = 136
-	dataLenOffset  = 8
-	pubkeyOffset   = 16
-	lamportsOffset = 48
-	ownerOffset    = 64
+	hdrLen                     = 136
+	dataLenOffset              = 8
+	pubkeyOffset               = 16
+	lamportsOffset             = 48
+	ownerOffset                = 64
+	maxAppendVecAccountDataLen = 10 * 1024 * 1024
 )
 
 type appendVecParser struct {
@@ -96,6 +97,14 @@ func (parser *appendVecParser) parseNextAcct(pk *solana.PublicKey, a *AccountInd
 	if parsedPubkey == (solana.PublicKey{}) && lamports == 0 {
 		return io.EOF
 	}
+	if dataLen > maxAppendVecAccountDataLen {
+		return fmt.Errorf(
+			"appendvec account data length %d exceeds maximum %d at offset %d",
+			dataLen,
+			maxAppendVecAccountDataLen,
+			offset,
+		)
+	}
 
 	dataOffset := offset + hdrLen
 	if dataLen > limit-dataOffset {
@@ -122,8 +131,11 @@ func (parser *appendVecParser) parseNextAcct(pk *solana.PublicKey, a *AccountInd
 // of the append vec. Should be kept in sync with
 // (*AppendVecAccount).Unmarshal.
 func GetAppendVecDataLen(f *os.File, offset uint64) (uint64, error) {
+	if offset > uint64(int64Max-hdrLen) {
+		return 0, fmt.Errorf("appendvec account offset %d overflows int64: %w", offset, io.ErrUnexpectedEOF)
+	}
 	var hdrBytes [8]byte
-	_, err := f.ReadAt(hdrBytes[:], int64(offset+8))
+	_, err := f.ReadAt(hdrBytes[:], int64(offset)+dataLenOffset)
 	if err != nil {
 		return 0, err
 	}
@@ -131,13 +143,22 @@ func GetAppendVecDataLen(f *os.File, offset uint64) (uint64, error) {
 }
 
 func (acct *AppendVecAccount) Unmarshal(buf io.Reader) error {
-	var err error
-	var hdrBytes [hdrLen]byte
-	_, err = buf.Read(hdrBytes[:])
-	if err != nil {
+	if err := acct.unmarshalHeader(buf); err != nil {
 		return err
 	}
+	return acct.unmarshalData(buf)
+}
 
+func (acct *AppendVecAccount) unmarshalHeader(buf io.Reader) error {
+	var hdrBytes [hdrLen]byte
+	if _, err := io.ReadFull(buf, hdrBytes[:]); err != nil {
+		return err
+	}
+	acct.unmarshalHeaderBytes(&hdrBytes)
+	return nil
+}
+
+func (acct *AppendVecAccount) unmarshalHeaderBytes(hdrBytes *[hdrLen]byte) {
 	acct.WriteVersion = binary.LittleEndian.Uint64(hdrBytes[:8])
 	acct.DataLen = binary.LittleEndian.Uint64(hdrBytes[8:16])
 	copy(acct.Pubkey[:], hdrBytes[16:48])
@@ -147,11 +168,58 @@ func (acct *AppendVecAccount) Unmarshal(buf io.Reader) error {
 	acct.Executable = hdrBytes[96] != 0
 	copy(acct.Padding[:], hdrBytes[97:104])
 	copy(acct.Hash[:], hdrBytes[104:136])
+}
 
-	acct.Data = make([]byte, acct.DataLen)
-	_, err = buf.Read(acct.Data)
+func (acct *AppendVecAccount) unmarshalData(buf io.Reader) error {
+	if acct.isTerminator() {
+		return io.EOF
+	}
+	if acct.DataLen > uint64(maxInt) {
+		return fmt.Errorf(
+			"appendvec account data length %d overflows addressable range: %w",
+			acct.DataLen,
+			io.ErrUnexpectedEOF,
+		)
+	}
+	// This is the Solana per-account data limit. Keeping the same bound at the
+	// persistence boundary prevents a corrupt appendvec header from turning a
+	// tiny read into a multi-gigabyte allocation, without adding a Stat syscall
+	// to every account read.
+	if acct.DataLen > maxAppendVecAccountDataLen {
+		return fmt.Errorf(
+			"appendvec account data length %d exceeds maximum %d: %w",
+			acct.DataLen,
+			maxAppendVecAccountDataLen,
+			io.ErrUnexpectedEOF,
+		)
+	}
+	if available, bounded := appendVecReaderRemaining(buf); bounded && acct.DataLen > available {
+		return fmt.Errorf(
+			"appendvec account data length %d exceeds %d available bytes: %w",
+			acct.DataLen,
+			available,
+			io.ErrUnexpectedEOF,
+		)
+	}
 
+	acct.Data = make([]byte, int(acct.DataLen))
+	_, err := io.ReadFull(buf, acct.Data)
 	return err
+}
+
+func (acct *AppendVecAccount) isTerminator() bool {
+	return acct.Pubkey == (solana.PublicKey{}) && acct.Lamports == 0
+}
+
+// appendVecReaderRemaining returns the number of readable bytes when the
+// reader exposes a trustworthy in-memory bound. This lets short buffer-backed
+// inputs fail before allocating their claimed size. File-backed reads rely on
+// the protocol limit above and io.ReadFull, avoiding per-account metadata I/O.
+func appendVecReaderRemaining(buf io.Reader) (remaining uint64, bounded bool) {
+	if sized, ok := buf.(interface{ Len() int }); ok {
+		return uint64(sized.Len()), true
+	}
+	return 0, false
 }
 
 var padding [2048]byte
@@ -223,3 +291,84 @@ func unmarshalAcctFromAppendVecAcctHeader(buf io.Reader) (*accounts.Account, err
 
 	return appendVecAcct.ToAccount(), nil
 }
+
+// unmarshalAcctFromAppendVecAcctHeaderExpected checks the pubkey after reading
+// the fixed 136-byte header but before allocating or reading account data. A
+// StreamHash non-member can resolve to a real account candidate; rejecting it
+// here keeps that exactness check cheap even when the candidate has large data.
+// On mismatch, the returned account contains only the stored key and exact is
+// false so callers can distinguish a base false-positive from delta corruption.
+func unmarshalAcctFromAppendVecAcctHeaderExpected(
+	buf io.Reader,
+	expected solana.PublicKey,
+) (acct *accounts.Account, exact bool, err error) {
+	var appendVecAcct AppendVecAccount
+	if err := appendVecAcct.unmarshalHeader(buf); err != nil {
+		return nil, false, err
+	}
+	if appendVecAcct.isTerminator() {
+		return nil, false, io.EOF
+	}
+	if appendVecAcct.Pubkey != expected {
+		return &accounts.Account{Key: appendVecAcct.Pubkey}, false, nil
+	}
+	if err := appendVecAcct.unmarshalData(buf); err != nil {
+		return nil, false, err
+	}
+	return appendVecAcct.ToAccount(), true, nil
+}
+
+// unmarshalAcctFromAppendVecAcctHeaderExpectedAt is the ReaderAt variant used
+// by batch loading. It avoids allocating a SectionReader for every account and
+// lets several sorted chunks safely share one appendvec file descriptor.
+func unmarshalAcctFromAppendVecAcctHeaderExpectedAt(
+	buf *os.File,
+	offset int64,
+	expected solana.PublicKey,
+) (acct *accounts.Account, exact bool, err error) {
+	if offset < 0 || offset > int64Max-hdrLen {
+		return nil, false, fmt.Errorf("appendvec account offset %d overflows int64: %w", offset, io.ErrUnexpectedEOF)
+	}
+
+	var hdrBytes [hdrLen]byte
+	if _, err := buf.ReadAt(hdrBytes[:], offset); err != nil {
+		return nil, false, err
+	}
+	var appendVecAcct AppendVecAccount
+	appendVecAcct.unmarshalHeaderBytes(&hdrBytes)
+	if appendVecAcct.isTerminator() {
+		return nil, false, io.EOF
+	}
+	if appendVecAcct.Pubkey != expected {
+		return &accounts.Account{Key: appendVecAcct.Pubkey}, false, nil
+	}
+	if appendVecAcct.DataLen > uint64(maxInt) ||
+		appendVecAcct.DataLen > uint64(int64Max-offset-hdrLen) {
+		return nil, false, fmt.Errorf(
+			"appendvec account data length %d overflows addressable range: %w",
+			appendVecAcct.DataLen,
+			io.ErrUnexpectedEOF,
+		)
+	}
+	if appendVecAcct.DataLen > maxAppendVecAccountDataLen {
+		return nil, false, fmt.Errorf(
+			"appendvec account data length %d exceeds maximum %d: %w",
+			appendVecAcct.DataLen,
+			maxAppendVecAccountDataLen,
+			io.ErrUnexpectedEOF,
+		)
+	}
+	dataOffset := offset + hdrLen
+	appendVecAcct.Data = make([]byte, int(appendVecAcct.DataLen))
+	if len(appendVecAcct.Data) > 0 {
+		if _, err := buf.ReadAt(appendVecAcct.Data, dataOffset); err != nil {
+			return nil, false, err
+		}
+	}
+	return appendVecAcct.ToAccount(), true, nil
+}
+
+const (
+	int64Max = int64(^uint64(0) >> 1)
+	maxInt   = int(^uint(0) >> 1)
+)

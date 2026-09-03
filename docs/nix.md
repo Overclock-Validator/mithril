@@ -11,6 +11,10 @@ This repository ships a `flake.nix` with:
 The module can generate `config.toml` from Nix options. You can still override
 or add any config keys via `services.mithril.config.settings`.
 
+> The V2 AccountsDB runtime on this branch currently supports only
+> `networkCluster = "alpenglow"`. Use the `dev` branch for pre-Alpenglow
+> `mainnet-beta`, `testnet`, or `devnet` full-node operation.
+
 ---
 
 ## Flake Usage (NixOS)
@@ -43,8 +47,8 @@ or add any config keys via `services.mithril.config.settings`.
               # Config schema (typed)
               configSchema = {
                 name = "mithril";
-                networkCluster = "mainnet-beta";
-                networkRpc = [ "https://api.mainnet-beta.solana.com" ];
+                networkCluster = "alpenglow";
+                networkRpc = [ "https://rpc.ag.validator1.net" ];
                 blockSource = "rpc";
               };
 
@@ -88,8 +92,8 @@ or add any config keys via `services.mithril.config.settings`.
               # Config generation (system paths)
               configSchema = {
                 name = "mithril";
-                networkCluster = "mainnet-beta";
-                networkRpc = [ "https://api.mainnet-beta.solana.com" ];
+                networkCluster = "alpenglow";
+                networkRpc = [ "https://rpc.ag.validator1.net" ];
               };
 
               # Optional user/group for launchd daemon
@@ -124,8 +128,8 @@ or add any config keys via `services.mithril.config.settings`.
               # Generates ${XDG_CONFIG_HOME}/mithril/config.toml
               configSchema = {
                 name = "mithril";
-                networkCluster = "mainnet-beta";
-                networkRpc = [ "https://api.mainnet-beta.solana.com" ];
+                networkCluster = "alpenglow";
+                networkRpc = [ "https://rpc.ag.validator1.net" ];
               };
             };
           })
@@ -144,6 +148,13 @@ or add any config keys via `services.mithril.config.settings`.
 - On Linux systemd units, `services.mithril.environmentFile` loads environment
   variables at runtime and interpolates `$ENV_VAR` or `${ENV_VAR}` in the
   generated `config.toml`.
+- Linux systemd units set `LimitNOFILE=65536`, leaving checked descriptor
+  headroom for AccountsDB V2's exact scan across the default 1,024 shards.
+- Generated configs enable pressure-gated appendvec compaction and its hard
+  free-space reserve. The typed `storageCompact*` options tune its adaptive
+  thresholds and bounded routine work; disabling
+  `storageCompactEnforceDiskReserve` is explicitly unsafe and permits
+  unbounded growth toward `ENOSPC`.
 - On macOS (nix-darwin or Home Manager launchd), `services.mithril.environmentFile`
   is sourced at runtime before interpolation; ensure the file is shell-compatible.
 - The module generates `config.toml` by default, and always generates when

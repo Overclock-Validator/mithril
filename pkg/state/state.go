@@ -2,11 +2,13 @@ package state
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"time"
 
+	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/mr-tron/base58"
 )
@@ -68,8 +70,12 @@ type MithrilState struct {
 	// Block configuration seed
 	ManifestParentSlot     uint64 `json:"manifest_parent_slot,omitempty"`
 	ManifestParentBankhash string `json:"manifest_parent_bankhash,omitempty"` // base58
-	ManifestBlockHeight    uint64 `json:"manifest_block_height,omitempty"`
-	ManifestAcctsLtHash    string `json:"manifest_accts_lt_hash,omitempty"` // base64
+	// ManifestParentAlpenglowBlockID is the exact double-Merkle identity of
+	// ManifestParentSlot. It is distinct from the PoH bank hash and anchors the
+	// first post-snapshot Alpenglow block or skip chain.
+	ManifestParentAlpenglowBlockID string `json:"manifest_parent_alpenglow_block_id,omitempty"`
+	ManifestBlockHeight            uint64 `json:"manifest_block_height,omitempty"`
+	ManifestAcctsLtHash            string `json:"manifest_accts_lt_hash,omitempty"` // base64
 
 	// Fee rate governor seed (static fields only)
 	ManifestFeeRateGovernor *ManifestFeeRateGovernorSeed `json:"manifest_fee_rate_governor,omitempty"`
@@ -370,13 +376,17 @@ func (s *MithrilState) Save(accountsDbDir string) error {
 		os.Remove(tmpFile)
 		return fmt.Errorf("failed to rename state file: %w", err)
 	}
-	// Make the rename itself durable.
-	if dir, err := os.Open(accountsDbDir); err == nil {
-		syncErr := dir.Sync()
-		dir.Close()
-		if syncErr != nil {
-			return fmt.Errorf("failed to fsync state directory: %w", syncErr)
-		}
+	// Make the rename itself durable. The final name is already visible, so an
+	// open/sync/close failure is commit-decided: report it and leave both the
+	// marker and its dependencies intact for startup validation.
+	dir, err := os.Open(accountsDbDir)
+	if err != nil {
+		return fmt.Errorf("state file rename is visible but opening its directory for fsync failed: %w", err)
+	}
+	syncErr := dir.Sync()
+	closeErr := dir.Close()
+	if err := errors.Join(syncErr, closeErr); err != nil {
+		return fmt.Errorf("state file rename is visible but directory durability is uncertain: %w", err)
 	}
 
 	return nil
@@ -745,34 +755,80 @@ func DeleteState(accountsDbDir string) error {
 	return nil
 }
 
-// ValidateAccountsDbArtifacts checks if expected AccountsDB artifacts exist.
-// This provides an extra layer of validation beyond just checking the state file.
+// ValidateAccountsDbArtifacts verifies the generic AccountsDB state and the
+// complete V2 account index selected by its root catalog. A legacy index is
+// returned as ErrAccountIndexMigrationRequired; an incomplete or corrupt V2
+// index is returned as ErrProductionAccountIndexPoisoned.
 func ValidateAccountsDbArtifacts(accountsDbDir string) error {
-	requiredFiles := []string{
-		"mithril_db",
-		"bankhash_db",
-		"accounts",
-		"largest_file_id",
-		"bank_hash",
-		"manifest",
+	if err := accountsdb.ValidateProductionAccountIndexArtifacts(accountsDbDir); err != nil {
+		return fmt.Errorf("invalid production account-index artifacts: %w", err)
 	}
 
-	for _, file := range requiredFiles {
-		path := filepath.Join(accountsDbDir, file)
-		if _, err := os.Stat(path); err != nil {
+	requiredDirectories := []string{
+		"bankhash_db",
+		"accounts",
+	}
+	for _, directory := range requiredDirectories {
+		path := filepath.Join(accountsDbDir, directory)
+		info, err := os.Lstat(path)
+		if err != nil {
 			if os.IsNotExist(err) {
-				return fmt.Errorf("missing required artifact: %s", file)
+				return fmt.Errorf("missing required artifact: %s", directory)
 			}
-			return fmt.Errorf("error checking artifact %s: %w", file, err)
+			return fmt.Errorf("error checking artifact %s: %w", directory, err)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("required artifact %s is not a directory", directory)
 		}
 	}
 
+	requiredFiles := []struct {
+		name      string
+		exactSize int64
+		minSize   int64
+	}{
+		{name: accountsdb.LargestFileIDFileName, exactSize: accountsdb.LargestFileIDSize},
+		{name: accountsdb.BootstrapHighFileIDFileName, exactSize: accountsdb.BootstrapHighFileIDSize},
+		{name: "bank_hash", exactSize: 32},
+		{name: "manifest", minSize: 1},
+		{name: "stake_pubkeys.idx", minSize: 1},
+	}
+	for _, required := range requiredFiles {
+		path := filepath.Join(accountsDbDir, required.name)
+		info, err := os.Lstat(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return fmt.Errorf("missing required artifact: %s", required.name)
+			}
+			return fmt.Errorf("error checking artifact %s: %w", required.name, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("required artifact %s is not a regular file", required.name)
+		}
+		if required.exactSize != 0 && info.Size() != required.exactSize {
+			return fmt.Errorf("required artifact %s has size %d, expected %d", required.name, info.Size(), required.exactSize)
+		}
+		if info.Size() < required.minSize {
+			return fmt.Errorf("required artifact %s has size %d, expected at least %d", required.name, info.Size(), required.minSize)
+		}
+	}
+	if _, err := accountsdb.ValidateLargestFileID(accountsDbDir); err != nil {
+		return fmt.Errorf("required artifact %s is invalid: %w", accountsdb.LargestFileIDFileName, err)
+	}
+	if _, err := accountsdb.ReadBootstrapHighFileID(accountsDbDir); err != nil {
+		return fmt.Errorf("required artifact %s is invalid: %w", accountsdb.BootstrapHighFileIDFileName, err)
+	}
+	if _, err := accountsdb.ValidateStakePubkeyIndex(filepath.Join(accountsDbDir, "stake_pubkeys.idx")); err != nil {
+		return fmt.Errorf("required artifact stake_pubkeys.idx is invalid: %w", err)
+	}
 	return nil
 }
 
 // CheckAndLoadValidState loads state and validates that AccountsDB is ready.
-// Returns (state, nil) if valid, or (nil, nil) if state is invalid/missing.
-// Returns (nil, error) only for unexpected errors.
+// Returns (state, nil) if valid, or (nil, nil) if the state marker is
+// missing/non-ready/corrupted. A ready state with missing, legacy, or corrupt
+// durable artifacts returns an error so automatic startup cannot silently
+// reinterpret a damaged database as an absent one.
 func CheckAndLoadValidState(accountsDbDir string) (*MithrilState, error) {
 	state, err := LoadState(accountsDbDir)
 	if err != nil {
@@ -798,8 +854,7 @@ func CheckAndLoadValidState(accountsDbDir string) (*MithrilState, error) {
 
 	// Extra validation: check that artifacts actually exist
 	if err := ValidateAccountsDbArtifacts(accountsDbDir); err != nil {
-		mlog.Log.Infof("state file says ready but artifacts invalid: %v", err)
-		return nil, nil
+		return nil, fmt.Errorf("state file says ready but AccountsDB artifacts are invalid: %w", err)
 	}
 
 	return state, nil

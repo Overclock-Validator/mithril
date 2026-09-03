@@ -3,10 +3,8 @@
 package global
 
 import (
-	"encoding/binary"
 	"fmt"
 	"math"
-	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -33,6 +31,7 @@ type GlobalCtx struct {
 	transactionCount           uint64
 	pendingStakeBySlot         map[uint64][]accountsdb.StakeIndexEntry // New stake entries keyed by the slot that created them; flushed to the index file only when that slot FOLDS (branch-safe: unwound slots drop their entries), merged into stake scans from RAM meanwhile
 	cachedStakeEntries         []accountsdb.StakeIndexEntry            // Parsed+sorted index, populated on first load
+	cachedStakeIndexPath       string                                  // Canonical file backing cachedStakeEntries; prevents cross-store cache reuse
 	entriesFlushedSinceCompact int                                     // Appended entries since last compaction
 	voteCache                  map[solana.PublicKey]*sealevel.VoteStateVersions
 	epochVoteStateSnapshots    map[uint64]map[solana.PublicKey]*sealevel.VoteStateVersions
@@ -42,6 +41,7 @@ type GlobalCtx struct {
 	leaderSchedules            map[uint64]*leaderschedule.LeaderSchedule
 	calcUnixTimeForClockSysvar bool
 	manageLeaderSchedule       bool
+	stakeIndexIOMutex          sync.Mutex // Serializes load, append and atomic compaction publication
 	pendingStakeMutex          sync.Mutex // Protects pendingNewStakePubkeys
 	voteCacheMutex             sync.RWMutex
 	slotsConfirmedMutex        sync.Mutex
@@ -108,6 +108,8 @@ func PendingStakeEntriesSnapshot() []accountsdb.StakeIndexEntry {
 // Called by the fork-switch unwind so wrong-fork stake entries never reach the
 // durable index. Returns the number of entries dropped.
 func DropPendingStakePubkeysFrom(fromSlot uint64) int {
+	instance.stakeIndexIOMutex.Lock()
+	defer instance.stakeIndexIOMutex.Unlock()
 	instance.pendingStakeMutex.Lock()
 	defer instance.pendingStakeMutex.Unlock()
 	dropped := 0
@@ -510,11 +512,16 @@ func FlushPendingStakePubkeys(accountsDbDir string) (int, error) {
 // in RAM (merged into scans) until their own fold or unwind decides them.
 // Returns the number of entries flushed.
 func FlushPendingStakePubkeysThrough(accountsDbDir string, through uint64) (int, error) {
+	instance.stakeIndexIOMutex.Lock()
+	defer instance.stakeIndexIOMutex.Unlock()
+
 	instance.pendingStakeMutex.Lock()
+	selected := make(map[uint64][]accountsdb.StakeIndexEntry)
 	var pending []accountsdb.StakeIndexEntry
 	for slot, entries := range instance.pendingStakeBySlot {
 		if slot <= through {
 			pending = append(pending, entries...)
+			selected[slot] = entries
 			delete(instance.pendingStakeBySlot, slot)
 		}
 	}
@@ -523,44 +530,26 @@ func FlushPendingStakePubkeysThrough(accountsDbDir string, through uint64) (int,
 		return 0, nil
 	}
 	instance.cachedStakeEntries = nil // file is changing, invalidate cache
+	instance.cachedStakeIndexPath = ""
 	instance.pendingStakeMutex.Unlock()
 
-	// Append to index file (don't hold lock during I/O)
+	// Append one checksummed frame. If an interrupted prior attempt left a
+	// frame without its commit trailer, AppendStakePubkeyIndex truncates that
+	// uncommitted tail before retrying.
 	indexPath := filepath.Join(accountsDbDir, StakePubkeyIndexFileName)
-	f, err := os.OpenFile(indexPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return 0, fmt.Errorf("opening stake pubkey index for append: %w", err)
-	}
-	defer f.Close()
-
-	// If file is empty/new, write header first to avoid a headerless file
-	info, err := f.Stat()
-	if err != nil {
-		return 0, fmt.Errorf("stat stake pubkey index: %w", err)
-	}
-	if info.Size() == 0 {
-		var header [8]byte
-		copy(header[0:4], accountsdb.StakeIndexMagic[:])
-		binary.LittleEndian.PutUint32(header[4:8], accountsdb.StakeIndexVersion)
-		if _, err := f.Write(header[:]); err != nil {
-			return 0, fmt.Errorf("writing stake index header: %w", err)
+	if err := accountsdb.AppendStakePubkeyIndex(indexPath, pending); err != nil {
+		// The AccountsDB fold did not run, so put every selected entry back in
+		// RAM. Entries enqueued concurrently are newer and remain after these
+		// restored entries, preserving keep-last deduplication semantics.
+		instance.pendingStakeMutex.Lock()
+		if instance.pendingStakeBySlot == nil {
+			instance.pendingStakeBySlot = make(map[uint64][]accountsdb.StakeIndexEntry)
 		}
-	}
-
-	var record [accountsdb.StakeIndexRecordSize]byte
-	for _, e := range pending {
-		copy(record[0:32], e.Pubkey[:])
-		binary.LittleEndian.PutUint64(record[32:40], e.FileId)
-		binary.LittleEndian.PutUint64(record[40:48], e.Offset)
-		if _, err := f.Write(record[:]); err != nil {
-			return 0, fmt.Errorf("writing stake index entry: %w", err)
+		for slot, entries := range selected {
+			instance.pendingStakeBySlot[slot] = append(entries, instance.pendingStakeBySlot[slot]...)
 		}
-	}
-
-	// Ensure data is flushed to disk before returning.
-	// This is critical: the index must be at least as current as the state file.
-	if err := f.Sync(); err != nil {
-		return 0, fmt.Errorf("syncing stake pubkey index: %w", err)
+		instance.pendingStakeMutex.Unlock()
+		return 0, fmt.Errorf("appending stake pubkey index: %w", err)
 	}
 
 	instance.pendingStakeMutex.Lock()
@@ -573,6 +562,8 @@ func FlushPendingStakePubkeysThrough(accountsDbDir string, through uint64) (int,
 // ClearPendingStakePubkeys discards any pending stake pubkeys without writing them.
 // Used for rollback on failed block replay.
 func ClearPendingStakePubkeys() {
+	instance.stakeIndexIOMutex.Lock()
+	defer instance.stakeIndexIOMutex.Unlock()
 	instance.pendingStakeMutex.Lock()
 	defer instance.pendingStakeMutex.Unlock()
 	instance.pendingStakeBySlot = nil
@@ -587,20 +578,24 @@ const compactThreshold = 1000
 // Only triggers when at least compactThreshold entries have been appended since last compaction.
 // Should be called at epoch boundary when the cache is already populated.
 func CompactStakePubkeyIndex(accountsDbDir string) error {
+	instance.stakeIndexIOMutex.Lock()
+	defer instance.stakeIndexIOMutex.Unlock()
+
+	indexPath := filepath.Join(accountsDbDir, StakePubkeyIndexFileName)
 	instance.pendingStakeMutex.Lock()
 	flushed := instance.entriesFlushedSinceCompact
 	cached := instance.cachedStakeEntries
+	cachePath := instance.cachedStakeIndexPath
 	instance.pendingStakeMutex.Unlock()
 
 	if flushed < compactThreshold {
 		return nil // Not enough new entries to justify rewrite
 	}
 
-	if cached == nil || len(cached) == 0 {
+	if cached == nil || len(cached) == 0 || cachePath != indexPath {
 		return nil // Nothing to compact
 	}
 
-	indexPath := filepath.Join(accountsDbDir, StakePubkeyIndexFileName)
 	if err := accountsdb.WriteStakePubkeyIndex(indexPath, cached); err != nil {
 		return fmt.Errorf("compacting stake pubkey index: %w", err)
 	}
@@ -617,31 +612,24 @@ func CompactStakePubkeyIndex(accountsDbDir string) error {
 // Returns deduplicated entries sorted by (FileId, Offset) for sequential I/O.
 // Results are cached after first load; subsequent calls return the cached slice.
 // IMPORTANT: The returned slice is shared — callers must NOT mutate it.
-// Legacy format: 32-byte pubkeys with no location hints (FileId=0, Offset=0).
-// Current format: 8-byte header ("STKI" + version) + 48-byte records (pubkey + fileId + offset).
+// Legacy V1 is bare 32-byte pubkeys and V2 is an unframed STKI header plus
+// 48-byte records. Current V3 stores bounded, counted, checksummed commit
+// frames so an interrupted final append can be distinguished from committed
+// data. V1/V2 are accepted read-only and upgraded on their next append.
 func LoadStakePubkeyIndex(accountsDbDir string) ([]accountsdb.StakeIndexEntry, error) {
+	instance.stakeIndexIOMutex.Lock()
+	defer instance.stakeIndexIOMutex.Unlock()
+
+	indexPath := filepath.Join(accountsDbDir, StakePubkeyIndexFileName)
 	instance.pendingStakeMutex.Lock()
-	if instance.cachedStakeEntries != nil {
+	if instance.cachedStakeEntries != nil && instance.cachedStakeIndexPath == indexPath {
 		cached := instance.cachedStakeEntries
 		instance.pendingStakeMutex.Unlock()
 		return cached, nil
 	}
 	instance.pendingStakeMutex.Unlock()
 
-	indexPath := filepath.Join(accountsDbDir, StakePubkeyIndexFileName)
-	data, err := os.ReadFile(indexPath)
-	if err != nil {
-		return nil, err
-	}
-
-	var entries []accountsdb.StakeIndexEntry
-
-	// Detect format: current format starts with "STKI" magic
-	if len(data) >= 8 && string(data[0:4]) == "STKI" {
-		entries, err = loadStakePubkeyIndexCurrent(data)
-	} else {
-		entries, err = loadStakePubkeyIndexLegacy(data)
-	}
+	entries, _, err := accountsdb.ReadStakePubkeyIndex(indexPath)
 	if err != nil {
 		return nil, err
 	}
@@ -652,7 +640,9 @@ func LoadStakePubkeyIndex(accountsDbDir string) ([]accountsdb.StakeIndexEntry, e
 
 	// Deduplicate by pubkey (keep last occurrence = freshest location hint)
 	seen := make(map[solana.PublicKey]int, len(entries))
-	deduped := make([]accountsdb.StakeIndexEntry, 0, len(entries))
+	// Reuse the decoder's backing array so peak load memory is one entry slice
+	// plus the exact dedup map, rather than two full entry slices plus the map.
+	deduped := entries[:0]
 	for _, e := range entries {
 		if idx, exists := seen[e.Pubkey]; exists {
 			deduped[idx] = e // overwrite with newer entry
@@ -682,42 +672,10 @@ func LoadStakePubkeyIndex(accountsDbDir string) ([]accountsdb.StakeIndexEntry, e
 	// Cache for subsequent calls
 	instance.pendingStakeMutex.Lock()
 	instance.cachedStakeEntries = deduped
+	instance.cachedStakeIndexPath = indexPath
 	instance.pendingStakeMutex.Unlock()
 
 	return deduped, nil
-}
-
-func loadStakePubkeyIndexLegacy(data []byte) ([]accountsdb.StakeIndexEntry, error) {
-	if len(data)%32 != 0 {
-		return nil, fmt.Errorf("stake pubkey index V1 corrupt: length %d not multiple of 32", len(data))
-	}
-	count := len(data) / 32
-	entries := make([]accountsdb.StakeIndexEntry, count)
-	for i := 0; i < count; i++ {
-		copy(entries[i].Pubkey[:], data[i*32:(i+1)*32])
-		// FileId=0, Offset=0 — no location hint, sort is effectively no-op
-	}
-	return entries, nil
-}
-
-func loadStakePubkeyIndexCurrent(data []byte) ([]accountsdb.StakeIndexEntry, error) {
-	version := binary.LittleEndian.Uint32(data[4:8])
-	if version != accountsdb.StakeIndexVersion {
-		return nil, fmt.Errorf("stake pubkey index: unsupported version %d", version)
-	}
-	body := data[8:]
-	if len(body)%accountsdb.StakeIndexRecordSize != 0 {
-		return nil, fmt.Errorf("stake pubkey index corrupt: body length %d not multiple of %d", len(body), accountsdb.StakeIndexRecordSize)
-	}
-	count := len(body) / accountsdb.StakeIndexRecordSize
-	entries := make([]accountsdb.StakeIndexEntry, count)
-	for i := 0; i < count; i++ {
-		base := i * accountsdb.StakeIndexRecordSize
-		copy(entries[i].Pubkey[:], body[base:base+32])
-		entries[i].FileId = binary.LittleEndian.Uint64(body[base+32 : base+40])
-		entries[i].Offset = binary.LittleEndian.Uint64(body[base+40 : base+48])
-	}
-	return entries, nil
 }
 
 // StreamStakeAccounts iterates all stake accounts from the pubkey index,

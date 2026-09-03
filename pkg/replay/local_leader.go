@@ -74,7 +74,9 @@ func adoptLocalLeaderBlock(
 	modified := collectAdoptAccounts(slotCtx, block)
 	bankhash := append([]byte(nil), slotCtx.FinalBankhash...)
 	if tail != nil {
-		tail.Add(slotCtx.Slot, modified, bankhash)
+		if err := tail.Add(slotCtx.Slot, modified, bankhash); err != nil {
+			return nil, fmt.Errorf("adopt local leader block slot %d: publish account layer: %w", block.Slot, err)
+		}
 	}
 	if persistedHashes != nil {
 		persistedHashes.Set(block.Slot, bankhash)

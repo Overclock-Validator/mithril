@@ -8,10 +8,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime/trace"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,20 +30,34 @@ import (
 )
 
 type AccountsDb struct {
-	Index            *pebble.DB
-	BankHashStore    *pebble.DB
-	AcctsDir         string
-	LargestFileId    atomic.Uint64
-	VoteAcctCache    otter.Cache[solana.PublicKey, *accounts.Account]
-	CommonAcctsCache otter.Cache[solana.PublicKey, *accounts.Account]
-	ProgramCache     otter.Cache[solana.PublicKey, *ProgramCacheEntry]
+	// ProductionIndex is the V2 sharded StreamHash index used by snapshot-built
+	// and resumed nodes. Index/BaseIndex remain only as the transitional V1
+	// in-process representation used by older fixtures and offline tooling.
+	ProductionIndex *ProductionAccountIndex
+	// Index is the exact journaled RAM head. BaseIndex is the immutable
+	// StreamHash snapshot index. The head always takes precedence over the
+	// base; its on-disk journal is never consulted by a lookup.
+	Index         *MutableAccountIndex
+	BaseIndex     *StreamAccountIndex
+	BankHashStore *pebble.DB
+	AcctsDir      string
+	LargestFileId atomic.Uint64
+	// fileIDMu serializes the global durable allocator. fileIDFatal fences all
+	// later allocations after a selector rename with an uncertain durability
+	// outcome; only restart/reconciliation may resolve that state.
+	fileIDMu             sync.Mutex
+	fileIDFatal          error
+	publishLargestFileID largestFileIDPublisher
+	VoteAcctCache        otter.Cache[solana.PublicKey, *accounts.Account]
+	CommonAcctsCache     otter.Cache[solana.PublicKey, *accounts.Account]
+	ProgramCache         otter.Cache[solana.PublicKey, *ProgramCacheEntry]
 	// Otter permits concurrent ordinary operations but not Clear. Rewind takes
 	// the write side; hot-path program cache operations take the read side.
 	programCacheMu sync.RWMutex
 
 	// readCacheEpochMu protects the cache epoch and the pending fold view.
 	// CommitBatch publishes its immutable newest-wins union here before the
-	// Pebble index commit. Readers use that view for changed keys while the
+	// journaled index commit. Readers use that view for changed keys while the
 	// index and caches catch up, so the expensive durable commit does not hold
 	// this mutex and old snapshot reads still cannot publish stale cache bytes.
 	readCacheEpochMu sync.RWMutex
@@ -54,24 +71,40 @@ type AccountsDb struct {
 	// index move plus source unlink, and the legacy mutable store takes it while
 	// writing, so a batch never falls through to a different logical epoch.
 	appendVecReadMu sync.RWMutex
+	// accountIndexWriteMu keeps a logical multi-frame recovery/rewind/fold
+	// transaction contiguous with respect to every other index writer. Point
+	// readers remain lock-free; live oversized folds publish pendingFold first.
+	accountIndexWriteMu sync.Mutex
 
 	// RootedDurable keeps the canonical store rooted-only: replayed slots buffer
 	// in an in-RAM working set (pkg/accounts) and fold to disk via CommitBatch
 	// once finalized+verified. The Alpenglow node forces this on at startup.
 	RootedDurable bool
 
-	// IndexWALDisabled runs the Pebble index without a WAL; the fold manifests
-	// are the index redo log (recovery replays the contiguous manifest run
-	// above the committed fold meta). Off by default until soaked.
-	IndexWALDisabled bool
-
 	// Batch-fold state (segment.go/fold.go/recovery.go). foldMu serializes
 	// CommitBatch, recovery, rewind, and compaction.
 	foldMu         sync.Mutex
 	lastBatchSeq   uint64        // guarded by foldMu; seeded by RecoverFoldState
 	durableThrough atomic.Uint64 // observability: highest durably folded slot
+	foldCommits    atomic.Uint64 // successful live logical fold commits
+	foldWALFrames  atomic.Uint64 // physical account-index frames in those commits
+	foldOversized  atomic.Uint64 // live folds requiring more than one frame
+	foldMaxKeys    atomic.Uint64 // high-water union size for a live fold
 	foldHooks      foldTestHooks // test-only crash injection
 	compactCursor  string        // guarded by foldMu; scan resume point across CompactOnce cycles
+	// foldDiskAdmission is installed once, before replay starts. It reserves
+	// enough filesystem headroom for one complete fold before CommitBatch takes
+	// foldMu or performs any durable side effect. The returned release function
+	// keeps concurrent admissions and pressure compaction serialized through the
+	// end of the fold.
+	foldDiskAdmissionMu sync.RWMutex
+	foldDiskAdmission   FoldDiskAdmission
+	// diskSpaceProbe is overridden only by deterministic package tests.
+	diskSpaceProbe func(string) (AppendVecFilesystemSpace, error)
+	// foldFatal is set only after a fold manifest may have crossed its durable
+	// commit point without completing. The process must restart so recovery can
+	// resolve the on-disk decision before another BatchSeq is allocated.
+	foldFatal error // guarded by foldMu
 
 	// A list of store requests. They are added to the back as they arrive and
 	// removed from the front as they are persisted.
@@ -79,6 +112,21 @@ type AccountsDb struct {
 	inProgressStoreRequests   *list.List
 	storeRequestChan          chan *list.Element
 	storeWorkerDone           chan struct{}
+
+	// shutdownMu makes teardown retryable without double-closing resources.
+	// In particular, a timed-out V2 generation drain leaves the production
+	// index and its exclusive store lock live for a later Shutdown call.
+	shutdownMu              sync.Mutex
+	shutdownErr             error
+	productionIndexClosed   bool
+	transitionalIndexClosed bool
+	baseIndexClosed         bool
+	bankHashStoreClosed     bool
+	// storeLock is populated only for a successfully opened transitional V1
+	// store. V2 ownership lives in ProductionIndex. Either way, AccountsDb
+	// keeps the store-wide exclusion until every sidecar has closed.
+	storeLock       *productionAccountIndexStoreLock
+	storeLockClosed bool
 }
 
 type storeRequest struct {
@@ -112,31 +160,181 @@ var (
 	CommonAccountCacheMaxMB = DefaultCommonAccountCacheMaxMB
 )
 
+type accountIndexSource uint8
+
 const (
-	indexPebbleMemTableSize                = 64 << 20
-	indexPebbleMemTableStopWritesThreshold = 4
-	DefaultCommonAccountCacheMaxMB         = 256
-	DefaultProgramCacheMaxMB               = 1024
-	programCacheCostUnitBytes              = 1 << 20
-	commonAccountCacheEntryOverheadBytes   = 256
+	accountIndexSourceNone accountIndexSource = iota
+	accountIndexSourceDelta
+	accountIndexSourceBase
 )
 
-// DisableIndexWAL (storage.index_wal=false) runs the account index without a
-// Pebble WAL: the fold manifests are the index redo log, and recovery replays
-// the contiguous manifest run above the committed fold meta. Set before
-// OpenDb. Default false (WAL on) until soaked.
-var DisableIndexWAL bool
-
-func NewAccountsIndexPebbleOptions(logger pebble.Logger) *pebble.Options {
-	return &pebble.Options{
-		Logger:                      logger,
-		MemTableSize:                indexPebbleMemTableSize,
-		MemTableStopWritesThreshold: indexPebbleMemTableStopWritesThreshold,
-		DisableWAL:                  DisableIndexWAL,
-	}
-}
+const (
+	DefaultCommonAccountCacheMaxMB       = 256
+	DefaultProgramCacheMaxMB             = 1024
+	programCacheCostUnitBytes            = 1 << 20
+	commonAccountCacheEntryOverheadBytes = 256
+)
 
 func OpenDb(accountsDbDir string) (*AccountsDb, error) {
+	config, err := CurrentProductionAccountIndexConfig()
+	if err != nil {
+		return nil, err
+	}
+	return OpenDbWithProductionAccountIndexConfig(accountsDbDir, config)
+}
+
+// OpenDbWithStoreGuard is the guarded counterpart used by snapshot
+// bootstrap. It resolves the current production configuration and transfers
+// the already-held exclusive guard into the opened V2 index.
+func OpenDbWithStoreGuard(
+	accountsDbDir string,
+	guard *ProductionAccountIndexStoreGuard,
+) (*AccountsDb, error) {
+	config, err := CurrentProductionAccountIndexConfig()
+	if err != nil {
+		return nil, err
+	}
+	return OpenDbWithProductionAccountIndexConfigAndStoreGuard(accountsDbDir, config, guard)
+}
+
+// OpenDbWithPreparedSnapshotAccountIndexAndStoreGuard adopts the immutable
+// generation retained by snapshot verification while continuously holding the
+// same exclusive store guard. It performs every ordinary AccountsDB preflight
+// and opens all sidecars, but does not rehash/revalidate the immutable payload
+// bytes a second time.
+func OpenDbWithPreparedSnapshotAccountIndexAndStoreGuard(
+	accountsDbDir string,
+	prepared *PreparedSnapshotAccountIndex,
+	guard *ProductionAccountIndexStoreGuard,
+) (*AccountsDb, error) {
+	if guard == nil {
+		return nil, errors.New("accountsdb: nil production account-index store guard")
+	}
+	config, err := prepared.productionConfig()
+	if err != nil {
+		return nil, err
+	}
+	var accountsDB *AccountsDb
+	err = guard.transferProductionAccountIndexStoreLockOnSuccess(
+		accountsDbDir,
+		func(storeLock *productionAccountIndexStoreLock) error {
+			return prepared.adopt(
+				accountsDbDir,
+				config,
+				storeLock,
+				func(catalog *RootIndexCatalog, immutable *ShardedImmutableIndex) (bool, error) {
+					consumed := false
+					var openErr error
+					accountsDB, openErr = openDbWithProductionAccountIndexConfigUsingPrepared(
+						accountsDbDir,
+						config,
+						storeLock,
+						true,
+						catalog,
+						immutable,
+						&consumed,
+					)
+					return consumed, openErr
+				},
+			)
+		},
+	)
+	return accountsDB, err
+}
+
+// OpenDbWithProductionAccountIndexConfig is the explicit-config form used by
+// tests, embedded callers and tooling. Production node startup normally uses
+// OpenDb after binding its flags into CurrentProductionAccountIndexConfig.
+func OpenDbWithProductionAccountIndexConfig(
+	accountsDbDir string,
+	productionConfig ProductionAccountIndexConfig,
+) (_ *AccountsDb, retErr error) {
+	// The store lock must precede every store-derived read, including the
+	// appendvec high-water reconciliation. Otherwise an opener can observe a
+	// stale high-water mark while a prior owner is still publishing or closing.
+	guard, err := AcquireExclusiveProductionAccountIndexStore(accountsDbDir)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		retErr = errors.Join(retErr, guard.Close())
+	}()
+	return openDbWithProductionAccountIndexConfigAndStoreGuard(
+		accountsDbDir, productionConfig, guard, false,
+	)
+}
+
+// OpenDbWithProductionAccountIndexConfigAndStoreGuard completes a snapshot
+// bootstrap without releasing exclusive store ownership. The guard transfers
+// into the opened V2 index and becomes an idempotently closed shell.
+func OpenDbWithProductionAccountIndexConfigAndStoreGuard(
+	accountsDbDir string,
+	productionConfig ProductionAccountIndexConfig,
+	guard *ProductionAccountIndexStoreGuard,
+) (*AccountsDb, error) {
+	return openDbWithProductionAccountIndexConfigAndStoreGuard(
+		accountsDbDir, productionConfig, guard, true,
+	)
+}
+
+func openDbWithProductionAccountIndexConfigAndStoreGuard(
+	accountsDbDir string,
+	productionConfig ProductionAccountIndexConfig,
+	guard *ProductionAccountIndexStoreGuard,
+	requireProductionV2 bool,
+) (*AccountsDb, error) {
+	if guard == nil {
+		return nil, errors.New("accountsdb: nil production account-index store guard")
+	}
+	var accountsDB *AccountsDb
+	err := guard.transferProductionAccountIndexStoreLockOnSuccess(
+		accountsDbDir,
+		func(storeLock *productionAccountIndexStoreLock) error {
+			var openErr error
+			accountsDB, openErr = openDbWithProductionAccountIndexConfig(
+				accountsDbDir, productionConfig, storeLock, requireProductionV2,
+			)
+			return openErr
+		},
+	)
+	return accountsDB, err
+}
+
+func openDbWithProductionAccountIndexConfig(
+	accountsDbDir string,
+	productionConfig ProductionAccountIndexConfig,
+	heldStoreLock *productionAccountIndexStoreLock,
+	requireProductionV2 bool,
+) (*AccountsDb, error) {
+	return openDbWithProductionAccountIndexConfigUsingPrepared(
+		accountsDbDir,
+		productionConfig,
+		heldStoreLock,
+		requireProductionV2,
+		nil,
+		nil,
+		nil,
+	)
+}
+
+func openDbWithProductionAccountIndexConfigUsingPrepared(
+	accountsDbDir string,
+	productionConfig ProductionAccountIndexConfig,
+	heldStoreLock *productionAccountIndexStoreLock,
+	requireProductionV2 bool,
+	preparedCatalog *RootIndexCatalog,
+	preparedImmutable *ShardedImmutableIndex,
+	preparedConsumed *bool,
+) (*AccountsDb, error) {
+	if preparedConsumed != nil {
+		*preparedConsumed = false
+	}
+	if heldStoreLock == nil {
+		return nil, errors.New("accountsdb: opening a store requires an exclusive production account-index lock")
+	}
+	if err := productionConfig.Validate(); err != nil {
+		return nil, err
+	}
 	// check for existence of the 'accounts' directory, which holds the appendvecs
 	appendVecsDir := fmt.Sprintf("%s/accounts", accountsDbDir)
 	_, err := os.Stat(appendVecsDir)
@@ -144,40 +342,124 @@ func OpenDb(accountsDbDir string) (*AccountsDb, error) {
 		return nil, err
 	}
 
-	// attempt to open largest_file_id file
-	largestFileIdFn := fmt.Sprintf("%s/largest_file_id", accountsDbDir)
-	lfi, err := os.Open(largestFileIdFn)
+	// Validate both the checksummed selector and its global uniqueness relation
+	// to every canonical appendvec/segment before any new ID can be allocated.
+	largestFileId, err := ValidateLargestFileID(accountsDbDir)
 	if err != nil {
-		mlog.Log.Infof("failed to open %s\n", largestFileIdFn)
 		return nil, err
 	}
 
-	largestFileIdBytes := make([]byte, 8)
-	bytesRead, err := lfi.Read(largestFileIdBytes)
-	if err != nil {
-		mlog.Log.Infof("error reading %s: %s\n", largestFileIdFn, err)
-		return nil, err
-	} else if bytesRead != 8 {
-		mlog.Log.Infof("error reading %s: expected 8 bytes, got %d\n", largestFileIdFn, bytesRead)
-		return nil, fmt.Errorf("only got %d bytes", bytesRead)
+	// Reject incompatible or incomplete stores before hashing a potentially
+	// multi-gigabyte immutable base.
+	legacyIndexDir := filepath.Join(accountsDbDir, "mithril_db")
+	if _, legacyErr := os.Stat(legacyIndexDir); legacyErr == nil {
+		return nil, fmt.Errorf("accountsdb: legacy Pebble account index %s is not supported by the Pebble-free format; bootstrap from a fresh snapshot", legacyIndexDir)
+	} else if !os.IsNotExist(legacyErr) {
+		return nil, fmt.Errorf("accountsdb: inspect legacy account index %s: %w", legacyIndexDir, legacyErr)
 	}
-
-	largestFileId := binary.LittleEndian.Uint64(largestFileIdBytes)
-
-	indexDir := filepath.Join(accountsDbDir, "mithril_db")
-	db, err := pebble.Open(indexDir, NewAccountsIndexPebbleOptions(silentLogger{}))
-	if err != nil {
-		return nil, fmt.Errorf("opening indexDir=%s: %w", indexDir, err)
+	var productionIndex *ProductionAccountIndex
+	var index *MutableAccountIndex
+	var baseIndex *StreamAccountIndex
+	rootPath := filepath.Join(accountsDbDir, RootIndexCatalogFileName)
+	if _, rootErr := os.Lstat(rootPath); rootErr == nil {
+		verifyStarted := time.Now()
+		if preparedImmutable != nil {
+			if preparedCatalog == nil || preparedConsumed == nil {
+				return nil, errors.New("accountsdb: incomplete prepared snapshot adoption state")
+			}
+			// Ownership transfers on entry to the runtime constructor. It closes
+			// the immutable generation on every failure, so the prepared handle
+			// must become permanently consumed from this point onward.
+			*preparedConsumed = true
+			productionIndex, err = openProductionAccountIndexFromImmutableWithStoreLock(
+				accountsDbDir,
+				productionConfig.withCheckpointBudgetDefaults(),
+				heldStoreLock,
+				preparedCatalog,
+				preparedImmutable,
+				nil,
+			)
+		} else {
+			productionIndex, err = openProductionAccountIndexWithStoreLock(
+				accountsDbDir,
+				productionConfig.withCheckpointBudgetDefaults(),
+				heldStoreLock,
+				false,
+			)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("opening production account index: %w", err)
+		}
+		if preparedImmutable != nil {
+			mlog.Log.Infof("Adopted verified sharded production StreamHash account index in %s", time.Since(verifyStarted))
+		} else {
+			mlog.Log.Infof("Verified and opened sharded production StreamHash account index in %s", time.Since(verifyStarted))
+		}
+	} else if !errors.Is(rootErr, os.ErrNotExist) {
+		return nil, fmt.Errorf("accountsdb: inspect production root index %s: %w", rootPath, rootErr)
+	} else {
+		if requireProductionV2 {
+			return nil, fmt.Errorf("%w: guarded bootstrap produced no V2 root", ErrAccountIndexMigrationRequired)
+		}
+		// Keep the Pebble-free V1 format readable for offline tooling and older
+		// unit fixtures. The node's state validator requires V2, so production
+		// resume cannot silently remain on this bounded global overlay.
+		journalPath := filepath.Join(accountsDbDir, DeltaIndexJournalFileName)
+		if _, journalErr := os.Stat(journalPath); journalErr != nil {
+			return nil, fmt.Errorf("%w: no V2 root and legacy journal %s is unavailable: %v", ErrAccountIndexMigrationRequired, journalPath, journalErr)
+		}
+		if err := validateStreamIndexManifestArtifacts(accountsDbDir); err != nil {
+			return nil, err
+		}
+		basePath := filepath.Join(accountsDbDir, StreamIndexFileName)
+		if _, statErr := os.Stat(basePath); statErr == nil {
+			verifyStarted := time.Now()
+			baseIndex, err = OpenStreamAccountIndex(basePath)
+			if err != nil {
+				return nil, fmt.Errorf("opening StreamHash account index %s: %w", basePath, err)
+			}
+			mlog.Log.Infof("Verified and opened transitional V1 StreamHash account index in %s", time.Since(verifyStarted))
+		} else if !os.IsNotExist(statErr) {
+			return nil, fmt.Errorf("stat StreamHash account index %s: %w", basePath, statErr)
+		}
+		index, err = OpenMutableAccountIndex(accountsDbDir)
+		if err != nil {
+			var cleanupErr error
+			if baseIndex != nil {
+				cleanupErr = baseIndex.Close()
+			}
+			return nil, errors.Join(err, cleanupErr)
+		}
 	}
 
 	bankhashDir := filepath.Join(accountsDbDir, "bankhash_db")
 	bankhashDb, err := pebble.Open(bankhashDir, &pebble.Options{Logger: silentLogger{}})
 	if err != nil {
-		return nil, fmt.Errorf("opening bankhashDir=%s: %w", bankhashDir, err)
+		var cleanupErr error
+		if productionIndex != nil {
+			if heldStoreLock != nil {
+				// The outer guard still owns this borrowed lock until the
+				// complete AccountsDb open succeeds. Detach it before tearing
+				// down the partially opened index on a later sidecar failure.
+				productionIndex.storeLock = nil
+			}
+			cleanupErr = errors.Join(cleanupErr, productionIndex.Close())
+		}
+		if baseIndex != nil {
+			cleanupErr = errors.Join(cleanupErr, baseIndex.Close())
+		}
+		if index != nil {
+			cleanupErr = errors.Join(cleanupErr, index.Close())
+		}
+		return nil, errors.Join(fmt.Errorf("opening bankhashDir=%s: %w", bankhashDir, err), cleanupErr)
 	}
 
 	accountsDb := &AccountsDb{
-		IndexWALDisabled: DisableIndexWAL, Index: db, BankHashStore: bankhashDb, AcctsDir: appendVecsDir}
+		ProductionIndex: productionIndex,
+		Index:           index, BaseIndex: baseIndex, BankHashStore: bankhashDb, AcctsDir: appendVecsDir}
+	if productionIndex == nil {
+		accountsDb.storeLock = heldStoreLock
+	}
 	accountsDb.LargestFileId.Store(largestFileId)
 
 	accountsDb.inProgressStoreRequests = list.New()
@@ -201,17 +483,97 @@ func (accountsDb *AccountsDb) WaitForStoreWorker() {
 	accountsDb.storeWorkerDone = nil
 }
 
-func (accountsDb *AccountsDb) CloseDb() {
+// Shutdown closes AccountsDB and reports every durability/resource teardown
+// failure. A V2 immutable-generation drain observes ctx; if it times out, the
+// production store lock remains held and a later call resumes the same drain.
+// Shutdown must not run concurrently with account operations.
+func (accountsDb *AccountsDb) Shutdown(ctx context.Context) error {
+	if accountsDb == nil {
+		return nil
+	}
+	if ctx == nil {
+		return errors.New("accountsdb: nil shutdown context")
+	}
+	accountsDb.shutdownMu.Lock()
+	defer accountsDb.shutdownMu.Unlock()
+
 	accountsDb.WaitForStoreWorker()
-	mlog.Log.Infof("CloseDb: syncing and closing Index...")
-	if err := accountsDb.Index.Close(); err != nil {
-		mlog.Log.Errorf("CloseDb: Index.Close() error: %v", err)
+	mlog.Log.Infof("AccountsDb.Shutdown: syncing and closing index...")
+	if accountsDb.Index != nil && !accountsDb.transitionalIndexClosed {
+		if err := accountsDb.Index.Close(); err != nil {
+			accountsDb.shutdownErr = errors.Join(
+				accountsDb.shutdownErr,
+				fmt.Errorf("accountsdb: close transitional mutable account index: %w", err),
+			)
+		}
+		accountsDb.transitionalIndexClosed = true
 	}
-	mlog.Log.Infof("CloseDb: syncing and closing BankHashStore...")
-	if err := accountsDb.BankHashStore.Close(); err != nil {
-		mlog.Log.Errorf("CloseDb: BankHashStore.Close() error: %v", err)
+	if accountsDb.BaseIndex != nil && !accountsDb.baseIndexClosed {
+		mlog.Log.Infof("AccountsDb.Shutdown: closing transitional immutable StreamHash index...")
+		if err := accountsDb.BaseIndex.Close(); err != nil {
+			accountsDb.shutdownErr = errors.Join(
+				accountsDb.shutdownErr,
+				fmt.Errorf("accountsdb: close transitional immutable account index: %w", err),
+			)
+		}
+		accountsDb.baseIndexClosed = true
 	}
-	mlog.Log.Infof("CloseDb: done\n") // extra newline for spacing after close
+	if accountsDb.BankHashStore != nil && !accountsDb.bankHashStoreClosed {
+		mlog.Log.Infof("AccountsDb.Shutdown: syncing and closing bankhash store...")
+		if err := accountsDb.BankHashStore.Close(); err != nil {
+			accountsDb.shutdownErr = errors.Join(
+				accountsDb.shutdownErr,
+				fmt.Errorf("accountsdb: close bankhash store: %w", err),
+			)
+		}
+		accountsDb.bankHashStoreClosed = true
+	}
+	// The production index owns the store-wide flock, so it must shut down
+	// last. No other process may open the store while a sidecar is still being
+	// synced or closed.
+	if accountsDb.ProductionIndex != nil && !accountsDb.productionIndexClosed {
+		err := accountsDb.ProductionIndex.Shutdown(ctx)
+		if !accountsDb.ProductionIndex.shutdownComplete() {
+			// A context timeout is not a permanent close error. The production
+			// index continues its drain while retaining the store lock, and the
+			// caller can supply a fresh context to retry.
+			return errors.Join(
+				accountsDb.shutdownErr,
+				fmt.Errorf("accountsdb: drain production account index: %w", err),
+			)
+		}
+		// If ctx cancellation raced the shutdownDone close, read the stable
+		// terminal result rather than persisting a transient DeadlineExceeded.
+		err = accountsDb.ProductionIndex.Shutdown(context.Background())
+		if err != nil {
+			accountsDb.shutdownErr = errors.Join(
+				accountsDb.shutdownErr,
+				fmt.Errorf("accountsdb: shut down production account index: %w", err),
+			)
+		}
+		accountsDb.productionIndexClosed = true
+	}
+	if accountsDb.storeLock != nil && !accountsDb.storeLockClosed {
+		if err := accountsDb.storeLock.Close(); err != nil {
+			accountsDb.shutdownErr = errors.Join(
+				accountsDb.shutdownErr,
+				fmt.Errorf("accountsdb: release transitional account-index store lock: %w", err),
+			)
+		}
+		accountsDb.storeLockClosed = true
+	}
+	mlog.Log.Infof("AccountsDb.Shutdown: done\n") // extra newline for spacing after close
+	return accountsDb.shutdownErr
+}
+
+// CloseDb preserves the existing unbounded convenience API while returning
+// teardown errors to callers that choose to check them.
+func (accountsDb *AccountsDb) CloseDb() error {
+	err := accountsDb.Shutdown(context.Background())
+	if err != nil {
+		mlog.Log.Errorf("CloseDb: %v", err)
+	}
+	return err
 }
 
 func (accountsDb *AccountsDb) InitCaches() {
@@ -382,7 +744,7 @@ func (accountsDb *AccountsDb) getStoredAccount(slot uint64, pubkey solana.Public
 
 // getStoredAccountPinned requires appendVecReadMu to be held for reading.
 func (accountsDb *AccountsDb) getStoredAccountPinned(slot uint64, pubkey solana.PublicKey) (*accounts.Account, error) {
-	if accountsDb.Index == nil {
+	if !accountsDb.hasAccountIndex() {
 		return nil, ErrNoAccount
 	}
 	r := trace.StartRegion(context.Background(), "GetStoredAccountCache")
@@ -411,7 +773,7 @@ func (accountsDb *AccountsDb) getStoredAccountPinned(slot uint64, pubkey solana.
 }
 
 func (accountsDb *AccountsDb) getStoredAccountPinnedWithStats(slot uint64, pubkey solana.PublicKey, stats *AccountReadStats) (*accounts.Account, error) {
-	if accountsDb.Index == nil {
+	if !accountsDb.hasAccountIndex() {
 		return nil, ErrNoAccount
 	}
 	r := trace.StartRegion(context.Background(), "GetStoredAccountCache")
@@ -477,7 +839,7 @@ func (accountsDb *AccountsDb) getCachedAccountAndEpoch(pubkey solana.PublicKey) 
 
 // getCachedAccountLocked requires readCacheEpochMu to be held for reading or
 // writing. Keeping a whole batch's cache probes under one epoch makes its
-// cache results coherent with the Pebble snapshot created at that boundary.
+// cache results coherent with the mutable-index snapshot at that boundary.
 func (accountsDb *AccountsDb) getCachedAccountLocked(pubkey solana.PublicKey) (*accounts.Account, bool, bool) {
 	if version, ok := accountsDb.pendingFold[[32]byte(pubkey)]; ok {
 		return version.acct, true, true
@@ -563,39 +925,305 @@ func (accountsDb *AccountsDb) pendingFoldContainsLocked(pubkey solana.PublicKey)
 	return ok
 }
 
-// readIndexedAccount performs one index-fetch + file-read attempt.
-func (accountsDb *AccountsDb) readIndexedAccount(pubkey solana.PublicKey) (*accounts.Account, error) {
-	acctIdxEntryBytes, c, err := accountsDb.Index.Get(pubkey[:])
-	if err != nil {
-		if errors.Is(err, pebble.ErrNotFound) {
-			return nil, ErrNoAccount
+// lookupAccountIndexCandidate resolves the exact mutable head first. An exact
+// tombstone stops resolution. Only an absent delta probes the immutable base,
+// whose fingerprint-backed result remains a candidate until its appendvec
+// pubkey is checked.
+func (accountsDb *AccountsDb) lookupAccountIndexCandidate(pubkey solana.PublicKey) (AccountIndexEntry, accountIndexSource, bool, error) {
+	if accountsDb.ProductionIndex != nil {
+		entry, source, found, err := accountsDb.ProductionIndex.LookupCandidate(pubkey)
+		if err != nil {
+			return AccountIndexEntry{}, accountIndexSourceNone, false, fmt.Errorf("production index lookup %s: %w", pubkey, err)
 		}
-		return nil, fmt.Errorf("index get: %w", err)
+		return entry, source, found, nil
+	}
+	if accountsDb.Index != nil {
+		value, ok, err := accountsDb.Index.LookupWithError(pubkey)
+		if err != nil {
+			return AccountIndexEntry{}, accountIndexSourceNone, false, fmt.Errorf("mutable index lookup %s: %w", pubkey, err)
+		}
+		if ok {
+			if value.Tombstone {
+				return AccountIndexEntry{}, accountIndexSourceNone, false, nil
+			}
+			return value.Entry, accountIndexSourceDelta, true, nil
+		}
+	}
+	if accountsDb.BaseIndex == nil {
+		return AccountIndexEntry{}, accountIndexSourceNone, false, nil
+	}
+	entry, found, err := accountsDb.BaseIndex.LookupCandidate(pubkey)
+	if err != nil {
+		return AccountIndexEntry{}, accountIndexSourceNone, false, fmt.Errorf("base index lookup %s: %w", pubkey, err)
+	}
+	if !found {
+		return AccountIndexEntry{}, accountIndexSourceNone, false, nil
+	}
+	return entry, accountIndexSourceBase, true, nil
+}
+
+func (accountsDb *AccountsDb) hasAccountIndex() bool {
+	return accountsDb != nil && (accountsDb.ProductionIndex != nil || accountsDb.Index != nil || accountsDb.BaseIndex != nil)
+}
+
+func (accountsDb *AccountsDb) applyAccountIndexMutations(
+	mutations []deltaIndexMutation,
+	meta *foldMeta,
+) error {
+	if accountsDb == nil {
+		return errors.New("accountsdb: nil database")
+	}
+	accountsDb.accountIndexWriteMu.Lock()
+	defer accountsDb.accountIndexWriteMu.Unlock()
+	return accountsDb.applyAccountIndexMutationsLocked(mutations, meta)
+}
+
+func (accountsDb *AccountsDb) applyAccountIndexMutationsLocked(
+	mutations []deltaIndexMutation,
+	meta *foldMeta,
+) error {
+	if accountsDb.ProductionIndex != nil {
+		return accountsDb.ProductionIndex.Apply(mutations, meta, true)
+	}
+	if accountsDb.Index == nil {
+		return errors.New("accountsdb: no writable account index")
+	}
+	return accountsDb.Index.Apply(mutations, meta, true)
+}
+
+// lookupExactAccountIndexEntry turns a base candidate into an authoritative
+// result by checking the full pubkey in its appendvec record. Delta mappings
+// are exact by construction and need no second index-membership check.
+func (accountsDb *AccountsDb) lookupExactAccountIndexEntry(pubkey solana.PublicKey) (AccountIndexEntry, accountIndexSource, bool, error) {
+	entry, source, found, err := accountsDb.lookupAccountIndexCandidate(pubkey)
+	if err != nil || !found || source != accountIndexSourceBase {
+		return entry, source, found, err
+	}
+	matches, err := accountsDb.baseIndexEntryMatchesPubkey(pubkey, entry)
+	if err != nil {
+		return AccountIndexEntry{}, accountIndexSourceNone, false, err
+	}
+	if !matches {
+		return AccountIndexEntry{}, accountIndexSourceNone, false, nil
+	}
+	return entry, source, true, nil
+}
+
+// lookupExactAccountIndexEntries resolves a fold's previous locations in one
+// batch. Exact delta entries need no I/O. Immutable-base candidates are grouped
+// by appendvec so thousands of updated accounts do not turn into thousands of
+// open/close pairs merely to validate StreamHash membership.
+func (accountsDb *AccountsDb) lookupExactAccountIndexEntries(
+	pubkeys []solana.PublicKey,
+) ([]AccountIndexEntry, []bool, error) {
+	entries := make([]AccountIndexEntry, len(pubkeys))
+	found := make([]bool, len(pubkeys))
+	sources := make([]accountIndexSource, len(pubkeys))
+	if accountsDb.ProductionIndex != nil {
+		snapshot, err := accountsDb.ProductionIndex.NewSnapshot(pubkeys)
+		if err != nil {
+			return nil, nil, err
+		}
+		values := make([]deltaIndexValue, len(pubkeys))
+		resolved := make([]bool, len(pubkeys))
+		lookupErr := snapshot.LookupBatch(context.Background(), values, sources, resolved)
+		closeErr := snapshot.Close()
+		if err := errors.Join(lookupErr, closeErr); err != nil {
+			return nil, nil, err
+		}
+		for i, ok := range resolved {
+			if ok && !values[i].Tombstone {
+				entries[i], found[i] = values[i].Entry, true
+			}
+		}
+	} else {
+		if err := runBatchWorkers(context.Background(), len(pubkeys), func(i int) error {
+			entry, source, ok, err := accountsDb.lookupAccountIndexCandidate(pubkeys[i])
+			if err != nil {
+				return err
+			}
+			entries[i], sources[i], found[i] = entry, source, ok
+			return nil
+		}); err != nil {
+			return nil, nil, err
+		}
 	}
 
-	acctIdxEntry, err := UnmarshalAcctIdxEntry(acctIdxEntryBytes)
-	c.Close()
+	type verificationGroup struct {
+		id      appendVecID
+		indexes []int
+	}
+	grouped := make(map[appendVecID][]int)
+	for i, source := range sources {
+		if found[i] && source == accountIndexSourceBase {
+			entry := entries[i]
+			id := appendVecID{slot: entry.Slot, fileID: entry.FileId}
+			grouped[id] = append(grouped[id], i)
+		}
+	}
+	groups := make([]verificationGroup, 0, len(grouped))
+	for id, indexes := range grouped {
+		sort.Slice(indexes, func(i, j int) bool {
+			return entries[indexes[i]].Offset < entries[indexes[j]].Offset
+		})
+		groups = append(groups, verificationGroup{id: id, indexes: indexes})
+	}
+
+	if err := runBatchWorkers(context.Background(), len(groups), func(job int) (retErr error) {
+		group := groups[job]
+		path := filepath.Join(accountsDb.AcctsDir, fmt.Sprintf("%d.%d", group.id.slot, group.id.fileID))
+		file, err := os.Open(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				retired, markerErr := accountsDb.isAppendVecRetired(group.id.slot, group.id.fileID)
+				if markerErr != nil {
+					return markerErr
+				}
+				if !retired {
+					return fmt.Errorf("accountsdb: active base-index appendvec %s is missing", path)
+				}
+				for _, idx := range group.indexes {
+					found[idx] = false
+				}
+				return nil
+			}
+			return fmt.Errorf("open base-index appendvec %s: %w", path, err)
+		}
+		defer func() {
+			if closeErr := file.Close(); retErr == nil && closeErr != nil {
+				retErr = fmt.Errorf("close base-index appendvec %s: %w", path, closeErr)
+			}
+		}()
+
+		for _, idx := range group.indexes {
+			stored, readable, err := readAccountIndexEntryPubkey(file, entries[idx])
+			if err != nil {
+				return fmt.Errorf("read base-index pubkey from %s: %w", path, err)
+			}
+			if !readable {
+				retired, markerErr := accountsDb.isAppendVecRetired(group.id.slot, group.id.fileID)
+				if markerErr != nil {
+					return markerErr
+				}
+				if !retired {
+					return fmt.Errorf("accountsdb: active base-index appendvec %s is truncated", path)
+				}
+				found[idx] = false
+				continue
+			}
+			if stored != pubkeys[idx] {
+				found[idx] = false
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, nil, err
+	}
+	return entries, found, nil
+}
+
+func (accountsDb *AccountsDb) baseIndexEntryMatchesPubkey(pubkey solana.PublicKey, entry AccountIndexEntry) (bool, error) {
+	path := filepath.Join(accountsDb.AcctsDir, fmt.Sprintf("%d.%d", entry.Slot, entry.FileId))
+	f, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("unmarshal index entry: %w", err)
+		if os.IsNotExist(err) {
+			retired, markerErr := accountsDb.isAppendVecRetired(entry.Slot, entry.FileId)
+			if markerErr != nil {
+				return false, markerErr
+			}
+			if retired {
+				return false, nil
+			}
+			return false, fmt.Errorf("accountsdb: active base-index appendvec %s is missing", path)
+		}
+		return false, fmt.Errorf("open base-index appendvec %s: %w", path, err)
+	}
+	defer f.Close()
+	stored, readable, err := readAccountIndexEntryPubkey(f, entry)
+	if err != nil {
+		return false, fmt.Errorf("read base-index pubkey at %s@%d: %w", path, entry.Offset, err)
+	}
+	if !readable {
+		retired, markerErr := accountsDb.isAppendVecRetired(entry.Slot, entry.FileId)
+		if markerErr != nil {
+			return false, markerErr
+		}
+		if !retired {
+			return false, fmt.Errorf("accountsdb: active base-index appendvec %s is truncated", path)
+		}
+		return false, nil
+	}
+	return stored == pubkey, nil
+}
+
+func readAccountIndexEntryPubkey(file *os.File, entry AccountIndexEntry) (solana.PublicKey, bool, error) {
+	var stored solana.PublicKey
+	if entry.Offset > math.MaxInt64-pubkeyOffset {
+		return stored, false, nil
+	}
+	_, err := file.ReadAt(stored[:], int64(entry.Offset+pubkeyOffset))
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return stored, false, nil
+	}
+	if err != nil {
+		return stored, false, err
+	}
+	return stored, true, nil
+}
+
+// readIndexedAccount performs one union-index fetch + file-read attempt.
+func (accountsDb *AccountsDb) readIndexedAccount(pubkey solana.PublicKey) (*accounts.Account, error) {
+	acctIdxEntry, source, found, err := accountsDb.lookupAccountIndexCandidate(pubkey)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, ErrNoAccount
 	}
 
 	appendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, acctIdxEntry.Slot, acctIdxEntry.FileId)
 
 	appendVecFile, err := os.Open(appendVecFileName)
 	if err != nil {
+		if source == accountIndexSourceBase && os.IsNotExist(err) {
+			retired, markerErr := accountsDb.isAppendVecRetired(acctIdxEntry.Slot, acctIdxEntry.FileId)
+			if markerErr != nil {
+				return nil, markerErr
+			}
+			if retired {
+				return nil, ErrNoAccount
+			}
+			return nil, fmt.Errorf("accountsdb: active base-index appendvec %s is missing", appendVecFileName)
+		}
 		return nil, err
 	}
 	defer appendVecFile.Close()
 
+	if acctIdxEntry.Offset > math.MaxInt64 {
+		return nil, fmt.Errorf("account offset %d overflows int64", acctIdxEntry.Offset)
+	}
 	if _, err := appendVecFile.Seek(int64(acctIdxEntry.Offset), 0); err != nil {
 		return nil, fmt.Errorf("seek %s@%d: %w", appendVecFileName, acctIdxEntry.Offset, err)
 	}
 
-	acct, err := unmarshalAcctFromAppendVecAcctHeader(appendVecFile)
+	acct, exact, err := unmarshalAcctFromAppendVecAcctHeaderExpected(appendVecFile, pubkey)
 	if err != nil {
+		if source == accountIndexSourceBase &&
+			(errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) {
+			retired, markerErr := accountsDb.isAppendVecRetired(acctIdxEntry.Slot, acctIdxEntry.FileId)
+			if markerErr != nil {
+				return nil, markerErr
+			}
+			if retired {
+				return nil, ErrNoAccount
+			}
+		}
 		return nil, fmt.Errorf("unmarshal account at %s@%d: %w", appendVecFileName, acctIdxEntry.Offset, err)
 	}
-	if acct.Key != pubkey {
+	if !exact {
+		if source == accountIndexSourceBase {
+			return nil, ErrNoAccount
+		}
 		return nil, fmt.Errorf("record at %s@%d holds %s (stale index entry)", appendVecFileName, acctIdxEntry.Offset, acct.Key)
 	}
 
@@ -630,6 +1258,9 @@ func (accountsDb *AccountsDb) StoreAccounts(
 	slot uint64,
 	cb func(),
 ) error {
+	if accountsDb.ProductionIndex != nil && !accountsDb.RootedDurable {
+		return ErrProductionAccountIndexRequiresRootedDurable
+	}
 	// Rooted-durable (the only mode of the Alpenglow-only build): direct stores
 	// are no-ops. Every write reaches disk exclusively via the fold path
 	// (CommitBatch) once finalized+verified — epoch-boundary code that still
@@ -746,9 +1377,12 @@ func (accountsDb *AccountsDb) storeWorker() {
 }
 
 func (accountsDb *AccountsDb) storeAccountsInternal(accts []*accounts.Account, slot uint64) {
-	fileId := accountsDb.LargestFileId.Add(1)
+	fileId, err := accountsDb.allocateFileID()
+	if err != nil {
+		panic(fmt.Sprintf("allocate appendvec file ID: %v", err))
+	}
 	appendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, slot, fileId)
-	appendVecFile, err := os.OpenFile(appendVecFileName, os.O_RDWR|os.O_CREATE, 0666)
+	appendVecFile, err := os.OpenFile(appendVecFileName, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0666)
 	if err != nil {
 		//mlog.Log.Debugf("unable to open appendvec file %s for writing to accountsdb", appendVecFileName)
 		panic(err)
@@ -757,7 +1391,7 @@ func (accountsDb *AccountsDb) storeAccountsInternal(accts []*accounts.Account, s
 
 	appendVecAcctsBuf := new(bytes.Buffer)
 	writer := new(bytes.Buffer)
-	var acctIdxEntryBuf [24]byte
+	mutations := make([]deltaIndexMutation, 0, len(accts))
 
 	for _, acct := range accts {
 		if acct == nil {
@@ -769,21 +1403,17 @@ func (accountsDb *AccountsDb) storeAccountsInternal(accts []*accounts.Account, s
 		writer.Reset()
 
 		indexEntry := AccountIndexEntry{Slot: slot, FileId: fileId, Offset: uint64(appendVecAcctsBuf.Len())}
-		indexEntry.Marshal(&acctIdxEntryBuf)
 
 		// if an entry already existed in the index for this account, very often we can simply make the state update
 		// in-place, i.e. into the account's existing appendvec blob.
 		// we can make the account state update in-place iff the existing version's data length is the same as the
 		// new version's data length, which is the case about 98% of the time.
 		// if not, then we write out a new appendvec.
-		existingacctIdxEntryBuf, c, err := accountsDb.Index.Get(acct.Key[:])
-		if err == nil {
-			acctIdxEntry, err := UnmarshalAcctIdxEntry(existingacctIdxEntryBuf)
-			if err != nil {
-				panic("failed to unmarshal AccountIndexEntry from index kv database")
-			}
-			c.Close()
-
+		acctIdxEntry, _, found, err := accountsDb.lookupExactAccountIndexEntry(acct.Key)
+		if err != nil {
+			panic(fmt.Sprintf("failed to look up existing AccountIndexEntry: %v", err))
+		}
+		if found {
 			existingAppendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, acctIdxEntry.Slot, acctIdxEntry.FileId)
 			existingAppendVecFile, err := os.OpenFile(existingAppendVecFileName, os.O_RDWR, 0666)
 			if err != nil {
@@ -817,12 +1447,10 @@ func (accountsDb *AccountsDb) storeAccountsInternal(accts []*accounts.Account, s
 				existingAppendVecFile.Close()
 				continue
 			}
+			existingAppendVecFile.Close()
 		}
 
-		err = accountsDb.Index.Set(acct.Key[:], acctIdxEntryBuf[:], &pebble.WriteOptions{})
-		if err != nil {
-			panic(fmt.Sprintf("unable to add acct for %s to acctsdb: %v", acct.Key, err))
-		}
+		mutations = append(mutations, liveDeltaMutation(acct.Key, indexEntry))
 
 		// marshal up the account as an appendvec style account and write it to the buffer
 		appendVecAcct := AppendVecAccount{DataLen: uint64(len(acct.Data)), Pubkey: acct.Key, Lamports: acct.Lamports,
@@ -838,6 +1466,14 @@ func (accountsDb *AccountsDb) storeAccountsInternal(accts []*accounts.Account, s
 	_, err = appendVecFile.Write(appendVecAcctsBuf.Bytes())
 	if err != nil {
 		panic(err)
+	}
+	if err := appendVecFile.Sync(); err != nil {
+		panic(err)
+	}
+	if len(mutations) > 0 {
+		if err := accountsDb.applyAccountIndexMutations(mutations, nil); err != nil {
+			panic(fmt.Sprintf("unable to publish %d account-index mutations: %v", len(mutations), err))
+		}
 	}
 }
 
@@ -872,18 +1508,13 @@ func (accountsDb *AccountsDb) parallelStoreAccounts(n int, accts []*accounts.Acc
 					return ctx.Err()
 				}
 				err := func(a *accounts.Account) error {
-					existingacctIdxEntryBuf, c, err := accountsDb.Index.Get(a.Key[:])
-					if errors.Is(err, pebble.ErrNotFound) {
-						lengthChangedAccounts <- a
-						return nil
-					}
+					existingIdxEntry, _, found, err := accountsDb.lookupExactAccountIndexEntry(a.Key)
 					if err != nil {
 						return fmt.Errorf("reading from index: %w", err)
 					}
-					existingIdxEntry, err := UnmarshalAcctIdxEntry(existingacctIdxEntryBuf)
-					c.Close()
-					if err != nil {
-						return fmt.Errorf("unmarshaling index entry: %w", err)
+					if !found {
+						lengthChangedAccounts <- a
+						return nil
 					}
 
 					existingAppendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, existingIdxEntry.Slot, existingIdxEntry.FileId)
@@ -931,26 +1562,24 @@ func (accountsDb *AccountsDb) parallelStoreAccounts(n int, accts []*accounts.Acc
 	}
 	newAppendVecGroup := errgroup.Group{}
 	newAppendVecGroup.Go(func() error {
-		fileId := accountsDb.LargestFileId.Add(1)
+		fileId, err := accountsDb.allocateFileID()
+		if err != nil {
+			return fmt.Errorf("allocate appendvec file ID: %w", err)
+		}
 		appendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, slot, fileId)
-		appendVecFile, err := os.OpenFile(appendVecFileName, os.O_RDWR|os.O_CREATE, 0666)
+		appendVecFile, err := os.OpenFile(appendVecFileName, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0666)
 		if err != nil {
 			return err
 		}
 		defer appendVecFile.Close()
 		appendVecWriter := bufio.NewWriter(appendVecFile)
-		defer appendVecWriter.Flush()
 
 		appendVecFileOffset := uint64(0)
-		var acctIdxEntryBuf [24]byte
+		mutations := make([]deltaIndexMutation, 0)
 
 		for acct := range lengthChangedAccounts {
 			indexEntry := AccountIndexEntry{Slot: slot, FileId: fileId, Offset: appendVecFileOffset}
-			indexEntry.Marshal(&acctIdxEntryBuf)
-			err = accountsDb.Index.Set(acct.Key[:], acctIdxEntryBuf[:], &pebble.WriteOptions{})
-			if err != nil {
-				return fmt.Errorf("unable to add acct for %s to acctsdb: %v", acct.Key, err)
-			}
+			mutations = append(mutations, liveDeltaMutation(acct.Key, indexEntry))
 
 			appendVecAcct := AppendVecAccount{
 				DataLen:    uint64(len(acct.Data)),
@@ -967,8 +1596,13 @@ func (accountsDb *AccountsDb) parallelStoreAccounts(n int, accts []*accounts.Acc
 			}
 			appendVecFileOffset += uint64(l)
 		}
-
-		return nil
+		if err := appendVecWriter.Flush(); err != nil {
+			return err
+		}
+		if err := appendVecFile.Sync(); err != nil {
+			return err
+		}
+		return accountsDb.applyAccountIndexMutations(mutations, nil)
 	})
 
 	e1 := overwriteOrPassGroup.Wait()
@@ -999,18 +1633,20 @@ func (accountsDb *AccountsDb) StoreBankHashForSlot(slot uint64, bankHash []byte)
 }
 
 func (accountsDb *AccountsDb) KeysBetweenPrefixes(startPrefix uint64, endPrefix uint64) []solana.PublicKey {
-	return nil
-	/*keys := accountsDb.IndexDb.KeysBetweenPrefixes(startPrefix, endPrefix)
-
-	keyObjs := make([]solana.PublicKey, 0)
-	for _, key := range keys {
-		keyObject := solana.PublicKeyFromBytes(key)
-		keyObjs = append(keyObjs, keyObject)
+	keys, err := accountsDb.KeysBetweenPrefixesContext(context.Background(), startPrefix, endPrefix)
+	if err != nil {
+		// This compatibility API predates error-returning AccountsDB methods.
+		// Failing closed is consensus-safe; returning an empty range would
+		// silently skip due rent on clusters where rent rewrites remain active.
+		panic(fmt.Sprintf("accountsdb: enumerate keys between prefixes: %v", err))
 	}
-
-	return keyObjs*/
+	return keys
 }
 
 func (accountsDb *AccountsDb) AllKeys() [][]byte {
-	return nil
+	keys, err := accountsDb.AllKeysContext(context.Background())
+	if err != nil {
+		panic(fmt.Sprintf("accountsdb: enumerate all keys: %v", err))
+	}
+	return keys
 }

@@ -16,12 +16,19 @@ import (
 func TestDistributeVotingRewardsBuildsOnStagedAccount(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "accounts"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "largest_file_id"), make([]byte, 8), 0o644))
+	require.NoError(t, accountsdb.WriteLargestFileID(dir, 0))
+	require.NoError(t, accountsdb.WriteBootstrapHighFileID(dir, 0))
 
-	db, err := accountsdb.OpenDb(dir)
+	indexConfig := accountsdb.DefaultProductionAccountIndexConfig()
+	indexConfig.ShardCount = 1
+	indexConfig.CheckpointWorkers = 1
+	indexConfig.MaxConcurrentSeals = 1
+	require.NoError(t, accountsdb.InitializeEmptyProductionAccountIndex(t.Context(), dir, indexConfig))
+	db, err := accountsdb.OpenDbWithProductionAccountIndexConfig(dir, indexConfig)
 	require.NoError(t, err)
 	db.InitCaches()
-	t.Cleanup(db.CloseDb)
+	db.RootedDurable = true
+	t.Cleanup(func() { require.NoError(t, db.CloseDb()) })
 
 	votePubkey := solana.NewWallet().PublicKey()
 	parent := &accounts.Account{
@@ -30,9 +37,8 @@ func TestDistributeVotingRewardsBuildsOnStagedAccount(t *testing.T) {
 		Owner:     a.VoteProgramAddr,
 		RentEpoch: 0,
 	}
-	stored := make(chan struct{})
-	require.NoError(t, db.StoreAccounts([]*accounts.Account{parent}, 10, func() { close(stored) }))
-	<-stored
+	_, err = db.CommitBatch([]accounts.SlotDelta{{Slot: 10, Delta: []*accounts.Account{parent}}}, 10, nil, nil)
+	require.NoError(t, err)
 
 	const vatDebit = uint64(800_000_000)
 	const votingReward = uint64(123_456_789)
@@ -46,7 +52,6 @@ func TestDistributeVotingRewardsBuildsOnStagedAccount(t *testing.T) {
 	// Production Alpenglow replay is rooted-durable, so StoreAccounts is a
 	// no-op until the slot folds. The staged loader is therefore the only
 	// source of the same-bank VAT debit.
-	db.RootedDurable = true
 	updated, immediateParents, distributed := DistributeVotingRewards(
 		db, validatorRewards, 11,
 		func(pubkey solana.PublicKey) (*accounts.Account, error) {

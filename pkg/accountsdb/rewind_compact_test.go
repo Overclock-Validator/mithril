@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
-	"github.com/cockroachdb/pebble"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -21,6 +21,9 @@ import (
 func TestRecoveryDetectsInterruptedRewind(t *testing.T) {
 	db, dir := newFoldTestDb(t)
 	r1 := commitTestBatch(t, db, 110, foldAcct(1, 100, []byte("v1")))
+	r1Entry, _, found, err := db.lookupExactAccountIndexEntry(solana.PublicKey{1})
+	require.NoError(t, err)
+	require.True(t, found)
 	r2 := commitTestBatch(t, db, 120, foldAcct(1, 111, []byte("v2")))
 	r3 := commitTestBatch(t, db, 130, foldAcct(1, 122, []byte("v3")))
 
@@ -31,8 +34,12 @@ func TestRecoveryDetectsInterruptedRewind(t *testing.T) {
 		p := segmentManifestPath(db.AcctsDir, r.ThroughSlot, r.FileId)
 		require.NoError(t, os.Rename(p, p+".rewound"))
 	}
-	require.NoError(t, db.Index.Set(metaKeyLastBatch,
-		encodeFoldMeta(foldMeta{BatchSeq: 1, ThroughSlot: 110, FileId: r1.FileId}), pebble.Sync))
+	targetMeta := foldMeta{BatchSeq: 1, ThroughSlot: 110, FileId: r1.FileId}
+	require.NoError(t, db.Index.Apply(
+		[]deltaIndexMutation{liveDeltaMutation(solana.PublicKey{1}, r1Entry)},
+		&targetMeta,
+		true,
+	))
 
 	db = reopenFoldTestDb(t, db, dir)
 	defer db.CloseDb()
@@ -41,6 +48,7 @@ func TestRecoveryDetectsInterruptedRewind(t *testing.T) {
 	assert.True(t, rec.RewindInProgress, "parked .rewound manifests must be detected")
 	assert.Equal(t, uint64(110), rec.DurableThrough, "store sits at the rewound boundary")
 	assert.Equal(t, []byte("ctx-110"), rec.ResumeCtx, "the rewound boundary's context is available for reconcile")
+	assert.Equal(t, uint64(100), mustColdRead(t, db, 110, solana.PublicKey{1}).Lamports)
 	// The parked suffix segments are NOT orphan-GC'd (a re-run can still use them).
 	assert.FileExists(t, filepath.Join(db.AcctsDir, SegmentDataName(130, r3.FileId)))
 
@@ -92,24 +100,86 @@ func TestRewindCompletesAfterParkOnlyInterruption(t *testing.T) {
 	assert.Equal(t, uint64(110), meta.ThroughSlot)
 }
 
-// snapshotIndex captures the full account index (pubkey -> entry), excluding
-// the fold meta row, for bit-exact before/after comparisons.
+func TestInterruptedRewindPartialAscendingParkRecoversExactTarget(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		parkedCount int
+	}{
+		{name: "crash after first rename", parkedCount: 1},
+		{name: "crash after middle rename", parkedCount: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, dir := newFoldTestDb(t)
+			results := []BatchCommitResult{
+				commitTestBatch(t, db, 110, foldAcct(1, 100, []byte("target"))),
+				commitTestBatch(t, db, 120, foldAcct(1, 120, []byte("suffix-1"))),
+				commitTestBatch(t, db, 130, foldAcct(1, 130, []byte("suffix-2"))),
+				commitTestBatch(t, db, 140, foldAcct(1, 140, []byte("suffix-3"))),
+			}
+
+			// Step 1 parks ascending. Simulate losing power before the loop has
+			// reached every suffix manifest and before fold meta is rolled back.
+			for index := 1; index <= tc.parkedCount; index++ {
+				result := results[index]
+				path := segmentManifestPath(db.AcctsDir, result.ThroughSlot, result.FileId)
+				require.NoError(t, os.Rename(path, path+".rewound"))
+				// Rewind durably orders each ascending rename before issuing the
+				// next. This fixture models exactly such a power-loss-visible prefix.
+				require.NoError(t, fsyncDir(db.AcctsDir))
+			}
+
+			db = reopenFoldTestDb(t, db, dir)
+			defer db.CloseDb()
+			recovery, err := db.RecoverFoldState()
+			require.NoError(t, err)
+			require.True(t, recovery.RewindInProgress)
+			_, err = db.RewindToBatchBoundary(140)
+			require.ErrorContains(t, err, "must complete its exact target")
+			meta, haveMeta, err := db.readFoldMeta()
+			require.NoError(t, err)
+			require.True(t, haveMeta)
+			assert.Equal(t, uint64(140), meta.ThroughSlot, "wrong-target refusal must not change fold meta")
+
+			points, err := db.ListRewindPoints()
+			require.NoError(t, err)
+			require.NotEmpty(t, points)
+			assert.Equal(t, uint64(110), points[len(points)-1].ThroughSlot,
+				"not-yet-parked suffix must not be mistaken for the target")
+
+			result, err := db.RewindToBatchBoundary(points[len(points)-1].ThroughSlot)
+			require.NoError(t, err)
+			assert.Equal(t, uint64(110), result.NewThrough)
+			assert.Equal(t, uint64(100), mustColdRead(t, db, 110, solana.PublicKey{1}).Lamports)
+
+			recovered, err := db.RecoverFoldState()
+			require.NoError(t, err)
+			assert.False(t, recovered.RewindInProgress)
+			rootEntries, err := os.ReadDir(db.AcctsDir)
+			require.NoError(t, err)
+			for _, entry := range rootEntries {
+				assert.False(t, strings.HasSuffix(entry.Name(), segManifestRewoundSuffix),
+					"parked root-level manifest survived completion: %s", entry.Name())
+			}
+		})
+	}
+}
+
+// snapshotIndex captures the live rows in this fixture's one-byte keyspace for
+// bit-exact before/after comparisons. Tombstones represent absence.
 func snapshotIndex(t *testing.T, db *AccountsDb) map[[32]byte]AccountIndexEntry {
 	t.Helper()
-	iter, err := db.Index.NewIter(nil)
-	require.NoError(t, err)
-	defer iter.Close()
+	snapshot := db.Index.NewSnapshot()
+	require.NotNil(t, snapshot)
+	defer snapshot.Close()
 	out := make(map[[32]byte]AccountIndexEntry)
-	for iter.First(); iter.Valid(); iter.Next() {
-		k := iter.Key()
-		if len(k) != 32 {
-			continue // fold meta row
+	for firstByte := 0; firstByte < 256; firstByte++ {
+		key := solana.PublicKey{byte(firstByte)}
+		value, found, err := snapshot.LookupWithError(key)
+		require.NoError(t, err)
+		if !found || value.Tombstone {
+			continue
 		}
-		var key [32]byte
-		copy(key[:], k)
-		e, uerr := UnmarshalAcctIdxEntry(iter.Value())
-		require.NoError(t, uerr)
-		out[key] = *e
+		out[[32]byte(key)] = value.Entry
 	}
 	return out
 }
@@ -334,8 +404,49 @@ func TestCompactMovesLiveRespectsPinsAndRewind(t *testing.T) {
 	assert.Equal(t, []byte("keep"), mustColdRead(t, db, 130, solana.PublicKey{3}).Data, "compacted key unaffected by rewind")
 }
 
-// Mostly-live files are left to decay; the move budget bounds work per cycle
-// while fully-dead deletion stays free.
+// Retaining H rewind transitions requires H+1 boundary manifests. In
+// particular, the oldest permitted target may be an empty bankhash-only fold
+// that no newer undo pointer names; compaction must not mistake it for a dead
+// appendvec and delete the only durable boundary to which rewind can return.
+func TestCompactPreservesOldestRewindBoundary(t *testing.T) {
+	db, _ := newFoldTestDb(t)
+	defer db.CloseDb()
+
+	target := commitTestBatch(t, db, 110)
+	head := commitTestBatch(t, db, 120, foldAcct(1, 120, []byte("head")))
+
+	stats, err := db.CompactOnce(CompactionConfig{RewindHorizonBatches: 1, MinDeadFraction: 0.5})
+	require.NoError(t, err)
+	assert.Zero(t, stats.FilesDeleted)
+	assert.Zero(t, stats.FilesCompacted)
+	assert.FileExists(t, filepath.Join(db.AcctsDir, SegmentDataName(110, target.FileId)))
+	assert.FileExists(t, segmentManifestPath(db.AcctsDir, 110, target.FileId))
+	assert.FileExists(t, filepath.Join(db.AcctsDir, SegmentDataName(120, head.FileId)))
+
+	res, err := db.RewindToBatchBoundary(110)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(110), res.NewThrough)
+}
+
+func TestCompactPinsAllFoldHistoryWhenHeadIsInsideHorizon(t *testing.T) {
+	db, _ := newFoldTestDb(t)
+	defer db.CloseDb()
+
+	first := commitTestBatch(t, db, 110)
+	second := commitTestBatch(t, db, 120)
+
+	stats, err := db.CompactOnce(CompactionConfig{RewindHorizonBatches: 64, MinDeadFraction: 0.5})
+	require.NoError(t, err)
+	assert.Zero(t, stats.FilesDeleted)
+	assert.Zero(t, stats.FilesCompacted)
+	assert.FileExists(t, filepath.Join(db.AcctsDir, SegmentDataName(110, first.FileId)))
+	assert.FileExists(t, segmentManifestPath(db.AcctsDir, 110, first.FileId))
+	assert.FileExists(t, filepath.Join(db.AcctsDir, SegmentDataName(120, second.FileId)))
+	assert.FileExists(t, segmentManifestPath(db.AcctsDir, 120, second.FileId))
+}
+
+// Mostly-live files are left to decay; the soft move target stops admission
+// between files while fully-dead deletion stays free.
 func TestCompactThresholdAndBudget(t *testing.T) {
 	db, _ := newFoldTestDb(t)
 	defer db.CloseDb()
@@ -350,8 +461,8 @@ func TestCompactThresholdAndBudget(t *testing.T) {
 	assert.Zero(t, stats.FilesCompacted, "mostly-live file must not be rewritten")
 	assert.Zero(t, stats.FilesDeleted)
 
-	// Two compactable files, budget of 1 byte: only the first move lands this
-	// cycle; the cursor resumes at the second next cycle.
+	// Two compactable files, target of 1 byte: one whole-file move overshoots the
+	// target, then admission stops; the cursor resumes at the second next cycle.
 	db2, _ := newFoldTestDb(t)
 	defer db2.CloseDb()
 	commitTestBatch(t, db2, 110, foldAcct(1, 100, big), foldAcct(4, 400, []byte("live-a")))
@@ -361,7 +472,11 @@ func TestCompactThresholdAndBudget(t *testing.T) {
 
 	stats, err = db2.CompactOnce(CompactionConfig{RewindHorizonBatches: 1, MinDeadFraction: 0.5, MaxMoveBytesPerCycle: 1})
 	require.NoError(t, err)
-	assert.Equal(t, 1, stats.FilesCompacted, "move budget stops the cycle after one file")
+	assert.Equal(t, 1, stats.FilesCompacted, "move target stops admission after one file")
+	assert.Greater(t, stats.LiveBytesMoved, int64(1), "one-source soft-target overshoot is observable")
+	assert.Greater(t, stats.ScannedBytes, int64(0))
+	assert.Greater(t, stats.MaxSourceBytes, int64(0))
+	assert.LessOrEqual(t, stats.MaxSourceBytes, stats.ScannedBytes)
 	stats, err = db2.CompactOnce(CompactionConfig{RewindHorizonBatches: 1, MinDeadFraction: 0.5, MaxMoveBytesPerCycle: 1})
 	require.NoError(t, err)
 	assert.Equal(t, 1, stats.FilesCompacted, "next cycle picks up the remaining file")
@@ -391,10 +506,10 @@ func TestCompactBootstrapAppendVecAndOrphanSkip(t *testing.T) {
 		require.NoError(t, err)
 	}
 	require.NoError(t, os.WriteFile(filepath.Join(db.AcctsDir, "50.0"), buf.Bytes(), 0o644))
-	var idxBuf [24]byte
 	entry := AccountIndexEntry{Slot: 50, FileId: 0, Offset: offsets[1]}
-	entry.Marshal(&idxBuf)
-	require.NoError(t, db.Index.Set(accts[1].Key[:], idxBuf[:], nil))
+	require.NoError(t, db.Index.Apply(
+		[]deltaIndexMutation{liveDeltaMutation(accts[1].Key, entry)}, nil, true,
+	))
 
 	// An undecided orphan (fileId above bootstrap high-water, no manifest).
 	require.NoError(t, os.WriteFile(filepath.Join(db.AcctsDir, "60.7"), []byte("junk"), 0o644))
@@ -410,6 +525,49 @@ func TestCompactBootstrapAppendVecAndOrphanSkip(t *testing.T) {
 	assert.Equal(t, []byte("live"), got.Data)
 }
 
+// A final manifest is a durable publication, not an ignorable temporary. If
+// its header or in-horizon body is corrupt, compaction cannot know the complete
+// undo-pointer pin set and must preserve every possible target.
+func TestCompactFailsClosedOnCorruptPublishedManifest(t *testing.T) {
+	t.Run("header", func(t *testing.T) {
+		db, _ := newFoldTestDb(t)
+		defer db.CloseDb()
+
+		first := commitTestBatch(t, db, 110, foldAcct(1, 100, make([]byte, 2048)))
+		second := commitTestBatch(t, db, 120, foldAcct(1, 200, []byte("new")))
+		manifestPath := segmentManifestPath(db.AcctsDir, second.ThroughSlot, second.FileId)
+		require.NoError(t, os.WriteFile(manifestPath, []byte("torn-final-manifest"), 0o644))
+
+		_, err := db.CompactOnce(CompactionConfig{
+			RewindHorizonBatches: 1,
+			MinDeadFraction:      0.5,
+		})
+		require.ErrorContains(t, err, "published manifest")
+		assert.FileExists(t, filepath.Join(db.AcctsDir, SegmentDataName(first.ThroughSlot, first.FileId)))
+	})
+
+	t.Run("body", func(t *testing.T) {
+		db, _ := newFoldTestDb(t)
+		defer db.CloseDb()
+
+		first := commitTestBatch(t, db, 110, foldAcct(1, 100, make([]byte, 2048)))
+		second := commitTestBatch(t, db, 120, foldAcct(1, 200, []byte("new")))
+		manifestPath := segmentManifestPath(db.AcctsDir, second.ThroughSlot, second.FileId)
+		encoded, err := os.ReadFile(manifestPath)
+		require.NoError(t, err)
+		require.Greater(t, len(encoded), 4)
+		encoded[len(encoded)-5] ^= 0xff // corrupt the body, not only the CRC word
+		require.NoError(t, os.WriteFile(manifestPath, encoded, 0o644))
+
+		_, err = db.CompactOnce(CompactionConfig{
+			RewindHorizonBatches: 1,
+			MinDeadFraction:      0.5,
+		})
+		require.ErrorContains(t, err, "fully CRC-valid")
+		assert.FileExists(t, filepath.Join(db.AcctsDir, SegmentDataName(first.ThroughSlot, first.FileId)))
+	})
+}
+
 // The read path errors (after one retry) instead of panicking when the index
 // names a missing file or a record that holds a different pubkey.
 func TestReadPathErrorsInsteadOfPanicking(t *testing.T) {
@@ -418,9 +576,10 @@ func TestReadPathErrorsInsteadOfPanicking(t *testing.T) {
 
 	// Dangling entry: file does not exist.
 	dangling := solana.PublicKey{7}
-	var idxBuf [24]byte
-	(&AccountIndexEntry{Slot: 99, FileId: 424242, Offset: 0}).Marshal(&idxBuf)
-	require.NoError(t, db.Index.Set(dangling[:], idxBuf[:], nil))
+	require.NoError(t, db.Index.Apply([]deltaIndexMutation{liveDeltaMutation(
+		dangling,
+		AccountIndexEntry{Slot: 99, FileId: 424242, Offset: 0},
+	)}, nil, true))
 	_, err := db.GetAccount(99, dangling)
 	require.Error(t, err)
 	require.NotErrorIs(t, err, ErrNoAccount, "a broken read must not masquerade as account-absent")
@@ -428,8 +587,10 @@ func TestReadPathErrorsInsteadOfPanicking(t *testing.T) {
 	// Wrong-pubkey record: key 9's entry points at key 1's record.
 	r := commitTestBatch(t, db, 110, foldAcct(1, 100, []byte("v1")))
 	wrong := solana.PublicKey{9}
-	(&AccountIndexEntry{Slot: 110, FileId: r.FileId, Offset: 0}).Marshal(&idxBuf)
-	require.NoError(t, db.Index.Set(wrong[:], idxBuf[:], nil))
+	require.NoError(t, db.Index.Apply([]deltaIndexMutation{liveDeltaMutation(
+		wrong,
+		AccountIndexEntry{Slot: 110, FileId: r.FileId, Offset: 0},
+	)}, nil, true))
 	_, err = db.GetAccount(110, wrong)
 	require.Error(t, err)
 	require.ErrorContains(t, err, "after retry")

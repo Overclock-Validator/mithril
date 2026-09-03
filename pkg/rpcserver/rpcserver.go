@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync"
 	"time"
@@ -24,7 +24,6 @@ import (
 type RpcServer struct {
 	isReady       bool
 	rpcService    *jsonrpc.RPCServer
-	serv          *httptest.Server
 	listener      net.Listener
 	acctsDb       *accountsdb.AccountsDb
 	epochSchedule *sealevel.SysvarEpochSchedule
@@ -35,7 +34,18 @@ type RpcServer struct {
 	leaderTPUByIdentity      map[solana.PublicKey]tpuEndpoint
 	leaderTPUCacheUpdatedAt  time.Time
 	clusterNodesRefreshEvery time.Duration
-	clusterNodesRefreshOnce  sync.Once
+
+	lifecycleMu      sync.Mutex
+	shutdownMu       sync.Mutex
+	httpServer       *http.Server
+	serveHandler     http.Handler // test seam; nil serves rpcServer itself
+	serveDone        chan struct{}
+	serveErr         error
+	refreshCancel    context.CancelFunc
+	refreshDone      chan struct{}
+	stopping         bool
+	shutdownComplete bool
+	shutdownErr      error
 
 	clusterRPCEndpoints []string
 	clusterNodesFetcher clusterNodesFetcher
@@ -117,8 +127,107 @@ func (rpcServer *RpcServer) getSlotCtx() *sealevel.SlotCtx {
 }
 
 func (rpcServer *RpcServer) Start() {
-	rpcServer.startClusterNodesRefreshLoop()
-	go http.Serve(rpcServer.listener, rpcServer)
+	if rpcServer == nil {
+		return
+	}
+	rpcServer.lifecycleMu.Lock()
+	if rpcServer.httpServer != nil || rpcServer.stopping {
+		rpcServer.lifecycleMu.Unlock()
+		return
+	}
+	handler := rpcServer.serveHandler
+	if handler == nil {
+		handler = rpcServer
+	}
+	server := &http.Server{Handler: handler}
+	serveDone := make(chan struct{})
+	refreshCtx, refreshCancel := context.WithCancel(context.Background())
+	refreshDone := make(chan struct{})
+	rpcServer.httpServer = server
+	rpcServer.serveDone = serveDone
+	rpcServer.refreshCancel = refreshCancel
+	rpcServer.refreshDone = refreshDone
+	listener := rpcServer.listener
+	rpcServer.lifecycleMu.Unlock()
+
+	go rpcServer.runClusterNodesRefreshLoop(refreshCtx, refreshDone)
+	go func() {
+		err := server.Serve(listener)
+		if errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
+			err = nil
+		}
+		rpcServer.lifecycleMu.Lock()
+		rpcServer.serveErr = err
+		rpcServer.lifecycleMu.Unlock()
+		close(serveDone)
+	}()
+}
+
+// Shutdown fences new RPC connections, waits for every in-flight handler and
+// joins the cluster-node refresh loop. AccountsDB must not be closed until it
+// returns nil. A timed-out call can be retried with a fresh context.
+func (rpcServer *RpcServer) Shutdown(ctx context.Context) error {
+	if rpcServer == nil {
+		return nil
+	}
+	if ctx == nil {
+		return errors.New("rpcserver: nil shutdown context")
+	}
+	rpcServer.shutdownMu.Lock()
+	defer rpcServer.shutdownMu.Unlock()
+	if rpcServer.shutdownComplete {
+		return rpcServer.shutdownErr
+	}
+
+	rpcServer.lifecycleMu.Lock()
+	rpcServer.stopping = true
+	server := rpcServer.httpServer
+	listener := rpcServer.listener
+	serveDone := rpcServer.serveDone
+	refreshCancel := rpcServer.refreshCancel
+	refreshDone := rpcServer.refreshDone
+	rpcServer.lifecycleMu.Unlock()
+
+	if refreshCancel != nil {
+		refreshCancel()
+	}
+	var transientErr error
+	if server != nil {
+		if err := server.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			transientErr = errors.Join(transientErr, fmt.Errorf("rpcserver: stop HTTP server: %w", err))
+		}
+	} else if listener != nil {
+		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			transientErr = errors.Join(transientErr, fmt.Errorf("rpcserver: close listener: %w", err))
+		}
+	}
+	if err := waitRPCServerLoop(ctx, serveDone, "HTTP serve loop"); err != nil {
+		transientErr = errors.Join(transientErr, err)
+	}
+	if err := waitRPCServerLoop(ctx, refreshDone, "cluster-node refresh loop"); err != nil {
+		transientErr = errors.Join(transientErr, err)
+	}
+	if transientErr != nil {
+		return transientErr
+	}
+
+	rpcServer.lifecycleMu.Lock()
+	rpcServer.shutdownErr = errors.Join(rpcServer.shutdownErr, rpcServer.serveErr)
+	rpcServer.shutdownComplete = true
+	rpcServer.lifecycleMu.Unlock()
+	return rpcServer.shutdownErr
+}
+
+func waitRPCServerLoop(ctx context.Context, done <-chan struct{}, name string) error {
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("rpcserver: wait for %s: %w", name, ctx.Err())
+	}
 }
 
 func (rpcServer *RpcServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -273,27 +382,28 @@ func readQuietMethodProbeBody(r *http.Request) ([]byte, bool) {
 	return body, true
 }
 
-func (rpcServer *RpcServer) startClusterNodesRefreshLoop() {
-	rpcServer.clusterNodesRefreshOnce.Do(func() {
-		if rpcServer.clusterNodesFetcher == nil && len(rpcServer.clusterRPCEndpoints) == 0 {
+func (rpcServer *RpcServer) runClusterNodesRefreshLoop(ctx context.Context, done chan<- struct{}) {
+	defer close(done)
+	if rpcServer.clusterNodesFetcher == nil && len(rpcServer.clusterRPCEndpoints) == 0 {
+		return
+	}
+
+	if err := rpcServer.refreshLeaderTPUCache(ctx); err != nil && ctx.Err() == nil {
+		mlog.Log.Warnf("sendTransaction: initial cluster node refresh failed: %v", err)
+	}
+
+	ticker := time.NewTicker(rpcServer.clusterNodesRefreshInterval())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
 			return
+		case <-ticker.C:
+			if err := rpcServer.refreshLeaderTPUCache(ctx); err != nil && ctx.Err() == nil {
+				mlog.Log.Warnf("sendTransaction: periodic cluster node refresh failed: %v", err)
+			}
 		}
-
-		go func() {
-			if err := rpcServer.refreshLeaderTPUCache(context.Background()); err != nil {
-				mlog.Log.Warnf("sendTransaction: initial cluster node refresh failed: %v", err)
-			}
-
-			ticker := time.NewTicker(rpcServer.clusterNodesRefreshInterval())
-			defer ticker.Stop()
-
-			for range ticker.C {
-				if err := rpcServer.refreshLeaderTPUCache(context.Background()); err != nil {
-					mlog.Log.Warnf("sendTransaction: periodic cluster node refresh failed: %v", err)
-				}
-			}
-		}()
-	})
+	}
 }
 
 func (rpcServer *RpcServer) clusterNodesRefreshInterval() time.Duration {

@@ -20,11 +20,25 @@ import (
 // exceed it rather than growing RAM unbounded (~16x normal rooting lag).
 const unrootedTailHaltCap = 512
 
+// DefaultWorkingSetMaxRetainedBytes is the conservative charged-memory hard
+// limit for speculative account layers. Publication of an incoming slot is
+// rejected atomically when its complete charge would cross this limit.
+const DefaultWorkingSetMaxRetainedBytes = uint64(1 << 30)
+
 // batchCommitter durably folds a batch of rooted slots into the canonical
 // store as one sequential segment (union-deduped, one fsync, atomic index
 // flip). Satisfied by AccountsDb.CommitBatch.
 type batchCommitter interface {
 	CommitBatch(deltas []accounts.SlotDelta, throughSlot uint64, bankhashes map[uint64][32]byte, resumeCtx []byte) (accountsdb.BatchCommitResult, error)
+}
+
+// batchMutationLimiter is implemented by the production AccountsDB. It lets
+// the promoter shorten a fold at a slot boundary before the account-index WAL
+// limit can be encountered. Keeping this optional preserves small test and
+// alternate committers; CommitBatch itself remains the authoritative
+// pre-commit safety boundary.
+type batchMutationLimiter interface {
+	MaxBatchAccountIndexMutations() uint64
 }
 
 // TransactionStatusCheckpointHooks deliberately split status-cache capture
@@ -69,6 +83,13 @@ type measuredSharedBlockAccountSource interface {
 	GetAccountsBatchSharedWithStats(ctx context.Context, slot uint64, pks []solana.PublicKey) ([]*accounts.Account, accountsdb.BatchReadStats, error)
 }
 
+// measuredUniqueSharedBlockAccountSource is intentionally narrower than the
+// public defensive batch API. Replay uses it only after block-wide key dedupe,
+// and an unrooted overlay preserves uniqueness when it extracts durable misses.
+type measuredUniqueSharedBlockAccountSource interface {
+	GetUniqueAccountsBatchSharedWithStats(ctx context.Context, slot uint64, pks []solana.PublicKey) ([]*accounts.Account, accountsdb.BatchReadStats, error)
+}
+
 type measuredBlockAccountSource interface {
 	GetAccountWithStats(slot uint64, pubkey solana.PublicKey) (*accounts.Account, accountsdb.AccountReadStats, error)
 }
@@ -102,13 +123,25 @@ func getAccountsBatchSharedWithStats(ctx context.Context, source blockAccountSou
 	return out, accountsdb.BatchReadStats{RequestedKeys: uint64(len(pks)), DurableKeys: uint64(len(pks))}, err
 }
 
+func getUniqueAccountsBatchSharedWithStats(
+	ctx context.Context,
+	source blockAccountSource,
+	slot uint64,
+	pks []solana.PublicKey,
+) ([]*accounts.Account, accountsdb.BatchReadStats, error) {
+	if measured, ok := source.(measuredUniqueSharedBlockAccountSource); ok {
+		return measured.GetUniqueAccountsBatchSharedWithStats(ctx, slot, pks)
+	}
+	return getAccountsBatchSharedWithStats(ctx, source, slot, pks)
+}
+
 // unrootedState is the in-RAM speculative-state engine the replay loop drives in
 // rooted-durable mode: reads resolve speculative→durable, commits buffer in RAM,
 // rooted slots promote to disk. Implemented by unrootedTail (linear) and forkTail
 // (fork-aware, over forkCoordinator).
 type unrootedState interface {
 	blockAccountSource
-	Add(slot uint64, delta []*accounts.Account, bankhash []byte)
+	Add(slot uint64, delta []*accounts.Account, bankhash []byte) error
 	SetContext(slot uint64, ctx *state.ResumeContext, bankSysvars ...*sealevel.BankSysvars)
 	promote(through uint64) (uint64, *state.ResumeContext, error)
 	// flush force-folds the trailing partial chunk <= through. Epoch-boundary
@@ -142,12 +175,16 @@ type unrootedTail struct {
 	transactionStatusCheckpointHooks TransactionStatusCheckpointHooks
 }
 
-func newUnrootedTail(durable blockAccountSource, committer batchCommitter, haltCap int, batchSlots int, stakeIdxDir string) *unrootedTail {
+func newUnrootedTail(durable blockAccountSource, committer batchCommitter, haltCap int, batchSlots int, stakeIdxDir string, maximumRetainedBytes ...uint64) *unrootedTail {
 	if batchSlots <= 0 {
 		batchSlots = defaultFoldBatchSlots
 	}
+	maxBytes := DefaultWorkingSetMaxRetainedBytes
+	if len(maximumRetainedBytes) > 0 {
+		maxBytes = maximumRetainedBytes[0]
+	}
 	return &unrootedTail{
-		overlay:     accounts.NewWorkingSet(),
+		overlay:     accounts.NewWorkingSetWithMaxRetainedBytes(maxBytes),
 		durable:     durable,
 		committer:   committer,
 		bankhashes:  make(map[uint64][32]byte),
@@ -238,6 +275,26 @@ func (t *unrootedTail) GetAccountsBatchShared(ctx context.Context, slot uint64, 
 }
 
 func (t *unrootedTail) GetAccountsBatchSharedWithStats(ctx context.Context, slot uint64, pks []solana.PublicKey) ([]*accounts.Account, accountsdb.BatchReadStats, error) {
+	return t.getAccountsBatchSharedWithStats(ctx, slot, pks, false)
+}
+
+// GetUniqueAccountsBatchSharedWithStats propagates replay's block-wide
+// uniqueness proof through the speculative overlay. Removing overlay hits from
+// a unique input leaves a unique durable miss list.
+func (t *unrootedTail) GetUniqueAccountsBatchSharedWithStats(
+	ctx context.Context,
+	slot uint64,
+	pks []solana.PublicKey,
+) ([]*accounts.Account, accountsdb.BatchReadStats, error) {
+	return t.getAccountsBatchSharedWithStats(ctx, slot, pks, true)
+}
+
+func (t *unrootedTail) getAccountsBatchSharedWithStats(
+	ctx context.Context,
+	slot uint64,
+	pks []solana.PublicKey,
+	alreadyUnique bool,
+) ([]*accounts.Account, accountsdb.BatchReadStats, error) {
 	stats := accountsdb.BatchReadStats{RequestedKeys: uint64(len(pks))}
 	if len(pks) == 0 {
 		return nil, stats, nil
@@ -254,6 +311,10 @@ func (t *unrootedTail) GetAccountsBatchSharedWithStats(ctx context.Context, slot
 	}
 	stats.WorkingSetHits = uint64(len(pks) - missCount)
 	stats.DurableKeys = uint64(missCount)
+	if alreadyUnique {
+		stats.UniqueKeys = uint64(len(pks))
+		stats.UniqueDurableKeys = uint64(missCount)
+	}
 	if missCount > 0 {
 		misses := make([]solana.PublicKey, 0, missCount)
 		missIdx := make([]int, 0, missCount)
@@ -263,7 +324,14 @@ func (t *unrootedTail) GetAccountsBatchSharedWithStats(ctx context.Context, slot
 				missIdx = append(missIdx, i)
 			}
 		}
-		loaded, durableStats, err := getAccountsBatchSharedWithStats(ctx, t.durable, slot, misses)
+		var loaded []*accounts.Account
+		var durableStats accountsdb.BatchReadStats
+		var err error
+		if alreadyUnique {
+			loaded, durableStats, err = getUniqueAccountsBatchSharedWithStats(ctx, t.durable, slot, misses)
+		} else {
+			loaded, durableStats, err = getAccountsBatchSharedWithStats(ctx, t.durable, slot, misses)
+		}
 		if err != nil {
 			return nil, stats, err
 		}
@@ -271,6 +339,11 @@ func (t *unrootedTail) GetAccountsBatchSharedWithStats(ctx context.Context, slot
 		durableStats.DurableKeys = stats.DurableKeys
 		durableStats.WorkingSetHits += stats.WorkingSetHits
 		durableStats.WorkingSetLookupNanoseconds += stats.WorkingSetLookupNanoseconds
+		if alreadyUnique {
+			durableStats.UniqueKeys = stats.UniqueKeys
+			durableStats.UniqueDurableKeys = stats.UniqueDurableKeys
+			durableStats.DuplicateKeys = 0
+		}
 		stats = durableStats
 		// Durable returns one entry per requested key; guard so a contract
 		// violation surfaces as an error, not an index panic.
@@ -286,11 +359,21 @@ func (t *unrootedTail) GetAccountsBatchSharedWithStats(ctx context.Context, slot
 
 // Add buffers a replayed slot's writes + bankhash in the overlay; it becomes
 // durable only via promote(). Resume context is attached separately (SetContext).
-func (t *unrootedTail) Add(slot uint64, delta []*accounts.Account, bankhash []byte) {
-	t.overlay.Add(slot, delta)
+func (t *unrootedTail) Add(slot uint64, delta []*accounts.Account, bankhash []byte) error {
+	if err := t.overlay.Add(slot, delta); err != nil {
+		return err
+	}
 	var slotBankhash [32]byte
 	copy(slotBankhash[:], bankhash)
 	t.bankhashes[slot] = slotBankhash
+	return nil
+}
+
+func (t *unrootedTail) workingSetStats() accounts.WorkingSetStats {
+	if t == nil || t.overlay == nil {
+		return accounts.WorkingSetStats{}
+	}
+	return t.overlay.Stats()
 }
 
 // SetContext attaches a held slot's end-of-slot resume context and, when
@@ -398,14 +481,15 @@ func (t *unrootedTail) buildFoldJob(through uint64, force bool, hookOverrides ..
 	if err != nil {
 		return nil, err
 	}
-	prefix := t.overlay.PromotionPrefix(through)
-	if len(prefix) == 0 {
+	chunk, limitReached := t.overlay.PromotionPrefixBounded(
+		through,
+		t.batchSlots,
+		batchAccountMutationLimit(t.committer),
+	)
+	if len(chunk) == 0 {
 		return nil, nil
 	}
-	chunk := prefix
-	if len(chunk) > t.batchSlots {
-		chunk = chunk[:t.batchSlots]
-	} else if len(chunk) < t.batchSlots && !force {
+	if !limitReached && !force {
 		return nil, nil // trailing partial chunk stays in RAM
 	}
 	through = chunk[len(chunk)-1].Slot
@@ -435,7 +519,7 @@ func (t *unrootedTail) buildFoldJob(through uint64, force bool, hookOverrides ..
 		}
 	}
 	return &foldJob{
-		chunk:                                  append([]accounts.SlotDelta(nil), chunk...),
+		chunk:                                  chunk,
 		through:                                through,
 		bankhashes:                             bankhashes,
 		ctx:                                    ctx,
@@ -636,7 +720,12 @@ func (t *unrootedTail) unwind(fromSlot uint64) (*state.ResumeContext, *sealevel.
 // OverCap reports whether the unrooted tail has grown past the halt cap, i.e.
 // rooting has stalled and we must stop replay rather than grow RAM unbounded.
 func (t *unrootedTail) OverCap() bool {
-	return t.haltCap > 0 && t.overlay.HeldSlots() > t.haltCap
+	if t == nil || t.overlay == nil {
+		return false
+	}
+	stats := t.overlay.Stats()
+	return (t.haltCap > 0 && stats.HeldSlots > uint64(t.haltCap)) ||
+		(stats.MaximumBytes > 0 && stats.RetainedBytes > stats.MaximumBytes)
 }
 
 // promoteRootedBatched folds held slots <= through in chunks of batchSlots.
@@ -677,20 +766,19 @@ func promoteRootedBatched(
 	if err != nil {
 		return 0, err
 	}
-	prefix := overlay.PromotionPrefix(through)
-	if len(prefix) == 0 {
-		return 0, nil
+	if batchSlots <= 0 {
+		batchSlots = defaultFoldBatchSlots
 	}
 
-	for start := 0; start < len(prefix); start += batchSlots {
-		end := start + batchSlots
-		if end > len(prefix) {
-			if !force {
-				break // trailing partial chunk stays in RAM
-			}
-			end = len(prefix)
+	mutationLimit := batchAccountMutationLimit(committer)
+	for {
+		chunk, limitReached := overlay.PromotionPrefixBounded(through, batchSlots, mutationLimit)
+		if len(chunk) == 0 {
+			break
 		}
-		chunk := prefix[start:end]
+		if !limitReached && !force {
+			break // trailing partial chunk stays in RAM
+		}
 		chunkThrough := chunk[len(chunk)-1].Slot
 
 		chunkBankhashes := make(map[uint64][32]byte, len(chunk))
@@ -776,6 +864,69 @@ func promoteRootedBatched(
 		promotedThrough = chunkThrough
 	}
 	return promotedThrough, err
+}
+
+func batchAccountMutationLimit(committer batchCommitter) uint64 {
+	limiter, ok := committer.(batchMutationLimiter)
+	if !ok {
+		return 0
+	}
+	return limiter.MaxBatchAccountIndexMutations()
+}
+
+// selectFoldChunk returns the longest leading chunk within both the configured
+// slot count and the production index's atomic-mutation limit. WorkingSet
+// already makes each SlotDelta unique by pubkey, so summing lengths is a cheap
+// conservative upper bound: keys repeated across slots may cause an earlier
+// fold, but can never make the chosen fold unsafe. This runs on replay's loop
+// thread and deliberately avoids allocating a million-key dedupe map there.
+func selectFoldChunk(
+	prefix []accounts.SlotDelta,
+	batchSlots int,
+	force bool,
+	mutationLimit uint64,
+) ([]accounts.SlotDelta, bool, error) {
+	if len(prefix) == 0 {
+		return nil, false, nil
+	}
+	if batchSlots <= 0 {
+		batchSlots = defaultFoldBatchSlots
+	}
+	maxSlots := min(len(prefix), batchSlots)
+	if mutationLimit == 0 {
+		if maxSlots < batchSlots && !force {
+			return nil, false, nil
+		}
+		return prefix[:maxSlots], true, nil
+	}
+
+	var mutations uint64
+	for end := 0; end < maxSlots; end++ {
+		slotMutations := uint64(len(prefix[end].Delta))
+		if slotMutations > mutationLimit {
+			if end != 0 {
+				return prefix[:end], true, nil
+			}
+			// Slot boundaries are semantic and cannot be invented inside one
+			// block. CommitBatch supports this rare case as a logical
+			// multi-frame transaction protected by pendingFold.
+			return prefix[:1], true, nil
+		}
+		if slotMutations > mutationLimit-mutations {
+			// The overflowing slot remains in the WorkingSet for the next fold.
+			// end cannot be zero because the single-slot case was checked above.
+			return prefix[:end], true, nil
+		}
+		mutations += slotMutations
+		if mutations == mutationLimit {
+			return prefix[:end+1], true, nil
+		}
+	}
+
+	if maxSlots < batchSlots && !force {
+		return nil, false, nil
+	}
+	return prefix[:maxSlots], true, nil
 }
 
 func resolveTransactionStatusCheckpointHooks(configured TransactionStatusCheckpointHooks, overrides []TransactionStatusCheckpointHooks) (TransactionStatusCheckpointHooks, error) {

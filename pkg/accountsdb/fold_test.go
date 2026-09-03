@@ -2,6 +2,7 @@ package accountsdb
 
 import (
 	"encoding/binary"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"testing"
@@ -19,8 +20,9 @@ func newFoldTestDb(t testing.TB) (*AccountsDb, string) {
 	t.Helper()
 	dir := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "accounts"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "largest_file_id"), make([]byte, 8), 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "bootstrap_high_file_id"), make([]byte, 8), 0o644))
+	require.NoError(t, WriteLargestFileID(dir, 0))
+	require.NoError(t, WriteBootstrapHighFileID(dir, 0))
+	require.NoError(t, InitializeMutableAccountIndex(dir))
 	db, err := OpenDb(dir)
 	require.NoError(t, err)
 	db.RootedDurable = true // production storage mode (node.go forces it on)
@@ -31,6 +33,18 @@ func newFoldTestDb(t testing.TB) (*AccountsDb, string) {
 func reopenFoldTestDb(t *testing.T, db *AccountsDb, dir string) *AccountsDb {
 	t.Helper()
 	db.CloseDb()
+	re, err := OpenDb(dir)
+	require.NoError(t, err)
+	re.RootedDurable = true
+	re.InitCaches()
+	return re
+}
+
+func reopenFoldTestDbWithFreshMutableIndex(t *testing.T, db *AccountsDb, dir string) *AccountsDb {
+	t.Helper()
+	db.CloseDb()
+	require.NoError(t, os.Remove(filepath.Join(dir, DeltaIndexJournalFileName)))
+	require.NoError(t, InitializeMutableAccountIndex(dir))
 	re, err := OpenDb(dir)
 	require.NoError(t, err)
 	re.RootedDurable = true
@@ -131,7 +145,7 @@ func TestSegmentManifestRoundTripAndTornDetection(t *testing.T) {
 		Bankhashes:  []SlotBankhash{{Slot: 100, Bankhash: bh(100)}, {Slot: 130, Bankhash: bh(130)}},
 		Records: []ManifestRecord{
 			{Pubkey: [32]byte{1}, Offset: 0, OwnerSlot: 100, PrevValid: true, Prev: AccountIndexEntry{Slot: 90, FileId: 3, Offset: 77}},
-			{Pubkey: [32]byte{2}, Offset: 136, OwnerSlot: 130},
+			{Pubkey: [32]byte{2}, Offset: 136, OwnerSlot: 130, Tombstone: true},
 		},
 		ResumeCtx: []byte(`{"slot":130}`),
 	}
@@ -158,6 +172,57 @@ func TestSegmentManifestRoundTripAndTornDetection(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, data, 0o644))
 	_, err = ReadSegmentManifest(path)
 	assert.ErrorIs(t, err, ErrTornManifest)
+}
+
+func TestSegmentManifestRejectsMalformedCountsAndFlagsBeforeAllocation(t *testing.T) {
+	dir := t.TempDir()
+	manifest := &SegmentManifest{
+		Version:     segManifestVersion,
+		Kind:        ManifestKindFold,
+		BatchSeq:    1,
+		ThroughSlot: 10,
+		FileId:      1,
+		Records:     []ManifestRecord{{Pubkey: [32]byte{1}}},
+	}
+	path := segmentManifestPath(dir, manifest.ThroughSlot, manifest.FileId)
+	baseline := manifest.encode()
+	for _, test := range []struct {
+		name   string
+		mutate func([]byte)
+	}{
+		{
+			name: "bankhash count exceeds remaining body",
+			mutate: func(encoded []byte) {
+				binary.LittleEndian.PutUint32(encoded[manifestFixedPrefixSize:], ^uint32(0))
+			},
+		},
+		{
+			name: "record count does not exactly consume tail",
+			mutate: func(encoded []byte) {
+				recordCountOffset := manifestFixedPrefixSize + 4 + 4
+				binary.LittleEndian.PutUint64(encoded[recordCountOffset:], 0)
+			},
+		},
+		{
+			name: "unknown record flag",
+			mutate: func(encoded []byte) {
+				flagsOffset := manifestFixedPrefixSize + 4 + 4 + 8 + manifestRecordFlagsOffset
+				encoded[flagsOffset] = 1 << 7
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			encoded := append([]byte(nil), baseline...)
+			test.mutate(encoded)
+			binary.LittleEndian.PutUint32(encoded[len(encoded)-4:], crc32.ChecksumIEEE(encoded[:len(encoded)-4]))
+			require.NoError(t, os.WriteFile(path, encoded, 0o644))
+
+			_, err := ReadSegmentManifest(path)
+			require.ErrorIs(t, err, ErrTornManifest)
+			_, err = readValidatedManifestHeader(path)
+			require.ErrorIs(t, err, ErrTornManifest)
+		})
+	}
 }
 
 func BenchmarkReadSegmentManifestContext(b *testing.B) {
@@ -290,9 +355,30 @@ func TestRecoverFoldStateIdempotent(t *testing.T) {
 	assert.Empty(t, second.OrphansRemoved)
 }
 
-// A gap in the BatchSeq run bounds recovery: contiguous manifests replay, and
-// everything above the gap is undecided -> deleted.
-func TestRecoverFoldStateStopsAtGapAndRemovesAbove(t *testing.T) {
+func TestRecoverFoldStateRepairsAlreadyAppliedFrontierBankhash(t *testing.T) {
+	db, _ := newFoldTestDb(t)
+	defer db.CloseDb()
+	commitTestBatch(t, db, 110, foldAcct(1, 100, nil))
+
+	var slot [8]byte
+	binary.LittleEndian.PutUint64(slot[:], 110)
+	require.NoError(t, db.BankHashStore.Delete(slot[:], pebble.Sync))
+	_, err := db.GetBankHashForSlot(110)
+	require.Error(t, err)
+
+	recovery, err := db.RecoverFoldState()
+	require.NoError(t, err)
+	assert.Empty(t, recovery.ReplayedBatches, "frontier was already applied")
+	got, err := db.GetBankHashForSlot(110)
+	require.NoError(t, err)
+	want := bh(110)
+	assert.Equal(t, want[:], got)
+}
+
+// A higher final manifest proves that a missing sequence is corruption, not an
+// undecided tail. Recovery must reject the store without deleting any remaining
+// manifest or segment (including the now-manifest-less segment at the gap).
+func TestRecoverFoldStateRejectsGapAndPreservesArtifacts(t *testing.T) {
 	db, dir := newFoldTestDb(t)
 
 	for i, through := range []uint64{105, 110, 115} {
@@ -302,30 +388,33 @@ func TestRecoverFoldStateStopsAtGapAndRemovesAbove(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	// Rewind the index to "nothing applied" and delete seq 2's manifest to
-	// create a gap: seq 1 must replay, seq 3 must be treated as undecided.
-	require.NoError(t, db.Index.Delete(metaKeyLastBatch, pebble.Sync))
+	// Delete seq 2's manifest to create a gap, then explicitly seed an empty
+	// test index. Seq 3 is already a durable decision, so it cannot be discarded.
 	headers, err := ListFoldManifests(db.AcctsDir)
 	require.NoError(t, err)
 	require.Len(t, headers, 3)
+	dataPaths := make([]string, len(headers))
+	for i, header := range headers {
+		dataPaths[i] = filepath.Join(db.AcctsDir, SegmentDataName(header.ThroughSlot, header.FileId))
+	}
 	require.NoError(t, os.Remove(headers[1].Path))
 
-	db = reopenFoldTestDb(t, db, dir)
+	db = reopenFoldTestDbWithFreshMutableIndex(t, db, dir)
 	defer db.CloseDb()
 	res, err := db.RecoverFoldState()
-	require.NoError(t, err)
-	assert.Equal(t, uint64(1), res.BatchSeq)
-	assert.Equal(t, uint64(105), res.DurableThrough)
-	assert.Equal(t, []uint64{1}, res.ReplayedBatches)
-	assert.NotEmpty(t, res.OrphansRemoved, "seq-3 manifest + segment must be removed")
-
-	remaining, err := ListFoldManifests(db.AcctsDir)
-	require.NoError(t, err)
-	assert.Len(t, remaining, 1)
+	require.ErrorContains(t, err, "fold manifest sequence gap at 2 before durable sequence 3")
+	assert.Empty(t, res.OrphansRemoved)
+	assert.FileExists(t, headers[0].Path)
+	assert.NoFileExists(t, headers[1].Path, "the test deliberately removed only this manifest")
+	assert.FileExists(t, headers[2].Path)
+	for _, path := range dataPaths {
+		assert.FileExists(t, path, "fail-closed recovery must not run orphan GC")
+	}
 }
 
-// A torn manifest stops the replay run exactly like a gap.
-func TestRecoverFoldStateStopsAtTornManifest(t *testing.T) {
+// A torn final manifest above meta is a damaged durable decision, not an
+// undecided tail. Neither it nor its data segment may be deleted.
+func TestRecoverFoldStateRejectsTornFinalManifestWithoutDeleting(t *testing.T) {
 	db, dir := newFoldTestDb(t)
 	for i, through := range []uint64{105, 110} {
 		_, err := db.CommitBatch(foldDeltas(
@@ -333,28 +422,28 @@ func TestRecoverFoldStateStopsAtTornManifest(t *testing.T) {
 		), through, map[uint64][32]byte{through: bh(through)}, nil)
 		require.NoError(t, err)
 	}
-	require.NoError(t, db.Index.Delete(metaKeyLastBatch, pebble.Sync))
-
 	headers, err := ListFoldManifests(db.AcctsDir)
 	require.NoError(t, err)
-	data, err := os.ReadFile(headers[1].Path)
+	tornPath := headers[1].Path
+	tornDataPath := filepath.Join(db.AcctsDir, SegmentDataName(headers[1].ThroughSlot, headers[1].FileId))
+	data, err := os.ReadFile(tornPath)
 	require.NoError(t, err)
 	data[len(data)-2] ^= 0xFF // corrupt inside the CRC-covered region
-	require.NoError(t, os.WriteFile(headers[1].Path, data, 0o644))
+	require.NoError(t, os.WriteFile(tornPath, data, 0o644))
 
-	db = reopenFoldTestDb(t, db, dir)
+	db = reopenFoldTestDbWithFreshMutableIndex(t, db, dir)
 	defer db.CloseDb()
 	res, err := db.RecoverFoldState()
-	require.NoError(t, err)
-	assert.Equal(t, uint64(1), res.BatchSeq)
-	assert.Equal(t, []uint64{1}, res.ReplayedBatches)
+	require.ErrorIs(t, err, ErrTornManifest)
+	assert.Empty(t, res.OrphansRemoved)
+	assert.FileExists(t, tornPath)
+	assert.FileExists(t, tornDataPath)
 }
 
-// WAL-off mode: losing the index tail (simulated by wiping entries + meta) is
-// fully repaired by manifest replay — the manifests ARE the index redo log.
-func TestRecoverFoldStateRebuildsIndexTailWithWALOff(t *testing.T) {
+// Runtime open must never reinterpret loss of the mutable journal as a fresh
+// store. Retained manifests are not guaranteed to cover compacted history.
+func TestOpenDbRejectsMissingMutableJournal(t *testing.T) {
 	db, dir := newFoldTestDb(t)
-	db.IndexWALDisabled = true
 
 	a1 := foldAcct(1, 11, []byte("one"))
 	a2 := foldAcct(2, 22, []byte("two"))
@@ -367,23 +456,12 @@ func TestRecoverFoldStateRebuildsIndexTailWithWALOff(t *testing.T) {
 	), 110, map[uint64][32]byte{110: bh(110)}, []byte("ctx-110"))
 	require.NoError(t, err)
 
-	// Simulate the lost memtable tail: wipe both entries and the meta.
-	require.NoError(t, db.Index.Delete(metaKeyLastBatch, pebble.Sync))
-	require.NoError(t, db.Index.Delete(a1.Key[:], pebble.Sync))
-	require.NoError(t, db.Index.Delete(a2.Key[:], pebble.Sync))
-
-	db = reopenFoldTestDb(t, db, dir)
-	defer db.CloseDb()
-	res, err := db.RecoverFoldState()
-	require.NoError(t, err)
-	assert.Equal(t, []uint64{1, 2}, res.ReplayedBatches)
-	assert.Equal(t, uint64(110), res.DurableThrough)
-	assert.Equal(t, []byte("ctx-110"), res.ResumeCtx)
-
-	got1 := mustColdRead(t, db, 110, solana.PublicKey{1})
-	assert.Equal(t, uint64(11), got1.Lamports)
-	got2 := mustColdRead(t, db, 110, solana.PublicKey{2})
-	assert.Equal(t, uint64(22), got2.Lamports)
+	db.CloseDb()
+	require.NoError(t, os.Remove(filepath.Join(dir, DeltaIndexJournalFileName)))
+	missing, err := OpenDb(dir)
+	require.ErrorIs(t, err, ErrAccountIndexMigrationRequired)
+	require.ErrorContains(t, err, "legacy journal")
+	assert.Nil(t, missing)
 }
 
 // Fresh store: no manifests, no meta — recovery reports a clean zero state.
@@ -422,4 +500,104 @@ func TestCommitBatchNeverReusesFileIdAfterCrash(t *testing.T) {
 	), 110, map[uint64][32]byte{110: bh(110)}, nil)
 	require.NoError(t, err)
 	assert.GreaterOrEqual(t, res.FileId, uint64(2), "aborted fold's fileId must stay consumed")
+}
+
+func TestCommitBatchRejectsSequenceOverflowBeforeFileSideEffects(t *testing.T) {
+	db, _ := newFoldTestDb(t)
+	defer db.CloseDb()
+	db.lastBatchSeq = ^uint64(0)
+	before := db.LargestFileId.Load()
+
+	_, err := db.CommitBatch([]accounts.SlotDelta{{Slot: 1}}, 1, nil, nil)
+	require.ErrorContains(t, err, "batch sequence exhausted")
+	assert.Equal(t, before, db.LargestFileId.Load())
+	entries, readErr := os.ReadDir(db.AcctsDir)
+	require.NoError(t, readErr)
+	assert.Empty(t, entries)
+}
+
+func TestWriteSegmentManifestNeverReplacesDurableDecision(t *testing.T) {
+	dir := t.TempDir()
+	manifest := &SegmentManifest{
+		Version:     segManifestVersion,
+		Kind:        ManifestKindFold,
+		BatchSeq:    1,
+		ThroughSlot: 10,
+		FileId:      20,
+		ResumeCtx:   []byte("first"),
+	}
+	require.NoError(t, WriteSegmentManifest(dir, manifest))
+	path := segmentManifestPath(dir, manifest.ThroughSlot, manifest.FileId)
+	want, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	manifest.ResumeCtx = []byte("replacement")
+	err = WriteSegmentManifest(dir, manifest)
+	require.Error(t, err)
+	assert.False(t, segmentManifestWasRenamed(err))
+	got, readErr := os.ReadFile(path)
+	require.NoError(t, readErr)
+	assert.Equal(t, want, got, "existing commit decision must remain byte-identical")
+}
+
+func TestManifestReadersRejectSymlinkWithoutMutatingTarget(t *testing.T) {
+	dir := t.TempDir()
+	manifest := &SegmentManifest{
+		Version:     segManifestVersion,
+		Kind:        ManifestKindFold,
+		BatchSeq:    1,
+		FromSlot:    1,
+		ThroughSlot: 2,
+		FileId:      3,
+		ResumeCtx:   []byte("resume"),
+	}
+	require.NoError(t, WriteSegmentManifest(dir, manifest))
+	path := segmentManifestPath(dir, manifest.ThroughSlot, manifest.FileId)
+	externalPath := path + ".external-target"
+	require.NoError(t, os.Rename(path, externalPath))
+	want, err := os.ReadFile(externalPath)
+	require.NoError(t, err)
+	require.NoError(t, os.Symlink(externalPath, path))
+
+	readers := []struct {
+		name string
+		read func() error
+	}{
+		{name: "full", read: func() error { _, err := ReadSegmentManifest(path); return err }},
+		{name: "context", read: func() error { _, err := ReadSegmentManifestContext(path); return err }},
+		{name: "header", read: func() error { _, err := readManifestHeader(path); return err }},
+	}
+	for _, reader := range readers {
+		t.Run(reader.name, func(t *testing.T) {
+			err := reader.read()
+			require.Error(t, err)
+			require.ErrorIs(t, err, ErrTornManifest)
+		})
+	}
+	got, err := os.ReadFile(externalPath)
+	require.NoError(t, err)
+	assert.Equal(t, want, got, "rejected manifest symlink must not mutate its target")
+	info, err := os.Lstat(path)
+	require.NoError(t, err)
+	assert.NotZero(t, info.Mode()&os.ModeSymlink)
+}
+
+func TestCommitBatchRefusesToClobberExistingSegmentPath(t *testing.T) {
+	db, _ := newFoldTestDb(t)
+	defer db.CloseDb()
+
+	path := filepath.Join(db.AcctsDir, SegmentDataName(10, 1))
+	original := []byte("pre-existing-segment-must-survive")
+	require.NoError(t, os.WriteFile(path, original, 0o644))
+
+	_, err := db.CommitBatch(foldDeltas(
+		accounts.SlotDelta{Slot: 10, Delta: []*accounts.Account{foldAcct(1, 1, nil)}},
+	), 10, nil, nil)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, os.ErrExist)
+
+	got, readErr := os.ReadFile(path)
+	require.NoError(t, readErr)
+	assert.Equal(t, original, got)
+	assert.NoFileExists(t, segmentManifestPath(db.AcctsDir, 10, 1))
 }

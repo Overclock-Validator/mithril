@@ -7,6 +7,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/epochstakes"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/state"
+	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/require"
 )
 
@@ -48,4 +49,20 @@ func TestPopulateManifestSeedKeepsManifestEpochFrame(t *testing.T) {
 	if persisted.Epoch != 1073 {
 		t.Fatalf("persisted epoch = %d, want 1073", persisted.Epoch)
 	}
+}
+
+func TestPopulateManifestSeedPersistsAndClearsAlpenglowBlockID(t *testing.T) {
+	blockID := solana.Hash{1, 2, 3, 4}
+	manifest := &SnapshotManifest{
+		Bank:    &DeserializableVersionedBank{Slot: 123},
+		BlockID: &blockID,
+	}
+	mithrilState := state.NewReadyState(manifest.Bank.Slot, 0, "", "", 0, 0)
+
+	PopulateManifestSeed(mithrilState, manifest)
+	require.Equal(t, blockID.String(), mithrilState.ManifestParentAlpenglowBlockID)
+
+	manifest.BlockID = nil
+	PopulateManifestSeed(mithrilState, manifest)
+	require.Empty(t, mithrilState.ManifestParentAlpenglowBlockID)
 }
