@@ -1,6 +1,9 @@
 package packet
 
-const DataSize = 1232
+// DataSize is the largest transaction payload accepted by TPU QUIC. Legacy
+// and v0 transactions remain capped at 1232 bytes by wire sanitization; the
+// larger buffer is for SIMD-0385 v1 transactions.
+const DataSize = 4096
 
 // Packet is a received TPU transaction payload moving through the pipeline.
 type Packet struct {

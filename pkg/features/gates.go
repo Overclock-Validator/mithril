@@ -62,6 +62,11 @@ var EnableSbpfV3DeploymentAndExecution = FeatureGate{Name: "EnableSbpfV3Deployme
 var DisableSbpfV0Execution = FeatureGate{Name: "DisableSbpfV0Execution", Address: base58.MustDecodeFromString("TestFeature11111111111111111111111111111111")}
 var ReenableSbpfV0Execution = FeatureGate{Name: "ReenableSbpfV0Execution", Address: base58.MustDecodeFromString("TestFeature21111111111111111111111111111111")}
 var FormalizeLoadedTransactionDataSize = FeatureGate{Name: "FormalizeLoadedTransactionDataSize", Address: base58.MustDecodeFromString("DeS7sR48ZcFTUmt5FFEVDr1v1bh73aAbZiZq3SYr8Eh8")}
+var EnableTxV1 = FeatureGate{Name: "EnableTxV1", Address: base58.MustDecodeFromString("txv1aq4pp281K9um3tnPgkfX8UqtFT6wcVW3hNezGLL")}
+var DefineLtdsFeeOnlySemantics = FeatureGate{Name: "DefineLtdsFeeOnlySemantics", Address: base58.MustDecodeFromString("LTDSzjZKFJMKHYpNycG1FrWwGGTaFFwqEFjB5GGLNVD")}
+var RelaxPostExecMinBalanceCheck = FeatureGate{Name: "RelaxPostExecMinBalanceCheck", Address: base58.MustDecodeFromString("DEJmsCntuYqbXtL5z5TxbaxJXFUJAFjf7TqWSF7YWjQg")}
+var RelaxFeePayerConstraint = FeatureGate{Name: "RelaxFeePayerConstraint", Address: base58.MustDecodeFromString("FEEXbxUuKobtrt1qNK5pjtzbPQhsppBTrNNG74xu4mai")}
+var RaiseBlockLimitsTo100m = FeatureGate{Name: "RaiseBlockLimitsTo100m", Address: base58.MustDecodeFromString("P1BCUMpAC7V2GRBRiJCNUgpMyWZhoqt3LKo712ePqsz")}
 
 const AlpenglowFeatureGateAddress = "A1PeNGc3D8SQmKwdYf4qj1XG7XgWVSuFQaiJSCQj775h"
 
@@ -114,7 +119,8 @@ var AllFeatureGates = []FeatureGate{StopTruncatingStringsInSyscalls, EnableParti
 	FullInflationVote, FullInflationEnable, FullInflationDevnetAndTestnet, PicoInflation, DisableAccountLoaderSpecialCase, EnableGetEpochStakeSyscall,
 	ReserveMinimalCUsForBuiltinInstructions, RelaxIntraBatchAccountLocks, MaskOutRentEpochInVmSerialization, RemoveAccountsExecutableFlagChecks,
 	AccountsLtHash, RemoveAccountsDeltaHash, EnableLoaderV4, EnableSbpfV1DeploymentAndExecution, EnableSbpfV2DeploymentAndExecution,
-	EnableSbpfV3DeploymentAndExecution, DisableSbpfV0Execution, ReenableSbpfV0Execution, FormalizeLoadedTransactionDataSize, Alpenglow, AlpenglowDevContext,
+	EnableSbpfV3DeploymentAndExecution, DisableSbpfV0Execution, ReenableSbpfV0Execution, FormalizeLoadedTransactionDataSize,
+	EnableTxV1, DefineLtdsFeeOnlySemantics, RelaxPostExecMinBalanceCheck, RelaxFeePayerConstraint, RaiseBlockLimitsTo100m, Alpenglow, AlpenglowDevContext,
 	ValidatorAdmissionTicket, ReduceSlotTimeTo350ms, ReduceSlotTimeTo300ms, ReduceSlotTimeTo250ms, ReduceSlotTimeTo200ms, IncreaseCpiAccountInfoLimit,
 	StaticInstructionLimit, PoseidonEnforcePadding, FixAltBn128PairingLengthCheck, DeprecateRentExemptionThreshold,
 	ProvideInstructionDataOffsetInVmR2, SyscallParameterAddressRestrictions, VirtualAddressSpaceAdjustments, AccountDataDirectMapping,

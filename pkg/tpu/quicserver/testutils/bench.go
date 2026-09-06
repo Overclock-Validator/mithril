@@ -58,7 +58,7 @@ func ParseBenchFlags(fs *flag.FlagSet, args []string) (BenchOptions, error) {
 	fs.StringVar(&opts.Addr, "addr", opts.Addr, "TPU QUIC server address (host:port)")
 	fs.DurationVar(&opts.Duration, "duration", opts.Duration, "Bench duration after warmup")
 	fs.IntVar(&opts.Connections, "connections", opts.Connections, "Concurrent QUIC connections")
-	fs.IntVar(&opts.PayloadSize, "payload-size", opts.PayloadSize, "Transaction payload size in bytes (max 1232)")
+	fs.IntVar(&opts.PayloadSize, "payload-size", opts.PayloadSize, fmt.Sprintf("Transaction payload size in bytes (max %d)", quicserver.PacketDataSize))
 	fs.DurationVar(&opts.Warmup, "warmup", opts.Warmup, "Warmup duration excluded from results")
 	fs.DurationVar(&opts.ProgressEvery, "progress-every", opts.ProgressEvery, "Progress reporting interval; 0 disables")
 	fs.DurationVar(&opts.DialTimeout, "dial-timeout", opts.DialTimeout, "QUIC dial timeout")

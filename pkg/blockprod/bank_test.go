@@ -6,11 +6,13 @@ import (
 
 	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/costmodel"
+	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/replay"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/txfixture"
 	"github.com/Overclock-Validator/mithril/pkg/turbine"
 	"github.com/gagliardetto/solana-go"
+	computebudget "github.com/gagliardetto/solana-go/programs/compute-budget"
 	"github.com/gagliardetto/solana-go/programs/system"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -101,6 +103,144 @@ func mustSignedTransfer(t *testing.T, lamports uint64) *solana.Transaction {
 	})
 	require.NoError(t, err)
 	return tx
+}
+
+func mustSignBankTestTransaction(t *testing.T, instructions ...solana.Instruction) *solana.Transaction {
+	t.Helper()
+	tx, err := solana.NewTransaction(
+		instructions,
+		txfixture.TestBlockhash(),
+		solana.TransactionPayer(txfixture.PayerPubkey()),
+	)
+	require.NoError(t, err)
+	payerKey := txfixture.PayerPrivateKey()
+	_, err = tx.Sign(func(key solana.PublicKey) *solana.PrivateKey {
+		if key.Equals(txfixture.PayerPubkey()) {
+			return &payerKey
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	return tx
+}
+
+func TestWorkingBankIncludesAndChargesFeesOnlyLoadFailure(t *testing.T) {
+	env := NewTestEnv(TestEnvConfig{})
+	defer env.Close()
+
+	tx := mustSignBankTestTransaction(t,
+		computebudget.NewSetLoadedAccountsDataSizeLimitInstruction(1).Build(),
+		system.NewTransferInstruction(1, txfixture.PayerPubkey(), txfixture.DestPubkey()).Build(),
+	)
+	wire, err := tx.MarshalBinary()
+	require.NoError(t, err)
+
+	// The account loader classifies this as a processable fee-only failure:
+	// the one-byte limit cannot hold even the payer's account base size.
+	preview := replay.LoadAndExecuteTransaction(replay.LoadAndExecuteTransactionInput{
+		SlotCtx:     env.SlotCtx,
+		Transaction: tx,
+		LeanResult:  true,
+	})
+	require.NotNil(t, preview.ProcessingResult.TransactionError)
+	assert.Equal(t, replay.TransactionErrorMaxLoadedAccountsDataSizeExceeded, preview.ProcessingResult.TransactionError.ErrorType)
+
+	payerBefore, err := env.SlotCtx.GetAccount(txfixture.PayerPubkey())
+	require.NoError(t, err)
+	destBefore, err := env.SlotCtx.GetAccount(txfixture.DestPubkey())
+	require.NoError(t, err)
+
+	result, reason := env.Bank.ForgeTransaction(tx, len(wire))
+	require.Equal(t, ForgeAccepted, result)
+	require.Equal(t, costmodel.ExceedNone, reason)
+	payerAfter, err := env.SlotCtx.GetAccount(txfixture.PayerPubkey())
+	require.NoError(t, err)
+	destAfter, err := env.SlotCtx.GetAccount(txfixture.DestPubkey())
+	require.NoError(t, err)
+	assert.Equal(t, payerBefore.Lamports-5_000, payerAfter.Lamports)
+	assert.Equal(t, destBefore.Lamports, destAfter.Lamports)
+	assert.Equal(t, uint64(5_000), env.Bank.TxFeeAccumulator().TotalFees)
+	assert.Len(t, env.Bank.ForgedTransactions(), 1)
+	assert.Equal(t, 1, env.Bank.EntryBuilder().PendingCount())
+	assert.NotZero(t, env.Bank.CostTracker().BlockCost())
+
+	// Inclusion records the failed transaction's message status, so it cannot
+	// be charged or included a second time in this bank.
+	result, reason = env.Bank.ForgeTransaction(tx, len(wire))
+	assert.Equal(t, ForgeDroppedAlreadyProcessed, result)
+	assert.Equal(t, costmodel.ExceedNone, reason)
+	payerAfterRetry, err := env.SlotCtx.GetAccount(txfixture.PayerPubkey())
+	require.NoError(t, err)
+	assert.Equal(t, payerAfter.Lamports, payerAfterRetry.Lamports)
+}
+
+func TestWorkingBankIncludesV1DefaultLoadedLimitAsFeesOnly(t *testing.T) {
+	env := NewTestEnv(TestEnvConfig{})
+	defer env.Close()
+	env.SlotCtx.Features.EnableFeature(features.EnableTxV1, 0)
+
+	tx := mustSignedTransfer(t, 1)
+	_, err := tx.Message.SetVersion(solana.MessageVersionV1)
+	require.NoError(t, err)
+	// An omitted V1 loaded-accounts limit defaults to zero. Even the payer's
+	// 64-byte protocol base therefore produces a processable fees-only result.
+	tx.Message.TransactionConfig = solana.TransactionConfig{}
+	payerKey := txfixture.PayerPrivateKey()
+	_, err = tx.Sign(func(key solana.PublicKey) *solana.PrivateKey {
+		if key.Equals(txfixture.PayerPubkey()) {
+			return &payerKey
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	wire, err := tx.MarshalBinary()
+	require.NoError(t, err)
+	payerBefore, err := env.SlotCtx.GetAccount(txfixture.PayerPubkey())
+	require.NoError(t, err)
+	destBefore, err := env.SlotCtx.GetAccount(txfixture.DestPubkey())
+	require.NoError(t, err)
+
+	result, reason := env.Bank.ForgeTransaction(tx, len(wire))
+	assert.Equal(t, ForgeAccepted, result)
+	assert.Equal(t, costmodel.ExceedNone, reason)
+	payerAfter, err := env.SlotCtx.GetAccount(txfixture.PayerPubkey())
+	require.NoError(t, err)
+	destAfter, err := env.SlotCtx.GetAccount(txfixture.DestPubkey())
+	require.NoError(t, err)
+	assert.Equal(t, payerBefore.Lamports-5_000, payerAfter.Lamports)
+	assert.Equal(t, destBefore.Lamports, destAfter.Lamports)
+	assert.Equal(t, uint64(5_000), env.Bank.TxFeeAccumulator().TotalFees)
+	assert.Len(t, env.Bank.ForgedTransactions(), 1)
+}
+
+func TestWorkingBankRejectsUnsupportedV1WithoutCharging(t *testing.T) {
+	env := NewTestEnv(TestEnvConfig{})
+	defer env.Close()
+
+	tx := mustSignedTransfer(t, 1)
+	_, err := tx.Message.SetVersion(solana.MessageVersionV1)
+	require.NoError(t, err)
+	payerKey := txfixture.PayerPrivateKey()
+	_, err = tx.Sign(func(key solana.PublicKey) *solana.PrivateKey {
+		if key.Equals(txfixture.PayerPubkey()) {
+			return &payerKey
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	wire, err := tx.MarshalBinary()
+	require.NoError(t, err)
+	payerBefore, err := env.SlotCtx.GetAccount(txfixture.PayerPubkey())
+	require.NoError(t, err)
+
+	result, reason := env.Bank.ForgeTransaction(tx, len(wire))
+	assert.Equal(t, ForgeDroppedExecution, result)
+	assert.Equal(t, costmodel.ExceedNone, reason)
+	payerAfter, err := env.SlotCtx.GetAccount(txfixture.PayerPubkey())
+	require.NoError(t, err)
+	assert.Equal(t, payerBefore.Lamports, payerAfter.Lamports)
+	assert.Empty(t, env.Bank.ForgedTransactions())
+	assert.Zero(t, env.Bank.TxFeeAccumulator().TotalFees)
 }
 
 func TestWorkingBankAcceptsTransferThatDrainsPayerToZero(t *testing.T) {

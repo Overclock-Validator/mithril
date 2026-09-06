@@ -256,3 +256,13 @@ func ChainTipParentContext() ChainTipSnapshot {
 	}
 	return ctx
 }
+
+// ChainTipFeatureActive reports the current replay tip's feature state without
+// cloning the full producer context. It is intended for hot admission paths,
+// such as TPU sigverify, that must follow bank feature activation even outside
+// this validator's leader windows.
+func ChainTipFeatureActive(gate features.FeatureGate) bool {
+	chainTipMu.RLock()
+	defer chainTipMu.RUnlock()
+	return chainTipFeatures != nil && chainTipFeatures.IsActive(gate)
+}

@@ -248,10 +248,15 @@ func (b *WorkingBank) ForgeTransaction(tx *solana.Transaction, wireSize int) (Fo
 		LeanResult:  true,
 	})
 	if output.ProcessingResult.TransactionError != nil {
-		return ForgeDroppedExecution, costmodel.ExceedNone
-	}
-	if err := replay.ApplySuccessfulTransaction(b.slotCtx, output); err != nil {
-		return ForgeDroppedExecution, costmodel.ExceedNone
+		feeInfo, err := replay.ApplyFeesOnlyTransaction(b.slotCtx, tx, output)
+		if err != nil {
+			return ForgeDroppedExecution, costmodel.ExceedNone
+		}
+		output.FeeInfo = feeInfo
+	} else {
+		if err := replay.ApplySuccessfulTransaction(b.slotCtx, output); err != nil {
+			return ForgeDroppedExecution, costmodel.ExceedNone
+		}
 	}
 	if b.seenMessages == nil {
 		b.seenMessages = make(map[[32]byte]struct{})
@@ -275,22 +280,13 @@ func (b *WorkingBank) ForgeTransaction(tx *solana.Transaction, wireSize int) (Fo
 }
 
 func actualExecutionUsage(output replay.LoadAndExecuteTransactionOutput) (execCU, loadedCost uint64) {
+	loadedCost = costmodel.LoadedAccountsDataSizeCost(output.LoadedAccountsDataSize)
 	execCtx := output.ExecCtx
 	if execCtx == nil {
-		return 0, 0
+		return 0, loadedCost
 	}
 	execCU = execCtx.ComputeMeter.Used()
-	if execCtx.TransactionContext == nil {
-		return execCU, 0
-	}
-	var loadedBytes uint32
-	for _, acct := range execCtx.TransactionContext.Accounts.Accounts {
-		if acct == nil || acct.IsDummy {
-			continue
-		}
-		loadedBytes += uint32(len(acct.Data))
-	}
-	return execCU, costmodel.LoadedAccountsDataSizeCost(loadedBytes)
+	return execCU, loadedCost
 }
 
 // BufferedDropReason classifies why a buffered transaction should be discarded.

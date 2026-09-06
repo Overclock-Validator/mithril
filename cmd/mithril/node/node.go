@@ -33,6 +33,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/blockstream"
 	"github.com/Overclock-Validator/mithril/pkg/config"
 	consensusengine "github.com/Overclock-Validator/mithril/pkg/consensus"
+	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
 	"github.com/Overclock-Validator/mithril/pkg/lightbringer"
@@ -2689,6 +2690,15 @@ postBootstrap:
 		tpuCfg.ListenAddr = validatorTPUQUICBind
 		tpuCfg.AdvertisedIP = advertisedIP
 		tpuCfg.Pipeline.Sink = topicSink
+		tpuCfg.Pipeline.TxV1Enabled = func() bool {
+			// During our leader window, admission must use that working bank's
+			// feature snapshot rather than the concurrently advancing replay tip.
+			if bank := controller.WorkingBank(); bank != nil {
+				slotCtx := bank.SlotCtx()
+				return slotCtx != nil && slotCtx.Features != nil && slotCtx.Features.IsActive(features.EnableTxV1)
+			}
+			return replay.ChainTipFeatureActive(features.EnableTxV1)
+		}
 		if validatorSigverifyWorkers > 0 {
 			tpuCfg.Pipeline.SigverifyWorkers = validatorSigverifyWorkers
 		}

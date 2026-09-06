@@ -1,11 +1,17 @@
 package costmodel
 
+import (
+	"github.com/Overclock-Validator/mithril/pkg/features"
+	"github.com/gagliardetto/solana-go"
+)
+
 // Block cost limits mirror agave/cost-model/src/block_cost_limits.rs defaults.
 const (
 	ComputeUnitToUSRatio = 30
 
 	SignatureCost            = ComputeUnitToUSRatio * 24 // 720
 	Secp256k1VerifyCost      = ComputeUnitToUSRatio * 223
+	Ed25519VerifyCost        = ComputeUnitToUSRatio * 76
 	Ed25519VerifyStrictCost  = ComputeUnitToUSRatio * 80
 	Secp256r1VerifyCost      = ComputeUnitToUSRatio * 160
 	WriteLockUnits           = ComputeUnitToUSRatio * 10  // 300
@@ -26,10 +32,15 @@ const (
 	DefaultMaxDataShredsPerSlot = 32 * 1024
 	// SIMD-0525 max_entry_bytes_per_slot at the 400ms / 32,768-shred baseline.
 	DefaultMaxEntryBytesPerSlot = 20 * 1024 * 1024
-	PacketDataSize              = 1232
+	// PacketDataSize is the legacy/V0 transaction packet limit.
+	PacketDataSize = 1232
+	// MaxTransactionSize includes the larger SIMD-0385 V1 transaction limit.
+	MaxTransactionSize = solana.MaxTransactionSizeV1
 	// EntryHeaderBytes is the Agave/Firedancer 48-byte entry header used for
 	// pack byte accounting and the reserved ending-tick.
 	EntryHeaderBytes = 48
+	// MaxMicroblockBytes is the largest transaction plus its entry header.
+	MaxMicroblockBytes = EntryHeaderBytes + MaxTransactionSize
 
 	// TypicalDataShredPayloadBytes is chained-merkle unsigned data capacity
 	// for one shred: 1203 - 88 - 32 - 6*20.
@@ -62,4 +73,13 @@ func DefaultLimits() Limits {
 		MaxBatchBytes:          DefaultTargetBatchBytes,
 		MaxEntryBytes:          DefaultPackEntryBytes(),
 	}
+}
+
+// LimitsForFeatures returns the cost limits selected by the bank's feature set.
+func LimitsForFeatures(feats *features.Features) Limits {
+	limits := DefaultLimits()
+	if feats != nil && feats.IsActive(features.RaiseBlockLimitsTo100m) {
+		limits.BlockCost = MaxBlockUnitsSIMD0286
+	}
+	return limits
 }

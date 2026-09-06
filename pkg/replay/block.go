@@ -275,7 +275,7 @@ func resolveAddrTableLookups(accountsDb blockAccountSource, block *b.Block) erro
 	tables := make(map[solana.PublicKey]solana.PublicKeySlice)
 
 	for _, tx := range block.Transactions {
-		if !tx.Message.IsVersioned() {
+		if tx.Message.GetVersion() != solana.MessageVersionV0 {
 			continue
 		}
 
@@ -307,7 +307,7 @@ func resolveAddrTableLookups(accountsDb blockAccountSource, block *b.Block) erro
 
 txResolveLoop:
 	for _, tx := range block.Transactions {
-		if !tx.Message.IsVersioned() || tx.Message.AddressTableLookups.NumLookups() == 0 {
+		if tx.Message.GetVersion() != solana.MessageVersionV0 || tx.Message.AddressTableLookups.NumLookups() == 0 {
 			continue
 		}
 		for _, addrTableKey := range tx.Message.GetAddressTableLookups().GetTableIDs() {
@@ -336,7 +336,7 @@ txResolveLoop:
 // callers can map missing/invalid tables to AddressLookupTableNotFound or
 // InvalidAddressLookupTableData.
 func ResolveAddrTableLookupsForTx(ctx context.Context, accountsDb *accountsdb.AccountsDb, slot uint64, tx *solana.Transaction) error {
-	if !tx.Message.IsVersioned() || tx.Message.AddressTableLookups.NumLookups() == 0 {
+	if tx.Message.GetVersion() != solana.MessageVersionV0 || tx.Message.AddressTableLookups.NumLookups() == 0 {
 		return nil
 	}
 
@@ -3635,6 +3635,28 @@ type blockTransactionExecutionPlan struct {
 	processedSignatures uint64
 }
 
+// validateBlockTransactionVersions is the authoritative bank-boundary feature
+// check for transactions arriving from any block source. Native Turbine must be
+// able to decode a V1 wire packet before the candidate bank is constructed, so
+// ingress cannot safely decide whether V1 is active. The candidate block's
+// feature snapshot can, and must reject pre-activation V1 before transaction
+// execution can turn UnsupportedVersion into a nil-fee replay invariant panic.
+func validateBlockTransactionVersions(block *b.Block) error {
+	if block == nil {
+		return errors.New("nil block")
+	}
+	v1Active := block.Features != nil && block.Features.IsActive(features.EnableTxV1)
+	if v1Active {
+		return nil
+	}
+	for idx, tx := range block.Transactions {
+		if tx != nil && tx.Message.GetVersion() == solana.MessageVersionV1 {
+			return fmt.Errorf("transaction %d uses V1 before EnableTxV1 activation: %w", idx, TxErrUnsupportedVersion)
+		}
+	}
+	return nil
+}
+
 // planBlockTransactionExecution mirrors Agave's AlreadyProcessed check for
 // transactions presented to one bank. A duplicate message makes the whole
 // block invalid; replay must never silently filter it and compute a bank hash
@@ -4043,6 +4065,9 @@ func ProcessBlock(
 ) (*sealevel.SlotCtx, error) {
 	if block == nil {
 		return nil, errors.New("validate transaction messages: nil block")
+	}
+	if err := validateBlockTransactionVersions(block); err != nil {
+		return nil, fmt.Errorf("validate transaction versions for slot %d: %w", block.Slot, err)
 	}
 	executionPlanStart := time.Now()
 	executionPlan, err := planBlockTransactionExecution(block)

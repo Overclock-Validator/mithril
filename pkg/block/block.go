@@ -260,14 +260,33 @@ func (b *Block) CompleteTurbineReplayAdmission(at time.Time) (TurbineIngressTimi
 	b.turbineReplayAdmissionStart = time.Time{}
 	return b.turbineIngressTimings, true
 }
-func (b *Block) FixupTxVersions() {
+func (b *Block) FixupTxVersions() error {
 	if b == nil || len(b.Versions) == 0 {
-		return
+		return nil
 	}
-	b.invalidateTransactionDerivedState()
+	if len(b.Versions) != len(b.Transactions) {
+		return fmt.Errorf("restore transaction versions: have %d versions for %d transactions", len(b.Versions), len(b.Transactions))
+	}
+
+	// Validate into copies first so malformed persisted metadata cannot leave a
+	// partially updated block or invalidate otherwise reusable derived state.
+	messages := make([]solana.Message, len(b.Transactions))
 	for idx, tx := range b.Transactions {
-		tx.Message.SetVersion(solana.MessageVersion(b.Versions[idx]))
+		if tx == nil {
+			return fmt.Errorf("restore transaction version %d: nil transaction", idx)
+		}
+		messages[idx] = tx.Message
+		version := solana.MessageVersion(b.Versions[idx])
+		if _, err := messages[idx].SetVersion(version); err != nil {
+			return fmt.Errorf("restore transaction version %d as message version %d: %w", idx, version, err)
+		}
 	}
+
+	b.invalidateTransactionDerivedState()
+	for idx := range b.Transactions {
+		b.Transactions[idx].Message = messages[idx]
+	}
+	return nil
 }
 
 type TxEntry struct {
