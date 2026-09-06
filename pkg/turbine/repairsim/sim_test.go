@@ -102,6 +102,42 @@ func TestNearTipWithoutRepairRemainsIncomplete(t *testing.T) {
 	}
 }
 
+func TestNaturalLateShredsWithoutRepair(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		fecs          int
+		wantCompleted int
+	}{
+		{name: "live-arrivals-complete-slots", fecs: 1, wantCompleted: 2},
+		{name: "live-arrivals-leave-other-holes", fecs: 2, wantCompleted: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ledger := testLedger(t, 2, tc.fecs)
+			cfg := deterministicConfig(ScenarioNearTip)
+			cfg.RepairEnabled = false
+			cfg.NaturalLateShreds = true
+			result, err := Run(ledger, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.CompletedSlots != tc.wantCompleted || result.SpoolCompleteSlots != tc.wantCompleted {
+				t.Fatalf("completed=%d spool=%d, want %d", result.CompletedSlots, result.SpoolCompleteSlots, tc.wantCompleted)
+			}
+			// Each live arrival provides the 32nd shard in its slot's first FEC,
+			// recovering one missing data shred without any repair response.
+			if result.LocallyRecoveredDataShreds != 2 {
+				t.Fatalf("recovered=%d, want 2 after both live arrivals", result.LocallyRecoveredDataShreds)
+			}
+			if result.RepairRequests != 0 || result.RepairResponses != 0 || result.RepairBytesRequested != 0 {
+				t.Fatalf("repair disabled: requests=%d responses=%d bytes requested=%d", result.RepairRequests, result.RepairResponses, result.RepairBytesRequested)
+			}
+			if result.LogicalElapsed < cfg.RepairLatency/2+time.Microsecond {
+				t.Fatalf("elapsed=%v, stopped before the last live arrival", result.LogicalElapsed)
+			}
+		})
+	}
+}
+
 func TestCompleteDeliveryEstablishesZeroRepairBaseline(t *testing.T) {
 	ledger := testLedger(t, 2, 2)
 	cfg := deterministicConfig(ScenarioNearTip)

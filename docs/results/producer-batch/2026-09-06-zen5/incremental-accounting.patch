@@ -1,0 +1,55 @@
+--- a/pkg/blockprod/entry.go
++++ b/pkg/blockprod/entry.go
+@@ -11,0 +12,4 @@
++// EntryBuilder emits one entry per batch: an entry count, num_hashes, a
++// 32-byte hash, and a transaction count precede the serialized transactions.
++const singleEntryBatchHeaderBytes = 8 + 8 + 32 + 8
++
+@@ -16,3 +20,4 @@
+-	pendingTxns []solana.Transaction
+-	pendingWire int
+-	entryHash   solana.Hash
++	pendingTxns            []solana.Transaction
++	pendingWire            int
++	pendingSerializedBytes int
++	entryHash              solana.Hash
+@@ -38,0 +44,8 @@
++	// MarshalWithEncoder writes these transaction bytes without framing. Size
++	// each new transaction once rather than reserializing the pending batch.
++	// Keep this separate from the caller's wire-size hint, which may differ
++	// from the serialized representation used in the emitted component.
++	wire, err := tx.MarshalBinary()
++	if err != nil {
++		return nil, 0, false
++	}
+@@ -40,4 +52,0 @@
+-		wire, err := tx.MarshalBinary()
+-		if err != nil {
+-			return nil, 0, false
+-		}
+@@ -47,4 +56 @@
+-	nextBytes, err := estimateBatchBytes(b.pendingTxns, tx)
+-	if err != nil {
+-		return nil, 0, false
+-	}
++	nextBytes := singleEntryBatchHeaderBytes + b.pendingSerializedBytes + len(wire)
+@@ -54,0 +61 @@
++		b.pendingSerializedBytes = len(wire)
+@@ -59,0 +67 @@
++	b.pendingSerializedBytes += len(wire)
+@@ -89,0 +98 @@
++	b.pendingSerializedBytes = 0
+@@ -91,13 +99,0 @@
+-}
+-
+-func estimateBatchBytes(pending []solana.Transaction, next solana.Transaction) (int, error) {
+-	txns := append(append([]solana.Transaction(nil), pending...), next)
+-	entries := []turbine.Entry{{
+-		NumHashes: 1,
+-		Txns:      txns,
+-	}}
+-	out, err := marshalEntryBatchBytes(entries)
+-	if err != nil {
+-		return 0, err
+-	}
+-	return len(out), nil

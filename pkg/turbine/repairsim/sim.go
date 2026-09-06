@@ -198,10 +198,8 @@ func Run(ledger *Ledger, cfg Config) (Result, error) {
 	if err := s.seedLocalState(); err != nil {
 		return Result{}, err
 	}
-	if cfg.RepairEnabled {
-		if err := s.repairUntilDone(); err != nil {
-			return Result{}, err
-		}
+	if err := s.runDeliveries(); err != nil {
+		return Result{}, err
 	}
 
 	var memAfter runtime.MemStats
@@ -288,10 +286,14 @@ type simulation struct {
 
 func (s *simulation) seedLocalState() error {
 	s.corruptLeft = s.cfg.CorruptResponses
+	packetsBySlot := make([][]Packet, len(s.ledger.Slots))
+	for slotIdx := range s.ledger.Slots {
+		packetsBySlot[slotIdx] = initialPackets(&s.ledger.Slots[slotIdx], s.cfg.Availability)
+	}
 	for ordinal := 0; ; ordinal++ {
 		added := false
 		for slotIdx := range s.ledger.Slots {
-			packets := initialPackets(&s.ledger.Slots[slotIdx], s.cfg.Availability)
+			packets := packetsBySlot[slotIdx]
 			if ordinal >= len(packets) {
 				continue
 			}
@@ -343,15 +345,22 @@ func initialPackets(slot *Slot, availability Availability) []Packet {
 	return out
 }
 
-func (s *simulation) repairUntilDone() error {
+func (s *simulation) runDeliveries() error {
 	const maxIterations = 10_000_000
 	for iterations := 0; len(s.completed) < len(s.ledger.Slots); iterations++ {
 		if iterations >= maxIterations {
 			return errors.New("repair simulation exceeded iteration limit")
 		}
-		s.prioritizeHeadWindow()
-		s.scheduleRequests()
+		if s.cfg.RepairEnabled {
+			s.prioritizeHeadWindow()
+			s.scheduleRequests()
+		}
 		if len(s.queue) == 0 {
+			// Without repair, exhaust the live arrivals and report any remaining
+			// holes. No more traffic is expected to complete those slots.
+			if !s.cfg.RepairEnabled {
+				return nil
+			}
 			return fmt.Errorf("repair stalled with %d/%d completed", len(s.completed), len(s.ledger.Slots))
 		}
 		event := heap.Pop(&s.queue).(delivery)

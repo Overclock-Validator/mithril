@@ -44,6 +44,10 @@ Selected omitted shreds can also arrive through the simulated live path while
 a repair response is outstanding. This measures cancellation/late-response
 behavior without changing production scheduling.
 
+Disabling repair stops request scheduling but still delivers natural late live
+shreds. The run ends when all slots complete or those live arrivals are
+exhausted; incomplete slots are reported without a repair-stall error.
+
 ### Deep catch-up
 
 `mixed` begins every FEC set with 16 data + 15 coding shreds. One fetched data
