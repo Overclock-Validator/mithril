@@ -1,0 +1,30 @@
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/blockprod
+cpu: AMD Ryzen 7 9700X 8-Core Processor
+BenchmarkProducerBranchHeads/small-215B/one-fec         	       1	  72424110 ns/op	     30816 batch-target-B	       350.0 entry-batches/op	     11296 max-data-shreds/slot	  10769600 max-entry-B/slot	     22592 packets/op	         1.000 slots/op	     50000 transactions/op	       215.0 wire-B/tx	141777944 B/op	  735400 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/blockprod
+cpu: AMD Ryzen 7 9700X 8-Core Processor
+BenchmarkProducerBranchHeads/small-215B/one-fec         	       1	  72844387 ns/op	     30816 batch-target-B	       350.0 entry-batches/op	     11296 max-data-shreds/slot	  10769600 max-entry-B/slot	     22592 packets/op	         1.000 slots/op	     50000 transactions/op	       215.0 wire-B/tx	141777880 B/op	  735400 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/blockprod
+cpu: AMD Ryzen 7 9700X 8-Core Processor
+BenchmarkProducerBranchHeads/small-215B/one-fec         	       1	  70699409 ns/op	     30816 batch-target-B	       350.0 entry-batches/op	     11296 max-data-shreds/slot	  10769600 max-entry-B/slot	     22592 packets/op	         1.000 slots/op	     50000 transactions/op	       215.0 wire-B/tx	141778192 B/op	  735404 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/blockprod
+cpu: AMD Ryzen 7 9700X 8-Core Processor
+BenchmarkProducerBranchHeads/small-215B/one-fec         	       1	  72504651 ns/op	     30816 batch-target-B	       350.0 entry-batches/op	     11296 max-data-shreds/slot	  10769600 max-entry-B/slot	     22592 packets/op	         1.000 slots/op	     50000 transactions/op	       215.0 wire-B/tx	141778192 B/op	  735404 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/blockprod
+cpu: AMD Ryzen 7 9700X 8-Core Processor
+BenchmarkProducerBranchHeads/small-215B/one-fec         	       1	  71786365 ns/op	     30816 batch-target-B	       350.0 entry-batches/op	     11296 max-data-shreds/slot	  10769600 max-entry-B/slot	     22592 packets/op	         1.000 slots/op	     50000 transactions/op	       215.0 wire-B/tx	141777912 B/op	  735400 allocs/op
+PASS

@@ -1,0 +1,5 @@
+=== RUN   TestProducerBranchComparisonFixtures
+    producer_branch_bench_test.go:208: wire=215 batch-target=30816 batches=2 packets=512
+    producer_branch_bench_test.go:208: wire=1232 batch-target=30816 batches=10 packets=1024
+--- PASS: TestProducerBranchComparisonFixtures (0.07s)
+PASS
