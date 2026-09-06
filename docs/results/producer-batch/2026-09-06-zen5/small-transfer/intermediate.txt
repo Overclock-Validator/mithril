@@ -1,0 +1,30 @@
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/blockprod
+cpu: AMD Ryzen 7 9700X 8-Core Processor
+BenchmarkProducerBlock50k 	       1	  97930817 ns/op	       175.0 entry-batches/op	     22592 packets/op	     50000 transactions/op	       215.0 wire-B/tx	232001200 B/op	 1131417 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/blockprod
+cpu: AMD Ryzen 7 9700X 8-Core Processor
+BenchmarkProducerBlock50k 	       1	 105399577 ns/op	       175.0 entry-batches/op	     22592 packets/op	     50000 transactions/op	       215.0 wire-B/tx	232001576 B/op	 1131421 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/blockprod
+cpu: AMD Ryzen 7 9700X 8-Core Processor
+BenchmarkProducerBlock50k 	       1	 103304583 ns/op	       175.0 entry-batches/op	     22592 packets/op	     50000 transactions/op	       215.0 wire-B/tx	232001624 B/op	 1131422 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/blockprod
+cpu: AMD Ryzen 7 9700X 8-Core Processor
+BenchmarkProducerBlock50k 	       1	  97647918 ns/op	       175.0 entry-batches/op	     22592 packets/op	     50000 transactions/op	       215.0 wire-B/tx	232001200 B/op	 1131417 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/blockprod
+cpu: AMD Ryzen 7 9700X 8-Core Processor
+BenchmarkProducerBlock50k 	       1	  97644912 ns/op	       175.0 entry-batches/op	     22592 packets/op	     50000 transactions/op	       215.0 wire-B/tx	232001264 B/op	 1131417 allocs/op
+PASS

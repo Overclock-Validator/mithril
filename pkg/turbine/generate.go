@@ -38,6 +38,14 @@ type ShredGenerator struct {
 	ReferenceTick uint8
 }
 
+// shredPackets retains the roots already computed during generation, in FEC
+// order, so broadcast can commit to them without parsing the packets again.
+type shredPackets struct {
+	packets           [][]byte
+	fecSetRoots       []solana.Hash
+	chainedMerkleRoot solana.Hash
+}
+
 func dataCapacity(proofSize uint8, resigned bool) int {
 	capacity := dataPayloadSize - dataHeaderSize - merkleRootSize - int(proofSize)*merkleProofEntrySize
 	if resigned {
@@ -82,15 +90,29 @@ func (g *ShredGenerator) MakeShredsFromData(
 	nextShredIndex uint32,
 	nextCodeIndex uint32,
 ) ([][]byte, solana.Hash, uint32, uint32, error) {
+	batch, nextData, nextCode, err := g.makeShredsFromData(
+		leader, data, isLastInSlot, chainedMerkleRoot, nextShredIndex, nextCodeIndex,
+	)
+	return batch.packets, batch.chainedMerkleRoot, nextData, nextCode, err
+}
+
+func (g *ShredGenerator) makeShredsFromData(
+	leader solana.PrivateKey,
+	data []byte,
+	isLastInSlot bool,
+	chainedMerkleRoot solana.Hash,
+	nextShredIndex uint32,
+	nextCodeIndex uint32,
+) (shredPackets, uint32, uint32, error) {
 	if g.Slot < g.ParentSlot || g.Slot-g.ParentSlot > uint64(^uint16(0)) {
-		return nil, solana.Hash{}, nextShredIndex, nextCodeIndex, fmt.Errorf("invalid parent slot %d for slot %d", g.ParentSlot, g.Slot)
+		return shredPackets{}, nextShredIndex, nextCodeIndex, fmt.Errorf("invalid parent slot %d for slot %d", g.ParentSlot, g.Slot)
 	}
 	// The 32+32 coding matrix is invariant across every FEC set in this
 	// operation. Building it requires a Vandermonde inversion, so retain the
 	// encoder for the whole payload rather than reconstructing it per set.
 	encoder, err := acquireErasureEncoder()
 	if err != nil {
-		return nil, solana.Hash{}, nextShredIndex, nextCodeIndex, err
+		return shredPackets{}, nextShredIndex, nextCodeIndex, err
 	}
 	defer releaseErasureEncoder(encoder)
 	proofSize := uint8(proofEntriesFor32x32)
@@ -116,6 +138,7 @@ func (g *ShredGenerator) MakeShredsFromData(
 	}
 
 	var packets [][]byte
+	var fecSetRoots []solana.Hash
 	dataIndex := nextShredIndex
 	codeIndex := nextCodeIndex
 	chainedRoot := chainedMerkleRoot
@@ -129,9 +152,10 @@ func (g *ShredGenerator) MakeShredsFromData(
 		dataComplete := len(unsignedData) == 0 && len(signedData) == 0
 		batchPackets, root, err := g.makeFECBatch(encoder, leader, batch, unsignedCap, proofSize, false, parentOffset, flags, dataComplete, false, chainedRoot, dataIndex, codeIndex)
 		if err != nil {
-			return nil, solana.Hash{}, dataIndex, codeIndex, err
+			return shredPackets{}, dataIndex, codeIndex, err
 		}
 		packets = append(packets, batchPackets...)
+		fecSetRoots = append(fecSetRoots, root)
 		chainedRoot = root
 		dataIndex += dataShredsPerFECBlock
 		codeIndex += codingShredsPerFECBlock
@@ -141,9 +165,10 @@ func (g *ShredGenerator) MakeShredsFromData(
 		dataComplete := len(signedData) == 0
 		batchPackets, root, err := g.makeFECBatch(encoder, leader, unsignedData, unsignedCap, proofSize, false, parentOffset, flags, dataComplete, false, chainedRoot, dataIndex, codeIndex)
 		if err != nil {
-			return nil, solana.Hash{}, dataIndex, codeIndex, err
+			return shredPackets{}, dataIndex, codeIndex, err
 		}
 		packets = append(packets, batchPackets...)
+		fecSetRoots = append(fecSetRoots, root)
 		chainedRoot = root
 		dataIndex += dataShredsPerFECBlock
 		codeIndex += codingShredsPerFECBlock
@@ -152,15 +177,18 @@ func (g *ShredGenerator) MakeShredsFromData(
 	if len(signedData) > 0 || (len(packets) == 0 && isLastInSlot) {
 		batchPackets, root, err := g.makeFECBatch(encoder, leader, signedData, signedCap, proofSize, true, parentOffset, flags, true, isLastInSlot, chainedRoot, dataIndex, codeIndex)
 		if err != nil {
-			return nil, solana.Hash{}, dataIndex, codeIndex, err
+			return shredPackets{}, dataIndex, codeIndex, err
 		}
 		packets = append(packets, batchPackets...)
+		fecSetRoots = append(fecSetRoots, root)
 		chainedRoot = root
 		dataIndex += dataShredsPerFECBlock
 		codeIndex += codingShredsPerFECBlock
 	}
 
-	return packets, chainedRoot, dataIndex, codeIndex, nil
+	return shredPackets{
+		packets: packets, fecSetRoots: fecSetRoots, chainedMerkleRoot: chainedRoot,
+	}, dataIndex, codeIndex, nil
 }
 
 func (g *ShredGenerator) makeFECBatch(
