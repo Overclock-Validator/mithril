@@ -4,12 +4,12 @@ package costmodel
 const (
 	ComputeUnitToUSRatio = 30
 
-	SignatureCost            = ComputeUnitToUSRatio * 24  // 720
+	SignatureCost            = ComputeUnitToUSRatio * 24 // 720
 	Secp256k1VerifyCost      = ComputeUnitToUSRatio * 223
 	Ed25519VerifyStrictCost  = ComputeUnitToUSRatio * 80
 	Secp256r1VerifyCost      = ComputeUnitToUSRatio * 160
-	WriteLockUnits           = ComputeUnitToUSRatio * 10 // 300
-	InstructionDataBytesCost = 140 / ComputeUnitToUSRatio  // ~4 CU per byte
+	WriteLockUnits           = ComputeUnitToUSRatio * 10  // 300
+	InstructionDataBytesCost = 140 / ComputeUnitToUSRatio // ~4 CU per byte
 
 	MaxBlockUnitsSIMD0256 = 60_000_000
 	MaxBlockUnitsSIMD0286 = 100_000_000
@@ -20,9 +20,15 @@ const (
 
 	// DefaultMaxDataShredsPerSlot matches agave DEFAULT_MAX_DATA_SHREDS_PER_SLOT.
 	DefaultMaxDataShredsPerSlot = 32 * 1024
-	// TypicalDataShredPayloadBytes is the usable data bytes per entry-batch target.
+	// TypicalDataShredPayloadBytes is the usable data in one chained Merkle
+	// data shred for the standard 32+32 FEC layout.
 	TypicalDataShredPayloadBytes = 963
-	DefaultTargetBatchBytes      = 2 * TypicalDataShredPayloadBytes
+	// DataShredsPerFECBlock and DefaultTargetBatchBytes mirror Agave's
+	// DATA_SHREDS_PER_FEC_BLOCK and get_target_batch_bytes_default. The target
+	// is two complete FEC payloads, not two individual shred payloads.
+	DataShredsPerFECBlock   = 32
+	TypicalFECDataBytes     = DataShredsPerFECBlock * TypicalDataShredPayloadBytes
+	DefaultTargetBatchBytes = 2 * TypicalFECDataBytes
 )
 
 // Limits configures per-slot cost and size budgets.

@@ -455,6 +455,19 @@ func TestEntryBuilderFlush(t *testing.T) {
 	assert.Greater(t, batchBytes, 0)
 }
 
+func TestEntryBuilderDefaultTargetCoalescesTransactions(t *testing.T) {
+	builder := NewEntryBuilder(costmodel.DefaultLimits(), solana.Hash{0xcd})
+	for seq := uint64(0); seq < 2; seq++ {
+		wire := txfixture.MustSignedTransferWire(seq)
+		tx, err := solana.TransactionFromBytes(wire)
+		require.NoError(t, err)
+		entries, _, flushed := builder.Append(*tx, len(wire))
+		assert.False(t, flushed)
+		assert.Empty(t, entries)
+	}
+	assert.Equal(t, 2, builder.PendingCount())
+}
+
 func TestControllerWorkingBank(t *testing.T) {
 	controller := NewController()
 	assert.Nil(t, controller.WorkingBank())

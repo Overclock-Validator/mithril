@@ -410,13 +410,12 @@ func merkleHashNode(left []byte, right []byte) solana.Hash {
 	return hashv([][]byte{[]byte(merkleHashPrefixNode), left, right})
 }
 
-func hashv(parts [][]byte) solana.Hash {
+func hashv(parts [][]byte) (out solana.Hash) {
 	h := sha256.New()
 	for _, part := range parts {
 		_, _ = h.Write(part)
 	}
-	var out solana.Hash
-	copy(out[:], h.Sum(nil))
+	_ = h.Sum(out[:0])
 	return out
 }
 

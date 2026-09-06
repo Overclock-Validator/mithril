@@ -1,0 +1,30 @@
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/blockprod
+cpu: AMD Ryzen 7 9700X 8-Core Processor
+BenchmarkProducer50kMaxSize 	       1	2106644723 ns/op	      1022 entry-batches/op	     32768 max-data-shreds/slot	    131072 packets/op	         2.000 slots/op	     50000 transactions/op	      1232 wire-B/tx	10132961632 B/op	12526140 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/blockprod
+cpu: AMD Ryzen 7 9700X 8-Core Processor
+BenchmarkProducer50kMaxSize 	       1	2114571842 ns/op	      1022 entry-batches/op	     32768 max-data-shreds/slot	    131072 packets/op	         2.000 slots/op	     50000 transactions/op	      1232 wire-B/tx	10132677856 B/op	12525201 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/blockprod
+cpu: AMD Ryzen 7 9700X 8-Core Processor
+BenchmarkProducer50kMaxSize 	       1	2123394398 ns/op	      1022 entry-batches/op	     32768 max-data-shreds/slot	    131072 packets/op	         2.000 slots/op	     50000 transactions/op	      1232 wire-B/tx	10132771968 B/op	12525508 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/blockprod
+cpu: AMD Ryzen 7 9700X 8-Core Processor
+BenchmarkProducer50kMaxSize 	       1	2115793410 ns/op	      1022 entry-batches/op	     32768 max-data-shreds/slot	    131072 packets/op	         2.000 slots/op	     50000 transactions/op	      1232 wire-B/tx	10132869248 B/op	12525856 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/blockprod
+cpu: AMD Ryzen 7 9700X 8-Core Processor
+BenchmarkProducer50kMaxSize 	       1	2107312334 ns/op	      1022 entry-batches/op	     32768 max-data-shreds/slot	    131072 packets/op	         2.000 slots/op	     50000 transactions/op	      1232 wire-B/tx	10132867648 B/op	12525832 allocs/op
+PASS

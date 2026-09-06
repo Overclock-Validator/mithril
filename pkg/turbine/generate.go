@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"encoding/binary"
 	"fmt"
+	"sync"
 
 	"github.com/gagliardetto/solana-go"
 	"github.com/klauspost/reedsolomon"
@@ -14,12 +15,35 @@ const (
 	proofEntriesFor32x32    = 6
 )
 
+var erasureEncoderPool sync.Pool
+
+func acquireErasureEncoder() (reedsolomon.Encoder, error) {
+	if encoder := erasureEncoderPool.Get(); encoder != nil {
+		return encoder.(reedsolomon.Encoder), nil
+	}
+	return reedsolomon.New(dataShredsPerFECBlock, codingShredsPerFECBlock)
+}
+
+func releaseErasureEncoder(encoder reedsolomon.Encoder) {
+	if encoder != nil {
+		erasureEncoderPool.Put(encoder)
+	}
+}
+
 // ShredGenerator builds merkle FEC shreds from a serialized byte buffer.
 type ShredGenerator struct {
 	Slot          uint64
 	ParentSlot    uint64
 	Version       uint16
 	ReferenceTick uint8
+}
+
+// shredPackets retains the roots already computed during generation, in FEC
+// order, so broadcast can commit to them without parsing the packets again.
+type shredPackets struct {
+	packets           [][]byte
+	fecSetRoots       []solana.Hash
+	chainedMerkleRoot solana.Hash
 }
 
 func dataCapacity(proofSize uint8, resigned bool) int {
@@ -66,9 +90,31 @@ func (g *ShredGenerator) MakeShredsFromData(
 	nextShredIndex uint32,
 	nextCodeIndex uint32,
 ) ([][]byte, solana.Hash, uint32, uint32, error) {
+	batch, nextData, nextCode, err := g.makeShredsFromData(
+		leader, data, isLastInSlot, chainedMerkleRoot, nextShredIndex, nextCodeIndex,
+	)
+	return batch.packets, batch.chainedMerkleRoot, nextData, nextCode, err
+}
+
+func (g *ShredGenerator) makeShredsFromData(
+	leader solana.PrivateKey,
+	data []byte,
+	isLastInSlot bool,
+	chainedMerkleRoot solana.Hash,
+	nextShredIndex uint32,
+	nextCodeIndex uint32,
+) (shredPackets, uint32, uint32, error) {
 	if g.Slot < g.ParentSlot || g.Slot-g.ParentSlot > uint64(^uint16(0)) {
-		return nil, solana.Hash{}, nextShredIndex, nextCodeIndex, fmt.Errorf("invalid parent slot %d for slot %d", g.ParentSlot, g.Slot)
+		return shredPackets{}, nextShredIndex, nextCodeIndex, fmt.Errorf("invalid parent slot %d for slot %d", g.ParentSlot, g.Slot)
 	}
+	// The 32+32 coding matrix is invariant across every FEC set in this
+	// operation. Building it requires a Vandermonde inversion, so retain the
+	// encoder for the whole payload rather than reconstructing it per set.
+	encoder, err := acquireErasureEncoder()
+	if err != nil {
+		return shredPackets{}, nextShredIndex, nextCodeIndex, err
+	}
+	defer releaseErasureEncoder(encoder)
 	proofSize := uint8(proofEntriesFor32x32)
 	unsignedCap := dataCapacity(proofSize, false)
 	signedCap := dataCapacity(proofSize, true)
@@ -92,6 +138,7 @@ func (g *ShredGenerator) MakeShredsFromData(
 	}
 
 	var packets [][]byte
+	var fecSetRoots []solana.Hash
 	dataIndex := nextShredIndex
 	codeIndex := nextCodeIndex
 	chainedRoot := chainedMerkleRoot
@@ -99,42 +146,53 @@ func (g *ShredGenerator) MakeShredsFromData(
 	for len(unsignedData) >= unsignedBatch {
 		batch := unsignedData[:unsignedBatch]
 		unsignedData = unsignedData[unsignedBatch:]
-		batchPackets, root, err := g.makeFECBatch(leader, batch, unsignedCap, proofSize, false, parentOffset, flags, false, chainedRoot, dataIndex, codeIndex)
+		// DATA_COMPLETE marks the end of the serialized component, not the end
+		// of every FEC set. A full unsigned batch is complete only when no
+		// unsigned remainder or signed-last batch follows it.
+		dataComplete := len(unsignedData) == 0 && len(signedData) == 0
+		batchPackets, root, err := g.makeFECBatch(encoder, leader, batch, unsignedCap, proofSize, false, parentOffset, flags, dataComplete, false, chainedRoot, dataIndex, codeIndex)
 		if err != nil {
-			return nil, solana.Hash{}, dataIndex, codeIndex, err
+			return shredPackets{}, dataIndex, codeIndex, err
 		}
 		packets = append(packets, batchPackets...)
+		fecSetRoots = append(fecSetRoots, root)
 		chainedRoot = root
 		dataIndex += dataShredsPerFECBlock
 		codeIndex += codingShredsPerFECBlock
 	}
 
 	if len(unsignedData) > 0 || (len(packets) == 0 && !isLastInSlot) {
-		batchPackets, root, err := g.makeFECBatch(leader, unsignedData, unsignedCap, proofSize, false, parentOffset, flags, false, chainedRoot, dataIndex, codeIndex)
+		dataComplete := len(signedData) == 0
+		batchPackets, root, err := g.makeFECBatch(encoder, leader, unsignedData, unsignedCap, proofSize, false, parentOffset, flags, dataComplete, false, chainedRoot, dataIndex, codeIndex)
 		if err != nil {
-			return nil, solana.Hash{}, dataIndex, codeIndex, err
+			return shredPackets{}, dataIndex, codeIndex, err
 		}
 		packets = append(packets, batchPackets...)
+		fecSetRoots = append(fecSetRoots, root)
 		chainedRoot = root
 		dataIndex += dataShredsPerFECBlock
 		codeIndex += codingShredsPerFECBlock
 	}
 
 	if len(signedData) > 0 || (len(packets) == 0 && isLastInSlot) {
-		batchPackets, root, err := g.makeFECBatch(leader, signedData, signedCap, proofSize, true, parentOffset, flags, isLastInSlot, chainedRoot, dataIndex, codeIndex)
+		batchPackets, root, err := g.makeFECBatch(encoder, leader, signedData, signedCap, proofSize, true, parentOffset, flags, true, isLastInSlot, chainedRoot, dataIndex, codeIndex)
 		if err != nil {
-			return nil, solana.Hash{}, dataIndex, codeIndex, err
+			return shredPackets{}, dataIndex, codeIndex, err
 		}
 		packets = append(packets, batchPackets...)
+		fecSetRoots = append(fecSetRoots, root)
 		chainedRoot = root
 		dataIndex += dataShredsPerFECBlock
 		codeIndex += codingShredsPerFECBlock
 	}
 
-	return packets, chainedRoot, dataIndex, codeIndex, nil
+	return shredPackets{
+		packets: packets, fecSetRoots: fecSetRoots, chainedMerkleRoot: chainedRoot,
+	}, dataIndex, codeIndex, nil
 }
 
 func (g *ShredGenerator) makeFECBatch(
+	encoder reedsolomon.Encoder,
 	leader solana.PrivateKey,
 	data []byte,
 	dataCap int,
@@ -142,6 +200,7 @@ func (g *ShredGenerator) makeFECBatch(
 	resigned bool,
 	parentOffset uint16,
 	flags byte,
+	dataComplete bool,
 	isLastInSlot bool,
 	chainedMerkleRoot solana.Hash,
 	dataIndex uint32,
@@ -196,11 +255,11 @@ func (g *ShredGenerator) makeFECBatch(
 			dataPackets[i][dataFlagsOffset] |= shredFlagLastShredInSlot
 			break
 		}
-	} else if len(dataPackets) > 0 {
+	} else if dataComplete && len(dataPackets) > 0 {
 		dataPackets[len(dataPackets)-1][dataFlagsOffset] |= shredFlagDataComplete
 	}
 
-	root, err := finishErasureBatch(leader, allPackets, chainedMerkleRoot, proofSize, resigned)
+	root, err := finishErasureBatch(encoder, leader, allPackets, chainedMerkleRoot, proofSize, resigned)
 	if err != nil {
 		return nil, solana.Hash{}, err
 	}
@@ -208,101 +267,70 @@ func (g *ShredGenerator) makeFECBatch(
 }
 
 func finishErasureBatch(
+	encoder reedsolomon.Encoder,
 	leader solana.PrivateKey,
 	packets [][]byte,
 	chainedMerkleRoot solana.Hash,
 	proofSize uint8,
 	resigned bool,
 ) (solana.Hash, error) {
-	encoder, err := reedsolomon.New(dataShredsPerFECBlock, codingShredsPerFECBlock)
+	if len(packets) != dataShredsPerFECBlock+codingShredsPerFECBlock {
+		return solana.Hash{}, fmt.Errorf("invalid FEC packet count %d", len(packets))
+	}
+	dataCap, err := merkleCapacity(dataPayloadSize, dataHeaderSize, proofSize, true, resigned)
 	if err != nil {
 		return solana.Hash{}, err
 	}
+	codeCap, err := merkleCapacity(codingPayloadSize, codingHeaderSize, proofSize, true, resigned)
+	if err != nil {
+		return solana.Hash{}, err
+	}
+	dataVariant := chainedDataVariant(proofSize, resigned)
+	codeVariant := chainedCodeVariant(proofSize, resigned)
 
+	// These packets were constructed immediately above, so retain direct views
+	// of their erasure regions. ParseShred is intentionally a defensive,
+	// owning parser for untrusted network packets; using it here would allocate
+	// and copy every packet several times only to copy the same bytes back.
 	shards := make([][]byte, len(packets))
 	for i, packet := range packets {
-		shred, err := ParseShred(packet)
-		if err != nil {
-			return solana.Hash{}, fmt.Errorf("parse batch shred %d: %w", i, err)
+		if i < dataShredsPerFECBlock {
+			if len(packet) < dataPayloadSize || packet[shredVariantOffset] != dataVariant {
+				return solana.Hash{}, fmt.Errorf("invalid generated data shred %d", i)
+			}
+			shards[i] = packet[shredSignatureSize : dataHeaderSize+dataCap]
+			continue
 		}
-		shard, err := shred.erasureShard()
-		if err != nil {
-			return solana.Hash{}, fmt.Errorf("erasure shard %d: %w", i, err)
+		if len(packet) < codingPayloadSize || packet[shredVariantOffset] != codeVariant {
+			return solana.Hash{}, fmt.Errorf("invalid generated coding shred %d", i-dataShredsPerFECBlock)
 		}
-		shards[i] = shard
+		shards[i] = packet[codingHeaderSize : codingHeaderSize+codeCap]
 	}
 	if err := encoder.Encode(shards); err != nil {
 		return solana.Hash{}, fmt.Errorf("reed-solomon encode: %w", err)
 	}
 
 	for i, packet := range packets {
-		shred, err := ParseShred(packet)
-		if err != nil {
-			return solana.Hash{}, err
-		}
-		proofSizeInfo, chained, resignedFlag, ok := merkleVariantInfo(shred.Variant)
-		if !ok {
-			return solana.Hash{}, ErrUnsupportedShred
-		}
-		_ = proofSizeInfo
-		_ = chained
-		_ = resignedFlag
-
-		capacity, err := merkleCapacity(len(packet), dataHeaderSize, proofSize, true, resigned)
-		if shred.Type == ShredTypeCode {
-			capacity, err = merkleCapacity(len(packet), codingHeaderSize, proofSize, true, resigned)
-		}
-		if err != nil {
-			return solana.Hash{}, err
-		}
-		rootOffset := dataHeaderSize + capacity
-		if shred.Type == ShredTypeCode {
-			rootOffset = codingHeaderSize + capacity
+		rootOffset := dataHeaderSize + dataCap
+		if i >= dataShredsPerFECBlock {
+			rootOffset = codingHeaderSize + codeCap
 		}
 		copy(packet[rootOffset:rootOffset+merkleRootSize], chainedMerkleRoot[:])
-
-		if shred.Type == ShredTypeCode {
-			start := codingHeaderSize
-			end := start + capacity
-			copy(packet[start:end], shards[i])
-		} else {
-			start := shredSignatureSize
-			end := dataHeaderSize + capacity
-			copy(packet[start:end], shards[i])
-		}
 	}
 
-	nodes, err := buildMerkleTree(packets)
-	if err != nil {
-		return solana.Hash{}, err
-	}
+	nodes := buildGeneratedMerkleTree(packets, dataCap, codeCap)
 	root := nodes[len(nodes)-1]
 	sig := ed25519.Sign(ed25519.PrivateKey(leader), root[:])
 
-	for _, packet := range packets {
+	for i, packet := range packets {
 		copy(packet[shredSignatureOffset:shredSignatureSize], sig)
-		shred, err := ParseShred(packet)
-		if err != nil {
-			return solana.Hash{}, err
+		proofOffset := dataHeaderSize + dataCap + merkleRootSize
+		if i >= dataShredsPerFECBlock {
+			proofOffset = codingHeaderSize + codeCap + merkleRootSize
 		}
-		leafIndex, err := shred.merkleLeafIndex()
-		if err != nil {
-			return solana.Hash{}, err
-		}
-		proof := makeMerkleProof(nodes, leafIndex, len(packets))
-		capacity, err := merkleCapacity(len(packet), dataHeaderSize, proofSize, true, resigned)
-		if shred.Type == ShredTypeCode {
-			capacity, err = merkleCapacity(len(packet), codingHeaderSize, proofSize, true, resigned)
-		}
-		if err != nil {
-			return solana.Hash{}, err
-		}
-		proofOffset := dataHeaderSize + capacity + merkleRootSize
-		if shred.Type == ShredTypeCode {
-			proofOffset = codingHeaderSize + capacity + merkleRootSize
-		}
-		for j, entry := range proof {
-			copy(packet[proofOffset+j*merkleProofEntrySize:], entry[:])
+		proofEntries := writeMerkleProof(packet[proofOffset:], nodes, i, len(packets))
+		if proofEntries != int(proofSize) {
+			return solana.Hash{}, fmt.Errorf("generated merkle proof has %d entries, want %d", proofEntries, proofSize)
 		}
 		if resigned {
 			retransmitOffset := proofOffset + int(proofSize)*merkleProofEntrySize
@@ -310,6 +338,54 @@ func finishErasureBatch(
 		}
 	}
 	return root, nil
+}
+
+// buildGeneratedMerkleTree hashes the fixed packet order emitted by
+// makeFECBatch: 32 data shreds followed by 32 coding shreds. Callers must have
+// already validated the packet sizes and variants in finishErasureBatch.
+func buildGeneratedMerkleTree(packets [][]byte, dataCap, codeCap int) []solana.Hash {
+	leaves := make([]solana.Hash, len(packets))
+	for i, packet := range packets {
+		end := dataHeaderSize + dataCap + merkleRootSize
+		if i >= dataShredsPerFECBlock {
+			end = codingHeaderSize + codeCap + merkleRootSize
+		}
+		leaves[i] = merkleHashLeaf(packet[shredSignatureSize:end])
+	}
+
+	nodes := make([]solana.Hash, 0, merkleTreeSize(len(leaves)))
+	nodes = append(nodes, leaves...)
+	for size := len(leaves); size > 1; size = (size + 1) >> 1 {
+		offset := len(nodes) - size
+		for index := offset; index < offset+size; index += 2 {
+			other := index + 1
+			if other >= offset+size {
+				other = offset + size - 1
+			}
+			nodes = append(nodes, merkleHashNode(nodes[index][:merkleProofEntrySize], nodes[other][:merkleProofEntrySize]))
+		}
+	}
+	return nodes
+}
+
+// writeMerkleProof writes the truncated sibling hashes directly into a packet.
+// The generated FEC tree has fixed depth, so materializing a temporary proof
+// slice for every one of its 64 packets only adds allocator and copy traffic.
+func writeMerkleProof(dst []byte, nodes []solana.Hash, index, size int) int {
+	entries := 0
+	offset := 0
+	for size > 1 {
+		sibling := index ^ 1
+		if sibling >= size {
+			sibling = size - 1
+		}
+		copy(dst[entries*merkleProofEntrySize:], nodes[offset+sibling][:merkleProofEntrySize])
+		entries++
+		offset += size
+		size = (size + 1) >> 1
+		index >>= 1
+	}
+	return entries
 }
 
 func buildMerkleTree(packets [][]byte) ([]solana.Hash, error) {

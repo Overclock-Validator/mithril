@@ -52,6 +52,70 @@ func TestBroadcastSessionHeaderAndFooter(t *testing.T) {
 	require.NotEqual(t, parentBlockID, chainedRoot)
 }
 
+func TestBroadcastSessionMatchesParsedShreds(t *testing.T) {
+	leader := testBroadcastLeader(t)
+	parentID, parentRoot := solana.Hash{0xaa}, solana.Hash{0xbb}
+	capture := &packetCapture{}
+	session := NewBroadcastSession(BroadcastSessionConfig{
+		Leader: leader, Slot: 100, ParentSlot: 99, Version: 7,
+		ParentChainedMerkleRoot: parentRoot, Broadcaster: capture,
+	})
+	shredder := Shredder{Slot: 100, ParentSlot: 99, Version: 7}
+	txns := make([]solana.Transaction, 400)
+	for i := range txns {
+		txns[i] = mustParseTransferTx(t, uint64(i))
+	}
+	entries, err := NewEntryBatch([]Entry{{NumHashes: 1, Hash: solana.Hash{1}, Txns: txns}})
+	require.NoError(t, err)
+	tick, err := NewEntryBatch([]Entry{{NumHashes: 1, Hash: solana.Hash{2}}})
+	require.NoError(t, err)
+	components := []BlockComponent{
+		NewBlockHeader(99, parentID),
+		entries, // More than two FEC sets: every root must enter the block ID.
+		NewUpdateParent(98, solana.Hash{3}),
+		NewBlockFooter(BlockFooter{BankHash: solana.Hash{4}}),
+		tick,
+	}
+	var nextData, nextCode uint32
+	root := parentRoot
+	var roots []solana.Hash
+	for i, component := range components {
+		last := i == len(components)-1
+		batch, data, code, err := shredder.MakeMerkleShredsFromComponent(
+			leader, component, last, root, nextData, nextCode,
+		)
+		require.NoError(t, err)
+		if i == 1 {
+			require.Greater(t, len(batch.DataShreds), 2*dataShredsPerFECBlock)
+		}
+		for j, shred := range batch.DataShreds {
+			if j == 0 || shred.FECSetIndex != batch.DataShreds[j-1].FECSetIndex {
+				fecRoot, err := shred.MerkleRoot()
+				require.NoError(t, err)
+				roots = append(roots, fecRoot)
+			}
+		}
+		capture.packets = nil
+		require.NoError(t, session.BroadcastComponent(component, last))
+		require.Equal(t, batch.Packets, capture.packets)
+		require.Equal(t, batch.ChainedMerkleRoot, session.ChainedMerkleRoot())
+		require.Equal(t, data, session.nextDataIndex)
+		require.Equal(t, code, session.nextCodeIndex)
+		require.Equal(t, roots, session.fecSetRoots)
+		require.Equal(t, DoubleMerkleBlockID(99, parentID, roots), session.BlockID(99, parentID))
+		root, nextData, nextCode = batch.ChainedMerkleRoot, data, code
+	}
+
+	// Invalid components must not publish packets or advance the commitment.
+	capture.packets = nil
+	require.Error(t, session.BroadcastComponent(BlockComponent{Marker: &BlockMarker{Kind: 255}}, false))
+	require.Empty(t, capture.packets)
+	require.Equal(t, root, session.ChainedMerkleRoot())
+	require.Equal(t, nextData, session.nextDataIndex)
+	require.Equal(t, nextCode, session.nextCodeIndex)
+	require.Equal(t, roots, session.fecSetRoots)
+}
+
 func TestUDPBroadcasterLoopback(t *testing.T) {
 	recvAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
 	require.NoError(t, err)
