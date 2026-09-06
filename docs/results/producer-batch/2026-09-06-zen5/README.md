@@ -5,6 +5,18 @@ Go 1.26.4, `GOAMD64=v1`, `CGO_ENABLED=0`. Each process used `GOMAXPROCS=1`
 and was pinned to logical CPU 6. SMT and frequency boost were enabled on the
 shared host. These are serial producer workloads on one logical CPU.
 
+## Comparison with current alpenglow-dev
+
+A subsequent comparison uses dev head `7e4e8af1`, which already has incremental
+size accounting and one-FEC batching. The PR is **2.60x faster** for maximum-size
+transactions and **2.10x faster** for small transfers in the serial producer
+workload. The maximum-size comparison uses three slots on both sides to fit
+dev's slot limits. See [the branch-head comparison](alpenglow-dev-head/README.md)
+for raw samples, matched-batch controls, and full scope.
+
+The tables below retain the earlier comparison against PR commit `84776893`;
+they do not use the current dev head as their baseline.
+
 ## What changed
 
 The reviewed branch already increased the batch target to 61,632 bytes.
