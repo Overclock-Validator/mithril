@@ -78,7 +78,7 @@ type CompactStats struct {
 	FilesDeleted      int // fully-dead fast path (no bytes moved)
 	FilesSparsified   int // dead payload pages released without moving live/undo records
 	LiveBytesMoved    int64
-	BytesReclaimed    int64 // source bytes freed (compacted + deleted)
+	BytesReclaimed    int64 // net bytes freed; may be negative during bounded evacuation
 }
 
 const (
@@ -89,6 +89,8 @@ const (
 
 type compactCandidate struct {
 	name          string
+	path          string
+	coalesced     bool // snapshot data file or kind-3 output; see compactCoalesced
 	slot          uint64
 	fileId        uint64
 	size          int64
@@ -191,6 +193,13 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 		}
 	}
 
+	// Coalesced evacuation relocates records, so any pin on its source (whole
+	// file or a single undo record) invalidates in-progress scan state.
+	for id := range db.coalescedScans {
+		if _, ok := pinned.whole[id]; ok || len(pinned.records[id]) > 0 {
+			delete(db.coalescedScans, id)
+		}
+	}
 	bootstrapHigh := db.bootstrapHighFileId()
 	candidates := make([]compactCandidate, 0, len(inv.data))
 	for name, file := range inv.data {
@@ -212,14 +221,34 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 		// Small files and bootstrap appendvecs still use relocation compaction.
 		// Only manifest-backed large files support reclaiming individual dead
 		// payloads while keeping all undo pointers at their original offsets.
-		if len(pinned.records[fileId]) > 0 && (!hasManifest || file.size < sparseCompactionMinSize || !sparseCompactionSupported) {
+		// Coalesced outputs are evacuated, never sparsified: any pin holds them whole.
+		_, coalesced := db.coalescedFiles.Load(fileId)
+		if len(pinned.records[fileId]) > 0 && (coalesced || !hasManifest || file.size < sparseCompactionMinSize || !sparseCompactionSupported) {
 			continue
 		}
 		candidates = append(candidates, compactCandidate{
-			name: name, slot: slot, fileId: fileId, size: file.size, allocated: allocated, manifestPath: manifest.Path,
+			name: name, path: filepath.Join(db.AcctsDir, name), slot: slot, fileId: fileId, size: file.size, allocated: allocated, manifestPath: manifest.Path,
+			coalesced:     coalesced,
 			alreadySparse: (manifest.Kind == ManifestKindCompact && manifest.DataCRC == 0) || db.compactLastScan[fileId] != 0,
 			scanOrder:     db.compactLastScan[fileId],
 		})
+	}
+	if db.Shards != nil {
+		for i, dir := range db.Shards.dirs {
+			id := uint64(i)
+			if _, ok := pinned.whole[id]; ok || len(pinned.records[id]) > 0 {
+				continue
+			}
+			path := filepath.Join(dir, "data")
+			info, e := os.Stat(path)
+			if os.IsNotExist(e) {
+				continue
+			}
+			if e != nil {
+				return stats, e
+			}
+			candidates = append(candidates, compactCandidate{name: fmt.Sprintf("snapshot-%020d", id), path: path, fileId: id, size: info.Size(), coalesced: true})
+		}
 	}
 	db.compactCycles++
 	queue := newCompactCandidateQueue(candidates, db.sparseCursor, db.compactCursor, db.resparseNext, db.compactCycles%8 == 0)
@@ -247,6 +276,23 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 			db.resparseNext = false
 		default:
 			db.compactCursor = compactCandidateKey(c)
+		}
+		if c.coalesced {
+			stats.CandidatesScanned++
+			indexCache = sparseIndexCache{} // evacuation moves index locations
+			r, e := db.compactCoalesced(c, cfg.MaxScanBytesPerCycle-scannedBytes, cfg.MaxMoveBytesPerCycle-stats.LiveBytesMoved, cfg.MinDeadFraction, stats.LiveBytesMoved == 0)
+			if e != nil {
+				return stats, fmt.Errorf("accountsdb: compact %s: %w", c.name, e)
+			}
+			scannedBytes += r.scanned
+			stats.LiveBytesMoved += r.moved
+			stats.BytesReclaimed += r.freed - r.moved
+			if r.moved > 0 {
+				stats.FilesCompacted++
+			} else if r.deleted {
+				stats.FilesDeleted++
+			}
+			continue
 		}
 		stats.CandidatesScanned++
 		if c.manifestPath != "" && c.size >= sparseCompactionMinSize && sparseCompactionSupported {
@@ -313,7 +359,7 @@ func compactCandidateLess(a, b compactCandidate) bool {
 }
 
 func compactCandidateClass(c compactCandidate) byte {
-	if c.manifestPath != "" && c.allocated >= sparseCompactionMinSize {
+	if !c.coalesced && c.manifestPath != "" && c.allocated >= sparseCompactionMinSize {
 		if c.alreadySparse {
 			// Hole punching retains record headers and edge pages. Repeatedly
 			// walking a multi-GB logical file with only a few percent allocated
@@ -410,8 +456,8 @@ func (db *AccountsDb) compactionPinSet(headSeq, horizon uint64, inv *compactionI
 		dataName := strings.TrimSuffix(strings.TrimSuffix(name, ".rewound"), segManifestSuffix)
 		slot, fileID, validName := parseDataFileName(dataName)
 		if !validName || hdr.FileId != fileID || hdr.ThroughSlot != slot ||
-			(hdr.Kind != ManifestKindFold && hdr.Kind != ManifestKindCompact) ||
-			(hdr.Kind == ManifestKindCompact && hdr.BatchSeq != 0) ||
+			(hdr.Kind != ManifestKindFold && hdr.Kind != ManifestKindCompact && hdr.Kind != ManifestKindCoalescedCompact) ||
+			(hdr.Kind != ManifestKindFold && hdr.BatchSeq != 0) ||
 			(hdr.Kind == ManifestKindFold && hdr.BatchSeq == 0) {
 			return nil, nil, fmt.Errorf("cannot establish rewind pins: invalid manifest header %s", name)
 		}
@@ -689,6 +735,9 @@ func removeSourceFiles(acctsDir, srcPath, manifestPath string) error {
 }
 
 func humanBytes(n int64) string {
+	if n < 0 {
+		return "-" + humanBytes(-n)
+	}
 	switch {
 	case n >= 1<<30:
 		return fmt.Sprintf("%.1fGiB", float64(n)/float64(1<<30))

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/trace"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -73,19 +74,22 @@ type AccountsDb struct {
 
 	// Batch-fold state (segment.go/fold.go/recovery.go). foldMu serializes
 	// CommitBatch, recovery, rewind, and compaction.
-	foldMu           metrics.TimedMutex
-	lastBatchSeq     uint64        // guarded by foldMu; seeded by RecoverFoldState
-	durableThrough   atomic.Uint64 // observability: highest durably folded slot
-	foldHooks        foldTestHooks // test-only crash injection
-	compactCursor    string        // guarded by foldMu; scan resume point across CompactOnce cycles
-	sparseCursor     string        // independent cursor so bootstrap scanning cannot starve large segments
-	resparseNext     bool          // alternate new and previously sparse segments, even with one-file cycles
-	compactScanSeq   uint64
-	compactScanned   map[uint64]struct{} // successful sparse scans at compactScanSeq; reset when the head changes
-	compactScanClock uint64
-	compactLastScan  map[uint64]uint64 // oldest scan first; a growing directory must not postpone cursor wrap forever
-	compactCycles    uint64            // periodically serve bootstrap and mostly-empty sparse files too
-	compactHooks     compactionTestHooks
+	foldMu               metrics.TimedMutex
+	lastBatchSeq         uint64                    // guarded by foldMu; seeded by RecoverFoldState
+	durableThrough       atomic.Uint64             // observability: highest durably folded slot
+	foldHooks            foldTestHooks             // test-only crash injection
+	coalescedFiles       sync.Map                  // file ID -> physical path; immutable compact outputs
+	coalescedScans       map[uint64]*coalescedScan // guarded by foldMu
+	coalescedCompactHook func(string) error        // test-only crash injection
+	compactCursor        string                    // guarded by foldMu; scan resume point across CompactOnce cycles
+	sparseCursor         string                    // independent cursor so bootstrap scanning cannot starve large segments
+	resparseNext         bool                      // alternate new and previously sparse segments, even with one-file cycles
+	compactScanSeq       uint64
+	compactScanned       map[uint64]struct{} // successful sparse scans at compactScanSeq; reset when the head changes
+	compactScanClock     uint64
+	compactLastScan      map[uint64]uint64 // oldest scan first; a growing directory must not postpone cursor wrap forever
+	compactCycles        uint64            // periodically serve bootstrap and mostly-empty sparse files too
+	compactHooks         compactionTestHooks
 	// compactInventory is the in-memory view of the accounts directory that
 	// compaction scans (nil = rebuild from the directory); compactPinCache holds
 	// pins computed from unchanged retained manifests. Both guarded by foldMu.
@@ -164,8 +168,8 @@ func OpenDb(accountsDbDir string) (*AccountsDb, error) {
 }
 
 func OpenDbPaths(accountsPaths []string) (*AccountsDb, error) {
-	if len(accountsPaths) == 0 {
-		return nil, fmt.Errorf("OpenDb: no accounts paths configured")
+	if err := ValidateAccountsPaths(accountsPaths); err != nil {
+		return nil, err
 	}
 	// The first path holds all metadata (index, manifest, state); every path
 	// holds an "accounts" dir with that disk's shard data.
@@ -206,6 +210,9 @@ func OpenDbPaths(accountsPaths []string) (*AccountsDb, error) {
 	indexOpts.EventListener = pebbleEventListener("index")
 	db, err := pebble.Open(indexDir, indexOpts)
 	if err != nil {
+		if strings.Contains(err.Error(), "format major version") {
+			return nil, fmt.Errorf("opening indexDir=%s: %w (an AccountsDB built by an older Mithril cannot be opened: rebuild it from a snapshot)", indexDir, err)
+		}
 		return nil, fmt.Errorf("opening indexDir=%s: %w", indexDir, err)
 	}
 
@@ -229,6 +236,11 @@ func OpenDbPaths(accountsPaths []string) (*AccountsDb, error) {
 	accountsDb.LargestFileId.Store(binary.LittleEndian.Uint64(largestBytes))
 	accountsDb.bindLockDiagnostics()
 
+	if err := accountsDb.loadCoalescedFiles(); err != nil {
+		bankhashDb.Close()
+		db.Close()
+		return nil, err
+	}
 	accountsDb.inProgressStoreRequests = list.New()
 	accountsDb.storeRequestChan = make(chan *list.Element)
 	accountsDb.storeWorkerDone = make(chan struct{})

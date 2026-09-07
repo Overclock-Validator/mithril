@@ -620,7 +620,8 @@ name = "mithril"
     snapshot_index_committer_workers = 64
 
     # Number of temporary account-index shard logs/SSTs.
-    snapshot_index_shards = 64
+    # More shards reduce per-flusher sort memory when entries are evenly spread.
+    snapshot_index_shards = 256
 
     # Optional temp directory for snapshot index shard logs/SST staging.
     # This can move tens of GB of temporary write/read churn off the AccountsDB
@@ -629,6 +630,7 @@ name = "mithril"
     snapshot_index_temp_dir = ""
 
     # Bound for number of index shards to convert to SSTs at once.
+    # Lower this to reduce concurrent sort memory at the cost of throughput.
     max_concurrent_flushers = 8
 
     # Concurrent sort workers used during the index flush.
@@ -642,6 +644,12 @@ name = "mithril"
     # default (buffered is the safe choice). Requires a filesystem that supports
     # O_DIRECT (ext4/xfs; not tmpfs).
     # snapshot_directio = false
+
+    # With several accounts directories, stop placing snapshot data on a
+    # filesystem once its free space falls to this many MiB, and send the rest to
+    # the other directories. This lets disks of different sizes each fill to
+    # capacity. Ignored with a single accounts directory.
+    # snapshot_shard_min_free_mb = 16384
 
     # Size in MB for serialized parameter arena (0 to disable)
     param_arena_size_mb = 512

@@ -44,6 +44,8 @@ const (
 	// its only job is proving the data file is not an orphan.
 	ManifestKindFold    = uint8(1)
 	ManifestKindCompact = uint8(2)
+	// Compact output addressed by file ID, retaining each index entry's Slot.
+	ManifestKindCoalescedCompact = uint8(3)
 )
 
 // ErrTornManifest reports a manifest that fails CRC or structural validation.

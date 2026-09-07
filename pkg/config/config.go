@@ -73,6 +73,7 @@ type DevelopmentConfig struct {
 	MaxConcurrentFlushers         int         `toml:"max_concurrent_flushers" mapstructure:"max_concurrent_flushers"`                   // was: max-concurrent-flushers
 	FlushSortWorkers              int         `toml:"flush_sort_workers" mapstructure:"flush_sort_workers"`                             // Snapshot index-flush concurrent sort workers (0 = NumCPU)
 	SnapshotDirectIO              bool        `toml:"snapshot_directio" mapstructure:"snapshot_directio"`                               // Write snapshot big files with O_DIRECT (bypasses page cache)
+	SnapshotShardMinFreeMB        int         `toml:"snapshot_shard_min_free_mb" mapstructure:"snapshot_shard_min_free_mb"`             // Multi-dir unpack: per-filesystem free-space reserve in MiB
 	SnapshotAppendVecWorkers      int         `toml:"snapshot_append_vec_workers" mapstructure:"snapshot_append_vec_workers"`           // Snapshot appendvec write workers
 	SnapshotIndexBuilderWorkers   int         `toml:"snapshot_index_builder_workers" mapstructure:"snapshot_index_builder_workers"`     // Snapshot index parsing workers
 	SnapshotIndexCommitterWorkers int         `toml:"snapshot_index_committer_workers" mapstructure:"snapshot_index_committer_workers"` // Snapshot index shard enqueue workers

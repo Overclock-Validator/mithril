@@ -138,14 +138,16 @@ func TestSnapshotWorkersSupportArchiveSizedAppendVecs(t *testing.T) {
 			shardLogger := NewShardLogger(1, t.TempDir())
 			closeShardLogger := sync.OnceFunc(func() { require.NoError(t, shardLogger.Close(context.Background())) })
 			t.Cleanup(closeShardLogger)
+			shardFiles, err := openShardBigFiles([]string{filepath.Join(accountsDir, "accounts")})
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, shardFiles.close()) })
 			wg := &sync.WaitGroup{}
-			largestFileID := &atomic.Uint64{}
 			stakes := &stakeIndexCollector{}
-			pools, err := initWorkerPools(wg, shardLogger, tt.full, tt.incremental, accountsDir, largestFileID, stakes)
+			pools, err := initWorkerPools(wg, shardLogger, tt.full, tt.incremental, shardFiles, stakes)
 			require.NoError(t, err)
 			t.Cleanup(pools.Release)
 			require.NoError(t, invokeSnapshotTask(wg, pools.appendVecCopying, appendVecCopyingTask{
-				Filename: "accounts/20.21", TarBuffer: bytes.NewBuffer(tt.data), FromIncrementalSnapshot: tt.fromIncr,
+				Filename: "accounts/20.21", Buf: tt.data, FromIncrementalSnapshot: tt.fromIncr,
 			}))
 			err = waitForSnapshotWorkers(wg, pools)
 			if tt.wantErr != "" {
@@ -154,12 +156,15 @@ func TestSnapshotWorkersSupportArchiveSizedAppendVecs(t *testing.T) {
 			}
 			require.NoError(t, err)
 			closeShardLogger()
-			require.Equal(t, int64(tt.wantEntries*(32+vlen)), shardLogger.TotalBytes())
-			require.Equal(t, fileID, largestFileID.Load())
+			logged := 0
+			for _, sh := range shardLogger.shards {
+				logged += sh.logSize
+			}
+			require.Equal(t, tt.wantEntries*(32+vlen), logged)
 			require.Len(t, stakes.entries, tt.wantEntries)
 			for i, entry := range stakes.entries {
 				require.Equal(t, keys[i], entry.Pubkey)
-				require.Equal(t, fileID, entry.FileId)
+				require.Equal(t, uint64(0), entry.FileId) // shard 0, segment 0: the coalesced data file
 				require.Equal(t, uint64(i)*oneAccountSize, entry.Offset)
 			}
 		})

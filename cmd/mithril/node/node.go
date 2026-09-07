@@ -81,6 +81,7 @@ var (
 	incrementalSnapshotFilename      string
 	accountsPath                     string
 	accountsPaths                    []string
+	snapshotShardMinFreeMB           int
 	scratchDirectory                 string
 	rpcEndpoints                     []string
 	cluster                          string // "alpenglow", "mainnet-beta", "testnet", or "devnet"
@@ -600,6 +601,7 @@ func init() {
 	Run.Flags().IntVar(&snapshot.MaxConcurrentFlushers, "max-concurrent-flushers", snapshot.DefaultSnapshotMaxConcurrentFlushers, "Bound for number of log shards to flush to Accounts DB Index at once")
 	Run.Flags().IntVar(&snapshot.SnapshotFlushSortWorkers, "flush-sort-workers", snapshot.DefaultSnapshotFlushSortWorkers, "Snapshot index-flush concurrent sort workers (0 = one per CPU)")
 	Run.Flags().BoolVar(&snapshot.SnapshotDirectIO, "snapshot-directio", snapshot.DefaultSnapshotDirectIO, "Write snapshot big files with O_DIRECT (bypasses the page cache; helps decode throughput on low-RAM boxes)")
+	Run.Flags().IntVar(&snapshotShardMinFreeMB, "snapshot-shard-min-free-mb", snapshot.DefaultSnapshotShardMinFreeMB, "With several accounts directories, stop placing snapshot data on a filesystem once its free space reaches this many MiB")
 	Run.Flags().IntVar(&snapshot.SnapshotAppendVecCopyingWorkers, "snapshot-append-vec-workers", snapshot.DefaultSnapshotAppendVecCopyingWorkers, "Snapshot bootstrap appendvec write workers")
 	Run.Flags().IntVar(&snapshot.SnapshotIndexEntryBuilderWorkers, "snapshot-index-builder-workers", snapshot.DefaultSnapshotIndexEntryBuilderWorkers, "Snapshot bootstrap account-index parser workers")
 	Run.Flags().IntVar(&snapshot.SnapshotIndexEntryCommitterWorkers, "snapshot-index-committer-workers", snapshot.DefaultSnapshotIndexEntryCommitterWorkers, "Snapshot bootstrap account-index shard enqueue workers")
@@ -841,6 +843,9 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	}
 	if len(accountsPaths) == 0 {
 		return fmt.Errorf("no accounts path configured (set storage.accounts)")
+	}
+	if err := accountsdb.ValidateAccountsPaths(accountsPaths); err != nil {
+		return err
 	}
 	accountsPath = accountsPaths[0]
 	// Check write permission early to fail fast with helpful error
@@ -1195,6 +1200,11 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	snapshot.MaxConcurrentFlushers = getInt("max-concurrent-flushers", "tuning.max_concurrent_flushers")
 	snapshot.SnapshotFlushSortWorkers = getInt("flush-sort-workers", "tuning.flush_sort_workers")
 	snapshot.SnapshotDirectIO = getBool("snapshot-directio", "tuning.snapshot_directio")
+	snapshotShardMinFreeMB = getInt("snapshot-shard-min-free-mb", "tuning.snapshot_shard_min_free_mb")
+	if snapshotShardMinFreeMB < 0 {
+		return fmt.Errorf("tuning.snapshot_shard_min_free_mb must be >= 0, got %d", snapshotShardMinFreeMB)
+	}
+	snapshot.SnapshotShardMinFreeBytes = uint64(snapshotShardMinFreeMB) << 20
 	snapshot.SnapshotAppendVecCopyingWorkers = getInt("snapshot-append-vec-workers", "tuning.snapshot_append_vec_workers")
 	snapshot.SnapshotIndexEntryBuilderWorkers = getInt("snapshot-index-builder-workers", "tuning.snapshot_index_builder_workers")
 	snapshot.SnapshotIndexEntryCommitterWorkers = getInt("snapshot-index-committer-workers", "tuning.snapshot_index_committer_workers")

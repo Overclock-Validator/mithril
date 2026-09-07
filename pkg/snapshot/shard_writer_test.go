@@ -6,17 +6,15 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // TestShardWriterReadback verifies that bytes appended to a shardWriter can be read
 // back at the base offset it returned, for both buffered and O_DIRECT modes and
-// including a record larger than the staging buffer. Runs on an ext4 mount because
-// O_DIRECT is not supported on tmpfs.
+// including a record larger than the staging buffer. Set TMPDIR to a filesystem
+// supporting O_DIRECT to exercise direct mode; buffered mode always runs.
 func TestShardWriterReadback(t *testing.T) {
-	dir := "/mnt/disk0"
-	if _, err := os.Stat(dir); err != nil {
-		t.Skipf("shard writer test needs an ext4 mount at %s: %v", dir, err)
-	}
+	dir := t.TempDir()
 
 	for _, direct := range []bool{false, true} {
 		t.Run(fmt.Sprintf("direct=%v", direct), func(t *testing.T) {
@@ -77,15 +75,7 @@ func TestShardWriterReadback(t *testing.T) {
 // onto shard 0) and (2) every record reads back at the path+offset its returned
 // fileId/base resolve to.
 func TestShardBigFilesPlacement(t *testing.T) {
-	dirs := []string{"/mnt/disk0", "/mnt/disk1", "/mnt/disk2"}
-	shardDirs := make([]string, len(dirs))
-	for i, d := range dirs {
-		shardDirs[i] = filepath.Join(d, "shardplace_test")
-		if err := os.MkdirAll(shardDirs[i], 0755); err != nil {
-			t.Skipf("need writable ext4 dirs (%s): %v", shardDirs[i], err)
-		}
-		defer os.RemoveAll(shardDirs[i])
-	}
+	shardDirs := []string{t.TempDir(), t.TempDir(), t.TempDir()}
 
 	for _, direct := range []bool{false, true} {
 		t.Run(fmt.Sprintf("direct=%v", direct), func(t *testing.T) {
@@ -150,5 +140,69 @@ func TestShardBigFilesPlacement(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestShardBigFilesRespectsFreeSpace gives one directory 3 MiB of room above
+// the reserve and the other plenty. Records must stop landing on the small one
+// once its room is used, and a build whose every disk is at its reserve must
+// still write rather than fail early.
+func TestShardBigFilesRespectsFreeSpace(t *testing.T) {
+	small, large := t.TempDir(), t.TempDir()
+	const reserve = uint64(64 << 20)
+	capacity := map[string]uint64{small: reserve + 3<<20, large: 1 << 40}
+	oldAvail, oldReserve, oldInterval := shardAvailableBytes, SnapshotShardMinFreeBytes, shardFreeRefreshInterval
+	t.Cleanup(func() {
+		shardAvailableBytes, SnapshotShardMinFreeBytes, shardFreeRefreshInterval = oldAvail, oldReserve, oldInterval
+	})
+	// Like statfs: bytes already written to the data file are no longer free.
+	shardAvailableBytes = func(dir string) (uint64, error) {
+		used := uint64(0)
+		if info, err := os.Stat(filepath.Join(dir, "data")); err == nil {
+			used = uint64(info.Size())
+		}
+		if used > capacity[dir] {
+			return 0, nil
+		}
+		return capacity[dir] - used, nil
+	}
+	SnapshotShardMinFreeBytes = reserve
+	shardFreeRefreshInterval = time.Millisecond
+
+	sb, err := openShardBigFiles([]string{small, large})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := make([]byte, 256<<10)
+	perShard := map[uint64]int{}
+	for i := 0; i < 200; i++ {
+		fileId, _, err := sb.write(record)
+		if err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		perShard[fileId]++
+		if i%10 == 0 {
+			time.Sleep(2 * time.Millisecond) // let refreshes interleave with writes
+		}
+	}
+	if err := sb.close(); err != nil {
+		t.Fatal(err)
+	}
+	// 3 MiB of room is 12 records; one more may be in flight when it runs out.
+	if perShard[0] > 13 || perShard[1] == 0 {
+		t.Fatalf("small shard took %d records, large took %d", perShard[0], perShard[1])
+	}
+
+	// Both directories below the reserve (unknown to capacity, so 0 bytes free):
+	// placement falls back instead of failing.
+	sb, err = openShardBigFiles([]string{t.TempDir(), t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := sb.write(record); err != nil {
+		t.Fatalf("write with every shard at its reserve: %v", err)
+	}
+	if err := sb.close(); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -26,13 +26,16 @@ const (
 	DefaultSnapshotIndexEntryCommitterWorkers = 64
 	DefaultSnapshotIndexEntryBuilderWorkers   = 64
 	DefaultSnapshotAppendVecCopyingWorkers    = 32
-	DefaultSnapshotIndexShards                = 64
+	DefaultSnapshotIndexShards                = 256
 	DefaultSnapshotMaxConcurrentFlushers      = 8
 	// DefaultSnapshotFlushSortWorkers == 0 means "auto": use runtime.NumCPU().
 	DefaultSnapshotFlushSortWorkers = 0
 	// DefaultSnapshotDirectIO keeps O_DIRECT big-file writes off by default;
 	// buffered is the safe default and O_DIRECT is an opt-in tuning knob.
 	DefaultSnapshotDirectIO = false
+	// DefaultSnapshotShardMinFreeMB is the free space a multi-directory unpack
+	// leaves on each accounts filesystem before steering records elsewhere.
+	DefaultSnapshotShardMinFreeMB = 16 << 10
 )
 
 var (
@@ -42,6 +45,7 @@ var (
 	SnapshotIndexShards                = DefaultSnapshotIndexShards
 	SnapshotFlushSortWorkers           = DefaultSnapshotFlushSortWorkers
 	SnapshotDirectIO                   = DefaultSnapshotDirectIO
+	SnapshotShardMinFreeBytes          = uint64(DefaultSnapshotShardMinFreeMB) << 20
 	SnapshotIndexTempDir               string
 )
 
@@ -51,7 +55,8 @@ var (
 func CleanAccountsDbDir(accountsDbDir string) { CleanAccountsDbDirs([]string{accountsDbDir}) }
 
 func CleanAccountsDbDirs(accountsPaths []string) {
-	if len(accountsPaths) == 0 {
+	if err := accountsdb.ValidateAccountsPaths(accountsPaths); err != nil {
+		mlog.Log.Errorf("refusing AccountsDB cleanup: %v", err)
 		return
 	}
 	// List of all files/directories that may be left from a previous incomplete run
@@ -294,8 +299,8 @@ func BuildAccountsDbPaths(
 	accountsPaths []string,
 	dp *progress.DualProgress,
 ) (*accountsdb.AccountsDb, *SnapshotManifest, error) {
-	if len(accountsPaths) == 0 {
-		return nil, nil, fmt.Errorf("no accounts paths configured")
+	if err := accountsdb.ValidateAccountsPaths(accountsPaths); err != nil {
+		return nil, nil, err
 	}
 	// The first path holds all metadata; every path holds a shard's accounts dir.
 	accountsDbDir := accountsPaths[0]
@@ -338,6 +343,7 @@ func BuildAccountsDbPaths(
 	if err != nil {
 		return nil, nil, fmt.Errorf("opening shard big files: %w", err)
 	}
+	defer shardFiles.close() // also drain and release writers on bootstrap errors
 	logSnapshotBootstrapTuning()
 
 	defer ants.Release()
@@ -413,6 +419,9 @@ func BuildAccountsDbPaths(
 		}
 	}
 
+	// Workers have drained; release their pools before the memory-intensive sort.
+	pools.Release()
+
 	// flush and close every shard's big file now that all appends are done
 	if err := shardFiles.close(); err != nil {
 		return nil, nil, fmt.Errorf("closing shard big files: %w", err)
@@ -467,6 +476,9 @@ func BuildAccountsDbPaths(
 	stakeIndexPath := filepath.Join(accountsDbDir, "stake_pubkeys.idx")
 	if err := accountsdb.WriteStakePubkeyIndex(stakeIndexPath, stakeCollector.entries); err != nil {
 		return nil, nil, fmt.Errorf("writing stake pubkey index: %w", err)
+	}
+	if err := syncBuildMetadata(accountsDbDir); err != nil {
+		return nil, nil, fmt.Errorf("syncing AccountsDB metadata: %w", err)
 	}
 
 	bankhashDir := filepath.Join(accountsDbDir, "bankhash_db")
@@ -954,9 +966,20 @@ func initWorkerPools(
 }
 
 func (p *snapshotWorkerPools) Release() {
-	p.appendVecCopying.Release()
-	p.indexEntryBuilder.Release()
-	p.indexEntryCommitter.Release()
+	// Call only after waitForSnapshotWorkers. Idempotent for deferred cleanup.
+	if p.appendVecCopying != nil {
+		p.appendVecCopying.Release()
+		p.appendVecCopying = nil
+	}
+	if p.indexEntryBuilder != nil {
+		p.indexEntryBuilder.Release()
+		p.indexEntryBuilder = nil
+	}
+	if p.indexEntryCommitter != nil {
+		p.indexEntryCommitter.Release()
+		p.indexEntryCommitter = nil
+	}
+	p.tarBufs = nil
 }
 
 // Ingest SSTs into a fresh pebble DB and return it.
