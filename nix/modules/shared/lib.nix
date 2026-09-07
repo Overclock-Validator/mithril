@@ -66,6 +66,7 @@
       };
       tuning = {
         zstd_decoder_concurrency = cfg.configSchema.tuningZstdDecoderConcurrency;
+        snapshot_index_shards = cfg.configSchema.tuningSnapshotIndexShards;
         max_concurrent_flushers = cfg.configSchema.tuningMaxConcurrentFlushers;
         param_arena_size_mb = cfg.configSchema.tuningParamArenaSizeMb;
         borrowed_account_arena_size = cfg.configSchema.tuningBorrowedAccountArenaSize;

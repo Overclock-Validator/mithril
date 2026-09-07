@@ -344,9 +344,15 @@
         description = "Zstd decoder concurrency.";
       };
 
+      tuningSnapshotIndexShards = lib.mkOption {
+        type = lib.types.ints.between 1 1000;
+        default = 256;
+        description = "Snapshot account-index shard count; more shards reduce per-flusher sort memory when entries are evenly spread.";
+      };
+
       tuningMaxConcurrentFlushers = lib.mkOption {
         type = lib.types.int;
-        default = 16;
+        default = 8;
         description = "Max concurrent flushers.";
       };
 

@@ -26,7 +26,7 @@ const (
 	DefaultSnapshotIndexEntryCommitterWorkers = 64
 	DefaultSnapshotIndexEntryBuilderWorkers   = 64
 	DefaultSnapshotAppendVecCopyingWorkers    = 32
-	DefaultSnapshotIndexShards                = 64
+	DefaultSnapshotIndexShards                = 256
 	DefaultSnapshotMaxConcurrentFlushers      = 8
 	// DefaultSnapshotFlushSortWorkers == 0 means "auto": use runtime.NumCPU().
 	DefaultSnapshotFlushSortWorkers = 0
