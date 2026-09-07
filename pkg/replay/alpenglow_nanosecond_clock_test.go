@@ -14,7 +14,7 @@ import (
 )
 
 func TestNanosecondClockAccountAddr(t *testing.T) {
-	require.Equal(t, "ErF9JEo3jKD5kWfvgagixVHRfJwa6qFVnaEYDdi7Wdrk", NanosecondClockAccountAddr().String())
+	require.Equal(t, "GaGQ2vyb3xuUwjKiq9tQQWoqhzWYh7LbiLXvqG2sUzzG", NanosecondClockAccountAddr().String())
 }
 
 func TestEncodeNanosecondClockData(t *testing.T) {

@@ -47,6 +47,13 @@ func RentForSlot(slotCtx *sealevel.SlotCtx) sealevel.SysvarRent {
 // system payer may be drained to zero, but must not be left with a
 // nonzero balance below the exemption minimum.
 func ValidateFeePayer(payer *accounts.Account, fee uint64, rent sealevel.SysvarRent) error {
+	return ValidateFeePayerWithFeatures(payer, fee, rent, nil)
+}
+
+// ValidateFeePayerWithFeatures applies pending fee-payer feature semantics.
+// The nil feature set preserves the pre-activation behavior for callers that
+// deliberately require strict block-production admission.
+func ValidateFeePayerWithFeatures(payer *accounts.Account, fee uint64, rent sealevel.SysvarRent, feats *features.Features) error {
 	if payer == nil || payer.Lamports == 0 {
 		return ErrFeePayerNotFound
 	}
@@ -62,8 +69,18 @@ func ValidateFeePayer(payer *accounts.Account, fee uint64, rent sealevel.SysvarR
 		return ErrInsufficientFundsForFee
 	}
 	post := payer.Lamports - fee
-	if kind == systemAccountKindSystem && post != 0 && rent.IsExempt(payer.Lamports, 0) && !rent.IsExempt(post, 0) {
-		return ErrInsufficientFundsForRent
+	relaxPostExecMinBalance := feats != nil && feats.IsActive(features.RelaxPostExecMinBalanceCheck)
+	if kind == systemAccountKindSystem && post != 0 && !rent.IsExempt(post, 0) {
+		// Before SIMD-0392, an already-rent-paying system account may keep
+		// decreasing while remaining rent-paying. After activation, Agave
+		// treats the pre-state as rent-exempt but allows an otherwise unchanged
+		// account to remain sub-exempt when its balance did not decrease. A fee
+		// payer's owner and data cannot change during this phase, so only the
+		// balance comparison remains here.
+		if (relaxPostExecMinBalance && post < payer.Lamports) ||
+			(!relaxPostExecMinBalance && rent.IsExempt(payer.Lamports, 0)) {
+			return ErrInsufficientFundsForRent
+		}
 	}
 	return nil
 }
@@ -86,12 +103,44 @@ func PayerCanFund(slotCtx *sealevel.SlotCtx, tx *solana.Transaction) error {
 	if err != nil {
 		return err
 	}
-	limits, err := sealevel.ComputeBudgetExecuteInstructions(instrs, feats)
+	limits, err := sealevel.ComputeBudgetLimitsForTransaction(tx, instrs, feats)
 	if err != nil {
 		return err
 	}
+	// Agave's block-production admission stays strict even after SIMD-0290;
+	// only replay may turn a blockhash transaction into a committed no-op.
 	feeInfo := CalculateTxFees(tx, instrs, limits, feats)
-	return ValidateFeePayer(payer, feeInfo.TotalFee, RentForSlot(slotCtx))
+	return ValidateFeePayerWithFeatures(payer, feeInfo.TotalFee, RentForSlot(slotCtx), feats)
+}
+
+// ValidateTransactionFeePayer performs the fee-payer phase of Agave's
+// transaction loader without mutating bank state. It deliberately runs before
+// loading the remaining transaction accounts so fee-payer errors take
+// precedence over account-load errors. The caller may subsequently deduct the
+// returned fee from a transaction-local account clone, or publish it as the
+// rollback state for a fees-only transaction.
+func ValidateTransactionFeePayer(
+	slotCtx *sealevel.SlotCtx,
+	tx *solana.Transaction,
+	instrs []sealevel.Instruction,
+	limits *sealevel.ComputeBudgetLimits,
+) (*TxFeeInfo, error) {
+	if slotCtx == nil || tx == nil || len(tx.Message.AccountKeys) == 0 || limits == nil {
+		return nil, ErrFeePayerNotFound
+	}
+	feats := slotCtx.Features
+	if feats == nil {
+		feats = features.NewFeaturesDefault()
+	}
+	feeInfo := CalculateTxFees(tx, instrs, limits, feats)
+	payer, err := loadPayer(slotCtx, tx.Message.AccountKeys[0])
+	if err != nil {
+		return feeInfo, ErrFeePayerNotFound
+	}
+	if err := ValidateFeePayerWithFeatures(payer, feeInfo.TotalFee, RentForSlot(slotCtx), feats); err != nil {
+		return feeInfo, err
+	}
+	return feeInfo, nil
 }
 
 func loadPayer(slotCtx *sealevel.SlotCtx, pk solana.PublicKey) (*accounts.Account, error) {
@@ -128,6 +177,9 @@ func systemAccountKind(acct *accounts.Account) (int, bool) {
 	}
 	if len(acct.Data) == 0 {
 		return systemAccountKindSystem, true
+	}
+	if len(acct.Data) != NonceStateSize {
+		return 0, false
 	}
 	nonceState, err := sealevel.UnmarshalNonceStateVersions(acct.Data)
 	if err != nil || !nonceState.State().IsInitialized {

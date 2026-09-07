@@ -33,6 +33,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/blockstream"
 	"github.com/Overclock-Validator/mithril/pkg/config"
 	consensusengine "github.com/Overclock-Validator/mithril/pkg/consensus"
+	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
 	"github.com/Overclock-Validator/mithril/pkg/lightbringer"
@@ -2470,6 +2471,29 @@ postBootstrap:
 		}
 	}
 
+	// Validate the exact local parent bank before opening operational RPC and
+	// before starting consensus, voting, or block production. Passive turbine
+	// prewarm ingress may already be running, but it cannot participate in
+	// consensus. In particular, an Alpenglow cluster setting is not evidence that
+	// the snapshot has crossed Alpenglow genesis: the deployed feature and its
+	// consensus metadata must be present in AccountsDB.
+	if alpenglowMode {
+		if startSlot < 1 {
+			klog.Fatalf("Alpenglow replay has invalid start slot %d", startSlot)
+		}
+		parentSlot := uint64(startSlot - 1)
+		if err := replay.ValidateAlpenglowStartupState(accountsDb, parentSlot); err != nil {
+			klog.Fatalf("Alpenglow startup safety check failed: %v", err)
+		}
+		mlog.Log.Infof(
+			"Alpenglow startup safety check passed at parent slot %d (feature=%s alpenclock=%s vote_reward=%s)",
+			parentSlot,
+			features.AlpenglowFeatureGateAddress,
+			replay.NanosecondClockAccountAddr(),
+			replay.VoteRewardAccountAddr(),
+		)
+	}
+
 	// Write replay timings to run-specific log directory
 	replayTimingsPath := filepath.Join(mlog.GetLogDir(), "replay_timings.jsonl")
 	metricsWriter, metricsWriterCleanup, err := createBufWriter(replayTimingsPath)
@@ -2689,6 +2713,15 @@ postBootstrap:
 		tpuCfg.ListenAddr = validatorTPUQUICBind
 		tpuCfg.AdvertisedIP = advertisedIP
 		tpuCfg.Pipeline.Sink = topicSink
+		tpuCfg.Pipeline.TxV1Enabled = func() bool {
+			// During our leader window, admission must use that working bank's
+			// feature snapshot rather than the concurrently advancing replay tip.
+			if bank := controller.WorkingBank(); bank != nil {
+				slotCtx := bank.SlotCtx()
+				return slotCtx != nil && slotCtx.Features != nil && slotCtx.Features.IsActive(features.EnableTxV1)
+			}
+			return replay.ChainTipFeatureActive(features.EnableTxV1)
+		}
 		if validatorSigverifyWorkers > 0 {
 			tpuCfg.Pipeline.SigverifyWorkers = validatorSigverifyWorkers
 		}

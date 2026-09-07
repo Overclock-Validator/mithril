@@ -22,6 +22,7 @@ const (
 	// A minimally encoded transaction still has compact counts, the message
 	// header, and a recent blockhash.
 	minimumTransactionWireSize = 1 + 3 + 1 + 32 + 1
+	legacyTransactionWireLimit = 1232
 )
 
 type Entry struct {
@@ -58,8 +59,22 @@ func (e *Entry) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 	}
 	e.Txns = make([]solana.Transaction, numTxns)
 	for i := uint64(0); i < numTxns; i++ {
+		transactionStart := decoder.Position()
 		if err = e.Txns[i].UnmarshalWithDecoder(decoder); err != nil {
 			return fmt.Errorf("read transaction %d: %w", i, err)
+		}
+		transactionSize := decoder.Position() - transactionStart
+		var transactionLimit uint
+		switch version := e.Txns[i].Message.GetVersion(); version {
+		case solana.MessageVersionLegacy, solana.MessageVersionV0:
+			transactionLimit = legacyTransactionWireLimit
+		case solana.MessageVersionV1:
+			transactionLimit = solana.MaxTransactionSizeV1
+		default:
+			return fmt.Errorf("read transaction %d: unsupported message version %d", i, version)
+		}
+		if transactionSize > transactionLimit {
+			return fmt.Errorf("read transaction %d: wire size %d exceeds version %d limit %d", i, transactionSize, e.Txns[i].Message.GetVersion(), transactionLimit)
 		}
 	}
 	return nil

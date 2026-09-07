@@ -9,8 +9,8 @@ import (
 
 func TestAlpenglowMetadataAddresses(t *testing.T) {
 	require.Equal(t, features.AlpenglowFeatureGateAddress, AlpenglowFeatureGatePubkey)
-	require.Equal(t, "A1PeNGc3D8SQmKwdYf4qj1XG7XgWVSuFQaiJSCQj775h", alpenglowFeatureGatePubkey.String())
-	require.Equal(t, "CzbDGGjhn3JhaaukmLjnmb3kcC8ohGs98GqZR6GcrkQf", VoteRewardAccountAddr().String())
-	require.Equal(t, "ErF9JEo3jKD5kWfvgagixVHRfJwa6qFVnaEYDdi7Wdrk", NanosecondClockAccountAddr().String())
-	require.Equal(t, "EEJkUCpugoK7DnYjxv3msztqhEJ45r8MKZwfBUV57pug", RewardEpochDelegatedStakesAccountAddr().String())
+	require.Equal(t, "A1pengvuM6JEcyNuTnMqepBKhwHE3N6PmUrdATGawhJS", alpenglowFeatureGatePubkey.String())
+	require.Equal(t, "3vJzniWALu2qGFJ1ZY6JD3Y2ZmA5zWqmVdDX7yBXHgu7", VoteRewardAccountAddr().String())
+	require.Equal(t, "GaGQ2vyb3xuUwjKiq9tQQWoqhzWYh7LbiLXvqG2sUzzG", NanosecondClockAccountAddr().String())
+	require.Equal(t, "CHfmHwNcskfxg1ZnLatbHbmVvYbA6rLDz3Xok5a3Ku8i", RewardEpochDelegatedStakesAccountAddr().String())
 }

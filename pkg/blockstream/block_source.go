@@ -1813,7 +1813,10 @@ func (bs *BlockSource) tryGetBlockFromFile(slot uint64) (*block.Block, error) {
 		file.Close()
 		return nil, fmt.Errorf("block decode error: %w", err)
 	}
-	out.FixupTxVersions()
+	if err := out.FixupTxVersions(); err != nil {
+		file.Close()
+		return nil, fmt.Errorf("block transaction-version fixup: %w", err)
+	}
 
 	file.Close()
 	os.Remove(blockFilename)
@@ -1927,7 +1930,7 @@ func (bs *BlockSource) fetchBlockOnce(slot uint64, rpcIdx int32) (*b.Block, erro
 		return nil, err
 	}
 
-	return block.FromBlockResult(blockResult, slot, rpc), nil
+	return block.FromBlockResult(blockResult, slot, rpc)
 }
 
 // pollTip periodically updates the confirmed tip by querying all configured RPCs
@@ -3663,7 +3666,10 @@ func (bs *BlockSource) fetchAndParseBlockSequential(slot uint64) (*b.Block, erro
 					return nil, fmt.Errorf("error fetching block: %w", err)
 				}
 			}
-			blk = block.FromBlockResult(blockResult, slot, rpc)
+			blk, err = block.FromBlockResult(blockResult, slot, rpc)
+			if err != nil {
+				return nil, err
+			}
 		}
 	} else if bs.sourceType == BlockSourceLightbringer || bs.sourceType == BlockSourceTurbine {
 		// Legacy sequential mode does not support the live stream handoff.
@@ -3685,7 +3691,10 @@ func (bs *BlockSource) fetchAndParseBlockSequential(slot uint64) (*b.Block, erro
 				return nil, fmt.Errorf("error fetching block: %w", err)
 			}
 		}
-		blk = block.FromBlockResult(blockResult, slot, rpc)
+		blk, err = block.FromBlockResult(blockResult, slot, rpc)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return blk, nil

@@ -5,6 +5,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
+	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -28,6 +29,28 @@ func TestValidateFeePayer_SystemRentExemptRemainder(t *testing.T) {
 	assert.ErrorIs(t, ValidateFeePayer(systemPayer(fee-1), fee, rent), ErrInsufficientFundsForFee)
 	assert.ErrorIs(t, ValidateFeePayer(systemPayer(0), fee, rent), ErrFeePayerNotFound)
 	assert.ErrorIs(t, ValidateFeePayer(nil, fee, rent), ErrFeePayerNotFound)
+}
+
+func TestValidateFeePayer_RelaxPostExecMinBalanceCheck(t *testing.T) {
+	rent := sealevel.NewDefaultRentSysvar()
+	rentMin := rent.MinimumBalance(0)
+	const fee = uint64(5000)
+	payer := &accounts.Account{
+		Owner:    addresses.SystemProgramAddr,
+		Lamports: rentMin - 1,
+	}
+
+	feats := features.NewFeaturesDefault()
+	assert.NoError(t, ValidateFeePayerWithFeatures(payer, fee, rent, feats))
+	feats.EnableFeature(features.RelaxPostExecMinBalanceCheck, 0)
+	assert.ErrorIs(t, ValidateFeePayerWithFeatures(payer, fee, rent, feats), ErrInsufficientFundsForRent)
+	assert.NoError(t, ValidateFeePayerWithFeatures(payer, 0, rent, feats),
+		"SIMD-0392 permits an unchanged rent-paying account")
+
+	// A rent-exempt payer may not be drained to a nonzero sub-exempt balance
+	// in either mode.
+	payer.Lamports = rentMin + fee - 1
+	assert.ErrorIs(t, ValidateFeePayerWithFeatures(payer, fee, rent, feats), ErrInsufficientFundsForRent)
 }
 
 func TestValidateFeePayer_RejectsNonSystemOwner(t *testing.T) {
@@ -63,6 +86,10 @@ func TestValidateFeePayer_NonceKeepsNonceRent(t *testing.T) {
 
 	payer.Lamports = nonceMin + fee
 	assert.NoError(t, ValidateFeePayer(payer, fee, rent))
+
+	payer.Data = append(payer.Data, 0)
+	assert.ErrorIs(t, ValidateFeePayer(payer, fee, rent), ErrInvalidAccountForFee,
+		"Agave requires nonce fee-payer data to be exactly 80 bytes")
 }
 
 func TestValidateFeePayer_RentPayingSystemMaySpendToZero(t *testing.T) {
