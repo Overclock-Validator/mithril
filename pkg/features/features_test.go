@@ -58,7 +58,7 @@ func TestTransactionV1CompanionFeatureGates(t *testing.T) {
 	}{
 		{EnableTxV1, "txv1aq4pp281K9um3tnPgkfX8UqtFT6wcVW3hNezGLL"},
 		{DefineLtdsFeeOnlySemantics, "LTDSzjZKFJMKHYpNycG1FrWwGGTaFFwqEFjB5GGLNVD"},
-		{RelaxPostExecMinBalanceCheck, "DEJmsCntuYqbXtL5z5TxbaxJXFUJAFjf7TqWSF7YWjQg"},
+		{RelaxPostExecMinBalanceCheck, "BY4JhHLahVzS9ynfDz4exzGPbVXhFmJvEyMWsXbDBqME"},
 		{RelaxFeePayerConstraint, "FEEXbxUuKobtrt1qNK5pjtzbPQhsppBTrNNG74xu4mai"},
 	} {
 		assert.Equal(t, base58.MustDecodeFromString(test.addr), test.gate.Address)
@@ -78,7 +78,7 @@ func TestEnableSbpfV3DeploymentAndExecutionFeatureGates(t *testing.T) {
 
 func TestAlpenglowFeatureGate(t *testing.T) {
 	assert.Equal(t, "Alpenglow", Alpenglow.Name)
-	assert.Equal(t, "A1PeNGc3D8SQmKwdYf4qj1XG7XgWVSuFQaiJSCQj775h", AlpenglowFeatureGateAddress)
+	assert.Equal(t, "A1pengvuM6JEcyNuTnMqepBKhwHE3N6PmUrdATGawhJS", AlpenglowFeatureGateAddress)
 	assert.Equal(t, base58.MustDecodeFromString(AlpenglowFeatureGateAddress), Alpenglow.Address)
 	assert.Contains(t, AllFeatureGates, Alpenglow)
 }
