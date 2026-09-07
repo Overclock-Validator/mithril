@@ -2471,6 +2471,29 @@ postBootstrap:
 		}
 	}
 
+	// Validate the exact local parent bank before opening operational RPC and
+	// before starting consensus, voting, or block production. Passive turbine
+	// prewarm ingress may already be running, but it cannot participate in
+	// consensus. In particular, an Alpenglow cluster setting is not evidence that
+	// the snapshot has crossed Alpenglow genesis: the deployed feature and its
+	// consensus metadata must be present in AccountsDB.
+	if alpenglowMode {
+		if startSlot < 1 {
+			klog.Fatalf("Alpenglow replay has invalid start slot %d", startSlot)
+		}
+		parentSlot := uint64(startSlot - 1)
+		if err := replay.ValidateAlpenglowStartupState(accountsDb, parentSlot); err != nil {
+			klog.Fatalf("Alpenglow startup safety check failed: %v", err)
+		}
+		mlog.Log.Infof(
+			"Alpenglow startup safety check passed at parent slot %d (feature=%s alpenclock=%s vote_reward=%s)",
+			parentSlot,
+			features.AlpenglowFeatureGateAddress,
+			replay.NanosecondClockAccountAddr(),
+			replay.VoteRewardAccountAddr(),
+		)
+	}
+
 	// Write replay timings to run-specific log directory
 	replayTimingsPath := filepath.Join(mlog.GetLogDir(), "replay_timings.jsonl")
 	metricsWriter, metricsWriterCleanup, err := createBufWriter(replayTimingsPath)

@@ -1782,6 +1782,10 @@ func ReplayBlocks(
 	isFirstSlotInEpoch := epochSchedule.FirstSlotInEpoch(startEpoch) == startSlot
 	replayCtx.CurrentFeatures, featuresActivatedInFirstSlot, parentFeaturesActivatedInFirstSlot = scanAndEnableFeatures(acctsDb, replayCtx, startSlot, isFirstSlotInEpoch)
 	if alpenglowMode {
+		if err := validateAlpenglowRuntimeFeatureSet(replayCtx.CurrentFeatures, startSlot); err != nil {
+			result.Error = err
+			return result
+		}
 		applyAlpenglowRuntimeFeatureOverrides(replayCtx.CurrentFeatures, startSlot)
 	}
 	var initialLtHash *lthash.LtHash
