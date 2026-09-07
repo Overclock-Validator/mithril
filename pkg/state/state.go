@@ -752,7 +752,7 @@ func ValidateAccountsDbArtifacts(accountsDbDir string) error {
 		"mithril_db",
 		"bankhash_db",
 		"accounts",
-		"num_shards",
+		"largest_file_id",
 		"bank_hash",
 		"manifest",
 	}

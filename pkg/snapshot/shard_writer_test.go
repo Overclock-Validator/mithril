@@ -10,13 +10,10 @@ import (
 
 // TestShardWriterReadback verifies that bytes appended to a shardWriter can be read
 // back at the base offset it returned, for both buffered and O_DIRECT modes and
-// including a record larger than the staging buffer. Runs on an ext4 mount because
-// O_DIRECT is not supported on tmpfs.
+// including a record larger than the staging buffer. Set TMPDIR to a filesystem
+// supporting O_DIRECT to exercise direct mode; buffered mode always runs.
 func TestShardWriterReadback(t *testing.T) {
-	dir := "/mnt/disk0"
-	if _, err := os.Stat(dir); err != nil {
-		t.Skipf("shard writer test needs an ext4 mount at %s: %v", dir, err)
-	}
+	dir := t.TempDir()
 
 	for _, direct := range []bool{false, true} {
 		t.Run(fmt.Sprintf("direct=%v", direct), func(t *testing.T) {
@@ -77,15 +74,7 @@ func TestShardWriterReadback(t *testing.T) {
 // onto shard 0) and (2) every record reads back at the path+offset its returned
 // fileId/base resolve to.
 func TestShardBigFilesPlacement(t *testing.T) {
-	dirs := []string{"/mnt/disk0", "/mnt/disk1", "/mnt/disk2"}
-	shardDirs := make([]string, len(dirs))
-	for i, d := range dirs {
-		shardDirs[i] = filepath.Join(d, "shardplace_test")
-		if err := os.MkdirAll(shardDirs[i], 0755); err != nil {
-			t.Skipf("need writable ext4 dirs (%s): %v", shardDirs[i], err)
-		}
-		defer os.RemoveAll(shardDirs[i])
-	}
+	shardDirs := []string{t.TempDir(), t.TempDir(), t.TempDir()}
 
 	for _, direct := range []bool{false, true} {
 		t.Run(fmt.Sprintf("direct=%v", direct), func(t *testing.T) {
