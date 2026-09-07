@@ -68,11 +68,14 @@ type AccountsDb struct {
 
 	// Batch-fold state (segment.go/fold.go/recovery.go). foldMu serializes
 	// CommitBatch, recovery, rewind, and compaction.
-	foldMu         sync.Mutex
-	lastBatchSeq   uint64        // guarded by foldMu; seeded by RecoverFoldState
-	durableThrough atomic.Uint64 // observability: highest durably folded slot
-	foldHooks      foldTestHooks // test-only crash injection
-	compactCursor  string        // guarded by foldMu; scan resume point across CompactOnce cycles
+	foldMu               sync.Mutex
+	lastBatchSeq         uint64                    // guarded by foldMu; seeded by RecoverFoldState
+	durableThrough       atomic.Uint64             // observability: highest durably folded slot
+	foldHooks            foldTestHooks             // test-only crash injection
+	coalescedFiles       sync.Map                  // file ID -> physical path; immutable compact outputs
+	coalescedScans       map[uint64]*coalescedScan // guarded by foldMu
+	coalescedCompactHook func(string) error        // test-only crash injection
+	compactCursor        string                    // guarded by foldMu; scan resume point across CompactOnce cycles
 
 	// A list of store requests. They are added to the back as they arrive and
 	// removed from the front as they are persisted.
@@ -142,8 +145,8 @@ func OpenDb(accountsDbDir string) (*AccountsDb, error) {
 }
 
 func OpenDbPaths(accountsPaths []string) (*AccountsDb, error) {
-	if len(accountsPaths) == 0 {
-		return nil, fmt.Errorf("OpenDb: no accounts paths configured")
+	if err := ValidateAccountsPaths(accountsPaths); err != nil {
+		return nil, err
 	}
 	// The first path holds all metadata (index, manifest, state); every path
 	// holds an "accounts" dir with that disk's shard data.
@@ -204,6 +207,11 @@ func OpenDbPaths(accountsPaths []string) (*AccountsDb, error) {
 	}
 	accountsDb.LargestFileId.Store(binary.LittleEndian.Uint64(largestBytes))
 
+	if err := accountsDb.loadCoalescedFiles(); err != nil {
+		bankhashDb.Close()
+		db.Close()
+		return nil, err
+	}
 	accountsDb.inProgressStoreRequests = list.New()
 	accountsDb.storeRequestChan = make(chan *list.Element)
 	accountsDb.storeWorkerDone = make(chan struct{})

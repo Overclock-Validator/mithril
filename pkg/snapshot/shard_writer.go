@@ -7,9 +7,9 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"unsafe"
 
+	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 )
 
@@ -53,8 +53,11 @@ type shardWriter struct {
 	wg     sync.WaitGroup
 	queued atomic.Int64 // bytes accepted but not yet written (backpressure signal)
 
-	errMu sync.Mutex
-	err   error
+	errMu     sync.Mutex
+	err       error
+	closed    bool // guarded by mu; close is terminal
+	closeOnce sync.Once
+	closeErr  error
 }
 
 type wItem struct {
@@ -73,7 +76,11 @@ func (s *shardWriter) newBuf() []byte {
 func newShardWriter(path string, direct bool) (*shardWriter, error) {
 	flags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
 	if direct {
-		flags |= syscall.O_DIRECT
+		flag, err := directIOFlag()
+		if err != nil {
+			return nil, err
+		}
+		flags |= flag
 	}
 	f, err := os.OpenFile(path, flags, 0644)
 	if err != nil {
@@ -119,6 +126,10 @@ func (s *shardWriter) append(blob []byte) (uint64, error) {
 	}
 
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return 0, os.ErrClosed
+	}
 	base := s.offset
 
 	// len(s.cur), not cap: alignedBuf over-allocates, so cap can exceed the logical
@@ -173,16 +184,27 @@ func (s *shardWriter) flushLocked() {
 }
 
 func (s *shardWriter) close() error {
-	s.mu.Lock()
-	s.flushLocked()
-	s.mu.Unlock()
-	close(s.queue)
-	s.wg.Wait()
-	cerr := s.f.Close()
-	if werr := s.loadErr(); werr != nil {
-		return werr
-	}
-	return cerr
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.flushLocked()
+		s.closed = true
+		close(s.queue)
+		s.mu.Unlock()
+		s.wg.Wait()
+		s.closeErr = s.f.Close()
+		if werr := s.loadErr(); werr != nil {
+			s.closeErr = werr
+		}
+		// The writer may remain reachable through worker closures until bootstrap
+		// returns. Its 32 MiB of staging buffers are no longer needed during sorting.
+		s.mu.Lock()
+		s.cur = nil
+		close(s.free)
+		for range s.free {
+		}
+		s.mu.Unlock()
+	})
+	return s.closeErr
 }
 
 func (s *shardWriter) loadErr() error {
@@ -208,6 +230,9 @@ type shardBigFiles struct {
 }
 
 func openShardBigFiles(shardDirs []string) (*shardBigFiles, error) {
+	if err := accountsdb.ValidateStorageDirectories(shardDirs); err != nil {
+		return nil, err
+	}
 	direct := SnapshotDirectIO
 	mlog.Log.Infof("snapshot shard writers: %d shard(s), O_DIRECT=%v", len(shardDirs), direct)
 	sb := &shardBigFiles{

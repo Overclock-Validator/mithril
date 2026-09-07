@@ -45,8 +45,8 @@ func BuildAccountsDbAuto(
 	snapCfg snapshotdl.SnapshotConfig,
 	dp *progress.DualProgress,
 ) (*accountsdb.AccountsDb, *SnapshotManifest, error) {
-	if len(accountsPaths) == 0 {
-		return nil, nil, fmt.Errorf("no accounts paths configured")
+	if err := accountsdb.ValidateAccountsPaths(accountsPaths); err != nil {
+		return nil, nil, err
 	}
 	// The first path holds all metadata; every path holds a shard's accounts dir.
 	accountsDbDir := accountsPaths[0]
@@ -76,6 +76,7 @@ func BuildAccountsDbAuto(
 	if err != nil {
 		return nil, nil, fmt.Errorf("opening shard big files: %w", err)
 	}
+	defer shardFiles.close() // also drain and release writers on bootstrap errors
 	logSnapshotBootstrapTuning()
 
 	defer ants.Release()
@@ -257,6 +258,9 @@ func BuildAccountsDbAuto(
 	if err != nil {
 		return nil, nil, err
 	}
+
+	// Workers have drained; release their pools before the memory-intensive sort.
+	pools.Release()
 
 	// flush and close every shard's big file now that all appends are done
 	if err := shardFiles.close(); err != nil {

@@ -55,6 +55,9 @@ func (s *Shards) path(slot, fileId uint64) string {
 
 // appendVecPath keeps legacy stores readable and resolves coalesced snapshot data.
 func (db *AccountsDb) appendVecPath(slot, fileId uint64) string {
+	if path, ok := db.coalescedFiles.Load(fileId); ok {
+		return path.(string)
+	}
 	if db.Shards != nil {
 		return db.Shards.path(slot, fileId)
 	}

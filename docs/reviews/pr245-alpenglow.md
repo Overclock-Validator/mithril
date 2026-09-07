@@ -10,7 +10,7 @@ The PR was rebased in an isolated worktree. Its four commits are retained;
 conflict resolution also ports the layout to Alpenglow's newer AccountsDB.
 The existing checkouts and the upstream PR branch were not changed.
 
-## Findings
+## Findings at the review checkpoint (`18631a3a`)
 
 1. **P1 — Reject duplicate or aliased shard directories before opening writers.**
    `openShardBigFiles` opens an independent truncating writer for every supplied
@@ -43,8 +43,10 @@ The existing checkouts and the upstream PR branch were not changed.
    platform build constraints, with an explicit unsupported-direct-mode error
    on other systems while retaining buffered writes.
 
-The reproductions intentionally fail on this review branch and are kept outside
-its ordinary test suite. This review does not implement the outstanding fixes.
+The reproductions intentionally fail at the review checkpoint and remain in
+the original artifacts. The follow-up fixes are now on this branch; see
+[PR #245 fixes and memory investigation](pr245-fixes.md) for implementation,
+new passing regressions, durability checks, and updated measurements.
 
 ## Rebase integration
 
@@ -125,8 +127,9 @@ The candidate used **9.4% less elapsed time**, winning all eight paired samples
 (two-sided exact sign test p=0.0078125). **Peak RSS increased about 90%**. RSS is
 measured for the probe process, including its close/reopen/cache initialization;
 it is not a count of allocations or total memory including OS page cache.
-Buffer retention is a possible contributor and needs profiling before making
-claims about its cause or mainnet-scale memory requirements.
+Subsequent heap profiles confirmed retained tar and writer buffers as
+contributors. See the follow-up report for measurements after earlier buffer
+release; mainnet-scale memory requirements remain unmeasured.
 
 Two-directory buffered and one-directory O_DIRECT builds also reopened and
 validated every account against the same digest. These were correctness runs,

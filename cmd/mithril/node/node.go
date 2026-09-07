@@ -789,6 +789,9 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	if len(accountsPaths) == 0 {
 		return fmt.Errorf("no accounts path configured (set storage.accounts)")
 	}
+	if err := accountsdb.ValidateAccountsPaths(accountsPaths); err != nil {
+		return err
+	}
 	accountsPath = accountsPaths[0]
 	// Check write permission early to fail fast with helpful error
 	for _, p := range accountsPaths {
