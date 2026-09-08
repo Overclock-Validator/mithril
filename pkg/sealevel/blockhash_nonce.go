@@ -206,6 +206,21 @@ func IsTransactionAgeValid(tx *solana.Transaction, instrs []Instruction, slotCtx
 	return true
 }
 
+// IsRecentBlockhashTransaction distinguishes ordinary blockhash transactions
+// from durable-nonce transactions after age validation. SIMD-0290 permits an
+// invalid fee payer to become a no-op only for the former.
+func IsRecentBlockhashTransaction(tx *solana.Transaction, slotCtx *SlotCtx) bool {
+	if tx == nil || slotCtx == nil {
+		return false
+	}
+	recentBlockhashes, ok := recentBlockhashesForSlot(slotCtx)
+	if !ok {
+		return false
+	}
+	return recentBlockhashes.IsBlockhashAgeValid(tx.Message.RecentBlockhash) ||
+		tx.Message.RecentBlockhash == slotCtx.LatestEvictedBlockhash
+}
+
 func recentBlockhashesForSlot(slotCtx *SlotCtx) (SysvarRecentBlockhashes, bool) {
 	if slotCtx != nil {
 		if bankSysvars := slotCtx.BankSysvars(); bankSysvars != nil {

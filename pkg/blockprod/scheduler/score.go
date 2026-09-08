@@ -22,7 +22,7 @@ func scoreTransaction(tx *solana.Transaction, feats *features.Features) (reward 
 	if err != nil {
 		return 0, messageHash, err
 	}
-	limits, err := sealevel.ComputeBudgetExecuteInstructions(instrs, feats)
+	limits, err := sealevel.ComputeBudgetLimitsForTransaction(tx, instrs, feats)
 	if err != nil {
 		return 0, messageHash, err
 	}

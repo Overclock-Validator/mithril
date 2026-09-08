@@ -19,7 +19,10 @@ type Config struct {
 	IngressCap         int
 	DedupOutCap        int
 	VerifiedCap        int
-	Sink               sink.Receiver
+	// TxV1Enabled must reflect the current replay bank's SIMD-0385 feature
+	// state. Nil deliberately fails closed for v1 transactions.
+	TxV1Enabled func() bool
+	Sink        sink.Receiver
 }
 
 func (c Config) normalized() Config {
@@ -89,7 +92,7 @@ func Start(parent context.Context, cfg Config) (*Pipeline, chan<- packet.Packet)
 	dedupOut := make(chan packet.Packet, cfg.DedupOutCap)
 	verified := make(chan packet.Packet, cfg.VerifiedCap)
 
-	dedupStage := dedup.NewStage(p.ingress, dedupOut, dedup.NewCache(cfg.DedupCacheCapacity))
+	dedupStage := dedup.NewStage(p.ingress, dedupOut, dedup.NewCache(cfg.DedupCacheCapacity), cfg.TxV1Enabled)
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
@@ -97,7 +100,7 @@ func Start(parent context.Context, cfg Config) (*Pipeline, chan<- packet.Packet)
 		dedupStage.Run(&p.stats.Dedup)
 	}()
 
-	startSigverifyPool(&p.wg, dedupOut, verified, cfg.SigverifyWorkers, &p.stats.Sigverify)
+	startSigverifyPool(&p.wg, dedupOut, verified, cfg.SigverifyWorkers, cfg.TxV1Enabled, &p.stats.Sigverify)
 
 	p.wg.Add(1)
 	go func() {
@@ -164,6 +167,7 @@ func startSigverifyPool(
 	in <-chan packet.Packet,
 	out chan<- packet.Packet,
 	workers int,
+	txV1Enabled func() bool,
 	stats *SigverifyStats,
 ) {
 	var verifyWG sync.WaitGroup
@@ -173,7 +177,7 @@ func startSigverifyPool(
 		go func() {
 			defer verifyWG.Done()
 			defer wg.Done()
-			runSigverifyWorker(in, out, workers, stats)
+			runSigverifyWorker(in, out, workers, txV1Enabled, stats)
 		}()
 	}
 	wg.Add(1)
@@ -196,6 +200,7 @@ func runSigverifyWorker(
 	in <-chan packet.Packet,
 	out chan<- packet.Packet,
 	workers int,
+	txV1Enabled func() bool,
 	stats *SigverifyStats,
 ) {
 	// Worker-local scratch, reused across groups.
@@ -205,6 +210,7 @@ func runSigverifyWorker(
 		verdicts []bool
 		verifier batchVerifier
 	)
+	verifier.SetTxV1Enabled(txV1Enabled)
 	for pkt := range in {
 		group = sigverify.Drain(group, pkt, in,
 			sigverify.FairShare(len(in), workers, sigverify.MaxDrain))

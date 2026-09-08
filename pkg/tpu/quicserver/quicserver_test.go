@@ -15,6 +15,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/tpu/quicserver"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/quicserver/testutils"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/sink"
+	"github.com/Overclock-Validator/mithril/pkg/tpu/txfixture"
 	"github.com/stretchr/testify/require"
 )
 
@@ -65,7 +66,11 @@ func spawnWithPipeline(
 	require.NoError(t, err)
 
 	noop := &sink.Noop{}
-	pl, ingress := pipeline.Start(ctx, pipeline.Config{SigverifyWorkers: 2, Sink: noop})
+	pl, ingress := pipeline.Start(ctx, pipeline.Config{
+		SigverifyWorkers: 2,
+		TxV1Enabled:      func() bool { return true },
+		Sink:             noop,
+	})
 	cfg.Ingress = ingress
 
 	result, err := quicserver.Spawn(
@@ -116,6 +121,93 @@ func TestServerReceivesTransactionOverQUIC(t *testing.T) {
 		stats := noop.Snapshot()
 		return stats.InPackets == 1 && stats.InBytes == uint64(len(payload))
 	}, time.Second, 10*time.Millisecond)
+}
+
+func TestServerReceivesMaxSizeV1TransactionOverQUIC(t *testing.T) {
+	// This fixture's fixed envelope is 175 bytes, leaving 3921 instruction
+	// data bytes at the 4096-byte SIMD-0385 limit.
+	payload := txfixture.MustSignedV1Wire(17, 3921)
+	require.Len(t, payload, quicserver.PacketDataSize)
+
+	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	require.NoError(t, err)
+	defer udpConn.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result, pl, noop := spawnWithPipeline(t, ctx, "test-tpu-v1-max", udpConn, quicserver.DefaultServerConfig())
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer shutdownCancel()
+		_ = result.Close(shutdownCtx)
+		pl.Stop()
+	}()
+
+	client, err := testutils.NewClient()
+	require.NoError(t, err)
+	conn, err := client.Dial(ctx, result.Listeners[0].Addr().String())
+	require.NoError(t, err)
+	defer conn.CloseWithError(0, "done")
+	require.NoError(t, client.Send(ctx, conn, payload))
+
+	require.Eventually(t, func() bool {
+		stats := noop.Snapshot()
+		return stats.InPackets == 1 && stats.InBytes == uint64(len(payload))
+	}, 2*time.Second, 10*time.Millisecond)
+}
+
+func TestServerRejectsTransactionAboveV1Limit(t *testing.T) {
+	payload := txfixture.MustSignedV1Wire(18, 3922)
+	require.Len(t, payload, quicserver.PacketDataSize+1)
+
+	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	require.NoError(t, err)
+	defer udpConn.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result, pl, noop := spawnWithPipeline(t, ctx, "test-tpu-v1-over", udpConn, quicserver.DefaultServerConfig())
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer shutdownCancel()
+		_ = result.Close(shutdownCtx)
+		pl.Stop()
+	}()
+
+	client, err := testutils.NewClient()
+	require.NoError(t, err)
+	conn, err := client.Dial(ctx, result.Listeners[0].Addr().String())
+	require.NoError(t, err)
+	defer conn.CloseWithError(0, "done")
+	_ = client.Send(ctx, conn, payload)
+
+	require.Eventually(t, func() bool {
+		return result.Stats.InvalidStreamSize.Load() == 1
+	}, 2*time.Second, 10*time.Millisecond)
+	require.Zero(t, noop.Snapshot().InPackets)
+}
+
+func TestServerRejectsTransportLimitsThatExceedPool(t *testing.T) {
+	_, identity, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	require.NoError(t, err)
+	defer udpConn.Close()
+
+	cfg := quicserver.DefaultServerConfig()
+	cfg.MaxStreamDataBytes = quicserver.PacketDataSize + 1
+	cfg.StreamReceiveWindowSize = cfg.MaxStreamDataBytes
+	_, err = quicserver.Spawn(context.Background(), "invalid-pool-limit", []quicserver.QuicSocket{
+		quicserver.QuicSocketFromUDP(udpConn),
+	}, identity, cfg)
+	require.ErrorContains(t, err, "exceeds packet buffer size")
+
+	cfg = quicserver.DefaultServerConfig()
+	cfg.StreamReceiveWindowSize = cfg.MaxStreamDataBytes - 1
+	_, err = quicserver.Spawn(context.Background(), "invalid-window", []quicserver.QuicSocket{
+		quicserver.QuicSocketFromUDP(udpConn),
+	}, identity, cfg)
+	require.ErrorContains(t, err, "smaller than max stream data bytes")
 }
 
 func TestServerDiscardsInvalidTransaction(t *testing.T) {

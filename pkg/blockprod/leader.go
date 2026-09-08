@@ -1210,7 +1210,7 @@ func (l *LeaderLoop) startSlotLocked(slot uint64) error {
 		SlotCtx:             slotCtx,
 		Slot:                slot,
 		Leader:              l.identity.PublicKey(),
-		Limits:              costmodel.DefaultLimits(),
+		Limits:              costmodel.LimitsForFeatures(slotCtx.Features),
 		EntryHash:           startEntryHash,
 		Sink:                sink,
 		TransactionStatuses: parentCtx.TransactionStatuses,

@@ -1,6 +1,7 @@
 package txfixture
 
 import (
+	"encoding/binary"
 	"fmt"
 
 	"github.com/gagliardetto/solana-go"
@@ -15,6 +16,59 @@ var (
 // PayerPubkey returns the funded signer used by transfer fixtures.
 func PayerPubkey() solana.PublicKey {
 	return payerWallet.PublicKey()
+}
+
+// SignedV1Wire returns a structurally valid, signed SIMD-0385 transaction.
+// dataLen can be used to exercise the larger v1 QUIC admission boundary; seq
+// is encoded into the payload so fixtures have distinct signatures.
+func SignedV1Wire(seq uint64, dataLen int) ([]byte, error) {
+	if dataLen < 0 {
+		return nil, fmt.Errorf("negative instruction data length %d", dataLen)
+	}
+	data := make([]byte, dataLen)
+	if len(data) >= 8 {
+		binary.LittleEndian.PutUint64(data, seq)
+	} else {
+		for i := range data {
+			data[i] = byte(seq >> (8 * i))
+		}
+	}
+
+	msg := solana.Message{
+		Header: solana.MessageHeader{
+			NumRequiredSignatures:       1,
+			NumReadonlyUnsignedAccounts: 1,
+		},
+		AccountKeys:     solana.PublicKeySlice{payerWallet.PublicKey(), solana.SystemProgramID},
+		RecentBlockhash: solana.Hash{},
+		Instructions: []solana.CompiledInstruction{{
+			ProgramIDIndex: 1,
+			Accounts:       []uint16{0},
+			Data:           data,
+		}},
+	}
+	if _, err := msg.SetVersion(solana.MessageVersionV1); err != nil {
+		return nil, fmt.Errorf("set v1 message version: %w", err)
+	}
+	tx := &solana.Transaction{Message: msg}
+	if _, err := tx.Sign(func(key solana.PublicKey) *solana.PrivateKey {
+		if payerWallet.PublicKey().Equals(key) {
+			return &payerWallet.PrivateKey
+		}
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("sign v1 transaction: %w", err)
+	}
+	return tx.MarshalBinary()
+}
+
+// MustSignedV1Wire panics if SignedV1Wire fails.
+func MustSignedV1Wire(seq uint64, dataLen int) []byte {
+	wire, err := SignedV1Wire(seq, dataLen)
+	if err != nil {
+		panic(err)
+	}
+	return wire
 }
 
 // DestPubkey returns the transfer destination used by transfer fixtures.

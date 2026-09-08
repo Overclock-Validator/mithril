@@ -1,9 +1,16 @@
 package costmodel
 
 import (
+	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/gagliardetto/solana-go"
+)
+
+var (
+	secp256kPrecompileID  solana.PublicKey = addresses.Secp256kPrecompileAddr
+	ed25519PrecompileID   solana.PublicKey = addresses.Ed25519PrecompileAddr
+	secp256r1PrecompileID solana.PublicKey = addresses.Secp256r1PrecompileAddr
 )
 
 // TransactionCost is the estimated block-cost budget a transaction consumes.
@@ -37,20 +44,24 @@ func EstimateTransactionCost(tx *solana.Transaction, feats *features.Features) (
 		return TransactionCost{}, err
 	}
 
-	limits, err := sealevel.ComputeBudgetExecuteInstructions(instrs, feats)
+	limits, err := sealevel.ComputeBudgetLimitsForTransaction(tx, instrs, feats)
 	if err != nil {
 		// A compute-budget parse failure yields zero execution cost; the transaction will not execute.
 		return TransactionCost{
-			SignatureCost: signatureCost(tx),
-			WriteLockCost: writeLockCost(countWriteLocks(tx)),
-			DataBytesCost: instructionDataCost(tx),
+			SignatureCost:    signatureCost(tx, instrs, feats),
+			WriteLockCost:    writeLockCost(countWriteLocks(tx)),
+			DataBytesCost:    instructionDataCost(tx),
 			WritableAccounts: writableAccounts(tx),
 		}, nil
 	}
 
 	loadedDataCost := loadedAccountsDataSizeCost(limits.LoadedAccountBytes)
+	// Banking-stage admission must reserve at least one page for the fee
+	// payer, including V1 transactions whose inline loaded-data limit is zero.
+	// Agave applies this floor in QosService after calculating the raw cost.
+	loadedDataCost = max(loadedDataCost, uint64(HeapCost))
 	return TransactionCost{
-		SignatureCost:              signatureCost(tx),
+		SignatureCost:              signatureCost(tx, instrs, feats),
 		WriteLockCost:              writeLockCost(countWriteLocks(tx)),
 		DataBytesCost:              instructionDataCost(tx),
 		ProgramsExecutionCost:      uint64(limits.ComputeUnitLimit),
@@ -60,8 +71,31 @@ func EstimateTransactionCost(tx *solana.Transaction, feats *features.Features) (
 	}, nil
 }
 
-func signatureCost(tx *solana.Transaction) uint64 {
-	return uint64(len(tx.Signatures)) * SignatureCost
+func signatureCost(tx *solana.Transaction, instrs []sealevel.Instruction, feats *features.Features) uint64 {
+	cost := uint64(len(tx.Signatures)) * SignatureCost
+	ed25519Cost := uint64(Ed25519VerifyCost)
+	if feats != nil && feats.IsActive(features.Ed25519PrecompileVerifyStrict) {
+		ed25519Cost = Ed25519VerifyStrictCost
+	}
+	secp256r1Enabled := feats != nil && feats.IsActive(features.EnableSecp256r1Precompile)
+
+	for _, instr := range instrs {
+		if len(instr.Data) == 0 {
+			continue
+		}
+		numSignatures := uint64(instr.Data[0])
+		switch instr.ProgramId {
+		case secp256kPrecompileID:
+			cost += numSignatures * Secp256k1VerifyCost
+		case ed25519PrecompileID:
+			cost += numSignatures * ed25519Cost
+		case secp256r1PrecompileID:
+			if secp256r1Enabled {
+				cost += numSignatures * Secp256r1VerifyCost
+			}
+		}
+	}
+	return cost
 }
 
 func writeLockCost(num uint64) uint64 {
@@ -115,8 +149,12 @@ func writableAccounts(tx *solana.Transaction) []solana.PublicKey {
 	for i := 0; i < numWritableSigners && i < numKeys; i++ {
 		out = append(out, tx.Message.AccountKeys[i])
 	}
-	start := numSigners + int(hdr.NumReadonlyUnsignedAccounts)
-	for i := start; i < numKeys; i++ {
+	start := numSigners
+	end := numKeys - int(hdr.NumReadonlyUnsignedAccounts)
+	if end < start {
+		end = start
+	}
+	for i := start; i < end; i++ {
 		out = append(out, tx.Message.AccountKeys[i])
 	}
 	return out

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/tpu/sink"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/txfixture"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/wire"
+	"github.com/stretchr/testify/require"
 )
 
 func TestWireSanitizeAcceptsValidFixture(t *testing.T) {
@@ -36,6 +38,62 @@ func TestPipelineEndToEnd(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+func TestPipelineV1FeatureAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		enabled    func() bool
+		wantAtSink bool
+	}{
+		{name: "nil_fails_closed", enabled: nil, wantAtSink: false},
+		{name: "inactive", enabled: func() bool { return false }, wantAtSink: false},
+		{name: "active", enabled: func() bool { return true }, wantAtSink: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			noop := &sink.Noop{}
+			p, ingress := Start(context.Background(), Config{
+				SigverifyWorkers: 1,
+				TxV1Enabled:      tc.enabled,
+				Sink:             noop,
+			})
+			defer p.Stop()
+
+			wireTx := txfixture.MustSignedV1Wire(11, 32)
+			requireEnqueue(t, ingress, packet.Owned(wireTx))
+			require.Eventually(t, func() bool {
+				stats := p.Stats()
+				return stats.Dedup.DroppedUnsupportedVersion+
+					stats.Sigverify.VerifiedPackets+stats.Sigverify.DroppedSigverify == 1
+			}, 2*time.Second, 5*time.Millisecond)
+			require.Equal(t, tc.wantAtSink, noop.Snapshot().InPackets == 1)
+		})
+	}
+}
+
+func TestPipelineV1ActivationDoesNotPoisonDedup(t *testing.T) {
+	var enabled atomic.Bool
+	noop := &sink.Noop{}
+	p, ingress := Start(context.Background(), Config{
+		SigverifyWorkers: 1,
+		TxV1Enabled:      enabled.Load,
+		Sink:             noop,
+	})
+	defer p.Stop()
+
+	wireTx := txfixture.MustSignedV1Wire(12, 32)
+	requireEnqueue(t, ingress, packet.Owned(wireTx))
+	require.Eventually(t, func() bool {
+		return p.Stats().Dedup.DroppedUnsupportedVersion == 1
+	}, 2*time.Second, 5*time.Millisecond)
+	require.Zero(t, p.Stats().Dedup.DroppedDedup)
+
+	enabled.Store(true)
+	requireEnqueue(t, ingress, packet.Owned(wireTx))
+	require.Eventually(t, func() bool {
+		return noop.Snapshot().InPackets == 1
+	}, 2*time.Second, 5*time.Millisecond)
+	require.Zero(t, p.Stats().Dedup.DroppedDedup)
 }
 
 func requireEnqueue(t *testing.T, ingress chan<- packet.Packet, pkt packet.Packet) {
