@@ -99,8 +99,8 @@ github.com/ethereum/go-ethereum v1.15.12-0.20250620111820-f26b5653e8bf h1:JcGe2d
 github.com/ethereum/go-ethereum v1.15.12-0.20250620111820-f26b5653e8bf/go.mod h1:ngYIvmMAYdo4sGW9cGzLvSsPGhDOOzL0jK5S5iXpj0g=
 github.com/fatih/color v1.18.0 h1:S8gINlzdQ840/4pfAwic/ZE0djQEH3wM94VfqLTZcOM=
 github.com/fatih/color v1.18.0/go.mod h1:4FelSpRwEGDpQ12mAdzqdOukCy4u8WUtOY6lkT/6HfU=
-github.com/filecoin-project/go-jsonrpc v0.8.0 h1:2yqlN3Vd8Gx5UtA3fib7tQu2aW1cSOJt253LEBWExo4=
-github.com/filecoin-project/go-jsonrpc v0.8.0/go.mod h1:p8WGOwQGYbFugSdK7qKIGhhb1VVcQ2rtBLdEiik1QWI=
+github.com/filecoin-project/go-jsonrpc v0.10.2 h1:Lk1IE43n1KUuOanvD5Pl2t3zX+3B6Ed4kaP0KSWn68k=
+github.com/filecoin-project/go-jsonrpc v0.10.2/go.mod h1:U4dFi7TqMb1t5Fp5sTfiF1rX+cPrK/C/q4twXYNxyss=
 github.com/frankban/quicktest v1.14.6 h1:7Xjx+VpznH+oBnejlPUj8oUpdxnVs4f8XU8WnHkI4W8=
 github.com/frankban/quicktest v1.14.6/go.mod h1:4ptaffx2x8+WTWXmUCuVU6aPUX1/Mz7zb5vbUoiM6w0=
 github.com/fsnotify/fsnotify v1.9.0 h1:2Ml+OJNzbYCTzsxtv8vKSFD9PbJjmhYF14k/jKC7S9k=
