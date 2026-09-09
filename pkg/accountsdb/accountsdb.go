@@ -705,12 +705,27 @@ type AccountReadStats struct {
 	CachePublicationEpochRejected    bool
 }
 
+// checkAccountReadsUsable admits reads only while the production index is
+// usable, including reads satisfied entirely by caches or pending writes. A
+// failed decided fold retains pendingFold for recovery; it must not admit new
+// readers into that epoch after poisoning the index. Reads already admitted
+// may finish against their pinned view.
+func (accountsDb *AccountsDb) checkAccountReadsUsable() error {
+	if accountsDb.ProductionIndex != nil {
+		return accountsDb.ProductionIndex.checkUsable()
+	}
+	return nil
+}
+
 func (accountsDb *AccountsDb) GetAccount(slot uint64, pubkey solana.PublicKey) (*accounts.Account, error) {
 	if accountsDb == nil {
 		return nil, ErrNoAccount
 	}
 	accountsDb.appendVecReadMu.RLock()
 	defer accountsDb.appendVecReadMu.RUnlock()
+	if err := accountsDb.checkAccountReadsUsable(); err != nil {
+		return nil, err
+	}
 	accts := accountsDb.getStoreInProgressAccounts([]solana.PublicKey{pubkey})
 	if accts[0] != nil {
 		return accts[0], nil
@@ -727,6 +742,9 @@ func (accountsDb *AccountsDb) GetAccountWithStats(slot uint64, pubkey solana.Pub
 	accountsDb.appendVecReadMu.RLock()
 	stats.AppendVecPinWaitNanoseconds = uint64(time.Since(start).Nanoseconds())
 	defer accountsDb.appendVecReadMu.RUnlock()
+	if err := accountsDb.checkAccountReadsUsable(); err != nil {
+		return nil, stats, err
+	}
 	start = time.Now()
 	accts := accountsDb.getStoreInProgressAccounts([]solana.PublicKey{pubkey})
 	stats.InProgressNanoseconds = uint64(time.Since(start).Nanoseconds())
@@ -741,6 +759,9 @@ func (accountsDb *AccountsDb) GetAccountWithStats(slot uint64, pubkey solana.Pub
 func (accountsDb *AccountsDb) getStoredAccount(slot uint64, pubkey solana.PublicKey) (*accounts.Account, error) {
 	accountsDb.appendVecReadMu.RLock()
 	defer accountsDb.appendVecReadMu.RUnlock()
+	if err := accountsDb.checkAccountReadsUsable(); err != nil {
+		return nil, err
+	}
 	return accountsDb.getStoredAccountPinned(slot, pubkey)
 }
 

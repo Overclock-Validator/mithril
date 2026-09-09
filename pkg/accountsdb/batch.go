@@ -375,6 +375,9 @@ func (db *AccountsDb) getAccountsBatchWithStatsMode(
 			db.appendVecReadMu.RUnlock()
 		}
 	}()
+	if err := db.checkAccountReadsUsable(); err != nil {
+		return nil, stats, err
+	}
 
 	phaseStart = time.Now()
 	out := db.getStoreInProgressAccounts(pks)
