@@ -1,11 +1,13 @@
 package accountsdb
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"os"
 
 	"github.com/gagliardetto/solana-go"
@@ -37,7 +39,8 @@ func newMergedShardIndexSource(base *ShardedStreamBaseShard, delta *DeltaCheckpo
 type shardedBaseMergeCursor struct {
 	shard    *ShardedStreamBaseShard
 	catalog  *PersistentExtentCatalog
-	scan     *os.File
+	reader   *bufio.Reader
+	encoded  [shardedBaseScanRecordSize]byte
 	ordinal  uint64
 	bodyCRC  hash32
 	previous solana.PublicKey
@@ -56,8 +59,15 @@ func newShardedBaseMergeCursor(
 	catalog *PersistentExtentCatalog,
 	scan *os.File,
 ) *shardedBaseMergeCursor {
+	// Keep reads sequential and bounded without changing the file's offset.
+	records := io.NewSectionReader(
+		scan, shardedBaseMetadataSize, int64(shard.metadata.KeyCount)*shardedBaseScanRecordSize,
+	)
 	return &shardedBaseMergeCursor{
-		shard: shard, catalog: catalog, scan: scan, bodyCRC: crc32.New(shardedBaseCRC),
+		shard:   shard,
+		catalog: catalog,
+		reader:  bufio.NewReaderSize(records, 256<<10),
+		bodyCRC: crc32.New(shardedBaseCRC),
 	}
 }
 
@@ -73,9 +83,8 @@ func (cursor *shardedBaseMergeCursor) next() (solana.PublicKey, AccountIndexEntr
 		return solana.PublicKey{}, AccountIndexEntry{}, false, nil
 	}
 
-	var encoded [shardedBaseScanRecordSize]byte
-	offset := int64(shardedBaseMetadataSize) + int64(cursor.ordinal)*shardedBaseScanRecordSize
-	if _, err := cursor.scan.ReadAt(encoded[:], offset); err != nil {
+	encoded := cursor.encoded[:]
+	if _, err := io.ReadFull(cursor.reader, encoded); err != nil {
 		return solana.PublicKey{}, AccountIndexEntry{}, false, fmt.Errorf(
 			"accountsdb: read shard %d base record %d: %w",
 			cursor.shard.metadata.ShardID,
