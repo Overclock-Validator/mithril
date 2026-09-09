@@ -1039,7 +1039,7 @@ func (index *ProductionAccountIndex) publishCheckpoint(
 	if root.Generation == ^uint64(0) {
 		return index.setPoison(errors.New("accountsdb: root catalog generation exhausted"))
 	}
-	artifacts, err := IdentifyShardedDeltaCheckpointArtifacts(
+	verified, err := identifyShardedDeltaCheckpointArtifacts(
 		index.root,
 		publication.Directory,
 		publication.Next,
@@ -1047,6 +1047,7 @@ func (index *ProductionAccountIndex) publishCheckpoint(
 	if err != nil {
 		return err
 	}
+	artifacts := verified.artifacts
 	artifactBytes, err := checkpointArtifactSetBytes(artifacts)
 	if err != nil {
 		return err
@@ -1126,7 +1127,7 @@ func (index *ProductionAccountIndex) publishCheckpoint(
 		return err
 	}
 
-	nextPayload, resources, obsolete, err := current.DeriveWithCheckpoint(nextRoot, effectivePublication)
+	nextPayload, resources, obsolete, err := current.deriveWithCheckpoint(nextRoot, effectivePublication, &verified)
 	if err != nil {
 		return err
 	}

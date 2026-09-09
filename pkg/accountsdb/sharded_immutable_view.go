@@ -293,7 +293,48 @@ func IdentifyShardedDeltaCheckpointArtifacts(
 	directory string,
 	handle *ShardedDeltaCheckpointHandle,
 ) (ShardedDeltaCheckpointArtifactSet, error) {
-	var result ShardedDeltaCheckpointArtifactSet
+	verified, err := identifyShardedDeltaCheckpointArtifacts(root, directory, handle)
+	return verified.artifacts, err
+}
+
+// verifiedShardedDeltaCheckpointArtifacts is a publication-scoped receipt for
+// a complete hash and descriptor check. It is reusable only while the caller
+// owns the checkpoint handle and excludes publication/cleanup (publishMu in
+// production). It is never persisted or reused across publications or opens.
+type verifiedShardedDeltaCheckpointArtifacts struct {
+	artifacts ShardedDeltaCheckpointArtifactSet
+	root      string
+	directory string
+	handle    *ShardedDeltaCheckpointHandle
+	fileInfos [3]os.FileInfo // index, records, descriptor, captured before hashing
+}
+
+func (verified verifiedShardedDeltaCheckpointArtifacts) validate(root, directory string, handle *ShardedDeltaCheckpointHandle) error {
+	if handle == nil || verified.handle != handle ||
+		!sameImmutablePath(root, verified.root) || !sameImmutablePath(directory, verified.directory) {
+		return fmt.Errorf("%w: verified checkpoint belongs to a different publication", ErrInvalidRootIndexCatalog)
+	}
+	for i, artifact := range []IndexCatalogArtifact{verified.artifacts.Index, verified.artifacts.Records, verified.artifacts.Descriptor} {
+		path, err := ResolveIndexCatalogArtifactPath(root, artifact)
+		if err != nil {
+			return err
+		}
+		if err := validateIndexCatalogArtifactPathComponents(root, artifact.RelativePath); err != nil {
+			return err
+		}
+		if err := validateRegularFilePathIdentity(path, verified.fileInfos[i]); err != nil {
+			return fmt.Errorf("%w: verified checkpoint artifact changed: %v", ErrInvalidRootIndexCatalog, err)
+		}
+	}
+	return nil
+}
+
+func identifyShardedDeltaCheckpointArtifacts(
+	root string,
+	directory string,
+	handle *ShardedDeltaCheckpointHandle,
+) (verifiedShardedDeltaCheckpointArtifacts, error) {
+	var result verifiedShardedDeltaCheckpointArtifacts
 	if handle == nil {
 		return result, errors.New("accountsdb: nil sharded delta checkpoint handle")
 	}
@@ -335,6 +376,15 @@ func IdentifyShardedDeltaCheckpointArtifacts(
 		)
 	}
 
+	// Capture identities before the stable full-file hashes, so replacing a
+	// path between hashing and handoff cannot authorize an unverified inode.
+	var fileInfos [3]os.FileInfo
+	for i, path := range []string{paths.index, paths.records, paths.descriptor} {
+		fileInfos[i], err = os.Lstat(path)
+		if err != nil {
+			return result, fmt.Errorf("accountsdb: inspect delta checkpoint artifact: %w", err)
+		}
+	}
 	indexArtifact, err := computeImmutableArtifactAtPath(root, paths.index)
 	if err != nil {
 		return result, fmt.Errorf("accountsdb: identify delta checkpoint index: %w", err)
@@ -364,14 +414,21 @@ func IdentifyShardedDeltaCheckpointArtifacts(
 		descriptor.Records.SHA256 != recordArtifact.SHA256 {
 		return result, fmt.Errorf("%w: checkpoint descriptor, files and retained handle disagree", ErrInvalidRootIndexCatalog)
 	}
-	return ShardedDeltaCheckpointArtifactSet{
-		Generation:      generation,
-		CoveredSequence: coveredSequence,
-		RecordCount:     recordCount,
-		Index:           indexArtifact,
-		Records:         recordArtifact,
-		Descriptor:      descriptorArtifact,
-	}, nil
+	result = verifiedShardedDeltaCheckpointArtifacts{
+		artifacts: ShardedDeltaCheckpointArtifactSet{
+			Generation:      generation,
+			CoveredSequence: coveredSequence,
+			RecordCount:     recordCount,
+			Index:           indexArtifact,
+			Records:         recordArtifact,
+			Descriptor:      descriptorArtifact,
+		},
+		root: root, directory: directory, handle: handle, fileInfos: fileInfos,
+	}
+	if err := result.validate(root, directory, handle); err != nil {
+		return verifiedShardedDeltaCheckpointArtifacts{}, err
+	}
+	return result, nil
 }
 
 func computeImmutableArtifactAtPath(root string, absolutePath string) (IndexCatalogArtifact, error) {
@@ -629,6 +686,16 @@ func (index *ShardedImmutableIndex) InitialCheckpointHandles() ([]*ShardedDeltaC
 func (index *ShardedImmutableIndex) DeriveWithCheckpoint(
 	rootNext *RootIndexCatalog,
 	publication ShardedMutableCheckpointPublication,
+) (*ShardedImmutableIndex, []*IndexGenerationResource, []*IndexGenerationResource, error) {
+	// Independent callers must always verify the complete artifacts. Only the
+	// serialized production publisher can supply a receipt from its own check.
+	return index.deriveWithCheckpoint(rootNext, publication, nil)
+}
+
+func (index *ShardedImmutableIndex) deriveWithCheckpoint(
+	rootNext *RootIndexCatalog,
+	publication ShardedMutableCheckpointPublication,
+	verified *verifiedShardedDeltaCheckpointArtifacts,
 ) (
 	next *ShardedImmutableIndex,
 	resources []*IndexGenerationResource,
@@ -665,10 +732,17 @@ func (index *ShardedImmutableIndex) DeriveWithCheckpoint(
 			expectedDirectory,
 		)
 	}
-	artifacts, err := IdentifyShardedDeltaCheckpointArtifacts(index.root, publication.Directory, publication.Next)
-	if err != nil {
+	if verified == nil {
+		identified, identifyErr := identifyShardedDeltaCheckpointArtifacts(index.root, publication.Directory, publication.Next)
+		if identifyErr != nil {
+			return nil, nil, nil, identifyErr
+		}
+		verified = &identified
+	}
+	if err := verified.validate(index.root, publication.Directory, publication.Next); err != nil {
 		return nil, nil, nil, err
 	}
+	artifacts := verified.artifacts
 	if artifacts.CoveredSequence != publication.CoveredSequence {
 		return nil, nil, nil, fmt.Errorf(
 			"%w: checkpoint physically covers %d, publication says %d",
