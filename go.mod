@@ -118,7 +118,7 @@ require (
 	github.com/dgryski/go-sip13 v0.0.0-20200911182023-62edffca9245
 	github.com/ethereum/go-ethereum v1.15.12-0.20250620111820-f26b5653e8bf
 	github.com/fatih/color v1.18.0 // indirect
-	github.com/filecoin-project/go-jsonrpc v0.8.0
+	github.com/filecoin-project/go-jsonrpc v0.10.2
 	github.com/gagliardetto/treeout v0.1.4 // indirect
 	github.com/gammazero/deque v1.0.0
 	github.com/go-logr/logr v1.4.3 // indirect
