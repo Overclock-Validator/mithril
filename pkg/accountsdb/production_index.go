@@ -728,37 +728,53 @@ func (index *ProductionAccountIndex) checkUsable() error {
 
 // LookupCandidate returns an exact mutable result or a probabilistic cold-base
 // candidate. A found exact tombstone has found=false so callers never expose an
-// older base record.
+// older base record. Account reads use lookupCandidatePinned to retain the
+// candidate's generation through appendvec verification.
 func (index *ProductionAccountIndex) LookupCandidate(
 	key solana.PublicKey,
 ) (AccountIndexEntry, accountIndexSource, bool, error) {
+	entry, source, found, pin, err := index.lookupCandidatePinned(key)
+	if pin != nil {
+		defer pin.Close()
+	}
+	return entry, source, found, err
+}
+
+// lookupCandidatePinned transfers ownership of the base generation pin to the
+// caller. Keep it until appendvec verification finishes: a false positive can
+// refer to a retired file whose marker is retained by this generation.
+// Exact mutable results and misses need no base pin.
+func (index *ProductionAccountIndex) lookupCandidatePinned(
+	key solana.PublicKey,
+) (AccountIndexEntry, accountIndexSource, bool, *IndexReadView, error) {
 	if err := index.checkUsable(); err != nil {
-		return AccountIndexEntry{}, accountIndexSourceNone, false, err
+		return AccountIndexEntry{}, accountIndexSourceNone, false, nil, err
 	}
 	value, found, err := index.mutable.LookupWithError(key)
 	if err != nil {
-		return AccountIndexEntry{}, accountIndexSourceNone, false, err
+		return AccountIndexEntry{}, accountIndexSourceNone, false, nil, err
 	}
 	if found {
 		if value.Tombstone {
-			return AccountIndexEntry{}, accountIndexSourceNone, false, nil
+			return AccountIndexEntry{}, accountIndexSourceNone, false, nil, nil
 		}
-		return value.Entry, accountIndexSourceDelta, true, nil
+		return value.Entry, accountIndexSourceDelta, true, nil, nil
 	}
 	view, err := index.view.Acquire()
 	if err != nil {
-		return AccountIndexEntry{}, accountIndexSourceNone, false, err
+		return AccountIndexEntry{}, accountIndexSourceNone, false, nil, err
 	}
-	defer view.Close()
 	immutable, ok := view.Payload().(*ShardedImmutableIndex)
 	if !ok || immutable == nil {
-		return AccountIndexEntry{}, accountIndexSourceNone, false, errors.New("accountsdb: invalid immutable index payload")
+		_ = view.Close()
+		return AccountIndexEntry{}, accountIndexSourceNone, false, nil, errors.New("accountsdb: invalid immutable index payload")
 	}
 	entry, found, err := immutable.LookupBaseCandidate(key)
 	if err != nil || !found {
-		return AccountIndexEntry{}, accountIndexSourceNone, false, err
+		_ = view.Close()
+		return AccountIndexEntry{}, accountIndexSourceNone, false, nil, err
 	}
-	return entry, accountIndexSourceBase, true, nil
+	return entry, accountIndexSourceBase, true, view, nil
 }
 
 // ProductionAccountIndexSnapshot pins a coherent mutable epoch and the root

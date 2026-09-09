@@ -65,6 +65,8 @@ type AccountsDb struct {
 	pendingFold      map[[32]byte]dedupedVersion
 	commonAdmission  *commonCacheAdmission
 	batchHooks       batchReadTestHooks
+	// Test-only scheduling hook between candidate lookup and file verification.
+	afterAccountIndexLookup func()
 
 	// appendVecReadMu pins appendvec paths from before an index snapshot until
 	// its file reads complete. Compaction/rewind take the write side across an
@@ -925,41 +927,42 @@ func (accountsDb *AccountsDb) pendingFoldContainsLocked(pubkey solana.PublicKey)
 	return ok
 }
 
-// lookupAccountIndexCandidate resolves the exact mutable head first. An exact
+// lookupAccountIndexCandidatePinned resolves the exact mutable head first. An exact
 // tombstone stops resolution. Only an absent delta probes the immutable base,
 // whose fingerprint-backed result remains a candidate until its appendvec
-// pubkey is checked.
-func (accountsDb *AccountsDb) lookupAccountIndexCandidate(pubkey solana.PublicKey) (AccountIndexEntry, accountIndexSource, bool, error) {
+// pubkey is checked. The caller must close any returned generation pin after
+// that verification, including error paths.
+func (accountsDb *AccountsDb) lookupAccountIndexCandidatePinned(pubkey solana.PublicKey) (AccountIndexEntry, accountIndexSource, bool, *IndexReadView, error) {
 	if accountsDb.ProductionIndex != nil {
-		entry, source, found, err := accountsDb.ProductionIndex.LookupCandidate(pubkey)
+		entry, source, found, pin, err := accountsDb.ProductionIndex.lookupCandidatePinned(pubkey)
 		if err != nil {
-			return AccountIndexEntry{}, accountIndexSourceNone, false, fmt.Errorf("production index lookup %s: %w", pubkey, err)
+			return AccountIndexEntry{}, accountIndexSourceNone, false, nil, fmt.Errorf("production index lookup %s: %w", pubkey, err)
 		}
-		return entry, source, found, nil
+		return entry, source, found, pin, nil
 	}
 	if accountsDb.Index != nil {
 		value, ok, err := accountsDb.Index.LookupWithError(pubkey)
 		if err != nil {
-			return AccountIndexEntry{}, accountIndexSourceNone, false, fmt.Errorf("mutable index lookup %s: %w", pubkey, err)
+			return AccountIndexEntry{}, accountIndexSourceNone, false, nil, fmt.Errorf("mutable index lookup %s: %w", pubkey, err)
 		}
 		if ok {
 			if value.Tombstone {
-				return AccountIndexEntry{}, accountIndexSourceNone, false, nil
+				return AccountIndexEntry{}, accountIndexSourceNone, false, nil, nil
 			}
-			return value.Entry, accountIndexSourceDelta, true, nil
+			return value.Entry, accountIndexSourceDelta, true, nil, nil
 		}
 	}
 	if accountsDb.BaseIndex == nil {
-		return AccountIndexEntry{}, accountIndexSourceNone, false, nil
+		return AccountIndexEntry{}, accountIndexSourceNone, false, nil, nil
 	}
 	entry, found, err := accountsDb.BaseIndex.LookupCandidate(pubkey)
 	if err != nil {
-		return AccountIndexEntry{}, accountIndexSourceNone, false, fmt.Errorf("base index lookup %s: %w", pubkey, err)
+		return AccountIndexEntry{}, accountIndexSourceNone, false, nil, fmt.Errorf("base index lookup %s: %w", pubkey, err)
 	}
 	if !found {
-		return AccountIndexEntry{}, accountIndexSourceNone, false, nil
+		return AccountIndexEntry{}, accountIndexSourceNone, false, nil, nil
 	}
-	return entry, accountIndexSourceBase, true, nil
+	return entry, accountIndexSourceBase, true, nil, nil
 }
 
 func (accountsDb *AccountsDb) hasAccountIndex() bool {
@@ -995,10 +998,14 @@ func (accountsDb *AccountsDb) applyAccountIndexMutationsLocked(
 // result by checking the full pubkey in its appendvec record. Delta mappings
 // are exact by construction and need no second index-membership check.
 func (accountsDb *AccountsDb) lookupExactAccountIndexEntry(pubkey solana.PublicKey) (AccountIndexEntry, accountIndexSource, bool, error) {
-	entry, source, found, err := accountsDb.lookupAccountIndexCandidate(pubkey)
+	entry, source, found, pin, err := accountsDb.lookupAccountIndexCandidatePinned(pubkey)
+	if pin != nil {
+		defer pin.Close()
+	}
 	if err != nil || !found || source != accountIndexSourceBase {
 		return entry, source, found, err
 	}
+	fire(accountsDb.afterAccountIndexLookup)
 	matches, err := accountsDb.baseIndexEntryMatchesPubkey(pubkey, entry)
 	if err != nil {
 		return AccountIndexEntry{}, accountIndexSourceNone, false, err
@@ -1015,20 +1022,25 @@ func (accountsDb *AccountsDb) lookupExactAccountIndexEntry(pubkey solana.PublicK
 // open/close pairs merely to validate StreamHash membership.
 func (accountsDb *AccountsDb) lookupExactAccountIndexEntries(
 	pubkeys []solana.PublicKey,
-) ([]AccountIndexEntry, []bool, error) {
-	entries := make([]AccountIndexEntry, len(pubkeys))
-	found := make([]bool, len(pubkeys))
+) (entries []AccountIndexEntry, found []bool, retErr error) {
+	entries = make([]AccountIndexEntry, len(pubkeys))
+	found = make([]bool, len(pubkeys))
 	sources := make([]accountIndexSource, len(pubkeys))
 	if accountsDb.ProductionIndex != nil {
 		snapshot, err := accountsDb.ProductionIndex.NewSnapshot(pubkeys)
 		if err != nil {
 			return nil, nil, err
 		}
+		// Verification below still needs this generation's retirement markers.
+		// The snapshot retains resources without holding the mutable state lock.
+		defer func() {
+			if closeErr := snapshot.Close(); closeErr != nil {
+				retErr = errors.Join(retErr, closeErr)
+			}
+		}()
 		values := make([]deltaIndexValue, len(pubkeys))
 		resolved := make([]bool, len(pubkeys))
-		lookupErr := snapshot.LookupBatch(context.Background(), values, sources, resolved)
-		closeErr := snapshot.Close()
-		if err := errors.Join(lookupErr, closeErr); err != nil {
+		if err := snapshot.LookupBatch(context.Background(), values, sources, resolved); err != nil {
 			return nil, nil, err
 		}
 		for i, ok := range resolved {
@@ -1038,7 +1050,10 @@ func (accountsDb *AccountsDb) lookupExactAccountIndexEntries(
 		}
 	} else {
 		if err := runBatchWorkers(context.Background(), len(pubkeys), func(i int) error {
-			entry, source, ok, err := accountsDb.lookupAccountIndexCandidate(pubkeys[i])
+			entry, source, ok, pin, err := accountsDb.lookupAccountIndexCandidatePinned(pubkeys[i])
+			if pin != nil {
+				defer pin.Close()
+			}
 			if err != nil {
 				return err
 			}
@@ -1049,6 +1064,7 @@ func (accountsDb *AccountsDb) lookupExactAccountIndexEntries(
 		}
 	}
 
+	fire(accountsDb.afterAccountIndexLookup)
 	type verificationGroup struct {
 		id      appendVecID
 		indexes []int
@@ -1173,13 +1189,17 @@ func readAccountIndexEntryPubkey(file *os.File, entry AccountIndexEntry) (solana
 
 // readIndexedAccount performs one union-index fetch + file-read attempt.
 func (accountsDb *AccountsDb) readIndexedAccount(pubkey solana.PublicKey) (*accounts.Account, error) {
-	acctIdxEntry, source, found, err := accountsDb.lookupAccountIndexCandidate(pubkey)
+	acctIdxEntry, source, found, pin, err := accountsDb.lookupAccountIndexCandidatePinned(pubkey)
+	if pin != nil {
+		defer pin.Close()
+	}
 	if err != nil {
 		return nil, err
 	}
 	if !found {
 		return nil, ErrNoAccount
 	}
+	fire(accountsDb.afterAccountIndexLookup)
 
 	appendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, acctIdxEntry.Slot, acctIdxEntry.FileId)
 

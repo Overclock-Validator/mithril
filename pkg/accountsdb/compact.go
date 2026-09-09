@@ -491,7 +491,10 @@ func (db *AccountsDb) compactFile(
 	isLive := func(rec appendVecScanRecord) (bool, error) {
 		// The source scan supplies the full key, and the complete tuple check is
 		// sufficient to reject a StreamHash false candidate without reading data.
-		curEntry, source, found, lookupErr := db.lookupAccountIndexCandidate(rec.Pubkey)
+		curEntry, source, found, pin, lookupErr := db.lookupAccountIndexCandidatePinned(rec.Pubkey)
+		if pin != nil {
+			defer pin.Close()
+		}
 		if lookupErr != nil {
 			return false, lookupErr
 		}

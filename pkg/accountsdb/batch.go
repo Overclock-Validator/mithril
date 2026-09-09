@@ -340,8 +340,8 @@ func (db *AccountsDb) getAccountsBatchWithStatsMode(
 	slot uint64,
 	pks []solana.PublicKey,
 	alreadyUnique bool,
-) ([]*accounts.Account, BatchReadStats, error) {
-	stats := BatchReadStats{RequestedKeys: uint64(len(pks)), DurableKeys: uint64(len(pks))}
+) (result []*accounts.Account, stats BatchReadStats, retErr error) {
+	stats = BatchReadStats{RequestedKeys: uint64(len(pks)), DurableKeys: uint64(len(pks))}
 	if len(pks) == 0 {
 		stats.UniqueKeys = 0
 		stats.UniqueDurableKeys = 0
@@ -425,6 +425,13 @@ func (db *AccountsDb) getAccountsBatchWithStatsMode(
 			db.readCacheEpochMu.RUnlock()
 			return nil, stats, fmt.Errorf("capture production account-index snapshot: %w", err)
 		}
+		// Retain the root through appendvec verification, including cancellation
+		// and error paths. This does not hold the mutable index's state lock.
+		defer func() {
+			if closeErr := productionSnapshot.Close(); closeErr != nil {
+				retErr = errors.Join(retErr, closeErr)
+			}
+		}()
 	} else if len(cold) > 0 && db.Index != nil {
 		// The cache probes and snapshot share one publication epoch. A fold
 		// cannot flip the index and refresh caches between these two views.
@@ -457,9 +464,6 @@ func (db *AccountsDb) getAccountsBatchWithStatsMode(
 		locations, found, err = resolveBatchAccountLocations(ctx, indexSnapshot, pks, cold, out)
 	}
 	var closeErr error
-	if productionSnapshot != nil {
-		closeErr = productionSnapshot.Close()
-	}
 	if indexSnapshot != nil {
 		closeErr = indexSnapshot.Close()
 	}
@@ -469,15 +473,16 @@ func (db *AccountsDb) getAccountsBatchWithStatsMode(
 	if closeErr != nil {
 		return nil, stats, fmt.Errorf("close account index snapshot: %w", closeErr)
 	}
-	// The exact mutable epoch is now fully materialized in locations/found.
-	// Release its read pin before issuing potentially cold immutable mmap probes
-	// so a fold publication is never delayed by base-index page faults.
+	// The legacy mutable epoch is now fully materialized in locations/found,
+	// so its read lock can be released before cold base-index probes. The V2
+	// snapshot instead keeps its generation resources pinned through file I/O.
 	if productionSnapshot == nil {
 		if err := resolveBatchBaseCandidates(ctx, db.BaseIndex, pks, cold, out, locations, found); err != nil {
 			return nil, stats, err
 		}
 	}
 	stats.IndexLookupNanoseconds = snapshotSetupNanoseconds + uint64(time.Since(phaseStart).Nanoseconds())
+	fire(db.afterAccountIndexLookup)
 
 	phaseStart = time.Now()
 	planned := locations[:0]
@@ -626,6 +631,11 @@ func (db *AccountsDb) getAccountsBatchWithStatsMode(
 		return nil, stats, err
 	}
 
+	if productionSnapshot != nil {
+		if err := productionSnapshot.Close(); err != nil {
+			return nil, stats, fmt.Errorf("close account index snapshot: %w", err)
+		}
+	}
 	// File paths are no longer needed. Let compaction/rewind proceed while the
 	// decoded values pass through the epoch-checked selective cache policy.
 	db.appendVecReadMu.RUnlock()
