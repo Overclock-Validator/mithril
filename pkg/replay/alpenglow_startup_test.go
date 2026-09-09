@@ -75,29 +75,44 @@ func validAlpenglowStartupAccounts(t *testing.T, activationSlot uint64) map[sola
 	}
 }
 
+func openAlpenglowTestAccountsDB(t *testing.T) *accountsdb.AccountsDb {
+	t.Helper()
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "accounts"), 0o755))
+	require.NoError(t, accountsdb.WriteLargestFileID(dir, 0))
+	require.NoError(t, accountsdb.WriteBootstrapHighFileID(dir, 0))
+
+	indexConfig := accountsdb.DefaultProductionAccountIndexConfig()
+	indexConfig.ShardCount = 1
+	indexConfig.CheckpointWorkers = 1
+	indexConfig.MaxConcurrentSeals = 1
+	require.NoError(t, accountsdb.InitializeEmptyProductionAccountIndex(t.Context(), dir, indexConfig))
+
+	db, err := accountsdb.OpenDbWithProductionAccountIndexConfig(dir, indexConfig)
+	require.NoError(t, err)
+	db.RootedDurable = true
+	db.InitCaches()
+	t.Cleanup(func() {
+		require.NoError(t, db.CloseDb())
+	})
+	return db
+}
+
 func TestValidateAlpenglowStartupState(t *testing.T) {
 	reader := alpenglowStartupTestReader{accounts: validAlpenglowStartupAccounts(t, 486_000)}
 	require.NoError(t, validateAlpenglowStartupState(reader, 975_511))
 }
 
 func TestValidateAlpenglowStartupStateWithAccountsDB(t *testing.T) {
-	dir := t.TempDir()
-	require.NoError(t, os.MkdirAll(filepath.Join(dir, "accounts"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "largest_file_id"), make([]byte, 8), 0o644))
+	db := openAlpenglowTestAccountsDB(t)
 
-	db, err := accountsdb.OpenDb(dir)
-	require.NoError(t, err)
-	db.InitCaches()
-	t.Cleanup(db.CloseDb)
-
-	stored := make(chan struct{})
 	startupAccounts := validAlpenglowStartupAccounts(t, 486_000)
 	toStore := make([]*accounts.Account, 0, len(startupAccounts))
 	for _, acct := range startupAccounts {
 		toStore = append(toStore, acct)
 	}
-	require.NoError(t, db.StoreAccounts(toStore, 486_000, func() { close(stored) }))
-	<-stored
+	_, err := db.CommitBatch([]accounts.SlotDelta{{Slot: 486_000, Delta: toStore}}, 486_000, nil, nil)
+	require.NoError(t, err)
 
 	require.NoError(t, ValidateAlpenglowStartupState(db, 975_511))
 }
