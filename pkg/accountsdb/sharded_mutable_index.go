@@ -2765,6 +2765,22 @@ func (idx *ShardedMutableAccountIndex) compactJournal(ctx context.Context, prune
 				*pruneThrough, idx.seq,
 			)
 		}
+		// Avoid rewriting the hot-state journal when no retirement can be
+		// pruned. Explicit CompactJournal calls still compact ordinary history.
+		if pruneThrough != nil {
+			eligible := false
+			for _, sequence := range idx.retired {
+				if sequence <= *pruneThrough {
+					eligible = true
+					break
+				}
+			}
+			if !eligible {
+				idx.stateMu.Unlock()
+				idx.writeMu.Unlock()
+				return ctx.Err()
+			}
+		}
 		if idx.rewriting {
 			wait := idx.progress
 			idx.stateMu.Unlock()
