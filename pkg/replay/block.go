@@ -2626,6 +2626,27 @@ func ReplayBlocks(
 				}
 			}
 
+			// A complete Turbine candidate may carry an invalid reward certificate
+			// and be skipped by the cluster. Reject it before ObserveBlock/voting
+			// or any bank changes, while the selected parent is still untouched.
+			if alpenglowMode && !block.IsSkipped {
+				if validationErr := validatePreConsensusRewardCertificates(block, epochSchedule, block.AlpenglowShredVersion); validationErr != nil {
+					if !IsInvalidRewardCertificateError(validationErr) {
+						result.Error = fmt.Errorf("pre-consensus reward validation failed at slot %d: %w", block.Slot, validationErr)
+						mlog.Log.Errorf("%v", result.Error)
+						break
+					}
+					if quarantineErr := blockStream.QuarantineInvalidAlpenglowBlock(block); quarantineErr != nil {
+						result.Error = fmt.Errorf("pre-consensus reward validation failed at slot %d and the source could not quarantine it (%v): %w",
+							block.Slot, quarantineErr, validationErr)
+						mlog.Log.Errorf("%v", result.Error)
+						break
+					}
+					mlog.Log.Warnf("replay: %v; exact Alpenglow candidate quarantined before ObserveBlock/voting", validationErr)
+					continue
+				}
+			}
+
 			// Alpenglow: feed the observed block to the consensus engine. This is a
 			// consensus boundary, not telemetry: a latched pool/tracker fault stops
 			// replay before execution or durable promotion can continue.
