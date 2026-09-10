@@ -54,6 +54,7 @@ in {
         StateDirectory = "mithril";
         CacheDirectory = "mithril";
         RuntimeDirectory = "mithril";
+        LimitNOFILE = 65536;
         ReadWritePaths = rwPaths;
       }
       // lib.optionalAttrs fileLoggingEnabled {

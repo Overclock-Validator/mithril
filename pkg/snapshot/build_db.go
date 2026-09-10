@@ -1,9 +1,11 @@
 package snapshot
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
-	"encoding/binary"
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,7 +20,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/progress"
 	"github.com/Overclock-Validator/mithril/pkg/statsd"
 	"github.com/Overclock-Validator/mithril/pkg/txstatus"
-	"github.com/cockroachdb/pebble"
+	"github.com/gagliardetto/solana-go"
 	"github.com/panjf2000/ants/v2"
 )
 
@@ -28,6 +30,8 @@ const (
 	DefaultSnapshotAppendVecCopyingWorkers    = 32
 	DefaultSnapshotIndexShards                = 64
 	DefaultSnapshotMaxConcurrentFlushers      = 8
+	defaultSnapshotIndexEntryBatchSize        = 20_000
+	SnapshotIndexRunDirName                   = "accounts_index_runs"
 )
 
 var (
@@ -38,10 +42,66 @@ var (
 	SnapshotIndexTempDir               string
 )
 
-// CleanAccountsDbDir removes all artifacts from a previous incomplete snapshot run.
-// This prevents corruption from Ctrl+C or partial downloads.
-// Exported so it can be called early in startup before any failures.
-func CleanAccountsDbDir(accountsDbDir string) {
+// CleanAccountsDbDir removes all artifacts from a previous incomplete snapshot
+// run while holding the V2 store-wide exclusive lock. It deliberately leaves
+// the stable lockfile in place: unlinking it could split ownership between two
+// processes holding different inodes.
+func CleanAccountsDbDir(accountsDbDir string) error {
+	if err := os.MkdirAll(accountsDbDir, 0o775); err != nil {
+		return fmt.Errorf("create AccountsDB cleanup root: %w", err)
+	}
+	return accountsdb.WithExclusiveProductionAccountIndexStore(accountsDbDir, func() error {
+		return cleanAccountsDbDirLocked(accountsDbDir)
+	})
+}
+
+func beginSnapshotBootstrap(
+	accountsDbDir string,
+) (*accountsdb.ProductionAccountIndexStoreGuard, error) {
+	if err := os.MkdirAll(accountsDbDir, 0o775); err != nil {
+		return nil, fmt.Errorf("create AccountsDB bootstrap root: %w", err)
+	}
+	guard, err := accountsdb.AcquireExclusiveProductionAccountIndexStore(accountsDbDir)
+	if err != nil {
+		return nil, err
+	}
+	if err := cleanAccountsDbDirLocked(accountsDbDir); err != nil {
+		return nil, errors.Join(err, guard.Close())
+	}
+	return guard, nil
+}
+
+func cleanAccountsDbDirLocked(accountsDbDir string) error {
+	var cleanupErr error
+	record := func(path string, err error) {
+		if err == nil || os.IsNotExist(err) {
+			return
+		}
+		mlog.Log.Errorf("failed to remove %s: %v", path, err)
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove %s: %w", path, err))
+	}
+	removeRegular := func(path string) {
+		info, err := os.Lstat(path)
+		if err != nil {
+			record(path, err)
+			return
+		}
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return
+		}
+		record(path, os.Remove(path))
+	}
+	removeRealDirectory := func(path string) {
+		info, err := os.Lstat(path)
+		if err != nil {
+			record(path, err)
+			return
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return
+		}
+		record(path, os.RemoveAll(path))
+	}
 	// List of all files/directories that may be left from a previous incomplete run
 	artifacts := []string{
 		"accounts",
@@ -53,24 +113,106 @@ func CleanAccountsDbDir(accountsDbDir string) {
 		"transaction-status-checkpoints",
 		"mithril_db",
 		"mithril_db_log_shards",
+		SnapshotIndexRunDirName,
+		"mithril_db_build", // legacy temporary Pebble snapshot-index source
+		accountsdb.StreamIndexFileName,
+		accountsdb.StreamIndexFileName + ".partial",
+		accountsdb.StreamIndexManifestFileName,
+		accountsdb.StreamIndexManifestFileName + ".tmp",
+		accountsdb.DeltaIndexJournalFileName,
+		accountsdb.DeltaIndexJournalRewriteFileName,
+		accountsdb.RootIndexCatalogFileName,
+		accountsdb.ShardedDeltaIndexJournalFileName,
+		accountsdb.ShardedDeltaIndexJournalRewriteFileName,
+		accountsdb.ShardedDeltaCheckpointDirName,
 		"bankhash_db",
 		"largest_file_id",
+		"bootstrap_high_file_id",
+		"bank_hash",
+		"stake_pubkeys.idx",
 		"manifest",
 		"mithril_state.json", // State file for tracking valid builds and replay progress
 	}
 	for _, artifact := range artifacts {
 		path := filepath.Join(accountsDbDir, artifact)
-		if err := os.RemoveAll(path); err != nil {
-			mlog.Log.Errorf("failed to remove %s: %v", path, err)
-		}
+		record(path, os.RemoveAll(path))
 	}
-	partials, _ := filepath.Glob(filepath.Join(accountsDbDir, ".snapshot-status-cache-*.partial"))
+	partials, err := filepath.Glob(filepath.Join(accountsDbDir, ".snapshot-status-cache-*.partial"))
+	cleanupErr = errors.Join(cleanupErr, err)
 	for _, partial := range partials {
-		if err := os.Remove(partial); err != nil && !os.IsNotExist(err) {
-			mlog.Log.Errorf("failed to remove stale status-cache partial %s: %v", partial, err)
+		if isDecimalTemporaryName(filepath.Base(partial), ".snapshot-status-cache-", ".partial") {
+			removeRegular(partial)
 		}
 	}
-
+	collisionLists, err := filepath.Glob(filepath.Join(accountsDbDir, "."+accountsdb.StreamIndexFileName+".collisions-*"))
+	cleanupErr = errors.Join(cleanupErr, err)
+	for _, collisionList := range collisionLists {
+		if isDecimalTemporaryName(filepath.Base(collisionList), "."+accountsdb.StreamIndexFileName+".collisions-", "") {
+			removeRegular(collisionList)
+		}
+	}
+	streamHashParts, err := filepath.Glob(filepath.Join(accountsDbDir, "streamhash-parts-*"))
+	cleanupErr = errors.Join(cleanupErr, err)
+	for _, partsDir := range streamHashParts {
+		if isDecimalTemporaryName(filepath.Base(partsDir), "streamhash-parts-", "") {
+			removeRealDirectory(partsDir)
+		}
+	}
+	deltaCheckpoints, err := filepath.Glob(filepath.Join(accountsDbDir, accountsdb.DeltaCheckpointFilePrefix+"*"))
+	cleanupErr = errors.Join(cleanupErr, err)
+	for _, checkpoint := range deltaCheckpoints {
+		if isDeltaCheckpointArtifactFileName(filepath.Base(checkpoint)) {
+			removeRegular(checkpoint)
+		}
+	}
+	deltaBuildDirs, err := filepath.Glob(filepath.Join(accountsDbDir, accountsdb.DeltaCheckpointBuildDirPrefix+"*"))
+	cleanupErr = errors.Join(cleanupErr, err)
+	for _, buildDir := range deltaBuildDirs {
+		if isDecimalTemporaryName(filepath.Base(buildDir), accountsdb.DeltaCheckpointBuildDirPrefix, "") {
+			removeRealDirectory(buildDir)
+		}
+	}
+	rootCatalogPartials, err := filepath.Glob(filepath.Join(accountsDbDir, accountsdb.RootIndexCatalogFileName+".tmp-*"))
+	cleanupErr = errors.Join(cleanupErr, err)
+	for _, partial := range rootCatalogPartials {
+		if isDecimalTemporaryName(filepath.Base(partial), accountsdb.RootIndexCatalogFileName+".tmp-", "") {
+			removeRegular(partial)
+		}
+	}
+	bootstrapHighPartials, err := filepath.Glob(filepath.Join(accountsDbDir, ".bootstrap-high-*.tmp"))
+	cleanupErr = errors.Join(cleanupErr, err)
+	for _, partial := range bootstrapHighPartials {
+		if !isBootstrapHighTempFileName(filepath.Base(partial)) {
+			continue
+		}
+		removeRegular(partial)
+	}
+	largestFileIDPartials, err := filepath.Glob(filepath.Join(accountsDbDir, ".largest-file-id-*.tmp"))
+	cleanupErr = errors.Join(cleanupErr, err)
+	for _, partial := range largestFileIDPartials {
+		if isDecimalTemporaryName(filepath.Base(partial), ".largest-file-id-", ".tmp") {
+			removeRegular(partial)
+		}
+	}
+	entries, err := os.ReadDir(accountsDbDir)
+	if err != nil && !os.IsNotExist(err) {
+		mlog.Log.Errorf("failed to list AccountsDB V2 base generations in %s: %v", accountsDbDir, err)
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("list V2 base generations: %w", err))
+	}
+	for _, entry := range entries {
+		if !accountsdb.IsProductionAccountIndexGenerationDirectory(entry.Name()) {
+			continue
+		}
+		generationDir := filepath.Join(accountsDbDir, entry.Name())
+		record(generationDir, os.RemoveAll(generationDir))
+	}
+	directory, err := os.Open(accountsDbDir)
+	if err != nil {
+		return errors.Join(cleanupErr, fmt.Errorf("open AccountsDB directory for cleanup sync: %w", err))
+	}
+	syncErr := directory.Sync()
+	closeErr := directory.Close()
+	return errors.Join(cleanupErr, syncErr, closeErr)
 }
 
 // CleanSnapshotDownloadDir removes old snapshot files based on retention settings.
@@ -88,7 +230,11 @@ func CleanSnapshotDownloadDir(downloadPath string, maxSnapshots int) {
 
 	// Always clean up .partial files first (incomplete downloads from crashes)
 	for _, entry := range entries {
-		if strings.HasSuffix(entry.Name(), PartialSuffix) {
+		name := entry.Name()
+		baseName := strings.TrimSuffix(name, PartialSuffix)
+		_, fullErr := parseFullSnapshotArchiveSlot(baseName)
+		_, _, incrementalErr := parseIncrementalSnapshotArchiveSlots(baseName)
+		if strings.HasSuffix(name, PartialSuffix) && (fullErr == nil || incrementalErr == nil) && entry.Type().IsRegular() {
 			path := filepath.Join(downloadPath, entry.Name())
 			mlog.Log.Infof("Cleaning up incomplete download from previous run: %s", entry.Name())
 			if err := os.Remove(path); err != nil {
@@ -108,7 +254,7 @@ func CleanSnapshotDownloadDir(downloadPath string, maxSnapshots int) {
 
 	for _, entry := range entries {
 		name := entry.Name()
-		if strings.HasPrefix(name, "snapshot-") && strings.HasSuffix(name, ".tar.zst") {
+		if _, err := parseFullSnapshotArchiveSlot(name); err == nil && entry.Type().IsRegular() {
 			path := filepath.Join(downloadPath, name)
 			info, err := entry.Info()
 			if err != nil {
@@ -116,7 +262,7 @@ func CleanSnapshotDownloadDir(downloadPath string, maxSnapshots int) {
 			}
 			fullSnapshots = append(fullSnapshots, snapshotFile{name, path, info.ModTime()})
 		}
-		if strings.HasPrefix(name, "incremental-snapshot-") && strings.HasSuffix(name, ".tar.zst") {
+		if _, _, err := parseIncrementalSnapshotArchiveSlots(name); err == nil && entry.Type().IsRegular() {
 			path := filepath.Join(downloadPath, name)
 			info, err := entry.Info()
 			if err != nil {
@@ -219,11 +365,12 @@ func logSnapshotBootstrapTuning() {
 	if indexTempDir == "" {
 		indexTempDir = "(accountsdb)"
 	}
-	mlog.Log.Infof("Snapshot bootstrap tuning: append_vec_workers=%d index_builder_workers=%d index_committer_workers=%d index_shards=%d max_concurrent_flushers=%d zstd_decoder_concurrency=%d index_temp_dir=%s",
+	mlog.Log.Infof("Snapshot bootstrap tuning: append_vec_workers=%d index_builder_workers=%d index_committer_workers=%d index_shards=%d index_sort_chunk_mb=%d max_concurrent_flushers=%d zstd_decoder_concurrency=%d index_temp_dir=%s",
 		snapshotAppendVecCopyingWorkers(),
 		snapshotIndexEntryBuilderWorkers(),
 		snapshotIndexEntryCommitterWorkers(),
 		snapshotIndexShards(),
+		shardSortChunkBytes()>>20,
 		snapshotMaxConcurrentFlushers(),
 		ZstdDecoderConcurrency,
 		indexTempDir)
@@ -231,21 +378,26 @@ func logSnapshotBootstrapTuning() {
 
 func prepareSnapshotIndexWorkDir(accountsDbDir string) (string, func(), error) {
 	if SnapshotIndexTempDir == "" {
-		logsDir := filepath.Join(accountsDbDir, "mithril_db_log_shards")
+		logsDir := filepath.Join(accountsDbDir, SnapshotIndexRunDirName)
 		if err := os.MkdirAll(logsDir, 0775); err != nil {
 			return "", nil, err
 		}
-		return logsDir, func() {}, nil
+		cleanup := func() {
+			if err := os.RemoveAll(logsDir); err != nil {
+				mlog.Log.Warnf("failed to remove snapshot index work dir %s: %v", logsDir, err)
+			}
+		}
+		return logsDir, cleanup, nil
 	}
 
 	if err := os.MkdirAll(SnapshotIndexTempDir, 0775); err != nil {
 		return "", nil, fmt.Errorf("creating snapshot index temp dir %s: %w", SnapshotIndexTempDir, err)
 	}
-	logsDir, err := os.MkdirTemp(SnapshotIndexTempDir, "mithril-db-log-shards-*")
+	logsDir, err := os.MkdirTemp(SnapshotIndexTempDir, "accounts-index-runs-*")
 	if err != nil {
 		return "", nil, fmt.Errorf("creating snapshot index work dir in %s: %w", SnapshotIndexTempDir, err)
 	}
-	mlog.Log.Infof("Snapshot index shard logs/SST staging: %s", logsDir)
+	mlog.Log.Infof("Snapshot index sorted-run staging: %s", logsDir)
 
 	cleanup := func() {
 		if err := os.RemoveAll(logsDir); err != nil {
@@ -261,31 +413,53 @@ func BuildAccountsDbPaths(
 	incrementalSnapshotFile string,
 	accountsDbDir string,
 	dp *progress.DualProgress,
-) (*accountsdb.AccountsDb, *SnapshotManifest, error) {
+) (_ *accountsdb.AccountsDb, _ *SnapshotManifest, retErr error) {
 	// Clean any leftover artifacts from previous incomplete runs (e.g., Ctrl+C)
-	CleanAccountsDbDir(accountsDbDir)
+	storeGuard, err := beginSnapshotBootstrap(accountsDbDir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("clean previous AccountsDB: %w", err)
+	}
+	storeGuardTransferred := false
+	defer func() {
+		// A V2 root is published before the independent AccountsLtHash check so
+		// the verifier can probe it. If any later bootstrap stage fails, remove
+		// that private, not-ready store before releasing the lifetime lock; an
+		// unrelated opener must never observe an unverified root between retries.
+		if retErr != nil && !storeGuardTransferred {
+			retErr = errors.Join(retErr, cleanAccountsDbDirLocked(accountsDbDir))
+		}
+		retErr = errors.Join(retErr, storeGuard.Close())
+	}()
 
 	mlog.Log.Infof("Parsing full snapshot manifest...")
 	manifest, err := UnmarshalManifestFromSnapshot(ctx, snapshotFile, accountsDbDir)
 	if err != nil {
-		return nil, nil, fmt.Errorf("reading snapshot manifest: %v", err)
+		return nil, nil, fmt.Errorf("reading snapshot manifest: %w", err)
 	}
 	mlog.Log.Infof("Parsed full snapshot manifest")
-	if OnFullSnapshotManifestParsed != nil {
-		OnFullSnapshotManifestParsed(manifest)
-	}
 
 	var incrementalManifest *SnapshotManifest
 	if incrementalSnapshotFile != "" {
 		mlog.Log.FileOnlyf("Parsing incremental snapshot manifest...")
 		incrementalManifest, err = UnmarshalManifestFromSnapshot(ctx, incrementalSnapshotFile, accountsDbDir)
 		if err != nil {
-			return nil, nil, fmt.Errorf("reading incremental snapshot manifest: %v", err)
+			return nil, nil, fmt.Errorf("reading incremental snapshot manifest: %w", err)
 		}
 		mlog.Log.FileOnlyf("Parsed incremental snapshot manifest")
-		if OnIncrementalManifestParsed != nil {
-			OnIncrementalManifestParsed(incrementalManifest)
-		}
+	}
+	if err := validateSnapshotManifestPair(manifest, incrementalManifest); err != nil {
+		return nil, nil, fmt.Errorf("validate full/incremental snapshot pairing: %w", err)
+	}
+	if err := validateSnapshotArchiveManifestSlots(
+		snapshotFile, manifest, incrementalSnapshotFile, incrementalManifest,
+	); err != nil {
+		return nil, nil, fmt.Errorf("validate snapshot archive identity: %w", err)
+	}
+	if OnFullSnapshotManifestParsed != nil {
+		OnFullSnapshotManifestParsed(manifest)
+	}
+	if incrementalManifest != nil && OnIncrementalManifestParsed != nil {
+		OnIncrementalManifestParsed(incrementalManifest)
 	}
 
 	start := time.Now()
@@ -307,7 +481,15 @@ func BuildAccountsDbPaths(
 	}
 	defer cleanupIndexWorkDir()
 	numShards := snapshotIndexShards()
-	sl := NewShardLogger(numShards, logsDir)
+	sl, err := NewShardLogger(numShards, logsDir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("creating snapshot shard logger: %w", err)
+	}
+	defer func() {
+		if abortErr := sl.Abort(); abortErr != nil {
+			mlog.Log.Warnf("failed to abort snapshot shard logger: %v", abortErr)
+		}
+	}()
 
 	// Create stake pubkey collector for building stake index during appendvec processing
 	stakeCollector := &stakeIndexCollector{
@@ -369,6 +551,9 @@ func BuildAccountsDbPaths(
 			return nil, nil, err
 		}
 	}
+	if err := syncDirectory(appendVecsOutputDir); err != nil {
+		return nil, nil, fmt.Errorf("persist snapshot appendvec publications: %w", err)
+	}
 
 	mlog.Log.Debugf("done processing snapshots in %s.", fmtDuration(time.Since(start)))
 
@@ -381,67 +566,48 @@ func BuildAccountsDbPaths(
 	if err != nil {
 		return nil, nil, fmt.Errorf("closing shard logger: %w", err)
 	}
-	indexDir := filepath.Join(accountsDbDir, "mithril_db")
-	index, err := ingestSSTFiles(indexDir, logsDir)
-	if err != nil {
-		return nil, nil, fmt.Errorf("initializing pebble from SST files: %w", err)
+	if err := buildSnapshotAccountsIndex(ctx, accountsDbDir, logsDir, storeGuard); err != nil {
+		return nil, nil, err
 	}
-	index.Close()
+
+	finalManifest := manifest
+	if incrementalManifest != nil {
+		finalManifest = incrementalManifest
+	}
+	preparedIndex, err := verifyBuiltSnapshotAccountsState(
+		ctx, accountsDbDir, manifest, incrementalManifest, finalManifest, storeGuard,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() {
+		retErr = errors.Join(retErr, preparedIndex.Close())
+	}()
 
 	mlog.Log.Infof("Snapshot processed in %s.", fmtDuration(time.Since(start)))
 
-	var largestFileIdBytes [8]byte
-	binary.LittleEndian.PutUint64(largestFileIdBytes[:], largestFileId.Load())
-
-	path := filepath.Join(accountsDbDir, "largest_file_id")
-	if err := os.WriteFile(path, largestFileIdBytes[:], 0644); err != nil {
-		mlog.Log.Errorf("error while writing largest file ID=%d to %s: %s", largestFileId.Load(), path, err)
+	if err := finalizeSnapshotBootstrapArtifacts(
+		accountsDbDir,
+		largestFileId.Load(),
+		finalManifest.Bank.Hash,
+		stakeCollector.entries,
+	); err != nil {
 		return nil, nil, err
 	}
 
-	// bootstrap_high_file_id: write-once record of the highest fileId produced
-	// by snapshot bootstrap. The batch-fold engine uses it to classify data
-	// files: anything newer without a manifest is an undecided orphan.
-	bootstrapHighPath := filepath.Join(accountsDbDir, "bootstrap_high_file_id")
-	if err := os.WriteFile(bootstrapHighPath, largestFileIdBytes[:], 0644); err != nil {
-		mlog.Log.Errorf("error while writing bootstrap high file ID to %s: %s", bootstrapHighPath, err)
-		return nil, nil, err
-	}
-
-	bankHashOutputFileName := filepath.Join(accountsDbDir, "bank_hash")
-	if err := os.WriteFile(bankHashOutputFileName, manifest.Bank.Hash[:], 0644); err != nil {
-		mlog.Log.Errorf("error writing bank hash=%x to file=%s: %s", manifest.Bank.Hash, bankHashOutputFileName, err)
-		return nil, nil, err
-	}
-
-	// Write stake pubkey index file (with appendvec location hints)
-	stakeIndexPath := filepath.Join(accountsDbDir, "stake_pubkeys.idx")
-	if err := accountsdb.WriteStakePubkeyIndex(stakeIndexPath, stakeCollector.entries); err != nil {
-		return nil, nil, fmt.Errorf("writing stake pubkey index: %w", err)
-	}
-
-	bankhashDir := filepath.Join(accountsDbDir, "bankhash_db")
-	bankhashDb, err := pebble.Open(bankhashDir, &pebble.Options{})
-	if err != nil {
-		return nil, nil, fmt.Errorf("opening bankhashDir=%s: %w", bankhashDir, err)
-	}
-	bankhashDb.Close()
-
-	accountsDb, err := accountsdb.OpenDb(accountsDbDir)
+	accountsDb, err := accountsdb.OpenDbWithPreparedSnapshotAccountIndexAndStoreGuard(
+		accountsDbDir, preparedIndex, storeGuard,
+	)
 	if err != nil {
 		return nil, nil, err
 	}
+	storeGuardTransferred = true
 
 	if incrementalManifest != nil {
 		return accountsDb, incrementalManifest, nil
 	} else {
 		return accountsDb, manifest, nil
 	}
-}
-
-// identify appendvec files, whose path is of the form "accounts/SLOT.ID"
-func isAppendVec(filename string) bool {
-	return strings.Contains(filename, "accounts/") && strings.Contains(filename, ".")
 }
 
 type readTarOptions struct {
@@ -471,7 +637,33 @@ func readTar(
 	if err != nil {
 		return err
 	}
-	defer closer.Close()
+	snapshotClosed := false
+	defer func() {
+		if !snapshotClosed {
+			_ = closer.Close()
+		}
+	}()
+
+	var expectedAppendVecs map[snapshotAppendVecKey]uint64
+	var expectedManifestDigest [sha256.Size]byte
+	haveExpectedManifestDigest := false
+	if pools != nil {
+		manifest := pools.manifest
+		if options.isIncremental {
+			manifest = pools.incrementalManifest
+			expectedAppendVecs, err = expectedIncrementalSnapshotAppendVecs(
+				pools.manifest,
+				pools.incrementalManifest,
+			)
+		} else {
+			expectedAppendVecs, err = expectedFullSnapshotAppendVecs(manifest)
+		}
+		if err != nil {
+			return fmt.Errorf("validate snapshot appendvec manifest: %w", err)
+		}
+		expectedManifestDigest = manifest.rawDigest
+		haveExpectedManifestDigest = manifest.hasRawDigest
+	}
 
 	// Set up download progress callback
 	if dp != nil {
@@ -490,6 +682,9 @@ func readTar(
 			CleanupPartialDownload(savePath)
 		}
 	}
+	seenAppendVecs := make(map[string]struct{})
+	manifestMembers := 0
+	versionMembers := 0
 
 	for {
 		if pools != nil {
@@ -524,14 +719,124 @@ func readTar(
 			continue
 		}
 
-		if !isAppendVec(header.Name) {
+		if _, isManifest := parseSnapshotManifestTarPath(header.Name); isManifest && pools != nil {
+			if header.Typeflag != tar.TypeReg && header.Typeflag != tar.TypeRegA {
+				cleanupPartial("invalid manifest member type")
+				return fmt.Errorf("snapshot manifest member %q is not a regular file", header.Name)
+			}
+			if header.Size < 0 || header.Size > maxSnapshotManifestSize {
+				cleanupPartial("invalid manifest member size")
+				return fmt.Errorf(
+					"snapshot manifest member %q has invalid size %d (maximum %d)",
+					header.Name, header.Size, maxSnapshotManifestSize,
+				)
+			}
+			manifestMembers++
+			if manifestMembers != 1 {
+				cleanupPartial("duplicate manifest member")
+				return fmt.Errorf("snapshot archive contains multiple canonical manifest members")
+			}
+			hasher := sha256.New()
+			manifestBytesRead, hashErr := io.CopyN(hasher, tarReader, header.Size)
+			if hashErr != nil {
+				cleanupPartial("manifest read error")
+				return fmt.Errorf("read snapshot manifest member %q: %w", header.Name, hashErr)
+			}
+			statsd.Count(statsd.SnapshotTarBytesRead, manifestBytesRead, nil)
+			if dp != nil {
+				dp.Extract.Add(manifestBytesRead)
+			}
+			if !haveExpectedManifestDigest || !bytes.Equal(hasher.Sum(nil), expectedManifestDigest[:]) {
+				cleanupPartial("manifest changed between passes")
+				return fmt.Errorf("snapshot archive manifest differs from the manifest selected for bootstrap")
+			}
+			continue
+		}
+		if header.Name == "version" && pools != nil {
+			if header.Typeflag != tar.TypeReg && header.Typeflag != tar.TypeRegA {
+				cleanupPartial("invalid snapshot version member type")
+				return fmt.Errorf("snapshot version member is not a regular file")
+			}
+			if header.Size < 0 || header.Size > 32 {
+				cleanupPartial("invalid snapshot version member size")
+				return fmt.Errorf("snapshot version member has invalid size %d", header.Size)
+			}
+			versionMembers++
+			if versionMembers != 1 {
+				cleanupPartial("duplicate snapshot version member")
+				return fmt.Errorf("snapshot archive contains multiple version members")
+			}
+			versionBytes := make([]byte, int(header.Size))
+			if _, readErr := io.ReadFull(tarReader, versionBytes); readErr != nil {
+				cleanupPartial("snapshot version read error")
+				return fmt.Errorf("read snapshot version member: %w", readErr)
+			}
+			statsd.Count(statsd.SnapshotTarBytesRead, header.Size, nil)
+			if dp != nil {
+				dp.Extract.Add(header.Size)
+			}
+			if strings.TrimSpace(string(versionBytes)) != "1.2.0" {
+				cleanupPartial("unsupported snapshot version")
+				return fmt.Errorf("unsupported snapshot version %q", strings.TrimSpace(string(versionBytes)))
+			}
 			continue
 		}
 
-		writer := bytes.NewBuffer(make([]byte, 0, header.Size))
-		tarBytesRead, err := io.Copy(writer, tarReader)
+		slot, fileID, isAppendVec, parseErr := parseAppendVecTarPath(header.Name)
+		if parseErr != nil {
+			cleanupPartial("invalid appendvec path")
+			return parseErr
+		}
+		if !isAppendVec {
+			continue
+		}
+		if header.Typeflag != tar.TypeReg && header.Typeflag != tar.TypeRegA {
+			cleanupPartial("invalid appendvec member type")
+			return fmt.Errorf("appendvec member %q is not a regular file", header.Name)
+		}
+		if _, exists := seenAppendVecs[header.Name]; exists {
+			cleanupPartial("duplicate appendvec")
+			return fmt.Errorf("snapshot archive contains duplicate appendvec %q", header.Name)
+		}
+		seenAppendVecs[header.Name] = struct{}{}
+		if pools == nil {
+			cleanupPartial("worker pool unavailable")
+			return fmt.Errorf("snapshot archive contains appendvec %q but no worker pool is available", header.Name)
+		}
+		appendVecKey := snapshotAppendVecKey{slot: slot, fileID: fileID}
+		fileSize, exists := expectedAppendVecs[appendVecKey]
+		if !exists {
+			cleanupPartial("appendvec absent from manifest")
+			return fmt.Errorf("snapshot archive contains appendvec slot=%d file_id=%d absent from its manifest", slot, fileID)
+		}
+		if fileSize > maximumSolanaAppendVecFileSize {
+			cleanupPartial("oversized appendvec")
+			return fmt.Errorf(
+				"appendvec %q size %d exceeds Solana maximum %d",
+				header.Name, fileSize, maximumSolanaAppendVecFileSize,
+			)
+		}
+		if header.Size < 0 || uint64(header.Size) != fileSize {
+			cleanupPartial("appendvec size mismatch")
+			return fmt.Errorf(
+				"appendvec %q archive size %d does not match manifest size %d",
+				header.Name, header.Size, fileSize,
+			)
+		}
+		if uint64(header.Size) > uint64(^uint(0)>>1) {
+			cleanupPartial("appendvec exceeds address space")
+			return fmt.Errorf("appendvec %q size %d exceeds this process address space", header.Name, header.Size)
+		}
+
+		appendVecPath, tarBytesRead, err := streamSnapshotAppendVec(
+			pools.accountsDbDir,
+			slot,
+			fileID,
+			fileSize,
+			tarReader,
+		)
 		if err != nil {
-			mlog.Log.Errorf("err copying data to reader: %s\n", err)
+			mlog.Log.Errorf("err streaming appendvec to disk: %s\n", err)
 			cleanupPartial("copy error")
 			return err
 		}
@@ -542,10 +847,11 @@ func readTar(
 			dp.Extract.Add(tarBytesRead)
 		}
 
-		task := appendVecCopyingTask{TarBuffer: writer, Filename: header.Name, FromIncrementalSnapshot: options.isIncremental}
-		if pools == nil {
-			cleanupPartial("worker pool unavailable")
-			return fmt.Errorf("snapshot archive contains appendvec %q but no worker pool is available", header.Name)
+		task := appendVecCopyingTask{
+			Path:     appendVecPath,
+			Slot:     slot,
+			FileID:   fileID,
+			FileSize: fileSize,
 		}
 		err = invokeSnapshotTask(wg, pools.appendVecCopying, task)
 		if err != nil {
@@ -553,11 +859,55 @@ func readTar(
 			cleanupPartial("pool error")
 			return err
 		}
+		delete(expectedAppendVecs, appendVecKey)
+	}
+	// Worker stages are part of consuming the archive. Do not publish the
+	// status-cache seed or a reusable downloaded snapshot until every parser
+	// and index-log task has completed successfully.
+	if wg != nil {
+		wg.Wait()
 	}
 	if pools != nil {
 		if workerErr := pools.Err(); workerErr != nil {
 			cleanupPartial("worker error")
 			return workerErr
+		}
+	}
+	if len(expectedAppendVecs) != 0 {
+		first := firstMissingSnapshotAppendVec(expectedAppendVecs)
+		cleanupPartial("missing manifest appendvec")
+		return fmt.Errorf(
+			"snapshot archive omitted %d manifest appendvec(s), first missing slot=%d file_id=%d",
+			len(expectedAppendVecs), first.slot, first.fileID,
+		)
+	}
+	if pools != nil && manifestMembers != 1 {
+		cleanupPartial("missing manifest member")
+		return fmt.Errorf("snapshot archive contains %d canonical manifest members, want exactly one", manifestMembers)
+	}
+	if pools != nil && versionMembers != 1 {
+		cleanupPartial("missing snapshot version member")
+		return fmt.Errorf("snapshot archive contains %d version members, want exactly one", versionMembers)
+	}
+	var closeErr error
+	if finisher, ok := closer.(interface{ Finish() error }); ok {
+		closeErr = finisher.Finish()
+	} else {
+		closeErr = closer.Close()
+	}
+	snapshotClosed = true
+	if closeErr != nil {
+		cleanupPartial("snapshot close error")
+		return fmt.Errorf("close consumed snapshot: %w", closeErr)
+	}
+	if savePath != "" && bmr.TotalSize() >= 0 {
+		bytesRead := bmr.BytesRead()
+		if bytesRead != bmr.TotalSize() {
+			cleanupPartial("incomplete saved download")
+			return fmt.Errorf(
+				"snapshot download consumed %d of %d compressed bytes",
+				bytesRead, bmr.TotalSize(),
+			)
 		}
 	}
 
@@ -581,6 +931,9 @@ type snapshotWorkerPools struct {
 	indexEntryBuilder   *ants.PoolWithFunc
 	indexEntryCommitter *ants.PoolWithFunc
 	errors              *snapshotWorkerErrors
+	manifest            *SnapshotManifest
+	incrementalManifest *SnapshotManifest
+	accountsDbDir       string
 }
 
 type snapshotWorkerErrors struct {
@@ -722,21 +1075,35 @@ func initWorkerPools(
 			return
 		}
 		task := i.(indexEntryBuilderTask)
-		pubkeys, entries, stakeEntries, err := accountsdb.BuildIndexEntriesFromAppendVecs(task.Data, task.FileSize, task.Slot, task.FileId)
+		data, cleanupMapping, err := mmapSnapshotAppendVec(task.Path, task.FileSize)
 		if err != nil {
+			workerErrors.Record(fmt.Errorf("mapping appendvec %d.%d: %w", task.Slot, task.FileId, err))
+			return
+		}
+		scanErr := accountsdb.ScanIndexEntriesFromAppendVecs(
+			data,
+			task.FileSize,
+			task.Slot,
+			task.FileId,
+			defaultSnapshotIndexEntryBatchSize,
+			func(pubkeys []solana.PublicKey, entries []accountsdb.AccountIndexEntry, stakeEntries []accountsdb.StakeIndexEntry) error {
+				if err := workerErrors.Err(); err != nil {
+					return err
+				}
+				stakeCollector.Add(stakeEntries)
+				commitTask := indexEntryCommitterTask{IndexEntries: entries, Pubkeys: pubkeys}
+				if err := invokeSnapshotTask(wg, indexEntryCommitterPool, commitTask); err != nil {
+					return fmt.Errorf("submitting index entry committer task: %w", err)
+				}
+				return nil
+			},
+		)
+		cleanupErr := cleanupMapping()
+		if err := errors.Join(scanErr, cleanupErr); err != nil {
 			workerErrors.Record(fmt.Errorf("building index entries: %w", err))
 			return
 		}
-
-		// Collect stake entries with appendvec location hints for building stake index
-		stakeCollector.Add(stakeEntries)
-
-		commitTask := indexEntryCommitterTask{IndexEntries: entries, Pubkeys: pubkeys}
 		statsd.Timing(statsd.TasksIndexEntryBuilderLatency, uint64(time.Since(start)), nil)
-		err = invokeSnapshotTask(wg, indexEntryCommitterPool, commitTask)
-		if err != nil {
-			workerErrors.Record(fmt.Errorf("submitting index entry committer task: %w", err))
-		}
 	})
 	if err != nil {
 		indexEntryCommitterPool.Release()
@@ -754,77 +1121,31 @@ func initWorkerPools(
 			return
 		}
 		task := i.(appendVecCopyingTask)
-		filename := task.Filename
-		writer := task.TarBuffer
-
-		outFilename := filepath.Join(accountsDbDir, filename)
-
-		// validate that the path doesn't escape accountsDbDir (via '../' sequences)
-		cleanPath := filepath.Clean(outFilename)
-		if !strings.HasPrefix(cleanPath, filepath.Clean(accountsDbDir)+string(os.PathSeparator)) {
-			workerErrors.Record(fmt.Errorf("invalid path in tar archive: %s", filename))
-			return
-		}
-
-		appendVecBytes := writer.Bytes()
-		err := os.WriteFile(cleanPath, appendVecBytes, 0644)
-		if err != nil {
-			workerErrors.Record(fmt.Errorf("writing appendvec %s: %w", cleanPath, err))
-			return
-		}
-
-		var slot, fileId uint64
-		if n, err := fmt.Sscanf(filepath.Base(filename), "%d.%d", &slot, &fileId); n != 2 || err != nil {
-			workerErrors.Record(fmt.Errorf(
-				"failed to parse slot and file from filename=%s basename=%s; parsed n=%d arguments (expected 2) and had err=%v",
-				filename, filepath.Base(filename), n, err))
-			return
+		if task.Path == "" {
+			if err := writeSnapshotAppendVec(accountsDbDir, task); err != nil {
+				workerErrors.Record(err)
+				return
+			}
+			task.Path = filepath.Join(accountsDbDir, "accounts", fmt.Sprintf("%d.%d", task.Slot, task.FileID))
 		}
 
 		for {
 			prevLargestFileId := largestFileId.Load()
-			if fileId <= prevLargestFileId {
+			if task.FileID <= prevLargestFileId {
 				break
 			}
-			swapped := largestFileId.CompareAndSwap(prevLargestFileId, fileId)
+			swapped := largestFileId.CompareAndSwap(prevLargestFileId, task.FileID)
 			if swapped {
 				break
 			}
 		}
 
-		// find the relevant appendvec storage info. use the info from the incremental
-		// snapshot manifest if this account entry is from the incremental snapshot.
-		var fileSize uint64
-		var usedIncrementalSnapshotVal bool
-		if task.FromIncrementalSnapshot {
-			if incrementalManifest == nil {
-				workerErrors.Record(fmt.Errorf("tried to process incremental snapshot without having parsed incremental snapshot manifest first"))
-				return
-			}
-			for _, av := range incrementalManifest.AccountsDb.Storages[slot].AcctVecs {
-				if av.Id == fileId {
-					fileSize = av.FileSize
-					usedIncrementalSnapshotVal = true
-					break
-				}
-			}
+		nextTask := indexEntryBuilderTask{
+			Path:     task.Path,
+			FileSize: task.FileSize,
+			Slot:     task.Slot,
+			FileId:   task.FileID,
 		}
-
-		if !usedIncrementalSnapshotVal {
-			for _, av := range manifest.AccountsDb.Storages[slot].AcctVecs {
-				if av.Id == fileId {
-					fileSize = av.FileSize
-					break
-				}
-			}
-		}
-
-		if fileSize == 0 {
-			workerErrors.Record(fmt.Errorf("manifest has no file size for appendvec slot=%d file_id=%d", slot, fileId))
-			return
-		}
-
-		nextTask := indexEntryBuilderTask{Data: appendVecBytes, FileSize: fileSize, Slot: slot, FileId: fileId}
 		statsd.Timing(statsd.TasksAppendVecCopyingLatency, uint64(time.Since(start)), nil)
 		err = invokeSnapshotTask(wg, indexEntryBuilderPool, nextTask)
 		if err != nil {
@@ -838,10 +1159,13 @@ func initWorkerPools(
 	}
 
 	return &snapshotWorkerPools{
-		appendVecCopyingPool,
-		indexEntryBuilderPool,
-		indexEntryCommitterPool,
-		workerErrors,
+		appendVecCopying:    appendVecCopyingPool,
+		indexEntryBuilder:   indexEntryBuilderPool,
+		indexEntryCommitter: indexEntryCommitterPool,
+		errors:              workerErrors,
+		manifest:            manifest,
+		incrementalManifest: incrementalManifest,
+		accountsDbDir:       accountsDbDir,
 	}, nil
 }
 
@@ -851,25 +1175,80 @@ func (p *snapshotWorkerPools) Release() {
 	p.indexEntryCommitter.Release()
 }
 
-// Ingest SSTs into a fresh pebble DB and return it.
-func ingestSSTFiles(indexDir, logsDir string) (*pebble.DB, error) {
-	db, err := pebble.Open(indexDir, accountsdb.NewAccountsIndexPebbleOptions(nil))
+// buildSnapshotAccountsIndex turns the sorted, deduplicated snapshot runs into
+// the complete production V2 index: sharded immutable StreamHash bases, the
+// atomic root catalog, and the exact CRC-framed mutable WAL. Callers may write
+// a ready state marker only after this function returns successfully.
+func buildSnapshotAccountsIndex(
+	ctx context.Context,
+	accountsDbDir string,
+	logsDir string,
+	storeGuard *accountsdb.ProductionAccountIndexStoreGuard,
+) error {
+	source, err := accountsdb.OpenStreamIndexRunSource(logsDir)
 	if err != nil {
-		return nil, fmt.Errorf("pebble.Open(%s): %w", indexDir, err)
+		return fmt.Errorf("opening sorted snapshot index runs: %w", err)
+	}
+	config, err := accountsdb.CurrentProductionAccountIndexConfig()
+	if err != nil {
+		return fmt.Errorf("validating production account-index configuration: %w", err)
 	}
 
-	glob := filepath.Join(logsDir, "*.sst")
-	sstFiles, err := filepath.Glob(glob)
-	if err != nil {
-		return nil, fmt.Errorf("filepath.Glob(%s): %w", glob, err)
+	mlog.Log.Infof(
+		"Building production AccountsDB V2 index from snapshot keys (%d StreamHash shards, %d workers)...",
+		config.ShardCount,
+		config.CheckpointWorkers,
+	)
+	if err := accountsdb.InitializeProductionAccountIndexWithStoreGuard(
+		ctx, accountsDbDir, source, config, storeGuard,
+	); err != nil {
+		return fmt.Errorf("building production AccountsDB V2 index: %w", err)
 	}
-	if len(sstFiles) == 0 {
-		return nil, fmt.Errorf("filepath.Glob(%s): unexpectedly globbed 0 SST files!", glob)
+	mlog.Log.Infof("Built and durably published production AccountsDB V2 account index")
+	return nil
+}
+
+// verifyBuiltSnapshotAccountsState independently validates the immutable
+// index before any ready marker, largest-file selector, stake sidecar, or bank
+// hash is published.  The index builder and verifier deliberately consume
+// different representations so a bad sort/dedup winner cannot self-certify.
+func verifyBuiltSnapshotAccountsState(
+	ctx context.Context,
+	accountsDbDir string,
+	fullManifest *SnapshotManifest,
+	incrementalManifest *SnapshotManifest,
+	finalManifest *SnapshotManifest,
+	storeGuard *accountsdb.ProductionAccountIndexStoreGuard,
+) (*accountsdb.PreparedSnapshotAccountIndex, error) {
+	if finalManifest == nil || finalManifest.Bank == nil {
+		return nil, errors.New("verify snapshot account state: final manifest is incomplete")
+	}
+	appendVecs, err := snapshotVerificationAppendVecs(fullManifest, incrementalManifest)
+	if err != nil {
+		return nil, fmt.Errorf("prepare snapshot account-state verification: %w", err)
+	}
+	config, err := accountsdb.CurrentProductionAccountIndexConfig()
+	if err != nil {
+		return nil, fmt.Errorf("validate production account-index configuration for snapshot handoff: %w", err)
 	}
 
-	err = db.Ingest(sstFiles)
+	start := time.Now()
+	mlog.Log.Infof(
+		"Verifying production AccountsDB V2 state against snapshot AccountsLtHash and capitalization (%d appendvecs)...",
+		len(appendVecs),
+	)
+	prepared, err := accountsdb.PrepareVerifiedSnapshotAccountIndexWithStoreGuard(
+		ctx,
+		accountsDbDir,
+		appendVecs,
+		finalManifest.LtHash,
+		finalManifest.Bank.Capitalization,
+		config,
+		storeGuard,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("ingesting SSTs: %w", err)
+		return nil, fmt.Errorf("verify production AccountsDB V2 snapshot state: %w", err)
 	}
-	return db, nil
+	mlog.Log.Infof("Verified snapshot account state in %s", fmtDuration(time.Since(start)))
+	return prepared, nil
 }

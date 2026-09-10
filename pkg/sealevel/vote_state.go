@@ -30,6 +30,26 @@ const (
 	VoteStateV4Size = VoteStateV3Size
 )
 
+func validateVoteStateCollectionLength(
+	decoder *bin.Decoder,
+	name string,
+	count uint64,
+	minimumElementBytes uint64,
+	protocolMaximum uint64,
+) error {
+	if decoder == nil || minimumElementBytes == 0 {
+		return fmt.Errorf("vote state: invalid %s decoder bound", name)
+	}
+	if protocolMaximum != 0 && count > protocolMaximum {
+		return fmt.Errorf("vote state: %s count %d exceeds protocol maximum %d", name, count, protocolMaximum)
+	}
+	remaining := decoder.Remaining()
+	if remaining < 0 || count > uint64(remaining)/minimumElementBytes {
+		return fmt.Errorf("vote state: %s count %d cannot fit in %d remaining bytes", name, count, remaining)
+	}
+	return nil
+}
+
 func sizeOfVersionedVoteState(f features.Features) uint64 {
 	if f.IsActive(features.VoteStateAddVoteLatency) || f.IsActive(features.VoteStateV4) {
 		return VoteStateV3Size
@@ -424,6 +444,9 @@ func (voteState *VoteState0_23_5) UnmarshalWithDecoder(decoder *bin.Decoder) err
 	if err != nil {
 		return err
 	}
+	if err := validateVoteStateCollectionLength(decoder, "lockout", numLockouts, 12, MaxLockoutHistory); err != nil {
+		return err
+	}
 
 	voteState.Votes.Clear()
 	voteState.Votes.SetBaseCap(int(numLockouts))
@@ -453,7 +476,11 @@ func (voteState *VoteState0_23_5) UnmarshalWithDecoder(decoder *bin.Decoder) err
 	if err != nil {
 		return err
 	}
+	if err := validateVoteStateCollectionLength(decoder, "epoch credits", numEpochCredits, 24, MaxEpochCreditsHistory); err != nil {
+		return err
+	}
 
+	voteState.EpochCredits = voteState.EpochCredits[:0]
 	for count := uint64(0); count < numEpochCredits; count++ {
 		var epochCredits EpochCredits
 		err = epochCredits.UnmarshalWithDecoder(decoder)
@@ -578,7 +605,11 @@ func (authVoters *AuthorizedVoters) UnmarshalWithDecoder(decoder *bin.Decoder) e
 	if err != nil {
 		return err
 	}
+	if err := validateVoteStateCollectionLength(decoder, "authorized voter", numAuthVoters, 40, 0); err != nil {
+		return err
+	}
 
+	authVoters.AuthorizedVoters.Clear()
 	count := uint64(0)
 	for ; count < numAuthVoters; count++ {
 		var authVoter AuthorizedVoter
@@ -747,6 +778,9 @@ func (voteState *VoteState1_14_11) UnmarshalWithDecoder(decoder *bin.Decoder) er
 	if err != nil {
 		return err
 	}
+	if err := validateVoteStateCollectionLength(decoder, "lockout", numLockouts, 12, MaxLockoutHistory); err != nil {
+		return err
+	}
 
 	voteState.Votes.Clear()
 	voteState.Votes.SetBaseCap(int(numLockouts))
@@ -786,7 +820,11 @@ func (voteState *VoteState1_14_11) UnmarshalWithDecoder(decoder *bin.Decoder) er
 	if err != nil {
 		return err
 	}
+	if err := validateVoteStateCollectionLength(decoder, "epoch credits", numEpochCredits, 24, MaxEpochCreditsHistory); err != nil {
+		return err
+	}
 
+	voteState.EpochCredits = voteState.EpochCredits[:0]
 	for count := uint64(0); count < numEpochCredits; count++ {
 		var epochCredits EpochCredits
 		err = epochCredits.UnmarshalWithDecoder(decoder)
@@ -894,6 +932,9 @@ func (voteState *VoteState) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 	if err != nil {
 		return err
 	}
+	if err := validateVoteStateCollectionLength(decoder, "landed vote", numLockouts, 13, MaxLockoutHistory); err != nil {
+		return err
+	}
 
 	voteState.Votes.Clear()
 	voteState.Votes.SetBaseCap(int(numLockouts))
@@ -933,8 +974,11 @@ func (voteState *VoteState) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 	if err != nil {
 		return err
 	}
+	if err := validateVoteStateCollectionLength(decoder, "epoch credits", numEpochCredits, 24, MaxEpochCreditsHistory); err != nil {
+		return err
+	}
 
-	voteState.EpochCredits = slices.Grow(voteState.EpochCredits, int(numEpochCredits))
+	voteState.EpochCredits = slices.Grow(voteState.EpochCredits[:0], int(numEpochCredits))
 	for count := uint64(0); count < numEpochCredits; count++ {
 		var epochCredits EpochCredits
 		err = epochCredits.UnmarshalWithDecoder(decoder)
@@ -1081,6 +1125,9 @@ func (voteState *VoteState4) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 	if err != nil {
 		return err
 	}
+	if err := validateVoteStateCollectionLength(decoder, "landed vote", numLockouts, 13, MaxLockoutHistory); err != nil {
+		return err
+	}
 
 	voteState.Votes.Clear()
 	voteState.Votes.SetBaseCap(int(numLockouts))
@@ -1115,8 +1162,11 @@ func (voteState *VoteState4) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 	if err != nil {
 		return err
 	}
+	if err := validateVoteStateCollectionLength(decoder, "epoch credits", numEpochCredits, 24, MaxEpochCreditsHistory); err != nil {
+		return err
+	}
 
-	voteState.EpochCredits = slices.Grow(voteState.EpochCredits, int(numEpochCredits))
+	voteState.EpochCredits = slices.Grow(voteState.EpochCredits[:0], int(numEpochCredits))
 	for count := uint64(0); count < numEpochCredits; count++ {
 		var epochCredits EpochCredits
 		err = epochCredits.UnmarshalWithDecoder(decoder)

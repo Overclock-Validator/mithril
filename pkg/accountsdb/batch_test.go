@@ -14,11 +14,47 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
-	"github.com/cockroachdb/pebble"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestDedupeBatchRequestIsStableAndUsesScatterOnlyWhenNeeded(t *testing.T) {
+	uniqueInput := make([]solana.PublicKey, batchDedupeLinearScanMax+4)
+	for i := range uniqueInput {
+		binary.LittleEndian.PutUint64(uniqueInput[i][:8], uint64(i+1))
+	}
+	request, err := dedupeBatchRequest(context.Background(), uniqueInput)
+	require.NoError(t, err)
+	require.Len(t, request.keys, len(uniqueInput))
+	assert.Same(t, &uniqueInput[0], &request.keys[0], "an all-unique request must retain its input slice")
+	assert.Nil(t, request.scatter)
+	assert.Nil(t, request.logicalCopies)
+
+	lateKey := solana.PublicKey{0xfe}
+	input := append([]solana.PublicKey(nil), uniqueInput...)
+	input = append(input, uniqueInput[3], lateKey, uniqueInput[0], lateKey)
+	request, err = dedupeBatchRequest(context.Background(), input)
+	require.NoError(t, err)
+	require.Len(t, request.keys, len(uniqueInput)+1)
+	assert.Equal(t, uniqueInput, request.keys[:len(uniqueInput)])
+	assert.Equal(t, lateKey, request.keys[len(uniqueInput)])
+	for i := range uniqueInput {
+		assert.Equal(t, i, request.scatter[i])
+	}
+	assert.Equal(t, 3, request.scatter[len(uniqueInput)])
+	assert.Equal(t, len(uniqueInput), request.scatter[len(uniqueInput)+1])
+	assert.Equal(t, 0, request.scatter[len(uniqueInput)+2])
+	assert.Equal(t, len(uniqueInput), request.scatter[len(uniqueInput)+3])
+	assert.Equal(t, uint64(2), request.logicalCopies[0])
+	assert.Equal(t, uint64(2), request.logicalCopies[3])
+	assert.Equal(t, uint64(2), request.logicalCopies[len(uniqueInput)])
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = dedupeBatchRequest(cancelled, input)
+	assert.ErrorIs(t, err, context.Canceled)
+}
 
 func TestGetAccountsBatchGroupedReadsPreserveOrder(t *testing.T) {
 	db, _ := newFoldTestDb(t)
@@ -99,6 +135,45 @@ func TestGetAccountsBatchStatsAndSmallBatchAdmissions(t *testing.T) {
 	assert.Equal(t, uint64(1), second.IndexMisses, "negative entries are deliberately not cached yet")
 }
 
+func TestUniqueSharedBatchPathPreservesResultsAndStats(t *testing.T) {
+	db, _ := newFoldTestDb(t)
+	defer db.CloseDb()
+
+	first := foldAcct(1, 100, []byte{1, 2, 3})
+	second := foldAcct(2, 200, []byte{4, 5})
+	_, err := db.CommitBatch(
+		[]accounts.SlotDelta{{Slot: 100, Delta: []*accounts.Account{first, second}}},
+		100,
+		nil,
+		nil,
+	)
+	require.NoError(t, err)
+	db.CommonAcctsCache.Delete(first.Key)
+	db.CommonAcctsCache.Delete(second.Key)
+
+	missing := solana.PublicKey{9}
+	keys := []solana.PublicKey{second.Key, missing, first.Key}
+	out, stats, err := db.GetUniqueAccountsBatchSharedWithStats(
+		context.Background(), 100, keys,
+	)
+	require.NoError(t, err)
+	require.Len(t, out, len(keys))
+	assert.Equal(t, second.Key, out[0].Key)
+	assert.Equal(t, uint64(200), out[0].Lamports)
+	assert.Equal(t, missing, out[1].Key)
+	assert.Zero(t, out[1].Lamports)
+	assert.Equal(t, first.Key, out[2].Key)
+	assert.Equal(t, uint64(100), out[2].Lamports)
+	assert.Equal(t, uint64(len(keys)), stats.RequestedKeys)
+	assert.Equal(t, uint64(len(keys)), stats.UniqueKeys)
+	assert.Zero(t, stats.DuplicateKeys)
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, err = db.GetUniqueAccountsBatchSharedWithStats(cancelled, 100, keys)
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
 func TestLargeBatchSelectivelyAdmitsReusableAccounts(t *testing.T) {
 	db, _ := newFoldTestDb(t)
 	defer db.CloseDb()
@@ -137,11 +212,11 @@ func TestLargeBatchSelectivelyAdmitsReusableAccounts(t *testing.T) {
 	assert.True(t, db.CommonAcctsCache.Has(hot.Key))
 }
 
-func TestGetAccountsBatchIteratorExactMatchOrderAndInputImmutability(t *testing.T) {
+func TestGetAccountsBatchExactMatchOrderAndInputImmutability(t *testing.T) {
 	db, _ := newFoldTestDb(t)
 	defer db.CloseDb()
 
-	const count = batchIndexIteratorThreshold*2 + 17
+	const count = 145
 	delta := make([]*accounts.Account, count)
 	keys := make([]solana.PublicKey, count)
 	for i := range keys {
@@ -173,32 +248,12 @@ func TestGetAccountsBatchIteratorExactMatchOrderAndInputImmutability(t *testing.
 		assert.Equal(t, uint64(requestIdx+1), out[i].Lamports)
 	}
 	assert.Equal(t, between, out[count].Key)
-	assert.Zero(t, out[count].Lamports, "SeekGE must not return the next stored key for an interior miss")
+	assert.Zero(t, out[count].Lamports, "an interior miss must not resolve to a neighboring key")
 	assert.Equal(t, keys[0], out[count+1].Key)
 	assert.Equal(t, out[count+2].Lamports, out[count+3].Lamports)
 }
 
-func TestNextPubkey(t *testing.T) {
-	key := solana.PublicKey{1, 2, 3}
-	var next [32]byte
-	require.True(t, nextPubkey(key, &next))
-	assert.Equal(t, byte(1), next[0])
-	assert.Equal(t, byte(1), next[len(next)-1])
-
-	key = solana.PublicKey{}
-	key[len(key)-2] = 7
-	key[len(key)-1] = 0xff
-	require.True(t, nextPubkey(key, &next))
-	assert.Equal(t, byte(8), next[len(next)-2])
-	assert.Zero(t, next[len(next)-1])
-
-	for idx := range key {
-		key[idx] = 0xff
-	}
-	assert.False(t, nextPubkey(key, &next))
-}
-
-func TestGetAccountsBatchRejectsCancelledContextAndMalformedIndex(t *testing.T) {
+func TestGetAccountsBatchRejectsCancelledContext(t *testing.T) {
 	db, _ := newFoldTestDb(t)
 	defer db.CloseDb()
 
@@ -206,12 +261,6 @@ func TestGetAccountsBatchRejectsCancelledContextAndMalformedIndex(t *testing.T) 
 	cancel()
 	_, err := db.GetAccountsBatch(ctx, 100, []solana.PublicKey{{1}})
 	assert.ErrorIs(t, err, context.Canceled)
-
-	key := solana.PublicKey{2}
-	require.NoError(t, db.Index.Set(key[:], []byte{1, 2, 3}, pebble.NoSync))
-	_, err = db.GetAccountsBatch(context.Background(), 100, []solana.PublicKey{key})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unmarshal index entry")
 }
 
 func TestBatchCacheAdmissionCannotOverwriteNewerFold(t *testing.T) {
@@ -392,6 +441,48 @@ func TestRunBatchWorkersBoundsConcurrency(t *testing.T) {
 	assert.LessOrEqual(t, peak.Load(), int64(max(1, runtime.GOMAXPROCS(0)*2)))
 }
 
+func TestRunBatchWorkersLimitedAppliesHardConcurrencyBound(t *testing.T) {
+	const (
+		jobs  = 1_000
+		limit = 3
+	)
+	var active atomic.Int64
+	var peak atomic.Int64
+	release := make(chan struct{})
+	started := make(chan struct{}, limit)
+	done := make(chan error, 1)
+	go func() {
+		done <- runBatchWorkersLimited(context.Background(), jobs, limit, func(int) error {
+			now := active.Add(1)
+			for {
+				old := peak.Load()
+				if now <= old || peak.CompareAndSwap(old, now) {
+					break
+				}
+			}
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			<-release
+			active.Add(-1)
+			return nil
+		})
+	}()
+
+	wantWorkers := min(limit, max(1, runtime.GOMAXPROCS(0)*2))
+	for range wantWorkers {
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("bounded workers did not start")
+		}
+	}
+	close(release)
+	require.NoError(t, <-done)
+	assert.LessOrEqual(t, peak.Load(), int64(limit))
+}
+
 func TestRunBatchWorkersReturnsContextAndWorkErrors(t *testing.T) {
 	want := errors.New("boom")
 	err := runBatchWorkers(context.Background(), 100, func(job int) error {
@@ -520,25 +611,57 @@ func BenchmarkGetAccountsBatchColdFoldSegment(b *testing.B) {
 	})
 }
 
+func BenchmarkUniqueBatchProof30KCacheHits(b *testing.B) {
+	db, _ := newFoldTestDb(b)
+	defer db.CloseDb()
+
+	const accountCount = 30_000
+	keys := make([]solana.PublicKey, accountCount)
+	for i := range keys {
+		binary.LittleEndian.PutUint64(keys[i][:8], uint64(i+1))
+		acct := &accounts.Account{Key: keys[i], Lamports: uint64(i + 1), Owner: [32]byte{7}}
+		if !db.CommonAcctsCache.Set(keys[i], acct) {
+			b.Fatalf("cache rejected fixture account %d", i)
+		}
+	}
+
+	b.Run("defensive-dedupe", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			out, _, err := db.GetAccountsBatchSharedWithStats(context.Background(), 100, keys)
+			if err != nil {
+				b.Fatal(err)
+			}
+			runtime.KeepAlive(out)
+		}
+	})
+	b.Run("caller-proved-unique", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			out, _, err := db.GetUniqueAccountsBatchSharedWithStats(context.Background(), 100, keys)
+			if err != nil {
+				b.Fatal(err)
+			}
+			runtime.KeepAlive(out)
+		}
+	})
+}
+
 func BenchmarkResolveBatchAccountLocations(b *testing.B) {
 	db, _ := newFoldTestDb(b)
 	defer db.CloseDb()
 
 	const accountCount = 1 << 16
 	storedKeys := make([]solana.PublicKey, accountCount)
-	indexBatch := db.Index.NewBatch()
-	var entryBuf [24]byte
+	mutations := make([]deltaIndexMutation, accountCount)
 	for i := range storedKeys {
 		binary.BigEndian.PutUint64(storedKeys[i][:8], uint64(i+1))
 		entry := AccountIndexEntry{Slot: 100, FileId: 1, Offset: uint64(i)}
-		entry.Marshal(&entryBuf)
-		require.NoError(b, indexBatch.Set(storedKeys[i][:], entryBuf[:], nil))
+		mutations[i] = liveDeltaMutation(storedKeys[i], entry)
 	}
-	require.NoError(b, indexBatch.Commit(pebble.NoSync))
-	require.NoError(b, indexBatch.Close())
-	require.NoError(b, db.Index.Flush())
+	require.NoError(b, db.Index.Apply(mutations, nil, false))
 
-	run := func(b *testing.B, request []solana.PublicKey, pointGets, auto bool, workers int) {
+	run := func(b *testing.B, request []solana.PublicKey) {
 		b.Helper()
 		b.ReportAllocs()
 		b.ReportMetric(float64(len(request)), "keys/op")
@@ -550,22 +673,9 @@ func BenchmarkResolveBatchAccountLocations(b *testing.B) {
 			}
 			out := make([]*accounts.Account, len(request))
 			snapshot := db.Index.NewSnapshot()
-			var locations []batchAccountLocation
-			var found []bool
-			var err error
-			if pointGets {
-				locations, found, err = resolveBatchAccountLocationsPointGets(
-					context.Background(), snapshot, request, cold, out,
-				)
-			} else if auto {
-				locations, found, err = resolveBatchAccountLocations(
-					context.Background(), snapshot, request, cold, out,
-				)
-			} else {
-				locations, found, err = resolveBatchAccountLocationsIterators(
-					context.Background(), snapshot, request, cold, out, workers,
-				)
-			}
+			locations, found, err := resolveBatchAccountLocations(
+				context.Background(), snapshot, request, cold, out,
+			)
 			closeErr := snapshot.Close()
 			if err != nil || closeErr != nil || len(locations) != len(request) ||
 				len(found) != len(request) || !found[0] || !found[len(found)-1] {
@@ -592,17 +702,7 @@ func BenchmarkResolveBatchAccountLocations(b *testing.B) {
 			request[i] = storedKeys[(i*4051)&(accountCount-1)]
 		}
 		b.Run(fmt.Sprintf("%06d-keys", size), func(b *testing.B) {
-			b.Run("point", func(b *testing.B) {
-				run(b, request, true, false, 0)
-			})
-			b.Run("auto", func(b *testing.B) {
-				run(b, request, false, true, 0)
-			})
-			for _, workers := range []int{1, 2, 4, 8, 16, 32} {
-				b.Run(fmt.Sprintf("iterator-%02d", workers), func(b *testing.B) {
-					run(b, request, false, false, workers)
-				})
-			}
+			run(b, request)
 		})
 	}
 }

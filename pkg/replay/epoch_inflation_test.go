@@ -161,12 +161,19 @@ func TestPartitionedRewardsBudgetIncludesMigrationEpochAndFailsClosed(t *testing
 func TestStageEpochInflationAccountRollsStateAndCapitalization(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "accounts"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "largest_file_id"), make([]byte, 8), 0o644))
+	require.NoError(t, accountsdb.WriteLargestFileID(dir, 0))
+	require.NoError(t, accountsdb.WriteBootstrapHighFileID(dir, 0))
 
-	db, err := accountsdb.OpenDb(dir)
+	indexConfig := accountsdb.DefaultProductionAccountIndexConfig()
+	indexConfig.ShardCount = 1
+	indexConfig.CheckpointWorkers = 1
+	indexConfig.MaxConcurrentSeals = 1
+	require.NoError(t, accountsdb.InitializeEmptyProductionAccountIndex(t.Context(), dir, indexConfig))
+	db, err := accountsdb.OpenDbWithProductionAccountIndexConfig(dir, indexConfig)
 	require.NoError(t, err)
 	db.InitCaches()
-	t.Cleanup(db.CloseDb)
+	db.RootedDurable = true
+	t.Cleanup(func() { require.NoError(t, db.CloseDb()) })
 
 	previousRent := sealevel.SysvarCache.Rent.Sysvar
 	rent := sealevel.NewDefaultRentSysvar()
@@ -179,15 +186,15 @@ func TestStageEpochInflationAccountRollsStateAndCapitalization(t *testing.T) {
 		Epoch:                      114,
 	}}
 	parent := &accounts.Account{
+		Slot:      10,
 		Key:       VoteRewardAccountAddr(),
 		Lamports:  500,
 		Data:      encodeEpochInflationAccountState(existing),
 		Owner:     a.SystemProgramAddr,
 		RentEpoch: 0,
 	}
-	parentStored := make(chan struct{})
-	require.NoError(t, db.StoreAccounts([]*accounts.Account{parent}, 10, func() { close(parentStored) }))
-	<-parentStored
+	_, err = db.CommitBatch([]accounts.SlotDelta{{Slot: 10, Delta: []*accounts.Account{parent}}}, 10, nil, nil)
+	require.NoError(t, err)
 
 	f := features.NewFeaturesDefault()
 	f.EnableFeature(features.FullInflationEnable, 0)
@@ -220,8 +227,8 @@ func TestStageEpochInflationAccountRollsStateAndCapitalization(t *testing.T) {
 	db.WaitForStoreWorker()
 	stored, err := db.GetAccount(11, VoteRewardAccountAddr())
 	require.NoError(t, err)
-	require.Equal(t, updated.Data, stored.Data)
-	require.Equal(t, updated.Lamports, stored.Lamports)
+	require.Equal(t, parent.Data, stored.Data, "unrooted epoch update must remain staged until its slot folds")
+	require.Equal(t, parent.Lamports, stored.Lamports)
 }
 
 func TestLoadEpochInflationAccountStateForReplayPrefersStagedBoundaryAccount(t *testing.T) {

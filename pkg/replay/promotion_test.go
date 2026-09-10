@@ -19,8 +19,9 @@ import (
 // keys return a placeholder (mirroring AccountsDb.GetAccountsBatch). batchCalls
 // counts GetAccountsBatch invocations so tests can assert misses are batched.
 type fakeDurable struct {
-	known      map[solana.PublicKey]uint64
-	batchCalls int
+	known            map[solana.PublicKey]uint64
+	batchCalls       int
+	uniqueBatchCalls int
 }
 
 // sharedAccountDurable deliberately returns the same pointer on every read,
@@ -60,6 +61,21 @@ func (d *fakeDurable) GetAccountsBatch(ctx context.Context, slot uint64, pks []s
 		out[i], _ = d.GetAccount(slot, pk)
 	}
 	return out, nil
+}
+
+func (d *fakeDurable) GetUniqueAccountsBatchSharedWithStats(
+	ctx context.Context,
+	slot uint64,
+	pks []solana.PublicKey,
+) ([]*accounts.Account, accountsdb.BatchReadStats, error) {
+	d.uniqueBatchCalls++
+	out, err := d.GetAccountsBatch(ctx, slot, pks)
+	return out, accountsdb.BatchReadStats{
+		RequestedKeys:     uint64(len(pks)),
+		UniqueKeys:        uint64(len(pks)),
+		DurableKeys:       uint64(len(pks)),
+		UniqueDurableKeys: uint64(len(pks)),
+	}, err
 }
 
 func testKey(b byte) solana.PublicKey { return solana.PublicKey{b} }
@@ -350,6 +366,29 @@ func TestUnrootedTailSharedBatchReportsWorkingSetAndDurableKeys(t *testing.T) {
 	assert.Equal(t, 1, durable.batchCalls)
 }
 
+func TestUnrootedTailPropagatesUniqueBatchProofToDurableMisses(t *testing.T) {
+	durable := &fakeDurable{known: map[solana.PublicKey]uint64{testKey(2): 200}}
+	tail := newUnrootedTail(durable, &fakeCommitter{}, 512, 1, "")
+	held := testAccount(1, 100)
+	tail.Add(5, []*accounts.Account{held}, testHashBytes(5))
+
+	out, stats, err := tail.GetUniqueAccountsBatchSharedWithStats(
+		context.Background(), 6, []solana.PublicKey{held.Key, testKey(2)},
+	)
+	require.NoError(t, err)
+	require.Len(t, out, 2)
+	assert.Same(t, held, out[0])
+	assert.Equal(t, uint64(200), out[1].Lamports)
+	assert.Equal(t, uint64(2), stats.RequestedKeys)
+	assert.Equal(t, uint64(2), stats.UniqueKeys)
+	assert.Equal(t, uint64(1), stats.WorkingSetHits)
+	assert.Equal(t, uint64(1), stats.DurableKeys)
+	assert.Equal(t, uint64(1), stats.UniqueDurableKeys)
+	assert.Zero(t, stats.DuplicateKeys)
+	assert.Equal(t, 1, durable.uniqueBatchCalls)
+	assert.Equal(t, 1, durable.batchCalls)
+}
+
 func BenchmarkUnrootedTailBlockParentBatch(b *testing.B) {
 	const accountCount = 30_000
 	tail := newUnrootedTail(&fakeDurable{}, &fakeCommitter{}, 512, 1, "")
@@ -385,7 +424,7 @@ func BenchmarkUnrootedTailBlockParentBatch(b *testing.B) {
 	})
 }
 
-// OverCap trips only when held slots exceed the cap (backpressure on stalled rooting).
+// OverCap trips when held slots exceed the cap (backpressure on stalled rooting).
 func TestUnrootedTailOverCap(t *testing.T) {
 	tail := newUnrootedTail(&fakeDurable{}, &fakeCommitter{}, 2, 1, "")
 	tail.Add(1, nil, testHashBytes(1))
@@ -393,6 +432,28 @@ func TestUnrootedTailOverCap(t *testing.T) {
 	assert.False(t, tail.OverCap(), "2 held == cap, not over")
 	tail.Add(3, nil, testHashBytes(3))
 	assert.True(t, tail.OverCap(), "3 held > cap 2")
+}
+
+func TestUnrootedTailByteLimitRejectsAccountAndBankhashAtomically(t *testing.T) {
+	tail := newUnrootedTail(&fakeDurable{}, &fakeCommitter{}, 512, 1, "", 1<<20)
+	large := testAccount(1, 1)
+	large.Data = make([]byte, 2<<20)
+	err := tail.Add(1, []*accounts.Account{large}, testHashBytes(1))
+	require.ErrorIs(t, err, accounts.ErrWorkingSetCapacity)
+	_, accountPublished := tail.overlay.Lookup([32]byte(large.Key))
+	assert.False(t, accountPublished)
+	_, bankhashPublished := tail.bankhashes[1]
+	assert.False(t, bankhashPublished)
+	assert.Equal(t, uint64(0), tail.workingSetStats().HeldSlots)
+	assert.False(t, tail.OverCap(), "a rejected slot cannot push retained state over the hard limit")
+
+	small := testAccount(2, 2)
+	require.NoError(t, tail.Add(2, []*accounts.Account{small}, testHashBytes(2)))
+	stored, accountPublished := tail.overlay.Lookup([32]byte(small.Key))
+	require.True(t, accountPublished)
+	assert.Same(t, small, stored)
+	_, bankhashPublished = tail.bankhashes[2]
+	assert.True(t, bankhashPublished)
 }
 
 // promote returns the resume context as of the highest promoted slot and prunes

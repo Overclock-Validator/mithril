@@ -218,6 +218,7 @@ func stageEpochInflationAccount(
 	}
 
 	updated := &accounts.Account{
+		Slot:       storeSlot,
 		Key:        key,
 		Lamports:   lamports,
 		Data:       data,

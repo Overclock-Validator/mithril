@@ -99,13 +99,8 @@ func TestCapturedAGEpoch35BoundaryMatchesClusterSchedule(t *testing.T) {
 
 func capturedEpochBoundaryDB(t *testing.T, slot uint64, delegations []capturedBoundaryDelegation) *accountsdb.AccountsDb {
 	t.Helper()
-	dir := t.TempDir()
-	require.NoError(t, os.MkdirAll(filepath.Join(dir, "accounts"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "largest_file_id"), make([]byte, 8), 0o644))
-	db, err := accountsdb.OpenDb(dir)
-	require.NoError(t, err)
-	db.InitCaches()
-	t.Cleanup(db.CloseDb)
+	db := openAlpenglowTestAccountsDB(t)
+	dir := filepath.Dir(db.AcctsDir)
 	global.ClearPendingStakePubkeys()
 	accts := make([]*accounts.Account, 0, len(delegations))
 	for _, captured := range delegations {
@@ -117,9 +112,8 @@ func capturedEpochBoundaryDB(t *testing.T, slot uint64, delegations []capturedBo
 			Lamports: captured.Delegation.StakeLamports, Data: data})
 		global.EnqueuePendingStakePubkey(slot, captured.Pubkey)
 	}
-	done := make(chan struct{})
-	require.NoError(t, db.StoreAccounts(accts, slot, func() { close(done) }))
-	<-done
+	_, err := db.CommitBatch([]accounts.SlotDelta{{Slot: slot, Delta: accts}}, slot, nil, nil)
+	require.NoError(t, err)
 	_, err = global.FlushPendingStakePubkeys(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() {

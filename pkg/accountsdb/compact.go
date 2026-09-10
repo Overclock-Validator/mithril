@@ -1,17 +1,20 @@
 package accountsdb
 
 import (
-	"bytes"
+	"context"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
-	"github.com/Overclock-Validator/mithril/pkg/util"
-	"github.com/cockroachdb/pebble"
+	"github.com/gagliardetto/solana-go"
 )
 
 // Compaction reclaims dead bytes from the append-only store. Folds never
@@ -47,32 +50,104 @@ import (
 // output as non-orphan). A crash anywhere leaves either duplicate bytes (source
 // still authoritative) or a fully-dead source; both converge on the next cycle.
 
-// CompactionConfig bounds one CompactOnce cycle.
+// CompactionConfig controls one CompactOnce cycle. The byte settings are soft
+// targets checked between source files, not hard caps: a cycle may exceed each
+// target by at most the work attributable to one selected source file.
 type CompactionConfig struct {
-	// RewindHorizonBatches pins the newest N fold batches and every file their
-	// undo pointers name. Must match (or exceed) the operational rewind
-	// horizon. Clamped to >= 1 so the committed head fold is always pinned.
+	// RewindHorizonBatches preserves the newest N fold transitions plus the
+	// boundary manifest/file immediately before them, and pins every file the N
+	// transitions' undo pointers name. Must match (or exceed) the operational
+	// rewind horizon. Clamped to >= 1 so the committed head fold is always pinned.
 	RewindHorizonBatches uint64
 	// MinDeadFraction is the dead-byte fraction a file must reach before its
 	// live records are moved. Defaults to 0.7.
 	MinDeadFraction float64
-	// MaxMoveBytesPerCycle caps live bytes rewritten per call (wear/latency
-	// bound). Deleting fully-dead files is free and not counted. Default 256MB.
+	// MaxMoveBytesPerCycle is the soft target for live bytes rewritten per call.
+	// The target is checked between source files, so one source's live bytes may
+	// overshoot it. Deleting fully-dead files is free and not counted. Default
+	// 256MB.
 	MaxMoveBytesPerCycle int64
-	// MaxScanBytesPerCycle caps bytes read for liveness scans per call (read
-	// churn bound; mostly-live files cost a scan but yield no move). Progress
+	// MaxScanBytesPerCycle is the soft target for bytes read by liveness scans.
+	// The target is checked between source files, so one source's full size may
+	// overshoot it. Mostly-live files cost a scan but yield no move. Progress
 	// across cycles is kept by a directory cursor. Default 1GB.
 	MaxScanBytesPerCycle int64
+	// MaxSourceBytes is a hard admission cap checked before opening or scanning a
+	// source. It bounds one routine cycle's uninterrupted per-file work. Zero is
+	// unlimited and is reserved for explicit callers and emergency disk-pressure
+	// compaction, where bounded replay backpressure is safer than ENOSPC.
+	MaxSourceBytes int64
+	// NonBlocking makes the cycle return ErrCompactionBusy instead of waiting
+	// for an active fold/recovery/rewind. Background maintenance uses this so it
+	// never queues ahead of replay's durable fold. Emergency disk-pressure
+	// admission deliberately leaves it false and applies bounded backpressure.
+	NonBlocking bool
+	// MinOutputFreeBytes is filesystem headroom that must remain in addition to
+	// a selected source's exact live-byte output. The check happens after the
+	// liveness pass but before file-ID allocation or output creation.
+	MinOutputFreeBytes uint64
+	// ContinueOnOutputSpacePressure lets an emergency pass defer a candidate
+	// whose live output will not fit and continue looking for fully-dead (or
+	// smaller) files that can still reclaim space. If the pass makes no
+	// reclamation progress, the strongest deferred disk-pressure error is
+	// returned. Callers must opt in explicitly so unexpected pressure is never
+	// silently hidden by a direct CompactOnce invocation.
+	ContinueOnOutputSpacePressure bool
 }
 
 // CompactStats reports one CompactOnce cycle.
 type CompactStats struct {
-	CandidatesScanned int
-	FilesCompacted    int
-	FilesDeleted      int // fully-dead fast path (no bytes moved)
-	LiveBytesMoved    int64
-	BytesReclaimed    int64 // source bytes freed (compacted + deleted)
+	EligibleCandidates int
+	CandidatesScanned  int
+	FilesCompacted     int
+	FilesDeleted       int // fully-dead fast path (no bytes moved)
+	// OutputSpaceDeferrals counts otherwise-eligible source files skipped because
+	// their live output plus the configured scratch reserve did not fit.
+	OutputSpaceDeferrals int
+	// SourceSizeDeferrals counts files rejected before their liveness scan by
+	// MaxSourceBytes. MaxDeferredSourceBytes makes the largest such file visible.
+	SourceSizeDeferrals    int
+	MaxDeferredSourceBytes int64
+	ScannedBytes           int64
+	// MaxSourceBytes is the largest source admitted during this cycle. It makes
+	// the possible one-source overshoot of the soft byte targets observable.
+	MaxSourceBytes int64
+	LiveBytesMoved int64
+	BytesReclaimed int64 // source bytes freed (compacted + deleted)
+	// PassComplete is true when this invocation examined every candidate that
+	// was eligible at its start. False means a soft byte target stopped it and
+	// the persistent cursor will resume the pass on the next call.
+	PassComplete bool
 }
+
+var (
+	ErrCompactionBusy        = errors.New("accountsdb: appendvec compaction busy")
+	ErrAppendVecDiskPressure = errors.New("accountsdb: appendvec disk pressure")
+)
+
+// AppendVecDiskPressureError reports a fail-closed admission or compaction
+// refusal before the next durable allocation. It is safe for errors.Is with
+// ErrAppendVecDiskPressure.
+type AppendVecDiskPressureError struct {
+	Operation      string
+	AvailableBytes uint64
+	RequiredBytes  uint64
+}
+
+func (err *AppendVecDiskPressureError) Error() string {
+	if err == nil {
+		return ErrAppendVecDiskPressure.Error()
+	}
+	return fmt.Sprintf(
+		"%s: %s has %d available bytes, requires %d bytes",
+		ErrAppendVecDiskPressure,
+		err.Operation,
+		err.AvailableBytes,
+		err.RequiredBytes,
+	)
+}
+
+func (*AppendVecDiskPressureError) Unwrap() error { return ErrAppendVecDiskPressure }
 
 const (
 	defaultMinDeadFraction      = 0.7
@@ -81,24 +156,45 @@ const (
 )
 
 type compactCandidate struct {
-	name         string
-	slot         uint64
-	fileId       uint64
-	size         int64
-	manifestPath string // the source's own manifest; "" for bootstrap appendvecs
+	name               string
+	slot               uint64
+	fileId             uint64
+	size               int64
+	manifestPath       string // the source's own manifest; "" for bootstrap appendvecs
+	retirementRequired bool   // an immutable generation may still return this path
 }
 
 // CompactOnce runs one bounded compaction cycle and returns what it did.
 func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
+	return db.CompactOnceContext(context.Background(), cfg)
+}
+
+// CompactOnceContext is CompactOnce with cancellation between records and
+// bounded copy chunks. Cancellation never weakens crash safety: a published
+// output is retained, while the source is unlinked only after every relocation
+// and its retirement marker are durable.
+func (db *AccountsDb) CompactOnceContext(ctx context.Context, cfg CompactionConfig) (CompactStats, error) {
 	stats := CompactStats{}
+	if ctx == nil {
+		return stats, errors.New("accountsdb: nil compaction context")
+	}
+	if err := ctx.Err(); err != nil {
+		return stats, err
+	}
 	if !db.RootedDurable {
 		return stats, fmt.Errorf("accountsdb: compaction requires rooted-durable mode (the direct store path writes the index outside foldMu)")
+	}
+	if db.ProductionIndex == nil && db.Index == nil {
+		return stats, errors.New("accountsdb: compaction requires a durable mutable account index")
 	}
 	if cfg.RewindHorizonBatches == 0 {
 		cfg.RewindHorizonBatches = 1
 	}
 	if cfg.MinDeadFraction <= 0 {
 		cfg.MinDeadFraction = defaultMinDeadFraction
+	}
+	if math.IsNaN(cfg.MinDeadFraction) || cfg.MinDeadFraction > 1 {
+		return stats, fmt.Errorf("accountsdb: invalid compaction minimum dead fraction %v", cfg.MinDeadFraction)
 	}
 	if cfg.MaxMoveBytesPerCycle <= 0 {
 		cfg.MaxMoveBytesPerCycle = defaultMaxMoveBytesPerCycle
@@ -107,26 +203,43 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 		cfg.MaxScanBytesPerCycle = defaultMaxScanBytesPerCycle
 	}
 
-	db.foldMu.Lock()
+	if cfg.NonBlocking {
+		if !db.foldMu.TryLock() {
+			return stats, ErrCompactionBusy
+		}
+	} else {
+		db.foldMu.Lock()
+	}
 	defer db.foldMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return stats, err
+	}
 
 	meta, _, err := db.readFoldMeta()
 	if err != nil {
 		return stats, err
 	}
 
-	pinned, manifestByFileId, err := db.compactionPinSet(meta.BatchSeq, cfg.RewindHorizonBatches)
+	pinned, manifestByFileId, err := db.compactionPinSet(ctx, meta.BatchSeq, cfg.RewindHorizonBatches)
 	if err != nil {
 		return stats, err
 	}
 
-	bootstrapHigh := db.bootstrapHighFileId()
+	bootstrapHigh, err := db.bootstrapHighFileId()
+	if err != nil {
+		return stats, err
+	}
 	entries, err := os.ReadDir(db.AcctsDir)
 	if err != nil {
 		return stats, err
 	}
 	candidates := make([]compactCandidate, 0, len(entries))
-	for _, e := range entries {
+	for entryOrdinal, e := range entries {
+		if entryOrdinal&4095 == 0 {
+			if err := ctx.Err(); err != nil {
+				return stats, err
+			}
+		}
 		name := e.Name()
 		if e.IsDir() {
 			continue
@@ -144,12 +257,22 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 		}
 		info, ierr := e.Info()
 		if ierr != nil {
-			continue
+			return stats, fmt.Errorf("accountsdb: inspect compaction candidate %s: %w", name, ierr)
+		}
+		if !info.Mode().IsRegular() {
+			return stats, fmt.Errorf("accountsdb: compaction candidate %s is not a regular file", name)
 		}
 		candidates = append(candidates, compactCandidate{
 			name: name, slot: slot, fileId: fileId, size: info.Size(), manifestPath: mpath,
+			// FileId order only distinguishes bootstrap data from undecided
+			// orphans; it does not prove which files a rolling immutable index
+			// generation references. Retirement is cheap and idempotent, so record
+			// it for every removed path. Generation GC may discard the marker once
+			// no published or pinned base can name the path.
+			retirementRequired: db.ProductionIndex != nil || db.Index != nil,
 		})
 	}
+	stats.EligibleCandidates = len(candidates)
 	// Deterministic order + resume after the previous cycle's cursor so large
 	// directories make steady progress instead of rescanning the same prefix.
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].name < candidates[j].name })
@@ -166,17 +289,33 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 		candidates = append(rotated, before...)
 	}
 
-	var scannedBytes int64
+	var deferredOutputPressure error
 	for _, c := range candidates {
-		if stats.LiveBytesMoved >= cfg.MaxMoveBytesPerCycle || scannedBytes >= cfg.MaxScanBytesPerCycle {
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
+		if stats.LiveBytesMoved >= cfg.MaxMoveBytesPerCycle || stats.ScannedBytes >= cfg.MaxScanBytesPerCycle {
 			break
 		}
 		db.compactCursor = c.name
-		scannedBytes += c.size
+		if cfg.MaxSourceBytes > 0 && c.size > cfg.MaxSourceBytes {
+			stats.SourceSizeDeferrals++
+			stats.MaxDeferredSourceBytes = max(stats.MaxDeferredSourceBytes, c.size)
+			continue
+		}
+		stats.ScannedBytes += c.size
+		stats.MaxSourceBytes = max(stats.MaxSourceBytes, c.size)
 		stats.CandidatesScanned++
 
-		acted, moved, err := db.compactFile(c, cfg.MinDeadFraction)
+		acted, moved, err := db.compactFile(ctx, c, cfg.MinDeadFraction, cfg.MinOutputFreeBytes)
 		if err != nil {
+			if cfg.ContinueOnOutputSpacePressure && errors.Is(err, ErrAppendVecDiskPressure) {
+				stats.OutputSpaceDeferrals++
+				if deferredOutputPressure == nil {
+					deferredOutputPressure = fmt.Errorf("accountsdb: compact %s: %w", c.name, err)
+				}
+				continue
+			}
 			return stats, fmt.Errorf("accountsdb: compact %s: %w", c.name, err)
 		}
 		switch {
@@ -191,9 +330,14 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 			stats.BytesReclaimed += c.size - moved
 		}
 	}
+	stats.PassComplete = stats.CandidatesScanned+stats.SourceSizeDeferrals == stats.EligibleCandidates
+	if deferredOutputPressure != nil && stats.BytesReclaimed == 0 {
+		return stats, deferredOutputPressure
+	}
 	if stats.FilesCompacted > 0 || stats.FilesDeleted > 0 {
-		mlog.Log.Infof("accountsdb: compaction cycle — %d scanned, %d compacted, %d deleted, %s live moved, %s reclaimed",
-			stats.CandidatesScanned, stats.FilesCompacted, stats.FilesDeleted,
+		mlog.Log.Infof("accountsdb: compaction cycle — %d files/%s scanned (largest source %s), %d compacted, %d deleted, %s live moved, %s reclaimed",
+			stats.CandidatesScanned, humanBytes(stats.ScannedBytes), humanBytes(stats.MaxSourceBytes),
+			stats.FilesCompacted, stats.FilesDeleted,
 			humanBytes(stats.LiveBytesMoved), humanBytes(stats.BytesReclaimed))
 	}
 	return stats, nil
@@ -202,11 +346,15 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 // compactionPinSet returns the fileIds compaction must not touch (I5) plus a
 // fileId -> manifest-path map for every current (non-parked) manifest.
 //
-// Pinned: in-horizon fold segments (BatchSeq > head-horizon), every file an
-// in-horizon undo pointer names, and — unconditionally — parked ".rewound"
-// manifests' segments and undo targets (an interrupted rewind resumes through
-// them at the next startup; compaction must not pull files out from under it).
-func (db *AccountsDb) compactionPinSet(headSeq, horizon uint64) (map[uint64]struct{}, map[uint64]string, error) {
+// Pinned: the newest horizon fold segments and the boundary segment immediately
+// before them (BatchSeq >= head-horizon), every file an actually undoable suffix
+// manifest (BatchSeq > head-horizon) names, and — unconditionally — parked
+// ".rewound" manifests' segments and undo targets (an interrupted rewind resumes
+// through them at the next startup; compaction must not pull files out from
+// under it). The extra boundary segment is required because rewinding N batches
+// targets that manifest; its own undo pointers belong to the N+1 transition and
+// need not remain pinned.
+func (db *AccountsDb) compactionPinSet(ctx context.Context, headSeq, horizon uint64) (map[uint64]struct{}, map[uint64]string, error) {
 	horizonFloor := uint64(0)
 	if headSeq > horizon {
 		horizonFloor = headSeq - horizon
@@ -218,7 +366,12 @@ func (db *AccountsDb) compactionPinSet(headSeq, horizon uint64) (map[uint64]stru
 	if err != nil {
 		return nil, nil, err
 	}
-	for _, e := range entries {
+	for entryOrdinal, e := range entries {
+		if entryOrdinal&4095 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, nil, err
+			}
+		}
 		name := e.Name()
 		if e.IsDir() || strings.HasSuffix(name, segManifestTmpSuffix) {
 			continue
@@ -230,23 +383,63 @@ func (db *AccountsDb) compactionPinSet(headSeq, horizon uint64) (map[uint64]stru
 		path := filepath.Join(db.AcctsDir, name)
 		hdr, herr := readManifestHeader(path)
 		if herr != nil {
-			continue // torn — recovery quarantines; its data file stays untouched (no manifest entry -> orphan rule)
+			// A published manifest is part of the rewind/compaction safety
+			// metadata.  If its header cannot be decoded, we cannot know its
+			// output file or (for a fold) which older appendvecs its undo
+			// pointers pin.  Continuing could therefore reclaim data needed by
+			// recovery or rewind.  Only .tmp files are undecided and were
+			// filtered above; malformed final manifests fail closed.
+			return nil, nil, fmt.Errorf(
+				"accountsdb: compaction: published manifest %s is not readable: %w",
+				path,
+				herr,
+			)
 		}
 		if !parked {
+			if previous, duplicate := manifestByFileId[hdr.FileId]; duplicate {
+				return nil, nil, fmt.Errorf(
+					"accountsdb: compaction: duplicate published manifest file ID %d: %s and %s",
+					hdr.FileId,
+					previous,
+					path,
+				)
+			}
 			manifestByFileId[hdr.FileId] = path
 		}
 		if hdr.Kind != ManifestKindFold {
 			continue
 		}
-		if parked || hdr.BatchSeq > horizonFloor {
+		pinOutput := parked || hdr.BatchSeq >= horizonFloor
+		pinUndoTargets := parked || hdr.BatchSeq > horizonFloor
+		if pinOutput {
 			pinned[hdr.FileId] = struct{}{}
 			m, merr := ReadSegmentManifest(path)
 			if merr != nil {
-				continue // segment itself stays pinned; undo targets unknown but recovery will quarantine this manifest
+				return nil, nil, fmt.Errorf(
+					"accountsdb: compaction: in-horizon manifest %s is not fully CRC-valid: %w",
+					path,
+					merr,
+				)
 			}
-			for i := range m.Records {
-				if m.Records[i].PrevValid {
-					pinned[m.Records[i].Prev.FileId] = struct{}{}
+			if err := validateManifestHeaderIdentity(hdr, m); err != nil {
+				return nil, nil, fmt.Errorf(
+					"accountsdb: compaction: in-horizon manifest %s changed while reading: %w",
+					path,
+					err,
+				)
+			}
+			if err := validateFoldManifestIdentity(m, path, parked); err != nil {
+				return nil, nil, fmt.Errorf(
+					"accountsdb: compaction: invalid in-horizon fold manifest %s: %w",
+					path,
+					err,
+				)
+			}
+			if pinUndoTargets {
+				for i := range m.Records {
+					if m.Records[i].PrevValid {
+						pinned[m.Records[i].Prev.FileId] = struct{}{}
+					}
 				}
 			}
 		}
@@ -258,51 +451,111 @@ func (db *AccountsDb) compactionPinSet(headSeq, horizon uint64) (map[uint64]stru
 // to a fresh output file and unlinks the source. Returns (acted, liveBytesMoved).
 // acted=false means the file was left alone (too live). liveBytesMoved==0 with
 // acted=true means the fully-dead fast path (source deleted, nothing written).
-func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (bool, int64, error) {
+func (db *AccountsDb) compactFile(
+	ctx context.Context,
+	c compactCandidate,
+	minDeadFraction float64,
+	minOutputFreeBytes uint64,
+) (bool, int64, error) {
 	srcPath := filepath.Join(db.AcctsDir, c.name)
-	data, err := os.ReadFile(srcPath)
+	src, openedInfo, err := openStableRegularFile(srcPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return false, 0, nil // raced an external cleanup; nothing to do
 		}
 		return false, 0, err
 	}
+	defer src.Close()
+	if openedInfo.Size() < 0 {
+		return false, 0, fmt.Errorf("source is not a regular appendvec")
+	}
+	sourceSize := openedInfo.Size()
 
-	pubkeys, idxEntries, _, err := BuildIndexEntriesFromAppendVecs(data, uint64(len(data)), c.slot, c.fileId)
-	if err != nil {
-		return false, 0, err
+	// A previously durable retirement can be left behind by a crash before
+	// unlink. Such a path is no longer authoritative for immutable-base hits;
+	// exact mutable mappings (if any) still count as live defensively.
+	alreadyRetired := false
+	if c.retirementRequired {
+		alreadyRetired, err = db.isAppendVecRetired(c.slot, c.fileId)
+		if err != nil {
+			return false, 0, err
+		}
 	}
 
 	// Exact liveness: the index still names this (fileId, offset). The entry's
 	// slot must also equal the filename slot — the read path builds the file
 	// name from the entry's slot, so a mismatched entry could not be served
 	// from the output file and is safest left untouched.
-	liveIdx := make([]int, 0, len(idxEntries))
-	var liveBytes int64
-	for i := range idxEntries {
-		cur, closer, gerr := db.Index.Get(pubkeys[i][:])
-		if gerr != nil {
-			if gerr == pebble.ErrNotFound {
-				continue
-			}
-			return false, 0, gerr
+	var liveBytes uint64
+	var liveRecords uint64
+	isLive := func(rec appendVecScanRecord) (bool, error) {
+		// The source scan supplies the full key, and the complete tuple check is
+		// sufficient to reject a StreamHash false candidate without reading data.
+		curEntry, source, found, pin, lookupErr := db.lookupAccountIndexCandidatePinned(rec.Pubkey)
+		if pin != nil {
+			defer pin.Close()
 		}
-		curEntry, derr := UnmarshalAcctIdxEntry(cur)
-		closer.Close()
-		if derr != nil {
-			return false, 0, derr
+		if lookupErr != nil {
+			return false, lookupErr
 		}
-		if curEntry.FileId == c.fileId && curEntry.Offset == idxEntries[i].Offset && curEntry.Slot == c.slot {
-			liveIdx = append(liveIdx, i)
-			liveBytes += recordLenAt(data, idxEntries[i].Offset)
+		if !found || curEntry.FileId != c.fileId || curEntry.Offset != rec.Offset || curEntry.Slot != c.slot {
+			return false, nil
 		}
+		if alreadyRetired && source == accountIndexSourceBase {
+			return false, nil
+		}
+		return true, nil
+	}
+	if err := scanAppendVecRecords(ctx, src, sourceSize, func(rec appendVecScanRecord) error {
+		live, lookupErr := isLive(rec)
+		if lookupErr != nil {
+			return lookupErr
+		}
+		if !live {
+			return nil
+		}
+		if liveBytes > math.MaxUint64-rec.Span {
+			return errors.New("live appendvec byte count overflows uint64")
+		}
+		liveBytes += rec.Span
+		if liveRecords == math.MaxUint64 {
+			return errors.New("live appendvec record count overflows uint64")
+		}
+		liveRecords++
+		return nil
+	}); err != nil {
+		return false, 0, err
+	}
+	// The accounts directory is process-private in normal operation, but fail
+	// closed if it was accidentally or maliciously rewritten while this long
+	// liveness scan was in flight. In particular, never retire or unlink a path
+	// that has become a symlink or now names a different inode.
+	fire(db.foldHooks.afterCompactionSourceScan)
+	if err := validateStableRegularFile(src, srcPath, openedInfo); err != nil {
+		return false, 0, fmt.Errorf("validate compaction source after liveness scan: %w", err)
 	}
 
-	if len(data) == 0 || len(liveIdx) == 0 {
+	if sourceSize == 0 || liveRecords == 0 {
 		// Fully dead (or empty bankhash-only segment past the horizon): no
-		// index state references it; drop source + its manifest.
+		// index state references it. Durably retire the path before unlinking so
+		// immutable-base false positives remain distinguishable from data loss.
+		if err := ctx.Err(); err != nil {
+			return false, 0, err
+		}
+		if c.retirementRequired && !alreadyRetired {
+			err = db.markAppendVecRetired(c.slot, c.fileId)
+		}
+		if err != nil {
+			return false, 0, err
+		}
+		if err := ctx.Err(); err != nil {
+			return false, 0, err
+		}
 		db.appendVecReadMu.Lock()
-		err := removeSourceFiles(db.AcctsDir, srcPath, c.manifestPath)
+		err = validateStableRegularFile(src, srcPath, openedInfo)
+		if err == nil {
+			err = removeSourceFiles(db.AcctsDir, srcPath, c.manifestPath)
+		}
 		db.appendVecReadMu.Unlock()
 		if err != nil {
 			return false, 0, err
@@ -310,46 +563,93 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 		return true, 0, nil
 	}
 
-	deadFraction := 1.0 - float64(liveBytes)/float64(len(data))
+	if liveBytes > uint64(sourceSize) {
+		return false, 0, fmt.Errorf("live byte count %d exceeds source size %d", liveBytes, sourceSize)
+	}
+	deadFraction := 1.0 - float64(liveBytes)/float64(sourceSize)
 	if deadFraction < minDeadFraction {
 		return false, 0, nil
+	}
+	if minOutputFreeBytes > 0 {
+		space, spaceErr := db.appendVecFilesystemSpace()
+		if spaceErr != nil {
+			return false, 0, spaceErr
+		}
+		required := saturatingAddUint64(liveBytes, compactionRelocationWALBytes(liveRecords))
+		required = saturatingAddUint64(required, db.compactionRewriteAndMetadataHeadroomBytes())
+		required = saturatingAddUint64(required, minOutputFreeBytes)
+		if space.AvailableBytes < required {
+			return false, 0, &AppendVecDiskPressureError{
+				Operation:      "compaction output preflight",
+				AvailableBytes: space.AvailableBytes,
+				RequiredBytes:  required,
+			}
+		}
 	}
 
 	// Allocate the output fileId, persisting the high-water mark before the
 	// first data byte (I7 — a crash must never lead to fileId reuse).
-	newFileId := db.LargestFileId.Add(1)
-	if err := db.persistLargestFileId(); err != nil {
+	newFileId, err := db.allocateFileID()
+	if err != nil {
 		return false, 0, err
-	}
-
-	// Raw-copy each live record span (header + data + alignment padding) so the
-	// output is byte-identical per record; offsets are freshly assigned.
-	var buf bytes.Buffer
-	buf.Grow(int(liveBytes))
-	records := make([]ManifestRecord, 0, len(liveIdx))
-	for _, i := range liveIdx {
-		off := idxEntries[i].Offset
-		recLen := recordLenAt(data, off)
-		records = append(records, ManifestRecord{
-			Pubkey:    pubkeys[i],
-			Offset:    uint64(buf.Len()),
-			OwnerSlot: c.slot,
-		})
-		buf.Write(data[off : int64(off)+recLen])
 	}
 
 	outName := SegmentDataName(c.slot, newFileId)
 	outPath := filepath.Join(db.AcctsDir, outName)
-	f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return false, 0, err
 	}
-	if _, err := f.Write(buf.Bytes()); err != nil {
-		f.Close()
+	outputPublished := false
+	defer func() {
+		if outputPublished {
+			return
+		}
+		_ = f.Close()
+		if removeErr := os.Remove(outPath); removeErr == nil {
+			_ = fsyncDir(db.AcctsDir)
+		}
+	}()
+
+	// Pass two raw-copies only live spans. Account data is never materialized;
+	// the fixed copy buffer bounds memory independently of appendvec size.
+	copyBuf := make([]byte, compactCopyBufferBytes)
+	dataCRC := crc32.NewIEEE()
+	var outputBytes uint64
+	var outputRecords uint64
+	if err := scanAppendVecRecords(ctx, src, sourceSize, func(rec appendVecScanRecord) error {
+		live, lookupErr := isLive(rec)
+		if lookupErr != nil {
+			return lookupErr
+		}
+		if !live {
+			return nil
+		}
+		if outputBytes > math.MaxUint64-rec.Span {
+			return errors.New("compaction output length overflows uint64")
+		}
+		if err := copyAppendVecSpan(ctx, f, dataCRC, src, rec.Offset, rec.Span, copyBuf); err != nil {
+			return err
+		}
+		outputBytes += rec.Span
+		outputRecords++
+		return nil
+	}); err != nil {
+		return false, 0, err
+	}
+	if outputBytes != liveBytes || outputRecords != liveRecords {
+		return false, 0, fmt.Errorf(
+			"liveness changed while compacting: first pass=%d records/%d bytes, copy pass=%d records/%d bytes",
+			liveRecords, liveBytes, outputRecords, outputBytes,
+		)
+	}
+	if err := validateStableRegularFile(src, srcPath, openedInfo); err != nil {
+		return false, 0, fmt.Errorf("validate compaction source after copy: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
 		return false, 0, err
 	}
 	if err := f.Sync(); err != nil {
-		f.Close()
 		return false, 0, err
 	}
 	if err := f.Close(); err != nil {
@@ -369,75 +669,350 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 		FromSlot:    c.slot,
 		ThroughSlot: c.slot,
 		FileId:      newFileId,
-		DataLen:     uint64(buf.Len()),
-		DataCRC:     crc32.ChecksumIEEE(buf.Bytes()),
-		Records:     records,
+		DataLen:     outputBytes,
+		DataCRC:     dataCRC.Sum32(),
+		// Compact manifests are non-orphan certificates, not redo logs. Keeping
+		// relocation records out of them avoids retaining O(file records) RAM;
+		// the durable mutable-index journal below remains the source of truth.
+		Records: nil,
 	}
+	// WriteSegmentManifest may report a directory-fsync failure after its
+	// rename has already made the manifest visible. From this point onward keep
+	// the data file on every error; an unmanifested copy is an ordinary orphan,
+	// while a published manifest must never name a file we cleaned up.
+	outputPublished = true
 	if err := WriteSegmentManifest(db.AcctsDir, manifest); err != nil {
 		return false, 0, err
 	}
+	fire(db.foldHooks.afterManifestRename)
 
-	// Move the index entries in one batch, then make the move durable BEFORE
-	// unlinking the source — with the WAL off that means an explicit Flush,
-	// because compact manifests are not replayed at recovery. Exclude snapshot
-	// readers from this short move-to-unlink window, so each sees either the old
-	// path or the new path and never needs a cross-epoch per-key fallback.
-	db.appendVecReadMu.Lock()
-	defer db.appendVecReadMu.Unlock()
-	batch := db.Index.NewBatch()
-	defer batch.Close()
-	var idxBuf [24]byte
-	for _, rec := range records {
-		entry := AccountIndexEntry{Slot: c.slot, FileId: newFileId, Offset: rec.Offset}
-		entry.Marshal(&idxBuf)
-		if err := batch.Set(rec.Pubkey[:], idxBuf[:], nil); err != nil {
-			return false, 0, err
-		}
-	}
-	opts := pebble.Sync
-	if db.IndexWALDisabled {
-		opts = pebble.NoSync
-	}
-	if err := batch.Commit(opts); err != nil {
+	// Relocation frames are deliberately bounded. Between frames both files
+	// exist, so readers can safely observe either mapping; an interrupted run is
+	// resumed as ordinary dead-space cleanup. The source is retired and removed
+	// only after all relocation frames have reached durable storage.
+	if err := db.publishCompactionRelocations(ctx, outPath, int64(outputBytes), c.slot, newFileId); err != nil {
 		return false, 0, err
 	}
-	if db.IndexWALDisabled {
-		if err := db.Index.Flush(); err != nil {
+	if err := ctx.Err(); err != nil {
+		return false, 0, err
+	}
+
+	// Durably retire the old path without holding up readers on the journal
+	// fsync. Both copies still exist at this point and every true member has an
+	// exact relocation above the immutable base.
+	if c.retirementRequired && !alreadyRetired {
+		if err := db.markAppendVecRetired(c.slot, c.fileId); err != nil {
 			return false, 0, err
 		}
 	}
+	fire(db.foldHooks.afterIndexCommit)
+	if err := ctx.Err(); err != nil {
+		return false, 0, err
+	}
 
+	// Wait only for readers that captured an old mapping, then unlink. New
+	// readers already resolve every live key to the output.
+	db.appendVecReadMu.Lock()
+	defer db.appendVecReadMu.Unlock()
+	if err := validateStableRegularFile(src, srcPath, openedInfo); err != nil {
+		return false, 0, fmt.Errorf("validate compaction source before unlink: %w", err)
+	}
 	if err := removeSourceFiles(db.AcctsDir, srcPath, c.manifestPath); err != nil {
 		return false, 0, err
 	}
-	return true, int64(buf.Len()), nil
+	if outputBytes > math.MaxInt64 {
+		return false, 0, fmt.Errorf("compaction output length %d overflows int64", outputBytes)
+	}
+	return true, int64(outputBytes), nil
 }
 
-// recordLenAt returns the byte length of the appendvec record starting at off
-// (header + data + 8-byte alignment padding), clamped to the file end.
-func recordLenAt(data []byte, off uint64) int64 {
-	if int64(off)+hdrLen > int64(len(data)) {
-		return int64(len(data)) - int64(off)
+func (db *AccountsDb) appendVecFilesystemSpace() (AppendVecFilesystemSpace, error) {
+	probe := db.diskSpaceProbe
+	if probe == nil {
+		probe = ReadAppendVecFilesystemSpace
 	}
-	dataLen := uint64(0)
-	for i := 0; i < 8; i++ {
-		dataLen |= uint64(data[off+dataLenOffset+uint64(i)]) << (8 * i)
+	return probe(db.AcctsDir)
+}
+
+const (
+	compactCopyBufferBytes               = 256 << 10
+	compactRelocationChunkKeys           = 64 << 10
+	compactionFixedMetadataHeadroomBytes = uint64(64 << 20)
+	compactionRetirementWALMutations     = uint64(1)
+)
+
+// compactionRelocationWALBytes is the exact journal growth of the bounded
+// relocation frames plus one conservative retirement-marker frame. Every live
+// record produces one fixed-size mutation; each chunk has its own frame header.
+// Saturation is intentional: an unrepresentable requirement must fail closed.
+func compactionRelocationWALBytes(liveRecords uint64) uint64 {
+	frames := liveRecords / compactRelocationChunkKeys
+	if liveRecords%compactRelocationChunkKeys != 0 {
+		frames++
 	}
-	recLen := int64(hdrLen) + int64(util.AlignUp(dataLen, 8))
-	if int64(off)+recLen > int64(len(data)) {
-		return int64(len(data)) - int64(off)
+	payload := saturatingMultiplyUint64(liveRecords, deltaMutationSize)
+	headers := saturatingMultiplyUint64(frames, deltaFrameHeaderSize)
+	retirement := saturatingAddUint64(
+		deltaFrameHeaderSize,
+		saturatingMultiplyUint64(compactionRetirementWALMutations, deltaMutationSize),
+	)
+	return saturatingAddUint64(saturatingAddUint64(payload, headers), retirement)
+}
+
+// compactionRewriteAndMetadataHeadroomBytes covers the selector/manifest and
+// filesystem metadata plus the largest temporary exact-state WAL rewrite the
+// configured production mutable index can create while relocation frames are
+// being published. The old journal already occupies disk; this is the bounded
+// additional replacement file. Saturation again forces a safe refusal.
+func (db *AccountsDb) compactionRewriteAndMetadataHeadroomBytes() uint64 {
+	headroom := compactionFixedMetadataHeadroomBytes
+	if db == nil || db.ProductionIndex == nil || db.ProductionIndex.mutable == nil {
+		return headroom
 	}
-	return recLen
+	mutable := db.ProductionIndex.mutable
+	minimumCharge := min(mutable.config.BytesPerKey, mutable.config.BytesPerRetired)
+	if minimumCharge == 0 {
+		return math.MaxUint64
+	}
+	maxMutations := mutable.config.MaxHotBytes / minimumCharge
+	maxFrameMutations := mutable.maxFrameMutations()
+	if maxMutations != 0 && maxFrameMutations == 0 {
+		return math.MaxUint64
+	}
+	frames := uint64(0)
+	if maxMutations != 0 {
+		frames = maxMutations / maxFrameMutations
+		if maxMutations%maxFrameMutations != 0 {
+			frames++
+		}
+	}
+	rewriteBytes := saturatingAddUint64(
+		deltaJournalHeaderSize,
+		saturatingMultiplyUint64(maxMutations, deltaMutationSize),
+	)
+	rewriteBytes = saturatingAddUint64(
+		rewriteBytes,
+		saturatingMultiplyUint64(frames, deltaFrameHeaderSize),
+	)
+	return saturatingAddUint64(headroom, rewriteBytes)
+}
+
+type appendVecScanRecord struct {
+	Pubkey solana.PublicKey
+	Offset uint64
+	Span   uint64
+}
+
+// scanAppendVecRecords performs the hardened appendvec structural scan using
+// one fixed header. It intentionally skips account bodies: liveness needs only
+// the key and record span. A final record may omit up to seven padding bytes,
+// matching snapshot appendvec parsing.
+func scanAppendVecRecords(
+	ctx context.Context,
+	r io.ReaderAt,
+	fileSize int64,
+	visit func(appendVecScanRecord) error,
+) error {
+	if ctx == nil {
+		return errors.New("nil appendvec scan context")
+	}
+	if r == nil {
+		return errors.New("nil appendvec reader")
+	}
+	if visit == nil {
+		return errors.New("nil appendvec scan visitor")
+	}
+	if fileSize < 0 {
+		return fmt.Errorf("negative appendvec size %d", fileSize)
+	}
+	limit := uint64(fileSize)
+	var offset uint64
+	var header [hdrLen]byte
+	for offset < limit {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		remaining := limit - offset
+		if remaining < hdrLen {
+			tail := header[:int(remaining)]
+			clear(tail)
+			if err := readAppendVecAt(r, tail, offset); err != nil {
+				return fmt.Errorf("read appendvec tail at %d: %w", offset, err)
+			}
+			for _, b := range tail {
+				if b != 0 {
+					return fmt.Errorf("truncated appendvec header at offset %d: have %d bytes, need %d", offset, remaining, hdrLen)
+				}
+			}
+			return nil
+		}
+		if err := readAppendVecAt(r, header[:], offset); err != nil {
+			return fmt.Errorf("read appendvec header at %d: %w", offset, err)
+		}
+		dataLen := binary.LittleEndian.Uint64(header[dataLenOffset : dataLenOffset+8])
+		pubkey := solana.PublicKeyFromBytes(header[pubkeyOffset : pubkeyOffset+32])
+		lamports := binary.LittleEndian.Uint64(header[lamportsOffset : lamportsOffset+8])
+		if pubkey == (solana.PublicKey{}) && lamports == 0 {
+			return nil
+		}
+		if dataLen > maxAppendVecAccountDataLen {
+			return fmt.Errorf(
+				"appendvec account data length %d exceeds maximum %d at offset %d",
+				dataLen, maxAppendVecAccountDataLen, offset,
+			)
+		}
+		dataOffset := offset + hdrLen
+		if dataLen > limit-dataOffset {
+			return fmt.Errorf(
+				"truncated appendvec account data at offset %d: data length %d exceeds %d available bytes",
+				offset, dataLen, limit-dataOffset,
+			)
+		}
+		if dataLen > math.MaxUint64-7 {
+			return fmt.Errorf("appendvec account data length overflows alignment at offset %d: %d", offset, dataLen)
+		}
+		alignedDataLen := (dataLen + 7) &^ uint64(7)
+		if dataOffset > math.MaxUint64-alignedDataLen {
+			return fmt.Errorf("appendvec record end overflows at offset %d", offset)
+		}
+		recordEnd := dataOffset + alignedDataLen
+		actualEnd := recordEnd
+		if actualEnd > limit {
+			actualEnd = limit
+		}
+		if actualEnd <= offset {
+			return fmt.Errorf("appendvec record at offset %d has invalid end %d", offset, actualEnd)
+		}
+		if err := visit(appendVecScanRecord{Pubkey: pubkey, Offset: offset, Span: actualEnd - offset}); err != nil {
+			return err
+		}
+		offset = recordEnd
+	}
+	return nil
+}
+
+func readAppendVecAt(r io.ReaderAt, dst []byte, offset uint64) error {
+	if offset > math.MaxInt64 || uint64(len(dst)) > uint64(math.MaxInt64)-offset {
+		return fmt.Errorf("appendvec read range %d+%d overflows int64", offset, len(dst))
+	}
+	n, err := r.ReadAt(dst, int64(offset))
+	if n == len(dst) {
+		return nil
+	}
+	if err == nil {
+		err = io.ErrUnexpectedEOF
+	}
+	return err
+}
+
+func copyAppendVecSpan(
+	ctx context.Context,
+	dst io.Writer,
+	crc io.Writer,
+	src io.ReaderAt,
+	offset uint64,
+	length uint64,
+	buf []byte,
+) error {
+	if len(buf) == 0 {
+		return errors.New("empty compaction copy buffer")
+	}
+	for copied := uint64(0); copied < length; {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		chunk := min(uint64(len(buf)), length-copied)
+		if copied > math.MaxUint64-offset {
+			return errors.New("appendvec copy offset overflows uint64")
+		}
+		if err := readAppendVecAt(src, buf[:int(chunk)], offset+copied); err != nil {
+			return fmt.Errorf("read record span at %d: %w", offset+copied, err)
+		}
+		if err := writeCompactionBytes(dst, buf[:int(chunk)]); err != nil {
+			return fmt.Errorf("write compacted record: %w", err)
+		}
+		if err := writeCompactionBytes(crc, buf[:int(chunk)]); err != nil {
+			return fmt.Errorf("checksum compacted record: %w", err)
+		}
+		copied += chunk
+	}
+	return nil
+}
+
+func writeCompactionBytes(dst io.Writer, data []byte) error {
+	for len(data) != 0 {
+		n, err := dst.Write(data)
+		if n < 0 || n > len(data) {
+			return fmt.Errorf("invalid write count %d for %d bytes", n, len(data))
+		}
+		if n > 0 {
+			data = data[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
+}
+
+func (db *AccountsDb) publishCompactionRelocations(
+	ctx context.Context,
+	outPath string,
+	outputSize int64,
+	slot uint64,
+	fileID uint64,
+) error {
+	out, err := os.Open(outPath)
+	if err != nil {
+		return fmt.Errorf("open compaction output for publication: %w", err)
+	}
+	defer out.Close()
+	mutations := make([]deltaIndexMutation, 0, compactRelocationChunkKeys)
+	flush := func() error {
+		if len(mutations) == 0 {
+			return nil
+		}
+		if err := db.applyAccountIndexMutations(mutations, nil); err != nil {
+			return err
+		}
+		mutations = mutations[:0]
+		return nil
+	}
+	if err := scanAppendVecRecords(ctx, out, outputSize, func(rec appendVecScanRecord) error {
+		entry := AccountIndexEntry{Slot: slot, FileId: fileID, Offset: rec.Offset}
+		mutations = append(mutations, liveDeltaMutation(rec.Pubkey, entry))
+		if len(mutations) == cap(mutations) {
+			return flush()
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("scan compaction output for index publication: %w", err)
+	}
+	if err := flush(); err != nil {
+		return fmt.Errorf("publish compaction index relocations: %w", err)
+	}
+	return nil
 }
 
 func removeSourceFiles(acctsDir, srcPath, manifestPath string) error {
-	if err := os.Remove(srcPath); err != nil && !os.IsNotExist(err) {
-		return err
-	}
+	// Remove and durably forget the old commit record first. If power is lost
+	// here, its still-present data file is merely an orphan; the already-durable
+	// index points at the compaction output. Removing data first could leave a
+	// durable fold manifest naming a missing segment, causing recovery to mistake
+	// old compacted history for a torn canonical batch.
 	if manifestPath != "" {
 		if err := os.Remove(manifestPath); err != nil && !os.IsNotExist(err) {
 			return err
 		}
+		if err := fsyncDir(acctsDir); err != nil {
+			return err
+		}
+	}
+	if err := os.Remove(srcPath); err != nil && !os.IsNotExist(err) {
+		return err
 	}
 	return fsyncDir(acctsDir)
 }

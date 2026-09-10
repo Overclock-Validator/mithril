@@ -50,12 +50,14 @@ func runDoctor() {
 	// 2. Cluster and protocol path.
 	total++
 	cluster := config.GetString("network.cluster")
-	if cluster == "alpenglow" || cluster == "mainnet-beta" || cluster == "testnet" || cluster == "devnet" {
+	if cluster == "alpenglow" {
 		fmt.Printf("  %s Network: %s\n", successStyle.Render("✓"), cluster)
 		passed++
 	} else if cluster == "" {
 		fmt.Printf("  %s Network: alpenglow (default; network.cluster not set)\n", successStyle.Render("✓"))
 		passed++
+	} else if cluster == "mainnet-beta" || cluster == "testnet" || cluster == "devnet" {
+		fmt.Printf("  %s Network: %s is not supported by this branch's V2 runtime (use the dev branch for classic clusters)\n", errorStyle.Render("✗"), cluster)
 	} else {
 		fmt.Printf("  %s Invalid cluster: %s\n", errorStyle.Render("✗"), cluster)
 	}

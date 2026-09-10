@@ -63,20 +63,34 @@ type DebugConfig struct {
 
 // DevelopmentConfig holds development/tuning configuration (matches Firedancer [development] section)
 type DevelopmentConfig struct {
-	ZstdDecoderConcurrency        int         `toml:"zstd_decoder_concurrency" mapstructure:"zstd_decoder_concurrency"`                 // was: zstd-decoder-concurrency
-	MaxConcurrentFlushers         int         `toml:"max_concurrent_flushers" mapstructure:"max_concurrent_flushers"`                   // was: max-concurrent-flushers
-	SnapshotAppendVecWorkers      int         `toml:"snapshot_append_vec_workers" mapstructure:"snapshot_append_vec_workers"`           // Snapshot appendvec write workers
-	SnapshotIndexBuilderWorkers   int         `toml:"snapshot_index_builder_workers" mapstructure:"snapshot_index_builder_workers"`     // Snapshot index parsing workers
-	SnapshotIndexCommitterWorkers int         `toml:"snapshot_index_committer_workers" mapstructure:"snapshot_index_committer_workers"` // Snapshot index shard enqueue workers
-	SnapshotIndexShards           int         `toml:"snapshot_index_shards" mapstructure:"snapshot_index_shards"`                       // Snapshot account-index shard count
-	SnapshotIndexTempDir          string      `toml:"snapshot_index_temp_dir" mapstructure:"snapshot_index_temp_dir"`                   // Optional temp dir for snapshot index shard logs/SST staging
-	ParamArenaSizeMB              uint64      `toml:"param_arena_size_mb" mapstructure:"param_arena_size_mb"`                           // was: param-arena-size-mb
-	BorrowedAccountArenaSize      uint64      `toml:"borrowed_account_arena_size" mapstructure:"borrowed_account_arena_size"`           // was: borrowed-account-arena-size
-	UsePool                       bool        `toml:"use_pool" mapstructure:"use_pool"`                                                 // was: use-pool
-	Pprof                         PprofConfig `toml:"pprof" mapstructure:"pprof"`
-	ProgramCacheMaxMB             int         `toml:"program_cache_max_mb" mapstructure:"program_cache_max_mb"`               // Approximate SBPF program cache size in MiB
-	CommonAccountCacheMaxMB       int         `toml:"common_account_cache_max_mb" mapstructure:"common_account_cache_max_mb"` // Retained decoded account cache budget in MiB
-	Debug                         DebugConfig `toml:"debug" mapstructure:"debug"`
+	ZstdDecoderConcurrency              int         `toml:"zstd_decoder_concurrency" mapstructure:"zstd_decoder_concurrency"`                                 // was: zstd-decoder-concurrency
+	MaxConcurrentFlushers               int         `toml:"max_concurrent_flushers" mapstructure:"max_concurrent_flushers"`                                   // was: max-concurrent-flushers
+	SnapshotAppendVecWorkers            int         `toml:"snapshot_append_vec_workers" mapstructure:"snapshot_append_vec_workers"`                           // Snapshot appendvec write workers
+	SnapshotIndexBuilderWorkers         int         `toml:"snapshot_index_builder_workers" mapstructure:"snapshot_index_builder_workers"`                     // Snapshot index parsing workers
+	SnapshotIndexCommitterWorkers       int         `toml:"snapshot_index_committer_workers" mapstructure:"snapshot_index_committer_workers"`                 // Snapshot index shard enqueue workers
+	SnapshotIndexShards                 int         `toml:"snapshot_index_shards" mapstructure:"snapshot_index_shards"`                                       // Snapshot account-index shard count
+	SnapshotIndexTempDir                string      `toml:"snapshot_index_temp_dir" mapstructure:"snapshot_index_temp_dir"`                                   // Optional temp dir for snapshot index sorted-run staging
+	SnapshotIndexSortChunkMB            int         `toml:"snapshot_index_sort_chunk_mb" mapstructure:"snapshot_index_sort_chunk_mb"`                         // Per-flusher external-sort memory bound
+	AccountIndexShards                  int         `toml:"account_index_shards" mapstructure:"account_index_shards"`                                         // Persistent V2 shard count (immutable for an existing DB)
+	AccountIndexMaxHotKeys              uint64      `toml:"account_index_max_hot_keys" mapstructure:"account_index_max_hot_keys"`                             // Exact mutable overlay key bound
+	AccountIndexMaxHotMB                uint64      `toml:"account_index_max_hot_mb" mapstructure:"account_index_max_hot_mb"`                                 // Accounted mutable overlay memory bound
+	AccountIndexMaxCheckpointSelectedMB uint64      `toml:"account_index_max_checkpoint_selected_mb" mapstructure:"account_index_max_checkpoint_selected_mb"` // Root-selected exact checkpoint disk/RSS budget
+	AccountIndexMaxCheckpointPhysicalMB uint64      `toml:"account_index_max_checkpoint_physical_mb" mapstructure:"account_index_max_checkpoint_physical_mb"` // Selected, building, and reader-pinned checkpoint budget
+	AccountIndexSealKeys                uint64      `toml:"account_index_seal_keys" mapstructure:"account_index_seal_keys"`                                   // Per-shard checkpoint threshold
+	AccountIndexSealMaxAgeMS            int64       `toml:"account_index_seal_max_age_ms" mapstructure:"account_index_seal_max_age_ms"`                       // Maximum non-empty shard age
+	AccountIndexRebaseKeys              uint64      `toml:"account_index_rebase_keys" mapstructure:"account_index_rebase_keys"`                               // Per-shard rolling base threshold
+	AccountIndexJournalRewriteMB        uint64      `toml:"account_index_journal_rewrite_mb" mapstructure:"account_index_journal_rewrite_mb"`                 // WAL rewrite growth threshold
+	AccountIndexCheckpointWorkers       int         `toml:"account_index_checkpoint_workers" mapstructure:"account_index_checkpoint_workers"`                 // Checkpoint build parallelism
+	AccountIndexMaxConcurrentSeals      int         `toml:"account_index_max_concurrent_seals" mapstructure:"account_index_max_concurrent_seals"`             // Concurrent shard checkpoint builds
+	AccountIndexRebaseWorkers           int         `toml:"account_index_rebase_workers" mapstructure:"account_index_rebase_workers"`                         // Serialized while extent lineage is shared
+	WorkingSetMaxMB                     uint64      `toml:"working_set_max_mb" mapstructure:"working_set_max_mb"`                                             // Conservative unrooted account-layer threshold
+	ParamArenaSizeMB                    uint64      `toml:"param_arena_size_mb" mapstructure:"param_arena_size_mb"`                                           // was: param-arena-size-mb
+	BorrowedAccountArenaSize            uint64      `toml:"borrowed_account_arena_size" mapstructure:"borrowed_account_arena_size"`                           // was: borrowed-account-arena-size
+	UsePool                             bool        `toml:"use_pool" mapstructure:"use_pool"`                                                                 // was: use-pool
+	Pprof                               PprofConfig `toml:"pprof" mapstructure:"pprof"`
+	ProgramCacheMaxMB                   int         `toml:"program_cache_max_mb" mapstructure:"program_cache_max_mb"`               // Approximate SBPF program cache size in MiB
+	CommonAccountCacheMaxMB             int         `toml:"common_account_cache_max_mb" mapstructure:"common_account_cache_max_mb"` // Retained decoded account cache budget in MiB
+	Debug                               DebugConfig `toml:"debug" mapstructure:"debug"`
 }
 
 // ReportingConfig holds metrics/reporting configuration (matches Firedancer [reporting] section)

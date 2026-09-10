@@ -283,9 +283,6 @@ func (m editModel) currentItems() []edItem {
 		}
 		return []edItem{
 			{label: "alpenglow", value: "alpenglow", desc: "Certificate fork choice and speculative replay"},
-			{label: "mainnet-beta", value: "mainnet-beta", desc: "Classic verifying-only RPC replay"},
-			{label: "testnet", value: "testnet", desc: "Classic verifying-only RPC replay"},
-			{label: "devnet", value: "devnet", desc: "Classic verifying-only RPC replay"},
 			{isSep: true},
 			{label: "← Back", value: "_back"},
 		}

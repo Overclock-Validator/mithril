@@ -4,12 +4,15 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/stretchr/testify/require"
 )
 
 func TestReadTarRetainsStatusCacheForEveryBuilderOptionPath(t *testing.T) {
@@ -97,6 +100,103 @@ func TestReadTarCorruptTailAfterStatusCachePreservesInstalledSeed(t *testing.T) 
 	if len(temporaries) != 0 {
 		t.Fatalf("temporary status-cache files remain after corrupt archive: %v", temporaries)
 	}
+}
+
+func TestReadTarRejectsArchiveMissingManifestAppendVec(t *testing.T) {
+	dir := t.TempDir()
+	archive := filepath.Join(dir, "missing-appendvec.tar.zst")
+	writeStatusCacheArchive(t, archive, []byte("status-cache"), 1)
+	pools := &snapshotWorkerPools{
+		errors: &snapshotWorkerErrors{},
+		manifest: &SnapshotManifest{
+			Bank: &DeserializableVersionedBank{Slot: 7},
+			AccountsDb: &AccountsDbFields{Slot: 7, Storages: map[uint64]SlotAcctVecs{
+				7: {Slot: 7, AcctVecs: []AcctVec{{Id: 9, FileSize: 123}}},
+			}}},
+	}
+	destination := filepath.Join(dir, "status-cache")
+
+	err := readTar(context.Background(), &sync.WaitGroup{}, archive, pools, readTarOptions{
+		statusCachePath: destination,
+	})
+	if err == nil || !strings.Contains(err.Error(), "omitted 1 manifest appendvec") {
+		t.Fatalf("expected missing manifest appendvec error, got %v", err)
+	}
+	if _, statErr := os.Stat(destination); !os.IsNotExist(statErr) {
+		t.Fatalf("status cache was published for incomplete archive: %v", statErr)
+	}
+}
+
+func TestReadTarBindsManifestPassAndRequiresSupportedVersion(t *testing.T) {
+	dir := t.TempDir()
+	expectedManifest := []byte("manifest-selected-on-first-pass")
+	manifest := &SnapshotManifest{
+		Bank:         &DeserializableVersionedBank{Slot: 7},
+		AccountsDb:   &AccountsDbFields{Slot: 7, Storages: map[uint64]SlotAcctVecs{}},
+		rawDigest:    sha256.Sum256(expectedManifest),
+		hasRawDigest: true,
+	}
+	pools := &snapshotWorkerPools{errors: &snapshotWorkerErrors{}, manifest: manifest}
+
+	valid := filepath.Join(dir, "valid.tar.zst")
+	writeBootstrapMetadataArchive(t, valid, expectedManifest, "1.2.0", 1, 1)
+	require.NoError(t, readTar(context.Background(), &sync.WaitGroup{}, valid, pools, readTarOptions{
+		statusCachePath: filepath.Join(dir, "valid-status"),
+	}))
+
+	changed := filepath.Join(dir, "changed.tar.zst")
+	writeBootstrapMetadataArchive(t, changed, []byte("different-manifest"), "1.2.0", 1, 1)
+	err := readTar(context.Background(), &sync.WaitGroup{}, changed, pools, readTarOptions{
+		statusCachePath: filepath.Join(dir, "changed-status"),
+	})
+	require.ErrorContains(t, err, "manifest differs")
+
+	unsupported := filepath.Join(dir, "unsupported.tar.zst")
+	writeBootstrapMetadataArchive(t, unsupported, expectedManifest, "2.0.0", 1, 1)
+	err = readTar(context.Background(), &sync.WaitGroup{}, unsupported, pools, readTarOptions{
+		statusCachePath: filepath.Join(dir, "unsupported-status"),
+	})
+	require.ErrorContains(t, err, "unsupported snapshot version")
+
+	duplicate := filepath.Join(dir, "duplicate-manifest.tar.zst")
+	writeBootstrapMetadataArchive(t, duplicate, expectedManifest, "1.2.0", 2, 1)
+	err = readTar(context.Background(), &sync.WaitGroup{}, duplicate, pools, readTarOptions{
+		statusCachePath: filepath.Join(dir, "duplicate-status"),
+	})
+	require.ErrorContains(t, err, "multiple canonical manifest")
+}
+
+func writeBootstrapMetadataArchive(
+	t *testing.T,
+	filename string,
+	manifest []byte,
+	version string,
+	manifestCopies int,
+	versionCopies int,
+) {
+	t.Helper()
+	f, err := os.Create(filename)
+	require.NoError(t, err)
+	zw, err := zstd.NewWriter(f)
+	require.NoError(t, err)
+	tw := tar.NewWriter(zw)
+	for range versionCopies {
+		require.NoError(t, tw.WriteHeader(&tar.Header{Name: "version", Mode: 0o644, Size: int64(len(version))}))
+		_, err = tw.Write([]byte(version))
+		require.NoError(t, err)
+	}
+	for range manifestCopies {
+		require.NoError(t, tw.WriteHeader(&tar.Header{Name: "snapshots/7/7", Mode: 0o644, Size: int64(len(manifest))}))
+		_, err = tw.Write(manifest)
+		require.NoError(t, err)
+	}
+	status := bytes.Repeat([]byte{0x7a}, 32)
+	require.NoError(t, tw.WriteHeader(&tar.Header{Name: agaveStatusCacheArchiveMember, Mode: 0o644, Size: int64(len(status))}))
+	_, err = tw.Write(status)
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+	require.NoError(t, zw.Close())
+	require.NoError(t, f.Close())
 }
 
 func writeStatusCacheArchive(t *testing.T, filename string, payload []byte, copies int) {

@@ -1,7 +1,6 @@
 package replay
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
 
@@ -38,23 +37,17 @@ func (o *orderAssertingCommitter) CommitBatch(deltas []accounts.SlotDelta, throu
 	return o.fakeCommitter.CommitBatch(deltas, throughSlot, bankhashes, resumeCtx)
 }
 
-// readStakeIndexPubkeys parses the on-disk index directly (8-byte "STKI"
-// header + 48-byte records) so assertions are independent of the global's
-// load cache.
+// readStakeIndexPubkeys parses the on-disk index directly so assertions are
+// independent of the global's load cache.
 func readStakeIndexPubkeys(t *testing.T, path string) map[solana.PublicKey]struct{} {
 	t.Helper()
-	data, err := os.ReadFile(path)
+	entries, _, err := accountsdb.ReadStakePubkeyIndex(path)
 	if err != nil {
 		return map[solana.PublicKey]struct{}{} // no file yet = nothing flushed
 	}
 	out := make(map[solana.PublicKey]struct{})
-	if len(data) < 8 {
-		return out
-	}
-	for off := 8; off+accountsdb.StakeIndexRecordSize <= len(data); off += accountsdb.StakeIndexRecordSize {
-		var pk solana.PublicKey
-		copy(pk[:], data[off:off+32])
-		out[pk] = struct{}{}
+	for _, entry := range entries {
+		out[entry.Pubkey] = struct{}{}
 	}
 	return out
 }

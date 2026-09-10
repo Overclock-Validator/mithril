@@ -4,24 +4,21 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
+	"sync"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
+	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/cockroachdb/pebble"
-	"golang.org/x/sync/errgroup"
+	"github.com/gagliardetto/solana-go"
 )
-
-// metaKeyLastBatch is the Pebble index key holding the fold commit watermark
-// {batchSeq, throughSlot, fileId}. Its length (!= 32) cannot collide with an
-// account pubkey key. Writing it in the same batch as the index entries is the
-// atomic "index epoch flip" that decides batch visibility.
-var metaKeyLastBatch = []byte("\x00mithril.meta.last_batch")
 
 type foldMeta struct {
 	BatchSeq    uint64
@@ -29,51 +26,30 @@ type foldMeta struct {
 	FileId      uint64
 }
 
-func encodeFoldMeta(m foldMeta) []byte {
-	var b [24]byte
-	binary.LittleEndian.PutUint64(b[0:8], m.BatchSeq)
-	binary.LittleEndian.PutUint64(b[8:16], m.ThroughSlot)
-	binary.LittleEndian.PutUint64(b[16:24], m.FileId)
-	return b[:]
-}
-
-func decodeFoldMeta(data []byte) (foldMeta, error) {
-	if len(data) < 24 {
-		return foldMeta{}, fmt.Errorf("accountsdb: fold meta record has %d < 24 bytes", len(data))
-	}
-	return foldMeta{
-		BatchSeq:    binary.LittleEndian.Uint64(data[0:8]),
-		ThroughSlot: binary.LittleEndian.Uint64(data[8:16]),
-		FileId:      binary.LittleEndian.Uint64(data[16:24]),
-	}, nil
-}
-
 // readFoldMeta returns the current fold watermark, or (zero, false) on a fresh
 // (never-folded) store.
 func (db *AccountsDb) readFoldMeta() (foldMeta, bool, error) {
-	val, closer, err := db.Index.Get(metaKeyLastBatch)
-	if err != nil {
-		if err == pebble.ErrNotFound {
-			return foldMeta{}, false, nil
-		}
-		return foldMeta{}, false, err
+	if db.ProductionIndex != nil {
+		meta, ok := db.ProductionIndex.ReadFoldMeta()
+		return meta, ok, nil
 	}
-	meta, derr := decodeFoldMeta(val)
-	closer.Close()
-	if derr != nil {
-		return foldMeta{}, false, derr
+	if db.Index == nil {
+		return foldMeta{}, false, nil
 	}
-	return meta, true, nil
+	meta, ok := db.Index.ReadFoldMeta()
+	return meta, ok, nil
 }
 
 // foldTestHooks fire between CommitBatch stages so tests can inject crashes
 // (each hook may panic) at every point of the crash matrix.
 type foldTestHooks struct {
-	afterSegmentFsync     func()
-	afterManifestRename   func()
-	beforeIndexCommit     func()
-	afterPublicationStart func()
-	afterIndexCommit      func()
+	afterSegmentFsync         func()
+	afterManifestRename       func()
+	beforeIndexCommit         func()
+	afterPublicationStart     func()
+	afterIndexTxnFrame        func(completed, total int)
+	afterIndexCommit          func()
+	afterCompactionSourceScan func()
 }
 
 func fire(h func()) {
@@ -91,6 +67,77 @@ type BatchCommitResult struct {
 	Bytes       int64
 }
 
+// FoldDiskAdmission reserves filesystem headroom for one fold. Admission runs
+// before CommitBatch takes foldMu, allocates a file ID, or writes any data. A
+// successful callback must return a non-nil, idempotent release function that
+// remains held through the complete fold.
+type FoldDiskAdmission func(requiredBytes uint64) (release func(), err error)
+
+// SetFoldDiskAdmission installs the process-local appendvec disk policy. Node
+// startup calls this before replay; the mutex also makes clearing it during a
+// quiesced shutdown race-safe for embedded callers.
+func (db *AccountsDb) SetFoldDiskAdmission(admission FoldDiskAdmission) error {
+	if db == nil {
+		return errors.New("accountsdb: set fold disk admission on nil database")
+	}
+	db.foldDiskAdmissionMu.Lock()
+	db.foldDiskAdmission = admission
+	db.foldDiskAdmissionMu.Unlock()
+	return nil
+}
+
+const (
+	// Besides the appendvec body, a fold may publish its manifest, index WAL
+	// frames, bank-hash metadata and filesystem bookkeeping. Charging 512 bytes
+	// per input account (before dedupe) plus a fixed 64 MiB is intentionally an
+	// upper bound rather than a prediction of the final segment size.
+	foldDiskBytesPerInputAccount = uint64(512)
+	foldDiskFixedHeadroomBytes   = uint64(64 << 20)
+)
+
+func estimateFoldDiskBytes(deltas []accounts.SlotDelta) (uint64, error) {
+	required := foldDiskFixedHeadroomBytes
+	for _, delta := range deltas {
+		for _, account := range delta.Delta {
+			if account == nil {
+				continue
+			}
+			dataBytes := uint64(len(account.Data))
+			if dataBytes > math.MaxUint64-7 {
+				return 0, errors.New("accountsdb: fold account data length overflows alignment")
+			}
+			alignedDataBytes := (dataBytes + 7) &^ uint64(7)
+			charge := saturatingAddUint64(foldDiskBytesPerInputAccount, alignedDataBytes)
+			if charge == math.MaxUint64 || required > math.MaxUint64-charge {
+				return 0, errors.New("accountsdb: estimated fold disk requirement overflows uint64")
+			}
+			required += charge
+		}
+	}
+	return required, nil
+}
+
+func (db *AccountsDb) acquireFoldDiskAdmission(deltas []accounts.SlotDelta) (func(), error) {
+	db.foldDiskAdmissionMu.RLock()
+	admit := db.foldDiskAdmission
+	db.foldDiskAdmissionMu.RUnlock()
+	if admit == nil {
+		return func() {}, nil
+	}
+	required, err := estimateFoldDiskBytes(deltas)
+	if err != nil {
+		return nil, err
+	}
+	release, err := admit(required)
+	if err != nil {
+		return nil, fmt.Errorf("accountsdb: admit fold requiring up to %d bytes: %w", required, err)
+	}
+	if release == nil {
+		return nil, errors.New("accountsdb: fold disk admission returned a nil release function")
+	}
+	return release, nil
+}
+
 type dedupedVersion struct {
 	acct      *accounts.Account
 	ownerSlot uint64
@@ -106,7 +153,7 @@ type dedupedVersion struct {
 //  5. write + fsync the manifest — once durable, the commit is DECIDED;
 //     recovery completes it from here (crash matrix C3)
 //  6. record bankhashes (advisory, NoSync — recoverable from the manifest)
-//  7. commit index entries + fold meta in one Pebble batch (the epoch flip)
+//  7. commit index entries + fold meta in one journal frame (the epoch flip)
 //  8. refresh read caches and advance the in-memory watermark
 //
 // The fold never overwrites existing data files, so concurrent readers are
@@ -118,14 +165,36 @@ func (db *AccountsDb) CommitBatch(
 	bankhashes map[uint64][32]byte,
 	resumeCtx []byte,
 ) (BatchCommitResult, error) {
+	// Disk admission is the first operation: failure must leave the file-ID
+	// selector, appendvec directory, manifest chain, bankhash store and account
+	// index untouched. The admission guard stays held until every fold side
+	// effect has completed, serializing it with emergency compaction.
+	releaseDiskAdmission, err := db.acquireFoldDiskAdmission(deltas)
+	if err != nil {
+		return BatchCommitResult{}, err
+	}
+	defer releaseDiskAdmission()
+
 	db.foldMu.Lock()
 	defer db.foldMu.Unlock()
+	if db.foldFatal != nil {
+		return BatchCommitResult{}, fmt.Errorf(
+			"accountsdb: refusing fold after an unresolved decided commit: %w",
+			db.foldFatal,
+		)
+	}
+	if db.lastBatchSeq == ^uint64(0) {
+		return BatchCommitResult{}, errors.New("accountsdb: fold batch sequence exhausted")
+	}
 
 	// (1) Union-dedupe, newest wins. Deltas MUST arrive strictly ascending by
 	// slot: newest-wins depends on iterating in order so a later slot's version
 	// overwrites an earlier one. Validate it so a future fork-aware caller can
 	// never silently fold stale state from mis-ordered deltas.
-	fromSlot := uint64(0)
+	// A manifest-only batch still belongs to the durable slot chain. Production
+	// promotion supplies at least one SlotDelta (even for an empty block), but
+	// retain a correct lower bound for direct callers that commit an empty slice.
+	fromSlot := db.durableThrough.Load()
 	prevSlot := uint64(0)
 	havePrev := false
 	union := make(map[[32]byte]dedupedVersion)
@@ -147,6 +216,14 @@ func (db *AccountsDb) CommitBatch(
 			union[[32]byte(a.Key)] = dedupedVersion{acct: a, ownerSlot: sd.Slot}
 		}
 	}
+	// Preflight the selected index before any file-id/data/manifest side effect.
+	// Replay normally shortens a fold to one WAL frame at a slot boundary. A
+	// single exceptionally large valid slot remains supported: pendingFold
+	// supplies its atomic read view while bounded idempotent frames are synced,
+	// and only the final frame advances fold meta.
+	if err := db.validateBatchAccountIndexMutations(uint64(len(union))); err != nil {
+		return BatchCommitResult{}, err
+	}
 	// An all-empty batch (empty blocks) still folds: the manifest records the
 	// batch's bankhashes + resume context and advances the watermark; the data
 	// file is empty and no index entries are written.
@@ -159,17 +236,47 @@ func (db *AccountsDb) CommitBatch(
 	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i][:], keys[j][:]) < 0 })
 
 	// (2) fileId allocation; persist high-water BEFORE the first data byte (I7).
-	fileId := db.LargestFileId.Add(1)
-	if err := db.persistLargestFileId(); err != nil {
+	fileId, err := db.allocateFileID()
+	if err != nil {
 		return BatchCommitResult{}, err
 	}
+
+	// The old-location lookup is independent of encoding the new immutable
+	// segment. Start it now so base-index mmap misses and appendvec header reads
+	// overlap segment serialization and fsync, then join before the manifest
+	// makes the commit durable.
+	type prevLookupResult struct {
+		entries []AccountIndexEntry
+		found   []bool
+		err     error
+	}
+	prevKeys := make([]solana.PublicKey, len(keys))
+	for i := range keys {
+		prevKeys[i] = keys[i]
+	}
+	prevLookupDone := make(chan prevLookupResult, 1)
+	go func() {
+		entries, found, err := db.lookupExactAccountIndexEntries(prevKeys)
+		prevLookupDone <- prevLookupResult{entries: entries, found: found, err: err}
+	}()
+	var (
+		prevLookup     prevLookupResult
+		prevLookupOnce sync.Once
+	)
+	waitForPrevLookup := func() {
+		prevLookupOnce.Do(func() { prevLookup = <-prevLookupDone })
+	}
+	defer waitForPrevLookup()
 
 	// (3) Stream each deduped record straight to the segment file (buffered),
 	// updating a running CRC and byte count as we go, so the fully serialized
 	// segment is never materialized in RAM — only the bufio buffer is. Record
 	// offsets are the byte position before each record.
 	dataName := filepath.Join(db.AcctsDir, SegmentDataName(throughSlot, fileId))
-	f, err := os.OpenFile(dataName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	// File IDs are durably monotonic. An existing path therefore signals a
+	// broken high-water invariant (or an unexpected concurrent writer) and must
+	// fail closed rather than truncating potentially committed account data.
+	f, err := os.OpenFile(dataName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return BatchCommitResult{}, err
 	}
@@ -181,7 +288,12 @@ func (db *AccountsDb) CommitBatch(
 	segErr := func() error {
 		for _, k := range keys {
 			v := union[k]
-			records = append(records, ManifestRecord{Pubkey: k, Offset: dataLen, OwnerSlot: v.ownerSlot})
+			records = append(records, ManifestRecord{
+				Pubkey:    k,
+				Offset:    dataLen,
+				OwnerSlot: v.ownerSlot,
+				Tombstone: v.acct.Lamports == 0,
+			})
 			ava := AppendVecAccount{
 				DataLen:    uint64(len(v.acct.Data)),
 				Pubkey:     v.acct.Key,
@@ -218,31 +330,17 @@ func (db *AccountsDb) CommitBatch(
 
 	// (4) Undo pointers: the index entry each key had before this batch. Bloom
 	// filters make misses cheap; bounded parallelism keeps fold latency down.
+	waitForPrevLookup()
 	prevs := make([]ManifestRecord, len(records))
 	copy(prevs, records)
-	var g errgroup.Group
-	g.SetLimit(max(4, runtime.NumCPU()/2))
-	for i := range prevs {
-		g.Go(func() error {
-			val, closer, err := db.Index.Get(prevs[i].Pubkey[:])
-			if err != nil {
-				if err == pebble.ErrNotFound {
-					return nil // PrevValid stays false
-				}
-				return err
-			}
-			entry, derr := UnmarshalAcctIdxEntry(val)
-			closer.Close()
-			if derr != nil {
-				return derr
-			}
-			prevs[i].PrevValid = true
-			prevs[i].Prev = *entry
-			return nil
-		})
+	if prevLookup.err != nil {
+		return BatchCommitResult{}, fmt.Errorf("accountsdb: capture undo pointers: %w", prevLookup.err)
 	}
-	if err := g.Wait(); err != nil {
-		return BatchCommitResult{}, fmt.Errorf("accountsdb: capture undo pointers: %w", err)
+	for i := range prevs {
+		if prevLookup.found[i] {
+			prevs[i].PrevValid = true
+			prevs[i].Prev = prevLookup.entries[i]
+		}
 	}
 
 	// (5) Manifest: once this rename is durable the commit is decided.
@@ -261,6 +359,14 @@ func (db *AccountsDb) CommitBatch(
 		ResumeCtx:   resumeCtx,
 	}
 	if err := WriteSegmentManifest(db.AcctsDir, manifest); err != nil {
+		if segmentManifestWasRenamed(err) {
+			return BatchCommitResult{}, db.failDecidedFold(
+				batchSeq,
+				throughSlot,
+				"manifest-directory-sync",
+				err,
+			)
+		}
 		return BatchCommitResult{}, err
 	}
 	fire(db.foldHooks.afterManifestRename)
@@ -270,7 +376,14 @@ func (db *AccountsDb) CommitBatch(
 		var slotBytes [8]byte
 		binary.LittleEndian.PutUint64(slotBytes[:], slot)
 		if err := db.BankHashStore.Set(slotBytes[:], bh[:], pebble.NoSync); err != nil {
-			return BatchCommitResult{}, err
+			// Advisory rows are reconstructed from the already-durable
+			// manifest. Aborting here would invite a duplicate BatchSeq retry
+			// even though the commit decision has already been made.
+			mlog.Log.Warnf(
+				"accountsdb: defer bankhash row for slot %d to recovery after advisory write failed: %v",
+				slot,
+				err,
+			)
 		}
 	}
 
@@ -283,7 +396,7 @@ func (db *AccountsDb) CommitBatch(
 	// (7) Publish the immutable changed-key view and advance the cache epoch
 	// under a short lock. While pendingFold is installed, readers resolve every
 	// changed key from the new union; unchanged keys are identical on both sides
-	// of the atomic Pebble commit. This lets the expensive index fsync and cache
+	// of the atomic index commit. This lets the expensive index fsync and cache
 	// refresh proceed without blocking account loaders.
 	fire(db.foldHooks.beforeIndexCommit)
 	db.readCacheEpochMu.Lock()
@@ -293,10 +406,11 @@ func (db *AccountsDb) CommitBatch(
 	fire(db.foldHooks.afterPublicationStart)
 
 	if err := db.applyManifestToIndex(manifest); err != nil {
-		db.readCacheEpochMu.Lock()
-		db.pendingFold = nil
-		db.readCacheEpochMu.Unlock()
-		return BatchCommitResult{}, err
+		// Keep pendingFold installed: it is the only complete read view if one
+		// or more bounded frames landed before the failure. The manifest is
+		// already the durable decision, so this process must fail closed and let
+		// startup idempotently finish it rather than attempt another live fold.
+		return BatchCommitResult{}, db.failDecidedFold(batchSeq, throughSlot, "account-index", err)
 	}
 
 	// Old readers captured the preceding epoch and therefore cannot publish
@@ -312,6 +426,13 @@ func (db *AccountsDb) CommitBatch(
 	// (8) Publish.
 	db.lastBatchSeq = batchSeq
 	db.durableThrough.Store(throughSlot)
+	frames := db.accountIndexMutationFrameCount(uint64(len(union)))
+	db.foldCommits.Add(1)
+	db.foldWALFrames.Add(frames)
+	if frames > 1 {
+		db.foldOversized.Add(1)
+	}
+	updateAtomicMaximum(&db.foldMaxKeys, uint64(len(union)))
 
 	return BatchCommitResult{
 		BatchSeq:    batchSeq,
@@ -322,34 +443,45 @@ func (db *AccountsDb) CommitBatch(
 	}, nil
 }
 
-// applyManifestToIndex installs a manifest's index entries + the fold meta in
-// one Pebble batch. Idempotent: re-applying an already-applied manifest writes
-// identical values. Sync honors the WAL mode (a WAL-less index recovers its
-// tail by replaying manifests instead).
+// failDecidedFold permanently fences this AccountsDb instance. Caller holds
+// foldMu. A fresh process must inspect the manifest path and idempotently
+// recover (or discard an unpersisted rename) before writes or reads resume.
+func (db *AccountsDb) failDecidedFold(
+	batchSeq uint64,
+	throughSlot uint64,
+	stage string,
+	cause error,
+) error {
+	decided := foldCommitDecidedError(batchSeq, throughSlot, stage, cause)
+	db.foldFatal = decided
+	if db.ProductionIndex != nil {
+		_ = db.ProductionIndex.setPoison(decided)
+	}
+	return decided
+}
+
+// applyManifestToIndex installs a manifest's index entries and fold watermark.
+// Normal replay planning aims for one CRC-protected frame, but a single valid
+// oversized slot can require several. Bounded idempotent data frames precede
+// the final fold-meta commit marker, and startup retries the entire decided
+// manifest after a crash.
 func (db *AccountsDb) applyManifestToIndex(m *SegmentManifest) error {
-	batch := db.Index.NewBatch()
-	defer batch.Close()
-	var idxBuf [24]byte
+	mutations := make([]deltaIndexMutation, 0, len(m.Records))
 	for i := range m.Records {
 		r := &m.Records[i]
-		entry := AccountIndexEntry{Slot: m.ThroughSlot, FileId: m.FileId, Offset: r.Offset}
-		entry.Marshal(&idxBuf)
-		if err := batch.Set(r.Pubkey[:], idxBuf[:], nil); err != nil {
-			return err
+		if r.Tombstone {
+			mutations = append(mutations, tombstoneDeltaMutation(r.Pubkey))
+			continue
 		}
+		entry := AccountIndexEntry{Slot: m.ThroughSlot, FileId: m.FileId, Offset: r.Offset}
+		mutations = append(mutations, liveDeltaMutation(r.Pubkey, entry))
 	}
-	if err := batch.Set(metaKeyLastBatch, encodeFoldMeta(foldMeta{
+	meta := foldMeta{
 		BatchSeq:    m.BatchSeq,
 		ThroughSlot: m.ThroughSlot,
 		FileId:      m.FileId,
-	}), nil); err != nil {
-		return err
 	}
-	opts := pebble.Sync
-	if db.IndexWALDisabled {
-		opts = pebble.NoSync
-	}
-	return batch.Commit(opts)
+	return db.applyAccountIndexMutationTransaction(mutations, &meta)
 }
 
 func sortedBankhashes(bankhashes map[uint64][32]byte) []SlotBankhash {

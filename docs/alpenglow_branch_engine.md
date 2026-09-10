@@ -4,9 +4,10 @@ This document describes the engine selected by `network.cluster = "alpenglow"`.
 It uses an **execute-on-receipt** model where certificates gate *promotion to
 durable state* rather than execution.
 
-> `mainnet-beta`, `testnet`, and `devnet` do not enter this path. They retain
-> Mithril's established verifying-only RPC replay and per-slot persistence;
-> validator mode is rejected for those clusters.
+> The V2 AccountsDB runtime on this branch is currently Alpenglow-only.
+> `mithril run` rejects `mainnet-beta`, `testnet`, and `devnet` because their
+> classic per-slot persistence path is not safe with the V2 index. Use the
+> `dev` branch for pre-Alpenglow full-node operation.
 
 ## Model in one paragraph
 
@@ -58,6 +59,15 @@ for O(1) reads plus a per-slot undo journal. Siblings are never materialized as
 state — they are parked as block bytes and re-served on demand. This bounds RAM
 and makes the common (no-fork) path cheap while the rare fork case pays.
 
+The WorkingSet also has a hard, conservatively charged 1 GiB memory limit
+(`tuning.working_set_max_mb`). Replay prepares and charges a complete slot once;
+if current plus incoming state would exceed the limit, it publishes neither the
+slot's accounts nor its bank hash and returns a typed capacity error. There is
+no partial publication or one-slot overshoot. Operators must size the limit
+above the largest valid slot they need to admit. Total process RSS remains a
+cgroup-soak acceptance property because caches, mappings, resume contexts and
+execution scratch lie outside this charge.
+
 - `PromotePrefix(through)` folds the oldest suffix slots into durable state.
 - `EvictFrom(slot)` unwinds a suffix by replaying its undo journal
   newest-layer-first, restoring the exact pre-suffix values.
@@ -80,7 +90,8 @@ must contain a footer, the double-Merkle block id commits to that footer, and
 local replay must reproduce its bank hash before the block is accepted. Durable
 promotion then gates on certificate finality. This is the validator path that
 will eventually vote on its own execution result; the RPC oracle remains a
-verifying-mode diagnostic and the classic non-Alpenglow flow is unchanged.
+verifying-mode diagnostic. Classic non-Alpenglow operation remains on the
+`dev` branch until it has a rooted-durable V2 persistence integration.
 
 ### 5. Fork switch: sweep + unwind
 
@@ -108,9 +119,10 @@ keeps re-hinting the certified sibling after a switch until its data arrives.
 Rooted slots fold to disk in batches (`pkg/accountsdb/fold.go`,
 `CommitBatch`): K slots union-deduped into one sequential segment file + one
 manifest + one atomic index flip, instead of per-slot in-place writes. The
-manifest is simultaneously the commit record, the index redo log (which allows
-running the account index without a WAL), the undo-pointer log, and the carrier
-of batch bankhashes plus the resume context at the batch boundary. Recovery
+manifest is simultaneously the commit record and recovery redo source, the
+undo-pointer log, and the carrier of batch bankhashes plus the resume context
+at the batch boundary. The Pebble-free V2 account index publishes that flip as
+one CRC-framed, synced WAL record above sharded StreamHash bases. Recovery
 (`pkg/accountsdb/recovery.go`) reconstructs the durable frontier from the store
 itself, so a hard `kill -9` no longer forces a re-bootstrap.
 
@@ -123,7 +135,13 @@ Two capabilities fall out of the undo-pointer log:
   as `--rewind-to-slot` and as an automatic recovery arm.
 - **Compaction** (`pkg/accountsdb/compact.go`, `CompactOnce`): reclaim dead
   bytes from out-of-horizon segments and bootstrap appendvecs, pinned so it
-  never touches a file any in-horizon undo pointer still needs.
+  never touches a file any in-horizon undo pointer still needs. The shipped
+  policy is default-on and pressure gated: routine cycles use a non-blocking
+  fold lock and reject source files over 64 MiB before scanning; a pre-fold
+  hard free-space guard may run synchronous uncapped emergency compaction and
+  otherwise halts before any fold side effect rather than risking `ENOSPC`.
+  Large-file resumable/concurrent compaction remains follow-up work; emergency
+  processing of such a file intentionally trades replay latency for safety.
 
 ## Voting readiness (one fork choice, no modes)
 

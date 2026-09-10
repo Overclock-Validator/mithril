@@ -8,6 +8,9 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
 	"github.com/Overclock-Validator/mithril/pkg/replay"
+	"github.com/Overclock-Validator/mithril/pkg/state"
+	"github.com/gagliardetto/solana-go"
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/require"
 )
 
@@ -24,6 +27,28 @@ func TestAlpenglowModeForCluster(t *testing.T) {
 
 	_, err = alpenglowModeForCluster("localnet")
 	require.Error(t, err)
+}
+
+func TestV2RuntimeClusterPreflightStopsClassicBeforeRun(t *testing.T) {
+	for _, cluster := range []string{"mainnet-beta", "testnet", "devnet"} {
+		t.Run(cluster, func(t *testing.T) {
+			runCalled := false
+			cmd := cobra.Command{
+				PreRunE: func(*cobra.Command, []string) error {
+					return validateV2RuntimeCluster(cluster)
+				},
+				Run: func(*cobra.Command, []string) {
+					runCalled = true
+				},
+			}
+			cmd.SetArgs(nil)
+			err := cmd.Execute()
+			require.ErrorContains(t, err, "currently supports only network.cluster=alpenglow")
+			require.False(t, runCalled, "classic preflight must stop runLive and all of its side effects")
+		})
+	}
+
+	require.NoError(t, validateV2RuntimeCluster("alpenglow"))
 }
 
 func TestResolveTurbineShredVersion(t *testing.T) {
@@ -79,4 +104,40 @@ func TestTxParallelismForMode(t *testing.T) {
 	require.Equal(t, int64(7), txParallelismForMode("validator", 7, true, 16))
 	require.Equal(t, int64(0), txParallelismForMode("verifying", 0, false, 16), "non-Alpenglow verifying flow must remain unchanged")
 	require.Equal(t, int64(2), txParallelismForMode("validator", 0, false, 0), "invalid CPU discovery gets a safe minimum")
+}
+
+func TestResolveInitialAlpenglowBlockID(t *testing.T) {
+	snapshotID := solana.Hash{1, 2, 3}
+	mithrilState := &state.MithrilState{
+		ManifestParentSlot:             100,
+		ManifestParentAlpenglowBlockID: snapshotID.String(),
+	}
+
+	got, err := resolveInitialAlpenglowBlockID(mithrilState, nil)
+	require.NoError(t, err)
+	require.Equal(t, snapshotID, got)
+
+	checkpointID := solana.Hash{9, 8, 7}
+	got, err = resolveInitialAlpenglowBlockID(mithrilState, &replay.ResumeState{
+		ParentSlot:                120,
+		ParentAlpenglowBlockID:    checkpointID,
+		HasParentAlpenglowBlockID: true,
+	})
+	require.NoError(t, err)
+	require.Equal(t, checkpointID, got, "a rooted checkpoint supersedes the snapshot anchor")
+
+	for name, stateValue := range map[string]*state.MithrilState{
+		"missing state": nil,
+		"missing id":    {ManifestParentSlot: 100},
+		"malformed id":  {ManifestParentSlot: 100, ManifestParentAlpenglowBlockID: "not-base58!"},
+		"zero id":       {ManifestParentSlot: 100, ManifestParentAlpenglowBlockID: (solana.Hash{}).String()},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := resolveInitialAlpenglowBlockID(stateValue, nil)
+			require.Error(t, err)
+		})
+	}
+
+	_, err = resolveInitialAlpenglowBlockID(mithrilState, &replay.ResumeState{ParentSlot: 120})
+	require.ErrorContains(t, err, "has no Alpenglow block ID")
 }

@@ -140,23 +140,31 @@
           statix check ${self}
           touch $out
         '';
-        home-manager-module = pkgs.runCommand "home-manager-module-eval" {} ''
-          echo ${lib.escapeShellArg (builtins.toString hmEval.config.services.mithril.package)} > /dev/null
-          touch $out
-        '';
+        home-manager-module = assert pkgs.stdenv.isDarwin || hmEval.config.systemd.user.services.mithril.serviceConfig.LimitNOFILE == 65536;
+          pkgs.runCommand "home-manager-module-eval" {} ''
+            echo ${lib.escapeShellArg (builtins.toString hmEval.config.services.mithril.package)} > /dev/null
+            touch $out
+          '';
         darwin-module = pkgs.runCommand "darwin-module-eval" {} ''
           echo ${lib.escapeShellArg (builtins.toString darwinEval.config.services.mithril.package)} > /dev/null
           touch $out
         '';
         config-smoke = pkgs.runCommand "mithril-config-smoke" {} ''
-          cp ${configSmoke} $out
+                grep -F 'cluster = "alpenglow"' ${configSmoke} >/dev/null
+                grep -F 'mode = "verifying"' ${configSmoke} >/dev/null
+                grep -F 'https://rpc.ag.validator1.net' ${configSmoke} >/dev/null
+                grep -F 'working_set_max_mb = 1024' ${configSmoke} >/dev/null
+          grep -F 'enforce_disk_reserve = true' ${configSmoke} >/dev/null
+          grep -F 'max_source_mb = 64' ${configSmoke} >/dev/null
+                cp ${configSmoke} $out
         '';
       }
       // lib.optionalAttrs pkgs.stdenv.isLinux {
-        nixos-module = pkgs.runCommand "nixos-module-eval" {} ''
-          echo ${lib.escapeShellArg (builtins.toString nixosEval.config.services.mithril.package)} > /dev/null
-          touch $out
-        '';
+        nixos-module = assert nixosEval.config.systemd.services.mithril.serviceConfig.LimitNOFILE == 65536;
+          pkgs.runCommand "nixos-module-eval" {} ''
+            echo ${lib.escapeShellArg (builtins.toString nixosEval.config.services.mithril.package)} > /dev/null
+            touch $out
+          '';
       });
 
     nixosModules = {

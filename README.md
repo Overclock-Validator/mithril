@@ -1,6 +1,6 @@
 # Mithril
 
-Mithril is a Solana validator client (Alpenglow), and Solana full node client (Alpenglow & pre-Alpenglow) written in Golang. 
+Mithril is a Solana validator client (Alpenglow), and Solana full node client (Alpenglow & pre-Alpenglow) written in Golang.
 
 Mithril was originally built for the purpose of serving as a "verifying full node" with lower hardware requirements than that of Solana validators and RPC nodes. Now that Mithril has begun its journey as a validator implementation, we still aim for Mithril to be deployable on accessible server platforms. This project is being developed upon the foundations of [Radiance](https://github.com/firedancer-io/radiance), which was built by Richard Patel (@ripatel) with contributions from @leoluk.
 
@@ -17,7 +17,7 @@ While Mithril is already functional and runs reliably for many use cases, it is 
 
 The `run` command starts Mithril as a live full node - it bootstraps from a Solana snapshot and continuously verifies new blocks as they are produced.
 
-This branch supports two protocol paths. `network.cluster = "alpenglow"` (the default) uses native turbine, certificate-driven fork choice, speculative replay, and rooted-durable storage. `mainnet-beta`, `testnet`, and `devnet` retain Mithril's established verifying-only RPC replay and per-slot AccountsDB persistence. Validator/block-production mode is deliberately available only on Alpenglow; the classic clusters remain verifying nodes.
+This branch's V2 AccountsDB runtime currently supports only `network.cluster = "alpenglow"` (the default), using native turbine, certificate-driven fork choice, speculative replay, and rooted-durable storage. `mithril run` deliberately refuses `mainnet-beta`, `testnet`, and `devnet` here because their classic per-slot persistence path is not safe with the V2 index. Use the `dev` branch for pre-Alpenglow full-node operation until classic clusters have a rooted-durable integration.
 
 Mithril in its `alpenglow-dev` branch can be run via a command of the following form:
 ```
@@ -132,7 +132,7 @@ Mithril runs as one of two node types, selected by `[consensus].mode`:
 - **Verifying node** (`mode = "verifying"`, the default) — non-voting: observes, executes, and verifies the cluster. No keypairs required.
 - **Validator** (`mode = "validator"`, Alpenglow only) — enables Votor voting, TPU ingress, and scheduled block production. It enforces an identity plus vote-account address, the turbine block source with a gossip entrypoint, a public advertised IP, and the Votor QUIC listener. Like Agave, the authorized voter defaults to the identity; configure a separate authorized-voter keypair when applicable.
 
-Alpenglow verifying and validator modes share the same certificate fork choice. Classic clusters do not start the Alpenglow engine and retain their existing verifying flow.
+Alpenglow verifying and validator modes share the same certificate fork choice. On this branch both modes require `network.cluster = "alpenglow"`; use the `dev` branch for the classic pre-Alpenglow verifying flow.
 
 Generate a starter config for your node type:
 
@@ -257,9 +257,21 @@ make build
 
 **Note:** The default `bootstrap.mode = "auto"` will reuse an existing valid AccountsDB when available, otherwise it downloads a snapshot. Set `bootstrap.mode = "snapshot"` to use an existing snapshot if available, or `bootstrap.mode = "new-snapshot"` to always download a fresh one.
 
+The Pebble-free, sharded StreamHash account index and its operational limits
+are documented in [docs/accountsdb_v2.md](docs/accountsdb_v2.md).
+
 ### Operational Best Practices
 
 **Clean Shutdown**: Always use `Ctrl+C` to stop Mithril cleanly rather than killing the terminal or closing the SSH session. This allows Mithril to flush data and exit gracefully.
+
+**AccountsDB disk headroom**: Appendvec reclamation is enabled by default and
+runs only under filesystem pressure. Routine work never waits ahead of an
+active fold and has a 64 MiB hard source-file cap. At the hard free-space
+reserve, Mithril deliberately pauses folding for synchronous reclamation or
+halts before the fold writes anything; disabling
+`storage.compact.enforce_disk_reserve` is an unsafe, unbounded-growth escape
+hatch. Put AccountsDB on a dedicated volume where possible and alert on the
+reported free-space/compaction logs.
 
 For detailed troubleshooting tips, see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 
@@ -291,7 +303,7 @@ See [COMPATIBILITY.md](COMPATIBILITY.md) for supported networks and feature gate
 - First formal audit (https://runtimeverification.com/ team is nearing end of audit). Includes development and intensive use of a robust and comprehensive 'conformance suite' for verification of compliance of the VM, interpreter, and runtime as a complete unit. Differential fuzzing will be used to detect differences versus relevant versions of the Labs client, and guided fuzzing will be used generally to uncover security and loss-of-availability issues. Any bugs identified during this phase will be remediated.
 - Thorough optimization work on entire system, including on components such as the Virtual Machine and AccountsDB.
 - Consensus verification implementation (landed on this branch: the Alpenglow certificate engine drives fork choice and durable-state promotion).
-- Direct shred replay support (landed on this branch: native turbine is the default Alpenglow block source; classic clusters default to RPC).
+- Direct shred replay support (landed on this branch: native turbine is the default Alpenglow block source; the V2 runtime currently rejects classic clusters).
 - Achieve multi-epoch runs without bugs (e.g. bankhash mismatches with mainnet)
 - Transaction simulation and transaction sending
 - Earlier testing on testnet environments.

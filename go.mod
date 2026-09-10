@@ -11,6 +11,7 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/cockroachdb/pebble v1.1.5
+	github.com/edsrzf/mmap-go v1.2.0
 	github.com/gagliardetto/binary v0.8.0
 	github.com/gagliardetto/solana-go v1.23.0
 	github.com/google/flatbuffers v25.12.19+incompatible
@@ -21,11 +22,13 @@ require (
 	github.com/prometheus/client_golang v1.20.4
 	github.com/quic-go/quic-go v0.59.1
 	github.com/spf13/cobra v1.9.1
+	github.com/stellar/streamhash v0.0.0-20260713164615-c72a4e6f578d
 	github.com/stretchr/testify v1.11.1
 	github.com/twmb/murmur3 v1.1.8
 	github.com/vbauerster/mpb/v8 v8.4.0
-	golang.org/x/sync v0.19.0
-	golang.org/x/sys v0.40.0
+	github.com/zeebo/xxh3 v1.1.0
+	golang.org/x/sync v0.21.0
+	golang.org/x/sys v0.46.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	k8s.io/klog/v2 v2.100.1
 )
@@ -62,7 +65,6 @@ require (
 	github.com/prometheus/common v0.67.4 // indirect
 	github.com/rogpeppe/go-internal v1.12.0 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
-	github.com/zeebo/assert v1.3.0 // indirect
 	go.mongodb.org/mongo-driver/v2 v2.5.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.3 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect

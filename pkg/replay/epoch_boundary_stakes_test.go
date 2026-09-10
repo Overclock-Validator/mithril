@@ -3,7 +3,6 @@ package replay
 import (
 	"fmt"
 	"math"
-	"os"
 	"path/filepath"
 	"testing"
 
@@ -104,13 +103,8 @@ func TestEpochBoundaryStakesUsesEnteredEpochAcrossScheduleOffsets(t *testing.T) 
 
 func epochBoundaryStakeDB(t *testing.T, slot uint64, delegations []sealevel.Delegation) *accountsdb.AccountsDb {
 	t.Helper()
-	dir := t.TempDir()
-	require.NoError(t, os.MkdirAll(filepath.Join(dir, "accounts"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "largest_file_id"), make([]byte, 8), 0o644))
-	db, err := accountsdb.OpenDb(dir)
-	require.NoError(t, err)
-	db.InitCaches()
-	t.Cleanup(db.CloseDb)
+	db := openAlpenglowTestAccountsDB(t)
+	dir := filepath.Dir(db.AcctsDir)
 
 	global.ClearPendingStakePubkeys()
 	var accts []*accounts.Account
@@ -137,9 +131,8 @@ func epochBoundaryStakeDB(t *testing.T, slot uint64, delegations []sealevel.Dele
 		require.NoError(t, err)
 		accts = append(accts, &accounts.Account{Key: voteKey, Owner: addresses.VoteProgramAddr, Lamports: 1_000_000_000, Data: voteData})
 	}
-	done := make(chan struct{})
-	require.NoError(t, db.StoreAccounts(accts, slot, func() { close(done) }))
-	<-done
+	_, err := db.CommitBatch([]accounts.SlotDelta{{Slot: slot, Delta: accts}}, slot, nil, nil)
+	require.NoError(t, err)
 	_, err = global.FlushPendingStakePubkeys(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() {

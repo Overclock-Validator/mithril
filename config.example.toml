@@ -28,7 +28,8 @@
 #
 # Alpenglow supports "verifying" (default; non-voting) and "validator" modes.
 # Validator mode enables TPU ingress and block production but does not cast
-# votes yet. mainnet-beta/testnet/devnet retain the classic verifying-only flow.
+# votes yet. This V2 branch currently rejects mainnet-beta/testnet/devnet at
+# runtime; use the dev branch for classic pre-Alpenglow full-node operation.
 # Generate a per-type starter config: mithril config init [--validator]
 # ----------------------------------------------------------------------------
 
@@ -101,31 +102,12 @@ name = "mithril"
     # longer bounded re-execution window after a hard crash. Range 32..512.
     fold_batch_slots = 128
 
-    # Account-index Pebble WAL. Set false to remove the WAL write stream
-    # entirely: fold manifests then serve as the index redo log and recovery
-    # replays them. Keep true until the deployment has soaked.
-    index_wal = true
-
     # Rewind horizon: how many fold batches of undo pointers stay actionable.
     # Within the horizon, --rewind-to-slot (or the automatic late-divergence
     # recovery) can restore durable state to any retained fold boundary without
     # re-bootstrapping from a snapshot. Also pins those batches' files against
     # compaction. At K=128 slots/batch, 64 batches =~ 55 minutes of chain.
     rewind_horizon_batches = 64
-
-    # Background compaction: reclaims dead bytes from out-of-horizon segments
-    # and bootstrap appendvecs (folds never overwrite, so superseded account
-    # versions accumulate). OFF by default until soaked — each cycle holds the
-    # store's fold lock while it works, so on a latency-sensitive validator keep
-    # the per-cycle budgets small (defaults below) to avoid stalling folds.
-    #[storage.compact]
-    #    enabled = false
-    #    # Move a file's live records only once at least this fraction is dead.
-    #    min_dead_fraction = 0.7
-    #    # Per-cycle caps on live bytes moved / bytes scanned (MiB). Smaller =
-    #    # shorter fold-lock hold per cycle.
-    #    max_move_mb = 64
-    #    max_scan_mb = 256
 
     # Shredstore - Lightbringer stores received shreds here
     # Used for block streaming and potential repair serving.
@@ -136,6 +118,36 @@ name = "mithril"
 
     # Logs - runtime output for debugging and monitoring
     logs = "/mnt/mithril-logs"
+
+[storage.compact]
+    # Enabled by default. Routine cycles run only below target_free_mb, use a
+    # non-blocking fold lock, and never scan a source above max_source_mb.
+    # Emergency cycles run synchronously only at the hard reserve and may scan
+    # a larger source: bounded replay backpressure is preferable to ENOSPC.
+    enabled = true
+
+    # Keep the pre-fold free-space guard enabled. Setting this false is an
+    # explicit unsafe escape hatch: appendvec growth becomes unbounded and a
+    # fold may reach ENOSPC part-way through its durable commit.
+    enforce_disk_reserve = true
+
+    interval_seconds = 30
+    # Zero selects filesystem-adaptive defaults. On a 500GiB AccountsDB volume
+    # these resolve to a 25GiB hard minimum and a 50GiB maintenance target.
+    min_free_mb = 0
+    target_free_mb = 0
+
+    # Routine work moves a file only after 70% is dead. Under hard pressure the
+    # threshold drops to 20%, allowing more write amplification to regain space.
+    min_dead_fraction = 0.7
+    emergency_min_dead_fraction = 0.2
+
+    # Routine-cycle limits. Move/scan are soft targets checked between sources;
+    # max_source_mb is a hard pre-scan admission cap. Emergency pressure
+    # compaction deliberately removes the source cap.
+    max_move_mb = 64
+    max_scan_mb = 256
+    max_source_mb = 64
 
 # ============================================================================
 # [network] - RPC Endpoints
@@ -152,9 +164,9 @@ name = "mithril"
 # probes the primary and restores to it when healthy.
 
 [network]
-    # Solana cluster. Defaults to "alpenglow". Alpenglow uses certificate fork
-    # choice and rooted speculative replay. "mainnet-beta", "testnet", and
-    # "devnet" use the established verifying-only RPC replay path.
+    # Solana cluster. Defaults to "alpenglow", the only cluster currently
+    # supported by this branch's V2 AccountsDB runtime. Use the dev branch for
+    # "mainnet-beta", "testnet", or "devnet" full-node operation.
     cluster = "alpenglow"
 
     # RPC endpoints in priority order (first = primary, rest = fallbacks)
@@ -173,8 +185,9 @@ name = "mithril"
 # Block source configuration. See also [lightbringer] below for sidecar settings.
 
 [block]
-    # Where to stream new blocks from. Empty selects the protocol default:
-    # "turbine" for Alpenglow, "rpc" for classic clusters.
+    # Where to stream new blocks from. Empty selects "turbine" for Alpenglow.
+    # "rpc" remains available as an explicit Alpenglow source; classic clusters
+    # are not supported by this branch's V2 runtime.
     #   "turbine"      - Native UDP turbine shred receiver (the LIVE mode, and
     #                    the DEFAULT). Uses RPC for catchup, hands off to
     #                    reconstructed shreds near tip. Shreds carry the
@@ -333,8 +346,8 @@ name = "mithril"
 # ============================================================================
 #
 # On Alpenglow, blocks execute immediately on receipt and certificates are the
-# source of truth for fork choice and durable-state promotion. Classic clusters
-# do not start this engine and retain the established verifying-only flow.
+# source of truth for fork choice and durable-state promotion. This branch's V2
+# runtime currently rejects classic clusters; use the dev branch for them.
 
 [consensus]
     # Node mode:
@@ -506,17 +519,59 @@ name = "mithril"
     # Workers enqueueing account-index entries into shard logs.
     snapshot_index_committer_workers = 64
 
-    # Number of temporary account-index shard logs/SSTs.
+    # Number of temporary sorted account-index runs.
     snapshot_index_shards = 64
 
-    # Optional temp directory for snapshot index shard logs/SST staging.
+    # Optional temp directory for snapshot sorted-run staging.
     # This can move tens of GB of temporary write/read churn off the AccountsDB
     # disk. On RAM-rich machines, /dev/shm/mithril-snapshot-index is useful.
     # Leave empty to stage under storage.accounts.
     snapshot_index_temp_dir = ""
 
-    # Bound for number of index shards to convert to SSTs at once.
+    # Hard per-flusher memory bound for external sorting. With the defaults of
+    # 64 MiB and eight flushers, primary sort arrays stay near 512 MiB even if
+    # every account key lands in one prefix shard.
+    snapshot_index_sort_chunk_mb = 64
+
+    # Bound for number of index shards to sort and flush as runs at once.
     max_concurrent_flushers = 8
+
+    # Production AccountsDB V2 index. account_index_shards is part of the
+    # durable routing format: changing it for an existing database is rejected
+    # and requires a fresh snapshot. The remaining limits may change at restart.
+    account_index_shards = 1024
+
+    # Exact mutable overlay envelope. Accounting is deliberately conservative;
+    # the immutable StreamHash bases and sorted scan sidecars remain file-backed.
+    account_index_max_hot_keys = 2097152
+    account_index_max_hot_mb = 512
+
+    # Bound exact immutable delta checkpoints independently from the mutable
+    # heap. The physical limit also includes in-flight builds and obsolete
+    # generations still pinned by readers.
+    account_index_max_checkpoint_selected_mb = 1024
+    account_index_max_checkpoint_physical_mb = 2048
+
+    # Seal a busy shard at 8192 changed keys, or a non-empty quiet shard after
+    # 30 seconds. Rebase it into a new immutable base at 65536 delta keys.
+    account_index_seal_keys = 8192
+    account_index_seal_max_age_ms = 30000
+    account_index_rebase_keys = 65536
+
+    # Rewrite the CRC-framed WAL after 512 MiB of growth. The checkpoint worker
+    # and concurrent-seal keys are intentionally omitted so each host inherits
+    # adaptive defaults (GOMAXPROCS workers and at most 8 concurrent seals).
+    # Set them explicitly only after host-specific measurement. Rebase
+    # concurrency must remain 1 because all shard generations currently extend
+    # one shared extent-ordinal lineage.
+    account_index_journal_rewrite_mb = 512
+    account_index_rebase_workers = 1
+
+    # Hard conservative charged-memory limit for the unrooted account WorkingSet.
+    # Publication is slot-atomic: a complete slot that would exceed the limit is
+    # rejected wholly, including its bank hash. Size this above the largest valid
+    # slot the validator must admit.
+    working_set_max_mb = 1024
 
     # Size in MB for serialized parameter arena (0 to disable)
     param_arena_size_mb = 512

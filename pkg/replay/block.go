@@ -582,7 +582,7 @@ func loadBlockAccountsAndUpdateSysvars(accountsDb blockAccountSource, block *b.B
 	metrics.GlobalBlockReplay.AccountLoader.DedupeBlockAccounts.AddTimingSince(phaseStart)
 	ctx := context.Background()
 	phaseStart = time.Now()
-	slotAccts, batchStats, err := getAccountsBatchSharedWithStats(ctx, accountsDb, block.Slot, dedupedAccts)
+	slotAccts, batchStats, err := getUniqueAccountsBatchSharedWithStats(ctx, accountsDb, block.Slot, dedupedAccts)
 	metrics.GlobalBlockReplay.AccountLoader.SourceBatch.AddTimingSince(phaseStart)
 	recordAccountLoaderBatchStats(&metrics.GlobalBlockReplay.AccountLoader, batchStats)
 	if err != nil {
@@ -1017,19 +1017,33 @@ func loadBlockAccountsAndUpdateSysvars(accountsDb blockAccountSource, block *b.B
 
 func recordAccountLoaderBatchStats(dst *metrics.AccountLoader, src accountsdb.BatchReadStats) {
 	dst.RequestedKeys = src.RequestedKeys
+	dst.UniqueKeys = src.UniqueKeys
+	dst.DuplicateKeys = src.DuplicateKeys
 	dst.DurableKeys = src.DurableKeys
+	dst.UniqueDurableKeys = src.UniqueDurableKeys
 	dst.WorkingSetHits = src.WorkingSetHits
 	dst.InProgressHits = src.InProgressHits
 	dst.PendingFoldHits = src.PendingFoldHits
 	dst.CacheHits = src.CacheHits
 	dst.IndexHits = src.IndexHits
 	dst.IndexMisses = src.IndexMisses
+	dst.DeltaIndexProbes = src.DeltaIndexProbes
+	dst.DeltaIndexHits = src.DeltaIndexHits
+	dst.DeltaIndexTombstones = src.DeltaIndexTombstones
+	dst.BaseIndexProbes = src.BaseIndexProbes
+	dst.BaseIndexCandidates = src.BaseIndexCandidates
+	dst.BaseIndexHits = src.BaseIndexHits
+	dst.BaseIndexFalsePositives = src.BaseIndexFalsePositives
 	dst.UniqueAppendVecs = src.UniqueAppendVecs
 	dst.AppendVecChunks = src.AppendVecChunks
 	dst.AppendVecAccounts = src.AppendVecAccounts
 	dst.OpenFailures = src.OpenFailures
 	dst.ReadFailures = src.ReadFailures
 	dst.RetryAccounts = src.RetryAccounts
+	dst.AppendVecReadRanges = src.AppendVecReadRanges
+	dst.AppendVecPreadCalls = src.AppendVecPreadCalls
+	dst.AppendVecRequestedBytes = src.AppendVecRequestedBytes
+	dst.AppendVecPhysicalReadBytes = src.AppendVecPhysicalReadBytes
 	dst.CommonCacheAdmissions = src.CommonCacheAdmissions
 	dst.CommonCacheAdmissionsSkipped = src.CommonCacheAdmissionsSkipped
 	dst.VoteCacheAdmissions = src.VoteCacheAdmissions
@@ -1661,6 +1675,25 @@ func ReplayBlocks(
 ) *ReplayResult {
 	result := &ReplayResult{}
 	alpenglowMode := consensusOpts != nil && consensusOpts.Alpenglow
+	var alpenglowParentSlot uint64
+	var alpenglowParentBlockID solana.Hash
+	if alpenglowMode {
+		var err error
+		alpenglowParentSlot, alpenglowParentBlockID, err = alpenglowReplayParentAnchor(
+			mithrilState, resumeState, consensusOpts,
+		)
+		if err != nil {
+			result.Error = fmt.Errorf("initialize Alpenglow replay parent: %w", err)
+			return result
+		}
+		if startSlot == 0 || alpenglowParentSlot != startSlot-1 {
+			result.Error = fmt.Errorf(
+				"initialize Alpenglow replay parent: durable parent slot %d is inconsistent with start slot %d",
+				alpenglowParentSlot, startSlot,
+			)
+			return result
+		}
+	}
 	replayFrontier := uint64(0)
 	if startSlot > 0 {
 		replayFrontier = startSlot - 1
@@ -1671,6 +1704,7 @@ func ReplayBlocks(
 		// These maps are process-local and can otherwise retain a discarded fork
 		// across the node's rooted-checkpoint recovery loop.
 		global.ResetAlpenglowChainMetadata()
+		global.SetAlpenglowBlockID(alpenglowParentSlot, alpenglowParentBlockID)
 	}
 
 	// Generate unique run ID for log correlation (only if not already set by startup)
@@ -1741,8 +1775,8 @@ func ReplayBlocks(
 		return result
 	}
 	expectedStatusRoot := mithrilState.ManifestParentSlot
-	var statusParentBlockID solana.Hash
-	var hasStatusParentBlockID bool
+	statusParentBlockID := alpenglowParentBlockID
+	hasStatusParentBlockID := alpenglowMode
 	var statusCheckpoint *state.TransactionStatusCheckpointRef
 	if resumeState != nil {
 		expectedStatusRoot = resumeState.ParentSlot
@@ -1965,7 +1999,11 @@ func ReplayBlocks(
 	var promoter *asyncPromoter
 	var applyFoldOutcome func(res *foldResult) // assigned below, used by the exit drain
 	if acctsDb.RootedDurable {
-		unrootedTailState = newUnrootedTail(acctsDb, acctsDb, unrootedTailHaltCap, FoldBatchSlots, filepath.Join(acctsDb.AcctsDir, ".."))
+		workingSetMaxBytes := DefaultWorkingSetMaxRetainedBytes
+		if consensusOpts != nil && consensusOpts.WorkingSetMaxRetainedBytes != 0 {
+			workingSetMaxBytes = consensusOpts.WorkingSetMaxRetainedBytes
+		}
+		unrootedTailState = newUnrootedTail(acctsDb, acctsDb, unrootedTailHaltCap, FoldBatchSlots, filepath.Join(acctsDb.AcctsDir, ".."), workingSetMaxBytes)
 		var checkpointAfterCommit func(*state.TransactionStatusCheckpointRef) error
 		if consensusOpts != nil {
 			checkpointAfterCommit = consensusOpts.TransactionStatusCheckpointAfterCommit
@@ -2086,6 +2124,12 @@ func ReplayBlocks(
 			return
 		}
 		if res.err != nil {
+			if errors.Is(res.err, accountsdb.ErrFoldCommitDecided) && result.Error == nil {
+				result.Error = fmt.Errorf(
+					"rooted-durable: a fold crossed its durable manifest commit point but did not finish: %w",
+					res.err,
+				)
+			}
 			mlog.Log.Errorf("rooted-durable: async fold failed: %v", res.err)
 			return
 		}
@@ -2124,6 +2168,9 @@ func ReplayBlocks(
 		// Apply any completed async fold first so the gates below see the
 		// current durable frontier.
 		applyFoldOutcome(promoter.poll())
+		if result.Error != nil {
+			return true
+		}
 		if lastRootedWatermark == 0 {
 			return false
 		}
@@ -2202,9 +2249,19 @@ func ReplayBlocks(
 			if res := promoter.drain(); res != nil {
 				applyFoldOutcome(res)
 			}
+			if result.Error != nil {
+				return true
+			}
 			promotedThrough, rootedCtx, perr := unrootedTailState.flush(promoteThrough)
 			if perr != nil {
 				mlog.Log.Errorf("rooted-durable: forced fold stopped at slot %d: %v", promotedThrough, perr)
+				if errors.Is(perr, accountsdb.ErrFoldCommitDecided) && result.Error == nil {
+					result.Error = fmt.Errorf(
+						"rooted-durable: a forced fold crossed its durable manifest commit point but did not finish: %w",
+						perr,
+					)
+					return true
+				}
 			}
 			if promotedThrough > mithrilState.LastRootedSlot && rootedCtx != nil {
 				applyPromotionBookkeeping(promotedThrough, rootedCtx)
@@ -2307,8 +2364,8 @@ func ReplayBlocks(
 			ingestAlpenglowFooterCertificate(consensusEngine, raw)
 		}
 	}
-	if alpenglowMode && resumeState != nil && resumeState.HasParentAlpenglowBlockID {
-		opts.InitialAlpenglowBlockID = resumeState.ParentAlpenglowBlockID
+	if alpenglowMode {
+		opts.InitialAlpenglowBlockID = alpenglowParentBlockID
 		opts.HasInitialAlpenglowBlockID = true
 	}
 
@@ -2404,6 +2461,9 @@ func ReplayBlocks(
 		// durable frontier past the switch slot, mutating source ancestry first
 		// would leave the source on a branch AccountsDB can no longer adopt.
 		applyFoldOutcome(promoter.drain())
+		if errors.Is(result.Error, accountsdb.ErrFoldCommitDecided) {
+			return false
+		}
 		if sw.Slot <= mithrilState.LastRootedSlot {
 			windowSwitchFallback++
 			switchFallbackReasons["durable-overlap"]++
@@ -2549,6 +2609,9 @@ func ReplayBlocks(
 				// afterwards, and halted with no retained rewind boundary.
 				if promoter != nil {
 					applyFoldOutcome(promoter.drain())
+				}
+				if errors.Is(result.Error, accountsdb.ErrFoldCommitDecided) {
+					break
 				}
 				if parentSwitch.SwitchSlot <= mithrilState.LastRootedSlot {
 					windowSwitches++
@@ -3161,6 +3224,9 @@ func ReplayBlocks(
 		if unrootedTailState != nil && unrootedTailState.OverCap() {
 			hadInFlightFold := promoter != nil && promoter.inFlight
 			stillOverCap := settleInFlightFoldAtCapacity(unrootedTailState, promoter, block.Slot, applyFoldOutcome)
+			if errors.Is(result.Error, accountsdb.ErrFoldCommitDecided) {
+				break
+			}
 			if stillOverCap {
 				// Diagnose WHY rooting stalled. Validator mode verifies the footer
 				// bank hash inline and has no trailing-verifier watermark; do not
@@ -3179,8 +3245,41 @@ func ReplayBlocks(
 				if trailingVerifier != nil && TrailingVerifierCfg.Required && lastRootedWatermark > verifiedWM+uint64(FoldBatchSlots) {
 					hint = " — the trailing verifier cannot keep pace with replay (finality is ahead; the verifier fetches every block's execution metas via RPC, which is slow for very large blocks). Options: verifier.required=false to gate folds on certificate finality only, a faster/archival RPC for the verifier, or wait for peer bankhash cross-checking to replace the RPC oracle"
 				}
-				result.Error = fmt.Errorf("rooted-durable: speculative state exceeded %d held slots at slot %d; rooting stalled (%s)%s; halting", unrootedTailHaltCap, block.Slot, diag, hint)
+				workingSetStats := unrootedTailState.workingSetStats()
+				overage := uint64(0)
+				if workingSetStats.MaximumBytes != 0 && workingSetStats.RetainedBytes > workingSetStats.MaximumBytes {
+					overage = workingSetStats.RetainedBytes - workingSetStats.MaximumBytes
+				}
+				result.Error = fmt.Errorf(
+					"rooted-durable: speculative state exceeded a safety threshold at slot %d: held_slots=%d slot_limit=%d retained_bytes=%d byte_threshold=%d overage_bytes=%d largest_slot_bytes=%d high_water_bytes=%d; rooting stalled (%s)%s; halting",
+					block.Slot,
+					unrootedTailState.overlay.HeldSlots(),
+					unrootedTailHaltCap,
+					workingSetStats.RetainedBytes,
+					workingSetStats.MaximumBytes,
+					overage,
+					workingSetStats.LargestSlotBytes,
+					workingSetStats.HighWaterBytes,
+					diag,
+					hint,
+				)
 				mlog.Log.Errorf("%v", result.Error)
+				// This slot-count safety halt is terminal, so the normal metrics
+				// export below will not run. Emit its retained/high-water snapshot
+				// here rather than losing the most important capacity sample.
+				capacityHaltAt := time.Now()
+				metrics.GlobalBlockReplay.PostProcessBlock.AddTiming(capacityHaltAt.Sub(postProcessBlockStart))
+				metrics.GlobalBlockReplay.SlotReplay.AddTiming(capacityHaltAt.Sub(start))
+				metrics.GlobalBlockReplay.Slot = block.Slot
+				metrics.GlobalBlockReplay.AccountIndex = snapshotAccountIndexMetrics(acctsDb)
+				applyWorkingSetMetrics(&metrics.GlobalBlockReplay.AccountIndex, workingSetStats)
+				if metricsWriter != nil {
+					if encodeErr := json.NewEncoder(metricsWriter).Encode(metrics.GlobalBlockReplay); encodeErr != nil {
+						mlog.Log.Errorf("Error marshaling terminal capacity metrics: %v", encodeErr)
+					}
+				}
+				statsd.SendBlockReplayMetrics(metrics.GlobalBlockReplay)
+				metrics.GlobalBlockReplay = metrics.BlockReplay{}
 				break
 			}
 		}
@@ -3424,6 +3523,10 @@ func ReplayBlocks(
 		}
 		{
 			metrics.GlobalBlockReplay.Slot = block.Slot
+			metrics.GlobalBlockReplay.AccountIndex = snapshotAccountIndexMetrics(acctsDb)
+			if unrootedTailState != nil {
+				applyWorkingSetMetrics(&metrics.GlobalBlockReplay.AccountIndex, unrootedTailState.workingSetStats())
+			}
 			if metricsWriter != nil {
 				encoder := json.NewEncoder(metricsWriter)
 				err := encoder.Encode(metrics.GlobalBlockReplay)
@@ -4347,7 +4450,14 @@ func ProcessBlock(
 	if tail != nil {
 		// Rooted-durable: buffer this slot's writes + bankhash in the RAM overlay
 		// (always, even when empty, so the bankhash is recorded); no durable write.
-		tail.Add(slotCtx.Slot, modifiedAccts, persistedBankhash)
+		if addErr := tail.Add(slotCtx.Slot, modifiedAccts, persistedBankhash); addErr != nil {
+			// Admission rejected the entire slot before publishing any account or
+			// bankhash. This is a safe replay halt, not an interrupted commit.
+			commitInProgress.Store(false)
+			commitSlot.Store(0)
+			metrics.GlobalBlockReplay.BlockUpdateAccounts.AddTimingSince(blockUpdateStart)
+			return slotCtx, fmt.Errorf("publish rooted-durable slot %d: %w", slotCtx.Slot, addErr)
+		}
 		afterStoreAccounts()
 	} else if len(modifiedAccts) > 0 {
 		err = acctsDb.StoreAccounts(modifiedAccts, slotCtx.Slot, afterStoreAccounts)

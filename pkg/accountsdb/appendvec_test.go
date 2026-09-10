@@ -87,6 +87,20 @@ func TestBuildIndexEntriesRejectsTruncatedAccountData(t *testing.T) {
 	assert.Nil(t, stakeEntries)
 }
 
+func TestBuildIndexEntriesRejectsOversizedAccountData(t *testing.T) {
+	key := appendVecTestPubkey(9)
+	data := make([]byte, hdrLen)
+	binary.LittleEndian.PutUint64(data[dataLenOffset:dataLenOffset+8], maxAppendVecAccountDataLen+1)
+	copy(data[pubkeyOffset:pubkeyOffset+32], key[:])
+	binary.LittleEndian.PutUint64(data[lamportsOffset:lamportsOffset+8], 1)
+
+	pubkeys, entries, stakeEntries, err := BuildIndexEntriesFromAppendVecs(data, uint64(len(data)), 20, 21)
+	require.ErrorContains(t, err, "exceeds maximum")
+	assert.Nil(t, pubkeys)
+	assert.Nil(t, entries)
+	assert.Nil(t, stakeEntries)
+}
+
 func TestBuildIndexEntriesAcceptsFinalAccountWithoutAlignmentPadding(t *testing.T) {
 	key := appendVecTestPubkey(7)
 	encoded := marshalAppendVecTestAccount(t, key, 77, []byte{1, 2, 3})

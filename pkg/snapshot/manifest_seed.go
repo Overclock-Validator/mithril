@@ -34,6 +34,12 @@ func PopulateManifestSeed(s *state.MithrilState, m *SnapshotManifest) {
 	// Block config
 	s.ManifestParentSlot = m.Bank.Slot
 	s.ManifestParentBankhash = base58.Encode(m.Bank.Hash[:])
+	// Clear first so refreshing from a manifest without the optional field
+	// cannot retain an identity from a different snapshot.
+	s.ManifestParentAlpenglowBlockID = ""
+	if m.BlockID != nil {
+		s.ManifestParentAlpenglowBlockID = m.BlockID.String()
+	}
 	s.ManifestBlockHeight = m.Bank.BlockHeight
 
 	// LtHash: use Hash() method, encode as base64

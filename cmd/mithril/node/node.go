@@ -60,6 +60,11 @@ import (
 	"k8s.io/klog/v2"
 )
 
+const (
+	accountsDBShutdownTimeout = 30 * time.Second
+	rpcServerShutdownTimeout  = 10 * time.Second
+)
+
 var (
 	// Run is the main command for running Mithril as a live full node.
 	// This is the primary way most users will run Mithril.
@@ -67,7 +72,10 @@ var (
 		Use:   "run",
 		Short: "Run Mithril full node (downloads snapshot, builds AccountsDB, replays blocks)",
 		PreRunE: func(cmd *cobra.Command, args []string) error {
-			return initConfigAndBindFlags(cmd)
+			if err := initConfigAndBindFlags(cmd); err != nil {
+				return err
+			}
+			return validateV2RuntimeCluster(cluster)
 		},
 		Run: func(cmd *cobra.Command, args []string) {
 			runLive(cmd, args)
@@ -133,6 +141,7 @@ var (
 	resolvedSigverifyBackend string
 	paramArenaSizeMB         uint64
 	borrowedAccountArenaSize uint64
+	workingSetMaxMB          uint64
 
 	rpcPort int
 
@@ -209,6 +218,24 @@ func alpenglowModeForCluster(cluster string) (bool, error) {
 	}
 }
 
+// validateV2RuntimeCluster is a command preflight: it must run before runLive
+// can kill another process, inspect or clean storage, or start a snapshot
+// bootstrap. Classic cluster names remain parseable for lineage/config tooling,
+// but their in-place persistence path is not safe with the V2 account index.
+func validateV2RuntimeCluster(cluster string) error {
+	alpenglow, err := alpenglowModeForCluster(cluster)
+	if err != nil {
+		return err
+	}
+	if !alpenglow {
+		return fmt.Errorf(
+			"the V2 AccountsDB runtime currently supports only network.cluster=alpenglow; use the dev branch for %s full-node operation",
+			cluster,
+		)
+	}
+	return nil
+}
+
 func defaultBlockSourceForMode(alpenglow bool) string {
 	if alpenglow {
 		return "turbine"
@@ -217,7 +244,7 @@ func defaultBlockSourceForMode(alpenglow bool) string {
 }
 
 // txParallelismForMode gives full-validator replay a usable default without
-// changing the classic verifying flow. Zero remains a meaningful, supported
+// changing verifying-mode behavior. Zero remains a meaningful, supported
 // operator choice when it was explicitly supplied through CLI or config.
 func txParallelismForMode(mode string, configured int64, explicitlySet bool, cpuCount int) int64 {
 	if mode != "validator" || explicitlySet || configured != 0 {
@@ -317,6 +344,45 @@ func saveReadyStateForBootstrap(accountsPath string, manifest *snapshot.Snapshot
 		return nil, fmt.Errorf("save ready state: %w", err)
 	}
 	return mithrilState, nil
+}
+
+// resolveInitialAlpenglowBlockID returns the exact consensus-domain identity
+// of the durable parent. A replay checkpoint supersedes the snapshot seed;
+// fresh replay must use the BlockID carried by the selected snapshot manifest.
+func resolveInitialAlpenglowBlockID(
+	mithrilState *state.MithrilState,
+	resumeState *replay.ResumeState,
+) (solana.Hash, error) {
+	if resumeState != nil {
+		if !resumeState.HasParentAlpenglowBlockID || resumeState.ParentAlpenglowBlockID == (solana.Hash{}) {
+			return solana.Hash{}, fmt.Errorf(
+				"rooted replay checkpoint at slot %d has no Alpenglow block ID",
+				resumeState.ParentSlot,
+			)
+		}
+		return resumeState.ParentAlpenglowBlockID, nil
+	}
+	if mithrilState == nil {
+		return solana.Hash{}, errors.New("fresh Alpenglow replay has no snapshot state")
+	}
+	encoded := strings.TrimSpace(mithrilState.ManifestParentAlpenglowBlockID)
+	if encoded == "" {
+		return solana.Hash{}, fmt.Errorf(
+			"snapshot slot %d has no manifest Alpenglow block ID",
+			mithrilState.ManifestParentSlot,
+		)
+	}
+	blockID, err := solana.HashFromBase58(encoded)
+	if err != nil {
+		return solana.Hash{}, fmt.Errorf("decode snapshot Alpenglow block ID: %w", err)
+	}
+	if blockID == (solana.Hash{}) {
+		return solana.Hash{}, errors.New("snapshot Alpenglow block ID is zero")
+	}
+	if blockID.String() != encoded {
+		return solana.Hash{}, errors.New("snapshot Alpenglow block ID is not canonical base58")
+	}
+	return blockID, nil
 }
 
 func validateAccountsGenesisForBootstrap(hasValidState bool, storedGenesis, assertedLegacyGenesis, currentGenesis, buildMode string) (priorGenesis string, mismatch bool, err error) {
@@ -483,7 +549,12 @@ func refreshManifestSeedFromManifest(accountsPath string, s *state.MithrilState,
 	// the large JSON seed.  A later graceful state save persists that cleared
 	// value, so schedule metadata alone does not mean the manifest seed is
 	// complete on restart.  Rehydrate when the stakes payload is absent.
+	expectedManifestBlockID := ""
+	if manifest.BlockID != nil {
+		expectedManifestBlockID = manifest.BlockID.String()
+	}
 	if manifestEpochScheduleSeedMatches(s, manifest) &&
+		s.ManifestParentAlpenglowBlockID == expectedManifestBlockID &&
 		s.SnapshotEpoch == snapshotEpoch && len(s.ManifestEpochStakes) > 0 {
 		return
 	}
@@ -524,7 +595,7 @@ func init() {
 
 	// [network] section flags
 	Run.Flags().StringSliceVarP(&rpcEndpoints, "rpc", "r", []string{}, "URL(s) for RPC endpoint(s) - can specify multiple")
-	Run.Flags().StringVar(&cluster, "cluster", "", "Solana cluster: 'alpenglow' (default), 'mainnet-beta', 'testnet', or 'devnet'")
+	Run.Flags().StringVar(&cluster, "cluster", "", "Solana cluster (this V2 runtime currently requires 'alpenglow')")
 	Run.Flags().StringVar(&legacyGenesisHash, "legacy-genesis-hash", "", "Genesis hash owning legacy unbound AccountsDB/ledger artifacts (one-time re-genesis safety acknowledgement)")
 
 	// [rpc] section flags (Mithril's RPC server)
@@ -552,18 +623,32 @@ func init() {
 	Run.Flags().Uint64Var(&paramArenaSizeMB, "param-arena-size-mb", 512, "Size in MB for serialized parameter arena (0 to disable)")
 	Run.Flags().Uint64Var(&borrowedAccountArenaSize, "borrowed-account-arena-size", 1024, "Number of borrowed accounts to preallocate in arena (0 to disable)")
 	Run.Flags().IntVar(&snapshot.ZstdDecoderConcurrency, "zstd-decoder-concurrency", runtime.NumCPU(), "Zstd decoder concurrency")
-	Run.Flags().IntVar(&snapshot.MaxConcurrentFlushers, "max-concurrent-flushers", snapshot.DefaultSnapshotMaxConcurrentFlushers, "Bound for number of log shards to flush to Accounts DB Index at once")
+	Run.Flags().IntVar(&snapshot.MaxConcurrentFlushers, "max-concurrent-flushers", snapshot.DefaultSnapshotMaxConcurrentFlushers, "Bound for number of account-index shards to sort and flush as runs at once")
 	Run.Flags().IntVar(&snapshot.SnapshotAppendVecCopyingWorkers, "snapshot-append-vec-workers", snapshot.DefaultSnapshotAppendVecCopyingWorkers, "Snapshot bootstrap appendvec write workers")
 	Run.Flags().IntVar(&snapshot.SnapshotIndexEntryBuilderWorkers, "snapshot-index-builder-workers", snapshot.DefaultSnapshotIndexEntryBuilderWorkers, "Snapshot bootstrap account-index parser workers")
 	Run.Flags().IntVar(&snapshot.SnapshotIndexEntryCommitterWorkers, "snapshot-index-committer-workers", snapshot.DefaultSnapshotIndexEntryCommitterWorkers, "Snapshot bootstrap account-index shard enqueue workers")
 	Run.Flags().IntVar(&snapshot.SnapshotIndexShards, "snapshot-index-shards", snapshot.DefaultSnapshotIndexShards, "Snapshot bootstrap account-index shard count")
-	Run.Flags().StringVar(&snapshot.SnapshotIndexTempDir, "snapshot-index-temp-dir", "", "Optional directory for snapshot index shard logs/SST staging")
+	Run.Flags().StringVar(&snapshot.SnapshotIndexTempDir, "snapshot-index-temp-dir", "", "Optional directory for snapshot index sorted-run staging")
+	Run.Flags().IntVar(&snapshot.SnapshotShardSortChunkMB, "snapshot-index-sort-chunk-mb", snapshot.DefaultSnapshotShardSortChunkMB, "Maximum MiB held by each snapshot index shard sorter")
 	Run.Flags().StringVar(&sigverify.Cfg.Backend, "sigverify-backend", sigverify.Defaults().Backend,
 		"ed25519 verification backend: auto|r51|generic|stdlib")
 	Run.Flags().BoolVar(&sbpf.UsePool, "use-pool", true, "Disable to allocate fresh slices")
 	Run.Flags().IntVar(&accountsdb.StoreAccountsWorkers, "store-accounts-workers", 128, "Number of workers to write account updates")
 	Run.Flags().IntVar(&accountsdb.ProgramCacheMaxMB, "program-cache-max-mb", accountsdb.DefaultProgramCacheMaxMB, "Maximum approximate SBPF program cache size in MiB")
 	Run.Flags().IntVar(&accountsdb.CommonAccountCacheMaxMB, "common-account-cache-max-mb", accountsdb.DefaultCommonAccountCacheMaxMB, "Approximate retained decoded account cache weight budget in MiB")
+	Run.Flags().IntVar(&accountsdb.ProductionAccountIndexShardCount, "account-index-shards", accountsdb.DefaultPersistentIndexShards, "Persistent V2 account-index shards (power of two; fixed for the life of an AccountsDB)")
+	Run.Flags().Uint64Var(&accountsdb.ProductionAccountIndexMaxHotKeys, "account-index-max-hot-keys", accountsdb.DefaultShardedMutableMaxHotKeys, "Maximum exact V2 account-index keys retained in mutable RAM")
+	Run.Flags().Uint64Var(&accountsdb.ProductionAccountIndexMaxHotMB, "account-index-max-hot-mb", accountsdb.DefaultShardedMutableMaxHotBytes>>20, "Maximum accounted V2 mutable account-index memory in MiB")
+	Run.Flags().Uint64Var(&accountsdb.ProductionAccountIndexMaxCheckpointSelectedMB, "account-index-max-checkpoint-selected-mb", accountsdb.DefaultProductionAccountIndexMaxCheckpointSelectedBytes>>20, "Maximum root-selected V2 exact checkpoint artifacts in MiB")
+	Run.Flags().Uint64Var(&accountsdb.ProductionAccountIndexMaxCheckpointPhysicalMB, "account-index-max-checkpoint-physical-mb", accountsdb.DefaultProductionAccountIndexMaxCheckpointPhysicalBytes>>20, "Maximum selected, building, and reader-pinned V2 checkpoint artifacts in MiB")
+	Run.Flags().Uint64Var(&accountsdb.ProductionAccountIndexSealKeys, "account-index-seal-keys", accountsdb.DefaultShardedMutableSealKeys, "Changed keys in one persistent shard that trigger an immutable delta seal")
+	Run.Flags().Int64Var(&accountsdb.ProductionAccountIndexSealMaxAgeMS, "account-index-seal-max-age-ms", int64(accountsdb.DefaultProductionAccountIndexSealMaxAge/time.Millisecond), "Maximum age in milliseconds before a non-empty mutable shard is sealed")
+	Run.Flags().Uint64Var(&accountsdb.ProductionAccountIndexRebaseKeys, "account-index-rebase-keys", accountsdb.DefaultShardedMutableRebaseKeys, "Exact delta keys in one shard that trigger rolling base rebuild")
+	Run.Flags().Uint64Var(&accountsdb.ProductionAccountIndexJournalRewriteMB, "account-index-journal-rewrite-mb", accountsdb.DefaultShardedMutableJournalRewriteAt>>20, "V2 account-index WAL growth in MiB before bounded state rewrite")
+	Run.Flags().IntVar(&accountsdb.ProductionAccountIndexCheckpointWorkers, "account-index-checkpoint-workers", accountsdb.DefaultProductionAccountIndexConfig().CheckpointWorkers, "Approximate CPU worker budget shared across concurrent shard checkpoints")
+	Run.Flags().IntVar(&accountsdb.ProductionAccountIndexMaxConcurrentSeals, "account-index-max-concurrent-seals", accountsdb.DefaultProductionAccountIndexConfig().MaxConcurrentSeals, "Maximum shard checkpoints built concurrently")
+	Run.Flags().IntVar(&accountsdb.ProductionAccountIndexRebaseWorkers, "account-index-rebase-workers", 1, "Rolling shard rebase concurrency (currently required to be 1 for shared extent lineage)")
+	Run.Flags().Uint64Var(&workingSetMaxMB, "working-set-max-mb", replay.DefaultWorkingSetMaxRetainedBytes>>20, "Hard conservative unrooted account WorkingSet memory limit in MiB (an over-limit slot is rejected atomically)")
 	Run.Flags().Int64Var(&rewindToSlot, "rewind-to-slot", 0, "Rewind durable account state to the fold batch boundary at this slot before replaying (must be a retained boundary; run once to list boundaries on mismatch)")
 
 	// [tuning.pprof] section flags
@@ -802,8 +887,8 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 
 	// Cluster selects the protocol path as well as protecting against
 	// mainnet/testnet AccountsDB mixups. Alpenglow uses certificate forkchoice
-	// and rooted speculative replay; the established clusters retain the
-	// classic verifying flow.
+	// and rooted speculative replay. Classic names remain parseable for state
+	// separation, but the V2 runtime rejects them before unsafe persistence.
 	cluster = getString("cluster", "network.cluster")
 	if cluster == "" {
 		cluster = "alpenglow"
@@ -820,11 +905,8 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		return err
 	}
 
-	// Must be decided before any OpenDb call: with the WAL off, the fold
-	// manifests are the index redo log (recovery replays them).
-	if config.IsSet("storage.index_wal") && !config.GetBool("storage.index_wal") {
-		accountsdb.DisableIndexWAL = true
-		mlog.Log.Warnf("storage.index_wal=false: account index runs without a Pebble WAL; fold manifests serve as the index redo log")
+	if config.IsSet("storage.index_wal") {
+		mlog.Log.Warnf("storage.index_wal is obsolete: the Pebble-free account index always uses its CRC-framed durable journal")
 	}
 
 	// [rpc] section - Mithril's RPC server
@@ -986,7 +1068,7 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	if consensusMode == "validator" {
 		var missing []string
 		if !alpenglowMode {
-			missing = append(missing, "network.cluster=alpenglow (classic clusters remain verifying-only)")
+			missing = append(missing, "network.cluster=alpenglow (the V2 runtime is currently Alpenglow-only)")
 		}
 		if validatorIdentityKeypair == "" {
 			missing = append(missing, "validator.identity_keypair (signs gossip/turbine and authenticates Votor QUIC)")
@@ -1108,6 +1190,45 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	snapshot.SnapshotIndexEntryCommitterWorkers = getInt("snapshot-index-committer-workers", "tuning.snapshot_index_committer_workers")
 	snapshot.SnapshotIndexShards = getInt("snapshot-index-shards", "tuning.snapshot_index_shards")
 	snapshot.SnapshotIndexTempDir = getString("snapshot-index-temp-dir", "tuning.snapshot_index_temp_dir")
+	snapshot.SnapshotShardSortChunkMB = getInt("snapshot-index-sort-chunk-mb", "tuning.snapshot_index_sort_chunk_mb")
+	accountsdb.ProductionAccountIndexShardCount = getInt("account-index-shards", "tuning.account_index_shards")
+	accountsdb.ProductionAccountIndexMaxHotKeys = getUint64("account-index-max-hot-keys", "tuning.account_index_max_hot_keys")
+	accountsdb.ProductionAccountIndexMaxHotMB = getUint64("account-index-max-hot-mb", "tuning.account_index_max_hot_mb")
+	accountsdb.ProductionAccountIndexMaxCheckpointSelectedMB = getUint64("account-index-max-checkpoint-selected-mb", "tuning.account_index_max_checkpoint_selected_mb")
+	accountsdb.ProductionAccountIndexMaxCheckpointPhysicalMB = getUint64("account-index-max-checkpoint-physical-mb", "tuning.account_index_max_checkpoint_physical_mb")
+	accountsdb.ProductionAccountIndexSealKeys = getUint64("account-index-seal-keys", "tuning.account_index_seal_keys")
+	accountsdb.ProductionAccountIndexSealMaxAgeMS = getInt64("account-index-seal-max-age-ms", "tuning.account_index_seal_max_age_ms")
+	accountsdb.ProductionAccountIndexRebaseKeys = getUint64("account-index-rebase-keys", "tuning.account_index_rebase_keys")
+	accountsdb.ProductionAccountIndexJournalRewriteMB = getUint64("account-index-journal-rewrite-mb", "tuning.account_index_journal_rewrite_mb")
+	accountsdb.ProductionAccountIndexCheckpointWorkers = getInt("account-index-checkpoint-workers", "tuning.account_index_checkpoint_workers")
+	accountsdb.ProductionAccountIndexMaxConcurrentSeals = getInt("account-index-max-concurrent-seals", "tuning.account_index_max_concurrent_seals")
+	accountsdb.ProductionAccountIndexRebaseWorkers = getInt("account-index-rebase-workers", "tuning.account_index_rebase_workers")
+	workingSetMaxMB = getUint64("working-set-max-mb", "tuning.working_set_max_mb")
+	if workingSetMaxMB == 0 {
+		return fmt.Errorf("tuning.working_set_max_mb must be > 0")
+	}
+	if workingSetMaxMB > ^uint64(0)>>20 {
+		return fmt.Errorf("tuning.working_set_max_mb is too large")
+	}
+	accountIndexConfig, err := accountsdb.CurrentProductionAccountIndexConfig()
+	if err != nil {
+		return fmt.Errorf("invalid V2 account-index tuning: %w", err)
+	}
+	mlog.Log.Infof(
+		"V2 account-index tuning: shards=%d hot_keys=%d hot_memory=%dMiB checkpoint_selected=%dMiB checkpoint_physical=%dMiB seal_keys=%d seal_age=%s rebase_keys=%d journal_rewrite=%dMiB checkpoint_workers=%d concurrent_seals=%d rebase_workers=%d",
+		accountIndexConfig.ShardCount,
+		accountIndexConfig.MaxHotKeys,
+		accountIndexConfig.MaxHotBytes>>20,
+		accountIndexConfig.MaxCheckpointSelectedBytes>>20,
+		accountIndexConfig.MaxCheckpointPhysicalBytes>>20,
+		accountIndexConfig.SealKeys,
+		accountIndexConfig.SealMaxAge,
+		accountIndexConfig.RebaseKeys,
+		accountIndexConfig.JournalRewriteBytes>>20,
+		accountIndexConfig.CheckpointWorkers,
+		accountIndexConfig.MaxConcurrentSeals,
+		accountIndexConfig.RebaseWorkers,
+	)
 	if snapshot.MaxConcurrentFlushers <= 0 {
 		return fmt.Errorf("tuning.max_concurrent_flushers must be > 0")
 	}
@@ -1122,6 +1243,9 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	}
 	if snapshot.SnapshotIndexShards <= 0 || snapshot.SnapshotIndexShards > 1000 {
 		return fmt.Errorf("tuning.snapshot_index_shards must be between 1 and 1000")
+	}
+	if snapshot.SnapshotShardSortChunkMB <= 0 {
+		return fmt.Errorf("tuning.snapshot_index_sort_chunk_mb must be > 0")
 	}
 	// Resolve and install the signature-verification backend here rather than
 	// later: narya pins its backend on first use, and selecting it explicitly
@@ -1800,7 +1924,9 @@ func runLive(c *cobra.Command, args []string) {
 				state.RecordRebuild(accountsPath, 0, "", getVersion(), getCommit(), getBranch(), "new-snapshot mode (no prior state)")
 			}
 			mlog.Log.Infof("Cleaning up previous AccountsDB artifacts in %s", accountsPath)
-			snapshot.CleanAccountsDbDir(accountsPath)
+			if err := snapshot.CleanAccountsDbDir(accountsPath); err != nil {
+				klog.Fatalf("failed to clean previous AccountsDB artifacts: %v", err)
+			}
 		}
 		// Clean existing snapshots (respecting retention setting)
 		if snapshotDownloadPath != "" {
@@ -1846,7 +1972,9 @@ func runLive(c *cobra.Command, args []string) {
 				state.RecordRebuild(accountsPath, 0, "", getVersion(), getCommit(), getBranch(), "new-incremental mode (no prior state)")
 			}
 			mlog.Log.Infof("Cleaning up previous AccountsDB artifacts in %s", accountsPath)
-			snapshot.CleanAccountsDbDir(accountsPath)
+			if err := snapshot.CleanAccountsDbDir(accountsPath); err != nil {
+				klog.Fatalf("failed to clean previous AccountsDB artifacts: %v", err)
+			}
 		}
 		accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPath, blockstorePath, rpcEndpoints)
 		if err != nil {
@@ -1872,7 +2000,9 @@ func runLive(c *cobra.Command, args []string) {
 				state.RecordRebuild(accountsPath, 0, "", getVersion(), getCommit(), getBranch(), "snapshot mode (no prior state)")
 			}
 			mlog.Log.Infof("Cleaning up previous AccountsDB artifacts in %s", accountsPath)
-			snapshot.CleanAccountsDbDir(accountsPath)
+			if err := snapshot.CleanAccountsDbDir(accountsPath); err != nil {
+				klog.Fatalf("failed to clean previous AccountsDB artifacts: %v", err)
+			}
 		}
 
 		// Check for existing fresh snapshot
@@ -1975,7 +2105,9 @@ func runLive(c *cobra.Command, args []string) {
 						// mithrilState is guaranteed non-nil here (we prompted because it was stale)
 						state.RecordRebuild(accountsPath, mithrilState.LastSlot, mithrilState.LastBankhash, getVersion(), getCommit(), getBranch(), "user chose rebuild (stale AccountsDB)")
 						mlog.Log.Infof("Cleaning up previous AccountsDB artifacts in %s", accountsPath)
-						snapshot.CleanAccountsDbDir(accountsPath)
+						if err := snapshot.CleanAccountsDbDir(accountsPath); err != nil {
+							klog.Fatalf("failed to clean previous AccountsDB artifacts: %v", err)
+						}
 					}
 					// choice 3 forces a fresh download: skip the local-reuse check.
 					if choice == 2 {
@@ -2053,8 +2185,11 @@ func runLive(c *cobra.Command, args []string) {
 					state.RecordCorrupted(accountsPath, mithrilState.LastSlot, mithrilState.LastBankhash, replay.CurrentRunID, getVersion(), getCommit(), getBranch(), err.Error())
 				}
 
-				// Close AccountsDB before exiting
-				accountsDb.CloseDb()
+				// Close AccountsDB before exiting. A leaked immutable-index view is
+				// a fatal shutdown failure, not something to hide in a log line.
+				if closeErr := shutdownAccountsDB(accountsDb, accountsDBShutdownTimeout); closeErr != nil {
+					klog.Fatalf("AccountsDB corrupted and failed to shut down cleanly: %v (integrity failure: %v)", closeErr, err)
+				}
 
 				mlog.Log.Infof("restart mithril to automatically rebuild from snapshot")
 				klog.Fatalf("AccountsDB corrupted - restart to rebuild")
@@ -2084,7 +2219,9 @@ func runLive(c *cobra.Command, args []string) {
 					state.RecordRebuild(accountsPath, 0, "", getVersion(), getCommit(), getBranch(), reason)
 				}
 				mlog.Log.Infof("Cleaning up previous AccountsDB artifacts in %s", accountsPath)
-				snapshot.CleanAccountsDbDir(accountsPath)
+				if err := snapshot.CleanAccountsDbDir(accountsPath); err != nil {
+					klog.Fatalf("failed to clean previous AccountsDB artifacts: %v", err)
+				}
 			}
 
 			// Check for existing fresh snapshot
@@ -2253,13 +2390,13 @@ postBootstrap:
 	accountsDb.InitCaches()
 
 	// Alpenglow buffers replayed slots in a fork-aware WorkingSet and folds only
-	// finalized prefixes. Classic verifying mode retains the established
-	// per-slot AccountsDB persistence path.
+	// finalized prefixes. The V2 index has no safe classic per-slot persistence
+	// integration yet, so the non-Alpenglow runtime fails closed below.
 	if config.IsSet("storage.durable_commit") {
 		klog.Fatalf("storage.durable_commit was removed: batch folds replaced the per-slot redo-log commit path — delete the key (rooted-durable batching is always on)")
 	}
-	if config.IsSet("storage.rooted_durable") && config.GetBool("storage.rooted_durable") != alpenglowMode {
-		klog.Fatalf("storage.rooted_durable must be %t for network.cluster=%s", alpenglowMode, cluster)
+	if config.IsSet("storage.rooted_durable") && !config.GetBool("storage.rooted_durable") {
+		klog.Fatalf("storage.rooted_durable cannot be disabled: the V2 AccountsDB index requires rooted-only batch commits")
 	}
 	accountsDb.RootedDurable = alpenglowMode
 	if config.IsSet("storage.fork_aware") {
@@ -2292,31 +2429,96 @@ postBootstrap:
 	// [storage] rewind horizon + compaction. The horizon bounds how far back
 	// RewindToBatchBoundary can restore durable state AND pins the files the
 	// compactor must not reclaim (undo-pointer targets stay alive inside it).
-	// Per-cycle work is deliberately small: CompactOnce holds the store's fold
-	// lock for a cycle, so large scan/move budgets could stall fold/promotion/
-	// rewind — keep validator-safe defaults, overridable once soaked.
+	// Per-cycle work targets are deliberately small: CompactOnce holds the
+	// store's fold lock for a cycle. Scan/move targets are soft, while routine
+	// cycles reject a source above MaxSourceBytes before scanning it. Emergency
+	// disk-pressure compaction removes that cap and applies replay backpressure.
 	compactCfg := accountsdb.CompactionConfig{
 		RewindHorizonBatches: 64,
-		MaxMoveBytesPerCycle: 64 << 20,  // 64 MiB moved per cycle
-		MaxScanBytesPerCycle: 256 << 20, // 256 MiB scanned per cycle
+		MinDeadFraction:      0.7,
+		MaxMoveBytesPerCycle: 64 << 20,  // 64 MiB soft move target
+		MaxScanBytesPerCycle: 256 << 20, // 256 MiB soft scan target
+		MaxSourceBytes:       64 << 20,  // hard routine-cycle source admission
 	}
 	if v := config.GetInt("storage.rewind_horizon_batches"); v > 0 {
 		compactCfg.RewindHorizonBatches = uint64(v)
 	}
-	if v := config.GetFloat64("storage.compact.min_dead_fraction"); v > 0 {
+	if config.IsSet("storage.compact.min_dead_fraction") {
+		v := config.GetFloat64("storage.compact.min_dead_fraction")
+		if v <= 0 || v > 1 || math.IsNaN(v) {
+			klog.Fatalf("storage.compact.min_dead_fraction=%v must be in (0,1]", v)
+		}
 		compactCfg.MinDeadFraction = v
 	}
-	if v := config.GetInt("storage.compact.max_move_mb"); v > 0 {
-		compactCfg.MaxMoveBytesPerCycle = int64(v) << 20
+	if config.IsSet("storage.compact.max_move_mb") {
+		v := config.GetInt64("storage.compact.max_move_mb")
+		if v <= 0 || v > math.MaxInt64>>20 {
+			klog.Fatalf("storage.compact.max_move_mb=%d must be in [1,%d]", v, int64(math.MaxInt64>>20))
+		}
+		compactCfg.MaxMoveBytesPerCycle = v << 20
 	}
-	if v := config.GetInt("storage.compact.max_scan_mb"); v > 0 {
-		compactCfg.MaxScanBytesPerCycle = int64(v) << 20
+	if config.IsSet("storage.compact.max_scan_mb") {
+		v := config.GetInt64("storage.compact.max_scan_mb")
+		if v <= 0 || v > math.MaxInt64>>20 {
+			klog.Fatalf("storage.compact.max_scan_mb=%d must be in [1,%d]", v, int64(math.MaxInt64>>20))
+		}
+		compactCfg.MaxScanBytesPerCycle = v << 20
 	}
-	// Background compaction is OFF by default until soaked (it holds the store's
-	// fold lock during each cycle); operators opt in via storage.compact.enabled.
-	compactEnabled := false
+	if config.IsSet("storage.compact.max_source_mb") {
+		v := config.GetInt64("storage.compact.max_source_mb")
+		if v <= 0 || v > math.MaxInt64>>20 {
+			klog.Fatalf("storage.compact.max_source_mb=%d must be in [1,%d]", v, int64(math.MaxInt64>>20))
+		}
+		compactCfg.MaxSourceBytes = v << 20
+	}
+	compactEnabled := alpenglowMode
 	if alpenglowMode && config.IsSet("storage.compact.enabled") {
 		compactEnabled = config.GetBool("storage.compact.enabled")
+	}
+	compactReserveEnforced := alpenglowMode
+	if alpenglowMode && config.IsSet("storage.compact.enforce_disk_reserve") {
+		compactReserveEnforced = config.GetBool("storage.compact.enforce_disk_reserve")
+	}
+	compactInterval := time.Duration(defaultAppendVecCompactionIntervalSeconds) * time.Second
+	if config.IsSet("storage.compact.interval_seconds") {
+		v := config.GetInt64("storage.compact.interval_seconds")
+		if v < 1 || v > 3600 {
+			klog.Fatalf("storage.compact.interval_seconds=%d must be in [1,3600]", v)
+		}
+		compactInterval = time.Duration(v) * time.Second
+	}
+	compactMinFreeBytes := uint64(0)
+	if config.IsSet("storage.compact.min_free_mb") {
+		v := config.GetInt64("storage.compact.min_free_mb")
+		if v < 0 || uint64(v) > math.MaxUint64>>20 {
+			klog.Fatalf("storage.compact.min_free_mb=%d must be zero (adaptive) or a non-negative MiB value without overflow", v)
+		}
+		compactMinFreeBytes = uint64(v) << 20
+	}
+	compactTargetFreeBytes := uint64(0)
+	if config.IsSet("storage.compact.target_free_mb") {
+		v := config.GetInt64("storage.compact.target_free_mb")
+		if v < 0 || uint64(v) > math.MaxUint64>>20 {
+			klog.Fatalf("storage.compact.target_free_mb=%d must be zero (adaptive) or a non-negative MiB value without overflow", v)
+		}
+		compactTargetFreeBytes = uint64(v) << 20
+	}
+	emergencyMinDeadFraction := defaultEmergencyMinDeadFraction
+	if config.IsSet("storage.compact.emergency_min_dead_fraction") {
+		emergencyMinDeadFraction = config.GetFloat64("storage.compact.emergency_min_dead_fraction")
+		if emergencyMinDeadFraction <= 0 || emergencyMinDeadFraction > compactCfg.MinDeadFraction || math.IsNaN(emergencyMinDeadFraction) {
+			klog.Fatalf(
+				"storage.compact.emergency_min_dead_fraction=%v must be in (0,min_dead_fraction=%v]",
+				emergencyMinDeadFraction,
+				compactCfg.MinDeadFraction,
+			)
+		}
+	}
+	if !compactEnabled {
+		mlog.Log.Warnf("automatic appendvec compaction explicitly disabled; the hard free-space reserve will halt folds instead of allowing ENOSPC, but unattended disk reclamation is disabled")
+	}
+	if !compactReserveEnforced {
+		mlog.Log.Warnf("UNSAFE storage.compact.enforce_disk_reserve=false: folds can consume filesystem headroom and fail at ENOSPC; appendvec disk use is not bounded")
 	}
 
 	// Crash recovery reconcile: the durable fold frontier (recovered above from
@@ -2470,6 +2672,13 @@ postBootstrap:
 			liveEndSlot = uint64(math.MaxUint64)
 		}
 	}
+	var initialAlpenglowBlockID solana.Hash
+	if alpenglowMode {
+		initialAlpenglowBlockID, err = resolveInitialAlpenglowBlockID(mithrilState, resumeState)
+		if err != nil {
+			klog.Fatalf("cannot establish the Alpenglow identity of the durable replay root: %v; rebuild from a current Alpenglow snapshot", err)
+		}
+	}
 
 	// Validate the exact local parent bank before opening operational RPC and
 	// before starting consensus, voting, or block production. Passive turbine
@@ -2518,6 +2727,11 @@ postBootstrap:
 	} else if rpcPort != 0 {
 		rpcServer = rpcserver.NewRpcServer(accountsDb, uint16(rpcPort), epochScheduleFromState(mithrilState), solana.MustHashFromBase58(networkGenesisHash))
 		rpcServer.Start()
+		defer func() {
+			if err := shutdownRPCServer(rpcServer, rpcServerShutdownTimeout); err != nil {
+				mlog.Log.Errorf("RPC server shutdown fallback failed: %v", err)
+			}
+		}()
 		mlog.Log.Infof("Started RPC server on port %d", rpcPort)
 	}
 
@@ -2547,10 +2761,8 @@ postBootstrap:
 		}
 		if resumeState != nil {
 			root.Slot = resumeState.ParentSlot
-			if resumeState.HasParentAlpenglowBlockID {
-				root.Hash = resumeState.ParentAlpenglowBlockID
-			}
 		}
+		root.Hash = initialAlpenglowBlockID
 		// Load the same persisted/manifest stake view replay will use before the
 		// receiver or broadcaster can make an admission decision. This is crucial
 		// on AccountsDB resume, where global epoch stakes are otherwise populated
@@ -2597,6 +2809,7 @@ postBootstrap:
 	localBlocks := make(chan *block.Block, 16)
 	var sharedGossip *gossip.Client
 	var validatorPrewarmBlocks []*block.Block
+	var stopValidatorServices func() error
 	if consensusMode == "validator" {
 		if turbinePrewarm != nil {
 			var dropped int
@@ -2729,10 +2942,18 @@ postBootstrap:
 		if err != nil {
 			klog.Fatalf("start validator TPU: %v", err)
 		}
+		var tpuStopOnce sync.Once
+		var tpuStopErr error
+		stopTPU := func() error {
+			tpuStopOnce.Do(func() {
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				tpuStopErr = tpuService.Stop(shutdownCtx)
+			})
+			return tpuStopErr
+		}
 		defer func() {
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if err := tpuService.Stop(shutdownCtx); err != nil {
+			if err := stopTPU(); err != nil {
 				mlog.Log.Warnf("validator TPU shutdown: %v", err)
 			}
 		}()
@@ -2815,9 +3036,20 @@ postBootstrap:
 			defer close(leaderDone)
 			leaderLoop.Run(leaderStop)
 		}()
+		leaderStopper := newJoinedStopper(func() { close(leaderStop) }, leaderDone)
+		stopValidatorServices = func() error {
+			// Stop new work before asking the leader loop to finish its active
+			// bank. finishActiveSlot may still read AccountsDB, so join it last.
+			cancelRun()
+			tpuErr := stopTPU()
+			topicSink.Stop()
+			leaderStopper.Stop()
+			return tpuErr
+		}
 		defer func() {
-			close(leaderStop)
-			<-leaderDone
+			if err := stopValidatorServices(); err != nil {
+				mlog.Log.Warnf("validator service shutdown fallback: %v", err)
+			}
 		}()
 		mlog.Log.Infof("Alpenglow validator production active: TPU=%s advertised=%s", tpuService.ListenAddr(), tpuAdvertise)
 	}
@@ -2861,10 +3093,15 @@ postBootstrap:
 	}
 
 	consensusOpts := &replay.ConsensusOpts{
-		Alpenglow: alpenglowMode,
-		Engine:    consensusEngine,
+		Alpenglow:                  alpenglowMode,
+		Engine:                     consensusEngine,
+		WorkingSetMaxRetainedBytes: workingSetMaxMB << 20,
 	}
 	if alpenglowMode {
+		if resumeState == nil {
+			consensusOpts.SnapshotParentAlpenglowBlockID = initialAlpenglowBlockID
+			consensusOpts.HasSnapshotParentAlpenglowBlockID = true
+		}
 		consensusOpts.TransactionStatusCheckpointAfterCommit = func(selected *state.TransactionStatusCheckpointRef) error {
 			removed, err := cleanupRetainedTransactionStatusCheckpoints(
 				accountsPath, accountsDb, compactCfg.RewindHorizonBatches, selected,
@@ -2882,25 +3119,66 @@ postBootstrap:
 		slotCtxSetter = rpcServer
 	}
 
-	// Background compaction: folds never overwrite, so dead bytes accumulate in
-	// out-of-horizon segments and bootstrap appendvecs. Each cycle is bounded
-	// (move + scan budgets) and serialized against folds via the store's
-	// internal lock; the rewind horizon pins are what it must never touch.
+	// Appendvec disk management is enabled by default. Healthy replay pays only
+	// one cheap statfs admission per fold. Normal compaction starts below an
+	// adaptive target and uses TryLock so it never waits ahead of an active
+	// fold; only the hard reserve permits synchronous compaction/backpressure.
+	diskManager, diskManagerErr := newAppendVecDiskManager(
+		ctx,
+		cancelRun,
+		appendVecDiskPolicyConfig{
+			AccountsPath:             accountsDb.AcctsDir,
+			CompactionEnabled:        compactEnabled,
+			ReserveEnforced:          compactReserveEnforced,
+			MinFreeBytes:             compactMinFreeBytes,
+			TargetFreeBytes:          compactTargetFreeBytes,
+			EmergencyMinDeadFraction: emergencyMinDeadFraction,
+			NormalCompaction:         compactCfg,
+		},
+		nil,
+		accountsDb.CompactOnceContext,
+	)
+	if diskManagerErr != nil {
+		klog.Fatalf("initialize appendvec disk manager: %v", diskManagerErr)
+	}
+	if compactReserveEnforced {
+		if err := accountsDb.SetFoldDiskAdmission(diskManager.AdmitFold); err != nil {
+			klog.Fatalf("install appendvec fold disk admission: %v", err)
+		}
+		release, err := diskManager.AdmitFold(0)
+		if err != nil {
+			klog.Fatalf("appendvec startup disk reserve cannot be restored: %v", err)
+		}
+		release()
+	}
+	mlog.Log.Infof(
+		"appendvec disk policy: compaction=%t reserve=%t minimum-free=%s target-free=%s interval=%s",
+		compactEnabled,
+		compactReserveEnforced,
+		formatDiskBytes(diskManager.MinFreeBytes()),
+		formatDiskBytes(diskManager.TargetFreeBytes()),
+		compactInterval,
+	)
+
+	var compactor *backgroundCompactor
 	if compactEnabled {
-		go func() {
-			ticker := time.NewTicker(10 * time.Minute)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					if _, cerr := accountsDb.CompactOnce(compactCfg); cerr != nil {
-						mlog.Log.Warnf("compaction cycle failed: %v", cerr)
-					}
-				}
+		if stats, err := diskManager.RunNormalCycle(ctx); err != nil {
+			klog.Fatalf("initial appendvec compaction cycle failed: %v", err)
+		} else {
+			logAppendVecCompactionStats(stats)
+		}
+		compactor = startBackgroundCompactor(ctx, compactInterval, func(compactCtx context.Context) {
+			stats, cerr := diskManager.RunNormalCycle(compactCtx)
+			if cerr != nil && !errors.Is(cerr, context.Canceled) {
+				mlog.Log.Errorf("appendvec compaction failed; stopping replay: %v", cerr)
+				diskManager.Fail(cerr)
+				return
 			}
-		}()
+			logAppendVecCompactionStats(stats)
+		})
+		// Panic/early-return safety. The explicit Stop immediately after replay is
+		// what establishes the normal state/AccountsDB teardown ordering.
+		defer compactor.Stop()
 	}
 
 	startSigverifyReporter(ctx)
@@ -2910,6 +3188,29 @@ postBootstrap:
 		turbineAlpenglowAddr = alpenglowAddrForGossip(alpenglowObserverBindAddr)
 	}
 	result := runReplayWithRecovery(ctx, accountsDb, accountsPath, manifest, resumeState, uint64(startSlot), liveEndSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, uint16(turbineShredVersion), turbineAlpenglowAddr, validatorIdentity, blockstorePath, int(txParallelism), true, useLightbringer, useTurbine, dbgOpts, metricsWriter, slotCtxSetter, mithrilState, blockFetchOpts, consensusOpts, compactCfg.RewindHorizonBatches, replayStartTime)
+	if compactor != nil {
+		// CompactOnceContext can hold foldMu and touch index/appendvec resources.
+		// Cancel and join it before state finalization or AccountsDB shutdown.
+		compactor.Stop()
+	}
+	if diskErr := diskManager.Err(); diskErr != nil {
+		result.Error = errors.Join(result.Error, diskErr)
+		result.WasCancelled = false
+	}
+	// Finite and error replay can return while the command context is still
+	// live. Fence all request/production ingress explicitly, then join every
+	// AccountsDB-owning service before state finalization or database teardown.
+	cancelRun()
+	var serviceStopErr error
+	if rpcServer != nil {
+		serviceStopErr = errors.Join(serviceStopErr, shutdownRPCServer(rpcServer, rpcServerShutdownTimeout))
+	}
+	if stopValidatorServices != nil {
+		serviceStopErr = errors.Join(serviceStopErr, stopValidatorServices())
+	}
+	if serviceStopErr != nil {
+		klog.Fatalf("background service shutdown failed; refusing AccountsDB teardown: %v", serviceStopErr)
+	}
 
 	if result.Error != nil {
 		if result.LastPersistedSlot == 0 {
@@ -3008,7 +3309,33 @@ postBootstrap:
 	}
 
 	mlog.Log.Infof("Done replaying, closing DB")
-	accountsDb.CloseDb()
+	if err := shutdownAccountsDB(accountsDb, accountsDBShutdownTimeout); err != nil {
+		klog.Fatalf("AccountsDB shutdown failed: %v", err)
+	}
+}
+
+func shutdownAccountsDB(accountsDb *accountsdb.AccountsDb, timeout time.Duration) error {
+	if accountsDb == nil {
+		return nil
+	}
+	if timeout <= 0 {
+		return fmt.Errorf("invalid AccountsDB shutdown timeout %s", timeout)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return accountsDb.Shutdown(ctx)
+}
+
+func shutdownRPCServer(server *rpcserver.RpcServer, timeout time.Duration) error {
+	if server == nil {
+		return nil
+	}
+	if timeout <= 0 {
+		return fmt.Errorf("invalid RPC server shutdown timeout %s", timeout)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return server.Shutdown(ctx)
 }
 
 type turbineEntrypointQuery func(*net.UDPAddr, time.Duration) (gossip.EchoResponse, error)
@@ -4245,18 +4572,19 @@ func adoptRewindResult(accountsDbPath string, s *state.MithrilState, res account
 
 // completeInterruptedRewind finishes a rewind that crashed mid-flight (parked
 // ".rewound" manifests remain). It rewinds to the highest retained boundary
-// below the parked suffix — RewindToBatchBoundary is idempotent, so this works
-// whether the crash landed before the meta rollback (does the full rewind now)
-// or after it (a no-op that just finalizes the leftovers) — and adopts that
-// boundary as the rooted checkpoint. Fatals only when nothing is left to finish
-// the rewind with.
+// below the parked suffix. ListRewindPoints validates the combined ordinary
+// and parked sequence layout and, even after only part of the ascending park
+// loop reached disk, hides every boundary above the exact original target.
+// RewindToBatchBoundary is idempotent, so this works whether the crash landed
+// before the meta rollback (does the full rewind now) or after it (a no-op that
+// just finalizes the leftovers). Fatals on a missing or ambiguous target.
 func completeInterruptedRewind(accountsDbPath string, accountsDb *accountsdb.AccountsDb, mithrilState *state.MithrilState) {
 	points, err := accountsDb.ListRewindPoints()
 	if err != nil || len(points) == 0 {
 		klog.Fatalf("interrupted rewind detected but no retained fold boundary remains to complete it; re-bootstrap with --bootstrap snapshot")
 	}
-	// The rewind parks every batch above its target, so the highest still-present
-	// (non-parked) boundary IS the target.
+	// During an interrupted rewind, ListRewindPoints returns no ordinary suffix
+	// boundary above the exact target derived from the validated parked layout.
 	targetPoint := points[len(points)-1]
 	target := targetPoint.ThroughSlot
 	if err := validateTransactionStatusRewindPoint(accountsDbPath, accountsDb, targetPoint); err != nil {

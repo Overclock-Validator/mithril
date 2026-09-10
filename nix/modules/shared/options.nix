@@ -218,20 +218,80 @@
         description = "Logs path override.";
       };
 
+      storageCompactEnabled = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Enable pressure-gated appendvec compaction.";
+      };
+
+      storageCompactEnforceDiskReserve = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Fail closed before a fold consumes the appendvec free-space reserve. Disabling this permits unsafe, unbounded disk growth.";
+      };
+
+      storageCompactIntervalSeconds = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 30;
+        description = "Routine appendvec pressure-check interval in seconds.";
+      };
+
+      storageCompactMinFreeMb = lib.mkOption {
+        type = lib.types.addCheck lib.types.int (value: value >= 0);
+        default = 0;
+        description = "Hard appendvec free-space reserve in MiB; zero selects the filesystem-adaptive default.";
+      };
+
+      storageCompactTargetFreeMb = lib.mkOption {
+        type = lib.types.addCheck lib.types.int (value: value >= 0);
+        default = 0;
+        description = "Free-space target that starts routine appendvec compaction in MiB; zero selects the filesystem-adaptive default.";
+      };
+
+      storageCompactMinDeadFraction = lib.mkOption {
+        type = lib.types.addCheck lib.types.float (value: value > 0.0 && value <= 1.0);
+        default = 0.7;
+        description = "Minimum dead-byte fraction for routine appendvec compaction.";
+      };
+
+      storageCompactEmergencyMinDeadFraction = lib.mkOption {
+        type = lib.types.addCheck lib.types.float (value: value > 0.0 && value <= 1.0);
+        default = 0.2;
+        description = "Minimum dead-byte fraction used only during synchronous hard-pressure compaction; must not exceed storageCompactMinDeadFraction.";
+      };
+
+      storageCompactMaxMoveMb = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 64;
+        description = "Soft routine-cycle live-byte move target in MiB.";
+      };
+
+      storageCompactMaxScanMb = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 256;
+        description = "Soft routine-cycle liveness-scan target in MiB.";
+      };
+
+      storageCompactMaxSourceMb = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 64;
+        description = "Hard source-file size cap for routine compaction in MiB; emergency pressure compaction removes this cap.";
+      };
+
       networkCluster = lib.mkOption {
-        type = lib.types.enum ["mainnet-beta" "testnet" "devnet"];
-        default = "mainnet-beta";
-        description = "Solana cluster.";
+        type = lib.types.enum ["alpenglow" "mainnet-beta" "testnet" "devnet"];
+        default = "alpenglow";
+        description = "Solana cluster. This V2 branch currently runs only on Alpenglow; classic names remain available for explicit cross-branch configurations.";
       };
 
       networkRpc = lib.mkOption {
         type = lib.types.listOf lib.types.str;
-        default = ["https://api.mainnet-beta.solana.com"];
+        default = ["https://rpc.ag.validator1.net"];
         description = "RPC endpoints in priority order.";
       };
 
       blockSource = lib.mkOption {
-        type = lib.types.enum ["rpc" "lightbringer"];
+        type = lib.types.enum ["turbine" "rpc" "lightbringer"];
         default = "rpc";
         description = "Block source.";
       };
@@ -315,9 +375,9 @@
       };
 
       consensusMode = lib.mkOption {
-        type = lib.types.enum ["classic" "legacy" "alpenglow-observer" "alpenglow"];
-        default = "classic";
-        description = "Consensus mode. \"legacy\" is accepted as an alias for \"classic\".";
+        type = lib.types.enum ["verifying" "validator"];
+        default = "verifying";
+        description = "Node mode: non-voting verifying node or Alpenglow validator.";
       };
 
       consensusAlpenglowObserverBindAddr = lib.mkOption {
@@ -346,7 +406,7 @@
 
       tuningMaxConcurrentFlushers = lib.mkOption {
         type = lib.types.int;
-        default = 16;
+        default = 8;
         description = "Max concurrent flushers.";
       };
 
@@ -378,6 +438,12 @@
         type = lib.types.int;
         default = 1024;
         description = "Approximate maximum retained SBPF program cache size in MiB.";
+      };
+
+      tuningWorkingSetMaxMb = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 1024;
+        description = "Conservative unrooted account WorkingSet memory threshold in MiB; one complete slot may overshoot before replay drains or halts.";
       };
 
       tuningPprofPort = lib.mkOption {
