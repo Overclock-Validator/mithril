@@ -392,6 +392,12 @@ name = "mithril"
     # [block].turbine_bind_addr; set either one (this key takes precedence).
     # bind_addr = "0.0.0.0:8001"
 
+    # UDP address advertised in gossip for Solana serve-repair. Mithril answers
+    # signed WindowIndex and HighestWindowIndex requests from its verified
+    # on-disk shredstore. Open this port inbound. Defaults to 0.0.0.0:8003 when
+    # gossip_entrypoint is configured; set an explicit empty string to disable.
+    serve_repair_bind_addr = "0.0.0.0:8003"
+
     # UDP address where Mithril listens for gossip traffic. Leave empty to let
     # the OS choose an available port. Set a fixed port if your firewall/NAT
     # needs an explicit rule.

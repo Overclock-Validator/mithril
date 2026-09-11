@@ -29,6 +29,8 @@ type UDPReceiver struct {
 	completionPool *slotCompletionPool
 	leaderForSlot  LeaderForSlotFunc
 	repairClient   *repairClient
+	serveRepairCfg *ServeRepairConfig
+	serveRepair    *ServeRepairServer
 	retransmitCfg  *RetransmitConfig
 	retransmitter  *Retransmitter
 	sigCache       shredSigCache
@@ -110,6 +112,7 @@ type ReceiverStats struct {
 	LastNonCanonicalGot   solana.Hash
 	LastNonCanonicalWant  solana.Hash
 	Repair                RepairStats
+	ServeRepair           ServeRepairStats
 	LastPacketUnix        int64
 	LastDataSlot          uint64
 	LastBlockSlot         uint64
@@ -207,6 +210,29 @@ func (r *UDPReceiver) SetRepairPeerSource(identity ed25519.PrivateKey, source fu
 		return err
 	}
 	r.repairClient = client
+	return nil
+}
+
+// SetServeRepair enables the advertised Solana repair service backed by the
+// receiver's verified shred spool. SetShredSpool must be called first.
+func (r *UDPReceiver) SetServeRepair(addr string, identity ed25519.PrivateKey) error {
+	if r.spool == nil {
+		return errors.New("serve repair requires a shred spool")
+	}
+	if r.leaderForSlot == nil {
+		return errors.New("serve repair requires leader lookup for verified shred ingestion")
+	}
+	if addr == "" {
+		return errors.New("serve repair bind address is required")
+	}
+	if len(identity) != ed25519.PrivateKeySize {
+		return fmt.Errorf("serve repair identity has invalid size %d", len(identity))
+	}
+	r.serveRepairCfg = &ServeRepairConfig{
+		Addr:     addr,
+		Identity: append(ed25519.PrivateKey(nil), identity...),
+		Store:    r.spool,
+	}
 	return nil
 }
 
@@ -457,6 +483,7 @@ func (r *UDPReceiver) Stats() ReceiverStats {
 		LastNonCanonicalGot:   nonCanonicalGot,
 		LastNonCanonicalWant:  nonCanonicalWant,
 		Repair:                r.repairStats(),
+		ServeRepair:           r.serveRepairStats(),
 		LastPacketUnix:        r.lastPacketUnix.Load(),
 		LastDataSlot:          r.lastDataSlot.Load(),
 		LastBlockSlot:         r.lastBlockSlot.Load(),
@@ -467,6 +494,13 @@ func (r *UDPReceiver) Stats() ReceiverStats {
 		SigVerifyCached:       sigHits,
 		Retransmit:            r.retransmitStats(),
 	}
+}
+
+func (r *UDPReceiver) serveRepairStats() ServeRepairStats {
+	if r.serveRepair == nil {
+		return ServeRepairStats{}
+	}
+	return r.serveRepair.Stats()
 }
 
 func (r *UDPReceiver) retransmitStats() RetransmitStats {
@@ -503,6 +537,10 @@ func (r *UDPReceiver) Run(ctx context.Context) error {
 	// restart or prewarm handover (found by review).
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
+	if r.spool != nil {
+		// Run owns every attached spool even when a later socket setup fails.
+		defer r.spool.Close()
+	}
 
 	udpAddr, err := net.ResolveUDPAddr("udp", r.Addr)
 	if err != nil {
@@ -533,6 +571,15 @@ func (r *UDPReceiver) Run(ctx context.Context) error {
 		gossip.BoostUDPReceiveBuffer(repairConn, gossip.TurbineUDPReceiveBufferBytes, "turbine repair receiver")
 	}
 
+	if r.serveRepairCfg != nil {
+		r.serveRepair, err = NewServeRepairServer(*r.serveRepairCfg)
+		if err != nil {
+			r.signalReady(fmt.Errorf("start serve repair: %w", err))
+			return fmt.Errorf("start serve repair: %w", err)
+		}
+		defer r.serveRepair.Close()
+	}
+
 	var retransmitDone chan struct{}
 	if r.retransmitCfg != nil {
 		r.retransmitter, err = NewRetransmitter(*r.retransmitCfg)
@@ -561,6 +608,9 @@ func (r *UDPReceiver) Run(ctx context.Context) error {
 		if repairConn != nil {
 			_ = repairConn.Close()
 		}
+		if r.serveRepair != nil {
+			_ = r.serveRepair.Close()
+		}
 	}()
 	if repairConn != nil {
 		go r.repairClient.run(runCtx, repairConn, r.assembler)
@@ -572,7 +622,6 @@ func (r *UDPReceiver) Run(ctx context.Context) error {
 		// directory (block source after a prewarm handoff, or a stream
 		// restart) can only see what reached disk — and it truncate-rewrites
 		// the journal on open, so ours must be closed first.
-		defer r.spool.Close()
 		hydratorDone = make(chan struct{})
 		go func() {
 			defer close(hydratorDone)
@@ -581,7 +630,7 @@ func (r *UDPReceiver) Run(ctx context.Context) error {
 	}
 
 	readers := 1
-	readErr := make(chan error, 1+turbineRepairReadWorkers)
+	readErr := make(chan error, 2+turbineRepairReadWorkers)
 	go func() { readErr <- r.readPackets(runCtx, liveConn, false) }()
 	if repairConn != nil {
 		readers += turbineRepairReadWorkers
@@ -589,11 +638,18 @@ func (r *UDPReceiver) Run(ctx context.Context) error {
 			go func() { readErr <- r.readPackets(runCtx, repairConn, true) }()
 		}
 	}
+	if r.serveRepair != nil {
+		readers++
+		go func() { readErr <- r.serveRepair.Run(runCtx) }()
+	}
 	firstErr := <-readErr
 	runCancel()
 	_ = liveConn.Close()
 	if repairConn != nil {
 		_ = repairConn.Close()
+	}
+	if r.serveRepair != nil {
+		_ = r.serveRepair.Close()
 	}
 	for i := 1; i < readers; i++ {
 		<-readErr

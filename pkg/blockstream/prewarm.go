@@ -56,21 +56,22 @@ const prewarmProbeSlots = 64
 // prewarm receiver is torn down (freeing the bind port) before the
 // BlockSource constructs its own.
 type TurbinePrewarmConfig struct {
-	BindAddr         string
-	GossipEntrypoint string
-	GossipBindAddr   string
-	AdvertisedIP     string
-	ShredVersion     uint16
-	AlpenglowAddr    string
-	Identity         ed25519.PrivateKey
-	LeaderForSlot    turbine.LeaderForSlotFunc
-	StakesForSlot    func(slot uint64) map[solana.PublicKey]uint64
-	EpochForSlot     func(slot uint64) uint64
-	RootSlot         func() uint64
-	UseChaCha8       bool
-	DedupAddrs       bool
-	FloorSlot        uint64 // resume frontier: spool floor and assembler retention floor
-	MaxSpoolBlocks   int
+	BindAddr            string
+	ServeRepairBindAddr string
+	GossipEntrypoint    string
+	GossipBindAddr      string
+	AdvertisedIP        string
+	ShredVersion        uint16
+	AlpenglowAddr       string
+	Identity            ed25519.PrivateKey
+	LeaderForSlot       turbine.LeaderForSlotFunc
+	StakesForSlot       func(slot uint64) map[solana.PublicKey]uint64
+	EpochForSlot        func(slot uint64) uint64
+	RootSlot            func() uint64
+	UseChaCha8          bool
+	DedupAddrs          bool
+	FloorSlot           uint64 // resume frontier: spool floor and assembler retention floor
+	MaxSpoolBlocks      int
 	// ShredSpoolDir: shared on-disk shred spool. Everything the prewarm
 	// hears goes to disk too, so even blocks beyond the in-RAM spool cap
 	// hydrate later instead of re-repairing.
@@ -97,14 +98,15 @@ func StartTurbinePrewarm(cfg TurbinePrewarmConfig) (*TurbinePrewarm, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	gossipCfg := gossipclient.Config{
-		Entrypoint:    cfg.GossipEntrypoint,
-		BindAddr:      cfg.GossipBindAddr,
-		TVUAddr:       cfg.BindAddr,
-		AlpenglowAddr: cfg.AlpenglowAddr,
-		AdvertisedIP:  cfg.AdvertisedIP,
-		ShredVersion:  cfg.ShredVersion,
-		Identity:      cfg.Identity,
-		Name:          gossipclient.ClientName,
+		Entrypoint:      cfg.GossipEntrypoint,
+		BindAddr:        cfg.GossipBindAddr,
+		TVUAddr:         cfg.BindAddr,
+		ServeRepairAddr: cfg.ServeRepairBindAddr,
+		AlpenglowAddr:   cfg.AlpenglowAddr,
+		AdvertisedIP:    cfg.AdvertisedIP,
+		ShredVersion:    cfg.ShredVersion,
+		Identity:        cfg.Identity,
+		Name:            gossipclient.ClientName,
 	}
 	client, err := gossipclient.NewClient(gossipCfg)
 	if err != nil {
@@ -141,13 +143,27 @@ func StartTurbinePrewarm(cfg TurbinePrewarmConfig) (*TurbinePrewarm, error) {
 	}
 	if cfg.ShredSpoolDir != "" {
 		if spool, serr := turbine.OpenShredSpool(cfg.ShredSpoolDir, shredSpoolMaxBytes); serr != nil {
+			if cfg.ServeRepairBindAddr != "" {
+				cancel()
+				return nil, fmt.Errorf("prewarm serve-repair shred store: %w", serr)
+			}
 			mlog.Log.FileOnlyf("prewarm shred spool disabled: %v", serr)
 		} else {
 			receiver.SetShredSpool(spool)
+			if cfg.ServeRepairBindAddr != "" {
+				if err := receiver.SetServeRepair(cfg.ServeRepairBindAddr, client.Identity()); err != nil {
+					cancel()
+					spool.Close()
+					return nil, fmt.Errorf("prewarm serve repair setup: %w", err)
+				}
+			}
 			// Assemble the resume-adjacent window in RAM; spool the far
 			// edge to disk only.
 			receiver.SetHydrationWindow(cfg.FloorSlot, cfg.FloorSlot+repairCatchupLiveDeliverWindow)
 		}
+	} else if cfg.ServeRepairBindAddr != "" {
+		cancel()
+		return nil, fmt.Errorf("prewarm serve repair requires a shred spool directory")
 	}
 
 	if cfg.FloorSlot > 0 {

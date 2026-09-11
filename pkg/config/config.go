@@ -123,11 +123,12 @@ type BlockConfig struct {
 
 // TurbineConfig holds native gossip/turbine receiver configuration.
 type TurbineConfig struct {
-	BindAddr         string `toml:"bind_addr" mapstructure:"bind_addr"`                 // UDP address for incoming turbine shreds
-	GossipEntrypoint string `toml:"gossip_entrypoint" mapstructure:"gossip_entrypoint"` // Solana gossip entrypoint for turbine tree joining
-	GossipBindAddr   string `toml:"gossip_bind_addr" mapstructure:"gossip_bind_addr"`   // UDP address for Mithril gossip traffic
-	AdvertisedIP     string `toml:"advertised_ip" mapstructure:"advertised_ip"`         // Public IP to advertise in gossip
-	ShredVersion     uint16 `toml:"shred_version" mapstructure:"shred_version"`         // Optional override; normally discovered from entrypoint
+	BindAddr            string `toml:"bind_addr" mapstructure:"bind_addr"`                           // UDP address for incoming turbine shreds
+	ServeRepairBindAddr string `toml:"serve_repair_bind_addr" mapstructure:"serve_repair_bind_addr"` // UDP address for inbound Solana repair requests
+	GossipEntrypoint    string `toml:"gossip_entrypoint" mapstructure:"gossip_entrypoint"`           // Solana gossip entrypoint for turbine tree joining
+	GossipBindAddr      string `toml:"gossip_bind_addr" mapstructure:"gossip_bind_addr"`             // UDP address for Mithril gossip traffic
+	AdvertisedIP        string `toml:"advertised_ip" mapstructure:"advertised_ip"`                   // Public IP to advertise in gossip
+	ShredVersion        uint16 `toml:"shred_version" mapstructure:"shred_version"`                   // Optional override; normally discovered from entrypoint
 }
 
 // SnapshotConfig holds snapshot download configuration

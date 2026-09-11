@@ -233,6 +233,7 @@ near_tip_lookahead = 2
 # ── Turbine (native shred receiver; source = "turbine") ──────────────────
 [turbine]
 gossip_entrypoint = ""    # REQUIRED for turbine: a gossip entrypoint of your Alpenglow cluster (host:port)
+serve_repair_bind_addr = "0.0.0.0:8003" # Solana repair service backed by storage.shredstore (open inbound UDP)
 gossip_bind_addr = "0.0.0.0:65401"  # Local gossip UDP port (open inbound); empty = OS-assigned
 # Gossip-connected nodes automatically retransmit verified broadcast shreds to their Agave-compatible downstream Turbine peers; repair responses are never forwarded.
 # advertised_ip = ""      # Public IP peers reach you at; empty = auto-detect via the entrypoint's IP-echo

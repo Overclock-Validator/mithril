@@ -22,7 +22,40 @@ const (
 	repairSignatureOffset = 4
 	repairSignatureSize   = 64
 	repairPingSize        = 4 + 32 + 32 + 64
+	repairRequestSize     = 4 + repairSignatureSize + 32 + 32 + 8 + 4 + 8 + 8
 )
+
+const (
+	// RequestPacketSize is the exact bincode wire size of a modern signed
+	// WindowIndex or HighestWindowIndex request.
+	RequestPacketSize = repairRequestSize
+	// RequestSignableSize excludes the signature field from RequestPacketSize.
+	RequestSignableSize = repairRequestSize - repairSignatureSize
+)
+
+// RequestKind identifies the modern signed Solana repair requests Mithril
+// can answer. Legacy, orphan, and ancestor-hash requests are deliberately not
+// admitted by DecodeRequest.
+type RequestKind uint8
+
+const (
+	RequestWindowIndex RequestKind = iota
+	RequestHighestWindowIndex
+)
+
+// Request is the pointer-free portion of a modern signed repair request. The
+// signature is verified against the original packet with VerifySignedRequest;
+// keeping it out of this value avoids accidentally authenticating a
+// re-encoded representation instead of the exact wire bytes.
+type Request struct {
+	Kind       RequestKind
+	Sender     gossip.Pubkey
+	Recipient  gossip.Pubkey
+	Timestamp  uint64
+	Nonce      uint32
+	Slot       uint64
+	ShredIndex uint64
+}
 
 type Ping struct {
 	From      gossip.Pubkey
@@ -54,6 +87,58 @@ func NewHighestWindowIndexRequest(identity ed25519.PrivateKey, recipient gossip.
 
 func BuildHighestWindowIndexRequest(identity ed25519.PrivateKey, recipient gossip.Pubkey, slot uint64, shredIndex uint64, nonce uint32) ([]byte, error) {
 	return buildRequest(identity, recipient, repairProtocolHighestWindowIndex, slot, shredIndex, nonce, uint64(time.Now().UnixMilli()))
+}
+
+// DecodeRequest decodes exactly one modern signed WindowIndex or
+// HighestWindowIndex request. It rejects trailing bytes just like Solana's
+// bincode repair decoder. Call VerifySignedRequest before trusting the decoded
+// sender or serving data.
+func DecodeRequest(packet []byte) (Request, bool) {
+	if len(packet) != repairRequestSize {
+		return Request{}, false
+	}
+
+	var request Request
+	switch binary.LittleEndian.Uint32(packet[:4]) {
+	case repairProtocolWindowIndex:
+		request.Kind = RequestWindowIndex
+	case repairProtocolHighestWindowIndex:
+		request.Kind = RequestHighestWindowIndex
+	default:
+		return Request{}, false
+	}
+	copy(request.Sender[:], packet[68:100])
+	copy(request.Recipient[:], packet[100:132])
+	request.Timestamp = binary.LittleEndian.Uint64(packet[132:140])
+	request.Nonce = binary.LittleEndian.Uint32(packet[140:144])
+	request.Slot = binary.LittleEndian.Uint64(packet[144:152])
+	request.ShredIndex = binary.LittleEndian.Uint64(packet[152:160])
+	return request, true
+}
+
+// CopyRequestSignable copies the exact bytes authenticated by a repair
+// request into dst. Keeping this as a fixed-size copy lets packet consumers
+// batch strict Ed25519 verification without allocating a re-encoded request.
+func CopyRequestSignable(dst []byte, packet []byte) bool {
+	if len(packet) != repairRequestSize || len(dst) < RequestSignableSize {
+		return false
+	}
+	copy(dst[:repairSignatureOffset], packet[:repairSignatureOffset])
+	copy(dst[repairSignatureOffset:RequestSignableSize], packet[repairSignatureOffset+repairSignatureSize:])
+	return true
+}
+
+// RequestSignature returns the signature bytes in an exact-size request.
+func RequestSignature(packet []byte) ([]byte, bool) {
+	if len(packet) != repairRequestSize {
+		return nil, false
+	}
+	return packet[repairSignatureOffset : repairSignatureOffset+repairSignatureSize], true
+}
+
+// IsPong reports whether packet has the canonical Solana repair Pong shape.
+func IsPong(packet []byte) bool {
+	return len(packet) == repairPingSize && binary.LittleEndian.Uint32(packet[:4]) == repairProtocolPong
 }
 
 func ResponseNonce(packet []byte) (uint32, bool) {
@@ -137,29 +222,17 @@ func signRepairPacket(identity ed25519.PrivateKey, packet []byte) {
 	copy(packet[repairSignatureOffset:repairSignatureOffset+repairSignatureSize], signature)
 }
 
-// VerifySignedRequest authenticates an INBOUND repair request — a peer asking
-// us to serve it a shred. Mithril is requester-side only today, so nothing
-// outside tests calls this yet.
-//
-// When repair serving is wired up, this becomes a packet-rate consumer fed by
-// a UDP socket loop, which is the shape that wants batching: signatures are
-// verified eight per AVX-512 group, so verifying one packet at a time pays for
-// a whole group and uses one lane of it. Drain the socket's work queue and
-// verify a group per pass, exactly as pkg/tpu/pipeline does — sigverify.Drain
-// and sigverify.FairShare exist for this, and take a share rather than the
-// whole queue so batching does not eat the parallelism across workers.
-//
-// The predicate here is already the strict one, which matters more than the
-// throughput: a repair request authenticated under plain stdlib rules would
-// accept small-order sender keys that Agave rejects.
+// VerifySignedRequest authenticates an inbound repair request with Solana's
+// strict Ed25519 predicate. The serve-repair packet loop uses the batched
+// sigverify path; this single-request helper remains useful to callers and
+// protocol tests.
 func VerifySignedRequest(packet []byte, sender gossip.Pubkey) bool {
-	if len(packet) < repairSignatureOffset+repairSignatureSize {
+	var signable [RequestSignableSize]byte
+	if !CopyRequestSignable(signable[:], packet) {
 		return false
 	}
-	signable := make([]byte, 0, len(packet)-repairSignatureSize)
-	signable = append(signable, packet[:repairSignatureOffset]...)
-	signable = append(signable, packet[repairSignatureOffset+repairSignatureSize:]...)
-	return narya.VerifyStrict(sender[:], signable, packet[repairSignatureOffset:repairSignatureOffset+repairSignatureSize])
+	signature, _ := RequestSignature(packet)
+	return narya.VerifyStrict(sender[:], signable[:], signature)
 }
 
 func hashPingToken(token [32]byte) gossip.Hash {

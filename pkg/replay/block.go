@@ -75,6 +75,9 @@ type BlockFetchOpts struct {
 	RepairCatchupMaxGapSlots uint64
 	// Repair request-rate ceiling override, requests/second (0 = default).
 	RepairMaxRequestsPerSecond int
+	// TurbineServeRepairAddr is the fixed UDP endpoint advertised for inbound
+	// Solana repair requests (empty disables serving).
+	TurbineServeRepairAddr string
 	// Shreds-only: RPC never fetches blocks (block.rpc_fallback=false).
 	DisableRPCBlockFetch bool
 	// TurbinePrewarm: boot-time shred collector to hand over (stop + drain)
@@ -2320,6 +2323,7 @@ func ReplayBlocks(
 		opts.TipSafetyMargin = blockFetchOpts.TipSafetyMargin
 		opts.RepairCatchupMaxGapSlots = blockFetchOpts.RepairCatchupMaxGapSlots
 		opts.RepairMaxRequestsPerSecond = blockFetchOpts.RepairMaxRequestsPerSecond
+		opts.TurbineServeRepairAddr = blockFetchOpts.TurbineServeRepairAddr
 		opts.DisableRPCBlockFetch = blockFetchOpts.DisableRPCBlockFetch
 		opts.ShredSpoolDir = blockFetchOpts.ShredSpoolDir
 		opts.LocalLeaderForSlot = blockFetchOpts.LocalLeaderForSlot

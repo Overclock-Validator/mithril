@@ -39,6 +39,7 @@ type BlockSourceOpts struct {
 	SourceType              BlockSourceType
 	LightbringerEndpoint    string
 	TurbineBindAddr         string
+	TurbineServeRepairAddr  string
 	TurbineGossipEntrypoint string
 	TurbineGossipBindAddr   string
 	TurbineAdvertisedIP     string
@@ -398,6 +399,7 @@ type BlockSource struct {
 	// Lightbringer live-stream handoff
 	lightbringerEndpoint         string
 	turbineBindAddr              string
+	turbineServeRepairAddr       string
 	repairMaxRequestsPerSecond   int
 	turbineGossipEntrypoint      string
 	turbineGossipBindAddr        string
@@ -752,6 +754,7 @@ func NewBlockSource(opts *BlockSourceOpts) *BlockSource {
 		catchupTipSafety:               tipSafetyMargin, // Store original for switching back to catchup
 		lightbringerEndpoint:           opts.LightbringerEndpoint,
 		turbineBindAddr:                opts.TurbineBindAddr,
+		turbineServeRepairAddr:         opts.TurbineServeRepairAddr,
 		repairCatchupMaxGapSlots:       opts.RepairCatchupMaxGapSlots,
 		repairMaxRequestsPerSecond:     opts.RepairMaxRequestsPerSecond,
 		shredSpoolDir:                  opts.ShredSpoolDir,

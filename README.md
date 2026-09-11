@@ -231,7 +231,7 @@ We're actively expanding RPC method coverage. Upcoming methods include transacti
 - **RPC still required**: live near-tip blocks stream from turbine shreds, but RPC `getBlock` is still used for catchup and by the trailing execution verifier (Alpenglow certificates attest block *data*, not execution results, so an external oracle cross-checks execution until peer bankhash cross-checking lands).
 - **Alpenglow voting is experimental**: validator mode now signs, persists, self-verifies, and broadcasts Votor votes, but should be exercised on the community cluster before production use. Vote history is identity-bound and startup fails closed if it is corrupt. A `vote landed source=votor-quic proof=verified-aggregate` log is emitted only when an exact network-received, BLS-verified certificate includes the validator's rank for a vote present in its durable history; periodic `alpenglow voting stats` lines expose the cumulative confirmation and broadcast counters.
 - **Leader edge cases fail closed**: local production intentionally misses epoch-transition slots and slots with active partitioned epoch rewards until producer-side transition handling is implemented. TPU sanitation currently accepts legacy transactions only; versioned transactions are dropped rather than produced incorrectly.
-- **Remaining validator services**: repair serving and Rotor relay duty are still future work.
+- **Remaining validator services**: Rotor relay duty is still future work. Native turbine nodes now serve signed Solana `WindowIndex` and `HighestWindowIndex` repair requests from their verified on-disk shredstore.
 
 ### RPC Sources
 
@@ -298,7 +298,7 @@ See [COMPATIBILITY.md](COMPATIBILITY.md) for supported networks and feature gate
 - **Target**: More polished release midway through Q1 2026.
 
 ### Future Directions
-- Complete Alpenglow validator mode: add the voting engine (Votor event loop, BLS vote signing, durable vote history), versioned-transaction TPU handling, epoch-transition/reward production, repair serving, and Rotor relay duty on top of the existing fork choice and block producer.
+- Complete Alpenglow validator mode: add the voting engine (Votor event loop, BLS vote signing, durable vote history), versioned-transaction TPU handling, epoch-transition/reward production, and Rotor relay duty on top of the existing fork choice and block producer.
 - Add Agave ledger-tool type features for Mithril
 - gRPC interface support.
 - Expanded RPC feature set.
