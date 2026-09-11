@@ -14,6 +14,7 @@ const (
 	hash_sol_log_64_                           = 0x5c2a3178
 	hash_sol_log_pubkey                        = 0x7ef088ca
 	hash_sol_log_compute_units_                = 0x52ba5096
+	hash_sol_remaining_compute_units           = 0xedef5aee
 	hash_sol_log_data                          = 0x7317b434
 	hash_sol_sha256                            = 0x11f49d86
 	hash_sol_keccak256                         = 0xd7793abb
@@ -64,6 +65,9 @@ func Syscalls(ft *features.Features, isDeploy bool, h uint32) (f sbpf.Syscall, o
 		f = SyscallLogPubkey
 	case hash_sol_log_compute_units_:
 		f = SyscallLogCUs
+	case hash_sol_remaining_compute_units:
+		f = SyscallRemainingComputeUnits
+		ok = ft.IsActive(features.RemainingComputeUnitsSyscallEnabled)
 	case hash_sol_log_data:
 		f = SyscallLogData
 	case hash_sol_sha256:
