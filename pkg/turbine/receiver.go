@@ -12,6 +12,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
+	"github.com/Overclock-Validator/mithril/pkg/sigverify"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -546,7 +547,6 @@ func (r *UDPReceiver) Run(ctx context.Context) error {
 			r.retransmitter.Run(runCtx)
 		}()
 	}
-	r.signalReady(nil)
 	completionPool := newSlotCompletionPool(r.assembler, &r.slotResetMu, r.startPendingBlock, defaultSlotCompletionWorkers(), slotCompletionQueueDepth)
 	r.completionPool = completionPool
 	completionDone := make(chan struct{})
@@ -555,6 +555,18 @@ func (r *UDPReceiver) Run(ctx context.Context) error {
 		r.consumeCompletionResults(runCtx, completionPool.results)
 	}()
 
+	// Install the bounded decode/verification stage before any packet reader
+	// or spool hydrator can expose a DATA_COMPLETE component. Custom verifiers
+	// used by callers/tests retain the whole-block completion path.
+	var entryPrefetch *entryPrefetchPool
+	r.assembler.mu.Lock()
+	useEntryPrefetch := !sigverify.Cfg.DisableShredOverlap && r.assembler.verifyTransactions == nil
+	r.assembler.mu.Unlock()
+	if useEntryPrefetch {
+		entryPrefetch = newEntryPrefetchPool(runCtx, r.assembler, getDefaultTransactionVerifier())
+	}
+	r.signalReady(nil)
+
 	go func() {
 		<-runCtx.Done()
 		_ = liveConn.Close()
@@ -562,8 +574,13 @@ func (r *UDPReceiver) Run(ctx context.Context) error {
 			_ = repairConn.Close()
 		}
 	}()
+	var repairDone chan struct{}
 	if repairConn != nil {
-		go r.repairClient.run(runCtx, repairConn, r.assembler)
+		repairDone = make(chan struct{})
+		go func() {
+			defer close(repairDone)
+			r.repairClient.run(runCtx, repairConn, r.assembler)
+		}()
 	}
 	var hydratorDone chan struct{}
 	if r.spool != nil {
@@ -603,6 +620,15 @@ func (r *UDPReceiver) Run(ctx context.Context) error {
 	}
 	if retransmitDone != nil {
 		<-retransmitDone
+	}
+	if repairDone != nil {
+		<-repairDone
+	}
+	// Readers and hydration can no longer add components. Cancel and join
+	// the early stage before draining completion workers, while
+	// all transaction objects and the spool are still owned by this receiver.
+	if entryPrefetch != nil {
+		entryPrefetch.closeAndWait()
 	}
 	// No submitters remain. Drain queued work while the spool hook and result
 	// consumer are alive, then close results and join it before channel close.

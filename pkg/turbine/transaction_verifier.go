@@ -3,8 +3,8 @@ package turbine
 import (
 	"context"
 	"fmt"
-	"runtime"
 	"sync"
+	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/sigverify"
@@ -12,105 +12,251 @@ import (
 	"github.com/gagliardetto/solana-go"
 )
 
-var errNilTransaction = fmt.Errorf("nil transaction")
+var (
+	errNilTransaction            = fmt.Errorf("nil transaction")
+	errTransactionVerifierClosed = fmt.Errorf("transaction verifier closed")
+)
 
+// A job is formed before admission, from transactions which are already
+// available. Workers never wait for more transactions to fill a vector group.
 type transactionVerifyJob struct {
-	tx   *solana.Transaction
-	err  *error
-	done *sync.WaitGroup
+	txs   []*solana.Transaction
+	errs  []error
+	start int
+	done  chan<- *transactionVerifyJob
+}
+
+// transactionVerification owns an asynchronous request until done closes.
+// Transactions submitted to it must remain immutable until wait returns.
+type transactionVerification struct {
+	done       chan struct{}
+	cancel     context.CancelFunc
+	index      int
+	err        error
+	finishedAt time.Time
+}
+
+func (r *transactionVerification) wait() (int, error) {
+	return r.waitContext(context.Background())
+}
+
+// waitContext cancels further admission when ctx is canceled, but joins every
+// admitted job before returning. The caller may then safely release or mutate
+// the transaction objects, including their backing message byte slices.
+func (r *transactionVerification) waitContext(ctx context.Context) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-r.done:
+	case <-ctx.Done():
+		r.cancel()
+		<-r.done
+		return -1, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return -1, err
+	}
+	return r.index, r.err
 }
 
 type transactionVerifier struct {
-	jobs    chan transactionVerifyJob
-	verify  func(*solana.Transaction) error
-	workers int
-	// wave is how many transactions verifyBlockContext admits at once. It is
-	// workers * sigverify.BatchTarget so each worker can actually accumulate a
-	// full vector group rather than being handed one transaction at a time.
-	wave  int
-	close sync.Once
-
-	worker sync.WaitGroup
+	jobs        chan *transactionVerifyJob
+	verify      func(*solana.Transaction) error
+	workers     int
+	batchTarget int
+	// Each accepted request owns at most workers outstanding groups. The
+	// admission semaphore also bounds asynchronous request goroutines; callers
+	// apply backpressure before handing off another decoded component.
+	requests chan struct{}
+	request  sync.WaitGroup
+	mu       sync.Mutex
+	closed   bool
+	stopped  chan struct{}
+	close    sync.Once
+	worker   sync.WaitGroup
 }
 
 func newTransactionVerifier(workers, queueDepth int, verify func(*solana.Transaction) error) *transactionVerifier {
-	if workers < 1 {
-		workers = 1
-	}
-	wave := workers * sigverify.BatchTarget
-	if queueDepth < 1 {
-		queueDepth = 1
-	}
+	return newTransactionVerifierWithBatchTarget(workers, queueDepth, sigverify.BatchTarget, verify)
+}
+
+// queueDepth is a transaction budget, rounded up to whole groups. batchTarget
+// counts signature lanes: multi-signature transactions stay indivisible and
+// may exceed the target. Four/eight targets can be compared without changing
+// the admission or cancellation policy.
+func newTransactionVerifierWithBatchTarget(workers, queueDepth, batchTarget int, verify func(*solana.Transaction) error) *transactionVerifier {
+	workers = max(1, workers)
+	batchTarget = max(1, min(batchTarget, sigverify.BatchTarget))
+	queueGroups := max(1, (queueDepth+batchTarget-1)/batchTarget)
 	v := &transactionVerifier{
-		jobs:    make(chan transactionVerifyJob, queueDepth),
-		verify:  verify,
-		workers: workers,
-		wave:    wave,
+		jobs:        make(chan *transactionVerifyJob, queueGroups),
+		verify:      verify,
+		workers:     workers,
+		batchTarget: batchTarget,
+		requests:    make(chan struct{}, 2*workers),
+		stopped:     make(chan struct{}),
 	}
 	v.worker.Add(workers)
 	for i := 0; i < workers; i++ {
 		go func() {
 			defer v.worker.Done()
-			// Worker-local scratch reused across groups.
-			var (
-				group []transactionVerifyJob
-				scr   verifyScratch
-			)
+			var batch txverify.BatchVerifier
 			for job := range v.jobs {
-				group = sigverify.Drain(group, job, v.jobs,
-					sigverify.FairShare(len(v.jobs), v.workers, sigverify.BatchTarget))
-				v.verifyGroup(group, &scr)
-				// Do not keep finished jobs reachable through the scratch.
-				clear(group)
+				v.verifyGroup(job, &batch)
 			}
 		}()
 	}
 	return v
 }
 
-// verifyScratch is one worker's reusable buffers.
-type verifyScratch struct {
-	txs   []*solana.Transaction
-	errs  []error
-	batch txverify.BatchVerifier
-}
-
-// verifyGroup verifies a drained group and releases every job in it.
-//
-// Releasing happens in a defer covering the whole group, so no caller can be
-// left waiting on a job that was drained into a batch which then failed —
-// a stranded job would hang verifyBlockContext's done.Wait() forever.
-func (v *transactionVerifier) verifyGroup(group []transactionVerifyJob, scr *verifyScratch) {
-	defer func() {
-		for _, job := range group {
-			job.done.Done()
-		}
-	}()
-
-	// An injected verifier is a per-transaction function and stays that way;
-	// only the default path can batch. This seam is used by tests.
+// verifyGroup releases its job even if signature verification panics. The
+// request's bounded completion channel always has room for every pending job.
+func (v *transactionVerifier) verifyGroup(job *transactionVerifyJob, batch *txverify.BatchVerifier) {
+	defer func() { job.done <- job }()
 	if v.verify != nil {
-		for _, job := range group {
-			*job.err = verifyTransactionSafely(v.verify, job.tx)
+		for i, tx := range job.txs {
+			if tx == nil {
+				job.errs[i] = errNilTransaction
+			} else {
+				job.errs[i] = verifyTransactionSafely(v.verify, tx)
+			}
 		}
 		return
 	}
+	verifyBatchSafely(batch, job.txs, job.errs)
+}
 
-	scr.txs = scr.txs[:0]
-	for _, job := range group {
-		scr.txs = append(scr.txs, job.tx)
+// submitTransactions admits one immutable decoded component or complete block.
+// Admission is bounded and may block: call it from a decode/completion worker,
+// never the UDP reader or while holding the assembler mutex. Cancellation of
+// ctx stops further groups but still joins every admitted group.
+func (v *transactionVerifier) submitTransactions(ctx context.Context, txs []*solana.Transaction) (*transactionVerification, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	if cap(scr.errs) < len(scr.txs) {
-		scr.errs = make([]error, len(scr.txs))
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	scr.errs = scr.errs[:len(scr.txs)]
+	select {
+	case v.requests <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-v.stopped:
+		return nil, errTransactionVerifierClosed
+	}
 
-	verifyBatchSafely(&scr.batch, scr.txs, scr.errs)
-
-	for i, job := range group {
-		*job.err = scr.errs[i]
+	v.mu.Lock()
+	if v.closed {
+		v.mu.Unlock()
+		<-v.requests
+		return nil, errTransactionVerifierClosed
 	}
-	clear(scr.txs)
+	v.request.Add(1)
+	v.mu.Unlock()
+	ctx, cancel := context.WithCancel(ctx)
+	r := &transactionVerification{done: make(chan struct{}), cancel: cancel, index: -1}
+	go func() {
+		defer v.request.Done()
+		defer func() { <-v.requests }()
+		defer cancel()
+		r.index, r.err = v.verifyTransactions(ctx, txs)
+		r.finishedAt = time.Now()
+		close(r.done)
+	}()
+	return r, nil
+}
+
+// verifyTransactions keeps a rolling window instead of waiting for an entire
+// worker wave. A slow group cannot idle workers whose earlier groups finished.
+// One caller can queue at most workers groups, so a large catch-up block cannot
+// put all its transactions ahead of a newly available component.
+func (v *transactionVerifier) verifyTransactions(ctx context.Context, txs []*solana.Transaction) (int, error) {
+	if len(txs) == 0 {
+		return -1, ctx.Err()
+	}
+	window := min(v.workers, len(txs))
+	completed := make(chan *transactionVerifyJob, window)
+	groups := make([]transactionVerifyJob, window)
+	errs := make([]error, window*v.batchTarget)
+	free := make([]*transactionVerifyJob, window)
+	for i := range groups {
+		groups[i].errs = errs[i*v.batchTarget : (i+1)*v.batchTarget]
+		groups[i].done = completed
+		free[i] = &groups[i]
+	}
+
+	nextIndex, active := 0, 0
+	failureIndex := -1
+	var failure error
+	var pending *transactionVerifyJob
+	ctxDone := ctx.Done()
+	stopped := false
+	for active > 0 || (!stopped && nextIndex < len(txs)) {
+		if !stopped && ctx.Err() != nil {
+			stopped = true
+			ctxDone = nil
+		}
+		if stopped && active == 0 {
+			break
+		}
+		if !stopped && pending == nil && nextIndex < len(txs) && len(free) > 0 {
+			pending = free[len(free)-1]
+			free = free[:len(free)-1]
+			end := transactionVerifyGroupEnd(txs, nextIndex, v.batchTarget)
+			pending.start = nextIndex
+			pending.txs = txs[nextIndex:end]
+			pending.errs = pending.errs[:end-nextIndex]
+			clear(pending.errs)
+		}
+		var admission chan *transactionVerifyJob
+		if !stopped && pending != nil {
+			admission = v.jobs
+		}
+		select {
+		case admission <- pending:
+			nextIndex += len(pending.txs)
+			active++
+			pending = nil
+		case job := <-completed:
+			active--
+			for i, err := range job.errs {
+				if err != nil && (failureIndex < 0 || job.start+i < failureIndex) {
+					failureIndex, failure = job.start+i, err
+					stopped = true
+				}
+			}
+			job.txs = nil
+			clear(job.errs)
+			free = append(free, job)
+		case <-ctxDone:
+			stopped = true
+			ctxDone = nil
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return -1, err
+	}
+	return failureIndex, failure
+}
+
+func transactionVerifyGroupEnd(txs []*solana.Transaction, start, target int) int {
+	end, signatures := start, 0
+	for end < len(txs) && end-start < target {
+		count := 1
+		if txs[end] != nil {
+			count = max(1, len(txs[end].Signatures))
+		}
+		if end > start && signatures+count > target {
+			break
+		}
+		signatures += count
+		end++
+		if signatures >= target {
+			break
+		}
+	}
+	return end
 }
 
 // verifyBatchSafely mirrors verifyTransactionSafely: a panic in the verifier
@@ -134,6 +280,11 @@ func (v *transactionVerifier) closeAndWait() {
 		return
 	}
 	v.close.Do(func() {
+		v.mu.Lock()
+		v.closed = true
+		close(v.stopped)
+		v.mu.Unlock()
+		v.request.Wait()
 		close(v.jobs)
 		v.worker.Wait()
 	})
@@ -162,47 +313,15 @@ func (v *transactionVerifier) verifyBlockContext(ctx context.Context, blk *block
 	if blk == nil || len(blk.Transactions) == 0 {
 		return nil
 	}
-	// Admit one worker-wave at a time. A monster block still occupies every
-	// verifier lane, but cannot park tens of thousands of jobs ahead of a newly
-	// completed small block in the shared bounded queue.
-	for chunkStart := 0; chunkStart < len(blk.Transactions); chunkStart += v.wave {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		chunkEnd := min(chunkStart+v.wave, len(blk.Transactions))
-		errs := make([]error, chunkEnd-chunkStart)
-		var done sync.WaitGroup
-		for txIdx := chunkStart; txIdx < chunkEnd; txIdx++ {
-			if err := ctx.Err(); err != nil {
-				done.Wait()
-				return err
-			}
-			tx := blk.Transactions[txIdx]
-			errIdx := txIdx - chunkStart
-			if tx == nil {
-				errs[errIdx] = errNilTransaction
-				continue
-			}
-			done.Add(1)
-			select {
-			case v.jobs <- transactionVerifyJob{tx: tx, err: &errs[errIdx], done: &done}:
-			case <-ctx.Done():
-				done.Done()
-				done.Wait()
-				return ctx.Err()
-			}
-		}
-		done.Wait()
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		for errIdx, err := range errs {
-			if err != nil {
-				return formatTransactionVerificationError(blk, chunkStart+errIdx, err)
-			}
-		}
+	request, err := v.submitTransactions(ctx, blk.Transactions)
+	if err != nil {
+		return err
 	}
-	return nil
+	index, err := request.wait()
+	if err != nil && index >= 0 {
+		return formatTransactionVerificationError(blk, index, err)
+	}
+	return err
 }
 
 func formatTransactionVerificationError(blk *block.Block, txIdx int, err error) error {
@@ -226,12 +345,17 @@ var (
 	defaultTransactionVerifier     *transactionVerifier
 )
 
-func validateBlockTransactionsContext(ctx context.Context, blk *block.Block) error {
+func getDefaultTransactionVerifier() *transactionVerifier {
 	defaultTransactionVerifierOnce.Do(func() {
-		workers := max(1, (runtime.GOMAXPROCS(0)+1)/2)
-		defaultTransactionVerifier = newTransactionVerifier(workers, 2*workers*sigverify.BatchTarget, nil)
+		workers := sigverify.TransactionWorkers()
+		target := sigverify.TransactionBatchTarget()
+		defaultTransactionVerifier = newTransactionVerifierWithBatchTarget(workers, 2*workers*target, target, nil)
 	})
-	return defaultTransactionVerifier.verifyBlockContext(ctx, blk)
+	return defaultTransactionVerifier
+}
+
+func validateBlockTransactionsContext(ctx context.Context, blk *block.Block) error {
+	return getDefaultTransactionVerifier().verifyBlockContext(ctx, blk)
 }
 
 func validateBlockTransactions(blk *block.Block) error {

@@ -524,14 +524,6 @@ name = "mithril"
     # Number of borrowed accounts to preallocate in arena (0 to disable)
     borrowed_account_arena_size = 1024
 
-    # ed25519 signature verification backend.
-    #   auto    - use the AVX-512 accelerated backend when the CPU has
-    #             AVX512-IFMA (Zen 4/5, Ice Lake and newer), else portable
-    #   r51     - force the accelerated backend; startup fails without AVX512-IFMA
-    #   generic - force the portable pure-Go backend
-    #   stdlib  - use Go’s crypto/ed25519 implementation after the mandatory strict rejection checks.
-    sigverify_backend = "auto"
-
     # Enable/disable pool allocator for slices
     use_pool = true
 
@@ -573,6 +565,33 @@ name = "mithril"
 
         # Filename to write CPU profile (for offline analysis with go tool pprof)
         # cpu_profile_path = "/mnt/mithril-data/profiling/cpu.pprof"
+
+# ============================================================================
+# [sigverify] - Transaction Signature Verification
+# ============================================================================
+
+[sigverify]
+    # ed25519 backend: auto selects AVX-512 IFMA when available, else portable.
+    # r51 requires AVX-512 IFMA; generic and stdlib force portable backends.
+    # Strict signature checks are always enabled. The older
+    # tuning.sigverify_backend key remains supported when this key is absent.
+    backend = "auto"
+
+    # Shared Turbine transaction verification workers; 0 = min(2, GOMAXPROCS).
+    # Leaves execution and shred/consensus processing room to run concurrently.
+    # This does not change validator.tpu_sigverify_workers or replay's fallback pool.
+    workers = 0
+
+    # Signature lanes per group: 4 or 8 (0 also means 8). Transactions stay
+    # indivisible, so a multisignature transaction may exceed this target.
+    # Ready short groups run immediately; no timer waits for more shreds.
+    batch_target = 8
+
+    # Decode complete entry batches and verify while later shreds arrive.
+    # Set true to compare against completion-only verification.
+    # Early work reserves at most 8 slots and 64 MiB of encoded component bytes;
+    # decoded transactions and Go bookkeeping use additional heap memory.
+    disable_shred_overlap = false
 
 # ============================================================================
 # [debug] - Debug Logging

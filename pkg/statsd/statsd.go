@@ -124,6 +124,13 @@ var (
 	TurbineBlockDecode                          = Metric{"turbine_block_decode_duration_seconds"}
 	TurbineTransactionParse                     = Metric{"turbine_transaction_parse_duration_seconds"}
 	TurbineTransactionSigverify                 = Metric{"turbine_transaction_sigverify_duration_seconds"}
+	// Early durations sum elapsed component work, including verifier queueing;
+	// they overlap shred collection and are neither CPU nor pipeline wall time.
+	TurbineEarlyTransactionParse     = Metric{"turbine_early_transaction_parse_duration_seconds"}
+	TurbineEarlyTransactionSigverify = Metric{"turbine_early_transaction_sigverify_elapsed_seconds"}
+	TurbineEarlyPreparationWait      = Metric{"turbine_early_preparation_wait_seconds"}
+	TurbineEarlyVerifiedTransactions = Metric{"turbine_early_verified_transactions_total"}
+	TurbineFullToReady               = Metric{"turbine_full_to_ready_duration_seconds"}
 	// ReplaySigverifyGroup times one drained group of transaction signatures
 	// and ReplaySigverifyGroupSignatures counts how many signatures were in it.
 	// The pair is what tells an operator whether batching is actually happening:
@@ -245,6 +252,11 @@ var MetricToType = map[Metric]metricType{
 	TurbineBlockDecode:                          TimingT,
 	TurbineTransactionParse:                     TimingT,
 	TurbineTransactionSigverify:                 TimingT,
+	TurbineEarlyTransactionParse:                TimingT,
+	TurbineEarlyTransactionSigverify:            TimingT,
+	TurbineEarlyPreparationWait:                 TimingT,
+	TurbineEarlyVerifiedTransactions:            CountT,
+	TurbineFullToReady:                          TimingT,
 	ReplaySigverifyGroup:                        TimingT,
 	ReplaySigverifyGroupSignatures:              CountT,
 	TurbineReplayAdmission:                      TimingT,
@@ -353,6 +365,11 @@ var MetricToLabels = map[Metric][]string{
 	TurbineBlockDecode:                          {},
 	TurbineTransactionParse:                     {},
 	TurbineTransactionSigverify:                 {},
+	TurbineEarlyTransactionParse:                {},
+	TurbineEarlyTransactionSigverify:            {},
+	TurbineEarlyPreparationWait:                 {},
+	TurbineEarlyVerifiedTransactions:            {},
+	TurbineFullToReady:                          {},
 	ReplaySigverifyGroup:                        {},
 	ReplaySigverifyGroupSignatures:              {},
 	TurbineReplayAdmission:                      {},
@@ -390,6 +407,10 @@ var MetricToBuckets = map[Metric][]float64{
 	TurbineBlockDecode:                          turbinePipelineDurationBuckets,
 	TurbineTransactionParse:                     turbinePipelineDurationBuckets,
 	TurbineTransactionSigverify:                 turbinePipelineDurationBuckets,
+	TurbineEarlyTransactionParse:                turbinePipelineDurationBuckets,
+	TurbineEarlyTransactionSigverify:            turbinePipelineDurationBuckets,
+	TurbineEarlyPreparationWait:                 turbinePipelineDurationBuckets,
+	TurbineFullToReady:                          turbinePipelineDurationBuckets,
 	ReplaySigverifyGroup:                        turbinePipelineDurationBuckets,
 	TurbineReplayAdmission:                      turbinePipelineDurationBuckets,
 	AlpenglowVoteRewards:                        turbinePipelineDurationBuckets,

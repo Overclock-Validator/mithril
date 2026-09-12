@@ -1,6 +1,8 @@
 package turbine
 
 import (
+	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"sort"
@@ -40,6 +42,11 @@ type AlpenglowParentInfo struct {
 
 type entryDecodeTimings struct {
 	transactionParse time.Duration
+	ctx              context.Context
+	prefetched       map[uint32]*prefetchedShredBatch
+	retained         []*prefetchedShredBatch
+	all              []*prefetchedShredBatch
+	prefetchWait     time.Duration
 }
 
 func (e *Entry) UnmarshalWithDecoder(decoder *bin.Decoder) error {
@@ -125,11 +132,7 @@ func decodeEntriesAndAlpenglowMarkersFromDataShreds(shreds []*Shred, timings *en
 		return shreds[i].Index < shreds[j].Index
 	})
 
-	type decodedEntryBatch struct {
-		start   uint32
-		entries []Entry
-	}
-	var entryBatches []decodedEntryBatch
+	var entryBatches []*prefetchedShredBatch
 	var parentInfo *AlpenglowParentInfo
 	var blockFooter *BlockFooter
 	var batchBytes []byte
@@ -147,39 +150,61 @@ func decodeEntriesAndAlpenglowMarkersFromDataShreds(shreds []*Shred, timings *en
 		if !shred.DataComplete() {
 			continue
 		}
-		if parent, footer, ok, err := decodeAlpenglowMarkerFromShredBatch(batchBytes, batchStart); err != nil {
-			return nil, nil, nil, fmt.Errorf("decode alpenglow block marker ending at shred %d: %w", shred.Index, err)
-		} else if ok {
-			if parent != nil {
-				parentInfo, err = mergeAlpenglowParentInfo(parentInfo, parent)
+		var batch *prefetchedShredBatch
+		if timings != nil {
+			if cached := timings.prefetched[batchStart]; cached != nil && cached.start == batchStart && cached.end == shred.Index {
+				ctx := timings.ctx
+				if ctx == nil {
+					ctx = context.Background()
+				}
+				if cached.ready != nil {
+					waitStarted := time.Now()
+					select {
+					case <-cached.ready:
+					case <-ctx.Done():
+						timings.prefetchWait += time.Since(waitStarted)
+						return nil, nil, nil, ctx.Err()
+					}
+					timings.prefetchWait += time.Since(waitStarted)
+				}
+				if err := ctx.Err(); err != nil {
+					return nil, nil, nil, err
+				}
+				// Bounds alone cannot prove identity after repair or replacement.
+				// Read decoded fields only after the preparation channel closes.
+				if bytes.Equal(batchBytes, cached.raw) {
+					batch = cached
+				}
+			}
+		}
+		if batch == nil {
+			batch = decodeClosedShredBatch(batchBytes, batchStart, shred.Index)
+			if timings != nil {
+				timings.transactionParse += batch.parseDuration
+			}
+		}
+		if timings != nil {
+			timings.all = append(timings.all, batch)
+		}
+		if batch.err != nil {
+			return nil, nil, nil, batch.err
+		}
+		if batch.marker {
+			if batch.parent != nil {
+				var err error
+				parentInfo, err = mergeAlpenglowParentInfo(parentInfo, batch.parent)
 				if err != nil {
 					return nil, nil, nil, fmt.Errorf("merge alpenglow parent marker ending at shred %d: %w", shred.Index, err)
 				}
 			}
-			if footer != nil {
-				blockFooter = footer
+			if batch.footer != nil {
+				blockFooter = batch.footer
 			}
 			batchBytes = nil
 			haveBatch = false
 			continue
 		}
-		parseStart := time.Now()
-		batchEntries, consumed, err := decodeEntryBatchPrefix(batchBytes)
-		if timings != nil {
-			timings.transactionParse += time.Since(parseStart)
-		}
-		// A zero entry count with more bytes denotes a marker. Preserve the
-		// rejection of unrecognized or misplaced markers in this fallback path.
-		if err == nil && len(batchEntries) == 0 && consumed != len(batchBytes) {
-			err = fmt.Errorf("entry batch has %d trailing bytes", len(batchBytes)-consumed)
-		}
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("decode entry batch ending at shred %d: %w", shred.Index, err)
-		}
-		entryBatches = append(entryBatches, decodedEntryBatch{
-			start:   batchStart,
-			entries: batchEntries,
-		})
+		entryBatches = append(entryBatches, batch)
 		// Decoded transactions retain slices into the batch buffer for instruction data.
 		// Keep the backing array alive instead of reusing and overwriting it.
 		batchBytes = nil
@@ -199,8 +224,41 @@ func decodeEntriesAndAlpenglowMarkersFromDataShreds(shreds []*Shred, timings *en
 			continue
 		}
 		entries = append(entries, batch.entries...)
+		if timings != nil {
+			timings.retained = append(timings.retained, batch)
+		}
 	}
 	return entries, parentInfo, blockFooter, nil
+}
+
+// decodeClosedShredBatch owns raw through the returned decoded transactions.
+// It decodes the same padded component envelope for early and full assembly;
+// marker merging and UpdateParent selection still require the full slot.
+func decodeClosedShredBatch(raw []byte, start, end uint32) *prefetchedShredBatch {
+	batch := &prefetchedShredBatch{start: start, end: end, raw: raw}
+	parent, footer, marker, err := decodeAlpenglowMarkerFromShredBatch(raw, start)
+	if err != nil {
+		batch.err = fmt.Errorf("decode alpenglow block marker ending at shred %d: %w", end, err)
+		return batch
+	}
+	if marker {
+		batch.parent, batch.footer, batch.marker = parent, footer, true
+		return batch
+	}
+	parseStarted := time.Now()
+	entries, consumed, err := decodeEntryBatchPrefix(raw)
+	batch.parseDuration = time.Since(parseStarted)
+	// A zero entry count with more bytes denotes a marker. Preserve rejection
+	// of unknown or misplaced markers instead of treating them as an empty batch.
+	if err == nil && len(entries) == 0 && consumed != len(raw) {
+		err = fmt.Errorf("entry batch has %d trailing bytes", len(raw)-consumed)
+	}
+	if err != nil {
+		batch.err = fmt.Errorf("decode entry batch ending at shred %d: %w", end, err)
+		return batch
+	}
+	batch.entries = entries
+	return batch
 }
 
 func decodeEntryBatch(data []byte) ([]Entry, error) {

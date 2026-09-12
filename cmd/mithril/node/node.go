@@ -560,6 +560,12 @@ func init() {
 	Run.Flags().StringVar(&snapshot.SnapshotIndexTempDir, "snapshot-index-temp-dir", "", "Optional directory for snapshot index shard logs/SST staging")
 	Run.Flags().StringVar(&sigverify.Cfg.Backend, "sigverify-backend", sigverify.Defaults().Backend,
 		"ed25519 verification backend: auto|r51|generic|stdlib")
+	Run.Flags().IntVar(&sigverify.Cfg.Workers, "sigverify-workers", 0,
+		"Turbine transaction signature verification workers (0 = min(2, GOMAXPROCS))")
+	Run.Flags().IntVar(&sigverify.Cfg.BatchTarget, "sigverify-batch-target", sigverify.Defaults().BatchTarget,
+		"Turbine transaction signature batch target: 4 or 8 (available short batches run immediately)")
+	Run.Flags().BoolVar(&sigverify.Cfg.DisableShredOverlap, "sigverify-disable-shred-overlap", false,
+		"Defer Turbine transaction decoding and signature verification until all block shreds arrive")
 	Run.Flags().BoolVar(&sbpf.UsePool, "use-pool", true, "Disable to allocate fresh slices")
 	Run.Flags().IntVar(&accountsdb.StoreAccountsWorkers, "store-accounts-workers", 128, "Number of workers to write account updates")
 	Run.Flags().IntVar(&accountsdb.ProgramCacheMaxMB, "program-cache-max-mb", accountsdb.DefaultProgramCacheMaxMB, "Maximum approximate SBPF program cache size in MiB")
@@ -1127,10 +1133,17 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	// later: narya pins its backend on first use, and selecting it explicitly
 	// doubles as a startup health check, so a machine that cannot run the
 	// requested backend fails now instead of at the first block.
-	sigverify.Cfg.Backend = getString("sigverify-backend", "tuning.sigverify_backend")
+	backendKey := "sigverify.backend"
+	if !config.IsSet(backendKey) {
+		backendKey = "tuning.sigverify_backend" // older configuration files
+	}
+	sigverify.Cfg.Backend = getString("sigverify-backend", backendKey)
+	sigverify.Cfg.Workers = getInt("sigverify-workers", "sigverify.workers")
+	sigverify.Cfg.BatchTarget = getInt("sigverify-batch-target", "sigverify.batch_target")
+	sigverify.Cfg.DisableShredOverlap = getBool("sigverify-disable-shred-overlap", "sigverify.disable_shred_overlap")
 	resolved, err := sigverify.Configure(sigverify.Cfg)
 	if err != nil {
-		return fmt.Errorf("tuning.sigverify_backend: %w", err)
+		return fmt.Errorf("signature verification configuration: %w", err)
 	}
 	resolvedSigverifyBackend = resolved
 	sbpf.UsePool = getBool("use-pool", "tuning.use_pool")
@@ -3214,6 +3227,8 @@ func printStartupInfo(commandName string) {
 		}
 		fmt.Printf("  Sigverify:    %s%s%s %s(%s)%s\n",
 			green, resolvedSigverifyBackend, reset, dim, sigverifyDesc, reset)
+		fmt.Printf("                workers=%d batch_target=%d shred_overlap=%t\n",
+			sigverify.TransactionWorkers(), sigverify.TransactionBatchTarget(), !sigverify.Cfg.DisableShredOverlap)
 	}
 
 	// Load state file for detailed info (only show for modes that use existing AccountsDB)

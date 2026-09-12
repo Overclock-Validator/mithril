@@ -14,15 +14,30 @@ import (
 	"github.com/gagliardetto/solana-go/rpc"
 )
 
-// TurbineIngressTimings is the per-slot decomposition carried only by a
+// TurbineIngressTimings carries per-slot observations only on a
 // trusted in-memory Turbine block. Durations never serialize with Block.
 type TurbineIngressTimings struct {
 	ShredCollection      time.Duration
 	CompletionQueueDelay time.Duration
 	BlockDecode          time.Duration
+	// Completion-only parse and outstanding-signature join/verification time.
 	TransactionParse     time.Duration
 	TransactionSigverify time.Duration
 	ReplayAdmission      time.Duration
+	// Early durations sum completed prefetched component work, including an
+	// optimistic prefix later discarded, and overlap reception and each other.
+	// EarlyTransactionSigverify includes queueing through future completion;
+	// neither early duration is CPU time or an additive pipeline wall stage.
+	EarlyTransactionParse     time.Duration
+	EarlyTransactionSigverify time.Duration
+	// Completion wait for already-claimed background parsing/submission.
+	// Recorded separately from BlockDecode's active completion work.
+	EarlyPreparationWait time.Duration
+	// Only retained transactions whose verification finished by ShredFullNanos.
+	EarlyVerifiedTransactions uint64
+	// FullToReady is wall time from full shred assembly to replay-ready completion.
+	// It contains completion queueing, decode and outstanding verification waits.
+	FullToReady time.Duration
 }
 
 var transactionDerivedStateInitMu sync.Mutex
