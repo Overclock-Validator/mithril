@@ -71,7 +71,7 @@ type CompactStats struct {
 	FilesCompacted    int
 	FilesDeleted      int // fully-dead fast path (no bytes moved)
 	LiveBytesMoved    int64
-	BytesReclaimed    int64 // source bytes freed (compacted + deleted)
+	BytesReclaimed    int64 // net bytes freed; may be negative during bounded evacuation
 }
 
 const (
@@ -82,6 +82,8 @@ const (
 
 type compactCandidate struct {
 	name         string
+	path         string
+	coalesced    bool
 	slot         uint64
 	fileId       uint64
 	size         int64
@@ -120,6 +122,9 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 		return stats, err
 	}
 
+	for id := range pinned {
+		delete(db.coalescedScans, id)
+	}
 	bootstrapHigh := db.bootstrapHighFileId()
 	entries, err := os.ReadDir(db.AcctsDir)
 	if err != nil {
@@ -147,8 +152,28 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 			continue
 		}
 		candidates = append(candidates, compactCandidate{
-			name: name, slot: slot, fileId: fileId, size: info.Size(), manifestPath: mpath,
+			name: name, path: filepath.Join(db.AcctsDir, name), slot: slot, fileId: fileId, size: info.Size(), manifestPath: mpath,
 		})
+	}
+	for i := range candidates {
+		_, candidates[i].coalesced = db.coalescedFiles.Load(candidates[i].fileId)
+	}
+	if db.Shards != nil {
+		for i, dir := range db.Shards.dirs {
+			id := uint64(i)
+			if _, ok := pinned[id]; ok {
+				continue
+			}
+			path := filepath.Join(dir, "data")
+			info, e := os.Stat(path)
+			if os.IsNotExist(e) {
+				continue
+			}
+			if e != nil {
+				return stats, e
+			}
+			candidates = append(candidates, compactCandidate{name: fmt.Sprintf("snapshot-%020d", id), path: path, fileId: id, size: info.Size(), coalesced: true})
+		}
 	}
 	// Deterministic order + resume after the previous cycle's cursor so large
 	// directories make steady progress instead of rescanning the same prefix.
@@ -172,6 +197,22 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 			break
 		}
 		db.compactCursor = c.name
+		if c.coalesced {
+			stats.CandidatesScanned++
+			r, e := db.compactCoalesced(c, cfg.MaxScanBytesPerCycle-scannedBytes, cfg.MaxMoveBytesPerCycle-stats.LiveBytesMoved, cfg.MinDeadFraction, stats.LiveBytesMoved == 0)
+			if e != nil {
+				return stats, fmt.Errorf("accountsdb: compact %s: %w", c.name, e)
+			}
+			scannedBytes += r.scanned
+			stats.LiveBytesMoved += r.moved
+			stats.BytesReclaimed += r.freed - r.moved
+			if r.moved > 0 {
+				stats.FilesCompacted++
+			} else if r.deleted {
+				stats.FilesDeleted++
+			}
+			continue
+		}
 		scannedBytes += c.size
 		stats.CandidatesScanned++
 
@@ -268,7 +309,7 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 		return false, 0, err
 	}
 
-	pubkeys, idxEntries, _, err := BuildIndexEntriesFromAppendVecs(data, uint64(len(data)), c.slot, c.fileId)
+	pubkeys, idxEntries, _, err := BuildIndexEntriesFromAppendVecs(data, uint64(len(data)), c.slot, c.fileId, 0)
 	if err != nil {
 		return false, 0, err
 	}
@@ -317,7 +358,7 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 
 	// Allocate the output fileId, persisting the high-water mark before the
 	// first data byte (I7 — a crash must never lead to fileId reuse).
-	newFileId := db.LargestFileId.Add(1)
+	newFileId := db.nextFileId(0)
 	if err := db.persistLargestFileId(); err != nil {
 		return false, 0, err
 	}
@@ -443,6 +484,9 @@ func removeSourceFiles(acctsDir, srcPath, manifestPath string) error {
 }
 
 func humanBytes(n int64) string {
+	if n < 0 {
+		return "-" + humanBytes(-n)
+	}
 	switch {
 	case n >= 1<<30:
 		return fmt.Sprintf("%.1fGiB", float64(n)/float64(1<<30))
