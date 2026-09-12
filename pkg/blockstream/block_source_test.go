@@ -409,6 +409,45 @@ func TestApplyAlpenglowCertifiedSkipModeIndependent(t *testing.T) {
 	}
 }
 
+func TestApplyAlpenglowDecisiveBlockReauthorizesOutsideNearTip(t *testing.T) {
+	blockID := solana.Hash{0xA1}
+	bs := NewBlockSource(&BlockSourceOpts{
+		SourceType:                   BlockSourceTurbine,
+		TurbineBindAddr:              "127.0.0.1:0",
+		TurbineAlpenglowBlockIDHints: true,
+		StartSlot:                    151,
+		EndSlot:                      200,
+		AlpenglowDecisionSource: func(anchorSlot uint64) (alpenglow.ChainDecision, bool) {
+			return alpenglow.ChainDecision{
+				Slot: 151, Kind: alpenglow.ChainDecisionKindBlock,
+				Block: alpenglow.BlockID{Slot: 151, Hash: blockID},
+			}, true
+		},
+	})
+	block := &b.Block{Slot: 151, HasAlpenglowBlockID: true, AlpenglowBlockID: blockID}
+	bs.rejectAlpenglowBlockID(151, blockID)
+	if !bs.isRejectedAlpenglowBlock(block) {
+		t.Fatal("test premise: decisive block was not soft-tombstoned")
+	}
+	// Catchup/pre-handoff: candidate steering is inactive, but consensus
+	// authority still has to revive this identity for later repair.
+	bs.isNearTip.Store(false)
+	bs.liveStreamActive.Store(false)
+
+	bs.reorderMu.Lock()
+	changed := bs.applyAlpenglowDecisionLocked()
+	bs.reorderMu.Unlock()
+	if changed {
+		t.Fatal("mode-independent reauthorization must not claim a buffered change")
+	}
+	if bs.isRejectedAlpenglowBlock(block) {
+		t.Fatal("decisive block remained tombstoned outside near-tip mode")
+	}
+	if got := bs.knownAlpenglowBlockIDs[151]; got != blockID {
+		t.Fatalf("known Alpenglow block id = %s, want %s", got, blockID)
+	}
+}
+
 func TestApplyAlpenglowDecisionLockedLeavesMatchingCertifiedBlock(t *testing.T) {
 	blockID := solana.Hash{1}
 	bs := NewBlockSource(&BlockSourceOpts{
@@ -427,11 +466,16 @@ func TestApplyAlpenglowDecisionLockedLeavesMatchingCertifiedBlock(t *testing.T) 
 	})
 	bs.isNearTip.Store(true)
 	bs.liveStreamActive.Store(true)
-	bs.reorderBuffer[151] = &b.Block{
+	matching := &b.Block{
 		Slot:                151,
 		FromLiveStream:      true,
 		HasAlpenglowBlockID: true,
 		AlpenglowBlockID:    [32]byte(blockID),
+	}
+	bs.reorderBuffer[151] = matching
+	bs.rejectAlpenglowBlockID(151, blockID)
+	if !bs.isRejectedAlpenglowBlock(matching) {
+		t.Fatal("test premise: matching decisive block was not speculatively tombstoned")
 	}
 
 	bs.reorderMu.Lock()
@@ -443,6 +487,12 @@ func TestApplyAlpenglowDecisionLockedLeavesMatchingCertifiedBlock(t *testing.T) 
 	}
 	if bs.reorderBuffer[151] == nil {
 		t.Fatalf("expected matching block to remain buffered")
+	}
+	if bs.isRejectedAlpenglowBlock(matching) {
+		t.Fatal("decisive block decision did not clear its speculative tombstone")
+	}
+	if got := bs.knownAlpenglowBlockIDs[151]; got != blockID {
+		t.Fatalf("known Alpenglow block id = %s, want %s", got, blockID)
 	}
 }
 
@@ -1338,7 +1388,7 @@ func TestRejectAlpenglowParentSwitchRetainsRootedBranch(t *testing.T) {
 	parentID := solana.Hash{0x43}
 	rootedChildID := solana.Hash{0x48}
 	lateSibling := &b.Block{
-		Slot:                      344,
+		Slot:                      350,
 		FromLiveStream:            true,
 		SourceParentSlot:          343,
 		AlpenglowBlockID:          rootedChildID,
@@ -1352,7 +1402,7 @@ func TestRejectAlpenglowParentSwitchRetainsRootedBranch(t *testing.T) {
 	bs.lastEmittedAlpenglowBlockID = solana.Hash{0x99}
 	bs.hasLastEmittedAlpenglowBlockID = true
 	bs.nextSlotToSend = 349
-	bs.reorderBuffer[344] = lateSibling
+	bs.reorderBuffer[350] = lateSibling
 
 	bs.reorderMu.Lock()
 	if !bs.queueAlpenglowParentSwitchLocked(lateSibling) {
@@ -1382,6 +1432,70 @@ func TestRejectAlpenglowParentSwitchRetainsRootedBranch(t *testing.T) {
 	bs.reorderMu.Unlock()
 	if reversed {
 		t.Fatal("tombstoned late sibling queued the same reverse switch again")
+	}
+}
+
+func TestLateParentLinkedChildCannotReplaceProgressedEmittedBranchWithoutDecision(t *testing.T) {
+	parentID := solana.Hash{0x45}
+	canonicalID := solana.Hash{0x48}
+	lateID := solana.Hash{0x46}
+	bs := NewBlockSource(&BlockSourceOpts{
+		SourceType:                   BlockSourceTurbine,
+		TurbineBindAddr:              "127.0.0.1:0",
+		TurbineAlpenglowBlockIDHints: true,
+		StartSlot:                    346,
+		EndSlot:                      400,
+	})
+	bs.emittedAlpenglowBlockIDs[345] = parentID
+	bs.emittedAlpenglowBlockIDs[348] = canonicalID
+	bs.emittedAlpenglowBlockIDOrder = []uint64{345, 348}
+	bs.lastEmittedBlockSlot = 348
+	bs.lastEmittedAlpenglowBlockID = canonicalID
+	bs.hasLastEmittedAlpenglowBlockID = true
+	bs.nextSlotToSend = 349
+	late := &b.Block{
+		Slot:                      346,
+		FromLiveStream:            true,
+		SourceParentSlot:          345,
+		AlpenglowBlockID:          lateID,
+		HasAlpenglowBlockID:       true,
+		AlpenglowParentBlockID:    parentID,
+		HasAlpenglowParentBlockID: true,
+	}
+
+	bs.reorderMu.Lock()
+	queued := bs.queueAlpenglowParentSwitchLocked(late)
+	bs.reorderMu.Unlock()
+	if queued || bs.pendingAlpenglowParentSwitch != nil {
+		t.Fatal("late unknown child replaced a branch already emitted past its slot")
+	}
+	if got := bs.emittedAlpenglowBlockIDs[348]; got != canonicalID {
+		t.Fatalf("progressed branch identity changed: got %s want %s", got, canonicalID)
+	}
+	if !bs.isRejectedAlpenglowBlock(late) {
+		t.Fatal("late unknown child was not soft-tombstoned")
+	}
+	canonical := &b.Block{Slot: 348, HasAlpenglowBlockID: true, AlpenglowBlockID: canonicalID}
+	if bs.isRejectedAlpenglowBlock(canonical) {
+		t.Fatal("retained progressed branch was tombstoned")
+	}
+
+	// Consensus authority, unlike arrival order, may select the late branch.
+	bs.SetKnownAlpenglowBlockID(late.Slot, lateID)
+	bs.alpenglowDecisionSource = func(anchor uint64) (alpenglow.ChainDecision, bool) {
+		if anchor != late.Slot-1 {
+			return alpenglow.ChainDecision{}, false
+		}
+		return alpenglow.ChainDecision{
+			Slot: late.Slot, Kind: alpenglow.ChainDecisionKindBlock,
+			Block: alpenglow.BlockID{Slot: late.Slot, Hash: lateID},
+		}, true
+	}
+	bs.reorderMu.Lock()
+	queued = bs.queueAlpenglowParentSwitchLocked(late)
+	bs.reorderMu.Unlock()
+	if !queued || bs.pendingAlpenglowParentSwitch == nil {
+		t.Fatal("decisive consensus block did not override the late-child guard")
 	}
 }
 

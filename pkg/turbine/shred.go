@@ -391,6 +391,53 @@ func (s *Shred) MerkleRoot() (solana.Hash, error) {
 	return root, nil
 }
 
+// RetransmitterSignature returns the hop signature carried by a resigned
+// Merkle shred. It is distinct from Signature, which always belongs to the
+// slot leader and authenticates the FEC-set Merkle root.
+func (s *Shred) RetransmitterSignature() (solana.Signature, error) {
+	var signature solana.Signature
+	offset, err := s.retransmitterSignatureOffset()
+	if err != nil {
+		return signature, err
+	}
+	if offset+shredSignatureSize > len(s.Payload) {
+		return signature, fmt.Errorf("%w: retransmitter signature slice %d:%d payload %d", ErrShortShred, offset, offset+shredSignatureSize, len(s.Payload))
+	}
+	copy(signature[:], s.Payload[offset:offset+shredSignatureSize])
+	return signature, nil
+}
+
+func (s *Shred) retransmitterSignatureOffset() (int, error) {
+	if s == nil || !isMerkleVariant(s.Variant) {
+		return 0, ErrUnsupportedShred
+	}
+	proofSize, chained, resigned, ok := merkleVariantInfo(s.Variant)
+	if !ok || !resigned {
+		return 0, ErrUnsupportedShred
+	}
+	var headerSize, payloadSize int
+	switch s.Type {
+	case ShredTypeData:
+		headerSize = dataHeaderSize
+		payloadSize = dataPayloadSize
+	case ShredTypeCode:
+		headerSize = codingHeaderSize
+		payloadSize = codingPayloadSize
+	default:
+		return 0, ErrUnsupportedShred
+	}
+	capacity, err := merkleCapacity(payloadSize, headerSize, proofSize, chained, resigned)
+	if err != nil {
+		return 0, err
+	}
+	offset := headerSize + capacity
+	if chained {
+		offset += merkleRootSize
+	}
+	offset += int(proofSize) * merkleProofEntrySize
+	return offset, nil
+}
+
 func (s *Shred) VerifySignature(leader solana.PublicKey) error {
 	root, err := s.MerkleRoot()
 	if err != nil {

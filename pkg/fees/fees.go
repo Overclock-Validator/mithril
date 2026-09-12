@@ -19,6 +19,9 @@ var microLamportsPerLamport = wide.Uint128FromUint64(1000000)
 var microLamportsPerLamportMinus1 = wide.Uint128FromUint64(1000000 - 1)
 
 func calculatePriorityFee(computeBudgetLimits *sealevel.ComputeBudgetLimits) uint64 {
+	if computeBudgetLimits.UsesDirectPriorityFee {
+		return computeBudgetLimits.DirectPriorityFeeLamports
+	}
 	computeUnitPrice := wide.Uint128FromUint64(computeBudgetLimits.ComputeUnitPrice)
 	computeUnitLimit := wide.Uint128FromUint64(uint64(computeBudgetLimits.ComputeUnitLimit))
 
@@ -35,9 +38,10 @@ func calculatePriorityFee(computeBudgetLimits *sealevel.ComputeBudgetLimits) uin
 	return priorityFee
 }
 
-// There are currently two aspects of the tx fee cost model on Solana
-// 1) fee per signature (5k lamports/sig)
-// 2) prioritization fees set via a SetComputeUnitPrice instruction
+// There are currently two aspects of the transaction fee model:
+//  1. fee per signature (5k lamports/signature)
+//  2. a prioritization fee, derived from SetComputeUnitPrice for legacy/v0 or
+//     supplied directly as total lamports in a SIMD-0385 v1 header
 
 const feePayerIdx = 0
 
@@ -72,6 +76,16 @@ func (txFeeAccumulator *TxFeeInfoAccumulator) Add(txFeeInfo *TxFeeInfo) {
 	}
 }
 
+// LeaderReward is the lamports credited to the slot leader for a transaction:
+// full priority fee plus the unburned half of the signature (execution) fee.
+func LeaderReward(feeInfo *TxFeeInfo) uint64 {
+	if feeInfo == nil {
+		return 0
+	}
+	unburnedSigFee := feeInfo.ExecutionFee - feeInfo.ExecutionFee/2
+	return safemath.SaturatingAddU64(feeInfo.PriorityFee, unburnedSigFee)
+}
+
 func CalculateTxFees(tx *solana.Transaction, instrs []sealevel.Instruction, computeBudgetLimits *sealevel.ComputeBudgetLimits, f *features.Features) *TxFeeInfo {
 	numSignatures := uint64(tx.Message.Header.NumRequiredSignatures)
 	secp256r1PrecompiledEnabled := f.IsActive(features.EnableSecp256r1Precompile)
@@ -91,7 +105,7 @@ func CalculateTxFees(tx *solana.Transaction, instrs []sealevel.Instruction, comp
 
 	// prioritization fees
 	var priorityFee uint64
-	if computeBudgetLimits.ComputeUnitPrice != 0 {
+	if computeBudgetLimits.UsesDirectPriorityFee || computeBudgetLimits.ComputeUnitPrice != 0 {
 		priorityFee = calculatePriorityFee(computeBudgetLimits)
 	}
 
@@ -100,7 +114,7 @@ func CalculateTxFees(tx *solana.Transaction, instrs []sealevel.Instruction, comp
 }
 
 // TODO: implement new fee model
-func CalculateAndDeductTxFees(tx *solana.Transaction, txMeta *rpc.TransactionMeta, instrs []sealevel.Instruction, transactionAccts *sealevel.TransactionAccounts, computeBudgetLimits *sealevel.ComputeBudgetLimits, f *features.Features, isSimulation bool) (*TxFeeInfo, uint64, error) {
+func CalculateAndDeductTxFees(tx *solana.Transaction, txMeta *rpc.TransactionMeta, instrs []sealevel.Instruction, transactionAccts *sealevel.TransactionAccounts, computeBudgetLimits *sealevel.ComputeBudgetLimits, f *features.Features, rent sealevel.SysvarRent, isSimulation bool) (*TxFeeInfo, uint64, error) {
 	feePayerAcct, err := transactionAccts.GetAccount(feePayerIdx)
 	if err != nil {
 		if isSimulation {
@@ -135,21 +149,27 @@ func CalculateAndDeductTxFees(tx *solana.Transaction, txMeta *rpc.TransactionMet
 
 	// prioritization fees
 	var priorityFee uint64
-	if computeBudgetLimits.ComputeUnitPrice != 0 {
+	if computeBudgetLimits.UsesDirectPriorityFee || computeBudgetLimits.ComputeUnitPrice != 0 {
 		priorityFee = calculatePriorityFee(computeBudgetLimits)
 	}
 
 	totalTxFee := safemath.SaturatingAddU64(baseTxFee, priorityFee)
 	feeInfo := &TxFeeInfo{ExecutionFee: baseTxFee, PriorityFee: priorityFee, TotalFee: totalTxFee}
 
-	if feePayerAcct.Lamports < totalTxFee {
-		return feeInfo, 0, sealevel.InstrErrInsufficientFunds
+	if err := ValidateFeePayerWithFeatures(feePayerAcct, totalTxFee, rent, f); err != nil {
+		return feeInfo, 0, err
 	}
 	////mlog.Log.Debugf("feePayerAcct.Lamports=%d totalTxFee=%d", feePayerAcct.Lamports, totalTxFee)
 
 	feePayerAcct, err = transactionAccts.Touch(feePayerIdx)
 	if err != nil {
 		return feeInfo, 0, err
+	}
+	// Agave normalizes a rent-exempt payer before deducting its fee. Successful
+	// execution commits this value; replay's failure publisher separately
+	// restores the originally loaded epoch for ordinary-blockhash rollbacks.
+	if feePayerAcct.RentEpoch != math.MaxUint64 && rent.IsExempt(feePayerAcct.Lamports, uint64(len(feePayerAcct.Data))) {
+		feePayerAcct.RentEpoch = math.MaxUint64
 	}
 	feePayerAcct.Lamports -= totalTxFee
 

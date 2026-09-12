@@ -143,27 +143,29 @@ func (recentBlockhashes *SysvarRecentBlockhashes) IsBlockhashAgeValid(hash [32]b
 }
 
 func ReadRecentBlockHashesSysvar(execCtx *ExecutionCtx) (SysvarRecentBlockhashes, error) {
+	if execCtx != nil && execCtx.SlotCtx != nil {
+		if bankSysvars := execCtx.SlotCtx.BankSysvars(); bankSysvars != nil {
+			recentBlockhashes, ok := bankSysvars.RecentBlockhashes()
+			if !ok {
+				return SysvarRecentBlockhashes{}, InstrErrUnsupportedSysvar
+			}
+			return recentBlockhashes, nil
+		}
+	}
+
+	if recentAcct, ok := localSysvarAccount(execCtx, SysvarRecentBlockHashesAddr); ok {
+		if recentAcct.Lamports == 0 || len(recentAcct.Data) == 0 {
+			return SysvarRecentBlockhashes{}, InstrErrUnsupportedSysvar
+		}
+		var recentBlockhashes SysvarRecentBlockhashes
+		if err := recentBlockhashes.UnmarshalWithDecoder(bin.NewBinDecoder(recentAcct.Data)); err != nil {
+			return SysvarRecentBlockhashes{}, InstrErrUnsupportedSysvar
+		}
+		return recentBlockhashes, nil
+	}
+
 	if SysvarCache.RecentBlockHashes.Sysvar != nil {
 		return *SysvarCache.RecentBlockHashes.Sysvar, nil
 	}
-
-	accts := addrObjectForLookup(execCtx)
-	recentBlockhashesAcct, err := (*accts).GetAccount(&SysvarRecentBlockHashesAddr)
-	if err != nil {
-		return SysvarRecentBlockhashes{}, InstrErrUnsupportedSysvar
-	}
-
-	if recentBlockhashesAcct.Lamports == 0 || len(recentBlockhashesAcct.Data) == 0 {
-		return SysvarRecentBlockhashes{}, InstrErrUnsupportedSysvar
-	}
-
-	dec := bin.NewBinDecoder(recentBlockhashesAcct.Data)
-
-	var recentBlockhashes SysvarRecentBlockhashes
-	err = recentBlockhashes.UnmarshalWithDecoder(dec)
-	if err != nil {
-		return SysvarRecentBlockhashes{}, InstrErrUnsupportedSysvar
-	}
-
-	return recentBlockhashes, nil
+	return SysvarRecentBlockhashes{}, InstrErrUnsupportedSysvar
 }

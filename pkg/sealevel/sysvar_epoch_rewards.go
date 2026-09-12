@@ -136,30 +136,31 @@ func (sr *SysvarEpochRewards) Distribute(amount uint64) {
 }
 
 func ReadEpochRewardsSysvar(execCtx *ExecutionCtx) (SysvarEpochRewards, error) {
+	if execCtx != nil && execCtx.SlotCtx != nil {
+		if bankSysvars := execCtx.SlotCtx.BankSysvars(); bankSysvars != nil {
+			epochRewards, ok := bankSysvars.EpochRewards()
+			if !ok {
+				return SysvarEpochRewards{}, InstrErrUnsupportedSysvar
+			}
+			return epochRewards, nil
+		}
+	}
+
+	if epochRewardsAcct, ok := localSysvarAccount(execCtx, SysvarEpochRewardsAddr); ok {
+		if epochRewardsAcct.Lamports == 0 {
+			return SysvarEpochRewards{}, InstrErrUnsupportedSysvar
+		}
+		var epochRewards SysvarEpochRewards
+		if err := epochRewards.UnmarshalWithDecoder(bin.NewBinDecoder(epochRewardsAcct.Data)); err != nil {
+			return SysvarEpochRewards{}, InstrErrUnsupportedSysvar
+		}
+		return epochRewards, nil
+	}
+
 	if SysvarCache.EpochRewards.Sysvar != nil {
 		return *SysvarCache.EpochRewards.Sysvar, nil
 	}
-
-	accts := addrObjectForLookup(execCtx)
-
-	epochRewardsSysvarAcct, err := (*accts).GetAccount(&SysvarEpochRewardsAddr)
-	if err != nil {
-		return SysvarEpochRewards{}, InstrErrUnsupportedSysvar
-	}
-
-	if epochRewardsSysvarAcct.Lamports == 0 {
-		return SysvarEpochRewards{}, InstrErrUnsupportedSysvar
-	}
-
-	dec := bin.NewBinDecoder(epochRewardsSysvarAcct.Data)
-
-	var epochRewards SysvarEpochRewards
-	err = epochRewards.UnmarshalWithDecoder(dec)
-	if err != nil {
-		return SysvarEpochRewards{}, InstrErrUnsupportedSysvar
-	}
-
-	return epochRewards, nil
+	return SysvarEpochRewards{}, InstrErrUnsupportedSysvar
 }
 
 func WriteEpochRewardsSysvar(accts *accounts.Accounts, epochRewards SysvarEpochRewards) {

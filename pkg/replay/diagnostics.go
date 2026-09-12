@@ -131,10 +131,16 @@ func consensusSignatureStrings(tx *solana.Transaction) []string {
 }
 
 func consensusTxVersion(tx *solana.Transaction) string {
-	if tx.Message.IsVersioned() {
-		return fmt.Sprintf("v%d", tx.Message.GetVersion())
+	switch tx.Message.GetVersion() {
+	case solana.MessageVersionLegacy:
+		return "legacy"
+	case solana.MessageVersionV0:
+		return "v0"
+	case solana.MessageVersionV1:
+		return "v1"
+	default:
+		return fmt.Sprintf("unknown(%d)", tx.Message.GetVersion())
 	}
-	return "legacy"
 }
 
 func consensusProgramIDs(tx *solana.Transaction) []string {
@@ -157,7 +163,7 @@ func consensusProgramIDs(tx *solana.Transaction) []string {
 }
 
 func consensusLookupTableKeys(tx *solana.Transaction) []string {
-	if !tx.Message.IsVersioned() || tx.Message.AddressTableLookups.NumLookups() == 0 {
+	if tx.Message.GetVersion() != solana.MessageVersionV0 || tx.Message.AddressTableLookups.NumLookups() == 0 {
 		return nil
 	}
 	tableIDs := tx.Message.GetAddressTableLookups().GetTableIDs()

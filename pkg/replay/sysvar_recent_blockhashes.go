@@ -37,9 +37,9 @@ func SeedRecentBlockhashesCache(recent sealevel.SysvarRecentBlockhashes) {
 	sealevel.SysvarCache.RecentBlockHashes.Sysvar = &recent
 }
 
-// cloneRecentBlockhashesFromCache returns a copy of the in-memory RecentBlockhashes deque.
-// SysvarCache is the authoritative source during replay and leader production; AccountsDB
-// may hold a snapshot-era sysvar account but it is not updated reliably enough to reload from.
+// cloneRecentBlockhashesFromCache returns a copy of the legacy ordered-replay
+// bootstrap deque. Executing replay and leader banks use SlotCtx.BankSysvars;
+// this singleton must not be treated as transaction-visible bank state.
 func cloneRecentBlockhashesFromCache() (sealevel.SysvarRecentBlockhashes, error) {
 	if sealevel.SysvarCache.RecentBlockHashes.Sysvar == nil {
 		return nil, fmt.Errorf("RecentBlockhashes sysvar cache is nil")

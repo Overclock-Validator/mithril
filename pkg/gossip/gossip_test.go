@@ -129,17 +129,8 @@ func TestClientAdvertisesAlpenglowSocket(t *testing.T) {
 	if got, want := contact.AlpenglowAddr.String(), "203.0.113.10:8002"; got != want {
 		t.Fatalf("alpenglow addr = %s, want %s", got, want)
 	}
-	if contact.TPUVoteAddr == nil {
-		t.Fatalf("expected TPU vote socket to be advertised for Alpenglow Votor compatibility")
-	}
-	if got, want := contact.TPUVoteAddr.String(), "203.0.113.10:8002"; got != want {
-		t.Fatalf("tpu vote addr = %s, want %s", got, want)
-	}
-	if contact.TPUVoteQuicAddr == nil {
-		t.Fatalf("expected TPU vote QUIC socket to be advertised for Alpenglow Votor compatibility")
-	}
-	if got, want := contact.TPUVoteQuicAddr.String(), "203.0.113.10:8002"; got != want {
-		t.Fatalf("tpu vote quic addr = %s, want %s", got, want)
+	if contact.TPUVoteAddr != nil || contact.TPUVoteQuicAddr != nil {
+		t.Fatalf("Alpenglow tag 13 must not be duplicated into TPU vote tags 9/12: udp=%v quic=%v", contact.TPUVoteAddr, contact.TPUVoteQuicAddr)
 	}
 }
 

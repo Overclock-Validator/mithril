@@ -22,7 +22,7 @@ func canDeriveAccountsFromMessage(t *solana.Transaction) bool {
 	if len(t.Message.AccountKeys) == 0 {
 		return false
 	}
-	return !t.Message.IsVersioned() || t.Message.AddressTableLookups.NumLookups() == 0
+	return t.Message.GetVersion() != solana.MessageVersionV0 || t.Message.AddressTableLookups.NumLookups() == 0
 }
 
 func messageAccountLayout(msg *solana.Message) (numStaticAccounts, numWritableLookupAccounts int) {

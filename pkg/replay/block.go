@@ -83,12 +83,17 @@ type BlockFetchOpts struct {
 	// ShredSpoolDir: on-disk verified-shred spool shared by prewarm and the
 	// block source (empty = disabled).
 	ShredSpoolDir string
-	// LocalBlocks carries fully frozen blocks produced by this validator. They
-	// enter the normal ordered block source and are re-executed by ProcessBlock.
-	LocalBlocks        <-chan *b.Block
-	LocalLeaderForSlot func(slot uint64) bool
-	GossipClient       *gossip.Client
-	PrewarmBlocks      []*b.Block
+	// LocalBlocks carries fully frozen blocks produced by this validator. Replay
+	// adopts the already-mutated leader SlotCtx and does not re-execute.
+	LocalBlocks          <-chan *b.Block
+	LocalLeaderForSlot   func(slot uint64) bool
+	GossipClient         *gossip.Client
+	PrewarmBlocks        []*b.Block
+	TurbineStakesForSlot func(slot uint64) map[solana.PublicKey]uint64
+	TurbineEpochForSlot  func(slot uint64) uint64
+	TurbineRootSlot      func() uint64
+	TurbineUseChaCha8    bool
+	TurbineDedupAddrs    bool
 }
 
 var SerializedParameterArena *arena.Arena[byte]
@@ -111,6 +116,17 @@ func GenerateRunID() string {
 		return fmt.Sprintf("%08x", time.Now().UnixNano()&0xFFFFFFFF)
 	}
 	return hex.EncodeToString(b)
+}
+
+func identityFromTurbineKey(priv ed25519.PrivateKey) solana.PublicKey {
+	if len(priv) != ed25519.PrivateKeySize {
+		return solana.PublicKey{}
+	}
+	pub, ok := priv.Public().(ed25519.PublicKey)
+	if !ok {
+		return solana.PublicKey{}
+	}
+	return solana.PublicKeyFromBytes(pub)
 }
 
 // IsCommitInProgress returns true if we're in the critical commit window.
@@ -259,7 +275,7 @@ func resolveAddrTableLookups(accountsDb blockAccountSource, block *b.Block) erro
 	tables := make(map[solana.PublicKey]solana.PublicKeySlice)
 
 	for _, tx := range block.Transactions {
-		if !tx.Message.IsVersioned() {
+		if tx.Message.GetVersion() != solana.MessageVersionV0 {
 			continue
 		}
 
@@ -291,7 +307,7 @@ func resolveAddrTableLookups(accountsDb blockAccountSource, block *b.Block) erro
 
 txResolveLoop:
 	for _, tx := range block.Transactions {
-		if !tx.Message.IsVersioned() || tx.Message.AddressTableLookups.NumLookups() == 0 {
+		if tx.Message.GetVersion() != solana.MessageVersionV0 || tx.Message.AddressTableLookups.NumLookups() == 0 {
 			continue
 		}
 		for _, addrTableKey := range tx.Message.GetAddressTableLookups().GetTableIDs() {
@@ -320,7 +336,7 @@ txResolveLoop:
 // callers can map missing/invalid tables to AddressLookupTableNotFound or
 // InvalidAddressLookupTableData.
 func ResolveAddrTableLookupsForTx(ctx context.Context, accountsDb *accountsdb.AccountsDb, slot uint64, tx *solana.Transaction) error {
-	if !tx.Message.IsVersioned() || tx.Message.AddressTableLookups.NumLookups() == 0 {
+	if tx.Message.GetVersion() != solana.MessageVersionV0 || tx.Message.AddressTableLookups.NumLookups() == 0 {
 		return nil
 	}
 
@@ -389,6 +405,17 @@ func extractAndDedupeBlockAccts(block *b.Block) ([]solana.PublicKey, int) {
 	return pubkeys, writableAccountCount
 }
 
+func includeAlpenglowParentStateAccounts(pubkeys []solana.PublicKey, alpenglowClock bool) []solana.PublicKey {
+	if !alpenglowClock {
+		return pubkeys
+	}
+	nanoClockAddr := NanosecondClockAccountAddr()
+	if slices.Contains(pubkeys, nanoClockAddr) {
+		return pubkeys
+	}
+	return append(pubkeys, nanoClockAddr)
+}
+
 func publicationMapCapacity(block *b.Block, uniqueWritableAccounts int, alpenglow bool) int {
 	// This is an allocation hint, not a shard-count bound. Cap speculative
 	// transaction capacity at the observed transfer workload's touch rate so
@@ -423,6 +450,11 @@ func cacheFeesSysvar(acctsDb *accountsdb.AccountsDb) {
 	}
 	acct, err := acctsDb.GetAccount(0, sealevel.SysvarFeesAddr)
 	if errors.Is(err, accountsdb.ErrNoAccount) {
+		// Absence is authoritative. Replay can be restarted in-process after a
+		// fork recovery, so retaining a value from an earlier bootstrap would
+		// incorrectly resurrect the disabled legacy sysvar in BankSysvars.
+		sealevel.SysvarCache.Fees.Sysvar = nil
+		sealevel.SysvarCache.Fees.Acct = nil
 		return
 	}
 	if err != nil {
@@ -530,16 +562,22 @@ func recordSysvarAccountReadStats(dst *metrics.AccountLoader, src accountsdb.Acc
 	}
 }
 
-func loadBlockAccountsAndUpdateSysvars(accountsDb blockAccountSource, block *b.Block, epochSchedule *sealevel.SysvarEpochSchedule, alpenglowClock bool) (accounts.Accounts, accounts.Accounts, int, error) {
+func loadBlockAccountsAndUpdateSysvars(accountsDb blockAccountSource, block *b.Block, epochSchedule *sealevel.SysvarEpochSchedule, alpenglowClock bool, parentBankSysvars *sealevel.BankSysvars) (accounts.Accounts, accounts.Accounts, int, *sealevel.BankSysvars, error) {
+	var bankSysvars *sealevel.BankSysvars
 	phaseStart := time.Now()
 	err := resolveAddrTableLookups(accountsDb, block)
 	metrics.GlobalBlockReplay.AccountLoader.AddressTableLookups.AddTimingSince(phaseStart)
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, nil, 0, bankSysvars, err
 	}
 
 	phaseStart = time.Now()
 	dedupedAccts, uniqueWritableAccounts := extractAndDedupeBlockAccts(block)
+	// The footer-owned nanosecond clock is bank state even when no transaction
+	// mentions it. Pin the exact parent account (or AccountsDB's tombstone for
+	// absence) in the same batch snapshot as all other execution accounts. This
+	// preserves both the footer bounds anchor and the AccountsLtHash before-image.
+	dedupedAccts = includeAlpenglowParentStateAccounts(dedupedAccts, alpenglowClock)
 	publicationCapacity := publicationMapCapacity(block, uniqueWritableAccounts, alpenglowClock)
 	metrics.GlobalBlockReplay.AccountLoader.DedupeBlockAccounts.AddTimingSince(phaseStart)
 	ctx := context.Background()
@@ -548,7 +586,7 @@ func loadBlockAccountsAndUpdateSysvars(accountsDb blockAccountSource, block *b.B
 	metrics.GlobalBlockReplay.AccountLoader.SourceBatch.AddTimingSince(phaseStart)
 	recordAccountLoaderBatchStats(&metrics.GlobalBlockReplay.AccountLoader, batchStats)
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, nil, 0, bankSysvars, err
 	}
 
 	phaseStart = time.Now()
@@ -557,13 +595,35 @@ func loadBlockAccountsAndUpdateSysvars(accountsDb blockAccountSource, block *b.B
 	parentAccts := accounts.NewMemAccountsWithLen(uint64(numAccts))
 	for _, acct := range slotAccts {
 		if err = parentAccts.SetAccountWithoutLock(acct.Key, acct); err != nil {
-			return nil, nil, 0, err
+			return nil, nil, 0, bankSysvars, err
 		}
 	}
 
 	// accts is a branch-local overlay over the pristine parent snapshot; execution
 	// copy-on-writes, so parentAccts stays pristine for LtHash "before" values.
 	accts := accounts.NewOverlayAccountsWithSizing(parentAccts, numAccts, publicationCapacity)
+	if parentBankSysvars != nil {
+		if parentBankSysvars.Slot() != block.ParentSlot {
+			return nil, nil, 0, nil, fmt.Errorf(
+				"parent bank sysvar slot %d does not match block parent %d",
+				parentBankSysvars.Slot(), block.ParentSlot,
+			)
+		}
+		// Pin every bank-owned sysvar to the exact immutable parent generation
+		// before applying this bank's lifecycle updates. This covers raw account
+		// reads as well as typed reads and installs explicit tombstones for sysvars
+		// absent in the parent, so neither AccountsDB nor a process-global cache can
+		// leak a newer abandoned-fork generation into this child.
+		if err := sealevel.RangeBankSysvarAddresses(func(key solana.PublicKey) error {
+			acct, ok := parentBankSysvars.AccountView(key)
+			if !ok {
+				acct = &accounts.Account{Key: key, RentEpoch: math.MaxUint64}
+			}
+			return parentAccts.SetAccountWithoutLock(key, acct)
+		}); err != nil {
+			return nil, nil, 0, nil, fmt.Errorf("install parent bank sysvars: %w", err)
+		}
+	}
 	metrics.GlobalBlockReplay.AccountLoader.ParentMapBuild.AddTimingSince(phaseStart)
 
 	phaseStart = time.Now()
@@ -577,32 +637,47 @@ func loadBlockAccountsAndUpdateSysvars(accountsDb blockAccountSource, block *b.B
 		// update and cache clock sysvar
 		{
 			var clockAcct *accounts.Account
+			var clock sealevel.SysvarClock
+			clockEpochSchedule := epochSchedule
 			var err error
-			if sealevel.SysvarCache.Clock.Acct != nil {
+			if parentBankSysvars != nil {
+				var ok bool
+				clockAcct, ok = parentBankSysvars.CloneAccount(sealevel.SysvarClockAddr)
+				if !ok {
+					panic("required Clock sysvar is absent from parent bank snapshot")
+				}
+				clock, ok = parentBankSysvars.Clock()
+				if !ok {
+					panic("decoded Clock sysvar is absent from parent bank snapshot")
+				}
+				parentEpochSchedule, ok := parentBankSysvars.EpochSchedule()
+				if !ok {
+					panic("decoded EpochSchedule sysvar is absent from parent bank snapshot")
+				}
+				clockEpochSchedule = &parentEpochSchedule
+			} else if sealevel.SysvarCache.Clock.Acct != nil {
 				// Prefer the in-RAM Clock (mirrors SlotHashes/RecentBlockhashes): on
 				// resume it is the restored Clock as of the last rooted slot, which durable may not match.
 				clockAcct = sealevel.SysvarCache.Clock.Acct.Clone()
 			} else {
 				clockAcct, err = loadSysvarAccount(accountsDb, block.Slot, sealevel.SysvarClockAddr, &metrics.GlobalBlockReplay.AccountLoader.SysvarClockRead)
+			}
+			if err != nil {
+				panic("unable to retrieve clock sysvar when updating clock")
+			}
+
+			if parentBankSysvars == nil {
+				err = parentAccts.SetAccountWithoutLock(sealevel.SysvarClockAddr, clockAcct.Clone())
 				if err != nil {
-					panic("unable to retrieve clock sysvar when updating clock")
+					panic("unable to set clock sysvar to accts")
+				}
+				err = clock.UnmarshalWithDecoder(bin.NewBinDecoder(clockAcct.Data))
+				if err != nil {
+					panic("unable to unmarshal clock sysvar")
 				}
 			}
 
-			err = parentAccts.SetAccountWithoutLock(sealevel.SysvarClockAddr, clockAcct.Clone())
-			if err != nil {
-				panic("unable to set clock sysvar to accts")
-			}
-
-			decoder := bin.NewBinDecoder(clockAcct.Data)
-			var clock sealevel.SysvarClock
-
-			err = clock.UnmarshalWithDecoder(decoder)
-			if err != nil {
-				panic("unable to unmarshal clock sysvar")
-			}
-
-			err = updateClockSysvarForMode(&clock, block, epochSchedule, alpenglowClock)
+			err = updateClockSysvarForMode(&clock, block, clockEpochSchedule, alpenglowClock)
 			if err != nil {
 				panic(fmt.Sprintf("failed to update clock sysvar: %s", err))
 			}
@@ -611,7 +686,6 @@ func loadBlockAccountsAndUpdateSysvars(accountsDb blockAccountSource, block *b.B
 			copy(clockAcct.Data, newClockBytes)
 			sealevel.SysvarCache.Clock.Sysvar = &clock
 			sealevel.SysvarCache.Clock.Acct = clockAcct
-
 			err = accts.SetAccountWithoutLock(sealevel.SysvarClockAddr, clockAcct)
 			if err != nil {
 				panic("unable to set clock sysvar to accts")
@@ -620,14 +694,30 @@ func loadBlockAccountsAndUpdateSysvars(accountsDb blockAccountSource, block *b.B
 
 		// update and cache SlotHashes sysvar
 		{
-			slotHashesAcct, err := loadSysvarAccount(accountsDb, block.Slot, sealevel.SysvarSlotHashesAddr, &metrics.GlobalBlockReplay.AccountLoader.SysvarSlotHashesRead)
-			if err != nil {
-				panic("unable to retrieve slothashes sysvar from acctsdb")
+			var slotHashesAcct *accounts.Account
+			var slotHashes sealevel.SysvarSlotHashes
+			var err error
+			if parentBankSysvars != nil {
+				var ok bool
+				slotHashesAcct, ok = parentBankSysvars.CloneAccount(sealevel.SysvarSlotHashesAddr)
+				if !ok {
+					panic("required SlotHashes sysvar is absent from parent bank snapshot")
+				}
+				parentSlotHashes, ok := parentBankSysvars.SlotHashes()
+				if !ok {
+					panic("decoded SlotHashes sysvar is absent from parent bank snapshot")
+				}
+				// Update mutates the slice; detach it while sharing every other
+				// decoded sysvar with the immutable parent snapshot.
+				slotHashes = append(sealevel.SysvarSlotHashes(nil), parentSlotHashes...)
+			} else {
+				slotHashesAcct, err = loadSysvarAccount(accountsDb, block.Slot, sealevel.SysvarSlotHashesAddr, &metrics.GlobalBlockReplay.AccountLoader.SysvarSlotHashesRead)
+				if err != nil {
+					panic("unable to retrieve slothashes sysvar from acctsdb")
+				}
 			}
 
-			var slotHashes sealevel.SysvarSlotHashes
-
-			if sealevel.SysvarCache.SlotHashes.Sysvar == nil {
+			if parentBankSysvars == nil && sealevel.SysvarCache.SlotHashes.Sysvar == nil {
 				// Fresh start (first slot): unmarshal from AccountsDB
 				decoder := bin.NewBinDecoder(slotHashesAcct.Data)
 				err = slotHashes.UnmarshalWithDecoder(decoder)
@@ -635,7 +725,7 @@ func loadBlockAccountsAndUpdateSysvars(accountsDb blockAccountSource, block *b.B
 					panic("unable to unmarshal slothashes sysvar")
 				}
 
-			} else {
+			} else if parentBankSysvars == nil {
 				// SysvarCache already populated (either from resume state file or from previous slot).
 				// The account data from AccountsDB may be stale (appendvec writes are not fsynced),
 				// so overwrite it with the authoritative data from SysvarCache.
@@ -649,19 +739,20 @@ func loadBlockAccountsAndUpdateSysvars(accountsDb blockAccountSource, block *b.B
 				copy(slotHashesAcct.Data, newData)
 			}
 
-			// Set parentAccts BEFORE updating slotHashes to ensure LtHash delta is computed correctly
-			err = parentAccts.SetAccountWithoutLock(sealevel.SysvarSlotHashesAddr, slotHashesAcct.Clone())
-			if err != nil {
-				panic("unable to set slothashes sysvar to accountsdb")
+			if parentBankSysvars == nil {
+				// Set parentAccts BEFORE updating slotHashes to ensure LtHash delta is computed correctly.
+				err = parentAccts.SetAccountWithoutLock(sealevel.SysvarSlotHashesAddr, slotHashesAcct.Clone())
+				if err != nil {
+					panic("unable to set slothashes sysvar to accountsdb")
+				}
 			}
 
 			// Now update with the new slot/bankhash
 			slotHashes.Update(block.Slot, block.ParentSlot, block.ParentBankhash)
 			newSlotHashesBytes := slotHashes.MustMarshal()
-			copy(slotHashesAcct.Data, newSlotHashesBytes)
+			slotHashesAcct.Data = newSlotHashesBytes
 			sealevel.SysvarCache.SlotHashes.Sysvar = &slotHashes
 			sealevel.SysvarCache.SlotHashes.Acct = slotHashesAcct
-
 			err = accts.SetAccountWithoutLock(sealevel.SysvarSlotHashesAddr, slotHashesAcct)
 			if err != nil {
 				panic("unable to set slothashes sysvar to accountsdb")
@@ -670,137 +761,161 @@ func loadBlockAccountsAndUpdateSysvars(accountsDb blockAccountSource, block *b.B
 
 		// cache RecentBlockhashes sysvar
 		{
-			recentBlockhashesAcct, err := loadSysvarAccount(accountsDb, block.Slot, sealevel.SysvarRecentBlockHashesAddr, &metrics.GlobalBlockReplay.AccountLoader.SysvarRecentBlockhashesRead)
-			if err != nil {
-				panic("unable to get recentblockhashes")
-			}
-
-			if sealevel.SysvarCache.RecentBlockHashes.Sysvar == nil {
-				// Fresh start (first slot): unmarshal from AccountsDB
-				decoder := bin.NewBinDecoder(recentBlockhashesAcct.Data)
-				var recentBlockhashes sealevel.SysvarRecentBlockhashes
-				recentBlockhashes.MustUnmarshalWithDecoder(decoder)
-				sealevel.SysvarCache.RecentBlockHashes.Sysvar = &recentBlockhashes
-				sealevel.SysvarCache.RecentBlockHashes.Acct = recentBlockhashesAcct
-
-				// Debug: log the blockhash range on first load
-				if len(recentBlockhashes) > 0 {
-					mlog.Log.Infof("loaded RecentBlockhashes sysvar: %d entries, newest=%x, oldest=%x",
-						len(recentBlockhashes), recentBlockhashes[0].Blockhash[:8], recentBlockhashes[len(recentBlockhashes)-1].Blockhash[:8])
+			if parentBankSysvars != nil {
+				if _, ok := parentBankSysvars.RecentBlockhashes(); !ok {
+					panic("required RecentBlockhashes sysvar is absent from parent bank snapshot")
 				}
 			} else {
-				// SysvarCache already populated (either from resume state file or from previous slot).
-				// The account data from AccountsDB may be stale (appendvec writes are not fsynced),
-				// so overwrite it with the authoritative data from SysvarCache.
-				// This ensures BPF programs reading the account data directly see correct values.
-				recentBlockhashes := sealevel.SysvarCache.RecentBlockHashes.Sysvar
-				newData := recentBlockhashes.MustMarshal()
-				if len(newData) != len(recentBlockhashesAcct.Data) {
-					panic(fmt.Sprintf("RecentBlockhashes data length mismatch: marshaled=%d, account=%d",
-						len(newData), len(recentBlockhashesAcct.Data)))
+				recentBlockhashesAcct, err := loadSysvarAccount(accountsDb, block.Slot, sealevel.SysvarRecentBlockHashesAddr, &metrics.GlobalBlockReplay.AccountLoader.SysvarRecentBlockhashesRead)
+				if err != nil {
+					panic("unable to get recentblockhashes")
 				}
-				copy(recentBlockhashesAcct.Data, newData)
-				sealevel.SysvarCache.RecentBlockHashes.Acct = recentBlockhashesAcct
-			}
 
-			// Set parentAccts AFTER potential data correction to ensure LtHash delta is computed correctly
-			err = parentAccts.SetAccountWithoutLock(sealevel.SysvarRecentBlockHashesAddr, recentBlockhashesAcct.Clone())
-			if err != nil {
-				panic("unable to set recentblockhashes sysvar to accts")
-			}
+				if sealevel.SysvarCache.RecentBlockHashes.Sysvar == nil {
+					// Fresh start (first slot): unmarshal from AccountsDB
+					decoder := bin.NewBinDecoder(recentBlockhashesAcct.Data)
+					var recentBlockhashes sealevel.SysvarRecentBlockhashes
+					recentBlockhashes.MustUnmarshalWithDecoder(decoder)
+					sealevel.SysvarCache.RecentBlockHashes.Sysvar = &recentBlockhashes
+					sealevel.SysvarCache.RecentBlockHashes.Acct = recentBlockhashesAcct
 
-			err = accts.SetAccountWithoutLock(sealevel.SysvarRecentBlockHashesAddr, recentBlockhashesAcct)
-			if err != nil {
-				panic("unable to set recentblockhashes sysvar to accts")
+					// Debug: log the blockhash range on first load
+					if len(recentBlockhashes) > 0 {
+						mlog.Log.Infof("loaded RecentBlockhashes sysvar: %d entries, newest=%x, oldest=%x",
+							len(recentBlockhashes), recentBlockhashes[0].Blockhash[:8], recentBlockhashes[len(recentBlockhashes)-1].Blockhash[:8])
+					}
+				} else {
+					// SysvarCache already populated (either from resume state file or from previous slot).
+					// The account data from AccountsDB may be stale (appendvec writes are not fsynced),
+					// so overwrite it with the authoritative data from SysvarCache.
+					// This ensures BPF programs reading the account data directly see correct values.
+					recentBlockhashes := sealevel.SysvarCache.RecentBlockHashes.Sysvar
+					newData := recentBlockhashes.MustMarshal()
+					if len(newData) != len(recentBlockhashesAcct.Data) {
+						panic(fmt.Sprintf("RecentBlockhashes data length mismatch: marshaled=%d, account=%d",
+							len(newData), len(recentBlockhashesAcct.Data)))
+					}
+					copy(recentBlockhashesAcct.Data, newData)
+					sealevel.SysvarCache.RecentBlockHashes.Acct = recentBlockhashesAcct
+				}
+
+				// Set parentAccts AFTER potential data correction to ensure LtHash delta is computed correctly
+				err = parentAccts.SetAccountWithoutLock(sealevel.SysvarRecentBlockHashesAddr, recentBlockhashesAcct.Clone())
+				if err != nil {
+					panic("unable to set recentblockhashes sysvar to accts")
+				}
+
+				err = accts.SetAccountWithoutLock(sealevel.SysvarRecentBlockHashesAddr, recentBlockhashesAcct)
+				if err != nil {
+					panic("unable to set recentblockhashes sysvar to accts")
+				}
 			}
 		}
 
 		// cache SlotHistory sysvar
 		{
-			slotHistoryAcct, err := loadSysvarAccount(accountsDb, block.Slot, sealevel.SysvarSlotHistoryAddr, &metrics.GlobalBlockReplay.AccountLoader.SysvarSlotHistoryRead)
-			if err != nil {
-				panic("unable to get slothistory")
-			}
+			if parentBankSysvars != nil {
+				if _, ok := parentBankSysvars.SlotHistory(); !ok {
+					panic("required SlotHistory sysvar is absent from parent bank snapshot")
+				}
+			} else {
+				slotHistoryAcct, err := loadSysvarAccount(accountsDb, block.Slot, sealevel.SysvarSlotHistoryAddr, &metrics.GlobalBlockReplay.AccountLoader.SysvarSlotHistoryRead)
+				if err != nil {
+					panic("unable to get slothistory")
+				}
 
-			err = parentAccts.SetAccountWithoutLock(sealevel.SysvarSlotHistoryAddr, slotHistoryAcct.Clone())
-			if err != nil {
-				panic("unable to set slothistory sysvar to accts")
-			}
+				err = parentAccts.SetAccountWithoutLock(sealevel.SysvarSlotHistoryAddr, slotHistoryAcct.Clone())
+				if err != nil {
+					panic("unable to set slothistory sysvar to accts")
+				}
 
-			decoder := bin.NewBinDecoder(slotHistoryAcct.Data)
-			var slotHistory sealevel.SysvarSlotHistory
-			slotHistory.MustUnmarshalWithDecoder(decoder)
-			sealevel.SysvarCache.SlotHistory.Sysvar = &slotHistory
-			sealevel.SysvarCache.SlotHistory.Acct = slotHistoryAcct
+				decoder := bin.NewBinDecoder(slotHistoryAcct.Data)
+				var slotHistory sealevel.SysvarSlotHistory
+				slotHistory.MustUnmarshalWithDecoder(decoder)
+				sealevel.SysvarCache.SlotHistory.Sysvar = &slotHistory
+				sealevel.SysvarCache.SlotHistory.Acct = slotHistoryAcct
 
-			err = accts.SetAccountWithoutLock(sealevel.SysvarSlotHistoryAddr, slotHistoryAcct)
-			if err != nil {
-				panic("unable to set clock sysvar to accts")
+				err = accts.SetAccountWithoutLock(sealevel.SysvarSlotHistoryAddr, slotHistoryAcct)
+				if err != nil {
+					panic("unable to set clock sysvar to accts")
+				}
 			}
 		}
 
 		// cache StakeHistory sysvar
 		{
-			stakeHistoryAcct, err := loadSysvarAccount(accountsDb, block.Slot, sealevel.SysvarStakeHistoryAddr, &metrics.GlobalBlockReplay.AccountLoader.SysvarStakeHistoryRead)
-			if err != nil {
-				panic("unable to get stakehistory")
-			}
+			if parentBankSysvars != nil {
+				if _, ok := parentBankSysvars.StakeHistory(); !ok {
+					panic("required StakeHistory sysvar is absent from parent bank snapshot")
+				}
+			} else {
+				stakeHistoryAcct, err := loadSysvarAccount(accountsDb, block.Slot, sealevel.SysvarStakeHistoryAddr, &metrics.GlobalBlockReplay.AccountLoader.SysvarStakeHistoryRead)
+				if err != nil {
+					panic("unable to get stakehistory")
+				}
 
-			var setStakeHistoryParent bool
-			if len(block.EpochUpdatedAccts) != 0 {
-				for _, a := range block.ParentEpochUpdatedAccts {
-					if a != nil {
-						if a.Key == sealevel.SysvarStakeHistoryAddr {
-							err = parentAccts.SetAccountWithoutLock(sealevel.SysvarStakeHistoryAddr, a.Clone())
-							if err != nil {
-								panic("unable to set stakehistory sysvar to accts")
+				var setStakeHistoryParent bool
+				if len(block.EpochUpdatedAccts) != 0 {
+					for _, a := range block.ParentEpochUpdatedAccts {
+						if a != nil {
+							if a.Key == sealevel.SysvarStakeHistoryAddr {
+								err = parentAccts.SetAccountWithoutLock(sealevel.SysvarStakeHistoryAddr, a.Clone())
+								if err != nil {
+									panic("unable to set stakehistory sysvar to accts")
+								}
+								setStakeHistoryParent = true
 							}
-							setStakeHistoryParent = true
 						}
 					}
 				}
-			}
 
-			if !setStakeHistoryParent {
-				err = parentAccts.SetAccountWithoutLock(sealevel.SysvarStakeHistoryAddr, stakeHistoryAcct.Clone())
+				if !setStakeHistoryParent {
+					err = parentAccts.SetAccountWithoutLock(sealevel.SysvarStakeHistoryAddr, stakeHistoryAcct.Clone())
+					if err != nil {
+						panic("unable to set stakehistory sysvar to accts")
+					}
+				}
+
+				decoder := bin.NewBinDecoder(stakeHistoryAcct.Data)
+				var stakeHistory sealevel.SysvarStakeHistory
+				stakeHistory.MustUnmarshalWithDecoder(decoder)
+				sealevel.SysvarCache.StakeHistory.Sysvar = &stakeHistory
+				sealevel.SysvarCache.StakeHistory.Acct = stakeHistoryAcct
+
+				err = accts.SetAccountWithoutLock(sealevel.SysvarStakeHistoryAddr, stakeHistoryAcct)
 				if err != nil {
 					panic("unable to set stakehistory sysvar to accts")
 				}
-			}
-
-			decoder := bin.NewBinDecoder(stakeHistoryAcct.Data)
-			var stakeHistory sealevel.SysvarStakeHistory
-			stakeHistory.MustUnmarshalWithDecoder(decoder)
-			sealevel.SysvarCache.StakeHistory.Sysvar = &stakeHistory
-			sealevel.SysvarCache.StakeHistory.Acct = stakeHistoryAcct
-
-			err = accts.SetAccountWithoutLock(sealevel.SysvarStakeHistoryAddr, stakeHistoryAcct)
-			if err != nil {
-				panic("unable to set stakehistory sysvar to accts")
 			}
 		}
 
 		// cache LastRestartSlot sysvar
 		{
-			lastRestartSlotAcct, err := loadSysvarAccount(accountsDb, block.Slot, sealevel.SysvarLastRestartSlotAddr, &metrics.GlobalBlockReplay.AccountLoader.SysvarLastRestartSlotRead)
-			if err != nil {
-				panic("unable to get last restart slot sysvar acct")
-			}
+			if parentBankSysvars != nil {
+				if _, ok := parentBankSysvars.LastRestartSlot(); !ok {
+					panic("required LastRestartSlot sysvar is absent from parent bank snapshot")
+				}
+			} else {
+				lastRestartSlotAcct, err := loadSysvarAccount(accountsDb, block.Slot, sealevel.SysvarLastRestartSlotAddr, &metrics.GlobalBlockReplay.AccountLoader.SysvarLastRestartSlotRead)
+				if err != nil {
+					panic("unable to get last restart slot sysvar acct")
+				}
 
-			err = parentAccts.SetAccountWithoutLock(sealevel.SysvarLastRestartSlotAddr, lastRestartSlotAcct.Clone())
-			if err != nil {
-				panic("unable to set last restart slot sysvar to accts")
-			}
+				err = parentAccts.SetAccountWithoutLock(sealevel.SysvarLastRestartSlotAddr, lastRestartSlotAcct.Clone())
+				if err != nil {
+					panic("unable to set last restart slot sysvar to accts")
+				}
 
-			decoder := bin.NewBinDecoder(lastRestartSlotAcct.Data)
-			var lastRestartSlot sealevel.SysvarLastRestartSlot
-			lastRestartSlot.MustUnmarshalWithDecoder(decoder)
-			sealevel.SysvarCache.LastRestartSlot.Sysvar = &lastRestartSlot
-			sealevel.SysvarCache.LastRestartSlot.Acct = lastRestartSlotAcct
+				decoder := bin.NewBinDecoder(lastRestartSlotAcct.Data)
+				var lastRestartSlot sealevel.SysvarLastRestartSlot
+				lastRestartSlot.MustUnmarshalWithDecoder(decoder)
+				sealevel.SysvarCache.LastRestartSlot.Sysvar = &lastRestartSlot
+				sealevel.SysvarCache.LastRestartSlot.Acct = lastRestartSlotAcct
 
-			err = accts.SetAccountWithoutLock(sealevel.SysvarLastRestartSlotAddr, lastRestartSlotAcct)
-			if err != nil {
-				panic("unable to set last restart slot sysvar to accts")
+				err = accts.SetAccountWithoutLock(sealevel.SysvarLastRestartSlotAddr, lastRestartSlotAcct)
+				if err != nil {
+					panic("unable to set last restart slot sysvar to accts")
+				}
 			}
 		}
 	}
@@ -822,8 +937,82 @@ func loadBlockAccountsAndUpdateSysvars(accountsDb blockAccountSource, block *b.B
 		}
 	}
 
+	// The process-global cache is retained only as the ordered replay bootstrap
+	// source.  Freeze a complete immutable bank-owned snapshot after applying
+	// every epoch-boundary override; transaction execution never reads the
+	// singleton once this snapshot is published to SlotCtx.
+	loadCurrentSysvar := func(key solana.PublicKey) (*accounts.Account, bool, error) {
+		accountKey := [32]byte(key)
+		acct, getErr := accts.GetAccount(&accountKey)
+		if getErr != nil || acct == nil {
+			return nil, false, nil
+		}
+		return acct, true, nil
+	}
+	if parentBankSysvars == nil {
+		// The first bank after bootstrap/resume converts the legacy ordered-replay
+		// cache once. Every subsequent bank derives from its immutable parent.
+		bankSysvars, err = sealevel.SnapshotLegacySysvarCache(block.Slot, loadCurrentSysvar)
+		if err != nil {
+			return nil, nil, 0, nil, fmt.Errorf("snapshot replay sysvars: %w", err)
+		}
+		var currentSysvars []*accounts.Account
+		if err := bankSysvars.RangeAccountViews(func(key solana.PublicKey, _ *accounts.Account) error {
+			if acct, found, _ := loadCurrentSysvar(key); found {
+				currentSysvars = append(currentSysvars, acct)
+			}
+			return nil
+		}); err != nil {
+			return nil, nil, 0, nil, fmt.Errorf("enumerate replay sysvars: %w", err)
+		}
+		bankSysvars, err = bankSysvars.WithAccounts(currentSysvars...)
+		if err != nil {
+			return nil, nil, 0, nil, fmt.Errorf("apply current replay sysvars: %w", err)
+		}
+	} else {
+		// Clock and SlotHashes change at bank start. Epoch/reward/feature staging
+		// contributes any other changed sysvar accounts explicitly. Everything
+		// else is immutable and shared with the parent snapshot without another
+		// clone or decode.
+		updates := make([]*accounts.Account, 0, 2+len(block.EpochUpdatedAccts))
+		updateIndex := make(map[solana.PublicKey]int, cap(updates))
+		addCurrent := func(key solana.PublicKey) error {
+			acct, found, loadErr := loadCurrentSysvar(key)
+			if loadErr != nil {
+				return loadErr
+			}
+			if !found {
+				return fmt.Errorf("updated bank sysvar %s is missing from slot accounts", key)
+			}
+			if idx, exists := updateIndex[key]; exists {
+				updates[idx] = acct
+				return nil
+			}
+			updateIndex[key] = len(updates)
+			updates = append(updates, acct)
+			return nil
+		}
+		if err := addCurrent(sealevel.SysvarClockAddr); err != nil {
+			return nil, nil, 0, nil, err
+		}
+		if err := addCurrent(sealevel.SysvarSlotHashesAddr); err != nil {
+			return nil, nil, 0, nil, err
+		}
+		for _, acct := range block.EpochUpdatedAccts {
+			if acct != nil && sealevel.IsBankSysvarAccount(acct.Key) {
+				if err := addCurrent(acct.Key); err != nil {
+					return nil, nil, 0, nil, err
+				}
+			}
+		}
+		bankSysvars, err = parentBankSysvars.Derive(block.Slot, updates...)
+		if err != nil {
+			return nil, nil, 0, nil, fmt.Errorf("derive replay bank sysvars: %w", err)
+		}
+	}
+
 	metrics.GlobalBlockReplay.AccountLoader.SysvarUpdates.AddTimingSince(phaseStart)
-	return accts, parentAccts, publicationCapacity, nil
+	return accts, parentAccts, publicationCapacity, bankSysvars, nil
 }
 
 func recordAccountLoaderBatchStats(dst *metrics.AccountLoader, src accountsdb.BatchReadStats) {
@@ -1357,6 +1546,36 @@ func buildInitialEpochStakesCache(mithrilState *state.MithrilState, currentEpoch
 	return nil
 }
 
+// LoadInitialEpochStakesCache is the single startup policy for choosing
+// manifest versus persisted post-boundary epoch stakes. It is exported so the
+// node can establish the exact replay stake view before advertising Votor.
+func LoadInitialEpochStakesCache(mithrilState *state.MithrilState, resumeState *ResumeState, startEpoch, snapshotEpoch uint64) error {
+	if resumeState != nil {
+		epochsCrossed := startEpoch > snapshotEpoch
+		if epochsCrossed && len(resumeState.ComputedEpochStakes) == 0 {
+			return fmt.Errorf("resume at epoch %d (snapshot epoch %d) but no persisted epoch stakes found - cannot use stale manifest stakes (need fresh snapshot)", startEpoch, snapshotEpoch)
+		}
+		if len(resumeState.ComputedEpochStakes) > 0 {
+			// Once replay has crossed a boundary, only its persisted effective
+			// stakes are authoritative; never fall back to the snapshot manifest.
+			for epoch, data := range resumeState.ComputedEpochStakes {
+				loadedEpoch, err := global.DeserializeAndLoadEpochStakes(data)
+				if err != nil {
+					return fmt.Errorf("failed to load persisted epoch %d stakes: %w", epoch, err)
+				}
+				mlog.Log.Debugf("loaded persisted epoch stakes for epoch %d from state file", loadedEpoch)
+			}
+			if !global.HasEpochStakes(startEpoch) {
+				return fmt.Errorf("missing required epoch stakes for current epoch %d - cannot resume (need fresh snapshot)", startEpoch)
+			}
+			return nil
+		}
+		// Same-epoch resume with no computed boundary state safely uses the
+		// original manifest stake cache.
+	}
+	return buildInitialEpochStakesCache(mithrilState, startEpoch, snapshotEpoch)
+}
+
 type persistedTracker struct {
 	mu       sync.Mutex
 	slot     uint64
@@ -1378,6 +1597,38 @@ func (t *persistedTracker) Get() (uint64, []byte) {
 	copy(out, t.bankhash)
 	t.mu.Unlock()
 	return slot, out
+}
+
+// settleInFlightFoldAtCapacity turns the async fold worker into bounded
+// backpressure only when the speculative tail crosses its hard cap. A fold
+// already in flight was admitted through every finality/verification gate, so
+// waiting for and applying it is safe. We deliberately do not enqueue work
+// here: no in-flight fold at capacity means the normal loop could not admit
+// one (or its previous fold failed), which remains a fail-closed halt.
+// It returns whether the tail is still over capacity after settlement.
+func settleInFlightFoldAtCapacity(
+	tail *unrootedTail,
+	promoter *asyncPromoter,
+	tipSlot uint64,
+	applyFoldOutcome func(*foldResult),
+) bool {
+	if tail == nil || !tail.OverCap() {
+		return false
+	}
+	// ProcessBlock publishes its delta before the replay loop constructs the
+	// resume context. Never let draining an older chunk mask a mid-slot ordering
+	// bug by dropping HeldSlots below the cap while the current tip is still
+	// unrecoverable.
+	if tail.contexts[tipSlot] == nil {
+		return true
+	}
+	if promoter != nil && promoter.inFlight {
+		res := promoter.drain()
+		if applyFoldOutcome != nil {
+			applyFoldOutcome(res)
+		}
+	}
+	return tail.OverCap()
 }
 
 func ReplayBlocks(
@@ -1428,6 +1679,7 @@ func ReplayBlocks(
 	}
 	// Fresh vote/stake dirty watermark for this run (gates the in-loop unwind).
 	resetVoteStakeDirty()
+	nextLeader := newNextLeaderCursor(identityFromTurbineKey(turbineIdentity))
 	// Create bankhash log file
 	bankhashLogPath := fmt.Sprintf("%s/bankhash.log", acctsDbPath)
 	bankhashLogFile, bankhashLogErr := os.OpenFile(bankhashLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -1472,6 +1724,11 @@ func ReplayBlocks(
 	startEpoch := epochSchedule.GetEpoch(startSlot)
 	currentEpoch := initialReplayEpoch(epochSchedule, startSlot, mithrilState.ManifestParentSlot, resumeState)
 	var lastSlotCtx *sealevel.SlotCtx
+	// Set only by a successful in-loop fork unwind. The next executable bank
+	// must derive from this exact surviving parent snapshot, not the legacy
+	// process-global cache left by the discarded suffix. Skipped slots leave it
+	// untouched until that bank arrives.
+	var unwoundParentBankSysvars *sealevel.BankSysvars
 	var partitionedEpochRewardsEnabled bool
 	var partitionedRewardsInfo *rewards.PartitionedRewardDistributionInfo
 	var featuresActivatedInFirstSlot []*accounts.Account
@@ -1525,6 +1782,10 @@ func ReplayBlocks(
 	isFirstSlotInEpoch := epochSchedule.FirstSlotInEpoch(startEpoch) == startSlot
 	replayCtx.CurrentFeatures, featuresActivatedInFirstSlot, parentFeaturesActivatedInFirstSlot = scanAndEnableFeatures(acctsDb, replayCtx, startSlot, isFirstSlotInEpoch)
 	if alpenglowMode {
+		if err := validateAlpenglowRuntimeFeatureSet(replayCtx.CurrentFeatures, startSlot); err != nil {
+			result.Error = err
+			return result
+		}
 		applyAlpenglowRuntimeFeatureOverrides(replayCtx.CurrentFeatures, startSlot)
 	}
 	var initialLtHash *lthash.LtHash
@@ -1559,50 +1820,13 @@ func ReplayBlocks(
 	InitChainTip(initialLtHash, replayCtx.CurrentFeatures, initialNumSignatures, initialLastBlockhash, transactionStatuses.View())
 	partitionedEpochRewardsEnabled = replayCtx.CurrentFeatures.IsActive(features.EnablePartitionedEpochReward) || replayCtx.CurrentFeatures.IsActive(features.EnablePartitionedEpochRewardsSuperfeature)
 
-	// Load epoch stakes - persisted stakes on resume, state file on fresh start
+	// Load epoch stakes - persisted stakes on resume, state file on fresh start.
+	// Node startup invokes the same helper before opening Votor so this second
+	// call is an idempotent replay-side safety check, not a separate policy.
 	snapshotEpoch := epochSchedule.GetEpoch(mithrilState.ManifestParentSlot)
-	if resumeState != nil {
-		// Resume case - check if we've crossed epoch boundaries since snapshot
-		epochsCrossed := startEpoch > snapshotEpoch
-		if epochsCrossed && len(resumeState.ComputedEpochStakes) == 0 {
-			// Crossed epoch boundary but no persisted stakes - data loss (crash before persist)
-			mlog.Log.Errorf("Resume at epoch %d (snapshot epoch %d) but no persisted epoch stakes found - cannot use stale manifest stakes (need fresh snapshot)", startEpoch, snapshotEpoch)
-			result.Error = fmt.Errorf("resume at epoch %d (snapshot epoch %d) but no persisted epoch stakes found - cannot use stale manifest stakes (need fresh snapshot)", startEpoch, snapshotEpoch)
-			return result
-		}
-		if len(resumeState.ComputedEpochStakes) > 0 {
-			// Load ONLY persisted epoch stakes from state file (NO manifest fallback)
-			// This ensures we use the exact stakes computed at prior epoch boundaries
-			for epoch, data := range resumeState.ComputedEpochStakes {
-				if loadedEpoch, err := global.DeserializeAndLoadEpochStakes(data); err != nil {
-					mlog.Log.Errorf("Failed to load persisted epoch %d stakes: %v", epoch, err)
-					result.Error = fmt.Errorf("failed to load persisted epoch %d stakes: %w", epoch, err)
-					return result
-				} else {
-					mlog.Log.Debugf("Loaded persisted epoch stakes for epoch %d from state file", loadedEpoch)
-				}
-			}
-			// Validate current epoch stakes exist (we build schedules for block.Epoch)
-			// Note: Don't validate leaderScheduleEpoch here - it can point to E+1 in second
-			// half of epoch E with non-standard slot offsets, causing false failures
-			if !global.HasEpochStakes(startEpoch) {
-				mlog.Log.Errorf("Missing required epoch stakes for current epoch %d - cannot resume (need fresh snapshot)", startEpoch)
-				result.Error = fmt.Errorf("missing required epoch stakes for current epoch %d - cannot resume (need fresh snapshot)", startEpoch)
-				return result
-			}
-		} else {
-			// Resume in same epoch as snapshot, no boundaries crossed - state file epoch stakes still valid
-			if err := buildInitialEpochStakesCache(mithrilState, startEpoch, snapshotEpoch); err != nil {
-				result.Error = err
-				return result
-			}
-		}
-	} else {
-		// Fresh start: load all epochs from state file
-		if err := buildInitialEpochStakesCache(mithrilState, startEpoch, snapshotEpoch); err != nil {
-			result.Error = err
-			return result
-		}
+	if err := LoadInitialEpochStakesCache(mithrilState, resumeState, startEpoch, snapshotEpoch); err != nil {
+		result.Error = err
+		return result
 	}
 
 	// Shreds before blocks: turbine shred signature verification needs every
@@ -1652,7 +1876,7 @@ func ReplayBlocks(
 		if lookupSink, ok := consensusEngine.(consensusengine.AlpenglowEpochLookupSink); ok {
 			lookupSink.SetAlpenglowEpochLookup(epochSchedule.GetEpoch)
 		}
-		installCachedAlpenglowValidatorSets(consensusEngine, startEpoch)
+		_, _ = InstallCachedAlpenglowValidatorSets(consensusEngine, startEpoch)
 	}
 
 	// 100-slot summary window collectors ("full" = reconstructable-from-shreds,
@@ -1697,7 +1921,7 @@ func ReplayBlocks(
 	var gateStats alpenglowGateStats
 	// Persisted gate evidence: a previously-disputed slot promotes only on an exact
 	// executed match after restart — never under delegated trust.
-	alpenglowForced := make(map[uint64]solana.Hash)
+	alpenglowForced := make(map[uint64]alpenglowFinalityExpectation)
 	for _, ev := range mithrilState.AlpenglowEvidence {
 		if !alpenglowMode {
 			break
@@ -1705,13 +1929,24 @@ func ReplayBlocks(
 		if ev.Slot <= mithrilState.LastRootedSlot {
 			continue
 		}
-		var want solana.Hash
-		if !ev.Conflict {
+		want := alpenglowFinalityExpectation{Skip: ev.Skip, Conflict: ev.Conflict}
+		if !want.Conflict {
 			raw, err := hex.DecodeString(ev.Finalized)
 			if err != nil || len(raw) != 32 {
 				mlog.Log.Warnf("alpenglow evidence for slot %d has a malformed finalized id; treating as conflict", ev.Slot)
+				want.Conflict = true
+				want.Skip = false
 			} else {
-				copy(want[:], raw)
+				copy(want.Block[:], raw)
+				// Legacy evidence had no explicit skip bit. A zero finalized
+				// identity with Conflict=false can only mean a finalized skip.
+				if want.Block.IsZero() {
+					want.Skip = true
+				} else if want.Skip {
+					mlog.Log.Warnf("alpenglow evidence for slot %d marks a skip with a nonzero finalized id; treating as conflict", ev.Slot)
+					want.Conflict = true
+					want.Skip = false
+				}
 			}
 		}
 		alpenglowForced[ev.Slot] = want
@@ -2091,6 +2326,11 @@ func ReplayBlocks(
 		opts.LocalBlocks = blockFetchOpts.LocalBlocks
 		opts.GossipClient = blockFetchOpts.GossipClient
 		opts.PrewarmBlocks = append(opts.PrewarmBlocks, blockFetchOpts.PrewarmBlocks...)
+		opts.TurbineStakesForSlot = blockFetchOpts.TurbineStakesForSlot
+		opts.TurbineEpochForSlot = blockFetchOpts.TurbineEpochForSlot
+		opts.TurbineRootSlot = blockFetchOpts.TurbineRootSlot
+		opts.TurbineUseChaCha8 = blockFetchOpts.TurbineUseChaCha8
+		opts.TurbineDedupAddrs = blockFetchOpts.TurbineDedupAddrs
 
 		// Mode thresholds
 		opts.NearTipThreshold = blockFetchOpts.NearTipThreshold
@@ -2178,7 +2418,7 @@ func ReplayBlocks(
 			mlog.Log.Warnf("%v — block source rejected the fork rewind", sw)
 			return false
 		}
-		rs, fallbackReason := tryInLoopUnwind(sw, unrootedTailState, mithrilState, epochSchedule, currentEpoch, partitionedRewardsInfo)
+		rs, parentBankSysvars, fallbackReason := tryInLoopUnwind(sw, unrootedTailState, mithrilState, epochSchedule, currentEpoch, partitionedRewardsInfo)
 		if rs == nil {
 			windowSwitchFallback++
 			switchFallbackReasons[fallbackReason]++
@@ -2202,6 +2442,7 @@ func ReplayBlocks(
 		global.DeleteAlpenglowBlockIDsFrom(sw.Slot)
 		global.DeleteAlpenglowChainedRootsFrom(sw.Slot)
 		resumeState = rs
+		unwoundParentBankSysvars = parentBankSysvars
 		lastSlotCtx = nil // next block configures from the rebuilt resume context
 		replayCtx.Capitalization = rs.Capitalization
 		global.SetBlockHeight(rs.ParentBlockHeight)
@@ -2385,6 +2626,27 @@ func ReplayBlocks(
 				}
 			}
 
+			// A complete Turbine candidate may carry an invalid reward certificate
+			// and be skipped by the cluster. Reject it before ObserveBlock/voting
+			// or any bank changes, while the selected parent is still untouched.
+			if alpenglowMode && !block.IsSkipped {
+				if validationErr := validatePreConsensusRewardCertificates(block, epochSchedule, block.AlpenglowShredVersion); validationErr != nil {
+					if !IsInvalidRewardCertificateError(validationErr) {
+						result.Error = fmt.Errorf("pre-consensus reward validation failed at slot %d: %w", block.Slot, validationErr)
+						mlog.Log.Errorf("%v", result.Error)
+						break
+					}
+					if quarantineErr := blockStream.QuarantineInvalidAlpenglowBlock(block); quarantineErr != nil {
+						result.Error = fmt.Errorf("pre-consensus reward validation failed at slot %d and the source could not quarantine it (%v): %w",
+							block.Slot, quarantineErr, validationErr)
+						mlog.Log.Errorf("%v", result.Error)
+						break
+					}
+					mlog.Log.Warnf("replay: %v; exact Alpenglow candidate quarantined before ObserveBlock/voting", validationErr)
+					continue
+				}
+			}
+
 			// Alpenglow: feed the observed block to the consensus engine. This is a
 			// consensus boundary, not telemetry: a latched pool/tracker fault stops
 			// replay before execution or durable promotion can continue.
@@ -2488,7 +2750,7 @@ func ReplayBlocks(
 			// arrivals (leader sent something but the slot never became full).
 			// Full detail (wait) stays in logs.
 			partialShreds, repairedShreds, _, _ := blockStream.TurbineShredObservation(block.Slot)
-			mlog.Log.InfofPrecise("%s", buildSkippedStatsLine(block.Slot, leaderStr, partialShreds, repairedShreds))
+			mlog.Log.InfofPrecise("%s", appendNextLeaderHint(buildSkippedStatsLine(block.Slot, leaderStr, partialShreds, repairedShreds), nextLeader.hint(block.Slot)))
 			if partialShreds > 0 {
 				windowSkippedWithShreds++
 			}
@@ -2675,7 +2937,7 @@ func ReplayBlocks(
 
 		// post-epoch boundary rewards distribution
 		if partitionedEpochRewardsEnabled && partitionedRewardsInfo != nil && currentSlot >= partitionedRewardsInfo.FirstStakingRewardSlot && partitionedRewardsInfo.NumRewardPartitionsRemaining > 0 {
-			distributedAccts, parentDistributedAccts := distributePartitionedEpochRewardsForSlot(acctsDb, lastSlotCtx, replayCtx, partitionedRewardsInfo, currentSlot, block.BlockHeight)
+			distributedAccts, parentDistributedAccts := distributePartitionedEpochRewardsForSlot(acctsDb, lastSlotCtx, block.EpochUpdatedAccts, replayCtx, partitionedRewardsInfo, currentSlot, block.BlockHeight)
 			block.EpochUpdatedAccts = append(block.EpochUpdatedAccts, distributedAccts...)
 			block.ParentEpochUpdatedAccts = append(block.ParentEpochUpdatedAccts, parentDistributedAccts...)
 		}
@@ -2687,7 +2949,15 @@ func ReplayBlocks(
 		processBlockStart := time.Now()
 		metrics.GlobalBlockReplay.PreprocessBlock.AddTiming(processBlockStart.Sub(start))
 		alpenglowClock := alpenglowMode
-		lastSlotCtx, err = ProcessBlock(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, unrootedTailState, transactionStatuses, alpenglowClock)
+		parentBankSysvars := unwoundParentBankSysvars
+		if lastSlotCtx != nil {
+			parentBankSysvars = lastSlotCtx.BankSysvars()
+		}
+		if block.FromLocalProduction {
+			lastSlotCtx, err = adoptLocalLeaderBlock(block, unrootedTailState, transactionStatuses, persistedHashes)
+		} else {
+			lastSlotCtx, err = ProcessBlock(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, unrootedTailState, transactionStatuses, alpenglowClock, parentBankSysvars)
+		}
 		processBlockEnd := time.Now()
 		metrics.GlobalBlockReplay.ProcessBlock.AddTiming(processBlockEnd.Sub(processBlockStart))
 		if err != nil {
@@ -2697,6 +2967,9 @@ func ReplayBlocks(
 			global.ClearPendingStakePubkeys()
 			break
 		}
+		// The successful child now owns its derived snapshot. Any later bank uses
+		// lastSlotCtx; the one-shot retained unwind bridge is no longer needed.
+		unwoundParentBankSysvars = nil
 		postProcessBlockStart := processBlockEnd
 		statusViewStart := time.Now()
 		statuses := transactionStatuses.View()
@@ -2712,9 +2985,9 @@ func ReplayBlocks(
 			}
 		}
 		if unrootedTailState != nil {
-			UpdateChainTipFromSlotCtx(lastSlotCtx, block.Features, statuses, identity, unrootedTailState)
+			UpdateChainTipFromSlotCtxWithBankMetadata(lastSlotCtx, block.Features, statuses, identity, ChainTipBankMetadata{BlockHeight: block.BlockHeight}, unrootedTailState)
 		} else {
-			UpdateChainTipFromSlotCtx(lastSlotCtx, block.Features, statuses, identity)
+			UpdateChainTipFromSlotCtxWithBankMetadata(lastSlotCtx, block.Features, statuses, identity, ChainTipBankMetadata{BlockHeight: block.BlockHeight})
 		}
 		if alpenglowMode && block.HasAlpenglowBlockID {
 			global.SetAlpenglowBlockID(block.Slot, solana.Hash(block.AlpenglowBlockID))
@@ -2724,27 +2997,6 @@ func ReplayBlocks(
 		}
 		metrics.GlobalBlockReplay.ChainTipUpdate.AddTimingSince(chainTipStart)
 
-		// Rooted-durable backpressure: if the unrooted tail grew past its cap (rooting
-		// stalled), halt rather than grow RAM unbounded; resume re-replays from the last rooted slot.
-		if unrootedTailState != nil && unrootedTailState.OverCap() {
-			// Diagnose WHY rooting stalled: folds gate on min(finality,
-			// verified). If finality ran ahead but the verifier watermark
-			// lags, the trailing verifier (RPC-served execution metas) is
-			// the bottleneck — common on clusters with giant blocks the RPC
-			// serializes slowly.
-			verifiedWM := uint64(0)
-			if trailingVerifier != nil {
-				verifiedWM = trailingVerifier.VerifiedWatermark()
-			}
-			diag := fmt.Sprintf("durable=%d finality=%d verified=%d replay=%d", mithrilState.LastRootedSlot, lastRootedWatermark, verifiedWM, block.Slot)
-			hint := ""
-			if trailingVerifier != nil && TrailingVerifierCfg.Required && lastRootedWatermark > verifiedWM+uint64(FoldBatchSlots) {
-				hint = " — the trailing verifier cannot keep pace with replay (finality is ahead; the verifier fetches every block's execution metas via RPC, which is slow for very large blocks). Options: verifier.required=false to gate folds on certificate finality only, a faster/archival RPC for the verifier, or wait for peer bankhash cross-checking to replace the RPC oracle"
-			}
-			result.Error = fmt.Errorf("rooted-durable: speculative state exceeded %d held slots at slot %d; rooting stalled (%s)%s; halting", unrootedTailHaltCap, block.Slot, diag, hint)
-			mlog.Log.Errorf("%v", result.Error)
-			break
-		}
 		global.SetBlockHeight(block.BlockHeight)
 		if trailingVerifier != nil {
 			trailingVerifier.Record(buildSlotDigest(block))
@@ -2786,6 +3038,16 @@ func ReplayBlocks(
 		if unrootedTailState != nil && lastSlotCtx != nil {
 			resumeContextStart := time.Now()
 			txCountAtSlot := global.TransactionCount() // ProcessBlock already added this block's txs
+			var recentBlockhashes *sealevel.SysvarRecentBlockhashes
+			var slotHashes *sealevel.SysvarSlotHashes
+			if bankSysvars := lastSlotCtx.BankSysvars(); bankSysvars != nil {
+				if recent, ok := bankSysvars.RecentBlockhashes(); ok {
+					recentBlockhashes = &recent
+				}
+				if hashes, ok := bankSysvars.SlotHashes(); ok {
+					slotHashes = &hashes
+				}
+			}
 			resumeCtx := &state.ResumeContext{
 				Slot:                    block.Slot,
 				Bankhash:                base58.Encode(lastSlotCtx.FinalBankhash),
@@ -2794,8 +3056,8 @@ func ReplayBlocks(
 				NumSignatures:           lastSlotCtx.NumSignatures,
 				EvictedBlockhash:        base58.Encode(lastSlotCtx.LatestEvictedBlockhash[:]),
 				Blockhash:               base58.Encode(lastSlotCtx.Blockhash[:]),
-				RecentBlockhashes:       EncodeRecentBlockhashes(sealevel.SysvarCache.RecentBlockHashes.Sysvar),
-				SlotHashes:              EncodeSlotHashes(sealevel.SysvarCache.SlotHashes.Sysvar),
+				RecentBlockhashes:       EncodeRecentBlockhashes(recentBlockhashes),
+				SlotHashes:              EncodeSlotHashes(slotHashes),
 				Capitalization:          replayCtx.Capitalization,
 				SlotsPerYear:            replayCtx.SlotsPerYear,
 				InflationInitial:        replayCtx.Inflation.Initial,
@@ -2814,16 +3076,18 @@ func ReplayBlocks(
 			if lastSlotCtx.AcctsLtHash != nil {
 				resumeCtx.AcctsLtHash = base64.StdEncoding.EncodeToString(lastSlotCtx.AcctsLtHash.Hash())
 			}
-			// Capture the Clock sysvar as of the last rooted slot: read from durable (not SysvarCache)
-			// during load, so resume must restore it or the first slot's LtHash diverges.
-			if sealevel.SysvarCache.Clock.Acct != nil {
-				resumeCtx.Clock = base64.StdEncoding.EncodeToString(sealevel.SysvarCache.Clock.Acct.Data)
+			// Persist the Clock from the completed bank snapshot, never from a
+			// process-global cache that may already be constructing another bank.
+			if bankSysvars := lastSlotCtx.BankSysvars(); bankSysvars != nil {
+				if raw, ok := bankSysvars.RawView(sealevel.SysvarClockAddr); ok {
+					resumeCtx.Clock = base64.StdEncoding.EncodeToString(raw)
+				}
 			}
 			if lastSlotCtx.FeeRateGovernor != nil {
 				resumeCtx.LamportsPerSignature = lastSlotCtx.FeeRateGovernor.LamportsPerSignature
 				resumeCtx.PrevLamportsPerSig = lastSlotCtx.FeeRateGovernor.PrevLamportsPerSignature
 			}
-			unrootedTailState.SetContext(block.Slot, resumeCtx)
+			unrootedTailState.SetContext(block.Slot, resumeCtx, lastSlotCtx.BankSysvars())
 			metrics.GlobalBlockReplay.ResumeContext.AddTimingSince(resumeContextStart)
 		}
 
@@ -2855,10 +3119,18 @@ func ReplayBlocks(
 					result.LastPrevLamportsPerSig = lastSlotCtx.FeeRateGovernor.PrevLamportsPerSignature
 				}
 				result.LastNumSignatures = lastSlotCtx.NumSignatures
-				result.LastRecentBlockhashes = sealevel.SysvarCache.RecentBlockHashes.Sysvar
+				if bankSysvars := lastSlotCtx.BankSysvars(); bankSysvars != nil {
+					if recent, ok := bankSysvars.RecentBlockhashes(); ok {
+						copyRecent := append(sealevel.SysvarRecentBlockhashes(nil), recent...)
+						result.LastRecentBlockhashes = &copyRecent
+					}
+					if slotHashes, ok := bankSysvars.SlotHashes(); ok {
+						copySlotHashes := append(sealevel.SysvarSlotHashes(nil), slotHashes...)
+						result.LastSlotHashes = &copySlotHashes
+					}
+				}
 				result.LastEvictedBlockhash = lastSlotCtx.LatestEvictedBlockhash
 				result.LastBlockhash = lastSlotCtx.Blockhash
-				result.LastSlotHashes = sealevel.SysvarCache.SlotHashes.Sysvar
 			}
 
 			// Capture ReplayCtx fields for resume independence from stale manifest
@@ -2879,6 +3151,38 @@ func ReplayBlocks(
 			}
 
 			break
+		}
+
+		// Rooted-durable backpressure runs only after this slot is complete and its
+		// resume context is attached. If the async writer is merely slower than
+		// replay, wait for its already-admitted fold and apply it before deciding
+		// the tail is truly stalled. No new fold is admitted here: a still-full
+		// tail remains a fail-closed error.
+		if unrootedTailState != nil && unrootedTailState.OverCap() {
+			hadInFlightFold := promoter != nil && promoter.inFlight
+			stillOverCap := settleInFlightFoldAtCapacity(unrootedTailState, promoter, block.Slot, applyFoldOutcome)
+			if stillOverCap {
+				// Diagnose WHY rooting stalled. Validator mode verifies the footer
+				// bank hash inline and has no trailing-verifier watermark; do not
+				// misreport that safe path as verified=0.
+				verifiedWM := uint64(0)
+				verifiedDiag := "n/a/not-required"
+				if trailingVerifier != nil {
+					verifiedWM = trailingVerifier.VerifiedWatermark()
+					verifiedDiag = fmt.Sprintf("%d", verifiedWM)
+				} else if TrailingVerifierCfg.ValidatorFooterHash {
+					verifiedDiag = "n/a/footer-inline"
+				}
+				diag := fmt.Sprintf("durable=%d finality=%d verified=%s replay=%d fold_in_flight=%t",
+					mithrilState.LastRootedSlot, lastRootedWatermark, verifiedDiag, block.Slot, hadInFlightFold)
+				hint := ""
+				if trailingVerifier != nil && TrailingVerifierCfg.Required && lastRootedWatermark > verifiedWM+uint64(FoldBatchSlots) {
+					hint = " — the trailing verifier cannot keep pace with replay (finality is ahead; the verifier fetches every block's execution metas via RPC, which is slow for very large blocks). Options: verifier.required=false to gate folds on certificate finality only, a faster/archival RPC for the verifier, or wait for peer bankhash cross-checking to replace the RPC oracle"
+				}
+				result.Error = fmt.Errorf("rooted-durable: speculative state exceeded %d held slots at slot %d; rooting stalled (%s)%s; halting", unrootedTailHaltCap, block.Slot, diag, hint)
+				mlog.Log.Errorf("%v", result.Error)
+				break
+			}
 		}
 
 		// Stop before per-slot logging, summary generation, and metric export so
@@ -2908,7 +3212,7 @@ func ReplayBlocks(
 			readySecsLine = float64(block.ShredFullNanos-neededAt.UnixNano()) / 1e9
 			asmSecsLine = float64(block.ShredFullNanos-block.ShredFirstNanos) / 1e9
 		}
-		mlog.Log.InfofPrecise("%s", buildSlotStatsLine(block.Slot, leaderStr, txnCount, totalCU, execMsLine, hasShreds, readySecsLine, asmSecsLine, block.RepairedShreds))
+		mlog.Log.InfofPrecise("%s", appendNextLeaderHint(buildSlotStatsLine(block.Slot, leaderStr, txnCount, totalCU, execMsLine, hasShreds, readySecsLine, asmSecsLine, block.RepairedShreds), nextLeader.hint(block.Slot)))
 		// Full detail (wait, vote split) stays in file logs for debugging.
 		var voteTxCount int
 		for _, tx := range block.Transactions {
@@ -3145,12 +3449,14 @@ func ReplayBlocks(
 	// however long the partial ran.
 	if unrootedTailState != nil {
 		preFlushRooted := mithrilState.LastRootedSlot
+		preFlushEvidence := len(mithrilState.AlpenglowEvidence)
 		foldRootedPrefix(true)
 		// The cancel-path state save ran BEFORE this flush; if the flush
-		// advanced the watermark, re-save so the state file matches the store
-		// exactly. (Without this, startup's store-ahead reconcile still adopts
-		// the manifest context — this just keeps the file authoritative.)
-		if result.StateWrittenOnCancel && onCancelWriteState != nil && mithrilState.LastRootedSlot > preFlushRooted {
+		// advanced the watermark or its finality gate recorded new evidence,
+		// re-save so the state file matches the store and a restart cannot lose
+		// a shutdown-only safety finding.
+		stateChanged := mithrilState.LastRootedSlot > preFlushRooted || len(mithrilState.AlpenglowEvidence) > preFlushEvidence
+		if result.StateWrittenOnCancel && onCancelWriteState != nil && stateChanged {
 			if err := onCancelWriteState(result); err != nil {
 				mlog.Log.Errorf("failed to re-write state after shutdown flush (recovery reconcile will cover it): %v", err)
 			}
@@ -3171,13 +3477,20 @@ func ReplayBlocks(
 		}
 		result.LastNumSignatures = lastSlotCtx.NumSignatures
 
-		// Capture blockhash context from SysvarCache (required because appendvec writes are not fsynced)
-		result.LastRecentBlockhashes = sealevel.SysvarCache.RecentBlockHashes.Sysvar
+		// Capture blockhash context from the completed bank snapshot because
+		// appendvec writes are not necessarily fsynced yet.
+		if bankSysvars := lastSlotCtx.BankSysvars(); bankSysvars != nil {
+			if recent, ok := bankSysvars.RecentBlockhashes(); ok {
+				copyRecent := append(sealevel.SysvarRecentBlockhashes(nil), recent...)
+				result.LastRecentBlockhashes = &copyRecent
+			}
+			if slotHashes, ok := bankSysvars.SlotHashes(); ok {
+				copySlotHashes := append(sealevel.SysvarSlotHashes(nil), slotHashes...)
+				result.LastSlotHashes = &copySlotHashes
+			}
+		}
 		result.LastEvictedBlockhash = lastSlotCtx.LatestEvictedBlockhash
 		result.LastBlockhash = lastSlotCtx.Blockhash
-
-		// Capture SlotHashes context (same issue, vote program needs accurate slot→hash mappings)
-		result.LastSlotHashes = sealevel.SysvarCache.SlotHashes.Sysvar
 	}
 
 	// Capture ReplayCtx fields for resume independence from stale manifest
@@ -3203,7 +3516,7 @@ func runIncinerator(slotCtx *sealevel.SlotCtx) {
 
 func compileWritableAndModifiedAccts(slotCtx *sealevel.SlotCtx, block *b.Block, rentAccts []*accounts.Account) ([]*accounts.Account, []*accounts.Account) {
 	adhRemoved := accountsDeltaHashRemoved(slotCtx)
-	sysvarAccts := collectAndUpdateSysvarAcctsForAdh(slotCtx)
+	sysvarAccts := collectSysvarAcctsForAdh(slotCtx)
 	var writableAccts []*accounts.Account
 	var alreadyAdded map[solana.PublicKey]bool
 	if !adhRemoved {
@@ -3345,6 +3658,28 @@ type blockTransactionExecutionPlan struct {
 	execute             []bool
 	processedTxCount    uint64
 	processedSignatures uint64
+}
+
+// validateBlockTransactionVersions is the authoritative bank-boundary feature
+// check for transactions arriving from any block source. Native Turbine must be
+// able to decode a V1 wire packet before the candidate bank is constructed, so
+// ingress cannot safely decide whether V1 is active. The candidate block's
+// feature snapshot can, and must reject pre-activation V1 before transaction
+// execution can turn UnsupportedVersion into a nil-fee replay invariant panic.
+func validateBlockTransactionVersions(block *b.Block) error {
+	if block == nil {
+		return errors.New("nil block")
+	}
+	v1Active := block.Features != nil && block.Features.IsActive(features.EnableTxV1)
+	if v1Active {
+		return nil
+	}
+	for idx, tx := range block.Transactions {
+		if tx != nil && tx.Message.GetVersion() == solana.MessageVersionV1 {
+			return fmt.Errorf("transaction %d uses V1 before EnableTxV1 activation: %w", idx, TxErrUnsupportedVersion)
+		}
+	}
+	return nil
 }
 
 // planBlockTransactionExecution mirrors Agave's AlreadyProcessed check for
@@ -3682,13 +4017,16 @@ func parallelTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, bloc
 		if txFeeInfo == nil {
 			// This happens when IsTransactionAgeValid returns false (blockhash not found)
 			tx := block.Transactions[idx]
-			recentBlockhashes := sealevel.SysvarCache.RecentBlockHashes.Sysvar
+			var recentBlockhashes sealevel.SysvarRecentBlockhashes
+			if bankSysvars := slotCtx.BankSysvars(); bankSysvars != nil {
+				recentBlockhashes, _ = bankSysvars.RecentBlockhashes()
+			}
 			mlog.Log.Errorf("txFeeInfo is nil for tx %s in slot %d", tx.Signatures[0], block.Slot)
 			mlog.Log.Errorf("  tx blockhash: %s", tx.Message.RecentBlockhash)
 			mlog.Log.Errorf("  LatestEvictedBlockhash: %x", slotCtx.LatestEvictedBlockhash[:8])
-			if recentBlockhashes != nil && len(*recentBlockhashes) > 0 {
+			if len(recentBlockhashes) > 0 {
 				mlog.Log.Errorf("  RecentBlockhashes: %d entries, newest=%x, oldest=%x",
-					len(*recentBlockhashes), (*recentBlockhashes)[0].Blockhash[:8], (*recentBlockhashes)[len(*recentBlockhashes)-1].Blockhash[:8])
+					len(recentBlockhashes), recentBlockhashes[0].Blockhash[:8], recentBlockhashes[len(recentBlockhashes)-1].Blockhash[:8])
 			} else {
 				mlog.Log.Errorf("  RecentBlockhashes: nil or empty!")
 			}
@@ -3748,9 +4086,13 @@ func ProcessBlock(
 	tail unrootedState,
 	transactionStatuses *TransactionStatusCache,
 	alpenglowClock bool,
+	parentBankSysvars *sealevel.BankSysvars,
 ) (*sealevel.SlotCtx, error) {
 	if block == nil {
 		return nil, errors.New("validate transaction messages: nil block")
+	}
+	if err := validateBlockTransactionVersions(block); err != nil {
+		return nil, fmt.Errorf("validate transaction versions for slot %d: %w", block.Slot, err)
 	}
 	executionPlanStart := time.Now()
 	executionPlan, err := planBlockTransactionExecution(block)
@@ -3840,15 +4182,31 @@ func ProcessBlock(
 	if tail != nil {
 		blockSrc = tail
 	}
-	accts, parentAccts, accountMapCapacity, err := loadBlockAccountsAndUpdateSysvars(blockSrc, block, epochSchedule, alpenglowClock)
+	accts, parentAccts, accountMapCapacity, bankSysvars, err := loadBlockAccountsAndUpdateSysvars(blockSrc, block, epochSchedule, alpenglowClock, parentBankSysvars)
 	loadAcctsRegion.End()
 	if err != nil {
 		panic(fmt.Sprintf("unable to load slot accounts and update sysvars: %s", err))
+	}
+	if err := bankSysvars.ValidateForExecution(); err != nil {
+		return nil, fmt.Errorf("invalid bank sysvar snapshot at slot %d: %w", block.Slot, err)
 	}
 	metrics.GlobalBlockReplay.LoadBlockAccounts.AddTimingSince(start)
 
 	slotCtxSetupStart := time.Now()
 	slotCtx := newSlotCtx(block, accts, parentAccts, acctsDb, tail, accountMapCapacity)
+	if err := slotCtx.PublishBankSysvars(bankSysvars); err != nil {
+		return nil, fmt.Errorf("publish bank sysvars at slot %d: %w", block.Slot, err)
+	}
+	bankEpochScheduleValue, ok := bankSysvars.EpochSchedule()
+	if !ok {
+		return nil, fmt.Errorf("bank-local EpochSchedule sysvar unavailable at slot %d", block.Slot)
+	}
+	bankEpochSchedule := &bankEpochScheduleValue
+	if requireAlpenglowBlockFooter(block, slotCtx, alpenglowClock) {
+		if err := validateAlpenglowFooterNanosecondClock(slotCtx, block); err != nil {
+			return nil, err
+		}
+	}
 	slotCtx.TraceCtx = ctx
 	slotCtx.NumSignatures = executionPlan.processedSignatures
 	metrics.GlobalBlockReplay.SlotCtxSetup.AddTimingSince(slotCtxSetupStart)
@@ -3884,8 +4242,11 @@ func ProcessBlock(
 
 	start = time.Now()
 	setReplayStage("collect_rent")
-	rentSysvar := sealevel.SysvarCache.Rent.Sysvar
-	rentAccts := rent.CollectRentEagerly(slotCtx, rentSysvar, epochSchedule)
+	bankRent, ok := slotCtx.BankSysvars().Rent()
+	if !ok {
+		return nil, fmt.Errorf("bank-local Rent sysvar unavailable at slot %d", block.Slot)
+	}
+	rentAccts := rent.CollectRentEagerly(slotCtx, &bankRent, bankEpochSchedule)
 	metrics.GlobalBlockReplay.Rent.AddTimingSince(start)
 
 	start = time.Now()
@@ -3896,7 +4257,7 @@ func ProcessBlock(
 	// Alpenglow banks set the Clock timestamp from the block footer after execution.
 	if alpenglowClock {
 		footerClockStart := time.Now()
-		if err := applyAlpenglowFooterClock(slotCtx, block, epochSchedule); err != nil {
+		if err := applyAlpenglowFooterClock(slotCtx, block, bankEpochSchedule); err != nil {
 			metrics.GlobalBlockReplay.AlpenglowFooterClock.AddTimingSince(footerClockStart)
 			return nil, fmt.Errorf("apply alpenglow footer clock at slot %d: %w", block.Slot, err)
 		}
@@ -3906,11 +4267,14 @@ func ProcessBlock(
 		}
 		metrics.GlobalBlockReplay.AlpenglowFooterClock.AddTimingSince(footerClockStart)
 		voteRewardsStart := time.Now()
-		voteRewardsErr := ApplyAlpenglowVoteRewards(slotCtx, block, epochSchedule, block.SkipRewardCert, block.NotarRewardCert, block.BlockFinalCert, block.AlpenglowShredVersion)
+		voteRewardsErr := ApplyAlpenglowVoteRewards(slotCtx, block, bankEpochSchedule, block.SkipRewardCert, block.NotarRewardCert, block.BlockFinalCert, block.AlpenglowShredVersion)
 		metrics.GlobalBlockReplay.AlpenglowVoteRewards.AddTimingSince(voteRewardsStart)
 		if voteRewardsErr != nil {
 			return nil, voteRewardsErr
 		}
+	}
+	if err := finalizeBankSysvars(slotCtx); err != nil {
+		return nil, fmt.Errorf("finalize bank sysvars at slot %d: %w", block.Slot, err)
 	}
 
 	setReplayStage("compile_accounts")

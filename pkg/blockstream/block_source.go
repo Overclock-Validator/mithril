@@ -49,6 +49,11 @@ type BlockSourceOpts struct {
 	TurbineAlpenglowBlockIDHints bool
 	TurbineIdentity              ed25519.PrivateKey
 	LeaderForSlot                func(slot uint64) (solana.PublicKey, bool)
+	TurbineStakesForSlot         func(slot uint64) map[solana.PublicKey]uint64
+	TurbineEpochForSlot          func(slot uint64) uint64
+	TurbineRootSlot              func() uint64
+	TurbineUseChaCha8            bool
+	TurbineDedupAddrs            bool
 	LocalLeaderForSlot           func(slot uint64) bool
 	GossipClient                 *gossip.Client
 	AlpenglowDecisionSource      func(anchorSlot uint64) (alpenglow.ChainDecision, bool)
@@ -96,7 +101,8 @@ type BlockSourceOpts struct {
 	PrewarmBlocks []*b.Block
 	// LocalBlocks carries fully frozen blocks from this node's producer. The
 	// source owns the consumer for exactly its own lifetime, avoiding stale
-	// consumers across a replay/fork-recovery restart.
+	// consumers across a replay/fork-recovery restart. Replay adopts the
+	// producer SlotCtx for these slots and does not re-execute them.
 	LocalBlocks <-chan *b.Block
 	// DisableRPCBlockFetch (config block.rpc_fallback=false): a live-shred
 	// source NEVER fetches blocks over RPC — shreds via turbine + repair are
@@ -401,6 +407,11 @@ type BlockSource struct {
 	turbineAlpenglowBlockIDHints bool
 	turbineIdentity              ed25519.PrivateKey
 	leaderForSlot                func(slot uint64) (solana.PublicKey, bool)
+	turbineStakesForSlot         func(slot uint64) map[solana.PublicKey]uint64
+	turbineEpochForSlot          func(slot uint64) uint64
+	turbineRootSlot              func() uint64
+	turbineUseChaCha8            bool
+	turbineDedupAddrs            bool
 	localLeaderForSlot           func(slot uint64) bool
 	localBlocks                  <-chan *b.Block
 	gossipClient                 *gossip.Client
@@ -753,6 +764,11 @@ func NewBlockSource(opts *BlockSourceOpts) *BlockSource {
 		turbineAlpenglowBlockIDHints:   opts.TurbineAlpenglowBlockIDHints,
 		turbineIdentity:                clonePrivateKey(opts.TurbineIdentity),
 		leaderForSlot:                  opts.LeaderForSlot,
+		turbineStakesForSlot:           opts.TurbineStakesForSlot,
+		turbineEpochForSlot:            opts.TurbineEpochForSlot,
+		turbineRootSlot:                opts.TurbineRootSlot,
+		turbineUseChaCha8:              opts.TurbineUseChaCha8,
+		turbineDedupAddrs:              opts.TurbineDedupAddrs,
 		localLeaderForSlot:             opts.LocalLeaderForSlot,
 		localBlocks:                    opts.LocalBlocks,
 		gossipClient:                   opts.GossipClient,
@@ -1365,6 +1381,13 @@ func (bs *BlockSource) applyAlpenglowDecisionLocked() bool {
 		delete(bs.reorderBuffer, waitingSlot)
 		return false
 	}
+	if decision.Kind == alpenglow.ChainDecisionKindBlock {
+		// A decisive block identity is authoritative over soft tombstones left
+		// by an earlier speculative parent switch. Publish it even outside
+		// active near-tip mode and when no candidate is buffered yet, so the
+		// next repaired/spooled copy is admitted instead of rejected forever.
+		bs.SetKnownAlpenglowBlockID(waitingSlot, decision.Block.Hash)
+	}
 	// Buffered-candidate steering otherwise needs active near-tip Turbine.
 	if !bs.liveStreamActive.Load() || !bs.isNearTip.Load() {
 		return false
@@ -1790,7 +1813,10 @@ func (bs *BlockSource) tryGetBlockFromFile(slot uint64) (*block.Block, error) {
 		file.Close()
 		return nil, fmt.Errorf("block decode error: %w", err)
 	}
-	out.FixupTxVersions()
+	if err := out.FixupTxVersions(); err != nil {
+		file.Close()
+		return nil, fmt.Errorf("block transaction-version fixup: %w", err)
+	}
 
 	file.Close()
 	os.Remove(blockFilename)
@@ -1904,7 +1930,7 @@ func (bs *BlockSource) fetchBlockOnce(slot uint64, rpcIdx int32) (*b.Block, erro
 		return nil, err
 	}
 
-	return block.FromBlockResult(blockResult, slot, rpc), nil
+	return block.FromBlockResult(blockResult, slot, rpc)
 }
 
 // pollTip periodically updates the confirmed tip by querying all configured RPCs
@@ -2973,8 +2999,8 @@ func (bs *BlockSource) emitOrderedBlocks() {
 							}
 						}
 					} else if blk.FromLocalProduction {
-						// Local production is an authoritative input to replay, not a
-						// source handoff away from the turbine stream.
+						// Local production is sequenced into replay so it can adopt
+						// the producer SlotCtx; it is not a source handoff.
 					} else if repairingSlot {
 						bs.clearLiveRepairSlot(blk.Slot)
 						mlog.Log.Infof("BLOCK SOURCE STATUS: missing streamed slot recovered via RPC at slot %d; staying on %s stream", blk.Slot, bs.liveShredStreamName())
@@ -3480,8 +3506,8 @@ func (bs *BlockSource) DownloadInitialBlocks() {
 }
 
 // InjectLocalBlock queues a fully frozen locally produced block through the
-// same ordered emitter used by network blocks. Replay and forkchoice remain the
-// only path that can accept its state.
+// same ordered emitter used by network blocks so replay can adopt the
+// already-mutated producer SlotCtx in slot order.
 func (bs *BlockSource) InjectLocalBlock(blk *b.Block) bool {
 	if bs == nil || blk == nil {
 		return false
@@ -3640,7 +3666,10 @@ func (bs *BlockSource) fetchAndParseBlockSequential(slot uint64) (*b.Block, erro
 					return nil, fmt.Errorf("error fetching block: %w", err)
 				}
 			}
-			blk = block.FromBlockResult(blockResult, slot, rpc)
+			blk, err = block.FromBlockResult(blockResult, slot, rpc)
+			if err != nil {
+				return nil, err
+			}
 		}
 	} else if bs.sourceType == BlockSourceLightbringer || bs.sourceType == BlockSourceTurbine {
 		// Legacy sequential mode does not support the live stream handoff.
@@ -3662,7 +3691,10 @@ func (bs *BlockSource) fetchAndParseBlockSequential(slot uint64) (*b.Block, erro
 				return nil, fmt.Errorf("error fetching block: %w", err)
 			}
 		}
-		blk = block.FromBlockResult(blockResult, slot, rpc)
+		blk, err = block.FromBlockResult(blockResult, slot, rpc)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return blk, nil

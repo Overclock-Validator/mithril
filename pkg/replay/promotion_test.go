@@ -400,11 +400,11 @@ func TestUnrootedTailOverCap(t *testing.T) {
 func TestUnrootedTailContextCaptureAndPromote(t *testing.T) {
 	tail := newUnrootedTail(&fakeDurable{}, &fakeCommitter{durable: accounts.NewMemAccounts()}, 512, 1, "")
 	tail.Add(5, []*accounts.Account{testAccount(1, 51)}, testHashBytes(5))
-	tail.SetContext(5, &state.ResumeContext{Slot: 5, Bankhash: "bh5"})
+	tail.SetContext(5, &state.ResumeContext{Slot: 5, Bankhash: "bh5"}, testUnwindBankSysvars(t, 5, 50))
 	tail.Add(7, []*accounts.Account{testAccount(2, 72)}, testHashBytes(7))
-	tail.SetContext(7, &state.ResumeContext{Slot: 7, Bankhash: "bh7"})
+	tail.SetContext(7, &state.ResumeContext{Slot: 7, Bankhash: "bh7"}, testUnwindBankSysvars(t, 7, 70))
 	tail.Add(9, []*accounts.Account{testAccount(3, 93)}, testHashBytes(9))
-	tail.SetContext(9, &state.ResumeContext{Slot: 9, Bankhash: "bh9"})
+	tail.SetContext(9, &state.ResumeContext{Slot: 9, Bankhash: "bh9"}, testUnwindBankSysvars(t, 9, 90))
 
 	promotedThrough, ctx, err := tail.promote(7)
 	require.NoError(t, err)
@@ -418,6 +418,9 @@ func TestUnrootedTailContextCaptureAndPromote(t *testing.T) {
 	assert.False(t, has5, "promoted context pruned")
 	assert.False(t, has7, "promoted context pruned")
 	assert.True(t, has9, "still-held context retained")
+	assert.NotContains(t, tail.bankSysvars, uint64(5), "promoted sysvar snapshot pruned")
+	assert.NotContains(t, tail.bankSysvars, uint64(7), "promoted sysvar snapshot pruned")
+	assert.Contains(t, tail.bankSysvars, uint64(9), "still-held sysvar snapshot retained")
 }
 
 // Nothing to promote (through below all held slots) is a no-op, not an error.

@@ -71,3 +71,30 @@ func TestNodeKeyedScheduleHasNoVoteAccountProvenance(t *testing.T) {
 	_, _, ok = schedule.LeaderForSlotWithVoteAccount(101)
 	require.False(t, ok)
 }
+
+func TestNextSlotForLeader(t *testing.T) {
+	ours := solana.PublicKey{1}
+	other := solana.PublicKey{2}
+	schedule := NewLeaderScheduleFromKeyedSlots(
+		map[solana.PublicKey][]uint64{
+			ours:  {0, 1, 10},
+			other: {2, 3},
+		},
+		100,
+	)
+
+	slot, ok := schedule.NextSlotForLeader(ours, 100)
+	require.True(t, ok)
+	require.Equal(t, uint64(100), slot)
+
+	slot, ok = schedule.NextSlotForLeader(ours, 101)
+	require.True(t, ok)
+	require.Equal(t, uint64(101), slot)
+
+	slot, ok = schedule.NextSlotForLeader(ours, 102)
+	require.True(t, ok)
+	require.Equal(t, uint64(110), slot)
+
+	_, ok = schedule.NextSlotForLeader(ours, 111)
+	require.False(t, ok)
+}

@@ -24,7 +24,7 @@ func DecodeComponentsFromDataShreds(shreds []*Shred) ([]BlockComponent, error) {
 		if !shred.DataComplete() {
 			continue
 		}
-		component, err := UnmarshalBlockComponent(batchBytes)
+		component, err := unmarshalBlockComponentFromShredBatch(batchBytes)
 		if err != nil {
 			return nil, fmt.Errorf("decode component ending at shred %d: %w", shred.Index, err)
 		}

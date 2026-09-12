@@ -141,9 +141,7 @@ func Ed25519ProgramExecute(execCtx *ExecutionCtx) error {
 		// throughput of a batch that is usually one or two signatures deep.
 		if execCtx.Features.IsActive(features.Ed25519PrecompileVerifyStrict) {
 			// DalekStrict: reject small-order A and R, accept a non-canonical
-			// A and hash its original bytes. Routed through pkg/sigverify so
-			// the precompile honours the same backend selection and stdlib
-			// rollback switch as every other verification site.
+			// A and hash its original bytes.
 			if !sigverify.VerifyOne((*[32]byte)(pubkey), msg[:offsets.MessageDataSize], signature[:64]) {
 				return PrecompileErrSignature
 			}

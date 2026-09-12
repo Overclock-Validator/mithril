@@ -234,6 +234,7 @@ near_tip_lookahead = 2
 [turbine]
 gossip_entrypoint = ""    # REQUIRED for turbine: a gossip entrypoint of your Alpenglow cluster (host:port)
 gossip_bind_addr = "0.0.0.0:65401"  # Local gossip UDP port (open inbound); empty = OS-assigned
+# Gossip-connected nodes automatically retransmit verified broadcast shreds to their Agave-compatible downstream Turbine peers; repair responses are never forwarded.
 # advertised_ip = ""      # Public IP peers reach you at; empty = auto-detect via the entrypoint's IP-echo
 # shred_version = 0       # 0 = auto-discover from the entrypoint (setting it wrong silently drops all shreds)
 
@@ -260,7 +261,7 @@ max_rps = 8               # Verifier's own RPC budget (never shares the block-fe
 # ── Replay tuning ────────────────────────────────────────────────────────
 [tuning]
 txpar = 24                # Validator auto-defaults to 2x CPU cores only when unset; explicit 0 = sequential
-sigverify_backend = "auto" # auto|r51|generic|stdlib; stdlib is a rollback that weakens the predicate
+sigverify_backend = "auto" # auto|r51|generic|stdlib; stdlib uses Go's crypto/ed25519 impl after strict checks.
 
 # ── Mithril's RPC server ─────────────────────────────────────────────────
 [rpc]

@@ -29,7 +29,10 @@ type UDPReceiver struct {
 	completionPool *slotCompletionPool
 	leaderForSlot  LeaderForSlotFunc
 	repairClient   *repairClient
+	retransmitCfg  *RetransmitConfig
+	retransmitter  *Retransmitter
 	sigCache       shredSigCache
+	shredVersion   uint16
 	blocks         chan *block.Block
 	// Count queued deliveries rather than storing a boolean. A rejected
 	// Alpenglow variant can reset a slot and assemble its replacement while
@@ -59,7 +62,9 @@ type UDPReceiver struct {
 	// counter keeps them in the useful-repair throughput picture; without it,
 	// USEFUL shreds/s reads ~0 exactly when disk-bound catchup repair is doing
 	// all the work.
-	spooledRepairShreds atomic.Uint64
+	spooledRepairShreds   atomic.Uint64
+	repairSocketPackets   atomic.Uint64
+	repairSocketUnmatched atomic.Uint64
 
 	packets         atomic.Uint64
 	dataShreds      atomic.Uint64
@@ -67,6 +72,7 @@ type UDPReceiver struct {
 	parseErrors     atomic.Uint64
 	signatureErrors atomic.Uint64
 	missingLeaders  atomic.Uint64
+	versionMismatch atomic.Uint64
 	assemblyErrors  atomic.Uint64
 	blocksEmitted   atomic.Uint64
 	lastPacketUnix  atomic.Int64
@@ -82,29 +88,32 @@ type UDPReceiver struct {
 const maxFirstShredNotifications = 8192
 
 type ReceiverStats struct {
-	Packets              uint64
-	DataShreds           uint64
-	CodingShreds         uint64
-	ParseErrors          uint64
-	SignatureErrors      uint64
-	MissingLeaders       uint64
-	AssemblyErrors       uint64
-	BlocksEmitted        uint64
-	RecoveredData        uint64
-	UsefulRepairShreds   uint64 // distinct repair data shreds accepted into in-RAM assembly
-	SpooledRepairShreds  uint64 // repair data shreds written to the catchup spool (not yet assembled)
-	EvictedSlots         uint64
-	IgnoredOldShreds     uint64
-	PriorityRepairSlots  int
-	NonCanonicalBlockIDs uint64
-	LastNonCanonicalSlot uint64
-	LastNonCanonicalGot  solana.Hash
-	LastNonCanonicalWant solana.Hash
-	Repair               RepairStats
-	LastPacketUnix       int64
-	LastDataSlot         uint64
-	LastBlockSlot        uint64
-	ActiveSlots          int
+	Packets               uint64
+	DataShreds            uint64
+	CodingShreds          uint64
+	ParseErrors           uint64
+	SignatureErrors       uint64
+	MissingLeaders        uint64
+	ShredVersionMismatch  uint64
+	AssemblyErrors        uint64
+	BlocksEmitted         uint64
+	RecoveredData         uint64
+	UsefulRepairShreds    uint64 // distinct repair data shreds accepted into in-RAM assembly
+	SpooledRepairShreds   uint64 // repair data shreds written to the catchup spool (not yet assembled)
+	RepairSocketPackets   uint64 // all datagrams read from the dedicated repair socket
+	RepairSocketUnmatched uint64 // parsed shreds on that socket which no longer match an outstanding request
+	EvictedSlots          uint64
+	IgnoredOldShreds      uint64
+	PriorityRepairSlots   int
+	NonCanonicalBlockIDs  uint64
+	LastNonCanonicalSlot  uint64
+	LastNonCanonicalGot   solana.Hash
+	LastNonCanonicalWant  solana.Hash
+	Repair                RepairStats
+	LastPacketUnix        int64
+	LastDataSlot          uint64
+	LastBlockSlot         uint64
+	ActiveSlots           int
 	// Spool hydration outcomes: slots fed from disk, and how many of those
 	// completed with zero network repair (spooled coding healed the holes).
 	HydratedSlots    uint64
@@ -113,6 +122,7 @@ type ReceiverStats struct {
 	// off the per-FEC-set merkle root cache (one signed root covers ~64 shreds).
 	SigVerifies     uint64
 	SigVerifyCached uint64
+	Retransmit      RetransmitStats
 }
 
 // Repair catchup is packet-processing heavy (wire decode, Merkle proof,
@@ -134,6 +144,28 @@ func NewUDPReceiver(addr string) *UDPReceiver {
 		hydrateKick:    make(chan struct{}, 1),
 		firstShredSeen: make(map[uint64]struct{}),
 	}
+}
+
+// SetShredVersion rejects packets for another cluster before they can be
+// assembled or amplified by retransmit. A zero version leaves filtering off.
+func (r *UDPReceiver) SetShredVersion(version uint16) {
+	r.shredVersion = version
+}
+
+// SetRetransmit configures the receiver as a Turbine relay. It must be called
+// before Run and requires a leader lookup so the receiver can authenticate the
+// leader before the retransmitter validates the upstream hop.
+func (r *UDPReceiver) SetRetransmit(cfg RetransmitConfig) error {
+	if r.leaderForSlot == nil {
+		return errors.New("turbine retransmit requires a leader-for-slot source")
+	}
+	if len(cfg.Identity) != ed25519.PrivateKeySize {
+		return fmt.Errorf("turbine retransmit identity has invalid size %d", len(cfg.Identity))
+	}
+	cp := cfg
+	cp.Identity = append(ed25519.PrivateKey(nil), cfg.Identity...)
+	r.retransmitCfg = &cp
+	return nil
 }
 
 func (r *UDPReceiver) SetLeaderForSlot(fn LeaderForSlotFunc) {
@@ -403,34 +435,45 @@ func (r *UDPReceiver) Stats() ReceiverStats {
 	nonCanonicalCount, nonCanonicalSlot, nonCanonicalGot, nonCanonicalWant := r.assembler.NonCanonicalBlockIDStats()
 	sigHits, sigVerifies := r.sigCache.stats()
 	return ReceiverStats{
-		Packets:              r.packets.Load(),
-		DataShreds:           r.dataShreds.Load(),
-		CodingShreds:         r.codingShreds.Load(),
-		ParseErrors:          r.parseErrors.Load(),
-		SignatureErrors:      r.signatureErrors.Load(),
-		MissingLeaders:       r.missingLeaders.Load(),
-		AssemblyErrors:       r.assemblyErrors.Load(),
-		BlocksEmitted:        r.blocksEmitted.Load(),
-		RecoveredData:        r.assembler.RecoveredDataShreds(),
-		UsefulRepairShreds:   r.assembler.UsefulRepairShreds(),
-		SpooledRepairShreds:  r.spooledRepairShreds.Load(),
-		EvictedSlots:         r.assembler.EvictedSlots(),
-		IgnoredOldShreds:     r.assembler.IgnoredOldShreds(),
-		PriorityRepairSlots:  r.assembler.PriorityRepairSlots(),
-		NonCanonicalBlockIDs: nonCanonicalCount,
-		LastNonCanonicalSlot: nonCanonicalSlot,
-		LastNonCanonicalGot:  nonCanonicalGot,
-		LastNonCanonicalWant: nonCanonicalWant,
-		Repair:               r.repairStats(),
-		LastPacketUnix:       r.lastPacketUnix.Load(),
-		LastDataSlot:         r.lastDataSlot.Load(),
-		LastBlockSlot:        r.lastBlockSlot.Load(),
-		ActiveSlots:          r.assembler.ActiveSlots(),
-		HydratedSlots:        r.hydratedSlots.Load(),
-		HydratedFromDisk:     r.hydratedFromDisk.Load(),
-		SigVerifies:          sigVerifies,
-		SigVerifyCached:      sigHits,
+		Packets:               r.packets.Load(),
+		DataShreds:            r.dataShreds.Load(),
+		CodingShreds:          r.codingShreds.Load(),
+		ParseErrors:           r.parseErrors.Load(),
+		SignatureErrors:       r.signatureErrors.Load(),
+		MissingLeaders:        r.missingLeaders.Load(),
+		ShredVersionMismatch:  r.versionMismatch.Load(),
+		AssemblyErrors:        r.assemblyErrors.Load(),
+		BlocksEmitted:         r.blocksEmitted.Load(),
+		RecoveredData:         r.assembler.RecoveredDataShreds(),
+		UsefulRepairShreds:    r.assembler.UsefulRepairShreds(),
+		SpooledRepairShreds:   r.spooledRepairShreds.Load(),
+		RepairSocketPackets:   r.repairSocketPackets.Load(),
+		RepairSocketUnmatched: r.repairSocketUnmatched.Load(),
+		EvictedSlots:          r.assembler.EvictedSlots(),
+		IgnoredOldShreds:      r.assembler.IgnoredOldShreds(),
+		PriorityRepairSlots:   r.assembler.PriorityRepairSlots(),
+		NonCanonicalBlockIDs:  nonCanonicalCount,
+		LastNonCanonicalSlot:  nonCanonicalSlot,
+		LastNonCanonicalGot:   nonCanonicalGot,
+		LastNonCanonicalWant:  nonCanonicalWant,
+		Repair:                r.repairStats(),
+		LastPacketUnix:        r.lastPacketUnix.Load(),
+		LastDataSlot:          r.lastDataSlot.Load(),
+		LastBlockSlot:         r.lastBlockSlot.Load(),
+		ActiveSlots:           r.assembler.ActiveSlots(),
+		HydratedSlots:         r.hydratedSlots.Load(),
+		HydratedFromDisk:      r.hydratedFromDisk.Load(),
+		SigVerifies:           sigVerifies,
+		SigVerifyCached:       sigHits,
+		Retransmit:            r.retransmitStats(),
 	}
+}
+
+func (r *UDPReceiver) retransmitStats() RetransmitStats {
+	if r.retransmitter == nil {
+		return RetransmitStats{}
+	}
+	return r.retransmitter.Stats()
 }
 
 func (r *UDPReceiver) repairStats() RepairStats {
@@ -489,6 +532,20 @@ func (r *UDPReceiver) Run(ctx context.Context) error {
 		defer repairConn.Close()
 		gossip.BoostUDPReceiveBuffer(repairConn, gossip.TurbineUDPReceiveBufferBytes, "turbine repair receiver")
 	}
+
+	var retransmitDone chan struct{}
+	if r.retransmitCfg != nil {
+		r.retransmitter, err = NewRetransmitter(*r.retransmitCfg)
+		if err != nil {
+			r.signalReady(fmt.Errorf("start turbine retransmit: %w", err))
+			return fmt.Errorf("start turbine retransmit: %w", err)
+		}
+		retransmitDone = make(chan struct{})
+		go func() {
+			defer close(retransmitDone)
+			r.retransmitter.Run(runCtx)
+		}()
+	}
 	r.signalReady(nil)
 	completionPool := newSlotCompletionPool(r.assembler, &r.slotResetMu, r.startPendingBlock, defaultSlotCompletionWorkers(), slotCompletionQueueDepth)
 	r.completionPool = completionPool
@@ -525,11 +582,11 @@ func (r *UDPReceiver) Run(ctx context.Context) error {
 
 	readers := 1
 	readErr := make(chan error, 1+turbineRepairReadWorkers)
-	go func() { readErr <- r.readPackets(runCtx, liveConn) }()
+	go func() { readErr <- r.readPackets(runCtx, liveConn, false) }()
 	if repairConn != nil {
 		readers += turbineRepairReadWorkers
 		for i := 0; i < turbineRepairReadWorkers; i++ {
-			go func() { readErr <- r.readPackets(runCtx, repairConn) }()
+			go func() { readErr <- r.readPackets(runCtx, repairConn, true) }()
 		}
 	}
 	firstErr := <-readErr
@@ -544,6 +601,9 @@ func (r *UDPReceiver) Run(ctx context.Context) error {
 	if hydratorDone != nil {
 		<-hydratorDone
 	}
+	if retransmitDone != nil {
+		<-retransmitDone
+	}
 	// No submitters remain. Drain queued work while the spool hook and result
 	// consumer are alive, then close results and join it before channel close.
 	completionPool.closeAndWait()
@@ -556,7 +616,7 @@ func (r *UDPReceiver) Run(ctx context.Context) error {
 	return nil
 }
 
-func (r *UDPReceiver) readPackets(ctx context.Context, conn *net.UDPConn) error {
+func (r *UDPReceiver) readPackets(ctx context.Context, conn *net.UDPConn, onRepairSocket bool) error {
 	buf := make([]byte, packetDataSize)
 	for {
 		n, addr, err := conn.ReadFromUDP(buf)
@@ -566,14 +626,17 @@ func (r *UDPReceiver) readPackets(ctx context.Context, conn *net.UDPConn) error 
 			}
 			return err
 		}
-		if !r.processPacket(ctx, conn, buf[:n], addr) {
+		if !r.processPacket(ctx, conn, buf[:n], addr, onRepairSocket) {
 			return nil
 		}
 	}
 }
 
-func (r *UDPReceiver) processPacket(ctx context.Context, conn *net.UDPConn, packet []byte, addr *net.UDPAddr) bool {
+func (r *UDPReceiver) processPacket(ctx context.Context, conn *net.UDPConn, packet []byte, addr *net.UDPAddr, onRepairSocket bool) bool {
 	r.packets.Add(1)
+	if onRepairSocket {
+		r.repairSocketPackets.Add(1)
+	}
 	r.lastPacketUnix.Store(time.Now().Unix())
 	if r.repairClient != nil && r.repairClient.handleRepairPing(conn, packet, addr) {
 		return true
@@ -587,6 +650,14 @@ func (r *UDPReceiver) processPacket(ctx context.Context, conn *net.UDPConn, pack
 		r.parseErrors.Add(1)
 		select {
 		case r.errs <- err:
+		default:
+		}
+		return true
+	}
+	if r.shredVersion != 0 && shred.Version != r.shredVersion {
+		r.versionMismatch.Add(1)
+		select {
+		case r.errs <- fmt.Errorf("turbine shred version mismatch: slot %d shred %d got %d want %d", shred.Slot, shred.Index, shred.Version, r.shredVersion):
 		default:
 		}
 		return true
@@ -605,8 +676,10 @@ func (r *UDPReceiver) processPacket(ctx context.Context, conn *net.UDPConn, pack
 	case ShredTypeCode:
 		r.codingShreds.Add(1)
 	}
+	var leader solana.PublicKey
 	if r.leaderForSlot != nil {
-		leader, ok := r.leaderForSlot(shred.Slot)
+		var ok bool
+		leader, ok = r.leaderForSlot(shred.Slot)
 		if !ok {
 			r.missingLeaders.Add(1)
 			select {
@@ -624,12 +697,33 @@ func (r *UDPReceiver) processPacket(ctx context.Context, conn *net.UDPConn, pack
 			return true
 		}
 	}
-	r.noteFirstShred(shred.Slot)
-	fromRepair := false
+	matchedRepair := false
+	if onRepairSocket && r.repairClient != nil {
+		matchedRepair = r.repairClient.observeShredResponse(conn, packet, addr, shred)
+	}
+	if onRepairSocket && !matchedRepair {
+		r.repairSocketUnmatched.Add(1)
+	}
+	if r.retransmitter != nil {
+		// Socket origin, rather than mutable nonce-accounting state, decides
+		// whether a packet may be retransmitted. Duplicate or late repair
+		// responses remain repair-path packets even after their nonce entry was
+		// consumed or expired.
+		if err := r.retransmitter.SubmitFrom(packet, shred, leader, onRepairSocket, addr); err != nil {
+			r.signatureErrors.Add(1)
+			select {
+			case r.errs <- err:
+			default:
+			}
+			return true
+		}
+	}
 	if r.repairClient != nil {
-		fromRepair = r.repairClient.observeShredResponse(conn, packet, addr, shred)
+		// A leader-valid broadcast with a forged upstream signature is not an
+		// accepted shred and must not retire repair for the real packet.
 		r.repairClient.satisfyDataShred(shred)
 	}
+	r.noteFirstShred(shred.Slot)
 	r.slotResetMu.RLock()
 	if r.spool != nil {
 		// Write-through of every VERIFIED shred. AppendShred consumes packet
@@ -647,13 +741,13 @@ func (r *UDPReceiver) processPacket(ctx context.Context, conn *net.UDPConn, pack
 			// disk-bound catchup, where most repair goes straight to the
 			// spool, would read as ~zero useful/s while repair is in fact
 			// carrying the whole catchup.
-			if fromRepair && spooled {
+			if matchedRepair && spooled {
 				r.spooledRepairShreds.Add(1)
 			}
 			return true
 		}
 	}
-	work, err := r.assembler.addShredFrom(shred, fromRepair)
+	work, err := r.assembler.addShredFrom(shred, matchedRepair)
 	r.slotResetMu.RUnlock()
 	if err != nil {
 		if errors.Is(err, ErrDuplicateShred) {

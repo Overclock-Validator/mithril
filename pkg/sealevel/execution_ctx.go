@@ -2,7 +2,9 @@ package sealevel
 
 import (
 	"context"
+	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
@@ -100,8 +102,34 @@ type SlotCtx struct {
 	LatestEvictedBlockhash    [32]byte
 
 	SerializedParameterArena *arena.Arena[byte]
+	bankSysvars              atomic.Pointer[BankSysvars]
 
 	TraceCtx context.Context
+}
+
+// BankSysvars returns the immutable sysvar snapshot owned by this bank.
+func (slotCtx *SlotCtx) BankSysvars() *BankSysvars {
+	if slotCtx == nil {
+		return nil
+	}
+	return slotCtx.bankSysvars.Load()
+}
+
+// PublishBankSysvars atomically installs a complete sysvar generation. Bank
+// construction and finalization publish only while transaction readers are
+// quiescent; the atomic pointer also makes completed SlotCtx reads race-free.
+func (slotCtx *SlotCtx) PublishBankSysvars(snapshot *BankSysvars) error {
+	if slotCtx == nil {
+		return fmt.Errorf("cannot publish bank sysvars to nil slot context")
+	}
+	if snapshot == nil {
+		return fmt.Errorf("cannot publish nil bank sysvars for slot %d", slotCtx.Slot)
+	}
+	if snapshot.Slot() != slotCtx.Slot {
+		return fmt.Errorf("bank sysvar slot %d does not match slot context %d", snapshot.Slot(), slotCtx.Slot)
+	}
+	slotCtx.bankSysvars.Store(snapshot)
+	return nil
 }
 
 func (execCtx *ExecutionCtx) PrepareInstruction(ix Instruction, signers []solana.PublicKey) ([]InstructionAccount, []uint64, error) {
@@ -449,6 +477,12 @@ func (slotCtx *SlotCtx) GetParentAccount(pubkey solana.PublicKey) (*accounts.Acc
 }
 
 func (slotCtx *SlotCtx) GetAccountFromAccountsDb(pubkey solana.PublicKey) (*accounts.Account, error) {
+	if bankSysvars := slotCtx.BankSysvars(); bankSysvars != nil && IsBankSysvarAccount(pubkey) {
+		if acct, ok := bankSysvars.CloneAccount(pubkey); ok {
+			return acct, nil
+		}
+		return nil, fmt.Errorf("bank sysvar account %s is absent at slot %d", pubkey, slotCtx.Slot)
+	}
 	if slotCtx.UnrootedRead != nil {
 		return slotCtx.UnrootedRead.GetAccount(slotCtx.Slot, pubkey)
 	}

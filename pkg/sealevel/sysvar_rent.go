@@ -97,25 +97,31 @@ func (sr *SysvarRent) InitializeDefault() {
 }
 
 func ReadRentSysvar(execCtx *ExecutionCtx) (SysvarRent, error) {
+	if execCtx != nil && execCtx.SlotCtx != nil {
+		if bankSysvars := execCtx.SlotCtx.BankSysvars(); bankSysvars != nil {
+			rent, ok := bankSysvars.Rent()
+			if !ok {
+				return SysvarRent{}, InstrErrUnsupportedSysvar
+			}
+			return rent, nil
+		}
+	}
+
+	if rentAcct, ok := localSysvarAccount(execCtx, SysvarRentAddr); ok {
+		if rentAcct.Lamports == 0 {
+			return SysvarRent{}, InstrErrUnsupportedSysvar
+		}
+		var rent SysvarRent
+		if err := rent.UnmarshalWithDecoder(bin.NewBinDecoder(rentAcct.Data)); err != nil {
+			return SysvarRent{}, InstrErrUnsupportedSysvar
+		}
+		return rent, nil
+	}
+
 	if SysvarCache.Rent.Sysvar != nil {
 		return *SysvarCache.Rent.Sysvar, nil
 	}
-
-	accts := addrObjectForLookup(execCtx)
-	rentAcct, err := (*accts).GetAccount(&SysvarRentAddr)
-	if err != nil {
-		return SysvarRent{}, err
-	}
-
-	dec := bin.NewBinDecoder(rentAcct.Data)
-
-	var rent SysvarRent
-	err = rent.UnmarshalWithDecoder(dec)
-	if err != nil {
-		return SysvarRent{}, InstrErrUnsupportedSysvar
-	}
-
-	return rent, nil
+	return SysvarRent{}, InstrErrUnsupportedSysvar
 }
 
 func WriteRentSysvar(accts *accounts.Accounts, rent SysvarRent) {

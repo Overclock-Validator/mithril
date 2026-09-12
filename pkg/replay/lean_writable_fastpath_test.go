@@ -435,7 +435,6 @@ func TestCompileWritableAndModifiedAcctsGatesWritableListOnADH(t *testing.T) {
 			require.NoError(t, slotCtx.SetAccount(epochAcct.Key, epochAcct))
 			rentAcct := &accounts.Account{Key: solana.PublicKey{0xF2}, Lamports: 1}
 
-			previousSlotHistory := sealevel.SysvarCache.SlotHistory.Sysvar
 			slotHistory := sealevel.SysvarSlotHistory{
 				Bits: sealevel.SlotHistoryBitvec{
 					Bits: sealevel.SlotHistoryInner{BlocksLen: 1, Blocks: []uint64{0}},
@@ -443,8 +442,6 @@ func TestCompileWritableAndModifiedAcctsGatesWritableListOnADH(t *testing.T) {
 				},
 				NextSlot: slotCtx.Slot,
 			}
-			sealevel.SysvarCache.SlotHistory.Sysvar = &slotHistory
-			defer func() { sealevel.SysvarCache.SlotHistory.Sysvar = previousSlotHistory }()
 
 			clock := sealevel.SysvarClock{}
 			slotHashes := sealevel.SysvarSlotHashes{}
@@ -454,12 +451,11 @@ func TestCompileWritableAndModifiedAcctsGatesWritableListOnADH(t *testing.T) {
 				{Key: sealevel.SysvarSlotHashesAddr, Lamports: 1, Data: slotHashes.MustMarshal()},
 				{Key: sealevel.SysvarSlotHistoryAddr, Lamports: 1, Data: slotHistory.MustMarshal()},
 			}
-			originalRecentData := append([]byte(nil), sysvarAccts[1].Data...)
-			originalSlotHistoryData := append([]byte(nil), sysvarAccts[3].Data...)
 			for _, acct := range sysvarAccts {
 				require.NoError(t, slotCtx.SetAccount(acct.Key, acct))
 			}
 			slotCtx.Blockhash = [32]byte{0xA5}
+			require.NoError(t, finalizeBankSysvars(slotCtx))
 
 			block := &b.Block{EpochUpdatedAccts: []*accounts.Account{epochAcct}}
 			writable, modified := compileWritableAndModifiedAccts(slotCtx, block, []*accounts.Account{rentAcct})
@@ -488,24 +484,28 @@ func TestCompileWritableAndModifiedAcctsGatesWritableListOnADH(t *testing.T) {
 			compiledSlotHistory := modifiedByKey[sealevel.SysvarSlotHistoryAddr]
 			require.NotNil(t, compiledRecent)
 			require.NotNil(t, compiledSlotHistory)
-			expectedRecentData := sealevel.SysvarCache.RecentBlockHashes.Sysvar.MustMarshal()
+			bankRecent, ok := slotCtx.BankSysvars().RecentBlockhashes()
+			require.True(t, ok)
+			expectedRecentData := bankRecent.MustMarshal()
 			assert.Equal(t, expectedRecentData, compiledRecent.Data[:len(expectedRecentData)],
-				"bank-hash input must retain the cloned RecentBlockhashes update")
-			assert.Equal(t, slotHistory.MustMarshal(), compiledSlotHistory.Data,
-				"bank-hash input must retain the cloned SlotHistory update")
+				"bank-hash input must retain the finalized RecentBlockhashes update")
+			bankHistory, ok := slotCtx.BankSysvars().SlotHistory()
+			require.True(t, ok)
+			assert.Equal(t, bankHistory.MustMarshal(), compiledSlotHistory.Data,
+				"bank-hash input must retain the finalized SlotHistory update")
 
 			storedRecent, err := slotCtx.GetAccount(sealevel.SysvarRecentBlockHashesAddr)
 			require.NoError(t, err)
 			storedSlotHistory, err := slotCtx.GetAccount(sealevel.SysvarSlotHistoryAddr)
 			require.NoError(t, err)
-			assert.Equal(t, originalRecentData, storedRecent.Data,
-				"the test must exercise a clone-only sysvar update, not an overlay write")
-			assert.Equal(t, originalSlotHistoryData, storedSlotHistory.Data,
-				"the test must exercise a clone-only sysvar update, not an overlay write")
+			assert.Equal(t, compiledRecent.Data, storedRecent.Data,
+				"frozen SlotCtx and bank-hash input must use identical RecentBlockhashes bytes")
+			assert.Equal(t, compiledSlotHistory.Data, storedSlotHistory.Data,
+				"frozen SlotCtx and bank-hash input must use identical SlotHistory bytes")
 
-			assert.Equal(t, slotCtx.Slot+1, slotHistory.NextSlot, "required sysvar updates must still run when ADH is removed")
-			assert.NotZero(t, slotHistory.Bits.Bits.Blocks[0]&(uint64(1)<<(slotCtx.Slot%64)))
-			assert.Equal(t, slotCtx.Blockhash, (*sealevel.SysvarCache.RecentBlockHashes.Sysvar)[0].Blockhash)
+			assert.Equal(t, slotCtx.Slot+1, bankHistory.NextSlot, "required sysvar updates must still run when ADH is removed")
+			assert.NotZero(t, bankHistory.Bits.Bits.Blocks[0]&(uint64(1)<<(slotCtx.Slot%64)))
+			assert.Equal(t, slotCtx.Blockhash, bankRecent[0].Blockhash)
 		})
 	}
 }

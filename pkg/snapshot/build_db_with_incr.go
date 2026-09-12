@@ -90,6 +90,7 @@ func BuildAccountsDbAuto(
 	if err != nil {
 		return nil, nil, fmt.Errorf("initializing worker pools: %w", err)
 	}
+	defer pools.Release()
 
 	// Determine save path for full snapshot if streaming from HTTP
 	var fullSavePath string
@@ -117,11 +118,17 @@ func BuildAccountsDbAuto(
 		dp.Start()
 	}
 
-	err = readTar(ctx, wg, fullSnapshotFile, pools.appendVecCopying, readTarOptions{
+	err = readTar(ctx, wg, fullSnapshotFile, pools, readTarOptions{
 		savePath:        fullSavePath,
 		progress:        dp,
 		statusCachePath: retainedStatusCachePath(accountsDbDir),
 	})
+	// A successful archive read is not a successful build until all three
+	// worker stages have drained without error.
+	workerErr := waitForSnapshotWorkers(wg, pools)
+	if err == nil {
+		err = workerErr
+	}
 	if err != nil {
 		if dp != nil {
 			dp.Interrupt(err)
@@ -133,9 +140,6 @@ func BuildAccountsDbAuto(
 	if dp != nil {
 		dp.Stop()
 	}
-
-	// Wait for all workers to finish before continuing to incremental phase
-	wg.Wait()
 
 	// Log full snapshot processing time to debug log only (noise reduction)
 	mlog.Log.Debugf("done processing full snapshot in %s.", fmtDuration(time.Since(start)))
@@ -224,12 +228,15 @@ func BuildAccountsDbAuto(
 			}
 		}
 
-		err = readTar(ctx, wg, incrementalSnapshotPath, pools.appendVecCopying, readTarOptions{
+		err = readTar(ctx, wg, incrementalSnapshotPath, pools, readTarOptions{
 			savePath:        incrSavePath,
 			isIncremental:   true,
 			statusCachePath: retainedStatusCachePath(accountsDbDir),
 		})
-		wg.Wait()
+		workerErr = waitForSnapshotWorkers(wg, pools)
+		if workerErr != nil {
+			return nil, nil, fmt.Errorf("processing incremental snapshot workers: %w", workerErr)
+		}
 		// Check if we should retry
 		if err == nil {
 			break // Success
@@ -277,8 +284,6 @@ func BuildAccountsDbAuto(
 		mlog.Log.Errorf("error writing bank hash=%x to file=%s: %s", manifest.Bank.Hash, bankHashOutputFileName, err)
 		return nil, nil, err
 	}
-
-	pools.Release()
 
 	// Write stake pubkey index file (with appendvec location hints)
 	stakeIndexPath := filepath.Join(accountsDbDir, "stake_pubkeys.idx")

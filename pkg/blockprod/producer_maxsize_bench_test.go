@@ -44,8 +44,8 @@ func maxSizeTransferPool(tb testing.TB) ([][]byte, []solana.Transaction) {
 		if err != nil {
 			tb.Fatal(err)
 		}
-		if len(raw) != txwire.PacketDataSize {
-			tb.Fatalf("wire size %d, expected %d", len(raw), txwire.PacketDataSize)
+		if len(raw) != costmodel.PacketDataSize {
+			tb.Fatalf("wire size %d, expected %d", len(raw), costmodel.PacketDataSize)
 		}
 		if _, err := txwire.Sanitize(raw); err != nil {
 			tb.Fatal(err)

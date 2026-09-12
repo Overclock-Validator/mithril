@@ -443,12 +443,6 @@ func (c *Client) initializeContact(localGossipAddr *net.UDPAddr) error {
 		if err := contact.SetAlpenglowAddr(alpenglowAddr); err != nil {
 			return fmt.Errorf("set Alpenglow gossip socket: %w", err)
 		}
-		if err := contact.SetTPUVoteAddr(alpenglowAddr); err != nil {
-			return fmt.Errorf("set Alpenglow TPU vote gossip socket: %w", err)
-		}
-		if err := contact.SetTPUVoteQuicAddr(alpenglowAddr); err != nil {
-			return fmt.Errorf("set Alpenglow TPU vote QUIC gossip socket: %w", err)
-		}
 	}
 	c.contactMu.Lock()
 	if c.pendingTPUQUIC != nil {

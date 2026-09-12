@@ -3,7 +3,6 @@ package consensus
 import (
 	"context"
 	"crypto/ed25519"
-	"net"
 	"testing"
 	"time"
 
@@ -23,7 +22,7 @@ func TestDeferredIntrawindowSafeToNotarDrainsAfterExactReplay(t *testing.T) {
 	voteAccount := solana.PublicKey(voterTestKey(103).Public().(ed25519.PublicKey))
 	set := voterTestValidatorSet(t, identity, authorized, voteAccount)
 
-	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234})
+	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234, AlpenglowIdentity: identity})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, engine.Close()) })
 	engine.SetAlpenglowEpochLookup(func(uint64) uint64 { return set.Epoch })
@@ -41,7 +40,7 @@ func TestDeferredIntrawindowSafeToNotarDrainsAfterExactReplay(t *testing.T) {
 		VoteAccount:     voteAccount,
 		HistoryDir:      historyDir,
 		EpochForSlot:    func(uint64) uint64 { return set.Epoch },
-		Peers:           func(uint64, []alpenglow.ValidatorStake) []*net.UDPAddr { return nil },
+		Peers:           func([]alpenglow.ValidatorStake) []alpenglow.VotorPeer { return nil },
 		WaitToVoteSlot:  root.Slot + 1,
 		ReadyToVote:     func(uint64) bool { return true },
 	}))
@@ -127,7 +126,7 @@ func TestDeferredIntrawindowSafeToNotarDrainsAfterLateEnable(t *testing.T) {
 	authorized := voterTestKey(105)
 	voteAccount := solana.PublicKey(voterTestKey(106).Public().(ed25519.PublicKey))
 	set := voterTestValidatorSet(t, identity, authorized, voteAccount)
-	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234})
+	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234, AlpenglowIdentity: identity})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, engine.Close()) })
 	engine.SetAlpenglowEpochLookup(func(uint64) uint64 { return set.Epoch })
@@ -165,7 +164,7 @@ func TestDeferredIntrawindowSafeToNotarDrainsAfterLateEnable(t *testing.T) {
 	require.NoError(t, engine.EnableVoting(VotingConfig{
 		Identity: identity, AuthorizedVoter: authorized, VoteAccount: voteAccount, HistoryDir: historyDir,
 		EpochForSlot:   func(uint64) uint64 { return set.Epoch },
-		Peers:          func(uint64, []alpenglow.ValidatorStake) []*net.UDPAddr { return nil },
+		Peers:          func([]alpenglow.ValidatorStake) []alpenglow.VotorPeer { return nil },
 		WaitToVoteSlot: root.Slot + 1,
 		ReadyToVote:    func(uint64) bool { return true },
 	}))

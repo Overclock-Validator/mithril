@@ -10,6 +10,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/safemath"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/wide"
+	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 	"github.com/tidwall/btree"
 )
@@ -206,7 +207,86 @@ func calculateStakeWeightedTimestamp(
 	return estimate, nil
 }
 
-func collectAndUpdateSysvarAcctsForAdh(slotCtx *sealevel.SlotCtx) []*accounts.Account {
+// finalizeBankSysvars applies the bank-end updates that are shared by replay
+// and local production.  The account overlay and the immutable bank sysvar
+// snapshot are replaced together before either bank hashing or chain-tip
+// publication, so no consumer can observe the pre-finalization bytes.
+func finalizeBankSysvars(slotCtx *sealevel.SlotCtx) error {
+	if slotCtx == nil {
+		return fmt.Errorf("missing slot context while finalizing bank sysvars")
+	}
+
+	recentAcct, err := slotCtx.GetAccount(sealevel.SysvarRecentBlockHashesAddr)
+	if err != nil {
+		return fmt.Errorf("get RecentBlockhashes sysvar: %w", err)
+	}
+	var recent sealevel.SysvarRecentBlockhashes
+	if bankSysvars := slotCtx.BankSysvars(); bankSysvars != nil {
+		if cached, ok := bankSysvars.RecentBlockhashes(); ok {
+			recent = append(sealevel.SysvarRecentBlockhashes(nil), cached...)
+		}
+	}
+	if recent == nil {
+		recent.MustUnmarshalWithDecoder(bin.NewBinDecoder(recentAcct.Data))
+	}
+	slotCtx.LatestEvictedBlockhash = recent.PushLatest(slotCtx.Blockhash, slotCtx.FeeRateGovernor.LamportsPerSignature)
+	recentAcct.Data = recent.MustMarshal()
+
+	historyAcct, err := slotCtx.GetAccount(sealevel.SysvarSlotHistoryAddr)
+	if err != nil {
+		return fmt.Errorf("get SlotHistory sysvar: %w", err)
+	}
+	var history sealevel.SysvarSlotHistory
+	hasCachedHistory := false
+	if bankSysvars := slotCtx.BankSysvars(); bankSysvars != nil {
+		if cached, ok := bankSysvars.SlotHistory(); ok {
+			history = cached
+			history.Bits.Bits.Blocks = append([]uint64(nil), cached.Bits.Bits.Blocks...)
+			hasCachedHistory = true
+		}
+	}
+	if !hasCachedHistory {
+		history.MustUnmarshalWithDecoder(bin.NewBinDecoder(historyAcct.Data))
+	}
+	history.Add(slotCtx.Slot)
+	history.SetNextSlot(slotCtx.Slot + 1)
+	historyAcct.Data = history.MustMarshal()
+
+	if err := slotCtx.SetAccount(recentAcct.Key, recentAcct); err != nil {
+		return fmt.Errorf("write RecentBlockhashes sysvar: %w", err)
+	}
+	if err := slotCtx.SetAccount(historyAcct.Key, historyAcct); err != nil {
+		return fmt.Errorf("write SlotHistory sysvar: %w", err)
+	}
+
+	bankSysvars := slotCtx.BankSysvars()
+	if bankSysvars == nil {
+		bankSysvars, err = sealevel.NewBankSysvars(slotCtx.Slot, recentAcct, historyAcct)
+	} else {
+		bankSysvars, err = bankSysvars.WithAccounts(recentAcct, historyAcct)
+	}
+	if err != nil {
+		return fmt.Errorf("update finalized bank sysvar snapshot: %w", err)
+	}
+	if err := slotCtx.PublishBankSysvars(bankSysvars); err != nil {
+		return err
+	}
+
+	// The legacy singleton remains an ordered-replay bootstrap/checkpoint aid.
+	// Never publish speculative producer state into it.
+	if slotCtx.Replay {
+		recentForLegacy := append(sealevel.SysvarRecentBlockhashes(nil), recent...)
+		historyForLegacy := history
+		historyForLegacy.Bits.Bits.Blocks = append([]uint64(nil), history.Bits.Bits.Blocks...)
+		sealevel.SysvarCache.RecentBlockHashes.Sysvar = &recentForLegacy
+		sealevel.SysvarCache.RecentBlockHashes.Acct = recentAcct.Clone()
+		sealevel.SysvarCache.SlotHistory.Sysvar = &historyForLegacy
+		sealevel.SysvarCache.SlotHistory.Acct = historyAcct.Clone()
+	}
+	return nil
+}
+
+func collectSysvarAcctsForAdh(slotCtx *sealevel.SlotCtx) []*accounts.Account {
 	sysvarPubkeys := []solana.PublicKey{sealevel.SysvarClockAddr, sealevel.SysvarRecentBlockHashesAddr, sealevel.SysvarSlotHashesAddr, sealevel.SysvarSlotHistoryAddr}
 	var sysvarAccts []*accounts.Account
 
@@ -214,21 +294,6 @@ func collectAndUpdateSysvarAcctsForAdh(slotCtx *sealevel.SlotCtx) []*accounts.Ac
 		acct, err := slotCtx.GetAccount(pk)
 		if err != nil {
 			panic(fmt.Sprintf("unable to get sysvar account for ADH: %s", pk))
-		}
-
-		if acct.Key == sealevel.SysvarSlotHistoryAddr {
-			slotHistory := sealevel.SysvarCache.SlotHistory.Sysvar
-			slotHistory.Add(slotCtx.Slot)
-			slotHistory.SetNextSlot(slotCtx.Slot + 1)
-			newSlotHistoryBytes := slotHistory.MustMarshal()
-			copy(acct.Data, newSlotHistoryBytes)
-		}
-
-		if acct.Key == sealevel.SysvarRecentBlockHashesAddr {
-			recentBlockhashes := sealevel.SysvarCache.RecentBlockHashes.Sysvar
-			slotCtx.LatestEvictedBlockhash = recentBlockhashes.PushLatest(slotCtx.Blockhash, slotCtx.FeeRateGovernor.LamportsPerSignature)
-			newRecentBlockhashesBytes := recentBlockhashes.MustMarshal()
-			copy(acct.Data, newRecentBlockhashesBytes)
 		}
 
 		sysvarAccts = append(sysvarAccts, acct)

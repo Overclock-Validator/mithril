@@ -694,6 +694,19 @@ func (bs *BlockSource) queueAlpenglowParentSwitchLocked(blk *b.Block) bool {
 			event.ChildID, event.ChildSlot, event.ParentID, event.ParentSlot, reason)
 		return false
 	}
+	if event.ChildSlot < bs.nextSlotToSend && !bs.alpenglowParentSwitchSelectedByDecision(event) {
+		// Exact parent linkage proves that this is a coherent alternate branch,
+		// not that it won fork choice. Once the source has already emitted past
+		// the child, replacing and tombstoning that progressed suffix on arrival
+		// order alone is destructive: a delayed earlier-slot sibling could erase
+		// the branch whose later finalized child proves the intervening skips.
+		// Keep first-emitted selection until consensus decisively names the late
+		// child; SetKnownAlpenglowBlockID then clears this soft tombstone.
+		bs.rejectAlpenglowBlockID(event.ChildSlot, event.ChildID)
+		mlog.Log.Warnf("ALPENGLOW progressed branch retained: dropping late speculative child %s at slot %d behind emitted frontier %d; exact parent link alone cannot replace the emitted suffix",
+			event.ChildID, event.ChildSlot, bs.nextSlotToSend-1)
+		return false
+	}
 	if pending := bs.pendingAlpenglowParentSwitch; pending != nil {
 		return *pending == event
 	}
@@ -707,6 +720,14 @@ func (bs *BlockSource) queueAlpenglowParentSwitchLocked(blk *b.Block) bool {
 		// is set. Do not replace it and risk reordering two replay rewinds.
 	}
 	return true
+}
+
+func (bs *BlockSource) alpenglowParentSwitchSelectedByDecision(event AlpenglowParentSwitch) bool {
+	if bs.alpenglowDecisionSource == nil {
+		return false
+	}
+	decision, ok := bs.alpenglowDecisionSource(event.ChildSlot - 1)
+	return ok && decision.Slot == event.ChildSlot && decision.Kind == alpenglow.ChainDecisionKindBlock && decision.Block.Hash == event.ChildID
 }
 
 // alpenglowParentSwitchConflictsWithDecision checks the entire direct-link

@@ -6,9 +6,9 @@ import (
 	"github.com/gagliardetto/solana-go"
 )
 
-// EntryBuilder emits one entry per batch: an entry count, num_hashes, a
-// 32-byte hash, and a transaction count precede the serialized transactions.
-const singleEntryBatchHeaderBytes = 8 + 8 + 32 + 8
+// entryBatchOverheadBytes is the wincode prefix for a one-entry batch:
+// entry count, num_hashes, hash, and transaction count.
+const entryBatchOverheadBytes = 8 + 8 + 32 + 8
 
 // EntryBuilder accumulates forged transactions into Alpenglow-style entry batches.
 type EntryBuilder struct {
@@ -17,6 +17,8 @@ type EntryBuilder struct {
 	pendingTxns            []solana.Transaction
 	pendingWire            int
 	pendingSerializedBytes int
+	flushedBytes           int
+	reservedBytes          int
 	entryHash              solana.Hash
 }
 
@@ -35,6 +37,68 @@ func (b *EntryBuilder) PendingWireBytes() int {
 	return b.pendingWire
 }
 
+func (b *EntryBuilder) FlushedBytes() int {
+	return b.flushedBytes
+}
+
+func (b *EntryBuilder) ReservedBytes() int {
+	return b.reservedBytes
+}
+
+// SlotBytes is flushed entry bytes plus the current pending entry and any
+// in-flight schedule reservation.
+func (b *EntryBuilder) SlotBytes() int {
+	pending := 0
+	if len(b.pendingTxns) > 0 {
+		pending = b.projectedBytes(0)
+	}
+	return b.flushedBytes + pending + b.reservedBytes
+}
+
+func (b *EntryBuilder) wouldOverflowBatch(nextWire int) bool {
+	return len(b.pendingTxns) > 0 && b.projectedBytes(nextWire) > int(b.limits.MaxBatchBytes)
+}
+
+func (b *EntryBuilder) wouldExceedSlot(nextWire int) bool {
+	maxEntry := int(b.limits.MaxEntryBytes)
+	if maxEntry <= 0 {
+		return false
+	}
+	return b.SlotBytes()+b.admitBytes(nextWire) > maxEntry
+}
+
+func (b *EntryBuilder) admitBytes(nextWire int) int {
+	if b.wouldOverflowBatch(nextWire) || len(b.pendingTxns) == 0 {
+		return entryBatchOverheadBytes + nextWire
+	}
+	return nextWire
+}
+
+func (b *EntryBuilder) reserve(wireSize int) bool {
+	if b.wouldExceedSlot(wireSize) {
+		return false
+	}
+	b.reservedBytes += b.admitBytes(wireSize)
+	return true
+}
+
+func (b *EntryBuilder) rebateReserved(wireSize int) {
+	b.consumeReserved(wireSize)
+}
+
+func (b *EntryBuilder) consumeReserved(wireSize int) {
+	n := b.admitBytes(wireSize)
+	if b.reservedBytes < n {
+		b.reservedBytes = 0
+		return
+	}
+	b.reservedBytes -= n
+}
+
+func (b *EntryBuilder) dropReservation() {
+	b.reservedBytes = 0
+}
+
 // Append adds a forged transaction. When the batch byte budget is exceeded it
 // returns the flushed entry batch and resets the pending buffer.
 // Appended transactions must remain immutable; batches retain their nested slices.
@@ -51,8 +115,8 @@ func (b *EntryBuilder) Append(tx solana.Transaction, wireSize int) ([]turbine.En
 		wireSize = len(wire)
 	}
 
-	nextBytes := singleEntryBatchHeaderBytes + b.pendingSerializedBytes + len(wire)
-	if len(b.pendingTxns) > 0 && nextBytes > int(b.limits.MaxBatchBytes) {
+	b.consumeReserved(wireSize)
+	if b.wouldOverflowBatch(len(wire)) {
 		flushed, batchBytes := b.flushLocked()
 		b.pendingTxns = append(b.pendingTxns[:0], tx)
 		b.pendingWire = wireSize
@@ -64,6 +128,10 @@ func (b *EntryBuilder) Append(tx solana.Transaction, wireSize int) ([]turbine.En
 	b.pendingWire += wireSize
 	b.pendingSerializedBytes += len(wire)
 	return nil, 0, false
+}
+
+func (b *EntryBuilder) projectedBytes(nextWire int) int {
+	return entryBatchOverheadBytes + b.pendingSerializedBytes + nextWire
 }
 
 // Flush emits the current pending transactions as a single PoH entry.
@@ -87,9 +155,9 @@ func (b *EntryBuilder) flushLocked() ([]turbine.Entry, int) {
 		Txns:      txns,
 	}}
 	b.entryHash = entryHash
-	// Append already measured each transaction's canonical encoding. The
-	// entry hash changes the bytes, but not the fixed-size entry header.
-	batchBytes := singleEntryBatchHeaderBytes + b.pendingSerializedBytes
+	// Append measured canonical transaction sizes; hashing does not change length.
+	batchBytes := entryBatchOverheadBytes + b.pendingSerializedBytes
+	b.flushedBytes += batchBytes
 	b.pendingTxns = b.pendingTxns[:0]
 	b.pendingWire = 0
 	b.pendingSerializedBytes = 0

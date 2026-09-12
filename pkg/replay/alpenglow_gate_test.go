@@ -6,13 +6,15 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/alpenglow"
 	consensusengine "github.com/Overclock-Validator/mithril/pkg/consensus"
+	"github.com/Overclock-Validator/mithril/pkg/state"
 	"github.com/gagliardetto/solana-go"
 )
 
 type stubFinalityEngine struct {
 	consensusengine.Engine
-	finalized map[uint64]alpenglow.BlockID
-	conflicts map[uint64]bool
+	finalized      map[uint64]alpenglow.BlockID
+	finalizedSkips map[uint64]alpenglow.BlockID
+	conflicts      map[uint64]bool
 }
 
 func (s *stubFinalityEngine) FinalizedBlockAt(slot uint64) (alpenglow.BlockID, bool) {
@@ -22,6 +24,11 @@ func (s *stubFinalityEngine) FinalizedBlockAt(slot uint64) (alpenglow.BlockID, b
 
 func (s *stubFinalityEngine) FinalityConflictAt(slot uint64) bool {
 	return s.conflicts[slot]
+}
+
+func (s *stubFinalityEngine) FinalizedSkipAt(slot uint64) (alpenglow.BlockID, bool) {
+	via, ok := s.finalizedSkips[slot]
+	return via, ok
 }
 
 func TestPromotionGatePassesMatchingSlots(t *testing.T) {
@@ -115,6 +122,46 @@ func TestPromotionGateStopsOnConflict(t *testing.T) {
 	}
 }
 
+func TestPromotionGateStopsOnFinalizedSkipMismatch(t *testing.T) {
+	via := alpenglow.BlockID{Slot: 8, Hash: solana.Hash{0x8}}
+	engine := &stubFinalityEngine{finalizedSkips: map[uint64]alpenglow.BlockID{
+		5: via,
+		6: via,
+	}}
+	through, err := alpenglowPromotionGate(engine, nil,
+		map[uint64]solana.Hash{5: {0xA}, 6: {}}, nil, 4, 8, 8, nil)
+	if through != 4 {
+		t.Fatalf("executed block at finalized-skipped slot 5 must cap promotion at 4, got %d", through)
+	}
+	var mismatch *AlpenglowFinalityMismatch
+	if !errors.As(err, &mismatch) || mismatch.Slot != 5 || !mismatch.Skip || mismatch.Conflict {
+		t.Fatalf("want finalized-skip mismatch at slot 5, got %#v (%v)", mismatch, err)
+	}
+
+	through, err = alpenglowPromotionGate(engine, nil,
+		map[uint64]solana.Hash{5: {}, 6: {}}, nil, 4, 8, 8, nil)
+	if err != nil || through != 8 {
+		t.Fatalf("local skips must match finalized skipped ancestry: through=%d err=%v", through, err)
+	}
+}
+
+func TestFinalizedSkipEvidenceIsDistinctFromConflict(t *testing.T) {
+	mithrilState := &state.MithrilState{}
+	recordAlpenglowEvidence(mithrilState, &AlpenglowFinalityMismatch{
+		Slot: 5, Executed: solana.Hash{0xA}, Skip: true,
+	})
+	if len(mithrilState.AlpenglowEvidence) != 1 {
+		t.Fatalf("evidence count = %d, want 1", len(mithrilState.AlpenglowEvidence))
+	}
+	ev := mithrilState.AlpenglowEvidence[0]
+	if !ev.Skip || ev.Conflict {
+		t.Fatalf("finalized skip evidence lost outcome distinction: %+v", ev)
+	}
+	if ev.Finalized != "0000000000000000000000000000000000000000000000000000000000000000" {
+		t.Fatalf("finalized skip encoding = %q", ev.Finalized)
+	}
+}
+
 // Fresh bootstrap: lastRooted starts at 0 while the executed tip is in the millions —
 // the walk must be floored at the tail depth, not span the whole chain.
 func TestPromotionGateWalkFlooredAtTailDepth(t *testing.T) {
@@ -132,7 +179,7 @@ func TestPromotionGateWalkFlooredAtTailDepth(t *testing.T) {
 // Persisted evidence: a previously-disputed slot promotes only on an exact executed
 // match — the delegated-trust pass (missing sides) no longer applies to it.
 func TestPromotionGateForcedEvidence(t *testing.T) {
-	forced := map[uint64]solana.Hash{5: {0xA}}
+	forced := map[uint64]alpenglowFinalityExpectation{5: {Block: solana.Hash{0xA}}}
 
 	// No executed identity (RPC block): would pass under delegated trust, must now stop.
 	through, err := alpenglowPromotionGate(&stubFinalityEngine{}, nil, nil, forced, 4, 8, 8, nil)
@@ -153,12 +200,19 @@ func TestPromotionGateForcedEvidence(t *testing.T) {
 	}
 	// Conflict evidence (zero hash): never promotes.
 	through, err = alpenglowPromotionGate(&stubFinalityEngine{}, nil,
-		map[uint64]solana.Hash{5: {0xA}}, map[uint64]solana.Hash{5: {}}, 4, 8, 8, nil)
+		map[uint64]solana.Hash{5: {0xA}}, map[uint64]alpenglowFinalityExpectation{5: {Conflict: true}}, 4, 8, 8, nil)
 	if through != 4 || err == nil {
 		t.Fatalf("conflict evidence must block promotion: through=%d err=%v", through, err)
 	}
 	var mismatch *AlpenglowFinalityMismatch
 	if !errors.As(err, &mismatch) || !mismatch.Conflict {
 		t.Fatalf("conflict evidence must surface as Conflict, got %v", err)
+	}
+	// A persisted finalized skip is a valid zero local outcome, not a
+	// conflict sentinel.
+	through, err = alpenglowPromotionGate(&stubFinalityEngine{}, nil,
+		map[uint64]solana.Hash{5: {}}, map[uint64]alpenglowFinalityExpectation{5: {Skip: true}}, 4, 8, 8, nil)
+	if err != nil || through != 8 {
+		t.Fatalf("persisted finalized skip must accept the local skip: through=%d err=%v", through, err)
 	}
 }

@@ -11,3 +11,14 @@ func TestDefaultTargetBatchBytesMatchesTwoTypicalFECSets(t *testing.T) {
 		t.Fatal("default batch target must remain two complete typical FEC payloads")
 	}
 }
+
+// A batch spanning multiple FEC sets must consume each set from the slot budget.
+func TestPackEntryBytesMaxFitsAvailableFECs(t *testing.T) {
+	for fecSets := uint64(0); fecSets < 100; fecSets++ {
+		got := PackEntryBytesMax(fecSets*DataShredsPerFECSet, MaxMicroblockBytes)
+		capacity := fecSets * TypicalFECSetPayloadBytes
+		if got > capacity {
+			t.Fatalf("%d FEC sets: entry budget %d exceeds raw payload capacity %d", fecSets, got, capacity)
+		}
+	}
+}

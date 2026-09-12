@@ -35,18 +35,8 @@ const (
 	BackendR51 = "r51"
 	// BackendGeneric forces the portable pure-Go backend.
 	BackendGeneric = "generic"
-	// BackendStdlib selects the library's own crypto/ed25519-backed arithmetic.
-	// It swaps out the r51 assembly, the comb tables and the batch kernels --
-	// where an implementation bug would realistically live -- while leaving the
-	// acceptance rule untouched, so an operator can rule those out without
-	// rebuilding.
-	//
-	// This deliberately does NOT bypass the library. An earlier revision routed
-	// this name straight at crypto/ed25519, which silently dropped the
-	// small-order rejection and made an operator flag change which signatures
-	// the node accepts. Two nodes on different settings would disagree on block
-	// validity, and the flag would be reached for under exactly the pressure
-	// that makes a silent fork worst. The predicate is not an operator knob.
+	// BackendStdlib uses Go's crypto/ed25519-backed arithmetic, but with the
+	// strictness checks applied first.
 	BackendStdlib = "stdlib"
 )
 

@@ -89,3 +89,42 @@ func (t *CostTracker) Record(cost TransactionCost) {
 	}
 	t.allocatedDataSizeDelta += cost.AllocatedAccountsDataSize
 }
+
+// Rebate replaces reserved execution and loaded-accounts cost with the actual
+// usage. Signature, write-lock, and instruction-data costs are left as recorded.
+func (t *CostTracker) Rebate(estimated TransactionCost, actualExec, actualLoaded uint64) {
+	estimatedUsage := estimated.ProgramsExecutionCost + estimated.LoadedAccountsDataSizeCost
+	actualUsage := actualExec + actualLoaded
+	if actualUsage == estimatedUsage {
+		return
+	}
+	if actualUsage < estimatedUsage {
+		t.adjustUsage(estimated.WritableAccounts, estimatedUsage-actualUsage, false)
+		return
+	}
+	t.adjustUsage(estimated.WritableAccounts, actualUsage-estimatedUsage, true)
+}
+
+func (t *CostTracker) adjustUsage(writable []solana.PublicKey, delta uint64, add bool) {
+	if delta == 0 {
+		return
+	}
+	if add {
+		t.blockCost += delta
+		for _, pk := range writable {
+			t.perWritableAccountCost[pk] += delta
+		}
+		return
+	}
+	t.blockCost = satSub(t.blockCost, delta)
+	for _, pk := range writable {
+		t.perWritableAccountCost[pk] = satSub(t.perWritableAccountCost[pk], delta)
+	}
+}
+
+func satSub(v, delta uint64) uint64 {
+	if v < delta {
+		return 0
+	}
+	return v - delta
+}

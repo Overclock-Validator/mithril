@@ -3,6 +3,7 @@ package replay
 import (
 	"testing"
 
+	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -21,6 +22,38 @@ func TestPercentileHelpers(t *testing.T) {
 	// Empty inputs are zeros, never a panic.
 	assert.Equal(t, 0.0, medianF(nil))
 	assert.Equal(t, 0.0, maxF(nil))
+}
+
+func TestFormatSlotETA(t *testing.T) {
+	assert.Equal(t, "200ms", formatSlotETA(1))
+	assert.Equal(t, "1.0s", formatSlotETA(5))
+	assert.Equal(t, "23s", formatSlotETA(117))
+	assert.Equal(t, "1m00s", formatSlotETA(300))
+	assert.Equal(t, "1m30s", formatSlotETA(450))
+}
+
+func TestNextLeaderHint(t *testing.T) {
+	var identity solana.PublicKey
+	identity[0] = 7
+	lookup := func(_ solana.PublicKey, from uint64) (uint64, bool) {
+		if from <= 110 {
+			return 110, true
+		}
+		if from <= 200 {
+			return 200, true
+		}
+		return 0, false
+	}
+	c := &nextLeaderCursor{identity: identity, lookup: lookup}
+
+	assert.Equal(t, "next 110 ~1.0s", c.hint(105))
+	assert.Equal(t, "ours", c.hint(110))
+	assert.Equal(t, "next 200 ~18s", c.hint(111))
+	assert.Equal(t, "", c.hint(201))
+	assert.Equal(t, "", newNextLeaderCursor(solana.PublicKey{}).hint(1))
+	assert.Equal(t,
+		"slot 1 | leader abcd...xyz | ours",
+		appendNextLeaderHint("slot 1 | leader abcd...xyz", "ours"))
 }
 
 func TestFormatHelpers(t *testing.T) {

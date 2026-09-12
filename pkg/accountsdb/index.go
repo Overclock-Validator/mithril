@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
@@ -102,19 +104,20 @@ func BuildIndexEntriesFromAppendVecs(data []byte, fileSize uint64, slot uint64, 
 	pubkeys := make([]solana.PublicKey, 0, 20000)
 	acctIdxEntries := make([]AccountIndexEntry, 0, 20000)
 	stakeEntries := make([]StakeIndexEntry, 0, 1000)
-	var err error
-
 	parser := &appendVecParser{Buf: data, FileSize: fileSize, FileId: fileId, Slot: slot}
 
 	var owner solana.PublicKey
 	for {
 		pubkeys = append(pubkeys, solana.PublicKey{})
 		acctIdxEntries = append(acctIdxEntries, AccountIndexEntry{})
-		err = parser.ParseNextAcctWithOwner(&pubkeys[len(pubkeys)-1], &acctIdxEntries[len(acctIdxEntries)-1], &owner)
+		err := parser.ParseNextAcctWithOwner(&pubkeys[len(pubkeys)-1], &acctIdxEntries[len(acctIdxEntries)-1], &owner)
 		if err != nil {
 			pubkeys = pubkeys[:len(pubkeys)-1]
 			acctIdxEntries = acctIdxEntries[:len(acctIdxEntries)-1]
-			break
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, nil, nil, fmt.Errorf("parse appendvec slot=%d file_id=%d: %w", slot, fileId, err)
 		}
 		// Collect stake account entries with appendvec location hints
 		if bytes.Equal(owner[:], addresses.StakeProgramAddr[:]) {

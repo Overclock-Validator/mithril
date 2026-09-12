@@ -29,10 +29,11 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/arena"
 	"github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/blockprod"
+	"github.com/Overclock-Validator/mithril/pkg/blockprod/scheduler"
 	"github.com/Overclock-Validator/mithril/pkg/blockstream"
 	"github.com/Overclock-Validator/mithril/pkg/config"
 	consensusengine "github.com/Overclock-Validator/mithril/pkg/consensus"
-	"github.com/Overclock-Validator/mithril/pkg/forge"
+	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
 	"github.com/Overclock-Validator/mithril/pkg/lightbringer"
@@ -80,6 +81,7 @@ var (
 	scratchDirectory                string
 	rpcEndpoints                    []string
 	cluster                         string // "alpenglow", "mainnet-beta", "testnet", or "devnet"
+	legacyGenesisHash               string // explicit lineage for pre-binding AccountsDB/ledger artifacts
 	blockSource                     string // "turbine", "rpc", or "lightbringer"
 	lightbringerEndpoint            string
 	repairCatchupMaxGapSlots        int    // Resume gaps up to this fill via turbine repair instead of RPC (0 = off)
@@ -269,6 +271,139 @@ func catchupShredSpoolDir() string {
 	return filepath.Join(blockstorePath, "catchup-spool")
 }
 
+func shortHash(hash string) string {
+	if len(hash) <= 12 {
+		return hash
+	}
+	return hash[:12]
+}
+
+// newReadyStateForBootstrap is the single construction path for a freshly
+// built AccountsDB. A build without a confirmed genesis must remain invalid
+// rather than producing another unbound "ready" marker.
+func newReadyStateForBootstrap(snapshotSlot, snapshotEpoch uint64, buildMode, cluster, genesisHash string) (*state.MithrilState, error) {
+	if strings.TrimSpace(cluster) == "" {
+		return nil, fmt.Errorf("cannot mark AccountsDB ready without a cluster")
+	}
+	if strings.TrimSpace(genesisHash) == "" {
+		return nil, fmt.Errorf("cannot mark AccountsDB ready without a confirmed RPC genesis hash")
+	}
+	if err := validateGenesisHashString("ready state", genesisHash); err != nil {
+		return nil, err
+	}
+	return state.NewReadyStateWithOpts(state.NewReadyStateOpts{
+		SnapshotSlot:  snapshotSlot,
+		SnapshotEpoch: snapshotEpoch,
+		BuildMode:     buildMode,
+		Cluster:       cluster,
+		GenesisHash:   genesisHash,
+		WriterVersion: getVersion(),
+		WriterCommit:  getCommit(),
+	}), nil
+}
+
+func saveReadyStateForBootstrap(accountsPath string, manifest *snapshot.SnapshotManifest, buildMode, cluster, genesisHash string) (*state.MithrilState, error) {
+	if manifest == nil || manifest.Bank == nil {
+		return nil, fmt.Errorf("cannot mark AccountsDB ready without a snapshot manifest")
+	}
+	mithrilState, err := newReadyStateForBootstrap(
+		manifest.Bank.Slot, snapshotEpochForState(manifest), buildMode, cluster, genesisHash,
+	)
+	if err != nil {
+		return nil, err
+	}
+	snapshot.PopulateManifestSeed(mithrilState, manifest)
+	if err := mithrilState.Save(accountsPath); err != nil {
+		return nil, fmt.Errorf("save ready state: %w", err)
+	}
+	return mithrilState, nil
+}
+
+func validateAccountsGenesisForBootstrap(hasValidState bool, storedGenesis, assertedLegacyGenesis, currentGenesis, buildMode string) (priorGenesis string, mismatch bool, err error) {
+	if err := validateGenesisHashString("current RPC", currentGenesis); err != nil {
+		return "", false, err
+	}
+	if !hasValidState {
+		return "", false, nil
+	}
+	priorGenesis = strings.TrimSpace(storedGenesis)
+	if priorGenesis != "" {
+		if err := validateGenesisHashString("stored AccountsDB", priorGenesis); err != nil {
+			return priorGenesis, false, err
+		}
+	}
+	if priorGenesis == "" {
+		priorGenesis = strings.TrimSpace(assertedLegacyGenesis)
+		if priorGenesis != "" {
+			if err := validateGenesisHashString("legacy assertion", priorGenesis); err != nil {
+				return priorGenesis, false, err
+			}
+		}
+	}
+	if priorGenesis == "" {
+		if buildMode == "new-snapshot" {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("existing AccountsDB has no genesis binding; refusing to adopt the current RPC genesis implicitly")
+	}
+	if priorGenesis == currentGenesis {
+		return priorGenesis, false, nil
+	}
+	if buildMode != "new-snapshot" {
+		return priorGenesis, true, fmt.Errorf("genesis hash mismatch: existing AccountsDB belongs to %s, RPC returned %s", priorGenesis, currentGenesis)
+	}
+	return priorGenesis, true, nil
+}
+
+func validateGenesisHashString(label, hash string) error {
+	decoded, err := base58.Decode(hash)
+	if err != nil || len(decoded) != 32 {
+		return fmt.Errorf("%s genesis hash must be base58 encoding of exactly 32 bytes", label)
+	}
+	return nil
+}
+
+// loadBootstrapState distinguishes an absent or deliberately invalid state
+// marker from one that cannot be decoded or checked. Only new-snapshot is
+// allowed to replace an unreadable state file; every other mode fails closed
+// because it cannot prove the lineage of a local or explicitly supplied input.
+func loadBootstrapState(accountsPath, buildMode string) (*state.MithrilState, error) {
+	return loadBootstrapStateWith(
+		accountsPath,
+		buildMode,
+		state.LoadState,
+		state.CheckAndLoadValidState,
+	)
+}
+
+func loadBootstrapStateWith(
+	accountsPath, buildMode string,
+	loadState func(string) (*state.MithrilState, error),
+	checkState func(string) (*state.MithrilState, error),
+) (*state.MithrilState, error) {
+	// CheckAndLoadValidState intentionally classifies non-ready/corrupted states
+	// as unusable, but older implementations also classified decode errors as
+	// absence. LoadState first so malformed state cannot silently enter an auto
+	// rebuild or legacy-detection path.
+	if _, err := loadState(accountsPath); err != nil {
+		if buildMode == "new-snapshot" {
+			mlog.Log.Warnf("mode=new-snapshot: unreadable existing state will be replaced: %v", err)
+			return nil, nil
+		}
+		return nil, fmt.Errorf("load AccountsDB state: %w", err)
+	}
+
+	validState, err := checkState(accountsPath)
+	if err != nil {
+		if buildMode == "new-snapshot" {
+			mlog.Log.Warnf("mode=new-snapshot: invalid existing state will be replaced: %v", err)
+			return nil, nil
+		}
+		return nil, fmt.Errorf("check AccountsDB state: %w", err)
+	}
+	return validState, nil
+}
+
 func loadValidatorIdentityKeypair(path string) (ed25519.PrivateKey, string, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -390,6 +525,7 @@ func init() {
 	// [network] section flags
 	Run.Flags().StringSliceVarP(&rpcEndpoints, "rpc", "r", []string{}, "URL(s) for RPC endpoint(s) - can specify multiple")
 	Run.Flags().StringVar(&cluster, "cluster", "", "Solana cluster: 'alpenglow' (default), 'mainnet-beta', 'testnet', or 'devnet'")
+	Run.Flags().StringVar(&legacyGenesisHash, "legacy-genesis-hash", "", "Genesis hash owning legacy unbound AccountsDB/ledger artifacts (one-time re-genesis safety acknowledgement)")
 
 	// [rpc] section flags (Mithril's RPC server)
 	Run.Flags().IntVar(&rpcPort, "rpc-port", 0, "RPC server port. Default off.")
@@ -403,7 +539,7 @@ func init() {
 	Run.Flags().StringVar(&consensusModeFlag, "consensus-mode", "verifying", "Node mode: 'verifying' (default; non-voting) or Alpenglow-only 'validator' (TPU, block production, and Votor voting active)")
 	Run.Flags().StringVar(&alpenglowObserverBindAddr, "alpenglow-observer-bind-addr", "", "Alpenglow Votor QUIC listener address")
 	Run.Flags().StringVar(&alpenglowBLSDST, "alpenglow-bls-dst", "", "BLS hash-to-curve DST override (must match cluster's solana-bls version; empty = default)")
-	Run.Flags().Int64Var(&alpenglowMaxMessageBytes, "alpenglow-max-message-bytes", 0, "Maximum Alpenglow Votor QUIC stream payload size (0 = default)")
+	Run.Flags().Int64Var(&alpenglowMaxMessageBytes, "alpenglow-max-message-bytes", 0, "Maximum Alpenglow Votor QUIC datagram payload size (0 = default)")
 	Run.Flags().StringVar(&validatorIdentityKeypair, "identity-keypair", "", "Validator identity keypair for native turbine gossip (Solana keygen JSON)")
 	Run.Flags().StringVar(&validatorVoteAccountKeypair, "vote-account-keypair", "", "On-chain vote account public key or keypair path")
 	Run.Flags().StringVar(&validatorAuthorizedVoterKeypair, "authorized-voter-keypair", "", "Authorized voter keypair used to derive the Alpenglow BLS signer (defaults to identity-keypair, matching Agave)")
@@ -423,7 +559,7 @@ func init() {
 	Run.Flags().IntVar(&snapshot.SnapshotIndexShards, "snapshot-index-shards", snapshot.DefaultSnapshotIndexShards, "Snapshot bootstrap account-index shard count")
 	Run.Flags().StringVar(&snapshot.SnapshotIndexTempDir, "snapshot-index-temp-dir", "", "Optional directory for snapshot index shard logs/SST staging")
 	Run.Flags().StringVar(&sigverify.Cfg.Backend, "sigverify-backend", sigverify.Defaults().Backend,
-		"ed25519 verification backend: auto|r51|generic|stdlib (stdlib is a rollback that restores the pre-strict predicate)")
+		"ed25519 verification backend: auto|r51|generic|stdlib")
 	Run.Flags().BoolVar(&sbpf.UsePool, "use-pool", true, "Disable to allocate fresh slices")
 	Run.Flags().IntVar(&accountsdb.StoreAccountsWorkers, "store-accounts-workers", 128, "Number of workers to write account updates")
 	Run.Flags().IntVar(&accountsdb.ProgramCacheMaxMB, "program-cache-max-mb", accountsdb.DefaultProgramCacheMaxMB, "Maximum approximate SBPF program cache size in MiB")
@@ -672,6 +808,12 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	if cluster == "" {
 		cluster = "alpenglow"
 		mlog.Log.Infof("network.cluster not set; defaulting to %q", cluster)
+	}
+	legacyGenesisHash = strings.TrimSpace(getString("legacy-genesis-hash", "network.legacy_genesis_hash"))
+	if legacyGenesisHash != "" {
+		if err := validateGenesisHashString("network.legacy_genesis_hash", legacyGenesisHash); err != nil {
+			return err
+		}
 	}
 	alpenglowMode, err := alpenglowModeForCluster(cluster)
 	if err != nil {
@@ -1195,6 +1337,76 @@ func runLive(c *cobra.Command, args []string) {
 	// Now start the metrics server (after banner so errors don't appear first)
 	statsd.StartMetricsServer()
 
+	// Chain lineage is a startup gate, not part of AccountsDB bootstrap. Resolve
+	// it before Lightbringer can open ledger storage and before history records
+	// describe any mutation. Fetch genesis exactly once and carry that value
+	// through every fresh ready-state write below.
+	if len(rpcEndpoints) == 0 {
+		rpcEndpoints = []string{"https://api.mainnet-beta.solana.com"}
+	}
+	networkGenesisHash := fetchGenesisHash(ctx)
+	if networkGenesisHash == "" {
+		klog.Fatalf("FATAL: could not confirm the RPC genesis hash; refusing startup because AccountsDB, shred spool, and vote-history lineage cannot be validated")
+	}
+
+	mithrilState, err := loadBootstrapState(accountsPath, bootstrapMode)
+	if err != nil {
+		klog.Fatalf("FATAL: %v. Re-run with --bootstrap new-snapshot to replace the unreadable state and AccountsDB.", err)
+	}
+	hasValidState := mithrilState != nil
+
+	// Read both bindings before mutating either location. The ledger marker
+	// survives AccountsDB cleanup and therefore remains authoritative for the
+	// signed vote history and catchup spool across snapshot rebuilds.
+	ledgerBinding, err := state.LoadLedgerChainBinding(blockstorePath)
+	if err != nil {
+		klog.Fatalf("ledger chain binding is invalid: %v", err)
+	}
+	if ledgerBinding != nil && legacyGenesisHash != "" && legacyGenesisHash != ledgerBinding.GenesisHash {
+		klog.Fatalf("FATAL: --legacy-genesis-hash %s conflicts with stored ledger binding %s; refusing to choose a lineage",
+			legacyGenesisHash, ledgerBinding.GenesisHash)
+	}
+	storedAccountsGenesis := ""
+	if hasValidState {
+		storedAccountsGenesis = mithrilState.GenesisHash
+	}
+	accountsPriorGenesis, accountsGenesisMismatch, accountsGenesisErr := validateAccountsGenesisForBootstrap(
+		hasValidState, storedAccountsGenesis, legacyGenesisHash, networkGenesisHash, bootstrapMode,
+	)
+	if accountsGenesisErr != nil {
+		if accountsPriorGenesis == "" {
+			klog.Fatalf("FATAL: %v. Re-run once with --legacy-genesis-hash <the genesis hash this AccountsDB belongs to>, or use --bootstrap new-snapshot to replace it.", accountsGenesisErr)
+		}
+		klog.Fatalf("FATAL: %v. Re-run with --bootstrap new-snapshot; old ledger artifacts will be quarantined, not deleted.", accountsGenesisErr)
+	}
+
+	transition, lineageErr := state.EnsureLedgerChainBinding(
+		blockstorePath, cluster, networkGenesisHash, legacyGenesisHash,
+	)
+	if lineageErr != nil {
+		if errors.Is(lineageErr, state.ErrUnboundLedgerArtifacts) {
+			klog.Fatalf("FATAL: %v. Refusing to guess the lineage of signed vote history. Re-run once with --legacy-genesis-hash <the genesis hash these artifacts belong to>.", lineageErr)
+		}
+		klog.Fatalf("FATAL: reconcile ledger chain lineage: %v", lineageErr)
+	}
+	if transition.QuarantineDir != "" {
+		mlog.Log.Warnf("confirmed re-genesis %s -> %s: quarantined %d ledger artifact(s) in %s",
+			transition.PreviousGenesisHash, transition.CurrentGenesisHash, len(transition.MovedPaths), transition.QuarantineDir)
+	}
+
+	if hasValidState && mithrilState.GenesisHash == "" && accountsPriorGenesis == networkGenesisHash {
+		mlog.Log.Infof("Binding legacy state file to cluster=%s genesis=%s...", cluster, shortHash(networkGenesisHash))
+		mithrilState.SetClusterInfo(cluster, networkGenesisHash)
+		if err := mithrilState.Save(accountsPath); err != nil {
+			klog.Fatalf("persist legacy state genesis binding: %v", err)
+		}
+	}
+	if accountsGenesisMismatch {
+		// new-snapshot is the only mode admitted above. Make sure no later auto
+		// path can accidentally resume the old AccountsDB.
+		hasValidState = false
+	}
+
 	// Lightbringer sidecar management
 	var lbManager *lightbringer.Manager
 	useLightbringer := blockSource == "lightbringer"
@@ -1248,6 +1460,19 @@ func runLive(c *cobra.Command, args []string) {
 			return true
 		}
 		startPrewarm := func(m *snapshot.SnapshotManifest, origin string) {
+			epochSchedule := m.Bank.EpochSchedule
+			rootSlot := m.Bank.Slot
+			stakesForSlot := func(slot uint64) map[solana.PublicKey]uint64 {
+				epoch := epochSchedule.GetEpoch(slot)
+				voteAccounts := global.EpochStakesVoteAccts(epoch)
+				return turbine.StakedNodes(global.EpochStakes(epoch), func(vote solana.PublicKey) (solana.PublicKey, bool) {
+					voteAccount, ok := voteAccounts[vote]
+					if !ok || voteAccount == nil {
+						return solana.PublicKey{}, false
+					}
+					return voteAccount.NodePubkey, true
+				})
+			}
 			pw, err := blockstream.StartTurbinePrewarm(blockstream.TurbinePrewarmConfig{
 				BindAddr:                   turbineBindAddr,
 				GossipEntrypoint:           turbineGossipEntrypoint,
@@ -1257,6 +1482,11 @@ func runLive(c *cobra.Command, args []string) {
 				AlpenglowAddr:              alpenglowObserverBindAddr,
 				Identity:                   validatorIdentity,
 				LeaderForSlot:              global.LeaderForSlot,
+				StakesForSlot:              stakesForSlot,
+				EpochForSlot:               epochSchedule.GetEpoch,
+				RootSlot:                   func() uint64 { return rootSlot },
+				UseChaCha8:                 true,
+				DedupAddrs:                 false,
 				FloorSlot:                  m.Bank.Slot + 1,
 				ShredSpoolDir:              catchupShredSpoolDir(),
 				RepairMaxRequestsPerSecond: repairMaxRequestsPerSecond,
@@ -1435,14 +1665,9 @@ func runLive(c *cobra.Command, args []string) {
 		defer pprof.StopCPUProfile()
 	}
 
-	if len(rpcEndpoints) == 0 {
-		rpcEndpoints = []string{"https://api.mainnet-beta.solana.com"}
-	}
-
 	// Bootstrap: determine how to initialize AccountsDB based on mode
 	var accountsDb *accountsdb.AccountsDb
 	var manifest *snapshot.SnapshotManifest
-	var mithrilState *state.MithrilState
 
 	// Fold recovery runs once on existing-DB startup, BEFORE
 	// ValidateAgainstBankhashDB, because it restores the index tail and the
@@ -1461,33 +1686,20 @@ func runLive(c *cobra.Command, args []string) {
 		}
 	}
 
-	// Check for valid state file first (this is the authoritative source of truth)
-	mithrilState, _ = state.CheckAndLoadValidState(accountsPath)
-	hasValidState := mithrilState != nil
-
-	// Validate genesis hash if we have a valid state (prevents mainnet/testnet mixups)
-	if hasValidState {
-		genesisHash := fetchGenesisHash(ctx)
-		if genesisHash != "" {
-			if err := mithrilState.ValidateGenesisHash(genesisHash); err != nil {
-				klog.Fatalf("FATAL: %v\nThis AccountsDB was built for a different cluster. Use --bootstrap snapshot to rebuild.", err)
-			}
-			// If state has no genesis hash (older version), set it now
-			if mithrilState.GenesisHash == "" {
-				mlog.Log.Infof("Updating state file with cluster=%s genesis=%s", cluster, genesisHash[:12]+"...")
-				mithrilState.SetClusterInfo(cluster, genesisHash)
-				if err := mithrilState.Save(accountsPath); err != nil {
-					mlog.Log.Infof("WARNING: failed to update state file with cluster info: %v", err)
-				}
-			}
-		}
-	}
-
 	// Fall back to legacy detection if no state file
 	hasAccountsDB, accountsDBSlot := detectExistingAccountsDB(accountsPath)
 	if hasValidState {
 		hasAccountsDB = true
 		accountsDBSlot = mithrilState.GetCurrentSlot() // Use current slot (LastSlot if replayed, else SnapshotSlot)
+	}
+	if bootstrapMode == "accountsdb" && hasAccountsDB && !hasValidState {
+		if legacyGenesisHash == "" {
+			klog.Fatalf("FATAL: mode=accountsdb found an AccountsDB without a valid genesis-bound state. Supply --legacy-genesis-hash only if its lineage is known, or rebuild with --bootstrap new-snapshot.")
+		}
+		if legacyGenesisHash != networkGenesisHash {
+			klog.Fatalf("FATAL: mode=accountsdb cannot open legacy AccountsDB from genesis %s against RPC genesis %s; rebuild with --bootstrap new-snapshot.",
+				legacyGenesisHash, networkGenesisHash)
+		}
 	}
 
 	// Handle explicit --snapshot flag (bypasses all auto-discovery, does NOT delete snapshot files)
@@ -1522,13 +1734,10 @@ func runLive(c *cobra.Command, args []string) {
 			klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
 		}
 
-		// Write state file
-		snapshotEpoch := snapshotEpochForState(manifest)
-		mithrilState = state.NewReadyState(manifest.Bank.Slot, snapshotEpoch, "", "", 0, 0)
-		// Populate manifest seed data so replay doesn't need manifest at runtime
-		snapshot.PopulateManifestSeed(mithrilState, manifest)
-		if err := mithrilState.Save(accountsPath); err != nil {
-			mlog.Log.Errorf("failed to save state file: %v", err)
+		// Write the genesis-bound state file only after a complete build.
+		mithrilState, err = saveReadyStateForBootstrap(accountsPath, manifest, bootstrapMode, cluster, networkGenesisHash)
+		if err != nil {
+			klog.Fatalf("failed to persist ready state: %v", err)
 		}
 		state.RecordBootstrap(accountsPath, manifest.Bank.Slot, "", replay.CurrentRunID, getVersion(), getCommit(), getBranch())
 		goto postBootstrap
@@ -1606,13 +1815,10 @@ func runLive(c *cobra.Command, args []string) {
 		if err != nil {
 			klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
 		}
-		// Write state file to mark build as complete
-		snapshotEpoch := snapshotEpochForState(manifest)
-		mithrilState = state.NewReadyState(manifest.Bank.Slot, snapshotEpoch, "", "", 0, 0)
-		// Populate manifest seed data so replay doesn't need manifest at runtime
-		snapshot.PopulateManifestSeed(mithrilState, manifest)
-		if err := mithrilState.Save(accountsPath); err != nil {
-			mlog.Log.Errorf("failed to save state file: %v", err)
+		// Write state file to mark build as complete.
+		mithrilState, err = saveReadyStateForBootstrap(accountsPath, manifest, bootstrapMode, cluster, networkGenesisHash)
+		if err != nil {
+			klog.Fatalf("failed to persist ready state: %v", err)
 		}
 		// Record bootstrap in history
 		state.RecordBootstrap(accountsPath, manifest.Bank.Slot, "", replay.CurrentRunID, getVersion(), getCommit(), getBranch())
@@ -1646,11 +1852,9 @@ func runLive(c *cobra.Command, args []string) {
 		if err != nil {
 			klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
 		}
-		snapshotEpoch := snapshotEpochForState(manifest)
-		mithrilState = state.NewReadyState(manifest.Bank.Slot, snapshotEpoch, "", "", 0, 0)
-		snapshot.PopulateManifestSeed(mithrilState, manifest)
-		if err := mithrilState.Save(accountsPath); err != nil {
-			mlog.Log.Errorf("failed to save state file: %v", err)
+		mithrilState, err = saveReadyStateForBootstrap(accountsPath, manifest, bootstrapMode, cluster, networkGenesisHash)
+		if err != nil {
+			klog.Fatalf("failed to persist ready state: %v", err)
 		}
 		state.RecordBootstrap(accountsPath, manifest.Bank.Slot, "", replay.CurrentRunID, getVersion(), getCommit(), getBranch())
 
@@ -1698,13 +1902,10 @@ func runLive(c *cobra.Command, args []string) {
 		if err != nil {
 			klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
 		}
-		// Write state file to mark build as complete
-		snapshotEpoch := snapshotEpochForState(manifest)
-		mithrilState = state.NewReadyState(manifest.Bank.Slot, snapshotEpoch, "", "", 0, 0)
-		// Populate manifest seed data so replay doesn't need manifest at runtime
-		snapshot.PopulateManifestSeed(mithrilState, manifest)
-		if err := mithrilState.Save(accountsPath); err != nil {
-			mlog.Log.Errorf("failed to save state file: %v", err)
+		// Write state file to mark build as complete.
+		mithrilState, err = saveReadyStateForBootstrap(accountsPath, manifest, bootstrapMode, cluster, networkGenesisHash)
+		if err != nil {
+			klog.Fatalf("failed to persist ready state: %v", err)
 		}
 		// Record bootstrap in history
 		state.RecordBootstrap(accountsPath, manifest.Bank.Slot, "", replay.CurrentRunID, getVersion(), getCommit(), getBranch())
@@ -1797,12 +1998,9 @@ func runLive(c *cobra.Command, args []string) {
 					if err != nil {
 						klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
 					}
-					snapshotEpoch := snapshotEpochForState(manifest)
-					mithrilState = state.NewReadyState(manifest.Bank.Slot, snapshotEpoch, "", "", 0, 0)
-					// Populate manifest seed data so replay doesn't need manifest at runtime
-					snapshot.PopulateManifestSeed(mithrilState, manifest)
-					if err := mithrilState.Save(accountsPath); err != nil {
-						mlog.Log.Errorf("failed to save state file: %v", err)
+					mithrilState, err = saveReadyStateForBootstrap(accountsPath, manifest, bootstrapMode, cluster, networkGenesisHash)
+					if err != nil {
+						klog.Fatalf("failed to persist ready state: %v", err)
 					}
 					// Record bootstrap in history
 					state.RecordBootstrap(accountsPath, manifest.Bank.Slot, "", replay.CurrentRunID, getVersion(), getCommit(), getBranch())
@@ -1906,21 +2104,10 @@ func runLive(c *cobra.Command, args []string) {
 			if err != nil {
 				klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
 			}
-			// Write state file to mark build as complete
-			snapshotEpoch := snapshotEpochForState(manifest)
-			mithrilState = state.NewReadyStateWithOpts(state.NewReadyStateOpts{
-				SnapshotSlot:  manifest.Bank.Slot,
-				SnapshotEpoch: snapshotEpoch,
-				BuildMode:     bootstrapMode,
-				Cluster:       cluster,
-				GenesisHash:   fetchGenesisHash(ctx),
-				WriterVersion: getVersion(),
-				WriterCommit:  getCommit(),
-			})
-			// Populate manifest seed data so replay doesn't need manifest at runtime
-			snapshot.PopulateManifestSeed(mithrilState, manifest)
-			if err := mithrilState.Save(accountsPath); err != nil {
-				mlog.Log.Errorf("failed to save state file: %v", err)
+			// Write state file to mark build as complete.
+			mithrilState, err = saveReadyStateForBootstrap(accountsPath, manifest, bootstrapMode, cluster, networkGenesisHash)
+			if err != nil {
+				klog.Fatalf("failed to persist ready state: %v", err)
 			}
 			// Record bootstrap in history
 			state.RecordBootstrap(accountsPath, manifest.Bank.Slot, "", replay.CurrentRunID, getVersion(), getCommit(), getBranch())
@@ -2042,12 +2229,9 @@ postBootstrap:
 
 	if mithrilState == nil {
 		// Initialize state for this session
-		snapshotEpoch := snapshotEpochForState(manifest)
-		mithrilState = state.NewReadyState(manifest.Bank.Slot, snapshotEpoch, "", "", 0, 0)
-		// Populate manifest seed data so replay doesn't need manifest at runtime
-		snapshot.PopulateManifestSeed(mithrilState, manifest)
-		if err := mithrilState.Save(accountsPath); err != nil {
-			mlog.Log.Errorf("failed to save state file: %v", err)
+		mithrilState, err = saveReadyStateForBootstrap(accountsPath, manifest, bootstrapMode, cluster, networkGenesisHash)
+		if err != nil {
+			klog.Fatalf("failed to persist ready state: %v", err)
 		}
 		// Record bootstrap in history
 		state.RecordBootstrap(accountsPath, manifest.Bank.Slot, "", replay.CurrentRunID, getVersion(), getCommit(), getBranch())
@@ -2287,6 +2471,29 @@ postBootstrap:
 		}
 	}
 
+	// Validate the exact local parent bank before opening operational RPC and
+	// before starting consensus, voting, or block production. Passive turbine
+	// prewarm ingress may already be running, but it cannot participate in
+	// consensus. In particular, an Alpenglow cluster setting is not evidence that
+	// the snapshot has crossed Alpenglow genesis: the deployed feature and its
+	// consensus metadata must be present in AccountsDB.
+	if alpenglowMode {
+		if startSlot < 1 {
+			klog.Fatalf("Alpenglow replay has invalid start slot %d", startSlot)
+		}
+		parentSlot := uint64(startSlot - 1)
+		if err := replay.ValidateAlpenglowStartupState(accountsDb, parentSlot); err != nil {
+			klog.Fatalf("Alpenglow startup safety check failed: %v", err)
+		}
+		mlog.Log.Infof(
+			"Alpenglow startup safety check passed at parent slot %d (feature=%s alpenclock=%s vote_reward=%s)",
+			parentSlot,
+			features.AlpenglowFeatureGateAddress,
+			replay.NanosecondClockAccountAddr(),
+			replay.VoteRewardAccountAddr(),
+		)
+	}
+
 	// Write replay timings to run-specific log directory
 	replayTimingsPath := filepath.Join(mlog.GetLogDir(), "replay_timings.jsonl")
 	metricsWriter, metricsWriterCleanup, err := createBufWriter(replayTimingsPath)
@@ -2309,7 +2516,7 @@ postBootstrap:
 	if rpcPort < 0 || rpcPort > 65535 {
 		klog.Fatalf("invalid port: %d", rpcPort)
 	} else if rpcPort != 0 {
-		rpcServer = rpcserver.NewRpcServer(accountsDb, uint16(rpcPort), epochScheduleFromState(mithrilState))
+		rpcServer = rpcserver.NewRpcServer(accountsDb, uint16(rpcPort), epochScheduleFromState(mithrilState), solana.MustHashFromBase58(networkGenesisHash))
 		rpcServer.Start()
 		mlog.Log.Infof("Started RPC server on port %d", rpcPort)
 	}
@@ -2318,7 +2525,12 @@ postBootstrap:
 	// Classic clusters deliberately run without a certificate engine and keep
 	// their verifying-only replay semantics.
 	var consensusEngine *consensusengine.AlpenglowObserverEngine
+	var alpenglowEpochSchedule *sealevel.SysvarEpochSchedule
 	if alpenglowMode {
+		alpenglowEpochSchedule = epochScheduleFromState(mithrilState)
+		if alpenglowEpochSchedule == nil {
+			klog.Fatalf("Alpenglow consensus requires an epoch schedule in the snapshot/state seed")
+		}
 		consensusEngine, err = consensusengine.NewEngine(consensusengine.Config{
 			AlpenglowObserverBindAddr: alpenglowObserverBindAddr,
 			AlpenglowMaxMessageBytes:  alpenglowMaxMessageBytes,
@@ -2339,6 +2551,24 @@ postBootstrap:
 				root.Hash = resumeState.ParentAlpenglowBlockID
 			}
 		}
+		// Load the same persisted/manifest stake view replay will use before the
+		// receiver or broadcaster can make an admission decision. This is crucial
+		// on AccountsDB resume, where global epoch stakes are otherwise populated
+		// only inside ReplayBlocks after the network services have started.
+		replayStartEpoch := alpenglowEpochSchedule.GetEpoch(uint64(startSlot))
+		snapshotEpoch := alpenglowEpochSchedule.GetEpoch(mithrilState.ManifestParentSlot)
+		if err := replay.LoadInitialEpochStakesCache(mithrilState, resumeState, replayStartEpoch, snapshotEpoch); err != nil {
+			klog.Fatalf("load Alpenglow epoch stakes before Votor startup: %v", err)
+		}
+		// Publish the lookup and cached VAT/rank sets before opening the QUIC
+		// listener. Otherwise an admitted validator is briefly indistinguishable
+		// from an unstaked TLS peer and every startup connection is rejected.
+		consensusEngine.SetAlpenglowEpochLookup(alpenglowEpochSchedule.GetEpoch)
+		rootEpoch := alpenglowEpochSchedule.GetEpoch(root.Slot)
+		installed, rootInstalled := replay.InstallCachedAlpenglowValidatorSets(consensusEngine, rootEpoch)
+		if !rootInstalled {
+			klog.Fatalf("unable to install the Alpenglow validator set for Votor root slot %d epoch %d before transport startup (installed %d other cached set(s))", root.Slot, rootEpoch, installed)
+		}
 		consensusEngine.SetAlpenglowRoot(root)
 		if err := consensusEngine.Start(ctx); err != nil {
 			klog.Fatalf("unable to start consensus engine %q: %v", consensusEngine.Name(), err)
@@ -2348,6 +2578,20 @@ postBootstrap:
 				mlog.Log.Warnf("consensus engine close failed: %v", err)
 			}
 		}()
+	}
+	var turbineStakesForSlot func(slot uint64) map[solana.PublicKey]uint64
+	if alpenglowEpochSchedule != nil {
+		turbineStakesForSlot = func(slot uint64) map[solana.PublicKey]uint64 {
+			epoch := alpenglowEpochSchedule.GetEpoch(slot)
+			voteAccounts := global.EpochStakesVoteAccts(epoch)
+			return turbine.StakedNodes(global.EpochStakes(epoch), func(vote solana.PublicKey) (solana.PublicKey, bool) {
+				voteAccount, ok := voteAccounts[vote]
+				if !ok || voteAccount == nil {
+					return solana.PublicKey{}, false
+				}
+				return voteAccount.NodePubkey, true
+			})
+		}
 	}
 
 	localBlocks := make(chan *block.Block, 16)
@@ -2390,10 +2634,7 @@ postBootstrap:
 		}()
 		go monitorValidatorIdentityOwnership(ctx, rpcEndpoints, solana.PrivateKey(validatorIdentity).PublicKey(), sharedGossip, cancelRun)
 
-		epochSchedule := epochScheduleFromState(mithrilState)
-		if epochSchedule == nil {
-			klog.Fatalf("validator production requires an epoch schedule in the snapshot/state seed")
-		}
+		epochSchedule := alpenglowEpochSchedule
 		global.SetWallClockSlotDuration(blockprod.AlpenglowSlotDuration)
 		wallClockSeed, err := queryWallClockSeedSlot(ctx, rpcEndpoints)
 		if err != nil {
@@ -2425,48 +2666,32 @@ postBootstrap:
 				}
 				return slot >= wallSlot || wallSlot-slot <= alpenglow.LeaderWindowSlots
 			},
-			Peers: func(slot uint64, _ []alpenglow.ValidatorStake) []*net.UDPAddr {
-				epoch := epochSchedule.GetEpoch(slot)
-				stakes := global.EpochStakes(epoch)
-				voteAccounts := global.EpochStakesVoteAccts(epoch)
-				peers := make([]*net.UDPAddr, 0, len(stakes))
-				seen := make(map[string]struct{}, len(stakes))
-				for voteAccount, stake := range stakes {
-					account := voteAccounts[voteAccount]
-					if stake == 0 || account == nil || account.NodePubkey == identityPubkey {
+			Peers: func(validators []alpenglow.ValidatorStake) []alpenglow.VotorPeer {
+				peers := make([]alpenglow.VotorPeer, 0, len(validators))
+				seen := make(map[solana.PublicKey]struct{}, len(validators))
+				for _, validator := range validators {
+					if validator.Stake == 0 || validator.NodePubkey == identityPubkey {
 						continue
 					}
-					addr, ok := sharedGossip.LookupAlpenglow(account.NodePubkey)
+					addr, ok := sharedGossip.LookupAlpenglow(validator.NodePubkey)
 					if !ok {
 						continue
 					}
-					key := addr.String()
-					if _, duplicate := seen[key]; duplicate {
+					if _, duplicate := seen[validator.NodePubkey]; duplicate {
 						continue
 					}
-					seen[key] = struct{}{}
-					peers = append(peers, addr)
+					seen[validator.NodePubkey] = struct{}{}
+					peers = append(peers, alpenglow.VotorPeer{Identity: validator.NodePubkey, Addr: addr})
 				}
 				return peers
 			},
 		}); err != nil {
 			klog.Fatalf("enable Alpenglow voting: %v", err)
 		}
-		stakesForSlot := func(slot uint64) map[solana.PublicKey]uint64 {
-			epoch := epochSchedule.GetEpoch(slot)
-			voteAccounts := global.EpochStakesVoteAccts(epoch)
-			return turbine.StakedNodes(global.EpochStakes(epoch), func(vote solana.PublicKey) (solana.PublicKey, bool) {
-				voteAccount, ok := voteAccounts[vote]
-				if !ok || voteAccount == nil {
-					return solana.PublicKey{}, false
-				}
-				return voteAccount.NodePubkey, true
-			})
-		}
 		broadcaster, err := turbine.NewTurbineBroadcaster(turbine.TurbineBroadcasterConfig{
 			Self:          solana.PrivateKey(validatorIdentity).PublicKey(),
 			Peers:         sharedGossip,
-			Stakes:        stakesForSlot,
+			Stakes:        turbineStakesForSlot,
 			EpochForSlot:  epochSchedule.GetEpoch,
 			LeaderForSlot: global.LeaderForSlot,
 			UseChaCha8:    true,
@@ -2480,12 +2705,23 @@ postBootstrap:
 		defer broadcaster.Close()
 
 		controller := blockprod.NewController()
-		topicSink := forge.NewSink(controller)
+		topicSink := scheduler.New(controller)
+		topicSink.Start(ctx)
+		defer topicSink.Stop()
 		tpuCfg := tpu.DefaultConfig()
 		tpuCfg.Identity = validatorIdentity
 		tpuCfg.ListenAddr = validatorTPUQUICBind
 		tpuCfg.AdvertisedIP = advertisedIP
 		tpuCfg.Pipeline.Sink = topicSink
+		tpuCfg.Pipeline.TxV1Enabled = func() bool {
+			// During our leader window, admission must use that working bank's
+			// feature snapshot rather than the concurrently advancing replay tip.
+			if bank := controller.WorkingBank(); bank != nil {
+				slotCtx := bank.SlotCtx()
+				return slotCtx != nil && slotCtx.Features != nil && slotCtx.Features.IsActive(features.EnableTxV1)
+			}
+			return replay.ChainTipFeatureActive(features.EnableTxV1)
+		}
 		if validatorSigverifyWorkers > 0 {
 			tpuCfg.Pipeline.SigverifyWorkers = validatorSigverifyWorkers
 		}
@@ -2542,11 +2778,19 @@ postBootstrap:
 					ParentChainedMerkleRoot:    tip.AlpenglowChainedMerkleRoot,
 					HasParentChainedMerkleRoot: tip.HasAlpenglowChainedMerkleRoot,
 					ParentLastEntryHash:        tip.LastEntryHash,
+					ParentLastBlockhash:        tip.LastBlockhash,
+					ParentBlockHeight:          tip.BlockHeight,
+					LatestEvictedBlockhash:     tip.LatestEvictedBlockhash,
 					EpochRewardsActive:         tip.EpochRewardsActive,
 					PrevNumSigs:                tip.PrevNumSigs,
 					PrevFeeGovernor:            tip.PrevFeeGovernor,
 					AcctsLtHash:                tip.AcctsLtHash,
 					Features:                   tip.Features,
+					BankSysvars:                tip.BankSysvars,
+					EpochStakes:                tip.EpochStakes,
+					TotalEpochStake:            tip.TotalEpochStake,
+					NanosecondClockAccount:     tip.NanosecondClockAccount,
+					HasNanosecondClockAccount:  tip.HasNanosecondClockAccount,
 					UnrootedRead:               tip.UnrootedRead,
 					TransactionStatuses:        tip.TransactionStatuses,
 				}
@@ -2596,6 +2840,16 @@ postBootstrap:
 		PrewarmBlocks:              validatorPrewarmBlocks,
 		ShredSpoolDir:              catchupShredSpoolDir(),
 		GossipClient:               sharedGossip,
+		TurbineStakesForSlot:       turbineStakesForSlot,
+		TurbineEpochForSlot: func(slot uint64) uint64 {
+			if alpenglowEpochSchedule == nil {
+				return slot
+			}
+			return alpenglowEpochSchedule.GetEpoch(slot)
+		},
+		TurbineRootSlot:   global.ReplayFrontier,
+		TurbineUseChaCha8: true,
+		TurbineDedupAddrs: false,
 	}
 	if consensusMode == "validator" {
 		identity := solana.PrivateKey(validatorIdentity).PublicKey()
@@ -2956,7 +3210,7 @@ func printStartupInfo(commandName string) {
 		case sigverify.BackendGeneric:
 			sigverifyDesc = "portable; no AVX512-IFMA on this CPU"
 		case sigverify.BackendStdlib:
-			sigverifyDesc = "ROLLBACK: non-strict, accepts signatures mainnet rejects"
+			sigverifyDesc = "Go's crypto/ed25519, but also uses Narya's strictness checks"
 		}
 		fmt.Printf("  Sigverify:    %s%s%s %s(%s)%s\n",
 			green, resolvedSigverifyBackend, reset, dim, sigverifyDesc, reset)

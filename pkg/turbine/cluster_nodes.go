@@ -3,8 +3,10 @@ package turbine
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"net"
 	"sort"
+	"sync"
 
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
 	"github.com/gagliardetto/solana-go"
@@ -12,6 +14,15 @@ import (
 )
 
 const maxNodesPerIPAddress = 1
+
+const (
+	// dataPlaneFanout is Agave's DATA_PLANE_FANOUT. Alpenglow initially keeps
+	// Turbine for block dissemination, so the same 200-wide tree is used.
+	dataPlaneFanout = 200
+	maxTurbineHops  = 4
+)
+
+var ErrRetransmitLoopback = errors.New("slot leader cannot retransmit its own shred")
 
 type clusterNode struct {
 	pubkey     solana.PublicKey
@@ -22,11 +33,12 @@ type clusterNode struct {
 
 // ClusterNodes implements Agave's broadcast-stage turbine peer selection.
 type ClusterNodes struct {
-	selfPubkey solana.PublicKey
-	nodes      []clusterNode
-	selfIndex  int
-	shuffle    *WeightedShuffle
-	useChaCha8 bool
+	selfPubkey  solana.PublicKey
+	nodes       []clusterNode
+	selfIndex   int
+	shuffle     *WeightedShuffle
+	shufflePool sync.Pool
+	useChaCha8  bool
 }
 
 type ClusterNodesConfig struct {
@@ -39,6 +51,14 @@ type ClusterNodesConfig struct {
 }
 
 func NewBroadcastClusterNodes(cfg ClusterNodesConfig) *ClusterNodes {
+	return newClusterNodes(cfg, true)
+}
+
+func NewRetransmitClusterNodes(cfg ClusterNodesConfig) *ClusterNodes {
+	return newClusterNodes(cfg, false)
+}
+
+func newClusterNodes(cfg ClusterNodesConfig, broadcast bool) *ClusterNodes {
 	nodes := buildClusterNodes(cfg)
 	selfIndex := -1
 	for i, node := range nodes {
@@ -52,7 +72,7 @@ func NewBroadcastClusterNodes(cfg ClusterNodesConfig) *ClusterNodes {
 		weights[i] = node.stake
 	}
 	shuffle := NewWeightedShuffle(weights)
-	if selfIndex >= 0 {
+	if broadcast && selfIndex >= 0 {
 		shuffle.RemoveIndex(selfIndex)
 	}
 	return &ClusterNodes{
@@ -61,6 +81,159 @@ func NewBroadcastClusterNodes(cfg ClusterNodesConfig) *ClusterNodes {
 		selfIndex:  selfIndex,
 		shuffle:    shuffle,
 		useChaCha8: cfg.UseChaCha8,
+	}
+}
+
+// RetransmitPeers returns this node's distance from the Turbine root and its
+// downstream peers for a shred. The leader is excluded before the weighted
+// shuffle because it already owns the shred. Tree placement and fanout match
+// Agave ClusterNodes<RetransmitStage>::get_retransmit_addrs.
+func (c *ClusterNodes) RetransmitPeers(leader solana.PublicKey, shred ShredID, fanout int) (uint8, []*net.UDPAddr, error) {
+	if c == nil || fanout <= 0 {
+		return maxTurbineHops - 1, nil, nil
+	}
+	if leader == c.selfPubkey {
+		return 0, nil, ErrRetransmitLoopback
+	}
+	shuffle := c.borrowRetransmitShuffle(leader)
+	defer c.releaseRetransmitShuffle(shuffle)
+	rng := newTurbineRNG(shred.Seed(leader), c.useChaCha8)
+	selfPos := -1
+	for position := 0; ; position++ {
+		index, ok := shuffle.Next(rng)
+		if !ok {
+			break
+		}
+		if c.nodes[index].pubkey == c.selfPubkey {
+			selfPos = position
+			break
+		}
+	}
+	if selfPos < 0 {
+		return maxTurbineHops - 1, nil, nil
+	}
+
+	offset := 0
+	if selfPos > 0 {
+		offset = (selfPos - 1) % fanout
+	}
+	anchor := selfPos - offset
+	step := fanout
+	if selfPos == 0 {
+		step = 1
+	}
+	position := anchor*fanout + offset + 1
+	peers := make([]*net.UDPAddr, 0, fanout)
+	shufflePosition := selfPos
+	for range fanout {
+		var index int
+		for shufflePosition < position {
+			var ok bool
+			index, ok = shuffle.Next(rng)
+			if !ok {
+				return turbineRootDistance(selfPos, fanout), peers, nil
+			}
+			shufflePosition++
+		}
+		node := c.nodes[index]
+		if node.hasContact {
+			if addr, ok := broadcastTVUUDP(node.tvuAddr); ok {
+				peers = append(peers, addr)
+			}
+		}
+		position += step
+	}
+	return turbineRootDistance(selfPos, fanout), peers, nil
+}
+
+// RetransmitParent returns the deterministic upstream node whose signature is
+// expected on a retransmitter-signed Merkle shred. Unstaked nodes have no
+// stable parent because their tree position depends on gossip convergence.
+func (c *ClusterNodes) RetransmitParent(leader solana.PublicKey, shred ShredID, fanout int) (solana.PublicKey, bool, error) {
+	if c == nil || fanout <= 0 {
+		return solana.PublicKey{}, false, nil
+	}
+	if leader == c.selfPubkey {
+		return solana.PublicKey{}, false, ErrRetransmitLoopback
+	}
+	if c.selfIndex < 0 || c.nodes[c.selfIndex].stake == 0 {
+		return solana.PublicKey{}, false, nil
+	}
+	shuffle := c.borrowRetransmitShuffle(leader)
+	defer c.releaseRetransmitShuffle(shuffle)
+	rng := newTurbineRNG(shred.Seed(leader), c.useChaCha8)
+	beforeSelf := make([]int, 0, len(c.nodes)/2)
+	for {
+		index, ok := shuffle.Next(rng)
+		if !ok {
+			return solana.PublicKey{}, false, nil
+		}
+		if c.nodes[index].pubkey == c.selfPubkey {
+			break
+		}
+		beforeSelf = append(beforeSelf, index)
+	}
+	selfPos := len(beforeSelf)
+	if selfPos <= 0 {
+		return solana.PublicKey{}, false, nil
+	}
+
+	offset := (selfPos - 1) % fanout
+	parentPos := (selfPos - 1) / fanout
+	if parentPos > 0 {
+		parentPos -= (parentPos - 1) % fanout
+		parentPos += offset
+	}
+	if parentPos < 0 || parentPos >= len(beforeSelf) {
+		return solana.PublicKey{}, false, nil
+	}
+	return c.nodes[beforeSelf[parentPos]].pubkey, true, nil
+}
+
+func (c *ClusterNodes) retransmitShuffle(leader solana.PublicKey, shred ShredID) []int {
+	shuffle := c.borrowRetransmitShuffle(leader)
+	defer c.releaseRetransmitShuffle(shuffle)
+	rng := newTurbineRNG(shred.Seed(leader), c.useChaCha8)
+	indices := make([]int, 0, len(c.nodes))
+	for {
+		index, ok := shuffle.Next(rng)
+		if !ok {
+			break
+		}
+		indices = append(indices, index)
+	}
+	return indices
+}
+
+func (c *ClusterNodes) borrowRetransmitShuffle(leader solana.PublicKey) *WeightedShuffle {
+	shuffle, _ := c.shufflePool.Get().(*WeightedShuffle)
+	if shuffle == nil {
+		shuffle = &WeightedShuffle{}
+	}
+	copyWeightedShuffle(shuffle, c.shuffle)
+	for i, node := range c.nodes {
+		if node.pubkey == leader {
+			shuffle.RemoveIndex(i)
+			break
+		}
+	}
+	return shuffle
+}
+
+func (c *ClusterNodes) releaseRetransmitShuffle(shuffle *WeightedShuffle) {
+	c.shufflePool.Put(shuffle)
+}
+
+func turbineRootDistance(index, fanout int) uint8 {
+	switch {
+	case index <= 0:
+		return 0
+	case index <= fanout:
+		return 1
+	case index <= (fanout+1)*fanout:
+		return 2
+	default:
+		return maxTurbineHops - 1
 	}
 }
 
@@ -260,6 +433,17 @@ func cloneWeightedShuffle(src *WeightedShuffle) *WeightedShuffle {
 	cp.zeros = append([]int(nil), src.zeros...)
 	cp.tree = append([][weightedShuffleFanout]uint64(nil), src.tree...)
 	return &cp
+}
+
+func copyWeightedShuffle(dst, src *WeightedShuffle) {
+	if src == nil {
+		*dst = *NewWeightedShuffle(nil)
+		return
+	}
+	dst.numNodes = src.numNodes
+	dst.weight = src.weight
+	dst.zeros = append(dst.zeros[:0], src.zeros...)
+	dst.tree = append(dst.tree[:0], src.tree...)
 }
 
 // StakedNodes maps vote-account stakes onto validator identities, matching

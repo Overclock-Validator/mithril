@@ -145,7 +145,6 @@ func encodeWireVoteMessageInto(w *wincode.Writer, msg VoteMessage) error {
 	if err := w.WriteFixedBytes("vote signature", msg.Signature, BLSSignatureSize); err != nil {
 		return err
 	}
-	w.WriteU16(msg.Rank)
 	return nil
 }
 
@@ -206,10 +205,6 @@ func decodeWireMessageV1From(r *wincode.Reader, opts DecodeOptions) (Message, er
 		if err != nil {
 			return Message{}, err
 		}
-		rank, err := r.ReadU16()
-		if err != nil {
-			return Message{}, err
-		}
 		var vote Vote
 		switch kind {
 		case votorWireKindNotarVote:
@@ -225,7 +220,10 @@ func decodeWireMessageV1From(r *wincode.Reader, opts DecodeOptions) (Message, er
 		case votorWireKindGenesisVote:
 			vote = NewGenesisVote(slot, hash)
 		}
-		msg := VoteMessage{Vote: vote, Signature: signature, Rank: rank}
+		// Agave v4.3 authenticates the sender at the Votor transport layer and
+		// derives rank from that identity. Rank is deliberately absent from the
+		// wire message and is injected by the receiver after decoding.
+		msg := VoteMessage{Vote: vote, Signature: signature}
 		return Message{Vote: &msg}, nil
 
 	case votorWireKindFinalizeCert, votorWireKindFastFinalizeCert, votorWireKindNotarCert,
@@ -352,7 +350,6 @@ func encodeVoteMessageInto(w *wincode.Writer, msg VoteMessage) error {
 	if err := w.WriteFixedBytes("vote signature", msg.Signature, BLSSignatureSize); err != nil {
 		return err
 	}
-	w.WriteU16(msg.Rank)
 	return nil
 }
 
@@ -365,11 +362,7 @@ func decodeVoteMessageFrom(r *wincode.Reader) (VoteMessage, error) {
 	if err != nil {
 		return VoteMessage{}, err
 	}
-	rank, err := r.ReadU16()
-	if err != nil {
-		return VoteMessage{}, err
-	}
-	return VoteMessage{Vote: vote, Signature: signature, Rank: rank}, nil
+	return VoteMessage{Vote: vote, Signature: signature}, nil
 }
 
 func encodeVotePayloadToSignInto(w *wincode.Writer, vote Vote, shredVersion uint16) error {

@@ -35,10 +35,10 @@ func alpenglowRootedSlot(consensusEngine consensusengine.Engine) (uint64, bool) 
 
 // installAlpenglowValidatorSet builds and installs the BLS validator set for one
 // epoch into the engine (no-op if the engine isn't a validator-set sink).
-func installAlpenglowValidatorSet(consensusEngine consensusengine.Engine, epoch uint64) {
+func installAlpenglowValidatorSet(consensusEngine consensusengine.Engine, epoch uint64) bool {
 	sink, ok := consensusEngine.(consensusengine.AlpenglowValidatorSetSink)
 	if !ok {
-		return
+		return false
 	}
 
 	stakes := global.EpochStakes(epoch)
@@ -46,11 +46,13 @@ func installAlpenglowValidatorSet(consensusEngine consensusengine.Engine, epoch 
 	set, err := alpenglow.BuildValidatorSet(epoch, stakes, voteAccts, global.EpochTotalStake(epoch))
 	if err != nil {
 		mlog.Log.FileOnlyf("ALPENGLOW observer: validator set unavailable for epoch %d: %v", epoch, err)
-		return
+		return false
 	}
 	if err := sink.SetAlpenglowValidatorSet(set); err != nil {
 		mlog.Log.FileOnlyf("ALPENGLOW observer: failed to install validator set for epoch %d: %v", epoch, err)
+		return false
 	}
+	return true
 }
 
 // installEpochTransitionAlpenglowValidatorSets installs the validator sets
@@ -62,24 +64,31 @@ func installEpochTransitionAlpenglowValidatorSets(consensusEngine consensusengin
 	}
 }
 
-// installCachedAlpenglowValidatorSets installs validator sets for every cached
+// InstallCachedAlpenglowValidatorSets installs validator sets for every cached
 // epoch (so certs spanning an epoch boundary verify), plus the current epoch.
-func installCachedAlpenglowValidatorSets(consensusEngine consensusengine.Engine, currentEpoch uint64) {
+// It returns the number of sets successfully published and whether the
+// requested root/current epoch was among them. Node startup requires the
+// latter before advertising Votor; replay calls it idempotently.
+func InstallCachedAlpenglowValidatorSets(consensusEngine consensusengine.Engine, currentEpoch uint64) (int, bool) {
 	sink, ok := consensusEngine.(consensusengine.AlpenglowValidatorSetSink)
 	if !ok {
-		return
+		return 0, false
 	}
 
 	epochs := global.GetAllCachedEpochs()
 	if len(epochs) == 0 {
-		installAlpenglowValidatorSet(consensusEngine, currentEpoch)
-		return
+		if installAlpenglowValidatorSet(consensusEngine, currentEpoch) {
+			return 1, true
+		}
+		return 0, false
 	}
 	sort.Slice(epochs, func(i, j int) bool { return epochs[i] < epochs[j] })
+	sawCurrent := false
 	installedCurrent := false
+	installed := 0
 	for _, epoch := range epochs {
 		if epoch == currentEpoch {
-			installedCurrent = true
+			sawCurrent = true
 		}
 		stakes := global.EpochStakes(epoch)
 		voteAccts := alpenglowVoteAccountsForEpoch(epoch, stakes)
@@ -90,11 +99,20 @@ func installCachedAlpenglowValidatorSets(consensusEngine consensusengine.Engine,
 		}
 		if err := sink.SetAlpenglowValidatorSet(set); err != nil {
 			mlog.Log.FileOnlyf("ALPENGLOW observer: failed to install cached validator set for epoch %d: %v", epoch, err)
+			continue
+		}
+		installed++
+		if epoch == currentEpoch {
+			installedCurrent = true
 		}
 	}
-	if !installedCurrent {
-		installAlpenglowValidatorSet(consensusEngine, currentEpoch)
+	if !sawCurrent {
+		if installAlpenglowValidatorSet(consensusEngine, currentEpoch) {
+			installed++
+			installedCurrent = true
+		}
 	}
+	return installed, installedCurrent
 }
 
 func alpenglowVoteAccountsForEpoch(epoch uint64, stakes map[solana.PublicKey]uint64) map[solana.PublicKey]*epochstakes.VoteAccount {
@@ -127,9 +145,9 @@ func applyAlpenglowFooterClock(slotCtx *sealevel.SlotCtx, block *b.Block, epochS
 
 // applyAlpenglowFooterClockLocal performs the same deterministic slot-state
 // update without publishing it globally. Block production freezes a candidate
-// before that candidate re-enters ordered replay; updating SysvarCache there
-// would make replay mistake the candidate's Clock for its parent Clock and omit
-// the Clock delta from AccountsLtHash.
+// before ordered adopt publishes the cache; updating SysvarCache at freeze
+// would make the next load mistake the candidate's Clock for its parent Clock
+// and omit the Clock delta from AccountsLtHash.
 func applyAlpenglowFooterClockLocal(slotCtx *sealevel.SlotCtx, block *b.Block, epochSchedule *sealevel.SysvarEpochSchedule) error {
 	return applyAlpenglowFooterClockWithCache(slotCtx, block, epochSchedule, false)
 }
@@ -161,6 +179,18 @@ func applyAlpenglowFooterClockWithCache(slotCtx *sealevel.SlotCtx, block *b.Bloc
 	// into slot state — otherwise the timestamp is dropped from the bankhash.
 	if err := slotCtx.SetAccount(sealevel.SysvarClockAddr, clockAcct); err != nil {
 		return fmt.Errorf("unable to write Alpenglow footer clock back to slot state: %w", err)
+	}
+	bankSysvars := slotCtx.BankSysvars()
+	if bankSysvars == nil {
+		bankSysvars, err = sealevel.NewBankSysvars(slotCtx.Slot, clockAcct)
+	} else {
+		bankSysvars, err = bankSysvars.WithAccounts(clockAcct)
+	}
+	if err != nil {
+		return fmt.Errorf("update bank-local Clock snapshot: %w", err)
+	}
+	if err := slotCtx.PublishBankSysvars(bankSysvars); err != nil {
+		return err
 	}
 	if updateCache {
 		sealevel.SysvarCache.Clock.Sysvar = &clock
@@ -203,10 +233,17 @@ type AlpenglowFinalityMismatch struct {
 	Slot      uint64
 	Executed  solana.Hash
 	Finalized solana.Hash
+	Skip      bool // finalized ancestry proves this slot was omitted
 	Conflict  bool // recorded safety violation at the slot, not a wrong local block
 }
 
 func (m *AlpenglowFinalityMismatch) Error() string {
+	if m.Conflict {
+		return fmt.Sprintf("alpenglow finality conflict at slot %d", m.Slot)
+	}
+	if m.Skip {
+		return fmt.Sprintf("alpenglow finality mismatch at slot %d: executed block %s, finalized outcome skipped", m.Slot, m.Executed)
+	}
 	return fmt.Sprintf("alpenglow finality mismatch at slot %d: executed block %s, finalized block %s",
 		m.Slot, m.Executed, m.Finalized)
 }
@@ -225,7 +262,7 @@ func recordAlpenglowEvidence(mithrilState *state.MithrilState, m *AlpenglowFinal
 			return
 		}
 	}
-	ev := state.AlpenglowFinalityEvidence{Slot: m.Slot, Conflict: m.Conflict}
+	ev := state.AlpenglowFinalityEvidence{Slot: m.Slot, Skip: m.Skip, Conflict: m.Conflict}
 	if !m.Conflict {
 		ev.Executed = hex.EncodeToString(m.Executed[:])
 		ev.Finalized = hex.EncodeToString(m.Finalized[:])
@@ -252,6 +289,15 @@ type alpenglowGateStats struct {
 	checked, matched, noFinality, noLocalID uint64
 }
 
+// alpenglowFinalityExpectation preserves the distinction between a conflict
+// and a finalized skip. Both have no finalized block hash, but a skip is a
+// valid local outcome while a conflict must never promote.
+type alpenglowFinalityExpectation struct {
+	Block    solana.Hash
+	Skip     bool
+	Conflict bool
+}
+
 // alpenglowPromotionGate caps promotion at the last slot whose executed identity is
 // consistent with certificate finality. It walks (lastRooted, through] in order and
 // stops at the first violation (prefix-stop: descendants of an unpromoted block must
@@ -259,13 +305,13 @@ type alpenglowGateStats struct {
 // or no known finality (pruned/absent) pass under the delegated-trust regime.
 // footerFinalized is the replay-local capture, immune to tracker pruning; the engine
 // index is the near-tip fallback. forced holds persisted evidence expectations: a
-// slot present there promotes ONLY on an exact executed match (zero hash = conflict
-// evidence, never promotes) — delegated trust does not apply to a disputed slot.
+// slot present there promotes ONLY on an exact executed outcome; delegated
+// trust does not apply to a disputed slot.
 func alpenglowPromotionGate(
 	consensusEngine consensusengine.Engine,
 	footerFinalized map[uint64]solana.Hash,
 	executed map[uint64]solana.Hash,
-	forced map[uint64]solana.Hash,
+	forced map[uint64]alpenglowFinalityExpectation,
 	lastRooted, through, executedTip uint64,
 	stats *alpenglowGateStats,
 ) (uint64, error) {
@@ -288,15 +334,34 @@ func alpenglowPromotionGate(
 	index, _ := consensusEngine.(consensusengine.AlpenglowFinalityIndex)
 	for slot := lastRooted + 1; slot <= walkTop; slot++ {
 		if want, disputed := forced[slot]; disputed {
-			if want.IsZero() {
+			if want.Conflict {
 				return slot - 1, &AlpenglowFinalityMismatch{Slot: slot, Conflict: true}
 			}
-			if got, ok := executed[slot]; !ok || got != want {
-				return slot - 1, &AlpenglowFinalityMismatch{Slot: slot, Executed: got, Finalized: want}
+			if got, ok := executed[slot]; !ok || got != want.Block {
+				return slot - 1, &AlpenglowFinalityMismatch{
+					Slot: slot, Executed: got, Finalized: want.Block, Skip: want.Skip,
+				}
 			}
 		}
 		if index != nil && index.FinalityConflictAt(slot) {
 			return slot - 1, &AlpenglowFinalityMismatch{Slot: slot, Conflict: true}
+		}
+		if index != nil {
+			if _, finalizedSkip := index.FinalizedSkipAt(slot); finalizedSkip {
+				got, haveExecuted := executed[slot]
+				if stats != nil {
+					stats.checked++
+					if !haveExecuted {
+						stats.noLocalID++
+					} else if got.IsZero() {
+						stats.matched++
+					}
+				}
+				if haveExecuted && !got.IsZero() {
+					return slot - 1, &AlpenglowFinalityMismatch{Slot: slot, Executed: got, Skip: true}
+				}
+				continue
+			}
 		}
 		expected, haveExpected := footerFinalized[slot]
 		if !haveExpected && index != nil {

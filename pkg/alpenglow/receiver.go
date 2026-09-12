@@ -3,30 +3,28 @@ package alpenglow
 import (
 	"context"
 	"crypto/ed25519"
-	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"errors"
 	"fmt"
-	"io"
-	"math/big"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/gagliardetto/solana-go"
 	"github.com/quic-go/quic-go"
 )
 
 const (
-	VotorQUICALPN                 = "solana-tpu"
-	DefaultReceiverBindAddr       = "0.0.0.0:0"
-	DefaultReceiverMaxMessageSize = int64(DefaultMaxBitmapSize + 4096)
-	DefaultReceiverLogInterval    = 10 * time.Second
-	DefaultReceiverMaxConnections = 512
-	DefaultReceiverMaxConnsPerIP  = 32
-	DefaultReceiverStreamsPerSec  = 4096
+	VotorQUICALPN                  = "alpenglow-v1"
+	VotorQUICInitialPacketSize     = uint16(1280)
+	DefaultReceiverBindAddr        = "0.0.0.0:0"
+	DefaultReceiverMaxMessageSize  = int64(VotorQUICInitialPacketSize)
+	DefaultReceiverLogInterval     = 10 * time.Second
+	DefaultReceiverMaxConnections  = 512
+	DefaultReceiverMaxConnsPerIP   = 32
+	DefaultReceiverMaxConnsPerPeer = 2
+	DefaultReceiverDatagramsPerSec = 50
 )
 
 type ReceiverConfig struct {
@@ -36,35 +34,41 @@ type ReceiverConfig struct {
 	// Identity binds the QUIC certificate's Ed25519 public key to the validator
 	// identity, allowing Agave's staked A2A admission to recognize this node.
 	// Empty retains an ephemeral certificate for passive observer mode.
-	Identity            ed25519.PrivateKey
-	Decode              DecodeOptions
-	LogInterval         time.Duration
-	MaxConnections      int
-	MaxConnsPerIP       int
-	MaxStreamsPerSecond int
+	Identity              ed25519.PrivateKey
+	Decode                DecodeOptions
+	LogInterval           time.Duration
+	MaxConnections        int
+	MaxConnsPerIP         int
+	MaxConnsPerPeer       int
+	MaxDatagramsPerSecond int
+	// AdmitPeer is called with the Ed25519 identity authenticated by TLS before
+	// the connection is allowed to deliver datagrams. A nil callback admits any
+	// correctly encoded single-certificate Ed25519 identity.
+	AdmitPeer func(solana.PublicKey) bool
 	// AdmitMessage runs after wire decoding/version checks but before the
 	// observer. It may authenticate/normalize a message or reject a duplicate.
 	// This boundary keeps unauthenticated certificates out of trusted observer
 	// state and prevents rebroadcast duplicates from reaching expensive users.
-	AdmitMessage func(Message) (Message, bool)
+	AdmitMessage func(solana.PublicKey, Message) (Message, bool)
 	OnMessage    func(Message)
 }
 
 func DefaultReceiverConfig() ReceiverConfig {
 	return ReceiverConfig{
-		BindAddr:            DefaultReceiverBindAddr,
-		MaxMessageBytes:     DefaultReceiverMaxMessageSize,
-		Decode:              DefaultDecodeOptions(),
-		LogInterval:         DefaultReceiverLogInterval,
-		MaxConnections:      DefaultReceiverMaxConnections,
-		MaxConnsPerIP:       DefaultReceiverMaxConnsPerIP,
-		MaxStreamsPerSecond: DefaultReceiverStreamsPerSec,
+		BindAddr:              DefaultReceiverBindAddr,
+		MaxMessageBytes:       DefaultReceiverMaxMessageSize,
+		Decode:                DefaultDecodeOptions(),
+		LogInterval:           DefaultReceiverLogInterval,
+		MaxConnections:        DefaultReceiverMaxConnections,
+		MaxConnsPerIP:         DefaultReceiverMaxConnsPerIP,
+		MaxConnsPerPeer:       DefaultReceiverMaxConnsPerPeer,
+		MaxDatagramsPerSecond: DefaultReceiverDatagramsPerSec,
 	}
 }
 
 type ReceiverStats struct {
 	ConnectionsAccepted    uint64    `json:"connections_accepted"`
-	StreamsReceived        uint64    `json:"streams_received"`
+	DatagramsReceived      uint64    `json:"datagrams_received"`
 	MessagesDecoded        uint64    `json:"messages_decoded"`
 	VotesDecoded           uint64    `json:"votes_decoded"`
 	CertificatesDecoded    uint64    `json:"certificates_decoded"`
@@ -74,7 +78,7 @@ type ReceiverStats struct {
 	AcceptErrors           uint64    `json:"accept_errors"`
 	OversizeMessages       uint64    `json:"oversize_messages"`
 	ConnectionsRejected    uint64    `json:"connections_rejected"`
-	RateLimitedStreams     uint64    `json:"rate_limited_streams"`
+	RateLimitedDatagrams   uint64    `json:"rate_limited_datagrams"`
 	LastMessageAt          time.Time `json:"last_message_at,omitempty"`
 	LatestVoteSlot         uint64    `json:"latest_vote_slot,omitempty"`
 	LatestCertSlot         uint64    `json:"latest_certificate_slot,omitempty"`
@@ -85,11 +89,17 @@ type Receiver struct {
 	observer *Observer
 	listener *quic.Listener
 
-	mu        sync.Mutex
-	closed    bool
-	conns     map[*quic.Conn]string
-	connsByIP map[string]int
-	stats     ReceiverStats
+	mu          sync.Mutex
+	closed      bool
+	conns       map[*quic.Conn]receiverConnection
+	connsByIP   map[string]int
+	connsByPeer map[solana.PublicKey]int
+	stats       ReceiverStats
+}
+
+type receiverConnection struct {
+	remoteIP string
+	peer     solana.PublicKey
 }
 
 func NewReceiver(cfg ReceiverConfig, observer *Observer) (*Receiver, error) {
@@ -108,21 +118,18 @@ func NewReceiver(cfg ReceiverConfig, observer *Observer) (*Receiver, error) {
 		ClientAuth:   tls.RequireAnyClientCert,
 		NextProtos:   []string{VotorQUICALPN},
 		MinVersion:   tls.VersionTLS13,
-	}, &quic.Config{
-		HandshakeIdleTimeout: 3 * time.Second,
-		MaxIdleTimeout:       30 * time.Second,
-		KeepAlivePeriod:      time.Second,
-	})
+	}, newVotorQUICConfig())
 	if err != nil {
 		return nil, fmt.Errorf("listen for Alpenglow Votor QUIC on %s: %w", cfg.BindAddr, err)
 	}
 
 	return &Receiver{
-		cfg:       cfg,
-		observer:  observer,
-		listener:  listener,
-		conns:     make(map[*quic.Conn]string),
-		connsByIP: make(map[string]int),
+		cfg:         cfg,
+		observer:    observer,
+		listener:    listener,
+		conns:       make(map[*quic.Conn]receiverConnection),
+		connsByIP:   make(map[string]int),
+		connsByPeer: make(map[solana.PublicKey]int),
 	}, nil
 }
 
@@ -143,8 +150,8 @@ func (r *Receiver) Run(ctx context.Context) error {
 	defer cancel()
 	go r.logStatsLoop(runCtx)
 
-	mlog.Log.FileOnlyf("ALPENGLOW Votor receiver listening on %s (transport=quic alpn=%s max_message=%d shred_version=%d)",
-		r.listener.Addr(), VotorQUICALPN, r.cfg.MaxMessageBytes, r.cfg.ShredVersion)
+	mlog.Log.FileOnlyf("ALPENGLOW Votor receiver listening on %s (transport=quic-datagram alpn=%s packet_mtu=%d app_max_datagram_bytes=%d shred_version=%d)",
+		r.listener.Addr(), VotorQUICALPN, VotorQUICInitialPacketSize, r.cfg.MaxMessageBytes, r.cfg.ShredVersion)
 
 	for {
 		conn, err := r.listener.Accept(ctx)
@@ -156,11 +163,20 @@ func (r *Receiver) Run(ctx context.Context) error {
 			return fmt.Errorf("accept Alpenglow Votor QUIC connection: %w", err)
 		}
 
-		if !r.addConn(conn) {
+		if _, ok := receiverRemoteIPv4(conn.RemoteAddr()); !ok {
+			r.rejectConn(conn, "alpenglow receiver requires an IPv4 unicast peer")
+			continue
+		}
+		peer, err := votorPeerIdentity(conn.ConnectionState().TLS)
+		if err != nil || (r.cfg.AdmitPeer != nil && !r.cfg.AdmitPeer(peer)) {
+			r.rejectConn(conn, "alpenglow receiver peer identity rejected")
+			continue
+		}
+		if !r.addConn(conn, peer) {
 			continue
 		}
 		r.recordConnection()
-		go r.handleConn(runCtx, conn)
+		go r.handleConn(runCtx, conn, peer)
 	}
 }
 
@@ -201,14 +217,14 @@ func (r *Receiver) Stats() ReceiverStats {
 	return r.stats
 }
 
-func (r *Receiver) handleConn(ctx context.Context, conn *quic.Conn) {
+func (r *Receiver) handleConn(ctx context.Context, conn *quic.Conn, peer solana.PublicKey) {
 	defer r.removeConn(conn)
 	defer conn.CloseWithError(0, "alpenglow receiver done")
 
 	windowStart := time.Now()
-	streamsThisWindow := 0
+	datagramsThisWindow := 0
 	for {
-		stream, err := conn.AcceptUniStream(ctx)
+		payload, err := conn.ReceiveDatagram(ctx)
 		if err != nil {
 			if ctx.Err() != nil || conn.Context().Err() != nil || r.isClosed() {
 				return
@@ -219,29 +235,19 @@ func (r *Receiver) handleConn(ctx context.Context, conn *quic.Conn) {
 		now := time.Now()
 		if now.Sub(windowStart) >= time.Second {
 			windowStart = now
-			streamsThisWindow = 0
+			datagramsThisWindow = 0
 		}
-		if streamsThisWindow >= r.cfg.MaxStreamsPerSecond {
-			// Client certificates are not yet bound to staked identities. A per-
-			// connection ceiling prevents one unauthenticated peer from monopolizing
-			// decode and pending-vote capacity before cryptographic admission.
-			stream.CancelRead(0)
-			r.recordRateLimitedStream()
+		if datagramsThisWindow >= r.cfg.MaxDatagramsPerSecond {
+			r.recordRateLimitedDatagram()
 			continue
 		}
-		streamsThisWindow++
-		r.handleStream(stream)
+		datagramsThisWindow++
+		r.handleDatagram(peer, payload)
 	}
 }
 
-func (r *Receiver) handleStream(stream *quic.ReceiveStream) {
-	r.recordStream()
-
-	payload, err := io.ReadAll(io.LimitReader(stream, r.cfg.MaxMessageBytes+1))
-	if err != nil {
-		r.recordReadError()
-		return
-	}
+func (r *Receiver) handleDatagram(peer solana.PublicKey, payload []byte) {
+	r.recordDatagram()
 	if int64(len(payload)) > r.cfg.MaxMessageBytes {
 		r.recordOversizeMessage()
 		return
@@ -262,7 +268,7 @@ func (r *Receiver) handleStream(stream *quic.ReceiveStream) {
 	r.recordMessage(msg)
 	if r.cfg.AdmitMessage != nil {
 		var admitted bool
-		msg, admitted = r.cfg.AdmitMessage(msg)
+		msg, admitted = r.cfg.AdmitMessage(peer, msg)
 		if !admitted {
 			return
 		}
@@ -290,9 +296,9 @@ func (r *Receiver) logStatsLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			stats := r.Stats()
-			mlog.Log.FileOnlyf("alpenglow Votor receiver stats: connections=%d streams=%d messages=%d votes=%d certificates=%d decode_errors=%d shred_version_mismatches=%d read_errors=%d accept_errors=%d oversize=%d rejected_connections=%d rate_limited_streams=%d latest_vote_slot=%d latest_certificate_slot=%d last_message=%s",
-				stats.ConnectionsAccepted, stats.StreamsReceived, stats.MessagesDecoded, stats.VotesDecoded, stats.CertificatesDecoded,
-				stats.DecodeErrors, stats.ShredVersionMismatches, stats.ReadErrors, stats.AcceptErrors, stats.OversizeMessages, stats.ConnectionsRejected, stats.RateLimitedStreams, stats.LatestVoteSlot, stats.LatestCertSlot,
+			mlog.Log.FileOnlyf("alpenglow Votor receiver stats: connections=%d datagrams=%d messages=%d votes=%d certificates=%d decode_errors=%d shred_version_mismatches=%d read_errors=%d accept_errors=%d oversize=%d rejected_connections=%d rate_limited_datagrams=%d latest_vote_slot=%d latest_certificate_slot=%d last_message=%s",
+				stats.ConnectionsAccepted, stats.DatagramsReceived, stats.MessagesDecoded, stats.VotesDecoded, stats.CertificatesDecoded,
+				stats.DecodeErrors, stats.ShredVersionMismatches, stats.ReadErrors, stats.AcceptErrors, stats.OversizeMessages, stats.ConnectionsRejected, stats.RateLimitedDatagrams, stats.LatestVoteSlot, stats.LatestCertSlot,
 				formatStatsTime(stats.LastMessageAt))
 		}
 	}
@@ -304,9 +310,9 @@ func (r *Receiver) recordConnection() {
 	r.mu.Unlock()
 }
 
-func (r *Receiver) recordStream() {
+func (r *Receiver) recordDatagram() {
 	r.mu.Lock()
-	r.stats.StreamsReceived++
+	r.stats.DatagramsReceived++
 	r.mu.Unlock()
 }
 
@@ -366,54 +372,72 @@ func (r *Receiver) recordOversizeMessage() {
 	r.mu.Unlock()
 }
 
-func (r *Receiver) recordRateLimitedStream() {
+func (r *Receiver) recordRateLimitedDatagram() {
 	r.mu.Lock()
-	r.stats.RateLimitedStreams++
+	r.stats.RateLimitedDatagrams++
 	r.mu.Unlock()
 }
 
-func (r *Receiver) addConn(conn *quic.Conn) bool {
-	remoteIP := receiverRemoteIP(conn.RemoteAddr())
+func (r *Receiver) rejectConn(conn *quic.Conn, reason string) {
+	r.mu.Lock()
+	r.stats.ConnectionsRejected++
+	r.mu.Unlock()
+	_ = conn.CloseWithError(0, reason)
+}
+
+func (r *Receiver) addConn(conn *quic.Conn, peer solana.PublicKey) bool {
+	remoteIP, ok := receiverRemoteIPv4(conn.RemoteAddr())
+	if !ok {
+		r.rejectConn(conn, "alpenglow receiver requires an IPv4 unicast peer")
+		return false
+	}
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
 		_ = conn.CloseWithError(0, "alpenglow receiver closed")
 		return false
 	}
-	if len(r.conns) >= r.cfg.MaxConnections || r.connsByIP[remoteIP] >= r.cfg.MaxConnsPerIP {
+	if len(r.conns) >= r.cfg.MaxConnections || r.connsByIP[remoteIP] >= r.cfg.MaxConnsPerIP ||
+		r.connsByPeer[peer] >= r.cfg.MaxConnsPerPeer {
 		r.stats.ConnectionsRejected++
 		r.mu.Unlock()
 		_ = conn.CloseWithError(0, "alpenglow receiver connection limit")
 		return false
 	}
-	r.conns[conn] = remoteIP
+	r.conns[conn] = receiverConnection{remoteIP: remoteIP, peer: peer}
 	r.connsByIP[remoteIP]++
+	r.connsByPeer[peer]++
 	r.mu.Unlock()
 	return true
 }
 
 func (r *Receiver) removeConn(conn *quic.Conn) {
 	r.mu.Lock()
-	remoteIP, exists := r.conns[conn]
+	tracked, exists := r.conns[conn]
 	delete(r.conns, conn)
 	if exists {
-		r.connsByIP[remoteIP]--
-		if r.connsByIP[remoteIP] <= 0 {
-			delete(r.connsByIP, remoteIP)
+		r.connsByIP[tracked.remoteIP]--
+		if r.connsByIP[tracked.remoteIP] <= 0 {
+			delete(r.connsByIP, tracked.remoteIP)
+		}
+		r.connsByPeer[tracked.peer]--
+		if r.connsByPeer[tracked.peer] <= 0 {
+			delete(r.connsByPeer, tracked.peer)
 		}
 	}
 	r.mu.Unlock()
 }
 
-func receiverRemoteIP(addr net.Addr) string {
-	if udp, ok := addr.(*net.UDPAddr); ok {
-		return udp.IP.String()
+func receiverRemoteIPv4(addr net.Addr) (string, bool) {
+	udp, ok := addr.(*net.UDPAddr)
+	if !ok || udp.IP == nil || udp.IP.IsUnspecified() || udp.IP.IsMulticast() {
+		return "", false
 	}
-	host, _, err := net.SplitHostPort(addr.String())
-	if err == nil {
-		return host
+	ipv4 := udp.IP.To4()
+	if ipv4 == nil {
+		return "", false
 	}
-	return addr.String()
+	return ipv4.String(), true
 }
 
 func (r *Receiver) isClosed() bool {
@@ -442,55 +466,13 @@ func normalizeReceiverConfig(cfg ReceiverConfig) ReceiverConfig {
 	if cfg.MaxConnsPerIP <= 0 {
 		cfg.MaxConnsPerIP = defaults.MaxConnsPerIP
 	}
-	if cfg.MaxStreamsPerSecond <= 0 {
-		cfg.MaxStreamsPerSecond = defaults.MaxStreamsPerSecond
+	if cfg.MaxConnsPerPeer <= 0 {
+		cfg.MaxConnsPerPeer = defaults.MaxConnsPerPeer
+	}
+	if cfg.MaxDatagramsPerSecond <= 0 {
+		cfg.MaxDatagramsPerSecond = defaults.MaxDatagramsPerSecond
 	}
 	return cfg
-}
-
-func newVotorQUICCertificate(identity ed25519.PrivateKey) (tls.Certificate, error) {
-	priv := identity
-	var pub ed25519.PublicKey
-	if len(priv) == 0 {
-		var err error
-		pub, priv, err = ed25519.GenerateKey(rand.Reader)
-		if err != nil {
-			return tls.Certificate{}, err
-		}
-	} else {
-		if len(priv) != ed25519.PrivateKeySize {
-			return tls.Certificate{}, fmt.Errorf("invalid Votor QUIC identity size %d", len(priv))
-		}
-		pub = priv.Public().(ed25519.PublicKey)
-	}
-
-	template := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject: pkix.Name{
-			CommonName: "Mithril Alpenglow observer",
-		},
-		NotBefore:             time.Unix(0, 0),
-		NotAfter:              time.Date(4096, 1, 1, 0, 0, 0, 0, time.UTC),
-		KeyUsage:              x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-		DNSNames:              []string{"localhost"},
-		BasicConstraintsValid: true,
-	}
-
-	certDER, err := x509.CreateCertificate(rand.Reader, template, template, pub, priv)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	cert, err := x509.ParseCertificate(certDER)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-
-	return tls.Certificate{
-		Certificate: [][]byte{certDER},
-		PrivateKey:  priv,
-		Leaf:        cert,
-	}, nil
 }
 
 func formatStatsTime(t time.Time) string {

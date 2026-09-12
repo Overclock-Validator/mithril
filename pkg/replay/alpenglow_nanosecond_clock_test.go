@@ -2,6 +2,7 @@ package replay
 
 import (
 	"encoding/binary"
+	"math"
 	"sync"
 	"testing"
 
@@ -13,7 +14,7 @@ import (
 )
 
 func TestNanosecondClockAccountAddr(t *testing.T) {
-	require.Equal(t, "HQcg2uM8uUqfRprvypQGcU7qucUZJY3odWjJVYce2a6C", NanosecondClockAccountAddr().String())
+	require.Equal(t, "GaGQ2vyb3xuUwjKiq9tQQWoqhzWYh7LbiLXvqG2sUzzG", NanosecondClockAccountAddr().String())
 }
 
 func TestEncodeNanosecondClockData(t *testing.T) {
@@ -70,6 +71,10 @@ func TestNanosecondClockBounds(t *testing.T) {
 	// Multi-slot gap scales the upper bound.
 	_, upper5 := NanosecondClockBounds(parent, 5*slotNanos)
 	require.Equal(t, parent+2*5*slotNanos, upper5)
+
+	// Agave saturates the doubled elapsed duration to the full i64 maximum.
+	_, saturatedUpper := NanosecondClockBounds(0, math.MaxUint64)
+	require.Equal(t, int64(math.MaxInt64), saturatedUpper)
 }
 
 func TestSkewBlockProducerTimeNanosClampsBothEnds(t *testing.T) {
@@ -87,4 +92,89 @@ func TestSkewBlockProducerTimeNanosClampsBothEnds(t *testing.T) {
 	// In-bounds value passes through unchanged.
 	inBounds := parent + slotNanos
 	require.Equal(t, inBounds, SkewBlockProducerTimeNanos(parent, inBounds, slotNanos))
+}
+
+func TestValidateAlpenglowFooterNanosecondClockBounds(t *testing.T) {
+	const (
+		parentSlot  = uint64(100)
+		workingSlot = uint64(101)
+		parentNanos = int64(1_782_240_542_000_000_000)
+	)
+	parentAccts := accounts.NewMemAccounts()
+	nanoClock := &accounts.Account{
+		Key:      NanosecondClockAccountAddr(),
+		Lamports: 1,
+		Data:     encodeNanosecondClockData(parentNanos),
+	}
+	require.NoError(t, parentAccts.SetAccountWithoutLock(nanoClock.Key, nanoClock))
+	clock := sealevel.SysvarClock{Slot: workingSlot, UnixTimestamp: parentNanos / 1_000_000_000}
+	clockAcct := &accounts.Account{Key: sealevel.SysvarClockAddr, Lamports: 1, Data: clock.MustMarshal()}
+	bankSysvars, err := sealevel.NewBankSysvars(workingSlot, clockAcct)
+	require.NoError(t, err)
+	slotCtx := &sealevel.SlotCtx{
+		Slot:        workingSlot,
+		ParentSlot:  parentSlot,
+		ParentAccts: parentAccts,
+	}
+	require.NoError(t, slotCtx.PublishBankSysvars(bankSysvars))
+
+	lower, upper := NanosecondClockBounds(parentNanos, uint64(alpenglowNsPerSlot))
+	for _, tc := range []struct {
+		name      string
+		producer  uint64
+		wantError bool
+	}{
+		{name: "inclusive lower", producer: uint64(lower)},
+		{name: "inclusive upper", producer: uint64(upper)},
+		{name: "zero", producer: 0, wantError: true},
+		{name: "equal parent", producer: uint64(parentNanos), wantError: true},
+		{name: "above upper", producer: uint64(upper + 1), wantError: true},
+		{name: "i64 overflow", producer: uint64(math.MaxInt64) + 1, wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			block := &b.Block{
+				Slot:                    workingSlot,
+				ParentSlot:              parentSlot,
+				HasAlpenglowFooter:      true,
+				FooterProducerTimeNanos: tc.producer,
+			}
+			err := validateAlpenglowFooterNanosecondClock(slotCtx, block)
+			if tc.wantError {
+				require.ErrorContains(t, err, "nanosecond clock out of bounds")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestNanosecondClockAnchorUsesPinnedParentAndBankClockFallback(t *testing.T) {
+	const (
+		parentNanos = int64(1_782_240_542_000_000_000)
+		childNanos  = parentNanos + 123
+	)
+	parentAccts := accounts.NewMemAccounts()
+	currentAccts := accounts.NewMemAccounts()
+	parentNano := &accounts.Account{Key: NanosecondClockAccountAddr(), Lamports: 1, Data: encodeNanosecondClockData(parentNanos)}
+	childNano := &accounts.Account{Key: NanosecondClockAccountAddr(), Lamports: 1, Data: encodeNanosecondClockData(childNanos)}
+	require.NoError(t, parentAccts.SetAccountWithoutLock(parentNano.Key, parentNano))
+	require.NoError(t, currentAccts.SetAccountWithoutLock(childNano.Key, childNano))
+	clock := sealevel.SysvarClock{Slot: 101, UnixTimestamp: 1234}
+	clockAcct := &accounts.Account{Key: sealevel.SysvarClockAddr, Lamports: 1, Data: clock.MustMarshal()}
+	bankSysvars, err := sealevel.NewBankSysvars(101, clockAcct)
+	require.NoError(t, err)
+	slotCtx := &sealevel.SlotCtx{Slot: 101, ParentSlot: 100, Accounts: currentAccts, ParentAccts: parentAccts}
+	require.NoError(t, slotCtx.PublishBankSysvars(bankSysvars))
+
+	got, ok := ReadNanosecondClockFromSlotCtx(slotCtx)
+	require.True(t, ok)
+	require.Equal(t, parentNanos, got)
+
+	// A prefunded but not-yet-populated PDA is still an account before-image,
+	// but it supplies no time value. Agave falls back to the bank-start Clock.
+	prefunded := &accounts.Account{Key: NanosecondClockAccountAddr(), Lamports: 1}
+	require.NoError(t, parentAccts.SetAccountWithoutLock(prefunded.Key, prefunded))
+	got, ok = ReadNanosecondClockFromSlotCtx(slotCtx)
+	require.True(t, ok)
+	require.Equal(t, int64(1_234_000_000_000), got)
 }

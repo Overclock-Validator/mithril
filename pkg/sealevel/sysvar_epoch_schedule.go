@@ -157,23 +157,31 @@ func (sr *SysvarEpochSchedule) LeaderScheduleEpoch(slot uint64) uint64 {
 }
 
 func ReadEpochScheduleSysvar(execCtx *ExecutionCtx) (SysvarEpochSchedule, error) {
+	if execCtx != nil && execCtx.SlotCtx != nil {
+		if bankSysvars := execCtx.SlotCtx.BankSysvars(); bankSysvars != nil {
+			epochSchedule, ok := bankSysvars.EpochSchedule()
+			if !ok {
+				return SysvarEpochSchedule{}, InstrErrUnsupportedSysvar
+			}
+			return epochSchedule, nil
+		}
+	}
+
+	if epochScheduleAcct, ok := localSysvarAccount(execCtx, SysvarEpochScheduleAddr); ok {
+		if epochScheduleAcct.Lamports == 0 {
+			return SysvarEpochSchedule{}, InstrErrUnsupportedSysvar
+		}
+		var epochSchedule SysvarEpochSchedule
+		if err := epochSchedule.UnmarshalWithDecoder(bin.NewBinDecoder(epochScheduleAcct.Data)); err != nil {
+			return SysvarEpochSchedule{}, InstrErrUnsupportedSysvar
+		}
+		return epochSchedule, nil
+	}
+
 	if SysvarCache.EpochSchedule.Sysvar != nil {
 		return *SysvarCache.EpochSchedule.Sysvar, nil
 	}
-
-	accts := addrObjectForLookup(execCtx)
-
-	epochScheduleSysvarAcct, err := (*accts).GetAccount(&SysvarEpochScheduleAddr)
-	if err != nil {
-		return SysvarEpochSchedule{}, InstrErrUnsupportedSysvar
-	}
-
-	dec := bin.NewBinDecoder(epochScheduleSysvarAcct.Data)
-
-	var epochSchedule SysvarEpochSchedule
-	err = epochSchedule.UnmarshalWithDecoder(dec)
-
-	return epochSchedule, err
+	return SysvarEpochSchedule{}, InstrErrUnsupportedSysvar
 }
 
 func WriteEpochScheduleSysvar(accts *accounts.Accounts, epochSchedule SysvarEpochSchedule) {

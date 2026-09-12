@@ -10,7 +10,10 @@ import (
 	"github.com/gagliardetto/solana-go"
 )
 
-const AgaveVoteVerificationWindow = uint64(90_000)
+// Agave v4.3's bls-sigverify accepts Votor votes and certificates at most
+// 30,000 slots ahead of root. Peer admission uses the same horizon to open the
+// upcoming epoch's validator set before the boundary.
+const AgaveVoteVerificationWindow = uint64(30_000)
 
 type ConsensusEventKind string
 

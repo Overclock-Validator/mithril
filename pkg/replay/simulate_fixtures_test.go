@@ -42,7 +42,7 @@ const (
 	fixtureOOBProgram = "AT2SwP5wteXeZK5dcicARe9tPzofzhoUDRBgMS+By+o8CwEidmOMyFLPlqDk1AY8PP0dk5u9zkBCCAhiRXRfVQIBAAABm5dS3l4ndvoMPGwAgbDa2etV4ba8GhFmzEEoWLnQUzIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFjAAA="
 
 	// Tx with no instructions. Should pass sanitize and proceed to
-	// fee-payer balance check; payer has 0 SOL → InsufficientFundsForFee.
+	// fee-payer balance check; payer has 0 SOL → AccountNotFound
 	fixtureNoInstructions = "AUoD9kRSzxiTCsWNc0tek1JI5Capj2LNsTI0MTUTYwuF15j7urkfyWvnyPQ87UHzaMHkChQ3TA7CBhuNwmojVgUBAAABm5dS3l4ndvoMPGwAgbDa2etV4ba8GhFmzEEoWLnQUzIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
 	// Self-transfer: fee payer also receives.
@@ -98,20 +98,14 @@ func withEmptyRecentBlockhashesSysvarFixture() func() {
 	return func() { sealevel.SysvarCache.RecentBlockHashes.Sysvar = prev }
 }
 
-// Without a populated AccountsDb, the System Program is unreachable and
-// the loader rejects with ProgramAccountNotFound. With AccountsDb (the
-// production case), the Pass-1 fallback resolves it and the tx fails
-// later at the fee-payer balance check (InsufficientFundsForFee). Either
-// outcome is a clean TransactionError, never a panic.
+// Agave validates the fee payer before loading the remaining accounts, so the
+// empty fixture bank deterministically reports AccountNotFound rather than a
+// later program-load failure. Either way, malformed local state must never
+// panic the simulation worker.
 func TestSimulateFixture_MissingAccount(t *testing.T) {
 	out := runSimulateFixture(t, fixtureMissingAccount)
 	require.NotNil(t, out.ProcessingResult.TransactionError)
-	got := out.ProcessingResult.TransactionError.ErrorType
-	assert.Contains(t,
-		[]TransactionErrorType{TransactionErrorProgramAccountNotFound, TransactionErrorInsufficientFundsForFee},
-		got,
-		"expected ProgramAccountNotFound (no AccountsDb) or InsufficientFundsForFee (with AccountsDb), got %v", got,
-	)
+	assert.Equal(t, TransactionErrorAccountNotFound, out.ProcessingResult.TransactionError.ErrorType)
 }
 
 func TestSimulateFixture_ZeroSig(t *testing.T) {
@@ -153,27 +147,17 @@ func TestSimulateFixture_OOBProgram(t *testing.T) {
 func TestSimulateFixture_NoInstructions(t *testing.T) {
 	out := runSimulateFixture(t, fixtureNoInstructions)
 	require.NotNil(t, out.ProcessingResult.TransactionError)
-	assert.Equal(t, TransactionErrorInsufficientFundsForFee, out.ProcessingResult.TransactionError.ErrorType)
+	assert.Equal(t, TransactionErrorAccountNotFound, out.ProcessingResult.TransactionError.ErrorType)
 }
 
-// Same caveat as MissingAccount: with no AccountsDb the System Program
-// is unreachable, so the loader fails earlier than the fee-payer check.
 func TestSimulateFixture_SelfTransfer(t *testing.T) {
 	out := runSimulateFixture(t, fixtureSelfTransfer)
 	require.NotNil(t, out.ProcessingResult.TransactionError)
-	got := out.ProcessingResult.TransactionError.ErrorType
-	assert.Contains(t,
-		[]TransactionErrorType{TransactionErrorProgramAccountNotFound, TransactionErrorInsufficientFundsForFee},
-		got,
-	)
+	assert.Equal(t, TransactionErrorAccountNotFound, out.ProcessingResult.TransactionError.ErrorType)
 }
 
 func TestSimulateFixture_DuplicateKeys(t *testing.T) {
 	out := runSimulateFixture(t, fixtureDuplicateKeys)
 	require.NotNil(t, out.ProcessingResult.TransactionError)
-	got := out.ProcessingResult.TransactionError.ErrorType
-	assert.Contains(t,
-		[]TransactionErrorType{TransactionErrorProgramAccountNotFound, TransactionErrorInsufficientFundsForFee},
-		got,
-	)
+	assert.Equal(t, TransactionErrorAccountNotFound, out.ProcessingResult.TransactionError.ErrorType)
 }

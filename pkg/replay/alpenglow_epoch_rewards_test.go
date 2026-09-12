@@ -25,7 +25,7 @@ func (r rewardAccountReader) GetAccount(_ uint64, pubkey solana.PublicKey) (*acc
 func TestRewardEpochDelegatedStakesAddress(t *testing.T) {
 	require.Equal(
 		t,
-		"FEhusMkCSpywBcjYA7j3NwrSKGH7oPmM1BbHZNFtjzkU",
+		"CHfmHwNcskfxg1ZnLatbHbmVvYbA6rLDz3Xok5a3Ku8i",
 		RewardEpochDelegatedStakesAccountAddr().String(),
 	)
 }

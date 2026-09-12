@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
-	"net"
 	"testing"
 	"time"
 
@@ -47,6 +46,62 @@ func TestAlpenglowVoterLoopFailureClosesAdmission(t *testing.T) {
 	require.Empty(t, voter.events, "closed voter retained events without a consumer")
 }
 
+func TestEnableVotingRejectsDifferentTransportIdentity(t *testing.T) {
+	transportIdentity := voterTestKey(31)
+	votingIdentity := voterTestKey(32)
+	engine, err := NewEngine(Config{AlpenglowIdentity: transportIdentity})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, engine.Close()) })
+
+	err = engine.EnableVoting(VotingConfig{
+		Identity:        votingIdentity,
+		AuthorizedVoter: voterTestKey(33),
+		VoteAccount:     solana.PublicKey(voterTestKey(34).Public().(ed25519.PublicKey)),
+		HistoryDir:      t.TempDir(),
+		EpochForSlot:    func(uint64) uint64 { return 0 },
+		Peers:           func([]alpenglow.ValidatorStake) []alpenglow.VotorPeer { return nil },
+	})
+	require.ErrorContains(t, err, "does not match consensus transport identity")
+}
+
+func TestEnableVotingSeedsTransportPeersBeforeBroadcasterStarts(t *testing.T) {
+	identity := voterTestKey(35)
+	authorized := voterTestKey(36)
+	voteAccount := solana.PublicKey(voterTestKey(37).Public().(ed25519.PublicKey))
+	set := voterTestValidatorSet(t, identity, authorized, voteAccount)
+	root := alpenglow.BlockID{Slot: 39, Hash: solana.Hash{0x39}}
+
+	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234, AlpenglowIdentity: identity})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, engine.Close()) })
+	engine.SetAlpenglowEpochLookup(func(uint64) uint64 { return set.Epoch })
+	require.NoError(t, engine.SetAlpenglowValidatorSet(set))
+	engine.SetAlpenglowRoot(root)
+
+	firstPeers := make(chan []alpenglow.ValidatorStake, 1)
+	require.NoError(t, engine.EnableVoting(VotingConfig{
+		Identity:        identity,
+		AuthorizedVoter: authorized,
+		VoteAccount:     voteAccount,
+		HistoryDir:      t.TempDir(),
+		EpochForSlot:    func(uint64) uint64 { return set.Epoch },
+		Peers: func(validators []alpenglow.ValidatorStake) []alpenglow.VotorPeer {
+			select {
+			case firstPeers <- append([]alpenglow.ValidatorStake(nil), validators...):
+			default:
+			}
+			return nil
+		},
+	}))
+
+	select {
+	case validators := <-firstPeers:
+		require.Equal(t, set.Validators, validators)
+	default:
+		t.Fatal("initial broadcaster reconciliation ran before validator sets were installed")
+	}
+}
+
 func TestNetworkCertificateLandingIgnoredAfterSafetyFault(t *testing.T) {
 	engine, err := NewEngine(Config{})
 	require.NoError(t, err)
@@ -86,7 +141,7 @@ func TestEngineVotingWiringCastsOnlyAfterSuccessfulReplay(t *testing.T) {
 	root := alpenglow.BlockID{Slot: 39, Hash: solana.Hash{0x39}}
 	historyDir := t.TempDir()
 
-	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234})
+	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234, AlpenglowIdentity: identity})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, engine.Close()) })
 	engine.SetAlpenglowEpochLookup(func(uint64) uint64 { return set.Epoch })
@@ -98,7 +153,7 @@ func TestEngineVotingWiringCastsOnlyAfterSuccessfulReplay(t *testing.T) {
 		VoteAccount:     voteAccount,
 		HistoryDir:      historyDir,
 		EpochForSlot:    func(uint64) uint64 { return set.Epoch },
-		Peers:           func(uint64, []alpenglow.ValidatorStake) []*net.UDPAddr { return nil },
+		Peers:           func([]alpenglow.ValidatorStake) []alpenglow.VotorPeer { return nil },
 		ReadyToVote:     func(uint64) bool { return true },
 	}))
 
@@ -140,7 +195,7 @@ func TestLocalVoteSelfVerificationUsesVoteSlotEpoch(t *testing.T) {
 	future.Epoch = 69
 	future.TotalStake = 6385864915298246
 
-	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234})
+	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234, AlpenglowIdentity: identity})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, engine.Close()) })
 	engine.SetAlpenglowEpochLookup(func(slot uint64) uint64 {
@@ -180,7 +235,7 @@ func TestAlpenglowVoterWaitsForLiveWindowThenVotesAndPersists(t *testing.T) {
 	set := voterTestValidatorSet(t, identity, authorized, voteAccount)
 	root := alpenglow.BlockID{Slot: 39, Hash: solana.Hash{0x39}}
 
-	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234})
+	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234, AlpenglowIdentity: identity})
 	require.NoError(t, err)
 	engine.SetAlpenglowEpochLookup(func(uint64) uint64 { return set.Epoch })
 	require.NoError(t, engine.SetAlpenglowValidatorSet(set))
@@ -193,7 +248,7 @@ func TestAlpenglowVoterWaitsForLiveWindowThenVotesAndPersists(t *testing.T) {
 		VoteAccount:     voteAccount,
 		HistoryDir:      t.TempDir(),
 		EpochForSlot:    func(uint64) uint64 { return set.Epoch },
-		Peers:           func(uint64, []alpenglow.ValidatorStake) []*net.UDPAddr { return nil },
+		Peers:           func([]alpenglow.ValidatorStake) []alpenglow.VotorPeer { return nil },
 		WaitToVoteSlot:  40,
 		ReadyToVote:     func(uint64) bool { return ready },
 	}, root)
@@ -254,7 +309,7 @@ func TestAlpenglowVoterSuccessfulVoteCompletesLiveWindowJoin(t *testing.T) {
 	set := voterTestValidatorSet(t, identity, authorized, voteAccount)
 	root := alpenglow.BlockID{Slot: 39, Hash: solana.Hash{0x39}}
 
-	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234})
+	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234, AlpenglowIdentity: identity})
 	require.NoError(t, err)
 	engine.SetAlpenglowEpochLookup(func(uint64) uint64 { return set.Epoch })
 	require.NoError(t, engine.SetAlpenglowValidatorSet(set))
@@ -267,7 +322,7 @@ func TestAlpenglowVoterSuccessfulVoteCompletesLiveWindowJoin(t *testing.T) {
 		VoteAccount:     voteAccount,
 		HistoryDir:      t.TempDir(),
 		EpochForSlot:    func(uint64) uint64 { return set.Epoch },
-		Peers:           func(uint64, []alpenglow.ValidatorStake) []*net.UDPAddr { return nil },
+		Peers:           func([]alpenglow.ValidatorStake) []alpenglow.VotorPeer { return nil },
 		WaitToVoteSlot:  40,
 		ReadyToVote:     func(uint64) bool { return ready },
 	}, root)
@@ -359,7 +414,7 @@ func TestNetworkVoteLandingRequiresExactVotorCertificateProof(t *testing.T) {
 		require.NoError(t, history.AddVote(alpenglow.NewNotarizationVote(40, blockID)))
 		require.NoError(t, alpenglow.SaveVoteHistory(historyDir, history, identity))
 
-		engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234})
+		engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234, AlpenglowIdentity: identity})
 		require.NoError(t, err)
 		t.Cleanup(func() { require.NoError(t, engine.Close()) })
 		engine.SetAlpenglowEpochLookup(func(uint64) uint64 { return set.Epoch })
@@ -370,7 +425,7 @@ func TestNetworkVoteLandingRequiresExactVotorCertificateProof(t *testing.T) {
 			VoteAccount:     voteAccount,
 			HistoryDir:      historyDir,
 			EpochForSlot:    func(uint64) uint64 { return set.Epoch },
-			Peers:           func(uint64, []alpenglow.ValidatorStake) []*net.UDPAddr { return nil },
+			Peers:           func([]alpenglow.ValidatorStake) []alpenglow.VotorPeer { return nil },
 			ReadyToVote:     func(uint64) bool { return true },
 		}))
 
@@ -392,7 +447,7 @@ func networkLandingTestEngine(t *testing.T) (*AlpenglowObserverEngine, alpenglow
 	set := voterTestValidatorSet(t, identity, authorized, voteAccount)
 	root := alpenglow.BlockID{Slot: 39, Hash: solana.Hash{0x39}}
 
-	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234})
+	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234, AlpenglowIdentity: identity})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, engine.Close()) })
 	engine.SetAlpenglowEpochLookup(func(uint64) uint64 { return set.Epoch })
@@ -404,7 +459,7 @@ func networkLandingTestEngine(t *testing.T) (*AlpenglowObserverEngine, alpenglow
 		VoteAccount:     voteAccount,
 		HistoryDir:      t.TempDir(),
 		EpochForSlot:    func(uint64) uint64 { return set.Epoch },
-		Peers:           func(uint64, []alpenglow.ValidatorStake) []*net.UDPAddr { return nil },
+		Peers:           func([]alpenglow.ValidatorStake) []alpenglow.VotorPeer { return nil },
 		ReadyToVote:     func(uint64) bool { return true },
 	}))
 

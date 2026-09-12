@@ -53,6 +53,7 @@ func ApplyAlpenglowVoteRewards(
 	var rewardValidators map[solana.PublicKey]struct{}
 	var rewardSlot uint64
 	var rewardEpoch uint64
+	currentEpoch := block.Epoch
 	var inflationState EpochInflationState
 	var rewardEpochStakes map[solana.PublicKey]uint64
 	var totalStake uint64
@@ -80,19 +81,17 @@ func ApplyAlpenglowVoteRewards(
 			return fmt.Errorf("slot %d vote rewards: %w", block.Slot, err)
 		}
 
-		validated, validationTimings, err := rewardcerts.ValidateRewardCertificatesWithVerifier(
+		validated, validationTimings, err := verifierMaterial.validateRewardCertificates(
 			block.Slot,
 			skipRaw,
 			notarRaw,
-			rewardEpoch,
-			verifierMaterial.verifier,
 			rewardDetails != nil,
 		)
 		if rewardDetails != nil {
-			if len(skipRaw) > 0 {
+			if validationTimings.Skip > 0 {
 				rewardDetails.SkipCertificateValidation.AddTiming(validationTimings.Skip)
 			}
-			if len(notarRaw) > 0 {
+			if validationTimings.Notar > 0 {
 				rewardDetails.NotarCertificateValidation.AddTiming(validationTimings.Notar)
 			}
 		}
@@ -114,10 +113,13 @@ func ApplyAlpenglowVoteRewards(
 		if err != nil {
 			return fmt.Errorf("slot %d vote rewards: %w", block.Slot, err)
 		}
-		var okInflation bool
-		inflationState, okInflation = inflationAcct.epochState(rewardEpoch)
-		if !okInflation {
-			return fmt.Errorf("slot %d vote rewards: missing epoch inflation for reward epoch %d", block.Slot, rewardEpoch)
+		// Vote rewards are credited to the processing bank's epoch, so their
+		// reward rate comes from that epoch too.  The stake distribution still
+		// comes from rewardSlot (eight slots earlier).  These epochs differ for
+		// the first eight banks after an epoch boundary.
+		inflationState, err = voteRewardInflationState(inflationAcct, currentEpoch, rewardEpoch)
+		if err != nil {
+			return fmt.Errorf("slot %d vote rewards: %w", block.Slot, err)
 		}
 
 		migrationEpoch, err = alpenglowMigrationEpoch(block, epochSchedule)
@@ -228,7 +230,6 @@ func ApplyAlpenglowVoteRewards(
 		accountMutationStart = time.Now()
 	}
 
-	currentEpoch := block.Epoch
 	var leaderRewardAccum uint64
 	var voteAccountsUpdated int
 	var leaderUpdatedInUnion bool
@@ -522,6 +523,24 @@ func calculateAlpenglowReward(inflation EpochInflationState, totalStake, validat
 	validatorReward = rewardLamports / 2
 	leaderReward = rewardLamports - validatorReward
 	return validatorReward, leaderReward
+}
+
+// voteRewardInflationState deliberately accepts both epochs to make the
+// boundary rule explicit: delayed certificates use rewardEpoch's stake view,
+// but rewards are credited using the processing bank epoch's inflation budget.
+func voteRewardInflationState(
+	state EpochInflationAccountState,
+	processingEpoch, rewardEpoch uint64,
+) (EpochInflationState, error) {
+	inflation, ok := state.epochState(processingEpoch)
+	if !ok {
+		return EpochInflationState{}, fmt.Errorf(
+			"missing epoch inflation for processing epoch %d (reward slot epoch %d)",
+			processingEpoch,
+			rewardEpoch,
+		)
+	}
+	return inflation, nil
 }
 
 func incrementAlpenglowCredits(epochCredits *[]sealevel.EpochCredits, migrationEpoch, epoch, newCredits uint64) {

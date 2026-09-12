@@ -343,6 +343,7 @@ func (bs *BlockSource) runTurbineStream() {
 
 		receiver := turbine.NewUDPReceiver(bs.turbineBindAddr)
 		receiver.SetLeaderForSlot(bs.leaderForSlot)
+		receiver.SetShredVersion(bs.turbineShredVersion)
 		receiver.SetFirstShredSink(bs.alpenglowFirstShredSink)
 		if bs.shredSpoolDir != "" {
 			if spool, serr := turbine.OpenShredSpool(bs.shredSpoolDir, shredSpoolMaxBytes); serr != nil {
@@ -359,6 +360,24 @@ func (bs *BlockSource) runTurbineStream() {
 		// before hydration can reconstruct them.
 		bs.attachAlpenglowBlockIDHintsToReceiver(receiver)
 		if gossipClient != nil {
+			if bs.turbineStakesForSlot != nil {
+				if err := receiver.SetRetransmit(turbine.RetransmitConfig{
+					Identity:     gossipClient.Identity(),
+					Peers:        gossipClient,
+					Stakes:       bs.turbineStakesForSlot,
+					EpochForSlot: bs.turbineEpochForSlot,
+					RootSlot:     bs.turbineRootSlot,
+					UseChaCha8:   bs.turbineUseChaCha8,
+					DedupAddrs:   bs.turbineDedupAddrs,
+				}); err != nil {
+					cancelStream()
+					bs.handleLiveShredStreamClosed(fmt.Sprintf("native turbine retransmit setup failed: %v", err))
+					if bs.waitForStopOrTimeout(backoff) {
+						return
+					}
+					continue
+				}
+			}
 			if err := receiver.SetRepairPeerSource(gossipClient.Identity(), gossipClient.RepairPeers); err == nil {
 				receiver.SetRepairRequestRate(bs.repairMaxRequestsPerSecond)
 			} else {
@@ -423,7 +442,7 @@ func (bs *BlockSource) runTurbineStream() {
 
 		if gossipClient != nil {
 			if !ownsGossipClient {
-				mlog.Log.FileOnlyf("Native turbine receiver using shared gossip client for repair and peer discovery")
+				mlog.Log.FileOnlyf("Native turbine receiver using shared gossip client for repair, retransmit, and peer discovery")
 			} else {
 				done := make(chan error, 1)
 				go func() {
@@ -438,7 +457,7 @@ func (bs *BlockSource) runTurbineStream() {
 				if bs.turbineAlpenglowAddr != "" {
 					alpenglowAddr = bs.turbineAlpenglowAddr
 				}
-				mlog.Log.FileOnlyf("Native turbine gossip client starting: entrypoint=%s bind=%s client=%s repair=enabled alpenglow=%s", bs.turbineGossipEntrypoint, bindAddr, gossipclient.ClientName, alpenglowAddr)
+				mlog.Log.FileOnlyf("Native turbine gossip client starting: entrypoint=%s bind=%s client=%s repair=enabled retransmit=%t alpenglow=%s", bs.turbineGossipEntrypoint, bindAddr, gossipclient.ClientName, bs.turbineStakesForSlot != nil, alpenglowAddr)
 			}
 		} else {
 			mlog.Log.Warnf("Native turbine gossip entrypoint is not configured; receiver is running UDP-only on %s with repair disabled", bs.turbineBindAddr)
@@ -488,10 +507,23 @@ func (bs *BlockSource) runTurbineStream() {
 				if stats.NonCanonicalBlockIDs != 0 {
 					nonCanonicalDesc = fmt.Sprintf("%d:%s!=%s", stats.LastNonCanonicalSlot, stats.LastNonCanonicalGot, stats.LastNonCanonicalWant)
 				}
-				mlog.Log.FileOnlyf("native turbine receiver stats: packets=%d data=%d coding=%d recovered=%d blocks=%d active_slots=%d evicted_slots=%d ignored_old_shreds=%d priority_repair_slots=%d noncanonical_block_ids=%d last_noncanonical=%s repair_requests=%d repair_responses=%d repair_timeouts=%d repair_outstanding=%d repair_peers=%d repair_pings=%d/%d repair_errors=%d parse_errors=%d sig_errors=%d missing_leaders=%d assembly_errors=%d last_packet=%s last_data_slot=%d last_block_slot=%d",
+				sendDiagnostic := stats.Retransmit.LastSendDiagnostic
+				if sendDiagnostic == "" {
+					sendDiagnostic = "none"
+				}
+				parentDiagnostic := stats.Retransmit.LastParentDiagnostic
+				if parentDiagnostic == "" {
+					parentDiagnostic = "none"
+				}
+				mlog.Log.FileOnlyf("native turbine receiver stats: packets=%d data=%d coding=%d recovered=%d blocks=%d active_slots=%d evicted_slots=%d ignored_old_shreds=%d priority_repair_slots=%d noncanonical_block_ids=%d last_noncanonical=%s repair_requests=%d repair_responses=%d repair_timeouts=%d repair_outstanding=%d repair_peers=%d repair_pings=%d/%d repair_errors=%d repair_socket_packets=%d repair_socket_unmatched=%d retransmit_shreds=%d retransmit_packets=%d retransmit_target_packets=%d retransmit_packet_attempts=%d retransmit_unsent_packets=%d retransmit_duplicates=%d retransmit_queue_drops=%d retransmit_no_peers=%d retransmit_parent_sigs=%d/%d retransmit_sig_errors=%d retransmit_sig_direct_leader=%d retransmit_sig_repair_socket=%d retransmit_sig_unexplained=%d retransmit_parent_sig_samples=%d retransmit_actual_signer_found=%d retransmit_actual_signer_unknown=%d retransmit_send_errors=%d retransmit_peer_selection_errors=%d retransmit_send_buffer_bytes=%d retransmit_send_syscall_errors=%d retransmit_short_batches=%d retransmit_retry_batches=%d retransmit_retry_packets=%d retransmit_retry_sent=%d retransmit_exhausted_batches=%d retransmit_send_samples=%d retransmit_last_send=%q retransmit_last_parent_sig=%q shred_version_mismatches=%d parse_errors=%d sig_errors=%d missing_leaders=%d assembly_errors=%d last_packet=%s last_data_slot=%d last_block_slot=%d",
 					stats.Packets, stats.DataShreds, stats.CodingShreds, stats.RecoveredData, stats.BlocksEmitted, stats.ActiveSlots,
 					stats.EvictedSlots, stats.IgnoredOldShreds, stats.PriorityRepairSlots, stats.NonCanonicalBlockIDs, nonCanonicalDesc, stats.Repair.Requests, stats.Repair.Responses, stats.Repair.Timeouts, stats.Repair.Outstanding, stats.Repair.Peers,
-					stats.Repair.Pings, stats.Repair.Pongs, stats.Repair.Errors, stats.ParseErrors, stats.SignatureErrors, stats.MissingLeaders, stats.AssemblyErrors,
+					stats.Repair.Pings, stats.Repair.Pongs, stats.Repair.Errors, stats.RepairSocketPackets, stats.RepairSocketUnmatched, stats.Retransmit.SentShreds, stats.Retransmit.SentPackets, stats.Retransmit.TargetPackets, stats.Retransmit.PacketAttempts, stats.Retransmit.UnsentPackets,
+					stats.Retransmit.DuplicateShreds, stats.Retransmit.QueueDrops, stats.Retransmit.NoPeers, stats.Retransmit.ParentSignaturesVerified, stats.Retransmit.ParentSignaturesSkipped, stats.Retransmit.InvalidParentSignatures,
+					stats.Retransmit.ParentSourceDirectLeader, stats.Retransmit.ParentSourceRepairSocket, stats.Retransmit.ParentSourceUnexplained, stats.Retransmit.ParentDiagnosticSamples, stats.Retransmit.ParentSignerFound, stats.Retransmit.ParentSignerNotFound, stats.Retransmit.SendErrors, stats.Retransmit.PeerSelectionErrors, stats.Retransmit.SendBufferBytes,
+					stats.Retransmit.SendSyscallErrors, stats.Retransmit.ShortSendBatches, stats.Retransmit.RetryBatches, stats.Retransmit.RetryPackets, stats.Retransmit.RetrySentPackets,
+					stats.Retransmit.ExhaustedSendBatches, stats.Retransmit.SendDiagnosticSamples, sendDiagnostic, parentDiagnostic, stats.ShredVersionMismatch,
+					stats.ParseErrors, stats.SignatureErrors, stats.MissingLeaders, stats.AssemblyErrors,
 					lastPacketAge, stats.LastDataSlot, stats.LastBlockSlot)
 			case err := <-streamDone:
 				streamErr = err

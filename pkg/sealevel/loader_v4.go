@@ -498,7 +498,10 @@ func LoaderV4ProcessSetProgramLength(execCtx *ExecutionCtx, newLen uint32) error
 
 	var requiredLamports uint64
 	if newLen != 0 {
-		rent := SysvarCache.Rent.Sysvar
+		rent, err := ReadRentSysvar(execCtx)
+		if err != nil {
+			return err
+		}
 		requiredLamports = max(rent.MinimumBalance(uint64(newLen)+loaderV4ProgramDataOffset), 1)
 	}
 
@@ -590,7 +593,10 @@ func LoaderV4ProcessDeploy(execCtx *ExecutionCtx) error {
 		return err
 	}
 
-	clock := SysvarCache.Clock.Sysvar
+	clock, err := ReadClockSysvar(execCtx)
+	if err != nil {
+		return err
+	}
 	currentSlot := clock.Slot
 
 	if state.Slot != 0 && (state.Slot+deploymentCooldownInSlots) > currentSlot {
@@ -654,7 +660,10 @@ func LoaderV4ProcessRetract(execCtx *ExecutionCtx) error {
 		return err
 	}
 
-	clock := SysvarCache.Clock.Sysvar
+	clock, err := ReadClockSysvar(execCtx)
+	if err != nil {
+		return err
+	}
 	currentSlot := clock.Slot
 
 	if (state.Slot + deploymentCooldownInSlots) > currentSlot {

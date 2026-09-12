@@ -42,22 +42,30 @@ func (sf *SysvarFees) Update(lamportsPerSignature uint64) {
 	sf.FeeCalculator.LamportsPerSignature = lamportsPerSignature
 }
 
-func ReadFeesSysvar(accts *accounts.Accounts) SysvarFees {
+func ReadFeesSysvar(execCtx *ExecutionCtx) SysvarFees {
+	if execCtx != nil && execCtx.SlotCtx != nil {
+		if bankSysvars := execCtx.SlotCtx.BankSysvars(); bankSysvars != nil {
+			fees, ok := bankSysvars.Fees()
+			if !ok {
+				panic("Fees sysvar is absent from bank snapshot")
+			}
+			return fees
+		}
+	}
+
+	if feesAcct, ok := localSysvarAccount(execCtx, SysvarFeesAddr); ok {
+		if feesAcct.Lamports == 0 {
+			panic("Fees sysvar account is absent")
+		}
+		var fees SysvarFees
+		fees.MustUnmarshalWithDecoder(bin.NewBinDecoder(feesAcct.Data))
+		return fees
+	}
+
 	if SysvarCache.Fees.Sysvar != nil {
 		return *SysvarCache.Fees.Sysvar
 	}
-
-	feesSysvarAcct, err := (*accts).GetAccount(&SysvarFeesAddr)
-	if err != nil {
-		panic("failed to read fees sysvar account")
-	}
-
-	dec := bin.NewBinDecoder(feesSysvarAcct.Data)
-
-	var fees SysvarFees
-	fees.MustUnmarshalWithDecoder(dec)
-
-	return fees
+	panic("failed to read fees sysvar account")
 }
 
 func WriteFeesSysvar(accts *accounts.Accounts, fees SysvarFees) {

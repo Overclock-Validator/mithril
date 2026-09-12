@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -375,7 +374,7 @@ func TestAlpenglowVotingEnabledAfterReplayRestoresAllExecutionProvenForkVotes(t 
 	authorized := voterTestKey(92)
 	voteAccount := solana.PublicKey(voterTestKey(93).Public().(ed25519.PublicKey))
 	set := voterTestValidatorSet(t, identity, authorized, voteAccount)
-	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234})
+	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234, AlpenglowIdentity: identity})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, engine.Close()) })
 	engine.SetAlpenglowEpochLookup(func(uint64) uint64 { return set.Epoch })
@@ -408,7 +407,7 @@ func TestAlpenglowVotingEnabledAfterReplayRestoresAllExecutionProvenForkVotes(t 
 		VoteAccount:     voteAccount,
 		HistoryDir:      historyDir,
 		EpochForSlot:    func(uint64) uint64 { return set.Epoch },
-		Peers:           func(uint64, []alpenglow.ValidatorStake) []*net.UDPAddr { return nil },
+		Peers:           func([]alpenglow.ValidatorStake) []alpenglow.VotorPeer { return nil },
 		WaitToVoteSlot:  firstBlock.Slot,
 		ReadyToVote:     func(uint64) bool { return true },
 	}))
@@ -506,7 +505,7 @@ func newStoppedFloorTestVoter(t *testing.T, root alpenglow.BlockID) (*AlpenglowO
 	voteAccount := solana.PublicKey(voterTestKey(83).Public().(ed25519.PublicKey))
 	set := voterTestValidatorSet(t, identity, authorized, voteAccount)
 
-	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234})
+	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234, AlpenglowIdentity: identity})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, engine.Close()) })
 	engine.SetAlpenglowEpochLookup(func(uint64) uint64 { return set.Epoch })
@@ -519,7 +518,7 @@ func newStoppedFloorTestVoter(t *testing.T, root alpenglow.BlockID) (*AlpenglowO
 		VoteAccount:     voteAccount,
 		HistoryDir:      t.TempDir(),
 		EpochForSlot:    func(uint64) uint64 { return set.Epoch },
-		Peers:           func(uint64, []alpenglow.ValidatorStake) []*net.UDPAddr { return nil },
+		Peers:           func([]alpenglow.ValidatorStake) []alpenglow.VotorPeer { return nil },
 		WaitToVoteSlot:  root.Slot + 1,
 		ReadyToVote:     func(uint64) bool { return true },
 	}, root)

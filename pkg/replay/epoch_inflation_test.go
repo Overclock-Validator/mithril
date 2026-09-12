@@ -1,6 +1,7 @@
 package replay
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	a "github.com/Overclock-Validator/mithril/pkg/addresses"
+	"github.com/Overclock-Validator/mithril/pkg/base58"
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/rewards"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
@@ -55,6 +57,105 @@ func TestCapitalizingEpochRewardsIncludesVotingAndStakingRewards(t *testing.T) {
 		10_515_249_682_157,
 		564_305_250_105,
 	))
+}
+
+func TestPartitionedRewardsBudgetUsesRecordedAlpenglowCeilingAtEpoch46Boundary(t *testing.T) {
+	const (
+		rewardedEpoch       = uint64(45)
+		recordedCeiling     = uint64(13_001_490_002_123)
+		recalculatedCeiling = uint64(12_999_897_233_543)
+	)
+
+	state := EpochInflationAccountState{
+		Current: EpochInflationState{
+			MaxPossibleValidatorReward: recordedCeiling,
+			SlotsPerEpoch:              54_000,
+			Epoch:                      rewardedEpoch,
+		},
+	}
+	acct := &accounts.Account{
+		Key:  VoteRewardAccountAddr(),
+		Data: encodeEpochInflationAccountState(state),
+	}
+	slotCtx := &sealevel.SlotCtx{
+		Accounts:     accounts.NewMemAccounts(),
+		Slot:         2_483_999,
+		ParentSlot:   2_483_998,
+		UnrootedRead: rewardAccountReader{acct: acct},
+	}
+	epochSchedule := &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 54_000}
+	f := features.NewFeaturesDefault()
+	f.EnableFeature(features.Alpenglow, 324_000)
+
+	got, err := partitionedRewardsBudget(
+		slotCtx, epochSchedule, f, rewardedEpoch, recalculatedCeiling,
+	)
+	require.NoError(t, err)
+	require.Equal(t, recordedCeiling, got)
+	require.NotEqual(t, recalculatedCeiling, got,
+		"recomputing after epoch VAT burns caused the slot-2484000 bank-hash divergence")
+
+	// Golden from the canonical slot-2,484,000 boundary bank.  Every other
+	// EpochRewards field was already byte-identical; TotalRewards is the sole
+	// field that changed the footer bank hash from Yx6C... to 7pR5....
+	parentBlockhash := base58.MustDecodeFromString("25Nf6yZEJHAGZsg7C7M1G7VZDRtm5zvfgLts7hkz3xXN")
+	encoded := encodeEpochRewardsForTest(t, sealevel.SysvarEpochRewards{
+		DistributionStartingBlockHeight: 2_409_026,
+		NumPartitions:                   1,
+		ParentBlockhash:                 parentBlockhash,
+		TotalRewards:                    got,
+		DistributedRewards:              12_473_161_378_901,
+		Active:                          true,
+	})
+	dataHash := sha256.Sum256(encoded)
+	require.Equal(t,
+		"8986b3a9662f9f07ed88db0a78cbb6b75150039c3e1b3dfcbc6426b8d485073e",
+		hex.EncodeToString(dataHash[:]),
+	)
+}
+
+func TestPartitionedRewardsBudgetUsesCalculatedFallbackBeforeAlpenglow(t *testing.T) {
+	const fallback = uint64(1234)
+	got, err := partitionedRewardsBudget(
+		nil,
+		&sealevel.SysvarEpochSchedule{SlotsPerEpoch: 54_000},
+		features.NewFeaturesDefault(),
+		45,
+		fallback,
+	)
+	require.NoError(t, err)
+	require.Equal(t, fallback, got)
+}
+
+func TestPartitionedRewardsBudgetIncludesMigrationEpochAndFailsClosed(t *testing.T) {
+	const migrationEpoch = uint64(6)
+	state := EpochInflationAccountState{Current: EpochInflationState{
+		MaxPossibleValidatorReward: 9876,
+		SlotsPerEpoch:              54_000,
+		Epoch:                      migrationEpoch,
+	}}
+	key := VoteRewardAccountAddr()
+	parent := &accounts.Account{Key: key, Data: encodeEpochInflationAccountState(state)}
+	slotCtx := &sealevel.SlotCtx{
+		Accounts:     accounts.NewMemAccounts(),
+		Slot:         377_999,
+		ParentSlot:   377_998,
+		UnrootedRead: rewardAccountReader{acct: parent},
+	}
+	schedule := &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 54_000}
+	f := features.NewFeaturesDefault()
+	f.EnableFeature(features.Alpenglow, migrationEpoch*schedule.SlotsPerEpoch)
+
+	got, err := partitionedRewardsBudget(slotCtx, schedule, f, migrationEpoch, 1234)
+	require.NoError(t, err)
+	require.Equal(t, uint64(9876), got)
+
+	_, err = partitionedRewardsBudget(slotCtx, schedule, f, migrationEpoch+1, 1234)
+	require.ErrorContains(t, err, "has no inflation budget for rewarded epoch 7")
+
+	slotCtx.UnrootedRead = rewardAccountReader{}
+	_, err = partitionedRewardsBudget(slotCtx, schedule, f, migrationEpoch, 1234)
+	require.ErrorContains(t, err, "load recorded inflation budget")
 }
 
 func TestStageEpochInflationAccountRollsStateAndCapitalization(t *testing.T) {

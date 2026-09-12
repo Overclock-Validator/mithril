@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
-	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -214,7 +213,7 @@ func TestFinalVoteGuardSeesInvalidationAfterEligibilityCheck(t *testing.T) {
 	root := alpenglow.BlockID{Slot: 39, Hash: solana.Hash{0x39}}
 	blockID := alpenglow.BlockID{Slot: 40, Hash: solana.Hash{0x40}}
 
-	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234})
+	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234, AlpenglowIdentity: identity})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +230,7 @@ func TestFinalVoteGuardSeesInvalidationAfterEligibilityCheck(t *testing.T) {
 		VoteAccount:     voteAccount,
 		HistoryDir:      t.TempDir(),
 		EpochForSlot:    func(uint64) uint64 { return set.Epoch },
-		Peers:           func(uint64, []alpenglow.ValidatorStake) []*net.UDPAddr { return nil },
+		Peers:           func([]alpenglow.ValidatorStake) []alpenglow.VotorPeer { return nil },
 		ReadyToVote:     func(uint64) bool { return true },
 	}, root)
 	if err != nil {

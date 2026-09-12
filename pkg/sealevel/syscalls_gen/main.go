@@ -23,6 +23,7 @@ func main() {
 		{"sol_log_64_", "SyscallLog64", ""},
 		{"sol_log_pubkey", "SyscallLogPubkey", ""},
 		{"sol_log_compute_units_", "SyscallLogCUs", ""},
+		{"sol_remaining_compute_units", "SyscallRemainingComputeUnits", "ft.IsActive(features.RemainingComputeUnitsSyscallEnabled)"},
 		{"sol_log_data", "SyscallLogData", ""},
 		{"sol_sha256", "SyscallSha256", ""},
 		{"sol_keccak256", "SyscallKeccak256", ""},

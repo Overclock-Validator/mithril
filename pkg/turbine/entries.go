@@ -22,6 +22,7 @@ const (
 	// A minimally encoded transaction still has compact counts, the message
 	// header, and a recent blockhash.
 	minimumTransactionWireSize = 1 + 3 + 1 + 32 + 1
+	legacyTransactionWireLimit = 1232
 )
 
 type Entry struct {
@@ -58,8 +59,22 @@ func (e *Entry) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 	}
 	e.Txns = make([]solana.Transaction, numTxns)
 	for i := uint64(0); i < numTxns; i++ {
+		transactionStart := decoder.Position()
 		if err = e.Txns[i].UnmarshalWithDecoder(decoder); err != nil {
 			return fmt.Errorf("read transaction %d: %w", i, err)
+		}
+		transactionSize := decoder.Position() - transactionStart
+		var transactionLimit uint
+		switch version := e.Txns[i].Message.GetVersion(); version {
+		case solana.MessageVersionLegacy, solana.MessageVersionV0:
+			transactionLimit = legacyTransactionWireLimit
+		case solana.MessageVersionV1:
+			transactionLimit = solana.MaxTransactionSizeV1
+		default:
+			return fmt.Errorf("read transaction %d: unsupported message version %d", i, version)
+		}
+		if transactionSize > transactionLimit {
+			return fmt.Errorf("read transaction %d: wire size %d exceeds version %d limit %d", i, transactionSize, e.Txns[i].Message.GetVersion(), transactionLimit)
 		}
 	}
 	return nil
@@ -132,7 +147,7 @@ func decodeEntriesAndAlpenglowMarkersFromDataShreds(shreds []*Shred, timings *en
 		if !shred.DataComplete() {
 			continue
 		}
-		if parent, footer, ok, err := decodeAlpenglowMarker(batchBytes, batchStart); err != nil {
+		if parent, footer, ok, err := decodeAlpenglowMarkerFromShredBatch(batchBytes, batchStart); err != nil {
 			return nil, nil, nil, fmt.Errorf("decode alpenglow block marker ending at shred %d: %w", shred.Index, err)
 		} else if ok {
 			if parent != nil {
@@ -149,9 +164,14 @@ func decodeEntriesAndAlpenglowMarkersFromDataShreds(shreds []*Shred, timings *en
 			continue
 		}
 		parseStart := time.Now()
-		batchEntries, err := decodeEntryBatch(batchBytes)
+		batchEntries, consumed, err := decodeEntryBatchPrefix(batchBytes)
 		if timings != nil {
 			timings.transactionParse += time.Since(parseStart)
+		}
+		// A zero entry count with more bytes denotes a marker. Preserve the
+		// rejection of unrecognized or misplaced markers in this fallback path.
+		if err == nil && len(batchEntries) == 0 && consumed != len(batchBytes) {
+			err = fmt.Errorf("entry batch has %d trailing bytes", len(batchBytes)-consumed)
 		}
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("decode entry batch ending at shred %d: %w", shred.Index, err)
@@ -184,22 +204,45 @@ func decodeEntriesAndAlpenglowMarkersFromDataShreds(shreds []*Shred, timings *en
 }
 
 func decodeEntryBatch(data []byte) ([]Entry, error) {
+	entries, consumed, err := decodeEntryBatchPrefix(data)
+	if err != nil {
+		return nil, err
+	}
+	if consumed != len(data) {
+		return nil, fmt.Errorf("entry batch has %d trailing bytes", len(data)-consumed)
+	}
+	return entries, nil
+}
+
+// decodeEntryBatchPrefix reads one entry batch and reports its encoded size.
+// Agave's entry/src/block_component_parser.rs ignores trailing bytes after one
+// component in a DATA_COMPLETE batch. Standalone decoding still requires an
+// exact envelope.
+func decodeEntryBatchPrefix(data []byte) ([]Entry, int, error) {
 	var decoder bin.Decoder
 	decoder.SetEncoding(bin.EncodingBin)
 	decoder.Reset(data)
 	var batch entryBatch
 	if err := batch.UnmarshalWithDecoder(&decoder); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	if decoder.Remaining() != 0 {
-		return nil, fmt.Errorf("entry batch has %d trailing bytes", decoder.Remaining())
-	}
-	return batch.Entries, nil
+	return batch.Entries, len(data) - decoder.Remaining(), nil
 }
 
 func decodeAlpenglowParentMarker(data []byte, batchStart uint32) (*AlpenglowParentInfo, bool, error) {
 	parent, _, ok, err := decodeAlpenglowMarker(data, batchStart)
 	return parent, ok && parent != nil, err
+}
+
+func decodeAlpenglowMarkerFromShredBatch(data []byte, batchStart uint32) (*AlpenglowParentInfo, *BlockFooter, bool, error) {
+	if len(data) >= 13 && binary.LittleEndian.Uint64(data[:8]) == 0 && binary.LittleEndian.Uint16(data[8:10]) == blockComponentMarkerVersionV1 {
+		markerSize, err := blockMarkerPrefixSize(data)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		data = data[:markerSize]
+	}
+	return decodeAlpenglowMarker(data, batchStart)
 }
 
 func decodeAlpenglowMarker(data []byte, batchStart uint32) (*AlpenglowParentInfo, *BlockFooter, bool, error) {

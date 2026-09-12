@@ -402,12 +402,23 @@ func (t *ChainTracker) ObserveFinalized(block BlockID, certType CertificateType)
 	}
 
 	conflictsBefore := len(t.conflicts)
+	_, wasDirectFinalized := t.directFinalized[block]
+	decisionVersionBefore := t.decisionVersion
 	t.markDirectFinalizedLocked(block, certType)
 	if conflict, ok := t.conflicts[block.Slot]; ok {
 		return fmt.Errorf("finalization conflict at slot %d: %s", block.Slot, conflict.reason)
 	}
 	if len(t.conflicts) > conflictsBefore {
 		return fmt.Errorf("finalization of block %s exposed conflicting finalized ancestry", block)
+	}
+	// Certificate acceptance and pool finalization are separate tracker
+	// transitions. The certificate already re-arms decision consumers, but the
+	// finalization step can additionally select exact ancestry and derive omitted
+	// slots. Re-arm once for a newly installed direct-finality decision so a
+	// concurrent consumer that observed the certificate version cannot miss the
+	// ancestry change. Idempotent ObserveFinalized calls do not bump again.
+	if _, nowDirectFinalized := t.directFinalized[block]; !wasDirectFinalized && nowDirectFinalized && t.decisionVersion == decisionVersionBefore {
+		t.bumpDecisionLocked()
 	}
 	return nil
 }
@@ -776,6 +787,27 @@ func (t *ChainTracker) FinalizedBlockAt(slot uint64) (BlockID, bool) {
 		return BlockID{}, false
 	}
 	return found, true
+}
+
+// FinalizedSkipAt returns the finalized descendant whose exact parent edge
+// omits slot. Unlike SkipCertifiedAt, this deliberately excludes a standalone
+// skip certificate: only finalized ancestry proves that an executed block at
+// the omitted slot is off the selected chain. A finalized block selected at
+// slot itself remains authoritative over any same-slot skip evidence.
+func (t *ChainTracker) FinalizedSkipAt(slot uint64) (BlockID, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if _, conflicted := t.conflicts[slot]; conflicted {
+		return BlockID{}, false
+	}
+	if selected, ok := t.finalizedBySlot[slot]; ok && !t.isObjectivelyInvalidBlockLocked(selected) {
+		return BlockID{}, false
+	}
+	indirect, ok := t.indirectSkips[slot]
+	if !ok || indirect.viaFinalized.IsZero() || t.isObjectivelyInvalidBlockLocked(indirect.viaFinalized) {
+		return BlockID{}, false
+	}
+	return indirect.viaFinalized, true
 }
 
 // FinalityConflictAt reports whether the slot carries a recorded safety violation.
