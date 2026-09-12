@@ -17,10 +17,12 @@ and repair catch-up without a mode transition or a 200 ms batching delay.
 3. Signature groups contain available transactions up to the configured lane
    target. Transactions with multiple signatures remain indivisible. A rolling
    per-request window refills when any group finishes, without a wave barrier.
-4. Once the full slot is assembled, completion rechecks exact batch bytes,
-   processes all Alpenglow markers and FEC roots, and constructs the final ordered
-   block. It submits any transactions not already covered and joins signature
-   work for the retained batches before marking the block verified.
+4. Once the full slot is assembled, completion compares shred slices directly
+   against the cached component bytes, including padding. Cache hits avoid a
+   second component buffer; misses allocate a fresh buffer at its exact size.
+   Completion processes all Alpenglow markers and FEC roots and constructs the
+   final ordered block. It submits any transactions not already covered and joins
+   signature work for the retained batches before marking the block verified.
 5. The existing replay pipeline receives the verified block. This change does
    not execute transactions before full-slot admission, alter execution batching,
    or move parent-dependent validation ahead of its required state.
@@ -97,3 +99,5 @@ throughput alone is insufficient evidence of end-to-end replay improvement.
 
 Measured Zen 5 results, raw logs, and validation details are in the
 [September 12 benchmark report](results/sigverify-streaming/2026-09-12-zen5/README.md).
+The subsequent [direct cache-comparison report](results/sigverify-direct-cache/2026-09-12-zen5/README.md)
+isolates the removal of redundant component-buffer construction at completion.
