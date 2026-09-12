@@ -1,0 +1,1653 @@
+{
+  "description": "Compare actual transfer load/execute under separate-process sigverify load.\n\nThis does not benchmark complete block replay, the shared Go scheduler, account\ncommit, or the dependency planner. Both processes use the same explicitly chosen\neight physical CPU cores. The signature workload uses the production verifier\npool; 200 ms availability is simulated, not a captured network trace.\n",
+  "arguments": {
+    "turbine_bin": "/srv/mithril-sigverify-streaming-20260912/bin/turbine-final.test",
+    "replay_bin": "/srv/mithril-sigverify-streaming-20260912/bin/replay.test",
+    "fixtures": "/srv/mithril-planner-pr257-trial-20260912/fixtures",
+    "slot": 2622581,
+    "cpus": "0-7",
+    "out": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention",
+    "samples": 3,
+    "probe_time": "500ms",
+    "catchup_blocks": 96,
+    "tip_blocks": 20,
+    "warmup_ms": 400,
+    "backend": "r51",
+    "seed": 1,
+    "timeout": 120
+  },
+  "topology": [
+    {
+      "cpu": 0,
+      "package": 0,
+      "core": 0
+    },
+    {
+      "cpu": 1,
+      "package": 0,
+      "core": 1
+    },
+    {
+      "cpu": 2,
+      "package": 0,
+      "core": 2
+    },
+    {
+      "cpu": 3,
+      "package": 0,
+      "core": 3
+    },
+    {
+      "cpu": 4,
+      "package": 0,
+      "core": 4
+    },
+    {
+      "cpu": 5,
+      "package": 0,
+      "core": 5
+    },
+    {
+      "cpu": 6,
+      "package": 0,
+      "core": 6
+    },
+    {
+      "cpu": 7,
+      "package": 0,
+      "core": 7
+    }
+  ],
+  "gomaxprocs_each_process": 8,
+  "execution_probe_command": [
+    "taskset",
+    "--cpu-list",
+    "0-7",
+    "/srv/mithril-sigverify-streaming-20260912/bin/replay.test",
+    "-test.run=^$",
+    "-test.bench=^BenchmarkLoadAndExecuteTransferResultMode$/^lean$",
+    "-test.benchtime=500ms",
+    "-test.count=1",
+    "-test.timeout=120s"
+  ],
+  "runs": [
+    {
+      "sample": 1,
+      "workers": 2,
+      "target": 8,
+      "mode": "tip_200ms_overlap",
+      "baseline": {
+        "wall_seconds": 0.6645082151517272,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 167744,
+          "ns/op": 3471.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-1-tip_200ms_overlap-workers2-target8/execution-baseline.log"
+      },
+      "concurrent": {
+        "wall_seconds": 0.6648174938745797,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 171600,
+          "ns/op": 3530.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-1-tip_200ms_overlap-workers2-target8/execution-concurrent.log"
+      },
+      "execution_slowdown_ratio": 1.0169979832901181,
+      "sigverify": {
+        "name": "BenchmarkTransactionVerificationFlow/captured_2622581/workers_2/target_8/tip_200ms_overlap-8",
+        "iterations": 20,
+        "ns/op": 200924240.0,
+        "avg_cpu_cores": 0.8916,
+        "components/block": 126.0,
+        "cpu-ms/block": 179.2,
+        "feed_lag_p50-ms": 0.4462,
+        "feed_lag_p95-ms": 0.9733,
+        "mean_width": 7.912,
+        "ready_p50-ms": 1.19,
+        "ready_p95-ms": 1.808,
+        "residual_p50-ms": 0.9351,
+        "residual_p95-ms": 1.356,
+        "signatures/block": 33760.0,
+        "signatures/s": 168024.0,
+        "submit_p50-ms": 0.001734,
+        "submit_p95-ms": 0.004288,
+        "B/op": 7208732.0,
+        "allocs/op": 68935.0
+      },
+      "sigverify_command": [
+        "taskset",
+        "--cpu-list",
+        "0-7",
+        "/srv/mithril-sigverify-streaming-20260912/bin/turbine-final.test",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkTransactionVerificationFlow$/^captured_2622581$/^workers_2$/^target_8$/^tip_200ms_overlap$",
+        "-test.benchtime=20x",
+        "-test.count=1",
+        "-test.timeout=120s"
+      ],
+      "sigverify_log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-1-tip_200ms_overlap-workers2-target8/sigverify-load.log"
+    },
+    {
+      "sample": 1,
+      "workers": 4,
+      "target": 8,
+      "mode": "catchup",
+      "baseline": {
+        "wall_seconds": 0.6647921879775822,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 170856,
+          "ns/op": 3547.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-1-catchup-workers4-target8/execution-baseline.log"
+      },
+      "concurrent": {
+        "wall_seconds": 0.6148647838272154,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 139512,
+          "ns/op": 4060.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-1-catchup-workers4-target8/execution-concurrent.log"
+      },
+      "execution_slowdown_ratio": 1.1446292641669016,
+      "sigverify": {
+        "name": "BenchmarkTransactionVerificationFlow/captured_2622581/workers_4/target_8/catchup-8",
+        "iterations": 96,
+        "ns/op": 40210294.0,
+        "avg_cpu_cores": 3.993,
+        "components/block": 1.0,
+        "cpu-ms/block": 160.6,
+        "feed_lag_p50-ms": 0.000211,
+        "feed_lag_p95-ms": 0.00043,
+        "mean_width": 8.0,
+        "ready_p50-ms": 39.57,
+        "ready_p95-ms": 43.68,
+        "residual_p50-ms": 39.57,
+        "residual_p95-ms": 43.68,
+        "signatures/block": 33760.0,
+        "signatures/s": 839586.0,
+        "submit_p50-ms": 0.003306,
+        "submit_p95-ms": 0.005891,
+        "B/op": 7058192.0,
+        "allocs/op": 67537.0
+      },
+      "sigverify_command": [
+        "taskset",
+        "--cpu-list",
+        "0-7",
+        "/srv/mithril-sigverify-streaming-20260912/bin/turbine-final.test",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkTransactionVerificationFlow$/^captured_2622581$/^workers_4$/^target_8$/^catchup$",
+        "-test.benchtime=96x",
+        "-test.count=1",
+        "-test.timeout=120s"
+      ],
+      "sigverify_log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-1-catchup-workers4-target8/sigverify-load.log"
+    },
+    {
+      "sample": 1,
+      "workers": 2,
+      "target": 4,
+      "mode": "tip_200ms_overlap",
+      "baseline": {
+        "wall_seconds": 0.6646570740267634,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 172561,
+          "ns/op": 3462.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-1-tip_200ms_overlap-workers2-target4/execution-baseline.log"
+      },
+      "concurrent": {
+        "wall_seconds": 0.6148028671741486,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 156918,
+          "ns/op": 3704.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-1-tip_200ms_overlap-workers2-target4/execution-concurrent.log"
+      },
+      "execution_slowdown_ratio": 1.069901790872328,
+      "sigverify": {
+        "name": "BenchmarkTransactionVerificationFlow/captured_2622581/workers_2/target_4/tip_200ms_overlap-8",
+        "iterations": 20,
+        "ns/op": 201168852.0,
+        "avg_cpu_cores": 1.563,
+        "components/block": 126.0,
+        "cpu-ms/block": 314.3,
+        "feed_lag_p50-ms": 0.04094,
+        "feed_lag_p95-ms": 0.8651,
+        "mean_width": 3.956,
+        "ready_p50-ms": 1.616,
+        "ready_p95-ms": 2.755,
+        "residual_p50-ms": 1.196,
+        "residual_p95-ms": 1.497,
+        "signatures/block": 33760.0,
+        "signatures/s": 167819.0,
+        "submit_p50-ms": 0.001432,
+        "submit_p95-ms": 0.004018,
+        "B/op": 7234818.0,
+        "allocs/op": 68941.0
+      },
+      "sigverify_command": [
+        "taskset",
+        "--cpu-list",
+        "0-7",
+        "/srv/mithril-sigverify-streaming-20260912/bin/turbine-final.test",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkTransactionVerificationFlow$/^captured_2622581$/^workers_2$/^target_4$/^tip_200ms_overlap$",
+        "-test.benchtime=20x",
+        "-test.count=1",
+        "-test.timeout=120s"
+      ],
+      "sigverify_log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-1-tip_200ms_overlap-workers2-target4/sigverify-load.log"
+    },
+    {
+      "sample": 1,
+      "workers": 4,
+      "target": 4,
+      "mode": "tip_200ms_overlap",
+      "baseline": {
+        "wall_seconds": 0.6144880480132997,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 165466,
+          "ns/op": 3489.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-1-tip_200ms_overlap-workers4-target4/execution-baseline.log"
+      },
+      "concurrent": {
+        "wall_seconds": 0.7155657866969705,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 155095,
+          "ns/op": 4302.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-1-tip_200ms_overlap-workers4-target4/execution-concurrent.log"
+      },
+      "execution_slowdown_ratio": 1.233018056749785,
+      "sigverify": {
+        "name": "BenchmarkTransactionVerificationFlow/captured_2622581/workers_4/target_4/tip_200ms_overlap-8",
+        "iterations": 20,
+        "ns/op": 201022700.0,
+        "avg_cpu_cores": 1.651,
+        "components/block": 126.0,
+        "cpu-ms/block": 332.0,
+        "feed_lag_p50-ms": 0.4337,
+        "feed_lag_p95-ms": 0.9876,
+        "mean_width": 3.956,
+        "ready_p50-ms": 1.206,
+        "ready_p95-ms": 1.982,
+        "residual_p50-ms": 1.099,
+        "residual_p95-ms": 1.257,
+        "signatures/block": 33760.0,
+        "signatures/s": 167941.0,
+        "submit_p50-ms": 0.001674,
+        "submit_p95-ms": 0.004459,
+        "B/op": 7241454.0,
+        "allocs/op": 68940.0
+      },
+      "sigverify_command": [
+        "taskset",
+        "--cpu-list",
+        "0-7",
+        "/srv/mithril-sigverify-streaming-20260912/bin/turbine-final.test",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkTransactionVerificationFlow$/^captured_2622581$/^workers_4$/^target_4$/^tip_200ms_overlap$",
+        "-test.benchtime=20x",
+        "-test.count=1",
+        "-test.timeout=120s"
+      ],
+      "sigverify_log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-1-tip_200ms_overlap-workers4-target4/sigverify-load.log"
+    },
+    {
+      "sample": 1,
+      "workers": 4,
+      "target": 8,
+      "mode": "tip_200ms_overlap",
+      "baseline": {
+        "wall_seconds": 0.6647598869167268,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 165728,
+          "ns/op": 3596.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-1-tip_200ms_overlap-workers4-target8/execution-baseline.log"
+      },
+      "concurrent": {
+        "wall_seconds": 0.6647413833998144,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 167448,
+          "ns/op": 3564.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-1-tip_200ms_overlap-workers4-target8/execution-concurrent.log"
+      },
+      "execution_slowdown_ratio": 0.9911012235817576,
+      "sigverify": {
+        "name": "BenchmarkTransactionVerificationFlow/captured_2622581/workers_4/target_8/tip_200ms_overlap-8",
+        "iterations": 20,
+        "ns/op": 200934390.0,
+        "avg_cpu_cores": 0.8582,
+        "components/block": 126.0,
+        "cpu-ms/block": 172.4,
+        "feed_lag_p50-ms": 0.517,
+        "feed_lag_p95-ms": 1.006,
+        "mean_width": 7.912,
+        "ready_p50-ms": 0.9062,
+        "ready_p95-ms": 1.396,
+        "residual_p50-ms": 1.041,
+        "residual_p95-ms": 1.256,
+        "signatures/block": 33760.0,
+        "signatures/s": 168015.0,
+        "submit_p50-ms": 0.001383,
+        "submit_p95-ms": 0.003878,
+        "B/op": 7274370.0,
+        "allocs/op": 68941.0
+      },
+      "sigverify_command": [
+        "taskset",
+        "--cpu-list",
+        "0-7",
+        "/srv/mithril-sigverify-streaming-20260912/bin/turbine-final.test",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkTransactionVerificationFlow$/^captured_2622581$/^workers_4$/^target_8$/^tip_200ms_overlap$",
+        "-test.benchtime=20x",
+        "-test.count=1",
+        "-test.timeout=120s"
+      ],
+      "sigverify_log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-1-tip_200ms_overlap-workers4-target8/sigverify-load.log"
+    },
+    {
+      "sample": 1,
+      "workers": 2,
+      "target": 4,
+      "mode": "catchup",
+      "baseline": {
+        "wall_seconds": 0.6649067718535662,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 149238,
+          "ns/op": 4008.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-1-catchup-workers2-target4/execution-baseline.log"
+      },
+      "concurrent": {
+        "wall_seconds": 0.6675727372057736,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 146756,
+          "ns/op": 4085.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-1-catchup-workers2-target4/execution-concurrent.log"
+      },
+      "execution_slowdown_ratio": 1.0192115768463075,
+      "sigverify": {
+        "name": "BenchmarkTransactionVerificationFlow/captured_2622581/workers_2/target_4/catchup-8",
+        "iterations": 96,
+        "ns/op": 153189266.0,
+        "avg_cpu_cores": 2.048,
+        "components/block": 1.0,
+        "cpu-ms/block": 313.8,
+        "feed_lag_p50-ms": 0.000211,
+        "feed_lag_p95-ms": 0.000481,
+        "mean_width": 4.0,
+        "ready_p50-ms": 149.6,
+        "ready_p95-ms": 174.2,
+        "residual_p50-ms": 149.6,
+        "residual_p95-ms": 174.2,
+        "signatures/block": 33760.0,
+        "signatures/s": 220381.0,
+        "submit_p50-ms": 0.003657,
+        "submit_p95-ms": 0.01091,
+        "B/op": 7054772.0,
+        "allocs/op": 67536.0
+      },
+      "sigverify_command": [
+        "taskset",
+        "--cpu-list",
+        "0-7",
+        "/srv/mithril-sigverify-streaming-20260912/bin/turbine-final.test",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkTransactionVerificationFlow$/^captured_2622581$/^workers_2$/^target_4$/^catchup$",
+        "-test.benchtime=96x",
+        "-test.count=1",
+        "-test.timeout=120s"
+      ],
+      "sigverify_log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-1-catchup-workers2-target4/sigverify-load.log"
+    },
+    {
+      "sample": 1,
+      "workers": 4,
+      "target": 4,
+      "mode": "catchup",
+      "baseline": {
+        "wall_seconds": 0.7147685927338898,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 164997,
+          "ns/op": 3958.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-1-catchup-workers4-target4/execution-baseline.log"
+      },
+      "concurrent": {
+        "wall_seconds": 0.6648671478033066,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 152398,
+          "ns/op": 4006.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-1-catchup-workers4-target4/execution-concurrent.log"
+      },
+      "execution_slowdown_ratio": 1.0121273370389086,
+      "sigverify": {
+        "name": "BenchmarkTransactionVerificationFlow/captured_2622581/workers_4/target_4/catchup-8",
+        "iterations": 96,
+        "ns/op": 79167070.0,
+        "avg_cpu_cores": 3.991,
+        "components/block": 1.0,
+        "cpu-ms/block": 316.0,
+        "feed_lag_p50-ms": 0.00023,
+        "feed_lag_p95-ms": 0.00037,
+        "mean_width": 4.0,
+        "ready_p50-ms": 76.56,
+        "ready_p95-ms": 96.7,
+        "residual_p50-ms": 76.56,
+        "residual_p95-ms": 96.7,
+        "signatures/block": 33760.0,
+        "signatures/s": 426440.0,
+        "submit_p50-ms": 0.003706,
+        "submit_p95-ms": 0.011,
+        "B/op": 7060780.0,
+        "allocs/op": 67537.0
+      },
+      "sigverify_command": [
+        "taskset",
+        "--cpu-list",
+        "0-7",
+        "/srv/mithril-sigverify-streaming-20260912/bin/turbine-final.test",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkTransactionVerificationFlow$/^captured_2622581$/^workers_4$/^target_4$/^catchup$",
+        "-test.benchtime=96x",
+        "-test.count=1",
+        "-test.timeout=120s"
+      ],
+      "sigverify_log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-1-catchup-workers4-target4/sigverify-load.log"
+    },
+    {
+      "sample": 1,
+      "workers": 2,
+      "target": 8,
+      "mode": "catchup",
+      "baseline": {
+        "wall_seconds": 0.6647211848758161,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 174750,
+          "ns/op": 3542.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-1-catchup-workers2-target8/execution-baseline.log"
+      },
+      "concurrent": {
+        "wall_seconds": 0.7656238148920238,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 159576,
+          "ns/op": 4432.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-1-catchup-workers2-target8/execution-concurrent.log"
+      },
+      "execution_slowdown_ratio": 1.251270468661773,
+      "sigverify": {
+        "name": "BenchmarkTransactionVerificationFlow/captured_2622581/workers_2/target_8/catchup-8",
+        "iterations": 96,
+        "ns/op": 78756306.0,
+        "avg_cpu_cores": 2.051,
+        "components/block": 1.0,
+        "cpu-ms/block": 161.6,
+        "feed_lag_p50-ms": 0.00022,
+        "feed_lag_p95-ms": 0.000491,
+        "mean_width": 8.0,
+        "ready_p50-ms": 75.68,
+        "ready_p95-ms": 90.65,
+        "residual_p50-ms": 75.68,
+        "residual_p95-ms": 90.65,
+        "signatures/block": 33760.0,
+        "signatures/s": 428664.0,
+        "submit_p50-ms": 0.003326,
+        "submit_p95-ms": 0.01184,
+        "B/op": 7060612.0,
+        "allocs/op": 67536.0
+      },
+      "sigverify_command": [
+        "taskset",
+        "--cpu-list",
+        "0-7",
+        "/srv/mithril-sigverify-streaming-20260912/bin/turbine-final.test",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkTransactionVerificationFlow$/^captured_2622581$/^workers_2$/^target_8$/^catchup$",
+        "-test.benchtime=96x",
+        "-test.count=1",
+        "-test.timeout=120s"
+      ],
+      "sigverify_log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-1-catchup-workers2-target8/sigverify-load.log"
+    },
+    {
+      "sample": 2,
+      "workers": 2,
+      "target": 8,
+      "mode": "catchup",
+      "baseline": {
+        "wall_seconds": 0.6144605274312198,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 168331,
+          "ns/op": 3448.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-2-catchup-workers2-target8/execution-baseline.log"
+      },
+      "concurrent": {
+        "wall_seconds": 0.6650009588338435,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 142396,
+          "ns/op": 4201.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-2-catchup-workers2-target8/execution-concurrent.log"
+      },
+      "execution_slowdown_ratio": 1.2183874709976799,
+      "sigverify": {
+        "name": "BenchmarkTransactionVerificationFlow/captured_2622581/workers_2/target_8/catchup-8",
+        "iterations": 96,
+        "ns/op": 77871825.0,
+        "avg_cpu_cores": 2.052,
+        "components/block": 1.0,
+        "cpu-ms/block": 159.8,
+        "feed_lag_p50-ms": 0.0002,
+        "feed_lag_p95-ms": 0.00038,
+        "mean_width": 8.0,
+        "ready_p50-ms": 76.13,
+        "ready_p95-ms": 88.31,
+        "residual_p50-ms": 76.13,
+        "residual_p95-ms": 88.31,
+        "signatures/block": 33760.0,
+        "signatures/s": 433533.0,
+        "submit_p50-ms": 0.003436,
+        "submit_p95-ms": 0.007464,
+        "B/op": 7056320.0,
+        "allocs/op": 67536.0
+      },
+      "sigverify_command": [
+        "taskset",
+        "--cpu-list",
+        "0-7",
+        "/srv/mithril-sigverify-streaming-20260912/bin/turbine-final.test",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkTransactionVerificationFlow$/^captured_2622581$/^workers_2$/^target_8$/^catchup$",
+        "-test.benchtime=96x",
+        "-test.count=1",
+        "-test.timeout=120s"
+      ],
+      "sigverify_log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-2-catchup-workers2-target8/sigverify-load.log"
+    },
+    {
+      "sample": 2,
+      "workers": 4,
+      "target": 8,
+      "mode": "catchup",
+      "baseline": {
+        "wall_seconds": 0.6145014832727611,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 168381,
+          "ns/op": 3462.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-2-catchup-workers4-target8/execution-baseline.log"
+      },
+      "concurrent": {
+        "wall_seconds": 0.7652924442663789,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 141712,
+          "ns/op": 4887.0,
+          "B/op": 4145.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-2-catchup-workers4-target8/execution-concurrent.log"
+      },
+      "execution_slowdown_ratio": 1.4116117850953207,
+      "sigverify": {
+        "name": "BenchmarkTransactionVerificationFlow/captured_2622581/workers_4/target_8/catchup-8",
+        "iterations": 96,
+        "ns/op": 42898713.0,
+        "avg_cpu_cores": 3.925,
+        "components/block": 1.0,
+        "cpu-ms/block": 168.4,
+        "feed_lag_p50-ms": 0.00023,
+        "feed_lag_p95-ms": 0.000471,
+        "mean_width": 8.0,
+        "ready_p50-ms": 41.07,
+        "ready_p95-ms": 54.05,
+        "residual_p50-ms": 41.07,
+        "residual_p95-ms": 54.05,
+        "signatures/block": 33760.0,
+        "signatures/s": 786970.0,
+        "submit_p50-ms": 0.003397,
+        "submit_p95-ms": 0.01086,
+        "B/op": 7053910.0,
+        "allocs/op": 67536.0
+      },
+      "sigverify_command": [
+        "taskset",
+        "--cpu-list",
+        "0-7",
+        "/srv/mithril-sigverify-streaming-20260912/bin/turbine-final.test",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkTransactionVerificationFlow$/^captured_2622581$/^workers_4$/^target_8$/^catchup$",
+        "-test.benchtime=96x",
+        "-test.count=1",
+        "-test.timeout=120s"
+      ],
+      "sigverify_log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-2-catchup-workers4-target8/sigverify-load.log"
+    },
+    {
+      "sample": 2,
+      "workers": 4,
+      "target": 4,
+      "mode": "catchup",
+      "baseline": {
+        "wall_seconds": 0.7149186637252569,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 155592,
+          "ns/op": 4248.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-2-catchup-workers4-target4/execution-baseline.log"
+      },
+      "concurrent": {
+        "wall_seconds": 0.6148898312821984,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 134372,
+          "ns/op": 4182.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-2-catchup-workers4-target4/execution-concurrent.log"
+      },
+      "execution_slowdown_ratio": 0.9844632768361582,
+      "sigverify": {
+        "name": "BenchmarkTransactionVerificationFlow/captured_2622581/workers_4/target_4/catchup-8",
+        "iterations": 96,
+        "ns/op": 79047165.0,
+        "avg_cpu_cores": 3.999,
+        "components/block": 1.0,
+        "cpu-ms/block": 316.1,
+        "feed_lag_p50-ms": 0.0002,
+        "feed_lag_p95-ms": 0.000291,
+        "mean_width": 4.0,
+        "ready_p50-ms": 76.57,
+        "ready_p95-ms": 94.24,
+        "residual_p50-ms": 76.57,
+        "residual_p95-ms": 94.24,
+        "signatures/block": 33760.0,
+        "signatures/s": 427087.0,
+        "submit_p50-ms": 0.003747,
+        "submit_p95-ms": 0.01152,
+        "B/op": 7056514.0,
+        "allocs/op": 67537.0
+      },
+      "sigverify_command": [
+        "taskset",
+        "--cpu-list",
+        "0-7",
+        "/srv/mithril-sigverify-streaming-20260912/bin/turbine-final.test",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkTransactionVerificationFlow$/^captured_2622581$/^workers_4$/^target_4$/^catchup$",
+        "-test.benchtime=96x",
+        "-test.count=1",
+        "-test.timeout=120s"
+      ],
+      "sigverify_log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-2-catchup-workers4-target4/sigverify-load.log"
+    },
+    {
+      "sample": 2,
+      "workers": 2,
+      "target": 4,
+      "mode": "catchup",
+      "baseline": {
+        "wall_seconds": 0.6647634031251073,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 170058,
+          "ns/op": 3624.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-2-catchup-workers2-target4/execution-baseline.log"
+      },
+      "concurrent": {
+        "wall_seconds": 0.7149660927243531,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 160458,
+          "ns/op": 4021.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-2-catchup-workers2-target4/execution-concurrent.log"
+      },
+      "execution_slowdown_ratio": 1.1095474613686533,
+      "sigverify": {
+        "name": "BenchmarkTransactionVerificationFlow/captured_2622581/workers_2/target_4/catchup-8",
+        "iterations": 96,
+        "ns/op": 151919970.0,
+        "avg_cpu_cores": 2.051,
+        "components/block": 1.0,
+        "cpu-ms/block": 311.5,
+        "feed_lag_p50-ms": 0.00022,
+        "feed_lag_p95-ms": 0.000461,
+        "mean_width": 4.0,
+        "ready_p50-ms": 147.5,
+        "ready_p95-ms": 175.5,
+        "residual_p50-ms": 147.5,
+        "residual_p95-ms": 175.5,
+        "signatures/block": 33760.0,
+        "signatures/s": 222222.0,
+        "submit_p50-ms": 0.003677,
+        "submit_p95-ms": 0.007574,
+        "B/op": 7061922.0,
+        "allocs/op": 67537.0
+      },
+      "sigverify_command": [
+        "taskset",
+        "--cpu-list",
+        "0-7",
+        "/srv/mithril-sigverify-streaming-20260912/bin/turbine-final.test",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkTransactionVerificationFlow$/^captured_2622581$/^workers_2$/^target_4$/^catchup$",
+        "-test.benchtime=96x",
+        "-test.count=1",
+        "-test.timeout=120s"
+      ],
+      "sigverify_log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-2-catchup-workers2-target4/sigverify-load.log"
+    },
+    {
+      "sample": 2,
+      "workers": 2,
+      "target": 4,
+      "mode": "tip_200ms_overlap",
+      "baseline": {
+        "wall_seconds": 0.6146299438551068,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 166706,
+          "ns/op": 3502.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-2-tip_200ms_overlap-workers2-target4/execution-baseline.log"
+      },
+      "concurrent": {
+        "wall_seconds": 0.5672630779445171,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 107145,
+          "ns/op": 4799.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-2-tip_200ms_overlap-workers2-target4/execution-concurrent.log"
+      },
+      "execution_slowdown_ratio": 1.3703597944031982,
+      "sigverify": {
+        "name": "BenchmarkTransactionVerificationFlow/captured_2622581/workers_2/target_4/tip_200ms_overlap-8",
+        "iterations": 20,
+        "ns/op": 201262863.0,
+        "avg_cpu_cores": 1.606,
+        "components/block": 126.0,
+        "cpu-ms/block": 323.2,
+        "feed_lag_p50-ms": 0.03106,
+        "feed_lag_p95-ms": 0.8493,
+        "mean_width": 3.956,
+        "ready_p50-ms": 1.723,
+        "ready_p95-ms": 2.871,
+        "residual_p50-ms": 1.114,
+        "residual_p95-ms": 1.802,
+        "signatures/block": 33760.0,
+        "signatures/s": 167741.0,
+        "submit_p50-ms": 0.001453,
+        "submit_p95-ms": 0.004058,
+        "B/op": 7212730.0,
+        "allocs/op": 68935.0
+      },
+      "sigverify_command": [
+        "taskset",
+        "--cpu-list",
+        "0-7",
+        "/srv/mithril-sigverify-streaming-20260912/bin/turbine-final.test",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkTransactionVerificationFlow$/^captured_2622581$/^workers_2$/^target_4$/^tip_200ms_overlap$",
+        "-test.benchtime=20x",
+        "-test.count=1",
+        "-test.timeout=120s"
+      ],
+      "sigverify_log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-2-tip_200ms_overlap-workers2-target4/sigverify-load.log"
+    },
+    {
+      "sample": 2,
+      "workers": 2,
+      "target": 8,
+      "mode": "tip_200ms_overlap",
+      "baseline": {
+        "wall_seconds": 0.7147977370768785,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 174418,
+          "ns/op": 3727.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-2-tip_200ms_overlap-workers2-target8/execution-baseline.log"
+      },
+      "concurrent": {
+        "wall_seconds": 0.6647711875848472,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 167622,
+          "ns/op": 3536.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-2-tip_200ms_overlap-workers2-target8/execution-concurrent.log"
+      },
+      "execution_slowdown_ratio": 0.948752347732761,
+      "sigverify": {
+        "name": "BenchmarkTransactionVerificationFlow/captured_2622581/workers_2/target_8/tip_200ms_overlap-8",
+        "iterations": 20,
+        "ns/op": 200967117.0,
+        "avg_cpu_cores": 0.8453,
+        "components/block": 126.0,
+        "cpu-ms/block": 169.9,
+        "feed_lag_p50-ms": 0.4835,
+        "feed_lag_p95-ms": 0.9802,
+        "mean_width": 7.912,
+        "ready_p50-ms": 1.166,
+        "ready_p95-ms": 1.747,
+        "residual_p50-ms": 0.9879,
+        "residual_p95-ms": 1.377,
+        "signatures/block": 33760.0,
+        "signatures/s": 167988.0,
+        "submit_p50-ms": 0.001313,
+        "submit_p95-ms": 0.003486,
+        "B/op": 7222552.0,
+        "allocs/op": 68937.0
+      },
+      "sigverify_command": [
+        "taskset",
+        "--cpu-list",
+        "0-7",
+        "/srv/mithril-sigverify-streaming-20260912/bin/turbine-final.test",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkTransactionVerificationFlow$/^captured_2622581$/^workers_2$/^target_8$/^tip_200ms_overlap$",
+        "-test.benchtime=20x",
+        "-test.count=1",
+        "-test.timeout=120s"
+      ],
+      "sigverify_log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-2-tip_200ms_overlap-workers2-target8/sigverify-load.log"
+    },
+    {
+      "sample": 2,
+      "workers": 4,
+      "target": 4,
+      "mode": "tip_200ms_overlap",
+      "baseline": {
+        "wall_seconds": 0.6646457533352077,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 174780,
+          "ns/op": 3601.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-2-tip_200ms_overlap-workers4-target4/execution-baseline.log"
+      },
+      "concurrent": {
+        "wall_seconds": 0.6648325030691922,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 162474,
+          "ns/op": 3740.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-2-tip_200ms_overlap-workers4-target4/execution-concurrent.log"
+      },
+      "execution_slowdown_ratio": 1.0386003887808941,
+      "sigverify": {
+        "name": "BenchmarkTransactionVerificationFlow/captured_2622581/workers_4/target_4/tip_200ms_overlap-8",
+        "iterations": 20,
+        "ns/op": 200928113.0,
+        "avg_cpu_cores": 1.526,
+        "components/block": 126.0,
+        "cpu-ms/block": 306.7,
+        "feed_lag_p50-ms": 0.476,
+        "feed_lag_p95-ms": 0.9896,
+        "mean_width": 3.956,
+        "ready_p50-ms": 1.136,
+        "ready_p95-ms": 1.672,
+        "residual_p50-ms": 1.002,
+        "residual_p95-ms": 1.263,
+        "signatures/block": 33760.0,
+        "signatures/s": 168020.0,
+        "submit_p50-ms": 0.001252,
+        "submit_p95-ms": 0.003527,
+        "B/op": 7256845.0,
+        "allocs/op": 68947.0
+      },
+      "sigverify_command": [
+        "taskset",
+        "--cpu-list",
+        "0-7",
+        "/srv/mithril-sigverify-streaming-20260912/bin/turbine-final.test",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkTransactionVerificationFlow$/^captured_2622581$/^workers_4$/^target_4$/^tip_200ms_overlap$",
+        "-test.benchtime=20x",
+        "-test.count=1",
+        "-test.timeout=120s"
+      ],
+      "sigverify_log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-2-tip_200ms_overlap-workers4-target4/sigverify-load.log"
+    },
+    {
+      "sample": 2,
+      "workers": 4,
+      "target": 8,
+      "mode": "tip_200ms_overlap",
+      "baseline": {
+        "wall_seconds": 0.6147988210432231,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 137796,
+          "ns/op": 3945.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-2-tip_200ms_overlap-workers4-target8/execution-baseline.log"
+      },
+      "concurrent": {
+        "wall_seconds": 0.6647517010569572,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 171933,
+          "ns/op": 3546.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-2-tip_200ms_overlap-workers4-target8/execution-concurrent.log"
+      },
+      "execution_slowdown_ratio": 0.8988593155893536,
+      "sigverify": {
+        "name": "BenchmarkTransactionVerificationFlow/captured_2622581/workers_4/target_8/tip_200ms_overlap-8",
+        "iterations": 20,
+        "ns/op": 200756778.0,
+        "avg_cpu_cores": 0.8979,
+        "components/block": 126.0,
+        "cpu-ms/block": 180.3,
+        "feed_lag_p50-ms": 0.5109,
+        "feed_lag_p95-ms": 0.9931,
+        "mean_width": 7.912,
+        "ready_p50-ms": 0.9308,
+        "ready_p95-ms": 1.413,
+        "residual_p50-ms": 0.7481,
+        "residual_p95-ms": 1.147,
+        "signatures/block": 33760.0,
+        "signatures/s": 168164.0,
+        "submit_p50-ms": 0.001683,
+        "submit_p95-ms": 0.004809,
+        "B/op": 7287646.0,
+        "allocs/op": 68938.0
+      },
+      "sigverify_command": [
+        "taskset",
+        "--cpu-list",
+        "0-7",
+        "/srv/mithril-sigverify-streaming-20260912/bin/turbine-final.test",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkTransactionVerificationFlow$/^captured_2622581$/^workers_4$/^target_8$/^tip_200ms_overlap$",
+        "-test.benchtime=20x",
+        "-test.count=1",
+        "-test.timeout=120s"
+      ],
+      "sigverify_log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-2-tip_200ms_overlap-workers4-target8/sigverify-load.log"
+    },
+    {
+      "sample": 3,
+      "workers": 2,
+      "target": 8,
+      "mode": "catchup",
+      "baseline": {
+        "wall_seconds": 0.6647746949456632,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 164358,
+          "ns/op": 3884.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-3-catchup-workers2-target8/execution-baseline.log"
+      },
+      "concurrent": {
+        "wall_seconds": 0.6149854301474988,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 126450,
+          "ns/op": 4148.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-3-catchup-workers2-target8/execution-concurrent.log"
+      },
+      "execution_slowdown_ratio": 1.0679711637487126,
+      "sigverify": {
+        "name": "BenchmarkTransactionVerificationFlow/captured_2622581/workers_2/target_8/catchup-8",
+        "iterations": 96,
+        "ns/op": 78410504.0,
+        "avg_cpu_cores": 2.05,
+        "components/block": 1.0,
+        "cpu-ms/block": 160.8,
+        "feed_lag_p50-ms": 0.00023,
+        "feed_lag_p95-ms": 0.000481,
+        "mean_width": 8.0,
+        "ready_p50-ms": 75.31,
+        "ready_p95-ms": 90.25,
+        "residual_p50-ms": 75.31,
+        "residual_p95-ms": 90.25,
+        "signatures/block": 33760.0,
+        "signatures/s": 430555.0,
+        "submit_p50-ms": 0.003577,
+        "submit_p95-ms": 0.007614,
+        "B/op": 7057749.0,
+        "allocs/op": 67536.0
+      },
+      "sigverify_command": [
+        "taskset",
+        "--cpu-list",
+        "0-7",
+        "/srv/mithril-sigverify-streaming-20260912/bin/turbine-final.test",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkTransactionVerificationFlow$/^captured_2622581$/^workers_2$/^target_8$/^catchup$",
+        "-test.benchtime=96x",
+        "-test.count=1",
+        "-test.timeout=120s"
+      ],
+      "sigverify_log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-3-catchup-workers2-target8/sigverify-load.log"
+    },
+    {
+      "sample": 3,
+      "workers": 4,
+      "target": 4,
+      "mode": "tip_200ms_overlap",
+      "baseline": {
+        "wall_seconds": 0.6145468889735639,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 167756,
+          "ns/op": 3486.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-3-tip_200ms_overlap-workers4-target4/execution-baseline.log"
+      },
+      "concurrent": {
+        "wall_seconds": 0.665121624711901,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 141630,
+          "ns/op": 4231.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-3-tip_200ms_overlap-workers4-target4/execution-concurrent.log"
+      },
+      "execution_slowdown_ratio": 1.2137119908204246,
+      "sigverify": {
+        "name": "BenchmarkTransactionVerificationFlow/captured_2622581/workers_4/target_4/tip_200ms_overlap-8",
+        "iterations": 20,
+        "ns/op": 200751013.0,
+        "avg_cpu_cores": 1.678,
+        "components/block": 126.0,
+        "cpu-ms/block": 336.9,
+        "feed_lag_p50-ms": 0.4283,
+        "feed_lag_p95-ms": 0.9902,
+        "mean_width": 3.956,
+        "ready_p50-ms": 1.217,
+        "ready_p95-ms": 2.032,
+        "residual_p50-ms": 0.5827,
+        "residual_p95-ms": 1.286,
+        "signatures/block": 33760.0,
+        "signatures/s": 168169.0,
+        "submit_p50-ms": 0.001764,
+        "submit_p95-ms": 0.004468,
+        "B/op": 7235916.0,
+        "allocs/op": 68943.0
+      },
+      "sigverify_command": [
+        "taskset",
+        "--cpu-list",
+        "0-7",
+        "/srv/mithril-sigverify-streaming-20260912/bin/turbine-final.test",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkTransactionVerificationFlow$/^captured_2622581$/^workers_4$/^target_4$/^tip_200ms_overlap$",
+        "-test.benchtime=20x",
+        "-test.count=1",
+        "-test.timeout=120s"
+      ],
+      "sigverify_log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-3-tip_200ms_overlap-workers4-target4/sigverify-load.log"
+    },
+    {
+      "sample": 3,
+      "workers": 2,
+      "target": 4,
+      "mode": "tip_200ms_overlap",
+      "baseline": {
+        "wall_seconds": 0.5645706839859486,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 140451,
+          "ns/op": 3666.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-3-tip_200ms_overlap-workers2-target4/execution-baseline.log"
+      },
+      "concurrent": {
+        "wall_seconds": 0.6147960559464991,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 155277,
+          "ns/op": 3597.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-3-tip_200ms_overlap-workers2-target4/execution-concurrent.log"
+      },
+      "execution_slowdown_ratio": 0.9811783960720131,
+      "sigverify": {
+        "name": "BenchmarkTransactionVerificationFlow/captured_2622581/workers_2/target_4/tip_200ms_overlap-8",
+        "iterations": 20,
+        "ns/op": 201192091.0,
+        "avg_cpu_cores": 1.506,
+        "components/block": 126.0,
+        "cpu-ms/block": 303.0,
+        "feed_lag_p50-ms": 0.0687,
+        "feed_lag_p95-ms": 0.8534,
+        "mean_width": 3.956,
+        "ready_p50-ms": 1.591,
+        "ready_p95-ms": 2.54,
+        "residual_p50-ms": 1.178,
+        "residual_p95-ms": 1.465,
+        "signatures/block": 33760.0,
+        "signatures/s": 167800.0,
+        "submit_p50-ms": 0.001112,
+        "submit_p95-ms": 0.002705,
+        "B/op": 7200373.0,
+        "allocs/op": 68940.0
+      },
+      "sigverify_command": [
+        "taskset",
+        "--cpu-list",
+        "0-7",
+        "/srv/mithril-sigverify-streaming-20260912/bin/turbine-final.test",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkTransactionVerificationFlow$/^captured_2622581$/^workers_2$/^target_4$/^tip_200ms_overlap$",
+        "-test.benchtime=20x",
+        "-test.count=1",
+        "-test.timeout=120s"
+      ],
+      "sigverify_log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-3-tip_200ms_overlap-workers2-target4/sigverify-load.log"
+    },
+    {
+      "sample": 3,
+      "workers": 4,
+      "target": 8,
+      "mode": "tip_200ms_overlap",
+      "baseline": {
+        "wall_seconds": 0.6645939256995916,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 170604,
+          "ns/op": 3472.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-3-tip_200ms_overlap-workers4-target8/execution-baseline.log"
+      },
+      "concurrent": {
+        "wall_seconds": 0.7150162868201733,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 159267,
+          "ns/op": 4093.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-3-tip_200ms_overlap-workers4-target8/execution-concurrent.log"
+      },
+      "execution_slowdown_ratio": 1.1788594470046083,
+      "sigverify": {
+        "name": "BenchmarkTransactionVerificationFlow/captured_2622581/workers_4/target_8/tip_200ms_overlap-8",
+        "iterations": 20,
+        "ns/op": 200971694.0,
+        "avg_cpu_cores": 0.8761,
+        "components/block": 126.0,
+        "cpu-ms/block": 176.1,
+        "feed_lag_p50-ms": 0.5208,
+        "feed_lag_p95-ms": 1.015,
+        "mean_width": 7.912,
+        "ready_p50-ms": 0.9286,
+        "ready_p95-ms": 1.43,
+        "residual_p50-ms": 1.097,
+        "residual_p95-ms": 1.294,
+        "signatures/block": 33760.0,
+        "signatures/s": 167984.0,
+        "submit_p50-ms": 0.001553,
+        "submit_p95-ms": 0.004518,
+        "B/op": 7272930.0,
+        "allocs/op": 68937.0
+      },
+      "sigverify_command": [
+        "taskset",
+        "--cpu-list",
+        "0-7",
+        "/srv/mithril-sigverify-streaming-20260912/bin/turbine-final.test",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkTransactionVerificationFlow$/^captured_2622581$/^workers_4$/^target_8$/^tip_200ms_overlap$",
+        "-test.benchtime=20x",
+        "-test.count=1",
+        "-test.timeout=120s"
+      ],
+      "sigverify_log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-3-tip_200ms_overlap-workers4-target8/sigverify-load.log"
+    },
+    {
+      "sample": 3,
+      "workers": 2,
+      "target": 4,
+      "mode": "catchup",
+      "baseline": {
+        "wall_seconds": 0.6646965383552015,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 166202,
+          "ns/op": 3817.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-3-catchup-workers2-target4/execution-baseline.log"
+      },
+      "concurrent": {
+        "wall_seconds": 0.6147506199777126,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 160532,
+          "ns/op": 3624.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-3-catchup-workers2-target4/execution-concurrent.log"
+      },
+      "execution_slowdown_ratio": 0.9494367304165575,
+      "sigverify": {
+        "name": "BenchmarkTransactionVerificationFlow/captured_2622581/workers_2/target_4/catchup-8",
+        "iterations": 96,
+        "ns/op": 147847296.0,
+        "avg_cpu_cores": 2.051,
+        "components/block": 1.0,
+        "cpu-ms/block": 303.2,
+        "feed_lag_p50-ms": 0.00023,
+        "feed_lag_p95-ms": 0.000491,
+        "mean_width": 4.0,
+        "ready_p50-ms": 145.3,
+        "ready_p95-ms": 159.8,
+        "residual_p50-ms": 145.3,
+        "residual_p95-ms": 159.8,
+        "signatures/block": 33760.0,
+        "signatures/s": 228344.0,
+        "submit_p50-ms": 0.003817,
+        "submit_p95-ms": 0.007323,
+        "B/op": 7057630.0,
+        "allocs/op": 67536.0
+      },
+      "sigverify_command": [
+        "taskset",
+        "--cpu-list",
+        "0-7",
+        "/srv/mithril-sigverify-streaming-20260912/bin/turbine-final.test",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkTransactionVerificationFlow$/^captured_2622581$/^workers_2$/^target_4$/^catchup$",
+        "-test.benchtime=96x",
+        "-test.count=1",
+        "-test.timeout=120s"
+      ],
+      "sigverify_log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-3-catchup-workers2-target4/sigverify-load.log"
+    },
+    {
+      "sample": 3,
+      "workers": 4,
+      "target": 4,
+      "mode": "catchup",
+      "baseline": {
+        "wall_seconds": 0.664639541413635,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 169953,
+          "ns/op": 3669.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-3-catchup-workers4-target4/execution-baseline.log"
+      },
+      "concurrent": {
+        "wall_seconds": 0.6653050077147782,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 145288,
+          "ns/op": 4207.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-3-catchup-workers4-target4/execution-concurrent.log"
+      },
+      "execution_slowdown_ratio": 1.146633960207141,
+      "sigverify": {
+        "name": "BenchmarkTransactionVerificationFlow/captured_2622581/workers_4/target_4/catchup-8",
+        "iterations": 96,
+        "ns/op": 80096206.0,
+        "avg_cpu_cores": 3.978,
+        "components/block": 1.0,
+        "cpu-ms/block": 318.6,
+        "feed_lag_p50-ms": 0.00023,
+        "feed_lag_p95-ms": 0.000691,
+        "mean_width": 4.0,
+        "ready_p50-ms": 77.65,
+        "ready_p95-ms": 92.49,
+        "residual_p50-ms": 77.65,
+        "residual_p95-ms": 92.49,
+        "signatures/block": 33760.0,
+        "signatures/s": 421493.0,
+        "submit_p50-ms": 0.004018,
+        "submit_p95-ms": 0.01255,
+        "B/op": 7057922.0,
+        "allocs/op": 67536.0
+      },
+      "sigverify_command": [
+        "taskset",
+        "--cpu-list",
+        "0-7",
+        "/srv/mithril-sigverify-streaming-20260912/bin/turbine-final.test",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkTransactionVerificationFlow$/^captured_2622581$/^workers_4$/^target_4$/^catchup$",
+        "-test.benchtime=96x",
+        "-test.count=1",
+        "-test.timeout=120s"
+      ],
+      "sigverify_log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-3-catchup-workers4-target4/sigverify-load.log"
+    },
+    {
+      "sample": 3,
+      "workers": 2,
+      "target": 8,
+      "mode": "tip_200ms_overlap",
+      "baseline": {
+        "wall_seconds": 0.614480503834784,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 168775,
+          "ns/op": 3465.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-3-tip_200ms_overlap-workers2-target8/execution-baseline.log"
+      },
+      "concurrent": {
+        "wall_seconds": 0.6648324020206928,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 167258,
+          "ns/op": 3583.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-3-tip_200ms_overlap-workers2-target8/execution-concurrent.log"
+      },
+      "execution_slowdown_ratio": 1.0340548340548341,
+      "sigverify": {
+        "name": "BenchmarkTransactionVerificationFlow/captured_2622581/workers_2/target_8/tip_200ms_overlap-8",
+        "iterations": 20,
+        "ns/op": 200968000.0,
+        "avg_cpu_cores": 0.842,
+        "components/block": 126.0,
+        "cpu-ms/block": 169.2,
+        "feed_lag_p50-ms": 0.4334,
+        "feed_lag_p95-ms": 0.9712,
+        "mean_width": 7.912,
+        "ready_p50-ms": 1.178,
+        "ready_p95-ms": 1.715,
+        "residual_p50-ms": 1.039,
+        "residual_p95-ms": 1.357,
+        "signatures/block": 33760.0,
+        "signatures/s": 167987.0,
+        "submit_p50-ms": 0.001403,
+        "submit_p95-ms": 0.004248,
+        "B/op": 7250793.0,
+        "allocs/op": 68941.0
+      },
+      "sigverify_command": [
+        "taskset",
+        "--cpu-list",
+        "0-7",
+        "/srv/mithril-sigverify-streaming-20260912/bin/turbine-final.test",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkTransactionVerificationFlow$/^captured_2622581$/^workers_2$/^target_8$/^tip_200ms_overlap$",
+        "-test.benchtime=20x",
+        "-test.count=1",
+        "-test.timeout=120s"
+      ],
+      "sigverify_log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-3-tip_200ms_overlap-workers2-target8/sigverify-load.log"
+    },
+    {
+      "sample": 3,
+      "workers": 4,
+      "target": 8,
+      "mode": "catchup",
+      "baseline": {
+        "wall_seconds": 0.6646514940075576,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 167019,
+          "ns/op": 3809.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-3-catchup-workers4-target8/execution-baseline.log"
+      },
+      "concurrent": {
+        "wall_seconds": 0.7654618811793625,
+        "benchmark": {
+          "name": "BenchmarkLoadAndExecuteTransferResultMode/lean-8",
+          "iterations": 148914,
+          "ns/op": 4629.0,
+          "B/op": 4146.0,
+          "allocs/op": 59.0
+        },
+        "log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-3-catchup-workers4-target8/execution-concurrent.log"
+      },
+      "execution_slowdown_ratio": 1.2152796009451299,
+      "sigverify": {
+        "name": "BenchmarkTransactionVerificationFlow/captured_2622581/workers_4/target_8/catchup-8",
+        "iterations": 96,
+        "ns/op": 44540126.0,
+        "avg_cpu_cores": 3.899,
+        "components/block": 1.0,
+        "cpu-ms/block": 173.7,
+        "feed_lag_p50-ms": 0.00024,
+        "feed_lag_p95-ms": 0.00033,
+        "mean_width": 8.0,
+        "ready_p50-ms": 42.49,
+        "ready_p95-ms": 55.03,
+        "residual_p50-ms": 42.49,
+        "residual_p95-ms": 55.03,
+        "signatures/block": 33760.0,
+        "signatures/s": 757968.0,
+        "submit_p50-ms": 0.003727,
+        "submit_p95-ms": 0.01137,
+        "B/op": 7053895.0,
+        "allocs/op": 67536.0
+      },
+      "sigverify_command": [
+        "taskset",
+        "--cpu-list",
+        "0-7",
+        "/srv/mithril-sigverify-streaming-20260912/bin/turbine-final.test",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkTransactionVerificationFlow$/^captured_2622581$/^workers_4$/^target_8$/^catchup$",
+        "-test.benchtime=96x",
+        "-test.count=1",
+        "-test.timeout=120s"
+      ],
+      "sigverify_log": "/srv/mithril-sigverify-streaming-20260912/results/execution-contention/sample-3-catchup-workers4-target8/sigverify-load.log"
+    }
+  ],
+  "summary": [
+    {
+      "workers": 2,
+      "target": 4,
+      "mode": "catchup",
+      "samples": 3,
+      "median_execution_slowdown_ratio": 1.0192115768463075,
+      "median_execution_baseline_ns": 3817.0,
+      "median_execution_concurrent_ns": 4021.0,
+      "median_sigverify_residual_p95_ms": 174.2,
+      "median_sigverify_cpu_ms_per_block": 311.5
+    },
+    {
+      "workers": 2,
+      "target": 4,
+      "mode": "tip_200ms_overlap",
+      "samples": 3,
+      "median_execution_slowdown_ratio": 1.069901790872328,
+      "median_execution_baseline_ns": 3502.0,
+      "median_execution_concurrent_ns": 3704.0,
+      "median_sigverify_residual_p95_ms": 1.497,
+      "median_sigverify_cpu_ms_per_block": 314.3
+    },
+    {
+      "workers": 2,
+      "target": 8,
+      "mode": "catchup",
+      "samples": 3,
+      "median_execution_slowdown_ratio": 1.2183874709976799,
+      "median_execution_baseline_ns": 3542.0,
+      "median_execution_concurrent_ns": 4201.0,
+      "median_sigverify_residual_p95_ms": 90.25,
+      "median_sigverify_cpu_ms_per_block": 160.8
+    },
+    {
+      "workers": 2,
+      "target": 8,
+      "mode": "tip_200ms_overlap",
+      "samples": 3,
+      "median_execution_slowdown_ratio": 1.0169979832901181,
+      "median_execution_baseline_ns": 3471.0,
+      "median_execution_concurrent_ns": 3536.0,
+      "median_sigverify_residual_p95_ms": 1.357,
+      "median_sigverify_cpu_ms_per_block": 169.9
+    },
+    {
+      "workers": 4,
+      "target": 4,
+      "mode": "catchup",
+      "samples": 3,
+      "median_execution_slowdown_ratio": 1.0121273370389086,
+      "median_execution_baseline_ns": 3958.0,
+      "median_execution_concurrent_ns": 4182.0,
+      "median_sigverify_residual_p95_ms": 94.24,
+      "median_sigverify_cpu_ms_per_block": 316.1
+    },
+    {
+      "workers": 4,
+      "target": 4,
+      "mode": "tip_200ms_overlap",
+      "samples": 3,
+      "median_execution_slowdown_ratio": 1.2137119908204246,
+      "median_execution_baseline_ns": 3489.0,
+      "median_execution_concurrent_ns": 4231.0,
+      "median_sigverify_residual_p95_ms": 1.263,
+      "median_sigverify_cpu_ms_per_block": 332.0
+    },
+    {
+      "workers": 4,
+      "target": 8,
+      "mode": "catchup",
+      "samples": 3,
+      "median_execution_slowdown_ratio": 1.2152796009451299,
+      "median_execution_baseline_ns": 3547.0,
+      "median_execution_concurrent_ns": 4629.0,
+      "median_sigverify_residual_p95_ms": 54.05,
+      "median_sigverify_cpu_ms_per_block": 168.4
+    },
+    {
+      "workers": 4,
+      "target": 8,
+      "mode": "tip_200ms_overlap",
+      "samples": 3,
+      "median_execution_slowdown_ratio": 0.9911012235817576,
+      "median_execution_baseline_ns": 3596.0,
+      "median_execution_concurrent_ns": 3564.0,
+      "median_sigverify_residual_p95_ms": 1.256,
+      "median_sigverify_cpu_ms_per_block": 176.1
+    }
+  ]
+}
