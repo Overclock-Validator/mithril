@@ -20,6 +20,7 @@ package sigverify
 
 import (
 	"fmt"
+	"runtime"
 	"sync"
 
 	narya "github.com/Overclock-Validator/narya-ed25519/ed25519"
@@ -40,15 +41,60 @@ const (
 	BackendStdlib = "stdlib"
 )
 
-// Config selects the verification backend. It is deliberately tiny: the
-// library's own defaults are good, and every knob here is a consensus-visible
-// or performance-visible choice that an operator should have to state.
+// Config selects the backend and the Turbine transaction-verification policy.
+// Worker and batching settings do not change the TPU or fallback replay pools.
 type Config struct {
-	Backend string
+	Backend             string
+	Workers             int
+	BatchTarget         int
+	DisableShredOverlap bool
 }
 
 // Defaults returns the configuration used when the operator sets nothing.
-func Defaults() Config { return Config{Backend: BackendAuto} }
+func Defaults() Config { return Config{Backend: BackendAuto, BatchTarget: BatchTarget} }
+
+// ResolveConfig validates every setting before the one-shot backend selection.
+// Zero workers selects at most two transaction-verification workers; zero batch
+// target uses eight signatures. Available short batches are never held to fill.
+func ResolveConfig(cfg Config) (Config, error) {
+	if cfg.Backend == "" {
+		cfg.Backend = BackendAuto
+	}
+	switch cfg.Backend {
+	case BackendAuto, BackendR51, BackendGeneric, BackendStdlib:
+	default:
+		return Config{}, fmt.Errorf("sigverify.backend must be one of %q, %q, %q, %q; got %q", BackendAuto, BackendR51, BackendGeneric, BackendStdlib, cfg.Backend)
+	}
+	if cfg.Workers < 0 {
+		return Config{}, fmt.Errorf("sigverify.workers must be >= 0; got %d", cfg.Workers)
+	}
+	if cfg.Workers == 0 {
+		cfg.Workers = min(2, max(1, runtime.GOMAXPROCS(0)))
+	}
+	if cfg.BatchTarget == 0 {
+		cfg.BatchTarget = BatchTarget
+	}
+	if cfg.BatchTarget != 4 && cfg.BatchTarget != 8 {
+		return Config{}, fmt.Errorf("sigverify.batch_target must be 4 or 8 (0 uses 8); got %d", cfg.BatchTarget)
+	}
+	return cfg, nil
+}
+
+// TransactionWorkers also supports callers that do not run node Configure.
+func TransactionWorkers() int {
+	if Cfg.Workers > 0 {
+		return Cfg.Workers
+	}
+	return min(2, max(1, runtime.GOMAXPROCS(0)))
+}
+
+// TransactionBatchTarget also supports the zero configuration outside startup.
+func TransactionBatchTarget() int {
+	if Cfg.BatchTarget == 4 {
+		return 4
+	}
+	return BatchTarget
+}
 
 // Cfg is the live configuration, set once by Configure during startup and
 // read-only afterwards. It follows the same shape as replay.TrailingVerifierCfg.
@@ -64,10 +110,6 @@ var Cfg = Defaults()
 // underlying library pins its backend on first use and a late switch would
 // leave the process in a state neither caller asked for.
 func Configure(cfg Config) (string, error) {
-	if cfg.Backend == "" {
-		cfg.Backend = Defaults().Backend
-	}
-
 	configureMu.Lock()
 	defer configureMu.Unlock()
 
@@ -79,12 +121,10 @@ func Configure(cfg Config) (string, error) {
 
 	// Validate before publishing anything. Assigning Cfg first would leave a
 	// rejected backend name visible to Backend() and to the startup log.
-	switch cfg.Backend {
-	case BackendAuto, BackendR51, BackendGeneric, BackendStdlib:
-	default:
-		return "", fmt.Errorf(
-			"sigverify.backend must be one of %q, %q, %q, %q; got %q",
-			BackendAuto, BackendR51, BackendGeneric, BackendStdlib, cfg.Backend)
+	var err error
+	cfg, err = ResolveConfig(cfg)
+	if err != nil {
+		return "", err
 	}
 
 	resolved, err := installBackend(cfg.Backend)

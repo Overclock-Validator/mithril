@@ -2795,6 +2795,11 @@ func ReplayBlocks(
 			record.TransactionParse.AddTiming(ingressTimings.TransactionParse)
 			record.TransactionSigverify.AddTiming(ingressTimings.TransactionSigverify)
 			record.ReplayAdmission.AddTiming(ingressTimings.ReplayAdmission)
+			record.EarlyTransactionParse.AddTiming(ingressTimings.EarlyTransactionParse)
+			record.EarlyTransactionSigverify.AddTiming(ingressTimings.EarlyTransactionSigverify)
+			record.EarlyPreparationWait.AddTiming(ingressTimings.EarlyPreparationWait)
+			record.EarlyVerifiedTransactions = ingressTimings.EarlyVerifiedTransactions
+			record.FullToReady.AddTiming(ingressTimings.FullToReady)
 		}
 		start := time.Now()
 
