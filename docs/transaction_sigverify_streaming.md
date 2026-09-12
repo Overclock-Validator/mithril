@@ -94,3 +94,6 @@ alongside signature work on the same eight physical cores. Its separate
 processes measure hardware/OS contention, excluding shared Go scheduler/heap
 effects, full-block dependency planning, commit and live network timing. Pool
 throughput alone is insufficient evidence of end-to-end replay improvement.
+
+Measured Zen 5 results, raw logs, and validation details are in the
+[September 12 benchmark report](results/sigverify-streaming/2026-09-12-zen5/README.md).
