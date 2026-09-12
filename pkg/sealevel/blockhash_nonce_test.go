@@ -94,3 +94,30 @@ func TestIsTransactionAgeValid_NonceMissing_NilAccountsDb_ReturnsFalse(t *testin
 		assert.False(t, IsTransactionAgeValid(tx, instrs, slotCtx))
 	})
 }
+
+func TestTransactionAgeUsesBankRecentBlockhashQueue(t *testing.T) {
+	previous := SysvarCache.RecentBlockHashes
+	t.Cleanup(func() { SysvarCache.RecentBlockHashes = previous })
+	globalHash := [32]byte{0xA1}
+	globalRecent := SysvarRecentBlockhashes{{Blockhash: globalHash}}
+	SysvarCache.RecentBlockHashes.Sysvar = &globalRecent
+
+	bankHash := [32]byte{0xB2}
+	bankRecent := SysvarRecentBlockhashes{{Blockhash: bankHash}}
+	bankSnapshot, err := NewBankSysvars(42, &accounts.Account{
+		Key: SysvarRecentBlockHashesAddr, Lamports: 1, Data: bankRecent.MustMarshal(),
+	})
+	require.NoError(t, err)
+	slotCtx := &SlotCtx{Slot: 42, LatestEvictedBlockhash: [32]byte{0xC3}}
+	require.NoError(t, slotCtx.PublishBankSysvars(bankSnapshot))
+
+	require.True(t, IsTransactionAgeValid(&solana.Transaction{
+		Message: solana.Message{RecentBlockhash: bankHash},
+	}, nil, slotCtx))
+	require.False(t, IsTransactionAgeValid(&solana.Transaction{
+		Message: solana.Message{RecentBlockhash: globalHash},
+	}, nil, slotCtx), "a conflicting process-global queue must not leak into this bank")
+	require.True(t, IsTransactionAgeValid(&solana.Transaction{
+		Message: solana.Message{RecentBlockhash: slotCtx.LatestEvictedBlockhash},
+	}, nil, slotCtx), "the bank-pinned 151st hash remains valid")
+}

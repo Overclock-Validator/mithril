@@ -1,6 +1,7 @@
 package replay
 
 import (
+	"errors"
 	"math"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/migration"
 	"github.com/Overclock-Validator/mithril/pkg/rent"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
+	"github.com/Overclock-Validator/mithril/pkg/txverify"
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
 )
@@ -62,6 +64,65 @@ func sanitizeFailureOutput() LoadAndExecuteTransactionOutput {
 	}
 }
 
+func feePayerTransactionError(err error) (TransactionErrorType, *uint8) {
+	errType := TransactionErrorInsufficientFundsForFee
+	var accountIndex *uint8
+	switch {
+	case errors.Is(err, fees.ErrFeePayerNotFound):
+		errType = TransactionErrorAccountNotFound
+	case errors.Is(err, fees.ErrInvalidAccountForFee):
+		errType = TransactionErrorInvalidAccountForFee
+	case errors.Is(err, fees.ErrInsufficientFundsForRent):
+		errType = TransactionErrorInsufficientFundsForRent
+		zero := uint8(0)
+		accountIndex = &zero
+	}
+	return errType, accountIndex
+}
+
+// feeOnlyRollbackAccountsDataSize reproduces the pre-amendment SIMD-0186
+// accounting for a fees-only transaction: the raw data lengths of the
+// rollback fee payer and, for a distinct durable nonce, the nonce account.
+func feeOnlyRollbackAccountsDataSize(slotCtx *sealevel.SlotCtx, tx *solana.Transaction, instrs []sealevel.Instruction) uint32 {
+	if slotCtx == nil || tx == nil || len(tx.Message.AccountKeys) == 0 {
+		return 0
+	}
+
+	load := func(key solana.PublicKey) *accounts.Account {
+		acct, err := slotCtx.GetAccountShared(key)
+		if err == nil {
+			return acct
+		}
+		if slotCtx.UnrootedRead == nil && slotCtx.AccountsDb == nil {
+			return nil
+		}
+		acct, _ = slotCtx.GetAccountFromAccountsDb(key)
+		return acct
+	}
+
+	var total uint64
+	add := func(acct *accounts.Account) {
+		if acct == nil {
+			return
+		}
+		total += uint64(len(acct.Data))
+		if total > math.MaxUint32 {
+			total = math.MaxUint32
+		}
+	}
+
+	payerKey := tx.Message.AccountKeys[0]
+	add(load(payerKey))
+	if sealevel.IsRecentBlockhashTransaction(tx, slotCtx) || len(instrs) == 0 || !sealevel.IsNonceInstr(instrs[0]) {
+		return uint32(total)
+	}
+	nonceKey := instrs[0].Accounts[0].Pubkey
+	if nonceKey != payerKey {
+		add(load(nonceKey))
+	}
+	return uint32(total)
+}
+
 func LoadAndExecuteTransaction(input LoadAndExecuteTransactionInput) LoadAndExecuteTransactionOutput {
 	tx := input.Transaction
 	slotCtx := input.SlotCtx
@@ -70,13 +131,25 @@ func LoadAndExecuteTransaction(input LoadAndExecuteTransactionInput) LoadAndExec
 		input.Arena.Reset()
 	}
 
-	// Agave-style sanitize: reject malformed user txs before they
-	// reach downstream index panics.
-	hdr := tx.Message.Header
-	numKeys := len(tx.Message.AccountKeys)
-	if hdr.NumReadonlySignedAccounts >= hdr.NumRequiredSignatures ||
-		int(hdr.NumRequiredSignatures) > len(tx.Signatures) ||
-		len(tx.Signatures) > numKeys {
+	if tx == nil || slotCtx == nil || slotCtx.Features == nil {
+		return sanitizeFailureOutput()
+	}
+
+	// Match Agave's Bank verification order: once a transaction has decoded as
+	// v1, the feature gate is checked before structural sanitization.
+	if tx.Message.GetVersion() == solana.MessageVersionV1 && !slotCtx.Features.IsActive(features.EnableTxV1) {
+		return LoadAndExecuteTransactionOutput{
+			ProcessingResult: TransactionProcessingResult{
+				TransactionError: &TransactionError{
+					ErrorType:        TransactionErrorUnsupportedVersion,
+					InstructionError: TxErrUnsupportedVersion,
+				},
+			},
+		}
+	}
+	// Reject malformed transactions before account-indexed code can observe
+	// them. The helper also handles Mithril's already-resolved v0 messages.
+	if err := txverify.SanitizeTransaction(tx); err != nil {
 		return sanitizeFailureOutput()
 	}
 	// Mirror block-replay's StaticInstructionLimit cap so pre-activation
@@ -84,16 +157,6 @@ func LoadAndExecuteTransaction(input LoadAndExecuteTransactionInput) LoadAndExec
 	if slotCtx.Features.IsActive(features.StaticInstructionLimit) &&
 		len(tx.Message.Instructions) > maxInstrTraceCapacity {
 		return sanitizeFailureOutput()
-	}
-	for _, ci := range tx.Message.Instructions {
-		if int(ci.ProgramIDIndex) >= numKeys {
-			return sanitizeFailureOutput()
-		}
-		for _, idx := range ci.Accounts {
-			if int(idx) >= numKeys {
-				return sanitizeFailureOutput()
-			}
-		}
 	}
 
 	// Parse instructions and account metas
@@ -113,7 +176,7 @@ func LoadAndExecuteTransaction(input LoadAndExecuteTransactionInput) LoadAndExec
 
 	// Compute budget limits
 	start = time.Now()
-	computeBudgetLimits, err := sealevel.ComputeBudgetExecuteInstructions(instrs, slotCtx.Features)
+	computeBudgetLimits, err := sealevel.ComputeBudgetLimitsForTransaction(tx, instrs, slotCtx.Features)
 	if err != nil {
 		return LoadAndExecuteTransactionOutput{
 			ProcessingResult: TransactionProcessingResult{
@@ -140,28 +203,68 @@ func LoadAndExecuteTransaction(input LoadAndExecuteTransactionInput) LoadAndExec
 		}
 	}
 
+	// Match Agave's loader ordering: validate the fee payer before loading any
+	// other transaction account. This matters for error precedence and is
+	// especially visible for V1, whose omitted loaded-data limit defaults to
+	// zero. Deduction still occurs on the transaction-local clone below so this
+	// function remains side-effect free.
+	validatedFeeInfo, payerErr := fees.ValidateTransactionFeePayer(slotCtx, tx, instrs, computeBudgetLimits)
+	if payerErr != nil {
+		errType, accountIndex := feePayerTransactionError(payerErr)
+		isNoOp := slotCtx.Features.IsActive(features.RelaxFeePayerConstraint) &&
+			sealevel.IsRecentBlockhashTransaction(tx, slotCtx)
+		out := LoadAndExecuteTransactionOutput{
+			ProcessingResult: TransactionProcessingResult{
+				TransactionError: &TransactionError{
+					ErrorType:        errType,
+					InstructionError: payerErr,
+					AccountIndex:     accountIndex,
+				},
+			},
+			Instrs:              instrs,
+			ComputeBudgetLimits: computeBudgetLimits,
+			FeeInfo:             validatedFeeInfo,
+			ProcessedAsNoOp:     isNoOp,
+		}
+		if isNoOp {
+			// SIMD-0290 no-ops pay no fee but reserve their maximum requested
+			// compute and loaded-data budgets, preventing cheap block stuffing.
+			out.FeeInfo = &fees.TxFeeInfo{}
+			out.LoadedAccountsDataSize = computeBudgetLimits.LoadedAccountBytes
+		}
+		return out
+	}
+
 	// Load and validate accounts
 	start = time.Now()
 	instructionsSysvarIdx := instructionsSysvarAccountIndex(tx)
 	var instrsAcct *accounts.Account
 	if instructionsSysvarIdx >= 0 {
-		instrsAcct = sealevel.MakeInstructionsSysvarAccount(instrs)
+		// Keep a nil account on offset overflow. The account loader detects it
+		// when it reaches the sysvar key so its partial loaded-data-size matches
+		// Agave's fee-only accounting order.
+		instrsAcct, _ = sealevel.MakeInstructionsSysvarAccount(instrs)
 	}
 	var transactionAccts *sealevel.TransactionAccounts
+	var loadedAccountsDataSize uint32
 
 	if slotCtx.Features.IsActive(features.FormalizeLoadedTransactionDataSize) {
-		transactionAccts, txAcctMetas, err = loadAndValidateTxAcctsSimd186(slotCtx, txAcctMetas, tx, instrs, instrsAcct, computeBudgetLimits.LoadedAccountBytes)
+		transactionAccts, txAcctMetas, loadedAccountsDataSize, err = loadAndValidateTxAcctsSimd186(slotCtx, txAcctMetas, tx, instrs, instrsAcct, computeBudgetLimits.LoadedAccountBytes)
 	} else {
-		transactionAccts, txAcctMetas, err = loadAndValidateTxAccts(slotCtx, txAcctMetas, tx, instrs, instrsAcct, computeBudgetLimits.LoadedAccountBytes)
+		transactionAccts, txAcctMetas, loadedAccountsDataSize, err = loadAndValidateTxAccts(slotCtx, txAcctMetas, tx, instrs, instrsAcct, computeBudgetLimits.LoadedAccountBytes)
 	}
 
 	// Base output fields for all paths after parsing
 	baseFields := func(out *LoadAndExecuteTransactionOutput) {
 		out.Instrs = instrs
 		out.ComputeBudgetLimits = computeBudgetLimits
+		out.LoadedAccountsDataSize = loadedAccountsDataSize
 	}
 
 	if err == TxErrMaxLoadedAccountsDataSizeExceeded || err == TxErrInvalidProgramForExecution || err == TxErrProgramAccountNotFound {
+		if !slotCtx.Features.IsActive(features.DefineLtdsFeeOnlySemantics) {
+			loadedAccountsDataSize = feeOnlyRollbackAccountsDataSize(slotCtx, tx, instrs)
+		}
 		errType := mapLoadErrorType(err)
 		out := LoadAndExecuteTransactionOutput{
 			ProcessingResult: TransactionProcessingResult{
@@ -171,6 +274,7 @@ func LoadAndExecuteTransaction(input LoadAndExecuteTransactionInput) LoadAndExec
 				},
 			},
 		}
+		out.FeeInfo = validatedFeeInfo
 		baseFields(&out)
 		return out
 	} else if err != nil {
@@ -226,15 +330,18 @@ func LoadAndExecuteTransaction(input LoadAndExecuteTransactionInput) LoadAndExec
 		}
 	}
 
-	// Calculate and deduct fees
+	// Calculate and deduct fees. RentForSlot supplies the exemption
+	// minimum so a rent-exempt payer is rejected before instructions run.
 	start = time.Now()
-	txFeeInfo, _, err := fees.CalculateAndDeductTxFees(tx, input.TxMeta, instrs, &execCtx.TransactionContext.Accounts, computeBudgetLimits, slotCtx.Features, input.IsSimulation)
+	txFeeInfo, _, err := fees.CalculateAndDeductTxFees(tx, input.TxMeta, instrs, &execCtx.TransactionContext.Accounts, computeBudgetLimits, slotCtx.Features, fees.RentForSlot(slotCtx), input.IsSimulation)
 	if err != nil {
+		errType, accountIndex := feePayerTransactionError(err)
 		out := LoadAndExecuteTransactionOutput{
 			ProcessingResult: TransactionProcessingResult{
 				TransactionError: &TransactionError{
-					ErrorType:        TransactionErrorInsufficientFundsForFee,
+					ErrorType:        errType,
 					InstructionError: err,
+					AccountIndex:     accountIndex,
 				},
 			},
 			ExecCtx:             execCtx,
@@ -323,12 +430,18 @@ func LoadAndExecuteTransaction(input LoadAndExecuteTransactionInput) LoadAndExec
 	if instrErr != nil || rentStateErr != nil {
 		var relevantErr error
 		var errType TransactionErrorType
+		var accountIndex *uint8
 		if instrErr != nil {
 			relevantErr = instrErr
 			errType = TransactionErrorInstructionError
 		} else {
 			relevantErr = rentStateErr
 			errType = TransactionErrorInsufficientFundsForRent
+			var transitionErr *rent.RentStateTransitionError
+			if errors.As(rentStateErr, &transitionErr) {
+				idx := transitionErr.AccountIndex
+				accountIndex = &idx
+			}
 		}
 
 		out := LoadAndExecuteTransactionOutput{
@@ -336,6 +449,7 @@ func LoadAndExecuteTransaction(input LoadAndExecuteTransactionInput) LoadAndExec
 				TransactionError: &TransactionError{
 					ErrorType:        errType,
 					InstructionError: relevantErr,
+					AccountIndex:     accountIndex,
 				},
 			},
 			ExecCtx:             execCtx,
@@ -355,12 +469,13 @@ func LoadAndExecuteTransaction(input LoadAndExecuteTransactionInput) LoadAndExec
 	// must retain the legacy all-writable semantics.
 	if input.LeanResult && accountsDeltaHashRemoved(slotCtx) {
 		return LoadAndExecuteTransactionOutput{
-			ExecCtx:             execCtx,
-			PreBalances:         preBalances,
-			PreAccountSnapshots: preAccountSnapshots,
-			FeeInfo:             txFeeInfo,
-			Instrs:              instrs,
-			ComputeBudgetLimits: computeBudgetLimits,
+			ExecCtx:                execCtx,
+			PreBalances:            preBalances,
+			PreAccountSnapshots:    preAccountSnapshots,
+			FeeInfo:                txFeeInfo,
+			Instrs:                 instrs,
+			ComputeBudgetLimits:    computeBudgetLimits,
+			LoadedAccountsDataSize: loadedAccountsDataSize,
 		}
 	}
 
@@ -393,12 +508,13 @@ func LoadAndExecuteTransaction(input LoadAndExecuteTransactionInput) LoadAndExec
 				WritableAccounts:   writablePubkeys,
 				WritableAccountSet: writablePubkeySet,
 			},
-			ExecCtx:             execCtx,
-			PreBalances:         preBalances,
-			PreAccountSnapshots: preAccountSnapshots,
-			FeeInfo:             txFeeInfo,
-			Instrs:              instrs,
-			ComputeBudgetLimits: computeBudgetLimits,
+			ExecCtx:                execCtx,
+			PreBalances:            preBalances,
+			PreAccountSnapshots:    preAccountSnapshots,
+			FeeInfo:                txFeeInfo,
+			Instrs:                 instrs,
+			ComputeBudgetLimits:    computeBudgetLimits,
+			LoadedAccountsDataSize: loadedAccountsDataSize,
 		}
 	}
 
@@ -409,14 +525,6 @@ func LoadAndExecuteTransaction(input LoadAndExecuteTransactionInput) LoadAndExec
 	modifiedVoteAccounts := make(map[solana.PublicKey]*sealevel.VoteStateVersions)
 	for pk, voteState := range execCtx.ModifiedVoteStates {
 		modifiedVoteAccounts[pk] = voteState
-	}
-
-	// Calculate loaded accounts data size
-	var loadedAccountsDataSize uint32
-	for _, acct := range transactionAccts.Accounts {
-		if !acct.IsDummy {
-			loadedAccountsDataSize += uint32(len(acct.Data))
-		}
 	}
 
 	// Collect return data

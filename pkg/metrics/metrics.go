@@ -105,9 +105,9 @@ type TurbineIngress struct {
 	ReplayAdmission      Timing
 }
 
-// VoteRewardDetails decomposes AlpenglowVoteRewards. Certificate timers retain
-// exact BLS verification; validator preparation measures only immutable
-// epoch-material lookup/build work.
+// VoteRewardDetails decomposes RewardCertificatePreflight and
+// AlpenglowVoteRewards together. Certificate timers retain exact BLS verification;
+// validator preparation measures only immutable epoch-material lookup/build work.
 type VoteRewardDetails struct {
 	ValidatorPreparation       Timing
 	SkipCertificateValidation  Timing
@@ -129,6 +129,10 @@ type BlockReplay struct {
 	Slot           uint64
 	AccountLoader  AccountLoader
 	TurbineIngress TurbineIngress
+
+	// RewardCertificatePreflight runs before consensus admission and bank replay,
+	// outside SlotReplay, which starts after the candidate is admitted.
+	RewardCertificatePreflight Timing
 
 	// Exact slot wall-clock closure: SlotReplay equals the sum of the disjoint
 	// PreprocessBlock, ProcessBlock, and PostProcessBlock intervals. The more

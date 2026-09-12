@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/Overclock-Validator/mithril/pkg/sigverify"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/dedup"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/packet"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/sink"
@@ -18,7 +19,10 @@ type Config struct {
 	IngressCap         int
 	DedupOutCap        int
 	VerifiedCap        int
-	Sink               sink.Receiver
+	// TxV1Enabled must reflect the current replay bank's SIMD-0385 feature
+	// state. Nil deliberately fails closed for v1 transactions.
+	TxV1Enabled func() bool
+	Sink        sink.Receiver
 }
 
 func (c Config) normalized() Config {
@@ -88,7 +92,7 @@ func Start(parent context.Context, cfg Config) (*Pipeline, chan<- packet.Packet)
 	dedupOut := make(chan packet.Packet, cfg.DedupOutCap)
 	verified := make(chan packet.Packet, cfg.VerifiedCap)
 
-	dedupStage := dedup.NewStage(p.ingress, dedupOut, dedup.NewCache(cfg.DedupCacheCapacity))
+	dedupStage := dedup.NewStage(p.ingress, dedupOut, dedup.NewCache(cfg.DedupCacheCapacity), cfg.TxV1Enabled)
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
@@ -96,7 +100,7 @@ func Start(parent context.Context, cfg Config) (*Pipeline, chan<- packet.Packet)
 		dedupStage.Run(&p.stats.Dedup)
 	}()
 
-	startSigverifyPool(&p.wg, dedupOut, verified, cfg.SigverifyWorkers, &p.stats.Sigverify)
+	startSigverifyPool(&p.wg, dedupOut, verified, cfg.SigverifyWorkers, cfg.TxV1Enabled, &p.stats.Sigverify)
 
 	p.wg.Add(1)
 	go func() {
@@ -163,6 +167,7 @@ func startSigverifyPool(
 	in <-chan packet.Packet,
 	out chan<- packet.Packet,
 	workers int,
+	txV1Enabled func() bool,
 	stats *SigverifyStats,
 ) {
 	var verifyWG sync.WaitGroup
@@ -172,7 +177,7 @@ func startSigverifyPool(
 		go func() {
 			defer verifyWG.Done()
 			defer wg.Done()
-			runSigverifyWorker(in, out, stats)
+			runSigverifyWorker(in, out, workers, txV1Enabled, stats)
 		}()
 	}
 	wg.Add(1)
@@ -183,24 +188,61 @@ func startSigverifyPool(
 	}()
 }
 
+// runSigverifyWorker verifies a DRAINED GROUP of packets per pass rather than
+// one packet at a time.
+//
+// A transaction carries one or two signatures, and the vectorized backend
+// verifies eight per group, so packet-at-a-time verification pays for a whole
+// group and uses one lane of it. Draining costs nothing when ingress is quiet —
+// the worker still takes exactly the packet it blocked for, and forwards it
+// with unchanged latency — and turns a burst into free width.
 func runSigverifyWorker(
 	in <-chan packet.Packet,
 	out chan<- packet.Packet,
+	workers int,
+	txV1Enabled func() bool,
 	stats *SigverifyStats,
 ) {
+	// Worker-local scratch, reused across groups.
+	var (
+		group    []packet.Packet
+		payloads [][]byte
+		verdicts []bool
+		verifier batchVerifier
+	)
+	verifier.SetTxV1Enabled(txV1Enabled)
 	for pkt := range in {
-		data := pkt.Data()
-		atomic.AddUint64(&stats.InPackets, 1)
-		atomic.AddUint64(&stats.InBytes, uint64(len(data)))
+		group = sigverify.Drain(group, pkt, in,
+			sigverify.FairShare(len(in), workers, sigverify.MaxDrain))
 
-		if !verifyPacket(data) {
-			atomic.AddUint64(&stats.DroppedSigverify, 1)
-			pkt.Release()
-			continue
+		payloads = payloads[:0]
+		for _, p := range group {
+			data := p.Data()
+			atomic.AddUint64(&stats.InPackets, 1)
+			atomic.AddUint64(&stats.InBytes, uint64(len(data)))
+			payloads = append(payloads, data)
 		}
 
-		atomic.AddUint64(&stats.VerifiedPackets, 1)
-		atomic.AddUint64(&stats.VerifiedBytes, uint64(len(data)))
-		out <- pkt
+		if cap(verdicts) < len(payloads) {
+			verdicts = make([]bool, len(payloads))
+		}
+		verdicts = verdicts[:len(payloads)]
+		verifier.Verify(payloads, verdicts)
+
+		for i, p := range group {
+			if !verdicts[i] {
+				atomic.AddUint64(&stats.DroppedSigverify, 1)
+				p.Release()
+				continue
+			}
+			atomic.AddUint64(&stats.VerifiedPackets, 1)
+			atomic.AddUint64(&stats.VerifiedBytes, uint64(len(payloads[i])))
+			out <- p
+		}
+
+		// Released packets must not stay reachable through the scratch slices
+		// until the next group happens to overwrite that index.
+		clear(group)
+		clear(payloads)
 	}
 }

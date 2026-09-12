@@ -3,6 +3,7 @@ package sealevel
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/fixtures"
@@ -13,6 +14,7 @@ import (
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestExecute_Tx_Sysvar_Instructions_Serialization_Test(t *testing.T) {
@@ -22,7 +24,8 @@ func TestExecute_Tx_Sysvar_Instructions_Serialization_Test(t *testing.T) {
 	instr2, err := newTestSetComputeUnitLimit(1000)
 	assert.NoError(t, err)
 
-	serializedData := marshalInstructions([]Instruction{instr1, instr2})
+	serializedData, err := marshalInstructions([]Instruction{instr1, instr2})
+	require.NoError(t, err)
 	fmt.Printf("size of data: %d\n", len(serializedData))
 }
 
@@ -84,7 +87,8 @@ func TestExecute_Tx_Sysvar_Instructions_Bpf_Test(t *testing.T) {
 	instr2.Accounts = append(instr2.Accounts, AccountMeta{Pubkey: a.Secp256kPrecompileAddr, IsWritable: false, IsSigner: false})
 	assert.NoError(t, err)
 
-	sysvarInstructionsData := marshalInstructions([]Instruction{instr1, instr2})
+	sysvarInstructionsData, err := marshalInstructions([]Instruction{instr1, instr2})
+	require.NoError(t, err)
 	sysvarInstructionsAcct := accounts.Account{Key: SysvarInstructionsAddr, Lamports: 1, Data: sysvarInstructionsData, Owner: a.SysvarOwnerAddr, Executable: false, RentEpoch: 100}
 
 	instrData := make([]byte, 1)
@@ -162,4 +166,40 @@ func TestExecute_Tx_Sysvar_Instructions_Bpf_Test(t *testing.T) {
 	for _, l := range log.Logs {
 		fmt.Printf("log: %s\n", l)
 	}
+}
+
+func TestMarshalInstructionsRejectsInstructionOffsetOverflow(t *testing.T) {
+	makeInstruction := func(numAccountRefs int, data []byte) Instruction {
+		accountMeta := AccountMeta{Pubkey: a.SystemProgramAddr}
+		instruction := Instruction{
+			ProgramId: a.SystemProgramAddr,
+			Accounts:  make([]AccountMeta, numAccountRefs),
+			Data:      data,
+		}
+		for i := range instruction.Accounts {
+			instruction.Accounts[i] = accountMeta
+		}
+		return instruction
+	}
+	makeInstructions := func(paddingData []byte) []Instruction {
+		instructions := make([]Instruction, 0, 9)
+		for range 7 {
+			instructions = append(instructions, makeInstruction(255, nil))
+		}
+		instructions = append(instructions, makeInstruction(191, paddingData))
+		instructions = append(instructions, makeInstruction(255, nil))
+		return instructions
+	}
+
+	boundaryData := make([]byte, 19)
+	serialized, err := marshalInstructions(makeInstructions(boundaryData))
+	require.NoError(t, err)
+	require.Greater(t, len(serialized), math.MaxUint16)
+
+	overflowData := make([]byte, 20)
+	_, err = marshalInstructions(makeInstructions(overflowData))
+	require.ErrorIs(t, err, ErrInstructionsSysvarInstructionIndexOutOfBounds)
+
+	_, err = MakeInstructionsSysvarAccount(makeInstructions(overflowData))
+	require.ErrorIs(t, err, ErrInstructionsSysvarInstructionIndexOutOfBounds)
 }

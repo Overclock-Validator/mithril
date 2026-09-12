@@ -2,10 +2,14 @@ package replay
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/Overclock-Validator/mithril/pkg/global"
+	"github.com/gagliardetto/solana-go"
 )
 
 // Terminal replay stats for the Alpenglow/native-shred path. Terminology
@@ -97,6 +101,70 @@ const (
 	dashExec = "  --  "
 	dashEff  = "   --      "
 )
+
+// nextLeaderCursor caches the next scheduled slot for this node's identity
+// so the per-slot line can show a countdown without rescanning every slot.
+type nextLeaderCursor struct {
+	identity solana.PublicKey
+	next     uint64
+	ok       bool
+	lookup   func(solana.PublicKey, uint64) (uint64, bool)
+}
+
+func newNextLeaderCursor(identity solana.PublicKey) *nextLeaderCursor {
+	if identity.IsZero() {
+		return nil
+	}
+	return &nextLeaderCursor{identity: identity}
+}
+
+func (c *nextLeaderCursor) hint(slot uint64) string {
+	if c == nil || c.identity.IsZero() {
+		return ""
+	}
+	lookup := c.lookup
+	if lookup == nil {
+		lookup = global.NextSlotForLeader
+	}
+	if !c.ok || slot > c.next {
+		c.next, c.ok = lookup(c.identity, slot)
+	}
+	if !c.ok {
+		return ""
+	}
+	if slot == c.next {
+		return "ours"
+	}
+	if slot < c.next {
+		return fmt.Sprintf("next %d ~%s", c.next, formatSlotETA(c.next-slot))
+	}
+	return ""
+}
+
+func appendNextLeaderHint(line, hint string) string {
+	if hint == "" {
+		return line
+	}
+	return line + " | " + hint
+}
+
+// formatSlotETA renders remaining Alpenglow slots (200ms) as a short timer.
+func formatSlotETA(slots uint64) string {
+	ms := slots * 200
+	switch {
+	case ms < 1000:
+		return fmt.Sprintf("%dms", ms)
+	case ms < 60_000:
+		sec := float64(ms) / 1000
+		if sec < 10 {
+			return fmt.Sprintf("%.1fs", sec)
+		}
+		return fmt.Sprintf("%.0fs", math.Round(sec))
+	default:
+		totalSec := (ms + 500) / 1000
+		return fmt.Sprintf("%dm%02ds", totalSec/60, totalSec%60)
+	}
+}
 
 // buildSlotStatsLine renders the per-slot terminal line. The shreds segment is
 // omitted for blocks that did not come from shreds (never fabricated). Value

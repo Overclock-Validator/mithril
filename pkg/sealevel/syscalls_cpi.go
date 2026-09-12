@@ -850,6 +850,16 @@ func updateCallerAccountRegion(vm sbpf.VM, execCtx *ExecutionCtx, callerAcct *Ca
 
 	writable := calleeAcct.DataCanBeChanged(execCtx.Features) == nil
 	if accountDataDirectMappingActive(execCtx) {
+		// A direct-mapped account can still reference the transaction's shared
+		// parent state here.  Keep the caller region read-only in that case so
+		// its existing OnWrite hook performs the first-write clone.  Marking the
+		// region writable would let the caller mutate the shared backing slice
+		// without setting TransactionAccounts.Touched, so the successful write
+		// would be omitted from publication and the accounts LtHash.
+		if calleeAcct.IndexInTransaction < uint64(len(calleeAcct.TxCtx.Accounts.Shared)) &&
+			calleeAcct.TxCtx.Accounts.Shared[calleeAcct.IndexInTransaction] {
+			writable = false
+		}
 		updater, ok := vm.(inputRegionDataUpdater)
 		if !ok {
 			return nil

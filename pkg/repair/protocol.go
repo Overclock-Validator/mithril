@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
+	narya "github.com/Overclock-Validator/narya-ed25519/ed25519"
 )
 
 const (
@@ -73,7 +74,7 @@ func DecodePing(packet []byte) (Ping, bool) {
 	copy(ping.From[:], packet[4:36])
 	copy(ping.Token[:], packet[36:68])
 	copy(ping.Signature[:], packet[68:132])
-	if !ed25519.Verify(ed25519.PublicKey(ping.From[:]), ping.Token[:], ping.Signature[:]) {
+	if !narya.VerifyStrict(ping.From[:], ping.Token[:], ping.Signature[:]) {
 		return Ping{}, false
 	}
 	return ping, true
@@ -136,6 +137,21 @@ func signRepairPacket(identity ed25519.PrivateKey, packet []byte) {
 	copy(packet[repairSignatureOffset:repairSignatureOffset+repairSignatureSize], signature)
 }
 
+// VerifySignedRequest authenticates an INBOUND repair request — a peer asking
+// us to serve it a shred. Mithril is requester-side only today, so nothing
+// outside tests calls this yet.
+//
+// When repair serving is wired up, this becomes a packet-rate consumer fed by
+// a UDP socket loop, which is the shape that wants batching: signatures are
+// verified eight per AVX-512 group, so verifying one packet at a time pays for
+// a whole group and uses one lane of it. Drain the socket's work queue and
+// verify a group per pass, exactly as pkg/tpu/pipeline does — sigverify.Drain
+// and sigverify.FairShare exist for this, and take a share rather than the
+// whole queue so batching does not eat the parallelism across workers.
+//
+// The predicate here is already the strict one, which matters more than the
+// throughput: a repair request authenticated under plain stdlib rules would
+// accept small-order sender keys that Agave rejects.
 func VerifySignedRequest(packet []byte, sender gossip.Pubkey) bool {
 	if len(packet) < repairSignatureOffset+repairSignatureSize {
 		return false
@@ -143,7 +159,7 @@ func VerifySignedRequest(packet []byte, sender gossip.Pubkey) bool {
 	signable := make([]byte, 0, len(packet)-repairSignatureSize)
 	signable = append(signable, packet[:repairSignatureOffset]...)
 	signable = append(signable, packet[repairSignatureOffset+repairSignatureSize:]...)
-	return ed25519.Verify(ed25519.PublicKey(sender[:]), signable, packet[repairSignatureOffset:repairSignatureOffset+repairSignatureSize])
+	return narya.VerifyStrict(sender[:], signable, packet[repairSignatureOffset:repairSignatureOffset+repairSignatureSize])
 }
 
 func hashPingToken(token [32]byte) gossip.Hash {

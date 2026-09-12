@@ -26,6 +26,9 @@ var errLocalVoteStale = errors.New("local vote is at or below the consensus acti
 const (
 	maxRecentAlpenglowBlockIDs   = 8192
 	maxVerifiedVotorCertificates = 8192
+	// Agave reward certificates cover votes from the preceding eight slots.
+	// Its transport keeps that trailing epoch admitted across the boundary.
+	alpenglowRewardVoteSlots = uint64(8)
 	// Network events continuously re-anchor this short extrapolation. Capping
 	// it to one leader window prevents a quiet or disconnected receiver from
 	// recreating the unbounded startup-wall-clock drift that can skip our own
@@ -80,6 +83,7 @@ type AlpenglowDecisionSource interface {
 // AlpenglowFinalityIndex answers per-slot finality queries for the promotion gate.
 type AlpenglowFinalityIndex interface {
 	FinalizedBlockAt(slot uint64) (alpenglow.BlockID, bool)
+	FinalizedSkipAt(slot uint64) (alpenglow.BlockID, bool)
 	FinalityConflictAt(slot uint64) bool
 }
 
@@ -138,6 +142,7 @@ type AlpenglowBlockProductionParentSource interface {
 type AlpenglowChainQuery interface {
 	CertifiedBlockAt(slot uint64) (alpenglow.BlockID, alpenglow.CertificateType, bool)
 	SkipCertifiedAt(slot uint64) bool
+	FinalizedSkipAt(slot uint64) (alpenglow.BlockID, bool)
 	// ChainDecisionVersion gates the sweep: it advances on ANY decision-relevant
 	// change (cert acceptance, replay-derived parent links, finalized ancestry,
 	// indirect skips, conflicts), not only on new certificates — so a
@@ -201,6 +206,7 @@ func NewEngine(cfg Config) (*AlpenglowObserverEngine, error) {
 		observedReplayBlocks:    make(map[uint64]alpenglow.ReplayBlockObservation),
 		executedReplayBlocks:    make(map[alpenglow.BlockID]alpenglow.BlockID),
 		validatorSets:           make(map[uint64]alpenglow.ValidatorSet),
+		validatorRanks:          make(map[uint64]map[solana.PublicKey]uint16),
 	}
 	// CertPool remains the bounded, lazy BLS batch-verification front end. Its
 	// verified votes feed ConsensusPool, which is the sole certificate/finality
@@ -236,11 +242,21 @@ type AlpenglowObserverEngine struct {
 	executedReplayBlocks map[alpenglow.BlockID]alpenglow.BlockID
 	validatorSetsMu      sync.RWMutex
 	validatorSets        map[uint64]alpenglow.ValidatorSet
-	blockIDSinkMu        sync.RWMutex
-	blockIDSink          AlpenglowBlockIDSink
-	recentBlockIDs       map[uint64]solana.Hash
-	recentBlockIDOrder   []uint64
-	invalidBlockIDs      map[alpenglow.BlockID]struct{}
+	// validatorRanks is the immutable node-identity index for each installed
+	// BLS rank set. QUIC admission is per datagram at cluster traffic rates, so
+	// it must not linearly rescan up to the 2,000-entry VAT set each time.
+	validatorRanks map[uint64]map[solana.PublicKey]uint16
+	// votorPeerRoot is the locally durable/rootable bank used by Agave's peer
+	// list updater. It is deliberately independent of ConsensusPool.RootSlot:
+	// certificate finality prunes that pool ahead of local replay, while the
+	// transport membership window must follow the local BankForks root.
+	votorPeerRoot      atomic.Uint64
+	votorPeerRootSet   atomic.Bool
+	blockIDSinkMu      sync.RWMutex
+	blockIDSink        AlpenglowBlockIDSink
+	recentBlockIDs     map[uint64]solana.Hash
+	recentBlockIDOrder []uint64
+	invalidBlockIDs    map[alpenglow.BlockID]struct{}
 	// beforeBlockIDPublication is a deterministic test seam for the race
 	// between decisive lookup and the publication lock. Production leaves it nil.
 	beforeBlockIDPublication func()
@@ -306,7 +322,8 @@ func (e *AlpenglowObserverEngine) Start(ctx context.Context) error {
 		MaxMessageBytes: e.receiverMaxMessageBytes,
 		ShredVersion:    e.shredVersion,
 		Identity:        e.identity,
-		AdmitMessage:    e.admitVotorMessage,
+		AdmitPeer:       e.admitVotorPeer,
+		AdmitMessage:    e.admitAuthenticatedVotorMessage,
 	}, observer)
 	if err != nil {
 		return err
@@ -339,7 +356,12 @@ func (e *AlpenglowObserverEngine) EnableVoting(cfg VotingConfig) error {
 	if block, ok := e.ensureChain().FinalizedBlockAt(root.Slot); ok {
 		root = block
 	}
-	voter, err := newAlpenglowVoterUnstarted(e, cfg, root)
+	sets := make([]alpenglow.ValidatorSet, 0, len(e.validatorSets))
+	for _, set := range e.validatorSets {
+		sets = append(sets, cloneValidatorSet(set))
+	}
+	sort.Slice(sets, func(i, j int) bool { return sets[i].Epoch < sets[j].Epoch })
+	voter, err := newAlpenglowVoterUnstarted(e, cfg, root, sets)
 	if err != nil {
 		e.voterMu.Unlock()
 		e.validatorSetsMu.RUnlock()
@@ -365,16 +387,10 @@ func (e *AlpenglowObserverEngine) EnableVoting(cfg VotingConfig) error {
 		}
 	}
 
-	sets := make([]alpenglow.ValidatorSet, 0, len(e.validatorSets))
-	for _, set := range e.validatorSets {
-		sets = append(sets, cloneValidatorSet(set))
-	}
-	sort.Slice(sets, func(i, j int) bool { return sets[i].Epoch < sets[j].Epoch })
 	for _, set := range sets {
-		// Publish signing eligibility before exposing the voter pointer. The
-		// queued event then performs logging and durable vote restoration first
-		// in FIFO order, ahead of any externally enqueued consensus event.
-		voter.sets[set.Epoch] = cloneValidatorSet(set)
+		// Signing and transport eligibility were installed before broadcaster
+		// construction. The queued event performs logging and durable vote
+		// restoration in FIFO order before any external consensus event.
 		if err := voter.enqueue(voterEvent{kind: voterEventValidatorSet, set: set}); err != nil {
 			e.voterMu.Unlock()
 			e.validatorSetsMu.RUnlock()
@@ -627,6 +643,109 @@ func (e *AlpenglowObserverEngine) SetAlpenglowBlockIDSink(sink AlpenglowBlockIDS
 
 func (e *AlpenglowObserverEngine) observeVotorMessage(msg alpenglow.Message) {
 	_, _ = e.admitVotorMessage(msg)
+}
+
+// admitVotorPeer mirrors Agave's Votor peer-list trust boundary. The root
+// epoch is always admitted; validators from root-8 remain eligible long enough
+// to deliver reward votes across an epoch boundary, and the next epoch opens
+// when it falls inside Agave's vote-verification window. The local identity
+// must itself be in that merged set or this endpoint remains fail-closed.
+func (e *AlpenglowObserverEngine) admitVotorPeer(peer solana.PublicKey) bool {
+	if peer == (solana.PublicKey{}) || len(e.identity) != ed25519.PrivateKeySize {
+		return false
+	}
+	epochs, ok := e.votorPeerEpochs()
+	if !ok {
+		return false
+	}
+
+	local := solana.PublicKey(e.identity.Public().(ed25519.PublicKey))
+	e.validatorSetsMu.RLock()
+	defer e.validatorSetsMu.RUnlock()
+	localAdmitted := validatorIdentityInEpochs(e.validatorRanks, epochs, local)
+	return localAdmitted && validatorIdentityInEpochs(e.validatorRanks, epochs, peer)
+}
+
+func (e *AlpenglowObserverEngine) votorPeerEpochs() ([]uint64, bool) {
+	if !e.votorPeerRootSet.Load() {
+		return nil, false
+	}
+	root := e.votorPeerRoot.Load()
+	rootEpoch, ok := e.alpenglowEpochForSlot(root)
+	if !ok {
+		return nil, false
+	}
+
+	epochs := []uint64{rootEpoch}
+	trailingSlot := root - minU64(root, alpenglowRewardVoteSlots)
+	if trailingEpoch, ok := e.alpenglowEpochForSlot(trailingSlot); ok && trailingEpoch != rootEpoch {
+		epochs = append(epochs, trailingEpoch)
+	}
+	if root <= ^uint64(0)-alpenglow.AgaveVoteVerificationWindow {
+		if futureEpoch, ok := e.alpenglowEpochForSlot(root + alpenglow.AgaveVoteVerificationWindow); ok && futureEpoch > rootEpoch {
+			epochs = append(epochs, rootEpoch+1)
+		}
+	}
+	return epochs, true
+}
+
+func (e *AlpenglowObserverEngine) advanceVotorPeerRoot(slot uint64) {
+	// BankForks roots are monotonic. Preserve that invariant even if a stale
+	// replay callback races a newer durable-fold notification. Store the slot
+	// before publishing the initialized bit, so first-time readers fail closed
+	// rather than briefly observing the zero value as an epoch-0 root.
+	for {
+		current := e.votorPeerRoot.Load()
+		if e.votorPeerRootSet.Load() && slot <= current {
+			return
+		}
+		if e.votorPeerRoot.CompareAndSwap(current, max(current, slot)) {
+			e.votorPeerRootSet.Store(true)
+			return
+		}
+	}
+}
+
+func validatorIdentityInEpochs(ranks map[uint64]map[solana.PublicKey]uint16, epochs []uint64, identity solana.PublicKey) bool {
+	for _, epoch := range epochs {
+		if _, ok := ranks[epoch][identity]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// admitAuthenticatedVotorMessage derives vote rank from the TLS-authenticated
+// validator identity. Rank is deliberately absent from Agave v4.3 wire votes;
+// trusting a packet-supplied rank would both break interoperability and permit
+// one admitted identity to impersonate another validator's BLS key.
+func (e *AlpenglowObserverEngine) admitAuthenticatedVotorMessage(peer solana.PublicKey, msg alpenglow.Message) (alpenglow.Message, bool) {
+	if !e.admitVotorPeer(peer) {
+		return alpenglow.Message{}, false
+	}
+	if msg.Vote != nil {
+		rank, ok := e.votorRankForPeer(msg.Vote.Vote.Slot, peer)
+		if !ok {
+			return alpenglow.Message{}, false
+		}
+		msg.Vote.Rank = rank
+	}
+	return e.admitVotorMessage(msg)
+}
+
+func (e *AlpenglowObserverEngine) votorRankForPeer(slot uint64, peer solana.PublicKey) (uint16, bool) {
+	epoch, ok := e.alpenglowEpochForSlot(slot)
+	if !ok {
+		return 0, false
+	}
+	e.validatorSetsMu.RLock()
+	defer e.validatorSetsMu.RUnlock()
+	ranks, exists := e.validatorRanks[epoch]
+	if !exists {
+		return 0, false
+	}
+	rank, exists := ranks[peer]
+	return rank, exists
 }
 
 // admitVotorMessage is the trust boundary between wire decoding and observer
@@ -1176,6 +1295,10 @@ func (e *AlpenglowObserverEngine) FinalizedBlockAt(slot uint64) (alpenglow.Block
 	return e.ensureChain().FinalizedBlockAt(slot)
 }
 
+func (e *AlpenglowObserverEngine) FinalizedSkipAt(slot uint64) (alpenglow.BlockID, bool) {
+	return e.ensureChain().FinalizedSkipAt(slot)
+}
+
 func (e *AlpenglowObserverEngine) FinalityConflictAt(slot uint64) bool {
 	return e.ensureChain().FinalityConflictAt(slot)
 }
@@ -1284,6 +1407,11 @@ func (e *AlpenglowObserverEngine) SetAlpenglowValidatorSet(set alpenglow.Validat
 		return err
 	}
 	e.validatorSets[set.Epoch] = cloneValidatorSet(set)
+	ranks := make(map[solana.PublicKey]uint16, len(set.Validators))
+	for _, validator := range set.Validators {
+		ranks[validator.NodePubkey] = validator.Rank
+	}
+	e.validatorRanks[set.Epoch] = ranks
 	if voter != nil {
 		voter.sets[set.Epoch] = cloneValidatorSet(set)
 		voter.setsMu.Unlock()
@@ -1332,6 +1460,9 @@ func (e *AlpenglowObserverEngine) SetAlpenglowRoot(block alpenglow.BlockID) {
 	if err := e.enqueueVoter(voterEvent{kind: voterEventRoot, root: block}); err != nil {
 		e.latchSafetyError(err)
 	}
+	// Startup restores this from the same durable checkpoint that seeds replay.
+	// A fresh engine has no earlier transport root to preserve.
+	e.advanceVotorPeerRoot(block.Slot)
 }
 
 func (e *AlpenglowObserverEngine) AlpenglowBlockProductionParent(slot uint64) alpenglow.BlockProductionParent {
@@ -1415,6 +1546,10 @@ func (e *AlpenglowObserverEngine) PruneAlpenglowBefore(slot uint64) {
 	if err := e.enqueueVoter(voterEvent{kind: voterEventRoot, root: root}); err != nil {
 		e.latchSafetyError(err)
 	}
+	// Replay calls this only after the fold through slot is durably committed.
+	// Keep the transport peer window tied to that local root, not to speculative
+	// certificate finality or the pool's reward-retention floor.
+	e.advanceVotorPeerRoot(slot)
 }
 
 func (e *AlpenglowObserverEngine) pruneInvalidBlockIDsBefore(slot uint64) {

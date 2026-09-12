@@ -123,6 +123,12 @@ func (s *alpenglowSwitchSweeper) sweep(executed map[uint64]solana.Hash, lastRoot
 		if !ran {
 			continue
 		}
+		if _, finalizedSkip := s.query.FinalizedSkipAt(slot); finalizedSkip {
+			if !executedID.IsZero() {
+				return &CertifiedSwitch{Slot: slot, Executed: executedID, Skip: true}
+			}
+			continue
+		}
 		if s.query.SkipCertifiedAt(slot) {
 			// A skip certificate permits a future child to omit this slot, but it
 			// does not invalidate an already replayed block as that child's parent.
@@ -159,12 +165,15 @@ const (
 	unwindFallbackRewardsWindow  = "rewards-window"
 	unwindFallbackVoteStakeDirty = "vote-stake-dirty"
 	unwindFallbackMissingContext = "missing-context"
+	unwindFallbackMissingSysvars = "missing-bank-sysvars"
+	unwindFallbackSysvarSlot     = "bank-sysvar-slot-mismatch"
 	unwindFallbackContextRebuild = "context-rebuild"
 )
 
 // tryInLoopUnwind attempts the in-RAM fork switch. On success it returns the
-// rebuilt resume state and "". Otherwise it returns nil and the guard reason
-// that forced the rooted-checkpoint fallback.
+// rebuilt resume state, the exact immutable sysvar snapshot of its parent bank,
+// and "". Otherwise it returns nil values and the guard reason that forced the
+// rooted-checkpoint fallback.
 func tryInLoopUnwind(
 	sw *CertifiedSwitch,
 	tail *unrootedTail,
@@ -172,15 +181,18 @@ func tryInLoopUnwind(
 	epochSchedule *sealevel.SysvarEpochSchedule,
 	currentEpoch uint64,
 	partitionedRewardsInfo *rewards.PartitionedRewardDistributionInfo,
-) (*ResumeState, string) {
+) (*ResumeState, *sealevel.BankSysvars, string) {
 	if tail == nil || sw.Slot == 0 {
-		return nil, unwindFallbackNilTail
+		return nil, nil, unwindFallbackNilTail
 	}
 	if epochSchedule.GetEpoch(sw.Slot-1) != currentEpoch || epochSchedule.GetEpoch(sw.Slot) != currentEpoch {
-		return nil, unwindFallbackCrossEpoch
+		return nil, nil, unwindFallbackCrossEpoch
 	}
-	if partitionedRewardsInfo != nil && partitionedRewardsInfo.NumRewardPartitionsRemaining > 0 {
-		return nil, unwindFallbackRewardsWindow
+	if partitionedRewardsInfo != nil {
+		// Even after the last partition is distributed, the in-memory spool and
+		// completed-distribution bookkeeping describe the abandoned suffix. They
+		// cannot be reconstructed safely without re-running the epoch boundary.
+		return nil, nil, unwindFallbackRewardsWindow
 	}
 	// Vote/stake cache safety, BOTH directions. The unwind cannot roll the
 	// global vote/stake caches back (a write in the UNWOUND suffix >= sw.Slot
@@ -194,22 +206,31 @@ func tryInLoopUnwind(
 	// exact by construction. Vote-program writes are rare in Alpenglow blocks
 	// (vote transactions are off-chain), so the fast path still dominates.
 	if voteStakeDirtySlot.Load() > mithrilState.LastRootedSlot {
-		return nil, unwindFallbackVoteStakeDirty
+		return nil, nil, unwindFallbackVoteStakeDirty
 	}
 
-	ctx := tail.unwind(sw.Slot)
+	ctx, bankSysvars := tail.unwind(sw.Slot)
 	if ctx == nil && sw.Slot-1 == mithrilState.LastRootedSlot && mithrilState.LastRootedContext != nil {
-		// Parent is exactly the durable fold boundary: its context lives in
-		// the state file rather than the tail.
-		ctx = mithrilState.LastRootedContext
+		// The durable boundary carries a persisted ResumeContext, but deliberately
+		// no in-memory BankSysvars pointer. Re-entering through the normal rooted
+		// recovery path rebuilds the complete snapshot; using process globals here
+		// could resurrect a sysvar generation from the discarded suffix.
+		return nil, nil, unwindFallbackMissingSysvars
 	}
 	if ctx == nil {
-		return nil, unwindFallbackMissingContext
+		return nil, nil, unwindFallbackMissingContext
+	}
+	if bankSysvars == nil {
+		return nil, nil, unwindFallbackMissingSysvars
+	}
+	if bankSysvars.Slot() != ctx.Slot {
+		mlog.Log.Warnf("alpenglow switch: retained bank sysvars at slot %d do not match resume context slot %d", bankSysvars.Slot(), ctx.Slot)
+		return nil, nil, unwindFallbackSysvarSlot
 	}
 	rs, err := ResumeStateFromRootedContext(ctx, nil)
 	if err != nil {
 		mlog.Log.Warnf("alpenglow switch: cannot rebuild resume state from retained context at slot %d: %v", ctx.Slot, err)
-		return nil, unwindFallbackContextRebuild
+		return nil, nil, unwindFallbackContextRebuild
 	}
-	return rs, ""
+	return rs, bankSysvars, ""
 }

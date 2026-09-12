@@ -246,6 +246,41 @@ func TestChainTrackerDecisionVersionAdvancesOnReplayDerivation(t *testing.T) {
 	}
 }
 
+func TestChainTrackerDecisionVersionAdvancesOnceOnFinalization(t *testing.T) {
+	tracker := NewChainTracker()
+	blockID := BlockID{Slot: 15, Hash: chainTestHash(15)}
+
+	// Supply the exact parent edge before finalization so ObserveFinalized is
+	// the transition that selects ancestry and derives the omitted slots.
+	tracker.ObserveReplayBlock(ReplayBlockObservation{
+		Block: blockID, ParentSlot: 12, ParentHash: chainTestHash(12),
+	})
+	if _, err := tracker.ObserveCertificate(Certificate{
+		Type: CertificateFinalizeFast, Slot: blockID.Slot, BlockHash: blockID.Hash, SignatureVerified: true,
+	}); err != nil {
+		t.Fatalf("observe cert: %v", err)
+	}
+
+	before := tracker.DecisionVersion()
+	if err := tracker.ObserveFinalized(blockID, CertificateFinalizeFast); err != nil {
+		t.Fatalf("observe pool finalization: %v", err)
+	}
+	if after := tracker.DecisionVersion(); after != before+1 {
+		t.Fatalf("new finalization must advance decision version exactly once (%d -> %d)", before, after)
+	}
+	if via, ok := tracker.FinalizedSkipAt(13); !ok || via != blockID {
+		t.Fatalf("finalization did not publish its derived skip: via=%+v ok=%v", via, ok)
+	}
+
+	beforeDuplicate := tracker.DecisionVersion()
+	if err := tracker.ObserveFinalized(blockID, CertificateFinalizeFast); err != nil {
+		t.Fatalf("repeat pool finalization: %v", err)
+	}
+	if afterDuplicate := tracker.DecisionVersion(); afterDuplicate != beforeDuplicate {
+		t.Fatalf("idempotent finalization changed decision version (%d -> %d)", beforeDuplicate, afterDuplicate)
+	}
+}
+
 func TestChainTrackerSlowFinalizationRequiresNotarizationCertificate(t *testing.T) {
 	tracker := NewChainTracker()
 	blockID := BlockID{Slot: 15, Hash: chainTestHash(15)}

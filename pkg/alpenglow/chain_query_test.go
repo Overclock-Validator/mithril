@@ -49,6 +49,9 @@ func TestSkipCertifiedAtExplicit(t *testing.T) {
 	if _, _, ok := tracker.CertifiedBlockAt(42); ok {
 		t.Fatalf("a skip-certified slot has no decisive block")
 	}
+	if via, ok := tracker.FinalizedSkipAt(42); ok {
+		t.Fatalf("standalone skip certificate must not report a finalized skip via %+v", via)
+	}
 }
 
 // Indirect skips: a finalized block whose parent link jumps slots derives the
@@ -66,9 +69,18 @@ func TestSkipCertifiedAtIndirect(t *testing.T) {
 		if !tracker.SkipCertifiedAt(slot) {
 			t.Fatalf("slot %d omitted between finalized ancestors must be indirectly skip-certified", slot)
 		}
+		if via, ok := tracker.FinalizedSkipAt(slot); !ok || via != finalized {
+			t.Fatalf("slot %d finalized skip = %+v ok=%v, want descendant %+v", slot, via, ok, finalized)
+		}
 	}
 	if tracker.SkipCertifiedAt(12) {
 		t.Fatalf("the finalized parent slot itself is not skipped")
+	}
+	if via, ok := tracker.FinalizedSkipAt(12); ok {
+		t.Fatalf("the selected finalized parent must not report a finalized skip via %+v", via)
+	}
+	if via, ok := tracker.FinalizedSkipAt(finalized.Slot); ok {
+		t.Fatalf("the directly finalized block slot must not report a finalized skip via %+v", via)
 	}
 	// And the finalized block is decisive at its own slot.
 	if got, _, ok := tracker.CertifiedBlockAt(15); !ok || got != finalized {
@@ -164,6 +176,9 @@ func TestChainQueriesFailClosedOnFinalizedSkipConflict(t *testing.T) {
 	}
 	if tracker.SkipCertifiedAt(block.Slot) {
 		t.Fatal("conflicted slot exposed a skip decision")
+	}
+	if via, ok := tracker.FinalizedSkipAt(block.Slot); ok {
+		t.Fatalf("conflicted slot exposed a finalized skip via %+v", via)
 	}
 	if wanted := tracker.WantedBlocks(block.Slot-1, 1); len(wanted) != 0 {
 		t.Fatalf("conflicted slot exposed a repair target: %+v", wanted)

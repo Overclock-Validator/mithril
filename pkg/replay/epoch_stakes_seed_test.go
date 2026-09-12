@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/epochstakes"
+	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/state"
 )
 
@@ -67,6 +68,49 @@ func TestPrepareManifestEpochStakesForRuntimeKeepsRuntimeFrame(t *testing.T) {
 	}
 	if len(seeds) != 2 || seeds[0].runtimeEpoch != 1073 || seeds[1].runtimeEpoch != 1074 {
 		t.Fatalf("unexpected seeds: %#v", seeds)
+	}
+}
+
+func TestLoadInitialEpochStakesCacheUsesManifestOnSameEpochResume(t *testing.T) {
+	const epoch = uint64(84001)
+	global.ClearEpochStakes(epoch)
+	t.Cleanup(func() { global.ClearEpochStakes(epoch) })
+
+	mithrilState := &state.MithrilState{
+		ManifestEpochStakes: map[uint64]string{epoch: persistedEpochStakeJSON(t, epoch)},
+	}
+	restart := &ResumeState{}
+	requireNoError(t, LoadInitialEpochStakesCache(mithrilState, restart, epoch, epoch))
+	if !global.HasEpochStakes(epoch) {
+		t.Fatalf("same-epoch resume did not load manifest stakes for epoch %d", epoch)
+	}
+}
+
+func TestLoadInitialEpochStakesCacheRequiresComputedStakesAfterBoundary(t *testing.T) {
+	err := LoadInitialEpochStakesCache(&state.MithrilState{}, &ResumeState{}, 84002, 84001)
+	if err == nil {
+		t.Fatal("cross-epoch resume without computed stakes unexpectedly succeeded")
+	}
+}
+
+func TestLoadInitialEpochStakesCacheUsesPersistedStakesAfterBoundary(t *testing.T) {
+	const epoch = uint64(84003)
+	global.ClearEpochStakes(epoch)
+	t.Cleanup(func() { global.ClearEpochStakes(epoch) })
+
+	restart := &ResumeState{ComputedEpochStakes: map[uint64][]byte{
+		epoch: []byte(persistedEpochStakeJSON(t, epoch)),
+	}}
+	requireNoError(t, LoadInitialEpochStakesCache(&state.MithrilState{}, restart, epoch, epoch-1))
+	if !global.HasEpochStakes(epoch) {
+		t.Fatalf("cross-epoch resume did not load persisted stakes for epoch %d", epoch)
+	}
+}
+
+func requireNoError(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
+	"github.com/Overclock-Validator/mithril/pkg/tpu/txfixture"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -83,6 +84,50 @@ func TestLoadAndExecuteTransaction_RejectsUnsignedTx(t *testing.T) {
 		require.NotNil(t, out.ProcessingResult.TransactionError)
 		assert.Equal(t, TransactionErrorSanitizeFailure, out.ProcessingResult.TransactionError.ErrorType)
 	})
+}
+
+func TestLoadAndExecuteTransaction_GatesV1UntilFeatureActivation(t *testing.T) {
+	feats := features.NewFeaturesDefault()
+	slotCtx := &sealevel.SlotCtx{Features: feats}
+	msg := solana.Message{
+		Header: solana.MessageHeader{
+			NumRequiredSignatures:       1,
+			NumReadonlyUnsignedAccounts: 1,
+		},
+		AccountKeys: []solana.PublicKey{testPubkey(1), testPubkey(2)},
+		Instructions: []solana.CompiledInstruction{{
+			ProgramIDIndex: 1,
+		}},
+	}
+	_, err := msg.SetVersion(solana.MessageVersionV1)
+	require.NoError(t, err)
+	tx := &solana.Transaction{Message: msg, Signatures: []solana.Signature{{}}}
+
+	out := LoadAndExecuteTransaction(LoadAndExecuteTransactionInput{
+		SlotCtx:     slotCtx,
+		Transaction: tx,
+	})
+	require.NotNil(t, out.ProcessingResult.TransactionError)
+	assert.Equal(t, TransactionErrorUnsupportedVersion, out.ProcessingResult.TransactionError.ErrorType)
+	assert.ErrorIs(t, out.ProcessingResult.TransactionError.InstructionError, TxErrUnsupportedVersion)
+}
+
+func TestLoadAndExecuteTransaction_GatesV1BeforeSanitizing(t *testing.T) {
+	feats := features.NewFeaturesDefault()
+	msg := solana.Message{
+		Header:      solana.MessageHeader{NumRequiredSignatures: 1},
+		AccountKeys: []solana.PublicKey{testPubkey(1), testPubkey(1)}, // V1 forbids duplicate addresses.
+	}
+	_, err := msg.SetVersion(solana.MessageVersionV1)
+	require.NoError(t, err)
+	tx := &solana.Transaction{Message: msg, Signatures: []solana.Signature{{}}}
+
+	out := LoadAndExecuteTransaction(LoadAndExecuteTransactionInput{
+		SlotCtx:     &sealevel.SlotCtx{Features: feats},
+		Transaction: tx,
+	})
+	require.NotNil(t, out.ProcessingResult.TransactionError)
+	assert.Equal(t, TransactionErrorUnsupportedVersion, out.ProcessingResult.TransactionError.ErrorType)
 }
 
 // TestLoadAndExecuteTransaction_RejectsInsufficientSignatures covers the
@@ -370,6 +415,33 @@ func TestTransactionError_MarshalJSON_TupleStructVariants(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"DuplicateInstruction":5}`, string(got))
+}
+
+func TestLoadAndExecuteTransaction_RentFailureCarriesNonPayerAccountIndex(t *testing.T) {
+	slotCtx, cleanup := newCommitTestSlotCtx()
+	defer cleanup()
+
+	rent := sealevel.NewDefaultRentSysvar()
+	destination, err := slotCtx.GetAccount(txfixture.DestPubkey())
+	require.NoError(t, err)
+	// Legacy rent rules reject crediting a rent-paying account while it remains
+	// below the exemption threshold. The transfer credits eight lamports, so
+	// account 1—not the fee payer at account 0—must be named in the error.
+	destination.Lamports = rent.MinimumBalance(0) - 10
+	require.NoError(t, slotCtx.SetAccount(txfixture.DestPubkey(), destination))
+
+	tx, err := solana.TransactionFromBytes(txfixture.MustSignedTransferWire(7))
+	require.NoError(t, err)
+	output := LoadAndExecuteTransaction(LoadAndExecuteTransactionInput{
+		SlotCtx:     slotCtx,
+		Transaction: tx,
+	})
+
+	require.NotNil(t, output.ProcessingResult.TransactionError)
+	txErr := output.ProcessingResult.TransactionError
+	assert.Equal(t, TransactionErrorInsufficientFundsForRent, txErr.ErrorType)
+	require.NotNil(t, txErr.AccountIndex)
+	assert.Equal(t, uint8(1), *txErr.AccountIndex)
 }
 
 // TestTransactionErrorType_String spot-checks the Agave-format wire

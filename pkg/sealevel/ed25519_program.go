@@ -1,13 +1,15 @@
 package sealevel
 
 import (
+	stded25519 "crypto/ed25519"
+
 	"bytes"
 	"encoding/binary"
 	"io"
 	"math"
 
 	"github.com/Overclock-Validator/mithril/pkg/features"
-	"github.com/oasisprotocol/curve25519-voi/primitives/ed25519"
+	"github.com/Overclock-Validator/mithril/pkg/sigverify"
 )
 
 const DataStart = (SignatureOffsetsSerializedSize + SignatureOffsetStarts)
@@ -127,17 +129,29 @@ func Ed25519ProgramExecute(execCtx *ExecutionCtx) error {
 			return PrecompileErrDataOffset
 		}
 
-		pk := ed25519.PublicKey(pubkey)
+		if len(pubkey) != PubkeySerializedSize {
+			return PrecompileErrDataOffset
+		}
 
+		// Signatures are verified one at a time on purpose. The reference
+		// walks entries in order and returns the FIRST error, so batching
+		// these would let a later entry's offset error preempt an earlier
+		// entry's signature error. That error code reaches the ledger, so the
+		// ordering is consensus-visible and is not worth trading for the
+		// throughput of a batch that is usually one or two signatures deep.
 		if execCtx.Features.IsActive(features.Ed25519PrecompileVerifyStrict) {
-			verifyOptions := ed25519.VerifyOptions{AllowSmallOrderA: false, AllowSmallOrderR: false, CofactorlessVerify: true}
-			opts := ed25519.Options{Verify: &verifyOptions}
-
-			if !ed25519.VerifyWithOptions(pk, msg[:offsets.MessageDataSize], signature[:64], &opts) {
+			// DalekStrict: reject small-order A and R, accept a non-canonical
+			// A and hash its original bytes.
+			if !sigverify.VerifyOne((*[32]byte)(pubkey), msg[:offsets.MessageDataSize], signature[:64]) {
 				return PrecompileErrSignature
 			}
 		} else {
-			if !ed25519.Verify(pk, msg[:offsets.MessageDataSize], signature[:64]) {
+			// Before the feature gate the reference used plain (non-strict)
+			// verification, which is exactly crypto/ed25519.Verify: cofactorless,
+			// no small-order rejection, non-canonical A accepted, R compared as
+			// bytes. narya exposes no StdlibCompat entry point, and the stdlib
+			// is definitionally correct here, so this path uses it directly.
+			if !stded25519.Verify(stded25519.PublicKey(pubkey), msg[:offsets.MessageDataSize], signature[:64]) {
 				return PrecompileErrSignature
 			}
 		}

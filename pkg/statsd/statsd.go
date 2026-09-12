@@ -124,7 +124,14 @@ var (
 	TurbineBlockDecode                          = Metric{"turbine_block_decode_duration_seconds"}
 	TurbineTransactionParse                     = Metric{"turbine_transaction_parse_duration_seconds"}
 	TurbineTransactionSigverify                 = Metric{"turbine_transaction_sigverify_duration_seconds"}
-	TurbineReplayAdmission                      = Metric{"turbine_replay_admission_duration_seconds"}
+	// ReplaySigverifyGroup times one drained group of transaction signatures
+	// and ReplaySigverifyGroupSignatures counts how many signatures were in it.
+	// The pair is what tells an operator whether batching is actually happening:
+	// a group width stuck near one means work is arriving too thinly to fill a
+	// vector group, which is a throughput ceiling no backend choice can lift.
+	ReplaySigverifyGroup           = Metric{"replay_sigverify_group_duration_seconds"}
+	ReplaySigverifyGroupSignatures = Metric{"replay_sigverify_group_signatures_total"}
+	TurbineReplayAdmission         = Metric{"turbine_replay_admission_duration_seconds"}
 
 	SnapshotWorkerPoolUtilization = Metric{"snapshot_worker_pool_utilization"}
 	TasksSetIfSlotHigherQueueSize = Metric{"tasks_set_if_slot_higher_queue_size"}
@@ -238,6 +245,8 @@ var MetricToType = map[Metric]metricType{
 	TurbineBlockDecode:                          TimingT,
 	TurbineTransactionParse:                     TimingT,
 	TurbineTransactionSigverify:                 TimingT,
+	ReplaySigverifyGroup:                        TimingT,
+	ReplaySigverifyGroupSignatures:              CountT,
 	TurbineReplayAdmission:                      TimingT,
 
 	TestCount: CountT,
@@ -344,6 +353,8 @@ var MetricToLabels = map[Metric][]string{
 	TurbineBlockDecode:                          {},
 	TurbineTransactionParse:                     {},
 	TurbineTransactionSigverify:                 {},
+	ReplaySigverifyGroup:                        {},
+	ReplaySigverifyGroupSignatures:              {},
 	TurbineReplayAdmission:                      {},
 
 	SnapshotWorkerPoolUtilization: {"task"},
@@ -379,6 +390,7 @@ var MetricToBuckets = map[Metric][]float64{
 	TurbineBlockDecode:                          turbinePipelineDurationBuckets,
 	TurbineTransactionParse:                     turbinePipelineDurationBuckets,
 	TurbineTransactionSigverify:                 turbinePipelineDurationBuckets,
+	ReplaySigverifyGroup:                        turbinePipelineDurationBuckets,
 	TurbineReplayAdmission:                      turbinePipelineDurationBuckets,
 	AlpenglowVoteRewards:                        turbinePipelineDurationBuckets,
 	VoteRewardValidatorPreparation:              turbinePipelineDurationBuckets,

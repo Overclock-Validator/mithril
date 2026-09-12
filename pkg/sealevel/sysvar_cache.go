@@ -1,8 +1,6 @@
 package sealevel
 
-import (
-	"github.com/Overclock-Validator/mithril/pkg/accounts"
-)
+import "github.com/Overclock-Validator/mithril/pkg/accounts"
 
 type sysvarCache struct {
 	RecentBlockHashes recentBlockhashesCache

@@ -29,7 +29,7 @@ func decodeEpochRewardsForTest(t *testing.T, data []byte) sealevel.SysvarEpochRe
 	return epochRewards
 }
 
-func TestEmptyRewardPartitionClosesEpochRewardsWithoutCapitalization(t *testing.T) {
+func TestSameBankRewardPartitionWaitsForStartingBlockHeight(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "accounts"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "largest_file_id"), make([]byte, 8), 0o644))
@@ -59,8 +59,18 @@ func TestEmptyRewardPartitionClosesEpochRewardsWithoutCapitalization(t *testing.
 		Data:     encodeEpochRewardsForTest(t, active),
 		Owner:    a.SysvarOwnerAddr,
 	}
+	// A skipped boundary slot can make epoch initialization and partition zero
+	// execute in one bank. AccountsDB still contains the previous epoch sysvar;
+	// distribution must consume the fresh same-bank write instead.
+	stale := active
+	stale.DistributionStartingBlockHeight = 1
+	stale.TotalRewards = 999
+	stale.DistributedRewards = 999
+	stale.Active = false
+	staleAccount := activeAccount.Clone()
+	staleAccount.Data = encodeEpochRewardsForTest(t, stale)
 	stored := make(chan struct{})
-	require.NoError(t, db.StoreAccounts([]*accounts.Account{activeAccount}, 10, func() { close(stored) }))
+	require.NoError(t, db.StoreAccounts([]*accounts.Account{staleAccount}, 10, func() { close(stored) }))
 	<-stored
 
 	distribution := &rewards.PartitionedRewardDistributionInfo{
@@ -69,13 +79,21 @@ func TestEmptyRewardPartitionClosesEpochRewardsWithoutCapitalization(t *testing.
 		NumRewardPartitionsRemaining: 1,
 	}
 	replayCtx := &ReplayCtx{Capitalization: 12345}
-	updated, parents := distributePartitionedEpochRewardsForSlot(db, nil, replayCtx, distribution, 11, 101)
+	updated, parents := distributePartitionedEpochRewardsForSlot(db, nil, []*accounts.Account{activeAccount}, replayCtx, distribution, 11, 100)
+
+	require.Equal(t, uint64(1), distribution.NumRewardPartitionsRemaining)
+	require.Equal(t, uint64(12345), replayCtx.Capitalization)
+	require.Empty(t, updated)
+	require.Empty(t, parents)
+
+	updated, parents = distributePartitionedEpochRewardsForSlot(db, nil, []*accounts.Account{activeAccount}, replayCtx, distribution, 11, 101)
 
 	require.Zero(t, distribution.NumRewardPartitionsRemaining)
 	require.Equal(t, uint64(12345), replayCtx.Capitalization)
 	require.Len(t, updated, 1)
 	require.Len(t, parents, 1)
 	require.True(t, decodeEpochRewardsForTest(t, parents[0].Data).Active)
+	require.Equal(t, active.TotalRewards, decodeEpochRewardsForTest(t, parents[0].Data).TotalRewards)
 
 	completed := decodeEpochRewardsForTest(t, updated[0].Data)
 	require.False(t, completed.Active)

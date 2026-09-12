@@ -232,7 +232,28 @@ func (bs *BlockSource) runLightbringerStream() {
 				continue
 			}
 
-			blk := block.FromLightbringerStreamMsg(resp)
+			blk, err := block.FromLightbringerStreamMsg(resp)
+			if err != nil {
+				connectionClosedOnce.Do(func() {
+					close(connectionClosed)
+				})
+				reason := fmt.Sprintf("cannot decode Lightbringer slot %d: %v; the Lightbringer/Overcast schema supports only legacy and V0 transactions, so native Turbine is required for TxV1", resp.Slot, err)
+				bs.handleLiveShredStreamClosed(reason)
+				cancelStream()
+				<-streamDone
+				_ = conn.Close()
+				bs.liveReconnectRequested.Store(false)
+				mlog.Log.Warnf("Lightbringer stream decode failed closed; reconnecting")
+
+				if bs.waitForStopOrTimeout(backoff) {
+					return
+				}
+				backoff *= 2
+				if backoff > liveMaxRetryBackoff {
+					backoff = liveMaxRetryBackoff
+				}
+				break
+			}
 			if !bs.ingestLiveShredBlock(blk) {
 				cancelStream()
 				<-streamDone

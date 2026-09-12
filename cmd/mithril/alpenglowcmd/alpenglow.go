@@ -3,6 +3,7 @@ package alpenglowcmd
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"fmt"
 	"net"
 	"strings"
@@ -55,7 +56,7 @@ func init() {
 	probeCmd.Flags().StringVar(&probeAdvertisedIP, "advertised-ip", "", "Public IP advertised in gossip (optional; otherwise discovered from entrypoint)")
 	probeCmd.Flags().Uint16Var(&probeShredVersion, "shred-version", 0, "Shred version override (0 = discover from entrypoint)")
 	probeCmd.Flags().StringVar(&probeAlpenglowBind, "alpenglow-bind-addr", "", "QUIC address for passive Alpenglow Votor messages (default: config consensus.alpenglow_observer_bind_addr or 0.0.0.0:8002)")
-	probeCmd.Flags().Int64Var(&probeMaxMessageBytes, "alpenglow-max-message-bytes", 0, "Maximum Votor QUIC stream payload size (0 = default)")
+	probeCmd.Flags().Int64Var(&probeMaxMessageBytes, "alpenglow-max-message-bytes", 0, "Maximum Votor QUIC datagram payload size (0 = default)")
 	probeCmd.Flags().StringVar(&probeIdentityKeypair, "identity-keypair", "", "Validator identity keypair to advertise in gossip (Solana keygen JSON)")
 	probeCmd.Flags().StringVar(&probeVoteKeypair, "vote-account-keypair", "", "Vote account keypair for diagnostics (Solana keygen JSON; not used for signing)")
 	probeCmd.Flags().StringVar(&probeWithdrawerKeypair, "authorized-withdrawer-keypair", "", "Authorized withdrawer keypair for diagnostics (Solana keygen JSON; not used for signing)")
@@ -92,6 +93,17 @@ func runProbe(cmd *cobra.Command, _ []string) error {
 		ctx, cancel = context.WithTimeout(ctx, opts.duration)
 		defer cancel()
 	}
+	identity, identityPubkey, err := loadProbeIdentity(opts.identityKeypair)
+	if err != nil {
+		return err
+	}
+	if len(identity) == 0 {
+		_, identity, err = ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			return fmt.Errorf("generate ephemeral probe identity: %w", err)
+		}
+		identityPubkey = solana.PublicKey(identity.Public().(ed25519.PublicKey)).String()
+	}
 
 	observer := alpenglow.NewObserver()
 	var turbineReceiver *turbine.UDPReceiver
@@ -99,6 +111,7 @@ func runProbe(cmd *cobra.Command, _ []string) error {
 		BindAddr:        opts.alpenglowBind,
 		MaxMessageBytes: opts.maxMessageBytes,
 		ShredVersion:    opts.shredVersion,
+		Identity:        identity,
 		LogInterval:     0,
 		OnMessage: func(msg alpenglow.Message) {
 			seedTurbineBlockIDFromVotor(turbineReceiver, msg)
@@ -110,10 +123,6 @@ func runProbe(cmd *cobra.Command, _ []string) error {
 	defer votorReceiver.Close()
 
 	advertisedAlpenglowAddr := advertisedAddrForListener(opts.alpenglowBind, votorReceiver.Addr())
-	identity, identityPubkey, err := loadProbeIdentity(opts.identityKeypair)
-	if err != nil {
-		return err
-	}
 	votePubkey, err := loadOptionalKeypairPubkey("vote account", opts.voteKeypair)
 	if err != nil {
 		return err
@@ -136,11 +145,32 @@ func runProbe(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
-	if identityPubkey == "" {
-		identityPubkey = solana.PublicKey(gossipClient.Pubkey()).String()
+	localIdentity := solana.PublicKey(identity.Public().(ed25519.PublicKey))
+	// A passive probe still exercises the outbound half of the protocol by
+	// establishing authenticated datagram connections. It never enqueues a
+	// message, so no vote or certificate can be emitted.
+	votorBroadcaster, err := alpenglow.NewVotorBroadcaster(alpenglow.VotorBroadcasterConfig{
+		Identity:     identity,
+		ShredVersion: opts.shredVersion,
+		Peers: func() []alpenglow.VotorPeer {
+			contacts := gossipClient.AlpenglowPeers()
+			peers := make([]alpenglow.VotorPeer, 0, len(contacts))
+			for _, contact := range contacts {
+				peerIdentity := solana.PublicKey(contact.Pubkey)
+				if peerIdentity == localIdentity {
+					continue
+				}
+				peers = append(peers, alpenglow.VotorPeer{Identity: peerIdentity, Addr: contact.AlpenglowAddr})
+			}
+			return peers
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("start passive outbound Votor handshake probe: %w", err)
 	}
-
+	defer votorBroadcaster.Close()
 	turbineReceiver = turbine.NewUDPReceiver(opts.turbineBind)
+	turbineReceiver.SetShredVersion(opts.shredVersion)
 	if err := turbineReceiver.SetRepairPeerSource(gossipClient.Identity(), gossipClient.RepairPeers); err != nil {
 		return err
 	}
@@ -188,11 +218,11 @@ func runProbe(cmd *cobra.Command, _ []string) error {
 		turbineErrsCh    = turbineReceiver.Errors()
 	)
 
-	printProbeStats(gossipClient, turbineReceiver, votorReceiver, observer, localBlocks, localTurbineErrs, latestBlock)
+	printProbeStats(gossipClient, turbineReceiver, votorReceiver, votorBroadcaster, observer, localBlocks, localTurbineErrs, latestBlock)
 	for {
 		select {
 		case <-ctx.Done():
-			printProbeStats(gossipClient, turbineReceiver, votorReceiver, observer, localBlocks, localTurbineErrs, latestBlock)
+			printProbeStats(gossipClient, turbineReceiver, votorReceiver, votorBroadcaster, observer, localBlocks, localTurbineErrs, latestBlock)
 			return nil
 		case err := <-errCh:
 			if err == nil && ctx.Err() != nil {
@@ -221,7 +251,7 @@ func runProbe(cmd *cobra.Command, _ []string) error {
 				localTurbineErrs++
 			}
 		case <-ticker.C:
-			printProbeStats(gossipClient, turbineReceiver, votorReceiver, observer, localBlocks, localTurbineErrs, latestBlock)
+			printProbeStats(gossipClient, turbineReceiver, votorReceiver, votorBroadcaster, observer, localBlocks, localTurbineErrs, latestBlock)
 		}
 	}
 }
@@ -356,6 +386,7 @@ func printProbeStats(
 	gossipClient *gossip.Client,
 	turbineReceiver *turbine.UDPReceiver,
 	votorReceiver *alpenglow.Receiver,
+	votorBroadcaster *alpenglow.VotorBroadcaster,
 	observer *alpenglow.Observer,
 	localBlocks uint64,
 	localTurbineErrs uint64,
@@ -364,17 +395,19 @@ func printProbeStats(
 	gossipStats := gossipClient.Stats()
 	turbineStats := turbineReceiver.Stats()
 	votorStats := votorReceiver.Stats()
+	votorOutStats := votorBroadcaster.Stats()
 	observerStats := observer.Snapshot()
 
 	fmt.Printf(
-		"probe stats: turbine packets=%d data=%d coding=%d recovered=%d blocks=%d local_blocks=%d active_slots=%d repair=%d/%d timeouts=%d peers=%d errs=%d parse=%d sig=%d last_packet=%s last_data_slot=%d last_block=%s | gossip rx=%d tx=%d peers=%d repair_peers=%d contacts=%d | votor conn=%d streams=%d msgs=%d votes=%d certs=%d decode_errors=%d shred_version_mismatches=%d last_msg=%s latest_vote=%d latest_cert=%d | cert_replay match/miss/pending=%d/%d/%d mature=%d pre_window=%d pending_range=%s mature_oldest=%s\n",
+		"probe stats: turbine packets=%d data=%d coding=%d recovered=%d blocks=%d local_blocks=%d active_slots=%d repair=%d/%d timeouts=%d peers=%d errs=%d parse=%d sig=%d last_packet=%s last_data_slot=%d last_block=%s | gossip rx=%d tx=%d peers=%d repair_peers=%d contacts=%d | votor_in conn=%d datagrams=%d msgs=%d votes=%d certs=%d decode_errors=%d shred_version_mismatches=%d last_msg=%s latest_vote=%d latest_cert=%d | votor_out desired=%d conn=%d pending=%d attempts=%d errors=%d | cert_replay match/miss/pending=%d/%d/%d mature=%d pre_window=%d pending_range=%s mature_oldest=%s\n",
 		turbineStats.Packets, turbineStats.DataShreds, turbineStats.CodingShreds, turbineStats.RecoveredData,
 		turbineStats.BlocksEmitted, localBlocks, turbineStats.ActiveSlots, turbineStats.Repair.Responses, turbineStats.Repair.Requests,
 		turbineStats.Repair.Timeouts, turbineStats.Repair.Peers, localTurbineErrs, turbineStats.ParseErrors, turbineStats.SignatureErrors,
 		ageLabel(turbineStats.LastPacketUnix), turbineStats.LastDataSlot, blockLabel(latestBlock),
 		gossipStats.RxPackets, gossipStats.TxPackets, gossipStats.Peers, gossipStats.RepairPeers, gossipStats.AcceptedContacts,
-		votorStats.ConnectionsAccepted, votorStats.StreamsReceived, votorStats.MessagesDecoded, votorStats.VotesDecoded, votorStats.CertificatesDecoded,
+		votorStats.ConnectionsAccepted, votorStats.DatagramsReceived, votorStats.MessagesDecoded, votorStats.VotesDecoded, votorStats.CertificatesDecoded,
 		votorStats.DecodeErrors, votorStats.ShredVersionMismatches, timeAgeLabel(votorStats.LastMessageAt), votorStats.LatestVoteSlot, votorStats.LatestCertSlot,
+		votorOutStats.DesiredPeers, votorOutStats.Connections, votorOutStats.PendingConnections, votorOutStats.ConnectionAttempts, votorOutStats.ConnectionErrors,
 		observerStats.CertificateReplayMatches, observerStats.CertificateReplayMismatches, observerStats.CertificateReplayPending,
 		observerStats.CertificateReplayMaturePending, observerStats.CertificateReplayPreWindowPending,
 		slotRangeLabel(observerStats.CertificateReplayPendingOldestSlot, observerStats.CertificateReplayPendingNewestSlot),

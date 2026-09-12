@@ -2,6 +2,7 @@ package alpenglow
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"os"
 	"reflect"
@@ -32,8 +33,15 @@ func TestEncodeMessageVoteGolden(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecodeMessage: %v", err)
 	}
-	if !reflect.DeepEqual(decoded, msg) {
-		t.Fatalf("roundtrip mismatch:\n got %#v\nwant %#v", decoded, msg)
+	wantDecoded := msg
+	wantVote := *msg.Vote
+	wantVote.Rank = 0
+	wantDecoded.Vote = &wantVote
+	if !reflect.DeepEqual(decoded, wantDecoded) {
+		t.Fatalf("roundtrip mismatch:\n got %#v\nwant %#v", decoded, wantDecoded)
+	}
+	if got[len(got)-2] != 0xfe || got[len(got)-1] != 0xca {
+		t.Fatalf("shred version is not the final little-endian u16: %x", got[len(got)-2:])
 	}
 }
 
@@ -56,6 +64,10 @@ func TestEncodeMessageCertificateGolden(t *testing.T) {
 
 	if !bytes.Equal(got, want) {
 		t.Fatalf("golden mismatch:\n got %x\nwant %x", got, want)
+	}
+	const bitmapLengthOffset = 1 + 1 + 8 + BLSSignatureSize
+	if gotLen := binary.LittleEndian.Uint64(got[bitmapLengthOffset : bitmapLengthOffset+8]); gotLen != 3 {
+		t.Fatalf("certificate bitmap wincode length = %d, want u64(3)", gotLen)
 	}
 
 	decoded, err := DecodeMessage(got)
@@ -147,9 +159,78 @@ func TestVersionedWireMessageRoundTripsAllVariants(t *testing.T) {
 		if err != nil {
 			t.Fatalf("message %d decode: %v", i, err)
 		}
-		if !reflect.DeepEqual(decoded, messages[i]) {
-			t.Fatalf("message %d roundtrip mismatch:\n got %#v\nwant %#v", i, decoded, messages[i])
+		want := messages[i]
+		if want.Vote != nil {
+			wantVote := *want.Vote
+			wantVote.Rank = 0
+			want.Vote = &wantVote
 		}
+		if !reflect.DeepEqual(decoded, want) {
+			t.Fatalf("message %d roundtrip mismatch:\n got %#v\nwant %#v", i, decoded, want)
+		}
+	}
+}
+
+func TestVoteMessageWireOmitsRank(t *testing.T) {
+	sig := testSignatureSeq(0x55)
+	withRank := NewVoteMessage(NewSkipVote(99), sig, 0xbeef)
+	withoutRank := NewVoteMessage(NewSkipVote(99), sig, 0)
+	withRank.ShredVersion = 0xcafe
+	withoutRank.ShredVersion = 0xcafe
+
+	gotWithRank, err := EncodeMessage(withRank)
+	if err != nil {
+		t.Fatalf("EncodeMessage with rank: %v", err)
+	}
+	gotWithoutRank, err := EncodeMessage(withoutRank)
+	if err != nil {
+		t.Fatalf("EncodeMessage without rank: %v", err)
+	}
+	if !bytes.Equal(gotWithRank, gotWithoutRank) {
+		t.Fatalf("rank changed v4.3 wire bytes:\nwith    %x\nwithout %x", gotWithRank, gotWithoutRank)
+	}
+
+	decoded, err := DecodeMessage(gotWithRank)
+	if err != nil {
+		t.Fatalf("DecodeMessage: %v", err)
+	}
+	if decoded.Vote == nil || decoded.Vote.Rank != 0 {
+		t.Fatalf("decoded wire rank = %v, want unset rank 0", decoded.Vote)
+	}
+
+	bareWithRank, err := EncodeVoteMessage(*withRank.Vote)
+	if err != nil {
+		t.Fatalf("EncodeVoteMessage with rank: %v", err)
+	}
+	bareWithoutRank, err := EncodeVoteMessage(*withoutRank.Vote)
+	if err != nil {
+		t.Fatalf("EncodeVoteMessage without rank: %v", err)
+	}
+	if !bytes.Equal(bareWithRank, bareWithoutRank) {
+		t.Fatalf("rank changed bare vote-message bytes:\nwith    %x\nwithout %x", bareWithRank, bareWithoutRank)
+	}
+	bareDecoded, err := DecodeVoteMessage(bareWithRank)
+	if err != nil {
+		t.Fatalf("DecodeVoteMessage: %v", err)
+	}
+	if bareDecoded.Rank != 0 {
+		t.Fatalf("decoded bare rank = %d, want unset rank 0", bareDecoded.Rank)
+	}
+}
+
+func TestDecodeMessageRejectsLegacyRankBearingVote(t *testing.T) {
+	v43 := readHexFixture(t, "testdata/agave_votor_vote_notarize.hex")
+	legacy := make([]byte, 0, len(v43)+2)
+	legacy = append(legacy, v43[:len(v43)-2]...)
+	legacy = append(legacy, 0xef, 0xbe) // legacy advertised rank 0xbeef
+	legacy = append(legacy, v43[len(v43)-2:]...)
+
+	_, err := DecodeMessage(legacy)
+	if err == nil {
+		t.Fatal("expected legacy rank-bearing Votor vote to be rejected")
+	}
+	if !strings.Contains(err.Error(), "trailing bytes") {
+		t.Fatalf("legacy vote error = %v, want trailing-byte rejection", err)
 	}
 }
 

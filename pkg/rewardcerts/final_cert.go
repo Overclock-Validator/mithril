@@ -157,6 +157,9 @@ func validateDecodedBlockFinalCertificate(
 		if _, _, err := verifier.VerifyCertificateForEpoch(validatorSet.Epoch, finalizeCert); err != nil {
 			return nil, fmt.Errorf("verify finalize final cert: %w", err)
 		}
+		if err := collectFinalCertSigners(validatorSet, notarCert, signers); err != nil {
+			return nil, err
+		}
 		if err := collectFinalCertSigners(validatorSet, finalizeCert, signers); err != nil {
 			return nil, err
 		}

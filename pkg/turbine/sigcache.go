@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	narya "github.com/Overclock-Validator/narya-ed25519/ed25519"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -15,8 +16,8 @@ import (
 // bytes to the root) resolves to an already-verified (leader, root,
 // signature) triple is authenticated by the chain alone. Signature verifies
 // drop from one per shred to one per FEC set while staying bit-for-bit
-// equivalent to verifying each: ed25519.Verify is deterministic, so a hit
-// reproduces exactly the result of re-running it on the same inputs.
+// equivalent to verifying each: strict verification is deterministic, so a
+// hit reproduces exactly the result of re-running it on the same inputs.
 // Tampered content can never hit — different bytes yield a different root,
 // hence a different key. Failures are never cached.
 type shredSigCache struct {
@@ -64,7 +65,7 @@ func (c *shredSigCache) verifyShred(s *Shred, leader solana.PublicKey) error {
 	c.mu.Unlock()
 
 	c.verifies.Add(1)
-	if !leader.Verify(root[:], s.Signature) {
+	if !narya.VerifyStrict(leader[:], root[:], s.Signature[:]) {
 		return fmt.Errorf("%w: slot %d shred %d", ErrInvalidSignature, s.Slot, s.Index)
 	}
 	c.mu.Lock()

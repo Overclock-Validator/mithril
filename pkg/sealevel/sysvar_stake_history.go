@@ -153,26 +153,31 @@ func (sh *SysvarStakeHistory) String() string {
 }
 
 func ReadStakeHistorySysvar(execCtx *ExecutionCtx) (SysvarStakeHistory, error) {
+	if execCtx != nil && execCtx.SlotCtx != nil {
+		if bankSysvars := execCtx.SlotCtx.BankSysvars(); bankSysvars != nil {
+			stakeHistory, ok := bankSysvars.StakeHistory()
+			if !ok {
+				return SysvarStakeHistory{}, InstrErrUnsupportedSysvar
+			}
+			return stakeHistory, nil
+		}
+	}
+
+	if stakeHistoryAcct, ok := localSysvarAccount(execCtx, SysvarStakeHistoryAddr); ok {
+		if stakeHistoryAcct.Lamports == 0 {
+			return SysvarStakeHistory{}, InstrErrUnsupportedSysvar
+		}
+		var stakeHistory SysvarStakeHistory
+		if err := stakeHistory.UnmarshalWithDecoder(bin.NewBinDecoder(stakeHistoryAcct.Data)); err != nil {
+			return SysvarStakeHistory{}, InstrErrUnsupportedSysvar
+		}
+		return stakeHistory, nil
+	}
+
 	if SysvarCache.StakeHistory.Sysvar != nil {
 		return *SysvarCache.StakeHistory.Sysvar, nil
 	}
-
-	accts := addrObjectForLookup(execCtx)
-	stakeHistorySysvarAcct, err := (*accts).GetAccount(&SysvarStakeHistoryAddr)
-	if err != nil {
-		return SysvarStakeHistory{}, InstrErrUnsupportedSysvar
-	}
-
-	if stakeHistorySysvarAcct.Lamports == 0 {
-		return SysvarStakeHistory{}, InstrErrUnsupportedSysvar
-	}
-
-	dec := bin.NewBinDecoder(stakeHistorySysvarAcct.Data)
-
-	var stakeHistory SysvarStakeHistory
-	stakeHistory.MustUnmarshalWithDecoder(dec)
-
-	return stakeHistory, nil
+	return SysvarStakeHistory{}, InstrErrUnsupportedSysvar
 }
 
 func WriteStakeHistorySysvar(accts *accounts.Accounts, stakeHistory SysvarStakeHistory) {

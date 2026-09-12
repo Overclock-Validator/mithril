@@ -6,7 +6,6 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/base58"
-	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	bin "github.com/gagliardetto/binary"
 )
 
@@ -97,31 +96,35 @@ func (sc *SysvarClock) MustMarshal() []byte {
 }
 
 func ReadClockSysvar(execCtx *ExecutionCtx) (SysvarClock, error) {
+	if execCtx != nil && execCtx.SlotCtx != nil {
+		if bankSysvars := execCtx.SlotCtx.BankSysvars(); bankSysvars != nil {
+			clock, ok := bankSysvars.Clock()
+			if !ok {
+				return SysvarClock{}, InstrErrUnsupportedSysvar
+			}
+			return clock, nil
+		}
+	}
+
+	if clockAccount, ok := localSysvarAccount(execCtx, SysvarClockAddr); ok {
+		if clockAccount.Lamports == 0 {
+			return SysvarClock{}, InstrErrUnsupportedSysvar
+		}
+		var clock SysvarClock
+		if err := clock.UnmarshalWithDecoder(bin.NewBinDecoder(clockAccount.Data)); err != nil {
+			return SysvarClock{}, InstrErrUnsupportedSysvar
+		}
+		return clock, nil
+	}
+
+	// The global cache remains the fallback for execution contexts that do not
+	// carry a bank-local Clock (primarily isolated native-program tests). A
+	// present bank account is authoritative even when the bank is a speculative
+	// leader bank rather than an ordered-replay bank.
 	if SysvarCache.Clock.Sysvar != nil {
 		return *SysvarCache.Clock.Sysvar, nil
 	}
-
-	accts := addrObjectForLookup(execCtx)
-	clockAccount, err := (*accts).GetAccount(&SysvarClockAddr)
-	if err != nil {
-		mlog.Log.Infof("returning at [1] for clock: %+v\n", clockAccount)
-		return SysvarClock{}, InstrErrUnsupportedSysvar
-	}
-
-	if clockAccount.Lamports == 0 {
-		mlog.Log.Infof("returning at [2] for clock: %+v\n", clockAccount)
-		return SysvarClock{}, InstrErrUnsupportedSysvar
-	}
-
-	dec := bin.NewBinDecoder(clockAccount.Data)
-	var clock SysvarClock
-	err = clock.UnmarshalWithDecoder(dec)
-	if err != nil {
-		mlog.Log.Infof("returning at [3] for clock: %+v\n", clockAccount)
-		return SysvarClock{}, InstrErrUnsupportedSysvar
-	}
-
-	return clock, nil
+	return SysvarClock{}, InstrErrUnsupportedSysvar
 }
 
 func WriteClockSysvar(accts *accounts.Accounts, clock SysvarClock) {

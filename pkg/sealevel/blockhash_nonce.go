@@ -41,7 +41,10 @@ func MaybeAdvanceNonceAccountForFailedTx(slotCtx *SlotCtx, tx *solana.Transactio
 	// we check against the latest 151 blockhashes (hence slotCtx.LatestEvictedBlockhash) instead of 150
 	// because of a (known) quirk in Agave's blockhash queue implementation.
 	// see https://github.com/anza-xyz/agave/blame/992a398fe8ea29ec4f04d081ceef7664960206f4/accounts-db/src/blockhash_queue.rs#L222
-	recentBlockhashes := SysvarCache.RecentBlockHashes.Sysvar
+	recentBlockhashes, ok := recentBlockhashesForSlot(slotCtx)
+	if !ok {
+		return solana.PublicKey{}, false
+	}
 	if recentBlockhashes.IsBlockhashAgeValid(tx.Message.RecentBlockhash) {
 		return solana.PublicKey{}, false
 	} else if tx.Message.RecentBlockhash == slotCtx.LatestEvictedBlockhash {
@@ -112,7 +115,10 @@ func IsTransactionAgeValid(tx *solana.Transaction, instrs []Instruction, slotCtx
 	// because of a (known) quirk in Agave's blockhash queue implementation.
 	// see https://github.com/anza-xyz/agave/blame/992a398fe8ea29ec4f04d081ceef7664960206f4/accounts-db/src/blockhash_queue.rs#L222
 
-	recentBlockhashes := SysvarCache.RecentBlockHashes.Sysvar
+	recentBlockhashes, ok := recentBlockhashesForSlot(slotCtx)
+	if !ok {
+		return false
+	}
 	if recentBlockhashes.IsBlockhashAgeValid(tx.Message.RecentBlockhash) || tx.Message.RecentBlockhash == slotCtx.LatestEvictedBlockhash {
 		return true
 	}
@@ -198,4 +204,35 @@ func IsTransactionAgeValid(tx *solana.Transaction, instrs []Instruction, slotCtx
 	}
 
 	return true
+}
+
+// IsRecentBlockhashTransaction distinguishes ordinary blockhash transactions
+// from durable-nonce transactions after age validation. SIMD-0290 permits an
+// invalid fee payer to become a no-op only for the former.
+func IsRecentBlockhashTransaction(tx *solana.Transaction, slotCtx *SlotCtx) bool {
+	if tx == nil || slotCtx == nil {
+		return false
+	}
+	recentBlockhashes, ok := recentBlockhashesForSlot(slotCtx)
+	if !ok {
+		return false
+	}
+	return recentBlockhashes.IsBlockhashAgeValid(tx.Message.RecentBlockhash) ||
+		tx.Message.RecentBlockhash == slotCtx.LatestEvictedBlockhash
+}
+
+func recentBlockhashesForSlot(slotCtx *SlotCtx) (SysvarRecentBlockhashes, bool) {
+	if slotCtx != nil {
+		if bankSysvars := slotCtx.BankSysvars(); bankSysvars != nil {
+			recentBlockhashes, ok := bankSysvars.RecentBlockhashes()
+			if !ok {
+				return nil, false
+			}
+			return recentBlockhashes, true
+		}
+	}
+	if SysvarCache.RecentBlockHashes.Sysvar == nil {
+		return nil, false
+	}
+	return *SysvarCache.RecentBlockHashes.Sysvar, true
 }

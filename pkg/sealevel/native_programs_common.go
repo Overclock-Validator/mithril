@@ -18,6 +18,17 @@ func resolveNativeProgramById(programId [32]byte) (func(ctx *ExecutionCtx) error
 		return SystemProgramExecute, a.SystemProgramAddrStr, nil
 	case a.VoteProgramAddr:
 		return VoteProgramExecute, a.VoteProgramAddrStr, nil
+	case a.AddressLookupTableAddr:
+		return AddressLookupTableExecute, a.AddressLookupTableProgramAddrStr, nil
+	// Config and Stake have been migrated to BPF on mainnet, so in practice
+	// their accounts are loader-owned and route through the loader instead.
+	// The caller only reaches this resolver when the program account's owner is
+	// NativeLoader, which is the pre-migration shape, so these cases exist for
+	// historical replay and cannot shadow the migrated versions.
+	case a.ConfigProgramAddr:
+		return ConfigProgramExecute, a.ConfigProgramAddrStr, nil
+	case a.StakeProgramAddr:
+		return StakeProgramExecute, a.StakeProgramAddrStr, nil
 	case a.ComputeBudgetProgramAddr:
 		return ComputeBudgetExecute, a.ComputeBudgetProgramAddrStr, nil
 	case a.BpfLoader2Addr:

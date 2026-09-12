@@ -12,6 +12,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/leaderschedule"
+	"github.com/Overclock-Validator/mithril/pkg/replay"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/filecoin-project/go-jsonrpc"
 	"github.com/gagliardetto/solana-go"
@@ -28,11 +29,74 @@ func TestParseSendTransactionConfig_Defaults(t *testing.T) {
 	assert.Nil(t, conf.minContextSlot)
 }
 
+func TestDecodeSendTransactionV1Base64AndSizeLimits(t *testing.T) {
+	tx, wire := testV1Transaction(t, 0)
+	require.Equal(t, byte(0x81), wire[0])
+
+	decoded, decodedWire, err := decodeSendTransaction(base64.StdEncoding.EncodeToString(wire), "base64")
+	require.NoError(t, err)
+	assert.Equal(t, wire, decodedWire)
+	assert.Equal(t, solana.MessageVersionV1, decoded.Message.GetVersion())
+	assert.Equal(t, tx.Message.TransactionConfig, decoded.Message.TransactionConfig)
+
+	_, maxWire := testV1Transaction(t, v1TransactionSize-len(wire))
+	require.Len(t, maxWire, v1TransactionSize)
+	_, _, err = decodeSendTransaction(base64.StdEncoding.EncodeToString(maxWire), "base64")
+	require.NoError(t, err)
+
+	tooLarge := append(append([]byte(nil), maxWire...), 0)
+	_, _, err = decodeSendTransaction(base64.StdEncoding.EncodeToString(tooLarge), "base64")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "decoded solana_transaction too large")
+}
+
+func TestDecodeSendTransactionV1RejectsTrailingBytes(t *testing.T) {
+	_, wire := testV1Transaction(t, 0)
+	wire = append(wire, 0)
+
+	_, _, err := decodeSendTransaction(base64.StdEncoding.EncodeToString(wire), "base64")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "trailing bytes")
+}
+
+func TestDecodeSendTransactionLegacyRejectsTrailingBytes(t *testing.T) {
+	_, wire := testLegacyTransaction(t)
+	wire = append(wire, 0)
+
+	_, _, err := decodeSendTransaction(base64.StdEncoding.EncodeToString(wire), "base64")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to deserialize solana_transaction")
+}
+
+func TestDecodeSendTransactionRetainsLegacyPacketLimit(t *testing.T) {
+	_, wire := testLegacyTransaction(t)
+	wire = append(wire, make([]byte, legacyTransactionSize-len(wire)+1)...)
+	require.Len(t, wire, legacyTransactionSize+1)
+
+	_, _, err := decodeSendTransaction(base64.StdEncoding.EncodeToString(wire), "base64")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "decoded solana_transaction too large")
+	assert.Contains(t, err.Error(), "max: 1232 bytes")
+}
+
+func TestDefaultTransactionSenderRejectsLargeUDPTransaction(t *testing.T) {
+	err := defaultTransactionSender(
+		context.Background(),
+		make([]byte, legacyTransactionSize+1),
+		tpuEndpoint{Addr: netip.MustParseAddrPort("127.0.0.1:1"), Transport: tpuTransportUDP},
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "UDP TPU supports at most 1232 bytes")
+}
+
 func TestSendTransaction_RejectsSanitizeFailure(t *testing.T) {
 	rpcServer := &RpcServer{}
 	tx := &solana.Transaction{
 		Message: solana.Message{
-			Header:      solana.MessageHeader{NumRequiredSignatures: 1},
+			Header: solana.MessageHeader{
+				NumRequiredSignatures:     1,
+				NumReadonlySignedAccounts: 1,
+			},
 			AccountKeys: []solana.PublicKey{{1}},
 		},
 	}
@@ -86,6 +150,21 @@ func TestSendTransaction_PreflightSignatureFailure(t *testing.T) {
 	sig, sigErr := firstSignature(tx)
 	require.NoError(t, sigErr)
 	assert.Equal(t, tx.Signatures[0], sig)
+}
+
+func TestFailureLoadedAccountsDataSizeUsesLoaderSelectedSemantics(t *testing.T) {
+	output := replay.LoadAndExecuteTransactionOutput{
+		ProcessingResult: replay.TransactionProcessingResult{
+			TransactionError: &replay.TransactionError{
+				ErrorType: replay.TransactionErrorMaxLoadedAccountsDataSizeExceeded,
+			},
+		},
+		LoadedAccountsDataSize: 1234,
+	}
+	assert.Equal(t, uint32(1234), failureLoadedAccountsDataSize(output))
+
+	output.ProcessingResult.TransactionError.ErrorType = replay.TransactionErrorBlockhashNotFound
+	assert.Zero(t, failureLoadedAccountsDataSize(output), "only fee-only load failures publish the selected size")
 }
 
 func TestSendTransaction_SkipPreflight_FansOutToUpcomingLeaders(t *testing.T) {
@@ -315,6 +394,32 @@ func testLegacyTransaction(t *testing.T) (*solana.Transaction, []byte) {
 
 	wire, err := tx.MarshalBinary()
 	require.NoError(t, err)
+	return tx, wire
+}
+
+func testV1Transaction(t *testing.T, dataLen int) (*solana.Transaction, []byte) {
+	t.Helper()
+
+	msg := solana.Message{
+		Header: solana.MessageHeader{
+			NumRequiredSignatures:       1,
+			NumReadonlyUnsignedAccounts: 1,
+		},
+		AccountKeys:       []solana.PublicKey{{0x11}, {0x22}},
+		RecentBlockhash:   solana.Hash{0x33},
+		TransactionConfig: solana.TransactionConfig{}.WithPriorityFee(7).WithComputeUnitLimit(100_000),
+		Instructions: []solana.CompiledInstruction{{
+			ProgramIDIndex: 1,
+			Accounts:       []uint16{0},
+			Data:           make([]byte, dataLen),
+		}},
+	}
+	_, err := msg.SetVersion(solana.MessageVersionV1)
+	require.NoError(t, err)
+	tx := &solana.Transaction{Message: msg, Signatures: []solana.Signature{{}}}
+	wire, err := tx.MarshalBinary()
+	require.NoError(t, err)
+	require.NoError(t, tx.Sanitize())
 	return tx, wire
 }
 

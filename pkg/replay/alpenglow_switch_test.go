@@ -11,9 +11,10 @@ import (
 
 // fakeChainQuery is a canned AlpenglowChainQuery.
 type fakeChainQuery struct {
-	certified map[uint64]alpenglow.BlockID
-	skipped   map[uint64]bool
-	version   uint64
+	certified      map[uint64]alpenglow.BlockID
+	skipped        map[uint64]bool
+	finalizedSkips map[uint64]alpenglow.BlockID
+	version        uint64
 }
 
 type trackerChainQuery struct{ *alpenglow.ChainTracker }
@@ -27,7 +28,11 @@ func (f *fakeChainQuery) CertifiedBlockAt(slot uint64) (alpenglow.BlockID, alpen
 	return alpenglow.BlockID{}, "", false
 }
 func (f *fakeChainQuery) SkipCertifiedAt(slot uint64) bool { return f.skipped[slot] }
-func (f *fakeChainQuery) ChainDecisionVersion() uint64     { return f.version }
+func (f *fakeChainQuery) FinalizedSkipAt(slot uint64) (alpenglow.BlockID, bool) {
+	via, ok := f.finalizedSkips[slot]
+	return via, ok
+}
+func (f *fakeChainQuery) ChainDecisionVersion() uint64 { return f.version }
 
 func swHash(b byte) solana.Hash { var h solana.Hash; h[0] = b; return h }
 
@@ -73,6 +78,22 @@ func TestSweepSkipDoesNotInvalidateExecutedPotentialParent(t *testing.T) {
 	s := newTestSweeper(q)
 	executed := map[uint64]solana.Hash{101: swHash(1)}
 	assert.Nil(t, s.sweep(executed, 100, 101))
+}
+
+func TestSweepFinalizedAncestrySkipInvalidatesExecutedBlock(t *testing.T) {
+	q := &fakeChainQuery{
+		finalizedSkips: map[uint64]alpenglow.BlockID{
+			101: {Slot: 104, Hash: swHash(4)},
+		},
+		version: 1,
+	}
+	s := newTestSweeper(q)
+	sw := s.sweep(map[uint64]solana.Hash{101: swHash(1)}, 100, 101)
+	require.NotNil(t, sw)
+	assert.Equal(t, uint64(101), sw.Slot)
+	assert.Equal(t, swHash(1), sw.Executed)
+	assert.True(t, sw.Skip)
+	assert.True(t, sw.Certified.IsZero())
 }
 
 func TestSweepRetainsSkipCertifiedParentSelectedByFinalizedChild(t *testing.T) {

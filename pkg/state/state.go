@@ -122,8 +122,8 @@ type MithrilState struct {
 
 	// AlpenglowEvidence persists finality mismatches/conflicts that halted promotion,
 	// so a restart cannot fold the disputed slot under delegated trust. An entry
-	// clears when its slot promotes with a matching identity; conflict entries (zero
-	// hashes) block promotion until removed by an operator.
+	// clears when its slot promotes with a matching block/skip outcome; conflict
+	// entries block promotion until removed by an operator.
 	AlpenglowEvidence []AlpenglowFinalityEvidence `json:"alpenglow_finality_evidence,omitempty"`
 
 	// ReplayDivergenceEvidence records trailing-verifier execution mismatches
@@ -222,12 +222,13 @@ type SlotHashEntry struct {
 // In rooted-durable mode it is captured as of the last rooted slot (stored in
 // MithrilState.LastRootedContext). Epoch stakes live in ComputedEpochStakes, not here.
 // AlpenglowFinalityEvidence is one persisted promotion-gate violation: an executed
-// block-id contradicting the certificate-finalized one, or a certificate conflict
-// (Conflict=true, empty hashes).
+// block-id contradicting the certificate-finalized block/skip outcome, or a
+// certificate conflict (Conflict=true, empty hashes).
 type AlpenglowFinalityEvidence struct {
 	Slot      uint64 `json:"slot"`
 	Executed  string `json:"executed,omitempty"`  // hex block-id
 	Finalized string `json:"finalized,omitempty"` // hex block-id
+	Skip      bool   `json:"skip,omitempty"`      // finalized ancestry omitted this slot
 	Conflict  bool   `json:"conflict,omitempty"`
 }
 

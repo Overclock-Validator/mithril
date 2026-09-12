@@ -11,6 +11,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/state"
 	"github.com/gagliardetto/solana-go"
 )
@@ -108,7 +109,7 @@ func getAccountsBatchSharedWithStats(ctx context.Context, source blockAccountSou
 type unrootedState interface {
 	blockAccountSource
 	Add(slot uint64, delta []*accounts.Account, bankhash []byte)
-	SetContext(slot uint64, ctx *state.ResumeContext)
+	SetContext(slot uint64, ctx *state.ResumeContext, bankSysvars ...*sealevel.BankSysvars)
 	promote(through uint64) (uint64, *state.ResumeContext, error)
 	// flush force-folds the trailing partial chunk <= through. Epoch-boundary
 	// scans use it to settle the durable AccountsDB view; graceful shutdown uses
@@ -129,7 +130,14 @@ type unrootedTail struct {
 	// contexts holds the deep-copied end-of-slot resume context per held slot,
 	// retained until promotion so the context as of the last rooted slot survives for resume.
 	contexts map[uint64]*state.ResumeContext
-	haltCap  int // halt replay if held slots exceed this (rooting stalled)
+	// bankSysvars is the in-memory-only immutable sysvar snapshot paired with
+	// each retained context. It is deliberately not part of ResumeContext (and
+	// therefore never enters persisted JSON): the durable resume path rebuilds
+	// its first snapshot from AccountsDB, while an in-loop fork unwind needs the
+	// exact surviving unrooted parent rather than the process-global cache left
+	// by the abandoned suffix.
+	bankSysvars map[uint64]*sealevel.BankSysvars
+	haltCap     int // halt replay if held slots exceed this (rooting stalled)
 
 	transactionStatusCheckpointHooks TransactionStatusCheckpointHooks
 }
@@ -146,6 +154,7 @@ func newUnrootedTail(durable blockAccountSource, committer batchCommitter, haltC
 		batchSlots:  batchSlots,
 		stakeIdxDir: stakeIdxDir,
 		contexts:    make(map[uint64]*state.ResumeContext),
+		bankSysvars: make(map[uint64]*sealevel.BankSysvars),
 		haltCap:     haltCap,
 	}
 }
@@ -284,11 +293,19 @@ func (t *unrootedTail) Add(slot uint64, delta []*accounts.Account, bankhash []by
 	t.bankhashes[slot] = slotBankhash
 }
 
-// SetContext attaches a held slot's end-of-slot resume context. ctx MUST be
-// deep-copied (no pointers into the global SysvarCache); retained until promotion.
-func (t *unrootedTail) SetContext(slot uint64, ctx *state.ResumeContext) {
+// SetContext attaches a held slot's end-of-slot resume context and, when
+// supplied, its immutable bank-local sysvar snapshot. ctx MUST be deep-copied
+// (no pointers into the global SysvarCache); both values are retained until
+// promotion. The variadic snapshot preserves compatibility for test/bootstrap
+// callers that only exercise durable context persistence; such entries are
+// intentionally ineligible for an in-loop fork unwind.
+func (t *unrootedTail) SetContext(slot uint64, ctx *state.ResumeContext, bankSysvars ...*sealevel.BankSysvars) {
 	if ctx != nil {
 		t.contexts[slot] = ctx
+		delete(t.bankSysvars, slot)
+		if len(bankSysvars) > 0 && bankSysvars[0] != nil {
+			t.bankSysvars[slot] = bankSysvars[0]
+		}
 	}
 }
 
@@ -314,6 +331,11 @@ func (t *unrootedTail) promoteChunked(through uint64, force bool) (uint64, *stat
 	for s := range t.contexts {
 		if s <= promotedThrough {
 			delete(t.contexts, s)
+		}
+	}
+	for s := range t.bankSysvars {
+		if s <= promotedThrough {
+			delete(t.bankSysvars, s)
 		}
 	}
 	return promotedThrough, ctx, err
@@ -482,6 +504,11 @@ func (t *unrootedTail) applyFoldJob(job *foldJob) *state.ResumeContext {
 			delete(t.contexts, s)
 		}
 	}
+	for s := range t.bankSysvars {
+		if s <= job.through {
+			delete(t.bankSysvars, s)
+		}
+	}
 	return job.ctx
 }
 
@@ -561,11 +588,11 @@ func (p *asyncPromoter) stop() {
 }
 
 // unwind drops all held slots >= fromSlot (the execute-on-receipt fork
-// switch) and returns the retained resume context of the last surviving slot
-// so the replay loop can rebuild execution state and re-run the certified
-// version. Returns nil when no context for fromSlot-1 is retained (caller
-// falls back to the rooted-checkpoint re-replay).
-func (t *unrootedTail) unwind(fromSlot uint64) *state.ResumeContext {
+// switch) and returns the retained resume context and immutable bank-sysvar
+// snapshot of the last surviving executed slot so the replay loop can rebuild
+// execution state and re-run the certified version. Either result may be nil;
+// the caller validates the pair and falls back to rooted-checkpoint re-replay.
+func (t *unrootedTail) unwind(fromSlot uint64) (*state.ResumeContext, *sealevel.BankSysvars) {
 	t.overlay.EvictFrom(fromSlot)
 	// Branch-scoped side effect: stake pubkeys enqueued by the evicted slots
 	// must never reach the durable index — drop them with the state.
@@ -578,13 +605,20 @@ func (t *unrootedTail) unwind(fromSlot uint64) *state.ResumeContext {
 		}
 	}
 	var ctx *state.ResumeContext
+	var ctxSlot uint64
 	for s, c := range t.contexts {
 		if s >= fromSlot {
 			delete(t.contexts, s)
 			continue
 		}
-		if ctx == nil || s > ctx.Slot {
+		if ctx == nil || s > ctxSlot {
 			ctx = c
+			ctxSlot = s
+		}
+	}
+	for s := range t.bankSysvars {
+		if s >= fromSlot {
+			delete(t.bankSysvars, s)
 		}
 	}
 	// ctx is the highest retained context with slot < fromSlot: the ACTUAL
@@ -593,7 +627,10 @@ func (t *unrootedTail) unwind(fromSlot uint64) *state.ResumeContext {
 	// slots call SetContext), so the last executed slot IS the parent bank of the
 	// certified block at fromSlot. Returning nil (parent already durably folded,
 	// or nothing retained) routes the caller to the rooted-checkpoint fallback.
-	return ctx
+	if ctx == nil {
+		return nil, nil
+	}
+	return ctx, t.bankSysvars[ctxSlot]
 }
 
 // OverCap reports whether the unrooted tail has grown past the halt cap, i.e.

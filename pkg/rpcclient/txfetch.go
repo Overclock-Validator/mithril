@@ -8,8 +8,10 @@ import (
 )
 
 func (fetcher *RpcClient) GetTransactionMeta(sig solana.Signature) (*rpc.TransactionMeta, error) {
+	maxSupportedTxVer := rpc.MaxSupportedTransactionVersion1
 	tx, err := fetcher.client.GetTransaction(context.TODO(), sig, &rpc.GetTransactionOpts{
-		Encoding: solana.EncodingJSON,
+		Encoding:                       solana.EncodingJSON,
+		MaxSupportedTransactionVersion: &maxSupportedTxVer,
 	})
 
 	if err != nil {

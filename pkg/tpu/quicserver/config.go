@@ -10,7 +10,7 @@ import (
 const (
 	ALPNTPUProtocolID = "solana-tpu"
 
-	PacketDataSize = 1232
+	PacketDataSize = packet.DataSize
 
 	DefaultMaxConnections       = 1024
 	DefaultMaxStreamsPerConn    = 16
@@ -36,8 +36,8 @@ type ServerConfig struct {
 
 	// Ingress receives completed transaction packets for the TPU pipeline.
 	// When nil, packets are released after read.
-	Ingress       chan<- packet.Packet
-	IngressStats  *pipeline.IngressStats
+	Ingress      chan<- packet.Packet
+	IngressStats *pipeline.IngressStats
 }
 
 func DefaultServerConfig() ServerConfig {

@@ -22,6 +22,9 @@ func newClockSlotCtx(t *testing.T, clock sealevel.SysvarClock) *sealevel.SlotCtx
 	}
 	slotCtx := &sealevel.SlotCtx{Accounts: mem}
 	require.NoError(t, slotCtx.SetAccount(sealevel.SysvarClockAddr, acct))
+	bankSysvars, err := sealevel.NewBankSysvars(slotCtx.Slot, acct)
+	require.NoError(t, err)
+	require.NoError(t, slotCtx.PublishBankSysvars(bankSysvars))
 	return slotCtx
 }
 
@@ -134,6 +137,9 @@ func TestApplyAlpenglowFooterClockLocalDoesNotPublishSpeculativeClock(t *testing
 	require.NoError(t, candidate.UnmarshalWithDecoder(bin.NewBinDecoder(stored.Data)))
 	require.Equal(t, blk.Slot, candidate.Slot)
 	require.Equal(t, int64(1779999999), candidate.UnixTimestamp)
+	cached, err := sealevel.ReadClockSysvar(&sealevel.ExecutionCtx{SlotCtx: slotCtx})
+	require.NoError(t, err)
+	require.Equal(t, candidate, cached)
 
 	// Ordered replay still sees the genuine parent Clock until it accepts the
 	// produced block itself.

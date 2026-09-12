@@ -12,6 +12,7 @@ import (
 	gossipclient "github.com/Overclock-Validator/mithril/pkg/gossip"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/turbine"
+	"github.com/gagliardetto/solana-go"
 )
 
 // TurbinePrewarm collects live turbine blocks BEFORE replay exists. The
@@ -63,6 +64,11 @@ type TurbinePrewarmConfig struct {
 	AlpenglowAddr    string
 	Identity         ed25519.PrivateKey
 	LeaderForSlot    turbine.LeaderForSlotFunc
+	StakesForSlot    func(slot uint64) map[solana.PublicKey]uint64
+	EpochForSlot     func(slot uint64) uint64
+	RootSlot         func() uint64
+	UseChaCha8       bool
+	DedupAddrs       bool
 	FloorSlot        uint64 // resume frontier: spool floor and assembler retention floor
 	MaxSpoolBlocks   int
 	// ShredSpoolDir: shared on-disk shred spool. Everything the prewarm
@@ -107,8 +113,23 @@ func StartTurbinePrewarm(cfg TurbinePrewarmConfig) (*TurbinePrewarm, error) {
 	}
 
 	receiver := turbine.NewUDPReceiver(cfg.BindAddr)
+	receiver.SetShredVersion(cfg.ShredVersion)
 	if cfg.LeaderForSlot != nil {
 		receiver.SetLeaderForSlot(cfg.LeaderForSlot)
+	}
+	if cfg.StakesForSlot != nil {
+		if err := receiver.SetRetransmit(turbine.RetransmitConfig{
+			Identity:     client.Identity(),
+			Peers:        client,
+			Stakes:       cfg.StakesForSlot,
+			EpochForSlot: cfg.EpochForSlot,
+			RootSlot:     cfg.RootSlot,
+			UseChaCha8:   cfg.UseChaCha8,
+			DedupAddrs:   cfg.DedupAddrs,
+		}); err != nil {
+			cancel()
+			return nil, fmt.Errorf("prewarm retransmit setup: %w", err)
+		}
 	}
 	if err := receiver.SetRepairPeerSource(client.Identity(), client.RepairPeers); err != nil {
 		cancel()

@@ -5,8 +5,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Overclock-Validator/mithril/pkg/fees"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
+	"github.com/gagliardetto/solana-go"
 )
 
 func applySuccessfulTransactionState(slotCtx *sealevel.SlotCtx, execCtx *sealevel.ExecutionCtx, executionResult *TransactionExecutionResult) error {
@@ -63,4 +65,28 @@ func ApplySuccessfulTransaction(slotCtx *sealevel.SlotCtx, output LoadAndExecute
 		return fmt.Errorf("cannot apply failed transaction: %s", output.ProcessingResult.TransactionError.ErrorType.String())
 	}
 	return applySuccessfulTransactionState(slotCtx, output.ExecCtx, output.ExecutionResult)
+}
+
+// ApplyFeesOnlyTransaction commits the fee-payer and durable-nonce rollback
+// state for an account-load failure that Agave treats as processable. The
+// transaction itself remains failed, but must be recorded in the block.
+func ApplyFeesOnlyTransaction(slotCtx *sealevel.SlotCtx, tx *solana.Transaction, output LoadAndExecuteTransactionOutput) (*fees.TxFeeInfo, error) {
+	txErr := output.ProcessingResult.TransactionError
+	if txErr == nil {
+		return nil, fmt.Errorf("fees-only transaction has no transaction error")
+	}
+	switch txErr.ErrorType {
+	case TransactionErrorMaxLoadedAccountsDataSizeExceeded,
+		TransactionErrorInvalidProgramForExecution,
+		TransactionErrorProgramAccountNotFound:
+	default:
+		return nil, fmt.Errorf("transaction error %s is not a processable fees-only load failure", txErr.ErrorType.String())
+	}
+	if slotCtx == nil || tx == nil || output.ComputeBudgetLimits == nil || output.FeeInfo == nil {
+		return nil, fmt.Errorf("fees-only transaction is missing required processing state")
+	}
+
+	// The load error is the transaction's recorded status, not a failure to
+	// publish its fee/nonce effects, so do not return it as an apply error.
+	return handleFailedTx(slotCtx, tx, output.Instrs, output.ComputeBudgetLimits, nil, nil)
 }

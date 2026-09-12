@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+
+	narya "github.com/Overclock-Validator/narya-ed25519/ed25519"
 )
 
 var errUnsupportedCRDSValue = errors.New("unsupported CRDS value")
@@ -50,11 +52,11 @@ func newPong(ping Ping, identity ed25519.PrivateKey) (Pong, error) {
 }
 
 func (p Ping) Verify() bool {
-	return ed25519.Verify(ed25519.PublicKey(p.From[:]), p.Token[:], p.Signature[:])
+	return narya.VerifyStrict(p.From[:], p.Token[:], p.Signature[:])
 }
 
 func (p Pong) Verify() bool {
-	return ed25519.Verify(ed25519.PublicKey(p.From[:]), p.Hash[:], p.Signature[:])
+	return narya.VerifyStrict(p.From[:], p.Hash[:], p.Signature[:])
 }
 
 func encodePingMessage(ping Ping) []byte {

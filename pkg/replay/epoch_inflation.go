@@ -100,6 +100,37 @@ func (s EpochInflationAccountState) epochState(epoch uint64) (EpochInflationStat
 	return EpochInflationState{}, false
 }
 
+// partitionedRewardsBudget selects the inflation ceiling Agave records in the
+// EpochRewards sysvar and uses as PointValue.rewards.  Once Alpenglow is
+// active, the rewarded epoch's ceiling was fixed at that epoch's start and is
+// persisted in the vote-reward metadata account.  Recomputing it from the
+// capitalization at the following boundary is not equivalent: VAT burns and
+// other capitalization changes have happened in the meantime.
+func partitionedRewardsBudget(
+	slotCtx *sealevel.SlotCtx,
+	epochSchedule *sealevel.SysvarEpochSchedule,
+	f *features.Features,
+	rewardedEpoch, calculatedFallback uint64,
+) (uint64, error) {
+	migrationSlot, alpenglowActive := f.ActivationSlot(features.Alpenglow)
+	if !alpenglowActive || rewardedEpoch < epochSchedule.GetEpoch(migrationSlot) {
+		return calculatedFallback, nil
+	}
+
+	state, err := loadEpochInflationAccountStateForReplay(slotCtx)
+	if err != nil {
+		return 0, fmt.Errorf("load recorded inflation budget for rewarded epoch %d: %w", rewardedEpoch, err)
+	}
+	inflation, ok := state.epochState(rewardedEpoch)
+	if !ok {
+		return 0, fmt.Errorf(
+			"vote reward account has no inflation budget for rewarded epoch %d (current=%d)",
+			rewardedEpoch, state.Current.Epoch,
+		)
+	}
+	return inflation.MaxPossibleValidatorReward, nil
+}
+
 func calculateEpochInflationRewards(
 	epochSchedule *sealevel.SysvarEpochSchedule,
 	inflation *rewards.Inflation,

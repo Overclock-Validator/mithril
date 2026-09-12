@@ -10,6 +10,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/gagliardetto/solana-go"
+	"github.com/stretchr/testify/require"
 )
 
 func verifierTestBlock(count int) *block.Block {
@@ -126,5 +127,37 @@ func TestTransactionVerifierRejectsNilAtDeterministicIndex(t *testing.T) {
 	err := verifier.verifyBlock(blk)
 	if got, want := fmt.Sprint(err), "slot 77 transaction 2 is nil"; got != want {
 		t.Fatalf("nil transaction error = %q, want %q", got, want)
+	}
+}
+
+// Every transaction in a block must be verified and joined, whatever the count.
+// Workers group transactions, so a count that divides badly into groups must
+// not leave a remainder waiting for company: verifyBlockContext joins each
+// wave with done.Wait(), and a stranded job would hang it forever.
+//
+// A counting verifier is injected so the assertion is on what was actually
+// verified, not merely on returning without error.
+func TestTransactionVerifierVerifiesEveryTransactionForAwkwardCounts(t *testing.T) {
+	for _, count := range []int{1, 3, 7, 8, 9, 33, 65} {
+		t.Run(fmt.Sprintf("count=%d", count), func(t *testing.T) {
+			var seen atomic.Int32
+			verifier := newTransactionVerifier(4, 8, func(*solana.Transaction) error {
+				seen.Add(1)
+				return nil
+			})
+			defer verifier.closeAndWait()
+
+			done := make(chan error, 1)
+			go func() { done <- verifier.verifyBlock(verifierTestBlock(count)) }()
+
+			select {
+			case err := <-done:
+				require.NoError(t, err)
+			case <-time.After(30 * time.Second):
+				t.Fatalf("count=%d: transactions stranded in an unfinished group", count)
+			}
+			require.Equal(t, int32(count), seen.Load(),
+				"count=%d: every transaction must be verified exactly once", count)
+		})
 	}
 }

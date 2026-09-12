@@ -219,7 +219,7 @@ func newVMProgramExecCtxAndInstrAccts(fixture *InstrFixture) (*sealevelPkg.Execu
 		Log:                &sealevelPkg.LogRecorder{},
 	}
 	execCtx.Accounts = accounts.NewMemAccounts()
-	execCtx.Features = *parsePBFeatures(input.GetEpochContext().GetFeatures())
+	execCtx.Features = *parsePBFeatures(input.GetFeatures())
 
 	withoutConformanceStdout(func() {
 		configureSysvarsFromFixture(&execCtx, fixture)
@@ -237,10 +237,10 @@ func newVMProgramExecCtxAndInstrAccts(fixture *InstrFixture) (*sealevelPkg.Execu
 		}
 	}
 
-	slot := input.GetSlotContext().GetSlot()
-	if slot == 0 {
-		slot = ^uint64(0)
-	}
+	// protosol v5.4.0 removed slot_context from InstrContext, so the corpus no
+	// longer pins a slot for the instruction harness. Keep the sentinel the
+	// previous code already used whenever the fixture supplied none.
+	slot := ^uint64(0)
 	execCtx.SlotCtx = &sealevelPkg.SlotCtx{
 		Accounts:      slotAccounts,
 		ParentAccts:   accounts.NewMemAccounts(),

@@ -38,9 +38,7 @@ func bpfLoaderTestAccountStateChangesMatch(t *testing.T, execCtx *sealevel.Execu
 				if fixtureModifiedAcct.Executable != mithrilModifiedAcct.Executable {
 					return false
 				}
-				if fixtureModifiedAcct.RentEpoch != mithrilModifiedAcct.RentEpoch {
-					return false
-				}
+				// AcctState dropped rent_epoch in protosol v5.4.0.
 				if solana.PublicKeyFromBytes(fixtureModifiedAcct.Owner[:]) != solana.PublicKeyFromBytes(mithrilModifiedAcct.Owner[:]) {
 					return false
 				}

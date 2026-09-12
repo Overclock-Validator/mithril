@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"runtime/trace"
 	"strings"
 	"sync"
@@ -19,6 +20,8 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
+	"github.com/Overclock-Validator/mithril/pkg/sigverify"
+	"github.com/Overclock-Validator/mithril/pkg/statsd"
 	"github.com/Overclock-Validator/mithril/pkg/txverify"
 	"github.com/Overclock-Validator/mithril/pkg/util"
 	bin "github.com/gagliardetto/binary"
@@ -45,6 +48,7 @@ var (
 	TxErrInvalidProgramForExecution        = errors.New("TxErrInvalidProgramForExecution")
 	TxErrInvalidBlockhash                  = errors.New("TxErrInvalidBlockhash")
 	TxErrSanitizeFailure                   = errors.New("TxErrSanitizeFailure")
+	TxErrUnsupportedVersion                = errors.New("TxErrUnsupportedVersion")
 )
 
 const (
@@ -58,6 +62,20 @@ func (discardLogger) Log(string) {}
 
 func newExecCtx(slotCtx *sealevel.SlotCtx, transactionAccts *sealevel.TransactionAccounts, computeBudgetLimits *sealevel.ComputeBudgetLimits, log sealevel.Logger) *sealevel.ExecutionCtx {
 	txCtx := sealevel.NewTransactionCtx(*transactionAccts, maxStackCapacity, maxInstrTraceCapacity)
+	if bankSysvars := slotCtx.BankSysvars(); bankSysvars != nil {
+		bankRent, ok := bankSysvars.Rent()
+		if !ok {
+			// Production bank construction validates the complete snapshot once
+			// before entering the transaction loop. Do not silently execute with a
+			// zero Rent value if an isolated caller violates that invariant.
+			panic(fmt.Sprintf("bank sysvar snapshot for slot %d is missing Rent", slotCtx.Slot))
+		}
+		txCtx.Rent = bankRent
+	} else if sealevel.SysvarCache.Rent.Sysvar != nil {
+		// Compatibility for isolated legacy test/simulation contexts. Production
+		// replay and leader banks always publish a complete bank snapshot.
+		txCtx.Rent = *sealevel.SysvarCache.Rent.Sysvar
+	}
 	execCtx := &sealevel.ExecutionCtx{Log: log, TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeter(uint64(computeBudgetLimits.ComputeUnitLimit)), PrevLamportsPerSignature: slotCtx.FeeRateGovernor.PrevLamportsPerSignature}
 
 	execCtx.Features = *slotCtx.Features
@@ -356,29 +374,55 @@ func handleFailedTx(slotCtx *sealevel.SlotCtx, tx *solana.Transaction, instrs []
 		}()
 	}
 
+	if slotCtx == nil || tx == nil || len(tx.Message.AccountKeys) == 0 || computeBudgetLimits == nil {
+		return nil, fees.ErrFeePayerNotFound
+	}
 	txFeeInfo := fees.CalculateTxFees(tx, instrs, computeBudgetLimits, slotCtx.Features)
 
 	payerAcctKey := tx.Message.AccountKeys[0]
 	p, err := slotCtx.GetAccount(payerAcctKey)
 	if err != nil {
-		panic(fmt.Sprintf("unable to get slot account to update payer acct state after failed tx: %s", err))
+		if slotCtx.UnrootedRead == nil && slotCtx.AccountsDb == nil {
+			if recordMetrics {
+				metrics.GlobalBlockReplay.TxFailedPublicationPreparation.AddTimingSince(preparationStart)
+			}
+			return nil, fees.ErrFeePayerNotFound
+		}
+		p, err = slotCtx.GetAccountFromAccountsDb(payerAcctKey)
+		if err != nil {
+			if recordMetrics {
+				metrics.GlobalBlockReplay.TxFailedPublicationPreparation.AddTimingSince(preparationStart)
+			}
+			return nil, fees.ErrFeePayerNotFound
+		}
 	}
 
-	if txFeeInfo.TotalFee > p.Lamports {
+	rentSysvar := fees.RentForSlot(slotCtx)
+	if err := fees.ValidateFeePayerWithFeatures(p, txFeeInfo.TotalFee, rentSysvar, slotCtx.Features); err != nil {
 		if recordMetrics {
 			metrics.GlobalBlockReplay.TxFailedPublicationPreparation.AddTimingSince(preparationStart)
 		}
-		return nil, sealevel.InstrErrInsufficientFunds
+		return nil, err
 	}
 
 	if recordMetrics {
 		metrics.GlobalBlockReplay.TxFailedPublicationPreparation.AddTimingSince(preparationStart)
+	}
+	originalRentEpoch := p.RentEpoch
+	if p.RentEpoch != math.MaxUint64 && rentSysvar.IsExempt(p.Lamports, uint64(len(p.Data))) {
+		p.RentEpoch = math.MaxUint64
 	}
 	var payerStart time.Time
 	if recordMetrics {
 		payerStart = time.Now()
 	}
 	p.Lamports -= txFeeInfo.TotalFee
+	// Agave's ordinary-blockhash rollback preserves the payer's originally
+	// loaded rent epoch. Durable-nonce rollback intentionally keeps the
+	// normalized epoch alongside the advanced nonce state.
+	if sealevel.IsRecentBlockhashTransaction(tx, slotCtx) {
+		p.RentEpoch = originalRentEpoch
+	}
 	err = slotCtx.SetAccount(payerAcctKey, p)
 	if err != nil {
 		panic(fmt.Sprintf("unable to set slot account to update state of payer acct after failed t: %s", err))
@@ -491,25 +535,79 @@ func (s *sigverifySnapshot) diagContext() string {
 		s.staticKeys, s.totalKeys, s.lookups, firstSigners, firstKeys)
 }
 
+// verifySignatures verifies one snapshot. It is the single-job spelling of
+// verifySignatureBatch, so the arity check, the failure diagnostics, and the
+// halt semantics have exactly one implementation.
 func verifySignatures(snapshot *sigverifySnapshot, sigverifyWg *sync.WaitGroup) {
-	defer sigverifyWg.Done()
-	start := time.Now()
+	var batch sigverify.Batch
+	verifySignatureBatch([]sigverifyJob{{snapshot: snapshot, wg: sigverifyWg}}, &batch)
+}
 
-	if len(snapshot.signers) != len(snapshot.signatures) {
-		mlog.Log.Errorf("sigverify context: %s", snapshot.diagContext())
-		panic(fmt.Sprintf("error - tx %s (version = %d) had mismatched signers/signatures: got %d signers, but %d signatures",
-			snapshot.txSigString(), snapshot.version, len(snapshot.signers), len(snapshot.signatures)))
-	}
-
-	for i, sig := range snapshot.signatures {
-		if snapshot.signers[i].Verify(snapshot.message, sig) {
-			continue
+// verifySignatureBatch verifies every signature across a drained group of jobs
+// in one call, then attributes the result back to the transaction it came from.
+//
+// Grouping is what makes the vectorized backend worth having, and it is safe
+// here because the backend reports a verdict PER SIGNATURE rather than a single
+// batch-wide answer. The failing signer is therefore identified exactly as
+// before, with no re-verification and no loss of diagnostic precision — which
+// matters, because an invalid signature is a deliberate process halt and the
+// panic message is the only forensic artifact.
+//
+// batch is caller-owned scratch so a pool worker reuses it across groups.
+func verifySignatureBatch(group []sigverifyJob, batch *sigverify.Batch) {
+	// Release every job's WaitGroup even if verification panics, matching the
+	// deferred Done() this replaced. A panic halts the process so nothing
+	// observes the difference today; the defer keeps the contract honest
+	// against future edits that might recover.
+	defer func() {
+		for _, job := range group {
+			job.wg.Done()
 		}
-		mlog.Log.Errorf("sigverify context: %s", snapshot.diagContext())
-		panic(fmt.Sprintf("error - tx %s (version = %d) had an invalid signature: invalid signature by %s",
-			snapshot.txSigString(), snapshot.version, snapshot.signers[i]))
+	}()
+
+	start := time.Now()
+	batch.Reset()
+	for _, job := range group {
+		snapshot := job.snapshot
+		if len(snapshot.signers) != len(snapshot.signatures) {
+			mlog.Log.Errorf("sigverify context: %s", snapshot.diagContext())
+			panic(fmt.Sprintf("error - tx %s (version = %d) had mismatched signers/signatures: got %d signers, but %d signatures",
+				snapshot.txSigString(), snapshot.version, len(snapshot.signers), len(snapshot.signatures)))
+		}
+		for i := range snapshot.signatures {
+			batch.Add((*[32]byte)(&snapshot.signers[i]), snapshot.message, snapshot.signatures[i][:])
+		}
 	}
-	metrics.GlobalBlockReplay.Sigverify.AddTimingSince(start)
+
+	if !batch.Verify() {
+		lane := 0
+		for _, job := range group {
+			snapshot := job.snapshot
+			for i := range snapshot.signatures {
+				if !batch.OK(lane) {
+					mlog.Log.Errorf("sigverify context: %s", snapshot.diagContext())
+					panic(fmt.Sprintf("error - tx %s (version = %d) had an invalid signature: invalid signature by %s",
+						snapshot.txSigString(), snapshot.version, snapshot.signers[i]))
+				}
+				lane++
+			}
+		}
+	}
+
+	// One observation per group. SumNanoseconds keeps its documented meaning —
+	// total asynchronous worker time spent verifying — while Count now counts
+	// groups rather than transactions, so a mean derived from these two is a
+	// mean per group. The group-width metric below carries the missing factor,
+	// so the pair stays interpretable.
+	elapsed := time.Since(start)
+	metrics.GlobalBlockReplay.Sigverify.AddTiming(elapsed)
+
+	// Replay sigverify had no Prometheus series at all before this. Width is
+	// the one worth watching: it is the difference between paying for a vector
+	// group and using it, and no backend setting can compensate for work that
+	// arrives too thinly to fill one.
+	_ = statsd.Duration(statsd.ReplaySigverifyGroup, elapsed, nil)
+	statsd.Count(statsd.ReplaySigverifyGroupSignatures, int64(batch.Len()), nil)
 }
 
 func processTransactionComputeUnits(execCtx *sealevel.ExecutionCtx) uint64 {
@@ -627,10 +725,23 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 				}
 			}
 		}
+		if output.ProcessedAsNoOp {
+			var computeUnits uint64
+			if computeBudgetLimits != nil {
+				computeUnits = uint64(computeBudgetLimits.ComputeUnitLimit)
+			}
+			return output.FeeInfo, computeUnits, txErr.InstructionError
+		}
 
 		switch txErr.ErrorType {
 		case TransactionErrorSanitizeFailure:
-			return nil, processTransactionComputeUnits(execCtx), txErr.InstructionError
+			if txErr.InstructionError != nil {
+				return nil, processTransactionComputeUnits(execCtx), txErr.InstructionError
+			}
+			return nil, processTransactionComputeUnits(execCtx), TxErrSanitizeFailure
+
+		case TransactionErrorUnsupportedVersion:
+			return nil, processTransactionComputeUnits(execCtx), TxErrUnsupportedVersion
 
 		case TransactionErrorBlockhashNotFound:
 			return nil, processTransactionComputeUnits(execCtx), TxErrInvalidBlockhash
@@ -642,8 +753,9 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 			return txFeeInfo, processTransactionComputeUnits(execCtx), err
 
 		case TransactionErrorInsufficientFundsForFee:
-			// CalculateAndDeductTxFees failed - return fee info with nil error (matches original behavior)
-			return output.FeeInfo, processTransactionComputeUnits(execCtx), nil
+			// A fee-payer validation failure is unprocessable unless SIMD-0290
+			// converted it to the no-op result handled above.
+			return nil, processTransactionComputeUnits(execCtx), txErr.InstructionError
 
 		case TransactionErrorInstructionError:
 			txFeeInfo, err := handleFailedTx(slotCtx, tx, instrs, computeBudgetLimits, txErr.InstructionError, nil)

@@ -200,6 +200,9 @@ func asyncTestTail(committer batchCommitter, slots ...uint64) *unrootedTail {
 func TestAsyncFoldBuildRunApply(t *testing.T) {
 	fc := &fakeCommitter{durable: accounts.NewMemAccounts()}
 	tail := asyncTestTail(fc, 5, 6, 7)
+	for _, slot := range []uint64{5, 6, 7} {
+		tail.SetContext(slot, tail.contexts[slot], testUnwindBankSysvars(t, slot, slot*10))
+	}
 
 	job, err := tail.buildFoldJob(7, false)
 	require.NoError(t, err)
@@ -221,6 +224,9 @@ func TestAsyncFoldBuildRunApply(t *testing.T) {
 	assert.Empty(t, tail.bankhashes[uint64(5)])
 	_, has5 := tail.contexts[5]
 	assert.False(t, has5, "contexts pruned through the fold")
+	assert.NotContains(t, tail.bankSysvars, uint64(5), "bank sysvars pruned through the fold")
+	assert.NotContains(t, tail.bankSysvars, uint64(6), "chunk-top bank sysvars pruned through the fold")
+	assert.Contains(t, tail.bankSysvars, uint64(7), "unfolded bank sysvars remain retained")
 }
 
 // A partial trailing chunk builds only under force (the shutdown flush).
@@ -284,6 +290,107 @@ func TestAsyncPromoterOffLoopAndDrain(t *testing.T) {
 	ctx := tail.applyFoldJob(res.job)
 	require.NotNil(t, ctx)
 	assert.Equal(t, 1, tail.overlay.HeldSlots())
+}
+
+func TestFoldCapacityBackpressureDrainsOneAdmittedFold(t *testing.T) {
+	fc := &fakeCommitter{durable: accounts.NewMemAccounts()}
+	tail := newUnrootedTail(&fakeDurable{}, fc, 2, 2, "")
+	for slot := uint64(1); slot <= 2; slot++ {
+		tail.Add(slot, []*accounts.Account{testAccount(byte(slot), slot)}, testHashBytes(byte(slot)))
+		tail.SetContext(slot, &state.ResumeContext{Slot: slot})
+	}
+	job, err := tail.buildFoldJob(2, false)
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	p := newAsyncPromoter(fc)
+	defer p.stop()
+	p.enqueue(job)
+
+	// Replay completes one more slot while the admitted fold is running. The
+	// cap handler must wait for that fold, apply it, and retain a recoverable tip.
+	tail.Add(3, []*accounts.Account{testAccount(3, 3)}, testHashBytes(3))
+	tail.SetContext(3, &state.ResumeContext{Slot: 3})
+	require.True(t, tail.OverCap())
+	stillOver := settleInFlightFoldAtCapacity(tail, p, 3, func(res *foldResult) {
+		if res != nil && res.err == nil {
+			tail.applyFoldJob(res.job)
+		}
+	})
+	require.False(t, stillOver)
+	require.False(t, p.inFlight)
+	require.Equal(t, 1, tail.overlay.HeldSlots())
+	require.NotNil(t, tail.contexts[3], "cap-crossing tip context was lost")
+
+	// The retained tip remains force-foldable on shutdown; backpressure did not
+	// merely hide a context-less slot by reducing HeldSlots.
+	promoted, rootedCtx, err := tail.flush(3)
+	require.NoError(t, err)
+	require.Equal(t, uint64(3), promoted)
+	require.NotNil(t, rootedCtx)
+	require.Equal(t, uint64(3), rootedCtx.Slot)
+}
+
+func TestFoldCapacityBackpressureFailsClosed(t *testing.T) {
+	t.Run("in-flight fold fails", func(t *testing.T) {
+		fc := &fakeCommitter{durable: accounts.NewMemAccounts(), failOn: 1}
+		tail := newUnrootedTail(&fakeDurable{}, fc, 2, 2, "")
+		for slot := uint64(1); slot <= 3; slot++ {
+			tail.Add(slot, []*accounts.Account{testAccount(byte(slot), slot)}, testHashBytes(byte(slot)))
+			tail.SetContext(slot, &state.ResumeContext{Slot: slot})
+		}
+		job, err := tail.buildFoldJob(3, false)
+		require.NoError(t, err)
+		p := newAsyncPromoter(fc)
+		defer p.stop()
+		p.enqueue(job)
+
+		stillOver := settleInFlightFoldAtCapacity(tail, p, 3, func(res *foldResult) {
+			if res != nil && res.err == nil {
+				tail.applyFoldJob(res.job)
+			}
+		})
+		require.True(t, stillOver, "failed fold must leave the cap halt armed")
+		require.False(t, p.inFlight)
+		require.Equal(t, 3, tail.overlay.HeldSlots())
+		require.Empty(t, fc.committed, "capacity handler retried a failed fold")
+	})
+
+	t.Run("no admitted fold", func(t *testing.T) {
+		fc := &fakeCommitter{durable: accounts.NewMemAccounts()}
+		tail := newUnrootedTail(&fakeDurable{}, fc, 2, 2, "")
+		for slot := uint64(1); slot <= 3; slot++ {
+			tail.Add(slot, nil, testHashBytes(byte(slot)))
+			tail.SetContext(slot, &state.ResumeContext{Slot: slot})
+		}
+		p := newAsyncPromoter(fc)
+		defer p.stop()
+
+		require.True(t, settleInFlightFoldAtCapacity(tail, p, 3, nil))
+		require.Empty(t, fc.committed, "capacity handler admitted new fold work")
+	})
+
+	t.Run("missing tip context", func(t *testing.T) {
+		fc := &fakeCommitter{durable: accounts.NewMemAccounts()}
+		tail := newUnrootedTail(&fakeDurable{}, fc, 2, 2, "")
+		for slot := uint64(1); slot <= 2; slot++ {
+			tail.Add(slot, nil, testHashBytes(byte(slot)))
+			tail.SetContext(slot, &state.ResumeContext{Slot: slot})
+		}
+		job, err := tail.buildFoldJob(2, false)
+		require.NoError(t, err)
+		p := newAsyncPromoter(fc)
+		defer p.stop()
+		p.enqueue(job)
+		tail.Add(3, nil, testHashBytes(3)) // deliberately omit SetContext(3)
+
+		require.True(t, settleInFlightFoldAtCapacity(tail, p, 3, func(res *foldResult) {
+			if res != nil && res.err == nil {
+				tail.applyFoldJob(res.job)
+			}
+		}))
+		require.True(t, p.inFlight, "context-less tip must be rejected before draining hides it")
+		require.Equal(t, 3, tail.overlay.HeldSlots())
+	})
 }
 
 // A failed fold leaves the tail untouched (natural retry: the same chunk

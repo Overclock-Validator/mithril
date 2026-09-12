@@ -73,3 +73,12 @@ func TestExtractAndDedupeBlockAcctsPublicationCapacity(t *testing.T) {
 	assert.Equal(t, 5+nonTransactionCapacity+len(block.EpochStakesPerVoteAcct), publicationMapCapacity(block, uniqueWritableAccounts, true))
 	assert.Equal(t, len(block.Transactions)*expectedTouchedAccountsPerTransaction+nonTransactionCapacity, publicationMapCapacity(block, 20, false))
 }
+
+func TestIncludeAlpenglowParentStateAccountsPinsNanosecondClockOnce(t *testing.T) {
+	other := solana.PublicKey{1}
+	nanoClock := NanosecondClockAccountAddr()
+
+	require.Equal(t, []solana.PublicKey{other}, includeAlpenglowParentStateAccounts([]solana.PublicKey{other}, false))
+	require.Equal(t, []solana.PublicKey{other, nanoClock}, includeAlpenglowParentStateAccounts([]solana.PublicKey{other}, true))
+	require.Equal(t, []solana.PublicKey{other, nanoClock}, includeAlpenglowParentStateAccounts([]solana.PublicKey{other, nanoClock}, true))
+}

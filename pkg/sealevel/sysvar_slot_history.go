@@ -144,22 +144,29 @@ func (sr *SysvarSlotHistory) SetNextSlot(nextSlot uint64) {
 }
 
 func ReadSlotHistorySysvar(execCtx *ExecutionCtx) SysvarSlotHistory {
+	if execCtx != nil && execCtx.SlotCtx != nil {
+		if bankSysvars := execCtx.SlotCtx.BankSysvars(); bankSysvars != nil {
+			slotHistory, ok := bankSysvars.SlotHistory()
+			if !ok {
+				panic("SlotHistory sysvar is absent from bank snapshot")
+			}
+			return slotHistory
+		}
+	}
+
+	if slotHistoryAcct, ok := localSysvarAccount(execCtx, SysvarSlotHistoryAddr); ok {
+		if slotHistoryAcct.Lamports == 0 {
+			panic("SlotHistory sysvar account is absent")
+		}
+		var slotHistory SysvarSlotHistory
+		slotHistory.MustUnmarshalWithDecoder(bin.NewBinDecoder(slotHistoryAcct.Data))
+		return slotHistory
+	}
+
 	if SysvarCache.SlotHistory.Sysvar != nil {
 		return *SysvarCache.SlotHistory.Sysvar
 	}
-
-	accts := addrObjectForLookup(execCtx)
-	slotHistorySysvarAcct, err := (*accts).GetAccount(&SysvarSlotHistoryAddr)
-	if err != nil {
-		panic("failed to read SlotHistory sysvar account")
-	}
-
-	dec := bin.NewBinDecoder(slotHistorySysvarAcct.Data)
-
-	var slotHistory SysvarSlotHistory
-	slotHistory.MustUnmarshalWithDecoder(dec)
-
-	return slotHistory
+	panic("failed to read SlotHistory sysvar account")
 }
 
 func WriteSlotHistorySysvar(accts *accounts.Accounts, slotHistory SysvarSlotHistory) {

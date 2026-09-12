@@ -318,6 +318,7 @@ func BuildAccountsDbPaths(
 	if err != nil {
 		return nil, nil, fmt.Errorf("initializing worker pools: %w", err)
 	}
+	defer pools.Release()
 
 	// Start progress display if provided
 	if dp != nil {
@@ -331,13 +332,16 @@ func BuildAccountsDbPaths(
 
 	// Process snapshots sequentially for better performance (less lock contention)
 	// Full snapshot first
-	err = readTar(ctx, wg, snapshotFile, pools.appendVecCopying, readTarOptions{
+	err = readTar(ctx, wg, snapshotFile, pools, readTarOptions{
 		progress:        dp,
 		statusCachePath: retainedStatusCachePath(accountsDbDir),
 	})
 
 	// Wait for ALL worker tasks from full snapshot to complete before starting incremental
-	wg.Wait()
+	workerErr := waitForSnapshotWorkers(wg, pools)
+	if err == nil {
+		err = workerErr
+	}
 
 	// Stop progress display after full snapshot
 	if dp != nil {
@@ -354,13 +358,16 @@ func BuildAccountsDbPaths(
 
 	// Process incremental snapshot (if provided)
 	if incrementalSnapshotFile != "" {
-		err = readTar(ctx, wg, incrementalSnapshotFile, pools.appendVecCopying,
+		err = readTar(ctx, wg, incrementalSnapshotFile, pools,
 			readTarOptions{isIncremental: true, statusCachePath: retainedStatusCachePath(accountsDbDir)})
+		// Wait for all incremental worker tasks to complete
+		workerErr = waitForSnapshotWorkers(wg, pools)
+		if err == nil {
+			err = workerErr
+		}
 		if err != nil {
 			return nil, nil, err
 		}
-		// Wait for all incremental worker tasks to complete
-		wg.Wait()
 	}
 
 	mlog.Log.Debugf("done processing snapshots in %s.", fmtDuration(time.Since(start)))
@@ -406,8 +413,6 @@ func BuildAccountsDbPaths(
 		mlog.Log.Errorf("error writing bank hash=%x to file=%s: %s", manifest.Bank.Hash, bankHashOutputFileName, err)
 		return nil, nil, err
 	}
-
-	pools.Release()
 
 	// Write stake pubkey index file (with appendvec location hints)
 	stakeIndexPath := filepath.Join(accountsDbDir, "stake_pubkeys.idx")
@@ -455,7 +460,7 @@ func readTar(
 	ctx context.Context,
 	wg *sync.WaitGroup,
 	filename string,
-	appendVecCopyingPool *ants.PoolWithFunc,
+	pools *snapshotWorkerPools,
 	options readTarOptions,
 ) error {
 	dp := options.progress
@@ -487,6 +492,12 @@ func readTar(
 	}
 
 	for {
+		if pools != nil {
+			if workerErr := pools.Err(); workerErr != nil {
+				cleanupPartial("worker error")
+				return workerErr
+			}
+		}
 		if ctx.Err() != nil {
 			mlog.Log.Infof("Context cancelled, stopping snapshot unpack: %v", ctx.Err())
 			cleanupPartial("cancelled")
@@ -532,12 +543,21 @@ func readTar(
 		}
 
 		task := appendVecCopyingTask{TarBuffer: writer, Filename: header.Name, FromIncrementalSnapshot: options.isIncremental}
-		wg.Add(1)
-		err = appendVecCopyingPool.Invoke(task)
+		if pools == nil {
+			cleanupPartial("worker pool unavailable")
+			return fmt.Errorf("snapshot archive contains appendvec %q but no worker pool is available", header.Name)
+		}
+		err = invokeSnapshotTask(wg, pools.appendVecCopying, task)
 		if err != nil {
 			mlog.Log.Errorf("error calling appendVecCopyingPool.Invoke: %v", err)
 			cleanupPartial("pool error")
 			return err
+		}
+	}
+	if pools != nil {
+		if workerErr := pools.Err(); workerErr != nil {
+			cleanupPartial("worker error")
+			return workerErr
 		}
 	}
 
@@ -560,6 +580,70 @@ type snapshotWorkerPools struct {
 	appendVecCopying    *ants.PoolWithFunc
 	indexEntryBuilder   *ants.PoolWithFunc
 	indexEntryCommitter *ants.PoolWithFunc
+	errors              *snapshotWorkerErrors
+}
+
+type snapshotWorkerErrors struct {
+	mu  sync.Mutex
+	err error
+}
+
+func (e *snapshotWorkerErrors) Record(err error) {
+	if err == nil {
+		return
+	}
+	e.mu.Lock()
+	if e.err == nil {
+		e.err = err
+		mlog.Log.Errorf("snapshot worker failed: %v", err)
+	}
+	e.mu.Unlock()
+}
+
+func (e *snapshotWorkerErrors) Recover(stage string) {
+	if recovered := recover(); recovered != nil {
+		e.Record(fmt.Errorf("%s worker panicked: %v", stage, recovered))
+	}
+}
+
+func (e *snapshotWorkerErrors) Err() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.err
+}
+
+func (p *snapshotWorkerPools) Err() error {
+	if p == nil || p.errors == nil {
+		return nil
+	}
+	return p.errors.Err()
+}
+
+func waitForSnapshotWorkers(wg *sync.WaitGroup, pools *snapshotWorkerPools) error {
+	wg.Wait()
+	return pools.Err()
+}
+
+// invokeSnapshotTask keeps the wait-group balanced when a pool rejects a
+// submission (or panics while accepting it).  Without the compensating Done,
+// bootstrap can either hang forever or incorrectly outlive a failed stage.
+func invokeSnapshotTask(wg *sync.WaitGroup, pool *ants.PoolWithFunc, task any) (err error) {
+	if pool == nil {
+		return fmt.Errorf("snapshot worker pool is nil")
+	}
+	wg.Add(1)
+	submitted := false
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("submitting snapshot worker task: %v", recovered)
+		}
+		if !submitted {
+			wg.Done()
+		}
+	}()
+	err = pool.Invoke(task)
+	submitted = err == nil
+	return err
 }
 
 // stakeIndexCollector aggregates stake account pubkeys from multiple worker goroutines
@@ -600,19 +684,28 @@ func initWorkerPools(
 	indexEntryCommitterWorkers := snapshotIndexEntryCommitterWorkers()
 	indexEntryBuilderWorkers := snapshotIndexEntryBuilderWorkers()
 	appendVecCopyingWorkers := snapshotAppendVecCopyingWorkers()
+	workerErrors := &snapshotWorkerErrors{}
 
 	indexEntryCommitterPool, err := ants.NewPoolWithFunc(indexEntryCommitterWorkers, func(i any) {
 		tasks := indexEntryCommitterInProgress.Add(1)
 		statsd.Gauge(statsd.SnapshotWorkerPoolUtilization, float64(tasks)/float64(indexEntryCommitterWorkers), []string{"index_entry_committer"})
 		start := time.Now()
 		defer wg.Done()
+		defer indexEntryCommitterInProgress.Add(-1)
+		defer workerErrors.Recover("index entry committer")
+		if workerErrors.Err() != nil {
+			return
+		}
 		task := i.(indexEntryCommitterTask)
+		if len(task.IndexEntries) != len(task.Pubkeys) {
+			workerErrors.Record(fmt.Errorf("index entry committer received %d entries for %d pubkeys", len(task.IndexEntries), len(task.Pubkeys)))
+			return
+		}
 
 		for idx, entry := range task.IndexEntries {
 			sl.EnqueueRequest(task.Pubkeys[idx], entry)
 		}
 		statsd.Timing(statsd.TaskIndexEntryCommitterLatency, uint64(time.Since(start)), nil)
-		indexEntryCommitterInProgress.Add(-1)
 	})
 	if err != nil {
 		return nil, err
@@ -623,26 +716,30 @@ func initWorkerPools(
 		statsd.Gauge(statsd.SnapshotWorkerPoolUtilization, float64(tasks)/float64(indexEntryBuilderWorkers), []string{"index_entry_builder"})
 		start := time.Now()
 		defer wg.Done()
+		defer indexEntryBuilderInProgress.Add(-1)
+		defer workerErrors.Recover("index entry builder")
+		if workerErrors.Err() != nil {
+			return
+		}
 		task := i.(indexEntryBuilderTask)
 		pubkeys, entries, stakeEntries, err := accountsdb.BuildIndexEntriesFromAppendVecs(task.Data, task.FileSize, task.Slot, task.FileId)
 		if err != nil {
-			mlog.Log.Errorf("BuildIndexEntriesFromAppendVecs: %v", err)
+			workerErrors.Record(fmt.Errorf("building index entries: %w", err))
 			return
 		}
 
 		// Collect stake entries with appendvec location hints for building stake index
 		stakeCollector.Add(stakeEntries)
 
-		indexEntryBuilderInProgress.Add(-1)
 		commitTask := indexEntryCommitterTask{IndexEntries: entries, Pubkeys: pubkeys}
-		wg.Add(1)
 		statsd.Timing(statsd.TasksIndexEntryBuilderLatency, uint64(time.Since(start)), nil)
-		err = indexEntryCommitterPool.Invoke(commitTask)
+		err = invokeSnapshotTask(wg, indexEntryCommitterPool, commitTask)
 		if err != nil {
-			mlog.Log.Errorf("indexEntryCommitterPool.Invoke: %v", err)
+			workerErrors.Record(fmt.Errorf("submitting index entry committer task: %w", err))
 		}
 	})
 	if err != nil {
+		indexEntryCommitterPool.Release()
 		return nil, err
 	}
 
@@ -651,6 +748,11 @@ func initWorkerPools(
 		statsd.Gauge(statsd.SnapshotWorkerPoolUtilization, float64(tasks)/float64(appendVecCopyingWorkers), []string{"append_vec_copying"})
 		start := time.Now()
 		defer wg.Done()
+		defer appendVecCopyingInProgress.Add(-1)
+		defer workerErrors.Recover("appendvec copying")
+		if workerErrors.Err() != nil {
+			return
+		}
 		task := i.(appendVecCopyingTask)
 		filename := task.Filename
 		writer := task.TarBuffer
@@ -660,22 +762,23 @@ func initWorkerPools(
 		// validate that the path doesn't escape accountsDbDir (via '../' sequences)
 		cleanPath := filepath.Clean(outFilename)
 		if !strings.HasPrefix(cleanPath, filepath.Clean(accountsDbDir)+string(os.PathSeparator)) {
-			panic(fmt.Sprintf("invalid path in tar archive: %s", filename))
+			workerErrors.Record(fmt.Errorf("invalid path in tar archive: %s", filename))
+			return
 		}
 
 		appendVecBytes := writer.Bytes()
 		err := os.WriteFile(cleanPath, appendVecBytes, 0644)
 		if err != nil {
-			mlog.Log.Errorf("err writing new file=%s: %v", cleanPath, err)
-			appendVecCopyingInProgress.Add(-1)
+			workerErrors.Record(fmt.Errorf("writing appendvec %s: %w", cleanPath, err))
 			return
 		}
 
 		var slot, fileId uint64
 		if n, err := fmt.Sscanf(filepath.Base(filename), "%d.%d", &slot, &fileId); n != 2 || err != nil {
-			panic(fmt.Sprintf(
+			workerErrors.Record(fmt.Errorf(
 				"failed to parse slot and file from filename=%s basename=%s; parsed n=%d arguments (expected 2) and had err=%v",
 				filename, filepath.Base(filename), n, err))
+			return
 		}
 
 		for {
@@ -695,7 +798,8 @@ func initWorkerPools(
 		var usedIncrementalSnapshotVal bool
 		if task.FromIncrementalSnapshot {
 			if incrementalManifest == nil {
-				panic("tried to process incremental snapshot without having parsed incremental snapshot manifest first!")
+				workerErrors.Record(fmt.Errorf("tried to process incremental snapshot without having parsed incremental snapshot manifest first"))
+				return
 			}
 			for _, av := range incrementalManifest.AccountsDb.Storages[slot].AcctVecs {
 				if av.Id == fileId {
@@ -716,19 +820,20 @@ func initWorkerPools(
 		}
 
 		if fileSize == 0 {
-			panic("programming error - fileSize for appendvec was 0")
+			workerErrors.Record(fmt.Errorf("manifest has no file size for appendvec slot=%d file_id=%d", slot, fileId))
+			return
 		}
 
-		appendVecCopyingInProgress.Add(-1)
 		nextTask := indexEntryBuilderTask{Data: appendVecBytes, FileSize: fileSize, Slot: slot, FileId: fileId}
-		wg.Add(1)
 		statsd.Timing(statsd.TasksAppendVecCopyingLatency, uint64(time.Since(start)), nil)
-		err = indexEntryBuilderPool.Invoke(nextTask)
+		err = invokeSnapshotTask(wg, indexEntryBuilderPool, nextTask)
 		if err != nil {
-			mlog.Log.Errorf("error calling indexEntryBuilderPool.Invoke\n")
+			workerErrors.Record(fmt.Errorf("submitting index entry builder task: %w", err))
 		}
 	})
 	if err != nil {
+		indexEntryBuilderPool.Release()
+		indexEntryCommitterPool.Release()
 		return nil, err
 	}
 
@@ -736,6 +841,7 @@ func initWorkerPools(
 		appendVecCopyingPool,
 		indexEntryBuilderPool,
 		indexEntryCommitterPool,
+		workerErrors,
 	}, nil
 }
 

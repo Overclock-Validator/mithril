@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/Overclock-Validator/mithril/pkg/block"
+	"github.com/Overclock-Validator/mithril/pkg/sigverify"
 	"github.com/Overclock-Validator/mithril/pkg/txverify"
 	"github.com/gagliardetto/solana-go"
 )
@@ -23,38 +24,109 @@ type transactionVerifier struct {
 	jobs    chan transactionVerifyJob
 	verify  func(*solana.Transaction) error
 	workers int
-	close   sync.Once
-	worker  sync.WaitGroup
+	// wave is how many transactions verifyBlockContext admits at once. It is
+	// workers * sigverify.BatchTarget so each worker can actually accumulate a
+	// full vector group rather than being handed one transaction at a time.
+	wave  int
+	close sync.Once
+
+	worker sync.WaitGroup
 }
 
 func newTransactionVerifier(workers, queueDepth int, verify func(*solana.Transaction) error) *transactionVerifier {
 	if workers < 1 {
 		workers = 1
 	}
+	wave := workers * sigverify.BatchTarget
 	if queueDepth < 1 {
 		queueDepth = 1
-	}
-	if verify == nil {
-		verify = txverify.VerifyTransaction
 	}
 	v := &transactionVerifier{
 		jobs:    make(chan transactionVerifyJob, queueDepth),
 		verify:  verify,
 		workers: workers,
+		wave:    wave,
 	}
 	v.worker.Add(workers)
 	for i := 0; i < workers; i++ {
 		go func() {
 			defer v.worker.Done()
+			// Worker-local scratch reused across groups.
+			var (
+				group []transactionVerifyJob
+				scr   verifyScratch
+			)
 			for job := range v.jobs {
-				func() {
-					defer job.done.Done()
-					*job.err = verifyTransactionSafely(v.verify, job.tx)
-				}()
+				group = sigverify.Drain(group, job, v.jobs,
+					sigverify.FairShare(len(v.jobs), v.workers, sigverify.BatchTarget))
+				v.verifyGroup(group, &scr)
+				// Do not keep finished jobs reachable through the scratch.
+				clear(group)
 			}
 		}()
 	}
 	return v
+}
+
+// verifyScratch is one worker's reusable buffers.
+type verifyScratch struct {
+	txs   []*solana.Transaction
+	errs  []error
+	batch txverify.BatchVerifier
+}
+
+// verifyGroup verifies a drained group and releases every job in it.
+//
+// Releasing happens in a defer covering the whole group, so no caller can be
+// left waiting on a job that was drained into a batch which then failed —
+// a stranded job would hang verifyBlockContext's done.Wait() forever.
+func (v *transactionVerifier) verifyGroup(group []transactionVerifyJob, scr *verifyScratch) {
+	defer func() {
+		for _, job := range group {
+			job.done.Done()
+		}
+	}()
+
+	// An injected verifier is a per-transaction function and stays that way;
+	// only the default path can batch. This seam is used by tests.
+	if v.verify != nil {
+		for _, job := range group {
+			*job.err = verifyTransactionSafely(v.verify, job.tx)
+		}
+		return
+	}
+
+	scr.txs = scr.txs[:0]
+	for _, job := range group {
+		scr.txs = append(scr.txs, job.tx)
+	}
+	if cap(scr.errs) < len(scr.txs) {
+		scr.errs = make([]error, len(scr.txs))
+	}
+	scr.errs = scr.errs[:len(scr.txs)]
+
+	verifyBatchSafely(&scr.batch, scr.txs, scr.errs)
+
+	for i, job := range group {
+		*job.err = scr.errs[i]
+	}
+	clear(scr.txs)
+}
+
+// verifyBatchSafely mirrors verifyTransactionSafely: a panic in the verifier
+// becomes an error for every transaction in the group rather than taking down
+// the process. Attributing it to all of them is deliberate — a panic gives no
+// evidence about which transaction caused it, and silently passing the others
+// would admit unverified transactions.
+func verifyBatchSafely(batch *txverify.BatchVerifier, txs []*solana.Transaction, errs []error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			for i := range errs {
+				errs[i] = fmt.Errorf("signature verifier panic: %v", recovered)
+			}
+		}
+	}()
+	batch.Verify(txs, errs)
 }
 
 func (v *transactionVerifier) closeAndWait() {
@@ -93,11 +165,11 @@ func (v *transactionVerifier) verifyBlockContext(ctx context.Context, blk *block
 	// Admit one worker-wave at a time. A monster block still occupies every
 	// verifier lane, but cannot park tens of thousands of jobs ahead of a newly
 	// completed small block in the shared bounded queue.
-	for chunkStart := 0; chunkStart < len(blk.Transactions); chunkStart += v.workers {
+	for chunkStart := 0; chunkStart < len(blk.Transactions); chunkStart += v.wave {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		chunkEnd := min(chunkStart+v.workers, len(blk.Transactions))
+		chunkEnd := min(chunkStart+v.wave, len(blk.Transactions))
 		errs := make([]error, chunkEnd-chunkStart)
 		var done sync.WaitGroup
 		for txIdx := chunkStart; txIdx < chunkEnd; txIdx++ {
@@ -157,7 +229,7 @@ var (
 func validateBlockTransactionsContext(ctx context.Context, blk *block.Block) error {
 	defaultTransactionVerifierOnce.Do(func() {
 		workers := max(1, (runtime.GOMAXPROCS(0)+1)/2)
-		defaultTransactionVerifier = newTransactionVerifier(workers, 2*workers, nil)
+		defaultTransactionVerifier = newTransactionVerifier(workers, 2*workers*sigverify.BatchTarget, nil)
 	})
 	return defaultTransactionVerifier.verifyBlockContext(ctx, blk)
 }

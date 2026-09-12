@@ -24,14 +24,15 @@ func NanosecondClockBounds(parentNanos int64, elapsedSlotDurationNanos uint64) (
 		lower++
 	}
 
-	offset := elapsedSlotDurationNanos
-	if offset > uint64(math.MaxInt64)/2 {
-		offset = uint64(math.MaxInt64) / 2
+	var maxOffset int64
+	if elapsedSlotDurationNanos > uint64(math.MaxInt64)/2 {
+		maxOffset = math.MaxInt64
+	} else {
+		maxOffset = int64(elapsedSlotDurationNanos * 2)
 	}
-	maxOffset := int64(offset * 2)
 
 	upper := parentNanos
-	if maxOffset > math.MaxInt64-parentNanos {
+	if parentNanos > math.MaxInt64-maxOffset {
 		upper = math.MaxInt64
 	} else {
 		upper += maxOffset
@@ -76,24 +77,94 @@ func ReadNanosecondClockAt(acctsDb *accountsdb.AccountsDb, slot uint64) (int64, 
 	return clock.UnixTimestamp * 1_000_000_000, true
 }
 
-// ReadNanosecondClockFromSlotCtx reads the parent-visible clock through the
-// slot's AccountReader, so locally produced descendants see unrooted replay.
+// ReadNanosecondClockFromSlotCtx returns the exact parent-time anchor used for
+// Alpenglow footer bounds. The parent account is pinned when the bank is built;
+// a transaction in the child bank must not be able to change this value.
+//
+// Before the nanosecond account is populated, Agave falls back to the child
+// bank's pre-footer Clock timestamp. Neither path consults a process-global or
+// unrooted account view.
 func ReadNanosecondClockFromSlotCtx(slotCtx *sealevel.SlotCtx) (int64, bool) {
+	nanos, err := nanosecondClockAnchor(slotCtx)
+	return nanos, err == nil
+}
+
+func nanosecondClockAnchor(slotCtx *sealevel.SlotCtx) (int64, error) {
 	if slotCtx == nil {
-		return 0, false
+		return 0, fmt.Errorf("missing slot context")
 	}
-	if acct, err := slotCtx.GetAccountFromAccountsDb(NanosecondClockAccountAddr()); err == nil && acct != nil && len(acct.Data) >= nanosecondClockDataLen {
-		return int64(binary.LittleEndian.Uint64(acct.Data[:nanosecondClockDataLen])), true
+	var nanoClockAcct *accounts.Account
+	if slotCtx.ParentAccts != nil {
+		acct, err := slotCtx.GetParentAccount(NanosecondClockAccountAddr())
+		if err != nil {
+			return 0, fmt.Errorf("parent nanosecond clock was not pinned: %w", err)
+		}
+		nanoClockAcct = acct
+	} else if slotCtx.Accounts != nil {
+		// Compatibility for isolated callers that predate parent snapshots.
+		nanoClockAcct, _ = slotCtx.GetAccount(NanosecondClockAccountAddr())
 	}
-	clockAcct, err := slotCtx.GetAccountFromAccountsDb(sealevel.SysvarClockAddr)
-	if err != nil || clockAcct == nil {
-		return 0, false
+	if nanoClockAcct != nil && nanoClockAcct.Lamports > 0 && len(nanoClockAcct.Data) != 0 {
+		if len(nanoClockAcct.Data) < nanosecondClockDataLen {
+			return 0, fmt.Errorf("parent nanosecond clock has invalid data length %d", len(nanoClockAcct.Data))
+		}
+		return int64(binary.LittleEndian.Uint64(nanoClockAcct.Data[:nanosecondClockDataLen])), nil
 	}
-	var clock sealevel.SysvarClock
-	if err := clock.UnmarshalWithDecoder(bin.NewBinDecoder(clockAcct.Data)); err != nil {
-		return 0, false
+	if bankSysvars := slotCtx.BankSysvars(); bankSysvars != nil {
+		if clock, ok := bankSysvars.Clock(); ok {
+			return secondsToNanosecondsSaturating(clock.UnixTimestamp), nil
+		}
 	}
-	return clock.UnixTimestamp * 1_000_000_000, true
+	return 0, fmt.Errorf("bank-local Clock sysvar is unavailable")
+}
+
+func secondsToNanosecondsSaturating(seconds int64) int64 {
+	const nanosPerSecond = int64(1_000_000_000)
+	if seconds > math.MaxInt64/nanosPerSecond {
+		return math.MaxInt64
+	}
+	if seconds < math.MinInt64/nanosPerSecond {
+		return math.MinInt64
+	}
+	return seconds * nanosPerSecond
+}
+
+// validateAlpenglowFooterNanosecondClock mirrors Agave's footer-time check.
+// FooterProducerTimeNanos is a required wire value here: zero is numeric zero,
+// not an invitation to fall back to the second-resolution compatibility field.
+func validateAlpenglowFooterNanosecondClock(slotCtx *sealevel.SlotCtx, block *b.Block) error {
+	if slotCtx == nil || block == nil {
+		return fmt.Errorf("cannot validate Alpenglow footer nanosecond clock without bank state")
+	}
+	if !block.HasAlpenglowFooter {
+		return fmt.Errorf("slot %d missing block footer", block.Slot)
+	}
+	if block.FooterProducerTimeNanos > uint64(math.MaxInt64) {
+		return fmt.Errorf("slot %d footer nanosecond clock out of bounds: producer time %d overflows i64", block.Slot, block.FooterProducerTimeNanos)
+	}
+	parentNanos, err := nanosecondClockAnchor(slotCtx)
+	if err != nil {
+		return fmt.Errorf("slot %d footer nanosecond clock: %w", block.Slot, err)
+	}
+
+	var elapsed uint64
+	if slotCtx.Slot > slotCtx.ParentSlot {
+		slotGap := slotCtx.Slot - slotCtx.ParentSlot
+		if slotGap > math.MaxUint64/uint64(alpenglowNsPerSlot) {
+			elapsed = math.MaxUint64
+		} else {
+			elapsed = slotGap * uint64(alpenglowNsPerSlot)
+		}
+	}
+	lower, upper := NanosecondClockBounds(parentNanos, elapsed)
+	producerNanos := int64(block.FooterProducerTimeNanos)
+	if producerNanos < lower || producerNanos > upper {
+		return fmt.Errorf(
+			"slot %d footer nanosecond clock out of bounds: producer=%d parent=%d bounds=[%d,%d]",
+			block.Slot, producerNanos, parentNanos, lower, upper,
+		)
+	}
+	return nil
 }
 
 func alpenglowFooterProducerTimeNanos(block *b.Block) (int64, bool, error) {
@@ -130,15 +201,10 @@ func updateAlpenglowNanosecondClockAccount(slotCtx *sealevel.SlotCtx, block *b.B
 	addr := NanosecondClockAccountAddr()
 	acct, err := slotCtx.GetAccount(addr)
 	if err != nil {
-		acct, err = slotCtx.GetAccountFromAccountsDb(addr)
-		if err != nil {
-			acct = &accounts.Account{
-				Key:       addr,
-				Owner:     a.SystemProgramAddr,
-				RentEpoch: 0,
-			}
-		} else {
-			acct = acct.Clone()
+		acct = &accounts.Account{
+			Key:       addr,
+			Owner:     a.SystemProgramAddr,
+			RentEpoch: 0,
 		}
 	}
 

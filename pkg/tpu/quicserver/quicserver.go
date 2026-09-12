@@ -68,6 +68,12 @@ func Spawn(
 	}
 
 	cfg = cfg.normalized()
+	if cfg.MaxStreamDataBytes > packet.DataSize {
+		return nil, &ServerError{Op: "configure transport", Err: fmt.Errorf("max stream data bytes %d exceeds packet buffer size %d", cfg.MaxStreamDataBytes, packet.DataSize)}
+	}
+	if cfg.StreamReceiveWindowSize < cfg.MaxStreamDataBytes {
+		return nil, &ServerError{Op: "configure transport", Err: fmt.Errorf("stream receive window %d is smaller than max stream data bytes %d", cfg.StreamReceiveWindowSize, cfg.MaxStreamDataBytes)}
+	}
 	tlsConf, err := newServerTLSConfig(identity)
 	if err != nil {
 		return nil, &ServerError{Op: "configure tls", Err: err}

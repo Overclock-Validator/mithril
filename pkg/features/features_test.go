@@ -45,6 +45,27 @@ func TestDisableFeesSysvarFeatureGate(t *testing.T) {
 	assert.Contains(t, AllFeatureGates, DisableFeesSysvar)
 }
 
+func TestRaiseBlockLimitsTo100mFeatureGate(t *testing.T) {
+	assert.Equal(t, "RaiseBlockLimitsTo100m", RaiseBlockLimitsTo100m.Name)
+	assert.Equal(t, base58.MustDecodeFromString("P1BCUMpAC7V2GRBRiJCNUgpMyWZhoqt3LKo712ePqsz"), RaiseBlockLimitsTo100m.Address)
+	assert.Contains(t, AllFeatureGates, RaiseBlockLimitsTo100m)
+}
+
+func TestTransactionV1CompanionFeatureGates(t *testing.T) {
+	for _, test := range []struct {
+		gate FeatureGate
+		addr string
+	}{
+		{EnableTxV1, "txv1aq4pp281K9um3tnPgkfX8UqtFT6wcVW3hNezGLL"},
+		{DefineLtdsFeeOnlySemantics, "LTDSzjZKFJMKHYpNycG1FrWwGGTaFFwqEFjB5GGLNVD"},
+		{RelaxPostExecMinBalanceCheck, "BY4JhHLahVzS9ynfDz4exzGPbVXhFmJvEyMWsXbDBqME"},
+		{RelaxFeePayerConstraint, "FEEXbxUuKobtrt1qNK5pjtzbPQhsppBTrNNG74xu4mai"},
+	} {
+		assert.Equal(t, base58.MustDecodeFromString(test.addr), test.gate.Address)
+		assert.Contains(t, AllFeatureGates, test.gate)
+	}
+}
+
 func TestEnableSbpfV3DeploymentAndExecutionFeatureGates(t *testing.T) {
 	assert.Equal(t, "EnableSbpfV3DeploymentAndExecution", EnableSbpfV3DeploymentAndExecution.Name)
 	assert.Equal(t, base58.MustDecodeFromString("5cC3foj77CWun58pC51ebHFUWavHWKarWyR5UUik7dnC"), EnableSbpfV3DeploymentAndExecution.Address)
@@ -57,7 +78,8 @@ func TestEnableSbpfV3DeploymentAndExecutionFeatureGates(t *testing.T) {
 
 func TestAlpenglowFeatureGate(t *testing.T) {
 	assert.Equal(t, "Alpenglow", Alpenglow.Name)
-	assert.Equal(t, base58.MustDecodeFromString("a1penGLz8Vm2QHYB3JPefBiU4BY3Z6JkW2k3Scw5GWP"), Alpenglow.Address)
+	assert.Equal(t, "A1pengvuM6JEcyNuTnMqepBKhwHE3N6PmUrdATGawhJS", AlpenglowFeatureGateAddress)
+	assert.Equal(t, base58.MustDecodeFromString(AlpenglowFeatureGateAddress), Alpenglow.Address)
 	assert.Contains(t, AllFeatureGates, Alpenglow)
 }
 
@@ -83,6 +105,16 @@ func TestVoteAccountInitializeV2FeatureGates(t *testing.T) {
 	} {
 		assert.Contains(t, AllFeatureGates, gate)
 	}
+}
+
+func TestCustomCommissionCollectorFeatureGate(t *testing.T) {
+	assert.Equal(t, "CustomCommissionCollector", CustomCommissionCollector.Name)
+	assert.Equal(
+		t,
+		base58.MustDecodeFromString("3HcSrCTGXTUnrTueHi4DAwNuMxZSsm5xui2Ax3mgxHqf"),
+		CustomCommissionCollector.Address,
+	)
+	assert.Contains(t, AllFeatureGates, CustomCommissionCollector)
 }
 
 func TestSyscallParameterAddressRestrictionsFeatureGate(t *testing.T) {

@@ -373,6 +373,11 @@ name = "mithril"
 #
 # Native turbine mode reconstructs blocks from data shreds inside Mithril.
 # RPC remains configured for catchup, tip polling, and repair/fallback paths.
+# A gossip-connected node also performs Agave-compatible Turbine retransmit:
+# verified broadcast shreds are relayed to its deterministic downstream peers
+# (fanout 200), while repair responses are never amplified. Resigned Merkle
+# shreds are checked against the expected upstream parent and re-signed with
+# validator.identity_keypair before forwarding.
 
 [turbine]
     # Solana gossip entrypoint of your Alpenglow cluster (host:port). REQUIRED
@@ -518,6 +523,14 @@ name = "mithril"
 
     # Number of borrowed accounts to preallocate in arena (0 to disable)
     borrowed_account_arena_size = 1024
+
+    # ed25519 signature verification backend.
+    #   auto    - use the AVX-512 accelerated backend when the CPU has
+    #             AVX512-IFMA (Zen 4/5, Ice Lake and newer), else portable
+    #   r51     - force the accelerated backend; startup fails without AVX512-IFMA
+    #   generic - force the portable pure-Go backend
+    #   stdlib  - use Go’s crypto/ed25519 implementation after the mandatory strict rejection checks.
+    sigverify_backend = "auto"
 
     # Enable/disable pool allocator for slices
     use_pool = true

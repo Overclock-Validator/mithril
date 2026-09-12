@@ -381,6 +381,30 @@ func LeaderForSlot(slot uint64) (solana.PublicKey, bool) {
 	return solana.PublicKey{}, false
 }
 
+// NextSlotForLeader returns the earliest scheduled slot at or after from
+// for identity across installed epoch schedules.
+func NextSlotForLeader(identity solana.PublicKey, from uint64) (uint64, bool) {
+	instance.leaderScheduleMutex.RLock()
+	defer instance.leaderScheduleMutex.RUnlock()
+
+	if instance.leaderSchedule != nil {
+		return instance.leaderSchedule.NextSlotForLeader(identity, from)
+	}
+	var best uint64
+	found := false
+	for _, schedule := range instance.leaderSchedules {
+		slot, ok := schedule.NextSlotForLeader(identity, from)
+		if !ok {
+			continue
+		}
+		if !found || slot < best {
+			best = slot
+			found = true
+		}
+	}
+	return best, found
+}
+
 // LeaderForSlotWithVoteAccount returns the coherent node and vote-account pair
 // sampled for slot by a locally built vote-keyed schedule. Compatibility
 // schedules built from node-keyed RPC data return false.

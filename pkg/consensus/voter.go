@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"net"
 	"sort"
 	"sync"
 	"time"
@@ -29,7 +28,10 @@ var (
 	errVoterNotReady    = errors.New("validator has not joined live voting")
 )
 
-type VotingPeerSource func(slot uint64, validators []alpenglow.ValidatorStake) []*net.UDPAddr
+// VotingPeerSource resolves gossip endpoints for the already-merged Votor
+// transport membership. The message slot is intentionally absent: callers
+// must not narrow this union back to one epoch at an epoch boundary.
+type VotingPeerSource func(validators []alpenglow.ValidatorStake) []alpenglow.VotorPeer
 
 // VotingConfig contains the operator-held material and network discovery
 // boundary required to activate voting. VoteAccount is the on-chain vote
@@ -51,18 +53,28 @@ type VotingConfig struct {
 // NetworkLandedVotes counts unique persisted votes whose rank appeared in the
 // exact BLS-verified certificate proof received over Votor QUIC.
 type VotingStats struct {
-	Enabled                    bool                      `json:"enabled"`
-	VotesCastThisRun           uint64                    `json:"votes_cast_this_run"`
-	NetworkLandedVotes         uint64                    `json:"network_landed_votes"`
-	LastNetworkLandedSlot      uint64                    `json:"last_network_landed_slot,omitempty"`
-	LastNetworkLandedVoteType  alpenglow.VoteType        `json:"last_network_landed_vote_type,omitempty"`
-	LastNetworkCertificateType alpenglow.CertificateType `json:"last_network_certificate_type,omitempty"`
-	LastNetworkLandedAt        time.Time                 `json:"last_network_landed_at,omitempty"`
-	BroadcastMessagesQueued    uint64                    `json:"broadcast_messages_queued"`
-	BroadcastMessagesDropped   uint64                    `json:"broadcast_messages_dropped"`
-	BroadcastPeerSends         uint64                    `json:"broadcast_peer_sends"`
-	BroadcastPeerSendErrors    uint64                    `json:"broadcast_peer_send_errors"`
-	BroadcastActiveConnections int                       `json:"broadcast_active_connections"`
+	Enabled                        bool                      `json:"enabled"`
+	VotesCastThisRun               uint64                    `json:"votes_cast_this_run"`
+	NetworkLandedVotes             uint64                    `json:"network_landed_votes"`
+	LastNetworkLandedSlot          uint64                    `json:"last_network_landed_slot,omitempty"`
+	LastNetworkLandedVoteType      alpenglow.VoteType        `json:"last_network_landed_vote_type,omitempty"`
+	LastNetworkCertificateType     alpenglow.CertificateType `json:"last_network_certificate_type,omitempty"`
+	LastNetworkLandedAt            time.Time                 `json:"last_network_landed_at,omitempty"`
+	BroadcastMessagesQueued        uint64                    `json:"broadcast_messages_queued"`
+	BroadcastMessagesDropped       uint64                    `json:"broadcast_messages_dropped"`
+	BroadcastPeerSends             uint64                    `json:"broadcast_peer_sends"`
+	BroadcastPeerSendsSkipped      uint64                    `json:"broadcast_peer_sends_skipped"`
+	BroadcastPeerSendErrors        uint64                    `json:"broadcast_peer_send_errors"`
+	BroadcastDesiredPeers          int                       `json:"broadcast_desired_peers"`
+	BroadcastActiveConnections     int                       `json:"broadcast_active_connections"`
+	BroadcastPendingConnections    int                       `json:"broadcast_pending_connections"`
+	BroadcastConnectionAttempts    uint64                    `json:"broadcast_connection_attempts"`
+	BroadcastConnectionErrors      uint64                    `json:"broadcast_connection_errors"`
+	BroadcastConnectionJobsDropped uint64                    `json:"broadcast_connection_jobs_dropped"`
+	BroadcastLastPeerSendError     string                    `json:"broadcast_last_peer_send_error,omitempty"`
+	BroadcastLastPeerSendErrorAt   time.Time                 `json:"broadcast_last_peer_send_error_at,omitempty"`
+	BroadcastLastConnectionError   string                    `json:"broadcast_last_connection_error,omitempty"`
+	BroadcastLastConnectionErrorAt time.Time                 `json:"broadcast_last_connection_error_at,omitempty"`
 }
 
 type voterEventKind uint8
@@ -143,14 +155,14 @@ type alpenglowVoter struct {
 }
 
 func newAlpenglowVoter(engine *AlpenglowObserverEngine, cfg VotingConfig, root alpenglow.BlockID) (*alpenglowVoter, error) {
-	return newAlpenglowVoterWithStart(engine, cfg, root, true)
+	return newAlpenglowVoterWithStart(engine, cfg, root, true, nil)
 }
 
-func newAlpenglowVoterUnstarted(engine *AlpenglowObserverEngine, cfg VotingConfig, root alpenglow.BlockID) (*alpenglowVoter, error) {
-	return newAlpenglowVoterWithStart(engine, cfg, root, false)
+func newAlpenglowVoterUnstarted(engine *AlpenglowObserverEngine, cfg VotingConfig, root alpenglow.BlockID, sets []alpenglow.ValidatorSet) (*alpenglowVoter, error) {
+	return newAlpenglowVoterWithStart(engine, cfg, root, false, sets)
 }
 
-func newAlpenglowVoterWithStart(engine *AlpenglowObserverEngine, cfg VotingConfig, root alpenglow.BlockID, start bool) (*alpenglowVoter, error) {
+func newAlpenglowVoterWithStart(engine *AlpenglowObserverEngine, cfg VotingConfig, root alpenglow.BlockID, start bool, sets []alpenglow.ValidatorSet) (*alpenglowVoter, error) {
 	if engine == nil {
 		return nil, fmt.Errorf("enable Alpenglow voting: nil consensus engine")
 	}
@@ -169,10 +181,17 @@ func newAlpenglowVoterWithStart(engine *AlpenglowObserverEngine, cfg VotingConfi
 	if cfg.EpochForSlot == nil || cfg.Peers == nil {
 		return nil, fmt.Errorf("enable Alpenglow voting: epoch and peer sources are required")
 	}
+	if len(engine.identity) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("enable Alpenglow voting: consensus engine has no validator transport identity")
+	}
 	if cfg.SlotDuration <= 0 {
 		cfg.SlotDuration = defaultAlpenglowSlotDur
 	}
 	node := solana.PublicKey(cfg.Identity.Public().(ed25519.PublicKey))
+	engineNode := solana.PublicKey(engine.identity.Public().(ed25519.PublicKey))
+	if node != engineNode {
+		return nil, fmt.Errorf("enable Alpenglow voting: identity %s does not match consensus transport identity %s", node, engineNode)
+	}
 	history, err := alpenglow.LoadVoteHistory(cfg.HistoryDir, node)
 	if err != nil {
 		if !errors.Is(err, alpenglow.ErrVoteHistoryNotFound) {
@@ -221,15 +240,21 @@ func newAlpenglowVoterWithStart(engine *AlpenglowObserverEngine, cfg VotingConfi
 		landed:          make(map[alpenglow.VoteMessageKey]struct{}),
 		stats:           VotingStats{Enabled: true},
 	}
+	// NewVotorBroadcaster performs its first peer reconciliation synchronously
+	// and starts a periodic reconciler before returning. Seed the immutable
+	// startup snapshot before either can read v.sets.
+	for _, set := range sets {
+		v.sets[set.Epoch] = cloneValidatorSet(set)
+	}
 	broadcaster, err := alpenglow.NewVotorBroadcaster(alpenglow.VotorBroadcasterConfig{
 		Identity:     cfg.Identity,
 		ShredVersion: engine.shredVersion,
-		Peers: func(slot uint64) []*net.UDPAddr {
-			set, ok := v.validatorSet(slot)
-			if !ok {
+		Peers: func() []alpenglow.VotorPeer {
+			validators := v.votorTransportValidators()
+			if len(validators) == 0 {
 				return nil
 			}
-			return v.peerSource(slot, set.Validators)
+			return v.peerSource(validators)
 		},
 	})
 	if err != nil {
@@ -775,6 +800,42 @@ func (v *alpenglowVoter) validatorSet(slot uint64) (alpenglow.ValidatorSet, bool
 	return set, ok
 }
 
+// votorTransportValidators mirrors Agave's merged transport peer list rather
+// than sending only to the message slot's validator set. This keeps trailing
+// reward traffic connected across an epoch boundary and preconnects the next
+// set inside the vote-verification horizon.
+func (v *alpenglowVoter) votorTransportValidators() []alpenglow.ValidatorStake {
+	epochs, ok := v.engine.votorPeerEpochs()
+	if !ok {
+		return nil
+	}
+	v.setsMu.RLock()
+	defer v.setsMu.RUnlock()
+	seen := make(map[solana.PublicKey]struct{})
+	validators := make([]alpenglow.ValidatorStake, 0)
+	localAdmitted := false
+	for _, epoch := range epochs {
+		set, exists := v.sets[epoch]
+		if !exists {
+			continue
+		}
+		for _, validator := range set.Validators {
+			if validator.NodePubkey == v.node {
+				localAdmitted = true
+			}
+			if _, duplicate := seen[validator.NodePubkey]; duplicate {
+				continue
+			}
+			seen[validator.NodePubkey] = struct{}{}
+			validators = append(validators, validator)
+		}
+	}
+	if !localAdmitted {
+		return nil
+	}
+	return validators
+}
+
 func (v *alpenglowVoter) restoreVotesForEpoch(epoch uint64) error {
 	floor := v.admissionFloor()
 	for _, vote := range v.history.VotesAfter(v.history.Root - minU64(v.history.Root, 1)) {
@@ -1145,8 +1206,18 @@ func (v *alpenglowVoter) snapshot() VotingStats {
 		stats.BroadcastMessagesQueued = broadcast.MessagesQueued
 		stats.BroadcastMessagesDropped = broadcast.MessagesDropped
 		stats.BroadcastPeerSends = broadcast.PeerSends
+		stats.BroadcastPeerSendsSkipped = broadcast.PeerSendsSkipped
 		stats.BroadcastPeerSendErrors = broadcast.PeerSendErrors
+		stats.BroadcastDesiredPeers = broadcast.DesiredPeers
 		stats.BroadcastActiveConnections = broadcast.Connections
+		stats.BroadcastPendingConnections = broadcast.PendingConnections
+		stats.BroadcastConnectionAttempts = broadcast.ConnectionAttempts
+		stats.BroadcastConnectionErrors = broadcast.ConnectionErrors
+		stats.BroadcastConnectionJobsDropped = broadcast.ConnectionJobsDropped
+		stats.BroadcastLastPeerSendError = broadcast.LastPeerSendError
+		stats.BroadcastLastPeerSendErrorAt = broadcast.LastPeerSendErrorAt
+		stats.BroadcastLastConnectionError = broadcast.LastConnectionError
+		stats.BroadcastLastConnectionErrorAt = broadcast.LastConnectionErrorAt
 	}
 	return stats
 }
@@ -1157,15 +1228,21 @@ func (v *alpenglowVoter) maybeLogStats() {
 	}
 	v.lastStatsLog = time.Now()
 	stats := v.snapshot()
-	mlog.Log.FileOnlyf("alpenglow voting stats: votes_cast_this_run=%d network_landed=%d last_landed_slot=%d broadcast_queued=%d broadcast_dropped=%d peer_sends=%d peer_send_errors=%d active_connections=%d",
+	mlog.Log.FileOnlyf("alpenglow voting stats: votes_cast_this_run=%d network_landed=%d last_landed_slot=%d broadcast_queued=%d broadcast_dropped=%d peer_sends=%d peer_sends_skipped=%d peer_send_errors=%d desired_peers=%d active_connections=%d pending_connections=%d connection_attempts=%d connection_errors=%d connection_jobs_dropped=%d",
 		stats.VotesCastThisRun,
 		stats.NetworkLandedVotes,
 		stats.LastNetworkLandedSlot,
 		stats.BroadcastMessagesQueued,
 		stats.BroadcastMessagesDropped,
 		stats.BroadcastPeerSends,
+		stats.BroadcastPeerSendsSkipped,
 		stats.BroadcastPeerSendErrors,
+		stats.BroadcastDesiredPeers,
 		stats.BroadcastActiveConnections,
+		stats.BroadcastPendingConnections,
+		stats.BroadcastConnectionAttempts,
+		stats.BroadcastConnectionErrors,
+		stats.BroadcastConnectionJobsDropped,
 	)
 }
 

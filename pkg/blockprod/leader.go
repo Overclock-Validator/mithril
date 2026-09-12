@@ -79,41 +79,6 @@ type leaderSlotFailure struct {
 	detail string
 }
 
-// ShredSink shreds forged entry batches and broadcasts them via turbine.
-type ShredSink struct {
-	session *turbine.BroadcastSession
-	mu      sync.Mutex
-	err     error
-}
-
-func NewShredSink(session *turbine.BroadcastSession) *ShredSink {
-	return &ShredSink{session: session}
-}
-
-func (s *ShredSink) OnEntryBatch(entries []turbine.Entry, _ int) {
-	if s.session == nil || len(entries) == 0 {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.err != nil {
-		return
-	}
-	if err := s.session.BroadcastEntryBatch(entries); err != nil {
-		s.err = err
-		mlog.Log.Warnf("blockprod shred broadcast entry batch failed: %v", err)
-	}
-}
-
-func (s *ShredSink) Err() error {
-	if s == nil {
-		return nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.err
-}
-
 // LeaderLoop activates forge when this validator is the scheduled leader.
 // RewardCertBuilder produces skip/notar reward certificates for block footers.
 type RewardCertBuilder interface {
@@ -752,6 +717,9 @@ func (l *LeaderLoop) abortActiveSlotLocked() {
 	if l.activeBank != nil {
 		l.activeBank.Close()
 	}
+	if l.activeSink != nil {
+		l.activeSink.Discard()
+	}
 	l.activeBank = nil
 	l.activeSess = nil
 	l.activeSink = nil
@@ -983,6 +951,7 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 		l.abortActiveSlotLocked()
 		return
 	}
+	l.activeSink.Wait()
 	if err := l.activeSink.Err(); err != nil {
 		l.failProductionWindowLocked(slot, leaderReasonEntryBroadcastFailed, err.Error())
 		l.abortActiveSlotLocked()
@@ -999,21 +968,26 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 		footerRewards = l.rewardCerts.BuildForLeaderSlot(slot)
 	}
 
-	if l.accountsDb == nil || l.epochSchedule == nil || l.activeSess == nil {
-		l.failProductionWindowLocked(slot, leaderReasonFinalizationUnavailable, "accounts DB, epoch schedule, or broadcast session is unavailable")
+	if l.accountsDb == nil || l.activeSess == nil {
+		l.failProductionWindowLocked(slot, leaderReasonFinalizationUnavailable, "accounts DB or broadcast session is unavailable")
 		l.abortActiveSlotLocked()
 		return
 	}
+	parentLastBlockhash := l.parentCtx.ParentLastBlockhash
+	if parentLastBlockhash == (solana.Hash{}) {
+		parentLastBlockhash = l.parentCtx.ParentLastEntryHash
+	}
 
 	producedBlock := BuildLeaderBlock(LeaderBlockInput{
-		Bank:             l.activeBank,
-		EpochSchedule:    l.epochSchedule,
-		ParentSlot:       l.parentCtx.ParentSlot,
-		ParentBankhash:   l.parentCtx.ParentBankhash,
-		PrevNumSigs:      l.parentCtx.PrevNumSigs,
-		PrevFeeGovernor:  l.parentCtx.PrevFeeGovernor,
-		EntryBlockhash:   tickHash,
-		TxFeeAccumulator: l.activeBank.TxFeeAccumulator(),
+		Bank:                l.activeBank,
+		ParentSlot:          l.parentCtx.ParentSlot,
+		ParentBankhash:      l.parentCtx.ParentBankhash,
+		ParentLastBlockhash: parentLastBlockhash,
+		ParentBlockHeight:   l.parentCtx.ParentBlockHeight,
+		PrevNumSigs:         l.parentCtx.PrevNumSigs,
+		PrevFeeGovernor:     l.parentCtx.PrevFeeGovernor,
+		EntryBlockhash:      tickHash,
+		TxFeeAccumulator:    l.activeBank.TxFeeAccumulator(),
 	})
 	producedBlock.SkipRewardCert = append([]byte(nil), footerRewards.Skip...)
 	producedBlock.NotarRewardCert = append([]byte(nil), footerRewards.Notar...)
@@ -1033,7 +1007,6 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 		AcctsDb:                 l.accountsDb,
 		SlotCtx:                 l.activeBank.SlotCtx(),
 		Block:                   producedBlock,
-		EpochSchedule:           l.epochSchedule,
 		TxFeeAccumulator:        l.activeBank.TxFeeAccumulator(),
 		AlpenglowClock:          l.alpenglowClock,
 		AlpenglowShredVersion:   l.shredVersion,
@@ -1056,6 +1029,8 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 		l.abortActiveSlotLocked()
 		return
 	}
+	// Ending tick is the last-in-slot shred. Mid-slot entry batches are only
+	// emitted when they fill a FEC set; Freeze already flushed any leftover.
 	if err := l.activeSess.BroadcastEndingTickLast(tickHash); err != nil {
 		l.failProductionWindowLocked(slot, leaderReasonEndingTickBroadcastFailed, err.Error())
 		l.abortActiveSlotLocked()
@@ -1078,6 +1053,7 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 		producedBlock.HasAlpenglowLastChainedRoot = true
 		global.SetAlpenglowChainedMerkleRoot(slot, chained)
 	}
+	replay.RegisterLocalLeaderCommit(l.activeBank.SlotCtx())
 	if l.onBlock != nil {
 		handoffStartedAt := l.now()
 		l.onBlock(producedBlock)
@@ -1139,6 +1115,14 @@ func (l *LeaderLoop) startSlotLocked(slot uint64) error {
 	if l.parentContext != nil {
 		parentCtx = l.parentContext(slot)
 	}
+	epochSchedule := l.epochSchedule
+	if parentCtx.BankSysvars != nil {
+		if bankEpochSchedule, ok := parentCtx.BankSysvars.EpochSchedule(); ok {
+			epochSchedule = &bankEpochSchedule
+		} else {
+			return fmt.Errorf("%w: EpochSchedule missing for replay parent slot %d", errParentNotReady, parentCtx.ParentSlot)
+		}
+	}
 	parentSlot := parentCtx.ParentSlot
 	if slot == 0 {
 		parentSlot = 0
@@ -1152,7 +1136,7 @@ func (l *LeaderLoop) startSlotLocked(slot uint64) error {
 	if slot > 0 && parentCtx.ParentBankhash == (solana.Hash{}) {
 		return fmt.Errorf("%w: parent bankhash missing for slot %d", errParentNotReady, parentSlot)
 	}
-	if slot > 0 && l.epochSchedule != nil && l.epochSchedule.GetEpoch(parentSlot) != l.epochSchedule.GetEpoch(slot) {
+	if slot > 0 && epochSchedule != nil && epochSchedule.GetEpoch(parentSlot) != epochSchedule.GetEpoch(slot) {
 		return fmt.Errorf("%w: parent block is slot %d", errEpochTransitionProductionUnsupported, parentSlot)
 	}
 	if parentCtx.EpochRewardsActive {
@@ -1163,6 +1147,14 @@ func (l *LeaderLoop) startSlotLocked(slot uint64) error {
 	}
 	if slot > 0 && parentCtx.PrevFeeGovernor == nil {
 		return fmt.Errorf("%w: parent fee rate governor missing for replay parent slot %d", errParentNotReady, parentSlot)
+	}
+	if slot > 0 && l.accountsDb != nil && parentCtx.BankSysvars == nil {
+		return fmt.Errorf("%w: bank sysvar snapshot missing for replay parent slot %d", errParentNotReady, parentSlot)
+	}
+	if slot > 0 && l.accountsDb != nil {
+		if err := parentCtx.BankSysvars.ValidateForExecution(); err != nil {
+			return fmt.Errorf("%w: invalid bank sysvar snapshot for replay parent slot %d: %v", errParentNotReady, parentSlot, err)
+		}
 	}
 	if slot > 0 && parentCtx.ReplayGeneration == 0 {
 		return fmt.Errorf("%w: replay generation missing for parent slot %d", errParentNotReady, parentSlot)
@@ -1191,22 +1183,25 @@ func (l *LeaderLoop) startSlotLocked(slot uint64) error {
 		Broadcaster:             l.broadcaster,
 		UserAgent:               l.userAgent,
 	})
-	slotCtx, err := NewLeaderSlotCtx(slot, parentSlot, l.accountsDb, parentCtx, l.epochSchedule)
+	slotCtx, err := NewLeaderSlotCtx(slot, parentSlot, l.accountsDb, parentCtx, epochSchedule)
 	if err != nil {
 		return fmt.Errorf("new leader slot ctx: %w", err)
 	}
-	if l.accountsDb != nil && l.epochSchedule != nil {
+	if l.accountsDb != nil && epochSchedule != nil {
 		prepBlock := &b.Block{
 			Slot:           slot,
 			ParentSlot:     parentSlot,
-			Epoch:          l.epochSchedule.GetEpoch(slot),
+			Epoch:          epochSchedule.GetEpoch(slot),
 			ParentBankhash: parentCtx.ParentBankhash,
 		}
-		if err := replay.PrepareLeaderSlotSysvars(slotCtx, prepBlock, l.epochSchedule, l.alpenglowClock); err != nil {
+		if err := replay.PrepareLeaderSlotSysvars(slotCtx, prepBlock, l.alpenglowClock); err != nil {
 			return fmt.Errorf("prepare leader sysvars: %w", err)
 		}
 	}
-	startEntryHash := parentCtx.ParentLastEntryHash
+	startEntryHash := parentCtx.ParentLastBlockhash
+	if startEntryHash == (solana.Hash{}) {
+		startEntryHash = parentCtx.ParentLastEntryHash
+	}
 	if startEntryHash == (solana.Hash{}) {
 		startEntryHash = parentCtx.ParentBankhash
 	}
@@ -1215,7 +1210,7 @@ func (l *LeaderLoop) startSlotLocked(slot uint64) error {
 		SlotCtx:             slotCtx,
 		Slot:                slot,
 		Leader:              l.identity.PublicKey(),
-		Limits:              costmodel.DefaultLimits(),
+		Limits:              costmodel.LimitsForFeatures(slotCtx.Features),
 		EntryHash:           startEntryHash,
 		Sink:                sink,
 		TransactionStatuses: parentCtx.TransactionStatuses,

@@ -85,6 +85,39 @@ func (w *WeightedShuffle) First(rng rngSource) (int, bool) {
 	return w.zeros[idx], true
 }
 
+// Next removes and returns the next index from the stake-weighted shuffle.
+// Positive-weight entries are sampled first; zero-weight entries follow in a
+// uniformly shuffled tail. This matches Agave's WeightedShuffle iterator and
+// is used when deriving the complete Turbine retransmit tree.
+func (w *WeightedShuffle) Next(rng rngSource) (int, bool) {
+	if w.weight > 0 {
+		sampler := newUniformU64TraitSampler(w.weight)
+		sample := sampler.sample(rng)
+		index, weight := w.search(sample)
+		w.remove(index, weight)
+		return index, true
+	}
+	if len(w.zeros) == 0 {
+		return 0, false
+	}
+	sampler := newUniformU64TraitSampler(uint64(len(w.zeros)))
+	index := int(sampler.sample(rng))
+	value := w.zeros[index]
+	w.zeros[index] = w.zeros[len(w.zeros)-1]
+	w.zeros = w.zeros[:len(w.zeros)-1]
+	return value, true
+}
+
+func (w *WeightedShuffle) remove(k int, weight uint64) {
+	w.weight -= weight
+	index := w.numNodes + k
+	for index != 0 {
+		offset := (index - 1) & weightedShuffleBitMask
+		index = (index - 1) >> weightedShuffleBitShift
+		w.tree[index][offset] -= weight
+	}
+}
+
 func (w *WeightedShuffle) search(val uint64) (int, uint64) {
 	index := 0
 	for {

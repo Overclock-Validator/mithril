@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"math"
+	"os"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
@@ -18,18 +20,23 @@ import (
 
 func fixtureAcctStateToAccount(acctState *AcctState) accounts.Account {
 	var acct accounts.Account
+	// See createProgramAcct: the field is gone from the schema, and its implied
+	// value for a converted account is the maximum, not zero.
+	acct.RentEpoch = math.MaxUint64
 	acct.Key = solana.PublicKeyFromBytes(acctState.Address[:])
 	acct.Lamports = acctState.Lamports
 	acct.Data = acctState.Data
 	acct.Executable = acctState.Executable
-	acct.RentEpoch = acctState.RentEpoch
 	copy(acct.Owner[:], acctState.Owner)
 	return acct
 }
 
 func createProgramAcct(programId []byte) accounts.Account {
 	programKey := solana.PublicKeyFromBytes(programId)
-	programAcct := accounts.Account{Key: programKey, Lamports: 100000000, Data: make([]byte, 0), Owner: a.NativeLoaderAddr, Executable: true, RentEpoch: 100}
+	// protosol v5.4.0 dropped rent_epoch from AcctState, but converted accounts
+	// are defined as carrying the maximum value rather than zero. Leaving the Go
+	// zero here would silently model every account as rent-paying.
+	programAcct := accounts.Account{Key: programKey, Lamports: 100000000, Data: make([]byte, 0), Owner: a.NativeLoaderAddr, Executable: true, RentEpoch: math.MaxUint64}
 	return programAcct
 }
 
@@ -211,11 +218,21 @@ func parseAndConfigureFeatures(execCtx *sealevel.ExecutionCtx, fixture *InstrFix
 	f := features.NewFeaturesDefault()
 	execCtx.Features = *f
 
-	for _, ftr := range fixture.Input.EpochContext.Features.Features {
+	// Not every fixture carries an epoch context; the precompile corpus mostly
+	// does not. Treat a missing one as "no features beyond the defaults" rather
+	// than dereferencing through it.
+	if fixture.Input == nil || fixture.Input.Features == nil {
+		return
+	}
+
+	verbose := os.Getenv("MITHRIL_CONFORMANCE_VERBOSE") != ""
+	for _, ftr := range fixture.Input.Features.Features {
 		for _, featureGate := range features.AllFeatureGates {
 			featureIdInt := binary.LittleEndian.Uint64(featureGate.Address[:8])
 			if featureIdInt == ftr {
-				fmt.Printf("enabling feature %s\n", featureGate.Name)
+				if verbose {
+					fmt.Printf("enabling feature %s\n", featureGate.Name)
+				}
 				execCtx.Features.EnableFeature(featureGate, 0)
 			}
 		}
@@ -323,9 +340,8 @@ func accountStateChangesMatch(t *testing.T, execCtx *sealevel.ExecutionCtx, fixt
 				if fixtureModifiedAcct.Executable != mithrilModifiedAcct.Executable {
 					return false
 				}
-				if fixtureModifiedAcct.RentEpoch != mithrilModifiedAcct.RentEpoch {
-					return false
-				}
+				// AcctState dropped rent_epoch in protosol v5.4.0, so the
+				// corpus no longer carries an expected value to compare.
 				if solana.PublicKeyFromBytes(fixtureModifiedAcct.Owner[:]) != solana.PublicKeyFromBytes(mithrilModifiedAcct.Owner[:]) {
 					return false
 				}

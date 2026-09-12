@@ -31,13 +31,13 @@ func TestReceiverFinalShredReturnsBeforeCompletionWorkFinishes(t *testing.T) {
 	}()
 
 	for idx, packet := range packets[:len(packets)-1] {
-		if !receiver.processPacket(ctx, nil, packet, nil) {
+		if !receiver.processPacket(ctx, nil, packet, nil, false) {
 			t.Fatalf("processPacket(%d) stopped", idx)
 		}
 	}
 	finalReturned := make(chan bool, 1)
 	go func() {
-		finalReturned <- receiver.processPacket(ctx, nil, packets[len(packets)-1], nil)
+		finalReturned <- receiver.processPacket(ctx, nil, packets[len(packets)-1], nil, false)
 	}()
 	select {
 	case keepRunning := <-finalReturned:

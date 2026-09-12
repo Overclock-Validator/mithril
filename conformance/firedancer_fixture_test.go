@@ -182,13 +182,13 @@ func unmarshalFiredancerInstrFixture(data []byte) (*InstrFixture, error) {
 	}
 	features, ok := currentInstrFeatures(data)
 	if ok {
-		currentFixture.Input.EpochContext = &EpochContext{Features: &FeatureSet{Features: features}}
-	} else if currentFixture.Input.EpochContext == nil {
-		currentFixture.Input.EpochContext = &EpochContext{}
+		// protosol v5.4.0 flattened epoch_context away: InstrContext now
+		// carries the FeatureSet directly at field 10.
+		currentFixture.Input.Features = &FeatureSet{Features: features}
+	} else if currentFixture.Input.Features == nil {
+		currentFixture.Input.Features = &FeatureSet{}
 	}
-	if currentFixture.Input.SlotContext == nil {
-		currentFixture.Input.SlotContext = &SlotContext{}
-	}
+	// slot_context was removed from InstrContext in protosol v5.4.0.
 	return &InstrFixture{
 		Input:  currentFixture.Input,
 		Output: currentFixture.Output,

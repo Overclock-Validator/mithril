@@ -234,6 +234,14 @@ func fetchSysvarBytesForPubkey(execCtx *ExecutionCtx, pubkey solana.PublicKey) (
 	if !slices.Contains(permittedSysvarAddrs, pubkey) {
 		return nil, fmt.Errorf("unrecognised sysvar")
 	}
+	if execCtx != nil && execCtx.SlotCtx != nil {
+		if bankSysvars := execCtx.SlotCtx.BankSysvars(); bankSysvars != nil {
+			if data, ok := bankSysvars.RawView(pubkey); ok {
+				return data, nil
+			}
+			return nil, fmt.Errorf("sysvar account not found in bank snapshot")
+		}
+	}
 
 	accts := addrObjectForLookup(execCtx)
 	if accts != nil && *accts != nil {

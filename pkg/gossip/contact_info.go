@@ -8,6 +8,8 @@ import (
 	"net"
 	"sort"
 	"time"
+
+	narya "github.com/Overclock-Validator/narya-ed25519/ed25519"
 )
 
 const (
@@ -120,7 +122,7 @@ func NewContactInfo(pubkey Pubkey, shredVersion uint16, gossipAddr, tvuAddr *net
 }
 
 func (r contactRecord) Verify() bool {
-	return ed25519.Verify(ed25519.PublicKey(r.Pubkey[:]), r.data, r.signature[:])
+	return narya.VerifyStrict(r.Pubkey[:], r.data, r.signature[:])
 }
 
 func (r contactRecord) ContactInfo() *ContactInfo {
@@ -641,7 +643,7 @@ func (v CrdsValue) Verify() bool {
 	if v.ContactInfo == nil {
 		return false
 	}
-	return ed25519.Verify(ed25519.PublicKey(v.ContactInfo.Pubkey[:]), v.Data, v.Signature[:])
+	return narya.VerifyStrict(v.ContactInfo.Pubkey[:], v.Data, v.Signature[:])
 }
 
 func hashPingToken(token [32]byte) Hash {

@@ -112,3 +112,58 @@ func TestValidateDecodedBlockFinalCertificateWithVerifierRetainsExactBLSChecks(t
 	)
 	require.Error(t, err)
 }
+
+func TestValidateDecodedSlowFinalCertificateReturnsUnionOfSigners(t *testing.T) {
+	const slot = uint64(789)
+	var blockID solana.Hash
+	blockID[0] = 10
+
+	keys := testBLSKeys(t, 3)
+	notarVotes := []alpenglow.VoteMessage{
+		testSignedVote(t, alpenglow.NewNotarizationVote(slot, blockID), 0, keys[0]),
+		testSignedVote(t, alpenglow.NewNotarizationVote(slot, blockID), 1, keys[1]),
+	}
+	finalizeVotes := []alpenglow.VoteMessage{
+		testSignedVote(t, alpenglow.NewFinalizationVote(slot), 1, keys[1]),
+		testSignedVote(t, alpenglow.NewFinalizationVote(slot), 2, keys[2]),
+	}
+	validatorSet, _ := testValidatorSetForVotes(t, append(notarVotes, finalizeVotes...))
+	verifier := alpenglow.NewCertificateVerifier()
+	require.NoError(t, verifier.SetValidatorSet(validatorSet))
+	verifier.SetShredVersion(0)
+
+	notarSignature, err := aggregateVoteSignatures([][]byte{
+		notarVotes[0].Signature,
+		notarVotes[1].Signature,
+	})
+	require.NoError(t, err)
+	finalizeSignature, err := aggregateVoteSignatures([][]byte{
+		finalizeVotes[0].Signature,
+		finalizeVotes[1].Signature,
+	})
+	require.NoError(t, err)
+	finalCertificate := FinalCertificate{
+		Slot:    slot,
+		BlockID: blockID,
+		FinalAggregate: VotesAggregateWire{
+			Signature: finalizeSignature,
+			Bitmap:    mustSignerBitmapBase2(t, 3, 1, 2),
+		},
+		NotarAggregate: &VotesAggregateWire{
+			Signature: notarSignature,
+			Bitmap:    mustSignerBitmapBase2(t, 3, 0, 1),
+		},
+	}
+
+	validated, err := ValidateDecodedBlockFinalCertificateWithVerifier(
+		finalCertificate,
+		validatorSet.Epoch,
+		verifier,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, validated)
+	require.Len(t, validated.Signers, 3)
+	for _, validator := range validatorSet.Validators {
+		assert.Contains(t, validated.Signers, validator.VoteAccount)
+	}
+}
