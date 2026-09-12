@@ -651,6 +651,9 @@ func activeLeaderFailureDetail(reason string) string {
 }
 
 func sameReplayParentSnapshot(want, got ParentContext) bool {
+	if got.GenesisParent != want.GenesisParent {
+		return false
+	}
 	if want.ReplayGeneration == 0 || got.ReplayGeneration != want.ReplayGeneration {
 		return false
 	}
@@ -960,7 +963,7 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 
 	pohTip := l.activeBank.EntryHash()
 	tickHash := turbine.AlpentickHash(pohTip)
-	producerTimeNanos := l.clampProducerTimeNanos(slot, time.Now().UnixNano())
+	producerTimeNanos := l.clampProducerTimeNanos(slot, l.now().UnixNano())
 	footerTimestamp := int64(producerTimeNanos / 1_000_000_000)
 
 	var footerRewards rewardcerts.RewardCertificates
@@ -1152,7 +1155,18 @@ func (l *LeaderLoop) startSlotLocked(slot uint64) error {
 		return fmt.Errorf("%w: bank sysvar snapshot missing for replay parent slot %d", errParentNotReady, parentSlot)
 	}
 	if slot > 0 && l.accountsDb != nil {
-		if err := parentCtx.BankSysvars.ValidateForExecution(); err != nil {
+		validationSysvars := parentCtx.BankSysvars
+		if parentCtx.GenesisParent != nil {
+			firstHashes, err := parentCtx.GenesisParent.FirstChildSlotHashes(slot, parentSlot, parentCtx.ParentBankhash, validationSysvars)
+			if err != nil {
+				return err
+			}
+			validationSysvars, err = validationSysvars.WithAccounts(firstHashes)
+			if err != nil {
+				return err
+			}
+		}
+		if err := validationSysvars.ValidateForExecution(); err != nil {
 			return fmt.Errorf("%w: invalid bank sysvar snapshot for replay parent slot %d: %v", errParentNotReady, parentSlot, err)
 		}
 	}
@@ -1189,10 +1203,14 @@ func (l *LeaderLoop) startSlotLocked(slot uint64) error {
 	}
 	if l.accountsDb != nil && epochSchedule != nil {
 		prepBlock := &b.Block{
-			Slot:           slot,
-			ParentSlot:     parentSlot,
-			Epoch:          epochSchedule.GetEpoch(slot),
-			ParentBankhash: parentCtx.ParentBankhash,
+			Slot:                   slot,
+			ParentSlot:             parentSlot,
+			Epoch:                  epochSchedule.GetEpoch(slot),
+			ParentBankhash:         parentCtx.ParentBankhash,
+			Features:               slotCtx.Features,
+			VoteTimestamps:         slotCtx.VoteTimestamps,
+			EpochStakesPerVoteAcct: slotCtx.VoteAccts,
+			TotalEpochStake:        slotCtx.TotalEpochStake,
 		}
 		if err := replay.PrepareLeaderSlotSysvars(slotCtx, prepBlock, l.alpenglowClock); err != nil {
 			return fmt.Errorf("prepare leader sysvars: %w", err)

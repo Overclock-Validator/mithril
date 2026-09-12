@@ -9,6 +9,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	a "github.com/Overclock-Validator/mithril/pkg/addresses"
 	b "github.com/Overclock-Validator/mithril/pkg/block"
+	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	bin "github.com/gagliardetto/binary"
 )
@@ -57,11 +58,11 @@ func SkewBlockProducerTimeNanos(parentNanos, workingNanos int64, elapsedSlotDura
 // timestamp clamping. It reads the alpenclock PDA at the given slot, falling
 // back to the Clock sysvar's unix_timestamp (seconds -> nanoseconds), mirroring
 // Agave's bank.get_nanosecond_clock().unwrap_or_else(clock fallback).
-func ReadNanosecondClockAt(acctsDb *accountsdb.AccountsDb, slot uint64) (int64, bool) {
+func ReadNanosecondClockAt(acctsDb *accountsdb.AccountsDb, slot uint64, bankFeatures ...*features.Features) (int64, bool) {
 	if acctsDb == nil {
 		return 0, false
 	}
-	if acct, err := acctsDb.GetAccount(slot, NanosecondClockAccountAddr()); err == nil &&
+	if acct, err := acctsDb.GetAccount(slot, NanosecondClockAccountAddr(bankFeatures...)); err == nil &&
 		acct != nil && len(acct.Data) >= nanosecondClockDataLen {
 		return int64(binary.LittleEndian.Uint64(acct.Data[:nanosecondClockDataLen])), true
 	}
@@ -95,14 +96,14 @@ func nanosecondClockAnchor(slotCtx *sealevel.SlotCtx) (int64, error) {
 	}
 	var nanoClockAcct *accounts.Account
 	if slotCtx.ParentAccts != nil {
-		acct, err := slotCtx.GetParentAccount(NanosecondClockAccountAddr())
+		acct, err := slotCtx.GetParentAccount(NanosecondClockAccountAddr(slotCtx.Features))
 		if err != nil {
 			return 0, fmt.Errorf("parent nanosecond clock was not pinned: %w", err)
 		}
 		nanoClockAcct = acct
 	} else if slotCtx.Accounts != nil {
 		// Compatibility for isolated callers that predate parent snapshots.
-		nanoClockAcct, _ = slotCtx.GetAccount(NanosecondClockAccountAddr())
+		nanoClockAcct, _ = slotCtx.GetAccount(NanosecondClockAccountAddr(slotCtx.Features))
 	}
 	if nanoClockAcct != nil && nanoClockAcct.Lamports > 0 && len(nanoClockAcct.Data) != 0 {
 		if len(nanoClockAcct.Data) < nanosecondClockDataLen {
@@ -198,7 +199,7 @@ func updateAlpenglowNanosecondClockAccount(slotCtx *sealevel.SlotCtx, block *b.B
 		return nil
 	}
 
-	addr := NanosecondClockAccountAddr()
+	addr := NanosecondClockAccountAddr(slotCtx.Features)
 	acct, err := slotCtx.GetAccount(addr)
 	if err != nil {
 		acct = &accounts.Account{

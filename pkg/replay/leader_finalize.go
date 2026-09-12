@@ -76,7 +76,7 @@ func PrepareLeaderSlotSysvars(slotCtx *sealevel.SlotCtx, block *b.Block, alpengl
 		return fmt.Errorf("leader parent snapshot has no SlotHashes account")
 	}
 	slotHashes.Update(block.Slot, block.ParentSlot, block.ParentBankhash)
-	slotHashesAcct.Data = slotHashes.MustMarshal()
+	slotHashesAcct.Data = paddedSysvarData(slotHashes.MustMarshal(), len(slotHashesAcct.Data))
 	if err := slotCtx.SetAccount(slotHashesAcct.Key, slotHashesAcct); err != nil {
 		return err
 	}

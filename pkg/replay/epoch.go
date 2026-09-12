@@ -321,7 +321,7 @@ func handleEpochTransition(acctsDb *accountsdb.AccountsDb, partitionedEpochRewar
 		if alpenglowActive && rewardedEpoch >= migrationEpoch {
 			updated, parent, err := stageRewardEpochDelegatedStakes(
 				acctsDb, prevSlotCtx.Slot, block.Slot, rewardedEpoch,
-				admitted, scanResult.RewardEpochEffectiveStakes, replayCtx,
+				admitted, scanResult.RewardEpochEffectiveStakes, replayCtx, f,
 			)
 			if err != nil {
 				panic(err)
@@ -330,7 +330,7 @@ func handleEpochTransition(acctsDb *accountsdb.AccountsDb, partitionedEpochRewar
 			block.ParentEpochUpdatedAccts = append(block.ParentEpochUpdatedAccts, parent)
 		}
 
-		if alpenglowActive && f.IsActive(features.ValidatorAdmissionTicket) {
+		if alpenglowClockFeatureActive(f) && f.IsActive(features.ValidatorAdmissionTicket) {
 			updated, parents, err := applyAlpenglowBoundaryVAT(
 				acctsDb, prevSlotCtx.Slot, block.Slot,
 				alpenglowVATBurnPerEpoch(f, epochSchedule, block.Slot), admitted,
@@ -351,7 +351,10 @@ func handleEpochTransition(acctsDb *accountsdb.AccountsDb, partitionedEpochRewar
 		block.EpochUpdatedAccts = append(block.EpochUpdatedAccts, updated...)
 		block.ParentEpochUpdatedAccts = append(block.ParentEpochUpdatedAccts, parents...)
 
-		if alpenglowClockFeatureActive(f) {
+		// The pinned genesis-v1 revision predates the vote-reward inflation
+		// account. Its clock uses Alpenglow, but rewards still use the older
+		// partitioned-reward state. Creating this later PDA changes its bank hash.
+		if alpenglowClockFeatureActive(f) && !genesisV1AlpenglowMetadata([]*features.Features{f}) {
 			updated, parent, err := stageEpochInflationAccount(
 				acctsDb, prevSlotCtx.Slot, block.Slot, replayCtx, epochSchedule, f,
 				newEpoch, epochStartCapitalization, epochRewardsCapitalizationIncrease,

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/Overclock-Validator/mithril/pkg/util"
 	"hash/crc32"
 	"io"
 	"os"
@@ -174,7 +175,7 @@ func WriteSegmentManifest(acctsDir string, m *SegmentManifest) error {
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("accountsdb: close manifest: %w", err)
 	}
-	if err := os.Rename(tmp, final); err != nil {
+	if err := util.RenameNoReplace(tmp, final); err != nil {
 		return fmt.Errorf("accountsdb: rename manifest: %w", err)
 	}
 	return fsyncDir(acctsDir)

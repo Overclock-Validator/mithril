@@ -668,15 +668,12 @@ func (c *TransactionStatusCache) Root(through uint64) bool {
 	if through > c.rootedThrough {
 		c.rootedThrough = through
 	}
-	if !c.coverageComplete {
-		rooted := uint32(c.rootedSinceSeed) + uint32(newlyRooted)
-		if rooted >= maxTransactionStatusRoots {
-			c.rootedSinceSeed = maxTransactionStatusRoots
-			c.coverageComplete = true
-		} else {
-			c.rootedSinceSeed = uint16(rooted)
-		}
-	}
+	// A genesis cache has complete coverage from the outset, but still needs
+	// to count its rooted banks. Otherwise its own serialized checkpoint fails
+	// the complete-window validation when reopened after the first root.
+	rooted := uint32(c.rootedSinceSeed) + uint32(newlyRooted)
+	c.rootedSinceSeed = uint16(min(rooted, maxTransactionStatusRoots))
+	c.coverageComplete = c.coverageComplete || rooted >= maxTransactionStatusRoots
 	c.pruneLocked(through)
 	return !wasComplete && c.coverageComplete
 }

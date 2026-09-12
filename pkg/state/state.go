@@ -20,10 +20,21 @@ const HistoryFileName = "mithril_state.history.jsonl"
 // balances; older checkpoints cannot prove SIMD-0357 VAT admission on resume.
 const CurrentStateSchemaVersion uint32 = 3
 
+// Snapshot-origin state remains v3. Pebble genesis uses v6 (V2 used v4/v5) so an older reader cannot
+// mistake a completed slot-zero bank for an absent snapshot/recovery root.
+const GenesisStateSchemaVersion uint32 = 6
+
+// GenesisReplayStateSchemaVersion fences stores that may contain offline child
+// checkpoints. The immutable genesis marker remains the slot-0 anchor; Pebble fold
+// manifests select the durable replay position, without claiming finality.
+const GenesisReplayStateSchemaVersion uint32 = 7
+
 // MithrilState tracks the current state of the mithril node.
 // The state file serves as an atomic marker of validity - AccountsDB is valid
 // if and only if this file exists with Stage == "ready".
 type MithrilState struct {
+	Origin  string         `json:"origin,omitempty"`
+	Genesis *GenesisOrigin `json:"genesis,omitempty"`
 	// =========================================================================
 	// Schema & Run Lineage
 	// =========================================================================
@@ -321,9 +332,12 @@ func LoadState(accountsDbDir string) (*MithrilState, error) {
 		return nil, fmt.Errorf("failed to parse state file: %w", err)
 	}
 
-	// Require schema version 2 - no migration from older versions
-	if state.StateSchemaVersion != CurrentStateSchemaVersion {
-		return nil, fmt.Errorf("state file schema version %d is not supported (requires v%d). Delete AccountsDB and rebuild from snapshot", state.StateSchemaVersion, CurrentStateSchemaVersion)
+	if state.StateSchemaVersion == GenesisStateSchemaVersion || state.StateSchemaVersion == GenesisReplayStateSchemaVersion {
+		if err := state.ValidateGenesisOrigin(); err != nil {
+			return nil, err
+		}
+	} else if state.StateSchemaVersion != CurrentStateSchemaVersion || state.Origin != "" && state.Origin != "snapshot" || state.Genesis != nil {
+		return nil, fmt.Errorf("unsupported state schema/origin: version %d, origin %q; use a compatible Mithril binary", state.StateSchemaVersion, state.Origin)
 	}
 
 	return &state, nil
@@ -562,6 +576,9 @@ func (s *MithrilState) getWriterCommit() string {
 // rooted slot in rooted-durable mode (the in-RAM slots above the last rooted slot
 // are lost on restart), else LastSlot+1, else SnapshotSlot+1.
 func (s *MithrilState) GetResumeSlot() uint64 {
+	if s.HasGenesisRoot() {
+		return s.Genesis.NextReplaySlot
+	}
 	if s.LastRootedSlot > 0 {
 		return s.LastRootedSlot + 1
 	}
@@ -604,6 +621,9 @@ type BankhashGetter interface {
 // This detects cases where the process was killed (Ctrl+Z, kill -9) without
 // updating the state file, leaving AccountsDB in an inconsistent state.
 func (s *MithrilState) ValidateAgainstBankhashDB(bankhashDb BankhashGetter) error {
+	if s.HasGenesisRoot() {
+		return s.validateGenesisBankhash(bankhashDb)
+	}
 	// Rooted-durable: the fold meta + manifests are the commit authority (see
 	// accountsdb.RecoverFoldState, which reconciles R before this runs).
 	// Bankhash rows BEYOND R are legal: fold bankhashes are written NoSync and
@@ -777,12 +797,15 @@ func CheckAndLoadValidState(accountsDbDir string) (*MithrilState, error) {
 	state, err := LoadState(accountsDbDir)
 	if err != nil {
 		mlog.Log.Infof("error loading state file: %v", err)
-		return nil, nil
+		return nil, err
 	}
 
 	if state == nil {
 		mlog.Log.Infof("no state file found in %s", accountsDbDir)
 		return nil, nil
+	}
+	if state.StateSchemaVersion == GenesisReplayStateSchemaVersion {
+		return nil, fmt.Errorf("genesis replay store requires manifest-aware replay.OpenGenesisReplay; the state marker only describes the slot-0 anchor")
 	}
 
 	// Handle corrupted state with specific logging
@@ -797,7 +820,11 @@ func CheckAndLoadValidState(accountsDbDir string) (*MithrilState, error) {
 	}
 
 	// Extra validation: check that artifacts actually exist
-	if err := ValidateAccountsDbArtifacts(accountsDbDir); err != nil {
+	if state.HasGenesisRoot() {
+		if err := state.ValidateGenesisArtifacts(accountsDbDir); err != nil {
+			return nil, fmt.Errorf("invalid genesis AccountsDB artifacts: %w", err)
+		}
+	} else if err := ValidateAccountsDbArtifacts(accountsDbDir); err != nil {
 		mlog.Log.Infof("state file says ready but artifacts invalid: %v", err)
 		return nil, nil
 	}

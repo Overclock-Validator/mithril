@@ -405,11 +405,11 @@ func extractAndDedupeBlockAccts(block *b.Block) ([]solana.PublicKey, int) {
 	return pubkeys, writableAccountCount
 }
 
-func includeAlpenglowParentStateAccounts(pubkeys []solana.PublicKey, alpenglowClock bool) []solana.PublicKey {
+func includeAlpenglowParentStateAccounts(pubkeys []solana.PublicKey, alpenglowClock bool, bankFeatures ...*features.Features) []solana.PublicKey {
 	if !alpenglowClock {
 		return pubkeys
 	}
-	nanoClockAddr := NanosecondClockAccountAddr()
+	nanoClockAddr := NanosecondClockAccountAddr(bankFeatures...)
 	if slices.Contains(pubkeys, nanoClockAddr) {
 		return pubkeys
 	}
@@ -562,7 +562,7 @@ func recordSysvarAccountReadStats(dst *metrics.AccountLoader, src accountsdb.Acc
 	}
 }
 
-func loadBlockAccountsAndUpdateSysvars(accountsDb blockAccountSource, block *b.Block, epochSchedule *sealevel.SysvarEpochSchedule, alpenglowClock bool, parentBankSysvars *sealevel.BankSysvars) (accounts.Accounts, accounts.Accounts, int, *sealevel.BankSysvars, error) {
+func loadBlockAccountsAndUpdateSysvars(accountsDb blockAccountSource, block *b.Block, epochSchedule *sealevel.SysvarEpochSchedule, alpenglowClock bool, parentBankSysvars *sealevel.BankSysvars, genesisParent ...*GenesisReplayBootstrap) (accounts.Accounts, accounts.Accounts, int, *sealevel.BankSysvars, error) {
 	var bankSysvars *sealevel.BankSysvars
 	phaseStart := time.Now()
 	err := resolveAddrTableLookups(accountsDb, block)
@@ -577,7 +577,7 @@ func loadBlockAccountsAndUpdateSysvars(accountsDb blockAccountSource, block *b.B
 	// mentions it. Pin the exact parent account (or AccountsDB's tombstone for
 	// absence) in the same batch snapshot as all other execution accounts. This
 	// preserves both the footer bounds anchor and the AccountsLtHash before-image.
-	dedupedAccts = includeAlpenglowParentStateAccounts(dedupedAccts, alpenglowClock)
+	dedupedAccts = includeAlpenglowParentStateAccounts(dedupedAccts, alpenglowClock, block.Features)
 	publicationCapacity := publicationMapCapacity(block, uniqueWritableAccounts, alpenglowClock)
 	metrics.GlobalBlockReplay.AccountLoader.DedupeBlockAccounts.AddTimingSince(phaseStart)
 	ctx := context.Background()
@@ -701,11 +701,17 @@ func loadBlockAccountsAndUpdateSysvars(accountsDb blockAccountSource, block *b.B
 				var ok bool
 				slotHashesAcct, ok = parentBankSysvars.CloneAccount(sealevel.SysvarSlotHashesAddr)
 				if !ok {
-					panic("required SlotHashes sysvar is absent from parent bank snapshot")
+					if len(genesisParent) != 1 {
+						return nil, nil, 0, nil, fmt.Errorf("required SlotHashes sysvar is absent from parent bank snapshot")
+					}
+					slotHashesAcct, err = genesisParent[0].slotHashesAccount(block, parentBankSysvars)
+					if err != nil {
+						return nil, nil, 0, nil, err
+					}
 				}
-				parentSlotHashes, ok := parentBankSysvars.SlotHashes()
-				if !ok {
-					panic("decoded SlotHashes sysvar is absent from parent bank snapshot")
+				parentSlotHashes, decoded := parentBankSysvars.SlotHashes()
+				if ok && !decoded {
+					return nil, nil, 0, nil, fmt.Errorf("decoded SlotHashes sysvar is absent from parent bank snapshot")
 				}
 				// Update mutates the slice; detach it while sharing every other
 				// decoded sysvar with the immutable parent snapshot.
@@ -731,7 +737,7 @@ func loadBlockAccountsAndUpdateSysvars(accountsDb blockAccountSource, block *b.B
 				// so overwrite it with the authoritative data from SysvarCache.
 				// This ensures BPF programs reading the account data directly see correct values.
 				slotHashes = *sealevel.SysvarCache.SlotHashes.Sysvar
-				newData := slotHashes.MustMarshal()
+				newData := paddedSysvarData(slotHashes.MustMarshal(), len(slotHashesAcct.Data))
 				if len(newData) != len(slotHashesAcct.Data) {
 					panic(fmt.Sprintf("SlotHashes data length mismatch: marshaled=%d, account=%d",
 						len(newData), len(slotHashesAcct.Data)))
@@ -750,7 +756,7 @@ func loadBlockAccountsAndUpdateSysvars(accountsDb blockAccountSource, block *b.B
 			// Now update with the new slot/bankhash
 			slotHashes.Update(block.Slot, block.ParentSlot, block.ParentBankhash)
 			newSlotHashesBytes := slotHashes.MustMarshal()
-			slotHashesAcct.Data = newSlotHashesBytes
+			slotHashesAcct.Data = paddedSysvarData(newSlotHashesBytes, len(slotHashesAcct.Data))
 			sealevel.SysvarCache.SlotHashes.Sysvar = &slotHashes
 			sealevel.SysvarCache.SlotHashes.Acct = slotHashesAcct
 			err = accts.SetAccountWithoutLock(sealevel.SysvarSlotHashesAddr, slotHashesAcct)
@@ -790,7 +796,7 @@ func loadBlockAccountsAndUpdateSysvars(accountsDb blockAccountSource, block *b.B
 					// so overwrite it with the authoritative data from SysvarCache.
 					// This ensures BPF programs reading the account data directly see correct values.
 					recentBlockhashes := sealevel.SysvarCache.RecentBlockHashes.Sysvar
-					newData := recentBlockhashes.MustMarshal()
+					newData := paddedSysvarData(recentBlockhashes.MustMarshal(), len(recentBlockhashesAcct.Data))
 					if len(newData) != len(recentBlockhashesAcct.Data) {
 						panic(fmt.Sprintf("RecentBlockhashes data length mismatch: marshaled=%d, account=%d",
 							len(newData), len(recentBlockhashesAcct.Data)))
@@ -2935,16 +2941,7 @@ func ReplayBlocks(
 
 		block.Features = replayCtx.CurrentFeatures
 
-		// post-epoch boundary rewards distribution
-		if partitionedEpochRewardsEnabled && partitionedRewardsInfo != nil && currentSlot >= partitionedRewardsInfo.FirstStakingRewardSlot && partitionedRewardsInfo.NumRewardPartitionsRemaining > 0 {
-			distributedAccts, parentDistributedAccts := distributePartitionedEpochRewardsForSlot(acctsDb, lastSlotCtx, block.EpochUpdatedAccts, replayCtx, partitionedRewardsInfo, currentSlot, block.BlockHeight)
-			block.EpochUpdatedAccts = append(block.EpochUpdatedAccts, distributedAccts...)
-			block.ParentEpochUpdatedAccts = append(block.ParentEpochUpdatedAccts, parentDistributedAccts...)
-		}
-
-		block.EpochUpdatedAccts, block.ParentEpochUpdatedAccts = coalesceEpochAccountUpdates(
-			block.EpochUpdatedAccts, block.ParentEpochUpdatedAccts,
-		)
+		distributeEpochRewardsForBlock(acctsDb, lastSlotCtx, replayCtx, partitionedRewardsInfo, block)
 
 		processBlockStart := time.Now()
 		metrics.GlobalBlockReplay.PreprocessBlock.AddTiming(processBlockStart.Sub(start))
@@ -4087,6 +4084,7 @@ func ProcessBlock(
 	transactionStatuses *TransactionStatusCache,
 	alpenglowClock bool,
 	parentBankSysvars *sealevel.BankSysvars,
+	genesisParent ...*GenesisReplayBootstrap,
 ) (*sealevel.SlotCtx, error) {
 	if block == nil {
 		return nil, errors.New("validate transaction messages: nil block")
@@ -4182,10 +4180,10 @@ func ProcessBlock(
 	if tail != nil {
 		blockSrc = tail
 	}
-	accts, parentAccts, accountMapCapacity, bankSysvars, err := loadBlockAccountsAndUpdateSysvars(blockSrc, block, epochSchedule, alpenglowClock, parentBankSysvars)
+	accts, parentAccts, accountMapCapacity, bankSysvars, err := loadBlockAccountsAndUpdateSysvars(blockSrc, block, epochSchedule, alpenglowClock, parentBankSysvars, genesisParent...)
 	loadAcctsRegion.End()
 	if err != nil {
-		panic(fmt.Sprintf("unable to load slot accounts and update sysvars: %s", err))
+		return nil, fmt.Errorf("unable to load slot accounts and update sysvars: %w", err)
 	}
 	if err := bankSysvars.ValidateForExecution(); err != nil {
 		return nil, fmt.Errorf("invalid bank sysvar snapshot at slot %d: %w", block.Slot, err)
