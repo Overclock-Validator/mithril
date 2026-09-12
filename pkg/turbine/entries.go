@@ -135,21 +135,23 @@ func decodeEntriesAndAlpenglowMarkersFromDataShreds(shreds []*Shred, timings *en
 	var entryBatches []*prefetchedShredBatch
 	var parentInfo *AlpenglowParentInfo
 	var blockFooter *BlockFooter
-	var batchBytes []byte
 	var batchStart uint32
+	var batchStartPos, batchSize int
 	var haveBatch bool
-	for _, shred := range shreds {
+	for shredPos, shred := range shreds {
 		if shred == nil || shred.Type != ShredTypeData {
 			continue
 		}
 		if !haveBatch {
 			batchStart = shred.Index
+			batchStartPos = shredPos
 			haveBatch = true
 		}
-		batchBytes = append(batchBytes, shred.Data...)
+		batchSize += len(shred.Data)
 		if !shred.DataComplete() {
 			continue
 		}
+		batchShreds := shreds[batchStartPos : shredPos+1]
 		var batch *prefetchedShredBatch
 		if timings != nil {
 			if cached := timings.prefetched[batchStart]; cached != nil && cached.start == batchStart && cached.end == shred.Index {
@@ -172,12 +174,22 @@ func decodeEntriesAndAlpenglowMarkersFromDataShreds(shreds []*Shred, timings *en
 				}
 				// Bounds alone cannot prove identity after repair or replacement.
 				// Read decoded fields only after the preparation channel closes.
-				if bytes.Equal(batchBytes, cached.raw) {
+				// Compare the original slices directly: a cache hit needs no
+				// second component buffer or copies of already decoded bytes.
+				if len(cached.raw) == batchSize && dataShredBatchMatches(batchShreds, cached.raw) {
 					batch = cached
 				}
 			}
 		}
 		if batch == nil {
+			// A miss owns a fresh, exactly sized backing array. Transactions
+			// retain instruction-data slices into it after this call returns.
+			batchBytes := make([]byte, 0, batchSize)
+			for _, part := range batchShreds {
+				if part != nil && part.Type == ShredTypeData {
+					batchBytes = append(batchBytes, part.Data...)
+				}
+			}
 			batch = decodeClosedShredBatch(batchBytes, batchStart, shred.Index)
 			if timings != nil {
 				timings.transactionParse += batch.parseDuration
@@ -200,18 +212,16 @@ func decodeEntriesAndAlpenglowMarkersFromDataShreds(shreds []*Shred, timings *en
 			if batch.footer != nil {
 				blockFooter = batch.footer
 			}
-			batchBytes = nil
+			batchSize = 0
 			haveBatch = false
 			continue
 		}
 		entryBatches = append(entryBatches, batch)
-		// Decoded transactions retain slices into the batch buffer for instruction data.
-		// Keep the backing array alive instead of reusing and overwriting it.
-		batchBytes = nil
+		batchSize = 0
 		haveBatch = false
 	}
-	if len(batchBytes) != 0 {
-		return nil, nil, nil, fmt.Errorf("slot ended with %d undecoded entry bytes", len(batchBytes))
+	if batchSize != 0 {
+		return nil, nil, nil, fmt.Errorf("slot ended with %d undecoded entry bytes", batchSize)
 	}
 	var entries []Entry
 	for _, batch := range entryBatches {
@@ -229,6 +239,23 @@ func decodeEntriesAndAlpenglowMarkersFromDataShreds(shreds []*Shred, timings *en
 		}
 	}
 	return entries, parentInfo, blockFooter, nil
+}
+
+// dataShredBatchMatches is equivalent to comparing raw with the concatenated
+// data bytes, including all padding. Neither equal prefixes nor changed lengths
+// can reuse a cached signature verdict. It does not retain or allocate buffers.
+func dataShredBatchMatches(shreds []*Shred, raw []byte) bool {
+	offset := 0
+	for _, shred := range shreds {
+		if shred == nil || shred.Type != ShredTypeData {
+			continue
+		}
+		if len(shred.Data) > len(raw)-offset || !bytes.Equal(shred.Data, raw[offset:offset+len(shred.Data)]) {
+			return false
+		}
+		offset += len(shred.Data)
+	}
+	return offset == len(raw)
 }
 
 // decodeClosedShredBatch owns raw through the returned decoded transactions.
