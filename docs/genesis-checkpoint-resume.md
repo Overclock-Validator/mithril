@@ -1,7 +1,7 @@
 # Genesis replay checkpoints and resume
 
 The offline genesis replay path can now checkpoint a completed child bank to
-Pebble AccountsDB, close, reopen and continue from the next slot. The native-producer
+AccountsDB, close, reopen and continue from the next slot. The native-producer
 fixture checkpoints its independent non-voting receiver at slots 2 and 4. After
 restarting at slot 2, replay matches the uninterrupted native producer and pinned
 Agave through slot 4, including every live account and the bank hash.
@@ -66,12 +66,12 @@ are separate milestones. The receiver does not vote. Lightbringer is unchanged.
 
 ## Durable boundary
 
-The implementation reuses `alpenglow-dev`'s Pebble `CommitBatch`, manifest format and file allocation.
+The implementation reuses AccountsDB's `CommitBatch`, manifest format and file allocation.
 A shared `accountsdb.lock` guard spans initialization and open-database ownership.
 Genesis recovery validates every decided manifest and segment before ordinary
 recovery can remove orphans. It does not introduce another account index or commit protocol.
 
-1. Capture the completed bank and scan the current account view. a pinned Pebble iterator's ordered
+1. Capture the completed bank and scan the current account view. A pinned account-index iterator's ordered
    enumeration is merged with the bounded speculative write set. The scan checks
    AccountsLtHash and records capitalization, data length, live account count and
    a canonical SHA-256 digest of all account fields, including rent epoch.
@@ -81,7 +81,7 @@ recovery can remove orphans. It does not introduce another account index or comm
    Older binaries reject this schema. The immutable slot-0 genesis files and
    marker remain the origin anchor, never the current child checkpoint.
 4. Commit account deltas, bank hashes and the complete checkpoint envelope through
-   Pebble AccountsDB. Its fsynced manifest is the durable decision; recovery finishes any decided
+   AccountsDB. Its fsynced manifest is the durable decision; recovery finishes any decided
    index publication. No subsequent state-file update is needed to select the tip.
 
 Checkpoint envelope version 2 includes the pinned genesis/runtime profile,
@@ -90,12 +90,12 @@ states for delayed commissions. Reopen replaces historical process caches with
 this bank's state, including an explicitly empty future stake set. Up to five
 stake generations and three commission-history generations are retained. Old
 version-1 checkpoints remain readable in epoch 0; old readers reject version 2
-before Pebble AccountsDB recovery cleanup.
+before AccountsDB recovery cleanup.
 
 The envelope also contains the child's bank and parent hashes, consensus block ID and chained shred root;
 fees, vote timestamps, recent/evicted blockhashes, slot hashes, clock, tick height,
 block height, capitalization, account-data length, AccountsLtHash and exact
-transaction count. Account bytes, including the nanosecond clock, live in Pebble AccountsDB.
+transaction count. Account bytes, including the nanosecond clock, live in AccountsDB.
 These identities remain distinct from the genesis hash and slot-0 certificate.
 
 Reopen validates manifest metadata, the complete fold/segment chain and referenced
@@ -106,7 +106,7 @@ startup does not silently choose genesis or another checkpoint. Ordinary snapsho
 resume checks remain unchanged. Generic state loading cannot mistake the
 schema-7 origin marker for the current replay position.
 
-Cancellation is honored before starting Pebble AccountsDB's commit. Once it starts, the commit
+Cancellation is honored before starting AccountsDB's commit. Once it starts, the commit
 must finish or report its durability decision; cancellation cannot cut an fsync
 sequence in half. An uncertain commit fences the session until close/reopen.
 Unselected immutable sidecars can remain after interruption; they do not select
@@ -142,9 +142,9 @@ a checkpoint and this milestone adds no new retention/garbage-collection policy.
   status references, missing/corrupted sidecars and corrupt decided manifests.
 - Account corruption in rent epoch, which is outside AccountsLtHash, and missing
   ending ticks or entry hashes that do not extend the selected parent.
-- Pebble AccountsDB exclusive ownership, schema fencing and refusal of unsupported node launch.
+- AccountsDB exclusive ownership, schema fencing and refusal of unsupported node launch.
 
-The existing Pebble AccountsDB crash-matrix tests cover interruption inside `CommitBatch` itself.
+The existing AccountsDB crash-matrix tests cover interruption inside `CommitBatch` itself.
 The new subprocess tests cover the genesis adapter's publication boundaries.
 See [native-genesis-validation.md](native-genesis-validation.md) for test outcomes
 and existing full-suite failures.

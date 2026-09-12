@@ -45,7 +45,7 @@ func AcquireExclusiveAccountsDbStore(root string) (*AccountsDbStoreGuard, error)
 	if root == "" {
 		return nil, errors.New("accountsdb: empty AccountsDB lock root")
 	}
-	if err := RejectV2Artifacts(root); err != nil {
+	if err := RejectUnsupportedIndexArtifacts(root); err != nil {
 		return nil, err
 	}
 	canonicalRoot, err := filepath.Abs(root)

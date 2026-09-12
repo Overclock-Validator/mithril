@@ -2,7 +2,7 @@
 
 The pinned Agave oracle now creates a deterministic four-slot bank fixture from
 Mithril-generated genesis. Mithril replays its entry streams using the production
-`ProcessBlock` path, starting with a verified, reopened Pebble AccountsDB initial bank.
+`ProcessBlock` path, starting with a verified, reopened AccountsDB initial bank.
 The test runs with serial execution and two transaction workers. A second path
 transports the same banks through the production signed-shred broadcaster and
 UDP receiver before replay.

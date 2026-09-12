@@ -4,7 +4,7 @@ Mithril's real `LeaderLoop` now produces the first four banks from a verified,
 reopened genesis database. It creates entries with `WorkingBank.Forge`, flushes
 them through `ShredSink`, freezes with `CommitLeaderSlot`, and broadcasts its own
 bank-hash footer and single Alpenglow ending tick. A separate, non-voting UDP
-receiver executes those blocks against an independently initialized Pebble AccountsDB.
+receiver executes those blocks against an independently initialized AccountsDB.
 
 ```sh
 go test ./pkg/replay -run '^TestGenesisNativeProducerAgave$' -count=1 -v

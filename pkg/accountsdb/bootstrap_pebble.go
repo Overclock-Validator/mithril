@@ -15,12 +15,12 @@ import (
 	"github.com/gagliardetto/solana-go"
 )
 
-// RejectV2Artifacts prevents the legacy opener from creating an empty Pebble
-// index beside an incompatible V2 store. No format conversion is implicit.
-func RejectV2Artifacts(root string) error {
+// RejectUnsupportedIndexArtifacts prevents an opener from creating an empty
+// index beside an incompatible store. No format conversion is implicit.
+func RejectUnsupportedIndexArtifacts(root string) error {
 	for _, name := range []string{"accounts_index_v2.lock", "accounts_index.root", "accounts_delta_v2.journal", "accounts_index.stmh", "accounts_index.manifest"} {
 		if _, err := os.Lstat(filepath.Join(root, name)); err == nil {
-			return fmt.Errorf("accountsdb: incompatible V2 store (%s); initialize a new Pebble database from genesis or a snapshot", name)
+			return fmt.Errorf("accountsdb: unsupported account-index format (%s); initialize a new database from genesis or a snapshot", name)
 		} else if !os.IsNotExist(err) {
 			return err
 		}
@@ -28,8 +28,8 @@ func RejectV2Artifacts(root string) error {
 	return nil
 }
 
-func ValidatePebbleArtifacts(root string) error {
-	if err := RejectV2Artifacts(root); err != nil {
+func ValidateBootstrapStoreArtifacts(root string) error {
+	if err := RejectUnsupportedIndexArtifacts(root); err != nil {
 		return err
 	}
 	for _, name := range []string{"mithril_db", "bankhash_db", "accounts"} {
@@ -121,8 +121,8 @@ func WriteBootstrapHighFileID(root string, value uint64) error {
 	return writeUint64Sidecar(root, "bootstrap_high_file_id", value, true)
 }
 
-// ValidateStakePubkeyIndex checks the existing Pebble branch's version-2 format
-// with bounded memory. It intentionally does not introduce V2's framed format.
+// ValidateStakePubkeyIndex checks the existing stake-index record format
+// with bounded memory.
 func ValidateStakePubkeyIndex(path string) (uint64, error) {
 	info, err := os.Lstat(path)
 	if err != nil {

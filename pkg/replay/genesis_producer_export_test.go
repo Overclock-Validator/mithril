@@ -174,7 +174,7 @@ func runGenesisProducerFixture(t *testing.T, produce func(*testing.T, GenesisPro
 		require.NotNil(t, produced)
 		require.NotNil(t, producerCtx)
 		// Remove the process-local adoption optimization. This receiver must
-		// independently execute bytes received over UDP into its own Pebble-backed tail.
+		// independently execute bytes received over UDP into its own account tail.
 		_, present := TakeLocalLeaderCommit(slot)
 		require.False(t, present, "producer callback must consume its local commit")
 		var received *b.Block

@@ -43,7 +43,7 @@ func TestGenesisSchemaExplicitRoot(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestPebbleGenesisRejectsV2SchemasAndWrongBackend(t *testing.T) {
+func TestAccountsDbGenesisRejectsUnsupportedSchemasAndWrongBackend(t *testing.T) {
 	for _, version := range []uint32{4, 5, GenesisStateSchemaVersion, GenesisReplayStateSchemaVersion} {
 		t.Run(fmt.Sprint(version), func(t *testing.T) {
 			root := t.TempDir()

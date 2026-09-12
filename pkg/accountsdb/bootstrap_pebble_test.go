@@ -14,7 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestPebbleStoreGuardOwnership(t *testing.T) {
+func TestAccountsDbStoreGuardOwnership(t *testing.T) {
 	db, root := newFoldTestDb(t)
 	_, err := AcquireExclusiveAccountsDbStore(root)
 	require.ErrorIs(t, err, ErrAccountsDbInUse)
@@ -35,13 +35,13 @@ func TestPebbleStoreGuardOwnership(t *testing.T) {
 	require.NoError(t, reopened.Shutdown(t.Context()))
 }
 
-func TestPebbleRejectsV2BeforeCreatingFiles(t *testing.T) {
+func TestAccountsDbRejectsUnsupportedIndexBeforeCreatingFiles(t *testing.T) {
 	for _, name := range []string{"accounts_index_v2.lock", "accounts_index.root", "accounts_delta_v2.journal"} {
 		t.Run(name, func(t *testing.T) {
 			root := t.TempDir()
 			require.NoError(t, os.WriteFile(filepath.Join(root, name), []byte("preserve"), 0600))
 			_, err := OpenDb(root)
-			require.ErrorContains(t, err, "incompatible V2")
+			require.ErrorContains(t, err, "unsupported account-index format")
 			entries, err := os.ReadDir(root)
 			require.NoError(t, err)
 			require.Len(t, entries, 1)
@@ -49,7 +49,7 @@ func TestPebbleRejectsV2BeforeCreatingFiles(t *testing.T) {
 	}
 }
 
-func TestPebbleScanPinnedOrderBoundsAndCancellation(t *testing.T) {
+func TestAccountsDbScanPinnedOrderBoundsAndCancellation(t *testing.T) {
 	db, _ := newFoldTestDb(t)
 	defer db.CloseDb()
 	key := func(prefix uint64) solana.PublicKey {
@@ -81,7 +81,7 @@ func TestPebbleScanPinnedOrderBoundsAndCancellation(t *testing.T) {
 	require.ErrorIs(t, db.ScanKeysBetweenPrefixes(ctx, 0, ^uint64(0), func(solana.PublicKey) error { cancel(); return nil }), context.Canceled)
 }
 
-func TestPebbleGenesisRecoveryFailsBeforeCleanup(t *testing.T) {
+func TestAccountsDbGenesisRecoveryFailsBeforeCleanup(t *testing.T) {
 	for _, damage := range []string{"manifest_crc", "segment_crc", "gap", "filename", "missing_selected", "watermark", "bootstrap"} {
 		t.Run(damage, func(t *testing.T) {
 			db, root := newFoldTestDb(t)
@@ -136,7 +136,7 @@ func TestPebbleGenesisRecoveryFailsBeforeCleanup(t *testing.T) {
 	}
 }
 
-func TestPebbleGenesisRecoveryRepairsAdvisoryBankHashes(t *testing.T) {
+func TestAccountsDbGenesisRecoveryRepairsAdvisoryBankHashes(t *testing.T) {
 	db, root := newFoldTestDb(t)
 	defer db.CloseDb()
 	db.LargestFileId.Store(1)

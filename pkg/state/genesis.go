@@ -70,14 +70,14 @@ func (s *MithrilState) ValidateGenesisArtifacts(root string) error {
 	if err := s.ValidateGenesisOrigin(); err != nil {
 		return err
 	}
-	if err := accountsdb.ValidatePebbleArtifacts(root); err != nil {
+	if err := accountsdb.ValidateBootstrapStoreArtifacts(root); err != nil {
 		return err
 	}
 	return s.ValidateGenesisSidecars(root)
 }
 
 // ValidateGenesisSidecars may be called while holding the exclusive AccountsDB guard.
-// The guarded database opener validates the Pebble index itself.
+// The guarded database opener validates the account index itself.
 func (s *MithrilState) ValidateGenesisSidecars(root string) error {
 	if err := s.ValidateGenesisOrigin(); err != nil {
 		return err

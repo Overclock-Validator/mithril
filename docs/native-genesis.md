@@ -1,7 +1,7 @@
 # Native genesis and slot-0 bootstrap
 
 This milestone creates a deterministic Solana-format genesis and a verified,
-reopenable Pebble AccountsDB containing the completed slot-0 bank. The offline harness also exercises native block production and signed UDP replay.
+reopenable AccountsDB containing the completed slot-0 bank. The offline harness also exercises native block production and signed UDP replay.
 Live cluster startup, voting and snapshot production remain separate work.
 Mithril's verifying full-node mode does not vote.
 
@@ -85,11 +85,11 @@ block identity, slot hashes or fictitious snapshot manifest is created.
 `genesisinit.Initialize` and `genesisinit.Open` are the reusable storage adapters.
 Initialization acquires the shared exclusive AccountsDB store lock before checking
 occupancy or writing. It writes durable intent, appendvecs, the stake index,
-file-ID high-water marks, complete bank metadata and the Pebble index, then verifies
+file-ID high-water marks, complete bank metadata and the account index, then verifies
 all account contents and the bank hash. It publishes `mithril_state.json` last.
 The CLI closes and independently reopens the database before reporting success.
 
-Genesis state uses schema 6 and `storage_format = "pebble-v1"`, with an explicit
+Genesis state uses schema 6 with an explicit storage-format tag and a durable
 root at slot 0; next replay is slot 1. Existing snapshot-origin schema 3 remains supported. Schema-3 readers reject
 genesis state as unsupported. `genesis_bank.json` retains the complete seed and
 is bound to the marker with SHA-256. The raw genesis is also retained and checked
@@ -150,9 +150,6 @@ initialized, non-voting replay instance. Both agree with Agave. The
 child banks and verifies continued replay after restart. Live startup remains
 separate work.
 
-The Pebble port starts from `origin/alpenglow-dev` at
-`ea579cb4` and keeps its newer epoch-boundary and reward-certificate fixes.
-V2 genesis databases (schemas 4/5) are incompatible and must be rebuilt in a new
-directory; both the format tag and schema fence prevent implicit conversion.
-Existing snapshot-origin schema 3 and the Pebble account/stake-index formats are
-retained. The original V2 worktree remains available for comparison.
+Genesis databases must use the supported storage format and state schema.
+Incompatible database formats are rejected without implicit conversion. Existing
+snapshot-origin schema 3 and the account/stake-index formats remain supported.

@@ -39,7 +39,7 @@ func NewCommand() *cobra.Command {
 	create.Flags().StringVar(&output, "output", "", "New output directory")
 	_ = create.MarkFlagRequired("config")
 	_ = create.MarkFlagRequired("output")
-	init := &cobra.Command{Use: "init --genesis <path> --accounts-path <dir>", Short: "Persist and verify the completed initial bank in an empty Pebble AccountsDB", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
+	init := &cobra.Command{Use: "init --genesis <path> --accounts-path <dir>", Short: "Persist and verify the completed initial bank in an empty AccountsDB", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
 		g, _, err := genesis.ReadGenesisFromFile(path)
 		if err != nil {
 			return err

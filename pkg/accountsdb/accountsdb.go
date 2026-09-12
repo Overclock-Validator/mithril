@@ -139,7 +139,7 @@ func NewAccountsIndexPebbleOptions(logger pebble.Logger) *pebble.Options {
 	}
 }
 
-// OpenDb opens the ordinary Pebble store while holding the same store guard
+// OpenDb opens the AccountsDB store while holding the same store guard
 // used by genesis initialization. Snapshot builders retain their existing format.
 func OpenDb(root string) (_ *AccountsDb, retErr error) {
 	guard, err := AcquireExclusiveAccountsDbStore(root)
@@ -151,7 +151,7 @@ func OpenDb(root string) (_ *AccountsDb, retErr error) {
 }
 
 // OpenDbWithStoreGuard reopens an existing store, transferring guard ownership
-// only after both Pebble databases have opened successfully.
+// only after both databases have opened successfully.
 func OpenDbWithStoreGuard(root string, guard *AccountsDbStoreGuard) (*AccountsDb, error) {
 	return openDbWithStoreGuard(root, guard, false, true)
 }
@@ -165,7 +165,7 @@ func CreateDbWithStoreGuard(root string, guard *AccountsDbStoreGuard) (*Accounts
 func openDbWithStoreGuard(root string, guard *AccountsDbStoreGuard, create, existing bool) (*AccountsDb, error) {
 	var result *AccountsDb
 	err := guard.transferAccountsDbStoreLockOnSuccess(root, func(lock *accountsDbStoreLock) error {
-		if err := RejectV2Artifacts(root); err != nil {
+		if err := RejectUnsupportedIndexArtifacts(root); err != nil {
 			return err
 		}
 		appendVecsDir := filepath.Join(root, "accounts")

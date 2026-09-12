@@ -1,30 +1,22 @@
-# Native genesis validation on Pebble
+# Native genesis validation
 
-Validated on 2026-09-11, macOS arm64, Go 1.26.4. The isolated branch is
-`7layer/native-genesis-pebble`, based on freshly fetched `origin/alpenglow-dev`
-at `ea579cb4`. The original dirty Mithril checkout, V2 genesis worktree, and
-pinned Agave checkout were preserved. SHA-256 checks confirmed that all 88
-modified/new files in the V2 worktree remained unchanged during the port.
+Validated on 2026-09-11, macOS arm64, Go 1.26.4, against `alpenglow-dev`
+at `ea579cb4` and the pinned Agave bank helper described below.
 
-## Storage port
+## Persistence and recovery
 
-The account-location index is `alpenglow-dev`'s Pebble index, with its existing
-24-byte locations, appendvecs, version-2 stake-index records, fold manifests and
-snapshot-origin schema 3. No StreamHash base, mutable delta index, V2 maintenance
-workers or V2 snapshot builder is included.
+Genesis initialization uses the existing AccountsDB account index, appendvecs,
+stake-index records and fold manifests. `AccountsDbStoreGuard` provides exclusive
+ownership shared by initialization, database opens and snapshot cleanup/build.
+A successful open transfers ownership to the database; shutdown reports close
+errors and releases the guard after both databases close. Initialization publishes
+its ready marker only after durable accounts, index entries, bank hashes and
+complete bootstrap metadata have been verified.
 
-The existing V2 ownership-guard mechanism was carried over independently of its
-index implementation and renamed to `AccountsDbStoreGuard`. Its persistent
-`accountsdb.lock` is shared by initialization, ordinary database opens and snapshot
-cleanup/build. A successful open transfers ownership to the database; shutdown
-reports close errors and releases the guard after both Pebble databases close.
-Genesis initialization publishes its ready marker only after durable accounts,
-index entries, bank hashes and complete bootstrap metadata have been verified.
-
-Genesis origin uses schema 6 and `storage_format = "pebble-v1"`; child replay uses
-schema 7. V2 genesis databases (schemas 4/5) must be rebuilt in a new directory.
-V2 index artifacts are rejected before an opener creates any Pebble files.
-The standard genesis bytes and runtime profile are unchanged by the storage port.
+Genesis origin uses schema 6 with an explicit storage-format tag; child replay
+uses schema 7. Unsupported database formats and schemas are rejected before
+initialization or recovery can overwrite their artifacts. Existing snapshot-origin
+schema 3 remains supported.
 
 Genesis recovery checks the complete manifest sequence, filenames, segment CRCs,
 allocation bounds, bank-hash coverage and selected index watermark before orphan
@@ -60,7 +52,7 @@ fences the session so it cannot retry with consumed pending entries.
   restored, including the empty future leader set after admission funding runs out.
 - Cancellation, invalid metadata/sidecars, account corruption outside LtHash,
   actual subprocess exits around initialization/checkpoint publication, and the
-  existing Pebble fold crash matrix.
+  existing AccountsDB fold crash matrix.
 - Concurrent ownership; transferred/closed/wrong-root guards; snapshot cleanup
   and build refusal against an owned store or a genesis-origin directory;
   incompatible schemas/backends; pinned key scans with ordering, bounds,
@@ -69,7 +61,7 @@ fences the session so it cannot retry with consumed pending entries.
   markers all fail without deleting the orphan sentinel.
 - Deterministic recovery of missing advisory bank hashes for already-applied folds.
 - CLI build, `genesis create`, both raw and archived `genesis init`, independent
-  reopen, matching metadata, actual Pebble `mithril_db/CURRENT`, and schema 6.
+  reopen, matching metadata, persisted account-index files, and schema 6.
 - Race detector on genesis initialization, UDP replay, checkpoint/restart,
   epoch boundaries, store ownership and snapshot protection: all passed.
 - Full affected packages passed, including `accountsdb`, `genesis`, `genesisinit`,
@@ -104,7 +96,7 @@ One hundred subsequent runs and the final full replay suite passed.
 go test ./pkg/genesis ./pkg/genesisinit ./pkg/accountsdb ./pkg/state ./pkg/snapshot
 go test ./pkg/replay -run 'Genesis' -count=1 -timeout=10m
 go test -race ./pkg/genesisinit ./pkg/replay ./pkg/accountsdb ./pkg/snapshot \
-  -run 'Genesis|Initialize|Initialization|InterruptedInitialization|CancellationAndDestinationOwnership|Pebble|SnapshotCleanupAndBuild' \
+  -run 'Genesis|Initialize|Initialization|InterruptedInitialization|CancellationAndDestinationOwnership|AccountsDb|SnapshotCleanupAndBuild' \
   -count=1 -timeout=10m
 go test ./... -count=1 -timeout=15m
 ```

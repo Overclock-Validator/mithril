@@ -20,12 +20,12 @@ const HistoryFileName = "mithril_state.history.jsonl"
 // balances; older checkpoints cannot prove SIMD-0357 VAT admission on resume.
 const CurrentStateSchemaVersion uint32 = 3
 
-// Snapshot-origin state remains v3. Pebble genesis uses v6 (V2 used v4/v5) so an older reader cannot
+// Snapshot-origin state remains v3. Genesis uses v6 so an older reader cannot
 // mistake a completed slot-zero bank for an absent snapshot/recovery root.
 const GenesisStateSchemaVersion uint32 = 6
 
 // GenesisReplayStateSchemaVersion fences stores that may contain offline child
-// checkpoints. The immutable genesis marker remains the slot-0 anchor; Pebble fold
+// checkpoints. The immutable genesis marker remains the slot-0 anchor; AccountsDB fold
 // manifests select the durable replay position, without claiming finality.
 const GenesisReplayStateSchemaVersion uint32 = 7
 

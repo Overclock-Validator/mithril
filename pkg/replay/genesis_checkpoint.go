@@ -52,7 +52,7 @@ type GenesisCheckpoint struct {
 	AccountsSHA256  string                                       `json:"accounts_sha256"`
 }
 
-// GenesisReplay owns the Pebble store lock and a speculative account tail. Calls are
+// GenesisReplay owns the AccountsDB store lock and a speculative account tail. Calls are
 // serialized, but execution still uses replay's process-wide runtime: only one
 // replay executor may run at a time. Close discards uncheckpointed child banks.
 // Epoch transitions reuse the normal replay machinery. The parent must be
@@ -77,7 +77,7 @@ type GenesisReplay struct {
 	partitionedRewards                            *rewards.PartitionedRewardDistributionInfo
 }
 
-// OpenGenesisReplay validates the immutable seed, recovers the Pebble manifest
+// OpenGenesisReplay validates the immutable seed, recovers the AccountsDB manifest
 // decision, verifies the complete durable account state and restores its bank
 // context. It does not contact RPC, start consensus or change process globals.
 func OpenGenesisReplay(ctx context.Context, root string) (_ *GenesisReplay, retErr error) {
@@ -196,7 +196,7 @@ func OpenGenesisReplay(ctx context.Context, root string) (_ *GenesisReplay, retE
 		return nil, err
 	}
 	if solana.Hash(recovery.RootedBankhash).String() != cp.Context.Bankhash {
-		return nil, fmt.Errorf("checkpoint bank hash differs from Pebble decision")
+		return nil, fmt.Errorf("checkpoint bank hash differs from the durable commit decision")
 	}
 	stats, sysvars, err := scanGenesisBank(ctx, db, s.tail, cp.Context.Slot)
 	if err != nil {
@@ -389,7 +389,7 @@ func validateGenesisReplayEntries(block *b.Block) error {
 
 // CheckpointTrusted atomically persists the completed offline replay tip. Calling
 // this explicitly trusts this local branch; it does not certify it for a cluster.
-// Cancellation is checked before Pebble's commit decision. Once CommitBatch starts,
+// Cancellation is checked before AccountsDB's commit decision. Once CommitBatch starts,
 // it completes/reports its decision without cancelling fsync halfway through.
 func (s *GenesisReplay) CheckpointTrusted(ctx context.Context) error { return s.checkpoint(ctx, nil) }
 
@@ -603,7 +603,7 @@ type genesisAccountSummary struct {
 	lt                  *lthash.LtHash
 }
 
-// Merge the Pebble streaming enumeration with only the bounded unrooted write set.
+// Merge the account-index streaming enumeration with only the bounded unrooted write set.
 // Hash every live account field, including rent epoch (not covered by LtHash).
 // No second account index or complete in-memory bank copy is required.
 func scanGenesisBank(ctx context.Context, db *accountsdb.AccountsDb, tail *unrootedTail, slot uint64) (genesisAccountSummary, []*accounts.Account, error) {

@@ -1,4 +1,4 @@
-// Package genesisinit adapts a native genesis bank to Pebble AccountsDB. It is
+// Package genesisinit adapts a native genesis bank to AccountsDB. It is
 // reusable by a future live bootstrap path; it contains no network fallback.
 package genesisinit
 
