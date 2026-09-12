@@ -610,24 +610,6 @@ func verifySignatureBatch(group []sigverifyJob, batch *sigverify.Batch) {
 	statsd.Count(statsd.ReplaySigverifyGroupSignatures, int64(batch.Len()), nil)
 }
 
-func cloneTransaction(tx *solana.Transaction) (*solana.Transaction, error) {
-	if tx == nil {
-		return nil, nil
-	}
-
-	raw, err := tx.MarshalBinary()
-	if err != nil {
-		return nil, err
-	}
-
-	cloned, err := solana.TransactionFromBytes(raw)
-	if err != nil {
-		return nil, err
-	}
-
-	return cloned, nil
-}
-
 func processTransactionComputeUnits(execCtx *sealevel.ExecutionCtx) uint64 {
 	if execCtx == nil {
 		return 0
