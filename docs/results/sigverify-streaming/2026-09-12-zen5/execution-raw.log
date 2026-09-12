@@ -1,0 +1,576 @@
+
+=== sample-1-catchup-workers2-target4/execution-baseline.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  149238	      4008 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-1-catchup-workers2-target4/execution-concurrent.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  146756	      4085 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-1-catchup-workers2-target4/sigverify-load.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/turbine
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionVerificationFlow/captured_2622581/workers_2/target_4/catchup-8 	      96	 153189266 ns/op	         2.048 avg_cpu_cores	         1.000 components/block	       313.8 cpu-ms/block	         0.0002110 feed_lag_p50-ms	         0.0004810 feed_lag_p95-ms	         4.000 mean_width	       149.6 ready_p50-ms	       174.2 ready_p95-ms	       149.6 residual_p50-ms	       174.2 residual_p95-ms	     33760 signatures/block	    220381 signatures/s	         0.003657 submit_p50-ms	         0.01091 submit_p95-ms	 7054772 B/op	   67536 allocs/op
+PASS
+
+=== sample-1-catchup-workers2-target8/execution-baseline.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  174750	      3542 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-1-catchup-workers2-target8/execution-concurrent.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  159576	      4432 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-1-catchup-workers2-target8/sigverify-load.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/turbine
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionVerificationFlow/captured_2622581/workers_2/target_8/catchup-8 	      96	  78756306 ns/op	         2.051 avg_cpu_cores	         1.000 components/block	       161.6 cpu-ms/block	         0.0002200 feed_lag_p50-ms	         0.0004910 feed_lag_p95-ms	         8.000 mean_width	        75.68 ready_p50-ms	        90.65 ready_p95-ms	        75.68 residual_p50-ms	        90.65 residual_p95-ms	     33760 signatures/block	    428664 signatures/s	         0.003326 submit_p50-ms	         0.01184 submit_p95-ms	 7060612 B/op	   67536 allocs/op
+PASS
+
+=== sample-1-catchup-workers4-target4/execution-baseline.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  164997	      3958 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-1-catchup-workers4-target4/execution-concurrent.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  152398	      4006 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-1-catchup-workers4-target4/sigverify-load.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/turbine
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionVerificationFlow/captured_2622581/workers_4/target_4/catchup-8 	      96	  79167070 ns/op	         3.991 avg_cpu_cores	         1.000 components/block	       316.0 cpu-ms/block	         0.0002300 feed_lag_p50-ms	         0.0003700 feed_lag_p95-ms	         4.000 mean_width	        76.56 ready_p50-ms	        96.70 ready_p95-ms	        76.56 residual_p50-ms	        96.70 residual_p95-ms	     33760 signatures/block	    426440 signatures/s	         0.003706 submit_p50-ms	         0.01100 submit_p95-ms	 7060780 B/op	   67537 allocs/op
+PASS
+
+=== sample-1-catchup-workers4-target8/execution-baseline.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  170856	      3547 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-1-catchup-workers4-target8/execution-concurrent.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  139512	      4060 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-1-catchup-workers4-target8/sigverify-load.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/turbine
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionVerificationFlow/captured_2622581/workers_4/target_8/catchup-8 	      96	  40210294 ns/op	         3.993 avg_cpu_cores	         1.000 components/block	       160.6 cpu-ms/block	         0.0002110 feed_lag_p50-ms	         0.0004300 feed_lag_p95-ms	         8.000 mean_width	        39.57 ready_p50-ms	        43.68 ready_p95-ms	        39.57 residual_p50-ms	        43.68 residual_p95-ms	     33760 signatures/block	    839586 signatures/s	         0.003306 submit_p50-ms	         0.005891 submit_p95-ms	 7058192 B/op	   67537 allocs/op
+PASS
+
+=== sample-1-tip_200ms_overlap-workers2-target4/execution-baseline.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  172561	      3462 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-1-tip_200ms_overlap-workers2-target4/execution-concurrent.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  156918	      3704 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-1-tip_200ms_overlap-workers2-target4/sigverify-load.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/turbine
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionVerificationFlow/captured_2622581/workers_2/target_4/tip_200ms_overlap-8         	      20	 201168852 ns/op	         1.563 avg_cpu_cores	       126.0 components/block	       314.3 cpu-ms/block	         0.04094 feed_lag_p50-ms	         0.8651 feed_lag_p95-ms	         3.956 mean_width	         1.616 ready_p50-ms	         2.755 ready_p95-ms	         1.196 residual_p50-ms	         1.497 residual_p95-ms	     33760 signatures/block	    167819 signatures/s	         0.001432 submit_p50-ms	         0.004018 submit_p95-ms	 7234818 B/op	   68941 allocs/op
+PASS
+
+=== sample-1-tip_200ms_overlap-workers2-target8/execution-baseline.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  167744	      3471 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-1-tip_200ms_overlap-workers2-target8/execution-concurrent.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  171600	      3530 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-1-tip_200ms_overlap-workers2-target8/sigverify-load.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/turbine
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionVerificationFlow/captured_2622581/workers_2/target_8/tip_200ms_overlap-8         	      20	 200924240 ns/op	         0.8916 avg_cpu_cores	       126.0 components/block	       179.2 cpu-ms/block	         0.4462 feed_lag_p50-ms	         0.9733 feed_lag_p95-ms	         7.912 mean_width	         1.190 ready_p50-ms	         1.808 ready_p95-ms	         0.9351 residual_p50-ms	         1.356 residual_p95-ms	     33760 signatures/block	    168024 signatures/s	         0.001734 submit_p50-ms	         0.004288 submit_p95-ms	 7208732 B/op	   68935 allocs/op
+PASS
+
+=== sample-1-tip_200ms_overlap-workers4-target4/execution-baseline.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  165466	      3489 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-1-tip_200ms_overlap-workers4-target4/execution-concurrent.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  155095	      4302 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-1-tip_200ms_overlap-workers4-target4/sigverify-load.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/turbine
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionVerificationFlow/captured_2622581/workers_4/target_4/tip_200ms_overlap-8         	      20	 201022700 ns/op	         1.651 avg_cpu_cores	       126.0 components/block	       332.0 cpu-ms/block	         0.4337 feed_lag_p50-ms	         0.9876 feed_lag_p95-ms	         3.956 mean_width	         1.206 ready_p50-ms	         1.982 ready_p95-ms	         1.099 residual_p50-ms	         1.257 residual_p95-ms	     33760 signatures/block	    167941 signatures/s	         0.001674 submit_p50-ms	         0.004459 submit_p95-ms	 7241454 B/op	   68940 allocs/op
+PASS
+
+=== sample-1-tip_200ms_overlap-workers4-target8/execution-baseline.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  165728	      3596 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-1-tip_200ms_overlap-workers4-target8/execution-concurrent.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  167448	      3564 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-1-tip_200ms_overlap-workers4-target8/sigverify-load.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/turbine
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionVerificationFlow/captured_2622581/workers_4/target_8/tip_200ms_overlap-8         	      20	 200934390 ns/op	         0.8582 avg_cpu_cores	       126.0 components/block	       172.4 cpu-ms/block	         0.5170 feed_lag_p50-ms	         1.006 feed_lag_p95-ms	         7.912 mean_width	         0.9062 ready_p50-ms	         1.396 ready_p95-ms	         1.041 residual_p50-ms	         1.256 residual_p95-ms	     33760 signatures/block	    168015 signatures/s	         0.001383 submit_p50-ms	         0.003878 submit_p95-ms	 7274370 B/op	   68941 allocs/op
+PASS
+
+=== sample-2-catchup-workers2-target4/execution-baseline.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  170058	      3624 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-2-catchup-workers2-target4/execution-concurrent.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  160458	      4021 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-2-catchup-workers2-target4/sigverify-load.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/turbine
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionVerificationFlow/captured_2622581/workers_2/target_4/catchup-8 	      96	 151919970 ns/op	         2.051 avg_cpu_cores	         1.000 components/block	       311.5 cpu-ms/block	         0.0002200 feed_lag_p50-ms	         0.0004610 feed_lag_p95-ms	         4.000 mean_width	       147.5 ready_p50-ms	       175.5 ready_p95-ms	       147.5 residual_p50-ms	       175.5 residual_p95-ms	     33760 signatures/block	    222222 signatures/s	         0.003677 submit_p50-ms	         0.007574 submit_p95-ms	 7061922 B/op	   67537 allocs/op
+PASS
+
+=== sample-2-catchup-workers2-target8/execution-baseline.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  168331	      3448 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-2-catchup-workers2-target8/execution-concurrent.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  142396	      4201 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-2-catchup-workers2-target8/sigverify-load.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/turbine
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionVerificationFlow/captured_2622581/workers_2/target_8/catchup-8 	      96	  77871825 ns/op	         2.052 avg_cpu_cores	         1.000 components/block	       159.8 cpu-ms/block	         0.0002000 feed_lag_p50-ms	         0.0003800 feed_lag_p95-ms	         8.000 mean_width	        76.13 ready_p50-ms	        88.31 ready_p95-ms	        76.13 residual_p50-ms	        88.31 residual_p95-ms	     33760 signatures/block	    433533 signatures/s	         0.003436 submit_p50-ms	         0.007464 submit_p95-ms	 7056320 B/op	   67536 allocs/op
+PASS
+
+=== sample-2-catchup-workers4-target4/execution-baseline.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  155592	      4248 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-2-catchup-workers4-target4/execution-concurrent.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  134372	      4182 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-2-catchup-workers4-target4/sigverify-load.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/turbine
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionVerificationFlow/captured_2622581/workers_4/target_4/catchup-8 	      96	  79047165 ns/op	         3.999 avg_cpu_cores	         1.000 components/block	       316.1 cpu-ms/block	         0.0002000 feed_lag_p50-ms	         0.0002910 feed_lag_p95-ms	         4.000 mean_width	        76.57 ready_p50-ms	        94.24 ready_p95-ms	        76.57 residual_p50-ms	        94.24 residual_p95-ms	     33760 signatures/block	    427087 signatures/s	         0.003747 submit_p50-ms	         0.01152 submit_p95-ms	 7056514 B/op	   67537 allocs/op
+PASS
+
+=== sample-2-catchup-workers4-target8/execution-baseline.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  168381	      3462 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-2-catchup-workers4-target8/execution-concurrent.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  141712	      4887 ns/op	    4145 B/op	      59 allocs/op
+PASS
+
+=== sample-2-catchup-workers4-target8/sigverify-load.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/turbine
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionVerificationFlow/captured_2622581/workers_4/target_8/catchup-8 	      96	  42898713 ns/op	         3.925 avg_cpu_cores	         1.000 components/block	       168.4 cpu-ms/block	         0.0002300 feed_lag_p50-ms	         0.0004710 feed_lag_p95-ms	         8.000 mean_width	        41.07 ready_p50-ms	        54.05 ready_p95-ms	        41.07 residual_p50-ms	        54.05 residual_p95-ms	     33760 signatures/block	    786970 signatures/s	         0.003397 submit_p50-ms	         0.01086 submit_p95-ms	 7053910 B/op	   67536 allocs/op
+PASS
+
+=== sample-2-tip_200ms_overlap-workers2-target4/execution-baseline.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  166706	      3502 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-2-tip_200ms_overlap-workers2-target4/execution-concurrent.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  107145	      4799 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-2-tip_200ms_overlap-workers2-target4/sigverify-load.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/turbine
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionVerificationFlow/captured_2622581/workers_2/target_4/tip_200ms_overlap-8         	      20	 201262863 ns/op	         1.606 avg_cpu_cores	       126.0 components/block	       323.2 cpu-ms/block	         0.03106 feed_lag_p50-ms	         0.8493 feed_lag_p95-ms	         3.956 mean_width	         1.723 ready_p50-ms	         2.871 ready_p95-ms	         1.114 residual_p50-ms	         1.802 residual_p95-ms	     33760 signatures/block	    167741 signatures/s	         0.001453 submit_p50-ms	         0.004058 submit_p95-ms	 7212730 B/op	   68935 allocs/op
+PASS
+
+=== sample-2-tip_200ms_overlap-workers2-target8/execution-baseline.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  174418	      3727 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-2-tip_200ms_overlap-workers2-target8/execution-concurrent.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  167622	      3536 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-2-tip_200ms_overlap-workers2-target8/sigverify-load.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/turbine
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionVerificationFlow/captured_2622581/workers_2/target_8/tip_200ms_overlap-8         	      20	 200967117 ns/op	         0.8453 avg_cpu_cores	       126.0 components/block	       169.9 cpu-ms/block	         0.4835 feed_lag_p50-ms	         0.9802 feed_lag_p95-ms	         7.912 mean_width	         1.166 ready_p50-ms	         1.747 ready_p95-ms	         0.9879 residual_p50-ms	         1.377 residual_p95-ms	     33760 signatures/block	    167988 signatures/s	         0.001313 submit_p50-ms	         0.003486 submit_p95-ms	 7222552 B/op	   68937 allocs/op
+PASS
+
+=== sample-2-tip_200ms_overlap-workers4-target4/execution-baseline.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  174780	      3601 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-2-tip_200ms_overlap-workers4-target4/execution-concurrent.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  162474	      3740 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-2-tip_200ms_overlap-workers4-target4/sigverify-load.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/turbine
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionVerificationFlow/captured_2622581/workers_4/target_4/tip_200ms_overlap-8         	      20	 200928113 ns/op	         1.526 avg_cpu_cores	       126.0 components/block	       306.7 cpu-ms/block	         0.4760 feed_lag_p50-ms	         0.9896 feed_lag_p95-ms	         3.956 mean_width	         1.136 ready_p50-ms	         1.672 ready_p95-ms	         1.002 residual_p50-ms	         1.263 residual_p95-ms	     33760 signatures/block	    168020 signatures/s	         0.001252 submit_p50-ms	         0.003527 submit_p95-ms	 7256845 B/op	   68947 allocs/op
+PASS
+
+=== sample-2-tip_200ms_overlap-workers4-target8/execution-baseline.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  137796	      3945 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-2-tip_200ms_overlap-workers4-target8/execution-concurrent.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  171933	      3546 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-2-tip_200ms_overlap-workers4-target8/sigverify-load.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/turbine
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionVerificationFlow/captured_2622581/workers_4/target_8/tip_200ms_overlap-8         	      20	 200756778 ns/op	         0.8979 avg_cpu_cores	       126.0 components/block	       180.3 cpu-ms/block	         0.5109 feed_lag_p50-ms	         0.9931 feed_lag_p95-ms	         7.912 mean_width	         0.9308 ready_p50-ms	         1.413 ready_p95-ms	         0.7481 residual_p50-ms	         1.147 residual_p95-ms	     33760 signatures/block	    168164 signatures/s	         0.001683 submit_p50-ms	         0.004809 submit_p95-ms	 7287646 B/op	   68938 allocs/op
+PASS
+
+=== sample-3-catchup-workers2-target4/execution-baseline.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  166202	      3817 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-3-catchup-workers2-target4/execution-concurrent.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  160532	      3624 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-3-catchup-workers2-target4/sigverify-load.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/turbine
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionVerificationFlow/captured_2622581/workers_2/target_4/catchup-8 	      96	 147847296 ns/op	         2.051 avg_cpu_cores	         1.000 components/block	       303.2 cpu-ms/block	         0.0002300 feed_lag_p50-ms	         0.0004910 feed_lag_p95-ms	         4.000 mean_width	       145.3 ready_p50-ms	       159.8 ready_p95-ms	       145.3 residual_p50-ms	       159.8 residual_p95-ms	     33760 signatures/block	    228344 signatures/s	         0.003817 submit_p50-ms	         0.007323 submit_p95-ms	 7057630 B/op	   67536 allocs/op
+PASS
+
+=== sample-3-catchup-workers2-target8/execution-baseline.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  164358	      3884 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-3-catchup-workers2-target8/execution-concurrent.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  126450	      4148 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-3-catchup-workers2-target8/sigverify-load.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/turbine
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionVerificationFlow/captured_2622581/workers_2/target_8/catchup-8 	      96	  78410504 ns/op	         2.050 avg_cpu_cores	         1.000 components/block	       160.8 cpu-ms/block	         0.0002300 feed_lag_p50-ms	         0.0004810 feed_lag_p95-ms	         8.000 mean_width	        75.31 ready_p50-ms	        90.25 ready_p95-ms	        75.31 residual_p50-ms	        90.25 residual_p95-ms	     33760 signatures/block	    430555 signatures/s	         0.003577 submit_p50-ms	         0.007614 submit_p95-ms	 7057749 B/op	   67536 allocs/op
+PASS
+
+=== sample-3-catchup-workers4-target4/execution-baseline.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  169953	      3669 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-3-catchup-workers4-target4/execution-concurrent.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  145288	      4207 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-3-catchup-workers4-target4/sigverify-load.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/turbine
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionVerificationFlow/captured_2622581/workers_4/target_4/catchup-8 	      96	  80096206 ns/op	         3.978 avg_cpu_cores	         1.000 components/block	       318.6 cpu-ms/block	         0.0002300 feed_lag_p50-ms	         0.0006910 feed_lag_p95-ms	         4.000 mean_width	        77.65 ready_p50-ms	        92.49 ready_p95-ms	        77.65 residual_p50-ms	        92.49 residual_p95-ms	     33760 signatures/block	    421493 signatures/s	         0.004018 submit_p50-ms	         0.01255 submit_p95-ms	 7057922 B/op	   67536 allocs/op
+PASS
+
+=== sample-3-catchup-workers4-target8/execution-baseline.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  167019	      3809 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-3-catchup-workers4-target8/execution-concurrent.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  148914	      4629 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-3-catchup-workers4-target8/sigverify-load.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/turbine
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionVerificationFlow/captured_2622581/workers_4/target_8/catchup-8 	      96	  44540126 ns/op	         3.899 avg_cpu_cores	         1.000 components/block	       173.7 cpu-ms/block	         0.0002400 feed_lag_p50-ms	         0.0003300 feed_lag_p95-ms	         8.000 mean_width	        42.49 ready_p50-ms	        55.03 ready_p95-ms	        42.49 residual_p50-ms	        55.03 residual_p95-ms	     33760 signatures/block	    757968 signatures/s	         0.003727 submit_p50-ms	         0.01137 submit_p95-ms	 7053895 B/op	   67536 allocs/op
+PASS
+
+=== sample-3-tip_200ms_overlap-workers2-target4/execution-baseline.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  140451	      3666 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-3-tip_200ms_overlap-workers2-target4/execution-concurrent.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  155277	      3597 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-3-tip_200ms_overlap-workers2-target4/sigverify-load.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/turbine
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionVerificationFlow/captured_2622581/workers_2/target_4/tip_200ms_overlap-8         	      20	 201192091 ns/op	         1.506 avg_cpu_cores	       126.0 components/block	       303.0 cpu-ms/block	         0.06870 feed_lag_p50-ms	         0.8534 feed_lag_p95-ms	         3.956 mean_width	         1.591 ready_p50-ms	         2.540 ready_p95-ms	         1.178 residual_p50-ms	         1.465 residual_p95-ms	     33760 signatures/block	    167800 signatures/s	         0.001112 submit_p50-ms	         0.002705 submit_p95-ms	 7200373 B/op	   68940 allocs/op
+PASS
+
+=== sample-3-tip_200ms_overlap-workers2-target8/execution-baseline.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  168775	      3465 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-3-tip_200ms_overlap-workers2-target8/execution-concurrent.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  167258	      3583 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-3-tip_200ms_overlap-workers2-target8/sigverify-load.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/turbine
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionVerificationFlow/captured_2622581/workers_2/target_8/tip_200ms_overlap-8         	      20	 200968000 ns/op	         0.8420 avg_cpu_cores	       126.0 components/block	       169.2 cpu-ms/block	         0.4334 feed_lag_p50-ms	         0.9712 feed_lag_p95-ms	         7.912 mean_width	         1.178 ready_p50-ms	         1.715 ready_p95-ms	         1.039 residual_p50-ms	         1.357 residual_p95-ms	     33760 signatures/block	    167987 signatures/s	         0.001403 submit_p50-ms	         0.004248 submit_p95-ms	 7250793 B/op	   68941 allocs/op
+PASS
+
+=== sample-3-tip_200ms_overlap-workers4-target4/execution-baseline.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  167756	      3486 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-3-tip_200ms_overlap-workers4-target4/execution-concurrent.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  141630	      4231 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-3-tip_200ms_overlap-workers4-target4/sigverify-load.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/turbine
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionVerificationFlow/captured_2622581/workers_4/target_4/tip_200ms_overlap-8         	      20	 200751013 ns/op	         1.678 avg_cpu_cores	       126.0 components/block	       336.9 cpu-ms/block	         0.4283 feed_lag_p50-ms	         0.9902 feed_lag_p95-ms	         3.956 mean_width	         1.217 ready_p50-ms	         2.032 ready_p95-ms	         0.5827 residual_p50-ms	         1.286 residual_p95-ms	     33760 signatures/block	    168169 signatures/s	         0.001764 submit_p50-ms	         0.004468 submit_p95-ms	 7235916 B/op	   68943 allocs/op
+PASS
+
+=== sample-3-tip_200ms_overlap-workers4-target8/execution-baseline.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  170604	      3472 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-3-tip_200ms_overlap-workers4-target8/execution-concurrent.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkLoadAndExecuteTransferResultMode/lean-8         	  159267	      4093 ns/op	    4146 B/op	      59 allocs/op
+PASS
+
+=== sample-3-tip_200ms_overlap-workers4-target8/sigverify-load.log ===
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/turbine
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionVerificationFlow/captured_2622581/workers_4/target_8/tip_200ms_overlap-8         	      20	 200971694 ns/op	         0.8761 avg_cpu_cores	       126.0 components/block	       176.1 cpu-ms/block	         0.5208 feed_lag_p50-ms	         1.015 feed_lag_p95-ms	         7.912 mean_width	         0.9286 ready_p50-ms	         1.430 ready_p95-ms	         1.097 residual_p50-ms	         1.294 residual_p95-ms	     33760 signatures/block	    167984 signatures/s	         0.001553 submit_p50-ms	         0.004518 submit_p95-ms	 7272930 B/op	   68937 allocs/op
+PASS
