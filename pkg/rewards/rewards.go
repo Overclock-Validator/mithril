@@ -1083,6 +1083,10 @@ func CalculateRewardsStreaming(
 		phase2TotalStakerRewards, totalVotingRewards, len(validatorRewards), numPartitions)
 
 	// ==================== PHASE 3: Read temp spool, assign partitions, write per-partition spools ====================
+	if err := resetPartitionedSpoolFiles(spoolDir, slot, numPartitions); err != nil {
+		CleanupTempSpoolFile(tempPath)
+		return nil, err
+	}
 	tempReader, err := NewTempSpoolReader(tempPath)
 	if err != nil {
 		CleanupTempSpoolFile(tempPath)

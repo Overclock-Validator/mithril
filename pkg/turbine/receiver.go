@@ -18,7 +18,9 @@ import (
 type LeaderForSlotFunc func(slot uint64) (solana.PublicKey, bool)
 
 type UDPReceiver struct {
-	Addr string
+	Addr        string
+	localAddrMu sync.RWMutex
+	localAddr   *net.UDPAddr
 
 	assembler *SlotAssembler
 	// A reset must be atomic with respect to both network ingestion and spool
@@ -490,6 +492,20 @@ func (r *UDPReceiver) signalReady(err error) {
 	})
 }
 
+// LocalAddr returns the bound live-ingress address after Ready succeeds, or nil
+// when Run is not listening. The returned address is a copy. This allows callers
+// to use an OS-assigned port without reserving and reopening a socket.
+func (r *UDPReceiver) LocalAddr() *net.UDPAddr {
+	r.localAddrMu.RLock()
+	defer r.localAddrMu.RUnlock()
+	if r.localAddr == nil {
+		return nil
+	}
+	addr := *r.localAddr
+	addr.IP = append(net.IP(nil), addr.IP...)
+	return &addr
+}
+
 func (r *UDPReceiver) Run(ctx context.Context) error {
 	defer r.once.Do(func() {
 		close(r.blocks)
@@ -515,6 +531,14 @@ func (r *UDPReceiver) Run(ctx context.Context) error {
 		return err
 	}
 	defer liveConn.Close()
+	r.localAddrMu.Lock()
+	r.localAddr = liveConn.LocalAddr().(*net.UDPAddr)
+	r.localAddrMu.Unlock()
+	defer func() {
+		r.localAddrMu.Lock()
+		r.localAddr = nil
+		r.localAddrMu.Unlock()
+	}()
 	gossip.BoostUDPReceiveBuffer(liveConn, gossip.TurbineUDPReceiveBufferBytes, "turbine receiver")
 
 	// Serve-repair replies to the request's UDP source port. Give repair its

@@ -27,6 +27,9 @@ import (
 )
 
 type AccountsDb struct {
+	storeLock        *accountsDbStoreLock
+	shutdownOnce     sync.Once
+	shutdownErr      error
 	Index            *pebble.DB
 	BankHashStore    *pebble.DB
 	AcctsDir         string
@@ -136,56 +139,71 @@ func NewAccountsIndexPebbleOptions(logger pebble.Logger) *pebble.Options {
 	}
 }
 
-func OpenDb(accountsDbDir string) (*AccountsDb, error) {
-	// check for existence of the 'accounts' directory, which holds the appendvecs
-	appendVecsDir := fmt.Sprintf("%s/accounts", accountsDbDir)
-	_, err := os.Stat(appendVecsDir)
+// OpenDb opens the AccountsDB store while holding the same store guard
+// used by genesis initialization. Snapshot builders retain their existing format.
+func OpenDb(root string) (_ *AccountsDb, retErr error) {
+	guard, err := AcquireExclusiveAccountsDbStore(root)
 	if err != nil {
 		return nil, err
 	}
+	defer func() { retErr = errors.Join(retErr, guard.Close()) }()
+	return openDbWithStoreGuard(root, guard, false, false)
+}
 
-	// attempt to open largest_file_id file
-	largestFileIdFn := fmt.Sprintf("%s/largest_file_id", accountsDbDir)
-	lfi, err := os.Open(largestFileIdFn)
-	if err != nil {
-		mlog.Log.Infof("failed to open %s\n", largestFileIdFn)
-		return nil, err
-	}
+// OpenDbWithStoreGuard reopens an existing store, transferring guard ownership
+// only after both databases have opened successfully.
+func OpenDbWithStoreGuard(root string, guard *AccountsDbStoreGuard) (*AccountsDb, error) {
+	return openDbWithStoreGuard(root, guard, false, true)
+}
 
-	largestFileIdBytes := make([]byte, 8)
-	bytesRead, err := lfi.Read(largestFileIdBytes)
-	if err != nil {
-		mlog.Log.Infof("error reading %s: %s\n", largestFileIdFn, err)
-		return nil, err
-	} else if bytesRead != 8 {
-		mlog.Log.Infof("error reading %s: expected 8 bytes, got %d\n", largestFileIdFn, bytesRead)
-		return nil, fmt.Errorf("only got %d bytes", bytesRead)
-	}
+// CreateDbWithStoreGuard creates both indexes exclusively. The caller must
+// prepare the appendvecs and bootstrap sidecars under this same guard first.
+func CreateDbWithStoreGuard(root string, guard *AccountsDbStoreGuard) (*AccountsDb, error) {
+	return openDbWithStoreGuard(root, guard, true, false)
+}
 
-	largestFileId := binary.LittleEndian.Uint64(largestFileIdBytes)
-
-	indexDir := filepath.Join(accountsDbDir, "mithril_db")
-	db, err := pebble.Open(indexDir, NewAccountsIndexPebbleOptions(silentLogger{}))
-	if err != nil {
-		return nil, fmt.Errorf("opening indexDir=%s: %w", indexDir, err)
-	}
-
-	bankhashDir := filepath.Join(accountsDbDir, "bankhash_db")
-	bankhashDb, err := pebble.Open(bankhashDir, &pebble.Options{Logger: silentLogger{}})
-	if err != nil {
-		return nil, fmt.Errorf("opening bankhashDir=%s: %w", bankhashDir, err)
-	}
-
-	accountsDb := &AccountsDb{
-		IndexWALDisabled: DisableIndexWAL, Index: db, BankHashStore: bankhashDb, AcctsDir: appendVecsDir}
-	accountsDb.LargestFileId.Store(largestFileId)
-
-	accountsDb.inProgressStoreRequests = list.New()
-	accountsDb.storeRequestChan = make(chan *list.Element)
-	accountsDb.storeWorkerDone = make(chan struct{})
-	go accountsDb.storeWorker()
-
-	return accountsDb, nil
+func openDbWithStoreGuard(root string, guard *AccountsDbStoreGuard, create, existing bool) (*AccountsDb, error) {
+	var result *AccountsDb
+	err := guard.transferAccountsDbStoreLockOnSuccess(root, func(lock *accountsDbStoreLock) error {
+		if err := RejectUnsupportedIndexArtifacts(root); err != nil {
+			return err
+		}
+		appendVecsDir := filepath.Join(root, "accounts")
+		info, err := os.Lstat(appendVecsDir)
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("accountsdb: accounts is not a real directory")
+		}
+		largestFileId, err := ValidateLargestFileID(root)
+		if err != nil {
+			return err
+		}
+		options := NewAccountsIndexPebbleOptions(silentLogger{})
+		options.ErrorIfExists, options.ErrorIfNotExists = create, existing
+		// Creation must durably publish the genesis index even if the caller
+		// configured WAL-less replay (which relies on subsequent fold manifests).
+		if create {
+			options.DisableWAL = false
+		}
+		index, err := pebble.Open(filepath.Join(root, "mithril_db"), options)
+		if err != nil {
+			return fmt.Errorf("opening account index: %w", err)
+		}
+		bankhash, err := pebble.Open(filepath.Join(root, "bankhash_db"), &pebble.Options{Logger: silentLogger{}, ErrorIfExists: create, ErrorIfNotExists: existing})
+		if err != nil {
+			return errors.Join(err, index.Close())
+		}
+		result = &AccountsDb{Index: index, BankHashStore: bankhash, AcctsDir: appendVecsDir, IndexWALDisabled: options.DisableWAL, storeLock: lock}
+		result.LargestFileId.Store(largestFileId)
+		result.inProgressStoreRequests = list.New()
+		result.storeRequestChan = make(chan *list.Element)
+		result.storeWorkerDone = make(chan struct{})
+		go result.storeWorker()
+		return nil
+	})
+	return result, err
 }
 
 // Turns down the store worker. AccountsDb cannot accept writes after this.
@@ -201,17 +219,29 @@ func (accountsDb *AccountsDb) WaitForStoreWorker() {
 	accountsDb.storeWorkerDone = nil
 }
 
+// Shutdown drains writes, closes both databases and then releases ownership.
+// Once started it finishes closing even if ctx is cancelled during shutdown.
+func (accountsDb *AccountsDb) Shutdown(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	accountsDb.shutdownOnce.Do(func() {
+		accountsDb.WaitForStoreWorker()
+		if accountsDb.Index != nil {
+			accountsDb.shutdownErr = errors.Join(accountsDb.shutdownErr, accountsDb.Index.Close())
+		}
+		if accountsDb.BankHashStore != nil {
+			accountsDb.shutdownErr = errors.Join(accountsDb.shutdownErr, accountsDb.BankHashStore.Close())
+		}
+		accountsDb.shutdownErr = errors.Join(accountsDb.shutdownErr, accountsDb.storeLock.Close())
+	})
+	return accountsDb.shutdownErr
+}
+
 func (accountsDb *AccountsDb) CloseDb() {
-	accountsDb.WaitForStoreWorker()
-	mlog.Log.Infof("CloseDb: syncing and closing Index...")
-	if err := accountsDb.Index.Close(); err != nil {
-		mlog.Log.Errorf("CloseDb: Index.Close() error: %v", err)
+	if err := accountsDb.Shutdown(context.Background()); err != nil {
+		mlog.Log.Errorf("CloseDb: %v", err)
 	}
-	mlog.Log.Infof("CloseDb: syncing and closing BankHashStore...")
-	if err := accountsDb.BankHashStore.Close(); err != nil {
-		mlog.Log.Errorf("CloseDb: BankHashStore.Close() error: %v", err)
-	}
-	mlog.Log.Infof("CloseDb: done\n") // extra newline for spacing after close
 }
 
 func (accountsDb *AccountsDb) InitCaches() {

@@ -578,6 +578,15 @@ func ClearPendingStakePubkeys() {
 	instance.pendingStakeBySlot = nil
 }
 
+// InvalidateStakePubkeyIndexCache is used when an offline replay session takes
+// ownership of epoch execution. Entries from another database or a prior open
+// must not supply this bank's stake scan.
+func InvalidateStakePubkeyIndexCache() {
+	instance.pendingStakeMutex.Lock()
+	defer instance.pendingStakeMutex.Unlock()
+	instance.cachedStakeEntries = nil
+}
+
 // compactThreshold is the minimum number of appended entries before compaction triggers.
 // At ~1 new stake account per block × 432k blocks/epoch ≈ a few thousand new entries max.
 // 1000 keeps the file clean without rewriting 24MB every boundary when only a handful changed.

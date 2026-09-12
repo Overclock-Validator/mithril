@@ -781,6 +781,9 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	if accountsPath == "" {
 		accountsPath = getString("accounts-path", "ledger.accounts_path")
 	}
+	if err := state.RejectGenesisLaunch(accountsPath); err != nil {
+		return err
+	}
 	// Check write permission early to fail fast with helpful error
 	if err := checkDirWritable(accountsPath, "AccountsDB"); err != nil {
 		return err

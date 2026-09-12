@@ -40,7 +40,7 @@ func ApplyAlpenglowVoteRewards(
 	if len(skipRaw) == 0 && len(notarRaw) == 0 && len(finalCertRaw) == 0 {
 		return nil
 	}
-	if slotCtx.Features == nil || !(slotCtx.Features.IsActive(features.Alpenglow) || slotCtx.Features.IsActive(features.AlpenglowDevContext)) {
+	if !alpenglowClockFeatureActive(slotCtx.Features) {
 		return nil
 	}
 

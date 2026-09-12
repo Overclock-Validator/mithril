@@ -12,6 +12,7 @@ import (
 // To be removed when switching over to serde-generate.
 
 func (a *PohParams) UnmarshalWithDecoder(decoder *bin.Decoder) (err error) {
+	*a = PohParams{}
 	var tickDuration serdeDuration
 	if err = decoder.Decode(&tickDuration); err != nil {
 		return err
@@ -38,18 +39,36 @@ func (a *PohParams) UnmarshalWithDecoder(decoder *bin.Decoder) (err error) {
 	return nil
 }
 
-func (a *PohParams) MarshalWithDecoder(encoder *bin.Encoder) (err error) {
-	tickDuration := newSerdeDuration(a.TickDuration)
-	_ = encoder.Encode(&tickDuration)
-	_ = encoder.WriteBool(a.HasTickCount)
-	if a.HasTickCount {
-		_ = encoder.WriteUint64(a.TickCount, bin.LE)
+func (a *PohParams) MarshalWithEncoder(encoder *bin.Encoder) (err error) {
+	if a.TickDuration < 0 {
+		return fmt.Errorf("negative tick duration")
 	}
-	_ = encoder.WriteBool(a.HasHashesPerTick)
+	tickDuration := newSerdeDuration(a.TickDuration)
+	if err = encoder.Encode(&tickDuration); err != nil {
+		return err
+	}
+	if err = encoder.WriteBool(a.HasTickCount); err != nil {
+		return err
+	}
+	if a.HasTickCount {
+		if err = encoder.WriteUint64(a.TickCount, bin.LE); err != nil {
+			return err
+		}
+	}
+	if err = encoder.WriteBool(a.HasHashesPerTick); err != nil {
+		return err
+	}
 	if a.HasHashesPerTick {
-		_ = encoder.WriteUint64(a.HashesPerTick, bin.LE)
+		if err = encoder.WriteUint64(a.HashesPerTick, bin.LE); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// MarshalWithDecoder is retained for callers of the historically misnamed method.
+func (a *PohParams) MarshalWithDecoder(encoder *bin.Encoder) error {
+	return a.MarshalWithEncoder(encoder)
 }
 
 // serdeDuration implements the bincode serialization of std::time::Duration.
@@ -69,12 +88,16 @@ func newSerdeDuration(d time.Duration) serdeDuration {
 }
 
 func (s serdeDuration) Duration() (time.Duration, error) {
-	if time.Duration(s.Nanos) > time.Second {
+	if time.Duration(s.Nanos) >= time.Second {
 		return 0, fmt.Errorf("malformed serde duration")
 	}
 	if s.Secs > uint64(time.Duration(math.MaxInt64)/time.Second) {
 		return 0, fmt.Errorf("malformed serde duration")
 	}
-	d := time.Duration(s.Nanos) + (time.Duration(s.Secs) * time.Second)
+	seconds := time.Duration(s.Secs) * time.Second
+	if seconds > time.Duration(math.MaxInt64)-time.Duration(s.Nanos) {
+		return 0, fmt.Errorf("malformed serde duration")
+	}
+	d := time.Duration(s.Nanos) + seconds
 	return d, nil
 }

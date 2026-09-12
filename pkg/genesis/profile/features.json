@@ -1,0 +1,1094 @@
+[
+  {
+    "address": "16FMCmgLzCNNz6eTwGanbyN2ZxvTBSLuQ6DZhgeMshg",
+    "name": "Stop truncating strings in syscalls #31029"
+  },
+  {
+    "address": "21AWDosvp3pBamFW91KB35pNoaoZVTM7ess8nr2nt53B",
+    "name": "merge NonceError into SystemError"
+  },
+  {
+    "address": "25vqsfjk7Nv1prsQJmA4Xu1bN61s8LXCBGUPp8Rfy1UF",
+    "name": "only hash accounts in incremental snapshot during incremental snapshot creation #26799"
+  },
+  {
+    "address": "265hPS8k8xJ37ot82KEgjRunsUp5w4n4Q4VwwiN9i9ps",
+    "name": "optimize epoch boundary updates"
+  },
+  {
+    "address": "28s7i3htzhahXQKqmS2ExzbEoUypg9krwvtK2M9UWXh9",
+    "name": "update rewards from cached accounts"
+  },
+  {
+    "address": "2B2SBNbUcr438LtGXNcJNBP2GBSxjx81F945SdSkUSfC",
+    "name": "SIMD-0175: Disable partitioned rent collection #4562"
+  },
+  {
+    "address": "2Fr57nzzkLYXW695UdDxDeR5fhnZWSttZeZYemrnpGFV",
+    "name": "SIMD-0140: Migrate Config program to Core BPF"
+  },
+  {
+    "address": "2GCrNXbzmt4xrwdcKS2RdsLzsgu4V5zHAemW57pcHT6a",
+    "name": "stop use static SimpleVote transaction cost, issue #10227"
+  },
+  {
+    "address": "2HmTkCj9tXuPE4ueHzdD7jPeMf9JGCoZh5AsyoATiWEe",
+    "name": "stop incorrectly throwing IncorrectProgramId in bpf_loader #30747"
+  },
+  {
+    "address": "2R72wpcQ7qV7aTJWUumdn8u5wmmTyXbK7qzEy7YSAgyY",
+    "name": "include account index in rent tx error #25190"
+  },
+  {
+    "address": "2aQJYqER2aKyb3cZw22v4SL2xMX7vwXBRWfvS4pTrtED",
+    "name": "SIMD-0167: Enable Loader-v4"
+  },
+  {
+    "address": "2h63t332mGCCsWK2nqqqHhN4U9ayyqhLVFvczznHDoTZ",
+    "name": "update syscall base costs"
+  },
+  {
+    "address": "2jXx2yDmGysmBKfKYNgLj2DQyAQv6mMk2BPh4eSbyB4H",
+    "name": "deprecate fee calculator"
+  },
+  {
+    "address": "2oMRZEDWT2tqtYMofhmmfQ8SsjqUFzT6sYXppQDavxwz",
+    "name": "Enable ExtendProgramChecked instruction"
+  },
+  {
+    "address": "2ry7ygxiYURULZCrypHhveanvP5tzZ4toRwVp89oCNSj",
+    "name": "apply cost tracker to blocks during replay #29595"
+  },
+  {
+    "address": "2uxQgtKa2ECHGs67Zdj7dgmzn2w9HiqhdcedwCWfYzzq",
+    "name": "SIMD-0387: BLS Pubkey Management in Vote Account"
+  },
+  {
+    "address": "36PRUK2Dz6HWYdG9SpjeAsF5F3KxnFCakA2BZMbtMhSb",
+    "name": "use correct check for nonoverlapping regions in memcpy syscall"
+  },
+  {
+    "address": "3BX6SBeEBibHaVQXywdkcgyUk6evfYZkHdztXiDtEpFS",
+    "name": "warp timestamp again, adjust bounding to 150% slow #25666"
+  },
+  {
+    "address": "3E3jV7v9VcdJL8iYZUMax9DiDno8j7EWUVbhm9RtShj2",
+    "name": "demote program write locks to readonly, except when upgradeable loader present #19593 #20265"
+  },
+  {
+    "address": "3KZZ6Ks1885aGBQ45fwRcPXVBCtzUvxhUTkwKMR41Tca",
+    "name": "enable versioned transaction message processing"
+  },
+  {
+    "address": "3NKRSwpySNwD3TvP5pHnRmkAQRsdkXWRr1WaQh8p4PWX",
+    "name": "Reject bpf callx r10 instructions"
+  },
+  {
+    "address": "3XgNukcZWf9o3HdA3fpJbm94XFc4qpvTXc8h1wxYwiPi",
+    "name": "disable ldabs* and ldind* SBF instructions"
+  },
+  {
+    "address": "3aJdcZqxoLpSBxgeYGjPwaYS1zzcByxUDqJkbzWAH1Zb",
+    "name": "move the CPI stack overflow check to the end of push"
+  },
+  {
+    "address": "3ccR6QpxGYsAbWyfevEtBNGfWV4xBffxRj2tD6A9i39F",
+    "name": "check initialized Vote data"
+  },
+  {
+    "address": "3gtZPqvPpsbXZVCx6hceMfWxtsmrjMzmg8C7PLKSxS2d",
+    "name": "filter vote slots older than the slot hashes history"
+  },
+  {
+    "address": "3opE3EzAKnUftUDURkzMgwpNgimBAypW1mNDYH4x4Zg7",
+    "name": "SIMD-0096: Reward full priority fee to validators"
+  },
+  {
+    "address": "3u3Er5Vc2jVcwz4xr2GJeSAXT3fAj6ADHZ4BJMZiScFd",
+    "name": "durable nonces must be advanceable"
+  },
+  {
+    "address": "3uFHb9oKdGfgZGJK9EHaAXN4USvnQtAFC13Fh5gGFS5B",
+    "name": "Update desired hashes per tick on epoch boundary"
+  },
+  {
+    "address": "3uRVPBpyEJRo1emLCrq38eLRFGcu6uKSpUXqGvU8T7SZ",
+    "name": "check syscall outputs do_not overlap #28600"
+  },
+  {
+    "address": "437r62HoAdUb63amq3D7ENnBLDhHT2xY8eFkLJYVKK4x",
+    "name": "enable the deactivate delinquent stake instruction #23932"
+  },
+  {
+    "address": "4ApgRX3ud6p7LNMJmsuaAcZY5HWctGPr5obAsjB3A54d",
+    "name": "prevent calling precompiles as programs"
+  },
+  {
+    "address": "4Di3y24QFLt5QEUPZtbnjyfQKfm6ZMTfa6Dw1psfoMKU",
+    "name": "drop redundant turbine path"
+  },
+  {
+    "address": "4EJQtF2pkRyawwcTVfQutzq4Sa5hRhibF6QAK1QXhtEX",
+    "name": "enable durable nonce #25744"
+  },
+  {
+    "address": "4RWNif6C2WCNiKVW7otP4G7dkmkHGyKQWRpuZ1pxKU5m",
+    "name": "pico inflation"
+  },
+  {
+    "address": "4UDcAfQ6EcA6bdcadkeHpkarkhZGJ7Bpq7wTAiRMjkoi",
+    "name": "disable builtin loader ownership chains #29956"
+  },
+  {
+    "address": "4WeHX6QoXCCwqbSFgi6dxnB6QsPo6YApaNTH7P4MLQ99",
+    "name": "SIMD-0083: Allow batched transactions to read/write and write/write the same accounts"
+  },
+  {
+    "address": "4a6f7o7iTcA8hRDCrPLkSatnt5Ykxiu36wo5p1Tt12wC",
+    "name": "SIMD-0437-1: Set lamports per byte to 6333"
+  },
+  {
+    "address": "4d5AKtxoh93Dwm1vHXUU3iRATuMndx1c431KgT2td52r",
+    "name": "Add compute_budget_program"
+  },
+  {
+    "address": "4eohviozzEeivk1y9UbrnekbAFMDQyJz5JjA9Y6gyvky",
+    "name": "SIMD-0089: Migrate Feature Gate program to Core BPF (programify)"
+  },
+  {
+    "address": "4kpdyrcj5jS47CZb2oJGfVxjYbsMm2Kx97gFyZrxxwXz",
+    "name": "no overflow rent distribution"
+  },
+  {
+    "address": "4yuaYAj2jGMGTh1sSmi4G2eFscsDq8qjugJXZoBN6YEa",
+    "name": "disable reporting of unresolved SBF symbols at runtime"
+  },
+  {
+    "address": "51VCKU5eV6mcTc9q9ArfWELU2CqDoi13hdAjr6fHMdtv",
+    "name": "Verify retransmitter signature #1840"
+  },
+  {
+    "address": "54KAoNiUERNoWWUhTWWwXgym94gzoXFVnHyQwPA18V9A",
+    "name": "fail libsecp256k1_verify if count appears wrong"
+  },
+  {
+    "address": "5GpmAKxaGsWWbPp4bNXFLJxZVvG92ctxf7jQnzTQjF3n",
+    "name": "enable epoch accounts hash calculation #27539"
+  },
+  {
+    "address": "5JsG4NWH8Jbrqdd8uL6BNwnyZK3dQSoieRXG5vmofj9y",
+    "name": "SIMD-0180: Enable vote address leader schedule #4573"
+  },
+  {
+    "address": "5KLGJSASDVxKPjLCDWNtnABLpZjsQSrYZ8HKwcEdAMC8",
+    "name": "drops unchained Merkle shreds #2149"
+  },
+  {
+    "address": "5Pecy6ie6XGm22pc9d4P9W5c31BugcFBuy6hsP2zkETv",
+    "name": "checked arithmetic in fee validation #31273"
+  },
+  {
+    "address": "5TuppMutoyzhUSfuYdhgzD47F92GL1g89KpCZQKqedxP",
+    "name": "enable the remaining_compute_units syscall"
+  },
+  {
+    "address": "5ZCcFAzJ1zsFKe1KSZa9K92jhx7gkcKj97ci2DBo1vwj",
+    "name": "Simplify checks performed for writable upgradeable program accounts #30559"
+  },
+  {
+    "address": "5cC3foj77CWun58pC51ebHFUWavHWKarWyR5UUik7dnC",
+    "name": "SIMD-0178, SIMD-0189 and SIMD-0377: Enable deployment and execution of SBPFv3 programs"
+  },
+  {
+    "address": "5ekBxc8itEnPv4NzGJtr8BVVQLNMQuLMNQQj7pHoLNZ9",
+    "name": "transaction wide compute cap"
+  },
+  {
+    "address": "5oMCU3JPaFLr8Zr4ct7yFA7jdk6Mw1RmB8K4u9ZbS42z",
+    "name": "SIMD-0207: Raise block limit to 50M"
+  },
+  {
+    "address": "5wAGiy15X1Jb2hkHnPDCM8oB9V42VNA9ftNVFK84dEgv",
+    "name": "set rent epoch to Epoch::MAX for rent-exempt accounts #28683"
+  },
+  {
+    "address": "5x3825XS7M2A3Ekbn5VGGkvFoAg5qrRWkTrY4bARP1GL",
+    "name": "enable bpf upgradeable loader SetAuthorityChecked instruction #28424"
+  },
+  {
+    "address": "5xXZc66h4UdB6Yq7FzdBxBiRAFMMScMLwHxk2QZDaNZL",
+    "name": "SIMD-0321: Provide instruction data offset in VM r2"
+  },
+  {
+    "address": "61BtM7BkDEE8Yq5fskEVAQT9mYA8qCejJWoLe5apqg81",
+    "name": "SIMD-0437-2: Set lamports per byte to 5080"
+  },
+  {
+    "address": "64ixypL1HPu8WtJhNSMb9mSgfFaJvsANuRkTbHyuLfnx",
+    "name": "SIMD-0160: static instruction limit"
+  },
+  {
+    "address": "6M4oQ6eXneVhtLoiAr4yRYQY43eVLjrKbiDZDJc892yk",
+    "name": "SIMD-0196: Migrate Stake program to Core BPF #3655"
+  },
+  {
+    "address": "6RvdSWHh8oh72Dp7wMTS2DBkf3fRPtChfNrAo3cZZoXJ",
+    "name": "secp256k1_recover syscall"
+  },
+  {
+    "address": "6TkHkRmP7JZy1fdM6fg5uXn76wChQBWGokHBJzrLB3mj",
+    "name": "SIMD-0268: Raise CPI nesting limit from 4 to 8"
+  },
+  {
+    "address": "6Uf8S75PVh91MYgPQSHnjRAPQq6an5BDv9vomrCwDqLe",
+    "name": "Deprecate unused legacy vote tx plumbing"
+  },
+  {
+    "address": "6YsBCejwK96GZCkJ6mkZ4b68oP63z2PLoQmWjC7ggTqZ",
+    "name": "consume duplicate proofs from blockstore in consensus #34372"
+  },
+  {
+    "address": "6aHuNsUmwSzCEMjrBzBCYaxHAyAcQBjVES92JigHBDuC",
+    "name": "SIMD-0406: Maximum instruction accounts"
+  },
+  {
+    "address": "6iyggb5MTcsvdcugX7bEKbHV8c6jdLbpHwkncrgLMhfo",
+    "name": "stop adding hashes for skipped slots to recent blockhashes"
+  },
+  {
+    "address": "6oMCUgfY6BzZ6jwB681J6ju5Bh6CjVXbd7NeWYqiXBSu",
+    "name": "SIMD-0256: Raise block limit to 60M"
+  },
+  {
+    "address": "6ppMXNYLhVd7GcsZ5uV11wQEW7spppiMVfqQv5SXhDpX",
+    "name": "enable builtin ed25519 signature verify program"
+  },
+  {
+    "address": "6sPDzwyARRExKH52LECxcGoqziH8G7SZofwuxi8Ja331",
+    "name": "SIMD-0312: Enable CreateAccountAllowPrefund system program instruction"
+  },
+  {
+    "address": "6tRxEYKuy2L5nnv5bgn7iT28MxUbYxp5h7F3Ncf1exrT",
+    "name": "An instruction you can use to change a vote accounts authority when the current authority is a derived key #25860"
+  },
+  {
+    "address": "6uaHcKPGUy4J7emLBgUTeufhJdiwhngW6a1R9B7c2ob9",
+    "name": "enable sol_log_data syscall"
+  },
+  {
+    "address": "74CoWuBmt3rUVUrCb2JiSTvh6nXyBWUsK4SaMj3CtE3T",
+    "name": "cpi ignore serialized_len_ptr #29592"
+  },
+  {
+    "address": "75m6ysz33AfLA5DDEzWM1obBrnPQRSsdVQ2nRmc8Vuu1",
+    "name": "support account data reallocation"
+  },
+  {
+    "address": "76dHtohc2s5dR3ahJyBxs7eJJVipFkaPdih9CLgTTb4B",
+    "name": "SIMD-0249: Delay Commission Updates"
+  },
+  {
+    "address": "79HWsX9rpnnJBPcdNURVqygpMAfxdrAirzAGAVmf92im",
+    "name": "disable new deployments of deprecated sol_alloc_free_ syscall"
+  },
+  {
+    "address": "7GUcYgq4tVtaqNCKT3dho9r4665Qp5TxCZ27Qgjx3829",
+    "name": "Executables incur CPI data costs"
+  },
+  {
+    "address": "7VVhpg5oAjAmnmz1zCcSHb2Z9ecZB2FQqpnEwReka9Zm",
+    "name": "SIMD-0242: Static Nonce Account Only"
+  },
+  {
+    "address": "7Vced912WrRnfjaiKRiNBcbuFw7RrnLv3E3z95Y4GTNc",
+    "name": "enable early verification of account modifications #25899"
+  },
+  {
+    "address": "7VgiehxNxu53KdxgLspGQY8myE6f7UokaWa4jsGcaSz",
+    "name": "SIMD-0460: Virtual Address Space Adjustments"
+  },
+  {
+    "address": "7WeS1vfPRgeeoXArLh7879YcB9mgE9ktjPDtajXeWfXn",
+    "name": "disable bpf loader management instructions #34194"
+  },
+  {
+    "address": "7XRJcS5Ud5vxGB54JbK9N2vBZVwnwdBNeJW1ibRgD9gx",
+    "name": "full inflation enabled by Certus One"
+  },
+  {
+    "address": "7axKe5BTYBDD87ftzWbk5DfzWMGyRvqmWTduuo22Yaqy",
+    "name": "replace Lockout with LandedVote (including vote latency) in vote state #31264"
+  },
+  {
+    "address": "7bTK6Jis8Xpfrs8ZoUfiMDPazTcdPcTWheZFJTA5Z6X4",
+    "name": "Enable MoveStake and MoveLamports stake program instructions #1610"
+  },
+  {
+    "address": "7g9EUwj4j7CS21Yx1wvgWLjSZeh5aPq8x9kpoPwXM8n8",
+    "name": "limit secp256k1 recovery id"
+  },
+  {
+    "address": "7rcw5UtqgDTBBv2EcynNfYckgdAaH1MAsCjKgXMkN7Ri",
+    "name": "enable curve25519 syscalls"
+  },
+  {
+    "address": "7txXZZD6Um59YoLMF7XUNimbMjsqsWhc7g2EniiTrmp1",
+    "name": "fail vote withdraw instructions which leave the account non-rent-exempt"
+  },
+  {
+    "address": "7uZBkJXJ1HkuP6R3MJfZs7mLwymBcDbKdqbF51ZWLier",
+    "name": "Enable chained Merkle shreds #34916"
+  },
+  {
+    "address": "812kqX67odAp5NFwM8D2N24cku7WTm9CHUTFUXaDkWPn",
+    "name": "prevent crediting rent paying accounts #26606"
+  },
+  {
+    "address": "8199Q2gMD2kwgfopK5qqVWuDbegLgpuFUFHCcUJQDN8b",
+    "name": "error on bpf function hash collisions"
+  },
+  {
+    "address": "86HpNqzutEZwLcPxS6EHDcMNYWk6ikhteg9un7Y2PBKE",
+    "name": "Compact vote state updates to lower block size"
+  },
+  {
+    "address": "8C8MCtsab5SsfammbzvYz65HHauuUYdbY2DZ4sznH6h5",
+    "name": "Update desired hashes per tick to 4.4M"
+  },
+  {
+    "address": "8FdwgyHFEjhAdjWfV2vfqk7wA1g9X3fQpKH7SBpEv3kC",
+    "name": "require static program ids in versioned transactions"
+  },
+  {
+    "address": "8U4skmMVnF6k2kMvrWbQuRUT3qQSiTYpSjqmhmgfthZu",
+    "name": "SIMD-0105: Maintain Dynamic Set of Reserved Account Keys"
+  },
+  {
+    "address": "8We4E7DPwF2WfAN8tRTtWQNhi98B99Qpuj7JoZ3Aikgg",
+    "name": "Update desired hashes per tick to 7.6M"
+  },
+  {
+    "address": "8Zs9W7D9MpSEtUWSQdGniZk2cNmV22y6FLJwCx53asme",
+    "name": "enable bpf upgradeable loader ExtendProgram instruction #25234"
+  },
+  {
+    "address": "8aXvSuopd1PUj7UhehfXJRg6619RHp8ZvwTyyJHdUYsj",
+    "name": "fail libsecp256k1_verify if count appears wrong"
+  },
+  {
+    "address": "8kEuAshXLsgkUEdcFVLqrjCGGHVWFW99ZZpxvAzzMtBp",
+    "name": "dedupe config program signers"
+  },
+  {
+    "address": "8pgXCMNXC8qyEFypuwpXyRxLXZdpM4Qo72gJ6k87A6wL",
+    "name": "Native program should consume compute units #30620"
+  },
+  {
+    "address": "8sKQrMQoUHtQSUP83SPG4ta2JDjSAiWs7t5aJ9uEd6To",
+    "name": "use default units per instruction in fee calculation #26785"
+  },
+  {
+    "address": "98std1NSHqXi9WYvFShfVepRdCoq1qvsp8fsR2XZtG8g",
+    "name": "add compute budget ix for setting a compute unit price"
+  },
+  {
+    "address": "9LZdXeKGeBV6hRLdxS1rHbHoEUsKqesCC2ZAPTPKJAbK",
+    "name": "increase tx account lock limit to 128 #27241"
+  },
+  {
+    "address": "9gxu85LYRAcZL38We8MYJ4A9AwgBBPtVBAqebMcT1241",
+    "name": "cap accounts data allocations per transaction #27375"
+  },
+  {
+    "address": "9k5ijzTbYPtjzu8wj2ErH9v45xecHzQ1x4PMYMMxFgdM",
+    "name": "enforce max number of accounts per bpf program instruction #26628"
+  },
+  {
+    "address": "9kdtFSrXHQg3hKkbXkQ6trJ3Ja1xpJ22CTFSNAciEwmL",
+    "name": "fail instructions which have native_loader as program_id directly"
+  },
+  {
+    "address": "9onWzzvCzNC2jfhxxeqRgs5q7nFAAKpCUvkj6T6GJK9i",
+    "name": "Raise minimum stake delegation to 1.0 SOL #24357"
+  },
+  {
+    "address": "9ypxGLzkMxi89eDerRKXWDXe44UY2z4hBig4mDhNq5Dp",
+    "name": "SIMD-0159: Move precompile verification into SVM"
+  },
+  {
+    "address": "A16q37opZdQMCbe5qJ6xpBB9usykfv8jZaMkxvZQi4GJ",
+    "name": "add alt_bn128 syscalls #27961"
+  },
+  {
+    "address": "A8xyMHZovGXFkorFqEmVH2PKGLiBip5JD7jt4zsUWo4H",
+    "name": "Remove congestion multiplier from transaction fee calculation #29881"
+  },
+  {
+    "address": "ALBk3EWdeAg2WAGf6GPDUf1nynyNqCdEVmgouG7rpuCj",
+    "name": "fail vote account withdraw to 0 unless account earned 0 credits in last completed epoch"
+  },
+  {
+    "address": "AVZS3ZsN4gi6Rkx2QUibYuSJG3S6QHib7xCYhG6vGJxU",
+    "name": "vote account withdraw authority may change the authorized voter #22521"
+  },
+  {
+    "address": "B1ockRevenueSharing111111111111111111111111",
+    "name": "SIMD-0123: Block Revenue Sharing"
+  },
+  {
+    "address": "B7H2caeia4ZFcpE3QcgMqbiWiBtWrdBRBSJ1DY6Ktxbq",
+    "name": "SIMD-0182: Deplete compute meter for vm errors #3993"
+  },
+  {
+    "address": "B9cdB55u4jQsDNsdTK525yE9dmSc5Ga7YBaBrDFvEhM9",
+    "name": "disable setting is_executable and_rent_epoch in CPI #26987"
+  },
+  {
+    "address": "BKCPBQQBZqggVnFso5nQ8rQ4RwwogYwjuUt9biBjxwNF",
+    "name": "collect rent from accounts owned by sysvars"
+  },
+  {
+    "address": "BL99GYhdjjcv6ys22C9wPgn2aTVERDbPHHo4NbS3hgp7",
+    "name": "spl-token self-transfer fix"
+  },
+  {
+    "address": "BTWmtJC8U5ZLMbBUUA1k6As62sYjPEjAiNAT55xYGdJU",
+    "name": "revise turbine epoch stakes"
+  },
+  {
+    "address": "BUS12ciZ5gCoFafUHWW8qaFMMtwFQGVxjsDheWLdqBE2",
+    "name": "Auto rewind stake's credits_observed if (accidental) vote recreation is detected #22546"
+  },
+  {
+    "address": "BcWknVcgvonN8sL4HE4XFuEVgfcee5MwxWPAgP6ZV89X",
+    "name": "vote/state program checked instructions #18345"
+  },
+  {
+    "address": "BiCU7M5w8ZCMykVSyhZ7Q3m2SWoR2qrEQ86ERcDX77ME",
+    "name": "nonce must be writable"
+  },
+  {
+    "address": "Bj2jmUsM2iRhfdLLDSTkhM5UQRQvQHm57HSmPibPtEyu",
+    "name": "Return InsufficientDelegation instead of InsufficientFunds or InsufficientStake where applicable #31206"
+  },
+  {
+    "address": "BkFDxiJQWZXGTZaJQxH7wVEHkAmwCgSEVkrvswFfRJPD",
+    "name": "require all new transaction accounts with data to be rent-exempt"
+  },
+  {
+    "address": "BrTR9hzw4WBGFP65AJMbpAo64DcA3U6jdPSga9fMV5cS",
+    "name": "perform all checks for transfers of 0 lamports"
+  },
+  {
+    "address": "BsKLKAn1WM4HVhPRDsjosmqSg2J8Tq5xP2s2daDS6Ni4",
+    "name": "Update desired hashes per tick to 9.2M"
+  },
+  {
+    "address": "BtVN7YjDzNE6Dk7kTT7YTDgMNUZTNgiSJgsdzAeTg2jF",
+    "name": "Removing unwanted rounding in fee calculation #34982"
+  },
+  {
+    "address": "BzBBveUDymEYoYzcMWNQCx3cd4jQs7puaVFHLtsbB6fm",
+    "name": "community vote allowing Certus One to enable full inflation"
+  },
+  {
+    "address": "C5fh68nJ7uyKAuYZg2x9sEQ5YrVf3dkW6oojNBSc3Jvo",
+    "name": "send votes to the tpu vote port"
+  },
+  {
+    "address": "C97eKZygrkU4JxJsZdjgbUY7iQR7rKTr4NyDWo2E5pRm",
+    "name": "SIMD-0128: Migrate Address Lookup Table program to Core BPF"
+  },
+  {
+    "address": "C9oAhLxDBm3ssWtJx1yBGzPY55r2rArHmN1pbQn6HogH",
+    "name": "SIMD-0170: Reserve minimal CUs for builtin instructions #2562"
+  },
+  {
+    "address": "CBkDroRDqm8HwHe6ak9cguPjUomrASEkfmxEaZ5CNNxz",
+    "name": "enforce max number of locked accounts per transaction"
+  },
+  {
+    "address": "CCu4boMmfLuqcmfTLPHQiUo22ZdUsXjgzPAURYaWt1Bw",
+    "name": "Requestable heap frame size"
+  },
+  {
+    "address": "CE2et8pqgyQMP2mQRg3CgvX8nJBKUArMu3wfiQiQKY1y",
+    "name": "round up heap size when calculating heap cost #30679"
+  },
+  {
+    "address": "CFK1hRCNy8JJuAAY8Pb2GjLFNdCThS2qwZNe3izzBMgn",
+    "name": "add add_get_processed_sibling_instruction_syscall"
+  },
+  {
+    "address": "CGB2jM8pwZkeeiXQ66kBMyBR6Np61mggL7XUsmLjVcrw",
+    "name": "SIMD-0183: Skip rent rewrites"
+  },
+  {
+    "address": "CHaChatUnR3s6cPyPMMGNJa3VdQQ8PNH2JqdD4LpCKnB",
+    "name": "SIMD-0332: Reduce ChaCha rounds for Turbine from 20 to 8"
+  },
+  {
+    "address": "CJzY83ggJHqPGDq8VisV3U91jDJLuEaALZooBrXtnnLU",
+    "name": "SIMD-0084: Disable rent fees collection"
+  },
+  {
+    "address": "CLCoTADvV64PSrnR6QXty6Fwrt9Xc6EdxSJE4wLRePjq",
+    "name": "SIMD-0127: Enable syscall for fetching Sysvar bytes"
+  },
+  {
+    "address": "CR3dVN2Yoo95Y96kLSTaziWDAQT2MNEpiWh5cqVq2pNE",
+    "name": "enable account data direct mapping"
+  },
+  {
+    "address": "Cdkc8PPTeTNUPoZEfCY5AyetUrEdkZtNPMgz58nqyaHD",
+    "name": "switch to new ELF parser #30497"
+  },
+  {
+    "address": "CommissionRate1nBasisPoints1111111111111111",
+    "name": "SIMD-0291: Commission Rate in Basis Points"
+  },
+  {
+    "address": "CpkdQmspsaZZ8FVAouQTtTWZkc8eeQ7V3uj7dWz543rZ",
+    "name": "on bank load account, do not try to fix up rent_epoch #28541"
+  },
+  {
+    "address": "CustomCommissionCo11ector111111111111111111",
+    "name": "SIMD-0232: Custom Commission Collector"
+  },
+  {
+    "address": "CveezY6FDLVBToHDcvJRmtMouqzsmj4UXYh5ths5G5Uv",
+    "name": "Calculate vote credits for VoteStateUpdate per vote dequeue to match credit awards for Vote instruction"
+  },
+  {
+    "address": "D2aip4BBr8NPWtU9vLrwrBvbuaQ8w1zV38zFLxx4pfBV",
+    "name": "Require stake split destination account to be rent exempt"
+  },
+  {
+    "address": "D31EFnLgdiysi84Woo3of4JMu7VmasUS3Z7j9HYXCeLY",
+    "name": "enable turbine fanout experiments #29393"
+  },
+  {
+    "address": "D4jsDcXaqdW8tDAWn8H4R25Cdns2YwLneujSL1zvjW6R",
+    "name": "require custodian to authorize withdrawer change for locked stake"
+  },
+  {
+    "address": "DT4n6ABDqs6w4bnfwrXT9rsprcPf6cdDga1egctaPkLC",
+    "name": "full inflation on devnet and testnet"
+  },
+  {
+    "address": "DTVTkmw3JSofd8CJVJte8PXEbxNQ2yZijvVr3pe2APPj",
+    "name": "on accounts hash calculation, do not try to rehash accounts #28934"
+  },
+  {
+    "address": "DdLwVYuvDz26JohmgSbA7mjpJFgX5zP2dkp8qsF2C33V",
+    "name": "cap transaction accounts data size up to a limit #27839"
+  },
+  {
+    "address": "DeS7sR48ZcFTUmt5FFEVDr1v1bh73aAbZiZq3SYr8Eh8",
+    "name": "SIMD-0186: Loaded transaction data size specification"
+  },
+  {
+    "address": "DhsYfRjxfnh2g7HKJYSzT79r74Afa1wbHkAgHndrA1oy",
+    "name": "upgrade libsecp256k1 to v0.5.0"
+  },
+  {
+    "address": "DpJREPyuMZ5nDfU6H3WTqSqUFSXAfw8u7xqmWtEwJDcP",
+    "name": "quick bail on panic"
+  },
+  {
+    "address": "Ds87KVeqhbv7Jw8W6avsS1mqz3Mw5J3pRTpPoDQ2QdiJ",
+    "name": "add shred-type to shred seed #25556"
+  },
+  {
+    "address": "DwScAzPUjuv65TMbDnFY7AgwmotzWy3xpEJMXM3hZFaB",
+    "name": "enable sol_{set,get}_return_data syscall"
+  },
+  {
+    "address": "E3PHP7w8kB7np3CTQ1qQ2tW3KCtjRSXBQgW9vM2mWv2Y",
+    "name": "secp256k1 program"
+  },
+  {
+    "address": "E5JiFDQCwyC6QfT9REFyMpfK2mHcmv1GUDySU1Ue7TYv",
+    "name": "spl-token multisig fix"
+  },
+  {
+    "address": "E8MkiWZNNPGU6n55jkGzyj8ghUmjCHRmDFdYYFYHxWhQ",
+    "name": "leave nonce as is on success"
+  },
+  {
+    "address": "EBeznQDjcPG8491sFsKZYBi5S5jTVXMpAKNDJMQPS2kq",
+    "name": "reduce required payer balance for program deploys"
+  },
+  {
+    "address": "EBq48m8irRKuE7ZnMTLvLg2UuGSqhe8s8oMqnmja1fJw",
+    "name": "add big_mod_exp syscall #28503"
+  },
+  {
+    "address": "EDGMC5kxFxGk4ixsNkGt8bW7QL5hDMXnbwaZvYMwNfzF",
+    "name": "SIMD-0459: Syscall Parameter Address Restrictions"
+  },
+  {
+    "address": "EJJewYSddEEtSZHiqugnvhQHiWyZKjkFDQASd7oKSagn",
+    "name": "add alt_bn128 compression syscalls"
+  },
+  {
+    "address": "EMX9Q7TVFAmQ9V1CggAkhMzhXSg8ECp7fHrWQX2G1chf",
+    "name": "evict invalid stakes cache entries on epoch boundaries"
+  },
+  {
+    "address": "EQUMpNFr7Nacb1sva56xn1aLfBxppEoSBH8RRVdkcD1x",
+    "name": "Disable account loader special case #3513"
+  },
+  {
+    "address": "EVW9B5xD9FFK7vw1SBARwMA4s5eRo5eKJdKpsBikzKBz",
+    "name": "prohibit extra transaction signatures"
+  },
+  {
+    "address": "EWme9uFqfy1ikK1jhJs8fM5hxWnK336QJpbscNtizkTU",
+    "name": "Update desired hashes per tick to 2.8M"
+  },
+  {
+    "address": "EYVpEP7uzH1CoXzbD6PubGhYmnxRXPeq3PPsm1ba3gpo",
+    "name": "stop the search in get_processed_sibling_instruction when the parent instruction is reached #27289"
+  },
+  {
+    "address": "EaQpmC6GtRssaZ3PCUM5YksGqUdMLeZ46BQXYtHYakDS",
+    "name": "include transaction loaded accounts data size in base fee calculation #30657"
+  },
+  {
+    "address": "EfhYd3SafzGT472tYQDUc4dPd2xdEfKs5fwkowUgVt4W",
+    "name": "remove support for RequestUnitsDeprecated instruction #27500"
+  },
+  {
+    "address": "F6UVKh1ujTEFK3en2SyAL3cdVnqko1FVEXWhmdLRu6WP",
+    "name": "SIMD-0173 and SIMD-0174: Enable deployment and execution of SBPFv2 programs"
+  },
+  {
+    "address": "FKAcEvNgSY79RpqsPNUV5gDyumopH4cEHqUxyfm8b8Ap",
+    "name": "relax authority signer check for lookup table creation #27205"
+  },
+  {
+    "address": "FKe75t4LXxGaQnVHdUKM6DSFifVVraGZ8LyNo7oPwy1Z",
+    "name": "SIMD-0133: Enable syscall: sol_get_epoch_stake"
+  },
+  {
+    "address": "FKu1qYwLQSiehz644H6Si65U5ZQ2cp9GxsyFUfYcuADv",
+    "name": "Update desired hashes per tick to 10M"
+  },
+  {
+    "address": "FL9RsQA6TVUoh5xJQ9d936RHSebA1NLQqe3Zv9sXZRpr",
+    "name": "Enable Poseidon syscall"
+  },
+  {
+    "address": "FNKCMBzYUdjhHyPdsKG2LSmdzH8TCHXn3ytj8RNBS4nG",
+    "name": "enable gossip duplicate proof ingestion #32963"
+  },
+  {
+    "address": "FQnc7U4koHqWgRvFaBJjZnV8VPg6L6wWK33yJeDp4yvV",
+    "name": "stake split instruction uses rent sysvar"
+  },
+  {
+    "address": "FToKNBYyiF4ky9s8WsmLBXHCht17Ek7RXaLZGHzzQhJ1",
+    "name": "spl-token set_authority fix"
+  },
+  {
+    "address": "FXs1zh47QbNnhXcnB6YiAQoJ4sGB91tKF3UFHLcKT7PM",
+    "name": "SIMD-0162: Remove checks of accounts is_executable flag"
+  },
+  {
+    "address": "FaTa17gVKoqbh38HcfiQonPsAaQViyDCCSg71AubYZw8",
+    "name": "SPL Associated Token Account Program version 1.1.0 release #24741"
+  },
+  {
+    "address": "FaTa4SpiaSNH44PGC4z8bnGVTkSRYaWvrBs3KTu8XQQq",
+    "name": "SPL Associated Token Account Program release version 1.0.4, tied to token 3.3.0 #22648"
+  },
+  {
+    "address": "Fab5oP3DmsLYCiQZXdjyqT3ukFFPrsmqhXU4WU1AWVVF",
+    "name": "prevent recipients of rent rewards from ending in rent-paying state #30151"
+  },
+  {
+    "address": "Ff8b1fBeB86q8cjq47ZhsQLgv5EkHu3G1C99zjUfAzrq",
+    "name": "enable direct vote state update"
+  },
+  {
+    "address": "Ffswd3egL3tccB6Rv3XY6oqfdzn913vUcjCSnpvCKpfx",
+    "name": "better error codes for tx lamport check #33353"
+  },
+  {
+    "address": "Ftok2jhqAqxUWEiCVRrfRs9DPppWP8cgTB7NQNKL88mS",
+    "name": "spl-token v3.3.0 release"
+  },
+  {
+    "address": "Ftok4njE8b7tDffYkC5bAbCaQv5sL6jispYrprzatUwN",
+    "name": "SPL Token Program version 3.4.0 release #24740"
+  },
+  {
+    "address": "Ftxb3ZKq7aNqgxDBbP7EonvR2RszZk9ctjdsTX38kQaz",
+    "name": "SIMD-0437-3: Set lamports per byte to 2575"
+  },
+  {
+    "address": "FuS3FPfJDKSNot99ECLXtp3rueq36hMNStJkPJwWodLh",
+    "name": "SIMD-0137: Abort when elliptic curve syscalls invoked on invalid curve id"
+  },
+  {
+    "address": "G6ANXD6ptCSyNd9znZm7j4dEczAJCfx7Cy43oBx3rKHJ",
+    "name": "stakes must be at least the minimum delegation to earn rewards"
+  },
+  {
+    "address": "G6vbf1UBok8MWb8m25ex86aoQHeKTzDKzuZADHkShqm6",
+    "name": "add compute budget instruction for setting account data size per transaction #30366"
+  },
+  {
+    "address": "G74BkWBzmsByZ1kxHy44H3wjwp5hp7JbrGRuDpco22tY",
+    "name": "fix root in vote state updates #27361"
+  },
+  {
+    "address": "GDH5TVdbTPUpRnXaRyQqiKUa7uZAbZ28Q2N9bhbKoMLm",
+    "name": "loosen cpi size restrictions #26641"
+  },
+  {
+    "address": "GE7fRxmW46K6EmCD9AMZSbnaJ2e3LfqCZzdHi9hmYAgi",
+    "name": "filter stake_delegation_accounts #14062"
+  },
+  {
+    "address": "GQALDaC48fEhZGWRj9iL5Q889emJKcj3aCvHF7VCbbF4",
+    "name": "limit max instruction trace length #27939"
+  },
+  {
+    "address": "GTUMCZ8LTNxVfxdrw7ZsDFTxXb7TutYkzJnFwinpE6dg",
+    "name": "disable the deprecated BPF loader"
+  },
+  {
+    "address": "GV49KKQdBNaiv2pgqhS2Dy3GWYJGXMTVYbYkdk91orRy",
+    "name": "drops legacy shreds #34328"
+  },
+  {
+    "address": "GaBtBJvmS4Arjj5W1NmFcyvPjsHN38UGYDq2MDwbs9Qu",
+    "name": "deprecate unused rewards sysvar"
+  },
+  {
+    "address": "Gea3ZkK2N4pHuVZVxWcnAtS6UEDdyumdYt4pFcKjA3ar",
+    "name": "separate durable nonce and blockhash domains #25744"
+  },
+  {
+    "address": "GmC19j9qLn2RFk5NduX6QXaDhVpGncVVBzyM8e9WMz2F",
+    "name": "check size when translating slices"
+  },
+  {
+    "address": "GmuBvtFb2aHfSfMXpuFeWZGHyDeCLPS79s48fmCWCfM5",
+    "name": "delay visibility of program upgrades #30085"
+  },
+  {
+    "address": "GsUBNYNDPdMLHPD37TToHzrzcNcjpC9w5n1EcJk5iTaM",
+    "name": "SIMD-0437-4: Set lamports per byte to 1322"
+  },
+  {
+    "address": "GvDsGDkH5gyzwpDhxNixx8vtx1kwYHH13RiNAPw27zXb",
+    "name": "warp timestamp again, adjust bounding to 25% fast 80% slow #15204"
+  },
+  {
+    "address": "GwtDQBghCTBgmX2cpEGNPxTEBUTQRaDMGTr5qychdGMj",
+    "name": "reduce stake warmup cooldown from 25% to 9%"
+  },
+  {
+    "address": "Gx4XFcrVMt4HUvPzTpTSVkdDVgcDSjKhDN1RqRS6KDuZ",
+    "name": "SIMD-0185: Vote State v4"
+  },
+  {
+    "address": "H3kBSaKdeiUsyHmeHqjJYNc27jesXZ6zWj3zWkowQbkV",
+    "name": "fix owner for instructions sysvar"
+  },
+  {
+    "address": "H6iVbVaDZgDphcPbcZwc5LoznMPWQfnJ1AM7L1xzqvt5",
+    "name": "SIMD-0339: Increase CPI Account Infos Limit"
+  },
+  {
+    "address": "HFpdDDNQjvcXnXKec697HDDsyk6tFoWS2o8fkxuhQZpL",
+    "name": "remove delegations from stakes cache when inactive"
+  },
+  {
+    "address": "HH3MUYReL2BvqqA3oEcAa7txju5GY6G4nxJ51zvsEjEZ",
+    "name": "preserve rent epoch for rent exempt accounts #26479"
+  },
+  {
+    "address": "HTTgmruMYRZEntyL3EdCDdnS6e4D5wRq1FA7kQsb66qq",
+    "name": "remove support for the native loader"
+  },
+  {
+    "address": "HTW2pSyErTj4BV6KBM9NZ9VBUJVxt7sacNWcf76wtzb3",
+    "name": "blake3 syscall"
+  },
+  {
+    "address": "HooKD5NC9QNxk25QuzCssB8ecrEzGt6eXEPBUxWp1LaR",
+    "name": "SIMD-0047: Enable new sysvar last_restart_slot"
+  },
+  {
+    "address": "Hr1nUA9b7NJ6eChS26o7Vi8gYYDDwWD3YeBfzJkTbU86",
+    "name": "Enable transaction to request heap frame using compute budget instruction #30076"
+  },
+  {
+    "address": "HxrEu1gXuH7iD3Puua1ohd5n4iUKJyFNtNxk9DVJkvgr",
+    "name": "nonce must be authorized"
+  },
+  {
+    "address": "HyrbKftCdJ5CrUfEti6x26Cj7rZLNe32weugk7tLcWb8",
+    "name": "syscalls use saturated math"
+  },
+  {
+    "address": "J2QdYx8crLbTVK8nur1jeLsmc3krDbfjoxoea2V1Uy5Q",
+    "name": "Default max tx-wide compute units calculated per instruction"
+  },
+  {
+    "address": "J4HFT8usBxpcF63y46t1upYobJgChmKyZPm5uTBRg25Z",
+    "name": "enable program redeployment cooldown #29135"
+  },
+  {
+    "address": "JAN1trEUEtZjgXYzNBYHU9DYd7GnThhXfFP7SzPXkPsG",
+    "name": "disable fees sysvar"
+  },
+  {
+    "address": "JDn5q3GBeqzvUa7z67BbmVHVdE3EbUAjvFep3weR3jxX",
+    "name": "SIMD-0129: simplify alt_bn128 syscall error codes"
+  },
+  {
+    "address": "JE86WkYvTrzW8HgNmrHY7dFYpCmSptUpKupbo2AdQ9cG",
+    "name": "SIMD-0166: Enable deployment and execution of SBPFv1 programs"
+  },
+  {
+    "address": "LTHasHQX6661DaDD4S6A2TFi6QBuiwXKv66fB1obfHq",
+    "name": "SIMD-0215: enables lattice-based accounts hash"
+  },
+  {
+    "address": "LTdLt9Ycbyoipz5fLysCi1NnDnASsZfmJLJXts5ZxZz",
+    "name": "SIMD-0223: removes accounts delta hash"
+  },
+  {
+    "address": "LTsNAP8h1voEVVToMNBNqoiNQex4aqfUrbFhRH3mSQ2",
+    "name": "SIMD-0220: snapshots use lattice-based accounts hash"
+  },
+  {
+    "address": "P1BCUMpAC7V2GRBRiJCNUgpMyWZhoqt3LKo712ePqsz",
+    "name": "SIMD-0286: Raise block limit to 100M"
+  },
+  {
+    "address": "PERzQrt5gBD1XEe2c9XdFWqwgHY3mr7cYWbm5V772V8",
+    "name": "SIMD-0118: replaces enable_partitioned_epoch_reward to enable partitioned rewards at epoch boundary"
+  },
+  {
+    "address": "PaymEPK2oqwT9TXAVfadjztH2H6KfLEB9Hhd5Q5frvP",
+    "name": "SIMD-0082: Enable fees for some additional transaction failures"
+  },
+  {
+    "address": "RENtePQcDLrAbxAsP3k8dwVcnNYQ466hi2uKvALjnXx",
+    "name": "SIMD-0267: Sets rent_epoch to a constant in the VM"
+  },
+  {
+    "address": "RfEcA95xnhuwooVAhUUksEJLZBF7xKCLuqrJoqk4Zph",
+    "name": "vote only on retransmitter signed fec sets"
+  },
+  {
+    "address": "SAdVFw3RZvzbo6DvySbSdBnHN4gkzSTH9dSxesyKKPj",
+    "name": "Enable advancing credits observed for activation epoch #19309"
+  },
+  {
+    "address": "STk5Xj8hdAx3sTzmtJ3QysKkq6X2A3yj73JtxttiRyk",
+    "name": "SIMD-0490: Upgrade BPF Stake Program to v5.0.0"
+  },
+  {
+    "address": "SVn36yVApPLYsa8koK3qUcy14zXDnqkNYWyUh1f4oK1",
+    "name": "ignore slot when calculating an account hash #28420"
+  },
+  {
+    "address": "St8k9dVXP97xT6faW24YmRSYConLbhsMJA4TJTBLmMT",
+    "name": "add GetMinimumDelegation instruction to stake program"
+  },
+  {
+    "address": "TestFeature11111111111111111111111111111111",
+    "name": "SIMD-0161: Disables execution of SBPFv0 programs"
+  },
+  {
+    "address": "TestFeature21111111111111111111111111111111",
+    "name": "Re-enables execution of SBPFv0 programs"
+  },
+  {
+    "address": "VAT9huvhPjRN9cyrPytq9rwvEJ3J4ADtjdncgZRyANJ",
+    "name": "SIMD-0357: Alpenglow VAT implementation"
+  },
+  {
+    "address": "Vo5siZ442SaZBKPXNocthiXysNviW4UYPwRFggmbgAp",
+    "name": "fixes Bank::transaction_count to include all committed transactions, not just successful ones"
+  },
+  {
+    "address": "VoteAccount1nitia1izeV211111111111111111111",
+    "name": "SIMD-0464: Vote Account Initialize V2"
+  },
+  {
+    "address": "b1sgUiJ3qu7hYm3tNDyyqZNQd6gLGJmJppnLNa93PCQ",
+    "name": "SIMD-0388: BLS12-381 syscalls"
+  },
+  {
+    "address": "bn1hKNURMGQaQoEVxahcEAcqiX3NwRs6hgKKNSLeKxH",
+    "name": "SIMD-0302: Add alt_bn128 G2 syscalls"
+  },
+  {
+    "address": "bn2oPgpkzQPT3tohMaAsMVGjhDmmDa4jCaVPqCFmtxM",
+    "name": "SIMD-0284: Add little-endian compatibility for alt_bn128"
+  },
+  {
+    "address": "bn2puAyxUx6JUabAxYdKdJ5QHbNNmKw8dCGuGCyRrFN",
+    "name": "SIMD-0222: fix alt_bn128 multiplication input length #3686"
+  },
+  {
+    "address": "bnYzodLwmybj7e1HAe98yZrdJTd7we69eMMLgCXqKZm",
+    "name": "SIMD-0334: Fix alt_bn128_pairing length check"
+  },
+  {
+    "address": "chaie9S2zVfuxJKNRGkyTDokLwWxx6kD2ZLsqQHaDD8",
+    "name": "generate duplicate proofs for chained merkle root conflicts"
+  },
+  {
+    "address": "decoMktMcnmiq6t3u7g5BfgcQu91nKZr6RvMYf9z1Jb",
+    "name": "Allow commission decrease at any time in epoch #33843"
+  },
+  {
+    "address": "depVvnQ2UysGrhwdiwU42tCadZL8GcBb1i2GYhMopQv",
+    "name": "Deprecate legacy vote instructions"
+  },
+  {
+    "address": "dupPajaLy2SSn8ko42aZz4mHANDNrLe8Nw8VQgFecLa",
+    "name": "generate duplicate proofs for index and erasure conflicts #34360"
+  },
+  {
+    "address": "eca6zf6JJRjQsYYPkBHF3N32MTzur4n2WL4QiiacPCL",
+    "name": "restrict curve25519 multiscalar multiplication vector lengths #34763"
+  },
+  {
+    "address": "ed9tNscbWLYBooxWA7FE2B5KHWs8A6sxfY8EzezEcoo",
+    "name": "SIMD-0152: Use strict verification in ed25519 precompile"
+  },
+  {
+    "address": "ffecLRhhakKSGhMuc6Fz2Lnfq4uT9q3iu9ZsNaPLxPc",
+    "name": "vote only full fec sets"
+  },
+  {
+    "address": "fixfecLZYMfkGzwq6NJA11Yw6KYztzXiK9QcL3K78in",
+    "name": "SIMD-0317: Enforce 32 data + 32 coding shreds"
+  },
+  {
+    "address": "htsptAwi2yRoZH83SKaUXykeZGtZHgxkS2QwW1pssR8",
+    "name": "SIMD-0306: Raise account CU limit to 40% max"
+  },
+  {
+    "address": "mZdnRh9T2EbDNvqKjkCR3bvo5c816tJaojtE9Xs7iuY",
+    "name": "SIMD-0437-5: Set lamports per byte to 696"
+  },
+  {
+    "address": "meRgp4ArRPhD3KtCY9c5yAf2med7mBLsjKTPeVUHqBL",
+    "name": "allow merging active stakes with unmatched credits_observed #18985"
+  },
+  {
+    "address": "mrkPjRg79B2oK2ZLgd7S3AfEJaX9B6gAF3H9aEykRUS",
+    "name": "generate duplicate proofs for merkle root conflicts #34270"
+  },
+  {
+    "address": "mustRekeyVm2QHYB3JPefBiU4BY3Z6JkW2k3Scw5GWP",
+    "name": "SIMD-0326: Alpenglow: new consensus algorithm"
+  },
+  {
+    "address": "nWBqjr3gpETbiaVj3CBJ3HFC5TMdnJDGt21hnvSTvVZ",
+    "name": "check physical overlapping regions"
+  },
+  {
+    "address": "noRuG2kzACwgaY7TVmLRnUNPLKNVQE1fb7X55YWBehp",
+    "name": "validator commission updates are only allowed in the first half of an epoch #29362"
+  },
+  {
+    "address": "poUdAqRXXsNmfqAZ6UqpjbeYgwBygbfQLEvWSqVhSnb",
+    "name": "SIMD-0359: Enforce padding in Poseidon hash inputs"
+  },
+  {
+    "address": "prpFrMtgNmzaNzkPJg9o753fVvbHKqNrNTm76foJ2wm",
+    "name": "validate fee collector account #33888"
+  },
+  {
+    "address": "ptokFjwyJtrwCa9Kgo9xoDS59V4QccBGEaRFnRPnSdP",
+    "name": "SIMD-0266: Efficient Token program"
+  },
+  {
+    "address": "ptrXWLkSDMZZmZN8GAT6W5yW4EvYByfw6cRRHbXwQNS",
+    "name": "SIMD-0449: Direct Account Pointers in Program Input"
+  },
+  {
+    "address": "rent6iVy6PDoViPBeJ6k5EJQrkj62h7DPyLbWGHwjrC",
+    "name": "SIMD-0194: Deprecate rent exemption threshold"
+  },
+  {
+    "address": "rexav5eNTUSNT1K2N7cfRjnthwhcP5BC25v2tA4rW4h",
+    "name": "SIMD-0444: Relax program data account check in migration"
+  },
+  {
+    "address": "sProgVaNWkYdP2eTRAy1CPrgb3b9p8yXCASrPEqo6VJ",
+    "name": "SIMD-0204: Slashable event verification"
+  },
+  {
+    "address": "sTKz343FM8mqtyGvYWvbLpTThw3ixRM4Xk8QvZ985mw",
+    "name": "Allow zero-lamport undelegated amount for initialized stakes #24670"
+  },
+  {
+    "address": "shredXP8xLjJWp1AWh3gAFsFn4GSH1vohhCMDHw5koU",
+    "name": "SIMD-0337: Markers for Alpenglow Fast Leader Handover, DATA_COMPLETE_SHRED placement rules"
+  },
+  {
+    "address": "srremy31J5Y25FrAApwVb9kZcfXbusYMMsvTK9aWv5q",
+    "name": "SIMD-0075: Enable secp256r1 precompile"
+  },
+  {
+    "address": "tSynMCspg4xFiCj1v3TDb4c7crMR5tSBhLz4sF7rrNA",
+    "name": "Enable tower sync vote instruction"
+  },
+  {
+    "address": "turbRpTzBzDU6PJmWvRTbcJXXGxUs19CvQamUrRD9bN",
+    "name": "enable turbine extended fanout experiments #"
+  },
+  {
+    "address": "turbnbNRp22nwZCmgVVXFSshz7H7V23zMzQgA46YpmQ",
+    "name": "disable turbine fanout experiments #29393"
+  },
+  {
+    "address": "tvcF6b1TRz353zKuhBjinZkKzjmihXmBAHJdjNYw1sQ",
+    "name": "use timeliness of votes in determining credits to award"
+  },
+  {
+    "address": "vcmrbYbiMVKaq1snKP6eCacNDcr6qZvpCNUjmk6gxvZ",
+    "name": "SIMD-0340: Validate chained block ID"
+  },
+  {
+    "address": "wLckV1a64ngtcKPRGU4S4grVTestXjmNjxBjaKZrAcn",
+    "name": "cost model uses number of requested write locks #34819"
+  },
+  {
+    "address": "zk1snxsc6Fh3wsGNbbHAJNHiJoYgF29mMnTSusGx5EJ",
+    "name": "enable Zk Token proof program and syscalls"
+  },
+  {
+    "address": "zkNLP7EQALfC1TYeB3biDU7akDckj8iPkvh9y2Mt2K3",
+    "name": "enable Zk Token proof program transfer with fee"
+  },
+  {
+    "address": "zkdoVwnSFnSLtGJG7irJPEYUpmb4i7sGMGcnN6T9rnC",
+    "name": "Disables zk-elgamal-proof program"
+  },
+  {
+    "address": "zkexuyPRdyTVbZqEAREueqL2xvvoBhRgth9xGSc1tMN",
+    "name": "Re-enables zk-elgamal-proof program"
+  },
+  {
+    "address": "zkhiy5oLowR7HY4zogXjCjeMXyruLqBwSWH21qcFtnv",
+    "name": "SIMD-0153: Enable ZkElGamalProof program"
+  },
+  {
+    "address": "zkiTNuzBKxrCLMKehzuQeKZyLtX2yvFcEKMML8nExU8",
+    "name": "Enable zk token proof program to read proof from accounts instead of instruction data #34750"
+  }
+]

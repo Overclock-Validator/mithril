@@ -53,7 +53,10 @@ type RecoveryResult struct {
 func (db *AccountsDb) RecoverFoldState() (RecoveryResult, error) {
 	db.foldMu.Lock()
 	defer db.foldMu.Unlock()
+	return db.recoverFoldStateLocked()
+}
 
+func (db *AccountsDb) recoverFoldStateLocked() (RecoveryResult, error) {
 	res := RecoveryResult{}
 
 	meta, haveMeta, err := db.readFoldMeta()

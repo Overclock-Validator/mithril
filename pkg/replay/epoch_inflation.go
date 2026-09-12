@@ -178,7 +178,7 @@ func stageEpochInflationAccount(
 	f *features.Features,
 	newEpoch, epochStartCapitalization, additionalValidatorRewards uint64,
 ) (*accounts.Account, *accounts.Account, error) {
-	key := VoteRewardAccountAddr()
+	key := VoteRewardAccountAddr(f)
 	parent, err := acctsDb.GetAccount(readSlot, key)
 	if err != nil {
 		if !errors.Is(err, accountsdb.ErrNoAccount) {
@@ -247,12 +247,12 @@ func loadEpochInflationAccountStateForReplay(slotCtx *sealevel.SlotCtx) (EpochIn
 	// already targets the new epoch, while the parent still contains only the
 	// previous epoch's inflation state.
 	if slotCtx.Accounts != nil {
-		if acct, err := slotCtx.GetAccount(VoteRewardAccountAddr()); err == nil && acct != nil {
+		if acct, err := slotCtx.GetAccount(VoteRewardAccountAddr(slotCtx.Features)); err == nil && acct != nil {
 			return decodeEpochInflationAccountFromAcct(acct, slotCtx.Slot)
 		}
 	}
 
-	acct, err := slotCtx.GetAccountFromAccountsDb(VoteRewardAccountAddr())
+	acct, err := slotCtx.GetAccountFromAccountsDb(VoteRewardAccountAddr(slotCtx.Features))
 	if err != nil {
 		return EpochInflationAccountState{}, fmt.Errorf("load vote reward account at parent slot %d: %w", slotCtx.ParentSlot, err)
 	}
