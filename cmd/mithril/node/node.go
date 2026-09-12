@@ -23,6 +23,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/alpenglow"
@@ -42,6 +43,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/progress"
 	"github.com/Overclock-Validator/mithril/pkg/replay"
 	"github.com/Overclock-Validator/mithril/pkg/rewardcerts"
+	"github.com/Overclock-Validator/mithril/pkg/rpcclient"
 	"github.com/Overclock-Validator/mithril/pkg/rpcserver"
 	"github.com/Overclock-Validator/mithril/pkg/sbpf"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
@@ -302,7 +304,7 @@ func newReadyStateForBootstrap(snapshotSlot, snapshotEpoch uint64, buildMode, cl
 	}), nil
 }
 
-func saveReadyStateForBootstrap(accountsPath string, manifest *snapshot.SnapshotManifest, buildMode, cluster, genesisHash string) (*state.MithrilState, error) {
+func saveReadyStateForBootstrap(accountsPath string, manifest *snapshot.SnapshotManifest, buildMode, cluster, genesisHash string, buildStartedAt time.Time) (*state.MithrilState, error) {
 	if manifest == nil || manifest.Bank == nil {
 		return nil, fmt.Errorf("cannot mark AccountsDB ready without a snapshot manifest")
 	}
@@ -312,6 +314,7 @@ func saveReadyStateForBootstrap(accountsPath string, manifest *snapshot.Snapshot
 	if err != nil {
 		return nil, err
 	}
+	mithrilState.BuildStartedAt = buildStartedAt
 	snapshot.PopulateManifestSeed(mithrilState, manifest)
 	if err := mithrilState.Save(accountsPath); err != nil {
 		return nil, fmt.Errorf("save ready state: %w", err)
@@ -567,7 +570,7 @@ func init() {
 	Run.Flags().Int64Var(&rewindToSlot, "rewind-to-slot", 0, "Rewind durable account state to the fold batch boundary at this slot before replaying (must be a retained boundary; run once to list boundaries on mismatch)")
 
 	// [tuning.pprof] section flags
-	Run.Flags().Int64Var(&pprofPort, "pprof-port", -1, "Port to serve HTTP pprof endpoint")
+	Run.Flags().Int64Var(&pprofPort, "pprof-port", -1, "Port to serve the loopback-only HTTP pprof endpoint (-1 disables it)")
 	Run.Flags().StringVar(&cpuprofPath, "cpu-profile-path", "", "Filename to write CPU profile")
 
 	// [debug] section flags
@@ -1237,7 +1240,9 @@ func buildSnapshotConfig(rpcEndpoints []string) snapshotdl.SnapshotConfig {
 func runLive(c *cobra.Command, args []string) {
 	alpenglowMode := cluster == "alpenglow"
 	if pprofPort != -1 {
-		startPprofHandlers(int(pprofPort))
+		if err := startPprofHandlers(int(pprofPort)); err != nil {
+			klog.Errorf("pprof server unavailable: %v", err)
+		}
 	}
 	ctx, cancelRun := context.WithCancel(c.Context())
 	defer cancelRun()
@@ -1335,7 +1340,9 @@ func runLive(c *cobra.Command, args []string) {
 	printStartupInfo("run")
 
 	// Now start the metrics server (after banner so errors don't appear first)
-	statsd.StartMetricsServer()
+	if err := statsd.StartMetricsServer(); err != nil {
+		klog.Errorf("metrics server unavailable: %v", err)
+	}
 
 	// Chain lineage is a startup gate, not part of AccountsDB bootstrap. Resolve
 	// it before Lightbringer can open ledger storage and before history records
@@ -1701,6 +1708,7 @@ func runLive(c *cobra.Command, args []string) {
 				legacyGenesisHash, networkGenesisHash)
 		}
 	}
+	var snapshotBuildStartedAt time.Time
 
 	// Handle explicit --snapshot flag (bypasses all auto-discovery, does NOT delete snapshot files)
 	if snapshotArchivePath != "" {
@@ -1729,13 +1737,14 @@ func runLive(c *cobra.Command, args []string) {
 		// Build directly from the specified files (BuildAccountsDbPaths handles AccountsDB cleanup internally)
 		// NOTE: We do NOT clean snapshot files in explicit mode - user wants to keep their explicit snapshots
 		dp := progress.NewDualProgress()
+		snapshotBuildStartedAt = time.Now().UTC()
 		accountsDb, manifest, err = snapshot.BuildAccountsDbPaths(ctx, snapshotArchivePath, incrementalSnapshotFilename, accountsPath, dp)
 		if err != nil {
 			klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
 		}
 
 		// Write the genesis-bound state file only after a complete build.
-		mithrilState, err = saveReadyStateForBootstrap(accountsPath, manifest, bootstrapMode, cluster, networkGenesisHash)
+		mithrilState, err = saveReadyStateForBootstrap(accountsPath, manifest, bootstrapMode, cluster, networkGenesisHash, snapshotBuildStartedAt)
 		if err != nil {
 			klog.Fatalf("failed to persist ready state: %v", err)
 		}
@@ -1791,6 +1800,7 @@ func runLive(c *cobra.Command, args []string) {
 		if snapshotDownloadPath == "" {
 			klog.Fatalf("mode=new-snapshot requires a snapshot directory (set storage.snapshots or snapshot.download_path in config)")
 		}
+		snapshotBuildStartedAt = time.Now().UTC()
 		mlog.Log.Infof("mode=new-snapshot: Downloading fresh snapshot")
 		if accountsPath != "" {
 			// Record rebuild in history before cleanup (history file is preserved)
@@ -1813,10 +1823,10 @@ func runLive(c *cobra.Command, args []string) {
 		}
 		accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPath, blockstorePath)
 		if err != nil {
-			klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
+			klog.Fatalf("failed to build AccountsDB from snapshot: %s", rpcclient.SanitizeErrorForDisplay(err))
 		}
 		// Write state file to mark build as complete.
-		mithrilState, err = saveReadyStateForBootstrap(accountsPath, manifest, bootstrapMode, cluster, networkGenesisHash)
+		mithrilState, err = saveReadyStateForBootstrap(accountsPath, manifest, bootstrapMode, cluster, networkGenesisHash, snapshotBuildStartedAt)
 		if err != nil {
 			klog.Fatalf("failed to persist ready state: %v", err)
 		}
@@ -1848,11 +1858,12 @@ func runLive(c *cobra.Command, args []string) {
 			mlog.Log.Infof("Cleaning up previous AccountsDB artifacts in %s", accountsPath)
 			snapshot.CleanAccountsDbDir(accountsPath)
 		}
+		snapshotBuildStartedAt = time.Now().UTC()
 		accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPath, blockstorePath, rpcEndpoints)
 		if err != nil {
 			klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
 		}
-		mithrilState, err = saveReadyStateForBootstrap(accountsPath, manifest, bootstrapMode, cluster, networkGenesisHash)
+		mithrilState, err = saveReadyStateForBootstrap(accountsPath, manifest, bootstrapMode, cluster, networkGenesisHash, snapshotBuildStartedAt)
 		if err != nil {
 			klog.Fatalf("failed to persist ready state: %v", err)
 		}
@@ -1863,6 +1874,7 @@ func runLive(c *cobra.Command, args []string) {
 		if snapshotDownloadPath == "" {
 			klog.Fatalf("mode=snapshot requires a snapshot directory (set storage.snapshots or snapshot.download_path in config)")
 		}
+		snapshotBuildStartedAt = time.Now().UTC()
 		mlog.Log.Infof("mode=snapshot: Will rebuild AccountsDB from snapshot")
 		if accountsPath != "" {
 			// Record rebuild in history before cleanup (history file is preserved)
@@ -1900,10 +1912,10 @@ func runLive(c *cobra.Command, args []string) {
 			accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPath, blockstorePath)
 		}
 		if err != nil {
-			klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
+			klog.Fatalf("failed to build AccountsDB from snapshot: %s", rpcclient.SanitizeErrorForDisplay(err))
 		}
 		// Write state file to mark build as complete.
-		mithrilState, err = saveReadyStateForBootstrap(accountsPath, manifest, bootstrapMode, cluster, networkGenesisHash)
+		mithrilState, err = saveReadyStateForBootstrap(accountsPath, manifest, bootstrapMode, cluster, networkGenesisHash, snapshotBuildStartedAt)
 		if err != nil {
 			klog.Fatalf("failed to persist ready state: %v", err)
 		}
@@ -1931,7 +1943,7 @@ func runLive(c *cobra.Command, args []string) {
 			}
 			currentSlot, err := queryCurrentSlot(ctx, rpcEndpoints)
 			if err != nil {
-				mlog.Log.Infof("could not query current slot: %v (continuing with existing AccountsDB)", err)
+				mlog.Log.Infof("could not query current slot: %s (continuing with existing AccountsDB)", rpcclient.SanitizeErrorForDisplay(err))
 			} else if mithrilState.IsStale(currentSlot, uint64(stalePromptThreshold)) {
 				slotsBehind := currentSlot - mithrilState.GetCurrentSlot()
 				mlog.Log.Infof("AccountsDB is %d slots behind chain tip", slotsBehind)
@@ -1953,6 +1965,7 @@ func runLive(c *cobra.Command, args []string) {
 					if snapshotDownloadPath == "" {
 						klog.Fatalf("cannot rebuild from snapshot: no snapshot directory configured (set storage.snapshots or snapshot.download_path in config)")
 					}
+					snapshotBuildStartedAt = time.Now().UTC()
 					switch choice {
 					case 2:
 						mlog.Log.Infof("User chose to rebuild from the best available snapshot")
@@ -1996,9 +2009,9 @@ func runLive(c *cobra.Command, args []string) {
 						accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPath, blockstorePath)
 					}
 					if err != nil {
-						klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
+						klog.Fatalf("failed to build AccountsDB from snapshot: %s", rpcclient.SanitizeErrorForDisplay(err))
 					}
-					mithrilState, err = saveReadyStateForBootstrap(accountsPath, manifest, bootstrapMode, cluster, networkGenesisHash)
+					mithrilState, err = saveReadyStateForBootstrap(accountsPath, manifest, bootstrapMode, cluster, networkGenesisHash, snapshotBuildStartedAt)
 					if err != nil {
 						klog.Fatalf("failed to persist ready state: %v", err)
 					}
@@ -2064,6 +2077,7 @@ func runLive(c *cobra.Command, args []string) {
 			if snapshotDownloadPath == "" {
 				klog.Fatalf("mode=auto requires a snapshot directory to rebuild (set storage.snapshots or snapshot.download_path in config)")
 			}
+			snapshotBuildStartedAt = time.Now().UTC()
 			if hasAccountsDB {
 				mlog.Log.Infof("mode=auto: AccountsDB exists but state invalid, rebuilding from snapshot")
 			} else {
@@ -2102,10 +2116,10 @@ func runLive(c *cobra.Command, args []string) {
 				accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPath, blockstorePath)
 			}
 			if err != nil {
-				klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
+				klog.Fatalf("failed to build AccountsDB from snapshot: %s", rpcclient.SanitizeErrorForDisplay(err))
 			}
 			// Write state file to mark build as complete.
-			mithrilState, err = saveReadyStateForBootstrap(accountsPath, manifest, bootstrapMode, cluster, networkGenesisHash)
+			mithrilState, err = saveReadyStateForBootstrap(accountsPath, manifest, bootstrapMode, cluster, networkGenesisHash, snapshotBuildStartedAt)
 			if err != nil {
 				klog.Fatalf("failed to persist ready state: %v", err)
 			}
@@ -2229,7 +2243,7 @@ postBootstrap:
 
 	if mithrilState == nil {
 		// Initialize state for this session
-		mithrilState, err = saveReadyStateForBootstrap(accountsPath, manifest, bootstrapMode, cluster, networkGenesisHash)
+		mithrilState, err = saveReadyStateForBootstrap(accountsPath, manifest, bootstrapMode, cluster, networkGenesisHash, snapshotBuildStartedAt)
 		if err != nil {
 			klog.Fatalf("failed to persist ready state: %v", err)
 		}
@@ -2913,9 +2927,9 @@ postBootstrap:
 
 	if result.Error != nil {
 		if result.LastPersistedSlot == 0 {
-			mlog.Log.Errorf("Replay stopped before persisting the first post-start slot: %v", result.Error)
+			mlog.Log.Errorf("Replay stopped before persisting the first post-start slot: %s", rpcclient.SanitizeErrorForDisplay(result.Error))
 		} else {
-			mlog.Log.Errorf("Replay stopped with error after persisting slot %d: %v", result.LastPersistedSlot, result.Error)
+			mlog.Log.Errorf("Replay stopped with error after persisting slot %d: %s", result.LastPersistedSlot, rpcclient.SanitizeErrorForDisplay(result.Error))
 		}
 	}
 
@@ -2937,7 +2951,7 @@ postBootstrap:
 					shutdownReason = state.ShutdownReasonLeaderSchedule
 				} else {
 					// Include the actual error for easier debugging
-					shutdownReason = fmt.Sprintf("%s: %v", state.ShutdownReasonError, result.Error)
+					shutdownReason = fmt.Sprintf("%s: %s", state.ShutdownReasonError, rpcclient.SanitizeErrorForDisplay(result.Error))
 				}
 			}
 
@@ -3081,7 +3095,7 @@ func fetchGenesisHash(ctx context.Context) string {
 	client := solrpc.New(rpcEndpoints[0])
 	hash, err := client.GetGenesisHash(ctx)
 	if err != nil {
-		mlog.Log.Infof("WARNING: failed to fetch genesis hash from RPC: %v", err)
+		mlog.Log.Infof("WARNING: failed to fetch genesis hash from RPC: %s", rpcclient.SanitizeErrorForDisplay(err))
 		return ""
 	}
 	return hash.String()
@@ -3273,7 +3287,7 @@ func printStartupInfo(commandName string) {
 			// Last shutdown reason (if available)
 			if mithrilState.LastShutdownReason != "" {
 				reasonColor := dim
-				reason := mithrilState.LastShutdownReason
+				reason := rpcclient.SanitizeTextForDisplay(mithrilState.LastShutdownReason)
 				// Choose color based on reason type
 				switch {
 				case reason == state.ShutdownReasonNormal:
@@ -3358,9 +3372,9 @@ func printStartupInfo(commandName string) {
 
 	// RPC endpoints - show auxiliary (network.rpc) endpoints
 	if len(rpcEndpoints) > 0 {
-		fmt.Printf("  RPC:          %s%s%s (primary)\n", gold, rpcEndpoints[0], reset)
+		fmt.Printf("  RPC:          %s%s%s (primary)\n", gold, rpcclient.SanitizeEndpointForDisplay(rpcEndpoints[0]), reset)
 		for _, ep := range rpcEndpoints[1:] {
-			fmt.Printf("                %s%s%s (fallback)\n", gold, ep, reset)
+			fmt.Printf("                %s%s%s (fallback)\n", gold, rpcclient.SanitizeEndpointForDisplay(ep), reset)
 		}
 	}
 	if blockSource == "lightbringer" && lightbringerEndpoint != "" {
@@ -3578,7 +3592,7 @@ func detectLocalFullSnapshot(snapshotDir string, fullThreshold int, rpcEndpoints
 	// Get current slot estimate from RPC
 	currentSlot, err := queryCurrentSlot(ctx, rpcEndpoints)
 	if err != nil {
-		mlog.Log.Infof("could not query current slot: %v", err)
+		mlog.Log.Infof("could not query current slot: %s", rpcclient.SanitizeErrorForDisplay(err))
 		return nil
 	}
 
@@ -3796,6 +3810,9 @@ func queryLatestSnapshotSlot(ctx context.Context, rpcEndpoints []string) (uint64
 
 // buildFromExistingSnapshot builds AccountsDB from an existing downloaded snapshot file.
 func buildFromExistingSnapshot(ctx context.Context, snap *snapshotInfo, snapshotDir, accountsPath, blockstorePath string, rpcEndpoints []string) (*accountsdb.AccountsDb, *snapshot.SnapshotManifest, error) {
+	finishBootstrap := statsd.BeginSnapshotBootstrap()
+	defer finishBootstrap()
+
 	snapCfg := buildSnapshotConfig(rpcEndpoints)
 
 	// Construct full path to snapshot file
@@ -3816,6 +3833,9 @@ func buildFromExistingSnapshot(ctx context.Context, snap *snapshotInfo, snapshot
 
 // downloadAndBuildFromSnapshot finds, downloads, and builds AccountsDB from a snapshot
 func downloadAndBuildFromSnapshot(ctx context.Context, rpcEndpoints []string, snapshotDownloadPath, accountsPath, blockstorePath string) (*accountsdb.AccountsDb, *snapshot.SnapshotManifest, error) {
+	finishBootstrap := statsd.BeginSnapshotBootstrap()
+	defer finishBootstrap()
+
 	snapCfg := buildSnapshotConfig(rpcEndpoints)
 	fullSnapshotDlStart := time.Now()
 	fullSnapshotInfo, err := snapshotdl.GetSnapshotURLWithInfo(ctx, snapCfg)
@@ -4320,12 +4340,154 @@ func rewindStoreBelowDivergence(accountsDbPath string, accountsDb *accountsdb.Ac
 // maxForkSwitchRetries bounds fork-aware dump-then-repair re-replays per run.
 const maxForkSwitchRetries = 3
 
+const (
+	maxSanitizedPanicValueBytes = 4 * 1024
+	maxSanitizedPanicStackBytes = 64 * 1024
+)
+
+type replayPanic struct {
+	Value string
+	Stack string
+}
+
+// captureSanitizedPanic records the faulting stack while the original panic is
+// active. The caller can log this bounded, sanitized diagnostic after the
+// original panic has fully unwound, then re-panic with only the safe value.
+func captureSanitizedPanic(run func()) (captured replayPanic, recovered bool) {
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				captured.Value = truncatePanicText(rpcclient.SanitizeTextForDisplay(fmt.Sprint(r)), maxSanitizedPanicValueBytes)
+				captured.Stack = sanitizePanicStack(debug.Stack())
+				recovered = true
+			}
+		}()
+		run()
+	}()
+	return captured, recovered
+}
+
+func sanitizePanicStack(raw []byte) string {
+	lines := strings.Split(string(raw), "\n")
+	for i := range lines {
+		lines[i] = rpcclient.SanitizeTextForDisplay(lines[i])
+	}
+	return truncatePanicText(strings.Join(lines, "\n"), maxSanitizedPanicStackBytes)
+}
+
+func truncatePanicText(value string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(value) <= maxBytes {
+		return value
+	}
+	const suffix = "\n...[truncated]"
+	if maxBytes <= len(suffix) {
+		return suffix[:maxBytes]
+	}
+	end := maxBytes - len(suffix)
+	for end > 0 && !utf8.ValidString(value[:end]) {
+		end--
+	}
+	return value[:end] + suffix
+}
+
+func reportReplayPanic(captured replayPanic, accountsDbPath string, mithrilState *state.MithrilState) {
+	runID := replay.CurrentRunID
+	if replay.IsCommitInProgress() {
+		commitSlot := replay.GetCommitSlot()
+		mlog.Log.Errorf("[run:%s] FATAL: Panic during commit at slot %d - AccountsDB may be corrupted", runID, commitSlot)
+		mlog.Log.Errorf("[run:%s] Panic occurred between StoreAccounts and StoreBankHashForSlot", runID)
+		if mithrilState != nil {
+			reason := fmt.Sprintf("panic during commit at slot %d: %s", commitSlot, captured.Value)
+			if err := mithrilState.MarkCorrupted(accountsDbPath, reason); err != nil {
+				mlog.Log.Errorf("[run:%s] Failed to mark state as corrupted: %v", runID, err)
+			} else {
+				state.RecordCorrupted(accountsDbPath, mithrilState.LastSlot, mithrilState.LastBankhash, runID, getVersion(), getCommit(), getBranch(), reason)
+			}
+		}
+	} else {
+		mlog.Log.Errorf("[run:%s] Panic during replay (outside commit window) - AccountsDB is SAFE", runID)
+		mlog.Log.Errorf("[run:%s] This appears to be a divergence panic. You can resume from the last persisted slot.", runID)
+	}
+	if captured.Stack != "" {
+		mlog.Log.Errorf("[run:%s] Sanitized panic stack:\n%s", runID, captured.Stack)
+	}
+
+	mlog.Log.Errorf("[run:%s] Debug info:", runID)
+	if mithrilState != nil {
+		mlog.Log.Errorf("[run:%s]   Snapshot slot: %d", runID, mithrilState.SnapshotSlot)
+		if mithrilState.FullSnapshot != nil {
+			mlog.Log.Errorf("[run:%s]   Full snapshot:  %s (slot %d)", runID, mithrilState.FullSnapshot.Path, mithrilState.FullSnapshot.Slot)
+		}
+		if mithrilState.IncrSnapshot != nil {
+			mlog.Log.Errorf("[run:%s]   Incr snapshot:  %s (base %d -> slot %d)", runID, mithrilState.IncrSnapshot.Path, mithrilState.IncrSnapshot.BaseSlot, mithrilState.IncrSnapshot.Slot)
+		}
+		if mithrilState.LastSlot > 0 {
+			mlog.Log.Errorf("[run:%s]   Last persisted: slot %d, bankhash %s", runID, mithrilState.LastSlot, mithrilState.LastBankhash)
+		}
+	}
+	mlog.Log.Errorf("[run:%s] Debug files:", runID)
+	mlog.Log.Errorf("[run:%s]   Bankhash log: %s/bankhash.log", runID, accountsDbPath)
+	mlog.Log.Errorf("[run:%s]   State file:   %s/mithril_state.json", runID, accountsDbPath)
+	panic(captured.Value)
+}
+
 // runReplayWithRecovery wraps replay.ReplayBlocks with panic recovery.
 // It distinguishes between:
 // - Panics during commit (commitInProgress=true): AccountsDB may be corrupted, marks state as corrupted
 // - Panics outside commit (divergence): AccountsDB is safe, logs helpful message
-// After handling, it re-panics to propagate the error.
+// After handling, it re-panics with a sanitized value.
 func runReplayWithRecovery(
+	ctx context.Context,
+	accountsDb *accountsdb.AccountsDb,
+	accountsDbPath string,
+	manifest *snapshot.SnapshotManifest,
+	resumeState *replay.ResumeState,
+	startSlot, endSlot uint64,
+	rpcEndpoints []string,
+	lightbringerEndpoint string,
+	turbineBindAddr string,
+	turbineGossipEntrypoint string,
+	turbineGossipBindAddr string,
+	turbineAdvertisedIP string,
+	turbineShredVersion uint16,
+	turbineAlpenglowAddr string,
+	turbineIdentity ed25519.PrivateKey,
+	blockDir string,
+	txParallelism int,
+	isLive bool,
+	useLightbringer bool,
+	useTurbine bool,
+	dbgOpts *replay.DebugOptions,
+	metricsWriter io.Writer,
+	rpcServer replay.SlotCtxSetter,
+	mithrilState *state.MithrilState,
+	blockFetchOpts *replay.BlockFetchOpts,
+	consensusOpts *replay.ConsensusOpts,
+	rewindHorizon uint64,
+	replayStartTime time.Time,
+) *replay.ReplayResult {
+	var result *replay.ReplayResult
+	captured, recovered := captureSanitizedPanic(func() {
+		result = runReplayWithForkRecovery(
+			ctx, accountsDb, accountsDbPath, manifest, resumeState,
+			startSlot, endSlot, rpcEndpoints, lightbringerEndpoint,
+			turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr,
+			turbineAdvertisedIP, turbineShredVersion, turbineAlpenglowAddr,
+			turbineIdentity, blockDir, txParallelism, isLive, useLightbringer,
+			useTurbine, dbgOpts, metricsWriter, rpcServer, mithrilState,
+			blockFetchOpts, consensusOpts, rewindHorizon, replayStartTime,
+		)
+	})
+	if recovered {
+		reportReplayPanic(captured, accountsDbPath, mithrilState)
+	}
+	return result
+}
+
+func runReplayWithForkRecovery(
 	ctx context.Context,
 	accountsDb *accountsdb.AccountsDb,
 	accountsDbPath string,
@@ -4418,49 +4580,6 @@ func runReplayWithRecovery(
 		mlog.Log.Infof("State saved to %s/mithril_state.json at slot %d", accountsDbPath, r.LastPersistedSlot)
 		return nil
 	}
-
-	defer func() {
-		if r := recover(); r != nil {
-			runID := replay.CurrentRunID
-			if replay.IsCommitInProgress() {
-				commitSlot := replay.GetCommitSlot()
-				mlog.Log.Errorf("[run:%s] FATAL: Panic during commit at slot %d - AccountsDB may be corrupted", runID, commitSlot)
-				mlog.Log.Errorf("[run:%s] Panic occurred between StoreAccounts and StoreBankHashForSlot", runID)
-				// Mark state as corrupted so next startup knows to rebuild
-				if mithrilState != nil {
-					reason := fmt.Sprintf("panic during commit at slot %d: %v", commitSlot, r)
-					if err := mithrilState.MarkCorrupted(accountsDbPath, reason); err != nil {
-						mlog.Log.Errorf("[run:%s] Failed to mark state as corrupted: %v", runID, err)
-					} else {
-						// Record corruption in history
-						state.RecordCorrupted(accountsDbPath, mithrilState.LastSlot, mithrilState.LastBankhash, runID, getVersion(), getCommit(), getBranch(), reason)
-					}
-				}
-			} else {
-				mlog.Log.Errorf("[run:%s] Panic during replay (outside commit window) - AccountsDB is SAFE", runID)
-				mlog.Log.Errorf("[run:%s] This appears to be a divergence panic. You can resume from the last persisted slot.", runID)
-			}
-			// Print debug info and paths
-			mlog.Log.Errorf("[run:%s] Debug info:", runID)
-			if mithrilState != nil {
-				mlog.Log.Errorf("[run:%s]   Snapshot slot: %d", runID, mithrilState.SnapshotSlot)
-				if mithrilState.FullSnapshot != nil {
-					mlog.Log.Errorf("[run:%s]   Full snapshot:  %s (slot %d)", runID, mithrilState.FullSnapshot.Path, mithrilState.FullSnapshot.Slot)
-				}
-				if mithrilState.IncrSnapshot != nil {
-					mlog.Log.Errorf("[run:%s]   Incr snapshot:  %s (base %d -> slot %d)", runID, mithrilState.IncrSnapshot.Path, mithrilState.IncrSnapshot.BaseSlot, mithrilState.IncrSnapshot.Slot)
-				}
-				if mithrilState.LastSlot > 0 {
-					mlog.Log.Errorf("[run:%s]   Last persisted: slot %d, bankhash %s", runID, mithrilState.LastSlot, mithrilState.LastBankhash)
-				}
-			}
-			mlog.Log.Errorf("[run:%s] Debug files:", runID)
-			mlog.Log.Errorf("[run:%s]   Bankhash log: %s/bankhash.log", runID, accountsDbPath)
-			mlog.Log.Errorf("[run:%s]   State file:   %s/mithril_state.json", runID, accountsDbPath)
-			// Re-panic to propagate the error
-			panic(r)
-		}
-	}()
 
 	result = replay.ReplayBlocks(ctx, accountsDb, accountsDbPath, mithrilState, resumeState, startSlot, endSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, turbineShredVersion, turbineAlpenglowAddr, turbineIdentity, blockDir, txParallelism, isLive, useLightbringer, useTurbine, dbgOpts, metricsWriter, rpcServer, blockFetchOpts, consensusOpts, onCancelWriteState)
 	if consensusOpts == nil || !consensusOpts.Alpenglow {

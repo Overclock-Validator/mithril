@@ -405,9 +405,8 @@ func formatTOMLValue(value string) string {
 	if _, err := fmt.Sscanf(value, "%d", &n); err == nil && fmt.Sprintf("%d", n) == strings.TrimSpace(value) {
 		return fmt.Sprintf("%d", n)
 	}
-	// Check if it's a float — return the parsed number, not raw input
-	var f float64
-	if _, err := fmt.Sscanf(value, "%f", &f); err == nil && !strings.ContainsAny(value, "\n\r") {
+	// Check if it's a float — ParseFloat rejects numeric prefixes such as IP addresses.
+	if f, err := strconv.ParseFloat(strings.TrimSpace(value), 64); err == nil {
 		return strconv.FormatFloat(f, 'f', -1, 64)
 	}
 

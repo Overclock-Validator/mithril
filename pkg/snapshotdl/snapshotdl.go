@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/Overclock-Validator/mithril/pkg/rpcclient"
 	"github.com/Overclock-Validator/solana-snapshot-finder-go/pkg/config"
 	"github.com/Overclock-Validator/solana-snapshot-finder-go/pkg/rpc"
 	"github.com/Overclock-Validator/solana-snapshot-finder-go/pkg/snapshot"
@@ -675,9 +676,9 @@ func GetSnapshotURL(ctx context.Context, snapCfg SnapshotConfig) (string, int, i
 	mlog.Log.Infof("Getting reference slot from RPC(s)...")
 	referenceSlot, preferredRPC, err := rpc.GetReferenceSlotFromMultiple(cfg.RPCAddresses)
 	if err != nil {
-		return "", 0, 0, fmt.Errorf("error getting reference slot: %w", err)
+		return "", 0, 0, fmt.Errorf("error getting reference slot: %w", rpcclient.WrapErrorForDisplay(err))
 	}
-	mlog.Log.Infof("Reference slot: %d (from %s)", referenceSlot, preferredRPC)
+	mlog.Log.Infof("Reference slot: %d (from %s)", referenceSlot, rpcclient.SanitizeEndpointForDisplay(preferredRPC))
 
 	// Step 2: Fetch cluster nodes
 	mlog.Log.Infof("Discovering RPC nodes from cluster...")
@@ -751,11 +752,11 @@ func GetSnapshotURL(ctx context.Context, snapCfg SnapshotConfig) (string, int, i
 
 		if i > 0 {
 			// We're on a fallback attempt
-			mlog.Log.Infof("Trying fallback source #%d: %s", i+1, nodeRPC)
+			mlog.Log.Infof("Trying fallback source #%d: %s", i+1, rpcclient.SanitizeEndpointForDisplay(nodeRPC))
 		}
 
 		if snapCfg.Verbose {
-			mlog.Log.Infof("Getting snapshot URL from: %s (rank #%d)", nodeRPC, i+1)
+			mlog.Log.Infof("Getting snapshot URL from: %s (rank #%d)", rpcclient.SanitizeEndpointForDisplay(nodeRPC), i+1)
 		}
 		urlInfo, err := snapshot.GetSnapshotURL(ctx, nodeRPC, "full")
 
@@ -767,12 +768,14 @@ func GetSnapshotURL(ctx context.Context, snapCfg SnapshotConfig) (string, int, i
 
 		if err != nil {
 			if snapCfg.Verbose {
-				mlog.Log.Infof("Failed to get snapshot URL from %s: %v. Trying next...", nodeRPC, err)
+				mlog.Log.Infof("Failed to get snapshot URL from %s: %s. Trying next...",
+					rpcclient.SanitizeEndpointForDisplay(nodeRPC), rpcclient.SanitizeErrorForDisplay(err))
 			}
-			urlErr = err
+			urlErr = rpcclient.WrapErrorForDisplay(err)
 		} else {
 			if snapCfg.Verbose {
-				mlog.Log.Infof("GetSnapshotURL from %s returned nil. Trying next...", nodeRPC)
+				mlog.Log.Infof("GetSnapshotURL from %s returned nil. Trying next...",
+					rpcclient.SanitizeEndpointForDisplay(nodeRPC))
 			}
 		}
 	}
@@ -797,10 +800,10 @@ func GetSnapshotURLWithInfo(ctx context.Context, snapCfg SnapshotConfig) (*Snaps
 	// Step 1: Get reference slot from multiple RPCs for reliability
 	referenceSlot, preferredRPC, err := rpc.GetReferenceSlotFromMultiple(cfg.RPCAddresses)
 	if err != nil {
-		return nil, fmt.Errorf("error getting reference slot: %w", err)
+		return nil, fmt.Errorf("error getting reference slot: %w", rpcclient.WrapErrorForDisplay(err))
 	}
 	if snapCfg.Verbose {
-		mlog.Log.Infof("Reference slot: %d (from %s)", referenceSlot, preferredRPC)
+		mlog.Log.Infof("Reference slot: %d (from %s)", referenceSlot, rpcclient.SanitizeEndpointForDisplay(preferredRPC))
 	}
 
 	// Step 2: Fetch cluster nodes
@@ -905,11 +908,11 @@ func GetSnapshotURLWithInfo(ctx context.Context, snapCfg SnapshotConfig) (*Snaps
 		}
 
 		if i > 0 {
-			mlog.Log.Infof("Trying fallback source #%d: %s", i+1, nodeRPC)
+			mlog.Log.Infof("Trying fallback source #%d: %s", i+1, rpcclient.SanitizeEndpointForDisplay(nodeRPC))
 		}
 
 		if snapCfg.Verbose {
-			mlog.Log.Infof("Getting snapshot URL from: %s (rank #%d)", nodeRPC, i+1)
+			mlog.Log.Infof("Getting snapshot URL from: %s (rank #%d)", rpcclient.SanitizeEndpointForDisplay(nodeRPC), i+1)
 		}
 		urlInfo, err := snapshot.GetSnapshotURL(ctx, nodeRPC, "full")
 
@@ -936,12 +939,14 @@ func GetSnapshotURLWithInfo(ctx context.Context, snapCfg SnapshotConfig) (*Snaps
 
 		if err != nil {
 			if snapCfg.Verbose {
-				mlog.Log.Infof("Failed to get snapshot URL from %s: %v. Trying next...", nodeRPC, err)
+				mlog.Log.Infof("Failed to get snapshot URL from %s: %s. Trying next...",
+					rpcclient.SanitizeEndpointForDisplay(nodeRPC), rpcclient.SanitizeErrorForDisplay(err))
 			}
-			urlErr = err
+			urlErr = rpcclient.WrapErrorForDisplay(err)
 		} else {
 			if snapCfg.Verbose {
-				mlog.Log.Infof("GetSnapshotURL from %s returned nil. Trying next...", nodeRPC)
+				mlog.Log.Infof("GetSnapshotURL from %s returned nil. Trying next...",
+					rpcclient.SanitizeEndpointForDisplay(nodeRPC))
 			}
 		}
 	}
@@ -951,10 +956,8 @@ func GetSnapshotURLWithInfo(ctx context.Context, snapCfg SnapshotConfig) (*Snaps
 	}
 
 	// Extract IP from RPC URL (e.g., "http://141.94.163.217:8899" -> "141.94.163.217:8899")
-	nodeIP := selectedNodeRPC
-	if idx := strings.Index(nodeIP, "://"); idx != -1 {
-		nodeIP = nodeIP[idx+3:]
-	}
+	nodeIP := strings.TrimPrefix(strings.TrimPrefix(
+		rpcclient.SanitizeEndpointForDisplay(selectedNodeRPC), "https://"), "http://")
 
 	return &SnapshotInfo{
 		URL:           snapshotURL,
@@ -991,9 +994,9 @@ func DownloadSnapshotWithConfig(ctx context.Context, path string, snapCfg Snapsh
 	mlog.Log.Infof("Getting reference slot from RPC(s)...")
 	referenceSlot, preferredRPC, err := rpc.GetReferenceSlotFromMultiple(cfg.RPCAddresses)
 	if err != nil {
-		return "", 0, 0, fmt.Errorf("error getting reference slot: %w", err)
+		return "", 0, 0, fmt.Errorf("error getting reference slot: %w", rpcclient.WrapErrorForDisplay(err))
 	}
-	mlog.Log.Infof("Reference slot: %d (from %s)", referenceSlot, preferredRPC)
+	mlog.Log.Infof("Reference slot: %d (from %s)", referenceSlot, rpcclient.SanitizeEndpointForDisplay(preferredRPC))
 
 	// Step 2: Fetch cluster nodes
 	mlog.Log.Infof("Discovering RPC nodes from cluster...")
@@ -1062,16 +1065,17 @@ func DownloadSnapshotWithConfig(ctx context.Context, path string, snapCfg Snapsh
 		}
 
 		if i > 0 {
-			mlog.Log.Infof("Trying fallback source #%d: %s", i+1, nodeRPC)
+			mlog.Log.Infof("Trying fallback source #%d: %s", i+1, rpcclient.SanitizeEndpointForDisplay(nodeRPC))
 		}
 
-		mlog.Log.Infof("Downloading from: %s (rank #%d)", nodeRPC, i+1)
+		mlog.Log.Infof("Downloading from: %s (rank #%d)", rpcclient.SanitizeEndpointForDisplay(nodeRPC), i+1)
 		downloadStart := time.Now()
 		finalPath, downloadErr = snapshot.DownloadSnapshotWithContext(
 			ctx, nodeRPC, cfg, "snapshot-", referenceSlot, nil)
 
 		if downloadErr == nil && finalPath != "" {
-			mlog.Log.Infof("Successfully downloaded snapshot from %s in %s", nodeRPC, time.Since(downloadStart))
+			mlog.Log.Infof("Successfully downloaded snapshot from %s in %s",
+				rpcclient.SanitizeEndpointForDisplay(nodeRPC), time.Since(downloadStart))
 			break
 		}
 
@@ -1081,9 +1085,12 @@ func DownloadSnapshotWithConfig(ctx context.Context, path string, snapCfg Snapsh
 		}
 
 		if downloadErr != nil {
-			mlog.Log.Infof("Failed to download from %s: %v. Trying next...", nodeRPC, downloadErr)
+			mlog.Log.Infof("Failed to download from %s: %s. Trying next...",
+				rpcclient.SanitizeEndpointForDisplay(nodeRPC), rpcclient.SanitizeErrorForDisplay(downloadErr))
+			downloadErr = rpcclient.WrapErrorForDisplay(downloadErr)
 		} else {
-			mlog.Log.Infof("Download from %s returned empty path. Trying next...", nodeRPC)
+			mlog.Log.Infof("Download from %s returned empty path. Trying next...",
+				rpcclient.SanitizeEndpointForDisplay(nodeRPC))
 		}
 	}
 
@@ -1210,7 +1217,7 @@ func DownloadIncrementalSnapshotWithConfig(path string, referenceSlot int, fullS
 	}
 
 	mlog.Log.Infof("Found matching incremental on %s: base=%d, end=%d",
-		incrInfo.NodeRPC, incrInfo.BaseSlot, incrInfo.EndSlot)
+		rpcclient.SanitizeEndpointForDisplay(incrInfo.NodeRPC), incrInfo.BaseSlot, incrInfo.EndSlot)
 
 	// Step 5: Download the incremental snapshot
 	downloadStart := time.Now()
@@ -1218,10 +1225,12 @@ func DownloadIncrementalSnapshotWithConfig(path string, referenceSlot int, fullS
 		ctx, incrInfo.NodeRPC, cfg, "incremental", referenceSlot, nil)
 
 	if err != nil {
-		return "", 0, 0, fmt.Errorf("failed to download incremental from %s: %w", incrInfo.NodeRPC, err)
+		return "", 0, 0, fmt.Errorf("failed to download incremental from %s: %w",
+			rpcclient.SanitizeEndpointForDisplay(incrInfo.NodeRPC), rpcclient.WrapErrorForDisplay(err))
 	}
 
-	mlog.Log.Infof("Downloaded incremental snapshot from %s in %s", incrInfo.NodeRPC, time.Since(downloadStart))
+	mlog.Log.Infof("Downloaded incremental snapshot from %s in %s",
+		rpcclient.SanitizeEndpointForDisplay(incrInfo.NodeRPC), time.Since(downloadStart))
 
 	// Step 6: Verify the downloaded snapshot matches expected slots
 	baseSlot, endSlot, err := snapshot.ExtractIncrementalSnapshotSlots(finalPath)
@@ -1366,9 +1375,11 @@ func GetIncrementalSnapshotURL(fullSnapshotURL string, referenceSlot int, fullSn
 
 	// Step 1: Try to get incremental from the same source as the full snapshot
 	if sourceNodeRPC != "" && blacklist.contains(sourceNodeRPC) {
-		mlog.Log.Infof("Skipping same-source incremental check because %s is in snapshot.node_blacklist", sourceNodeRPC)
+		mlog.Log.Infof("Skipping same-source incremental check because %s is in snapshot.node_blacklist",
+			rpcclient.SanitizeEndpointForDisplay(sourceNodeRPC))
 	} else if sourceNodeRPC != "" {
-		mlog.Log.FileOnlyf("Checking same source for incremental (base slot %d): %s", fullSnapshotSlot, sourceNodeRPC)
+		mlog.Log.FileOnlyf("Checking same source for incremental (base slot %d): %s",
+			fullSnapshotSlot, rpcclient.SanitizeEndpointForDisplay(sourceNodeRPC))
 		urlInfo, err := snapshot.GetSnapshotURL(ctx, sourceNodeRPC, "incremental")
 
 		if err == nil && urlInfo != nil && urlInfo.BaseSlot == fullSnapshotSlot {
@@ -1381,7 +1392,7 @@ func GetIncrementalSnapshotURL(fullSnapshotURL string, referenceSlot int, fullSn
 					age, incrementalSameSourceFreshSlots)
 			} else {
 				mlog.Log.Infof("📸 Incremental snapshot source: %s (same as full, base=%d, end=%d, age=%d slots)",
-					sourceNodeRPC, urlInfo.BaseSlot, urlInfo.Slot, age)
+					rpcclient.SanitizeEndpointForDisplay(sourceNodeRPC), urlInfo.BaseSlot, urlInfo.Slot, age)
 				return urlInfo.URL, urlInfo.BaseSlot, urlInfo.Slot, nil
 			}
 		} else {
@@ -1532,7 +1543,7 @@ func GetIncrementalSnapshotURL(fullSnapshotURL string, referenceSlot int, fullSn
 		for i := 0; i < min(3, len(matchingNodes)); i++ {
 			node := matchingNodes[i]
 			mlog.Log.Infof("  #%d: %s (end slot: %d, %.1f MB/s)",
-				i+1, node.Result.RPC, node.Result.IncSlot, node.S1.MedianMBs)
+				i+1, rpcclient.SanitizeEndpointForDisplay(node.Result.RPC), node.Result.IncSlot, node.S1.MedianMBs)
 		}
 	}
 
@@ -1552,12 +1563,12 @@ func GetIncrementalSnapshotURL(fullSnapshotURL string, referenceSlot int, fullSn
 
 		if i > 0 {
 			mlog.Log.Infof("Trying fallback incremental source #%d: %s (end slot: %d)",
-				i+1, node.Result.RPC, node.Result.IncSlot)
+				i+1, rpcclient.SanitizeEndpointForDisplay(node.Result.RPC), node.Result.IncSlot)
 		}
 
 		if snapCfg.Verbose {
 			mlog.Log.Infof("Getting incremental URL from %s (base=%d, end=%d)",
-				node.Result.RPC, node.Result.IncBase, node.Result.IncSlot)
+				rpcclient.SanitizeEndpointForDisplay(node.Result.RPC), node.Result.IncBase, node.Result.IncSlot)
 		}
 
 		urlInfo, err := snapshot.GetSnapshotURL(ctx, node.Result.RPC, "incremental")
@@ -1576,9 +1587,10 @@ func GetIncrementalSnapshotURL(fullSnapshotURL string, referenceSlot int, fullSn
 			}
 		} else {
 			if snapCfg.Verbose {
-				mlog.Log.Infof("Failed to get URL from %s: %v. Trying next...", node.Result.RPC, err)
+				mlog.Log.Infof("Failed to get URL from %s: %s. Trying next...",
+					rpcclient.SanitizeEndpointForDisplay(node.Result.RPC), rpcclient.SanitizeErrorForDisplay(err))
 			}
-			urlErr = err
+			urlErr = rpcclient.WrapErrorForDisplay(err)
 		}
 	}
 
@@ -1589,7 +1601,7 @@ func GetIncrementalSnapshotURL(fullSnapshotURL string, referenceSlot int, fullSn
 
 	// Always log the selected source
 	mlog.Log.Infof("📸 Incremental snapshot source: %s (base=%d, end=%d)",
-		selectedNode, incrBaseSlot, incrEndSlot)
+		rpcclient.SanitizeEndpointForDisplay(selectedNode), incrBaseSlot, incrEndSlot)
 	return incrURL, incrBaseSlot, incrEndSlot, nil
 }
 

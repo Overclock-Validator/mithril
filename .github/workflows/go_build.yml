@@ -1,19 +1,45 @@
 name: CI
+permissions:
+  contents: read
 on:
   pull_request:
   push:
     branches:
+      - alpenglow-dev
       - dev
 jobs:
   go-build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Setup Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: 1.26.4
+          go-version-file: go.mod
+
+      - name: Test MCP
+        run: go test -race ./pkg/mcp ./cmd/mithril/mcpcmd ./internal/safedisplay
+
+      - name: Test MCP integrations
+        run: go test ./cmd/mithril/configcmd ./cmd/mithril/node ./pkg/blockstream ./pkg/replay ./pkg/rpcclient ./pkg/statsd ./pkg/turbine
+
+      - name: Vet MCP
+        run: go vet ./pkg/mcp ./cmd/mithril/mcpcmd ./internal/safedisplay
+
+      - name: Scan MCP dependencies
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./pkg/mcp ./cmd/mithril/mcpcmd ./internal/safedisplay
 
       - name: Build
         run: go build -v ./cmd/mithril
+
+  nix-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Build Mithril
+        run: nix build .#mithril

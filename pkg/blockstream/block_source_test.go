@@ -1,6 +1,7 @@
 package blockstream
 
 import (
+	"errors"
 	"math"
 	"net"
 	"strings"
@@ -9,7 +10,9 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/alpenglow"
 	b "github.com/Overclock-Validator/mithril/pkg/block"
+	"github.com/Overclock-Validator/mithril/pkg/rpcclient"
 	"github.com/gagliardetto/solana-go"
+	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -24,6 +27,21 @@ func waitForBlockSourceCondition(t *testing.T, condition func() bool) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("timed out waiting for block source condition")
+}
+
+func prometheusGaugeValue(t *testing.T, name string) float64 {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	for _, family := range families {
+		if family.GetName() == name && len(family.Metric) == 1 {
+			return family.Metric[0].GetGauge().GetValue()
+		}
+	}
+	t.Fatalf("metric %q not found", name)
+	return 0
 }
 
 // A rooted Alpenglow fork recovery starts a replacement BlockSource in the
@@ -50,6 +68,9 @@ func TestStopReleasesTurbineSocketForForkReplay(t *testing.T) {
 	bs.liveStreamWg.Add(1)
 	go bs.runTurbineStream()
 	waitForBlockSourceCondition(t, bs.liveStreamConnected.Load)
+	if got := prometheusGaugeValue(t, "turbine_receiver_active"); got != 1 {
+		t.Fatalf("turbine receiver active = %v, want 1", got)
+	}
 
 	// Model Stop racing with the scheduler's ordinary Start shutdown.
 	bs.Stop()
@@ -63,6 +84,9 @@ func TestStopReleasesTurbineSocketForForkReplay(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("turbine stream did not stop and release ownership")
+	}
+	if got := prometheusGaugeValue(t, "turbine_receiver_active"); got != 0 {
+		t.Fatalf("turbine receiver active after stop = %v, want 0", got)
 	}
 
 	replacement, err := net.ListenUDP("udp", mustResolveUDPAddr(t, addr))
@@ -196,6 +220,40 @@ func TestInjectLocalBlockReplacesProvisionalSkip(t *testing.T) {
 
 	close(bs.resultQueue)
 	<-emitterDone
+}
+
+func TestRPCDiagnosticsSanitizeEndpointAndErrors(t *testing.T) {
+	const primary = "https://primary-user:primary-password@primary.example.com:8899/private?api-key=PRIMARY_SECRET"
+	const backup = "https://backup-user:backup-password@backup.example.com:8899/tenant/BACKUP_SECRET"
+	bs := NewBlockSource(&BlockSourceOpts{
+		RpcClient:          rpcclient.NewRpcClient(primary),
+		BackupRpcEndpoints: []string{backup},
+		StartSlot:          42,
+		EndSlot:            43,
+	})
+	bs.activeRpcIdx.Store(1)
+	bs.trackSlotError(42, errors.New("fetch failed via "+primary+" token=ERROR_SECRET"), 0, 7)
+
+	diag := bs.collectStallDiagnostics()
+	if got, want := diag.ActiveRpcURL, "https://backup.example.com:8899"; got != want {
+		t.Fatalf("active RPC diagnostic = %q, want %q", got, want)
+	}
+	if diag.WaitingSlotErrors == nil {
+		t.Fatal("waiting-slot error diagnostic is missing")
+	}
+	for _, secret := range []string{
+		"primary-user", "primary-password", "private", "PRIMARY_SECRET",
+		"backup-user", "backup-password", "BACKUP_SECRET", "ERROR_SECRET",
+	} {
+		if strings.Contains(diag.ActiveRpcURL, secret) || strings.Contains(diag.WaitingSlotErrors.lastError, secret) {
+			t.Fatalf("secret %q leaked in diagnostics: endpoint=%q error=%q", secret, diag.ActiveRpcURL, diag.WaitingSlotErrors.lastError)
+		}
+	}
+
+	bs.activeRpcIdx.Store(-1)
+	if got := bs.collectStallDiagnostics().ActiveRpcURL; got != "" {
+		t.Fatalf("negative active RPC index exposed endpoint %q", got)
+	}
 }
 
 func TestLightbringerBlockConnectsLocked(t *testing.T) {

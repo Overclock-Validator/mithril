@@ -262,6 +262,9 @@ func BuildAccountsDbPaths(
 	accountsDbDir string,
 	dp *progress.DualProgress,
 ) (*accountsdb.AccountsDb, *SnapshotManifest, error) {
+	finishBootstrap := statsd.BeginSnapshotBootstrap()
+	defer finishBootstrap()
+
 	// Clean any leftover artifacts from previous incomplete runs (e.g., Ctrl+C)
 	CleanAccountsDbDir(accountsDbDir)
 
