@@ -14,6 +14,8 @@ github.com/Overclock-Validator/gnark-crypto v0.0.0-20250309203346-2a67ed08a105 h
 github.com/Overclock-Validator/gnark-crypto v0.0.0-20250309203346-2a67ed08a105/go.mod h1:Poczuq3dbt+CwyTKgOjGaEwJOMP7YxQobF7QhgNcguk=
 github.com/Overclock-Validator/narya-ed25519 v0.0.0-20260726222623-da0d045dae9d h1:ipaL+9MHKeI8QIfWneId0VLa+STLRM1e6MnvZhQyhPU=
 github.com/Overclock-Validator/narya-ed25519 v0.0.0-20260726222623-da0d045dae9d/go.mod h1:B7/xqV/5NtGJa8OlZAa9TRMHgeIE+VEJNiPzMP4FrIg=
+github.com/Overclock-Validator/narya-ed25519 v0.0.0-20260730051143-c265ee966713 h1:nRAD+snanlR/sX4W5rkrxr6+sYBZ3Hl2xZQ6HCpM0Hc=
+github.com/Overclock-Validator/narya-ed25519 v0.0.0-20260730051143-c265ee966713/go.mod h1:B7/xqV/5NtGJa8OlZAa9TRMHgeIE+VEJNiPzMP4FrIg=
 github.com/Overclock-Validator/solana-snapshot-finder-go v0.0.0-20260223201452-d8363b514fc0 h1:elgavEQb8l7Zn3gS3Y+2/98PlUylOWdlM3V1VumQ7mA=
 github.com/Overclock-Validator/solana-snapshot-finder-go v0.0.0-20260223201452-d8363b514fc0/go.mod h1:XbqbvMA2NKeosY0w3WdBOpCg2eYJesBjfE4cNt9HSE8=
 github.com/Overclock-Validator/wide v0.0.0-20250221123529-f80959d02044 h1:ph9gnWIY116AWT/iCfXoPe9/cn2aWx2uJBuLdf/LyEE=
