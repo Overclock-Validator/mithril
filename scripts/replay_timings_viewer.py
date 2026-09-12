@@ -100,8 +100,9 @@ def _(alt, latency_records, mo):
 
 @app.cell(hide_code=True)
 def _(alt, latency_records, mo):
-    # Only disjoint top-level ProcessBlock phases are stacked. Planner build
-    # and dispatch are nested within TxLoop, so they are overlaid as lines.
+    # Only disjoint top-level ProcessBlock phases are stacked. Prepared planner
+    # build may overlap account loading; wait and dispatch are nested within
+    # TxLoop, so all three are overlaid as diagnostic lines.
     # SignatureVerificationJoin is only the final blocking wait; the existing
     # Sigverify metric is summed worker time that overlaps these wall phases.
     process_components = (
@@ -149,7 +150,11 @@ def _(alt, latency_records, mo):
     planner_detail = (
         alt.Chart(alt.InlineData(values=latency_records))
         .transform_fold(
-            ["DependencyPlannerBuild", "DependencyPlannerDispatch"],
+            [
+                "DependencyPlannerBuild",
+                "DependencyPlannerWait",
+                "DependencyPlannerDispatch",
+            ],
             as_=["Nested timer", "Latency"],
         )
         .mark_line(point=True, strokeDash=[5, 3])
@@ -164,7 +169,7 @@ def _(alt, latency_records, mo):
         alt.layer(process_components, process_total, planner_detail)
         .resolve_scale(color="independent")
         .properties(
-            title="ProcessBlock detail (black total; dashed planner timers are nested in TxLoop)"
+            title="ProcessBlock detail (black total; prepared build may overlap load, wait/dispatch are nested in TxLoop)"
         )
     )
     mo.ui.altair_chart(process_chart)
