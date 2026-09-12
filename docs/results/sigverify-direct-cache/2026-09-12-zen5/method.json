@@ -1,0 +1,8 @@
+{
+  "base_commit": "11939e2fda29c60381370242e4a26308fd09c9f9",
+  "files": {
+    "entries.go": "d9c8c79bf9b4264ccbcb5028439b67d552947e690603283eaeb8c5525c90668d",
+    "entries_direct_compare_test.go": "afde5079ef3e99535a69077d01db41b141ebe69d94e9c290b5894d8804a7ef4e"
+  },
+  "description": "Only entries.go production change, direct slice comparison on hits and exact-capacity component allocation on misses. Existing benchmark unchanged."
+}
