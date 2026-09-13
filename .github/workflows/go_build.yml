@@ -17,3 +17,6 @@ jobs:
 
       - name: Build
         run: go build -v ./cmd/mithril
+
+      - name: Test gossip and networking
+        run: go test -race ./pkg/gossip ./pkg/repair ./pkg/turbine ./pkg/blockstream
