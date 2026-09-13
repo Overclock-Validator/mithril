@@ -235,6 +235,8 @@ type ValidatorConfig struct {
 	TPUQUICBindAddr             string `toml:"tpu_quic_bind_addr" mapstructure:"tpu_quic_bind_addr"`
 	AdvertisedIP                string `toml:"advertised_ip" mapstructure:"advertised_ip"`
 	TPUSigverifyWorkers         int    `toml:"tpu_sigverify_workers" mapstructure:"tpu_sigverify_workers"`
+	BlockCompletionReserveMs    int    `toml:"block_completion_reserve_ms" mapstructure:"block_completion_reserve_ms"`
+	TPUMaxBufferedTransactions  int    `toml:"tpu_max_buffered_transactions" mapstructure:"tpu_max_buffered_transactions"`
 }
 
 // Config holds all configuration options for Mithril (Firedancer-style hierarchy)
