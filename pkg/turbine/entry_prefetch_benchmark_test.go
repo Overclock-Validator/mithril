@@ -84,15 +84,14 @@ func makeAssemblyFlowFixture(tb testing.TB, source *block.Block) assemblyFlowFix
 		if err != nil {
 			tb.Fatal(err)
 		}
-		generated, dataEnd, codeEnd, err := generator.makeShredsFromData(leader, raw, last, chained, nextData, nextCode)
+		packets, finalRoot, dataEnd, codeEnd, err := generator.MakeShredsFromData(leader, raw, last, chained, nextData, nextCode)
 		if err != nil {
 			tb.Fatal(err)
 		}
-		chained, nextData, nextCode = generated.chainedMerkleRoot, dataEnd, codeEnd
-		roots = append(roots, generated.fecSetRoots...)
+		chained, nextData, nextCode = finalRoot, dataEnd, codeEnd
 		var data []*Shred
 		var authenticatedRoots []solana.Hash
-		for _, packet := range generated.packets {
+		for _, packet := range packets {
 			shred, err := ParseShred(packet)
 			if err != nil {
 				tb.Fatal(err)
@@ -106,6 +105,9 @@ func makeAssemblyFlowFixture(tb testing.TB, source *block.Block) assemblyFlowFix
 			root, err := shred.MerkleRoot()
 			if err != nil {
 				tb.Fatal(err)
+			}
+			if shred.Index == shred.FECSetIndex {
+				roots = append(roots, root)
 			}
 			authenticatedRoots = append(authenticatedRoots, root)
 			data = append(data, shred)
