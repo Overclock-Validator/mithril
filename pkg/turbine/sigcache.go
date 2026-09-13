@@ -53,9 +53,16 @@ const shredSigCacheGenCap = 4096
 // verifyShred authenticates a shred exactly like Shred.VerifySignature, with
 // the per-root ed25519 result cached.
 func (c *ShredSignatureVerifier) verifyShred(s *Shred, leader solana.PublicKey) error {
+	_, err := c.verifyShredRoot(s, leader)
+	return err
+}
+
+// verifyShredRoot also returns the root authenticated for these exact bytes.
+// Callers must keep the shred immutable through assembler admission.
+func (c *ShredSignatureVerifier) verifyShredRoot(s *Shred, leader solana.PublicKey) (solana.Hash, error) {
 	root, err := s.MerkleRoot()
 	if err != nil {
-		return err
+		return solana.Hash{}, err
 	}
 	key := shredSigCacheKey{leader: leader, root: root, sig: s.Signature}
 
@@ -63,25 +70,25 @@ func (c *ShredSignatureVerifier) verifyShred(s *Shred, leader solana.PublicKey) 
 	if _, ok := c.cur[key]; ok {
 		c.mu.Unlock()
 		c.hits.Add(1)
-		return nil
+		return root, nil
 	}
 	if _, ok := c.prev[key]; ok {
 		// Promote: a set straddling a rotation keeps its entry hot.
 		c.addLocked(key)
 		c.mu.Unlock()
 		c.hits.Add(1)
-		return nil
+		return root, nil
 	}
 	c.mu.Unlock()
 
 	c.verifies.Add(1)
 	if !narya.VerifyStrict(leader[:], root[:], s.Signature[:]) {
-		return fmt.Errorf("%w: slot %d shred %d", ErrInvalidSignature, s.Slot, s.Index)
+		return solana.Hash{}, fmt.Errorf("%w: slot %d shred %d", ErrInvalidSignature, s.Slot, s.Index)
 	}
 	c.mu.Lock()
 	c.addLocked(key)
 	c.mu.Unlock()
-	return nil
+	return root, nil
 }
 
 // Verify authenticates one shred and retains successful root/signature tuples

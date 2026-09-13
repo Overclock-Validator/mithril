@@ -60,11 +60,12 @@ func BenchmarkEntryPrefetchAssembly(b *testing.B) {
 }
 
 type assemblyFlowFixture struct {
-	components [][]*Shred
-	blockID    solana.Hash
-	parentID   solana.Hash
-	bankhash   solana.Hash
-	shreds     int
+	components         [][]*Shred
+	authenticatedRoots [][]solana.Hash
+	blockID            solana.Hash
+	parentID           solana.Hash
+	bankhash           solana.Hash
+	shreds             int
 }
 
 func makeAssemblyFlowFixture(tb testing.TB, source *block.Block) assemblyFlowFixture {
@@ -90,6 +91,7 @@ func makeAssemblyFlowFixture(tb testing.TB, source *block.Block) assemblyFlowFix
 		chained, nextData, nextCode = generated.chainedMerkleRoot, dataEnd, codeEnd
 		roots = append(roots, generated.fecSetRoots...)
 		var data []*Shred
+		var authenticatedRoots []solana.Hash
 		for _, packet := range generated.packets {
 			shred, err := ParseShred(packet)
 			if err != nil {
@@ -101,9 +103,15 @@ func makeAssemblyFlowFixture(tb testing.TB, source *block.Block) assemblyFlowFix
 			if err := shred.VerifySignature(public); err != nil {
 				tb.Fatal(err)
 			}
+			root, err := shred.MerkleRoot()
+			if err != nil {
+				tb.Fatal(err)
+			}
+			authenticatedRoots = append(authenticatedRoots, root)
 			data = append(data, shred)
 		}
 		fixture.components = append(fixture.components, data)
+		fixture.authenticatedRoots = append(fixture.authenticatedRoots, authenticatedRoots)
 		fixture.shreds += len(data)
 	}
 	appendComponent(NewBlockHeader(99, fixture.parentID), false)
@@ -154,8 +162,8 @@ func runAssemblyFlowBenchmark(b *testing.B, source *block.Block, fixture assembl
 			if span > 0 {
 				time.Sleep(time.Until(started.Add(flowArrivalOffset(componentIndex, len(fixture.components), span))))
 			}
-			for _, shred := range component {
-				candidate, err := a.addShredFrom(shred, false)
+			for shredIndex, shred := range component {
+				candidate, err := a.addShredFromWithRoot(shred, false, &fixture.authenticatedRoots[componentIndex][shredIndex])
 				if err != nil {
 					b.Fatal(err)
 				}

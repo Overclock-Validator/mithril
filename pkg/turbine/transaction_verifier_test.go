@@ -245,7 +245,7 @@ func TestTransactionVerifierLargeRequestDoesNotQueuePastSmallRequest(t *testing.
 	releaseOnce.Do(func() { close(release) })
 	_, err = smallRequest.wait()
 	require.NoError(t, err)
-	require.Equal(t, int32(8), callsBeforeSmall.Load(), "large request may only stay one group ahead")
+	require.Equal(t, int32(v.batchTarget*v.jobGroups), callsBeforeSmall.Load(), "large request may only stay one job ahead")
 	_, err = largeRequest.wait()
 	require.NoError(t, err)
 	require.Equal(t, int32(800), largeCalls.Load())
@@ -425,23 +425,29 @@ func TestTransactionVerifierKeepsMultisignatureTransactionsIntactAcrossTargets(t
 		txs[i] = tx
 	}
 	for _, target := range []int{4, 8} {
-		t.Run(fmt.Sprintf("target=%d", target), func(t *testing.T) {
-			v := newTransactionVerifierWithBatchTarget(2, 16, target, nil)
-			defer v.closeAndWait()
-			r, err := v.submitTransactions(context.Background(), txs)
-			require.NoError(t, err)
-			_, err = r.wait()
-			require.NoError(t, err)
+		for _, groups := range []int{1, 4, 8} {
+			t.Run(fmt.Sprintf("target=%d/groups=%d", target, groups), func(t *testing.T) {
+				v := newTransactionVerifierWithJobGroups(2, 16, target, groups, nil)
+				defer v.closeAndWait()
+				var large []*solana.Transaction
+				for range 40 {
+					large = append(large, txs...)
+				}
+				r, err := v.submitTransactions(context.Background(), large)
+				require.NoError(t, err)
+				_, err = r.wait()
+				require.NoError(t, err)
 
-			// Corrupt a non-first signer after an oversized (nine-signature)
-			// transaction. Results must still map to the original tx index.
-			txs[6].Signatures[1][11] ^= 0x20
-			r, err = v.submitTransactions(context.Background(), txs)
-			require.NoError(t, err)
-			index, err := r.wait()
-			require.ErrorContains(t, err, "invalid signature")
-			require.Equal(t, 6, index)
-			txs[6].Signatures[1][11] ^= 0x20
-		})
+				// Corrupt a non-first signer after an oversized (nine-signature)
+				// transaction. Results must still map to the original tx index.
+				txs[6].Signatures[1][11] ^= 0x20
+				r, err = v.submitTransactions(context.Background(), large)
+				require.NoError(t, err)
+				index, err := r.wait()
+				require.ErrorContains(t, err, "invalid signature")
+				require.Equal(t, 6, index)
+				txs[6].Signatures[1][11] ^= 0x20
+			})
+		}
 	}
 }
