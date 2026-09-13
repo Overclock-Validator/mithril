@@ -1,7 +1,11 @@
 package costmodel
 
 import (
+	"fmt"
+
 	"github.com/Overclock-Validator/mithril/pkg/features"
+	"github.com/Overclock-Validator/mithril/pkg/safemath"
+	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -75,11 +79,53 @@ func DefaultLimits() Limits {
 	}
 }
 
-// LimitsForFeatures returns the cost limits selected by the bank's feature set.
+// LimitsForFeatures returns the legacy 400ms budgets. Live banks must use
+// LimitsForSlot to apply slot-time reductions at the correct epoch boundary.
 func LimitsForFeatures(feats *features.Features) Limits {
 	limits := DefaultLimits()
 	if feats != nil && feats.IsActive(features.RaiseBlockLimitsTo100m) {
 		limits.BlockCost = MaxBlockUnitsSIMD0286
+		limits.WritableAccountCost = 40_000_000
 	}
 	return limits
+}
+
+// LimitsForSlot mirrors Agave v4.3.0-rc.1 runtime/slot_params.rs. A slot-time
+// gate takes effect in the epoch after activation; among effective gates the
+// shortest duration wins, even if longer-duration gates activate later.
+func LimitsForSlot(feats *features.Features, schedule *sealevel.SysvarEpochSchedule, slot uint64) (Limits, error) {
+	limits := DefaultLimits()
+	for _, transition := range []struct {
+		gate                                  features.FeatureGate
+		account, block, data, shreds, entries uint64
+	}{
+		{features.ReduceSlotTimeTo350ms, 21_000_000, 52_500_000, 87_500_000, 28_672, 18_350_080},
+		{features.ReduceSlotTimeTo300ms, 18_000_000, 45_000_000, 75_000_000, 24_576, 15_728_640},
+		{features.ReduceSlotTimeTo250ms, 15_000_000, 37_500_000, 62_500_000, 20_480, 13_107_200},
+		{features.ReduceSlotTimeTo200ms, 12_000_000, 30_000_000, 50_000_000, 16_384, 10_485_760},
+	} {
+		if feats == nil {
+			break
+		}
+		activation, active := feats.ActivationSlot(transition.gate)
+		if !active {
+			continue
+		}
+		if schedule == nil || schedule.SlotsPerEpoch == 0 {
+			return Limits{}, fmt.Errorf("epoch schedule required for slot-time cost limits")
+		}
+		effective := schedule.FirstSlotInEpoch(safemath.SaturatingAddU64(schedule.GetEpoch(activation), 1))
+		if effective > slot {
+			continue
+		}
+		limits.WritableAccountCost = transition.account
+		limits.BlockCost = transition.block
+		limits.AllocatedDataSizeDelta = transition.data
+		limits.MaxEntryBytes = packEntryBytes(transition.shreds, transition.entries)
+	}
+	if feats != nil && feats.IsActive(features.RaiseBlockLimitsTo100m) {
+		limits.BlockCost = limits.BlockCost * 100 / 60
+		limits.WritableAccountCost = limits.WritableAccountCost * 100 / 60
+	}
+	return limits, nil
 }
