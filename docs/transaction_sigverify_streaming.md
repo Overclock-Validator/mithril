@@ -116,3 +116,7 @@ The subsequent [direct cache-comparison report](results/sigverify-direct-cache/2
 isolates the removal of redundant component-buffer construction at completion.
 The [completion follow-up report](results/completion-followup/2026-09-12-zen5/README.md)
 measures direct ordering, authenticated-root reuse, and the four-vector job policy.
+
+The [standalone PR review](results/streaming-pr-review/2026-09-13/README.md)
+records extraction onto current `alpenglow-dev`, the small shared component-boundary
+prerequisite, final allocation improvement, and the scope of the live trial.
