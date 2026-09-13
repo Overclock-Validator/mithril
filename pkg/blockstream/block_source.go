@@ -288,6 +288,9 @@ type BlockSource struct {
 	// under reorderMu before selection is published; invalid-block quarantine
 	// raises its gate, crosses reorderMu, then waits before its final drain.
 	replayEmissionWg sync.WaitGroup
+	// Certificate correction can wake replay while Start is shutting down.
+	// Keep its channel drains/wake send serialized with terminal channel close.
+	certifiedRewindMu sync.Mutex
 	// Test-only scheduling hook, deliberately invoked after reorderMu is
 	// released and before streamChan send.
 	beforeReplayBlockSend func(*b.Block)
@@ -1315,11 +1318,10 @@ func (bs *BlockSource) shouldDiscardLiveStreamResult(slot uint64, generation uin
 
 // applyAlpenglowCertifiedSkipLocked marks the waiting slot skipped when the
 // consensus decision source certifies it skipped — in ANY block-source mode
-// (RPC catchup / pre-handoff included). A certified skip is a consensus fact,
-// so applying it early is always safe; it keeps a certified-skipped slot from
-// being re-fetched/re-run and makes the skip decision survive block-source
-// recreation on a post-switch re-replay. The emit loop then advances the
-// frontier for the marked skip mode-independently. Returns true if it newly
+// (RPC catchup / pre-handoff included). A skip certificate permits omission;
+// finalized ancestry may later select a block at the same slot. Replay must
+// then rewind that provisional skip and repair the selected block. The emit
+// loop advances the marked skip mode-independently. Returns true if it newly
 // marked the slot.
 func (bs *BlockSource) applyAlpenglowCertifiedSkipLocked() bool {
 	if bs.alpenglowDecisionSource == nil {
@@ -1351,9 +1353,8 @@ func (bs *BlockSource) applyAlpenglowDecisionLocked() bool {
 	if bs.alpenglowDecisionSource == nil || bs.sourceType != BlockSourceTurbine || !bs.turbineAlpenglowBlockIDHints {
 		return false
 	}
-	// Certified skips are consensus facts — apply them regardless of mode so a
-	// certified-skipped slot is never re-run and the decision survives source
-	// recreation. The marked skip advances via the normal emit path.
+	// Apply the current skip decision regardless of mode. Finalized ancestry
+	// can supersede it with a block decision, including during repair catchup.
 	if bs.applyAlpenglowCertifiedSkipLocked() {
 		return false
 	}
@@ -1387,12 +1388,23 @@ func (bs *BlockSource) applyAlpenglowDecisionLocked() bool {
 		// active near-tip mode and when no candidate is buffered yet, so the
 		// next repaired/spooled copy is admitted instead of rejected forever.
 		bs.SetKnownAlpenglowBlockID(waitingSlot, decision.Block.Hash)
+		if bs.skippedSlots[waitingSlot] {
+			delete(bs.skippedSlots, waitingSlot)
+			delete(bs.liveSynthesizedSkips, waitingSlot)
+			delete(bs.alpenglowCertifiedSkips, waitingSlot)
+			// The old skip's done marker must not reject the repaired block as
+			// a duplicate. This also applies outside the near-tip steering gate.
+			bs.slotStateMu.Lock()
+			delete(bs.slotState, waitingSlot)
+			delete(bs.inflightStart, waitingSlot)
+			bs.slotStateMu.Unlock()
+			bs.clearSlotErrors(waitingSlot)
+			bs.resetTurbineSlotForAlpenglowBlock(waitingSlot, decision.Block.Hash)
+		}
 	}
-	// Buffered-candidate steering otherwise needs active near-tip Turbine.
-	if !bs.liveStreamActive.Load() || !bs.isNearTip.Load() {
-		return false
-	}
-
+	// Exact decisive identities also steer buffered candidates during catchup.
+	// Holding a wrong sibling here would prevent the next block from arriving
+	// and leave replay unable to advance after its certificate rewind.
 	switch decision.Kind {
 	case alpenglow.ChainDecisionKindSkip:
 		if !bs.skippedSlots[waitingSlot] {
@@ -1410,11 +1422,6 @@ func (bs *BlockSource) applyAlpenglowDecisionLocked() bool {
 		}
 		return false
 	case alpenglow.ChainDecisionKindBlock:
-		if bs.skippedSlots[waitingSlot] {
-			delete(bs.skippedSlots, waitingSlot)
-			delete(bs.liveSynthesizedSkips, waitingSlot)
-			delete(bs.alpenglowCertifiedSkips, waitingSlot)
-		}
 		blk := bs.reorderBuffer[waitingSlot]
 		if blk == nil || !blk.HasAlpenglowBlockID {
 			return false
@@ -2027,15 +2034,42 @@ func (bs *BlockSource) RewindForAlpenglowSwitch(slot uint64, certified solana.Ha
 	if slot == 0 {
 		return
 	}
+	bs.certifiedRewindMu.Lock()
+	defer bs.certifiedRewindMu.Unlock()
+	if bs.stopped.Load() {
+		return
+	}
+	// Replay serializes certificate rewinds and invalid-block quarantine. Use
+	// the same emission barrier so a send already outside reorderMu cannot
+	// advance the restored frontier or leak an obsolete skip after this rewind.
+	bs.alpenglowQuarantineFrom.Store(slot)
+	resetSlots := map[uint64]struct{}{slot: {}}
+	bs.reorderMu.Lock()
+	if certified != (solana.Hash{}) {
+		bs.SetKnownAlpenglowBlockID(slot, certified)
+	}
+	bs.invalidateLiveStreamResults()
+	bs.reorderMu.Unlock()
+	for _, drained := range bs.drainEmittedAlpenglowSuffix(slot) {
+		resetSlots[drained] = struct{}{}
+	}
+	bs.replayEmissionWg.Wait()
+
 	bs.reorderMu.Lock()
 	if bs.nextSlotToSend > slot {
 		bs.nextSlotToSend = slot
+	}
+	for emittedSlot := range bs.emittedAlpenglowBlockIDs {
+		if emittedSlot >= slot {
+			resetSlots[emittedSlot] = struct{}{}
+		}
 	}
 	bs.rejectAlpenglowEmissionSuffixLocked(slot)
 	bs.rewindAlpenglowEmissionAnchorLocked(slot)
 	for bufferedSlot := range bs.reorderBuffer {
 		if bufferedSlot >= slot {
 			delete(bs.reorderBuffer, bufferedSlot)
+			resetSlots[bufferedSlot] = struct{}{}
 		}
 	}
 	for skippedSlot := range bs.skippedSlots {
@@ -2045,13 +2079,35 @@ func (bs *BlockSource) RewindForAlpenglowSwitch(slot uint64, certified solana.Ha
 			delete(bs.alpenglowCertifiedSkips, skippedSlot)
 		}
 	}
+	bs.pendingAlpenglowParentSwitch = nil
 	bs.reorderMu.Unlock()
+	bs.drainAlpenglowParentSwitchNotifications()
+	for _, drained := range bs.drainEmittedAlpenglowSuffix(slot) {
+		resetSlots[drained] = struct{}{}
+	}
+
+	bs.liveStagingMu.Lock()
+	for stagedSlot := range bs.liveStagingBuffer {
+		if stagedSlot >= slot {
+			delete(bs.liveStagingBuffer, stagedSlot)
+			resetSlots[stagedSlot] = struct{}{}
+		}
+	}
+	kept := bs.liveStagingOrder[:0]
+	for _, stagedSlot := range bs.liveStagingOrder {
+		if stagedSlot < slot {
+			kept = append(kept, stagedSlot)
+		}
+	}
+	bs.liveStagingOrder = kept
+	bs.liveStagingMu.Unlock()
 
 	bs.slotStateMu.Lock()
 	for trackedSlot := range bs.slotState {
 		if trackedSlot >= slot {
 			delete(bs.slotState, trackedSlot)
 			delete(bs.inflightStart, trackedSlot)
+			resetSlots[trackedSlot] = struct{}{}
 		}
 	}
 	bs.slotStateMu.Unlock()
@@ -2068,13 +2124,37 @@ func (bs *BlockSource) RewindForAlpenglowSwitch(slot uint64, certified solana.Ha
 	}
 	bs.retryMu.Unlock()
 
-	// Drop prefetched live-stream blocks for the rewound range and invalidate
-	// in-flight results so stale emissions can't race the re-serve.
-	bs.invalidateLiveStreamResults()
+	// A catchup handoff may have been armed AFTER the now-superseded skip.
+	// Lower its admission gates too, or the repaired parent is silently dropped
+	// for being below the old handoff while its completed marker stays set.
+	for _, frontier := range []*atomic.Uint64{&bs.liveHandoffSlot, &bs.repairCatchupFrom} {
+		for old := frontier.Load(); old > slot; old = frontier.Load() {
+			if frontier.CompareAndSwap(old, slot) {
+				break
+			}
+		}
+	}
+	bs.alpenglowMu.Lock()
+	receiver := bs.activeTurbineReceiver
+	bs.alpenglowMu.Unlock()
+	if receiver != nil && bs.repairCatchupActive() {
+		receiver.SetRetentionFloor(slot)
+		receiver.SetHydrationWindow(slot, slot+repairCatchupLiveDeliverWindow)
+	}
+	for resetSlot := range resetSlots {
+		bs.clearSlotErrors(resetSlot)
+		bs.clearLiveRepairSlot(resetSlot)
+		bs.resetTurbineSlotState(resetSlot)
+	}
 
 	if certified != (solana.Hash{}) {
-		bs.SetKnownAlpenglowBlockID(slot, certified)
 		bs.resetTurbineSlotForAlpenglowBlock(slot, certified)
+	}
+	bs.alpenglowQuarantineFrom.Store(0)
+	bs.lastProgress.Store(time.Now().Unix())
+	select {
+	case bs.resultQueue <- fetchResult{wakeEmitter: true}:
+	default:
 	}
 	mlog.Log.Warnf("BLOCK SOURCE REWIND: re-serving slot %d after certificate switch (certified=%s)", slot, certified)
 }
@@ -3604,9 +3684,11 @@ func (bs *BlockSource) Start() {
 	bs.liveStreamWg.Wait()
 	bs.backgroundWg.Wait()
 	localBlocksWg.Wait()
+	bs.certifiedRewindMu.Lock()
 	close(bs.resultQueue)
 	<-emitterDone
 	close(bs.streamChan)
+	bs.certifiedRewindMu.Unlock()
 }
 
 // Stop asks every component owned by this block source to exit. Callers that

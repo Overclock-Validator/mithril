@@ -1,9 +1,13 @@
 package replay
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/alpenglow"
+	b "github.com/Overclock-Validator/mithril/pkg/block"
+	"github.com/Overclock-Validator/mithril/pkg/blockstream"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -206,4 +210,124 @@ func TestSweepGatingAndBounds(t *testing.T) {
 func TestSweepNilSweeper(t *testing.T) {
 	var s *alpenglowSwitchSweeper
 	assert.Nil(t, s.sweep(map[uint64]solana.Hash{1: swHash(1)}, 0, 1))
+}
+
+func TestSweepNewlyConsumedSkipRechecksUnchangedDecision(t *testing.T) {
+	q := &fakeChainQuery{
+		certified: map[uint64]alpenglow.BlockID{101: {Slot: 101, Hash: swHash(1)}},
+		version:   1,
+	}
+	s := newTestSweeper(q)
+	executed := map[uint64]solana.Hash{100: swHash(100)}
+	require.Nil(t, s.sweep(executed, 99, 100))
+
+	// A skip already queued by the source can be consumed after the same
+	// certificate was checked. Advancing the consumed frontier must recheck it.
+	executed[101] = solana.Hash{}
+	sw := s.sweep(executed, 99, 101)
+	require.NotNil(t, sw)
+	require.Equal(t, uint64(101), sw.Slot)
+	require.True(t, sw.Executed.IsZero())
+	require.Equal(t, swHash(1), sw.Certified)
+}
+
+func TestWaitForAlpenglowReplayInputRepairsSkippedParentWhileChildHeld(t *testing.T) {
+	tracker := alpenglow.NewChainTracker()
+	parent := alpenglow.BlockID{Slot: 2795461, Hash: swHash(61)}
+	child := alpenglow.BlockID{Slot: 2795464, Hash: swHash(64)}
+	for slot := uint64(2795461); slot <= 2795463; slot++ {
+		_, err := tracker.ObserveCertificate(alpenglow.Certificate{
+			Type: alpenglow.CertificateSkip, Slot: slot, SignatureVerified: true,
+		})
+		require.NoError(t, err)
+	}
+	tracker.ObserveReplayBlock(alpenglow.ReplayBlockObservation{
+		Block: child, ParentSlot: parent.Slot, ParentHash: parent.Hash,
+	})
+	executed := map[uint64]solana.Hash{
+		2795460: swHash(60), 2795461: {}, 2795462: {}, 2795463: {},
+	}
+	s := &alpenglowSwitchSweeper{query: &trackerChainQuery{ChainTracker: tracker}}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	waiting := make(chan struct{}, 1)
+	returned := make(chan *CertifiedSwitch, 1)
+	go func() {
+		_, _, sw := waitForAlpenglowReplayInput(ctx,
+			func(waitCtx context.Context) (*b.Block, *blockstream.AlpenglowParentSwitch) {
+				select {
+				case waiting <- struct{}{}:
+				default:
+				}
+				// The ordered emitter holds child until its missing parent has
+				// replayed. No block delivery wakes this call.
+				<-waitCtx.Done()
+				return nil, nil
+			},
+			func() *CertifiedSwitch { return s.sweep(executed, 2795459, 2795463) },
+			5*time.Millisecond)
+		returned <- sw
+	}()
+	select {
+	case <-waiting:
+	case <-ctx.Done():
+		t.Fatal("replay did not start waiting")
+	}
+	_, err := tracker.ObserveCertificate(alpenglow.Certificate{
+		Type: alpenglow.CertificateFinalizeFast, Slot: child.Slot, BlockHash: child.Hash, SignatureVerified: true,
+	})
+	require.NoError(t, err)
+	require.NoError(t, tracker.ObserveFinalized(child, alpenglow.CertificateFinalizeFast))
+
+	select {
+	case sw := <-returned:
+		require.NotNil(t, sw, "certificate correction must wake replay before another block arrives")
+		require.Equal(t, parent.Slot, sw.Slot)
+		require.Equal(t, parent.Hash, sw.Certified)
+		require.True(t, sw.Executed.IsZero())
+		require.False(t, parentSwitchNeedsStateUnwind(sw.Slot, 2795460), "the skipped suffix has no account state to unwind")
+	case <-ctx.Done():
+		t.Fatal("certificate-selected skipped parent left replay stalled")
+	}
+}
+
+func TestWaitForAlpenglowReplayInputPreservesSourceResults(t *testing.T) {
+	block := &b.Block{Slot: 101}
+	parentSwitch := &blockstream.AlpenglowParentSwitch{SwitchSlot: 101}
+	for _, tc := range []struct {
+		name         string
+		block        *b.Block
+		parentSwitch *blockstream.AlpenglowParentSwitch
+	}{
+		{name: "block", block: block},
+		{name: "parent switch", parentSwitch: parentSwitch},
+		{name: "closed source"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			gotBlock, gotParent, gotCertified := waitForAlpenglowReplayInput(context.Background(),
+				func(context.Context) (*b.Block, *blockstream.AlpenglowParentSwitch) {
+					calls++
+					return tc.block, tc.parentSwitch
+				}, func() *CertifiedSwitch { return nil }, time.Second)
+			require.Same(t, tc.block, gotBlock)
+			require.Same(t, tc.parentSwitch, gotParent)
+			require.Nil(t, gotCertified)
+			require.Equal(t, 1, calls)
+		})
+	}
+}
+
+func TestWaitForAlpenglowReplayInputHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	block, parentSwitch, certifiedSwitch := waitForAlpenglowReplayInput(ctx,
+		func(waitCtx context.Context) (*b.Block, *blockstream.AlpenglowParentSwitch) {
+			cancel()
+			<-waitCtx.Done()
+			return nil, nil
+		}, func() *CertifiedSwitch { return nil }, time.Second)
+	require.Nil(t, block)
+	require.Nil(t, parentSwitch)
+	require.Nil(t, certifiedSwitch)
 }

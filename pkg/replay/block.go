@@ -2434,6 +2434,21 @@ func ReplayBlocks(
 			mlog.Log.Warnf("%v — block source rejected the fork rewind", sw)
 			return false
 		}
+		if !parentSwitchNeedsStateUnwind(sw.Slot, currentExecutedAnchorSlot()) {
+			// Trailing skips advance replay's consumed frontier without creating
+			// account-state layers. Finalized ancestry can later require a block
+			// in that range; re-open its source slot and retain the executed bank.
+			for slot := range alpenglowExecutedBlockIDs {
+				if slot >= sw.Slot {
+					delete(alpenglowExecutedBlockIDs, slot)
+				}
+			}
+			replayFrontier = sw.Slot - 1
+			blockStream.SetLastExecutedSlot(replayFrontier)
+			global.SetReplayFrontier(replayFrontier)
+			mlog.Log.Warnf("%v — re-serving the skipped suffix from slot %d; executed bank remains at slot %d", sw, sw.Slot, currentExecutedAnchorSlot())
+			return true
+		}
 		rs, parentBankSysvars, fallbackReason := tryInLoopUnwind(sw, unrootedTailState, mithrilState, epochSchedule, currentEpoch, partitionedRewardsInfo)
 		if rs == nil {
 			windowSwitchFallback++
@@ -2466,11 +2481,18 @@ func ReplayBlocks(
 			global.SetTransactionCount(*rs.TransactionCount) // drop the discarded fork's txs
 		}
 		blockStream.SetLastExecutedSlot(rs.ParentSlot)
+		replayFrontier = rs.ParentSlot
 		global.SetReplayFrontier(rs.ParentSlot)
 		ResetChainTip()
 		windowSwitchInRAM++
 		mlog.Log.Warnf("%v — unwound in RAM to executed parent slot %d; re-executing the selected chain (in-RAM switches this window: %d)", sw, rs.ParentSlot, windowSwitchInRAM)
 		return true
+	}
+	var sweepWhileWaiting func() *CertifiedSwitch
+	if unrootedTailState != nil && switchSweeper != nil {
+		sweepWhileWaiting = func() *CertifiedSwitch {
+			return switchSweeper.sweep(alpenglowExecutedBlockIDs, mithrilState.LastRootedSlot, replayFrontier)
+		}
 	}
 
 	for {
@@ -2485,11 +2507,12 @@ func ReplayBlocks(
 		}
 
 		var (
-			block          *b.Block
-			parentSwitch   *blockstream.AlpenglowParentSwitch
-			ingressTimings *b.TurbineIngressTimings
-			waitTime       time.Duration
-			neededAt       time.Time // when replay asked the source for this slot
+			block           *b.Block
+			parentSwitch    *blockstream.AlpenglowParentSwitch
+			certifiedSwitch *CertifiedSwitch
+			ingressTimings  *b.TurbineIngressTimings
+			waitTime        time.Duration
+			neededAt        time.Time // when replay asked the source for this slot
 		)
 
 		{
@@ -2523,7 +2546,8 @@ func ReplayBlocks(
 			}
 
 			neededAt = time.Now()
-			block, parentSwitch = blockStream.NextBlockOrAlpenglowParentSwitch(ctx)
+			block, parentSwitch, certifiedSwitch = waitForAlpenglowReplayInput(ctx,
+				blockStream.NextBlockOrAlpenglowParentSwitch, sweepWhileWaiting, alpenglowSwitchPollInterval)
 			if ingress, ok := block.CompleteTurbineReplayAdmission(time.Now()); ok {
 				_ = statsd.Duration(statsd.TurbineReplayAdmission, ingress.ReplayAdmission, nil)
 				ingressTimings = &ingress
@@ -2537,6 +2561,15 @@ func ReplayBlocks(
 			if ctx.Err() != nil {
 				mlog.Log.Infof("context cancelled while waiting for the next block: %v", ctx.Err())
 				result.WasCancelled = true
+				break
+			}
+			if certifiedSwitch != nil {
+				if handleAlpenglowSwitch(certifiedSwitch, func() bool {
+					blockStream.RewindForAlpenglowSwitch(certifiedSwitch.Slot, certifiedSwitch.Certified)
+					return true
+				}) {
+					continue
+				}
 				break
 			}
 
@@ -2695,7 +2728,7 @@ func ReplayBlocks(
 			// recovery loop re-replays from the rooted checkpoint (repair
 			// re-fetches the certified version either way).
 			if unrootedTailState != nil {
-				if sw := switchSweeper.sweep(alpenglowExecutedBlockIDs, mithrilState.LastRootedSlot, currentExecutedAnchorSlot()); sw != nil {
+				if sw := switchSweeper.sweep(alpenglowExecutedBlockIDs, mithrilState.LastRootedSlot, replayFrontier); sw != nil {
 					if handleAlpenglowSwitch(sw, func() bool {
 						blockStream.RewindForAlpenglowSwitch(sw.Slot, sw.Certified)
 						return true
@@ -2778,6 +2811,7 @@ func ReplayBlocks(
 			// A resolved skip still advances replay progress for near-tip mode and
 			// consensus-managed Lightbringer delivery.
 			blockStream.SetLastExecutedSlot(block.Slot)
+			replayFrontier = block.Slot
 			global.SetReplayFrontier(block.Slot)
 			continue // Skip all execution - no state changes for skipped slots
 		}
@@ -3252,6 +3286,7 @@ func ReplayBlocks(
 
 		// Track last executed slot for accurate tip distance calculation and mode switching
 		blockStream.SetLastExecutedSlot(block.Slot)
+		replayFrontier = block.Slot
 		global.SetReplayFrontier(block.Slot)
 
 		if !justCrossedEpochBoundary {
