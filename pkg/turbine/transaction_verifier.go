@@ -17,9 +17,14 @@ var (
 	errTransactionVerifierClosed = fmt.Errorf("transaction verifier closed")
 )
 
+// Four vector groups amortize dispatch for large ready requests while bounding
+// the work that can precede another component on a worker.
+const defaultTransactionJobGroups = 4
+
 // A job is formed before admission, from transactions which are already
 // available. Workers never wait for more transactions to fill a vector group.
 type transactionVerifyJob struct {
+	ctx   context.Context
 	txs   []*solana.Transaction
 	errs  []error
 	start int
@@ -65,7 +70,8 @@ type transactionVerifier struct {
 	verify      func(*solana.Transaction) error
 	workers     int
 	batchTarget int
-	// Each accepted request owns at most workers outstanding groups. The
+	jobGroups   int
+	// Each accepted request owns at most workers outstanding jobs. The
 	// admission semaphore also bounds asynchronous request goroutines; callers
 	// apply backpressure before handing off another decoded component.
 	requests chan struct{}
@@ -81,19 +87,28 @@ func newTransactionVerifier(workers, queueDepth int, verify func(*solana.Transac
 	return newTransactionVerifierWithBatchTarget(workers, queueDepth, sigverify.BatchTarget, verify)
 }
 
-// queueDepth is a transaction budget, rounded up to whole groups. batchTarget
+// queueDepth is a transaction budget, rounded up to whole jobs. batchTarget
 // counts signature lanes: multi-signature transactions stay indivisible and
 // may exceed the target. Four/eight targets can be compared without changing
 // the admission or cancellation policy.
 func newTransactionVerifierWithBatchTarget(workers, queueDepth, batchTarget int, verify func(*solana.Transaction) error) *transactionVerifier {
+	return newTransactionVerifierWithJobGroups(workers, queueDepth, batchTarget, defaultTransactionJobGroups, verify)
+}
+
+// Job groups amortize dispatch over already available vector groups. They do
+// not change vector width or wait for future transactions to arrive.
+func newTransactionVerifierWithJobGroups(workers, queueDepth, batchTarget, jobGroups int, verify func(*solana.Transaction) error) *transactionVerifier {
 	workers = max(1, workers)
 	batchTarget = max(1, min(batchTarget, sigverify.BatchTarget))
-	queueGroups := max(1, (queueDepth+batchTarget-1)/batchTarget)
+	jobGroups = max(1, min(jobGroups, 8))
+	jobCapacity := batchTarget * jobGroups
+	queueGroups := max(1, (queueDepth+jobCapacity-1)/jobCapacity)
 	v := &transactionVerifier{
 		jobs:        make(chan *transactionVerifyJob, queueGroups),
 		verify:      verify,
 		workers:     workers,
 		batchTarget: batchTarget,
+		jobGroups:   jobGroups,
 		requests:    make(chan struct{}, 2*workers),
 		stopped:     make(chan struct{}),
 	}
@@ -114,17 +129,30 @@ func newTransactionVerifierWithBatchTarget(workers, queueDepth, batchTarget int,
 // request's bounded completion channel always has room for every pending job.
 func (v *transactionVerifier) verifyGroup(job *transactionVerifyJob, batch *txverify.BatchVerifier) {
 	defer func() { job.done <- job }()
-	if v.verify != nil {
-		for i, tx := range job.txs {
-			if tx == nil {
-				job.errs[i] = errNilTransaction
-			} else {
-				job.errs[i] = verifyTransactionSafely(v.verify, tx)
+	for start := 0; start < len(job.txs); {
+		// An admitted job always finishes its first vector group, preserving
+		// ownership/join semantics. Cancellation can skip additional groups.
+		if err := job.ctx.Err(); start > 0 && err != nil {
+			for i := start; i < len(job.errs); i++ {
+				job.errs[i] = err
 			}
+			return
 		}
-		return
+		end := transactionVerifyGroupEnd(job.txs, start, v.batchTarget)
+		if v.verify != nil {
+			for i := start; i < end; i++ {
+				tx := job.txs[i]
+				if tx == nil {
+					job.errs[i] = errNilTransaction
+				} else {
+					job.errs[i] = verifyTransactionSafely(v.verify, tx)
+				}
+			}
+		} else {
+			verifyBatchSafely(batch, job.txs[start:end], job.errs[start:end])
+		}
+		start = end
 	}
-	verifyBatchSafely(batch, job.txs, job.errs)
 }
 
 // submitTransactions admits one immutable decoded component or complete block.
@@ -168,20 +196,28 @@ func (v *transactionVerifier) submitTransactions(ctx context.Context, txs []*sol
 }
 
 // verifyTransactions keeps a rolling window instead of waiting for an entire
-// worker wave. A slow group cannot idle workers whose earlier groups finished.
-// One caller can queue at most workers groups, so a large catch-up block cannot
+// worker wave. A slow job cannot idle workers whose earlier jobs finished.
+// One caller can queue at most workers jobs, so a large catch-up block cannot
 // put all its transactions ahead of a newly available component.
 func (v *transactionVerifier) verifyTransactions(ctx context.Context, txs []*solana.Transaction) (int, error) {
 	if len(txs) == 0 {
 		return -1, ctx.Err()
 	}
 	window := min(v.workers, len(txs))
+	jobGroups := v.jobGroups
+	// Keep short components responsive and enough independent jobs to supply
+	// every worker. This is a ready-work threshold, never a batching timer.
+	if len(txs) < 2*v.workers*v.batchTarget*jobGroups {
+		jobGroups = 1
+	}
+	jobCapacity := v.batchTarget * jobGroups
 	completed := make(chan *transactionVerifyJob, window)
 	groups := make([]transactionVerifyJob, window)
-	errs := make([]error, window*v.batchTarget)
+	errs := make([]error, window*jobCapacity)
 	free := make([]*transactionVerifyJob, window)
 	for i := range groups {
-		groups[i].errs = errs[i*v.batchTarget : (i+1)*v.batchTarget]
+		groups[i].ctx = ctx
+		groups[i].errs = errs[i*jobCapacity : (i+1)*jobCapacity]
 		groups[i].done = completed
 		free[i] = &groups[i]
 	}
@@ -203,7 +239,10 @@ func (v *transactionVerifier) verifyTransactions(ctx context.Context, txs []*sol
 		if !stopped && pending == nil && nextIndex < len(txs) && len(free) > 0 {
 			pending = free[len(free)-1]
 			free = free[:len(free)-1]
-			end := transactionVerifyGroupEnd(txs, nextIndex, v.batchTarget)
+			end := nextIndex
+			for group := 0; group < jobGroups && end < len(txs); group++ {
+				end = transactionVerifyGroupEnd(txs, end, v.batchTarget)
+			}
 			pending.start = nextIndex
 			pending.txs = txs[nextIndex:end]
 			pending.errs = pending.errs[:end-nextIndex]
