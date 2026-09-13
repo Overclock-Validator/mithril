@@ -187,7 +187,13 @@ func (p *entryPrefetchPool) run() {
 }
 
 func entryBatchTransactions(entries []Entry) []*solana.Transaction {
-	var txs []*solana.Transaction
+	count := 0
+	for i := range entries {
+		count += len(entries[i].Txns)
+	}
+	// Entries are already decoded: size this pointer view once instead of
+	// repeatedly reallocating and copying it while preparing each component.
+	txs := make([]*solana.Transaction, 0, count)
 	for i := range entries {
 		for j := range entries[i].Txns {
 			txs = append(txs, &entries[i].Txns[j])
