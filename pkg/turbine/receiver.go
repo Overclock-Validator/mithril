@@ -703,6 +703,7 @@ func (r *UDPReceiver) processPacket(ctx context.Context, conn *net.UDPConn, pack
 		r.codingShreds.Add(1)
 	}
 	var leader solana.PublicKey
+	var authenticatedRoot *solana.Hash
 	if r.leaderForSlot != nil {
 		var ok bool
 		leader, ok = r.leaderForSlot(shred.Slot)
@@ -714,7 +715,8 @@ func (r *UDPReceiver) processPacket(ctx context.Context, conn *net.UDPConn, pack
 			}
 			return true
 		}
-		if err := r.sigCache.verifyShred(shred, leader); err != nil {
+		root, err := r.sigCache.verifyShredRoot(shred, leader)
+		if err != nil {
 			r.signatureErrors.Add(1)
 			select {
 			case r.errs <- err:
@@ -722,6 +724,7 @@ func (r *UDPReceiver) processPacket(ctx context.Context, conn *net.UDPConn, pack
 			}
 			return true
 		}
+		authenticatedRoot = &root
 	}
 	matchedRepair := false
 	if onRepairSocket && r.repairClient != nil {
@@ -773,7 +776,7 @@ func (r *UDPReceiver) processPacket(ctx context.Context, conn *net.UDPConn, pack
 			return true
 		}
 	}
-	work, err := r.assembler.addShredFrom(shred, matchedRepair)
+	work, err := r.assembler.addShredFromWithRoot(shred, matchedRepair, authenticatedRoot)
 	r.slotResetMu.RUnlock()
 	if err != nil {
 		if errors.Is(err, ErrDuplicateShred) {

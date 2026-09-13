@@ -131,7 +131,12 @@ func decodeEntriesAndAlpenglowMarkersFromDataShreds(shreds []*Shred, timings *en
 	sort.Slice(shreds, func(i, j int) bool {
 		return shreds[i].Index < shreds[j].Index
 	})
+	return decodeEntriesFromOrderedDataShreds(shreds, timings)
+}
 
+// decodeEntriesFromOrderedDataShreds requires increasing shred indexes. The
+// assembler supplies that order directly; public decoding still sorts input.
+func decodeEntriesFromOrderedDataShreds(shreds []*Shred, timings *entryDecodeTimings) ([]Entry, *AlpenglowParentInfo, *BlockFooter, error) {
 	var entryBatches []*prefetchedShredBatch
 	var parentInfo *AlpenglowParentInfo
 	var blockFooter *BlockFooter
