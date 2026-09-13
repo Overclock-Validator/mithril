@@ -1,0 +1,35 @@
+{
+  "stage": "window-fill",
+  "finalized_load_transactions": 152831,
+  "not_included_after_expiry": 47169,
+  "blocks": [
+    {
+      "slot": 3077076,
+      "transactions": 26687,
+      "load_transactions": 26687,
+      "cost_units": 27434236,
+      "failed_transactions": 0
+    },
+    {
+      "slot": 3077077,
+      "transactions": 42150,
+      "load_transactions": 42150,
+      "cost_units": 43330200,
+      "failed_transactions": 0
+    },
+    {
+      "slot": 3077078,
+      "transactions": 41387,
+      "load_transactions": 41387,
+      "cost_units": 42545836,
+      "failed_transactions": 0
+    },
+    {
+      "slot": 3077079,
+      "transactions": 42607,
+      "load_transactions": 42607,
+      "cost_units": 43799996,
+      "failed_transactions": 0
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "end_slot": 3077062,
+  "end_utc": "2026-09-13T06:57:13.621742904Z",
+  "first_error": "",
+  "not_sent": 0,
+  "send_errors": 0,
+  "send_seconds": 1.333626813,
+  "sent": 200000,
+  "start_utc": "2026-09-13T06:57:12.288116091Z",
+  "target_window": 3077076
+}
