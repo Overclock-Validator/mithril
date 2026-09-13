@@ -15,8 +15,18 @@ func (t *Timing) AddTiming(d time.Duration) {
 	atomic.AddUint64(&t.SumNanoseconds, uint64(d.Nanoseconds()))
 }
 
+// StartTiming avoids reading the clock when a caller does not record timings.
+func StartTiming(enabled bool) time.Time {
+	if enabled {
+		return time.Now()
+	}
+	return time.Time{}
+}
+
 func (t *Timing) AddTimingSince(start time.Time) {
-	t.AddTiming(time.Since(start))
+	if !start.IsZero() {
+		t.AddTiming(time.Since(start))
+	}
 }
 
 // AccountLoader is the per-slot decomposition of LoadBlockAccounts. Counters
