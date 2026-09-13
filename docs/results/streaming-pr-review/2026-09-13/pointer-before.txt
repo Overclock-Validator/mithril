@@ -1,0 +1,18 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/Overclock-Validator/mithril/pkg/turbine
+cpu: Apple M4 Pro
+BenchmarkEntryBatchTransactions/tx_4-12         	 5438229	        44.07 ns/op	      56 B/op	       3 allocs/op
+BenchmarkEntryBatchTransactions/tx_4-12         	 5468454	        44.47 ns/op	      56 B/op	       3 allocs/op
+BenchmarkEntryBatchTransactions/tx_4-12         	 5464107	        43.92 ns/op	      56 B/op	       3 allocs/op
+BenchmarkEntryBatchTransactions/tx_49-12        	  938340	       278.3 ns/op	    1016 B/op	       7 allocs/op
+BenchmarkEntryBatchTransactions/tx_49-12        	  866556	       282.0 ns/op	    1016 B/op	       7 allocs/op
+BenchmarkEntryBatchTransactions/tx_49-12        	  867691	       277.3 ns/op	    1016 B/op	       7 allocs/op
+BenchmarkEntryBatchTransactions/tx_269-12       	  243710	       969.2 ns/op	    4472 B/op	       9 allocs/op
+BenchmarkEntryBatchTransactions/tx_269-12       	  239790	       974.8 ns/op	    4472 B/op	       9 allocs/op
+BenchmarkEntryBatchTransactions/tx_269-12       	  251006	       977.0 ns/op	    4472 B/op	       9 allocs/op
+BenchmarkEntryBatchTransactions/tx_33760-12     	    1576	    145701 ns/op	 1301628 B/op	      23 allocs/op
+BenchmarkEntryBatchTransactions/tx_33760-12     	    1692	    145071 ns/op	 1301624 B/op	      23 allocs/op
+BenchmarkEntryBatchTransactions/tx_33760-12     	    1538	    148765 ns/op	 1301624 B/op	      23 allocs/op
+PASS
+ok  	github.com/Overclock-Validator/mithril/pkg/turbine	3.467s
