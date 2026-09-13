@@ -1,9 +1,13 @@
 package replay
 
 import (
+	"context"
 	"fmt"
 	"sync/atomic"
+	"time"
 
+	b "github.com/Overclock-Validator/mithril/pkg/block"
+	"github.com/Overclock-Validator/mithril/pkg/blockstream"
 	consensusengine "github.com/Overclock-Validator/mithril/pkg/consensus"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/rewards"
@@ -39,9 +43,9 @@ func markVoteStakeDirty(slot uint64) {
 func resetVoteStakeDirty() { voteStakeDirtySlot.Store(0) }
 
 // parentSwitchNeedsStateUnwind distinguishes an already-executed divergence
-// from a fork that repair discovered ahead of replay. The latter only needs a
-// block-source branch replacement; replay's account state is still on the
-// common ancestor.
+// from a fork discovered ahead of the executed bank, including a certificate
+// selecting a previously skipped parent. The latter only needs a block-source
+// branch replacement; replay's account state is still on the common ancestor.
 func parentSwitchNeedsStateUnwind(switchSlot, executedAnchor uint64) bool {
 	return switchSlot <= executedAnchor
 }
@@ -88,13 +92,14 @@ func (e *CertifiedSwitch) Error() string {
 	return fmt.Sprintf("alpenglow switch: slot %d executed block %s but certificates name %s", e.Slot, e.Executed, e.Certified)
 }
 
-// alpenglowSwitchSweeper rate-gates the sweep on decision-version changes (cert
-// arrivals AND replay-derived decisiveness — parent links, finalized ancestry,
-// indirect skips, conflicts), so a contradiction that arises without a new
-// certificate is not skipped.
+// alpenglowSwitchSweeper rate-gates the sweep on decision-version and replay
+// frontier changes. Both newly decisive ancestry and a queued skip consumed
+// after its overriding certificate must trigger correction.
 type alpenglowSwitchSweeper struct {
 	query            consensusengine.AlpenglowChainQuery
 	lastDecisionSeen uint64
+	lastReplayTip    uint64
+	lastRooted       uint64
 }
 
 func newAlpenglowSwitchSweeper(engine consensusengine.Engine) *alpenglowSwitchSweeper {
@@ -105,18 +110,20 @@ func newAlpenglowSwitchSweeper(engine consensusengine.Engine) *alpenglowSwitchSw
 	return &alpenglowSwitchSweeper{query: q}
 }
 
-// sweep walks executed identities in (lastRooted, tip] and returns the first
-// contradiction with a decisive certificate. Cheap: no-ops unless the
-// tracker accepted new certificates since the last sweep.
+// sweep walks consumed block/skip outcomes in (lastRooted, tip] and returns
+// the first contradiction with a decisive certificate. tip includes trailing
+// skips even when the executed bank remains at an earlier slot.
 func (s *alpenglowSwitchSweeper) sweep(executed map[uint64]solana.Hash, lastRooted, tip uint64) *CertifiedSwitch {
 	if s == nil || len(executed) == 0 || tip <= lastRooted {
 		return nil
 	}
 	version := s.query.ChainDecisionVersion()
-	if version == s.lastDecisionSeen {
+	if version == s.lastDecisionSeen && tip == s.lastReplayTip && lastRooted == s.lastRooted {
 		return nil
 	}
 	s.lastDecisionSeen = version
+	s.lastReplayTip = tip
+	s.lastRooted = lastRooted
 
 	for slot := lastRooted + 1; slot <= tip; slot++ {
 		executedID, ran := executed[slot]
@@ -143,6 +150,40 @@ func (s *alpenglowSwitchSweeper) sweep(executed map[uint64]solana.Hash, lastRoot
 		}
 	}
 	return nil
+}
+
+const alpenglowSwitchPollInterval = 250 * time.Millisecond
+
+// waitForAlpenglowReplayInput keeps certificate correction live while ancestry
+// checks deliberately hold the next block. In particular, a finalized child
+// can select a parent whose slot replay already consumed as a skip. Waiting
+// for that child before checking certificates would deadlock both sides.
+// A nil sweep preserves the ordinary blocking wait for other replay modes.
+func waitForAlpenglowReplayInput(
+	ctx context.Context,
+	next func(context.Context) (*b.Block, *blockstream.AlpenglowParentSwitch),
+	sweep func() *CertifiedSwitch,
+	pollInterval time.Duration,
+) (*b.Block, *blockstream.AlpenglowParentSwitch, *CertifiedSwitch) {
+	if sweep == nil {
+		block, parentSwitch := next(ctx)
+		return block, parentSwitch, nil
+	}
+	for {
+		if ctx.Err() != nil {
+			return nil, nil, nil
+		}
+		if sw := sweep(); sw != nil {
+			return nil, nil, sw
+		}
+		waitCtx, cancel := context.WithTimeout(ctx, pollInterval)
+		block, parentSwitch := next(waitCtx)
+		timedOut := waitCtx.Err() == context.DeadlineExceeded
+		cancel()
+		if block != nil || parentSwitch != nil || !timedOut {
+			return block, parentSwitch, nil
+		}
+	}
 }
 
 // tryInLoopUnwind attempts the in-RAM fork switch: evict the wrong suffix
