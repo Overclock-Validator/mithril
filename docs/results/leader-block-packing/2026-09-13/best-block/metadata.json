@@ -1,0 +1,17 @@
+{
+  "blockhash": "4X7hVhH1RJReoEkJcFQSV2BTKbjFQT8JK16dD3bEEwuv",
+  "count": 200000,
+  "last_valid_block_height": 2839082,
+  "offered_tps": 150000,
+  "prefill_count": 120000,
+  "prefill_slots": 10,
+  "prepare_seconds": 2.715821878,
+  "sender": "127.0.0.1:8011; GOMAXPROCS=2; signatures prepared before send",
+  "shape": "readonly-pair",
+  "signatures_per_transaction": 1,
+  "topup_blockhash": "DTSw2jqMLS6A3yCuJ27d7BpH5sWttE53sy6Pw6FMwWie",
+  "topup_count": 80000,
+  "topup_trigger": "first local block broadcast",
+  "transaction_bytes": 198,
+  "window": 3073656
+}
