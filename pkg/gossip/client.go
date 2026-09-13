@@ -54,6 +54,7 @@ type Client struct {
 
 	contactMu sync.RWMutex
 	contact   *ContactInfo
+	relay     contactRelay
 
 	identityConflictMu        sync.Mutex
 	identityConflictGossip    contactEndpoint
@@ -475,13 +476,23 @@ func (c *Client) pushContact(conn *net.UDPConn) error {
 	if err != nil {
 		return err
 	}
-	for _, peer := range c.currentPeers() {
-		if err := sendUDP(conn, packet, peer); err != nil {
-			c.txErrors.Add(1)
+	packets := [][]byte{packet}
+	if values := c.relay.values(wallclockMillis()); len(values) != 0 {
+		packet, err := encodePushMessage(c.pubkey, values)
+		if err != nil {
 			return err
 		}
-		c.recordTx()
-		c.txPushMessages.Add(1)
+		packets = append(packets, packet)
+	}
+	for _, peer := range c.currentPeers() {
+		for _, packet := range packets {
+			if err := sendUDP(conn, packet, peer); err != nil {
+				c.txErrors.Add(1)
+				break
+			}
+			c.recordTx()
+			c.txPushMessages.Add(1)
+		}
 	}
 	return nil
 }
@@ -626,6 +637,10 @@ func (c *Client) handleContactRecord(record contactRecord, shredVersion uint16) 
 	if record.ShredVer != shredVersion || !record.GossipAddr.ok {
 		return
 	}
+	addr := record.GossipAddr.UDPAddr()
+	if addr == nil || addr.Port == 0 || addr.IP.IsUnspecified() || addr.IP.IsMulticast() {
+		return
+	}
 	// CRDS is keyed by validator identity. If another process publishes that
 	// same identity with different sockets, its newer ContactInfo replaces ours
 	// cluster-wide: turbine and Votor traffic then move to the other process in
@@ -635,6 +650,11 @@ func (c *Client) handleContactRecord(record contactRecord, shredVersion uint16) 
 	// trip a fresh process.
 	if record.Pubkey == c.pubkey {
 		c.observeOwnContactRecord(record)
+		return
+	}
+	// The decoder verified the original signed bytes. Retain those bytes for
+	// relay, and do not let an older relayed contact replace newer endpoints.
+	if !c.relay.accept(record, wallclockMillis()) {
 		return
 	}
 	// The entrypoint is commonly a validator itself. Do not add its gossip
@@ -742,16 +762,17 @@ func (c *Client) recordRepairPeer(contact *ContactInfo) {
 }
 
 func (c *Client) recordRepairPeerRecord(record contactRecord) {
+	c.repairPeerMu.Lock()
+	defer c.repairPeerMu.Unlock()
 	if !record.ServeRepairAddr.ok || record.ServeRepairAddr.port == 0 {
+		delete(c.repairPeers, record.Pubkey)
 		return
 	}
 	now := time.Now()
 	key := record.Pubkey
-	c.repairPeerMu.Lock()
 	if existing, ok := c.repairPeers[key]; ok && sameEndpointUDPAddr(record.ServeRepairAddr, existing.Addr) {
 		existing.LastSeen = now
 		c.repairPeers[key] = existing
-		c.repairPeerMu.Unlock()
 		return
 	}
 	c.repairPeers[key] = RepairPeer{
@@ -759,7 +780,6 @@ func (c *Client) recordRepairPeerRecord(record contactRecord) {
 		Addr:     record.ServeRepairAddr.UDPAddr(),
 		LastSeen: now,
 	}
-	c.repairPeerMu.Unlock()
 }
 
 // TVUPeers returns non-expired TVU endpoints learned from gossip.
@@ -841,30 +861,32 @@ func (c *Client) LookupAlpenglow(pubkey solana.PublicKey) (*net.UDPAddr, bool) {
 
 func (c *Client) recordTVUPeerRecord(record contactRecord) {
 	addr := record.TVUAddr.UDPAddr()
+	c.tvuPeerMu.Lock()
+	defer c.tvuPeerMu.Unlock()
 	if addr == nil {
+		delete(c.tvuPeers, record.Pubkey)
 		return
 	}
-	c.tvuPeerMu.Lock()
 	c.tvuPeers[record.Pubkey] = TVUPeer{
 		Pubkey:   record.Pubkey,
 		TVUAddr:  addr,
 		LastSeen: time.Now(),
 	}
-	c.tvuPeerMu.Unlock()
 }
 
 func (c *Client) recordAlpenglowPeerRecord(record contactRecord) {
 	addr := record.Sockets[socketTagAlpenglow].UDPAddr()
+	c.alpenglowPeerMu.Lock()
+	defer c.alpenglowPeerMu.Unlock()
 	if addr == nil {
+		delete(c.alpenglowPeers, record.Pubkey)
 		return
 	}
-	c.alpenglowPeerMu.Lock()
 	c.alpenglowPeers[record.Pubkey] = AlpenglowPeer{
 		Pubkey:        record.Pubkey,
 		AlpenglowAddr: addr,
 		LastSeen:      time.Now(),
 	}
-	c.alpenglowPeerMu.Unlock()
 }
 
 func (c *Client) recordTx() {
