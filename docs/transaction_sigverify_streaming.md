@@ -10,16 +10,22 @@ and repair catch-up without a mode transition or a 200 ms batching delay.
 
 1. The receiver authenticates the shred and performs existing assembly/FEC
    recovery. The packet reader advances a contiguous data-shred frontier and
-   attempts a nonblocking background enqueue.
+   attempts a nonblocking background enqueue. Assembly retains an authenticated
+   root and a snapshot of its source shred for each FEC set when available.
 2. Two background preparation workers copy and decode complete DATA_COMPLETE
    entry batches. A batch may span several FEC sets. They submit its immutable
    transactions to the shared signature pool while later shreds arrive.
 3. Signature groups contain available transactions up to the configured lane
-   target. Transactions with multiple signatures remain indivisible. A rolling
-   per-request window refills when any group finishes, without a wave barrier.
+   target. Transactions with multiple signatures remain indivisible. Large
+   already-decoded requests bundle four vector groups per dispatch job (normally
+   32 one-signature transactions). Requests smaller than
+   `2 * workers * batch_target * 4` transactions keep one group per job; the
+   default threshold is 128 ready transactions. A rolling per-request window
+   refills when any job finishes, without a wave barrier or batching timer.
 4. Once the full slot is assembled, completion compares shred slices directly
    against the cached component bytes, including padding. Cache hits avoid a
    second component buffer; misses allocate a fresh buffer at its exact size.
+   Complete contiguous slots supply shred order directly, avoiding two sorts.
    Completion processes all Alpenglow markers and FEC roots and constructs the
    final ordered block. It submits any transactions not already covered and joins
    signature work for the retained batches before marking the block verified.
@@ -40,7 +46,7 @@ start. Four workers can improve catch-up latency but occupy more cores at once.
   Decoded transaction objects add heap overhead. Saturation skips optional early
   work; normal full-slot verification still covers every retained transaction.
 - One queued/active preparation token per generation coalesces packet arrivals.
-  Verifier requests and each request's outstanding groups are also bounded.
+  Verifier requests and each request's outstanding jobs are also bounded.
   Request admission can wait behind existing requests; this is not a strict
   replay-head priority scheduler.
 - No transaction decoding or verifier admission occurs under the assembler mutex or on the
@@ -49,11 +55,18 @@ start. Four workers can improve catch-up latency but occupy more cores at once.
 - Cached results belong to one generation, shred range and exact byte sequence.
   Reset/eviction cancels that generation. Reservations remain charged until
   admitted readers have relinquished their transaction buffers.
+- A FEC root cache retains at most one source snapshot per FEC state, in addition
+  to the entry-prefetch budget. Completion preserves the deterministic choice of
+  the lowest-index non-recovered data proof, then lowest coding position. Cached
+  roots require the same source, parsed root inputs, and exact payload bytes;
+  mismatches, unauthenticated callers, and spool hydration recompute the root.
 - `UpdateParent` can discard an optimistic prefix. Parse and marker checks still
   cover that prefix, while its transaction signature verdict is discarded along
   with its transactions. Retained signatures must all pass before replay.
 - Cancellation is not an invalid-signature verdict. A retry on the same slot
   generation verifies transactions again if an earlier request was canceled.
+  An admitted job finishes its first vector group; cancellation can skip later
+  groups in that job. The request joins all admitted jobs before releasing input.
 
 ## Configuration and observability
 
@@ -101,3 +114,5 @@ Measured Zen 5 results, raw logs, and validation details are in the
 [September 12 benchmark report](results/sigverify-streaming/2026-09-12-zen5/README.md).
 The subsequent [direct cache-comparison report](results/sigverify-direct-cache/2026-09-12-zen5/README.md)
 isolates the removal of redundant component-buffer construction at completion.
+The [completion follow-up report](results/completion-followup/2026-09-12-zen5/README.md)
+measures direct ordering, authenticated-root reuse, and the four-vector job policy.
