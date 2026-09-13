@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
@@ -19,6 +18,9 @@ import (
 )
 
 type ExecutionCtx struct {
+	// SkipTimingMetrics disables instruction-dispatch timing collection for
+	// leader execution; it never changes instruction validation or CU charging.
+	SkipTimingMetrics        bool
 	Log                      Logger
 	Accounts                 accounts.Accounts
 	TransactionContext       *TransactionCtx
@@ -237,14 +239,14 @@ func (execCtx *ExecutionCtx) PrepareInstruction(ix Instruction, signers []solana
 }
 
 func (execCtx *ExecutionCtx) ProcessInstruction(instrData []byte, instructionAccts []InstructionAccount, programIndices []uint64) error {
-	start := time.Now()
+	start := metrics.StartTiming(!execCtx.SkipTimingMetrics)
 	nextInstrCtx, err := execCtx.TransactionContext.NextInstructionCtx()
 	if err != nil {
 		return err
 	}
 	metrics.GlobalBlockReplay.GetNextIxCtx.AddTimingSince(start)
 
-	start = time.Now()
+	start = metrics.StartTiming(!execCtx.SkipTimingMetrics)
 	nextInstrCtx.Configure(programIndices, instructionAccts, instrData)
 	metrics.GlobalBlockReplay.NextIxCtxConfigure.AddTimingSince(start)
 
@@ -267,7 +269,7 @@ func (execCtx *ExecutionCtx) ProcessInstruction(instrData []byte, instructionAcc
 		})
 	}
 
-	start = time.Now()
+	start = metrics.StartTiming(!execCtx.SkipTimingMetrics)
 	err = execCtx.Push()
 	if err != nil {
 		return err
@@ -283,7 +285,7 @@ func (execCtx *ExecutionCtx) ProcessInstruction(instrData []byte, instructionAcc
 
 	err1 := execCtx.ExecuteInstruction()
 
-	start = time.Now()
+	start = metrics.StartTiming(!execCtx.SkipTimingMetrics)
 	err2 := execCtx.Pop()
 	metrics.GlobalBlockReplay.IxPop.AddTimingSince(start)
 
@@ -304,7 +306,7 @@ func (execCtx *ExecutionCtx) AddModifiedVoteState(pubkey solana.PublicKey, state
 }
 
 func (execCtx *ExecutionCtx) ExecuteInstruction() error {
-	start := time.Now()
+	start := metrics.StartTiming(!execCtx.SkipTimingMetrics)
 
 	txCtx := execCtx.TransactionContext
 	instrCtx, err := txCtx.CurrentInstructionCtx()
@@ -334,7 +336,7 @@ func (execCtx *ExecutionCtx) ExecuteInstruction() error {
 	}
 	metrics.GlobalBlockReplay.ExecIxResolveNativeProgram.AddTimingSince(start)
 
-	start = time.Now()
+	start = metrics.StartTiming(!execCtx.SkipTimingMetrics)
 	err = nativeProgramFn(execCtx)
 	switch nativeProgramStr {
 	case a.SystemProgramAddrStr:
