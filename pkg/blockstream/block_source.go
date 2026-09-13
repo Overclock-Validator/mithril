@@ -1671,7 +1671,7 @@ func (bs *BlockSource) trackSlotError(slot uint64, err error, rpcIdx int32, late
 	info.retryCount++
 	info.lastSeenAt = time.Now()
 	if err != nil {
-		info.lastError = err.Error()
+		info.lastError = rpcclient.SanitizeErrorForDisplay(err)
 		// Truncate long error messages
 		if len(info.lastError) > 200 {
 			info.lastError = info.lastError[:200] + "..."
@@ -1723,9 +1723,9 @@ func (bs *BlockSource) rpcEndpointForIndex(rpcIdx int32) string {
 		if len(bs.rpcClients) == 0 {
 			return "unknown"
 		}
-		return bs.rpcClients[0].Endpoint()
+		return bs.rpcClients[0].EndpointForDisplay()
 	}
-	return bs.rpcClients[rpcIdx].Endpoint()
+	return bs.rpcClients[rpcIdx].EndpointForDisplay()
 }
 
 func (bs *BlockSource) shouldProbeAbsentConfirmation(slot uint64) bool {
@@ -1771,14 +1771,14 @@ func (bs *BlockSource) confirmSlotAbsentViaRPC(slot uint64) bool {
 		if shouldLog {
 			switch {
 			case err != nil:
-				mlog.Log.Warnf("RPC omission probe: slot %d via %s | err=%v",
-					slot, bs.rpcClients[idx].Endpoint(), err)
+				mlog.Log.Warnf("RPC omission probe: slot %d via %s | err=%s",
+					slot, bs.rpcClients[idx].EndpointForDisplay(), rpcclient.SanitizeErrorForDisplay(err))
 			case len(slots) == 0:
 				mlog.Log.Warnf("RPC omission probe: slot %d via %s | returned no confirmed slots",
-					slot, bs.rpcClients[idx].Endpoint())
+					slot, bs.rpcClients[idx].EndpointForDisplay())
 			default:
 				mlog.Log.Warnf("RPC omission probe: slot %d via %s | first_confirmed_slot=%d",
-					slot, bs.rpcClients[idx].Endpoint(), slots[0])
+					slot, bs.rpcClients[idx].EndpointForDisplay(), slots[0])
 			}
 		}
 		if err != nil || len(slots) == 0 {
@@ -1862,8 +1862,8 @@ func (bs *BlockSource) failoverToNext() bool {
 		bs.slotsSinceFailover.Store(0)
 		bs.lastFailoverTime.Store(time.Now().Unix())
 
-		currentEndpoint := bs.rpcClients[currentIdx].Endpoint()
-		nextEndpoint := bs.rpcClients[nextIdx].Endpoint()
+		currentEndpoint := bs.rpcClients[currentIdx].EndpointForDisplay()
+		nextEndpoint := bs.rpcClients[nextIdx].EndpointForDisplay()
 
 		if nextIdx == 0 {
 			mlog.Log.Infof("RPC failover: restored to primary endpoint %s", nextEndpoint)
@@ -1904,7 +1904,7 @@ func (bs *BlockSource) restoreToPrimary() bool {
 		bs.slotsSinceFailover.Store(0)
 		bs.hardErrCount.Store(0) // Reset error count when switching back
 		mlog.Log.Infof("RPC restored to primary endpoint %s (health probe succeeded)",
-			bs.rpcClients[0].Endpoint())
+			bs.rpcClients[0].EndpointForDisplay())
 		return true
 	}
 	return false
@@ -2791,7 +2791,7 @@ func (bs *BlockSource) emitOrderedBlocks() {
 		if isHistoryErr && len(bs.rpcClients) > 1 && result.rpcIdx == bs.activeRpcIdx.Load() {
 			if result.rpcIdx >= 0 && int(result.rpcIdx) < len(bs.rpcClients) {
 				mlog.Log.Errorf("RPC endpoint %s cannot serve getBlock transaction history; trying backup RPC",
-					bs.rpcClients[result.rpcIdx].Endpoint())
+					bs.rpcClients[result.rpcIdx].EndpointForDisplay())
 			}
 			bs.failoverToNext()
 			bs.hardErrCount.Store(0)

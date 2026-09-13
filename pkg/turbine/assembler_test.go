@@ -900,6 +900,22 @@ func TestUDPReceiverSignalsReadyAfterBind(t *testing.T) {
 	}
 }
 
+func TestUDPReceiverRecordsBlockActivity(t *testing.T) {
+	receiver := NewUDPReceiver("127.0.0.1:0")
+	before := time.Now().Unix()
+	receiver.recordBlockEmitted(123)
+	receiver.recordBlockEmitted(124)
+	after := time.Now().Unix()
+
+	stats := receiver.Stats()
+	if stats.BlocksEmitted != 2 || stats.LastBlockSlot != 124 {
+		t.Fatalf("block stats = count %d slot %d, want 2 and 124", stats.BlocksEmitted, stats.LastBlockSlot)
+	}
+	if stats.LastBlockUnix < before || stats.LastBlockUnix > after {
+		t.Fatalf("last block timestamp = %d, want [%d,%d]", stats.LastBlockUnix, before, after)
+	}
+}
+
 func localnetMerkleShreds(t testing.TB, prefix string) [][]byte {
 	t.Helper()
 	dir := fixtures.Path(t, "shreds", "localnet", "merkle")

@@ -83,10 +83,11 @@ func writeEpochBoundaryCalculatedRewards(logDir string, epoch uint64, slot uint6
 	relativePath := filepath.Join("rewards", filename)
 	artifactPath := filepath.Join(dir, filename)
 
-	file, err := os.Create(artifactPath)
+	file, err := openPrivateArtifact(artifactPath)
 	if err != nil {
 		return nil, "", fmt.Errorf("creating reward artifact csv: %w", err)
 	}
+	defer discardPrivateArtifact(file)
 
 	bufw := bufio.NewWriterSize(file, 1<<20)
 	csvw := csv.NewWriter(bufw)
@@ -101,7 +102,7 @@ func writeEpochBoundaryCalculatedRewards(logDir string, epoch uint64, slot uint6
 			file.Close()
 			return err
 		}
-		return file.Close()
+		return publishPrivateArtifact(file, artifactPath)
 	}
 
 	if err := csvw.Write([]string{
