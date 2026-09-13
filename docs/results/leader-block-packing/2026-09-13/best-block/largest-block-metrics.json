@@ -1,0 +1,16 @@
+{
+  "slot": 3073657,
+  "transactions": 48523,
+  "load_transactions": 48523,
+  "block_cost_units": 49881644,
+  "execution_cu": 0,
+  "failed_transactions": 0,
+  "load_cost_units_each": [
+    1028
+  ],
+  "load_execution_cu_each": [
+    0
+  ],
+  "finalized": true,
+  "blockhash": "H6iU43SrXp94LRvfpvhLDskboUJA4CupsEVFJcCRLANF"
+}
