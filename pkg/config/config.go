@@ -12,6 +12,9 @@ const LightbringerQuietDefault = true
 
 func ApplyDefaults(v *viper.Viper) {
 	v.SetDefault("lightbringer.quiet", LightbringerQuietDefault)
+	// The run command resolves this boolean through Viper, so its CLI default
+	// alone does not apply when the TOML setting is omitted.
+	v.SetDefault("tuning.use_pool", true)
 	// network.cluster and block.source default in the run command itself
 	// (Alpenglow/turbine, classic/RPC) — NOT here, because the lightbringer
 	// auto-switch needs to distinguish "operator chose a source" from "defaulted".
