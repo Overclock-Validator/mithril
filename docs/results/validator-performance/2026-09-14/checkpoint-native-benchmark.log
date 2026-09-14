@@ -1,0 +1,15 @@
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionStatusCheckpointCapture/SynchronousBaseline         	       1	 206554597 ns/op	99120032 B/op	    2731 allocs/op
+BenchmarkTransactionStatusCheckpointCapture/SynchronousBaseline         	       1	 207352232 ns/op	99120072 B/op	    2732 allocs/op
+BenchmarkTransactionStatusCheckpointCapture/SynchronousBaseline         	       1	 202442401 ns/op	99120048 B/op	    2731 allocs/op
+BenchmarkTransactionStatusCheckpointCapture/CaptureOnReplay             	   47412	      5936 ns/op	   35168 B/op	      11 allocs/op
+BenchmarkTransactionStatusCheckpointCapture/CaptureOnReplay             	   39506	      6057 ns/op	   35168 B/op	      11 allocs/op
+BenchmarkTransactionStatusCheckpointCapture/CaptureOnReplay             	   37850	      5922 ns/op	   35168 B/op	      11 allocs/op
+BenchmarkTransactionStatusCheckpointCapture/EncodeOnWorker              	       2	 202522908 ns/op	99108084 B/op	    2723 allocs/op
+BenchmarkTransactionStatusCheckpointCapture/EncodeOnWorker              	       2	 201841085 ns/op	99108076 B/op	    2723 allocs/op
+BenchmarkTransactionStatusCheckpointCapture/EncodeOnWorker              	       1	 200834149 ns/op	99108104 B/op	    2724 allocs/op
+PASS
+ok  	github.com/Overclock-Validator/mithril/pkg/replay	3.133s

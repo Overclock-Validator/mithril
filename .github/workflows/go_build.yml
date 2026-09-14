@@ -17,3 +17,31 @@ jobs:
 
       - name: Build
         run: go build -v ./cmd/mithril
+
+  regression-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      GOMAXPROCS: "2"
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: 1.26.4
+
+      - name: Voting, checkpoint, streaming and scheduler race regressions
+        # Run the complete affected package suites, including subprocess crash
+        # recovery and cancellation tests. The independent sealevel suite has
+        # known base-branch failures documented in the validation report.
+        run: >-
+          go test -race -p 2 -count=1
+          ./pkg/alpenglow ./pkg/consensus ./pkg/replay
+          ./pkg/turbine ./pkg/sigverify ./pkg/blockprod/...
+          ./cmd/mithril/node ./cmd/mithril/configcmd
+
+      - name: Vote-program deque ownership race regression
+        run: go test -race -count=1 ./pkg/sealevel -run '^TestProcessNewVoteStateOwnsRetainedDeque$'

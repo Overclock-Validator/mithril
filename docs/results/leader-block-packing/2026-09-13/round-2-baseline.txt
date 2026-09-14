@@ -1,0 +1,7 @@
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/blockprod
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkReadonlyPairFullBlock/wire-8         	       3	 206873746 ns/op	     48622 tx/block	259272293 B/op	 3363455 allocs/op
+BenchmarkReadonlyPairFullBlock/decoded-8      	       3	 214317833 ns/op	     48622 tx/block	237880618 B/op	 3071736 allocs/op
+PASS

@@ -1,0 +1,26 @@
+{
+  "failed_tests": [
+    "TestExecute_Tx_BpfLoader_Write_Success",
+    "TestExecute_Tx_BpfLoader_Write_Offset_Too_Large_Failure",
+    "TestExecute_Tx_BpfLoader_Write_Buffer_Authority_Didnt_Sign_Failure",
+    "TestExecute_Tx_BpfLoader_Write_Incorrect_Authority_Failure",
+    "TestExecute_Tx_BpfLoader_SetAuthority_Not_Enough_Instr_Accts_Failure",
+    "TestExecute_Tx_BpfLoader_SetAuthorityChecked_Not_Enough_Instr_Accts_Failure",
+    "TestExecute_Tx_BpfLoader_SetAuthorityChecked_Buffer_Success",
+    "TestExecute_Tx_BpfLoader_SetAuthorityChecked_ProgramData_Success",
+    "TestExecute_Tx_BpfLoader_SetAuthorityChecked_Buffer_Immutable_Failure",
+    "TestExecute_Tx_BpfLoader_SetAuthorityChecked_Buffer_Wrong_Upgrade_Authority_Failure",
+    "TestExecute_Tx_BpfLoader_SetAuthorityChecked_Buffer_Authority_Didnt_Sign_Failure",
+    "TestExecute_Tx_BpfLoader_SetAuthorityChecked_Buffer_New_Authority_Didnt_Sign_Failure",
+    "TestExecute_Tx_BpfLoader_SetAuthorityChecked_Buffer_Uninitialized_Account_Failure",
+    "TestExecute_Tx_BpfLoader_SetAuthorityChecked_ProgramData_Immutable_Failure",
+    "TestExecute_Tx_BpfLoader_SetAuthorityChecked_ProgramData_Authority_Didnt_Sign_Failure",
+    "TestExecute_Tx_BpfLoader_SetAuthorityChecked_ProgramData_New_Authority_Didnt_Sign_Failure",
+    "TestExecute_Tx_BpfLoader_SetAuthorityChecked_ProgramData_Wrong_Authority_Failure",
+    "TestExecute_Tx_BpfLoader_Close_Buffer_Not_Enough_Accounts",
+    "TestExecute_Tx_BpfLoader_Close_ProgramData_Success"
+  ],
+  "same_failed_test_names": true,
+  "same_panic_function": "UpgradeableLoaderClose",
+  "same_failed_test_names_on_native_base": true
+}

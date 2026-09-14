@@ -7,6 +7,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/blockprod"
 	"github.com/Overclock-Validator/mithril/pkg/costmodel"
+	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/fees"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/packet"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/txfixture"
@@ -244,7 +245,9 @@ func TestMaxBufferedTxnsConstant(t *testing.T) {
 }
 
 func TestSchedulerCopiesPooledPacketBytes(t *testing.T) {
-	sched := New(blockprod.NewController())
+	env := blockprod.NewTestEnv(blockprod.TestEnvConfig{})
+	defer env.Close()
+	sched := NewWithFeatureSource(blockprod.NewController(), func() *features.Features { return env.SlotCtx.Features.Clone() })
 	pool := packet.NewPool(1)
 	buf, idx, ok := pool.Acquire()
 	require.True(t, ok)
@@ -269,11 +272,26 @@ func TestSchedulerCopiesPooledPacketBytes(t *testing.T) {
 	e := sched.buffer.PopMax()
 	require.NotNil(t, e)
 	require.Equal(t, wire, e.wire)
+	require.NotNil(t, e.prepared)
 
 	// Re-parse and verify the buffered transaction still has a valid signature.
 	tx, err := solana.TransactionFromBytes(e.wire)
 	require.NoError(t, err)
 	require.Equal(t, e.tx.Signatures[0], tx.Signatures[0])
+
+	// Exercise the actual drain path using the retained decoded transaction,
+	// after its original pooled packet has already been overwritten.
+	res, _ := sched.buffer.Insert(e)
+	require.Equal(t, InsertAccepted, res)
+	sched.banks = env.Controller
+	sched.Start(context.Background())
+	defer sched.Stop()
+	require.Eventually(t, func() bool { return sched.Stats().Accepted == 1 }, time.Second, time.Millisecond)
+	forged := env.Bank.ForgedTransactions()
+	require.Len(t, forged, 1)
+	forgedWire, err := forged[0].MarshalBinary()
+	require.NoError(t, err)
+	require.Equal(t, wire, forgedWire)
 }
 
 func TestClassifyBufferedExpired(t *testing.T) {

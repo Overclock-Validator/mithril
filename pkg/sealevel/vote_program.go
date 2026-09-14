@@ -1951,7 +1951,14 @@ func processNewVoteState(voteState *VoteState, newState *deque.Deque[LandedVote]
 	}
 
 	voteState.RootSlot = newRoot
-	voteState.Votes = *newState
+	// newState may be a pooled deque. Own the backing storage before its
+	// caller returns it to the pool: the resulting state can escape into the
+	// shared vote cache after this instruction completes.
+	var owned deque.Deque[LandedVote]
+	for i := 0; i < newState.Len(); i++ {
+		owned.PushBack(newState.At(i))
+	}
+	voteState.Votes = owned
 
 	return nil
 }

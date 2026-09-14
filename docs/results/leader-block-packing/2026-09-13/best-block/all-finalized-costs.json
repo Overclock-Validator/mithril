@@ -1,0 +1,56 @@
+{
+  "stage": "window-fill",
+  "finalized_load_transactions": 200000,
+  "not_included_after_expiry": 0,
+  "blocks": [
+    {
+      "slot": 3073656,
+      "transactions": 31732,
+      "load_transactions": 31732,
+      "cost_units": 32620496,
+      "failed_transactions": 0
+    },
+    {
+      "slot": 3073657,
+      "transactions": 48523,
+      "load_transactions": 48523,
+      "cost_units": 49881644,
+      "failed_transactions": 0
+    },
+    {
+      "slot": 3073658,
+      "transactions": 39911,
+      "load_transactions": 39745,
+      "cost_units": 41103706,
+      "failed_transactions": 0
+    },
+    {
+      "slot": 3073659,
+      "transactions": 138,
+      "load_transactions": 0,
+      "cost_units": 204378,
+      "failed_transactions": 0
+    },
+    {
+      "slot": 3073740,
+      "transactions": 34188,
+      "load_transactions": 34150,
+      "cost_units": 35162478,
+      "failed_transactions": 0
+    },
+    {
+      "slot": 3073741,
+      "transactions": 45094,
+      "load_transactions": 45094,
+      "cost_units": 46356632,
+      "failed_transactions": 0
+    },
+    {
+      "slot": 3073742,
+      "transactions": 852,
+      "load_transactions": 756,
+      "cost_units": 919344,
+      "failed_transactions": 0
+    }
+  ]
+}

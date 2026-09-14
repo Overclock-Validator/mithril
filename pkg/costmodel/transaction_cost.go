@@ -55,6 +55,13 @@ func EstimateTransactionCost(tx *solana.Transaction, feats *features.Features) (
 		}, nil
 	}
 
+	return EstimatePreparedTransactionCost(tx, instrs, limits, feats), nil
+}
+
+// EstimatePreparedTransactionCost reuses successfully parsed instructions and
+// compute limits from the same immutable transaction and feature snapshot.
+func EstimatePreparedTransactionCost(tx *solana.Transaction, instrs []sealevel.Instruction, limits *sealevel.ComputeBudgetLimits, feats *features.Features) TransactionCost {
+	writable := writableAccounts(tx)
 	loadedDataCost := loadedAccountsDataSizeCost(limits.LoadedAccountBytes)
 	// Banking-stage admission must reserve at least one page for the fee
 	// payer, including V1 transactions whose inline loaded-data limit is zero.
@@ -62,13 +69,13 @@ func EstimateTransactionCost(tx *solana.Transaction, feats *features.Features) (
 	loadedDataCost = max(loadedDataCost, uint64(HeapCost))
 	return TransactionCost{
 		SignatureCost:              signatureCost(tx, instrs, feats),
-		WriteLockCost:              writeLockCost(countWriteLocks(tx)),
+		WriteLockCost:              writeLockCost(uint64(len(writable))),
 		DataBytesCost:              instructionDataCost(tx),
 		ProgramsExecutionCost:      uint64(limits.ComputeUnitLimit),
 		LoadedAccountsDataSizeCost: loadedDataCost,
 		AllocatedAccountsDataSize:  estimateAllocDelta(instrs, feats),
-		WritableAccounts:           writableAccounts(tx),
-	}, nil
+		WritableAccounts:           writable,
+	}
 }
 
 func signatureCost(tx *solana.Transaction, instrs []sealevel.Instruction, feats *features.Features) uint64 {
@@ -177,7 +184,7 @@ func replayInstrsAndAcctMetas(tx *solana.Transaction, feats *features.Features) 
 	}
 	upgradeableLoaderPresent := false
 	for _, key := range tx.Message.AccountKeys {
-		if key.String() == "BPFLoaderUpgradeab1e11111111111111111111111" {
+		if key == addresses.BpfLoaderUpgradeableAddr {
 			upgradeableLoaderPresent = true
 			break
 		}
