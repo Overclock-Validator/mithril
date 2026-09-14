@@ -23,8 +23,8 @@ The commits preserve the implementation sequence and can be reviewed by subsyste
    queue capacity and completion-reserve settings while keeping
    their defaults. Correct slot-duration-dependent resource budgets.
    [Design and synthetic block tests](leader_block_packing.md).
-3. **Observer and certificate compatibility:** enable existing safe VM pooling
-   defaults, reduce observer statistics overhead, and use the Votor-compatible
+3. **Observer and certificate compatibility:** enable VM pooling
+   defaults and give retained vote-state deques their own backing storage, reduce observer statistics overhead, and use the Votor-compatible
    certificate layout accepted by Agave/Firedancer. The regression fixture is
    an X.509 certificate, with no private signing key.
 4. **Voting persistence and recovery:** optional durable signing reservations,
@@ -135,3 +135,31 @@ These include signing-reservation recovery, history-writer ordering, checkpoint
 capture, streaming cancellation and queue-retention regressions. The separately
 documented base failures in the sealevel suite remain outside this selected CI
 command. [Queue follow-up validation](results/queue-retention/2026-09-14/README.md).
+
+## Review follow-up
+
+Retained vote-state deques now own their backing storage before TowerSync returns
+its scratch deque to the pool. Reset prefetch generations retain their capacity
+until both queued work and verification readers retire. Local transport setup
+precedes consumption of the clean voting marker. Starter configs emit the
+current `[sigverify]` keys; the two-worker default and default-mode voting
+changes are documented in the linked configuration and recovery guides.
+
+The slot-time cost, account-data, shred and entry-byte table was checked against
+[Agave v4.3.0-rc.1 slot_params.rs](https://github.com/anza-xyz/agave/blob/v4.3.0-rc.1/runtime/src/slot_params.rs),
+including next-epoch activation, shortest-duration precedence and the 100/60
+account/block cost multiplier. No table correction was needed.
+
+Avoiding static preparation for duplicate or below-floor ingress transactions is
+left for the separate block-production work; this follow-up changes no scheduler
+admission policy. Existing raw benchmark evidence stays linked to this PR.
+
+Local validation of this follow-up passed: full race suites for Turbine, node,
+config generation, signature verification, consensus, Alpenglow, replay and cost
+model; vote-program tests selected by `Test.*Vote`; vet for the changed Go
+packages; and a complete validator build. Both ownership and reset-capacity
+regressions fail against the prior PR implementation and pass with these fixes.
+The reset regression also passed ten race runs. CI now includes config generation
+and the targeted vote-deque regression. The previously documented unrelated
+full-sealevel failures remain outside these passing targeted suites. This
+follow-up has not been deployed or benchmarked on the live validator.

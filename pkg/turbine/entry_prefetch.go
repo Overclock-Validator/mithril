@@ -45,6 +45,7 @@ type slotEntryPrefetch struct {
 	batches          map[uint32]*prefetchedShredBatch
 	next             int
 	queued, released bool
+	queueDone        chan struct{} // closed after the queued/running token retires
 	bytes            int
 }
 
@@ -110,6 +111,7 @@ func (p *entryPrefetchPool) enqueueLocked(s *slotState) {
 	select {
 	case p.jobs <- s:
 		f.queued = true
+		f.queueDone = make(chan struct{})
 	default:
 	}
 }
@@ -121,6 +123,7 @@ func (p *entryPrefetchPool) run() {
 		f := s.prefetch
 		if p.closed || f.released || f.ctx.Err() != nil || p.a.slots[s.slot] != s || s.completing {
 			f.queued = false
+			close(f.queueDone)
 			p.a.mu.Unlock()
 			continue
 		}
@@ -157,6 +160,7 @@ func (p *entryPrefetchPool) run() {
 		}
 		if batch == nil {
 			f.queued = false
+			close(f.queueDone)
 			p.a.mu.Unlock()
 			continue
 		}
@@ -181,6 +185,7 @@ func (p *entryPrefetchPool) run() {
 		close(ready)
 		p.a.mu.Lock()
 		f.queued = false
+		close(f.queueDone)
 		p.enqueueLocked(s)
 		p.a.mu.Unlock()
 	}
@@ -212,6 +217,7 @@ func (a *SlotAssembler) releasePrefetchLocked(s *slotState) {
 	f.released = true
 	f.cancel()
 	p := f.pool
+	queueDone := f.queueDone
 	p.cleanup.Add(1)
 	go func() {
 		defer p.cleanup.Done()
@@ -220,6 +226,9 @@ func (a *SlotAssembler) releasePrefetchLocked(s *slotState) {
 			if b.verification != nil {
 				b.verification.wait()
 			}
+		}
+		if queueDone != nil {
+			<-queueDone
 		}
 		p.a.mu.Lock()
 		p.slots--
