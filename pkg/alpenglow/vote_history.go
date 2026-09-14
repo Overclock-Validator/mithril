@@ -15,6 +15,7 @@ import (
 )
 
 const voteHistoryVersion = 1
+const reservedVoteHistoryVersion = 2
 
 var ErrVoteHistoryNotFound = errors.New("alpenglow vote history not found")
 
@@ -23,6 +24,7 @@ var ErrVoteHistoryNotFound = errors.New("alpenglow vote history not found")
 // Agave when resuming (notarized blocks and ParentReady edges), in addition to
 // the anti-equivocation vote sets.
 type VoteHistory struct {
+	ReservationRequired  bool                            `json:"reservation_required,omitempty"`
 	Version              uint32                          `json:"version"`
 	NodePubkey           solana.PublicKey                `json:"node_pubkey"`
 	Root                 uint64                          `json:"root"`
@@ -424,6 +426,19 @@ func VoteHistoryFilename(dir string, node solana.PublicKey) string {
 // identity and atomically replaces the previous file before a vote can be
 // admitted to consensus or sent to the network.
 func SaveVoteHistory(dir string, h *VoteHistory, identity ed25519.PrivateKey) error {
+	return saveVoteHistory(dir, h, identity, true)
+}
+
+// SaveReservedVoteHistory writes and renames without per-vote sync. The caller
+// must enforce an independently durable signing reservation before using it.
+func SaveReservedVoteHistory(dir string, h *VoteHistory, identity ed25519.PrivateKey) error {
+	if h == nil || !h.ReservationRequired {
+		return fmt.Errorf("reserved history requires durable reservation enrollment")
+	}
+	return saveVoteHistory(dir, h, identity, false)
+}
+
+func saveVoteHistory(dir string, h *VoteHistory, identity ed25519.PrivateKey, durable bool) error {
 	if h == nil {
 		return fmt.Errorf("save vote history: nil history")
 	}
@@ -435,6 +450,9 @@ func SaveVoteHistory(dir string, h *VoteHistory, identity ed25519.PrivateKey) er
 		return fmt.Errorf("save vote history: identity %s does not match history %s", node, h.NodePubkey)
 	}
 	h.Version = voteHistoryVersion
+	if h.ReservationRequired {
+		h.Version = reservedVoteHistoryVersion
+	}
 	if err := h.preparePersistedViews(); err != nil {
 		return fmt.Errorf("save vote history: %w", err)
 	}
@@ -450,7 +468,7 @@ func SaveVoteHistory(dir string, h *VoteHistory, identity ed25519.PrivateKey) er
 		return fmt.Errorf("serialize vote history: %w", err)
 	}
 	envelope := savedVoteHistory{
-		Version:   voteHistoryVersion,
+		Version:   h.Version,
 		Node:      node,
 		Data:      data,
 		Signature: ed25519.Sign(identity, data),
@@ -463,7 +481,7 @@ func SaveVoteHistory(dir string, h *VoteHistory, identity ed25519.PrivateKey) er
 		return err
 	}
 	filename := VoteHistoryFilename(dir, node)
-	return persistVoteHistoryFile(dir, filename, encoded)
+	return replaceVoteHistoryFile(dir, filename, encoded, durable)
 }
 
 // ensureDurableVoteHistoryDirectory creates each missing path component and
@@ -515,6 +533,10 @@ func ensureDurableVoteHistoryDirectory(dir string) error {
 // alone does not guarantee that either the bytes or the new directory entry
 // survives a crash.
 func persistVoteHistoryFile(dir, filename string, encoded []byte) error {
+	return replaceVoteHistoryFile(dir, filename, encoded, true)
+}
+
+func replaceVoteHistoryFile(dir, filename string, encoded []byte, durable bool) error {
 	temporary, err := os.CreateTemp(dir, "."+filepath.Base(filename)+".tmp-")
 	if err != nil {
 		return fmt.Errorf("create temporary vote history: %w", err)
@@ -538,8 +560,10 @@ func persistVoteHistoryFile(dir, filename string, encoded []byte) error {
 	if n != len(encoded) {
 		return fmt.Errorf("write temporary vote history: %w", io.ErrShortWrite)
 	}
-	if err := temporary.Sync(); err != nil {
-		return fmt.Errorf("sync temporary vote history: %w", err)
+	if durable {
+		if err := temporary.Sync(); err != nil {
+			return fmt.Errorf("sync temporary vote history: %w", err)
+		}
 	}
 	closeErr := temporary.Close()
 	closed = true
@@ -551,8 +575,8 @@ func persistVoteHistoryFile(dir, filename string, encoded []byte) error {
 	}
 	renamed = true
 
-	if err := syncVoteHistoryDirectory(dir); err != nil {
-		return err
+	if durable {
+		return syncVoteHistoryDirectory(dir)
 	}
 	return nil
 }
@@ -586,7 +610,7 @@ func LoadVoteHistory(dir string, node solana.PublicKey) (*VoteHistory, error) {
 	if err := json.Unmarshal(encoded, &envelope); err != nil {
 		return nil, fmt.Errorf("decode saved vote history: %w", err)
 	}
-	if envelope.Version != voteHistoryVersion || envelope.Node != node {
+	if (envelope.Version != voteHistoryVersion && envelope.Version != reservedVoteHistoryVersion) || envelope.Node != node {
 		return nil, fmt.Errorf("saved vote history identity/version mismatch")
 	}
 	if !ed25519.Verify(ed25519.PublicKey(node[:]), envelope.Data, envelope.Signature) {
@@ -596,7 +620,7 @@ func LoadVoteHistory(dir string, node solana.PublicKey) (*VoteHistory, error) {
 	if err := json.Unmarshal(envelope.Data, &h); err != nil {
 		return nil, fmt.Errorf("decode vote history: %w", err)
 	}
-	if h.Version != voteHistoryVersion || h.NodePubkey != node {
+	if h.Version != envelope.Version || h.NodePubkey != node || h.ReservationRequired != (h.Version == reservedVoteHistoryVersion) {
 		return nil, fmt.Errorf("vote history identity/version mismatch")
 	}
 	if err := h.validatePersistedState(); err != nil {
