@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/big"
 	"sync"
+	"sync/atomic"
 
 	bls12381 "github.com/Overclock-Validator/gnark-crypto/ecc/bls12-381"
 	blsfr "github.com/Overclock-Validator/gnark-crypto/ecc/bls12-381/fr"
@@ -171,8 +172,8 @@ type CertPool struct {
 	slots        map[uint64]*poolSlot
 	emitted      map[CertificateKey]struct{}
 	floor        uint64
-	liveSlot     uint64 // trusted replay/observed watermark (NOT advanced by raw votes)
-	highestSlot  uint64 // observability only: highest vote slot seen
+	liveSlot     atomic.Uint64 // trusted replay/observed watermark (NOT advanced by raw votes)
+	highestSlot  uint64        // observability only: highest vote slot seen
 	totalPending int
 	equivocation []EquivocationEvidence
 	snap         CertPoolSnapshot
@@ -236,21 +237,24 @@ func (p *CertPool) SetEpochLookup(fn func(slot uint64) uint64) {
 // (from replay progress / observed finality — never from raw votes, so an
 // attacker cannot slide the window forward). Monotonic.
 func (p *CertPool) NoteLiveSlot(slot uint64) {
-	p.mu.Lock()
-	if slot > p.liveSlot {
-		p.liveSlot = slot
+	// Replay must not wait for BLS verification under p.mu merely to announce
+	// progress. Concurrent trusted updates may arrive out of order.
+	for current := p.liveSlot.Load(); slot > current; current = p.liveSlot.Load() {
+		if p.liveSlot.CompareAndSwap(current, slot) {
+			return
+		}
 	}
-	p.mu.Unlock()
 }
 
 // windowAnchorLocked is the trusted upper anchor of the live vote window: the
 // higher of the finalized floor and the replay-observed live slot. It is NOT
 // derived from raw votes, so ingest cannot advance it.
 func (p *CertPool) windowAnchorLocked() uint64 {
-	if p.floor > p.liveSlot {
+	liveSlot := p.liveSlot.Load()
+	if p.floor > liveSlot {
 		return p.floor
 	}
-	return p.liveSlot
+	return liveSlot
 }
 
 // setForSlotLocked resolves the validator set covering slot. Returns nil (votes
@@ -560,7 +564,7 @@ func (p *CertPool) Snapshot() CertPoolSnapshot {
 	snap.Slots = len(p.slots)
 	snap.Floor = p.floor
 	snap.HighestSlot = p.highestSlot
-	snap.LiveSlot = p.liveSlot
+	snap.LiveSlot = p.liveSlot.Load()
 	snap.PendingTotal = p.totalPending
 	return snap
 }
