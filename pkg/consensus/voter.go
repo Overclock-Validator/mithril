@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -38,21 +39,27 @@ type VotingPeerSource func(validators []alpenglow.ValidatorStake) []alpenglow.Vo
 // account address; AuthorizedVoter is the Ed25519 signer from which its BLS key
 // was registered.
 type VotingConfig struct {
-	Identity        ed25519.PrivateKey
-	AuthorizedVoter ed25519.PrivateKey
-	VoteAccount     solana.PublicKey
-	HistoryDir      string
-	EpochForSlot    func(slot uint64) uint64
-	Peers           VotingPeerSource
-	SlotDuration    time.Duration
-	WaitToVoteSlot  uint64
-	ReadyToVote     func(slot uint64) bool
+	Identity                  ed25519.PrivateKey
+	AuthorizedVoter           ed25519.PrivateKey
+	VoteAccount               solana.PublicKey
+	HistoryDir                string
+	ReservedHistory           bool
+	InitializeVoteReservation bool
+	Genesis                   solana.Hash
+	EpochForSlot              func(slot uint64) uint64
+	Peers                     VotingPeerSource
+	SlotDuration              time.Duration
+	WaitToVoteSlot            uint64 // Inclusive minimum for new votes; authenticated history restoration is separate
+	ReadyToVote               func(slot uint64) bool
 }
 
 // VotingStats exposes positive network evidence separately from local casting.
 // NetworkLandedVotes counts unique persisted votes whose rank appeared in the
 // exact BLS-verified certificate proof received over Votor QUIC.
 type VotingStats struct {
+	ReservedHistory                bool                      `json:"reserved_history"`
+	SigningReservedThrough         uint64                    `json:"signing_reserved_through,omitempty"`
+	RecoveryThrough                uint64                    `json:"recovery_through,omitempty"`
 	Enabled                        bool                      `json:"enabled"`
 	VotesCastThisRun               uint64                    `json:"votes_cast_this_run"`
 	NetworkLandedVotes             uint64                    `json:"network_landed_votes"`
@@ -109,43 +116,48 @@ type pendingVotorBlock struct {
 // history decisions run on loop; validator-set snapshots are protected only so
 // the outbound peer callback can read them from broadcast workers.
 type alpenglowVoter struct {
-	engine          *AlpenglowObserverEngine
-	identity        ed25519.PrivateKey
-	node            solana.PublicKey
-	voteAccount     solana.PublicKey
-	signer          *alpenglow.BLSSigner
-	historyDir      string
-	history         *alpenglow.VoteHistory
-	epochForSlot    func(uint64) uint64
-	peerSource      VotingPeerSource
-	slotDuration    time.Duration
-	waitToVoteSlot  uint64
-	readyToVote     func(slot uint64) bool
-	broadcaster     *alpenglow.VotorBroadcaster
-	events          chan voterEvent
-	done            chan struct{}
-	startOnce       sync.Once
-	closeOnce       sync.Once
-	wg              sync.WaitGroup
-	setsMu          sync.RWMutex
-	sets            map[uint64]alpenglow.ValidatorSet
-	restored        map[alpenglow.VoteMessageKey]bool
-	pending         map[uint64][]pendingVotorBlock
-	receivedShred   map[uint64]bool
-	timeoutsSet     map[uint64]bool
-	executedBlocks  map[alpenglow.BlockID]bool
-	highestFinal    uint64
-	lastFinalizedAt time.Time
-	votingStarted   bool
-	latestLiveSlot  uint64
-	standstillSlot  *uint64
-	refreshQueue    []alpenglow.Message
-	refreshCursor   int
-	lastWarn        map[uint64]time.Time
-	landingMu       sync.RWMutex
-	landed          map[alpenglow.VoteMessageKey]struct{}
-	stats           VotingStats
-	lastStatsLog    time.Time
+	engine            *AlpenglowObserverEngine
+	identity          ed25519.PrivateKey
+	node              solana.PublicKey
+	voteAccount       solana.PublicKey
+	signer            *alpenglow.BLSSigner
+	historyDir        string
+	historyLock       *os.File
+	reservation       *signingReservation
+	reservationEvents []voterEvent
+	shutdownOnce      sync.Once
+	shutdownErr       error
+	history           *alpenglow.VoteHistory
+	epochForSlot      func(uint64) uint64
+	peerSource        VotingPeerSource
+	slotDuration      time.Duration
+	waitToVoteSlot    uint64
+	readyToVote       func(slot uint64) bool
+	broadcaster       *alpenglow.VotorBroadcaster
+	events            chan voterEvent
+	done              chan struct{}
+	startOnce         sync.Once
+	closeOnce         sync.Once
+	wg                sync.WaitGroup
+	setsMu            sync.RWMutex
+	sets              map[uint64]alpenglow.ValidatorSet
+	restored          map[alpenglow.VoteMessageKey]bool
+	pending           map[uint64][]pendingVotorBlock
+	receivedShred     map[uint64]bool
+	timeoutsSet       map[uint64]bool
+	executedBlocks    map[alpenglow.BlockID]bool
+	highestFinal      uint64
+	lastFinalizedAt   time.Time
+	votingStarted     bool
+	latestLiveSlot    uint64
+	standstillSlot    *uint64
+	refreshQueue      []alpenglow.Message
+	refreshCursor     int
+	lastWarn          map[uint64]time.Time
+	landingMu         sync.RWMutex
+	landed            map[alpenglow.VoteMessageKey]struct{}
+	stats             VotingStats
+	lastStatsLog      time.Time
 	// beforeVoteGuard is a deterministic test seam for invalidation races. It
 	// is nil in production.
 	beforeVoteGuard func(alpenglow.BlockID)
@@ -163,6 +175,9 @@ func newAlpenglowVoterUnstarted(engine *AlpenglowObserverEngine, cfg VotingConfi
 }
 
 func newAlpenglowVoterWithStart(engine *AlpenglowObserverEngine, cfg VotingConfig, root alpenglow.BlockID, start bool, sets []alpenglow.ValidatorSet) (*alpenglowVoter, error) {
+	if cfg.InitializeVoteReservation && !cfg.ReservedHistory {
+		return nil, errors.New("initialize-vote-reservation requires reserved-vote-history")
+	}
 	if engine == nil {
 		return nil, fmt.Errorf("enable Alpenglow voting: nil consensus engine")
 	}
@@ -192,16 +207,51 @@ func newAlpenglowVoterWithStart(engine *AlpenglowObserverEngine, cfg VotingConfi
 	if node != engineNode {
 		return nil, fmt.Errorf("enable Alpenglow voting: identity %s does not match consensus transport identity %s", node, engineNode)
 	}
+	historyLock, err := alpenglow.LockVoteHistory(cfg.HistoryDir, node)
+	if err != nil {
+		return nil, err
+	}
+	keepLock := false
+	defer func() {
+		if !keepLock {
+			historyLock.Close()
+		}
+	}()
+	if !cfg.ReservedHistory {
+		if _, err := os.Stat(alpenglow.VoteReservationFilename(cfg.HistoryDir, node)); !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("existing or unreadable vote reservation requires reserved history mode")
+		}
+	}
 	history, err := alpenglow.LoadVoteHistory(cfg.HistoryDir, node)
 	if err != nil {
 		if !errors.Is(err, alpenglow.ErrVoteHistoryNotFound) {
 			return nil, fmt.Errorf("enable Alpenglow voting: refuse unsafe vote-history reset: %w", err)
+		}
+		if cfg.ReservedHistory {
+			if _, err := os.Stat(alpenglow.VoteReservationFilename(cfg.HistoryDir, node)); !errors.Is(err, os.ErrNotExist) || !cfg.InitializeVoteReservation {
+				return nil, fmt.Errorf("missing history for reserved voter; refusing automatic reset")
+			}
 		}
 		history = alpenglow.NewVoteHistory(node, root.Slot)
 		if err := alpenglow.SaveVoteHistory(cfg.HistoryDir, history, cfg.Identity); err != nil {
 			return nil, fmt.Errorf("initialize Alpenglow vote history: %w", err)
 		}
 		mlog.Log.FileOnlyf("ALPENGLOW voting: created new vote history for %s at root %d; do not reuse this vote account on another validator", node, root.Slot)
+	}
+	if history.ReservationRequired && !cfg.ReservedHistory {
+		return nil, errors.New("reserved vote history cannot be opened in synchronous mode")
+	}
+	var reservation *signingReservation
+	if cfg.ReservedHistory {
+		reservation, err = openSigningReservation(cfg, node, engine.shredVersion, history)
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			if !keepLock {
+				reservation.halt()
+			}
+		}()
 	}
 	if history.Root < root.Slot {
 		history.SetRoot(root.Slot)
@@ -220,6 +270,8 @@ func newAlpenglowVoterWithStart(engine *AlpenglowObserverEngine, cfg VotingConfi
 		voteAccount:     cfg.VoteAccount,
 		signer:          signer,
 		historyDir:      cfg.HistoryDir,
+		historyLock:     historyLock,
+		reservation:     reservation,
 		history:         history,
 		epochForSlot:    cfg.EpochForSlot,
 		peerSource:      cfg.Peers,
@@ -261,6 +313,7 @@ func newAlpenglowVoterWithStart(engine *AlpenglowObserverEngine, cfg VotingConfi
 		return nil, err
 	}
 	v.broadcaster = broadcaster
+	keepLock = true
 	if start {
 		v.start()
 	}
@@ -300,12 +353,25 @@ func (v *alpenglowVoter) loop() {
 		v.closeOnce.Do(func() { close(v.done) })
 		v.wg.Done()
 	}()
+	var reservationChanged <-chan struct{}
+	if v.reservation != nil {
+		reservationChanged = v.reservation.changed
+	}
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-v.done:
 			return
+		case <-reservationChanged:
+			pending := v.reservationEvents
+			v.reservationEvents = nil
+			for _, event := range pending {
+				if err := v.handle(event); err != nil {
+					v.engine.latchSafetyError(fmt.Errorf("reservation retry: %w", err))
+					return
+				}
+			}
 		case event := <-v.events:
 			if err := v.handle(event); err != nil {
 				v.engine.latchSafetyError(fmt.Errorf("voting engine: %w", err))
@@ -324,6 +390,11 @@ func (v *alpenglowVoter) loop() {
 }
 
 func (v *alpenglowVoter) handle(event voterEvent) error {
+	v.retainReservationEvent(event)
+	return v.handleEvent(event)
+}
+
+func (v *alpenglowVoter) handleEvent(event voterEvent) error {
 	floor := v.admissionFloor()
 	if event.kind == voterEventBlock && v.engine.ensureChain().IsObjectivelyInvalidBlock(event.block.Block) {
 		return nil
@@ -691,9 +762,9 @@ func (v *alpenglowVoter) castTarget(vote alpenglow.Vote, restoring bool, guarded
 		if err := v.history.AddVote(vote); err != nil {
 			return false, fmt.Errorf("record %s vote at slot %d: %w", vote.Type, vote.Slot, err)
 		}
-		// Pool admission may synchronously assemble and publish a certificate.
-		// Persist the anti-equivocation record first so no externally visible
-		// proof can survive a crash without its signed local history.
+		// Pool admission can publish a certificate. In reserved mode the durable
+		// upper bound covers loss of this unsynchronized history replacement;
+		// synchronous mode still persists the exact history before admission.
 		if err := v.saveHistory(); err != nil {
 			return false, err
 		}
@@ -728,6 +799,9 @@ func (v *alpenglowVoter) castTarget(vote alpenglow.Vote, restoring bool, guarded
 }
 
 func (v *alpenglowVoter) sign(vote alpenglow.Vote, respectVotingGate bool) (alpenglow.VoteMessage, alpenglow.VoteVerifyResult, error) {
+	if v.reservation != nil && !v.reservation.allow(vote.Slot, v.engine.alpenglowVoteActionFloor(), false) {
+		return alpenglow.VoteMessage{}, alpenglow.VoteVerifyResult{}, fmt.Errorf("%w: waiting for verified recovery or durable signing reservation", errVoterNotReady)
+	}
 	if respectVotingGate {
 		if err := v.votingGateError(vote.Slot); err != nil {
 			return alpenglow.VoteMessage{}, alpenglow.VoteVerifyResult{}, err
@@ -768,7 +842,7 @@ func (v *alpenglowVoter) votingGateError(slot uint64) error {
 		return fmt.Errorf("%w: slot %d is at or below consensus action floor %d", errVoterNotReady, slot, floor)
 	}
 	if slot < v.waitToVoteSlot {
-		return fmt.Errorf("%w: waiting for startup watermark slot %d", errVoterNotReady, v.waitToVoteSlot)
+		return fmt.Errorf("%w: waiting for voting cutoff slot %d", errVoterNotReady, v.waitToVoteSlot)
 	}
 	// ReadyToVote is a startup join guard, not a perpetual clock check. Once an
 	// accepted live block or vote joins Votor, verified ParentReady and timeout
@@ -776,6 +850,9 @@ func (v *alpenglowVoter) votingGateError(slot uint64) error {
 	// slot can drift ahead of a healthy cluster and must not later stop voting.
 	if !v.votingStarted && v.readyToVote != nil && !v.readyToVote(slot) {
 		return fmt.Errorf("%w: slot is still behind the startup live voting window", errVoterNotReady)
+	}
+	if v.reservation != nil && !v.reservation.allow(slot, v.engine.alpenglowVoteActionFloor(), false) {
+		return fmt.Errorf("%w: waiting for verified recovery or durable signing reservation", errVoterNotReady)
 	}
 	return nil
 }
@@ -837,6 +914,9 @@ func (v *alpenglowVoter) votorTransportValidators() []alpenglow.ValidatorStake {
 }
 
 func (v *alpenglowVoter) restoreVotesForEpoch(epoch uint64) error {
+	if v.reservation != nil && v.reservation.recoverThrough != 0 {
+		return nil
+	}
 	floor := v.admissionFloor()
 	for _, vote := range v.history.VotesAfter(v.history.Root - minU64(v.history.Root, 1)) {
 		// Keep every signed history entry for anti-equivocation, but do not
@@ -884,6 +964,9 @@ func (v *alpenglowVoter) restoreVotesForEpoch(epoch uint64) error {
 // persist-before-admission crash window without trusting process-local invalid
 // block state across a restart.
 func (v *alpenglowVoter) restoreVotesForBlock(block alpenglow.BlockID) (bool, error) {
+	if v.reservation != nil && v.reservation.recoverThrough != 0 {
+		return false, nil
+	}
 	if block.Slot <= v.admissionFloor() {
 		return false, nil
 	}
@@ -1087,7 +1170,11 @@ func (v *alpenglowVoter) isIdentityStaked(slot uint64) bool {
 }
 
 func (v *alpenglowVoter) saveHistory() error {
-	if err := alpenglow.SaveVoteHistory(v.historyDir, v.history, v.identity); err != nil {
+	save := alpenglow.SaveVoteHistory
+	if v.reservation != nil {
+		save = alpenglow.SaveReservedVoteHistory
+	}
+	if err := save(v.historyDir, v.history, v.identity); err != nil {
 		return fmt.Errorf("persist vote history before consensus publication: %w", err)
 	}
 	return nil
@@ -1201,6 +1288,11 @@ func (v *alpenglowVoter) snapshot() VotingStats {
 	stats := v.stats
 	v.landingMu.RUnlock()
 	stats.Enabled = true
+	if v.reservation != nil {
+		stats.ReservedHistory = true
+		stats.SigningReservedThrough = v.reservation.through.Load()
+		stats.RecoveryThrough = v.reservation.recoverThrough
+	}
 	if v.broadcaster != nil {
 		broadcast := v.broadcaster.Stats()
 		stats.BroadcastMessagesQueued = broadcast.MessagesQueued
@@ -1228,7 +1320,7 @@ func (v *alpenglowVoter) maybeLogStats() {
 	}
 	v.lastStatsLog = time.Now()
 	stats := v.snapshot()
-	mlog.Log.FileOnlyf("alpenglow voting stats: votes_cast_this_run=%d network_landed=%d last_landed_slot=%d broadcast_queued=%d broadcast_dropped=%d peer_sends=%d peer_sends_skipped=%d peer_send_errors=%d desired_peers=%d active_connections=%d pending_connections=%d connection_attempts=%d connection_errors=%d connection_jobs_dropped=%d",
+	mlog.Log.FileOnlyf("alpenglow voting stats: votes_cast_this_run=%d network_landed=%d last_landed_slot=%d broadcast_queued=%d broadcast_dropped=%d peer_sends=%d peer_sends_skipped=%d peer_send_errors=%d desired_peers=%d active_connections=%d pending_connections=%d connection_attempts=%d connection_errors=%d connection_jobs_dropped=%d reserved_history=%t signing_through=%d recovery_through=%d",
 		stats.VotesCastThisRun,
 		stats.NetworkLandedVotes,
 		stats.LastNetworkLandedSlot,
@@ -1243,6 +1335,7 @@ func (v *alpenglowVoter) maybeLogStats() {
 		stats.BroadcastConnectionAttempts,
 		stats.BroadcastConnectionErrors,
 		stats.BroadcastConnectionJobsDropped,
+		stats.ReservedHistory, stats.SigningReservedThrough, stats.RecoveryThrough,
 	)
 }
 
@@ -1274,9 +1367,23 @@ func (v *alpenglowVoter) close() error {
 	if v == nil {
 		return nil
 	}
-	v.closeOnce.Do(func() { close(v.done) })
-	v.wg.Wait()
-	return v.broadcaster.Close()
+	v.shutdownOnce.Do(func() {
+		v.closeOnce.Do(func() { close(v.done) })
+		v.wg.Wait()
+		if v.reservation != nil {
+			v.reservation.halt()
+			floor := v.engine.alpenglowVoteActionFloor()
+			if v.engine.safetyError() == nil && floor >= v.reservation.recoverThrough {
+				v.history.SetRoot(floor)
+				v.shutdownErr = v.reservation.seal(v.historyDir, v.history, v.identity)
+				if v.shutdownErr == nil {
+					mlog.Log.Infof("ALPENGLOW signing reservation: clean history sealed at root=%d through=%d", v.history.Root, v.reservation.through.Load())
+				}
+			}
+		}
+		v.shutdownErr = errors.Join(v.shutdownErr, v.broadcaster.Close(), v.historyLock.Close())
+	})
+	return v.shutdownErr
 }
 
 func pendingContains(blocks []pendingVotorBlock, candidate pendingVotorBlock) bool {

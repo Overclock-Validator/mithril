@@ -381,7 +381,7 @@ func (e *AlpenglowObserverEngine) EnableVoting(cfg VotingConfig) error {
 	// events, matching Agave's initial_parent_ready selection.
 	if slot, parent, ok := voter.history.HighestParentReadyMatching(func(parent alpenglow.BlockID) bool {
 		return !e.ensureChain().IsObjectivelyInvalidBlock(parent)
-	}); ok && slot > root.Slot {
+	}); ok && slot > root.Slot && (voter.reservation == nil || voter.reservation.recoverThrough == 0) {
 		if !e.ensurePool().RestoreParentReady(slot, parent) {
 			mlog.Log.FileOnlyf("ALPENGLOW voting: ignored persisted ParentReady slot=%d parent=%s because newer root/live tracker state is authoritative", slot, parent)
 		}
