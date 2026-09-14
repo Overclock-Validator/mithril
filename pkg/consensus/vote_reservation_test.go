@@ -48,6 +48,9 @@ func crashReservedTestVoter(t *testing.T, v *alpenglowVoter) {
 		v.closeOnce.Do(func() { close(v.done) })
 		v.wg.Wait()
 		v.reservation.halt()
+		if v.historyWriter != nil {
+			require.NoError(t, v.historyWriter.close())
+		}
 		require.NoError(t, v.broadcaster.Close())
 		require.NoError(t, v.historyLock.Close())
 	})

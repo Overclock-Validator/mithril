@@ -1,7 +1,7 @@
 # Reserved vote history (experimental, opt-in)
 
-Use `--reserved-vote-history` to keep detailed per-vote history with atomic
-write-and-rename, without explicitly syncing each vote. An independent signed
+Use `--reserved-vote-history` to keep detailed history with atomic
+write-and-rename on an ordered background writer, without explicitly syncing each vote. An independent signed
 reservation is synced before its slot range can be used. The default remains
 synchronous history. `--wait-to-vote-slot N` is an additional inclusive minimum;
 it cannot override recovery, finality, execution or ParentReady checks.
@@ -23,6 +23,17 @@ of AccountsDB snapshot restoration. Do not copy older safety files back during
 an application rollback. Keys, vote account, genesis and shred-version changes
 fail closed and require an explicit domain migration, not automatic re-enrollment.
 
+Each history update validates and signs an immutable, complete snapshot on the
+voter goroutine, then submits it without waiting for filesystem I/O. One worker
+per voter owns all history replacements; it retains at most one in-flight and
+one newer pending snapshot. While a write is blocked, the newest complete
+snapshot supersedes an older pending snapshot. There is no intentional batching
+delay. Complete in-memory voting decisions remain authoritative while running,
+and the normal verified-root pruning rules still apply. Snapshot preparation
+keeps serialization/signing CPU work on the voter but performs no filesystem
+operations. Worker errors latch the engine safety fault and stop voting; an
+already in-flight vote remains protected by the durable reservation.
+
 The reservation worker grants up to 32 slots beyond the requested slot and
 renews when 16 or fewer remain. At the nominal 200 ms cadence those correspond
 to about 6.4 seconds of reserve and 3.2 seconds of renewal slack. They are slot
@@ -40,8 +51,9 @@ normal live joining and protocol checks. RPC wall-clock estimates cannot release
 this recovery gate. Repeated crashes without new permission do not advance it.
 The conservative finality wait can be indefinite on a halted cluster.
 
-Clean shutdown first stops the voter, joins the reservation worker, syncs exact
-history (including the verified finality floor), then syncs a marker containing
+Clean shutdown first stops the voter, joins the reservation worker, drains and
+joins the history writer, syncs exact history (including the verified finality
+floor), then syncs a marker containing
 its digest. Startup checks the digest and durably consumes the marker before
 any new signature or history mutation. A crash in that interval therefore falls
 back to the reservation. A shutdown before uncertain recovery completes cannot
@@ -60,7 +72,14 @@ Validation includes race tests for incomplete history, repeated crashes, clean
 marker consumption/mismatch, missing/corrupt records, incompatible domains,
 unacknowledged and uncertain writes, H/H+1 for all five vote types and restoration,
 renewal retry with finality advancement, window-spanning skips, and leader gates.
-These are deterministic software tests, not a host power-loss qualification or
+Writer tests additionally cover snapshot isolation from mutable state, continued
+voting while disk I/O is blocked, coalescing with complete retained decisions,
+shutdown ordering, terminal write failures and killing a subprocess with both
+an in-flight and pending unwritten snapshot. The reservation refuses voting in
+the uncertain range after restart. The process-kill test does not simulate
+power loss to the disk or a filesystem rollback.
+
+These are software tests, not a host power-loss qualification or
 formal proof of the full consensus protocol. `BenchmarkVoteHistoryPersistence`
 compares the actual serialization/write paths with 32 recorded notarizations;
 it does not measure block replay or full validator FAST participation.
