@@ -18,7 +18,9 @@ The commits preserve the implementation sequence and can be reviewed by subsyste
 2. **Leader packing:** decode and statically prepare owned transactions before
    leadership, revalidate bank-dependent inputs, reduce scratch allocation,
    compute signature roots without unused proof nodes, and improve scheduler
-   ordering. Expose queue capacity and completion-reserve settings while keeping
+   ordering. Remove consumed, evicted and expired entries from both indexed
+   priority heaps so retained references stay bounded by queue capacity. Expose
+   queue capacity and completion-reserve settings while keeping
    their defaults. Correct slot-duration-dependent resource budgets.
    [Design and synthetic block tests](leader_block_packing.md).
 3. **Observer and certificate compatibility:** enable existing safe VM pooling
@@ -110,8 +112,12 @@ tests and a clean live restart do not qualify host power-loss behavior. A halted
 cluster can leave conservative crash recovery waiting indefinitely. Preserve
 the reservation and latest history across application or AccountsDB rollback.
 
-The separately observed scheduler heap retention issue is not fixed here, and
-the remaining FAST/Titan reward omissions are not assumed to be solved. Server
+The scheduler now removes entries from both heaps, including repeated cross-slot
+rebuffering. Its existing scan/retry policy is preserved: newly arrived
+higher-priority transactions remain eligible for normal selection. The queue
+retention fix does not establish a measured improvement in block fullness or
+FAST participation. Remaining FAST/Titan reward omissions are not assumed to
+be solved. Server
 loader scheduling, faucet automation, monitoring scripts and validator keys are
 not part of the product changes in this PR.
 
@@ -122,3 +128,10 @@ results and the baseline BPF-loader failures are recorded in
 [the validation report](results/validator-performance/2026-09-14/README.md).
 Archived benchmark output is retained verbatim and marked as generated for
 review; the Markdown explanations and executable test harnesses remain visible.
+
+CI additionally runs complete race suites for Alpenglow, consensus, replay,
+Turbine, signature verification, block production/scheduling and node startup.
+These include signing-reservation recovery, history-writer ordering, checkpoint
+capture, streaming cancellation and queue-retention regressions. The separately
+documented base failures in the sealevel suite remain outside this selected CI
+command. [Queue follow-up validation](results/queue-retention/2026-09-14/README.md).

@@ -3,7 +3,10 @@
 The combined runtime code was archived and tested at commit
 `4a5a9761847a4fd8e7d60c72810082cf91fb73d5` against base
 `33dde4050d9250557583395810799aaac2f54017`. Subsequent additions are review
-documentation, attributes and evidence. The live validator was not redeployed.
+documentation, attributes and evidence through `b24de8e6`. The later queue
+retention fix and automated regression CI have a separate
+[validation report](../../queue-retention/2026-09-14/README.md).
+The live validator was not redeployed for these validation runs.
 This folder adds the checkpoint/voting evidence to the existing standalone
 streaming and leader-packing benchmark reports.
 

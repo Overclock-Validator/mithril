@@ -1,0 +1,80 @@
+[
+  {
+    "round": 1,
+    "variant": "baseline",
+    "command": [
+      "/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-review-279-20260914/baseline-scheduler.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkBufferDrain$",
+      "-test.benchtime=120000x",
+      "-test.count=1"
+    ],
+    "exit": 0,
+    "seconds": 0.6474292278289795
+  },
+  {
+    "round": 1,
+    "variant": "candidate",
+    "command": [
+      "/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-review-279-20260914/candidate-scheduler.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkBufferDrain$",
+      "-test.benchtime=120000x",
+      "-test.count=1"
+    ],
+    "exit": 0,
+    "seconds": 0.6436319351196289
+  },
+  {
+    "round": 2,
+    "variant": "candidate",
+    "command": [
+      "/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-review-279-20260914/candidate-scheduler.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkBufferDrain$",
+      "-test.benchtime=120000x",
+      "-test.count=1"
+    ],
+    "exit": 0,
+    "seconds": 0.306088924407959
+  },
+  {
+    "round": 2,
+    "variant": "baseline",
+    "command": [
+      "/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-review-279-20260914/baseline-scheduler.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkBufferDrain$",
+      "-test.benchtime=120000x",
+      "-test.count=1"
+    ],
+    "exit": 0,
+    "seconds": 0.2681159973144531
+  },
+  {
+    "round": 3,
+    "variant": "baseline",
+    "command": [
+      "/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-review-279-20260914/baseline-scheduler.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkBufferDrain$",
+      "-test.benchtime=120000x",
+      "-test.count=1"
+    ],
+    "exit": 0,
+    "seconds": 0.2570068836212158
+  },
+  {
+    "round": 3,
+    "variant": "candidate",
+    "command": [
+      "/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-review-279-20260914/candidate-scheduler.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkBufferDrain$",
+      "-test.benchtime=120000x",
+      "-test.count=1"
+    ],
+    "exit": 0,
+    "seconds": 0.269057035446167
+  }
+]
