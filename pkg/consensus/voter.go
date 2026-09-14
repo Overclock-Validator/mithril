@@ -57,6 +57,9 @@ type VotingConfig struct {
 // NetworkLandedVotes counts unique persisted votes whose rank appeared in the
 // exact BLS-verified certificate proof received over Votor QUIC.
 type VotingStats struct {
+	HistorySnapshotsSubmitted      uint64                    `json:"history_snapshots_submitted,omitempty"`
+	HistorySnapshotsWritten        uint64                    `json:"history_snapshots_written,omitempty"`
+	HistorySnapshotsCoalesced      uint64                    `json:"history_snapshots_coalesced,omitempty"`
 	ReservedHistory                bool                      `json:"reserved_history"`
 	SigningReservedThrough         uint64                    `json:"signing_reserved_through,omitempty"`
 	RecoveryThrough                uint64                    `json:"recovery_through,omitempty"`
@@ -124,6 +127,7 @@ type alpenglowVoter struct {
 	historyDir        string
 	historyLock       *os.File
 	reservation       *signingReservation
+	historyWriter     *voteHistoryWriter
 	reservationEvents []voterEvent
 	shutdownOnce      sync.Once
 	shutdownErr       error
@@ -313,6 +317,11 @@ func newAlpenglowVoterWithStart(engine *AlpenglowObserverEngine, cfg VotingConfi
 		return nil, err
 	}
 	v.broadcaster = broadcaster
+	if reservation != nil {
+		v.historyWriter = newVoteHistoryWriter(func(snapshot *alpenglow.VoteHistorySnapshot) error {
+			return alpenglow.SaveReservedVoteHistorySnapshot(v.historyDir, snapshot)
+		}, v.failHistoryWrite)
+	}
 	keepLock = true
 	if start {
 		v.start()
@@ -799,6 +808,9 @@ func (v *alpenglowVoter) castTarget(vote alpenglow.Vote, restoring bool, guarded
 }
 
 func (v *alpenglowVoter) sign(vote alpenglow.Vote, respectVotingGate bool) (alpenglow.VoteMessage, alpenglow.VoteVerifyResult, error) {
+	if err := v.engine.safetyError(); err != nil {
+		return alpenglow.VoteMessage{}, alpenglow.VoteVerifyResult{}, err
+	}
 	if v.reservation != nil && !v.reservation.allow(vote.Slot, v.engine.alpenglowVoteActionFloor(), false) {
 		return alpenglow.VoteMessage{}, alpenglow.VoteVerifyResult{}, fmt.Errorf("%w: waiting for verified recovery or durable signing reservation", errVoterNotReady)
 	}
@@ -1170,14 +1182,23 @@ func (v *alpenglowVoter) isIdentityStaked(slot uint64) bool {
 }
 
 func (v *alpenglowVoter) saveHistory() error {
-	save := alpenglow.SaveVoteHistory
-	if v.reservation != nil {
-		save = alpenglow.SaveReservedVoteHistory
+	if v.historyWriter != nil {
+		snapshot, err := alpenglow.PrepareReservedVoteHistory(v.history, v.identity)
+		if err != nil {
+			return err
+		}
+		return v.historyWriter.submit(snapshot)
 	}
-	if err := save(v.historyDir, v.history, v.identity); err != nil {
+	if err := alpenglow.SaveVoteHistory(v.historyDir, v.history, v.identity); err != nil {
 		return fmt.Errorf("persist vote history before consensus publication: %w", err)
 	}
 	return nil
+}
+
+func (v *alpenglowVoter) failHistoryWrite(err error) {
+	v.engine.latchSafetyError(err)
+	mlog.Log.Errorf("ALPENGLOW VOTING SAFETY: %v", err)
+	v.closeOnce.Do(func() { close(v.done) })
 }
 
 func (v *alpenglowVoter) recordNetworkCertificate(cert alpenglow.Certificate) {
@@ -1288,6 +1309,9 @@ func (v *alpenglowVoter) snapshot() VotingStats {
 	stats := v.stats
 	v.landingMu.RUnlock()
 	stats.Enabled = true
+	if v.historyWriter != nil {
+		stats.HistorySnapshotsSubmitted, stats.HistorySnapshotsWritten, stats.HistorySnapshotsCoalesced = v.historyWriter.counters()
+	}
 	if v.reservation != nil {
 		stats.ReservedHistory = true
 		stats.SigningReservedThrough = v.reservation.through.Load()
@@ -1320,7 +1344,7 @@ func (v *alpenglowVoter) maybeLogStats() {
 	}
 	v.lastStatsLog = time.Now()
 	stats := v.snapshot()
-	mlog.Log.FileOnlyf("alpenglow voting stats: votes_cast_this_run=%d network_landed=%d last_landed_slot=%d broadcast_queued=%d broadcast_dropped=%d peer_sends=%d peer_sends_skipped=%d peer_send_errors=%d desired_peers=%d active_connections=%d pending_connections=%d connection_attempts=%d connection_errors=%d connection_jobs_dropped=%d reserved_history=%t signing_through=%d recovery_through=%d",
+	mlog.Log.FileOnlyf("alpenglow voting stats: votes_cast_this_run=%d network_landed=%d last_landed_slot=%d broadcast_queued=%d broadcast_dropped=%d peer_sends=%d peer_sends_skipped=%d peer_send_errors=%d desired_peers=%d active_connections=%d pending_connections=%d connection_attempts=%d connection_errors=%d connection_jobs_dropped=%d reserved_history=%t signing_through=%d recovery_through=%d history_submitted=%d history_written=%d history_coalesced=%d",
 		stats.VotesCastThisRun,
 		stats.NetworkLandedVotes,
 		stats.LastNetworkLandedSlot,
@@ -1336,6 +1360,7 @@ func (v *alpenglowVoter) maybeLogStats() {
 		stats.BroadcastConnectionErrors,
 		stats.BroadcastConnectionJobsDropped,
 		stats.ReservedHistory, stats.SigningReservedThrough, stats.RecoveryThrough,
+		stats.HistorySnapshotsSubmitted, stats.HistorySnapshotsWritten, stats.HistorySnapshotsCoalesced,
 	)
 }
 
@@ -1372,8 +1397,11 @@ func (v *alpenglowVoter) close() error {
 		v.wg.Wait()
 		if v.reservation != nil {
 			v.reservation.halt()
+			if v.historyWriter != nil {
+				v.shutdownErr = v.historyWriter.close()
+			}
 			floor := v.engine.alpenglowVoteActionFloor()
-			if v.engine.safetyError() == nil && floor >= v.reservation.recoverThrough {
+			if v.shutdownErr == nil && v.engine.safetyError() == nil && floor >= v.reservation.recoverThrough {
 				v.history.SetRoot(floor)
 				v.shutdownErr = v.reservation.seal(v.historyDir, v.history, v.identity)
 				if v.shutdownErr == nil {
