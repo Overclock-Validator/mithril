@@ -98,6 +98,7 @@ const (
 	voterEventValidatorSet
 	voterEventRoot
 	voterEventNetworkCertificate
+	voterEventDurableRoot
 )
 
 type voterEvent struct {
@@ -443,6 +444,9 @@ func (v *alpenglowVoter) handleEvent(event voterEvent) error {
 			return nil
 		}
 		return v.saveHistory()
+	case voterEventDurableRoot:
+		root := v.engine.applyAlpenglowDurableRoot(event.slot)
+		return v.handleEvent(voterEvent{kind: voterEventRoot, root: root})
 	case voterEventNetworkCertificate:
 		v.recordNetworkCertificate(event.certificate)
 		return nil
@@ -557,9 +561,9 @@ func (v *alpenglowVoter) handleConsensus(event alpenglow.ConsensusEvent) error {
 
 func (v *alpenglowVoter) admissionFloor() uint64 {
 	floor := v.history.Root
-	if v.highestFinal > floor {
-		floor = v.highestFinal
-	}
+	// highestFinal tracks network progress and standstill, not retirement of
+	// our own decisions. Keep ParentReady, pending replay and exact vote history
+	// available until the retained pool or an ordered durable root retires them.
 	if engineFloor := v.engine.alpenglowVoteActionFloor(); engineFloor > floor {
 		floor = engineFloor
 	}
@@ -762,9 +766,9 @@ func (v *alpenglowVoter) castTarget(vote alpenglow.Vote, restoring bool, guarded
 		return false, nil
 	}
 	if !restoring {
-		// Finality can advance while the BLS signature is computed. Avoid a
-		// durable stale record when that race is already visible here; if it
-		// advances later, atomic admission below classifies it benignly.
+		// Retention/root pruning can advance while the BLS signature is computed.
+		// Avoid an expired record if that race is already visible here; atomic
+		// admission below classifies a later pruning race benignly.
 		if vote.Slot <= v.admissionFloor() {
 			return false, nil
 		}
@@ -811,7 +815,7 @@ func (v *alpenglowVoter) sign(vote alpenglow.Vote, respectVotingGate bool) (alpe
 	if err := v.engine.safetyError(); err != nil {
 		return alpenglow.VoteMessage{}, alpenglow.VoteVerifyResult{}, err
 	}
-	if v.reservation != nil && !v.reservation.allow(vote.Slot, v.engine.alpenglowVoteActionFloor(), false) {
+	if v.reservation != nil && !v.reservation.allow(vote.Slot, v.engine.alpenglowVerifiedFinalityFloor(), false) {
 		return alpenglow.VoteMessage{}, alpenglow.VoteVerifyResult{}, fmt.Errorf("%w: waiting for verified recovery or durable signing reservation", errVoterNotReady)
 	}
 	if respectVotingGate {
@@ -863,7 +867,7 @@ func (v *alpenglowVoter) votingGateError(slot uint64) error {
 	if !v.votingStarted && v.readyToVote != nil && !v.readyToVote(slot) {
 		return fmt.Errorf("%w: slot is still behind the startup live voting window", errVoterNotReady)
 	}
-	if v.reservation != nil && !v.reservation.allow(slot, v.engine.alpenglowVoteActionFloor(), false) {
+	if v.reservation != nil && !v.reservation.allow(slot, v.engine.alpenglowVerifiedFinalityFloor(), false) {
 		return fmt.Errorf("%w: waiting for verified recovery or durable signing reservation", errVoterNotReady)
 	}
 	return nil
@@ -1400,7 +1404,7 @@ func (v *alpenglowVoter) close() error {
 			if v.historyWriter != nil {
 				v.shutdownErr = v.historyWriter.close()
 			}
-			floor := v.engine.alpenglowVoteActionFloor()
+			floor := v.engine.alpenglowVerifiedFinalityFloor()
 			if v.shutdownErr == nil && v.engine.safetyError() == nil && floor >= v.reservation.recoverThrough {
 				v.history.SetRoot(floor)
 				v.shutdownErr = v.reservation.seal(v.historyDir, v.history, v.identity)

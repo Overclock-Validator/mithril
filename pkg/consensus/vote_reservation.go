@@ -237,7 +237,7 @@ func (v *alpenglowVoter) retainReservationEvent(event voterEvent) {
 	default:
 		return
 	}
-	if slot <= r.through.Load() || slot <= v.admissionFloor() || slot < v.waitToVoteSlot || v.engine.alpenglowVoteActionFloor() < r.recoverThrough || slot <= r.recoverThrough {
+	if slot <= r.through.Load() || slot <= v.admissionFloor() || slot < v.waitToVoteSlot || v.engine.alpenglowVerifiedFinalityFloor() < r.recoverThrough || slot <= r.recoverThrough {
 		return
 	}
 	if !v.votingStarted && v.readyToVote != nil && !v.readyToVote(slot) {
@@ -265,5 +265,5 @@ func (e *AlpenglowObserverEngine) AlpenglowCanSignLeaderSlot(slot uint64) bool {
 	if v.reservation == nil {
 		return true
 	}
-	return v.reservation.allow(slot, e.alpenglowVoteActionFloor(), true)
+	return v.reservation.allow(slot, e.alpenglowVerifiedFinalityFloor(), true)
 }
