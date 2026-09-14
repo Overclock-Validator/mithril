@@ -883,10 +883,8 @@ func (c *TransactionStatusCache) pruneLocked(through uint64) {
 	if drop <= 0 {
 		return
 	}
-	for _, node := range nodes[:drop] {
-		c.removeDeltaVisibleLocked(node.delta)
-	}
 	retained := nodes[drop:]
+	c.expireVisibleLocked(nodes[:drop], retained)
 	var parent *transactionStatusNode
 	for _, old := range retained {
 		parent = &transactionStatusNode{
@@ -895,6 +893,65 @@ func (c *TransactionStatusCache) pruneLocked(through uint64) {
 		}
 	}
 	c.tip = parent
+}
+
+// expireVisibleLocked expires a whole rooted batch. Most old blockhash groups
+// have no surviving bank and can be removed without visiting their transaction
+// keys. For a group crossing the boundary, update whichever side is smaller.
+// Immutable node deltas (including those pinned by producer views/checkpoints)
+// are never mutated. Unrooted retained banks count as survivors too.
+func (c *TransactionStatusCache) expireVisibleLocked(expired, retained []*transactionStatusNode) {
+	type groupExpiry struct {
+		expiredKeys  int
+		retainedKeys int
+		survivors    []*transactionStatusGroup
+	}
+	groups := make(map[solana.Hash]*groupExpiry)
+	for _, node := range expired {
+		for hash, delta := range node.delta {
+			g := groups[hash]
+			if g == nil {
+				g = &groupExpiry{}
+				groups[hash] = g
+			}
+			g.expiredKeys += len(delta.keys)
+		}
+	}
+	for _, node := range retained {
+		for hash, delta := range node.delta {
+			if g := groups[hash]; g != nil {
+				g.retainedKeys += len(delta.keys)
+				g.survivors = append(g.survivors, delta)
+			}
+		}
+	}
+	for hash, g := range groups {
+		if len(g.survivors) == 0 {
+			delete(c.visible, hash)
+		} else if g.retainedKeys < g.expiredKeys {
+			rebuilt := &visibleTransactionStatusGroup{keyIndex: g.survivors[0].keyIndex, keys: make(map[transactionStatusKey]uint16)}
+			for _, delta := range g.survivors {
+				for key := range delta.keys {
+					rebuilt.keys[key]++
+				}
+			}
+			c.visible[hash] = rebuilt
+			if len(rebuilt.keys) == 0 {
+				delete(c.visible, hash)
+			}
+		}
+	}
+	for _, node := range expired {
+		for hash, delta := range node.delta {
+			g := groups[hash]
+			if len(g.survivors) == 0 || g.retainedKeys < g.expiredKeys {
+				continue
+			}
+			// The existing removal path preserves reference counts for keys
+			// occurring in more than one retained/expired bank.
+			c.removeDeltaVisibleLocked(transactionStatusDelta{hash: delta})
+		}
+	}
 }
 
 func sliceTransactionStatusKey(messageHash [32]byte, keyIndex uint8) transactionStatusKey {
