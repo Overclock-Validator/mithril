@@ -103,6 +103,9 @@ var (
 	validatorTPUQUICBind             string
 	validatorAdvertisedIP            string
 	validatorSigverifyWorkers        int
+	validatorWaitToVoteSlot          uint64
+	validatorReservedHistory         bool
+	validatorInitializeReservation   bool
 	validatorCompletionReserveMs     int
 	validatorMaxBufferedTransactions int
 
@@ -549,6 +552,9 @@ func init() {
 	Run.Flags().StringVar(&validatorTPUQUICBind, "tpu-quic-bind-addr", "", "Validator TPU QUIC listen address (default 0.0.0.0:8004)")
 	Run.Flags().StringVar(&validatorAdvertisedIP, "validator-advertised-ip", "", "Public IP advertised for validator TPU QUIC")
 	Run.Flags().IntVar(&validatorSigverifyWorkers, "tpu-sigverify-workers", 0, "TPU signature verification workers (0 = GOMAXPROCS)")
+	Run.Flags().BoolVar(&validatorReservedHistory, "reserved-vote-history", false, "Use durable signing reservations with unsynchronized per-vote history writes")
+	Run.Flags().BoolVar(&validatorInitializeReservation, "initialize-vote-reservation", false, "Enroll complete synchronous vote history in reserved mode (one-time migration)")
+	Run.Flags().Uint64Var(&validatorWaitToVoteSlot, "wait-to-vote-slot", 0, "Do not cast new votes below this slot; the automatic startup cutoff still applies (0 = automatic only)")
 	Run.Flags().IntVar(&validatorCompletionReserveMs, "leader-completion-reserve-ms", 0, "Time reserved for leader finalization and broadcast (0 = 75ms default; tune from measured completion times)")
 	Run.Flags().IntVar(&validatorMaxBufferedTransactions, "tpu-max-buffered-transactions", 0, "Maximum queued TPU transactions (0 = 131072 default)")
 
@@ -648,6 +654,11 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	// Initialize config from file (do NOT bind flags - we handle precedence manually)
 	if err := config.InitConfig(); err != nil {
 		return err
+	}
+	if slot, err := configuredWaitToVoteSlot(cmd); err != nil {
+		return err
+	} else {
+		validatorWaitToVoteSlot = slot
 	}
 
 	// Check if a CLI flag was explicitly set by the user
@@ -2667,23 +2678,21 @@ postBootstrap:
 		}
 		global.SeedWallClockSlot(wallClockSeed)
 		startupWallSlot := global.WallClockSlot()
-		waitToVoteSlot := startupWallSlot - startupWallSlot%alpenglow.LeaderWindowSlots
-		if waitToVoteSlot <= math.MaxUint64-2*alpenglow.LeaderWindowSlots {
-			waitToVoteSlot += 2 * alpenglow.LeaderWindowSlots
-		} else {
-			waitToVoteSlot = math.MaxUint64
-		}
-		mlog.Log.Infof("ALPENGLOW voting startup watermark: wall_clock=%d wait_to_vote=%d", startupWallSlot, waitToVoteSlot)
+		waitToVoteSlot := effectiveWaitToVoteSlot(startupWallSlot, validatorWaitToVoteSlot)
+		mlog.Log.Infof("ALPENGLOW voting startup watermark: wall_clock=%d configured_wait_to_vote=%d wait_to_vote=%d", startupWallSlot, validatorWaitToVoteSlot, waitToVoteSlot)
 
 		identityPubkey := solana.PrivateKey(validatorIdentity).PublicKey()
 		if err := consensusEngine.EnableVoting(consensusengine.VotingConfig{
-			Identity:        validatorIdentity,
-			AuthorizedVoter: validatorAuthorizedVoter,
-			VoteAccount:     validatorVoteAccount,
-			HistoryDir:      blockstorePath,
-			EpochForSlot:    epochSchedule.GetEpoch,
-			SlotDuration:    blockprod.AlpenglowSlotDuration,
-			WaitToVoteSlot:  waitToVoteSlot,
+			Identity:                  validatorIdentity,
+			AuthorizedVoter:           validatorAuthorizedVoter,
+			VoteAccount:               validatorVoteAccount,
+			HistoryDir:                blockstorePath,
+			ReservedHistory:           validatorReservedHistory,
+			InitializeVoteReservation: validatorInitializeReservation,
+			Genesis:                   solana.MustHashFromBase58(networkGenesisHash),
+			EpochForSlot:              epochSchedule.GetEpoch,
+			SlotDuration:              blockprod.AlpenglowSlotDuration,
+			WaitToVoteSlot:            waitToVoteSlot,
 			ReadyToVote: func(slot uint64) bool {
 				wallSlot := global.WallClockSlot()
 				if liveSlot, ok := consensusEngine.AlpenglowLiveSlot(); ok {
@@ -2824,6 +2833,7 @@ postBootstrap:
 				}
 			},
 			ProductionParent: consensusEngine.AlpenglowBlockProductionParent,
+			CanSignSlot:      consensusEngine.AlpenglowCanSignLeaderSlot,
 			CurrentSlot: func() uint64 {
 				if slot, ok := consensusEngine.AlpenglowLiveSlot(); ok {
 					return slot
