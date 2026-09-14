@@ -479,3 +479,47 @@ func TestEntryPrefetchIndexDisabledAndLateInstall(t *testing.T) {
 	_, err := cached.verification.wait()
 	require.NoError(t, err)
 }
+
+func TestEntryPrefetchResetRetainsQueuedReservations(t *testing.T) {
+	a := NewSlotAssembler()
+	ctx, cancel := context.WithCancel(context.Background())
+	// Hold workers until after reset so all tokens remain in the channel.
+	p := &entryPrefetchPool{a: a, ctx: ctx, cancel: cancel, jobs: make(chan *slotState, entryPrefetchSlots)}
+	a.entryPrefetch = p
+	startWorker := sync.OnceFunc(func() {
+		p.workers.Add(1)
+		go p.run()
+	})
+	defer func() {
+		startWorker()
+		p.closeAndWait()
+	}()
+	for i := 0; i < entryPrefetchSlots; i++ {
+		s := &slotState{slot: uint64(i), completeBatches: []shredBatchRange{{0, 0}}}
+		a.mu.Lock()
+		a.slots[s.slot] = s
+		a.prefetchEntriesLocked(s)
+		a.releasePrefetchLocked(s)
+		a.mu.Unlock()
+	}
+	require.Equal(t, entryPrefetchSlots, len(p.jobs))
+	// Cleanup must not admit another generation while stale queue tokens live.
+	require.Never(t, func() bool {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		return p.slots != entryPrefetchSlots
+	}, 50*time.Millisecond, time.Millisecond)
+	fresh := &slotState{slot: 100, completeBatches: []shredBatchRange{{0, 0}}}
+	a.mu.Lock()
+	a.prefetchEntriesLocked(fresh)
+	reserved := fresh.prefetch != nil
+	a.mu.Unlock()
+	// Start the worker before assertions so test failures cannot strand cleanup.
+	startWorker()
+	require.False(t, reserved)
+	p.cleanup.Wait()
+	a.mu.Lock()
+	slots := p.slots
+	a.mu.Unlock()
+	require.Zero(t, slots)
+}

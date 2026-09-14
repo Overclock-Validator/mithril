@@ -41,4 +41,7 @@ jobs:
           go test -race -p 2 -count=1
           ./pkg/alpenglow ./pkg/consensus ./pkg/replay
           ./pkg/turbine ./pkg/sigverify ./pkg/blockprod/...
-          ./cmd/mithril/node
+          ./cmd/mithril/node ./cmd/mithril/configcmd
+
+      - name: Vote-program deque ownership race regression
+        run: go test -race -count=1 ./pkg/sealevel -run '^TestProcessNewVoteStateOwnsRetainedDeque$'
