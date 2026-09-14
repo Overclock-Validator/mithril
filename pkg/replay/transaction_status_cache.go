@@ -681,10 +681,32 @@ func (c *TransactionStatusCache) Root(through uint64) bool {
 	return !wasComplete && c.coverageComplete
 }
 
-// SnapshotThrough serializes only the rooted lineage needed at through. It is
-// called while constructing a fold job, so the blob rides in that exact durable
-// manifest without being copied into every speculative ResumeContext.
-func (c *TransactionStatusCache) SnapshotThrough(through uint64) ([]byte, error) {
+// TransactionStatusSnapshot pins an immutable checkpoint view. MarshalBinary
+// must use only captured data, without locking or revisiting the live cache,
+// and return an owned payload. It can run on the checkpoint worker while replay
+// commits, roots, or unwinds its current lineage.
+type TransactionStatusSnapshot interface {
+	MarshalBinary() ([]byte, error)
+}
+
+type transactionStatusSnapshot struct {
+	nodes               []*transactionStatusNode
+	rootedSinceSeed     uint16
+	complete            bool
+	coverageFromGenesis bool
+}
+
+func (s *transactionStatusSnapshot) MarshalBinary() ([]byte, error) {
+	if s == nil {
+		return nil, nil
+	}
+	return marshalTransactionStatusNodes(s.nodes, s.rootedSinceSeed, s.complete, s.coverageFromGenesis)
+}
+
+// CaptureSnapshotThrough selects the exact checkpoint lineage and coverage on
+// replay, but leaves transaction-key sorting and serialization to the worker.
+// Published deltas are immutable; only small node headers are copied here.
+func (c *TransactionStatusCache) CaptureSnapshotThrough(through uint64) (TransactionStatusSnapshot, error) {
 	if c == nil {
 		return nil, nil
 	}
@@ -700,7 +722,29 @@ func (c *TransactionStatusCache) SnapshotThrough(through uint64) ([]byte, error)
 	if rootedSinceSeed > maxTransactionStatusRoots {
 		rootedSinceSeed = maxTransactionStatusRoots
 	}
-	return marshalTransactionStatusNodes(nodes, uint16(rootedSinceSeed), complete, c.coverageFromGenesis)
+	owned := make([]transactionStatusNode, len(nodes))
+	pinned := make([]*transactionStatusNode, len(nodes))
+	for i, node := range nodes {
+		owned[i] = *node
+		// The encoder consumes only these node deltas. Do not keep the old
+		// parent chain, which could retain roots excluded from this snapshot.
+		owned[i].parent = nil
+		pinned[i] = &owned[i]
+	}
+	return &transactionStatusSnapshot{
+		nodes: pinned, rootedSinceSeed: uint16(rootedSinceSeed), complete: complete,
+		coverageFromGenesis: c.coverageFromGenesis,
+	}, nil
+}
+
+// SnapshotThrough is the synchronous convenience API. Serialization still
+// happens after releasing the cache lock; normal folds use CaptureSnapshotThrough.
+func (c *TransactionStatusCache) SnapshotThrough(through uint64) ([]byte, error) {
+	snapshot, err := c.CaptureSnapshotThrough(through)
+	if err != nil || snapshot == nil {
+		return nil, err
+	}
+	return snapshot.MarshalBinary()
 }
 
 func (c *TransactionStatusCache) processedSlotLocked(blockhash solana.Hash, key transactionStatusKey) uint64 {
