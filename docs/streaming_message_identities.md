@@ -76,8 +76,19 @@ storage ownership, JSON round-trips, early preparation and mixed canceled-batch
 fallback. Existing turbine tests cover invalid and discarded prefixes and
 completion cancellation.
 
-The benchmarked candidate passed native Zen 5 race tests. A subsequent explicit
-per-batch length guard and two additional ownership/fallback tests passed the
-final local race suite. Automatic approval review blocked uploading those final
-source/test updates; final-revision native verification is still pending. No
-new binary has been deployed and no live FAST improvement is claimed.
+The final revision passed native Zen 5 race tests covering txstatus, txverify,
+block, turbine, replay, consensus and node startup, plus vet and a full build.
+It was deployed at 21:25:24 UTC on September 14 with clean reserved-history
+shutdown and all prior live integrations preserved. Continuous leader load
+resumed at 21:26:04 UTC after three advancing healthy vote checks. Live FAST
+comparison excludes the first two minutes after load resumes; benchmark gains
+alone do not establish a FAST improvement.
+
+The first completed live comparison covers 1,336 post-warmup FAST proofs over
+7.3 minutes. Large-block median full-assembly-to-admission fell from 18.15 to
+7.04 ms (admission alone 14.25→1.82 ms). FAST inclusion changed from 98.08% to
+98.35% overall and 88.42% to 90.50% on large blocks. These small score changes
+are observational; the baseline and candidate windows span an epoch change.
+Several remaining misses coincide with unusually slow replay during local
+load sends, while others have late signature completions or shred collection.
+No claim of eliminating FAST misses or proving a score improvement is made.
