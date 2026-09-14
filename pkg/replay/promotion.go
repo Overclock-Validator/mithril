@@ -27,14 +27,13 @@ type batchCommitter interface {
 	CommitBatch(deltas []accounts.SlotDelta, throughSlot uint64, bankhashes map[uint64][32]byte, resumeCtx []byte) (accountsdb.BatchCommitResult, error)
 }
 
-// TransactionStatusCheckpointHooks deliberately split status-cache capture
-// from sidecar I/O. Snapshot runs on the replay loop while its mutable cache is
-// coherent; Install runs on the fold worker using only those immutable bytes.
-// This makes it impossible for the async worker to traverse concurrently
-// changing replay lineage. The later AccountsDB manifest remains the selector.
+// TransactionStatusCheckpointHooks split immutable status capture from encoding
+// and sidecar I/O. Capture runs on replay; the fold worker serializes the captured
+// view and then calls Install. Neither worker operation revisits live lineage.
+// The later AccountsDB manifest remains the durable checkpoint selector.
 type TransactionStatusCheckpointHooks struct {
-	Snapshot func(through uint64) ([]byte, error)
-	Install  func(through uint64, payload []byte) (*state.TransactionStatusCheckpointRef, error)
+	Capture func(through uint64) (TransactionStatusSnapshot, error)
+	Install func(through uint64, payload []byte) (*state.TransactionStatusCheckpointRef, error)
 	// AfterCommit is an advisory retention hook. It runs only after CommitBatch
 	// has durably selected the manifest carrying selected. Its error is logged
 	// and ignored: once CommitBatch succeeds, the fold must remain successful.
@@ -378,7 +377,10 @@ type foldJob struct {
 	ctx                                    *state.ResumeContext
 	ctxJSON                                []byte
 	stakeIdxDir                            string
-	transactionStatusCheckpointPayload     []byte
+	transactionStatusSnapshot              TransactionStatusSnapshot
+	checkpointCaptureTime                  time.Duration
+	checkpointEncodeTime                   time.Duration
+	checkpointBytes                        int
 	installTransactionStatusCheckpoint     func(through uint64, payload []byte) (*state.TransactionStatusCheckpointRef, error)
 	afterTransactionStatusCheckpointCommit func(selected *state.TransactionStatusCheckpointRef) error
 }
@@ -415,18 +417,18 @@ func (t *unrootedTail) buildFoldJob(through uint64, force bool, hookOverrides ..
 		return nil, fmt.Errorf("fold chunk through slot %d: no resume context recorded for chunk-top slot", through)
 	}
 	ctx = cloneResumeContextForFold(ctx)
-	var checkpointPayload []byte
-	if hooks.Snapshot != nil {
-		checkpointPayload, err = hooks.Snapshot(through)
+	var snapshot TransactionStatusSnapshot
+	var captureTime time.Duration
+	if hooks.Capture != nil {
+		start := time.Now()
+		snapshot, err = hooks.Capture(through)
+		captureTime = time.Since(start)
 		if err != nil {
-			return nil, fmt.Errorf("fold chunk through slot %d: snapshot transaction status checkpoint: %w", through, err)
+			return nil, fmt.Errorf("fold chunk through slot %d: capture transaction status checkpoint: %w", through, err)
 		}
-		if len(checkpointPayload) == 0 {
-			return nil, fmt.Errorf("fold chunk through slot %d: transaction status checkpoint snapshot is empty", through)
+		if snapshot == nil {
+			return nil, fmt.Errorf("fold chunk through slot %d: transaction status checkpoint capture is nil", through)
 		}
-		// The worker owns this immutable copy. Even a future Snapshot
-		// implementation that reuses a scratch buffer cannot race it.
-		checkpointPayload = append([]byte(nil), checkpointPayload...)
 	}
 	bankhashes := make(map[uint64][32]byte, len(chunk))
 	for _, sd := range chunk {
@@ -440,7 +442,8 @@ func (t *unrootedTail) buildFoldJob(through uint64, force bool, hookOverrides ..
 		bankhashes:                             bankhashes,
 		ctx:                                    ctx,
 		stakeIdxDir:                            t.stakeIdxDir,
-		transactionStatusCheckpointPayload:     checkpointPayload,
+		transactionStatusSnapshot:              snapshot,
+		checkpointCaptureTime:                  captureTime,
 		installTransactionStatusCheckpoint:     hooks.Install,
 		afterTransactionStatusCheckpointCommit: hooks.AfterCommit,
 	}, nil
@@ -450,12 +453,26 @@ func (t *unrootedTail) buildFoldJob(through uint64, force bool, hookOverrides ..
 // state). Stake-index entries flush (fsync'd) BEFORE the batch commit — see
 // promoteRootedBatched for why that order is a correctness requirement.
 func runFoldJob(committer batchCommitter, job *foldJob) error {
-	if job == nil || job.ctx == nil {
+	if job == nil {
+		return errors.New("fold job has no resume context")
+	}
+	// Failed folds are rebuilt from the retained tail. Neither a failed result
+	// nor a completed-but-unapplied job should keep checkpoint deltas alive.
+	defer func() { job.transactionStatusSnapshot = nil }()
+	if job.ctx == nil {
 		return errors.New("fold job has no resume context")
 	}
 	var selectedCheckpoint *state.TransactionStatusCheckpointRef
 	if job.installTransactionStatusCheckpoint != nil {
-		ref, err := job.installTransactionStatusCheckpoint(job.through, job.transactionStatusCheckpointPayload)
+		start := time.Now()
+		payload, err := encodeTransactionStatusCheckpoint(job.transactionStatusSnapshot)
+		job.checkpointEncodeTime = time.Since(start)
+		job.transactionStatusSnapshot = nil
+		if err != nil {
+			return fmt.Errorf("fold chunk through slot %d: encode transaction status checkpoint: %w", job.through, err)
+		}
+		job.checkpointBytes = len(payload)
+		ref, err := job.installTransactionStatusCheckpoint(job.through, payload)
 		if err != nil {
 			return fmt.Errorf("fold chunk through slot %d: prepare transaction status checkpoint: %w", job.through, err)
 		}
@@ -539,7 +556,9 @@ func (p *asyncPromoter) run() {
 		start := time.Now()
 		err := runFoldJob(p.committer, job)
 		if err == nil {
-			mlog.Log.FileOnlyf("async fold: committed %d slots through %d in %s", len(job.chunk), job.through, time.Since(start).Round(time.Millisecond))
+			mlog.Log.FileOnlyf("async fold: committed %d slots through %d in %s checkpoint_capture=%s checkpoint_encode=%s checkpoint_bytes=%d",
+				len(job.chunk), job.through, time.Since(start).Round(time.Millisecond),
+				job.checkpointCaptureTime, job.checkpointEncodeTime, job.checkpointBytes)
 		}
 		p.results <- foldResult{job: job, err: err}
 	}
@@ -713,14 +732,15 @@ func promoteRootedBatched(
 		}
 		ctx = cloneResumeContextForFold(ctx)
 		var selectedCheckpoint *state.TransactionStatusCheckpointRef
-		if hooks.Snapshot != nil {
-			payload, serr := hooks.Snapshot(chunkThrough)
+		if hooks.Capture != nil {
+			snapshot, serr := hooks.Capture(chunkThrough)
 			if serr != nil {
-				err = fmt.Errorf("promote chunk through slot %d: snapshot transaction status checkpoint: %w", chunkThrough, serr)
+				err = fmt.Errorf("promote chunk through slot %d: capture transaction status checkpoint: %w", chunkThrough, serr)
 				break
 			}
-			if len(payload) == 0 {
-				err = fmt.Errorf("promote chunk through slot %d: transaction status checkpoint snapshot is empty", chunkThrough)
+			payload, serr := encodeTransactionStatusCheckpoint(snapshot)
+			if serr != nil {
+				err = fmt.Errorf("promote chunk through slot %d: encode transaction status checkpoint: %w", chunkThrough, serr)
 				break
 			}
 			ref, perr := hooks.Install(chunkThrough, payload)
@@ -792,13 +812,27 @@ func resolveTransactionStatusCheckpointHooks(configured TransactionStatusCheckpo
 }
 
 func validateTransactionStatusCheckpointHooks(hooks TransactionStatusCheckpointHooks) error {
-	if (hooks.Snapshot == nil) != (hooks.Install == nil) {
-		return errors.New("transaction status checkpoint Snapshot and Install hooks must either both be set or both be nil")
+	if (hooks.Capture == nil) != (hooks.Install == nil) {
+		return errors.New("transaction status checkpoint Capture and Install hooks must either both be set or both be nil")
 	}
 	if hooks.AfterCommit != nil && hooks.Install == nil {
-		return errors.New("transaction status checkpoint AfterCommit hook requires Snapshot and Install hooks")
+		return errors.New("transaction status checkpoint AfterCommit hook requires Capture and Install hooks")
 	}
 	return nil
+}
+
+func encodeTransactionStatusCheckpoint(snapshot TransactionStatusSnapshot) ([]byte, error) {
+	if snapshot == nil {
+		return nil, errors.New("transaction status checkpoint capture is nil")
+	}
+	payload, err := snapshot.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	if len(payload) == 0 {
+		return nil, errors.New("transaction status checkpoint snapshot is empty")
+	}
+	return payload, nil
 }
 
 func cloneResumeContextForFold(ctx *state.ResumeContext) *state.ResumeContext {
