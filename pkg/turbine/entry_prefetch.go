@@ -3,10 +3,12 @@ package turbine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/block"
+	"github.com/Overclock-Validator/mithril/pkg/txverify"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -255,6 +257,7 @@ func verifyDecodedEntryBatches(ctx context.Context, blk *block.Block, batches []
 	type pending struct {
 		future *transactionVerification
 		offset int
+		count  int
 	}
 	var early []pending
 	var missing []*solana.Transaction
@@ -276,7 +279,7 @@ func verifyDecodedEntryBatches(ctx context.Context, blk *block.Block, batches []
 			}
 		}
 		if reusable {
-			early = append(early, pending{b.verification, offset})
+			early = append(early, pending{b.verification, offset, count})
 		} else {
 			missing = append(missing, blk.Transactions[offset:offset+count]...)
 			for i := 0; i < count; i++ {
@@ -316,7 +319,33 @@ func verifyDecodedEntryBatches(ctx context.Context, blk *block.Block, batches []
 	if firstErr != nil && firstIndex < len(blk.Transactions) {
 		return formatTransactionVerificationError(blk, firstIndex, firstErr)
 	}
-	return firstErr
+	if firstErr != nil {
+		return firstErr
+	}
+	// Custom verification hooks do not produce trusted message identities.
+	// Preserve their existing lazy preparation path (primarily test fixtures).
+	if verifier.verify != nil {
+		return nil
+	}
+	if offset != len(blk.Transactions) {
+		return fmt.Errorf("entry identity coverage mismatch")
+	}
+	identities := make([]txverify.VerifiedMessageIdentity, len(blk.Transactions))
+	for _, p := range early {
+		if len(p.future.identities) != p.count || p.offset+len(p.future.identities) > len(identities) {
+			return fmt.Errorf("entry identity range mismatch")
+		}
+		copy(identities[p.offset:], p.future.identities)
+	}
+	if fallback != nil {
+		if len(fallback.identities) != len(indices) {
+			return fmt.Errorf("fallback identity coverage mismatch")
+		}
+		for i, index := range indices {
+			identities[index] = fallback.identities[i]
+		}
+	}
+	return blk.CacheVerifiedTransactionMessageIdentities(identities)
 }
 
 func earlyEntryTimings(t *entryDecodeTimings, fullAt time.Time, timings *block.TurbineIngressTimings) {
