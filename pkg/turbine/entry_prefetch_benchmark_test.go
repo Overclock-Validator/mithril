@@ -46,7 +46,7 @@ func BenchmarkEntryPrefetchAssembly(b *testing.B) {
 											name = "overlap_on"
 										}
 										b.Run(name, func(b *testing.B) {
-											runAssemblyFlowBenchmark(b, source.blk, fixture, workers, target, arrival.span, overlap)
+											runAssemblyFlowBenchmark(b, source.blk, fixture, workers, target, arrival.span, overlap, false)
 										})
 									}
 								})
@@ -133,7 +133,7 @@ func makeAssemblyFlowFixture(tb testing.TB, source *block.Block) assemblyFlowFix
 	return fixture
 }
 
-func runAssemblyFlowBenchmark(b *testing.B, source *block.Block, fixture assemblyFlowFixture, workers, target int, span time.Duration, overlap bool) {
+func runAssemblyFlowBenchmark(b *testing.B, source *block.Block, fixture assemblyFlowFixture, workers, target int, span time.Duration, overlap, prepareIdentities bool) {
 	v := newTransactionVerifierWithBatchTarget(workers, 2*workers*target, target, nil)
 	defer v.closeAndWait()
 	if err := v.verifyBlock(source); err != nil {
@@ -147,7 +147,7 @@ func runAssemblyFlowBenchmark(b *testing.B, source *block.Block, fixture assembl
 		prefetch := newEntryPrefetchPool(context.Background(), a, v)
 		defer prefetch.closeAndWait()
 	}
-	var ready, parse, preparation, joins, arrivals []time.Duration
+	var ready, parse, preparation, joins, arrivals, identityPreparation, fullToIdentities []time.Duration
 	var early uint64
 	var cpu float64
 	before := sigverify.Stats()
@@ -182,6 +182,12 @@ func runAssemblyFlowBenchmark(b *testing.B, source *block.Block, fixture assembl
 		}
 		processed := a.processCompletion(context.Background(), work)
 		completed, err := a.finalizeCompletion(work, processed)
+		if prepareIdentities && err == nil && completed != nil {
+			start := time.Now()
+			_, err = completed.PrepareTransactionMessageIdentities()
+			identityPreparation = append(identityPreparation, time.Since(start))
+			fullToIdentities = append(fullToIdentities, time.Since(work.state.fullAt))
+		}
 		b.StopTimer()
 		cpu += flowCPUSeconds(b) - cpuStarted
 		if err != nil || completed == nil {
@@ -214,6 +220,10 @@ func runAssemblyFlowBenchmark(b *testing.B, source *block.Block, fixture assembl
 	flowReportPercentiles(b, preparation, "preparation_wait")
 	flowReportPercentiles(b, joins, "completion_sigverify")
 	flowReportPercentiles(b, arrivals, "collection")
+	if prepareIdentities {
+		flowReportPercentiles(b, identityPreparation, "identity_admission")
+		flowReportPercentiles(b, fullToIdentities, "full_to_identities")
+	}
 	if after.InternalFaultFallbacks != before.InternalFaultFallbacks {
 		b.Fatal("signature verifier used an internal fault fallback")
 	}
@@ -223,5 +233,26 @@ func runAssemblyFlowBenchmark(b *testing.B, source *block.Block, fixture assembl
 	}
 	if got, want := after.Signatures-before.Signatures, signatures*uint64(b.N); got != want {
 		b.Fatalf("verified %d signatures; want %d, exactly once per retained transaction", got, want)
+	}
+}
+
+// BenchmarkEntryMessageIdentityArrival includes the first admission-time message
+// identity lookup after assembly. Compare unchanged baseline and candidate with
+// identical fixtures; full_to_identities includes any moved completion work.
+// This does not include replay's whole-block duplicate map or transaction loop.
+func BenchmarkEntryMessageIdentityArrival(b *testing.B) {
+	flowConfigureBackend(b)
+	for _, source := range flowBenchmarkFixtures(b) {
+		b.Run(source.name, func(b *testing.B) {
+			fixture := makeAssemblyFlowFixture(b, source.blk)
+			for _, arrival := range []struct {
+				name string
+				span time.Duration
+			}{{"catchup", 0}, {"tip_200ms", 200 * time.Millisecond}} {
+				b.Run(arrival.name, func(b *testing.B) {
+					runAssemblyFlowBenchmark(b, source.blk, fixture, 2, 8, arrival.span, true, true)
+				})
+			}
+		})
 	}
 }

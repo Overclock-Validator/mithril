@@ -24,11 +24,12 @@ const defaultTransactionJobGroups = 4
 // A job is formed before admission, from transactions which are already
 // available. Workers never wait for more transactions to fill a vector group.
 type transactionVerifyJob struct {
-	ctx   context.Context
-	txs   []*solana.Transaction
-	errs  []error
-	start int
-	done  chan<- *transactionVerifyJob
+	ctx        context.Context
+	txs        []*solana.Transaction
+	identities []txverify.VerifiedMessageIdentity
+	errs       []error
+	start      int
+	done       chan<- *transactionVerifyJob
 }
 
 // transactionVerification owns an asynchronous request until done closes.
@@ -39,6 +40,7 @@ type transactionVerification struct {
 	index      int
 	err        error
 	finishedAt time.Time
+	identities []txverify.VerifiedMessageIdentity
 }
 
 func (r *transactionVerification) wait() (int, error) {
@@ -149,7 +151,11 @@ func (v *transactionVerifier) verifyGroup(job *transactionVerifyJob, batch *txve
 				}
 			}
 		} else {
-			verifyBatchSafely(batch, job.txs[start:end], job.errs[start:end])
+			if job.identities != nil {
+				verifyBatchWithIdentitiesSafely(batch, job.txs[start:end], job.errs[start:end], job.identities[start:end])
+			} else {
+				verifyBatchSafely(batch, job.txs[start:end], job.errs[start:end])
+			}
 		}
 		start = end
 	}
@@ -184,11 +190,14 @@ func (v *transactionVerifier) submitTransactions(ctx context.Context, txs []*sol
 	v.mu.Unlock()
 	ctx, cancel := context.WithCancel(ctx)
 	r := &transactionVerification{done: make(chan struct{}), cancel: cancel, index: -1}
+	if v.verify == nil {
+		r.identities = make([]txverify.VerifiedMessageIdentity, len(txs))
+	}
 	go func() {
 		defer v.request.Done()
 		defer func() { <-v.requests }()
 		defer cancel()
-		r.index, r.err = v.verifyTransactions(ctx, txs)
+		r.index, r.err = v.verifyTransactionsWithIdentities(ctx, txs, r.identities)
 		r.finishedAt = time.Now()
 		close(r.done)
 	}()
@@ -200,6 +209,10 @@ func (v *transactionVerifier) submitTransactions(ctx context.Context, txs []*sol
 // One caller can queue at most workers jobs, so a large catch-up block cannot
 // put all its transactions ahead of a newly available component.
 func (v *transactionVerifier) verifyTransactions(ctx context.Context, txs []*solana.Transaction) (int, error) {
+	return v.verifyTransactionsWithIdentities(ctx, txs, nil)
+}
+
+func (v *transactionVerifier) verifyTransactionsWithIdentities(ctx context.Context, txs []*solana.Transaction, identities []txverify.VerifiedMessageIdentity) (int, error) {
 	if len(txs) == 0 {
 		return -1, ctx.Err()
 	}
@@ -245,6 +258,9 @@ func (v *transactionVerifier) verifyTransactions(ctx context.Context, txs []*sol
 			}
 			pending.start = nextIndex
 			pending.txs = txs[nextIndex:end]
+			if identities != nil {
+				pending.identities = identities[nextIndex:end]
+			}
 			pending.errs = pending.errs[:end-nextIndex]
 			clear(pending.errs)
 		}
@@ -266,6 +282,7 @@ func (v *transactionVerifier) verifyTransactions(ctx context.Context, txs []*sol
 				}
 			}
 			job.txs = nil
+			job.identities = nil
 			clear(job.errs)
 			free = append(free, job)
 		case <-ctxDone:
@@ -314,6 +331,18 @@ func verifyBatchSafely(batch *txverify.BatchVerifier, txs []*solana.Transaction,
 	batch.Verify(txs, errs)
 }
 
+func verifyBatchWithIdentitiesSafely(batch *txverify.BatchVerifier, txs []*solana.Transaction, errs []error, identities []txverify.VerifiedMessageIdentity) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			clear(identities)
+			for i := range errs {
+				errs[i] = fmt.Errorf("signature verifier panic: %v", recovered)
+			}
+		}
+	}()
+	batch.VerifyWithMessageIdentities(txs, errs, identities)
+}
+
 func (v *transactionVerifier) closeAndWait() {
 	if v == nil {
 		return
@@ -359,6 +388,9 @@ func (v *transactionVerifier) verifyBlockContext(ctx context.Context, blk *block
 	index, err := request.wait()
 	if err != nil && index >= 0 {
 		return formatTransactionVerificationError(blk, index, err)
+	}
+	if err == nil && request.identities != nil {
+		return blk.CacheVerifiedTransactionMessageIdentities(request.identities)
 	}
 	return err
 }
