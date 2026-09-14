@@ -28,6 +28,9 @@ type entry struct {
 	skipGen uint64
 
 	alive bool
+	// Indexes belong to Buffer.mu. Every buffered entry appears exactly once
+	// in each heap; -1 denotes absence while an entry is owned by the consumer.
+	maxIndex, minIndex int
 }
 
 type maxHeap []*entry
@@ -38,15 +41,18 @@ func (h maxHeap) Less(i, j int) bool {
 }
 func (h maxHeap) Swap(i, j int) {
 	h[i], h[j] = h[j], h[i]
+	h[i].maxIndex, h[j].maxIndex = i, j
 }
 func (h *maxHeap) Push(x any) {
 	e := x.(*entry)
+	e.maxIndex = len(*h)
 	*h = append(*h, e)
 }
 func (h *maxHeap) Pop() any {
 	old := *h
 	n := len(old)
 	e := old[n-1]
+	e.maxIndex = -1
 	old[n-1] = nil
 	*h = old[:n-1]
 	return e
@@ -64,15 +70,18 @@ func (h minHeap) Less(i, j int) bool {
 }
 func (h minHeap) Swap(i, j int) {
 	h[i], h[j] = h[j], h[i]
+	h[i].minIndex, h[j].minIndex = i, j
 }
 func (h *minHeap) Push(x any) {
 	e := x.(*entry)
+	e.minIndex = len(*h)
 	*h = append(*h, e)
 }
 func (h *minHeap) Pop() any {
 	old := *h
 	n := len(old)
 	e := old[n-1]
+	e.minIndex = -1
 	old[n-1] = nil
 	*h = old[:n-1]
 	return e
@@ -162,21 +171,19 @@ func (b *Buffer) Cleanup(drop func(*entry) bool) int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	var doomed []*entry
+	dropped := 0
 	for _, e := range b.byHash {
-		if e.alive && drop(e) {
-			doomed = append(doomed, e)
+		if drop(e) {
+			b.killLocked(e)
+			dropped++
 		}
 	}
-	for _, e := range doomed {
-		b.killLocked(e)
-	}
-	b.drainDeadLocked()
-	return len(doomed)
+	return dropped
 }
 
 func (b *Buffer) pushAliveLocked(e *entry) {
 	e.alive = true
+	e.maxIndex, e.minIndex = -1, -1
 	b.byHash[e.messageHash] = e
 	heap.Push(&b.max, e)
 	heap.Push(&b.min, e)
@@ -187,17 +194,20 @@ func (b *Buffer) killLocked(e *entry) {
 	if e == nil || !e.alive {
 		return
 	}
+	if e.maxIndex >= 0 {
+		heap.Remove(&b.max, e.maxIndex)
+	}
+	if e.minIndex >= 0 {
+		heap.Remove(&b.min, e.minIndex)
+	}
 	e.alive = false
 	delete(b.byHash, e.messageHash)
 	b.alive--
 }
 
 func (b *Buffer) popMaxAliveLocked() *entry {
-	for b.max.Len() > 0 {
+	if b.max.Len() > 0 {
 		e := b.max.popEntry()
-		if !e.alive {
-			continue
-		}
 		b.killLocked(e)
 		return e
 	}
@@ -210,6 +220,7 @@ func (b *Buffer) popMaxAliveLocked() *entry {
 func (h *maxHeap) popEntry() *entry {
 	nodes := *h
 	root := nodes[0]
+	root.maxIndex = -1
 	last := nodes[len(nodes)-1]
 	nodes[len(nodes)-1] = nil
 	nodes = nodes[:len(nodes)-1]
@@ -227,9 +238,11 @@ func (h *maxHeap) popEntry() *entry {
 				break
 			}
 			nodes[i] = nodes[child]
+			nodes[i].maxIndex = i
 			i = child
 		}
 		nodes[i] = last
+		last.maxIndex = i
 	}
 	*h = nodes
 	return root
@@ -243,38 +256,17 @@ func higherPriority(a, b *entry) bool {
 }
 
 func (b *Buffer) peekMinAliveLocked() *entry {
-	for b.min.Len() > 0 {
-		if b.min[0].alive {
-			return b.min[0]
-		}
-		heap.Pop(&b.min)
+	if b.min.Len() > 0 {
+		return b.min[0]
 	}
 	return nil
 }
 
 func (b *Buffer) popMinAliveLocked() *entry {
-	for b.min.Len() > 0 {
+	if b.min.Len() > 0 {
 		e := heap.Pop(&b.min).(*entry)
-		if !e.alive {
-			continue
-		}
 		b.killLocked(e)
 		return e
 	}
 	return nil
-}
-
-func (b *Buffer) drainDeadLocked() {
-	for b.max.Len() > 0 {
-		if b.max[0].alive {
-			break
-		}
-		heap.Pop(&b.max)
-	}
-	for b.min.Len() > 0 {
-		if b.min[0].alive {
-			break
-		}
-		heap.Pop(&b.min)
-	}
 }
