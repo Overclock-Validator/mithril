@@ -35,8 +35,8 @@ func TestMaxHeapRemovalMatchesSortedOrder(t *testing.T) {
 }
 
 // Compare interleaved insertion, eviction, cleanup and removal with a small
-// unsorted reference model. Reusing hashes after removal also exercises stale
-// nodes left in the other heap without reusing the entry objects themselves.
+// unsorted reference model. Reusing hashes after removal exercises replacement
+// entries as well as counterpart removal from both indexed heaps.
 func TestBufferMixedOperationsMatchReference(t *testing.T) {
 	const capacity = 64
 	rng := rand.New(rand.NewSource(418))
@@ -95,6 +95,7 @@ func TestBufferMixedOperationsMatchReference(t *testing.T) {
 			require.Equal(t, want, b.Cleanup(func(e *entry) bool { return e.seq%11 == mod }))
 		}
 		require.Equal(t, len(model), b.Len(), "step=%d", step)
+		assertBufferIndexes(t, b)
 	}
 	for len(model) > 0 {
 		want := best(true)
