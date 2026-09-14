@@ -1,7 +1,7 @@
 # Keep raw benchmark evidence available without overwhelming the review.
-# Go's CPU-identification line may include trailing padding; retain raw bytes.
+# Retain raw Go CPU padding and test-framework space/tab indentation.
 docs/results/**/*.json linguist-generated=true
 docs/results/**/*.jsonl linguist-generated=true
 docs/results/**/*.txt linguist-generated=true whitespace=-blank-at-eol
-docs/results/**/*.log linguist-generated=true whitespace=-blank-at-eol
+docs/results/**/*.log linguist-generated=true -whitespace
 docs/results/**/*.tar.gz linguist-generated=true
