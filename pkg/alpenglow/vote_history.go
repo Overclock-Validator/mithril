@@ -438,34 +438,77 @@ func SaveReservedVoteHistory(dir string, h *VoteHistory, identity ed25519.Privat
 	return saveVoteHistory(dir, h, identity, false)
 }
 
+// VoteHistorySnapshot owns signed, immutable bytes. It retains no reference to
+// the voter's mutable maps or signing key and can be saved by a worker.
+type VoteHistorySnapshot struct {
+	node    solana.PublicKey
+	encoded []byte
+}
+
+// PrepareReservedVoteHistory validates and signs the complete current history
+// without filesystem access. Only the owner of h may call this while mutating h.
+func PrepareReservedVoteHistory(h *VoteHistory, identity ed25519.PrivateKey) (*VoteHistorySnapshot, error) {
+	if h == nil || !h.ReservationRequired {
+		return nil, fmt.Errorf("reserved history requires durable reservation enrollment")
+	}
+	encoded, err := encodeVoteHistory(h, identity)
+	if err != nil {
+		return nil, err
+	}
+	return &VoteHistorySnapshot{node: h.NodePubkey, encoded: encoded}, nil
+}
+
+// SaveReservedVoteHistorySnapshot replaces history without an explicit sync.
+// Callers must serialize writes and enforce the independent durable reservation.
+func SaveReservedVoteHistorySnapshot(dir string, snapshot *VoteHistorySnapshot) error {
+	if snapshot == nil || len(snapshot.encoded) == 0 {
+		return fmt.Errorf("save reserved history: empty snapshot")
+	}
+	if err := ensureDurableVoteHistoryDirectory(dir); err != nil {
+		return err
+	}
+	return replaceVoteHistoryFile(dir, VoteHistoryFilename(dir, snapshot.node), snapshot.encoded, false)
+}
+
 func saveVoteHistory(dir string, h *VoteHistory, identity ed25519.PrivateKey, durable bool) error {
+	encoded, err := encodeVoteHistory(h, identity)
+	if err != nil {
+		return err
+	}
+	if err := ensureDurableVoteHistoryDirectory(dir); err != nil {
+		return err
+	}
+	return replaceVoteHistoryFile(dir, VoteHistoryFilename(dir, h.NodePubkey), encoded, durable)
+}
+
+func encodeVoteHistory(h *VoteHistory, identity ed25519.PrivateKey) ([]byte, error) {
 	if h == nil {
-		return fmt.Errorf("save vote history: nil history")
+		return nil, fmt.Errorf("save vote history: nil history")
 	}
 	if len(identity) != ed25519.PrivateKeySize {
-		return fmt.Errorf("save vote history: invalid identity key size %d", len(identity))
+		return nil, fmt.Errorf("save vote history: invalid identity key size %d", len(identity))
 	}
 	node := solana.PublicKey(identity.Public().(ed25519.PublicKey))
 	if node != h.NodePubkey {
-		return fmt.Errorf("save vote history: identity %s does not match history %s", node, h.NodePubkey)
+		return nil, fmt.Errorf("save vote history: identity %s does not match history %s", node, h.NodePubkey)
 	}
 	h.Version = voteHistoryVersion
 	if h.ReservationRequired {
 		h.Version = reservedVoteHistoryVersion
 	}
 	if err := h.preparePersistedViews(); err != nil {
-		return fmt.Errorf("save vote history: %w", err)
+		return nil, fmt.Errorf("save vote history: %w", err)
 	}
 	defer func() {
 		h.PersistedNotarized = nil
 		h.PersistedParentReady = nil
 	}()
 	if err := h.validatePersistedState(); err != nil {
-		return fmt.Errorf("save vote history: %w", err)
+		return nil, fmt.Errorf("save vote history: %w", err)
 	}
 	data, err := json.Marshal(h)
 	if err != nil {
-		return fmt.Errorf("serialize vote history: %w", err)
+		return nil, fmt.Errorf("serialize vote history: %w", err)
 	}
 	envelope := savedVoteHistory{
 		Version:   h.Version,
@@ -475,13 +518,9 @@ func saveVoteHistory(dir string, h *VoteHistory, identity ed25519.PrivateKey, du
 	}
 	encoded, err := json.Marshal(envelope)
 	if err != nil {
-		return fmt.Errorf("serialize saved vote history: %w", err)
+		return nil, fmt.Errorf("serialize saved vote history: %w", err)
 	}
-	if err := ensureDurableVoteHistoryDirectory(dir); err != nil {
-		return err
-	}
-	filename := VoteHistoryFilename(dir, node)
-	return replaceVoteHistoryFile(dir, filename, encoded, durable)
+	return encoded, nil
 }
 
 // ensureDurableVoteHistoryDirectory creates each missing path component and
