@@ -43,20 +43,26 @@ const (
 )
 
 type SlotAssembler struct {
-	mu                   sync.Mutex
-	slots                map[uint64]*slotState
-	completedSlots       map[uint64]struct{}
-	knownBlockIDs        map[uint64]solana.Hash
-	rejectedBlockIDs     map[uint64]map[solana.Hash]struct{}
-	protectedKnownIDs    map[uint64]struct{}
-	protectedBlockIDs    map[uint64]struct{}
-	priorityRepairSlots  map[uint64]struct{}
-	priorityRepairOrder  []uint64
-	encoders             map[fecLayout]reedsolomon.Encoder
-	partialShredObs      map[uint64]PartialShredObservation // shreds seen for slots that never became full (retained for skip observability)
-	retentionFloor       uint64                             // when non-zero, slots >= floor are never "too old" (repair catchup holds a window far behind the live edge)
-	edgeScanLag          uint64                             // how far behind the shred edge the freshness-repair scan reaches (0 = repairScanSlotWindow)
-	maxObservedSlot      uint64
+	mu                  sync.Mutex
+	slots               map[uint64]*slotState
+	completedSlots      map[uint64]struct{}
+	knownBlockIDs       map[uint64]solana.Hash
+	rejectedBlockIDs    map[uint64]map[solana.Hash]struct{}
+	protectedKnownIDs   map[uint64]struct{}
+	protectedBlockIDs   map[uint64]struct{}
+	priorityRepairSlots map[uint64]struct{}
+	priorityRepairOrder []uint64
+	encoders            map[fecLayout]reedsolomon.Encoder
+	partialShredObs     map[uint64]PartialShredObservation // shreds seen for slots that never became full (retained for skip observability)
+	retentionFloor      uint64                             // when non-zero, slots >= floor are never "too old" (repair catchup holds a window far behind the live edge)
+	edgeScanLag         uint64                             // how far behind the shred edge the freshness-repair scan reaches (0 = repairScanSlotWindow)
+	maxObservedSlot     uint64
+	// Age sweeps depend on the edge, repair floor, and mutations that can add
+	// old metadata or release a completing generation's protected identities.
+	retentionSwept       bool
+	retentionDirty       bool
+	retentionSweepEdge   uint64
+	retentionSweepFloor  uint64
 	highestFullSlot      uint64 // monotonic: highest slot reconstructed from shreds ("full", Agave SlotMeta/is_full sense)
 	recoveredDataShreds  uint64
 	usefulRepairShreds   uint64 // distinct data shreds delivered BY repair (the throughput signal)
@@ -189,6 +195,7 @@ func (a *SlotAssembler) recordPartialObsLocked(state *slotState) {
 	if state == nil || len(state.shreds) == 0 {
 		return
 	}
+	a.retentionDirty = true
 	a.partialShredObs[state.slot] = PartialShredObservation{
 		DataShreds:     len(state.shreds),
 		RepairedShreds: state.repairedShreds,
@@ -365,6 +372,7 @@ func (a *SlotAssembler) abortCompletion(work *slotCompletionWork) {
 	}
 	a.mu.Lock()
 	if a.slots[work.state.slot] == work.state && work.state.completing {
+		a.retentionDirty = true
 		work.state.completing = false
 	}
 	a.mu.Unlock()
@@ -456,6 +464,8 @@ func (a *SlotAssembler) finalizeCompletion(work *slotCompletionWork, processed p
 		a.mu.Unlock()
 		return nil, nil
 	}
+	// Every terminal outcome releases this generation's retention protection.
+	a.retentionDirty = true
 	if processed.canceled {
 		state.completing = false
 		a.mu.Unlock()
@@ -553,6 +563,9 @@ func (a *SlotAssembler) SetKnownAlpenglowBlockID(slot uint64, blockID solana.Has
 	if _, rejected := a.rejectedBlockIDs[slot][blockID]; rejected {
 		return
 	}
+	if _, exists := a.knownBlockIDs[slot]; !exists {
+		a.retentionDirty = true
+	}
 	a.knownBlockIDs[slot] = blockID
 }
 
@@ -573,6 +586,7 @@ func (a *SlotAssembler) RejectAlpenglowBlockID(slot uint64, blockID solana.Hash)
 	if ids == nil {
 		ids = make(map[solana.Hash]struct{})
 		a.rejectedBlockIDs[slot] = ids
+		a.retentionDirty = true
 	}
 	ids[blockID] = struct{}{}
 	if a.knownBlockIDs[slot] == blockID {
@@ -584,6 +598,7 @@ func (a *SlotAssembler) ResetSlot(slot uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	a.retentionDirty = true
 	a.recordPartialObsLocked(a.slots[slot])
 	a.releasePrefetchLocked(a.slots[slot])
 	delete(a.slots, slot)
@@ -679,6 +694,32 @@ func (a *SlotAssembler) slotTooOldLocked(slot uint64) bool {
 }
 
 func (a *SlotAssembler) pruneOldSlotsLocked() {
+	if !a.retentionSwept || a.retentionDirty || a.retentionSweepEdge != a.maxObservedSlot || a.retentionSweepFloor != a.retentionFloor {
+		a.sweepRetentionMapsLocked()
+		a.retentionSwept = true
+		a.retentionDirty = false
+		a.retentionSweepEdge = a.maxObservedSlot
+		a.retentionSweepFloor = a.retentionFloor
+	}
+	// New incomplete generations can exceed the cap without advancing the
+	// edge (especially during catch-up). Never cache the capacity check.
+
+	if len(a.slots) == 0 {
+		return
+	}
+	for len(a.slots) > maxRetainedIncompleteSlotCap {
+		victim, ok := a.capEvictionCandidateLocked()
+		if !ok {
+			return
+		}
+		a.recordPartialObsLocked(a.slots[victim])
+		a.releasePrefetchLocked(a.slots[victim])
+		delete(a.slots, victim)
+		a.evictedSlots++
+	}
+}
+
+func (a *SlotAssembler) sweepRetentionMapsLocked() {
 	if len(a.slots) > 0 && a.maxObservedSlot > maxRetainedIncompleteSlotLag {
 		minSlot := a.maxObservedSlot - maxRetainedIncompleteSlotLag
 		if a.retentionFloor > 0 && a.retentionFloor < minSlot {
@@ -731,19 +772,6 @@ func (a *SlotAssembler) pruneOldSlotsLocked() {
 	}
 	a.prunePriorityRepairSlotsLocked()
 
-	if len(a.slots) == 0 {
-		return
-	}
-	for len(a.slots) > maxRetainedIncompleteSlotCap {
-		victim, ok := a.capEvictionCandidateLocked()
-		if !ok {
-			return
-		}
-		a.recordPartialObsLocked(a.slots[victim])
-		a.releasePrefetchLocked(a.slots[victim])
-		delete(a.slots, victim)
-		a.evictedSlots++
-	}
 }
 
 // capEvictionCandidateLocked chooses state furthest ahead of replay, rather
@@ -1063,6 +1091,9 @@ func (a *SlotAssembler) trackBlockIDLocked(blk *block.Block) {
 	}
 	if known, ok := a.knownBlockIDs[blk.Slot]; ok && known != (solana.Hash{}) && known != blockID {
 		return
+	}
+	if _, exists := a.knownBlockIDs[blk.Slot]; !exists {
+		a.retentionDirty = true
 	}
 	a.knownBlockIDs[blk.Slot] = blockID
 }
