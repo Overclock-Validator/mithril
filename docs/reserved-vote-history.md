@@ -4,7 +4,19 @@ Use `--reserved-vote-history` to keep detailed history with atomic
 write-and-rename on an ordered background writer, without explicitly syncing each vote. An independent signed
 reservation is synced before its slot range can be used. The default remains
 synchronous history. `--wait-to-vote-slot N` is an additional inclusive minimum;
-it cannot override recovery, finality, execution or ParentReady checks.
+it cannot override recovery, retained-root, execution or ParentReady checks.
+
+Live vote admission uses the retained consensus-pool root and the persisted
+vote-history root. Receiving a finalization certificate does not itself retire
+that slot for voting: successful replay may still supply a valid notarization
+before a later fast or slot+8 reward certificate is collected. The pool keeps
+its existing bounded 16-slot finality tail; expired catch-up work is still
+discarded. Exact execution, ParentReady, parent-vote and anti-equivocation rules
+are unchanged. Durable checkpoint pruning is queued behind completed replay
+events on the voter, so it cannot remove a block's voting state before its
+earlier replay event is processed. Observer-only pruning remains synchronous.
+Crash recovery uses a separate verified-finality/checkpoint floor, not this
+live admission window.
 
 For the first enrollment, stop the previous validator normally and start with
 `--reserved-vote-history --initialize-vote-reservation`. Enrollment requires the
