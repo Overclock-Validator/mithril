@@ -71,3 +71,29 @@ allocation reduction. Cold/all-new windows remain roughly unchanged. Native
 combined race suites, vet and the validator build passed. These are staging
 measurements: the encoding cache has not been deployed, so a live reduction in
 durable-root lag or missed FAST votes has not yet been established.
+
+## Fold admission before collecting account writes
+
+Replay checks for a checkpoint batch on every iteration, including skipped
+slots. `WorkingSet.PromotionChunk` first counts eligible held slots under its
+read lock. If fewer than the configured batch size are available, ordinary
+admission returns nil without allocating account-pointer lists. When ready,
+it collects only the oldest batch, not the entire eligible suffix. Forced
+partial folds still collect the available prefix.
+
+This preflight is not a finality shortcut or a new recovery policy. Replay's
+existing finality/verification gates supply the upper bound. Selection and
+collection hold the same lock; account pointers retain their existing ownership
+contract. Preparation does not prune the suffix or advance the durable root.
+The worker's write/commit order, required resume context, checkpoint reference
+validation, completion bookkeeping, and forced shutdown/epoch-boundary paths
+are unchanged.
+
+`BenchmarkBuildFoldJobWaitingForBatch` holds 127 slots with 512 account writes
+each while waiting for the default 128-slot batch. On Ryzen 9700X,
+GOMAXPROCS=8, three 300 ms runs, median admission-check time fell from 426 µs
+to 31.8 ns; 627,008 bytes and 134 allocations per rejected preparation became
+zero. This measures an ineligible batch check, not encoding, disk I/O, or a
+ready checkpoint. Boundary tests cover gaps, the finality upper bound, a full
+batch, forced partial batches, and selection after promotion; existing replay
+checkpoint/recovery tests cover the unchanged durable path.

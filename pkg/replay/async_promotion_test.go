@@ -444,3 +444,26 @@ func TestShutdownFlushCannotFoldPastGateTarget(t *testing.T) {
 	target = safePromoteTarget(9, true, 7, 6)
 	assert.Equal(t, uint64(5), target, "persisted-divergence floor holds promotion below the disputed slot")
 }
+
+// Model repeated replay/skip iterations while a nearly full checkpoint batch
+// waits for one more held bank. Account writes must not be copied on this path.
+func BenchmarkBuildFoldJobWaitingForBatch(b *testing.B) {
+	tail := newUnrootedTail(&fakeDurable{}, &fakeCommitter{durable: accounts.NewMemAccounts()}, 512, 128, "")
+	writes := make([]*accounts.Account, 512)
+	for i := range writes {
+		var key [32]byte
+		key[0], key[1] = byte(i), byte(i>>8)
+		writes[i] = &accounts.Account{Key: key, Lamports: 1}
+	}
+	for slot := uint64(1); slot <= 127; slot++ {
+		tail.Add(slot, writes, nil)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		job, err := tail.buildFoldJob(127, false)
+		if err != nil || job != nil {
+			b.Fatalf("unexpected fold admission: job=%v err=%v", job, err)
+		}
+	}
+}
