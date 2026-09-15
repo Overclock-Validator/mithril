@@ -57,3 +57,30 @@ Full native replay/block race tests, targeted node recovery race tests, vet and 
 
 
 Deployed September 15 at approximately 12:39 UTC after a clean stop, preserving signing/checkpoint state. The post-deployment 180-second trace showed no second scan in 63 executed slots with at least 30,000 fee checks. Publication median was 5.270 ms before (123 slots) versus 3.719 ms after (63 slots); these cohorts are not matched for leader/type/CU and are not p99 evidence. Across all publication callers, including direct local-leader adoption which still scans, trace p99 was 7.665→8.296 ms; no overall tail improvement is claimed. First complete candidate FAST sample: 769/774 (99.35%), clean parsing and verified binary metadata. Five completed sender runs each submitted 200,000 transactions with zero errors; maximum observed own block 48,622 transactions. Voting, load and monitors remain running. These operational checks do not establish sustained FAST improvement.
+
+### Partition visible status maps for large batches
+
+Large blockhash groups use 64 reference-count maps, with unique updates grouped during preparation so publication works on one smaller map at a time. Groups starting below 1,024 keys stay compact; growing them never copies the existing index merely to repartition it. All access retains the existing cache lock. MTS2 checkpoint bytes, immutable bank deltas, duplicate checks, unwind and voting/recovery guarantees are unchanged. Prepared batches remain private scratch and are discarded alongside stale key-slice offsets.
+
+Incremental Zen 5 tests against the previously deployed validator (not the full PR versus alpenglow-dev), 33,760 identities, GOMAXPROCS=2, three samples × 30 iterations: validated publication improved from **1.151–1.492 ms to 0.852–1.126 ms** across one/four and new/existing blockhash-group cases. Total preparation plus commit increased, particularly for four groups (**3.072→4.306 ms**, **4.346→5.812 ms**); the intended benefit depends on hiding preparation during execution. Separate three × 150-iteration tail benchmarks were mixed: median run p99 **3.142→1.488 ms** for new groups, **2.549→2.869 ms** for warmed existing groups. These are component measurements, not an overall p99 or FAST claim. Detailed methodology and recovery contract: `docs/transaction-status-publication.md`.
+
+Native targeted replay/block-production race tests, vet and the combined validator build passed. Regression coverage includes reference counts under concentrated keys, compact-group growth, expiry, restore, unwind, stale identity binding and concurrent publication. The candidate was deployed September 15 at 17:32 UTC after a clean stop; three advancing voting checks passed before the existing leader loader and FAST monitor resumed. Raw evidence and the exact combined candidate remain server-side at `/srv/mithril-status-index-20260915`.
+
+
+Initial live trial: 958 baseline versus 182 candidate received blocks with at
+least 30,000 transactions, excluding startup/native-test windows. Publication
+median/p99 measured **3.607/6.901 → 2.875/6.343 ms**. All 182 candidates had
+controls matched by leader, position, sender overlap and transaction/CU within
+10%; the median per-block difference was **−0.737 ms publication**, **+1.100 ms
+preparation**, **+0.498 ms execution**, and **−0.298 ms full assembly-to-local
+serialization**. Preparation-wait p99 remained 0.001 ms. Controls are reused and
+windows are unequal, so this is observational evidence, not isolated causation.
+
+Overall large-block p99 was **119.050 → 123.871 ms**; an overall tail improvement
+is not established. Five candidate admission outliers (four empty blocks) spent
+31.823 ms median / 39.907 ms maximum between spool-completion entry and beginning
+delivery, before status publication. Their deeper cause is not yet established
+on this binary. Two initial five-minute captures contained 1,911 inclusions in
+1,933 unique observed FAST proofs (98.86%); startup is included in this operational
+score, and it is not a before/after FAST comparison. Keep the candidate under
+monitoring; the status-stage gain alone does not establish the final p99 goal.
