@@ -29,4 +29,4 @@ Ten real QUIC blackhole race runs passed on both M4 Pro and Zen 5, covering reco
 
 Full local standalone race suites, vet and build passed. Fresh combined native race suites, vet and build also passed, including the latest status-publication and streaming follow-ups. Raw before/after logs and tested source hashes: `docs/results/review-fixes/2026-09-15`. The earlier combined failure remains preserved in `docs/results/pr-split-2026-09-15/voting/combined-tests.log`.
 
-Extracted from #279 with subsequent fixes. These follow-ups are not deployed; the enrolled validator continues running its existing binary.
+Extracted from #279 with subsequent fixes. These follow-ups are now included in the combined testnet deployment. Deployment is not mainnet durability qualification; the recovery contract and draft review requirement still apply.

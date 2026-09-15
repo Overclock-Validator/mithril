@@ -8,7 +8,7 @@ Zen 5 Ryzen 7 9700X, Go 1.26.4, GOMAXPROCS=2; 33,760 prepared identities, one or
 
 Remaining commit work measured **4.6–5.2 ms before versus 1.6–2.9 ms after prior preparation**. This excludes the preparation that can overlap execution. Total-work results were mixed in the first run; the slower case and its alternating-order recheck are preserved in the method document. The recheck measured 4.40–4.56 ms before versus 2.98–3.13 ms for preparation plus commit. New-group allocations halved, approximately 6.30 MB to 3.15 MB.
 
-A separate controlled transfer-execution workload measured 20.68 ms baseline, 18.57 ms with sizing alone, and 17.09 ms with overlap using two Go execution threads. This tests contention, not complete bank replay. No live FAST improvement is claimed and this publication change has not been deployed.
+A separate controlled transfer-execution workload measured 20.68 ms baseline, 18.57 ms with sizing alone, and 17.09 ms with overlap using two Go execution threads. This tests contention, not complete bank replay. This publication change is now deployed in the combined testnet validator; no isolated live FAST improvement is claimed.
 
 Method, all cases and raw evidence: `docs/transaction-status-publication.md` and `docs/results/status-publication/2026-09-15`.
 
@@ -28,4 +28,13 @@ Memoize each immutable node's MTS2 bytes and share the cache across snapshot cap
 
 On Zen 5, a moving 300-root window with 5,000 keys per root and the default 128-root fold cadence encoded in **194.52 ms before versus 85.02 ms after** (three-sample medians). Allocation fell from 99.12 MB to 57.33 MB per encoding. The baseline is the original uncached encoder from this split branch; this is an incremental encoding comparison, not the whole PR against dev. Entirely new windows were roughly unchanged. Method and other cadences: `docs/status-checkpoint-capture.md`.
 
-Final combined native race suites, vet and build passed. No deployment or live durable-root/FAST gain is claimed. Raw run artifacts remain outside the source tree.
+Final combined native race suites, vet and build passed. Encoding reuse is now deployed in the combined testnet validator; an isolated live durable-root/FAST gain is not established. Raw run artifacts remain outside the source tree.
+
+
+Fold admission now checks the held-slot count before materializing account-write lists and copies only the selected oldest batch. This removes repeated work when empty blocks or skipped-slot runs arrive before a checkpoint batch fills. Selection and collection share one WorkingSet read lock. The verified upper bound, forced partial folds, required resume context, checkpoint validation and durable commit/root ordering remain unchanged.
+
+`BenchmarkBuildFoldJobWaitingForBatch` (Ryzen 9700X, GOMAXPROCS=8, 127 held slots × 512 account writes, batch 128, three 300 ms runs) measured **426 µs → 31.8 ns**, with **627,008 bytes / 134 allocations → zero** per ineligible check. This is not a full-checkpoint or FAST-score speedup. Native account and targeted replay recovery/checkpoint race tests, vet and the combined build passed. Boundary tests cover eligibility, gaps, selected-prefix bounds and forced partial chunks. See `docs/status-checkpoint-capture.md`. Fix commit: `d55c7962`.
+
+### Empty-block deployment measurement
+
+Fold preflight (`d55c7962`) and the pending-certificate observer index (`72514abc`, separate certificate PR) were deployed together on September 15. Initial empty-block replay-admission p99 was **4.486 → 0.483 ms** (565 before, 401 after). Post-deployment fold admission across 1,386 calls measured 0.0071 ms median, 0.0125 ms p99 and 1.136 ms maximum. These are short observational windows, exclude the native benchmark interval, and do not establish either patch’s isolated contribution or sustained overall FAST gains.

@@ -1,35 +1,36 @@
 # Mithril performance review branches
 
-The accumulated changes from PR #279 and the later working tree are organized into six focused branches. All branches have been pushed as 7layermagik. PR creation is pending because GitHub returned HTTP403 for the token’s pull-request write permission; the existing PR #279 is unchanged.
+The changes from PR #279 and subsequent improvements are published in six focused review branches under **7layermagik**. GitHub still rejects PR creation with HTTP 403 (`Resource not accessible by personal access token`), confirmed September 15. These are published branches and ready PR descriptions, not six open PRs. PR #279 remains the older combined implementation.
 
-The current alpenglow-dev base was checked immediately before publication: `33dde4050d9250557583395810799aaac2f54017`. Four branches are based directly on it. Voting is stacked on certificate processing; leader packing is stacked on streaming preparation. The leader branch includes the latest streaming fixes through a history-preserving merge; its own code diff is unchanged.
+The verified development base is `33dde4050d9250557583395810799aaac2f54017`. Voting is stacked on certificate processing; leader packing is stacked on streaming preparation. The other four branches target `alpenglow-dev`.
 
-| Review | Base | Code diff | Description |
+| Review | Current head | Base | Description |
 |---|---|---|---|
+| [turbine: prepare complete transaction batches during shred arrival](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-streaming-preparation) | `311f83ea` | `alpenglow-dev` | [Scope, tests and benchmarks](review-prs/streaming-preparation.md) |
+| [alpenglow: reduce certificate verification lock contention](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-certificate-processing) | `72514abc` | `alpenglow-dev` | [Scope, tests and benchmarks](review-prs/certificate-processing.md) |
+| [replay: prepare status publication and defer checkpoint work](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-status-checkpoint-expiry) | `d55c7962` | `alpenglow-dev` | [Scope, tests and benchmarks](review-prs/status-checkpoint-expiry.md) |
+| [runtime: enable VM pooling and preserve owned vote state](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-runtime-allocation) | `752ef973` | `alpenglow-dev` | [Scope, tests and benchmarks](review-prs/runtime-allocation.md) |
+| [leader: improve packing and add near-limit block benchmarks](https://github.com/Overclock-Validator/mithril/compare/7layer%2Freview-streaming-preparation...7layer%2Freview-leader-packing) | `cc1e3dfc` | `7layer/review-streaming-preparation` | [Scope, tests and benchmarks](review-prs/leader-packing.md) |
+| [alpenglow: isolate vote delivery and reserve durable signing bounds](https://github.com/Overclock-Validator/mithril/compare/7layer%2Freview-certificate-processing...7layer%2Freview-vote-delivery-persistence) | `54b233ff` | `7layer/review-certificate-processing` | [Scope, tests and benchmarks](review-prs/vote-delivery-persistence.md) |
 
-| turbine: prepare complete transaction batches during shred arrival | `alpenglow-dev` | [Review diff](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-streaming-preparation) | [Scope, tests and benchmarks](review-prs/streaming-preparation.md) |
+## Newest validator changes
 
-| alpenglow: reduce certificate verification lock contention | `alpenglow-dev` | [Review diff](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-certificate-processing) | [Scope, tests and benchmarks](review-prs/certificate-processing.md) |
+- Certificate processing includes bounded MultiExp with unchanged full-strength random coefficients and pending-only observer reconciliation (`72514abc`).
+- Status checkpoints include immutable node encoding reuse and allocation-free rejection of incomplete fold batches (`d55c7962`).
+- Streaming includes relay-buffer reuse (`311f83ea`); voting and leader branches include their latest respective parent branches.
 
-| replay: prepare status publication and defer checkpoint work | `alpenglow-dev` | [Review diff](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-status-checkpoint-expiry) | [Scope, tests and benchmarks](review-prs/status-checkpoint-expiry.md) |
+These changes are included in the combined Zen 5 testnet deployment. The September 15 empty-block comparison measured replay-admission p99 of **4.486 → 0.483 ms** (565 before, 401 after), after deploying both observer reconciliation and fold preflight. This short observational comparison does not isolate either change or establish sustained overall FAST improvement. The descriptions retain component benchmarks, their actual baselines, validation and limitations.
 
-| runtime: enable VM pooling and preserve owned vote state | `alpenglow-dev` | [Review diff](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-runtime-allocation) | [Scope, tests and benchmarks](review-prs/runtime-allocation.md) |
+## Non-empty block follow-up
 
-| leader: improve packing and add near-limit block benchmarks | `7layer/review-streaming-preparation` | [Review diff](https://github.com/Overclock-Validator/mithril/compare/7layer%2Freview-streaming-preparation...7layer%2Freview-leader-packing) | [Scope, tests and benchmarks](review-prs/leader-packing.md) |
+The subsequent investigation changed the synthetic sender’s pacing and added operational diagnostics; it did not change or restart the validator binary. The first matched pacing comparison included only ten baseline and four candidate blocks. It is not p99 evidence. The leader description records the settings, results, variable block fill and exclusions. Machine-specific services, funding/runtime state and trace collectors remain outside these validator review branches.
 
-| alpenglow: isolate vote delivery and reserve durable signing bounds | `7layer/review-certificate-processing` | [Review diff](https://github.com/Overclock-Validator/mithril/compare/7layer%2Freview-certificate-processing...7layer%2Freview-vote-delivery-persistence) | [Scope, tests and benchmarks](review-prs/vote-delivery-persistence.md) |
+A roughly 51 ms completion-to-ingestion outlier remains unexplained and did not recur in the bounded trace. Omission from one FAST certificate does not prove absence from all FAST certificates. No fix or sustained FAST improvement is claimed for that investigation.
 
+## Review and validation
 
-Start with runtime allocation, certificate processing and the status cache for the smaller independent reviews. Streaming preparation contains the newest large-block fix. Review voting after certificate processing, and leader packing after streaming. Each diff includes its own tests and applicable benchmark evidence; generated evidence is collapsed using .gitattributes.
+Start with runtime allocation, certificate processing and status checkpoints. Review voting after certificates, and leader packing after streaming. Voting should remain draft: reserved persistence is opt-in and its explicit crash-recovery contract sacrifices availability when previous signing decisions are uncertain. Native race tests, vet and combined builds passed as documented in each description; testnet deployment is not mainnet power-loss qualification.
 
-## Verification
+The split was initially recombined and checked against the preserved implementation; later follow-ups were checked in separate combined audit builds. Full sealevel-suite success is not claimed: unrelated BPF-loader failures were reproduced on the unchanged development base.
 
-The split branches were recombined in an isolated audit checkout. After reconciling shared CLI/configuration additions in three files, Go sources, module files, TOML configuration and CI matched the preserved full implementation exactly. That snapshot includes the original PR’s review-fix commit d1172b9a and the later performance work. Formatting-only cleanup followed. The original dirty working tree was left unchanged and its17file hashes verified.
-
-Individual branch checks passed as documented in docs/results/pr-split-2026-09-15. The combined validator build passed. The original combined race run hit `TestVotorBroadcasterIsolatesBlockedPeer/reconnect`. The follow-up fixes its queue-age timeout weakness and both remote-close reconnect paths; deterministic regressions and ten real blackhole race runs passed on both M4 Pro and Zen 5. The fresh combined native race suites, vet and build passed, including status publication and these review fixes. Voting remains draft pending review of the consensus-sensitive branch. Full sealevel-suite success is not claimed because the original PR recorded unrelated BPF-loader failures on the unchanged base.
-
-## Scope and runtime
-
-The status-cache branch now also includes the measured transaction-status publication optimization and immutable checkpoint-node encoding reuse. Certificate processing also includes bounded MultiExp with the original scalar path for small batches and single-thread runtimes. Final combined native race tests, vet and build passed; the voting branch remains stacked on the new certificate head with its scoped diff unchanged. Its scope, benchmark limitations and fresh native validation are in the linked review description. It has not been deployed. Streaming now owns its config template, and inconsistent prefetched identities trigger full final-block verification. The two-worker default is unchanged. Deferred scheduler retry experiments remain separate. No validator deployment, restart, load-policy change or key/ledger operation was performed during the split. The previously deployed validator, continuous own-leader large blocks and monitoring remain under the existing server services.
-
-This integration branch preserves the combined implementation from the split and historical combined evidence for reference; its code snapshot does not include the later status-publication, checkpoint-encoding, MultiExp or transport/identity-recovery follow-ups. Review the current focused branch heads; a separate combined audit checkout validated those updates together. Review the six focused diffs above; it is not an additional monolithic PR.
+This integration branch is a review index and historical combined snapshot. Its source is not the latest combined deployed source; use the six focused branch heads for code review. No validator restart or runtime configuration change was performed while preparing this index.
