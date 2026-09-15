@@ -422,15 +422,19 @@ func VoteHistoryFilename(dir string, node solana.PublicKey) string {
 	return filepath.Join(dir, fmt.Sprintf("vote_history-%s.mithril.json", node))
 }
 
-// SaveVoteHistory signs the exact serialized history with the validator
-// identity and atomically replaces the previous file before a vote can be
-// admitted to consensus or sent to the network.
+// SaveVoteHistory authenticates and durably replaces the exact history: write,
+// file sync, rename, then directory sync. Synchronous-mode callers require
+// success before pool admission (which can publish certificates) or network
+// enqueue. The BLS signature may already have been computed privately in RAM;
+// this is persist-before-publication, not persist-before-BLS-computation.
 func SaveVoteHistory(dir string, h *VoteHistory, identity ed25519.PrivateKey) error {
 	return saveVoteHistory(dir, h, identity, true)
 }
 
-// SaveReservedVoteHistory writes and renames without per-vote sync. The caller
-// must enforce an independently durable signing reservation before using it.
+// SaveReservedVoteHistory writes and renames without per-vote sync. Success
+// does not prove that this history survived a host/power failure. The caller
+// must enforce an independently durable signing reservation and its restart
+// quarantine; a valid-looking older history is not evidence of completeness.
 func SaveReservedVoteHistory(dir string, h *VoteHistory, identity ed25519.PrivateKey) error {
 	if h == nil || !h.ReservationRequired {
 		return fmt.Errorf("reserved history requires durable reservation enrollment")
@@ -459,7 +463,9 @@ func PrepareReservedVoteHistory(h *VoteHistory, identity ed25519.PrivateKey) (*V
 }
 
 // SaveReservedVoteHistorySnapshot replaces history without an explicit sync.
-// Callers must serialize writes and enforce the independent durable reservation.
+// Success means replacement completed, not durable vote acknowledgement. Callers
+// must serialize writes and enforce the independent durable reservation. On an
+// unclean restart even an intact snapshot cannot bypass the startup bound.
 func SaveReservedVoteHistorySnapshot(dir string, snapshot *VoteHistorySnapshot) error {
 	if snapshot == nil || len(snapshot.encoded) == 0 {
 		return fmt.Errorf("save reserved history: empty snapshot")

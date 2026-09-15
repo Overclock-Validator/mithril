@@ -19,15 +19,29 @@ import (
 const signingReserveSlots = uint64(32)
 const signingRenewRemaining = uint64(16)
 
-// The worker owns record after startup. Only its acknowledged Through is
-// published to signers. Requested slots never grant signing permission.
+// signingReservation bounds what a crash may erase from detailed vote history.
+// Intended guarantee: losing recent history must not authorize conflicting
+// voting/leader actions after restart. It does NOT guarantee that every vote
+// survives on disk, immediate restart voting, or recovery from safety-file rollback.
+//
+// On an enrolled restart, H is the startup reservation. Without a clean-history
+// seal, all vote types (including restored votes) are forbidden at slots <= H;
+// slots > H also wait until verified finality/checkpoint state reaches H.
+// Leaders always obey that startup barrier, even after a clean vote-history seal.
+// The current acknowledged Through separately caps every new signing permission.
+// Renewal can raise Through, but never moves this run's fixed recovery barrier.
+//
+// The worker owns record after startup. Only a successful file+directory sync
+// publishes Through to signers; a request, queued write or uncertain sync cannot.
+// This assumes storage honors sync and a single fenced identity owner preserves
+// the current reservation independently of AccountsDB. See docs/reserved-vote-history.md.
 type signingReservation struct {
 	uncertain      bool // Worker only, read after halt. Failed sync may have reached storage.
 	record         alpenglow.VoteReservation
 	through        atomic.Uint64
 	desired        atomic.Uint64
 	stopped        atomic.Bool
-	recoverThrough uint64 // Immutable bound read at startup, zero after verified clean shutdown.
+	recoverThrough uint64 // Startup H, or zero after first enrollment / a validated clean-history seal.
 	leaderThrough  uint64 // Exact leader production history is not saved: always skip the old range.
 	wake           chan struct{}
 	changed        chan struct{}
@@ -87,7 +101,11 @@ func openSigningReservation(cfg VotingConfig, node solana.PublicKey, shredVersio
 			r.recoverThrough = 0
 		}
 	}
-	// Consume the clean marker before any new signature or history mutation.
+	// A matching digest proves exact history only for the sealed session. Consume
+	// that exception with a durably acknowledged dirty successor before allowing
+	// new vote/leader signing or new detailed-history decisions. A crash after
+	// this write must use H,
+	// even if the detailed history file still looks valid or matches the old seal.
 	r.record.CleanHistoryDigest = nil
 	r.record.Generation++
 	if err := r.persist(r.record); err != nil {
@@ -104,8 +122,12 @@ func openSigningReservation(cfg VotingConfig, node solana.PublicKey, shredVersio
 	return r, nil
 }
 
-// allow is nonblocking and can also be called by the leader loop. Finality
-// comes from verified consensus/checkpoint state, never an RPC wall-clock tip.
+// allow is nonblocking and protects vote signing/restoration and leader slots.
+// For a nonzero startup barrier H, require slot > H AND finalized >= H. Merely
+// observing a new block, waiting elapsed time, or replaying past H is not proof
+// that prior decisions can be forgotten. Finality comes from verified consensus/
+// checkpoint state, never an RPC tip; --wait-to-vote-slot cannot override it.
+// Passing this gate is necessary, not sufficient: normal protocol checks apply.
 func (r *signingReservation) allow(slot, finalized uint64, leader bool) bool {
 	if r.stopped.Load() {
 		return false
@@ -187,8 +209,13 @@ func (r *signingReservation) halt() {
 	<-r.done
 }
 
-// Called only after the voter loop and leader producer have stopped. A failure
-// leaves dirty recovery in force; history must be synced before its digest.
+// seal may be called only after the voter loop and leader producer have stopped,
+// and after the ordered history writer has been drained/joined. The caller must
+// also establish verified finality >= recoverThrough and no latched safety fault.
+// Sync exact history first, then sync its digest in the reservation. A normal
+// process exit or successful unsynced rename alone is not a clean seal. On an
+// error the caller must not assume cleanliness; restart validates whichever
+// durable record survived. The seal never relaxes the next run's leader barrier.
 func (r *signingReservation) seal(dir string, history *alpenglow.VoteHistory, identity ed25519.PrivateKey) error {
 	r.halt()
 	if r.uncertain {

@@ -13,9 +13,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// VoteReservation is independent of AccountsDB checkpoints. Never restore an
-// older copy of this record when restoring a snapshot. A clean digest is valid
-// only until a durably written dirty successor consumes it before signing.
+// VoteReservation is the durable upper bound on slots this identity may sign,
+// not a record of slots actually signed. It must survive independently of
+// AccountsDB checkpoints and must never be restored from an older snapshot.
+// A signature authenticates this file; it does not prove freshness against
+// rollback, nor does Generation provide an external monotonic counter.
+// CleanHistoryDigest permits exact-history vote recovery only after validation
+// and durable consumption by a dirty successor before signing. It does not
+// certify complete leader-block history. See docs/reserved-vote-history.md.
 type VoteReservation struct {
 	Version            uint32           `json:"version"`
 	Node               solana.PublicKey `json:"node"`
