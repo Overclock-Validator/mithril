@@ -182,7 +182,7 @@ func (p *entryPrefetchPool) run() {
 			txs := entryBatchTransactions(batch.entries)
 			if len(txs) > 0 {
 				batch.submittedAt = time.Now()
-				batch.verification, batch.submitErr = p.verifier.submitTransactions(f.ctx, txs)
+				batch.verification, batch.submitErr = p.verifier.submitPrefetchTransactions(f.ctx, txs)
 			}
 		}
 		close(ready)

@@ -131,3 +131,29 @@ of maximum catch-up throughput on every core count or backend. Set
 larger machine; disabling overlap alone does not restore the previous worker
 count. Existing two/four-worker contention measurements are in the September 12
 report above. No 32-core comparison was performed.
+
+## Reserved admission for completion
+
+Decoded prefetch components now use a separate admission class. The existing total request limit remains `2 * workers`; at most `2 * workers - 1` requests may prefetch. Thus the default two-worker pool keeps four total permits, with at most three occupied by prefetch. Waiting completion/full-block recovery requests win the next free permit over prefetch. Their admission, cancellation and close registration share the verifier mutex; notification channels are allocated only when callers must wait.
+
+No worker or job queue is added, and verification, vector width, job grouping and per-request rolling windows are unchanged. Accepted jobs finish normally and are joined before transaction memory can be reused. No signature checks are skipped. Prefetch may wait while completion callers remain queued and resumes when that backlog drains. This is completion-class priority, not exact replay-head priority: future-slot completions also qualify, and already admitted prefetch work is not promoted or preempted. Checkpoint, persistence and voting-recovery contracts are unchanged.
+
+### Saturation benchmark
+
+`BenchmarkVerifierCompletionReservation` verifies four already-ready prefetch components (256 or 4,096 signed 228-byte transactions each) plus a 32-transaction completion request. All requests are joined; total-work timing includes all four components. Two verifier workers, eight signature lanes, four vector groups, GOMAXPROCS=8, Narya r51, Ryzen 9700X / Go1.26.4. Three runs of 100 iterations each, Nice19 and a 200% CPU quota on the shared validator host. Test intervals are excluded from live FAST comparisons.
+
+The before comparison uses the previously deployed source (status-validation combined build, SHA256 `2c81fc403e8a6eca73b87ede51890041347e1af0e3c63df005fcfeb26448e872`) with only the benchmark added via a Go test overlay. The candidate also measures the shared-class control to distinguish policy from incidental overhead. These are incremental admission results, not the whole PR versus alpenglow-dev.
+
+For four 4,096-transaction components, medians of the three per-run statistics were:
+
+| Measurement | Previous deployment | Reserved admission |
+|---|---:|---:|
+| Completion admission p50 | 37.19 ms | 0.000742 ms |
+| Completion admission p99 | 45.78 ms | 0.004599 ms |
+| Completion finished p99 | 47.31 ms | 1.488 ms |
+| All work finished p50 | 39.43 ms | 39.11 ms |
+| All work finished p99 | 49.09 ms | 50.65 ms |
+
+Completion-finished p99 ranged 46.43–54.52 ms before and 1.477–1.719 ms after. Admission p99 ranged 44.27–53.76 ms before and 0.003206–0.06401 ms after. Every iteration reached its intended request occupancy. For 256-transaction components, completion-finished p99 medians were 3.215→1.165 ms. Shared-host scheduling introduces variation; reserving admission does not remove queued-job or CPU delays, and these 100-sample tails are not a live p99/FAST claim. Total-work throughput was roughly unchanged; no total-work tail improvement is claimed.
+
+Full local/native turbine and blockstream race suites, targeted native node recovery race tests, local/native vet and combined build passed. Tests cover the reserved permit, the unchanged total bound, waiting completion priority, prefetch resumption, cancellation cleanup, close/admission races and joining owned transactions. The reset test retains both generations' memory reservations while a one-worker verifier delays the new prefetch until its canceled old reader joins. Server-only raw evidence and exact combined source: `/srv/mithril-verifier-reservation-20260915`.
