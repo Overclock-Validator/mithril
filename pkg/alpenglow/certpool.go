@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"math/big"
+	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -1237,8 +1238,10 @@ func (p *CertPool) verifyParsedBatch(members []parsedBatchVote, payload []byte) 
 
 func randomizedAggregatePairingOK(members []parsedBatchVote, payload []byte) (bool, error) {
 	// Bucket setup outweighs MultiExp's savings on small batches, including
-	// the two-candidate collision path and failed-batch subdivisions.
-	if len(members) < 16 {
+	// the two-candidate collision path and failed-batch subdivisions. Its
+	// internal task handoffs can also delay verification behind replay when
+	// only one Go execution thread is available, despite doing less arithmetic.
+	if len(members) < 16 || runtime.GOMAXPROCS(0) == 1 {
 		return randomizedAggregatePairingScalarOK(members, payload)
 	}
 	return randomizedAggregatePairingMultiExpOK(members, payload)
