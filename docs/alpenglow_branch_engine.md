@@ -154,6 +154,31 @@ mixed (heterogeneous-client) or Mithril-only cluster identically:
   timeouts, vote signing/transmission, durable vote-history persistence, and
   standstill participation.
 
+## Replay-observer diagnostics
+
+The observer retains certificate history for deduplication and match/mismatch
+reporting. A separate bounded index contains only retained, block-bearing
+certificates that have not yet been reconciled against replay. Reconciliation
+removes an entry after either a match or mismatch; eviction removes it together
+with the historical certificate. Hashless/skipped replay cannot reconcile a
+block-bearing certificate. Pending counts and age/window statistics retain the
+same semantics, but scan unresolved entries rather than completed history.
+
+This index is disposable, process-local diagnostic state. It neither authorizes
+votes nor substitutes for verified certificates, the chain tracker's finality
+checks, durable signing bounds, vote history, or checkpoint recovery. Those
+checks and persistence contracts are unchanged.
+
+`BenchmarkObserverEmptyReplay` measures observer work for an empty block, with
+or without four preceding skipped slots, against 4,096 retained certificates.
+It covers 0, 32, and 4,096 unresolved entries. On Ryzen 9700X (GOMAXPROCS=8,
+three 300 ms runs), median time for the four-skips-plus-empty case with 32
+unresolved entries was 686.4 µs before the index and 1.87 µs afterward. With
+all 4,096 entries unresolved it was 380.5 → 159.3 µs. These are component
+benchmarks; they exclude execution, certificate cryptography, network delivery,
+and end-to-end FAST inclusion. Live comparisons must account for observer
+history warming after a restart and different leader/skip patterns.
+
 ## What this proves — and does not
 
 The certificate layer proves which block *data* the cluster settled on. In
