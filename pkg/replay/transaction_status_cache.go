@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/state"
@@ -48,6 +49,38 @@ type transactionStatusNode struct {
 	hasBlockID bool
 	parent     *transactionStatusNode
 	delta      transactionStatusDelta
+
+	// Shared by parentless checkpoint copies and relinked retained nodes.
+	// Only the memoized encoding changes after publication; lineage and delta
+	// remain immutable. Never copy the atomic field after its first use.
+	encoding atomic.Pointer[transactionStatusNodeEncoding]
+}
+
+type transactionStatusNodeEncoding struct {
+	once sync.Once
+	data []byte
+}
+
+func (n *transactionStatusNode) encodingCache() *transactionStatusNodeEncoding {
+	if cache := n.encoding.Load(); cache != nil {
+		return cache
+	}
+	cache := new(transactionStatusNodeEncoding)
+	if n.encoding.CompareAndSwap(nil, cache) {
+		return cache
+	}
+	return n.encoding.Load()
+}
+
+// copyInto initializes a fresh node, sharing its encoding without retaining
+// excluded ancestry or copying a used synchronization primitive. The encoding excludes
+// parent links and depends only on the immutable slot, block ID and delta.
+func (n *transactionStatusNode) copyInto(copy *transactionStatusNode, parent *transactionStatusNode) {
+	*copy = transactionStatusNode{
+		slot: n.slot, blockID: n.blockID, hasBlockID: n.hasBlockID,
+		parent: parent, delta: n.delta,
+	}
+	copy.encoding.Store(n.encodingCache())
 }
 
 type visibleTransactionStatusGroup struct {
@@ -733,10 +766,8 @@ func (c *TransactionStatusCache) CaptureSnapshotThrough(through uint64) (Transac
 	owned := make([]transactionStatusNode, len(nodes))
 	pinned := make([]*transactionStatusNode, len(nodes))
 	for i, node := range nodes {
-		owned[i] = *node
-		// The encoder consumes only these node deltas. Do not keep the old
-		// parent chain, which could retain roots excluded from this snapshot.
-		owned[i].parent = nil
+		// Do not keep the old parent chain or copy its atomic field.
+		node.copyInto(&owned[i], nil)
 		pinned[i] = &owned[i]
 	}
 	return &transactionStatusSnapshot{
@@ -895,10 +926,9 @@ func (c *TransactionStatusCache) pruneLocked(through uint64) {
 	c.expireVisibleLocked(nodes[:drop], retained)
 	var parent *transactionStatusNode
 	for _, old := range retained {
-		parent = &transactionStatusNode{
-			slot: old.slot, blockID: old.blockID, hasBlockID: old.hasBlockID,
-			parent: parent, delta: old.delta,
-		}
+		next := new(transactionStatusNode)
+		old.copyInto(next, parent)
+		parent = next
 	}
 	c.tip = parent
 }
@@ -976,7 +1006,16 @@ func sliceTransactionStatusKey(messageHash [32]byte, keyIndex uint8) transaction
 }
 
 func marshalTransactionStatusNodes(nodes []*transactionStatusNode, rootedSinceSeed uint16, complete bool, coverageFromGenesis bool) ([]byte, error) {
-	var buf bytes.Buffer
+	encoded := make([][]byte, len(nodes))
+	size := 9 // magic, flags, rooted count and node count
+	for i, node := range nodes {
+		cache := node.encodingCache()
+		cache.once.Do(func() { cache.data = marshalTransactionStatusNode(node) })
+		encoded[i] = cache.data
+		size += len(cache.data)
+	}
+	// Every caller owns its result. Never return or append into a cached slice.
+	buf := bytes.NewBuffer(make([]byte, 0, size))
 	buf.Write(transactionStatusSnapshotMagic[:])
 	flags := byte(0)
 	if complete {
@@ -986,44 +1025,57 @@ func marshalTransactionStatusNodes(nodes []*transactionStatusNode, rootedSinceSe
 		flags |= 2
 	}
 	buf.WriteByte(flags)
-	_ = binary.Write(&buf, binary.LittleEndian, rootedSinceSeed)
-	_ = binary.Write(&buf, binary.LittleEndian, uint16(len(nodes)))
-	for _, node := range nodes {
-		_ = binary.Write(&buf, binary.LittleEndian, node.slot)
-		nodeFlags := byte(0)
-		if node.hasBlockID {
-			nodeFlags = 1
-		}
-		buf.WriteByte(nodeFlags)
-		if node.hasBlockID {
-			buf.Write(node.blockID[:])
-		}
-		blockhashes := make([]solana.Hash, 0, len(node.delta))
-		for blockhash := range node.delta {
-			blockhashes = append(blockhashes, blockhash)
-		}
-		sort.Slice(blockhashes, func(i, j int) bool {
-			return bytes.Compare(blockhashes[i][:], blockhashes[j][:]) < 0
-		})
-		_ = binary.Write(&buf, binary.LittleEndian, uint32(len(blockhashes)))
-		for _, blockhash := range blockhashes {
-			group := node.delta[blockhash]
-			buf.Write(blockhash[:])
-			buf.WriteByte(group.keyIndex)
-			keys := make([]transactionStatusKey, 0, len(group.keys))
-			for key := range group.keys {
-				keys = append(keys, key)
-			}
-			sort.Slice(keys, func(i, j int) bool {
-				return bytes.Compare(keys[i][:], keys[j][:]) < 0
-			})
-			_ = binary.Write(&buf, binary.LittleEndian, uint32(len(keys)))
-			for _, key := range keys {
-				buf.Write(key[:])
-			}
-		}
+	_ = binary.Write(buf, binary.LittleEndian, rootedSinceSeed)
+	_ = binary.Write(buf, binary.LittleEndian, uint16(len(nodes)))
+	for _, data := range encoded {
+		buf.Write(data)
 	}
 	return buf.Bytes(), nil
+}
+
+func marshalTransactionStatusNode(node *transactionStatusNode) []byte {
+	size := 8 + 1 + 4 // slot, flags and group count
+	if node.hasBlockID {
+		size += len(node.blockID)
+	}
+	for _, group := range node.delta {
+		size += 32 + 1 + 4 + transactionStatusKeySize*len(group.keys)
+	}
+	buf := bytes.NewBuffer(make([]byte, 0, size))
+	_ = binary.Write(buf, binary.LittleEndian, node.slot)
+	nodeFlags := byte(0)
+	if node.hasBlockID {
+		nodeFlags = 1
+	}
+	buf.WriteByte(nodeFlags)
+	if node.hasBlockID {
+		buf.Write(node.blockID[:])
+	}
+	blockhashes := make([]solana.Hash, 0, len(node.delta))
+	for blockhash := range node.delta {
+		blockhashes = append(blockhashes, blockhash)
+	}
+	sort.Slice(blockhashes, func(i, j int) bool {
+		return bytes.Compare(blockhashes[i][:], blockhashes[j][:]) < 0
+	})
+	_ = binary.Write(buf, binary.LittleEndian, uint32(len(blockhashes)))
+	for _, blockhash := range blockhashes {
+		group := node.delta[blockhash]
+		buf.Write(blockhash[:])
+		buf.WriteByte(group.keyIndex)
+		keys := make([]transactionStatusKey, 0, len(group.keys))
+		for key := range group.keys {
+			keys = append(keys, key)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			return bytes.Compare(keys[i][:], keys[j][:]) < 0
+		})
+		_ = binary.Write(buf, binary.LittleEndian, uint32(len(keys)))
+		for _, key := range keys {
+			buf.Write(key[:])
+		}
+	}
+	return buf.Bytes()
 }
 
 func (c *TransactionStatusCache) restore(data []byte) error {
