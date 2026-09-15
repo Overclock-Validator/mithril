@@ -74,38 +74,38 @@ var (
 		},
 	}
 
-	bootstrapMode                    string // "auto", "snapshot", "new-snapshot", "new-incremental", or "accountsdb"
-	snapshotArchivePath              string
-	incrementalSnapshotFilename      string
-	accountsPath                     string
-	scratchDirectory                 string
-	rpcEndpoints                     []string
-	cluster                          string // "alpenglow", "mainnet-beta", "testnet", or "devnet"
-	legacyGenesisHash                string // explicit lineage for pre-binding AccountsDB/ledger artifacts
-	blockSource                      string // "turbine", "rpc", or "lightbringer"
-	lightbringerEndpoint             string
-	repairCatchupMaxGapSlots         int    // Resume gaps up to this fill via turbine repair instead of RPC (0 = off)
-	repairMaxRequestsPerSecond       int    // Repair request-rate ceiling override (0 = adaptive default)
-	blockRPCFallback                 bool   // Allow RPC block fetch when > repairCatchupMaxGapSlots behind (default false: shreds only)
-	blockMaxRPS                      int    // Rate limit for block fetching
-	blockMaxInflight                 int    // Max concurrent block fetch workers
-	blockTipPollIntervalMs           int    // Tip poll interval in milliseconds
-	blockTipSafetyMargin             int    // Don't fetch within N slots of tip
-	consensusModeFlag                string // raw --consensus-mode value (cobra binding)
-	consensusMode                    string // resolved: "verifying" (default) or "validator"
-	alpenglowObserverBindAddr        string
-	alpenglowMaxMessageBytes         int64
-	alpenglowBLSDST                  string
-	validatorIdentityKeypair         string
-	validatorVoteAccountKeypair      string
-	validatorAuthorizedVoterKeypair  string
-	validatorWithdrawerKeypair       string
-	validatorTPUQUICBind             string
-	validatorAdvertisedIP            string
-	validatorSigverifyWorkers        int
-	validatorWaitToVoteSlot          uint64
-	validatorReservedHistory         bool
-	validatorInitializeReservation   bool
+	bootstrapMode                   string // "auto", "snapshot", "new-snapshot", "new-incremental", or "accountsdb"
+	snapshotArchivePath             string
+	incrementalSnapshotFilename     string
+	accountsPath                    string
+	scratchDirectory                string
+	rpcEndpoints                    []string
+	cluster                         string // "alpenglow", "mainnet-beta", "testnet", or "devnet"
+	legacyGenesisHash               string // explicit lineage for pre-binding AccountsDB/ledger artifacts
+	blockSource                     string // "turbine", "rpc", or "lightbringer"
+	lightbringerEndpoint            string
+	repairCatchupMaxGapSlots        int    // Resume gaps up to this fill via turbine repair instead of RPC (0 = off)
+	repairMaxRequestsPerSecond      int    // Repair request-rate ceiling override (0 = adaptive default)
+	blockRPCFallback                bool   // Allow RPC block fetch when > repairCatchupMaxGapSlots behind (default false: shreds only)
+	blockMaxRPS                     int    // Rate limit for block fetching
+	blockMaxInflight                int    // Max concurrent block fetch workers
+	blockTipPollIntervalMs          int    // Tip poll interval in milliseconds
+	blockTipSafetyMargin            int    // Don't fetch within N slots of tip
+	consensusModeFlag               string // raw --consensus-mode value (cobra binding)
+	consensusMode                   string // resolved: "verifying" (default) or "validator"
+	alpenglowObserverBindAddr       string
+	alpenglowMaxMessageBytes        int64
+	alpenglowBLSDST                 string
+	validatorIdentityKeypair        string
+	validatorVoteAccountKeypair     string
+	validatorAuthorizedVoterKeypair string
+	validatorWithdrawerKeypair      string
+	validatorTPUQUICBind            string
+	validatorAdvertisedIP           string
+	validatorSigverifyWorkers       int
+	validatorWaitToVoteSlot         uint64
+	validatorReservedHistory        bool
+	validatorInitializeReservation  bool
 
 	// Mode thresholds
 	blockNearTipThreshold        int // Enter near-tip when gap <= this
