@@ -1,15 +1,23 @@
-Preparing a transaction-status checkpoint on replay could stall voting for hundreds of milliseconds. Capture immutable lineage and coverage metadata on replay, then encode on the existing promotion worker. During durable promotion, discard fully expired blockhash groups directly and update partially retained groups by visiting the smaller side.
+Replay's transaction-status work can delay voting both at ordinary block commit and during checkpoint preparation. Prepare large banks' immutable status deltas during execution, pre-size status maps, capture checkpoint lineage on replay for encoding by the promotion worker, and expire blockhash groups in batches.
 
-Preserves checkpoint bytes/format, capture-before-prune ordering, immutable producer views, the300-root retention rule, duplicate reference counts and unwind checks. The proposed transaction-status **publication** optimization is not included; this PR only organizes the already implemented checkpoint and expiry work.
+Commit still rechecks exact block binding, coverage, parent lineage and ancestor duplicates under the publication lock. Changed snapshot slice offsets trigger a safe rebuild. Preparation never publishes statuses, and every ProcessBlock exit joins its worker. Blocks with at most 32 transactions and single-thread configurations stay inline. Checkpoint format, capture-before-prune ordering, the 300-root retention rule, pinned producer views and unwind semantics remain intact.
 
-### Benchmarks
+### Publication benchmark
 
-Native Zen5: capturing a roughly30MB checkpoint on replay changed from202–207ms to5.92–6.06microseconds. Encoding moved to the worker; it did not disappear. In ten historical live checkpoints, replay-side capture took29–34microseconds and worker encoding179–367ms.
+Zen 5 Ryzen 7 9700X, Go 1.26.4, GOMAXPROCS=2; 33,760 prepared identities, one or four blockhash groups, with/without existing ancestor groups. Five samples of ten iterations on the shared validator host. Baseline functions exactly match alpenglow-dev at `33dde4050d9250557583395810799aaac2f54017`.
 
-Synthetic expiry of128banks ×33,760keys with one retained bank: four-bank blockhash groups changed from306–311ms to0.049–0.057ms; a group crossing the retention boundary changed from717–735ms to1.85–2.05ms. Setup and later GC are excluded; this workload exceeds the live stall samples and is not a total replay/FAST speedup.
+Remaining commit work measured **4.6–5.2 ms before versus 1.6–2.9 ms after prior preparation**. This excludes the preparation that can overlap execution. Total-work results were mixed in the first run; the slower case and its alternating-order recheck are preserved in the method document. The recheck measured 4.40–4.56 ms before versus 2.98–3.13 ms for preparation plus commit. New-group allocations halved, approximately 6.30 MB to 3.15 MB.
 
-Methods: `docs/status-checkpoint-capture.md` and `docs/transaction-status-expiry.md`. Raw native evidence: `docs/results/status-cache/2026-09-14`.
+A separate controlled transfer-execution workload measured 20.68 ms baseline, 18.57 ms with sizing alone, and 17.09 ms with overlap using two Go execution threads. This tests contention, not complete bank replay. No live FAST improvement is claimed and this publication change has not been deployed.
 
-Fresh standalone replay race tests and vet passed. Coverage includes concurrent snapshot/prune behavior, exact checkpoint equivalence, randomized expiry against the old per-key oracle, pinned views, restore and unwind. Fresh logs: `docs/results/pr-split-2026-09-15/status`.
+Method, all cases and raw evidence: `docs/transaction-status-publication.md` and `docs/results/status-publication/2026-09-15`.
 
-Split from #279; base development commit: `33dde4050d9250557583395810799aaac2f54017`. Historical native measurements retain their original tested source; these reorganized heads have fresh local validation.
+### Existing checkpoint and expiry measurements
+
+Historical native Zen 5 capture of a roughly 30 MB checkpoint changed from 202–207 ms to 5.92–6.06 microseconds. Encoding moved to the worker; it did not disappear. Ten historical live checkpoints took 29–34 microseconds to capture and 179–367 ms to encode.
+
+Synthetic expiry of 128 banks × 33,760 keys with one retained bank changed from 306–311 ms to 0.049–0.057 ms for four-bank blockhash groups, and from 717–735 ms to 1.85–2.05 ms for a group crossing the retention boundary. Setup and later GC are excluded; these are not whole-replay gains. Historical methods and baselines remain in `docs/status-checkpoint-capture.md`, `docs/transaction-status-expiry.md` and `docs/results/status-cache/2026-09-14`.
+
+Full replay/block race suites passed locally and natively; native replay/metrics vet and validator build passed. Regression coverage includes concurrent siblings, late ancestor duplicates, stale preparation, snapshot offset changes, rejected banks, pinned views, restore/unwind and scheduling boundaries. Existing tests cover snapshot/prune behavior, exact checkpoint equivalence and randomized expiry against the old oracle.
+
+Split from #279, with the subsequent publication optimization added to this status-cache branch. Base: `33dde4050d9250557583395810799aaac2f54017`.

@@ -11,7 +11,7 @@ The current alpenglow-dev base was checked immediately before publication: `33dd
 
 | alpenglow: reduce certificate verification lock contention | `alpenglow-dev` | [Review diff](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-certificate-processing) | [Scope, tests and benchmarks](review-prs/certificate-processing.md) |
 
-| replay: defer status checkpoint encoding and batch expiry | `alpenglow-dev` | [Review diff](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-status-checkpoint-expiry) | [Scope, tests and benchmarks](review-prs/status-checkpoint-expiry.md) |
+| replay: prepare status publication and defer checkpoint work | `alpenglow-dev` | [Review diff](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-status-checkpoint-expiry) | [Scope, tests and benchmarks](review-prs/status-checkpoint-expiry.md) |
 
 | runtime: enable VM pooling and preserve owned vote state | `alpenglow-dev` | [Review diff](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-runtime-allocation) | [Scope, tests and benchmarks](review-prs/runtime-allocation.md) |
 
@@ -30,6 +30,6 @@ Individual branch checks passed as documented in docs/results/pr-split-2026-09-1
 
 ## Scope and runtime
 
-No new transaction-status publication optimization was started. Deferred scheduler retry experiments remain separate. No validator deployment, restart, load-policy change or key/ledger operation was performed during the split. The previously deployed validator, continuous own-leader large blocks and monitoring remain under the existing server services.
+The status-cache branch now also includes the subsequent measured transaction-status publication optimization. Its scope, benchmark limitations and fresh native validation are in the linked review description. It has not been deployed. Deferred scheduler retry experiments remain separate. No validator deployment, restart, load-policy change or key/ledger operation was performed during the split. The previously deployed validator, continuous own-leader large blocks and monitoring remain under the existing server services.
 
-This integration branch preserves the full combined implementation and historical combined evidence for reference. Review the six focused diffs above; it is not an additional monolithic PR.
+This integration branch preserves the combined implementation from the split and historical combined evidence for reference; its code snapshot does not include the later status-publication follow-up. Review the six focused diffs above; it is not an additional monolithic PR.
