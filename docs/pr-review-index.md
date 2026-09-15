@@ -13,6 +13,10 @@ The verified development base is `33dde4050d9250557583395810799aaac2f54017`. Vot
 | [leader: improve packing and add near-limit block benchmarks](https://github.com/Overclock-Validator/mithril/compare/7layer%2Freview-streaming-preparation...7layer%2Freview-leader-packing) | `06ef0677` | `7layer/review-streaming-preparation` | [Scope, tests and benchmarks](review-prs/leader-packing.md) |
 | [alpenglow: isolate vote delivery and reserve durable signing bounds](https://github.com/Overclock-Validator/mithril/compare/7layer%2Freview-certificate-processing...7layer%2Freview-vote-delivery-persistence) | `54b233ff` | `7layer/review-certificate-processing` | [Scope, tests and benchmarks](review-prs/vote-delivery-persistence.md) |
 
+## Spool completion follow-up
+
+[Spool completion journal review](https://github.com/Overclock-Validator/mithril/compare/7layer%2Freview-streaming-preparation...7layer%2Fspool-completion-journal) is a separate branch stacked on streaming preparation, current head `f0b72ab2` (implementation `bb590199`). It queues disposable completion hints without blocking delivery, preserves ordered invalidations and clean handoff, and changes no voting persistence contract. [Scope, tests and measurements](review-prs/spool-completion-journal.md). This is an additional review branch, not another opened PR.
+
 ## Newest validator changes
 
 - Certificate processing includes bounded MultiExp with unchanged full-strength random coefficients and pending-only observer reconciliation (`72514abc`).
