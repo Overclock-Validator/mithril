@@ -1,6 +1,7 @@
 package alpenglow
 
 import (
+	"fmt"
 	"math/big"
 	"testing"
 	"time"
@@ -803,5 +804,52 @@ func TestCertPoolEmitsOnce(t *testing.T) {
 	addVote(t, pool, vote, 4, keys[4]) // more stake, same certs already out (fast needs 80: 40+30+5=75, no)
 	if len(*emitted) != n {
 		t.Fatalf("no new certs expected, went from %d to %d", n, len(*emitted))
+	}
+}
+
+// Exercise both aggregation paths, including a malformed member at every
+// position, a different signed payload, and failed-batch subdivision. Valid
+// votes must survive independently of which member causes the batch to fail.
+func TestCertPoolBatchAggregationPaths(t *testing.T) {
+	for _, size := range []int{2, 8, 16, 64} {
+		t.Run(fmt.Sprintf("votes=%d", size), func(t *testing.T) {
+			verifier, set, vote, batch := certPoolBenchmarkFixture(t, size)
+			pool := NewCertPool(DefaultCertPoolConfig(), verifier, nil)
+			payload, err := EncodeVotePayloadToSign(vote, verifier.ShredVersion())
+			if err != nil {
+				t.Fatal(err)
+			}
+			members := pool.verifyBatch(batch, &set)
+			if len(members) != size {
+				t.Fatal("valid batch rejected")
+			}
+			var tweak bls12381.G2Affine
+			tweak.ScalarMultiplicationBase(big.NewInt(1234567))
+			for i := range members {
+				bad := append([]parsedBatchVote(nil), members...)
+				bad[i].sig.Add(&bad[i].sig, &tweak)
+				if ok, err := randomizedAggregatePairingOK(bad, payload); err != nil || ok {
+					t.Fatalf("bad member %d: accepted=%t err=%v", i, ok, err)
+				}
+			}
+			wrongPayload := append([]byte(nil), payload...)
+			wrongPayload[0] ^= 1
+			if ok, err := randomizedAggregatePairingOK(members, wrongPayload); err != nil || ok {
+				t.Fatalf("wrong payload: accepted=%t err=%v", ok, err)
+			}
+			// Preserve the unweighted sum while corrupting two shares in a
+			// large batch; subdivision must keep exactly the honest members.
+			members[0].sig.Add(&members[0].sig, &tweak)
+			members[len(members)-1].sig.Sub(&members[len(members)-1].sig, &tweak)
+			valid := pool.verifyParsedBatch(members, payload)
+			if len(valid) != size-2 {
+				t.Fatalf("verified %d, want %d", len(valid), size-2)
+			}
+			for _, member := range valid {
+				if member.message.Rank == 0 || int(member.message.Rank) == size-1 {
+					t.Fatal("invalid share survived")
+				}
+			}
+		})
 	}
 }
