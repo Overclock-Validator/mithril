@@ -1,0 +1,95 @@
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionStatusExecutionOverlap/legacy           	       5	  24692874 ns/op	   6513086 commit-with-wait-ns/op	  18179262 execution-ns/op	23276118 B/op	  242222 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/legacy           	       5	  22834712 ns/op	   5772168 commit-with-wait-ns/op	  17062174 execution-ns/op	23276118 B/op	  242222 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/legacy           	       5	  23370663 ns/op	   6486422 commit-with-wait-ns/op	  16883798 execution-ns/op	23276136 B/op	  242222 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/legacy           	       5	  23246803 ns/op	   5956655 commit-with-wait-ns/op	  17289566 execution-ns/op	23276145 B/op	  242222 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/legacy           	       5	  24078611 ns/op	   6062517 commit-with-wait-ns/op	  18015548 execution-ns/op	23276059 B/op	  242221 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/legacy-2         	       5	  20677847 ns/op	   5607605 commit-with-wait-ns/op	  15069600 execution-ns/op	23276630 B/op	  242225 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/legacy-2         	       5	  20222041 ns/op	   5394296 commit-with-wait-ns/op	  14827324 execution-ns/op	23276627 B/op	  242225 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/legacy-2         	       6	  19971750 ns/op	   5078614 commit-with-wait-ns/op	  14892735 execution-ns/op	23276532 B/op	  242224 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/legacy-2         	       5	  22424538 ns/op	   5368235 commit-with-wait-ns/op	  17055698 execution-ns/op	23276712 B/op	  242226 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/legacy-2         	       5	  20975910 ns/op	   5790017 commit-with-wait-ns/op	  15184788 execution-ns/op	23276624 B/op	  242225 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/sized            	       5	  21296975 ns/op	   3860111 commit-with-wait-ns/op	  17436468 execution-ns/op	20125587 B/op	  241932 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/sized            	       5	  21108482 ns/op	   4260022 commit-with-wait-ns/op	  16848123 execution-ns/op	20125592 B/op	  241932 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/sized            	       6	  20802767 ns/op	   4299800 commit-with-wait-ns/op	  16502635 execution-ns/op	20125558 B/op	  241932 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/sized            	       6	  22758328 ns/op	   5033044 commit-with-wait-ns/op	  17724954 execution-ns/op	20125533 B/op	  241931 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/sized            	       5	  23246396 ns/op	   5467937 commit-with-wait-ns/op	  17778082 execution-ns/op	20125614 B/op	  241932 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/sized-2          	       6	  19020036 ns/op	   4526523 commit-with-wait-ns/op	  14493163 execution-ns/op	20126028 B/op	  241935 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/sized-2          	       6	  18422586 ns/op	   4167392 commit-with-wait-ns/op	  14254792 execution-ns/op	20126009 B/op	  241934 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/sized-2          	       6	  18573776 ns/op	   4299496 commit-with-wait-ns/op	  14273834 execution-ns/op	20126012 B/op	  241934 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/sized-2          	       6	  18332367 ns/op	   3962772 commit-with-wait-ns/op	  14369209 execution-ns/op	20126006 B/op	  241934 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/sized-2          	       6	  19268730 ns/op	   4381208 commit-with-wait-ns/op	  14886998 execution-ns/op	20126038 B/op	  241935 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/overlap          	       6	  21422337 ns/op	   4616295 commit-with-wait-ns/op	  16804831 execution-ns/op	20125514 B/op	  241931 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/overlap          	       5	  21450447 ns/op	   3882218 commit-with-wait-ns/op	  17567431 execution-ns/op	20125593 B/op	  241932 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/overlap          	       5	  23556986 ns/op	   5081649 commit-with-wait-ns/op	  18474472 execution-ns/op	20125593 B/op	  241932 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/overlap          	       5	  22188363 ns/op	   4492746 commit-with-wait-ns/op	  17694970 execution-ns/op	20125587 B/op	  241932 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/overlap          	       6	  22888561 ns/op	   4725085 commit-with-wait-ns/op	  18162634 execution-ns/op	20125536 B/op	  241931 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/overlap-2        	       6	  17090947 ns/op	   2119131 commit-with-wait-ns/op	  14966507 execution-ns/op	20126253 B/op	  241938 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/overlap-2        	       6	  17313847 ns/op	   2127423 commit-with-wait-ns/op	  15181536 execution-ns/op	20126212 B/op	  241938 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/overlap-2        	       7	  17116780 ns/op	   1984282 commit-with-wait-ns/op	  15127492 execution-ns/op	20126437 B/op	  241939 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/overlap-2        	       7	  16485753 ns/op	   1917207 commit-with-wait-ns/op	  14563704 execution-ns/op	20126176 B/op	  241938 allocs/op
+BenchmarkTransactionStatusExecutionOverlap/overlap-2        	       6	  16709920 ns/op	   2210525 commit-with-wait-ns/op	  14495070 execution-ns/op	20126125 B/op	  241937 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_0/legacy     	 1299566	        94.83 ns/op	     112 B/op	       2 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_0/legacy     	 1284991	        93.05 ns/op	     112 B/op	       2 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_0/legacy     	 1247547	        96.51 ns/op	     112 B/op	       2 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_0/legacy     	 1211845	        96.60 ns/op	     112 B/op	       2 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_0/legacy     	 1238605	        95.12 ns/op	     112 B/op	       2 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_0/legacy-2   	 1596568	        76.21 ns/op	     112 B/op	       2 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_0/legacy-2   	 1614400	        74.16 ns/op	     112 B/op	       2 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_0/legacy-2   	 1581337	        76.14 ns/op	     112 B/op	       2 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_0/legacy-2   	 1574422	        74.71 ns/op	     112 B/op	       2 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_0/legacy-2   	 1589880	        74.16 ns/op	     112 B/op	       2 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_0/prepared_total           	 1000000	       123.0 ns/op	     112 B/op	       2 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_0/prepared_total           	 1000000	       119.6 ns/op	     112 B/op	       2 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_0/prepared_total           	 1000000	       118.8 ns/op	     112 B/op	       2 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_0/prepared_total           	 1000000	       119.4 ns/op	     112 B/op	       2 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_0/prepared_total           	 1000000	       117.4 ns/op	     112 B/op	       2 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_0/prepared_total-2         	 1000000	       100.4 ns/op	     112 B/op	       2 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_0/prepared_total-2         	 1231928	        97.12 ns/op	     112 B/op	       2 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_0/prepared_total-2         	 1000000	       101.3 ns/op	     112 B/op	       2 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_0/prepared_total-2         	 1200760	        99.52 ns/op	     112 B/op	       2 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_0/prepared_total-2         	 1206331	       100.0 ns/op	     112 B/op	       2 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_1/legacy                   	  189308	       586.1 ns/op	     960 B/op	       9 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_1/legacy                   	  200305	       607.5 ns/op	     960 B/op	       9 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_1/legacy                   	  188314	       597.3 ns/op	     960 B/op	       9 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_1/legacy                   	  196060	       586.6 ns/op	     960 B/op	       9 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_1/legacy                   	  197784	       593.0 ns/op	     960 B/op	       9 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_1/legacy-2                 	  227380	       470.5 ns/op	     960 B/op	       9 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_1/legacy-2                 	  240021	       461.5 ns/op	     960 B/op	       9 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_1/legacy-2                 	  231192	       472.9 ns/op	     960 B/op	       9 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_1/legacy-2                 	  254556	       466.8 ns/op	     960 B/op	       9 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_1/legacy-2                 	  239902	       443.4 ns/op	     960 B/op	       9 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_1/prepared_total           	  167852	       716.6 ns/op	     960 B/op	       9 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_1/prepared_total           	  167379	       708.2 ns/op	     960 B/op	       9 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_1/prepared_total           	  167563	       708.3 ns/op	     960 B/op	       9 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_1/prepared_total           	  169233	       699.7 ns/op	     960 B/op	       9 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_1/prepared_total           	  164168	       735.9 ns/op	     960 B/op	       9 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_1/prepared_total-2         	  190630	       609.1 ns/op	     960 B/op	       9 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_1/prepared_total-2         	  190263	       615.6 ns/op	     960 B/op	       9 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_1/prepared_total-2         	  176863	       604.2 ns/op	     960 B/op	       9 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_1/prepared_total-2         	  196165	       632.1 ns/op	     960 B/op	       9 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_1/prepared_total-2         	  185583	       588.6 ns/op	     960 B/op	       9 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_32/legacy                  	   17916	      6009 ns/op	    6320 B/op	      23 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_32/legacy                  	   19801	      6085 ns/op	    6320 B/op	      23 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_32/legacy                  	   19857	      6155 ns/op	    6320 B/op	      23 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_32/legacy                  	   19308	      6126 ns/op	    6320 B/op	      23 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_32/legacy                  	   20053	      6002 ns/op	    6320 B/op	      23 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_32/legacy-2                	   23298	      5038 ns/op	    6320 B/op	      23 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_32/legacy-2                	   23206	      5158 ns/op	    6320 B/op	      23 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_32/legacy-2                	   22210	      5145 ns/op	    6320 B/op	      23 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_32/legacy-2                	   23406	      5305 ns/op	    6320 B/op	      23 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_32/legacy-2                	   23084	      5114 ns/op	    6320 B/op	      23 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_32/prepared_total          	   26672	      4343 ns/op	    3616 B/op	      13 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_32/prepared_total          	   26752	      4456 ns/op	    3616 B/op	      13 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_32/prepared_total          	   27342	      4471 ns/op	    3616 B/op	      13 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_32/prepared_total          	   26960	      4312 ns/op	    3616 B/op	      13 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_32/prepared_total          	   27775	      4592 ns/op	    3616 B/op	      13 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_32/prepared_total-2        	   31856	      3644 ns/op	    3616 B/op	      13 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_32/prepared_total-2        	   32778	      3717 ns/op	    3616 B/op	      13 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_32/prepared_total-2        	   32239	      3784 ns/op	    3616 B/op	      13 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_32/prepared_total-2        	   30372	      3818 ns/op	    3616 B/op	      13 allocs/op
+BenchmarkTransactionStatusSmallPublication/txs_32/prepared_total-2        	   32263	      3770 ns/op	    3616 B/op	      13 allocs/op
+PASS

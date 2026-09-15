@@ -1,0 +1,34 @@
+Running as unit: mithril-status-publication-recheck-20260915.service; invocation ID: 8079e456482443308a68c660fb8f6b29
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionStatusPublication/groups_4/existing_false/legacy-2  	      50	   4400299 ns/op	 6301401 B/op	     659 allocs/op
+PASS
+
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionStatusPublication/groups_4/existing_false/prepared_total-2         	      50	   2984879 ns/op	 3152087 B/op	     287 allocs/op
+PASS
+
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionStatusPublication/groups_4/existing_false/prepared_total-2         	      50	   3131031 ns/op	 3152091 B/op	     287 allocs/op
+PASS
+
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionStatusPublication/groups_4/existing_false/legacy-2  	      50	   4564884 ns/op	 6301399 B/op	     659 allocs/op
+PASS
+
+          Finished with result: success
+Main processes terminated with: code=exited, status=0/SUCCESS
+               Service runtime: 1.278s
+             CPU time consumed: 1.456s
+                   Memory peak: 73.9M (swap: 0B)
