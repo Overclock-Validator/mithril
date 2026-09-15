@@ -1,0 +1,1 @@
+{"utc": "2026-09-15T02:58:13.874813+00:00", "health": {"utc": "2026-09-15T02:58:13.949166+00:00", "pid": 568418, "rpc_slot": 3824460, "local_slot": 3824460, "last_vote": 3824459, "vote_lag": 1}, "pid": "MainPID=568418", "services": ["active", "active", "active", "active"]}

@@ -4115,6 +4115,15 @@ func ProcessBlock(
 	if statusValidationErr != nil {
 		return nil, fmt.Errorf("validate transaction statuses for slot %d: %w", block.Slot, statusValidationErr)
 	}
+	statusPreparation := transactionStatuses.startStatusPreparation(executionPlan)
+	defer func() {
+		// Join before returning so a rejected bank cannot leave work behind or
+		// charge its preparation time to the next block's metrics record.
+		statusPreparation.wait()
+		if statusPreparation != nil {
+			metrics.GlobalBlockReplay.TransactionStatusPreparation.AddTiming(statusPreparation.duration)
+		}
+	}()
 	ctx, task := trace.NewTask(context.Background(), "ProcessBlock")
 	defer task.End()
 	trace.Log(ctx, "slot", fmt.Sprintf("%d", block.Slot))
@@ -4374,7 +4383,10 @@ func ProcessBlock(
 		return slotCtx, err
 	}
 	statusCommitStart := time.Now()
-	statusErr := transactionStatuses.commitBlockWithPlan(block, executionPlan)
+	statusWaitStart := time.Now()
+	preparedStatuses := statusPreparation.wait()
+	metrics.GlobalBlockReplay.TransactionStatusPreparationWait.AddTimingSince(statusWaitStart)
+	statusErr := transactionStatuses.commitBlockWithPreparedDelta(block, executionPlan, preparedStatuses)
 	metrics.GlobalBlockReplay.TransactionStatusCommit.AddTimingSince(statusCommitStart)
 	if statusErr != nil {
 		return nil, fmt.Errorf("commit transaction statuses for slot %d after bank state commit: %w", block.Slot, statusErr)

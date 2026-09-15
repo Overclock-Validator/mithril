@@ -1,0 +1,16 @@
+{
+  "base": "33dde4050d9250557583395810799aaac2f54017",
+  "branch_before_change": "31e0d8c0",
+  "files": {
+    "pkg/replay/transaction_status_overlap_benchmark_test.go": "6310ce381e6e88151b14a7f0e5f56e7370a8e1d94af466911dd69707379d8cdb",
+    "pkg/replay/transaction_status_publication.go": "a94c1227ce0b0e329dfff390c2303bb36525493e0cde3fce7d3fe177eaa1681b",
+    "pkg/replay/transaction_status_publication_benchmark_test.go": "0ff3a1f0c2a8d0ceafb5d7ba300c6cb5358082fd019f75a4b6fe0c35fde1575e",
+    "pkg/replay/transaction_status_publication_test.go": "eae775d2d10e6ca5b13b1e6f201cff15d8d0174b40ff20a69aa4279004799ca1",
+    "pkg/metrics/metrics.go": "17005056d872f9b8acf75fee15dc2c175bc4addad1b2dafee61445124dfbe307",
+    "pkg/replay/block.go": "19e7e931ec5e8aaab2e910808cb2f6e19f5721ff2ad953541f42828a88076a0d",
+    "pkg/replay/transaction_status_cache.go": "731febda7fdfe09b84d4281c53c3d0f4381e8f7d67d9d47f084c8a10c1523935",
+    "pkg/replay/transaction_status_plan_binding_test.go": "6c1fe9c92af2011402025ca96601847a1313bf2ffb564082eb06aa89088e250b",
+    "pkg/replay/transaction_status_prepared_test.go": "1944b443624d1075f6ea3e89630cdca42a6245a95a3116bbd47bd670311ad876"
+  },
+  "baseline_check": "Frozen commitBlockWithPlan and addDeltaVisibleLocked exactly match alpenglow-dev at the recorded base after renaming benchmark helper methods."
+}
