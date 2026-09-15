@@ -50,3 +50,24 @@ callers mutate their own output buffers. The replay race suite and vet pass.
 
 Related behavior: [status expiry](transaction-status-expiry.md) and
 [status publication](transaction-status-publication.md).
+
+## Native Zen 5 validation
+
+AMD Ryzen 7 9700X, Go 1.26.4, GOMAXPROCS=2, Nice 15 and a two-core CPU quota,
+while the validator continued its normal workload. Same moving-window fixture;
+three samples per case, medians below. This compares the original uncached
+encoder with memoization, not the whole status-publication change against dev.
+
+| New roots per checkpoint | Original encoding | Cached encoding |
+| --- | ---: | ---: |
+| 1 | 195.34 ms | 3.73 ms |
+| 8 | 195.15 ms | 8.56 ms |
+| 32 | 194.77 ms | 23.54 ms |
+| 128 (default fold cadence) | 194.52 ms | 85.02 ms |
+| 300 (entirely new) | 201.88 ms | 198.55 ms |
+
+The default-cadence result is approximately 2.3x, with the same 99.12 → 57.33 MB
+allocation reduction. Cold/all-new windows remain roughly unchanged. Native
+combined race suites, vet and the validator build passed. These are staging
+measurements: the encoding cache has not been deployed, so a live reduction in
+durable-root lag or missed FAST votes has not yet been established.
