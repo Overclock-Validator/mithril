@@ -37,11 +37,15 @@ Native race tests passed for Alpenglow, consensus, replay and node integration. 
 
 ## Bounded multi-scalar aggregation
 
-Batches of at least 16 parsed votes now use gnark `MultiExp` for each weighted
+With more than one Go execution thread, batches of at least 16 parsed votes
+use gnark `MultiExp` for each weighted
 public-key/signature sum. G1 and G2 run sequentially with `NbTasks: 1`; the
 existing pool verification mutex still admits one expensive batch at a time.
 Smaller batches keep the scalar loop because bucket setup costs more than it
 saves, particularly during failed-batch subdivision and two-candidate checks.
+Single-thread configurations also retain the scalar path: native contention
+tests found that MultiExp task handoffs could increase certificate wall time
+there, despite reducing arithmetic.
 
 Each member still receives a fresh, independent, nonzero coefficient sampled
 from the full scalar field. Its public key and signature use the same
@@ -70,19 +74,44 @@ votes, allocated bytes per full fold increased from approximately 225 KB to
 Run `go test ./pkg/alpenglow -run '^$' -bench '^BenchmarkCertPool(WeightedPairing|FoldVerifiedBatch)$' -benchmem -benchtime=500ms -count=3`.
 
 These are local component measurements; this aggregation change has not been
-deployed and does not yet have native Zen 5 or live FAST results. The earlier
-native/deployment measurements above describe the preceding implementation.
+deployed. Native staging measurements follow below. The earlier deployment
+measurements above describe the preceding implementation.
 The full local Alpenglow race suite and vet pass. Additional coverage checks
 invalid members at every position, wrong payloads, cancelling invalid shares
 in larger batches, and subdivision across the scalar/MultiExp boundary.
 
 The 16-vote cutoff was also measured directly: weighted pairing improved from
-5.28 ms to 3.80 ms. A separate local scheduling experiment alternated baseline,
-candidate, candidate, baseline with 64 valid votes every 200 ms alongside
-4,096 repeated transfer executions. With GOMAXPROCS=2, transfer execution was
-11.89–12.04 ms before and 11.80–11.83 ms after; certificate processing was
-24.75–26.15 ms before and 12.94–13.24 ms after. With GOMAXPROCS=1, transfer
-execution improved from 15.75–15.91 ms to 13.95–15.13 ms, but certificate wall
-time stayed around 30–32 ms. Scheduler waiting therefore still matters. This
-controlled experiment excludes account commits, network delivery and live
-vote persistence; it does not establish production latency or FAST scores.
+5.28 ms to 3.80 ms locally and from 3.44 ms to 2.29 ms on Zen 5.
+
+### Native staging validation
+
+AMD Ryzen 7 9700X, Go 1.26.4, GOMAXPROCS=2, Nice 15, two-core CPU quota, with
+the normal validator workload still running. The baseline restores the scalar
+implementation from the preceding certificate split head (`395e4566`) with
+identical fixtures. Baseline/candidate/candidate/baseline runs were followed by
+a final check after adding the single-thread safeguard. Full-fold ranges:
+
+| Votes in fold | Scalar baseline | Final implementation |
+| --- | ---: | ---: |
+| 32 | 7.385–7.386 ms | 4.238–4.344 ms |
+| 64 | 14.217–14.280 ms | 6.800–7.135 ms |
+
+A controlled scheduling experiment runs 64 valid votes every 200 ms alongside
+4,096 repeated transfer executions. With two Go execution threads, the final
+alternating native comparison reduced certificate processing from
+16.25–16.39 ms to 8.43–10.22 ms. Execution results were noisy: 13.80–14.38 ms
+baseline versus 13.84–17.56 ms candidate. The earlier native comparison and the
+local comparison showed no execution regression, but the slower final sample
+is retained; the shared host does not establish absence of interference.
+This workload excludes account commits, network delivery and vote persistence.
+
+The initial prototype's single-thread certificate latency could worsen while
+execution improved slightly. The final implementation therefore keeps the
+original scalar arithmetic whenever GOMAXPROCS is one. No worker-count or
+verification-admission changes accompany this optimization.
+
+Final combined native race suites, targeted adversarial tests at GOMAXPROCS=1
+and 2, vet and the validator production build passed. Native source hashes
+matched the complete local combined candidate. Live FAST, durable-root lag and
+voting latency still need a deployment comparison; these staging results do
+not establish those gains.
