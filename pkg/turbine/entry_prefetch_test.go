@@ -175,14 +175,17 @@ func TestEntryPrefetchResetKeepsOldReservationsUntilReadersJoin(t *testing.T) {
 	require.Positive(t, p.bytes)
 	a.mu.Unlock()
 	require.Nil(t, feedPrefetchShreds(t, a, fresh[0]))
-	newBatch := waitPrefetchedBatch(t, a, slot, 0)
-	require.NotSame(t, oldBatch, newBatch)
 	a.mu.Lock()
 	require.Equal(t, 2, p.slots)
 	a.mu.Unlock()
+	// With one verifier worker only one request may prefetch. The fresh
+	// generation keeps its pool reservation while admission waits for the old
+	// reader to join; it must not release or reuse the old generation's bytes.
 	releaseOnce.Do(func() { close(release) })
 	_, err := oldBatch.verification.wait()
 	require.ErrorIs(t, err, context.Canceled)
+	newBatch := waitPrefetchedBatch(t, a, slot, 0)
+	require.NotSame(t, oldBatch, newBatch)
 	_, err = newBatch.verification.wait()
 	require.NoError(t, err)
 	blk := feedPrefetchShreds(t, a, fresh[1])

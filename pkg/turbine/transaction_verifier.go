@@ -80,12 +80,16 @@ type transactionVerifier struct {
 	// admission semaphore also bounds asynchronous request goroutines; callers
 	// apply backpressure before handing off another decoded component.
 	requests chan struct{}
-	request  sync.WaitGroup
-	mu       sync.Mutex
-	closed   bool
-	stopped  chan struct{}
-	close    sync.Once
-	worker   sync.WaitGroup
+	// Protected by mu. Reserve one request permit for completion/recovery.
+	prefetchRequests  int
+	completionWaiters int
+	admissionChanged  chan struct{}
+	request           sync.WaitGroup
+	mu                sync.Mutex
+	closed            bool
+	stopped           chan struct{}
+	close             sync.Once
+	worker            sync.WaitGroup
 }
 
 func newTransactionVerifier(workers, queueDepth int, verify func(*solana.Transaction) error) *transactionVerifier {
@@ -177,6 +181,16 @@ func (v *transactionVerifier) verifyGroup(job *transactionVerifyJob, batch *txve
 // never the UDP reader or while holding the assembler mutex. Cancellation of
 // ctx stops further groups but still joins every admitted group.
 func (v *transactionVerifier) submitTransactions(ctx context.Context, txs []*solana.Transaction) (*transactionVerification, error) {
+	return v.submitRequest(ctx, txs, false)
+}
+
+// submitPrefetchTransactions applies backpressure before allocating a request:
+// prefetch may use at most 2*workers-1 of the existing 2*workers permits.
+func (v *transactionVerifier) submitPrefetchTransactions(ctx context.Context, txs []*solana.Transaction) (*transactionVerification, error) {
+	return v.submitRequest(ctx, txs, true)
+}
+
+func (v *transactionVerifier) submitRequest(ctx context.Context, txs []*solana.Transaction, prefetch bool) (*transactionVerification, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -187,22 +201,9 @@ func (v *transactionVerifier) submitTransactions(ctx context.Context, txs []*sol
 	if entryTraceContext(ctx) {
 		trace = &entryVerificationTrace{Submit: entryTraceNow(), Transactions: len(txs)}
 	}
-	select {
-	case v.requests <- struct{}{}:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-v.stopped:
-		return nil, errTransactionVerifierClosed
+	if err := v.acquireRequest(ctx, prefetch); err != nil {
+		return nil, err
 	}
-
-	v.mu.Lock()
-	if v.closed {
-		v.mu.Unlock()
-		<-v.requests
-		return nil, errTransactionVerifierClosed
-	}
-	v.request.Add(1)
-	v.mu.Unlock()
 	ctx, cancel := context.WithCancel(ctx)
 	if trace != nil {
 		trace.Admitted = entryTraceNow()
@@ -213,7 +214,7 @@ func (v *transactionVerifier) submitTransactions(ctx context.Context, txs []*sol
 	}
 	go func() {
 		defer v.request.Done()
-		defer func() { <-v.requests }()
+		defer v.releaseRequest(prefetch)
 		defer cancel()
 		r.index, r.err = v.verifyTransactionsWithTiming(ctx, txs, r.identities, trace)
 		if trace != nil {
