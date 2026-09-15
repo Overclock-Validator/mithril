@@ -8,7 +8,7 @@ The verified development base is `33dde4050d9250557583395810799aaac2f54017`. Vot
 |---|---|---|---|
 | [turbine: prepare complete transaction batches during shred arrival](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-streaming-preparation) | `311f83ea` | `alpenglow-dev` | [Scope, tests and benchmarks](review-prs/streaming-preparation.md) |
 | [alpenglow: reduce certificate verification lock contention](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-certificate-processing) | `72514abc` | `alpenglow-dev` | [Scope, tests and benchmarks](review-prs/certificate-processing.md) |
-| [replay: prepare status publication and defer checkpoint work](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-status-checkpoint-expiry) | `d55c7962` | `alpenglow-dev` | [Scope, tests and benchmarks](review-prs/status-checkpoint-expiry.md) |
+| [replay: prepare status publication and defer checkpoint work](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-status-checkpoint-expiry) | `c78e35cd` | `alpenglow-dev` | [Scope, tests and benchmarks](review-prs/status-checkpoint-expiry.md) |
 | [runtime: enable VM pooling and preserve owned vote state](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-runtime-allocation) | `752ef973` | `alpenglow-dev` | [Scope, tests and benchmarks](review-prs/runtime-allocation.md) |
 | [leader: improve packing and add near-limit block benchmarks](https://github.com/Overclock-Validator/mithril/compare/7layer%2Freview-streaming-preparation...7layer%2Freview-leader-packing) | `cc1e3dfc` | `7layer/review-streaming-preparation` | [Scope, tests and benchmarks](review-prs/leader-packing.md) |
 | [alpenglow: isolate vote delivery and reserve durable signing bounds](https://github.com/Overclock-Validator/mithril/compare/7layer%2Freview-certificate-processing...7layer%2Freview-vote-delivery-persistence) | `54b233ff` | `7layer/review-certificate-processing` | [Scope, tests and benchmarks](review-prs/vote-delivery-persistence.md) |
@@ -16,7 +16,7 @@ The verified development base is `33dde4050d9250557583395810799aaac2f54017`. Vot
 ## Newest validator changes
 
 - Certificate processing includes bounded MultiExp with unchanged full-strength random coefficients and pending-only observer reconciliation (`72514abc`).
-- Status checkpoints include immutable node encoding reuse and allocation-free rejection of incomplete fold batches (`d55c7962`).
+- Status checkpoints include immutable node encoding reuse, allocation-free rejection of incomplete fold batches (`d55c7962`), and retirement of completed rewards bookkeeping after durable promotion (`c78e35cd`). The latter avoids an unnecessary fork-recovery guard after rewards are safely rooted; native tests passed and it was deployed at 12:20 UTC. Live latency benefit awaits an applicable fork switch.
 - Streaming includes relay-buffer reuse (`311f83ea`); voting and leader branches include their latest respective parent branches.
 
 These changes are included in the combined Zen 5 testnet deployment. The September 15 empty-block comparison measured replay-admission p99 of **4.486 → 0.483 ms** (565 before, 401 after), after deploying both observer reconciliation and fold preflight. This short observational comparison does not isolate either change or establish sustained overall FAST improvement. The descriptions retain component benchmarks, their actual baselines, validation and limitations.

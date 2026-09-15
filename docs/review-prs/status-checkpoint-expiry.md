@@ -38,3 +38,11 @@ Fold admission now checks the held-slot count before materializing account-write
 ### Empty-block deployment measurement
 
 Fold preflight (`d55c7962`) and the pending-certificate observer index (`72514abc`, separate certificate PR) were deployed together on September 15. Initial empty-block replay-admission p99 was **4.486 → 0.483 ms** (565 before, 401 after). Post-deployment fold admission across 1,386 calls measured 0.0071 ms median, 0.0125 ms p99 and 1.136 ms maximum. These are short observational windows, exclude the native benchmark interval, and do not establish either patch’s isolated contribution or sustained overall FAST gains.
+
+### Retire rewards bookkeeping after durable completion
+
+A finished distribution retained its descriptor and therefore blocked in-memory fork unwind long after rewards were durable. Track an inactive EpochRewards snapshot from a successfully executed bank, bound to the exact distribution descriptor, and retire it only when a successfully committed fold advances the durable root through that bank. Active, unknown and uncommitted completion still force the existing fallback; all other unwind and restart/signing safety checks remain intact. No new persisted format or sync is added.
+
+At the motivating fork, rewards had finished at 3,942,001 and the durable root had reached 3,944,067. Recovery nevertheless re-fetched blocks, recording 2.739 s and 0.967 s waits; an assembled 665-transaction block waited 3.614 s for admission before 7.520 ms execution. These are incident measurements, not candidate speedups or checkpoint encoding timings.
+
+Commit `c78e35cd` adds boundary/generation/failed-fold tests and exact-parent account, resume-state and rewards-snapshot checks. Full replay/rewards race suites passed on M4 and Zen 5; native node recovery/checkpoint race tests, vet and combined build passed. Deployed in the combined Zen 5 validator September 15 at 12:20 UTC after a clean stop; three advancing health checks passed before resuming the existing paced sender. The first post-restart epoch completion and comparable fork switch are still needed to establish live benefit. Method and contract: `docs/rewards-unwind-retirement.md`.
