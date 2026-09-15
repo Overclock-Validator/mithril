@@ -400,15 +400,12 @@ func (t *unrootedTail) buildFoldJob(through uint64, force bool, hookOverrides ..
 	if err != nil {
 		return nil, err
 	}
-	prefix := t.overlay.PromotionPrefix(through)
-	if len(prefix) == 0 {
+	// Check chunk eligibility before materializing account-write lists. Replay
+	// calls this on every iteration, including skipped slots; a partial batch
+	// remains in RAM without rescanning all of its accounts each time.
+	chunk := t.overlay.PromotionChunk(through, t.batchSlots, force)
+	if len(chunk) == 0 {
 		return nil, nil
-	}
-	chunk := prefix
-	if len(chunk) > t.batchSlots {
-		chunk = chunk[:t.batchSlots]
-	} else if len(chunk) < t.batchSlots && !force {
-		return nil, nil // trailing partial chunk stays in RAM
 	}
 	through = chunk[len(chunk)-1].Slot
 
