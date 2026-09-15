@@ -2656,47 +2656,6 @@ postBootstrap:
 		waitToVoteSlot := effectiveWaitToVoteSlot(startupWallSlot, validatorWaitToVoteSlot)
 		mlog.Log.Infof("ALPENGLOW voting startup watermark: wall_clock=%d configured_wait_to_vote=%d wait_to_vote=%d", startupWallSlot, validatorWaitToVoteSlot, waitToVoteSlot)
 
-		identityPubkey := solana.PrivateKey(validatorIdentity).PublicKey()
-		if err := consensusEngine.EnableVoting(consensusengine.VotingConfig{
-			Identity:                  validatorIdentity,
-			AuthorizedVoter:           validatorAuthorizedVoter,
-			VoteAccount:               validatorVoteAccount,
-			HistoryDir:                blockstorePath,
-			ReservedHistory:           validatorReservedHistory,
-			InitializeVoteReservation: validatorInitializeReservation,
-			Genesis:                   solana.MustHashFromBase58(networkGenesisHash),
-			EpochForSlot:              epochSchedule.GetEpoch,
-			SlotDuration:              blockprod.AlpenglowSlotDuration,
-			WaitToVoteSlot:            waitToVoteSlot,
-			ReadyToVote: func(slot uint64) bool {
-				wallSlot := global.WallClockSlot()
-				if liveSlot, ok := consensusEngine.AlpenglowLiveSlot(); ok {
-					wallSlot = liveSlot
-				}
-				return slot >= wallSlot || wallSlot-slot <= alpenglow.LeaderWindowSlots
-			},
-			Peers: func(validators []alpenglow.ValidatorStake) []alpenglow.VotorPeer {
-				peers := make([]alpenglow.VotorPeer, 0, len(validators))
-				seen := make(map[solana.PublicKey]struct{}, len(validators))
-				for _, validator := range validators {
-					if validator.Stake == 0 || validator.NodePubkey == identityPubkey {
-						continue
-					}
-					addr, ok := sharedGossip.LookupAlpenglow(validator.NodePubkey)
-					if !ok {
-						continue
-					}
-					if _, duplicate := seen[validator.NodePubkey]; duplicate {
-						continue
-					}
-					seen[validator.NodePubkey] = struct{}{}
-					peers = append(peers, alpenglow.VotorPeer{Identity: validator.NodePubkey, Addr: addr})
-				}
-				return peers
-			},
-		}); err != nil {
-			klog.Fatalf("enable Alpenglow voting: %v", err)
-		}
 		broadcaster, err := turbine.NewTurbineBroadcaster(turbine.TurbineBroadcasterConfig{
 			Self:          solana.PrivateKey(validatorIdentity).PublicKey(),
 			Peers:         sharedGossip,
@@ -2751,6 +2710,50 @@ postBootstrap:
 		}
 		if err := sharedGossip.SetTPUQUIC(tpuAdvertise); err != nil {
 			mlog.Log.Warnf("validator gossip TPU advertisement: %v", err)
+		}
+
+		// Bind and validate local transports before consuming the durable clean
+		// voting marker. Startup configuration failures must not force recovery.
+		identityPubkey := solana.PrivateKey(validatorIdentity).PublicKey()
+		if err := consensusEngine.EnableVoting(consensusengine.VotingConfig{
+			Identity:                  validatorIdentity,
+			AuthorizedVoter:           validatorAuthorizedVoter,
+			VoteAccount:               validatorVoteAccount,
+			HistoryDir:                blockstorePath,
+			ReservedHistory:           validatorReservedHistory,
+			InitializeVoteReservation: validatorInitializeReservation,
+			Genesis:                   solana.MustHashFromBase58(networkGenesisHash),
+			EpochForSlot:              epochSchedule.GetEpoch,
+			SlotDuration:              blockprod.AlpenglowSlotDuration,
+			WaitToVoteSlot:            waitToVoteSlot,
+			ReadyToVote: func(slot uint64) bool {
+				wallSlot := global.WallClockSlot()
+				if liveSlot, ok := consensusEngine.AlpenglowLiveSlot(); ok {
+					wallSlot = liveSlot
+				}
+				return slot >= wallSlot || wallSlot-slot <= alpenglow.LeaderWindowSlots
+			},
+			Peers: func(validators []alpenglow.ValidatorStake) []alpenglow.VotorPeer {
+				peers := make([]alpenglow.VotorPeer, 0, len(validators))
+				seen := make(map[solana.PublicKey]struct{}, len(validators))
+				for _, validator := range validators {
+					if validator.Stake == 0 || validator.NodePubkey == identityPubkey {
+						continue
+					}
+					addr, ok := sharedGossip.LookupAlpenglow(validator.NodePubkey)
+					if !ok {
+						continue
+					}
+					if _, duplicate := seen[validator.NodePubkey]; duplicate {
+						continue
+					}
+					seen[validator.NodePubkey] = struct{}{}
+					peers = append(peers, alpenglow.VotorPeer{Identity: validator.NodePubkey, Addr: addr})
+				}
+				return peers
+			},
+		}); err != nil {
+			klog.Fatalf("enable Alpenglow voting: %v", err)
 		}
 
 		rewardBuilder := rewardcerts.NewBuilder(rewardcerts.BuilderConfig{
