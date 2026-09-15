@@ -12,6 +12,10 @@ import (
 // snapshot. A newer complete history supersedes an unwritten snapshot; every
 // retained, unrooted voting decision is still present in that newer history.
 // The independently durable reservation, not this queue, authorizes signing.
+// In-flight/pending snapshots may be lost on process death; even a completed
+// unsynced replacement may be lost on host/power failure. Neither submitted nor
+// written is a durable vote acknowledgement. Recovery must use the startup
+// reservation unless the separate clean-history seal validates.
 type voteHistoryWriter struct {
 	mu        sync.Mutex
 	pending   *alpenglow.VoteHistorySnapshot
@@ -34,6 +38,7 @@ func newVoteHistoryWriter(persist func(*alpenglow.VoteHistorySnapshot) error, on
 
 // submit does no I/O and never waits for the writer. The mutex only protects
 // pointer/counter changes; neither persistence nor error callbacks hold it.
+// A nil return means queued only. It must never replace the reservation check.
 func (w *voteHistoryWriter) submit(snapshot *alpenglow.VoteHistorySnapshot) error {
 	if snapshot == nil {
 		return errors.New("nil vote-history snapshot")

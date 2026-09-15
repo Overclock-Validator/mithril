@@ -750,7 +750,7 @@ func (v *alpenglowVoter) castTarget(vote alpenglow.Vote, restoring bool, guarded
 		if !restoring && v.beforeVoteGuard != nil {
 			v.beforeVoteGuard(guardedBlock)
 		}
-		// Hold through signing, durable history, pool admission, and broadcast.
+		// Hold through signing, history recording, pool admission, and broadcast.
 		// Objective invalidation takes the write side before changing the chain,
 		// so a new or restored vote is wholly before it or sees the tombstone.
 		v.engine.invalidActionMu.RLock()
@@ -783,6 +783,10 @@ func (v *alpenglowVoter) castTarget(vote alpenglow.Vote, restoring bool, guarded
 		// Pool admission can publish a certificate. In reserved mode the durable
 		// upper bound covers loss of this unsynchronized history replacement;
 		// synchronous mode still persists the exact history before admission.
+		// sign computed BLS bytes in RAM, but nothing may expose them before
+		// this boundary succeeds. In reserved mode saveHistory only queues the
+		// snapshot: restart safety comes from the durable reservation checked
+		// before sign, not from assuming this snapshot reached durable storage.
 		if err := v.saveHistory(); err != nil {
 			return false, err
 		}
@@ -816,6 +820,9 @@ func (v *alpenglowVoter) castTarget(vote alpenglow.Vote, restoring bool, guarded
 	return true, nil
 }
 
+// sign checks reservation recovery even when restoration bypasses the live
+// joining gate. Re-signing a saved vote is still signing; the presence of an
+// older valid history file cannot prove that its lost suffix was conflict-free.
 func (v *alpenglowVoter) sign(vote alpenglow.Vote, respectVotingGate bool) (alpenglow.VoteMessage, alpenglow.VoteVerifyResult, error) {
 	if err := v.engine.safetyError(); err != nil {
 		return alpenglow.VoteMessage{}, alpenglow.VoteVerifyResult{}, err
@@ -1190,6 +1197,9 @@ func (v *alpenglowVoter) isIdentityStaked(slot uint64) bool {
 	return false
 }
 
+// saveHistory is a publication boundary with different persistence semantics:
+// synchronous mode acknowledges durable exact history; reserved mode acknowledges
+// an immutable queued snapshot only. The latter relies on the signing reservation.
 func (v *alpenglowVoter) saveHistory() error {
 	if v.historyWriter != nil {
 		snapshot, err := alpenglow.PrepareReservedVoteHistory(v.history, v.identity)
@@ -1418,6 +1428,8 @@ func (v *alpenglowVoter) close() error {
 			if v.historyWriter != nil {
 				v.shutdownErr = v.historyWriter.close()
 			}
+			// Exiting normally is insufficient: an unresolved recovery barrier,
+			// writer failure or safety fault must leave the session unsealed.
 			floor := v.engine.alpenglowVerifiedFinalityFloor()
 			if v.shutdownErr == nil && v.engine.safetyError() == nil && floor >= v.reservation.recoverThrough {
 				v.history.SetRoot(floor)
