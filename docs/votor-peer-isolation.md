@@ -11,11 +11,19 @@ queues. The existing bounded worker pool handles connection attempts only;
 `VotorBroadcasterConfig.Workers` controls that pool. A blocked connection cannot
 consume another peer's sender or a connection worker.
 
-A watchdog checks every 100 ms for a `SendDatagram` call blocked for at least
-one second. It closes that connection, waking the sender, and queues a reconnect.
-The timeout is an operational bound on local QUIC enqueueing, not a consensus
-deadline or a remote-delivery guarantee. Runtime scheduling can delay the check.
-It does not create a goroutine or timer for each send.
+A watchdog checks every 100 ms whether the active datagram's peer-queue wait
+plus its current `SendDatagram` duration has reached one second. Occasional QUIC
+PTO probes can free queue entries without proving delivery; they no longer
+restart this budget for an old backlog. Dequeue also retires a connection before
+feeding an already-one-second-old entry into QUIC, even if sends keep completing
+between watchdog ticks. The effective active-send bound is one second from
+fanout enqueue, plus up to one watchdog interval and runtime scheduling delay.
+
+Retirement closes that connection, wakes a blocked sender, discards its queued
+copies and requests a bounded reconnect. This is an operational limit on local
+queueing, not a consensus validity deadline or a remote-delivery guarantee. It
+adds no per-send timer or goroutine. An idle connection is not expired merely
+because its previous send had a long queue delay.
 
 ## Failure and ordering semantics
 
@@ -26,7 +34,13 @@ It does not create a goroutine or timer for each send.
   `MessagesDropped` counter, and continues sending to other peers.
 - Messages queued on a failed, removed or replaced connection are discarded and
   counted in `PeerQueueDiscarded`. They are not transferred to a new connection
-  or address. The failed in-flight send is counted in `PeerSendErrors`.
+  or address. A datagram expired at dequeue is counted in `PeerQueueDiscarded`;
+  a failed `SendDatagram` call is counted in `PeerSendErrors`. The watchdog and
+  dequeue path claim retirement under the sender mutex, counting one timeout.
+- Every sender exit requests a bounded, deduplicated reconnect. This covers
+  both a remote-close notification and closure detected while dequeuing. Peer
+  departure, shutdown and a healthy replacement suppress obsolete requests;
+  normal remote closure no longer relies on the periodic reconciliation tick.
 - Messages for disconnected peers increment `PeerSendsSkipped`, as before.
   This change adds no automatic application-level retransmission.
 - A single sender preserves local enqueue order within its connection. QUIC
@@ -42,7 +56,8 @@ certificate validation are unchanged.
 The voting log adds `peer_queue_drops`, `peer_queue_discarded`,
 `peer_send_timeouts`, and `peer_queue_max_delay`. These counters/high-water marks
 survive reconnects. `PeerQueueMaxDelay` measures time from fanout enqueue to
-entering `SendDatagram`; it does not include time blocked inside that call.
+sender dequeue, including entries retired before reaching QUIC; it does not
+include time blocked inside `SendDatagram`.
 
 Voting snapshots also expose `broadcast_peer_queues` with each current peer's
 identity, address, queue depth, time in the active send, last/max queue delay,
@@ -59,6 +74,18 @@ connections, then blackholes one UDP path. It observes the blocked
 250 ms while the failed connection is still open. It also covers peer queue
 overflow, watchdog reconnection, fresh traffic after reconnect, shutdown with a
 blocked sender, peer departure, and replacement of a blocked peer's address.
+Its connection-retirement deadline is measured from the blackhole, with explicit
+scheduler slack; the healthy-peer latency assertion remains 250 ms.
+
+Deterministic regressions reproduce a fresh send following an old queue wait,
+remote closure while idle and while dequeuing, and an already-aged queue entry.
+The reconnect fixture has no reconciliation loop, so a timer cannot hide a missed
+reconnect trigger. The pre-fix failures and fresh validation are retained under
+`docs/results/review-fixes/2026-09-15`.
+
+The signature-verification config template and its tests now belong to the
+streaming branch, which reads those settings. This standalone voting branch
+retains its base branch's supported `tuning.sigverify_backend` template.
 
 ```sh
 go test -race ./pkg/alpenglow ./pkg/consensus -count=1 -timeout=180s

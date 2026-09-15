@@ -104,6 +104,7 @@ func testVotorBlockedPeer(t *testing.T, action string) {
 	case <-time.After(time.Second):
 		t.Fatal("proxied baseline failed")
 	}
+	blackholedAt := time.Now()
 	blackhole.Store(true)
 	for slot := uint64(1); slot <= 256; slot++ {
 		require.NoError(t, b.Enqueue(NewVoteMessage(NewSkipVote(slot), testSignatureSeq(0x41), 3)))
@@ -206,7 +207,13 @@ func testVotorBlockedPeer(t *testing.T, action string) {
 	case <-time.After(250 * time.Millisecond):
 		t.Fatal("full peer queue delayed healthy delivery")
 	}
-	require.Eventually(t, func() bool { return badConn.Context().Err() != nil }, 3*time.Second, 5*time.Millisecond)
+	// Queue age is measured from fanout, so PTO progress no longer restarts
+	// the one-second budget. Allow two seconds of test scheduling slack beyond
+	// one watchdog tick, measured from the fault rather than this assertion.
+	remaining := time.Until(blackholedAt.Add(votorSendTimeout + votorSendWatchInterval + 2*time.Second))
+	require.Positive(t, remaining)
+	require.Eventually(t, func() bool { return badConn.Context().Err() != nil }, remaining, 5*time.Millisecond)
+	t.Logf("Blackholed peer retired after %s", time.Since(blackholedAt))
 	select {
 	case <-badSender.done:
 	case <-time.After(time.Second):

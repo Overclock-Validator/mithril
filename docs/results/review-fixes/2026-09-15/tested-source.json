@@ -1,0 +1,16 @@
+{
+  "combined_base": "97c6562f",
+  "status_publication": "6d819275",
+  "streaming_before_fix": "75e76646",
+  "voting_before_fix": "0e0afb06",
+  "changed_go": {
+    "pkg/turbine/entry_prefetch.go": "6c158d62826fd6e263eeb1182643a777b035ee67deb4275538a674cf595d2ab1",
+    "pkg/turbine/entry_identity_recovery_test.go": "f3f3dcf1fd4b299b2cdce55d58295cf1f0f33344fcd6e2493a6615d12022408b",
+    "cmd/mithril/configcmd/configcmd.go": "a41c8a29265099f625f8342517ac8c64f30d28067a83cc4db796d339e76dc1cd",
+    "cmd/mithril/configcmd/configcmd_test.go": "70b19e81e02e3144a5f91f6f6d38defd2af3c9ce4d37794b420eec8a33d27418",
+    "pkg/alpenglow/peer_sender.go": "78589eb1879ba5a5f7e96126d5ba62415b68fa39fcb86884b618020ea91f5ca0",
+    "pkg/alpenglow/peer_sender_test.go": "f0c9e112205e92fc7f5bb4b874fff115615e8ecdd9f3ae03405b88047a47851b",
+    "pkg/alpenglow/peer_sender_recovery_test.go": "555c06411d147720c6c0bcd1481111e6209a98f20c3515b5168f9b4a3da7dd75"
+  },
+  "note": "Native combined tests include all six split branches plus status publication and these fixes. Final template-only narrowing was checked separately with config/node race tests and a final build. Standalone voting retains its base template; the native combined template comes from streaming."
+}

@@ -1,0 +1,10 @@
+Running as unit: mithril-review-fixes-check-20260915.service; invocation ID: 51c80c67f31744f9bbf9b056bbecd2db
+race 0
+blackhole-race 0
+vet 0
+build 0
+          Finished with result: success
+Main processes terminated with: code=exited, status=0/SUCCESS
+               Service runtime: 1min 4.346s
+             CPU time consumed: 1min 12.623s
+                   Memory peak: 1019.1M (swap: 0B)
