@@ -1747,6 +1747,7 @@ func ReplayBlocks(
 	var unwoundParentBankSysvars *sealevel.BankSysvars
 	var partitionedEpochRewardsEnabled bool
 	var partitionedRewardsInfo *rewards.PartitionedRewardDistributionInfo
+	var rewardsCompletion partitionedRewardsCompletion
 	var featuresActivatedInFirstSlot []*accounts.Account
 	var parentFeaturesActivatedInFirstSlot []*accounts.Account
 
@@ -2061,6 +2062,10 @@ func ReplayBlocks(
 		mithrilState.LastRootedSlot = promotedThrough
 		mithrilState.LastRootedBankhash = rootedCtx.Bankhash
 		mithrilState.LastRootedContext = rootedCtx
+		if rewardsCompletion.retire(&partitionedRewardsInfo, promotedThrough) {
+			rewardsHoldBelowSlot = 0
+			mlog.Log.Infof("epoch rewards bookkeeping retired through durable slot %d; later fork switches may unwind in memory", promotedThrough)
+		}
 		if transactionStatuses.Root(promotedThrough) {
 			mlog.Log.Infof("transaction status cache reconstructed complete %d-root coverage through durable slot %d",
 				maxTransactionStatusRoots, promotedThrough)
@@ -2873,6 +2878,7 @@ func ReplayBlocks(
 				boundaryParentCtx = epochBoundaryParentCtx(acctsDb, block, currentEpoch, replayCtx.CurrentFeatures)
 			}
 			partitionedRewardsInfo = handleEpochTransition(acctsDb, partitionedEpochRewardsEnabled, boundaryParentCtx, replayCtx, epochSchedule, replayCtx.CurrentFeatures, block, currentEpoch, rpcc, dbgOpts)
+			rewardsCompletion = partitionedRewardsCompletion{}
 			currentEpoch = block.Epoch
 			justCrossedEpochBoundary = true
 			// While partitioned rewards are distributing, hold durable promotion
@@ -2985,6 +2991,7 @@ func ReplayBlocks(
 		}
 		// The successful child now owns its derived snapshot. Any later bank uses
 		// lastSlotCtx; the one-shot retained unwind bridge is no longer needed.
+		rewardsCompletion.observeBank(partitionedRewardsInfo, lastSlotCtx.BankSysvars())
 		unwoundParentBankSysvars = nil
 		postProcessBlockStart := processBlockEnd
 		statusViewStart := time.Now()
