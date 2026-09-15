@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/Overclock-Validator/gnark-crypto/ecc"
 	bls12381 "github.com/Overclock-Validator/gnark-crypto/ecc/bls12-381"
 	blsfr "github.com/Overclock-Validator/gnark-crypto/ecc/bls12-381/fr"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
@@ -1235,6 +1236,45 @@ func (p *CertPool) verifyParsedBatch(members []parsedBatchVote, payload []byte) 
 }
 
 func randomizedAggregatePairingOK(members []parsedBatchVote, payload []byte) (bool, error) {
+	// Bucket setup outweighs MultiExp's savings on small batches, including
+	// the two-candidate collision path and failed-batch subdivisions.
+	if len(members) < 16 {
+		return randomizedAggregatePairingScalarOK(members, payload)
+	}
+	return randomizedAggregatePairingMultiExpOK(members, payload)
+}
+
+func randomizedAggregatePairingMultiExpOK(members []parsedBatchVote, payload []byte) (bool, error) {
+	pubkeys := make([]bls12381.G1Affine, len(members))
+	signatures := make([]bls12381.G2Affine, len(members))
+	coefficients := make([]blsfr.Element, len(members))
+	for i := range members {
+		coefficient, err := randomNonzeroBatchCoefficient()
+		if err != nil {
+			return false, err
+		}
+		// Keep independent, nonzero, full-field coefficients and apply the
+		// same coefficient to each member's public key and signature.
+		coefficients[i].SetBigInt(coefficient)
+		pubkeys[i] = members[i].pubkey
+		signatures[i] = members[i].sig
+	}
+	// MultiExp defaults to using all CPUs. Keep its arithmetic concurrency at
+	// one, and run G1/G2 sequentially, to avoid competing with replay workers.
+	// Pool-level verification admission remains bounded by verificationMu.
+	config := ecc.MultiExpConfig{NbTasks: 1}
+	var aggPub bls12381.G1Affine
+	if _, err := aggPub.MultiExp(pubkeys, coefficients, config); err != nil {
+		return false, err
+	}
+	var aggSig bls12381.G2Affine
+	if _, err := aggSig.MultiExp(signatures, coefficients, config); err != nil {
+		return false, err
+	}
+	return aggregatePairingOK(aggPub, payload, aggSig), nil
+}
+
+func randomizedAggregatePairingScalarOK(members []parsedBatchVote, payload []byte) (bool, error) {
 	var aggPub bls12381.G1Affine
 	var aggSig bls12381.G2Affine
 	aggPub.SetInfinity()
