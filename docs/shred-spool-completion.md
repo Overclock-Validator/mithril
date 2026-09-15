@@ -74,3 +74,49 @@ baseline is the exact previously deployed combined validator, SHA256
 branch versus alpenglow-dev. Exact source copies, native outputs, test-exclusion
 windows and binary-verified traces remain at
 `/srv/mithril-spool-async-20260915` on the validator host.
+
+## Initial deployment measurement
+
+Deployed September 15 at 18:06 UTC after a clean stop. Three advancing health
+checks finished at one-slot vote lag before the existing loader and FAST monitor
+resumed. The exact candidate SHA256 is
+`d6966d72afa9cb7dbb6724d16e459402918975a17bdf0638136e1c68c339ba08`.
+The status-map experiment and all other runtime settings remained unchanged, so
+this trial changed only spool behavior.
+
+Both bounded ten-minute spool traces exited successfully. The candidate recorded
+2,522 completion calls: median 0.00945 ms, p99 0.02104 ms, maximum 0.14015 ms,
+including probe overhead. Its background journal writer recorded three writes
+above 1 ms, with a 39.334 ms maximum. No completion call exceeded 1 ms. Background
+write records were not tagged as completion versus tombstone, so this does not
+identify the particular slow record or prove a counterfactual per-block saving.
+The blocked-writer tests establish isolation of completion publication. Other
+spool I/O remains: one measured slot-file close took 29.824 ms.
+
+The preceding trace had 2,524 completions and no long stalls either. Directly
+comparing its 0.04212 ms p99 with the candidate's 0.02104 ms p99 is confounded by
+unequal probe counts inside the measured function. Use the identical untraced
+native benchmark for the ordinary-path component comparison.
+
+Received-block comparison excludes startup, native-test intervals and incomplete
+or nonmonotonic joins. Assembler completeness is reconstructed from completion
+entry minus queue delay; the endpoint is local QUIC serialization, not receipt
+by another validator. Locally adopted own blocks are excluded. Windows and sample
+sizes differ and are not randomized A/B.
+
+| Received blocks | Before n | Candidate n | Overall p99 before → candidate |
+|---|---:|---:|---|
+| Empty | 2,257 | 570 | 8.464 → 7.871 ms |
+| At least 30,000 transactions | 546 | 209 | 123.954 → 148.555 ms |
+
+No overall large-block tail improvement is established. Of the 209 large blocks,
+204 had controls matched by leader, slot position, sender overlap and transaction
+count/rounded CU within 10%, within one hour. Median per-candidate total difference
+was +0.519 ms; controls can be reused. Two consecutive same-leader blocks around
+80 seconds after restart spent 23.458 and 182.377 ms in remaining verification;
+one had no early parsing or verification recorded. Their spool-to-delivery
+intervals were at most 0.01765 ms, and no metadata-recovery warning appeared.
+The deeper cause of this verification gap remains open; stage attribution alone
+does not prove it is unrelated to all effects of the deployment.
+
+Voting, continuous large-block production and the existing monitors remain active.
