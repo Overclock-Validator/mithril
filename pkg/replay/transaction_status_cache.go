@@ -586,6 +586,10 @@ func (c *TransactionStatusCache) CommitBlock(block *b.Block) error {
 // commitBlockWithPlan atomically rechecks the mutable lineage/status state and
 // publishes the already-prepared immutable transaction identities.
 func (c *TransactionStatusCache) commitBlockWithPlan(block *b.Block, plan blockTransactionExecutionPlan) error {
+	return c.commitBlockWithPreparedDelta(block, plan, nil)
+}
+
+func (c *TransactionStatusCache) commitBlockWithPreparedDelta(block *b.Block, plan blockTransactionExecutionPlan, prepared *preparedTransactionStatusDelta) error {
 	if block == nil || plan.messageIdentities == nil || !plan.messageIdentities.MatchesBlock(block) {
 		return errors.New("prepared transaction message identities do not match block")
 	}
@@ -604,23 +608,27 @@ func (c *TransactionStatusCache) commitBlockWithPlan(block *b.Block, plan blockT
 		return err
 	}
 
-	delta := make(transactionStatusDelta)
-	for index := 0; index < plan.messageIdentities.Len(); index++ {
-		identity := plan.messageIdentities.Identity(index)
-		blockhash := identity.RecentBlockhash
-		group := delta[blockhash]
-		if group == nil {
-			keyIndex := uint8(0)
-			if visible := c.visible[blockhash]; visible != nil {
-				keyIndex = visible.keyIndex
+	delta := transactionStatusDelta(nil)
+	if prepared != nil && prepared.identities == plan.messageIdentities {
+		delta = prepared.delta
+		// A restore or branch transition can change a blockhash's slice offset.
+		// Rebuild from full identities if any current group uses another offset.
+		for blockhash, group := range delta {
+			if visible := c.visible[blockhash]; visible != nil && visible.keyIndex != group.keyIndex {
+				delta = nil
+				break
 			}
-			group = &transactionStatusGroup{
-				keyIndex: keyIndex,
-				keys:     make(map[transactionStatusKey]struct{}),
-			}
-			delta[blockhash] = group
 		}
-		group.keys[sliceTransactionStatusKey(identity.MessageHash, group.keyIndex)] = struct{}{}
+	}
+	if delta == nil {
+		counts := countTransactionStatusGroups(plan.messageIdentities)
+		indexes := make(map[solana.Hash]uint8, len(counts))
+		for blockhash := range counts {
+			if visible := c.visible[blockhash]; visible != nil {
+				indexes[blockhash] = visible.keyIndex
+			}
+		}
+		delta = buildTransactionStatusDelta(plan.messageIdentities, counts, indexes)
 	}
 
 	if err := c.addDeltaVisibleLocked(delta); err != nil {
@@ -804,7 +812,7 @@ func (c *TransactionStatusCache) addDeltaVisibleLocked(delta transactionStatusDe
 		if group == nil {
 			group = &visibleTransactionStatusGroup{
 				keyIndex: deltaGroup.keyIndex,
-				keys:     make(map[transactionStatusKey]uint16),
+				keys:     make(map[transactionStatusKey]uint16, len(deltaGroup.keys)),
 			}
 			c.visible[blockhash] = group
 		}

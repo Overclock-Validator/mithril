@@ -26,6 +26,7 @@ func TestPreparedCommitRechecksAncestorAfterForkSwitch(t *testing.T) {
 	plan, err := planBlockTransactionExecution(candidate)
 	requireNoError(err)
 	requireNoError(cache.validateBlockWithPlan(candidate, plan))
+	prepared := cache.prepareTransactionStatusDelta(plan.messageIdentities)
 
 	requireNoError(cache.Unwind(11))
 	replacement := statusCacheTestBlock(
@@ -34,7 +35,7 @@ func TestPreparedCommitRechecksAncestorAfterForkSwitch(t *testing.T) {
 	)
 	requireNoError(cache.CommitBlock(replacement))
 
-	err = cache.commitBlockWithPlan(candidate, plan)
+	err = cache.commitBlockWithPreparedDelta(candidate, plan, prepared)
 	var ancestorErr *AncestorAlreadyProcessedTransactionMessagesError
 	if !errors.As(err, &ancestorErr) {
 		t.Fatalf("prepared commit error = %v, want ancestor AlreadyProcessed", err)
@@ -83,15 +84,17 @@ func TestConcurrentPreparedSiblingCommitsPublishExactlyOne(t *testing.T) {
 		t.Fatalf("prevalidate right sibling: %v", err)
 	}
 
+	leftPrepared := cache.prepareTransactionStatusDelta(leftPlan.messageIdentities)
+	rightPrepared := cache.prepareTransactionStatusDelta(rightPlan.messageIdentities)
 	start := make(chan struct{})
 	results := make(chan error, 2)
 	go func() {
 		<-start
-		results <- cache.commitBlockWithPlan(left, leftPlan)
+		results <- cache.commitBlockWithPreparedDelta(left, leftPlan, leftPrepared)
 	}()
 	go func() {
 		<-start
-		results <- cache.commitBlockWithPlan(right, rightPlan)
+		results <- cache.commitBlockWithPreparedDelta(right, rightPlan, rightPrepared)
 	}()
 	close(start)
 
