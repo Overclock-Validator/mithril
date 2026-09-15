@@ -4,7 +4,7 @@ Replay previously built the immutable per-bank transaction-status delta and grew
 
 Count identities by recent blockhash and allocate each delta map at its final capacity. Pre-size newly created visible maps too. For banks with more than 32 transactions and GOMAXPROCS greater than one, prepare the immutable delta during account loading and execution. Smaller banks and single-thread configurations keep the work inline. There is at most one preparation task per ProcessBlock call, and every return joins it, including rejected banks. No status becomes visible during preparation.
 
-The worker reads immutable prepared message identities and briefly snapshots only blockhash slice offsets under the cache read lock. It builds its private maps outside the lock. Commit still checks exact block/identity binding, complete coverage, parent lineage and all ancestor duplicates under the publication lock. A changed slice offset or mismatched preparation triggers a rebuild from the actual block's identities. Publication still happens only after successful bank-state commit. Failed instructions within an accepted bank remain processed; rejected banks publish nothing. Pinned views, snapshots, reference counts and unwind keep their existing semantics.
+The worker reads immutable prepared message identities and briefly snapshots only blockhash slice offsets under the cache read lock. It builds its private maps outside the lock. Commit checks exact block/identity binding, complete coverage and parent lineage under the publication lock. It rechecks ancestor duplicates unless the successful pre-execution validation belongs to the same cache instance, immutable identity set and unchanged cache version (see below). A changed slice offset or mismatched preparation triggers a rebuild from the actual block's identities. Publication still happens only after successful bank-state commit. Failed instructions within an accepted bank remain processed; rejected banks publish nothing. Pinned views, snapshots, reference counts and unwind keep their existing semantics.
 
 TransactionStatusPreparation measures worker wall time, which overlaps execution; it is not additive with replay wall time. TransactionStatusPreparationWait measures the residual join and is nested inside TransactionStatusCommit. The latter still includes waiting, final checks, visible-index updates and node publication. Preparation time excludes initial goroutine scheduling delay; any residual scheduling delay remains in the join/commit timer.
 
@@ -50,3 +50,24 @@ GOMAXPROCS=2 go build -p 2 ./cmd/mithril
 GOMAXPROCS=2 go test ./pkg/replay -run '^$' -bench '^BenchmarkTransactionStatusPublication$' -benchtime=10x -count=5
 go test ./pkg/replay -run '^$' -bench '^BenchmarkTransactionStatus(ExecutionOverlap|SmallPublication)$' -benchtime=100ms -count=5 -cpu=1,2
 ```
+
+## Reusing pre-execution ancestor validation
+
+`ProcessBlock` now carries a private validation receipt from its successful ancestor scan to status publication. Under the commit lock, an unchanged receipt avoids scanning all transaction messages again. Publication still checks block binding, complete coverage and parent lineage every time; a missing, foreign or stale receipt performs the full ancestor scan. Direct `CommitBlock` callers retain the full scan.
+
+The receipt is bound to the cache instance and exact immutable prepared-identity pointer. Visible-index insertion/removal, tip binding, root/prune and restore invalidate the version, including empty commits. Committing and then unwinding back to an identical parent cannot revive a receipt. Version saturation disables reuse permanently rather than wrapping. Snapshot/Agave recovery creates a new cache instance. Receipts are never persisted, and no checkpoint format, durability, voting-resume or crash-recovery guarantee changes.
+
+The publication benchmark adds `validated_commit` and `invalidated_commit` alongside `prepared_commit`. All three exclude delta preparation and the pre-execution scan. The first reuses that scan; the second calls `Root` between validation and publication, forcing revalidation. Each iteration unwinds and obtains a fresh receipt outside the timer. These are incremental publication comparisons, not the full PR against alpenglow-dev or per-block tail latency. Tests exercise fork replacement introducing duplicates, concurrent sibling commits, cross-cache and cross-identity misuse, snapshot replacement, pruning/root invalidation, binding changes, transaction replacement and version saturation.
+
+Zen 5 incremental measurement (Ryzen 9700X, Go 1.26.4, GOMAXPROCS=2, five samples × 20 iterations, Nice=19 / 200% CPU quota on the running validator host):
+
+| Recent blockhash groups | Existing ancestor groups | Full recheck | Reused validation | Invalidated validation |
+|---|---|---|---|---|
+| 1 | yes | 2.510 ms | 1.364 ms | 2.536 ms |
+| 4 | yes | 2.412 ms | 1.283 ms | 2.440 ms |
+| 1 | no | 1.461 ms | 1.472 ms | 1.769 ms |
+| 4 | no | 1.323 ms | 1.395 ms | 1.303 ms |
+
+Values are medians of sample means. Existing-group cases remove approximately 1.1 ms of repeated lookup work; new-group cases show no clear gain and shared-host variation. Full native replay/block race suites, targeted node recovery race tests, vet and the combined build passed. Local replay race tests and vet also passed.
+
+A separate 180-second pre-change live trace observed 728 publications. In the 145 publications taking at least 1 ms, the repeated scan measured 1.805 ms median / 3.180 ms maximum; insertion 2.198 / 6.774 ms. Lock acquisition was at most 0.0058 ms across all publications, and the preparation join at most 0.0010 ms. This latency-selected cohort is not a fixed transaction-size sample or a before/after p99 comparison. Probe overhead is included. These measurements identify removable work; they do not establish a sustained FAST improvement. Raw traces, native test windows and exact combined source stay on the validator host at `/srv/mithril-status-validation-20260915`.
