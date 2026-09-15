@@ -1,0 +1,38 @@
+{
+  "samples_ns_per_pop": {
+    "baseline": {
+      "equal_rewards": [
+        143.0,
+        147.6,
+        140.1
+      ],
+      "mixed_rewards": [
+        240.2,
+        261.2,
+        254.0
+      ]
+    },
+    "candidate": {
+      "equal_rewards": [
+        188.0,
+        302.4,
+        183.5
+      ],
+      "mixed_rewards": [
+        268.0,
+        276.0,
+        274.2
+      ]
+    }
+  },
+  "median_ns_per_pop": {
+    "baseline": {
+      "equal_rewards": 143.0,
+      "mixed_rewards": 254.0
+    },
+    "candidate": {
+      "equal_rewards": 188.0,
+      "mixed_rewards": 274.2
+    }
+  }
+}
