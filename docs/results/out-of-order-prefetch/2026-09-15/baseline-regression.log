@@ -1,0 +1,16 @@
+--- FAIL: TestEntryPrefetchBypassesEarlierGap (6.01s)
+    --- FAIL: TestEntryPrefetchBypassesEarlierGap/lateBoundary=false (3.00s)
+        gap_regression_test.go:39: 
+            	Error Trace:	/srv/mithril-out-of-order-prefetch-20260915/benchmark-baseline/pkg/turbine/entry_prefetch_test.go:66
+            	            				/srv/mithril-out-of-order-prefetch-20260915/benchmark-baseline/pkg/turbine/gap_regression_test.go:39
+            	Error:      	Condition never satisfied
+            	Test:       	TestEntryPrefetchBypassesEarlierGap/lateBoundary=false
+    --- FAIL: TestEntryPrefetchBypassesEarlierGap/lateBoundary=true (3.00s)
+        gap_regression_test.go:39: 
+            	Error Trace:	/srv/mithril-out-of-order-prefetch-20260915/benchmark-baseline/pkg/turbine/entry_prefetch_test.go:66
+            	            				/srv/mithril-out-of-order-prefetch-20260915/benchmark-baseline/pkg/turbine/gap_regression_test.go:39
+            	Error:      	Condition never satisfied
+            	Test:       	TestEntryPrefetchBypassesEarlierGap/lateBoundary=true
+FAIL
+FAIL	github.com/Overclock-Validator/mithril/pkg/turbine	6.032s
+FAIL
