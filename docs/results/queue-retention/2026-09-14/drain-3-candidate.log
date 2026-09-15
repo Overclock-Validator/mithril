@@ -1,0 +1,7 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/Overclock-Validator/mithril/pkg/blockprod/scheduler
+cpu: Apple M4 Pro
+BenchmarkBufferDrain/equal_rewards         	  120000	       183.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBufferDrain/mixed_rewards         	  120000	       274.2 ns/op	       0 B/op	       0 allocs/op
+PASS

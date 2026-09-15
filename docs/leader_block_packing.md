@@ -10,8 +10,12 @@ execution and all resource budgets remain bank-dependent checks.
 Leader execution reuses borrowed-account scratch and skips detailed replay
 stage timers. Missing-current-bank lookup errors defer base58 formatting until
 used, avoiding wasted work before parent lookup. Entry Merkle hashing retains
-only the root-building scratch, and queue removal avoids heap interface dispatch
-and unused index updates while preserving priority/FIFO order.
+only the root-building scratch, and max-heap removal avoids heap interface dispatch
+while preserving priority/FIFO order. Both priority heaps now track entry
+indexes so consumption, eviction and expiry remove every buffer reference.
+Repeated rebuffering reuses the caller's intact transaction without accumulating
+duplicate heap references. The existing slot-local skip scanning policy remains
+unchanged, including selection of newly arrived higher-priority transactions.
 
 ## Capacity and protocol limits
 
