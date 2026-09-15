@@ -1,0 +1,6 @@
+ok  	github.com/Overclock-Validator/mithril/pkg/alpenglow	10.809s
+ok  	github.com/Overclock-Validator/mithril/pkg/consensus	10.259s
+ok  	github.com/Overclock-Validator/mithril/pkg/blockprod	2.129s
+ok  	github.com/Overclock-Validator/mithril/pkg/config	1.156s
+ok  	github.com/Overclock-Validator/mithril/cmd/mithril/node	1.894s
+ok  	github.com/Overclock-Validator/mithril/cmd/mithril/configcmd	1.205s

@@ -1,0 +1,7 @@
+# Review branch validation, September 15
+
+This PR is split from #279 plus the later working-tree improvements. The tested code commit before this documentation commit was `e9feb8efdf1273f4aec444cc55c821e66e33e857`. Tests ran locally on Apple M4 Pro, Go1.26.4, GOMAXPROCS3 and package parallelism2. Logs beside this file are the fresh split-branch checks, not native measurements. Existing Zen5 benchmark documents retain their original baselines and scope. No validator restart or deployment occurred during this reorganization.
+
+Four independent branches start at current alpenglow-dev33dde405. Voting is based on the certificate-processing PR; leader packing is based on the streaming-preparation PR. Runtime changes and status-cache changes are independent. Shared CLI/configuration additions need an ordinary three-file merge reconciliation when combining leader packing and voting. A separate audit checkout reconciled these additions and matched the preserved full implementation exactly across Go sources, module files, TOML configuration and CI.
+
+The standalone voting race suites, vet and full build passed. The combined audit race run failed in the previously recorded intermittent `TestVotorBroadcasterIsolatesBlockedPeer/reconnect` timeout at peer_sender_test.go:209; the healthy peer received its marker in4.27ms. The other combined suites passed. The voting PR remains draft for review of this qualification issue. Tests were not weakened or retried to hide the failure.

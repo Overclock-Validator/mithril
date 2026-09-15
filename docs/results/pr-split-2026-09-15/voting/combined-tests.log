@@ -1,0 +1,36 @@
+(+    0s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=77 latest_certificate_slot=0)
+(+    0s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=99 latest_certificate_slot=0)
+(+    0s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=100 latest_certificate_slot=0)
+(+    4s) WARN: ALPENGLOW cert pool: equivocation evidence — rank 0 cast conflicting VERIFIED notarize votes at slot 900 (4uQeVj5tqViQh7yWWGStvkEG1Zmhx6uasJtWCJziofM vs 8opHzTAnfzRpPEx21XtnrVTX28YQuCpAjcn1PczScKh)
+(+    6s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    6s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    9s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    9s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    9s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    9s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    9s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    9s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    9s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+--- FAIL: TestVotorBroadcasterIsolatesBlockedPeer (3.07s)
+    --- FAIL: TestVotorBroadcasterIsolatesBlockedPeer/reconnect (3.02s)
+        peer_sender_test.go:134: Healthy marker received in 4.271292ms while other peer's SendDatagram is blocked
+        peer_sender_test.go:209: 
+            	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-split-20260915/split-audit/pkg/alpenglow/peer_sender_test.go:209
+            	            				/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-split-20260915/split-audit/pkg/alpenglow/peer_sender_test.go:20
+            	Error:      	Condition never satisfied
+            	Test:       	TestVotorBroadcasterIsolatesBlockedPeer/reconnect
+(+    9s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=42 latest_certificate_slot=0)
+(+    9s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=43 latest_certificate_slot=0)
+(+    9s) ALPENGLOW Votor receiver decoded first message (votes=0 certificates=1 latest_vote_slot=0 latest_certificate_slot=42)
+(+   10s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=61 latest_certificate_slot=0)
+FAIL
+FAIL	github.com/Overclock-Validator/mithril/pkg/alpenglow	10.536s
+ok  	github.com/Overclock-Validator/mithril/pkg/consensus	10.167s
+ok  	github.com/Overclock-Validator/mithril/pkg/replay	4.571s
+ok  	github.com/Overclock-Validator/mithril/pkg/turbine	10.298s
+ok  	github.com/Overclock-Validator/mithril/pkg/blockprod	21.409s
+ok  	github.com/Overclock-Validator/mithril/pkg/blockprod/scheduler	5.253s
+ok  	github.com/Overclock-Validator/mithril/pkg/config	1.173s
+ok  	github.com/Overclock-Validator/mithril/cmd/mithril/node	1.888s
+ok  	github.com/Overclock-Validator/mithril/cmd/mithril/configcmd	1.177s
+FAIL
