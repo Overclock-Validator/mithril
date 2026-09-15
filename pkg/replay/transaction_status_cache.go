@@ -85,7 +85,7 @@ func (n *transactionStatusNode) copyInto(copy *transactionStatusNode, parent *tr
 
 type visibleTransactionStatusGroup struct {
 	keyIndex uint8
-	keys     map[transactionStatusKey]uint16
+	keys     transactionStatusIndex
 }
 
 // TransactionStatusCache is replay's authoritative, fork-aware
@@ -590,7 +590,7 @@ func (c *TransactionStatusCache) validateAncestorTransactionsLocked(slot uint64,
 			continue
 		}
 		key := sliceTransactionStatusKey(identity.MessageHash, group.keyIndex)
-		if group.keys[key] == 0 {
+		if group.keys.count(key) == 0 {
 			continue
 		}
 		if already == nil {
@@ -661,13 +661,16 @@ func (c *TransactionStatusCache) commitBlockWithValidation(block *b.Block, plan 
 	}
 
 	delta := transactionStatusDelta(nil)
+	var indexBatches map[solana.Hash]*transactionStatusIndexBatch
 	if prepared != nil && prepared.identities == plan.messageIdentities {
 		delta = prepared.delta
+		indexBatches = prepared.indexBatches
 		// A restore or branch transition can change a blockhash's slice offset.
 		// Rebuild from full identities if any current group uses another offset.
 		for blockhash, group := range delta {
 			if visible := c.visible[blockhash]; visible != nil && visible.keyIndex != group.keyIndex {
 				delta = nil
+				indexBatches = nil
 				break
 			}
 		}
@@ -683,7 +686,7 @@ func (c *TransactionStatusCache) commitBlockWithValidation(block *b.Block, plan 
 		delta = buildTransactionStatusDelta(plan.messageIdentities, counts, indexes)
 	}
 
-	if err := c.addDeltaVisibleLocked(delta); err != nil {
+	if err := c.addDeltaVisibleBatchesLocked(delta, indexBatches); err != nil {
 		return err
 	}
 	c.tip = &transactionStatusNode{
@@ -852,6 +855,10 @@ func (c *TransactionStatusCache) validateParentLocked(block *b.Block) error {
 }
 
 func (c *TransactionStatusCache) addDeltaVisibleLocked(delta transactionStatusDelta) error {
+	return c.addDeltaVisibleBatchesLocked(delta, nil)
+}
+
+func (c *TransactionStatusCache) addDeltaVisibleBatchesLocked(delta transactionStatusDelta, batches map[solana.Hash]*transactionStatusIndexBatch) error {
 	c.invalidateValidationLocked()
 	for blockhash, deltaGroup := range delta {
 		if group := c.visible[blockhash]; group != nil && group.keyIndex != deltaGroup.keyIndex {
@@ -864,12 +871,16 @@ func (c *TransactionStatusCache) addDeltaVisibleLocked(delta transactionStatusDe
 		if group == nil {
 			group = &visibleTransactionStatusGroup{
 				keyIndex: deltaGroup.keyIndex,
-				keys:     make(map[transactionStatusKey]uint16, len(deltaGroup.keys)),
 			}
+			group.keys.init(len(deltaGroup.keys))
 			c.visible[blockhash] = group
 		}
-		for key := range deltaGroup.keys {
-			group.keys[key]++
+		if batch := batches[blockhash]; batch != nil {
+			group.keys.addBatch(batch)
+		} else {
+			for key := range deltaGroup.keys {
+				group.keys.add(key)
+			}
 		}
 	}
 	return nil
@@ -883,13 +894,9 @@ func (c *TransactionStatusCache) removeDeltaVisibleLocked(delta transactionStatu
 			continue
 		}
 		for key := range deltaGroup.keys {
-			if group.keys[key] <= 1 {
-				delete(group.keys, key)
-			} else {
-				group.keys[key]--
-			}
+			group.keys.remove(key)
 		}
-		if len(group.keys) == 0 {
+		if group.keys.empty() {
 			delete(c.visible, blockhash)
 		}
 	}
@@ -989,14 +996,15 @@ func (c *TransactionStatusCache) expireVisibleLocked(expired, retained []*transa
 		if len(g.survivors) == 0 {
 			delete(c.visible, hash)
 		} else if g.retainedKeys < g.expiredKeys {
-			rebuilt := &visibleTransactionStatusGroup{keyIndex: g.survivors[0].keyIndex, keys: make(map[transactionStatusKey]uint16)}
+			rebuilt := &visibleTransactionStatusGroup{keyIndex: g.survivors[0].keyIndex}
+			rebuilt.keys.init(g.retainedKeys)
 			for _, delta := range g.survivors {
 				for key := range delta.keys {
-					rebuilt.keys[key]++
+					rebuilt.keys.add(key)
 				}
 			}
 			c.visible[hash] = rebuilt
-			if len(rebuilt.keys) == 0 {
+			if rebuilt.keys.empty() {
 				delete(c.visible, hash)
 			}
 		}
