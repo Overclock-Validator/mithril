@@ -34,3 +34,55 @@ Live voting/FAST results, exact deployment evidence and raw measurements are in 
 New deterministic race tests park real work at the verification gate and cover concurrent admission, in-flight accounting, duplicate admission, capacity wakeup, pruning, eviction, changed bindings and reward-flush waiting. Existing invalid-share cancellation, malformed signature, aggregate-certificate, equivocation, fallback and publication tests remain.
 
 Native race tests passed for Alpenglow, consensus, replay and node integration. Peer isolation tests separately passed three native runs; an intermittent timeout had reproduced on the unchanged local baseline earlier. Native vet and the application build passed. The four deployed source/test files match local hashes. Instruction probes and nearby stack/register operations were checked against old/new disassembly, normalizing linker relocations. A live sanity capture observed 133 replays and 133 notarize events with no reservation exhaustion or admission rejection.
+
+## Bounded multi-scalar aggregation
+
+Batches of at least 16 parsed votes now use gnark `MultiExp` for each weighted
+public-key/signature sum. G1 and G2 run sequentially with `NbTasks: 1`; the
+existing pool verification mutex still admits one expensive batch at a time.
+Smaller batches keep the scalar loop because bucket setup costs more than it
+saves, particularly during failed-batch subdivision and two-candidate checks.
+
+Each member still receives a fresh, independent, nonzero coefficient sampled
+from the full scalar field. Its public key and signature use the same
+coefficient. Entropy/aggregation errors retain the individual-verification
+fallback. Parsing, subgroup/infinity checks, failed-batch subdivision,
+publication and stake accounting are unchanged.
+
+### Local component measurements
+
+Apple M4 Pro, Go 1.26.4, one caller, GOMAXPROCS=12. Three samples per version;
+medians below compare the split branch before this change with bounded
+multi-scalar aggregation. `BenchmarkCertPoolFoldVerifiedBatch` includes parsing,
+pending-map setup, verification and tally folding; fixture signing is excluded.
+
+| Votes in fold | Scalar implementation | Bounded MultiExp |
+| --- | ---: | ---: |
+| 32 | 11.23 ms | 6.73 ms |
+| 64 | 21.26 ms | 10.61 ms |
+
+A same-binary comparison of the weighted-pairing helpers found 2-vote batches
+slower with MultiExp (1.49 → 2.04 ms) and 4-vote batches slower (2.01 → 2.44 ms).
+Those sizes therefore retain the scalar implementation in production. At 64
+votes, allocated bytes per full fold increased from approximately 225 KB to
+274 KB, although allocation count decreased from 1,204 to approximately 922.
+
+Run `go test ./pkg/alpenglow -run '^$' -bench '^BenchmarkCertPool(WeightedPairing|FoldVerifiedBatch)$' -benchmem -benchtime=500ms -count=3`.
+
+These are local component measurements; this aggregation change has not been
+deployed and does not yet have native Zen 5 or live FAST results. The earlier
+native/deployment measurements above describe the preceding implementation.
+The full local Alpenglow race suite and vet pass. Additional coverage checks
+invalid members at every position, wrong payloads, cancelling invalid shares
+in larger batches, and subdivision across the scalar/MultiExp boundary.
+
+The 16-vote cutoff was also measured directly: weighted pairing improved from
+5.28 ms to 3.80 ms. A separate local scheduling experiment alternated baseline,
+candidate, candidate, baseline with 64 valid votes every 200 ms alongside
+4,096 repeated transfer executions. With GOMAXPROCS=2, transfer execution was
+11.89–12.04 ms before and 11.80–11.83 ms after; certificate processing was
+24.75–26.15 ms before and 12.94–13.24 ms after. With GOMAXPROCS=1, transfer
+execution improved from 15.75–15.91 ms to 13.95–15.13 ms, but certificate wall
+time stayed around 30–32 ms. Scheduler waiting therefore still matters. This
+controlled experiment excludes account commits, network delivery and live
+vote persistence; it does not establish production latency or FAST scores.

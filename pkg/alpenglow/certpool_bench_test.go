@@ -44,7 +44,7 @@ func BenchmarkCertPoolFoldVerifiedBatch(b *testing.B) {
 	}
 }
 
-func certPoolBenchmarkFixture(b *testing.B, size int) (*CertificateVerifier, ValidatorSet, Vote, []VoteMessage) {
+func certPoolBenchmarkFixture(b testing.TB, size int) (*CertificateVerifier, ValidatorSet, Vote, []VoteMessage) {
 	stakes := make([]uint64, size)
 	for i := range stakes {
 		stakes[i] = 1
@@ -120,4 +120,41 @@ func BenchmarkCertPoolConcurrentVotes(b *testing.B) {
 	slices.Sort(waits)
 	b.ReportMetric(float64(waits[len(waits)*95/100]), "snapshot-p95-ns")
 	b.ReportMetric(float64(waits[len(waits)-1]), "snapshot-max-ns")
+}
+
+func BenchmarkCertPoolWeightedPairing(b *testing.B) {
+	for _, size := range []int{2, 4, 8, 16, 32, 64, 128} {
+		verifier, set, vote, batch := certPoolBenchmarkFixture(b, size)
+		payload, err := EncodeVotePayloadToSign(vote, verifier.ShredVersion())
+		if err != nil {
+			b.Fatal(err)
+		}
+		members := make([]parsedBatchVote, size)
+		for i, msg := range batch {
+			pub, err := validatorBLSPubkey(set, int(msg.Rank))
+			if err != nil {
+				b.Fatal(err)
+			}
+			members[i] = parsedBatchVote{message: msg, pubkey: pub}
+			if _, err := members[i].sig.SetBytes(msg.Signature); err != nil {
+				b.Fatal(err)
+			}
+		}
+		for _, impl := range []struct {
+			name   string
+			verify func([]parsedBatchVote, []byte) (bool, error)
+		}{
+			{"Scalar", randomizedAggregatePairingScalarOK},
+			{"MultiExp", randomizedAggregatePairingMultiExpOK},
+		} {
+			b.Run(fmt.Sprintf("votes=%d/%s", size, impl.name), func(b *testing.B) {
+				b.ReportAllocs()
+				for n := 0; n < b.N; n++ {
+					if ok, err := impl.verify(members, payload); err != nil || !ok {
+						b.Fatalf("verification: %t %v", ok, err)
+					}
+				}
+			})
+		}
+	}
 }
