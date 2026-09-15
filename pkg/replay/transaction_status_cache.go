@@ -105,6 +105,9 @@ type TransactionStatusCache struct {
 	// from a known-empty genesis cache. Without this bit, completeness requires
 	// the full 300 retained roots; a serialized boolean alone is not evidence.
 	coverageFromGenesis bool
+
+	// Protected by mu; see transactionStatusValidation. Never serialized.
+	validationVersion uint64
 }
 
 // TransactionStatusView is an immutable view of one bank lineage. It lazily
@@ -445,6 +448,7 @@ func (c *TransactionStatusCache) BindTipBlockID(slot uint64, blockID solana.Hash
 	if c.tip.hasBlockID && c.tip.blockID != blockID {
 		return fmt.Errorf("transaction status tip at slot %d has block id %s, cannot bind %s", slot, c.tip.blockID, blockID)
 	}
+	c.invalidateValidationLocked()
 	c.tip = &transactionStatusNode{
 		slot: slot, blockID: blockID, hasBlockID: true,
 		parent: c.tip.parent, delta: c.tip.delta,
@@ -548,25 +552,33 @@ func (c *TransactionStatusCache) ValidateBlock(block *b.Block) error {
 // validateBlockWithPlan preserves the status-cache checks while letting
 // replay reuse the exact immutable identities used for execution planning.
 func (c *TransactionStatusCache) validateBlockWithPlan(block *b.Block, plan blockTransactionExecutionPlan) error {
+	_, err := c.validateBlockForPublication(block, plan)
+	return err
+}
+
+func (c *TransactionStatusCache) validateBlockForPublication(block *b.Block, plan blockTransactionExecutionPlan) (transactionStatusValidation, error) {
 	if block == nil {
-		return errors.New("nil block")
+		return transactionStatusValidation{}, errors.New("nil block")
 	}
 	if plan.messageIdentities == nil || !plan.messageIdentities.MatchesBlock(block) {
-		return errors.New("prepared transaction message identities do not match block")
+		return transactionStatusValidation{}, errors.New("prepared transaction message identities do not match block")
 	}
 	if c == nil {
-		return &IncompleteTransactionStatusCoverageError{}
+		return transactionStatusValidation{}, &IncompleteTransactionStatusCoverageError{}
 	}
 
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if !c.coverageComplete {
-		return &IncompleteTransactionStatusCoverageError{CachedRoot: c.rootedThrough}
+		return transactionStatusValidation{}, &IncompleteTransactionStatusCoverageError{CachedRoot: c.rootedThrough}
 	}
 	if err := c.validateParentLocked(block); err != nil {
-		return err
+		return transactionStatusValidation{}, err
 	}
-	return c.validateAncestorTransactionsLocked(block.Slot, plan.messageIdentities)
+	if err := c.validateAncestorTransactionsLocked(block.Slot, plan.messageIdentities); err != nil {
+		return transactionStatusValidation{}, err
+	}
+	return transactionStatusValidation{cache: c, identities: plan.messageIdentities, version: c.validationVersion}, nil
 }
 
 func (c *TransactionStatusCache) validateAncestorTransactionsLocked(slot uint64, identities *b.PreparedTransactionMessageIdentities) error {
@@ -623,6 +635,10 @@ func (c *TransactionStatusCache) commitBlockWithPlan(block *b.Block, plan blockT
 }
 
 func (c *TransactionStatusCache) commitBlockWithPreparedDelta(block *b.Block, plan blockTransactionExecutionPlan, prepared *preparedTransactionStatusDelta) error {
+	return c.commitBlockWithValidation(block, plan, prepared, transactionStatusValidation{})
+}
+
+func (c *TransactionStatusCache) commitBlockWithValidation(block *b.Block, plan blockTransactionExecutionPlan, prepared *preparedTransactionStatusDelta, validation transactionStatusValidation) error {
 	if block == nil || plan.messageIdentities == nil || !plan.messageIdentities.MatchesBlock(block) {
 		return errors.New("prepared transaction message identities do not match block")
 	}
@@ -631,14 +647,17 @@ func (c *TransactionStatusCache) commitBlockWithPreparedDelta(block *b.Block, pl
 	if !c.coverageComplete {
 		return &IncompleteTransactionStatusCoverageError{CachedRoot: c.rootedThrough}
 	}
-	// Parent lineage and ancestor status are mutable, so both remain under the
-	// publication lock even when hashing and same-bank deduplication happened
-	// earlier. This keeps commit safe across a concurrent branch transition.
+	// Always check coverage, block binding and parent lineage. Reuse the earlier
+	// ancestor scan only under this lock and only for the same unchanged cache
+	// and immutable identities. A branch transition (including away and back)
+	// or root/prune invalidates it, requiring a fresh scan before publication.
 	if err := c.validateParentLocked(block); err != nil {
 		return err
 	}
-	if err := c.validateAncestorTransactionsLocked(block.Slot, plan.messageIdentities); err != nil {
-		return err
+	if !validation.reusableForLocked(c, plan.messageIdentities) {
+		if err := c.validateAncestorTransactionsLocked(block.Slot, plan.messageIdentities); err != nil {
+			return err
+		}
 	}
 
 	delta := transactionStatusDelta(nil)
@@ -704,6 +723,7 @@ func (c *TransactionStatusCache) Root(through uint64) bool {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.invalidateValidationLocked()
 	wasComplete := c.coverageComplete
 	newlyRooted := c.countNodesBetweenLocked(c.rootedThrough, through)
 	if through > c.rootedThrough {
@@ -832,6 +852,7 @@ func (c *TransactionStatusCache) validateParentLocked(block *b.Block) error {
 }
 
 func (c *TransactionStatusCache) addDeltaVisibleLocked(delta transactionStatusDelta) error {
+	c.invalidateValidationLocked()
 	for blockhash, deltaGroup := range delta {
 		if group := c.visible[blockhash]; group != nil && group.keyIndex != deltaGroup.keyIndex {
 			return fmt.Errorf("transaction status blockhash %s uses inconsistent key indexes %d and %d",
@@ -855,6 +876,7 @@ func (c *TransactionStatusCache) addDeltaVisibleLocked(delta transactionStatusDe
 }
 
 func (c *TransactionStatusCache) removeDeltaVisibleLocked(delta transactionStatusDelta) {
+	c.invalidateValidationLocked()
 	for blockhash, deltaGroup := range delta {
 		group := c.visible[blockhash]
 		if group == nil {
@@ -1079,6 +1101,7 @@ func marshalTransactionStatusNode(node *transactionStatusNode) []byte {
 }
 
 func (c *TransactionStatusCache) restore(data []byte) error {
+	c.invalidateValidationLocked()
 	reader := bytes.NewReader(data)
 	var magic [4]byte
 	if _, err := io.ReadFull(reader, magic[:]); err != nil {

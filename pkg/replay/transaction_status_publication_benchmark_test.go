@@ -90,6 +90,8 @@ func (c *TransactionStatusCache) legacyAddStatusForBenchmark(delta transactionSt
 // prepared message identities. No execution, disk I/O, signing or networking.
 // prepared_commit excludes delta preparation; prepared_total includes it and
 // goroutine dispatch/join, with no execution overlap. Neither measures replay.
+// validated_commit also excludes the successful pre-execution ancestor scan.
+// invalidated_commit roots between validation and commit, forcing a full recheck.
 // Each iteration restores the same ancestor contents; existing maps retain
 // steady-state capacity. Fixture creation, seeding and unwind are not timed.
 func BenchmarkTransactionStatusPublication(tb *testing.B) {
@@ -110,7 +112,7 @@ func BenchmarkTransactionStatusPublication(tb *testing.B) {
 				if err != nil {
 					tb.Fatal(err)
 				}
-				for _, name := range []string{"legacy", "sized", "prepared_total", "prepared_commit"} {
+				for _, name := range []string{"legacy", "sized", "prepared_total", "prepared_commit", "validated_commit", "invalidated_commit"} {
 					tb.Run(name, func(tb *testing.B) {
 						cache := NewTransactionStatusCache()
 						if err := cache.CommitBlock(parent); err != nil {
@@ -120,11 +122,22 @@ func BenchmarkTransactionStatusPublication(tb *testing.B) {
 						tb.ResetTimer()
 						for range tb.N {
 							var err error
-							if name == "prepared_commit" {
+							if name == "prepared_commit" || name == "validated_commit" || name == "invalidated_commit" {
 								tb.StopTimer()
 								prepared := cache.prepareTransactionStatusDelta(plan.messageIdentities)
+								validation, validationErr := cache.validateBlockForPublication(blk, plan)
+								if validationErr != nil {
+									tb.Fatal(validationErr)
+								}
+								if name == "invalidated_commit" {
+									cache.Root(10)
+								}
 								tb.StartTimer()
-								err = cache.commitBlockWithPreparedDelta(blk, plan, prepared)
+								if name == "prepared_commit" {
+									err = cache.commitBlockWithPreparedDelta(blk, plan, prepared)
+								} else {
+									err = cache.commitBlockWithValidation(blk, plan, prepared, validation)
+								}
 							} else if name == "prepared_total" {
 								prepared := cache.startStatusPreparation(plan).wait()
 								err = cache.commitBlockWithPreparedDelta(blk, plan, prepared)

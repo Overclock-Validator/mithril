@@ -4154,7 +4154,7 @@ func ProcessBlock(
 		return nil, fmt.Errorf("validate transaction messages for slot %d: %w", block.Slot, err)
 	}
 	statusValidationStart := time.Now()
-	statusValidationErr := transactionStatuses.validateBlockWithPlan(block, executionPlan)
+	statusValidation, statusValidationErr := transactionStatuses.validateBlockForPublication(block, executionPlan)
 	metrics.GlobalBlockReplay.TransactionStatusValidation.AddTimingSince(statusValidationStart)
 	if statusValidationErr != nil {
 		return nil, fmt.Errorf("validate transaction statuses for slot %d: %w", block.Slot, statusValidationErr)
@@ -4430,7 +4430,7 @@ func ProcessBlock(
 	statusWaitStart := time.Now()
 	preparedStatuses := statusPreparation.wait()
 	metrics.GlobalBlockReplay.TransactionStatusPreparationWait.AddTimingSince(statusWaitStart)
-	statusErr := transactionStatuses.commitBlockWithPreparedDelta(block, executionPlan, preparedStatuses)
+	statusErr := transactionStatuses.commitBlockWithValidation(block, executionPlan, preparedStatuses, statusValidation)
 	metrics.GlobalBlockReplay.TransactionStatusCommit.AddTimingSince(statusCommitStart)
 	if statusErr != nil {
 		return nil, fmt.Errorf("commit transaction statuses for slot %d after bank state commit: %w", block.Slot, statusErr)
