@@ -70,6 +70,10 @@ func (s *votorPeerSender) enqueue(job votorDatagram) {
 func (s *votorPeerSender) run() {
 	defer s.b.wg.Done()
 	defer close(s.done)
+	// Cover both remote-close select and close detected after dequeuing a job.
+	// The queue is bounded/deduplicated; shutdown, departure and a healthy
+	// replacement connection suppress obsolete reconnect requests.
+	defer s.b.queueConnect(s.peer.Identity)
 	defer func() {
 		s.mu.Lock()
 		s.closed = true
@@ -106,6 +110,15 @@ func (s *votorPeerSender) run() {
 				if s.b.peerQueueMaxDelay.CompareAndSwap(old, int64(s.lastQueueDelay)) {
 					break
 				}
+			}
+			if s.lastQueueDelay >= votorSendTimeout {
+				// Do not feed an already-stale backlog into a briefly writable
+				// QUIC queue between watchdog ticks. Retire this connection.
+				s.closed = true
+				s.mu.Unlock()
+				s.b.peerQueueDiscarded.Add(1)
+				s.timeout()
+				return
 			}
 			s.mu.Unlock()
 			err := s.conn.SendDatagram(job.payload)
@@ -145,7 +158,7 @@ func (b *VotorBroadcaster) expirePeerSends(now time.Time) {
 	senders, _ := b.connectedSenders()
 	for _, s := range senders {
 		s.mu.Lock()
-		expired := !s.closed && !s.sendingSince.IsZero() && now.Sub(s.sendingSince) >= votorSendTimeout
+		expired := !s.closed && !s.sendingSince.IsZero() && s.lastQueueDelay+now.Sub(s.sendingSince) >= votorSendTimeout
 		if expired {
 			// Serialize with send completion so a late watchdog cannot close a
 			// later, unrelated send after the blocked operation has finished.
@@ -153,10 +166,16 @@ func (b *VotorBroadcaster) expirePeerSends(now time.Time) {
 		}
 		s.mu.Unlock()
 		if expired {
-			b.peerSendTimeouts.Add(1)
-			// Closing wakes SendDatagram without leaking a timeout goroutine.
-			b.dropConnection(s.peer.Identity, s.conn)
-			b.queueConnect(s.peer.Identity)
+			s.timeout()
 		}
 	}
+}
+
+// Caller must first claim the timeout by setting closed under s.mu. This makes
+// the dequeue check and watchdog mutually exclusive and counts one timeout.
+func (s *votorPeerSender) timeout() {
+	s.b.peerSendTimeouts.Add(1)
+	// Closing wakes SendDatagram without leaking a timeout goroutine.
+	s.b.dropConnection(s.peer.Identity, s.conn)
+	s.b.queueConnect(s.peer.Identity)
 }
