@@ -1,0 +1,9 @@
+Running as unit: mithril-review-config-final-20260915.service
+ok  	github.com/Overclock-Validator/mithril/pkg/config	1.006s
+ok  	github.com/Overclock-Validator/mithril/cmd/mithril/configcmd	1.007s
+ok  	github.com/Overclock-Validator/mithril/cmd/mithril/node	1.140s
+          Finished with result: success
+Main processes terminated with: code=exited, status=0/SUCCESS
+               Service runtime: 3.313s
+             CPU time consumed: 1.955s
+                   Memory peak: 375.3M (swap: 0B)

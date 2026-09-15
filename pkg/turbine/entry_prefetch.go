@@ -3,11 +3,11 @@ package turbine
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/block"
+	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/txverify"
 	"github.com/gagliardetto/solana-go"
 )
@@ -268,6 +268,12 @@ func verifyDecodedEntryBatches(ctx context.Context, blk *block.Block, batches []
 }
 
 func verifyDecodedEntryBatchesWithTimings(ctx context.Context, blk *block.Block, batches []*prefetchedShredBatch, verifier *transactionVerifier, timings *entryDecodeTimings) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if blk == nil {
+		return errors.New("verify decoded entries: nil block")
+	}
 	type pending struct {
 		future *transactionVerification
 		offset int
@@ -278,9 +284,15 @@ func verifyDecodedEntryBatchesWithTimings(ctx context.Context, blk *block.Block,
 	var indices []int
 	offset := 0
 	for _, b := range batches {
+		if b == nil {
+			return recoverEntryVerification(ctx, blk, batches, verifier, errors.New("nil retained entry batch"))
+		}
 		count := 0
 		for _, e := range b.entries {
 			count += len(e.Txns)
+		}
+		if count > len(blk.Transactions)-offset {
+			return recoverEntryVerification(ctx, blk, batches, verifier, errors.New("entry transaction range exceeds final block"))
 		}
 		reusable := b.verification != nil
 		if reusable {
@@ -301,6 +313,9 @@ func verifyDecodedEntryBatchesWithTimings(ctx context.Context, blk *block.Block,
 			}
 		}
 		offset += count
+	}
+	if offset != len(blk.Transactions) {
+		return recoverEntryVerification(ctx, blk, batches, verifier, errors.New("entry identity coverage mismatch"))
 	}
 	var fallback *transactionVerification
 	var err error
@@ -344,25 +359,43 @@ func verifyDecodedEntryBatchesWithTimings(ctx context.Context, blk *block.Block,
 	if verifier.verify != nil {
 		return nil
 	}
-	if offset != len(blk.Transactions) {
-		return fmt.Errorf("entry identity coverage mismatch")
-	}
 	identities := make([]txverify.VerifiedMessageIdentity, len(blk.Transactions))
 	for _, p := range early {
 		if len(p.future.identities) != p.count || p.offset+len(p.future.identities) > len(identities) {
-			return fmt.Errorf("entry identity range mismatch")
+			return recoverEntryVerification(ctx, blk, batches, verifier, errors.New("entry identity range mismatch"))
 		}
 		copy(identities[p.offset:], p.future.identities)
 	}
 	if fallback != nil {
 		if len(fallback.identities) != len(indices) {
-			return fmt.Errorf("fallback identity coverage mismatch")
+			return recoverEntryVerification(ctx, blk, batches, verifier, errors.New("fallback identity coverage mismatch"))
 		}
 		for i, index := range indices {
 			identities[index] = fallback.identities[i]
 		}
 	}
-	return blk.CacheVerifiedTransactionMessageIdentities(identities)
+	if err := blk.CacheVerifiedTransactionMessageIdentities(identities); err != nil {
+		return recoverEntryVerification(ctx, blk, batches, verifier, err)
+	}
+	return nil
+}
+
+// Prefetch metadata is an optimization, never a substitute for verifying the
+// final block. Join old readers, then verify every final transaction afresh.
+// This also repairs pointer/coverage mismatches without treating a successful
+// verdict for another transaction as proof for this one. Normal signature
+// failures above are still rejected directly. Failed recovery stays an error.
+func recoverEntryVerification(ctx context.Context, blk *block.Block, batches []*prefetchedShredBatch, verifier *transactionVerifier, reason error) error {
+	for _, batch := range batches {
+		if batch != nil && batch.verification != nil {
+			_, _ = batch.verification.waitContext(ctx)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	mlog.Log.Warnf("slot %d: discarded inconsistent entry verification metadata; re-verifying final transactions: %v", blk.Slot, reason)
+	return verifier.verifyBlockContext(ctx, blk)
 }
 
 func earlyEntryTimings(t *entryDecodeTimings, fullAt time.Time, timings *block.TurbineIngressTimings) {

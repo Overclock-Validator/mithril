@@ -1,0 +1,37 @@
+--- FAIL: TestEntryIdentityRecoveryVerifiesFinalTransactions (0.00s)
+    --- FAIL: TestEntryIdentityRecoveryVerifiesFinalTransactions/partial_identities/valid (0.00s)
+        entry_identity_recovery_test.go:57: 
+            	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-split-20260915/streaming-preparation/pkg/turbine/entry_identity_recovery_test.go:57
+            	Error:      	Received unexpected error:
+            	            	entry identity range mismatch
+            	Test:       	TestEntryIdentityRecoveryVerifiesFinalTransactions/partial_identities/valid
+    --- FAIL: TestEntryIdentityRecoveryVerifiesFinalTransactions/partial_identities/invalid (0.00s)
+        entry_identity_recovery_test.go:54: 
+            	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-split-20260915/streaming-preparation/pkg/turbine/entry_identity_recovery_test.go:54
+            	Error:      	Error "entry identity range mismatch" does not contain "failed signature verification"
+            	Test:       	TestEntryIdentityRecoveryVerifiesFinalTransactions/partial_identities/invalid
+    --- FAIL: TestEntryIdentityRecoveryVerifiesFinalTransactions/wrong_pointer/valid (0.00s)
+        entry_identity_recovery_test.go:57: 
+            	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-split-20260915/streaming-preparation/pkg/turbine/entry_identity_recovery_test.go:57
+            	Error:      	Received unexpected error:
+            	            	verified message identity does not match transaction 0
+            	Test:       	TestEntryIdentityRecoveryVerifiesFinalTransactions/wrong_pointer/valid
+    --- FAIL: TestEntryIdentityRecoveryVerifiesFinalTransactions/wrong_pointer/invalid (0.00s)
+        entry_identity_recovery_test.go:54: 
+            	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-split-20260915/streaming-preparation/pkg/turbine/entry_identity_recovery_test.go:54
+            	Error:      	Error "verified message identity does not match transaction 0" does not contain "failed signature verification"
+            	Test:       	TestEntryIdentityRecoveryVerifiesFinalTransactions/wrong_pointer/invalid
+    --- FAIL: TestEntryIdentityRecoveryVerifiesFinalTransactions/missing_range/valid (0.00s)
+        entry_identity_recovery_test.go:57: 
+            	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-split-20260915/streaming-preparation/pkg/turbine/entry_identity_recovery_test.go:57
+            	Error:      	Received unexpected error:
+            	            	entry identity coverage mismatch
+            	Test:       	TestEntryIdentityRecoveryVerifiesFinalTransactions/missing_range/valid
+    --- FAIL: TestEntryIdentityRecoveryVerifiesFinalTransactions/missing_range/invalid (0.00s)
+        entry_identity_recovery_test.go:54: 
+            	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-split-20260915/streaming-preparation/pkg/turbine/entry_identity_recovery_test.go:54
+            	Error:      	Error "entry identity coverage mismatch" does not contain "failed signature verification"
+            	Test:       	TestEntryIdentityRecoveryVerifiesFinalTransactions/missing_range/invalid
+FAIL
+FAIL	github.com/Overclock-Validator/mithril/pkg/turbine	0.319s
+FAIL

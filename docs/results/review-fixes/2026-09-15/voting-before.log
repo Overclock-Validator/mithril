@@ -1,0 +1,18 @@
+--- FAIL: TestVotorPeerReconnectOnRemoteCloseWithoutReconcile (0.01s)
+    --- FAIL: TestVotorPeerReconnectOnRemoteCloseWithoutReconcile/idle (0.00s)
+        peer_sender_recovery_test.go:81: sender exited without requesting reconnect
+    --- FAIL: TestVotorPeerReconnectOnRemoteCloseWithoutReconcile/dequeue (0.00s)
+        peer_sender_recovery_test.go:81: sender exited without requesting reconnect
+--- FAIL: TestVotorPeerDeadlineIncludesQueueAge (0.00s)
+    --- FAIL: TestVotorPeerDeadlineIncludesQueueAge/progress_does_not_reset_age (0.00s)
+        peer_sender_recovery_test.go:111: 
+            	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-split-20260915/vote-delivery-persistence/pkg/alpenglow/peer_sender_recovery_test.go:111
+            	Error:      	Not equal: 
+            	            	expected: true
+            	            	actual  : false
+            	Test:       	TestVotorPeerDeadlineIncludesQueueAge/progress_does_not_reset_age
+--- FAIL: TestVotorPeerRejectsAgedQueueBeforeQUICEnqueue (1.00s)
+    peer_sender_recovery_test.go:129: aged queue did not retire its connection
+FAIL
+FAIL	github.com/Overclock-Validator/mithril/pkg/alpenglow	1.194s
+FAIL

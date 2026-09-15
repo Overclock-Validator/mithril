@@ -1,0 +1,242 @@
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/reconnect
+(+    0s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    0s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 391.583µs while other peer's SendDatagram is blocked
+    peer_sender_test.go:216: Blackholed peer retired after 1.092794036s
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/close
+(+    1s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    1s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 323.005µs while other peer's SendDatagram is blocked
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/depart
+(+    1s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    1s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 549.921µs while other peer's SendDatagram is blocked
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/move
+(+    1s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    1s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 3.679084ms while other peer's SendDatagram is blocked
+(+    1s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+--- PASS: TestVotorBroadcasterIsolatesBlockedPeer (1.37s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/reconnect (1.32s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/close (0.01s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/depart (0.01s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/move (0.02s)
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/reconnect
+(+    1s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    1s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 124.033µs while other peer's SendDatagram is blocked
+    peer_sender_test.go:216: Blackholed peer retired after 1.096725481s
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/close
+(+    2s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    2s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 3.817733ms while other peer's SendDatagram is blocked
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/depart
+(+    2s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    2s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 190.036µs while other peer's SendDatagram is blocked
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/move
+(+    2s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    2s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 88.305µs while other peer's SendDatagram is blocked
+(+    2s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+--- PASS: TestVotorBroadcasterIsolatesBlockedPeer (1.16s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/reconnect (1.11s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/close (0.01s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/depart (0.01s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/move (0.02s)
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/reconnect
+(+    2s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    2s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 4.433337ms while other peer's SendDatagram is blocked
+    peer_sender_test.go:216: Blackholed peer retired after 1.097000497s
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/close
+(+    3s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    3s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 69.74µs while other peer's SendDatagram is blocked
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/depart
+(+    3s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    3s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 4.71775ms while other peer's SendDatagram is blocked
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/move
+(+    3s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    3s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 150.843µs while other peer's SendDatagram is blocked
+(+    3s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+--- PASS: TestVotorBroadcasterIsolatesBlockedPeer (1.36s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/reconnect (1.31s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/close (0.01s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/depart (0.01s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/move (0.02s)
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/reconnect
+(+    3s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    3s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 219.862µs while other peer's SendDatagram is blocked
+    peer_sender_test.go:216: Blackholed peer retired after 1.097559214s
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/close
+(+    5s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    5s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 152.987µs while other peer's SendDatagram is blocked
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/depart
+(+    5s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    5s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 8.361257ms while other peer's SendDatagram is blocked
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/move
+(+    5s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    5s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 146.214µs while other peer's SendDatagram is blocked
+(+    5s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+--- PASS: TestVotorBroadcasterIsolatesBlockedPeer (1.39s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/reconnect (1.32s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/close (0.03s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/depart (0.02s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/move (0.03s)
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/reconnect
+(+    5s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    5s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 4.565925ms while other peer's SendDatagram is blocked
+    peer_sender_test.go:216: Blackholed peer retired after 1.037632347s
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/close
+(+    6s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    6s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 125.615µs while other peer's SendDatagram is blocked
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/depart
+(+    6s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    6s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 118.261µs while other peer's SendDatagram is blocked
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/move
+(+    6s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    6s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 209.753µs while other peer's SendDatagram is blocked
+(+    6s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+--- PASS: TestVotorBroadcasterIsolatesBlockedPeer (1.31s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/reconnect (1.26s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/close (0.01s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/depart (0.01s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/move (0.02s)
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/reconnect
+(+    6s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    6s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 95.769µs while other peer's SendDatagram is blocked
+    peer_sender_test.go:216: Blackholed peer retired after 1.097403342s
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/close
+(+    7s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    7s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 81.482µs while other peer's SendDatagram is blocked
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/depart
+(+    7s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    7s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 85.37µs while other peer's SendDatagram is blocked
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/move
+(+    7s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    7s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 113.492µs while other peer's SendDatagram is blocked
+(+    7s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+--- PASS: TestVotorBroadcasterIsolatesBlockedPeer (1.36s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/reconnect (1.32s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/close (0.01s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/depart (0.01s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/move (0.02s)
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/reconnect
+(+    7s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    7s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 169.097µs while other peer's SendDatagram is blocked
+    peer_sender_test.go:216: Blackholed peer retired after 1.098292458s
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/close
+(+    9s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    9s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 4.337057ms while other peer's SendDatagram is blocked
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/depart
+(+    9s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    9s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 153.357µs while other peer's SendDatagram is blocked
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/move
+(+    9s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    9s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 4.582918ms while other peer's SendDatagram is blocked
+(+    9s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+--- PASS: TestVotorBroadcasterIsolatesBlockedPeer (1.36s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/reconnect (1.32s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/close (0.01s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/depart (0.01s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/move (0.02s)
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/reconnect
+(+    9s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+    9s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 160.09µs while other peer's SendDatagram is blocked
+    peer_sender_test.go:216: Blackholed peer retired after 1.097958692s
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/close
+(+   10s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+   10s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 89.748µs while other peer's SendDatagram is blocked
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/depart
+(+   10s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+   10s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 278.562µs while other peer's SendDatagram is blocked
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/move
+(+   10s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+   10s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 4.742486ms while other peer's SendDatagram is blocked
+(+   10s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+--- PASS: TestVotorBroadcasterIsolatesBlockedPeer (1.36s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/reconnect (1.32s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/close (0.01s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/depart (0.01s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/move (0.02s)
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/reconnect
+(+   10s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+   10s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 109.656µs while other peer's SendDatagram is blocked
+    peer_sender_test.go:216: Blackholed peer retired after 1.098472025s
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/close
+(+   11s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+   11s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 647.754µs while other peer's SendDatagram is blocked
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/depart
+(+   12s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+   12s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 4.269089ms while other peer's SendDatagram is blocked
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/move
+(+   12s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+   12s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 3.536917ms while other peer's SendDatagram is blocked
+(+   12s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+--- PASS: TestVotorBroadcasterIsolatesBlockedPeer (1.36s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/reconnect (1.32s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/close (0.01s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/depart (0.01s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/move (0.02s)
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/reconnect
+(+   12s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+   12s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 111.178µs while other peer's SendDatagram is blocked
+    peer_sender_test.go:216: Blackholed peer retired after 1.098050635s
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/close
+(+   13s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+   13s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 82.054µs while other peer's SendDatagram is blocked
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/depart
+(+   13s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+   13s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 1.004662ms while other peer's SendDatagram is blocked
+=== RUN   TestVotorBroadcasterIsolatesBlockedPeer/move
+(+   13s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+(+   13s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+    peer_sender_test.go:135: Healthy marker received in 103.303µs while other peer's SendDatagram is blocked
+(+   13s) ALPENGLOW Votor receiver decoded first message (votes=1 certificates=0 latest_vote_slot=999999 latest_certificate_slot=0)
+--- PASS: TestVotorBroadcasterIsolatesBlockedPeer (1.36s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/reconnect (1.32s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/close (0.01s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/depart (0.02s)
+    --- PASS: TestVotorBroadcasterIsolatesBlockedPeer/move (0.02s)
+PASS
+ok  	github.com/Overclock-Validator/mithril/pkg/alpenglow	14.403s
