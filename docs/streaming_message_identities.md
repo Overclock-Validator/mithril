@@ -92,3 +92,29 @@ are observational; the baseline and candidate windows span an epoch change.
 Several remaining misses coincide with unusually slow replay during local
 load sends, while others have late signature completions or shred collection.
 No claim of eliminating FAST misses or proving a score improvement is made.
+
+
+## Recovery from inconsistent prefetch metadata
+
+Missing/oversized retained ranges, partial identities and identity-binding
+mismatches now log a warning and fall back to full signature verification of the
+final block. Bounds are checked before slicing the final transaction array. Old
+readers are joined first, including on cancellation. Valid final transactions
+can therefore recover from an optimization bookkeeping fault; a successful
+cached verdict for different bytes cannot authorize the final transaction.
+Normal cached signature failures remain errors, as do failed re-verification,
+cancellation and a closed verifier. No signatures or duplicate checks are skipped.
+
+Regression tests cover valid and invalid final blocks for each metadata fault,
+cache identities matching the final transaction order, canceled-reader ownership
+and verifier failure. The ordinary path retains exact-range/byte checks and
+verified identity reuse. Full re-verification is exceptional and costs additional
+work; this change is a correctness/availability fix, not a throughput claim.
+
+The `[sigverify]` starter configuration and its test moved here from the voting
+branch, because this branch reads those keys and supports the legacy backend key.
+The unrelated explicit `tuning.use_pool` template setting is omitted: enabling
+pooling by default and fixing retained vote ownership belong to the runtime
+branch. In the combined build, its configuration defaults still enable pooling.
+The default remains two Turbine verification workers (bounded by GOMAXPROCS).
+Many-core catch-up tuning remains a separate measurement question.
