@@ -14,7 +14,7 @@ AMD Ryzen 7 9700X (Zen 5), Go 1.26.4, GOMAXPROCS=2. Tests ran in a separate proc
 
 Each block has 33,760 unique prepared message identities spread across one or four recent blockhashes. Existing-group cases seed 33,760 different ancestor transactions. Fixture creation, hashing, seeding and unwind are untimed. Existing maps retain capacity after unwind: the first timed commit's growth is amortized across the ten iterations. This does not model an index growing indefinitely across live blocks.
 
-The frozen baseline functions exactly match alpenglow-dev commit `33dde4050d9250557583395810799aaac2f54017`. Both versions use the same prepared identities, parent/duplicate checks and fixtures.
+These historical measurements used the benchmark at `23e18d81`, whose baseline functions matched alpenglow-dev commit `33dde4050d9250557583395810799aaac2f54017`. Both versions used the same prepared identities, parent/duplicate checks and fixtures. The current `legacy` helper uses the current visible-index representation; reproduce this historical comparison at that commit, not by treating today’s helper as a frozen index baseline.
 
 | Recent blockhash groups | Parent has keys in these groups | Baseline commit | Sized maps, inline | Preparation + commit, no overlap | Commit after preparation |
 |---|---|---:|---:|---:|---:|
@@ -71,3 +71,71 @@ Zen 5 incremental measurement (Ryzen 9700X, Go 1.26.4, GOMAXPROCS=2, five sample
 Values are medians of sample means. Existing-group cases remove approximately 1.1 ms of repeated lookup work; new-group cases show no clear gain and shared-host variation. Full native replay/block race suites, targeted node recovery race tests, vet and the combined build passed. Local replay race tests and vet also passed.
 
 A separate 180-second pre-change live trace observed 728 publications. In the 145 publications taking at least 1 ms, the repeated scan measured 1.805 ms median / 3.180 ms maximum; insertion 2.198 / 6.774 ms. Lock acquisition was at most 0.0058 ms across all publications, and the preparation join at most 0.0010 ms. This latency-selected cohort is not a fixed transaction-size sample or a before/after p99 comparison. Probe overhead is included. These measurements identify removable work; they do not establish a sustained FAST improvement. Raw traces, native test windows and exact combined source stay on the validator host at `/srv/mithril-status-validation-20260915`.
+
+## Partitioned visible status index
+
+Large blockhash groups use 64 smaller reference-count maps, selected by the low
+six bits of the stored message key's first byte. During delta preparation, unique
+keys are grouped by partition in private scratch space; publication then updates
+one partition at a time. Groups starting below 1,024 keys retain one map for their
+lifetime, avoiding a full-index copy when they grow. All visible-index reads and
+writes retain the existing cache lock. No extra publication worker is introduced.
+
+The immutable per-bank deltas and MTS2 checkpoint bytes are unchanged. Restore
+reconstructs this derived index from those deltas; unwind removes the same bank
+references. Preparation does not authorize a block, persist a vote, or extend a
+checkpoint's durable coverage. Commit still checks identity binding, complete
+coverage, parent lineage and the ancestor-validation receipt. Changed key-slice
+offsets discard both the prepared delta and its partition batches. These are the
+same duplicate-prevention and crash-recovery guarantees as before this change.
+
+Incremental Zen 5 comparison against the previously deployed combined validator
+(binary SHA256 `2c3628ad62a313a9dcf13878cafcb6fbd8f5fa12cd8637038de762758489c651`),
+not the full PR against alpenglow-dev: Go 1.26.4, GOMAXPROCS=2, Nice=19,
+200% CPU quota on the active validator host, three samples of 30 iterations.
+Each block contains 33,760 unique identities. Values are medians of sample means.
+
+| Blockhash groups | Existing groups | Validated commit before → after | Preparation + commit, without overlap |
+|---|---|---|---|
+| 1 | No | 1.492 → 0.852 ms | 3.422 → 3.479 ms |
+| 1 | Yes | 1.425 → 1.126 ms | 4.676 → 4.977 ms |
+| 4 | No | 1.151 → 0.869 ms | 3.072 → 4.306 ms |
+| 4 | Yes | 1.281 → 0.984 ms | 4.346 → 5.812 ms |
+
+Publication improves in these samples, but total preparation work increases,
+especially with multiple blockhashes. Scratch costs roughly 20 bytes per unique
+key plus partition metadata and is not retained in published bank nodes. The
+benefit depends on execution hiding preparation without excessive contention.
+
+`BenchmarkStatusMapCriticalTail` measures individual validated commits with
+preparation and unwind excluded. Run the identical benchmark file on both source
+revisions: three samples of 150 iterations, one blockhash, nearest-rank p99. The
+median of each run's p99 fell from 3.142 to 1.488 ms for new groups, but rose from
+2.549 to 2.869 ms for warmed existing groups. This is not a consistent component
+p99 win, and neither benchmark predicts live FAST inclusion.
+
+Native targeted replay/block-production race tests, vet and the validator build
+passed. Coverage includes a randomized reference-count oracle with concentrated
+keys, compact-group growth, expiry, snapshot restore, fork unwind, stale identity
+binding and concurrent publication. Source copies, native results, exclusions for
+test load and deployment metadata are retained on Zen 5 under
+`/srv/mithril-status-index-20260915`.
+
+
+Initial live trial: 958 baseline versus 182 candidate received blocks with at
+least 30,000 transactions, excluding startup/native-test windows. Publication
+median/p99 measured **3.607/6.901 → 2.875/6.343 ms**. All 182 candidates had
+controls matched by leader, position, sender overlap and transaction/CU within
+10%; the median per-block difference was **−0.737 ms publication**, **+1.100 ms
+preparation**, **+0.498 ms execution**, and **−0.298 ms full assembly-to-local
+serialization**. Preparation-wait p99 remained 0.001 ms. Controls are reused and
+windows are unequal, so this is observational evidence, not isolated causation.
+
+Overall large-block p99 was **119.050 → 123.871 ms**; an overall tail improvement
+is not established. Five candidate admission outliers (four empty blocks) spent
+31.823 ms median / 39.907 ms maximum between spool-completion entry and beginning
+delivery, before status publication. Their deeper cause is not yet established
+on this binary. Two initial five-minute captures contained 1,911 inclusions in
+1,933 unique observed FAST proofs (98.86%); startup is included in this operational
+score, and it is not a before/after FAST comparison. Keep the candidate under
+monitoring; the status-stage gain alone does not establish the final p99 goal.
