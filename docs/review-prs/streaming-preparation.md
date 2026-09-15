@@ -19,4 +19,8 @@ Start with `docs/transaction_sigverify_streaming.md`, `docs/out-of-order-entry-p
 
 Fresh standalone race suites passed for Turbine, block, txverify, txstatus, sigverify and replay; vet and the full validator build passed. Includes both the new gap regressions and #279's reset-accounting correction. Fresh logs: `docs/results/pr-split-2026-09-15/streaming`.
 
-Split from #279; base development commit: `33dde4050d9250557583395810799aaac2f54017`. Historical native measurements retain their original tested source; these reorganized heads have fresh local validation.
+### Cache recovery and configuration ownership
+
+Move the signature-verification template and test here, alongside the code that reads those settings. Do not enable unrelated VM pooling in the standalone template; the runtime branch supplies that default with its ownership fix.
+
+On inconsistent cached identity/range metadata, join old readers and re-verify every final transaction. Valid blocks recover; invalid signatures, cancellation and verifier failure remain errors. Bounds are checked before slicing. Normal signature failures still reject the block, and the default worker count is unchanged. Local standalone and native combined race suites, vet and builds passed. Regression failures before the fix and passing evidence: `docs/results/review-fixes/2026-09-15`. Not deployed.
