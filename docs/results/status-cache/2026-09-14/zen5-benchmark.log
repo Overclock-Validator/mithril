@@ -1,0 +1,24 @@
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 7 9700X 8-Core Processor             
+BenchmarkTransactionStatusBatchExpiry/four-bank-groups/legacy=true-2         	       1	 308302685 ns/op
+BenchmarkTransactionStatusBatchExpiry/four-bank-groups/legacy=true-2         	       1	 311104834 ns/op
+BenchmarkTransactionStatusBatchExpiry/four-bank-groups/legacy=true-2         	       1	 306059722 ns/op
+BenchmarkTransactionStatusBatchExpiry/four-bank-groups/legacy=false-2        	       1	     56685 ns/op
+BenchmarkTransactionStatusBatchExpiry/four-bank-groups/legacy=false-2        	       1	     49743 ns/op
+BenchmarkTransactionStatusBatchExpiry/four-bank-groups/legacy=false-2        	       1	     48581 ns/op
+BenchmarkTransactionStatusBatchExpiry/one-expired-group/legacy=true-2        	       1	 700015562 ns/op
+BenchmarkTransactionStatusBatchExpiry/one-expired-group/legacy=true-2        	       1	 718445604 ns/op
+BenchmarkTransactionStatusBatchExpiry/one-expired-group/legacy=true-2        	       1	 716785553 ns/op
+BenchmarkTransactionStatusBatchExpiry/one-expired-group/legacy=false-2       	       1	     30758 ns/op
+BenchmarkTransactionStatusBatchExpiry/one-expired-group/legacy=false-2       	       1	     26119 ns/op
+BenchmarkTransactionStatusBatchExpiry/one-expired-group/legacy=false-2       	       1	     24436 ns/op
+BenchmarkTransactionStatusBatchExpiry/crossing-group/legacy=true-2           	       1	 734956959 ns/op
+BenchmarkTransactionStatusBatchExpiry/crossing-group/legacy=true-2           	       1	 722327226 ns/op
+BenchmarkTransactionStatusBatchExpiry/crossing-group/legacy=true-2           	       1	 717188987 ns/op
+BenchmarkTransactionStatusBatchExpiry/crossing-group/legacy=false-2          	       1	   2045462 ns/op
+BenchmarkTransactionStatusBatchExpiry/crossing-group/legacy=false-2          	       1	   1845859 ns/op
+BenchmarkTransactionStatusBatchExpiry/crossing-group/legacy=false-2          	       1	   1983167 ns/op
+PASS
+ok  	github.com/Overclock-Validator/mithril/pkg/replay	22.725s
