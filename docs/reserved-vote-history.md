@@ -95,3 +95,23 @@ These are software tests, not a host power-loss qualification or
 formal proof of the full consensus protocol. `BenchmarkVoteHistoryPersistence`
 compares the actual serialization/write paths with 32 recorded notarizations;
 it does not measure block replay or full validator FAST participation.
+
+## Startup configuration and default-mode changes
+
+`--reserved-vote-history` and `--initialize-vote-reservation` are explicit CLI
+flags; they are not TOML keys. Keep the mode flag in the service command line.
+The initialization flag is one-time enrollment authorization and must be removed
+after migration, rather than saved as a permanent configuration default.
+Transport binding and advertised-address validation complete before voting is
+enabled and before a clean marker is consumed, so those startup failures do not
+turn a clean shutdown into uncertain recovery.
+
+Only the asynchronous history writer and reservation protocol are opt-in.
+Synchronous mode also acquires the history-directory lock, refuses a directory
+already migrated to reserved history, queues durable-root pruning behind replay,
+and uses the retained pool/history voting floor instead of immediately retiring
+votes at the latest finality certificate. Thus the default persistence method is
+unchanged, but the full default voting path is not. If replay lags, the voter can
+now emit skip votes for a slot already finalized by the network while that slot
+remains inside the retained voting window. The leader reservation gate
+applies when reservation mode is enabled.
