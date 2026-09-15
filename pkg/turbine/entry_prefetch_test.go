@@ -3,6 +3,7 @@ package turbine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -357,4 +358,124 @@ func TestEntryPrefetchCanceledCompletionCanRetrySameGeneration(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, blk)
 	require.True(t, blk.TransactionSignaturesVerified())
+}
+
+// A complete later batch must verify while an earlier batch still has a gap.
+// Its preceding DATA_COMPLETE shred remains necessary to establish its start.
+func TestEntryPrefetchBypassesEarlierGap(t *testing.T) {
+	for _, lateBoundary := range []bool{false, true} {
+		t.Run(fmt.Sprint("lateBoundary=", lateBoundary), func(t *testing.T) {
+			var calls atomic.Int32
+			v := newTransactionVerifier(2, 8, func(tx *solana.Transaction) error { calls.Add(1); return txverify.VerifyTransaction(tx) })
+			defer v.closeAndWait()
+			a := NewSlotAssembler()
+			p := newEntryPrefetchPool(context.Background(), a, v)
+			defer p.closeAndWait()
+			const slot = 909
+			txs := verifierSignedTransactions(t, 60)
+			batches := prefetchTestShreds(t, slot, prefetchTestPayload(t, txs[:30]), prefetchTestPayload(t, txs[30:]), buildAlpenglowEndingTick(t))
+			require.Greater(t, len(batches[0]), 2)
+			end := len(batches[0]) - 1
+			for i, sh := range batches[0] {
+				if i == 1 || (lateBoundary && i == end) {
+					continue
+				}
+				require.Nil(t, feedPrefetchShreds(t, a, []*Shred{sh}))
+			}
+			require.Nil(t, feedPrefetchShreds(t, a, batches[1]))
+			if lateBoundary {
+				a.mu.Lock()
+				empty := len(a.slots[slot].completeBatches) == 0
+				a.mu.Unlock()
+				require.True(t, empty, "unknown preceding boundary must prevent speculation")
+				require.Nil(t, feedPrefetchShreds(t, a, batches[0][end:]))
+			}
+			later := waitPrefetchedBatch(t, a, slot, batches[1][0].Index)
+			_, err := later.verification.wait()
+			require.NoError(t, err)
+			require.Equal(t, int32(30), calls.Load())
+			require.Nil(t, feedPrefetchShreds(t, a, batches[0][1:2]))
+			earlier := waitPrefetchedBatch(t, a, slot, 0)
+			_, err = earlier.verification.wait()
+			require.NoError(t, err)
+			blk := feedPrefetchShreds(t, a, batches[2])
+			require.NotNil(t, blk)
+			require.True(t, blk.TransactionSignaturesVerified())
+			require.Len(t, blk.Transactions, 60)
+			require.Equal(t, int32(60), calls.Load(), "every signature verified exactly once")
+			for i, tx := range txs {
+				require.Equal(t, tx.Signatures[0], blk.Transactions[i].Signatures[0])
+			}
+		})
+	}
+}
+
+func TestEntryPrefetchDiscoversRecoveredBoundary(t *testing.T) {
+	v := newTransactionVerifier(2, 8, nil)
+	defer v.closeAndWait()
+	a := NewSlotAssembler()
+	p := newEntryPrefetchPool(context.Background(), a, v)
+	defer p.closeAndWait()
+	const slot = 910
+	txs := verifierSignedTransactions(t, 60)
+	gen := ShredGenerator{Slot: slot, ParentSlot: slot - 1, Version: 1}
+	raw := prefetchTestPayload(t, txs[:30])
+	packets, root, nextData, nextCode, err := gen.MakeShredsFromData(testShredLeader(t), raw, false, solana.Hash{}, 0, 0)
+	require.NoError(t, err)
+	var code []*Shred
+	for _, packet := range packets {
+		sh, err := ParseShred(packet)
+		require.NoError(t, err)
+		if sh.Type == ShredTypeCode {
+			code = append(code, sh)
+			continue
+		}
+		if !sh.DataComplete() {
+			require.Nil(t, feedPrefetchShreds(t, a, []*Shred{sh}))
+		}
+	}
+	packets, _, _, _, err = gen.MakeShredsFromData(testShredLeader(t), prefetchTestPayload(t, txs[30:]), false, root, nextData, nextCode)
+	require.NoError(t, err)
+	for _, packet := range packets {
+		sh, err := ParseShred(packet)
+		require.NoError(t, err)
+		if sh.Type == ShredTypeData {
+			require.Nil(t, feedPrefetchShreds(t, a, []*Shred{sh}))
+		}
+	}
+	a.mu.Lock()
+	empty := len(a.slots[slot].completeBatches) == 0
+	a.mu.Unlock()
+	require.True(t, empty)
+	require.NotEmpty(t, code)
+	for _, sh := range code {
+		require.Nil(t, feedPrefetchShreds(t, a, []*Shred{sh}))
+	}
+	later := waitPrefetchedBatch(t, a, slot, nextData)
+	_, err = later.verification.wait()
+	require.NoError(t, err)
+	first := waitPrefetchedBatch(t, a, slot, 0)
+	_, err = first.verification.wait()
+	require.NoError(t, err)
+}
+
+func TestEntryPrefetchIndexDisabledAndLateInstall(t *testing.T) {
+	a := NewSlotAssembler()
+	batches := prefetchTestShreds(t, 911, prefetchTestPayload(t, verifierSignedTransactions(t, 3)), buildAlpenglowEndingTick(t))
+	require.Nil(t, feedPrefetchShreds(t, a, batches[0]))
+	a.mu.Lock()
+	absent := a.slots[911].batchIndex == nil
+	a.mu.Unlock()
+	require.True(t, absent)
+	v := newTransactionVerifier(2, 8, nil)
+	defer v.closeAndWait()
+	p := newEntryPrefetchPool(context.Background(), a, v)
+	defer p.closeAndWait()
+	// Seeding also works on a coding-only admission with no new data recovery.
+	a.mu.Lock()
+	a.prefetchEntriesLocked(a.slots[911])
+	a.mu.Unlock()
+	cached := waitPrefetchedBatch(t, a, 911, 0)
+	_, err := cached.verification.wait()
+	require.NoError(t, err)
 }

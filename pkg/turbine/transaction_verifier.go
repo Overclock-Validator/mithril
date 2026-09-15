@@ -24,17 +24,20 @@ const defaultTransactionJobGroups = 4
 // A job is formed before admission, from transactions which are already
 // available. Workers never wait for more transactions to fill a vector group.
 type transactionVerifyJob struct {
-	ctx        context.Context
-	txs        []*solana.Transaction
-	identities []txverify.VerifiedMessageIdentity
-	errs       []error
-	start      int
-	done       chan<- *transactionVerifyJob
+	trace                             bool
+	offeredAt, workerStart, workerEnd int64
+	ctx                               context.Context
+	txs                               []*solana.Transaction
+	identities                        []txverify.VerifiedMessageIdentity
+	errs                              []error
+	start                             int
+	done                              chan<- *transactionVerifyJob
 }
 
 // transactionVerification owns an asynchronous request until done closes.
 // Transactions submitted to it must remain immutable until wait returns.
 type transactionVerification struct {
+	trace      *entryVerificationTrace
 	done       chan struct{}
 	cancel     context.CancelFunc
 	index      int
@@ -130,7 +133,15 @@ func newTransactionVerifierWithJobGroups(workers, queueDepth, batchTarget, jobGr
 // verifyGroup releases its job even if signature verification panics. The
 // request's bounded completion channel always has room for every pending job.
 func (v *transactionVerifier) verifyGroup(job *transactionVerifyJob, batch *txverify.BatchVerifier) {
-	defer func() { job.done <- job }()
+	if job.trace {
+		job.workerStart = entryTraceNow()
+	}
+	defer func() {
+		if job.trace {
+			job.workerEnd = entryTraceNow()
+		}
+		job.done <- job
+	}()
 	for start := 0; start < len(job.txs); {
 		// An admitted job always finishes its first vector group, preserving
 		// ownership/join semantics. Cancellation can skip additional groups.
@@ -172,6 +183,10 @@ func (v *transactionVerifier) submitTransactions(ctx context.Context, txs []*sol
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	var trace *entryVerificationTrace
+	if entryTraceContext(ctx) {
+		trace = &entryVerificationTrace{Submit: entryTraceNow(), Transactions: len(txs)}
+	}
 	select {
 	case v.requests <- struct{}{}:
 	case <-ctx.Done():
@@ -189,7 +204,10 @@ func (v *transactionVerifier) submitTransactions(ctx context.Context, txs []*sol
 	v.request.Add(1)
 	v.mu.Unlock()
 	ctx, cancel := context.WithCancel(ctx)
-	r := &transactionVerification{done: make(chan struct{}), cancel: cancel, index: -1}
+	if trace != nil {
+		trace.Admitted = entryTraceNow()
+	}
+	r := &transactionVerification{done: make(chan struct{}), cancel: cancel, index: -1, trace: trace}
 	if v.verify == nil {
 		r.identities = make([]txverify.VerifiedMessageIdentity, len(txs))
 	}
@@ -197,7 +215,10 @@ func (v *transactionVerifier) submitTransactions(ctx context.Context, txs []*sol
 		defer v.request.Done()
 		defer func() { <-v.requests }()
 		defer cancel()
-		r.index, r.err = v.verifyTransactionsWithIdentities(ctx, txs, r.identities)
+		r.index, r.err = v.verifyTransactionsWithTiming(ctx, txs, r.identities, trace)
+		if trace != nil {
+			trace.Finished = entryTraceNow()
+		}
 		r.finishedAt = time.Now()
 		close(r.done)
 	}()
@@ -213,6 +234,10 @@ func (v *transactionVerifier) verifyTransactions(ctx context.Context, txs []*sol
 }
 
 func (v *transactionVerifier) verifyTransactionsWithIdentities(ctx context.Context, txs []*solana.Transaction, identities []txverify.VerifiedMessageIdentity) (int, error) {
+	return v.verifyTransactionsWithTiming(ctx, txs, identities, nil)
+}
+
+func (v *transactionVerifier) verifyTransactionsWithTiming(ctx context.Context, txs []*solana.Transaction, identities []txverify.VerifiedMessageIdentity, trace *entryVerificationTrace) (int, error) {
 	if len(txs) == 0 {
 		return -1, ctx.Err()
 	}
@@ -229,6 +254,7 @@ func (v *transactionVerifier) verifyTransactionsWithIdentities(ctx context.Conte
 	errs := make([]error, window*jobCapacity)
 	free := make([]*transactionVerifyJob, window)
 	for i := range groups {
+		groups[i].trace = trace != nil
 		groups[i].ctx = ctx
 		groups[i].errs = errs[i*jobCapacity : (i+1)*jobCapacity]
 		groups[i].done = completed
@@ -256,6 +282,9 @@ func (v *transactionVerifier) verifyTransactionsWithIdentities(ctx context.Conte
 			for group := 0; group < jobGroups && end < len(txs); group++ {
 				end = transactionVerifyGroupEnd(txs, end, v.batchTarget)
 			}
+			if trace != nil {
+				pending.offeredAt = entryTraceNow()
+			}
 			pending.start = nextIndex
 			pending.txs = txs[nextIndex:end]
 			if identities != nil {
@@ -274,6 +303,9 @@ func (v *transactionVerifier) verifyTransactionsWithIdentities(ctx context.Conte
 			active++
 			pending = nil
 		case job := <-completed:
+			if trace != nil {
+				trace.observe(job)
+			}
 			active--
 			for i, err := range job.errs {
 				if err != nil && (failureIndex < 0 || job.start+i < failureIndex) {

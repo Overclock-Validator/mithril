@@ -98,14 +98,15 @@ type PartialShredObservation struct {
 }
 
 type slotState struct {
-	slot        uint64
-	parentSlot  uint64
-	shreds      map[uint32]*Shred
-	fecSets     map[uint32]*fecState
-	lastIndex   uint32
-	haveLast    bool
-	shredVer    uint16
-	firstParent bool
+	pipelineTrace *entryPipelineTrace
+	slot          uint64
+	parentSlot    uint64
+	shreds        map[uint32]*Shred
+	fecSets       map[uint32]*fecState
+	lastIndex     uint32
+	haveLast      bool
+	shredVer      uint16
+	firstParent   bool
 
 	// Observability: when the slot's first shred was accepted, and how many of
 	// its shreds arrived via repair rather than turbine.
@@ -113,10 +114,10 @@ type slotState struct {
 	fullAt         time.Time
 	repairedShreds int
 	// completing makes the immutable full state a single-owner generation token.
-	completing            bool
-	batchScan, batchStart uint32
-	completeBatches       []shredBatchRange
-	prefetch              *slotEntryPrefetch
+	completing      bool
+	batchIndex      *entryBatchIndex
+	completeBatches []shredBatchRange
+	prefetch        *slotEntryPrefetch
 	// Assembly failures for this slot (mixed variants/signatures, FEC layout
 	// conflicts, ...). A slot frozen below completion while repair responses
 	// flow is usually poisoned state — the latest error names the poison.
@@ -305,6 +306,8 @@ func (a *SlotAssembler) addShredFromWithRoot(shred *Shred, fromRepair bool, root
 		state.noteError(err)
 		return nil, err
 	}
+	state.traceAcceptedShred(shred)
+	a.notePrefetchShredLocked(state, shred)
 	if state.firstShredAt.IsZero() {
 		state.firstShredAt = time.Now()
 	}
@@ -326,6 +329,8 @@ func (a *SlotAssembler) addShredFromWithRoot(shred *Shred, fromRepair bool, root
 			return nil, err
 		}
 		if err == nil {
+			state.traceAcceptedShred(recoveredShred)
+			a.notePrefetchShredLocked(state, recoveredShred)
 			a.recoveredDataShreds++
 		}
 	}
@@ -342,6 +347,9 @@ func (a *SlotAssembler) claimCompletionLocked(state *slotState, reportNonCanonic
 		return nil
 	}
 	now := time.Now()
+	if state.pipelineTrace != nil {
+		state.pipelineTrace.sealed = true
+	}
 	observeCollection := state.fullAt.IsZero()
 	if observeCollection {
 		state.fullAt = now
@@ -388,6 +396,7 @@ func (a *SlotAssembler) processCompletion(ctx context.Context, work *slotComplet
 	if ctx.Err() != nil {
 		return processedSlotCompletion{canceled: true}
 	}
+	ctx = withEntryPipelineTrace(ctx, work.state.pipelineTrace)
 	startedAt := time.Now()
 	timings := block.TurbineIngressTimings{CompletionQueueDelay: startedAt.Sub(work.queuedAt)}
 	_ = statsd.Duration(statsd.TurbineBlockCompletionQueueDelay, timings.CompletionQueueDelay, nil)
@@ -429,7 +438,7 @@ func (a *SlotAssembler) processCompletion(ctx context.Context, work *slotComplet
 
 	sigverifyStartedAt := time.Now()
 	if work.state.prefetch != nil && len(decodeTimings.retained) > 0 {
-		processed.err = verifyDecodedEntryBatches(ctx, blk, decodeTimings.retained, work.state.prefetch.pool.verifier)
+		processed.err = verifyDecodedEntryBatchesWithTimings(ctx, blk, decodeTimings.retained, work.state.prefetch.pool.verifier, &decodeTimings)
 	} else {
 		processed.err = work.verifyTransactions(ctx, blk)
 	}
@@ -450,6 +459,7 @@ func (a *SlotAssembler) processCompletion(ctx context.Context, work *slotComplet
 		_ = statsd.Duration(statsd.TurbineEarlyTransactionParse, processed.timings.EarlyTransactionParse, nil)
 		_ = statsd.Duration(statsd.TurbineEarlyTransactionSigverify, processed.timings.EarlyTransactionSigverify, nil)
 		_ = statsd.Count(statsd.TurbineEarlyVerifiedTransactions, int64(processed.timings.EarlyVerifiedTransactions), nil)
+		queueEntryPipelineReport(work.state, blk, &decodeTimings, startedAt, processed.completionReadyAt)
 	}
 	return processed
 }
