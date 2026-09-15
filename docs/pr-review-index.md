@@ -6,11 +6,11 @@ The verified development base is `33dde4050d9250557583395810799aaac2f54017`. Vot
 
 | Review | Current head | Base | Description |
 |---|---|---|---|
-| [turbine: prepare complete transaction batches during shred arrival](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-streaming-preparation) | `311f83ea` | `alpenglow-dev` | [Scope, tests and benchmarks](review-prs/streaming-preparation.md) |
+| [turbine: prepare complete transaction batches during shred arrival](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-streaming-preparation) | `1c1171d3` | `alpenglow-dev` | [Scope, tests and benchmarks](review-prs/streaming-preparation.md) |
 | [alpenglow: reduce certificate verification lock contention](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-certificate-processing) | `72514abc` | `alpenglow-dev` | [Scope, tests and benchmarks](review-prs/certificate-processing.md) |
 | [replay: prepare status publication and defer checkpoint work](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-status-checkpoint-expiry) | `d04ad985` | `alpenglow-dev` | [Scope, tests and benchmarks](review-prs/status-checkpoint-expiry.md) |
 | [runtime: enable VM pooling and preserve owned vote state](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-runtime-allocation) | `752ef973` | `alpenglow-dev` | [Scope, tests and benchmarks](review-prs/runtime-allocation.md) |
-| [leader: improve packing and add near-limit block benchmarks](https://github.com/Overclock-Validator/mithril/compare/7layer%2Freview-streaming-preparation...7layer%2Freview-leader-packing) | `cc1e3dfc` | `7layer/review-streaming-preparation` | [Scope, tests and benchmarks](review-prs/leader-packing.md) |
+| [leader: improve packing and add near-limit block benchmarks](https://github.com/Overclock-Validator/mithril/compare/7layer%2Freview-streaming-preparation...7layer%2Freview-leader-packing) | `06ef0677` | `7layer/review-streaming-preparation` | [Scope, tests and benchmarks](review-prs/leader-packing.md) |
 | [alpenglow: isolate vote delivery and reserve durable signing bounds](https://github.com/Overclock-Validator/mithril/compare/7layer%2Freview-certificate-processing...7layer%2Freview-vote-delivery-persistence) | `54b233ff` | `7layer/review-certificate-processing` | [Scope, tests and benchmarks](review-prs/vote-delivery-persistence.md) |
 
 ## Newest validator changes
@@ -18,7 +18,7 @@ The verified development base is `33dde4050d9250557583395810799aaac2f54017`. Vot
 - Certificate processing includes bounded MultiExp with unchanged full-strength random coefficients and pending-only observer reconciliation (`72514abc`).
 - Status checkpoints include immutable node encoding reuse, allocation-free rejection of incomplete fold batches (`d55c7962`), and retirement of completed rewards bookkeeping after durable promotion (`c78e35cd`). The latter avoids an unnecessary fork-recovery guard after rewards are safely rooted; native tests passed and it was deployed at 12:20 UTC. Live latency benefit awaits an applicable fork switch.
 - Status publication also reuses successful ancestor validation only for the same unchanged cache and identities (`d04ad985`). Existing-group Zen 5 publication benchmarks improved from 2.4–2.5 ms to 1.3–1.4 ms; native race tests, vet and build passed. This is an incremental component gain, not a FAST-score claim.
-- Streaming includes relay-buffer reuse (`311f83ea`); voting and leader branches include their latest respective parent branches.
+- Streaming includes relay-buffer reuse (`311f83ea`) and completion-reserved verifier admission (`1c1171d3`), keeping two workers and four total request permits. Deployed at approximately15:18UTC; initial voting lag1–2 and all services recovered. The stacked leader branch includes this parent at`06ef0677`. Saturated native completion p99 improved from 47.31ms to 1.488ms; this does not establish live FAST improvement.
 
 These changes are included in the combined Zen 5 testnet deployment. The September 15 empty-block comparison measured replay-admission p99 of **4.486 → 0.483 ms** (565 before, 401 after), after deploying both observer reconciliation and fold preflight. This short observational comparison does not isolate either change or establish sustained overall FAST improvement. The descriptions retain component benchmarks, their actual baselines, validation and limitations.
 
