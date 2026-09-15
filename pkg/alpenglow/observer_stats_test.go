@@ -42,7 +42,16 @@ func TestObserverPendingStatsMatchFullScan(t *testing.T) {
 				}
 				o.Snapshot()
 				o.mu.RLock()
-				cached, scanned := o.pendingStats, o.certificateReplayPendingStatsLocked()
+				cached, scanned := o.pendingStats, observerPendingStatsFullScan(o)
+				pending := make(map[CertificateKey]BlockID)
+				for key, cert := range o.certificates {
+					if _, checked := o.replayChecks[key]; !checked {
+						if block, ok := cert.Block(); ok && block.HasHash() {
+							pending[key] = block
+						}
+					}
+				}
+				require.Equal(t, pending, o.pendingReplayCertificates, "operation %d", i)
 				o.mu.RUnlock()
 				require.Equal(t, scanned, cached, "operation %d", i)
 			}
@@ -82,4 +91,37 @@ func TestObserverConcurrentSnapshotsAndReconciliation(t *testing.T) {
 	snapshot := o.Snapshot()
 	require.Equal(t, uint64(100), snapshot.CertificateReplayMatches)
 	require.Zero(t, snapshot.CertificateReplayPending)
+}
+
+// Independent reference retains the original scan over every retained certificate.
+func observerPendingStatsFullScan(o *Observer) certificateReplayPendingStats {
+	var stats certificateReplayPendingStats
+	for key, cert := range o.certificates {
+		if _, checked := o.replayChecks[key]; checked {
+			continue
+		}
+		certBlock, ok := cert.Block()
+		if ok && certBlock.HasHash() {
+			stats.count++
+			if stats.oldestSlot == 0 || certBlock.Slot < stats.oldestSlot {
+				stats.oldestSlot = certBlock.Slot
+			}
+			if certBlock.Slot > stats.newestSlot {
+				stats.newestSlot = certBlock.Slot
+			}
+			if o.oldestReplayBlockSlot != 0 && certBlock.Slot < o.oldestReplayBlockSlot {
+				stats.preWindow++
+			}
+			if o.oldestReplayBlockSlot != 0 &&
+				o.latestReplayBlockSlot != 0 &&
+				certBlock.Slot >= o.oldestReplayBlockSlot &&
+				certBlock.Slot <= o.latestReplayBlockSlot {
+				stats.mature++
+				if stats.matureOldestSlot == 0 || certBlock.Slot < stats.matureOldestSlot {
+					stats.matureOldestSlot = certBlock.Slot
+				}
+			}
+		}
+	}
+	return stats
 }
