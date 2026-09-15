@@ -21,3 +21,11 @@ Synthetic expiry of 128 banks × 33,760 keys with one retained bank changed from
 Full replay/block race suites passed locally and natively; native replay/metrics vet and validator build passed. Regression coverage includes concurrent siblings, late ancestor duplicates, stale preparation, snapshot offset changes, rejected banks, pinned views, restore/unwind and scheduling boundaries. Existing tests cover snapshot/prune behavior, exact checkpoint equivalence and randomized expiry against the old oracle.
 
 Split from #279, with the subsequent publication optimization added to this status-cache branch. Base: `33dde4050d9250557583395810799aaac2f54017`.
+
+### Checkpoint encoding reuse
+
+Memoize each immutable node's MTS2 bytes and share the cache across snapshot capture and pruning. Snapshot headers remain per-capture, output buffers remain caller-owned, and cached data retains no excluded parent chain. The cache adds approximately one encoded window of retained memory (about 30 MB for the benchmark).
+
+On Zen 5, a moving 300-root window with 5,000 keys per root and the default 128-root fold cadence encoded in **194.52 ms before versus 85.02 ms after** (three-sample medians). Allocation fell from 99.12 MB to 57.33 MB per encoding. The baseline is the original uncached encoder from this split branch; this is an incremental encoding comparison, not the whole PR against dev. Entirely new windows were roughly unchanged. Method and other cadences: `docs/status-checkpoint-capture.md`.
+
+Final combined native race suites, vet and build passed. No deployment or live durable-root/FAST gain is claimed. Raw run artifacts remain outside the source tree.
