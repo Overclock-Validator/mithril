@@ -1,0 +1,52 @@
+# Preparing transaction-status publication during execution
+
+Replay previously built the immutable per-bank transaction-status delta and grew the visible duplicate index only after execution and bank-state publication. In a prior live sample of 25 large blocks, TransactionStatusCommit took 7.704 ms median and 10.206 ms maximum. Those live timings motivate this change; they are not the controlled benchmark baseline below.
+
+Count identities by recent blockhash and allocate each delta map at its final capacity. Pre-size newly created visible maps too. For banks with more than 32 transactions and GOMAXPROCS greater than one, prepare the immutable delta during account loading and execution. Smaller banks and single-thread configurations keep the work inline. There is at most one preparation task per ProcessBlock call, and every return joins it, including rejected banks. No status becomes visible during preparation.
+
+The worker reads immutable prepared message identities and briefly snapshots only blockhash slice offsets under the cache read lock. It builds its private maps outside the lock. Commit still checks exact block/identity binding, complete coverage, parent lineage and all ancestor duplicates under the publication lock. A changed slice offset or mismatched preparation triggers a rebuild from the actual block's identities. Publication still happens only after successful bank-state commit. Failed instructions within an accepted bank remain processed; rejected banks publish nothing. Pinned views, snapshots, reference counts and unwind keep their existing semantics.
+
+TransactionStatusPreparation measures worker wall time, which overlaps execution; it is not additive with replay wall time. TransactionStatusPreparationWait measures the residual join and is nested inside TransactionStatusCommit. The latter still includes waiting, final checks, visible-index updates and node publication. Preparation time excludes initial goroutine scheduling delay; any residual scheduling delay remains in the join/commit timer.
+
+## Native benchmark
+
+AMD Ryzen 7 9700X (Zen 5), Go 1.26.4, GOMAXPROCS=2. Tests ran in a separate process on the validator host with Nice=15 and a 200% CPU quota; the validator and loader continued running. This is a shared-host microbenchmark, with observable timing variation. Five samples per case, ten iterations per sample; values below are medians of sample means, not per-block percentiles.
+
+Each block has 33,760 unique prepared message identities spread across one or four recent blockhashes. Existing-group cases seed 33,760 different ancestor transactions. Fixture creation, hashing, seeding and unwind are untimed. Existing maps retain capacity after unwind: the first timed commit's growth is amortized across the ten iterations. This does not model an index growing indefinitely across live blocks.
+
+The frozen baseline functions exactly match alpenglow-dev commit `33dde4050d9250557583395810799aaac2f54017`. Both versions use the same prepared identities, parent/duplicate checks and fixtures.
+
+| Recent blockhash groups | Parent has keys in these groups | Baseline commit | Sized maps, inline | Preparation + commit, no overlap | Commit after preparation |
+|---|---|---:|---:|---:|---:|
+| 1 | No | 4.990 ms | 3.332 ms | 3.393 ms | 1.587 ms |
+| 1 | Yes | 4.991 ms | 4.657 ms | 4.434 ms | 2.757 ms |
+| 4 | No | 4.625 ms | 3.744 ms | 5.916 ms | 2.205 ms |
+| 4 | Yes | 5.224 ms | 4.644 ms | 4.949 ms | 2.858 ms |
+
+The last column deliberately excludes delta preparation: it measures the work remaining if execution hides preparation completely. It is not total replay or CPU work. Total publication allocations with new groups fell from approximately 6.30 MB to 3.15 MB per block. Existing-group allocation figures include the amortized first growth described above.
+
+The four-new-group total-work sample was slower. Preserve that result rather than claiming improvement in every sample. A subsequent baseline/candidate/candidate/baseline comparison of that same case, with 50 iterations per sample, measured baseline **4.400 and 4.565 ms**, candidate **2.985 and 3.131 ms**. This supports a reduction in work but does not isolate the cause of the earlier timing variation.
+
+## Execution contention and small blocks
+
+A separate controlled benchmark performs 4,096 load-and-execute calls using the existing transfer fixture while preparing 33,760 independent status keys. It does not commit transfer accounts, and its status fixture differs from the repeated transfer fixture. It tests scheduling/allocation contention, not whole-block replay or a valid block workload.
+
+With two Go execution threads, the final implementation measured **20.678 ms baseline**, **18.574 ms with sizing alone**, and **17.091 ms with overlap**. Execution itself measured 15.070, 14.369 and 14.967 ms respectively. Thus preparation competed with execution relative to sizing alone, but the shorter final stage outweighed that cost in this controlled workload. These are separate medians and need not add exactly.
+
+The initial unrestricted version showed no additional total-time benefit from overlap with GOMAXPROCS=1. Tiny-block measurements also showed roughly a microsecond of avoidable scheduling overhead. The final implementation therefore does no background preparation with one Go execution thread or at most 32 transactions. Empty and one-transaction cases retain the baseline allocation counts. The 32-transaction case benefits from sizing without launching a worker. Threshold and single-thread behavior have regression coverage.
+
+## Validation and limits
+
+Full replay and block race suites passed on both Zen 5 and M4 Pro. Metrics has no tests. Native vet for replay/metrics and the validator build passed. Tests cover fork replacement introducing a duplicate after preparation, concurrent sibling publication, stale identity binding, changed snapshot slice offsets, rejected/incomplete banks, mismatched preparation, pinned views, snapshot restore, unwind, empty banks and scheduling boundaries.
+
+Raw logs, source hashes, summaries and the alternating recheck are in [results/status-publication/2026-09-15](results/status-publication/2026-09-15). The baseline comparison covers only status publication. No live replay or FAST improvement is claimed. The staging binary was not deployed; the existing validator remained active and voting throughout the tests.
+
+Reproduce from this branch:
+
+```sh
+GOMAXPROCS=2 go test -race -p 2 ./pkg/replay ./pkg/block ./pkg/metrics -count=1
+GOMAXPROCS=2 go vet -p 2 ./pkg/replay ./pkg/metrics
+GOMAXPROCS=2 go build -p 2 ./cmd/mithril
+GOMAXPROCS=2 go test ./pkg/replay -run '^$' -bench '^BenchmarkTransactionStatusPublication$' -benchtime=10x -count=5
+go test ./pkg/replay -run '^$' -bench '^BenchmarkTransactionStatus(ExecutionOverlap|SmallPublication)$' -benchtime=100ms -count=5 -cpu=1,2
+```

@@ -1,0 +1,104 @@
+{
+  "BenchmarkTransactionStatusExecutionOverlap/legacy": {
+    "ns/op": 22833095.0,
+    "commit-with-wait-ns/op": 5848843.0,
+    "execution-ns/op": 16779392.0,
+    "B/op": 23276116.0,
+    "allocs/op": 242222.0
+  },
+  "BenchmarkTransactionStatusExecutionOverlap/legacy-2": {
+    "ns/op": 19163664.0,
+    "commit-with-wait-ns/op": 5114189.0,
+    "execution-ns/op": 14034884.0,
+    "B/op": 23276650.0,
+    "allocs/op": 242225.0
+  },
+  "BenchmarkTransactionStatusExecutionOverlap/sized": {
+    "ns/op": 21164557.0,
+    "commit-with-wait-ns/op": 4745710.0,
+    "execution-ns/op": 17057597.0,
+    "B/op": 20125556.0,
+    "allocs/op": 241932.0
+  },
+  "BenchmarkTransactionStatusExecutionOverlap/sized-2": {
+    "ns/op": 18233386.0,
+    "commit-with-wait-ns/op": 4143998.0,
+    "execution-ns/op": 14088971.0,
+    "B/op": 20126009.0,
+    "allocs/op": 241934.0
+  },
+  "BenchmarkTransactionStatusExecutionOverlap/overlap": {
+    "ns/op": 21351433.0,
+    "commit-with-wait-ns/op": 3481211.0,
+    "execution-ns/op": 18286875.0,
+    "B/op": 20125816.0,
+    "allocs/op": 241936.0
+  },
+  "BenchmarkTransactionStatusExecutionOverlap/overlap-2": {
+    "ns/op": 16814463.0,
+    "commit-with-wait-ns/op": 2297246.0,
+    "execution-ns/op": 14538161.0,
+    "B/op": 20126252.0,
+    "allocs/op": 241938.0
+  },
+  "BenchmarkTransactionStatusSmallPublication/txs_0/legacy": {
+    "ns/op": 94.81,
+    "B/op": 112.0,
+    "allocs/op": 2.0
+  },
+  "BenchmarkTransactionStatusSmallPublication/txs_0/legacy-2": {
+    "ns/op": 76.19,
+    "B/op": 112.0,
+    "allocs/op": 2.0
+  },
+  "BenchmarkTransactionStatusSmallPublication/txs_0/prepared_total": {
+    "ns/op": 181.7,
+    "B/op": 264.0,
+    "allocs/op": 5.0
+  },
+  "BenchmarkTransactionStatusSmallPublication/txs_0/prepared_total-2": {
+    "ns/op": 142.9,
+    "B/op": 264.0,
+    "allocs/op": 5.0
+  },
+  "BenchmarkTransactionStatusSmallPublication/txs_1/legacy": {
+    "ns/op": 810.9,
+    "B/op": 960.0,
+    "allocs/op": 9.0
+  },
+  "BenchmarkTransactionStatusSmallPublication/txs_1/legacy-2": {
+    "ns/op": 633.3,
+    "B/op": 960.0,
+    "allocs/op": 9.0
+  },
+  "BenchmarkTransactionStatusSmallPublication/txs_1/prepared_total": {
+    "ns/op": 1645.0,
+    "B/op": 1192.0,
+    "allocs/op": 13.0
+  },
+  "BenchmarkTransactionStatusSmallPublication/txs_1/prepared_total-2": {
+    "ns/op": 1511.0,
+    "B/op": 1192.0,
+    "allocs/op": 13.0
+  },
+  "BenchmarkTransactionStatusSmallPublication/txs_32/legacy": {
+    "ns/op": 6067.0,
+    "B/op": 6320.0,
+    "allocs/op": 23.0
+  },
+  "BenchmarkTransactionStatusSmallPublication/txs_32/legacy-2": {
+    "ns/op": 5064.0,
+    "B/op": 6320.0,
+    "allocs/op": 23.0
+  },
+  "BenchmarkTransactionStatusSmallPublication/txs_32/prepared_total": {
+    "ns/op": 5837.0,
+    "B/op": 3848.0,
+    "allocs/op": 17.0
+  },
+  "BenchmarkTransactionStatusSmallPublication/txs_32/prepared_total-2": {
+    "ns/op": 5961.0,
+    "B/op": 3848.0,
+    "allocs/op": 17.0
+  }
+}
