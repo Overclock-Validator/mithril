@@ -2489,7 +2489,9 @@ func ReplayBlocks(
 		return true
 	}
 	var sweepWhileWaiting func() *CertifiedSwitch
+	var decisionChanges <-chan struct{}
 	if unrootedTailState != nil && switchSweeper != nil {
+		decisionChanges = switchSweeper.decisionChanges
 		sweepWhileWaiting = func() *CertifiedSwitch {
 			return switchSweeper.sweep(alpenglowExecutedBlockIDs, mithrilState.LastRootedSlot, replayFrontier)
 		}
@@ -2547,7 +2549,7 @@ func ReplayBlocks(
 
 			neededAt = time.Now()
 			block, parentSwitch, certifiedSwitch = waitForAlpenglowReplayInput(ctx,
-				blockStream.NextBlockOrAlpenglowParentSwitch, sweepWhileWaiting, alpenglowSwitchPollInterval)
+				blockStream.NextBlockOrAlpenglowEvent, sweepWhileWaiting, decisionChanges, alpenglowSwitchPollInterval)
 			if ingress, ok := block.CompleteTurbineReplayAdmission(time.Now()); ok {
 				_ = statsd.Duration(statsd.TurbineReplayAdmission, ingress.ReplayAdmission, nil)
 				ingressTimings = &ingress

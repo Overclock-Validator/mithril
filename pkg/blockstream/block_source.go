@@ -3787,23 +3787,27 @@ func (bs *BlockSource) NextBlock() *b.Block {
 	return block
 }
 
-// NextBlockOrAlpenglowParentSwitch lets replay react to a parent-linked fork
-// while normal block emission is intentionally held. The fast pre-check gives
-// an already-queued switch priority over speculative blocks buffered just
-// before the alternate child exposed the fork.
-func (bs *BlockSource) NextBlockOrAlpenglowParentSwitch(ctx context.Context) (*b.Block, *AlpenglowParentSwitch) {
+// NextBlockOrAlpenglowEvent lets replay react to a parent-linked fork or chain
+// decision change while normal block emission is intentionally held. The fast
+// pre-check gives an already-queued switch priority over speculative blocks
+// buffered just before the alternate child exposed the fork. decisionChanges
+// may be nil to disable decision wakeups, but must never be closed. The third
+// result distinguishes a decision wakeup from a closed stream or cancellation.
+func (bs *BlockSource) NextBlockOrAlpenglowEvent(ctx context.Context, decisionChanges <-chan struct{}) (block *b.Block, parentSwitch *AlpenglowParentSwitch, decisionChanged bool) {
 	select {
 	case event := <-bs.alpenglowParentSwitchCh:
-		return nil, &event
+		return nil, &event, false
 	default:
 	}
 	select {
 	case event := <-bs.alpenglowParentSwitchCh:
-		return nil, &event
+		return nil, &event, false
 	case block := <-bs.streamChan:
-		return block, nil
+		return block, nil, false
+	case <-decisionChanges:
+		return nil, nil, true
 	case <-ctx.Done():
-		return nil, nil
+		return nil, nil, false
 	}
 }
 

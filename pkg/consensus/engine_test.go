@@ -239,6 +239,12 @@ func TestAlpenglowObserverFeedsCertifiedDecisionResolver(t *testing.T) {
 		t.Fatalf("NewEngine returned error: %v", err)
 	}
 	observer := engine
+	var notifier AlpenglowChainDecisionNotifier = observer
+	changes := notifier.ChainDecisionChanges()
+	if changes == nil || changes != notifier.ChainDecisionChanges() {
+		t.Fatal("observer did not expose a stable decision notification channel")
+	}
+	before := observer.ChainDecisionVersion()
 	if err := observer.SetAlpenglowValidatorSet(testAlpenglowValidatorSet()); err != nil {
 		t.Fatalf("SetAlpenglowValidatorSet returned error: %v", err)
 	}
@@ -250,6 +256,14 @@ func TestAlpenglowObserverFeedsCertifiedDecisionResolver(t *testing.T) {
 	}
 	cert.Signature = testAlpenglowCertificateSignature(t, cert)
 	observer.observeVotorMessage(alpenglow.NewCertificateMessage(cert))
+	select {
+	case <-changes:
+	default:
+		t.Fatal("accepted certificate did not notify replay")
+	}
+	if after := observer.ChainDecisionVersion(); after <= before {
+		t.Fatalf("certificate notification did not advance version: %d -> %d", before, after)
+	}
 
 	decision, ok := observer.NextAlpenglowDecision(41)
 	if !ok {
@@ -273,6 +287,7 @@ func TestAlpenglowObserverCandidateBlockEnablesIndirectSkipDecision(t *testing.T
 		t.Fatalf("NewEngine returned error: %v", err)
 	}
 	observer := engine
+	changes := observer.ChainDecisionChanges()
 	if err := observer.SetAlpenglowValidatorSet(testAlpenglowValidatorSet()); err != nil {
 		t.Fatalf("SetAlpenglowValidatorSet returned error: %v", err)
 	}
@@ -287,10 +302,24 @@ func TestAlpenglowObserverCandidateBlockEnablesIndirectSkipDecision(t *testing.T
 	}
 	cert.Signature = testAlpenglowCertificateSignature(t, cert)
 	observer.observeVotorMessage(alpenglow.NewCertificateMessage(cert))
+	select {
+	case <-changes:
+	default:
+		t.Fatal("finalization certificate did not notify replay")
+	}
+	before := observer.ChainDecisionVersion()
 	observer.ObserveAlpenglowCandidateBlock(alpenglow.ReplayBlockObservation{
 		Block:      alpenglow.BlockID{Slot: 15, Hash: blockID},
 		ParentSlot: 12,
 	})
+	select {
+	case <-changes:
+	default:
+		t.Fatal("newly discovered finalized ancestry did not notify replay")
+	}
+	if after := observer.ChainDecisionVersion(); after <= before {
+		t.Fatalf("ancestry notification did not advance version: %d -> %d", before, after)
+	}
 
 	decision, ok := observer.NextAlpenglowDecision(12)
 	if !ok {

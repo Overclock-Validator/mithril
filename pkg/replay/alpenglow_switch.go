@@ -97,6 +97,7 @@ func (e *CertifiedSwitch) Error() string {
 // after its overriding certificate must trigger correction.
 type alpenglowSwitchSweeper struct {
 	query            consensusengine.AlpenglowChainQuery
+	decisionChanges  <-chan struct{}
 	lastDecisionSeen uint64
 	lastReplayTip    uint64
 	lastRooted       uint64
@@ -107,7 +108,13 @@ func newAlpenglowSwitchSweeper(engine consensusengine.Engine) *alpenglowSwitchSw
 	if !ok {
 		return nil
 	}
-	return &alpenglowSwitchSweeper{query: q}
+	s := &alpenglowSwitchSweeper{query: q}
+	if notifier, ok := engine.(consensusengine.AlpenglowChainDecisionNotifier); ok {
+		// Obtain the notification channel before any sweep reads the version.
+		// A change between that read and the source wait then remains pending.
+		s.decisionChanges = notifier.ChainDecisionChanges()
+	}
+	return s
 }
 
 // sweep walks consumed block/skip outcomes in (lastRooted, tip] and returns
@@ -158,15 +165,19 @@ const alpenglowSwitchPollInterval = 250 * time.Millisecond
 // checks deliberately hold the next block. In particular, a finalized child
 // can select a parent whose slot replay already consumed as a skip. Waiting
 // for that child before checking certificates would deadlock both sides.
+// Decision notifications wake the existing sweep immediately; polling remains
+// a fallback for sources without notifications. The channel must be obtained
+// before the first sweep and must not be drained after checking the version.
 // A nil sweep preserves the ordinary blocking wait for other replay modes.
 func waitForAlpenglowReplayInput(
 	ctx context.Context,
-	next func(context.Context) (*b.Block, *blockstream.AlpenglowParentSwitch),
+	next func(context.Context, <-chan struct{}) (*b.Block, *blockstream.AlpenglowParentSwitch, bool),
 	sweep func() *CertifiedSwitch,
+	decisionChanges <-chan struct{},
 	pollInterval time.Duration,
 ) (*b.Block, *blockstream.AlpenglowParentSwitch, *CertifiedSwitch) {
 	if sweep == nil {
-		block, parentSwitch := next(ctx)
+		block, parentSwitch, _ := next(ctx, nil)
 		return block, parentSwitch, nil
 	}
 	for {
@@ -177,10 +188,10 @@ func waitForAlpenglowReplayInput(
 			return nil, nil, sw
 		}
 		waitCtx, cancel := context.WithTimeout(ctx, pollInterval)
-		block, parentSwitch := next(waitCtx)
+		block, parentSwitch, decisionChanged := next(waitCtx, decisionChanges)
 		timedOut := waitCtx.Err() == context.DeadlineExceeded
 		cancel()
-		if block != nil || parentSwitch != nil || !timedOut {
+		if block != nil || parentSwitch != nil || (!decisionChanged && !timedOut) {
 			return block, parentSwitch, nil
 		}
 	}
