@@ -1,7 +1,7 @@
 # Transaction signature verification during shred arrival
 
 Turbine verifies transaction signatures as complete entry batches arrive. The
-default shared transaction pool has two workers and targets eight signature
+default shared transaction pool has `min(2, GOMAXPROCS)` workers and targets eight signature
 lanes. A ready batch containing four transactions runs immediately; there is no
 timer or minimum occupancy requirement. The same policy handles live reception
 and repair catch-up without a mode transition or a 200 ms batching delay.
@@ -120,3 +120,14 @@ measures direct ordering, authenticated-root reuse, and the four-vector job poli
 The [standalone PR review](results/streaming-pr-review/2026-09-13/README.md)
 records extraction onto current `alpenglow-dev`, the small shared component-boundary
 prerequisite, final allocation improvement, and the scope of the live trial.
+
+## Worker default compatibility
+
+The automatic transaction-verifier default changes from `(GOMAXPROCS + 1) / 2` workers to
+`min(2, GOMAXPROCS)`, including when shred overlap is disabled. This favors spare
+CPU capacity for execution and other verification at the tip. It is not a claim
+of maximum catch-up throughput on every core count or backend. Set
+`--sigverify-workers N` or `[sigverify] workers = N` explicitly when tuning a
+larger machine; disabling overlap alone does not restore the previous worker
+count. Existing two/four-worker contention measurements are in the September 12
+report above. No 32-core comparison was performed.

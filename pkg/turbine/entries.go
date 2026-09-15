@@ -47,6 +47,7 @@ type entryDecodeTimings struct {
 	retained         []*prefetchedShredBatch
 	all              []*prefetchedShredBatch
 	prefetchWait     time.Duration
+	traceFallback    *transactionVerification
 }
 
 func (e *Entry) UnmarshalWithDecoder(decoder *bin.Decoder) error {
@@ -189,6 +190,10 @@ func decodeEntriesFromOrderedDataShreds(shreds []*Shred, timings *entryDecodeTim
 		if batch == nil {
 			// A miss owns a fresh, exactly sized backing array. Transactions
 			// retain instruction-data slices into it after this call returns.
+			var traceStart int64
+			if timings != nil && entryTraceContext(timings.ctx) {
+				traceStart = entryTraceNow()
+			}
 			batchBytes := make([]byte, 0, batchSize)
 			for _, part := range batchShreds {
 				if part != nil && part.Type == ShredTypeData {
@@ -196,6 +201,9 @@ func decodeEntriesFromOrderedDataShreds(shreds []*Shred, timings *entryDecodeTim
 				}
 			}
 			batch = decodeClosedShredBatch(batchBytes, batchStart, shred.Index)
+			if traceStart != 0 {
+				batch.traceDecodeStart, batch.traceDecodeEnd = traceStart, entryTraceNow()
+			}
 			if timings != nil {
 				timings.transactionParse += batch.parseDuration
 			}

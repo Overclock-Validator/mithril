@@ -26,18 +26,20 @@ type shredBatchRange struct{ start, end uint32 }
 // Fields are immutable after ready closes; signature readers own its decoded
 // transactions until verification.done closes.
 type prefetchedShredBatch struct {
-	start, end    uint32
-	raw           []byte
-	entries       []Entry
-	parent        *AlpenglowParentInfo
-	footer        *BlockFooter
-	marker        bool
-	parseDuration time.Duration
-	err           error
-	ready         chan struct{}
-	verification  *transactionVerification
-	submittedAt   time.Time
-	submitErr     error
+	start, end       uint32
+	raw              []byte
+	entries          []Entry
+	parent           *AlpenglowParentInfo
+	footer           *BlockFooter
+	marker           bool
+	traceDecodeStart int64
+	traceDecodeEnd   int64
+	parseDuration    time.Duration
+	err              error
+	ready            chan struct{}
+	verification     *transactionVerification
+	submittedAt      time.Time
+	submitErr        error
 }
 
 type slotEntryPrefetch struct {
@@ -47,11 +49,12 @@ type slotEntryPrefetch struct {
 	batches          map[uint32]*prefetchedShredBatch
 	next             int
 	queued, released bool
+	queueDone        chan struct{} // closed after the queued/running token retires
 	bytes            int
 }
 
 // All scheduling and accounting use assembler.mu. The packet reader only
-// advances a contiguous frontier and attempts a nonblocking, coalesced enqueue.
+// indexes complete data ranges and attempts a nonblocking, coalesced enqueue.
 // Decoding and bounded verifier admission run on separate background workers.
 type entryPrefetchPool struct {
 	a                *SlotAssembler
@@ -83,21 +86,14 @@ func (a *SlotAssembler) prefetchEntriesLocked(s *slotState) {
 	if p == nil || p.closed || p.ctx.Err() != nil {
 		return
 	}
-	// Each index is visited once, even when one batch spans many FEC sets or
-	// arrives out of order. A gap never yields a speculative partial decode.
-	for s.batchScan < maxDataShredsPerSlot {
-		sh := s.shreds[s.batchScan]
-		if sh == nil {
-			break
+	if s.batchIndex == nil && len(s.shreds) != 0 {
+		s.batchIndex = newEntryBatchIndex()
+		for _, sh := range s.shreds {
+			s.discoverEntryBatch(sh)
 		}
-		if sh.DataComplete() {
-			s.completeBatches = append(s.completeBatches, shredBatchRange{s.batchStart, s.batchScan})
-			s.batchStart = s.batchScan + 1
-		}
-		s.batchScan++
 	}
 	if s.prefetch == nil && len(s.completeBatches) > 0 && p.slots < entryPrefetchSlots {
-		ctx, cancel := context.WithCancel(p.ctx)
+		ctx, cancel := context.WithCancel(withEntryPipelineTrace(p.ctx, s.pipelineTrace))
 		s.prefetch = &slotEntryPrefetch{pool: p, ctx: ctx, cancel: cancel, batches: make(map[uint32]*prefetchedShredBatch)}
 		p.slots++
 	}
@@ -112,6 +108,7 @@ func (p *entryPrefetchPool) enqueueLocked(s *slotState) {
 	select {
 	case p.jobs <- s:
 		f.queued = true
+		f.queueDone = make(chan struct{})
 	default:
 	}
 }
@@ -123,6 +120,7 @@ func (p *entryPrefetchPool) run() {
 		f := s.prefetch
 		if p.closed || f.released || f.ctx.Err() != nil || p.a.slots[s.slot] != s || s.completing {
 			f.queued = false
+			close(f.queueDone)
 			p.a.mu.Unlock()
 			continue
 		}
@@ -159,11 +157,15 @@ func (p *entryPrefetchPool) run() {
 		}
 		if batch == nil {
 			f.queued = false
+			close(f.queueDone)
 			p.a.mu.Unlock()
 			continue
 		}
 		p.a.mu.Unlock()
 
+		if s.pipelineTrace != nil {
+			batch.traceDecodeStart = entryTraceNow()
+		}
 		raw := make([]byte, 0, rawSize)
 		for _, sh := range shreds {
 			raw = append(raw, sh.Data...)
@@ -173,6 +175,9 @@ func (p *entryPrefetchPool) run() {
 		batch.raw, batch.entries = decoded.raw, decoded.entries
 		batch.parent, batch.footer, batch.marker = decoded.parent, decoded.footer, decoded.marker
 		batch.parseDuration, batch.err = decoded.parseDuration, decoded.err
+		if s.pipelineTrace != nil {
+			batch.traceDecodeEnd = entryTraceNow()
+		}
 		if batch.err == nil && !batch.marker && f.ctx.Err() == nil {
 			txs := entryBatchTransactions(batch.entries)
 			if len(txs) > 0 {
@@ -183,6 +188,7 @@ func (p *entryPrefetchPool) run() {
 		close(ready)
 		p.a.mu.Lock()
 		f.queued = false
+		close(f.queueDone)
 		p.enqueueLocked(s)
 		p.a.mu.Unlock()
 	}
@@ -214,6 +220,7 @@ func (a *SlotAssembler) releasePrefetchLocked(s *slotState) {
 	f.released = true
 	f.cancel()
 	p := f.pool
+	queueDone := f.queueDone
 	p.cleanup.Add(1)
 	go func() {
 		defer p.cleanup.Done()
@@ -222,6 +229,9 @@ func (a *SlotAssembler) releasePrefetchLocked(s *slotState) {
 			if b.verification != nil {
 				b.verification.wait()
 			}
+		}
+		if queueDone != nil {
+			<-queueDone
 		}
 		p.a.mu.Lock()
 		p.slots--
@@ -254,6 +264,10 @@ func (p *entryPrefetchPool) closeAndWait() {
 // invalid optimistic prefix. Unprefetched transactions form one immediately
 // available request, overlapping any early requests still running.
 func verifyDecodedEntryBatches(ctx context.Context, blk *block.Block, batches []*prefetchedShredBatch, verifier *transactionVerifier) error {
+	return verifyDecodedEntryBatchesWithTimings(ctx, blk, batches, verifier, nil)
+}
+
+func verifyDecodedEntryBatchesWithTimings(ctx context.Context, blk *block.Block, batches []*prefetchedShredBatch, verifier *transactionVerifier, timings *entryDecodeTimings) error {
 	type pending struct {
 		future *transactionVerification
 		offset int
@@ -292,6 +306,9 @@ func verifyDecodedEntryBatches(ctx context.Context, blk *block.Block, batches []
 	var err error
 	if len(missing) > 0 {
 		fallback, err = verifier.submitTransactions(ctx, missing)
+		if timings != nil {
+			timings.traceFallback = fallback
+		}
 	}
 	firstIndex := len(blk.Transactions)
 	firstErr := err

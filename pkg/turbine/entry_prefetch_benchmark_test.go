@@ -66,6 +66,7 @@ type assemblyFlowFixture struct {
 	parentID           solana.Hash
 	bankhash           solana.Hash
 	shreds             int
+	holdGap            bool
 }
 
 func makeAssemblyFlowFixture(tb testing.TB, source *block.Block) assemblyFlowFixture {
@@ -165,6 +166,9 @@ func runAssemblyFlowBenchmark(b *testing.B, source *block.Block, fixture assembl
 				time.Sleep(time.Until(started.Add(flowArrivalOffset(componentIndex, len(fixture.components), span))))
 			}
 			for shredIndex, shred := range component {
+				if fixture.holdGap && componentIndex == len(fixture.components)*3/4 && shredIndex == 1 {
+					continue
+				}
 				candidate, err := a.addShredFromWithRoot(shred, false, &fixture.authenticatedRoots[componentIndex][shredIndex])
 				if err != nil {
 					b.Fatal(err)
@@ -176,6 +180,14 @@ func runAssemblyFlowBenchmark(b *testing.B, source *block.Block, fixture assembl
 					work = candidate
 				}
 			}
+		}
+		if fixture.holdGap {
+			ci := len(fixture.components) * 3 / 4
+			candidate, err := a.addShredFromWithRoot(fixture.components[ci][1], false, &fixture.authenticatedRoots[ci][1])
+			if err != nil || candidate == nil || work != nil {
+				b.Fatalf("held gap completion failed: %v", err)
+			}
+			work = candidate
 		}
 		if work == nil {
 			b.Fatal("all generated data shreds did not complete the slot")
@@ -251,6 +263,24 @@ func BenchmarkEntryMessageIdentityArrival(b *testing.B) {
 			}{{"catchup", 0}, {"tip_200ms", 200 * time.Millisecond}} {
 				b.Run(arrival.name, func(b *testing.B) {
 					runAssemblyFlowBenchmark(b, source.blk, fixture, 2, 8, arrival.span, true, true)
+				})
+			}
+		})
+	}
+}
+
+// Holds one data shred in a batch three quarters through the block until the
+// footer has arrived. Other complete batches continue arriving over 200 ms.
+// This isolates discovery behind a gap; it is not a measured network replay.
+func BenchmarkEntryPrefetchGapArrival(b *testing.B) {
+	flowConfigureBackend(b)
+	for _, source := range flowBenchmarkFixtures(b) {
+		b.Run(source.name, func(b *testing.B) {
+			fixture := makeAssemblyFlowFixture(b, source.blk)
+			for _, gap := range []bool{false, true} {
+				b.Run(fmt.Sprintf("gap_%t", gap), func(b *testing.B) {
+					fixture.holdGap = gap
+					runAssemblyFlowBenchmark(b, source.blk, fixture, 2, 8, 200*time.Millisecond, true, true)
 				})
 			}
 		})
