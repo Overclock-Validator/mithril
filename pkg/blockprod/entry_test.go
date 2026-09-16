@@ -106,6 +106,7 @@ func TestEntryBuilderBatchSizingMatchesComponentEncoding(t *testing.T) {
 			limits.MaxBatchBytes = uint64(len(encoded))
 			builder := NewEntryBuilder(limits, solana.Hash{1})
 
+			totalFlushed := 0
 			checkBatch := func(entries []turbine.Entry, batchBytes int, want []solana.Transaction) {
 				t.Helper()
 				require.Len(t, entries, 1)
@@ -115,6 +116,8 @@ func TestEntryBuilderBatchSizingMatchesComponentEncoding(t *testing.T) {
 				encoded, err := turbine.MarshalBlockComponent(component)
 				require.NoError(t, err)
 				require.Equal(t, len(encoded), batchBytes)
+				totalFlushed += batchBytes
+				require.Equal(t, totalFlushed, builder.FlushedBytes())
 			}
 
 			// Repeat after both an automatic and explicit flush to catch stale
@@ -142,6 +145,7 @@ func TestEntryBuilderBatchSizingMatchesComponentEncoding(t *testing.T) {
 				}
 				require.Equal(t, tc.count, builder.PendingCount())
 				require.Equal(t, pendingWire, builder.PendingWireBytes())
+				require.Equal(t, len(encoded), builder.projectedBytes(0))
 				entries, batchBytes, flushed := builder.Append(txns[0], 0)
 				require.True(t, flushed)
 				checkBatch(entries, batchBytes, txns)

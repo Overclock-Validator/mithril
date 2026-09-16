@@ -1,40 +1,13 @@
-# Erasure recovery experiments
+# Fixed-shape FEC recovery
 
-Status: `SlotAssembler` dispatches the fixed 32+32, exactly-one-missing-data
-case to the direct recovery path. Reduced multi-missing and all-coding paths
-remain experimental and are not used by production dispatch.
+Production uses direct recovery only for exactly one missing data shard in a
+32-data/32-coding FEC set with an available coding shard. All other availability
+patterns keep the general decoder. Recovery still passes ordinary packet/root
+validation before assembler admission.
 
-The end-to-end deterministic harness that drives production repair selection,
-assembly, storage, and completion is documented in [repair_sim.md](repair_sim.md).
-
-This document separates two repair regimes that have different objectives. It
-also records the fixed 32 data + 32 coding Reed-Solomon contract used by the
-synthetic implementation in `pkg/turbine/internal/rsrecover`.
-
-## Regimes
-
-Near-tip repair minimizes the time until replay receives a particular blocking
-data shred. Its primary candidate is direct recovery when exactly one data
-shred is absent and at least one coding shred is present.
-
-Catch-up repair minimizes useful recovered-data time across many incomplete FEC
-sets. Its candidate constructs only the reduced system induced by the missing
-data columns and produces only missing data outputs.
-
-Slot age alone should not select the regime. A future policy experiment should
-consume observed Turbine progress:
-
-- number and fraction of incomplete FEC sets;
-- missing data shreds per FEC set;
-- whether new shreds are still arriving;
-- time or scheduling intervals since the last useful arrival;
-- number of FEC sets that have crossed the recovery threshold;
-- data-heavy versus coding-heavy availability.
-
-A progressing slot with one or two holes remains a near-tip workload even if it
-is not the newest slot. A stalled slot with many incomplete FEC sets is a
-catch-up workload even if wall-clock age is modest. Any eventual selector needs
-hysteresis so bursty arrivals cannot oscillate the algorithm on every packet.
+The deterministic production-path harness is described in [repair_sim.md](repair_sim.md).
+Reduced-subset and all-coding plans remain reference benchmarks, not runtime
+policies. Historical investigation notes are in the [evidence archive](fec-producer-evidence.md).
 
 ## Matrix contract
 
@@ -156,30 +129,3 @@ enter it and remain effectively neutral, while the near-tip workload benefits
 from repeated exactly-one-missing recoveries. The one-missing boundary also
 dropped from 144 to 5 allocations per operation.
 
-## Preliminary Apple M4 Pro diagnostic
-
-These single-sample medians use 987-byte shards and exist only to reject or
-retain candidates before the amd64 gate. Times are microseconds per FEC set.
-
-| Missing data | Specialized first use | Specialized prepared | General uncached | General cached |
-|---:|---:|---:|---:|---:|
-| 1 | 1.97 | 1.07 | 8.36 | 2.31 |
-| 2 | 4.19 | 2.10 | 10.78 | 3.39 |
-| 4 | 8.84 | 4.19 | 17.00 | 5.91 |
-| 8 | 18.94 | 8.24 | 25.54 | 10.06 |
-| 16 | 39.90 | 16.44 | 44.93 | 19.78 |
-| 24 | 62.14 | 24.71 | 63.43 | 28.55 |
-| 32 | 79.50 | 32.76 | 89.53 | 37.53 |
-
-The all-coding involution arm measured approximately 36.5 microseconds,
-compared with 82.7 microseconds for an uncached general decode and 37.5
-microseconds for its cached form. Its main possible value is avoiding plan
-setup; the prepared reduced-system byte path was faster on this machine.
-
-The current interpretation is deliberately conditional:
-
-- direct one-data recovery is strong enough to require an amd64 prototype;
-- reduced-system first use wins through most of the tested range, but the
-  24-missing crossover is within noise on this machine;
-- prepared reduced-system execution wins at every tested width;
-- none of these figures establishes a production policy or Zen 5 result.
