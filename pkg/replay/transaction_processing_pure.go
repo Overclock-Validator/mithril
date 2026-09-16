@@ -42,6 +42,7 @@ type LoadAndExecuteTransactionInput struct {
 	// timings for leader execution. Replay and simulation retain their default
 	// instrumentation; program-specific instrumentation is independent.
 	SkipTimingMetrics bool
+	TimingSample      metrics.TxTimingSample
 	// CapturePreBalances retains pre-fee balances in lean mode. Rich mode
 	// always captures them for RPC compatibility.
 	CapturePreBalances bool
@@ -130,27 +131,12 @@ func LoadAndExecuteTransaction(input LoadAndExecuteTransactionInput) LoadAndExec
 	return loadAndExecuteTransaction(input, nil)
 }
 
-// txTimingEnabled decides once per transaction whether its transaction- and
-// instruction-level timers are recorded: never for leader execution, and
-// otherwise for the sampled subset chosen by metrics.TxTimingSampled (see
-// metrics.TxTimingSampleShift; shift 0 records every transaction).
-func txTimingEnabled(input *LoadAndExecuteTransactionInput) bool {
-	if input.SkipTimingMetrics {
-		return false
-	}
-	if tx := input.Transaction; tx != nil && len(tx.Signatures) > 0 {
-		return metrics.TxTimingSampled(tx.Signatures[0][:])
-	}
-	return metrics.TxTimingSampled(nil)
-}
-
-// txTimingSampled is txTimingEnabled for replay-side callers that only hold the
-// transaction (divergence checks and state publication in ProcessTransaction).
-func txTimingSampled(tx *solana.Transaction) bool {
+// txTimingSample captures a decision once, including for unsigned simulations.
+func txTimingSample(tx *solana.Transaction) metrics.TxTimingSample {
 	if tx != nil && len(tx.Signatures) > 0 {
-		return metrics.TxTimingSampled(tx.Signatures[0][:])
+		return metrics.CaptureTxTiming(tx.Signatures[0][:])
 	}
-	return metrics.TxTimingSampled(nil)
+	return metrics.CaptureTxTiming(nil)
 }
 
 func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *PreparedTransaction) LoadAndExecuteTransactionOutput {
@@ -169,7 +155,11 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 	// One sampling decision covers every transaction- and instruction-level
 	// timer below, including the dispatch and sBPF timers reached through
 	// execCtx. Leader execution (SkipTimingMetrics) records nothing.
-	recordTiming := txTimingEnabled(&input)
+	sample := input.TimingSample
+	if !sample.Valid {
+		sample = txTimingSample(tx)
+	}
+	recordTiming := !input.SkipTimingMetrics && sample.Sampled
 	start := metrics.StartTiming(false)
 	if prepared != nil {
 		instrs, instructionAcctsPerInstr, txAcctMetas = prepared.instrs, prepared.instructionAccts, prepared.accountMetas
@@ -216,7 +206,7 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 				},
 			}
 		}
-		metrics.GlobalBlockReplay.InstructionsAndAccountMetasFromTx.AddSampledTimingSince(start)
+		metrics.GlobalBlockReplay.InstructionsAndAccountMetasFromTx.AddSampledTimingSince(start, sample.Shift)
 
 		// Compute budget limits
 		start = metrics.StartTiming(recordTiming)
@@ -232,7 +222,7 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 				Instrs: instrs,
 			}
 		}
-		metrics.GlobalBlockReplay.ComputeBudgetExecutionInstructions.AddSampledTimingSince(start)
+		metrics.GlobalBlockReplay.ComputeBudgetExecutionInstructions.AddSampledTimingSince(start, sample.Shift)
 
 	}
 
@@ -335,7 +325,7 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 		baseFields(&out)
 		return out
 	}
-	metrics.GlobalBlockReplay.AccountsFromTx.AddSampledTimingSince(start)
+	metrics.GlobalBlockReplay.AccountsFromTx.AddSampledTimingSince(start, sample.Shift)
 
 	// Create execution context
 	var logRecorder *sealevel.LogRecorder
@@ -350,6 +340,7 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 	execCtx.TransactionContext.BorrowedAccountArena = input.Arena
 	execCtx.IsSimulation = input.IsSimulation
 	execCtx.SkipTimingMetrics = !recordTiming
+	execCtx.TimingSampleShift = sample.Shift
 	execCtx.RecordInnerInstructions = input.RecordInnerInstructions
 
 	// Capture pre-balance lamports (before fee deduction)
@@ -399,7 +390,7 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 		baseFields(&out)
 		return out
 	}
-	metrics.GlobalBlockReplay.CalcAndDeductFees.AddSampledTimingSince(start)
+	metrics.GlobalBlockReplay.CalcAndDeductFees.AddSampledTimingSince(start, sample.Shift)
 
 	// Read rent sysvar
 	start = metrics.StartTiming(recordTiming)
@@ -418,13 +409,13 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 			ComputeBudgetLimits: computeBudgetLimits,
 		}
 	}
-	metrics.GlobalBlockReplay.ReadRentSysvar.AddSampledTimingSince(start)
+	metrics.GlobalBlockReplay.ReadRentSysvar.AddSampledTimingSince(start, sample.Shift)
 
 	// Set rent-exempt rent epoch max and compute pre-tx rent states
 	start = metrics.StartTiming(recordTiming)
 	rent.MaybeSetRentExemptRentEpochMax(slotCtx, &rentSysvar, &execCtx.Features, &execCtx.TransactionContext.Accounts)
 	preTxRentStates := rent.NewRentStateInfo(&rentSysvar, execCtx.TransactionContext, &execCtx.Features)
-	metrics.GlobalBlockReplay.PreTxRentStates.AddSampledTimingSince(start)
+	metrics.GlobalBlockReplay.PreTxRentStates.AddSampledTimingSince(start, sample.Shift)
 
 	// Execute all instructions
 	var instrErr error
@@ -438,7 +429,7 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 				instrErr = err
 				break
 			}
-			metrics.GlobalBlockReplay.FixupInstructionsSysvarAccount.AddSampledTimingSince(ixStart)
+			metrics.GlobalBlockReplay.FixupInstructionsSysvarAccount.AddSampledTimingSince(ixStart, sample.Shift)
 		}
 
 		instructionAccts := instructionAcctsPerInstr[instrIdx]
@@ -465,13 +456,13 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 			break
 		}
 	}
-	metrics.GlobalBlockReplay.IxLoop.AddSampledTimingSince(start)
+	metrics.GlobalBlockReplay.IxLoop.AddSampledTimingSince(start, sample.Shift)
 
 	// Check rent state transitions
 	start = metrics.StartTiming(recordTiming)
 	postTxRentStates := rent.NewRentStateInfo(&rentSysvar, execCtx.TransactionContext, &execCtx.Features)
 	rentStateErr := rent.VerifyRentStateChanges(preTxRentStates, postTxRentStates, execCtx.TransactionContext)
-	metrics.GlobalBlockReplay.PostTxRentStates.AddSampledTimingSince(start)
+	metrics.GlobalBlockReplay.PostTxRentStates.AddSampledTimingSince(start, sample.Shift)
 
 	// If there was an error, return failed transaction result
 	if instrErr != nil || rentStateErr != nil {

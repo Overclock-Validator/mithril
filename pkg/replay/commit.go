@@ -26,12 +26,12 @@ func applySuccessfulTransactionState(slotCtx *sealevel.SlotCtx, execCtx *sealeve
 	if executionResult != nil && !accountsDeltaHashRemoved(slotCtx) {
 		writableStart := metrics.StartTiming(recordTimers)
 		slotCtx.RecordWritableAccts(executionResult.WritableAccounts)
-		metrics.GlobalBlockReplay.TxPublishRecordWritableAcct.AddSampledTimingSince(writableStart)
+		metrics.GlobalBlockReplay.TxPublishRecordWritableAcct.AddSampledTimingSince(writableStart, execCtx.TimingSampleShift)
 	}
 
 	touchedStart := metrics.StartTiming(recordTimers)
 	stats := handleModifiedAccounts(slotCtx, execCtx)
-	metrics.GlobalBlockReplay.TxPublishTouchedAccountState.AddSampledTimingSince(touchedStart)
+	metrics.GlobalBlockReplay.TxPublishTouchedAccountState.AddSampledTimingSince(touchedStart, execCtx.TimingSampleShift)
 	if recordCounters {
 		atomic.AddUint64(&metrics.GlobalBlockReplay.TxPublicationTouchedAccounts, stats.touchedAccounts)
 		atomic.AddUint64(&metrics.GlobalBlockReplay.TxPublicationTouchedAccountBytes, stats.touchedAccountBytes)
@@ -43,7 +43,7 @@ func applySuccessfulTransactionState(slotCtx *sealevel.SlotCtx, execCtx *sealeve
 	} else {
 		recordStakeAndVoteAccounts(slotCtx, execCtx, executionResult.WritableAccountSet)
 	}
-	metrics.GlobalBlockReplay.TxPublishStakeVoteBookkeeping.AddSampledTimingSince(stakeVoteStart)
+	metrics.GlobalBlockReplay.TxPublishStakeVoteBookkeeping.AddSampledTimingSince(stakeVoteStart, execCtx.TimingSampleShift)
 	return nil
 }
 

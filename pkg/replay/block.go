@@ -2506,7 +2506,7 @@ func ReplayBlocks(
 		// The collector is per replay attempt. Discarded candidates, skipped
 		// slots, and typed-recovery exits must never leak timings into the next
 		// successfully written slot (including a later ReplayBlocks invocation).
-		metrics.GlobalBlockReplay = metrics.BlockReplay{}
+		metrics.GlobalBlockReplay = metrics.BlockReplay{TxTimingSampleShift: metrics.TxTimingSampleShift(), TxTimingsEstimated: metrics.TxTimingSampleShift() != 0}
 		if ctx.Err() != nil {
 			mlog.Log.Infof("context cancelled, stopping replay: %v", ctx.Err())
 			result.WasCancelled = true
@@ -3497,7 +3497,7 @@ func ReplayBlocks(
 				}
 			}
 			statsd.SendBlockReplayMetrics(metrics.GlobalBlockReplay)
-			metrics.GlobalBlockReplay = metrics.BlockReplay{}
+			metrics.GlobalBlockReplay = metrics.BlockReplay{TxTimingSampleShift: metrics.TxTimingSampleShift(), TxTimingsEstimated: metrics.TxTimingSampleShift() != 0}
 		}
 
 	}

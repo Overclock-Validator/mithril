@@ -686,23 +686,7 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 
 	// Helper to get int: CLI flag if explicitly set, then TOML config, then flag default
 	getInt := func(cliKey, tomlKey string) int {
-		if flagChanged(cliKey) {
-			if f := cmd.Flags().Lookup(cliKey); f != nil {
-				if v, err := strconv.Atoi(f.Value.String()); err == nil {
-					return v
-				}
-			}
-		}
-		if config.IsSet(tomlKey) {
-			return config.GetInt(tomlKey)
-		}
-		// Fall back to flag default value
-		if f := cmd.Flags().Lookup(cliKey); f != nil {
-			if v, err := strconv.Atoi(f.DefValue); err == nil {
-				return v
-			}
-		}
-		return 0
+		return resolveIntOption(cmd.Flags().Lookup(cliKey), config.IsSet(tomlKey), config.GetInt(tomlKey))
 	}
 
 	// Helper to get int64: CLI flag if explicitly set, then TOML config, then flag default

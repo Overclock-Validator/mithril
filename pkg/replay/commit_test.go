@@ -572,6 +572,7 @@ func TestProcessTransactionTimingSampling(t *testing.T) {
 			got := metrics.GlobalBlockReplay
 			assert.Equal(t, uint64(2), got.TxPublicationTouchedAccounts, "touched-account counters stay exact")
 			if !test.sampled {
+				assert.Zero(t, got.TxTimingSampledTransactions)
 				assert.Zero(t, got.AccountsFromTx.Count)
 				assert.Zero(t, got.IxLoop.Count)
 				assert.Zero(t, got.GetNextIxCtx.Count)
@@ -580,6 +581,7 @@ func TestProcessTransactionTimingSampling(t *testing.T) {
 				assert.Zero(t, got.TxPublishTouchedAccountState.Count)
 				return
 			}
+			assert.Equal(t, uint64(1), got.TxTimingSampledTransactions)
 			assert.Equal(t, uint64(8), got.AccountsFromTx.Count)
 			assert.Equal(t, uint64(8), got.IxLoop.Count)
 			assert.Equal(t, uint64(8), got.GetNextIxCtx.Count)

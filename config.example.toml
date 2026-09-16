@@ -548,11 +548,11 @@ name = "mithril"
     # Replay records the per-transaction and per-instruction timers in
     # replay_timings.jsonl (AccountsFromTx, IxLoop, ExecIxNativeProgram*,
     # SbpfInterpreterRun, TxUpdateAccounts, ...) for 1 in 2^N transactions,
-    # chosen by signature, and scales the samples back up so per-block sums
-    # keep their meaning. 0 records every transaction (exact, ~2 clock reads
+    # chosen by signature, and scales them into estimates of aggregate worker time, not wall-clock
+    # latency. JSONL metadata identifies the sampling rate and sampled count. 0 records every transaction (exact, ~2 clock reads
     # and 2 contended atomics per timer); 3 samples one in eight. Max 7.
     # Block-level timers and the touched-account counters are never sampled.
-    tx_timing_sample_shift = 3
+    tx_timing_sample_shift = 0
 
     # Number of goroutines to store modified accounts at the end of each block
     store_accounts_workers = 128

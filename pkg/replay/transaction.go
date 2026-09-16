@@ -8,6 +8,7 @@ import (
 	"runtime/trace"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
@@ -654,9 +655,12 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 
 	debugTx := len(tx.Signatures) > 0 && dbgOpts != nil && dbgOpts.IsDebugTx(tx.Signatures[0])
 	captureTx := len(tx.Signatures) > 0 && txCaptureActive()
-	// The same signature-derived decision LoadAndExecuteTransaction makes for
-	// its own timers, so a sampled transaction is recorded end to end.
-	recordTiming := txTimingSampled(tx)
+	// Capture once and propagate through execution and publication.
+	sample := txTimingSample(tx)
+	recordTiming := sample.Sampled
+	if slotCtx.Replay && recordTiming {
+		atomic.AddUint64(&metrics.GlobalBlockReplay.TxTimingSampledTransactions, 1)
+	}
 	if debugTx {
 		mlog.Log.Infof("Turning on debug logs while executing tx %s", tx.Signatures[0])
 		mlog.Log.EnableInfLogging()
@@ -665,11 +669,12 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 
 	// Execute via pure function
 	input := LoadAndExecuteTransactionInput{
-		SlotCtx:     slotCtx,
-		Transaction: tx,
-		Arena:       arena,
-		TxMeta:      txMeta,
-		LeanResult:  true,
+		TimingSample: sample,
+		SlotCtx:      slotCtx,
+		Transaction:  tx,
+		Arena:        arena,
+		TxMeta:       txMeta,
+		LeanResult:   true,
 		// On-chain metadata and the trailing verifier are the only replay
 		// consumers of pre-balances. Ordinary production transactions skip it.
 		CapturePreBalances: txMeta != nil || captureTx,
@@ -700,7 +705,7 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 			}
 		}
 	}
-	metrics.GlobalBlockReplay.PreBalanceDivergenceCheck.AddSampledTimingSince(start)
+	metrics.GlobalBlockReplay.PreBalanceDivergenceCheck.AddSampledTimingSince(start, sample.Shift)
 
 	// Handle transaction errors from the pure function
 	if output.ProcessingResult.TransactionError != nil {
@@ -833,7 +838,7 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 			panic(msg)
 		}
 	}
-	metrics.GlobalBlockReplay.PostBalanceDivergenceCheck.AddSampledTimingSince(start)
+	metrics.GlobalBlockReplay.PostBalanceDivergenceCheck.AddSampledTimingSince(start, sample.Shift)
 
 	// Trailing-verifier capture (successful tx): fee + status + pre AND post
 	// balances, with the native/dummy comparability mask. Read-only walk;
@@ -867,7 +872,7 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 	if err := applySuccessfulTransactionState(slotCtx, execCtx, output.ExecutionResult); err != nil {
 		panic(fmt.Sprintf("unable to apply successful transaction %s in slot %d: %v", tx.Signatures[0], slotCtx.Slot, err))
 	}
-	metrics.GlobalBlockReplay.TxUpdateAccounts.AddSampledTimingSince(start)
+	metrics.GlobalBlockReplay.TxUpdateAccounts.AddSampledTimingSince(start, sample.Shift)
 
 	return txFeeInfo, processTransactionComputeUnits(execCtx), nil
 }

@@ -22,7 +22,7 @@ func TestTxTimingSampledShiftZeroRecordsEverything(t *testing.T) {
 		t.Fatal("shift 0 must sample a missing signature")
 	}
 	var timing Timing
-	timing.AddSampledTiming(5 * time.Nanosecond)
+	timing.AddSampledTiming(5*time.Nanosecond, TxTimingSampleShift())
 	if timing.Count != 1 || timing.SumNanoseconds != 5 {
 		t.Fatalf("shift 0 must not scale: got count %d sum %d", timing.Count, timing.SumNanoseconds)
 	}
@@ -85,15 +85,15 @@ func TestAddSampledTimingScalesToTheUnsampledTotal(t *testing.T) {
 	defer SetTxTimingSampleShift(previous)
 
 	var timing Timing
-	timing.AddSampledTiming(100 * time.Nanosecond)
+	timing.AddSampledTiming(100*time.Nanosecond, TxTimingSampleShift())
 	if timing.Count != 8 || timing.SumNanoseconds != 800 {
 		t.Fatalf("shift 3 must scale by 8: got count %d sum %d", timing.Count, timing.SumNanoseconds)
 	}
-	timing.AddSampledTimingSince(time.Time{})
+	timing.AddSampledTimingSince(time.Time{}, TxTimingSampleShift())
 	if timing.Count != 8 || timing.SumNanoseconds != 800 {
 		t.Fatal("a zero start must record nothing")
 	}
-	timing.AddSampledTimingSince(time.Now().Add(-time.Microsecond))
+	timing.AddSampledTimingSince(time.Now().Add(-time.Microsecond), TxTimingSampleShift())
 	if timing.Count != 16 || timing.SumNanoseconds < 800+8*1000 {
 		t.Fatalf("elapsed sample must be scaled: got count %d sum %d", timing.Count, timing.SumNanoseconds)
 	}
@@ -111,5 +111,34 @@ func TestSetTxTimingSampleShiftClamps(t *testing.T) {
 	}
 	if DefaultTxTimingSampleShift > maxTxTimingSampleShift {
 		t.Fatal("default shift exceeds the clamp")
+	}
+}
+
+func TestCapturedTimingScaleDoesNotChange(t *testing.T) {
+	previous := SetTxTimingSampleShift(3)
+	defer SetTxTimingSampleShift(previous)
+	sig := make([]byte, 64)
+	sig[0] = 8
+	sample := CaptureTxTiming(sig)
+	SetTxTimingSampleShift(0)
+	var got Timing
+	if !sample.Valid || !sample.Sampled || sample.Shift != 3 {
+		t.Fatal(sample)
+	}
+	got.AddSampledTiming(5*time.Nanosecond, sample.Shift)
+	if got.Count != 8 || got.SumNanoseconds != 40 {
+		t.Fatal(got)
+	}
+}
+
+func TestSignatureWithZeroPrefixRemainsDeterministic(t *testing.T) {
+	old := SetTxTimingSampleShift(3)
+	defer SetTxTimingSampleShift(old)
+	sig := make([]byte, 64)
+	sig[63] = 1
+	for i := 0; i < 20; i++ {
+		if !CaptureTxTiming(sig).Sampled {
+			t.Fatal("nonzero signature used unsigned fallback")
+		}
 	}
 }

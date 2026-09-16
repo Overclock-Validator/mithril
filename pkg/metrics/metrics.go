@@ -30,29 +30,11 @@ func (t *Timing) AddTimingSince(start time.Time) {
 	}
 }
 
-// Transaction timing sampling.
-//
-// The per-transaction and per-instruction timers (the "Tx-level" and
-// "Ix-level" BlockReplay fields below) cost two clock reads and two contended
-// atomic adds each, roughly a dozen times per transaction and half a dozen
-// times per instruction, from every executor goroutine at once. On a block of
-// 6,000 System transfers that is comparable to the work being measured.
-//
-// Instead of recording every transaction, replay records one in
-// 2^TxTimingSampleShift of them and scales each sampled observation by
-// 2^TxTimingSampleShift, so per-block sums keep their wall-clock meaning
-// (milliseconds per block, share of ProcessBlock) and Count/SumNanoseconds
-// ratios are unbiased per-call averages; only the variance changes. A shift of
-// zero restores exact, unsampled recording. Block-level timers are never
-// sampled.
-//
-// The choice is made once per transaction by TxTimingSampled so every timer
-// within a transaction, including the instruction dispatch and sBPF timers,
-// sees the same decision. It is derived from the transaction's first
-// signature, so it is stateless, uniform (ed25519 R is a random point), and
-// the same transactions are sampled by every node and every replay of the
-// same block. Transactions without a real signature (RPC simulation) fall back
-// to a round-robin counter.
+// Transaction timing sampling estimates aggregate worker time, not wall-clock
+// latency. Scaled counts and durations are estimates; their ratio is not an
+// unbiased estimator in general. Signature-based selection is reproducible,
+// but senders can deliberately select signatures and bias the sample.
+// Block timers and publication counters remain exact.
 const maxTxTimingSampleShift = 7
 
 var txTimingSampleShift atomic.Uint32
@@ -62,8 +44,8 @@ func init() {
 	txTimingSampleShift.Store(DefaultTxTimingSampleShift)
 }
 
-// DefaultTxTimingSampleShift samples one transaction in eight.
-const DefaultTxTimingSampleShift = 3
+// DefaultTxTimingSampleShift preserves exact transaction timing.
+const DefaultTxTimingSampleShift = 0
 
 // TxTimingSampleShift returns the current sampling shift (0 = every
 // transaction is recorded).
@@ -84,15 +66,34 @@ func SetTxTimingSampleShift(shift uint32) (previous uint32) {
 
 // TxTimingSampled reports whether the transaction with the given first
 // signature records its transaction- and instruction-level timings.
-func TxTimingSampled(sig []byte) bool {
+type TxTimingSample struct {
+	Valid   bool
+	Sampled bool
+	Shift   uint32
+}
+
+// CaptureTxTiming freezes the decision and scale together for one transaction.
+func CaptureTxTiming(sig []byte) TxTimingSample {
 	shift := txTimingSampleShift.Load()
+	return TxTimingSample{Valid: true, Sampled: sampleTxTiming(sig, shift), Shift: shift}
+}
+
+func TxTimingSampled(sig []byte) bool { return CaptureTxTiming(sig).Sampled }
+
+func sampleTxTiming(sig []byte, shift uint32) bool {
 	if shift == 0 {
 		return true
 	}
 	mask := uint64(1)<<shift - 1
 	if len(sig) >= 8 {
-		if r := binary.LittleEndian.Uint64(sig); r != 0 {
+		r := binary.LittleEndian.Uint64(sig)
+		if r != 0 {
 			return r&mask == 0
+		}
+		for _, b := range sig[8:] {
+			if b != 0 {
+				return true
+			}
 		}
 	}
 	return txTimingSampleCounter.Add(1)&mask == 0
@@ -100,17 +101,16 @@ func TxTimingSampled(sig []byte) bool {
 
 // AddSampledTiming records one observation from a sampled transaction, scaled
 // by the sampling rate so that sums over a block estimate the unsampled total.
-func (t *Timing) AddSampledTiming(d time.Duration) {
-	shift := txTimingSampleShift.Load()
+func (t *Timing) AddSampledTiming(d time.Duration, shift uint32) {
 	atomic.AddUint64(&t.Count, 1<<shift)
 	atomic.AddUint64(&t.SumNanoseconds, uint64(d.Nanoseconds())<<shift)
 }
 
 // AddSampledTimingSince is AddTimingSince for timers started with
 // StartTiming(TxTimingSampled(...)): a zero start records nothing.
-func (t *Timing) AddSampledTimingSince(start time.Time) {
+func (t *Timing) AddSampledTimingSince(start time.Time, shift uint32) {
 	if !start.IsZero() {
-		t.AddSampledTiming(time.Since(start))
+		t.AddSampledTiming(time.Since(start), shift)
 	}
 }
 
@@ -232,6 +232,12 @@ type VoteRewardDetails struct {
 
 // Metrics for replaying a single block
 type BlockReplay struct {
+	// TxTimingSampleShift is configured once before replay. Nonzero means the
+	// Tx/Ix timing fields (including their Count fields) contain estimates.
+	TxTimingSampleShift         uint32
+	TxTimingsEstimated          bool
+	TxTimingSampledTransactions uint64
+
 	Slot           uint64
 	AccountLoader  AccountLoader
 	TurbineIngress TurbineIngress
