@@ -153,7 +153,35 @@ func (h *streamingTestHarness) event(batch *turbine.StreamBatch) turbine.StreamE
 	return turbine.StreamEvent{Kind: turbine.StreamBatchReady, Slot: batch.Slot, Generation: batch.Generation, Batch: batch}
 }
 
-func (h *streamingTestHarness) executed() []*solana.Transaction { return h.env.exec.transactions }
+// executed returns the block objects the stream has executed (in order); the
+// bank itself ran stream-owned copies, which are checked to be copies of
+// exactly those objects.
+func (h *streamingTestHarness) executed() []*solana.Transaction {
+	if h.exec.current == nil {
+		return nil
+	}
+	return h.exec.current.origin
+}
+
+// sameCopies asserts that executed holds fresh copies of want, in order: the
+// same signatures and static keys, never the same objects, and never sharing
+// the originals' account-key storage.
+func sameCopies(t *testing.T, want, executed []*solana.Transaction) {
+	t.Helper()
+	require.Len(t, executed, len(want))
+	for i := range want {
+		require.NotSame(t, want[i], executed[i], "transaction %d must be a copy", i)
+		require.Equal(t, want[i].Signatures, executed[i].Signatures, "transaction %d signatures", i)
+		require.Equal(t, want[i].Message.GetVersion(), executed[i].Message.GetVersion())
+		require.Equal(t, want[i].Message.RecentBlockhash, executed[i].Message.RecentBlockhash)
+		if want[i].Message.GetVersion() == solana.MessageVersionV0 {
+			require.False(t, want[i].Message.IsResolved(), "transaction %d: the block's object must stay untouched", i)
+		}
+		if len(want[i].Message.AccountKeys) > 0 {
+			require.NotSame(t, &want[i].Message.AccountKeys[0], &executed[i].Message.AccountKeys[0], "transaction %d shares account-key storage", i)
+		}
+	}
+}
 
 func (h *streamingTestHarness) discardReason() string {
 	return metrics.GlobalBlockReplay.StreamingExecution.DiscardReason
@@ -179,6 +207,7 @@ func TestStreamingConsumeExecutesContiguousGroupsInOrder(t *testing.T) {
 	require.Empty(t, h.executed(), "a gap before the batch holds it")
 	h.exec.handleEvent(h.event(a))
 	sameTransactions(t, txs[0:6], h.executed())
+	sameCopies(t, txs[0:6], h.env.exec.transactions)
 	require.Len(t, h.exec.current.groups, 1, "contiguous batches execute as one group")
 	require.Equal(t, uint32(7), h.exec.current.nextStart)
 
@@ -189,6 +218,7 @@ func TestStreamingConsumeExecutesContiguousGroupsInOrder(t *testing.T) {
 
 	h.exec.handleEvent(h.event(c))
 	sameTransactions(t, txs, h.executed())
+	sameCopies(t, txs, h.env.exec.transactions)
 	require.Len(t, h.exec.current.groups, 2)
 	require.Equal(t, uint32(10), h.exec.current.nextStart)
 	require.Equal(t, uint64(9), h.env.exec.processedTxCount)

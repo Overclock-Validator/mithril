@@ -131,6 +131,10 @@ type streamingSlot struct {
 	parentSlot uint64
 	parentID   solana.Hash
 	exec       *blockExecution
+	// origin holds the block's own transaction objects in executed order;
+	// the bank executes stream-owned copies (see executionCopy), and the
+	// handshake proves the block by these originals.
+	origin     []*solana.Transaction
 	nextStart  uint32
 	pending    map[uint32]*turbine.StreamBatch
 	footerSeen bool
@@ -528,12 +532,22 @@ func (s *streamingExecutor) executeGroup(group []*turbine.StreamBatch) error {
 		// unauthenticated prefix must never do.
 		return errors.New("unverified_batch")
 	}
-	prepared, err := b.PrepareVerifiedTransactionMessageIdentities(txs, verified)
+	// The identities are bound to the block's objects by the verifier; that
+	// binding is checked here, on the originals, before the copies inherit it.
+	preparedForOriginals, err := b.PrepareVerifiedTransactionMessageIdentities(txs, verified)
+	if err != nil {
+		return fmt.Errorf("identities: %w", err)
+	}
+	copies, err := executionCopies(txs)
+	if err != nil {
+		return fmt.Errorf("copies: %w", err)
+	}
+	prepared, err := preparedForOriginals.Rebind(copies)
 	if err != nil {
 		return fmt.Errorf("identities: %w", err)
 	}
 	started := time.Now()
-	err = s.executeFn(cur.exec, txs, prepared, false)
+	err = s.executeFn(cur.exec, copies, prepared, false)
 	cur.exec.setReplayStage("streaming_wait")
 	if err != nil {
 		var duplicates *DuplicateTransactionMessagesError
@@ -545,8 +559,46 @@ func (s *streamingExecutor) executeGroup(group []*turbine.StreamBatch) error {
 		}
 		return fmt.Errorf("group: %w", err)
 	}
+	cur.origin = append(cur.origin, txs...)
 	cur.groups = append(cur.groups, streamingGroup{startedAt: started, finishedAt: time.Now(), transactions: len(txs)})
 	return nil
+}
+
+// errStreamInputResolved reports a batch whose transactions already carry
+// address-table resolution; the assembler never produces one, and a stream
+// must not execute an object whose account keys were derived elsewhere.
+var errStreamInputResolved = errors.New("stream input is already resolved")
+
+// executionCopy returns the object the stream executes in place of a block's
+// own transaction. Execution resolves address-table lookups in place
+// (SetAddressTables refuses a second call; ResolveLookups appends to
+// AccountKeys), so running the block's object would leave it resolved
+// against the stream's parent — and unusable, or worse, wrong, for the
+// whole-block path after a discard. The copy takes the message by value with
+// its own account-key slice; signatures and instructions are shared and never
+// mutated by execution.
+func executionCopy(tx *solana.Transaction) (*solana.Transaction, error) {
+	if tx == nil {
+		return nil, errors.New("nil transaction")
+	}
+	if tx.Message.GetVersion() == solana.MessageVersionV0 && tx.Message.IsResolved() {
+		return nil, errStreamInputResolved
+	}
+	message := tx.Message
+	message.AccountKeys = append(solana.PublicKeySlice(nil), tx.Message.AccountKeys...)
+	return &solana.Transaction{Signatures: tx.Signatures, Message: message}, nil
+}
+
+func executionCopies(txs []*solana.Transaction) ([]*solana.Transaction, error) {
+	copies := make([]*solana.Transaction, len(txs))
+	for i, tx := range txs {
+		dup, err := executionCopy(tx)
+		if err != nil {
+			return nil, fmt.Errorf("transaction %d: %w", i, err)
+		}
+		copies[i] = dup
+	}
+	return copies, nil
 }
 
 // discard throws the in-progress stream away and undoes every side effect it
@@ -644,7 +696,11 @@ func (s *streamingExecutor) finalize(block *b.Block, parentBankSysvars *sealevel
 		s.discard("plan")
 		return nil, false, nil
 	}
-	executed := len(exec.transactions)
+	executed := len(cur.origin)
+	if len(exec.transactions) != executed {
+		s.discard("prefix_bookkeeping")
+		return nil, false, nil
+	}
 	for i := 0; i < executed; i++ {
 		if executionPlan.execute[i] != exec.execute[i] {
 			s.discard("execution_mask")
@@ -755,14 +811,14 @@ func (s *streamingExecutor) handshake(block *b.Block, parentBankSysvars *sealeve
 		return "epoch"
 	case len(block.EpochUpdatedAccts) != 0:
 		return "epoch account updates"
-	case len(block.Transactions) < len(exec.transactions):
+	case len(block.Transactions) < len(cur.origin):
 		return "shorter than executed prefix"
 	}
 	status := s.deps.feed.StreamStatusOf(cur.generation)
 	if status == turbine.StreamGone {
 		return "generation gone"
 	}
-	for i, tx := range exec.transactions {
+	for i, tx := range cur.origin {
 		if block.Transactions[i] != tx {
 			return fmt.Sprintf("transaction %d identity", i)
 		}

@@ -1,7 +1,9 @@
 package replay
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"sort"
 	"testing"
 	"time"
@@ -17,6 +19,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/txfixture"
 	"github.com/Overclock-Validator/mithril/pkg/turbine"
+	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/require"
 )
@@ -196,7 +199,6 @@ func lifecycleOutcomeOf(t *testing.T, slotCtx *sealevel.SlotCtx, tail *lifecycle
 		delta[acct.Key] = acct
 	}
 	require.Contains(t, delta, txfixture.PayerPubkey())
-	require.Contains(t, delta, txfixture.DestPubkey())
 	return lifecycleOutcome{
 		bankhash:      append([]byte(nil), slotCtx.FinalBankhash...),
 		numSignatures: slotCtx.NumSignatures,
@@ -296,7 +298,8 @@ func lifecycleStream(t *testing.T, env *lifecycleEnv, txs []*solana.Transaction,
 		start = end
 	}
 	require.NotNil(t, s.current, "no group may have discarded the stream (%s)", metrics.GlobalBlockReplay.StreamingExecution.DiscardReason)
-	sameTransactions(t, streamed, exec.transactions)
+	sameTransactions(t, streamed, s.current.origin)
+	sameCopies(t, streamed, exec.transactions)
 
 	block := env.block(txs)
 	block.MarkTransactionSignaturesVerified()
@@ -369,7 +372,8 @@ func TestStreamingLifecycleDiscardThenWholeBlock(t *testing.T) {
 		exec: exec, pending: make(map[uint32]*turbine.StreamBatch), openedAt: time.Now(), headerAt: time.Now(), nextStart: 1}
 	s.handleEvent(turbine.StreamEvent{Kind: turbine.StreamBatchReady, Slot: lifecycleSlot, Generation: gen,
 		Batch: turbine.NewDetachedStreamBatch(gen, 1, 5, txs[:5], verifiedIdentities(t, txs[:5]))})
-	sameTransactions(t, txs[:5], exec.transactions)
+	sameTransactions(t, txs[:5], s.current.origin)
+	sameCopies(t, txs[:5], exec.transactions)
 	payerNow, err := exec.slotCtx.GetAccountShared(txfixture.PayerPubkey())
 	require.NoError(t, err)
 	require.Less(t, payerNow.Lamports, uint64(3_200_000), "the overlay saw the executed prefix")
@@ -382,4 +386,198 @@ func TestStreamingLifecycleDiscardThenWholeBlock(t *testing.T) {
 
 	again := lifecycleWholeBlock(t, env, txs, 2)
 	requireSameLifecycleOutcome(t, whole, again)
+}
+
+// V0 / address-lookup-table coverage. Resolving lookups mutates the message
+// object (SetAddressTables refuses a second call; ResolveLookups appends to
+// AccountKeys), so a stream must execute its own copies and leave the block's
+// objects for the whole-block path — which may run them against a different
+// parent, with a different table.
+
+var lifecycleTableKey = solana.PublicKey{0x7A, 0xB1, 0xE0}
+
+// lookupTableAccount is an active address lookup table whose only entry is
+// dest, encoded the way the ALT program stores it.
+func lookupTableAccount(t *testing.T, dest solana.PublicKey) *accounts.Account {
+	t.Helper()
+	var buf bytes.Buffer
+	enc := bin.NewBinEncoder(&buf)
+	require.NoError(t, enc.WriteUint32(sealevel.AddressLookupTableProgramStateLookupTable, bin.LE))
+	authority := txfixture.PayerPubkey()
+	meta := sealevel.LookupTableMeta{DeactivationSlot: ^uint64(0), LastExtendedSlot: 1, Authority: &authority}
+	require.NoError(t, meta.MarshalWithEncoder(enc))
+	require.NoError(t, enc.WriteBytes(dest[:], false))
+	require.Equal(t, sealevel.AddressLookupTableMetaSize+32, buf.Len())
+	return &accounts.Account{Key: lifecycleTableKey, Lamports: 1_000_000, Owner: addresses.AddressLookupTableAddr, Data: buf.Bytes(), RentEpoch: ^uint64(0)}
+}
+
+func systemTransferData(lamports uint64) []byte {
+	data := make([]byte, 12)
+	binary.LittleEndian.PutUint32(data, 2) // SystemInstruction::Transfer
+	binary.LittleEndian.PutUint64(data[4:], lamports)
+	return data
+}
+
+// signedV0TransferViaTableWire is a signed v0 transfer from the fixture payer
+// to entry 0 of lifecycleTableKey (a writable lookup): static keys are the
+// payer and the System program, so the destination is account index 2.
+func signedV0TransferViaTableWire(t *testing.T, seq uint64) []byte {
+	t.Helper()
+	msg := solana.Message{
+		Header:          solana.MessageHeader{NumRequiredSignatures: 1, NumReadonlyUnsignedAccounts: 1},
+		AccountKeys:     solana.PublicKeySlice{txfixture.PayerPubkey(), solana.SystemProgramID},
+		RecentBlockhash: txfixture.TestBlockhash(),
+		Instructions: []solana.CompiledInstruction{{
+			ProgramIDIndex: 1,
+			Accounts:       []uint16{0, 2},
+			Data:           systemTransferData(1_000 + seq),
+		}},
+		AddressTableLookups: solana.MessageAddressTableLookupSlice{{AccountKey: lifecycleTableKey, WritableIndexes: []uint8{0}}},
+	}
+	_, err := msg.SetVersion(solana.MessageVersionV0)
+	require.NoError(t, err)
+	tx := &solana.Transaction{Message: msg}
+	payerKey := txfixture.PayerPrivateKey()
+	_, err = tx.Sign(func(key solana.PublicKey) *solana.PrivateKey {
+		if key.Equals(txfixture.PayerPubkey()) {
+			return &payerKey
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	wire, err := tx.MarshalBinary()
+	require.NoError(t, err)
+	return wire
+}
+
+// decodeTransactions decodes wires the way turbine does, so each call yields
+// fresh, unresolved objects.
+func decodeTransactions(t *testing.T, wires [][]byte) []*solana.Transaction {
+	t.Helper()
+	txs := make([]*solana.Transaction, len(wires))
+	for i, wire := range wires {
+		tx, err := solana.TransactionFromBytes(wire)
+		require.NoError(t, err)
+		require.Equal(t, solana.MessageVersionV0, tx.Message.GetVersion())
+		require.False(t, tx.Message.IsResolved())
+		txs[i] = tx
+	}
+	return txs
+}
+
+// newLifecycleEnvWithTable is newLifecycleEnv with a well-funded payer, the
+// lookup table pointing at dest, and dest as an existing rent-exempt account,
+// so every v0 transfer succeeds and the credited destination shows which
+// table resolved it.
+func newLifecycleEnvWithTable(t *testing.T, dest solana.PublicKey) *lifecycleEnv {
+	t.Helper()
+	env := newLifecycleEnv(t)
+	_ = env.durable.SetAccountWithoutLock(txfixture.PayerPubkey(), &accounts.Account{
+		Key: txfixture.PayerPubkey(), Lamports: 10_000_000_000, Owner: addresses.SystemProgramAddr, RentEpoch: ^uint64(0),
+	})
+	_ = env.durable.SetAccountWithoutLock(dest, &accounts.Account{
+		Key: dest, Lamports: 10_000_000, Owner: addresses.SystemProgramAddr, RentEpoch: ^uint64(0),
+	})
+	_ = env.durable.SetAccountWithoutLock(lifecycleTableKey, lookupTableAccount(t, dest))
+	return env
+}
+
+func TestExecutionCopyLeavesTheBlockObjectUnresolved(t *testing.T) {
+	original := decodeTransactions(t, [][]byte{signedV0TransferViaTableWire(t, 1)})[0]
+	staticKeys := len(original.Message.AccountKeys)
+
+	dup, err := executionCopy(original)
+	require.NoError(t, err)
+	require.NotSame(t, original, dup)
+	require.Equal(t, original.Signatures, dup.Signatures)
+	require.NoError(t, dup.Message.SetAddressTables(map[solana.PublicKey]solana.PublicKeySlice{lifecycleTableKey: {{0xD1}}}))
+	require.NoError(t, dup.Message.ResolveLookups())
+	require.True(t, dup.Message.IsResolved())
+	require.Len(t, dup.Message.AccountKeys, staticKeys+1)
+	require.False(t, original.Message.IsResolved(), "resolving the copy must not resolve the original")
+	require.Len(t, original.Message.AccountKeys, staticKeys)
+	require.NoError(t, original.Message.SetAddressTables(map[solana.PublicKey]solana.PublicKeySlice{lifecycleTableKey: {{0xD2}}}),
+		"the original still accepts its own resolution")
+
+	_, err = executionCopy(dup)
+	require.ErrorIs(t, err, errStreamInputResolved, "a resolved input is never accepted by a stream")
+	_, err = executionCopies([]*solana.Transaction{original, dup})
+	require.ErrorIs(t, err, errStreamInputResolved)
+}
+
+func TestStreamingLifecycleV0LookupsMatchWholeBlock(t *testing.T) {
+	StreamingExecutionCfg = StreamingExecutionConfig{Enabled: true}
+	defer func() { StreamingExecutionCfg = StreamingExecutionConfig{} }()
+	dest := solana.PublicKey{0xDA}
+	wires := make([][]byte, 6)
+	for i := range wires {
+		wires[i] = signedV0TransferViaTableWire(t, uint64(i))
+	}
+	whole := lifecycleWholeBlock(t, newLifecycleEnvWithTable(t, dest), decodeTransactions(t, wires), 2)
+	require.Contains(t, whole.delta, dest)
+	require.Equal(t, uint64(10_000_000+6*1_000+0+1+2+3+4+5), whole.delta[dest].Lamports, "every transfer reached the table's entry")
+
+	orig := decodeTransactions(t, wires)
+	streamed, _ := lifecycleStream(t, newLifecycleEnvWithTable(t, dest), orig, []int{2}, 2, 2)
+	requireSameLifecycleOutcome(t, whole, streamed)
+	for i := 0; i < 4; i++ {
+		require.False(t, orig[i].Message.IsResolved(), "streamed transaction %d ran as a copy", i)
+	}
+	for i := 4; i < 6; i++ {
+		require.True(t, orig[i].Message.IsResolved(), "suffix transaction %d ran as the block's own object, like whole-block execution", i)
+	}
+}
+
+// A v0 prefix executed on a stream against parent A is discarded; the same
+// authoritative objects then execute whole against parent B, whose table
+// names a different destination. The block's objects must still resolve
+// (they were never touched), B's destination must be the one credited, and
+// the result must equal a fresh-decoded whole-block reference on B.
+func TestStreamingLifecycleDiscardedV0PrefixResolvesAgainstTheNewParent(t *testing.T) {
+	StreamingExecutionCfg = StreamingExecutionConfig{Enabled: true}
+	defer func() { StreamingExecutionCfg = StreamingExecutionConfig{} }()
+	destA, destB := solana.PublicKey{0xA1}, solana.PublicKey{0xB2}
+	wires := make([][]byte, 6)
+	for i := range wires {
+		wires[i] = signedV0TransferViaTableWire(t, uint64(10+i))
+	}
+	orig := decodeTransactions(t, wires)
+
+	envA := newLifecycleEnvWithTable(t, destA)
+	tail := &lifecycleTail{durable: envA.durable}
+	statuses := NewTransactionStatusCache()
+	exec := newBlockExecution(envA.acctsDb, envA.block(nil), envA.epochSchedule, 2, nil, &persistedTracker{}, tail, statuses, false, envA.parent)
+	require.NoError(t, exec.open())
+	feed := newFakeStreamFeed()
+	gen := turbine.NewDetachedStreamGeneration(lifecycleSlot)
+	feed.status[gen] = turbine.StreamActive
+	s := newStreamingExecutor(streamingDeps{feed: feed, epochSchedule: envA.epochSchedule, tail: tail, transactionStatuses: statuses})
+	s.current = &streamingSlot{slot: lifecycleSlot, generation: gen, parentSlot: lifecycleParentSlot, parentID: lifecycleParentBlockID,
+		exec: exec, pending: make(map[uint32]*turbine.StreamBatch), openedAt: time.Now(), headerAt: time.Now(), nextStart: 1}
+	s.handleEvent(turbine.StreamEvent{Kind: turbine.StreamBatchReady, Slot: lifecycleSlot, Generation: gen,
+		Batch: turbine.NewDetachedStreamBatch(gen, 1, 4, orig[:4], verifiedIdentities(t, orig[:4]))})
+	require.NotNil(t, s.current, "stream discarded: %s", metrics.GlobalBlockReplay.StreamingExecution.DiscardReason)
+	sameTransactions(t, orig[:4], s.current.origin)
+	sameCopies(t, orig[:4], exec.transactions)
+	creditedA, err := exec.slotCtx.GetAccountShared(destA)
+	require.NoError(t, err)
+	require.Equal(t, uint64(10_000_000+4*1_000+10+11+12+13), creditedA.Lamports, "the stream resolved through A's table")
+	for i, tx := range orig {
+		require.False(t, tx.Message.IsResolved(), "block object %d must be untouched by the stream", i)
+	}
+
+	s.discard("fork_switch")
+	require.Empty(t, tail.added)
+
+	envB := newLifecycleEnvWithTable(t, destB)
+	whole := lifecycleWholeBlock(t, envB, orig, 2)
+	require.Contains(t, whole.delta, destB, "the block's objects resolved through B's table")
+	require.NotContains(t, whole.delta, destA, "nothing of A's resolution survived")
+	require.Equal(t, uint64(10_000_000+6*1_000+10+11+12+13+14+15), whole.delta[destB].Lamports)
+	for i, tx := range orig {
+		require.True(t, tx.Message.IsResolved(), "block object %d was resolved by the whole-block path", i)
+	}
+
+	reference := lifecycleWholeBlock(t, newLifecycleEnvWithTable(t, destB), decodeTransactions(t, wires), 2)
+	requireSameLifecycleOutcome(t, reference, whole)
 }
