@@ -24,6 +24,14 @@ func MemOpConsume(execCtx *ExecutionCtx, n uint64) error {
 // source slice still refers to the previous backing buffer, whose bytes are
 // exactly what the old read-then-write sequence would have copied.
 func memmoveImplInternal(vm sbpf.VM, dst, src, n uint64) error {
+	// Translate intentionally bypasses address validation for zero-length slices;
+	// Read/Write did not. Preserve the old syscall validation and error order.
+	if n == 0 {
+		if err := vm.Read(src, nil); err != nil {
+			return err
+		}
+		return vm.Write(dst, nil)
+	}
 	srcMem, err := vm.Translate(src, n, false)
 	if err != nil {
 		return err

@@ -137,10 +137,11 @@ func TestSyscallMemcmpAndMemset(t *testing.T) {
 	require.Equal(t, int32(0xff)-int32(31), int32(binary.LittleEndian.Uint32(input[96:])))
 
 	// memset 0xab over 33 bytes, then zero over 9 bytes.
+	sentinel := input[97] // The preceding memcmp result overwrote bytes 96..99.
 	_, err = SyscallMemsetImpl(vm, sbpf.VaddrInput+64, 0x1ab, 33)
 	require.NoError(t, err)
 	require.Equal(t, bytes.Repeat([]byte{0xab}, 33), input[64:97])
-	require.Equal(t, byte(97), input[97])
+	require.Equal(t, sentinel, input[97])
 	_, err = SyscallMemsetImpl(vm, sbpf.VaddrInput+70, 0, 9)
 	require.NoError(t, err)
 	require.Equal(t, bytes.Repeat([]byte{0xab}, 6), input[64:70])
@@ -193,6 +194,24 @@ func TestMemsetBytes(t *testing.T) {
 			memsetBytes(mem, c)
 			if !bytes.Equal(mem, bytes.Repeat([]byte{c}, n)) {
 				t.Fatalf("n=%d c=%d: %x", n, c, mem)
+			}
+		}
+	}
+}
+
+func TestSyscallMemoryZeroLengthPreservesValidation(t *testing.T) {
+	for _, src := range []uint64{sbpf.VaddrInput, 0, ^uint64(0)} {
+		for _, dst := range []uint64{sbpf.VaddrInput, sbpf.VaddrProgram, ^uint64(0)} {
+			vm, _ := newMemSyscallVM(t, make([]byte, 32), nil)
+			want := vm.Read(src, nil)
+			if want == nil {
+				want = vm.Write(dst, nil)
+			}
+			got := memmoveImplInternal(vm, dst, src, 0)
+			if want == nil {
+				require.NoError(t, got)
+			} else {
+				require.EqualError(t, got, want.Error())
 			}
 		}
 	}
