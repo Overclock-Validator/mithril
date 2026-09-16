@@ -58,46 +58,55 @@ MITHRIL_PROGRAM_BENCH_DIR=/path/to/pinned-fixtures GOMAXPROCS=1 \
   -benchtime=1s -count=5 -benchmem
 ```
 
-## Recorded Alpenglow blocks
+## Correctness and comparison boundaries
 
-Each run bootstrapped a fresh isolated AccountsDB from the same public full
-snapshot at 4,150,503 and incremental snapshot at 4,231,162. Non-voting RPC replay
-covered slots **4,231,163–4,231,418**: 233 replayed blocks, 23 skipped slots, and
-142 blocks with sBPF execution. It ran with `--txpar 1`, `GOMAXPROCS=1`, CPU 15,
-nice 19. Two paired runs used baseline/candidate then candidate/baseline order.
-The live validator's AccountsDB and configuration were not used or changed.
+The generated-program harness compares return values, errors, CU usage and memory
+for 100,000 programs. Set `SBPF_DIFF_OUT` separately on the reference and candidate
+and compare the files; `SBPF_CHECK_POOL_ZERO=1` also checks reused memory. ARSH and
+verifier semantics changes are excluded from this performance work.
 
-All 233 per-slot bank hashes matched between baseline and candidate in both
-pairs, excluding the run-specific comment header in `bankhash.log`.
+For replay comparisons, use fresh isolated AccountsDBs from the same snapshots,
+identical transaction parallelism, and the same slot interval. Compare normalized
+per-slot bank hashes and slot sets before interpreting timings. Compare exact
+`ProcessBlock` wall-clock timers, not summed instruction/worker timers. Alternate
+run order and retain raw outputs plus commit IDs outside the merge diff.
 
-| Work measured | Pair 1 before → after | Pair 2 before → after |
-|---|---:|---:|
-| All-block median ProcessBlock | 210.34 → 139.08 ms | 206.12 → 142.83 ms |
-| All-block total ProcessBlock | 46.12 → 35.49 s | 45.16 → 35.94 s |
-| sBPF-block median ProcessBlock | 253.17 → 158.95 ms | 232.03 → 164.95 ms |
-| All-block p95 ProcessBlock | 433.13 → 437.99 ms | 420.52 → 442.43 ms |
-| All-block p99 ProcessBlock | 556.05 → 552.07 ms | 607.83 → 568.22 ms |
+The PR description links the recorded Alpenglow replay results and raw evidence.
+Single-core shared-host results do not establish multicore contention or live FAST
+inclusion gains. The baseline has failing legacy BPF-loader tests; do not describe
+a targeted test pass as a complete sealevel-suite pass. `TestInterpreter_Noop` now
+supplies its execution context's compute meter.
 
-The sample includes blocks around 40–46 million CU. Three inspected non-empty
-blocks used the System program, the AogGeA81 hash-loop workload, SPL Token, and
-Memo. This is not evidence for DEX or lending workloads. RPC per-program summaries
-attribute whole-transaction CU to every participating program and must not be
-summed as if they were exclusive per-program execution costs.
+## Optional timing sampling
 
-Whole-block p95 did not improve, and the p99 changes are small/variable. The
-slowest candidate blocks in the first pair contained no sBPF execution; their
-large timers were dispatch and signature verification. These single-CPU replay
-results do not establish a live voting/FAST improvement or production parallel
-replay latency. They exclude network wait from ProcessBlock and are not elapsed
-end-to-end catch-up times.
+Exact timing remains the default. `--tx-timing-sample-shift N` and
+`tuning.tx_timing_sample_shift` accept 0–7. Explicit CLI values, including zero,
+override TOML. At N=3, roughly one in eight signed transactions records detailed
+timers. Each transaction captures one decision and weight, shared by its nested
+instructions. Exact block timers and existing account counters are unchanged.
 
-## Correctness and limits
+JSONL fields `TxTimingSampleShift`, `TxTimingsEstimated`, and
+`TxTimingSampledTransactions` identify the mode and actual selected count. Scaled
+transaction/instruction counts and durations are estimates of aggregate worker
+work, not exact counts or elapsed block latency. Deterministic signature selection
+can be biased by deliberately chosen signatures. Missing/all-zero signatures use
+a local counter fallback for test/unsigned execution.
 
-- Native Zen 5 baseline and candidate differential outputs match for 100,000
-  deterministic generated programs; candidate pool-zero checks pass.
-- Baseline/candidate workload effects and CU charges match. Targeted race tests
-  for the interpreter, loader, and workload harness pass; vet passes.
-- An older `TestInterpreter_Noop` test panics on both the baseline and candidate;
-  therefore no complete sealevel test-suite pass is claimed. Broader conformance
-  testing remains separate from this performance experiment.
-- No candidate was deployed and no validator restart was needed.
+## Memory syscalls and LtHash
+
+Memory syscalls retain CU charges, source-before-destination error order,
+zero-length behavior, memcpy overlap rejection and memmove overlap support.
+Tests cover copy-on-write/growing regions and differential memory/CU results.
+
+LtHash uses AVX2 only when supported by both CPU and OS; other architectures and
+`-tags purego` use portable loops. The vector path preserves 16-bit wraparound and
+in-place operand aliasing. Randomized, unaligned, inverse and fallback tests cover
+both paths. Component speedups are not block-latency speedups.
+
+```sh
+go test ./pkg/metrics ./pkg/lthash ./pkg/sbpf ./pkg/sbpf/loader ./pkg/replay
+go test -tags purego ./pkg/lthash
+go test -race ./pkg/sealevel -run 'TestSyscallMem|TestMemoryCopyDifferential|TestNestedInstructionTimingSampling|TestProgramWorkloadResults'
+SBPF_DIFF_OUT=/tmp/candidate-diff.txt SBPF_CHECK_POOL_ZERO=1 go test ./pkg/sbpf -run TestDifferentialDump -count=1
+go test ./pkg/lthash -run '^$' -bench BenchmarkMix -benchmem -count=5
+```
