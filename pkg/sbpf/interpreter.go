@@ -1186,7 +1186,7 @@ func (ip *Interpreter) translateInternal(addr uint64, size uint64, write bool) (
 		if size == 0 {
 			return emptySlice, nil
 		}
-		if lo+size > uint64(len(ip.ro)) {
+		if lo+size < lo || lo+size > uint64(len(ip.ro)) {
 			return nil, NewExcBadAccess(addr, size, write, "out-of-bounds program read")
 		}
 		return unsafe.Pointer(&ip.ro[lo]), nil
@@ -1203,7 +1203,7 @@ func (ip *Interpreter) translateInternal(addr uint64, size uint64, write bool) (
 		if size == 0 {
 			return emptySlice, nil
 		}
-		if lo+size > uint64(len(ip.heap)) {
+		if lo+size < lo || lo+size > uint64(len(ip.heap)) {
 			return nil, NewExcBadAccess(addr, size, write, "out-of-bounds heap access")
 		}
 		return unsafe.Pointer(&ip.heap[lo]), nil
@@ -1214,7 +1214,7 @@ func (ip *Interpreter) translateInternal(addr uint64, size uint64, write bool) (
 		if len(ip.inputRegions) != 0 {
 			return ip.translateInputRegion(lo, size, write)
 		}
-		if lo+size > uint64(len(ip.input)) {
+		if lo+size < lo || lo+size > uint64(len(ip.input)) {
 			return nil, NewExcBadAccess(addr, size, write, "out-of-bounds input access")
 		}
 		return unsafe.Pointer(&ip.input[lo]), nil
