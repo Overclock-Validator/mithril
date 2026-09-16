@@ -1,6 +1,7 @@
 package sealevel
 
 import (
+	"bytes"
 	"encoding/binary"
 
 	//"github.com/Overclock-Validator/mithril/pkg/mlog"
@@ -15,14 +16,32 @@ func MemOpConsume(execCtx *ExecutionCtx, n uint64) error {
 	return execCtx.ComputeMeter.Consume(cost)
 }
 
-func memmoveImplInternal(vm sbpf.VM, dst, src, n uint64) (err error) {
-	srcBuf := make([]byte, n)
-	err = vm.Read(src, srcBuf)
-	if err != nil {
-		return
+// memmoveImplInternal copies n bytes from src to dst inside the VM without a
+// temporary buffer. The source is translated first so a bad source address is
+// reported before a bad destination, as before. Go's copy has memmove
+// semantics, so overlapping ranges within one region are handled; and when
+// the destination translation grows or copy-on-writes an account region, the
+// source slice still refers to the previous backing buffer, whose bytes are
+// exactly what the old read-then-write sequence would have copied.
+func memmoveImplInternal(vm sbpf.VM, dst, src, n uint64) error {
+	// Translate intentionally bypasses address validation for zero-length slices;
+	// Read/Write did not. Preserve the old syscall validation and error order.
+	if n == 0 {
+		if err := vm.Read(src, nil); err != nil {
+			return err
+		}
+		return vm.Write(dst, nil)
 	}
-	err = vm.Write(dst, srcBuf)
-	return
+	srcMem, err := vm.Translate(src, n, false)
+	if err != nil {
+		return err
+	}
+	dstMem, err := vm.Translate(dst, n, true)
+	if err != nil {
+		return err
+	}
+	copy(dstMem, srcMem)
+	return nil
 }
 
 // SyscallMemcpyImpl is the implementation of the memcpy (sol_memcpy_) syscall.
@@ -76,6 +95,26 @@ func SyscallMemmoveImpl(vm sbpf.VM, dst, src, n uint64) (uint64, error) {
 
 var SyscallMemmove = sbpf.SyscallFunc3(SyscallMemmoveImpl)
 
+// memcmpResult returns the C memcmp result of two equal-length slices: zero
+// when they are equal, otherwise the difference of the first differing bytes
+// as unsigned values, matching Agave's `(b1 as i32) - (b2 as i32)`.
+func memcmpResult(a, b []byte) int32 {
+	if bytes.Equal(a, b) {
+		return 0
+	}
+	// The slices differ: skip equal 8-byte words, then locate the byte.
+	i := 0
+	for i+8 <= len(a) && binary.LittleEndian.Uint64(a[i:]) == binary.LittleEndian.Uint64(b[i:]) {
+		i += 8
+	}
+	for ; i < len(a); i++ {
+		if a[i] != b[i] {
+			return int32(a[i]) - int32(b[i])
+		}
+	}
+	return 0
+}
+
 // SyscallMemcmpImpl is the implementation for the memcmp (sol_memcmp_) syscall.
 func SyscallMemcmpImpl(vm sbpf.VM, addr1, addr2, n, resultAddr uint64) (uint64, error) {
 	//mlog.Log.Debugf("SyscallMemcmp")
@@ -96,15 +135,7 @@ func SyscallMemcmpImpl(vm sbpf.VM, addr1, addr2, n, resultAddr uint64) (uint64, 
 		return syscallErr(err)
 	}
 
-	cmpResult := int32(0)
-	for count := uint64(0); count < n; count++ {
-		b1 := slice1[count]
-		b2 := slice2[count]
-		if b1 != b2 {
-			cmpResult = int32(b1) - int32(b2)
-			break
-		}
-	}
+	cmpResult := memcmpResult(slice1, slice2)
 
 	resultSlice, err := vm.Translate(resultAddr, 4, true)
 	if err != nil {
@@ -118,7 +149,23 @@ func SyscallMemcmpImpl(vm sbpf.VM, addr1, addr2, n, resultAddr uint64) (uint64, 
 
 var SyscallMemcmp = sbpf.SyscallFunc4(SyscallMemcmpImpl)
 
-// SyscallMemcmpImpl is the implementation for the memset (sol_memset_) syscall.
+// memsetBytes fills mem with c using the runtime's block clear for zero and a
+// doubling copy otherwise, instead of a byte-at-a-time loop.
+func memsetBytes(mem []byte, c byte) {
+	if len(mem) == 0 {
+		return
+	}
+	if c == 0 {
+		clear(mem)
+		return
+	}
+	mem[0] = c
+	for filled := 1; filled < len(mem); filled *= 2 {
+		copy(mem[filled:], mem[:filled])
+	}
+}
+
+// SyscallMemsetImpl is the implementation for the memset (sol_memset_) syscall.
 func SyscallMemsetImpl(vm sbpf.VM, dst, c, n uint64) (uint64, error) {
 	//mlog.Log.Debugf("SyscallMemset")
 
@@ -133,16 +180,14 @@ func SyscallMemsetImpl(vm sbpf.VM, dst, c, n uint64) (uint64, error) {
 		return syscallErr(err)
 	}
 
-	for i := uint64(0); i < n; i++ {
-		mem[i] = byte(c)
-	}
+	memsetBytes(mem, byte(c))
 
 	return syscallSuccess(0)
 }
 
 var SyscallMemset = sbpf.SyscallFunc3(SyscallMemsetImpl)
 
-// SyscallMemcmpImpl is the implementation for the memset (sol_memset_) syscall.
+// SyscallAllocFreeImpl is the implementation for the alloc/free (sol_alloc_free_) syscall.
 func SyscallAllocFreeImpl(vm sbpf.VM, size, freeAddr uint64) (uint64, error) {
 	//mlog.Log.Debugf("SyscallAllocFreeImpl")
 

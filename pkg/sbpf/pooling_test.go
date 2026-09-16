@@ -30,14 +30,28 @@ func TestPooledVMIsolationAcrossNestedAndConcurrentExecutions(t *testing.T) {
 					!bytes.Equal(parent.stack.mem, make([]byte, len(parent.stack.mem))) {
 					t.Error("pooled VM exposed data from an earlier execution")
 				}
-				parent.heap[0] = byte(worker + 1)
-				parent.stack.mem[0] = byte(worker + 1)
-				child := poolingInterpreter(256 * 1024)
-				for j := range child.heap {
-					child.heap[j] = 0xab
+				// Write through the VM's translation layer, as programs and
+				// syscalls do: the pool only re-zeroes memory the VM saw written.
+				if err := parent.Write8(VaddrHeap, byte(worker+1)); err != nil {
+					t.Error(err)
 				}
-				for j := range child.stack.mem {
-					child.stack.mem[j] = 0xcd
+				if err := parent.Write8(VaddrStack, byte(worker+1)); err != nil {
+					t.Error(err)
+				}
+				child := poolingInterpreter(256 * 1024)
+				childHeap, err := child.Translate(VaddrHeap, uint64(len(child.heap)), true)
+				if err != nil {
+					t.Error(err)
+				}
+				for j := range childHeap {
+					childHeap[j] = 0xab
+				}
+				childStack, err := child.Translate(VaddrStack, StackMax, true)
+				if err != nil {
+					t.Error(err)
+				}
+				for j := range childStack {
+					childStack[j] = 0xcd
 				}
 				child.Finish()
 				if parent.heap[0] != byte(worker+1) || parent.stack.mem[0] != byte(worker+1) {

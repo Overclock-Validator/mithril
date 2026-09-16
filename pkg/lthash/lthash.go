@@ -120,16 +120,15 @@ func (ltHash *LtHash) Clone() *LtHash {
 	return new
 }
 
+// MixIn adds other's 1024 lanes to ltHash, lane-wise modulo 2^16. The
+// lane arithmetic is vectorized where the platform supports it (see mix.go).
 func (ltHash *LtHash) MixIn(other *LtHash) {
-	for i := range numElements {
-		ltHash.value[i] = ltHash.value[i] + other.value[i]
-	}
+	mixIn(&ltHash.value, &other.value)
 }
 
+// MixOut subtracts other's lanes from ltHash, the inverse of MixIn.
 func (ltHash *LtHash) MixOut(other *LtHash) {
-	for i := range numElements {
-		ltHash.value[i] = ltHash.value[i] - other.value[i]
-	}
+	mixOut(&ltHash.value, &other.value)
 }
 
 func (ltHash *LtHash) Add(other *LtHash) *LtHash {
@@ -143,12 +142,7 @@ func (ltHash *LtHash) Sub(other *LtHash) *LtHash {
 }
 
 func (ltHash *LtHash) Equals(other *LtHash) bool {
-	for i, element := range ltHash.value {
-		if element != other.value[i] {
-			return false
-		}
-	}
-	return true
+	return ltHash.value == other.value
 }
 
 func (ltHash *LtHash) Checksum() []byte {
