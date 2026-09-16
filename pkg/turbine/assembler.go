@@ -1414,7 +1414,12 @@ func (a *SlotAssembler) recoverFEC(state *slotState, fecSetIndex uint32) ([]*Shr
 		if err != nil {
 			return nil, err
 		}
-		return []*Shred{shred}, nil
+		shards[missingDataIndex] = dst
+		recovered := []*Shred{shred}
+		if err := a.authenticateRecoveredFEC(fec, shards, recovered); err != nil {
+			return nil, err
+		}
+		return recovered, nil
 	}
 
 	required := make([]bool, int(layout.dataShreds)+int(layout.codingShreds))
@@ -1446,6 +1451,9 @@ func (a *SlotAssembler) recoverFEC(state *slotState, fecSetIndex uint32) ([]*Shr
 			return nil, err
 		}
 		recovered = append(recovered, shred)
+	}
+	if err := a.authenticateRecoveredFEC(fec, shards, recovered); err != nil {
+		return nil, err
 	}
 	return recovered, nil
 }
