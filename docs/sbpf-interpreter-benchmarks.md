@@ -1,40 +1,11 @@
-# Interpreter performance validation
+# Execution performance validation
 
-This experiment compares `9db7dcb` plus identical benchmark code with the same
-base plus the interpreter changes in `2ed5e533`. The separate arithmetic-shift
-semantics patch is excluded. Three VASA tests were updated to pass the new
-`*[16]uint64` register type; no further production optimization was added during
-this measurement pass.
+## Program workloads
 
-## Individual programs
-
-Zen 5 / Ryzen 7 9700X, Go 1.26.4, `GOMAXPROCS=1`, CPU 15, nice 19, five
-one-second samples per variant with alternating run order. The existing validator
-continued running. CPU 15 shares a physical core with CPU 7; these are shared-host
-measurements rather than an isolated-machine throughput ceiling.
-
-The harness has a preloaded program cache and asserts a cache hit before timing.
-Every invocation gets fresh account data and execution context. It measures
-instruction setup, serialization, execution and publication together; it is not
-just the interpreter loop. Timing instrumentation and instruction recording are
-enabled identically on both versions. Tests check arithmetic return values,
-post-transfer balances, allocation results, and recorded CPI. Requested budgets
-are equal and the measured CU charges match between variants.
-
-| Workload | CU | Median before → after | Speedup |
-|---|---:|---:|---:|
-| Token-2022 TransferChecked, no extensions | 1,720 | 19.52 → 13.70 µs | 1.42× |
-| Same, VASA | 1,720 | 21.78 → 16.11 µs | 1.35× |
-| Arithmetic, 500 iterations | 5,631 | 20.91 → 12.71 µs | 1.65× |
-| Arithmetic, 5,000 iterations | 55,131 | 167.24 → 94.55 µs | 1.77× |
-| Rust CPI to System Allocate | 2,346 | 16.75 → 13.77 µs | 1.22× |
-| Same, VASA | 2,346 | 18.97 → 15.50 µs | 1.22× |
-| BPF lamport-transfer fixture | 2,895 | 22.09 → 17.57 µs | 1.26× |
-
-The arithmetic VASA cases measured 20.09 → 12.07 µs and 170.24 → 97.90 µs.
-The BPF lamport-transfer VASA case measured 23.92 → 20.33 µs. These differ from
-the earlier SPL Token loader-only benchmark: they use different program binaries,
-instructions, and include execution-context setup.
+The program harness measures instruction setup, serialization, execution and
+publication with a warm program cache and fresh account data per invocation.
+It checks return values, account updates, CPI and CU consumption. Loader-only
+benchmarks separately measure VM execution and program loading.
 
 Set `MITHRIL_PROGRAM_BENCH_DIR` to a directory containing `rotation_compute.so`
 and `token2022.so` to enable those external fixtures. Without it, the in-repository
@@ -71,11 +42,9 @@ per-slot bank hashes and slot sets before interpreting timings. Compare exact
 `ProcessBlock` wall-clock timers, not summed instruction/worker timers. Alternate
 run order and retain raw outputs plus commit IDs outside the merge diff.
 
-The PR description links the recorded Alpenglow replay results and raw evidence.
+Record tested commit IDs, hardware, Go version, affinity and parallelism with results.
 Single-core shared-host results do not establish multicore contention or live FAST
-inclusion gains. The baseline has failing legacy BPF-loader tests; do not describe
-a targeted test pass as a complete sealevel-suite pass. `TestInterpreter_Noop` now
-supplies its execution context's compute meter.
+inclusion gains.
 
 ## Memory syscalls and LtHash
 
@@ -89,7 +58,7 @@ in-place operand aliasing. Randomized, unaligned, inverse and fallback tests cov
 both paths. Component speedups are not block-latency speedups.
 
 ```sh
-go test ./pkg/metrics ./pkg/lthash ./pkg/sbpf ./pkg/sbpf/loader ./pkg/replay
+go test ./pkg/lthash ./pkg/sbpf ./pkg/sbpf/loader
 go test -tags purego ./pkg/lthash
 go test -race ./pkg/sealevel -run 'TestSyscallMem|TestMemoryCopyDifferential|TestProgramWorkloadResults'
 SBPF_DIFF_OUT=/tmp/candidate-diff.txt SBPF_CHECK_POOL_ZERO=1 go test ./pkg/sbpf -run TestDifferentialDump -count=1
