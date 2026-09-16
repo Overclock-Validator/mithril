@@ -19,6 +19,6 @@ Fresh local Alpenglow, consensus, block-production and node race suites passed, 
 
 [Historical benchmark evidence](https://github.com/Overclock-Validator/mithril/tree/54b233ff0e27fb929644f7d53bf4a699cb590cd8/docs/results) is preserved outside the proposed merge; reusable benchmarks and maintained contracts remain in source.
 
-Stacked on `7layer/review-certificate-processing`, which includes #278 at `e1204b32`. Review this diff against that parent.
+Stacked on `7layer/review-certificate-processing`, which now targets `alpenglow-dev` directly. Review this diff against that parent.
 
 [Rebased validation and exact source heads](https://github.com/Overclock-Validator/mithril/blob/7layer/review-integration-20260915/docs/results/review-preparation/2026-09-16/README.md).
