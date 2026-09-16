@@ -42,18 +42,9 @@ measurements, not end-to-end Root/replay or a prediction of live FAST scores.
 
 Run `go test ./pkg/replay -run '^$' -bench '^BenchmarkTransactionStatusBatchExpiry$' -benchtime=1x -count=2`.
 
-Prepared on `7layer/status-expiry-performance` above the isolated Votor fix.
-This source is not the exact live FEC-integrated source. No deployment or public
-PR change is implied by these local results.
+## Native benchmark
 
-## Zen 5 validation — 20:05 UTC
-
-Native AMD Ryzen 7 9700X tests used an isolated copy of the preserved live
-FEC-integrated source at `/srv/mithril-status-expiry-test-20260914/source`.
-The original status-cache file was byte-identical to the change's parent.
-Only the reviewed cache source and new tests were overlaid, with SHA256 checks.
-The full replay race suite passed (2.189 s), and vet passed. No binary was deployed.
-
+Ryzen 7 9700X, Go 1.26.4, original per-key expiry versus batched expiry.
 Benchmarks ran with GOMAXPROCS=2, nice=15, one caller and three iterations per
 case, while the validator and loader remained active. Setup and later GC are
 excluded from the expiry timer. Each case expires 4,321,280 entries (128 banks
@@ -66,7 +57,5 @@ live stall samples and are not an end-to-end replay or FAST-score comparison.
 | One fully expired blockhash group | 700–718 ms | 0.024–0.031 ms |
 | Group crossing the retention boundary | 717–735 ms | 1.85–2.05 ms |
 
-At 20:05:13 UTC the enrolled validator PID 291548 was at RPC/local slot 3,708,093,
-last vote 3,708,092. Loader unpaused; validator, loader, FAST and Titan services
-all active. Source/implementation and deployment status remain unchanged.
-See zen5-benchmark.log, zen5-race.log, zen5-vet.log and zen5-health.json.
+[Historical evidence](status-checkpoint-expiry-evidence.md) preserves the original
+source revisions, raw measurements and validation.
