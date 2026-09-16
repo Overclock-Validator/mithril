@@ -131,3 +131,24 @@ func TestPreparedStatusDeltaScheduling(t *testing.T) {
 		}
 	}
 }
+
+func TestPreparedStatusDeltaRebindsMissingSnapshotGroup(t *testing.T) {
+	ancestor := statusCacheTestTransaction(1, 2, 3)
+	seed, err := NewTransactionStatusCacheFromAgaveSnapshot([]txstatus.SnapshotSlotDelta{
+		{Slot: 0, IsRoot: true, Statuses: []txstatus.SnapshotStatus{snapshotStatusCacheStatusForTx(t, ancestor, 7)}},
+	}, 0)
+	require.NoError(t, err)
+	candidate := statusCacheTestBlock(1, statusCacheTestTransaction(1, 4, 5))
+	plan, err := planBlockTransactionExecution(candidate)
+	require.NoError(t, err)
+	prepared := seed.prepareTransactionStatusDelta(plan.messageIdentities)
+	// Model restore/branch replacement removing the group after preparation.
+	cache := NewTransactionStatusCache()
+	require.NoError(t, cache.commitBlockWithPreparedDelta(candidate, plan, prepared))
+	inline := NewTransactionStatusCache()
+	require.NoError(t, inline.commitBlockWithPlan(candidate, plan))
+	require.Equal(t, inline.tip.delta, cache.tip.delta)
+	found, err := cache.View().ContainsTransaction(candidate.Transactions[0])
+	require.NoError(t, err)
+	require.True(t, found)
+}

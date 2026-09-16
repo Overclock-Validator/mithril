@@ -63,6 +63,9 @@ func (c *TransactionStatusCache) legacyCommitStatusForBenchmark(block *b.Block, 
 
 // Frozen production commit algorithm before publication optimization. This is
 // an independent baseline, including its original visible-index allocation.
+// Benchmark fixtures never reuse validation receipts on this path. This frozen
+// helper deliberately omits validation-version bumps and must not be used by
+// production callers or copied as a model for mutating the live cache.
 func (c *TransactionStatusCache) legacyAddStatusForBenchmark(delta transactionStatusDelta) error {
 	for blockhash, deltaGroup := range delta {
 		if group := c.visible[blockhash]; group != nil && group.keyIndex != deltaGroup.keyIndex {
