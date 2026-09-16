@@ -1,42 +1,34 @@
-# Mithril performance review branches
+# Mithril performance reviews
 
-The changes from PR #279 and subsequent improvements are published in six focused review branches under **7layermagik**. GitHub still rejects PR creation with HTTP 403 (`Resource not accessible by personal access token`), confirmed September 15. These are published branches and ready PR descriptions, not six open PRs. PR #279 remains the older combined implementation.
+Seven clean review branches are published under **7layermagik**, based on the latest PR #278 (`e1204b32`). GitHub rejected creation of the first split PR with HTTP 403 on September 16: `Resource not accessible by personal access token`. These are published branches with complete descriptions, not seven open PRs. The current token can push repository contents but could not create a pull request.
 
-The verified development base is `33dde4050d9250557583395810799aaac2f54017`. Voting is stacked on certificate processing; leader packing is stacked on streaming preparation. The other four branches target `alpenglow-dev`.
+#278 was still open when checked before publication. The four independent reviews target its branch so their diffs exclude its changes; after it merges, retarget them to `alpenglow-dev`. Voting is stacked on certificates; leader packing and spool completion are stacked on Turbine/FEC.
 
-| Review | Current head | Base | Description |
+| Review / create link | Published head | Base | Ready description |
 |---|---|---|---|
-| [turbine: prepare complete transaction batches during shred arrival](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-streaming-preparation) | `1c1171d3` | `alpenglow-dev` | [Scope, tests and benchmarks](review-prs/streaming-preparation.md) |
-| [alpenglow: reduce certificate verification lock contention](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-certificate-processing) | `72514abc` | `alpenglow-dev` | [Scope, tests and benchmarks](review-prs/certificate-processing.md) |
-| [replay: prepare status publication and defer checkpoint work](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-status-checkpoint-expiry) | `a511ad3b` | `alpenglow-dev` | [Scope, tests and benchmarks](review-prs/status-checkpoint-expiry.md) |
-| [runtime: enable VM pooling and preserve owned vote state](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-runtime-allocation) | `752ef973` | `alpenglow-dev` | [Scope, tests and benchmarks](review-prs/runtime-allocation.md) |
-| [leader: improve packing and add near-limit block benchmarks](https://github.com/Overclock-Validator/mithril/compare/7layer%2Freview-streaming-preparation...7layer%2Freview-leader-packing) | `06ef0677` | `7layer/review-streaming-preparation` | [Scope, tests and benchmarks](review-prs/leader-packing.md) |
-| [alpenglow: isolate vote delivery and reserve durable signing bounds](https://github.com/Overclock-Validator/mithril/compare/7layer%2Freview-certificate-processing...7layer%2Freview-vote-delivery-persistence) | `54b233ff` | `7layer/review-certificate-processing` | [Scope, tests and benchmarks](review-prs/vote-delivery-persistence.md) |
+| [runtime: enable VM pooling and own retained vote state](https://github.com/Overclock-Validator/mithril/compare/smcio%2Ffix-skipped-slot-cert-handling...7layer%2Freview-runtime-allocation?expand=1) | `6d098eae` | `smcio/fix-skipped-slot-cert-handling` | [Description](review-prs/runtime-allocation.md) |
+| [alpenglow: reduce certificate verification contention](https://github.com/Overclock-Validator/mithril/compare/smcio%2Ffix-skipped-slot-cert-handling...7layer%2Freview-certificate-processing?expand=1) | `65929042` | `smcio/fix-skipped-slot-cert-handling` | [Description](review-prs/certificate-processing.md) |
+| [turbine: accelerate FEC and prepare transactions during shred arrival](https://github.com/Overclock-Validator/mithril/compare/smcio%2Ffix-skipped-slot-cert-handling...7layer%2Freview-streaming-preparation?expand=1) | `60e0becb` | `smcio/fix-skipped-slot-cert-handling` | [Description](review-prs/streaming-preparation.md) |
+| [replay: prepare status publication and defer checkpoint work](https://github.com/Overclock-Validator/mithril/compare/smcio%2Ffix-skipped-slot-cert-handling...7layer%2Freview-status-checkpoint-expiry?expand=1) | `1f91ebb2` | `smcio/fix-skipped-slot-cert-handling` | [Description](review-prs/status-checkpoint-expiry.md) |
+| [leader: reduce packing overhead and add near-limit block tests](https://github.com/Overclock-Validator/mithril/compare/7layer%2Freview-streaming-preparation...7layer%2Freview-leader-packing?expand=1) | `fea3bdde` | `7layer/review-streaming-preparation` | [Description](review-prs/leader-packing.md) |
+| [turbine: publish spool completion without waiting for journal writes](https://github.com/Overclock-Validator/mithril/compare/7layer%2Freview-streaming-preparation...7layer%2Fspool-completion-journal?expand=1) | `d5876434` | `7layer/review-streaming-preparation` | [Description](review-prs/spool-completion-journal.md) |
+| [alpenglow: isolate vote delivery and bound crash recovery](https://github.com/Overclock-Validator/mithril/compare/7layer%2Freview-certificate-processing...7layer%2Freview-vote-delivery-persistence?expand=1) | `00125ab1` | `7layer/review-certificate-processing` | [Description](review-prs/vote-delivery-persistence.md) |
 
-## Spool completion follow-up
+## Scope and order
 
-[Spool completion journal review](https://github.com/Overclock-Validator/mithril/compare/7layer%2Freview-streaming-preparation...7layer%2Fspool-completion-journal) is a separate branch stacked on streaming preparation, current head `f0b72ab2` (implementation `bb590199`). It queues disposable completion hints without blocking delivery, preserves ordered invalidations and clean handoff, and changes no voting persistence contract. [Scope, tests and measurements](review-prs/spool-completion-journal.md). This is an additional review branch, not another opened PR.
+Start with runtime ownership/defaults, certificate processing, and checkpoint/publication work. The combined Turbine review includes the FEC producer/recovery changes formerly reviewed in #259 plus streaming preparation. Review leader packing and spool completion after it. Keep vote delivery/persistence **draft** until its transport and crash-recovery contract receive dedicated review.
 
-## Newest validator changes
+The later partitioned status-map experiment is excluded: it added preparation work without establishing an overall p99 gain. Its original source and measurements remain in the status evidence tag. No new execution optimization or live-validator deployment was performed here.
 
-- Certificate processing includes bounded MultiExp with unchanged full-strength random coefficients and pending-only observer reconciliation (`72514abc`).
-- Status checkpoints include immutable node encoding reuse, allocation-free rejection of incomplete fold batches (`d55c7962`), and retirement of completed rewards bookkeeping after durable promotion (`c78e35cd`). The latter avoids an unnecessary fork-recovery guard after rewards are safely rooted; native tests passed and it was deployed at 12:20 UTC. Live latency benefit awaits an applicable fork switch.
-- Status publication also reuses successful ancestor validation only for the same unchanged cache and identities (`d04ad985`). Existing-group Zen 5 publication benchmarks improved from 2.4–2.5 ms to 1.3–1.4 ms; native race tests, vet and build passed. This is an incremental component gain, not a FAST-score claim.
-- Large status maps now use partitioned updates prepared during execution (`a511ad3b`), deployed at 17:32 UTC. In 182 matched large blocks, publication was 0.737 ms faster at the median; total assembly-to-local-serialization improved only 0.298 ms at the median, with no demonstrated overall p99 gain. Extra preparation work and mixed component p99 results are documented explicitly. Crash-recovery and duplicate-detection contracts remain unchanged.
-- Streaming includes relay-buffer reuse (`311f83ea`) and completion-reserved verifier admission (`1c1171d3`), keeping two workers and four total request permits. Deployed at approximately15:18UTC; initial voting lag1–2 and all services recovered. The stacked leader branch includes this parent at`06ef0677`. Saturated native completion p99 improved from 47.31ms to 1.488ms; this does not establish live FAST improvement.
+## Clean review policy
 
-These changes are included in the combined Zen 5 testnet deployment. The September 15 empty-block comparison measured replay-admission p99 of **4.486 → 0.483 ms** (565 before, 401 after), after deploying both observer reconciliation and fold preflight. This short observational comparison does not isolate either change or establish sustained overall FAST improvement. The descriptions retain component benchmarks, their actual baselines, validation and limitations.
+The proposed diffs retain subsystem contracts, reusable tests/benchmarks, concise methodology and material limitations. Raw output, session notes, deployment diaries and machine-specific paths were removed. Historical evidence is preserved in the `review-evidence-20260916-*` tags. Descriptions state the actual benchmark baselines and do not treat historical component results as fresh #278 comparisons or combine their speedups.
 
-## Non-empty block follow-up
+[Fresh validation and exact source manifest](results/review-preparation/2026-09-16/README.md) records standalone and combined checks, the corrected test-only integration failure, and the remaining whole-suite limitations. No broad sealevel or mainnet power-loss qualification is claimed.
 
-The subsequent investigation changed the synthetic sender’s pacing and added operational diagnostics; it did not change or restart the validator binary. The first matched pacing comparison included only ten baseline and four candidate blocks. It is not p99 evidence. The leader description records the settings, results, variable block fill and exclusions. Machine-specific services, funding/runtime state and trace collectors remain outside these validator review branches.
+## Existing PRs
 
-A roughly 51 ms completion-to-ingestion outlier remains unexplained and did not recur in the bounded trace. Omission from one FAST certificate does not prove absence from all FAST certificates. No fix or sustained FAST improvement is claimed for that investigation.
+- [#259](https://github.com/Overclock-Validator/mithril/pull/259): older FEC-only draft. Its implementation is incorporated in the new combined Turbine branch; retain it until the replacement PR can be opened and linked.
+- [#279](https://github.com/Overclock-Validator/mithril/pull/279): older combined performance PR. Its passing CI is not validation of these newer split heads. Replace it with the focused reviews once their PRs exist.
 
-## Review and validation
-
-Start with runtime allocation, certificate processing and status checkpoints. Review voting after certificates, and leader packing after streaming. Voting should remain draft: reserved persistence is opt-in and its explicit crash-recovery contract sacrifices availability when previous signing decisions are uncertain. Native race tests, vet and combined builds passed as documented in each description; testnet deployment is not mainnet power-loss qualification.
-
-The split was initially recombined and checked against the preserved implementation; later follow-ups were checked in separate combined audit builds. Full sealevel-suite success is not claimed: unrelated BPF-loader failures were reproduced on the unchanged development base.
-
-This integration branch is a review index and historical combined snapshot. Its source is not the latest combined deployed source; use the six focused branch heads for code review. No validator restart or runtime configuration change was performed while preparing this index.
+This branch is a review index and historical combined source snapshot, not a merge candidate or deployable checkout of the final integration. Use the individual published heads for review; the validation manifest identifies the recombined source. PR descriptions are mirrored here only because PR creation is permission-blocked.

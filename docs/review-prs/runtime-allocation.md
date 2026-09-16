@@ -1,5 +1,11 @@
-The run command resolves pooling through Viper, so its CLI default alone did not enable the intended pooling behavior when TOML omitted the option. Set the configuration default and verify reuse isolation. Also copy retained vote-deque state into owned storage so a later transaction cannot overwrite it through reused invocation memory.
+Omitting `tuning.use_pool` bypassed the CLI's intended pooling default. Enable the default through configuration, resolve booleans in explicit-CLI → configured-value → flag-default order, and preserve explicit `false`. Copy retained vote-deque storage so pooled invocation memory cannot overwrite state used by later transactions.
 
-This extracts the small runtime/default changes and the vote-deque ownership correction from #279. It includes configuration override tests, VM pool reset/isolation tests and `TestProcessNewVoteStateOwnsRetainedDeque`.
+Tests cover omitted settings, TOML values, CLI overrides, heap/stack reset and retained-deque ownership. This is a small allocation/correctness change; it makes no whole-validator speedup claim.
 
-Config and SBF race suites, the exact vote-deque race regression and vet passed. Fresh logs: `docs/results/pr-split-2026-09-15/runtime`. An initial name filter selected no ownership tests; the separate ownership-test log records the corrected actual run. Full sealevel-suite success is not claimed: #279 records unrelated BPF-loader failures reproduced on unchanged alpenglow-dev. No end-to-end performance claim is attached to this split.
+Fresh local race tests passed for config, SBPF pooling and node startup/configuration; the retained-deque regression passed in the combined build. Combined integration validation also covers #278 and the other performance reviews. Historical native benchmarks retain their original baselines; this preparation pass ran locally, without touching the live validator.
+
+[Historical benchmark evidence](https://github.com/Overclock-Validator/mithril/tree/752ef97369e5b1614eeff64a242dfa87df673045/docs/results) is preserved outside the proposed merge; reusable benchmarks and maintained contracts remain in source.
+
+Based on #278 at `e1204b32`; retarget to `alpenglow-dev` after that PR merges.
+
+[Rebased validation and exact source heads](https://github.com/Overclock-Validator/mithril/blob/7layer/review-integration-20260915/docs/results/review-preparation/2026-09-16/README.md).

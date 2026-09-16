@@ -1,21 +1,19 @@
-Prepare owned transactions before leadership, recheck bank-dependent state at use, reduce scratch/entry-root overhead, correct slot-duration-dependent resource limits and expose bounded queue/finalization-reserve settings. Remove consumed, evicted and expired scheduler entries from both indexed heaps so stale transaction references do not accumulate.
+Static decoding, preparation, allocation and queue retention consume the leader's packing window. Prepare owned transactions before leadership, recheck the feature snapshot and all bank-dependent conditions at use, reuse execution/hash scratch, and immediately remove consumed/evicted/expired entries from both priority heaps.
 
-Includes deterministic single-signature load fixtures, near-limit bank generation, actual cost-limit assertions and emitted-entry shred round trips. The existing slot-local transaction retry policy is unchanged; later deferred-retry experiments remain outside this PR. Voting reservations and transport are separate.
+Apply slot-duration-dependent resource budgets and expose bounded queue/completion-reserve settings. New arrivals preserve priority/FIFO selection. The existing slot-local retry policy is unchanged; deferred-retry experiments are excluded. Voting persistence and the coordinated traffic tool are outside this review.
 
-### Benchmark
+| Historical Zen 5 whole-bank fixture | `alpenglow-dev` at `33dde405` → candidate |
+|---|---|
+| 48,622 transactions from wire bytes | **209.64 → 150.30 ms** |
+| Same bank from decoded transactions | **189.73 → 132.40 ms** |
 
-Zen5 Ryzen7 9700X, Go1.26.4; three alternating paired rounds against current alpenglow-dev33dde405. A48,622-transaction bank using unique198-byte single-signature transactions improved from209.64 to150.30ms from wire bytes, and189.73 to132.40ms from decoded transactions. This excludes signature verification, real AccountsDB, network broadcast and consensus. Heap counterpart removal has a small measured removal-cost tradeoff; see the queue evidence rather than interpreting it as a throughput gain.
+Three alternating paired rounds use unique 198-byte, one-signature transactions and an in-memory bank. The benchmark excludes signature verification, real AccountsDB, network and consensus; it is not replay time. A separate test checks the cost limit, rejection of the next transaction, and entry/shred round trips. Immediate counterpart-heap removal has a small measured per-removal cost. No live block-fill or FAST gain is claimed.
 
-Start with `docs/leader_block_packing.md`. Raw evidence is under `docs/results/leader-block-packing/2026-09-13` and `docs/results/queue-retention/2026-09-14`.
+[Design, method and limitations](https://github.com/Overclock-Validator/mithril/blob/fea3bdde4a1933962b493a6a3e163a5c8e85f494/docs/leader_block_packing.md).
+Fresh local leader/scheduler, account/config, cost-model, Merkle, fixture and node race tests passed. The post-FEC round-trip test uses the public component serializer. Combined integration validation also covers #278 and the other performance reviews. Historical native benchmarks retain their original baselines; this preparation pass ran locally, without touching the live validator.
 
-Fresh race suites passed for leader/scheduler, accounts, config, cost model, Merkle, replay, transaction fixtures, Turbine and node startup; vet passed. Logs: `docs/results/pr-split-2026-09-15/leader`.
+[Historical benchmark evidence](https://github.com/Overclock-Validator/mithril/tree/06ef067798c99947e8cc527450ad28430a9a7333/docs/results) is preserved outside the proposed merge; reusable benchmarks and maintained contracts remain in source.
 
-This is stacked on the streaming-preparation PR; the GitHub diff shows only leader-specific changes. It extracts the existing leader portion of #279 without adding new block-production work.
+Stacked on `7layer/review-streaming-preparation`, which includes #278 at `e1204b32`. Review this diff against that parent.
 
-### Live sender contention follow-up (operational experiment)
-
-On the unchanged combined validator, the synthetic sender was changed from 200,000 transactions at 150,000/s starting 20 slots before leadership to the same count at 75,000/s starting 27 slots before leadership. At 200 ms/slot this preserves theoretical completion headroom (2.67 → 2.73 seconds) while spreading sender/TPU work. This is a separate load-generator setting, not a validator scheduling change or new default in this PR.
-
-The first matched comparison had only **10 baseline and 4 candidate blocks**: median replay **128.5 → 85.1 ms**, with median excess above similar nearby no-send blocks **52.3 → 12.6 ms**. Controls match leader, position within its four-slot run, binary, transaction count and rounded CU within 10%, and time within five minutes. Build/test intervals are excluded. These observational samples do **not** establish causation, p99, or sustained FAST improvement.
-
-Five candidate sends each submitted all 200,000 with zero local send errors and finished 15–17 slots before leadership. This does not prove network receipt or inclusion of all submitted transactions. Four-block inclusion totals ranged from 121,358 to 147,680; equal block fullness is not established. Native sender race tests, vet, build and selfcheck passed. Machine-specific sender services, funding logic, runtime state and monitoring scripts remain outside this validator PR; the portable offline fixtures above remain the reproduction for its bank-building benchmark.
+[Rebased validation and exact source heads](https://github.com/Overclock-Validator/mithril/blob/7layer/review-integration-20260915/docs/results/review-preparation/2026-09-16/README.md).

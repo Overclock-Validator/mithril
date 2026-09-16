@@ -1,0 +1,66 @@
+{
+  "base": "e1204b3280f67e95a5f118fdff50f33f3d49b495",
+  "base_pr": 278,
+  "branches": [
+    {
+      "name": "runtime-allocation",
+      "title": "runtime: enable VM pooling and own retained vote state",
+      "base": "smcio/fix-skipped-slot-cert-handling",
+      "draft": false,
+      "head": "7layer/review-runtime-allocation",
+      "sha": "6d098eae73652c1c891b18533b9c9aa8e2d87ef6"
+    },
+    {
+      "name": "certificate-processing",
+      "title": "alpenglow: reduce certificate verification contention",
+      "base": "smcio/fix-skipped-slot-cert-handling",
+      "draft": false,
+      "head": "7layer/review-certificate-processing",
+      "sha": "659290426735e9bd78f9073fdef24435a709f781"
+    },
+    {
+      "name": "streaming-preparation",
+      "title": "turbine: accelerate FEC and prepare transactions during shred arrival",
+      "base": "smcio/fix-skipped-slot-cert-handling",
+      "draft": false,
+      "head": "7layer/review-streaming-preparation",
+      "sha": "60e0becb92267975afa23155d148a5f5898091b4"
+    },
+    {
+      "name": "status-checkpoint-expiry",
+      "title": "replay: prepare status publication and defer checkpoint work",
+      "base": "smcio/fix-skipped-slot-cert-handling",
+      "draft": false,
+      "head": "7layer/review-status-checkpoint-expiry",
+      "sha": "1f91ebb29d95dc4363969b65dd7edf14b28debe6"
+    },
+    {
+      "name": "leader-packing",
+      "title": "leader: reduce packing overhead and add near-limit block tests",
+      "base": "7layer/review-streaming-preparation",
+      "draft": false,
+      "head": "7layer/review-leader-packing",
+      "sha": "fea3bdde4a1933962b493a6a3e163a5c8e85f494"
+    },
+    {
+      "name": "spool-completion-journal",
+      "title": "turbine: publish spool completion without waiting for journal writes",
+      "base": "7layer/review-streaming-preparation",
+      "draft": false,
+      "head": "7layer/spool-completion-journal",
+      "sha": "d587643472ba768b4f149ccd2dc2b97e88b8937b"
+    },
+    {
+      "name": "vote-delivery-persistence",
+      "title": "alpenglow: isolate vote delivery and bound crash recovery",
+      "base": "7layer/review-certificate-processing",
+      "draft": true,
+      "head": "7layer/review-vote-delivery-persistence",
+      "sha": "00125ab1618dc87be3aaeb8d4149556454bd761b"
+    }
+  ],
+  "combined": "f2f23f8f356a80962020f059eccd68a3e8d857ed",
+  "excluded_status_map_experiment": "a511ad3b0bc77cf8b5ae4ee16359ac6b453fc7bf",
+  "fec_archive": "a3b16ebaaf803807ad04a7975f3eccf1c15649ea",
+  "binary_sha256": "db7b4e5d2c1a3154358e2f99e5619cd0f7f5e9cefbcca0a16f7e0c6cf4090567"
+}

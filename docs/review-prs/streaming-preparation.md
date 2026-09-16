@@ -1,44 +1,27 @@
-Large blocks can finish shred assembly with avoidable decoding and signature-verification work still pending. Prepare complete entry batches during arrival, including batches beyond an earlier missing shred, and reuse results only after exact range/byte validation. Final transaction order, block identity checks, signature checks, bounded ownership and cancellation remain intact.
+Large blocks can finish shred assembly with avoidable parsing, message-identity and signature-verification work pending. Discover complete entry components independently, including those beyond an earlier missing shred, prepare them during arrival, and restore final wire order using exact range/byte checks.
 
-Includes the Narya update, bounded ready-batch scheduling, direct cached-byte comparisons, authenticated FEC-root reuse, retention-sweep reduction, early message identities, independent batch discovery and the queued-prefetch-reset correction from #279. Opt-in sampled pipeline tracing defaults off. Leader packing, voting/persistence, certificate processing and transaction-status expiry are separate PRs. FEC acceleration remains #259.
+Combines #259 with streaming preparation: specialize exactly-one-missing-data recovery for 32+32 FEC sets, pool the fixed encoder, reuse generated packets/roots, and track canonical batch bytes. Preserve newer slot reservations and the asynchronous shred worker. The two-FEC producer target is 61,632 bytes; other recovery shapes retain the general decoder. Also includes the Narya update, bounded job groups, cached identity/FEC-root reuse, retention-sweep scheduling and owned relay buffers. Completion/recovery requests have priority at request admission and one of the existing four permits is reserved against prefetch. This protects completion as a class; it does not preempt admitted work or prioritize exactly the next replay slot. Worker defaults stay unchanged.
 
-### Benchmark
+Metadata inconsistencies join existing readers and reverify the final block. Invalid signatures, cancellation and verifier failure still reject it. Generation ownership, retained-memory bounds and final block checks remain enforced.
 
-Zen5 Ryzen7 9700X, Go1.26.4, Narya r51, two verification workers, batch target8, GOMAXPROCS8. Identical 33,760-transaction fixtures arrive over200ms; one shred three quarters through the block is held until after the footer. Two runs per version, three iterations per case, alternating baseline/candidate/candidate/baseline. Ranges are run medians.
+| Historical Zen 5 fixture | Earlier implementation → result |
+|---|---|
+| 33,760 × 228-byte transactions; one delayed shred; assembly → ready | **21.43–22.77 → 2.82–2.83 ms** |
+| Same, 1,232-byte transactions | **35.46–36.34 → 7.04–8.08 ms** |
+| Saturated prefetch; 32-transaction completion p99 | **47.31 → 1.488 ms** |
 
-| Transaction size | Previous streaming implementation | Independent batch discovery |
-|---|---:|---:|
-| 228 bytes, delayed shred | 21.43–22.77ms | 2.82–2.83ms |
-| 1,232 bytes, delayed shred | 35.46–36.34ms | 7.04–8.08ms |
+The first two comparisons use the preceding streaming implementation and arrivals spread over 200 ms; the last uses the preceding admission policy. They are incremental component comparisons, not #278-versus-PR or live FAST results. Ordered arrivals were roughly unchanged, and total-work p99 in the admission experiment did not improve.
 
-These are final-assembly-to-ready times against the **previous streaming implementation**, not alpenglow-dev or a whole-validator speedup. Ordered arrivals were roughly unchanged. The benchmark verifies every retained signature exactly once. Historical component comparisons keep their original baselines.
+[Design, method and limitations](https://github.com/Overclock-Validator/mithril/blob/60e0becb92267975afa23155d148a5f5898091b4/docs/transaction_sigverify_streaming.md).
+[Design, method and limitations](https://github.com/Overclock-Validator/mithril/blob/60e0becb92267975afa23155d148a5f5898091b4/docs/out-of-order-entry-prefetch.md).
+Fresh local race suites passed for repair, Turbine/recovery/simulator, block production, cost model, replay/blockstream, signature verification, block, stats and starter config. Combined integration validation also covers #278 and the other performance reviews. Historical native benchmarks retain their original baselines; this preparation pass ran locally, without touching the live validator.
 
-### Review and validation
+The historical #259 producer comparison on September 6 used development head `7e4e8af1`: 50,000 × 1,232-byte legacy transactions across three slots took **734.052 → 282.296 ms** on one pinned Zen 5 CPU. At an equal 30,816-byte target, it was **734.052 → 288.378 ms**. This excludes execution, admission verification, worker overlap and network delivery; it does not measure the rebased combined review. [Original FEC evidence](https://github.com/Overclock-Validator/mithril/tree/a3b16ebaaf803807ad04a7975f3eccf1c15649ea/docs/results/producer-batch/2026-09-06-zen5/alpenglow-dev-head).
 
-Start with `docs/transaction_sigverify_streaming.md`, `docs/out-of-order-entry-prefetch.md`, and `docs/streaming_message_identities.md`. Raw delayed-shred benchmarks are in `docs/results/out-of-order-prefetch/2026-09-15`; other historical evidence remains beside its original method.
+The legacy-size fixtures now explicitly retain the 1,232-byte limit; they must not inherit the newer 4,096-byte transport maximum. Tests check canonical sizes, accumulated slot bytes, generated roots/packets, all missing-data/coding-row pairs, simulator traces and general-decoder equivalence. Leader packing and spool publication remain separate dependent reviews. This combined review supersedes #259's implementation.
 
-Fresh standalone race suites passed for Turbine, block, txverify, txstatus, sigverify and replay; vet and the full validator build passed. Includes both the new gap regressions and #279's reset-accounting correction. Fresh logs: `docs/results/pr-split-2026-09-15/streaming`.
+[Historical benchmark evidence](https://github.com/Overclock-Validator/mithril/tree/1c1171d3661d0404b013a9bf9391e23eb660706e/docs/results) is preserved outside the proposed merge; reusable benchmarks and maintained contracts remain in source.
 
-### Cache recovery and configuration ownership
+Based on #278 at `e1204b32`; retarget to `alpenglow-dev` after that PR merges.
 
-Move the signature-verification template and test here, alongside the code that reads those settings. Do not enable unrelated VM pooling in the standalone template; the runtime branch supplies that default with its ownership fix.
-
-On inconsistent cached identity/range metadata, join old readers and re-verify every final transaction. Valid blocks recover; invalid signatures, cancellation and verifier failure remain errors. Bounds are checked before slicing. Normal signature failures still reject the block, and the default worker count is unchanged. Local standalone and native combined race suites, vet and builds passed. Regression failures before the fix and passing evidence: `docs/results/review-fixes/2026-09-15`. These recovery changes are now included in the combined testnet deployment.
-
-### Relay buffer reuse
-
-Reuse per-worker peer result storage and exclusively owned packet copies through synchronous sends and retries; queue rejection and shutdown return copies safely. Routing and authentication remain unchanged. The incremental Zen 5 comparison against c40ac9e8 reduces allocation from 3,784 to about 729 B/shred (8 to 6 allocations). Median in-memory pipeline time improved about 4–7% across 90/512-contact fixtures, with noisy samples; this does not establish network latency or FAST gains. See `docs/turbine-relay-buffers.md` for ownership, methodology and limitations. Local/native Turbine race tests, native vet and combined build passed. The relay follow-up was deployed and live-tested on Zen 5 at 2026-09-15 04:43 UTC. In the first completed five-minute window, 5.9 million destination packets had zero relay queue drops or send errors, and own blocks reached 48,505 transactions. FAST inclusion was 825/835 (98.80%) versus 839/843 (99.53%) immediately before; this lower short sample does not establish causation or a live gain. Median replay-to-vote was 1.56 versus 1.53 ms. Monitoring continues with the same worker and load settings.
-
-
-### Reserve verifier admission for completion
-
-Commit `1c1171d3` caps prefetch at three of the existing four request permits with the default two workers. Waiting completion/recovery requests get priority over prefetch at admission; job queues, vector grouping, rolling windows and worker count remain unchanged. Accepted jobs are still verified and joined before memory reuse. Prefetch resumes after the completion backlog drains. This is completion-class protection, not exact next-replay-slot priority; future-slot completions qualify too and already-admitted prefetch is not preempted. No persistence or voting-recovery contract changes.
-
-Zen 5 / Narya r51 / GOMAXPROCS8, three runs of100 saturated iterations: four ready4,096-transaction prefetch components plus a32-transaction completion. Compared with the previously deployed production source, completion-finished p99 was **47.31→1.488ms**, and admission p99 **45.78→0.004599ms** (medians of per-run statistics). Total-work median stayed **39.43→39.11ms**; total-work p99 **49.09→50.65ms**, so no total-work tail gain is claimed. This is a controlled saturation result, not live FAST or whole-PR performance. Method, ranges and smaller components: `docs/transaction_sigverify_streaming.md`.
-
-Full local/native turbine and blockstream race suites, native node recovery race tests, local/native vet and combined build passed. Regression coverage includes request bounds, completion priority, prefetch resumption, cancellation, shutdown joining and slot-reset memory ownership. Raw evidence stays server-side at `/srv/mithril-verifier-reservation-20260915`.
-
-
-Deployed September15 at approximately15:18UTC after an idle sender window and clean validator stop. Signing state and runtime policy were preserved; advancing health checks showed lag2/2/1 before resuming load and FAST monitoring. A bounded live trace measured233 successful completion/recovery admissions: **p990.006062ms, maximum0.006893ms**;28,293 prefetch admissions had p991.036452ms/max3.397236ms. There were no admission errors or trace stderr. These are post-deployment observations including probe overhead, not a matched live before/after comparison.
-
-The first valid candidate FAST sample was **822/833(98.68%)**, lower than the preceding sample, so no inclusion gain is claimed. All11omissions were nonempty; FullToReady was at most6.443ms and signature verification at most3.745ms. Eight had matched controls: additional signature-verification time was at most1.351ms, with a median delta of−0.086ms. This does not explain the remaining omissions or exclude rarer effects. Five completed load runs sent1million transactions with zero errors/unsent and produced all20leader blocks; the largest held48,622transactions. Voting, large-block production and existing monitors remain running.
+[Rebased validation and exact source heads](https://github.com/Overclock-Validator/mithril/blob/7layer/review-integration-20260915/docs/results/review-preparation/2026-09-16/README.md).
