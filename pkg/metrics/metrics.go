@@ -150,9 +150,11 @@ type VoteRewardDetails struct {
 // wake-up; Transactions counts what they executed. TxLoopBeforeFull is the
 // group execution wall time that finished before the slot was fully
 // assembled, i.e. the work hidden behind reception. OpenDelay runs from the
-// header batch being decoded to the stream opening (it measures how long the
-// parent's tail held the child). Discarded is 1 when a stream for this slot
-// was thrown away and the block was executed whole; DiscardReason names why.
+// header batch being decoded to the stream opening; the timeline fields and
+// the OpenWait* timings below say what held the child (its parent's arrival,
+// its parent's replay, or the loop itself). Discarded is 1 when a stream for
+// this slot was thrown away and the block was executed whole; DiscardReason
+// names why.
 type StreamingExecution struct {
 	Opened           uint64
 	Groups           uint64
@@ -161,6 +163,77 @@ type StreamingExecution struct {
 	OpenDelay        Timing
 	Discarded        uint64
 	DiscardReason    string
+
+	// Timeline: wall-clock unix nanoseconds of the events that bound the
+	// stream's open, zero when unknown. They join with the parent's record
+	// (ParentFullNanos is the parent's FullNanos) and with external captures.
+	//
+	//   HeaderReadyNanos     the child's header batch was decoded
+	//   HeaderSeenNanos      the executor first handled that header (from its
+	//                        wake-up, or recovered from the assembler after a
+	//                        dropped wake-up, in which case ready is the
+	//                        lookup instant and seen follows it at once)
+	//   ParentFullNanos      the parent's last shred (0: parent was a skip or
+	//                        not a turbine block)
+	//   ParentAdmittedNanos  the source handed the parent to replay (its own
+	//                        ancestors replayed, the emitter released it)
+	//   ParentReplayedNanos  the parent's replay result reached consensus and
+	//                        the frontier advanced to it (0: unknown, e.g. the
+	//                        frontier was re-based by a fork switch)
+	//   OpenedNanos          the stream's bank opened
+	//   FirstGroupStartNanos the first executed group started
+	//   WaitEnteredNanos     the loop first entered the replay wait after the
+	//                        parent was replayed (0: unknown)
+	//   FullNanos            this block's last shred
+	//   FinalizeStartNanos   the complete block reached the stream
+	HeaderReadyNanos     int64
+	HeaderSeenNanos      int64
+	ParentFullNanos      int64
+	ParentAdmittedNanos  int64
+	ParentReplayedNanos  int64
+	WaitEnteredNanos     int64
+	OpenedNanos          int64
+	FirstGroupStartNanos int64
+	FullNanos            int64
+	FinalizeStartNanos   int64
+
+	// OpenDelay decomposed into attributable waits (each zero when the
+	// timeline cannot support it):
+	//   OpenWaitParentArrival  header ready → parent's last shred: the child's
+	//                          header was decoded before its parent was even
+	//                          fully received (a leader/arrival gap, not ours)
+	//   OpenWaitParentReplay   parent's last shred (or header ready, whichever
+	//                          is later) → parent replayed: the parent's own
+	//                          post-full path held the child; split, when the
+	//                          parent's admission is known, into
+	//   OpenWaitParentQueue    … → the parent's admission: the parent's own
+	//                          post-full path in the source (completion,
+	//                          verification, and waiting for its ancestors —
+	//                          a leader window's earlier slots still replaying)
+	//   OpenWaitParentExec     admission → replayed: the parent's execution
+	//                          and tail
+	//   OpenWaitLoop           parent replayed (or header seen, whichever is
+	//                          later) → opened: the replay loop's own latency
+	//                          to open once nothing else stood in the way;
+	//                          split, when the wait entry is known, into
+	//   OpenWaitPostReplay     … → the loop's first wait entry after the
+	//                          parent: the parent's post-replay tail
+	//                          (promotion, RPC, stats) held the child
+	//   OpenWaitDispatch       wait entry (or header seen) → opened: events
+	//                          ahead of the header in the feed, the poll
+	OpenWaitParentArrival Timing
+	OpenWaitParentReplay  Timing
+	OpenWaitParentQueue   Timing
+	OpenWaitParentExec    Timing
+	OpenWaitLoop          Timing
+	OpenWaitPostReplay    Timing
+	OpenWaitDispatch      Timing
+
+	// NotOpenedReason is set when the block was executed whole without a
+	// stream having opened for it: why the executor never opened one
+	// ("header_not_seen", "declined:<eligibility>", "waiting_for_parent:…").
+	// Empty when a stream opened (see Discarded for the ones thrown away).
+	NotOpenedReason string
 }
 
 // Metrics for replaying a single block

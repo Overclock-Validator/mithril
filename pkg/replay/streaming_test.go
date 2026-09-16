@@ -134,8 +134,8 @@ func (h *streamingTestHarness) open() {
 		parentID:   h.parentID,
 		exec:       h.env.exec,
 		pending:    make(map[uint32]*turbine.StreamBatch),
-		openedAt:   time.Now(),
 		headerAt:   time.Now(),
+		openedAt:   time.Now(),
 	}
 	h.exec.handleEvent(h.event(h.header()))
 }
@@ -848,4 +848,165 @@ func TestStreamingGapSelectionAndSafety(t *testing.T) {
 	require.Nil(t, h.exec.current)
 	require.True(t, cur.exec.closed)
 	require.Equal(t, h.gen, h.exec.retired[46])
+}
+
+// The open timeline attributes every millisecond between the header's decode
+// and the open to exactly one of: the parent's arrival (header decoded before
+// the parent's last shred), the parent's replay (last shred → replay result),
+// or the loop (nothing left to wait for, still not opened).
+func TestStreamingTimelineAttributesOpenDelay(t *testing.T) {
+	t0 := time.Unix(1_700_000_000, 0)
+	at := func(ms int) time.Time { return t0.Add(time.Duration(ms) * time.Millisecond) }
+	block := &b.Block{ShredFullNanos: at(300).UnixNano()}
+	record := func(cur *streamingSlot) metrics.StreamingExecution {
+		var out metrics.StreamingExecution
+		cur.recordTimeline(&out, block, at(320))
+		return out
+	}
+	ms := func(timing metrics.Timing) float64 { return float64(timing.SumNanoseconds) / 1e6 }
+
+	// Header decoded 50 ms before the parent's last shred, parent admitted
+	// 20 ms after that and replayed 10 ms later, opened 5 ms after; the
+	// header wake-up was handled 10 ms after decode.
+	cur := &streamingSlot{
+		headerAt: at(0), headerSeenAt: at(10), openedAt: at(85),
+		parentFullNanos: at(50).UnixNano(), parentAdmittedAt: at(70), parentReplayedAt: at(80),
+		groups: []streamingGroup{{startedAt: at(90), finishedAt: at(120), transactions: 3}},
+	}
+	r := record(cur)
+	require.Equal(t, at(0).UnixNano(), r.HeaderReadyNanos)
+	require.Equal(t, at(10).UnixNano(), r.HeaderSeenNanos)
+	require.Equal(t, at(50).UnixNano(), r.ParentFullNanos)
+	require.Equal(t, at(70).UnixNano(), r.ParentAdmittedNanos)
+	require.Equal(t, at(80).UnixNano(), r.ParentReplayedNanos)
+	require.Equal(t, at(85).UnixNano(), r.OpenedNanos)
+	require.Equal(t, at(90).UnixNano(), r.FirstGroupStartNanos)
+	require.Equal(t, at(300).UnixNano(), r.FullNanos)
+	require.Equal(t, at(320).UnixNano(), r.FinalizeStartNanos)
+	require.Equal(t, 50.0, ms(r.OpenWaitParentArrival))
+	require.Equal(t, 30.0, ms(r.OpenWaitParentReplay))
+	require.Equal(t, 20.0, ms(r.OpenWaitParentQueue), "the parent sat in the source 20 ms after its last shred")
+	require.Equal(t, 10.0, ms(r.OpenWaitParentExec))
+	require.Equal(t, 5.0, ms(r.OpenWaitLoop))
+	require.Equal(t, uint64(1), r.OpenWaitLoop.Count)
+
+	// The parent was admitted before the child's header was decoded (its
+	// queueing cannot have held the child): the replay wait is all execution.
+	cur = &streamingSlot{headerAt: at(0), headerSeenAt: at(1), openedAt: at(40), parentFullNanos: at(-30).UnixNano(), parentAdmittedAt: at(-5), parentReplayedAt: at(30)}
+	r = record(cur)
+	require.Zero(t, r.OpenWaitParentQueue.Count)
+	require.Equal(t, 30.0, ms(r.OpenWaitParentExec))
+	require.Equal(t, 30.0, ms(r.OpenWaitParentReplay))
+
+	// Parent fully received before the header was even decoded: no arrival
+	// wait; the parent's replay wait starts at the header.
+	cur = &streamingSlot{headerAt: at(0), headerSeenAt: at(1), openedAt: at(40), parentFullNanos: at(-20).UnixNano(), parentReplayedAt: at(30)}
+	r = record(cur)
+	require.Zero(t, r.OpenWaitParentArrival.Count)
+	require.Equal(t, 30.0, ms(r.OpenWaitParentReplay))
+	require.Equal(t, 10.0, ms(r.OpenWaitLoop))
+
+	// Header handled only after the parent was replayed (the wake-up sat in
+	// the channel): the loop wait runs from the header being seen.
+	cur = &streamingSlot{headerAt: at(0), headerSeenAt: at(90), openedAt: at(95), parentFullNanos: at(20).UnixNano(), parentReplayedAt: at(60)}
+	r = record(cur)
+	require.Equal(t, 20.0, ms(r.OpenWaitParentArrival))
+	require.Equal(t, 40.0, ms(r.OpenWaitParentReplay))
+	require.Equal(t, 5.0, ms(r.OpenWaitLoop))
+
+	// The loop wait splits at the first wait entry after the parent: a header
+	// remembered while the parent executed waited through the parent's
+	// post-replay tail (replayed → wait entry) and then its dispatch (wait
+	// entry → opened).
+	cur = &streamingSlot{headerAt: at(0), headerSeenAt: at(5), openedAt: at(130), parentFullNanos: at(-100).UnixNano(), parentReplayedAt: at(60), waitEnteredAt: at(125)}
+	r = record(cur)
+	require.Equal(t, at(125).UnixNano(), r.WaitEnteredNanos)
+	require.Equal(t, 70.0, ms(r.OpenWaitLoop))
+	require.Equal(t, 65.0, ms(r.OpenWaitPostReplay))
+	require.Equal(t, 5.0, ms(r.OpenWaitDispatch))
+
+	// A header seen only after the wait entry (it arrived while the loop was
+	// already waiting) was not held by the tail: dispatch only, from seen.
+	cur = &streamingSlot{headerAt: at(0), headerSeenAt: at(140), openedAt: at(141), parentFullNanos: at(-100).UnixNano(), parentReplayedAt: at(60), waitEnteredAt: at(125)}
+	r = record(cur)
+	require.Zero(t, r.OpenWaitPostReplay.Count)
+	require.Equal(t, 1.0, ms(r.OpenWaitDispatch))
+	require.Equal(t, 1.0, ms(r.OpenWaitLoop))
+	require.Contains(t, cur.openTimeline(), "wait entered +125.0ms")
+
+	// Unknown parent instants (no mark, or a re-based frontier): only the
+	// loop wait, from the header being seen.
+	cur = &streamingSlot{headerAt: at(0), headerSeenAt: at(0), openedAt: at(70)}
+	r = record(cur)
+	require.Zero(t, r.ParentFullNanos)
+	require.Zero(t, r.ParentReplayedNanos)
+	require.Zero(t, r.OpenWaitParentArrival.Count)
+	require.Zero(t, r.OpenWaitParentReplay.Count)
+	require.Zero(t, r.OpenWaitParentQueue.Count)
+	require.Zero(t, r.OpenWaitParentExec.Count)
+	require.Equal(t, 70.0, ms(r.OpenWaitLoop))
+	require.Zero(t, r.OpenWaitPostReplay.Count)
+	require.Zero(t, r.OpenWaitDispatch.Count)
+	require.Zero(t, r.WaitEnteredNanos)
+	require.Zero(t, r.FirstGroupStartNanos, "no group ran")
+	require.Contains(t, cur.openTimeline(), "parent full ?")
+	require.Contains(t, cur.openTimeline(), "opened +70.0ms")
+}
+
+// A block executed whole says why no stream opened for it, from the
+// executor's per-slot observation of its header.
+func TestStreamingNoteWholeBlockReasons(t *testing.T) {
+	StreamingExecutionCfg = StreamingExecutionConfig{Enabled: true}
+	defer func() { StreamingExecutionCfg = StreamingExecutionConfig{} }()
+	h := newStreamingTestHarness(t)
+	reset := func() { metrics.GlobalBlockReplay.StreamingExecution = metrics.StreamingExecution{} }
+	reason := func() string { return metrics.GlobalBlockReplay.StreamingExecution.NotOpenedReason }
+
+	// Discarded stream, recorded on the observation (the record's own
+	// Discarded/DiscardReason may or may not have survived the loop's
+	// per-attempt reset; the observation always has it).
+	reset()
+	h.exec.observed[42] = &streamingObservation{generation: h.gen, parentSlot: 41, readyAt: time.Now(), seenAt: time.Now(), frontierAtSeen: 41}
+	h.exec.discard("timeout")
+	h.exec.noteWholeBlock(&b.Block{Slot: 42, ShredFullNanos: 123})
+	require.Equal(t, "discarded:timeout", reason())
+	require.Equal(t, int64(123), metrics.GlobalBlockReplay.StreamingExecution.FullNanos)
+	require.Positive(t, metrics.GlobalBlockReplay.StreamingExecution.HeaderReadyNanos)
+	require.Positive(t, metrics.GlobalBlockReplay.StreamingExecution.HeaderSeenNanos)
+
+	// Never saw a header.
+	reset()
+	delete(h.exec.observed, 42)
+	h.exec.noteWholeBlock(&b.Block{Slot: 42})
+	require.Equal(t, "header_not_seen", reason())
+
+	// Declined: the header's generation is unknown to the feed (gone).
+	reset()
+	declined := turbine.NewDetachedStreamMarker(turbine.NewDetachedStreamGeneration(42), 0, 0, turbine.StreamMarkerHeader, 41, h.parentID)
+	h.exec.handleEvent(h.event(declined))
+	require.Nil(t, h.exec.current)
+	h.exec.noteWholeBlock(&b.Block{Slot: 42})
+	require.Contains(t, reason(), "declined:generation no longer active")
+
+	// Waiting: a header whose parent is not the executed frontier stays
+	// remembered, and a whole-block execution of it reports what it waited on.
+	reset()
+	waiting := turbine.NewDetachedStreamMarker(turbine.NewDetachedStreamGeneration(44), 0, 0, turbine.StreamMarkerHeader, 43, solana.Hash{})
+	h.exec.handleEvent(h.event(waiting))
+	require.Contains(t, h.exec.headers, uint64(44))
+	h.exec.noteWholeBlock(&b.Block{Slot: 44})
+	require.Equal(t, "waiting_for_parent:header_on_parent_43_seen_at_frontier_41", reason())
+
+	// Skips never report; a nil executor is a no-op.
+	reset()
+	h.exec.noteWholeBlock(&b.Block{Slot: 44, IsSkipped: true})
+	require.Empty(t, reason())
+	var none *streamingExecutor
+	none.noteWholeBlock(&b.Block{Slot: 44})
+	require.Empty(t, reason())
+
+	// Observations are pruned with the frontier.
+	h.frontier = 44
+	h.exec.pruneHeaders(h.frontier)
+	require.Empty(t, h.exec.observed)
 }

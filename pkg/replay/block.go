@@ -2524,6 +2524,11 @@ func ReplayBlocks(
 	// the wait keeps its exact pre-streaming behaviour.
 	var streamer *streamingExecutor
 	var streamInput replayStreamer
+	// frontierMark is the timeline record of the last executed block (skips
+	// do not touch it: a child's parent is always a real block); the executor
+	// reads it to attribute a child's open delay to its parent's arrival, its
+	// parent's replay, or the loop itself.
+	var frontierMark streamingFrontierMark
 	if blockStream.StreamEvents() != nil {
 		streamer = newStreamingExecutor(streamingDeps{
 			acctsDb:             acctsDb,
@@ -2539,6 +2544,7 @@ func ReplayBlocks(
 			unrootedTailUsed:    unrootedTailState != nil,
 			lastSlotCtx:         func() *sealevel.SlotCtx { return lastSlotCtx },
 			frontier:            func() uint64 { return replayFrontier },
+			frontierMark:        func() streamingFrontierMark { return frontierMark },
 			currentFeatures:     func() *features.Features { return replayCtx.CurrentFeatures },
 			currentEpoch:        func() uint64 { return currentEpoch },
 			rewardsInFlight: func() bool {
@@ -2576,6 +2582,7 @@ func ReplayBlocks(
 			ingressTimings  *b.TurbineIngressTimings
 			waitTime        time.Duration
 			neededAt        time.Time // when replay asked the source for this slot
+			admittedAt      time.Time // when the source handed replay this input
 		)
 
 		{
@@ -2609,6 +2616,11 @@ func ReplayBlocks(
 			}
 
 			neededAt = time.Now()
+			if frontierMark.waitEnteredAt.IsZero() {
+				// First wait after the last executed block: what precedes it is
+				// that block's post-replay tail (promotion, RPC, stats).
+				frontierMark.waitEnteredAt = neededAt
+			}
 			block, parentSwitch, certifiedSwitch = waitForReplayInput(ctx,
 				blockStream.NextReplayInput, sweepWhileWaiting, decisionChanges, alpenglowSwitchPollInterval, streamInput)
 			if ingress, ok := block.CompleteTurbineReplayAdmission(time.Now()); ok {
@@ -2616,7 +2628,8 @@ func ReplayBlocks(
 				ingressTimings = &ingress
 			}
 
-			waitTime = time.Since(neededAt)
+			admittedAt = time.Now()
+			waitTime = admittedAt.Sub(neededAt)
 
 			if stallDone != nil {
 				close(stallDone)
@@ -3106,6 +3119,7 @@ func ReplayBlocks(
 				streamer.discard("other_block")
 			}
 			if !streamed {
+				streamer.noteWholeBlock(block)
 				lastSlotCtx, err = ProcessBlock(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, unrootedTailState, transactionStatuses, alpenglowClock, parentBankSysvars)
 			}
 		}
@@ -3178,6 +3192,10 @@ func ReplayBlocks(
 			}
 		}
 		recordFullToReplayed(block)
+		// The same instant FullToReplayed ends at: from here to the next wait
+		// entry is this block's post-replay tail, which a child's open timeline
+		// reports as OpenWaitPostReplay.
+		frontierMark = streamingFrontierMark{slot: block.Slot, fullNanos: block.ShredFullNanos, admittedAt: admittedAt, replayedAt: time.Now()}
 
 		if rpcServer != nil {
 			rpcServer.SetSlotCtx(lastSlotCtx)

@@ -65,6 +65,9 @@ type realFeedRig struct {
 	statuses    *TransactionStatusCache
 	exec        *streamingExecutor
 	block       *b.Block
+	// mark is the loop's record of the executed parent (replayed before any
+	// shred of the child is broadcast), as the loop would hold it.
+	mark streamingFrontierMark
 	// the slot's content, as wire bytes, decoded fresh for every use
 	legacyWires, v0Wires [][]byte
 }
@@ -142,6 +145,8 @@ func newRealFeedRig(t *testing.T, dest solana.PublicKey, eventBuffer int) *realF
 
 	rig.tail = &lifecycleTail{durable: env.durable}
 	rig.statuses = NewTransactionStatusCache()
+	now := time.Now()
+	rig.mark = streamingFrontierMark{slot: realFeedParentSlot, fullNanos: now.Add(-10 * time.Millisecond).UnixNano(), admittedAt: now.Add(-5 * time.Millisecond), replayedAt: now, waitEnteredAt: now.Add(time.Microsecond)}
 	rig.exec = newStreamingExecutor(streamingDeps{
 		acctsDb:             env.acctsDb,
 		feed:                rig.feed,
@@ -154,6 +159,7 @@ func newRealFeedRig(t *testing.T, dest solana.PublicKey, eventBuffer int) *realF
 		unrootedTailUsed:    true,
 		lastSlotCtx:         func() *sealevel.SlotCtx { return rig.lastCtx },
 		frontier:            func() uint64 { return realFeedParentSlot },
+		frontierMark:        func() streamingFrontierMark { return rig.mark },
 		currentFeatures:     func() *features.Features { return env.feats },
 		currentEpoch:        func() uint64 { return 0 },
 		rewardsInFlight:     func() bool { return false },
@@ -304,6 +310,29 @@ func (rig *realFeedRig) finalizeAndCompare(reference lifecycleOutcome) {
 	require.Equal(rig.t, uint64(1), record.Opened)
 	require.Equal(rig.t, uint64(len(rig.allWires())), record.Transactions)
 	require.Zero(rig.t, record.Discarded, "discard reason %q", record.DiscardReason)
+	require.Empty(rig.t, record.NotOpenedReason)
+
+	// The open timeline, in order: the parent was replayed before the child's
+	// header was decoded, the header was seen no earlier than decoded, the
+	// stream opened after that, executed, and finalized after the last shred.
+	require.Equal(rig.t, rig.mark.replayedAt.UnixNano(), record.ParentReplayedNanos)
+	require.Equal(rig.t, rig.mark.admittedAt.UnixNano(), record.ParentAdmittedNanos)
+	require.Equal(rig.t, rig.mark.fullNanos, record.ParentFullNanos)
+	require.Less(rig.t, record.ParentReplayedNanos, record.HeaderReadyNanos)
+	require.LessOrEqual(rig.t, record.HeaderReadyNanos, record.HeaderSeenNanos)
+	require.LessOrEqual(rig.t, record.HeaderSeenNanos, record.OpenedNanos)
+	require.LessOrEqual(rig.t, record.OpenedNanos, record.FirstGroupStartNanos)
+	require.Equal(rig.t, block.ShredFullNanos, record.FullNanos)
+	require.LessOrEqual(rig.t, record.FullNanos, record.FinalizeStartNanos)
+	require.Zero(rig.t, record.OpenWaitParentArrival.Count, "the parent was fully received before the header")
+	require.Zero(rig.t, record.OpenWaitParentReplay.Count, "the parent was replayed before the header")
+	require.Zero(rig.t, record.OpenWaitParentQueue.Count)
+	require.Zero(rig.t, record.OpenWaitParentExec.Count)
+	require.Equal(rig.t, uint64(1), record.OpenWaitLoop.Count)
+	require.Equal(rig.t, uint64(record.OpenedNanos-record.HeaderSeenNanos), record.OpenWaitLoop.SumNanoseconds, "with nothing to wait for, the whole open delay is the loop's")
+	require.Equal(rig.t, rig.mark.waitEnteredAt.UnixNano(), record.WaitEnteredNanos)
+	require.Zero(rig.t, record.OpenWaitPostReplay.Count, "the header arrived after the loop was already waiting")
+	require.Equal(rig.t, record.OpenWaitLoop, record.OpenWaitDispatch, "…so the loop's delay is all dispatch")
 }
 
 func TestStreamingRealFeedExecutesPrefixBeforeCompletionAndMatchesWholeBlock(t *testing.T) {

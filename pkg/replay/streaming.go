@@ -111,8 +111,11 @@ type streamingDeps struct {
 	transactionStatuses *TransactionStatusCache
 	alpenglowClock      bool
 
-	lastSlotCtx      func() *sealevel.SlotCtx
-	frontier         func() uint64
+	lastSlotCtx func() *sealevel.SlotCtx
+	frontier    func() uint64
+	// frontierMark reports the last executed block's replay and full instants
+	// (timeline only; nil when the loop does not track it).
+	frontierMark     func() streamingFrontierMark
 	currentFeatures  func() *features.Features
 	currentEpoch     func() uint64
 	rewardsInFlight  func() bool
@@ -125,6 +128,39 @@ type streamingDeps struct {
 type streamingGroup struct {
 	startedAt, finishedAt time.Time
 	transactions          int
+}
+
+// streamingFrontierMark is the replay loop's record of the last executed
+// block: the slot, the instant its replay result reached consensus, and its
+// last-shred instant (0 for a block that did not arrive as shreds). Skips do
+// not update it. It only feeds the timeline; the executor never decides
+// anything on it.
+type streamingFrontierMark struct {
+	slot      uint64
+	fullNanos int64
+	// admittedAt is when the source handed the block to replay (after its
+	// ancestors were replayed and the emitter released it); replayedAt when
+	// its replay result reached consensus.
+	admittedAt time.Time
+	replayedAt time.Time
+	// waitEnteredAt is the loop's first entry into the replay wait after
+	// replayedAt; what lies between is the executed block's post-replay tail.
+	waitEnteredAt time.Time
+}
+
+// streamingObservation is what the executor knows about a slot's header. It
+// outlives the header itself (pruned when the frontier passes the slot) so
+// that a block executed whole can report why no stream opened for it, and a
+// stream can report how long its header waited and on what.
+type streamingObservation struct {
+	generation     turbine.StreamGeneration
+	parentSlot     uint64
+	readyAt        time.Time // header batch decoded (its wake-up's ReadyAt)
+	seenAt         time.Time // executor first handled the header
+	frontierAtSeen uint64
+	declined       string // eligibility reason, when the header was declined
+	discarded      string // discard reason, when a stream opened and was thrown away
+	openedAt       time.Time
 }
 
 // streamingSlot is one in-progress stream.
@@ -145,6 +181,14 @@ type streamingSlot struct {
 	openedAt   time.Time
 	headerAt   time.Time
 	groups     []streamingGroup
+	// timeline: what bounded the open (see metrics.StreamingExecution). Kept
+	// here rather than in the collector because the loop resets the collector
+	// before every wait and the block may arrive several waits after the open.
+	headerSeenAt     time.Time
+	parentFullNanos  int64
+	parentAdmittedAt time.Time
+	parentReplayedAt time.Time
+	waitEnteredAt    time.Time
 	// restoreSysvarCache puts the legacy process-global sysvar cache back to
 	// its state before the bank opened; nil when nothing was published.
 	restoreSysvarCache func()
@@ -162,7 +206,10 @@ type streamingExecutor struct {
 	// declined; header recovery (recoverHeader) never reopens it. Pruned with
 	// headers.
 	retired map[uint64]turbine.StreamGeneration
-	ticker  *time.Ticker
+	// observed is the per-slot header timeline (see streamingObservation),
+	// pruned with headers.
+	observed map[uint64]*streamingObservation
+	ticker   *time.Ticker
 	// executeFn runs one group on the open execution; tests substitute it.
 	executeFn func(exec *blockExecution, txs []*solana.Transaction, identities *b.PreparedTransactionMessageIdentities, shouldVerifySignatures bool) error
 }
@@ -172,6 +219,7 @@ func newStreamingExecutor(deps streamingDeps) *streamingExecutor {
 		deps:      deps,
 		headers:   make(map[uint64]*turbine.StreamBatch),
 		retired:   make(map[uint64]turbine.StreamGeneration),
+		observed:  make(map[uint64]*streamingObservation),
 		executeFn: (*blockExecution).executeTransactionGroup,
 	}
 }
@@ -227,6 +275,7 @@ func (s *streamingExecutor) shutdown() {
 	s.stopTicker()
 	s.headers = make(map[uint64]*turbine.StreamBatch)
 	s.retired = make(map[uint64]turbine.StreamGeneration)
+	s.observed = make(map[uint64]*streamingObservation)
 }
 
 // handleEvent consumes one feed wake-up.
@@ -313,6 +362,15 @@ func (s *streamingExecutor) rememberHeader(header *turbine.StreamBatch) {
 		return
 	}
 	s.headers[header.Slot] = header
+	if obs := s.observed[header.Slot]; obs == nil || obs.generation != header.Generation {
+		s.observed[header.Slot] = &streamingObservation{
+			generation:     header.Generation,
+			parentSlot:     header.ParentSlot,
+			readyAt:        header.ReadyAt,
+			seenAt:         time.Now(),
+			frontierAtSeen: frontier,
+		}
+	}
 	s.pruneHeaders(frontier)
 }
 
@@ -369,6 +427,11 @@ func (s *streamingExecutor) pruneHeaders(frontier uint64) {
 			delete(s.retired, slot)
 		}
 	}
+	for slot := range s.observed {
+		if slot <= frontier {
+			delete(s.observed, slot)
+		}
+	}
 }
 
 // nextHeader prefers the next slot, otherwise the earliest nearby child of
@@ -409,6 +472,9 @@ func (s *streamingExecutor) tryOpen() {
 		if reason := s.eligibility(header); reason != "" {
 			mlog.Log.FileOnlyf("streaming: slot %d not opened (%s)", header.Slot, reason)
 			s.retire(header.Slot, header.Generation)
+			if obs := s.observed[header.Slot]; obs != nil && obs.generation == header.Generation {
+				obs.declined = reason
+			}
 			continue
 		}
 		s.openStream(header)
@@ -492,7 +558,7 @@ func (s *streamingExecutor) openStream(header *turbine.StreamBatch) {
 	exec.slotCtx.TrackProgramCacheAdds = true
 	exec.setReplayStage("streaming_wait")
 
-	s.current = &streamingSlot{
+	cur := &streamingSlot{
 		slot:               shell.Slot,
 		generation:         header.Generation,
 		parentSlot:         header.ParentSlot,
@@ -501,11 +567,30 @@ func (s *streamingExecutor) openStream(header *turbine.StreamBatch) {
 		pending:            make(map[uint32]*turbine.StreamBatch),
 		openedAt:           time.Now(),
 		headerAt:           header.ReadyAt,
+		headerSeenAt:       header.ReadyAt,
 		restoreSysvarCache: func() { sealevel.SysvarCache = sysvarCacheAtOpen },
 	}
+	if obs := s.observed[shell.Slot]; obs != nil && obs.generation == header.Generation {
+		obs.openedAt = cur.openedAt
+		if !obs.seenAt.IsZero() {
+			cur.headerSeenAt = obs.seenAt
+		}
+	}
+	if d.frontierMark != nil {
+		// The mark is only the child's parent when the last executed block is
+		// that very slot; after a fork-switch re-base it is not, and the
+		// timeline says "unknown" rather than blaming the wrong slot.
+		if mark := d.frontierMark(); mark.slot == header.ParentSlot && !mark.replayedAt.IsZero() {
+			cur.parentFullNanos = mark.fullNanos
+			cur.parentAdmittedAt = mark.admittedAt
+			cur.parentReplayedAt = mark.replayedAt
+			cur.waitEnteredAt = mark.waitEnteredAt
+		}
+	}
+	s.current = cur
 	metrics.GlobalBlockReplay.StreamingExecution.Opened = 1
 	d.feed.PrioritizeStreamRepair(shell.Slot)
-	mlog.Log.FileOnlyf("streaming: opened slot %d on parent %d", shell.Slot, header.ParentSlot)
+	mlog.Log.FileOnlyf("streaming: opened slot %d on parent %d | %s", shell.Slot, header.ParentSlot, cur.openTimeline())
 	s.offer(header)
 	s.pull()
 	s.consume()
@@ -663,6 +748,9 @@ func (s *streamingExecutor) discard(reason string) {
 	s.current = nil
 	s.stopTicker()
 	s.retire(cur.slot, cur.generation)
+	if obs := s.observed[cur.slot]; obs != nil && obs.generation == cur.generation {
+		obs.discarded = reason
+	}
 	exec := cur.exec
 	if exec != nil {
 		exec.close()
@@ -725,6 +813,7 @@ func (s *streamingExecutor) finalize(block *b.Block, parentBankSysvars *sealevel
 		return nil, false, nil
 	}
 	cur := s.current
+	finalizeStart := time.Now()
 	if reason := s.handshake(block, parentBankSysvars); reason != "" {
 		s.discard("prefix_mismatch:" + reason)
 		return nil, false, nil
@@ -839,6 +928,7 @@ func (s *streamingExecutor) finalize(block *b.Block, parentBankSysvars *sealevel
 		}
 	}
 	record.OpenDelay.AddTiming(cur.openedAt.Sub(cur.headerAt))
+	cur.recordTimeline(record, block, finalizeStart)
 	return slotCtx, true, nil
 }
 
@@ -877,4 +967,120 @@ func (s *streamingExecutor) handshake(block *b.Block, parentBankSysvars *sealeve
 		}
 	}
 	return ""
+}
+
+// nanosOf is a time as unix nanoseconds, 0 for the zero time.
+func nanosOf(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixNano()
+}
+
+// recordTimeline writes the stream's open timeline and its decomposition
+// into the block's record. Every wait is attributed to exactly one thing:
+//
+//	header ready ─(parent arrival)─▶ parent full ─(parent replay)─▶ parent
+//	replayed ─(loop: post-replay tail │ dispatch)─▶ opened
+//
+// with the header's own wake-up latency (ready → seen) reported alongside.
+// Each component is zero when the timeline cannot support it (unknown
+// instants, or an ordering that makes it empty). The arithmetic is done on
+// the wall-clock nanos the record carries, so the components and the
+// instants are exactly consistent for whoever joins them later.
+func (cur *streamingSlot) recordTimeline(record *metrics.StreamingExecution, block *b.Block, finalizeStart time.Time) {
+	ready, seen, opened := nanosOf(cur.headerAt), nanosOf(cur.headerSeenAt), nanosOf(cur.openedAt)
+	if seen == 0 {
+		seen = ready
+	}
+	parentFull, parentAdmitted, parentReplayed, waitEntered := cur.parentFullNanos, nanosOf(cur.parentAdmittedAt), nanosOf(cur.parentReplayedAt), nanosOf(cur.waitEnteredAt)
+	record.HeaderReadyNanos = ready
+	record.HeaderSeenNanos = seen
+	record.OpenedNanos = opened
+	record.ParentFullNanos = parentFull
+	record.ParentAdmittedNanos = parentAdmitted
+	record.ParentReplayedNanos = parentReplayed
+	record.WaitEnteredNanos = waitEntered
+	if len(cur.groups) > 0 {
+		record.FirstGroupStartNanos = nanosOf(cur.groups[0].startedAt)
+	}
+	if block != nil && block.ShredFullNanos > 0 {
+		record.FullNanos = block.ShredFullNanos
+	}
+	record.FinalizeStartNanos = nanosOf(finalizeStart)
+
+	add := func(timing *metrics.Timing, from, to int64) {
+		if from > 0 && to > from {
+			timing.AddTiming(time.Duration(to - from))
+		}
+	}
+	add(&record.OpenWaitParentArrival, ready, parentFull)
+	if parentReplayed > 0 {
+		replayStart := max(ready, parentFull)
+		add(&record.OpenWaitParentReplay, replayStart, parentReplayed)
+		// The parent's replay splits at its admission: before it the parent
+		// was still in the source (completion, verification, waiting for its
+		// own ancestors); after it, its execution and tail. Queue + Exec ==
+		// ParentReplay whatever the ordering.
+		if parentAdmitted > 0 {
+			add(&record.OpenWaitParentQueue, replayStart, min(parentAdmitted, parentReplayed))
+			add(&record.OpenWaitParentExec, max(parentAdmitted, replayStart), parentReplayed)
+		}
+	}
+	loopStart := max(seen, parentReplayed)
+	add(&record.OpenWaitLoop, loopStart, opened)
+	// The loop's wait splits at its first entry into the replay wait after
+	// the parent: before it is the parent's post-replay tail, after it the
+	// dispatch of the child's header (queued events ahead of it, the poll).
+	if waitEntered > 0 && parentReplayed > 0 && waitEntered > parentReplayed {
+		add(&record.OpenWaitPostReplay, loopStart, min(waitEntered, opened))
+		add(&record.OpenWaitDispatch, max(waitEntered, seen), opened)
+	}
+}
+
+// openTimeline renders the open's timeline for the log, relative to the
+// header's decode instant.
+func (cur *streamingSlot) openTimeline() string {
+	base := nanosOf(cur.headerAt)
+	rel := func(nanos int64) string {
+		if nanos == 0 {
+			return "?"
+		}
+		return fmt.Sprintf("%+.1fms", float64(nanos-base)/1e6)
+	}
+	return fmt.Sprintf("header seen %s, parent full %s, parent admitted %s, parent replayed %s, wait entered %s, opened %s (vs header ready)",
+		rel(nanosOf(cur.headerSeenAt)), rel(cur.parentFullNanos), rel(nanosOf(cur.parentAdmittedAt)), rel(nanosOf(cur.parentReplayedAt)), rel(nanosOf(cur.waitEnteredAt)), rel(nanosOf(cur.openedAt)))
+}
+
+// noteWholeBlock records, for a block about to execute whole, why no stream
+// opened for it (the block's record otherwise only says Opened == 0). The
+// header timeline is filled in when the header was seen, so the analysis can
+// tell "never decoded a header" from "decoded one and could not use it".
+func (s *streamingExecutor) noteWholeBlock(block *b.Block) {
+	if s == nil || block == nil || block.IsSkipped {
+		return
+	}
+	record := &metrics.GlobalBlockReplay.StreamingExecution
+	if block.ShredFullNanos > 0 {
+		record.FullNanos = block.ShredFullNanos
+	}
+	obs := s.observed[block.Slot]
+	switch {
+	case obs == nil:
+		record.NotOpenedReason = "header_not_seen"
+		return
+	case obs.discarded != "":
+		record.NotOpenedReason = "discarded:" + obs.discarded
+	case obs.declined != "":
+		record.NotOpenedReason = "declined:" + obs.declined
+	case !obs.openedAt.IsZero():
+		// Unreachable in practice (an opened stream ends in finalize or in a
+		// discard, which records itself); kept so the record never lies.
+		record.NotOpenedReason = "opened_not_discarded"
+	default:
+		record.NotOpenedReason = fmt.Sprintf("waiting_for_parent:header_on_parent_%d_seen_at_frontier_%d", obs.parentSlot, obs.frontierAtSeen)
+	}
+	record.HeaderReadyNanos = nanosOf(obs.readyAt)
+	record.HeaderSeenNanos = nanosOf(obs.seenAt)
+	record.OpenedNanos = nanosOf(obs.openedAt)
 }
