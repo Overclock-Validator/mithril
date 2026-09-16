@@ -5,6 +5,7 @@ package lthash
 import (
 	"math/rand"
 	"testing"
+	"unsafe"
 )
 
 // TestMixAVX2AgainstGeneric runs the assembly directly (when the CPU has
@@ -47,5 +48,27 @@ func TestMixGenericFallbackSelectable(t *testing.T) {
 	mixIn(dst, src)
 	if *dst != want {
 		t.Fatal("generic fallback must be used when AVX2 is disabled")
+	}
+}
+
+func TestMixAVX2UnalignedAndAliased(t *testing.T) {
+	if !useAVX2 {
+		t.Skip("AVX2 unavailable")
+	}
+	rng := rand.New(rand.NewSource(19))
+	for off := 0; off < 32; off += 2 {
+		storage := make([]byte, numElements*2+32)
+		dst := (*[numElements]uint16)(unsafe.Pointer(&storage[off]))
+		*dst = *randomLanes(rng)
+		want := *dst
+		mixInGeneric(&want, &want)
+		mixInAVX2(dst, dst)
+		if *dst != want {
+			t.Fatalf("aliased addition offset %d", off)
+		}
+		mixOutAVX2(dst, dst)
+		if *dst != ([numElements]uint16{}) {
+			t.Fatalf("aliased subtraction offset %d", off)
+		}
 	}
 }
