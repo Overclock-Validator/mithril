@@ -2,7 +2,7 @@
 
 The maintained subsystem documentation and reusable Go benchmarks describe the
 implementation and reproduction method. Historical raw results and session
-notes are retained at [the tested source snapshot](https://github.com/Overclock-Validator/mithril/blob/a511ad3b0bc77cf8b5ae4ee16359ac6b453fc7bf)
+notes are retained at [the tested source snapshot](https://github.com/Overclock-Validator/mithril/tree/a511ad3b0bc77cf8b5ae4ee16359ac6b453fc7bf)
 (tag `review-evidence-20260916-status-checkpoint-expiry`). They are omitted from this proposed merge.
 
 [Historical result files](https://github.com/Overclock-Validator/mithril/tree/a511ad3b0bc77cf8b5ae4ee16359ac6b453fc7bf/docs/results)
