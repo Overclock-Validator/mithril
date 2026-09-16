@@ -983,7 +983,12 @@ func (c *repairClient) sendShredAttempt(conn *net.UDPConn, peers []gossip.Repair
 	c.byResponse[responseKey] = key
 	c.mu.Unlock()
 
+	var traceStart int64
+	if entryTraceSelected(slot) {
+		traceStart = entryTraceNow()
+	}
 	if _, err := conn.WriteToUDP(packet, peer.Addr); err != nil {
+		traceRepairSend(slot, index, kind, attempt, traceStart, false)
 		c.mu.Lock()
 		delete(c.outstanding, key)
 		delete(c.byResponse, responseKey)
@@ -994,6 +999,7 @@ func (c *repairClient) sendShredAttempt(conn *net.UDPConn, peers []gossip.Repair
 		return false
 	}
 
+	traceRepairSend(slot, index, kind, attempt, traceStart, true)
 	c.requests.Add(1)
 	return true
 }

@@ -268,6 +268,10 @@ func (a *SlotAssembler) addShredFrom(shred *Shred, fromRepair bool) (*slotComple
 // of this immutable shred. Unauthenticated callers and spool hydration use nil
 // and retain the normal root-computation fallback.
 func (a *SlotAssembler) addShredFromWithRoot(shred *Shred, fromRepair bool, root *solana.Hash) (*slotCompletionWork, error) {
+	var admissionEntered int64
+	if shred != nil && entryTraceSelected(shred.Slot) {
+		admissionEntered = entryTraceNow()
+	}
 	if shred == nil {
 		return nil, nil
 	}
@@ -316,7 +320,11 @@ func (a *SlotAssembler) addShredFromWithRoot(shred *Shred, fromRepair bool, root
 		state.noteError(err)
 		return nil, err
 	}
-	state.traceAcceptedShred(shred)
+	source := entryShredSource{Path: "non_repair", FEC: shred.FECSetIndex, TriggerIndex: shred.Index, TriggerCoding: shred.Type == ShredTypeCode, TriggerRepair: fromRepair, AdmissionEntered: admissionEntered}
+	if fromRepair {
+		source.Path = "repair"
+	}
+	state.traceAcceptedShred(shred, source)
 	a.notePrefetchShredLocked(state, shred)
 	if state.firstShredAt.IsZero() {
 		state.firstShredAt = time.Now()
@@ -339,7 +347,8 @@ func (a *SlotAssembler) addShredFromWithRoot(shred *Shred, fromRepair bool, root
 			return nil, err
 		}
 		if err == nil {
-			state.traceAcceptedShred(recoveredShred)
+			source.Path = "fec_recovery"
+			state.traceAcceptedShred(recoveredShred, source)
 			a.notePrefetchShredLocked(state, recoveredShred)
 			a.recoveredDataShreds++
 		}

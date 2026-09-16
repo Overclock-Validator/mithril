@@ -157,3 +157,36 @@ For four 4,096-transaction components, medians of the three per-run statistics w
 Completion-finished p99 ranged 46.43–54.52 ms before and 1.477–1.719 ms after. Admission p99 ranged 44.27–53.76 ms before and 0.003206–0.06401 ms after. Every iteration reached its intended request occupancy. For 256-transaction components, completion-finished p99 medians were 3.215→1.165 ms. Shared-host scheduling introduces variation; reserving admission does not remove queued-job or CPU delays, and these 100-sample tails are not a live p99/FAST claim. Total-work throughput was roughly unchanged; no total-work tail improvement is claimed.
 
 Original run artifacts are retained in the [evidence archive](streaming-preparation-evidence.md).
+
+### Completion-critical shred diagnostics
+
+The optional `MITHRIL_ENTRY_TRACE_MOD`, `MITHRIL_ENTRY_TRACE_SECONDS` (at most
+1,800), and `MITHRIL_ENTRY_TRACE_FILE` settings are read at process startup.
+Use a new output file for each capture. Tracing is disabled by default.
+
+Large-block batch records include `critical_shred_index` and its admission
+source: `non_repair`, `repair`, or `fec_recovery`. The critical index maximizes
+local availability time across the batch **and its preceding DATA_COMPLETE
+boundary**. Equal timestamps select the lowest index and report the tie count;
+unknown coverage still sets `availability_known=false`. This identifies the
+last locally available dependency, not necessarily the replay cursor's current
+blocking range. Correlate with execution groups before calling it a replay stall.
+
+Recovered shreds identify the triggering packet's index, FEC set, coding/data
+type and repair status. `non_repair` can include spool hydration. Admission entry
+timestamps precede the assembler lock; they are not socket/NIC timestamps. A zero
+admission-entry timestamp means it was not sampled. Admission-to-availability
+includes local processing and, for recovered data, reconstruction.
+
+The same JSONL file also contains `event="repair_send"` records. Consumers must
+separate these from block reports. Join by `origin_unix_ns`, slot and shred index,
+then order by send timestamps; attempt IDs can reset. Start/end bracket the UDP
+write, and `success` means only that the local write succeeded. Highest-index
+probes are explicitly marked and must not be treated as exact-index requests.
+Request records can exist for slots without a large-block report. No response
+peer or exact request/response nonce correlation is recorded.
+
+Both queues are bounded and producers never wait for the writer. The cumulative
+`dropped_reports` counter covers queue drops and encoding failures; an absent
+repair record is not proof of no request if records were dropped. Tracing does
+not change repair scheduling, retry intervals, fanout or verification checks.
