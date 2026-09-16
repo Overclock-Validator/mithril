@@ -221,6 +221,9 @@ func (bs *BlockSource) attachAlpenglowBlockIDHintsToReceiver(receiver *turbine.U
 	// would then make its slot permanently unfetchable.
 	bs.alpenglowMu.Lock()
 	bs.activeTurbineReceiver = receiver
+	if bs.streamEvents != nil {
+		receiver.SubscribeStream(bs.streamEvents)
+	}
 	if !bs.turbineAlpenglowBlockIDHints {
 		bs.alpenglowMu.Unlock()
 		return
@@ -567,4 +570,56 @@ func (bs *BlockSource) runTurbineStream() {
 			backoff = liveMaxRetryBackoff
 		}
 	}
+}
+
+// streamEventBuffer bounds the streaming feed: a heavy block is a few hundred
+// DATA_COMPLETE ranges, and the consumer drains between groups.
+const streamEventBuffer = 4096
+
+func newStreamEventChannel(opts *BlockSourceOpts) chan turbine.StreamEvent {
+	if opts == nil || opts.SourceType != BlockSourceTurbine || !opts.TurbineStreamingExecution {
+		return nil
+	}
+	return make(chan turbine.StreamEvent, streamEventBuffer)
+}
+
+// StreamEvents is the turbine streaming feed for replay's streaming executor;
+// nil when streaming execution is not enabled for this source.
+func (bs *BlockSource) StreamEvents() <-chan turbine.StreamEvent {
+	if bs.streamEvents == nil {
+		return nil
+	}
+	return bs.streamEvents
+}
+
+// StreamStatusOf reports the assembler's view of a streaming generation
+// through the active receiver; a generation is gone when no receiver is
+// active.
+func (bs *BlockSource) StreamStatusOf(g turbine.StreamGeneration) turbine.StreamStatus {
+	bs.alpenglowMu.Lock()
+	receiver := bs.activeTurbineReceiver
+	bs.alpenglowMu.Unlock()
+	if receiver == nil {
+		return turbine.StreamGone
+	}
+	return receiver.StreamStatusOf(g)
+}
+
+// PendingStreamBatches returns the generation's decoded batches at or after
+// fromStart, in shred-index order, from the active receiver.
+func (bs *BlockSource) PendingStreamBatches(g turbine.StreamGeneration, fromStart uint32) []*turbine.StreamBatch {
+	bs.alpenglowMu.Lock()
+	receiver := bs.activeTurbineReceiver
+	bs.alpenglowMu.Unlock()
+	if receiver == nil {
+		return nil
+	}
+	return receiver.PendingStreamBatches(g, fromStart)
+}
+
+// PrioritizeStreamRepair keeps a slot that replay is executing while its
+// shreds arrive pinned for repair, since the emitter pins the head only when
+// it observes a gap.
+func (bs *BlockSource) PrioritizeStreamRepair(slot uint64) {
+	bs.prioritizeTurbineRepairRange(slot, slot)
 }

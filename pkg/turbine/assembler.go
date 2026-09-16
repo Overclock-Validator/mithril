@@ -80,6 +80,10 @@ type SlotAssembler struct {
 	// Production uses the process-wide bounded transaction verifier.
 	verifyTransactions func(context.Context, *block.Block) error
 	entryPrefetch      *entryPrefetchPool
+	// Streaming feed subscriber (see stream.go); nil when nothing consumes
+	// batches before completion.
+	streamSubscriber    chan<- StreamEvent
+	streamDroppedEvents uint64
 }
 
 type SlotRepairRequest struct {
@@ -124,6 +128,11 @@ type slotState struct {
 	// flow is usually poisoned state — the latest error names the poison.
 	errCount int
 	lastErr  string
+	// streamCompleted marks a generation whose complete block was accepted, so
+	// the feed's release event says "completed" rather than "cancelled";
+	// streamCancelReason names the discard path otherwise.
+	streamCompleted    bool
+	streamCancelReason string
 }
 
 func (s *slotState) noteError(err error) {
@@ -496,6 +505,7 @@ func (a *SlotAssembler) finalizeCompletion(work *slotCompletionWork, processed p
 	if !a.acceptAlpenglowBlockIDLocked(blk) {
 		a.trackNonCanonicalBlockIDLocked(blk)
 		a.recordPartialObsLocked(state)
+		state.streamCancelReason = "non_canonical"
 		a.releasePrefetchLocked(state)
 		delete(a.slots, state.slot)
 		a.mu.Unlock()
@@ -505,6 +515,7 @@ func (a *SlotAssembler) finalizeCompletion(work *slotCompletionWork, processed p
 		return nil, nil
 	}
 
+	state.streamCompleted = true
 	a.releasePrefetchLocked(state)
 	delete(a.slots, state.slot)
 	a.completedSlots[state.slot] = struct{}{}
@@ -611,6 +622,9 @@ func (a *SlotAssembler) ResetSlot(slot uint64) {
 
 	a.retentionDirty = true
 	a.recordPartialObsLocked(a.slots[slot])
+	if state := a.slots[slot]; state != nil {
+		state.streamCancelReason = "reset"
+	}
 	a.releasePrefetchLocked(a.slots[slot])
 	delete(a.slots, slot)
 	delete(a.completedSlots, slot)
@@ -724,6 +738,9 @@ func (a *SlotAssembler) pruneOldSlotsLocked() {
 			return
 		}
 		a.recordPartialObsLocked(a.slots[victim])
+		if state := a.slots[victim]; state != nil {
+			state.streamCancelReason = "evicted"
+		}
 		a.releasePrefetchLocked(a.slots[victim])
 		delete(a.slots, victim)
 		a.evictedSlots++
@@ -739,6 +756,7 @@ func (a *SlotAssembler) sweepRetentionMapsLocked() {
 		for slot, state := range a.slots {
 			if slot < minSlot && !state.completing {
 				a.recordPartialObsLocked(state)
+				state.streamCancelReason = "retention"
 				a.releasePrefetchLocked(a.slots[slot])
 				delete(a.slots, slot)
 				a.evictedSlots++

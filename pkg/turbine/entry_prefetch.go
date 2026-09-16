@@ -189,6 +189,9 @@ func (p *entryPrefetchPool) run() {
 		p.a.mu.Lock()
 		f.queued = false
 		close(f.queueDone)
+		if !f.released && p.a.slots[s.slot] == s {
+			p.a.publishStreamBatchReadyLocked(s, batch)
+		}
 		p.enqueueLocked(s)
 		p.a.mu.Unlock()
 	}
@@ -219,6 +222,11 @@ func (a *SlotAssembler) releasePrefetchLocked(s *slotState) {
 	f := s.prefetch
 	f.released = true
 	f.cancel()
+	reason := s.streamCancelReason
+	if reason == "" {
+		reason = "released"
+	}
+	a.publishStreamReleaseLocked(s, reason)
 	p := f.pool
 	queueDone := f.queueDone
 	p.cleanup.Add(1)
@@ -250,6 +258,9 @@ func (p *entryPrefetchPool) closeAndWait() {
 		}
 		for _, s := range p.a.slots {
 			if s.prefetch != nil && s.prefetch.pool == p {
+				if s.streamCancelReason == "" {
+					s.streamCancelReason = "shutdown"
+				}
 				p.a.releasePrefetchLocked(s)
 			}
 		}

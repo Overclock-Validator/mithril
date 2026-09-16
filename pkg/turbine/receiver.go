@@ -389,6 +389,24 @@ func (r *UDPReceiver) PrioritizeRepairRange(start, end uint64) {
 	r.assembler.PrioritizeRepairRange(start, end)
 }
 
+// SubscribeStream installs the streaming-execution feed subscriber on this
+// receiver's assembler (see stream.go). Only one subscriber is supported.
+func (r *UDPReceiver) SubscribeStream(ch chan<- StreamEvent) {
+	r.assembler.SubscribeStream(ch)
+}
+
+// StreamStatusOf reports whether a streaming generation is still the slot's
+// current assembly, completed into a block, or gone.
+func (r *UDPReceiver) StreamStatusOf(g StreamGeneration) StreamStatus {
+	return r.assembler.StreamStatusOf(g)
+}
+
+// PendingStreamBatches returns the generation's decoded batches starting at
+// or after fromStart, in shred-index order.
+func (r *UDPReceiver) PendingStreamBatches(g StreamGeneration, fromStart uint32) []*StreamBatch {
+	return r.assembler.PendingStreamBatches(g, fromStart)
+}
+
 func (r *UDPReceiver) Blocks() <-chan *block.Block {
 	return r.blocks
 }

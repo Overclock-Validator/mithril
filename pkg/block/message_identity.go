@@ -34,3 +34,16 @@ func (prepared *PreparedTransactionMessageIdentities) Identity(index int) txstat
 func (prepared *PreparedTransactionMessageIdentities) MatchesBlock(block *Block) bool {
 	return block != nil && prepared.matches(block.Transactions)
 }
+
+// Slice returns the prepared identities for transactions [from, to) as an
+// independent prepared set bound to that sub-slice.
+func (prepared *PreparedTransactionMessageIdentities) Slice(from, to int) *PreparedTransactionMessageIdentities {
+	if prepared == nil || from < 0 || to > len(prepared.identities) || from > to {
+		return nil
+	}
+	return &PreparedTransactionMessageIdentities{
+		transactions: prepared.transactions[from:to:to],
+		versions:     prepared.versions[from:to:to],
+		identities:   prepared.identities[from:to:to],
+	}
+}
