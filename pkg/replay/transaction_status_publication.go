@@ -11,9 +11,8 @@ import (
 // Preparation owns private, immutable maps. It never publishes a status or
 // authorizes a bank: commit still checks coverage, lineage, and duplicates.
 type preparedTransactionStatusDelta struct {
-	identities   *b.PreparedTransactionMessageIdentities
-	delta        transactionStatusDelta
-	indexBatches map[solana.Hash]*transactionStatusIndexBatch
+	identities *b.PreparedTransactionMessageIdentities
+	delta      transactionStatusDelta
 }
 
 type transactionStatusPreparation struct {
@@ -57,33 +56,14 @@ func countTransactionStatusGroups(identities *b.PreparedTransactionMessageIdenti
 }
 
 func buildTransactionStatusDelta(identities *b.PreparedTransactionMessageIdentities, counts map[solana.Hash]int, indexes map[solana.Hash]uint8) transactionStatusDelta {
-	return buildTransactionStatusDeltaWithBatches(identities, counts, indexes, nil)
-}
-
-func buildTransactionStatusDeltaWithBatches(identities *b.PreparedTransactionMessageIdentities, counts map[solana.Hash]int, indexes map[solana.Hash]uint8, batches map[solana.Hash]*transactionStatusIndexBatch) transactionStatusDelta {
 	delta := make(transactionStatusDelta, len(counts))
 	for blockhash, count := range counts {
 		delta[blockhash] = &transactionStatusGroup{keyIndex: indexes[blockhash], keys: make(map[transactionStatusKey]struct{}, count)}
-		if batches != nil && count >= 1024 {
-			batches[blockhash] = &transactionStatusIndexBatch{keys: make([]transactionStatusKey, 0, count)}
-		}
 	}
-	var previous solana.Hash
-	var group *transactionStatusGroup
-	var batch *transactionStatusIndexBatch
 	for i := 0; i < identities.Len(); i++ {
 		identity := identities.Identity(i)
-		if group == nil || identity.RecentBlockhash != previous {
-			previous = identity.RecentBlockhash
-			group = delta[previous]
-			batch = batches[previous]
-		}
-		key := sliceTransactionStatusKey(identity.MessageHash, group.keyIndex)
-		before := len(group.keys)
-		group.keys[key] = struct{}{}
-		if batch != nil && len(group.keys) != before {
-			batch.append(key)
-		}
+		group := delta[identity.RecentBlockhash]
+		group.keys[sliceTransactionStatusKey(identity.MessageHash, group.keyIndex)] = struct{}{}
 	}
 	return delta
 }
@@ -99,10 +79,5 @@ func (c *TransactionStatusCache) prepareTransactionStatusDelta(identities *b.Pre
 		}
 	}
 	c.mu.RUnlock()
-	batches := make(map[solana.Hash]*transactionStatusIndexBatch, len(counts))
-	delta := buildTransactionStatusDeltaWithBatches(identities, counts, indexes, batches)
-	for _, batch := range batches {
-		batch.partition()
-	}
-	return &preparedTransactionStatusDelta{identities: identities, delta: delta, indexBatches: batches}
+	return &preparedTransactionStatusDelta{identities: identities, delta: buildTransactionStatusDelta(identities, counts, indexes)}
 }

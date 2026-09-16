@@ -61,9 +61,8 @@ func (c *TransactionStatusCache) legacyCommitStatusForBenchmark(block *b.Block, 
 	return nil
 }
 
-// Historical unprepared delta construction, using the current visible index.
-// For before/after index comparisons run the same benchmark at both commits;
-// this helper is not a frozen baseline for the mutable index implementation.
+// Frozen production commit algorithm before publication optimization. This is
+// an independent baseline, including its original visible-index allocation.
 func (c *TransactionStatusCache) legacyAddStatusForBenchmark(delta transactionStatusDelta) error {
 	for blockhash, deltaGroup := range delta {
 		if group := c.visible[blockhash]; group != nil && group.keyIndex != deltaGroup.keyIndex {
@@ -76,11 +75,12 @@ func (c *TransactionStatusCache) legacyAddStatusForBenchmark(delta transactionSt
 		if group == nil {
 			group = &visibleTransactionStatusGroup{
 				keyIndex: deltaGroup.keyIndex,
+				keys:     make(map[transactionStatusKey]uint16),
 			}
 			c.visible[blockhash] = group
 		}
 		for key := range deltaGroup.keys {
-			group.keys.add(key)
+			group.keys[key]++
 		}
 	}
 	return nil

@@ -68,9 +68,8 @@ encoder with memoization, not the whole status-publication change against dev.
 
 The default-cadence result is approximately 2.3x, with the same 99.12 → 57.33 MB
 allocation reduction. Cold/all-new windows remain roughly unchanged. Native
-combined race suites, vet and the validator build passed. These are staging
-measurements: the encoding cache has not been deployed, so a live reduction in
-durable-root lag or missed FAST votes has not yet been established.
+combined race suites, vet and the validator build passed. These are historical staging measurements. They do not establish an isolated
+live reduction in durable-root lag or missed FAST votes.
 
 ## Fold admission before collecting account writes
 
