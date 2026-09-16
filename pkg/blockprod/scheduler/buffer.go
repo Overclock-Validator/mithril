@@ -129,27 +129,41 @@ const (
 	InsertRejectedCapacity
 )
 
+// precheck rejects entries that cannot be admitted now, without reserving space
+// or evicting anything. Preparation runs outside mu; Insert must recheck because
+// concurrent arrivals or draining can change both duplicates and the floor.
+func (b *Buffer) precheck(e *entry) InsertResult {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.admissionLocked(e)
+}
+
+func (b *Buffer) admissionLocked(e *entry) InsertResult {
+	if e == nil || e.tx == nil {
+		return InsertRejectedCapacity
+	}
+	if _, exists := b.byHash[e.messageHash]; exists {
+		return InsertDuplicate
+	}
+	if b.alive >= b.capacity {
+		min := b.peekMinAliveLocked()
+		if min == nil || e.reward <= min.reward {
+			return InsertRejectedCapacity
+		}
+	}
+	return InsertAccepted
+}
+
 // Insert adds e when not a duplicate. At capacity, the lowest-reward entry is
 // evicted if e has a strictly higher reward; otherwise e is rejected.
 func (b *Buffer) Insert(e *entry) (InsertResult, *entry) {
-	if e == nil || e.tx == nil {
-		return InsertRejectedCapacity, nil
-	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-
-	if _, exists := b.byHash[e.messageHash]; exists {
-		return InsertDuplicate, nil
+	if result := b.admissionLocked(e); result != InsertAccepted {
+		return result, nil
 	}
 	var evicted *entry
 	if b.alive >= b.capacity {
-		min := b.peekMinAliveLocked()
-		if min == nil {
-			return InsertRejectedCapacity, nil
-		}
-		if e.reward <= min.reward {
-			return InsertRejectedCapacity, nil
-		}
 		evicted = b.popMinAliveLocked()
 	}
 	b.pushAliveLocked(e)
