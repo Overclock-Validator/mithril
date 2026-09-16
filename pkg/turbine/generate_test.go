@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"encoding/binary"
+	"fmt"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/tpu/txfixture"
@@ -174,6 +175,46 @@ func TestMakeShredsFromDataRoundTrip(t *testing.T) {
 	}
 }
 
+func TestGeneratedFECRootsMatchPacketProofs(t *testing.T) {
+	unsignedBatch := dataShredsPerFECBlock * dataCapacity(proofEntriesFor32x32, false)
+	signedBatch := dataShredsPerFECBlock * dataCapacity(proofEntriesFor32x32, true)
+	for _, last := range []bool{false, true} {
+		for _, size := range []int{0, 1, signedBatch, signedBatch + 1, unsignedBatch, unsignedBatch + 1, 2 * unsignedBatch, 2*unsignedBatch + signedBatch} {
+			t.Run(fmt.Sprintf("last=%t/bytes=%d", last, size), func(t *testing.T) {
+				gen := ShredGenerator{Slot: 100, ParentSlot: 99, Version: 7, ReferenceTick: 17}
+				parentRoot := solana.Hash{5}
+				leader := testShredLeader(t)
+				batch, nextData, nextCode, err := gen.makeShredsFromData(
+					leader, benchmarkPayload(size), last, parentRoot, 7, 11,
+				)
+				require.NoError(t, err)
+				require.NotEmpty(t, batch.fecSetRoots)
+				require.Len(t, batch.packets, len(batch.fecSetRoots)*(dataShredsPerFECBlock+codingShredsPerFECBlock))
+				require.Equal(t, uint32(7+len(batch.fecSetRoots)*dataShredsPerFECBlock), nextData)
+				require.Equal(t, uint32(11+len(batch.fecSetRoots)*codingShredsPerFECBlock), nextCode)
+				require.Equal(t, batch.fecSetRoots[len(batch.fecSetRoots)-1], batch.chainedMerkleRoot)
+				for i, packet := range batch.packets {
+					fec := i / (dataShredsPerFECBlock + codingShredsPerFECBlock)
+					shred, err := ParseShred(packet)
+					require.NoError(t, err)
+					root, err := shred.MerkleRoot()
+					require.NoError(t, err)
+					require.Equal(t, batch.fecSetRoots[fec], root)
+					require.Equal(t, uint32(7+fec*dataShredsPerFECBlock), shred.FECSetIndex)
+					previousRoot := parentRoot
+					if fec > 0 {
+						previousRoot = batch.fecSetRoots[fec-1]
+					}
+					embeddedRoot, err := shred.EmbeddedChainedMerkleRoot()
+					require.NoError(t, err)
+					require.Equal(t, previousRoot, embeddedRoot)
+					require.NoError(t, shred.VerifySignature(leader.PublicKey()))
+				}
+			})
+		}
+	}
+}
+
 func TestMakeShredsFromAlpenglowBlock(t *testing.T) {
 	leader := testShredLeader(t)
 	gen := ShredGenerator{
@@ -184,10 +225,10 @@ func TestMakeShredsFromAlpenglowBlock(t *testing.T) {
 	}
 
 	var (
-		chainedRoot     = solana.Hash{5}
-		nextData uint32 = 0
-		nextCode uint32 = 0
-		allDataShreds   []*Shred
+		chainedRoot          = solana.Hash{5}
+		nextData      uint32 = 0
+		nextCode      uint32 = 0
+		allDataShreds []*Shred
 	)
 	for _, component := range buildAlpenglowSlot(t) {
 		packets, root, newData, newCode, err := gen.MakeShredsFromData(
