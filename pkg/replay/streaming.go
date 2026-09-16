@@ -132,7 +132,7 @@ type streamingSlot struct {
 	parentID   solana.Hash
 	exec       *blockExecution
 	// origin holds the block's own transaction objects in executed order;
-	// the bank executes stream-owned copies (see executionCopy), and the
+	// the bank executes stream-owned copies (block.ExecutionCopies), and the
 	// handshake proves the block by these originals.
 	origin     []*solana.Transaction
 	nextStart  uint32
@@ -533,18 +533,20 @@ func (s *streamingExecutor) executeGroup(group []*turbine.StreamBatch) error {
 		return errors.New("unverified_batch")
 	}
 	// The identities are bound to the block's objects by the verifier; that
-	// binding is checked here, on the originals, before the copies inherit it.
+	// binding is checked here, on the originals. The bank then executes
+	// copies made from those very originals (see block.ExecutionCopies): the
+	// block's objects are never resolved or otherwise mutated by a stream,
+	// so a discard leaves them exactly as turbine decoded them.
 	preparedForOriginals, err := b.PrepareVerifiedTransactionMessageIdentities(txs, verified)
 	if err != nil {
 		return fmt.Errorf("identities: %w", err)
 	}
-	copies, err := executionCopies(txs)
+	copies, prepared, err := preparedForOriginals.ExecutionCopies()
 	if err != nil {
+		if errors.Is(err, b.ErrTransactionAlreadyResolved) {
+			return errors.New("resolved_input")
+		}
 		return fmt.Errorf("copies: %w", err)
-	}
-	prepared, err := preparedForOriginals.Rebind(copies)
-	if err != nil {
-		return fmt.Errorf("identities: %w", err)
 	}
 	started := time.Now()
 	err = s.executeFn(cur.exec, copies, prepared, false)
@@ -562,43 +564,6 @@ func (s *streamingExecutor) executeGroup(group []*turbine.StreamBatch) error {
 	cur.origin = append(cur.origin, txs...)
 	cur.groups = append(cur.groups, streamingGroup{startedAt: started, finishedAt: time.Now(), transactions: len(txs)})
 	return nil
-}
-
-// errStreamInputResolved reports a batch whose transactions already carry
-// address-table resolution; the assembler never produces one, and a stream
-// must not execute an object whose account keys were derived elsewhere.
-var errStreamInputResolved = errors.New("stream input is already resolved")
-
-// executionCopy returns the object the stream executes in place of a block's
-// own transaction. Execution resolves address-table lookups in place
-// (SetAddressTables refuses a second call; ResolveLookups appends to
-// AccountKeys), so running the block's object would leave it resolved
-// against the stream's parent — and unusable, or worse, wrong, for the
-// whole-block path after a discard. The copy takes the message by value with
-// its own account-key slice; signatures and instructions are shared and never
-// mutated by execution.
-func executionCopy(tx *solana.Transaction) (*solana.Transaction, error) {
-	if tx == nil {
-		return nil, errors.New("nil transaction")
-	}
-	if tx.Message.GetVersion() == solana.MessageVersionV0 && tx.Message.IsResolved() {
-		return nil, errStreamInputResolved
-	}
-	message := tx.Message
-	message.AccountKeys = append(solana.PublicKeySlice(nil), tx.Message.AccountKeys...)
-	return &solana.Transaction{Signatures: tx.Signatures, Message: message}, nil
-}
-
-func executionCopies(txs []*solana.Transaction) ([]*solana.Transaction, error) {
-	copies := make([]*solana.Transaction, len(txs))
-	for i, tx := range txs {
-		dup, err := executionCopy(tx)
-		if err != nil {
-			return nil, fmt.Errorf("transaction %d: %w", i, err)
-		}
-		copies[i] = dup
-	}
-	return copies, nil
 }
 
 // discard throws the in-progress stream away and undoes every side effect it

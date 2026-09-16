@@ -1,6 +1,7 @@
 package block
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/Overclock-Validator/mithril/pkg/txstatus"
@@ -40,24 +41,49 @@ func (prepared *PreparedTransactionMessageIdentities) MatchesBlock(block *Block)
 	return block != nil && prepared.matches(block.Transactions)
 }
 
-// Rebind returns the same identities bound to copies of the same ordered
-// transactions: copies[i] must carry the message version and recent
-// blockhash identity i was prepared for. Streaming execution runs
-// stream-owned copies of a block's transactions (so address-table resolution
-// never touches the block's own objects) while proving the block by the
-// originals; the copies share the originals' identities.
-func (prepared *PreparedTransactionMessageIdentities) Rebind(copies []*solana.Transaction) (*PreparedTransactionMessageIdentities, error) {
-	if prepared == nil || len(copies) != len(prepared.identities) || len(copies) != len(prepared.versions) {
-		return nil, fmt.Errorf("prepared identities do not cover %d transaction copies", len(copies))
+// ErrTransactionAlreadyResolved reports a v0 transaction that already carries
+// address-table resolution where an unresolved, wire-decoded object is
+// required.
+var ErrTransactionAlreadyResolved = errors.New("transaction address-table lookups are already resolved")
+
+// ExecutionCopies returns execution copies of the transactions this set is
+// bound to, together with the same identities bound to those copies.
+//
+// Streaming replay executes a block's transactions before the block is
+// complete. Execution resolves a v0 transaction's address-table lookups in
+// place (solana-go's SetAddressTables refuses a second call and ResolveLookups
+// appends the looked-up keys to AccountKeys), so a bank that later turns out
+// not to be the block's — or the block's, on a different parent — must never
+// have run the block's own objects. The copies are made here, from the
+// originals this set was prepared for, so an identity can only ever be
+// attached to a copy of the very transaction it was computed from: each copy
+// shares the original's signatures and instructions and takes the message by
+// value with its own account-key slice, which is all that resolution mutates.
+// The identity itself (canonical message hash, recent blockhash) is therefore
+// the original's by construction; nothing here re-authenticates the signed
+// message, and callers must not treat the copies as independently verified.
+//
+// A bound transaction that already carries resolution is refused with
+// ErrTransactionAlreadyResolved: its account keys were derived elsewhere,
+// against a parent this bank cannot vouch for.
+func (prepared *PreparedTransactionMessageIdentities) ExecutionCopies() ([]*solana.Transaction, *PreparedTransactionMessageIdentities, error) {
+	if prepared == nil || len(prepared.transactions) != len(prepared.identities) || len(prepared.transactions) != len(prepared.versions) {
+		return nil, nil, errors.New("prepared identities are not bound to their transactions")
 	}
-	for index, tx := range copies {
-		if tx == nil || tx.Message.GetVersion() != prepared.versions[index] ||
-			tx.Message.RecentBlockhash != prepared.identities[index].RecentBlockhash {
-			return nil, fmt.Errorf("transaction copy %d does not match its prepared identity", index)
+	copies := make([]*solana.Transaction, len(prepared.transactions))
+	for index, tx := range prepared.transactions {
+		if tx == nil {
+			return nil, nil, fmt.Errorf("transaction %d is nil", index)
 		}
+		if tx.Message.GetVersion() == solana.MessageVersionV0 && tx.Message.IsResolved() {
+			return nil, nil, fmt.Errorf("transaction %d: %w", index, ErrTransactionAlreadyResolved)
+		}
+		message := tx.Message
+		message.AccountKeys = append(solana.PublicKeySlice(nil), tx.Message.AccountKeys...)
+		copies[index] = &solana.Transaction{Signatures: tx.Signatures, Message: message}
 	}
-	return &PreparedTransactionMessageIdentities{
-		transactions: append([]*solana.Transaction(nil), copies...),
+	return copies, &PreparedTransactionMessageIdentities{
+		transactions: copies,
 		versions:     append([]solana.MessageVersion(nil), prepared.versions...),
 		identities:   append([]txstatus.TransactionMessageIdentity(nil), prepared.identities...),
 	}, nil

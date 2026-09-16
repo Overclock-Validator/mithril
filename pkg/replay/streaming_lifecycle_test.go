@@ -482,27 +482,22 @@ func newLifecycleEnvWithTable(t *testing.T, dest solana.PublicKey) *lifecycleEnv
 	return env
 }
 
-func TestExecutionCopyLeavesTheBlockObjectUnresolved(t *testing.T) {
-	original := decodeTransactions(t, [][]byte{signedV0TransferViaTableWire(t, 1)})[0]
-	staticKeys := len(original.Message.AccountKeys)
+// A stream refuses a batch whose transactions already carry resolution:
+// their account keys were derived against a parent the stream cannot vouch
+// for. The assembler never produces one; this pins the refusal.
+func TestStreamingRefusesResolvedInput(t *testing.T) {
+	StreamingExecutionCfg = StreamingExecutionConfig{Enabled: true}
+	defer func() { StreamingExecutionCfg = StreamingExecutionConfig{} }()
+	txs := decodeTransactions(t, [][]byte{signedV0TransferViaTableWire(t, 1), signedV0TransferViaTableWire(t, 2)})
+	identities := verifiedIdentities(t, txs)
+	require.NoError(t, txs[1].Message.SetAddressTables(map[solana.PublicKey]solana.PublicKeySlice{lifecycleTableKey: {{0xD1}}}))
+	require.NoError(t, txs[1].Message.ResolveLookups())
 
-	dup, err := executionCopy(original)
-	require.NoError(t, err)
-	require.NotSame(t, original, dup)
-	require.Equal(t, original.Signatures, dup.Signatures)
-	require.NoError(t, dup.Message.SetAddressTables(map[solana.PublicKey]solana.PublicKeySlice{lifecycleTableKey: {{0xD1}}}))
-	require.NoError(t, dup.Message.ResolveLookups())
-	require.True(t, dup.Message.IsResolved())
-	require.Len(t, dup.Message.AccountKeys, staticKeys+1)
-	require.False(t, original.Message.IsResolved(), "resolving the copy must not resolve the original")
-	require.Len(t, original.Message.AccountKeys, staticKeys)
-	require.NoError(t, original.Message.SetAddressTables(map[solana.PublicKey]solana.PublicKeySlice{lifecycleTableKey: {{0xD2}}}),
-		"the original still accepts its own resolution")
-
-	_, err = executionCopy(dup)
-	require.ErrorIs(t, err, errStreamInputResolved, "a resolved input is never accepted by a stream")
-	_, err = executionCopies([]*solana.Transaction{original, dup})
-	require.ErrorIs(t, err, errStreamInputResolved)
+	h := newStreamingTestHarness(t)
+	h.exec.handleEvent(h.event(turbine.NewDetachedStreamBatch(h.gen, 1, 2, txs, identities)))
+	require.Nil(t, h.exec.current)
+	require.Equal(t, "resolved_input", h.discardReason())
+	require.False(t, txs[0].Message.IsResolved(), "the unresolved sibling is untouched")
 }
 
 func TestStreamingLifecycleV0LookupsMatchWholeBlock(t *testing.T) {
