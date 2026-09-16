@@ -14,8 +14,6 @@ import (
 
 // Frozen syscall implementation from bd17683a; keep independent for differential tests.
 func sha256BaselineReference(vm sbpf.VM, valsAddr, valsLen, resultsAddr uint64) (uint64, error) {
-	//mlog.Log.Debugf("sha256BaselineReference")
-
 	if valsLen > cu.CUSha256MaxSlices {
 		return syscallErr(SyscallErrTooManySlices)
 	}
@@ -70,81 +68,6 @@ func sha256BaselineReference(vm sbpf.VM, valsAddr, valsLen, resultsAddr uint64) 
 		}
 	}
 	copy(hashResult[:], hasher.Sum(nil))
-	return syscallSuccess(0)
-}
-
-// Experimental bounded-buffer variant retained only for benchmark comparison.
-func sha256SmallInputReference(vm sbpf.VM, valsAddr, valsLen, resultsAddr uint64) (uint64, error) {
-	//mlog.Log.Debugf("sha256SmallInputReference")
-
-	if valsLen > cu.CUSha256MaxSlices {
-		return syscallErr(SyscallErrTooManySlices)
-	}
-
-	execCtx := executionCtx(vm)
-	err := execCtx.ComputeMeter.Consume(cu.CUSha256BaseCost)
-	if err != nil {
-		return syscallCuErr()
-	}
-
-	hashResult, err := vm.Translate(resultsAddr, 32, true)
-	if err != nil {
-		return syscallErr(err)
-	}
-
-	hasher := sha256.New()
-	// Inputs up to 55 bytes fit in one padded SHA-256 block. Buffer only
-	// this bounded case; larger inputs retain streaming hashing.
-	var small [55]byte
-	buffered := 0
-	streaming := false
-	if valsLen > 0 {
-		var vals []byte
-
-		// The data at 'valsAddr' consists of an array of 'slice references', which consists
-		// of: [ptr (u64)] [size (u64)], hence 16 bytes for each of the slice references that
-		// refers to an input value to hash.
-		// Safety: valsLen*16 cannot overflow because of the check versus CUSha256MaxSlices above
-		vals, err = vm.Translate(valsAddr, valsLen*16, false)
-		if err != nil {
-			return syscallErr(err)
-		}
-
-		var data []byte
-
-		for count := uint64(0); count < valsLen; count++ {
-
-			offset := count * 16
-			vec := VectorDescrC{Addr: binary.LittleEndian.Uint64(vals[offset:]), Len: binary.LittleEndian.Uint64(vals[offset+8:])}
-
-			data, err = vm.Translate(vec.Addr, vec.Len, false)
-			if err != nil {
-				return syscallErr(err)
-			}
-
-			cost := max(vec.Len/2, cu.CUMemOpBaseCost)
-			err = execCtx.ComputeMeter.Consume(cost)
-			if err != nil {
-				return syscallCuErr()
-			}
-
-			if !streaming && len(data) <= len(small)-buffered {
-				buffered += copy(small[buffered:], data)
-			} else {
-				if !streaming {
-					hasher.Write(small[:buffered])
-					streaming = true
-				}
-				hasher.Write(data)
-			}
-		}
-	}
-	if streaming {
-		hasher.Sum(hashResult[:0])
-	} else {
-		digest := sha256.Sum256(small[:buffered])
-		copy(hashResult, digest[:])
-	}
 	return syscallSuccess(0)
 }
 
@@ -211,7 +134,7 @@ func TestSha256SyscallDifferential(t *testing.T) {
 		var wantMem []byte
 		var wantRet, wantCU uint64
 		var wantErr string
-		for k, fn := range []sha256Call{sha256BaselineReference, sha256SmallInputReference, SyscallSha256Impl} {
+		for k, fn := range []sha256Call{sha256BaselineReference, SyscallSha256Impl} {
 			buf := append([]byte(nil), mem...)
 			vm, ctx := sha256VM(buf, budget)
 			ret, err := fn(vm, a, n, out)
@@ -242,7 +165,7 @@ func BenchmarkSha256Syscall(b *testing.B) {
 		for _, variant := range []struct {
 			name string
 			fn   sha256Call
-		}{{"baseline", sha256BaselineReference}, {"lean", SyscallSha256Impl}, {"small", sha256SmallInputReference}} {
+		}{{"baseline", sha256BaselineReference}, {"lean", SyscallSha256Impl}} {
 			b.Run(tc.name+"/"+variant.name, func(b *testing.B) {
 				mem, a, n, out := sha256Fixture(tc.sizes)
 				vm, ctx := sha256VM(mem, ^uint64(0))

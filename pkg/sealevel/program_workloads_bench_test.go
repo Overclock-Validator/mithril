@@ -19,7 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// External ELF inputs are pinned by SHA-256 in the benchmark result manifest.
+// External ELF inputs are pinned by SHA-256 in docs/sbpf-interpreter-benchmarks.md.
 // No live account writes or network calls occur in this harness. Each invocation
 // gets fresh account data; the program cache is warm and shared between runs.
 type programWorkload struct {
