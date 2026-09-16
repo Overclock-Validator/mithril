@@ -1,11 +1,9 @@
-Omitting `tuning.use_pool` bypassed the CLI's intended pooling default. Enable the default through configuration, resolve booleans in explicit-CLI → configured-value → flag-default order, and preserve explicit `false`. Copy retained vote-deque storage so pooled invocation memory cannot overwrite state used by later transactions.
+Omitting `tuning.use_pool` silently disabled the CLI's intended pooling default. Resolve boolean options in explicit CLI → configured value → flag default order, preserving explicit `false`. The CLI flag remains the single source of the pooling default; the config editor and dashboard do not consume this setting.
 
-Tests cover omitted settings, TOML values, CLI overrides, heap/stack reset and retained-deque ownership. This is a small allocation/correctness change; it makes no whole-validator speedup claim.
+Copy retained vote-deque storage so returning and reusing pooled invocation memory cannot overwrite saved votes or the V4 vote-cache state.
 
-Fresh local race tests passed for config, SBPF pooling and node startup/configuration; the retained-deque regression passed in the combined build. Combined integration validation also covers #278 and the other performance reviews. Historical native benchmarks retain their original baselines; this preparation pass ran locally, without touching the live validator.
+Tests cover omitted settings, TOML values, CLI overrides, heap/stack isolation during nested and concurrent executions, and retained-deque ownership after scratch reuse. Targeted race tests and vet passed on `alpenglow-dev` (`33dde405`). This change makes no whole-validator performance claim.
 
-[Historical benchmark evidence](https://github.com/Overclock-Validator/mithril/tree/752ef97369e5b1614eeff64a242dfa87df673045/docs/results) is preserved outside the proposed merge; reusable benchmarks and maintained contracts remain in source.
+[Historical benchmark evidence](https://github.com/Overclock-Validator/mithril/tree/752ef97369e5b1614eeff64a242dfa87df673045/docs/results) retains its original baselines and does not measure this rebase.
 
-Based on #278 at `e1204b32`; retarget to `alpenglow-dev` after that PR merges.
-
-[Rebased validation and exact source heads](https://github.com/Overclock-Validator/mithril/blob/7layer/review-integration-20260915/docs/results/review-preparation/2026-09-16/README.md).
+Targets `alpenglow-dev` directly; independent of #278. Two commits separate boolean configuration resolution from retained vote ownership.
