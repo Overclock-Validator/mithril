@@ -107,6 +107,50 @@ type SlotCtx struct {
 	bankSysvars              atomic.Pointer[BankSysvars]
 
 	TraceCtx context.Context
+
+	// Speculative execution support (streaming replay). A bank executed before
+	// its block is complete must not publish to process-global state until
+	// the block is accepted, so a discard leaves nothing behind.
+	//
+	// DeferVoteCachePublication buffers global vote-cache puts and deletes in
+	// the pending maps (protected by PendingVoteCacheMu) and turns the
+	// vote/stake dirty marker into VoteStakeDirty; the replay finalize step
+	// publishes them once the bank is accepted.
+	DeferVoteCachePublication bool
+	PendingVoteCacheMu        sync.Mutex
+	PendingVoteCache          map[solana.PublicKey]*VoteStateVersions
+	PendingVoteCacheDeletes   map[solana.PublicKey]struct{}
+	VoteStakeDirty            bool
+	// TrackProgramCacheAdds records every program-cache insertion made while
+	// executing this bank so a discarded bank can evict them again (eviction
+	// only forces a reload from account data, so it is always safe).
+	TrackProgramCacheAdds bool
+	ProgramCacheAddsMu    sync.Mutex
+	ProgramCacheAdds      []solana.PublicKey
+}
+
+// RecordProgramCacheAdd notes a program-cache insertion for later undo when
+// TrackProgramCacheAdds is set.
+func (slotCtx *SlotCtx) RecordProgramCacheAdd(key solana.PublicKey) {
+	if slotCtx == nil || !slotCtx.TrackProgramCacheAdds {
+		return
+	}
+	slotCtx.ProgramCacheAddsMu.Lock()
+	slotCtx.ProgramCacheAdds = append(slotCtx.ProgramCacheAdds, key)
+	slotCtx.ProgramCacheAddsMu.Unlock()
+}
+
+// TakeProgramCacheAdds returns and clears the recorded program-cache
+// insertions.
+func (slotCtx *SlotCtx) TakeProgramCacheAdds() []solana.PublicKey {
+	if slotCtx == nil {
+		return nil
+	}
+	slotCtx.ProgramCacheAddsMu.Lock()
+	defer slotCtx.ProgramCacheAddsMu.Unlock()
+	adds := slotCtx.ProgramCacheAdds
+	slotCtx.ProgramCacheAdds = nil
+	return adds
 }
 
 // BankSysvars returns the immutable sysvar snapshot owned by this bank.

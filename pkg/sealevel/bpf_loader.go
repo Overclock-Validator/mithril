@@ -1366,6 +1366,7 @@ func addProgramToCache(execCtx *ExecutionCtx, programAddr solana.PublicKey, entr
 		return
 	}
 	execCtx.SlotCtx.AccountsDb.AddProgramToCache(programAddr, entry)
+	execCtx.SlotCtx.RecordProgramCacheAdd(programAddr)
 }
 
 func mapVirtualAddressSpaceRunErr(execCtx *ExecutionCtx, err error, inputRegions []sbpf.InputRegion) error {

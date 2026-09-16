@@ -627,6 +627,7 @@ func LoaderV4ProcessDeploy(execCtx *ExecutionCtx) error {
 	entry := &accountsdb.ProgramCacheEntry{Program: programObj, DeploymentSlot: currentSlot}
 	if !execCtx.IsSimulation {
 		execCtx.SlotCtx.AccountsDb.AddProgramToCache(program.Key(), entry)
+		execCtx.SlotCtx.RecordProgramCacheAdd(program.Key())
 	}
 
 	return nil
