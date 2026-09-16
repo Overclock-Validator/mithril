@@ -72,6 +72,7 @@ type SlotAssembler struct {
 	// Configured before ingestion; tests may replace it with a blocking probe.
 	// Production uses the process-wide bounded transaction verifier.
 	verifyTransactions func(context.Context, *block.Block) error
+	entryPrefetch      *entryPrefetchPool
 }
 
 type SlotRepairRequest struct {
@@ -106,7 +107,10 @@ type slotState struct {
 	fullAt         time.Time
 	repairedShreds int
 	// completing makes the immutable full state a single-owner generation token.
-	completing bool
+	completing            bool
+	batchScan, batchStart uint32
+	completeBatches       []shredBatchRange
+	prefetch              *slotEntryPrefetch
 	// Assembly failures for this slot (mixed variants/signatures, FEC layout
 	// conflicts, ...). A slot frozen below completion while repair responses
 	// flow is usually poisoned state — the latest error names the poison.
@@ -161,6 +165,7 @@ type fecState struct {
 	haveSig     bool
 	dataVariant byte
 	codeVariant byte
+	rootCache   *authenticatedFECRoot
 }
 
 func NewSlotAssembler() *SlotAssembler {
@@ -174,7 +179,6 @@ func NewSlotAssembler() *SlotAssembler {
 		priorityRepairSlots: make(map[uint64]struct{}),
 		partialShredObs:     make(map[uint64]PartialShredObservation),
 		encoders:            make(map[fecLayout]reedsolomon.Encoder),
-		verifyTransactions:  validateBlockTransactionsContext,
 	}
 }
 
@@ -239,6 +243,13 @@ func (a *SlotAssembler) AddShredFrom(shred *Shred, fromRepair bool) (*block.Bloc
 // reconstructable it returns a single immutable completion token; decoding,
 // parsing, and signature verification must happen after this method unlocks.
 func (a *SlotAssembler) addShredFrom(shred *Shred, fromRepair bool) (*slotCompletionWork, error) {
+	return a.addShredFromWithRoot(shred, fromRepair, nil)
+}
+
+// addShredFromWithRoot accepts an optional result from successful authentication
+// of this immutable shred. Unauthenticated callers and spool hydration use nil
+// and retain the normal root-computation fallback.
+func (a *SlotAssembler) addShredFromWithRoot(shred *Shred, fromRepair bool, root *solana.Hash) (*slotCompletionWork, error) {
 	if shred == nil {
 		return nil, nil
 	}
@@ -290,6 +301,11 @@ func (a *SlotAssembler) addShredFrom(shred *Shred, fromRepair bool) (*slotComple
 	if state.firstShredAt.IsZero() {
 		state.firstShredAt = time.Now()
 	}
+	if root != nil {
+		if fec := state.fecSets[shred.FECSetIndex]; fec != nil {
+			fec.rememberAuthenticatedRoot(shred, *root)
+		}
+	}
 
 	recovered, err := a.recoverFEC(state, shred.FECSetIndex)
 	if err != nil {
@@ -307,6 +323,7 @@ func (a *SlotAssembler) addShredFrom(shred *Shred, fromRepair bool) (*slotComple
 		}
 	}
 
+	a.prefetchEntriesLocked(state)
 	if !state.complete() {
 		return nil, nil
 	}
@@ -374,19 +391,27 @@ func (a *SlotAssembler) processCompletion(ctx context.Context, work *slotComplet
 	}
 
 	decodeStartedAt := time.Now()
-	var decodeTimings entryDecodeTimings
+	decodeTimings := entryDecodeTimings{ctx: ctx}
+	if work.state.prefetch != nil {
+		decodeTimings.prefetched = work.state.prefetch.batches
+	}
 	blk, parentInfo, roots, err := work.state.decodeBlock(&decodeTimings)
 	decodeTotal := time.Since(decodeStartedAt)
-	decodeOnly := decodeTotal - decodeTimings.transactionParse
+	decodeOnly := decodeTotal - decodeTimings.transactionParse - decodeTimings.prefetchWait
 	if decodeOnly < 0 {
 		decodeOnly = 0
 	}
 	timings.BlockDecode = decodeOnly
 	timings.TransactionParse = decodeTimings.transactionParse
+	timings.EarlyPreparationWait = decodeTimings.prefetchWait
 	_ = statsd.Duration(statsd.TurbineBlockDecode, timings.BlockDecode, nil)
 	_ = statsd.Duration(statsd.TurbineTransactionParse, timings.TransactionParse, nil)
 	processed := processedSlotCompletion{block: blk, parentInfo: parentInfo, roots: roots, err: err, timings: timings}
 	if err != nil {
+		if ctx.Err() != nil {
+			processed.canceled = true
+			processed.err = nil
+		}
 		return processed
 	}
 	if ctx.Err() != nil {
@@ -395,7 +420,12 @@ func (a *SlotAssembler) processCompletion(ctx context.Context, work *slotComplet
 	}
 
 	sigverifyStartedAt := time.Now()
-	processed.err = work.verifyTransactions(ctx, blk)
+	if work.state.prefetch != nil && len(decodeTimings.retained) > 0 {
+		processed.err = verifyDecodedEntryBatches(ctx, blk, decodeTimings.retained, work.state.prefetch.pool.verifier)
+	} else {
+		processed.err = work.verifyTransactions(ctx, blk)
+	}
+	earlyEntryTimings(&decodeTimings, work.state.fullAt, &processed.timings)
 	processed.timings.TransactionSigverify = time.Since(sigverifyStartedAt)
 	_ = statsd.Duration(statsd.TurbineTransactionSigverify, processed.timings.TransactionSigverify, nil)
 	if ctx.Err() != nil {
@@ -406,6 +436,12 @@ func (a *SlotAssembler) processCompletion(ctx context.Context, work *slotComplet
 	if processed.err == nil {
 		blk.MarkTransactionSignaturesVerified()
 		processed.completionReadyAt = time.Now()
+		processed.timings.FullToReady = processed.completionReadyAt.Sub(work.state.fullAt)
+		_ = statsd.Duration(statsd.TurbineFullToReady, processed.timings.FullToReady, nil)
+		_ = statsd.Duration(statsd.TurbineEarlyPreparationWait, processed.timings.EarlyPreparationWait, nil)
+		_ = statsd.Duration(statsd.TurbineEarlyTransactionParse, processed.timings.EarlyTransactionParse, nil)
+		_ = statsd.Duration(statsd.TurbineEarlyTransactionSigverify, processed.timings.EarlyTransactionSigverify, nil)
+		_ = statsd.Count(statsd.TurbineEarlyVerifiedTransactions, int64(processed.timings.EarlyVerifiedTransactions), nil)
 	}
 	return processed
 }
@@ -417,6 +453,11 @@ func (a *SlotAssembler) finalizeCompletion(work *slotCompletionWork, processed p
 	state := work.state
 	a.mu.Lock()
 	if a.slots[state.slot] != state || !state.completing {
+		a.mu.Unlock()
+		return nil, nil
+	}
+	if processed.canceled {
+		state.completing = false
 		a.mu.Unlock()
 		return nil, nil
 	}
@@ -434,6 +475,7 @@ func (a *SlotAssembler) finalizeCompletion(work *slotCompletionWork, processed p
 	if !a.acceptAlpenglowBlockIDLocked(blk) {
 		a.trackNonCanonicalBlockIDLocked(blk)
 		a.recordPartialObsLocked(state)
+		a.releasePrefetchLocked(state)
 		delete(a.slots, state.slot)
 		a.mu.Unlock()
 		if work.reportNonCanonical {
@@ -442,6 +484,7 @@ func (a *SlotAssembler) finalizeCompletion(work *slotCompletionWork, processed p
 		return nil, nil
 	}
 
+	a.releasePrefetchLocked(state)
 	delete(a.slots, state.slot)
 	a.completedSlots[state.slot] = struct{}{}
 	a.trackBlockIDLocked(blk)
@@ -542,6 +585,7 @@ func (a *SlotAssembler) ResetSlot(slot uint64) {
 	defer a.mu.Unlock()
 
 	a.recordPartialObsLocked(a.slots[slot])
+	a.releasePrefetchLocked(a.slots[slot])
 	delete(a.slots, slot)
 	delete(a.completedSlots, slot)
 }
@@ -643,6 +687,7 @@ func (a *SlotAssembler) pruneOldSlotsLocked() {
 		for slot, state := range a.slots {
 			if slot < minSlot && !state.completing {
 				a.recordPartialObsLocked(state)
+				a.releasePrefetchLocked(a.slots[slot])
 				delete(a.slots, slot)
 				a.evictedSlots++
 			}
@@ -695,6 +740,7 @@ func (a *SlotAssembler) pruneOldSlotsLocked() {
 			return
 		}
 		a.recordPartialObsLocked(a.slots[victim])
+		a.releasePrefetchLocked(a.slots[victim])
 		delete(a.slots, victim)
 		a.evictedSlots++
 	}
@@ -1498,6 +1544,24 @@ func (s *slotState) complete() bool {
 }
 
 func (s *slotState) orderedShreds() []*Shred {
+	// Normal completed slots contain exactly the contiguous range 0..lastIndex.
+	// Keep the sparse fallback: malformed tails and focused partial-state callers
+	// must not silently lose shreds beyond the last-in-slot marker.
+	if s.haveLast && uint64(len(s.shreds)) == uint64(s.lastIndex)+1 {
+		out := make([]*Shred, len(s.shreds))
+		for idx := range out {
+			shred := s.shreds[uint32(idx)]
+			if shred == nil || shred.Index != uint32(idx) {
+				return s.sortedShreds()
+			}
+			out[idx] = shred
+		}
+		return out
+	}
+	return s.sortedShreds()
+}
+
+func (s *slotState) sortedShreds() []*Shred {
 	indexes := make([]int, 0, len(s.shreds))
 	for idx := range s.shreds {
 		indexes = append(indexes, int(idx))
@@ -1507,6 +1571,7 @@ func (s *slotState) orderedShreds() []*Shred {
 	for _, idx := range indexes {
 		out = append(out, s.shreds[uint32(idx)])
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Index < out[j].Index })
 	return out
 }
 
@@ -1514,7 +1579,7 @@ func (s *slotState) orderedShreds() []*Shred {
 // transaction signature verification. Parent/child identity hints are applied
 // later under the assembler lock so hints learned while this runs still win.
 func (s *slotState) decodeBlock(timings *entryDecodeTimings) (*block.Block, *AlpenglowParentInfo, []solana.Hash, error) {
-	entries, parentInfo, footer, err := decodeEntriesAndAlpenglowMarkersFromDataShreds(s.orderedShreds(), timings)
+	entries, parentInfo, footer, err := decodeEntriesFromOrderedDataShreds(s.orderedShreds(), timings)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -1660,35 +1725,36 @@ func (s *slotState) fecSetMerkleRoots() ([]solana.Hash, error) {
 }
 
 func (f *fecState) merkleRoot() (solana.Hash, bool, error) {
-	for _, idx := range sortedUint32Keys(f.data) {
-		shred := f.data[idx]
-		if shred == nil || shred.Recovered {
-			continue
-		}
-		root, err := shred.MerkleRoot()
-		if err != nil {
-			if errors.Is(err, ErrUnsupportedShred) {
-				continue
+	// Preserve the old lowest-data-index, then lowest-coding-position choice,
+	// including its first error. Unsupported variants and recovered data have
+	// no usable proof. Selecting the minimum needs neither sorting nor scratch.
+	selected := f.data[0]
+	var first uint32
+	// Relative index zero is already the minimum. Repair or legacy/malformed
+	// inputs may lack that proof and still take the general selection path.
+	if !hasMerkleRootProof(selected) || selected.Recovered {
+		selected = nil
+		for idx, shred := range f.data {
+			if hasMerkleRootProof(shred) && !shred.Recovered && (selected == nil || idx < first) {
+				selected, first = shred, idx
 			}
-			return solana.Hash{}, false, err
 		}
-		return root, true, nil
 	}
-	for _, pos := range sortedUint16Keys(f.coding) {
-		shred := f.coding[pos]
-		if shred == nil {
-			continue
-		}
-		root, err := shred.MerkleRoot()
-		if err != nil {
-			if errors.Is(err, ErrUnsupportedShred) {
-				continue
+	if selected == nil {
+		for pos, shred := range f.coding {
+			if hasMerkleRootProof(shred) && (selected == nil || uint32(pos) < first) {
+				selected, first = shred, uint32(pos)
 			}
-			return solana.Hash{}, false, err
 		}
-		return root, true, nil
 	}
-	return solana.Hash{}, false, nil
+	if selected == nil {
+		return solana.Hash{}, false, nil
+	}
+	if cached := f.rootCache; cached != nil && cached.matches(selected) {
+		return cached.root, true, nil
+	}
+	root, err := selected.MerkleRoot()
+	return root, err == nil, err
 }
 
 func merkleTreeRoot(leaves []solana.Hash) solana.Hash {

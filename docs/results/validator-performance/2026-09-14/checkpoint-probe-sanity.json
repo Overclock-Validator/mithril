@@ -1,0 +1,1302 @@
+{
+  "utc": "2026-09-14T03:31:58.546087+00:00",
+  "unique_fast_certificates": 67,
+  "included": 65,
+  "missing": 2,
+  "fast_percent": 97.01492537313433,
+  "slow_footer_observations": 52,
+  "excluded": {},
+  "parse_errors": 0,
+  "truncated_captures": 0,
+  "certificates": [
+    {
+      "key": "66635ddf984df58cc314e63804d527a30b22d03a2198f63a9517f62e343614da",
+      "slot": 3427676,
+      "source_slot": 3427678,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": false,
+      "serialized_observed": false,
+      "serialized_after_footer_observed": false,
+      "transactions": null,
+      "timings": {}
+    },
+    {
+      "key": "70957edde11232ddd684bcade7a3ab0ddece13a80996074461bf7567cabbd48f",
+      "slot": 3427677,
+      "source_slot": 3427679,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": false,
+      "serialized_observed": false,
+      "serialized_after_footer_observed": false,
+      "transactions": null,
+      "timings": {}
+    },
+    {
+      "key": "6860e33f4c6f1f76f194b257b26a564b37b2b479c636587589b320b07327d434",
+      "slot": 3427679,
+      "source_slot": 3427680,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 4107,
+      "timings": {
+        "first_shred_to_completion_ms": 160.194044,
+        "completion_to_replay_ms": 15.450752,
+        "replay_to_vote_ms": 1.788652,
+        "history_to_injection_ms": 0.607729,
+        "enqueue_to_serialization_ms": 0.097012
+      }
+    },
+    {
+      "key": "22e9c9801ff4e0ff60ad45f50a50cdcf11d2d57b59760d3301317b17fafa1d67",
+      "slot": 3427683,
+      "source_slot": 3427684,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 0,
+      "timings": {
+        "first_shred_to_completion_ms": 20.913838,
+        "completion_to_replay_ms": 5.708277,
+        "replay_to_vote_ms": 1.659419,
+        "history_to_injection_ms": 0.55986,
+        "enqueue_to_serialization_ms": 0.05873
+      }
+    },
+    {
+      "key": "7b42ef8b2d34574855e9bd530f1499a0d40ebb256213db11ba5a2cb60934e2eb",
+      "slot": 3427684,
+      "source_slot": 3427686,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 0,
+      "timings": {
+        "first_shred_to_completion_ms": 18.440063,
+        "completion_to_replay_ms": 4.894151,
+        "replay_to_vote_ms": 1.679888,
+        "history_to_injection_ms": 0.591409,
+        "enqueue_to_serialization_ms": 0.06941
+      }
+    },
+    {
+      "key": "feebc5203460436e5471012d5fef6ff61d01717167115fc8afaf082ec152f949",
+      "slot": 3427687,
+      "source_slot": 3427688,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 0,
+      "timings": {
+        "first_shred_to_completion_ms": 17.608906,
+        "completion_to_replay_ms": 5.837208,
+        "replay_to_vote_ms": 1.679787,
+        "history_to_injection_ms": 0.599373,
+        "enqueue_to_serialization_ms": 0.047359
+      }
+    },
+    {
+      "key": "ed6e7b570306870f636d4cb1d538b6426d5ba180e73440ae533837df773ad5bd",
+      "slot": 3427691,
+      "source_slot": 3427692,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 1866,
+      "timings": {
+        "first_shred_to_completion_ms": 264.800928,
+        "completion_to_replay_ms": 11.952247,
+        "replay_to_vote_ms": 2.67924,
+        "history_to_injection_ms": 1.086987,
+        "enqueue_to_serialization_ms": 0.09066
+      }
+    },
+    {
+      "key": "839c21b16c4f079a437ba0aa1f849adc2f6dbaccfd083779ad1458e558249210",
+      "slot": 3427695,
+      "source_slot": 3427696,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 1900,
+      "timings": {
+        "first_shred_to_completion_ms": 226.637928,
+        "completion_to_replay_ms": 12.56236,
+        "replay_to_vote_ms": 1.74497,
+        "history_to_injection_ms": 0.642924,
+        "enqueue_to_serialization_ms": 0.074469
+      }
+    },
+    {
+      "key": "f8345151c1867cee92aceee8c6d5d0c9ed38acb79edda819d7c095e113c5d5a8",
+      "slot": 3427696,
+      "source_slot": 3427698,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 781,
+      "timings": {
+        "first_shred_to_completion_ms": 152.249718,
+        "completion_to_replay_ms": 8.010941,
+        "replay_to_vote_ms": 1.760559,
+        "history_to_injection_ms": 0.671087,
+        "enqueue_to_serialization_ms": 0.075461
+      }
+    },
+    {
+      "key": "e47b25114df954aa9a29dc29446b292ce7419f5a0917cfda28a094431585950a",
+      "slot": 3427697,
+      "source_slot": 3427699,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 1750,
+      "timings": {
+        "first_shred_to_completion_ms": 204.159518,
+        "completion_to_replay_ms": 10.146062,
+        "replay_to_vote_ms": 1.744268,
+        "history_to_injection_ms": 0.649537,
+        "enqueue_to_serialization_ms": 0.070252
+      }
+    },
+    {
+      "key": "7bbd556bb9aedc97937495f66f1813084872a10934801c05e84b870949dc3350",
+      "slot": 3427699,
+      "source_slot": 3427700,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 1781,
+      "timings": {
+        "first_shred_to_completion_ms": 208.64873,
+        "completion_to_replay_ms": 10.911857,
+        "replay_to_vote_ms": 1.754247,
+        "history_to_injection_ms": 0.667962,
+        "enqueue_to_serialization_ms": 0.06945
+      }
+    },
+    {
+      "key": "040d46d1079c9bc398e49708c771d9fa3361c3d6d4678f9276fd56792d409fb8",
+      "slot": 3427703,
+      "source_slot": 3427704,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 1814,
+      "timings": {
+        "first_shred_to_completion_ms": 245.512385,
+        "completion_to_replay_ms": 12.175264,
+        "replay_to_vote_ms": 1.817336,
+        "history_to_injection_ms": 0.66705,
+        "enqueue_to_serialization_ms": 0.076423
+      }
+    },
+    {
+      "key": "ed893c17113b7361a772973b5d7099aca3031f7d113349730001d49da4553eb2",
+      "slot": 3427704,
+      "source_slot": 3427706,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": false,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 1486,
+      "timings": {
+        "first_shred_to_completion_ms": 149.89184,
+        "completion_to_replay_ms": 61.329651,
+        "replay_to_vote_ms": 1.165804,
+        "history_to_injection_ms": 0.065302,
+        "enqueue_to_serialization_ms": 0.088115
+      }
+    },
+    {
+      "key": "97592466d5ecd5dd74d33a909748b111dad98f9c716626e5d07dd83750ccce14",
+      "slot": 3427705,
+      "source_slot": 3427707,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 1628,
+      "timings": {
+        "first_shred_to_completion_ms": 205.924995,
+        "completion_to_replay_ms": 9.361562,
+        "replay_to_vote_ms": 1.205329,
+        "history_to_injection_ms": 0.07977,
+        "enqueue_to_serialization_ms": 0.070592
+      }
+    },
+    {
+      "key": "8c7e0d9273901945328457eead6e64f2ec9cebadb04880b3f62977d558b78a9b",
+      "slot": 3427707,
+      "source_slot": 3427708,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 2143,
+      "timings": {
+        "first_shred_to_completion_ms": 198.933375,
+        "completion_to_replay_ms": 10.232604,
+        "replay_to_vote_ms": 1.199237,
+        "history_to_injection_ms": 0.088786,
+        "enqueue_to_serialization_ms": 0.09598
+      }
+    },
+    {
+      "key": "c5a6102fb7ca9adad8ee99752fe2e442db28d9d544294828af7644cd343e70f3",
+      "slot": 3427709,
+      "source_slot": 3427710,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 2181,
+      "timings": {
+        "first_shred_to_completion_ms": 220.804197,
+        "completion_to_replay_ms": 11.085933,
+        "replay_to_vote_ms": 1.192364,
+        "history_to_injection_ms": 0.09634,
+        "enqueue_to_serialization_ms": 0.072045
+      }
+    },
+    {
+      "key": "a52e49e524ebcdf65b1de76a6623342668fa35e81b2d7a7776525c4dba48db3c",
+      "slot": 3427711,
+      "source_slot": 3427712,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 1718,
+      "timings": {
+        "first_shred_to_completion_ms": 203.291782,
+        "completion_to_replay_ms": 10.106848,
+        "replay_to_vote_ms": 1.23792,
+        "history_to_injection_ms": 0.129894,
+        "enqueue_to_serialization_ms": 0.067346
+      }
+    },
+    {
+      "key": "cf67b480401070a76fa2f37141c8f8c707552a42a58114730b6cda6c638e52e4",
+      "slot": 3427712,
+      "source_slot": 3427714,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 763,
+      "timings": {
+        "first_shred_to_completion_ms": 137.552168,
+        "completion_to_replay_ms": 7.823519,
+        "replay_to_vote_ms": 1.204678,
+        "history_to_injection_ms": 0.110727,
+        "enqueue_to_serialization_ms": 0.073948
+      }
+    },
+    {
+      "key": "546cf922f0e0e1f6a0b3350bdc1dac7787d1c061015f17fd3e8b2c527522f524",
+      "slot": 3427713,
+      "source_slot": 3427715,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 1775,
+      "timings": {
+        "first_shred_to_completion_ms": 205.428756,
+        "completion_to_replay_ms": 8.906179,
+        "replay_to_vote_ms": 1.343577,
+        "history_to_injection_ms": 0.152686,
+        "enqueue_to_serialization_ms": 0.071885
+      }
+    },
+    {
+      "key": "6e9fe0addccadb0008c41299918d5bf2e01d5da6e2a738668b6d3837556d225e",
+      "slot": 3427715,
+      "source_slot": 3427716,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 1755,
+      "timings": {
+        "first_shred_to_completion_ms": 202.996969,
+        "completion_to_replay_ms": 8.86942,
+        "replay_to_vote_ms": 1.250422,
+        "history_to_injection_ms": 0.130214,
+        "enqueue_to_serialization_ms": 0.077415
+      }
+    },
+    {
+      "key": "21acbd7bca85e4069d5cf7c0581b69257ee6aef6d0ab9ec3ed0fe04729e2b465",
+      "slot": 3427716,
+      "source_slot": 3427718,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 31736,
+      "timings": {
+        "first_shred_to_completion_ms": 169.945006,
+        "completion_to_replay_ms": 93.913487,
+        "replay_to_vote_ms": 1.357613,
+        "history_to_injection_ms": 0.158166,
+        "enqueue_to_serialization_ms": 0.181891
+      }
+    },
+    {
+      "key": "e5b309a9a2d3a9de37f617607956fb30fa7215e4c9fe68fbdd389e7a164028a2",
+      "slot": 3427717,
+      "source_slot": 3427719,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 33760,
+      "timings": {
+        "first_shred_to_completion_ms": 220.202539,
+        "completion_to_replay_ms": 110.591158,
+        "replay_to_vote_ms": 2.255977,
+        "history_to_injection_ms": 0.253795,
+        "enqueue_to_serialization_ms": 0.253485
+      }
+    },
+    {
+      "key": "af80ca4a3ea53d577ee427b9c6f8d1bc22a19f435f09b706dece55fb0d455a52",
+      "slot": 3427719,
+      "source_slot": 3427721,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 33760,
+      "timings": {
+        "first_shred_to_completion_ms": 215.440446,
+        "completion_to_replay_ms": 103.558139,
+        "replay_to_vote_ms": 1.314884,
+        "history_to_injection_ms": 0.177643,
+        "enqueue_to_serialization_ms": 0.08516
+      }
+    },
+    {
+      "key": "8b08412d60cc66fb729e90767199c5765fd7cf60d580b1565fbcbcb3628286c0",
+      "slot": 3427720,
+      "source_slot": 3427722,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 4048,
+      "timings": {
+        "first_shred_to_completion_ms": 161.289346,
+        "completion_to_replay_ms": 14.938192,
+        "replay_to_vote_ms": 1.321907,
+        "history_to_injection_ms": 0.182642,
+        "enqueue_to_serialization_ms": 0.076573
+      }
+    },
+    {
+      "key": "fa20eaa2d9fccade3b0fbc6915a216eaa69aebc34b9cf6d3ecbcae749b1ad074",
+      "slot": 3427721,
+      "source_slot": 3427723,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 2048,
+      "timings": {
+        "first_shred_to_completion_ms": 201.085948,
+        "completion_to_replay_ms": 9.475345,
+        "replay_to_vote_ms": 1.266503,
+        "history_to_injection_ms": 0.157595,
+        "enqueue_to_serialization_ms": 0.070532
+      }
+    },
+    {
+      "key": "4ff05ffa25e5514966263d311f1073c3e60448cb591f0c5e10e0396ffac48044",
+      "slot": 3427723,
+      "source_slot": 3427724,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 1607,
+      "timings": {
+        "first_shred_to_completion_ms": 170.084387,
+        "completion_to_replay_ms": 10.283109,
+        "replay_to_vote_ms": 1.263167,
+        "history_to_injection_ms": 0.154189,
+        "enqueue_to_serialization_ms": 0.070362
+      }
+    },
+    {
+      "key": "b9801a1e83d0465ebfa5bce0490facab3436ef06666bc3e0e837b65219857f53",
+      "slot": 3427724,
+      "source_slot": 3427726,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 9793,
+      "timings": {
+        "first_shred_to_completion_ms": 181.894417,
+        "completion_to_replay_ms": 27.00905,
+        "replay_to_vote_ms": 1.292312,
+        "history_to_injection_ms": 0.18151,
+        "enqueue_to_serialization_ms": 0.076323
+      }
+    },
+    {
+      "key": "ed2d7782f03765e5cb4a5695d3ac6c68990fad8f8e21188f27a8342907798e7f",
+      "slot": 3427725,
+      "source_slot": 3427727,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 3057,
+      "timings": {
+        "first_shred_to_completion_ms": 227.88829,
+        "completion_to_replay_ms": 15.427278,
+        "replay_to_vote_ms": 1.316186,
+        "history_to_injection_ms": 0.183003,
+        "enqueue_to_serialization_ms": 0.074821
+      }
+    },
+    {
+      "key": "f3828295bc16bda5b3757a54c63cfdde2a3680ed02724ec43b3d22f3d09ad8cb",
+      "slot": 3427727,
+      "source_slot": 3427728,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 8358,
+      "timings": {
+        "first_shred_to_completion_ms": 216.778082,
+        "completion_to_replay_ms": 25.156789,
+        "replay_to_vote_ms": 1.332848,
+        "history_to_injection_ms": 0.193733,
+        "enqueue_to_serialization_ms": 0.077214
+      }
+    },
+    {
+      "key": "b744a0e4dc7c7d780658feb9437bd84e0e1fcf5f21744f25b544c7633343d885",
+      "slot": 3427731,
+      "source_slot": 3427732,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 1642,
+      "timings": {
+        "first_shred_to_completion_ms": 186.0591,
+        "completion_to_replay_ms": 10.786302,
+        "replay_to_vote_ms": 1.307079,
+        "history_to_injection_ms": 0.211116,
+        "enqueue_to_serialization_ms": 0.06921
+      }
+    },
+    {
+      "key": "719047229b13a3a3921de4963bf7303f878836c1fe3103cb797ad119fbc5fb1d",
+      "slot": 3427732,
+      "source_slot": 3427734,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 26245,
+      "timings": {
+        "first_shred_to_completion_ms": 162.904394,
+        "completion_to_replay_ms": 84.068979,
+        "replay_to_vote_ms": 1.414942,
+        "history_to_injection_ms": 0.248977,
+        "enqueue_to_serialization_ms": 0.231123
+      }
+    },
+    {
+      "key": "3dfc256f0cec52256785c19994e5bfe681700e6356efbec4be04a4916b35ee47",
+      "slot": 3427733,
+      "source_slot": 3427735,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 33760,
+      "timings": {
+        "first_shred_to_completion_ms": 221.125058,
+        "completion_to_replay_ms": 109.323122,
+        "replay_to_vote_ms": 1.737545,
+        "history_to_injection_ms": 0.271839,
+        "enqueue_to_serialization_ms": 0.160641
+      }
+    },
+    {
+      "key": "e5d3918c204c17aced5b9d4af67d3455fc71839a54eed2b566b620ef0dea2515",
+      "slot": 3427735,
+      "source_slot": 3427740,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 33760,
+      "timings": {
+        "first_shred_to_completion_ms": 220.006311,
+        "completion_to_replay_ms": 93.49894,
+        "replay_to_vote_ms": 1.381038,
+        "history_to_injection_ms": 0.25075,
+        "enqueue_to_serialization_ms": 0.084799
+      }
+    },
+    {
+      "key": "6630b3b6789622e5c48f210f0f0b5393bc0ae692c185757eeb2a39c33aaa3d0a",
+      "slot": 3427740,
+      "source_slot": 3427742,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 0,
+      "timings": {
+        "first_shred_to_completion_ms": 59.086287,
+        "completion_to_replay_ms": 6.707358,
+        "replay_to_vote_ms": 1.37696,
+        "history_to_injection_ms": 0.255138,
+        "enqueue_to_serialization_ms": 0.065112
+      }
+    },
+    {
+      "key": "c3d6f9244bf212c2680ed119e7f894b8e5b13909f543677d4a1b4be46eba52db",
+      "slot": 3427741,
+      "source_slot": 3427743,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 10,
+      "timings": {
+        "first_shred_to_completion_ms": 167.427028,
+        "completion_to_replay_ms": 5.480619,
+        "replay_to_vote_ms": 1.368004,
+        "history_to_injection_ms": 0.249859,
+        "enqueue_to_serialization_ms": 0.067887
+      }
+    },
+    {
+      "key": "d9e7f3ba8964125c2e1eb771927fa8a508875a22d4f0a2d37867c2ff52123880",
+      "slot": 3427743,
+      "source_slot": 3427744,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 2391,
+      "timings": {
+        "first_shred_to_completion_ms": 257.227988,
+        "completion_to_replay_ms": 13.159669,
+        "replay_to_vote_ms": 1.389644,
+        "history_to_injection_ms": 0.26689,
+        "enqueue_to_serialization_ms": 0.084969
+      }
+    },
+    {
+      "key": "7003c068c0edca7826bd092c0da9c72512a68fb215a6d0faee51c29f5a4eff1c",
+      "slot": 3427745,
+      "source_slot": 3427746,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 1871,
+      "timings": {
+        "first_shred_to_completion_ms": 202.414107,
+        "completion_to_replay_ms": 11.834366,
+        "replay_to_vote_ms": 1.35557,
+        "history_to_injection_ms": 0.255559,
+        "enqueue_to_serialization_ms": 0.074219
+      }
+    },
+    {
+      "key": "6cbd6f986daca6df360a4104ca91fd4eedaf63711eee5bb0a7a7b5f3d55ea309",
+      "slot": 3427747,
+      "source_slot": 3427748,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 2072,
+      "timings": {
+        "first_shred_to_completion_ms": 267.146103,
+        "completion_to_replay_ms": 11.186511,
+        "replay_to_vote_ms": 1.402629,
+        "history_to_injection_ms": 0.299612,
+        "enqueue_to_serialization_ms": 0.074179
+      }
+    },
+    {
+      "key": "bee8bdc7af64235e135f3a222bad6eedc68c8949a88a4a26f8222ba5b888a34a",
+      "slot": 3427751,
+      "source_slot": 3427752,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 1902,
+      "timings": {
+        "first_shred_to_completion_ms": 207.014637,
+        "completion_to_replay_ms": 12.600361,
+        "replay_to_vote_ms": 1.381158,
+        "history_to_injection_ms": 0.284363,
+        "enqueue_to_serialization_ms": 0.078487
+      }
+    },
+    {
+      "key": "9afd47b978c886618c73f239dbab7fa09499af0c7969013e8bae19336799f46d",
+      "slot": 3427755,
+      "source_slot": 3427756,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 0,
+      "timings": {
+        "first_shred_to_completion_ms": 17.110633,
+        "completion_to_replay_ms": 5.695923,
+        "replay_to_vote_ms": 1.429809,
+        "history_to_injection_ms": 0.296435,
+        "enqueue_to_serialization_ms": 0.067497
+      }
+    },
+    {
+      "key": "adb2aefe10a9093430961ce37c049418a8e03c7eed962151655e93fb4bde115c",
+      "slot": 3427756,
+      "source_slot": 3427758,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 1359,
+      "timings": {
+        "first_shred_to_completion_ms": 174.971455,
+        "completion_to_replay_ms": 9.470005,
+        "replay_to_vote_ms": 1.490783,
+        "history_to_injection_ms": 0.325079,
+        "enqueue_to_serialization_ms": 0.086242
+      }
+    },
+    {
+      "key": "35fa3ad2ce843fb0fb905aa7d1b4515ed468f9c7ef426f7e17ef0eba62f4f70e",
+      "slot": 3427757,
+      "source_slot": 3427759,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 1896,
+      "timings": {
+        "first_shred_to_completion_ms": 176.069902,
+        "completion_to_replay_ms": 10.261619,
+        "replay_to_vote_ms": 1.441421,
+        "history_to_injection_ms": 0.318777,
+        "enqueue_to_serialization_ms": 0.073748
+      }
+    },
+    {
+      "key": "a7ba4241262f7dc58326978390d06d6ba4ce4c15accde3cb62472b39e7efbe57",
+      "slot": 3427759,
+      "source_slot": 3427760,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 1837,
+      "timings": {
+        "first_shred_to_completion_ms": 198.988147,
+        "completion_to_replay_ms": 9.498499,
+        "replay_to_vote_ms": 1.429078,
+        "history_to_injection_ms": 0.32046,
+        "enqueue_to_serialization_ms": 0.065653
+      }
+    },
+    {
+      "key": "cdf842d883ac7f6759ff05fb050aabd68b46cd326ab4b1eed30382153270e895",
+      "slot": 3427760,
+      "source_slot": 3427761,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 0,
+      "timings": {
+        "first_shred_to_completion_ms": 16.056287,
+        "completion_to_replay_ms": 4.92618,
+        "replay_to_vote_ms": 1.427095,
+        "history_to_injection_ms": 0.350276,
+        "enqueue_to_serialization_ms": 0.072195
+      }
+    },
+    {
+      "key": "b1bed142a5efaf6ddc9d65a658cd6bc40f7cf699743b0ad50161ab8a07e05fa5",
+      "slot": 3427763,
+      "source_slot": 3427764,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 0,
+      "timings": {
+        "first_shred_to_completion_ms": 76.630822,
+        "completion_to_replay_ms": 5.588381,
+        "replay_to_vote_ms": 1.416946,
+        "history_to_injection_ms": 0.34686,
+        "enqueue_to_serialization_ms": 0.070402
+      }
+    },
+    {
+      "key": "1f25b1876f3ddcaac51d3ff973cb63446612819c8f98b1972b92da7237a9e72a",
+      "slot": 3427764,
+      "source_slot": 3427766,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 3655,
+      "timings": {
+        "first_shred_to_completion_ms": 156.070858,
+        "completion_to_replay_ms": 13.328255,
+        "replay_to_vote_ms": 1.43037,
+        "history_to_injection_ms": 0.342752,
+        "enqueue_to_serialization_ms": 0.082525
+      }
+    },
+    {
+      "key": "35b2cfdbdf95e76274ce131fc69caba50f9874fe5fd1cd188496b11d2896270d",
+      "slot": 3427765,
+      "source_slot": 3427767,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 1969,
+      "timings": {
+        "first_shred_to_completion_ms": 205.403319,
+        "completion_to_replay_ms": 10.133628,
+        "replay_to_vote_ms": 1.492948,
+        "history_to_injection_ms": 0.359544,
+        "enqueue_to_serialization_ms": 0.065783
+      }
+    },
+    {
+      "key": "4f43013c63129cddd3de0e1158a98874be1e636dd09511729037a723b211f588",
+      "slot": 3427767,
+      "source_slot": 3427768,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 1854,
+      "timings": {
+        "first_shred_to_completion_ms": 199.97666,
+        "completion_to_replay_ms": 9.726786,
+        "replay_to_vote_ms": 1.47266,
+        "history_to_injection_ms": 0.377087,
+        "enqueue_to_serialization_ms": 0.097302
+      }
+    },
+    {
+      "key": "c5850338aaa64e742f7914312f6d6da25603f353f6867e48646a0883e16bdbda",
+      "slot": 3427769,
+      "source_slot": 3427770,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 0,
+      "timings": {
+        "first_shred_to_completion_ms": 19.513715,
+        "completion_to_replay_ms": 6.661432,
+        "replay_to_vote_ms": 1.890703,
+        "history_to_injection_ms": 0.508272,
+        "enqueue_to_serialization_ms": 0.105818
+      }
+    },
+    {
+      "key": "0e1025e90c5405220ec9ef3984ac935506473b14552d609bd7e32ca434d31f7c",
+      "slot": 3427770,
+      "source_slot": 3427771,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 0,
+      "timings": {
+        "first_shred_to_completion_ms": 81.144831,
+        "completion_to_replay_ms": 5.034724,
+        "replay_to_vote_ms": 1.569541,
+        "history_to_injection_ms": 0.425147,
+        "enqueue_to_serialization_ms": 0.073518
+      }
+    },
+    {
+      "key": "fb4c1604ce9f74f7ae6eb389fbbf671d73b25dd8dae4bc5e1dda633eab8407c0",
+      "slot": 3427771,
+      "source_slot": 3427772,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 0,
+      "timings": {
+        "first_shred_to_completion_ms": 82.455526,
+        "completion_to_replay_ms": 4.860548,
+        "replay_to_vote_ms": 1.438796,
+        "history_to_injection_ms": 0.359594,
+        "enqueue_to_serialization_ms": 0.072075
+      }
+    },
+    {
+      "key": "f5227a53bfaa7476bd0605263369c2a36938429cf00e2a61bbc514accf92d49e",
+      "slot": 3427775,
+      "source_slot": 3427776,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 4558,
+      "timings": {
+        "first_shred_to_completion_ms": 202.041198,
+        "completion_to_replay_ms": 18.736349,
+        "replay_to_vote_ms": 1.512494,
+        "history_to_injection_ms": 0.424114,
+        "enqueue_to_serialization_ms": 0.079349
+      }
+    },
+    {
+      "key": "b8455e61b5a229aab86257b0beabca12a26331139c5df1237d0a6884019f8b65",
+      "slot": 3427779,
+      "source_slot": 3427780,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 1728,
+      "timings": {
+        "first_shred_to_completion_ms": 208.888409,
+        "completion_to_replay_ms": 10.567201,
+        "replay_to_vote_ms": 1.571866,
+        "history_to_injection_ms": 0.40566,
+        "enqueue_to_serialization_ms": 0.075171
+      }
+    },
+    {
+      "key": "ff811298c2dd93248dfc8648cd23adb2add946dbb481b2c69f1650eccbc7030f",
+      "slot": 3427783,
+      "source_slot": 3427784,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 2079,
+      "timings": {
+        "first_shred_to_completion_ms": 241.654797,
+        "completion_to_replay_ms": 12.636388,
+        "replay_to_vote_ms": 1.52071,
+        "history_to_injection_ms": 0.452958,
+        "enqueue_to_serialization_ms": 0.077936
+      }
+    },
+    {
+      "key": "e3d2ecec0b107a7b27237d650b02f485af900ba18df99092a1e7f470139e6e9c",
+      "slot": 3427787,
+      "source_slot": 3427788,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 0,
+      "timings": {
+        "first_shred_to_completion_ms": 27.731845,
+        "completion_to_replay_ms": 5.601185,
+        "replay_to_vote_ms": 1.607632,
+        "history_to_injection_ms": 0.490278,
+        "enqueue_to_serialization_ms": 0.070222
+      }
+    },
+    {
+      "key": "e6735e09d712aa4bfd588d8212ea0b3784bded8c8b980130367e1ca2e0116bd9",
+      "slot": 3427791,
+      "source_slot": 3427792,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 0,
+      "timings": {
+        "first_shred_to_completion_ms": 27.287802,
+        "completion_to_replay_ms": 5.837739,
+        "replay_to_vote_ms": 1.555375,
+        "history_to_injection_ms": 0.449803,
+        "enqueue_to_serialization_ms": 0.068548
+      }
+    },
+    {
+      "key": "29ad0046829bd7d6db749064a575f5f80c2cf94497f5a16ccd88cc6a7b261660",
+      "slot": 3427792,
+      "source_slot": 3427794,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 0,
+      "timings": {
+        "first_shred_to_completion_ms": 20.415104,
+        "completion_to_replay_ms": 5.116067,
+        "replay_to_vote_ms": 1.561536,
+        "history_to_injection_ms": 0.470381,
+        "enqueue_to_serialization_ms": 0.06959
+      }
+    },
+    {
+      "key": "2971a122990cfc1a34e3c352dc9b63c2b80a5308ee7457274e4b1456cde9f1fa",
+      "slot": 3427795,
+      "source_slot": 3427796,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 0,
+      "timings": {
+        "first_shred_to_completion_ms": 22.505722,
+        "completion_to_replay_ms": 6.11056,
+        "replay_to_vote_ms": 1.570643,
+        "history_to_injection_ms": 0.489257,
+        "enqueue_to_serialization_ms": 0.070643
+      }
+    },
+    {
+      "key": "ec2b9b17126f1b8d53accae2c48abab7caef30c259444f99367b57e5957c81a8",
+      "slot": 3427796,
+      "source_slot": 3427798,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 661,
+      "timings": {
+        "first_shred_to_completion_ms": 123.082354,
+        "completion_to_replay_ms": 7.898811,
+        "replay_to_vote_ms": 1.652556,
+        "history_to_injection_ms": 0.528781,
+        "enqueue_to_serialization_ms": 0.073548
+      }
+    },
+    {
+      "key": "1efd498bffd4bbbbba29749ed7f4e5b85206faf755bf433aad3503a819583136",
+      "slot": 3427797,
+      "source_slot": 3427799,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 1658,
+      "timings": {
+        "first_shred_to_completion_ms": 185.806908,
+        "completion_to_replay_ms": 11.071937,
+        "replay_to_vote_ms": 1.589768,
+        "history_to_injection_ms": 0.50142,
+        "enqueue_to_serialization_ms": 0.085711
+      }
+    },
+    {
+      "key": "526cb0d6bbf1c23a1b9df28bf9c1763ff13c03066c54901a5f5ab923e631c5f1",
+      "slot": 3427799,
+      "source_slot": 3427800,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 1952,
+      "timings": {
+        "first_shred_to_completion_ms": 206.06048,
+        "completion_to_replay_ms": 11.90601,
+        "replay_to_vote_ms": 1.593906,
+        "history_to_injection_ms": 0.495298,
+        "enqueue_to_serialization_ms": 0.067437
+      }
+    },
+    {
+      "key": "6f3331e4c902ea987385c0d6cb76b1a82cfe6ba7f331003bc2ee52d9d35ffe1d",
+      "slot": 3427803,
+      "source_slot": 3427804,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 2023,
+      "timings": {
+        "first_shred_to_completion_ms": 260.300125,
+        "completion_to_replay_ms": 11.481044,
+        "replay_to_vote_ms": 1.66514,
+        "history_to_injection_ms": 0.530755,
+        "enqueue_to_serialization_ms": 0.069109
+      }
+    },
+    {
+      "key": "9bf0025d99d2c01845d6278107e99938eb0d9b5350473e020d4a4ade2c299712",
+      "slot": 3427804,
+      "source_slot": 3427806,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 31873,
+      "timings": {
+        "first_shred_to_completion_ms": 175.892941,
+        "completion_to_replay_ms": 105.377889,
+        "replay_to_vote_ms": 1.834307,
+        "history_to_injection_ms": 0.615123,
+        "enqueue_to_serialization_ms": 0.221725
+      }
+    },
+    {
+      "key": "a7ab49cecc37985fd1ddec744fa471ded8018a26fc3f983bf01d994854319de7",
+      "slot": 3427805,
+      "source_slot": 3427807,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 33760,
+      "timings": {
+        "first_shred_to_completion_ms": 228.689502,
+        "completion_to_replay_ms": 110.120166,
+        "replay_to_vote_ms": 1.852892,
+        "history_to_injection_ms": 0.637384,
+        "enqueue_to_serialization_ms": 0.157996
+      }
+    },
+    {
+      "key": "9d86bb10a5bfd66014f3b324f344cf4f7426e8ccb572b79db6871f26cdc3928d",
+      "slot": 3427807,
+      "source_slot": 3427812,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 33760,
+      "timings": {
+        "first_shred_to_completion_ms": 277.260165,
+        "completion_to_replay_ms": 99.471141,
+        "replay_to_vote_ms": 1.781748,
+        "history_to_injection_ms": 0.64013,
+        "enqueue_to_serialization_ms": 0.134733
+      }
+    },
+    {
+      "key": "ec206c19aebd0c1123ec0c9ceb93d82928b7c85d25ee7a0a01c32465980fe177",
+      "slot": 3427812,
+      "source_slot": 3427814,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": false,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 32061,
+      "timings": {
+        "first_shred_to_completion_ms": 223.06323,
+        "completion_to_replay_ms": 120.796931,
+        "replay_to_vote_ms": 1.903487,
+        "history_to_injection_ms": 0.635471,
+        "enqueue_to_serialization_ms": 0.166973
+      }
+    },
+    {
+      "key": "568d1ab1d5356068b9f2a5109ea14589361ea820ea0c06a45ffe214efa0fea93",
+      "slot": 3427813,
+      "source_slot": 3427815,
+      "epoch": 63,
+      "own_rank": 20,
+      "included": true,
+      "notarize_observed": true,
+      "serialized_observed": true,
+      "serialized_after_footer_observed": false,
+      "transactions": 33760,
+      "timings": {
+        "first_shred_to_completion_ms": 266.445771,
+        "completion_to_replay_ms": 98.727998,
+        "replay_to_vote_ms": 1.789233,
+        "history_to_injection_ms": 0.621334,
+        "enqueue_to_serialization_ms": 0.174827
+      }
+    }
+  ],
+  "notes": [
+    "Local successfully replayed footer sample; not necessarily identical to Puffin observer sample.",
+    "Certificates deduplicated by full wire proof within this capture; aggregate across captures by key.",
+    "No remote receipt timestamp. First-shred interval includes leader production.",
+    "Capture edges and absent rank are excluded; no notarize event inside a capture does not prove no vote was ever sent."
+  ],
+  "probe_counts": {
+    "S": 130,
+    "J": 130,
+    "B": 130,
+    "R": 130,
+    "A": 130,
+    "C": 130,
+    "H": 130,
+    "I": 130,
+    "Q": 130,
+    "K": 172,
+    "V": 257,
+    "W": 0
+  },
+  "admission_rejections": 0,
+  "reservations": [
+    [
+      666,
+      16
+    ]
+  ],
+  "replays_without_observed_notarize": []
+}

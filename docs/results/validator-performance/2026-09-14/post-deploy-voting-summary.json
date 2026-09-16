@@ -1,0 +1,91 @@
+{
+  "utc": "2026-09-14T03:49:49Z",
+  "fast_captures": [
+    {
+      "utc": "2026-09-14T03:39:38.170708+00:00",
+      "unique_fast_certificates": 612,
+      "included": 594,
+      "missing": 18,
+      "fast_percent": 97.05882352941177
+    },
+    {
+      "utc": "2026-09-14T03:44:39.613287+00:00",
+      "unique_fast_certificates": 555,
+      "included": 543,
+      "missing": 12,
+      "fast_percent": 97.83783783783784
+    },
+    {
+      "utc": "2026-09-14T03:49:40.954783+00:00",
+      "unique_fast_certificates": 629,
+      "included": 609,
+      "missing": 20,
+      "fast_percent": 96.82034976152623
+    }
+  ],
+  "deduplicated_fast": {
+    "unique_proofs": 1796,
+    "included": 1746,
+    "missing": 50,
+    "replay_to_vote_ms": {
+      "count": 1792,
+      "median": 1.5542625,
+      "p95": 2.008444,
+      "max": 9.103538
+    }
+  },
+  "titan_windows": {
+    "1000": {
+      "actual_slots": 1000,
+      "voter": [
+        1000,
+        997,
+        3,
+        99.7
+      ],
+      "leader": [
+        12,
+        12,
+        0,
+        100,
+        80.81761,
+        85.6667
+      ]
+    },
+    "5000": {
+      "actual_slots": 5000,
+      "voter": [
+        5000,
+        4970,
+        30,
+        99.4
+      ],
+      "leader": [
+        56,
+        56,
+        0,
+        100,
+        80.727763,
+        85.5714
+      ]
+    },
+    "epoch": {
+      "actual_slots": 27516,
+      "voter": [
+        27514,
+        27033,
+        481,
+        98.251799
+      ],
+      "leader": [
+        346,
+        346,
+        0,
+        100,
+        80.837605,
+        85.6879
+      ]
+    }
+  },
+  "note": "Observed windows; not controlled attribution to a single patch."
+}

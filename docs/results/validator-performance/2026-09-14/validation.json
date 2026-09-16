@@ -1,0 +1,74 @@
+[
+  {
+    "label": "native-race",
+    "command": [
+      "go",
+      "test",
+      "-race",
+      "-p",
+      "1",
+      "-count=1",
+      "./pkg/accounts",
+      "./pkg/alpenglow",
+      "./pkg/block",
+      "./pkg/blockprod/...",
+      "./pkg/config",
+      "./pkg/consensus",
+      "./pkg/costmodel",
+      "./pkg/merkletree",
+      "./pkg/metrics",
+      "./pkg/replay",
+      "./pkg/sbpf",
+      "./pkg/sealevel",
+      "./pkg/sigverify",
+      "./pkg/statsd",
+      "./pkg/tpu/txfixture",
+      "./pkg/turbine",
+      "./cmd/mithril/node"
+    ],
+    "exit_code": 1,
+    "elapsed_seconds": 124.60674452781677
+  },
+  {
+    "label": "native-vet",
+    "command": [
+      "go",
+      "vet",
+      "-p",
+      "1",
+      "./pkg/accounts",
+      "./pkg/alpenglow",
+      "./pkg/block",
+      "./pkg/blockprod/...",
+      "./pkg/config",
+      "./pkg/consensus",
+      "./pkg/costmodel",
+      "./pkg/merkletree",
+      "./pkg/metrics",
+      "./pkg/replay",
+      "./pkg/sbpf",
+      "./pkg/sealevel",
+      "./pkg/sigverify",
+      "./pkg/statsd",
+      "./pkg/tpu/txfixture",
+      "./pkg/turbine",
+      "./cmd/mithril/node"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 10.573910236358643
+  },
+  {
+    "label": "native-build",
+    "command": [
+      "go",
+      "build",
+      "-p",
+      "1",
+      "-o",
+      "/srv/mithril-pr-consolidation-20260914/mithril-review",
+      "./cmd/mithril"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 3.2196364402770996
+  }
+]

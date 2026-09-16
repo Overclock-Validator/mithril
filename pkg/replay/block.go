@@ -1989,9 +1989,9 @@ func ReplayBlocks(
 			checkpointAfterCommit = consensusOpts.TransactionStatusCheckpointAfterCommit
 		}
 		if hookErr := unrootedTailState.SetTransactionStatusCheckpointHooks(TransactionStatusCheckpointHooks{
-			// Snapshot runs here on the replay loop during fold-job construction;
-			// only its immutable bytes cross to the async worker.
-			Snapshot: transactionStatuses.SnapshotThrough,
+			// Pin the exact immutable view on replay. Sorting and encoding run
+			// on the existing fold worker, after releasing the live cache lock.
+			Capture: transactionStatuses.CaptureSnapshotThrough,
 			Install: func(through uint64, payload []byte) (*state.TransactionStatusCheckpointRef, error) {
 				return PrepareTransactionStatusCheckpoint(acctsDbPath, through, payload)
 			},
@@ -2836,6 +2836,11 @@ func ReplayBlocks(
 			record.TransactionParse.AddTiming(ingressTimings.TransactionParse)
 			record.TransactionSigverify.AddTiming(ingressTimings.TransactionSigverify)
 			record.ReplayAdmission.AddTiming(ingressTimings.ReplayAdmission)
+			record.EarlyTransactionParse.AddTiming(ingressTimings.EarlyTransactionParse)
+			record.EarlyTransactionSigverify.AddTiming(ingressTimings.EarlyTransactionSigverify)
+			record.EarlyPreparationWait.AddTiming(ingressTimings.EarlyPreparationWait)
+			record.EarlyVerifiedTransactions = ingressTimings.EarlyVerifiedTransactions
+			record.FullToReady.AddTiming(ingressTimings.FullToReady)
 		}
 		start := time.Now()
 

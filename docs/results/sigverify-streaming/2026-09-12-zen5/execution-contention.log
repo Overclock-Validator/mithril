@@ -1,0 +1,162 @@
+sample-1-tip_200ms_overlap-workers2-target8: baseline execution
+sample-1-tip_200ms_overlap-workers2-target8: concurrent execution
+sample-1-tip_200ms_overlap-workers2-target8: execution ratio 1.017x
+sample-1-catchup-workers4-target8: baseline execution
+sample-1-catchup-workers4-target8: concurrent execution
+sample-1-catchup-workers4-target8: execution ratio 1.145x
+sample-1-tip_200ms_overlap-workers2-target4: baseline execution
+sample-1-tip_200ms_overlap-workers2-target4: concurrent execution
+sample-1-tip_200ms_overlap-workers2-target4: execution ratio 1.070x
+sample-1-tip_200ms_overlap-workers4-target4: baseline execution
+sample-1-tip_200ms_overlap-workers4-target4: concurrent execution
+sample-1-tip_200ms_overlap-workers4-target4: execution ratio 1.233x
+sample-1-tip_200ms_overlap-workers4-target8: baseline execution
+sample-1-tip_200ms_overlap-workers4-target8: concurrent execution
+sample-1-tip_200ms_overlap-workers4-target8: execution ratio 0.991x
+sample-1-catchup-workers2-target4: baseline execution
+sample-1-catchup-workers2-target4: concurrent execution
+sample-1-catchup-workers2-target4: execution ratio 1.019x
+sample-1-catchup-workers4-target4: baseline execution
+sample-1-catchup-workers4-target4: concurrent execution
+sample-1-catchup-workers4-target4: execution ratio 1.012x
+sample-1-catchup-workers2-target8: baseline execution
+sample-1-catchup-workers2-target8: concurrent execution
+sample-1-catchup-workers2-target8: execution ratio 1.251x
+sample-2-catchup-workers2-target8: baseline execution
+sample-2-catchup-workers2-target8: concurrent execution
+sample-2-catchup-workers2-target8: execution ratio 1.218x
+sample-2-catchup-workers4-target8: baseline execution
+sample-2-catchup-workers4-target8: concurrent execution
+sample-2-catchup-workers4-target8: execution ratio 1.412x
+sample-2-catchup-workers4-target4: baseline execution
+sample-2-catchup-workers4-target4: concurrent execution
+sample-2-catchup-workers4-target4: execution ratio 0.984x
+sample-2-catchup-workers2-target4: baseline execution
+sample-2-catchup-workers2-target4: concurrent execution
+sample-2-catchup-workers2-target4: execution ratio 1.110x
+sample-2-tip_200ms_overlap-workers2-target4: baseline execution
+sample-2-tip_200ms_overlap-workers2-target4: concurrent execution
+sample-2-tip_200ms_overlap-workers2-target4: execution ratio 1.370x
+sample-2-tip_200ms_overlap-workers2-target8: baseline execution
+sample-2-tip_200ms_overlap-workers2-target8: concurrent execution
+sample-2-tip_200ms_overlap-workers2-target8: execution ratio 0.949x
+sample-2-tip_200ms_overlap-workers4-target4: baseline execution
+sample-2-tip_200ms_overlap-workers4-target4: concurrent execution
+sample-2-tip_200ms_overlap-workers4-target4: execution ratio 1.039x
+sample-2-tip_200ms_overlap-workers4-target8: baseline execution
+sample-2-tip_200ms_overlap-workers4-target8: concurrent execution
+sample-2-tip_200ms_overlap-workers4-target8: execution ratio 0.899x
+sample-3-catchup-workers2-target8: baseline execution
+sample-3-catchup-workers2-target8: concurrent execution
+sample-3-catchup-workers2-target8: execution ratio 1.068x
+sample-3-tip_200ms_overlap-workers4-target4: baseline execution
+sample-3-tip_200ms_overlap-workers4-target4: concurrent execution
+sample-3-tip_200ms_overlap-workers4-target4: execution ratio 1.214x
+sample-3-tip_200ms_overlap-workers2-target4: baseline execution
+sample-3-tip_200ms_overlap-workers2-target4: concurrent execution
+sample-3-tip_200ms_overlap-workers2-target4: execution ratio 0.981x
+sample-3-tip_200ms_overlap-workers4-target8: baseline execution
+sample-3-tip_200ms_overlap-workers4-target8: concurrent execution
+sample-3-tip_200ms_overlap-workers4-target8: execution ratio 1.179x
+sample-3-catchup-workers2-target4: baseline execution
+sample-3-catchup-workers2-target4: concurrent execution
+sample-3-catchup-workers2-target4: execution ratio 0.949x
+sample-3-catchup-workers4-target4: baseline execution
+sample-3-catchup-workers4-target4: concurrent execution
+sample-3-catchup-workers4-target4: execution ratio 1.147x
+sample-3-tip_200ms_overlap-workers2-target8: baseline execution
+sample-3-tip_200ms_overlap-workers2-target8: concurrent execution
+sample-3-tip_200ms_overlap-workers2-target8: execution ratio 1.034x
+sample-3-catchup-workers4-target8: baseline execution
+sample-3-catchup-workers4-target8: concurrent execution
+sample-3-catchup-workers4-target8: execution ratio 1.215x
+[
+  {
+    "workers": 2,
+    "target": 4,
+    "mode": "catchup",
+    "samples": 3,
+    "median_execution_slowdown_ratio": 1.0192115768463075,
+    "median_execution_baseline_ns": 3817.0,
+    "median_execution_concurrent_ns": 4021.0,
+    "median_sigverify_residual_p95_ms": 174.2,
+    "median_sigverify_cpu_ms_per_block": 311.5
+  },
+  {
+    "workers": 2,
+    "target": 4,
+    "mode": "tip_200ms_overlap",
+    "samples": 3,
+    "median_execution_slowdown_ratio": 1.069901790872328,
+    "median_execution_baseline_ns": 3502.0,
+    "median_execution_concurrent_ns": 3704.0,
+    "median_sigverify_residual_p95_ms": 1.497,
+    "median_sigverify_cpu_ms_per_block": 314.3
+  },
+  {
+    "workers": 2,
+    "target": 8,
+    "mode": "catchup",
+    "samples": 3,
+    "median_execution_slowdown_ratio": 1.2183874709976799,
+    "median_execution_baseline_ns": 3542.0,
+    "median_execution_concurrent_ns": 4201.0,
+    "median_sigverify_residual_p95_ms": 90.25,
+    "median_sigverify_cpu_ms_per_block": 160.8
+  },
+  {
+    "workers": 2,
+    "target": 8,
+    "mode": "tip_200ms_overlap",
+    "samples": 3,
+    "median_execution_slowdown_ratio": 1.0169979832901181,
+    "median_execution_baseline_ns": 3471.0,
+    "median_execution_concurrent_ns": 3536.0,
+    "median_sigverify_residual_p95_ms": 1.357,
+    "median_sigverify_cpu_ms_per_block": 169.9
+  },
+  {
+    "workers": 4,
+    "target": 4,
+    "mode": "catchup",
+    "samples": 3,
+    "median_execution_slowdown_ratio": 1.0121273370389086,
+    "median_execution_baseline_ns": 3958.0,
+    "median_execution_concurrent_ns": 4182.0,
+    "median_sigverify_residual_p95_ms": 94.24,
+    "median_sigverify_cpu_ms_per_block": 316.1
+  },
+  {
+    "workers": 4,
+    "target": 4,
+    "mode": "tip_200ms_overlap",
+    "samples": 3,
+    "median_execution_slowdown_ratio": 1.2137119908204246,
+    "median_execution_baseline_ns": 3489.0,
+    "median_execution_concurrent_ns": 4231.0,
+    "median_sigverify_residual_p95_ms": 1.263,
+    "median_sigverify_cpu_ms_per_block": 332.0
+  },
+  {
+    "workers": 4,
+    "target": 8,
+    "mode": "catchup",
+    "samples": 3,
+    "median_execution_slowdown_ratio": 1.2152796009451299,
+    "median_execution_baseline_ns": 3547.0,
+    "median_execution_concurrent_ns": 4629.0,
+    "median_sigverify_residual_p95_ms": 54.05,
+    "median_sigverify_cpu_ms_per_block": 168.4
+  },
+  {
+    "workers": 4,
+    "target": 8,
+    "mode": "tip_200ms_overlap",
+    "samples": 3,
+    "median_execution_slowdown_ratio": 0.9911012235817576,
+    "median_execution_baseline_ns": 3596.0,
+    "median_execution_concurrent_ns": 3564.0,
+    "median_sigverify_residual_p95_ms": 1.256,
+    "median_sigverify_cpu_ms_per_block": 176.1
+  }
+]

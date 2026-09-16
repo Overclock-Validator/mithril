@@ -1,0 +1,4 @@
+=== RUN   TestBufferConsumedEntriesReleaseBothHeapReferences
+    buffer_retention_test.go:69: capacity=256 active=1 max_refs=1 min_refs=1
+--- PASS: TestBufferConsumedEntriesReleaseBothHeapReferences (0.10s)
+PASS

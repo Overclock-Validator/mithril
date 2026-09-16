@@ -1,0 +1,330 @@
+--- FAIL: TestExecute_Tx_BpfLoader_Write_Success (0.00s)
+    sealevel_bpf_loader_test.go:147: 
+        	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/sealevel_bpf_loader_test.go:147
+        	Error:      	Not equal: 
+        	            	expected: <nil>(<nil>)
+        	            	actual  : *errors.errorString(&errors.errorString{s:"InstrErrInvalidInstructionData"})
+        	Test:       	TestExecute_Tx_BpfLoader_Write_Success
+    sealevel_bpf_loader_test.go:156: 
+        	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/sealevel_bpf_loader_test.go:156
+        	Error:      	Not equal: 
+        	            	expected: true
+        	            	actual  : false
+        	Test:       	TestExecute_Tx_BpfLoader_Write_Success
+--- FAIL: TestExecute_Tx_BpfLoader_Write_Offset_Too_Large_Failure (0.00s)
+    sealevel_bpf_loader_test.go:207: 
+        	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/sealevel_bpf_loader_test.go:207
+        	Error:      	Not equal: 
+        	            	expected: &errors.errorString{s:"InstrErrAccountDataTooSmall"}
+        	            	actual  : &errors.errorString{s:"InstrErrInvalidInstructionData"}
+        	            	
+        	            	Diff:
+        	            	--- Expected
+        	            	+++ Actual
+        	            	@@ -1,3 +1,3 @@
+        	            	 (*errors.errorString)({
+        	            	- s: (string) (len=27) "InstrErrAccountDataTooSmall"
+        	            	+ s: (string) (len=30) "InstrErrInvalidInstructionData"
+        	            	 })
+        	Test:       	TestExecute_Tx_BpfLoader_Write_Offset_Too_Large_Failure
+--- FAIL: TestExecute_Tx_BpfLoader_Write_Buffer_Authority_Didnt_Sign_Failure (0.00s)
+    sealevel_bpf_loader_test.go:258: 
+        	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/sealevel_bpf_loader_test.go:258
+        	Error:      	Not equal: 
+        	            	expected: &errors.errorString{s:"InstrErrMissingRequiredSignature"}
+        	            	actual  : &errors.errorString{s:"InstrErrInvalidInstructionData"}
+        	            	
+        	            	Diff:
+        	            	--- Expected
+        	            	+++ Actual
+        	            	@@ -1,3 +1,3 @@
+        	            	 (*errors.errorString)({
+        	            	- s: (string) (len=32) "InstrErrMissingRequiredSignature"
+        	            	+ s: (string) (len=30) "InstrErrInvalidInstructionData"
+        	            	 })
+        	Test:       	TestExecute_Tx_BpfLoader_Write_Buffer_Authority_Didnt_Sign_Failure
+--- FAIL: TestExecute_Tx_BpfLoader_Write_Incorrect_Authority_Failure (0.00s)
+    sealevel_bpf_loader_test.go:314: 
+        	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/sealevel_bpf_loader_test.go:314
+        	Error:      	Not equal: 
+        	            	expected: &errors.errorString{s:"InstrErrIncorrectAuthority"}
+        	            	actual  : &errors.errorString{s:"InstrErrInvalidInstructionData"}
+        	            	
+        	            	Diff:
+        	            	--- Expected
+        	            	+++ Actual
+        	            	@@ -1,3 +1,3 @@
+        	            	 (*errors.errorString)({
+        	            	- s: (string) (len=26) "InstrErrIncorrectAuthority"
+        	            	+ s: (string) (len=30) "InstrErrInvalidInstructionData"
+        	            	 })
+        	Test:       	TestExecute_Tx_BpfLoader_Write_Incorrect_Authority_Failure
+--- FAIL: TestExecute_Tx_BpfLoader_SetAuthority_Not_Enough_Instr_Accts_Failure (0.00s)
+    sealevel_bpf_loader_test.go:350: 
+        	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/sealevel_bpf_loader_test.go:350
+        	Error:      	Not equal: 
+        	            	expected: &errors.errorString{s:"InstrErrNotEnoughAccountKeys"}
+        	            	actual  : &errors.errorString{s:"InstrErrMissingAccount"}
+        	            	
+        	            	Diff:
+        	            	--- Expected
+        	            	+++ Actual
+        	            	@@ -1,3 +1,3 @@
+        	            	 (*errors.errorString)({
+        	            	- s: (string) (len=28) "InstrErrNotEnoughAccountKeys"
+        	            	+ s: (string) (len=22) "InstrErrMissingAccount"
+        	            	 })
+        	Test:       	TestExecute_Tx_BpfLoader_SetAuthority_Not_Enough_Instr_Accts_Failure
+--- FAIL: TestExecute_Tx_BpfLoader_SetAuthorityChecked_Not_Enough_Instr_Accts_Failure (0.00s)
+    sealevel_bpf_loader_test.go:860: 
+        	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/sealevel_bpf_loader_test.go:860
+        	Error:      	Not equal: 
+        	            	expected: &errors.errorString{s:"InstrErrNotEnoughAccountKeys"}
+        	            	actual  : &errors.errorString{s:"InstrErrInvalidInstructionData"}
+        	            	
+        	            	Diff:
+        	            	--- Expected
+        	            	+++ Actual
+        	            	@@ -1,3 +1,3 @@
+        	            	 (*errors.errorString)({
+        	            	- s: (string) (len=28) "InstrErrNotEnoughAccountKeys"
+        	            	+ s: (string) (len=30) "InstrErrInvalidInstructionData"
+        	            	 })
+        	Test:       	TestExecute_Tx_BpfLoader_SetAuthorityChecked_Not_Enough_Instr_Accts_Failure
+--- FAIL: TestExecute_Tx_BpfLoader_SetAuthorityChecked_Buffer_Success (0.00s)
+    sealevel_bpf_loader_test.go:907: 
+        	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/sealevel_bpf_loader_test.go:907
+        	Error:      	Not equal: 
+        	            	expected: <nil>(<nil>)
+        	            	actual  : *errors.errorString(&errors.errorString{s:"InstrErrInvalidInstructionData"})
+        	Test:       	TestExecute_Tx_BpfLoader_SetAuthorityChecked_Buffer_Success
+    sealevel_bpf_loader_test.go:916: 
+        	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/sealevel_bpf_loader_test.go:916
+        	Error:      	Not equal: 
+        	            	expected: solana.PublicKey{0x10, 0x1e, 0xf, 0xda, 0xd4, 0x11, 0xef, 0xd1, 0xa, 0xd3, 0xf2, 0x5a, 0xa0, 0xc7, 0xbf, 0x10, 0xf8, 0x2b, 0x7, 0x95, 0x55, 0xd1, 0x42, 0xb, 0xe9, 0xa9, 0xe9, 0xef, 0xa8, 0xc9, 0x2b, 0xa5}
+        	            	actual  : solana.PublicKey{0x18, 0x89, 0x7a, 0x5e, 0xe7, 0x98, 0x52, 0xe9, 0xf, 0x51, 0x7b, 0x84, 0x15, 0xab, 0x73, 0xac, 0x87, 0xb2, 0xa, 0x9e, 0xa8, 0x39, 0xa0, 0x92, 0x76, 0x67, 0xa7, 0xf7, 0xb3, 0xab, 0xae, 0xe2}
+        	            	
+        	            	Diff:
+        	            	--- Expected
+        	            	+++ Actual
+        	            	@@ -1,4 +1,4 @@
+        	            	 (solana.PublicKey) (len=32) {
+        	            	- 00000000  10 1e 0f da d4 11 ef d1  0a d3 f2 5a a0 c7 bf 10  |...........Z....|
+        	            	- 00000010  f8 2b 07 95 55 d1 42 0b  e9 a9 e9 ef a8 c9 2b a5  |.+..U.B.......+.|
+        	            	+ 00000000  18 89 7a 5e e7 98 52 e9  0f 51 7b 84 15 ab 73 ac  |..z^..R..Q{...s.|
+        	            	+ 00000010  87 b2 0a 9e a8 39 a0 92  76 67 a7 f7 b3 ab ae e2  |.....9..vg......|
+        	            	 }
+        	Test:       	TestExecute_Tx_BpfLoader_SetAuthorityChecked_Buffer_Success
+--- FAIL: TestExecute_Tx_BpfLoader_SetAuthorityChecked_ProgramData_Success (0.00s)
+    sealevel_bpf_loader_test.go:963: 
+        	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/sealevel_bpf_loader_test.go:963
+        	Error:      	Not equal: 
+        	            	expected: <nil>(<nil>)
+        	            	actual  : *errors.errorString(&errors.errorString{s:"InstrErrInvalidInstructionData"})
+        	Test:       	TestExecute_Tx_BpfLoader_SetAuthorityChecked_ProgramData_Success
+    sealevel_bpf_loader_test.go:972: 
+        	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/sealevel_bpf_loader_test.go:972
+        	Error:      	Not equal: 
+        	            	expected: solana.PublicKey{0x7b, 0xfa, 0xe7, 0xc, 0x3a, 0xd0, 0x6, 0x9b, 0xfb, 0xba, 0xaa, 0x4d, 0x66, 0xd3, 0x37, 0x5a, 0x46, 0x1c, 0xb7, 0x87, 0xe3, 0x49, 0x76, 0xa8, 0xc5, 0x5f, 0x4, 0x4d, 0xf6, 0x5a, 0x4d, 0xb0}
+        	            	actual  : solana.PublicKey{0xbc, 0xc3, 0x71, 0xe, 0xd8, 0x11, 0x5, 0x52, 0x7f, 0xa0, 0x9e, 0x64, 0xbe, 0x60, 0x8e, 0x31, 0x35, 0x92, 0xc7, 0x84, 0x1e, 0x9a, 0xed, 0x37, 0xdb, 0x97, 0x73, 0xe9, 0xd6, 0x4, 0x97, 0xed}
+        	            	
+        	            	Diff:
+        	            	--- Expected
+        	            	+++ Actual
+        	            	@@ -1,4 +1,4 @@
+        	            	 (solana.PublicKey) (len=32) {
+        	            	- 00000000  7b fa e7 0c 3a d0 06 9b  fb ba aa 4d 66 d3 37 5a  |{...:......Mf.7Z|
+        	            	- 00000010  46 1c b7 87 e3 49 76 a8  c5 5f 04 4d f6 5a 4d b0  |F....Iv.._.M.ZM.|
+        	            	+ 00000000  bc c3 71 0e d8 11 05 52  7f a0 9e 64 be 60 8e 31  |..q....R...d.`.1|
+        	            	+ 00000010  35 92 c7 84 1e 9a ed 37  db 97 73 e9 d6 04 97 ed  |5......7..s.....|
+        	            	 }
+        	Test:       	TestExecute_Tx_BpfLoader_SetAuthorityChecked_ProgramData_Success
+--- FAIL: TestExecute_Tx_BpfLoader_SetAuthorityChecked_Buffer_Immutable_Failure (0.00s)
+    sealevel_bpf_loader_test.go:1019: 
+        	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/sealevel_bpf_loader_test.go:1019
+        	Error:      	Not equal: 
+        	            	expected: &errors.errorString{s:"InstrErrImmutable"}
+        	            	actual  : &errors.errorString{s:"InstrErrInvalidInstructionData"}
+        	            	
+        	            	Diff:
+        	            	--- Expected
+        	            	+++ Actual
+        	            	@@ -1,3 +1,3 @@
+        	            	 (*errors.errorString)({
+        	            	- s: (string) (len=17) "InstrErrImmutable"
+        	            	+ s: (string) (len=30) "InstrErrInvalidInstructionData"
+        	            	 })
+        	Test:       	TestExecute_Tx_BpfLoader_SetAuthorityChecked_Buffer_Immutable_Failure
+--- FAIL: TestExecute_Tx_BpfLoader_SetAuthorityChecked_Buffer_Wrong_Upgrade_Authority_Failure (0.00s)
+    sealevel_bpf_loader_test.go:1071: 
+        	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/sealevel_bpf_loader_test.go:1071
+        	Error:      	Not equal: 
+        	            	expected: &errors.errorString{s:"InstrErrIncorrectAuthority"}
+        	            	actual  : &errors.errorString{s:"InstrErrInvalidInstructionData"}
+        	            	
+        	            	Diff:
+        	            	--- Expected
+        	            	+++ Actual
+        	            	@@ -1,3 +1,3 @@
+        	            	 (*errors.errorString)({
+        	            	- s: (string) (len=26) "InstrErrIncorrectAuthority"
+        	            	+ s: (string) (len=30) "InstrErrInvalidInstructionData"
+        	            	 })
+        	Test:       	TestExecute_Tx_BpfLoader_SetAuthorityChecked_Buffer_Wrong_Upgrade_Authority_Failure
+--- FAIL: TestExecute_Tx_BpfLoader_SetAuthorityChecked_Buffer_Authority_Didnt_Sign_Failure (0.00s)
+    sealevel_bpf_loader_test.go:1118: 
+        	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/sealevel_bpf_loader_test.go:1118
+        	Error:      	Not equal: 
+        	            	expected: &errors.errorString{s:"InstrErrMissingRequiredSignature"}
+        	            	actual  : &errors.errorString{s:"InstrErrInvalidInstructionData"}
+        	            	
+        	            	Diff:
+        	            	--- Expected
+        	            	+++ Actual
+        	            	@@ -1,3 +1,3 @@
+        	            	 (*errors.errorString)({
+        	            	- s: (string) (len=32) "InstrErrMissingRequiredSignature"
+        	            	+ s: (string) (len=30) "InstrErrInvalidInstructionData"
+        	            	 })
+        	Test:       	TestExecute_Tx_BpfLoader_SetAuthorityChecked_Buffer_Authority_Didnt_Sign_Failure
+--- FAIL: TestExecute_Tx_BpfLoader_SetAuthorityChecked_Buffer_New_Authority_Didnt_Sign_Failure (0.00s)
+    sealevel_bpf_loader_test.go:1165: 
+        	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/sealevel_bpf_loader_test.go:1165
+        	Error:      	Not equal: 
+        	            	expected: &errors.errorString{s:"InstrErrMissingRequiredSignature"}
+        	            	actual  : &errors.errorString{s:"InstrErrInvalidInstructionData"}
+        	            	
+        	            	Diff:
+        	            	--- Expected
+        	            	+++ Actual
+        	            	@@ -1,3 +1,3 @@
+        	            	 (*errors.errorString)({
+        	            	- s: (string) (len=32) "InstrErrMissingRequiredSignature"
+        	            	+ s: (string) (len=30) "InstrErrInvalidInstructionData"
+        	            	 })
+        	Test:       	TestExecute_Tx_BpfLoader_SetAuthorityChecked_Buffer_New_Authority_Didnt_Sign_Failure
+--- FAIL: TestExecute_Tx_BpfLoader_SetAuthorityChecked_Buffer_Uninitialized_Account_Failure (0.00s)
+    sealevel_bpf_loader_test.go:1212: 
+        	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/sealevel_bpf_loader_test.go:1212
+        	Error:      	Not equal: 
+        	            	expected: &errors.errorString{s:"InstrErrInvalidArgument"}
+        	            	actual  : &errors.errorString{s:"InstrErrInvalidInstructionData"}
+        	            	
+        	            	Diff:
+        	            	--- Expected
+        	            	+++ Actual
+        	            	@@ -1,3 +1,3 @@
+        	            	 (*errors.errorString)({
+        	            	- s: (string) (len=23) "InstrErrInvalidArgument"
+        	            	+ s: (string) (len=30) "InstrErrInvalidInstructionData"
+        	            	 })
+        	Test:       	TestExecute_Tx_BpfLoader_SetAuthorityChecked_Buffer_Uninitialized_Account_Failure
+--- FAIL: TestExecute_Tx_BpfLoader_SetAuthorityChecked_ProgramData_Immutable_Failure (0.00s)
+    sealevel_bpf_loader_test.go:1259: 
+        	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/sealevel_bpf_loader_test.go:1259
+        	Error:      	Not equal: 
+        	            	expected: &errors.errorString{s:"InstrErrImmutable"}
+        	            	actual  : &errors.errorString{s:"InstrErrInvalidInstructionData"}
+        	            	
+        	            	Diff:
+        	            	--- Expected
+        	            	+++ Actual
+        	            	@@ -1,3 +1,3 @@
+        	            	 (*errors.errorString)({
+        	            	- s: (string) (len=17) "InstrErrImmutable"
+        	            	+ s: (string) (len=30) "InstrErrInvalidInstructionData"
+        	            	 })
+        	Test:       	TestExecute_Tx_BpfLoader_SetAuthorityChecked_ProgramData_Immutable_Failure
+--- FAIL: TestExecute_Tx_BpfLoader_SetAuthorityChecked_ProgramData_Authority_Didnt_Sign_Failure (0.00s)
+    sealevel_bpf_loader_test.go:1306: 
+        	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/sealevel_bpf_loader_test.go:1306
+        	Error:      	Not equal: 
+        	            	expected: &errors.errorString{s:"InstrErrMissingRequiredSignature"}
+        	            	actual  : &errors.errorString{s:"InstrErrInvalidInstructionData"}
+        	            	
+        	            	Diff:
+        	            	--- Expected
+        	            	+++ Actual
+        	            	@@ -1,3 +1,3 @@
+        	            	 (*errors.errorString)({
+        	            	- s: (string) (len=32) "InstrErrMissingRequiredSignature"
+        	            	+ s: (string) (len=30) "InstrErrInvalidInstructionData"
+        	            	 })
+        	Test:       	TestExecute_Tx_BpfLoader_SetAuthorityChecked_ProgramData_Authority_Didnt_Sign_Failure
+--- FAIL: TestExecute_Tx_BpfLoader_SetAuthorityChecked_ProgramData_New_Authority_Didnt_Sign_Failure (0.00s)
+    sealevel_bpf_loader_test.go:1353: 
+        	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/sealevel_bpf_loader_test.go:1353
+        	Error:      	Not equal: 
+        	            	expected: &errors.errorString{s:"InstrErrMissingRequiredSignature"}
+        	            	actual  : &errors.errorString{s:"InstrErrInvalidInstructionData"}
+        	            	
+        	            	Diff:
+        	            	--- Expected
+        	            	+++ Actual
+        	            	@@ -1,3 +1,3 @@
+        	            	 (*errors.errorString)({
+        	            	- s: (string) (len=32) "InstrErrMissingRequiredSignature"
+        	            	+ s: (string) (len=30) "InstrErrInvalidInstructionData"
+        	            	 })
+        	Test:       	TestExecute_Tx_BpfLoader_SetAuthorityChecked_ProgramData_New_Authority_Didnt_Sign_Failure
+--- FAIL: TestExecute_Tx_BpfLoader_SetAuthorityChecked_ProgramData_Wrong_Authority_Failure (0.00s)
+    sealevel_bpf_loader_test.go:1405: 
+        	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/sealevel_bpf_loader_test.go:1405
+        	Error:      	Not equal: 
+        	            	expected: &errors.errorString{s:"InstrErrIncorrectAuthority"}
+        	            	actual  : &errors.errorString{s:"InstrErrInvalidInstructionData"}
+        	            	
+        	            	Diff:
+        	            	--- Expected
+        	            	+++ Actual
+        	            	@@ -1,3 +1,3 @@
+        	            	 (*errors.errorString)({
+        	            	- s: (string) (len=26) "InstrErrIncorrectAuthority"
+        	            	+ s: (string) (len=30) "InstrErrInvalidInstructionData"
+        	            	 })
+        	Test:       	TestExecute_Tx_BpfLoader_SetAuthorityChecked_ProgramData_Wrong_Authority_Failure
+--- FAIL: TestExecute_Tx_BpfLoader_Close_Buffer_Not_Enough_Accounts (0.00s)
+    sealevel_bpf_loader_test.go:1727: 
+        	Error Trace:	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/sealevel_bpf_loader_test.go:1727
+        	Error:      	Not equal: 
+        	            	expected: &errors.errorString{s:"InstrErrNotEnoughAccountKeys"}
+        	            	actual  : &errors.errorString{s:"InstrErrMissingAccount"}
+        	            	
+        	            	Diff:
+        	            	--- Expected
+        	            	+++ Actual
+        	            	@@ -1,3 +1,3 @@
+        	            	 (*errors.errorString)({
+        	            	- s: (string) (len=28) "InstrErrNotEnoughAccountKeys"
+        	            	+ s: (string) (len=22) "InstrErrMissingAccount"
+        	            	 })
+        	Test:       	TestExecute_Tx_BpfLoader_Close_Buffer_Not_Enough_Accounts
+--- FAIL: TestExecute_Tx_BpfLoader_Close_ProgramData_Success (0.00s)
+panic: runtime error: invalid memory address or nil pointer dereference [recovered, repanicked]
+[signal SIGSEGV: segmentation violation code=0x2 addr=0x0 pc=0x1034f369c]
+
+goroutine 72 [running]:
+testing.tRunner.func1.2({0x1045f4e40, 0x10477e790})
+	/Users/nikolashayes/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.darwin-arm64/src/testing/testing.go:1974 +0x2b8
+testing.tRunner.func1()
+	/Users/nikolashayes/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.darwin-arm64/src/testing/testing.go:1977 +0x460
+panic({0x1045f4e40?, 0x10477e790?})
+	/Users/nikolashayes/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.darwin-arm64/src/runtime/panic.go:860 +0x12c
+github.com/Overclock-Validator/mithril/pkg/sealevel.UpgradeableLoaderClose(0xc000145080, 0xc0004a4c40, 0xc000147600)
+	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/bpf_loader.go:2703 +0x6fc
+github.com/Overclock-Validator/mithril/pkg/sealevel.ProcessUpgradeableLoaderInstruction(0xc000145080)
+	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/bpf_loader.go:2963 +0x230
+github.com/Overclock-Validator/mithril/pkg/sealevel.BpfLoaderProgramExecute(0xc000145080)
+	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/bpf_loader.go:1461 +0x298
+github.com/Overclock-Validator/mithril/pkg/sealevel.(*ExecutionCtx).ExecuteInstruction(0xc000145080)
+	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/execution_ctx.go:338 +0x2fc
+github.com/Overclock-Validator/mithril/pkg/sealevel.(*ExecutionCtx).ProcessInstruction(0xc000145080, {0xc0003deeec, 0x4, 0x4}, {0xc000490e80, 0x4, 0x4}, {0xc0003def28, 0x1, 0x1})
+	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/execution_ctx.go:284 +0x484
+github.com/Overclock-Validator/mithril/pkg/sealevel.TestExecute_Tx_BpfLoader_Close_ProgramData_Success(0xc0004a2fc8)
+	/Users/nikolashayes/Desktop/programming/Codex/mithril-pr-consolidation-20260914/baseline/pkg/sealevel/sealevel_bpf_loader_test.go:1790 +0x138c
+testing.tRunner(0xc0004a2fc8, 0x104735a40)
+	/Users/nikolashayes/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.darwin-arm64/src/testing/testing.go:2036 +0x168
+created by testing.(*T).Run in goroutine 1
+	/Users/nikolashayes/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.darwin-arm64/src/testing/testing.go:2101 +0x7c0
+FAIL	github.com/Overclock-Validator/mithril/pkg/sealevel	0.541s
+FAIL

@@ -22,7 +22,7 @@ type slowCommitter struct {
 	delay time.Duration
 }
 
-func TestFoldJobSnapshotsStatusOnLoopAndReferenceRidesManifest(t *testing.T) {
+func TestFoldJobCapturesStatusOnLoopAndReferenceRidesManifest(t *testing.T) {
 	rootDir := t.TempDir()
 	fc := &fakeCommitter{durable: accounts.NewMemAccounts()}
 	tail := asyncTestTail(fc, 5, 6, 7)
@@ -32,10 +32,10 @@ func TestFoldJobSnapshotsStatusOnLoopAndReferenceRidesManifest(t *testing.T) {
 	installCalled := false
 	afterCommitCalled := false
 	hooks := TransactionStatusCheckpointHooks{
-		Snapshot: func(through uint64) ([]byte, error) {
+		Capture: func(through uint64) (TransactionStatusSnapshot, error) {
 			require.Equal(t, uint64(6), through)
 			snapshotCalled = true
-			return scratch, nil
+			return testCheckpointBytes(scratch), nil
 		},
 		Install: func(through uint64, payload []byte) (*state.TransactionStatusCheckpointRef, error) {
 			require.True(t, snapshotCalled, "worker install ran before loop snapshot")
@@ -83,7 +83,7 @@ func TestFoldJobCheckpointFailuresCannotReachCommitBatch(t *testing.T) {
 		fc := &fakeCommitter{durable: accounts.NewMemAccounts()}
 		tail := asyncTestTail(fc, 5, 6)
 		require.NoError(t, tail.SetTransactionStatusCheckpointHooks(TransactionStatusCheckpointHooks{
-			Snapshot: func(uint64) ([]byte, error) { return nil, errors.New("snapshot boom") },
+			Capture: func(uint64) (TransactionStatusSnapshot, error) { return nil, errors.New("snapshot boom") },
 			Install: func(uint64, []byte) (*state.TransactionStatusCheckpointRef, error) {
 				t.Fatal("install must not run")
 				return nil, nil
@@ -101,7 +101,7 @@ func TestFoldJobCheckpointFailuresCannotReachCommitBatch(t *testing.T) {
 		fc := &fakeCommitter{durable: accounts.NewMemAccounts()}
 		tail := asyncTestTail(fc, 5, 6)
 		require.NoError(t, tail.SetTransactionStatusCheckpointHooks(TransactionStatusCheckpointHooks{
-			Snapshot: func(uint64) ([]byte, error) { return []byte("captured"), nil },
+			Capture: func(uint64) (TransactionStatusSnapshot, error) { return testCheckpointBytes([]byte("captured")), nil },
 			Install: func(uint64, []byte) (*state.TransactionStatusCheckpointRef, error) {
 				return nil, errors.New("fsync boom")
 			},
@@ -120,7 +120,7 @@ func TestFoldJobCheckpointFailuresCannotReachCommitBatch(t *testing.T) {
 		tail := asyncTestTail(fc, 5, 6)
 		afterCommitCalled := false
 		require.NoError(t, tail.SetTransactionStatusCheckpointHooks(TransactionStatusCheckpointHooks{
-			Snapshot: func(uint64) ([]byte, error) { return []byte("captured"), nil },
+			Capture: func(uint64) (TransactionStatusSnapshot, error) { return testCheckpointBytes([]byte("captured")), nil },
 			Install: func(through uint64, payload []byte) (*state.TransactionStatusCheckpointRef, error) {
 				return PrepareTransactionStatusCheckpoint(rootDir, through, payload)
 			},
@@ -144,9 +144,9 @@ func TestForcedFoldCarriesStatusCheckpointReference(t *testing.T) {
 	tail := asyncTestTail(fc, 5)
 	afterCommitCalled := false
 	require.NoError(t, tail.SetTransactionStatusCheckpointHooks(TransactionStatusCheckpointHooks{
-		Snapshot: func(through uint64) ([]byte, error) {
+		Capture: func(through uint64) (TransactionStatusSnapshot, error) {
 			require.Equal(t, uint64(5), through)
-			return []byte("forced-partial-status"), nil
+			return testCheckpointBytes([]byte("forced-partial-status")), nil
 		},
 		Install: func(through uint64, payload []byte) (*state.TransactionStatusCheckpointRef, error) {
 			return PrepareTransactionStatusCheckpoint(rootDir, through, payload)
@@ -175,7 +175,7 @@ func TestCheckpointAfterCommitRequiresDurabilityHooks(t *testing.T) {
 	err := tail.SetTransactionStatusCheckpointHooks(TransactionStatusCheckpointHooks{
 		AfterCommit: func(*state.TransactionStatusCheckpointRef) error { return nil },
 	})
-	require.ErrorContains(t, err, "requires Snapshot and Install")
+	require.ErrorContains(t, err, "requires Capture and Install")
 }
 
 func (c *slowCommitter) CommitBatch(deltas []accounts.SlotDelta, throughSlot uint64, bankhashes map[uint64][32]byte, resumeCtx []byte) (accountsdb.BatchCommitResult, error) {

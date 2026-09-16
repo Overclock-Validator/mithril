@@ -95,6 +95,11 @@ type Observer struct {
 	replayBlocks map[uint64]BlockID
 	replayOrder  []uint64
 	replayChecks map[CertificateKey]certificateReplayCheck
+	// Votes do not change certificate/replay reconciliation. Reuse its exact
+	// statistics until one of those inputs changes instead of scanning every
+	// retained certificate for each incoming vote.
+	pendingStats      certificateReplayPendingStats
+	pendingStatsValid bool
 
 	votesObserved                 uint64
 	certificatesObserved          uint64
@@ -211,6 +216,7 @@ func (o *Observer) ObserveCertificate(cert Certificate) (Observation, error) {
 	key := cert.Key()
 	_, exists := o.certificates[key]
 	if !exists {
+		o.pendingStatsValid = false
 		tracked := o.trackCertificateLocked(key, cert)
 		o.certificatesObserved++
 		o.applyCertificateLocked(cert)
@@ -225,6 +231,7 @@ func (o *Observer) ObserveCertificate(cert Certificate) (Observation, error) {
 func (o *Observer) ObserveReplayBlock(obs ReplayBlockObservation) Observation {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	o.pendingStatsValid = false
 
 	if obs.At.IsZero() {
 		obs.At = time.Now()
@@ -260,8 +267,8 @@ func (o *Observer) ObserveReplayResult(obs ReplayResultObservation) Observation 
 }
 
 func (o *Observer) Snapshot() Snapshot {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	return o.snapshotLocked()
 }
 
@@ -454,7 +461,11 @@ func (o *Observer) certificateReplayPendingStatsLocked() certificateReplayPendin
 }
 
 func (o *Observer) snapshotLocked() Snapshot {
-	pending := o.certificateReplayPendingStatsLocked()
+	if !o.pendingStatsValid {
+		o.pendingStats = o.certificateReplayPendingStatsLocked()
+		o.pendingStatsValid = true
+	}
+	pending := o.pendingStats
 	return Snapshot{
 		VotesObserved:                      o.votesObserved,
 		CertificatesObserved:               o.certificatesObserved,

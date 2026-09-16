@@ -15,8 +15,18 @@ func (t *Timing) AddTiming(d time.Duration) {
 	atomic.AddUint64(&t.SumNanoseconds, uint64(d.Nanoseconds()))
 }
 
+// StartTiming avoids reading the clock when a caller does not record timings.
+func StartTiming(enabled bool) time.Time {
+	if enabled {
+		return time.Now()
+	}
+	return time.Time{}
+}
+
 func (t *Timing) AddTimingSince(start time.Time) {
-	t.AddTiming(time.Since(start))
+	if !start.IsZero() {
+		t.AddTiming(time.Since(start))
+	}
 }
 
 // AccountLoader is the per-slot decomposition of LoadBlockAccounts. Counters
@@ -94,15 +104,26 @@ type AccountLoader struct {
 	SysvarCachePublicationEpochRejects uint64
 }
 
-// TurbineIngress is the exact per-slot pre-replay pipeline decomposition.
+// TurbineIngress records per-slot pre-replay pipeline observations.
 // It is written to replay_timings.jsonl without high-cardinality metric labels.
 type TurbineIngress struct {
 	ShredCollection      Timing
 	CompletionQueueDelay Timing
 	BlockDecode          Timing
+	// Completion-only parse and outstanding-signature join/verification time.
 	TransactionParse     Timing
 	TransactionSigverify Timing
 	ReplayAdmission      Timing
+	// Summed completed prefetched component durations, including any discarded
+	// optimistic prefix. Overlap reception; not CPU time or additive wall stages.
+	// Early sigverify includes queueing.
+	EarlyTransactionParse     Timing
+	EarlyTransactionSigverify Timing
+	// Completion wait for claimed background parsing/submission, outside BlockDecode.
+	EarlyPreparationWait      Timing
+	EarlyVerifiedTransactions uint64
+	// FullToReady contains the completion stages above, excluding admission.
+	FullToReady Timing
 }
 
 // VoteRewardDetails decomposes RewardCertificatePreflight and

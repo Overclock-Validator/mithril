@@ -1,0 +1,99 @@
+{
+  "utc": "2026-09-13T06:48:40.355016+00:00",
+  "stage": "window-fill",
+  "blocks": [
+    {
+      "slot": 3073656,
+      "blockhash": "6CGAhXwTZSMsS5Uda6CD19VRqaYeBUQoodZJW7X9PXcx",
+      "alpenglow_block_id": "8xkgbbwhcXujEMbn1bKhkWvTEiEwBfoPZVkTNs4ihcgj",
+      "certificate_logs": [
+        "(+17m19s) ALPENGLOW voting: vote landed source=votor-quic proof=verified-aggregate vote=notarize slot=3073656 rank=21 certificate=notarize block=8xkgbbwhcXujEMbn1bKhkWvTEiEwBfoPZVkTNs4ihcgj network_landed=8654"
+      ],
+      "finalized": true,
+      "finalization_ms": 7,
+      "deadline_margin_ms": 50,
+      "transactions": 31732,
+      "log": "(+17m19s) ALPENGLOW block production: broadcast local leader slot=3073656 terminal=complete cause=complete reason=complete replay_frontier=3073651 live_slot=3073655 block=8xkgbbwhcXujEMbn1bKhkWvTEiEwBfoPZVkTNs4ihcgj parent_slot=3073651 txns=31732 window_elapsed_ms=149 finalization_ms=7 deadline_margin_ms=50 local_handoff_ms=0"
+    },
+    {
+      "slot": 3073657,
+      "blockhash": "H6iU43SrXp94LRvfpvhLDskboUJA4CupsEVFJcCRLANF",
+      "alpenglow_block_id": "AQi4tKfzW3MRNHGhndxpL9sq6QBr5aoyR22ZPBA8RJUy",
+      "certificate_logs": [
+        "(+17m19s) ALPENGLOW voting: vote landed source=votor-quic proof=verified-aggregate vote=notarize slot=3073657 rank=21 certificate=notarize block=AQi4tKfzW3MRNHGhndxpL9sq6QBr5aoyR22ZPBA8RJUy network_landed=8656"
+      ],
+      "finalized": true,
+      "finalization_ms": 9,
+      "deadline_margin_ms": 49,
+      "transactions": 48523,
+      "log": "(+17m19s) ALPENGLOW block production: broadcast local leader slot=3073657 terminal=complete cause=complete reason=complete replay_frontier=3073656 live_slot=3073656 block=AQi4tKfzW3MRNHGhndxpL9sq6QBr5aoyR22ZPBA8RJUy parent_slot=3073656 txns=48523 window_elapsed_ms=350 finalization_ms=9 deadline_margin_ms=49 local_handoff_ms=0"
+    },
+    {
+      "slot": 3073658,
+      "blockhash": "939M6Zfyuj9wwyrMVnzhF5WmyqzpSZfUQJwBA5gk2jto",
+      "alpenglow_block_id": "EWr2Nh8MFMUMQXvLsPAW6Z3xSPcuFP8efDrxjYtdz9s5",
+      "certificate_logs": [
+        "(+17m19s) ALPENGLOW voting: vote landed source=votor-quic proof=verified-aggregate vote=notarize slot=3073658 rank=21 certificate=notarize-fallback block=EWr2Nh8MFMUMQXvLsPAW6Z3xSPcuFP8efDrxjYtdz9s5 network_landed=8658"
+      ],
+      "finalized": true,
+      "finalization_ms": 8,
+      "deadline_margin_ms": 49,
+      "transactions": 39911,
+      "log": "(+17m19s) ALPENGLOW block production: broadcast local leader slot=3073658 terminal=complete cause=complete reason=complete replay_frontier=3073657 live_slot=3073657 block=EWr2Nh8MFMUMQXvLsPAW6Z3xSPcuFP8efDrxjYtdz9s5 parent_slot=3073657 txns=39911 window_elapsed_ms=550 finalization_ms=8 deadline_margin_ms=49 local_handoff_ms=0"
+    },
+    {
+      "slot": 3073659,
+      "blockhash": "EXX1YCesL18q3KAUEehr4WsDZPcuSd2ErYKatMPBSDdS",
+      "alpenglow_block_id": "2JUsPbPn4JeyUhGkXqersNaYyKHZJut4NDgp6sFkarXe",
+      "certificate_logs": [
+        "(+17m19s) ALPENGLOW voting: vote landed source=votor-quic proof=verified-aggregate vote=notarize slot=3073659 rank=21 certificate=notarize-fallback block=2JUsPbPn4JeyUhGkXqersNaYyKHZJut4NDgp6sFkarXe network_landed=8659"
+      ],
+      "finalized": true,
+      "finalization_ms": 10,
+      "deadline_margin_ms": 47,
+      "transactions": 138,
+      "log": "(+17m19s) ALPENGLOW block production: broadcast local leader slot=3073659 terminal=complete cause=complete reason=complete replay_frontier=3073658 live_slot=3073658 block=2JUsPbPn4JeyUhGkXqersNaYyKHZJut4NDgp6sFkarXe parent_slot=3073658 txns=138 window_elapsed_ms=752 finalization_ms=10 deadline_margin_ms=47 local_handoff_ms=0"
+    },
+    {
+      "slot": 3073740,
+      "blockhash": "saQYhwkvXUsuqa9xN2gE1cGMPZpAPJmB4fTZWYrQ6wf",
+      "alpenglow_block_id": "CzcvprhgxhmS4uU4Xxav9g68aBozMt9KTj22SFxF6fNi",
+      "certificate_logs": [
+        "(+17m37s) ALPENGLOW voting: vote landed source=votor-quic proof=verified-aggregate vote=notarize slot=3073740 rank=21 certificate=notarize block=CzcvprhgxhmS4uU4Xxav9g68aBozMt9KTj22SFxF6fNi network_landed=8804"
+      ],
+      "finalized": true,
+      "finalization_ms": 10,
+      "deadline_margin_ms": 49,
+      "transactions": 34188,
+      "log": "(+17m37s) ALPENGLOW block production: broadcast local leader slot=3073740 terminal=complete cause=complete reason=complete replay_frontier=3073735 live_slot=3073739 block=CzcvprhgxhmS4uU4Xxav9g68aBozMt9KTj22SFxF6fNi parent_slot=3073735 txns=34188 window_elapsed_ms=150 finalization_ms=10 deadline_margin_ms=49 local_handoff_ms=0"
+    },
+    {
+      "slot": 3073741,
+      "blockhash": "BN1bpbetrHiU2tzm4DCam4T9F8ZisDkgDPnqA35S9gFi",
+      "alpenglow_block_id": "146JxvWuGXKR1wvsA4vmosPDMNVoEBEoD93u6fv1abWX",
+      "certificate_logs": [
+        "(+17m37s) ALPENGLOW voting: vote landed source=votor-quic proof=verified-aggregate vote=notarize slot=3073741 rank=21 certificate=notarize block=146JxvWuGXKR1wvsA4vmosPDMNVoEBEoD93u6fv1abWX network_landed=8806"
+      ],
+      "finalized": true,
+      "finalization_ms": 10,
+      "deadline_margin_ms": 49,
+      "transactions": 45094,
+      "log": "(+17m37s) ALPENGLOW block production: broadcast local leader slot=3073741 terminal=complete cause=complete reason=complete replay_frontier=3073740 live_slot=3073740 block=146JxvWuGXKR1wvsA4vmosPDMNVoEBEoD93u6fv1abWX parent_slot=3073740 txns=45094 window_elapsed_ms=350 finalization_ms=10 deadline_margin_ms=49 local_handoff_ms=0"
+    },
+    {
+      "slot": 3073742,
+      "blockhash": "AFytPNQRtXwRbWwnzi6D9aAVz55h43KknkHTJUWnqtr7",
+      "alpenglow_block_id": "3STHfQmzAywmCDRJuosJ6U6ASHJZxeXpRxaBnTfhiSEb",
+      "certificate_logs": [
+        "(+17m37s) ALPENGLOW voting: vote landed source=votor-quic proof=verified-aggregate vote=notarize slot=3073742 rank=21 certificate=notarize block=3STHfQmzAywmCDRJuosJ6U6ASHJZxeXpRxaBnTfhiSEb network_landed=8808"
+      ],
+      "finalized": true,
+      "finalization_ms": 9,
+      "deadline_margin_ms": 48,
+      "transactions": 852,
+      "log": "(+17m37s) ALPENGLOW block production: broadcast local leader slot=3073742 terminal=complete cause=complete reason=complete replay_frontier=3073741 live_slot=3073741 block=3STHfQmzAywmCDRJuosJ6U6ASHJZxeXpRxaBnTfhiSEb parent_slot=3073741 txns=852 window_elapsed_ms=551 finalization_ms=9 deadline_margin_ms=48 local_handoff_ms=0"
+    }
+  ],
+  "log_errors": [],
+  "included": 200000
+}
