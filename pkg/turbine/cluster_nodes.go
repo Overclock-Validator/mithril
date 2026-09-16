@@ -89,6 +89,13 @@ func newClusterNodes(cfg ClusterNodesConfig, broadcast bool) *ClusterNodes {
 // shuffle because it already owns the shred. Tree placement and fanout match
 // Agave ClusterNodes<RetransmitStage>::get_retransmit_addrs.
 func (c *ClusterNodes) RetransmitPeers(leader solana.PublicKey, shred ShredID, fanout int) (uint8, []*net.UDPAddr, error) {
+	return c.retransmitPeersInto(leader, shred, fanout, nil)
+}
+
+// retransmitPeersInto uses caller-owned result storage. The caller must finish
+// using the returned slice before reusing dst; addresses still belong to this
+// immutable cluster snapshot. Public callers retain the allocating API above.
+func (c *ClusterNodes) retransmitPeersInto(leader solana.PublicKey, shred ShredID, fanout int, dst []*net.UDPAddr) (uint8, []*net.UDPAddr, error) {
 	if c == nil || fanout <= 0 {
 		return maxTurbineHops - 1, nil, nil
 	}
@@ -123,7 +130,10 @@ func (c *ClusterNodes) RetransmitPeers(leader solana.PublicKey, shred ShredID, f
 		step = 1
 	}
 	position := anchor*fanout + offset + 1
-	peers := make([]*net.UDPAddr, 0, fanout)
+	peers := dst[:0]
+	if dst == nil {
+		peers = make([]*net.UDPAddr, 0, fanout)
+	}
 	shufflePosition := selfPos
 	for range fanout {
 		var index int

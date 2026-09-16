@@ -47,11 +47,11 @@ const (
 	TypicalDataShredPayloadBytes = 963
 	// DataShredsPerFECSet matches turbine's 32:32 erasure batch.
 	DataShredsPerFECSet = 32
-	// FECSetsPerBatch is the close watermark: hold until one FEC set is full.
-	FECSetsPerBatch = 1
+	// FECSetsPerBatch is the close watermark: hold until two FEC sets are full.
+	FECSetsPerBatch = 2
 	// TypicalFECSetPayloadBytes is one full unsigned FEC set.
 	TypicalFECSetPayloadBytes = DataShredsPerFECSet * TypicalDataShredPayloadBytes
-	// DefaultTargetBatchBytes is one FEC set. A short leftover is only
+	// DefaultTargetBatchBytes is two FEC sets. A short leftover is only
 	// emitted at slot end (Freeze / ending tick).
 	DefaultTargetBatchBytes = FECSetsPerBatch * TypicalFECSetPayloadBytes
 )

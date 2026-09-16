@@ -261,7 +261,12 @@ max_rps = 8               # Verifier's own RPC budget (never shares the block-fe
 # ── Replay tuning ────────────────────────────────────────────────────────
 [tuning]
 txpar = 24                # Validator auto-defaults to 2x CPU cores only when unset; explicit 0 = sequential
-sigverify_backend = "auto" # auto|r51|generic|stdlib; stdlib uses Go's crypto/ed25519 impl after strict checks.
+
+[sigverify]
+backend = "auto"          # auto|r51|generic|stdlib
+workers = 0               # 0 = min(2, GOMAXPROCS); explicit value overrides the shared transaction pool
+batch_target = 8          # 4 or 8 signature lanes; available work runs immediately
+disable_shred_overlap = false # Diagnostic fallback: verify after complete block assembly
 
 # ── Mithril's RPC server ─────────────────────────────────────────────────
 [rpc]
