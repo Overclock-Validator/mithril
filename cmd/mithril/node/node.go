@@ -721,14 +721,9 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		return 0
 	}
 
-	// Helper to get bool: CLI flag if explicitly set, otherwise TOML config
+	// Match numeric options: explicit CLI, configured value, then flag default.
 	getBool := func(cliKey, tomlKey string) bool {
-		if flagChanged(cliKey) {
-			if f := cmd.Flags().Lookup(cliKey); f != nil {
-				return f.Value.String() == "true"
-			}
-		}
-		return config.GetBool(tomlKey)
+		return resolveBoolOption(cmd.Flags().Lookup(cliKey), config.IsSet(tomlKey), config.GetBool(tomlKey))
 	}
 
 	// Helper to get string slice: CLI flag if explicitly set, otherwise TOML config
