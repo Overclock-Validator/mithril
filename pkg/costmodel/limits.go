@@ -90,7 +90,8 @@ func LimitsForFeatures(feats *features.Features) Limits {
 	return limits
 }
 
-// LimitsForSlot mirrors Agave v4.3.0-rc.1 runtime/slot_params.rs. A slot-time
+// LimitsForSlot mirrors Agave v4.3.0-rc.1 runtime/src/slot_params.rs.
+// Reference: https://github.com/anza-xyz/agave/blob/v4.3.0-rc.1/runtime/src/slot_params.rs A slot-time
 // gate takes effect in the epoch after activation; among effective gates the
 // shortest duration wins, even if longer-duration gates activate later.
 func LimitsForSlot(feats *features.Features, schedule *sealevel.SysvarEpochSchedule, slot uint64) (Limits, error) {

@@ -173,7 +173,6 @@ func (s *Scheduler) Receive(pkt packet.Packet) {
 
 	e := &entry{
 		tx:          tx,
-		prepared:    s.preparer.Load().Prepare(tx),
 		wire:        wire,
 		wireSize:    len(wire),
 		messageHash: messageHash,
@@ -181,7 +180,12 @@ func (s *Scheduler) Receive(pkt packet.Packet) {
 		reward:      reward,
 		seq:         s.seq.Add(1),
 	}
-	result, evicted := s.buffer.Insert(e)
+	result := s.buffer.precheck(e)
+	var evicted *entry
+	if result == InsertAccepted {
+		e.prepared = s.preparer.Load().Prepare(tx)
+		result, evicted = s.buffer.Insert(e)
+	}
 	s.mu.Lock()
 	switch result {
 	case InsertAccepted:
