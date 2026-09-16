@@ -1,0 +1,31 @@
+{
+  "dev": {
+    "sha": "7e4e8af115a27aa15f3401d59f3be1f0d79a4c1b"
+  },
+  "pr": {
+    "sha": "a598cd0508cab1788c688b8ce667c6c810e1f2d5"
+  },
+  "cpu": "AMD Ryzen 7 9700X",
+  "go_version": "1.26.4",
+  "goamd64": "v1",
+  "cgo_enabled": false,
+  "gomaxprocs": 1,
+  "pinned_logical_cpu": 6,
+  "smt_enabled": true,
+  "shared_host": true,
+  "samples_per_arm": 5,
+  "iterations_per_sample": 1,
+  "maximum_transaction_slots": [
+    16667,
+    16667,
+    16666
+  ],
+  "small_transfer_slots": [
+    50000
+  ],
+  "benchmark_source_sha256": "9ca52e8712bc24872693c2b6b43fe2e964bb1292a412601c49570f366d0a09e2",
+  "production_source_unchanged": true,
+  "entry_byte_cap_checked": 20971472,
+  "data_shred_cap_checked": 32768,
+  "scope": "Serial EntryBuilder and BroadcastSession CPU stage; excludes execution, admission, async worker queue, routing, UDP, receiver."
+}

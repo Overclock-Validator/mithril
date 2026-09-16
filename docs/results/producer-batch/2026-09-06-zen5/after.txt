@@ -1,0 +1,40 @@
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/blockprod
+cpu: AMD Ryzen 7 9700X 8-Core Processor
+BenchmarkEntryBuilder/append         	 2560165	       470.6 ns/op	     990 B/op	       7 allocs/op
+BenchmarkEntryBuilder/append-and-shred         	  762813	      1556 ns/op	    3468 B/op	      15 allocs/op
+BenchmarkEntryBuilder/append-and-broadcast     	  835798	      1407 ns/op	    2817 B/op	      14 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/blockprod
+cpu: AMD Ryzen 7 9700X 8-Core Processor
+BenchmarkEntryBuilder/append         	 2553692	       466.1 ns/op	     990 B/op	       7 allocs/op
+BenchmarkEntryBuilder/append-and-shred         	  762499	      1548 ns/op	    3468 B/op	      15 allocs/op
+BenchmarkEntryBuilder/append-and-broadcast     	  814294	      1409 ns/op	    2818 B/op	      14 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/blockprod
+cpu: AMD Ryzen 7 9700X 8-Core Processor
+BenchmarkEntryBuilder/append         	 2572012	       465.7 ns/op	     990 B/op	       7 allocs/op
+BenchmarkEntryBuilder/append-and-shred         	  766179	      1545 ns/op	    3468 B/op	      15 allocs/op
+BenchmarkEntryBuilder/append-and-broadcast     	  837370	      1411 ns/op	    2817 B/op	      14 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/blockprod
+cpu: AMD Ryzen 7 9700X 8-Core Processor
+BenchmarkEntryBuilder/append         	 2580415	       465.6 ns/op	     990 B/op	       7 allocs/op
+BenchmarkEntryBuilder/append-and-shred         	  753132	      1541 ns/op	    3468 B/op	      15 allocs/op
+BenchmarkEntryBuilder/append-and-broadcast     	  827732	      1405 ns/op	    2818 B/op	      14 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/blockprod
+cpu: AMD Ryzen 7 9700X 8-Core Processor
+BenchmarkEntryBuilder/append         	 2590515	       467.4 ns/op	     990 B/op	       7 allocs/op
+BenchmarkEntryBuilder/append-and-shred         	  756445	      1544 ns/op	    3467 B/op	      15 allocs/op
+BenchmarkEntryBuilder/append-and-broadcast     	  835386	      1404 ns/op	    2817 B/op	      14 allocs/op
+PASS
