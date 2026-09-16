@@ -127,12 +127,12 @@ type streamingDeps struct {
 
 type streamingGroup struct {
 	// readyAt is when the group was formed from contiguous decoded batches;
-	// verifiedAt when the verifier had finished every batch in it (the
-	// executor waits for that before executing anything); startedAt and
+	// joinedAt when the consumer finished joining verification and copying
+	// batch slices (not the verifier completion instant); startedAt and
 	// finishedAt bound the execution itself.
-	readyAt, verifiedAt, startedAt, finishedAt time.Time
-	batches, transactions                      int
-	suffix                                     bool // the finalize suffix, run on the complete block
+	readyAt, joinedAt, startedAt, finishedAt time.Time
+	batches, transactions                    int
+	suffix                                   bool // the finalize suffix, run on the complete block
 }
 
 // streamingFrontierMark is the replay loop's record of the last executed
@@ -699,7 +699,7 @@ func (s *streamingExecutor) executeGroup(group []*turbine.StreamBatch) error {
 		txs = append(txs, batch.Transactions...)
 		verified = append(verified, identities...)
 	}
-	verifiedAt := time.Now()
+	joinedAt := time.Now()
 	if len(txs) == 0 {
 		return nil
 	}
@@ -741,7 +741,7 @@ func (s *streamingExecutor) executeGroup(group []*turbine.StreamBatch) error {
 		return fmt.Errorf("group: %w", err)
 	}
 	cur.origin = append(cur.origin, txs...)
-	cur.groups = append(cur.groups, streamingGroup{readyAt: readyAt, verifiedAt: verifiedAt, startedAt: started, finishedAt: time.Now(), batches: len(group), transactions: len(txs)})
+	cur.groups = append(cur.groups, streamingGroup{readyAt: readyAt, joinedAt: joinedAt, startedAt: started, finishedAt: time.Now(), batches: len(group), transactions: len(txs)})
 	return nil
 }
 
@@ -894,7 +894,7 @@ func (s *streamingExecutor) finalize(block *b.Block, parentBankSysvars *sealevel
 		if err != nil {
 			return fail("suffix", fmt.Errorf("execute block suffix at slot %d: %w", block.Slot, err))
 		}
-		cur.groups = append(cur.groups, streamingGroup{readyAt: started, verifiedAt: started, startedAt: started, finishedAt: time.Now(), transactions: len(suffix), suffix: true})
+		cur.groups = append(cur.groups, streamingGroup{readyAt: started, joinedAt: started, startedAt: started, finishedAt: time.Now(), transactions: len(suffix), suffix: true})
 	}
 	if exec.processedSignatures != executionPlan.processedSignatures || exec.processedTxCount != executionPlan.processedTxCount {
 		return fail("counts", fmt.Errorf("streaming execution at slot %d processed %d transactions/%d signatures, block plan has %d/%d",
@@ -1026,28 +1026,26 @@ func (cur *streamingSlot) recordTimeline(record *metrics.StreamingExecution, blo
 	if parentReplayed > 0 {
 		replayStart := max(ready, parentFull)
 		add(&record.OpenWaitParentReplay, replayStart, parentReplayed)
-		// The parent's replay splits at its admission: before it the parent
-		// was still in the source (completion, verification, waiting for its
-		// own ancestors); after it, its execution and tail. Queue + Exec ==
-		// ParentReplay whatever the ordering.
+		// Admission is a milestone, not an execution boundary: streaming
+		// can execute inside waitForReplayInput before admission.
 		if parentAdmitted > 0 {
-			add(&record.OpenWaitParentQueue, replayStart, min(parentAdmitted, parentReplayed))
-			add(&record.OpenWaitParentExec, max(parentAdmitted, replayStart), parentReplayed)
+			add(&record.OpenWaitParentPreAdmission, replayStart, min(parentAdmitted, parentReplayed))
+			add(&record.OpenWaitParentPostAdmission, max(parentAdmitted, replayStart), parentReplayed)
 		}
 	}
-	loopStart := max(seen, parentReplayed)
+	loopStart := max(ready, parentReplayed)
 	add(&record.OpenWaitLoop, loopStart, opened)
 	// The loop's wait splits at its first entry into the replay wait after
 	// the parent: before it is the parent's post-replay tail, after it the
 	// dispatch of the child's header (queued events ahead of it, the poll).
 	if waitEntered > 0 && parentReplayed > 0 && waitEntered > parentReplayed {
 		add(&record.OpenWaitPostReplay, loopStart, min(waitEntered, opened))
-		add(&record.OpenWaitDispatch, max(waitEntered, seen), opened)
+		add(&record.OpenWaitDispatch, max(waitEntered, loopStart), opened)
 	}
 }
 
-// recordGroups writes the per-group view: how long groups waited for the
-// verifier before executing, how much of that and of the execution itself
+// recordGroups writes the per-group view: joining/assembly, preparation,
+// and execution elapsed intervals, including how much of each interval
 // fell after the last shred (the part FullToReplayed pays for), and the
 // largest group (a late open turns the whole backlog into one group). The
 // suffix counts as a group that starts after full.
@@ -1067,10 +1065,16 @@ func (cur *streamingSlot) recordGroups(record *metrics.StreamingExecution, fullA
 		return 0
 	}
 	for _, group := range cur.groups {
-		if wait := group.verifiedAt.Sub(group.readyAt); wait > 0 && !group.suffix {
-			record.GroupVerifyWait.AddTiming(wait)
-			if late := after(group.readyAt, group.verifiedAt); late > 0 {
-				record.GroupVerifyWaitAfterFull.AddTiming(late)
+		if wait := group.joinedAt.Sub(group.readyAt); wait > 0 && !group.suffix {
+			record.GroupJoinAssembly.AddTiming(wait)
+			if late := after(group.readyAt, group.joinedAt); late > 0 {
+				record.GroupJoinAssemblyAfterFull.AddTiming(late)
+			}
+		}
+		if !group.suffix && group.startedAt.After(group.joinedAt) {
+			record.GroupPreparation.AddTiming(group.startedAt.Sub(group.joinedAt))
+			if late := after(group.joinedAt, group.startedAt); late > 0 {
+				record.GroupPreparationAfterFull.AddTiming(late)
 			}
 		}
 		if late := after(group.startedAt, group.finishedAt); late > 0 {
@@ -1089,13 +1093,13 @@ func (cur *streamingSlot) recordGroups(record *metrics.StreamingExecution, fullA
 	}
 	// The tail cases are worth a per-group line; bounded so a heavy block
 	// with hundreds of groups does not flood the log.
-	if record.TxLoopAfterFull.SumNanoseconds > uint64(30*time.Millisecond) || record.GroupVerifyWaitAfterFull.SumNanoseconds > uint64(5*time.Millisecond) {
+	if record.TxLoopAfterFull.SumNanoseconds > uint64(30*time.Millisecond) || record.GroupJoinAssemblyAfterFull.SumNanoseconds > uint64(5*time.Millisecond) {
 		mlog.Log.FileOnlyf("streaming: slot %d groups (vs last shred): %s", cur.slot, cur.groupTimeline(fullAt, 12))
 	}
 }
 
 // groupTimeline renders up to limit groups (the first ones and the last)
-// relative to fullAt: "[#0 b=3 tx=1200 ready-150.2 verified-149.8 exec-149.8..-140.1]".
+// relative to fullAt: "[#0 b=3 tx=1200 ready-150.2 joined-149.8 exec-149.8..-140.1]".
 func (cur *streamingSlot) groupTimeline(fullAt time.Time, limit int) string {
 	rel := func(t time.Time) string {
 		if t.IsZero() || fullAt.IsZero() {
@@ -1110,7 +1114,7 @@ func (cur *streamingSlot) groupTimeline(fullAt time.Time, limit int) string {
 		if g.suffix {
 			kind = " suffix"
 		}
-		out = fmt.Appendf(out, "[#%d%s b=%d tx=%d ready%s verified%s exec%s..%s]", i, kind, g.batches, g.transactions, rel(g.readyAt), rel(g.verifiedAt), rel(g.startedAt), rel(g.finishedAt))
+		out = fmt.Appendf(out, "[#%d%s b=%d tx=%d ready%s joined%s exec%s..%s]", i, kind, g.batches, g.transactions, rel(g.readyAt), rel(g.joinedAt), rel(g.startedAt), rel(g.finishedAt))
 	}
 	n := len(cur.groups)
 	if n <= limit {

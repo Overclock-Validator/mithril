@@ -885,8 +885,8 @@ func TestStreamingTimelineAttributesOpenDelay(t *testing.T) {
 	require.Equal(t, at(320).UnixNano(), r.FinalizeStartNanos)
 	require.Equal(t, 50.0, ms(r.OpenWaitParentArrival))
 	require.Equal(t, 30.0, ms(r.OpenWaitParentReplay))
-	require.Equal(t, 20.0, ms(r.OpenWaitParentQueue), "the parent sat in the source 20 ms after its last shred")
-	require.Equal(t, 10.0, ms(r.OpenWaitParentExec))
+	require.Equal(t, 20.0, ms(r.OpenWaitParentPreAdmission), "the parent sat in the source 20 ms after its last shred")
+	require.Equal(t, 10.0, ms(r.OpenWaitParentPostAdmission))
 	require.Equal(t, 5.0, ms(r.OpenWaitLoop))
 	require.Equal(t, uint64(1), r.OpenWaitLoop.Count)
 
@@ -894,8 +894,8 @@ func TestStreamingTimelineAttributesOpenDelay(t *testing.T) {
 	// queueing cannot have held the child): the replay wait is all execution.
 	cur = &streamingSlot{headerAt: at(0), headerSeenAt: at(1), openedAt: at(40), parentFullNanos: at(-30).UnixNano(), parentAdmittedAt: at(-5), parentReplayedAt: at(30)}
 	r = record(cur)
-	require.Zero(t, r.OpenWaitParentQueue.Count)
-	require.Equal(t, 30.0, ms(r.OpenWaitParentExec))
+	require.Zero(t, r.OpenWaitParentPreAdmission.Count)
+	require.Equal(t, 30.0, ms(r.OpenWaitParentPostAdmission))
 	require.Equal(t, 30.0, ms(r.OpenWaitParentReplay))
 
 	// Parent fully received before the header was even decoded: no arrival
@@ -907,12 +907,13 @@ func TestStreamingTimelineAttributesOpenDelay(t *testing.T) {
 	require.Equal(t, 10.0, ms(r.OpenWaitLoop))
 
 	// Header handled only after the parent was replayed (the wake-up sat in
-	// the channel): the loop wait runs from the header being seen.
+	// the channel): include the queued wake-up before the header was seen.
 	cur = &streamingSlot{headerAt: at(0), headerSeenAt: at(90), openedAt: at(95), parentFullNanos: at(20).UnixNano(), parentReplayedAt: at(60)}
 	r = record(cur)
 	require.Equal(t, 20.0, ms(r.OpenWaitParentArrival))
 	require.Equal(t, 40.0, ms(r.OpenWaitParentReplay))
-	require.Equal(t, 5.0, ms(r.OpenWaitLoop))
+	require.Equal(t, 35.0, ms(r.OpenWaitLoop))
+	require.Equal(t, 95.0, ms(r.OpenWaitParentArrival)+ms(r.OpenWaitParentReplay)+ms(r.OpenWaitLoop))
 
 	// The loop wait splits at the first wait entry after the parent: a header
 	// remembered while the parent executed waited through the parent's
@@ -926,12 +927,12 @@ func TestStreamingTimelineAttributesOpenDelay(t *testing.T) {
 	require.Equal(t, 5.0, ms(r.OpenWaitDispatch))
 
 	// A header seen only after the wait entry (it arrived while the loop was
-	// already waiting) was not held by the tail: dispatch only, from seen.
+	// already waiting) includes both the tail and queued header dispatch.
 	cur = &streamingSlot{headerAt: at(0), headerSeenAt: at(140), openedAt: at(141), parentFullNanos: at(-100).UnixNano(), parentReplayedAt: at(60), waitEnteredAt: at(125)}
 	r = record(cur)
-	require.Zero(t, r.OpenWaitPostReplay.Count)
-	require.Equal(t, 1.0, ms(r.OpenWaitDispatch))
-	require.Equal(t, 1.0, ms(r.OpenWaitLoop))
+	require.Equal(t, 65.0, ms(r.OpenWaitPostReplay))
+	require.Equal(t, 16.0, ms(r.OpenWaitDispatch))
+	require.Equal(t, 81.0, ms(r.OpenWaitLoop))
 	require.Contains(t, cur.openTimeline(), "wait entered +125.0ms")
 
 	// Unknown parent instants (no mark, or a re-based frontier): only the
@@ -942,8 +943,8 @@ func TestStreamingTimelineAttributesOpenDelay(t *testing.T) {
 	require.Zero(t, r.ParentReplayedNanos)
 	require.Zero(t, r.OpenWaitParentArrival.Count)
 	require.Zero(t, r.OpenWaitParentReplay.Count)
-	require.Zero(t, r.OpenWaitParentQueue.Count)
-	require.Zero(t, r.OpenWaitParentExec.Count)
+	require.Zero(t, r.OpenWaitParentPreAdmission.Count)
+	require.Zero(t, r.OpenWaitParentPostAdmission.Count)
 	require.Equal(t, 70.0, ms(r.OpenWaitLoop))
 	require.Zero(t, r.OpenWaitPostReplay.Count)
 	require.Zero(t, r.OpenWaitDispatch.Count)
@@ -1019,17 +1020,17 @@ func TestStreamingGroupRecordSplitsAtFull(t *testing.T) {
 	at := func(ms int) time.Time { return t0.Add(time.Duration(ms) * time.Millisecond) }
 	ms := func(timing metrics.Timing) float64 { return float64(timing.SumNanoseconds) / 1e6 }
 	cur := &streamingSlot{slot: 42, groups: []streamingGroup{
-		{readyAt: at(90), verifiedAt: at(92), startedAt: at(92), finishedAt: at(120), batches: 3, transactions: 900},     // entirely before full
-		{readyAt: at(250), verifiedAt: at(310), startedAt: at(310), finishedAt: at(340), batches: 9, transactions: 5000}, // waited 60 ms for the verifier, 10 of them after full; ran after full
-		{readyAt: at(280), verifiedAt: at(281), startedAt: at(281), finishedAt: at(320), batches: 1, transactions: 300},  // straddles full
-		{readyAt: at(340), verifiedAt: at(340), startedAt: at(340), finishedAt: at(350), transactions: 40, suffix: true},
+		{readyAt: at(90), joinedAt: at(92), startedAt: at(92), finishedAt: at(120), batches: 3, transactions: 900},     // entirely before full
+		{readyAt: at(250), joinedAt: at(310), startedAt: at(310), finishedAt: at(340), batches: 9, transactions: 5000}, // waited 60 ms for the verifier, 10 of them after full; ran after full
+		{readyAt: at(280), joinedAt: at(281), startedAt: at(281), finishedAt: at(320), batches: 1, transactions: 300},  // straddles full
+		{readyAt: at(340), joinedAt: at(340), startedAt: at(340), finishedAt: at(350), transactions: 40, suffix: true},
 	}}
 	var r metrics.StreamingExecution
 	cur.recordGroups(&r, at(300))
-	require.Equal(t, 63.0, ms(r.GroupVerifyWait))
-	require.Equal(t, uint64(3), r.GroupVerifyWait.Count, "the suffix has no verifier wait")
-	require.Equal(t, 10.0, ms(r.GroupVerifyWaitAfterFull))
-	require.Equal(t, uint64(1), r.GroupVerifyWaitAfterFull.Count)
+	require.Equal(t, 63.0, ms(r.GroupJoinAssembly))
+	require.Equal(t, uint64(3), r.GroupJoinAssembly.Count, "the suffix has no verifier wait")
+	require.Equal(t, 10.0, ms(r.GroupJoinAssemblyAfterFull))
+	require.Equal(t, uint64(1), r.GroupJoinAssemblyAfterFull.Count)
 	require.Equal(t, 60.0, ms(r.TxLoopAfterFull), "30 + 20 + 10 ms of execution after the last shred")
 	require.Equal(t, uint64(3), r.TxLoopAfterFull.Count)
 	require.Equal(t, uint64(1), r.GroupsStraddlingFull)
@@ -1037,19 +1038,34 @@ func TestStreamingGroupRecordSplitsAtFull(t *testing.T) {
 	require.Equal(t, uint64(9), r.LargestGroupBatches)
 	require.Equal(t, at(350).UnixNano(), r.LastGroupEndNanos)
 	line := cur.groupTimeline(at(300), 3)
-	require.Contains(t, line, "[#0 b=3 tx=900 ready-210.0 verified-208.0 exec-208.0..-180.0]")
+	require.Contains(t, line, "[#0 b=3 tx=900 ready-210.0 joined-208.0 exec-208.0..-180.0]")
 	require.Contains(t, line, "…(1 more)")
-	require.Contains(t, line, "[#3 suffix b=0 tx=40 ready+40.0 verified+40.0 exec+40.0..+50.0]")
+	require.Contains(t, line, "[#3 suffix b=0 tx=40 ready+40.0 joined+40.0 exec+40.0..+50.0]")
 	require.NotContains(t, line, "#2 ")
 
 	// No full instant (a block that did not arrive as shreds): nothing is
 	// "after full", waits and sizes still count.
 	var whole metrics.StreamingExecution
 	cur.recordGroups(&whole, time.Time{})
-	require.Equal(t, 63.0, ms(whole.GroupVerifyWait))
-	require.Zero(t, whole.GroupVerifyWaitAfterFull.Count)
+	require.Equal(t, 63.0, ms(whole.GroupJoinAssembly))
+	require.Zero(t, whole.GroupJoinAssemblyAfterFull.Count)
 	require.Zero(t, whole.TxLoopAfterFull.Count)
 	require.Zero(t, whole.GroupsStraddlingFull)
 	require.Equal(t, uint64(5000), whole.LargestGroupTransactions)
 	require.Equal(t, at(350).UnixNano(), whole.LastGroupEndNanos)
+}
+
+// The group stages account for preparation even when it crosses completion.
+func TestStreamingGroupPreparationAccounting(t *testing.T) {
+	base := time.Unix(1700000000, 0)
+	at := func(ms int) time.Time { return base.Add(time.Duration(ms) * time.Millisecond) }
+	cur := &streamingSlot{groups: []streamingGroup{{readyAt: at(0), joinedAt: at(10), startedAt: at(30), finishedAt: at(50)}}}
+	var r metrics.StreamingExecution
+	cur.recordGroups(&r, at(20))
+	require.Equal(t, uint64(10*time.Millisecond), r.GroupJoinAssembly.SumNanoseconds)
+	require.Equal(t, uint64(20*time.Millisecond), r.GroupPreparation.SumNanoseconds)
+	require.Zero(t, r.GroupJoinAssemblyAfterFull.SumNanoseconds)
+	require.Equal(t, uint64(10*time.Millisecond), r.GroupPreparationAfterFull.SumNanoseconds)
+	require.Equal(t, uint64(20*time.Millisecond), r.TxLoopAfterFull.SumNanoseconds)
+	require.Equal(t, uint64(30*time.Millisecond), r.GroupJoinAssemblyAfterFull.SumNanoseconds+r.GroupPreparationAfterFull.SumNanoseconds+r.TxLoopAfterFull.SumNanoseconds)
 }

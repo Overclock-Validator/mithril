@@ -201,40 +201,35 @@ type StreamingExecution struct {
 	// timeline cannot support it):
 	//   OpenWaitParentArrival  header ready → parent's last shred: the child's
 	//                          header was decoded before its parent was even
-	//                          fully received (a leader/arrival gap, not ours)
+	//                          fully received (arrival timing; cause not established)
 	//   OpenWaitParentReplay   parent's last shred (or header ready, whichever
 	//                          is later) → parent replayed: the parent's own
 	//                          post-full path held the child; split, when the
 	//                          parent's admission is known, into
-	//   OpenWaitParentQueue    … → the parent's admission: the parent's own
-	//                          post-full path in the source (completion,
-	//                          verification, and waiting for its ancestors —
-	//                          a leader window's earlier slots still replaying)
-	//   OpenWaitParentExec     admission → replayed: the parent's execution
-	//                          and tail
-	//   OpenWaitLoop           parent replayed (or header seen, whichever is
-	//                          later) → opened: the replay loop's own latency
-	//                          to open once nothing else stood in the way;
-	//                          split, when the wait entry is known, into
-	//   OpenWaitPostReplay     … → the loop's first wait entry after the
-	//                          parent: the parent's post-replay tail
-	//                          (promotion, RPC, stats) held the child
-	//   OpenWaitDispatch       wait entry (or header seen) → opened: events
-	//                          ahead of the header in the feed, the poll
-	OpenWaitParentArrival Timing
-	OpenWaitParentReplay  Timing
-	OpenWaitParentQueue   Timing
-	OpenWaitParentExec    Timing
-	OpenWaitLoop          Timing
-	OpenWaitPostReplay    Timing
-	OpenWaitDispatch      Timing
+	//   OpenWaitParentPreAdmission  … → admission, including any streamed execution
+	//   OpenWaitParentPostAdmission admission → replayed, including finalization
+	//   OpenWaitLoop           max(parent replayed, header ready) → opened;
+	//                          includes time before the header is handled
+	//   OpenWaitPostReplay     loop start → first wait entry after the parent
+	//   OpenWaitDispatch       max(wait entry, loop start) → opened
+	// These are elapsed intervals, not CPU times. Subdivisions must not be
+	// added to their aggregates. Unknown parent milestones limit attribution.
+	OpenWaitParentArrival       Timing
+	OpenWaitParentReplay        Timing
+	OpenWaitParentPreAdmission  Timing
+	OpenWaitParentPostAdmission Timing
+	OpenWaitLoop                Timing
+	OpenWaitPostReplay          Timing
+	OpenWaitDispatch            Timing
 
 	// Groups, from the executor's per-group bookkeeping (each group is the
 	// contiguous set of decoded batches that was ready at one wake-up, or
 	// the finalize suffix):
-	//   GroupVerifyWait          time groups spent waiting for the verifier
-	//                            to finish their last batch before executing
-	//   GroupVerifyWaitAfterFull the part of that after the last shred
+	//   GroupJoinAssembly          verification joins plus batch-slice assembly;
+	//                              not pure cryptography or verifier queue time
+	//   GroupJoinAssemblyAfterFull intersection of that interval with post-full
+	//   GroupPreparation           identity binding and execution-copy creation
+	//   GroupPreparationAfterFull  intersection of preparation with post-full
 	//   TxLoopAfterFull          group/suffix execution after the last shred:
 	//                            the execution FullToReplayed actually paid for
 	//   GroupsStraddlingFull     groups that started before and finished after
@@ -242,13 +237,15 @@ type StreamingExecution struct {
 	//                            late open turns the whole backlog into one);
 	//                            Batches is 0 when that group was the suffix
 	//   LastGroupEndNanos        when the last group (or suffix) finished
-	GroupVerifyWait          Timing
-	GroupVerifyWaitAfterFull Timing
-	TxLoopAfterFull          Timing
-	GroupsStraddlingFull     uint64
-	LargestGroupTransactions uint64
-	LargestGroupBatches      uint64
-	LastGroupEndNanos        int64
+	GroupJoinAssembly          Timing
+	GroupJoinAssemblyAfterFull Timing
+	GroupPreparation           Timing
+	GroupPreparationAfterFull  Timing
+	TxLoopAfterFull            Timing
+	GroupsStraddlingFull       uint64
+	LargestGroupTransactions   uint64
+	LargestGroupBatches        uint64
+	LastGroupEndNanos          int64
 
 	// NotOpenedReason is set when the block was executed whole without a
 	// stream having opened for it: why the executor never opened one

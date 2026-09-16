@@ -326,10 +326,10 @@ func (rig *realFeedRig) finalizeAndCompare(reference lifecycleOutcome) {
 	require.LessOrEqual(rig.t, record.FullNanos, record.FinalizeStartNanos)
 	require.Zero(rig.t, record.OpenWaitParentArrival.Count, "the parent was fully received before the header")
 	require.Zero(rig.t, record.OpenWaitParentReplay.Count, "the parent was replayed before the header")
-	require.Zero(rig.t, record.OpenWaitParentQueue.Count)
-	require.Zero(rig.t, record.OpenWaitParentExec.Count)
+	require.Zero(rig.t, record.OpenWaitParentPreAdmission.Count)
+	require.Zero(rig.t, record.OpenWaitParentPostAdmission.Count)
 	require.Equal(rig.t, uint64(1), record.OpenWaitLoop.Count)
-	require.Equal(rig.t, uint64(record.OpenedNanos-record.HeaderSeenNanos), record.OpenWaitLoop.SumNanoseconds, "with nothing to wait for, the whole open delay is the loop's")
+	require.Equal(rig.t, uint64(record.OpenedNanos-record.HeaderReadyNanos), record.OpenWaitLoop.SumNanoseconds, "with nothing to wait for, the whole open delay is the loop's")
 	require.Equal(rig.t, rig.mark.waitEnteredAt.UnixNano(), record.WaitEnteredNanos)
 	// Every group ran before the completion was even broadcast.
 	require.Positive(rig.t, record.LastGroupEndNanos)
