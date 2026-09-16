@@ -23,12 +23,6 @@ The delayed-shred case now verifies roughly 33.5–33.7k transactions before ass
 
 Reproduce with `MITHRIL_SIGVERIFY_FLOW_BACKEND=r51 GOMAXPROCS=8 go test ./pkg/turbine -run '^$' -bench '^BenchmarkEntryPrefetchGapArrival$' -benchtime=3x` on each implementation, copying the same benchmark file to the baseline.
 
-## Initial live measurement
-
-The fixed post-warmup window, 2026-09-15 01:27:00–01:30:00 UTC, contains 27 sampled large blocks: 25 external and two own-leader observations, which are excluded from these latency statistics. Every retained transaction had known batch availability, timing order and transaction accounting passed validation, and no trace reports were dropped.
-
-Across the 25 external blocks, maximum complete-availability-to-discovery delay was 0.018715 ms (18.7 microseconds). Assembly-to-ready was 4.709 ms median and 14.710 ms maximum; none exceeded 20 ms. The earlier diagnostic window had five external blocks above20ms among30, including the38.99ms example. These are small observational samples with different blocks/leaders, not matched causal estimates or a guarantee that all long tails are gone. The direct discovery timings and controlled delayed-shred benchmark support the mechanism specifically.
-
-The first completed current-build FAST capture, filtered to source slots first observed after01:27UTC and deduplicated by full proof key, included us in461/466FAST certificates (98.93%); large blocks were79/82 (96.34%). This is a local footer sample, not the rolling Puffin score or Titan reward inclusion. It does not establish a lasting overall FAST improvement. All751clean replay observations had notarize events; no reservation exhaustion was observed. A separate30second probe sanity check also had112/112replay/notarize, no rejection/exhaustion and no parse/truncation errors.
-
-At01:30:27UTC voting was current within3slots, allfourservices active,88/88peer connections, zero broadcast drops, peer-send errors, queue drops/discards/timeouts or connection errors. Three completed own-leader load windows produced12blocks with zero sender errors, up to48,622transactions/block. Counts by window:3798364=[22447,48622,44343,43730];3799208=[17139,48622,36041,40611];3799488=[22814,46680,41221,42949]. The existing continuous loader and all monitoring remain running.
+Historical live trials and their limitations are in the
+[archived evidence](streaming-preparation-evidence.md). Component results do not establish
+a sustained FAST-inclusion improvement.

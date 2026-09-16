@@ -1,7 +1,0 @@
-goos: linux
-goarch: amd64
-pkg: github.com/Overclock-Validator/mithril/pkg/turbine
-cpu: AMD Ryzen 7 9700X 8-Core Processor             
-BenchmarkEntryBatchIndex/ordered-8         	    5683	    212759 ns/op	         3.246 ns/shred	       0 B/op	       0 allocs/op
-BenchmarkEntryBatchIndex/reverse-8         	    3334	    368259 ns/op	         5.619 ns/shred	       0 B/op	       0 allocs/op
-PASS

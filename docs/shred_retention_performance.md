@@ -39,23 +39,6 @@ Validation passed locally and natively: race suites for Turbine, replay,
 consensus and node; Turbine vet; complete validator build. The live integration
 applies this patch over the exact deployed FEC/peer-isolation/status-expiry source.
 
-## Initial live trial
-
-Deployed on the Ryzen 7 9700X at 20:47:35 UTC on September 14. A bounded
-30-second post-deployment CPU profile recorded no retention-sweep samples,
-compared with 7.66% of sampled CPU in the preceding profile. These are different
-live workloads; absence of samples does not mean zero cost.
-
-After excluding startup and extra profiling, local FAST inclusion was
-1,381/1,408 (98.08%) across about 7.4 minutes, compared with 3,646/3,792 (96.15%)
-in the prior 20-minute sample. For >=10,000-transaction targets it was 168/190
-(88.42%) versus 375/509 (73.67%). These are selected observed FAST certificates,
-not all blocks or reward opportunities. Different leaders/workloads, network
-variation and restart connection refresh prevent assigning the entire change to
-this optimization. All 27 remaining omissions had locally observed notarize
-votes; local serialization does not establish remote delivery.
-
-Voting remained current, with all 87 desired peers connected and no transport
-queue drops/send errors/timeouts or safety/history/fold faults in the reviewed
-run. Continuous load produced all 28 blocks in seven completed own-leader
-windows. The validator and automatic load/monitor services were left running.
+Historical live trials and their limitations are in the
+[archived evidence](streaming-preparation-evidence.md). Component results do not establish
+a sustained FAST-inclusion improvement.

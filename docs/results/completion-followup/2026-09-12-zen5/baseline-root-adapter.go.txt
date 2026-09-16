@@ -1,7 +1,0 @@
-package turbine
-
-import "github.com/gagliardetto/solana-go"
-
-func (a *SlotAssembler) addShredFromWithRoot(s *Shred, repair bool, root *solana.Hash) (*slotCompletionWork, error) {
-	return a.addShredFrom(s, repair)
-}

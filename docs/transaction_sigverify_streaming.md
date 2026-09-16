@@ -111,13 +111,13 @@ effects, full-block dependency planning, commit and live network timing. Pool
 throughput alone is insufficient evidence of end-to-end replay improvement.
 
 Measured Zen 5 results, raw logs, and validation details are in the
-[September 12 benchmark report](results/sigverify-streaming/2026-09-12-zen5/README.md).
-The subsequent [direct cache-comparison report](results/sigverify-direct-cache/2026-09-12-zen5/README.md)
+[September 12 benchmark report](https://github.com/Overclock-Validator/mithril/blob/1c1171d3661d0404b013a9bf9391e23eb660706e/docs/results/sigverify-streaming/2026-09-12-zen5/README.md).
+The subsequent [direct cache-comparison report](https://github.com/Overclock-Validator/mithril/blob/1c1171d3661d0404b013a9bf9391e23eb660706e/docs/results/sigverify-direct-cache/2026-09-12-zen5/README.md)
 isolates the removal of redundant component-buffer construction at completion.
-The [completion follow-up report](results/completion-followup/2026-09-12-zen5/README.md)
+The [completion follow-up report](https://github.com/Overclock-Validator/mithril/blob/1c1171d3661d0404b013a9bf9391e23eb660706e/docs/results/completion-followup/2026-09-12-zen5/README.md)
 measures direct ordering, authenticated-root reuse, and the four-vector job policy.
 
-The [standalone PR review](results/streaming-pr-review/2026-09-13/README.md)
+The [standalone PR review](https://github.com/Overclock-Validator/mithril/blob/1c1171d3661d0404b013a9bf9391e23eb660706e/docs/results/streaming-pr-review/2026-09-13/README.md)
 records extraction onto current `alpenglow-dev`, the small shared component-boundary
 prerequisite, final allocation improvement, and the scope of the live trial.
 

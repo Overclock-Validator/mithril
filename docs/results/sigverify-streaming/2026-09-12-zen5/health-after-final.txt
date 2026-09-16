@@ -1,4 +1,0 @@
-ActiveState=active
-SubState=running
-MainPID=3343610
-ExecMainStartTimestamp=Sat 2026-09-12 05:41:10 UTC

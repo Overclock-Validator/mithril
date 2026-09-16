@@ -57,4 +57,4 @@ Routing tests compare against a full weighted permutation, including both
 shuffle modes and missing/unroutable contacts. Ownership tests exercise caller
 buffer reuse, queue pressure, send retries, concurrent routing and shutdown.
 The full Turbine race suite passed locally and natively; native vet and the
-combined validator build passed. The benchmark candidate was not deployed.
+combined validator build passed. Historical run artifacts are linked from [the evidence archive](streaming-preparation-evidence.md).
