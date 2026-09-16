@@ -74,38 +74,40 @@ var (
 		},
 	}
 
-	bootstrapMode                   string // "auto", "snapshot", "new-snapshot", "new-incremental", or "accountsdb"
-	snapshotArchivePath             string
-	incrementalSnapshotFilename     string
-	accountsPath                    string
-	scratchDirectory                string
-	rpcEndpoints                    []string
-	cluster                         string // "alpenglow", "mainnet-beta", "testnet", or "devnet"
-	legacyGenesisHash               string // explicit lineage for pre-binding AccountsDB/ledger artifacts
-	blockSource                     string // "turbine", "rpc", or "lightbringer"
-	lightbringerEndpoint            string
-	repairCatchupMaxGapSlots        int    // Resume gaps up to this fill via turbine repair instead of RPC (0 = off)
-	repairMaxRequestsPerSecond      int    // Repair request-rate ceiling override (0 = adaptive default)
-	blockRPCFallback                bool   // Allow RPC block fetch when > repairCatchupMaxGapSlots behind (default false: shreds only)
-	blockMaxRPS                     int    // Rate limit for block fetching
-	blockMaxInflight                int    // Max concurrent block fetch workers
-	blockTipPollIntervalMs          int    // Tip poll interval in milliseconds
-	blockTipSafetyMargin            int    // Don't fetch within N slots of tip
-	consensusModeFlag               string // raw --consensus-mode value (cobra binding)
-	consensusMode                   string // resolved: "verifying" (default) or "validator"
-	alpenglowObserverBindAddr       string
-	alpenglowMaxMessageBytes        int64
-	alpenglowBLSDST                 string
-	validatorIdentityKeypair        string
-	validatorVoteAccountKeypair     string
-	validatorAuthorizedVoterKeypair string
-	validatorWithdrawerKeypair      string
-	validatorTPUQUICBind            string
-	validatorAdvertisedIP           string
-	validatorSigverifyWorkers       int
-	validatorWaitToVoteSlot         uint64
-	validatorReservedHistory        bool
-	validatorInitializeReservation  bool
+	bootstrapMode                    string // "auto", "snapshot", "new-snapshot", "new-incremental", or "accountsdb"
+	snapshotArchivePath              string
+	incrementalSnapshotFilename      string
+	accountsPath                     string
+	scratchDirectory                 string
+	rpcEndpoints                     []string
+	cluster                          string // "alpenglow", "mainnet-beta", "testnet", or "devnet"
+	legacyGenesisHash                string // explicit lineage for pre-binding AccountsDB/ledger artifacts
+	blockSource                      string // "turbine", "rpc", or "lightbringer"
+	lightbringerEndpoint             string
+	repairCatchupMaxGapSlots         int    // Resume gaps up to this fill via turbine repair instead of RPC (0 = off)
+	repairMaxRequestsPerSecond       int    // Repair request-rate ceiling override (0 = adaptive default)
+	blockRPCFallback                 bool   // Allow RPC block fetch when > repairCatchupMaxGapSlots behind (default false: shreds only)
+	blockMaxRPS                      int    // Rate limit for block fetching
+	blockMaxInflight                 int    // Max concurrent block fetch workers
+	blockTipPollIntervalMs           int    // Tip poll interval in milliseconds
+	blockTipSafetyMargin             int    // Don't fetch within N slots of tip
+	consensusModeFlag                string // raw --consensus-mode value (cobra binding)
+	consensusMode                    string // resolved: "verifying" (default) or "validator"
+	alpenglowObserverBindAddr        string
+	alpenglowMaxMessageBytes         int64
+	alpenglowBLSDST                  string
+	validatorIdentityKeypair         string
+	validatorVoteAccountKeypair      string
+	validatorAuthorizedVoterKeypair  string
+	validatorWithdrawerKeypair       string
+	validatorTPUQUICBind             string
+	validatorAdvertisedIP            string
+	validatorSigverifyWorkers        int
+	validatorWaitToVoteSlot          uint64
+	validatorReservedHistory         bool
+	validatorInitializeReservation   bool
+	validatorCompletionReserveMs     int
+	validatorMaxBufferedTransactions int
 
 	// Mode thresholds
 	blockNearTipThreshold        int // Enter near-tip when gap <= this
@@ -553,6 +555,8 @@ func init() {
 	Run.Flags().BoolVar(&validatorReservedHistory, "reserved-vote-history", false, "Use durable signing reservations with unsynchronized per-vote history writes")
 	Run.Flags().BoolVar(&validatorInitializeReservation, "initialize-vote-reservation", false, "Enroll complete synchronous vote history in reserved mode (one-time migration)")
 	Run.Flags().Uint64Var(&validatorWaitToVoteSlot, "wait-to-vote-slot", 0, "Do not cast new votes below this slot; the automatic startup cutoff still applies (0 = automatic only)")
+	Run.Flags().IntVar(&validatorCompletionReserveMs, "leader-completion-reserve-ms", 0, "Time reserved for leader finalization and broadcast (0 = 75ms default; tune from measured completion times)")
+	Run.Flags().IntVar(&validatorMaxBufferedTransactions, "tpu-max-buffered-transactions", 0, "Maximum queued TPU transactions (0 = 131072 default)")
 
 	// [tuning] section flags
 	Run.Flags().Uint64Var(&paramArenaSizeMB, "param-arena-size-mb", 512, "Size in MB for serialized parameter arena (0 to disable)")
@@ -875,6 +879,14 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	}
 	validatorAdvertisedIP = getString("validator-advertised-ip", "validator.advertised_ip")
 	validatorSigverifyWorkers = getInt("tpu-sigverify-workers", "validator.tpu_sigverify_workers")
+	validatorCompletionReserveMs = getInt("leader-completion-reserve-ms", "validator.block_completion_reserve_ms")
+	validatorMaxBufferedTransactions = getInt("tpu-max-buffered-transactions", "validator.tpu_max_buffered_transactions")
+	if validatorMaxBufferedTransactions < 0 {
+		return fmt.Errorf("TPU maximum buffered transactions must be nonnegative")
+	}
+	if validatorCompletionReserveMs < 0 || validatorCompletionReserveMs >= int(blockprod.AlpenglowSlotDuration/time.Millisecond) {
+		return fmt.Errorf("leader completion reserve must be 0 (default) or between 1 and 199 milliseconds")
+	}
 
 	// [block] section
 	blockSource = getString("block-source", "block.source")
@@ -2681,7 +2693,9 @@ postBootstrap:
 		defer broadcaster.Close()
 
 		controller := blockprod.NewController()
-		topicSink := scheduler.New(controller)
+		topicSink := scheduler.NewWithConfig(controller, scheduler.Config{
+			FeatureSource: replay.ChainTipFeatures, MaxBufferedTransactions: validatorMaxBufferedTransactions,
+		})
 		topicSink.Start(ctx)
 		defer topicSink.Stop()
 		tpuCfg := tpu.DefaultConfig()
@@ -2772,14 +2786,15 @@ postBootstrap:
 		leaderStop := make(chan struct{})
 		leaderDone := make(chan struct{})
 		leaderLoop := blockprod.NewLeaderLoop(blockprod.LeaderLoopConfig{
-			Controller:     controller,
-			Identity:       solana.PrivateKey(validatorIdentity),
-			AccountsDb:     accountsDb,
-			Broadcaster:    broadcaster,
-			ShredVersion:   uint16(turbineShredVersion),
-			EpochSchedule:  epochSchedule,
-			AlpenglowClock: true,
-			SlotDuration:   blockprod.AlpenglowSlotDuration,
+			Controller:        controller,
+			Identity:          solana.PrivateKey(validatorIdentity),
+			AccountsDb:        accountsDb,
+			Broadcaster:       broadcaster,
+			ShredVersion:      uint16(turbineShredVersion),
+			EpochSchedule:     epochSchedule,
+			AlpenglowClock:    true,
+			SlotDuration:      blockprod.AlpenglowSlotDuration,
+			CompletionReserve: time.Duration(validatorCompletionReserveMs) * time.Millisecond,
 			ParentContext: func(slot uint64) blockprod.ParentContext {
 				tip := replay.ChainTipParentContext()
 				// Blockprod owns the replay-readiness rule. In particular, the first

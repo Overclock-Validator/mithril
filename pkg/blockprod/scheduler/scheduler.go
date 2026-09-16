@@ -9,6 +9,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/blockprod"
 	"github.com/Overclock-Validator/mithril/pkg/costmodel"
 	"github.com/Overclock-Validator/mithril/pkg/features"
+	"github.com/Overclock-Validator/mithril/pkg/replay"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/packet"
 	"github.com/gagliardetto/solana-go"
 )
@@ -43,9 +44,12 @@ type Stats struct {
 // Scheduler buffers verified TPU transactions in a reward-ordered heap and
 // drains into the active WorkingBank when one is published.
 type Scheduler struct {
-	banks  BankSource
-	feats  *features.Features
-	buffer *Buffer
+	banks                  BankSource
+	feats                  *features.Features
+	buffer                 *Buffer
+	preparer               atomic.Pointer[replay.TransactionPreparer]
+	featureSource          func() *features.Features
+	lastPreparationRefresh time.Time
 
 	seq  atomic.Uint64
 	wake chan struct{}
@@ -78,6 +82,37 @@ func New(banks BankSource) *Scheduler {
 		wake:   make(chan struct{}, 1),
 		done:   make(chan struct{}),
 	}
+}
+
+// NewWithFeatureSource prepares queued messages against a replay-tip snapshot.
+// The active bank independently verifies feature compatibility before reuse.
+func NewWithFeatureSource(banks BankSource, source func() *features.Features) *Scheduler {
+	return NewWithConfig(banks, Config{FeatureSource: source})
+}
+
+// Config controls the bounded TPU queue and static preparation source.
+type Config struct {
+	// MaxBufferedTransactions defaults to MaxBufferedTxns when zero.
+	MaxBufferedTransactions int
+	FeatureSource           func() *features.Features
+}
+
+func NewWithConfig(banks BankSource, cfg Config) *Scheduler {
+	s := New(banks)
+	if cfg.MaxBufferedTransactions > 0 {
+		s.buffer = NewBuffer(cfg.MaxBufferedTransactions)
+	}
+	s.featureSource = cfg.FeatureSource
+	s.refreshPreparation()
+	return s
+}
+
+func (s *Scheduler) refreshPreparation() {
+	if s.featureSource == nil || time.Since(s.lastPreparationRefresh) < 100*time.Millisecond {
+		return
+	}
+	s.preparer.Store(replay.NewTransactionPreparer(s.featureSource()))
+	s.lastPreparationRefresh = time.Now()
 }
 
 // Start launches the bank-gated drain loop.
@@ -138,6 +173,7 @@ func (s *Scheduler) Receive(pkt packet.Packet) {
 
 	e := &entry{
 		tx:          tx,
+		prepared:    s.preparer.Load().Prepare(tx),
 		wire:        wire,
 		wireSize:    len(wire),
 		messageHash: messageHash,
@@ -219,6 +255,7 @@ func (s *Scheduler) drainLoop(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		s.refreshPreparation()
 		bank := s.banks.WorkingBank()
 		s.noteBank(bank)
 		if bank == nil {
@@ -258,15 +295,10 @@ func (s *Scheduler) drainLoop(ctx context.Context) {
 			continue
 		}
 
-		// Prefer the owned wire so forge reparses from stable bytes even if the
-		// retained tx view was somehow mutated after buffering.
-		var result blockprod.ForgeResult
-		var reason costmodel.ExceedReason
-		if len(e.wire) > 0 {
-			result, reason = bank.Forge(e.wire)
-		} else {
-			result, reason = bank.ForgeTransaction(e.tx, e.wireSize)
-		}
+		// Receive owns the wire and its decoded transaction for the entire queue
+		// lifetime. Execution modifies transaction-local account clones, not
+		// this immutable message, so reuse the decoded transaction across banks.
+		result, reason := bank.ForgePreparedTransaction(e.tx, e.wireSize, e.prepared)
 		switch result {
 		case blockprod.ForgeDroppedNoLeader:
 			s.rebuffer(e)

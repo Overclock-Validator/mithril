@@ -240,6 +240,8 @@ type ValidatorConfig struct {
 	AdvertisedIP                string `toml:"advertised_ip" mapstructure:"advertised_ip"`
 	TPUSigverifyWorkers         int    `toml:"tpu_sigverify_workers" mapstructure:"tpu_sigverify_workers"`
 	WaitToVoteSlot              uint64 `toml:"wait_to_vote_slot" mapstructure:"wait_to_vote_slot"` // Minimum slot for new votes; automatic startup cutoff still applies
+	BlockCompletionReserveMs    int    `toml:"block_completion_reserve_ms" mapstructure:"block_completion_reserve_ms"`
+	TPUMaxBufferedTransactions  int    `toml:"tpu_max_buffered_transactions" mapstructure:"tpu_max_buffered_transactions"`
 }
 
 // Config holds all configuration options for Mithril (Firedancer-style hierarchy)
