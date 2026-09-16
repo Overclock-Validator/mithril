@@ -3089,6 +3089,7 @@ func ReplayBlocks(
 				break
 			}
 		}
+		recordFullToReplayed(block)
 
 		if rpcServer != nil {
 			rpcServer.SetSlotCtx(lastSlotCtx)
@@ -4444,4 +4445,20 @@ func ProcessBlock(
 	global.IncrTransactionCount(executionPlan.processedTxCount)
 	setReplayStage("done")
 	return slotCtx, err
+}
+
+// recordFullToReplayed measures the vote-path latency replay controls for a
+// turbine block: from the assembler's full-assembly instant (the last shred,
+// carried as ShredFullNanos) to the replay result reaching consensus. Blocks
+// that did not arrive as shreds carry no full instant and record nothing.
+func recordFullToReplayed(block *b.Block) {
+	if block == nil || block.ShredFullNanos <= 0 {
+		return
+	}
+	fullToReplayed := time.Since(time.Unix(0, block.ShredFullNanos))
+	if fullToReplayed <= 0 {
+		return
+	}
+	metrics.GlobalBlockReplay.FullToReplayed.AddTiming(fullToReplayed)
+	_ = statsd.Duration(statsd.ReplayFullToReplayed, fullToReplayed, nil)
 }

@@ -145,6 +145,24 @@ type VoteRewardDetails struct {
 	VoteAccountsUpdated  uint64
 }
 
+// StreamingExecution records execution that ran while a block's shreds were
+// still arriving. Groups are the contiguous ready-batch sets executed per
+// wake-up; Transactions counts what they executed. TxLoopBeforeFull is the
+// group execution wall time that finished before the slot was fully
+// assembled, i.e. the work hidden behind reception. OpenDelay runs from the
+// header batch being decoded to the stream opening (it measures how long the
+// parent's tail held the child). Discarded is 1 when a stream for this slot
+// was thrown away and the block was executed whole; DiscardReason names why.
+type StreamingExecution struct {
+	Opened           uint64
+	Groups           uint64
+	Transactions     uint64
+	TxLoopBeforeFull Timing
+	OpenDelay        Timing
+	Discarded        uint64
+	DiscardReason    string
+}
+
 // Metrics for replaying a single block
 type BlockReplay struct {
 	Slot           uint64
@@ -214,6 +232,15 @@ type BlockReplay struct {
 	TransactionStatusView Timing
 	ChainTipUpdate        Timing
 	ResumeContext         Timing
+
+	// FullToReplayed is the vote-path latency Mithril controls: wall time from
+	// the last shred of a turbine block being assembled (the assembler's fullAt)
+	// to the replay result being handed to consensus. Absent for blocks that
+	// did not arrive as shreds. It is the number streaming execution reduces.
+	FullToReplayed Timing
+	// StreamingExecution summarizes any execution that overlapped shred
+	// reception for this block; all zero when the block was executed whole.
+	StreamingExecution StreamingExecution
 
 	LtHashInputAccounts     uint64
 	LtHashUniqueAccounts    uint64
