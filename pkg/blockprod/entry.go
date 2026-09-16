@@ -2,6 +2,8 @@ package blockprod
 
 import (
 	"github.com/Overclock-Validator/mithril/pkg/costmodel"
+	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/Overclock-Validator/mithril/pkg/statsd"
 	"github.com/Overclock-Validator/mithril/pkg/turbine"
 	"github.com/gagliardetto/solana-go"
 )
@@ -107,6 +109,8 @@ func (b *EntryBuilder) Append(tx solana.Transaction, wireSize int) ([]turbine.En
 	// once per transaction and reuse the count at flush, preserving slot budgets.
 	wire, err := tx.MarshalBinary()
 	if err != nil {
+		_ = statsd.Count(statsd.BlockProductionEntrySerializationErrors, 1, nil)
+		mlog.Log.Errorf("entry builder: cannot serialize applied transaction: %v", err)
 		return nil, 0, false
 	}
 	if wireSize <= 0 {

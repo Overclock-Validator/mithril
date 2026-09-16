@@ -111,6 +111,7 @@ var (
 	TxsPerBlock                                 = Metric{"txs_per_block"}
 	SnapshotTarBytesRead                        = Metric{"snapshot_tar_bytes_read"}
 	SlotReplays                                 = Metric{"slot_replays"}
+	BlockProductionEntrySerializationErrors     = Metric{"block_production_entry_serialization_errors_total"}
 	BlockProductionLeaderSlots                  = Metric{"block_production_leader_slots_total"}
 	BlockProductionLeaderSlotTerminals          = Metric{"block_production_leader_slot_terminals_total"}
 	BlockProductionParentReady                  = Metric{"block_production_parent_ready_activations_total"}
@@ -236,11 +237,12 @@ var MetricToType = map[Metric]metricType{
 	SlotReplayDurationMs: TimingT,
 	TxsPerBlock:          TimingT,
 
-	SnapshotTarBytesRead:               CountT,
-	SlotReplays:                        CountT,
-	BlockProductionLeaderSlots:         CountT,
-	BlockProductionLeaderSlotTerminals: CountT,
-	BlockProductionParentReady:         CountT,
+	SnapshotTarBytesRead:                    CountT,
+	SlotReplays:                             CountT,
+	BlockProductionEntrySerializationErrors: CountT,
+	BlockProductionLeaderSlots:              CountT,
+	BlockProductionLeaderSlotTerminals:      CountT,
+	BlockProductionParentReady:              CountT,
 
 	BlockProductionParentReadyAge:               TimingT,
 	BlockProductionStartCutoffLate:              TimingT,
@@ -347,13 +349,14 @@ var MetricToLabels = map[Metric][]string{
 	TasksIndexEntryBuilderLatency:  {},
 	TasksAppendVecCopyingLatency:   {},
 
-	SlotReplayDurationMs:               {},
-	TxsPerBlock:                        {},
-	SnapshotTarBytesRead:               {},
-	SlotReplays:                        {},
-	BlockProductionLeaderSlots:         {"outcome", "reason"},
-	BlockProductionLeaderSlotTerminals: {"outcome", "terminal", "cause"},
-	BlockProductionParentReady:         {"activation", "status"},
+	SlotReplayDurationMs:                    {},
+	TxsPerBlock:                             {},
+	SnapshotTarBytesRead:                    {},
+	SlotReplays:                             {},
+	BlockProductionEntrySerializationErrors: {},
+	BlockProductionLeaderSlots:              {"outcome", "reason"},
+	BlockProductionLeaderSlotTerminals:      {"outcome", "terminal", "cause"},
+	BlockProductionParentReady:              {"activation", "status"},
 
 	BlockProductionParentReadyAge:               {"activation"},
 	BlockProductionStartCutoffLate:              {"phase"},
