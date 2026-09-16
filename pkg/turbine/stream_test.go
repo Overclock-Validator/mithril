@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/block"
-	"github.com/Overclock-Validator/mithril/pkg/txverify"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/require"
 )
@@ -32,7 +31,9 @@ func nextStreamEvent(t *testing.T, ch <-chan StreamEvent, kind StreamEventKind) 
 // completion event for the same generation. The final component (the ending
 // tick) is decoded by completion, never by the prefetch, so it is not fed.
 func TestStreamFeedPublishesBatchesAndCompletion(t *testing.T) {
-	v := newTransactionVerifier(2, 16, func(tx *solana.Transaction) error { return txverify.VerifyTransaction(tx) })
+	// The production verifier (nil hook) is the one that attaches message
+	// identities; a per-transaction hook verifies without producing them.
+	v := newTransactionVerifier(2, 16, nil)
 	defer v.closeAndWait()
 	a := NewSlotAssembler()
 	p := newEntryPrefetchPool(context.Background(), a, v)
