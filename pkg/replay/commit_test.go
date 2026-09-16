@@ -933,3 +933,28 @@ func newCommitTestSlotCtx() (*sealevel.SlotCtx, func()) {
 		sealevel.SysvarCache.Rent.Sysvar = prevRent
 	}
 }
+
+func TestExecutionUsesCapturedTimingDecision(t *testing.T) {
+	oldMetrics := metrics.GlobalBlockReplay
+	defer func() { metrics.GlobalBlockReplay = oldMetrics }()
+	oldShift := metrics.SetTxTimingSampleShift(0)
+	defer metrics.SetTxTimingSampleShift(oldShift)
+	for _, sampled := range []bool{false, true} {
+		slotCtx, cleanup := newCommitTestSlotCtx()
+		tx, err := solana.TransactionFromBytes(txfixture.MustSignedTransferWire(0))
+		require.NoError(t, err)
+		metrics.GlobalBlockReplay = metrics.BlockReplay{}
+		out := LoadAndExecuteTransaction(LoadAndExecuteTransactionInput{SlotCtx: slotCtx, Transaction: tx, TimingSample: metrics.TxTimingSample{Valid: true, Sampled: sampled, Shift: 3}})
+		require.Nil(t, out.ProcessingResult.TransactionError)
+		require.NotNil(t, out.ExecCtx)
+		require.Equal(t, uint32(3), out.ExecCtx.TimingSampleShift)
+		require.Equal(t, !sampled, out.ExecCtx.SkipTimingMetrics)
+		want := uint64(0)
+		if sampled {
+			want = 8
+		}
+		require.Equal(t, want, metrics.GlobalBlockReplay.AccountsFromTx.Count)
+		require.Equal(t, want, metrics.GlobalBlockReplay.ExecIxNativeProgramSystem.Count)
+		cleanup()
+	}
+}

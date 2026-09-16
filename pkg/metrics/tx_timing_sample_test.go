@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"math/rand"
 	"testing"
 	"time"
@@ -140,5 +141,20 @@ func TestSignatureWithZeroPrefixRemainsDeterministic(t *testing.T) {
 		if !CaptureTxTiming(sig).Sampled {
 			t.Fatal("nonzero signature used unsigned fallback")
 		}
+	}
+}
+
+func TestSamplingMetadataJSON(t *testing.T) {
+	b := BlockReplay{TxTimingSampleShift: 3, TxTimingsEstimated: true, TxTimingSampledTransactions: 2}
+	data, err := json.Marshal(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	if err = json.Unmarshal(data, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out["TxTimingSampleShift"] != float64(3) || out["TxTimingsEstimated"] != true || out["TxTimingSampledTransactions"] != float64(2) {
+		t.Fatal(out)
 	}
 }
