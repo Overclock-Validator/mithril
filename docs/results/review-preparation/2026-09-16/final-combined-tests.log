@@ -1,0 +1,27 @@
+# github.com/Overclock-Validator/mithril/pkg/blockprod [github.com/Overclock-Validator/mithril/pkg/blockprod.test]
+pkg/blockprod/readonly_block_bench_test.go:119:15: undefined: marshalEntryBatchBytes
+ok  	github.com/Overclock-Validator/mithril/pkg/alpenglow	18.147s
+ok  	github.com/Overclock-Validator/mithril/pkg/consensus	10.256s
+ok  	github.com/Overclock-Validator/mithril/pkg/replay	4.811s
+ok  	github.com/Overclock-Validator/mithril/pkg/turbine	12.077s
+ok  	github.com/Overclock-Validator/mithril/pkg/turbine/internal/rsrecover	1.584s
+ok  	github.com/Overclock-Validator/mithril/pkg/turbine/repairsim	2.407s
+ok  	github.com/Overclock-Validator/mithril/pkg/repair	1.368s
+ok  	github.com/Overclock-Validator/mithril/pkg/blockstream	1.526s
+ok  	github.com/Overclock-Validator/mithril/pkg/block	1.590s
+FAIL	github.com/Overclock-Validator/mithril/pkg/blockprod [build failed]
+ok  	github.com/Overclock-Validator/mithril/pkg/blockprod/scheduler	5.176s
+ok  	github.com/Overclock-Validator/mithril/pkg/txverify	1.534s
+ok  	github.com/Overclock-Validator/mithril/pkg/txstatus	1.332s
+ok  	github.com/Overclock-Validator/mithril/pkg/sigverify	23.246s
+ok  	github.com/Overclock-Validator/mithril/pkg/config	1.169s
+ok  	github.com/Overclock-Validator/mithril/pkg/accounts	1.300s
+ok  	github.com/Overclock-Validator/mithril/pkg/sbpf	1.495s
+ok  	github.com/Overclock-Validator/mithril/pkg/costmodel	1.446s
+ok  	github.com/Overclock-Validator/mithril/pkg/merkletree	1.432s
+ok  	github.com/Overclock-Validator/mithril/pkg/statsd	1.174s
+ok  	github.com/Overclock-Validator/mithril/pkg/tpu/txfixture	53.187s
+ok  	github.com/Overclock-Validator/mithril/cmd/mithril/node	2.020s
+ok  	github.com/Overclock-Validator/mithril/cmd/mithril/configcmd	1.167s
+?   	github.com/Overclock-Validator/mithril/cmd/repair-sim	[no test files]
+FAIL

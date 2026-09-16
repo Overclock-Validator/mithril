@@ -1,6 +1,6 @@
 # Performance review validation — 2026-09-16
 
-Base: PR #278 at `e1204b3280f67e95a5f118fdff50f33f3d49b495`. The final manifest records each published review head, the combined integration commit and local production-binary hash. This evidence lives only on the review-index branch, not in the proposed review diffs.
+Base: PR #278 at `e1204b3280f67e95a5f118fdff50f33f3d49b495`. The combined source is preserved by the `review-validation-20260916` tag. The final manifest records each published review head, the combined integration commit and local production-binary hash. This evidence lives only on the review-index branch, not in the proposed review diffs.
 
 Validation ran locally on Apple M4 Pro / Go 1.26.4 with race detection. No source was built or deployed on the live validator during this pass. The historical Zen 5 benchmarks retain their original baselines; no new performance number is claimed for the rebase.
 
