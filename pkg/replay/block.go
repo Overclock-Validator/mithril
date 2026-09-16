@@ -1030,28 +1030,28 @@ func loadBlockAccountsAndUpdateSysvars(
 }
 
 func recordAccountLoaderBatchStats(dst *metrics.AccountLoader, src accountsdb.BatchReadStats) {
-	dst.RequestedKeys = src.RequestedKeys
-	dst.DurableKeys = src.DurableKeys
-	dst.WorkingSetHits = src.WorkingSetHits
-	dst.InProgressHits = src.InProgressHits
-	dst.PendingFoldHits = src.PendingFoldHits
-	dst.CacheHits = src.CacheHits
-	dst.IndexHits = src.IndexHits
-	dst.IndexMisses = src.IndexMisses
-	dst.UniqueAppendVecs = src.UniqueAppendVecs
-	dst.AppendVecChunks = src.AppendVecChunks
-	dst.AppendVecAccounts = src.AppendVecAccounts
-	dst.OpenFailures = src.OpenFailures
-	dst.ReadFailures = src.ReadFailures
-	dst.RetryAccounts = src.RetryAccounts
-	dst.CommonCacheAdmissions = src.CommonCacheAdmissions
-	dst.CommonCacheAdmissionsSkipped = src.CommonCacheAdmissionsSkipped
-	dst.VoteCacheAdmissions = src.VoteCacheAdmissions
-	dst.VoteCacheAdmissionsSkipped = src.VoteCacheAdmissionsSkipped
-	dst.CachePublicationEpochRejects = src.CachePublicationEpochRejects
-	dst.DecodedAccountObjects = src.DecodedAccountObjects
-	dst.DecodedAccountBytes = src.DecodedAccountBytes
-	dst.PlaceholderObjects = src.PlaceholderObjects
+	dst.RequestedKeys += src.RequestedKeys
+	dst.DurableKeys += src.DurableKeys
+	dst.WorkingSetHits += src.WorkingSetHits
+	dst.InProgressHits += src.InProgressHits
+	dst.PendingFoldHits += src.PendingFoldHits
+	dst.CacheHits += src.CacheHits
+	dst.IndexHits += src.IndexHits
+	dst.IndexMisses += src.IndexMisses
+	dst.UniqueAppendVecs += src.UniqueAppendVecs
+	dst.AppendVecChunks += src.AppendVecChunks
+	dst.AppendVecAccounts += src.AppendVecAccounts
+	dst.OpenFailures += src.OpenFailures
+	dst.ReadFailures += src.ReadFailures
+	dst.RetryAccounts += src.RetryAccounts
+	dst.CommonCacheAdmissions += src.CommonCacheAdmissions
+	dst.CommonCacheAdmissionsSkipped += src.CommonCacheAdmissionsSkipped
+	dst.VoteCacheAdmissions += src.VoteCacheAdmissions
+	dst.VoteCacheAdmissionsSkipped += src.VoteCacheAdmissionsSkipped
+	dst.CachePublicationEpochRejects += src.CachePublicationEpochRejects
+	dst.DecodedAccountObjects += src.DecodedAccountObjects
+	dst.DecodedAccountBytes += src.DecodedAccountBytes
+	dst.PlaceholderObjects += src.PlaceholderObjects
 	dst.WorkingSetLookup.AddTiming(time.Duration(src.WorkingSetLookupNanoseconds))
 	dst.InProgressLookup.AddTiming(time.Duration(src.InProgressNanoseconds))
 	dst.AppendVecPinWait.AddTiming(time.Duration(src.AppendVecPinWaitNanoseconds))

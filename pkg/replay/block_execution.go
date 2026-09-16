@@ -75,6 +75,9 @@ type blockExecution struct {
 
 	txFeeAccumulator fees.TxFeeInfoAccumulator
 	totalCU          uint64
+
+	// Retained across global metric resets while a speculative stream waits.
+	accountLoader metrics.AccountLoader
 }
 
 // newBlockExecution installs the per-bank trace task, the stage watchdog and
@@ -212,6 +215,7 @@ func (exec *blockExecution) installSlotCtx(accts accounts.Accounts, parentAccts 
 // without the whole-block planner, so a streaming caller can start executing
 // groups before any transaction of the block is known.
 func (exec *blockExecution) open() error {
+	defer exec.captureAccountLoader()()
 	block := exec.block
 	exec.setReplayStage("prepare_dependency_planner")
 	if SerializedParameterArena != nil {
@@ -366,6 +370,19 @@ func (exec *blockExecution) executeTransactionGroup(txs []*solana.Transaction, i
 	return nil
 }
 
+// captureAccountLoader isolates this stream's loader work from the global
+// record, which may belong to another replayed slot or be reset while waiting.
+// Only the replay goroutine may enter this scope; loader workers are joined
+// before it exits. Discarded streams never publish their retained totals.
+func (exec *blockExecution) captureAccountLoader() func() {
+	previous := metrics.GlobalBlockReplay.AccountLoader
+	metrics.GlobalBlockReplay.AccountLoader = metrics.AccountLoader{}
+	return func() {
+		exec.accountLoader.Accumulate(metrics.GlobalBlockReplay.AccountLoader)
+		metrics.GlobalBlockReplay.AccountLoader = previous
+	}
+}
+
 // loadTransactionAccounts resolves the group's address-table lookups and adds
 // the pristine parent image of every account the group can touch to the
 // parent snapshot, exactly as the whole-block loader does for a block, except
@@ -374,6 +391,7 @@ func (exec *blockExecution) executeTransactionGroup(txs []*solana.Transaction, i
 // overlay, so the first image is the right one and later groups must not
 // replace it.
 func (exec *blockExecution) loadTransactionAccounts(view *b.Block) error {
+	defer exec.captureAccountLoader()()
 	phaseStart := time.Now()
 	if err := resolveAddrTableLookups(exec.blockSrc, view); err != nil {
 		return fmt.Errorf("resolve address table lookups at slot %d: %w", view.Slot, err)

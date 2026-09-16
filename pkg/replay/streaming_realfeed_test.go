@@ -369,7 +369,15 @@ func TestStreamingRealFeedExecutesPrefixBeforeCompletionAndMatchesWholeBlock(t *
 		require.Same(t, rig.block.Transactions[i], tx, "the executed prefix is the block, by identity")
 	}
 
+	retainedLoader := rig.exec.current.exec.accountLoader
+	require.Positive(t, retainedLoader.SourceBatch.Count)
+	// Replay resets the global collector while waiting for the full block.
+	// Early loader work must survive and be published exactly once.
+	metrics.GlobalBlockReplay.AccountLoader = metrics.AccountLoader{}
 	rig.finalizeAndCompare(reference)
+	require.Equal(t, retainedLoader.SourceBatch, metrics.GlobalBlockReplay.AccountLoader.SourceBatch)
+	require.Equal(t, retainedLoader.RequestedKeys, metrics.GlobalBlockReplay.AccountLoader.RequestedKeys)
+	require.Equal(t, retainedLoader.ParentAccounts, metrics.GlobalBlockReplay.AccountLoader.ParentAccounts)
 	require.Positive(t, metrics.GlobalBlockReplay.StreamingExecution.TxLoopBeforeFull.Count, "transaction work finished before the slot was full")
 	require.Zero(t, rig.receiver.StreamDroppedEvents())
 }

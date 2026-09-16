@@ -32,6 +32,8 @@ func (t *Timing) AddTimingSince(start time.Time) {
 // AccountLoader is the per-slot decomposition of LoadBlockAccounts. Counters
 // describe logical loader work; allocation counters cover objects/data created
 // directly by the batch loader rather than runtime or Pebble internals.
+// Counts sum loader operations across groups, not unique keys/files per block;
+// in particular UniqueAppendVecs sums each batch's distinct file count.
 type AccountLoader struct {
 	AddressTableLookups Timing
 	DedupeBlockAccounts Timing
@@ -102,6 +104,103 @@ type AccountLoader struct {
 	SysvarCacheHits                    uint64
 	SysvarDurableReads                 uint64
 	SysvarCachePublicationEpochRejects uint64
+}
+
+// Accumulate merges completed loader work. Both records must be exclusively
+// owned by the replay goroutine; this is not a concurrent snapshot operation.
+func (dst *AccountLoader) Accumulate(src AccountLoader) {
+	dst.AddressTableLookups.Count += src.AddressTableLookups.Count
+	dst.AddressTableLookups.SumNanoseconds += src.AddressTableLookups.SumNanoseconds
+	dst.DedupeBlockAccounts.Count += src.DedupeBlockAccounts.Count
+	dst.DedupeBlockAccounts.SumNanoseconds += src.DedupeBlockAccounts.SumNanoseconds
+	dst.SourceBatch.Count += src.SourceBatch.Count
+	dst.SourceBatch.SumNanoseconds += src.SourceBatch.SumNanoseconds
+	dst.ParentMapBuild.Count += src.ParentMapBuild.Count
+	dst.ParentMapBuild.SumNanoseconds += src.ParentMapBuild.SumNanoseconds
+	dst.SysvarUpdates.Count += src.SysvarUpdates.Count
+	dst.SysvarUpdates.SumNanoseconds += src.SysvarUpdates.SumNanoseconds
+	dst.SysvarClockRead.Count += src.SysvarClockRead.Count
+	dst.SysvarClockRead.SumNanoseconds += src.SysvarClockRead.SumNanoseconds
+	dst.SysvarSlotHashesRead.Count += src.SysvarSlotHashesRead.Count
+	dst.SysvarSlotHashesRead.SumNanoseconds += src.SysvarSlotHashesRead.SumNanoseconds
+	dst.SysvarRecentBlockhashesRead.Count += src.SysvarRecentBlockhashesRead.Count
+	dst.SysvarRecentBlockhashesRead.SumNanoseconds += src.SysvarRecentBlockhashesRead.SumNanoseconds
+	dst.SysvarSlotHistoryRead.Count += src.SysvarSlotHistoryRead.Count
+	dst.SysvarSlotHistoryRead.SumNanoseconds += src.SysvarSlotHistoryRead.SumNanoseconds
+	dst.SysvarStakeHistoryRead.Count += src.SysvarStakeHistoryRead.Count
+	dst.SysvarStakeHistoryRead.SumNanoseconds += src.SysvarStakeHistoryRead.SumNanoseconds
+	dst.SysvarLastRestartSlotRead.Count += src.SysvarLastRestartSlotRead.Count
+	dst.SysvarLastRestartSlotRead.SumNanoseconds += src.SysvarLastRestartSlotRead.SumNanoseconds
+	dst.WorkingSetLookup.Count += src.WorkingSetLookup.Count
+	dst.WorkingSetLookup.SumNanoseconds += src.WorkingSetLookup.SumNanoseconds
+	dst.InProgressLookup.Count += src.InProgressLookup.Count
+	dst.InProgressLookup.SumNanoseconds += src.InProgressLookup.SumNanoseconds
+	dst.AppendVecPinWait.Count += src.AppendVecPinWait.Count
+	dst.AppendVecPinWait.SumNanoseconds += src.AppendVecPinWait.SumNanoseconds
+	dst.ReadCacheEpochWait.Count += src.ReadCacheEpochWait.Count
+	dst.ReadCacheEpochWait.SumNanoseconds += src.ReadCacheEpochWait.SumNanoseconds
+	dst.CacheLookup.Count += src.CacheLookup.Count
+	dst.CacheLookup.SumNanoseconds += src.CacheLookup.SumNanoseconds
+	dst.AdmissionFilter.Count += src.AdmissionFilter.Count
+	dst.AdmissionFilter.SumNanoseconds += src.AdmissionFilter.SumNanoseconds
+	dst.IndexLookup.Count += src.IndexLookup.Count
+	dst.IndexLookup.SumNanoseconds += src.IndexLookup.SumNanoseconds
+	dst.ReadPlanning.Count += src.ReadPlanning.Count
+	dst.ReadPlanning.SumNanoseconds += src.ReadPlanning.SumNanoseconds
+	dst.AppendVecRead.Count += src.AppendVecRead.Count
+	dst.AppendVecRead.SumNanoseconds += src.AppendVecRead.SumNanoseconds
+	dst.CachePublicationWait.Count += src.CachePublicationWait.Count
+	dst.CachePublicationWait.SumNanoseconds += src.CachePublicationWait.SumNanoseconds
+	dst.CachePublication.Count += src.CachePublication.Count
+	dst.CachePublication.SumNanoseconds += src.CachePublication.SumNanoseconds
+	dst.SysvarWorkingSetLookup.Count += src.SysvarWorkingSetLookup.Count
+	dst.SysvarWorkingSetLookup.SumNanoseconds += src.SysvarWorkingSetLookup.SumNanoseconds
+	dst.SysvarClone.Count += src.SysvarClone.Count
+	dst.SysvarClone.SumNanoseconds += src.SysvarClone.SumNanoseconds
+	dst.SysvarAppendVecPinWait.Count += src.SysvarAppendVecPinWait.Count
+	dst.SysvarAppendVecPinWait.SumNanoseconds += src.SysvarAppendVecPinWait.SumNanoseconds
+	dst.SysvarInProgressLookup.Count += src.SysvarInProgressLookup.Count
+	dst.SysvarInProgressLookup.SumNanoseconds += src.SysvarInProgressLookup.SumNanoseconds
+	dst.SysvarReadCacheEpochWait.Count += src.SysvarReadCacheEpochWait.Count
+	dst.SysvarReadCacheEpochWait.SumNanoseconds += src.SysvarReadCacheEpochWait.SumNanoseconds
+	dst.SysvarCacheLookup.Count += src.SysvarCacheLookup.Count
+	dst.SysvarCacheLookup.SumNanoseconds += src.SysvarCacheLookup.SumNanoseconds
+	dst.SysvarIndexAndAppendVecRead.Count += src.SysvarIndexAndAppendVecRead.Count
+	dst.SysvarIndexAndAppendVecRead.SumNanoseconds += src.SysvarIndexAndAppendVecRead.SumNanoseconds
+	dst.SysvarCachePublicationWait.Count += src.SysvarCachePublicationWait.Count
+	dst.SysvarCachePublicationWait.SumNanoseconds += src.SysvarCachePublicationWait.SumNanoseconds
+	dst.SysvarCachePublication.Count += src.SysvarCachePublication.Count
+	dst.SysvarCachePublication.SumNanoseconds += src.SysvarCachePublication.SumNanoseconds
+	dst.RequestedKeys += src.RequestedKeys
+	dst.DurableKeys += src.DurableKeys
+	dst.ParentAccounts += src.ParentAccounts
+	dst.WorkingSetHits += src.WorkingSetHits
+	dst.InProgressHits += src.InProgressHits
+	dst.PendingFoldHits += src.PendingFoldHits
+	dst.CacheHits += src.CacheHits
+	dst.IndexHits += src.IndexHits
+	dst.IndexMisses += src.IndexMisses
+	dst.UniqueAppendVecs += src.UniqueAppendVecs
+	dst.AppendVecChunks += src.AppendVecChunks
+	dst.AppendVecAccounts += src.AppendVecAccounts
+	dst.OpenFailures += src.OpenFailures
+	dst.ReadFailures += src.ReadFailures
+	dst.RetryAccounts += src.RetryAccounts
+	dst.CommonCacheAdmissions += src.CommonCacheAdmissions
+	dst.CommonCacheAdmissionsSkipped += src.CommonCacheAdmissionsSkipped
+	dst.VoteCacheAdmissions += src.VoteCacheAdmissions
+	dst.VoteCacheAdmissionsSkipped += src.VoteCacheAdmissionsSkipped
+	dst.CachePublicationEpochRejects += src.CachePublicationEpochRejects
+	dst.DecodedAccountObjects += src.DecodedAccountObjects
+	dst.DecodedAccountBytes += src.DecodedAccountBytes
+	dst.PlaceholderObjects += src.PlaceholderObjects
+	dst.SysvarReads += src.SysvarReads
+	dst.SysvarWorkingSetHits += src.SysvarWorkingSetHits
+	dst.SysvarInProgressHits += src.SysvarInProgressHits
+	dst.SysvarPendingFoldHits += src.SysvarPendingFoldHits
+	dst.SysvarCacheHits += src.SysvarCacheHits
+	dst.SysvarDurableReads += src.SysvarDurableReads
+	dst.SysvarCachePublicationEpochRejects += src.SysvarCachePublicationEpochRejects
 }
 
 // TurbineIngress records per-slot pre-replay pipeline observations.

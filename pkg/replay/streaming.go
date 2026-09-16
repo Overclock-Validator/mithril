@@ -941,6 +941,9 @@ func (s *streamingExecutor) finalize(block *b.Block, parentBankSysvars *sealevel
 	record.OpenDelay.AddTiming(cur.openedAt.Sub(cur.headerAt))
 	cur.recordTimeline(record, block, finalizeStart)
 	cur.recordGroups(record, fullAt)
+	// Publish only the accepted stream, including its open, early groups and
+	// suffix. The finalization record already contains any tail loader work.
+	metrics.GlobalBlockReplay.AccountLoader.Accumulate(exec.accountLoader)
 	return slotCtx, true, nil
 }
 
