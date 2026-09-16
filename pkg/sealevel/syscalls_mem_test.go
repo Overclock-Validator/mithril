@@ -216,3 +216,34 @@ func TestSyscallMemoryZeroLengthPreservesValidation(t *testing.T) {
 		}
 	}
 }
+
+// Compare the syscall with the old read-then-write path, including charged CU.
+func TestMemoryCopyDifferential(t *testing.T) {
+	rng := rand.New(rand.NewSource(127))
+	for i := 0; i < 300; i++ {
+		data := make([]byte, 128)
+		rng.Read(data)
+		actual, want := append([]byte(nil), data...), append([]byte(nil), data...)
+		vm, ctx := newMemSyscallVM(t, actual, nil)
+		ref, refCtx := newMemSyscallVM(t, want, nil)
+		src, dst, n := uint64(rng.Intn(145)), uint64(rng.Intn(145)), uint64(rng.Intn(80))
+		src += sbpf.VaddrInput
+		dst += sbpf.VaddrInput
+		_, gotErr := SyscallMemmoveImpl(vm, dst, src, n)
+		wantErr := MemOpConsume(refCtx, n)
+		if wantErr == nil {
+			buf := make([]byte, n)
+			wantErr = ref.Read(src, buf)
+			if wantErr == nil {
+				wantErr = ref.Write(dst, buf)
+			}
+		}
+		if wantErr == nil {
+			require.NoError(t, gotErr)
+		} else {
+			require.EqualError(t, gotErr, wantErr.Error())
+		}
+		require.Equal(t, want, actual)
+		require.Equal(t, refCtx.ComputeMeter.Remaining(), ctx.ComputeMeter.Remaining())
+	}
+}
