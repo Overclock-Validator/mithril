@@ -1069,3 +1069,29 @@ func TestStreamingGroupPreparationAccounting(t *testing.T) {
 	require.Equal(t, uint64(20*time.Millisecond), r.TxLoopAfterFull.SumNanoseconds)
 	require.Equal(t, uint64(30*time.Millisecond), r.GroupJoinAssemblyAfterFull.SumNanoseconds+r.GroupPreparationAfterFull.SumNanoseconds+r.TxLoopAfterFull.SumNanoseconds)
 }
+
+// One notification must pick up every ready contiguous batch, even when the
+// remaining notifications are queued or the generation has just completed.
+func TestStreamingEventRefreshesReadyBatches(t *testing.T) {
+	for _, completed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "active", true: "completed"}[completed], func(t *testing.T) {
+			StreamingExecutionCfg = StreamingExecutionConfig{Enabled: true}
+			defer func() { StreamingExecutionCfg = StreamingExecutionConfig{} }()
+			h := newStreamingTestHarness(t)
+			txs := transferTransactions(t, 9, 1700)
+			a, b, c := h.batch(t, 1, 3, txs[:3]), h.batch(t, 4, 6, txs[3:6]), h.batch(t, 7, 9, txs[6:])
+			h.feed.pending[h.gen] = []*turbine.StreamBatch{c, a, b}
+			if completed {
+				h.feed.status[h.gen] = turbine.StreamDone
+				h.exec.handleEvent(turbine.StreamEvent{Kind: turbine.StreamCompleted, Slot: a.Slot, Generation: h.gen})
+			} else {
+				h.exec.handleEvent(h.event(a))
+			}
+			sameTransactions(t, txs, h.executed())
+			require.Len(t, h.exec.current.groups, 1)
+			h.exec.handleEvent(h.event(b))
+			h.exec.handleEvent(h.event(c))
+			require.Len(t, h.exec.current.groups, 1, "queued stale notifications do not execute twice")
+		})
+	}
+}

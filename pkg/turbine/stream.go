@@ -227,16 +227,17 @@ func (a *SlotAssembler) streamStatusLocked(g StreamGeneration) StreamStatus {
 // PendingStreamBatches returns every decoded batch of the generation whose
 // range starts at or after fromStart, in shred-index order. It reads the
 // prefetch state directly, so it is the authoritative recovery path after a
-// dropped wake-up. The result is empty once the generation is no longer
-// active (its batches may still be used by a completed block, but the feed
-// has nothing more to offer).
+// dropped wake-up. A completed generation still owns its immutable ready
+// results, so completion does not hide batches behind queued/lost notifications.
+// Cancelled generations return nothing. No new prefetch work is scheduled here.
 func (a *SlotAssembler) PendingStreamBatches(g StreamGeneration, fromStart uint32) []*StreamBatch {
 	if g.state == nil {
 		return nil
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.streamStatusLocked(g) != StreamActive || g.state.prefetch == nil || g.state.prefetch.released {
+	status := a.streamStatusLocked(g)
+	if status == StreamGone || g.state.prefetch == nil || (g.state.prefetch.released && status != StreamDone) {
 		return nil
 	}
 	var out []*StreamBatch

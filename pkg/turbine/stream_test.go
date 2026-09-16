@@ -98,7 +98,21 @@ func TestStreamFeedPublishesBatchesAndCompletion(t *testing.T) {
 	done := nextStreamEvent(t, events, StreamCompleted)
 	require.Equal(t, first.Generation, done.Generation)
 	require.Equal(t, StreamDone, a.StreamStatusOf(first.Generation))
-	require.Empty(t, a.PendingStreamBatches(first.Generation, 0), "a completed generation has nothing pending")
+	retained := a.PendingStreamBatches(first.Generation, first.Batch.Start)
+	require.Len(t, retained, 2, "completion preserves already-ready entry batches")
+	for i, batch := range retained {
+		ids, ok, err := batch.WaitVerification(context.Background())
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.Len(t, ids, len(batch.Transactions))
+		offset := 0
+		if i == 1 {
+			offset = 3
+		}
+		for j, tx := range batch.Transactions {
+			require.Same(t, blk.Transactions[offset+j], tx)
+		}
+	}
 
 	// Pointer identity: the prefix a streaming consumer executed is the block.
 	require.Len(t, blk.Transactions, 7)

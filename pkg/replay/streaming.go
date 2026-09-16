@@ -294,7 +294,13 @@ func (s *streamingExecutor) handleEvent(event turbine.StreamEvent) {
 			return
 		}
 		if s.current != nil && event.Generation == s.current.generation {
+			// A previous group can leave many notifications queued. Refresh
+			// the authoritative ready set before choosing the next group.
+			if event.Batch.Start < s.current.nextStart {
+				return // already consumed by a prior refresh
+			}
 			s.offer(event.Batch)
+			s.pull()
 			s.consume()
 			return
 		}
@@ -315,11 +321,9 @@ func (s *streamingExecutor) handleEvent(event turbine.StreamEvent) {
 	case turbine.StreamCompleted:
 		if s.current != nil && event.Generation == s.current.generation {
 			s.current.completed = true
-			// Wake-ups for the slot's batches precede this event in the
-			// channel, so everything decoded is already pending; run it now
-			// (the group minimum no longer applies). Anything a dropped
-			// wake-up missed runs in the finalize suffix: the prefetch state
-			// is released at completion, so there is nothing left to pull.
+			// Released prefetch results remain immutable and owned by this
+			// generation. Recover ready batches whose wake-ups were dropped.
+			s.pull()
 			s.consume()
 			return
 		}
