@@ -1,6 +1,11 @@
 package block
 
-import "github.com/Overclock-Validator/mithril/pkg/txstatus"
+import (
+	"fmt"
+
+	"github.com/Overclock-Validator/mithril/pkg/txstatus"
+	"github.com/gagliardetto/solana-go"
+)
 
 // transactionState initializes the nonserialized holder under a short global
 // lock. Message hashing itself is protected only by the per-block state lock,
@@ -33,6 +38,29 @@ func (prepared *PreparedTransactionMessageIdentities) Identity(index int) txstat
 // contract; detecting arbitrary in-place edits would require hashing again.
 func (prepared *PreparedTransactionMessageIdentities) MatchesBlock(block *Block) bool {
 	return block != nil && prepared.matches(block.Transactions)
+}
+
+// Rebind returns the same identities bound to copies of the same ordered
+// transactions: copies[i] must carry the message version and recent
+// blockhash identity i was prepared for. Streaming execution runs
+// stream-owned copies of a block's transactions (so address-table resolution
+// never touches the block's own objects) while proving the block by the
+// originals; the copies share the originals' identities.
+func (prepared *PreparedTransactionMessageIdentities) Rebind(copies []*solana.Transaction) (*PreparedTransactionMessageIdentities, error) {
+	if prepared == nil || len(copies) != len(prepared.identities) || len(copies) != len(prepared.versions) {
+		return nil, fmt.Errorf("prepared identities do not cover %d transaction copies", len(copies))
+	}
+	for index, tx := range copies {
+		if tx == nil || tx.Message.GetVersion() != prepared.versions[index] ||
+			tx.Message.RecentBlockhash != prepared.identities[index].RecentBlockhash {
+			return nil, fmt.Errorf("transaction copy %d does not match its prepared identity", index)
+		}
+	}
+	return &PreparedTransactionMessageIdentities{
+		transactions: append([]*solana.Transaction(nil), copies...),
+		versions:     append([]solana.MessageVersion(nil), prepared.versions...),
+		identities:   append([]txstatus.TransactionMessageIdentity(nil), prepared.identities...),
+	}, nil
 }
 
 // Slice returns the prepared identities for transactions [from, to) as an
