@@ -2,7 +2,7 @@
 
 The maintained subsystem documentation and reusable Go benchmarks describe the
 implementation and reproduction method. Historical raw results and session
-notes are retained at [the tested source snapshot](https://github.com/Overclock-Validator/mithril/blob/72514abc5a2a98d2a2823fe92f0bfbbeedbcc9bc)
+notes are retained at [the tested source snapshot](https://github.com/Overclock-Validator/mithril/tree/72514abc5a2a98d2a2823fe92f0bfbbeedbcc9bc)
 (tag `review-evidence-20260916-certificate-processing`). They are omitted from this proposed merge.
 
 [Historical result files](https://github.com/Overclock-Validator/mithril/tree/72514abc5a2a98d2a2823fe92f0bfbbeedbcc9bc/docs/results)
