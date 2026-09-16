@@ -171,16 +171,20 @@ type BlockReplay struct {
 	// BlockUpdateAccounts is synchronous critical-path work: rooted-tail
 	// buffering (including its callback) or legacy store enqueue. It excludes
 	// legacy asynchronous disk completion.
-	BlockUpdateAccounts         Timing
-	TransactionStatusCommit     Timing
-	SignatureVerificationJoin   Timing
-	AccountsDeltaHash           Timing
-	LtHashDedupe                Timing
-	LtHashWorkerCompute         Timing
-	LtHashPartialReduce         Timing
-	BankHashFinalize            Timing
-	BankHash                    Timing
-	AlpenglowFooterVerification Timing
+	BlockUpdateAccounts     Timing
+	TransactionStatusCommit Timing
+	// Preparation overlaps execution and is not additive with replay wall time.
+	// PreparationWait is the residual join nested within TransactionStatusCommit.
+	TransactionStatusPreparation     Timing
+	TransactionStatusPreparationWait Timing
+	SignatureVerificationJoin        Timing
+	AccountsDeltaHash                Timing
+	LtHashDedupe                     Timing
+	LtHashWorkerCompute              Timing
+	LtHashPartialReduce              Timing
+	BankHashFinalize                 Timing
+	BankHash                         Timing
+	AlpenglowFooterVerification      Timing
 	// PostProcessBlock is caller-side state publication and replay
 	// bookkeeping after ProcessBlock returns. TransactionStatusView,
 	// ChainTipUpdate, and ResumeContext are nested sub-phases; logging, summary
