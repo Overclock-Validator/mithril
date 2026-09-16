@@ -28,8 +28,11 @@ func PackEntryBytesMax(slotMaxDataShreds, maxMicroblock uint64) uint64 {
 
 // DefaultPackEntryBytes is min(shred-safe, SIMD-0525) minus one ending tick.
 func DefaultPackEntryBytes() uint64 {
-	shredSafe := PackEntryBytesMax(DefaultMaxDataShredsPerSlot, MaxMicroblockBytes)
-	cap := uint64(DefaultMaxEntryBytesPerSlot)
+	return packEntryBytes(DefaultMaxDataShredsPerSlot, DefaultMaxEntryBytesPerSlot)
+}
+
+func packEntryBytes(maxDataShreds, cap uint64) uint64 {
+	shredSafe := PackEntryBytesMax(maxDataShreds, MaxMicroblockBytes)
 	if shredSafe > 0 && shredSafe < cap {
 		cap = shredSafe
 	}

@@ -1,11 +1,10 @@
 package blockprod
 
 import (
-	"bytes"
-
 	"github.com/Overclock-Validator/mithril/pkg/costmodel"
+	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/Overclock-Validator/mithril/pkg/statsd"
 	"github.com/Overclock-Validator/mithril/pkg/turbine"
-	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -17,11 +16,12 @@ const entryBatchOverheadBytes = 8 + 8 + 32 + 8
 type EntryBuilder struct {
 	limits costmodel.Limits
 
-	pendingTxns   []solana.Transaction
-	pendingWire   int
-	flushedBytes  int
-	reservedBytes int
-	entryHash     solana.Hash
+	pendingTxns            []solana.Transaction
+	pendingSerializedBytes int
+	pendingWire            int
+	flushedBytes           int
+	reservedBytes          int
+	entryHash              solana.Hash
 }
 
 func NewEntryBuilder(limits costmodel.Limits, entryHash solana.Hash) *EntryBuilder {
@@ -102,32 +102,38 @@ func (b *EntryBuilder) dropReservation() {
 }
 
 // Append adds a forged transaction. The pending entry is held until the next
-// transaction would overflow one FEC set. A short leftover is only emitted by
-// Flush (slot end / Freeze).
+// transaction would overflow the configured batch target. A short leftover is only emitted by
+// Flush (slot end / Freeze). Appended transactions must remain immutable.
 func (b *EntryBuilder) Append(tx solana.Transaction, wireSize int) ([]turbine.Entry, int, bool) {
+	// Canonical component bytes may differ from a transport-size hint. Measure
+	// once per transaction and reuse the count at flush, preserving slot budgets.
+	wire, err := tx.MarshalBinary()
+	if err != nil {
+		_ = statsd.Count(statsd.BlockProductionEntrySerializationErrors, 1, nil)
+		mlog.Log.Errorf("entry builder: cannot serialize applied transaction: %v", err)
+		return nil, 0, false
+	}
 	if wireSize <= 0 {
-		wire, err := tx.MarshalBinary()
-		if err != nil {
-			return nil, 0, false
-		}
 		wireSize = len(wire)
 	}
 
 	b.consumeReserved(wireSize)
-	if b.wouldOverflowBatch(wireSize) {
+	if b.wouldOverflowBatch(len(wire)) {
 		flushed, batchBytes := b.flushLocked()
 		b.pendingTxns = append(b.pendingTxns[:0], tx)
+		b.pendingSerializedBytes = len(wire)
 		b.pendingWire = wireSize
 		return flushed, batchBytes, true
 	}
 
 	b.pendingTxns = append(b.pendingTxns, tx)
+	b.pendingSerializedBytes += len(wire)
 	b.pendingWire += wireSize
 	return nil, 0, false
 }
 
 func (b *EntryBuilder) projectedBytes(nextWire int) int {
-	return entryBatchOverheadBytes + b.pendingWire + nextWire
+	return entryBatchOverheadBytes + b.pendingSerializedBytes + nextWire
 }
 
 // Flush emits the current pending transactions as a single PoH entry.
@@ -151,37 +157,10 @@ func (b *EntryBuilder) flushLocked() ([]turbine.Entry, int) {
 		Txns:      txns,
 	}}
 	b.entryHash = entryHash
-	batchBytes, err := marshalEntryBatchBytes(entries)
-	if err != nil {
-		return nil, 0
-	}
-	b.flushedBytes += len(batchBytes)
+	batchBytes := entryBatchOverheadBytes + b.pendingSerializedBytes
+	b.flushedBytes += batchBytes
 	b.pendingTxns = b.pendingTxns[:0]
 	b.pendingWire = 0
-	return entries, len(batchBytes)
-}
-
-func marshalEntryBatchBytes(entries []turbine.Entry) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := bin.NewEncoderWithEncoding(&buf, bin.EncodingBin)
-	if err := enc.WriteUint64(uint64(len(entries)), bin.LE); err != nil {
-		return nil, err
-	}
-	for _, entry := range entries {
-		if err := enc.WriteUint64(entry.NumHashes, bin.LE); err != nil {
-			return nil, err
-		}
-		if err := enc.WriteBytes(entry.Hash[:], false); err != nil {
-			return nil, err
-		}
-		if err := enc.WriteUint64(uint64(len(entry.Txns)), bin.LE); err != nil {
-			return nil, err
-		}
-		for i := range entry.Txns {
-			if err := entry.Txns[i].MarshalWithEncoder(enc); err != nil {
-				return nil, err
-			}
-		}
-	}
-	return buf.Bytes(), nil
+	b.pendingSerializedBytes = 0
+	return entries, batchBytes
 }
