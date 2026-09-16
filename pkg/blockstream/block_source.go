@@ -3803,20 +3803,48 @@ func (bs *BlockSource) NextBlock() *b.Block {
 // may be nil to disable decision wakeups, but must never be closed. The third
 // result distinguishes a decision wakeup from a closed stream or cancellation.
 func (bs *BlockSource) NextBlockOrAlpenglowEvent(ctx context.Context, decisionChanges <-chan struct{}) (block *b.Block, parentSwitch *AlpenglowParentSwitch, decisionChanged bool) {
+	in := bs.NextReplayInput(ctx, decisionChanges, nil, nil)
+	return in.Block, in.ParentSwitch, in.DecisionChanged
+}
+
+// ReplayInput is one wake-up of replay's wait for the next thing to do. At
+// most one field is set; the zero value means the wait context ended or the
+// source closed.
+type ReplayInput struct {
+	Block           *b.Block
+	ParentSwitch    *AlpenglowParentSwitch
+	DecisionChanged bool
+	// StreamEvent is a turbine streaming-feed wake-up (see StreamEvents).
+	StreamEvent *turbine.StreamEvent
+	// StreamTick is the streaming executor's poll timer.
+	StreamTick bool
+}
+
+// NextReplayInput is NextBlockOrAlpenglowEvent extended with the streaming
+// feed and the executor's poll timer, both of which may be nil (never fire).
+// A queued parent switch keeps its priority; among the remaining inputs the
+// choice is the runtime's, which is fine because every stream wake-up is
+// idempotent and the complete block is processed the same way whether or not
+// the feed was drained first.
+func (bs *BlockSource) NextReplayInput(ctx context.Context, decisionChanges <-chan struct{}, streamEvents <-chan turbine.StreamEvent, streamTick <-chan time.Time) ReplayInput {
 	select {
 	case event := <-bs.alpenglowParentSwitchCh:
-		return nil, &event, false
+		return ReplayInput{ParentSwitch: &event}
 	default:
 	}
 	select {
 	case event := <-bs.alpenglowParentSwitchCh:
-		return nil, &event, false
+		return ReplayInput{ParentSwitch: &event}
 	case block := <-bs.streamChan:
-		return block, nil, false
+		return ReplayInput{Block: block}
 	case <-decisionChanges:
-		return nil, nil, true
+		return ReplayInput{DecisionChanged: true}
+	case event := <-streamEvents:
+		return ReplayInput{StreamEvent: &event}
+	case <-streamTick:
+		return ReplayInput{StreamTick: true}
 	case <-ctx.Done():
-		return nil, nil, false
+		return ReplayInput{}
 	}
 }
 

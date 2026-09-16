@@ -511,6 +511,21 @@ name = "mithril"
     # Zstd decoder concurrency (defaults to NumCPU)
     # zstd_decoder_concurrency = 16
 
+    # Streaming execution (Alpenglow, native turbine only): execute a block's
+    # entry batches while its remaining shreds arrive, on a speculative bank
+    # over the executed parent. The complete block stays authoritative — the
+    # executed prefix must be the block's own transactions (pointer identity)
+    # or the bank is discarded and the block executes whole. Off by default.
+    # streaming_execution = false
+    # Execution workers per streaming group (0 = min(txpar, 4)).
+    # streaming_workers = 0
+    # Contiguous decoded batches to accumulate before a group executes
+    # (0 or 1 = execute as each batch arrives).
+    # streaming_min_group_batches = 0
+    # Discard a speculative bank whose block has not completed after this
+    # many milliseconds (0 = 2000).
+    # streaming_max_open_ms = 0
+
     # Snapshot bootstrap I/O tuning.
     # These defaults deliberately avoid flooding a single NVMe with hundreds of
     # concurrent writes. Increase cautiously on very fast multi-disk systems.

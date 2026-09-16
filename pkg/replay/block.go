@@ -1293,6 +1293,18 @@ func reconstructFeeRateGovernor(s *state.MithrilState) *sealevel.FeeRateGovernor
 func configureBlock(block *b.Block,
 	lastSlotCtx *sealevel.SlotCtx,
 	epochSchedule *sealevel.SysvarEpochSchedule) error {
+	return configureBlockFromParent(block, lastSlotCtx, epochSchedule, true)
+}
+
+// configureBlockFromParent derives the block's parent-dependent fields from
+// the executed parent context. publishGlobal also publishes the block as the
+// process-wide current slot (configureGlobalCtx); a speculative streaming
+// shell passes false so the global view keeps describing the executed
+// frontier until the complete block is configured.
+func configureBlockFromParent(block *b.Block,
+	lastSlotCtx *sealevel.SlotCtx,
+	epochSchedule *sealevel.SysvarEpochSchedule,
+	publishGlobal bool) error {
 
 	copy(block.ParentBankhash[:], lastSlotCtx.FinalBankhash)
 	block.AcctsLtHash = lastSlotCtx.AcctsLtHash
@@ -1308,7 +1320,9 @@ func configureBlock(block *b.Block,
 		block.LastBlockhash = lastSlotCtx.Blockhash
 	}
 
-	configureGlobalCtx(block)
+	if publishGlobal {
+		configureGlobalCtx(block)
+	}
 
 	if global.ManageLeaderSchedule() {
 		// epoch boundary. do not set leader
@@ -2330,6 +2344,9 @@ func ReplayBlocks(
 		opts.InitialAlpenglowBlockID = resumeState.ParentAlpenglowBlockID
 		opts.HasInitialAlpenglowBlockID = true
 	}
+	// Streaming execution needs the turbine batch feed; it is only ever
+	// eligible under Alpenglow with the unrooted tail (see streamingExecutor).
+	opts.TurbineStreamingExecution = StreamingExecutionCfg.Enabled && useTurbine && alpenglowMode && unrootedTailState != nil
 
 	// Apply block fetching options if provided
 	if blockFetchOpts != nil {
@@ -2500,6 +2517,47 @@ func ReplayBlocks(
 		}
 	}
 
+	// Streaming execution: while the loop waits for the next complete block,
+	// the executor runs the entry batches of frontier+1 as turbine decodes
+	// them, against a speculative bank on lastSlotCtx. The closures read the
+	// loop's state at call time. streamInput is nil when the feed is off so
+	// the wait keeps its exact pre-streaming behaviour.
+	var streamer *streamingExecutor
+	var streamInput replayStreamer
+	if blockStream.StreamEvents() != nil {
+		streamer = newStreamingExecutor(streamingDeps{
+			acctsDb:             acctsDb,
+			feed:                blockStream,
+			epochSchedule:       epochSchedule,
+			txParallelism:       txParallelism,
+			dbgOpts:             dbgOpts,
+			persistedHashes:     persistedHashes,
+			tail:                unrootedTailState,
+			transactionStatuses: transactionStatuses,
+			alpenglowClock:      alpenglowMode,
+			alpenglowMode:       alpenglowMode,
+			unrootedTailUsed:    unrootedTailState != nil,
+			lastSlotCtx:         func() *sealevel.SlotCtx { return lastSlotCtx },
+			frontier:            func() uint64 { return replayFrontier },
+			currentFeatures:     func() *features.Features { return replayCtx.CurrentFeatures },
+			currentEpoch:        func() uint64 { return currentEpoch },
+			rewardsInFlight: func() bool {
+				return partitionedRewardsInfo != nil && partitionedRewardsInfo.NumRewardPartitionsRemaining > 0
+			},
+			switchPending: func() bool { return sweepWhileWaiting != nil && sweepWhileWaiting() != nil },
+			executedBlockID: func(slot uint64) (solana.Hash, bool) {
+				if id, ok := alpenglowExecutedBlockIDs[slot]; ok {
+					return id, true
+				}
+				return global.AlpenglowBlockID(slot)
+			},
+		})
+		streamInput = streamer
+		defer streamer.shutdown()
+		mlog.Log.Infof("streaming execution enabled: workers=%d min_group_batches=%d max_open=%s",
+			StreamingExecutionCfg.workers(txParallelism), StreamingExecutionCfg.MinGroupBatches, StreamingExecutionCfg.maxOpenAge())
+	}
+
 	for {
 		// The collector is per replay attempt. Discarded candidates, skipped
 		// slots, and typed-recovery exits must never leak timings into the next
@@ -2551,8 +2609,8 @@ func ReplayBlocks(
 			}
 
 			neededAt = time.Now()
-			block, parentSwitch, certifiedSwitch = waitForAlpenglowReplayInput(ctx,
-				blockStream.NextBlockOrAlpenglowEvent, sweepWhileWaiting, decisionChanges, alpenglowSwitchPollInterval)
+			block, parentSwitch, certifiedSwitch = waitForReplayInput(ctx,
+				blockStream.NextReplayInput, sweepWhileWaiting, decisionChanges, alpenglowSwitchPollInterval, streamInput)
 			if ingress, ok := block.CompleteTurbineReplayAdmission(time.Now()); ok {
 				_ = statsd.Duration(statsd.TurbineReplayAdmission, ingress.ReplayAdmission, nil)
 				ingressTimings = &ingress
@@ -2567,6 +2625,11 @@ func ReplayBlocks(
 				mlog.Log.Infof("context cancelled while waiting for the next block: %v", ctx.Err())
 				result.WasCancelled = true
 				break
+			}
+			// Any fork switch invalidates a speculative bank above the frontier:
+			// its parent chain is about to be unwound or re-served.
+			if certifiedSwitch != nil || parentSwitch != nil {
+				streamer.discard("fork_switch")
 			}
 			if certifiedSwitch != nil {
 				if handleAlpenglowSwitch(certifiedSwitch, func() bool {
@@ -2655,6 +2718,7 @@ func ReplayBlocks(
 			// emitted suffix IDs are hard-tombstoned before that send, so discard
 			// any leaked descendant before it reaches consensus observation.
 			if blockStream.IsObjectivelyInvalidAlpenglowBlock(block) {
+				streamer.discardSlot(block.Slot, "quarantined")
 				mlog.Log.Warnf("replay: discarding quarantined Alpenglow block %s at slot %d before consensus observation",
 					solana.Hash(block.AlpenglowBlockID), block.Slot)
 				continue
@@ -2664,6 +2728,7 @@ func ReplayBlocks(
 				if validationErr := validatePreConsensusTransactionStatuses(
 					transactionStatuses, block, currentExecutedAnchorSlot(),
 				); validationErr != nil {
+					streamer.discardSlot(block.Slot, "status_validation")
 					if !IsAlreadyProcessedTransactionError(validationErr) {
 						result.Error = fmt.Errorf("pre-consensus block validation failed at slot %d: %w", block.Slot, validationErr)
 						mlog.Log.Errorf("%v", result.Error)
@@ -2685,6 +2750,7 @@ func ReplayBlocks(
 			// or any bank changes, while the selected parent is still untouched.
 			if alpenglowMode && !block.IsSkipped {
 				if validationErr := validatePreConsensusRewardCertificates(block, epochSchedule, block.AlpenglowShredVersion); validationErr != nil {
+					streamer.discardSlot(block.Slot, "reward_certificates")
 					if !IsInvalidRewardCertificateError(validationErr) {
 						result.Error = fmt.Errorf("pre-consensus reward validation failed at slot %d: %w", block.Slot, validationErr)
 						mlog.Log.Errorf("%v", result.Error)
@@ -2734,6 +2800,7 @@ func ReplayBlocks(
 			// re-fetches the certified version either way).
 			if unrootedTailState != nil {
 				if sw := switchSweeper.sweep(alpenglowExecutedBlockIDs, mithrilState.LastRootedSlot, replayFrontier); sw != nil {
+					streamer.discard("fork_switch")
 					if handleAlpenglowSwitch(sw, func() bool {
 						blockStream.RewindForAlpenglowSwitch(sw.Slot, sw.Certified)
 						return true
@@ -2789,6 +2856,7 @@ func ReplayBlocks(
 
 		// Handle skipped slots - log and continue without execution
 		if block.IsSkipped {
+			streamer.discardSlot(block.Slot, "skipped")
 			// Zero is the explicit locally executed outcome for a skip. Parent-ID
 			// gap inference is provisional; recording it lets a later certificate
 			// naming a real block trigger the same in-RAM switch as a wrong sibling.
@@ -3015,9 +3083,26 @@ func ReplayBlocks(
 			parentBankSysvars = lastSlotCtx.BankSysvars()
 		}
 		if block.FromLocalProduction {
+			streamer.discardSlot(block.Slot, "local_production")
 			lastSlotCtx, err = adoptLocalLeaderBlock(block, unrootedTailState, transactionStatuses, persistedHashes)
 		} else {
-			lastSlotCtx, err = ProcessBlock(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, unrootedTailState, transactionStatuses, alpenglowClock, parentBankSysvars)
+			// A stream open on this slot finishes the block on its speculative
+			// bank when the block proves to be what it executed; otherwise the
+			// stream is discarded and the block executes whole, exactly as
+			// without streaming.
+			streamed := false
+			if streamer.matches(block.Slot) {
+				var streamedCtx *sealevel.SlotCtx
+				streamedCtx, streamed, err = streamer.finalize(block, parentBankSysvars)
+				if streamed {
+					lastSlotCtx = streamedCtx
+				}
+			} else {
+				streamer.discard("other_block")
+			}
+			if !streamed {
+				lastSlotCtx, err = ProcessBlock(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, unrootedTailState, transactionStatuses, alpenglowClock, parentBankSysvars)
+			}
 		}
 		processBlockEnd := time.Now()
 		metrics.GlobalBlockReplay.ProcessBlock.AddTiming(processBlockEnd.Sub(processBlockStart))
