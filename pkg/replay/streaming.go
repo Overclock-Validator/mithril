@@ -155,6 +155,10 @@ type streamingExecutor struct {
 	// next slot can open as soon as its parent finishes, even when its header
 	// wake-up arrived earlier.
 	headers map[uint64]*turbine.StreamBatch
+	// retired is the last generation per slot that this executor discarded or
+	// declined; header recovery (recoverHeader) never reopens it. Pruned with
+	// headers.
+	retired map[uint64]turbine.StreamGeneration
 	ticker  *time.Ticker
 	// executeFn runs one group on the open execution; tests substitute it.
 	executeFn func(exec *blockExecution, txs []*solana.Transaction, identities *b.PreparedTransactionMessageIdentities, shouldVerifySignatures bool) error
@@ -164,6 +168,7 @@ func newStreamingExecutor(deps streamingDeps) *streamingExecutor {
 	return &streamingExecutor{
 		deps:      deps,
 		headers:   make(map[uint64]*turbine.StreamBatch),
+		retired:   make(map[uint64]turbine.StreamGeneration),
 		executeFn: (*blockExecution).executeTransactionGroup,
 	}
 }
@@ -210,6 +215,7 @@ func (s *streamingExecutor) shutdown() {
 	s.discard("shutdown")
 	s.stopTicker()
 	s.headers = make(map[uint64]*turbine.StreamBatch)
+	s.retired = make(map[uint64]turbine.StreamGeneration)
 }
 
 // handleEvent consumes one feed wake-up.
@@ -229,6 +235,8 @@ func (s *streamingExecutor) handleEvent(event turbine.StreamEvent) {
 		}
 		if event.Batch.Marker == turbine.StreamMarkerHeader && event.Batch.Start == 0 {
 			s.rememberHeader(event.Batch)
+		} else {
+			s.recoverHeader(event.Slot, event.Generation)
 		}
 		s.tryOpen()
 	case turbine.StreamCancelled:
@@ -297,12 +305,58 @@ func (s *streamingExecutor) rememberHeader(header *turbine.StreamBatch) {
 	s.pruneHeaders(frontier)
 }
 
-// pruneHeaders bounds the header map: anything at or below the frontier can
-// never open.
+// recoverHeader handles a wake-up for a batch of a generation whose header
+// this executor has not seen: the header's own wake-up may have been dropped
+// (full channel), in which case the assembler is the authoritative source.
+// Only the slot that could open next is worth the lookup — frontier+1 while
+// idle, the open stream's successor otherwise — and a generation this
+// executor already retired (discarded, or declined as ineligible) is never
+// brought back: whole-block execution owns it from then on. A recovered
+// header's ReadyAt is the lookup time, so OpenDelay reads as ~0 for it.
+func (s *streamingExecutor) recoverHeader(slot uint64, g turbine.StreamGeneration) {
+	if g.IsZero() {
+		return
+	}
+	next := s.deps.frontier() + 1
+	if s.current != nil {
+		next = s.current.slot + 1
+	}
+	if slot != next {
+		return
+	}
+	if known, ok := s.headers[slot]; ok && known.Generation == g {
+		return
+	}
+	if retired, ok := s.retired[slot]; ok && retired == g {
+		return
+	}
+	// Sorted by start: the header is the first batch, at 0, or not decoded.
+	pending := s.deps.feed.PendingStreamBatches(g, 0)
+	if len(pending) > 0 && pending[0].Start == 0 && pending[0].Marker == turbine.StreamMarkerHeader {
+		s.rememberHeader(pending[0])
+	}
+}
+
+// retire records that generation g of slot must not open again through
+// header recovery; discard and the ineligible path call it.
+func (s *streamingExecutor) retire(slot uint64, g turbine.StreamGeneration) {
+	if g.IsZero() {
+		return
+	}
+	s.retired[slot] = g
+}
+
+// pruneHeaders bounds the header and retired maps: anything at or below the
+// frontier can never open.
 func (s *streamingExecutor) pruneHeaders(frontier uint64) {
 	for slot := range s.headers {
 		if slot <= frontier {
 			delete(s.headers, slot)
+		}
+	}
+	for slot := range s.retired {
+		if slot <= frontier {
+			delete(s.retired, slot)
 		}
 	}
 }
@@ -323,6 +377,7 @@ func (s *streamingExecutor) tryOpen() {
 	if reason := s.eligibility(header); reason != "" {
 		mlog.Log.FileOnlyf("streaming: slot %d not opened (%s)", next, reason)
 		delete(s.headers, next)
+		s.retire(next, header.Generation)
 		return
 	}
 	delete(s.headers, next)
@@ -575,6 +630,7 @@ func (s *streamingExecutor) discard(reason string) {
 	cur := s.current
 	s.current = nil
 	s.stopTicker()
+	s.retire(cur.slot, cur.generation)
 	exec := cur.exec
 	if exec != nil {
 		exec.close()

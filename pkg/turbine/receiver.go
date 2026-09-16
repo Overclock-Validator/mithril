@@ -401,6 +401,12 @@ func (r *UDPReceiver) StreamStatusOf(g StreamGeneration) StreamStatus {
 	return r.assembler.StreamStatusOf(g)
 }
 
+// StreamDroppedEvents reports feed wake-ups dropped because the subscriber
+// was full; the subscriber recovers through PendingStreamBatches.
+func (r *UDPReceiver) StreamDroppedEvents() uint64 {
+	return r.assembler.StreamDroppedEvents()
+}
+
 // PendingStreamBatches returns the generation's decoded batches starting at
 // or after fromStart, in shred-index order.
 func (r *UDPReceiver) PendingStreamBatches(g StreamGeneration, fromStart uint32) []*StreamBatch {

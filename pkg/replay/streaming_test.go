@@ -446,6 +446,74 @@ func TestStreamingRememberHeaderAndTryOpenBounds(t *testing.T) {
 	require.Contains(t, h.exec.headers, uint64(42), "disabled: nothing opens")
 }
 
+// A dropped header wake-up is recovered from the assembler by the next
+// wake-up for the generation (the pending list is authoritative after a
+// drop); the usual open path follows. The lookup is only made for the slot
+// that could open next (frontier+1 while idle, the open stream's successor
+// otherwise), never for a generation this executor retired, and only finds
+// a header that is decoded.
+func TestStreamingRecoversHeaderFromPendingAfterDroppedWakeup(t *testing.T) {
+	StreamingExecutionCfg = StreamingExecutionConfig{Enabled: true}
+	defer func() { StreamingExecutionCfg = StreamingExecutionConfig{} }()
+	h := newStreamingTestHarness(t)
+	txs := transferTransactions(t, 3, 700)
+	g := turbine.NewDetachedStreamGeneration(42)
+	header := turbine.NewDetachedStreamMarker(g, 0, 0, turbine.StreamMarkerHeader, 41, h.parentID)
+	batch := turbine.NewDetachedStreamBatch(g, 1, 3, txs, verifiedIdentities(t, txs))
+	h.feed.pending[g] = []*turbine.StreamBatch{batch, header}
+
+	h.exec.recoverHeader(42, g)
+	require.Empty(t, h.exec.headers, "the open stream's own slot is not looked up (its successor is; see below)")
+
+	h.exec.discard("idle")
+	require.Equal(t, h.gen, h.exec.retired[42], "the discarded generation is retired")
+	h.exec.recoverHeader(42, g)
+	require.Same(t, header, h.exec.headers[42], "the batch wake-up recovered the decoded header")
+
+	// Declined once (the feed does not know the generation, so it is
+	// ineligible), the generation is retired and no later wake-up brings it
+	// back; whole-block execution owns the slot.
+	h.exec.tryOpen()
+	require.Nil(t, h.exec.current)
+	require.Empty(t, h.exec.headers)
+	require.Equal(t, g, h.exec.retired[42])
+	h.exec.recoverHeader(42, g)
+	require.Empty(t, h.exec.headers, "a retired generation is never recovered")
+
+	// A new generation of the slot (after a reset) is recoverable again, but
+	// only once its header is decoded.
+	renewed := turbine.NewDetachedStreamGeneration(42)
+	renewedHeader := turbine.NewDetachedStreamMarker(renewed, 0, 0, turbine.StreamMarkerHeader, 41, h.parentID)
+	h.feed.pending[renewed] = []*turbine.StreamBatch{turbine.NewDetachedStreamBatch(renewed, 1, 3, txs, verifiedIdentities(t, txs))}
+	h.exec.recoverHeader(42, renewed)
+	require.Empty(t, h.exec.headers, "a header that is not decoded yet cannot be recovered")
+	h.feed.pending[renewed] = append(h.feed.pending[renewed], renewedHeader)
+	h.exec.recoverHeader(42, renewed)
+	require.Same(t, renewedHeader, h.exec.headers[42])
+	delete(h.exec.headers, 42)
+
+	ahead := turbine.NewDetachedStreamGeneration(44)
+	h.feed.pending[ahead] = []*turbine.StreamBatch{turbine.NewDetachedStreamMarker(ahead, 0, 0, turbine.StreamMarkerHeader, 43, solana.Hash{})}
+	h.exec.recoverHeader(44, ahead)
+	require.Empty(t, h.exec.headers, "only the next slot to open is looked up")
+
+	h.exec.recoverHeader(42, turbine.StreamGeneration{})
+	require.Empty(t, h.exec.headers, "a zero generation has nothing pending")
+
+	// While a stream is open, its successor is the slot that could open next.
+	h.frontier = 42
+	h.exec.pruneHeaders(h.frontier)
+	require.Empty(t, h.exec.retired, "retirements at or below the frontier are pruned")
+	h.frontier = 41
+	h.open()
+	successor := turbine.NewDetachedStreamGeneration(43)
+	successorHeader := turbine.NewDetachedStreamMarker(successor, 0, 0, turbine.StreamMarkerHeader, 42, solana.Hash{1})
+	h.feed.pending[successor] = []*turbine.StreamBatch{successorHeader}
+	h.exec.recoverHeader(43, successor)
+	require.Same(t, successorHeader, h.exec.headers[43], "the open stream's successor is recoverable")
+	require.NotNil(t, h.exec.current, "the open stream is untouched")
+}
+
 func (h *streamingTestHarness) matchingBlock(t *testing.T, txs []*solana.Transaction) *b.Block {
 	t.Helper()
 	shell := h.env.exec.block
