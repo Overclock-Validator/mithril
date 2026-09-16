@@ -654,6 +654,9 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 
 	debugTx := len(tx.Signatures) > 0 && dbgOpts != nil && dbgOpts.IsDebugTx(tx.Signatures[0])
 	captureTx := len(tx.Signatures) > 0 && txCaptureActive()
+	// The same signature-derived decision LoadAndExecuteTransaction makes for
+	// its own timers, so a sampled transaction is recorded end to end.
+	recordTiming := txTimingSampled(tx)
 	if debugTx {
 		mlog.Log.Infof("Turning on debug logs while executing tx %s", tx.Signatures[0])
 		mlog.Log.EnableInfLogging()
@@ -679,7 +682,7 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 	computeBudgetLimits := output.ComputeBudgetLimits
 
 	// Pre-balance divergence check (uses pre-fee-deduction lamports from pure function output)
-	start := time.Now()
+	start := metrics.StartTiming(recordTiming)
 	if txMeta != nil && output.PreBalances != nil && execCtx != nil {
 		for count := uint64(0); count < uint64(len(tx.Message.AccountKeys)); count++ {
 			txAcct := execCtx.TransactionContext.Accounts.Accounts[count]
@@ -697,7 +700,7 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 			}
 		}
 	}
-	metrics.GlobalBlockReplay.PreBalanceDivergenceCheck.AddTimingSince(start)
+	metrics.GlobalBlockReplay.PreBalanceDivergenceCheck.AddSampledTimingSince(start)
 
 	// Handle transaction errors from the pure function
 	if output.ProcessingResult.TransactionError != nil {
@@ -805,7 +808,7 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 	}
 
 	// Post-balance divergence check (only if tx succeeded)
-	start = time.Now()
+	start = metrics.StartTiming(recordTiming)
 	if txMeta != nil {
 		var errBuf strings.Builder
 		for count := uint64(0); count < uint64(len(tx.Message.AccountKeys)); count++ {
@@ -830,7 +833,7 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 			panic(msg)
 		}
 	}
-	metrics.GlobalBlockReplay.PostBalanceDivergenceCheck.AddTimingSince(start)
+	metrics.GlobalBlockReplay.PostBalanceDivergenceCheck.AddSampledTimingSince(start)
 
 	// Trailing-verifier capture (successful tx): fee + status + pre AND post
 	// balances, with the native/dummy comparability mask. Read-only walk;
@@ -860,15 +863,11 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 	}
 
 	// Apply state changes to slotCtx
-	if slotCtx.Replay {
-		start = time.Now()
-	}
+	start = metrics.StartTiming(slotCtx.Replay && recordTiming)
 	if err := applySuccessfulTransactionState(slotCtx, execCtx, output.ExecutionResult); err != nil {
 		panic(fmt.Sprintf("unable to apply successful transaction %s in slot %d: %v", tx.Signatures[0], slotCtx.Slot, err))
 	}
-	if slotCtx.Replay {
-		metrics.GlobalBlockReplay.TxUpdateAccounts.AddTimingSince(start)
-	}
+	metrics.GlobalBlockReplay.TxUpdateAccounts.AddSampledTimingSince(start)
 
 	return txFeeInfo, processTransactionComputeUnits(execCtx), nil
 }

@@ -74,6 +74,7 @@ type DevelopmentConfig struct {
 	ParamArenaSizeMB              uint64      `toml:"param_arena_size_mb" mapstructure:"param_arena_size_mb"`                           // was: param-arena-size-mb
 	BorrowedAccountArenaSize      uint64      `toml:"borrowed_account_arena_size" mapstructure:"borrowed_account_arena_size"`           // was: borrowed-account-arena-size
 	UsePool                       bool        `toml:"use_pool" mapstructure:"use_pool"`                                                 // was: use-pool
+	TxTimingSampleShift           int         `toml:"tx_timing_sample_shift" mapstructure:"tx_timing_sample_shift"`                     // Replay Tx/Ix timers sampled 1 in 2^N transactions (0 = all)
 	Pprof                         PprofConfig `toml:"pprof" mapstructure:"pprof"`
 	ProgramCacheMaxMB             int         `toml:"program_cache_max_mb" mapstructure:"program_cache_max_mb"`               // Approximate SBPF program cache size in MiB
 	CommonAccountCacheMaxMB       int         `toml:"common_account_cache_max_mb" mapstructure:"common_account_cache_max_mb"` // Retained decoded account cache budget in MiB

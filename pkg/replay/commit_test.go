@@ -477,6 +477,10 @@ func TestProcessTransactionPublicationMetrics(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			previousMetrics := metrics.GlobalBlockReplay
 			defer func() { metrics.GlobalBlockReplay = previousMetrics }()
+			// Exact counts: the fixture's signature may not be in the sampled
+			// subset, and sampled observations are scaled.
+			previousShift := metrics.SetTxTimingSampleShift(0)
+			defer metrics.SetTxTimingSampleShift(previousShift)
 			slotCtx, cleanup := newCommitTestSlotCtx()
 			defer cleanup()
 			slotCtx.Replay = test.replay
@@ -517,6 +521,72 @@ func TestProcessTransactionPublicationMetrics(t *testing.T) {
 				got.TxPublishTouchedAccountState.SumNanoseconds +
 				got.TxPublishStakeVoteBookkeeping.SumNanoseconds
 			assert.LessOrEqual(t, children, got.TxUpdateAccounts.SumNanoseconds)
+		})
+	}
+}
+
+// TestProcessTransactionTimingSampling checks that the transaction-level
+// timers follow the signature-derived sampling decision: an unsampled
+// transaction records nothing (but the exact touched-account counters), a
+// sampled one records observations scaled by the sampling rate.
+func TestProcessTransactionTimingSampling(t *testing.T) {
+	previousMetrics := metrics.GlobalBlockReplay
+	defer func() { metrics.GlobalBlockReplay = previousMetrics }()
+	previousShift := metrics.SetTxTimingSampleShift(3)
+	defer metrics.SetTxTimingSampleShift(previousShift)
+
+	var sampledTx, unsampledTx *solana.Transaction
+	for i := uint64(0); i < 256 && (sampledTx == nil || unsampledTx == nil); i++ {
+		tx, err := solana.TransactionFromBytes(txfixture.MustSignedTransferWire(i))
+		require.NoError(t, err)
+		if metrics.TxTimingSampled(tx.Signatures[0][:]) {
+			if sampledTx == nil {
+				sampledTx = tx
+			}
+		} else if unsampledTx == nil {
+			unsampledTx = tx
+		}
+	}
+	require.NotNil(t, sampledTx, "no fixture transaction falls in the sampled 1/8")
+	require.NotNil(t, unsampledTx, "every fixture transaction falls in the sampled 1/8")
+
+	for _, test := range []struct {
+		name    string
+		tx      *solana.Transaction
+		sampled bool
+	}{
+		{name: "unsampled", tx: unsampledTx},
+		{name: "sampled", tx: sampledTx, sampled: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			slotCtx, cleanup := newCommitTestSlotCtx()
+			defer cleanup()
+			slotCtx.Replay = true
+			metrics.GlobalBlockReplay = metrics.BlockReplay{}
+			var sigverify sync.WaitGroup
+			feeInfo, _, err := ProcessTransaction(slotCtx, &sigverify, test.tx, nil, nil, nil, false)
+			sigverify.Wait()
+			require.NoError(t, err)
+			require.NotNil(t, feeInfo)
+
+			got := metrics.GlobalBlockReplay
+			assert.Equal(t, uint64(2), got.TxPublicationTouchedAccounts, "touched-account counters stay exact")
+			if !test.sampled {
+				assert.Zero(t, got.AccountsFromTx.Count)
+				assert.Zero(t, got.IxLoop.Count)
+				assert.Zero(t, got.GetNextIxCtx.Count)
+				assert.Zero(t, got.ExecIxNativeProgramSystem.Count)
+				assert.Zero(t, got.TxUpdateAccounts.Count)
+				assert.Zero(t, got.TxPublishTouchedAccountState.Count)
+				return
+			}
+			assert.Equal(t, uint64(8), got.AccountsFromTx.Count)
+			assert.Equal(t, uint64(8), got.IxLoop.Count)
+			assert.Equal(t, uint64(8), got.GetNextIxCtx.Count)
+			assert.Equal(t, uint64(8), got.ExecIxNativeProgramSystem.Count)
+			assert.Equal(t, uint64(8), got.TxUpdateAccounts.Count)
+			assert.Equal(t, uint64(8), got.TxPublishTouchedAccountState.Count)
+			assert.LessOrEqual(t, got.ExecIxNativeProgramSystem.SumNanoseconds, got.IxLoop.SumNanoseconds)
 		})
 	}
 }

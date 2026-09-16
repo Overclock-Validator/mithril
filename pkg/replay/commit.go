@@ -3,7 +3,6 @@ package replay
 import (
 	"fmt"
 	"sync/atomic"
-	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/fees"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
@@ -19,41 +18,32 @@ func applySuccessfulTransactionState(slotCtx *sealevel.SlotCtx, execCtx *sealeve
 		return fmt.Errorf("missing execution result while accounts delta hash is enabled")
 	}
 
-	recordMetrics := slotCtx != nil && slotCtx.Replay
+	// The touched-account counters stay exact for every replayed transaction;
+	// the publication timers follow the transaction's sampling decision
+	// (execCtx.SkipTimingMetrics) and are scaled like the other Tx-level timers.
+	recordCounters := slotCtx != nil && slotCtx.Replay
+	recordTimers := recordCounters && !execCtx.SkipTimingMetrics
 	if executionResult != nil && !accountsDeltaHashRemoved(slotCtx) {
-		var writableStart time.Time
-		if recordMetrics {
-			writableStart = time.Now()
-		}
+		writableStart := metrics.StartTiming(recordTimers)
 		slotCtx.RecordWritableAccts(executionResult.WritableAccounts)
-		if recordMetrics {
-			metrics.GlobalBlockReplay.TxPublishRecordWritableAcct.AddTimingSince(writableStart)
-		}
+		metrics.GlobalBlockReplay.TxPublishRecordWritableAcct.AddSampledTimingSince(writableStart)
 	}
 
-	var touchedStart time.Time
-	if recordMetrics {
-		touchedStart = time.Now()
-	}
+	touchedStart := metrics.StartTiming(recordTimers)
 	stats := handleModifiedAccounts(slotCtx, execCtx)
-	if recordMetrics {
-		metrics.GlobalBlockReplay.TxPublishTouchedAccountState.AddTimingSince(touchedStart)
+	metrics.GlobalBlockReplay.TxPublishTouchedAccountState.AddSampledTimingSince(touchedStart)
+	if recordCounters {
 		atomic.AddUint64(&metrics.GlobalBlockReplay.TxPublicationTouchedAccounts, stats.touchedAccounts)
 		atomic.AddUint64(&metrics.GlobalBlockReplay.TxPublicationTouchedAccountBytes, stats.touchedAccountBytes)
 	}
 
-	var stakeVoteStart time.Time
-	if recordMetrics {
-		stakeVoteStart = time.Now()
-	}
+	stakeVoteStart := metrics.StartTiming(recordTimers)
 	if executionResult == nil {
 		recordStakeAndVoteAccountsFromMetas(slotCtx, execCtx)
 	} else {
 		recordStakeAndVoteAccounts(slotCtx, execCtx, executionResult.WritableAccountSet)
 	}
-	if recordMetrics {
-		metrics.GlobalBlockReplay.TxPublishStakeVoteBookkeeping.AddTimingSince(stakeVoteStart)
-	}
+	metrics.GlobalBlockReplay.TxPublishStakeVoteBookkeeping.AddSampledTimingSince(stakeVoteStart)
 	return nil
 }
 

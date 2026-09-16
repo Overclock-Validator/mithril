@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
@@ -1300,13 +1299,13 @@ func executeLoadedProgram(execCtx *ExecutionCtx, program *sbpf.Program, syscallR
 		DisableStackFrameGaps: execCtx.Features.IsActive(features.VirtualAddressSpaceAdjustments) ||
 			!program.SbpfVersion.StackFrameGaps(),
 	}
-	start := time.Now()
+	start := metrics.StartTiming(!execCtx.SkipTimingMetrics)
 	interpreter := sbpf.NewInterpreter(program, opts)
 	defer interpreter.Finish()
-	metrics.GlobalBlockReplay.SbpfInterpreterNew.AddTimingSince(start)
-	start = time.Now()
+	metrics.GlobalBlockReplay.SbpfInterpreterNew.AddSampledTimingSince(start)
+	start = metrics.StartTiming(!execCtx.SkipTimingMetrics)
 	ret, _, runErr := interpreter.Run()
-	metrics.GlobalBlockReplay.SbpfInterpreterRun.AddTimingSince(start)
+	metrics.GlobalBlockReplay.SbpfInterpreterRun.AddSampledTimingSince(start)
 
 	if execCtx.Features.IsActive(features.VirtualAddressSpaceAdjustments) {
 		runErr = mapVirtualAddressSpaceRunErr(execCtx, runErr, inputRegions)
@@ -1337,7 +1336,7 @@ func executeLoadedProgram(execCtx *ExecutionCtx, program *sbpf.Program, syscallR
 }
 
 func executeProgramFromBytes(execCtx *ExecutionCtx, programAddr solana.PublicKey, programData []byte, syscallRegistry sbpf.SyscallRegistry) error {
-	start := time.Now()
+	start := metrics.StartTiming(!execCtx.SkipTimingMetrics)
 	loader, err := loader.NewLoaderWithSyscalls(programData, syscallRegistry, false, &execCtx.Features)
 	if err != nil {
 		return InstrErrUnsupportedProgramId
@@ -1356,7 +1355,7 @@ func executeProgramFromBytes(execCtx *ExecutionCtx, programAddr solana.PublicKey
 		addProgramToCache(execCtx, programAddr, entry)
 	}
 
-	metrics.GlobalBlockReplay.AddProgramToCache.AddTimingSince(start)
+	metrics.GlobalBlockReplay.AddProgramToCache.AddSampledTimingSince(start)
 
 	return executeLoadedProgram(execCtx, program, syscallRegistry)
 }
@@ -1520,7 +1519,7 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 		var programAcctState *UpgradeableLoaderState
 
 		if len(programAcct.Data()) == 0 {
-			start := time.Now()
+			start := metrics.StartTiming(!execCtx.SkipTimingMetrics)
 			var paTmp *accounts.Account
 			paTmp, err = execCtx.SlotCtx.GetAccount(programAcct.Key())
 
@@ -1534,7 +1533,7 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 			if err != nil {
 				return err
 			}
-			metrics.GlobalBlockReplay.GetProgramAccount.AddTimingSince(start)
+			metrics.GlobalBlockReplay.GetProgramAccount.AddSampledTimingSince(start)
 		} else {
 			programAcctState, err = UnmarshalUpgradeableLoaderState(programAcct.Data())
 			if err != nil {
@@ -1542,7 +1541,7 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 			}
 		}
 
-		start := time.Now()
+		start := metrics.StartTiming(!execCtx.SkipTimingMetrics)
 		var programCacheEntry *accountsdb.ProgramCacheEntry
 		programCacheEntry, hasLoadedProgram = execCtx.SlotCtx.AccountsDb.MaybeGetProgramFromCache(programAcctState.Program.ProgramDataAddress)
 		if hasLoadedProgram {
@@ -1551,7 +1550,7 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 			}
 			programAcctKey = programAcctState.Program.ProgramDataAddress
 			loadedProgram = programCacheEntry.Program
-			metrics.GlobalBlockReplay.GetProgramDataCached.AddTimingSince(start)
+			metrics.GlobalBlockReplay.GetProgramDataCached.AddSampledTimingSince(start)
 		} else { // program is not cached
 			programDataAcct, err := execCtx.SlotCtx.GetAccount(programAcctState.Program.ProgramDataAddress)
 			if err != nil {
@@ -1559,12 +1558,12 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 				if err != nil {
 					return InstrErrUnsupportedProgramId
 				}
-				metrics.GlobalBlockReplay.GetProgramDataUncachedAccountsDb.AddTimingSince(start)
+				metrics.GlobalBlockReplay.GetProgramDataUncachedAccountsDb.AddSampledTimingSince(start)
 			} else {
-				metrics.GlobalBlockReplay.GetProgramDataUncachedAccounts.AddTimingSince(start)
+				metrics.GlobalBlockReplay.GetProgramDataUncachedAccounts.AddSampledTimingSince(start)
 			}
 
-			start = time.Now()
+			start = metrics.StartTiming(!execCtx.SkipTimingMetrics)
 			programDataAcctState, err := UnmarshalUpgradeableLoaderState(programDataAcct.Data)
 			if err != nil {
 				return err
@@ -1584,7 +1583,7 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 			}
 			programAcctKey = programAcctState.Program.ProgramDataAddress
 			programBytes = programDataAcct.Data[upgradeableLoaderSizeOfProgramDataMetaData:]
-			metrics.GlobalBlockReplay.GetProgramDataUncachedMarshal.AddTimingSince(start)
+			metrics.GlobalBlockReplay.GetProgramDataUncachedMarshal.AddSampledTimingSince(start)
 		}
 	} else {
 		return InstrErrUnsupportedProgramId

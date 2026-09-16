@@ -38,6 +38,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
 	"github.com/Overclock-Validator/mithril/pkg/lightbringer"
 	"github.com/Overclock-Validator/mithril/pkg/lthash"
+	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/progress"
 	"github.com/Overclock-Validator/mithril/pkg/replay"
@@ -126,6 +127,9 @@ var (
 	pprofPort      int64
 	blockstorePath string
 	txParallelism  int64
+	// txTimingSampleShift: replay records the Tx/Ix-level timers for 1 in
+	// 2^shift transactions (see metrics.TxTimingSampled).
+	txTimingSampleShift int
 
 	debugTxs                       []string
 	debugAcctWrites                []string
@@ -577,6 +581,7 @@ func init() {
 	Run.Flags().BoolVar(&sigverify.Cfg.DisableShredOverlap, "sigverify-disable-shred-overlap", false,
 		"Defer Turbine transaction decoding and signature verification until all block shreds arrive")
 	Run.Flags().BoolVar(&sbpf.UsePool, "use-pool", true, "Disable to allocate fresh slices")
+	Run.Flags().IntVar(&txTimingSampleShift, "tx-timing-sample-shift", metrics.DefaultTxTimingSampleShift, "Record per-transaction/per-instruction replay timings for 1 in 2^N transactions, scaled back up (0 = every transaction, max 7)")
 	Run.Flags().IntVar(&accountsdb.StoreAccountsWorkers, "store-accounts-workers", 128, "Number of workers to write account updates")
 	Run.Flags().IntVar(&accountsdb.ProgramCacheMaxMB, "program-cache-max-mb", accountsdb.DefaultProgramCacheMaxMB, "Maximum approximate SBPF program cache size in MiB")
 	Run.Flags().IntVar(&accountsdb.CommonAccountCacheMaxMB, "common-account-cache-max-mb", accountsdb.DefaultCommonAccountCacheMaxMB, "Approximate retained decoded account cache weight budget in MiB")
@@ -1165,6 +1170,11 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	}
 	resolvedSigverifyBackend = resolved
 	sbpf.UsePool = getBool("use-pool", "tuning.use_pool")
+	txTimingSampleShift = getInt("tx-timing-sample-shift", "tuning.tx_timing_sample_shift")
+	if txTimingSampleShift < 0 || txTimingSampleShift > 7 {
+		return fmt.Errorf("tuning.tx_timing_sample_shift must be between 0 and 7")
+	}
+	metrics.SetTxTimingSampleShift(uint32(txTimingSampleShift))
 	accountsdb.StoreAccountsWorkers = getInt("store-accounts-workers", "tuning.store_accounts_workers")
 	accountsdb.ProgramCacheMaxMB = getInt("program-cache-max-mb", "tuning.program_cache_max_mb")
 	if accountsdb.ProgramCacheMaxMB <= 0 {
