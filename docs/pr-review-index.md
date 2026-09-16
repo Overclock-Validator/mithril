@@ -1,22 +1,22 @@
 # Mithril performance reviews
 
-Seven review branches are published. Runtime allocation and certificate processing target `alpenglow-dev` directly; Turbine/FEC and checkpoint/publication include PR #278 (`e1204b32`). The table below links each branch and its proposed PR description. For testing all changes together, use [7layer/review-performance-combined](https://github.com/Overclock-Validator/mithril/tree/7layer/review-performance-combined).
+Seven review branches are published. Runtime allocation, certificate processing and checkpoint/publication target `alpenglow-dev` directly; Turbine/FEC includes PR #278 (`e1204b32`). The table below links each branch and its proposed PR description. For testing all changes together, use [7layer/review-performance-combined](https://github.com/Overclock-Validator/mithril/tree/7layer/review-performance-combined).
 
-#278 was still open when checked before publication. Turbine/FEC and checkpoint/publication target its branch so their diffs exclude its changes; after it merges, retarget them to `alpenglow-dev`. Runtime allocation and certificate processing are independent and can merge first. Voting is stacked on certificates; leader packing and spool completion are stacked on Turbine/FEC.
+#278 was still open when checked before publication. Turbine/FEC targets its branch so its diff excludes those changes; after it merges, retarget it to `alpenglow-dev`. Runtime allocation, certificate processing and checkpoint/publication are independent and can merge first. Voting is stacked on certificates; leader packing and spool completion are stacked on Turbine/FEC.
 
 | Review / create link | Published head | Base | Ready description |
 |---|---|---|---|
 | [runtime: enable VM pooling and own retained vote state](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-runtime-allocation?expand=1) | `7e8d497e` | `alpenglow-dev` | [Description](review-prs/runtime-allocation.md) |
 | [alpenglow: reduce certificate verification contention](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-certificate-processing?expand=1) | `3f074edd` | `alpenglow-dev` | [Description](review-prs/certificate-processing.md) |
 | [turbine: accelerate FEC and prepare transactions during shred arrival](https://github.com/Overclock-Validator/mithril/compare/smcio%2Ffix-skipped-slot-cert-handling...7layer%2Freview-streaming-preparation?expand=1) | `039ebd67` | `smcio/fix-skipped-slot-cert-handling` | [Description](review-prs/streaming-preparation.md) |
-| [replay: prepare status publication and defer checkpoint work](https://github.com/Overclock-Validator/mithril/compare/smcio%2Ffix-skipped-slot-cert-handling...7layer%2Freview-status-checkpoint-expiry?expand=1) | `1f91ebb2` | `smcio/fix-skipped-slot-cert-handling` | [Description](review-prs/status-checkpoint-expiry.md) |
+| [replay: prepare status publication and defer checkpoint work](https://github.com/Overclock-Validator/mithril/compare/alpenglow-dev...7layer%2Freview-status-checkpoint-expiry?expand=1) | `939aa261` | `alpenglow-dev` | [Description](review-prs/status-checkpoint-expiry.md) |
 | [leader: reduce packing overhead and add near-limit block tests](https://github.com/Overclock-Validator/mithril/compare/7layer%2Freview-streaming-preparation...7layer%2Freview-leader-packing?expand=1) | `8e0409f8` | `7layer/review-streaming-preparation` | [Description](review-prs/leader-packing.md) |
 | [turbine: publish spool completion without waiting for journal writes](https://github.com/Overclock-Validator/mithril/compare/7layer%2Freview-streaming-preparation...7layer%2Fspool-completion-journal?expand=1) | `23a78a92` | `7layer/review-streaming-preparation` | [Description](review-prs/spool-completion-journal.md) |
 | [alpenglow: isolate vote delivery and bound crash recovery](https://github.com/Overclock-Validator/mithril/compare/7layer%2Freview-certificate-processing...7layer%2Freview-vote-delivery-persistence?expand=1) | `fc7d5d99` | `7layer/review-certificate-processing` | [Description](review-prs/vote-delivery-persistence.md) |
 
-The runtime review is now two commits, with redundant Viper defaults and the evidence-only document removed. The combined testing branch includes this cleanup and the certificate follow-ups at `9db7dcba`; the September 16 validation manifest below preserves the earlier tested heads.
+The runtime review is now two commits, with redundant Viper defaults and the evidence-only document removed. The combined testing branch includes this cleanup and the certificate follow-ups at `065ee9ea`; the September 16 validation manifest below preserves the earlier tested heads.
 
-The FEC producer target and component-completion correction now land in one atomic commit. The combined testing branch is a single integration commit to avoid retaining the superseded unsafe intermediate history.
+The FEC producer target and component-completion correction now land in one atomic commit. The combined testing branch starts with an atomic integration snapshot to avoid retaining the superseded unsafe intermediate history.
 
 ## Scope and order
 
