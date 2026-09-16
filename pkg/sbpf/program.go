@@ -13,6 +13,29 @@ type Program struct {
 	Entrypoint  uint64 // PC
 	Funcs       map[uint32]int64
 	SbpfVersion sbpfver.SbpfVersion
+
+	// CallTargets[pc] holds the resolved internal function target for a
+	// `call imm` slot at pc (non-static-syscall versions), or -1.
+	CallTargets []int64
+}
+
+// ResolveCallTargets precomputes CallTargets from Funcs so the interpreter
+// does not need a map lookup per call instruction.
+func (p *Program) ResolveCallTargets() {
+	if p.SbpfVersion.EnableStaticSyscalls() {
+		p.CallTargets = nil
+		return
+	}
+	targets := make([]int64, len(p.Text))
+	for pc, slot := range p.Text {
+		targets[pc] = -1
+		if slot.Op() == OpCall {
+			if t, ok := p.Funcs[slot.Uimm()]; ok {
+				targets[pc] = t
+			}
+		}
+	}
+	p.CallTargets = targets
 }
 
 func (p *Program) MemoryBytes() uint64 {
