@@ -42,7 +42,7 @@ func (p *Program) MemoryBytes() uint64 {
 	if p == nil {
 		return 0
 	}
-	total := uint64(len(p.RO)) + uint64(len(p.Text))*8
+	total := uint64(len(p.RO)) + uint64(len(p.Text))*8 + uint64(len(p.CallTargets))*8
 	if len(p.RO) == 0 {
 		total += uint64(len(p.TextBytes))
 	}
