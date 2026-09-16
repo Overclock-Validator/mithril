@@ -128,4 +128,3 @@ The production dispatch is intentionally narrow. The deep scenarios do not
 enter it and remain effectively neutral, while the near-tip workload benefits
 from repeated exactly-one-missing recoveries. The one-missing boundary also
 dropped from 144 to 5 allocations per operation.
-
