@@ -192,9 +192,12 @@ func runSequentialReference(t *testing.T, payerLamports uint64, txs []*solana.Tr
 	}
 	var sigverify sync.WaitGroup
 	var out groupExecutionOutcome
-	for _, tx := range txs {
-		feeInfo, cu, _ := ProcessTransaction(env.exec.slotCtx, &sigverify, tx, nil, nil, nil, false)
-		require.NotNil(t, feeInfo)
+	for i, tx := range txs {
+		feeInfo, cu, err := ProcessTransaction(env.exec.slotCtx, &sigverify, tx, nil, nil, nil, false)
+		// A failed transfer still returns its fee; a nil fee means the
+		// transaction was unprocessable (fee payer below rent exemption after
+		// the fee, bad blockhash...), which a valid block never contains.
+		require.NotNil(t, feeInfo, "transaction %d unprocessable: %v", i, err)
 		out.fees += feeInfo.TotalFee
 		out.cu += cu
 		out.processed++
@@ -216,10 +219,14 @@ func runSequentialReference(t *testing.T, payerLamports uint64, txs []*solana.Tr
 // enough that later transfers fail for insufficient funds, which exercises
 // fee charging on failed transactions and makes outcomes order-dependent.
 func TestExecuteTransactionGroupMatchesWholeBlock(t *testing.T) {
-	// Amounts are 999,001+ lamports each (seq%1e6+1), so with a 5 SOL-ish
-	// payer of 5,000,000 lamports the first few transfers succeed and the
-	// rest fail inside the System program while still paying their fee.
-	const payerLamports = 5_000_000
+	// Amounts are 999,001+ lamports each (seq%1e6+1) at a 5,000-lamport fee.
+	// With 3,200,000 lamports the first two transfers succeed (leaving
+	// 1,191,997) and the remaining 46 fail — the third would drop the payer
+	// below its 890,880-lamport rent-exempt minimum — while still paying
+	// their fee, ending at 961,997: every transaction stays processable (the
+	// fee payer never falls below rent exemption after the fee), which is
+	// what a valid block guarantees and what the loaders assert.
+	const payerLamports = 3_200_000
 	txs := transferTransactions(t, 48, 999_000)
 	reference := runSequentialReference(t, payerLamports, txs)
 	require.Less(t, reference.payer, uint64(payerLamports))
