@@ -116,7 +116,9 @@ func TestReadonlyPairBlockCapacityAndShredRoundTrip(t *testing.T) {
 	count, totalBytes := 0, 0
 	previous := solana.Hash{0xab}
 	for i, entries := range sink.batches {
-		raw, err := marshalEntryBatchBytes(entries)
+		component, err := turbine.NewEntryBatch(entries)
+		require.NoError(t, err)
+		raw, err := turbine.MarshalBlockComponent(component)
 		require.NoError(t, err)
 		require.Equal(t, len(raw), sink.bytes[i])
 		totalBytes += len(raw)
