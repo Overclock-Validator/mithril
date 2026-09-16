@@ -416,13 +416,15 @@ func TestInterpreter_Sha256(t *testing.T) {
 	syscalls.Register("my_memcmp", SyscallMemcmp)
 
 	var log LogRecorder
+	ctx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     ToFunc(syscalls),
+		Context:      ctx,
+		ComputeMeter: &ctx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
 
