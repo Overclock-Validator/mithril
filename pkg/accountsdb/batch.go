@@ -8,7 +8,6 @@ import (
 	"io"
 	"math"
 	"os"
-	"path/filepath"
 	"runtime"
 	"sort"
 	"sync"
@@ -253,7 +252,7 @@ func (db *AccountsDb) getAccountsBatchWithStats(ctx context.Context, slot uint64
 	err = runBatchWorkers(ctx, len(chunks), func(job int) error {
 		chunk := chunks[job]
 		jobStats := &chunkStats[job]
-		path := filepath.Join(db.AcctsDir, fmt.Sprintf("%d.%d", chunk.id.slot, chunk.id.fileID))
+		path := db.appendVecPath(chunk.id.slot, chunk.id.fileID)
 		file, openErr := os.Open(path)
 		if openErr != nil {
 			jobStats.openFailures++

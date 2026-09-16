@@ -159,7 +159,7 @@ func (db *AccountsDb) CommitBatch(
 	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i][:], keys[j][:]) < 0 })
 
 	// (2) fileId allocation; persist high-water BEFORE the first data byte (I7).
-	fileId := db.LargestFileId.Add(1)
+	fileId := db.nextFileId(0)
 	if err := db.persistLargestFileId(); err != nil {
 		return BatchCommitResult{}, err
 	}

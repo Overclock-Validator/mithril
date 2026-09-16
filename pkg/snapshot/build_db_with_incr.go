@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
@@ -40,14 +39,19 @@ func BuildAccountsDbAuto(
 	snapshotDownloadPath string,
 	fullSnapshotSlot int,
 	referenceSlot int,
-	accountsDbDir string,
+	accountsPaths []string,
 	rpcEndpoints []string,
 	blockDir string,
 	snapCfg snapshotdl.SnapshotConfig,
 	dp *progress.DualProgress,
 ) (*accountsdb.AccountsDb, *SnapshotManifest, error) {
+	if err := accountsdb.ValidateAccountsPaths(accountsPaths); err != nil {
+		return nil, nil, err
+	}
+	// The first path holds all metadata; every path holds a shard's accounts dir.
+	accountsDbDir := accountsPaths[0]
 	// Clean any leftover artifacts from previous incomplete runs (e.g., Ctrl+C)
-	CleanAccountsDbDir(accountsDbDir)
+	CleanAccountsDbDirs(accountsPaths)
 
 	mlog.Log.Infof("Parsing full snapshot manifest...")
 	manifest, err := UnmarshalManifestFromSnapshot(ctx, fullSnapshotFile, accountsDbDir)
@@ -61,16 +65,23 @@ func BuildAccountsDbAuto(
 
 	start := time.Now()
 
-	appendVecsOutputDir := filepath.Join(accountsDbDir, "accounts")
-	if err = os.MkdirAll(appendVecsOutputDir, 0775); err != nil {
-		return nil, nil, err
+	shardDirs := make([]string, len(accountsPaths))
+	for i, p := range accountsPaths {
+		shardDirs[i] = filepath.Join(p, "accounts")
+		if err = os.MkdirAll(shardDirs[i], 0775); err != nil {
+			return nil, nil, err
+		}
 	}
+	shardFiles, err := openShardBigFiles(shardDirs)
+	if err != nil {
+		return nil, nil, fmt.Errorf("opening shard big files: %w", err)
+	}
+	defer shardFiles.close() // also drain and release writers on bootstrap errors
 	logSnapshotBootstrapTuning()
 
 	defer ants.Release()
 
 	incrementalManifest := &SnapshotManifest{}
-	var largestFileId atomic.Uint64
 	wg := &sync.WaitGroup{}
 
 	numShards := snapshotIndexShards()
@@ -86,7 +97,7 @@ func BuildAccountsDbAuto(
 		entries: make([]accountsdb.StakeIndexEntry, 0, 1000000), // Pre-allocate for ~1M stake accounts
 	}
 
-	pools, err := initWorkerPools(wg, sl, manifest, incrementalManifest, accountsDbDir, &largestFileId, stakeCollector)
+	pools, err := initWorkerPools(wg, sl, manifest, incrementalManifest, shardFiles, stakeCollector)
 	if err != nil {
 		return nil, nil, fmt.Errorf("initializing worker pools: %w", err)
 	}
@@ -248,6 +259,14 @@ func BuildAccountsDbAuto(
 		return nil, nil, err
 	}
 
+	// Workers have drained; release their pools before the memory-intensive sort.
+	pools.Release()
+
+	// flush and close every shard's big file now that all appends are done
+	if err := shardFiles.close(); err != nil {
+		return nil, nil, fmt.Errorf("closing shard big files: %w", err)
+	}
+
 	// Show indexing progress for shard flush
 	indexProgress := progress.NewIndexingProgress("Flush (shard logs)")
 	indexProgress.Start(numShards)
@@ -261,12 +280,13 @@ func BuildAccountsDbAuto(
 	}
 	index.Close()
 
-	var largestFileIdBytes [8]byte
-	binary.LittleEndian.PutUint64(largestFileIdBytes[:], largestFileId.Load())
+	if err := writeShardMetadata(accountsDbDir, len(shardDirs)); err != nil {
+		return nil, nil, err
+	}
 
-	path := filepath.Join(accountsDbDir, "largest_file_id")
-	if err := os.WriteFile(path, largestFileIdBytes[:], 0644); err != nil {
-		mlog.Log.Errorf("error while writing largest file ID=%d to %s: %s", largestFileId.Load(), path, err)
+	var largestFileIdBytes [8]byte
+	binary.LittleEndian.PutUint64(largestFileIdBytes[:], uint64(len(shardDirs)-1))
+	if err := os.WriteFile(filepath.Join(accountsDbDir, "largest_file_id"), largestFileIdBytes[:], 0644); err != nil {
 		return nil, nil, err
 	}
 
@@ -298,7 +318,7 @@ func BuildAccountsDbAuto(
 	}
 	bankhashDb.Close()
 
-	accountsDb, err := accountsdb.OpenDb(accountsDbDir)
+	accountsDb, err := accountsdb.OpenDbPaths(accountsPaths)
 	if err != nil {
 		return nil, nil, err
 	}
