@@ -64,8 +64,7 @@ func SetTxTimingSampleShift(shift uint32) (previous uint32) {
 	return txTimingSampleShift.Swap(shift)
 }
 
-// TxTimingSampled reports whether the transaction with the given first
-// signature records its transaction- and instruction-level timings.
+// TxTimingSample carries a transaction-wide selection and its fixed weight.
 type TxTimingSample struct {
 	Valid   bool
 	Sampled bool

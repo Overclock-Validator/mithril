@@ -581,7 +581,7 @@ func init() {
 	Run.Flags().BoolVar(&sigverify.Cfg.DisableShredOverlap, "sigverify-disable-shred-overlap", false,
 		"Defer Turbine transaction decoding and signature verification until all block shreds arrive")
 	Run.Flags().BoolVar(&sbpf.UsePool, "use-pool", true, "Disable to allocate fresh slices")
-	Run.Flags().IntVar(&txTimingSampleShift, "tx-timing-sample-shift", metrics.DefaultTxTimingSampleShift, "Record per-transaction/per-instruction replay timings for 1 in 2^N transactions, scaled back up (0 = every transaction, max 7)")
+	Run.Flags().IntVar(&txTimingSampleShift, "tx-timing-sample-shift", metrics.DefaultTxTimingSampleShift, "Record per-transaction/per-instruction replay timings for 1 in 2^N transactions as scaled estimates (0 = exact default, max 7)")
 	Run.Flags().IntVar(&accountsdb.StoreAccountsWorkers, "store-accounts-workers", 128, "Number of workers to write account updates")
 	Run.Flags().IntVar(&accountsdb.ProgramCacheMaxMB, "program-cache-max-mb", accountsdb.DefaultProgramCacheMaxMB, "Maximum approximate SBPF program cache size in MiB")
 	Run.Flags().IntVar(&accountsdb.CommonAccountCacheMaxMB, "common-account-cache-max-mb", accountsdb.DefaultCommonAccountCacheMaxMB, "Approximate retained decoded account cache weight budget in MiB")

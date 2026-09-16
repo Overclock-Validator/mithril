@@ -12,6 +12,7 @@ import (
 	a "github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/cu"
 	"github.com/Overclock-Validator/mithril/pkg/features"
+	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/sbpf"
 	"github.com/Overclock-Validator/mithril/pkg/sbpf/loader"
 	"github.com/gagliardetto/solana-go"
@@ -111,7 +112,7 @@ func expandedProgramWorkloads(t testing.TB) []programWorkload {
 		}})
 	return cases
 }
-func workloadRunner(t testing.TB, w programWorkload, vasa bool) func() (*ExecutionCtx, error) {
+func workloadRunner(t testing.TB, w programWorkload, vasa bool, configure ...func(*ExecutionCtx)) func() (*ExecutionCtx, error) {
 	t.Helper()
 	f := features.NewFeaturesDefault()
 	if vasa {
@@ -144,6 +145,9 @@ func workloadRunner(t testing.TB, w programWorkload, vasa bool) func() (*Executi
 		ctx.SlotCtx = &SlotCtx{Slot: 1337, AccountsDb: db}
 		ctx.Log = &LogRecorder{}
 		ctx.RecordInnerInstructions = true
+		for _, f := range configure {
+			f(ctx)
+		}
 		err := ctx.ProcessInstruction(w.instruction, InstructionAcctsFromAccountMetas(w.metas, *tx), []uint64{0})
 		return ctx, err
 	}
@@ -190,6 +194,34 @@ func BenchmarkProgramWorkloads(b *testing.B) {
 				w.check(b, ctx)
 				b.ReportMetric(float64(used), "cu/op")
 			})
+		}
+	}
+}
+
+// Nested calls share the parent transaction's timing decision and weight.
+func TestNestedInstructionTimingSampling(t *testing.T) {
+	previous := metrics.GlobalBlockReplay
+	defer func() { metrics.GlobalBlockReplay = previous }()
+	for _, w := range expandedProgramWorkloads(t) {
+		if w.name != "CPI_Rust_SystemAllocate" {
+			continue
+		}
+		for _, sampled := range []bool{false, true} {
+			metrics.GlobalBlockReplay = metrics.BlockReplay{}
+			run := workloadRunner(t, w, false, func(ctx *ExecutionCtx) {
+				ctx.SkipTimingMetrics = !sampled
+				ctx.TimingSampleShift = 3
+			})
+			ctx, err := run()
+			require.NoError(t, err)
+			w.check(t, ctx)
+			want := uint64(0)
+			if sampled {
+				want = 8
+			}
+			require.Equal(t, want, metrics.GlobalBlockReplay.ExecIxNativeProgramSystem.Count)
+			require.Equal(t, want, metrics.GlobalBlockReplay.SbpfInterpreterRun.Count)
+			require.Equal(t, 2*want, metrics.GlobalBlockReplay.GetNextIxCtx.Count)
 		}
 	}
 }

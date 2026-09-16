@@ -548,9 +548,11 @@ name = "mithril"
     # Replay records the per-transaction and per-instruction timers in
     # replay_timings.jsonl (AccountsFromTx, IxLoop, ExecIxNativeProgram*,
     # SbpfInterpreterRun, TxUpdateAccounts, ...) for 1 in 2^N transactions,
-    # chosen by signature, and scales them into estimates of aggregate worker time, not wall-clock
-    # latency. JSONL metadata identifies the sampling rate and sampled count. 0 records every transaction (exact, ~2 clock reads
-    # and 2 contended atomics per timer); 3 samples one in eight. Max 7.
+    # chosen deterministically by signature. Scaled durations and counts are
+    # estimates of aggregate worker work, not wall-clock latency. Deliberately
+    # selected signatures can bias the sample. JSONL records the sampling shift,
+    # estimate marker and actual sampled transaction count. 0 is exact (default);
+    # 3 samples one in eight; valid range is 0-7. Explicit CLI zero overrides TOML.
     # Block-level timers and the touched-account counters are never sampled.
     tx_timing_sample_shift = 0
 
