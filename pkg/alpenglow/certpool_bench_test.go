@@ -25,7 +25,7 @@ func BenchmarkCertPoolFoldVerifiedBatch(b *testing.B) {
 				pool := NewCertPool(DefaultCertPoolConfig(), verifier, nil)
 				pool.SetEpochLookup(func(uint64) uint64 { return installed.Epoch })
 				tl := newTally()
-				ps := &poolSlot{verifiedHash: make(map[voteDedupKey][]solana.Hash), pendingByRank: make(map[uint16]int)}
+				ps := &poolSlot{processing: true, verifiedHash: make(map[voteDedupKey][]solana.Hash), pendingByRank: make(map[uint16]int)}
 				pool.slots[vote.Slot] = ps
 				for _, msg := range batch {
 					tl.pending[msg.Rank] = map[[sha256.Size]byte]VoteMessage{sha256.Sum256(msg.Signature): msg}
@@ -34,7 +34,7 @@ func BenchmarkCertPoolFoldVerifiedBatch(b *testing.B) {
 					pool.totalPending++
 				}
 				pool.mu.Lock()
-				pool.foldTallyLocked(vote.Slot, ps, tl, &installed)
+				pool.verifyAndFoldTallyWithLockReleased(vote.Slot, ps, tl, &installed)
 				pool.mu.Unlock()
 				if len(tl.verified) != size || tl.stake != uint64(size) || pool.totalPending != 0 {
 					b.Fatal("incomplete verified fold")

@@ -34,7 +34,7 @@ const maxUnverifiedCandidatesPerRank = 2
 // facts. Ingest (AddVote) only shape-checks, bounds buffering, and parks the
 // vote — it NEVER mutates dedupe, equivocation, disjointness, or tally state
 // that assembly or fork choice depends on. Those mutate only AFTER the BLS
-// signature verifies (foldTallyLocked). This prevents a bogus vote for a
+// signature verifies (verifyAndFoldTallyWithLockReleased). This prevents a bogus vote for a
 // victim rank from suppressing that validator's real vote (dedupe poisoning)
 // or forging equivocation evidence against an honest validator.
 //
@@ -285,7 +285,7 @@ func (p *CertPool) setForSlotLocked(slot uint64) *ValidatorSet {
 // AddVote ingests one raw (unverified) votor vote. It ONLY shape-checks, bounds
 // buffering, and parks the vote in its (type, hash) tally. It does NOT touch
 // dedupe/equivocation/disjointness state — those mutate only after the vote's
-// signature verifies (foldTallyLocked). A malformed vote, a vote outside the
+// signature verifies (verifyAndFoldTallyWithLockReleased). A malformed vote, a vote outside the
 // trusted slot window, or a vote past a memory bound is dropped.
 func (p *CertPool) AddVote(msg VoteMessage) {
 	if msg.Vote.ValidateBasic() != nil || len(msg.Signature) != BLSSignatureSize {
@@ -362,7 +362,7 @@ func (p *CertPool) AddVote(msg VoteMessage) {
 				p.foldPendingRankLocked(slot, ps, msg.Rank, set)
 			}
 			if p.slots[slot] != ps {
-				p.finishSlotLocked(slot, ps, nil)
+				p.finishSlotAndUnlock(slot, ps, nil)
 				return
 			}
 			candidates = tl.pending[msg.Rank]
@@ -376,7 +376,7 @@ func (p *CertPool) AddVote(msg VoteMessage) {
 					p.foldAllPendingLocked(slot, ps, set)
 				}
 				if p.slots[slot] != ps {
-					p.finishSlotLocked(slot, ps, nil)
+					p.finishSlotAndUnlock(slot, ps, nil)
 					return
 				}
 				if p.totalPending >= p.cfg.MaxPendingVotesTotal {
@@ -425,11 +425,11 @@ func (p *CertPool) AddVote(msg VoteMessage) {
 
 	if forceFold {
 		if set := p.setForSlotLocked(slot); set != nil {
-			p.foldTallyLocked(slot, ps, tl, set)
+			p.verifyAndFoldTallyWithLockReleased(slot, ps, tl, set)
 		}
 	}
 	emits := p.drainSlotLocked(slot, ps, false)
-	p.finishSlotLocked(slot, ps, emits)
+	p.finishSlotAndUnlock(slot, ps, emits)
 }
 
 func (p *CertPool) admissionNeedsFoldLocked(ps *poolSlot, msg VoteMessage) bool {
@@ -472,7 +472,7 @@ func (p *CertPool) drainSlotLocked(slot uint64, ps *poolSlot, flush bool) []Cert
 			if set := p.setForSlotLocked(slot); set != nil {
 				for key, tl := range ps.tallies {
 					if key.Type == VoteTypeSkip || key.Type == VoteTypeNotarize {
-						p.foldTallyLocked(slot, ps, tl, set)
+						p.verifyAndFoldTallyWithLockReleased(slot, ps, tl, set)
 					}
 				}
 			}
@@ -487,9 +487,11 @@ func (p *CertPool) drainSlotLocked(slot uint64, ps *poolSlot, flush bool) []Cert
 	return emits
 }
 
-// finishSlotLocked takes the publication barrier before making the slot
-// available to a flushing caller, then releases mu and emits certificates.
-func (p *CertPool) finishSlotLocked(slot uint64, ps *poolSlot, emits []Certificate) uint64 {
+// finishSlotAndUnlock requires p.mu held and returns with p.mu released.
+// It takes the publication barrier before making the slot available to a
+// flushing caller, then unlocks and emits certificates. Callers must not defer
+// an unlock across this call.
+func (p *CertPool) finishSlotAndUnlock(slot uint64, ps *poolSlot, emits []Certificate) uint64 {
 	if p.slots[slot] != ps {
 		emits = nil
 	}
@@ -526,7 +528,7 @@ func (p *CertPool) OnValidatorSetInstalled(epoch uint64) {
 		}
 		ps.processing = true
 		emits := p.drainSlotLocked(slot, ps, false)
-		p.finishSlotLocked(slot, ps, emits)
+		p.finishSlotAndUnlock(slot, ps, emits)
 	}
 }
 
@@ -545,7 +547,7 @@ func (p *CertPool) FlushRewardVotes(slot uint64) {
 	}
 	ps.processing = true
 	emits := p.drainSlotLocked(slot, ps, true)
-	target := p.finishSlotLocked(slot, ps, emits)
+	target := p.finishSlotAndUnlock(slot, ps, emits)
 	// Includes publication by an owner that was verifying when flush arrived.
 	p.waitForPublication(target)
 }
@@ -779,11 +781,11 @@ func (p *CertPool) maybeFoldTriggersLocked(slot uint64, ps *poolSlot) {
 		switch tk.Type {
 		case VoteTypeNotarize:
 			if foldAllNotar || foldNotar[tk.Hash] {
-				p.foldTallyLocked(slot, ps, tl, set)
+				p.verifyAndFoldTallyWithLockReleased(slot, ps, tl, set)
 			}
 		case VoteTypeSkip:
 			if foldSkip {
-				p.foldTallyLocked(slot, ps, tl, set)
+				p.verifyAndFoldTallyWithLockReleased(slot, ps, tl, set)
 			}
 		}
 	}
@@ -934,8 +936,8 @@ func (p *CertPool) maybeAssembleLocked(slot uint64, ps *poolSlot) []Certificate 
 		}
 
 		// Candidate stake crossed: fold pending votes (one pairing per tally).
-		p.foldTallyLocked(slot, ps, base, set)
-		p.foldTallyLocked(slot, ps, fb, set)
+		p.verifyAndFoldTallyWithLockReleased(slot, ps, base, set)
+		p.verifyAndFoldTallyWithLockReleased(slot, ps, fb, set)
 		if p.slots[slot] != ps {
 			return nil
 		}
@@ -963,13 +965,18 @@ func (p *CertPool) maybeAssembleLocked(slot uint64, ps *poolSlot) []Certificate 
 	return emits
 }
 
-// foldTallyLocked batch-verifies a tally's pending votes. All sign the same
+// verifyAndFoldTallyWithLockReleased requires p.mu held on entry and returns
+// with p.mu held on every path. The caller must own ps.processing. Verification
+// temporarily releases p.mu; retained slot and validator bindings are rechecked
+// after reacquiring it before any verified results are installed.
+//
+// It batch-verifies a tally's pending votes. All sign the same
 // payload, so randomized weighted pubkey/signature sums need one pairing;
 // failures bisect to isolate the bad votes (dropped + counted). Only AFTER a
 // vote verifies does it update the durable per-slot state — the vote-budget /
 // equivocation ledger (verifiedHash) and base↔fallback disjointness — so raw
 // votes can never poison those.
-func (p *CertPool) foldTallyLocked(slot uint64, ps *poolSlot, tl *tally, set *ValidatorSet) {
+func (p *CertPool) verifyAndFoldTallyWithLockReleased(slot uint64, ps *poolSlot, tl *tally, set *ValidatorSet) {
 	if p.slots[slot] != ps || tl == nil || len(tl.pending) == 0 {
 		return
 	}
@@ -1109,7 +1116,7 @@ func sameInstalledValidatorSet(a, b *ValidatorSet) bool {
 func (p *CertPool) foldPendingRankLocked(slot uint64, ps *poolSlot, rank uint16, set *ValidatorSet) {
 	for _, tl := range ps.tallies {
 		if len(tl.pending[rank]) != 0 {
-			p.foldTallyLocked(slot, ps, tl, set)
+			p.verifyAndFoldTallyWithLockReleased(slot, ps, tl, set)
 		}
 	}
 	return
@@ -1117,7 +1124,7 @@ func (p *CertPool) foldPendingRankLocked(slot uint64, ps *poolSlot, rank uint16,
 
 func (p *CertPool) foldAllPendingLocked(slot uint64, ps *poolSlot, set *ValidatorSet) {
 	for _, tl := range ps.tallies {
-		p.foldTallyLocked(slot, ps, tl, set)
+		p.verifyAndFoldTallyWithLockReleased(slot, ps, tl, set)
 	}
 	return
 }

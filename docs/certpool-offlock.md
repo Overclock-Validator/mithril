@@ -10,30 +10,14 @@ Each completed verified batch publishes promptly, outside both mutexes. New arri
 
 Point reuse is included: aggregation uses already-verified signature points, failed batches subdivide parsed members, and the unused tally public-key aggregate is removed. Randomized coefficients, signature checks, stake thresholds, equivocation budgets and paired-vote disjointness remain.
 
-## Measurements
+## Lock ownership
 
-Native AMD Ryzen 7 9700X, Go 1.26.4, with the validator and its normal continuous load running. Diagnostic processes used Nice 15; compilation used GOMAXPROCS 2. Diagnostic intervals are excluded from live comparisons.
-
-Point reuse alone, four alternating samples per version, median full pending-vote fold:
-
-| Batch size | Original | Point reuse | Time reduction |
-| --- | ---: | ---: | ---: |
-| 1 | 0.681 ms | 0.655 ms | 3.8% |
-| 8 | 2.567 ms | 2.357 ms | 8.2% |
-| 32 | 8.460 ms | 7.580 ms | 10.4% |
-| 64 | 16.637 ms | 15.127 ms | 9.1% |
-
-The concurrent diagnostic uses eight producers submitting 64 votes, samples Snapshot latency, then flushes and checks that all 64 votes published exactly once. In two alternating samples per version, Snapshot p95 was 8.57–8.72 ms with point reuse alone and 0.008–0.038 ms with off-lock verification. Benchmark ns/op includes deliberately spaced sampling; it is not production throughput.
-
-The combined build deployed September 14 at 22:46 UTC. The 45-second live trace measured 36,133 normally completed incoming calls: initial mutex wait median 1.24us, p95 3.64us, p99 9.10us and maximum 0.369ms. None waited over 1ms, versus 11,742 in the earlier baseline. Different live windows and probe overhead are limitations; this is not an equivalent end-to-end voting speedup. Verification-gate and admission-condition waits are separate from the measured initial mutex acquisition. Two durable-floor calls waited at most 1.95us.
-
-Live voting/FAST results, exact deployment evidence and raw measurements are in the workspace at `mithril-run-20260911/certpool-offlock-20260914/RESULTS.md`. Native artifacts are under `/srv/mithril-certpool-offlock-20260914`. Four TPU workers, two shred workers, GOMAXPROCS 8, reserved vote history, previous live integrations, continuous load policy and signing/payer ledgers are preserved.
-
-## Validation
-
-New deterministic race tests park real work at the verification gate and cover concurrent admission, in-flight accounting, duplicate admission, capacity wakeup, pruning, eviction, changed bindings and reward-flush waiting. Existing invalid-share cancellation, malformed signature, aggregate-certificate, equivocation, fallback and publication tests remain.
-
-Native race tests passed for Alpenglow, consensus, replay and node integration. Peer isolation tests separately passed three native runs; an intermittent timeout had reproduced on the unchanged local baseline earlier. Native vet and the application build passed. The four deployed source/test files match local hashes. Instruction probes and nearby stack/register operations were checked against old/new disassembly, normalizing linker relocations. A live sanity capture observed 133 replays and 133 notarize events with no reservation exhaustion or admission rejection.
+`verifyAndFoldTallyWithLockReleased` requires the pool lock on entry and returns
+with it held, including early exits. It releases the lock during crypto and
+revalidates slot and validator bindings after reacquiring it. The caller owns
+that slot's processing marker. `finishSlotAndUnlock` consumes lock ownership:
+it releases the lock, emits certificates and returns unlocked. Callers must not
+pair it with a deferred unlock.
 
 ## Bounded multi-scalar aggregation
 
@@ -52,36 +36,6 @@ from the full scalar field. Its public key and signature use the same
 coefficient. Entropy/aggregation errors retain the individual-verification
 fallback. Parsing, subgroup/infinity checks, failed-batch subdivision,
 publication and stake accounting are unchanged.
-
-### Local component measurements
-
-Apple M4 Pro, Go 1.26.4, one caller, GOMAXPROCS=12. Three samples per version;
-medians below compare the split branch before this change with bounded
-multi-scalar aggregation. `BenchmarkCertPoolFoldVerifiedBatch` includes parsing,
-pending-map setup, verification and tally folding; fixture signing is excluded.
-
-| Votes in fold | Scalar implementation | Bounded MultiExp |
-| --- | ---: | ---: |
-| 32 | 11.23 ms | 6.73 ms |
-| 64 | 21.26 ms | 10.61 ms |
-
-A same-binary comparison of the weighted-pairing helpers found 2-vote batches
-slower with MultiExp (1.49 → 2.04 ms) and 4-vote batches slower (2.01 → 2.44 ms).
-Those sizes therefore retain the scalar implementation in production. At 64
-votes, allocated bytes per full fold increased from approximately 225 KB to
-274 KB, although allocation count decreased from 1,204 to approximately 922.
-
-Run `go test ./pkg/alpenglow -run '^$' -bench '^BenchmarkCertPool(WeightedPairing|FoldVerifiedBatch)$' -benchmem -benchtime=500ms -count=3`.
-
-These are local component measurements; this aggregation change has not been
-deployed. Native staging measurements follow below. The earlier deployment
-measurements above describe the preceding implementation.
-The full local Alpenglow race suite and vet pass. Additional coverage checks
-invalid members at every position, wrong payloads, cancelling invalid shares
-in larger batches, and subdivision across the scalar/MultiExp boundary.
-
-The 16-vote cutoff was also measured directly: weighted pairing improved from
-5.28 ms to 3.80 ms locally and from 3.44 ms to 2.29 ms on Zen 5.
 
 ### Native staging validation
 
@@ -110,8 +64,15 @@ execution improved slightly. The final implementation therefore keeps the
 original scalar arithmetic whenever GOMAXPROCS is one. No worker-count or
 verification-admission changes accompany this optimization.
 
-Final combined native race suites, targeted adversarial tests at GOMAXPROCS=1
-and 2, vet and the validator production build passed. Native source hashes
-matched the complete local combined candidate. Live FAST, durable-root lag and
-voting latency still need a deployment comparison; these staging results do
-not establish those gains.
+## Reproduce and validate
+
+Run `go test -race ./pkg/alpenglow` for concurrency, pending-budget, stale-binding,
+invalid-share, equivocation and publication-barrier coverage.
+Run `go test ./pkg/alpenglow -run '^$' -bench '^BenchmarkCertPool(WeightedPairing|FoldVerifiedBatch)$' -benchmem -benchtime=500ms -count=3` with the same fixture on each revision.
+
+The earlier concurrent 64-vote diagnostic reduced Snapshot p95 from
+8.57–8.72 ms with point reuse alone to 0.008–0.038 ms with verification outside
+the lock. This measures reader latency, not vote throughput. The diagnostic's
+ns/op includes intentional sampling pauses. Historical component baselines,
+live observations and full qualifications are preserved in the
+[evidence archive](certificate-processing-evidence.md).
