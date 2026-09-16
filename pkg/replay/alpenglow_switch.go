@@ -1,9 +1,13 @@
 package replay
 
 import (
+	"context"
 	"fmt"
 	"sync/atomic"
+	"time"
 
+	b "github.com/Overclock-Validator/mithril/pkg/block"
+	"github.com/Overclock-Validator/mithril/pkg/blockstream"
 	consensusengine "github.com/Overclock-Validator/mithril/pkg/consensus"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/rewards"
@@ -39,34 +43,33 @@ func markVoteStakeDirty(slot uint64) {
 func resetVoteStakeDirty() { voteStakeDirtySlot.Store(0) }
 
 // parentSwitchNeedsStateUnwind distinguishes an already-executed divergence
-// from a fork that repair discovered ahead of replay. The latter only needs a
-// block-source branch replacement; replay's account state is still on the
-// common ancestor.
+// from a fork discovered ahead of the executed bank, including a certificate
+// selecting a previously skipped parent. The latter only needs a block-source
+// branch replacement; replay's account state is still on the common ancestor.
 func parentSwitchNeedsStateUnwind(switchSlot, executedAnchor uint64) bool {
 	return switchSlot <= executedAnchor
 }
 
-// Execute-on-receipt runs blocks the moment they're assembled, which means a
-// certificate can land AFTER the slot already executed and name a different
-// outcome: a sibling block we lost the shred race on, or a skip over a block
-// we ran. The switch sweep walks the executed-but-unfolded window whenever
-// new certificates arrive and reports the FIRST contradiction between an
-// executed identity and a decisive certificate.
+// Execute-on-receipt consumes blocks and provisional skips before the chain's
+// decisive outcome is known. Later certificates or newly discovered ancestry
+// can select a different sibling, skip an executed block, or require a block
+// previously consumed as a skip. The sweep walks the consumed-but-unrooted
+// window when the chain-decision version, replay tip, or rooted frontier changes
+// and reports the first contradiction.
 //
-// Until the WorkingSet unwind engine lands, the contradiction surfaces as a
-// typed error handled by the node-level recovery loop (re-replay from the
-// rooted checkpoint; repair re-fetches the certified version via the
-// block-id hints). The in-loop unwind replaces that coarse path.
+// Replay rewinds the source and, if the divergence includes executed blocks,
+// unwinds the in-RAM account-state suffix. If the retained state cannot support
+// that unwind, node-level recovery re-replays from the rooted checkpoint.
 
-// CertifiedSwitch reports an executed suffix contradicted either by a
-// decisive certificate or by an exact parent-linked speculative branch. The
+// CertifiedSwitch reports a consumed suffix contradicted either by a
+// decisive chain decision or by an exact parent-linked speculative branch. The
 // historical name is retained because node recovery treats both as the same
 // unwind/replay operation.
 type CertifiedSwitch struct {
 	Slot         uint64
 	Executed     solana.Hash // zero when the local slot was treated as skipped
-	Certified    solana.Hash // zero only for legacy skip-switch callers
-	Skip         bool        // retained for recovery/API compatibility; the sweeper no longer sets it
+	Certified    solana.Hash // zero for a finalized skip or a parent-linked switch
+	Skip         bool        // finalized skip contradicts a locally executed block
 	ParentLinked bool        // speculative child links to an older emitted ancestor
 	ParentSlot   uint64
 	ParentID     solana.Hash
@@ -88,13 +91,15 @@ func (e *CertifiedSwitch) Error() string {
 	return fmt.Sprintf("alpenglow switch: slot %d executed block %s but certificates name %s", e.Slot, e.Executed, e.Certified)
 }
 
-// alpenglowSwitchSweeper rate-gates the sweep on decision-version changes (cert
-// arrivals AND replay-derived decisiveness — parent links, finalized ancestry,
-// indirect skips, conflicts), so a contradiction that arises without a new
-// certificate is not skipped.
+// alpenglowSwitchSweeper rate-gates the sweep on decision-version, replay-tip,
+// and rooted-frontier changes. Both newly decisive ancestry and a queued skip
+// consumed after its overriding certificate must trigger correction.
 type alpenglowSwitchSweeper struct {
 	query            consensusengine.AlpenglowChainQuery
+	decisionChanges  <-chan struct{}
 	lastDecisionSeen uint64
+	lastReplayTip    uint64
+	lastRooted       uint64
 }
 
 func newAlpenglowSwitchSweeper(engine consensusengine.Engine) *alpenglowSwitchSweeper {
@@ -102,21 +107,29 @@ func newAlpenglowSwitchSweeper(engine consensusengine.Engine) *alpenglowSwitchSw
 	if !ok {
 		return nil
 	}
-	return &alpenglowSwitchSweeper{query: q}
+	s := &alpenglowSwitchSweeper{query: q}
+	if notifier, ok := engine.(consensusengine.AlpenglowChainDecisionNotifier); ok {
+		// Obtain the notification channel before any sweep reads the version.
+		// A change between that read and the source wait then remains pending.
+		s.decisionChanges = notifier.ChainDecisionChanges()
+	}
+	return s
 }
 
-// sweep walks executed identities in (lastRooted, tip] and returns the first
-// contradiction with a decisive certificate. Cheap: no-ops unless the
-// tracker accepted new certificates since the last sweep.
+// sweep walks consumed block/skip outcomes in (lastRooted, tip] and returns
+// the first contradiction with a decisive chain decision. tip includes trailing
+// skips even when the executed bank remains at an earlier slot.
 func (s *alpenglowSwitchSweeper) sweep(executed map[uint64]solana.Hash, lastRooted, tip uint64) *CertifiedSwitch {
 	if s == nil || len(executed) == 0 || tip <= lastRooted {
 		return nil
 	}
 	version := s.query.ChainDecisionVersion()
-	if version == s.lastDecisionSeen {
+	if version == s.lastDecisionSeen && tip == s.lastReplayTip && lastRooted == s.lastRooted {
 		return nil
 	}
 	s.lastDecisionSeen = version
+	s.lastReplayTip = tip
+	s.lastRooted = lastRooted
 
 	for slot := lastRooted + 1; slot <= tip; slot++ {
 		executedID, ran := executed[slot]
@@ -143,6 +156,44 @@ func (s *alpenglowSwitchSweeper) sweep(executed map[uint64]solana.Hash, lastRoot
 		}
 	}
 	return nil
+}
+
+const alpenglowSwitchPollInterval = 250 * time.Millisecond
+
+// waitForAlpenglowReplayInput keeps certificate correction live while ancestry
+// checks deliberately hold the next block. In particular, a finalized child
+// can select a parent whose slot replay already consumed as a skip. Waiting
+// for that child before checking certificates would deadlock both sides.
+// Decision notifications wake the existing sweep immediately; polling remains
+// a fallback for sources without notifications. The channel must be obtained
+// before the first sweep and must not be drained after checking the version.
+// A nil sweep preserves the ordinary blocking wait for other replay modes.
+func waitForAlpenglowReplayInput(
+	ctx context.Context,
+	next func(context.Context, <-chan struct{}) (*b.Block, *blockstream.AlpenglowParentSwitch, bool),
+	sweep func() *CertifiedSwitch,
+	decisionChanges <-chan struct{},
+	pollInterval time.Duration,
+) (*b.Block, *blockstream.AlpenglowParentSwitch, *CertifiedSwitch) {
+	if sweep == nil {
+		block, parentSwitch, _ := next(ctx, nil)
+		return block, parentSwitch, nil
+	}
+	for {
+		if ctx.Err() != nil {
+			return nil, nil, nil
+		}
+		if sw := sweep(); sw != nil {
+			return nil, nil, sw
+		}
+		waitCtx, cancel := context.WithTimeout(ctx, pollInterval)
+		block, parentSwitch, decisionChanged := next(waitCtx, decisionChanges)
+		timedOut := waitCtx.Err() == context.DeadlineExceeded
+		cancel()
+		if block != nil || parentSwitch != nil || (!decisionChanged && !timedOut) {
+			return block, parentSwitch, nil
+		}
+	}
 }
 
 // tryInLoopUnwind attempts the in-RAM fork switch: evict the wrong suffix
