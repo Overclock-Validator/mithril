@@ -1,1 +1,0 @@
-Historical native Zen5 raw benchmarks supporting docs/certpool-offlock.md. before versus stage1 compares point reuse; stage1-compare versus candidate compares verification outside the lock. Concurrent ns/op includes deliberate sampling delays and is not throughput. Production pool source is preserved by this split; see the fresh split-branch validation separately.

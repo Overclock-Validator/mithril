@@ -1,9 +1,0 @@
-goos: linux
-goarch: amd64
-pkg: github.com/Overclock-Validator/mithril/pkg/alpenglow
-cpu: AMD Ryzen 7 9700X 8-Core Processor             
-BenchmarkCertPoolFoldVerifiedBatch/votes=1         	     934	    657515 ns/op	    9688 B/op	      73 allocs/op
-BenchmarkCertPoolFoldVerifiedBatch/votes=8         	     258	   2349599 ns/op	   32155 B/op	     208 allocs/op
-BenchmarkCertPoolFoldVerifiedBatch/votes=32        	      79	   7376201 ns/op	  115313 B/op	     641 allocs/op
-BenchmarkCertPoolFoldVerifiedBatch/votes=64        	      42	  14172786 ns/op	  223616 B/op	    1193 allocs/op
-PASS
