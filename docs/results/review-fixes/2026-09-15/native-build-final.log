@@ -1,6 +1,0 @@
-Running as unit: mithril-review-build-final-20260915.service; invocation ID: f2a0b767b9084c4791e7f8566c5bd48f
-          Finished with result: success
-Main processes terminated with: code=exited, status=0/SUCCESS
-               Service runtime: 2.115s
-             CPU time consumed: 2.484s
-                   Memory peak: 529.2M (swap: 0B)

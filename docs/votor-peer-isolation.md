@@ -81,7 +81,7 @@ Deterministic regressions reproduce a fresh send following an old queue wait,
 remote closure while idle and while dequeuing, and an already-aged queue entry.
 The reconnect fixture has no reconciliation loop, so a timer cannot hide a missed
 reconnect trigger. The pre-fix failures and fresh validation are retained under
-`docs/results/review-fixes/2026-09-15`.
+[historical evidence](https://github.com/Overclock-Validator/mithril/blob/54b233ff0e27fb929644f7d53bf4a699cb590cd8/docs/results/review-fixes/2026-09-15).
 
 The signature-verification config template and its tests now belong to the
 streaming branch, which reads those settings. This standalone voting branch
