@@ -1,6 +1,6 @@
 # Mithril performance reviews
 
-Seven clean review branches are published under **7layermagik**, based on the latest PR #278 (`e1204b32`). GitHub rejected creation of the first split PR with HTTP 403 on September 16: `Resource not accessible by personal access token`. These are published branches with complete descriptions, not seven open PRs. The current token can push repository contents but could not create a pull request.
+Seven review branches are published, based on PR #278 (`e1204b32`). The table below links each branch and its proposed PR description. For testing all changes together, use [7layer/review-performance-combined](https://github.com/Overclock-Validator/mithril/tree/7layer/review-performance-combined).
 
 #278 was still open when checked before publication. The four independent reviews target its branch so their diffs exclude its changes; after it merges, retarget them to `alpenglow-dev`. Voting is stacked on certificates; leader packing and spool completion are stacked on Turbine/FEC.
 
@@ -31,4 +31,4 @@ The proposed diffs retain subsystem contracts, reusable tests/benchmarks, concis
 - [#259](https://github.com/Overclock-Validator/mithril/pull/259): older FEC-only draft. Its implementation is incorporated in the new combined Turbine branch; retain it until the replacement PR can be opened and linked.
 - [#279](https://github.com/Overclock-Validator/mithril/pull/279): older combined performance PR. Its passing CI is not validation of these newer split heads. Replace it with the focused reviews once their PRs exist.
 
-This branch is a review index and historical combined source snapshot, not a merge candidate or deployable checkout of the final integration. Use the individual published heads for review; the validation manifest identifies the recombined source. PR descriptions are mirrored here only because PR creation is permission-blocked.
+This branch is a review index and historical combined source snapshot, not a merge candidate or deployable checkout of the final integration. Use the individual published heads for review; the validation manifest identifies the recombined source. Proposed PR descriptions are maintained alongside this index.
