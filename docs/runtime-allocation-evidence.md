@@ -2,7 +2,7 @@
 
 The maintained subsystem documentation and reusable Go benchmarks describe the
 implementation and reproduction method. Historical raw results and session
-notes are retained at [the tested source snapshot](https://github.com/Overclock-Validator/mithril/blob/752ef97369e5b1614eeff64a242dfa87df673045)
+notes are retained at [the tested source snapshot](https://github.com/Overclock-Validator/mithril/tree/752ef97369e5b1614eeff64a242dfa87df673045)
 (tag `review-evidence-20260916-runtime-allocation`). They are omitted from this proposed merge.
 
 [Historical result files](https://github.com/Overclock-Validator/mithril/tree/752ef97369e5b1614eeff64a242dfa87df673045/docs/results)
