@@ -331,6 +331,12 @@ func (rig *realFeedRig) finalizeAndCompare(reference lifecycleOutcome) {
 	require.Equal(rig.t, uint64(1), record.OpenWaitLoop.Count)
 	require.Equal(rig.t, uint64(record.OpenedNanos-record.HeaderSeenNanos), record.OpenWaitLoop.SumNanoseconds, "with nothing to wait for, the whole open delay is the loop's")
 	require.Equal(rig.t, rig.mark.waitEnteredAt.UnixNano(), record.WaitEnteredNanos)
+	// Every group ran before the completion was even broadcast.
+	require.Positive(rig.t, record.LastGroupEndNanos)
+	require.LessOrEqual(rig.t, record.LastGroupEndNanos, record.FullNanos)
+	require.Zero(rig.t, record.TxLoopAfterFull.Count)
+	require.Zero(rig.t, record.GroupsStraddlingFull)
+	require.Contains(rig.t, []uint64{uint64(len(rig.legacyWires)), uint64(len(rig.allWires()))}, record.LargestGroupTransactions, "one or two groups, depending on how the batches were pulled")
 	require.Zero(rig.t, record.OpenWaitPostReplay.Count, "the header arrived after the loop was already waiting")
 	require.Equal(rig.t, record.OpenWaitLoop, record.OpenWaitDispatch, "…so the loop's delay is all dispatch")
 }

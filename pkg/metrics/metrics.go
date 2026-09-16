@@ -229,6 +229,27 @@ type StreamingExecution struct {
 	OpenWaitPostReplay    Timing
 	OpenWaitDispatch      Timing
 
+	// Groups, from the executor's per-group bookkeeping (each group is the
+	// contiguous set of decoded batches that was ready at one wake-up, or
+	// the finalize suffix):
+	//   GroupVerifyWait          time groups spent waiting for the verifier
+	//                            to finish their last batch before executing
+	//   GroupVerifyWaitAfterFull the part of that after the last shred
+	//   TxLoopAfterFull          group/suffix execution after the last shred:
+	//                            the execution FullToReplayed actually paid for
+	//   GroupsStraddlingFull     groups that started before and finished after
+	//   LargestGroupTransactions / LargestGroupBatches: the biggest group (a
+	//                            late open turns the whole backlog into one);
+	//                            Batches is 0 when that group was the suffix
+	//   LastGroupEndNanos        when the last group (or suffix) finished
+	GroupVerifyWait          Timing
+	GroupVerifyWaitAfterFull Timing
+	TxLoopAfterFull          Timing
+	GroupsStraddlingFull     uint64
+	LargestGroupTransactions uint64
+	LargestGroupBatches      uint64
+	LastGroupEndNanos        int64
+
 	// NotOpenedReason is set when the block was executed whole without a
 	// stream having opened for it: why the executor never opened one
 	// ("header_not_seen", "declined:<eligibility>", "waiting_for_parent:…").

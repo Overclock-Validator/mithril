@@ -1010,3 +1010,46 @@ func TestStreamingNoteWholeBlockReasons(t *testing.T) {
 	h.exec.pruneHeaders(h.frontier)
 	require.Empty(t, h.exec.observed)
 }
+
+// The per-group record splits verification waits and execution at the last
+// shred, so the execution FullToReplayed paid for is visible separately
+// from the work hidden behind reception.
+func TestStreamingGroupRecordSplitsAtFull(t *testing.T) {
+	t0 := time.Unix(1_700_000_000, 0)
+	at := func(ms int) time.Time { return t0.Add(time.Duration(ms) * time.Millisecond) }
+	ms := func(timing metrics.Timing) float64 { return float64(timing.SumNanoseconds) / 1e6 }
+	cur := &streamingSlot{slot: 42, groups: []streamingGroup{
+		{readyAt: at(90), verifiedAt: at(92), startedAt: at(92), finishedAt: at(120), batches: 3, transactions: 900},     // entirely before full
+		{readyAt: at(250), verifiedAt: at(310), startedAt: at(310), finishedAt: at(340), batches: 9, transactions: 5000}, // waited 60 ms for the verifier, 10 of them after full; ran after full
+		{readyAt: at(280), verifiedAt: at(281), startedAt: at(281), finishedAt: at(320), batches: 1, transactions: 300},  // straddles full
+		{readyAt: at(340), verifiedAt: at(340), startedAt: at(340), finishedAt: at(350), transactions: 40, suffix: true},
+	}}
+	var r metrics.StreamingExecution
+	cur.recordGroups(&r, at(300))
+	require.Equal(t, 63.0, ms(r.GroupVerifyWait))
+	require.Equal(t, uint64(3), r.GroupVerifyWait.Count, "the suffix has no verifier wait")
+	require.Equal(t, 10.0, ms(r.GroupVerifyWaitAfterFull))
+	require.Equal(t, uint64(1), r.GroupVerifyWaitAfterFull.Count)
+	require.Equal(t, 60.0, ms(r.TxLoopAfterFull), "30 + 20 + 10 ms of execution after the last shred")
+	require.Equal(t, uint64(3), r.TxLoopAfterFull.Count)
+	require.Equal(t, uint64(1), r.GroupsStraddlingFull)
+	require.Equal(t, uint64(5000), r.LargestGroupTransactions)
+	require.Equal(t, uint64(9), r.LargestGroupBatches)
+	require.Equal(t, at(350).UnixNano(), r.LastGroupEndNanos)
+	line := cur.groupTimeline(at(300), 3)
+	require.Contains(t, line, "[#0 b=3 tx=900 ready-210.0 verified-208.0 exec-208.0..-180.0]")
+	require.Contains(t, line, "…(1 more)")
+	require.Contains(t, line, "[#3 suffix b=0 tx=40 ready+40.0 verified+40.0 exec+40.0..+50.0]")
+	require.NotContains(t, line, "#2 ")
+
+	// No full instant (a block that did not arrive as shreds): nothing is
+	// "after full", waits and sizes still count.
+	var whole metrics.StreamingExecution
+	cur.recordGroups(&whole, time.Time{})
+	require.Equal(t, 63.0, ms(whole.GroupVerifyWait))
+	require.Zero(t, whole.GroupVerifyWaitAfterFull.Count)
+	require.Zero(t, whole.TxLoopAfterFull.Count)
+	require.Zero(t, whole.GroupsStraddlingFull)
+	require.Equal(t, uint64(5000), whole.LargestGroupTransactions)
+	require.Equal(t, at(350).UnixNano(), whole.LastGroupEndNanos)
+}
