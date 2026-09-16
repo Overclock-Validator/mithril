@@ -1,6 +1,7 @@
 package alpenglow
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -180,5 +181,72 @@ func TestCertPoolOffLockEvictionDoesNotResurrectSlot(t *testing.T) {
 	pool.FlushRewardVotes(near.Slot)
 	if len(seen) != 1 || (<-seen).Message.Vote.Slot != near.Slot || pool.Snapshot().PendingTotal != 0 {
 		t.Fatal("evicted work displaced or corrupted the nearer slot")
+	}
+}
+
+func TestCertPoolRewardFlushPriority(t *testing.T) {
+	for _, prune := range []bool{false, true} {
+		t.Run(fmt.Sprintf("prune=%t", prune), func(t *testing.T) {
+			pool, _, keys, _ := newTestPool(t)
+			vote := NewSkipVote(500)
+			// A below-threshold vote must be published by the reward flush.
+			pool.AddVote(VoteMessage{Vote: vote, Rank: 4, Signature: signTestVote(t, vote, keys[4])})
+			pool.mu.Lock()
+			ps := pool.slots[vote.Slot]
+			ps.processing = true // Hold ownership until both flushes are queued.
+			pool.mu.Unlock()
+			flush1 := certPoolAsync(func() { pool.FlushRewardVotes(vote.Slot) })
+			flush2 := certPoolAsync(func() { pool.FlushRewardVotes(vote.Slot) })
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				pool.mu.Lock()
+				waiting := ps.flushWaiting
+				pool.mu.Unlock()
+				if waiting == 2 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("flushes did not register")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			entered, release := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			t.Cleanup(func() { once.Do(func() { close(release) }) })
+			pool.SetVerifiedVoteSink(func(v VerifiedVote) {
+				if v.Message.Rank == 4 {
+					close(entered)
+					<-release
+				}
+			})
+			msg := VoteMessage{Vote: vote, Rank: 0, Signature: signTestVote(t, vote, keys[0])}
+			arrival := certPoolAsync(func() { pool.AddVote(msg) })
+			if prune {
+				pool.ObserveFloor(vote.Slot)
+			} else {
+				pool.mu.Lock()
+				ps.processing = false
+				pool.workCond.Broadcast()
+				pool.mu.Unlock()
+				waitCertPoolCall(t, entered)
+				if got := pool.Snapshot().VotesAccepted; got != 1 {
+					t.Fatalf("new arrival overtook reward flush: accepted=%d", got)
+				}
+				select {
+				case <-arrival:
+					t.Fatal("arrival escaped active flush")
+				default:
+				}
+			}
+			once.Do(func() { close(release) })
+			waitCertPoolCall(t, flush1)
+			waitCertPoolCall(t, flush2)
+			waitCertPoolCall(t, arrival)
+			pool.mu.Lock()
+			defer pool.mu.Unlock()
+			if ps.flushWaiting != 0 {
+				t.Fatalf("leaked flush waiters: %d", ps.flushWaiting)
+			}
+		})
 	}
 }

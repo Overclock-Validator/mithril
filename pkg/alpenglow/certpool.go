@@ -138,10 +138,13 @@ type tallyKey struct {
 
 type poolSlot struct {
 	// One caller owns folding for a slot while other callers may buffer votes.
-	// Both fields, like the maps below, are protected by CertPool.mu.
+	// All fields, like the maps below, are protected by CertPool.mu.
 	processing bool
-	dirty      bool
-	tallies    map[tallyKey]*tally
+	// Queued and active reward flushes take precedence over new arrivals/owners.
+	// A count preserves priority when multiple footer builders overlap.
+	flushWaiting int
+	dirty        bool
+	tallies      map[tallyKey]*tally
 	// verifiedHash tracks the block hashes a rank has cast VERIFIED votes for,
 	// per (rank, type), for equivocation/vote-budget enforcement. Populated only
 	// after signature verification — never from raw ingest — so a bogus vote can
@@ -292,6 +295,7 @@ func (p *CertPool) AddVote(msg VoteMessage) {
 		return
 	}
 	slot := msg.Vote.Slot
+	sigKey := sha256.Sum256(msg.Signature)
 
 	p.mu.Lock()
 	var ps *poolSlot
@@ -328,7 +332,8 @@ func (p *CertPool) AddVote(msg VoteMessage) {
 		// Ordinary arrivals can join the bounded pending maps during BLS work.
 		// Quota pressure and competing signatures still wait for authentication
 		// before admission, preserving the first-packet-poisoning protections.
-		if ps.processing && p.admissionNeedsFoldLocked(ps, msg) {
+		// A queued reward flush also stops new arrivals from extending its drain.
+		if ps.flushWaiting > 0 || (ps.processing && p.admissionNeedsFoldLocked(ps, msg, sigKey)) {
 			p.workCond.Wait()
 			continue
 		}
@@ -351,7 +356,6 @@ func (p *CertPool) AddVote(msg VoteMessage) {
 	// one. Different block hashes remain separate tallies.
 	forceFold := false
 	if _, done := tl.verified[msg.Rank]; !done {
-		sigKey := sha256.Sum256(msg.Signature)
 		candidates := tl.pending[msg.Rank]
 		_, duplicate := candidates[sigKey]
 		if !duplicate && ps.pendingByRank[msg.Rank] >= p.cfg.MaxPendingVotesPerRankSlot {
@@ -432,14 +436,14 @@ func (p *CertPool) AddVote(msg VoteMessage) {
 	p.finishSlotAndUnlock(slot, ps, emits)
 }
 
-func (p *CertPool) admissionNeedsFoldLocked(ps *poolSlot, msg VoteMessage) bool {
+func (p *CertPool) admissionNeedsFoldLocked(ps *poolSlot, msg VoteMessage, sigKey [sha256.Size]byte) bool {
 	tl := ps.tallies[tallyKey{Type: msg.Vote.Type, Hash: msg.Vote.BlockHash}]
 	if tl != nil {
 		if _, done := tl.verified[msg.Rank]; done {
 			return false
 		}
 		candidates := tl.pending[msg.Rank]
-		if _, duplicate := candidates[sha256.Sum256(msg.Signature)]; duplicate {
+		if _, duplicate := candidates[sigKey]; duplicate {
 			return false
 		}
 		if len(candidates) > 0 {
@@ -455,7 +459,7 @@ func (p *CertPool) admissionNeedsFoldLocked(ps *poolSlot, msg VoteMessage) bool 
 func (p *CertPool) waitForSlotLocked(slot uint64) *poolSlot {
 	for {
 		ps := p.slots[slot]
-		if ps == nil || !ps.processing {
+		if ps == nil || (!ps.processing && ps.flushWaiting == 0) {
 			return ps
 		}
 		p.workCond.Wait()
@@ -464,6 +468,8 @@ func (p *CertPool) waitForSlotLocked(slot uint64) *poolSlot {
 
 // drainSlotLocked catches arrivals buffered while the owner was outside mu.
 // Sub-threshold votes remain lazy except when preparing a reward footer.
+// Requires and returns with p.mu held, but may release it while folding;
+// ps may have been removed or replaced on return. The caller owns ps.processing.
 func (p *CertPool) drainSlotLocked(slot uint64, ps *poolSlot, flush bool) []Certificate {
 	var emits []Certificate
 	for p.slots[slot] == ps {
@@ -535,10 +541,28 @@ func (p *CertPool) OnValidatorSetInstalled(epoch uint64) {
 // FlushRewardVotes batch-verifies every pending plain skip/notarize vote for a
 // reward slot. Normal consensus verification stays lazy, but block production
 // calls this just before building the slot+8 footer so valid below-threshold
-// votes are not omitted from reward certificates.
+// votes are not omitted from reward certificates. Queued flushes take precedence
+// over new slot owners and arrivals; an existing owner finishes first. Pruning
+// can invalidate that generation, in which case the current slot is rechecked.
 func (p *CertPool) FlushRewardVotes(slot uint64) {
 	p.mu.Lock()
-	ps := p.waitForSlotLocked(slot)
+	var ps *poolSlot
+	for {
+		ps = p.slots[slot]
+		if ps == nil {
+			break
+		}
+		ps.flushWaiting++
+		for p.slots[slot] == ps && ps.processing {
+			p.workCond.Wait()
+		}
+		if p.slots[slot] == ps {
+			break
+		}
+		// Pruning or a binding change replaced this generation while waiting.
+		ps.flushWaiting--
+		p.workCond.Broadcast()
+	}
 	if ps == nil {
 		target := p.publicationTargetLocked()
 		p.mu.Unlock()
@@ -547,6 +571,7 @@ func (p *CertPool) FlushRewardVotes(slot uint64) {
 	}
 	ps.processing = true
 	emits := p.drainSlotLocked(slot, ps, true)
+	ps.flushWaiting--
 	target := p.finishSlotAndUnlock(slot, ps, emits)
 	// Includes publication by an owner that was verifying when flush arrived.
 	p.waitForPublication(target)
@@ -734,6 +759,8 @@ func meets(f Fraction, stake, total uint64) bool {
 // implementation (Agave) would. This is the ONLY fold policy: one fork-choice
 // behavior for observer and voting nodes alike; sub-trigger tallies still
 // cost nothing.
+// Requires and returns with p.mu held, but may release it while folding;
+// ps may have been removed or replaced on return. The caller owns ps.processing.
 func (p *CertPool) maybeFoldTriggersLocked(slot uint64, ps *poolSlot) {
 	if p.slots[slot] != ps {
 		return
@@ -892,6 +919,8 @@ func targetsForSlot(ps *poolSlot) []certTarget {
 // maybeAssembleLocked checks every assemblable target for the slot: folds
 // pending votes (batch verification) once candidate stake crosses the
 // threshold, and returns any newly assembled certificates for emission.
+// Requires and returns with p.mu held, but may release it while folding;
+// ps may have been removed or replaced on return. The caller owns ps.processing.
 func (p *CertPool) maybeAssembleLocked(slot uint64, ps *poolSlot) []Certificate {
 	if p.slots[slot] != ps {
 		return nil
@@ -981,11 +1010,18 @@ func (p *CertPool) verifyAndFoldTallyWithLockReleased(slot uint64, ps *poolSlot,
 		return
 	}
 	batch := make([]VoteMessage, 0, pendingCandidateCount(tl))
+	// Reuse admission keys without hashing each signature again on removal.
+	var keyStorage [64][sha256.Size]byte
+	keys := keyStorage[:0]
+	if cap(batch) > len(keyStorage) {
+		keys = make([][sha256.Size]byte, 0, cap(batch))
+	}
 	for rank, candidates := range tl.pending {
 		count := len(candidates)
 		if int(rank) < len(set.Validators) {
-			for _, msg := range candidates {
+			for key, msg := range candidates {
 				batch = append(batch, msg)
+				keys = append(keys, key)
 			}
 			continue
 		} else {
@@ -1026,9 +1062,9 @@ func (p *CertPool) verifyAndFoldTallyWithLockReleased(slot uint64, ps *poolSlot,
 		p.workCond.Broadcast()
 		return
 	}
-	for _, msg := range batch {
+	for i, msg := range batch {
 		candidates := tl.pending[msg.Rank]
-		delete(candidates, sha256.Sum256(msg.Signature))
+		delete(candidates, keys[i])
 		if len(candidates) == 0 {
 			delete(tl.pending, msg.Rank)
 		}
@@ -1113,6 +1149,8 @@ func sameInstalledValidatorSet(a, b *ValidatorSet) bool {
 		len(a.parsedPubkeys) == len(b.parsedPubkeys) && &a.parsedPubkeys[0] == &b.parsedPubkeys[0]
 }
 
+// Requires and returns with p.mu held, but may release it while folding;
+// ps may have been removed or replaced on return. The caller owns ps.processing.
 func (p *CertPool) foldPendingRankLocked(slot uint64, ps *poolSlot, rank uint16, set *ValidatorSet) {
 	for _, tl := range ps.tallies {
 		if len(tl.pending[rank]) != 0 {
@@ -1122,6 +1160,8 @@ func (p *CertPool) foldPendingRankLocked(slot uint64, ps *poolSlot, rank uint16,
 	return
 }
 
+// Requires and returns with p.mu held, but may release it while folding;
+// ps may have been removed or replaced on return. The caller owns ps.processing.
 func (p *CertPool) foldAllPendingLocked(slot uint64, ps *poolSlot, set *ValidatorSet) {
 	for _, tl := range ps.tallies {
 		p.verifyAndFoldTallyWithLockReleased(slot, ps, tl, set)
