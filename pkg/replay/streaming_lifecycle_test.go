@@ -192,7 +192,7 @@ func lifecycleOutcomeOf(t *testing.T, slotCtx *sealevel.SlotCtx, tail *lifecycle
 	t.Helper()
 	require.NotNil(t, slotCtx)
 	require.Len(t, tail.added, 1, "the bank commits exactly once")
-	require.Equal(t, lifecycleSlot, tail.added[0].slot)
+	require.Equal(t, slotCtx.Slot, tail.added[0].slot)
 	require.Equal(t, slotCtx.FinalBankhash, tail.added[0].bankhash)
 	delta := make(map[solana.PublicKey]*accounts.Account, len(tail.added[0].delta))
 	for _, acct := range tail.added[0].delta {

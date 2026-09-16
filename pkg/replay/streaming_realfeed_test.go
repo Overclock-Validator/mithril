@@ -53,6 +53,7 @@ func (f *receiverFeed) PendingStreamBatches(g turbine.StreamGeneration, from uin
 func (f *receiverFeed) PrioritizeStreamRepair(uint64) {}
 
 type realFeedRig struct {
+	slot        uint64
 	t           *testing.T
 	env         *lifecycleEnv
 	receiver    *turbine.UDPReceiver
@@ -83,7 +84,7 @@ func newRealFeedRig(t *testing.T, dest solana.PublicKey, eventBuffer int) *realF
 	t.Cleanup(func() { metrics.GlobalBlockReplay = previousMetrics })
 
 	env := newLifecycleEnvWithTable(t, dest)
-	rig := &realFeedRig{t: t, env: env, leader: solana.NewWallet().PrivateKey}
+	rig := &realFeedRig{slot: realFeedSlot, t: t, env: env, leader: solana.NewWallet().PrivateKey}
 	for i := 0; i < 4; i++ {
 		rig.legacyWires = append(rig.legacyWires, txfixture.MustSignedTransferWire(uint64(2000+i)))
 	}
@@ -204,7 +205,7 @@ func (rig *realFeedRig) configure(block *b.Block) {
 // the loop would: same parent, same content, same last-entry hash.
 func (rig *realFeedRig) reference() lifecycleOutcome {
 	block := &b.Block{
-		Slot:                      realFeedSlot,
+		Slot:                      rig.slot,
 		SourceParentSlot:          realFeedParentSlot,
 		FromLiveStream:            true,
 		AlpenglowParentBlockID:    lifecycleParentBlockID,
@@ -223,7 +224,7 @@ func (rig *realFeedRig) reference() lifecycleOutcome {
 func (rig *realFeedRig) session() *turbine.BroadcastSession {
 	return turbine.NewBroadcastSession(turbine.BroadcastSessionConfig{
 		Leader:                  rig.leader,
-		Slot:                    realFeedSlot,
+		Slot:                    rig.slot,
 		ParentSlot:              realFeedParentSlot,
 		ParentBlockID:           lifecycleParentBlockID,
 		ParentChainedMerkleRoot: solana.Hash{0xBB},
@@ -283,7 +284,7 @@ func (rig *realFeedRig) finalizeAndCompare(reference lifecycleOutcome) {
 	rig.t.Helper()
 	block := rig.block
 	require.NotNil(rig.t, block)
-	require.Equal(rig.t, realFeedSlot, block.Slot)
+	require.Equal(rig.t, rig.slot, block.Slot)
 	require.True(rig.t, block.HasAlpenglowParentBlockID)
 	require.Equal(rig.t, lifecycleParentBlockID, solana.Hash(block.AlpenglowParentBlockID))
 	require.True(rig.t, block.HasExpectedBankhash, "the footer carried the reference bank hash")
@@ -416,5 +417,32 @@ func TestStreamingRealFeedResetDiscardsAndRenews(t *testing.T) {
 	require.False(t, firstGeneration == rig.exec.current.generation, "a re-assembled slot is a new generation")
 	rig.broadcastCompletion(session, reference.bankhash)
 	rig.drive(func() bool { return rig.block != nil }, "the complete block")
+	rig.finalizeAndCompare(reference)
+}
+
+// The child executes on parent 7 while slots 8..11 are unresolved. Consuming
+// those skips advances only the frontier; the completed child must still
+// produce exactly the whole-block bank hash, accounts, fees and CU.
+func TestStreamingRealFeedAcrossSkippedSlots(t *testing.T) {
+	rig := newRealFeedRig(t, solana.PublicKey{0xF1}, 64)
+	rig.slot += 4
+	frontier := uint64(realFeedParentSlot)
+	rig.exec.deps.frontier = func() uint64 { return frontier }
+	reference := rig.reference()
+	session := rig.session()
+	rig.broadcastPrefix(session)
+	rig.drive(func() bool { return rig.executedPrefix() == len(rig.allWires()) }, "prefix across unresolved skips")
+	require.Equal(t, uint64(realFeedParentSlot), frontier, "speculation does not certify skips or advance replay")
+	require.False(t, rig.receiver.SlotCompleted(rig.slot))
+	cur := rig.exec.current
+	for slot := frontier + 1; slot < rig.slot; slot++ {
+		rig.exec.beforeBlock(&b.Block{Slot: slot, IsSkipped: true})
+		rig.exec.discardSlot(slot, "skipped")
+		frontier = slot
+		rig.exec.handleTick()
+		require.Same(t, cur, rig.exec.current)
+	}
+	rig.broadcastCompletion(session, reference.bankhash)
+	rig.drive(func() bool { return rig.block != nil }, "completed child after skips")
 	rig.finalizeAndCompare(reference)
 }

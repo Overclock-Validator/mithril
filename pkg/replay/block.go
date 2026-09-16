@@ -2714,6 +2714,11 @@ func ReplayBlocks(
 				continue
 			}
 
+			// A speculative stream may span unresolved slots on the last bank.
+			// An actual intervening block invalidates that assumption before any
+			// validation or bank work can observe speculative global state.
+			streamer.beforeBlock(block)
+
 			// An in-flight source send can race the first quarantine drain. Exact
 			// emitted suffix IDs are hard-tombstoned before that send, so discard
 			// any leaked descendant before it reaches consensus observation.

@@ -449,8 +449,7 @@ func TestStreamingRememberHeaderAndTryOpenBounds(t *testing.T) {
 // A dropped header wake-up is recovered from the assembler by the next
 // wake-up for the generation (the pending list is authoritative after a
 // drop); the usual open path follows. The lookup is only made for the slot
-// that could open next (frontier+1 while idle, the open stream's successor
-// otherwise), never for a generation this executor retired, and only finds
+// within the bounded lookahead, never for a generation this executor retired, and only finds
 // a header that is decoded.
 func TestStreamingRecoversHeaderFromPendingAfterDroppedWakeup(t *testing.T) {
 	StreamingExecutionCfg = StreamingExecutionConfig{Enabled: true}
@@ -495,7 +494,8 @@ func TestStreamingRecoversHeaderFromPendingAfterDroppedWakeup(t *testing.T) {
 	ahead := turbine.NewDetachedStreamGeneration(44)
 	h.feed.pending[ahead] = []*turbine.StreamBatch{turbine.NewDetachedStreamMarker(ahead, 0, 0, turbine.StreamMarkerHeader, 43, solana.Hash{})}
 	h.exec.recoverHeader(44, ahead)
-	require.Empty(t, h.exec.headers, "only the next slot to open is looked up")
+	require.Contains(t, h.exec.headers, uint64(44), "nearby header can be recovered before its parent is ready")
+	delete(h.exec.headers, 44)
 
 	h.exec.recoverHeader(42, turbine.StreamGeneration{})
 	require.Empty(t, h.exec.headers, "a zero generation has nothing pending")
@@ -813,4 +813,39 @@ func TestStreamingConfigDefaults(t *testing.T) {
 	require.Equal(t, defaultStreamingMaxAge, cfg.maxOpenAge())
 	cfg.MaxOpenAge = time.Second
 	require.Equal(t, time.Second, cfg.maxOpenAge())
+}
+
+func TestStreamingGapSelectionAndSafety(t *testing.T) {
+	h := newStreamingTestHarness(t)
+	defer h.exec.shutdown()
+	makeHeader := func(slot, parent uint64, id solana.Hash) *turbine.StreamBatch {
+		g := turbine.NewDetachedStreamGeneration(slot)
+		h.feed.status[g] = turbine.StreamActive
+		return turbine.NewDetachedStreamMarker(g, 0, 0, turbine.StreamMarkerHeader, parent, id)
+	}
+	gap := makeHeader(46, 41, h.parentID)
+	h.exec.headers[46] = gap
+	h.exec.headers[48] = makeHeader(48, 41, h.parentID)
+	h.exec.headers[44] = makeHeader(44, 43, h.parentID)
+	require.Same(t, gap, h.exec.nextHeader(h.frontier), "earliest direct child, not a grandchild")
+	require.Empty(t, h.exec.eligibility(gap))
+	require.NotEmpty(t, h.exec.eligibility(makeHeader(46, 41, solana.Hash{99})))
+	require.NotEmpty(t, h.exec.eligibility(makeHeader(46, 40, h.parentID)))
+	require.NotEmpty(t, h.exec.eligibility(makeHeader(74, 41, h.parentID)), "lookahead is bounded")
+	h.exec.deps.switchPending = func() bool { return true }
+	require.Equal(t, "fork switch pending", h.exec.eligibility(gap))
+	h.exec.deps.switchPending = func() bool { return false }
+	h.exec.headers[42] = makeHeader(42, 41, h.parentID)
+	require.Equal(t, uint64(42), h.exec.nextHeader(h.frontier).Slot)
+
+	// A late real bank in the unresolved gap must restore all speculative
+	// state before that bank is validated, configured or executed.
+	h.exec.current.slot = 46
+	cur := h.exec.current
+	h.exec.beforeBlock(&b.Block{Slot: 42, IsSkipped: true})
+	require.Same(t, cur, h.exec.current)
+	h.exec.beforeBlock(&b.Block{Slot: 42})
+	require.Nil(t, h.exec.current)
+	require.True(t, cur.exec.closed)
+	require.Equal(t, h.gen, h.exec.retired[46])
 }

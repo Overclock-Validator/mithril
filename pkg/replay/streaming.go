@@ -60,6 +60,9 @@ const (
 	defaultStreamingWorkers = 4
 	defaultStreamingMaxAge  = 2 * time.Second
 	streamingPollInterval   = 5 * time.Millisecond
+	// Bound speculation across missing leaders; this never advances replay
+	// or establishes that the intervening slots are actually skipped.
+	streamingMaxSlotDistance = uint64(32)
 	// streamingHardOpenAgeFactor bounds a completed-but-not-yet-emitted stream
 	// to this multiple of MaxOpenAge.
 	streamingHardOpenAgeFactor = 10
@@ -206,6 +209,14 @@ func (s *streamingExecutor) matches(slot uint64) bool {
 	return s != nil && s.current != nil && s.current.slot == slot
 }
 
+// beforeBlock restores speculative state before an intervening real bank is
+// observed. A skip has no bank changes and must not throw away a later child.
+func (s *streamingExecutor) beforeBlock(block *b.Block) {
+	if s != nil && s.current != nil && !block.IsSkipped && !s.matches(block.Slot) {
+		s.discard("other_block")
+	}
+}
+
 // shutdown discards any open stream; the replay loop defers it so an exiting
 // attempt never leaves a speculative bank (and its watchdog) behind.
 func (s *streamingExecutor) shutdown() {
@@ -308,8 +319,7 @@ func (s *streamingExecutor) rememberHeader(header *turbine.StreamBatch) {
 // recoverHeader handles a wake-up for a batch of a generation whose header
 // this executor has not seen: the header's own wake-up may have been dropped
 // (full channel), in which case the assembler is the authoritative source.
-// Only the slot that could open next is worth the lookup — frontier+1 while
-// idle, the open stream's successor otherwise — and a generation this
+// Only slots within the bounded lookahead are worth the lookup, and a generation this
 // executor already retired (discarded, or declined as ineligible) is never
 // brought back: whole-block execution owns it from then on. A recovered
 // header's ReadyAt is the lookup time, so OpenDelay reads as ~0 for it.
@@ -317,11 +327,11 @@ func (s *streamingExecutor) recoverHeader(slot uint64, g turbine.StreamGeneratio
 	if g.IsZero() {
 		return
 	}
-	next := s.deps.frontier() + 1
+	anchor := s.deps.frontier()
 	if s.current != nil {
-		next = s.current.slot + 1
+		anchor = s.current.slot
 	}
-	if slot != next {
+	if slot <= anchor || slot-anchor > streamingMaxSlotDistance {
 		return
 	}
 	if known, ok := s.headers[slot]; ok && known.Generation == g {
@@ -361,27 +371,49 @@ func (s *streamingExecutor) pruneHeaders(frontier uint64) {
 	}
 }
 
-// tryOpen opens a stream for frontier+1 when its header is known and every
-// eligibility condition holds.
+// nextHeader prefers the next slot, otherwise the earliest nearby child of
+// the executed bank. A header is only a speculation hint: it does not prove
+// skips, advance the frontier, or authorize publication or voting.
+func (s *streamingExecutor) nextHeader(frontier uint64) *turbine.StreamBatch {
+	last := s.deps.lastSlotCtx()
+	var selected *turbine.StreamBatch
+	for slot, header := range s.headers {
+		if slot <= frontier || slot-frontier > streamingMaxSlotDistance {
+			continue
+		}
+		if slot-frontier != 1 && (last == nil || header.ParentSlot != last.Slot) {
+			continue
+		}
+		if selected == nil || slot < selected.Slot {
+			selected = header
+		}
+	}
+	return selected
+}
+
+// tryOpen may speculate across unresolved slots only on the exact executed
+// parent. Real intervening blocks and fork switches discard the overlay;
+// skip records leave it alone. The complete-block handshake stays mandatory.
 func (s *streamingExecutor) tryOpen() {
 	if s == nil || s.current != nil || !StreamingExecutionCfg.Enabled {
 		return
 	}
 	frontier := s.deps.frontier()
 	s.pruneHeaders(frontier)
-	next := frontier + 1
-	header, ok := s.headers[next]
-	if !ok {
+	for {
+		header := s.nextHeader(frontier)
+		if header == nil {
+			return
+		}
+		delete(s.headers, header.Slot)
+		if reason := s.eligibility(header); reason != "" {
+			mlog.Log.FileOnlyf("streaming: slot %d not opened (%s)", header.Slot, reason)
+			s.retire(header.Slot, header.Generation)
+			continue
+		}
+		s.openStream(header)
 		return
 	}
-	if reason := s.eligibility(header); reason != "" {
-		mlog.Log.FileOnlyf("streaming: slot %d not opened (%s)", next, reason)
-		delete(s.headers, next)
-		s.retire(next, header.Generation)
-		return
-	}
-	delete(s.headers, next)
-	s.openStream(header)
 }
 
 // eligibility returns an empty string when a stream may open on header, or
@@ -398,7 +430,7 @@ func (s *streamingExecutor) eligibility(header *turbine.StreamBatch) string {
 	if last == nil {
 		return "no executed parent context"
 	}
-	if frontier := d.frontier(); header.Slot != frontier+1 || header.ParentSlot != last.Slot {
+	if frontier := d.frontier(); header.Slot <= frontier || header.Slot-frontier > streamingMaxSlotDistance || header.ParentSlot != last.Slot {
 		return fmt.Sprintf("slot %d on parent %d does not extend the executed frontier %d (parent context %d)", header.Slot, header.ParentSlot, frontier, last.Slot)
 	}
 	executedID, ok := d.executedBlockID(last.Slot)
