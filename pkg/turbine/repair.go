@@ -304,8 +304,9 @@ type RepairPeerReport struct {
 }
 
 type repairClient struct {
-	identity   ed25519.PrivateKey
-	peerSource RepairPeerSource
+	priorityWake chan struct{} // initialized before the receiver starts; coalesced hints
+	identity     ed25519.PrivateKey
+	peerSource   RepairPeerSource
 
 	mu          sync.Mutex
 	outstanding map[repairRequestKey]outstandingRepairRequest
@@ -375,28 +376,77 @@ func newRepairClient(identity ed25519.PrivateKey, peerSource RepairPeerSource) (
 		return nil, fmt.Errorf("repair peer source is required")
 	}
 	c := &repairClient{
-		identity:    append(ed25519.PrivateKey(nil), identity...),
-		peerSource:  peerSource,
-		outstanding: make(map[repairRequestKey]outstandingRepairRequest),
-		byResponse:  make(map[repairResponseKey]repairRequestKey),
-		inflight:    make(map[shredKey]*shredInflight),
-		perPeer:     make(map[repairAddressKey]*peerRecord),
-		expiredCur:  make(map[repairResponseKey]outstandingRepairRequest, repairExpiredGenMin),
+		priorityWake: make(chan struct{}, 1),
+		identity:     append(ed25519.PrivateKey(nil), identity...),
+		peerSource:   peerSource,
+		outstanding:  make(map[repairRequestKey]outstandingRepairRequest),
+		byResponse:   make(map[repairResponseKey]repairRequestKey),
+		inflight:     make(map[shredKey]*shredInflight),
+		perPeer:      make(map[repairAddressKey]*peerRecord),
+		expiredCur:   make(map[repairResponseKey]outstandingRepairRequest, repairExpiredGenMin),
 	}
 	c.timeoutNanos.Store(int64(repairMinRequestTimeout))
 	return c, nil
 }
 
+// wakePriority does not send requests or mint rate tokens. It only asks the
+// single repair loop to reconsider newly prioritized work sooner.
+func (c *repairClient) wakePriority() {
+	select {
+	case c.priorityWake <- struct{}{}:
+	default:
+	}
+}
+
 func (c *repairClient) run(ctx context.Context, conn *net.UDPConn, assembler *SlotAssembler) {
-	ticker := time.NewTicker(repairScanInterval)
+	runRepairSchedule(ctx, c.priorityWake, repairScanInterval, 20*time.Millisecond, func() {
+		c.expireOutstanding(time.Now())
+		c.repairOnce(conn, assembler)
+	})
+}
+
+// Keep periodic scans for retries/freshness. Coalesce urgent hints and bound
+// scan frequency; all sends still use the existing token bucket, admission,
+// retry, fanout and peer budgets. The loop remains the sole sender.
+func runRepairSchedule(ctx context.Context, wake <-chan struct{}, interval, minSpacing time.Duration, scan func()) {
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	var timer *time.Timer
+	var urgent <-chan time.Time
+	var last time.Time
+	stopTimer := func() {
+		if timer != nil {
+			timer.Stop()
+		}
+		urgent = nil
+	}
+	defer stopTimer()
+	run := func() {
+		stopTimer()
+		if ctx.Err() != nil {
+			return
+		}
+		scan()
+		last = time.Now()
+	}
+	schedule := func() {
+		if delay := minSpacing - time.Since(last); delay <= 0 {
+			run()
+		} else if urgent == nil {
+			timer = time.NewTimer(delay)
+			urgent = timer.C
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			c.expireOutstanding(time.Now())
-			c.repairOnce(conn, assembler)
+			schedule()
+		case <-urgent:
+			run()
+		case <-wake:
+			schedule()
 		}
 	}
 }

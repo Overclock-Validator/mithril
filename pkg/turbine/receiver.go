@@ -379,14 +379,16 @@ func (r *UDPReceiver) PrioritizeRepairSlot(slot uint64) {
 	if r == nil || r.assembler == nil {
 		return
 	}
-	r.assembler.PrioritizeRepairSlot(slot)
+	r.PrioritizeRepairRange(slot, slot)
 }
 
 func (r *UDPReceiver) PrioritizeRepairRange(start, end uint64) {
 	if r == nil || r.assembler == nil {
 		return
 	}
-	r.assembler.PrioritizeRepairRange(start, end)
+	if r.assembler.prioritizeRepairRange(start, end) && r.repairClient != nil {
+		r.repairClient.wakePriority()
+	}
 }
 
 // SubscribeStream installs the streaming-execution feed subscriber on this

@@ -635,8 +635,13 @@ func (a *SlotAssembler) PrioritizeRepairSlot(slot uint64) {
 }
 
 func (a *SlotAssembler) PrioritizeRepairRange(start, end uint64) {
+	a.prioritizeRepairRange(start, end)
+}
+
+// Report only newly installed pins, so repeated replay hints do not wake repair.
+func (a *SlotAssembler) prioritizeRepairRange(start, end uint64) bool {
 	if start == 0 {
-		return
+		return false
 	}
 	if end < start {
 		end = start
@@ -648,11 +653,13 @@ func (a *SlotAssembler) PrioritizeRepairRange(start, end uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	changed := false
 	for slot := start; ; slot++ {
 		if _, completed := a.completedSlots[slot]; !completed {
 			if _, exists := a.priorityRepairSlots[slot]; !exists {
 				a.priorityRepairSlots[slot] = struct{}{}
 				a.priorityRepairOrder = append(a.priorityRepairOrder, slot)
+				changed = true
 			}
 		}
 		if slot == end {
@@ -660,6 +667,7 @@ func (a *SlotAssembler) PrioritizeRepairRange(start, end uint64) {
 		}
 	}
 	a.prunePriorityRepairSlotsLocked()
+	return changed
 }
 
 func (a *SlotAssembler) slotState(slot uint64, version uint16) *slotState {
