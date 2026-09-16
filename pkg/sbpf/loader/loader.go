@@ -162,7 +162,7 @@ func parseSlots(bs []byte) []sbpf.Slot {
 }
 
 func (l *Loader) getProgram() *sbpf.Program {
-	return &sbpf.Program{
+	p := &sbpf.Program{
 		RO:          l.program,
 		TextBytes:   l.text,
 		Text:        parseSlots(l.text),
@@ -171,4 +171,6 @@ func (l *Loader) getProgram() *sbpf.Program {
 		Funcs:       l.funcs,
 		SbpfVersion: l.sbpfVersion(),
 	}
+	p.ResolveCallTargets()
+	return p
 }
