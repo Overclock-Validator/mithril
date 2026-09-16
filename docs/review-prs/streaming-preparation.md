@@ -12,8 +12,8 @@ Metadata inconsistencies join existing readers and reverify the final block. Inv
 
 The first two comparisons use the preceding streaming implementation and arrivals spread over 200 ms; the last uses the preceding admission policy. They are incremental component comparisons, not #278-versus-PR or live FAST results. Ordered arrivals were roughly unchanged, and total-work p99 in the admission experiment did not improve.
 
-[Design, method and limitations](https://github.com/Overclock-Validator/mithril/blob/039ebd67ef6623b696904ad5d98434c3d92abd3f/docs/transaction_sigverify_streaming.md).
-[Design, method and limitations](https://github.com/Overclock-Validator/mithril/blob/039ebd67ef6623b696904ad5d98434c3d92abd3f/docs/out-of-order-entry-prefetch.md).
+[Design, method and limitations](https://github.com/Overclock-Validator/mithril/blob/91129784a0e6bb675a83b65f8a388739cd935aa0/docs/transaction_sigverify_streaming.md).
+[Design, method and limitations](https://github.com/Overclock-Validator/mithril/blob/91129784a0e6bb675a83b65f8a388739cd935aa0/docs/out-of-order-entry-prefetch.md).
 Fresh local race suites passed for repair, Turbine/recovery/simulator, block production, cost model, replay/blockstream, signature verification, block, stats and starter config. Combined integration validation also covers #278 and the other performance reviews. Historical native benchmarks retain their original baselines; this preparation pass ran locally, without touching the live validator.
 
 The historical #259 producer comparison on September 6 used development head `7e4e8af1`: 50,000 × 1,232-byte legacy transactions across three slots took **734.052 → 282.296 ms** on one pinned Zen 5 CPU. At an equal 30,816-byte target, it was **734.052 → 288.378 ms**. This excludes execution, admission verification, worker overlap and network delivery; it does not measure the rebased combined review. [Original FEC evidence](https://github.com/Overclock-Validator/mithril/tree/a3b16ebaaf803807ad04a7975f3eccf1c15649ea/docs/results/producer-batch/2026-09-06-zen5/alpenglow-dev-head).
@@ -26,4 +26,6 @@ Based on #278 at `e1204b32`; retarget to `alpenglow-dev` after that PR merges.
 
 [Rebased validation and exact source heads](https://github.com/Overclock-Validator/mithril/blob/7layer/review-integration-20260915/docs/results/review-preparation/2026-09-16/README.md).
 
-Separate correctness follow-up: recovered data currently receives structural/header validation but is not authenticated against the signed FEC Merkle root. This pre-existing gap affects both recovery implementations and remains unresolved by this PR.
+Recovery authentication is fixed in a separate commit: both decoders reconstruct missing coding shards, rebuild the complete Merkle tree and require its root to match the signed received root before returning data. Recovered data receives complete proofs. Tests reject leader-signed inconsistent sets (including inconsistent missing parity) and altered recovered bytes, accept valid recovery, and reproduce the original roots and recovered bytes of four captured Agave FEC sets. The unchained 1+17 layout is also covered.
+
+This correctness check has a cost: on M4 Pro (`GOMAXPROCS=2`, five 200 ms samples), the warmed one-missing-data / all-coding recovery benchmark increases from **2.47 to 30.17 µs** per FEC set. Exactly-threshold arrivals measure **104.52–118.01 µs**, including reconstruction of missing parity. These are local component measurements, not live-validator results. The all-data-present path is unchanged. [Authentication contract, Agave reference and benchmark method](https://github.com/Overclock-Validator/mithril/blob/91129784a0e6bb675a83b65f8a388739cd935aa0/docs/fec-recovery-authentication.md).
