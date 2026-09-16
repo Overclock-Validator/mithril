@@ -101,17 +101,18 @@ func newStreamingTestHarness(t *testing.T) *streamingTestHarness {
 	h.lastCtx = &sealevel.SlotCtx{Slot: 41, Epoch: env.exec.block.Epoch}
 	epochSchedule := sealevel.SysvarEpochSchedule{SlotsPerEpoch: 432000, LeaderScheduleSlotOffset: 432000, FirstNormalEpoch: 0, FirstNormalSlot: 0}
 	h.exec = newStreamingExecutor(streamingDeps{
-		feed:             feed,
-		epochSchedule:    &epochSchedule,
-		tail:             fakeUnrootedState{},
-		alpenglowMode:    true,
-		unrootedTailUsed: true,
-		lastSlotCtx:      func() *sealevel.SlotCtx { return h.lastCtx },
-		frontier:         func() uint64 { return h.frontier },
-		currentFeatures:  func() *features.Features { return env.exec.block.Features },
-		currentEpoch:     func() uint64 { return env.exec.block.Epoch },
-		rewardsInFlight:  func() bool { return false },
-		switchPending:    func() bool { return false },
+		feed:                feed,
+		epochSchedule:       &epochSchedule,
+		tail:                fakeUnrootedState{},
+		transactionStatuses: NewTransactionStatusCache(),
+		alpenglowMode:       true,
+		unrootedTailUsed:    true,
+		lastSlotCtx:         func() *sealevel.SlotCtx { return h.lastCtx },
+		frontier:            func() uint64 { return h.frontier },
+		currentFeatures:     func() *features.Features { return env.exec.block.Features },
+		currentEpoch:        func() uint64 { return env.exec.block.Epoch },
+		rewardsInFlight:     func() bool { return false },
+		switchPending:       func() bool { return false },
 		executedBlockID: func(slot uint64) (solana.Hash, bool) {
 			if slot == 41 {
 				return h.parentID, true
@@ -501,17 +502,123 @@ func TestStreamingFinalizeFallsBackOnMismatch(t *testing.T) {
 	require.False(t, h.exec.matches(block.Slot))
 }
 
+// finalizeFailureHarness prepares a stream whose executed prefix matches the
+// block (three of four transfers executed) and instruments every undo hook,
+// so a post-handshake failure can be checked for the discard contract.
+type finalizeFailureHarness struct {
+	*streamingTestHarness
+	txs           []*solana.Transaction
+	restores      int
+	voteKey       solana.PublicKey
+	stakeBefore   int
+	openedPending int
+}
+
+func newFinalizeFailureHarness(t *testing.T) *finalizeFailureHarness {
+	t.Helper()
+	h := &finalizeFailureHarness{streamingTestHarness: newStreamingTestHarness(t), voteKey: solana.PublicKey{3, 3, 3}}
+	h.txs = transferTransactions(t, 4, 1300)
+	h.exec.handleEvent(h.event(h.batch(t, 1, 3, h.txs[:3])))
+	sameTransactions(t, h.txs[:3], h.executed())
+	h.exec.current.restoreSysvarCache = func() { h.restores++ }
+	slotCtx := h.env.exec.slotCtx
+	slotCtx.DeferVoteCachePublication = true
+	slotCtx.TrackProgramCacheAdds = true
+	putVoteCacheItem(slotCtx, h.voteKey, &sealevel.VoteStateVersions{})
+	slotCtx.RecordProgramCacheAdd(solana.PublicKey{4})
+	h.stakeBefore = len(global.PendingStakeEntriesSnapshot())
+	global.EnqueuePendingStakePubkey(h.env.exec.block.Slot, solana.PublicKey{5})
+	return h
+}
+
+func (h *finalizeFailureHarness) assertUndone(t *testing.T, reason string) {
+	t.Helper()
+	require.Nil(t, h.exec.current, "the stream no longer owns a bank")
+	require.True(t, h.env.exec.closed, "the execution is closed")
+	require.Equal(t, reason, h.discardReason())
+	require.Equal(t, 1, h.restores, "the legacy sysvar cache is restored once")
+	require.Nil(t, global.VoteCacheItem(h.voteKey), "unpublished vote-cache entries never reach the global cache")
+	require.Nil(t, h.env.exec.slotCtx.PendingVoteCache)
+	require.Empty(t, h.env.exec.slotCtx.TakeProgramCacheAdds(), "tracked program-cache adds were consumed by the undo")
+	require.Len(t, global.PendingStakeEntriesSnapshot(), h.stakeBefore, "the slot's stake index entries are dropped")
+	require.Nil(t, h.exec.tick())
+}
+
+func TestStreamingFinalizeSuffixFailureUndoesTheStream(t *testing.T) {
+	StreamingExecutionCfg = StreamingExecutionConfig{Enabled: true}
+	defer func() { StreamingExecutionCfg = StreamingExecutionConfig{} }()
+	h := newFinalizeFailureHarness(t)
+	suffixErr := errors.New("suffix exploded")
+	calls := 0
+	h.exec.executeFn = func(exec *blockExecution, group []*solana.Transaction, identities *b.PreparedTransactionMessageIdentities, shouldVerify bool) error {
+		calls++
+		sameTransactions(t, h.txs[3:], group)
+		require.Equal(t, 1, identities.Len())
+		require.True(t, shouldVerify, "an unmarked block's suffix is verified like any whole block")
+		return suffixErr
+	}
+	block := h.matchingBlock(t, h.txs)
+
+	slotCtx, ok, err := h.exec.finalize(block, h.env.exec.parentBankSysvars)
+	require.True(t, ok, "the handshake passed: the failure is the block's")
+	require.Nil(t, slotCtx)
+	require.ErrorIs(t, err, suffixErr)
+	var final *streamingFinalizeError
+	require.ErrorAs(t, err, &final)
+	require.Equal(t, 1, calls)
+	h.assertUndone(t, "finalize:suffix")
+}
+
+func TestStreamingFinalizeFooterRejectionUndoesTheStream(t *testing.T) {
+	StreamingExecutionCfg = StreamingExecutionConfig{Enabled: true}
+	defer func() { StreamingExecutionCfg = StreamingExecutionConfig{} }()
+	h := newFinalizeFailureHarness(t)
+	// An Alpenglow bank requires the footer before it executes the suffix; a
+	// live block without one is rejected exactly as ProcessBlock rejects it.
+	h.exec.deps.alpenglowClock = true
+	h.env.exec.block.Features.EnableFeature(features.AlpenglowDevContext, 0)
+	h.exec.executeFn = func(*blockExecution, []*solana.Transaction, *b.PreparedTransactionMessageIdentities, bool) error {
+		t.Fatal("the suffix must not execute after a footer rejection")
+		return nil
+	}
+	block := h.matchingBlock(t, h.txs)
+	require.False(t, block.HasAlpenglowFooter)
+
+	slotCtx, ok, err := h.exec.finalize(block, h.env.exec.parentBankSysvars)
+	require.True(t, ok)
+	require.Nil(t, slotCtx)
+	require.ErrorContains(t, err, "missing block footer")
+	h.assertUndone(t, "finalize:footer_clock")
+}
+
+func TestStreamingFinalizeProcessedCountMismatchUndoesTheStream(t *testing.T) {
+	StreamingExecutionCfg = StreamingExecutionConfig{Enabled: true}
+	defer func() { StreamingExecutionCfg = StreamingExecutionConfig{} }()
+	h := newFinalizeFailureHarness(t)
+	// A suffix that "succeeds" without recording its transactions leaves the
+	// executed counts short of the whole-block plan.
+	h.exec.executeFn = func(*blockExecution, []*solana.Transaction, *b.PreparedTransactionMessageIdentities, bool) error {
+		return nil
+	}
+	block := h.matchingBlock(t, h.txs)
+
+	_, ok, err := h.exec.finalize(block, h.env.exec.parentBankSysvars)
+	require.True(t, ok)
+	require.ErrorContains(t, err, "processed 3 transactions")
+	h.assertUndone(t, "finalize:counts")
+}
+
 // recordingStreamer is the wait loop's view of an executor.
 type recordingStreamer struct {
-	ch     chan turbine.StreamEvent
-	tickCh chan time.Time
-	events []turbine.StreamEvent
-	ticks  int
+	ch      chan turbine.StreamEvent
+	tickCh  chan time.Time
+	handled []turbine.StreamEvent
+	ticks   int
 }
 
 func (r *recordingStreamer) events() <-chan turbine.StreamEvent { return r.ch }
 func (r *recordingStreamer) tick() <-chan time.Time             { return r.tickCh }
-func (r *recordingStreamer) handleEvent(e turbine.StreamEvent)  { r.events = append(r.events, e) }
+func (r *recordingStreamer) handleEvent(e turbine.StreamEvent)  { r.handled = append(r.handled, e) }
 func (r *recordingStreamer) handleTick()                        { r.ticks++ }
 
 func TestWaitForReplayInputDispatchesStreamWakeups(t *testing.T) {
@@ -539,8 +646,8 @@ func TestWaitForReplayInputDispatchesStreamWakeups(t *testing.T) {
 	require.Same(t, block, got)
 	require.Nil(t, parentSwitch)
 	require.Nil(t, sw)
-	require.Len(t, streamer.events, 2, "feed wake-ups are handled and never end the wait")
-	require.Equal(t, turbine.StreamCompleted, streamer.events[1].Kind)
+	require.Len(t, streamer.handled, 2, "feed wake-ups are handled and never end the wait")
+	require.Equal(t, turbine.StreamCompleted, streamer.handled[1].Kind)
 	require.Equal(t, 2, streamer.ticks, "one tick on entry, one from the timer")
 	require.Equal(t, 5, sweeps, "every wait is preceded by a sweep")
 	for _, ch := range seenEvents {

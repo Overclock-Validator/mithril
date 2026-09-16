@@ -562,8 +562,9 @@ func (s *streamingExecutor) discard(reason string) {
 	if exec != nil {
 		exec.close()
 		if exec.slotCtx != nil {
-			if s.deps.acctsDb != nil {
-				for _, key := range exec.slotCtx.TakeProgramCacheAdds() {
+			exec.slotCtx.TrackProgramCacheAdds = false
+			for _, key := range exec.slotCtx.TakeProgramCacheAdds() {
+				if s.deps.acctsDb != nil {
 					s.deps.acctsDb.RemoveProgramFromCache(key)
 				}
 			}
@@ -591,8 +592,8 @@ func (s *streamingExecutor) discardSlot(slot uint64, reason string) {
 	}
 }
 
-// finalizeErr marks a failure after the handshake passed; the block is as
-// invalid as it would have been for the whole-block path.
+// streamingFinalizeError marks a failure after the handshake passed; the
+// block is as invalid as it would have been for the whole-block path.
 type streamingFinalizeError struct{ err error }
 
 func (e *streamingFinalizeError) Error() string { return e.err.Error() }
@@ -601,7 +602,19 @@ func (e *streamingFinalizeError) Unwrap() error { return e.err }
 // finalize completes execution of block on the open stream. ok reports
 // whether the stream matched the block; when it did not, the stream has been
 // discarded and the caller must execute the block whole. A non-nil error with
-// ok == true is a failure after the handshake and is final.
+// ok == true is a failure after the handshake and is final for the block,
+// exactly as a ProcessBlock error is.
+//
+// Ownership: the stream keeps owning its bank (s.current) until the tail has
+// committed, so every failure path after the handshake goes through the same
+// discard as a pre-handshake mismatch — program-cache insertions evicted,
+// unpublished vote-cache entries dropped, slot-keyed stake entries dropped,
+// the legacy sysvar cache restored, the execution closed. The one publication
+// that precedes the tail is the deferred vote cache, applied at the point
+// where whole-block execution would already have written it (before fees,
+// rent, footer and bank hash); a failure inside the tail therefore leaves the
+// same footprint a whole-block tail failure leaves, and the dirty marker it
+// sets is what forces the rooted-checkpoint re-replay on recovery.
 func (s *streamingExecutor) finalize(block *b.Block, parentBankSysvars *sealevel.BankSysvars) (slotCtx *sealevel.SlotCtx, ok bool, err error) {
 	if s == nil || s.current == nil || block == nil {
 		return nil, false, nil
@@ -618,7 +631,8 @@ func (s *streamingExecutor) finalize(block *b.Block, parentBankSysvars *sealevel
 	}
 
 	// Whole-block plan and status validation, exactly as ProcessBlock does
-	// them, now that the authoritative block exists.
+	// them, now that the authoritative block exists. A failure here is not yet
+	// a verdict on the block: the whole-block path re-derives it.
 	if err := validateBlockTransactionVersions(block); err != nil {
 		s.discard("versions")
 		return nil, false, nil
@@ -652,12 +666,13 @@ func (s *streamingExecutor) finalize(block *b.Block, parentBankSysvars *sealevel
 		}
 	}()
 
-	// From here on the stream is committed to this block: switch the
-	// execution to the complete block object, execute the unexecuted suffix
-	// with the same machinery, publish what was deferred, and run the tail.
-	s.current = nil
+	// From here on the stream is committed to this block: any failure is the
+	// block's failure. fail undoes the stream's side effects and reports it.
 	s.stopTicker()
-	defer exec.close()
+	fail := func(reason string, err error) (*sealevel.SlotCtx, bool, error) {
+		s.discard("finalize:" + reason)
+		return nil, true, &streamingFinalizeError{err: err}
+	}
 	block.FeeRateGovernor = exec.block.FeeRateGovernor
 	block.VoteTimestamps = exec.slotCtx.VoteTimestamps
 	exec.block = block
@@ -665,32 +680,39 @@ func (s *streamingExecutor) finalize(block *b.Block, parentBankSysvars *sealevel
 	exec.slotCtx.Epoch = block.Epoch
 	if requireAlpenglowBlockFooter(block, exec.slotCtx, s.deps.alpenglowClock) {
 		if err := validateAlpenglowFooterNanosecondClock(exec.slotCtx, block); err != nil {
-			return nil, true, &streamingFinalizeError{err: err}
+			return fail("footer_clock", err)
 		}
 	}
 	if suffix := block.Transactions[executed:]; len(suffix) > 0 {
 		started := time.Now()
-		if err := exec.executeTransactionGroup(suffix, executionPlan.messageIdentities.Slice(executed, len(block.Transactions)), !block.TransactionSignaturesVerified()); err != nil {
-			return nil, true, &streamingFinalizeError{err: fmt.Errorf("execute block suffix at slot %d: %w", block.Slot, err)}
+		err := s.executeFn(exec, suffix, executionPlan.messageIdentities.Slice(executed, len(block.Transactions)), !block.TransactionSignaturesVerified())
+		if err != nil {
+			return fail("suffix", fmt.Errorf("execute block suffix at slot %d: %w", block.Slot, err))
 		}
 		cur.groups = append(cur.groups, streamingGroup{startedAt: started, finishedAt: time.Now(), transactions: len(suffix)})
 	}
 	if exec.processedSignatures != executionPlan.processedSignatures || exec.processedTxCount != executionPlan.processedTxCount {
-		return nil, true, &streamingFinalizeError{err: fmt.Errorf("streaming execution at slot %d processed %d transactions/%d signatures, block plan has %d/%d",
-			block.Slot, exec.processedTxCount, exec.processedSignatures, executionPlan.processedTxCount, executionPlan.processedSignatures)}
+		return fail("counts", fmt.Errorf("streaming execution at slot %d processed %d transactions/%d signatures, block plan has %d/%d",
+			block.Slot, exec.processedTxCount, exec.processedSignatures, executionPlan.processedTxCount, executionPlan.processedSignatures))
 	}
 	exec.slotCtx.NumSignatures = executionPlan.processedSignatures
-	exec.slotCtx.TrackProgramCacheAdds = false
-	exec.slotCtx.TakeProgramCacheAdds()
-	publishDeferredVoteCache(exec.slotCtx)
 
+	// Acceptance of the executed transactions: publish what execution would
+	// have published as it ran, then run the unchanged tail. Program-cache
+	// insertions stay tracked until the tail commits so a tail failure can
+	// still evict them.
+	publishDeferredVoteCache(exec.slotCtx)
 	exec.executionPlan = executionPlan
 	exec.statusPreparation = statusPreparation
 	exec.statusValidation = statusValidation
 	slotCtx, err = exec.finalize()
 	if err != nil {
-		return nil, true, &streamingFinalizeError{err: err}
+		return fail("tail", err)
 	}
+	exec.slotCtx.TrackProgramCacheAdds = false
+	exec.slotCtx.TakeProgramCacheAdds()
+	s.current = nil
+	exec.close()
 
 	// The per-block record is rebuilt from the stream's own bookkeeping: the
 	// loop resets the collector between waits, so counters accumulated while
