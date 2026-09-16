@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/Overclock-Validator/mithril/pkg/mlog"
 )
 
 // ShredSpool is a disposable on-disk cache of VERIFIED raw shreds, one
@@ -385,6 +387,7 @@ func (s *ShredSpool) ensureRoomLocked(slot uint64, additional int64) bool {
 
 func (s *ShredSpool) dropSlotLocked(slot uint64) bool {
 	if err := s.invalidateCompleteLocked(slot); err != nil {
+		mlog.Log.Warnf("shred spool: retaining slot %d after completion invalidation failed: %v", slot, err)
 		return false
 	}
 	s.closeSlotLocked(slot)
