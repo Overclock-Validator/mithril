@@ -581,6 +581,25 @@ func (c *TransactionStatusCache) validateBlockForPublication(block *b.Block, pla
 	return transactionStatusValidation{cache: c, identities: plan.messageIdentities, version: c.validationVersion}, nil
 }
 
+// validateTransactionsAgainstAncestors is the per-group form of the ancestor
+// already-processed check, for execution that starts before the complete
+// block exists. It does not validate the parent link; the complete block is
+// validated again in full, with validateBlockForPublication, before commit.
+func (c *TransactionStatusCache) validateTransactionsAgainstAncestors(slot uint64, identities *b.PreparedTransactionMessageIdentities) error {
+	if identities == nil {
+		return errors.New("nil transaction message identities")
+	}
+	if c == nil {
+		return &IncompleteTransactionStatusCoverageError{}
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if !c.coverageComplete {
+		return &IncompleteTransactionStatusCoverageError{CachedRoot: c.rootedThrough}
+	}
+	return c.validateAncestorTransactionsLocked(slot, identities)
+}
+
 func (c *TransactionStatusCache) validateAncestorTransactionsLocked(slot uint64, identities *b.PreparedTransactionMessageIdentities) error {
 	var already *AncestorAlreadyProcessedTransactionMessagesError
 	for index := 0; index < identities.Len(); index++ {
