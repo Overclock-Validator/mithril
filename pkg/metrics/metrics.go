@@ -101,6 +101,11 @@ func sampleTxTiming(sig []byte, shift uint32) bool {
 // AddSampledTiming records one observation from a sampled transaction, scaled
 // by the sampling rate so that sums over a block estimate the unsampled total.
 func (t *Timing) AddSampledTiming(d time.Duration, shift uint32) {
+	// Keep the default exact path identical to ordinary timing updates.
+	if shift == 0 {
+		t.AddTiming(d)
+		return
+	}
 	atomic.AddUint64(&t.Count, 1<<shift)
 	atomic.AddUint64(&t.SumNanoseconds, uint64(d.Nanoseconds())<<shift)
 }
