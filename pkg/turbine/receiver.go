@@ -77,6 +77,7 @@ type UDPReceiver struct {
 	blocksEmitted   atomic.Uint64
 	lastPacketUnix  atomic.Int64
 	lastDataSlot    atomic.Uint64
+	lastBlockUnix   atomic.Int64
 	lastBlockSlot   atomic.Uint64
 
 	firstShredMu    sync.Mutex
@@ -112,6 +113,7 @@ type ReceiverStats struct {
 	Repair                RepairStats
 	LastPacketUnix        int64
 	LastDataSlot          uint64
+	LastBlockUnix         int64
 	LastBlockSlot         uint64
 	ActiveSlots           int
 	// Spool hydration outcomes: slots fed from disk, and how many of those
@@ -459,6 +461,7 @@ func (r *UDPReceiver) Stats() ReceiverStats {
 		Repair:                r.repairStats(),
 		LastPacketUnix:        r.lastPacketUnix.Load(),
 		LastDataSlot:          r.lastDataSlot.Load(),
+		LastBlockUnix:         r.lastBlockUnix.Load(),
 		LastBlockSlot:         r.lastBlockSlot.Load(),
 		ActiveSlots:           r.assembler.ActiveSlots(),
 		HydratedSlots:         r.hydratedSlots.Load(),
@@ -848,9 +851,14 @@ func (r *UDPReceiver) emitAssembled(ctx context.Context, blk *block.Block) bool 
 	return r.emitPendingAssembled(ctx, blk)
 }
 
-func (r *UDPReceiver) emitPendingAssembled(ctx context.Context, blk *block.Block) bool {
+func (r *UDPReceiver) recordBlockEmitted(slot uint64) {
 	r.blocksEmitted.Add(1)
-	r.lastBlockSlot.Store(blk.Slot)
+	r.lastBlockUnix.Store(time.Now().Unix())
+	r.lastBlockSlot.Store(slot)
+}
+
+func (r *UDPReceiver) emitPendingAssembled(ctx context.Context, blk *block.Block) bool {
+	r.recordBlockEmitted(blk.Slot)
 	select {
 	case r.blocks <- blk:
 		return true

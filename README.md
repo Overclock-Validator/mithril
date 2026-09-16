@@ -96,13 +96,13 @@ Mithril requires a C compiler for the zstd compression library:
 sudo apt-get update && sudo apt-get install -y build-essential
 ```
 
-**Step 4: Install Go 1.26.4**
+**Step 4: Install Go 1.26.6**
 
-Mithril pins Go 1.26.4 (see `go.mod`); this is the version CI builds with. Go's "green tea" garbage collector (since 1.25) gives better performance for memory-intensive applications like Mithril.
+Mithril pins Go 1.26.6 (see `go.mod`); this is the version CI builds with. Go's "green tea" garbage collector (since 1.25) gives better performance for memory-intensive applications like Mithril.
 
 ```bash
 # Set Go version and detect architecture
-GO_VERSION="1.26.4"
+GO_VERSION="1.26.6"
 case $(uname -m) in
     x86_64)  GOARCH="amd64" ;;
     aarch64) GOARCH="arm64" ;;
@@ -123,7 +123,10 @@ go version
 make build
 ```
 
-This builds the `mithril` binary with version, commit, and branch information embedded. Alternatively, you can use `make release` for a smaller binary with debug symbols stripped.
+This builds the `mithril` binary with version, commit, and branch information
+embedded. Alternatively, use `make release` for a smaller binary with debug
+symbols stripped. See the [Mithril MCP quick start](docs/mcp.md) to connect an
+MCP client such as Codex, Claude Code, Cursor, or VS Code.
 
 ### Configuration
 

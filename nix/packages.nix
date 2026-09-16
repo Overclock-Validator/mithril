@@ -35,19 +35,32 @@
     then "go_1_${builtins.elemAt goVersion 1}"
     else "go_${builtins.elemAt goVersion 0}_${builtins.elemAt goVersion 1}";
   goFor = pkgs:
-    if builtins.hasAttr goAttr pkgs
-    then pkgs.${goAttr}
-    else pkgs.go;
+    assert versionString == "1.26.6";
+    (
+      if builtins.hasAttr goAttr pkgs
+      then pkgs.${goAttr}
+      else pkgs.go
+    ).overrideAttrs (_: {
+      version = "1.26.6";
+      src = pkgs.fetchurl {
+        url = "https://go.dev/dl/go1.26.6.src.tar.gz";
+        hash = "sha256-oHIcVMaIkBRI13rZs+x+p8R0cwdV/4kTgukuy5P/LLE=";
+      };
+    });
 in {
   packages = forAllSystems (
     system: let
       pkgs = import nixpkgs {inherit system;};
-      mithril = pkgs.buildGoModule {
+      go = goFor pkgs;
+      buildGoModule = pkgs.buildGoModule.override {inherit go;};
+      mithril = buildGoModule {
         pname = "mithril";
         version = "0.0.0";
         src = self;
-        subPackages = ["cmd/mithril"];
-        vendorHash = "sha256-BVgVVvRAllEfb8D6Mh6NSaeLLOx6zeXwY4QyCwP0veo=";
+        subPackages = [
+          "cmd/mithril"
+        ];
+        vendorHash = "sha256-Vh2jJoKjuikI0IKEEniZVPsavfZYXtDzPKxJUxl7d8s=";
         nativeBuildInputs = [pkgs.pkg-config];
         buildInputs = [pkgs.zstd];
         env = {
