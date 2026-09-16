@@ -92,7 +92,7 @@ work. Preloading 200k into a larger queue improved the observed four-block total
 while the first block still had less usable time and later banks awaited local
 replay/adoption. These observations do not isolate a single CPU bottleneck.
 
-[Measured results, exact baselines and evidence](results/leader-block-packing/2026-09-13/README.md)
+[Measured results, exact baselines and evidence](https://github.com/Overclock-Validator/mithril/blob/06ef067798c99947e8cc527450ad28430a9a7333/docs/results/leader-block-packing/2026-09-13/README.md)
 include both the successful near-limit block and the still-underfilled four-slot
 window. The archived live helper is historical experiment source with explicit
 cluster/identity/path constants; the offline fixture is the portable reproduction.
