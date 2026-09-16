@@ -664,9 +664,14 @@ func (c *TransactionStatusCache) commitBlockWithValidation(block *b.Block, plan 
 	if prepared != nil && prepared.identities == plan.messageIdentities {
 		delta = prepared.delta
 		// A restore or branch transition can change a blockhash's slice offset.
-		// Rebuild from full identities if any current group uses another offset.
+		// Rebuild from full identities if a group changed offset or disappeared;
+		// a missing group uses the same zero offset as fresh preparation.
 		for blockhash, group := range delta {
-			if visible := c.visible[blockhash]; visible != nil && visible.keyIndex != group.keyIndex {
+			index := uint8(0)
+			if visible := c.visible[blockhash]; visible != nil {
+				index = visible.keyIndex
+			}
+			if index != group.keyIndex {
 				delta = nil
 				break
 			}

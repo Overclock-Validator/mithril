@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"math/rand"
 	"sort"
 	"sync"
 	"testing"
@@ -294,6 +295,40 @@ func TestTransactionStatusEncodingMatchesOriginalWireFormat(t *testing.T) {
 			got, err := marshalTransactionStatusNodes(nodes, 3, complete, genesis)
 			require.NoError(t, err)
 			require.Equal(t, want, got)
+		}
+	}
+}
+
+func TestTransactionStatusEncodingRandomizedByteIdentity(t *testing.T) {
+	rng := rand.New(rand.NewSource(20260916))
+	for trial := 0; trial < 200; trial++ {
+		nodes := make([]*transactionStatusNode, rng.Intn(13))
+		var slot uint64
+		for i := range nodes {
+			slot += uint64(1 + rng.Intn(5))
+			node := &transactionStatusNode{slot: slot, hasBlockID: rng.Intn(2) == 1, delta: make(transactionStatusDelta)}
+			_, _ = rng.Read(node.blockID[:])
+			for g := rng.Intn(8); g > 0; g-- {
+				var hash solana.Hash
+				_, _ = rng.Read(hash[:])
+				group := &transactionStatusGroup{keyIndex: uint8(rng.Intn(int(txstatus.MaxCachedKeyIndex) + 1)), keys: make(map[transactionStatusKey]struct{})}
+				for k := rng.Intn(13); k > 0; k-- {
+					var key transactionStatusKey
+					_, _ = rng.Read(key[:])
+					group.keys[key] = struct{}{}
+				}
+				node.delta[hash] = group
+			}
+			nodes[i] = node
+		}
+		rooted := uint16(rng.Intn(301))
+		complete, genesis := rng.Intn(2) == 1, rng.Intn(2) == 1
+		want, err := marshalTransactionStatusNodesUncached(nodes, rooted, complete, genesis)
+		require.NoError(t, err)
+		for pass := 0; pass < 2; pass++ {
+			got, err := marshalTransactionStatusNodes(nodes, rooted, complete, genesis)
+			require.NoError(t, err)
+			require.Equal(t, want, got, "trial=%d pass=%d", trial, pass)
 		}
 	}
 }
