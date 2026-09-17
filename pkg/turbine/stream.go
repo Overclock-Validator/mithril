@@ -181,6 +181,11 @@ func (a *SlotAssembler) SubscribeStream(ch chan<- StreamEvent) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.streamSubscriber = ch
+	if ch == nil {
+		a.streamRepairParent = nil
+		a.streamRepairChild = nil
+		a.streamRepairInvalidChild = nil
+	}
 }
 
 // StreamDroppedEvents reports wake-ups dropped because the subscriber was
@@ -297,6 +302,7 @@ func (a *SlotAssembler) publishStreamBatchReadyLocked(s *slotState, batch *prefe
 	if a.streamSubscriber == nil || s == nil || batch == nil {
 		return
 	}
+	a.noteChildRepairHeaderLocked(s, batch)
 	g := StreamGeneration{slot: s.slot, state: s}
 	a.publishStreamLocked(StreamEvent{Kind: StreamBatchReady, Slot: s.slot, Generation: g, Batch: newStreamBatch(g, batch)})
 }

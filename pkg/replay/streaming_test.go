@@ -55,8 +55,8 @@ func (f *fakeStreamFeed) PendingStreamBatches(g turbine.StreamGeneration, fromSt
 	return out
 }
 
-func (f *fakeStreamFeed) PrioritizeStreamRepair(slot uint64) {
-	f.prioritized = append(f.prioritized, slot)
+func (f *fakeStreamFeed) PrioritizeStreamRepair(g turbine.StreamGeneration) {
+	f.prioritized = append(f.prioritized, g.Slot())
 }
 
 // fakeUnrootedState satisfies the tail interface for eligibility checks; no

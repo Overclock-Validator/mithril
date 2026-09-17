@@ -208,6 +208,9 @@ func (r *UDPReceiver) SetRepairPeerSource(identity ed25519.PrivateKey, source fu
 		return err
 	}
 	r.repairClient = client
+	r.assembler.mu.Lock()
+	r.assembler.streamRepairWake = client.priorityWake
+	r.assembler.mu.Unlock()
 	return nil
 }
 
@@ -984,5 +987,17 @@ func (r *UDPReceiver) hydrateLoop(ctx context.Context) {
 			default:
 			}
 		}
+	}
+}
+
+// PrioritizeStreamRepair also anchors bounded asynchronous child lookahead.
+func (r *UDPReceiver) PrioritizeStreamRepair(g StreamGeneration) {
+	if r == nil || r.assembler == nil {
+		return
+	}
+	r.assembler.SetStreamRepairParent(g)
+	slot := g.Slot()
+	if slot != 0 {
+		r.PrioritizeRepairSlot(slot)
 	}
 }

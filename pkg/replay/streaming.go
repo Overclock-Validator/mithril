@@ -92,7 +92,7 @@ type streamingFeed interface {
 	StreamEvents() <-chan turbine.StreamEvent
 	StreamStatusOf(turbine.StreamGeneration) turbine.StreamStatus
 	PendingStreamBatches(turbine.StreamGeneration, uint32) []*turbine.StreamBatch
-	PrioritizeStreamRepair(uint64)
+	PrioritizeStreamRepair(turbine.StreamGeneration)
 }
 
 var _ streamingFeed = (*blockstream.BlockSource)(nil)
@@ -598,7 +598,7 @@ func (s *streamingExecutor) openStream(header *turbine.StreamBatch) {
 	}
 	s.current = cur
 	metrics.GlobalBlockReplay.StreamingExecution.Opened = 1
-	d.feed.PrioritizeStreamRepair(shell.Slot)
+	d.feed.PrioritizeStreamRepair(header.Generation)
 	mlog.Log.FileOnlyf("streaming: opened slot %d on parent %d | %s", shell.Slot, header.ParentSlot, cur.openTimeline())
 	s.offer(header)
 	s.pull()
@@ -757,6 +757,7 @@ func (s *streamingExecutor) discard(reason string) {
 	}
 	cur := s.current
 	s.current = nil
+	s.deps.feed.PrioritizeStreamRepair(turbine.StreamGeneration{})
 	s.stopTicker()
 	s.retire(cur.slot, cur.generation)
 	if obs := s.observed[cur.slot]; obs != nil && obs.generation == cur.generation {
@@ -921,6 +922,7 @@ func (s *streamingExecutor) finalize(block *b.Block, parentBankSysvars *sealevel
 	exec.slotCtx.TrackProgramCacheAdds = false
 	exec.slotCtx.TakeProgramCacheAdds()
 	s.current = nil
+	s.deps.feed.PrioritizeStreamRepair(turbine.StreamGeneration{})
 	exec.close()
 
 	// The per-block record is rebuilt from the stream's own bookkeeping: the

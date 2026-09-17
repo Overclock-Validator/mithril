@@ -457,7 +457,8 @@ func (c *repairClient) repairOnce(conn *net.UDPConn, assembler *SlotAssembler) {
 		return
 	}
 	priority, edge := assembler.RepairRequestsTiered(repairMaxSlotsPerScan, repairMaxMissingPerSlot)
-	if len(priority)+len(edge) == 0 {
+	child, haveChild := assembler.childRepairRequest(time.Now())
+	if len(priority)+len(edge) == 0 && !haveChild {
 		return
 	}
 
@@ -483,6 +484,9 @@ func (c *repairClient) repairOnce(conn *net.UDPConn, assembler *SlotAssembler) {
 	}
 	edgeDemand := tierSendDemand(edge, 1)
 	want := tierSendDemand(priority, headInitial) + edgeDemand
+	if haveChild {
+		want += len(child.MissingDataShreds)
+	}
 	if want > repairMaxOutstanding {
 		want = repairMaxOutstanding
 	}
@@ -506,6 +510,10 @@ func (c *repairClient) repairOnce(conn *net.UDPConn, assembler *SlotAssembler) {
 	// below what the edge can use; leftover head budget flows to the edge.
 	spent := c.sendTier(conn, peers, priority, splitRepairBudget(budget, edgeDemand), headPol, acct)
 	spent += c.sendTier(conn, peers, edge, budget-spent, nil, acct)
+	// Parent/normal repair and freshness keep first claim on every token.
+	if haveChild {
+		spent += c.sendChildRepair(conn, peers, child, budget-spent, acct)
+	}
 	c.returnRateTokens(budget - spent)
 }
 
@@ -1566,4 +1574,20 @@ func (c *repairClient) stats() RepairStats {
 		TimeoutMillis:     int64(time.Duration(c.timeoutNanos.Load()) / time.Millisecond),
 		AvgResponseMillis: avgResponseMillis,
 	}
+}
+
+// Called after normal priority and freshness work. Existing in-flight child
+// requests count against lookahead capacity; no fanout or highest-index probes.
+func (c *repairClient) sendChildRepair(conn *net.UDPConn, peers []gossip.RepairPeer, req SlotRepairRequest, budget int, acct time.Duration) int {
+	if budget <= 0 {
+		return 0
+	}
+	c.mu.Lock()
+	room := childRepairLimit - c.outstandingForSlotLocked(req.Slot)
+	c.mu.Unlock()
+	if room <= 0 {
+		return 0
+	}
+	req.NeedHighestDataShred = false
+	return c.sendTier(conn, peers, []SlotRepairRequest{req}, min(room, budget), nil, acct)
 }

@@ -620,6 +620,14 @@ func (bs *BlockSource) PendingStreamBatches(g turbine.StreamGeneration, fromStar
 // PrioritizeStreamRepair keeps a slot that replay is executing while its
 // shreds arrive pinned for repair, since the emitter pins the head only when
 // it observes a gap.
-func (bs *BlockSource) PrioritizeStreamRepair(slot uint64) {
-	bs.prioritizeTurbineRepairRange(slot, slot)
+func (bs *BlockSource) PrioritizeStreamRepair(g turbine.StreamGeneration) {
+	if bs.sourceType != BlockSourceTurbine || !bs.turbineAlpenglowBlockIDHints {
+		return
+	}
+	bs.alpenglowMu.Lock()
+	receiver := bs.activeTurbineReceiver
+	bs.alpenglowMu.Unlock()
+	if receiver != nil {
+		receiver.PrioritizeStreamRepair(g)
+	}
 }

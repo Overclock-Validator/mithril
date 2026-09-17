@@ -232,3 +232,27 @@ including lock wait and processing, not NIC timestamps. Already-completed,
 evicted, or completing slots return before this instrumentation. An unmatched
 or canceled response is not emitted as a matched response. Missing records,
 particularly with drops or capture boundaries, cannot establish packet loss.
+
+### Bounded child repair lookahead
+
+Replay supplies its exact streaming generation as a repair anchor. The
+asynchronous decoder can then recognize a decoded header for the immediate next
+slot naming that parent, even while replay executes a parent group. A header
+published earlier is recovered from the assembler's ready batches. The hint
+permits fetching only; it does not establish fork choice, validate the final
+parent block ID, or permit child execution before parent completion.
+
+After ordinary priority and freshness repair, leftover tokens may request up to
+four missing data shreds from the child's earliest incomplete FEC span. Existing
+in-flight requests for that child count against the four-request lookahead
+allowance. Normal repair can independently exceed that allowance. Global rate,
+per-scan and admission limits remain in force; lookahead uses bulk single-attempt
+policy, with no new retry/fanout or highest-index probing. If no capacity remains,
+the child waits.
+
+Only one child is tracked. The anchor expires after two seconds and is cleared
+on parent finalize/discard, parent reset/update, or stream unsubscribe. Child
+completion/reset and changed parent markers invalidate its hint. Generation
+checks reject stale headers. Already-sent requests still use normal response and
+expiry handling. Notifications and repair wakeups remain nonblocking/coalesced;
+no extra workers or polling loop are introduced.

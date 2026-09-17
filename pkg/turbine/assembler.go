@@ -82,8 +82,13 @@ type SlotAssembler struct {
 	entryPrefetch      *entryPrefetchPool
 	// Streaming feed subscriber (see stream.go); nil when nothing consumes
 	// batches before completion.
-	streamSubscriber    chan<- StreamEvent
-	streamDroppedEvents uint64
+	streamSubscriber         chan<- StreamEvent
+	streamDroppedEvents      uint64
+	streamRepairParent       *slotState
+	streamRepairChild        *slotState
+	streamRepairInvalidChild *slotState
+	streamRepairUntil        time.Time
+	streamRepairWake         chan<- struct{}
 }
 
 type SlotRepairRequest struct {
@@ -645,6 +650,13 @@ func (a *SlotAssembler) RejectAlpenglowBlockID(slot uint64, blockID solana.Hash)
 func (a *SlotAssembler) ResetSlot(slot uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.streamRepairParent != nil && a.streamRepairParent.slot == slot {
+		a.streamRepairParent = nil
+		a.streamRepairChild = nil
+	}
+	if a.streamRepairChild != nil && a.streamRepairChild.slot == slot {
+		a.streamRepairChild = nil
+	}
 
 	a.retentionDirty = true
 	a.recordPartialObsLocked(a.slots[slot])

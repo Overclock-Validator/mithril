@@ -50,7 +50,7 @@ func (f *receiverFeed) StreamStatusOf(g turbine.StreamGeneration) turbine.Stream
 func (f *receiverFeed) PendingStreamBatches(g turbine.StreamGeneration, from uint32) []*turbine.StreamBatch {
 	return f.r.PendingStreamBatches(g, from)
 }
-func (f *receiverFeed) PrioritizeStreamRepair(uint64) {}
+func (f *receiverFeed) PrioritizeStreamRepair(turbine.StreamGeneration) {}
 
 type realFeedRig struct {
 	slot        uint64
