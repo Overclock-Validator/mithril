@@ -295,6 +295,16 @@ func (a *SlotAssembler) addShredFromWithRoot(shred *Shred, fromRepair bool, root
 		a.ignoredOldShreds++
 		return nil, nil
 	}
+	// Diagnostic only; the deferred observation runs while a.mu is still held.
+	var repairTrace *entryRepairTrace
+	if fromRepair && admissionEntered != 0 {
+		repairTrace = &entryRepairTrace{Event: "repair_admission", Origin: entryTraceOrigin.UnixNano(), Slot: shred.Slot, Index: shred.Index, FEC: shred.FECSetIndex, AdmissionStart: admissionEntered, DeficitBefore: traceFECDeficit(state, shred.FECSetIndex), Outcome: "rejected"}
+		defer func() {
+			repairTrace.ResponseAt = entryTraceNow()
+			repairTrace.DeficitAfter = traceFECDeficit(state, shred.FECSetIndex)
+			emitRepairTrace(*repairTrace)
+		}()
+	}
 	var err error
 	switch shred.Type {
 	case ShredTypeData:
@@ -315,6 +325,9 @@ func (a *SlotAssembler) addShredFromWithRoot(shred *Shred, fromRepair bool, root
 	}
 	if err != nil {
 		if errors.Is(err, ErrDuplicateShred) {
+			if repairTrace != nil {
+				repairTrace.Outcome = "duplicate"
+			}
 			return nil, nil
 		}
 		state.noteError(err)
@@ -354,6 +367,10 @@ func (a *SlotAssembler) addShredFromWithRoot(shred *Shred, fromRepair bool, root
 		}
 	}
 
+	if repairTrace != nil {
+		repairTrace.Outcome = "accepted"
+		repairTrace.Recovered = len(recovered)
+	}
 	a.prefetchEntriesLocked(state)
 	if !state.complete() {
 		return nil, nil

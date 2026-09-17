@@ -245,7 +245,7 @@ func queueEntryPipelineReport(s *slotState, b *block.Block, d *entryDecodeTiming
 	}
 }
 
-// Attribution starts at assembler entry, not socket receipt. A recovered data
+// Attribution starts at assembler entry, not socket receipt.
 // "non_repair" includes direct/spooled admission, not proof of socket origin.
 // A recovered shred records the packet that triggered reconstruction; it is not itself a
 // received repair response. Missing source fields in older reports mean unknown.
@@ -262,30 +262,72 @@ type entryShredSource struct {
 // UDP write syscall, NOT delivery. Attempt IDs can reset; order by timestamps.
 // Highest-index probes are not exact requests for the returned shred index.
 type entryRepairTrace struct {
-	Event     string `json:"event"`
-	Origin    int64  `json:"origin_unix_ns"`
-	Slot      uint64 `json:"slot"`
-	Index     uint32 `json:"index"`
-	Highest   bool   `json:"highest_index_probe"`
-	Attempt   uint8  `json:"attempt"`
-	SendStart int64  `json:"send_start_ns"`
-	SendEnd   int64  `json:"send_end_ns"`
-	Success   bool   `json:"success"`
-	Dropped   uint64 `json:"dropped_reports"`
+	AdmissionStart int64  `json:"admission_start_ns,omitempty"`
+	Peer           string `json:"peer,omitempty"`
+	Nonce          uint32 `json:"nonce"`
+	ResponseAt     int64  `json:"response_ns,omitempty"`
+	RequestedAt    int64  `json:"requested_ns,omitempty"`
+	ReturnedIndex  uint32 `json:"returned_index"`
+	Late           bool   `json:"late"`
+	FEC            uint32 `json:"fec_set"`
+	DeficitBefore  int    `json:"deficit_before"`
+	DeficitAfter   int    `json:"deficit_after"`
+	Recovered      int    `json:"recovered"`
+	Outcome        string `json:"outcome,omitempty"`
+	Event          string `json:"event"`
+	Origin         int64  `json:"origin_unix_ns"`
+	Slot           uint64 `json:"slot"`
+	Index          uint32 `json:"index"`
+	Highest        bool   `json:"highest_index_probe"`
+	Attempt        uint8  `json:"attempt"`
+	SendStart      int64  `json:"send_start_ns"`
+	SendEnd        int64  `json:"send_end_ns"`
+	Success        bool   `json:"success"`
+	Dropped        uint64 `json:"dropped_reports"`
 }
 
 func entryTraceSelected(slot uint64) bool {
 	c := entryTraceConfig
 	return c.modulo != 0 && slot%c.modulo == 0 && time.Now().Before(c.until)
 }
-func traceRepairSend(slot uint64, index uint32, kind repairRequestKind, attempt uint8, start int64, success bool) {
+func traceRepairSend(slot uint64, index uint32, kind repairRequestKind, attempt uint8, start int64, success bool, binding ...entryRepairTrace) {
 	if start == 0 || entryTraceConfig.repairs == nil {
 		return
 	}
 	r := entryRepairTrace{Event: "repair_send", Origin: entryTraceOrigin.UnixNano(), Slot: slot, Index: index, Highest: kind == repairRequestHighestWindowIndex, Attempt: attempt, SendStart: start, SendEnd: entryTraceNow(), Success: success}
+	if len(binding) > 0 {
+		r.Peer = binding[0].Peer
+		r.Nonce = binding[0].Nonce
+	}
+	emitRepairTrace(r)
+}
+
+func emitRepairTrace(r entryRepairTrace) {
+	if entryTraceConfig.repairs == nil {
+		return
+	}
 	select {
 	case entryTraceConfig.repairs <- r:
 	default:
 		entryTraceDropped.Add(1)
 	}
+}
+
+// -1 means no authenticated coding layout is known. Zero means sufficient
+// shards, not that reconstruction necessarily succeeded (see outcome/recovered).
+func traceFECDeficit(s *slotState, index uint32) int {
+	if s == nil {
+		return -1
+	}
+	f := s.fecSets[index]
+	if f == nil || !f.haveLayout {
+		return -1
+	}
+	return max(0, int(f.layout.dataShreds)-len(f.data)-len(f.coding))
+}
+func traceRepairResponse(rec outstandingRepairRequest, sh *Shred, peer string, late bool) {
+	if !entryTraceSelected(sh.Slot) {
+		return
+	}
+	emitRepairTrace(entryRepairTrace{Event: "repair_response", Origin: entryTraceOrigin.UnixNano(), Slot: sh.Slot, Index: rec.key.index, Highest: rec.key.kind == repairRequestHighestWindowIndex, Attempt: rec.key.attempt, Nonce: rec.nonce, Peer: peer, RequestedAt: entryTraceTime(rec.sentAt), ResponseAt: entryTraceNow(), ReturnedIndex: sh.Index, FEC: sh.FECSetIndex, Late: late})
 }

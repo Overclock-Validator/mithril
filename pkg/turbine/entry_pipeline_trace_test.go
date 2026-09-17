@@ -2,6 +2,7 @@ package turbine
 
 import (
 	"context"
+	"net"
 	"testing"
 	"time"
 
@@ -128,4 +129,49 @@ func TestEntryTraceSelectionIsBounded(t *testing.T) {
 	require.False(t, entryTraceSelected(15))
 	entryTraceConfig = entryTraceSettings{}
 	require.False(t, entryTraceSelected(15))
+}
+
+func TestEntryRepairResponseCorrelation(t *testing.T) {
+	old := entryTraceConfig
+	defer func() { entryTraceConfig = old }()
+	entryTraceConfig = entryTraceSettings{modulo: 1, until: time.Now().Add(time.Minute), repairs: make(chan entryRepairTrace, 8)}
+	from := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8000}
+	addr, _ := repairAddressKeyFromUDP(from)
+	for _, late := range []bool{false, true} {
+		c := newPacingTestClient(t)
+		key := repairRequestKey{kind: repairRequestWindowIndex, slot: 42, index: 3}
+		rec := outstandingRepairRequest{key: key, nonce: 777, addr: addr, sentAt: time.Now().Add(-time.Second), accountAt: time.Now().Add(time.Second)}
+		responseKey := repairResponseKey{addr: addr, nonce: 777}
+		if late {
+			c.expiredCur[responseKey] = rec
+		} else {
+			c.outstanding[key] = rec
+			c.byResponse[responseKey] = key
+		}
+		require.False(t, c.observeShredResponse(nil, nonceTrailer(777), from, &Shred{Slot: 42, Index: 4, Type: ShredTypeData}))
+		require.Empty(t, entryTraceConfig.repairs, "wrong index cannot be reported as matched")
+		require.True(t, c.observeShredResponse(nil, nonceTrailer(777), from, &Shred{Slot: 42, Index: 3, Type: ShredTypeData}))
+		r := <-entryTraceConfig.repairs
+		require.Equal(t, "repair_response", r.Event)
+		require.Equal(t, uint32(777), r.Nonce)
+		require.Equal(t, from.String(), r.Peer)
+		require.Equal(t, late, r.Late)
+		require.Equal(t, uint32(3), r.ReturnedIndex)
+		require.Greater(t, r.ResponseAt, r.RequestedAt)
+		require.False(t, c.observeShredResponse(nil, nonceTrailer(777), from, &Shred{Slot: 42, Index: 3, Type: ShredTypeData}))
+		require.Empty(t, entryTraceConfig.repairs, "consumed nonce cannot count twice")
+	}
+}
+
+func TestEntryFECDeficit(t *testing.T) {
+	s := newRepairSelectionSlot(42)
+	require.Equal(t, -1, traceFECDeficit(s, 0))
+	addCodedSet(s, 0, 32, 32, seq(0, 19), 8)
+	require.Equal(t, 4, traceFECDeficit(s, 0))
+	s.fecSets[0].data[20] = &Shred{}
+	require.Equal(t, 3, traceFECDeficit(s, 0))
+	for i := uint32(21); i < 32; i++ {
+		s.fecSets[0].data[i] = &Shred{}
+	}
+	require.Zero(t, traceFECDeficit(s, 0), "enough shards is not a negative deficit")
 }

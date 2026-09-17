@@ -183,8 +183,7 @@ separate these from block reports. Join by `origin_unix_ns`, slot and shred inde
 then order by send timestamps; attempt IDs can reset. Start/end bracket the UDP
 write, and `success` means only that the local write succeeded. Highest-index
 probes are explicitly marked and must not be treated as exact-index requests.
-Request records can exist for slots without a large-block report. No response
-peer or exact request/response nonce correlation is recorded.
+Request records can exist for slots without a large-block report. Send records include the peer endpoint and nonce for response correlation.
 
 Both queues are bounded and producers never wait for the writer. The cumulative
 `dropped_reports` counter covers queue drops and encoding failures; an absent
@@ -212,3 +211,24 @@ recovery, at fixed request budgets and a 20ms simulated round trip. It checks
 identical assembled entries/transactions, request counts and full completion,
 and measures availability of the first data span. It does not model production
 retry timers, peer loss, execution timing, or reproduce a captured live slot.
+
+
+Response-effectiveness tracing also emits `repair_response` and
+`repair_admission` events. Treat every record with an `event` field as an event,
+not a block report. Match sends/responses by origin, peer, nonce and requested
+slot/index; use timestamps to disambiguate nonce reuse. Responses record the
+returned index, request-registration timestamp and whether the request had
+expired. Registration precedes signing/write; use `send_start_ns` for the closer
+approximation to network elapsed time. A matched response is not proof that
+assembly accepted it: later receive-path checks can still reject it.
+
+Admission events cover sampled matched-repair shreds reaching an active assembly;
+join to responses by slot/returned index and chronology (no nonce is carried into
+the assembler). They report accepted/duplicate/rejected, the coding-layout
+recovery deficit before/after, and the number of reconstructed data shreds.
+Deficit `-1` means unknown layout; zero means enough shards, not necessarily
+successful recovery. Admission timestamps are local assembler entry/exit,
+including lock wait and processing, not NIC timestamps. Already-completed,
+evicted, or completing slots return before this instrumentation. An unmatched
+or canceled response is not emitted as a matched response. Missing records,
+particularly with drops or capture boundaries, cannot establish packet loss.

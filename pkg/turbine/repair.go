@@ -691,6 +691,9 @@ func (c *repairClient) observeShredResponse(conn *net.UDPConn, packet []byte, fr
 	c.observeLatencyLocked(latency)
 	c.mu.Unlock()
 
+	if entryTraceSelected(shred.Slot) {
+		traceRepairResponse(outstanding, shred, from.String(), late)
+	}
 	if late {
 		c.lateResponses.Add(1)
 	} else {
@@ -984,11 +987,13 @@ func (c *repairClient) sendShredAttempt(conn *net.UDPConn, peers []gossip.Repair
 	c.mu.Unlock()
 
 	var traceStart int64
+	var traceBinding entryRepairTrace
 	if entryTraceSelected(slot) {
 		traceStart = entryTraceNow()
+		traceBinding = entryRepairTrace{Peer: peer.Addr.String(), Nonce: nonce}
 	}
 	if _, err := conn.WriteToUDP(packet, peer.Addr); err != nil {
-		traceRepairSend(slot, index, kind, attempt, traceStart, false)
+		traceRepairSend(slot, index, kind, attempt, traceStart, false, traceBinding)
 		c.mu.Lock()
 		delete(c.outstanding, key)
 		delete(c.byResponse, responseKey)
@@ -999,7 +1004,7 @@ func (c *repairClient) sendShredAttempt(conn *net.UDPConn, peers []gossip.Repair
 		return false
 	}
 
-	traceRepairSend(slot, index, kind, attempt, traceStart, true)
+	traceRepairSend(slot, index, kind, attempt, traceStart, true, traceBinding)
 	c.requests.Add(1)
 	return true
 }
