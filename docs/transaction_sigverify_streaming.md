@@ -190,3 +190,25 @@ Both queues are bounded and producers never wait for the writer. The cumulative
 `dropped_reports` counter covers queue drops and encoding failures; an absent
 repair record is not proof of no request if records were dropped. Tracing does
 not change repair scheduling, retry intervals, fanout or verification checks.
+
+### Repair ordering for streaming
+
+When a streaming subscriber is installed, the first priority repair slot puts
+its earliest missing data span ahead of the usual cheapest-FEC-unlock ordering.
+Known FEC sets still request only their recovery deficit; an unknown-layout hole
+prioritizes one missing index without guessing its FEC shape. Remaining work,
+other priority slots and freshness repair retain their previous ordering.
+Request budgets, admission shares, retry intervals and fanout are unchanged.
+
+This trades completing cheap later sets first for making the contiguous input
+prefix available sooner. It helps when request capacity is constrained; it does
+not accelerate requests already in flight, guarantee an earlier full block, or
+prove improved voting latency. The subscriber and priority head are used as the
+scope; the selector does not read the execution cursor.
+
+`go test ./pkg/turbine/repairsim -run TestStreamingPrefixRepairUnderLimitedBudget -v`
+compares both policies using authenticated generated shreds and production FEC
+recovery, at fixed request budgets and a 20ms simulated round trip. It checks
+identical assembled entries/transactions, request counts and full completion,
+and measures availability of the first data span. It does not model production
+retry timers, peer loss, execution timing, or reproduce a captured live slot.

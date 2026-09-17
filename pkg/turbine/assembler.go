@@ -929,6 +929,10 @@ func (s *slotState) addDataShred(shred *Shred) error {
 }
 
 func (s *slotState) repairRequest(maxMissing int) (SlotRepairRequest, bool) {
+	return s.repairRequestWithPrefix(maxMissing, false)
+}
+
+func (s *slotState) repairRequestWithPrefix(maxMissing int, prefix bool) (SlotRepairRequest, bool) {
 	req := SlotRepairRequest{Slot: s.slot}
 
 	var maxObserved uint32
@@ -945,7 +949,7 @@ func (s *slotState) repairRequest(maxMissing int) (SlotRepairRequest, bool) {
 		req.HighestDataShredIndex = maxObserved + 1
 	}
 
-	req.MissingDataShreds = s.missingDataForRepair(maxObserved, maxMissing)
+	req.MissingDataShreds = s.missingDataForRepairWithPrefix(maxObserved, maxMissing, prefix)
 
 	if len(req.MissingDataShreds) == 0 && !req.NeedHighestDataShred {
 		return SlotRepairRequest{}, false
@@ -994,6 +998,10 @@ func (span codedSpan) requestsToUnlock() int {
 // promises more — without that, the tail waits on a HighestWindowIndex
 // round trip to be discovered.
 func (s *slotState) missingDataForRepair(maxObserved uint32, maxMissing int) []uint32 {
+	return s.missingDataForRepairWithPrefix(maxObserved, maxMissing, false)
+}
+
+func (s *slotState) missingDataForRepairWithPrefix(maxObserved uint32, maxMissing int, prefix bool) []uint32 {
 	spans := make([]codedSpan, 0, len(s.fecSets))
 	for _, fec := range s.fecSets {
 		if !fec.haveLayout || fec.layout.dataShreds == 0 {
@@ -1053,7 +1061,38 @@ func (s *slotState) missingDataForRepair(maxObserved uint32, maxMissing int) []u
 		return spans[order[a]].start < spans[order[b]].start
 	})
 
+	// For a streaming head, one earliest hole gates every later batch. Move
+	// just that span ahead of cheapest-unlock order; retain deficit capping
+	// and every existing request/admission limit. Without a known layout,
+	// prioritize one earliest missing data index rather than guessing a span.
+	var first []uint32
+	if prefix {
+		earliest := -1
+		for _, i := range order {
+			if earliest < 0 || spans[i].missing[0] < spans[earliest].missing[0] {
+				earliest = i
+			}
+		}
+		if len(uncovered) > 0 && (earliest < 0 || uncovered[0] < spans[earliest].missing[0]) {
+			first = uncovered[:1]
+			uncovered = uncovered[1:]
+		} else if earliest >= 0 {
+			first = spans[earliest].missing[:spans[earliest].requestsToUnlock()]
+			for j, i := range order {
+				if i == earliest {
+					order = append(order[:j], order[j+1:]...)
+					break
+				}
+			}
+		}
+	}
 	missing := make([]uint32, 0, min(maxMissing, 64))
+	for _, index := range first {
+		if len(missing) >= maxMissing {
+			return missing
+		}
+		missing = append(missing, index)
+	}
 	for _, i := range order {
 		span := spans[i]
 		for _, index := range span.missing[:span.requestsToUnlock()] {
@@ -1342,7 +1381,7 @@ func (a *SlotAssembler) RepairRequestsTiered(maxSlots int, maxMissingPerSlot int
 				HighestDataShredIndex: 0,
 			})
 		}
-		if req, ok := state.repairRequest(maxMissing); ok {
+		if req, ok := state.repairRequestWithPrefix(maxMissing, priorityPin && len(dst) == 0 && a.streamSubscriber != nil); ok {
 			seen[slot] = struct{}{}
 			return append(dst, req)
 		}

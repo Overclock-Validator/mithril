@@ -251,3 +251,62 @@ func TestHeadPolicy(t *testing.T) {
 		t.Fatalf("bulk policy = %+v, want no concurrent duplicate attempts", bulk)
 	}
 }
+
+func TestRepairSelectionPrefixBeforeCheapest(t *testing.T) {
+	s := newRepairSelectionSlot(9)
+	addCodedSet(s, 0, 32, 32, seq(0, 9), 12)
+	addCodedSet(s, 32, 32, 32, seq(32, 56), 6)
+	s.haveLast = true
+	s.lastIndex = 63
+	got := s.missingDataForRepairWithPrefix(63, 4, true)
+	if !reflect.DeepEqual(got, seq(10, 13)) {
+		t.Fatalf("prefix %v", got)
+	}
+	all := s.missingDataForRepairWithPrefix(63, 256, true)
+	if !reflect.DeepEqual(all, append(seq(10, 19), 57)) {
+		t.Fatalf("remaining order %v", all)
+	}
+}
+
+func TestRepairSelectionUncodedPrefixBeforeCoded(t *testing.T) {
+	s := newRepairSelectionSlot(9)
+	addUncodedData(s, seq(1, 31)...)
+	addCodedSet(s, 32, 32, 32, seq(32, 56), 6)
+	s.haveLast = true
+	s.lastIndex = 63
+	got := s.missingDataForRepairWithPrefix(63, 256, true)
+	if !reflect.DeepEqual(got, []uint32{0, 57}) {
+		t.Fatalf("uncoded prefix %v", got)
+	}
+	if got := s.missingDataForRepairWithPrefix(63, 0, true); len(got) != 0 {
+		t.Fatalf("zero budget: %v", got)
+	}
+}
+
+func TestRepairSelectionPrefixOnlyForStreamingPriorityHead(t *testing.T) {
+	a := NewSlotAssembler()
+	for _, slot := range []uint64{9, 10} {
+		s := newRepairSelectionSlot(slot)
+		addCodedSet(s, 0, 32, 32, seq(0, 9), 12)
+		addCodedSet(s, 32, 32, 32, seq(32, 56), 6)
+		s.haveLast = true
+		s.lastIndex = 63
+		a.slots[slot] = s
+	}
+	a.maxObservedSlot = 11
+	a.PrioritizeRepairRange(9, 10)
+	p, _ := a.RepairRequestsTiered(2, 256)
+	if len(p) != 2 || p[0].MissingDataShreds[0] != 57 {
+		t.Fatalf("nonstreaming order %v", p)
+	}
+	a.SubscribeStream(make(chan StreamEvent, 1))
+	p, _ = a.RepairRequestsTiered(2, 256)
+	if len(p) != 2 || p[0].MissingDataShreds[0] != 10 || p[1].MissingDataShreds[0] != 57 {
+		t.Fatalf("streaming head scope %v", p)
+	}
+	a.SubscribeStream(nil)
+	p, _ = a.RepairRequestsTiered(2, 256)
+	if p[0].MissingDataShreds[0] != 57 {
+		t.Fatal("disabled streaming retained prefix policy")
+	}
+}
