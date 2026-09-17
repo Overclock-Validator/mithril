@@ -256,3 +256,18 @@ completion/reset and changed parent markers invalidate its hint. Generation
 checks reject stale headers. Already-sent requests still use normal response and
 expiry handling. Notifications and repair wakeups remain nonblocking/coalesced;
 no extra workers or polling loop are introduced.
+
+### Highest-index repair followups
+
+A matched highest-index response triggers followup selection only after receiver
+admission and FEC recovery. The assembler supplies its current deficit-aware
+selection (at most 256 data requests), rather than treating the interval below
+the response as missing. Completed, completing, evicted and absent assembler
+slots produce no immediate followups. During disk-only catchup, selection waits
+for hydration instead of blindly fetching data that may already be spooled.
+
+Followups retain the shared token bucket, admission limits, bulk retry policy,
+and a reserved token for continued highest-index discovery when needed. A
+snapshot can still race with subsequent arrivals; this removes known redundant
+requests, not every possible duplicate. No assembler lock is held while signing
+or sending requests. Response matching and peer credit are unchanged.

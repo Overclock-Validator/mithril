@@ -755,9 +755,9 @@ func (r *UDPReceiver) processPacket(ctx context.Context, conn *net.UDPConn, pack
 		}
 		authenticatedRoot = &root
 	}
-	matchedRepair := false
+	matchedRepair, highestRepair := false, false
 	if onRepairSocket && r.repairClient != nil {
-		matchedRepair = r.repairClient.observeShredResponse(conn, packet, addr, shred)
+		matchedRepair, highestRepair = r.repairClient.matchShredResponse(packet, addr, shred)
 	}
 	if onRepairSocket && !matchedRepair {
 		r.repairSocketUnmatched.Add(1)
@@ -817,6 +817,9 @@ func (r *UDPReceiver) processPacket(ctx context.Context, conn *net.UDPConn, pack
 		default:
 		}
 		return true
+	}
+	if highestRepair {
+		r.repairClient.followupHighestResponse(conn, r.assembler, shred.Slot)
 	}
 	return r.submitCompletion(ctx, work, false)
 }

@@ -148,9 +148,9 @@ func TestEntryRepairResponseCorrelation(t *testing.T) {
 			c.outstanding[key] = rec
 			c.byResponse[responseKey] = key
 		}
-		require.False(t, c.observeShredResponse(nil, nonceTrailer(777), from, &Shred{Slot: 42, Index: 4, Type: ShredTypeData}))
+		require.False(t, observeRepairForTest(c, nil, nonceTrailer(777), from, &Shred{Slot: 42, Index: 4, Type: ShredTypeData}))
 		require.Empty(t, entryTraceConfig.repairs, "wrong index cannot be reported as matched")
-		require.True(t, c.observeShredResponse(nil, nonceTrailer(777), from, &Shred{Slot: 42, Index: 3, Type: ShredTypeData}))
+		require.True(t, observeRepairForTest(c, nil, nonceTrailer(777), from, &Shred{Slot: 42, Index: 3, Type: ShredTypeData}))
 		r := <-entryTraceConfig.repairs
 		require.Equal(t, "repair_response", r.Event)
 		require.Equal(t, uint32(777), r.Nonce)
@@ -158,7 +158,7 @@ func TestEntryRepairResponseCorrelation(t *testing.T) {
 		require.Equal(t, late, r.Late)
 		require.Equal(t, uint32(3), r.ReturnedIndex)
 		require.Greater(t, r.ResponseAt, r.RequestedAt)
-		require.False(t, c.observeShredResponse(nil, nonceTrailer(777), from, &Shred{Slot: 42, Index: 3, Type: ShredTypeData}))
+		require.False(t, observeRepairForTest(c, nil, nonceTrailer(777), from, &Shred{Slot: 42, Index: 3, Type: ShredTypeData}))
 		require.Empty(t, entryTraceConfig.repairs, "consumed nonce cannot count twice")
 	}
 }

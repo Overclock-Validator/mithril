@@ -621,21 +621,23 @@ func shredSatisfiesRequest(key repairRequestKey, shred *Shred) bool {
 	}
 }
 
-// observeShredResponse matches an incoming packet against outstanding repair
+// matchShredResponse matches an incoming packet against outstanding repair
 // requests (responder address + nonce). Returns true when the shred was
 // delivered BY REPAIR — it answers one of our requests — so the caller can
-// attribute it in per-slot repair accounting.
-func (c *repairClient) observeShredResponse(conn *net.UDPConn, packet []byte, from *net.UDPAddr, shred *Shred) bool {
+// attribute it in per-slot repair accounting. highest is a discovery hint for
+// followup selection only AFTER the receiver admits the shred; matching and
+// peer credit alone do not authorize requests for the claimed range.
+func (c *repairClient) matchShredResponse(packet []byte, from *net.UDPAddr, shred *Shred) (matched, highest bool) {
 	if from == nil || shred == nil {
-		return false
+		return false, false
 	}
 	nonce, ok := repairproto.ResponseNonce(packet)
 	if !ok {
-		return false
+		return false, false
 	}
 	addrKey, ok := repairAddressKeyFromUDP(from)
 	if !ok {
-		return false
+		return false, false
 	}
 	responseKey := repairResponseKey{addr: addrKey, nonce: nonce}
 
@@ -669,7 +671,7 @@ func (c *repairClient) observeShredResponse(conn *net.UDPConn, packet []byte, fr
 		// so it still expires into a deserved timeout and keeps its in-flight
 		// slot for retry. The peer gets nothing.
 		c.mu.Unlock()
-		return false
+		return false, false
 	}
 	if late {
 		// The expired record lives in exactly one generation; deleting from
@@ -707,63 +709,7 @@ func (c *repairClient) observeShredResponse(conn *net.UDPConn, packet []byte, fr
 	} else {
 		c.responses.Add(1)
 	}
-	// shredSatisfiesRequest already guaranteed slot match and a data shred; the
-	// gap-backfill path below is HWI-only.
-	if outstanding.key.kind != repairRequestHighestWindowIndex {
-		return true
-	}
-
-	peers := c.peerSnapshot(time.Now())
-	if len(peers) == 0 {
-		return true
-	}
-	start := outstanding.key.index
-	gap := 0
-	if shred.Index > start {
-		gap = int(shred.Index - start)
-	}
-	ask := gap
-	if ask > repairMaxFollowupRequests {
-		ask = repairMaxFollowupRequests
-	}
-	chainProbe := !shred.LastInSlot() && shred.Index < maxDataShredsPerSlot-1
-	if chainProbe {
-		ask++
-	}
-	if ask == 0 {
-		return true
-	}
-	// Followups draw from the SAME token bucket as the scan. This path used
-	// to be unmetered — with hundreds of probed slots it pushed the total
-	// send rate ~70% past the cap, which is exactly the flood the peer-side
-	// QoS ban punishes. When the bucket is dry the scan's deficit-aware
-	// selection covers the slot on its own cadence.
-	grant := c.takeRateTokens(ask)
-	if grant <= 0 {
-		return true
-	}
-	windowBudget := grant
-	if chainProbe && windowBudget > 0 {
-		windowBudget-- // reserve the chained probe's token
-	}
-	// Discovery followups are bulk-paced and go through the same inflight
-	// dedup as the scan, so a window index already being repaired is not
-	// re-sent here.
-	bulk := bulkPolicy()
-	acct := c.accountingTimeout()
-	followups := 0
-	for index := start; index < shred.Index && followups < windowBudget; index++ {
-		if c.sendShredAttempt(conn, peers, repairRequestWindowIndex, shred.Slot, index, bulk, acct) {
-			followups++
-		}
-	}
-	if chainProbe && followups < grant {
-		if c.sendShredAttempt(conn, peers, repairRequestHighestWindowIndex, shred.Slot, shred.Index+1, bulk, acct) {
-			followups++
-		}
-	}
-	c.returnRateTokens(grant - followups)
-	return true
+	return true, outstanding.key.kind == repairRequestHighestWindowIndex
 }
 
 // observeLatencyLocked folds one request->response latency into the EWMA and
@@ -821,7 +767,7 @@ func bulkPolicy() retryPolicy {
 // satisfyDataShred retires WindowIndex requests satisfied by a verified data
 // shred arriving through any path: a matched repair response, Turbine
 // broadcast, FEC/spool hydration, or a duplicate response. Request nonce
-// matching still happens first in observeShredResponse so the answering peer
+// matching still happens first in matchShredResponse so the answering peer
 // receives its proper timely/late credit.
 func (c *repairClient) satisfyDataShred(shred *Shred) {
 	if c == nil || shred == nil || shred.Type != ShredTypeData {
@@ -950,7 +896,7 @@ func (c *repairClient) sendShredAttempt(conn *net.UDPConn, peers []gossip.Repair
 	// count), then release BEFORE signing. Ed25519 signing is ~tens of
 	// microseconds; at tens of thousands of req/s, holding the lock across it
 	// serialized every send against the response-processing path
-	// (observeShredResponse needs the same lock) and could stall the UDP
+	// (matchShredResponse needs the same lock) and could stall the UDP
 	// receive loop into kernel drops. The reserve is enough for coherence: a
 	// response for this attempt cannot arrive until after we WriteToUDP below,
 	// which is strictly after we register outstanding/byResponse.
