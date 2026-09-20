@@ -53,11 +53,11 @@ func SyscallGetReturnDataImpl(vm sbpf.VM, returnDataAddr, length, programIdAddr 
 			return syscallErr(err)
 		}
 
-		if len(returnData) != len(returnDataResult) {
+		if int(length) != len(returnDataResult) {
 			return syscallErr(SyscallErrInvalidLength)
 		}
 
-		copy(returnDataResult, returnData)
+		copy(returnDataResult, returnData[:length])
 
 		var programIdResult []byte
 		programIdResult, err = vm.Translate(programIdAddr, solana.PublicKeyLength, true)

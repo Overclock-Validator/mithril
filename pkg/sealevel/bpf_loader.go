@@ -123,7 +123,11 @@ func (write *UpgradeableLoaderInstrWrite) MarshalWithEncoder(encoder *bin.Encode
 		return err
 	}
 
-	err = encoder.WriteBytes(write.Bytes, true)
+	// UpgradeableLoaderInstruction uses bincode's fixed-width u64 vector length.
+	if err = encoder.WriteUint64(uint64(len(write.Bytes)), bin.LE); err != nil {
+		return err
+	}
+	err = encoder.WriteBytes(write.Bytes, false)
 	return err
 }
 
