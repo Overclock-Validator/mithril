@@ -221,6 +221,11 @@ func (a *SlotAssembler) StreamStatusOf(g StreamGeneration) StreamStatus {
 
 func (a *SlotAssembler) streamStatusLocked(g StreamGeneration) StreamStatus {
 	if a.slots[g.slot] == g.state {
+		// Failed completions retain state for diagnostics. Polling must still
+		// see cancellation when the bounded event channel dropped its wake-up.
+		if g.state.streamCancelReason != "" {
+			return StreamGone
+		}
 		return StreamActive
 	}
 	if g.state.streamCompleted {

@@ -527,6 +527,10 @@ func (a *SlotAssembler) finalizeCompletion(work *slotCompletionWork, processed p
 		// state so catchup diagnostics report poison instead of a missing slot.
 		state.noteError(processed.err)
 		state.completing = false
+		// Diagnostics retain the poisoned slot, not a usable stream. Cancel
+		// readers now; cleanup returns capacity only after they have joined.
+		state.streamCancelReason = "completion_failed"
+		a.releasePrefetchLocked(state)
 		a.mu.Unlock()
 		return nil, processed.err
 	}

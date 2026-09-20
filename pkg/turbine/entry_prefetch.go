@@ -83,7 +83,7 @@ func newEntryPrefetchPool(ctx context.Context, a *SlotAssembler, verifier *trans
 
 func (a *SlotAssembler) prefetchEntriesLocked(s *slotState) {
 	p := a.entryPrefetch
-	if p == nil || p.closed || p.ctx.Err() != nil {
+	if p == nil || p.closed || p.ctx.Err() != nil || s.streamCancelReason != "" {
 		return
 	}
 	if s.batchIndex == nil && len(s.shreds) != 0 {

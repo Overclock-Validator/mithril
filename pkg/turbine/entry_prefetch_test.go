@@ -273,6 +273,14 @@ func TestEntryPrefetchInvalidRetainedTransactionFailsClosed(t *testing.T) {
 	}
 	require.ErrorContains(t, finalErr, "transaction 1")
 	require.False(t, a.SlotCompleted(300))
+	p.cleanup.Wait()
+	a.mu.Lock()
+	g := StreamGeneration{slot: 300, state: a.slots[300]}
+	slots, bytes := p.slots, p.bytes
+	a.mu.Unlock()
+	require.Equal(t, StreamGone, a.StreamStatusOf(g))
+	require.Zero(t, slots)
+	require.Zero(t, bytes)
 }
 
 func TestEntryPrefetchUpdateParentDiscardsInvalidOptimisticPrefix(t *testing.T) {
@@ -525,4 +533,149 @@ func TestEntryPrefetchResetRetainsQueuedReservations(t *testing.T) {
 	slots := p.slots
 	a.mu.Unlock()
 	require.Zero(t, slots)
+}
+
+// Failed full blocks remain available for diagnostics, but must not consume
+// the prefetch budget or remain usable streaming generations until retention.
+func TestEntryPrefetchFailedCompletionReleasesCapacity(t *testing.T) {
+	for _, dropEvents := range []bool{false, true} {
+		t.Run(fmt.Sprintf("drop_events=%v", dropEvents), func(t *testing.T) {
+			v := newTransactionVerifier(2, 16, nil)
+			defer v.closeAndWait()
+			a := NewSlotAssembler()
+			p := newEntryPrefetchPool(context.Background(), a, v)
+			defer p.closeAndWait()
+			capacity := 16
+			if dropEvents {
+				capacity = 0
+			}
+			events := make(chan StreamEvent, capacity)
+			a.SubscribeStream(events)
+			payload := prefetchTestPayload(t, verifierSignedTransactions(t, 1))
+			for i := 0; i <= entryPrefetchSlots; i++ {
+				slot := uint64(900 + i)
+				// Zero entry count plus trailing bytes is an invalid component.
+				batches := prefetchTestShreds(t, slot, payload, make([]byte, 16))
+				require.Nil(t, feedPrefetchShreds(t, a, batches[0]))
+				batch := waitPrefetchedBatch(t, a, slot, 0)
+				_, err := batch.verification.wait()
+				require.NoError(t, err)
+				a.mu.Lock()
+				s := a.slots[slot]
+				g := StreamGeneration{slot: slot, state: s}
+				a.mu.Unlock()
+				var failure error
+				for _, sh := range batches[1] {
+					blk, err := a.AddShred(sh)
+					require.Nil(t, blk)
+					if err != nil {
+						failure = err
+					}
+				}
+				require.Error(t, failure)
+				count, last := a.SlotAssemblyErrors(slot)
+				require.Positive(t, count)
+				require.Equal(t, failure.Error(), last)
+				require.False(t, a.SlotCompleted(slot))
+				require.Equal(t, StreamGone, a.StreamStatusOf(g))
+				require.Empty(t, a.PendingStreamBatches(g, 0))
+				if !dropEvents {
+					event := nextStreamEvent(t, events, StreamCancelled)
+					require.Equal(t, g, event.Generation)
+					require.Equal(t, "completion_failed", event.Reason)
+				}
+				p.cleanup.Wait()
+				a.mu.Lock()
+				retained, slots, bytes := a.slots[slot], p.slots, p.bytes
+				// Repeated release/admission cannot double-refund or resurrect it.
+				a.releasePrefetchLocked(s)
+				a.prefetchEntriesLocked(s)
+				afterSlots := p.slots
+				a.mu.Unlock()
+				require.Same(t, s, retained, "preserve poisoned-slot diagnostics")
+				require.Zero(t, slots)
+				require.Zero(t, bytes)
+				require.Zero(t, afterSlots)
+			}
+			good := prefetchTestShreds(t, 920, payload, buildAlpenglowEndingTick(t))
+			require.Nil(t, feedPrefetchShreds(t, a, good[0]))
+			waitPrefetchedBatch(t, a, 920, 0)
+			blk := feedPrefetchShreds(t, a, good[1])
+			require.NotNil(t, blk)
+			require.True(t, blk.TransactionSignaturesVerified())
+		})
+	}
+}
+
+func TestEntryPrefetchFailedCompletionJoinsReaders(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	v := newTransactionVerifier(1, 8, func(*solana.Transaction) error {
+		close(started)
+		<-release
+		return nil
+	})
+	defer v.closeAndWait()
+	a := NewSlotAssembler()
+	p := newEntryPrefetchPool(context.Background(), a, v)
+	defer p.closeAndWait()
+	defer once.Do(func() { close(release) })
+	batches := prefetchTestShreds(t, 930, prefetchTestPayload(t, verifierSignedTransactions(t, 1)), make([]byte, 16))
+	require.Nil(t, feedPrefetchShreds(t, a, batches[0]))
+	waitSignal(t, started, "prefetch verifier")
+	waitPrefetchedBatch(t, a, 930, 0)
+	var failure error
+	for _, sh := range batches[1] {
+		blk, err := a.AddShred(sh)
+		require.Nil(t, blk)
+		if err != nil {
+			failure = err
+		}
+	}
+	require.Error(t, failure)
+	a.mu.Lock()
+	s := a.slots[930]
+	released, ctxErr, slots, bytes := s.prefetch.released, s.prefetch.ctx.Err(), p.slots, p.bytes
+	a.mu.Unlock()
+	require.True(t, released)
+	require.ErrorIs(t, ctxErr, context.Canceled)
+	require.Equal(t, 1, slots, "reader still owns the reservation")
+	require.Positive(t, bytes)
+	require.Equal(t, StreamGone, a.StreamStatusOf(StreamGeneration{slot: 930, state: s}))
+	once.Do(func() { close(release) })
+	p.cleanup.Wait()
+	a.mu.Lock()
+	slots, bytes = p.slots, p.bytes
+	a.mu.Unlock()
+	require.Zero(t, slots)
+	require.Zero(t, bytes)
+}
+
+// A failed generation that never received a reservation must not acquire one
+// later when capacity becomes available (or prefetch is attached).
+func TestEntryPrefetchFailedCompletionWithoutReservation(t *testing.T) {
+	a := NewSlotAssembler()
+	batches := prefetchTestShreds(t, 940, prefetchTestPayload(t, verifierSignedTransactions(t, 1)), make([]byte, 16))
+	require.Nil(t, feedPrefetchShreds(t, a, batches[0]))
+	var failure error
+	for _, sh := range batches[1] {
+		blk, err := a.AddShred(sh)
+		require.Nil(t, blk)
+		if err != nil {
+			failure = err
+		}
+	}
+	require.Error(t, failure)
+	v := newTransactionVerifier(1, 8, nil)
+	defer v.closeAndWait()
+	p := newEntryPrefetchPool(context.Background(), a, v)
+	defer p.closeAndWait()
+	a.mu.Lock()
+	s := a.slots[940]
+	a.prefetchEntriesLocked(s)
+	reserved, slots := s.prefetch, p.slots
+	a.mu.Unlock()
+	require.Nil(t, reserved)
+	require.Zero(t, slots)
+	require.Equal(t, StreamGone, a.StreamStatusOf(StreamGeneration{slot: 940, state: s}))
 }
