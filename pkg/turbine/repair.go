@@ -287,6 +287,8 @@ type peerRecord struct {
 	latEWMASec  float64 // smoothed response latency, timely + late
 	score       float64 // rolling quality in [0,1]; see notePeerOutcomeLocked
 	lastMatched time.Time
+	// Stop preferring a silent peer before its 60-second responder window expires.
+	timeoutsSinceMatch uint8
 }
 
 // RepairPeerReport is one peer's service record, for file-log peer tables.
@@ -1140,7 +1142,7 @@ func (c *repairClient) rebuildRankedLocked(peers []gossip.RepairPeer, now time.T
 		if !ok {
 			continue
 		}
-		if rec := c.perPeer[key]; rec != nil && now.Sub(rec.lastMatched) <= repairResponderWindow {
+		if rec := c.perPeer[key]; rec != nil && now.Sub(rec.lastMatched) <= repairResponderWindow && rec.timeoutsSinceMatch < 3 {
 			responders = append(responders, scoredPeer{peer: peer, score: rec.score})
 		}
 	}
@@ -1223,6 +1225,7 @@ func (c *repairClient) notePeerTimelyLocked(addr repairAddressKey, lat time.Dura
 	rec := c.notePeerOutcomeLocked(addr, quality, lat)
 	rec.timely++
 	rec.lastMatched = time.Now()
+	rec.timeoutsSinceMatch = 0
 	if rec.inflight > 0 {
 		rec.inflight-- // late answers don't decrement: expiry already did
 	}
@@ -1232,11 +1235,15 @@ func (c *repairClient) notePeerLateLocked(addr repairAddressKey, lat time.Durati
 	rec := c.notePeerOutcomeLocked(addr, repairScoreLateReward, lat)
 	rec.late++
 	rec.lastMatched = time.Now()
+	rec.timeoutsSinceMatch = 0
 }
 
 func (c *repairClient) notePeerTimeoutLocked(addr repairAddressKey) {
 	rec := c.notePeerOutcomeLocked(addr, 0, 0)
 	rec.timeouts++
+	if rec.timeoutsSinceMatch < 3 {
+		rec.timeoutsSinceMatch++
+	}
 	if rec.inflight > 0 {
 		rec.inflight--
 	}

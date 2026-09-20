@@ -345,8 +345,11 @@ func (bs *BlockSource) runTurbineStream() {
 		receiver.SetLeaderForSlot(bs.leaderForSlot)
 		receiver.SetShredVersion(bs.turbineShredVersion)
 		receiver.SetFirstShredSink(bs.alpenglowFirstShredSink)
-		if bs.shredSpoolDir != "" {
-			if spool, serr := turbine.OpenShredSpool(bs.shredSpoolDir, shredSpoolMaxBytes); serr != nil {
+		receiver.SetReplaySlotSource(bs.lastExecutedSlot.Load)
+		if bs.shredSpool != nil {
+			receiver.SetSharedShredSpool(bs.shredSpool)
+		} else if bs.shredSpoolDir != "" {
+			if spool, serr := turbine.OpenShredSpool(bs.shredSpoolDir, ShredSpoolMaxBytes); serr != nil {
 				mlog.Log.Warnf("shred spool disabled (%s): %v", bs.shredSpoolDir, serr)
 			} else {
 				receiver.SetShredSpool(spool)

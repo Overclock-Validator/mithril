@@ -117,8 +117,8 @@ func (bs *BlockSource) maybeRescueStalledCatchupSlot() {
 // serves only the trailing verifier. Turbine + repair are the native block
 // path; RPC block fetch exists ONLY for the too-far-behind case (the same
 // threshold, re-evaluated live inside the drive) — never on a stall timer.
-// A fresh boot within the threshold WAITS for turbine to wake (shreds
-// received, repair peers known) with RPC held off the gap entirely — shreds
+// With RPC fallback enabled, a fresh boot within the threshold waits for
+// turbine to wake (shreds received, repair peers known) — shreds
 // are coming, so the node waits for shreds; if the gap outgrows the
 // threshold while waiting, the far-behind rule releases the hold to RPC.
 // The only RPC bridge left is the no-tip-signal edge (RPC tip unknown AND
@@ -127,7 +127,7 @@ func (bs *BlockSource) runRepairCatchup(ctx context.Context, receiver *turbine.U
 	// The construction-time RPC hold persists until repair arms or is ruled
 	// out (gap too large, no tip signal). It is deliberately NOT released
 	// just because turbine is still waking up: a fresh boot within the
-	// repair threshold waits for shreds instead of starting an RPC catchup
+	// repair threshold waits for its repair path instead of starting an RPC catchup
 	// it would abandon.
 	first := true
 	releaseHold := func() {
@@ -197,18 +197,17 @@ func (bs *BlockSource) runRepairCatchup(ctx context.Context, receiver *turbine.U
 			(bs.repairCatchupMaxGapSlots > 0 && gap <= bs.repairCatchupMaxGapSlots)
 		eligible := bs.repairCatchupEligible(gapOK)
 
-		// Repair can only fill the gap if turbine is demonstrably alive: shreds
-		// actually received (proves the socket/gossip path) and repair peers
-		// known (proves there is someone to ask). Arming before that just
-		// stalls the drive and burns a re-arm cooldown while RPC is gated off
-		// the gap — the boot-time failure mode this guard exists for.
+		// Shreds-only startup must be able to request its first shred. Live
+		// traffic may belong to an epoch whose leader schedule is not loaded
+		// until replay catches up. Keep the existing live-traffic gate when
+		// repair is competing with RPC fallback.
 		turbineReady := false
 		var shredEdge uint64
 		repairPeers := 0
 		if eligible {
 			shredEdge, _ = receiver.ShredEdges()
 			repairPeers = receiver.Stats().Repair.Peers
-			turbineReady = shredEdge > 0 && repairPeers > 0
+			turbineReady = repairPeers > 0 && (shredEdge > 0 || !bs.rpcFallbackEnabled)
 		}
 
 		if !eligible || !turbineReady {
@@ -220,12 +219,10 @@ func (bs *BlockSource) runRepairCatchup(ctx context.Context, receiver *turbine.U
 					lastNotReadyLog = time.Now()
 					switch {
 					case !bs.rpcFallbackEnabled:
-						// The receiver counters split "nothing arrives" from
-						// "arrivals are rejected" (missing leader schedule,
-						// bad signatures, unparseable) — the first question
-						// to answer when this line repeats.
+						// A shreds-only boot needs a repair peer, even before
+						// any live shred is accepted.
 						stats := receiver.Stats()
-						mlog.Log.Infof("catchup: WAITING for turbine shreds (received: %v, repair peers: %d) — RPC block fetch is disabled (block.rpc_fallback=false); gap %d slots | receiver: packets %d, missing_leader %d, sig_err %d, parse_err %d",
+						mlog.Log.Infof("catchup: WAITING for repair peers (received shreds: %v, peers: %d) — RPC block fetch is disabled (block.rpc_fallback=false); gap %d slots | receiver: packets %d, missing_leader %d, sig_err %d, parse_err %d",
 							shredEdge > 0, repairPeers, gap, stats.Packets, stats.MissingLeaders, stats.SignatureErrors, stats.ParseErrors)
 					case first:
 						mlog.Log.Infof("catchup: gap %d slots is within the repair threshold (%d) — holding RPC block fetch and WAITING for turbine shreds (received: %v, repair peers: %d); RPC engages only if the gap outgrows the threshold", gap, bs.repairCatchupMaxGapSlots, shredEdge > 0, repairPeers)
@@ -235,7 +232,7 @@ func (bs *BlockSource) runRepairCatchup(ctx context.Context, receiver *turbine.U
 				}
 				// Within-threshold with turbine still waking: the RPC hold is
 				// NOT released — shreds are the native path, so a fresh boot
-				// waits for them instead of opening an RPC catchup it would
+				// waits for the native path instead of opening an RPC catchup it would
 				// abandon. The far-behind rule stands watch: if the gap
 				// outgrows the threshold while waiting, eligibility flips and
 				// the branch below releases the hold to RPC.

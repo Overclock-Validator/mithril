@@ -28,24 +28,47 @@ import (
 // merely stopping at it on read would make all later repairs unreachable and
 // could feed a packet assembled across the crash boundary back into replay.
 // Files below the floor are deleted as replay advances; when the byte cap is
-// exceeded the HIGHEST slots are dropped first — the live edge is cheap to
-// re-fetch near the tip, the low end borders replay and is what repair would
-// otherwise pay for dearly.
+// exceeded catchup keeps the lowest slots needed by replay. After live handoff,
+// recent slots take priority so old data cannot starve producer repair storage.
 type ShredSpool struct {
-	mu          sync.Mutex
-	dir         string
-	open        map[uint64]*spoolFile
-	sizes       map[uint64]int64                      // per-slot bytes on disk (open writers included)
-	seen        map[uint64]map[spoolShredKey]struct{} // distinct shreds appended this run
-	validated   map[uint64]bool                       // adopted files whose record tail was checked this run
-	complete    map[uint64]SpoolSlotMeta
-	journal     *os.File // append-only completeness journal (complete.idx)
-	bytes       int64
-	maxBytes    int64
-	highestSlot uint64
-	haveHighest bool
-	floor       uint64
-	closed      bool
+	mu           sync.Mutex
+	recovery     map[uint64]spoolRecoveryIndex
+	dir          string
+	open         map[uint64]*spoolFile
+	sizes        map[uint64]int64                      // per-slot bytes on disk (open writers included)
+	seen         map[uint64]map[spoolShredKey]struct{} // distinct shreds appended this run
+	validated    map[uint64]bool                       // adopted files whose record tail was checked this run
+	complete     map[uint64]SpoolSlotMeta
+	journal      *os.File // append-only completeness journal (complete.idx)
+	bytes        int64
+	maxBytes     int64
+	highestSlot  uint64
+	lowestSlot   uint64
+	haveHighest  bool
+	preferRecent bool
+	floor        uint64
+	closed       bool
+
+	receiverGeneration uint64
+}
+
+// beginReceiver starts a new owner of retention updates after the previous
+// receiver has stopped. A replay rewind may need slots below its old floor.
+func (s *ShredSpool) beginReceiver() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.receiverGeneration++
+	s.floor = 0
+	s.preferRecent = false
+	return s.receiverGeneration
+}
+
+func (s *ShredSpool) endReceiver(generation uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.receiverGeneration == generation {
+		s.receiverGeneration++
+	}
 }
 
 // SpoolSlotMeta records a slot proven FULLY assembled: every data shred
@@ -132,6 +155,9 @@ func OpenShredSpool(dir string, maxBytes int64) (*ShredSpool, error) {
 		}
 		s.sizes[slot] = info.Size()
 		s.bytes += info.Size()
+		if !s.haveHighest || slot < s.lowestSlot {
+			s.lowestSlot = slot
+		}
 		if !s.haveHighest || slot > s.highestSlot {
 			s.highestSlot, s.haveHighest = slot, true
 		}
@@ -251,14 +277,18 @@ func (s *ShredSpool) AppendShred(shred *Shred, packet []byte) bool {
 	if shred == nil || len(packet) == 0 {
 		return false
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.appendShredLocked(shred, packet)
+}
+
+func (s *ShredSpool) appendShredLocked(shred *Shred, packet []byte) bool {
 	key := spoolShredKey{
 		type_:       shred.Type,
 		index:       shred.Index,
 		fecSetIndex: shred.FECSetIndex,
 		position:    shred.Position,
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if slotSeen := s.seen[shred.Slot]; slotSeen != nil {
 		if _, duplicate := slotSeen[key]; duplicate {
 			return false
@@ -310,6 +340,9 @@ func (s *ShredSpool) appendLocked(slot uint64, packet []byte) bool {
 			s.sizes[slot] = int64(len(spoolFileMagic))
 			s.bytes += int64(len(spoolFileMagic))
 			s.validated[slot] = true
+			if !s.haveHighest || slot < s.lowestSlot {
+				s.lowestSlot = slot
+			}
 			if !s.haveHighest || slot > s.highestSlot {
 				s.highestSlot, s.haveHighest = slot, true
 			}
@@ -327,6 +360,11 @@ func (s *ShredSpool) appendLocked(slot uint64, packet []byte) bool {
 	written := int64(spoolRecordHeaderSize + len(packet))
 	s.sizes[slot] += written
 	s.bytes += written
+	if idx := s.recovery[slot]; idx != nil {
+		if err := idx.add(slot, packet, s.sizes[slot]-written); err != nil {
+			delete(s.recovery, slot)
+		}
+	}
 	return true
 }
 
@@ -346,6 +384,14 @@ func (s *ShredSpool) closeOldestLocked() {
 	}
 }
 
+// FlushSlot releases buffered packets and closes the slot's append handle.
+// This is best-effort cache retention, not fsync or a power-loss guarantee.
+func (s *ShredSpool) FlushSlot(slot uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closeSlotLocked(slot)
+}
+
 func (s *ShredSpool) closeSlotLocked(slot uint64) {
 	if sf := s.open[slot]; sf != nil {
 		_ = sf.w.Flush()
@@ -354,12 +400,9 @@ func (s *ShredSpool) closeSlotLocked(slot uint64) {
 	}
 }
 
-// ensureRoomLocked applies the retention policy before writing. Once the
-// spool is full, a new slot at/above the highest retained slot is rejected in
-// O(1): writing and immediately deleting it was both useless and, formerly,
-// performed an O(number-of-slots) highest-slot scan for every packet. A lower
-// catch-up slot may evict whole future slots; recomputing the maximum once per
-// evicted slot is rare and preserves the low-end-first retention contract.
+// ensureRoomLocked rejects lower-priority packets in O(1) when full. Catchup
+// prefers lower slots; live replay prefers recent slots. Bounds are recomputed
+// only when a whole slot is evicted, not for every rejected packet.
 func (s *ShredSpool) ensureRoomLocked(slot uint64, additional int64) bool {
 	if s.maxBytes <= 0 || s.bytes+additional <= s.maxBytes {
 		return true
@@ -368,10 +411,16 @@ func (s *ShredSpool) ensureRoomLocked(slot uint64, additional int64) bool {
 		if !s.haveHighest {
 			return additional <= s.maxBytes
 		}
-		if slot >= s.highestSlot {
+		victim := s.highestSlot
+		if s.preferRecent {
+			if slot <= s.lowestSlot {
+				return false
+			}
+			victim = s.lowestSlot
+		} else if slot >= s.highestSlot {
 			return false
 		}
-		s.dropSlotLocked(s.highestSlot)
+		s.dropSlotLocked(victim)
 	}
 	return true
 }
@@ -382,6 +431,7 @@ func (s *ShredSpool) dropSlotLocked(slot uint64) {
 	delete(s.sizes, slot)
 	delete(s.seen, slot)
 	delete(s.validated, slot)
+	delete(s.recovery, slot)
 	delete(s.complete, slot)
 	_ = os.Remove(s.pathFor(slot))
 	if s.journal != nil {
@@ -389,15 +439,19 @@ func (s *ShredSpool) dropSlotLocked(slot uint64) {
 		// re-created before the journal is compacted on restart.
 		s.journal.Write(spoolJournalRecord(slot, SpoolSlotMeta{}))
 	}
-	if s.haveHighest && slot == s.highestSlot {
-		s.recomputeHighestLocked()
+	if s.haveHighest && (slot == s.highestSlot || slot == s.lowestSlot) {
+		s.recomputeBoundsLocked()
 	}
 }
 
-func (s *ShredSpool) recomputeHighestLocked() {
+func (s *ShredSpool) recomputeBoundsLocked() {
 	s.haveHighest = false
 	s.highestSlot = 0
+	s.lowestSlot = 0
 	for slot := range s.sizes {
+		if !s.haveHighest || slot < s.lowestSlot {
+			s.lowestSlot = slot
+		}
 		if !s.haveHighest || slot > s.highestSlot {
 			s.highestSlot, s.haveHighest = slot, true
 		}
@@ -409,12 +463,16 @@ func (s *ShredSpool) recomputeHighestLocked() {
 // completion record from being resurrected if repair immediately recreates a
 // partial file with the same slot number.
 func (s *ShredSpool) DiscardSlot(slot uint64) {
+	s.discardSlot(slot, 0)
+}
+
+func (s *ShredSpool) discardSlot(slot, generation uint64) {
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.closed || (generation != 0 && generation != s.receiverGeneration) {
 		return
 	}
 	s.dropSlotLocked(slot)
@@ -483,6 +541,7 @@ func (s *ShredSpool) readSlotLocked(slot uint64) ([][]byte, error) {
 		validEnd = packetEnd
 	}
 	if validEnd != len(data) {
+		delete(s.recovery, slot)
 		if err := os.Truncate(path, int64(validEnd)); err != nil {
 			return nil, fmt.Errorf("truncate corrupt shred spool tail for slot %d: %w", slot, err)
 		}
@@ -501,8 +560,24 @@ func (s *ShredSpool) readSlotLocked(slot uint64) ([][]byte, error) {
 // SetFloor advances the retention floor, deleting slot files strictly below
 // it. Idempotent, monotonic.
 func (s *ShredSpool) SetFloor(slot uint64) {
+	s.setFloor(slot, 0)
+}
+
+func (s *ShredSpool) setFloor(slot, generation uint64) {
+	s.setRetention(slot, generation, false)
+}
+
+func (s *ShredSpool) setReplayFloor(slot, generation uint64) {
+	s.setRetention(slot, generation, true)
+}
+
+func (s *ShredSpool) setRetention(slot, generation uint64, recent bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed || (generation != 0 && generation != s.receiverGeneration) {
+		return
+	}
+	s.preferRecent = recent
 	if slot <= s.floor {
 		return
 	}

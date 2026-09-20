@@ -2596,6 +2596,7 @@ postBootstrap:
 
 	localBlocks := make(chan *block.Block, 16)
 	var sharedGossip *gossip.Client
+	var sharedShredSpool *turbine.ShredSpool
 	var validatorPrewarmBlocks []*block.Block
 	if consensusMode == "validator" {
 		if turbinePrewarm != nil {
@@ -2604,6 +2605,16 @@ postBootstrap:
 			turbinePrewarm = nil
 			if len(validatorPrewarmBlocks) > 0 || dropped > 0 {
 				mlog.Log.Infof("turbine prewarm handover for validator startup: %d blocks (%d dropped)", len(validatorPrewarmBlocks), dropped)
+			}
+		}
+
+		if dir := catchupShredSpoolDir(); dir != "" {
+			sharedShredSpool, err = turbine.OpenShredSpool(dir, blockstream.ShredSpoolMaxBytes)
+			if err != nil {
+				mlog.Log.Warnf("producer shred spool disabled: %v", err)
+			} else {
+				// Registered before producer shutdown so all users stop before close.
+				defer sharedShredSpool.Close()
 			}
 		}
 
@@ -2756,6 +2767,7 @@ postBootstrap:
 			Identity:       solana.PrivateKey(validatorIdentity),
 			AccountsDb:     accountsDb,
 			Broadcaster:    broadcaster,
+			ShredSpool:     sharedShredSpool,
 			ShredVersion:   uint16(turbineShredVersion),
 			EpochSchedule:  epochSchedule,
 			AlpenglowClock: true,
@@ -2840,6 +2852,7 @@ postBootstrap:
 		PrewarmBlocks:              validatorPrewarmBlocks,
 		ShredSpoolDir:              catchupShredSpoolDir(),
 		GossipClient:               sharedGossip,
+		ShredSpool:                 sharedShredSpool,
 		TurbineStakesForSlot:       turbineStakesForSlot,
 		TurbineEpochForSlot: func(slot uint64) uint64 {
 			if alpenglowEpochSchedule == nil {

@@ -43,6 +43,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/state"
 	"github.com/Overclock-Validator/mithril/pkg/statsd"
+	"github.com/Overclock-Validator/mithril/pkg/turbine"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
@@ -83,6 +84,8 @@ type BlockFetchOpts struct {
 	// ShredSpoolDir: on-disk verified-shred spool shared by prewarm and the
 	// block source (empty = disabled).
 	ShredSpoolDir string
+	// ShredSpool is shared with production and remains owned by the node.
+	ShredSpool *turbine.ShredSpool
 	// LocalBlocks carries fully frozen blocks produced by this validator. Replay
 	// adopts the already-mutated leader SlotCtx and does not re-execute.
 	LocalBlocks          <-chan *b.Block
@@ -2340,6 +2343,7 @@ func ReplayBlocks(
 		opts.RepairMaxRequestsPerSecond = blockFetchOpts.RepairMaxRequestsPerSecond
 		opts.DisableRPCBlockFetch = blockFetchOpts.DisableRPCBlockFetch
 		opts.ShredSpoolDir = blockFetchOpts.ShredSpoolDir
+		opts.ShredSpool = blockFetchOpts.ShredSpool
 		opts.LocalLeaderForSlot = blockFetchOpts.LocalLeaderForSlot
 		opts.LocalBlocks = blockFetchOpts.LocalBlocks
 		opts.GossipClient = blockFetchOpts.GossipClient
@@ -2887,6 +2891,15 @@ func ReplayBlocks(
 				boundaryParentSlot := block.ParentSlot
 				if lastSlotCtx != nil {
 					boundaryParentSlot = lastSlotCtx.Slot
+				}
+				// The verifier's normal lag cannot advance until replay crosses the
+				// epoch boundary. Verify the executed parent before folding it.
+				if trailingVerifier != nil && TrailingVerifierCfg.Required && boundaryParentSlot > mithrilState.LastRootedSlot {
+					if err := trailingVerifier.WaitThrough(ctx, boundaryParentSlot); err != nil {
+						recordReplayDivergenceEvidence(mithrilState, trailingVerifier.Failure())
+						result.Error = fmt.Errorf("verify epoch parent %d: %w", boundaryParentSlot, err)
+						break
+					}
 				}
 				if foldRootedPrefix(true) {
 					break

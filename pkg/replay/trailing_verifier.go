@@ -150,13 +150,14 @@ type TrailingVerifier struct {
 	cfg VerifierConfig
 	src blockVerificationSource
 
-	mu          sync.Mutex
-	pending     map[uint64]*pendingDigest
-	order       []uint64 // ascending recorded slots not yet verified
-	firstSlot   uint64   // first slot ever recorded (watermark floor anchor)
-	verified    uint64   // all recorded slots <= verified are verified
-	executedTip uint64
-	failure     *ReplayDivergence
+	mu            sync.Mutex
+	pending       map[uint64]*pendingDigest
+	order         []uint64 // ascending recorded slots not yet verified
+	firstSlot     uint64   // first slot ever recorded (watermark floor anchor)
+	verified      uint64   // all recorded slots <= verified are verified
+	executedTip   uint64
+	verifyThrough uint64 // executed prefix needed before replay can advance
+	failure       *ReplayDivergence
 
 	verifiedCount uint64
 	requeues      uint64
@@ -213,6 +214,42 @@ func (v *TrailingVerifier) SetExecutedTip(slot uint64) {
 		v.executedTip = slot
 	}
 	v.mu.Unlock()
+}
+
+// WaitThrough verifies an executed prefix without waiting for the normal lag.
+// Run still enforces the RPC budget, finalized commitment and retry backoff.
+func (v *TrailingVerifier) WaitThrough(ctx context.Context, slot uint64) error {
+	if v == nil {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	v.mu.Lock()
+	if slot > v.executedTip {
+		v.mu.Unlock()
+		return fmt.Errorf("cannot verify unexecuted slot %d", slot)
+	}
+	if slot > v.verifyThrough {
+		v.verifyThrough = slot
+	}
+	v.mu.Unlock()
+
+	ticker := time.NewTicker(time.Second / time.Duration(v.cfg.MaxRPS))
+	defer ticker.Stop()
+	for {
+		if div := v.Failure(); div != nil {
+			return div
+		}
+		if v.VerifiedWatermark() >= slot {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 // VerifiedWatermark returns the highest slot V such that every recorded slot
@@ -286,7 +323,7 @@ func (v *TrailingVerifier) verifyNext() {
 		if cand == nil {
 			continue
 		}
-		if v.executedTip < v.cfg.LagSlots || s > v.executedTip-v.cfg.LagSlots {
+		if s > v.verifyThrough && (v.executedTip < v.cfg.LagSlots || s > v.executedTip-v.cfg.LagSlots) {
 			break // too fresh; order is ascending so nothing later is eligible
 		}
 		if now.Before(cand.nextTry) {

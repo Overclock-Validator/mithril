@@ -45,10 +45,14 @@ type UDPReceiver struct {
 	once            sync.Once
 	readyOnce       sync.Once
 
-	spool       *ShredSpool
-	hydrLo      atomic.Uint64
-	hydrHi      atomic.Uint64
-	hydrateKick chan struct{}
+	spool        *ShredSpool
+	hydrLo       atomic.Uint64
+	hydrHi       atomic.Uint64
+	hydrateKick  chan struct{}
+	hydrationMu  sync.Mutex
+	replayedSlot func() uint64
+
+	spoolGeneration uint64 // Nonzero when borrowing the node-owned spool.
 	// Hydration outcomes: whether spooled slots complete purely from disk
 	// (their own data + spooled coding via recovery) or hand holes to network
 	// repair — the number that says if the freshness-repair lead time is
@@ -280,7 +284,7 @@ func (r *UDPReceiver) ResetSlotAndDiscardSpool(slot uint64) {
 	}
 	r.assembler.ResetSlot(slot)
 	if r.spool != nil {
-		r.spool.DiscardSlot(slot)
+		r.spool.discardSlot(slot, r.spoolGeneration)
 	}
 }
 
@@ -299,7 +303,7 @@ func (r *UDPReceiver) RejectAlpenglowBlockIDAndDiscardSlot(slot uint64, blockID 
 	r.assembler.RejectAlpenglowBlockID(slot, blockID)
 	r.assembler.ResetSlot(slot)
 	if r.spool != nil {
-		r.spool.DiscardSlot(slot)
+		r.spool.discardSlot(slot, r.spoolGeneration)
 	}
 }
 
@@ -333,15 +337,43 @@ func (r *UDPReceiver) ShredObservation(slot uint64) (PartialShredObservation, bo
 	return r.assembler.ShredObservation(slot)
 }
 
-// SetRetentionFloor pins the assembler's age cutoff for repair catchup: slots
-// >= floor stay accepted however far they trail the live edge. 0 restores the
-// normal lag-based retention.
-// SetShredSpool attaches the on-disk shred spool. Must be called before Run.
+// SetShredSpool transfers spool ownership to the receiver. Call before Run.
 func (r *UDPReceiver) SetShredSpool(spool *ShredSpool) {
 	r.spool = spool
+	r.spoolGeneration = 0
 	// Journal completeness the moment a slot fully assembles — including
 	// during hydration of adopted files, which self-heals missing markers.
 	r.assembler.SetOnComplete(spool.MarkComplete)
+}
+
+// SetSharedShredSpool borrows a node-owned spool without closing it on exit.
+// Call before Run, after the previous receiver using this spool has stopped.
+func (r *UDPReceiver) SetSharedShredSpool(spool *ShredSpool) {
+	r.SetShredSpool(spool)
+	r.spoolGeneration = spool.beginReceiver()
+}
+
+// SetReplaySlotSource supplies the consumed replay frontier for background cache
+// retention. Call before Run; the callback must be safe for concurrent reads.
+func (r *UDPReceiver) SetReplaySlotSource(source func() uint64) {
+	r.replayedSlot = source
+}
+
+func (r *UDPReceiver) pruneReplayedShreds() {
+	r.hydrationMu.Lock()
+	defer r.hydrationMu.Unlock()
+	if r.spool == nil || r.replayedSlot == nil || r.hydrHi.Load() != 0 {
+		return
+	}
+	// Keep the normal assembly history behind replay, not behind the network tip.
+	// An active catchup window owns retention until its handoff completes.
+	if slot := r.replayedSlot(); slot != 0 {
+		var floor uint64
+		if slot > maxRetainedCompletedSlotLag {
+			floor = slot - maxRetainedCompletedSlotLag
+		}
+		r.spool.setReplayFloor(floor, r.spoolGeneration)
+	}
 }
 
 // SetHydrationWindow bounds in-RAM assembly during catchup: verified shreds
@@ -350,10 +382,16 @@ func (r *UDPReceiver) SetShredSpool(spool *ShredSpool) {
 // the assembler AHEAD of replay — prefetch, not just-in-time. hi == 0
 // disables the policy (normal near-tip operation).
 func (r *UDPReceiver) SetHydrationWindow(lo, hi uint64) {
+	r.hydrationMu.Lock()
+	defer r.hydrationMu.Unlock()
 	r.hydrLo.Store(lo)
 	r.hydrHi.Store(hi)
-	if r.spool != nil && lo > 8 {
-		r.spool.SetFloor(lo - 8)
+	if r.spool != nil && (lo > 8 || hi != 0) {
+		var floor uint64
+		if lo > 8 {
+			floor = lo - 8
+		}
+		r.spool.setFloor(floor, r.spoolGeneration)
 	}
 	// Keep the freshness-repair scan aligned with the RAM policy: with the
 	// window ON, only the last spoolLiveAssemblyLag slots assemble in RAM,
@@ -370,6 +408,8 @@ func (r *UDPReceiver) SetHydrationWindow(lo, hi uint64) {
 	}
 }
 
+// SetRetentionFloor pins the assembler's age cutoff during repair catchup.
+// Zero restores normal lag-based retention.
 func (r *UDPReceiver) SetRetentionFloor(slot uint64) {
 	r.assembler.SetRetentionFloor(slot)
 }
@@ -491,6 +531,9 @@ func (r *UDPReceiver) signalReady(err error) {
 }
 
 func (r *UDPReceiver) Run(ctx context.Context) error {
+	if r.spoolGeneration != 0 {
+		defer r.spool.endReceiver(r.spoolGeneration)
+	}
 	defer r.once.Do(func() {
 		close(r.blocks)
 		close(r.errs)
@@ -567,12 +610,11 @@ func (r *UDPReceiver) Run(ctx context.Context) error {
 	}
 	var hydratorDone chan struct{}
 	if r.spool != nil {
-		// Flush buffered slot-file tails and close the completeness journal
-		// when this receiver dies: the next receiver over the SAME spool
-		// directory (block source after a prewarm handoff, or a stream
-		// restart) can only see what reached disk — and it truncate-rewrites
-		// the journal on open, so ours must be closed first.
-		defer r.spool.Close()
+		// Owned stores must flush before a replacement reopens the directory.
+		// A shared store stays open for production and the next receiver.
+		if r.spoolGeneration == 0 {
+			defer r.spool.Close()
+		}
 		hydratorDone = make(chan struct{})
 		go func() {
 			defer close(hydratorDone)
@@ -874,6 +916,7 @@ func (r *UDPReceiver) hydrateLoop(ctx context.Context) {
 		case <-r.hydrateKick:
 		case <-ticker.C:
 		}
+		r.pruneReplayedShreds()
 		lo := r.hydrLo.Load()
 		hi := r.hydrHi.Load()
 		if hi == 0 || lo > hi {

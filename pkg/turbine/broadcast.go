@@ -99,6 +99,7 @@ type BroadcastSession struct {
 	leader      solana.PrivateKey
 	shredder    Shredder
 	broadcaster PacketBroadcaster
+	shredSpool  *ShredSpool
 	userAgent   []byte
 
 	chainedMerkleRoot solana.Hash
@@ -116,8 +117,10 @@ type BroadcastSessionConfig struct {
 	// It seeds the chained merkle root embedded in this slot's first FEC batch.
 	ParentChainedMerkleRoot solana.Hash
 	Broadcaster             PacketBroadcaster
-	UserAgent                 []byte
-	Version                   uint16
+	// ShredSpool optionally retains generated shreds; the caller owns its lifetime.
+	ShredSpool *ShredSpool
+	UserAgent  []byte
+	Version    uint16
 }
 
 func NewBroadcastSession(cfg BroadcastSessionConfig) *BroadcastSession {
@@ -134,6 +137,7 @@ func NewBroadcastSession(cfg BroadcastSessionConfig) *BroadcastSession {
 			ReferenceTick: 0,
 		},
 		broadcaster:       cfg.Broadcaster,
+		shredSpool:        cfg.ShredSpool,
 		userAgent:         cfg.UserAgent,
 		chainedMerkleRoot: chainedRoot,
 	}
@@ -208,6 +212,17 @@ func (s *BroadcastSession) broadcastComponent(component BlockComponent, isLastIn
 	s.nextCodeIndex = nextCode
 	if len(batch.DataShreds) > 0 {
 		s.fecSetRoots = appendFECSetMerkleRoots(s.fecSetRoots, batch.DataShreds)
+	}
+	if s.shredSpool != nil {
+		// Cache locally generated shreds even when routing drops a packet.
+		for _, shreds := range [][]*Shred{batch.DataShreds, batch.CodeShreds} {
+			for _, shred := range shreds {
+				s.shredSpool.AppendShred(shred, shred.Payload)
+			}
+		}
+		if isLastInSlot {
+			s.shredSpool.FlushSlot(s.shredder.Slot)
+		}
 	}
 	return s.broadcaster.Broadcast(batch.Packets)
 }

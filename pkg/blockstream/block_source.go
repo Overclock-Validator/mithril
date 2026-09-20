@@ -95,6 +95,9 @@ type BlockSourceOpts struct {
 	// disk and hydrate in batches ahead of replay; survives restarts, so a
 	// rebooted node re-hydrates instead of re-repairing. Empty = disabled.
 	ShredSpoolDir string
+	// ShredSpool is borrowed from the node and takes precedence over ShredSpoolDir.
+	// The owner closes it after production and all block sources have stopped.
+	ShredSpool *turbine.ShredSpool
 	// PrewarmBlocks: turbine blocks collected by the boot-time prewarm
 	// receiver (see TurbinePrewarm), injected into the staging buffer at
 	// construction so the catchup handoff can arm from them immediately.
@@ -460,6 +463,7 @@ type BlockSource struct {
 	// threshold, cooldown-gated.
 	repairCatchupMaxGapSlots uint64
 	shredSpoolDir            string
+	shredSpool               *turbine.ShredSpool
 	rpcFallbackEnabled       bool // false (block.rpc_fallback=false): RPC never fetches blocks on a live-shred source
 	repairCatchupPending     atomic.Bool
 	repairCatchupFrom        atomic.Uint64 // first gap slot (0 = inactive)
@@ -638,8 +642,8 @@ const (
 	// memory path (monster blocks x hundreds). The drive drains staging
 	// into the queue as replay advances.
 	repairCatchupLiveDeliverWindow = uint64(256)
-	// On-disk shred spool byte cap (highest slots dropped first).
-	shredSpoolMaxBytes = int64(8) << 30
+	// ShredSpoolMaxBytes caps the on-disk cache.
+	ShredSpoolMaxBytes = int64(8) << 30
 	// Stuck-head self-heal: only a recorded assembly/decode failure is evidence
 	// of poisoned state (for example a bad first shred pinning an FEC signature,
 	// variant, or layout). A merely incomplete slot is never reset: the missing
@@ -759,6 +763,7 @@ func NewBlockSource(opts *BlockSourceOpts) *BlockSource {
 		repairCatchupMaxGapSlots:       opts.RepairCatchupMaxGapSlots,
 		repairMaxRequestsPerSecond:     opts.RepairMaxRequestsPerSecond,
 		shredSpoolDir:                  opts.ShredSpoolDir,
+		shredSpool:                     opts.ShredSpool,
 		rpcFallbackEnabled:             !opts.DisableRPCBlockFetch,
 		turbineGossipEntrypoint:        opts.TurbineGossipEntrypoint,
 		turbineGossipBindAddr:          opts.TurbineGossipBindAddr,

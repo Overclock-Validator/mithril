@@ -140,7 +140,7 @@ func StartTurbinePrewarm(cfg TurbinePrewarmConfig) (*TurbinePrewarm, error) {
 		receiver.SetRetentionFloor(cfg.FloorSlot)
 	}
 	if cfg.ShredSpoolDir != "" {
-		if spool, serr := turbine.OpenShredSpool(cfg.ShredSpoolDir, shredSpoolMaxBytes); serr != nil {
+		if spool, serr := turbine.OpenShredSpool(cfg.ShredSpoolDir, ShredSpoolMaxBytes); serr != nil {
 			mlog.Log.FileOnlyf("prewarm shred spool disabled: %v", serr)
 		} else {
 			receiver.SetShredSpool(spool)

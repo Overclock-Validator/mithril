@@ -90,6 +90,7 @@ type LeaderLoop struct {
 	identity         solana.PrivateKey
 	accountsDb       *accountsdb.AccountsDb
 	broadcaster      turbine.PacketBroadcaster
+	shredSpool       *turbine.ShredSpool
 	shredVersion     uint16
 	userAgent        []byte
 	rewardCerts      RewardCertBuilder
@@ -135,10 +136,12 @@ type leaderProductionWindow struct {
 }
 
 type LeaderLoopConfig struct {
-	Controller       *Controller
-	Identity         solana.PrivateKey
-	AccountsDb       *accountsdb.AccountsDb
-	Broadcaster      turbine.PacketBroadcaster
+	Controller  *Controller
+	Identity    solana.PrivateKey
+	AccountsDb  *accountsdb.AccountsDb
+	Broadcaster turbine.PacketBroadcaster
+	// ShredSpool is an optional cache owned by the caller, not the leader loop.
+	ShredSpool       *turbine.ShredSpool
 	ShredVersion     uint16
 	UserAgent        []byte
 	EpochSchedule    *sealevel.SysvarEpochSchedule
@@ -175,6 +178,7 @@ func NewLeaderLoop(cfg LeaderLoopConfig) *LeaderLoop {
 		identity:            cfg.Identity,
 		accountsDb:          cfg.AccountsDb,
 		broadcaster:         cfg.Broadcaster,
+		shredSpool:          cfg.ShredSpool,
 		shredVersion:        cfg.ShredVersion,
 		userAgent:           cfg.UserAgent,
 		epochSchedule:       cfg.EpochSchedule,
@@ -711,6 +715,15 @@ func (l *LeaderLoop) activeParentStillCanonicalLocked() (bool, string) {
 }
 
 func (l *LeaderLoop) abortActiveSlotLocked() {
+	slot := l.activeSlot
+	hadSession := l.activeSess != nil
+	l.clearActiveSlotLocked()
+	if hadSession && l.shredSpool != nil {
+		l.shredSpool.DiscardSlot(slot)
+	}
+}
+
+func (l *LeaderLoop) clearActiveSlotLocked() {
 	if l.controller != nil {
 		l.controller.ClearWorkingBank()
 	}
@@ -1064,7 +1077,7 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 	l.recordLeaderSlotOutcomeLocked(slot, leaderOutcomeBroadcast, leaderReasonComplete,
 		fmt.Sprintf("block=%s parent_slot=%d txns=%d%s", solana.Hash(producedBlock.AlpenglowBlockID).String(), producedBlock.ParentSlot, len(producedBlock.Transactions), timingDetail))
 	l.advanceProductionWindowLocked(slot)
-	l.abortActiveSlotLocked()
+	l.clearActiveSlotLocked()
 }
 
 func (l *LeaderLoop) advanceProductionWindowLocked(slot uint64) {
@@ -1181,6 +1194,7 @@ func (l *LeaderLoop) startSlotLocked(slot uint64) error {
 		ParentChainedMerkleRoot: parentChainedRoot,
 		Version:                 l.shredVersion,
 		Broadcaster:             l.broadcaster,
+		ShredSpool:              l.shredSpool,
 		UserAgent:               l.userAgent,
 	})
 	slotCtx, err := NewLeaderSlotCtx(slot, parentSlot, l.accountsDb, parentCtx, epochSchedule)
@@ -1215,38 +1229,43 @@ func (l *LeaderLoop) startSlotLocked(slot uint64) error {
 		Sink:                sink,
 		TransactionStatuses: parentCtx.TransactionStatuses,
 	})
-	if slot > 0 && !sameReplayParentSnapshot(parentCtx, l.parentContext(slot)) {
+	started, headerAttempted := false, false
+	defer func() {
+		if started {
+			return
+		}
 		bank.Close()
+		sink.Discard()
+		if headerAttempted && l.shredSpool != nil {
+			l.shredSpool.DiscardSlot(slot)
+		}
+	}()
+	if slot > 0 && !sameReplayParentSnapshot(parentCtx, l.parentContext(slot)) {
 		return fmt.Errorf("%w: replay parent changed while opening leader slot %d", errParentNotReady, slot)
 	}
 	if parentReadyRequired {
 		if err := l.revalidateProductionParentForStartLocked(slot, selectedParent); err != nil {
-			bank.Close()
 			return err
 		}
 	}
 	if err := l.productionStartCutoffErrorLocked(slot); err != nil {
-		bank.Close()
 		return err
 	}
 	// Publish the working bank only after all local preparation and the header
 	// broadcast succeed; failures before this point cannot admit TPU traffic.
+	headerAttempted = true
 	if err := session.BroadcastHeader(parentID); err != nil {
-		bank.Close()
 		return fmt.Errorf("broadcast header parent_block_id=%s: %w", parentID, err)
 	}
 	if slot > 0 && !sameReplayParentSnapshot(parentCtx, l.parentContext(slot)) {
-		bank.Close()
 		return fmt.Errorf("%w: replay parent changed while broadcasting leader header for slot %d", errParentNotReady, slot)
 	}
 	if parentReadyRequired {
 		if err := l.revalidateProductionParentForStartLocked(slot, selectedParent); err != nil {
-			bank.Close()
 			return err
 		}
 	}
 	if err := l.productionStartCutoffErrorLocked(slot); err != nil {
-		bank.Close()
 		return err
 	}
 	l.parentCtx = parentCtx
@@ -1260,5 +1279,6 @@ func (l *LeaderLoop) startSlotLocked(slot uint64) error {
 	if l.controller != nil {
 		l.controller.SetWorkingBank(bank)
 	}
+	started = true
 	return nil
 }
