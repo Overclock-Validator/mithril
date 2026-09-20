@@ -107,7 +107,9 @@ type StreamBatch struct {
 	// Transactions is empty for markers and for batches that failed to decode.
 	Transactions []*solana.Transaction
 	// Err is the decode error; a batch with Err makes the whole slot invalid.
-	Err     error
+	Err error
+	// ReadyAt is the original publication time, preserved across polling and
+	// notification recovery. It is not the time a consumer looked up the batch.
 	ReadyAt time.Time
 
 	batch *prefetchedShredBatch
@@ -329,13 +331,24 @@ func (a *SlotAssembler) PendingStreamBatches(g StreamGeneration, fromStart uint3
 // newStreamBatch builds the immutable view; it must only be called after the
 // batch's ready channel closed (its fields are immutable from then on).
 func newStreamBatch(g StreamGeneration, batch *prefetchedShredBatch) *StreamBatch {
+	batch.viewOnce.Do(func() {
+		batch.view = buildStreamBatch(g, batch)
+	})
+	return batch.view
+}
+
+func buildStreamBatch(g StreamGeneration, batch *prefetchedShredBatch) *StreamBatch {
+	readyAt := batch.readyAt
+	if readyAt.IsZero() { // detached test batches have no prefetch publication
+		readyAt = time.Now()
+	}
 	view := &StreamBatch{
 		Slot:       g.slot,
 		Generation: g,
 		Start:      batch.start,
 		End:        batch.end,
 		Err:        batch.err,
-		ReadyAt:    time.Now(),
+		ReadyAt:    readyAt,
 		batch:      batch,
 	}
 	switch {

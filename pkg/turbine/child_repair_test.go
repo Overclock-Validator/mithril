@@ -72,7 +72,7 @@ func TestChildRepairLifecycle(t *testing.T) {
 			case "unsubscribe":
 				a.SubscribeStream(nil)
 			case "update-parent", "wrong-parent":
-				changed := *b
+				changed := prefetchedShredBatch{start: b.start, end: b.end, parent: b.parent, marker: b.marker, ready: b.ready}
 				parent := *b.parent
 				changed.parent = &parent
 				if kind == "update-parent" {
@@ -103,7 +103,7 @@ func TestChildRepairLifecycle(t *testing.T) {
 func TestChildRepairRejectsUnrelatedAndInvalidHeader(t *testing.T) {
 	a, _, c, b := childRepairFixture(t)
 	a.streamRepairChild = nil
-	bad := *b
+	bad := prefetchedShredBatch{start: b.start, end: b.end, parent: b.parent, marker: b.marker, ready: b.ready}
 	bad.err = errors.New("invalid header")
 	a.mu.Lock()
 	a.noteChildRepairHeaderLocked(c, &bad)
@@ -147,7 +147,7 @@ func TestChildRepairRejectsStaleParentAnchor(t *testing.T) {
 
 func TestChildRepairParentUpdateClearsLookahead(t *testing.T) {
 	a, p, _, b := childRepairFixture(t)
-	update := *b
+	update := prefetchedShredBatch{start: b.start, end: b.end, parent: b.parent, marker: b.marker, ready: b.ready}
 	info := *b.parent
 	info.FromUpdateParent = true
 	update.parent = &info

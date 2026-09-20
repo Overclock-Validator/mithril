@@ -27,6 +27,9 @@ type shredBatchRange struct{ start, end uint32 }
 // Fields are immutable after ready closes; signature readers own its decoded
 // transactions until verification.done closes.
 type prefetchedShredBatch struct {
+	viewOnce         sync.Once // protects the immutable stream view, including concurrent Resolve
+	view             *StreamBatch
+	readyAt          time.Time // set before ready closes
 	start, end       uint32
 	raw              []byte
 	entries          []Entry
@@ -201,6 +204,7 @@ func (p *entryPrefetchPool) run() {
 				batch.verification, batch.submitErr = p.verifier.submitPrefetchTransactions(f.ctx, txs)
 			}
 		}
+		batch.readyAt = time.Now()
 		close(ready)
 		p.a.mu.Lock()
 		f.queued = false

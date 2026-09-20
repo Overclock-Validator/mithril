@@ -403,7 +403,7 @@ func (s *streamingExecutor) rememberHeader(header *turbine.StreamBatch) {
 // Only slots within the bounded lookahead are worth the lookup, and a generation this
 // executor already retired (discarded, or declined as ineligible) is never
 // brought back: whole-block execution owns it from then on. A recovered
-// header's ReadyAt is the lookup time, so OpenDelay reads as ~0 for it.
+// header retains its original readiness time, including time before this lookup.
 func (s *streamingExecutor) recoverHeader(slot uint64, g turbine.StreamGeneration) {
 	if g.IsZero() {
 		return
