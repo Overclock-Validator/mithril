@@ -35,8 +35,7 @@ jobs:
 
       - name: Voting, checkpoint, streaming and scheduler race regressions
         # Run the complete affected package suites, including subprocess crash
-        # recovery and cancellation tests. The broader sealevel suite still has unrelated legacy
-        # loader-fixture failures; the interpreter/syscall subset runs below.
+        # recovery and cancellation tests.
         run: >-
           go test -race -p 2 -count=1
           ./pkg/alpenglow ./pkg/consensus ./pkg/replay
@@ -47,4 +46,4 @@ jobs:
         run: go test -race -count=1 ./pkg/sbpf/...
 
       - name: Sealevel interpreter, syscall and vote ownership regressions
-        run: go test -race -count=1 ./pkg/sealevel -run '^(TestInterpreter_(Noop|Mem|Sha256|Blake3|Keccak256|CreateProgramAddress|TryFindProgramAddress|TestPanic|Secp256k1)|TestSyscall|TestMemoryCopyDifferential$|TestProcessNewVoteStateOwnsRetainedDeque$)'
+        run: go test -race -count=1 ./pkg/sealevel
