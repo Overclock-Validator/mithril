@@ -358,9 +358,6 @@ func (exec *blockExecution) executeTransactionGroup(txs []*solana.Transaction, i
 			continue
 		}
 		exec.totalCU += computeUnits[idx]
-		if txFeeInfo == nil {
-			reportNilFeeInfo(exec.slotCtx, txs[idx], slot)
-		}
 		exec.txFeeAccumulator.Add(txFeeInfo)
 	}
 	exec.slotCtx.TotalComputeUnitsConsumed = exec.totalCU
@@ -530,26 +527,6 @@ func streamingTransactionError(index int, err error) error {
 		err = errors.New("missing fee result")
 	}
 	return fmt.Errorf("unprocessable streaming transaction %d: %w", index, err)
-}
-
-// reportNilFeeInfo reproduces ProcessBlock's diagnostic for a transaction whose
-// fee information is missing, which only happens when blockhash validation
-// failed for a transaction the block claims to have processed.
-func reportNilFeeInfo(slotCtx *sealevel.SlotCtx, tx *solana.Transaction, slot uint64) {
-	var recentBlockhashes sealevel.SysvarRecentBlockhashes
-	if bankSysvars := slotCtx.BankSysvars(); bankSysvars != nil {
-		recentBlockhashes, _ = bankSysvars.RecentBlockhashes()
-	}
-	mlog.Log.Errorf("txFeeInfo is nil for tx %s in slot %d", tx.Signatures[0], slot)
-	mlog.Log.Errorf("  tx blockhash: %s", tx.Message.RecentBlockhash)
-	mlog.Log.Errorf("  LatestEvictedBlockhash: %x", slotCtx.LatestEvictedBlockhash[:8])
-	if len(recentBlockhashes) > 0 {
-		mlog.Log.Errorf("  RecentBlockhashes: %d entries, newest=%x, oldest=%x",
-			len(recentBlockhashes), recentBlockhashes[0].Blockhash[:8], recentBlockhashes[len(recentBlockhashes)-1].Blockhash[:8])
-	} else {
-		mlog.Log.Errorf("  RecentBlockhashes: nil or empty!")
-	}
-	panic(fmt.Sprintf("txFeeInfo is nil - blockhash validation failed for tx %s", tx.Signatures[0]))
 }
 
 // finalize runs the end-of-block phases over the open SlotCtx: fees to the
