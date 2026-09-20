@@ -1342,6 +1342,11 @@ func executeLoadedProgram(execCtx *ExecutionCtx, program *sbpf.Program, syscallR
 
 func executeProgramFromBytes(execCtx *ExecutionCtx, programAddr solana.PublicKey, programData []byte, syscallRegistry sbpf.SyscallRegistry) error {
 	start := time.Now()
+	// The caller has already validated the bank-visible loader metadata. Never
+	// let a global cache hit bypass that validation or select a different fork.
+	if entry, ok := execCtx.SlotCtx.AccountsDb.MaybeGetProgramFromCache(programAddr); ok && entry.MatchesSource(programData, &execCtx.Features) {
+		return executeLoadedProgram(execCtx, entry.Program, syscallRegistry)
+	}
 	loader, err := loader.NewLoaderWithSyscalls(programData, syscallRegistry, false, &execCtx.Features)
 	if err != nil {
 		return InstrErrUnsupportedProgramId
@@ -1356,6 +1361,7 @@ func executeProgramFromBytes(execCtx *ExecutionCtx, programAddr solana.PublicKey
 	}
 
 	entry := &accountsdb.ProgramCacheEntry{Program: program}
+	entry.BindSource(programData, &execCtx.Features)
 	if !execCtx.IsSimulation {
 		addProgramToCache(execCtx, programAddr, entry)
 	}
@@ -1495,36 +1501,27 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 	}
 
 	var programBytes []byte
-	var loadedProgram *sbpf.Program
-	var hasLoadedProgram bool
 	var programAcctKey solana.PublicKey
 
 	programOwner := programAcct.Owner()
 
 	if programOwner == a.BpfLoader2Addr || programOwner == a.BpfLoaderDeprecatedAddr {
-		var programCacheEntry *accountsdb.ProgramCacheEntry
-		programCacheEntry, hasLoadedProgram = execCtx.SlotCtx.AccountsDb.MaybeGetProgramFromCache(programAcct.Key())
-		if hasLoadedProgram {
-			programAcctKey = programAcct.Key()
-			loadedProgram = programCacheEntry.Program
-		} else { // program is not cached
-			if len(programAcct.Data()) == 0 {
-				var paTmp *accounts.Account
-				paTmp, err = execCtx.SlotCtx.GetAccount(programAcct.Key())
+		if len(programAcct.Data()) == 0 {
+			var paTmp *accounts.Account
+			paTmp, err = execCtx.SlotCtx.GetAccount(programAcct.Key())
 
+			if err != nil {
+				paTmp, err = execCtx.SlotCtx.GetAccountFromAccountsDb(programAcct.Key())
 				if err != nil {
-					paTmp, err = execCtx.SlotCtx.GetAccountFromAccountsDb(programAcct.Key())
-					if err != nil {
-						//mlog.Log.Debugf("unable to get account %s from accountsdb", programAcct.Key())
-						return InstrErrUnsupportedProgramId
-					}
+					//mlog.Log.Debugf("unable to get account %s from accountsdb", programAcct.Key())
+					return InstrErrUnsupportedProgramId
 				}
-				programBytes = paTmp.Data
-			} else {
-				programBytes = programAcct.Data()
 			}
-			programAcctKey = programAcct.Key()
+			programBytes = paTmp.Data
+		} else {
+			programBytes = programAcct.Data()
 		}
+		programAcctKey = programAcct.Key()
 	} else if programOwner == a.BpfLoaderUpgradeableAddr {
 		var programAcctState *UpgradeableLoaderState
 
@@ -1552,49 +1549,38 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 		}
 
 		start := time.Now()
-		var programCacheEntry *accountsdb.ProgramCacheEntry
-		programCacheEntry, hasLoadedProgram = execCtx.SlotCtx.AccountsDb.MaybeGetProgramFromCache(programAcctState.Program.ProgramDataAddress)
-		if hasLoadedProgram {
-			if programCacheEntry.DeploymentSlot >= execCtx.SlotCtx.Slot {
-				return InstrErrInvalidAccountData
-			}
-			programAcctKey = programAcctState.Program.ProgramDataAddress
-			loadedProgram = programCacheEntry.Program
-			metrics.GlobalBlockReplay.GetProgramDataCached.AddTimingSince(start)
-		} else { // program is not cached
-			programDataAcct, err := execCtx.SlotCtx.GetAccount(programAcctState.Program.ProgramDataAddress)
+		programDataAcct, err := execCtx.SlotCtx.GetAccount(programAcctState.Program.ProgramDataAddress)
+		if err != nil {
+			programDataAcct, err = execCtx.SlotCtx.GetAccountFromAccountsDb(programAcctState.Program.ProgramDataAddress)
 			if err != nil {
-				programDataAcct, err = execCtx.SlotCtx.GetAccountFromAccountsDb(programAcctState.Program.ProgramDataAddress)
-				if err != nil {
-					return InstrErrUnsupportedProgramId
-				}
-				metrics.GlobalBlockReplay.GetProgramDataUncachedAccountsDb.AddTimingSince(start)
-			} else {
-				metrics.GlobalBlockReplay.GetProgramDataUncachedAccounts.AddTimingSince(start)
-			}
-
-			start = time.Now()
-			programDataAcctState, err := UnmarshalUpgradeableLoaderState(programDataAcct.Data)
-			if err != nil {
-				return err
-			}
-
-			if programDataAcctState.Type != UpgradeableLoaderStateTypeProgramData {
 				return InstrErrUnsupportedProgramId
 			}
-
-			programDataSlot := programDataAcctState.ProgramData.Slot
-			if programDataSlot >= execCtx.SlotCtx.Slot {
-				return InstrErrInvalidAccountData
-			}
-
-			if len(programDataAcct.Data) < upgradeableLoaderSizeOfProgramDataMetaData {
-				return InstrErrUnsupportedProgramId
-			}
-			programAcctKey = programAcctState.Program.ProgramDataAddress
-			programBytes = programDataAcct.Data[upgradeableLoaderSizeOfProgramDataMetaData:]
-			metrics.GlobalBlockReplay.GetProgramDataUncachedMarshal.AddTimingSince(start)
+			metrics.GlobalBlockReplay.GetProgramDataUncachedAccountsDb.AddTimingSince(start)
+		} else {
+			metrics.GlobalBlockReplay.GetProgramDataUncachedAccounts.AddTimingSince(start)
 		}
+
+		start = time.Now()
+		programDataAcctState, err := UnmarshalUpgradeableLoaderState(programDataAcct.Data)
+		if err != nil {
+			return err
+		}
+
+		if programDataAcctState.Type != UpgradeableLoaderStateTypeProgramData {
+			return InstrErrUnsupportedProgramId
+		}
+
+		programDataSlot := programDataAcctState.ProgramData.Slot
+		if programDataSlot >= execCtx.SlotCtx.Slot {
+			return InstrErrInvalidAccountData
+		}
+
+		if len(programDataAcct.Data) < upgradeableLoaderSizeOfProgramDataMetaData {
+			return InstrErrUnsupportedProgramId
+		}
+		programAcctKey = programAcctState.Program.ProgramDataAddress
+		programBytes = programDataAcct.Data[upgradeableLoaderSizeOfProgramDataMetaData:]
+		metrics.GlobalBlockReplay.GetProgramDataUncachedMarshal.AddTimingSince(start)
 	} else {
 		return InstrErrUnsupportedProgramId
 	}
@@ -1605,13 +1591,7 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 		return Syscalls(&execCtx.Features, false, u)
 	})
 
-	// two cases here: we're either executing from the program cache, so from a pre-parsed/loaded program, or from bytes if
-	// the the program was not found in the cache.
-	if hasLoadedProgram {
-		err = executeLoadedProgram(execCtx, loadedProgram, syscallRegistry)
-	} else {
-		err = executeProgramFromBytes(execCtx, programAcctKey, programBytes, syscallRegistry)
-	}
+	err = executeProgramFromBytes(execCtx, programAcctKey, programBytes, syscallRegistry)
 
 	return err
 }

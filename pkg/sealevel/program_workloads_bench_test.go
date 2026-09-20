@@ -126,7 +126,9 @@ func workloadRunner(t testing.TB, w programWorkload, vasa bool) func() (*Executi
 	require.NoError(t, err)
 	t.Cleanup(cache.Close)
 	db := &accountsdb.AccountsDb{ProgramCache: cache}
-	db.AddProgramToCache(w.program, &accountsdb.ProgramCacheEntry{Program: prog})
+	entry := &accountsdb.ProgramCacheEntry{Program: prog}
+	entry.BindSource(w.elf, f)
+	db.AddProgramToCache(w.program, entry)
 	_, cached := db.MaybeGetProgramFromCache(w.program)
 	require.True(t, cached, "warm program must be cached")
 	return func() (*ExecutionCtx, error) {
