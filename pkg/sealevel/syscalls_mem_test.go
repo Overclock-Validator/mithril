@@ -199,19 +199,18 @@ func TestMemsetBytes(t *testing.T) {
 	}
 }
 
-func TestSyscallMemoryZeroLengthPreservesValidation(t *testing.T) {
+func TestSyscallMemoryZeroLengthSkipsAddressValidation(t *testing.T) {
 	for _, src := range []uint64{sbpf.VaddrInput, 0, ^uint64(0)} {
 		for _, dst := range []uint64{sbpf.VaddrInput, sbpf.VaddrProgram, ^uint64(0)} {
-			vm, _ := newMemSyscallVM(t, make([]byte, 32), nil)
-			want := vm.Read(src, nil)
-			if want == nil {
-				want = vm.Write(dst, nil)
-			}
-			got := memmoveImplInternal(vm, dst, src, 0)
-			if want == nil {
-				require.NoError(t, got)
-			} else {
-				require.EqualError(t, got, want.Error())
+			for _, fn := range []func(sbpf.VM, uint64, uint64, uint64) (uint64, error){SyscallMemmoveImpl, SyscallMemcpyImpl} {
+				input := bytes.Repeat([]byte{0x42}, 32)
+				vm, ctx := newMemSyscallVM(t, input, nil)
+				before := ctx.ComputeMeter.Remaining()
+				ret, err := fn(vm, dst, src, 0)
+				require.NoError(t, err)
+				require.Zero(t, ret)
+				require.Equal(t, before-cu.CUMemOpBaseCost, ctx.ComputeMeter.Remaining())
+				require.Equal(t, bytes.Repeat([]byte{0x42}, 32), input)
 			}
 		}
 	}
@@ -231,7 +230,7 @@ func TestMemoryCopyDifferential(t *testing.T) {
 		dst += sbpf.VaddrInput
 		_, gotErr := SyscallMemmoveImpl(vm, dst, src, n)
 		wantErr := MemOpConsume(refCtx, n)
-		if wantErr == nil {
+		if wantErr == nil && n > 0 {
 			buf := make([]byte, n)
 			wantErr = ref.Read(src, buf)
 			if wantErr == nil {
