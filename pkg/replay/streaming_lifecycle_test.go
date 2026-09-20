@@ -166,6 +166,7 @@ func newLifecycleEnv(t *testing.T) *lifecycleEnv {
 func (env *lifecycleEnv) block(txs []*solana.Transaction) *b.Block {
 	return &b.Block{
 		Slot:                      lifecycleSlot,
+		VoteTimestamps:            make(map[solana.PublicKey]sealevel.BlockTimestamp),
 		Epoch:                     0,
 		ParentSlot:                lifecycleParentSlot,
 		ParentBankhash:            [32]byte{0x88},
