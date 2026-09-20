@@ -2,7 +2,6 @@ package sbpf
 
 import (
 	"bufio"
-	"encoding/binary"
 	"fmt"
 	"hash/fnv"
 	"math/rand"
@@ -97,6 +96,15 @@ func diffRegistry(h uint32) (Syscall, bool) {
 	return nil, false
 }
 
+// v2 replaces LDDW with MOV32 + HOR64. MOV32 avoids sign-extending the
+// low word before ORing in the high word.
+func diffLoadImm64(dst uint8, value uint64, ver uint32) []Slot {
+	if ver == sbpfver.SbpfVersionV2 {
+		return []Slot{slot(OpMov32Imm, dst, 0, 0, uint32(value)), slot(OpHor64Imm, dst, 0, 0, uint32(value>>32))}
+	}
+	return []Slot{slot(OpLddw, dst, 0, 0, uint32(value)), slot(0, 0, 0, 0, uint32(value>>32))}
+}
+
 func randSlot(rng *rand.Rand, pc, n int, ver uint32, fnPC int64) []Slot {
 	reg := func() uint8 { return uint8(1 + rng.Intn(9)) } // r1..r9
 	imm := func() uint32 {
@@ -117,6 +125,29 @@ func randSlot(rng *rand.Rand, pc, n int, ver uint32, fnPC int64) []Slot {
 		OpAdd32Imm, OpAdd32Reg, OpSub32Imm, OpSub32Reg, OpMul32Imm, OpMul32Reg, OpDiv32Imm, OpDiv32Reg, OpOr32Imm, OpOr32Reg,
 		OpAnd32Imm, OpAnd32Reg, OpLsh32Imm, OpLsh32Reg, OpRsh32Imm, OpRsh32Reg, OpMod32Imm, OpMod32Reg, OpXor32Imm, OpXor32Reg,
 		OpMov32Imm, OpMov32Reg, OpArsh32Imm, OpArsh32Reg, OpNeg32, OpLe, OpBe}
+	if ver == sbpfver.SbpfVersionV2 {
+		// Arithmetic and memory encodings both change in v2. Keep generated ALU
+		// operations arithmetic rather than generating unintended memory accesses.
+		replacements := map[uint8]uint8{
+			OpMul32Imm: OpLmul32Imm, OpMul32Reg: OpLmul32Reg,
+			OpMul64Imm: OpLmul64Imm, OpMul64Reg: OpLmul64Reg,
+			OpDiv32Imm: OpUdiv32Imm, OpDiv32Reg: OpUdiv32Reg,
+			OpDiv64Imm: OpUdiv64Imm, OpDiv64Reg: OpUdiv64Reg,
+			OpMod32Imm: OpUrem32Imm, OpMod32Reg: OpUrem32Reg,
+			OpMod64Imm: OpUrem64Imm, OpMod64Reg: OpUrem64Reg,
+		}
+		filtered := alu64[:0]
+		for _, op := range alu64 {
+			if op == OpNeg32 || op == OpNeg64 || op == OpLe {
+				continue
+			}
+			if replacement, ok := replacements[op]; ok {
+				op = replacement
+			}
+			filtered = append(filtered, op)
+		}
+		alu64 = filtered
+	}
 	jmp := []uint8{OpJeqImm, OpJeqReg, OpJgtImm, OpJgtReg, OpJgeImm, OpJgeReg, OpJltImm, OpJltReg, OpJleImm, OpJleReg,
 		OpJsetImm, OpJsetReg, OpJneImm, OpJneReg, OpJsgtImm, OpJsgtReg, OpJsgeImm, OpJsgeReg, OpJsltImm, OpJsltReg, OpJsleImm, OpJsleReg}
 	switch rng.Intn(10) {
@@ -126,7 +157,7 @@ func randSlot(rng *rand.Rand, pc, n int, ver uint32, fnPC int64) []Slot {
 		if op == OpLe || op == OpBe {
 			i = []uint32{16, 32, 64}[rng.Intn(3)]
 		}
-		if (op == OpDiv64Imm || op == OpMod64Imm || op == OpDiv32Imm || op == OpMod32Imm) && i == 0 {
+		if (op == OpDiv64Imm || op == OpMod64Imm || op == OpDiv32Imm || op == OpMod32Imm || op == OpUdiv32Imm || op == OpUdiv64Imm || op == OpUrem32Imm || op == OpUrem64Imm) && i == 0 {
 			i = 3
 		}
 		switch op {
@@ -138,6 +169,9 @@ func randSlot(rng *rand.Rand, pc, n int, ver uint32, fnPC int64) []Slot {
 		return []Slot{slot(op, reg(), reg(), 0, i)}
 	case 4: // load
 		ops := []uint8{OpLdxb, OpLdxh, OpLdxw, OpLdxdw}
+		if ver == sbpfver.SbpfVersionV2 {
+			ops = []uint8{OpLd1BReg, OpLd2BReg, OpLd4BReg, OpLd8BReg}
+		}
 		// base register: r10 (stack) or r5 (heap ptr) or r1 (input ptr) or random
 		var base uint8
 		var off int16
@@ -154,6 +188,9 @@ func randSlot(rng *rand.Rand, pc, n int, ver uint32, fnPC int64) []Slot {
 		return []Slot{slot(ops[rng.Intn(4)], reg(), base, off, 0)}
 	case 5: // store
 		ops := []uint8{OpStb, OpSth, OpStw, OpStdw, OpStxb, OpStxh, OpStxw, OpStxdw}
+		if ver == sbpfver.SbpfVersionV2 {
+			ops = []uint8{OpSt1BImm, OpSt2BImm, OpSt4BImm, OpSt8BImm, OpSt1BReg, OpSt2BReg, OpSt4BReg, OpSt8BReg}
+		}
 		var base uint8
 		var off int16
 		switch rng.Intn(5) {
@@ -184,11 +221,11 @@ func randSlot(rng *rand.Rand, pc, n int, ver uint32, fnPC int64) []Slot {
 	default: // set up pointer registers
 		switch rng.Intn(3) {
 		case 0: // r5 = heap
-			return []Slot{slot(OpLddw, 5, 0, 0, uint32(VaddrHeap&0xffffffff)), slot(0, 0, 0, 0, uint32(VaddrHeap>>32))}
+			return diffLoadImm64(5, VaddrHeap, ver)
 		case 1: // r1 = input + small
-			return []Slot{slot(OpLddw, 1, 0, 0, uint32((VaddrInput+uint64(rng.Intn(64)))&0xffffffff)), slot(0, 0, 0, 0, uint32(VaddrInput>>32))}
+			return diffLoadImm64(1, VaddrInput+uint64(rng.Intn(64)), ver)
 		default: // r9 = random 64-bit
-			return []Slot{slot(OpLddw, 9, 0, 0, rng.Uint32()), slot(0, 0, 0, 0, uint32(rng.Intn(6)))}
+			return diffLoadImm64(9, uint64(rng.Uint32())|uint64(rng.Intn(6))<<32, ver)
 		}
 	}
 }
@@ -215,10 +252,14 @@ func genProgram(rng *rand.Rand, ver uint32) *Program {
 		}
 	}
 	// function
+	store := uint8(OpStxdw)
+	if ver == sbpfver.SbpfVersionV2 {
+		store = OpSt8BReg
+	}
 	body = append(body,
 		slot(OpAdd64Imm, 6, 0, 0, uint32(rng.Intn(100))),
 		slot(OpXor64Reg, 7, 6, 0, 0),
-		slot(OpStxdw, 10, 7, int16(-8-rng.Intn(64)), 0),
+		slot(store, 10, 7, int16(-8-rng.Intn(64)), 0),
 		slot(OpExit, 0, 0, 0, 0))
 	p := mkProgram(body, ver)
 	if ver < sbpfver.SbpfVersionV3 {
@@ -229,6 +270,29 @@ func genProgram(rng *rand.Rand, ver uint32) *Program {
 		p.RO[i] = byte(i * 7)
 	}
 	return p
+}
+
+// Keep this check in the ordinary suite: merely selecting v2 is insufficient
+// if its programs still contain legacy memory opcodes or LDDW and never run.
+func TestDifferentialV2Generator(t *testing.T) {
+	rng := rand.New(rand.NewSource(12345))
+	seen := make(map[uint8]bool)
+	for i := 0; i < 1000; i++ {
+		p := genProgram(rng, sbpfver.SbpfVersionV2)
+		if err := p.Verify(); err != nil {
+			continue
+		}
+		for _, ins := range p.Text {
+			seen[ins.Op()] = true
+		}
+	}
+	for _, op := range []uint8{OpLd1BReg, OpLd2BReg, OpLd4BReg, OpLd8BReg,
+		OpSt1BImm, OpSt2BImm, OpSt4BImm, OpSt8BImm,
+		OpSt1BReg, OpSt2BReg, OpSt4BReg, OpSt8BReg} {
+		if !seen[op] {
+			t.Errorf("no verifier-accepted v2 program contains opcode %#x", op)
+		}
+	}
 }
 
 func memHash(bs ...[]byte) uint64 {
@@ -255,8 +319,10 @@ func TestDifferentialDump(t *testing.T) {
 	rng := rand.New(rand.NewSource(12345))
 	const N = 100000
 	generated, verified := 0, 0
+	var verifiedByVersion [4]int
 	for i := 0; i < N; i++ {
-		ver := []uint32{0, 0, 3, 1}[rng.Intn(4)]
+		// Equal representation of every version, independent of RNG consumption.
+		ver := uint32(i % 4)
 		p := genProgram(rng, ver)
 		generated++
 		if err := p.Verify(); err != nil {
@@ -264,6 +330,7 @@ func TestDifferentialDump(t *testing.T) {
 			continue
 		}
 		verified++
+		verifiedByVersion[ver]++
 		resolveCallTargetsIfSupported(p)
 		input := make([]byte, 700)
 		for j := range input {
@@ -332,7 +399,10 @@ func TestDifferentialDump(t *testing.T) {
 			heapPool.Put(hp)
 		}
 	}
-	t.Logf("generated=%d verified=%d", generated, verified)
+	for ver, count := range verifiedByVersion {
+		if count == 0 {
+			t.Errorf("no verifier-accepted programs for v%d", ver)
+		}
+	}
+	t.Logf("generated=%d verified=%d verified_by_version=%v", generated, verified, verifiedByVersion)
 }
-
-var _ = binary.LittleEndian

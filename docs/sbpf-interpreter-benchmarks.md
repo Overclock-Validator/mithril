@@ -32,9 +32,14 @@ MITHRIL_PROGRAM_BENCH_DIR=/path/to/pinned-fixtures GOMAXPROCS=1 \
 ## Correctness and comparison boundaries
 
 The generated-program harness compares return values, errors, CU usage and memory
-for 100,000 programs. Set `SBPF_DIFF_OUT` separately on the reference and candidate
-and compare the files; `SBPF_CHECK_POOL_ZERO=1` also checks reused memory. ARSH and
-verifier semantics changes are excluded from this performance work.
+for 100,000 generated programs, evenly divided across SBPF v0–v3. The generator
+uses v2-specific memory, arithmetic and constant-loading encodings; the dump
+reports verifier rejection or execution results, and logs accepted counts per version.
+Run the same harness on both trees: set `SBPF_DIFF_OUT` separately on the reference
+and candidate and compare the files. `SBPF_CHECK_POOL_ZERO=1` additionally checks
+the candidate’s clear-on-return pool invariant; older references may clear on
+acquisition instead. ARSH and verifier semantics changes are excluded from this
+performance work.
 
 For replay comparisons, use fresh isolated AccountsDBs from the same snapshots,
 identical transaction parallelism, and the same slot interval. Compare normalized
