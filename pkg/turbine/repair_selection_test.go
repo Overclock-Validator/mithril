@@ -310,3 +310,18 @@ func TestRepairSelectionPrefixOnlyForStreamingPriorityHead(t *testing.T) {
 		t.Fatal("disabled streaming retained prefix policy")
 	}
 }
+
+func TestRepairPriorityParentPinnedAfterChild(t *testing.T) {
+	a := NewSlotAssembler()
+	a.maxObservedSlot = 101
+	a.retentionFloor = 100
+	a.PrioritizeRepairRange(101, 101)
+	a.PrioritizeRepairRange(100, 100)
+	priority, _ := a.RepairRequestsTiered(2, 16)
+	if len(priority) != 2 || priority[0].Slot != 100 || priority[1].Slot != 101 {
+		t.Fatalf("parent must precede earlier-pinned child: %+v", priority)
+	}
+	if a.priorityRepairOrder[0] != 101 {
+		t.Fatal("selection changed pin retention order")
+	}
+}

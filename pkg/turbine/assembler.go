@@ -1426,7 +1426,11 @@ func (a *SlotAssembler) RepairRequestsTiered(maxSlots int, maxMissingPerSlot int
 	}
 
 	a.prunePriorityRepairSlotsLocked()
-	for _, slot := range a.priorityRepairOrder {
+	// Pin insertion order is retention policy, not dependency order. An older
+	// parent can be discovered after its child; give that parent the head share.
+	ordered := append([]uint64(nil), a.priorityRepairOrder...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	for _, slot := range ordered {
 		// HEAD FIRST: the first priority slot — the one gating emission —
 		// may list up to repairHeadMaxMissing, several times the per-slot
 		// cap, so its admission share stays full at any response latency.
