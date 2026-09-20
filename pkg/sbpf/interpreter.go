@@ -162,6 +162,15 @@ func (ip *Interpreter) initRegions() {
 	if len(ip.heap) != 0 {
 		ip.regions[VaddrHeap>>32] = memRegion{base: unsafe.Pointer(&ip.heap[0]), rlen: uint64(len(ip.heap)), wlen: uint64(len(ip.heap)), gapShift: 63}
 	}
+	// Finish relies on complete write tracking before returning pooled storage.
+	// Larger heaps (or a future larger stack) must use translateInternal's byte
+	// ranges: shifting the fast-path bitmap beyond page 63 silently loses writes.
+	// Reads remain fast; current <=256 KiB writable mappings are unchanged.
+	for _, idx := range []uint64{VaddrStack >> 32, VaddrHeap >> 32} {
+		if ip.regions[idx].wlen > fastDirtyBytes {
+			ip.regions[idx].wlen = 0
+		}
+	}
 	if len(ip.inputRegions) == 0 && len(ip.input) != 0 {
 		ip.regions[VaddrInput>>32] = memRegion{base: unsafe.Pointer(&ip.input[0]), rlen: uint64(len(ip.input)), wlen: uint64(len(ip.input)), gapShift: 63}
 	}
