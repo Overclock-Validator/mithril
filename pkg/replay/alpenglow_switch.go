@@ -51,27 +51,26 @@ func parentSwitchNeedsStateUnwind(switchSlot, executedAnchor uint64) bool {
 	return switchSlot <= executedAnchor
 }
 
-// Execute-on-receipt runs blocks the moment they're assembled, which means a
-// certificate can land AFTER the slot already executed and name a different
-// outcome: a sibling block we lost the shred race on, or a skip over a block
-// we ran. The switch sweep walks the executed-but-unfolded window whenever
-// new certificates arrive and reports the FIRST contradiction between an
-// executed identity and a decisive certificate.
+// Execute-on-receipt consumes blocks and provisional skips before the chain's
+// decisive outcome is known. Later certificates or newly discovered ancestry
+// can select a different sibling, skip an executed block, or require a block
+// previously consumed as a skip. The sweep walks the consumed-but-unrooted
+// window when the chain-decision version, replay tip, or rooted frontier changes
+// and reports the first contradiction.
 //
-// Until the WorkingSet unwind engine lands, the contradiction surfaces as a
-// typed error handled by the node-level recovery loop (re-replay from the
-// rooted checkpoint; repair re-fetches the certified version via the
-// block-id hints). The in-loop unwind replaces that coarse path.
+// Replay rewinds the source and, if the divergence includes executed blocks,
+// unwinds the in-RAM account-state suffix. If the retained state cannot support
+// that unwind, node-level recovery re-replays from the rooted checkpoint.
 
-// CertifiedSwitch reports an executed suffix contradicted either by a
-// decisive certificate or by an exact parent-linked speculative branch. The
+// CertifiedSwitch reports a consumed suffix contradicted either by a
+// decisive chain decision or by an exact parent-linked speculative branch. The
 // historical name is retained because node recovery treats both as the same
 // unwind/replay operation.
 type CertifiedSwitch struct {
 	Slot         uint64
 	Executed     solana.Hash // zero when the local slot was treated as skipped
-	Certified    solana.Hash // zero only for legacy skip-switch callers
-	Skip         bool        // retained for recovery/API compatibility; the sweeper no longer sets it
+	Certified    solana.Hash // zero for a finalized skip or a parent-linked switch
+	Skip         bool        // finalized skip contradicts a locally executed block
 	ParentLinked bool        // speculative child links to an older emitted ancestor
 	ParentSlot   uint64
 	ParentID     solana.Hash
@@ -93,9 +92,9 @@ func (e *CertifiedSwitch) Error() string {
 	return fmt.Sprintf("alpenglow switch: slot %d executed block %s but certificates name %s", e.Slot, e.Executed, e.Certified)
 }
 
-// alpenglowSwitchSweeper rate-gates the sweep on decision-version and replay
-// frontier changes. Both newly decisive ancestry and a queued skip consumed
-// after its overriding certificate must trigger correction.
+// alpenglowSwitchSweeper rate-gates the sweep on decision-version, replay-tip,
+// and rooted-frontier changes. Both newly decisive ancestry and a queued skip
+// consumed after its overriding certificate must trigger correction.
 type alpenglowSwitchSweeper struct {
 	query            consensusengine.AlpenglowChainQuery
 	decisionChanges  <-chan struct{}
@@ -119,7 +118,7 @@ func newAlpenglowSwitchSweeper(engine consensusengine.Engine) *alpenglowSwitchSw
 }
 
 // sweep walks consumed block/skip outcomes in (lastRooted, tip] and returns
-// the first contradiction with a decisive certificate. tip includes trailing
+// the first contradiction with a decisive chain decision. tip includes trailing
 // skips even when the executed bank remains at an earlier slot.
 func (s *alpenglowSwitchSweeper) sweep(executed map[uint64]solana.Hash, lastRooted, tip uint64) *CertifiedSwitch {
 	if s == nil || len(executed) == 0 || tip <= lastRooted {
