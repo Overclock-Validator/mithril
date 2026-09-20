@@ -25,6 +25,9 @@ type memRegion struct {
 // emptyRegion never matches any access.
 var emptyRegion = memRegion{gapShift: 63}
 
+// A uint64 dirty bitmap can describe exactly 64 pages of 4 KiB.
+const fastDirtyBytes = 64 * 4096
+
 const numFastRegions = 6 // index 5 is a permanently empty catch-all
 
 // fastRead returns a host pointer for a size-byte read at vma, or nil if the

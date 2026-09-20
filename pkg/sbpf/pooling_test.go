@@ -2,10 +2,13 @@ package sbpf
 
 import (
 	"bytes"
+	"encoding/binary"
+	"fmt"
 	"sync"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/cu"
+	"github.com/Overclock-Validator/mithril/pkg/sbpf/sbpfver"
 	"github.com/stretchr/testify/require"
 )
 
@@ -85,5 +88,48 @@ func BenchmarkVMCreateAndFinish(b *testing.B) {
 				ip.Finish()
 			}
 		})
+	}
+}
+
+// Exercise actual stores at and beyond the bitmap boundary. Inspect the returned
+// buffer directly: sync.Pool is permitted to discard entries, so a subsequent Get
+// alone would not reliably detect a missed clear.
+func TestPooledHeapDirtyBitmapBoundary(t *testing.T) {
+	oldUsePool, oldPool := UsePool, heapPool
+	UsePool = true
+	heapPool = &sync.Pool{New: func() any { return newHeap() }}
+	t.Cleanup(func() { UsePool, heapPool = oldUsePool, oldPool })
+	for _, size := range []int{fastDirtyBytes, fastDirtyBytes + 1, 2 * fastDirtyBytes} {
+		for _, ver := range []uint32{sbpfver.SbpfVersionV0, sbpfver.SbpfVersionV2, sbpfver.SbpfVersionV3} {
+			t.Run(fmt.Sprintf("%d/v%d", size, ver), func(t *testing.T) {
+				offsets := []int{0, size - 8}
+				if size >= fastDirtyBytes+8 {
+					offsets = append(offsets, fastDirtyBytes-4, fastDirtyBytes)
+				}
+				var text []Slot
+				op := uint8(OpStdw)
+				if ver == sbpfver.SbpfVersionV2 {
+					op = OpSt8BImm
+				}
+				for _, off := range offsets {
+					text = append(text, diffLoadImm64(5, VaddrHeap+uint64(off), ver)...)
+					text = append(text, slot(op, 5, 0, 0, 0x12345678))
+				}
+				text = append(text, slot(OpExit, 0, 0, 0, 0))
+				program := mkProgram(text, ver)
+				require.NoError(t, program.Verify())
+				meter := cu.NewComputeMeter(100)
+				ip := NewInterpreter(program, &VMOpts{HeapMax: size, ComputeMeter: &meter, Syscalls: noSyscalls})
+				// Always clear test storage on failure so later cases cannot inherit dirt.
+				defer func() { clear(ip.heap) }()
+				require.NotNil(t, ip.fastRead(VaddrHeap+uint64(size-8), 8))
+				_, _, err := ip.Run()
+				require.NoError(t, err)
+				require.Equal(t, uint64(0x12345678), binary.LittleEndian.Uint64(ip.heap[offsets[len(offsets)-1]:]))
+				ip.Finish()
+				require.True(t, bytes.Equal(make([]byte, size), ip.heap), "Finish must clear every written byte before pooling")
+				require.Equal(t, size <= fastDirtyBytes, ip.regions[VaddrHeap>>32].wlen != 0)
+			})
+		}
 	}
 }
