@@ -3,6 +3,7 @@ package turbine
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
@@ -51,6 +52,7 @@ type slotEntryPrefetch struct {
 	queued, released bool
 	queueDone        chan struct{} // closed after the queued/running token retires
 	bytes            int
+	budgetBlocked    bool
 }
 
 // All scheduling and accounting use assembler.mu. The packet reader only
@@ -64,6 +66,7 @@ type entryPrefetchPool struct {
 	jobs             chan *slotState
 	workers, cleanup sync.WaitGroup
 	slots, bytes     int
+	active           map[*slotState]struct{} // at most entryPrefetchSlots admitted generations
 	closed           bool
 	close            sync.Once
 }
@@ -96,6 +99,10 @@ func (a *SlotAssembler) prefetchEntriesLocked(s *slotState) {
 		ctx, cancel := context.WithCancel(withEntryPipelineTrace(p.ctx, s.pipelineTrace))
 		s.prefetch = &slotEntryPrefetch{pool: p, ctx: ctx, cancel: cancel, batches: make(map[uint32]*prefetchedShredBatch)}
 		p.slots++
+		if p.active == nil {
+			p.active = make(map[*slotState]struct{})
+		}
+		p.active[s] = struct{}{}
 	}
 	p.enqueueLocked(s)
 }
@@ -124,6 +131,7 @@ func (p *entryPrefetchPool) run() {
 			p.a.mu.Unlock()
 			continue
 		}
+		f.budgetBlocked = false
 		var batch *prefetchedShredBatch
 		var shreds []*Shred
 		var rawSize int
@@ -137,10 +145,14 @@ func (p *entryPrefetchPool) run() {
 				}
 			}
 			if size > entryPrefetchBatchBytes {
-				f.next++
-				continue
+				// Never publish a prefix with an unfillable hole. Completion
+				// still decodes and verifies the entire valid block normally.
+				s.streamCancelReason = "prefetch_batch_too_large"
+				p.a.releasePrefetchLocked(s)
+				break
 			}
 			if p.bytes+size > entryPrefetchBytes {
+				f.budgetBlocked = true
 				break
 			}
 			f.next++
@@ -244,8 +256,28 @@ func (a *SlotAssembler) releasePrefetchLocked(s *slotState) {
 		p.a.mu.Lock()
 		p.slots--
 		p.bytes -= f.bytes
+		delete(p.active, s)
+		p.retryBudgetBlockedLocked()
 		p.a.mu.Unlock()
 	}()
+}
+
+// Retry only admitted generations, oldest slot first, when readers release bytes.
+// This avoids both waiting for another shred and scanning all retained slots.
+func (p *entryPrefetchPool) retryBudgetBlockedLocked() {
+	if p.closed || p.ctx.Err() != nil {
+		return
+	}
+	waiting := make([]*slotState, 0, len(p.active))
+	for s := range p.active {
+		if s.prefetch.budgetBlocked && p.a.slots[s.slot] == s {
+			waiting = append(waiting, s)
+		}
+	}
+	sort.Slice(waiting, func(i, j int) bool { return waiting[i].slot < waiting[j].slot })
+	for _, s := range waiting {
+		p.enqueueLocked(s)
+	}
 }
 
 func (p *entryPrefetchPool) closeAndWait() {

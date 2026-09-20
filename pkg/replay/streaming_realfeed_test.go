@@ -407,6 +407,9 @@ func TestStreamingRealFeedRecoversDroppedWakeups(t *testing.T) {
 	default:
 		t.Fatal("the surviving wake-up is not queued")
 	}
+	var live bool
+	survivor, live = survivor.Resolve()
+	require.True(t, live)
 	require.Zero(t, len(rig.feed.events), "nothing else was published")
 	require.Equal(t, turbine.StreamBatchReady, survivor.Kind)
 	require.Equal(t, uint64(realFeedSlot), survivor.Slot)

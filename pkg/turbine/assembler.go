@@ -146,6 +146,8 @@ func (s *slotState) noteError(err error) {
 }
 
 type slotCompletionWork struct {
+	// Captured under mu: cancelled prefetch readers are not completion inputs.
+	ignorePrefetch     bool
 	state              *slotState
 	queuedAt           time.Time
 	observeCollection  bool
@@ -405,6 +407,7 @@ func (a *SlotAssembler) claimCompletionLocked(state *slotState, reportNonCanonic
 	}
 	return &slotCompletionWork{
 		state:              state,
+		ignorePrefetch:     state.prefetch != nil && state.prefetch.released,
 		queuedAt:           now,
 		observeCollection:  observeCollection,
 		reportNonCanonical: reportNonCanonical,
@@ -450,7 +453,7 @@ func (a *SlotAssembler) processCompletion(ctx context.Context, work *slotComplet
 
 	decodeStartedAt := time.Now()
 	decodeTimings := entryDecodeTimings{ctx: ctx}
-	if work.state.prefetch != nil {
+	if work.state.prefetch != nil && !work.ignorePrefetch {
 		decodeTimings.prefetched = work.state.prefetch.batches
 	}
 	blk, parentInfo, roots, err := work.state.decodeBlock(&decodeTimings)

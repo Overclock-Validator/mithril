@@ -2,8 +2,10 @@ package turbine
 
 import (
 	"context"
+	"runtime"
 	"testing"
 	"time"
+	"weak"
 
 	"github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/gagliardetto/solana-go"
@@ -16,6 +18,10 @@ func nextStreamEvent(t *testing.T, ch <-chan StreamEvent, kind StreamEventKind) 
 	for {
 		select {
 		case event := <-ch:
+			event, live := event.Resolve()
+			if !live {
+				continue
+			}
 			if event.Kind == kind {
 				return event
 			}
@@ -186,4 +192,54 @@ func TestStreamFeedDropsWakeupsWhenSubscriberIsFull(t *testing.T) {
 	pending := a.PendingStreamBatches(g, 0)
 	require.Len(t, pending, 1)
 	require.Len(t, pending[0].Transactions, 2)
+}
+
+// Notifications must not own retired slots or decoded payloads. Conversely,
+// resolving a live event gives the consumer a strong polling handle.
+func TestStreamQueuedEventsDoNotRetainRetiredBuffers(t *testing.T) {
+	events := make(chan StreamEvent, 4)
+	publish := func() (weak.Pointer[slotState], weak.Pointer[prefetchedShredBatch]) {
+		a := NewSlotAssembler()
+		a.SubscribeStream(events)
+		batch := &prefetchedShredBatch{raw: make([]byte, 1<<20), marker: true}
+		state := &slotState{slot: 42, prefetch: &slotEntryPrefetch{batches: map[uint32]*prefetchedShredBatch{0: batch}}}
+		a.mu.Lock()
+		a.publishStreamBatchReadyLocked(state, batch)
+		a.publishStreamReleaseLocked(state, "reset")
+		a.mu.Unlock()
+		return weak.Make(state), weak.Make(batch)
+	}
+	state, batch := publish()
+	require.Eventually(t, func() bool {
+		runtime.GC()
+		return state.Value() == nil && batch.Value() == nil
+	}, 3*time.Second, time.Millisecond)
+	require.Len(t, events, 2)
+	for len(events) > 0 {
+		_, live := (<-events).Resolve()
+		require.False(t, live)
+	}
+}
+
+func TestStreamResolvedEventRetainsCompletedPollingState(t *testing.T) {
+	a := NewSlotAssembler()
+	events := make(chan StreamEvent, 2)
+	a.SubscribeStream(events)
+	ready := make(chan struct{})
+	close(ready)
+	batch := &prefetchedShredBatch{ready: ready, marker: true}
+	state := &slotState{slot: 42, streamCompleted: true, prefetch: &slotEntryPrefetch{batches: map[uint32]*prefetchedShredBatch{0: batch}, released: true}}
+	a.mu.Lock()
+	a.publishStreamBatchReadyLocked(state, batch)
+	a.publishStreamReleaseLocked(state, "")
+	a.mu.Unlock()
+	event, live := (<-events).Resolve()
+	require.True(t, live)
+	runtime.GC()
+	require.Equal(t, StreamDone, a.StreamStatusOf(event.Generation))
+	require.Len(t, a.PendingStreamBatches(event.Generation, 0), 1)
+	done, live := (<-events).Resolve()
+	require.True(t, live)
+	require.Equal(t, event.Generation, done.Generation)
+	require.Equal(t, StreamCompleted, done.Kind)
 }

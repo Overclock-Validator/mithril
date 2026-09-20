@@ -288,6 +288,11 @@ func (s *streamingExecutor) handleEvent(event turbine.StreamEvent) {
 	if s == nil {
 		return
 	}
+	var live bool
+	event, live = event.Resolve()
+	if !live {
+		return
+	}
 	switch event.Kind {
 	case turbine.StreamBatchReady:
 		if event.Batch == nil {

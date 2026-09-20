@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sort"
 	"time"
+	"weak"
 
 	"github.com/Overclock-Validator/mithril/pkg/txverify"
 	"github.com/gagliardetto/solana-go"
@@ -153,13 +154,40 @@ const (
 	StreamCompleted
 )
 
-// StreamEvent is one feed wake-up.
+// StreamEvent is an advisory wake-up. Call Resolve before inspecting Generation
+// or Batch. Queued notifications hold only weak references, so a stalled
+// subscriber cannot retain retired slot buffers outside the prefetch budget.
 type StreamEvent struct {
 	Kind       StreamEventKind
 	Slot       uint64
 	Generation StreamGeneration
 	Batch      *StreamBatch
 	Reason     string
+	state      weak.Pointer[slotState]
+	batch      weak.Pointer[prefetchedShredBatch]
+}
+
+// Resolve acquires ownership of a still-live notification. A false result means
+// the opportunity has expired; whole-block replay remains authoritative. Resolved
+// generations retain their state for polling, including after completion. Detached
+// events supplied by test feeds are already resolved.
+func (e StreamEvent) Resolve() (StreamEvent, bool) {
+	if !e.Generation.IsZero() {
+		return e, true
+	}
+	state := e.state.Value()
+	if state == nil {
+		return StreamEvent{}, false
+	}
+	e.Generation = StreamGeneration{slot: e.Slot, state: state}
+	if e.Kind == StreamBatchReady {
+		batch := e.batch.Value()
+		if batch == nil {
+			return StreamEvent{}, false
+		}
+		e.Batch = newStreamBatch(e.Generation, batch)
+	}
+	return e, true
 }
 
 // StreamStatus is the assembler's view of a generation.
@@ -308,8 +336,7 @@ func (a *SlotAssembler) publishStreamBatchReadyLocked(s *slotState, batch *prefe
 		return
 	}
 	a.noteChildRepairHeaderLocked(s, batch)
-	g := StreamGeneration{slot: s.slot, state: s}
-	a.publishStreamLocked(StreamEvent{Kind: StreamBatchReady, Slot: s.slot, Generation: g, Batch: newStreamBatch(g, batch)})
+	a.publishStreamLocked(StreamEvent{Kind: StreamBatchReady, Slot: s.slot, state: weak.Make(s), batch: weak.Make(batch)})
 }
 
 // publishStreamReleaseLocked is called from releasePrefetchLocked, i.e. from
@@ -319,10 +346,10 @@ func (a *SlotAssembler) publishStreamReleaseLocked(s *slotState, reason string) 
 	if a.streamSubscriber == nil || s == nil {
 		return
 	}
-	g := StreamGeneration{slot: s.slot, state: s}
+	state := weak.Make(s)
 	if s.streamCompleted {
-		a.publishStreamLocked(StreamEvent{Kind: StreamCompleted, Slot: s.slot, Generation: g})
+		a.publishStreamLocked(StreamEvent{Kind: StreamCompleted, Slot: s.slot, state: state})
 		return
 	}
-	a.publishStreamLocked(StreamEvent{Kind: StreamCancelled, Slot: s.slot, Generation: g, Reason: reason})
+	a.publishStreamLocked(StreamEvent{Kind: StreamCancelled, Slot: s.slot, state: state, Reason: reason})
 }
