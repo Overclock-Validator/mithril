@@ -76,6 +76,39 @@ func TestNextPeerPrefersRecentResponders(t *testing.T) {
 	}
 }
 
+func TestRecentResponderYieldsAfterRepeatedTimeouts(t *testing.T) {
+	peer := repairTestPeer(1, 8001)
+	key, ok := repairAddressKeyFromUDP(peer.Addr)
+	if !ok {
+		t.Fatal("invalid test peer")
+	}
+	client := &repairClient{perPeer: map[repairAddressKey]*peerRecord{
+		key: {score: 1, lastMatched: time.Now()},
+	}}
+	peers := []gossip.RepairPeer{peer}
+	client.rebuildRankedLocked(peers, time.Now())
+	if len(client.ranked) != 1 {
+		t.Fatal("answering peer must be preferred")
+	}
+	for range 2 {
+		client.notePeerTimeoutLocked(key)
+	}
+	client.rebuildRankedLocked(peers, time.Now())
+	if len(client.ranked) != 1 {
+		t.Fatal("peer must remain preferred before the timeout threshold")
+	}
+	client.notePeerTimeoutLocked(key)
+	client.rebuildRankedLocked(peers, time.Now())
+	if len(client.ranked) != 0 {
+		t.Fatal("unanswered peer must return to the exploration ring")
+	}
+	client.notePeerLateLocked(key, 3*time.Second)
+	client.rebuildRankedLocked(peers, time.Now())
+	if len(client.ranked) != 1 {
+		t.Fatal("peer must be preferred again after a late answer")
+	}
+}
+
 // Outcome scoring under the REAL request lifecycle. A late answer is not a
 // standalone outcome: the request first expires (timeout, score touch 0)
 // and the answer later matches (late, score touch 0.3) — so `late` is a

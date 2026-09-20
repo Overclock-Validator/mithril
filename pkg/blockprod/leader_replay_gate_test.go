@@ -7,6 +7,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/alpenglow"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/txfixture"
+	"github.com/Overclock-Validator/mithril/pkg/turbine"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -661,6 +662,9 @@ func TestLeaderWindowRejectsCutoffCrossedDuringHeaderBroadcast(t *testing.T) {
 func TestLeaderWindowRejectsParentChangeDuringHeaderBroadcast(t *testing.T) {
 	global.ResetAlpenglowChainMetadata()
 	t.Cleanup(global.ResetAlpenglowChainMetadata)
+	spool, err := turbine.OpenShredSpool(t.TempDir(), 0)
+	require.NoError(t, err)
+	t.Cleanup(spool.Close)
 
 	const leaderSlot = uint64(212)
 	parentA := alpenglow.BlockID{Slot: leaderSlot - alpenglow.LeaderWindowSlots, Hash: solana.Hash{3}}
@@ -681,6 +685,7 @@ func TestLeaderWindowRejectsParentChangeDuringHeaderBroadcast(t *testing.T) {
 		Controller:  controller,
 		Identity:    txfixture.PayerPrivateKey(),
 		Broadcaster: broadcaster,
+		ShredSpool:  spool,
 		CurrentSlot: func() uint64 { return leaderSlot - 1 },
 		Now:         func() time.Time { return now },
 		LeaderForSlot: func(slot uint64) (solana.PublicKey, bool) {
@@ -726,6 +731,29 @@ func TestLeaderWindowRejectsParentChangeDuringHeaderBroadcast(t *testing.T) {
 	require.Equal(t, readyAt, loop.productionWindow.readyAt)
 	require.Equal(t, parentB.Hash, loop.parentCtx.ParentBlockID)
 	require.NotNil(t, controller.WorkingBank())
+	requireCachedHeaderParent(t, spool, leaderSlot, self, parentB.Hash)
+}
+
+func requireCachedHeaderParent(t *testing.T, spool *turbine.ShredSpool, slot uint64, leader solana.PublicKey, want solana.Hash) {
+	t.Helper()
+	packets, err := spool.ReadSlot(slot)
+	require.NoError(t, err)
+	var data []*turbine.Shred
+	for _, packet := range packets {
+		shred, err := turbine.ParseShred(packet)
+		require.NoError(t, err)
+		require.NoError(t, shred.VerifySignature(leader))
+		if shred.Type == turbine.ShredTypeData {
+			data = append(data, shred)
+		}
+	}
+	components, err := turbine.DecodeComponentsFromDataShreds(data)
+	require.NoError(t, err)
+	require.Len(t, components, 1)
+	require.NotNil(t, components[0].Marker)
+	require.NotNil(t, components[0].Marker.Header)
+	require.Equal(t, want, components[0].Marker.Header.ParentBlockID,
+		"repair cache retained the abandoned parent's header after the same-slot retry")
 }
 
 func TestLeaderWindowLookaheadIsBoundedToNextWindow(t *testing.T) {
@@ -1121,6 +1149,9 @@ func TestLeaderAfterSkippedSlotsUsesActualReplayedParent(t *testing.T) {
 }
 
 func TestLeaderRestartsWhenReplayParentChangesBeforeFreeze(t *testing.T) {
+	spool, err := turbine.OpenShredSpool(t.TempDir(), 0)
+	require.NoError(t, err)
+	t.Cleanup(spool.Close)
 	self := txfixture.PayerPubkey()
 	const leaderSlot = uint64(52)
 	global.SetReplayFrontier(leaderSlot - 1)
@@ -1132,6 +1163,7 @@ func TestLeaderRestartsWhenReplayParentChangesBeforeFreeze(t *testing.T) {
 		Controller:  NewController(),
 		Identity:    txfixture.PayerPrivateKey(),
 		Broadcaster: &captureBroadcaster{},
+		ShredSpool:  spool,
 		CurrentSlot: func() uint64 { return leaderSlot },
 		LeaderForSlot: func(slot uint64) (solana.PublicKey, bool) {
 			return self, slot == leaderSlot
@@ -1146,11 +1178,15 @@ func TestLeaderRestartsWhenReplayParentChangesBeforeFreeze(t *testing.T) {
 
 	loop.tick()
 	require.NotNil(t, loop.activeBank)
+	t.Cleanup(loop.abortActiveSlotLocked)
+	requireCachedHeaderParent(t, spool, leaderSlot, self, solana.Hash{1})
 	parentHash = solana.Hash{9}
+	global.SetAlpenglowBlockID(leaderSlot-1, solana.Hash{9})
 	loop.tick()
 	require.NotNil(t, loop.activeBank)
 	require.Equal(t, parentHash, loop.parentCtx.ParentBankhash)
 	require.False(t, loop.isLeaderSlotFinished(leaderSlot))
+	requireCachedHeaderParent(t, spool, leaderSlot, self, solana.Hash{9})
 }
 
 func TestLeaderAbortsWhenOwnSlotAlreadyResolved(t *testing.T) {

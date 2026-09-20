@@ -176,6 +176,7 @@ func TestShredsOnlyRepairRearmsAcrossActiveHandoff(t *testing.T) {
 	bs.confirmedTip.Store(confirmedTip)
 	bs.liveHandoffSlot.Store(handoffSlot)
 	bs.liveStreamActive.Store(true)
+	bs.liveStreamStarted.Store(true) // The simulated active handoff already owns its stream.
 
 	bs.updateMode()
 
