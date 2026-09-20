@@ -309,3 +309,25 @@ func TestExecuteTransactionGroupRefusesClosedExecution(t *testing.T) {
 	err := env.exec.executeTransactionGroup(transferTransactions(t, 1, 300), nil, false)
 	require.ErrorIs(t, err, errBlockExecutionClosed)
 }
+
+func TestStreamingGroupRejectsUnprocessableTransactions(t *testing.T) {
+	for _, workers := range []int{0, 4} {
+		env := newGroupExecutionEnv(t, workers, 10_000_000)
+		defer env.cleanup()
+		txs := transferTransactions(t, 2, 1)
+		txs[0].Message.RecentBlockhash = solana.Hash{0xFA}
+		err := env.exec.executeTransactionGroup(txs, nil, false)
+		require.ErrorIs(t, err, TxErrInvalidBlockhash)
+	}
+}
+
+func TestStreamingGroupRejectsUnresolvedLookupsBeforeExecution(t *testing.T) {
+	for _, workers := range []int{0, 4} {
+		env := newGroupExecutionEnv(t, workers, 10_000_000)
+		defer env.cleanup()
+		txs := decodeTransactions(t, [][]byte{signedV0TransferViaTableWire(t, 1)})
+		err := env.exec.executeTransactionGroup(txs, nil, false)
+		require.ErrorContains(t, err, "unresolved address tables")
+		require.Zero(t, env.exec.slotCtx.TotalComputeUnitsConsumed)
+	}
+}

@@ -117,6 +117,16 @@ func newAlpenglowSwitchSweeper(engine consensusengine.Engine) *alpenglowSwitchSw
 	return s
 }
 
+// peek tests for a switch without consuming the sweep's version/frontier gate.
+// Streaming admission must leave a detected switch for the replay loop to apply.
+func (s *alpenglowSwitchSweeper) peek(executed map[uint64]solana.Hash, lastRooted, tip uint64) *CertifiedSwitch {
+	if s == nil {
+		return nil
+	}
+	snapshot := *s
+	return snapshot.sweep(executed, lastRooted, tip)
+}
+
 // sweep walks consumed block/skip outcomes in (lastRooted, tip] and returns
 // the first contradiction with a decisive chain decision. tip includes trailing
 // skips even when the executed bank remains at an earlier slot.

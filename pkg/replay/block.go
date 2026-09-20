@@ -2553,7 +2553,9 @@ func ReplayBlocks(
 			rewardsInFlight: func() bool {
 				return partitionedRewardsInfo != nil && partitionedRewardsInfo.NumRewardPartitionsRemaining > 0
 			},
-			switchPending: func() bool { return sweepWhileWaiting != nil && sweepWhileWaiting() != nil },
+			switchPending: func() bool {
+				return switchSweeper.peek(alpenglowExecutedBlockIDs, mithrilState.LastRootedSlot, replayFrontier) != nil
+			},
 			executedBlockID: func(slot uint64) (solana.Hash, bool) {
 				if id, ok := alpenglowExecutedBlockIDs[slot]; ok {
 					return id, true

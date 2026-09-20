@@ -1178,3 +1178,20 @@ func TestStreamingHeaderAdmissionBounds(t *testing.T) {
 	s.rememberHeader(turbine.NewDetachedStreamMarker(g, 0, 0, turbine.StreamMarkerHeader, frontier, solana.Hash{}))
 	require.Len(t, s.headers, 1, "distance comparison must not overflow")
 }
+
+func TestStreamingDiscardPreservesLaterLeaderStakeEntries(t *testing.T) {
+	h := newFinalizeFailureHarness(t)
+	leaderSlot := h.exec.current.slot + 4
+	leaderStake := solana.PublicKey{0xF7, 0xD1}
+	global.EnqueuePendingStakePubkey(leaderSlot, leaderStake)
+	t.Cleanup(func() { global.DropPendingStakePubkeys(leaderSlot) })
+	h.exec.discard("test")
+	entries := global.PendingStakeEntriesSnapshot()
+	found := false
+	for _, entry := range entries {
+		if entry.Pubkey == leaderStake {
+			found = true
+		}
+	}
+	require.True(t, found, "discard must not remove the independent leader bank's stake entries")
+}

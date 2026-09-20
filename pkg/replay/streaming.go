@@ -813,14 +813,14 @@ func (s *streamingExecutor) discard(reason string) {
 				}
 			}
 			// Deferred vote-cache changes die with the SlotCtx; the stake index
-			// entries are keyed by slot and the stream is the only bank above
-			// the frontier.
+			// entries belong to this slot; a concurrent leader bank may own
+			// entries at later slots.
 			exec.slotCtx.PendingVoteCache = nil
 			exec.slotCtx.PendingVoteCacheDeletes = nil
 			exec.slotCtx.VoteStakeDirty = false
 		}
 	}
-	global.DropPendingStakePubkeysFrom(cur.slot)
+	global.DropPendingStakePubkeys(cur.slot)
 	if cur.restoreSysvarCache != nil {
 		cur.restoreSysvarCache()
 	}

@@ -610,13 +610,11 @@ func (p *asyncPromoter) stop() {
 // the caller validates the pair and falls back to rooted-checkpoint re-replay.
 func (t *unrootedTail) unwind(fromSlot uint64) (*state.ResumeContext, *sealevel.BankSysvars) {
 	t.overlay.EvictFrom(fromSlot)
-	// Branch-scoped side effect: stake pubkeys enqueued by the evicted slots
-	// must never reach the durable index — drop them with the state.
-	if dropped := global.DropPendingStakePubkeysFrom(fromSlot); dropped > 0 {
-		mlog.Log.Infof("fork unwind: dropped %d pending stake-index entries from slots >= %d", dropped, fromSlot)
-	}
+	// Only replay-owned held slots are unwound. A future local leader bank
+	// is not part of this tail and must retain its pending stake entries.
 	for s := range t.bankhashes {
 		if s >= fromSlot {
+			global.DropPendingStakePubkeys(s)
 			delete(t.bankhashes, s)
 		}
 	}

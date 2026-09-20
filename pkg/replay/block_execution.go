@@ -444,7 +444,7 @@ func (exec *blockExecution) loadTransactionAccounts(view *b.Block) error {
 
 // runTransactionGroup is parallelTxLoop over a transaction slice with a plan
 // built for the group alone (indices are group-local). Without the planner
-// (txParallelism == 0, or an unresolvable lookup) it runs sequentially, which
+// (txParallelism <= 1) it runs sequentially, which
 // is always correct because groups are consumed in block order.
 func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execute []bool, shouldVerifySignatures bool) ([]*fees.TxFeeInfo, []uint64, error) {
 	slotCtx := exec.slotCtx
@@ -456,13 +456,15 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 	if workers > len(txs) {
 		workers = len(txs)
 	}
+	view := &b.Block{Transactions: txs}
+	if !canUseDependencyPlanner(view) {
+		return nil, nil, errors.New("streaming group has unresolved address tables")
+	}
 	var plan *dependencyPlan
 	if workers > 1 {
 		plannerBuildStart := time.Now()
-		plannerAccounts, available := plannerAccountsForBlock(&b.Block{Transactions: txs})
-		if available {
-			plan = buildDependencyPlan(plannerAccounts)
-		}
+		plannerAccounts, _ := plannerAccountsForBlock(view)
+		plan = buildDependencyPlan(plannerAccounts)
 		metrics.GlobalBlockReplay.DependencyPlannerBuild.AddTimingSince(plannerBuildStart)
 	}
 	if plan == nil {
@@ -470,12 +472,17 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 			if !execute[idx] {
 				continue
 			}
-			feeInfos[idx], computeUnits[idx], _ = ProcessTransaction(slotCtx, &exec.sigverifyWg, tx, nil, dbgOpts, nil, shouldVerifySignatures)
+			var txErr error
+			feeInfos[idx], computeUnits[idx], txErr = ProcessTransaction(slotCtx, &exec.sigverifyWg, tx, nil, dbgOpts, nil, shouldVerifySignatures)
+			if feeInfos[idx] == nil {
+				return nil, nil, streamingTransactionError(idx, txErr)
+			}
 		}
 		return feeInfos, computeUnits, nil
 	}
 
 	metrics.GlobalBlockReplay.DependencyPlannerPrepared = 1
+	txErrors := make([]error, len(txs))
 	do := make(chan int, len(txs))
 	done := make(chan int, len(txs))
 	plannerDone := make(chan struct{})
@@ -500,7 +507,7 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 					done <- idx
 					continue
 				}
-				feeInfos[idx], computeUnits[idx], _ = ProcessTransaction(slotCtx, &exec.sigverifyWg, txs[idx], nil, dbgOpts, workerArena, shouldVerifySignatures)
+				feeInfos[idx], computeUnits[idx], txErrors[idx] = ProcessTransaction(slotCtx, &exec.sigverifyWg, txs[idx], nil, dbgOpts, workerArena, shouldVerifySignatures)
 				done <- idx
 			}
 		}(i)
@@ -508,7 +515,21 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 	wg.Wait()
 	close(done)
 	<-plannerDone
+	for idx := range txs {
+		if execute[idx] && feeInfos[idx] == nil {
+			return nil, nil, streamingTransactionError(idx, txErrors[idx])
+		}
+	}
 	return feeInfos, computeUnits, nil
+}
+
+// Instruction failures still carry charged fees and remain valid block entries.
+// A missing fee result means transaction admission failed: discard the bank.
+func streamingTransactionError(index int, err error) error {
+	if err == nil {
+		err = errors.New("missing fee result")
+	}
+	return fmt.Errorf("unprocessable streaming transaction %d: %w", index, err)
 }
 
 // reportNilFeeInfo reproduces ProcessBlock's diagnostic for a transaction whose
