@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -335,9 +337,8 @@ func TestEntryPrefetchCanceledCompletionCanRetrySameGeneration(t *testing.T) {
 		require.NoError(t, err)
 	}
 	require.NotNil(t, work)
-	baseCtx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ctx := &verificationJoinContext{Context: baseCtx, waiting: make(chan struct{})}
 	canceled := make(chan struct{})
 	originalCancel := cached.verification.cancel
 	cached.verification.cancel = func() { close(canceled); originalCancel() }
@@ -345,7 +346,15 @@ func TestEntryPrefetchCanceledCompletionCanRetrySameGeneration(t *testing.T) {
 	go func() { done <- a.processCompletion(ctx, work) }()
 	// The completion has no expensive decode left and blocks joining this
 	// one already-prepared future; cancel while it owns those transactions.
-	waitSignal(t, ctx.waiting, "completion entered verification wait")
+	require.Eventually(t, func() bool {
+		stack := make([]byte, 2<<20)
+		for _, goroutine := range strings.Split(string(stack[:runtime.Stack(stack, true)]), "\n\n") {
+			if strings.Contains(goroutine, "(*SlotAssembler).processCompletion") && strings.Contains(goroutine, "(*transactionVerification).waitContext") {
+				return true
+			}
+		}
+		return false
+	}, 3*time.Second, time.Millisecond, "completion must enter the owning verification join")
 	cancel()
 	waitSignal(t, canceled, "completion canceled its signature request")
 	releaseOnce.Do(func() { close(release) })
@@ -679,17 +688,4 @@ func TestEntryPrefetchFailedCompletionWithoutReservation(t *testing.T) {
 	require.Nil(t, reserved)
 	require.Zero(t, slots)
 	require.Equal(t, StreamGone, a.StreamStatusOf(StreamGeneration{slot: 940, state: s}))
-}
-
-// Done is consulted by the blocking verification join; this avoids assuming
-// completion reaches that join within a fixed amount of wall time.
-type verificationJoinContext struct {
-	context.Context
-	waiting chan struct{}
-	once    sync.Once
-}
-
-func (c *verificationJoinContext) Done() <-chan struct{} {
-	c.once.Do(func() { close(c.waiting) })
-	return c.Context.Done()
 }
