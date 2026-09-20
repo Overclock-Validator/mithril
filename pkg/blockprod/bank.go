@@ -184,7 +184,8 @@ func (b *WorkingBank) Forge(wire []byte) (ForgeResult, costmodel.ExceedReason) {
 	return b.ForgeTransaction(tx, len(wire))
 }
 
-// ForgeTransaction executes and commits a parsed transaction.
+// ForgeTransaction executes and commits a parsed transaction. The caller must
+// keep it immutable: accepted transactions are retained for entry publication.
 func (b *WorkingBank) ForgeTransaction(tx *solana.Transaction, wireSize int) (ForgeResult, costmodel.ExceedReason) {
 	return b.forgeTransaction(tx, wireSize, nil)
 }
@@ -203,8 +204,15 @@ func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, pre
 		b.RebateSchedule(wireSize)
 		return ForgeDroppedParse, costmodel.ExceedNone
 	}
+	// Validate the full wire before execution can charge fees or publish
+	// account changes. Entry append then reuses this measured size and has no
+	// fallible serialization step after commit, including on the prepared path.
+	serializedSize, err := serializedTransactionSize(tx)
+	if err != nil {
+		b.RebateSchedule(wireSize)
+		return ForgeDroppedParse, costmodel.ExceedNone
+	}
 	var messageHash [32]byte
-	var err error
 	if prepared != nil {
 		messageHash = prepared.MessageHash()
 	} else {
@@ -307,7 +315,7 @@ func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, pre
 	b.costs.Record(cost)
 	execCU, loadedCost := actualExecutionUsage(output)
 	b.costs.Rebate(cost, execCU, loadedCost)
-	if flushed, batchBytes, didFlush := b.entries.Append(*tx, wireSize); didFlush {
+	if flushed, batchBytes, didFlush := b.entries.appendSerialized(*tx, wireSize, serializedSize); didFlush {
 		b.entryHash = b.entries.CurrentEntryHash()
 		b.sink.OnEntryBatch(flushed, batchBytes)
 	}
