@@ -75,6 +75,7 @@ func TestInterpreter_Noop(t *testing.T) {
 		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	require.NoError(t, err)
@@ -107,13 +108,16 @@ func TestInterpreter_Memcpy_Strings_Match(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		Syscalls:     ToFunc(syscalls),
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	assert.Equal(t, log.Logs, []string{
@@ -145,14 +149,17 @@ func TestInterpreter_Memcpy_Do_Not_Match(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     ToFunc(syscalls),
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	assert.Equal(t, log.Logs, []string{
@@ -183,14 +190,17 @@ func TestInterpreter_Memmove_Strings_Match(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     ToFunc(syscalls),
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	assert.Equal(t, log.Logs, []string{
@@ -222,14 +232,17 @@ func TestInterpreter_Memmove_Do_Not_Match(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     ToFunc(syscalls),
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	assert.Equal(t, log.Logs, []string{
@@ -259,14 +272,17 @@ func TestInterpreter_Memcpy_Overlapping(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     ToFunc(syscalls),
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 
@@ -297,14 +313,17 @@ func TestInterpreter_Memcmp_Matches(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     ToFunc(syscalls),
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	require.NoError(t, err)
@@ -338,14 +357,17 @@ func TestInterpreter_Memcmp_Does_Not_Match(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     ToFunc(syscalls),
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	require.NoError(t, err)
@@ -379,14 +401,17 @@ func TestInterpreter_Memset_Check_Correct(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     ToFunc(syscalls),
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	require.NoError(t, err)
@@ -429,6 +454,7 @@ func TestInterpreter_Sha256(t *testing.T) {
 		ComputeMeter: &ctx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	require.NoError(t, err)
@@ -462,14 +488,17 @@ func TestInterpreter_Blake3(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     ToFunc(syscalls),
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	require.NoError(t, err)
@@ -503,14 +532,17 @@ func TestInterpreter_Keccak256(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     ToFunc(syscalls),
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	require.NoError(t, err)
@@ -545,14 +577,17 @@ func TestInterpreter_CreateProgramAddress(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     ToFunc(syscalls),
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	require.NoError(t, err)
@@ -590,14 +625,17 @@ func TestInterpreter_TryFindProgramAddress(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     ToFunc(syscalls),
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	require.NoError(t, err)
@@ -628,18 +666,24 @@ func TestInterpreter_TestPanic(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     ToFunc(syscalls),
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	require.Error(t, err)
-	assert.Equal(t, err.Error(), "exception at 16: SBF program Panicked in some_file_1234.c at 1337:10")
+	require.Contains(t, err.Error(), "SBF program Panicked in some_file_1234.c at 1337:10")
+	var exception *sbpf.Exception
+	require.ErrorAs(t, err, &exception)
+	require.Equal(t, int64(17), exception.PC)
 }
 
 func TestInterpreter_Secp256k1_Syscall(t *testing.T) {
@@ -659,14 +703,17 @@ func TestInterpreter_Secp256k1_Syscall(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: syscalls,
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     syscalls,
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	require.NoError(t, err)
@@ -2091,6 +2138,7 @@ func (e *executeCase) run(t *testing.T) {
 
 	interpreter := sbpf.NewInterpreter(program, opts)
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	assert.NoError(t, err)

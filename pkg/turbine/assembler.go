@@ -1753,7 +1753,6 @@ func (s *slotState) sortedShreds() []*Shred {
 	for _, idx := range indexes {
 		out = append(out, s.shreds[uint32(idx)])
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Index < out[j].Index })
 	return out
 }
 

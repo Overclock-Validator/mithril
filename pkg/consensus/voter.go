@@ -384,6 +384,7 @@ func (v *alpenglowVoter) loop() {
 			for _, event := range pending {
 				if err := v.handle(event); err != nil {
 					v.engine.latchSafetyError(fmt.Errorf("reservation retry: %w", err))
+					mlog.Log.Errorf("ALPENGLOW VOTING SAFETY: reservation retry: %v", err)
 					return
 				}
 			}
@@ -827,7 +828,7 @@ func (v *alpenglowVoter) sign(vote alpenglow.Vote, respectVotingGate bool) (alpe
 	if err := v.engine.safetyError(); err != nil {
 		return alpenglow.VoteMessage{}, alpenglow.VoteVerifyResult{}, err
 	}
-	if v.reservation != nil && !v.reservation.allow(vote.Slot, v.engine.alpenglowVerifiedFinalityFloor(), false) {
+	if !respectVotingGate && v.reservation != nil && !v.reservation.allow(vote.Slot, v.engine.alpenglowVerifiedFinalityFloor(), false) {
 		return alpenglow.VoteMessage{}, alpenglow.VoteVerifyResult{}, fmt.Errorf("%w: waiting for verified recovery or durable signing reservation", errVoterNotReady)
 	}
 	if respectVotingGate {

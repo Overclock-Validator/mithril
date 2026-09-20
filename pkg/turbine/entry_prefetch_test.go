@@ -335,8 +335,9 @@ func TestEntryPrefetchCanceledCompletionCanRetrySameGeneration(t *testing.T) {
 		require.NoError(t, err)
 	}
 	require.NotNil(t, work)
-	ctx, cancel := context.WithCancel(context.Background())
+	baseCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	ctx := &verificationJoinContext{Context: baseCtx, waiting: make(chan struct{})}
 	canceled := make(chan struct{})
 	originalCancel := cached.verification.cancel
 	cached.verification.cancel = func() { close(canceled); originalCancel() }
@@ -344,7 +345,7 @@ func TestEntryPrefetchCanceledCompletionCanRetrySameGeneration(t *testing.T) {
 	go func() { done <- a.processCompletion(ctx, work) }()
 	// The completion has no expensive decode left and blocks joining this
 	// one already-prepared future; cancel while it owns those transactions.
-	time.Sleep(20 * time.Millisecond)
+	waitSignal(t, ctx.waiting, "completion entered verification wait")
 	cancel()
 	waitSignal(t, canceled, "completion canceled its signature request")
 	releaseOnce.Do(func() { close(release) })
@@ -678,4 +679,17 @@ func TestEntryPrefetchFailedCompletionWithoutReservation(t *testing.T) {
 	require.Nil(t, reserved)
 	require.Zero(t, slots)
 	require.Equal(t, StreamGone, a.StreamStatusOf(StreamGeneration{slot: 940, state: s}))
+}
+
+// Done is consulted by the blocking verification join; this avoids assuming
+// completion reaches that join within a fixed amount of wall time.
+type verificationJoinContext struct {
+	context.Context
+	waiting chan struct{}
+	once    sync.Once
+}
+
+func (c *verificationJoinContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.waiting) })
+	return c.Context.Done()
 }

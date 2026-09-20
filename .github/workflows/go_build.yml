@@ -35,13 +35,16 @@ jobs:
 
       - name: Voting, checkpoint, streaming and scheduler race regressions
         # Run the complete affected package suites, including subprocess crash
-        # recovery and cancellation tests. The independent sealevel suite has
-        # known base-branch failures documented in the validation report.
+        # recovery and cancellation tests. The broader sealevel suite still has unrelated legacy
+        # loader-fixture failures; the interpreter/syscall subset runs below.
         run: >-
           go test -race -p 2 -count=1
           ./pkg/alpenglow ./pkg/consensus ./pkg/replay
           ./pkg/turbine ./pkg/sigverify ./pkg/blockprod/...
           ./cmd/mithril/node ./cmd/mithril/configcmd
 
-      - name: Vote-program deque ownership race regression
-        run: go test -race -count=1 ./pkg/sealevel -run '^TestProcessNewVoteStateOwnsRetainedDeque$'
+      - name: Interpreter differential and memory race regressions
+        run: go test -race -count=1 ./pkg/sbpf/...
+
+      - name: Sealevel interpreter, syscall and vote ownership regressions
+        run: go test -race -count=1 ./pkg/sealevel -run '^(TestInterpreter_(Noop|Mem|Sha256|Blake3|Keccak256|CreateProgramAddress|TryFindProgramAddress|TestPanic|Secp256k1)|TestSyscall|TestMemoryCopyDifferential$|TestProcessNewVoteStateOwnsRetainedDeque$)'

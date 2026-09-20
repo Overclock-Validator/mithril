@@ -1160,3 +1160,21 @@ func TestStreamingVerificationWaitRespectsRemainingOpenAge(t *testing.T) {
 	require.Empty(t, h.executed())
 	require.Equal(t, "sigverify_timeout", h.discardReason())
 }
+
+func TestStreamingHeaderAdmissionBounds(t *testing.T) {
+	frontier := uint64(100)
+	s := newStreamingExecutor(streamingDeps{frontier: func() uint64 { return frontier }})
+	for _, slot := range []uint64{100, 101, 132, 133, ^uint64(0)} {
+		g := turbine.NewDetachedStreamGeneration(slot)
+		s.rememberHeader(turbine.NewDetachedStreamMarker(g, 0, 0, turbine.StreamMarkerHeader, 100, solana.Hash{}))
+	}
+	require.Len(t, s.headers, 2)
+	require.Len(t, s.observed, 2)
+	require.Contains(t, s.headers, uint64(101))
+	require.Contains(t, s.headers, uint64(132))
+	frontier = ^uint64(0) - 1
+	s.pruneHeaders(frontier)
+	g := turbine.NewDetachedStreamGeneration(^uint64(0))
+	s.rememberHeader(turbine.NewDetachedStreamMarker(g, 0, 0, turbine.StreamMarkerHeader, frontier, solana.Hash{}))
+	require.Len(t, s.headers, 1, "distance comparison must not overflow")
+}

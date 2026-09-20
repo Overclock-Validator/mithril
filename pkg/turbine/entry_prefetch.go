@@ -30,6 +30,7 @@ type prefetchedShredBatch struct {
 	start, end       uint32
 	raw              []byte
 	entries          []Entry
+	transactions     []*solana.Transaction // immutable pointer view, built once before ready closes
 	parent           *AlpenglowParentInfo
 	footer           *BlockFooter
 	marker           bool
@@ -190,8 +191,11 @@ func (p *entryPrefetchPool) run() {
 		if s.pipelineTrace != nil {
 			batch.traceDecodeEnd = entryTraceNow()
 		}
+		if batch.err == nil && !batch.marker {
+			batch.transactions = entryBatchTransactions(batch.entries)
+		}
 		if batch.err == nil && !batch.marker && f.ctx.Err() == nil {
-			txs := entryBatchTransactions(batch.entries)
+			txs := batch.transactions
 			if len(txs) > 0 {
 				batch.submittedAt = time.Now()
 				batch.verification, batch.submitErr = p.verifier.submitPrefetchTransactions(f.ctx, txs)

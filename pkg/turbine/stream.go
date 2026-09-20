@@ -339,7 +339,7 @@ func newStreamBatch(g StreamGeneration, batch *prefetchedShredBatch) *StreamBatc
 		// component boundary: nothing to execute, nothing to select.
 		view.Marker = StreamMarkerFooter
 	default:
-		view.Transactions = entryBatchTransactions(batch.entries)
+		view.Transactions = batch.transactions
 	}
 	return view
 }

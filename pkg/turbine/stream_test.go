@@ -271,3 +271,22 @@ func TestStreamVerificationTimeoutDoesNotCancelOrJoinOwner(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, verified, "same request remains usable after the observer leaves")
 }
+
+func TestStreamPollingReusesTransactionView(t *testing.T) {
+	v := newTransactionVerifier(2, 16, nil)
+	defer v.closeAndWait()
+	a := NewSlotAssembler()
+	p := newEntryPrefetchPool(context.Background(), a, v)
+	defer p.closeAndWait()
+	batches := prefetchTestShreds(t, 812, prefetchTestPayload(t, verifierSignedTransactions(t, 3)), buildAlpenglowEndingTick(t))
+	require.Nil(t, feedPrefetchShreds(t, a, batches[0]))
+	waitPrefetchedBatch(t, a, 812, 0)
+	a.mu.Lock()
+	g := StreamGeneration{slot: 812, state: a.slots[812]}
+	a.mu.Unlock()
+	first, second := a.PendingStreamBatches(g, 0), a.PendingStreamBatches(g, 0)
+	require.Len(t, first, 1)
+	require.Len(t, second, 1)
+	require.Len(t, first[0].Transactions, 3)
+	require.Same(t, &first[0].Transactions[0], &second[0].Transactions[0])
+}

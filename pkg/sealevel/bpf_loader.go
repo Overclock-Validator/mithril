@@ -1361,6 +1361,10 @@ func executeProgramFromBytes(execCtx *ExecutionCtx, programAddr solana.PublicKey
 	return executeLoadedProgram(execCtx, program, syscallRegistry)
 }
 
+// All loader cache insertions must pass through this helper. A speculative
+// stream records replacements for eviction on discard; the previous program is
+// then reloaded from authoritative account data, never retained from that stream.
+// Replay must discard its stream before executing a different bank.
 func addProgramToCache(execCtx *ExecutionCtx, programAddr solana.PublicKey, entry *accountsdb.ProgramCacheEntry) {
 	if execCtx.SlotCtx == nil || execCtx.SlotCtx.AccountsDb == nil {
 		return

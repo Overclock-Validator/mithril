@@ -2,8 +2,10 @@ package sbpf
 
 import (
 	"bufio"
+	"crypto/sha256"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"math/rand"
 	"os"
 	"testing"
@@ -316,11 +318,14 @@ func TestDifferentialDump(t *testing.T) {
 	w := bufio.NewWriter(f)
 	defer w.Flush()
 
+	writeDifferentialDump(t, w, 100000)
+}
+
+func writeDifferentialDump(t *testing.T, w io.Writer, n int) {
 	rng := rand.New(rand.NewSource(12345))
-	const N = 100000
 	generated, verified := 0, 0
 	var verifiedByVersion [4]int
-	for i := 0; i < N; i++ {
+	for i := 0; i < n; i++ {
 		// Equal representation of every version, independent of RNG consumption.
 		ver := uint32(i % 4)
 		p := genProgram(rng, ver)
@@ -405,4 +410,16 @@ func TestDifferentialDump(t *testing.T) {
 		}
 	}
 	t.Logf("generated=%d verified=%d verified_by_version=%v", generated, verified, verifiedByVersion)
+}
+
+// Golden derived from the pre-optimization e1204b32 interpreter with this
+// generator (seed 12345). Do not regenerate from candidate output alone.
+// Covers 1024 programs per version; dumps compare results, errors, CU and memory.
+func TestDifferentialGolden(t *testing.T) {
+	h := sha256.New()
+	writeDifferentialDump(t, h, 4096)
+	const want = "ccc16b4021e784342a7200a3d8911d362d2ab11a5ddefccf1c93880a704426b0"
+	if got := fmt.Sprintf("%x", h.Sum(nil)); got != want {
+		t.Fatalf("differential drift: got %s, want %s", got, want)
+	}
 }

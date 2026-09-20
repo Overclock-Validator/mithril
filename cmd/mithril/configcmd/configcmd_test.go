@@ -13,6 +13,10 @@ func TestStarterConfigSignatureVerification(t *testing.T) {
 		v := viper.New()
 		v.SetConfigType("toml")
 		require.NoError(t, v.ReadConfig(strings.NewReader(generateStarterConfig(validator))))
+		for _, key := range []string{"validator.wait_to_vote_slot", "validator.tpu_max_buffered_transactions", "validator.block_completion_reserve_ms"} {
+			require.True(t, v.IsSet(key), key)
+			require.Zero(t, v.GetInt(key), key)
+		}
 		require.Equal(t, "auto", v.GetString("sigverify.backend"))
 		require.True(t, v.IsSet("sigverify.workers"))
 		require.Zero(t, v.GetInt("sigverify.workers"))

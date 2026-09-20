@@ -1,7 +1,7 @@
 package costmodel
 
 // PackEntryBytesMax is the shred-safe entry-byte bound: we close a batch when
-// the next microblock would not fit in one FEC set, so padding is at most one
+// the next microblock would not fit in FECSetsPerBatch FEC sets, so padding is at most one
 // microblock. The slot cap is still min(this, SIMD-0525), decided at schedule
 // time like Firedancer pack.
 //
@@ -23,7 +23,7 @@ func PackEntryBytesMax(slotMaxDataShreds, maxMicroblock uint64) uint64 {
 	}
 	middle := fecSets - first - lastFEC
 	minBatch := wmark - maxMicroblock
-	return middle * minBatch
+	return (middle / FECSetsPerBatch) * minBatch
 }
 
 // DefaultPackEntryBytes is min(shred-safe, SIMD-0525) minus one ending tick.

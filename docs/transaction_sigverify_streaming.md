@@ -291,3 +291,12 @@ wait, not the duration of whole-block verification or recovery from a failed wor
 including failed joins and discarded streams. It overlaps `GroupJoinAssembly` for
 successful groups; do not add them together or interpret it as cryptographic CPU
 cost. The 100 ms limit is a conservative fallback budget, not a measured optimum.
+
+
+### Runtime pooling default
+
+Omitting `tuning.use_pool` now preserves the CLI default (`true`), instead of
+silently disabling VM pooling through the config reader's zero value. Explicit
+TOML `false` remains supported, and an explicitly supplied CLI flag takes
+precedence. This is a runtime behavior change for previously minimal configs;
+pooled memory is cleared before reuse. The flag remains the single default source.

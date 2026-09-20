@@ -100,3 +100,16 @@ func TestStackFrameGapsAreLegacyOnly(t *testing.T) {
 	require.Equal(t, VaddrStack+StackFrameSize*2, regs[10])
 	require.NotNil(t, stack.GetFrame(StackFrameSize))
 }
+
+func TestInputRegionFastCacheClampsToBackingBytes(t *testing.T) {
+	ip := &Interpreter{input: make([]byte, 8), inputRegions: []InputRegion{{Offset: 0, HostOffset: 4, RegionSize: 100, AddressSpaceReserved: 100, Writable: true, AccountIndex: -1}}}
+	ip.initRegions()
+	require.NoError(t, ip.Write8(VaddrInput, 7))
+	require.NotNil(t, ip.fastRead(VaddrInput+3, 1))
+	require.Nil(t, ip.fastRead(VaddrInput+4, 1))
+	require.Nil(t, ip.fastWrite(VaddrInput+4, 1))
+	_, err := ip.Read8(VaddrInput + 4)
+	require.Error(t, err)
+	require.Error(t, ip.Write8(VaddrInput+4, 8))
+	require.Equal(t, byte(7), ip.input[4])
+}

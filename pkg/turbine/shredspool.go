@@ -426,7 +426,9 @@ func (s *ShredSpool) recomputeHighestLocked() {
 // DiscardSlot removes both persisted packets and the completeness marker for
 // a poisoned or rejected slot. The journal tombstone prevents an older
 // completion record from being resurrected if repair immediately recreates a
-// partial file with the same slot number.
+// partial file with the same slot number. If the journal cannot durably fence
+// the old marker, retain the old file and reject replacement writes until a
+// retry succeeds; deleting it would permit stale completeness to certify new data.
 func (s *ShredSpool) DiscardSlot(slot uint64) {
 	if s == nil {
 		return

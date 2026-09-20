@@ -381,7 +381,7 @@ func (s *streamingExecutor) handleTick() {
 
 func (s *streamingExecutor) rememberHeader(header *turbine.StreamBatch) {
 	frontier := s.deps.frontier()
-	if header.Slot <= frontier {
+	if header.Slot <= frontier || header.Slot-frontier > streamingMaxSlotDistance {
 		return
 	}
 	s.headers[header.Slot] = header
@@ -441,17 +441,17 @@ func (s *streamingExecutor) retire(slot uint64, g turbine.StreamGeneration) {
 // frontier can never open.
 func (s *streamingExecutor) pruneHeaders(frontier uint64) {
 	for slot := range s.headers {
-		if slot <= frontier {
+		if slot <= frontier || slot-frontier > streamingMaxSlotDistance {
 			delete(s.headers, slot)
 		}
 	}
 	for slot := range s.retired {
-		if slot <= frontier {
+		if slot <= frontier || slot-frontier > streamingMaxSlotDistance {
 			delete(s.retired, slot)
 		}
 	}
 	for slot := range s.observed {
-		if slot <= frontier {
+		if slot <= frontier || slot-frontier > streamingMaxSlotDistance {
 			delete(s.observed, slot)
 		}
 	}

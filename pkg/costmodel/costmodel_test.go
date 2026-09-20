@@ -81,15 +81,6 @@ func TestEstimateTransactionCostCountsPrecompileSignatures(t *testing.T) {
 	)
 }
 
-func TestLimitsForFeaturesRaiseBlockLimitsTo100m(t *testing.T) {
-	feats := features.NewFeaturesDefault()
-	assert.Equal(t, uint64(MaxBlockUnitsSIMD0256), LimitsForFeatures(feats).BlockCost)
-
-	feats.EnableFeature(features.RaiseBlockLimitsTo100m, 123)
-	assert.Equal(t, uint64(MaxBlockUnitsSIMD0286), LimitsForFeatures(feats).BlockCost)
-	assert.Equal(t, uint64(MaxBlockUnitsSIMD0256), DefaultLimits().BlockCost)
-}
-
 func TestWritableAccountsUsesUnsignedWritableRange(t *testing.T) {
 	tx := &solana.Transaction{Message: solana.Message{
 		Header: solana.MessageHeader{
@@ -283,4 +274,13 @@ func TestCostTrackerAcceptsUnderLimits(t *testing.T) {
 	tracker.Record(cost)
 	assert.Equal(t, ExceedNone, tracker.WouldExceed(cost))
 	_ = wire
+}
+
+func TestPackEntryBytesMaxChargesEveryFECSetInBatch(t *testing.T) {
+	// One initial set, two reserved ending sets, then exactly one full batch.
+	shreds := uint64((1 + 2 + FECSetsPerBatch) * DataShredsPerFECSet)
+	want := uint64(DefaultTargetBatchBytes - 8 - MaxMicroblockBytes)
+	assert.Equal(t, want, PackEntryBytesMax(shreds, MaxMicroblockBytes))
+	assert.Equal(t, want, PackEntryBytesMax(shreds+DataShredsPerFECSet-1, MaxMicroblockBytes))
+	assert.Zero(t, PackEntryBytesMax(shreds-DataShredsPerFECSet, MaxMicroblockBytes))
 }

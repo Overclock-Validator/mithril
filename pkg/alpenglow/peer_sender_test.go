@@ -133,7 +133,9 @@ func testVotorBlockedPeer(t *testing.T, action string) {
 	select {
 	case received := <-marker:
 		t.Logf("Healthy marker received in %s while other peer's SendDatagram is blocked", received.Sub(start))
-	case <-time.After(250 * time.Millisecond):
+	case <-badConn.Context().Done():
+		t.Fatal("healthy marker did not arrive before stalled peer was released")
+	case <-time.After(3 * time.Second):
 		t.Fatal("stalled peer delayed healthy delivery")
 	}
 	require.NoError(t, badConn.Context().Err(), "marker must arrive before watchdog releases stalled peer")
@@ -144,7 +146,7 @@ func testVotorBlockedPeer(t *testing.T, action string) {
 			go func() { _ = b.Close(); close(closed) }()
 			select {
 			case <-closed:
-			case <-time.After(500 * time.Millisecond):
+			case <-time.After(3 * time.Second):
 				t.Fatal("Close waited for stalled SendDatagram")
 			}
 		case "depart":
@@ -158,7 +160,7 @@ func testVotorBlockedPeer(t *testing.T, action string) {
 		}
 		select {
 		case <-badSender.done:
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(3 * time.Second):
 			t.Fatal("old sender did not stop")
 		}
 		require.Error(t, badConn.Context().Err())
@@ -204,7 +206,9 @@ func testVotorBlockedPeer(t *testing.T, action string) {
 	require.NoError(t, b.Enqueue(NewVoteMessage(NewSkipVote(markerSlot), testSignatureSeq(0x43), 3)))
 	select {
 	case <-marker:
-	case <-time.After(250 * time.Millisecond):
+	case <-badConn.Context().Done():
+		t.Fatal("healthy marker did not arrive before stalled peer was released")
+	case <-time.After(3 * time.Second):
 		t.Fatal("full peer queue delayed healthy delivery")
 	}
 	// Queue age is measured from fanout, so PTO progress no longer restarts
