@@ -170,7 +170,7 @@ func SyscallGetProcessedSiblingInstructionImpl(vm sbpf.VM, index, metaAddr, prog
 	}
 
 	if instrCtxFound != nil {
-		resultsHeaderBytes, err := vm.Translate(metaAddr, ProcessedSiblingInstructionSize, false)
+		resultsHeaderBytes, err := vm.Translate(metaAddr, ProcessedSiblingInstructionSize, true)
 		if err != nil {
 			return syscallErr(err)
 		}
