@@ -3,6 +3,8 @@ package turbine
 import (
 	"context"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"weak"
@@ -242,4 +244,30 @@ func TestStreamResolvedEventRetainsCompletedPollingState(t *testing.T) {
 	require.True(t, live)
 	require.Equal(t, event.Generation, done.Generation)
 	require.Equal(t, StreamCompleted, done.Kind)
+}
+
+// The streaming observer must return while the owning request is still running.
+// Completion/cleanup retain the separate joining wait and own buffer lifetime.
+func TestStreamVerificationTimeoutDoesNotCancelOrJoinOwner(t *testing.T) {
+	done := make(chan struct{})
+	var closeOnce sync.Once
+	defer closeOnce.Do(func() { close(done) })
+	var cancelled atomic.Bool
+	future := &transactionVerification{done: done, cancel: func() { cancelled.Store(true) }}
+	batch := &StreamBatch{batch: &prefetchedShredBatch{verification: future}}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	returned := make(chan error, 1)
+	go func() { _, _, err := batch.WaitVerification(ctx); returned <- err }()
+	select {
+	case err := <-returned:
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+	case <-time.After(3 * time.Second):
+		t.Fatal("observer waited for unfinished owner")
+	}
+	require.False(t, cancelled.Load(), "observer must not cancel completion's shared work")
+	closeOnce.Do(func() { close(done) })
+	_, verified, err := batch.WaitVerification(context.Background())
+	require.NoError(t, err)
+	require.True(t, verified, "same request remains usable after the observer leaves")
 }

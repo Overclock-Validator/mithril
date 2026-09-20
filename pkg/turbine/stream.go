@@ -118,12 +118,15 @@ type StreamBatch struct {
 // consumer must verify signatures itself.
 var ErrStreamBatchUnverified = errors.New("stream batch has no verification result")
 
-// WaitVerification joins the batch's asynchronous signature verification and
+// WaitVerification observes the batch's asynchronous signature verification and
 // returns the verifier's message identities, one per transaction, bound to
 // Transactions (see block.PrepareVerifiedTransactionMessageIdentities). A
 // nil error with verified == false means no result is attached and the
 // caller must verify itself; any other error means a signature failed (the
-// slot is invalid) or ctx ended.
+// slot is invalid) or ctx ended. Unlike the owning verifier wait, a context
+// timeout returns without cancelling or joining the job: turbine retains the
+// immutable transaction storage and joins readers before releasing reservations.
+// A caller timing out must not mutate the batch or its transactions.
 func (sb *StreamBatch) WaitVerification(ctx context.Context) (identities []txverify.VerifiedMessageIdentity, verified bool, err error) {
 	if sb == nil || sb.batch == nil {
 		return nil, false, ErrStreamBatchUnverified
@@ -131,8 +134,20 @@ func (sb *StreamBatch) WaitVerification(ctx context.Context) (identities []txver
 	if sb.batch.verification == nil {
 		return nil, false, nil
 	}
-	if _, err := sb.batch.verification.waitContext(ctx); err != nil {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	future := sb.batch.verification
+	select {
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	case <-future.done:
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, false, err
+	}
+	if future.err != nil {
+		return nil, false, future.err
 	}
 	if len(sb.batch.verification.identities) != len(sb.Transactions) {
 		return nil, false, nil

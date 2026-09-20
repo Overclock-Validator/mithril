@@ -19,6 +19,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/txfixture"
 	"github.com/Overclock-Validator/mithril/pkg/turbine"
+	"github.com/Overclock-Validator/mithril/pkg/txverify"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/require"
@@ -355,37 +356,50 @@ func TestStreamingLifecycleMatchesWholeBlock(t *testing.T) {
 func TestStreamingLifecycleDiscardThenWholeBlock(t *testing.T) {
 	StreamingExecutionCfg = StreamingExecutionConfig{Enabled: true}
 	defer func() { StreamingExecutionCfg = StreamingExecutionConfig{} }()
-	txs := transferTransactions(t, 8, 999_000)
-	env := newLifecycleEnv(t)
-	whole := lifecycleWholeBlock(t, env, txs, 2)
+	for _, reason := range []string{"update_parent", "sigverify_timeout"} {
+		t.Run(reason, func(t *testing.T) {
+			txs := transferTransactions(t, 8, 999_000)
+			env := newLifecycleEnv(t)
+			whole := lifecycleWholeBlock(t, env, txs, 2)
 
-	tail := &lifecycleTail{durable: env.durable}
-	statuses := NewTransactionStatusCache()
-	shell := env.block(nil)
-	exec := newBlockExecution(env.acctsDb, shell, env.epochSchedule, 2, nil, &persistedTracker{}, tail, statuses, false, env.parent)
-	require.NoError(t, exec.open())
-	feed := newFakeStreamFeed()
-	gen := turbine.NewDetachedStreamGeneration(lifecycleSlot)
-	feed.status[gen] = turbine.StreamActive
-	s := newStreamingExecutor(streamingDeps{feed: feed, epochSchedule: env.epochSchedule, tail: tail, transactionStatuses: statuses})
-	s.current = &streamingSlot{slot: lifecycleSlot, generation: gen, parentSlot: lifecycleParentSlot, parentID: lifecycleParentBlockID,
-		exec: exec, pending: make(map[uint32]*turbine.StreamBatch), openedAt: time.Now(), headerAt: time.Now(), nextStart: 1}
-	s.handleEvent(turbine.StreamEvent{Kind: turbine.StreamBatchReady, Slot: lifecycleSlot, Generation: gen,
-		Batch: turbine.NewDetachedStreamBatch(gen, 1, 5, txs[:5], verifiedIdentities(t, txs[:5]))})
-	sameTransactions(t, txs[:5], s.current.origin)
-	sameCopies(t, txs[:5], exec.transactions)
-	payerNow, err := exec.slotCtx.GetAccountShared(txfixture.PayerPubkey())
-	require.NoError(t, err)
-	require.Less(t, payerNow.Lamports, uint64(3_200_000), "the overlay saw the executed prefix")
+			tail := &lifecycleTail{durable: env.durable}
+			statuses := NewTransactionStatusCache()
+			shell := env.block(nil)
+			exec := newBlockExecution(env.acctsDb, shell, env.epochSchedule, 2, nil, &persistedTracker{}, tail, statuses, false, env.parent)
+			require.NoError(t, exec.open())
+			feed := newFakeStreamFeed()
+			gen := turbine.NewDetachedStreamGeneration(lifecycleSlot)
+			feed.status[gen] = turbine.StreamActive
+			s := newStreamingExecutor(streamingDeps{feed: feed, epochSchedule: env.epochSchedule, tail: tail, transactionStatuses: statuses})
+			s.current = &streamingSlot{slot: lifecycleSlot, generation: gen, parentSlot: lifecycleParentSlot, parentID: lifecycleParentBlockID,
+				exec: exec, pending: make(map[uint32]*turbine.StreamBatch), openedAt: time.Now(), headerAt: time.Now(), nextStart: 1}
+			s.handleEvent(turbine.StreamEvent{Kind: turbine.StreamBatchReady, Slot: lifecycleSlot, Generation: gen,
+				Batch: turbine.NewDetachedStreamBatch(gen, 1, 5, txs[:5], verifiedIdentities(t, txs[:5]))})
+			sameTransactions(t, txs[:5], s.current.origin)
+			sameCopies(t, txs[:5], exec.transactions)
+			payerNow, err := exec.slotCtx.GetAccountShared(txfixture.PayerPubkey())
+			require.NoError(t, err)
+			require.Less(t, payerNow.Lamports, uint64(3_200_000), "the overlay saw the executed prefix")
 
-	s.discard("update_parent")
-	require.Empty(t, tail.added, "a discarded stream commits nothing")
-	durablePayer, err := env.durable.GetAccountWithoutLock(txfixture.PayerPubkey())
-	require.NoError(t, err)
-	require.Equal(t, uint64(3_200_000), durablePayer.Lamports, "the durable view is untouched")
+			if reason == "sigverify_timeout" {
+				s.waitVerificationFn = func(context.Context, *turbine.StreamBatch) ([]txverify.VerifiedMessageIdentity, bool, error) {
+					return nil, false, context.DeadlineExceeded
+				}
+				s.handleEvent(turbine.StreamEvent{Kind: turbine.StreamBatchReady, Slot: lifecycleSlot, Generation: gen, Batch: turbine.NewDetachedStreamBatch(gen, 6, 8, txs[5:], verifiedIdentities(t, txs[5:]))})
+				require.Nil(t, s.current)
+			} else {
+				s.discard(reason)
+			}
+			require.Empty(t, tail.added, "a discarded stream commits nothing")
+			durablePayer, err := env.durable.GetAccountWithoutLock(txfixture.PayerPubkey())
+			require.NoError(t, err)
+			require.Equal(t, uint64(3_200_000), durablePayer.Lamports, "the durable view is untouched")
 
-	again := lifecycleWholeBlock(t, env, txs, 2)
-	requireSameLifecycleOutcome(t, whole, again)
+			again := lifecycleWholeBlock(t, env, txs, 2)
+			requireSameLifecycleOutcome(t, whole, again)
+
+		})
+	}
 }
 
 // V0 / address-lookup-table coverage. Resolving lookups mutates the message

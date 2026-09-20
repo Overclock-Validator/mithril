@@ -271,3 +271,23 @@ and a reserved token for continued highest-index discovery when needed. A
 snapshot can still race with subsequent arrivals; this removes known redundant
 requests, not every possible duplicate. No assembler lock is held while signing
 or sending requests. Response matching and peer credit are unchanged.
+
+
+### Bounded speculative verification waits
+
+Replay joins a streaming group's signature verification with one shared 100 ms
+budget, capped by the stream's remaining open lifetime. The watchdog stage is
+`streaming_sigverify_wait`. Expiry discards the speculative overlay with reason
+`sigverify_timeout`; it is not a signature verdict. Whole-block replay still
+requires normal verification before accepting the block.
+
+The streaming wait only observes immutable verifier results. Timing out does not
+cancel the shared request or wait for its workers: turbine continues owning its
+transactions and retains reservations until readers finish. The owning completion
+and cleanup paths retain their joining waits. This bounds speculative replay's
+wait, not the duration of whole-block verification or recovery from a failed worker.
+
+`StreamingExecution.VerificationWait` records wall time spent joining groups,
+including failed joins and discarded streams. It overlaps `GroupJoinAssembly` for
+successful groups; do not add them together or interpret it as cryptographic CPU
+cost. The 100 ms limit is a conservative fallback budget, not a measured optimum.

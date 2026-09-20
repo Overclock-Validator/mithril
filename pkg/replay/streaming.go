@@ -60,6 +60,9 @@ const (
 	defaultStreamingWorkers = 4
 	defaultStreamingMaxAge  = 2 * time.Second
 	streamingPollInterval   = 5 * time.Millisecond
+	// Bound the entire group's verification join, not each batch separately.
+	// This is a speculative-work budget, not a signature validity deadline.
+	streamingVerificationWait = 100 * time.Millisecond
 	// Bound speculation across missing leaders; this never advances replay
 	// or establishes that the intervening slots are actually skipped.
 	streamingMaxSlotDistance = uint64(32)
@@ -158,14 +161,15 @@ type streamingFrontierMark struct {
 // that a block executed whole can report why no stream opened for it, and a
 // stream can report how long its header waited and on what.
 type streamingObservation struct {
-	generation     turbine.StreamGeneration
-	parentSlot     uint64
-	readyAt        time.Time // header batch decoded (its wake-up's ReadyAt)
-	seenAt         time.Time // executor first handled the header
-	frontierAtSeen uint64
-	declined       string // eligibility reason, when the header was declined
-	discarded      string // discard reason, when a stream opened and was thrown away
-	openedAt       time.Time
+	verificationWait metrics.Timing
+	generation       turbine.StreamGeneration
+	parentSlot       uint64
+	readyAt          time.Time // header batch decoded (its wake-up's ReadyAt)
+	seenAt           time.Time // executor first handled the header
+	frontierAtSeen   uint64
+	declined         string // eligibility reason, when the header was declined
+	discarded        string // discard reason, when a stream opened and was thrown away
+	openedAt         time.Time
 }
 
 // streamingSlot is one in-progress stream.
@@ -178,14 +182,15 @@ type streamingSlot struct {
 	// origin holds the block's own transaction objects in executed order;
 	// the bank executes stream-owned copies (block.ExecutionCopies), and the
 	// handshake proves the block by these originals.
-	origin     []*solana.Transaction
-	nextStart  uint32
-	pending    map[uint32]*turbine.StreamBatch
-	footerSeen bool
-	completed  bool
-	openedAt   time.Time
-	headerAt   time.Time
-	groups     []streamingGroup
+	origin           []*solana.Transaction
+	nextStart        uint32
+	pending          map[uint32]*turbine.StreamBatch
+	footerSeen       bool
+	completed        bool
+	openedAt         time.Time
+	headerAt         time.Time
+	groups           []streamingGroup
+	verificationWait metrics.Timing
 	// timeline: what bounded the open (see metrics.StreamingExecution). Kept
 	// here rather than in the collector because the loop resets the collector
 	// before every wait and the block may arrive several waits after the open.
@@ -215,8 +220,9 @@ type streamingExecutor struct {
 	// pruned with headers.
 	observed map[uint64]*streamingObservation
 	ticker   *time.Ticker
-	// executeFn runs one group on the open execution; tests substitute it.
-	executeFn func(exec *blockExecution, txs []*solana.Transaction, identities *b.PreparedTransactionMessageIdentities, shouldVerifySignatures bool) error
+	// Verification observation and group execution hooks; tests substitute them.
+	waitVerificationFn func(context.Context, *turbine.StreamBatch) ([]txverify.VerifiedMessageIdentity, bool, error)
+	executeFn          func(exec *blockExecution, txs []*solana.Transaction, identities *b.PreparedTransactionMessageIdentities, shouldVerifySignatures bool) error
 }
 
 func newStreamingExecutor(deps streamingDeps) *streamingExecutor {
@@ -226,6 +232,9 @@ func newStreamingExecutor(deps streamingDeps) *streamingExecutor {
 		retired:   make(map[uint64]turbine.StreamGeneration),
 		observed:  make(map[uint64]*streamingObservation),
 		executeFn: (*blockExecution).executeTransactionGroup,
+		waitVerificationFn: func(ctx context.Context, batch *turbine.StreamBatch) ([]txverify.VerifiedMessageIdentity, bool, error) {
+			return batch.WaitVerification(ctx)
+		},
 	}
 }
 
@@ -694,12 +703,36 @@ func (s *streamingExecutor) executeGroup(group []*turbine.StreamBatch) error {
 	var verified []txverify.VerifiedMessageIdentity
 	allVerified := true
 	readyAt := time.Now()
+	deadline := readyAt.Add(streamingVerificationWait)
+	maxAge := StreamingExecutionCfg.maxOpenAge()
+	if cur.completed {
+		maxAge *= streamingHardOpenAgeFactor
+	}
+	if ageDeadline := cur.openedAt.Add(maxAge); ageDeadline.Before(deadline) {
+		deadline = ageDeadline
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	cur.exec.setReplayStage("streaming_sigverify_wait")
+	// Keep failure timings across replay-loop metric resets, just like headers.
+	joinStarted := time.Now()
+	recordJoin := func() {
+		cur.verificationWait.AddTiming(time.Since(joinStarted))
+		if obs := s.observed[cur.slot]; obs != nil && obs.generation == cur.generation {
+			obs.verificationWait = cur.verificationWait
+		}
+		cur.exec.setReplayStage("streaming_wait")
+	}
 	for _, batch := range group {
-		identities, ok, err := batch.WaitVerification(context.Background())
+		identities, ok, err := s.waitVerificationFn(ctx, batch)
 		if errors.Is(err, turbine.ErrStreamBatchUnverified) {
 			ok, err = false, nil
 		}
 		if err != nil {
+			recordJoin()
+			if errors.Is(err, context.DeadlineExceeded) {
+				return errors.New("sigverify_timeout")
+			}
 			return fmt.Errorf("sigverify: %w", err)
 		}
 		if !ok {
@@ -708,6 +741,7 @@ func (s *streamingExecutor) executeGroup(group []*turbine.StreamBatch) error {
 		txs = append(txs, batch.Transactions...)
 		verified = append(verified, identities...)
 	}
+	recordJoin()
 	joinedAt := time.Now()
 	if len(txs) == 0 {
 		return nil
@@ -790,6 +824,7 @@ func (s *streamingExecutor) discard(reason string) {
 	if cur.restoreSysvarCache != nil {
 		cur.restoreSysvarCache()
 	}
+	metrics.GlobalBlockReplay.StreamingExecution.VerificationWait = cur.verificationWait
 	metrics.GlobalBlockReplay.StreamingExecution.Discarded = 1
 	metrics.GlobalBlockReplay.StreamingExecution.DiscardReason = reason
 	mlog.Log.FileOnlyf("streaming: discarded slot %d after %d groups (%s)", cur.slot, len(cur.groups), reason)
@@ -936,6 +971,7 @@ func (s *streamingExecutor) finalize(block *b.Block, parentBankSysvars *sealevel
 	record := &metrics.GlobalBlockReplay.StreamingExecution
 	discarded, discardReason := record.Discarded, record.DiscardReason
 	*record = metrics.StreamingExecution{Opened: 1, Discarded: discarded, DiscardReason: discardReason}
+	record.VerificationWait = cur.verificationWait
 	record.Groups = uint64(len(cur.groups))
 	for _, group := range cur.groups {
 		record.Transactions += uint64(group.transactions)
@@ -1187,6 +1223,7 @@ func (s *streamingExecutor) noteWholeBlock(block *b.Block) {
 	default:
 		record.NotOpenedReason = fmt.Sprintf("waiting_for_parent:header_on_parent_%d_seen_at_frontier_%d", obs.parentSlot, obs.frontierAtSeen)
 	}
+	record.VerificationWait = obs.verificationWait
 	record.HeaderReadyNanos = nanosOf(obs.readyAt)
 	record.HeaderSeenNanos = nanosOf(obs.seenAt)
 	record.OpenedNanos = nanosOf(obs.openedAt)

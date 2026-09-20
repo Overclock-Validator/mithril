@@ -1095,3 +1095,68 @@ func TestStreamingEventRefreshesReadyBatches(t *testing.T) {
 		})
 	}
 }
+
+func TestStreamingVerificationDeadlineAndDiscard(t *testing.T) {
+	old := StreamingExecutionCfg
+	StreamingExecutionCfg = StreamingExecutionConfig{Enabled: true}
+	defer func() { StreamingExecutionCfg = old }()
+	h := newFinalizeFailureHarness(t)
+	cur := h.exec.current
+	h.exec.observed[cur.slot] = &streamingObservation{generation: h.gen}
+	StreamingExecutionCfg.MinGroupBatches = 2
+	var stage string
+	cur.exec.setReplayStage = func(value string) { stage = value }
+	var firstContext context.Context
+	calls := 0
+	h.exec.waitVerificationFn = func(ctx context.Context, batch *turbine.StreamBatch) ([]txverify.VerifiedMessageIdentity, bool, error) {
+		require.Equal(t, "streaming_sigverify_wait", stage)
+		deadline, ok := ctx.Deadline()
+		require.True(t, ok)
+		require.LessOrEqual(t, time.Until(deadline), streamingVerificationWait)
+		calls++
+		if calls == 1 {
+			firstContext = ctx
+			return batch.WaitVerification(ctx)
+		}
+		require.Equal(t, firstContext, ctx, "one deadline covers all batches")
+		return nil, false, context.DeadlineExceeded
+	}
+	txs := transferTransactions(t, 2, 98123)
+	h.exec.handleEvent(h.event(h.batch(t, 4, 4, txs[:1])))
+	require.Zero(t, calls)
+	h.exec.handleEvent(h.event(h.batch(t, 5, 5, txs[1:])))
+	require.Equal(t, 2, calls)
+	h.assertUndone(t, "sigverify_timeout")
+	require.Equal(t, "streaming_wait", stage)
+	sameTransactions(t, h.txs[:3], cur.origin)
+	sameCopies(t, h.txs[:3], cur.exec.transactions)
+	_, ok, err := h.exec.finalize(h.env.exec.block, h.env.exec.parentBankSysvars)
+	require.NoError(t, err)
+	require.False(t, ok, "whole-block replay must take over")
+	metrics.GlobalBlockReplay.StreamingExecution = metrics.StreamingExecution{}
+	h.exec.noteWholeBlock(h.env.exec.block)
+	record := metrics.GlobalBlockReplay.StreamingExecution
+	require.Equal(t, "discarded:sigverify_timeout", record.NotOpenedReason)
+	require.Equal(t, uint64(2), record.VerificationWait.Count)
+	require.Positive(t, record.VerificationWait.SumNanoseconds)
+}
+
+func TestStreamingVerificationWaitRespectsRemainingOpenAge(t *testing.T) {
+	old := StreamingExecutionCfg
+	StreamingExecutionCfg = StreamingExecutionConfig{Enabled: true, MaxOpenAge: time.Second}
+	defer func() { StreamingExecutionCfg = old }()
+	h := newStreamingTestHarness(t)
+	cur := h.exec.current
+	cur.openedAt = time.Now().Add(-time.Second)
+	h.exec.waitVerificationFn = func(ctx context.Context, _ *turbine.StreamBatch) ([]txverify.VerifiedMessageIdentity, bool, error) {
+		deadline, ok := ctx.Deadline()
+		require.True(t, ok)
+		require.Equal(t, cur.openedAt.Add(time.Second), deadline)
+		require.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
+		return nil, false, ctx.Err()
+	}
+	h.exec.handleEvent(h.event(h.batch(t, 1, 1, transferTransactions(t, 1, 98124))))
+	require.Nil(t, h.exec.current)
+	require.Empty(t, h.executed())
+	require.Equal(t, "sigverify_timeout", h.discardReason())
+}

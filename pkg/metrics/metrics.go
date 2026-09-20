@@ -255,6 +255,10 @@ type VoteRewardDetails struct {
 // this slot was thrown away and the block was executed whole; DiscardReason
 // names why.
 type StreamingExecution struct {
+	// VerificationWait is wall time joining speculative verification groups,
+	// including failed joins. It overlaps GroupJoinAssembly for successful
+	// groups; it is neither crypto CPU time nor additional replay latency.
+	VerificationWait Timing
 	Opened           uint64
 	Groups           uint64
 	Transactions     uint64
