@@ -847,16 +847,18 @@ func (r *UDPReceiver) submitCompletion(ctx context.Context, work *slotCompletion
 	}
 	r.slotResetMu.RUnlock()
 	return r.handleCompletionResult(ctx, slotCompletionResult{
-		block:    blk,
-		err:      err,
-		hydrated: hydrated,
-		pending:  pending,
+		generation: StreamGeneration{slot: work.state.slot, state: work.state},
+		block:      blk,
+		err:        err,
+		hydrated:   hydrated,
+		pending:    pending,
 	})
 }
 
 func (r *UDPReceiver) consumeCompletionResults(ctx context.Context, results <-chan slotCompletionResult) {
 	for result := range results {
 		if ctx.Err() != nil {
+			r.assembler.cancelUndeliveredStream(result.generation)
 			if result.pending && result.block != nil {
 				r.finishPendingBlock(result.block.Slot)
 			}
@@ -884,10 +886,16 @@ func (r *UDPReceiver) handleCompletionResult(ctx context.Context, result slotCom
 	if result.hydrated {
 		r.hydratedFromDisk.Add(1)
 	}
+	var emitted bool
 	if result.pending {
-		return r.emitPendingAssembled(ctx, result.block)
+		emitted = r.emitPendingAssembled(ctx, result.block)
+	} else {
+		emitted = r.emitAssembled(ctx, result.block)
 	}
-	return r.emitAssembled(ctx, result.block)
+	if !emitted {
+		r.assembler.cancelUndeliveredStream(result.generation)
+	}
+	return emitted
 }
 
 // skipAssemblyForSpool implements the catchup RAM policy: with a hydration

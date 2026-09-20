@@ -37,6 +37,10 @@ func (c *repairClient) followupHighestResponse(conn *net.UDPConn, a *SlotAssembl
 	if len(peers) == 0 {
 		return
 	}
+	// A matched discovery response can request at most 256 missing pieces plus
+	// one highest-index probe. This response-driven burst shares the global
+	// token bucket (not the periodic head-share quota); inflight dedup suppresses
+	// repeat sends and unused tokens are returned below.
 	ask := len(req.MissingDataShreds)
 	if req.NeedHighestDataShred {
 		ask++

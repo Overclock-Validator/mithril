@@ -166,10 +166,11 @@ type processedSlotCompletion struct {
 }
 
 type slotCompletionResult struct {
-	block    *block.Block
-	err      error
-	hydrated bool
-	pending  bool
+	generation StreamGeneration
+	block      *block.Block
+	err        error
+	hydrated   bool
+	pending    bool
 }
 
 type fecLayout struct {

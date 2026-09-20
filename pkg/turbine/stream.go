@@ -277,6 +277,23 @@ func (a *SlotAssembler) streamStatusLocked(g StreamGeneration) StreamStatus {
 	return StreamGone
 }
 
+// cancelUndeliveredStream closes a completed generation whose result was
+// abandoned during receiver shutdown. Identity binding avoids cancelling a
+// replacement generation assembled for the same slot.
+func (a *SlotAssembler) cancelUndeliveredStream(g StreamGeneration) {
+	if g.state == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !g.state.streamCompleted {
+		return
+	}
+	g.state.streamCompleted = false
+	g.state.streamCancelReason = "delivery_cancelled"
+	a.publishStreamReleaseLocked(g.state, g.state.streamCancelReason)
+}
+
 // PendingStreamBatches returns every decoded batch of the generation whose
 // range starts at or after fromStart, in shred-index order. It reads the
 // prefetch state directly, so it is the authoritative recovery path after a

@@ -290,3 +290,34 @@ func TestStreamPollingReusesTransactionView(t *testing.T) {
 	require.Len(t, first[0].Transactions, 3)
 	require.Same(t, &first[0].Transactions[0], &second[0].Transactions[0])
 }
+
+func TestCompletedStreamCancelledWhenDeliveryAbandoned(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		a := &SlotAssembler{slots: make(map[uint64]*slotState)}
+		events := make(chan StreamEvent, 2)
+		a.SubscribeStream(events)
+		g := NewDetachedStreamGeneration(101)
+		g.state.streamCompleted = true
+		replacement := NewDetachedStreamGeneration(101)
+		a.slots[101] = replacement.state
+		r := &UDPReceiver{assembler: a, blocks: make(chan *block.Block), pendingBlocks: make(map[uint64]int)}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		result := slotCompletionResult{block: &block.Block{Slot: 101}, generation: g, pending: true}
+		r.startPendingBlock(101)
+		if queued {
+			results := make(chan slotCompletionResult, 1)
+			results <- result
+			close(results)
+			r.consumeCompletionResults(ctx, results)
+		} else {
+			require.False(t, r.handleCompletionResult(ctx, result))
+		}
+		require.Equal(t, StreamGone, a.StreamStatusOf(g))
+		require.Equal(t, StreamActive, a.StreamStatusOf(replacement))
+		require.Empty(t, r.pendingBlocks)
+		event := nextStreamEvent(t, events, StreamCancelled)
+		require.Equal(t, g, event.Generation)
+		require.Equal(t, "delivery_cancelled", event.Reason)
+	}
+}
