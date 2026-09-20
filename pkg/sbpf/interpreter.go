@@ -1299,6 +1299,86 @@ func (ip *Interpreter) Write64(addr uint64, x uint64) error {
 func (ip *Interpreter) executeCold(ins Slot, pc int64, r *[16]uint64) (int64, error) {
 	var err error
 	switch ins.Op() {
+	// In v2 these encodings are memory operations, not MUL/DIV/MOD.
+	// Run dispatches their non-v2 arithmetic forms on the hot path.
+	case OpLd1BReg:
+		if !ip.sbpfVersion.MoveMemoryInstructionClasses() {
+			err = ExcInvalidInstr
+			break
+		}
+		vma := uint64(int64(r[ins.Src()]) + int64(ins.Off()))
+		var v uint8
+		v, err = ip.Read8(vma)
+		r[ins.Dst()] = uint64(v)
+		pc++
+	case OpSt1BImm:
+		if !ip.sbpfVersion.MoveMemoryInstructionClasses() {
+			err = ExcInvalidInstr
+			break
+		}
+		vma := uint64(int64(r[ins.Dst()]) + int64(ins.Off()))
+		err = ip.Write8(vma, uint8(ins.Uimm()))
+		pc++
+	case OpSt1BReg:
+		if !ip.sbpfVersion.MoveMemoryInstructionClasses() {
+			err = ExcInvalidInstr
+			break
+		}
+		vma := uint64(int64(r[ins.Dst()]) + int64(ins.Off()))
+		err = ip.Write8(vma, uint8(r[ins.Src()]))
+		pc++
+	case OpLd2BReg:
+		if !ip.sbpfVersion.MoveMemoryInstructionClasses() {
+			err = ExcInvalidInstr
+			break
+		}
+		vma := uint64(int64(r[ins.Src()]) + int64(ins.Off()))
+		var v uint16
+		v, err = ip.Read16(vma)
+		r[ins.Dst()] = uint64(v)
+		pc++
+	case OpSt2BImm:
+		if !ip.sbpfVersion.MoveMemoryInstructionClasses() {
+			err = ExcInvalidInstr
+			break
+		}
+		vma := uint64(int64(r[ins.Dst()]) + int64(ins.Off()))
+		err = ip.Write16(vma, uint16(ins.Uimm()))
+		pc++
+	case OpSt2BReg:
+		if !ip.sbpfVersion.MoveMemoryInstructionClasses() {
+			err = ExcInvalidInstr
+			break
+		}
+		vma := uint64(int64(r[ins.Dst()]) + int64(ins.Off()))
+		err = ip.Write16(vma, uint16(r[ins.Src()]))
+		pc++
+	case OpLd8BReg:
+		if !ip.sbpfVersion.MoveMemoryInstructionClasses() {
+			err = ExcInvalidInstr
+			break
+		}
+		vma := uint64(int64(r[ins.Src()]) + int64(ins.Off()))
+		var v uint64
+		v, err = ip.Read64(vma)
+		r[ins.Dst()] = v
+		pc++
+	case OpSt8BImm:
+		if !ip.sbpfVersion.MoveMemoryInstructionClasses() {
+			err = ExcInvalidInstr
+			break
+		}
+		vma := uint64(int64(r[ins.Dst()]) + int64(ins.Off()))
+		err = ip.Write64(vma, uint64(ins.Imm()))
+		pc++
+	case OpSt8BReg:
+		if !ip.sbpfVersion.MoveMemoryInstructionClasses() {
+			err = ExcInvalidInstr
+			break
+		}
+		vma := uint64(int64(r[ins.Dst()]) + int64(ins.Off()))
+		err = ip.Write64(vma, r[ins.Src()])
+		pc++
 	case OpDiv32Imm:
 		r[ins.Dst()] = uint64(uint32(r[ins.Dst()]) / ins.Uimm())
 		pc++
