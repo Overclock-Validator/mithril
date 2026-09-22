@@ -388,6 +388,23 @@ type foldResult struct {
 	err error
 }
 
+// buildRewardsCompletionFoldJob puts the entire rewards window in one commit.
+// A normal batch cutoff inside that window would leave an active EpochRewards
+// checkpoint without the RAM-only spool bookkeeping needed to resume it. The
+// retained tail already bounds the size of this once-per-epoch fold.
+func (t *unrootedTail) buildRewardsCompletionFoldJob(through uint64) (*foldJob, error) {
+	whole := *t
+	whole.batchSlots = t.overlay.HeldSlots()
+	job, err := whole.buildFoldJob(through, true)
+	if err != nil {
+		return nil, err
+	}
+	if job == nil || job.through != through {
+		return nil, fmt.Errorf("rewards completion bank %d is absent from retained fold prefix", through)
+	}
+	return job, nil
+}
+
 // buildFoldJob snapshots the FIRST fold chunk of the rooted prefix <= through
 // (loop thread). force also takes a trailing partial chunk. Returns nil when
 // no chunk is ready. A missing chunk-top context is an error — a context-less

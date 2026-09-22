@@ -15,6 +15,19 @@ type partitionedRewardsCompletion struct {
 	slot uint64
 }
 
+// limitPromotion keeps the boundary replayable until a successfully verified
+// completion bank is eligible for promotion. Consuming the last spool changes
+// the RAM counter before footer verification and is not completion evidence.
+func (c *partitionedRewardsCompletion) limitPromotion(info *rewards.PartitionedRewardDistributionInfo, boundary, through uint64) uint64 {
+	if boundary == 0 || info == nil {
+		return through
+	}
+	if info.NumRewardPartitionsRemaining != 0 || c.info != info || c.slot == 0 || through < c.slot {
+		return min(through, boundary-1)
+	}
+	return through
+}
+
 // observeBank must run only after successful block execution/publication, using
 // that bank's immutable sysvars (never the speculative global sysvar cache).
 // If the first completed bank lacks evidence, recording a later descendant is

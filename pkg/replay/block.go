@@ -1929,8 +1929,8 @@ func ReplayBlocks(
 	var highestExecutedSlot uint64 // highest slot ProcessBlock has executed; bounds the promotion-gate walk
 	// While partitioned rewards distribute, promotion holds below the boundary
 	// block so a crash-resume always re-runs it (the distribution bookkeeping is
-	// RAM-only and not reconstructible mid-window). Self-clears when the window
-	// completes (NumRewardPartitionsRemaining reaches 0).
+	// RAM-only and not reconstructible mid-window). Release requires a verified
+	// completion bank, committed atomically with the whole rewards window.
 	var rewardsHoldBelowSlot uint64
 	// Alpenglow finality identities captured at observe/ingest time for the promotion
 	// gate (the tracker's own state may be pruned by promotion time). Pruned as slots
@@ -2175,13 +2175,9 @@ func ReplayBlocks(
 		}
 		promoteThrough := safePromoteTarget(lastRootedWatermark, verifierRequired, verifiedWM, replayDivergenceFloor)
 		// Partitioned-rewards window: hold promotion below the boundary block
-		// until every partition distributes, so a crash-resume re-runs the
-		// boundary and rebuilds the RAM-only distribution bookkeeping.
-		if rewardsHoldBelowSlot > 0 && partitionedRewardsInfo != nil && partitionedRewardsInfo.NumRewardPartitionsRemaining > 0 {
-			if promoteThrough >= rewardsHoldBelowSlot {
-				promoteThrough = rewardsHoldBelowSlot - 1
-			}
-		}
+		// until the completion bank verifies and is eligible to fold, so a
+		// failed distribution re-runs the boundary and rebuilds its bookkeeping.
+		promoteThrough = rewardsCompletion.limitPromotion(partitionedRewardsInfo, rewardsHoldBelowSlot, promoteThrough)
 		if promoteThrough <= mithrilState.LastRootedSlot {
 			// Operator signal: promotion is fully stalled (verifier lag,
 			// divergence floor, or rewards hold) while finality has run at
@@ -2212,6 +2208,8 @@ func ReplayBlocks(
 			mlog.Log.FileOnlyf("alpenglow gate: checked=%d matched=%d no_finality=%d no_local_id=%d",
 				gateStats.checked, gateStats.matched, gateStats.noFinality, gateStats.noLocalID)
 		}
+		// The finality gate can stop before the verified completion bank.
+		promoteThrough = rewardsCompletion.limitPromotion(partitionedRewardsInfo, rewardsHoldBelowSlot, promoteThrough)
 		if promoteThrough <= mithrilState.LastRootedSlot {
 			return false
 		}
@@ -2224,6 +2222,18 @@ func ReplayBlocks(
 			// loop would refuse.
 			if res := promoter.drain(); res != nil {
 				applyFoldOutcome(res)
+			}
+			if rewardsHoldBelowSlot > 0 && partitionedRewardsInfo != nil && promoteThrough >= rewardsHoldBelowSlot {
+				job, jerr := unrootedTailState.buildRewardsCompletionFoldJob(rewardsCompletion.slot)
+				if jerr != nil {
+					mlog.Log.Errorf("rooted-durable: rewards completion fold: %v", jerr)
+					return false
+				}
+				if err := runFoldJob(unrootedTailState.committer, job); err != nil {
+					mlog.Log.Errorf("rooted-durable: rewards completion fold: %v", err)
+					return false
+				}
+				applyFoldOutcome(&foldResult{job: job})
 			}
 			promotedThrough, rootedCtx, perr := unrootedTailState.flush(promoteThrough)
 			if perr != nil {
@@ -2238,7 +2248,13 @@ func ReplayBlocks(
 		// when idle; completions are applied at the top of this function on a
 		// later iteration.
 		if !promoter.inFlight {
-			job, jerr := unrootedTailState.buildFoldJob(promoteThrough, false)
+			var job *foldJob
+			var jerr error
+			if rewardsHoldBelowSlot > 0 && partitionedRewardsInfo != nil && promoteThrough >= rewardsHoldBelowSlot {
+				job, jerr = unrootedTailState.buildRewardsCompletionFoldJob(rewardsCompletion.slot)
+			} else {
+				job, jerr = unrootedTailState.buildFoldJob(promoteThrough, false)
+			}
 			if jerr != nil {
 				mlog.Log.Errorf("rooted-durable: %v; watermark held back", jerr)
 				return false
