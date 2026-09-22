@@ -17,3 +17,6 @@ jobs:
 
       - name: Build
         run: go build -v ./cmd/mithril
+
+      - name: Rewards and replay regressions
+        run: GOMAXPROCS=2 go test -race -p 2 -count=1 ./pkg/rewards ./pkg/replay
