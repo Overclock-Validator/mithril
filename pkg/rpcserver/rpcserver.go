@@ -31,6 +31,7 @@ type RpcServer struct {
 	slotCtx       *sealevel.SlotCtx
 	slotCtxMu     sync.RWMutex
 	genesisHash   string
+	identity      string
 
 	leaderTPUCacheMu         sync.RWMutex
 	leaderTPUByIdentity      map[solana.PublicKey]tpuEndpoint
@@ -53,7 +54,10 @@ var supportedRPCMethods = map[string]struct{}{
 	"getBlockHeight":      {},
 	"getEpochInfo":        {},
 	"getGenesisHash":      {},
+	"getHealth":           {},
+	"getIdentity":         {},
 	"getLatestBlockhash":  {},
+	"getVersion":          {},
 	"sendTransaction":     {},
 	"simulateTransaction": {},
 }
@@ -110,6 +114,10 @@ func (rpcServer *RpcServer) SetSlotCtx(slotCtx *sealevel.SlotCtx) {
 	rpcServer.slotCtxMu.Lock()
 	rpcServer.slotCtx = slotCtx
 	rpcServer.slotCtxMu.Unlock()
+}
+
+func (rpcServer *RpcServer) SetIdentity(identity string) {
+	rpcServer.identity = identity
 }
 
 func (rpcServer *RpcServer) getSlotCtx() *sealevel.SlotCtx {
