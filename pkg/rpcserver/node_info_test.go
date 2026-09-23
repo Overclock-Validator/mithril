@@ -27,6 +27,7 @@ func TestNodeInfoHTTP(t *testing.T) {
 	require.NoError(t, server.listener.Close())
 	server.SetIdentity("2r1F4iWqVcb8M1DbAjQuFpebkQHY9hcVU4WuW2DJBppN")
 	server.SetSlotCtx(&sealevel.SlotCtx{Slot: global.WallClockSlot()})
+	server.SetHealthSlotSource(func() (uint64, bool) { return global.WallClockSlot(), true })
 	endpoint := httptest.NewServer(server)
 	t.Cleanup(endpoint.Close)
 
