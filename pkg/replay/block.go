@@ -2371,6 +2371,10 @@ func ReplayBlocks(
 	}
 
 	blockStream := blockstream.NewBlockSource(opts)
+	if health, ok := rpcServer.(interface{ SetHealthSlotSource(func() (uint64, bool)) }); ok && isLive {
+		health.SetHealthSlotSource(blockStream.HealthSlot)
+		defer health.SetHealthSlotSource(func() (uint64, bool) { return 0, false })
+	}
 
 	if !isLive {
 		blockStream.DownloadInitialBlocks()

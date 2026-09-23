@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 
-	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/version"
 	"github.com/filecoin-project/go-jsonrpc"
 )
@@ -27,11 +26,21 @@ func (rpcServer *RpcServer) GetHealth(ctx context.Context, p jsonrpc.RawParams) 
 		return "", err
 	}
 
-	slotCtx := rpcServer.getSlotCtx()
-	if slotCtx == nil {
+	rpcServer.slotCtxMu.RLock()
+	slotCtx, healthSlot := rpcServer.slotCtx, rpcServer.healthSlot
+	rpcServer.slotCtxMu.RUnlock()
+	if slotCtx == nil || healthSlot == nil {
 		return nodeHealth(false, 0, 0)
 	}
-	return nodeHealth(true, slotCtx.Slot, global.WallClockSlot())
+	clusterSlot, fresh := healthSlot()
+	return nodeHealth(fresh, slotCtx.Slot, clusterSlot)
+}
+
+// SetHealthSlotSource uses the block source's cached network tip without polling per request.
+func (rpcServer *RpcServer) SetHealthSlotSource(source func() (uint64, bool)) {
+	rpcServer.slotCtxMu.Lock()
+	rpcServer.healthSlot = source
+	rpcServer.slotCtxMu.Unlock()
 }
 
 func nodeHealth(ready bool, localSlot, clusterSlot uint64) (string, error) {

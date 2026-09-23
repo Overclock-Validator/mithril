@@ -30,6 +30,7 @@ type RpcServer struct {
 	epochSchedule *sealevel.SysvarEpochSchedule
 	slotCtx       *sealevel.SlotCtx
 	slotCtxMu     sync.RWMutex
+	healthSlot    func() (uint64, bool)
 	genesisHash   string
 	identity      string
 
