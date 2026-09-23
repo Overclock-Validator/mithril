@@ -54,6 +54,14 @@ type SlotCtxSetter interface {
 	SetSlotCtx(slotCtx *sealevel.SlotCtx)
 }
 
+type blockHistoryPublisher interface {
+	RecordBlockHistory(block *b.Block) error
+	RecordSkippedBlockHistory(slot uint64) error
+	PrepareBlockHistory(through uint64) error
+	SetRootedBlockHistorySlot(slot uint64) error
+	DiscardUnrootedBlockHistory(from uint64) error
+}
+
 // BlockFetchOpts contains options for parallel block fetching
 type BlockFetchOpts struct {
 	MaxRPS          int    // Rate limit (requests per second), 0 = use default
@@ -1676,6 +1684,7 @@ func ReplayBlocks(
 	onCancelWriteState OnCancelWriteState, // callback to write state immediately on cancellation (can be nil)
 ) *ReplayResult {
 	result := &ReplayResult{}
+	historyPublisher, _ := rpcServer.(blockHistoryPublisher)
 	alpenglowMode := consensusOpts != nil && consensusOpts.Alpenglow
 	replayFrontier := uint64(0)
 	if startSlot > 0 {
@@ -1993,7 +2002,16 @@ func ReplayBlocks(
 			// only its immutable bytes cross to the async worker.
 			Snapshot: transactionStatuses.SnapshotThrough,
 			Install: func(through uint64, payload []byte) (*state.TransactionStatusCheckpointRef, error) {
-				return PrepareTransactionStatusCheckpoint(acctsDbPath, through, payload)
+				ref, err := PrepareTransactionStatusCheckpoint(acctsDbPath, through, payload)
+				if err != nil {
+					return nil, err
+				}
+				if historyPublisher != nil {
+					if err := historyPublisher.PrepareBlockHistory(through); err != nil {
+						return nil, fmt.Errorf("prepare block history: %w", err)
+					}
+				}
+				return ref, nil
 			},
 			AfterCommit: checkpointAfterCommit,
 		}); hookErr != nil {
@@ -2063,6 +2081,11 @@ func ReplayBlocks(
 		mithrilState.LastRootedSlot = promotedThrough
 		mithrilState.LastRootedBankhash = rootedCtx.Bankhash
 		mithrilState.LastRootedContext = rootedCtx
+		if historyPublisher != nil {
+			if err := historyPublisher.SetRootedBlockHistorySlot(promotedThrough); err != nil {
+				mlog.Log.Errorf("block history retention after rooted slot %d: %v", promotedThrough, err)
+			}
+		}
 		if transactionStatuses.Root(promotedThrough) {
 			mlog.Log.Infof("transaction status cache reconstructed complete %d-root coverage through durable slot %d",
 				maxTransactionStatusRoots, promotedThrough)
@@ -2436,6 +2459,13 @@ func ReplayBlocks(
 			mlog.Log.Warnf("%v — block source rejected the fork rewind", sw)
 			return false
 		}
+		if historyPublisher != nil {
+			if err := historyPublisher.DiscardUnrootedBlockHistory(sw.Slot); err != nil {
+				result.Error = fmt.Errorf("%w: discard unrooted block history: %v", sw, err)
+				mlog.Log.Warnf("%v", result.Error)
+				return false
+			}
+		}
 		if !parentSwitchNeedsStateUnwind(sw.Slot, currentExecutedAnchorSlot()) {
 			// Trailing skips advance replay's consumed frontier without creating
 			// account-state layers. Finalized ancestry can later require a block
@@ -2790,6 +2820,13 @@ func ReplayBlocks(
 
 		// Handle skipped slots - log and continue without execution
 		if block.IsSkipped {
+			if historyPublisher != nil {
+				if err := historyPublisher.RecordSkippedBlockHistory(block.Slot); err != nil {
+					result.Error = fmt.Errorf("record skipped block history at slot %d: %w", block.Slot, err)
+					mlog.Log.Errorf("%v", result.Error)
+					break
+				}
+			}
 			// Zero is the explicit locally consumed outcome for a skip. Parent-ID
 			// gap inference is provisional; recording it lets a later certificate
 			// or discovered ancestry require a source rewind and, when necessary,
@@ -3023,6 +3060,13 @@ func ReplayBlocks(
 			// Clear any pending stake pubkeys from this failed block
 			global.ClearPendingStakePubkeys()
 			break
+		}
+		if historyPublisher != nil {
+			if err := historyPublisher.RecordBlockHistory(block); err != nil {
+				result.Error = fmt.Errorf("record block history at slot %d: %w", block.Slot, err)
+				mlog.Log.Errorf("%v", result.Error)
+				break
+			}
 		}
 		// The successful child now owns its derived snapshot. Any later bank uses
 		// lastSlotCtx; the one-shot retained unwind bridge is no longer needed.
@@ -4294,6 +4338,9 @@ func ProcessBlock(
 	} else if global.ManageLeaderSchedule() && len(block.Transactions) > 0 {
 		slotCtx.LamportsBurnt = fees.DistributeTxFeesToSlotLeader(acctsDb, slotCtx, block.Leader, &txFeeAccumulator)
 		slotCtx.RecordModifiedAcct(block.Leader)
+	}
+	if err := recordBlockFeeReward(block, slotCtx, &txFeeAccumulator); err != nil {
+		return nil, err
 	}
 	metrics.GlobalBlockReplay.Reward.AddTimingSince(start)
 

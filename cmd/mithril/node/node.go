@@ -2517,6 +2517,10 @@ postBootstrap:
 		klog.Fatalf("invalid port: %d", rpcPort)
 	} else if rpcPort != 0 {
 		rpcServer = rpcserver.NewRpcServer(accountsDb, uint16(rpcPort), epochScheduleFromState(mithrilState), solana.MustHashFromBase58(networkGenesisHash))
+		retentionSlots := epochScheduleFromState(mithrilState).SlotsPerEpoch * 2
+		if err := rpcServer.EnableBlockHistory(filepath.Join(accountsPath, "rpc-block-history"), retentionSlots, mithrilState.LastRootedSlot); err != nil {
+			klog.Fatalf("enable RPC block history: %v", err)
+		}
 		rpcServer.Start()
 		mlog.Log.Infof("Started RPC server on port %d", rpcPort)
 	}
@@ -4543,6 +4547,13 @@ func runReplayWithRecovery(
 		// are retained for a horizon). Beyond the horizon -> fail closed.
 		if divSlot <= mithrilState.LastRootedSlot {
 			if !rewindStoreBelowDivergence(accountsDbPath, accountsDb, mithrilState, divSlot, rewindHorizon) {
+				break
+			}
+		}
+		if history, ok := rpcServer.(interface{ RewindBlockHistory(uint64) error }); ok {
+			if err := history.RewindBlockHistory(mithrilState.LastRootedSlot); err != nil {
+				result.Error = fmt.Errorf("fork switch: rewind RPC block history to slot %d: %w", mithrilState.LastRootedSlot, err)
+				mlog.Log.Errorf("%v; halting", result.Error)
 				break
 			}
 		}
