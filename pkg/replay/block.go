@@ -54,6 +54,13 @@ type SlotCtxSetter interface {
 	SetSlotCtx(slotCtx *sealevel.SlotCtx)
 }
 
+type epochRewardPublisher interface {
+	RecordEpochRewards(block *b.Block) error
+	PrepareEpochRewards(through uint64) error
+	SetRootedEpochRewardsSlot(slot uint64) error
+	RewindEpochRewards(fromSlot uint64) error
+}
+
 // BlockFetchOpts contains options for parallel block fetching
 type BlockFetchOpts struct {
 	MaxRPS          int    // Rate limit (requests per second), 0 = use default
@@ -1677,6 +1684,13 @@ func ReplayBlocks(
 ) *ReplayResult {
 	result := &ReplayResult{}
 	alpenglowMode := consensusOpts != nil && consensusOpts.Alpenglow
+	rewardPublisher, _ := rpcServer.(epochRewardPublisher)
+	if rewardPublisher != nil {
+		if err := rewardPublisher.RewindEpochRewards(startSlot); err != nil {
+			result.Error = fmt.Errorf("rewind epoch rewards from replay slot %d: %w", startSlot, err)
+			return result
+		}
+	}
 	replayFrontier := uint64(0)
 	if startSlot > 0 {
 		replayFrontier = startSlot - 1
@@ -1993,7 +2007,16 @@ func ReplayBlocks(
 			// only its immutable bytes cross to the async worker.
 			Snapshot: transactionStatuses.SnapshotThrough,
 			Install: func(through uint64, payload []byte) (*state.TransactionStatusCheckpointRef, error) {
-				return PrepareTransactionStatusCheckpoint(acctsDbPath, through, payload)
+				ref, err := PrepareTransactionStatusCheckpoint(acctsDbPath, through, payload)
+				if err != nil {
+					return nil, err
+				}
+				if rewardPublisher != nil {
+					if err := rewardPublisher.PrepareEpochRewards(through); err != nil {
+						return nil, fmt.Errorf("prepare epoch rewards: %w", err)
+					}
+				}
+				return ref, nil
 			},
 			AfterCommit: checkpointAfterCommit,
 		}); hookErr != nil {
@@ -2063,6 +2086,11 @@ func ReplayBlocks(
 		mithrilState.LastRootedSlot = promotedThrough
 		mithrilState.LastRootedBankhash = rootedCtx.Bankhash
 		mithrilState.LastRootedContext = rootedCtx
+		if rewardPublisher != nil {
+			if err := rewardPublisher.SetRootedEpochRewardsSlot(promotedThrough); err != nil {
+				mlog.Log.Errorf("failed to advance rooted epoch rewards through slot %d: %v", promotedThrough, err)
+			}
+		}
 		if transactionStatuses.Root(promotedThrough) {
 			mlog.Log.Infof("transaction status cache reconstructed complete %d-root coverage through durable slot %d",
 				maxTransactionStatusRoots, promotedThrough)
@@ -2466,6 +2494,13 @@ func ReplayBlocks(
 			result.Error = fmt.Errorf("%w: transaction status unwind refused: %v", sw, statusErr)
 			mlog.Log.Warnf("%v", result.Error)
 			return false
+		}
+		if rewardPublisher != nil {
+			if err := rewardPublisher.RewindEpochRewards(sw.Slot); err != nil {
+				result.Error = fmt.Errorf("%w: rewind epoch rewards: %v", sw, err)
+				mlog.Log.Warnf("%v", result.Error)
+				return false
+			}
 		}
 
 		for slot := range alpenglowExecutedBlockIDs {
@@ -2995,6 +3030,11 @@ func ReplayBlocks(
 		// post-epoch boundary rewards distribution
 		if partitionedEpochRewardsEnabled && partitionedRewardsInfo != nil && currentSlot >= partitionedRewardsInfo.FirstStakingRewardSlot && partitionedRewardsInfo.NumRewardPartitionsRemaining > 0 {
 			distributedAccts, parentDistributedAccts := distributePartitionedEpochRewardsForSlot(acctsDb, lastSlotCtx, block.EpochUpdatedAccts, replayCtx, partitionedRewardsInfo, currentSlot, block.BlockHeight)
+			if err := replaceInflationRewardRecords(block, distributedAccts, parentDistributedAccts, rpc.RewardTypeStaking); err != nil {
+				result.Error = err
+				mlog.Log.Errorf("%v", err)
+				break
+			}
 			block.EpochUpdatedAccts = append(block.EpochUpdatedAccts, distributedAccts...)
 			block.ParentEpochUpdatedAccts = append(block.ParentEpochUpdatedAccts, parentDistributedAccts...)
 		}
@@ -3023,6 +3063,12 @@ func ReplayBlocks(
 			// Clear any pending stake pubkeys from this failed block
 			global.ClearPendingStakePubkeys()
 			break
+		}
+		if rewardPublisher != nil {
+			if err := rewardPublisher.RecordEpochRewards(block); err != nil {
+				result.Error = fmt.Errorf("record epoch rewards for slot %d: %w", block.Slot, err)
+				break
+			}
 		}
 		// The successful child now owns its derived snapshot. Any later bank uses
 		// lastSlotCtx; the one-shot retained unwind bridge is no longer needed.

@@ -641,6 +641,17 @@ func voteInflationRewardsCollector(votePubkey solana.PublicKey, voteState *seale
 	return votePubkey
 }
 
+func accumulateVotingReward(validatorRewards map[solana.PublicKey]*atomic.Uint64, votePubkey solana.PublicKey, voteState *sealevel.VoteStateVersions, customCollector bool, amount uint64) {
+	// Zero commission still produces a vote reward record.
+	collector := voteInflationRewardsCollector(votePubkey, voteState, customCollector)
+	accumulator := validatorRewards[collector]
+	if accumulator == nil {
+		accumulator = &atomic.Uint64{}
+		validatorRewards[collector] = accumulator
+	}
+	accumulator.Add(amount)
+}
+
 func calculateStakePointsAndCredits(
 	pubkey solana.PublicKey,
 	stakeHistory *sealevel.SysvarStakeHistory,
@@ -1049,17 +1060,8 @@ func CalculateRewardsStreaming(
 			return nil, fmt.Errorf("temp spool write failed: %w", err)
 		}
 
-		if splitResult.VoterPortion > 0 {
-			collector := voteInflationRewardsCollector(
-				rec.VotePubkey, voteState, f.IsActive(features.CustomCommissionCollector),
-			)
-			accumulator := validatorRewards[collector]
-			if accumulator == nil {
-				accumulator = &atomic.Uint64{}
-				validatorRewards[collector] = accumulator
-			}
-			accumulator.Add(splitResult.VoterPortion)
-		}
+		accumulateVotingReward(validatorRewards, rec.VotePubkey, voteState,
+			f.IsActive(features.CustomCommissionCollector), splitResult.VoterPortion)
 	}
 
 	pointsReader.Close()
