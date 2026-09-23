@@ -2517,6 +2517,7 @@ postBootstrap:
 		klog.Fatalf("invalid port: %d", rpcPort)
 	} else if rpcPort != 0 {
 		rpcServer = rpcserver.NewRpcServer(accountsDb, uint16(rpcPort), epochScheduleFromState(mithrilState), solana.MustHashFromBase58(networkGenesisHash))
+		publishRPCBankState(rpcServer, mithrilState)
 		rpcServer.Start()
 		mlog.Log.Infof("Started RPC server on port %d", rpcPort)
 	}
@@ -2877,7 +2878,7 @@ postBootstrap:
 		}
 	}
 
-	var slotCtxSetter replay.SlotCtxSetter
+	var slotCtxSetter replay.RPCStateSetter
 	if rpcServer != nil {
 		slotCtxSetter = rpcServer
 	}
@@ -4348,7 +4349,7 @@ func runReplayWithRecovery(
 	useTurbine bool,
 	dbgOpts *replay.DebugOptions,
 	metricsWriter io.Writer,
-	rpcServer replay.SlotCtxSetter,
+	rpcServer replay.RPCStateSetter,
 	mithrilState *state.MithrilState,
 	blockFetchOpts *replay.BlockFetchOpts,
 	consensusOpts *replay.ConsensusOpts,
@@ -4550,6 +4551,7 @@ func runReplayWithRecovery(
 			mlog.Log.Errorf("fork switch: no rooted checkpoint context to re-replay from; halting")
 			break
 		}
+		publishRPCBankState(rpcServer, mithrilState)
 		if mithrilState.LastRootedSlot > prevRooted { // progress since last attempt -> fresh budget
 			attempt = 0
 			prevRooted = mithrilState.LastRootedSlot
@@ -4588,4 +4590,25 @@ func runReplayWithRecovery(
 		result = replay.ReplayBlocks(ctx, accountsDb, accountsDbPath, mithrilState, rs, retryStart, endSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, turbineShredVersion, turbineAlpenglowAddr, turbineIdentity, blockDir, txParallelism, isLive, useLightbringer, useTurbine, dbgOpts, metricsWriter, rpcServer, blockFetchOpts, consensusOpts, onCancelWriteState)
 	}
 	return result
+}
+
+type rpcBankStateSetter interface {
+	SetRootedBankState(slot, blockHeight, transactionCount uint64)
+}
+
+func publishRPCBankState(rpcServer rpcBankStateSetter, mithrilState *state.MithrilState) {
+	if rpcServer == nil || mithrilState == nil {
+		return
+	}
+	rootedSlot := mithrilState.ManifestParentSlot
+	rootedBlockHeight := mithrilState.ManifestBlockHeight
+	rootedTransactionCount := mithrilState.ManifestTransactionCount
+	if rootedCtx := mithrilState.LastRootedContext; rootedCtx != nil {
+		rootedSlot = rootedCtx.Slot
+		rootedBlockHeight = rootedCtx.BlockHeight
+		if rootedCtx.TransactionCount != nil {
+			rootedTransactionCount = *rootedCtx.TransactionCount
+		}
+	}
+	rpcServer.SetRootedBankState(rootedSlot, rootedBlockHeight, rootedTransactionCount)
 }

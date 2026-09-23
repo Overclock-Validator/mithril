@@ -304,6 +304,9 @@ func (db *AccountsDb) CommitBatch(
 	// ordinary concurrent-safe cache operations finish.
 	db.refreshReadCacheEntries(live)
 
+	// Advance the watermark before removing pendingFold so rooted readers keep
+	// waiting until the matching bank state is published.
+	db.durableThrough.Store(throughSlot)
 	db.readCacheEpochMu.Lock()
 	db.pendingFold = nil
 	db.readCacheEpochMu.Unlock()
@@ -311,7 +314,6 @@ func (db *AccountsDb) CommitBatch(
 
 	// (8) Publish.
 	db.lastBatchSeq = batchSeq
-	db.durableThrough.Store(throughSlot)
 
 	return BatchCommitResult{
 		BatchSeq:    batchSeq,

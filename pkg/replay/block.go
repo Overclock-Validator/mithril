@@ -49,9 +49,11 @@ import (
 	"github.com/panjf2000/ants/v2"
 )
 
-// SlotCtxSetter is implemented by types that accept a SlotCtx update (e.g. RpcServer).
-type SlotCtxSetter interface {
+// RPCStateSetter is implemented by the RPC server so replay can publish both
+// its live execution bank and the latest bank durably folded into AccountsDB.
+type RPCStateSetter interface {
 	SetSlotCtx(slotCtx *sealevel.SlotCtx)
+	SetRootedBankState(slot, blockHeight, transactionCount uint64)
 }
 
 // BlockFetchOpts contains options for parallel block fetching
@@ -1670,7 +1672,7 @@ func ReplayBlocks(
 	useTurbine bool,
 	dbgOpts *DebugOptions,
 	metricsWriter io.Writer,
-	rpcServer SlotCtxSetter,
+	rpcServer RPCStateSetter,
 	blockFetchOpts *BlockFetchOpts,
 	consensusOpts *ConsensusOpts, // nil = use defaults (max_depth=64, policy="halt")
 	onCancelWriteState OnCancelWriteState, // callback to write state immediately on cancellation (can be nil)
@@ -2063,6 +2065,13 @@ func ReplayBlocks(
 		mithrilState.LastRootedSlot = promotedThrough
 		mithrilState.LastRootedBankhash = rootedCtx.Bankhash
 		mithrilState.LastRootedContext = rootedCtx
+		if rpcServer != nil {
+			var transactionCount uint64
+			if rootedCtx.TransactionCount != nil {
+				transactionCount = *rootedCtx.TransactionCount
+			}
+			rpcServer.SetRootedBankState(promotedThrough, rootedCtx.BlockHeight, transactionCount)
+		}
 		if transactionStatuses.Root(promotedThrough) {
 			mlog.Log.Infof("transaction status cache reconstructed complete %d-root coverage through durable slot %d",
 				maxTransactionStatusRoots, promotedThrough)
@@ -3085,6 +3094,9 @@ func ReplayBlocks(
 
 		if rpcServer != nil {
 			rpcServer.SetSlotCtx(lastSlotCtx)
+			if unrootedTailState == nil {
+				rpcServer.SetRootedBankState(block.Slot, global.BlockHeight(), global.TransactionCount())
+			}
 		}
 
 		replayCtx.Capitalization -= lastSlotCtx.LamportsBurnt

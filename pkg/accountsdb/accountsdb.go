@@ -97,6 +97,21 @@ func (accountsDb *AccountsDb) StoreQueueLen() int {
 	return accountsDb.inProgressStoreRequests.Len()
 }
 
+// DurableThrough returns the highest slot whose fold is fully committed.
+func (accountsDb *AccountsDb) DurableThrough() uint64 {
+	return accountsDb.durableThrough.Load()
+}
+
+// VoteAccountPubkeys returns the vote accounts in the current cache view.
+func (accountsDb *AccountsDb) VoteAccountPubkeys() []solana.PublicKey {
+	pubkeys := make([]solana.PublicKey, 0, accountsDb.VoteAcctCache.Size())
+	accountsDb.VoteAcctCache.Range(func(pubkey solana.PublicKey, _ *accounts.Account) bool {
+		pubkeys = append(pubkeys, pubkey)
+		return true
+	})
+	return pubkeys
+}
+
 // silentLogger implements pebble.Logger but discards all messages.
 // This suppresses verbose WAL recovery messages on startup.
 type silentLogger struct{}
