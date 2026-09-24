@@ -53,28 +53,33 @@ type VotingConfig struct {
 // NetworkLandedVotes counts unique persisted votes whose rank appeared in the
 // exact BLS-verified certificate proof received over Votor QUIC.
 type VotingStats struct {
-	Enabled                        bool                      `json:"enabled"`
-	VotesCastThisRun               uint64                    `json:"votes_cast_this_run"`
-	NetworkLandedVotes             uint64                    `json:"network_landed_votes"`
-	LastNetworkLandedSlot          uint64                    `json:"last_network_landed_slot,omitempty"`
-	LastNetworkLandedVoteType      alpenglow.VoteType        `json:"last_network_landed_vote_type,omitempty"`
-	LastNetworkCertificateType     alpenglow.CertificateType `json:"last_network_certificate_type,omitempty"`
-	LastNetworkLandedAt            time.Time                 `json:"last_network_landed_at,omitempty"`
-	BroadcastMessagesQueued        uint64                    `json:"broadcast_messages_queued"`
-	BroadcastMessagesDropped       uint64                    `json:"broadcast_messages_dropped"`
-	BroadcastPeerSends             uint64                    `json:"broadcast_peer_sends"`
-	BroadcastPeerSendsSkipped      uint64                    `json:"broadcast_peer_sends_skipped"`
-	BroadcastPeerSendErrors        uint64                    `json:"broadcast_peer_send_errors"`
-	BroadcastDesiredPeers          int                       `json:"broadcast_desired_peers"`
-	BroadcastActiveConnections     int                       `json:"broadcast_active_connections"`
-	BroadcastPendingConnections    int                       `json:"broadcast_pending_connections"`
-	BroadcastConnectionAttempts    uint64                    `json:"broadcast_connection_attempts"`
-	BroadcastConnectionErrors      uint64                    `json:"broadcast_connection_errors"`
-	BroadcastConnectionJobsDropped uint64                    `json:"broadcast_connection_jobs_dropped"`
-	BroadcastLastPeerSendError     string                    `json:"broadcast_last_peer_send_error,omitempty"`
-	BroadcastLastPeerSendErrorAt   time.Time                 `json:"broadcast_last_peer_send_error_at,omitempty"`
-	BroadcastLastConnectionError   string                    `json:"broadcast_last_connection_error,omitempty"`
-	BroadcastLastConnectionErrorAt time.Time                 `json:"broadcast_last_connection_error_at,omitempty"`
+	Enabled                        bool                            `json:"enabled"`
+	VotesCastThisRun               uint64                          `json:"votes_cast_this_run"`
+	NetworkLandedVotes             uint64                          `json:"network_landed_votes"`
+	LastNetworkLandedSlot          uint64                          `json:"last_network_landed_slot,omitempty"`
+	LastNetworkLandedVoteType      alpenglow.VoteType              `json:"last_network_landed_vote_type,omitempty"`
+	LastNetworkCertificateType     alpenglow.CertificateType       `json:"last_network_certificate_type,omitempty"`
+	LastNetworkLandedAt            time.Time                       `json:"last_network_landed_at,omitempty"`
+	BroadcastMessagesQueued        uint64                          `json:"broadcast_messages_queued"`
+	BroadcastMessagesDropped       uint64                          `json:"broadcast_messages_dropped"`
+	BroadcastPeerSends             uint64                          `json:"broadcast_peer_sends"`
+	BroadcastPeerSendsSkipped      uint64                          `json:"broadcast_peer_sends_skipped"`
+	BroadcastPeerSendErrors        uint64                          `json:"broadcast_peer_send_errors"`
+	BroadcastPeerQueueDrops        uint64                          `json:"broadcast_peer_queue_drops"`
+	BroadcastPeerQueueDiscarded    uint64                          `json:"broadcast_peer_queue_discarded"`
+	BroadcastPeerSendTimeouts      uint64                          `json:"broadcast_peer_send_timeouts"`
+	BroadcastPeerQueueMaxDelay     time.Duration                   `json:"broadcast_peer_queue_max_delay"`
+	BroadcastPeerQueues            []alpenglow.VotorPeerQueueStats `json:"broadcast_peer_queues,omitempty"`
+	BroadcastDesiredPeers          int                             `json:"broadcast_desired_peers"`
+	BroadcastActiveConnections     int                             `json:"broadcast_active_connections"`
+	BroadcastPendingConnections    int                             `json:"broadcast_pending_connections"`
+	BroadcastConnectionAttempts    uint64                          `json:"broadcast_connection_attempts"`
+	BroadcastConnectionErrors      uint64                          `json:"broadcast_connection_errors"`
+	BroadcastConnectionJobsDropped uint64                          `json:"broadcast_connection_jobs_dropped"`
+	BroadcastLastPeerSendError     string                          `json:"broadcast_last_peer_send_error,omitempty"`
+	BroadcastLastPeerSendErrorAt   time.Time                       `json:"broadcast_last_peer_send_error_at,omitempty"`
+	BroadcastLastConnectionError   string                          `json:"broadcast_last_connection_error,omitempty"`
+	BroadcastLastConnectionErrorAt time.Time                       `json:"broadcast_last_connection_error_at,omitempty"`
 }
 
 type voterEventKind uint8
@@ -1208,6 +1213,11 @@ func (v *alpenglowVoter) snapshot() VotingStats {
 		stats.BroadcastPeerSends = broadcast.PeerSends
 		stats.BroadcastPeerSendsSkipped = broadcast.PeerSendsSkipped
 		stats.BroadcastPeerSendErrors = broadcast.PeerSendErrors
+		stats.BroadcastPeerQueueDrops = broadcast.PeerQueueDrops
+		stats.BroadcastPeerQueueDiscarded = broadcast.PeerQueueDiscarded
+		stats.BroadcastPeerSendTimeouts = broadcast.PeerSendTimeouts
+		stats.BroadcastPeerQueueMaxDelay = broadcast.PeerQueueMaxDelay
+		stats.BroadcastPeerQueues = broadcast.PeerQueues
 		stats.BroadcastDesiredPeers = broadcast.DesiredPeers
 		stats.BroadcastActiveConnections = broadcast.Connections
 		stats.BroadcastPendingConnections = broadcast.PendingConnections
