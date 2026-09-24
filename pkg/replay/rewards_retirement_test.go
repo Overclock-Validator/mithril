@@ -3,6 +3,7 @@ package replay
 import (
 	"bytes"
 	"encoding/base64"
+	"fmt"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
@@ -51,6 +52,68 @@ func TestRewardsRetirementRequiresCompletedBankAndDurability(t *testing.T) {
 	require.True(t, completed.retire(&info, 5), "later observations must not postpone recorded completion")
 	require.Nil(t, info)
 	require.False(t, completed.retire(&info, 100), "retirement is one-shot")
+}
+
+func TestRewardsPromotionRetainsBoundaryAfterFailedDistribution(t *testing.T) {
+	const boundary = uint64(6264000)
+	info := &rewards.PartitionedRewardDistributionInfo{NumRewardPartitionsRemaining: 1}
+	var completed partitionedRewardsCompletion
+	require.Equal(t, boundary-1, completed.limitPromotion(info, boundary, boundary+1))
+
+	// Distribution consumes the final spool before ProcessBlock checks the
+	// footer. The epoch-116 failure took this path; no successful bank was
+	// observed, so forced shutdown must not persist the boundary bank.
+	info.NumRewardPartitionsRemaining = 0
+	require.Equal(t, boundary-1, completed.limitPromotion(info, boundary, boundary+1))
+	completed.observeBank(info, nil)
+	require.Equal(t, boundary-1, completed.limitPromotion(info, boundary, boundary+1))
+
+	completed.observeBank(info, testUnwindBankSysvars(t, boundary+1, 50))
+	require.Equal(t, boundary-2, completed.limitPromotion(info, boundary, boundary-2))
+	require.Equal(t, boundary-1, completed.limitPromotion(info, boundary, boundary), "finality stopped inside rewards window")
+	require.Equal(t, boundary+1, completed.limitPromotion(info, boundary, boundary+1))
+
+	next := &rewards.PartitionedRewardDistributionInfo{}
+	require.Equal(t, boundary-1, completed.limitPromotion(next, boundary, boundary+2), "completion belongs to another distribution")
+	require.Equal(t, boundary+2, completed.limitPromotion(nil, boundary, boundary+2))
+	require.Equal(t, boundary+2, completed.limitPromotion(info, 0, boundary+2))
+}
+
+func TestRewardsCompletionFoldCannotCheckpointInsideWindow(t *testing.T) {
+	for _, batchSize := range []int{1, 2, 128} {
+		t.Run(fmt.Sprintf("batch_%d", batchSize), func(t *testing.T) {
+			fc := &fakeCommitter{durable: accounts.NewMemAccounts(), failOn: 7}
+			tail := asyncTestTail(fc, 5, 6, 7, 8)
+			tail.batchSlots = batchSize
+			info := &rewards.PartitionedRewardDistributionInfo{}
+			var completed partitionedRewardsCompletion
+			completed.observeBank(info, testUnwindBankSysvars(t, 7, 50))
+			through := completed.limitPromotion(info, 5, 8)
+			require.Equal(t, uint64(8), through)
+
+			job, err := tail.buildRewardsCompletionFoldJob(completed.slot)
+			require.NoError(t, err)
+			require.NotNil(t, job)
+			require.Equal(t, uint64(7), job.through)
+			require.Len(t, job.chunk, 3, "the entire distribution must share one commit")
+			require.Equal(t, batchSize, tail.batchSlots, "normal batching is unchanged")
+			require.Error(t, runFoldJob(fc, job))
+			require.Empty(t, fc.throughs)
+			require.False(t, completed.retire(&info, 4))
+
+			fc.failOn = 0
+			job, err = tail.buildRewardsCompletionFoldJob(completed.slot)
+			require.NoError(t, err)
+			require.NoError(t, runFoldJob(fc, job))
+			require.Equal(t, []uint64{7}, fc.throughs)
+			tail.applyFoldJob(job)
+			require.True(t, completed.retire(&info, 7))
+			require.Equal(t, 1, tail.overlay.HeldSlots(), "later banks remain buffered")
+		})
+	}
+	tail := asyncTestTail(&fakeCommitter{durable: accounts.NewMemAccounts()}, 5, 6)
+	_, err := tail.buildRewardsCompletionFoldJob(7)
+	require.ErrorContains(t, err, "absent from retained fold prefix")
 }
 
 func TestRewardsRetirementDoesNotCrossGenerations(t *testing.T) {

@@ -24,6 +24,10 @@ var ErrBlockNotQuarantinable = errors.New("block is not a quarantinable live Alp
 // SetKnownAlpenglowBlockID cannot clear them, even if a certificate names the
 // same identity. Such a certificate is a safety contradiction and the source
 // fails closed rather than re-authorizing invalid transaction contents.
+//
+// Only replay's serialized recovery path may call this method. It must not
+// overlap RewindForAlpenglowSwitch: replay owns the shared emission gate, and
+// the certified rewind's shutdown mutex does not serialize quarantine calls.
 func (bs *BlockSource) QuarantineInvalidAlpenglowBlock(blk *b.Block) error {
 	if bs == nil || blk == nil {
 		return fmt.Errorf("%w: nil source or block", ErrBlockNotQuarantinable)
@@ -46,6 +50,8 @@ func (bs *BlockSource) QuarantineInvalidAlpenglowBlock(blk *b.Block) error {
 	if invalidID == (solana.Hash{}) {
 		return fmt.Errorf("%w: block ID is zero", ErrBlockNotQuarantinable)
 	}
+	// CAS rejects an already-owned gate, but cannot protect against a concurrent
+	// certified rewind's Store. Replay must serialize both recovery methods.
 	if !bs.alpenglowQuarantineFrom.CompareAndSwap(0, from) {
 		return fmt.Errorf("%w: another Alpenglow quarantine is in progress", ErrBlockNotQuarantinable)
 	}
@@ -65,6 +71,7 @@ func (bs *BlockSource) QuarantineInvalidAlpenglowBlock(blk *b.Block) error {
 		bs.reorderMu.Unlock()
 		return fmt.Errorf("%w: block %s at slot %d is not the exact emitted identity", ErrBlockNotQuarantinable, invalidID, from)
 	}
+	bs.alpenglowRewindWait.clear()
 
 	// Every identity already emitted after this block is its selected suffix
 	// and therefore descends from objectively invalid contents. These hard
@@ -90,12 +97,7 @@ func (bs *BlockSource) QuarantineInvalidAlpenglowBlock(blk *b.Block) error {
 
 	bs.nextSlotToSend = from
 	bs.rewindAlpenglowEmissionAnchorLocked(from)
-	for slot := range bs.reorderBuffer {
-		if slot >= from {
-			delete(bs.reorderBuffer, slot)
-			resetSlots[slot] = struct{}{}
-		}
-	}
+	bs.clearAlpenglowBufferedSuffixLocked(from, resetSlots)
 	for slot := range bs.skippedSlots {
 		if slot < from || bs.alpenglowCertifiedSkips[slot] {
 			continue
@@ -142,57 +144,12 @@ func (bs *BlockSource) QuarantineInvalidAlpenglowBlock(blk *b.Block) error {
 	// behind alpenglowQuarantineFrom until the drain barrier completes.
 	resultGeneration := bs.invalidateLiveStreamResults()
 
-	bs.slotStateMu.Lock()
-	for slot := range bs.slotState {
-		if slot >= from {
-			delete(bs.slotState, slot)
-			delete(bs.inflightStart, slot)
-			resetSlots[slot] = struct{}{}
-		}
-	}
-	bs.slotStateMu.Unlock()
-
-	bs.retryMu.Lock()
-	if len(bs.retrySlots) > 0 {
-		kept := bs.retrySlots[:0]
-		for _, slot := range bs.retrySlots {
-			if slot < from {
-				kept = append(kept, slot)
-			}
-		}
-		bs.retrySlots = kept
-	}
-	bs.retryMu.Unlock()
-
-	bs.liveStagingMu.Lock()
-	for slot := range bs.liveStagingBuffer {
-		if slot >= from {
-			delete(bs.liveStagingBuffer, slot)
-			resetSlots[slot] = struct{}{}
-		}
-	}
-	if len(bs.liveStagingOrder) > 0 {
-		kept := bs.liveStagingOrder[:0]
-		for _, slot := range bs.liveStagingOrder {
-			if slot < from {
-				kept = append(kept, slot)
-			}
-		}
-		bs.liveStagingOrder = kept
-	}
-	bs.liveStagingMu.Unlock()
+	bs.clearAlpenglowTrackedSuffix(from, resetSlots)
+	bs.clearAlpenglowRetrySuffix(from)
+	bs.clearAlpenglowStagedSuffix(from, resetSlots)
 
 	bs.drainAlpenglowParentSwitchNotifications()
-	drainedSlots := bs.drainEmittedAlpenglowSuffix(from)
-	for _, slot := range drainedSlots {
-		resetSlots[slot] = struct{}{}
-	}
-
-	// Add happens under reorderMu before an emitter unlocks for streamChan send.
-	// Raising the gate and crossing reorderMu above therefore establishes the
-	// complete set of pre-quarantine sends. Drain first so a sender blocked on a
-	// full channel can finish, then wait through its send AND frontier increment.
-	bs.replayEmissionWg.Wait()
+	bs.waitForAlpenglowEmissionBarrier(from, resetSlots)
 
 	// A result that passed its generation check just before invalidation may
 	// have inserted stale suffix state after the first clear. The single emitter
@@ -201,12 +158,7 @@ func (bs *BlockSource) QuarantineInvalidAlpenglowBlock(blk *b.Block) error {
 	bs.reorderMu.Lock()
 	bs.nextSlotToSend = from
 	bs.rewindAlpenglowEmissionAnchorLocked(from)
-	for slot := range bs.reorderBuffer {
-		if slot >= from {
-			delete(bs.reorderBuffer, slot)
-			resetSlots[slot] = struct{}{}
-		}
-	}
+	bs.clearAlpenglowBufferedSuffixLocked(from, resetSlots)
 	for slot := range bs.skippedSlots {
 		if slot < from || bs.alpenglowCertifiedSkips[slot] {
 			continue
@@ -217,19 +169,9 @@ func (bs *BlockSource) QuarantineInvalidAlpenglowBlock(blk *b.Block) error {
 	}
 	bs.pendingAlpenglowParentSwitch = nil
 	bs.reorderMu.Unlock()
-	bs.slotStateMu.Lock()
-	for slot := range bs.slotState {
-		if slot >= from {
-			delete(bs.slotState, slot)
-			delete(bs.inflightStart, slot)
-			resetSlots[slot] = struct{}{}
-		}
-	}
-	bs.slotStateMu.Unlock()
+	bs.clearAlpenglowTrackedSuffix(from, resetSlots)
 	bs.drainAlpenglowParentSwitchNotifications()
-	for _, slot := range bs.drainEmittedAlpenglowSuffix(from) {
-		resetSlots[slot] = struct{}{}
-	}
+	bs.drainAlpenglowEmissionSuffixForReset(from, resetSlots)
 
 	allSlots := make([]uint64, 0, len(resetSlots)+len(poisonedSlots))
 	for slot := range resetSlots {
