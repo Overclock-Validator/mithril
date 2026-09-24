@@ -185,7 +185,7 @@ func TestSweepReportsFirstContradiction(t *testing.T) {
 	assert.Equal(t, uint64(101), sw.Slot, "lowest contradicted slot first")
 }
 
-// The sweep is gated on the decision version and bounded by the window. The
+// The sweep is gated on the decision version and the replay/root frontiers. The
 // decision version advances on ANY decisive change — not only certificates —
 // so a contradiction derived from replay observations (parent links, finalized
 // ancestry, indirect skips) still re-arms the sweep.
@@ -204,8 +204,8 @@ func TestSweepGatingAndBounds(t *testing.T) {
 	// First sweep at version=1 fires...
 	sw := s.sweep(executed, 100, 101)
 	require.NotNil(t, sw)
-	// ...but with no decision change the next sweep is a no-op even though the
-	// contradiction persists (the caller acts on the first report).
+	// ...but with no decision or frontier change the next sweep is a no-op even
+	// though the contradiction persists (the caller acts on the first report).
 	assert.Nil(t, s.sweep(executed, 100, 101), "no decision change -> no re-sweep")
 
 	// A decision-version bump WITHOUT a new certificate (e.g. replay-derived

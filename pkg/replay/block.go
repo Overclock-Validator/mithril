@@ -1906,8 +1906,10 @@ func ReplayBlocks(
 	var windowRepairedSlots int
 	var windowEmptyBlocks int
 	var windowSkippedWithShreds int // skipped slots where the leader sent partial shreds
-	var windowSwitches int          // certificate switches detected this window
+	var windowSwitches int          // certified or parent-linked switch events handled this window
 	var windowSwitchInRAM int       // switches resolved by the in-RAM unwind
+	var windowSwitchSourceOnly int  // switches that only replace the source's queued suffix
+	var windowSwitchRetained int    // speculative switches rejected to retain the rooted branch
 	var windowSwitchFallback int    // switches that fell back to rooted-checkpoint re-replay
 	switchFallbackReasons := make(map[string]int)
 	var promotionHolds int // iterations promotion was fully stalled while finality ran a chunk ahead
@@ -2031,8 +2033,8 @@ func ReplayBlocks(
 	if replayDivergenceFloor > 0 {
 		mlog.Log.Warnf("replay divergence evidence present (earliest slot %d): folds are blocked at that slot until the evidence is cleared after triage", replayDivergenceFloor)
 	}
-	// Switch sweep: detects executed slots contradicted by later decisive
-	// certificates (wrong sibling / certified skip) under execute-on-receipt.
+	// Switch sweep: detects consumed blocks or skips contradicted by decisive
+	// chain decisions, including ancestry discovered after a certificate.
 	switchSweeper := newAlpenglowSwitchSweeper(consensusEngine)
 
 	if TrailingVerifierCfg.Enabled && unrootedTailState != nil {
@@ -2446,6 +2448,7 @@ func ReplayBlocks(
 			replayFrontier = sw.Slot - 1
 			blockStream.SetLastExecutedSlot(replayFrontier)
 			global.SetReplayFrontier(replayFrontier)
+			windowSwitchSourceOnly++
 			mlog.Log.Warnf("%v — re-serving the skipped suffix from slot %d; executed bank remains at slot %d", sw, sw.Slot, currentExecutedAnchorSlot())
 			return true
 		}
@@ -2588,6 +2591,7 @@ func ReplayBlocks(
 						result.Error = fmt.Errorf("alpenglow speculative switch at slot %d: block source rejected pre-execution branch selection", parentSwitch.SwitchSlot)
 						break
 					}
+					windowSwitchSourceOnly++
 					mlog.Log.Warnf("ALPENGLOW speculative fork selected before execution: replaced queued suffix from slot %d with child %s at slot %d (replay currently at slot %d; no account-state unwind needed)",
 						parentSwitch.SwitchSlot, parentSwitch.ChildID, parentSwitch.ChildSlot, currentExecutedAnchorSlot())
 					continue
@@ -2609,6 +2613,7 @@ func ReplayBlocks(
 						result.Error = fmt.Errorf("alpenglow speculative switch at slot %d: block source rejected rooted-branch retention", parentSwitch.SwitchSlot)
 						break
 					}
+					windowSwitchRetained++
 					mlog.Log.Warnf("ALPENGLOW rooted branch retained: discarded late speculative child %s at slot %d linking to ancestor %s at slot %d; switch slot %d is already durable through %d",
 						parentSwitch.ChildID, parentSwitch.ChildSlot, parentSwitch.ParentID, parentSwitch.ParentSlot, parentSwitch.SwitchSlot, mithrilState.LastRootedSlot)
 					continue
@@ -2721,14 +2726,13 @@ func ReplayBlocks(
 				}
 			}
 
-			// Execute-on-receipt correction: certificates arriving after a slot
-			// executed can name a different outcome. The sweep reports the first
-			// contradiction. The COMMON path resolves it in RAM: evict the wrong
-			// suffix from the WorkingSet, rebuild execution state from the
-			// retained parent context, and continue the loop. Guarded cases
-			// (reasons below) surface a typed error instead and the node-level
-			// recovery loop re-replays from the rooted checkpoint (repair
-			// re-fetches the certified version either way).
+			// Correct consumed outcomes when the chain-decision version, replay
+			// frontier, or rooted frontier changes. The sweep reports the first
+			// contradiction. Replacing trailing skips only rewinds the source;
+			// replacing executed blocks also unwinds account state to the retained
+			// parent. If that unwind is unavailable, a typed error asks node-level
+			// recovery to re-replay from the rooted checkpoint. Repair fetches the
+			// selected block in either case.
 			if unrootedTailState != nil {
 				if sw := switchSweeper.sweep(alpenglowExecutedBlockIDs, mithrilState.LastRootedSlot, replayFrontier); sw != nil {
 					if handleAlpenglowSwitch(sw, func() bool {
@@ -2786,9 +2790,10 @@ func ReplayBlocks(
 
 		// Handle skipped slots - log and continue without execution
 		if block.IsSkipped {
-			// Zero is the explicit locally executed outcome for a skip. Parent-ID
+			// Zero is the explicit locally consumed outcome for a skip. Parent-ID
 			// gap inference is provisional; recording it lets a later certificate
-			// naming a real block trigger the same in-RAM switch as a wrong sibling.
+			// or discovered ancestry require a source rewind and, when necessary,
+			// an account-state unwind.
 			if consensusEngine != nil && unrootedTailState != nil {
 				alpenglowExecutedBlockIDs[block.Slot] = solana.Hash{}
 			}
@@ -3378,7 +3383,7 @@ func ReplayBlocks(
 					finalizedStr = fmt.Sprintf("%d", lastRootedWatermark)
 				}
 				if windowSwitches > 0 {
-					mlog.Log.InfofPrecise("  consensus: finalized slot %s | switches %d (in-RAM %d, fallback %d)", finalizedStr, windowSwitches, windowSwitchInRAM, windowSwitchFallback)
+					mlog.Log.InfofPrecise("  consensus: finalized slot %s | switches %d (in-RAM %d, source-only %d, retained %d, fallback %d)", finalizedStr, windowSwitches, windowSwitchInRAM, windowSwitchSourceOnly, windowSwitchRetained, windowSwitchFallback)
 					if len(switchFallbackReasons) > 0 {
 						mlog.Log.FileOnlyf("switch fallback reasons this window: %v", switchFallbackReasons)
 					}
@@ -3470,6 +3475,8 @@ func ReplayBlocks(
 				windowSkippedWithShreds = 0
 				windowSwitches = 0
 				windowSwitchInRAM = 0
+				windowSwitchSourceOnly = 0
+				windowSwitchRetained = 0
 				windowSwitchFallback = 0
 				clear(switchFallbackReasons)
 				promotionHolds = 0

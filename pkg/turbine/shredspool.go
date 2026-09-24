@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/Overclock-Validator/mithril/pkg/mlog"
 )
 
 // ShredSpool is a disposable on-disk cache of VERIFIED raw shreds, one
@@ -32,25 +34,28 @@ import (
 // re-fetch near the tip, the low end borders replay and is what repair would
 // otherwise pay for dearly.
 type ShredSpool struct {
-	mu          sync.Mutex
-	dir         string
-	open        map[uint64]*spoolFile
-	sizes       map[uint64]int64                      // per-slot bytes on disk (open writers included)
-	seen        map[uint64]map[spoolShredKey]struct{} // distinct shreds appended this run
-	validated   map[uint64]bool                       // adopted files whose record tail was checked this run
-	complete    map[uint64]SpoolSlotMeta
-	journal     *os.File // append-only completeness journal (complete.idx)
-	bytes       int64
-	maxBytes    int64
-	highestSlot uint64
-	haveHighest bool
-	floor       uint64
-	closed      bool
+	mu              sync.Mutex
+	dir             string
+	open            map[uint64]*spoolFile
+	sizes           map[uint64]int64                      // per-slot bytes on disk (open writers included)
+	seen            map[uint64]map[spoolShredKey]struct{} // distinct shreds appended this run
+	validated       map[uint64]bool                       // adopted files whose record tail was checked this run
+	complete        map[uint64]SpoolSlotMeta
+	journal         *spoolCompletionJournal // ordered completeness hints (complete.idx)
+	journalOverflow bool                    // Close must retry the current hints after queue overflow
+	bytes           int64
+	maxBytes        int64
+	highestSlot     uint64
+	haveHighest     bool
+	floor           uint64
+	closed          bool
 }
 
 // SpoolSlotMeta records a slot proven FULLY assembled: every data shred
 // 0..LastIndex was held when the assembler completed it. The completeness
-// index is what turns the spool from a byte cache into the seed of a
+// index is a repair hint, not proof that all buffered packets survived a crash.
+// The assembler still validates coverage when hydrating a slot. This turns
+// the spool from a byte cache into the seed of a
 // repair-serving shredstore: complete slots need zero network on restart,
 // answer HighestWindowIndex honestly, and define the serving/retention set.
 type SpoolSlotMeta struct {
@@ -170,10 +175,10 @@ func (s *ShredSpool) loadJournal() {
 	if err != nil {
 		return // journal unavailable: completeness degrades to per-run only
 	}
+	s.journal = newSpoolCompletionJournal(f)
 	for slot, meta := range s.complete {
-		f.Write(spoolJournalRecord(slot, meta))
+		s.journal.complete(slot, meta)
 	}
-	s.journal = f
 }
 
 func spoolJournalRecord(slot uint64, meta SpoolSlotMeta) []byte {
@@ -186,11 +191,13 @@ func spoolJournalRecord(slot uint64, meta SpoolSlotMeta) []byte {
 
 // MarkComplete records that the slot fully assembled (data shreds
 // 0..lastIndex all held). Called by the assembler's completion hook, so
-// hydrating an adopted file re-marks it for free. Idempotent.
+// hydrating an adopted file re-marks it for free. Idempotent. Journal submission
+// never waits for storage or queue space; a crash may lose this repair hint,
+// causing reassembly/repair, but cannot authorize a vote or advance a checkpoint.
 func (s *ShredSpool) MarkComplete(slot uint64, lastIndex uint32, shreds uint32) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if slot < s.floor || shreds == 0 {
+	if s.closed || slot < s.floor || shreds == 0 {
 		return
 	}
 	if _, done := s.complete[slot]; done {
@@ -198,8 +205,8 @@ func (s *ShredSpool) MarkComplete(slot uint64, lastIndex uint32, shreds uint32) 
 	}
 	meta := SpoolSlotMeta{LastIndex: lastIndex, Shreds: shreds}
 	s.complete[slot] = meta
-	if s.journal != nil {
-		s.journal.Write(spoolJournalRecord(slot, meta))
+	if s.journal != nil && !s.journal.tryComplete(slot, meta) {
+		s.journalOverflow = true
 	}
 }
 
@@ -371,12 +378,18 @@ func (s *ShredSpool) ensureRoomLocked(slot uint64, additional int64) bool {
 		if slot >= s.highestSlot {
 			return false
 		}
-		s.dropSlotLocked(s.highestSlot)
+		if !s.dropSlotLocked(s.highestSlot) {
+			return false
+		}
 	}
 	return true
 }
 
-func (s *ShredSpool) dropSlotLocked(slot uint64) {
+func (s *ShredSpool) dropSlotLocked(slot uint64) bool {
+	if err := s.invalidateCompleteLocked(slot); err != nil {
+		mlog.Log.Warnf("shred spool: retaining slot %d after completion invalidation failed: %v", slot, err)
+		return false
+	}
 	s.closeSlotLocked(slot)
 	s.bytes -= s.sizes[slot]
 	delete(s.sizes, slot)
@@ -384,14 +397,20 @@ func (s *ShredSpool) dropSlotLocked(slot uint64) {
 	delete(s.validated, slot)
 	delete(s.complete, slot)
 	_ = os.Remove(s.pathFor(slot))
-	if s.journal != nil {
-		// Supersede any older completion record if this slot number is later
-		// re-created before the journal is compacted on restart.
-		s.journal.Write(spoolJournalRecord(slot, SpoolSlotMeta{}))
-	}
 	if s.haveHighest && slot == s.highestSlot {
 		s.recomputeHighestLocked()
 	}
+	return true
+}
+
+// Remove the live hint immediately, but do not mutate its file until older
+// journal hints have been superseded. A failed fence leaves the file intact.
+func (s *ShredSpool) invalidateCompleteLocked(slot uint64) error {
+	delete(s.complete, slot)
+	if s.journal != nil {
+		return s.journal.invalidate(slot)
+	}
+	return nil
 }
 
 func (s *ShredSpool) recomputeHighestLocked() {
@@ -483,16 +502,15 @@ func (s *ShredSpool) readSlotLocked(slot uint64) ([][]byte, error) {
 		validEnd = packetEnd
 	}
 	if validEnd != len(data) {
+		if err := s.invalidateCompleteLocked(slot); err != nil {
+			return nil, err
+		}
 		if err := os.Truncate(path, int64(validEnd)); err != nil {
 			return nil, fmt.Errorf("truncate corrupt shred spool tail for slot %d: %w", slot, err)
 		}
 		oldSize := s.sizes[slot]
 		s.sizes[slot] = int64(validEnd)
 		s.bytes += int64(validEnd) - oldSize
-		delete(s.complete, slot)
-		if s.journal != nil {
-			s.journal.Write(spoolJournalRecord(slot, SpoolSlotMeta{}))
-		}
 	}
 	s.validated[slot] = true
 	return packets, nil
@@ -533,12 +551,20 @@ func (s *ShredSpool) Stats() (slots int, bytes int64) {
 func (s *ShredSpool) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
 	s.closed = true
 	for slot := range s.open {
 		s.closeSlotLocked(slot)
 	}
 	if s.journal != nil {
-		_ = s.journal.Close()
+		if s.journalOverflow {
+			for slot, meta := range s.complete {
+				s.journal.complete(slot, meta)
+			}
+		}
+		s.journal.close()
 		s.journal = nil
 	}
 }
