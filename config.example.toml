@@ -328,6 +328,16 @@ name = "mithril"
     # Signature-verification workers (0 = GOMAXPROCS).
     tpu_sigverify_workers = 0
 
+    # Optional minimum slot for NEW votes (inclusive), also --wait-to-vote-slot.
+    # Useful when rejoining after recovery. CLI overrides this setting.
+    # Zero adds no operator cutoff; the automatic startup cutoff and normal
+    # consensus checks still apply. A lower value cannot bypass those checks.
+    # Replay/repair continue while waiting. Previously recorded, authenticated
+    # votes can still be restored/rebroadcast under the existing recovery rules.
+    # This does not coordinate a cluster restart or wait for supermajority,
+    # and does not allow resetting a corrupt vote-history file.
+    wait_to_vote_slot = 0
+
 # ============================================================================
 # [consensus] - Alpenglow Consensus
 # ============================================================================

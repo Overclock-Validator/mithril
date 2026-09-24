@@ -97,6 +97,7 @@ type LeaderLoop struct {
 	alpenglowClock   bool
 	parentContext    func(uint64) ParentContext
 	productionParent func(uint64) alpenglow.BlockProductionParent
+	canSignSlot      func(uint64) bool
 	onBlock          func(*b.Block)
 	commitLeaderSlot func(replay.CommitLeaderInput) (*sealevel.SlotCtx, error)
 
@@ -145,6 +146,7 @@ type LeaderLoopConfig struct {
 	AlpenglowClock   bool
 	ParentContext    func(uint64) ParentContext
 	ProductionParent func(slot uint64) alpenglow.BlockProductionParent
+	CanSignSlot      func(slot uint64) bool
 	OnBlock          func(*b.Block)
 	CurrentSlot      func() uint64
 	LeaderForSlot    func(uint64) (solana.PublicKey, bool)
@@ -181,6 +183,7 @@ func NewLeaderLoop(cfg LeaderLoopConfig) *LeaderLoop {
 		alpenglowClock:      cfg.AlpenglowClock,
 		parentContext:       cfg.ParentContext,
 		productionParent:    cfg.ProductionParent,
+		canSignSlot:         cfg.CanSignSlot,
 		onBlock:             cfg.OnBlock,
 		currentSlot:         cfg.CurrentSlot,
 		leaderForSlot:       cfg.LeaderForSlot,
@@ -1101,6 +1104,9 @@ func (l *LeaderLoop) revalidateProductionParentForStartLocked(slot uint64, selec
 }
 
 func (l *LeaderLoop) startSlotLocked(slot uint64) error {
+	if l.canSignSlot != nil && !l.canSignSlot(slot) {
+		return fmt.Errorf("%w: waiting for durable signing reservation", errParentNotReady)
+	}
 	selectedParent, parentReadyRequired, err := l.resolveProductionParent(slot)
 	if err != nil {
 		return err
