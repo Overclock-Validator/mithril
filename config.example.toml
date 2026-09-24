@@ -337,6 +337,14 @@ name = "mithril"
     # This does not coordinate a cluster restart or wait for supermajority,
     # and does not allow resetting a corrupt vote-history file.
     wait_to_vote_slot = 0
+    # Bounded cross-slot TPU queue. Zero keeps the 131,072-transaction default.
+    # Larger queues can prefill four busy leader slots, using additional memory.
+    tpu_max_buffered_transactions = 0
+
+    # Milliseconds reserved for local finalization and broadcast, not consensus
+    # finality. Zero keeps the conservative 75ms default. Tune from measured
+    # completion margins; this does not change the protocol slot deadline.
+    block_completion_reserve_ms = 0
 
 # ============================================================================
 # [consensus] - Alpenglow Consensus
