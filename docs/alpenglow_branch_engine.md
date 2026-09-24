@@ -84,16 +84,22 @@ verifying-mode diagnostic and the classic non-Alpenglow flow is unchanged.
 
 ### 5. Fork switch: sweep + unwind
 
-Since a slot can execute before its certificate arrives, a later certificate can
-contradict an executed slot (a sibling we lost the shred race on, or a skip over
-a block we ran). The switch sweep (`pkg/replay/alpenglow_switch.go`, gated on new
-certificate arrivals) walks the executed-but-unfolded window and reports the
-first contradiction as a typed `CertifiedSwitch`. When the parent context is
+Replay can consume blocks and provisional skips before decisive certificates
+or newly discovered ancestry select the chain. The switch sweep
+(`pkg/replay/alpenglow_switch.go`) walks the consumed-but-unrooted window when
+the chain-decision version, replay tip, or rooted frontier changes and reports
+the first contradiction as a typed `CertifiedSwitch`. Decision notifications
+wake replay immediately, with a periodic sweep as a fallback. A switch affecting
+only trailing skips rewinds the block source without unwinding account state.
+For an already-executed divergence, when the parent context is
 retained and the span is safe (same epoch, not mid-rewards-distribution), the
 engine unwinds in-RAM (`tryInLoopUnwind` → `WorkingSet.EvictFrom`) and
 re-executes the certified alternative; otherwise it falls back to re-replay from
 the durable rooted checkpoint. The block source's emission frontier is rewound
-in lockstep (`RewindForAlpenglowSwitch`).
+in lockstep (`RewindForAlpenglowSwitch`). If the source has not delivered the
+selected outcome five seconds after a certified rewind, a warning reports the
+required slot/block id, replay and emission frontiers, and repair range. It
+repeats at most every thirty seconds until delivery or a superseding decision.
 
 ### 6. Cert-driven repair
 

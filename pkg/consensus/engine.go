@@ -150,6 +150,14 @@ type AlpenglowChainQuery interface {
 	ChainDecisionVersion() uint64
 }
 
+// AlpenglowChainDecisionNotifier optionally wakes replay when chain decisions
+// change. Its stable channel serves one replay consumer and is never closed.
+// Notifications are coalesced hints to rerun the decision sweep; obtain the
+// channel before checking ChainDecisionVersion to avoid missing a wakeup.
+type AlpenglowChainDecisionNotifier interface {
+	ChainDecisionChanges() <-chan struct{}
+}
+
 // AlpenglowWantedBlocksSource surfaces certified-but-unobserved blocks so the
 // block source can steer turbine/repair toward data the cluster has already
 // voted real (cert-driven repair).
@@ -1503,6 +1511,12 @@ func (e *AlpenglowObserverEngine) SkipCertifiedAt(slot uint64) bool {
 // without a new certificate.
 func (e *AlpenglowObserverEngine) ChainDecisionVersion() uint64 {
 	return e.ensureChain().DecisionVersion()
+}
+
+// ChainDecisionChanges wakes replay on every decision-version change, including
+// changes derived from newly observed ancestry without another certificate.
+func (e *AlpenglowObserverEngine) ChainDecisionChanges() <-chan struct{} {
+	return e.ensureChain().DecisionChanges()
 }
 
 // AlpenglowWantedBlocks lists certified-but-unobserved blocks for cert-driven
