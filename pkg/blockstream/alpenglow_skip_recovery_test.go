@@ -59,20 +59,30 @@ func TestAlpenglowFinalizedParentClearsQueuedSkipDuringCatchup(t *testing.T) {
 	bs.isNearTip.Store(false)
 	bs.liveStreamActive.Store(true)
 	bs.reorderMu.Lock()
+	bs.alpenglowRewindWait.begin(parent.Slot, parent.Hash, time.Now())
 	bs.applyAlpenglowDecisionLocked()
 	marked := bs.skippedSlots[parent.Slot] && bs.alpenglowCertifiedSkips[parent.Slot]
+	waitingAfterSkip := bs.alpenglowRewindWait.slot
 	bs.reorderMu.Unlock()
 	if !marked {
 		t.Fatal("initial skip certificate did not queue a skip")
 	}
+	if waitingAfterSkip != 0 {
+		t.Fatal("superseding skip decision left the old block delivery diagnostic active")
+	}
 
 	finalizeSkipRecoveryChild(t, tracker, child, parent)
 	bs.reorderMu.Lock()
+	bs.alpenglowRewindWait.begin(parent.Slot, solana.Hash{99}, time.Now())
 	bs.applyAlpenglowDecisionLocked()
 	stillSkipped := bs.skippedSlots[parent.Slot] || bs.alpenglowCertifiedSkips[parent.Slot] || bs.liveSynthesizedSkips[parent.Slot]
+	waitingAfterBlock := bs.alpenglowRewindWait.slot
 	bs.reorderMu.Unlock()
 	if stillSkipped {
 		t.Fatal("decisive parent block left a queued skip outside near-tip mode")
+	}
+	if waitingAfterBlock != 0 {
+		t.Fatal("superseding block decision left the old identity delivery diagnostic active")
 	}
 	bs.slotStateMu.Lock()
 	_, stillDone := bs.slotState[parent.Slot]
@@ -156,6 +166,9 @@ func TestAlpenglowSkippedParentRewindResumesRepairCatchup(t *testing.T) {
 		defer bs.reorderMu.Unlock()
 		return bs.nextSlotToSend == child.Slot
 	})
+	// Replay has consumed the trailing skips, but that frontier does not
+	// establish delivery of a subsequently selected parent after rewind.
+	bs.lastExecutedSlot.Store(child.Slot - 1)
 
 	childBlock := &b.Block{
 		Slot: child.Slot, ParentSlot: parent.Slot, SourceParentSlot: parent.Slot,
@@ -182,6 +195,12 @@ func TestAlpenglowSkippedParentRewindResumesRepairCatchup(t *testing.T) {
 	if got := bs.repairCatchupFrom.Load(); got != parent.Slot {
 		t.Fatalf("rewound repair catchup boundary = %d, want parent slot %d", got, parent.Slot)
 	}
+	bs.reorderMu.Lock()
+	notice, due := bs.alpenglowRewindWait.takeNotice(bs.alpenglowRewindWait.started.Add(alpenglowRewindWaitWarnAfter))
+	bs.reorderMu.Unlock()
+	if !due || notice.slot != parent.Slot || notice.certified != parent.Hash {
+		t.Fatalf("rewind lost the delivery wait behind consumed skips: notice=%+v due=%v", notice, due)
+	}
 	parentBlock := &b.Block{
 		Slot: parent.Slot, ParentSlot: anchor.Slot, SourceParentSlot: anchor.Slot,
 		FromLiveStream: true, HasAlpenglowBlockID: true, AlpenglowBlockID: [32]byte(parent.Hash),
@@ -193,6 +212,11 @@ func TestAlpenglowSkippedParentRewindResumesRepairCatchup(t *testing.T) {
 	if got := next(parent.Slot, false); solana.Hash(got.AlpenglowBlockID) != parent.Hash {
 		t.Fatal("repaired parent identity was not preserved")
 	}
+	waitForBlockSourceCondition(t, func() bool {
+		bs.reorderMu.Lock()
+		defer bs.reorderMu.Unlock()
+		return bs.alpenglowRewindWait.slot == 0
+	})
 	for slot := parent.Slot + 1; slot < child.Slot; slot++ {
 		next(slot, true)
 	}
@@ -274,10 +298,14 @@ func TestAlpenglowCertificateRewindWaitsForPausedSendAndDrainsSuffix(t *testing.
 	frontier, restoredAnchor := bs.nextSlotToSend, bs.lastEmittedBlockSlot
 	_, retainedDiscarded := bs.emittedAlpenglowBlockIDs[discarded.Slot]
 	_, retainedPaused := bs.emittedAlpenglowBlockIDs[paused.Slot]
+	notice, due := bs.alpenglowRewindWait.takeNotice(bs.alpenglowRewindWait.started.Add(alpenglowRewindWaitWarnAfter))
 	bs.reorderMu.Unlock()
 	if frontier != 151 || restoredAnchor != anchor.Slot || retainedDiscarded || retainedPaused {
 		t.Fatalf("old send corrupted restored frontier: next=%d anchor=%d old_block=%v paused_block=%v",
 			frontier, restoredAnchor, retainedDiscarded, retainedPaused)
+	}
+	if !due || notice.slot != 151 || notice.certified != selectedID {
+		t.Fatalf("pre-rewind send satisfied the post-rewind delivery wait: notice=%+v due=%v", notice, due)
 	}
 	select {
 	case got := <-bs.streamChan:
@@ -305,4 +333,9 @@ func TestAlpenglowCertificateRewindWaitsForPausedSendAndDrainsSuffix(t *testing.
 	case <-time.After(time.Second):
 		t.Fatal("selected replacement could not emit after the paused-send rewind")
 	}
+	waitForBlockSourceCondition(t, func() bool {
+		bs.reorderMu.Lock()
+		defer bs.reorderMu.Unlock()
+		return bs.alpenglowRewindWait.slot == 0
+	})
 }
