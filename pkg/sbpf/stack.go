@@ -36,6 +36,12 @@ type Stack struct {
 	shadow             []Frame
 	dynamicStackFrames bool
 	stackFrameGaps     bool
+	// dirtyLo/dirtyHi bound the physical byte range of mem that may have been
+	// written during this execution. Finish only has to zero this range before
+	// returning the buffer to the pool.
+	dirtyLo  uint64
+	dirtyHi  uint64
+	maxDepth int
 }
 
 // Frame is an entry on the shadow stack.
@@ -92,9 +98,11 @@ func NewStack(sbpfVer sbpfver.SbpfVersion, disableStackFrameGaps bool) Stack {
 	}
 
 	s := Stack{
-		mem:    m,
-		sp:     VaddrStack,
-		shadow: sh,
+		mem:     m,
+		sp:      VaddrStack,
+		shadow:  sh,
+		dirtyLo: StackMax,
+		dirtyHi: 0,
 	}
 
 	var sz uint64
@@ -115,10 +123,12 @@ func NewStack(sbpfVer sbpfver.SbpfVersion, disableStackFrameGaps bool) Stack {
 func (s *Stack) Finish() {
 	if UsePool {
 		s.mem = s.mem[:StackMax]
-		clear(s.mem)
+		if s.dirtyHi > s.dirtyLo {
+			clear(s.mem[s.dirtyLo:s.dirtyHi])
+		}
 		stackMemPool.Put(s.mem)
 		s.shadow = s.shadow[:StackDepth]
-		clear(s.shadow)
+		clear(s.shadow[:max(s.maxDepth, 1)])
 		s.shadow = s.shadow[:1]
 		stackShadowPool.Put(s.shadow)
 	}
@@ -153,21 +163,38 @@ func (s *Stack) GetFrame(addr uint32) []byte {
 	}
 }
 
+// MarkDirty records that physical stack bytes [off, off+size) may be written.
+func (s *Stack) MarkDirty(lo, hi uint64) {
+	if hi <= lo {
+		return
+	}
+	s.dirtyLo = min(s.dirtyLo, lo)
+	s.dirtyHi = max(s.dirtyHi, hi)
+}
+
 // Push allocates a new call frame.
 //
 // Saves the given nonvolatile regs, return address,
 // and current frame pointer.
 // Returns the new frame pointer.
-func (s *Stack) Push(regs []uint64, ret int64) bool {
-	if ok := len(s.shadow) < cap(s.shadow); !ok {
+func (s *Stack) Push(regs *[16]uint64, ret int64) bool {
+	n := len(s.shadow)
+	if n >= cap(s.shadow) {
 		return false
 	}
-
-	frame := Frame{RetAddr: ret}
-	copy(frame.NVRegs[:], regs[6:10])
-	frame.FramePtr = regs[10]
-
-	s.shadow = append(s.shadow, frame)
+	// Write the frame in place (no temporary Frame value / copy) to avoid
+	// store-forwarding stalls in this very hot path.
+	s.shadow = s.shadow[:n+1]
+	f := &s.shadow[n]
+	f.RetAddr = ret
+	f.NVRegs[0] = regs[6]
+	f.NVRegs[1] = regs[7]
+	f.NVRegs[2] = regs[8]
+	f.NVRegs[3] = regs[9]
+	f.FramePtr = regs[10]
+	if n+1 > s.maxDepth {
+		s.maxDepth = n + 1
+	}
 
 	if !s.dynamicStackFrames {
 		if s.stackFrameGaps {
@@ -185,16 +212,17 @@ func (s *Stack) Push(regs []uint64, ret int64) bool {
 // Restores saved nonvolatile regs into provided slice.
 // Returns saved return address and returns true upon success,
 // and returns false if no call frames are left.
-func (s *Stack) Pop(regs []uint64) (int64, bool) {
-	if len(s.shadow) <= 1 {
+func (s *Stack) Pop(regs *[16]uint64) (int64, bool) {
+	n := len(s.shadow)
+	if n <= 1 {
 		return 0, false
 	}
-
-	var frame Frame
-	frame, s.shadow = s.shadow[len(s.shadow)-1], s.shadow[:len(s.shadow)-1]
-
-	copy(regs[6:10], frame.NVRegs[:])
-	regs[10] = frame.FramePtr
-
-	return frame.RetAddr, true
+	f := &s.shadow[n-1]
+	regs[6] = f.NVRegs[0]
+	regs[7] = f.NVRegs[1]
+	regs[8] = f.NVRegs[2]
+	regs[9] = f.NVRegs[3]
+	regs[10] = f.FramePtr
+	s.shadow = s.shadow[:n-1]
+	return f.RetAddr, true
 }
