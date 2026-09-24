@@ -157,3 +157,146 @@ For four 4,096-transaction components, medians of the three per-run statistics w
 Completion-finished p99 ranged 46.43–54.52 ms before and 1.477–1.719 ms after. Admission p99 ranged 44.27–53.76 ms before and 0.003206–0.06401 ms after. Every iteration reached its intended request occupancy. For 256-transaction components, completion-finished p99 medians were 3.215→1.165 ms. Shared-host scheduling introduces variation; reserving admission does not remove queued-job or CPU delays, and these 100-sample tails are not a live p99/FAST claim. Total-work throughput was roughly unchanged; no total-work tail improvement is claimed.
 
 Original run artifacts are retained in the [evidence archive](streaming-preparation-evidence.md).
+
+### Completion-critical shred diagnostics
+
+The optional `MITHRIL_ENTRY_TRACE_MOD`, `MITHRIL_ENTRY_TRACE_SECONDS` (at most
+1,800), and `MITHRIL_ENTRY_TRACE_FILE` settings are read at process startup.
+Use a new output file for each capture. Tracing is disabled by default.
+
+Large-block batch records include `critical_shred_index` and its admission
+source: `non_repair`, `repair`, or `fec_recovery`. The critical index maximizes
+local availability time across the batch **and its preceding DATA_COMPLETE
+boundary**. Equal timestamps select the lowest index and report the tie count;
+unknown coverage still sets `availability_known=false`. This identifies the
+last locally available dependency, not necessarily the replay cursor's current
+blocking range. Correlate with execution groups before calling it a replay stall.
+
+Recovered shreds identify the triggering packet's index, FEC set, coding/data
+type and repair status. `non_repair` can include spool hydration. Admission entry
+timestamps precede the assembler lock; they are not socket/NIC timestamps. A zero
+admission-entry timestamp means it was not sampled. Admission-to-availability
+includes local processing and, for recovered data, reconstruction.
+
+The same JSONL file also contains `event="repair_send"` records. Consumers must
+separate these from block reports. Join by `origin_unix_ns`, slot and shred index,
+then order by send timestamps; attempt IDs can reset. Start/end bracket the UDP
+write, and `success` means only that the local write succeeded. Highest-index
+probes are explicitly marked and must not be treated as exact-index requests.
+Request records can exist for slots without a large-block report. Send records include the peer endpoint and nonce for response correlation.
+
+Both queues are bounded and producers never wait for the writer. The cumulative
+`dropped_reports` counter covers queue drops and encoding failures; an absent
+repair record is not proof of no request if records were dropped. Tracing does
+not change repair scheduling, retry intervals, fanout or verification checks.
+
+### Repair ordering for streaming
+
+When a streaming subscriber is installed, the first priority repair slot puts
+its earliest missing data span ahead of the usual cheapest-FEC-unlock ordering.
+Known FEC sets still request only their recovery deficit; an unknown-layout hole
+prioritizes one missing index without guessing its FEC shape. Remaining work,
+other priority slots and freshness repair retain their previous ordering.
+Request budgets, admission shares, retry intervals and fanout are unchanged.
+
+This trades completing cheap later sets first for making the contiguous input
+prefix available sooner. It helps when request capacity is constrained; it does
+not accelerate requests already in flight, guarantee an earlier full block, or
+prove improved voting latency. The subscriber and priority head are used as the
+scope; the selector does not read the execution cursor.
+
+`go test ./pkg/turbine/repairsim -run TestStreamingPrefixRepairUnderLimitedBudget -v`
+compares both policies using authenticated generated shreds and production FEC
+recovery, at fixed request budgets and a 20ms simulated round trip. It checks
+identical assembled entries/transactions, request counts and full completion,
+and measures availability of the first data span. It does not model production
+retry timers, peer loss, execution timing, or reproduce a captured live slot.
+
+
+Response-effectiveness tracing also emits `repair_response` and
+`repair_admission` events. Treat every record with an `event` field as an event,
+not a block report. Match sends/responses by origin, peer, nonce and requested
+slot/index; use timestamps to disambiguate nonce reuse. Responses record the
+returned index, request-registration timestamp and whether the request had
+expired. Registration precedes signing/write; use `send_start_ns` for the closer
+approximation to network elapsed time. A matched response is not proof that
+assembly accepted it: later receive-path checks can still reject it.
+
+Admission events cover sampled matched-repair shreds reaching an active assembly;
+join to responses by slot/returned index and chronology (no nonce is carried into
+the assembler). They report accepted/duplicate/rejected, the coding-layout
+recovery deficit before/after, and the number of reconstructed data shreds.
+Deficit `-1` means unknown layout; zero means enough shards, not necessarily
+successful recovery. Admission timestamps are local assembler entry/exit,
+including lock wait and processing, not NIC timestamps. Already-completed,
+evicted, or completing slots return before this instrumentation. An unmatched
+or canceled response is not emitted as a matched response. Missing records,
+particularly with drops or capture boundaries, cannot establish packet loss.
+
+### Bounded child repair lookahead
+
+Replay supplies its exact streaming generation as a repair anchor. The
+asynchronous decoder can then recognize a decoded header for the immediate next
+slot naming that parent, even while replay executes a parent group. A header
+published earlier is recovered from the assembler's ready batches. The hint
+permits fetching only; it does not establish fork choice, validate the final
+parent block ID, or permit child execution before parent completion.
+
+After ordinary priority and freshness repair, leftover tokens may request up to
+four missing data shreds from the child's earliest incomplete FEC span. Existing
+in-flight requests for that child count against the four-request lookahead
+allowance. Normal repair can independently exceed that allowance. Global rate,
+per-scan and admission limits remain in force; lookahead uses bulk single-attempt
+policy, with no new retry/fanout or highest-index probing. If no capacity remains,
+the child waits.
+
+Only one child is tracked. The anchor expires after two seconds and is cleared
+on parent finalize/discard, parent reset/update, or stream unsubscribe. Child
+completion/reset and changed parent markers invalidate its hint. Generation
+checks reject stale headers. Already-sent requests still use normal response and
+expiry handling. Notifications and repair wakeups remain nonblocking/coalesced;
+no extra workers or polling loop are introduced.
+
+### Highest-index repair followups
+
+A matched highest-index response triggers followup selection only after receiver
+admission and FEC recovery. The assembler supplies its current deficit-aware
+selection (at most 256 data requests), rather than treating the interval below
+the response as missing. Completed, completing, evicted and absent assembler
+slots produce no immediate followups. During disk-only catchup, selection waits
+for hydration instead of blindly fetching data that may already be spooled.
+
+Followups retain the shared token bucket, admission limits, bulk retry policy,
+and a reserved token for continued highest-index discovery when needed. A
+snapshot can still race with subsequent arrivals; this removes known redundant
+requests, not every possible duplicate. No assembler lock is held while signing
+or sending requests. Response matching and peer credit are unchanged.
+
+
+### Bounded speculative verification waits
+
+Replay joins a streaming group's signature verification with one shared 100 ms
+budget, capped by the stream's remaining open lifetime. The watchdog stage is
+`streaming_sigverify_wait`. Expiry discards the speculative overlay with reason
+`sigverify_timeout`; it is not a signature verdict. Whole-block replay still
+requires normal verification before accepting the block.
+
+The streaming wait only observes immutable verifier results. Timing out does not
+cancel the shared request or wait for its workers: turbine continues owning its
+transactions and retains reservations until readers finish. The owning completion
+and cleanup paths retain their joining waits. This bounds speculative replay's
+wait, not the duration of whole-block verification or recovery from a failed worker.
+
+`StreamingExecution.VerificationWait` records wall time spent joining groups,
+including failed joins and discarded streams. It overlaps `GroupJoinAssembly` for
+successful groups; do not add them together or interpret it as cryptographic CPU
+cost. The 100 ms limit is a conservative fallback budget, not a measured optimum.
+
+
+### Runtime pooling default
+
+Omitting `tuning.use_pool` now preserves the CLI default (`true`), instead of
+silently disabling VM pooling through the config reader's zero value. Explicit
+TOML `false` remains supported, and an explicitly supplied CLI flag takes
+precedence. This is a runtime behavior change for previously minimal configs;
+pooled memory is cleared before reuse. The flag remains the single default source.

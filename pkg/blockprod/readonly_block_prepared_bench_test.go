@@ -43,3 +43,19 @@ func BenchmarkReadonlyPairPreparedFullBlock(b *testing.B) {
 	}
 	b.ReportMetric(float64(readonlyBlockAccepted), "tx/block")
 }
+
+// Allocations per preparation bound the incremental prepared-object footprint;
+// excludes the already decoded transaction and wire bytes owned by the queue.
+func BenchmarkReadonlyPairPreparationMemory(b *testing.B) {
+	f := makeReadonlyBlockFixture(b, 1)
+	setup := f.bank(b, nil)
+	defer setup.Close()
+	preparer := replay.NewTransactionPreparer(setup.SlotCtx.Features)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if preparer.Prepare(f.txs[0]) == nil {
+			b.Fatal("preparation failed")
+		}
+	}
+}

@@ -126,6 +126,9 @@ var (
 	pprofPort      int64
 	blockstorePath string
 	txParallelism  int64
+	// streamingMaxOpenMs is --streaming-max-open-ms; resolved into
+	// replay.StreamingExecutionCfg.MaxOpenAge with the other [replay] keys.
+	streamingMaxOpenMs int
 
 	debugTxs                       []string
 	debugAcctWrites                []string
@@ -538,6 +541,14 @@ func init() {
 	// [replay] section flags
 	Run.Flags().Int64Var(&txParallelism, "txpar", 0, "Transaction execution workers (>0 enables topsort parallelism; explicit 0 is sequential; unset validator mode defaults to 2x CPU cores)")
 	Run.Flags().Int64Var(&numReplaySlots, "num-slots", 0, "Number of slots to replay (0 = run continuously)")
+	Run.Flags().BoolVar(&replay.StreamingExecutionCfg.Enabled, "streaming-execution", false,
+		"Execute Turbine blocks while their shreds arrive (Alpenglow validator/verifying modes only; the complete block remains authoritative and any mismatch falls back to whole-block execution)")
+	Run.Flags().IntVar(&replay.StreamingExecutionCfg.Workers, "streaming-workers", 0,
+		"Streaming execution workers per transaction group (0 = min(txpar, 4))")
+	Run.Flags().IntVar(&replay.StreamingExecutionCfg.MinGroupBatches, "streaming-min-group-batches", 0,
+		"Contiguous decoded batches to accumulate before a streaming group executes (0 or 1 = execute as batches arrive)")
+	Run.Flags().IntVar(&streamingMaxOpenMs, "streaming-max-open-ms", 0,
+		"Discard a streaming bank whose block has not completed after this many milliseconds (0 = 2000)")
 	Run.Flags().Int64VarP(&endSlot, "end-slot", "e", -1, "Block at which to stop replaying, inclusive (-1 = run continuously)")
 
 	// [consensus] section flags
@@ -1165,6 +1176,13 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	}
 	resolvedSigverifyBackend = resolved
 	sbpf.UsePool = getBool("use-pool", "tuning.use_pool")
+	// [tuning] streaming execution (off by default; Alpenglow turbine only).
+	replay.StreamingExecutionCfg.Enabled = getBool("streaming-execution", "tuning.streaming_execution")
+	replay.StreamingExecutionCfg.Workers = getInt("streaming-workers", "tuning.streaming_workers")
+	replay.StreamingExecutionCfg.MinGroupBatches = getInt("streaming-min-group-batches", "tuning.streaming_min_group_batches")
+	if ms := getInt("streaming-max-open-ms", "tuning.streaming_max_open_ms"); ms > 0 {
+		replay.StreamingExecutionCfg.MaxOpenAge = time.Duration(ms) * time.Millisecond
+	}
 	accountsdb.StoreAccountsWorkers = getInt("store-accounts-workers", "tuning.store_accounts_workers")
 	accountsdb.ProgramCacheMaxMB = getInt("program-cache-max-mb", "tuning.program_cache_max_mb")
 	if accountsdb.ProgramCacheMaxMB <= 0 {

@@ -132,6 +132,8 @@ var (
 	TurbineEarlyPreparationWait      = Metric{"turbine_early_preparation_wait_seconds"}
 	TurbineEarlyVerifiedTransactions = Metric{"turbine_early_verified_transactions_total"}
 	TurbineFullToReady               = Metric{"turbine_full_to_ready_duration_seconds"}
+	// ReplayFullToReplayed: last shred assembled -> replay result handed to consensus.
+	ReplayFullToReplayed = Metric{"replay_full_to_replayed_duration_seconds"}
 	// ReplaySigverifyGroup times one drained group of transaction signatures
 	// and ReplaySigverifyGroupSignatures counts how many signatures were in it.
 	// The pair is what tells an operator whether batching is actually happening:
@@ -259,6 +261,7 @@ var MetricToType = map[Metric]metricType{
 	TurbineEarlyPreparationWait:                 TimingT,
 	TurbineEarlyVerifiedTransactions:            CountT,
 	TurbineFullToReady:                          TimingT,
+	ReplayFullToReplayed:                        TimingT,
 	ReplaySigverifyGroup:                        TimingT,
 	ReplaySigverifyGroupSignatures:              CountT,
 	TurbineReplayAdmission:                      TimingT,
@@ -373,6 +376,7 @@ var MetricToLabels = map[Metric][]string{
 	TurbineEarlyPreparationWait:                 {},
 	TurbineEarlyVerifiedTransactions:            {},
 	TurbineFullToReady:                          {},
+	ReplayFullToReplayed:                        {},
 	ReplaySigverifyGroup:                        {},
 	ReplaySigverifyGroupSignatures:              {},
 	TurbineReplayAdmission:                      {},
@@ -414,6 +418,7 @@ var MetricToBuckets = map[Metric][]float64{
 	TurbineEarlyTransactionSigverify:            turbinePipelineDurationBuckets,
 	TurbineEarlyPreparationWait:                 turbinePipelineDurationBuckets,
 	TurbineFullToReady:                          turbinePipelineDurationBuckets,
+	ReplayFullToReplayed:                        turbinePipelineDurationBuckets,
 	ReplaySigverifyGroup:                        turbinePipelineDurationBuckets,
 	TurbineReplayAdmission:                      turbinePipelineDurationBuckets,
 	AlpenglowVoteRewards:                        turbinePipelineDurationBuckets,

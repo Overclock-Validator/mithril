@@ -79,7 +79,6 @@ func DefaultLimits() Limits {
 	}
 }
 
-// LimitsForFeatures returns the legacy 400ms budgets. Live banks must use
 // LimitsForSlot to apply slot-time reductions at the correct epoch boundary.
 func LimitsForFeatures(feats *features.Features) Limits {
 	limits := DefaultLimits()

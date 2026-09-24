@@ -501,6 +501,7 @@ func (p *CertPool) finishSlotAndUnlock(slot uint64, ps *poolSlot, emits []Certif
 	if p.slots[slot] != ps {
 		emits = nil
 	}
+	p.snap.CertsEmitted += uint64(len(emits))
 	target := p.publicationTargetLocked()
 	ps.processing = false
 	p.workCond.Broadcast()
@@ -988,7 +989,6 @@ func (p *CertPool) maybeAssembleLocked(slot uint64, ps *poolSlot) []Certificate 
 			continue
 		}
 		p.emitted[key] = struct{}{}
-		p.snap.CertsEmitted++
 		emits = append(emits, cert)
 	}
 	return emits

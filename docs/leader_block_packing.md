@@ -81,7 +81,14 @@ The corresponding flags are `--tpu-max-buffered-transactions` and
 `--leader-completion-reserve-ms`. The measured full-prefill trial used 262,144
 queue entries and a 60ms reserve. Those are opt-in tuning values; defaults stay
 unchanged. A larger queue uses additional memory for owned wire, decoded and
-prepared objects. A shorter reserve needs measured local finalization/broadcast
+prepared objects. `BenchmarkReadonlyPairPreparationMemory` measured 728 allocated
+bytes per preparation (9 allocations) on Go 1.26.4 arm64 for the 198-byte fixture.
+That is 91 MiB of allocation volume for 131,072 preparations, or 182 MiB for
+262,144, in addition to wire/decoded transactions and queue indexes. Allocation
+volume includes temporary preparation storage: it is not retained heap or RSS.
+More accounts/instructions increase the footprint; these are not worst-case caps.
+Reproduce with `go test ./pkg/blockprod -run '^$' -bench '^BenchmarkReadonlyPairPreparationMemory$' -benchmem`.
+A shorter reserve needs measured local finalization/broadcast
 margin and does not change the protocol deadline. Shifting completion also
 shifts later bank start times, so it does not add the same packing time to all
 four blocks.

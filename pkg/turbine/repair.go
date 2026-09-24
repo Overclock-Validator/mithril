@@ -304,8 +304,9 @@ type RepairPeerReport struct {
 }
 
 type repairClient struct {
-	identity   ed25519.PrivateKey
-	peerSource RepairPeerSource
+	priorityWake chan struct{} // initialized before the receiver starts; coalesced hints
+	identity     ed25519.PrivateKey
+	peerSource   RepairPeerSource
 
 	mu          sync.Mutex
 	outstanding map[repairRequestKey]outstandingRepairRequest
@@ -375,28 +376,77 @@ func newRepairClient(identity ed25519.PrivateKey, peerSource RepairPeerSource) (
 		return nil, fmt.Errorf("repair peer source is required")
 	}
 	c := &repairClient{
-		identity:    append(ed25519.PrivateKey(nil), identity...),
-		peerSource:  peerSource,
-		outstanding: make(map[repairRequestKey]outstandingRepairRequest),
-		byResponse:  make(map[repairResponseKey]repairRequestKey),
-		inflight:    make(map[shredKey]*shredInflight),
-		perPeer:     make(map[repairAddressKey]*peerRecord),
-		expiredCur:  make(map[repairResponseKey]outstandingRepairRequest, repairExpiredGenMin),
+		priorityWake: make(chan struct{}, 1),
+		identity:     append(ed25519.PrivateKey(nil), identity...),
+		peerSource:   peerSource,
+		outstanding:  make(map[repairRequestKey]outstandingRepairRequest),
+		byResponse:   make(map[repairResponseKey]repairRequestKey),
+		inflight:     make(map[shredKey]*shredInflight),
+		perPeer:      make(map[repairAddressKey]*peerRecord),
+		expiredCur:   make(map[repairResponseKey]outstandingRepairRequest, repairExpiredGenMin),
 	}
 	c.timeoutNanos.Store(int64(repairMinRequestTimeout))
 	return c, nil
 }
 
+// wakePriority does not send requests or mint rate tokens. It only asks the
+// single repair loop to reconsider newly prioritized work sooner.
+func (c *repairClient) wakePriority() {
+	select {
+	case c.priorityWake <- struct{}{}:
+	default:
+	}
+}
+
 func (c *repairClient) run(ctx context.Context, conn *net.UDPConn, assembler *SlotAssembler) {
-	ticker := time.NewTicker(repairScanInterval)
+	runRepairSchedule(ctx, c.priorityWake, repairScanInterval, 20*time.Millisecond, func() {
+		c.expireOutstanding(time.Now())
+		c.repairOnce(conn, assembler)
+	})
+}
+
+// Keep periodic scans for retries/freshness. Coalesce urgent hints and bound
+// scan frequency; all sends still use the existing token bucket, admission,
+// retry, fanout and peer budgets. The loop remains the sole sender.
+func runRepairSchedule(ctx context.Context, wake <-chan struct{}, interval, minSpacing time.Duration, scan func()) {
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	var timer *time.Timer
+	var urgent <-chan time.Time
+	var last time.Time
+	stopTimer := func() {
+		if timer != nil {
+			timer.Stop()
+		}
+		urgent = nil
+	}
+	defer stopTimer()
+	run := func() {
+		stopTimer()
+		if ctx.Err() != nil {
+			return
+		}
+		scan()
+		last = time.Now()
+	}
+	schedule := func() {
+		if delay := minSpacing - time.Since(last); delay <= 0 {
+			run()
+		} else if urgent == nil {
+			timer = time.NewTimer(delay)
+			urgent = timer.C
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			c.expireOutstanding(time.Now())
-			c.repairOnce(conn, assembler)
+			schedule()
+		case <-urgent:
+			run()
+		case <-wake:
+			schedule()
 		}
 	}
 }
@@ -407,7 +457,8 @@ func (c *repairClient) repairOnce(conn *net.UDPConn, assembler *SlotAssembler) {
 		return
 	}
 	priority, edge := assembler.RepairRequestsTiered(repairMaxSlotsPerScan, repairMaxMissingPerSlot)
-	if len(priority)+len(edge) == 0 {
+	child, haveChild := assembler.childRepairRequest(time.Now())
+	if len(priority)+len(edge) == 0 && !haveChild {
 		return
 	}
 
@@ -433,6 +484,9 @@ func (c *repairClient) repairOnce(conn *net.UDPConn, assembler *SlotAssembler) {
 	}
 	edgeDemand := tierSendDemand(edge, 1)
 	want := tierSendDemand(priority, headInitial) + edgeDemand
+	if haveChild {
+		want += len(child.MissingDataShreds)
+	}
 	if want > repairMaxOutstanding {
 		want = repairMaxOutstanding
 	}
@@ -456,6 +510,10 @@ func (c *repairClient) repairOnce(conn *net.UDPConn, assembler *SlotAssembler) {
 	// below what the edge can use; leftover head budget flows to the edge.
 	spent := c.sendTier(conn, peers, priority, splitRepairBudget(budget, edgeDemand), headPol, acct)
 	spent += c.sendTier(conn, peers, edge, budget-spent, nil, acct)
+	// Parent/normal repair and freshness keep first claim on every token.
+	if haveChild {
+		spent += c.sendChildRepair(conn, peers, child, budget-spent, acct)
+	}
 	c.returnRateTokens(budget - spent)
 }
 
@@ -563,21 +621,23 @@ func shredSatisfiesRequest(key repairRequestKey, shred *Shred) bool {
 	}
 }
 
-// observeShredResponse matches an incoming packet against outstanding repair
+// matchShredResponse matches an incoming packet against outstanding repair
 // requests (responder address + nonce). Returns true when the shred was
 // delivered BY REPAIR — it answers one of our requests — so the caller can
-// attribute it in per-slot repair accounting.
-func (c *repairClient) observeShredResponse(conn *net.UDPConn, packet []byte, from *net.UDPAddr, shred *Shred) bool {
+// attribute it in per-slot repair accounting. highest is a discovery hint for
+// followup selection only AFTER the receiver admits the shred; matching and
+// peer credit alone do not authorize requests for the claimed range.
+func (c *repairClient) matchShredResponse(packet []byte, from *net.UDPAddr, shred *Shred) (matched, highest bool) {
 	if from == nil || shred == nil {
-		return false
+		return false, false
 	}
 	nonce, ok := repairproto.ResponseNonce(packet)
 	if !ok {
-		return false
+		return false, false
 	}
 	addrKey, ok := repairAddressKeyFromUDP(from)
 	if !ok {
-		return false
+		return false, false
 	}
 	responseKey := repairResponseKey{addr: addrKey, nonce: nonce}
 
@@ -611,7 +671,7 @@ func (c *repairClient) observeShredResponse(conn *net.UDPConn, packet []byte, fr
 		// so it still expires into a deserved timeout and keeps its in-flight
 		// slot for retry. The peer gets nothing.
 		c.mu.Unlock()
-		return false
+		return false, false
 	}
 	if late {
 		// The expired record lives in exactly one generation; deleting from
@@ -641,68 +701,15 @@ func (c *repairClient) observeShredResponse(conn *net.UDPConn, packet []byte, fr
 	c.observeLatencyLocked(latency)
 	c.mu.Unlock()
 
+	if entryTraceSelected(shred.Slot) {
+		traceRepairResponse(outstanding, shred, from.String(), late)
+	}
 	if late {
 		c.lateResponses.Add(1)
 	} else {
 		c.responses.Add(1)
 	}
-	// shredSatisfiesRequest already guaranteed slot match and a data shred; the
-	// gap-backfill path below is HWI-only.
-	if outstanding.key.kind != repairRequestHighestWindowIndex {
-		return true
-	}
-
-	peers := c.peerSnapshot(time.Now())
-	if len(peers) == 0 {
-		return true
-	}
-	start := outstanding.key.index
-	gap := 0
-	if shred.Index > start {
-		gap = int(shred.Index - start)
-	}
-	ask := gap
-	if ask > repairMaxFollowupRequests {
-		ask = repairMaxFollowupRequests
-	}
-	chainProbe := !shred.LastInSlot() && shred.Index < maxDataShredsPerSlot-1
-	if chainProbe {
-		ask++
-	}
-	if ask == 0 {
-		return true
-	}
-	// Followups draw from the SAME token bucket as the scan. This path used
-	// to be unmetered — with hundreds of probed slots it pushed the total
-	// send rate ~70% past the cap, which is exactly the flood the peer-side
-	// QoS ban punishes. When the bucket is dry the scan's deficit-aware
-	// selection covers the slot on its own cadence.
-	grant := c.takeRateTokens(ask)
-	if grant <= 0 {
-		return true
-	}
-	windowBudget := grant
-	if chainProbe && windowBudget > 0 {
-		windowBudget-- // reserve the chained probe's token
-	}
-	// Discovery followups are bulk-paced and go through the same inflight
-	// dedup as the scan, so a window index already being repaired is not
-	// re-sent here.
-	bulk := bulkPolicy()
-	acct := c.accountingTimeout()
-	followups := 0
-	for index := start; index < shred.Index && followups < windowBudget; index++ {
-		if c.sendShredAttempt(conn, peers, repairRequestWindowIndex, shred.Slot, index, bulk, acct) {
-			followups++
-		}
-	}
-	if chainProbe && followups < grant {
-		if c.sendShredAttempt(conn, peers, repairRequestHighestWindowIndex, shred.Slot, shred.Index+1, bulk, acct) {
-			followups++
-		}
-	}
-	c.returnRateTokens(grant - followups)
-	return true
+	return true, outstanding.key.kind == repairRequestHighestWindowIndex
 }
 
 // observeLatencyLocked folds one request->response latency into the EWMA and
@@ -760,7 +767,7 @@ func bulkPolicy() retryPolicy {
 // satisfyDataShred retires WindowIndex requests satisfied by a verified data
 // shred arriving through any path: a matched repair response, Turbine
 // broadcast, FEC/spool hydration, or a duplicate response. Request nonce
-// matching still happens first in observeShredResponse so the answering peer
+// matching still happens first in matchShredResponse so the answering peer
 // receives its proper timely/late credit.
 func (c *repairClient) satisfyDataShred(shred *Shred) {
 	if c == nil || shred == nil || shred.Type != ShredTypeData {
@@ -889,7 +896,7 @@ func (c *repairClient) sendShredAttempt(conn *net.UDPConn, peers []gossip.Repair
 	// count), then release BEFORE signing. Ed25519 signing is ~tens of
 	// microseconds; at tens of thousands of req/s, holding the lock across it
 	// serialized every send against the response-processing path
-	// (observeShredResponse needs the same lock) and could stall the UDP
+	// (matchShredResponse needs the same lock) and could stall the UDP
 	// receive loop into kernel drops. The reserve is enough for coherence: a
 	// response for this attempt cannot arrive until after we WriteToUDP below,
 	// which is strictly after we register outstanding/byResponse.
@@ -933,7 +940,14 @@ func (c *repairClient) sendShredAttempt(conn *net.UDPConn, peers []gossip.Repair
 	c.byResponse[responseKey] = key
 	c.mu.Unlock()
 
+	var traceStart int64
+	var traceBinding entryRepairTrace
+	if entryTraceSelected(slot) {
+		traceStart = entryTraceNow()
+		traceBinding = entryRepairTrace{Peer: peer.Addr.String(), Nonce: nonce}
+	}
 	if _, err := conn.WriteToUDP(packet, peer.Addr); err != nil {
+		traceRepairSend(slot, index, kind, attempt, traceStart, false, traceBinding)
 		c.mu.Lock()
 		delete(c.outstanding, key)
 		delete(c.byResponse, responseKey)
@@ -944,6 +958,7 @@ func (c *repairClient) sendShredAttempt(conn *net.UDPConn, peers []gossip.Repair
 		return false
 	}
 
+	traceRepairSend(slot, index, kind, attempt, traceStart, true, traceBinding)
 	c.requests.Add(1)
 	return true
 }
@@ -1505,4 +1520,20 @@ func (c *repairClient) stats() RepairStats {
 		TimeoutMillis:     int64(time.Duration(c.timeoutNanos.Load()) / time.Millisecond),
 		AvgResponseMillis: avgResponseMillis,
 	}
+}
+
+// Called after normal priority and freshness work. Existing in-flight child
+// requests count against lookahead capacity; no fanout or highest-index probes.
+func (c *repairClient) sendChildRepair(conn *net.UDPConn, peers []gossip.RepairPeer, req SlotRepairRequest, budget int, acct time.Duration) int {
+	if budget <= 0 {
+		return 0
+	}
+	c.mu.Lock()
+	room := childRepairLimit - c.outstandingForSlotLocked(req.Slot)
+	c.mu.Unlock()
+	if room <= 0 {
+		return 0
+	}
+	req.NeedHighestDataShred = false
+	return c.sendTier(conn, peers, []SlotRepairRequest{req}, min(room, budget), nil, acct)
 }

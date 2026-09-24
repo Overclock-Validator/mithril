@@ -1111,10 +1111,16 @@ func (ip *Interpreter) translateInputRegion(offset, size uint64, write bool) (un
 	// same idea as Agave's MappingCache). Only the currently mapped
 	// RegionSize bytes are exposed; anything beyond takes the slow path
 	// again so that OnWrite / growth semantics are preserved.
-	if region.RegionSize != 0 && (region.Data == nil || uint64(len(region.Data)) >= region.RegionSize) {
-		cached := memRegion{base: base, start: region.Offset, rlen: region.RegionSize, gapShift: 63}
+	cacheLen := region.RegionSize
+	if region.Data == nil {
+		cacheLen = min(cacheLen, uint64(len(ip.input))-region.HostOffset)
+	} else {
+		cacheLen = min(cacheLen, uint64(len(region.Data)))
+	}
+	if cacheLen != 0 {
+		cached := memRegion{base: base, start: region.Offset, rlen: cacheLen, gapShift: 63}
 		if region.Writable {
-			cached.wlen = region.RegionSize
+			cached.wlen = cacheLen
 		}
 		ip.regions[VaddrInput>>32] = cached
 	}

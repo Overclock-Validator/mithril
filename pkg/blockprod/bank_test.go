@@ -819,3 +819,74 @@ func TestControllerWorkingBank(t *testing.T) {
 	controller.SetWorkingBank(env.Bank)
 	assert.Equal(t, env.Bank, controller.WorkingBank())
 }
+
+func TestWorkingBankSerializationFailureDoesNotCommit(t *testing.T) {
+	for _, mode := range []string{"ordinary", "prepared"} {
+		t.Run(mode, func(t *testing.T) {
+			sink := &captureSink{}
+			env := NewTestEnv(TestEnvConfig{Sink: sink})
+			defer env.Close()
+			env.SlotCtx.Features.EnableFeature(features.EnableTxV1, 0)
+			env.Bank.preparer = replay.NewTransactionPreparer(env.SlotCtx.Features)
+			tx := mustSignedTransfer(t, 1)
+			_, err := tx.Message.SetVersion(solana.MessageVersionV1)
+			require.NoError(t, err)
+			wire, err := tx.MarshalBinary()
+			require.NoError(t, err)
+			prepared := env.Bank.preparer.Prepare(tx)
+			if mode == "prepared" {
+				require.NotNil(t, prepared)
+			}
+			// Inject a malformed signature list after static preparation to
+			// ensure that even the prepared path cannot skip full-wire validation.
+			// The message is unchanged and serializable, but the full V1 wire
+			// cannot encode more signatures than the message header declares.
+			tx.Signatures = append(tx.Signatures, solana.Signature{1})
+			_, err = replay.TransactionMessageHash(tx)
+			require.NoError(t, err)
+			_, err = tx.MarshalBinary()
+			require.ErrorContains(t, err, "signatures but header requires")
+			payer, err := env.SlotCtx.GetAccount(txfixture.PayerPubkey())
+			require.NoError(t, err)
+			dest, err := env.SlotCtx.GetAccount(txfixture.DestPubkey())
+			require.NoError(t, err)
+			payerBalance, destBalance := payer.Lamports, dest.Lamports
+			hash := env.Bank.EntryHash()
+			require.Equal(t, costmodel.ExceedNone, env.Bank.PrepareSchedule(len(wire)))
+			require.Positive(t, env.Bank.EntryBuilder().ReservedBytes())
+			var result ForgeResult
+			var reason costmodel.ExceedReason
+			if mode == "prepared" {
+				result, reason = env.Bank.ForgePreparedTransaction(tx, len(wire), prepared)
+			} else {
+				result, reason = env.Bank.ForgeTransaction(tx, len(wire))
+			}
+			require.Equal(t, ForgeDroppedParse, result)
+			require.Equal(t, costmodel.ExceedNone, reason)
+			payer, err = env.SlotCtx.GetAccount(txfixture.PayerPubkey())
+			require.NoError(t, err)
+			dest, err = env.SlotCtx.GetAccount(txfixture.DestPubkey())
+			require.NoError(t, err)
+			require.Equal(t, payerBalance, payer.Lamports)
+			require.Equal(t, destBalance, dest.Lamports)
+			require.Zero(t, env.Bank.TxFeeAccumulator().TotalFees)
+			require.Zero(t, env.Bank.CostTracker().BlockCost())
+			require.Zero(t, env.Bank.NumSignatures())
+			require.Empty(t, env.Bank.ForgedTransactions())
+			require.Empty(t, env.Bank.seenMessages)
+			require.Empty(t, env.SlotCtx.ModifiedAccts)
+			require.Zero(t, env.Bank.EntryBuilder().PendingCount())
+			require.Zero(t, env.Bank.EntryBuilder().ReservedBytes())
+			require.Zero(t, env.Bank.EntryBytes())
+			require.Equal(t, hash, env.Bank.EntryHash())
+			require.Empty(t, sink.batches)
+			// The same message remains eligible after correcting the wire.
+			tx.Signatures = tx.Signatures[:1]
+			result, reason = env.Bank.ForgeTransaction(tx, len(wire))
+			require.Equal(t, ForgeAccepted, result)
+			require.Equal(t, costmodel.ExceedNone, reason)
+			require.Zero(t, env.Bank.EntryBuilder().ReservedBytes())
+			require.Equal(t, 1, env.Bank.EntryBuilder().PendingCount())
+		})
+	}
+}

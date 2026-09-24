@@ -105,29 +105,44 @@ func (b *EntryBuilder) dropReservation() {
 // transaction would overflow the configured batch target. A short leftover is only emitted by
 // Flush (slot end / Freeze). Appended transactions must remain immutable.
 func (b *EntryBuilder) Append(tx solana.Transaction, wireSize int) ([]turbine.Entry, int, bool) {
-	// Canonical component bytes may differ from a transport-size hint. Measure
-	// once per transaction and reuse the count at flush, preserving slot budgets.
+	serializedSize, err := serializedTransactionSize(&tx)
+	if err != nil {
+		return nil, 0, false
+	}
+	return b.appendSerialized(tx, wireSize, serializedSize)
+}
+
+// serializedTransactionSize validates the complete transaction, not just its
+// message. In particular, v1 signature-count errors surface only here.
+func serializedTransactionSize(tx *solana.Transaction) (int, error) {
 	wire, err := tx.MarshalBinary()
 	if err != nil {
 		_ = statsd.Count(statsd.BlockProductionEntrySerializationErrors, 1, nil)
-		mlog.Log.Errorf("entry builder: cannot serialize applied transaction: %v", err)
-		return nil, 0, false
+		mlog.Log.Errorf("entry builder: cannot serialize transaction: %v", err)
+		return 0, err
 	}
+	return len(wire), nil
+}
+
+// appendSerialized cannot fail after bank state is applied: the caller has
+// already serialized this exact transaction and must keep it immutable. Keep
+// canonical component size separate from the transport reservation-size hint.
+func (b *EntryBuilder) appendSerialized(tx solana.Transaction, wireSize, serializedSize int) ([]turbine.Entry, int, bool) {
 	if wireSize <= 0 {
-		wireSize = len(wire)
+		wireSize = serializedSize
 	}
 
 	b.consumeReserved(wireSize)
-	if b.wouldOverflowBatch(len(wire)) {
+	if b.wouldOverflowBatch(serializedSize) {
 		flushed, batchBytes := b.flushLocked()
 		b.pendingTxns = append(b.pendingTxns[:0], tx)
-		b.pendingSerializedBytes = len(wire)
+		b.pendingSerializedBytes = serializedSize
 		b.pendingWire = wireSize
 		return flushed, batchBytes, true
 	}
 
 	b.pendingTxns = append(b.pendingTxns, tx)
-	b.pendingSerializedBytes += len(wire)
+	b.pendingSerializedBytes += serializedSize
 	b.pendingWire += wireSize
 	return nil, 0, false
 }

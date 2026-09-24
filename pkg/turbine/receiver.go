@@ -208,6 +208,9 @@ func (r *UDPReceiver) SetRepairPeerSource(identity ed25519.PrivateKey, source fu
 		return err
 	}
 	r.repairClient = client
+	r.assembler.mu.Lock()
+	r.assembler.streamRepairWake = client.priorityWake
+	r.assembler.mu.Unlock()
 	return nil
 }
 
@@ -379,14 +382,40 @@ func (r *UDPReceiver) PrioritizeRepairSlot(slot uint64) {
 	if r == nil || r.assembler == nil {
 		return
 	}
-	r.assembler.PrioritizeRepairSlot(slot)
+	r.PrioritizeRepairRange(slot, slot)
 }
 
 func (r *UDPReceiver) PrioritizeRepairRange(start, end uint64) {
 	if r == nil || r.assembler == nil {
 		return
 	}
-	r.assembler.PrioritizeRepairRange(start, end)
+	if r.assembler.prioritizeRepairRange(start, end) && r.repairClient != nil {
+		r.repairClient.wakePriority()
+	}
+}
+
+// SubscribeStream installs the streaming-execution feed subscriber on this
+// receiver's assembler (see stream.go). Only one subscriber is supported.
+func (r *UDPReceiver) SubscribeStream(ch chan<- StreamEvent) {
+	r.assembler.SubscribeStream(ch)
+}
+
+// StreamStatusOf reports whether a streaming generation is still the slot's
+// current assembly, completed into a block, or gone.
+func (r *UDPReceiver) StreamStatusOf(g StreamGeneration) StreamStatus {
+	return r.assembler.StreamStatusOf(g)
+}
+
+// StreamDroppedEvents reports feed wake-ups dropped because the subscriber
+// was full; the subscriber recovers through PendingStreamBatches.
+func (r *UDPReceiver) StreamDroppedEvents() uint64 {
+	return r.assembler.StreamDroppedEvents()
+}
+
+// PendingStreamBatches returns the generation's decoded batches starting at
+// or after fromStart, in shred-index order.
+func (r *UDPReceiver) PendingStreamBatches(g StreamGeneration, fromStart uint32) []*StreamBatch {
+	return r.assembler.PendingStreamBatches(g, fromStart)
 }
 
 func (r *UDPReceiver) Blocks() <-chan *block.Block {
@@ -726,9 +755,9 @@ func (r *UDPReceiver) processPacket(ctx context.Context, conn *net.UDPConn, pack
 		}
 		authenticatedRoot = &root
 	}
-	matchedRepair := false
+	matchedRepair, highestRepair := false, false
 	if onRepairSocket && r.repairClient != nil {
-		matchedRepair = r.repairClient.observeShredResponse(conn, packet, addr, shred)
+		matchedRepair, highestRepair = r.repairClient.matchShredResponse(packet, addr, shred)
 	}
 	if onRepairSocket && !matchedRepair {
 		r.repairSocketUnmatched.Add(1)
@@ -789,6 +818,9 @@ func (r *UDPReceiver) processPacket(ctx context.Context, conn *net.UDPConn, pack
 		}
 		return true
 	}
+	if highestRepair {
+		r.repairClient.followupHighestResponse(conn, r.assembler, shred.Slot)
+	}
 	return r.submitCompletion(ctx, work, false)
 }
 
@@ -815,16 +847,18 @@ func (r *UDPReceiver) submitCompletion(ctx context.Context, work *slotCompletion
 	}
 	r.slotResetMu.RUnlock()
 	return r.handleCompletionResult(ctx, slotCompletionResult{
-		block:    blk,
-		err:      err,
-		hydrated: hydrated,
-		pending:  pending,
+		generation: StreamGeneration{slot: work.state.slot, state: work.state},
+		block:      blk,
+		err:        err,
+		hydrated:   hydrated,
+		pending:    pending,
 	})
 }
 
 func (r *UDPReceiver) consumeCompletionResults(ctx context.Context, results <-chan slotCompletionResult) {
 	for result := range results {
 		if ctx.Err() != nil {
+			r.assembler.cancelUndeliveredStream(result.generation)
 			if result.pending && result.block != nil {
 				r.finishPendingBlock(result.block.Slot)
 			}
@@ -852,10 +886,16 @@ func (r *UDPReceiver) handleCompletionResult(ctx context.Context, result slotCom
 	if result.hydrated {
 		r.hydratedFromDisk.Add(1)
 	}
+	var emitted bool
 	if result.pending {
-		return r.emitPendingAssembled(ctx, result.block)
+		emitted = r.emitPendingAssembled(ctx, result.block)
+	} else {
+		emitted = r.emitAssembled(ctx, result.block)
 	}
-	return r.emitAssembled(ctx, result.block)
+	if !emitted {
+		r.assembler.cancelUndeliveredStream(result.generation)
+	}
+	return emitted
 }
 
 // skipAssemblyForSpool implements the catchup RAM policy: with a hydration
@@ -958,5 +998,17 @@ func (r *UDPReceiver) hydrateLoop(ctx context.Context) {
 			default:
 			}
 		}
+	}
+}
+
+// PrioritizeStreamRepair also anchors bounded asynchronous child lookahead.
+func (r *UDPReceiver) PrioritizeStreamRepair(g StreamGeneration) {
+	if r == nil || r.assembler == nil {
+		return
+	}
+	r.assembler.SetStreamRepairParent(g)
+	slot := g.Slot()
+	if slot != 0 {
+		r.PrioritizeRepairSlot(slot)
 	}
 }

@@ -23,6 +23,7 @@ type entryTraceSettings struct {
 	modulo  uint64
 	until   time.Time
 	reports chan entryPipelineReport
+	repairs chan entryRepairTrace
 }
 
 func configureEntryTrace() entryTraceSettings {
@@ -44,18 +45,27 @@ func configureEntryTrace() entryTraceSettings {
 		return entryTraceSettings{}
 	}
 	ch := make(chan entryPipelineReport, 8)
+	repairs := make(chan entryRepairTrace, 256)
 	go func() {
 		defer f.Close()
 		enc := json.NewEncoder(f)
-		for r := range ch {
-			r.Dropped = entryTraceDropped.Load()
-			r.finish()
-			if err := enc.Encode(r); err != nil {
-				entryTraceDropped.Add(1)
+		for {
+			select {
+			case r := <-repairs:
+				r.Dropped = entryTraceDropped.Load()
+				if err := enc.Encode(r); err != nil {
+					entryTraceDropped.Add(1)
+				}
+			case r := <-ch:
+				r.Dropped = entryTraceDropped.Load()
+				r.finish()
+				if err := enc.Encode(r); err != nil {
+					entryTraceDropped.Add(1)
+				}
 			}
 		}
 	}()
-	return entryTraceSettings{n, time.Now().Add(time.Duration(seconds) * time.Second), ch}
+	return entryTraceSettings{modulo: n, until: time.Now().Add(time.Duration(seconds) * time.Second), reports: ch, repairs: repairs}
 }
 
 func entryTraceNow() int64             { return time.Since(entryTraceOrigin).Nanoseconds() }
@@ -75,13 +85,14 @@ func entryTraceContext(ctx context.Context) bool {
 
 type entryPipelineTrace struct {
 	arrivals   map[uint32]int64
+	sources    map[uint32]entryShredSource
 	discovered map[uint32]int64
 	sealed     bool // frozen at first completion claim, including retry/error paths
 }
 
 // Called only after successful admission, under the assembler lock. Includes
 // FEC-reconstructed data. This is local availability, not a NIC timestamp.
-func (s *slotState) traceAcceptedShred(sh *Shred) {
+func (s *slotState) traceAcceptedShred(sh *Shred, source ...entryShredSource) {
 	if sh.Type != ShredTypeData {
 		return
 	}
@@ -93,7 +104,16 @@ func (s *slotState) traceAcceptedShred(sh *Shred) {
 		s.pipelineTrace = &entryPipelineTrace{arrivals: make(map[uint32]int64), discovered: make(map[uint32]int64)}
 	}
 	if !s.pipelineTrace.sealed {
+		if _, exists := s.pipelineTrace.arrivals[sh.Index]; exists {
+			return
+		}
 		s.pipelineTrace.arrivals[sh.Index] = entryTraceNow()
+		if len(source) > 0 {
+			if s.pipelineTrace.sources == nil {
+				s.pipelineTrace.sources = make(map[uint32]entryShredSource)
+			}
+			s.pipelineTrace.sources[sh.Index] = source[0]
+		}
 	}
 }
 
@@ -125,6 +145,9 @@ func (t *entryVerificationTrace) observe(j *transactionVerifyJob) {
 }
 
 type entryBatchTraceReport struct {
+	CriticalIndex     *uint32                 `json:"critical_shred_index,omitempty"`
+	CriticalSource    *entryShredSource       `json:"critical_shred_source,omitempty"`
+	CriticalTies      int                     `json:"critical_timestamp_ties"`
 	Start             uint32                  `json:"start"`
 	End               uint32                  `json:"end"`
 	Transactions      int                     `json:"transactions"`
@@ -190,7 +213,18 @@ func (r *entryPipelineReport) finish() {
 			if !ok {
 				row.AvailabilityKnown = false
 			}
-			row.Available = max(row.Available, at)
+			if ok && (row.CriticalIndex == nil || at > row.Available) {
+				index := i
+				row.CriticalIndex = &index
+				row.CriticalTies = 1
+				row.CriticalSource = nil
+				if source, exists := r.source.sources[i]; exists {
+					row.CriticalSource = &source
+				}
+				row.Available = at
+			} else if ok && at == row.Available {
+				row.CriticalTies++
+			}
 		}
 		r.Batches = append(r.Batches, row)
 	}
@@ -209,4 +243,91 @@ func queueEntryPipelineReport(s *slotState, b *block.Block, d *entryDecodeTiming
 	default:
 		entryTraceDropped.Add(1)
 	}
+}
+
+// Attribution starts at assembler entry, not socket receipt.
+// "non_repair" includes direct/spooled admission, not proof of socket origin.
+// A recovered shred records the packet that triggered reconstruction; it is not itself a
+// received repair response. Missing source fields in older reports mean unknown.
+type entryShredSource struct {
+	Path             string `json:"path"`
+	FEC              uint32 `json:"fec_set"`
+	TriggerIndex     uint32 `json:"trigger_index"`
+	TriggerCoding    bool   `json:"trigger_coding"`
+	TriggerRepair    bool   `json:"trigger_repair"`
+	AdmissionEntered int64  `json:"admission_entered_ns"`
+}
+
+// Separate JSONL records join by origin/slot/index. The time pair brackets the
+// UDP write syscall, NOT delivery. Attempt IDs can reset; order by timestamps.
+// Highest-index probes are not exact requests for the returned shred index.
+type entryRepairTrace struct {
+	AdmissionStart int64  `json:"admission_start_ns,omitempty"`
+	Peer           string `json:"peer,omitempty"`
+	Nonce          uint32 `json:"nonce"`
+	ResponseAt     int64  `json:"response_ns,omitempty"`
+	RequestedAt    int64  `json:"requested_ns,omitempty"`
+	ReturnedIndex  uint32 `json:"returned_index"`
+	Late           bool   `json:"late"`
+	FEC            uint32 `json:"fec_set"`
+	DeficitBefore  int    `json:"deficit_before"`
+	DeficitAfter   int    `json:"deficit_after"`
+	Recovered      int    `json:"recovered"`
+	Outcome        string `json:"outcome,omitempty"`
+	Event          string `json:"event"`
+	Origin         int64  `json:"origin_unix_ns"`
+	Slot           uint64 `json:"slot"`
+	Index          uint32 `json:"index"`
+	Highest        bool   `json:"highest_index_probe"`
+	Attempt        uint8  `json:"attempt"`
+	SendStart      int64  `json:"send_start_ns"`
+	SendEnd        int64  `json:"send_end_ns"`
+	Success        bool   `json:"success"`
+	Dropped        uint64 `json:"dropped_reports"`
+}
+
+func entryTraceSelected(slot uint64) bool {
+	c := entryTraceConfig
+	return c.modulo != 0 && slot%c.modulo == 0 && time.Now().Before(c.until)
+}
+func traceRepairSend(slot uint64, index uint32, kind repairRequestKind, attempt uint8, start int64, success bool, binding ...entryRepairTrace) {
+	if start == 0 || entryTraceConfig.repairs == nil {
+		return
+	}
+	r := entryRepairTrace{Event: "repair_send", Origin: entryTraceOrigin.UnixNano(), Slot: slot, Index: index, Highest: kind == repairRequestHighestWindowIndex, Attempt: attempt, SendStart: start, SendEnd: entryTraceNow(), Success: success}
+	if len(binding) > 0 {
+		r.Peer = binding[0].Peer
+		r.Nonce = binding[0].Nonce
+	}
+	emitRepairTrace(r)
+}
+
+func emitRepairTrace(r entryRepairTrace) {
+	if entryTraceConfig.repairs == nil {
+		return
+	}
+	select {
+	case entryTraceConfig.repairs <- r:
+	default:
+		entryTraceDropped.Add(1)
+	}
+}
+
+// -1 means no authenticated coding layout is known. Zero means sufficient
+// shards, not that reconstruction necessarily succeeded (see outcome/recovered).
+func traceFECDeficit(s *slotState, index uint32) int {
+	if s == nil {
+		return -1
+	}
+	f := s.fecSets[index]
+	if f == nil || !f.haveLayout {
+		return -1
+	}
+	return max(0, int(f.layout.dataShreds)-len(f.data)-len(f.coding))
+}
+func traceRepairResponse(rec outstandingRepairRequest, sh *Shred, peer string, late bool) {
+	if !entryTraceSelected(sh.Slot) {
+		return
+	}
+	emitRepairTrace(entryRepairTrace{Event: "repair_response", Origin: entryTraceOrigin.UnixNano(), Slot: sh.Slot, Index: rec.key.index, Highest: rec.key.kind == repairRequestHighestWindowIndex, Attempt: rec.key.attempt, Nonce: rec.nonce, Peer: peer, RequestedAt: entryTraceTime(rec.sentAt), ResponseAt: entryTraceNow(), ReturnedIndex: sh.Index, FEC: sh.FECSetIndex, Late: late})
 }

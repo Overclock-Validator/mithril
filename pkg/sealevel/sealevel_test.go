@@ -3,6 +3,7 @@ package sealevel
 import (
 	"bytes"
 	_ "embed"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -75,6 +76,7 @@ func TestInterpreter_Noop(t *testing.T) {
 		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	require.NoError(t, err)
@@ -107,13 +109,16 @@ func TestInterpreter_Memcpy_Strings_Match(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		Syscalls:     ToFunc(syscalls),
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	assert.Equal(t, log.Logs, []string{
@@ -145,14 +150,17 @@ func TestInterpreter_Memcpy_Do_Not_Match(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     ToFunc(syscalls),
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	assert.Equal(t, log.Logs, []string{
@@ -183,14 +191,17 @@ func TestInterpreter_Memmove_Strings_Match(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     ToFunc(syscalls),
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	assert.Equal(t, log.Logs, []string{
@@ -222,14 +233,17 @@ func TestInterpreter_Memmove_Do_Not_Match(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     ToFunc(syscalls),
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	assert.Equal(t, log.Logs, []string{
@@ -259,14 +273,17 @@ func TestInterpreter_Memcpy_Overlapping(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     ToFunc(syscalls),
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 
@@ -297,14 +314,17 @@ func TestInterpreter_Memcmp_Matches(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     ToFunc(syscalls),
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	require.NoError(t, err)
@@ -338,14 +358,17 @@ func TestInterpreter_Memcmp_Does_Not_Match(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     ToFunc(syscalls),
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	require.NoError(t, err)
@@ -379,14 +402,17 @@ func TestInterpreter_Memset_Check_Correct(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     ToFunc(syscalls),
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	require.NoError(t, err)
@@ -429,6 +455,7 @@ func TestInterpreter_Sha256(t *testing.T) {
 		ComputeMeter: &ctx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	require.NoError(t, err)
@@ -462,14 +489,17 @@ func TestInterpreter_Blake3(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     ToFunc(syscalls),
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	require.NoError(t, err)
@@ -503,14 +533,17 @@ func TestInterpreter_Keccak256(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     ToFunc(syscalls),
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	require.NoError(t, err)
@@ -545,14 +578,17 @@ func TestInterpreter_CreateProgramAddress(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     ToFunc(syscalls),
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	require.NoError(t, err)
@@ -590,14 +626,17 @@ func TestInterpreter_TryFindProgramAddress(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     ToFunc(syscalls),
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	require.NoError(t, err)
@@ -628,18 +667,24 @@ func TestInterpreter_TestPanic(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: ToFunc(syscalls),
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     ToFunc(syscalls),
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	require.Error(t, err)
-	assert.Equal(t, err.Error(), "exception at 16: SBF program Panicked in some_file_1234.c at 1337:10")
+	require.Contains(t, err.Error(), "SBF program Panicked in some_file_1234.c at 1337:10")
+	var exception *sbpf.Exception
+	require.ErrorAs(t, err, &exception)
+	require.Equal(t, int64(17), exception.PC)
 }
 
 func TestInterpreter_Secp256k1_Syscall(t *testing.T) {
@@ -659,14 +704,17 @@ func TestInterpreter_Secp256k1_Syscall(t *testing.T) {
 
 	var log LogRecorder
 
+	execCtx := &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()}
 	interpreter := sbpf.NewInterpreter(program, &sbpf.VMOpts{
-		HeapMax:  32 * 1024,
-		Input:    nil,
-		MaxCU:    10000,
-		Syscalls: syscalls,
-		Context:  &ExecutionCtx{Log: &log, ComputeMeter: cu.NewComputeMeterDefault()},
+		HeapMax:      32 * 1024,
+		Input:        nil,
+		MaxCU:        10000,
+		Syscalls:     syscalls,
+		Context:      execCtx,
+		ComputeMeter: &execCtx.ComputeMeter,
 	})
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	require.NoError(t, err)
@@ -737,7 +785,7 @@ func TestInterpreter_Get_Stack_Height_Syscall(t *testing.T) {
 	err = execCtx.Accounts.SetAccount(&pk, &programDataAcct)
 	assert.NoError(t, err)
 
-	execCtx.SlotCtx = new(SlotCtx)
+	initializeLegacyBankFixture(t, &execCtx)
 	execCtx.SlotCtx.Slot = 1337
 
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
@@ -809,7 +857,7 @@ func TestInterpreter_ReturnData_Syscalls(t *testing.T) {
 	err = execCtx.Accounts.SetAccount(&pk, &programDataAcct)
 	assert.NoError(t, err)
 
-	execCtx.SlotCtx = new(SlotCtx)
+	initializeLegacyBankFixture(t, &execCtx)
 	execCtx.SlotCtx.Slot = 1337
 
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
@@ -894,130 +942,11 @@ func TestInterpreter_Poseidon_Syscall(t *testing.T) {
 	err = execCtx.Accounts.SetAccount(&pk, &programDataAcct)
 	assert.NoError(t, err)
 
-	execCtx.SlotCtx = new(SlotCtx)
+	initializeLegacyBankFixture(t, &execCtx)
 	execCtx.SlotCtx.Slot = 1337
 
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, nil, err)
-}
-
-func TestInterpreter_Get_Sysvar_Syscalls(t *testing.T) {
-	// program data account
-	programDataPrivKey, err := solana.NewRandomPrivateKey()
-	assert.NoError(t, err)
-	programDataPubkey := programDataPrivKey.PublicKey()
-	programDataAcctState := UpgradeableLoaderState{Type: UpgradeableLoaderStateTypeProgramData, ProgramData: UpgradeableLoaderStateProgramData{Slot: 0, UpgradeAuthorityAddress: nil}}
-	validProgramBytes := fixtures.Load(t, "sbpf", "sysvars.so")
-	programDataStateWriter := new(bytes.Buffer)
-	programDataStateEncoder := bin.NewBinEncoder(programDataStateWriter)
-	err = programDataAcctState.MarshalWithEncoder(programDataStateEncoder)
-	assert.NoError(t, err)
-	programDataStateWriter.Write(validProgramBytes)
-	programDataStateBytes := make([]byte, len(validProgramBytes)+upgradeableLoaderSizeOfProgramDataMetaData)
-	copy(programDataStateBytes, programDataStateWriter.Bytes())
-	copy(programDataStateBytes[upgradeableLoaderSizeOfProgramDataMetaData:], validProgramBytes)
-
-	programDataAcct := accounts.Account{Key: programDataPubkey, Lamports: 0, Data: programDataStateBytes, Owner: a.BpfLoaderUpgradeableAddr, Executable: false, RentEpoch: 100}
-
-	// program account
-	programAcctState := UpgradeableLoaderState{Type: UpgradeableLoaderStateTypeProgram, Program: UpgradeableLoaderStateProgram{ProgramDataAddress: programDataAcct.Key}}
-	programWriter := new(bytes.Buffer)
-	programEncoder := bin.NewBinEncoder(programWriter)
-	err = programAcctState.MarshalWithEncoder(programEncoder)
-	assert.NoError(t, err)
-	programBytes := programWriter.Bytes()
-	programPrivKey, err := solana.NewRandomPrivateKey()
-	assert.NoError(t, err)
-	programPubkey := programPrivKey.PublicKey()
-	programData := make([]byte, 5000)
-	copy(programData, programBytes)
-	programAcct := accounts.Account{Key: programPubkey, Lamports: 10000, Data: programData, Owner: a.BpfLoaderUpgradeableAddr, Executable: true, RentEpoch: 100}
-
-	instrData := make([]byte, 0)
-
-	transactionAccts := NewTransactionAccounts([]accounts.Account{programAcct})
-
-	acctMetas := []AccountMeta{{Pubkey: programAcct.Key, IsSigner: false, IsWritable: false}}
-
-	instructionAccts := InstructionAcctsFromAccountMetas(acctMetas, *transactionAccts)
-
-	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
-	var log LogRecorder
-	execCtx := ExecutionCtx{Log: &log, TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeter(10000000000)}
-
-	execCtx.Accounts = accounts.NewMemAccounts()
-	var clock SysvarClock
-	clock.Slot = 1234
-	clock.Epoch = 1111
-	clock.EpochStartTimestamp = 2222
-	clock.UnixTimestamp = 3
-	clock.LeaderScheduleEpoch = 100000
-	clockAcct := accounts.Account{}
-	clockAcct.Lamports = 1
-	execCtx.Accounts.SetAccount(&SysvarClockAddr, &clockAcct)
-	WriteClockSysvar(&execCtx.Accounts, clock)
-
-	var rent SysvarRent
-	rent.LamportsPerUint8Year = 12
-	rent.ExemptionThreshold = 34
-	rent.BurnPercent = 56
-
-	rentAcct := accounts.Account{}
-	rentAcct.Lamports = 1
-	execCtx.Accounts.SetAccount(&SysvarRentAddr, &rentAcct)
-	WriteRentSysvar(&execCtx.Accounts, rent)
-
-	var epochSchedule SysvarEpochSchedule
-	epochSchedule.SlotsPerEpoch = 1111
-	epochSchedule.LeaderScheduleSlotOffset = 2222
-	epochSchedule.Warmup = true
-	epochSchedule.FirstNormalEpoch = 4444
-	epochSchedule.FirstNormalSlot = 5555
-
-	epochScheduleAcct := accounts.Account{}
-	epochScheduleAcct.Lamports = 1
-	execCtx.Accounts.SetAccount(&SysvarEpochScheduleAddr, &epochScheduleAcct)
-	WriteEpochScheduleSysvar(&execCtx.Accounts, epochSchedule)
-
-	var lastRestartSlot SysvarLastRestartSlot
-	lastRestartSlot.LastRestartSlot = 989898
-	lastRestartSlotAcct := accounts.Account{}
-	lastRestartSlotAcct.Lamports = 1
-	execCtx.Accounts.SetAccount(&SysvarLastRestartSlotAddr, &lastRestartSlotAcct)
-	WriteLastRestartSlotSysvar(&execCtx.Accounts, lastRestartSlot)
-
-	var epochRewards SysvarEpochRewards
-	epochRewards.DistributionStartingBlockHeight = 1234
-	epochRewards.NumPartitions = 4321
-	copy(epochRewards.ParentBlockhash[:], "abaaaaaaaaaaaaaaaaaaaaaaaaaaaada")
-	epochRewards.TotalPoints.Lo = 0xffffffffffffffff
-	epochRewards.TotalPoints.Hi = 0xeeeeeeeeeeeeeeee
-	epochRewards.TotalRewards = 5656
-	epochRewards.DistributedRewards = 6767
-	epochRewards.Active = false
-	epochRewardsAcct := accounts.Account{}
-	epochRewardsAcct.Lamports = 1
-	execCtx.Accounts.SetAccount(&SysvarEpochRewardsAddr, &epochRewardsAcct)
-	WriteEpochRewardsSysvar(&execCtx.Accounts, epochRewards)
-
-	f := features.NewFeaturesDefault()
-	f.EnableFeature(features.LastRestartSlotSysvar, 0)
-	f.EnableFeature(features.EnablePartitionedEpochReward, 0)
-	execCtx.Features = *f
-
-	pk := [32]byte(programDataAcct.Key)
-	err = execCtx.Accounts.SetAccount(&pk, &programDataAcct)
-	assert.NoError(t, err)
-
-	execCtx.SlotCtx = new(SlotCtx)
-	execCtx.SlotCtx.Slot = 1337
-
-	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
-	assert.Equal(t, nil, err)
-
-	for _, l := range log.Logs {
-		fmt.Printf("log: %s\n", l)
-	}
 }
 
 func TestInterpreter_AltBn128_Ops_Syscall(t *testing.T) {
@@ -1064,7 +993,7 @@ func TestInterpreter_AltBn128_Ops_Syscall(t *testing.T) {
 	var log LogRecorder
 	execCtx := ExecutionCtx{Log: &log, TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeter(10000000000)}
 
-	execCtx.SlotCtx = new(SlotCtx)
+	initializeLegacyBankFixture(t, &execCtx)
 	execCtx.SlotCtx.Slot = 1337
 
 	execCtx.SlotCtx.Accounts = accounts.NewMemAccounts()
@@ -1190,7 +1119,7 @@ func TestInterpreter_Alloc_Free_Syscall(t *testing.T) {
 	err = execCtx.Accounts.SetAccount(&pk, &programDataAcct)
 	assert.NoError(t, err)
 
-	execCtx.SlotCtx = new(SlotCtx)
+	initializeLegacyBankFixture(t, &execCtx)
 	execCtx.SlotCtx.Slot = 1337
 
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
@@ -1254,7 +1183,7 @@ func TestInterpreter_Alt_Bn128_Compression_Syscall(t *testing.T) {
 	err = execCtx.Accounts.SetAccount(&pk, &programDataAcct)
 	assert.NoError(t, err)
 
-	execCtx.SlotCtx = new(SlotCtx)
+	initializeLegacyBankFixture(t, &execCtx)
 	execCtx.SlotCtx.Slot = 1337
 
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
@@ -1318,7 +1247,7 @@ func TestInterpreter_Validate_Point_Syscall(t *testing.T) {
 	err = execCtx.Accounts.SetAccount(&pk, &programDataAcct)
 	assert.NoError(t, err)
 
-	execCtx.SlotCtx = new(SlotCtx)
+	initializeLegacyBankFixture(t, &execCtx)
 	execCtx.SlotCtx.Slot = 1337
 
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
@@ -1382,7 +1311,7 @@ func TestInterpreter_Curve_Group_Ops_Syscall(t *testing.T) {
 	err = execCtx.Accounts.SetAccount(&pk, &programDataAcct)
 	assert.NoError(t, err)
 
-	execCtx.SlotCtx = new(SlotCtx)
+	initializeLegacyBankFixture(t, &execCtx)
 	execCtx.SlotCtx.Slot = 1337
 
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
@@ -1446,7 +1375,7 @@ func TestInterpreter_Curve_Multiscalar_Mul_Syscall(t *testing.T) {
 	err = execCtx.Accounts.SetAccount(&pk, &programDataAcct)
 	assert.NoError(t, err)
 
-	execCtx.SlotCtx = new(SlotCtx)
+	initializeLegacyBankFixture(t, &execCtx)
 	execCtx.SlotCtx.Slot = 1337
 
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
@@ -1510,7 +1439,7 @@ func TestInterpreter_Log_Data_Syscall(t *testing.T) {
 	err = execCtx.Accounts.SetAccount(&pk, &programDataAcct)
 	assert.NoError(t, err)
 
-	execCtx.SlotCtx = new(SlotCtx)
+	initializeLegacyBankFixture(t, &execCtx)
 	execCtx.SlotCtx.Slot = 1337
 
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
@@ -1585,7 +1514,7 @@ func TestInterpreter_Cpi_C_System_Program_Allocate(t *testing.T) {
 	err = execCtx.Accounts.SetAccount(&pk, &programDataAcct)
 	assert.NoError(t, err)
 
-	execCtx.SlotCtx = new(SlotCtx)
+	initializeLegacyBankFixture(t, &execCtx)
 	execCtx.SlotCtx.Slot = 1337
 
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
@@ -1665,7 +1594,7 @@ func TestInterpreter_Cpi_Rust_System_Program_Allocate(t *testing.T) {
 	err = execCtx.Accounts.SetAccount(&pk, &programDataAcct)
 	assert.NoError(t, err)
 
-	execCtx.SlotCtx = new(SlotCtx)
+	initializeLegacyBankFixture(t, &execCtx)
 	execCtx.SlotCtx.Slot = 1337
 
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
@@ -1747,7 +1676,7 @@ func TestInterpreter_Cpi_C_Bpf_Program_Call(t *testing.T) {
 	err = execCtx.Accounts.SetAccount(&pk, &programDataAcct)
 	assert.NoError(t, err)
 
-	execCtx.SlotCtx = new(SlotCtx)
+	initializeLegacyBankFixture(t, &execCtx)
 	execCtx.SlotCtx.Slot = 1337
 
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
@@ -1839,7 +1768,7 @@ func executeFirstBpfProgramAndReturnExecCtx(t *testing.T, log *LogRecorder, acct
 	err = execCtx.Accounts.SetAccount(&pk, &programDataAcct)
 	assert.NoError(t, err)
 
-	execCtx.SlotCtx = new(SlotCtx)
+	initializeLegacyBankFixture(t, &execCtx)
 	execCtx.SlotCtx.Slot = 1337
 
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
@@ -1915,14 +1844,21 @@ func TestInterpreter_Get_Processed_Sibling_Instruction_Test(t *testing.T) {
 
 	fmt.Printf("******** second program call is %s\n", programAcct.Key)
 
-	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{1})
-	assert.NoError(t, err)
+	// The introspection ELF only reads siblings; it does not invoke Allocate.
+	// Execute that preceding sibling explicitly before asking for indices 0/1.
+	allocateData := make([]byte, 12)
+	binary.LittleEndian.PutUint32(allocateData, SystemProgramInstrTypeAllocate)
+	binary.LittleEndian.PutUint64(allocateData[4:], 16)
+	allocateAccounts := InstructionAcctsFromAccountMetas([]AccountMeta{{Pubkey: acctToAlloc.Key, IsSigner: true, IsWritable: true}}, execCtx.TransactionContext.Accounts)
+	require.NoError(t, execCtx.ProcessInstruction(allocateData, allocateAccounts, []uint64{2}))
 
-	// test that the program logs from the CPI'd program (which calls get_processed_sibling_instruction)
-	// are as expected
-	expected := fmt.Sprintf("Program log: ******** sibling instruction 0 program id: %s", programAcct.Key)
+	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{1})
+	require.NoError(t, err)
+
+	// Check the introspection program reports both completed top-level siblings.
+	expected := fmt.Sprintf("Program log: ******** sibling instruction 0 program id: %s", solana.PublicKey(a.SystemProgramAddr))
 	assert.Equal(t, expected, log.Logs[1])
-	expected = fmt.Sprintf("Program log: ******** sibling instruction 0 instruction data: %s", reformatHexBytes(instrData))
+	expected = fmt.Sprintf("Program log: ******** sibling instruction 0 instruction data: %s", reformatHexBytes(allocateData))
 	assert.Equal(t, expected, log.Logs[2])
 
 	expected = fmt.Sprintf("Program log: ******** sibling instruction 1 program id: %s", firstProgramAcct.Key)
@@ -1968,7 +1904,7 @@ func TestInterpreter_Test_Memo_Program_With_LoaderV2(t *testing.T) {
 	err = execCtx.Accounts.SetAccount(&pk, &programAcct)
 	assert.NoError(t, err)
 
-	execCtx.SlotCtx = new(SlotCtx)
+	initializeLegacyBankFixture(t, &execCtx)
 	execCtx.SlotCtx.Slot = 1337
 
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
@@ -1985,7 +1921,7 @@ func TestInterpreter_Test_Memo_Program_With_LoaderV2(t *testing.T) {
 	instrData[1] = 0xff
 
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
-	assert.Equal(t, nil, err)
+	assert.Equal(t, InstrErrInvalidInstructionData, err)
 
 	expected = fmt.Sprintf("Program log: Signed by %s", signerPubkey)
 	containsExpected = strings.HasPrefix(log.Logs[2], expected)
@@ -2043,7 +1979,7 @@ func TestInterpreter_Test_Deprecated_Loader(t *testing.T) {
 	err = execCtx.Accounts.SetAccount(&pk, &programAcct)
 	assert.NoError(t, err)
 
-	execCtx.SlotCtx = new(SlotCtx)
+	initializeLegacyBankFixture(t, &execCtx)
 	execCtx.SlotCtx.Slot = 1337
 
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
@@ -2088,9 +2024,13 @@ func (e *executeCase) run(t *testing.T) {
 	tx.PushInstructionCtx(InstructionCtx{})
 	opts := tx.newVMOpts(&e.Params)
 	opts.Tracer = testLogger{t}
+	ctx := opts.Context.(*ExecutionCtx)
+	ctx.ComputeMeter = cu.NewComputeMeter(uint64(opts.MaxCU))
+	opts.ComputeMeter = &ctx.ComputeMeter
 
 	interpreter := sbpf.NewInterpreter(program, opts)
 	require.NotNil(t, interpreter)
+	defer interpreter.Finish()
 
 	_, _, err = interpreter.Run()
 	assert.NoError(t, err)
