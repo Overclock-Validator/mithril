@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
+	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/filecoin-project/go-jsonrpc"
@@ -75,8 +76,11 @@ func (rpcServer *RpcServer) GetVoteAccounts(ctx context.Context, p jsonrpc.RawPa
 			return GetVoteAccountsResp{}, err
 		}
 
-		votePubkeys := rpcServer.acctsDb.VoteAccountPubkeys()
-		// A fresh snapshot can have an empty vote cache before any vote account is read.
+		votePubkeys, err := rpcServer.acctsDb.VoteAccountPubkeys(ctx)
+		if err != nil {
+			return GetVoteAccountsResp{}, fmt.Errorf("list vote accounts: %w", err)
+		}
+		// Epoch stakes also cover stores created before the durable index was built.
 		for votePubkey := range stakes.Stakes {
 			votePubkeys = append(votePubkeys, votePubkey)
 		}
@@ -105,12 +109,12 @@ func (rpcServer *RpcServer) GetVoteAccounts(ctx context.Context, p jsonrpc.RawPa
 		}
 		for index, votePubkey := range votePubkeys {
 			account := accounts[index]
-			if account == nil || account.Owner != addresses.VoteProgramAddr {
-				return GetVoteAccountsResp{}, fmt.Errorf("vote account %s is unavailable at rooted slot %d", votePubkey, rooted.Slot)
+			if account == nil || account.Lamports == 0 || account.Owner != addresses.VoteProgramAddr {
+				continue // An old candidate may have been deleted or changed owner.
 			}
 			versioned, err := sealevel.UnmarshalVersionedVoteState(account.Data)
-			if err != nil {
-				return GetVoteAccountsResp{}, fmt.Errorf("decode vote account %s: %w", votePubkey, err)
+			if err != nil || !versioned.IsInitialized() {
+				continue // Exclude invalid and uninitialized vote states.
 			}
 			voteState := versioned.ConvertToCurrent()
 			lastVote, _ := voteState.LastVotedSlot()
@@ -152,7 +156,12 @@ func (rpcServer *RpcServer) GetVoteAccounts(ctx context.Context, p jsonrpc.RawPa
 }
 
 func (rpcServer *RpcServer) rootedActivatedStakes(ctx context.Context, slot, epoch uint64) (map[solana.PublicKey]uint64, error) {
-	rooted, accounts, err := rpcServer.readRootedAccounts(ctx, []solana.PublicKey{sealevel.SysvarStakeHistoryAddr})
+	// Replay may not have published a slot context after snapshot boot; both
+	// inputs to stake activation must come from the same rooted bank instead.
+	rooted, accounts, err := rpcServer.readRootedAccounts(ctx, []solana.PublicKey{
+		sealevel.SysvarStakeHistoryAddr,
+		features.ReduceStakeWarmupCooldown.Address,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("read rooted stake history: %w", err)
 	}
@@ -166,11 +175,18 @@ func (rpcServer *RpcServer) rootedActivatedStakes(ctx context.Context, slot, epo
 	if err := history.UnmarshalWithDecoder(bin.NewBinDecoder(accounts[0].Data)); err != nil {
 		return nil, fmt.Errorf("decode stake history at rooted slot %d: %w", slot, err)
 	}
-	slotCtx := rpcServer.getSlotCtx()
-	if slotCtx == nil || slotCtx.Features == nil {
-		return nil, fmt.Errorf("node features unavailable for stake activation")
+	var activationEpoch *uint64
+	featureAccount := accounts[1]
+	if featureAccount != nil && featureAccount.Lamports > 0 && featureAccount.Owner == addresses.FeatureAddr {
+		var feature features.FeatureAcct
+		if err := feature.UnmarshalWithDecoder(bin.NewBinDecoder(featureAccount.Data)); err != nil {
+			return nil, fmt.Errorf("decode rooted stake warmup feature: %w", err)
+		}
+		if feature.ActivatedAt != nil && *feature.ActivatedAt <= rooted.Slot {
+			epoch := rpcServer.epochSchedule.GetEpoch(*feature.ActivatedAt)
+			activationEpoch = &epoch
+		}
 	}
-	activationEpoch := sealevel.NewWarmupCooldownRateEpochWithSlotCtx(slotCtx, rpcServer.epochSchedule)
 	stakes := make(map[solana.PublicKey]uint64)
 	var mu sync.Mutex
 	_, err = global.StreamStakeAccounts(rpcServer.acctsDb, slot, func(_ solana.PublicKey, delegation *sealevel.Delegation, _ uint64) {
