@@ -1747,6 +1747,7 @@ func ReplayBlocks(
 	var unwoundParentBankSysvars *sealevel.BankSysvars
 	var partitionedEpochRewardsEnabled bool
 	var partitionedRewardsInfo *rewards.PartitionedRewardDistributionInfo
+	var rewardsCompletion partitionedRewardsCompletion
 	var featuresActivatedInFirstSlot []*accounts.Account
 	var parentFeaturesActivatedInFirstSlot []*accounts.Account
 
@@ -1928,8 +1929,8 @@ func ReplayBlocks(
 	var highestExecutedSlot uint64 // highest slot ProcessBlock has executed; bounds the promotion-gate walk
 	// While partitioned rewards distribute, promotion holds below the boundary
 	// block so a crash-resume always re-runs it (the distribution bookkeeping is
-	// RAM-only and not reconstructible mid-window). Self-clears when the window
-	// completes (NumRewardPartitionsRemaining reaches 0).
+	// RAM-only and not reconstructible mid-window). Release requires a verified
+	// completion bank, committed atomically with the whole rewards window.
 	var rewardsHoldBelowSlot uint64
 	// Alpenglow finality identities captured at observe/ingest time for the promotion
 	// gate (the tracker's own state may be pruned by promotion time). Pruned as slots
@@ -1989,9 +1990,9 @@ func ReplayBlocks(
 			checkpointAfterCommit = consensusOpts.TransactionStatusCheckpointAfterCommit
 		}
 		if hookErr := unrootedTailState.SetTransactionStatusCheckpointHooks(TransactionStatusCheckpointHooks{
-			// Snapshot runs here on the replay loop during fold-job construction;
-			// only its immutable bytes cross to the async worker.
-			Snapshot: transactionStatuses.SnapshotThrough,
+			// Pin the exact immutable view on replay. Sorting and encoding run
+			// on the existing fold worker, after releasing the live cache lock.
+			Capture: transactionStatuses.CaptureSnapshotThrough,
 			Install: func(through uint64, payload []byte) (*state.TransactionStatusCheckpointRef, error) {
 				return PrepareTransactionStatusCheckpoint(acctsDbPath, through, payload)
 			},
@@ -2063,6 +2064,10 @@ func ReplayBlocks(
 		mithrilState.LastRootedSlot = promotedThrough
 		mithrilState.LastRootedBankhash = rootedCtx.Bankhash
 		mithrilState.LastRootedContext = rootedCtx
+		if rewardsCompletion.retire(&partitionedRewardsInfo, promotedThrough) {
+			rewardsHoldBelowSlot = 0
+			mlog.Log.Infof("epoch rewards bookkeeping retired through durable slot %d; later fork switches may unwind in memory", promotedThrough)
+		}
 		if transactionStatuses.Root(promotedThrough) {
 			mlog.Log.Infof("transaction status cache reconstructed complete %d-root coverage through durable slot %d",
 				maxTransactionStatusRoots, promotedThrough)
@@ -2170,13 +2175,9 @@ func ReplayBlocks(
 		}
 		promoteThrough := safePromoteTarget(lastRootedWatermark, verifierRequired, verifiedWM, replayDivergenceFloor)
 		// Partitioned-rewards window: hold promotion below the boundary block
-		// until every partition distributes, so a crash-resume re-runs the
-		// boundary and rebuilds the RAM-only distribution bookkeeping.
-		if rewardsHoldBelowSlot > 0 && partitionedRewardsInfo != nil && partitionedRewardsInfo.NumRewardPartitionsRemaining > 0 {
-			if promoteThrough >= rewardsHoldBelowSlot {
-				promoteThrough = rewardsHoldBelowSlot - 1
-			}
-		}
+		// until the completion bank verifies and is eligible to fold, so a
+		// failed distribution re-runs the boundary and rebuilds its bookkeeping.
+		promoteThrough = rewardsCompletion.limitPromotion(partitionedRewardsInfo, rewardsHoldBelowSlot, promoteThrough)
 		if promoteThrough <= mithrilState.LastRootedSlot {
 			// Operator signal: promotion is fully stalled (verifier lag,
 			// divergence floor, or rewards hold) while finality has run at
@@ -2207,6 +2208,8 @@ func ReplayBlocks(
 			mlog.Log.FileOnlyf("alpenglow gate: checked=%d matched=%d no_finality=%d no_local_id=%d",
 				gateStats.checked, gateStats.matched, gateStats.noFinality, gateStats.noLocalID)
 		}
+		// The finality gate can stop before the verified completion bank.
+		promoteThrough = rewardsCompletion.limitPromotion(partitionedRewardsInfo, rewardsHoldBelowSlot, promoteThrough)
 		if promoteThrough <= mithrilState.LastRootedSlot {
 			return false
 		}
@@ -2219,6 +2222,18 @@ func ReplayBlocks(
 			// loop would refuse.
 			if res := promoter.drain(); res != nil {
 				applyFoldOutcome(res)
+			}
+			if rewardsHoldBelowSlot > 0 && partitionedRewardsInfo != nil && promoteThrough >= rewardsHoldBelowSlot {
+				job, jerr := unrootedTailState.buildRewardsCompletionFoldJob(rewardsCompletion.slot)
+				if jerr != nil {
+					mlog.Log.Errorf("rooted-durable: rewards completion fold: %v", jerr)
+					return false
+				}
+				if err := runFoldJob(unrootedTailState.committer, job); err != nil {
+					mlog.Log.Errorf("rooted-durable: rewards completion fold: %v", err)
+					return false
+				}
+				applyFoldOutcome(&foldResult{job: job})
 			}
 			promotedThrough, rootedCtx, perr := unrootedTailState.flush(promoteThrough)
 			if perr != nil {
@@ -2233,7 +2248,13 @@ func ReplayBlocks(
 		// when idle; completions are applied at the top of this function on a
 		// later iteration.
 		if !promoter.inFlight {
-			job, jerr := unrootedTailState.buildFoldJob(promoteThrough, false)
+			var job *foldJob
+			var jerr error
+			if rewardsHoldBelowSlot > 0 && partitionedRewardsInfo != nil && promoteThrough >= rewardsHoldBelowSlot {
+				job, jerr = unrootedTailState.buildRewardsCompletionFoldJob(rewardsCompletion.slot)
+			} else {
+				job, jerr = unrootedTailState.buildFoldJob(promoteThrough, false)
+			}
 			if jerr != nil {
 				mlog.Log.Errorf("rooted-durable: %v; watermark held back", jerr)
 				return false
@@ -2919,6 +2940,7 @@ func ReplayBlocks(
 				boundaryParentCtx = epochBoundaryParentCtx(acctsDb, block, currentEpoch, replayCtx.CurrentFeatures)
 			}
 			partitionedRewardsInfo = handleEpochTransition(acctsDb, partitionedEpochRewardsEnabled, boundaryParentCtx, replayCtx, epochSchedule, replayCtx.CurrentFeatures, block, currentEpoch, rpcc, dbgOpts)
+			rewardsCompletion = partitionedRewardsCompletion{}
 			currentEpoch = block.Epoch
 			justCrossedEpochBoundary = true
 			// While partitioned rewards are distributing, hold durable promotion
@@ -3031,6 +3053,7 @@ func ReplayBlocks(
 		}
 		// The successful child now owns its derived snapshot. Any later bank uses
 		// lastSlotCtx; the one-shot retained unwind bridge is no longer needed.
+		rewardsCompletion.observeBank(partitionedRewardsInfo, lastSlotCtx.BankSysvars())
 		unwoundParentBankSysvars = nil
 		postProcessBlockStart := processBlockEnd
 		statusViewStart := time.Now()
@@ -4159,11 +4182,20 @@ func ProcessBlock(
 		return nil, fmt.Errorf("validate transaction messages for slot %d: %w", block.Slot, err)
 	}
 	statusValidationStart := time.Now()
-	statusValidationErr := transactionStatuses.validateBlockWithPlan(block, executionPlan)
+	statusValidation, statusValidationErr := transactionStatuses.validateBlockForPublication(block, executionPlan)
 	metrics.GlobalBlockReplay.TransactionStatusValidation.AddTimingSince(statusValidationStart)
 	if statusValidationErr != nil {
 		return nil, fmt.Errorf("validate transaction statuses for slot %d: %w", block.Slot, statusValidationErr)
 	}
+	statusPreparation := transactionStatuses.startStatusPreparation(executionPlan)
+	defer func() {
+		// Join before returning so a rejected bank cannot leave work behind or
+		// charge its preparation time to the next block's metrics record.
+		statusPreparation.wait()
+		if statusPreparation != nil {
+			metrics.GlobalBlockReplay.TransactionStatusPreparation.AddTiming(statusPreparation.duration)
+		}
+	}()
 	ctx, task := trace.NewTask(context.Background(), "ProcessBlock")
 	defer task.End()
 	trace.Log(ctx, "slot", fmt.Sprintf("%d", block.Slot))
@@ -4423,7 +4455,10 @@ func ProcessBlock(
 		return slotCtx, err
 	}
 	statusCommitStart := time.Now()
-	statusErr := transactionStatuses.commitBlockWithPlan(block, executionPlan)
+	statusWaitStart := time.Now()
+	preparedStatuses := statusPreparation.wait()
+	metrics.GlobalBlockReplay.TransactionStatusPreparationWait.AddTimingSince(statusWaitStart)
+	statusErr := transactionStatuses.commitBlockWithValidation(block, executionPlan, preparedStatuses, statusValidation)
 	metrics.GlobalBlockReplay.TransactionStatusCommit.AddTimingSince(statusCommitStart)
 	if statusErr != nil {
 		return nil, fmt.Errorf("commit transaction statuses for slot %d after bank state commit: %w", block.Slot, statusErr)

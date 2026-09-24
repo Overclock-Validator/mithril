@@ -39,7 +39,7 @@ jobs:
         # known base-branch failures documented in the validation report.
         run: >-
           go test -race -p 2 -count=1
-          ./pkg/alpenglow ./pkg/consensus ./pkg/replay
+          ./pkg/alpenglow ./pkg/consensus ./pkg/replay ./pkg/rewards
           ./pkg/turbine ./pkg/sigverify ./pkg/blockprod/...
           ./cmd/mithril/node ./cmd/mithril/configcmd
 
