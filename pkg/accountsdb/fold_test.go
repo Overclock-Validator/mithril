@@ -144,7 +144,7 @@ func TestSegmentManifestRoundTripAndTornDetection(t *testing.T) {
 		Bankhashes:  []SlotBankhash{{Slot: 100, Bankhash: bh(100)}, {Slot: 130, Bankhash: bh(130)}},
 		Records: []ManifestRecord{
 			{Pubkey: [32]byte{1}, Offset: 0, OwnerSlot: 100, PrevValid: true, Prev: AccountIndexEntry{Slot: 90, FileId: 3, Offset: 77}},
-			{Pubkey: [32]byte{2}, Offset: 136, OwnerSlot: 130},
+			{Pubkey: [32]byte{2}, Offset: 136, OwnerSlot: 130, Vote: true},
 		},
 		ResumeCtx: []byte(`{"slot":130}`),
 	}

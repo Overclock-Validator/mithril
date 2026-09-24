@@ -26,6 +26,7 @@ func TestGetVoteAccountsUsesRootedVoteState(t *testing.T) {
 	currentVote := solana.PublicKey{1}
 	delinquentVote := solana.PublicKey{2}
 	newVote := solana.PublicKey{3}
+	invalidVote := solana.PublicKey{5}
 	currentNode := solana.PublicKey{11}
 	delinquentNode := solana.PublicKey{12}
 	newNode := solana.PublicKey{13}
@@ -34,6 +35,7 @@ func TestGetVoteAccountsUsesRootedVoteState(t *testing.T) {
 
 	currentState := sealevel.VoteStateVersions{Type: sealevel.VoteStateVersionV4}
 	currentState.V4.NodePubkey = currentNode
+	currentState.V4.AuthorizedVoters.AuthorizedVoters.Set(0, currentNode)
 	currentState.V4.InflationRewardsCommissionBps = 755
 	currentState.V4.RootSlot = &currentRoot
 	currentState.V4.Votes.PushBack(sealevel.LandedVote{Lockout: sealevel.VoteLockout{Slot: 499}})
@@ -48,13 +50,17 @@ func TestGetVoteAccountsUsesRootedVoteState(t *testing.T) {
 
 	delinquentState := sealevel.VoteStateVersions{Type: sealevel.VoteStateVersionCurrent}
 	delinquentState.Current.NodePubkey = delinquentNode
+	delinquentState.Current.AuthorizedVoters.AuthorizedVoters.Set(0, delinquentNode)
 	delinquentState.Current.Commission = 5
 	delinquentState.Current.RootSlot = &delinquentRoot
 	delinquentState.Current.Votes.PushBack(sealevel.LandedVote{Lockout: sealevel.VoteLockout{Slot: 300}})
 
 	newState := sealevel.VoteStateVersions{Type: sealevel.VoteStateVersionCurrent}
 	newState.Current.NodePubkey = newNode
+	newState.Current.AuthorizedVoters.AuthorizedVoters.Set(0, newNode)
 	newState.Current.Votes.PushBack(sealevel.LandedVote{Lockout: sealevel.VoteLockout{Slot: 498}})
+	uninitializedVote := solana.PublicKey{4}
+	uninitializedState := sealevel.VoteStateVersions{Type: sealevel.VoteStateVersionCurrent}
 
 	db := newRPCAccountsDB(t)
 	global.ClearPendingStakePubkeys()
@@ -84,9 +90,11 @@ func TestGetVoteAccountsUsesRootedVoteState(t *testing.T) {
 			voteAccountForRPC(t, currentVote, &currentState),
 			voteAccountForRPC(t, delinquentVote, &delinquentState),
 			voteAccountForRPC(t, newVote, &newState),
+			voteAccountForRPC(t, uninitializedVote, &uninitializedState),
+			{Key: invalidVote, Owner: addresses.VoteProgramAddr, Lamports: 1},
 			stakeAccount(solana.PublicKey{21}, currentVote, 125),
 			stakeAccount(solana.PublicKey{22}, delinquentVote, 200),
-			stakeAccount(solana.PublicKey{23}, solana.PublicKey{4}, 50),
+			stakeAccount(solana.PublicKey{23}, uninitializedVote, 50),
 			{Key: sealevel.SysvarStakeHistoryAddr, Owner: addresses.SysvarOwnerAddr, Lamports: 1, Data: historyData.Bytes()},
 		},
 	}}, rootedSlot, nil, nil)
@@ -117,7 +125,6 @@ func TestGetVoteAccountsUsesRootedVoteState(t *testing.T) {
 			SlotsPerEpoch: 1_000,
 		},
 	}
-	server.SetSlotCtx(&sealevel.SlotCtx{Features: features.NewFeaturesDefault()})
 	server.SetRootedBankState(rootedSlot, 490, 1_000)
 	got, err := server.GetVoteAccounts(t.Context(), mustRawParams(t, []interface{}{
 		map[string]interface{}{"commitment": "confirmed"},
@@ -149,10 +156,43 @@ func TestGetVoteAccountsUsesRootedVoteState(t *testing.T) {
 	db.VoteAcctCache.Clear()
 	cold, err := server.GetVoteAccounts(t.Context(), mustRawParams(t, []interface{}{}))
 	require.NoError(t, err)
-	require.Len(t, cold.Current, 1)
+	require.Len(t, cold.Current, 2)
 	require.Equal(t, currentVote.String(), cold.Current[0].VotePubkey)
+	require.Equal(t, newVote.String(), cold.Current[1].VotePubkey)
 	require.Len(t, cold.Delinquent, 1)
 	require.Equal(t, delinquentVote.String(), cold.Delinquent[0].VotePubkey)
+
+	// Candidate keys are append-only, but an account that changes owner must
+	// no longer be returned as a vote account.
+	_, err = db.CommitBatch([]accounts.SlotDelta{{Slot: 501, Delta: []*accounts.Account{{
+		Key: newVote, Lamports: 1, Owner: addresses.SystemProgramAddr,
+	}}}}, 501, nil, nil)
+	require.NoError(t, err)
+	server.SetRootedBankState(501, 490, 1_000)
+	changed, err := server.GetVoteAccounts(t.Context(), mustRawParams(t, []interface{}{}))
+	require.NoError(t, err)
+	require.Len(t, changed.Current, 1)
+	require.Equal(t, currentVote.String(), changed.Current[0].VotePubkey)
+
+	activationSlot := uint64(0)
+	featureData, err := features.MarshalFeatureAcct(&features.FeatureAcct{ActivatedAt: &activationSlot})
+	require.NoError(t, err)
+	_, err = db.CommitBatch([]accounts.SlotDelta{{Slot: 502, Delta: []*accounts.Account{{
+		Key: features.ReduceStakeWarmupCooldown.Address, Owner: addresses.FeatureAddr, Lamports: 1, Data: featureData,
+	}}}}, 502, nil, nil)
+	require.NoError(t, err)
+	server.SetRootedBankState(502, 490, 1_000)
+	withFeature, err := server.GetVoteAccounts(t.Context(), mustRawParams(t, []interface{}{}))
+	require.NoError(t, err)
+	require.Equal(t, uint64(125), withFeature.Current[0].ActivatedStake)
+
+	_, err = db.CommitBatch([]accounts.SlotDelta{{Slot: 503, Delta: []*accounts.Account{{
+		Key: features.ReduceStakeWarmupCooldown.Address, Owner: addresses.FeatureAddr, Lamports: 1, Data: []byte{1},
+	}}}}, 503, nil, nil)
+	require.NoError(t, err)
+	server.SetRootedBankState(503, 490, 1_000)
+	_, err = server.GetVoteAccounts(t.Context(), mustRawParams(t, []interface{}{}))
+	require.ErrorContains(t, err, "decode rooted stake warmup feature")
 }
 
 func TestGetVoteAccountsRejectsInvalidConfig(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"testing"
 
+	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -21,7 +22,7 @@ func TestBuildIndexEntriesDoesNotReadPastSliceLen(t *testing.T) {
 	copy(backing[len(real):], phantom)
 	data := backing[:len(real)] // len excludes phantom; cap and manifest include it.
 
-	pubkeys, entries, _, err := BuildIndexEntriesFromAppendVecs(data, uint64(cap(data)), 7, 9)
+	pubkeys, entries, _, _, err := BuildIndexEntriesFromAppendVecs(data, uint64(cap(data)), 7, 9)
 	require.NoError(t, err)
 	require.Equal(t, []solana.PublicKey{realKey}, pubkeys)
 	require.Len(t, entries, 1)
@@ -37,7 +38,7 @@ func TestBuildIndexEntriesBoundsOversizedManifestByDataLen(t *testing.T) {
 	var pubkeys []solana.PublicKey
 	require.NotPanics(t, func() {
 		var err error
-		pubkeys, _, _, err = BuildIndexEntriesFromAppendVecs(data, uint64(len(data)+hdrLen), 8, 10)
+		pubkeys, _, _, _, err = BuildIndexEntriesFromAppendVecs(data, uint64(len(data)+hdrLen), 8, 10)
 		require.NoError(t, err)
 	})
 	require.Equal(t, []solana.PublicKey{key}, pubkeys)
@@ -54,7 +55,7 @@ func TestBuildIndexEntriesStopsAtDefaultZeroLamportTerminator(t *testing.T) {
 	binary.LittleEndian.PutUint64(terminator[dataLenOffset:dataLenOffset+8], ^uint64(0))
 	data := append(append(append([]byte{}, first...), terminator...), afterTerminator...)
 
-	pubkeys, entries, _, err := BuildIndexEntriesFromAppendVecs(data, uint64(len(data)), 12, 13)
+	pubkeys, entries, _, _, err := BuildIndexEntriesFromAppendVecs(data, uint64(len(data)), 12, 13)
 	require.NoError(t, err)
 	require.Equal(t, []solana.PublicKey{firstKey}, pubkeys)
 	require.Len(t, entries, 1)
@@ -67,7 +68,7 @@ func TestBuildIndexEntriesTerminatorRequiresDefaultKeyAndZeroLamports(t *testing
 	zeroLamportAccount := marshalAppendVecTestAccount(t, zeroLamportKey, 0, []byte("tombstone"))
 	data := append(defaultKeyAccount, zeroLamportAccount...)
 
-	pubkeys, entries, _, err := BuildIndexEntriesFromAppendVecs(data, uint64(len(data)), 18, 19)
+	pubkeys, entries, _, _, err := BuildIndexEntriesFromAppendVecs(data, uint64(len(data)), 18, 19)
 	require.NoError(t, err)
 	require.Equal(t, []solana.PublicKey{defaultKey, zeroLamportKey}, pubkeys)
 	require.Len(t, entries, 2)
@@ -80,7 +81,7 @@ func TestBuildIndexEntriesRejectsTruncatedAccountData(t *testing.T) {
 	copy(data[pubkeyOffset:pubkeyOffset+32], key[:])
 	binary.LittleEndian.PutUint64(data[lamportsOffset:lamportsOffset+8], 1)
 
-	pubkeys, entries, stakeEntries, err := BuildIndexEntriesFromAppendVecs(data, uint64(len(data)), 14, 15)
+	pubkeys, entries, stakeEntries, _, err := BuildIndexEntriesFromAppendVecs(data, uint64(len(data)), 14, 15)
 	require.ErrorContains(t, err, "truncated appendvec account data")
 	assert.Nil(t, pubkeys)
 	assert.Nil(t, entries)
@@ -92,10 +93,21 @@ func TestBuildIndexEntriesAcceptsFinalAccountWithoutAlignmentPadding(t *testing.
 	encoded := marshalAppendVecTestAccount(t, key, 77, []byte{1, 2, 3})
 	data := encoded[: hdrLen+3 : hdrLen+3]
 
-	pubkeys, entries, _, err := BuildIndexEntriesFromAppendVecs(data, uint64(len(encoded)), 16, 17)
+	pubkeys, entries, _, _, err := BuildIndexEntriesFromAppendVecs(data, uint64(len(encoded)), 16, 17)
 	require.NoError(t, err)
 	require.Equal(t, []solana.PublicKey{key}, pubkeys)
 	require.Len(t, entries, 1)
+}
+
+func TestBuildIndexEntriesCollectsVoteAccounts(t *testing.T) {
+	vote := appendVecTestPubkey(10)
+	ordinary := appendVecTestPubkey(11)
+	voteData := marshalAppendVecTestAccount(t, vote, 1, nil)
+	copy(voteData[ownerOffset:ownerOffset+32], addresses.VoteProgramAddr[:])
+	data := append(voteData, marshalAppendVecTestAccount(t, ordinary, 1, nil)...)
+	_, _, _, votes, err := BuildIndexEntriesFromAppendVecs(data, uint64(len(data)), 20, 21)
+	require.NoError(t, err)
+	require.Equal(t, []solana.PublicKey{vote}, votes)
 }
 
 func appendVecTestPubkey(firstByte byte) solana.PublicKey {
