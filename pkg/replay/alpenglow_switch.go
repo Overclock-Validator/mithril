@@ -13,6 +13,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/rewards"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/state"
+	"github.com/Overclock-Validator/mithril/pkg/turbine"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -116,6 +117,16 @@ func newAlpenglowSwitchSweeper(engine consensusengine.Engine) *alpenglowSwitchSw
 	return s
 }
 
+// peek tests for a switch without consuming the sweep's version/frontier gate.
+// Streaming admission must leave a detected switch for the replay loop to apply.
+func (s *alpenglowSwitchSweeper) peek(executed map[uint64]solana.Hash, lastRooted, tip uint64) *CertifiedSwitch {
+	if s == nil {
+		return nil
+	}
+	snapshot := *s
+	return snapshot.sweep(executed, lastRooted, tip)
+}
+
 // sweep walks consumed block/skip outcomes in (lastRooted, tip] and returns
 // the first contradiction with a decisive chain decision. tip includes trailing
 // skips even when the executed bank remains at an earlier slot.
@@ -175,23 +186,86 @@ func waitForAlpenglowReplayInput(
 	decisionChanges <-chan struct{},
 	pollInterval time.Duration,
 ) (*b.Block, *blockstream.AlpenglowParentSwitch, *CertifiedSwitch) {
+	adapted := func(ctx context.Context, decisionChanges <-chan struct{}, _ <-chan turbine.StreamEvent, _ <-chan time.Time) blockstream.ReplayInput {
+		block, parentSwitch, decisionChanged := next(ctx, decisionChanges)
+		return blockstream.ReplayInput{Block: block, ParentSwitch: parentSwitch, DecisionChanged: decisionChanged}
+	}
+	return waitForReplayInput(ctx, adapted, sweep, decisionChanges, pollInterval, nil)
+}
+
+// replayStreamer is the streaming executor as the wait loop drives it: the
+// feed it listens to, its poll timer (nil while idle), and the two handlers,
+// which execute transaction groups on the replay goroutine.
+type replayStreamer interface {
+	events() <-chan turbine.StreamEvent
+	tick() <-chan time.Time
+	handleEvent(turbine.StreamEvent)
+	handleTick()
+}
+
+// replayInputSource is BlockSource.NextReplayInput.
+type replayInputSource func(ctx context.Context, decisionChanges <-chan struct{}, streamEvents <-chan turbine.StreamEvent, streamTick <-chan time.Time) blockstream.ReplayInput
+
+// waitForReplayInput is waitForAlpenglowReplayInput with the streaming
+// executor folded into the same wait: feed wake-ups and poll ticks are
+// handled here, on the replay goroutine, and never end the wait, so the loop
+// body only ever sees a block, a switch, or an ended wait exactly as before.
+// streamer may be nil (no streaming); sweep may be nil (no certificate
+// correction), in which case decision notifications stay disabled and the
+// wait blocks without polling, as it always did.
+func waitForReplayInput(
+	ctx context.Context,
+	next replayInputSource,
+	sweep func() *CertifiedSwitch,
+	decisionChanges <-chan struct{},
+	pollInterval time.Duration,
+	streamer replayStreamer,
+) (*b.Block, *blockstream.AlpenglowParentSwitch, *CertifiedSwitch) {
+	var streamEvents <-chan turbine.StreamEvent
+	if streamer != nil {
+		// A slot may have become eligible while the previous block executed
+		// (its header arrived mid-execution); open it before blocking.
+		streamer.handleTick()
+		streamEvents = streamer.events()
+	}
 	if sweep == nil {
-		block, parentSwitch, _ := next(ctx, nil)
-		return block, parentSwitch, nil
+		decisionChanges = nil
+		if streamer == nil {
+			in := next(ctx, nil, nil, nil)
+			return in.Block, in.ParentSwitch, nil
+		}
 	}
 	for {
 		if ctx.Err() != nil {
 			return nil, nil, nil
 		}
-		if sw := sweep(); sw != nil {
-			return nil, nil, sw
+		if sweep != nil {
+			if sw := sweep(); sw != nil {
+				return nil, nil, sw
+			}
 		}
-		waitCtx, cancel := context.WithTimeout(ctx, pollInterval)
-		block, parentSwitch, decisionChanged := next(waitCtx, decisionChanges)
-		timedOut := waitCtx.Err() == context.DeadlineExceeded
+		waitCtx, cancel := ctx, func() {}
+		if sweep != nil {
+			waitCtx, cancel = context.WithTimeout(ctx, pollInterval)
+		}
+		var tick <-chan time.Time
+		if streamer != nil {
+			tick = streamer.tick()
+		}
+		in := next(waitCtx, decisionChanges, streamEvents, tick)
+		timedOut := sweep != nil && waitCtx.Err() == context.DeadlineExceeded
 		cancel()
-		if block != nil || parentSwitch != nil || (!decisionChanged && !timedOut) {
-			return block, parentSwitch, nil
+		switch {
+		case in.Block != nil || in.ParentSwitch != nil:
+			return in.Block, in.ParentSwitch, nil
+		case in.StreamEvent != nil:
+			streamer.handleEvent(*in.StreamEvent)
+		case in.StreamTick:
+			streamer.handleTick()
+		case in.DecisionChanged || timedOut:
+			// Re-sweep, then wait again.
+		default:
+			return nil, nil, nil
 		}
 	}
 }

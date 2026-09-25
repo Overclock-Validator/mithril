@@ -60,9 +60,16 @@ type RetransmitConfig struct {
 
 type retransmitWork struct {
 	packet []byte
-	shred  ShredID
-	leader solana.PublicKey
+	// storage is exclusively owned by this work until send (including retries)
+	// completes. Nil denotes the unpooled oversized compatibility path.
+	storage *retransmitPacket
+	shred   ShredID
+	leader  solana.PublicKey
 }
+
+// Canonical shreds fit in one Solana packet. Keep the pool fixed-size rather
+// than retaining arbitrary caller-provided capacities.
+type retransmitPacket [packetDataSize]byte
 
 type cachedRetransmitNodes struct {
 	asof  time.Time
@@ -91,6 +98,8 @@ type retransmitParentSigCache struct {
 }
 
 type packetBatchSender interface {
+	// Send borrows packet and peers only until it returns, including on errors
+	// or partial sends. Implementations must copy anything they retain.
 	Send(packet []byte, peers []*net.UDPAddr) (int, error)
 	Close() error
 }
@@ -120,8 +129,13 @@ type Retransmitter struct {
 	// immediately visible alongside short-send counters.
 	sendBufferBytes int
 
-	queue   chan retransmitWork
-	senders []packetBatchSender
+	queue      chan retransmitWork
+	senders    []packetBatchSender
+	packetPool sync.Pool
+	// Only guards queue admission versus shutdown; never held during crypto,
+	// peer selection or socket writes. A stopped queue cannot retain late work.
+	submitMu sync.RWMutex
+	stopped  bool
 
 	cacheMu        sync.Mutex
 	cache          map[uint64]cachedRetransmitNodes
@@ -283,20 +297,53 @@ func (r *Retransmitter) Run(ctx context.Context) {
 		sender := sender
 		go func() {
 			defer workers.Done()
+			var peers [dataPlaneFanout]*net.UDPAddr
 			for {
 				select {
 				case <-ctx.Done():
 					return
 				case work := <-r.queue:
-					r.send(work, sender)
+					r.send(work, sender, peers[:0])
 				}
 			}
 		}()
 	}
 	<-ctx.Done()
+	r.submitMu.Lock()
+	r.stopped = true
+	r.submitMu.Unlock()
 	workers.Wait()
-	for _, sender := range r.senders {
-		_ = sender.Close()
+	// Admission is closed and senders have returned their leases. Drain the
+	// remaining queue without closing a channel still visible to submitters.
+	for {
+		select {
+		case work := <-r.queue:
+			r.releasePacket(work.storage)
+		default:
+			for _, sender := range r.senders {
+				_ = sender.Close()
+			}
+			return
+		}
+	}
+}
+
+func (r *Retransmitter) copyPacket(packet []byte) ([]byte, *retransmitPacket) {
+	if len(packet) > len(retransmitPacket{}) {
+		return append([]byte(nil), packet...), nil
+	}
+	storage, _ := r.packetPool.Get().(*retransmitPacket)
+	if storage == nil {
+		storage = new(retransmitPacket)
+	}
+	out := storage[:len(packet)]
+	copy(out, packet)
+	return out, storage
+}
+
+func (r *Retransmitter) releasePacket(storage *retransmitPacket) {
+	if storage != nil {
+		r.packetPool.Put(storage)
 	}
 }
 
@@ -340,25 +387,37 @@ func (r *Retransmitter) SubmitFrom(packet []byte, shred *Shred, leader solana.Pu
 	if packetSize == 0 || packetSize > len(packet) {
 		return fmt.Errorf("turbine retransmit: invalid canonical packet size %d/%d", packetSize, len(packet))
 	}
-	out := append([]byte(nil), packet[:packetSize]...)
+	// Validate the signing range before borrowing storage, so all error exits
+	// either precede ownership or release it through send/the queue-drop path.
+	offset := 0
 	if root != nil {
-		offset, err := shred.retransmitterSignatureOffset()
+		offset, err = shred.retransmitterSignatureOffset()
 		if err != nil {
 			return fmt.Errorf("turbine retransmit: locate retransmitter signature: %w", err)
 		}
-		if offset+ed25519.SignatureSize > len(out) {
-			return fmt.Errorf("turbine retransmit: retransmitter signature slice %d:%d exceeds packet size %d", offset, offset+ed25519.SignatureSize, len(out))
+		if offset+ed25519.SignatureSize > packetSize {
+			return fmt.Errorf("turbine retransmit: retransmitter signature slice %d:%d exceeds packet size %d", offset, offset+ed25519.SignatureSize, packetSize)
 		}
+	}
+	out, storage := r.copyPacket(packet[:packetSize])
+	if root != nil {
 		signature := ed25519.Sign(r.cfg.Identity, root[:])
 		copy(out[offset:offset+ed25519.SignatureSize], signature)
 		r.resignedShreds.Add(1)
 	}
 
 	r.submitted.Add(1)
+	r.submitMu.RLock()
+	defer r.submitMu.RUnlock()
+	if r.stopped {
+		r.releasePacket(storage)
+		return nil
+	}
 	select {
-	case r.queue <- retransmitWork{packet: out, shred: id, leader: leader}:
+	case r.queue <- retransmitWork{packet: out, storage: storage, shred: id, leader: leader}:
 	default:
 		r.queueDrops.Add(1)
+		r.releasePacket(storage)
 	}
 	return nil
 }
@@ -417,9 +476,13 @@ func (r *Retransmitter) verifyParentSignature(shred *Shred, leader solana.Public
 	return &root, nil
 }
 
-func (r *Retransmitter) send(work retransmitWork, sender packetBatchSender) {
+func (r *Retransmitter) send(work retransmitWork, sender packetBatchSender, scratch []*net.UDPAddr) {
+	defer r.releasePacket(work.storage)
+	// Clear even the unused tail after selection: worker scratch must not pin
+	// old snapshot addresses after a topology refresh or a no-peer/error path.
+	defer clear(scratch[:cap(scratch)])
 	nodes := r.clusterNodesForSlot(work.shred.Slot)
-	distance, peers, err := nodes.RetransmitPeers(work.leader, work.shred, dataPlaneFanout)
+	distance, peers, err := nodes.retransmitPeersInto(work.leader, work.shred, dataPlaneFanout, scratch)
 	if errors.Is(err, ErrRetransmitLoopback) {
 		r.loopbacks.Add(1)
 		return

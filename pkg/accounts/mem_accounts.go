@@ -1,7 +1,6 @@
 package accounts
 
 import (
-	"fmt"
 	"sync"
 
 	"github.com/Overclock-Validator/mithril/pkg/base58"
@@ -11,6 +10,16 @@ import (
 type MemAccounts struct {
 	Map map[[32]byte]*Account
 	mu  *sync.RWMutex
+}
+
+// A miss is an ordinary step when falling back to parent accounts. Defer the
+// diagnostic encoding until it is needed, and copy the key so callers can reuse it.
+type missingMemAccountError struct {
+	key [32]byte
+}
+
+func (e *missingMemAccountError) Error() string {
+	return "no such account " + base58.Encode(e.key[:]) + " found"
 }
 
 func NewMemAccounts() MemAccounts {
@@ -32,7 +41,7 @@ func (m MemAccounts) GetAccount(pubkey *[32]byte) (*Account, error) {
 	defer m.mu.RUnlock()
 	acct, ok := m.Map[*pubkey]
 	if !ok {
-		return nil, fmt.Errorf("no such account %s found", base58.Encode(pubkey[:]))
+		return nil, &missingMemAccountError{key: *pubkey}
 	}
 	return acct, nil
 }
@@ -40,7 +49,7 @@ func (m MemAccounts) GetAccount(pubkey *[32]byte) (*Account, error) {
 func (m MemAccounts) GetAccountWithoutLock(pubkey solana.PublicKey) (*Account, error) {
 	acct, ok := m.Map[pubkey]
 	if !ok {
-		return nil, fmt.Errorf("no such account %s found", base58.Encode(pubkey[:]))
+		return nil, &missingMemAccountError{key: pubkey}
 	}
 	return acct, nil
 }
