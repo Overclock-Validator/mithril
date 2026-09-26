@@ -83,10 +83,11 @@ func newSlotCompletionPool(assembler *SlotAssembler, resetGate *sync.RWMutex, on
 					p.resetGate.RUnlock()
 				}
 				p.results <- slotCompletionResult{
-					block:    blk,
-					err:      err,
-					hydrated: queued.hydrated,
-					pending:  pending,
+					generation: StreamGeneration{slot: queued.work.state.slot, state: queued.work.state},
+					block:      blk,
+					err:        err,
+					hydrated:   queued.hydrated,
+					pending:    pending,
 				}
 			}
 		}()

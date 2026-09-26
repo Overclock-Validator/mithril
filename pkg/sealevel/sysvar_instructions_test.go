@@ -113,7 +113,7 @@ func TestExecute_Tx_Sysvar_Instructions_Bpf_Test(t *testing.T) {
 	err = execCtx.Accounts.SetAccount(&pk, &programDataAcct)
 	assert.NoError(t, err)
 
-	execCtx.SlotCtx = new(SlotCtx)
+	initializeLegacyBankFixture(t, &execCtx)
 	execCtx.SlotCtx.Slot = 1337
 
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})

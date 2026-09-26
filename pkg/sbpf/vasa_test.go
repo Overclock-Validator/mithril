@@ -73,7 +73,7 @@ func TestStackFrameGapsCanBeDisabled(t *testing.T) {
 
 	gapped := NewStack(version, false)
 	defer gapped.Finish()
-	gappedRegs := make([]uint64, 11)
+	gappedRegs := new([16]uint64)
 	gappedRegs[10] = VaddrStack + StackFrameSize
 	require.True(t, gapped.Push(gappedRegs, 0))
 	require.Equal(t, VaddrStack+StackFrameSize*3, gappedRegs[10])
@@ -81,7 +81,7 @@ func TestStackFrameGapsCanBeDisabled(t *testing.T) {
 
 	contiguous := NewStack(version, true)
 	defer contiguous.Finish()
-	contiguousRegs := make([]uint64, 11)
+	contiguousRegs := new([16]uint64)
 	contiguousRegs[10] = VaddrStack + StackFrameSize
 	require.True(t, contiguous.Push(contiguousRegs, 0))
 	require.Equal(t, VaddrStack+StackFrameSize*2, contiguousRegs[10])
@@ -94,9 +94,22 @@ func TestStackFrameGapsAreLegacyOnly(t *testing.T) {
 	stack := NewStack(version, false)
 	defer stack.Finish()
 
-	regs := make([]uint64, 11)
+	regs := new([16]uint64)
 	regs[10] = VaddrStack + StackFrameSize
 	require.True(t, stack.Push(regs, 0))
 	require.Equal(t, VaddrStack+StackFrameSize*2, regs[10])
 	require.NotNil(t, stack.GetFrame(StackFrameSize))
+}
+
+func TestInputRegionFastCacheClampsToBackingBytes(t *testing.T) {
+	ip := &Interpreter{input: make([]byte, 8), inputRegions: []InputRegion{{Offset: 0, HostOffset: 4, RegionSize: 100, AddressSpaceReserved: 100, Writable: true, AccountIndex: -1}}}
+	ip.initRegions()
+	require.NoError(t, ip.Write8(VaddrInput, 7))
+	require.NotNil(t, ip.fastRead(VaddrInput+3, 1))
+	require.Nil(t, ip.fastRead(VaddrInput+4, 1))
+	require.Nil(t, ip.fastWrite(VaddrInput+4, 1))
+	_, err := ip.Read8(VaddrInput + 4)
+	require.Error(t, err)
+	require.Error(t, ip.Write8(VaddrInput+4, 8))
+	require.Equal(t, byte(7), ip.input[4])
 }
