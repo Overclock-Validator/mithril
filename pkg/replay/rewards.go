@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -493,6 +494,9 @@ func beginPartitionedEpochRewardsDistribution(acctsDb *accountsdb.AccountsDb, sl
 
 	rewardLoader := epochRewardAccountLoader(acctsDb, slot, slotCtx, stagedEpochAccts)
 	updatedAccts, parentUpdatedAccts, voteRewardsDistributed := rewards.DistributeVotingRewards(acctsDb, streamResult.ValidatorRewards, slot, rewardLoader)
+	if err := replaceInflationRewardRecords(block, updatedAccts, parentUpdatedAccts, rpc.RewardTypeVoting); err != nil {
+		panic(err)
+	}
 
 	newEpochRewards := sealevel.SysvarEpochRewards{DistributionStartingBlockHeight: block.BlockHeight + 1,
 		NumPartitions: streamResult.NumPartitions, ParentBlockhash: block.LastBlockhash,
@@ -584,4 +588,41 @@ func distributePartitionedEpochRewardsForSlot(acctsDb *accountsdb.AccountsDb, pa
 	}
 
 	return distributedAccts, parentDistributedAccts
+}
+
+func replaceInflationRewardRecords(block *block.Block, updated, parents []*accounts.Account, rewardType rpc.RewardType) error {
+	if block == nil {
+		return fmt.Errorf("record %s rewards: nil block", rewardType)
+	}
+	if len(updated) != len(parents) {
+		return fmt.Errorf("record %s rewards at slot %d: %d updated accounts, %d parents", rewardType, block.Slot, len(updated), len(parents))
+	}
+	records := make([]rpc.BlockReward, 0, len(updated))
+	for index, account := range updated {
+		if account == nil || account.Key == sealevel.SysvarEpochRewardsAddr {
+			continue
+		}
+		parent := parents[index]
+		if parent == nil {
+			return fmt.Errorf("record %s rewards at slot %d: account %s has no parent", rewardType, block.Slot, account.Key)
+		}
+		if account.Lamports < parent.Lamports {
+			return fmt.Errorf("record %s rewards at slot %d: account %s balance decreased from %d to %d", rewardType, block.Slot, account.Key, parent.Lamports, account.Lamports)
+		}
+		amount := account.Lamports - parent.Lamports
+		if amount > math.MaxInt64 {
+			return fmt.Errorf("record %s rewards at slot %d: account %s reward %d overflows int64", rewardType, block.Slot, account.Key, amount)
+		}
+		records = append(records, rpc.BlockReward{
+			Pubkey: account.Key, Lamports: int64(amount), PostBalance: account.Lamports, RewardType: rewardType,
+		})
+	}
+	kept := block.Rewards[:0]
+	for _, reward := range block.Rewards {
+		if reward.RewardType != rewardType {
+			kept = append(kept, reward)
+		}
+	}
+	block.Rewards = append(kept, records...)
+	return nil
 }

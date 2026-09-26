@@ -2,6 +2,7 @@ package rewards
 
 import (
 	"math"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/features"
@@ -86,6 +87,21 @@ func TestAlpenglowCommissionSplitPreservesFractionalLamport(t *testing.T) {
 	require.Equal(t, CommissionSplit{
 		VoterPortion: 123, StakerPortion: 876, IsSplit: true,
 	}, tower)
+}
+
+func TestZeroCommissionRetainsVotingRewardEntry(t *testing.T) {
+	votePubkey := solana.NewWallet().PublicKey()
+	voteState := &sealevel.VoteStateVersions{
+		Type: sealevel.VoteStateVersionV4,
+		V4:   sealevel.VoteState4{InflationRewardsCommissionBps: 0},
+	}
+	split := voteCommissionSplit(voteState, 1_000, true, true)
+	require.Zero(t, split.VoterPortion)
+
+	rewards := make(map[solana.PublicKey]*atomic.Uint64)
+	accumulateVotingReward(rewards, votePubkey, voteState, false, split.VoterPortion)
+	require.Contains(t, rewards, votePubkey)
+	require.Zero(t, rewards[votePubkey].Load())
 }
 
 func TestV4CommissionKeepsBasisPointPrecision(t *testing.T) {
