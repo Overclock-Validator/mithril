@@ -11,8 +11,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
@@ -31,6 +33,7 @@ type RpcServer struct {
 	slotCtx       *sealevel.SlotCtx
 	slotCtxMu     sync.RWMutex
 	genesisHash   string
+	rootedBank    atomic.Pointer[rootedBankState]
 
 	leaderTPUCacheMu         sync.RWMutex
 	leaderTPUByIdentity      map[solana.PublicKey]tpuEndpoint
@@ -45,17 +48,105 @@ type RpcServer struct {
 	sendTransactionLeaderForwardCount uint64
 }
 
+// rootedBankState identifies the durable AccountsDB view served by state RPCs.
+// Publishing it only after a successful fold keeps response context and account
+// values on the same finalized bank.
+type rootedBankState struct {
+	Slot             uint64
+	BlockHeight      uint64
+	TransactionCount uint64
+}
+
 const maxQuietMethodProbeBody = 64 << 10
 
 var supportedRPCMethods = map[string]struct{}{
 	"getAccountInfo":      {},
+	"getBalance":          {},
 	"getBankHash":         {},
+	"getBlockProduction":  {},
 	"getBlockHeight":      {},
 	"getEpochInfo":        {},
 	"getGenesisHash":      {},
 	"getLatestBlockhash":  {},
+	"getLeaderSchedule":   {},
+	"getVoteAccounts":     {},
 	"sendTransaction":     {},
 	"simulateTransaction": {},
+}
+
+func (rpcServer *RpcServer) SetRootedBankState(slot, blockHeight, transactionCount uint64) {
+	rpcServer.rootedBank.Store(&rootedBankState{
+		Slot:             slot,
+		BlockHeight:      blockHeight,
+		TransactionCount: transactionCount,
+	})
+}
+
+func (rpcServer *RpcServer) getRootedBankState() (rootedBankState, bool) {
+	rooted := rpcServer.rootedBank.Load()
+	if rooted == nil {
+		return rootedBankState{}, false
+	}
+	return *rooted, true
+}
+
+func (rpcServer *RpcServer) readRootedAccount(ctx context.Context, pubkey solana.PublicKey) (rootedBankState, *accounts.Account, error) {
+	rooted, accountSet, err := rpcServer.readRootedAccounts(ctx, []solana.PublicKey{pubkey})
+	if err != nil {
+		return rooted, nil, err
+	}
+	if len(accountSet) != 1 || accountSet[0] == nil {
+		return rooted, nil, accountsdb.ErrNoAccount
+	}
+	return rooted, accountSet[0], nil
+}
+
+func (rpcServer *RpcServer) readRootedAccounts(ctx context.Context, pubkeys []solana.PublicKey) (rootedBankState, []*accounts.Account, error) {
+	for {
+		rooted, ok := rpcServer.getRootedBankState()
+		if !ok {
+			return rootedBankState{}, nil, fmt.Errorf("node has no rooted bank available")
+		}
+		if rpcServer.acctsDb == nil {
+			return rootedBankState{}, nil, fmt.Errorf("node has no accounts database available")
+		}
+		if rpcServer.rootedPublicationPending(rooted.Slot) {
+			if err := waitForRootedPublication(ctx); err != nil {
+				return rooted, nil, err
+			}
+			continue
+		}
+		accounts, stats, err := rpcServer.acctsDb.GetAccountsBatchSharedWithStats(ctx, rooted.Slot, pubkeys)
+		latest, stillPublished := rpcServer.getRootedBankState()
+		if stats.PendingFoldHits > 0 || !stillPublished || latest.Slot != rooted.Slot ||
+			rpcServer.rootedPublicationPending(rooted.Slot) {
+			if err := waitForRootedPublication(ctx); err != nil {
+				return rooted, nil, err
+			}
+			continue
+		}
+		return rooted, accounts, err
+	}
+}
+
+func (rpcServer *RpcServer) rootedPublicationPending(rootedSlot uint64) bool {
+	if !rpcServer.acctsDb.RootedDurable {
+		return false
+	}
+	durableThrough := rpcServer.acctsDb.DurableThrough()
+	// Zero means the snapshot baseline is active and no fold has committed yet.
+	return durableThrough != 0 && durableThrough != rootedSlot
+}
+
+func waitForRootedPublication(ctx context.Context) error {
+	timer := time.NewTimer(time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func NewRpcServer(acctsDb *accountsdb.AccountsDb, port uint16, epochSchedule *sealevel.SysvarEpochSchedule, genesisHash solana.Hash) *RpcServer {

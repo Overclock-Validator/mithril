@@ -59,7 +59,7 @@ func TestSnapshotWorkerParseFailurePropagatesAfterDrain(t *testing.T) {
 		nil,
 		accountsDir,
 		&atomic.Uint64{},
-		&stakeIndexCollector{},
+		&snapshotAccountCollector{},
 	)
 	require.NoError(t, err)
 	t.Cleanup(pools.Release)

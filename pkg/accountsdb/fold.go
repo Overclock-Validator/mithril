@@ -13,6 +13,7 @@ import (
 	"sort"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
+	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/cockroachdb/pebble"
 	"golang.org/x/sync/errgroup"
 )
@@ -181,7 +182,10 @@ func (db *AccountsDb) CommitBatch(
 	segErr := func() error {
 		for _, k := range keys {
 			v := union[k]
-			records = append(records, ManifestRecord{Pubkey: k, Offset: dataLen, OwnerSlot: v.ownerSlot})
+			records = append(records, ManifestRecord{
+				Pubkey: k, Offset: dataLen, OwnerSlot: v.ownerSlot,
+				Vote: v.acct.Lamports > 0 && v.acct.Owner == addresses.VoteProgramAddr,
+			})
 			ava := AppendVecAccount{
 				DataLen:    uint64(len(v.acct.Data)),
 				Pubkey:     v.acct.Key,
@@ -304,6 +308,9 @@ func (db *AccountsDb) CommitBatch(
 	// ordinary concurrent-safe cache operations finish.
 	db.refreshReadCacheEntries(live)
 
+	// Advance the watermark before removing pendingFold so rooted readers keep
+	// waiting until the matching bank state is published.
+	db.durableThrough.Store(throughSlot)
 	db.readCacheEpochMu.Lock()
 	db.pendingFold = nil
 	db.readCacheEpochMu.Unlock()
@@ -311,7 +318,6 @@ func (db *AccountsDb) CommitBatch(
 
 	// (8) Publish.
 	db.lastBatchSeq = batchSeq
-	db.durableThrough.Store(throughSlot)
 
 	return BatchCommitResult{
 		BatchSeq:    batchSeq,
@@ -336,6 +342,11 @@ func (db *AccountsDb) applyManifestToIndex(m *SegmentManifest) error {
 		entry.Marshal(&idxBuf)
 		if err := batch.Set(r.Pubkey[:], idxBuf[:], nil); err != nil {
 			return err
+		}
+		if r.Vote {
+			if err := batch.Set(voteIndexKey(r.Pubkey), nil, nil); err != nil {
+				return err
+			}
 		}
 	}
 	if err := batch.Set(metaKeyLastBatch, encodeFoldMeta(foldMeta{

@@ -47,9 +47,11 @@ import (
 	"github.com/panjf2000/ants/v2"
 )
 
-// SlotCtxSetter is implemented by types that accept a SlotCtx update (e.g. RpcServer).
+// SlotCtxSetter is implemented by the RPC server so replay can publish both
+// its live execution bank and the latest bank durably folded into AccountsDB.
 type SlotCtxSetter interface {
 	SetSlotCtx(slotCtx *sealevel.SlotCtx)
+	SetRootedBankState(slot, blockHeight, transactionCount uint64)
 }
 
 // BlockFetchOpts contains options for parallel block fetching
@@ -2076,6 +2078,13 @@ func ReplayBlocks(
 		mithrilState.LastRootedSlot = promotedThrough
 		mithrilState.LastRootedBankhash = rootedCtx.Bankhash
 		mithrilState.LastRootedContext = rootedCtx
+		if rpcServer != nil {
+			var transactionCount uint64
+			if rootedCtx.TransactionCount != nil {
+				transactionCount = *rootedCtx.TransactionCount
+			}
+			rpcServer.SetRootedBankState(promotedThrough, rootedCtx.BlockHeight, transactionCount)
+		}
 		if rewardsCompletion.retire(&partitionedRewardsInfo, promotedThrough) {
 			rewardsHoldBelowSlot = 0
 			mlog.Log.Infof("epoch rewards bookkeeping retired through durable slot %d; later fork switches may unwind in memory", promotedThrough)
@@ -3222,6 +3231,9 @@ func ReplayBlocks(
 
 		if rpcServer != nil {
 			rpcServer.SetSlotCtx(lastSlotCtx)
+			if unrootedTailState == nil {
+				rpcServer.SetRootedBankState(block.Slot, global.BlockHeight(), global.TransactionCount())
+			}
 		}
 
 		replayCtx.Capitalization -= lastSlotCtx.LamportsBurnt

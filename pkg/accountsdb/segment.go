@@ -62,6 +62,7 @@ type ManifestRecord struct {
 	Offset    uint64            // record offset within this segment's data file
 	OwnerSlot uint64            // slot that produced this version (observability)
 	PrevValid bool              // false => the key was absent from the index before this batch
+	Vote      bool              // this version is a nonzero-lamport vote-program account
 	Prev      AccountIndexEntry // index entry before this batch overwrote it
 }
 
@@ -138,11 +139,14 @@ func (m *SegmentManifest) encode() []byte {
 		body.Write(r.Pubkey[:])
 		put64(r.Offset)
 		put64(r.OwnerSlot)
+		var flags byte
 		if r.PrevValid {
-			body.WriteByte(1)
-		} else {
-			body.WriteByte(0)
+			flags |= 1
 		}
+		if r.Vote {
+			flags |= 2
+		}
+		body.WriteByte(flags)
 		r.Prev.Marshal(&prevBuf)
 		body.Write(prevBuf[:])
 	}
@@ -324,7 +328,11 @@ func ReadSegmentManifest(path string) (*SegmentManifest, error) {
 		if err != nil {
 			return nil, err
 		}
-		r.PrevValid = pv == 1
+		if pv&^3 != 0 {
+			return nil, ErrTornManifest
+		}
+		r.PrevValid = pv&1 != 0
+		r.Vote = pv&2 != 0
 		prevRaw, err := d.bytes(24)
 		if err != nil {
 			return nil, err

@@ -34,6 +34,7 @@ type AccountsDb struct {
 	AcctsDir         string
 	LargestFileId    atomic.Uint64
 	VoteAcctCache    otter.Cache[solana.PublicKey, *accounts.Account]
+	voteIndexMu      sync.Mutex
 	CommonAcctsCache otter.Cache[solana.PublicKey, *accounts.Account]
 	ProgramCache     otter.Cache[solana.PublicKey, *ProgramCacheEntry]
 	// Otter permits concurrent ordinary operations but not Clear. Rewind takes
@@ -97,6 +98,11 @@ func (accountsDb *AccountsDb) StoreQueueLen() int {
 	accountsDb.inProgressStoreRequestsMu.Lock()
 	defer accountsDb.inProgressStoreRequestsMu.Unlock()
 	return accountsDb.inProgressStoreRequests.Len()
+}
+
+// DurableThrough returns the highest slot whose fold is fully committed.
+func (accountsDb *AccountsDb) DurableThrough() uint64 {
+	return accountsDb.durableThrough.Load()
 }
 
 // silentLogger implements pebble.Logger but discards all messages.
