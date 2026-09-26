@@ -22,6 +22,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/txverify"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
+	"github.com/gagliardetto/solana-go/rpc"
 	"github.com/stretchr/testify/require"
 )
 
@@ -71,6 +72,7 @@ func (t *lifecycleTail) Add(slot uint64, delta []*accounts.Account, bankhash []b
 func (t *lifecycleTail) OverCap() bool { return false }
 
 type lifecycleEnv struct {
+	leader        solana.PublicKey
 	feats         *features.Features
 	durable       accounts.MemAccounts
 	acctsDb       *accountsdb.AccountsDb
@@ -165,6 +167,7 @@ func newLifecycleEnv(t *testing.T) *lifecycleEnv {
 // executed parent; txs nil is the streaming shell.
 func (env *lifecycleEnv) block(txs []*solana.Transaction) *b.Block {
 	return &b.Block{
+		Leader:                    env.leader,
 		Slot:                      lifecycleSlot,
 		VoteTimestamps:            make(map[solana.PublicKey]sealevel.BlockTimestamp),
 		Epoch:                     0,
@@ -183,6 +186,7 @@ func (env *lifecycleEnv) block(txs []*solana.Transaction) *b.Block {
 }
 
 type lifecycleOutcome struct {
+	rewards       []rpc.BlockReward
 	bankhash      []byte
 	numSignatures uint64
 	computeUnits  uint64
@@ -245,7 +249,9 @@ func lifecycleWholeBlock(t *testing.T, env *lifecycleEnv, txs []*solana.Transact
 	block.MarkTransactionSignaturesVerified()
 	slotCtx, err := ProcessBlock(env.acctsDb, block, env.epochSchedule, txParallelism, nil, &persistedTracker{}, tail, statuses, false, env.parent)
 	require.NoError(t, err)
-	return lifecycleOutcomeOf(t, slotCtx, tail)
+	outcome := lifecycleOutcomeOf(t, slotCtx, tail)
+	outcome.rewards = block.Rewards
+	return outcome
 }
 
 // lifecycleStream opens the bank on a transaction-less shell, feeds txs in
@@ -312,7 +318,35 @@ func lifecycleStream(t *testing.T, env *lifecycleEnv, txs []*solana.Transaction,
 	require.True(t, exec.closed)
 	require.Equal(t, uint64(1), metrics.GlobalBlockReplay.StreamingExecution.Opened)
 	require.Equal(t, uint64(len(txs)), metrics.GlobalBlockReplay.StreamingExecution.Transactions)
-	return lifecycleOutcomeOf(t, slotCtx, tail), s
+	outcome := lifecycleOutcomeOf(t, slotCtx, tail)
+	outcome.rewards = block.Rewards
+	return outcome, s
+}
+
+func TestStreamingLifecycleRecordsExecutedFeeRewards(t *testing.T) {
+	previousStreaming, previousSchedule := StreamingExecutionCfg, global.ManageLeaderSchedule()
+	StreamingExecutionCfg = StreamingExecutionConfig{Enabled: true}
+	global.SetManageLeaderSchedule(true)
+	t.Cleanup(func() {
+		StreamingExecutionCfg = previousStreaming
+		global.SetManageLeaderSchedule(previousSchedule)
+	})
+	txs := transferTransactions(t, 4, 1_200)
+	leader := txfixture.DestPubkey()
+	wholeEnv := newLifecycleEnv(t)
+	wholeEnv.leader = leader
+	whole := lifecycleWholeBlock(t, wholeEnv, txs, 2)
+	require.Len(t, whole.rewards, 1)
+	require.Equal(t, rpc.RewardTypeFee, whole.rewards[0].RewardType)
+	require.Equal(t, leader, whole.rewards[0].Pubkey)
+	require.Equal(t, int64(10_000), whole.rewards[0].Lamports)
+	require.Equal(t, whole.delta[leader].Lamports, whole.rewards[0].PostBalance)
+
+	streamedEnv := newLifecycleEnv(t)
+	streamedEnv.leader = leader
+	streamed, _ := lifecycleStream(t, streamedEnv, txs, []int{2}, 1, 2)
+	requireSameLifecycleOutcome(t, whole, streamed)
+	require.Equal(t, whole.rewards, streamed.rewards)
 }
 
 func TestStreamingLifecycleMatchesWholeBlock(t *testing.T) {

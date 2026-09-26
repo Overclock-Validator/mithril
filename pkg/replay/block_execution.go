@@ -561,6 +561,9 @@ func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
 		slotCtx.LamportsBurnt = fees.DistributeTxFeesToSlotLeader(acctsDb, slotCtx, block.Leader, &txFeeAccumulator)
 		slotCtx.RecordModifiedAcct(block.Leader)
 	}
+	if err := recordBlockFeeReward(block, slotCtx, &txFeeAccumulator); err != nil {
+		return nil, err
+	}
 	metrics.GlobalBlockReplay.Reward.AddTimingSince(start)
 
 	start = time.Now()

@@ -13,8 +13,12 @@ const (
 	rpcCodeInvalidParams jsonrpc.ErrorCode = -32602
 	// -32002 matches Agave's SendTransactionPreflightFailure.
 	rpcCodeSendTransactionPreflightFailure jsonrpc.ErrorCode = -32002
+	// -32004 matches Agave's BlockNotAvailable error.
+	rpcCodeBlockNotAvailable jsonrpc.ErrorCode = -32004
 	// -32016 is Agave's reserved code for MinContextSlotNotReached.
 	rpcCodeMinContextSlotNotReached jsonrpc.ErrorCode = -32016
+	// -32007 matches Agave's SlotSkipped error.
+	rpcCodeSlotSkipped jsonrpc.ErrorCode = -32007
 )
 
 type MinContextSlotNotReachedError struct {
@@ -57,6 +61,44 @@ func (e *MinContextSlotNotReachedError) FromJSONRPCError(rpcErr jsonrpc.JSONRPCE
 
 type InvalidParamsError struct {
 	Message string
+}
+
+type SlotSkippedError struct {
+	Slot uint64
+}
+
+type BlockNotAvailableError struct {
+	Slot uint64
+}
+
+func (e *BlockNotAvailableError) Error() string {
+	return fmt.Sprintf("Block not available for slot %d", e.Slot)
+}
+
+func (e *BlockNotAvailableError) ToJSONRPCError() (jsonrpc.JSONRPCError, error) {
+	return jsonrpc.JSONRPCError{Code: rpcCodeBlockNotAvailable, Message: e.Error()}, nil
+}
+
+func (e *BlockNotAvailableError) FromJSONRPCError(rpcErr jsonrpc.JSONRPCError) error {
+	if rpcErr.Code != rpcCodeBlockNotAvailable {
+		return fmt.Errorf("unexpected code %d for BlockNotAvailableError", rpcErr.Code)
+	}
+	return nil
+}
+
+func (e *SlotSkippedError) Error() string {
+	return fmt.Sprintf("Slot %d was skipped", e.Slot)
+}
+
+func (e *SlotSkippedError) ToJSONRPCError() (jsonrpc.JSONRPCError, error) {
+	return jsonrpc.JSONRPCError{Code: rpcCodeSlotSkipped, Message: e.Error()}, nil
+}
+
+func (e *SlotSkippedError) FromJSONRPCError(rpcErr jsonrpc.JSONRPCError) error {
+	if rpcErr.Code != rpcCodeSlotSkipped {
+		return fmt.Errorf("unexpected code %d for SlotSkippedError", rpcErr.Code)
+	}
+	return nil
 }
 
 func (e *InvalidParamsError) Error() string { return e.Message }
@@ -114,6 +156,8 @@ func rpcErrorRegistry() jsonrpc.Errors {
 	errs := jsonrpc.NewErrors()
 	errs.Register(rpcCodeInvalidParams, new(*InvalidParamsError))
 	errs.Register(rpcCodeSendTransactionPreflightFailure, new(*SendTransactionPreflightFailureError))
+	errs.Register(rpcCodeBlockNotAvailable, new(*BlockNotAvailableError))
 	errs.Register(rpcCodeMinContextSlotNotReached, new(*MinContextSlotNotReachedError))
+	errs.Register(rpcCodeSlotSkipped, new(*SlotSkippedError))
 	return errs
 }
