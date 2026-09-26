@@ -43,6 +43,9 @@ type CalculatedStakePoints struct {
 	Points                              wide.Uint128
 	NewCreditsObserved                  uint64
 	ForceCreditsUpdateWithSkippedReward bool
+	// Inactive is set by Alpenglow points calculation when the delegation
+	// has neither effective nor activating stake in the rewarded epoch.
+	Inactive bool
 }
 
 const legacyInflationSlotsPerYear = 78_892_314.984
@@ -708,11 +711,14 @@ func calculateStakePointsAndCredits(
 		}
 		newObserved = max(newObserved, latest.Credits)
 
-		effectiveStake := delegation.StakeActivatingAndDeactivating(
+		status := delegation.StakeActivatingAndDeactivating(
 			rewardedEpoch, stakeHistory, newRateActivationEpoch,
-		).Effective
-		if earnedCredits == 0 || effectiveStake == 0 {
-			return CalculatedStakePoints{NewCreditsObserved: newObserved}
+		)
+		if earnedCredits == 0 || status.Effective == 0 {
+			return CalculatedStakePoints{
+				NewCreditsObserved: newObserved,
+				Inactive:           status.Effective == 0 && status.Activating == 0,
+			}
 		}
 		totalStake := mode.RewardEpochDelegatedStakes[delegation.VoterPubkey]
 		if totalStake == 0 {
@@ -722,7 +728,7 @@ func calculateStakePointsAndCredits(
 			}
 		}
 		points := wide.Uint128FromUint64(earnedCredits).
-			Mul(wide.Uint128FromUint64(effectiveStake)).
+			Mul(wide.Uint128FromUint64(status.Effective)).
 			Div(wide.Uint128FromUint64(totalStake))
 		return CalculatedStakePoints{Points: points, NewCreditsObserved: newObserved}
 	}
@@ -800,10 +806,14 @@ func shouldForceCreditsOnly(
 	pointValueRewards, activationEpoch, rewardedEpoch, creditsObserved uint64,
 	mode RewardCalculationMode,
 ) bool {
+	// Agave's skipped-reward credit advance applies only to effective or
+	// activating Alpenglow stakes. Fully cooled stakes must retain their
+	// account bytes, even though their vote account has earned new credits.
+	// The explicit forced-update cases still take precedence.
 	return pcs.ForceCreditsUpdateWithSkippedReward ||
 		pointValueRewards == 0 ||
 		activationEpoch == rewardedEpoch ||
-		(mode.FullAlpenglow && pcs.Points.Eq(wide.Uint128{}) && pcs.NewCreditsObserved != creditsObserved)
+		(mode.FullAlpenglow && !pcs.Inactive && pcs.Points.Eq(wide.Uint128{}) && pcs.NewCreditsObserved != creditsObserved)
 }
 
 // CalculateRewardsStreaming performs a streaming calculation of stake rewards.

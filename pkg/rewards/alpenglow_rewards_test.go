@@ -132,6 +132,59 @@ func TestAlpenglowEarnedPointsAreNotCreditsOnly(t *testing.T) {
 	))
 }
 
+func TestAlpenglowSkippedRewardCreditsRespectStakeActivation(t *testing.T) {
+	votePubkey := solana.PublicKey{1}
+	voteState := &sealevel.VoteStateVersions{
+		Type: sealevel.VoteStateVersionV4,
+		V4: sealevel.VoteState4{EpochCredits: []sealevel.EpochCredits{{
+			Epoch: 115, Credits: 2_000, PrevCredits: 1_000,
+		}}},
+	}
+	mode := RewardCalculationMode{
+		FullAlpenglow:              true,
+		RewardEpochDelegatedStakes: map[solana.PublicKey]uint64{votePubkey: 1_000_000},
+	}
+	for _, tc := range []struct {
+		name                     string
+		activation, deactivation uint64
+		advance                  bool
+	}{
+		{"fully cooled in rewarded epoch", 103, 114, false},
+		{"not yet activating", 116, math.MaxUint64, false},
+		{"activating in rewarded epoch", 115, math.MaxUint64, true},
+		{"effective fractional reward", 103, math.MaxUint64, true},
+		{"still cooling in rewarded epoch", 103, 115, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			delegation := &sealevel.Delegation{
+				VoterPubkey: votePubkey, StakeLamports: 1,
+				ActivationEpoch: tc.activation, DeactivationEpoch: tc.deactivation,
+				CreditsObserved: 1_000,
+			}
+			pcs := calculateStakePointsAndCredits(solana.PublicKey{}, &sealevel.SysvarStakeHistory{},
+				delegation, voteState, nil, 115, mode)
+			require.True(t, pcs.Points.Eq(wide.Uint128{}))
+			require.Equal(t, uint64(2_000), pcs.NewCreditsObserved)
+			require.Equal(t, tc.advance, shouldForceCreditsOnly(pcs, 1, tc.activation, 115, 1_000, mode))
+		})
+	}
+}
+
+func TestInactiveStakePreservesExplicitCreditUpdates(t *testing.T) {
+	pcs := CalculatedStakePoints{NewCreditsObserved: 2_000, Inactive: true}
+	mode := RewardCalculationMode{FullAlpenglow: true}
+	require.False(t, shouldForceCreditsOnly(pcs, 1, 103, 115, 1_000, mode))
+	require.True(t, shouldForceCreditsOnly(pcs, 0, 103, 115, 1_000, mode), "disabled inflation")
+	require.True(t, shouldForceCreditsOnly(pcs, 1, 115, 115, 1_000, mode), "activation epoch")
+	pcs.ForceCreditsUpdateWithSkippedReward = true
+	require.True(t, shouldForceCreditsOnly(pcs, 1, 103, 115, 3_000, mode), "vote credit rewind")
+
+	// Tower does not inherit Alpenglow's automatic skipped-reward advance.
+	pcs.ForceCreditsUpdateWithSkippedReward = false
+	pcs.Inactive = false
+	require.False(t, shouldForceCreditsOnly(pcs, 1, 103, 115, 1_000, RewardCalculationMode{}))
+}
+
 func TestInflationRewardsUseHistoricalSlotTimeTransitions(t *testing.T) {
 	schedule := &sealevel.SysvarEpochSchedule{
 		SlotsPerEpoch:            54_000,

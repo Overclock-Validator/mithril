@@ -195,7 +195,7 @@ func TestExecute_Tx_System_Program_CreateAccount_Not_Enough_Accts_Failure(t *tes
 	WriteRentSysvar(&execCtx.Accounts, rent)
 
 	err = execCtx.ProcessInstruction(instrBytes, instructionAccts, []uint64{0})
-	assert.Equal(t, InstrErrNotEnoughAccountKeys, err)
+	assert.Equal(t, InstrErrMissingAccount, err)
 }
 
 func TestExecute_Tx_System_Program_CreateAccount_New_Acct_Has_Lamports_Failure(t *testing.T) {
