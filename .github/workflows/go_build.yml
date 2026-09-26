@@ -18,5 +18,35 @@ jobs:
       - name: Build
         run: go build -v ./cmd/mithril
 
-      - name: Test gossip and networking
-        run: go test -race ./pkg/gossip ./pkg/repair ./pkg/turbine ./pkg/blockstream
+  regression-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      GOMAXPROCS: "2"
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: 1.26.4
+
+      - name: Voting, checkpoint, streaming and scheduler race regressions
+        # Run the complete affected package suites, including subprocess crash
+        # recovery and cancellation tests.
+        run: >-
+          go test -race -p 2 -count=1
+          ./pkg/alpenglow ./pkg/consensus ./pkg/replay ./pkg/rewards
+          ./pkg/turbine ./pkg/sigverify ./pkg/blockprod/...
+          ./cmd/mithril/node ./cmd/mithril/configcmd
+
+      - name: Interpreter differential and memory race regressions
+        run: go test -race -count=1 ./pkg/sbpf/...
+
+      - name: Sealevel interpreter, syscall and vote ownership regressions
+        run: go test -race -count=1 ./pkg/sealevel
+
+      - name: Gossip and networking regressions
+        run: go test -race -p 2 -count=1 ./pkg/gossip ./pkg/repair ./pkg/blockstream
