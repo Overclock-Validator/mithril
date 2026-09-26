@@ -318,15 +318,17 @@ type BlockSource struct {
 	maxInflight int
 
 	// Tip tracking
-	confirmedTip      atomic.Uint64
-	processedTip      atomic.Uint64 // Processed commitment tip (super tip)
-	tipAtSlot         atomic.Uint64 // What slot we had executed when tip was measured
-	lastExecutedSlot  atomic.Uint64 // Replay's consumed frontier, including skips (set by SetLastExecutedSlot)
-	tipSafetyMargin   uint64
-	tipPollInterval   time.Duration
-	lastTipUpdate     atomic.Int64  // Unix timestamp of last successful tip poll
-	tipPollFailures   atomic.Uint64 // Consecutive tip poll failures
-	totalTipPollFails atomic.Uint64 // Total tip poll failures (for stats)
+	confirmedTip          atomic.Uint64
+	observedConfirmedTip  atomic.Uint64 // Latest confirmed slot returned by a configured RPC
+	processedTip          atomic.Uint64 // Processed commitment tip (super tip)
+	tipAtSlot             atomic.Uint64 // What slot we had executed when tip was measured
+	lastExecutedSlot      atomic.Uint64 // Replay's consumed frontier, including skips (set by SetLastExecutedSlot)
+	tipSafetyMargin       uint64
+	tipPollInterval       time.Duration
+	lastTipUpdate         atomic.Int64  // Unix timestamp of last tip update (poll or fetched block)
+	lastObservedTipUpdate atomic.Int64  // Unix timestamp of last successful confirmed-tip RPC poll
+	tipPollFailures       atomic.Uint64 // Consecutive tip poll failures
+	totalTipPollFails     atomic.Uint64 // Total tip poll failures (for stats)
 
 	// Reorder buffer
 	reorderMu     sync.Mutex
@@ -2474,10 +2476,19 @@ func (bs *BlockSource) NotifyBlockStart(slot uint64) {
 // This allows accurate distance calculation: tip - tipAtSlot is precise at measurement time.
 func (bs *BlockSource) updateTipSnapshot(confirmedTip uint64) {
 	slotAtTip := bs.lastExecutedSlot.Load()
+	now := time.Now().Unix()
 
 	bs.confirmedTip.Store(confirmedTip)
 	bs.tipAtSlot.Store(slotAtTip)
-	bs.lastTipUpdate.Store(time.Now().Unix())
+	bs.lastTipUpdate.Store(now)
+	bs.observedConfirmedTip.Store(confirmedTip)
+	bs.lastObservedTipUpdate.Store(now)
+}
+
+// HealthSlot returns a recently observed network tip, not a replay-derived estimate.
+func (bs *BlockSource) HealthSlot() (uint64, bool) {
+	updated := bs.lastObservedTipUpdate.Load()
+	return bs.observedConfirmedTip.Load(), updated > 0 && time.Since(time.Unix(updated, 0)) <= max(30*time.Second, 2*bs.tipPollInterval)
 }
 
 // RefreshTipsForSummary triggers an async refresh of both confirmed and processed tips.
@@ -2524,9 +2535,12 @@ func (bs *BlockSource) RefreshTipsForSummary() {
 
 		// Store results
 		if maxConfirmed > 0 {
+			now := time.Now().Unix()
 			bs.confirmedTip.Store(maxConfirmed)
 			bs.tipAtSlot.Store(slotAtTip)
-			bs.lastTipUpdate.Store(time.Now().Unix())
+			bs.lastTipUpdate.Store(now)
+			bs.observedConfirmedTip.Store(maxConfirmed)
+			bs.lastObservedTipUpdate.Store(now)
 			bs.tipPollFailures.Store(0)
 		}
 		if maxProcessed > 0 {
