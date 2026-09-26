@@ -622,6 +622,15 @@ func TestDecodeAlpenglowParentMarkers(t *testing.T) {
 func TestSlotAssemblerRecoversMissingMerkleDataShredFromCodingShreds(t *testing.T) {
 	dataShreds := localnetMerkleShreds(t, "d")
 	codeShreds := localnetMerkleShreds(t, "c")
+	// These 2022 fixtures supply a useful non-power-of-two, unchained 1+17
+	// erasure layout, but their old proofs do not yield a common root under
+	// today's Merkle hashing. Re-sign each complete tree using current proofs;
+	// recovery must now authenticate the tree, not just reconstruct the data.
+	for i, data := range dataShreds {
+		packets := append([][]byte{data}, codeShreds[i*17:(i+1)*17]...)
+		resignRecoveryFixture(t, packets)
+	}
+
 	if len(dataShreds) < 2 || len(codeShreds) == 0 {
 		t.Fatalf("fixture needs data and coding shreds")
 	}

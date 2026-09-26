@@ -17,86 +17,52 @@ func TestTransactionVerifierCancellationDuringBlockedAdmissionJoinsAdmittedJobs(
 	const workers = 2
 	blocker := verifierTestBlock(workers)
 	target := verifierTestBlock(2 * workers)
-	filler := &solana.Transaction{}
-
 	release := make(chan struct{})
 	var releaseOnce sync.Once
 	started := make(chan struct{}, workers)
 	var targetFirstCalls atomic.Int32
 	var targetLaterCalls atomic.Int32
-
-	verifier := newTransactionVerifier(workers, workers, func(tx *solana.Transaction) error {
+	// Single-transaction groups make the blocked-admission boundary exact.
+	verifier := newTransactionVerifierWithBatchTarget(workers, 1, 1, func(tx *solana.Transaction) error {
 		switch tx {
 		case blocker.Transactions[0], blocker.Transactions[1]:
 			started <- struct{}{}
 			<-release
 		case target.Transactions[0]:
 			targetFirstCalls.Add(1)
-		case target.Transactions[1], target.Transactions[2], target.Transactions[3]:
+		default:
 			targetLaterCalls.Add(1)
 		}
 		return nil
 	})
-
+	defer verifier.closeAndWait()
+	defer releaseOnce.Do(func() { close(release) })
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	blockerDone := make(chan error, 1)
 	targetDone := make(chan error, 1)
-	var calls sync.WaitGroup
-	calls.Add(1)
-	go func() {
-		defer calls.Done()
-		blockerDone <- verifier.verifyBlock(blocker)
-	}()
+	go func() { blockerDone <- verifier.verifyBlock(blocker) }()
 	for range workers {
-		select {
-		case <-started:
-		case <-time.After(3 * time.Second):
-			cancel()
-			releaseOnce.Do(func() { close(release) })
-			calls.Wait()
-			verifier.closeAndWait()
-			t.Fatal("timed out occupying transaction verifier workers")
-		}
+		waitSignal(t, started, "occupied verifier worker")
 	}
 
-	// Leave one queued job ahead of the target. With both workers occupied and
-	// a two-entry queue, the target admits transaction 0 and then blocks trying
-	// to admit transaction 1. Cancellation must wait for transaction 0 to drain,
-	// while transactions 1 and all later chunks must never reach a worker.
-	var fillerErr error
-	var fillerDone sync.WaitGroup
-	fillerDone.Add(1)
-	verifier.jobs <- transactionVerifyJob{tx: filler, err: &fillerErr, done: &fillerDone}
-
-	calls.Add(1)
-	go func() {
-		defer calls.Done()
-		targetDone <- verifier.verifyBlockContext(ctx, target)
-	}()
+	// Both workers are occupied. The target's first group fills the one-entry
+	// queue, and its second blocks on admission. Cancellation must still join
+	// the first group while preventing any later transactions from running.
+	go func() { targetDone <- verifier.verifyBlockContext(ctx, target) }()
 	deadline := time.Now().Add(3 * time.Second)
 	for len(verifier.jobs) != cap(verifier.jobs) {
 		if time.Now().After(deadline) {
-			cancel()
-			releaseOnce.Do(func() { close(release) })
-			calls.Wait()
-			fillerDone.Wait()
-			verifier.closeAndWait()
-			t.Fatalf("transaction queue did not fill: len=%d cap=%d", len(verifier.jobs), cap(verifier.jobs))
+			t.Fatal("transaction queue did not fill")
 		}
 		time.Sleep(time.Millisecond)
 	}
-
 	cancel()
 	select {
 	case err := <-targetDone:
-		releaseOnce.Do(func() { close(release) })
-		calls.Wait()
-		fillerDone.Wait()
-		verifier.closeAndWait()
 		t.Fatalf("canceled verifier returned before its admitted job joined: %v", err)
 	case <-time.After(50 * time.Millisecond):
 	}
-
 	releaseOnce.Do(func() { close(release) })
 	select {
 	case err := <-targetDone:
@@ -113,13 +79,6 @@ func TestTransactionVerifierCancellationDuringBlockedAdmissionJoinsAdmittedJobs(
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("blocker verification did not drain")
-	}
-	fillerDone.Wait()
-	calls.Wait()
-	verifier.closeAndWait()
-
-	if fillerErr != nil {
-		t.Fatalf("filler verification: %v", fillerErr)
 	}
 	if got := targetFirstCalls.Load(); got != 1 {
 		t.Fatalf("admitted target transaction calls = %d, want 1", got)
