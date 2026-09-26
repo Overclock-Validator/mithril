@@ -165,7 +165,7 @@ func Initialize(cfg LogConfig, runID string) error {
 	// Start background flush goroutine
 	Log.stopCh = make(chan struct{})
 	Log.wg.Add(1)
-	go Log.flushLoop()
+	go Log.flushLoop(Log.stopCh)
 
 	Log.initialized = true
 	return nil
@@ -236,7 +236,7 @@ func (pw *prefixWriter) Write(p []byte) (int, error) {
 }
 
 // flushLoop periodically flushes the buffer and syncs to disk
-func (l *logger) flushLoop() {
+func (l *logger) flushLoop(stopCh <-chan struct{}) {
 	defer l.wg.Done()
 
 	flushTicker := time.NewTicker(2 * time.Second)
@@ -246,7 +246,7 @@ func (l *logger) flushLoop() {
 
 	for {
 		select {
-		case <-l.stopCh:
+		case <-stopCh:
 			return
 		case <-flushTicker.C:
 			l.flush()

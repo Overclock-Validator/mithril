@@ -344,12 +344,52 @@ func writeReplayArtifact(subdir string, filename string, data any) {
 	}
 
 	artifactPath := filepath.Join(dir, filename)
-	if err := os.WriteFile(artifactPath, artifactJSON, 0644); err != nil {
+	file, err := openPrivateArtifact(artifactPath)
+	if err != nil {
 		mlog.Log.Warnf("artifact: failed to write %s: %v", artifactPath, err)
+		return
+	}
+	defer discardPrivateArtifact(file)
+	if _, err := file.Write(artifactJSON); err != nil {
+		mlog.Log.Warnf("artifact: failed to write %s: %v", artifactPath, err)
+		return
+	}
+	if err := publishPrivateArtifact(file, artifactPath); err != nil {
+		mlog.Log.Warnf("artifact: failed to publish %s: %v", artifactPath, err)
 		return
 	}
 
 	mlog.Log.FileOnlyf("artifact written: %s", artifactPath)
+}
+
+func openPrivateArtifact(path string) (*os.File, error) {
+	file, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return nil, err
+	}
+	if err := file.Chmod(0600); err != nil {
+		name := file.Name()
+		_ = file.Close()
+		_ = os.Remove(name)
+		return nil, err
+	}
+	return file, nil
+}
+
+func publishPrivateArtifact(file *os.File, path string) error {
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(file.Name(), path)
+}
+
+func discardPrivateArtifact(file *os.File) {
+	_ = file.Close()
+	_ = os.Remove(file.Name())
 }
 
 func maybeDumpEpochVotingRewardDiff(dbgOpts *DebugOptions, rpcc *rpcclient.RpcClient, block *block.Block, epoch uint64, slot uint64, validatorRewards map[solana.PublicKey]*atomic.Uint64) {
@@ -376,11 +416,11 @@ func maybeDumpEpochVotingRewardDiff(dbgOpts *DebugOptions, rpcc *rpcclient.RpcCl
 	haveRPCFinalized := false
 
 	if rpcc != nil {
-		artifact.RPCEndpoint = rpcc.Endpoint()
+		artifact.RPCEndpoint = rpcc.EndpointForDisplay()
 
 		confirmedBlockRewards, err := rpcc.GetRewardsForSlotWithCommitment(slot, rpc.CommitmentConfirmed, 2*time.Second)
 		if err != nil {
-			artifact.RPCConfirmedError = err.Error()
+			artifact.RPCConfirmedError = rpcclient.SanitizeErrorForDisplay(err)
 		} else {
 			confirmedSnapshot, rewardsByPubkey := collectRPCVotingRewards(confirmedBlockRewards)
 			artifact.RPCConfirmed = &confirmedSnapshot
@@ -392,7 +432,7 @@ func maybeDumpEpochVotingRewardDiff(dbgOpts *DebugOptions, rpcc *rpcclient.RpcCl
 
 		finalizedBlockRewards, err := rpcc.GetRewardsForSlotWithCommitment(slot, rpc.CommitmentFinalized, 2*time.Second)
 		if err != nil {
-			artifact.RPCFinalizedError = err.Error()
+			artifact.RPCFinalizedError = rpcclient.SanitizeErrorForDisplay(err)
 		} else {
 			finalizedSnapshot, rewardsByPubkey := collectRPCVotingRewards(finalizedBlockRewards)
 			artifact.RPCFinalized = &finalizedSnapshot
