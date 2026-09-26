@@ -24,7 +24,7 @@ var splTokenProgramAddr = base58.MustDecodeFromString("TokenkegQfeZyiNwAJbNbGKPF
 // spl token program later.
 func setupSplTokenProgramAccount(t *testing.T, accts *accounts.Accounts) accounts.Account {
 	programBytes := fixtures.Load(t, "sbpf", "spl-token.so")
-	splTokenAcct := accounts.Account{Key: splTokenProgramAddr, Lamports: 0, Data: programBytes, Owner: a.BpfLoader2Addr, Executable: true, RentEpoch: 100}
+	splTokenAcct := accounts.Account{Key: splTokenProgramAddr, Lamports: 1, Data: programBytes, Owner: a.BpfLoader2Addr, Executable: true, RentEpoch: 100}
 
 	pk := [32]byte(splTokenProgramAddr)
 	err := (*accts).SetAccount(&pk, &splTokenAcct)
@@ -201,6 +201,7 @@ func Test_Spl_Token_Program_Demo(t *testing.T) {
 		{Pubkey: SysvarRentAddr, IsSigner: false, IsWritable: false}}
 	instructionAccts := InstructionAcctsFromAccountMetas(acctMetas, *transactionAccts)
 	execCtx.TransactionContext = NewTransactionCtx(*transactionAccts, 5, 64)
+	initializeLegacyBankFixture(t, execCtx)
 
 	// InitializeMint: execute SPL token InitializeMint instruction
 	err := execCtx.ProcessInstruction(initMintInstrData, instructionAccts, []uint64{0})
@@ -231,6 +232,7 @@ func Test_Spl_Token_Program_Demo(t *testing.T) {
 
 	instructionAccts = InstructionAcctsFromAccountMetas(acctMetas, *transactionAccts)
 	execCtx.TransactionContext = NewTransactionCtx(*transactionAccts, 5, 64)
+	initializeLegacyBankFixture(t, execCtx)
 
 	// InitializeAccount: execute SPL token InitializeMint instruction
 	err = execCtx.ProcessInstruction(initAccountInstrData, instructionAccts, []uint64{0})
@@ -260,6 +262,7 @@ func Test_Spl_Token_Program_Demo(t *testing.T) {
 
 	instructionAccts = InstructionAcctsFromAccountMetas(acctMetas, *transactionAccts)
 	execCtx.TransactionContext = NewTransactionCtx(*transactionAccts, 5, 64)
+	initializeLegacyBankFixture(t, execCtx)
 
 	// InitializeAccount: execute SPL token InitializeMint instruction
 	err = execCtx.ProcessInstruction(initAccountInstrData, instructionAccts, []uint64{0})
@@ -281,6 +284,7 @@ func Test_Spl_Token_Program_Demo(t *testing.T) {
 
 	instructionAccts = InstructionAcctsFromAccountMetas(acctMetas, *transactionAccts)
 	execCtx.TransactionContext = NewTransactionCtx(*transactionAccts, 5, 64)
+	initializeLegacyBankFixture(t, execCtx)
 
 	// MintTo: serialize up a MintTo instruction
 	numTokensToMint := uint64(61616161)
@@ -306,6 +310,7 @@ func Test_Spl_Token_Program_Demo(t *testing.T) {
 
 	instructionAccts = InstructionAcctsFromAccountMetas(acctMetas, *transactionAccts)
 	execCtx.TransactionContext = NewTransactionCtx(*transactionAccts, 5, 64)
+	initializeLegacyBankFixture(t, execCtx)
 
 	// Transfer: serialize up a Transfer instruction
 	numTokensToTransfer := uint64(1337)

@@ -455,3 +455,16 @@ func TestWaitForAlpenglowReplayInputHonorsCancellation(t *testing.T) {
 	require.Nil(t, parentSwitch)
 	require.Nil(t, certifiedSwitch)
 }
+
+func TestSwitchPeekDoesNotConsumeDecision(t *testing.T) {
+	q := &fakeChainQuery{certified: map[uint64]alpenglow.BlockID{101: {Slot: 101, Hash: swHash(9)}}, skipped: map[uint64]bool{}, version: 1}
+	s := newTestSweeper(q)
+	executed := map[uint64]solana.Hash{101: swHash(1)}
+	before := *s
+	first := s.peek(executed, 100, 101)
+	require.NotNil(t, first)
+	require.Equal(t, before, *s)
+	require.Equal(t, first, s.peek(executed, 100, 101))
+	require.Equal(t, first, s.sweep(executed, 100, 101), "replay still receives the switch")
+	require.Nil(t, s.sweep(executed, 100, 101), "normal sweep still consumes its gate")
+}
