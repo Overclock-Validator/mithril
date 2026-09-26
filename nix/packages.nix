@@ -60,7 +60,7 @@ in {
         subPackages = [
           "cmd/mithril"
         ];
-        vendorHash = "sha256-Vh2jJoKjuikI0IKEEniZVPsavfZYXtDzPKxJUxl7d8s=";
+        vendorHash = "sha256-6IQPqBlFnsvFParPAajkypnF9jBykOiQBdtb9+gQTFI=";
         nativeBuildInputs = [pkgs.pkg-config];
         buildInputs = [pkgs.zstd];
         env = {

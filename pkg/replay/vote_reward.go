@@ -81,19 +81,17 @@ func ApplyAlpenglowVoteRewards(
 			return fmt.Errorf("slot %d vote rewards: %w", block.Slot, err)
 		}
 
-		validated, validationTimings, err := rewardcerts.ValidateRewardCertificatesWithVerifier(
+		validated, validationTimings, err := verifierMaterial.validateRewardCertificates(
 			block.Slot,
 			skipRaw,
 			notarRaw,
-			rewardEpoch,
-			verifierMaterial.verifier,
 			rewardDetails != nil,
 		)
 		if rewardDetails != nil {
-			if len(skipRaw) > 0 {
+			if validationTimings.Skip > 0 {
 				rewardDetails.SkipCertificateValidation.AddTiming(validationTimings.Skip)
 			}
-			if len(notarRaw) > 0 {
+			if validationTimings.Notar > 0 {
 				rewardDetails.NotarCertificateValidation.AddTiming(validationTimings.Notar)
 			}
 		}

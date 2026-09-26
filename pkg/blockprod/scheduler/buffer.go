@@ -4,15 +4,17 @@ import (
 	"container/heap"
 	"sync"
 
+	"github.com/Overclock-Validator/mithril/pkg/replay"
 	"github.com/gagliardetto/solana-go"
 )
 
-// MaxBufferedTxns is the hard cap on cross-slot buffered transactions.
+// MaxBufferedTxns is the default cap on cross-slot buffered transactions.
 const MaxBufferedTxns = 2 * 65536
 
 // entry is one buffered, scored transaction.
 type entry struct {
-	tx *solana.Transaction
+	tx       *solana.Transaction
+	prepared *replay.PreparedTransaction
 	// wire is an owned copy of the packet bytes. Parsed tx fields may alias it
 	// (solana-go decoder slices), so it must outlive any use of tx.
 	wire        []byte
@@ -25,37 +27,34 @@ type entry struct {
 	// (e.g. cost limit). The entry is retained for cross-slot retry.
 	skipGen uint64
 
-	alive  bool
-	maxIdx int
-	minIdx int
+	alive bool
+	// Indexes belong to Buffer.mu. Every buffered entry appears exactly once
+	// in each heap; -1 denotes absence while an entry is owned by the consumer.
+	maxIndex, minIndex int
 }
 
 type maxHeap []*entry
 
 func (h maxHeap) Len() int { return len(h) }
 func (h maxHeap) Less(i, j int) bool {
-	if h[i].reward != h[j].reward {
-		return h[i].reward > h[j].reward
-	}
-	return h[i].seq < h[j].seq // older first on ties
+	return higherPriority(h[i], h[j])
 }
 func (h maxHeap) Swap(i, j int) {
 	h[i], h[j] = h[j], h[i]
-	h[i].maxIdx = i
-	h[j].maxIdx = j
+	h[i].maxIndex, h[j].maxIndex = i, j
 }
 func (h *maxHeap) Push(x any) {
 	e := x.(*entry)
-	e.maxIdx = len(*h)
+	e.maxIndex = len(*h)
 	*h = append(*h, e)
 }
 func (h *maxHeap) Pop() any {
 	old := *h
 	n := len(old)
 	e := old[n-1]
+	e.maxIndex = -1
 	old[n-1] = nil
 	*h = old[:n-1]
-	e.maxIdx = -1
 	return e
 }
 
@@ -71,21 +70,20 @@ func (h minHeap) Less(i, j int) bool {
 }
 func (h minHeap) Swap(i, j int) {
 	h[i], h[j] = h[j], h[i]
-	h[i].minIdx = i
-	h[j].minIdx = j
+	h[i].minIndex, h[j].minIndex = i, j
 }
 func (h *minHeap) Push(x any) {
 	e := x.(*entry)
-	e.minIdx = len(*h)
+	e.minIndex = len(*h)
 	*h = append(*h, e)
 }
 func (h *minHeap) Pop() any {
 	old := *h
 	n := len(old)
 	e := old[n-1]
+	e.minIndex = -1
 	old[n-1] = nil
 	*h = old[:n-1]
-	e.minIdx = -1
 	return e
 }
 
@@ -131,27 +129,41 @@ const (
 	InsertRejectedCapacity
 )
 
+// precheck rejects entries that cannot be admitted now, without reserving space
+// or evicting anything. Preparation runs outside mu; Insert must recheck because
+// concurrent arrivals or draining can change both duplicates and the floor.
+func (b *Buffer) precheck(e *entry) InsertResult {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.admissionLocked(e)
+}
+
+func (b *Buffer) admissionLocked(e *entry) InsertResult {
+	if e == nil || e.tx == nil {
+		return InsertRejectedCapacity
+	}
+	if _, exists := b.byHash[e.messageHash]; exists {
+		return InsertDuplicate
+	}
+	if b.alive >= b.capacity {
+		min := b.peekMinAliveLocked()
+		if min == nil || e.reward <= min.reward {
+			return InsertRejectedCapacity
+		}
+	}
+	return InsertAccepted
+}
+
 // Insert adds e when not a duplicate. At capacity, the lowest-reward entry is
 // evicted if e has a strictly higher reward; otherwise e is rejected.
 func (b *Buffer) Insert(e *entry) (InsertResult, *entry) {
-	if e == nil || e.tx == nil {
-		return InsertRejectedCapacity, nil
-	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-
-	if _, exists := b.byHash[e.messageHash]; exists {
-		return InsertDuplicate, nil
+	if result := b.admissionLocked(e); result != InsertAccepted {
+		return result, nil
 	}
 	var evicted *entry
 	if b.alive >= b.capacity {
-		min := b.peekMinAliveLocked()
-		if min == nil {
-			return InsertRejectedCapacity, nil
-		}
-		if e.reward <= min.reward {
-			return InsertRejectedCapacity, nil
-		}
 		evicted = b.popMinAliveLocked()
 	}
 	b.pushAliveLocked(e)
@@ -173,21 +185,19 @@ func (b *Buffer) Cleanup(drop func(*entry) bool) int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	var doomed []*entry
+	dropped := 0
 	for _, e := range b.byHash {
-		if e.alive && drop(e) {
-			doomed = append(doomed, e)
+		if drop(e) {
+			b.killLocked(e)
+			dropped++
 		}
 	}
-	for _, e := range doomed {
-		b.killLocked(e)
-	}
-	b.drainDeadLocked()
-	return len(doomed)
+	return dropped
 }
 
 func (b *Buffer) pushAliveLocked(e *entry) {
 	e.alive = true
+	e.maxIndex, e.minIndex = -1, -1
 	b.byHash[e.messageHash] = e
 	heap.Push(&b.max, e)
 	heap.Push(&b.min, e)
@@ -198,56 +208,79 @@ func (b *Buffer) killLocked(e *entry) {
 	if e == nil || !e.alive {
 		return
 	}
+	if e.maxIndex >= 0 {
+		heap.Remove(&b.max, e.maxIndex)
+	}
+	if e.minIndex >= 0 {
+		heap.Remove(&b.min, e.minIndex)
+	}
 	e.alive = false
 	delete(b.byHash, e.messageHash)
 	b.alive--
 }
 
 func (b *Buffer) popMaxAliveLocked() *entry {
-	for b.max.Len() > 0 {
-		e := heap.Pop(&b.max).(*entry)
-		if !e.alive {
-			continue
-		}
+	if b.max.Len() > 0 {
+		e := b.max.popEntry()
 		b.killLocked(e)
 		return e
 	}
 	return nil
 }
 
-func (b *Buffer) peekMinAliveLocked() *entry {
-	for b.min.Len() > 0 {
-		if b.min[0].alive {
-			return b.min[0]
+// popEntry moves the winning child into the hole at each level. This avoids
+// interface dispatch and swapping two entries at every level of a large queue.
+// Ordering is identical to maxHeap.Less, including FIFO for equal rewards.
+func (h *maxHeap) popEntry() *entry {
+	nodes := *h
+	root := nodes[0]
+	root.maxIndex = -1
+	last := nodes[len(nodes)-1]
+	nodes[len(nodes)-1] = nil
+	nodes = nodes[:len(nodes)-1]
+	if len(nodes) > 0 {
+		i := 0
+		for {
+			child := 2*i + 1
+			if child >= len(nodes) {
+				break
+			}
+			if child+1 < len(nodes) && higherPriority(nodes[child+1], nodes[child]) {
+				child++
+			}
+			if !higherPriority(nodes[child], last) {
+				break
+			}
+			nodes[i] = nodes[child]
+			nodes[i].maxIndex = i
+			i = child
 		}
-		heap.Pop(&b.min)
+		nodes[i] = last
+		last.maxIndex = i
+	}
+	*h = nodes
+	return root
+}
+
+func higherPriority(a, b *entry) bool {
+	if a.reward != b.reward {
+		return a.reward > b.reward
+	}
+	return a.seq < b.seq
+}
+
+func (b *Buffer) peekMinAliveLocked() *entry {
+	if b.min.Len() > 0 {
+		return b.min[0]
 	}
 	return nil
 }
 
 func (b *Buffer) popMinAliveLocked() *entry {
-	for b.min.Len() > 0 {
+	if b.min.Len() > 0 {
 		e := heap.Pop(&b.min).(*entry)
-		if !e.alive {
-			continue
-		}
 		b.killLocked(e)
 		return e
 	}
 	return nil
-}
-
-func (b *Buffer) drainDeadLocked() {
-	for b.max.Len() > 0 {
-		if b.max[0].alive {
-			break
-		}
-		heap.Pop(&b.max)
-	}
-	for b.min.Len() > 0 {
-		if b.min[0].alive {
-			break
-		}
-		heap.Pop(&b.min)
-	}
 }

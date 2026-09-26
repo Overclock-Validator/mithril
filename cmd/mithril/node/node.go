@@ -76,35 +76,40 @@ var (
 		},
 	}
 
-	bootstrapMode                   string // "auto", "snapshot", "new-snapshot", "new-incremental", or "accountsdb"
-	snapshotArchivePath             string
-	incrementalSnapshotFilename     string
-	accountsPath                    string
-	scratchDirectory                string
-	rpcEndpoints                    []string
-	cluster                         string // "alpenglow", "mainnet-beta", "testnet", or "devnet"
-	legacyGenesisHash               string // explicit lineage for pre-binding AccountsDB/ledger artifacts
-	blockSource                     string // "turbine", "rpc", or "lightbringer"
-	lightbringerEndpoint            string
-	repairCatchupMaxGapSlots        int    // Resume gaps up to this fill via turbine repair instead of RPC (0 = off)
-	repairMaxRequestsPerSecond      int    // Repair request-rate ceiling override (0 = adaptive default)
-	blockRPCFallback                bool   // Allow RPC block fetch when > repairCatchupMaxGapSlots behind (default false: shreds only)
-	blockMaxRPS                     int    // Rate limit for block fetching
-	blockMaxInflight                int    // Max concurrent block fetch workers
-	blockTipPollIntervalMs          int    // Tip poll interval in milliseconds
-	blockTipSafetyMargin            int    // Don't fetch within N slots of tip
-	consensusModeFlag               string // raw --consensus-mode value (cobra binding)
-	consensusMode                   string // resolved: "verifying" (default) or "validator"
-	alpenglowObserverBindAddr       string
-	alpenglowMaxMessageBytes        int64
-	alpenglowBLSDST                 string
-	validatorIdentityKeypair        string
-	validatorVoteAccountKeypair     string
-	validatorAuthorizedVoterKeypair string
-	validatorWithdrawerKeypair      string
-	validatorTPUQUICBind            string
-	validatorAdvertisedIP           string
-	validatorSigverifyWorkers       int
+	bootstrapMode                    string // "auto", "snapshot", "new-snapshot", "new-incremental", or "accountsdb"
+	snapshotArchivePath              string
+	incrementalSnapshotFilename      string
+	accountsPath                     string
+	scratchDirectory                 string
+	rpcEndpoints                     []string
+	cluster                          string // "alpenglow", "mainnet-beta", "testnet", or "devnet"
+	legacyGenesisHash                string // explicit lineage for pre-binding AccountsDB/ledger artifacts
+	blockSource                      string // "turbine", "rpc", or "lightbringer"
+	lightbringerEndpoint             string
+	repairCatchupMaxGapSlots         int    // Resume gaps up to this fill via turbine repair instead of RPC (0 = off)
+	repairMaxRequestsPerSecond       int    // Repair request-rate ceiling override (0 = adaptive default)
+	blockRPCFallback                 bool   // Allow RPC block fetch when > repairCatchupMaxGapSlots behind (default false: shreds only)
+	blockMaxRPS                      int    // Rate limit for block fetching
+	blockMaxInflight                 int    // Max concurrent block fetch workers
+	blockTipPollIntervalMs           int    // Tip poll interval in milliseconds
+	blockTipSafetyMargin             int    // Don't fetch within N slots of tip
+	consensusModeFlag                string // raw --consensus-mode value (cobra binding)
+	consensusMode                    string // resolved: "verifying" (default) or "validator"
+	alpenglowObserverBindAddr        string
+	alpenglowMaxMessageBytes         int64
+	alpenglowBLSDST                  string
+	validatorIdentityKeypair         string
+	validatorVoteAccountKeypair      string
+	validatorAuthorizedVoterKeypair  string
+	validatorWithdrawerKeypair       string
+	validatorTPUQUICBind             string
+	validatorAdvertisedIP            string
+	validatorSigverifyWorkers        int
+	validatorWaitToVoteSlot          uint64
+	validatorReservedHistory         bool
+	validatorInitializeReservation   bool
+	validatorCompletionReserveMs     int
+	validatorMaxBufferedTransactions int
 
 	// Mode thresholds
 	blockNearTipThreshold        int // Enter near-tip when gap <= this
@@ -123,6 +128,9 @@ var (
 	pprofPort      int64
 	blockstorePath string
 	txParallelism  int64
+	// streamingMaxOpenMs is --streaming-max-open-ms; resolved into
+	// replay.StreamingExecutionCfg.MaxOpenAge with the other [replay] keys.
+	streamingMaxOpenMs int
 
 	debugTxs                       []string
 	debugAcctWrites                []string
@@ -536,6 +544,14 @@ func init() {
 	// [replay] section flags
 	Run.Flags().Int64Var(&txParallelism, "txpar", 0, "Transaction execution workers (>0 enables topsort parallelism; explicit 0 is sequential; unset validator mode defaults to 2x CPU cores)")
 	Run.Flags().Int64Var(&numReplaySlots, "num-slots", 0, "Number of slots to replay (0 = run continuously)")
+	Run.Flags().BoolVar(&replay.StreamingExecutionCfg.Enabled, "streaming-execution", false,
+		"Execute Turbine blocks while their shreds arrive (Alpenglow validator/verifying modes only; the complete block remains authoritative and any mismatch falls back to whole-block execution)")
+	Run.Flags().IntVar(&replay.StreamingExecutionCfg.Workers, "streaming-workers", 0,
+		"Streaming execution workers per transaction group (0 = min(txpar, 4))")
+	Run.Flags().IntVar(&replay.StreamingExecutionCfg.MinGroupBatches, "streaming-min-group-batches", 0,
+		"Contiguous decoded batches to accumulate before a streaming group executes (0 or 1 = execute as batches arrive)")
+	Run.Flags().IntVar(&streamingMaxOpenMs, "streaming-max-open-ms", 0,
+		"Discard a streaming bank whose block has not completed after this many milliseconds (0 = 2000)")
 	Run.Flags().Int64VarP(&endSlot, "end-slot", "e", -1, "Block at which to stop replaying, inclusive (-1 = run continuously)")
 
 	// [consensus] section flags
@@ -550,6 +566,11 @@ func init() {
 	Run.Flags().StringVar(&validatorTPUQUICBind, "tpu-quic-bind-addr", "", "Validator TPU QUIC listen address (default 0.0.0.0:8004)")
 	Run.Flags().StringVar(&validatorAdvertisedIP, "validator-advertised-ip", "", "Public IP advertised for validator TPU QUIC")
 	Run.Flags().IntVar(&validatorSigverifyWorkers, "tpu-sigverify-workers", 0, "TPU signature verification workers (0 = GOMAXPROCS)")
+	Run.Flags().BoolVar(&validatorReservedHistory, "reserved-vote-history", false, "Use durable signing reservations with unsynchronized per-vote history writes")
+	Run.Flags().BoolVar(&validatorInitializeReservation, "initialize-vote-reservation", false, "Enroll complete synchronous vote history in reserved mode (one-time migration)")
+	Run.Flags().Uint64Var(&validatorWaitToVoteSlot, "wait-to-vote-slot", 0, "Do not cast new votes below this slot; the automatic startup cutoff still applies (0 = automatic only)")
+	Run.Flags().IntVar(&validatorCompletionReserveMs, "leader-completion-reserve-ms", 0, "Time reserved for leader finalization and broadcast (0 = 75ms default; tune from measured completion times)")
+	Run.Flags().IntVar(&validatorMaxBufferedTransactions, "tpu-max-buffered-transactions", 0, "Maximum queued TPU transactions (0 = 131072 default)")
 
 	// [tuning] section flags
 	Run.Flags().Uint64Var(&paramArenaSizeMB, "param-arena-size-mb", 512, "Size in MB for serialized parameter arena (0 to disable)")
@@ -563,6 +584,12 @@ func init() {
 	Run.Flags().StringVar(&snapshot.SnapshotIndexTempDir, "snapshot-index-temp-dir", "", "Optional directory for snapshot index shard logs/SST staging")
 	Run.Flags().StringVar(&sigverify.Cfg.Backend, "sigverify-backend", sigverify.Defaults().Backend,
 		"ed25519 verification backend: auto|r51|generic|stdlib")
+	Run.Flags().IntVar(&sigverify.Cfg.Workers, "sigverify-workers", 0,
+		"Turbine transaction signature verification workers (0 = min(2, GOMAXPROCS))")
+	Run.Flags().IntVar(&sigverify.Cfg.BatchTarget, "sigverify-batch-target", sigverify.Defaults().BatchTarget,
+		"Turbine transaction signature batch target: 4 or 8 (available short batches run immediately)")
+	Run.Flags().BoolVar(&sigverify.Cfg.DisableShredOverlap, "sigverify-disable-shred-overlap", false,
+		"Defer Turbine transaction decoding and signature verification until all block shreds arrive")
 	Run.Flags().BoolVar(&sbpf.UsePool, "use-pool", true, "Disable to allocate fresh slices")
 	Run.Flags().IntVar(&accountsdb.StoreAccountsWorkers, "store-accounts-workers", 128, "Number of workers to write account updates")
 	Run.Flags().IntVar(&accountsdb.ProgramCacheMaxMB, "program-cache-max-mb", accountsdb.DefaultProgramCacheMaxMB, "Maximum approximate SBPF program cache size in MiB")
@@ -641,6 +668,11 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	// Initialize config from file (do NOT bind flags - we handle precedence manually)
 	if err := config.InitConfig(); err != nil {
 		return err
+	}
+	if slot, err := configuredWaitToVoteSlot(cmd); err != nil {
+		return err
+	} else {
+		validatorWaitToVoteSlot = slot
 	}
 
 	// Check if a CLI flag was explicitly set by the user
@@ -724,14 +756,9 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		return 0
 	}
 
-	// Helper to get bool: CLI flag if explicitly set, otherwise TOML config
+	// Match numeric options: explicit CLI, configured value, then flag default.
 	getBool := func(cliKey, tomlKey string) bool {
-		if flagChanged(cliKey) {
-			if f := cmd.Flags().Lookup(cliKey); f != nil {
-				return f.Value.String() == "true"
-			}
-		}
-		return config.GetBool(tomlKey)
+		return resolveBoolOption(cmd.Flags().Lookup(cliKey), config.IsSet(tomlKey), config.GetBool(tomlKey))
 	}
 
 	// Helper to get string slice: CLI flag if explicitly set, otherwise TOML config
@@ -866,6 +893,14 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	}
 	validatorAdvertisedIP = getString("validator-advertised-ip", "validator.advertised_ip")
 	validatorSigverifyWorkers = getInt("tpu-sigverify-workers", "validator.tpu_sigverify_workers")
+	validatorCompletionReserveMs = getInt("leader-completion-reserve-ms", "validator.block_completion_reserve_ms")
+	validatorMaxBufferedTransactions = getInt("tpu-max-buffered-transactions", "validator.tpu_max_buffered_transactions")
+	if validatorMaxBufferedTransactions < 0 {
+		return fmt.Errorf("TPU maximum buffered transactions must be nonnegative")
+	}
+	if validatorCompletionReserveMs < 0 || validatorCompletionReserveMs >= int(blockprod.AlpenglowSlotDuration/time.Millisecond) {
+		return fmt.Errorf("leader completion reserve must be 0 (default) or between 1 and 199 milliseconds")
+	}
 
 	// [block] section
 	blockSource = getString("block-source", "block.source")
@@ -1130,13 +1165,27 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	// later: narya pins its backend on first use, and selecting it explicitly
 	// doubles as a startup health check, so a machine that cannot run the
 	// requested backend fails now instead of at the first block.
-	sigverify.Cfg.Backend = getString("sigverify-backend", "tuning.sigverify_backend")
+	backendKey := "sigverify.backend"
+	if !config.IsSet(backendKey) {
+		backendKey = "tuning.sigverify_backend" // older configuration files
+	}
+	sigverify.Cfg.Backend = getString("sigverify-backend", backendKey)
+	sigverify.Cfg.Workers = getInt("sigverify-workers", "sigverify.workers")
+	sigverify.Cfg.BatchTarget = getInt("sigverify-batch-target", "sigverify.batch_target")
+	sigverify.Cfg.DisableShredOverlap = getBool("sigverify-disable-shred-overlap", "sigverify.disable_shred_overlap")
 	resolved, err := sigverify.Configure(sigverify.Cfg)
 	if err != nil {
-		return fmt.Errorf("tuning.sigverify_backend: %w", err)
+		return fmt.Errorf("signature verification configuration: %w", err)
 	}
 	resolvedSigverifyBackend = resolved
 	sbpf.UsePool = getBool("use-pool", "tuning.use_pool")
+	// [tuning] streaming execution (off by default; Alpenglow turbine only).
+	replay.StreamingExecutionCfg.Enabled = getBool("streaming-execution", "tuning.streaming_execution")
+	replay.StreamingExecutionCfg.Workers = getInt("streaming-workers", "tuning.streaming_workers")
+	replay.StreamingExecutionCfg.MinGroupBatches = getInt("streaming-min-group-batches", "tuning.streaming_min_group_batches")
+	if ms := getInt("streaming-max-open-ms", "tuning.streaming_max_open_ms"); ms > 0 {
+		replay.StreamingExecutionCfg.MaxOpenAge = time.Duration(ms) * time.Millisecond
+	}
 	accountsdb.StoreAccountsWorkers = getInt("store-accounts-workers", "tuning.store_accounts_workers")
 	accountsdb.ProgramCacheMaxMB = getInt("program-cache-max-mb", "tuning.program_cache_max_mb")
 	if accountsdb.ProgramCacheMaxMB <= 0 {
@@ -2530,7 +2579,7 @@ postBootstrap:
 	if rpcPort < 0 || rpcPort > 65535 {
 		klog.Fatalf("invalid port: %d", rpcPort)
 	} else if rpcPort != 0 {
-		rpcServer = rpcserver.NewRpcServer(accountsDb, uint16(rpcPort), epochScheduleFromState(mithrilState))
+		rpcServer = rpcserver.NewRpcServer(accountsDb, uint16(rpcPort), epochScheduleFromState(mithrilState), solana.MustHashFromBase58(networkGenesisHash))
 		rpcServer.Start()
 		mlog.Log.Infof("Started RPC server on port %d", rpcPort)
 	}
@@ -2656,52 +2705,9 @@ postBootstrap:
 		}
 		global.SeedWallClockSlot(wallClockSeed)
 		startupWallSlot := global.WallClockSlot()
-		waitToVoteSlot := startupWallSlot - startupWallSlot%alpenglow.LeaderWindowSlots
-		if waitToVoteSlot <= math.MaxUint64-2*alpenglow.LeaderWindowSlots {
-			waitToVoteSlot += 2 * alpenglow.LeaderWindowSlots
-		} else {
-			waitToVoteSlot = math.MaxUint64
-		}
-		mlog.Log.Infof("ALPENGLOW voting startup watermark: wall_clock=%d wait_to_vote=%d", startupWallSlot, waitToVoteSlot)
+		waitToVoteSlot := effectiveWaitToVoteSlot(startupWallSlot, validatorWaitToVoteSlot)
+		mlog.Log.Infof("ALPENGLOW voting startup watermark: wall_clock=%d configured_wait_to_vote=%d wait_to_vote=%d", startupWallSlot, validatorWaitToVoteSlot, waitToVoteSlot)
 
-		identityPubkey := solana.PrivateKey(validatorIdentity).PublicKey()
-		if err := consensusEngine.EnableVoting(consensusengine.VotingConfig{
-			Identity:        validatorIdentity,
-			AuthorizedVoter: validatorAuthorizedVoter,
-			VoteAccount:     validatorVoteAccount,
-			HistoryDir:      blockstorePath,
-			EpochForSlot:    epochSchedule.GetEpoch,
-			SlotDuration:    blockprod.AlpenglowSlotDuration,
-			WaitToVoteSlot:  waitToVoteSlot,
-			ReadyToVote: func(slot uint64) bool {
-				wallSlot := global.WallClockSlot()
-				if liveSlot, ok := consensusEngine.AlpenglowLiveSlot(); ok {
-					wallSlot = liveSlot
-				}
-				return slot >= wallSlot || wallSlot-slot <= alpenglow.LeaderWindowSlots
-			},
-			Peers: func(validators []alpenglow.ValidatorStake) []alpenglow.VotorPeer {
-				peers := make([]alpenglow.VotorPeer, 0, len(validators))
-				seen := make(map[solana.PublicKey]struct{}, len(validators))
-				for _, validator := range validators {
-					if validator.Stake == 0 || validator.NodePubkey == identityPubkey {
-						continue
-					}
-					addr, ok := sharedGossip.LookupAlpenglow(validator.NodePubkey)
-					if !ok {
-						continue
-					}
-					if _, duplicate := seen[validator.NodePubkey]; duplicate {
-						continue
-					}
-					seen[validator.NodePubkey] = struct{}{}
-					peers = append(peers, alpenglow.VotorPeer{Identity: validator.NodePubkey, Addr: addr})
-				}
-				return peers
-			},
-		}); err != nil {
-			klog.Fatalf("enable Alpenglow voting: %v", err)
-		}
 		broadcaster, err := turbine.NewTurbineBroadcaster(turbine.TurbineBroadcasterConfig{
 			Self:          solana.PrivateKey(validatorIdentity).PublicKey(),
 			Peers:         sharedGossip,
@@ -2719,7 +2725,9 @@ postBootstrap:
 		defer broadcaster.Close()
 
 		controller := blockprod.NewController()
-		topicSink := scheduler.New(controller)
+		topicSink := scheduler.NewWithConfig(controller, scheduler.Config{
+			FeatureSource: replay.ChainTipFeatures, MaxBufferedTransactions: validatorMaxBufferedTransactions,
+		})
 		topicSink.Start(ctx)
 		defer topicSink.Stop()
 		tpuCfg := tpu.DefaultConfig()
@@ -2758,6 +2766,50 @@ postBootstrap:
 			mlog.Log.Warnf("validator gossip TPU advertisement: %v", err)
 		}
 
+		// Bind and validate local transports before consuming the durable clean
+		// voting marker. Startup configuration failures must not force recovery.
+		identityPubkey := solana.PrivateKey(validatorIdentity).PublicKey()
+		if err := consensusEngine.EnableVoting(consensusengine.VotingConfig{
+			Identity:                  validatorIdentity,
+			AuthorizedVoter:           validatorAuthorizedVoter,
+			VoteAccount:               validatorVoteAccount,
+			HistoryDir:                blockstorePath,
+			ReservedHistory:           validatorReservedHistory,
+			InitializeVoteReservation: validatorInitializeReservation,
+			Genesis:                   solana.MustHashFromBase58(networkGenesisHash),
+			EpochForSlot:              epochSchedule.GetEpoch,
+			SlotDuration:              blockprod.AlpenglowSlotDuration,
+			WaitToVoteSlot:            waitToVoteSlot,
+			ReadyToVote: func(slot uint64) bool {
+				wallSlot := global.WallClockSlot()
+				if liveSlot, ok := consensusEngine.AlpenglowLiveSlot(); ok {
+					wallSlot = liveSlot
+				}
+				return slot >= wallSlot || wallSlot-slot <= alpenglow.LeaderWindowSlots
+			},
+			Peers: func(validators []alpenglow.ValidatorStake) []alpenglow.VotorPeer {
+				peers := make([]alpenglow.VotorPeer, 0, len(validators))
+				seen := make(map[solana.PublicKey]struct{}, len(validators))
+				for _, validator := range validators {
+					if validator.Stake == 0 || validator.NodePubkey == identityPubkey {
+						continue
+					}
+					addr, ok := sharedGossip.LookupAlpenglow(validator.NodePubkey)
+					if !ok {
+						continue
+					}
+					if _, duplicate := seen[validator.NodePubkey]; duplicate {
+						continue
+					}
+					seen[validator.NodePubkey] = struct{}{}
+					peers = append(peers, alpenglow.VotorPeer{Identity: validator.NodePubkey, Addr: addr})
+				}
+				return peers
+			},
+		}); err != nil {
+			klog.Fatalf("enable Alpenglow voting: %v", err)
+		}
+
 		rewardBuilder := rewardcerts.NewBuilder(rewardcerts.BuilderConfig{
 			RootSlot:    global.Slot,
 			BeforeBuild: consensusEngine.FlushAlpenglowRewardVotes,
@@ -2766,14 +2818,15 @@ postBootstrap:
 		leaderStop := make(chan struct{})
 		leaderDone := make(chan struct{})
 		leaderLoop := blockprod.NewLeaderLoop(blockprod.LeaderLoopConfig{
-			Controller:     controller,
-			Identity:       solana.PrivateKey(validatorIdentity),
-			AccountsDb:     accountsDb,
-			Broadcaster:    broadcaster,
-			ShredVersion:   uint16(turbineShredVersion),
-			EpochSchedule:  epochSchedule,
-			AlpenglowClock: true,
-			SlotDuration:   blockprod.AlpenglowSlotDuration,
+			Controller:        controller,
+			Identity:          solana.PrivateKey(validatorIdentity),
+			AccountsDb:        accountsDb,
+			Broadcaster:       broadcaster,
+			ShredVersion:      uint16(turbineShredVersion),
+			EpochSchedule:     epochSchedule,
+			AlpenglowClock:    true,
+			SlotDuration:      blockprod.AlpenglowSlotDuration,
+			CompletionReserve: time.Duration(validatorCompletionReserveMs) * time.Millisecond,
 			ParentContext: func(slot uint64) blockprod.ParentContext {
 				tip := replay.ChainTipParentContext()
 				// Blockprod owns the replay-readiness rule. In particular, the first
@@ -2810,6 +2863,7 @@ postBootstrap:
 				}
 			},
 			ProductionParent: consensusEngine.AlpenglowBlockProductionParent,
+			CanSignSlot:      consensusEngine.AlpenglowCanSignLeaderSlot,
 			CurrentSlot: func() uint64 {
 				if slot, ok := consensusEngine.AlpenglowLiveSlot(); ok {
 					return slot
@@ -3228,6 +3282,8 @@ func printStartupInfo(commandName string) {
 		}
 		fmt.Printf("  Sigverify:    %s%s%s %s(%s)%s\n",
 			green, resolvedSigverifyBackend, reset, dim, sigverifyDesc, reset)
+		fmt.Printf("                workers=%d batch_target=%d shred_overlap=%t\n",
+			sigverify.TransactionWorkers(), sigverify.TransactionBatchTarget(), !sigverify.Cfg.DisableShredOverlap)
 	}
 
 	// Load state file for detailed info (only show for modes that use existing AccountsDB)

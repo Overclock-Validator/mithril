@@ -120,9 +120,8 @@ func newReplayCtx(mithrilState *state.MithrilState, resumeState *ResumeState) (*
 	return epochCtx, nil
 }
 
-// BoundaryStakeScanResult holds all accumulated data from a single streaming pass
-// over stake accounts at the epoch boundary, serving both stake history update
-// and epoch stakes/vote cache refresh.
+// BoundaryStakeScanResult holds the completed epoch's stake history and rewards
+// denominators, plus the newly entered epoch's effective stake distribution.
 type BoundaryStakeScanResult struct {
 	// For stake history update
 	StakeHistoryEffective    uint64
@@ -133,14 +132,17 @@ type BoundaryStakeScanResult struct {
 	EffectiveStakes map[solana.PublicKey]uint64
 	// RewardEpochEffectiveStakes is the per-vote-account effective stake in
 	// targetEpoch. Alpenglow reward credits are divided by this denominator;
-	// EffectiveStakes above is for the next leader-schedule epoch instead.
+	// EffectiveStakes above is for the newly entered epoch and will be stored
+	// under the future leader-schedule epoch.
 	RewardEpochEffectiveStakes map[solana.PublicKey]uint64
 	TotalEffectiveStake        uint64
 }
 
-// scanStakesForEpochBoundary performs a single streaming pass over all stake accounts,
-// accumulating data needed by both updateStakeHistorySysvar and updateEpochStakesAndRefreshVoteCache.
-func scanStakesForEpochBoundary(acctsDb *accountsdb.AccountsDb, slot uint64, targetEpoch uint64, leaderScheduleEpoch uint64, stakeHistory *sealevel.SysvarStakeHistory, epochSchedule *sealevel.SysvarEpochSchedule, f *features.Features) *BoundaryStakeScanResult {
+// scanStakesForEpochBoundary first completes targetEpoch's stake history, then
+// uses that history to calculate effective stakes in newEpoch. The future
+// leader-schedule epoch is only the key under which that distribution is saved.
+// Two streaming passes avoid retaining all stake accounts or delegations.
+func scanStakesForEpochBoundary(acctsDb *accountsdb.AccountsDb, slot uint64, targetEpoch uint64, newEpoch uint64, stakeHistory *sealevel.SysvarStakeHistory, epochSchedule *sealevel.SysvarEpochSchedule, f *features.Features) *BoundaryStakeScanResult {
 	newRateActivationEpoch := newWarmupCooldownRateEpoch(epochSchedule, f)
 
 	// Stake history accumulators (atomic — high contention from worker pool)
@@ -172,12 +174,29 @@ func scanStakesForEpochBoundary(acctsDb *accountsdb.AccountsDb, slot uint64, tar
 				}
 			}
 
-			// --- Epoch stakes accumulation ---
+			// Raw delegations also seed the vote-cache refresh.
 			voteAcctStakesMu.Lock()
 			voteAcctStakes[delegation.VoterPubkey] += delegation.StakeLamports
 			voteAcctStakesMu.Unlock()
+		})
+	if err != nil {
+		panic(fmt.Sprintf("error scanning stake history at epoch boundary: %s", err))
+	}
 
-			effectiveStake := delegation.Stake(leaderScheduleEpoch, stakeHistory, newRateActivationEpoch)
+	// Match Agave's calculate_activated_stake: append the completed epoch
+	// before refreshing the new epoch's vote-account weights. Missing history
+	// can otherwise treat newly activating stake as fully effective and newly
+	// deactivating stake as fully cooled down. Leave the parent's history intact.
+	newStakeHistory := append(sealevel.SysvarStakeHistory(nil), (*stakeHistory)...)
+	newStakeHistory.Update(targetEpoch, sealevel.StakeHistoryEntry{
+		Effective:    shEffective.Load(),
+		Activating:   shActivating.Load(),
+		Deactivating: shDeactivating.Load(),
+	})
+
+	_, err = global.StreamStakeAccounts(acctsDb, slot,
+		func(pk solana.PublicKey, delegation *sealevel.Delegation, creditsObs uint64) {
+			effectiveStake := delegation.Stake(newEpoch, &newStakeHistory, newRateActivationEpoch)
 			if effectiveStake > 0 {
 				effectiveStakesMu.Lock()
 				effectiveStakes[delegation.VoterPubkey] += effectiveStake
@@ -258,9 +277,9 @@ func handleEpochTransition(acctsDb *accountsdb.AccountsDb, partitionedEpochRewar
 	newEpoch := epoch + 1
 	leaderScheduleEpoch := epochSchedule.LeaderScheduleEpoch(block.Slot)
 
-	// Single streaming pass for both stake history and epoch stakes
+	// Complete the old epoch's history before calculating the new epoch's stakes.
 	t0 := time.Now()
-	scanResult := scanStakesForEpochBoundary(acctsDb, prevSlotCtx.Slot, epoch, leaderScheduleEpoch, &stakeHistory, epochSchedule, f)
+	scanResult := scanStakesForEpochBoundary(acctsDb, prevSlotCtx.Slot, epoch, newEpoch, &stakeHistory, epochSchedule, f)
 	t1 := time.Now()
 
 	updateEpochStakesAndRefreshVoteCache(leaderScheduleEpoch, block, acctsDb, prevSlotCtx.Slot, scanResult, f, epochSchedule)

@@ -555,6 +555,16 @@ func TestApplyAlpenglowDecisionLockedLeavesMatchingCertifiedBlock(t *testing.T) 
 }
 
 func TestApplyAlpenglowDecisionLockedDiscardsMismatchedCertifiedBlock(t *testing.T) {
+	t.Run("near tip", func(t *testing.T) {
+		testApplyAlpenglowDecisionDiscardsMismatch(t, true)
+	})
+	t.Run("catchup", func(t *testing.T) {
+		testApplyAlpenglowDecisionDiscardsMismatch(t, false)
+	})
+}
+
+func testApplyAlpenglowDecisionDiscardsMismatch(t *testing.T, nearTip bool) {
+	t.Helper()
 	wantBlockID := solana.Hash{1}
 	gotBlockID := solana.Hash{2}
 	bs := NewBlockSource(&BlockSourceOpts{
@@ -571,8 +581,8 @@ func TestApplyAlpenglowDecisionLockedDiscardsMismatchedCertifiedBlock(t *testing
 			}, true
 		},
 	})
-	bs.isNearTip.Store(true)
-	bs.liveStreamActive.Store(true)
+	bs.isNearTip.Store(nearTip)
+	bs.liveStreamActive.Store(nearTip)
 	bs.reorderBuffer[151] = &b.Block{
 		Slot:                151,
 		FromLiveStream:      true,
@@ -1297,6 +1307,17 @@ func TestRewindForAlpenglowSwitchRestoresLastRealAnchorAcrossSkips(t *testing.T)
 	}
 	if _, exists := bs.emittedAlpenglowBlockIDs[155]; exists {
 		t.Fatal("rewind retained a discarded descendant block ID")
+	}
+}
+
+func TestRewindForAlpenglowSwitchAfterSourceShutdown(t *testing.T) {
+	bs := NewBlockSource(&BlockSourceOpts{StartSlot: 151, EndSlot: 200})
+	bs.Stop()
+	close(bs.resultQueue)
+	close(bs.streamChan)
+	bs.RewindForAlpenglowSwitch(151, solana.Hash{1})
+	if bs.alpenglowQuarantineFrom.Load() != 0 {
+		t.Fatal("stopped source acquired a rewind barrier")
 	}
 }
 

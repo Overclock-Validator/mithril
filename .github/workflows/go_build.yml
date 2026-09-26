@@ -43,3 +43,33 @@ jobs:
 
       - name: Build Mithril
         run: nix build .#mithril
+
+  regression-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      GOMAXPROCS: "2"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+
+      - name: Voting, checkpoint, streaming and scheduler race regressions
+        # Run the complete affected package suites, including subprocess crash
+        # recovery and cancellation tests.
+        run: >-
+          go test -race -p 2 -count=1
+          ./pkg/alpenglow ./pkg/consensus ./pkg/replay ./pkg/rewards
+          ./pkg/turbine ./pkg/sigverify ./pkg/blockprod/...
+          ./cmd/mithril/node ./cmd/mithril/configcmd
+
+      - name: Interpreter differential and memory race regressions
+        run: go test -race -count=1 ./pkg/sbpf/...
+
+      - name: Sealevel interpreter, syscall and vote ownership regressions
+        run: go test -race -count=1 ./pkg/sealevel

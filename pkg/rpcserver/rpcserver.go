@@ -30,6 +30,7 @@ type RpcServer struct {
 	epochSchedule *sealevel.SysvarEpochSchedule
 	slotCtx       *sealevel.SlotCtx
 	slotCtxMu     sync.RWMutex
+	genesisHash   string
 
 	leaderTPUCacheMu         sync.RWMutex
 	leaderTPUByIdentity      map[solana.PublicKey]tpuEndpoint
@@ -51,14 +52,15 @@ var supportedRPCMethods = map[string]struct{}{
 	"getBankHash":         {},
 	"getBlockHeight":      {},
 	"getEpochInfo":        {},
+	"getGenesisHash":      {},
 	"getLatestBlockhash":  {},
 	"sendTransaction":     {},
 	"simulateTransaction": {},
 }
 
-func NewRpcServer(acctsDb *accountsdb.AccountsDb, port uint16, epochSchedule *sealevel.SysvarEpochSchedule) *RpcServer {
+func NewRpcServer(acctsDb *accountsdb.AccountsDb, port uint16, epochSchedule *sealevel.SysvarEpochSchedule, genesisHash solana.Hash) *RpcServer {
 	var err error
-	rpcServer := &RpcServer{}
+	rpcServer := &RpcServer{genesisHash: genesisHash.String()}
 
 	addrStr := fmt.Sprintf("0.0.0.0:%d", port)
 	rpcServer.listener, err = net.Listen("tcp", addrStr)

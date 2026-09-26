@@ -27,6 +27,7 @@ var DedupeConfigProgramSigners = FeatureGate{Name: "DedupeConfigProgramSigners",
 var Ed25519PrecompileVerifyStrict = FeatureGate{Name: "Ed25519PrecompileVerifyStrict", Address: base58.MustDecodeFromString("ed9tNscbWLYBooxWA7FE2B5KHWs8A6sxfY8EzezEcoo")}
 var AbortOnInvalidCurve = FeatureGate{Name: "AbortOnInvalidCurve", Address: base58.MustDecodeFromString("FuS3FPfJDKSNot99ECLXtp3rueq36hMNStJkPJwWodLh")}
 var Blake3SyscallEnabled = FeatureGate{Name: "Blake3SyscallEnabled", Address: base58.MustDecodeFromString("HTW2pSyErTj4BV6KBM9NZ9VBUJVxt7sacNWcf76wtzb3")}
+var RemainingComputeUnitsSyscallEnabled = FeatureGate{Name: "RemainingComputeUnitsSyscallEnabled", Address: base58.MustDecodeFromString("5TuppMutoyzhUSfuYdhgzD47F92GL1g89KpCZQKqedxP")}
 var Curve25519SyscallEnabled = FeatureGate{Name: "Curve25519SyscallEnabled", Address: base58.MustDecodeFromString("7rcw5UtqgDTBBv2EcynNfYckgdAaH1MAsCjKgXMkN7Ri")}
 var SimplifyAltBn128SyscallErrorCodes = FeatureGate{Name: "SimplityAltBn128SyscallErrorCodes", Address: base58.MustDecodeFromString("JDn5q3GBeqzvUa7z67BbmVHVdE3EbUAjvFep3weR3jxX")}
 var EnableAltbn128CompressionSyscall = FeatureGate{Name: "EnableAltbn128CompressionSyscall", Address: base58.MustDecodeFromString("EJJewYSddEEtSZHiqugnvhQHiWyZKjkFDQASd7oKSagn")}
@@ -115,7 +116,7 @@ var AllFeatureGates = []FeatureGate{StopTruncatingStringsInSyscalls, EnableParti
 	CommissionUpdatesOnlyAllowedInFirstHalfOfEpoch, TimelyVoteCredits, ReduceStakeWarmupCooldown,
 	StakeRaiseMinimumDelegationTo1Sol, StakeRedelegateInstruction, RequireRentExemptSplitDestination,
 	DeprecateExecutableMetaUpdateInBpfLoader, RelaxAuthoritySignerCheckForLookupTableCreation, DedupeConfigProgramSigners,
-	Ed25519PrecompileVerifyStrict, AbortOnInvalidCurve, Blake3SyscallEnabled, Curve25519SyscallEnabled, SimplifyAltBn128SyscallErrorCodes,
+	Ed25519PrecompileVerifyStrict, AbortOnInvalidCurve, Blake3SyscallEnabled, RemainingComputeUnitsSyscallEnabled, Curve25519SyscallEnabled, SimplifyAltBn128SyscallErrorCodes,
 	EnableAltbn128CompressionSyscall, EnableAltBn128Syscall, DisableFeesSysvar, DisableRentFeesCollection, DeprecateUnusedLegacyVotePlumbing,
 	RewardFullPriorityFee, StakeMinimumDelegationForRewards, MoveStakeAndMoveLamportsIxs, GetSysvarSyscallEnabled,
 	AddNewReservedAccountKeys, EnableSecp256r1Precompile, FixAltBn128MultiplicationInputLength, EnableTowerSyncIx, SkipRentRewrites,

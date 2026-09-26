@@ -5,7 +5,7 @@ go 1.26.6
 replace github.com/gagliardetto/binary => github.com/palmerlao/binary v0.0.0-20250617062159-3054b4d33aed
 
 require (
-	github.com/Overclock-Validator/narya-ed25519 v0.0.0-20260726222623-da0d045dae9d
+	github.com/Overclock-Validator/narya-ed25519 v0.0.0-20260730051143-c265ee966713
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/charmbracelet/bubbles v0.21.1-0.20250623103423-23b8fd6302d7
 	github.com/charmbracelet/bubbletea v1.3.10
@@ -124,7 +124,7 @@ require (
 	github.com/dgryski/go-sip13 v0.0.0-20200911182023-62edffca9245
 	github.com/ethereum/go-ethereum v1.15.12-0.20250620111820-f26b5653e8bf
 	github.com/fatih/color v1.18.0 // indirect
-	github.com/filecoin-project/go-jsonrpc v0.8.0
+	github.com/filecoin-project/go-jsonrpc v0.10.2
 	github.com/gagliardetto/treeout v0.1.4 // indirect
 	github.com/gammazero/deque v1.0.0
 	github.com/go-logr/logr v1.4.3 // indirect
@@ -152,7 +152,7 @@ require (
 	github.com/prometheus/procfs v0.15.1 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/samber/lo v1.49.1
-	github.com/spf13/pflag v1.0.10 // indirect
+	github.com/spf13/pflag v1.0.10
 	github.com/streamingfast/logging v0.0.0-20250404134358-92b15d2fbd2e // indirect
 	github.com/tidwall/btree v1.7.0
 	github.com/zeebo/blake3 v0.2.3

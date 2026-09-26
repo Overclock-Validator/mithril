@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/state"
@@ -48,6 +49,38 @@ type transactionStatusNode struct {
 	hasBlockID bool
 	parent     *transactionStatusNode
 	delta      transactionStatusDelta
+
+	// Shared by parentless checkpoint copies and relinked retained nodes.
+	// Only the memoized encoding changes after publication; lineage and delta
+	// remain immutable. Never copy the atomic field after its first use.
+	encoding atomic.Pointer[transactionStatusNodeEncoding]
+}
+
+type transactionStatusNodeEncoding struct {
+	once sync.Once
+	data []byte
+}
+
+func (n *transactionStatusNode) encodingCache() *transactionStatusNodeEncoding {
+	if cache := n.encoding.Load(); cache != nil {
+		return cache
+	}
+	cache := new(transactionStatusNodeEncoding)
+	if n.encoding.CompareAndSwap(nil, cache) {
+		return cache
+	}
+	return n.encoding.Load()
+}
+
+// copyInto initializes a fresh node, sharing its encoding without retaining
+// excluded ancestry or copying a used synchronization primitive. The encoding excludes
+// parent links and depends only on the immutable slot, block ID and delta.
+func (n *transactionStatusNode) copyInto(copy *transactionStatusNode, parent *transactionStatusNode) {
+	*copy = transactionStatusNode{
+		slot: n.slot, blockID: n.blockID, hasBlockID: n.hasBlockID,
+		parent: parent, delta: n.delta,
+	}
+	copy.encoding.Store(n.encodingCache())
 }
 
 type visibleTransactionStatusGroup struct {
@@ -72,6 +105,9 @@ type TransactionStatusCache struct {
 	// from a known-empty genesis cache. Without this bit, completeness requires
 	// the full 300 retained roots; a serialized boolean alone is not evidence.
 	coverageFromGenesis bool
+
+	// Protected by mu; see transactionStatusValidation. Never serialized.
+	validationVersion uint64
 }
 
 // TransactionStatusView is an immutable view of one bank lineage. It lazily
@@ -412,6 +448,7 @@ func (c *TransactionStatusCache) BindTipBlockID(slot uint64, blockID solana.Hash
 	if c.tip.hasBlockID && c.tip.blockID != blockID {
 		return fmt.Errorf("transaction status tip at slot %d has block id %s, cannot bind %s", slot, c.tip.blockID, blockID)
 	}
+	c.invalidateValidationLocked()
 	c.tip = &transactionStatusNode{
 		slot: slot, blockID: blockID, hasBlockID: true,
 		parent: c.tip.parent, delta: c.tip.delta,
@@ -515,25 +552,52 @@ func (c *TransactionStatusCache) ValidateBlock(block *b.Block) error {
 // validateBlockWithPlan preserves the status-cache checks while letting
 // replay reuse the exact immutable identities used for execution planning.
 func (c *TransactionStatusCache) validateBlockWithPlan(block *b.Block, plan blockTransactionExecutionPlan) error {
+	_, err := c.validateBlockForPublication(block, plan)
+	return err
+}
+
+func (c *TransactionStatusCache) validateBlockForPublication(block *b.Block, plan blockTransactionExecutionPlan) (transactionStatusValidation, error) {
 	if block == nil {
-		return errors.New("nil block")
+		return transactionStatusValidation{}, errors.New("nil block")
 	}
 	if plan.messageIdentities == nil || !plan.messageIdentities.MatchesBlock(block) {
-		return errors.New("prepared transaction message identities do not match block")
+		return transactionStatusValidation{}, errors.New("prepared transaction message identities do not match block")
 	}
 	if c == nil {
-		return &IncompleteTransactionStatusCoverageError{}
+		return transactionStatusValidation{}, &IncompleteTransactionStatusCoverageError{}
 	}
 
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if !c.coverageComplete {
-		return &IncompleteTransactionStatusCoverageError{CachedRoot: c.rootedThrough}
+		return transactionStatusValidation{}, &IncompleteTransactionStatusCoverageError{CachedRoot: c.rootedThrough}
 	}
 	if err := c.validateParentLocked(block); err != nil {
-		return err
+		return transactionStatusValidation{}, err
 	}
-	return c.validateAncestorTransactionsLocked(block.Slot, plan.messageIdentities)
+	if err := c.validateAncestorTransactionsLocked(block.Slot, plan.messageIdentities); err != nil {
+		return transactionStatusValidation{}, err
+	}
+	return transactionStatusValidation{cache: c, identities: plan.messageIdentities, version: c.validationVersion}, nil
+}
+
+// validateTransactionsAgainstAncestors is the per-group form of the ancestor
+// already-processed check, for execution that starts before the complete
+// block exists. It does not validate the parent link; the complete block is
+// validated again in full, with validateBlockForPublication, before commit.
+func (c *TransactionStatusCache) validateTransactionsAgainstAncestors(slot uint64, identities *b.PreparedTransactionMessageIdentities) error {
+	if identities == nil {
+		return errors.New("nil transaction message identities")
+	}
+	if c == nil {
+		return &IncompleteTransactionStatusCoverageError{}
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if !c.coverageComplete {
+		return &IncompleteTransactionStatusCoverageError{CachedRoot: c.rootedThrough}
+	}
+	return c.validateAncestorTransactionsLocked(slot, identities)
 }
 
 func (c *TransactionStatusCache) validateAncestorTransactionsLocked(slot uint64, identities *b.PreparedTransactionMessageIdentities) error {
@@ -586,6 +650,14 @@ func (c *TransactionStatusCache) CommitBlock(block *b.Block) error {
 // commitBlockWithPlan atomically rechecks the mutable lineage/status state and
 // publishes the already-prepared immutable transaction identities.
 func (c *TransactionStatusCache) commitBlockWithPlan(block *b.Block, plan blockTransactionExecutionPlan) error {
+	return c.commitBlockWithPreparedDelta(block, plan, nil)
+}
+
+func (c *TransactionStatusCache) commitBlockWithPreparedDelta(block *b.Block, plan blockTransactionExecutionPlan, prepared *preparedTransactionStatusDelta) error {
+	return c.commitBlockWithValidation(block, plan, prepared, transactionStatusValidation{})
+}
+
+func (c *TransactionStatusCache) commitBlockWithValidation(block *b.Block, plan blockTransactionExecutionPlan, prepared *preparedTransactionStatusDelta, validation transactionStatusValidation) error {
 	if block == nil || plan.messageIdentities == nil || !plan.messageIdentities.MatchesBlock(block) {
 		return errors.New("prepared transaction message identities do not match block")
 	}
@@ -594,33 +666,45 @@ func (c *TransactionStatusCache) commitBlockWithPlan(block *b.Block, plan blockT
 	if !c.coverageComplete {
 		return &IncompleteTransactionStatusCoverageError{CachedRoot: c.rootedThrough}
 	}
-	// Parent lineage and ancestor status are mutable, so both remain under the
-	// publication lock even when hashing and same-bank deduplication happened
-	// earlier. This keeps commit safe across a concurrent branch transition.
+	// Always check coverage, block binding and parent lineage. Reuse the earlier
+	// ancestor scan only under this lock and only for the same unchanged cache
+	// and immutable identities. A branch transition (including away and back)
+	// or root/prune invalidates it, requiring a fresh scan before publication.
 	if err := c.validateParentLocked(block); err != nil {
 		return err
 	}
-	if err := c.validateAncestorTransactionsLocked(block.Slot, plan.messageIdentities); err != nil {
-		return err
+	if !validation.reusableForLocked(c, plan.messageIdentities) {
+		if err := c.validateAncestorTransactionsLocked(block.Slot, plan.messageIdentities); err != nil {
+			return err
+		}
 	}
 
-	delta := make(transactionStatusDelta)
-	for index := 0; index < plan.messageIdentities.Len(); index++ {
-		identity := plan.messageIdentities.Identity(index)
-		blockhash := identity.RecentBlockhash
-		group := delta[blockhash]
-		if group == nil {
-			keyIndex := uint8(0)
+	delta := transactionStatusDelta(nil)
+	if prepared != nil && prepared.identities == plan.messageIdentities {
+		delta = prepared.delta
+		// A restore or branch transition can change a blockhash's slice offset.
+		// Rebuild from full identities if a group changed offset or disappeared;
+		// a missing group uses the same zero offset as fresh preparation.
+		for blockhash, group := range delta {
+			index := uint8(0)
 			if visible := c.visible[blockhash]; visible != nil {
-				keyIndex = visible.keyIndex
+				index = visible.keyIndex
 			}
-			group = &transactionStatusGroup{
-				keyIndex: keyIndex,
-				keys:     make(map[transactionStatusKey]struct{}),
+			if index != group.keyIndex {
+				delta = nil
+				break
 			}
-			delta[blockhash] = group
 		}
-		group.keys[sliceTransactionStatusKey(identity.MessageHash, group.keyIndex)] = struct{}{}
+	}
+	if delta == nil {
+		counts := countTransactionStatusGroups(plan.messageIdentities)
+		indexes := make(map[solana.Hash]uint8, len(counts))
+		for blockhash := range counts {
+			if visible := c.visible[blockhash]; visible != nil {
+				indexes[blockhash] = visible.keyIndex
+			}
+		}
+		delta = buildTransactionStatusDelta(plan.messageIdentities, counts, indexes)
 	}
 
 	if err := c.addDeltaVisibleLocked(delta); err != nil {
@@ -663,6 +747,7 @@ func (c *TransactionStatusCache) Root(through uint64) bool {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.invalidateValidationLocked()
 	wasComplete := c.coverageComplete
 	newlyRooted := c.countNodesBetweenLocked(c.rootedThrough, through)
 	if through > c.rootedThrough {
@@ -681,10 +766,32 @@ func (c *TransactionStatusCache) Root(through uint64) bool {
 	return !wasComplete && c.coverageComplete
 }
 
-// SnapshotThrough serializes only the rooted lineage needed at through. It is
-// called while constructing a fold job, so the blob rides in that exact durable
-// manifest without being copied into every speculative ResumeContext.
-func (c *TransactionStatusCache) SnapshotThrough(through uint64) ([]byte, error) {
+// TransactionStatusSnapshot pins an immutable checkpoint view. MarshalBinary
+// must use only captured data, without locking or revisiting the live cache,
+// and return an owned payload. It can run on the checkpoint worker while replay
+// commits, roots, or unwinds its current lineage.
+type TransactionStatusSnapshot interface {
+	MarshalBinary() ([]byte, error)
+}
+
+type transactionStatusSnapshot struct {
+	nodes               []*transactionStatusNode
+	rootedSinceSeed     uint16
+	complete            bool
+	coverageFromGenesis bool
+}
+
+func (s *transactionStatusSnapshot) MarshalBinary() ([]byte, error) {
+	if s == nil {
+		return nil, nil
+	}
+	return marshalTransactionStatusNodes(s.nodes, s.rootedSinceSeed, s.complete, s.coverageFromGenesis)
+}
+
+// CaptureSnapshotThrough selects the exact checkpoint lineage and coverage on
+// replay, but leaves transaction-key sorting and serialization to the worker.
+// Published deltas are immutable; only small node headers are copied here.
+func (c *TransactionStatusCache) CaptureSnapshotThrough(through uint64) (TransactionStatusSnapshot, error) {
 	if c == nil {
 		return nil, nil
 	}
@@ -700,7 +807,27 @@ func (c *TransactionStatusCache) SnapshotThrough(through uint64) ([]byte, error)
 	if rootedSinceSeed > maxTransactionStatusRoots {
 		rootedSinceSeed = maxTransactionStatusRoots
 	}
-	return marshalTransactionStatusNodes(nodes, uint16(rootedSinceSeed), complete, c.coverageFromGenesis)
+	owned := make([]transactionStatusNode, len(nodes))
+	pinned := make([]*transactionStatusNode, len(nodes))
+	for i, node := range nodes {
+		// Do not keep the old parent chain or copy its atomic field.
+		node.copyInto(&owned[i], nil)
+		pinned[i] = &owned[i]
+	}
+	return &transactionStatusSnapshot{
+		nodes: pinned, rootedSinceSeed: uint16(rootedSinceSeed), complete: complete,
+		coverageFromGenesis: c.coverageFromGenesis,
+	}, nil
+}
+
+// SnapshotThrough is the synchronous convenience API. Serialization still
+// happens after releasing the cache lock; normal folds use CaptureSnapshotThrough.
+func (c *TransactionStatusCache) SnapshotThrough(through uint64) ([]byte, error) {
+	snapshot, err := c.CaptureSnapshotThrough(through)
+	if err != nil || snapshot == nil {
+		return nil, err
+	}
+	return snapshot.MarshalBinary()
 }
 
 func (c *TransactionStatusCache) processedSlotLocked(blockhash solana.Hash, key transactionStatusKey) uint64 {
@@ -749,6 +876,7 @@ func (c *TransactionStatusCache) validateParentLocked(block *b.Block) error {
 }
 
 func (c *TransactionStatusCache) addDeltaVisibleLocked(delta transactionStatusDelta) error {
+	c.invalidateValidationLocked()
 	for blockhash, deltaGroup := range delta {
 		if group := c.visible[blockhash]; group != nil && group.keyIndex != deltaGroup.keyIndex {
 			return fmt.Errorf("transaction status blockhash %s uses inconsistent key indexes %d and %d",
@@ -760,7 +888,7 @@ func (c *TransactionStatusCache) addDeltaVisibleLocked(delta transactionStatusDe
 		if group == nil {
 			group = &visibleTransactionStatusGroup{
 				keyIndex: deltaGroup.keyIndex,
-				keys:     make(map[transactionStatusKey]uint16),
+				keys:     make(map[transactionStatusKey]uint16, len(deltaGroup.keys)),
 			}
 			c.visible[blockhash] = group
 		}
@@ -772,6 +900,7 @@ func (c *TransactionStatusCache) addDeltaVisibleLocked(delta transactionStatusDe
 }
 
 func (c *TransactionStatusCache) removeDeltaVisibleLocked(delta transactionStatusDelta) {
+	c.invalidateValidationLocked()
 	for blockhash, deltaGroup := range delta {
 		group := c.visible[blockhash]
 		if group == nil {
@@ -839,18 +968,74 @@ func (c *TransactionStatusCache) pruneLocked(through uint64) {
 	if drop <= 0 {
 		return
 	}
-	for _, node := range nodes[:drop] {
-		c.removeDeltaVisibleLocked(node.delta)
-	}
 	retained := nodes[drop:]
+	c.expireVisibleLocked(nodes[:drop], retained)
 	var parent *transactionStatusNode
 	for _, old := range retained {
-		parent = &transactionStatusNode{
-			slot: old.slot, blockID: old.blockID, hasBlockID: old.hasBlockID,
-			parent: parent, delta: old.delta,
-		}
+		next := new(transactionStatusNode)
+		old.copyInto(next, parent)
+		parent = next
 	}
 	c.tip = parent
+}
+
+// expireVisibleLocked expires a whole rooted batch. Most old blockhash groups
+// have no surviving bank and can be removed without visiting their transaction
+// keys. For a group crossing the boundary, update whichever side is smaller.
+// Immutable node deltas (including those pinned by producer views/checkpoints)
+// are never mutated. Unrooted retained banks count as survivors too.
+func (c *TransactionStatusCache) expireVisibleLocked(expired, retained []*transactionStatusNode) {
+	type groupExpiry struct {
+		expiredKeys  int
+		retainedKeys int
+		survivors    []*transactionStatusGroup
+	}
+	groups := make(map[solana.Hash]*groupExpiry)
+	for _, node := range expired {
+		for hash, delta := range node.delta {
+			g := groups[hash]
+			if g == nil {
+				g = &groupExpiry{}
+				groups[hash] = g
+			}
+			g.expiredKeys += len(delta.keys)
+		}
+	}
+	for _, node := range retained {
+		for hash, delta := range node.delta {
+			if g := groups[hash]; g != nil {
+				g.retainedKeys += len(delta.keys)
+				g.survivors = append(g.survivors, delta)
+			}
+		}
+	}
+	for hash, g := range groups {
+		if len(g.survivors) == 0 {
+			delete(c.visible, hash)
+		} else if g.retainedKeys < g.expiredKeys {
+			rebuilt := &visibleTransactionStatusGroup{keyIndex: g.survivors[0].keyIndex, keys: make(map[transactionStatusKey]uint16)}
+			for _, delta := range g.survivors {
+				for key := range delta.keys {
+					rebuilt.keys[key]++
+				}
+			}
+			c.visible[hash] = rebuilt
+			if len(rebuilt.keys) == 0 {
+				delete(c.visible, hash)
+			}
+		}
+	}
+	for _, node := range expired {
+		for hash, delta := range node.delta {
+			g := groups[hash]
+			if len(g.survivors) == 0 || g.retainedKeys < g.expiredKeys {
+				continue
+			}
+			// The existing removal path preserves reference counts for keys
+			// occurring in more than one retained/expired bank.
+			c.removeDeltaVisibleLocked(transactionStatusDelta{hash: delta})
+		}
+	}
 }
 
 func sliceTransactionStatusKey(messageHash [32]byte, keyIndex uint8) transactionStatusKey {
@@ -867,7 +1052,16 @@ func sliceTransactionStatusKey(messageHash [32]byte, keyIndex uint8) transaction
 }
 
 func marshalTransactionStatusNodes(nodes []*transactionStatusNode, rootedSinceSeed uint16, complete bool, coverageFromGenesis bool) ([]byte, error) {
-	var buf bytes.Buffer
+	encoded := make([][]byte, len(nodes))
+	size := 9 // magic, flags, rooted count and node count
+	for i, node := range nodes {
+		cache := node.encodingCache()
+		cache.once.Do(func() { cache.data = marshalTransactionStatusNode(node) })
+		encoded[i] = cache.data
+		size += len(cache.data)
+	}
+	// Every caller owns its result. Never return or append into a cached slice.
+	buf := bytes.NewBuffer(make([]byte, 0, size))
 	buf.Write(transactionStatusSnapshotMagic[:])
 	flags := byte(0)
 	if complete {
@@ -877,47 +1071,61 @@ func marshalTransactionStatusNodes(nodes []*transactionStatusNode, rootedSinceSe
 		flags |= 2
 	}
 	buf.WriteByte(flags)
-	_ = binary.Write(&buf, binary.LittleEndian, rootedSinceSeed)
-	_ = binary.Write(&buf, binary.LittleEndian, uint16(len(nodes)))
-	for _, node := range nodes {
-		_ = binary.Write(&buf, binary.LittleEndian, node.slot)
-		nodeFlags := byte(0)
-		if node.hasBlockID {
-			nodeFlags = 1
-		}
-		buf.WriteByte(nodeFlags)
-		if node.hasBlockID {
-			buf.Write(node.blockID[:])
-		}
-		blockhashes := make([]solana.Hash, 0, len(node.delta))
-		for blockhash := range node.delta {
-			blockhashes = append(blockhashes, blockhash)
-		}
-		sort.Slice(blockhashes, func(i, j int) bool {
-			return bytes.Compare(blockhashes[i][:], blockhashes[j][:]) < 0
-		})
-		_ = binary.Write(&buf, binary.LittleEndian, uint32(len(blockhashes)))
-		for _, blockhash := range blockhashes {
-			group := node.delta[blockhash]
-			buf.Write(blockhash[:])
-			buf.WriteByte(group.keyIndex)
-			keys := make([]transactionStatusKey, 0, len(group.keys))
-			for key := range group.keys {
-				keys = append(keys, key)
-			}
-			sort.Slice(keys, func(i, j int) bool {
-				return bytes.Compare(keys[i][:], keys[j][:]) < 0
-			})
-			_ = binary.Write(&buf, binary.LittleEndian, uint32(len(keys)))
-			for _, key := range keys {
-				buf.Write(key[:])
-			}
-		}
+	_ = binary.Write(buf, binary.LittleEndian, rootedSinceSeed)
+	_ = binary.Write(buf, binary.LittleEndian, uint16(len(nodes)))
+	for _, data := range encoded {
+		buf.Write(data)
 	}
 	return buf.Bytes(), nil
 }
 
+func marshalTransactionStatusNode(node *transactionStatusNode) []byte {
+	size := 8 + 1 + 4 // slot, flags and group count
+	if node.hasBlockID {
+		size += len(node.blockID)
+	}
+	for _, group := range node.delta {
+		size += 32 + 1 + 4 + transactionStatusKeySize*len(group.keys)
+	}
+	buf := bytes.NewBuffer(make([]byte, 0, size))
+	_ = binary.Write(buf, binary.LittleEndian, node.slot)
+	nodeFlags := byte(0)
+	if node.hasBlockID {
+		nodeFlags = 1
+	}
+	buf.WriteByte(nodeFlags)
+	if node.hasBlockID {
+		buf.Write(node.blockID[:])
+	}
+	blockhashes := make([]solana.Hash, 0, len(node.delta))
+	for blockhash := range node.delta {
+		blockhashes = append(blockhashes, blockhash)
+	}
+	sort.Slice(blockhashes, func(i, j int) bool {
+		return bytes.Compare(blockhashes[i][:], blockhashes[j][:]) < 0
+	})
+	_ = binary.Write(buf, binary.LittleEndian, uint32(len(blockhashes)))
+	for _, blockhash := range blockhashes {
+		group := node.delta[blockhash]
+		buf.Write(blockhash[:])
+		buf.WriteByte(group.keyIndex)
+		keys := make([]transactionStatusKey, 0, len(group.keys))
+		for key := range group.keys {
+			keys = append(keys, key)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			return bytes.Compare(keys[i][:], keys[j][:]) < 0
+		})
+		_ = binary.Write(buf, binary.LittleEndian, uint32(len(keys)))
+		for _, key := range keys {
+			buf.Write(key[:])
+		}
+	}
+	return buf.Bytes()
+}
+
 func (c *TransactionStatusCache) restore(data []byte) error {
+	c.invalidateValidationLocked()
 	reader := bytes.NewReader(data)
 	var magic [4]byte
 	if _, err := io.ReadFull(reader, magic[:]); err != nil {
