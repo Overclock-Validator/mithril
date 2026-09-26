@@ -2932,7 +2932,7 @@ postBootstrap:
 		}
 	}
 
-	var slotCtxSetter replay.RPCStateSetter
+	var slotCtxSetter replay.SlotCtxSetter
 	if rpcServer != nil {
 		slotCtxSetter = rpcServer
 	}
@@ -4405,7 +4405,7 @@ func runReplayWithRecovery(
 	useTurbine bool,
 	dbgOpts *replay.DebugOptions,
 	metricsWriter io.Writer,
-	rpcServer replay.RPCStateSetter,
+	rpcServer replay.SlotCtxSetter,
 	mithrilState *state.MithrilState,
 	blockFetchOpts *replay.BlockFetchOpts,
 	consensusOpts *replay.ConsensusOpts,

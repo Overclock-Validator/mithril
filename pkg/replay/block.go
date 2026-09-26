@@ -47,9 +47,9 @@ import (
 	"github.com/panjf2000/ants/v2"
 )
 
-// RPCStateSetter is implemented by the RPC server so replay can publish both
+// SlotCtxSetter is implemented by the RPC server so replay can publish both
 // its live execution bank and the latest bank durably folded into AccountsDB.
-type RPCStateSetter interface {
+type SlotCtxSetter interface {
 	SetSlotCtx(slotCtx *sealevel.SlotCtx)
 	SetRootedBankState(slot, blockHeight, transactionCount uint64)
 }
@@ -1684,7 +1684,7 @@ func ReplayBlocks(
 	useTurbine bool,
 	dbgOpts *DebugOptions,
 	metricsWriter io.Writer,
-	rpcServer RPCStateSetter,
+	rpcServer SlotCtxSetter,
 	blockFetchOpts *BlockFetchOpts,
 	consensusOpts *ConsensusOpts, // nil = use defaults (max_depth=64, policy="halt")
 	onCancelWriteState OnCancelWriteState, // callback to write state immediately on cancellation (can be nil)
