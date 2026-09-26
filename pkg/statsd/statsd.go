@@ -111,6 +111,7 @@ var (
 	TxsPerBlock                                 = Metric{"txs_per_block"}
 	SnapshotTarBytesRead                        = Metric{"snapshot_tar_bytes_read"}
 	SlotReplays                                 = Metric{"slot_replays"}
+	BlockProductionEntrySerializationErrors     = Metric{"block_production_entry_serialization_errors_total"}
 	BlockProductionLeaderSlots                  = Metric{"block_production_leader_slots_total"}
 	BlockProductionLeaderSlotTerminals          = Metric{"block_production_leader_slot_terminals_total"}
 	BlockProductionParentReady                  = Metric{"block_production_parent_ready_activations_total"}
@@ -124,6 +125,15 @@ var (
 	TurbineBlockDecode                          = Metric{"turbine_block_decode_duration_seconds"}
 	TurbineTransactionParse                     = Metric{"turbine_transaction_parse_duration_seconds"}
 	TurbineTransactionSigverify                 = Metric{"turbine_transaction_sigverify_duration_seconds"}
+	// Early durations sum elapsed component work, including verifier queueing;
+	// they overlap shred collection and are neither CPU nor pipeline wall time.
+	TurbineEarlyTransactionParse     = Metric{"turbine_early_transaction_parse_duration_seconds"}
+	TurbineEarlyTransactionSigverify = Metric{"turbine_early_transaction_sigverify_elapsed_seconds"}
+	TurbineEarlyPreparationWait      = Metric{"turbine_early_preparation_wait_seconds"}
+	TurbineEarlyVerifiedTransactions = Metric{"turbine_early_verified_transactions_total"}
+	TurbineFullToReady               = Metric{"turbine_full_to_ready_duration_seconds"}
+	// ReplayFullToReplayed: last shred assembled -> replay result handed to consensus.
+	ReplayFullToReplayed = Metric{"replay_full_to_replayed_duration_seconds"}
 	// ReplaySigverifyGroup times one drained group of transaction signatures
 	// and ReplaySigverifyGroupSignatures counts how many signatures were in it.
 	// The pair is what tells an operator whether batching is actually happening:
@@ -229,11 +239,12 @@ var MetricToType = map[Metric]metricType{
 	SlotReplayDurationMs: TimingT,
 	TxsPerBlock:          TimingT,
 
-	SnapshotTarBytesRead:               CountT,
-	SlotReplays:                        CountT,
-	BlockProductionLeaderSlots:         CountT,
-	BlockProductionLeaderSlotTerminals: CountT,
-	BlockProductionParentReady:         CountT,
+	SnapshotTarBytesRead:                    CountT,
+	SlotReplays:                             CountT,
+	BlockProductionEntrySerializationErrors: CountT,
+	BlockProductionLeaderSlots:              CountT,
+	BlockProductionLeaderSlotTerminals:      CountT,
+	BlockProductionParentReady:              CountT,
 
 	BlockProductionParentReadyAge:               TimingT,
 	BlockProductionStartCutoffLate:              TimingT,
@@ -245,6 +256,12 @@ var MetricToType = map[Metric]metricType{
 	TurbineBlockDecode:                          TimingT,
 	TurbineTransactionParse:                     TimingT,
 	TurbineTransactionSigverify:                 TimingT,
+	TurbineEarlyTransactionParse:                TimingT,
+	TurbineEarlyTransactionSigverify:            TimingT,
+	TurbineEarlyPreparationWait:                 TimingT,
+	TurbineEarlyVerifiedTransactions:            CountT,
+	TurbineFullToReady:                          TimingT,
+	ReplayFullToReplayed:                        TimingT,
 	ReplaySigverifyGroup:                        TimingT,
 	ReplaySigverifyGroupSignatures:              CountT,
 	TurbineReplayAdmission:                      TimingT,
@@ -335,13 +352,14 @@ var MetricToLabels = map[Metric][]string{
 	TasksIndexEntryBuilderLatency:  {},
 	TasksAppendVecCopyingLatency:   {},
 
-	SlotReplayDurationMs:               {},
-	TxsPerBlock:                        {},
-	SnapshotTarBytesRead:               {},
-	SlotReplays:                        {},
-	BlockProductionLeaderSlots:         {"outcome", "reason"},
-	BlockProductionLeaderSlotTerminals: {"outcome", "terminal", "cause"},
-	BlockProductionParentReady:         {"activation", "status"},
+	SlotReplayDurationMs:                    {},
+	TxsPerBlock:                             {},
+	SnapshotTarBytesRead:                    {},
+	SlotReplays:                             {},
+	BlockProductionEntrySerializationErrors: {},
+	BlockProductionLeaderSlots:              {"outcome", "reason"},
+	BlockProductionLeaderSlotTerminals:      {"outcome", "terminal", "cause"},
+	BlockProductionParentReady:              {"activation", "status"},
 
 	BlockProductionParentReadyAge:               {"activation"},
 	BlockProductionStartCutoffLate:              {"phase"},
@@ -353,6 +371,12 @@ var MetricToLabels = map[Metric][]string{
 	TurbineBlockDecode:                          {},
 	TurbineTransactionParse:                     {},
 	TurbineTransactionSigverify:                 {},
+	TurbineEarlyTransactionParse:                {},
+	TurbineEarlyTransactionSigverify:            {},
+	TurbineEarlyPreparationWait:                 {},
+	TurbineEarlyVerifiedTransactions:            {},
+	TurbineFullToReady:                          {},
+	ReplayFullToReplayed:                        {},
 	ReplaySigverifyGroup:                        {},
 	ReplaySigverifyGroupSignatures:              {},
 	TurbineReplayAdmission:                      {},
@@ -390,6 +414,11 @@ var MetricToBuckets = map[Metric][]float64{
 	TurbineBlockDecode:                          turbinePipelineDurationBuckets,
 	TurbineTransactionParse:                     turbinePipelineDurationBuckets,
 	TurbineTransactionSigverify:                 turbinePipelineDurationBuckets,
+	TurbineEarlyTransactionParse:                turbinePipelineDurationBuckets,
+	TurbineEarlyTransactionSigverify:            turbinePipelineDurationBuckets,
+	TurbineEarlyPreparationWait:                 turbinePipelineDurationBuckets,
+	TurbineFullToReady:                          turbinePipelineDurationBuckets,
+	ReplayFullToReplayed:                        turbinePipelineDurationBuckets,
 	ReplaySigverifyGroup:                        turbinePipelineDurationBuckets,
 	TurbineReplayAdmission:                      turbinePipelineDurationBuckets,
 	AlpenglowVoteRewards:                        turbinePipelineDurationBuckets,

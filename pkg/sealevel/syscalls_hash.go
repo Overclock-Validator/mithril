@@ -3,6 +3,7 @@ package sealevel
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"math/big"
 
@@ -49,15 +50,13 @@ func SyscallSha256Impl(vm sbpf.VM, valsAddr, valsLen, resultsAddr uint64) (uint6
 		}
 
 		var data []byte
-		reader := bytes.NewReader(vals)
 
+		// Translate validated the complete descriptor array above. Decode directly
+		// to avoid allocating a reader and a temporary buffer for each slice.
 		for count := uint64(0); count < valsLen; count++ {
 
-			var vec VectorDescrC
-			err = vec.Unmarshal(reader)
-			if err != nil {
-				return syscallErr(err)
-			}
+			offset := count * 16
+			vec := VectorDescrC{Addr: binary.LittleEndian.Uint64(vals[offset:]), Len: binary.LittleEndian.Uint64(vals[offset+8:])}
 
 			data, err = vm.Translate(vec.Addr, vec.Len, false)
 			if err != nil {
@@ -73,7 +72,9 @@ func SyscallSha256Impl(vm sbpf.VM, valsAddr, valsLen, resultsAddr uint64) (uint6
 			hasher.Write(data)
 		}
 	}
-	copy(hashResult[:], hasher.Sum(nil))
+	// All inputs have been read before writing, including when output aliases
+	// input memory. Append into the translated destination without allocating.
+	hasher.Sum(hashResult[:0])
 	return syscallSuccess(0)
 }
 
