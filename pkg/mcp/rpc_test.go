@@ -79,6 +79,51 @@ func TestGetSlotInfoSemanticLabels(t *testing.T) {
 	}
 }
 
+func TestSlotInfoUsesLiveHeadWhenRPCDefaultsToFinalized(t *testing.T) {
+	const liveSlot, rootedSlot = uint64(500), uint64(372)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Method string `json:"method"`
+			Params []struct {
+				Commitment string `json:"commitment"`
+			} `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.Method != "getEpochInfo" {
+			t.Errorf("unexpected RPC request: %+v, error %v", request, err)
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		slot := rootedSlot
+		if len(request.Params) == 1 && request.Params[0].Commitment == "processed" {
+			slot = liveSlot
+		}
+		_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":1,"result":{"absoluteSlot":%d,"blockHeight":%d,"epoch":1,"slotIndex":%d,"slotsInEpoch":256,"transactionCount":99}}`, slot, slot, slot-256)
+	}))
+	t.Cleanup(srv.Close)
+	client, err := newMithrilRPCClient(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Run("slot info", func(t *testing.T) {
+		info, err := client.getSlotInfo(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.AbsoluteSlot != liveSlot {
+			t.Fatalf("local unfinalized slot = %d, want live slot %d (durable root %d)", info.AbsoluteSlot, liveSlot, rootedSlot)
+		}
+	})
+	t.Run("cross check", func(t *testing.T) {
+		comparison, err := slotsBehindCheck(t.Context(), Config{RPCURL: srv.URL, SlotsBehindWarn: 64}, srv.URL, "processed")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if comparison.Status != "in_sync" || comparison.SlotsBehind != 0 {
+			t.Fatalf("live node comparison = %+v, want in_sync with zero lag", comparison)
+		}
+	})
+}
+
 func TestGetLatestBlockhashParse(t *testing.T) {
 	c := newRPCClientWithResponse(t, `{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":285},"value":{"blockhash":"`+testHash+`","lastValidBlockHeight":435}}}`)
 	bh, err := c.getLatestBlockhash(context.Background())

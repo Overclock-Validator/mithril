@@ -154,7 +154,7 @@ type SlotInfo struct {
 }
 
 func (c *mithrilRPCClient) getSlotInfo(ctx context.Context) (SlotInfo, error) {
-	raw, err := c.call(ctx, "getEpochInfo", []any{})
+	raw, err := c.call(ctx, "getEpochInfo", []any{map[string]string{"commitment": "processed"}})
 	if err != nil {
 		return SlotInfo{}, err
 	}
