@@ -69,6 +69,7 @@ var supportedRPCMethods = map[string]struct{}{
 	"getGenesisHash":      {},
 	"getLatestBlockhash":  {},
 	"getLeaderSchedule":   {},
+	"getSlot":             {},
 	"getVoteAccounts":     {},
 	"sendTransaction":     {},
 	"simulateTransaction": {},

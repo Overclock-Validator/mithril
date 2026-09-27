@@ -223,6 +223,12 @@ curl http://YOUR_MITHRIL_IP:8899 -X POST -H "Content-Type: application/json" -d 
 - `getBlockHeight` - Get current block height
 - `getEpochInfo` - Get current epoch info
 - `getLatestBlockhash` - Get recent blockhash
+- `getSlot` - Get the slot at the requested commitment (defaults to finalized)
+
+`getSlot` accepts an optional config object with `commitment` and `minContextSlot`.
+On Alpenglow, `processed` uses the live replay slot; `confirmed` and `finalized`
+use the published rooted slot. If that slot is below `minContextSlot`, the request
+returns error `-32016` with the available slot in `data.contextSlot`.
 
 We're actively expanding RPC method coverage. Upcoming methods include transaction simulation, send transaction, and get leader schedule.
 
