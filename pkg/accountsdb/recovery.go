@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 )
 
@@ -97,6 +98,12 @@ func (db *AccountsDb) RecoverFoldState() (RecoveryResult, error) {
 		if verr != nil {
 			mlog.Log.Warnf("accountsdb: fold manifest seq %d failed verification (%v); treating batch and everything above as undecided", seq, verr)
 			break
+		}
+		// Vote membership is derived from the CRC-checked segment, keeping the
+		// durable manifest compatible with pre-vote-index binaries. A read or
+		// metadata error must leave this decided batch intact for diagnosis/retry.
+		if err := db.restoreManifestVoteFlags(manifest); err != nil {
+			return res, fmt.Errorf("accountsdb: restore vote candidates for fold seq %d: %w", seq, err)
 		}
 		if err := db.applyManifestToIndex(manifest); err != nil {
 			return res, fmt.Errorf("accountsdb: replay fold manifest seq %d: %w", seq, err)
@@ -313,4 +320,40 @@ func (db *AccountsDb) removeStaleTmpManifests() ([]string, error) {
 		removed = append(removed, p)
 	}
 	return removed, nil
+}
+
+// restoreManifestVoteFlags reconstructs the transient vote-index hints before
+// replaying a durable manifest. Normal commits already have these hints from
+// the accounts being written and do not reread the segment. Read fixed headers
+// only, without loading account payloads or consulting the possibly stale index.
+// The caller must first verify the segment length and CRC.
+func (db *AccountsDb) restoreManifestVoteFlags(m *SegmentManifest) error {
+	if len(m.Records) == 0 {
+		return nil
+	}
+	f, err := os.Open(filepath.Join(db.AcctsDir, SegmentDataName(m.ThroughSlot, m.FileId)))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	var header [hdrLen]byte
+	for i := range m.Records {
+		r := &m.Records[i]
+		if r.Offset > m.DataLen || m.DataLen-r.Offset < hdrLen || r.Offset > uint64(1<<63-1)-hdrLen {
+			return fmt.Errorf("account %x: header offset %d outside segment", r.Pubkey, r.Offset)
+		}
+		if _, err := f.ReadAt(header[:], int64(r.Offset)); err != nil {
+			return err
+		}
+		if [32]byte(header[pubkeyOffset:pubkeyOffset+32]) != r.Pubkey {
+			return fmt.Errorf("account %x: segment pubkey mismatch", r.Pubkey)
+		}
+		dataLen := binary.LittleEndian.Uint64(header[dataLenOffset : dataLenOffset+8])
+		if dataLen > m.DataLen-r.Offset-hdrLen {
+			return fmt.Errorf("account %x: payload outside segment", r.Pubkey)
+		}
+		r.Vote = binary.LittleEndian.Uint64(header[lamportsOffset:lamportsOffset+8]) > 0 &&
+			[32]byte(header[ownerOffset:ownerOffset+32]) == addresses.VoteProgramAddr
+	}
+	return nil
 }

@@ -32,8 +32,23 @@ changed keys while loading candidates; recalculation temporarily holds a key lis
   or a subsequent successful write before the account version is readable again.
 
 This cache adds no durable index, disk writes, or manifest format changes. It is
-reconstructed after process restart. It does not address the separate manifest
-format compatibility issue in the PR on which it is based.
+reconstructed after process restart.
+
+The durable vote-candidate index also keeps the original version-1 manifest
+format: `PrevValid` is exactly 0 or 1, as required by older rewind readers.
+Vote membership is an in-memory hint during normal commits. Recovery derives it
+from account headers in the CRC-checked segment before atomically installing the
+primary index, vote candidates, and fold watermark. This adds header reads only
+for batches whose index application must be replayed. Metadata/read failures
+leave that batch's files intact and do not advance its watermark.
+
+The reader still accepts the 2/3 flag bytes emitted by earlier revisions of the
+RPC branch, preserving their undo pointers. Existing files are not automatically
+rewritten: stores that already contain those flags must use the corrected reader
+for recovery/rewind, or be rebuilt before downgrading to a pre-RPC binary. Newly
+written manifests are compatible with the original reader. A format-version bump
+alone would not make downgrade safe, because older recovery treats unknown
+manifest headers as orphans.
 
 ## Work and validation
 
