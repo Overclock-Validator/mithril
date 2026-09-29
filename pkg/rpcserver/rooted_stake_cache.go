@@ -367,10 +367,12 @@ func (s *RpcServer) bootstrapStakeCache(ctx context.Context, generation uint64) 
 	return nil
 }
 
-// Recalculate in bounded chunks. A per-entry calculation tag makes concurrent
-// committed updates part of the same sum exactly once. New accounts omitted
-// from the starting key list are already included by the observer. An activation
-// input change cancels this sum; ordinary account changes do not restart it.
+// Recalculate in bounded chunks. Every map iterator step and entry access holds
+// c.mu; commits may modify the map only between chunks. Go's map range semantics
+// permit those modifications: deleted entries disappear, and new entries may or
+// may not be visited. The observer already includes new/updated entries in this
+// calculation, so their tags prevent double counting either way. A reset or new
+// activation input cancels the iterator before it can advance again.
 func (s *RpcServer) recalculateStakeTotals(ctx context.Context, slot, epoch, generation uint64) (err error) {
 	c := &s.stakeCache
 	bank := s.rootedBank.Load()
@@ -393,38 +395,37 @@ func (s *RpcServer) recalculateStakeTotals(ctx context.Context, slot, epoch, gen
 	c.epoch, c.history, c.activationEpoch = epoch, history, activation
 	c.totals = make(map[solana.PublicKey]uint64)
 	c.totalsReady = false
-	keys := make([]solana.PublicKey, 0, len(c.byStake))
-	for key := range c.byStake {
-		keys = append(keys, key)
-	}
-	c.mu.Unlock()
+	// From here every return owns c.mu, including errors from yield. Invalidate
+	// only this calculation; a reset may already have installed a different view.
 	defer func() {
-		if err != nil {
-			c.mu.Lock()
-			if c.generation == generation && c.calculation == calculation {
-				c.totals = nil
-				c.totalsReady = false
-			}
-			c.mu.Unlock()
+		if err != nil && c.generation == generation && c.calculation == calculation {
+			c.totals = nil
+			c.totalsReady = false
 		}
+		c.mu.Unlock()
 	}()
-	for start := 0; start < len(keys); start += stakeCacheBatchSize {
+	// Enter and return locked. Never advance the map iterator while unlocked.
+	yield := func(visited int) error {
+		c.mu.Unlock()
 		if c.beforeRecalculationChunk != nil {
-			c.beforeRecalculationChunk(start)
+			c.beforeRecalculationChunk(visited)
 		}
-		if err = ctx.Err(); err != nil {
-			return err
-		}
+		canceled := ctx.Err()
 		c.mu.Lock()
+		if canceled != nil {
+			return canceled
+		}
 		if c.generation != generation || c.calculation != calculation {
-			c.mu.Unlock()
 			return errStakeViewChanged
 		}
-		for _, key := range keys[start:min(start+stakeCacheBatchSize, len(keys))] {
-			entry, exists := c.byStake[key]
-			if !exists || entry.calculation == calculation {
-				continue
-			}
+		return nil
+	}
+	if err = yield(0); err != nil {
+		return err
+	}
+	visited := 0
+	for key, entry := range c.byStake {
+		if entry.calculation != calculation {
 			entry.active = entry.delegation.Stake(epoch, &history, activation)
 			entry.calculation = calculation
 			c.byStake[key] = entry
@@ -432,12 +433,12 @@ func (s *RpcServer) recalculateStakeTotals(ctx context.Context, slot, epoch, gen
 				c.totals[entry.delegation.VoterPubkey] += entry.active
 			}
 		}
-		c.mu.Unlock()
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.generation != generation || c.calculation != calculation {
-		return errStakeViewChanged
+		visited++
+		if visited%stakeCacheBatchSize == 0 {
+			if err = yield(visited); err != nil {
+				return err
+			}
+		}
 	}
 	c.totalsReady = true
 	c.recalculations++

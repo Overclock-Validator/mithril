@@ -20,7 +20,8 @@ cached read. Unknown or invalid filtered keys do not create negative cache entri
 The retained data is one compact delegation/contribution per live delegated
 stake account, plus totals per vote account. Full account buffers are not retained.
 Memory is proportional to delegated stake accounts. Bootstrap temporarily tracks
-changed keys while loading candidates; recalculation temporarily holds a key list.
+changed keys while loading candidates. Recalculation walks the existing map
+without allocating or copying a whole-cache key list.
 
 ## Publication and recovery contract
 
@@ -37,6 +38,15 @@ changed keys while loading candidates; recalculation temporarily holds a key lis
 - Epoch, stake-history, or warmup-feature changes trigger a RAM-only recalculation
   in bounded chunks. Per-entry calculation tags count concurrent updates exactly
   once; new activation inputs cancel an unfinished calculation.
+- Recalculation holds the cache mutex for every map iterator step, read and write,
+  releasing it after each 512 visited entries, including already-counted entries.
+  Commits between chunks may delete or insert keys: the observer removes old
+  contributions and counts updated/new entries with the current calculation tag.
+  Those tags prevent double counting whether the iterator sees an insertion or
+  skips it, as permitted by [Go's map range semantics](https://go.dev/ref/spec#For_range).
+  After each lock reacquisition, generation and calculation checks reject resets
+  or changed activation inputs before the iterator advances again. This bounds
+  entries processed per lock hold, not a hard wall-clock latency guarantee.
 - Rewind, recovery, and failed writes invalidate the derived view. Recovery also
   clears old account-read caches before a rebuild. Reusing the same slot on another
   fork cannot reuse its old stake totals. Failed writes require successful repair
@@ -82,6 +92,20 @@ old per-query scan against warm aggregate reads, and separately measures applyin
 These are component measurements: they exclude JSON encoding, network latency,
 initial cache loading, and an epoch transition. They do not establish mainnet
 capacity or live validator performance.
+
+`BenchmarkRootedStakeRecalculation` isolates RAM traversal at 20,000 and 2 million
+delegations with 1,000 voters. The delegation cache is seeded directly and all
+stakes are bootstrap-active; it measures recalculation time and allocations,
+not startup, disk, or writer latency. For concurrent commits and mixed activation
+history, use the on-disk sizing experiment below. An optional Go mutex profile
+can attribute writer/reader lock wait; profile times sum waiting goroutines and
+must not be reported as a single request's wall-clock latency. The sizing test's
+full-scan correctness oracles also appear in whole-process profiles.
+
+```sh
+GOMAXPROCS=2 GOMEMLIMIT=4GiB go test ./pkg/rpcserver -run '^$' \
+  -bench '^BenchmarkRootedStakeRecalculation$' -benchtime=700ms -count=3
+```
 
 `BenchmarkGetVoteAccountsRecords` measures the warm handler plus JSON encoding
 for 1,000 V4 vote accounts (31 lockouts and 64 credit-history entries each), or one
