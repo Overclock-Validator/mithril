@@ -99,7 +99,9 @@ func (rpcServer *RpcServer) readRootedAccount(ctx context.Context, pubkey solana
 	if err != nil {
 		return rooted, nil, err
 	}
-	if len(accountSet) != 1 || accountSet[0] == nil {
+	// Batch reads use zero-lamport placeholders for absent/deleted accounts.
+	// Translate that loader representation into absence at the RPC boundary.
+	if len(accountSet) != 1 || accountSet[0] == nil || accountSet[0].Lamports == 0 {
 		return rooted, nil, accountsdb.ErrNoAccount
 	}
 	return rooted, accountSet[0], nil
