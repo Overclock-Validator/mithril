@@ -159,6 +159,11 @@ func (db *AccountsDb) CommitBatch(
 	}
 	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i][:], keys[j][:]) < 0 })
 
+	finish := db.beginAccountChange()
+	var committed []*accounts.Account
+	success := false
+	defer func() { finish(committed, throughSlot, success, false) }()
+
 	// (2) fileId allocation; persist high-water BEFORE the first data byte (I7).
 	fileId := db.LargestFileId.Add(1)
 	if err := db.persistLargestFileId(); err != nil {
@@ -318,6 +323,7 @@ func (db *AccountsDb) CommitBatch(
 
 	// (8) Publish.
 	db.lastBatchSeq = batchSeq
+	committed, success = live, true
 
 	return BatchCommitResult{
 		BatchSeq:    batchSeq,

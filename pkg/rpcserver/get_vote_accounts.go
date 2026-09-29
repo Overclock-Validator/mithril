@@ -2,16 +2,14 @@ package rpcserver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
-	"sync"
 
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
-	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/filecoin-project/go-jsonrpc"
-	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -62,6 +60,17 @@ func (rpcServer *RpcServer) GetVoteAccounts(ctx context.Context, p jsonrpc.RawPa
 	}
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return GetVoteAccountsResp{}, err
+		}
+		bank := rpcServer.rootedBank.Load()
+		version, stable := rpcServer.acctsDb.CommittedAccountVersion()
+		if !stable {
+			if err := waitForRootedPublication(ctx); err != nil {
+				return GetVoteAccountsResp{}, err
+			}
+			continue
+		}
 		rooted, ok := rpcServer.getRootedBankState()
 		if !ok {
 			return GetVoteAccountsResp{}, fmt.Errorf("node has no rooted bank available")
@@ -71,30 +80,32 @@ func (rpcServer *RpcServer) GetVoteAccounts(ctx context.Context, p jsonrpc.RawPa
 		if !ok {
 			return GetVoteAccountsResp{}, fmt.Errorf("epoch stakes unavailable for rooted epoch %d", epoch)
 		}
-		activeStakes, err := rpcServer.rootedActivatedStakes(ctx, rooted.Slot, epoch)
+		activeStakes, err := rpcServer.rootedActivatedStakes(ctx, rooted.Slot, epoch, config.votePubkey)
+		if errors.Is(err, errStakeViewChanged) {
+			if err := waitForRootedPublication(ctx); err != nil {
+				return GetVoteAccountsResp{}, err
+			}
+			continue
+		}
 		if err != nil {
 			return GetVoteAccountsResp{}, err
 		}
 
-		votePubkeys, err := rpcServer.acctsDb.VoteAccountPubkeys(ctx)
-		if err != nil {
-			return GetVoteAccountsResp{}, fmt.Errorf("list vote accounts: %w", err)
-		}
-		// Epoch stakes also cover stores created before the durable index was built.
-		for votePubkey := range stakes.Stakes {
-			votePubkeys = append(votePubkeys, votePubkey)
-		}
-		slices.SortFunc(votePubkeys, func(left, right solana.PublicKey) int {
-			return slices.Compare(left[:], right[:])
-		})
-		votePubkeys = slices.Compact(votePubkeys)
-		filtered := votePubkeys[:0]
-		for _, votePubkey := range votePubkeys {
-			if config.votePubkey == nil || votePubkey == *config.votePubkey {
-				filtered = append(filtered, votePubkey)
+		var votePubkeys []solana.PublicKey
+		if config.votePubkey != nil {
+			votePubkeys = []solana.PublicKey{*config.votePubkey}
+		} else {
+			votePubkeys, err = rpcServer.acctsDb.VoteAccountPubkeys(ctx)
+			if err != nil {
+				return GetVoteAccountsResp{}, fmt.Errorf("list vote accounts: %w", err)
 			}
+			// Epoch stakes also cover stores created before the durable index was built.
+			for key := range stakes.Stakes {
+				votePubkeys = append(votePubkeys, key)
+			}
+			slices.SortFunc(votePubkeys, func(a, b solana.PublicKey) int { return slices.Compare(a[:], b[:]) })
+			votePubkeys = slices.Compact(votePubkeys)
 		}
-		votePubkeys = filtered
 		published, accounts, err := rpcServer.readRootedAccounts(ctx, votePubkeys)
 		if err != nil {
 			return GetVoteAccountsResp{}, fmt.Errorf("read vote accounts at rooted slot %d: %w", rooted.Slot, err)
@@ -151,60 +162,12 @@ func (rpcServer *RpcServer) GetVoteAccounts(ctx context.Context, p jsonrpc.RawPa
 				response.Delinquent = append(response.Delinquent, info)
 			}
 		}
+		latest, stable := rpcServer.acctsDb.CommittedAccountVersion()
+		if !stable || latest != version || rpcServer.rootedBank.Load() != bank || rpcServer.rootedPublicationPending(rooted.Slot) {
+			continue
+		}
 		return response, nil
 	}
-}
-
-func (rpcServer *RpcServer) rootedActivatedStakes(ctx context.Context, slot, epoch uint64) (map[solana.PublicKey]uint64, error) {
-	// Replay may not have published a slot context after snapshot boot; both
-	// inputs to stake activation must come from the same rooted bank instead.
-	rooted, accounts, err := rpcServer.readRootedAccounts(ctx, []solana.PublicKey{
-		sealevel.SysvarStakeHistoryAddr,
-		features.ReduceStakeWarmupCooldown.Address,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("read rooted stake history: %w", err)
-	}
-	if rooted.Slot != slot {
-		return nil, nil
-	}
-	if accounts[0] == nil {
-		return nil, fmt.Errorf("stake history unavailable at rooted slot %d", slot)
-	}
-	var history sealevel.SysvarStakeHistory
-	if err := history.UnmarshalWithDecoder(bin.NewBinDecoder(accounts[0].Data)); err != nil {
-		return nil, fmt.Errorf("decode stake history at rooted slot %d: %w", slot, err)
-	}
-	var activationEpoch *uint64
-	featureAccount := accounts[1]
-	if featureAccount != nil && featureAccount.Lamports > 0 && featureAccount.Owner == addresses.FeatureAddr {
-		var feature features.FeatureAcct
-		if err := feature.UnmarshalWithDecoder(bin.NewBinDecoder(featureAccount.Data)); err != nil {
-			return nil, fmt.Errorf("decode rooted stake warmup feature: %w", err)
-		}
-		if feature.ActivatedAt != nil && *feature.ActivatedAt <= rooted.Slot {
-			epoch := rpcServer.epochSchedule.GetEpoch(*feature.ActivatedAt)
-			activationEpoch = &epoch
-		}
-	}
-	stakes := make(map[solana.PublicKey]uint64)
-	var mu sync.Mutex
-	_, err = global.StreamStakeAccounts(rpcServer.acctsDb, slot, func(_ solana.PublicKey, delegation *sealevel.Delegation, _ uint64) {
-		active := delegation.Stake(epoch, &history, activationEpoch)
-		if active == 0 {
-			return
-		}
-		mu.Lock()
-		stakes[delegation.VoterPubkey] += active
-		mu.Unlock()
-	})
-	if err != nil {
-		return nil, fmt.Errorf("scan rooted stake accounts at slot %d: %w", slot, err)
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	return stakes, nil
 }
 
 func parseGetVoteAccountsConfig(params []interface{}) (getVoteAccountsConfig, error) {

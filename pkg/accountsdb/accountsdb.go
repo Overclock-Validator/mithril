@@ -41,6 +41,14 @@ type AccountsDb struct {
 	// the write side; hot-path program cache operations take the read side.
 	programCacheMu sync.RWMutex
 
+	// Coherent, process-local derived views of committed account state.
+	accountStateMu        sync.Mutex
+	accountStateVersion   atomic.Uint64
+	accountCommittedSlot  atomic.Uint64
+	accountStateUncertain atomic.Bool
+	accountObserversMu    sync.Mutex
+	accountObservers      map[AccountStateObserver]struct{}
+
 	// readCacheEpochMu protects the cache epoch and the pending fold view.
 	// CommitBatch publishes its immutable newest-wins union here before the
 	// Pebble index commit. Readers use that view for changed keys while the
@@ -700,11 +708,15 @@ func (accountsDb *AccountsDb) storeAccountsSync(accts []*accounts.Account, slot 
 	accountsDb.refreshReadCaches(accts)
 	accountsDb.appendVecReadMu.Lock()
 	defer accountsDb.appendVecReadMu.Unlock()
+	finish := accountsDb.beginAccountChange()
+	success := false
+	defer func() { finish(accts, slot, success, false) }()
 	if StoreAccountsWorkers == 1 {
 		accountsDb.storeAccountsInternal(accts, slot)
 	} else {
 		accountsDb.parallelStoreAccounts(StoreAccountsWorkers, accts, slot)
 	}
+	success = true
 }
 
 // refreshReadCaches keeps already-hot common entries coherent after a store,

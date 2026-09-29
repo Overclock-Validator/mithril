@@ -53,6 +53,9 @@ type RecoveryResult struct {
 func (db *AccountsDb) RecoverFoldState() (RecoveryResult, error) {
 	db.foldMu.Lock()
 	defer db.foldMu.Unlock()
+	finish := db.beginAccountChange()
+	success := false
+	defer func() { finish(nil, db.durableThrough.Load(), success, true) }() // Derived indexes must rebuild, including on partial failures.
 
 	res := RecoveryResult{}
 
@@ -165,8 +168,19 @@ func (db *AccountsDb) RecoverFoldState() (RecoveryResult, error) {
 	// reconciliation instead of condemning the store as data loss.
 	res.RewindInProgress = hasParkedRewindManifests(db.AcctsDir)
 
+	// Recovery can also run in-process after a partial fold. Discard cached
+	// account bytes before rebuilding any derived view against the repaired index.
+	db.readCacheEpochMu.Lock()
+	db.readCacheEpoch++
+	db.pendingFold = nil
+	if db.commonAdmission != nil {
+		db.resetReadCachesLocked()
+	}
+	db.readCacheEpochMu.Unlock()
+
 	db.lastBatchSeq = res.BatchSeq
 	db.durableThrough.Store(res.DurableThrough)
+	success = true
 	return res, nil
 }
 

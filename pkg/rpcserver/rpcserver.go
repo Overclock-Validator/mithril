@@ -35,6 +35,9 @@ type RpcServer struct {
 	genesisHash   string
 	rootedBank    atomic.Pointer[rootedBankState]
 
+	stakeCacheOnce sync.Once
+	stakeCache     rootedStakeCache
+
 	leaderTPUCacheMu         sync.RWMutex
 	leaderTPUByIdentity      map[solana.PublicKey]tpuEndpoint
 	leaderTPUCacheUpdatedAt  time.Time
@@ -132,7 +135,8 @@ func (rpcServer *RpcServer) readRootedAccounts(ctx context.Context, pubkeys []so
 
 func (rpcServer *RpcServer) rootedPublicationPending(rootedSlot uint64) bool {
 	if !rpcServer.acctsDb.RootedDurable {
-		return false
+		committed := rpcServer.acctsDb.CommittedAccountSlot()
+		return committed != 0 && committed != rootedSlot
 	}
 	durableThrough := rpcServer.acctsDb.DurableThrough()
 	// Zero means the snapshot baseline is active and no fold has committed yet.

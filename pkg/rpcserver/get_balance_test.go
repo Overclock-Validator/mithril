@@ -97,7 +97,7 @@ func TestGetBalanceRejectsInvalidParams(t *testing.T) {
 	}
 }
 
-func newRPCAccountsDB(t *testing.T) *accountsdb.AccountsDb {
+func newRPCAccountsDB(t testing.TB) *accountsdb.AccountsDb {
 	t.Helper()
 	dir := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "accounts"), 0o755))
