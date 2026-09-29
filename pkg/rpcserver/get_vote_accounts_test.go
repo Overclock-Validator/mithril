@@ -212,7 +212,7 @@ func TestGetVoteAccountsRejectsInvalidConfig(t *testing.T) {
 	}
 }
 
-func voteAccountForRPC(t *testing.T, key solana.PublicKey, state *sealevel.VoteStateVersions) *accounts.Account {
+func voteAccountForRPC(t testing.TB, key solana.PublicKey, state *sealevel.VoteStateVersions) *accounts.Account {
 	t.Helper()
 	data, err := sealevel.MarshalVersionedVoteState(state)
 	require.NoError(t, err)

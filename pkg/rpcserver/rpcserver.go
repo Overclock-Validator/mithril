@@ -35,8 +35,10 @@ type RpcServer struct {
 	genesisHash   string
 	rootedBank    atomic.Pointer[rootedBankState]
 
-	stakeCacheOnce sync.Once
-	stakeCache     rootedStakeCache
+	stakeCacheOnce  sync.Once
+	stakeCache      rootedStakeCache
+	voteRecordsOnce sync.Once
+	voteRecords     rootedVoteRecordCache
 
 	leaderTPUCacheMu         sync.RWMutex
 	leaderTPUByIdentity      map[solana.PublicKey]tpuEndpoint

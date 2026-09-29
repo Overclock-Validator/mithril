@@ -3,8 +3,19 @@
 `getVoteAccounts` maintains activated stake by vote account in memory. The
 initial request loads the existing stake-candidate index and reads accounts in
 batches of 512. Subsequent account commits update only changed delegations.
-Filtered requests read one vote account and one total; unfiltered requests still
+Filtered requests select one vote record and one total; unfiltered requests still
 enumerate vote accounts, but neither path rescans stake accounts on each scrape.
+Initialized vote-account records are decoded lazily and reused until a committed
+write touches that account. The cache owns the RPC fields and up to five credit
+entries, not account buffers. Stake totals, epoch membership and delinquency are
+applied per request. Returned credit slices are copies owned by the caller.
+
+The writer only invalidates touched vote records; it performs no additional vote
+decoding or I/O. Rewind, recovery and failed writes clear all parsed records. Loads
+check the account version under the invalidation lock before entering the cache,
+so an old in-flight decode cannot resurrect a record after a concurrent commit.
+The final response still checks bank identity and account version even on a fully
+cached read. Unknown or invalid filtered keys do not create negative cache entries.
 
 The retained data is one compact delegation/contribution per live delegated
 stake account, plus totals per vote account. Full account buffers are not retained.
@@ -71,6 +82,20 @@ old per-query scan against warm aggregate reads, and separately measures applyin
 These are component measurements: they exclude JSON encoding, network latency,
 initial cache loading, and an epoch transition. They do not establish mainnet
 capacity or live validator performance.
+
+`BenchmarkGetVoteAccountsRecords` measures the warm handler plus JSON encoding
+for 1,000 V4 vote accounts (31 lockouts and 64 credit-history entries each), or one
+filtered account. It isolates vote records with initialized empty stake totals.
+The changed-record cases invalidate 10% or 100% of decoded records before every
+request, including invalidation cost, while account buffers remain warm. They
+simulate cache churn without disk commits; they do not measure writer contention.
+Reuse benefits depend on how many vote accounts change between requests. A full
+refresh still pays decoding plus cache maintenance and response ownership costs.
+
+```sh
+GOMAXPROCS=2 go test ./pkg/rpcserver -run '^$' \
+  -bench '^BenchmarkGetVoteAccountsRecords$' -benchtime=700ms -count=3
+```
 
 ## Larger on-disk sizing experiment
 

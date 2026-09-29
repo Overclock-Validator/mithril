@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"slices"
 
-	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/filecoin-project/go-jsonrpc"
@@ -106,12 +105,12 @@ func (rpcServer *RpcServer) GetVoteAccounts(ctx context.Context, p jsonrpc.RawPa
 			slices.SortFunc(votePubkeys, func(a, b solana.PublicKey) int { return slices.Compare(a[:], b[:]) })
 			votePubkeys = slices.Compact(votePubkeys)
 		}
-		published, accounts, err := rpcServer.readRootedAccounts(ctx, votePubkeys)
+		records, err := rpcServer.rootedVoteRecords(ctx, rooted.Slot, version, votePubkeys)
+		if errors.Is(err, errStakeViewChanged) {
+			continue
+		}
 		if err != nil {
 			return GetVoteAccountsResp{}, fmt.Errorf("read vote accounts at rooted slot %d: %w", rooted.Slot, err)
-		}
-		if published.Slot != rooted.Slot {
-			continue
 		}
 
 		response := GetVoteAccountsResp{
@@ -119,39 +118,17 @@ func (rpcServer *RpcServer) GetVoteAccounts(ctx context.Context, p jsonrpc.RawPa
 			Delinquent: make([]VoteAccountInfo, 0),
 		}
 		for index, votePubkey := range votePubkeys {
-			account := accounts[index]
-			if account == nil || account.Lamports == 0 || account.Owner != addresses.VoteProgramAddr {
-				continue // An old candidate may have been deleted or changed owner.
+			record := records[index]
+			if record == nil {
+				continue
 			}
-			versioned, err := sealevel.UnmarshalVersionedVoteState(account.Data)
-			if err != nil || !versioned.IsInitialized() {
-				continue // Exclude invalid and uninitialized vote states.
-			}
-			voteState := versioned.ConvertToCurrent()
-			lastVote, _ := voteState.LastVotedSlot()
-			var rootSlot uint64
-			if voteState.RootSlot != nil {
-				rootSlot = *voteState.RootSlot
-			}
-			creditsStart := max(0, len(voteState.EpochCredits)-maxRPCEpochCreditsHistory)
-			creditsHistory := voteState.EpochCredits[creditsStart:]
-			epochCredits := make([][3]uint64, len(creditsHistory))
-			for i, credits := range creditsHistory {
-				epochCredits[i] = [3]uint64{credits.Epoch, credits.Credits, credits.PrevCredits}
-			}
-			commission, commissionBPS := voteCommission(versioned, voteState)
-			_, epochVoteAccount := stakes.Stakes[votePubkey]
-			info := VoteAccountInfo{
-				VotePubkey:                    votePubkey.String(),
-				NodePubkey:                    voteState.NodePubkey.String(),
-				ActivatedStake:                activeStakes[votePubkey],
-				Commission:                    commission,
-				InflationRewardsCommissionBPS: commissionBPS,
-				EpochCredits:                  epochCredits,
-				EpochVoteAccount:              epochVoteAccount,
-				LastVote:                      lastVote,
-				RootSlot:                      rootSlot,
-			}
+			info := *record
+			// Response slices are owned by the caller, never by the retained cache.
+			info.EpochCredits = make([][3]uint64, len(record.EpochCredits))
+			copy(info.EpochCredits, record.EpochCredits)
+			info.ActivatedStake = activeStakes[votePubkey]
+			_, info.EpochVoteAccount = stakes.Stakes[votePubkey]
+			lastVote := info.LastVote
 			current := lastVote > 0
 			if rooted.Slot >= config.delinquentSlotDistance {
 				current = lastVote > rooted.Slot-config.delinquentSlotDistance
