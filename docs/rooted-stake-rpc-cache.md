@@ -71,3 +71,31 @@ old per-query scan against warm aggregate reads, and separately measures applyin
 These are component measurements: they exclude JSON encoding, network latency,
 initial cache loading, and an epoch transition. They do not establish mainnet
 capacity or live validator performance.
+
+## Larger on-disk sizing experiment
+
+The opt-in `TestRootedStakeCacheScale` exercises 1,000 initialized vote accounts
+and a configurable count of delegated stake accounts (up to 2 million). Its
+synthetic mix is 80% active, 10% activating, and 10% deactivating, with stake-history
+changes at epoch boundaries. Run each size in a fresh process:
+
+```sh
+MITHRIL_STAKE_SCALE=1000000 GOMAXPROCS=2 GOMEMLIMIT=4GiB \
+  go test ./pkg/rpcserver -run '^TestRootedStakeCacheScale$' \
+  -count=1 -v -timeout=10m
+```
+
+JSON log records report initial loading, warm all-voter/single-voter RPC handler
+latencies and allocations, epoch recalculation, and concurrent bootstrap and
+epoch changes. Four callers pause 50 ms between requests while 100 durable folds
+update 64 stake accounts each, with a 20 ms pause between folds. A separate
+no-reader stage measures fold latency. Every stage checks totals against a full
+account scan; concurrent root advancement must not restart the bootstrap scan.
+
+Handler timings include JSON response encoding but exclude HTTP. Startup clears
+application account caches; fixture creation still warms the OS page cache, so
+this is not a cold-storage benchmark. The retained-cache estimate is the change
+in live Go heap after dropping only the derived cache and collecting garbage.
+Whole-process peak memory includes fixture construction and full-scan oracles;
+it must not be described as the cache size or a complete RPC-node memory budget.
+Reported tail percentiles describe these short samples, not production SLOs.
