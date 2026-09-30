@@ -181,6 +181,10 @@ func (s *Store) install(value batch) {
 // SetRooted advances the durable reward view and prunes stale batches.
 func (s *Store) SetRooted(slot uint64) error {
 	s.mu.Lock()
+	if slot < s.rooted.Load() {
+		// A failed prune must not expose rewards above the recovered account root.
+		s.rooted.Store(slot)
+	}
 	for key, record := range s.pending {
 		if record.EffectiveSlot <= slot {
 			delete(s.pending, key)
@@ -191,6 +195,15 @@ func (s *Store) SetRooted(slot uint64) error {
 		pruneBefore = slot - s.retentionSlots
 	}
 	removed := false
+	for through := range s.batches {
+		if through > slot {
+			if err := s.restoreRetainedRecords(pruneBefore, slot); err != nil {
+				s.mu.Unlock()
+				return err
+			}
+			break
+		}
+	}
 	for through, keys := range s.batches {
 		orphaned := through > slot
 		expired := pruneBefore > 0 && through <= pruneBefore
@@ -229,6 +242,17 @@ func (s *Store) Rewind(fromSlot uint64) error {
 		}
 	}
 	removed := false
+	for through := range s.batches {
+		if through >= fromSlot && through > s.rooted.Load() {
+			// Keep every committed batch, including when fromSlot is below the root.
+			limit := max(fromSlot, s.rooted.Load()+1) - 1
+			if err := s.restoreRetainedRecords(0, limit); err != nil {
+				s.mu.Unlock()
+				return err
+			}
+			break
+		}
+	}
 	for through, keys := range s.batches {
 		if through < fromSlot || through <= s.rooted.Load() {
 			continue
@@ -250,6 +274,36 @@ func (s *Store) Rewind(fromSlot uint64) error {
 	if removed {
 		return syncDir(s.dir)
 	}
+	return nil
+}
+
+// An interrupted multi-chunk fold can leave the same reward in several batches.
+// Removing an uncommitted batch must reveal the preceding committed record.
+func (s *Store) restoreRetainedRecords(pruneBefore, throughLimit uint64) error {
+	throughs := make([]uint64, 0, len(s.batches))
+	for through := range s.batches {
+		if through <= throughLimit && (pruneBefore == 0 || through > pruneBefore) {
+			throughs = append(throughs, through)
+		}
+	}
+	sort.Slice(throughs, func(i, j int) bool { return throughs[i] < throughs[j] })
+	persisted := make(map[rewardKey]Record)
+	sources := make(map[rewardKey]uint64)
+	for _, through := range throughs {
+		value, err := readBatch(s.batchPath(through))
+		if err != nil {
+			return fmt.Errorf("restore epoch reward batch %d: %w", through, err)
+		}
+		if value.Through != through {
+			return fmt.Errorf("restore epoch reward batch %d: record contains through %d", through, value.Through)
+		}
+		for _, record := range value.Records {
+			key := rewardKey{epoch: record.Epoch, address: record.Address}
+			persisted[key] = record
+			sources[key] = through
+		}
+	}
+	s.persisted, s.sourceBatch = persisted, sources
 	return nil
 }
 

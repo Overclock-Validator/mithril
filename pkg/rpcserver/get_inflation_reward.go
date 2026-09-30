@@ -27,6 +27,11 @@ type InflationRewardResp struct {
 }
 
 func (rpcServer *RpcServer) GetInflationReward(ctx context.Context, p jsonrpc.RawParams) ([]*InflationRewardResp, error) {
+	rpcServer.historyRecoveryMu.RLock()
+	defer rpcServer.historyRecoveryMu.RUnlock()
+	if rpcServer.historyRecoveryPending {
+		return nil, fmt.Errorf("RPC history is unavailable during account recovery")
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

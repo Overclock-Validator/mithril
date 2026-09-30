@@ -2031,7 +2031,17 @@ func ReplayBlocks(
 				}
 				return ref, nil
 			},
-			AfterCommit: checkpointAfterCommit,
+			AfterCommit: func(ref *state.TransactionStatusCheckpointRef) error {
+				var err error
+				if rewardPublisher != nil {
+					// Forced flushes may commit several chunks before replay applies their results.
+					err = rewardPublisher.SetRootedEpochRewardsSlot(ref.Root)
+				}
+				if checkpointAfterCommit != nil {
+					err = errors.Join(err, checkpointAfterCommit(ref))
+				}
+				return err
+			},
 		}); hookErr != nil {
 			result.Error = fmt.Errorf("configure durable transaction status checkpoints: %w", hookErr)
 			return result
