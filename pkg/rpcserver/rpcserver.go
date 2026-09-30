@@ -23,6 +23,28 @@ import (
 	"github.com/gagliardetto/solana-go"
 )
 
+// rpcHandler exposes only public RPC methods to go-jsonrpc's reflection-based
+// registration. Internal setters and lifecycle hooks remain Go-only.
+type rpcHandler struct {
+	rpcMethods
+}
+
+type rpcMethods interface {
+	GetAccountInfo(context.Context, jsonrpc.RawParams) (GetAccountInfoResp, error)
+	GetBalance(context.Context, jsonrpc.RawParams) (GetBalanceResp, error)
+	GetBankHash(context.Context, jsonrpc.RawParams) (string, error)
+	GetBlockHeight(context.Context, jsonrpc.RawParams) (uint64, error)
+	GetBlockProduction(context.Context, jsonrpc.RawParams) (GetBlockProductionResp, error)
+	GetEpochInfo(context.Context, jsonrpc.RawParams) (GetEpochInfoResp, error)
+	GetGenesisHash(context.Context, jsonrpc.RawParams) (string, error)
+	GetLatestBlockhash(context.Context, jsonrpc.RawParams) (GetLatestBlockhashResp, error)
+	GetLeaderSchedule(context.Context, jsonrpc.RawParams) (map[string][]uint64, error)
+	GetSlot(context.Context, jsonrpc.RawParams) (uint64, error)
+	GetVoteAccounts(context.Context, jsonrpc.RawParams) (GetVoteAccountsResp, error)
+	SendTransaction(context.Context, jsonrpc.RawParams) (string, error)
+	SimulateTransaction(context.Context, jsonrpc.RawParams) (SimulateTransactionResp, error)
+}
+
 type RpcServer struct {
 	isReady       bool
 	rpcService    *jsonrpc.RPCServer
@@ -111,22 +133,24 @@ func (rpcServer *RpcServer) readRootedAccount(ctx context.Context, pubkey solana
 
 func (rpcServer *RpcServer) readRootedAccounts(ctx context.Context, pubkeys []solana.PublicKey) (rootedBankState, []*accounts.Account, error) {
 	for {
-		rooted, ok := rpcServer.getRootedBankState()
-		if !ok {
+		bank := rpcServer.rootedBank.Load()
+		if bank == nil {
 			return rootedBankState{}, nil, fmt.Errorf("node has no rooted bank available")
 		}
+		rooted := *bank
 		if rpcServer.acctsDb == nil {
 			return rootedBankState{}, nil, fmt.Errorf("node has no accounts database available")
 		}
-		if rpcServer.rootedPublicationPending(rooted.Slot) {
+		version, stable := rpcServer.acctsDb.CommittedAccountVersion()
+		if !stable || rpcServer.rootedPublicationPending(rooted.Slot) {
 			if err := waitForRootedPublication(ctx); err != nil {
 				return rooted, nil, err
 			}
 			continue
 		}
 		accounts, stats, err := rpcServer.acctsDb.GetAccountsBatchSharedWithStats(ctx, rooted.Slot, pubkeys)
-		latest, stillPublished := rpcServer.getRootedBankState()
-		if stats.PendingFoldHits > 0 || !stillPublished || latest.Slot != rooted.Slot ||
+		latest, stable := rpcServer.acctsDb.CommittedAccountVersion()
+		if !stable || latest != version || rpcServer.rootedBank.Load() != bank || stats.PendingFoldHits > 0 ||
 			rpcServer.rootedPublicationPending(rooted.Slot) {
 			if err := waitForRootedPublication(ctx); err != nil {
 				return rooted, nil, err
@@ -177,7 +201,7 @@ func NewRpcServer(acctsDb *accountsdb.AccountsDb, port uint16, epochSchedule *se
 		jsonrpc.WithServerErrors(rpcErrors),
 	)
 
-	rpcServer.rpcService.Register("MithrilRpc", rpcServer)
+	rpcServer.rpcService.Register("MithrilRpc", rpcHandler{rpcServer})
 	rpcServer.acctsDb = acctsDb
 	if epochSchedule != nil {
 		rpcServer.epochSchedule = epochSchedule
