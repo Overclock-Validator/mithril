@@ -26,6 +26,11 @@ type blockRewardResponse struct {
 }
 
 func (rpcServer *RpcServer) MinimumLedgerSlot(ctx context.Context, p jsonrpc.RawParams) (uint64, error) {
+	rpcServer.historyRecoveryMu.RLock()
+	defer rpcServer.historyRecoveryMu.RUnlock()
+	if rpcServer.historyRecoveryPending {
+		return 0, errors.New("RPC history is unavailable during account recovery")
+	}
 	if err := requireNoParams(p, "minimumLedgerSlot"); err != nil {
 		return 0, err
 	}
@@ -36,6 +41,11 @@ func (rpcServer *RpcServer) MinimumLedgerSlot(ctx context.Context, p jsonrpc.Raw
 }
 
 func (rpcServer *RpcServer) GetFirstAvailableBlock(ctx context.Context, p jsonrpc.RawParams) (uint64, error) {
+	rpcServer.historyRecoveryMu.RLock()
+	defer rpcServer.historyRecoveryMu.RUnlock()
+	if rpcServer.historyRecoveryPending {
+		return 0, errors.New("RPC history is unavailable during account recovery")
+	}
 	if err := requireNoParams(p, "getFirstAvailableBlock"); err != nil {
 		return 0, err
 	}
@@ -46,6 +56,11 @@ func (rpcServer *RpcServer) GetFirstAvailableBlock(ctx context.Context, p jsonrp
 }
 
 func (rpcServer *RpcServer) GetBlock(ctx context.Context, p jsonrpc.RawParams) (GetBlockResp, error) {
+	rpcServer.historyRecoveryMu.RLock()
+	defer rpcServer.historyRecoveryMu.RUnlock()
+	if rpcServer.historyRecoveryPending {
+		return GetBlockResp{}, errors.New("RPC history is unavailable during account recovery")
+	}
 	params, err := jsonrpc.DecodeParams[[]interface{}](p)
 	if err != nil {
 		return GetBlockResp{}, &InvalidParamsError{Message: fmt.Sprintf("decoding params: %v", err)}

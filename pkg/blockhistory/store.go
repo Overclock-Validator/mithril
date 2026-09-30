@@ -209,6 +209,15 @@ func (s *Store) DiscardUnrootedFrom(from uint64) error {
 		}
 	}
 	removed := false
+	for through := range s.batches {
+		if through >= from {
+			if err := s.restoreRetainedRecords(0, from-1); err != nil {
+				s.mu.Unlock()
+				return err
+			}
+			break
+		}
+	}
 	for through, slots := range s.batches {
 		if through < from || through <= rooted {
 			continue
@@ -246,6 +255,15 @@ func (s *Store) setRooted(slot uint64, rewind bool) error {
 		pruneBefore = slot - s.retentionSlots
 	}
 	removed := false
+	for through := range s.batches {
+		if through > slot {
+			if err := s.restoreRetainedRecords(pruneBefore, slot); err != nil {
+				s.mu.Unlock()
+				return err
+			}
+			break
+		}
+	}
 	for through, slots := range s.batches {
 		orphaned := through > slot
 		expired := pruneBefore > 0 && through <= pruneBefore
@@ -271,6 +289,35 @@ func (s *Store) setRooted(slot uint64, rewind bool) error {
 			return err
 		}
 	}
+	return nil
+}
+
+// An interrupted multi-chunk fold can leave the same slot in several batches.
+// Removing an uncommitted batch must reveal the preceding committed record.
+func (s *Store) restoreRetainedRecords(pruneBefore, throughLimit uint64) error {
+	throughs := make([]uint64, 0, len(s.batches))
+	for through := range s.batches {
+		if through <= throughLimit && (pruneBefore == 0 || through > pruneBefore) {
+			throughs = append(throughs, through)
+		}
+	}
+	sort.Slice(throughs, func(i, j int) bool { return throughs[i] < throughs[j] })
+	persisted := make(map[uint64]Record)
+	sources := make(map[uint64]uint64)
+	for _, through := range throughs {
+		value, err := readBatch(s.batchPath(through))
+		if err != nil {
+			return fmt.Errorf("restore block history batch %d: %w", through, err)
+		}
+		if value.Through != through {
+			return fmt.Errorf("restore block history batch %d: record contains through %d", through, value.Through)
+		}
+		for _, record := range value.Records {
+			persisted[record.Slot] = record
+			sources[record.Slot] = through
+		}
+	}
+	s.persisted, s.sourceBatch = persisted, sources
 	return nil
 }
 

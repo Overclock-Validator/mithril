@@ -2026,7 +2026,17 @@ func ReplayBlocks(
 				}
 				return ref, nil
 			},
-			AfterCommit: checkpointAfterCommit,
+			AfterCommit: func(ref *state.TransactionStatusCheckpointRef) error {
+				var err error
+				if historyPublisher != nil {
+					// Forced flushes may commit several chunks before replay applies their results.
+					err = historyPublisher.SetRootedBlockHistorySlot(ref.Root)
+				}
+				if checkpointAfterCommit != nil {
+					err = errors.Join(err, checkpointAfterCommit(ref))
+				}
+				return err
+			},
 		}); hookErr != nil {
 			result.Error = fmt.Errorf("configure durable transaction status checkpoints: %w", hookErr)
 			return result
@@ -2994,8 +3004,15 @@ func ReplayBlocks(
 
 		currentSlot = block.Slot
 		block.Epoch = epochSchedule.GetEpoch(currentSlot)
-		var configErr error
 		initialBlockConfigured := lastSlotCtx == nil
+		var historyParentBlockhash solana.Hash
+		if historyPublisher != nil && initialBlockConfigured {
+			historyParentBlockhash = initialLastBlockhash
+			if resumeState != nil {
+				historyParentBlockhash = solana.Hash(resumeState.LastBlockhash)
+			}
+		}
+		var configErr error
 		// Use lastSlotCtx == nil to detect first block, not currentSlot == startSlot.
 		// This handles the case where startSlot (or slots after it) are skipped -
 		// the first emitted block might have slot > startSlot.
@@ -3193,10 +3210,12 @@ func ReplayBlocks(
 			break
 		}
 		if historyPublisher != nil {
-			if err := historyPublisher.RecordBlockHistory(block); err != nil {
-				result.Error = fmt.Errorf("record block history at slot %d: %w", block.Slot, err)
-				mlog.Log.Errorf("%v", result.Error)
-				break
+			if historyBlock := blockForHistory(block, historyParentBlockhash); historyBlock != nil {
+				if err := historyPublisher.RecordBlockHistory(historyBlock); err != nil {
+					result.Error = fmt.Errorf("record block history at slot %d: %w", block.Slot, err)
+					mlog.Log.Errorf("%v", result.Error)
+					break
+				}
 			}
 		}
 		// The successful child now owns its derived snapshot. Any later bank uses

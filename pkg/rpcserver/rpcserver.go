@@ -23,7 +23,30 @@ import (
 	"github.com/gagliardetto/solana-go"
 )
 
+// rpcHandler exposes only public RPC methods to go-jsonrpc's reflection-based
+// registration. Internal setters and lifecycle hooks remain Go-only.
+type rpcHandler struct {
+	rpcMethods
+}
+
+type rpcMethods interface {
+	GetAccountInfo(context.Context, jsonrpc.RawParams) (GetAccountInfoResp, error)
+	GetBankHash(context.Context, jsonrpc.RawParams) (string, error)
+	GetBlock(context.Context, jsonrpc.RawParams) (GetBlockResp, error)
+	GetBlockHeight(context.Context, jsonrpc.RawParams) (uint64, error)
+	GetEpochInfo(context.Context, jsonrpc.RawParams) (GetEpochInfoResp, error)
+	GetFirstAvailableBlock(context.Context, jsonrpc.RawParams) (uint64, error)
+	GetGenesisHash(context.Context, jsonrpc.RawParams) (string, error)
+	GetLatestBlockhash(context.Context, jsonrpc.RawParams) (GetLatestBlockhashResp, error)
+	MinimumLedgerSlot(context.Context, jsonrpc.RawParams) (uint64, error)
+	SendTransaction(context.Context, jsonrpc.RawParams) (string, error)
+	SimulateTransaction(context.Context, jsonrpc.RawParams) (SimulateTransactionResp, error)
+}
+
 type RpcServer struct {
+	historyRecoveryMu      sync.RWMutex
+	historyRecoveryPending bool
+
 	isReady       bool
 	rpcService    *jsonrpc.RPCServer
 	serv          *httptest.Server
@@ -118,6 +141,17 @@ func (rpcServer *RpcServer) DiscardUnrootedBlockHistory(from uint64) error {
 	return rpcServer.blockHistory.DiscardUnrootedFrom(from)
 }
 
+// SetHistoryRecoveryPending blocks history reads during a durable account rewind.
+// Failed recovery leaves the gate closed without deleting retained records.
+func (rpcServer *RpcServer) SetHistoryRecoveryPending(pending bool) {
+	if rpcServer == nil {
+		return
+	}
+	rpcServer.historyRecoveryMu.Lock()
+	defer rpcServer.historyRecoveryMu.Unlock()
+	rpcServer.historyRecoveryPending = pending
+}
+
 func NewRpcServer(acctsDb *accountsdb.AccountsDb, port uint16, epochSchedule *sealevel.SysvarEpochSchedule, genesisHash solana.Hash) *RpcServer {
 	var err error
 	rpcServer := &RpcServer{genesisHash: genesisHash.String()}
@@ -137,7 +171,7 @@ func NewRpcServer(acctsDb *accountsdb.AccountsDb, port uint16, epochSchedule *se
 		jsonrpc.WithServerErrors(rpcErrors),
 	)
 
-	rpcServer.rpcService.Register("MithrilRpc", rpcServer)
+	rpcServer.rpcService.Register("MithrilRpc", rpcHandler{rpcServer})
 	rpcServer.acctsDb = acctsDb
 	if epochSchedule != nil {
 		rpcServer.epochSchedule = epochSchedule
