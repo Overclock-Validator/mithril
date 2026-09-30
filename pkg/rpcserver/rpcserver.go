@@ -21,6 +21,26 @@ import (
 	"github.com/gagliardetto/solana-go"
 )
 
+// rpcHandler exposes only public RPC methods to go-jsonrpc's reflection-based
+// registration. Internal setters and lifecycle hooks remain Go-only.
+type rpcHandler struct {
+	rpcMethods
+}
+
+type rpcMethods interface {
+	GetAccountInfo(context.Context, jsonrpc.RawParams) (GetAccountInfoResp, error)
+	GetBankHash(context.Context, jsonrpc.RawParams) (string, error)
+	GetBlockHeight(context.Context, jsonrpc.RawParams) (uint64, error)
+	GetEpochInfo(context.Context, jsonrpc.RawParams) (GetEpochInfoResp, error)
+	GetGenesisHash(context.Context, jsonrpc.RawParams) (string, error)
+	GetHealth(context.Context, jsonrpc.RawParams) (string, error)
+	GetIdentity(context.Context, jsonrpc.RawParams) (GetIdentityResp, error)
+	GetLatestBlockhash(context.Context, jsonrpc.RawParams) (GetLatestBlockhashResp, error)
+	GetVersion(context.Context, jsonrpc.RawParams) (GetVersionResp, error)
+	SendTransaction(context.Context, jsonrpc.RawParams) (string, error)
+	SimulateTransaction(context.Context, jsonrpc.RawParams) (SimulateTransactionResp, error)
+}
+
 type RpcServer struct {
 	isReady       bool
 	rpcService    *jsonrpc.RPCServer
@@ -82,7 +102,7 @@ func NewRpcServer(acctsDb *accountsdb.AccountsDb, port uint16, epochSchedule *se
 		jsonrpc.WithServerErrors(rpcErrors),
 	)
 
-	rpcServer.rpcService.Register("MithrilRpc", rpcServer)
+	rpcServer.rpcService.Register("MithrilRpc", rpcHandler{rpcServer})
 	rpcServer.acctsDb = acctsDb
 	if epochSchedule != nil {
 		rpcServer.epochSchedule = epochSchedule
