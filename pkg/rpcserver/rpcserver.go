@@ -109,6 +109,8 @@ func (rpcServer *RpcServer) PrepareEpochRewards(through uint64) error {
 	if rpcServer == nil || rpcServer.epochRewards == nil {
 		return nil
 	}
+	rpcServer.historyRecoveryMu.Lock()
+	defer rpcServer.historyRecoveryMu.Unlock()
 	return rpcServer.epochRewards.Prepare(through)
 }
 
@@ -117,6 +119,8 @@ func (rpcServer *RpcServer) SetRootedEpochRewardsSlot(slot uint64) error {
 	if rpcServer == nil || rpcServer.epochRewards == nil {
 		return nil
 	}
+	rpcServer.historyRecoveryMu.Lock()
+	defer rpcServer.historyRecoveryMu.Unlock()
 	return rpcServer.epochRewards.SetRooted(slot)
 }
 
@@ -125,6 +129,8 @@ func (rpcServer *RpcServer) RewindEpochRewards(fromSlot uint64) error {
 	if rpcServer == nil || rpcServer.epochRewards == nil {
 		return nil
 	}
+	rpcServer.historyRecoveryMu.Lock()
+	defer rpcServer.historyRecoveryMu.Unlock()
 	return rpcServer.epochRewards.Rewind(fromSlot)
 }
 
