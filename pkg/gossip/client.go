@@ -113,6 +113,7 @@ type TVUPeer struct {
 	Pubkey   Pubkey
 	TVUAddr  *net.UDPAddr
 	LastSeen time.Time
+	version  contactVersion
 }
 
 // AlpenglowPeer is a gossip contact's Votor QUIC endpoint. Voting code applies
@@ -468,6 +469,10 @@ func (c *Client) currentContactValue() (CrdsValue, error) {
 }
 
 func (c *Client) pushContact(conn *net.UDPConn) error {
+	// Standalone gossip clients may have no consumer calling TVUPeers.
+	c.tvuPeerMu.Lock()
+	c.pruneTVUPeersLocked(time.Now())
+	c.tvuPeerMu.Unlock()
 	value, err := c.currentContactValue()
 	if err != nil {
 		return err
@@ -652,8 +657,15 @@ func (c *Client) handleContactRecord(record contactRecord, shredVersion uint16) 
 		c.observeOwnContactRecord(record)
 		return
 	}
-	// The decoder verified the original signed bytes. Retain those bytes for
-	// relay, and do not let an older relayed contact replace newer endpoints.
+	// Route ordering outlives the bounded relay byte cache. Keep a nil TVU
+	// entry for withdrawals until the existing peer lifetime expires.
+	c.tvuPeerMu.Lock()
+	defer c.tvuPeerMu.Unlock()
+	version := record.version()
+	if previous, ok := c.tvuPeers[record.Pubkey]; ok && !version.newerThan(previous.version) {
+		return
+	}
+	// The decoder verified the original signed bytes. Retain those bytes for relay.
 	if !c.relay.accept(record, wallclockMillis()) {
 		return
 	}
@@ -664,8 +676,14 @@ func (c *Client) handleContactRecord(record contactRecord, shredVersion uint16) 
 		c.recordPeerEndpoint(record.GossipAddr)
 	}
 	c.recordRepairPeerRecord(record)
-	c.recordTVUPeerRecord(record)
 	c.recordAlpenglowPeerRecord(record)
+	// Expire ordering no earlier than the service endpoints it protects.
+	c.tvuPeers[record.Pubkey] = TVUPeer{
+		Pubkey:   record.Pubkey,
+		TVUAddr:  record.TVUAddr.UDPAddr(),
+		LastSeen: time.Now(),
+		version:  version,
+	}
 	c.acceptedContacts.Add(1)
 }
 
@@ -787,17 +805,24 @@ func (c *Client) TVUPeers() []TVUPeer {
 	now := time.Now()
 	c.tvuPeerMu.Lock()
 	defer c.tvuPeerMu.Unlock()
+	c.pruneTVUPeersLocked(now)
+	out := make([]TVUPeer, 0, len(c.tvuPeers))
+	for _, peer := range c.tvuPeers {
+		if peer.TVUAddr == nil {
+			continue
+		}
+		peer.TVUAddr = cloneUDPAddr(peer.TVUAddr)
+		out = append(out, peer)
+	}
+	return out
+}
+
+func (c *Client) pruneTVUPeersLocked(now time.Time) {
 	for key, peer := range c.tvuPeers {
 		if now.Sub(peer.LastSeen) > peerExpirationWindow {
 			delete(c.tvuPeers, key)
 		}
 	}
-	out := make([]TVUPeer, 0, len(c.tvuPeers))
-	for _, peer := range c.tvuPeers {
-		peer.TVUAddr = cloneUDPAddr(peer.TVUAddr)
-		out = append(out, peer)
-	}
-	return out
 }
 
 // SelfTVUAddr returns this node's configured TVU endpoint.
@@ -857,21 +882,6 @@ func (c *Client) LookupAlpenglow(pubkey solana.PublicKey) (*net.UDPAddr, bool) {
 		return nil, false
 	}
 	return cloneUDPAddr(peer.AlpenglowAddr), true
-}
-
-func (c *Client) recordTVUPeerRecord(record contactRecord) {
-	addr := record.TVUAddr.UDPAddr()
-	c.tvuPeerMu.Lock()
-	defer c.tvuPeerMu.Unlock()
-	if addr == nil {
-		delete(c.tvuPeers, record.Pubkey)
-		return
-	}
-	c.tvuPeers[record.Pubkey] = TVUPeer{
-		Pubkey:   record.Pubkey,
-		TVUAddr:  addr,
-		LastSeen: time.Now(),
-	}
 }
 
 func (c *Client) recordAlpenglowPeerRecord(record contactRecord) {

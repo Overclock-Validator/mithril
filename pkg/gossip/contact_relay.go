@@ -15,8 +15,31 @@ const crdsMessageHeaderSize = 4 + 32 + 8
 
 type relayContact struct {
 	record    contactRecord
-	hash      [32]byte
+	version   contactVersion
 	forwarded uint64
+}
+
+type contactVersion struct {
+	outset    uint64
+	wallclock uint64
+	hash      [32]byte
+}
+
+func (record contactRecord) version() contactVersion {
+	h := sha256.New()
+	h.Write(record.signature[:])
+	h.Write(record.data)
+	v := contactVersion{outset: record.Outset, wallclock: record.Wallclock}
+	copy(v.hash[:], h.Sum(nil))
+	return v
+}
+
+func (v contactVersion) newerThan(old contactVersion) bool {
+	// ContactInfo orders restarts first, then wallclock, then the hash of
+	// the complete signed value, matching Agave's CRDS replacement rule.
+	return v.outset > old.outset ||
+		(v.outset == old.outset && v.wallclock > old.wallclock) ||
+		(v.outset == old.outset && v.wallclock == old.wallclock && bytes.Compare(v.hash[:], old.hash[:]) > 0)
 }
 
 // contactRelay retains at most the existing gossip peer limit. Each push tick
@@ -42,20 +65,12 @@ func (r *contactRelay) accept(record contactRecord, now uint64) bool {
 	if len(record.data)+len(record.signature)+crdsMessageHeaderSize > packetDataSize {
 		return false
 	}
-	h := sha256.New()
-	h.Write(record.signature[:])
-	h.Write(record.data)
-	var hash [32]byte
-	copy(hash[:], h.Sum(nil))
+	version := record.version()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	old, exists := r.contacts[record.Pubkey]
 	if exists {
-		// ContactInfo orders restarts first, then wallclock, then the hash of
-		// the complete signed value, matching Agave's CRDS replacement rule.
-		if record.Outset < old.record.Outset ||
-			(record.Outset == old.record.Outset && record.Wallclock < old.record.Wallclock) ||
-			(record.Outset == old.record.Outset && record.Wallclock == old.record.Wallclock && bytes.Compare(hash[:], old.hash[:]) <= 0) {
+		if !version.newerThan(old.version) {
 			return false
 		}
 	} else if len(r.contacts) >= maxKnownGossipPeers {
@@ -73,7 +88,7 @@ func (r *contactRelay) accept(record contactRecord, now uint64) bool {
 	}
 	// The receive loop reuses its datagram buffer on the next packet.
 	record.data = bytes.Clone(record.data)
-	r.contacts[record.Pubkey] = relayContact{record: record, hash: hash, forwarded: old.forwarded}
+	r.contacts[record.Pubkey] = relayContact{record: record, version: version, forwarded: old.forwarded}
 	return true
 }
 

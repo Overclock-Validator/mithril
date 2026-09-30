@@ -211,6 +211,114 @@ func TestContactUpdateRemovesWithdrawnEndpoints(t *testing.T) {
 	}
 }
 
+func TestContactRelayEvictionPreservesRoutingOrder(t *testing.T) {
+	for _, withdrawn := range []bool{false, true} {
+		name := "active"
+		if withdrawn {
+			name = "withdrawn"
+		}
+		t.Run(name, func(t *testing.T) {
+			client, err := NewClient(Config{Entrypoint: "127.0.0.1:8000", ShredVersion: 4321})
+			if err != nil {
+				t.Fatal(err)
+			}
+			target, key := relayFixture(t)
+			target.Wallclock = wallclockMillis() - 1000
+			targetRecord := contactRecordFromInfo(t, target, key)
+			client.handleContactRecord(targetRecord, 4321)
+			if withdrawn {
+				update, err := NewContactInfo(target.Pubkey, 4321, target.GossipAddr, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				update.Outset, update.Wallclock = target.Outset, target.Wallclock+1
+				client.handleContactRecord(contactRecordFromInfo(t, update, key), 4321)
+			}
+			for i := 0; i < maxKnownGossipPeers; i++ {
+				info, identity := relayFixture(t)
+				client.handleContactRecord(contactRecordFromInfo(t, info, identity), 4321)
+			}
+			if _, retained := client.relay.contacts[target.Pubkey]; retained {
+				t.Fatal("target was not evicted from the relay cache")
+			}
+			if len(client.relay.contacts) != maxKnownGossipPeers {
+				t.Fatal("relay cache no longer has its configured capacity")
+			}
+			old := target.CloneWithWallclock(target.Wallclock - 1)
+			for _, tag := range []uint8{socketTagTVU, socketTagServeRepair, socketTagAlpenglow} {
+				if err := old.SetSocket(tag, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9900}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			accepted := client.Stats().AcceptedContacts
+			client.handleContactRecord(contactRecordFromInfo(t, old, key), 4321)
+			if client.Stats().AcceptedContacts != accepted {
+				t.Fatal("older contact was accepted after relay eviction")
+			}
+			pubkey := solana.PublicKey(target.Pubkey)
+			tvu, hasTVU := client.LookupTVU(pubkey)
+			alpenglow, hasAlpenglow := client.LookupAlpenglow(pubkey)
+			var repair *net.UDPAddr
+			for _, peer := range client.RepairPeers() {
+				if peer.Pubkey == target.Pubkey {
+					repair = peer.Addr
+				}
+			}
+			if withdrawn {
+				if hasTVU || hasAlpenglow || repair != nil || len(client.TVUPeers()) != maxKnownGossipPeers {
+					t.Fatal("older contact restored a withdrawn service endpoint")
+				}
+				peer := client.tvuPeers[target.Pubkey]
+				peer.LastSeen = time.Now().Add(-peerExpirationWindow - time.Second)
+				client.tvuPeers[target.Pubkey] = peer
+				client.TVUPeers()
+				if _, retained := client.tvuPeers[target.Pubkey]; retained {
+					t.Fatal("expired withdrawal retained ordering metadata")
+				}
+			} else if !hasTVU || !hasAlpenglow || !sameEndpointUDPAddr(targetRecord.TVUAddr, tvu) || !sameEndpointUDPAddr(targetRecord.Sockets[socketTagAlpenglow], alpenglow) || !sameEndpointUDPAddr(targetRecord.ServeRepairAddr, repair) || len(client.TVUPeers()) != maxKnownGossipPeers+1 {
+				t.Fatal("relay eviction changed the latest service routes")
+			}
+			// A genuine restart still supersedes the remembered contact even if
+			// its wallclock is lower than the previous process's last update.
+			old.Outset++
+			client.handleContactRecord(contactRecordFromInfo(t, old, key), 4321)
+			alpenglow, hasAlpenglow = client.LookupAlpenglow(pubkey)
+			if !hasAlpenglow || alpenglow.Port != 9900 {
+				t.Fatal("new process contact failed to replace the remembered route")
+			}
+		})
+	}
+}
+
+func TestGossipPushExpiresContactOrderingWithoutRouteConsumer(t *testing.T) {
+	client, err := NewClient(Config{Entrypoint: "127.0.0.1:9000", TVUAddr: "127.0.0.1:9001", AdvertisedIP: "127.0.0.1", ShredVersion: 4321})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.initializeContact(client.entrypoint); err != nil {
+		t.Fatal(err)
+	}
+	info, key := relayFixture(t)
+	withdrawn, err := NewContactInfo(info.Pubkey, 4321, info.GossipAddr, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.handleContactRecord(contactRecordFromInfo(t, withdrawn, key), 4321)
+	peer, retained := client.tvuPeers[info.Pubkey]
+	if !retained || peer.TVUAddr != nil {
+		t.Fatal("missing withdrawal ordering entry")
+	}
+	peer.LastSeen = time.Now().Add(-peerExpirationWindow - time.Second)
+	client.tvuPeers[info.Pubkey] = peer
+	// Its gossip address is the entrypoint, so no pull peer or network send is added.
+	if err := client.pushContact(nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, retained := client.tvuPeers[info.Pubkey]; retained {
+		t.Fatal("periodic push retained expired ordering without a TVUPeers consumer")
+	}
+}
+
 func waitForGossip(t *testing.T, label string, check func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
