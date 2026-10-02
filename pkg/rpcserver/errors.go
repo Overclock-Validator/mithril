@@ -13,9 +13,54 @@ const (
 	rpcCodeInvalidParams jsonrpc.ErrorCode = -32602
 	// -32002 matches Agave's SendTransactionPreflightFailure.
 	rpcCodeSendTransactionPreflightFailure jsonrpc.ErrorCode = -32002
+	// -32005 is the Solana RPC NodeUnhealthy error code.
+	rpcCodeNodeUnhealthy jsonrpc.ErrorCode = -32005
 	// -32016 is Agave's reserved code for MinContextSlotNotReached.
 	rpcCodeMinContextSlotNotReached jsonrpc.ErrorCode = -32016
 )
+
+type NodeUnhealthyError struct {
+	NumSlotsBehind *uint64
+}
+
+func (e *NodeUnhealthyError) Error() string {
+	if e.NumSlotsBehind != nil {
+		return fmt.Sprintf("Node is behind by %d slots", *e.NumSlotsBehind)
+	}
+	return "Node is unhealthy"
+}
+
+func (e *NodeUnhealthyError) ToJSONRPCError() (jsonrpc.JSONRPCError, error) {
+	return jsonrpc.JSONRPCError{
+		Code:    rpcCodeNodeUnhealthy,
+		Message: e.Error(),
+		Data: struct {
+			NumSlotsBehind *uint64 `json:"numSlotsBehind"`
+		}{NumSlotsBehind: e.NumSlotsBehind},
+	}, nil
+}
+
+func (e *NodeUnhealthyError) FromJSONRPCError(rpcErr jsonrpc.JSONRPCError) error {
+	if rpcErr.Code != rpcCodeNodeUnhealthy {
+		return fmt.Errorf("unexpected code %d for NodeUnhealthyError", rpcErr.Code)
+	}
+	if rpcErr.Data == nil {
+		e.NumSlotsBehind = nil
+		return nil
+	}
+	raw, err := json.Marshal(rpcErr.Data)
+	if err != nil {
+		return fmt.Errorf("re-encoding NodeUnhealthyError data: %w", err)
+	}
+	var payload struct {
+		NumSlotsBehind *uint64 `json:"numSlotsBehind"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return fmt.Errorf("decoding NodeUnhealthyError data: %w", err)
+	}
+	e.NumSlotsBehind = payload.NumSlotsBehind
+	return nil
+}
 
 type MinContextSlotNotReachedError struct {
 	ContextSlot uint64
@@ -114,6 +159,7 @@ func rpcErrorRegistry() jsonrpc.Errors {
 	errs := jsonrpc.NewErrors()
 	errs.Register(rpcCodeInvalidParams, new(*InvalidParamsError))
 	errs.Register(rpcCodeSendTransactionPreflightFailure, new(*SendTransactionPreflightFailureError))
+	errs.Register(rpcCodeNodeUnhealthy, new(*NodeUnhealthyError))
 	errs.Register(rpcCodeMinContextSlotNotReached, new(*MinContextSlotNotReachedError))
 	return errs
 }
