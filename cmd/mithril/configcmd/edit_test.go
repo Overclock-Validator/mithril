@@ -66,3 +66,9 @@ func TestEditor_QuietMenuItem_ShownWhenLBEnabled(t *testing.T) {
 	}
 	assert.True(t, found, "Quiet logs entry should appear when lbEnabled=true")
 }
+
+func TestFormatTOMLValueRejectsNumericPrefixes(t *testing.T) {
+	assert.Equal(t, `"203.0.113.5"`, formatTOMLValue("203.0.113.5"))
+	assert.Equal(t, `"12ms"`, formatTOMLValue("12ms"))
+	assert.Equal(t, "12.5", formatTOMLValue("12.5"))
+}

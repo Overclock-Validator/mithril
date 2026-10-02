@@ -1,6 +1,9 @@
 package statsd
 
 import (
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -9,6 +12,45 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 )
+
+func TestMetricsHandlerExposesOnlyMetrics(t *testing.T) {
+	previousDefault := http.DefaultServeMux
+	http.DefaultServeMux = http.NewServeMux()
+	http.DefaultServeMux.HandleFunc("/debug/pprof/", func(http.ResponseWriter, *http.Request) {})
+	http.DefaultServeMux.HandleFunc("/setcpuprofilerate", func(http.ResponseWriter, *http.Request) {})
+	t.Cleanup(func() { http.DefaultServeMux = previousDefault })
+
+	handler := newMetricsHandler()
+
+	metrics := httptest.NewRecorder()
+	handler.ServeHTTP(metrics, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if metrics.Code != http.StatusOK {
+		t.Fatalf("GET /metrics status = %d, want 200", metrics.Code)
+	}
+	if got := metrics.Header().Get(mithrilEndpointHeader); got != mithrilMetricsEndpoint {
+		t.Fatalf("GET /metrics identity = %q, want %q", got, mithrilMetricsEndpoint)
+	}
+
+	for _, path := range []string{"/debug/pprof/", "/setcpuprofilerate"} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code != http.StatusNotFound {
+			t.Errorf("GET %s status = %d, want 404", path, response.Code)
+		}
+	}
+}
+
+func TestMetricsServerRejectsOccupiedAddress(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve address: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	if err := startMetricsServer(listener.Addr().String()); err == nil {
+		t.Fatal("startMetricsServer() error = nil, want occupied-address error")
+	}
+}
 
 func TestInitializeStatsdMetrics(t *testing.T) {
 	//metricsCollection := InitializeStatsdMetrics()
@@ -84,6 +126,123 @@ func TestGaugeWithoutLabelValues(t *testing.T) {
 	m := &dto.Metric{}
 	metric.Write(m)
 	assert.Equal(t, m.GetGauge().GetValue(), val, "Gauge value should be 20")
+}
+
+func TestBeginSnapshotBootstrap(t *testing.T) {
+	before := time.Now().Unix()
+	finish := BeginSnapshotBootstrap()
+	after := time.Now().Unix()
+	t.Cleanup(finish)
+
+	readGauge := func(metric Metric) float64 {
+		m := &dto.Metric{}
+		if err := metricsCollection.gauges[metric].WithLabelValues().Write(m); err != nil {
+			t.Fatal(err)
+		}
+		return m.GetGauge().GetValue()
+	}
+	if got := readGauge(SnapshotBootstrapActive); got != 1 {
+		t.Fatalf("bootstrap active = %v, want 1", got)
+	}
+	if got := int64(readGauge(SnapshotBootstrapStartedAt)); got < before || got > after {
+		t.Fatalf("bootstrap start = %d, want [%d,%d]", got, before, after)
+	}
+	finish()
+	if got := readGauge(SnapshotBootstrapActive); got != 0 {
+		t.Fatalf("bootstrap active after finish = %v, want 0", got)
+	}
+}
+
+func TestSendTurbineReceiverMetrics(t *testing.T) {
+	readGauge := func(metric Metric) float64 {
+		m := &dto.Metric{}
+		if err := metricsCollection.gauges[metric].WithLabelValues().Write(m); err != nil {
+			t.Fatal(err)
+		}
+		return m.GetGauge().GetValue()
+	}
+	readCounter := func(metric Metric, labels ...string) float64 {
+		m := &dto.Metric{}
+		if err := metricsCollection.counters[metric].WithLabelValues(labels...).Write(m); err != nil {
+			t.Fatal(err)
+		}
+		return m.GetCounter().GetValue()
+	}
+
+	beforePackets := readCounter(TurbinePacketsReceived)
+	beforeData := readCounter(TurbineDataShredsReceived)
+	beforeBlocks := readCounter(TurbineBlocksEmitted)
+	beforeRejected := map[string]float64{}
+	for _, reason := range []string{"parse", "signature", "missing_leader", "assembly"} {
+		beforeRejected[reason] = readCounter(TurbineShredsRejected, reason)
+	}
+
+	first := TurbineReceiverSnapshot{
+		Packets:         10,
+		DataShreds:      7,
+		ParseErrors:     1,
+		SignatureErrors: 2,
+		MissingLeaders:  3,
+		AssemblyErrors:  4,
+		BlocksEmitted:   5,
+		LastPacketUnix:  1_700_000_000,
+		LastDataSlot:    123,
+		LastBlockUnix:   1_700_000_001,
+		LastBlockSlot:   122,
+		ActiveSlots:     6,
+	}
+	SendTurbineReceiverMetrics(first, TurbineReceiverSnapshot{}, true)
+
+	if got := readCounter(TurbinePacketsReceived) - beforePackets; got != 10 {
+		t.Errorf("packet delta = %v, want 10", got)
+	}
+	if got := readCounter(TurbineDataShredsReceived) - beforeData; got != 7 {
+		t.Errorf("data-shred delta = %v, want 7", got)
+	}
+	if got := readCounter(TurbineBlocksEmitted) - beforeBlocks; got != 5 {
+		t.Errorf("block delta = %v, want 5", got)
+	}
+	for reason, want := range map[string]float64{
+		"parse": 1, "signature": 2, "missing_leader": 3, "assembly": 4,
+	} {
+		if got := readCounter(TurbineShredsRejected, reason) - beforeRejected[reason]; got != want {
+			t.Errorf("%s rejection delta = %v, want %v", reason, got, want)
+		}
+	}
+	for metric, want := range map[Metric]float64{
+		TurbineReceiverActive:       1,
+		TurbineAssemblerActiveSlots: 6,
+		TurbineLastPacketTimestamp:  1_700_000_000,
+		TurbineLastDataSlot:         123,
+		TurbineLastBlockTimestamp:   1_700_000_001,
+		TurbineLastBlockSlot:        122,
+	} {
+		if got := readGauge(metric); got != want {
+			t.Errorf("%s = %v, want %v", metric, got, want)
+		}
+	}
+
+	second := first
+	second.Packets += 4
+	second.DataShreds += 3
+	second.BlocksEmitted += 2
+	second.ParseErrors++
+	SendTurbineReceiverMetrics(second, first, true)
+	if got := readCounter(TurbinePacketsReceived) - beforePackets; got != 14 {
+		t.Errorf("packet total after delta = %v, want 14", got)
+	}
+	if got := readCounter(TurbineShredsRejected, "parse") - beforeRejected["parse"]; got != 2 {
+		t.Errorf("parse total after delta = %v, want 2", got)
+	}
+
+	reset := TurbineReceiverSnapshot{Packets: 2, DataShreds: 1, BlocksEmitted: 1}
+	SendTurbineReceiverMetrics(reset, second, false)
+	if got := readCounter(TurbinePacketsReceived) - beforePackets; got != 16 {
+		t.Errorf("packet total after receiver reset = %v, want 16", got)
+	}
+	if got := readGauge(TurbineReceiverActive); got != 0 {
+		t.Errorf("receiver active after stop = %v, want 0", got)
+	}
 }
 
 func TestTimingWithLabelValues(t *testing.T) {
