@@ -134,6 +134,34 @@ func TestRecoveredManifestContextAdvancesStaleStateBeforeIntegrity(t *testing.T)
 	assert.Equal(t, manifestCtx, s.LastRootedContext)
 }
 
+type recordingRPCBankState struct {
+	slot             uint64
+	blockHeight      uint64
+	transactionCount uint64
+}
+
+func (state *recordingRPCBankState) SetRootedBankState(slot, blockHeight, transactionCount uint64) {
+	state.slot = slot
+	state.blockHeight = blockHeight
+	state.transactionCount = transactionCount
+}
+
+func TestPublishRPCBankStateUsesRecoveredRoot(t *testing.T) {
+	transactionCount := uint64(789)
+	server := new(recordingRPCBankState)
+	publishRPCBankState(server, &state.MithrilState{
+		ManifestParentSlot:       10,
+		ManifestBlockHeight:      20,
+		ManifestTransactionCount: 30,
+		LastRootedContext: &state.ResumeContext{
+			Slot:             123,
+			BlockHeight:      456,
+			TransactionCount: &transactionCount,
+		},
+	})
+	assert.Equal(t, recordingRPCBankState{slot: 123, blockHeight: 456, transactionCount: 789}, *server)
+}
+
 func writeCheckpointManifest(t *testing.T, accountsDbPath, manifestsDir string, seq, root, fileID uint64, suffix string) *state.TransactionStatusCheckpointRef {
 	t.Helper()
 	payload := []byte(fmt.Sprintf("checkpoint-payload-%d", root))

@@ -116,6 +116,19 @@ func TestCommitBatchReadsBackAndDedupes(t *testing.T) {
 	assert.Equal(t, []byte("ctx-108"), manifest.ResumeCtx)
 }
 
+func TestCommitBatchPublishesDurableThroughWithIndex(t *testing.T) {
+	db, _ := newFoldTestDb(t)
+	defer db.CloseDb()
+
+	db.foldHooks.afterIndexCommit = func() {
+		require.Equal(t, uint64(42), db.DurableThrough())
+	}
+	_, err := db.CommitBatch(foldDeltas(
+		accounts.SlotDelta{Slot: 42, Delta: []*accounts.Account{foldAcct(1, 1, nil)}},
+	), 42, nil, nil)
+	require.NoError(t, err)
+}
+
 // Manifest encode/decode round-trip, and CRC detection of a torn manifest.
 func TestSegmentManifestRoundTripAndTornDetection(t *testing.T) {
 	dir := t.TempDir()

@@ -62,6 +62,7 @@ type ManifestRecord struct {
 	Offset    uint64            // record offset within this segment's data file
 	OwnerSlot uint64            // slot that produced this version (observability)
 	PrevValid bool              // false => the key was absent from the index before this batch
+	Vote      bool              // derived in memory; not encoded in the v1 manifest
 	Prev      AccountIndexEntry // index entry before this batch overwrote it
 }
 
@@ -138,11 +139,13 @@ func (m *SegmentManifest) encode() []byte {
 		body.Write(r.Pubkey[:])
 		put64(r.Offset)
 		put64(r.OwnerSlot)
+		// Version 1 encodes a boolean, not a bit field. Older rewind readers
+		// use pv == 1; adding a vote flag here would silently lose undo pointers.
+		var prevValid byte
 		if r.PrevValid {
-			body.WriteByte(1)
-		} else {
-			body.WriteByte(0)
+			prevValid = 1
 		}
+		body.WriteByte(prevValid)
 		r.Prev.Marshal(&prevBuf)
 		body.Write(prevBuf[:])
 	}
@@ -324,7 +327,14 @@ func ReadSegmentManifest(path string) (*SegmentManifest, error) {
 		if err != nil {
 			return nil, err
 		}
-		r.PrevValid = pv == 1
+		if pv&^3 != 0 {
+			return nil, ErrTornManifest
+		}
+		// Accept the flags emitted by the earlier RPC branch so those stores
+		// remain readable. New writes use only 0/1; recovery derives Vote from
+		// the segment even for these older flagged manifests.
+		r.PrevValid = pv&1 != 0
+		r.Vote = pv&2 != 0
 		prevRaw, err := d.bytes(24)
 		if err != nil {
 			return nil, err

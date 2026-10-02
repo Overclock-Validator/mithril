@@ -11,8 +11,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
@@ -20,6 +22,28 @@ import (
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 )
+
+// rpcHandler exposes only public RPC methods to go-jsonrpc's reflection-based
+// registration. Internal setters and lifecycle hooks remain Go-only.
+type rpcHandler struct {
+	rpcMethods
+}
+
+type rpcMethods interface {
+	GetAccountInfo(context.Context, jsonrpc.RawParams) (GetAccountInfoResp, error)
+	GetBalance(context.Context, jsonrpc.RawParams) (GetBalanceResp, error)
+	GetBankHash(context.Context, jsonrpc.RawParams) (string, error)
+	GetBlockHeight(context.Context, jsonrpc.RawParams) (uint64, error)
+	GetBlockProduction(context.Context, jsonrpc.RawParams) (GetBlockProductionResp, error)
+	GetEpochInfo(context.Context, jsonrpc.RawParams) (GetEpochInfoResp, error)
+	GetGenesisHash(context.Context, jsonrpc.RawParams) (string, error)
+	GetLatestBlockhash(context.Context, jsonrpc.RawParams) (GetLatestBlockhashResp, error)
+	GetLeaderSchedule(context.Context, jsonrpc.RawParams) (map[string][]uint64, error)
+	GetSlot(context.Context, jsonrpc.RawParams) (uint64, error)
+	GetVoteAccounts(context.Context, jsonrpc.RawParams) (GetVoteAccountsResp, error)
+	SendTransaction(context.Context, jsonrpc.RawParams) (string, error)
+	SimulateTransaction(context.Context, jsonrpc.RawParams) (SimulateTransactionResp, error)
+}
 
 type RpcServer struct {
 	isReady       bool
@@ -31,6 +55,12 @@ type RpcServer struct {
 	slotCtx       *sealevel.SlotCtx
 	slotCtxMu     sync.RWMutex
 	genesisHash   string
+	rootedBank    atomic.Pointer[rootedBankState]
+
+	stakeCacheOnce  sync.Once
+	stakeCache      rootedStakeCache
+	voteRecordsOnce sync.Once
+	voteRecords     rootedVoteRecordCache
 
 	leaderTPUCacheMu         sync.RWMutex
 	leaderTPUByIdentity      map[solana.PublicKey]tpuEndpoint
@@ -45,17 +75,111 @@ type RpcServer struct {
 	sendTransactionLeaderForwardCount uint64
 }
 
+// rootedBankState identifies the durable AccountsDB view served by state RPCs.
+// Publishing it only after a successful fold keeps response context and account
+// values on the same finalized bank.
+type rootedBankState struct {
+	Slot             uint64
+	BlockHeight      uint64
+	TransactionCount uint64
+}
+
 const maxQuietMethodProbeBody = 64 << 10
 
 var supportedRPCMethods = map[string]struct{}{
 	"getAccountInfo":      {},
+	"getBalance":          {},
 	"getBankHash":         {},
+	"getBlockProduction":  {},
 	"getBlockHeight":      {},
 	"getEpochInfo":        {},
 	"getGenesisHash":      {},
 	"getLatestBlockhash":  {},
+	"getLeaderSchedule":   {},
+	"getSlot":             {},
+	"getVoteAccounts":     {},
 	"sendTransaction":     {},
 	"simulateTransaction": {},
+}
+
+func (rpcServer *RpcServer) SetRootedBankState(slot, blockHeight, transactionCount uint64) {
+	rpcServer.rootedBank.Store(&rootedBankState{
+		Slot:             slot,
+		BlockHeight:      blockHeight,
+		TransactionCount: transactionCount,
+	})
+}
+
+func (rpcServer *RpcServer) getRootedBankState() (rootedBankState, bool) {
+	rooted := rpcServer.rootedBank.Load()
+	if rooted == nil {
+		return rootedBankState{}, false
+	}
+	return *rooted, true
+}
+
+func (rpcServer *RpcServer) readRootedAccount(ctx context.Context, pubkey solana.PublicKey) (rootedBankState, *accounts.Account, error) {
+	rooted, accountSet, err := rpcServer.readRootedAccounts(ctx, []solana.PublicKey{pubkey})
+	if err != nil {
+		return rooted, nil, err
+	}
+	// Batch reads use zero-lamport placeholders for absent/deleted accounts.
+	// Translate that loader representation into absence at the RPC boundary.
+	if len(accountSet) != 1 || accountSet[0] == nil || accountSet[0].Lamports == 0 {
+		return rooted, nil, accountsdb.ErrNoAccount
+	}
+	return rooted, accountSet[0], nil
+}
+
+func (rpcServer *RpcServer) readRootedAccounts(ctx context.Context, pubkeys []solana.PublicKey) (rootedBankState, []*accounts.Account, error) {
+	for {
+		bank := rpcServer.rootedBank.Load()
+		if bank == nil {
+			return rootedBankState{}, nil, fmt.Errorf("node has no rooted bank available")
+		}
+		rooted := *bank
+		if rpcServer.acctsDb == nil {
+			return rootedBankState{}, nil, fmt.Errorf("node has no accounts database available")
+		}
+		version, stable := rpcServer.acctsDb.CommittedAccountVersion()
+		if !stable || rpcServer.rootedPublicationPending(rooted.Slot) {
+			if err := waitForRootedPublication(ctx); err != nil {
+				return rooted, nil, err
+			}
+			continue
+		}
+		accounts, stats, err := rpcServer.acctsDb.GetAccountsBatchSharedWithStats(ctx, rooted.Slot, pubkeys)
+		latest, stable := rpcServer.acctsDb.CommittedAccountVersion()
+		if !stable || latest != version || rpcServer.rootedBank.Load() != bank || stats.PendingFoldHits > 0 ||
+			rpcServer.rootedPublicationPending(rooted.Slot) {
+			if err := waitForRootedPublication(ctx); err != nil {
+				return rooted, nil, err
+			}
+			continue
+		}
+		return rooted, accounts, err
+	}
+}
+
+func (rpcServer *RpcServer) rootedPublicationPending(rootedSlot uint64) bool {
+	if !rpcServer.acctsDb.RootedDurable {
+		committed := rpcServer.acctsDb.CommittedAccountSlot()
+		return committed != 0 && committed != rootedSlot
+	}
+	durableThrough := rpcServer.acctsDb.DurableThrough()
+	// Zero means the snapshot baseline is active and no fold has committed yet.
+	return durableThrough != 0 && durableThrough != rootedSlot
+}
+
+func waitForRootedPublication(ctx context.Context) error {
+	timer := time.NewTimer(time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func NewRpcServer(acctsDb *accountsdb.AccountsDb, port uint16, epochSchedule *sealevel.SysvarEpochSchedule, genesisHash solana.Hash) *RpcServer {
@@ -77,7 +201,7 @@ func NewRpcServer(acctsDb *accountsdb.AccountsDb, port uint16, epochSchedule *se
 		jsonrpc.WithServerErrors(rpcErrors),
 	)
 
-	rpcServer.rpcService.Register("MithrilRpc", rpcServer)
+	rpcServer.rpcService.Register("MithrilRpc", rpcHandler{rpcServer})
 	rpcServer.acctsDb = acctsDb
 	if epochSchedule != nil {
 		rpcServer.epochSchedule = epochSchedule
