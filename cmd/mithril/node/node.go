@@ -2565,7 +2565,16 @@ postBootstrap:
 	if rpcPort < 0 || rpcPort > 65535 {
 		klog.Fatalf("invalid port: %d", rpcPort)
 	} else if rpcPort != 0 {
-		rpcServer = rpcserver.NewRpcServer(accountsDb, uint16(rpcPort), epochScheduleFromState(mithrilState), solana.MustHashFromBase58(networkGenesisHash))
+		schedule := epochScheduleFromState(mithrilState)
+		rpcServer = rpcserver.NewRpcServer(accountsDb, uint16(rpcPort), schedule, solana.MustHashFromBase58(networkGenesisHash))
+		if alpenglowMode {
+			if schedule == nil || schedule.SlotsPerEpoch == 0 || schedule.SlotsPerEpoch > math.MaxUint64/3 {
+				klog.Fatalf("Alpenglow RPC requires a valid epoch schedule")
+			}
+			if err := rpcServer.EnableEpochRewards(filepath.Join(accountsPath, "rpc-epoch-rewards"), 3*schedule.SlotsPerEpoch, mithrilState.LastRootedSlot); err != nil {
+				klog.Fatalf("unable to load RPC epoch rewards: %v", err)
+			}
+		}
 		rpcServer.Start()
 		mlog.Log.Infof("Started RPC server on port %d", rpcPort)
 	}
@@ -4333,7 +4342,11 @@ func completeInterruptedRewind(accountsDbPath string, accountsDb *accountsdb.Acc
 // boundary strictly below divSlot and adopts that boundary's context as the
 // rooted checkpoint. Returns false (caller halts) when no boundary below the
 // divergence is retained or the rewind/reconcile fails.
-func rewindStoreBelowDivergence(accountsDbPath string, accountsDb *accountsdb.AccountsDb, s *state.MithrilState, divSlot uint64, rewindHorizon uint64) bool {
+func rewindStoreBelowDivergence(accountsDbPath string, accountsDb *accountsdb.AccountsDb, s *state.MithrilState, divSlot uint64, rewindHorizon uint64, rpcServer replay.SlotCtxSetter) bool {
+	historyGate, hasHistoryGate := rpcServer.(interface{ SetHistoryRecoveryPending(bool) })
+	if hasHistoryGate {
+		historyGate.SetHistoryRecoveryPending(true)
+	}
 	points, err := accountsDb.ListRewindPoints()
 	if err != nil {
 		mlog.Log.Errorf("fork switch: cannot list rewind boundaries: %v; halting", err)
@@ -4364,12 +4377,21 @@ func rewindStoreBelowDivergence(accountsDbPath string, accountsDb *accountsdb.Ac
 		mlog.Log.Errorf("fork switch: rewind to boundary %d failed: %v; halting", target, err)
 		return false
 	}
+	if rewards, ok := rpcServer.(interface{ SetRootedEpochRewardsSlot(uint64) error }); ok {
+		if err := rewards.SetRootedEpochRewardsSlot(res.NewThrough); err != nil {
+			mlog.Log.Errorf("fork switch: rewind RPC epoch rewards to slot %d: %v; halting", res.NewThrough, err)
+			return false
+		}
+	}
 	if err := adoptRewindResult(accountsDbPath, s, res); err != nil {
 		mlog.Log.Errorf("fork switch: %v; halting", err)
 		return false
 	}
 	mlog.Log.Warnf("fork switch: superseded slot %d was already folded (R=%d); rewound durable state to boundary %d (%d batches / %d keys undone)",
 		divSlot, oldRooted, res.NewThrough, res.UndoneBatches, res.UndoneKeys)
+	if hasHistoryGate {
+		historyGate.SetHistoryRecoveryPending(false)
+	}
 	return true
 }
 
@@ -4598,7 +4620,7 @@ func runReplayWithRecovery(
 		// (this is exactly why durable state deliberately lags and undo pointers
 		// are retained for a horizon). Beyond the horizon -> fail closed.
 		if divSlot <= mithrilState.LastRootedSlot {
-			if !rewindStoreBelowDivergence(accountsDbPath, accountsDb, mithrilState, divSlot, rewindHorizon) {
+			if !rewindStoreBelowDivergence(accountsDbPath, accountsDb, mithrilState, divSlot, rewindHorizon, rpcServer) {
 				break
 			}
 		}
