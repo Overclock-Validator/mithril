@@ -53,7 +53,7 @@ func TestStartupEpochStakeSyscallUsesCurrentEffectiveStakes(t *testing.T) {
 			}
 			require.NoError(t, LoadInitialEpochStakesCache(ms, resume, epoch, snapshotEpoch))
 			block := &b.Block{Epoch: epoch}
-			require.NoError(t, seedCurrentEpochStakesForExecution(block))
+			require.NoError(t, seedEpochStakesForExecution(block, block.Epoch))
 			slotCtx := newSlotCtx(block, accounts.NewMemAccounts(), accounts.NewMemAccounts(), nil, nil, 0)
 			execCtx := &sealevel.ExecutionCtx{SlotCtx: slotCtx, ComputeMeter: cu.NewComputeMeter(10_000)}
 			input := append(append(append([]byte(nil), shared[:]...), previousOnly[:]...), currentOnly[:]...)
@@ -84,7 +84,7 @@ func TestStartupEpochStakesRejectMissingCurrentGeneration(t *testing.T) {
 	global.ClearEpochStakes(epoch + 1)
 	t.Cleanup(func() { global.ClearEpochStakes(epoch) })
 	block := &b.Block{Epoch: epoch}
-	require.ErrorContains(t, seedCurrentEpochStakesForExecution(block), "cache key 91004")
+	require.ErrorContains(t, seedEpochStakesForExecution(block, block.Epoch), "cache key 91004")
 	require.Nil(t, block.EpochStakesPerVoteAcct, "must not substitute the previous generation")
 }
 
