@@ -185,6 +185,47 @@ func TestSweepReportsFirstContradiction(t *testing.T) {
 	assert.Equal(t, uint64(101), sw.Slot, "lowest contradicted slot first")
 }
 
+func TestSweepFreshSnapshotSparseHistory(t *testing.T) {
+	for _, snapshotSlot := range []uint64{446_982_955, 1 << 62} {
+		q := &fakeChainQuery{version: 1}
+		s := newTestSweeper(q)
+		executed := map[uint64]solana.Hash{
+			0: swHash(1), snapshotSlot: swHash(2), snapshotSlot + 1: {},
+			snapshotSlot + 9: swHash(3), snapshotSlot + 10: swHash(4),
+		}
+		// Snapshot boots have a zero durable replay root until the first fold.
+		// Huge gaps must cost no more than the handful of retained outcomes.
+		require.Nil(t, s.sweep(executed, 0, snapshotSlot+9))
+		q.certified = map[uint64]alpenglow.BlockID{
+			0:                 {Slot: 0, Hash: swHash(9)},
+			snapshotSlot:      {Slot: snapshotSlot, Hash: swHash(2)},
+			snapshotSlot + 1:  {Slot: snapshotSlot + 1, Hash: swHash(5)},
+			snapshotSlot + 10: {Slot: snapshotSlot + 10, Hash: swHash(6)},
+		}
+		q.finalizedSkips = map[uint64]alpenglow.BlockID{
+			snapshotSlot + 9: {Slot: snapshotSlot + 10, Hash: swHash(6)},
+		}
+		q.version++
+		sw := s.sweep(executed, 0, snapshotSlot+9)
+		require.NotNil(t, sw)
+		require.Equal(t, snapshotSlot+1, sw.Slot, "earliest contradiction wins, including a consumed skip")
+		require.True(t, sw.Executed.IsZero())
+
+		// Fold past the earlier contradiction and resolve the later one.
+		// The contradictory certificate beyond tip must not affect replay.
+		executed[snapshotSlot+9] = swHash(6)
+		q.certified[snapshotSlot+9] = alpenglow.BlockID{Slot: snapshotSlot + 9, Hash: swHash(6)}
+		delete(q.finalizedSkips, snapshotSlot+9)
+		require.Nil(t, s.sweep(executed, snapshotSlot+1, snapshotSlot+9))
+	}
+}
+
+func TestSweepMaxSlotDoesNotWrap(t *testing.T) {
+	const tip = ^uint64(0)
+	s := newTestSweeper(&fakeChainQuery{version: 1})
+	require.Nil(t, s.sweep(map[uint64]solana.Hash{tip: swHash(1)}, tip-1, tip))
+}
+
 // The sweep is gated on the decision version and the replay/root frontiers. The
 // decision version advances on ANY decisive change — not only certificates —
 // so a contradiction derived from replay observations (parent links, finalized
