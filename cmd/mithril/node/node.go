@@ -2566,6 +2566,10 @@ postBootstrap:
 		klog.Fatalf("invalid port: %d", rpcPort)
 	} else if rpcPort != 0 {
 		rpcServer = rpcserver.NewRpcServer(accountsDb, uint16(rpcPort), epochScheduleFromState(mithrilState), solana.MustHashFromBase58(networkGenesisHash))
+		retentionSlots := epochScheduleFromState(mithrilState).SlotsPerEpoch * 2
+		if err := enableRPCBlockHistory(rpcServer, alpenglowMode, filepath.Join(accountsPath, "rpc-block-history"), retentionSlots, mithrilState.LastRootedSlot); err != nil {
+			klog.Fatalf("enable RPC block history: %v", err)
+		}
 		rpcServer.Start()
 		mlog.Log.Infof("Started RPC server on port %d", rpcPort)
 	}
@@ -4333,7 +4337,11 @@ func completeInterruptedRewind(accountsDbPath string, accountsDb *accountsdb.Acc
 // boundary strictly below divSlot and adopts that boundary's context as the
 // rooted checkpoint. Returns false (caller halts) when no boundary below the
 // divergence is retained or the rewind/reconcile fails.
-func rewindStoreBelowDivergence(accountsDbPath string, accountsDb *accountsdb.AccountsDb, s *state.MithrilState, divSlot uint64, rewindHorizon uint64) bool {
+func rewindStoreBelowDivergence(accountsDbPath string, accountsDb *accountsdb.AccountsDb, s *state.MithrilState, divSlot uint64, rewindHorizon uint64, rpcServer replay.SlotCtxSetter) bool {
+	historyGate, hasHistoryGate := rpcServer.(interface{ SetHistoryRecoveryPending(bool) })
+	if hasHistoryGate {
+		historyGate.SetHistoryRecoveryPending(true)
+	}
 	points, err := accountsDb.ListRewindPoints()
 	if err != nil {
 		mlog.Log.Errorf("fork switch: cannot list rewind boundaries: %v; halting", err)
@@ -4364,12 +4372,21 @@ func rewindStoreBelowDivergence(accountsDbPath string, accountsDb *accountsdb.Ac
 		mlog.Log.Errorf("fork switch: rewind to boundary %d failed: %v; halting", target, err)
 		return false
 	}
+	if history, ok := rpcServer.(interface{ RewindBlockHistory(uint64) error }); ok {
+		if err := history.RewindBlockHistory(res.NewThrough); err != nil {
+			mlog.Log.Errorf("fork switch: rewind RPC block history to slot %d: %v; halting", res.NewThrough, err)
+			return false
+		}
+	}
 	if err := adoptRewindResult(accountsDbPath, s, res); err != nil {
 		mlog.Log.Errorf("fork switch: %v; halting", err)
 		return false
 	}
 	mlog.Log.Warnf("fork switch: superseded slot %d was already folded (R=%d); rewound durable state to boundary %d (%d batches / %d keys undone)",
 		divSlot, oldRooted, res.NewThrough, res.UndoneBatches, res.UndoneKeys)
+	if hasHistoryGate {
+		historyGate.SetHistoryRecoveryPending(false)
+	}
 	return true
 }
 
@@ -4598,7 +4615,14 @@ func runReplayWithRecovery(
 		// (this is exactly why durable state deliberately lags and undo pointers
 		// are retained for a horizon). Beyond the horizon -> fail closed.
 		if divSlot <= mithrilState.LastRootedSlot {
-			if !rewindStoreBelowDivergence(accountsDbPath, accountsDb, mithrilState, divSlot, rewindHorizon) {
+			if !rewindStoreBelowDivergence(accountsDbPath, accountsDb, mithrilState, divSlot, rewindHorizon, rpcServer) {
+				break
+			}
+		}
+		if history, ok := rpcServer.(interface{ RewindBlockHistory(uint64) error }); ok {
+			if err := history.RewindBlockHistory(mithrilState.LastRootedSlot); err != nil {
+				result.Error = fmt.Errorf("fork switch: rewind RPC block history to slot %d: %w", mithrilState.LastRootedSlot, err)
+				mlog.Log.Errorf("%v; halting", result.Error)
 				break
 			}
 		}
