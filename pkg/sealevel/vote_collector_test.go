@@ -152,12 +152,12 @@ func TestVoteUpdateCommissionCollector(t *testing.T) {
 				{name: "collector_readonly", mutate: func(_ *features.Features, _ []accounts.Account, m []AccountMeta, _ *[]byte) { m[1].IsWritable = false }, want: InstrErrInvalidArgument},
 				{name: "vote_readonly", mutate: func(_ *features.Features, _ []accounts.Account, m []AccountMeta, _ *[]byte) { m[0].IsWritable = false }, want: InstrErrReadonlyDataModified},
 				{name: "invalid_vote_data", mutate: func(_ *features.Features, a []accounts.Account, _ []AccountMeta, _ *[]byte) { a[1].Data = []byte{99} }, want: InstrErrInvalidAccountData},
-				{name: "uninitialized", mutate: func(_ *features.Features, a []accounts.Account, _ []AccountMeta, _ *[]byte) {
+				{name: "zero_tag_full_size", mutate: func(_ *features.Features, a []accounts.Account, _ []AccountMeta, _ *[]byte) {
 					a[1].Data = make([]byte, VoteStateV4Size)
-				}, want: InstrErrUninitializedAccount},
-				{name: "uninitialized_tag_only", mutate: func(_ *features.Features, a []accounts.Account, _ []AccountMeta, _ *[]byte) {
+				}, want: InstrErrInvalidAccountData},
+				{name: "zero_tag_only", mutate: func(_ *features.Features, a []accounts.Account, _ []AccountMeta, _ *[]byte) {
 					a[1].Data = make([]byte, 4)
-				}, want: InstrErrUninitializedAccount},
+				}, want: InstrErrInvalidAccountData},
 				{name: "v4_without_authorized_voters", mutate: func(_ *features.Features, a []accounts.Account, _ []AccountMeta, _ *[]byte) {
 					state, err := UnmarshalVersionedVoteState(a[1].Data)
 					require.NoError(t, err)

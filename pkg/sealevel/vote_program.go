@@ -1282,10 +1282,10 @@ func VoteProgramUpdateCommissionCollector(execCtx *ExecutionCtx, instrCtx *Instr
 	}
 	defer voteAccount.Drop()
 
-	// Agave's V4 flow treats discriminant zero as Uninitialized (the
-	// retired V0_23_5 payload is no longer decoded).
+	// Agave's V4 decoder rejects discriminant zero (retired V0_23_5) as
+	// InvalidAccountData before checking whether the vote state is initialized.
 	if data := voteAccount.Data(); len(data) >= 4 && bin.LE.Uint32(data[:4]) == VoteStateVersionV0_23_5 {
-		return InstrErrUninitializedAccount
+		return InstrErrInvalidAccountData
 	}
 	versioned, err := UnmarshalVersionedVoteState(voteAccount.Data())
 	if err != nil {
