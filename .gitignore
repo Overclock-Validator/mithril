@@ -2,6 +2,7 @@
 *.log
 
 # Build artifacts
+target/
 /mithril
 /blockdl
 /cmd/mithril/mithril
