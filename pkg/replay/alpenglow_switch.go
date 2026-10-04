@@ -3,6 +3,7 @@ package replay
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -142,11 +143,18 @@ func (s *alpenglowSwitchSweeper) sweep(executed map[uint64]solana.Hash, lastRoot
 	s.lastReplayTip = tip
 	s.lastRooted = lastRooted
 
-	for slot := lastRooted + 1; slot <= tip; slot++ {
-		executedID, ran := executed[slot]
-		if !ran {
-			continue
+	// A fresh snapshot has no durable replay root yet (lastRooted == 0).
+	// Walk only retained outcomes, not every slot since genesis. Sorting keeps
+	// the earliest contradiction first even across gaps in the retained map.
+	slots := make([]uint64, 0, len(executed))
+	for slot := range executed {
+		if slot > lastRooted && slot <= tip {
+			slots = append(slots, slot)
 		}
+	}
+	slices.Sort(slots)
+	for _, slot := range slots {
+		executedID := executed[slot]
 		if _, finalizedSkip := s.query.FinalizedSkipAt(slot); finalizedSkip {
 			if !executedID.IsZero() {
 				return &CertifiedSwitch{Slot: slot, Executed: executedID, Skip: true}

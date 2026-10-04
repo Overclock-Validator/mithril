@@ -325,8 +325,9 @@ type repairClient struct {
 	exploreCursor uint64
 
 	// Quality-ranked responder cache (mu-guarded); see pickResponderLocked.
-	ranked   []gossip.RepairPeer
-	rankedAt time.Time
+	ranked    []gossip.RepairPeer
+	rankedAt  time.Time
+	headPeers headRepairPeers
 
 	peerCacheMu sync.Mutex
 	peerCache   []gossip.RepairPeer
@@ -457,6 +458,7 @@ func (c *repairClient) repairOnce(conn *net.UDPConn, assembler *SlotAssembler) {
 		return
 	}
 	priority, edge := assembler.RepairRequestsTiered(repairMaxSlotsPerScan, repairMaxMissingPerSlot)
+	c.setRepairHead(priority)
 	child, haveChild := assembler.childRepairRequest(time.Now())
 	if len(priority)+len(edge) == 0 && !haveChild {
 		return
@@ -687,6 +689,7 @@ func (c *repairClient) matchShredResponse(packet []byte, from *net.UDPAddr, shre
 		c.decInflightLocked(reqKey.shred())
 	}
 	latency := time.Since(outstanding.sentAt)
+	c.noteHeadResponseLocked(outstanding, latency, late)
 	if late {
 		c.notePeerLateLocked(addrKey, latency)
 	} else {
@@ -873,7 +876,7 @@ func (c *repairClient) sendShredAttempt(conn *net.UDPConn, peers []gossip.Repair
 		c.mu.Unlock()
 		return false
 	}
-	peer, ok := c.nextPeerLocked(peers)
+	peer, ok := c.nextPeerForRequestLocked(peers, sk)
 	if !ok {
 		c.mu.Unlock()
 		return false
@@ -1063,6 +1066,10 @@ func (c *repairClient) returnRateTokens(count int) {
 }
 
 func (c *repairClient) nextPeerLocked(peers []gossip.RepairPeer) (gossip.RepairPeer, bool) {
+	return c.nextPeerForRequestLocked(peers, shredKey{})
+}
+
+func (c *repairClient) nextPeerForRequestLocked(peers []gossip.RepairPeer, request shredKey) (gossip.RepairPeer, bool) {
 	if len(peers) == 0 {
 		return gossip.RepairPeer{}, false
 	}
@@ -1078,6 +1085,9 @@ func (c *repairClient) nextPeerLocked(peers []gossip.RepairPeer) (gossip.RepairP
 	// admission slots recycle 5-8x slower than a fast one's, so unbounded
 	// per-peer queueing lets the slow population clog the whole window.
 	if c.gateCursor%4 != 0 {
+		if peer, ok := c.pickHeadResponderLocked(peers, cap, request); ok {
+			return peer, true
+		}
 		if peer, ok := c.pickResponderLocked(peers, cap); ok {
 			return peer, true
 		}
@@ -1275,6 +1285,7 @@ func (c *repairClient) expireOutstanding(now time.Time) {
 		c.decInflightLocked(key.shred())
 		c.rememberExpiredLocked(responseKey, outstanding)
 		c.notePeerTimeoutLocked(outstanding.addr)
+		c.noteHeadTimeoutLocked(outstanding)
 		c.timeouts.Add(1)
 	}
 }

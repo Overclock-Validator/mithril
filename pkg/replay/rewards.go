@@ -472,7 +472,7 @@ func beginPartitionedEpochRewardsDistribution(acctsDb *accountsdb.AccountsDb, sl
 	pointValue := rewards.PointValue{Rewards: totalRewards, Points: wide.Uint128{}}
 	streamResult, streamErr := rewards.CalculateRewardsStreaming(
 		acctsDb, slot, stakeHistory, newWarmupCooldownRateEpoch,
-		voteCacheSnapshot, pointValue, epoch-1, slotCtx.Blockhash, slotCtx, f, mode)
+		voteCacheSnapshot, pointValue, epoch-1, slotCtx.Blockhash, slotCtx, f, epochSchedule, mode)
 	if streamErr != nil {
 		panic(fmt.Sprintf("streaming rewards calculation failed: %s", streamErr))
 	}
