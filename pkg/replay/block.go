@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -1078,9 +1077,8 @@ func recordAccountLoaderBatchStats(dst *metrics.AccountLoader, src accountsdb.Ba
 // This ensures the stake cache reflects the actual on-chain state, not potentially outdated
 // data. Fatal error if index file is missing - indicates corrupt/incomplete AccountsDB.
 // NO manifest parameter - derives everything from AccountsDB.
-func setupInitialVoteAcctsAndStakeAccts(acctsDb *accountsdb.AccountsDb, block *b.Block) {
+func setupInitialVoteAcctsAndStakeAccts(acctsDb *accountsdb.AccountsDb, block *b.Block, parentEpoch uint64) {
 	block.VoteTimestamps = make(map[solana.PublicKey]sealevel.BlockTimestamp)
-	block.EpochStakesPerVoteAcct = make(map[solana.PublicKey]uint64)
 
 	// Load stake entries from index file built during snapshot processing
 	// The index is in the accountsDbDir which is parent of AcctsDir
@@ -1173,20 +1171,11 @@ func setupInitialVoteAcctsAndStakeAccts(acctsDb *accountsdb.AccountsDb, block *b
 		mlog.Log.Warnf("vote cache rebuild had errors: %v", err)
 	}
 
-	// Seed EpochStakesPerVoteAcct and TotalEpochStake from the epoch stakes cache,
-	// loaded by buildInitialEpochStakesCache() from the manifest. These are
-	// epoch-effective stakes (warmup/cooldown applied), matching Agave's
-	// get_epoch_stake syscall behavior. The raw AccountsDB scan above uses
-	// delegation.StakeLamports which can differ from effective stake.
-	epochStakes := global.EpochStakes(block.Epoch)
-	if len(epochStakes) == 0 {
-		mlog.Log.Errorf("FATAL: no epoch stakes in cache for epoch %d - "+
-			"buildInitialEpochStakesCache should have loaded these from manifest", block.Epoch)
+	if err := seedEpochStakesForExecution(block, parentEpoch); err != nil {
+		mlog.Log.Errorf("FATAL: %v", err)
 		mlog.Log.Errorf("Available cached epochs: %v", global.GetAllCachedEpochs())
 		os.Exit(1)
 	}
-	maps.Copy(block.EpochStakesPerVoteAcct, epochStakes)
-	block.TotalEpochStake = global.EpochTotalStake(block.Epoch)
 
 	// Diagnostic: one-time startup comparison of raw scan vs epoch-effective totals
 	var rawScanTotal uint64
@@ -1255,7 +1244,7 @@ func configureInitialBlock(acctsDb *accountsdb.AccountsDb,
 	}
 	block.LatestEvictedBlockhash = evictedHash
 
-	setupInitialVoteAcctsAndStakeAccts(acctsDb, block)
+	setupInitialVoteAcctsAndStakeAccts(acctsDb, block, epochSchedule.GetEpoch(block.ParentSlot))
 	configureGlobalCtx(block)
 
 	if global.ManageLeaderSchedule() {
@@ -1397,7 +1386,7 @@ func configureInitialBlockFromResume(acctsDb *accountsdb.AccountsDb,
 	// Load vote accounts and populate global caches - same as fresh start
 	// This seeds both block.VoteAccts/VoteTimestamps AND global.VoteCache() from AccountsDB
 	// Required because getTimestampEstimate reads from global.VoteCache()
-	setupInitialVoteAcctsAndStakeAccts(acctsDb, block)
+	setupInitialVoteAcctsAndStakeAccts(acctsDb, block, epochSchedule.GetEpoch(block.ParentSlot))
 	configureGlobalCtx(block)
 
 	// On resume, epoch stakes will be loaded from the persisted state file (not manifest or AccountsDB).

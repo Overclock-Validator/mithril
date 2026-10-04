@@ -389,7 +389,7 @@ func handleEpochTransition(acctsDb *accountsdb.AccountsDb, partitionedEpochRewar
 // from the boundary scan to refresh the vote cache and store epoch stakes.
 func updateEpochStakesAndRefreshVoteCache(leaderScheduleEpoch uint64, b *block.Block, acctsDb *accountsdb.AccountsDb, slot uint64, scanResult *BoundaryStakeScanResult, f *features.Features, epochSchedule *sealevel.SysvarEpochSchedule) {
 	// Check if we need to compute epoch stakes (skip on resume)
-	hasEpochStakes := global.HasEpochStakes(leaderScheduleEpoch)
+	cachedEpochStakes, hasEpochStakes := global.EpochStakesSnapshot(leaderScheduleEpoch)
 
 	// ALWAYS refresh vote cache from AccountsDB, even if HasEpochStakes is true
 	// This ensures the vote cache has fresh NodePubkey for leader schedule
@@ -401,6 +401,11 @@ func updateEpochStakesAndRefreshVoteCache(leaderScheduleEpoch uint64, b *block.B
 	// Skip epoch stakes storage if already cached (resume)
 	if hasEpochStakes {
 		mlog.Log.Infof("already had EpochStakes for epoch %d", leaderScheduleEpoch)
+		// A restart can retain this generation from a previously attempted
+		// boundary, while configuration still inherits the parent's stakes.
+		// Install the cached generation on the child just as the fresh path does.
+		b.EpochStakesPerVoteAcct = maps.Clone(cachedEpochStakes.Stakes)
+		b.TotalEpochStake = cachedEpochStakes.TotalStake
 		return
 	}
 
