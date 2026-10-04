@@ -268,6 +268,107 @@ func TestLostLiveBlockRefetchClearsEmitterDoneState(t *testing.T) {
 	}
 }
 
+func TestRepairCatchupRetainsHeadDuringReplayBackpressure(t *testing.T) {
+	for _, stop := range []bool{false, true} {
+		name := "delivery resumes"
+		if stop {
+			name = "source stops"
+		}
+		t.Run(name, func(t *testing.T) {
+			bs := newRepairCatchupTestSource(1024)
+			const slot = uint64(1_000)
+			blk := &b.Block{Slot: slot, SourceParentSlot: slot - 1, FromLiveStream: true}
+			bs.isNearTip.Store(true)
+			bs.liveHandoffSlot.Store(slot)
+			for i := 0; i < cap(bs.streamChan); i++ {
+				bs.streamChan <- &b.Block{Slot: uint64(i)}
+			}
+			selected := make(chan struct{})
+			bs.beforeReplayBlockSend = func(got *b.Block) {
+				if got == blk {
+					close(selected)
+				}
+			}
+			done := make(chan struct{})
+			go func() {
+				bs.emitOrderedBlocks()
+				close(done)
+			}()
+			t.Cleanup(func() {
+				bs.Stop()
+				close(bs.resultQueue)
+				waitInvalidTestDone(t, done, "backpressured emitter")
+			})
+			bs.resultQueue <- fetchResult{slot: slot, block: blk}
+			waitInvalidTestDone(t, selected, "head selected for replay")
+
+			// The head has left the reorder buffer, but a full replay channel
+			// still holds up its delivery. Repair must not reset this block.
+			if inFlight, _ := bs.repairCatchupHeadInFlight(slot); !inFlight {
+				t.Fatal("backpressured replay send was classified as a lost block")
+			}
+			if stop {
+				bs.Stop()
+				waitInvalidTestDone(t, done, "cancelled replay send")
+				if inFlight, _ := bs.repairCatchupHeadInFlight(slot); inFlight {
+					t.Fatal("cancelled send retained ownership of an undelivered block")
+				}
+			} else {
+				<-bs.streamChan
+				waitForBlockSourceCondition(t, func() bool {
+					bs.reorderMu.Lock()
+					defer bs.reorderMu.Unlock()
+					return bs.nextSlotToSend == slot+1 && bs.replayEmissionBlock == nil
+				})
+				if inFlight, _ := bs.repairCatchupHeadInFlight(slot); !inFlight {
+					t.Fatal("stale monitor head would reset an already delivered block")
+				}
+				if inFlight, _ := bs.repairCatchupHeadInFlight(slot + 1); inFlight {
+					t.Fatal("genuinely missing next head was classified as in flight")
+				}
+				var delivered *b.Block
+				for len(bs.streamChan) > 0 {
+					delivered = <-bs.streamChan
+				}
+				if delivered != blk {
+					t.Fatal("replay did not receive the original assembled block")
+				}
+			}
+		})
+	}
+}
+
+func TestRepairCatchupRetainsHeadDuringEmitterIntake(t *testing.T) {
+	bs := newRepairCatchupTestSource(1024)
+	const slot = uint64(1_000)
+	blk := &b.Block{Slot: slot, SourceParentSlot: slot - 1, FromLiveStream: true}
+	bs.isNearTip.Store(true)
+	bs.liveHandoffSlot.Store(slot)
+	intake := make(chan struct{})
+	release := make(chan struct{})
+	bs.beforeLiveBlockCommit = func(*b.Block) {
+		close(intake)
+		<-release
+	}
+	done := make(chan struct{})
+	go func() {
+		bs.emitOrderedBlocks()
+		close(done)
+	}()
+	t.Cleanup(func() {
+		bs.Stop()
+		close(release)
+		close(bs.resultQueue)
+		waitInvalidTestDone(t, done, "paused intake")
+	})
+	bs.trackLiveDelivery(slot)
+	bs.resultQueue <- fetchResult{slot: slot, block: blk}
+	waitInvalidTestDone(t, intake, "emitter intake")
+	if inFlight, _ := bs.repairCatchupHeadInFlight(slot); !inFlight {
+		t.Fatal("intake released delivery ownership before committing to the reorder buffer")
+	}
+}
+
 func TestRepairCatchupDoesNotPurgeSlowErrorFreeHead(t *testing.T) {
 	// Live slot 3256396 held 8189/8192 verified data shreds with no assembly
 	// errors. The old time-only heuristic purged it, throwing away the whole
