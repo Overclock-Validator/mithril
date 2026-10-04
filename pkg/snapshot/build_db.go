@@ -797,11 +797,13 @@ func initWorkerPools(
 		// snapshot manifest if this account entry is from the incremental snapshot.
 		var fileSize uint64
 		var usedIncrementalSnapshotVal bool
+		sourceManifest := manifest
 		if task.FromIncrementalSnapshot {
 			if incrementalManifest == nil {
 				workerErrors.Record(fmt.Errorf("tried to process incremental snapshot without having parsed incremental snapshot manifest first"))
 				return
 			}
+			sourceManifest = incrementalManifest
 			for _, av := range incrementalManifest.AccountsDb.Storages[slot].AcctVecs {
 				if av.Id == fileId {
 					fileSize = av.FileSize
@@ -820,7 +822,15 @@ func initWorkerPools(
 			}
 		}
 
-		if fileSize == 0 {
+		// Agave 4.4 archives leave the legacy storage map empty and use the
+		// actual file length when restoring AppendVecs. Only an entirely empty
+		// source map enables this format: a missing entry in a populated map
+		// remains an error. An incremental archive's format takes precedence
+		// over any length found in the full manifest.
+		// See agave/runtime/src/serde_snapshot.rs::reconstruct_single_storage.
+		if len(sourceManifest.AccountsDb.Storages) == 0 {
+			fileSize = uint64(len(appendVecBytes))
+		} else if fileSize == 0 {
 			workerErrors.Record(fmt.Errorf("manifest has no file size for appendvec slot=%d file_id=%d", slot, fileId))
 			return
 		}

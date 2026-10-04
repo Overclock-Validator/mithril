@@ -22,9 +22,12 @@ func TestFreshBlockHistoryPreservesSnapshotParentHash(t *testing.T) {
 		VoterPubkey: vote, StakeLamports: 1,
 		ActivationEpoch: math.MaxUint64, DeactivationEpoch: math.MaxUint64,
 	}})
-	require.False(t, global.HasEpochStakes(epoch))
-	global.PutEpochStakes(epoch, map[solana.PublicKey]uint64{vote: 1}, map[solana.PublicKey]*epochstakes.VoteAccount{vote: {NodePubkey: vote}}, 1)
-	t.Cleanup(func() { global.ClearEpochStakes(epoch); global.SetLeaderScheduleForEpoch(epoch, nil) })
+	for _, stakesEpoch := range []uint64{epoch, epoch + 1} {
+		require.False(t, global.HasEpochStakes(stakesEpoch))
+		global.PutEpochStakes(stakesEpoch, map[solana.PublicKey]uint64{vote: 1}, map[solana.PublicKey]*epochstakes.VoteAccount{vote: {NodePubkey: vote}}, 1)
+		t.Cleanup(func() { global.ClearEpochStakes(stakesEpoch) })
+	}
+	t.Cleanup(func() { global.SetLeaderScheduleForEpoch(epoch, nil) })
 	previousManage := global.ManageLeaderSchedule()
 	global.SetManageLeaderSchedule(true)
 	t.Cleanup(func() { global.SetManageLeaderSchedule(previousManage) })

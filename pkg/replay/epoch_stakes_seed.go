@@ -3,11 +3,33 @@ package replay
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"sort"
 
+	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/epochstakes"
+	"github.com/Overclock-Validator/mithril/pkg/global"
+	"github.com/Overclock-Validator/mithril/pkg/safemath"
 	"github.com/Overclock-Validator/mithril/pkg/state"
 )
+
+// seedEpochStakesForExecution mirrors Agave Bank::current_epoch_stakes:
+// the effective stakes for bank epoch E are stored under leader-schedule key
+// E+1. Both forms of sol_get_epoch_stake use this generation. Consensus and
+// leader selection still use key E; substituting that older generation here
+// makes program output depend on whether replay started within the epoch.
+// Startup passes the parent's epoch: a child across a boundary inherits that
+// view until handleEpochTransition creates or restores the new generation.
+func seedEpochStakesForExecution(block *b.Block, bankEpoch uint64) error {
+	stakesEpoch := safemath.SaturatingAddU64(bankEpoch, 1)
+	snapshot, ok := global.EpochStakesSnapshot(stakesEpoch)
+	if !ok || len(snapshot.Stakes) == 0 {
+		return fmt.Errorf("no current epoch stakes for execution in epoch %d (cache key %d)", bankEpoch, stakesEpoch)
+	}
+	block.EpochStakesPerVoteAcct = maps.Clone(snapshot.Stakes)
+	block.TotalEpochStake = snapshot.TotalStake
+	return nil
+}
 
 type manifestEpochStakeSeed struct {
 	sourceEpoch  uint64
