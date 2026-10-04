@@ -759,12 +759,36 @@ func calculateStakePointsAndCredits(
 	}
 }
 
-func CalculateNumRewardPartitions(numStakingRewards uint64) uint64 {
-	numEligible := numStakingRewards
+func CalculateNumRewardPartitions(numStakingRewards uint64, f *features.Features, epochSchedule *sealevel.SysvarEpochSchedule, slot uint64) uint64 {
+	epoch := epochSchedule.GetEpoch(slot)
+	if epochSchedule.Warmup && epoch < epochSchedule.FirstNormalEpoch {
+		return 1
+	}
+	// Agave's SlotParams write budget follows the slot-time regime. A gate
+	// takes effect in the epoch AFTER activation, and a later activation of a
+	// slower regime must never undo an already effective faster regime.
 	target := uint64(4096)
-	slotsInEpoch := uint64(432000)
-	unclamped := (numEligible + (target - 1)) / target
-	cap := slotsInEpoch / 10
+	if f != nil {
+		for _, transition := range []struct {
+			gate   features.FeatureGate
+			target uint64
+		}{
+			{features.ReduceSlotTimeTo350ms, 3584},
+			{features.ReduceSlotTimeTo300ms, 3072},
+			{features.ReduceSlotTimeTo250ms, 2560},
+			{features.ReduceSlotTimeTo200ms, 2048},
+		} {
+			if activationSlot, ok := f.ActivationSlot(transition.gate); ok && epochSchedule.GetEpoch(activationSlot) < epoch {
+				target = transition.target
+			}
+		}
+	}
+	// Divide before rounding up so large counts cannot overflow.
+	unclamped := numStakingRewards / target
+	if numStakingRewards%target != 0 {
+		unclamped++
+	}
+	cap := max(uint64(1), epochSchedule.SlotsPerEpoch/10)
 	// Agave always schedules at least one distribution block, including when
 	// there are no eligible stake rewards. The empty partition is what advances
 	// EpochRewards from active to inactive on the next block; returning zero here
@@ -820,6 +844,7 @@ func CalculateRewardsStreaming(
 	blockhash [32]byte,
 	slotCtx *sealevel.SlotCtx,
 	f *features.Features,
+	epochSchedule *sealevel.SysvarEpochSchedule,
 	mode RewardCalculationMode,
 ) (*StreamingRewardsResult, error) {
 	minimum := minimumStakeDelegation(slotCtx)
@@ -1082,7 +1107,7 @@ func CalculateRewardsStreaming(
 
 	// ==================== Calculate numPartitions from ACTUAL count ====================
 	actualRewardCount := uint64(tempWriter.Count())
-	numPartitions := CalculateNumRewardPartitions(actualRewardCount)
+	numPartitions := CalculateNumRewardPartitions(actualRewardCount, f, epochSchedule, slot)
 
 	var totalVotingRewards uint64
 	for _, v := range validatorRewards {

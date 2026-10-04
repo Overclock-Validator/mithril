@@ -334,6 +334,9 @@ type BlockSource struct {
 	reorderMu     sync.Mutex
 	reorderBuffer map[uint64]*b.Block
 	skippedSlots  map[uint64]bool
+	// Protected by reorderMu: the ordered emitter owns this block while its
+	// send to replay is pending, including when streamChan is full.
+	replayEmissionBlock *b.Block
 	// Tracks provisional skipped slots inferred from an exact Alpenglow parent
 	// block-ID link. These are not RPC skip results and survive handoff, but a
 	// later certificate can unwind them through replay's switch sweep.
@@ -2700,9 +2703,6 @@ func (bs *BlockSource) emitReplayBlock(blk *b.Block) bool {
 // emitOrderedBlocks receives results and emits blocks in order
 func (bs *BlockSource) emitOrderedBlocks() {
 	for result := range bs.resultQueue {
-		if result.block != nil && result.block.FromLiveStream {
-			bs.finishLiveDelivery(result.slot)
-		}
 		var gapWaitingSlot uint64
 		var gapFirstBufferedSlot uint64
 		var gapFirstBufferedParentSlot uint64
@@ -2719,6 +2719,9 @@ func (bs *BlockSource) emitOrderedBlocks() {
 		}
 		if result.block != nil && !result.candidateObserved {
 			if !bs.observeAlpenglowCandidateBlock(result.block) {
+				if result.block.FromLiveStream {
+					bs.finishLiveDelivery(result.slot)
+				}
 				bs.slotStateMu.Lock()
 				delete(bs.slotState, result.slot)
 				delete(bs.inflightStart, result.slot)
@@ -2733,6 +2736,9 @@ func (bs *BlockSource) emitOrderedBlocks() {
 
 		bs.reorderMu.Lock()
 		if result.block != nil && result.block.FromLiveStream {
+			// Transfer ownership under reorderMu: repair must see either the
+			// pending intake or the committed buffer/send, never a gap between.
+			bs.finishLiveDelivery(result.slot)
 			if reason, invalid := bs.invalidAlpenglowCandidateReason(result.block); invalid {
 				bs.reorderMu.Unlock()
 				bs.rejectInvalidAlpenglowCandidate(result.block, reason)
@@ -3053,6 +3059,7 @@ func (bs *BlockSource) emitOrderedBlocks() {
 				}
 
 				delete(bs.reorderBuffer, bs.nextSlotToSend)
+				bs.replayEmissionBlock = blk
 				bs.lastEmittedBlockSlot = blk.Slot
 				bs.recordEmittedAlpenglowBlockIDLocked(blk)
 				rewindGeneration := bs.alpenglowRewindWait.generation()
@@ -3087,6 +3094,9 @@ func (bs *BlockSource) emitOrderedBlocks() {
 				}
 
 				if !bs.emitReplayBlock(blk) {
+					bs.reorderMu.Lock()
+					bs.replayEmissionBlock = nil
+					bs.reorderMu.Unlock()
 					bs.replayEmissionWg.Done()
 					return
 				}
@@ -3106,6 +3116,7 @@ func (bs *BlockSource) emitOrderedBlocks() {
 				bs.reorderMu.Lock()
 				bs.alpenglowRewindWait.served(rewindGeneration, blk)
 				bs.nextSlotToSend++
+				bs.replayEmissionBlock = nil
 				bs.replayEmissionWg.Done()
 			} else if bs.skippedSlots[bs.nextSlotToSend] {
 				if bs.shouldDiscardSkippedSlotAfterHandoff(bs.nextSlotToSend) {
