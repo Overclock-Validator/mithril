@@ -1922,3 +1922,12 @@ func setVoteAccountState(execCtx *ExecutionCtx, acct *BorrowedAccount, voteState
 		return err
 	}
 }
+
+// BlockRevenueCollector returns the SIMD-0232 destination to capture alongside
+// epoch stakes. Pre-V4 vote states pay the scheduled node identity.
+func (vs *VoteStateVersions) BlockRevenueCollector() solana.PublicKey {
+	if vs.Type == VoteStateVersionV4 {
+		return vs.V4.BlockRevenueCollector
+	}
+	return vs.NodePubkey()
+}
