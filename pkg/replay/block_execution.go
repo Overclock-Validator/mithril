@@ -555,6 +555,9 @@ func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
 	if err := distributeBlockTxFees(slotCtx, block, &txFeeAccumulator); err != nil {
 		return nil, err
 	}
+	if err := recordBlockFeeReward(block, slotCtx, &txFeeAccumulator); err != nil {
+		return nil, err
+	}
 	metrics.GlobalBlockReplay.Reward.AddTimingSince(start)
 
 	start = time.Now()
