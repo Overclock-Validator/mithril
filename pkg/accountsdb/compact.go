@@ -268,7 +268,7 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 		return false, 0, err
 	}
 
-	pubkeys, idxEntries, _, err := BuildIndexEntriesFromAppendVecs(data, uint64(len(data)), c.slot, c.fileId)
+	pubkeys, idxEntries, _, _, err := BuildIndexEntriesFromAppendVecs(data, uint64(len(data)), c.slot, c.fileId)
 	if err != nil {
 		return false, 0, err
 	}
