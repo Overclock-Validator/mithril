@@ -23,11 +23,14 @@ type VoteAccount struct {
 	Lamports            uint64
 	NodePubkey          solana.PublicKey
 	BlsPubkeyCompressed *[48]byte
-	LastTimestampTs     int64
-	LastTimestampSlot   uint64
-	Owner               solana.PublicKey
-	Executable          byte
-	RentEpoch           uint64
+	// Nil means an older persisted cache omitted this consensus-critical field.
+	// Legacy vote states explicitly use the scheduled node identity.
+	BlockRevenueCollector *solana.PublicKey
+	LastTimestampTs       int64
+	LastTimestampSlot     uint64
+	Owner                 solana.PublicKey
+	Executable            byte
+	RentEpoch             uint64
 }
 
 // Snapshot is one immutable, atomically published view of an epoch's stake
@@ -176,14 +179,15 @@ type PersistedEpochStakes struct {
 
 // VoteAccountJSON is the JSON-serializable format for vote account metadata.
 type VoteAccountJSON struct {
-	Lamports            uint64 `json:"lamports"`
-	NodePubkey          string `json:"node_pubkey"`
-	BlsPubkeyCompressed []byte `json:"bls_pubkey_compressed,omitempty"`
-	LastTimestampTs     int64  `json:"last_ts"`
-	LastTimestampSlot   uint64 `json:"last_ts_slot"`
-	Owner               string `json:"owner"`
-	Executable          byte   `json:"executable"`
-	RentEpoch           uint64 `json:"rent_epoch"`
+	Lamports              uint64 `json:"lamports"`
+	NodePubkey            string `json:"node_pubkey"`
+	BlsPubkeyCompressed   []byte `json:"bls_pubkey_compressed,omitempty"`
+	BlockRevenueCollector string `json:"block_revenue_collector,omitempty"`
+	LastTimestampTs       int64  `json:"last_ts"`
+	LastTimestampSlot     uint64 `json:"last_ts_slot"`
+	Owner                 string `json:"owner"`
+	Executable            byte   `json:"executable"`
+	RentEpoch             uint64 `json:"rent_epoch"`
 }
 
 // SerializeEpoch serializes the stakes for a single epoch to JSON.
@@ -210,15 +214,20 @@ func (cache *EpochStakesCache) SerializeEpoch(epoch uint64) ([]byte, error) {
 			if va.BlsPubkeyCompressed != nil {
 				bls = append([]byte(nil), va.BlsPubkeyCompressed[:]...)
 			}
+			var collector string
+			if va.BlockRevenueCollector != nil {
+				collector = va.BlockRevenueCollector.String()
+			}
 			persisted.VoteAccts[pk.String()] = &VoteAccountJSON{
-				Lamports:            va.Lamports,
-				NodePubkey:          va.NodePubkey.String(),
-				BlsPubkeyCompressed: bls,
-				LastTimestampTs:     va.LastTimestampTs,
-				LastTimestampSlot:   va.LastTimestampSlot,
-				Owner:               va.Owner.String(),
-				Executable:          va.Executable,
-				RentEpoch:           va.RentEpoch,
+				BlockRevenueCollector: collector,
+				Lamports:              va.Lamports,
+				NodePubkey:            va.NodePubkey.String(),
+				BlsPubkeyCompressed:   bls,
+				LastTimestampTs:       va.LastTimestampTs,
+				LastTimestampSlot:     va.LastTimestampSlot,
+				Owner:                 va.Owner.String(),
+				Executable:            va.Executable,
+				RentEpoch:             va.RentEpoch,
 			}
 		}
 	}
@@ -274,15 +283,24 @@ func (cache *EpochStakesCache) DeserializeAndLoadEpoch(data []byte) (uint64, err
 			copy(b[:], vaJSON.BlsPubkeyCompressed)
 			bls = &b
 		}
+		var collector *solana.PublicKey
+		if vaJSON.BlockRevenueCollector != "" {
+			key, err := solana.PublicKeyFromBase58(vaJSON.BlockRevenueCollector)
+			if err != nil {
+				return 0, fmt.Errorf("invalid block revenue collector for vote acct %s epoch %d: %w", pkStr, epoch, err)
+			}
+			collector = &key
+		}
 		voteAccounts[pk] = &VoteAccount{
-			Lamports:            vaJSON.Lamports,
-			NodePubkey:          nodePubkey,
-			BlsPubkeyCompressed: bls,
-			LastTimestampTs:     vaJSON.LastTimestampTs,
-			LastTimestampSlot:   vaJSON.LastTimestampSlot,
-			Owner:               owner,
-			Executable:          vaJSON.Executable,
-			RentEpoch:           vaJSON.RentEpoch,
+			BlockRevenueCollector: collector,
+			Lamports:              vaJSON.Lamports,
+			NodePubkey:            nodePubkey,
+			BlsPubkeyCompressed:   bls,
+			LastTimestampTs:       vaJSON.LastTimestampTs,
+			LastTimestampSlot:     vaJSON.LastTimestampSlot,
+			Owner:                 owner,
+			Executable:            vaJSON.Executable,
+			RentEpoch:             vaJSON.RentEpoch,
 		}
 	}
 
@@ -360,6 +378,10 @@ func cloneVoteAccount(voteAccount *VoteAccount) *VoteAccount {
 		return nil
 	}
 	cloned := *voteAccount
+	if voteAccount.BlockRevenueCollector != nil {
+		collector := *voteAccount.BlockRevenueCollector
+		cloned.BlockRevenueCollector = &collector
+	}
 	if voteAccount.BlsPubkeyCompressed != nil {
 		bls := *voteAccount.BlsPubkeyCompressed
 		cloned.BlsPubkeyCompressed = &bls

@@ -552,14 +552,8 @@ func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
 	start := time.Now()
 	setReplayStage("distribute_fees")
 
-	// distribute tx fees to the slot leader
-	// skip leader handling if there are zero transactions in this block
-	if !global.ManageLeaderSchedule() && block.BlockReward != nil && len(block.Transactions) > 0 {
-		slotCtx.LamportsBurnt = fees.DistributeTxFeesToSlotLeader(acctsDb, slotCtx, block.BlockReward.Leader, &txFeeAccumulator)
-		slotCtx.RecordModifiedAcct(block.BlockReward.Leader)
-	} else if global.ManageLeaderSchedule() && len(block.Transactions) > 0 {
-		slotCtx.LamportsBurnt = fees.DistributeTxFeesToSlotLeader(acctsDb, slotCtx, block.Leader, &txFeeAccumulator)
-		slotCtx.RecordModifiedAcct(block.Leader)
+	if err := distributeBlockTxFees(slotCtx, block, &txFeeAccumulator); err != nil {
+		return nil, err
 	}
 	metrics.GlobalBlockReplay.Reward.AddTimingSince(start)
 
