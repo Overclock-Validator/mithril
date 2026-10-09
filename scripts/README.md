@@ -6,12 +6,43 @@ These scripts are **optional** but recommended for optimal Mithril performance.
 
 ## Quick Start
 
-Run these commands in order. Detailed explanations for each step are in the sections below.
+Target **Ubuntu 26.04 LTS**. Prefer your provider's Ubuntu installer when available;
+use `install` only from a current Ubuntu rescue environment with UEFI and a
+debootstrap package that supports `resolute`. The script checks this before wiping.
+
+These scripts prepare the server; choose the separate
+[non-voting verifying guide](../docs/setup-verifying.md) or
+[Alpenglow validator guide](../docs/setup-validator.md) to build and run Mithril.
+The Go installer reads `go.mod` and verifies the official archive checksum:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential curl ca-certificates python3
+sudo bash scripts/install-go.sh
+export PATH=/usr/local/go/bin:$PATH
+make build
+```
+
+Inspect `lsblk -f`, `findmnt /`, and `df -h` before disk setup. Provider-installed
+RAID/LVM may occupy both drives. Do not format those disks: create Mithril directories
+on the existing filesystem instead. Automatic disk setup refuses roots spanning
+multiple physical disks. Use the non-voting guide's directory commands for this case.
+Ubuntu 26.04 defaults `/tmp` to tmpfs; keep snapshots, index staging and build scratch
+on disk. Run `disk-setup.sh --setup` only when preparing unused storage.
+
+For a fresh two-drive Mithril server, choose a **separate-disk/no-RAID** provider
+layout. Put Ubuntu on a small partition of the ledger/snapshot drive and reserve the
+other physical drive for AccountsDB. Mirroring both disks removes this I/O isolation
+and limits usable capacity to the smaller disk. A fixed-size OS partition also
+leaves room for the disk script to create a ledger partition. If the provider only
+offers a mirror, use rescue mode and the script's single-disk OS install instead.
+
+Detailed explanations for each step are below.
 
 **Fresh Ubuntu install (rescue/live boot):**
 ```bash
 # 1. Download and run install script (as root)
-curl -O https://raw.githubusercontent.com/Overclock-Validator/mithril/main/scripts/server-setup.sh
+curl -O https://raw.githubusercontent.com/Overclock-Validator/mithril/alpenglow-dev/scripts/server-setup.sh
 chmod +x server-setup.sh
 sudo ./server-setup.sh install
 
@@ -30,7 +61,7 @@ ssh -i ~/.ssh/YOUR_KEY YOUR_USERNAME@YOUR_SERVER_IP
 # Tip: Add an entry to ~/.ssh/config to avoid typing the key path each time
 
 # 4. Clone repo and run remaining setup
-git clone https://github.com/Overclock-Validator/mithril.git
+git clone --branch alpenglow-dev https://github.com/Overclock-Validator/mithril.git
 cd mithril
 chmod +x scripts/*.sh
 sudo ./scripts/disk-setup.sh --setup        # Configure storage (offers benchmarks)
@@ -39,7 +70,7 @@ sudo ./scripts/performance-tune.sh          # Apply performance tuning
 
 **Existing Ubuntu (just hardening + setup):**
 ```bash
-git clone https://github.com/Overclock-Validator/mithril.git
+git clone --branch alpenglow-dev https://github.com/Overclock-Validator/mithril.git
 cd mithril
 chmod +x scripts/*.sh
 sudo ./scripts/server-setup.sh harden       # Add SSH keys, firewall, fail2ban
@@ -80,7 +111,7 @@ sudo ./scripts/disk-setup.sh --clean-all         # Complete reset
 
 ### What You'll Need
 
-- **Ubuntu 24.04 LTS** (fresh install recommended)
+- **Ubuntu 26.04 LTS** (fresh install recommended)
 - **At least one NVMe SSD** (1 TB or larger)
 - **Terminal access** (Ctrl+Alt+T opens a terminal)
 - **sudo privileges** (you can run admin commands)
@@ -93,7 +124,7 @@ sudo ./scripts/disk-setup.sh --clean-all         # Complete reset
 
 ### What is `sudo`?
 
-`sudo` means "run this command as administrator". When you see `sudo` at the start of a command, Linux will ask for your password. This is normal and required for system changes.
+`sudo` means "run this command as administrator". When you see `sudo` at the start of a command, Linux may ask for your password. Newly created key-only admins use passwordless sudo because their account password is locked.
 
 ```bash
 # Example: this command needs admin privileges
@@ -108,12 +139,18 @@ When you type your password, **you won't see any characters appear** - this is a
 
 The server setup script helps you install Ubuntu from scratch or harden an existing installation. This is useful for dedicated servers, bare metal, or VPS providers that offer rescue/live environments.
 
+When hardening, keep your original session open and test key login **and sudo** as
+the admin in a second terminal before confirming `ACCESS VERIFIED`. The script
+checks effective SSH settings (including admin Match rules), restores its previous
+configuration on validation/reload failure, and permits the active SSH port in UFW.
+`status` displays effective password, keyboard-interactive and root login settings.
+
 ### When to Use This Script
 
 **Use `install` mode if:**
 - You have a bare metal server booted into rescue/live mode
-- You want a clean Ubuntu 24.04 installation optimized for Mithril
-- Your provider doesn't offer Ubuntu 24.04 directly
+- You want a clean Ubuntu 26.04 installation optimized for Mithril
+- Your provider doesn't offer Ubuntu 26.04 directly
 
 **Use `harden` mode if:**
 - You already have Ubuntu installed
@@ -132,20 +169,20 @@ Boot your server into rescue mode (via your provider's panel), then:
 
 ```bash
 # Download the script (or clone the repo)
-curl -O https://raw.githubusercontent.com/Overclock-Validator/mithril/main/scripts/server-setup.sh
+curl -O https://raw.githubusercontent.com/Overclock-Validator/mithril/alpenglow-dev/scripts/server-setup.sh
 chmod +x server-setup.sh
 
 sudo ./server-setup.sh install
 ```
 
-The script will:
+The script installs rescue dependencies and checks Ubuntu 26.04 support before touching disks. It will:
 1. Ask which disk to install Ubuntu on
 2. Create a fixed-size root partition (not consuming entire disk)
 3. Optionally create a data partition with remaining space
 4. Set up an admin user with your SSH key
 5. Configure security: fail2ban, UFW, unattended-upgrades
 6. Disable SSH password login (key-only)
-7. Install chrony (time sync) and haveged (entropy)
+7. Install chrony (time sync) and build dependencies
 8. Set journald limits to prevent log disk fill
 
 After installation, disable rescue boot in your provider panel and reboot.
@@ -165,7 +202,7 @@ From here, clone the Mithril repo and run the remaining setup scripts:
 
 ```bash
 # Clone the mithril repository
-git clone https://github.com/Overclock-Validator/mithril.git
+git clone --branch alpenglow-dev https://github.com/Overclock-Validator/mithril.git
 cd mithril
 
 # Run disk setup (benchmarks and formats drives)

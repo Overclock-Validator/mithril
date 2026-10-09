@@ -258,7 +258,7 @@ confirm_destructive() {
 # ------------------------------------------------------------------------------
 
 get_root_disk() {
-    local root_src root_pk
+    local root_src disks count
     root_src="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
 
     # Handle rescue mode where root is overlay/tmpfs/loop
@@ -267,12 +267,13 @@ get_root_disk() {
         return 0
     fi
 
-    root_pk="$(lsblk -no PKNAME "$root_src" 2>/dev/null || true)"
-    if [[ -z "$root_pk" ]]; then
-        echo "none"  # Can't determine parent disk
-        return 0
-    fi
-    echo "/dev/$root_pk"
+    # Inverse traversal resolves partitions, LVM and software RAID to disks.
+    disks=$(lsblk -snrpo NAME,TYPE "$root_src" | awk '$2=="disk" {print $1}' | sort -u) || \
+        die "Cannot resolve the root filesystem's physical disks."
+    [[ -n "$disks" ]] || die "Cannot identify the root disk; refusing automatic disk setup."
+    count=$(printf '%s\n' "$disks" | wc -l)
+    [[ "$count" -eq 1 ]] || die "Root spans multiple disks (RAID/LVM). Configure Mithril directories on the existing filesystem manually; automatic disk setup is unsupported."
+    printf '%s\n' "$disks"
 }
 
 # SAFETY: Check if a path is on the root/OS disk
@@ -292,12 +293,8 @@ path_on_root_disk() {
     # If path isn't mounted, it's not on root disk
     [[ -z "$path_device" ]] && return 1
 
-    # Get the parent disk of this device
-    path_disk="$(lsblk -no PKNAME "$path_device" 2>/dev/null || true)"
-    [[ -z "$path_disk" ]] && return 1
-
-    # Compare with root disk
-    [[ "/dev/$path_disk" == "$root_disk" ]]
+    path_disk=$(lsblk -snrpo NAME,TYPE "$path_device" | awk '$2=="disk" {print $1}')
+    grep -qxF "$root_disk" <<< "$path_disk"
 }
 
 list_nvme_disks() {
@@ -2929,4 +2926,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

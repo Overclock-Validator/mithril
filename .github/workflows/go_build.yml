@@ -3,35 +3,44 @@ on:
   pull_request:
   push:
     branches:
-      - dev
+      - alpenglow-dev
 jobs:
   go-build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
 
       - name: Setup Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v7
         with:
-          go-version: 1.26.4
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
 
       - name: Build
         run: go build -v ./cmd/mithril
 
   regression-tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:
       contents: read
     env:
       GOMAXPROCS: "2"
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
 
       - name: Setup Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v7
         with:
-          go-version: 1.26.4
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Setup script regressions
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-server
+          sudo mkdir -p /run/sshd
+          bash scripts/tests/server-setup-test.sh
 
       - name: Voting, checkpoint, streaming and scheduler race regressions
         # Run the complete affected package suites, including subprocess crash

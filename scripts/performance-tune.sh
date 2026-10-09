@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# performance-tune.sh - Ubuntu 24.04 System Optimization for Mithril
+# performance-tune.sh - Ubuntu 26.04 System Optimization for Mithril
 # ==============================================================================
 #
 # PURPOSE:
-# This script optimizes your Ubuntu 24.04 system for running Mithril, a high-
+# This script optimizes your Ubuntu 26.04 system for running Mithril, a high-
 # performance Solana ledger verification tool. Mithril is I/O intensive and
 # benefits from:
 #   - Fast disk access (reduced filesystem overhead)
@@ -20,7 +20,7 @@
 #   6. Read-ahead    - Tunes disk prefetching per workload type
 #   7. Huge Pages    - Configures THP to prevent latency spikes
 #   8. Mount Options - (EXPERIMENTAL) barrier=0, data=writeback for ext4
-#   9. Go Tuning     - Shows Go 1.25 runtime optimization tips
+#   9. Go Tuning     - Shows Go runtime optimization tips
 #
 # ==============================================================================
 # OPTIMIZATION CONFIDENCE LEVELS
@@ -53,7 +53,7 @@
 # then benchmarking [THEORETICAL] changes one at a time.
 #
 # REQUIREMENTS:
-#   - Ubuntu 24.04 LTS (may work on other versions)
+#   - Ubuntu 26.04 LTS (may work on other versions)
 #   - Root/sudo access
 #   - NVMe SSD storage
 #
@@ -182,7 +182,7 @@ show_status() {
 
     # Check EPP (modern Intel/AMD pstate drivers)
     local epp_values
-    epp_values=$(cat /sys/devices/system/cpu/cpufreq/policy*/energy_performance_preference 2>/dev/null | sort -u | tr '\n' ' ')
+    epp_values=$(cat /sys/devices/system/cpu/cpufreq/policy*/energy_performance_preference 2>/dev/null | sort -u | tr '\n' ' ' || true)
     if [[ -n "$epp_values" ]]; then
         echo "  Energy Performance Preference (EPP): ${epp_values}"
         if [[ "$epp_values" == *"performance"* ]]; then
@@ -1369,7 +1369,7 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
-# OPTIMIZATION 8: Go 1.25 Runtime Tuning for Minimum Latency
+# OPTIMIZATION 8: Go Runtime Tuning for Minimum Latency
 # ------------------------------------------------------------------------------
 #
 # Mithril is a Go application optimized for MINIMUM LATENCY during block replay.
@@ -1406,7 +1406,7 @@ EOF
 # ------------------------------------------------------------------------------
 
 show_go_tuning() {
-    info "Go 1.25 Runtime Tuning for Minimum Latency"
+    info "Go Runtime Tuning for Minimum Latency"
     echo ""
     echo "  Mithril's primary workload is block replay with random I/O to AccountsDB."
     echo "  These settings optimize for MINIMUM LATENCY during block processing."
@@ -1440,7 +1440,7 @@ show_go_tuning() {
     echo ""
     echo "  Example launch command (with GC tracing for debugging):"
     echo ""
-    echo "    GODEBUG=gctrace=1 ./mithril verify-live --config mithril.toml"
+    echo "    GODEBUG=gctrace=1 ./mithril run --config config.toml"
     echo ""
     echo "  Example systemd service for production:"
     echo ""

@@ -27,8 +27,8 @@
 #   [validator] identity_keypair = "/path/to/validator-keypair.json"
 #
 # Alpenglow supports "verifying" (default; non-voting) and "validator" modes.
-# Validator mode enables TPU ingress and block production but does not cast
-# votes yet. mainnet-beta/testnet/devnet retain the classic verifying-only flow.
+# Validator mode enables experimental Votor voting, TPU ingress and block
+# production. mainnet-beta/testnet/devnet retain the classic verifying-only flow.
 # Generate a per-type starter config: mithril config init [--validator]
 # ----------------------------------------------------------------------------
 
