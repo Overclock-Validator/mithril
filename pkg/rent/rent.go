@@ -30,25 +30,57 @@ type RentPayingInfo struct {
 type RentStateInfo struct {
 	RentState      uint64
 	RentPayingInfo RentPayingInfo
+	owner          solana.PublicKey
+	// relaxPostExecMinBalanceCheck records the transaction feature snapshot.
+	// NewRentStateInfo is used for both the pre- and post-execution snapshots,
+	// while SIMD-0392 needs both snapshots to derive the effective states.
+	relaxPostExecMinBalanceCheck bool
 }
 
-func rentStateFromAcct(acct *accounts.Account, rent *sealevel.SysvarRent) *RentStateInfo {
-	if acct.Lamports == 0 {
-		return &RentStateInfo{RentState: RentStateUninitialized, RentPayingInfo: RentPayingInfo{Lamports: acct.Lamports, DataSize: uint64(len(acct.Data)), Pk: acct.Key}}
-	} else if rent.IsExempt(acct.Lamports, uint64(len(acct.Data))) {
-		return &RentStateInfo{RentState: RentStateRentExempt, RentPayingInfo: RentPayingInfo{Lamports: acct.Lamports, DataSize: uint64(len(acct.Data)), Pk: acct.Key}}
-	} else {
-		return &RentStateInfo{RentState: RentStateRentPaying, RentPayingInfo: RentPayingInfo{Lamports: acct.Lamports, DataSize: uint64(len(acct.Data)), Pk: acct.Key}}
+// RentStateTransitionError identifies the transaction account whose rent-state
+// transition failed. TransactionError::InsufficientFundsForRent carries this
+// exact u8 index on the wire.
+type RentStateTransitionError struct {
+	AccountIndex uint8
+	Err          error
+}
+
+func (e *RentStateTransitionError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *RentStateTransitionError) Unwrap() error {
+	return e.Err
+}
+
+func rentStateFromAcct(acct *accounts.Account, rent *sealevel.SysvarRent, relaxPostExecMinBalanceCheck bool) *RentStateInfo {
+	info := &RentStateInfo{
+		RentPayingInfo: RentPayingInfo{
+			Lamports: acct.Lamports,
+			DataSize: uint64(len(acct.Data)),
+			Pk:       acct.Key,
+		},
+		owner:                        acct.Owner,
+		relaxPostExecMinBalanceCheck: relaxPostExecMinBalanceCheck,
 	}
+	if acct.Lamports == 0 {
+		info.RentState = RentStateUninitialized
+	} else if rent.IsExempt(acct.Lamports, uint64(len(acct.Data))) {
+		info.RentState = RentStateRentExempt
+	} else {
+		info.RentState = RentStateRentPaying
+	}
+	return info
 }
 
 func NewRentStateInfo(rent *sealevel.SysvarRent, txCtx *sealevel.TransactionCtx, f *features.Features) []*RentStateInfo {
 	rentStateInfos := make([]*RentStateInfo, 0, len(txCtx.Accounts.Accounts))
 	acctsMetas := txCtx.Accounts.AcctMetas
+	relaxPostExecMinBalanceCheck := f != nil && f.IsActive(features.RelaxPostExecMinBalanceCheck)
 
 	for idx, acct := range txCtx.Accounts.Accounts {
 		if sealevel.IsWritable(acctsMetas[idx], f) {
-			rentStateInfo := rentStateFromAcct(acct, rent)
+			rentStateInfo := rentStateFromAcct(acct, rent, relaxPostExecMinBalanceCheck)
 			rentStateInfos = append(rentStateInfos, rentStateInfo)
 		} else {
 			rentStateInfos = append(rentStateInfos, nil)
@@ -56,6 +88,37 @@ func NewRentStateInfo(rent *sealevel.SysvarRent, txCtx *sealevel.TransactionCtx,
 	}
 
 	return rentStateInfos
+}
+
+// effectiveRentStates applies the SIMD-0392 pre/post classifications. Before
+// activation, the raw legacy classifications are returned unchanged.
+//
+// Once active, a pre-existing rent-paying account is treated as rent-exempt.
+// A post-execution, nonzero sub-minimum balance may remain effectively exempt
+// only when the owner is unchanged, data did not grow, and the balance did not
+// decrease. This is the relaxation which lets legacy rent-paying accounts be
+// left unchanged or credited, while preventing any further debit.
+func effectiveRentStates(preRentState *RentStateInfo, postRentState *RentStateInfo) (uint64, uint64) {
+	if !preRentState.relaxPostExecMinBalanceCheck {
+		return preRentState.RentState, postRentState.RentState
+	}
+
+	effectivePre := preRentState.RentState
+	if effectivePre == RentStateRentPaying {
+		effectivePre = RentStateRentExempt
+	}
+
+	effectivePost := postRentState.RentState
+	relaxPostCriteria := effectivePre == RentStateRentExempt &&
+		preRentState.RentPayingInfo.DataSize >= postRentState.RentPayingInfo.DataSize &&
+		preRentState.owner == postRentState.owner
+	if relaxPostCriteria &&
+		effectivePost == RentStateRentPaying &&
+		postRentState.RentPayingInfo.Lamports >= preRentState.RentPayingInfo.Lamports {
+		effectivePost = RentStateRentExempt
+	}
+
+	return effectivePre, effectivePost
 }
 
 func checkRentStateTransitionAllowed(preRentState *RentStateInfo, postRentState *RentStateInfo, txCtx *sealevel.TransactionCtx, idx uint64) error {
@@ -73,26 +136,34 @@ func checkRentStateTransitionAllowed(preRentState *RentStateInfo, postRentState 
 	}
 
 	if acct.Key != a.IncineratorAddr {
-		if postRentState.RentState == RentStateUninitialized {
+		preState, postState := effectiveRentStates(preRentState, postRentState)
+		if postState == RentStateUninitialized {
 			return nil
-		} else if postRentState.RentState == RentStateRentExempt {
+		} else if postState == RentStateRentExempt {
 			return nil
-		} else if postRentState.RentState == RentStateRentPaying {
-			if preRentState.RentState == RentStateUninitialized {
-				return fmt.Errorf("[1] rent state transition not allowed. pre: %+v, post: %+v", preRentState, postRentState)
-			} else if preRentState.RentState == RentStateRentExempt {
-				return fmt.Errorf("[2] rent state transition not allowed. pre: %+v, post: %+v", preRentState, postRentState)
-			} else if preRentState.RentState == RentStateRentPaying {
+		} else if postState == RentStateRentPaying {
+			if preState == RentStateUninitialized {
+				return newRentStateTransitionError(idx, "[1] rent state transition not allowed. pre: %+v, post: %+v", preRentState, postRentState)
+			} else if preState == RentStateRentExempt {
+				return newRentStateTransitionError(idx, "[2] rent state transition not allowed. pre: %+v, post: %+v", preRentState, postRentState)
+			} else if preState == RentStateRentPaying {
 				if postRentState.RentPayingInfo.DataSize == preRentState.RentPayingInfo.DataSize && postRentState.RentPayingInfo.Lamports <= preRentState.RentPayingInfo.Lamports {
 					return nil
 				} else {
-					return fmt.Errorf("[3] rent state transition not allowed. pre: %+v, post: %+v", preRentState, postRentState)
+					return newRentStateTransitionError(idx, "[3] rent state transition not allowed. pre: %+v, post: %+v", preRentState, postRentState)
 				}
 			}
 		}
 	}
 
 	return nil
+}
+
+func newRentStateTransitionError(accountIndex uint64, format string, args ...interface{}) error {
+	return &RentStateTransitionError{
+		AccountIndex: uint8(accountIndex),
+		Err:          fmt.Errorf(format, args...),
+	}
 }
 
 func VerifyRentStateChanges(preStates []*RentStateInfo, postStates []*RentStateInfo, txCtx *sealevel.TransactionCtx) error {

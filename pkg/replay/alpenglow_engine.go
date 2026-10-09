@@ -145,9 +145,9 @@ func applyAlpenglowFooterClock(slotCtx *sealevel.SlotCtx, block *b.Block, epochS
 
 // applyAlpenglowFooterClockLocal performs the same deterministic slot-state
 // update without publishing it globally. Block production freezes a candidate
-// before that candidate re-enters ordered replay; updating SysvarCache there
-// would make replay mistake the candidate's Clock for its parent Clock and omit
-// the Clock delta from AccountsLtHash.
+// before ordered adopt publishes the cache; updating SysvarCache at freeze
+// would make the next load mistake the candidate's Clock for its parent Clock
+// and omit the Clock delta from AccountsLtHash.
 func applyAlpenglowFooterClockLocal(slotCtx *sealevel.SlotCtx, block *b.Block, epochSchedule *sealevel.SysvarEpochSchedule) error {
 	return applyAlpenglowFooterClockWithCache(slotCtx, block, epochSchedule, false)
 }

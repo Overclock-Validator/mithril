@@ -46,8 +46,29 @@ func (n *Nodes) GetRoot() (out *[32]byte) {
 	return &n.Nodes[len(n.Nodes)-1]
 }
 
-// TODO provide a method for memory-efficient Merkle construction when only the root is requested.
-//      Can be implemented using recursion root level downwards
+// HashRoot computes the same root as HashNodes without retaining proof nodes.
+// Empty input returns zero. Each level overwrites the preceding level, so only
+// one hash per leaf is allocated. Leaves are never modified.
+func HashRoot(leaves [][]byte) (root [32]byte) {
+	if len(leaves) == 0 {
+		return root
+	}
+	if len(leaves) == 1 {
+		return HashLeaf(leaves[0])
+	}
+	nodes := make([][32]byte, len(leaves))
+	for i, leaf := range leaves {
+		nodes[i] = HashLeaf(leaf)
+	}
+	for len(nodes) > 1 {
+		for i := 0; i < len(nodes); i += 2 {
+			right := min(i+1, len(nodes)-1)
+			nodes[i/2] = HashIntermediate(&nodes[i], &nodes[right])
+		}
+		nodes = nodes[:(len(nodes)+1)/2]
+	}
+	return nodes[0]
+}
 
 // HashNodes constructs proof data from a set of leaves.
 //
@@ -97,6 +118,14 @@ func HashNodes(leaves [][]byte) (out Nodes) {
 
 // HashLeaf returns the hash of a leaf node.
 func HashLeaf(data []byte) (out [32]byte) {
+	if len(data) == 64 {
+		// Transaction signatures are fixed-width leaves. A single buffer avoids
+		// incremental hash writes while retaining the leaf domain separator.
+		var input [65]byte
+		input[0] = TypeLeaf
+		copy(input[1:], data)
+		return sha256.Sum256(input[:])
+	}
 	h := sha256.New()
 	h.Write([]byte{TypeLeaf})
 	h.Write(data)
@@ -106,12 +135,11 @@ func HashLeaf(data []byte) (out [32]byte) {
 
 // HashIntermediate returns the hash of an intermediate node.
 func HashIntermediate(left *[32]byte, right *[32]byte) (out [32]byte) {
-	h := sha256.New()
-	h.Write([]byte{TypeIntermediate})
-	h.Write(left[:])
-	h.Write(right[:])
-	h.Sum(out[:0])
-	return
+	var input [65]byte
+	input[0] = TypeIntermediate
+	copy(input[1:33], left[:])
+	copy(input[33:], right[:])
+	return sha256.Sum256(input[:])
 }
 
 // nextLevelLen returns the amount of nodes in the layer above the current one,

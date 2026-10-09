@@ -208,12 +208,12 @@ func (accountMeta *SolAccountMetaC) Marshal() ([]byte, error) {
 		return nil, err
 	}
 
-	err = binary.Write(buf, binary.LittleEndian, accountMeta.IsSigner)
+	err = binary.Write(buf, binary.LittleEndian, accountMeta.IsWritable)
 	if err != nil {
 		return nil, err
 	}
 
-	err = binary.Write(buf, binary.LittleEndian, accountMeta.IsWritable)
+	err = binary.Write(buf, binary.LittleEndian, accountMeta.IsSigner)
 	if err != nil {
 		return nil, err
 	}

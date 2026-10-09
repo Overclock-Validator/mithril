@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"runtime/trace"
 	"strings"
 	"sync"
@@ -47,6 +48,7 @@ var (
 	TxErrInvalidProgramForExecution        = errors.New("TxErrInvalidProgramForExecution")
 	TxErrInvalidBlockhash                  = errors.New("TxErrInvalidBlockhash")
 	TxErrSanitizeFailure                   = errors.New("TxErrSanitizeFailure")
+	TxErrUnsupportedVersion                = errors.New("TxErrUnsupportedVersion")
 )
 
 const (
@@ -295,21 +297,106 @@ func recordVoteTimestampAndSlot(slotCtx *sealevel.SlotCtx, acct *accounts.Accoun
 
 func recordStakeAndVoteAccount(slotCtx *sealevel.SlotCtx, execCtx *sealevel.ExecutionCtx, acct *accounts.Account, modifiedVoteAccts bool) {
 	if acct.Lamports == 0 || acct.Owner != a.VoteProgramAddr {
-		if global.VoteCacheItem(acct.Key) != nil {
-			global.DeleteVoteCacheItem(acct.Key)
-			markVoteStakeDirty(slotCtx.Slot) // global cache mutated — gates in-loop unwind
+		if voteCacheHas(slotCtx, acct.Key) {
+			deleteVoteCacheItem(slotCtx, acct.Key)
+			markSlotVoteStakeDirty(slotCtx) // global cache mutated — gates in-loop unwind
 		}
 	} else if modifiedVoteAccts {
 		recordVoteTimestampAndSlot(slotCtx, acct)
 		newVersionedVoteState, wasModified := execCtx.ModifiedVoteStates[acct.Key]
 		if wasModified {
-			global.PutVoteCacheItem(acct.Key, newVersionedVoteState)
+			putVoteCacheItem(slotCtx, acct.Key, newVersionedVoteState)
 		}
-		markVoteStakeDirty(slotCtx.Slot)
+		markSlotVoteStakeDirty(slotCtx)
 	}
 
 	if acct.Owner == a.StakeProgramAddr {
 		recordStakeDelegation(slotCtx.Slot, acct)
+		markSlotVoteStakeDirty(slotCtx)
+	}
+}
+
+// The vote cache is process-global. A bank executed speculatively (streaming
+// replay) defers its puts/deletes into the SlotCtx so a discard leaves the
+// cache untouched; publishDeferredVoteCache applies them once the bank is
+// accepted. Non-deferring banks publish immediately, exactly as before.
+
+func voteCacheHas(slotCtx *sealevel.SlotCtx, key solana.PublicKey) bool {
+	if slotCtx.DeferVoteCachePublication {
+		slotCtx.PendingVoteCacheMu.Lock()
+		defer slotCtx.PendingVoteCacheMu.Unlock()
+		if _, deleted := slotCtx.PendingVoteCacheDeletes[key]; deleted {
+			return false
+		}
+		if _, pending := slotCtx.PendingVoteCache[key]; pending {
+			return true
+		}
+	}
+	return global.VoteCacheItem(key) != nil
+}
+
+func putVoteCacheItem(slotCtx *sealevel.SlotCtx, key solana.PublicKey, state *sealevel.VoteStateVersions) {
+	if !slotCtx.DeferVoteCachePublication {
+		global.PutVoteCacheItem(key, state)
+		return
+	}
+	slotCtx.PendingVoteCacheMu.Lock()
+	defer slotCtx.PendingVoteCacheMu.Unlock()
+	if slotCtx.PendingVoteCache == nil {
+		slotCtx.PendingVoteCache = make(map[solana.PublicKey]*sealevel.VoteStateVersions)
+	}
+	slotCtx.PendingVoteCache[key] = state
+	delete(slotCtx.PendingVoteCacheDeletes, key)
+}
+
+func deleteVoteCacheItem(slotCtx *sealevel.SlotCtx, key solana.PublicKey) {
+	if !slotCtx.DeferVoteCachePublication {
+		global.DeleteVoteCacheItem(key)
+		return
+	}
+	slotCtx.PendingVoteCacheMu.Lock()
+	defer slotCtx.PendingVoteCacheMu.Unlock()
+	if slotCtx.PendingVoteCacheDeletes == nil {
+		slotCtx.PendingVoteCacheDeletes = make(map[solana.PublicKey]struct{})
+	}
+	slotCtx.PendingVoteCacheDeletes[key] = struct{}{}
+	delete(slotCtx.PendingVoteCache, key)
+}
+
+func markSlotVoteStakeDirty(slotCtx *sealevel.SlotCtx) {
+	if slotCtx.DeferVoteCachePublication {
+		slotCtx.PendingVoteCacheMu.Lock()
+		slotCtx.VoteStakeDirty = true
+		slotCtx.PendingVoteCacheMu.Unlock()
+		return
+	}
+	markVoteStakeDirty(slotCtx.Slot)
+}
+
+// publishDeferredVoteCache applies a speculative bank's buffered vote-cache
+// changes and dirty marker. It is called by the streaming finalize step after
+// the complete block has been matched to the executed prefix and is a no-op
+// for banks that published immediately.
+func publishDeferredVoteCache(slotCtx *sealevel.SlotCtx) {
+	if slotCtx == nil || !slotCtx.DeferVoteCachePublication {
+		return
+	}
+	slotCtx.PendingVoteCacheMu.Lock()
+	puts := slotCtx.PendingVoteCache
+	deletes := slotCtx.PendingVoteCacheDeletes
+	dirty := slotCtx.VoteStakeDirty
+	slotCtx.PendingVoteCache = nil
+	slotCtx.PendingVoteCacheDeletes = nil
+	slotCtx.VoteStakeDirty = false
+	slotCtx.DeferVoteCachePublication = false
+	slotCtx.PendingVoteCacheMu.Unlock()
+	for key := range deletes {
+		global.DeleteVoteCacheItem(key)
+	}
+	for key, state := range puts {
+		global.PutVoteCacheItem(key, state)
+	}
+	if dirty {
 		markVoteStakeDirty(slotCtx.Slot)
 	}
 }
@@ -372,29 +459,55 @@ func handleFailedTx(slotCtx *sealevel.SlotCtx, tx *solana.Transaction, instrs []
 		}()
 	}
 
+	if slotCtx == nil || tx == nil || len(tx.Message.AccountKeys) == 0 || computeBudgetLimits == nil {
+		return nil, fees.ErrFeePayerNotFound
+	}
 	txFeeInfo := fees.CalculateTxFees(tx, instrs, computeBudgetLimits, slotCtx.Features)
 
 	payerAcctKey := tx.Message.AccountKeys[0]
 	p, err := slotCtx.GetAccount(payerAcctKey)
 	if err != nil {
-		panic(fmt.Sprintf("unable to get slot account to update payer acct state after failed tx: %s", err))
+		if slotCtx.UnrootedRead == nil && slotCtx.AccountsDb == nil {
+			if recordMetrics {
+				metrics.GlobalBlockReplay.TxFailedPublicationPreparation.AddTimingSince(preparationStart)
+			}
+			return nil, fees.ErrFeePayerNotFound
+		}
+		p, err = slotCtx.GetAccountFromAccountsDb(payerAcctKey)
+		if err != nil {
+			if recordMetrics {
+				metrics.GlobalBlockReplay.TxFailedPublicationPreparation.AddTimingSince(preparationStart)
+			}
+			return nil, fees.ErrFeePayerNotFound
+		}
 	}
 
-	if txFeeInfo.TotalFee > p.Lamports {
+	rentSysvar := fees.RentForSlot(slotCtx)
+	if err := fees.ValidateFeePayerWithFeatures(p, txFeeInfo.TotalFee, rentSysvar, slotCtx.Features); err != nil {
 		if recordMetrics {
 			metrics.GlobalBlockReplay.TxFailedPublicationPreparation.AddTimingSince(preparationStart)
 		}
-		return nil, sealevel.InstrErrInsufficientFunds
+		return nil, err
 	}
 
 	if recordMetrics {
 		metrics.GlobalBlockReplay.TxFailedPublicationPreparation.AddTimingSince(preparationStart)
+	}
+	originalRentEpoch := p.RentEpoch
+	if p.RentEpoch != math.MaxUint64 && rentSysvar.IsExempt(p.Lamports, uint64(len(p.Data))) {
+		p.RentEpoch = math.MaxUint64
 	}
 	var payerStart time.Time
 	if recordMetrics {
 		payerStart = time.Now()
 	}
 	p.Lamports -= txFeeInfo.TotalFee
+	// Agave's ordinary-blockhash rollback preserves the payer's originally
+	// loaded rent epoch. Durable-nonce rollback intentionally keeps the
+	// normalized epoch alongside the advanced nonce state.
+	if sealevel.IsRecentBlockhashTransaction(tx, slotCtx) {
+		p.RentEpoch = originalRentEpoch
+	}
 	err = slotCtx.SetAccount(payerAcctKey, p)
 	if err != nil {
 		panic(fmt.Sprintf("unable to set slot account to update state of payer acct after failed t: %s", err))
@@ -582,24 +695,6 @@ func verifySignatureBatch(group []sigverifyJob, batch *sigverify.Batch) {
 	statsd.Count(statsd.ReplaySigverifyGroupSignatures, int64(batch.Len()), nil)
 }
 
-func cloneTransaction(tx *solana.Transaction) (*solana.Transaction, error) {
-	if tx == nil {
-		return nil, nil
-	}
-
-	raw, err := tx.MarshalBinary()
-	if err != nil {
-		return nil, err
-	}
-
-	cloned, err := solana.TransactionFromBytes(raw)
-	if err != nil {
-		return nil, err
-	}
-
-	return cloned, nil
-}
-
 func processTransactionComputeUnits(execCtx *sealevel.ExecutionCtx) uint64 {
 	if execCtx == nil {
 		return 0
@@ -715,10 +810,23 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 				}
 			}
 		}
+		if output.ProcessedAsNoOp {
+			var computeUnits uint64
+			if computeBudgetLimits != nil {
+				computeUnits = uint64(computeBudgetLimits.ComputeUnitLimit)
+			}
+			return output.FeeInfo, computeUnits, txErr.InstructionError
+		}
 
 		switch txErr.ErrorType {
 		case TransactionErrorSanitizeFailure:
-			return nil, processTransactionComputeUnits(execCtx), txErr.InstructionError
+			if txErr.InstructionError != nil {
+				return nil, processTransactionComputeUnits(execCtx), txErr.InstructionError
+			}
+			return nil, processTransactionComputeUnits(execCtx), TxErrSanitizeFailure
+
+		case TransactionErrorUnsupportedVersion:
+			return nil, processTransactionComputeUnits(execCtx), TxErrUnsupportedVersion
 
 		case TransactionErrorBlockhashNotFound:
 			return nil, processTransactionComputeUnits(execCtx), TxErrInvalidBlockhash
@@ -730,8 +838,9 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 			return txFeeInfo, processTransactionComputeUnits(execCtx), err
 
 		case TransactionErrorInsufficientFundsForFee:
-			// CalculateAndDeductTxFees failed - return fee info with nil error (matches original behavior)
-			return output.FeeInfo, processTransactionComputeUnits(execCtx), nil
+			// A fee-payer validation failure is unprocessable unless SIMD-0290
+			// converted it to the no-op result handled above.
+			return nil, processTransactionComputeUnits(execCtx), txErr.InstructionError
 
 		case TransactionErrorInstructionError:
 			txFeeInfo, err := handleFailedTx(slotCtx, tx, instrs, computeBudgetLimits, txErr.InstructionError, nil)

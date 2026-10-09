@@ -134,7 +134,7 @@ func TestParentDerivedBankLoadsLifecycleSysvarsFromExactSnapshot(t *testing.T) {
 		LeaderScheduleSlotOffset: 0, // deliberately stale external schedule
 	}
 	_, parentAccts, _, childSnapshot, err := loadBlockAccountsAndUpdateSysvars(
-		&parentSnapshotOnlySource{t: t}, block, epochSchedule, true, parentSnapshot,
+		&parentSnapshotOnlySource{t: t}, block, epochSchedule, true, parentSnapshot, nil,
 	)
 	require.NoError(t, err)
 

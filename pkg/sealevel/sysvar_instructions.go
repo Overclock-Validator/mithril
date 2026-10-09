@@ -2,6 +2,8 @@ package sealevel
 
 import (
 	"encoding/binary"
+	"errors"
+	"math"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	a "github.com/Overclock-Validator/mithril/pkg/addresses"
@@ -16,13 +18,23 @@ var SysvarInstructionsAddr = base58.MustDecodeFromString(SysvarInstructionsAddrS
 var instructionSysvarAcctMetaIsSigner = byte(0b00000001)
 var instructionSysvarAcctMetaIsWritable = byte(0b00000010)
 
-func instructionsMarshaledSize(instructions []Instruction) uint64 {
+var ErrInstructionsSysvarInstructionIndexOutOfBounds = errors.New("instructions sysvar instruction index out of bounds")
+
+func instructionsMarshaledSize(instructions []Instruction) (uint64, error) {
 	var marshaledSize uint64
 
 	marshaledSize += 2                             // num_instructions
 	marshaledSize += uint64(2 * len(instructions)) // instruction offsets
 
 	for _, instr := range instructions {
+		// The instructions sysvar stores every instruction's start offset as a
+		// u16. Match Agave's construct_instructions_data behavior: the final
+		// instruction may extend beyond 64 KiB, but no instruction may start
+		// beyond the largest representable offset.
+		if marshaledSize > math.MaxUint16 {
+			return 0, ErrInstructionsSysvarInstructionIndexOutOfBounds
+		}
+
 		marshaledSize += 2                                                          // num_accounts
 		marshaledSize += uint64(len(instr.Accounts) * (1 + solana.PublicKeyLength)) // flags (i.e. is_signer, is_writeable) + pubkey len
 
@@ -33,11 +45,14 @@ func instructionsMarshaledSize(instructions []Instruction) uint64 {
 
 	marshaledSize += 2 // current_instr_id
 
-	return marshaledSize
+	return marshaledSize, nil
 }
 
-func marshalInstructions(instructions []Instruction) []byte {
-	serializedLen := instructionsMarshaledSize(instructions)
+func marshalInstructions(instructions []Instruction) ([]byte, error) {
+	serializedLen, err := instructionsMarshaledSize(instructions)
+	if err != nil {
+		return nil, err
+	}
 	data := make([]byte, serializedLen)
 
 	var offset uint64
@@ -90,11 +105,14 @@ func marshalInstructions(instructions []Instruction) []byte {
 
 	binary.LittleEndian.PutUint16(data[offset:], 0)
 
-	return data
+	return data, nil
 }
 
-func MakeInstructionsSysvarAccount(instructions []Instruction) *accounts.Account {
-	serializedData := marshalInstructions(instructions)
+func MakeInstructionsSysvarAccount(instructions []Instruction) (*accounts.Account, error) {
+	serializedData, err := marshalInstructions(instructions)
+	if err != nil {
+		return nil, err
+	}
 
 	instructionsAcct := accounts.Account{}
 	instructionsAcct.Key = SysvarInstructionsAddr
@@ -104,5 +122,5 @@ func MakeInstructionsSysvarAccount(instructions []Instruction) *accounts.Account
 	instructionsAcct.Executable = false
 	instructionsAcct.Owner = a.SysvarOwnerAddr
 
-	return &instructionsAcct
+	return &instructionsAcct, nil
 }

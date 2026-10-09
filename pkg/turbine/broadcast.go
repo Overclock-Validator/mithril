@@ -3,7 +3,6 @@ package turbine
 import (
 	"fmt"
 	"net"
-	"sort"
 	"sync"
 
 	"github.com/gagliardetto/solana-go"
@@ -116,8 +115,8 @@ type BroadcastSessionConfig struct {
 	// It seeds the chained merkle root embedded in this slot's first FEC batch.
 	ParentChainedMerkleRoot solana.Hash
 	Broadcaster             PacketBroadcaster
-	UserAgent                 []byte
-	Version                   uint16
+	UserAgent               []byte
+	Version                 uint16
 }
 
 func NewBroadcastSession(cfg BroadcastSessionConfig) *BroadcastSession {
@@ -192,7 +191,7 @@ func (s *BroadcastSession) broadcastComponent(component BlockComponent, isLastIn
 	if s.broadcaster == nil {
 		return nil
 	}
-	batch, nextData, nextCode, err := s.shredder.MakeMerkleShredsFromComponent(
+	batch, nextData, nextCode, err := s.shredder.makeMerklePacketsFromComponent(
 		s.leader,
 		component,
 		isLastInSlot,
@@ -203,44 +202,9 @@ func (s *BroadcastSession) broadcastComponent(component BlockComponent, isLastIn
 	if err != nil {
 		return err
 	}
-	s.chainedMerkleRoot = batch.ChainedMerkleRoot
+	s.chainedMerkleRoot = batch.chainedMerkleRoot
 	s.nextDataIndex = nextData
 	s.nextCodeIndex = nextCode
-	if len(batch.DataShreds) > 0 {
-		s.fecSetRoots = appendFECSetMerkleRoots(s.fecSetRoots, batch.DataShreds)
-	}
-	return s.broadcaster.Broadcast(batch.Packets)
-}
-
-func appendFECSetMerkleRoots(roots []solana.Hash, dataShreds []*Shred) []solana.Hash {
-	if len(dataShreds) == 0 {
-		return roots
-	}
-	indices := make([]uint32, 0)
-	seen := make(map[uint32]struct{})
-	for _, shred := range dataShreds {
-		if shred == nil {
-			continue
-		}
-		if _, ok := seen[shred.FECSetIndex]; ok {
-			continue
-		}
-		seen[shred.FECSetIndex] = struct{}{}
-		indices = append(indices, shred.FECSetIndex)
-	}
-	sort.Slice(indices, func(i, j int) bool { return indices[i] < indices[j] })
-	for _, fecSetIndex := range indices {
-		for _, shred := range dataShreds {
-			if shred == nil || shred.FECSetIndex != fecSetIndex {
-				continue
-			}
-			root, err := shred.MerkleRoot()
-			if err != nil {
-				continue
-			}
-			roots = append(roots, root)
-			break
-		}
-	}
-	return roots
+	s.fecSetRoots = append(s.fecSetRoots, batch.fecSetRoots...)
+	return s.broadcaster.Broadcast(batch.packets)
 }

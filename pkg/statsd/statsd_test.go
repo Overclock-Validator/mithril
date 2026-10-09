@@ -203,6 +203,10 @@ func TestTurbinePipelineDurationMetricsUseSecondsAndBoundedSchema(t *testing.T) 
 		TurbineBlockDecode,
 		TurbineTransactionParse,
 		TurbineTransactionSigverify,
+		TurbineEarlyTransactionParse,
+		TurbineEarlyTransactionSigverify,
+		TurbineEarlyPreparationWait,
+		TurbineFullToReady,
 		TurbineReplayAdmission,
 	}
 	duration := 25 * time.Millisecond
@@ -226,6 +230,11 @@ func TestTurbinePipelineDurationMetricsUseSecondsAndBoundedSchema(t *testing.T) 
 			assert.InDelta(t, duration.Seconds(), after.GetHistogram().GetSampleSum()-before.GetHistogram().GetSampleSum(), 1e-12)
 		})
 	}
+}
+
+func TestTurbineEarlyVerifiedTransactionsHasBoundedCountSchema(t *testing.T) {
+	assert.Equal(t, CountT, MetricToType[TurbineEarlyVerifiedTransactions])
+	assert.Equal(t, []string{}, MetricToLabels[TurbineEarlyVerifiedTransactions])
 }
 
 func TestBlockProductionMetricLabelsStayBounded(t *testing.T) {

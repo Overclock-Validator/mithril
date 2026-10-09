@@ -1,0 +1,323 @@
+package turbine
+
+import (
+	"context"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+	"weak"
+
+	"github.com/Overclock-Validator/mithril/pkg/block"
+	"github.com/gagliardetto/solana-go"
+	"github.com/stretchr/testify/require"
+)
+
+func nextStreamEvent(t *testing.T, ch <-chan StreamEvent, kind StreamEventKind) StreamEvent {
+	t.Helper()
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case event := <-ch:
+			event, live := event.Resolve()
+			if !live {
+				continue
+			}
+			if event.Kind == kind {
+				return event
+			}
+		case <-deadline:
+			t.Fatalf("no stream event of kind %d", kind)
+		}
+	}
+}
+
+// The feed publishes each prefetched batch once it is decoded — the header
+// marker with its parent identity, then entry batches whose transactions are
+// the very objects the completed block references — and ends with a
+// completion event for the same generation. The final component (the ending
+// tick) is decoded by completion, never by the prefetch, so it is not fed.
+func TestStreamFeedPublishesBatchesAndCompletion(t *testing.T) {
+	// The production verifier (nil hook) is the one that attaches message
+	// identities; a per-transaction hook verifies without producing them.
+	v := newTransactionVerifier(2, 16, nil)
+	defer v.closeAndWait()
+	a := NewSlotAssembler()
+	p := newEntryPrefetchPool(context.Background(), a, v)
+	defer p.closeAndWait()
+	events := make(chan StreamEvent, 64)
+	a.SubscribeStream(events)
+
+	const slot = 300
+	parentID := solana.Hash{9, 9, 9}
+	batches := prefetchTestShreds(t, slot,
+		testAlpenglowParentMarkerBytes(blockMarkerVariantHeader, slot-1, parentID),
+		prefetchTestPayload(t, verifierSignedTransactions(t, 3)),
+		prefetchTestPayload(t, verifierSignedTransactions(t, 4)),
+		buildAlpenglowEndingTick(t))
+	require.Nil(t, feedPrefetchShreds(t, a, batches[0]))
+	header := nextStreamEvent(t, events, StreamBatchReady)
+	require.Equal(t, uint64(slot), header.Slot)
+	require.False(t, header.Generation.IsZero())
+	require.Equal(t, StreamMarkerHeader, header.Batch.Marker)
+	require.Equal(t, uint64(slot-1), header.Batch.ParentSlot)
+	require.Equal(t, parentID, header.Batch.ParentBlockID)
+	require.Empty(t, header.Batch.Transactions)
+	_, verified, err := header.Batch.WaitVerification(context.Background())
+	require.NoError(t, err)
+	require.False(t, verified, "markers carry no verification")
+
+	require.Nil(t, feedPrefetchShreds(t, a, batches[1]))
+	first := nextStreamEvent(t, events, StreamBatchReady)
+	require.Equal(t, header.Generation, first.Generation)
+	require.Equal(t, batches[1][0].Index, first.Batch.Start)
+	require.Equal(t, StreamMarkerNone, first.Batch.Marker)
+	require.Len(t, first.Batch.Transactions, 3)
+	require.NoError(t, first.Batch.Err)
+	require.Equal(t, StreamActive, a.StreamStatusOf(first.Generation))
+
+	identities, verified, err := first.Batch.WaitVerification(context.Background())
+	require.NoError(t, err)
+	require.True(t, verified)
+	require.Len(t, identities, 3)
+	prepared, err := block.PrepareVerifiedTransactionMessageIdentities(first.Batch.Transactions, identities)
+	require.NoError(t, err)
+	require.Equal(t, 3, prepared.Len())
+
+	// Recovery path: the pending list must show the same batches by range.
+	pending := a.PendingStreamBatches(first.Generation, 0)
+	require.Len(t, pending, 2)
+	require.Equal(t, header.Batch.Start, pending[0].Start)
+	require.Equal(t, first.Batch.Start, pending[1].Start)
+	require.Equal(t, first.Batch.End, pending[1].End)
+	require.Empty(t, a.PendingStreamBatches(first.Generation, first.Batch.End+1))
+
+	require.Nil(t, feedPrefetchShreds(t, a, batches[2]))
+	second := nextStreamEvent(t, events, StreamBatchReady)
+	require.Equal(t, first.Generation, second.Generation)
+	require.Len(t, second.Batch.Transactions, 4)
+	// Make sure the prefetch has retained both entry batches before the last
+	// component completes the slot; completion then reuses them by identity.
+	waitPrefetchedBatch(t, a, slot, second.Batch.Start)
+
+	blk := feedPrefetchShreds(t, a, batches[3])
+	require.NotNil(t, blk)
+	done := nextStreamEvent(t, events, StreamCompleted)
+	require.Equal(t, first.Generation, done.Generation)
+	require.Equal(t, StreamDone, a.StreamStatusOf(first.Generation))
+	retained := a.PendingStreamBatches(first.Generation, first.Batch.Start)
+	require.Len(t, retained, 2, "completion preserves already-ready entry batches")
+	for i, batch := range retained {
+		ids, ok, err := batch.WaitVerification(context.Background())
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.Len(t, ids, len(batch.Transactions))
+		offset := 0
+		if i == 1 {
+			offset = 3
+		}
+		for j, tx := range batch.Transactions {
+			require.Same(t, blk.Transactions[offset+j], tx)
+		}
+	}
+
+	// Pointer identity: the prefix a streaming consumer executed is the block.
+	require.Len(t, blk.Transactions, 7)
+	for i, tx := range first.Batch.Transactions {
+		require.Same(t, tx, blk.Transactions[i])
+	}
+	for i, tx := range second.Batch.Transactions {
+		require.Same(t, tx, blk.Transactions[3+i])
+	}
+	require.Equal(t, uint64(slot-1), blk.SourceParentSlot)
+	require.True(t, blk.HasAlpenglowParentBlockID)
+	require.Equal(t, parentID, solana.Hash(blk.AlpenglowParentBlockID))
+	require.Zero(t, a.StreamDroppedEvents())
+}
+
+// A reset while a slot is streaming cancels the generation; re-assembling the
+// slot produces a different generation.
+func TestStreamFeedCancelsOnResetAndRenewsGeneration(t *testing.T) {
+	v := newTransactionVerifier(2, 16, func(*solana.Transaction) error { return nil })
+	defer v.closeAndWait()
+	a := NewSlotAssembler()
+	p := newEntryPrefetchPool(context.Background(), a, v)
+	defer p.closeAndWait()
+	events := make(chan StreamEvent, 64)
+	a.SubscribeStream(events)
+
+	const slot = 301
+	batches := prefetchTestShreds(t, slot,
+		prefetchTestPayload(t, verifierSignedTransactions(t, 2)),
+		prefetchTestPayload(t, verifierSignedTransactions(t, 2)))
+	require.Nil(t, feedPrefetchShreds(t, a, batches[0]))
+	first := nextStreamEvent(t, events, StreamBatchReady)
+
+	a.ResetSlot(slot)
+	cancelled := nextStreamEvent(t, events, StreamCancelled)
+	require.Equal(t, first.Generation, cancelled.Generation)
+	require.Equal(t, "reset", cancelled.Reason)
+	require.Equal(t, StreamGone, a.StreamStatusOf(first.Generation))
+	require.Empty(t, a.PendingStreamBatches(first.Generation, 0))
+
+	require.Nil(t, feedPrefetchShreds(t, a, batches[0]))
+	renewed := nextStreamEvent(t, events, StreamBatchReady)
+	require.NotEqual(t, first.Generation, renewed.Generation)
+	require.Equal(t, StreamActive, a.StreamStatusOf(renewed.Generation))
+}
+
+// Dropped wake-ups are counted and never lose state: the batches remain
+// discoverable through PendingStreamBatches.
+func TestStreamFeedDropsWakeupsWhenSubscriberIsFull(t *testing.T) {
+	v := newTransactionVerifier(2, 16, func(*solana.Transaction) error { return nil })
+	defer v.closeAndWait()
+	a := NewSlotAssembler()
+	p := newEntryPrefetchPool(context.Background(), a, v)
+	defer p.closeAndWait()
+	events := make(chan StreamEvent) // unbuffered and never drained: every send drops
+	a.SubscribeStream(events)
+
+	const slot = 302
+	batches := prefetchTestShreds(t, slot,
+		prefetchTestPayload(t, verifierSignedTransactions(t, 2)),
+		prefetchTestPayload(t, verifierSignedTransactions(t, 2)))
+	require.Nil(t, feedPrefetchShreds(t, a, batches[0]))
+	cached := waitPrefetchedBatch(t, a, slot, 0)
+	require.NotNil(t, cached)
+	require.Eventually(t, func() bool { return a.StreamDroppedEvents() >= 1 }, 3*time.Second, time.Millisecond)
+
+	a.mu.Lock()
+	state := a.slots[slot]
+	a.mu.Unlock()
+	g := StreamGeneration{slot: slot, state: state}
+	pending := a.PendingStreamBatches(g, 0)
+	require.Len(t, pending, 1)
+	require.Len(t, pending[0].Transactions, 2)
+}
+
+// Notifications must not own retired slots or decoded payloads. Conversely,
+// resolving a live event gives the consumer a strong polling handle.
+func TestStreamQueuedEventsDoNotRetainRetiredBuffers(t *testing.T) {
+	events := make(chan StreamEvent, 4)
+	publish := func() (weak.Pointer[slotState], weak.Pointer[prefetchedShredBatch]) {
+		a := NewSlotAssembler()
+		a.SubscribeStream(events)
+		batch := &prefetchedShredBatch{raw: make([]byte, 1<<20), marker: true}
+		state := &slotState{slot: 42, prefetch: &slotEntryPrefetch{batches: map[uint32]*prefetchedShredBatch{0: batch}}}
+		a.mu.Lock()
+		a.publishStreamBatchReadyLocked(state, batch)
+		a.publishStreamReleaseLocked(state, "reset")
+		a.mu.Unlock()
+		return weak.Make(state), weak.Make(batch)
+	}
+	state, batch := publish()
+	require.Eventually(t, func() bool {
+		runtime.GC()
+		return state.Value() == nil && batch.Value() == nil
+	}, 3*time.Second, time.Millisecond)
+	require.Len(t, events, 2)
+	for len(events) > 0 {
+		_, live := (<-events).Resolve()
+		require.False(t, live)
+	}
+}
+
+func TestStreamResolvedEventRetainsCompletedPollingState(t *testing.T) {
+	a := NewSlotAssembler()
+	events := make(chan StreamEvent, 2)
+	a.SubscribeStream(events)
+	ready := make(chan struct{})
+	close(ready)
+	batch := &prefetchedShredBatch{ready: ready, marker: true}
+	state := &slotState{slot: 42, streamCompleted: true, prefetch: &slotEntryPrefetch{batches: map[uint32]*prefetchedShredBatch{0: batch}, released: true}}
+	a.mu.Lock()
+	a.publishStreamBatchReadyLocked(state, batch)
+	a.publishStreamReleaseLocked(state, "")
+	a.mu.Unlock()
+	event, live := (<-events).Resolve()
+	require.True(t, live)
+	runtime.GC()
+	require.Equal(t, StreamDone, a.StreamStatusOf(event.Generation))
+	require.Len(t, a.PendingStreamBatches(event.Generation, 0), 1)
+	done, live := (<-events).Resolve()
+	require.True(t, live)
+	require.Equal(t, event.Generation, done.Generation)
+	require.Equal(t, StreamCompleted, done.Kind)
+}
+
+// The streaming observer must return while the owning request is still running.
+// Completion/cleanup retain the separate joining wait and own buffer lifetime.
+func TestStreamVerificationTimeoutDoesNotCancelOrJoinOwner(t *testing.T) {
+	done := make(chan struct{})
+	var closeOnce sync.Once
+	defer closeOnce.Do(func() { close(done) })
+	var cancelled atomic.Bool
+	future := &transactionVerification{done: done, cancel: func() { cancelled.Store(true) }}
+	batch := &StreamBatch{batch: &prefetchedShredBatch{verification: future}}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	returned := make(chan error, 1)
+	go func() { _, _, err := batch.WaitVerification(ctx); returned <- err }()
+	select {
+	case err := <-returned:
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+	case <-time.After(3 * time.Second):
+		t.Fatal("observer waited for unfinished owner")
+	}
+	require.False(t, cancelled.Load(), "observer must not cancel completion's shared work")
+	closeOnce.Do(func() { close(done) })
+	_, verified, err := batch.WaitVerification(context.Background())
+	require.NoError(t, err)
+	require.True(t, verified, "same request remains usable after the observer leaves")
+}
+
+func TestStreamPollingReusesTransactionView(t *testing.T) {
+	v := newTransactionVerifier(2, 16, nil)
+	defer v.closeAndWait()
+	a := NewSlotAssembler()
+	p := newEntryPrefetchPool(context.Background(), a, v)
+	defer p.closeAndWait()
+	batches := prefetchTestShreds(t, 812, prefetchTestPayload(t, verifierSignedTransactions(t, 3)), buildAlpenglowEndingTick(t))
+	require.Nil(t, feedPrefetchShreds(t, a, batches[0]))
+	waitPrefetchedBatch(t, a, 812, 0)
+	a.mu.Lock()
+	g := StreamGeneration{slot: 812, state: a.slots[812]}
+	a.mu.Unlock()
+	first, second := a.PendingStreamBatches(g, 0), a.PendingStreamBatches(g, 0)
+	require.Len(t, first, 1)
+	require.Len(t, second, 1)
+	require.Len(t, first[0].Transactions, 3)
+	require.Same(t, &first[0].Transactions[0], &second[0].Transactions[0])
+}
+
+func TestCompletedStreamCancelledWhenDeliveryAbandoned(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		a := &SlotAssembler{slots: make(map[uint64]*slotState)}
+		events := make(chan StreamEvent, 2)
+		a.SubscribeStream(events)
+		g := NewDetachedStreamGeneration(101)
+		g.state.streamCompleted = true
+		replacement := NewDetachedStreamGeneration(101)
+		a.slots[101] = replacement.state
+		r := &UDPReceiver{assembler: a, blocks: make(chan *block.Block), pendingBlocks: make(map[uint64]int)}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		result := slotCompletionResult{block: &block.Block{Slot: 101}, generation: g, pending: true}
+		r.startPendingBlock(101)
+		if queued {
+			results := make(chan slotCompletionResult, 1)
+			results <- result
+			close(results)
+			r.consumeCompletionResults(ctx, results)
+		} else {
+			require.False(t, r.handleCompletionResult(ctx, result))
+		}
+		require.Equal(t, StreamGone, a.StreamStatusOf(g))
+		require.Equal(t, StreamActive, a.StreamStatusOf(replacement))
+		require.Empty(t, r.pendingBlocks)
+		event := nextStreamEvent(t, events, StreamCancelled)
+		require.Equal(t, g, event.Generation)
+		require.Equal(t, "delivery_cancelled", event.Reason)
+	}
+}

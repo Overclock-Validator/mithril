@@ -79,41 +79,6 @@ type leaderSlotFailure struct {
 	detail string
 }
 
-// ShredSink shreds forged entry batches and broadcasts them via turbine.
-type ShredSink struct {
-	session *turbine.BroadcastSession
-	mu      sync.Mutex
-	err     error
-}
-
-func NewShredSink(session *turbine.BroadcastSession) *ShredSink {
-	return &ShredSink{session: session}
-}
-
-func (s *ShredSink) OnEntryBatch(entries []turbine.Entry, _ int) {
-	if s.session == nil || len(entries) == 0 {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.err != nil {
-		return
-	}
-	if err := s.session.BroadcastEntryBatch(entries); err != nil {
-		s.err = err
-		mlog.Log.Warnf("blockprod shred broadcast entry batch failed: %v", err)
-	}
-}
-
-func (s *ShredSink) Err() error {
-	if s == nil {
-		return nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.err
-}
-
 // LeaderLoop activates forge when this validator is the scheduled leader.
 // RewardCertBuilder produces skip/notar reward certificates for block footers.
 type RewardCertBuilder interface {
@@ -132,17 +97,19 @@ type LeaderLoop struct {
 	alpenglowClock   bool
 	parentContext    func(uint64) ParentContext
 	productionParent func(uint64) alpenglow.BlockProductionParent
+	canSignSlot      func(uint64) bool
 	onBlock          func(*b.Block)
 	commitLeaderSlot func(replay.CommitLeaderInput) (*sealevel.SlotCtx, error)
 
 	currentSlot   func() uint64
 	leaderForSlot func(uint64) (solana.PublicKey, bool)
 
-	pollInterval    time.Duration
-	slotDuration    time.Duration
-	now             func() time.Time
-	tickStartedAt   time.Time
-	tickDeliveryLag time.Duration
+	pollInterval      time.Duration
+	slotDuration      time.Duration
+	completionReserve time.Duration
+	now               func() time.Time
+	tickStartedAt     time.Time
+	tickDeliveryLag   time.Duration
 
 	mu                      sync.Mutex
 	activeSlot              uint64
@@ -180,6 +147,7 @@ type LeaderLoopConfig struct {
 	AlpenglowClock   bool
 	ParentContext    func(uint64) ParentContext
 	ProductionParent func(slot uint64) alpenglow.BlockProductionParent
+	CanSignSlot      func(slot uint64) bool
 	OnBlock          func(*b.Block)
 	CurrentSlot      func() uint64
 	LeaderForSlot    func(uint64) (solana.PublicKey, bool)
@@ -189,7 +157,10 @@ type LeaderLoopConfig struct {
 	RewardCerts   RewardCertBuilder
 	PollInterval  time.Duration
 	SlotDuration  time.Duration
-	Now           func() time.Time
+	// CompletionReserve is time retained for finalization and broadcast. Zero
+	// uses the conservative default; tune only from measured completion times.
+	CompletionReserve time.Duration
+	Now               func() time.Time
 }
 
 func NewLeaderLoop(cfg LeaderLoopConfig) *LeaderLoop {
@@ -205,6 +176,9 @@ func NewLeaderLoop(cfg LeaderLoopConfig) *LeaderLoop {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	if cfg.CompletionReserve <= 0 {
+		cfg.CompletionReserve = leaderBlockCompletionReserve
+	}
 	return &LeaderLoop{
 		controller:          cfg.Controller,
 		identity:            cfg.Identity,
@@ -216,12 +190,14 @@ func NewLeaderLoop(cfg LeaderLoopConfig) *LeaderLoop {
 		alpenglowClock:      cfg.AlpenglowClock,
 		parentContext:       cfg.ParentContext,
 		productionParent:    cfg.ProductionParent,
+		canSignSlot:         cfg.CanSignSlot,
 		onBlock:             cfg.OnBlock,
 		currentSlot:         cfg.CurrentSlot,
 		leaderForSlot:       cfg.LeaderForSlot,
 		rewardCerts:         cfg.RewardCerts,
 		pollInterval:        cfg.PollInterval,
 		slotDuration:        cfg.SlotDuration,
+		completionReserve:   cfg.CompletionReserve,
 		now:                 cfg.Now,
 		finishedLeaderSlots: make(map[uint64]struct{}),
 		pendingFailures:     make(map[uint64]leaderSlotFailure),
@@ -364,9 +340,11 @@ func (l *LeaderLoop) tickScheduled(scheduledAt time.Time) {
 		delete(l.pendingFailures, targetSlot)
 		openedAt := l.now()
 		l.recordTickTimingLocked(openedAt, "opened")
-		mlog.Log.InfofPrecise("ALPENGLOW block production: opened local leader slot=%d parent_slot=%d replay_frontier=%d live_slot=%d start_slot_ms=%d%s",
+		limits := l.activeBank.CostTracker().Limits()
+		mlog.Log.InfofPrecise("ALPENGLOW block production: opened local leader slot=%d parent_slot=%d replay_frontier=%d live_slot=%d start_slot_ms=%d block_cost_limit=%d account_cost_limit=%d entry_bytes_limit=%d%s",
 			targetSlot, l.parentCtx.ParentSlot, global.ReplayFrontier(), wallSlot,
-			startDuration.Milliseconds(), l.productionStartTimingDetailLocked(targetSlot, openedAt))
+			startDuration.Milliseconds(), limits.BlockCost, limits.WritableAccountCost, limits.MaxEntryBytes,
+			l.productionStartTimingDetailLocked(targetSlot, openedAt))
 
 		return
 	}
@@ -621,7 +599,10 @@ func (l *LeaderLoop) productionWindowDeadlineLocked(slot uint64) time.Time {
 	if deadline.IsZero() {
 		return time.Time{}
 	}
-	reserve := leaderBlockCompletionReserve
+	reserve := l.completionReserve
+	if reserve <= 0 {
+		reserve = leaderBlockCompletionReserve
+	}
 	if reserve >= l.slotDuration {
 		reserve = l.slotDuration / 4
 	}
@@ -751,6 +732,9 @@ func (l *LeaderLoop) abortActiveSlotLocked() {
 	}
 	if l.activeBank != nil {
 		l.activeBank.Close()
+	}
+	if l.activeSink != nil {
+		l.activeSink.Discard()
 	}
 	l.activeBank = nil
 	l.activeSess = nil
@@ -983,6 +967,7 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 		l.abortActiveSlotLocked()
 		return
 	}
+	l.activeSink.Wait()
 	if err := l.activeSink.Err(); err != nil {
 		l.failProductionWindowLocked(slot, leaderReasonEntryBroadcastFailed, err.Error())
 		l.abortActiveSlotLocked()
@@ -1060,6 +1045,8 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 		l.abortActiveSlotLocked()
 		return
 	}
+	// Ending tick is the last-in-slot shred. Mid-slot entry batches are only
+	// emitted when they fill a FEC set; Freeze already flushed any leftover.
 	if err := l.activeSess.BroadcastEndingTickLast(tickHash); err != nil {
 		l.failProductionWindowLocked(slot, leaderReasonEndingTickBroadcastFailed, err.Error())
 		l.abortActiveSlotLocked()
@@ -1082,6 +1069,7 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 		producedBlock.HasAlpenglowLastChainedRoot = true
 		global.SetAlpenglowChainedMerkleRoot(slot, chained)
 	}
+	replay.RegisterLocalLeaderCommit(l.activeBank.SlotCtx())
 	if l.onBlock != nil {
 		handoffStartedAt := l.now()
 		l.onBlock(producedBlock)
@@ -1129,6 +1117,9 @@ func (l *LeaderLoop) revalidateProductionParentForStartLocked(slot uint64, selec
 }
 
 func (l *LeaderLoop) startSlotLocked(slot uint64) error {
+	if l.canSignSlot != nil && !l.canSignSlot(slot) {
+		return fmt.Errorf("%w: waiting for durable signing reservation", errParentNotReady)
+	}
 	selectedParent, parentReadyRequired, err := l.resolveProductionParent(slot)
 	if err != nil {
 		return err
@@ -1233,12 +1224,16 @@ func (l *LeaderLoop) startSlotLocked(slot uint64) error {
 	if startEntryHash == (solana.Hash{}) {
 		startEntryHash = parentCtx.ParentBankhash
 	}
+	limits, err := costmodel.LimitsForSlot(slotCtx.Features, epochSchedule, slot)
+	if err != nil {
+		return fmt.Errorf("leader slot limits: %w", err)
+	}
 	sink := NewShredSink(session)
 	bank := NewWorkingBank(BankConfig{
 		SlotCtx:             slotCtx,
 		Slot:                slot,
 		Leader:              l.identity.PublicKey(),
-		Limits:              costmodel.DefaultLimits(),
+		Limits:              limits,
 		EntryHash:           startEntryHash,
 		Sink:                sink,
 		TransactionStatuses: parentCtx.TransactionStatuses,

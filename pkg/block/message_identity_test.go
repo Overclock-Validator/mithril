@@ -142,7 +142,9 @@ func TestFixupTxVersionsInvalidatesTransactionDerivedState(t *testing.T) {
 	}
 	block.MarkTransactionSignaturesVerified()
 
-	block.FixupTxVersions()
+	if err := block.FixupTxVersions(); err != nil {
+		t.Fatalf("fix up transaction versions: %v", err)
+	}
 
 	if tx.Message.GetVersion() != solana.MessageVersionV0 {
 		t.Fatalf("message version = %d, want v0", tx.Message.GetVersion())
@@ -159,5 +161,42 @@ func TestFixupTxVersionsInvalidatesTransactionDerivedState(t *testing.T) {
 	}
 	if before.Identity(0) == after.Identity(0) {
 		t.Fatal("legacy and v0 canonical messages produced the same identity")
+	}
+}
+
+func TestFixupTxVersionsRejectsMismatchedMetadata(t *testing.T) {
+	block := &Block{
+		Transactions: []*solana.Transaction{identityTestTransaction(1)},
+		Versions:     []uint8{uint8(solana.MessageVersionLegacy), uint8(solana.MessageVersionV0)},
+	}
+	if err := block.FixupTxVersions(); err == nil {
+		t.Fatal("mismatched transaction-version metadata was accepted")
+	}
+}
+
+func TestFixupTxVersionsFailureIsAtomic(t *testing.T) {
+	first := identityTestTransaction(1)
+	second := identityTestTransaction(2)
+	block := &Block{
+		Transactions: []*solana.Transaction{first, second},
+		Versions:     []uint8{uint8(solana.MessageVersionV0), 99},
+	}
+	if _, err := block.PrepareTransactionMessageIdentities(); err != nil {
+		t.Fatalf("prepare identities: %v", err)
+	}
+	prepared := block.transactionDerivedState.messageIdentities
+	block.MarkTransactionSignaturesVerified()
+
+	if err := block.FixupTxVersions(); err == nil {
+		t.Fatal("invalid transaction version was accepted")
+	}
+	if first.Message.GetVersion() != solana.MessageVersionLegacy || second.Message.GetVersion() != solana.MessageVersionLegacy {
+		t.Fatal("failed fixup partially changed transaction versions")
+	}
+	if block.transactionDerivedState.messageIdentities != prepared {
+		t.Fatal("failed fixup invalidated prepared identities")
+	}
+	if !block.TransactionSignaturesVerified() {
+		t.Fatal("failed fixup invalidated signature-verification trust")
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/migration"
 	bin "github.com/gagliardetto/binary"
+	"github.com/gagliardetto/solana-go"
 )
 
 const (
@@ -21,10 +22,12 @@ const (
 )
 
 type ComputeBudgetLimits struct {
-	UpdatedHeapBytes   uint32
-	ComputeUnitLimit   uint32
-	ComputeUnitPrice   uint64
-	LoadedAccountBytes uint32
+	UpdatedHeapBytes          uint32
+	ComputeUnitLimit          uint32
+	ComputeUnitPrice          uint64
+	LoadedAccountBytes        uint32
+	DirectPriorityFeeLamports uint64
+	UsesDirectPriorityFee     bool
 }
 
 const (
@@ -306,6 +309,49 @@ func ComputeBudgetExecuteInstructions(instructions []Instruction, f *features.Fe
 		ComputeUnitLimit: computeUnitLimit, ComputeUnitPrice: computeUnitPrice, LoadedAccountBytes: loadedAccountBytes}
 
 	return computeBudgetLimits, nil
+}
+
+// ComputeBudgetLimitsForTransaction returns the transaction's effective
+// resource limits. Legacy and v0 transactions configure their budget through
+// ComputeBudget program instructions. SIMD-0385 v1 transactions carry the
+// configuration inline; any ComputeBudget instructions in a v1 message are
+// deliberately ignored here and execute later as ordinary 150-CU no-ops.
+func ComputeBudgetLimitsForTransaction(tx *solana.Transaction, instructions []Instruction, f *features.Features) (*ComputeBudgetLimits, error) {
+	if tx == nil || tx.Message.GetVersion() != solana.MessageVersionV1 {
+		return ComputeBudgetExecuteInstructions(instructions, f)
+	}
+
+	config := tx.Message.TransactionConfig
+	heapBytes := uint32(MinHeapFrameBytes)
+	if config.HeapSize != nil {
+		heapBytes = *config.HeapSize
+		if !sanitizeRequestedHeapSize(heapBytes) {
+			return nil, fmt.Errorf("invalid v1 heap size %d", heapBytes)
+		}
+	}
+
+	var computeUnitLimit uint32
+	if config.ComputeUnitLimit != nil {
+		computeUnitLimit = min(*config.ComputeUnitLimit, uint32(MaxComputeUnitLimit))
+	}
+
+	var loadedAccountBytes uint32
+	if config.LoadedAccountsDataSizeLimit != nil {
+		loadedAccountBytes = min(*config.LoadedAccountsDataSizeLimit, uint32(MaxLoadedAccountsDataSizeBytes))
+	}
+
+	var priorityFee uint64
+	if config.PriorityFee != nil {
+		priorityFee = *config.PriorityFee
+	}
+
+	return &ComputeBudgetLimits{
+		UpdatedHeapBytes:          heapBytes,
+		ComputeUnitLimit:          computeUnitLimit,
+		LoadedAccountBytes:        loadedAccountBytes,
+		DirectPriorityFeeLamports: priorityFee,
+		UsesDirectPriorityFee:     true,
+	}, nil
 }
 
 func ComputeBudgetExecute(execCtx *ExecutionCtx) error {

@@ -214,6 +214,25 @@ func TestServeRepairWindowHighestAndPing(t *testing.T) {
 		t.Fatalf("BuildWindowIndexRequest: %v", err)
 	}
 	response := sendRepairRequest(t, client, server.Addr(), window)
+	challenge, ok := repairproto.DecodePing(response)
+	if !ok || challenge.From != serverKey {
+		t.Fatal("first request did not receive a signed source-address challenge")
+	}
+	// Forged pongs cannot authorize the source, and replaying a signed request
+	// before the challenge completes must not return a shred.
+	pongResponse, err := repairproto.BuildPong(clientIdentity, challenge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged := append([]byte(nil), pongResponse...)
+	forged[len(forged)-1] ^= 1
+	assertNoRepairResponse(t, client, server.Addr(), forged)
+	assertNoRepairResponse(t, client, server.Addr(), window)
+	if _, err := client.WriteToUDP(pongResponse, server.Addr()); err != nil {
+		t.Fatal(err)
+	}
+	waitForServeRepairStats(t, server, func(stats ServeRepairStats) bool { return stats.Pongs == 1 })
+	response = sendRepairRequest(t, client, server.Addr(), window)
 	assertRepairResponse(t, response, first.Payload, 0x11223344)
 
 	highest, err := repairproto.BuildHighestWindowIndexRequest(clientIdentity, serverKey, first.Slot, 0, 0x55667788)
@@ -255,11 +274,11 @@ func TestServeRepairWindowHighestAndPing(t *testing.T) {
 	assertNoRepairResponse(t, client, server.Addr(), badSignature)
 
 	waitForServeRepairStats(t, server, func(stats ServeRepairStats) bool {
-		return stats.Served == 2 && stats.Pings == 1 && stats.Pongs == 1 &&
-			stats.DropHeaderInvalid == 1 && stats.DropSignature == 1
+		return stats.Served == 2 && stats.Pings == 2 && stats.Pongs == 2 &&
+			stats.DropHeaderInvalid == 1 && stats.DropSignature == 2 && stats.DropUnverifiedPeer == 2
 	})
 	stats := server.Stats()
-	if stats.WindowIndex != 3 || stats.HighestWindowIndex != 1 {
+	if stats.WindowIndex != 5 || stats.HighestWindowIndex != 1 {
 		t.Fatalf("request-kind stats = window %d highest %d", stats.WindowIndex, stats.HighestWindowIndex)
 	}
 }

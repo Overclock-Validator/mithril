@@ -63,6 +63,44 @@ type Ping struct {
 	Signature gossip.Signature
 }
 
+type Pong struct {
+	From gossip.Pubkey
+	Hash gossip.Hash
+}
+
+// BuildPing returns the standard repair response challenge and the hash a
+// signed Pong must contain. Tokens come from the operating system RNG.
+func BuildPing(identity ed25519.PrivateKey) ([]byte, gossip.Hash, error) {
+	sender, err := senderPubkey(identity)
+	if err != nil {
+		return nil, gossip.Hash{}, err
+	}
+	var token [32]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return nil, gossip.Hash{}, err
+	}
+	packet := binary.LittleEndian.AppendUint32(nil, repairProtocolPingResponse)
+	packet = append(packet, sender[:]...)
+	packet = append(packet, token[:]...)
+	packet = append(packet, ed25519.Sign(identity, token[:])...)
+	return packet, hashPingToken(token), nil
+}
+
+// DecodePong verifies the original wire bytes with strict Ed25519 verification.
+// A valid signature still needs to match an outstanding source-address challenge.
+func DecodePong(packet []byte) (Pong, bool) {
+	if !IsPong(packet) {
+		return Pong{}, false
+	}
+	var pong Pong
+	copy(pong.From[:], packet[4:36])
+	copy(pong.Hash[:], packet[36:68])
+	if !narya.VerifyStrict(pong.From[:], pong.Hash[:], packet[68:132]) {
+		return Pong{}, false
+	}
+	return pong, true
+}
+
 func NewWindowIndexRequest(identity ed25519.PrivateKey, recipient gossip.Pubkey, slot uint64, shredIndex uint64) ([]byte, uint32, error) {
 	nonce, err := randomNonce()
 	if err != nil {

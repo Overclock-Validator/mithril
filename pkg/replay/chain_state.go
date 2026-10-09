@@ -128,6 +128,7 @@ func InitChainTip(acctsLtHash *lthash.LtHash, f *features.Features, prevNumSigs 
 // ResetChainTip invalidates producer parent state while replay is rewinding or
 // restarting. The next successfully replayed block installs a fresh snapshot.
 func ResetChainTip() {
+	ResetLocalLeaderCommits()
 	InitChainTip(nil, nil, 0, solana.Hash{})
 }
 
@@ -254,4 +255,25 @@ func ChainTipParentContext() ChainTipSnapshot {
 		ctx.NanosecondClockAccount = chainTipNanosecondClockAccount.Clone()
 	}
 	return ctx
+}
+
+// ChainTipFeatureActive reports the current replay tip's feature state without
+// cloning the full producer context. It is intended for hot admission paths,
+// such as TPU sigverify, that must follow bank feature activation even outside
+// this validator's leader windows.
+func ChainTipFeatureActive(gate features.FeatureGate) bool {
+	chainTipMu.RLock()
+	defer chainTipMu.RUnlock()
+	return chainTipFeatures != nil && chainTipFeatures.IsActive(gate)
+}
+
+// ChainTipFeatures returns an independent feature snapshot for queued transaction
+// preparation. Bank admission checks compatibility again before reuse.
+func ChainTipFeatures() *features.Features {
+	chainTipMu.RLock()
+	defer chainTipMu.RUnlock()
+	if chainTipFeatures == nil {
+		return nil
+	}
+	return chainTipFeatures.Clone()
 }

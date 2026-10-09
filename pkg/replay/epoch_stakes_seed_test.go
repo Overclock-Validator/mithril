@@ -4,10 +4,89 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/Overclock-Validator/mithril/pkg/accounts"
+	b "github.com/Overclock-Validator/mithril/pkg/block"
+	"github.com/Overclock-Validator/mithril/pkg/cu"
 	"github.com/Overclock-Validator/mithril/pkg/epochstakes"
 	"github.com/Overclock-Validator/mithril/pkg/global"
+	"github.com/Overclock-Validator/mithril/pkg/sbpf"
+	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/state"
+	"github.com/gagliardetto/solana-go"
+	"github.com/stretchr/testify/require"
 )
+
+func TestStartupEpochStakeSyscallUsesCurrentEffectiveStakes(t *testing.T) {
+	// Testnet slot 446988313 copied the total into a program account. Seeding
+	// execution from key E returned the previous total and diverged despite
+	// identical transaction outcomes, fees and compute units.
+	const previousTotal = uint64(361_336_206_088_827_916)
+	const currentTotal = uint64(383_027_894_827_581_045)
+	const epoch = uint64(91_001)
+	shared, previousOnly, currentOnly := solana.PublicKey{1}, solana.PublicKey{2}, solana.PublicKey{3}
+	encode := func(key, total uint64, stakes map[string]uint64) string {
+		data, err := json.Marshal(epochstakes.PersistedEpochStakes{Epoch: key, TotalStake: total, Stakes: stakes})
+		require.NoError(t, err)
+		return string(data)
+	}
+	seeds := map[uint64]string{
+		epoch:     encode(epoch, previousTotal, map[string]uint64{shared.String(): 10, previousOnly.String(): previousTotal - 10}),
+		epoch + 1: encode(epoch+1, currentTotal, map[string]uint64{shared.String(): 20, currentOnly.String(): currentTotal - 20}),
+	}
+	for _, mode := range []string{"snapshot", "same epoch resume", "resume after epoch boundary"} {
+		t.Run(mode, func(t *testing.T) {
+			for _, key := range []uint64{epoch, epoch + 1} {
+				global.ClearEpochStakes(key)
+				t.Cleanup(func() { global.ClearEpochStakes(key) })
+			}
+			ms := &state.MithrilState{ManifestEpochStakes: seeds}
+			var resume *ResumeState
+			snapshotEpoch := epoch
+			if mode == "same epoch resume" {
+				resume = &ResumeState{}
+			} else if mode == "resume after epoch boundary" {
+				ms.ManifestEpochStakes = nil
+				snapshotEpoch--
+				resume = &ResumeState{ComputedEpochStakes: map[uint64][]byte{
+					epoch: []byte(seeds[epoch]), epoch + 1: []byte(seeds[epoch+1]),
+				}}
+			}
+			require.NoError(t, LoadInitialEpochStakesCache(ms, resume, epoch, snapshotEpoch))
+			block := &b.Block{Epoch: epoch}
+			require.NoError(t, seedEpochStakesForExecution(block, block.Epoch))
+			slotCtx := newSlotCtx(block, accounts.NewMemAccounts(), accounts.NewMemAccounts(), nil, nil, 0)
+			execCtx := &sealevel.ExecutionCtx{SlotCtx: slotCtx, ComputeMeter: cu.NewComputeMeter(10_000)}
+			input := append(append(append([]byte(nil), shared[:]...), previousOnly[:]...), currentOnly[:]...)
+			vm := sbpf.NewInterpreter(&sbpf.Program{TextVA: sbpf.VaddrProgram, Funcs: map[uint32]int64{}}, &sbpf.VMOpts{
+				Input: input, Context: execCtx, ComputeMeter: &execCtx.ComputeMeter,
+			})
+			t.Cleanup(vm.Finish)
+			for _, query := range []struct{ address, want uint64 }{
+				{0, currentTotal},
+				{sbpf.VaddrInput, 20},
+				{sbpf.VaddrInput + 32, 0},
+				{sbpf.VaddrInput + 64, currentTotal - 20},
+			} {
+				got, err := sealevel.SyscallGetEpochStakeImpl(vm, query.address)
+				require.NoError(t, err)
+				require.Equal(t, query.want, got)
+			}
+			// Leader/consensus stakes retain the preceding generation under E.
+			require.Equal(t, previousTotal, global.EpochTotalStake(epoch))
+			require.Equal(t, uint64(10), global.EpochStakes(epoch)[shared])
+		})
+	}
+}
+
+func TestStartupEpochStakesRejectMissingCurrentGeneration(t *testing.T) {
+	const epoch = uint64(91_003)
+	global.PutEpochStakes(epoch, map[solana.PublicKey]uint64{{1}: 100}, nil, 100)
+	global.ClearEpochStakes(epoch + 1)
+	t.Cleanup(func() { global.ClearEpochStakes(epoch) })
+	block := &b.Block{Epoch: epoch}
+	require.ErrorContains(t, seedEpochStakesForExecution(block, block.Epoch), "cache key 91004")
+	require.Nil(t, block.EpochStakesPerVoteAcct, "must not substitute the previous generation")
+}
 
 func TestPrepareManifestEpochStakesForRuntimeRepairsPreviouslyRebasedDevnetFrame(t *testing.T) {
 	const (

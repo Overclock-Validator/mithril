@@ -136,13 +136,14 @@ func reportServerStats(ctx context.Context, svc *tpu.TPU, interval time.Duration
 
 			fmt.Fprintf(
 				os.Stdout,
-				"stats pps=%.0f gbps=%.3f sink=%d dedup_out=%d sigverify=%d sanitize_drop=%d dedup_drop=%d sig_drop=%d ingress_drop=%d open_conns=%d active_streams=%d\n",
+				"stats pps=%.0f gbps=%.3f sink=%d dedup_out=%d sigverify=%d sanitize_drop=%d version_drop=%d dedup_drop=%d sig_drop=%d ingress_drop=%d open_conns=%d active_streams=%d\n",
 				pps,
 				gbps,
 				packets,
 				stats.Pipeline.Dedup.OutPackets,
 				stats.Pipeline.Sigverify.VerifiedPackets,
 				stats.Pipeline.Dedup.DroppedSanitize,
+				stats.Pipeline.Dedup.DroppedUnsupportedVersion,
 				stats.Pipeline.Dedup.DroppedDedup,
 				stats.Pipeline.Sigverify.DroppedSigverify,
 				stats.Pipeline.Ingress.DroppedFull,

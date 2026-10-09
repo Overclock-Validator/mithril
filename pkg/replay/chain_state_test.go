@@ -2,6 +2,7 @@ package replay
 
 import (
 	"encoding/binary"
+	"sync"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
@@ -145,4 +146,49 @@ func TestInitChainTipFailsClosedWithoutCompleteReplayParent(t *testing.T) {
 	require.False(t, tip.HasAlpenglowBlockID)
 	require.False(t, tip.HasAlpenglowChainedMerkleRoot)
 	require.Nil(t, tip.PrevFeeGovernor)
+}
+
+func TestChainTipFeatureActiveTracksPublishedTip(t *testing.T) {
+	t.Cleanup(ResetChainTip)
+	ResetChainTip()
+	require.False(t, ChainTipFeatureActive(features.EnableTxV1))
+
+	feats := features.NewFeaturesDefault()
+	feats.EnableFeature(features.EnableTxV1, 42)
+	InitChainTip(nil, feats, 0, solana.Hash{})
+	require.True(t, ChainTipFeatureActive(features.EnableTxV1))
+
+	feats.DisableFeature(features.EnableTxV1)
+	// InitChainTip publishes a clone, so caller mutation cannot race with or
+	// alter the admission view.
+	require.True(t, ChainTipFeatureActive(features.EnableTxV1))
+	ResetChainTip()
+	require.False(t, ChainTipFeatureActive(features.EnableTxV1))
+}
+
+func TestChainTipFeatureActiveConcurrentPublication(t *testing.T) {
+	t.Cleanup(ResetChainTip)
+	active := features.NewFeaturesDefault()
+	active.EnableFeature(features.EnableTxV1, 1)
+	inactive := features.NewFeaturesDefault()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1_000; i++ {
+			if i%2 == 0 {
+				InitChainTip(nil, active, 0, solana.Hash{})
+			} else {
+				InitChainTip(nil, inactive, 0, solana.Hash{})
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10_000; i++ {
+			_ = ChainTipFeatureActive(features.EnableTxV1)
+		}
+	}()
+	wg.Wait()
 }

@@ -7,10 +7,12 @@ import (
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
+	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/rewards"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/state"
 	bin "github.com/gagliardetto/binary"
+	"github.com/gagliardetto/solana-go"
 	"github.com/mr-tron/base58"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -372,4 +374,26 @@ func assertUnwindFallbackReason(t *testing.T, want string, sw *CertifiedSwitch, 
 	assert.Nil(t, rs)
 	assert.Nil(t, bankSysvars)
 	assert.Equal(t, want, reason)
+}
+
+func TestUnwindPreservesPendingLeaderStakeEntries(t *testing.T) {
+	tail := newUnrootedTail(&fakeDurable{}, &fakeCommitter{durable: accounts.NewMemAccounts()}, 512, 1, "")
+	for _, slot := range []uint64{8, 9, 12} {
+		global.EnqueuePendingStakePubkey(slot, solana.PublicKey{byte(slot), 0xFA})
+		t.Cleanup(func() { global.DropPendingStakePubkeys(slot) })
+	}
+	for _, slot := range []uint64{8, 9} {
+		tail.Add(slot, []*accounts.Account{testAccount(1, slot)}, testHashBytes(byte(slot)))
+	}
+	tail.unwind(8)
+	entries := global.PendingStakeEntriesSnapshot()
+	for _, slot := range []uint64{8, 9, 12} {
+		found := false
+		for _, entry := range entries {
+			if entry.Pubkey == (solana.PublicKey{byte(slot), 0xFA}) {
+				found = true
+			}
+		}
+		require.Equal(t, slot == 12, found)
+	}
 }

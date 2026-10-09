@@ -11,7 +11,12 @@ func TestTransactionSignaturesVerifiedMarkerIsNotSerialized(t *testing.T) {
 	original.MarkTransactionSignaturesVerified()
 	admissionStart := time.Now()
 	original.MarkTurbineReplayAdmissionStart(admissionStart)
-	ingress := TurbineIngressTimings{ShredCollection: 12 * time.Millisecond, TransactionSigverify: 34 * time.Millisecond}
+	ingress := TurbineIngressTimings{
+		ShredCollection: 12 * time.Millisecond, TransactionSigverify: 34 * time.Millisecond,
+		EarlyTransactionParse: 2 * time.Millisecond, EarlyTransactionSigverify: 56 * time.Millisecond,
+		EarlyPreparationWait:      3 * time.Millisecond,
+		EarlyVerifiedTransactions: 80, FullToReady: 35 * time.Millisecond,
+	}
 	original.MarkTurbineIngressTimings(ingress)
 	if got, ok := original.TurbineIngressTimings(); !ok || got != ingress {
 		t.Fatalf("ingress timings = %+v, %t; want %+v, true", got, ok, ingress)

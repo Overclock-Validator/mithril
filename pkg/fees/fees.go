@@ -1,6 +1,7 @@
 package fees
 
 import (
+	"errors"
 	"fmt"
 	"math"
 
@@ -19,6 +20,9 @@ var microLamportsPerLamport = wide.Uint128FromUint64(1000000)
 var microLamportsPerLamportMinus1 = wide.Uint128FromUint64(1000000 - 1)
 
 func calculatePriorityFee(computeBudgetLimits *sealevel.ComputeBudgetLimits) uint64 {
+	if computeBudgetLimits.UsesDirectPriorityFee {
+		return computeBudgetLimits.DirectPriorityFeeLamports
+	}
 	computeUnitPrice := wide.Uint128FromUint64(computeBudgetLimits.ComputeUnitPrice)
 	computeUnitLimit := wide.Uint128FromUint64(uint64(computeBudgetLimits.ComputeUnitLimit))
 
@@ -35,9 +39,10 @@ func calculatePriorityFee(computeBudgetLimits *sealevel.ComputeBudgetLimits) uin
 	return priorityFee
 }
 
-// There are currently two aspects of the tx fee cost model on Solana
-// 1) fee per signature (5k lamports/sig)
-// 2) prioritization fees set via a SetComputeUnitPrice instruction
+// There are currently two aspects of the transaction fee model:
+//  1. fee per signature (5k lamports/signature)
+//  2. a prioritization fee, derived from SetComputeUnitPrice for legacy/v0 or
+//     supplied directly as total lamports in a SIMD-0385 v1 header
 
 const feePayerIdx = 0
 
@@ -72,6 +77,16 @@ func (txFeeAccumulator *TxFeeInfoAccumulator) Add(txFeeInfo *TxFeeInfo) {
 	}
 }
 
+// LeaderReward is the lamports credited to the slot leader for a transaction:
+// full priority fee plus the unburned half of the signature (execution) fee.
+func LeaderReward(feeInfo *TxFeeInfo) uint64 {
+	if feeInfo == nil {
+		return 0
+	}
+	unburnedSigFee := feeInfo.ExecutionFee - feeInfo.ExecutionFee/2
+	return safemath.SaturatingAddU64(feeInfo.PriorityFee, unburnedSigFee)
+}
+
 func CalculateTxFees(tx *solana.Transaction, instrs []sealevel.Instruction, computeBudgetLimits *sealevel.ComputeBudgetLimits, f *features.Features) *TxFeeInfo {
 	numSignatures := uint64(tx.Message.Header.NumRequiredSignatures)
 	secp256r1PrecompiledEnabled := f.IsActive(features.EnableSecp256r1Precompile)
@@ -91,7 +106,7 @@ func CalculateTxFees(tx *solana.Transaction, instrs []sealevel.Instruction, comp
 
 	// prioritization fees
 	var priorityFee uint64
-	if computeBudgetLimits.ComputeUnitPrice != 0 {
+	if computeBudgetLimits.UsesDirectPriorityFee || computeBudgetLimits.ComputeUnitPrice != 0 {
 		priorityFee = calculatePriorityFee(computeBudgetLimits)
 	}
 
@@ -100,7 +115,7 @@ func CalculateTxFees(tx *solana.Transaction, instrs []sealevel.Instruction, comp
 }
 
 // TODO: implement new fee model
-func CalculateAndDeductTxFees(tx *solana.Transaction, txMeta *rpc.TransactionMeta, instrs []sealevel.Instruction, transactionAccts *sealevel.TransactionAccounts, computeBudgetLimits *sealevel.ComputeBudgetLimits, f *features.Features, isSimulation bool) (*TxFeeInfo, uint64, error) {
+func CalculateAndDeductTxFees(tx *solana.Transaction, txMeta *rpc.TransactionMeta, instrs []sealevel.Instruction, transactionAccts *sealevel.TransactionAccounts, computeBudgetLimits *sealevel.ComputeBudgetLimits, f *features.Features, rent sealevel.SysvarRent, isSimulation bool) (*TxFeeInfo, uint64, error) {
 	feePayerAcct, err := transactionAccts.GetAccount(feePayerIdx)
 	if err != nil {
 		if isSimulation {
@@ -135,15 +150,15 @@ func CalculateAndDeductTxFees(tx *solana.Transaction, txMeta *rpc.TransactionMet
 
 	// prioritization fees
 	var priorityFee uint64
-	if computeBudgetLimits.ComputeUnitPrice != 0 {
+	if computeBudgetLimits.UsesDirectPriorityFee || computeBudgetLimits.ComputeUnitPrice != 0 {
 		priorityFee = calculatePriorityFee(computeBudgetLimits)
 	}
 
 	totalTxFee := safemath.SaturatingAddU64(baseTxFee, priorityFee)
 	feeInfo := &TxFeeInfo{ExecutionFee: baseTxFee, PriorityFee: priorityFee, TotalFee: totalTxFee}
 
-	if feePayerAcct.Lamports < totalTxFee {
-		return feeInfo, 0, sealevel.InstrErrInsufficientFunds
+	if err := ValidateFeePayerWithFeatures(feePayerAcct, totalTxFee, rent, f); err != nil {
+		return feeInfo, 0, err
 	}
 	////mlog.Log.Debugf("feePayerAcct.Lamports=%d totalTxFee=%d", feePayerAcct.Lamports, totalTxFee)
 
@@ -151,12 +166,21 @@ func CalculateAndDeductTxFees(tx *solana.Transaction, txMeta *rpc.TransactionMet
 	if err != nil {
 		return feeInfo, 0, err
 	}
+	// Agave normalizes a rent-exempt payer before deducting its fee. Successful
+	// execution commits this value; replay's failure publisher separately
+	// restores the originally loaded epoch for ordinary-blockhash rollbacks.
+	if feePayerAcct.RentEpoch != math.MaxUint64 && rent.IsExempt(feePayerAcct.Lamports, uint64(len(feePayerAcct.Data))) {
+		feePayerAcct.RentEpoch = math.MaxUint64
+	}
 	feePayerAcct.Lamports -= totalTxFee
 
 	return feeInfo, feePayerAcct.Lamports, nil
 }
 
-func DistributeTxFeesToSlotLeader(acctsDb *accountsdb.AccountsDb, slotCtx *sealevel.SlotCtx, leader solana.PublicKey, txFeeAccumulator *TxFeeInfoAccumulator) uint64 {
+// DistributeTxFees credits the historical collector selected by replay. An
+// invalid destination burns its share without publishing any account mutation.
+// Agave v4.4.0-alpha.5 runtime/src/bank/fee_distribution.rs:248-299.
+func DistributeTxFees(slotCtx *sealevel.SlotCtx, collector, leaderVote solana.PublicKey, txFeeAccumulator *TxFeeInfoAccumulator) (uint64, error) {
 	var feesToBurn uint64
 	var feesToLeader uint64
 
@@ -169,32 +193,54 @@ func DistributeTxFeesToSlotLeader(acctsDb *accountsdb.AccountsDb, slotCtx *seale
 		feesToLeader = txFeeAccumulator.TotalFees - feesToBurn
 	}
 
-	var leaderAcct *accounts.Account
-	var err error
-
-	leaderAcct, err = slotCtx.GetAccount(leader)
+	if feesToLeader == 0 {
+		return feesToBurn, nil
+	}
+	acct, err := slotCtx.GetAccount(collector)
 	if err != nil {
-		// Leader didn't appear in the block: fetch its latest state via the
-		// speculative-state-aware read (recent unrooted fee credits live in RAM,
-		// not on disk) and add it to the parent accts object.
-		leaderAcct, err = slotCtx.GetAccountFromAccountsDb(leader)
-		if err != nil {
-			panic(fmt.Sprintf("unable to get leader acct %s from both slotCtx and accountsdb", leader))
+		// Read through the speculative overlay: prior unrooted fee credits may
+		// not have reached AccountsDB yet.
+		acct, err = slotCtx.GetAccountFromAccountsDb(collector)
+		if errors.Is(err, accountsdb.ErrNoAccount) {
+			acct = &accounts.Account{Key: collector, Owner: a.SystemProgramAddr}
+		} else if err != nil {
+			return 0, fmt.Errorf("load fee collector %s: %w", collector, err)
 		}
-		slotCtx.ParentAccts.SetAccountWithoutLock(leader, leaderAcct.Clone())
+		slotCtx.ParentAccts.SetAccountWithoutLock(collector, acct.Clone())
 	}
-
-	leaderAcct.Lamports, err = safemath.CheckedAddU64(leaderAcct.Lamports, feesToLeader)
+	before := acct.Lamports
+	after, err := safemath.CheckedAddU64(before, feesToLeader)
+	burn := func() (uint64, error) { return safemath.SaturatingAddU64(feesToBurn, feesToLeader), nil }
 	if err != nil {
-		panic("overflow when adding reward to slot leader balance")
+		return burn()
 	}
-
-	err = slotCtx.SetAccount(leader, leaderAcct)
-	if err != nil {
-		panic(fmt.Sprintf("failed to SetAccount for leader acct %s when distributing tx fees", leader))
+	rent := RentForSlot(slotCtx)
+	custom := slotCtx.Features.IsActive(features.CustomCommissionCollector)
+	relax := slotCtx.Features.IsActive(features.RelaxPostExecMinBalanceCheck)
+	if !custom || collector != leaderVote {
+		if acct.Owner != a.SystemProgramAddr {
+			return burn()
+		}
+		if custom {
+			// ReservedAccountKeys includes pending keys regardless of their gate.
+			_, reserved := sealevel.NewReservedAcctsSet[collector]
+			if reserved || sealevel.IsNativeProgram(collector) || sealevel.IsSysvar(collector) || collector == a.Secp256r1PrecompileAddr {
+				return burn()
+			}
+			if collector != a.IncineratorAddr && !rent.IsExempt(after, uint64(len(acct.Data))) && (!relax || before == 0) {
+				return burn()
+			}
+		} else if !rent.IsExempt(after, uint64(len(acct.Data))) && (!relax || before == 0) {
+			// A positive deposit increases the balance, so under the old rent
+			// transition rules a rent-paying post-state is never permitted.
+			return burn()
+		}
 	}
-
-	//mlog.Log.Debugf("calculated fees for leader: %d, post-balance: %d (%s)", feesToLeader, leaderAcct.Lamports, leader)
-
-	return feesToBurn
+	acct = acct.Clone()
+	acct.Lamports = after
+	if err := slotCtx.SetAccount(collector, acct); err != nil {
+		return 0, fmt.Errorf("store fee collector %s: %w", collector, err)
+	}
+	slotCtx.RecordModifiedAcct(collector)
+	return feesToBurn, nil
 }

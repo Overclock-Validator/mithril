@@ -33,6 +33,11 @@ func (cm *ComputeMeter) Consume(cost uint64) error {
 	return nil
 }
 
+// Disabled reports whether metering is currently switched off (Consume is a no-op).
+func (cm *ComputeMeter) Disabled() bool {
+	return cm.disable
+}
+
 func (cm *ComputeMeter) Used() uint64 {
 	return cm.startingBalance - cm.computeMeter
 }

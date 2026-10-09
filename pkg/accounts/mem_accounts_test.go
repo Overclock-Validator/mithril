@@ -3,7 +3,22 @@ package accounts
 import (
 	"testing"
 	"time"
+
+	"github.com/gagliardetto/solana-go"
 )
+
+func TestMemAccountMissingErrorRetainsLookupKey(t *testing.T) {
+	mem := NewMemAccounts()
+	key := [32]byte{}
+	_, lockedErr := mem.GetAccount(&key)
+	_, unlockedErr := mem.GetAccountWithoutLock(solana.PublicKey(key))
+	key[0] = 99 // Lookup callers may reuse their key storage before reporting an error.
+	for _, err := range []error{lockedErr, unlockedErr} {
+		if err == nil || err.Error() != "no such account 11111111111111111111111111111111 found" {
+			t.Fatalf("missing error lost its original key: %v", err)
+		}
+	}
+}
 
 func TestMemAccountsReadsAreConcurrent(t *testing.T) {
 	mem := NewMemAccounts()

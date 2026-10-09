@@ -337,6 +337,26 @@ func (ls *LeaderSchedule) LeaderForSlot(slot uint64) (solana.PublicKey, bool) {
 	return leader.nodePubkey, true
 }
 
+// NextSlotForLeader returns the earliest scheduled slot at or after from
+// whose node identity is identity.
+func (ls *LeaderSchedule) NextSlotForLeader(identity solana.PublicKey, from uint64) (uint64, bool) {
+	if ls == nil {
+		return 0, false
+	}
+	var best uint64
+	found := false
+	for slot, leader := range ls.lsMap {
+		if leader.nodePubkey != identity || slot < from {
+			continue
+		}
+		if !found || slot < best {
+			best = slot
+			found = true
+		}
+	}
+	return best, found
+}
+
 // LeaderForSlotWithVoteAccount returns the coherent node and vote-account pair
 // selected by the vote-keyed schedule. Schedules constructed from node-keyed
 // RPC data do not have the vote account and return false.

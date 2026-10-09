@@ -12,14 +12,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// signedV0Transaction builds a versioned (v0) transaction and signs it over the
-// bytes a real Solana client signs — that is, with the 0x80 version prefix that
-// txverify.MessageBytes produces, not solana-go's MarshalBinary output.
-//
-// This distinction is the whole point of the test. solana-go's MarshalV0 emits
-// versionNum+127 = 0x7f, which is not the wire encoding. A verifier that
-// marshals for itself and skips the fixup checks the signature against bytes no
-// honest client ever signed, so it rejects every valid versioned transaction.
+// signedV0Transaction builds a versioned (v0) transaction and signs the exact
+// canonical message bytes, including the 0x80 version prefix.
 func signedV0Transaction(t *testing.T) *solana.Transaction {
 	t.Helper()
 
@@ -46,17 +40,70 @@ func signedV0Transaction(t *testing.T) *solana.Transaction {
 	return tx
 }
 
-// Regression: versioned transactions used to be dropped at TPU ingest no matter
-// how well signed they were, because this package marshalled the message itself
-// and never applied the version-byte fixup.
+// Regression: the version prefix is part of the signed message and must reach
+// the signature backend unchanged.
 func TestVersionedTransactionIsAccepted(t *testing.T) {
 	tx := signedV0Transaction(t)
 	require.True(t, VerifyTransaction(tx),
 		"a correctly signed v0 transaction must be admitted")
+	raw, err := tx.MarshalBinary()
+	require.NoError(t, err)
+	require.True(t, VerifyPacket(raw),
+		"a correctly signed v0 wire transaction must survive TPU sanitation")
 }
 
 func TestLegacyTransactionIsAccepted(t *testing.T) {
 	require.True(t, VerifyPacket(txfixture.MustSignedTransferWire(1)))
+}
+
+func TestV1AdmissionFollowsFeatureCallback(t *testing.T) {
+	wire := txfixture.MustSignedV1Wire(1, 32)
+
+	// Parsing is feature-independent, but admission fails closed when the
+	// caller has no current-bank feature source.
+	tx, err := ParseTx(wire)
+	require.NoError(t, err)
+	require.Equal(t, solana.MessageVersionV1, tx.Message.GetVersion())
+	require.False(t, VerifyPacket(wire))
+	require.False(t, VerifyPacketWithTxV1(wire, func() bool { return false }))
+	require.True(t, VerifyPacketWithTxV1(wire, func() bool { return true }))
+	require.False(t, VerifyTransaction(tx))
+	require.True(t, VerifyTransactionWithTxV1(tx, func() bool { return true }))
+}
+
+func TestV1SignatureTailIsVerified(t *testing.T) {
+	wire := txfixture.MustSignedV1Wire(2, 16)
+	require.True(t, VerifyPacketWithTxV1(wire, func() bool { return true }))
+
+	corrupt := append([]byte(nil), wire...)
+	corrupt[len(corrupt)-64] ^= 0xff
+	require.False(t, VerifyPacketWithTxV1(corrupt, func() bool { return true }))
+}
+
+func TestParseTxRejectsTrailingBytesForEveryVersion(t *testing.T) {
+	legacy := txfixture.MustSignedTransferWire(3)
+	_, err := ParseTx(append(append([]byte(nil), legacy...), 0))
+	require.Error(t, err)
+
+	v1 := txfixture.MustSignedV1Wire(3, 16)
+	_, err = ParseTx(append(append([]byte(nil), v1...), 0))
+	require.Error(t, err)
+}
+
+func TestBatchV1AdmissionFollowsFeatureCallback(t *testing.T) {
+	packets := [][]byte{
+		txfixture.MustSignedTransferWire(4),
+		txfixture.MustSignedV1Wire(4, 16),
+	}
+
+	var verifier BatchVerifier
+	got := make([]bool, len(packets))
+	verifier.Verify(packets, got)
+	require.Equal(t, []bool{true, false}, got)
+
+	verifier.SetTxV1Enabled(func() bool { return true })
+	verifier.Verify(packets, got)
+	require.Equal(t, []bool{true, true}, got)
 }
 
 func TestGarbageAndCorruptionAreRejected(t *testing.T) {

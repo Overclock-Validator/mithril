@@ -178,15 +178,8 @@ func NewLeaderSlotCtx(slot, parentSlot uint64, acctsDb *accountsdb.AccountsDb, p
 }
 
 func leaderFeatures(parent *features.Features) *features.Features {
-	feats := features.NewFeaturesDefault()
-	feats.EnableFeature(features.FormalizeLoadedTransactionDataSize, 0)
 	if parent == nil {
-		return feats
+		return features.NewFeaturesDefault()
 	}
-	for gate, info := range *parent {
-		if info.Enabled {
-			feats.EnableFeature(gate, info.ActivationSlot)
-		}
-	}
-	return feats
+	return parent.Clone()
 }

@@ -3,6 +3,7 @@ package blockprod
 import (
 	"sync"
 
+	"github.com/Overclock-Validator/mithril/pkg/arena"
 	"github.com/Overclock-Validator/mithril/pkg/costmodel"
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/fees"
@@ -44,6 +45,10 @@ type WorkingBank struct {
 	// seenMessages is the bank-local AlreadyProcessed status set. The TPU's
 	// signature LRU is only an ingress optimization and is not authoritative.
 	seenMessages map[[32]byte]struct{}
+	// Execution and commit are serialized by mu. Borrowed accounts never escape
+	// either phase, so their storage can be reset for the next transaction.
+	borrowedAccounts *arena.Arena[sealevel.BorrowedAccount]
+	preparer         *replay.TransactionPreparer
 }
 
 type BankConfig struct {
@@ -61,11 +66,22 @@ func NewWorkingBank(cfg BankConfig) *WorkingBank {
 	if limits.BlockCost == 0 {
 		limits = costmodel.DefaultLimits()
 	}
+	if limits.MaxBatchBytes == 0 {
+		limits.MaxBatchBytes = costmodel.DefaultTargetBatchBytes
+	}
+	if limits.MaxEntryBytes == 0 {
+		limits.MaxEntryBytes = costmodel.DefaultPackEntryBytes()
+	}
 	sink := cfg.Sink
 	if sink == nil {
 		sink = NopBatchSink{}
 	}
+	var preparer *replay.TransactionPreparer
+	if cfg.SlotCtx != nil {
+		preparer = replay.NewTransactionPreparer(cfg.SlotCtx.Features)
+	}
 	return &WorkingBank{
+		preparer:         preparer,
 		slotCtx:          cfg.SlotCtx,
 		slot:             cfg.Slot,
 		leader:           cfg.Leader,
@@ -76,6 +92,7 @@ func NewWorkingBank(cfg BankConfig) *WorkingBank {
 		accepting:        true,
 		ancestorStatuses: cfg.TransactionStatuses,
 		seenMessages:     make(map[[32]byte]struct{}),
+		borrowedAccounts: arena.New[sealevel.BorrowedAccount](64),
 	}
 }
 
@@ -161,21 +178,48 @@ func (r ForgeResult) String() string {
 func (b *WorkingBank) Forge(wire []byte) (ForgeResult, costmodel.ExceedReason) {
 	tx, err := solana.TransactionFromBytes(wire)
 	if err != nil {
+		b.RebateSchedule(len(wire))
 		return ForgeDroppedParse, costmodel.ExceedNone
 	}
 	return b.ForgeTransaction(tx, len(wire))
 }
 
-// ForgeTransaction executes and commits a parsed transaction.
+// ForgeTransaction executes and commits a parsed transaction. The caller must
+// keep it immutable: accepted transactions are retained for entry publication.
 func (b *WorkingBank) ForgeTransaction(tx *solana.Transaction, wireSize int) (ForgeResult, costmodel.ExceedReason) {
+	return b.forgeTransaction(tx, wireSize, nil)
+}
+
+// ForgePreparedTransaction reuses static work from owned, immutable TPU bytes.
+// A different bank feature snapshot falls back to the ordinary execution path.
+func (b *WorkingBank) ForgePreparedTransaction(tx *solana.Transaction, wireSize int, prepared *replay.PreparedTransaction) (ForgeResult, costmodel.ExceedReason) {
+	if b.slotCtx == nil || !b.preparer.Matches(prepared, tx, b.slotCtx.Features) {
+		prepared = nil
+	}
+	return b.forgeTransaction(tx, wireSize, prepared)
+}
+
+func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, prepared *replay.PreparedTransaction) (ForgeResult, costmodel.ExceedReason) {
 	if tx == nil {
+		b.RebateSchedule(wireSize)
 		return ForgeDroppedParse, costmodel.ExceedNone
 	}
-	if tx.IsVote() {
-		return ForgeDroppedVote, costmodel.ExceedNone
-	}
-	messageHash, err := replay.TransactionMessageHash(tx)
+	// Validate the full wire before execution can charge fees or publish
+	// account changes. Entry append then reuses this measured size and has no
+	// fallible serialization step after commit, including on the prepared path.
+	serializedSize, err := serializedTransactionSize(tx)
 	if err != nil {
+		b.RebateSchedule(wireSize)
+		return ForgeDroppedParse, costmodel.ExceedNone
+	}
+	var messageHash [32]byte
+	if prepared != nil {
+		messageHash = prepared.MessageHash()
+	} else {
+		messageHash, err = replay.TransactionMessageHash(tx)
+	}
+	if err != nil {
+		b.RebateSchedule(wireSize)
 		return ForgeDroppedParse, costmodel.ExceedNone
 	}
 	ancestorAlreadyProcessed := false
@@ -195,8 +239,13 @@ func (b *WorkingBank) ForgeTransaction(tx *solana.Transaction, wireSize int) (Fo
 			f := features.NewFeaturesDefault()
 			feats = f
 		}
-		cost, err = costmodel.EstimateTransactionCost(tx, feats)
+		if prepared != nil {
+			cost = prepared.Cost()
+		} else {
+			cost, err = costmodel.EstimateTransactionCost(tx, feats)
+		}
 		if err != nil {
+			b.RebateSchedule(wireSize)
 			return ForgeDroppedParse, costmodel.ExceedNone
 		}
 		cost.WireSize = wireSize
@@ -204,6 +253,12 @@ func (b *WorkingBank) ForgeTransaction(tx *solana.Transaction, wireSize int) (Fo
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	included := false
+	defer func() {
+		if !included {
+			b.entries.rebateReserved(wireSize)
+		}
+	}()
 	if !b.accepting {
 		return ForgeDroppedNoLeader, costmodel.ExceedNone
 	}
@@ -222,17 +277,30 @@ func (b *WorkingBank) ForgeTransaction(tx *solana.Transaction, wireSize int) (Fo
 	if reason := b.costs.WouldExceed(cost); reason != costmodel.ExceedNone {
 		return ForgeDroppedCost, reason
 	}
-
-	output := replay.LoadAndExecuteTransaction(replay.LoadAndExecuteTransactionInput{
-		SlotCtx:     b.slotCtx,
-		Transaction: tx,
-		LeanResult:  true,
-	})
-	if output.ProcessingResult.TransactionError != nil {
+	if reason := b.reserveEntryBytesLocked(wireSize); reason != costmodel.ExceedNone {
+		return ForgeDroppedCost, reason
+	}
+	if err := b.preparer.PayerCanFund(b.slotCtx, tx, prepared); err != nil {
 		return ForgeDroppedExecution, costmodel.ExceedNone
 	}
-	if err := replay.ApplySuccessfulTransaction(b.slotCtx, output); err != nil {
-		return ForgeDroppedExecution, costmodel.ExceedNone
+
+	output := b.preparer.LoadAndExecute(replay.LoadAndExecuteTransactionInput{
+		SlotCtx:           b.slotCtx,
+		Transaction:       tx,
+		LeanResult:        true,
+		SkipTimingMetrics: true,
+		Arena:             b.borrowedAccounts,
+	}, prepared)
+	if output.ProcessingResult.TransactionError != nil {
+		feeInfo, err := replay.ApplyFeesOnlyTransaction(b.slotCtx, tx, output)
+		if err != nil {
+			return ForgeDroppedExecution, costmodel.ExceedNone
+		}
+		output.FeeInfo = feeInfo
+	} else {
+		if err := replay.ApplySuccessfulTransaction(b.slotCtx, output); err != nil {
+			return ForgeDroppedExecution, costmodel.ExceedNone
+		}
 	}
 	if b.seenMessages == nil {
 		b.seenMessages = make(map[[32]byte]struct{})
@@ -245,11 +313,93 @@ func (b *WorkingBank) ForgeTransaction(tx *solana.Transaction, wireSize int) (Fo
 	b.numSigs += uint64(tx.Message.Header.NumRequiredSignatures)
 
 	b.costs.Record(cost)
-	if flushed, batchBytes, didFlush := b.entries.Append(*tx, wireSize); didFlush {
+	execCU, loadedCost := actualExecutionUsage(output)
+	b.costs.Rebate(cost, execCU, loadedCost)
+	if flushed, batchBytes, didFlush := b.entries.appendSerialized(*tx, wireSize, serializedSize); didFlush {
 		b.entryHash = b.entries.CurrentEntryHash()
 		b.sink.OnEntryBatch(flushed, batchBytes)
 	}
+	included = true
 	return ForgeAccepted, costmodel.ExceedNone
+}
+
+func actualExecutionUsage(output replay.LoadAndExecuteTransactionOutput) (execCU, loadedCost uint64) {
+	loadedCost = costmodel.LoadedAccountsDataSizeCost(output.LoadedAccountsDataSize)
+	execCtx := output.ExecCtx
+	if execCtx == nil {
+		return 0, loadedCost
+	}
+	execCU = execCtx.ComputeMeter.Used()
+	return execCU, loadedCost
+}
+
+// BufferedDropReason classifies why a buffered transaction should be discarded.
+type BufferedDropReason int
+
+const (
+	BufferedKeep BufferedDropReason = iota
+	BufferedExpired
+	BufferedAlreadyProcessed
+)
+
+// ClassifyBuffered reports whether a buffered transaction is expired or already
+// processed relative to this bank.
+func (b *WorkingBank) ClassifyBuffered(blockhash solana.Hash, messageHash [32]byte) BufferedDropReason {
+	if rbh := sealevel.SysvarCache.RecentBlockHashes.Sysvar; rbh == nil || !rbh.IsBlockhashAgeValid(blockhash) {
+		return BufferedExpired
+	}
+	if b.ancestorStatuses != nil {
+		if ok, err := b.ancestorStatuses.ContainsMessage(blockhash, messageHash); err == nil && ok {
+			return BufferedAlreadyProcessed
+		}
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, seen := b.seenMessages[messageHash]; seen {
+		return BufferedAlreadyProcessed
+	}
+	return BufferedKeep
+}
+
+// PrepareSchedule reserves entry bytes at schedule time. If the next
+// transaction would not fit in the current FEC set, the batch is
+// closed and shredded first. If the tx would then exceed the remaining
+// slot entry-byte budget, it is not reserved. A failed/unincludable
+// forge rebates the reservation.
+func (b *WorkingBank) PrepareSchedule(wireSize int) costmodel.ExceedReason {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.accepting {
+		return costmodel.ExceedNone
+	}
+	return b.reserveEntryBytesLocked(wireSize)
+}
+
+// RebateSchedule releases a schedule-time entry-byte reservation.
+func (b *WorkingBank) RebateSchedule(wireSize int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.entries.rebateReserved(wireSize)
+}
+
+func (b *WorkingBank) reserveEntryBytesLocked(wireSize int) costmodel.ExceedReason {
+	if b.entries.ReservedBytes() > 0 {
+		return costmodel.ExceedNone
+	}
+	if b.entries.wouldOverflowBatch(wireSize) {
+		b.flushEntriesLocked()
+	}
+	if !b.entries.reserve(wireSize) {
+		return costmodel.ExceedBatchBytes
+	}
+	return costmodel.ExceedNone
+}
+
+// EntryBytes is flushed plus pending plus reserved serialized entry bytes.
+func (b *WorkingBank) EntryBytes() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.entries.SlotBytes()
 }
 
 // FlushEntries emits any pending transactions as an entry batch.
@@ -259,13 +409,15 @@ func (b *WorkingBank) FlushEntries() {
 	b.flushEntriesLocked()
 }
 
-// Freeze stops transaction admission and emits the final pending entry batch.
-// It waits for any forge already holding the bank lock, so every accepted
-// transaction is included before the footer bank hash is computed.
+// Freeze stops transaction admission and emits the leftover entry batch even
+// if it does not fill a FEC set. It waits for any forge already holding the
+// bank lock, so every accepted transaction is included before the footer
+// bank hash is computed. Last-in-slot is marked on the ending tick, not here.
 func (b *WorkingBank) Freeze() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.accepting = false
+	b.entries.dropReservation()
 	b.flushEntriesLocked()
 }
 
@@ -274,6 +426,7 @@ func (b *WorkingBank) Freeze() {
 func (b *WorkingBank) Close() {
 	b.mu.Lock()
 	b.accepting = false
+	b.entries.dropReservation()
 	b.mu.Unlock()
 }
 

@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -25,7 +24,6 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	a "github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/arena"
-	"github.com/Overclock-Validator/mithril/pkg/bankhash"
 	"github.com/Overclock-Validator/mithril/pkg/base58"
 	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/blockstream"
@@ -37,7 +35,6 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/lthash"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
-	"github.com/Overclock-Validator/mithril/pkg/rent"
 	"github.com/Overclock-Validator/mithril/pkg/rewards"
 	"github.com/Overclock-Validator/mithril/pkg/rpcclient"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
@@ -86,8 +83,8 @@ type BlockFetchOpts struct {
 	// ShredSpoolDir: on-disk verified-shred spool shared by prewarm and the
 	// block source (empty = disabled).
 	ShredSpoolDir string
-	// LocalBlocks carries fully frozen blocks produced by this validator. They
-	// enter the normal ordered block source and are re-executed by ProcessBlock.
+	// LocalBlocks carries fully frozen blocks produced by this validator. Replay
+	// adopts the already-mutated leader SlotCtx and does not re-execute.
 	LocalBlocks          <-chan *b.Block
 	LocalLeaderForSlot   func(slot uint64) bool
 	GossipClient         *gossip.Client
@@ -119,6 +116,17 @@ func GenerateRunID() string {
 		return fmt.Sprintf("%08x", time.Now().UnixNano()&0xFFFFFFFF)
 	}
 	return hex.EncodeToString(b)
+}
+
+func identityFromTurbineKey(priv ed25519.PrivateKey) solana.PublicKey {
+	if len(priv) != ed25519.PrivateKeySize {
+		return solana.PublicKey{}
+	}
+	pub, ok := priv.Public().(ed25519.PublicKey)
+	if !ok {
+		return solana.PublicKey{}
+	}
+	return solana.PublicKeyFromBytes(pub)
 }
 
 // IsCommitInProgress returns true if we're in the critical commit window.
@@ -267,7 +275,7 @@ func resolveAddrTableLookups(accountsDb blockAccountSource, block *b.Block) erro
 	tables := make(map[solana.PublicKey]solana.PublicKeySlice)
 
 	for _, tx := range block.Transactions {
-		if !tx.Message.IsVersioned() {
+		if tx.Message.GetVersion() != solana.MessageVersionV0 {
 			continue
 		}
 
@@ -299,7 +307,7 @@ func resolveAddrTableLookups(accountsDb blockAccountSource, block *b.Block) erro
 
 txResolveLoop:
 	for _, tx := range block.Transactions {
-		if !tx.Message.IsVersioned() || tx.Message.AddressTableLookups.NumLookups() == 0 {
+		if tx.Message.GetVersion() != solana.MessageVersionV0 || tx.Message.AddressTableLookups.NumLookups() == 0 {
 			continue
 		}
 		for _, addrTableKey := range tx.Message.GetAddressTableLookups().GetTableIDs() {
@@ -328,7 +336,7 @@ txResolveLoop:
 // callers can map missing/invalid tables to AddressLookupTableNotFound or
 // InvalidAddressLookupTableData.
 func ResolveAddrTableLookupsForTx(ctx context.Context, accountsDb *accountsdb.AccountsDb, slot uint64, tx *solana.Transaction) error {
-	if !tx.Message.IsVersioned() || tx.Message.AddressTableLookups.NumLookups() == 0 {
+	if tx.Message.GetVersion() != solana.MessageVersionV0 || tx.Message.AddressTableLookups.NumLookups() == 0 {
 		return nil
 	}
 
@@ -554,13 +562,29 @@ func recordSysvarAccountReadStats(dst *metrics.AccountLoader, src accountsdb.Acc
 	}
 }
 
-func loadBlockAccountsAndUpdateSysvars(accountsDb blockAccountSource, block *b.Block, epochSchedule *sealevel.SysvarEpochSchedule, alpenglowClock bool, parentBankSysvars *sealevel.BankSysvars) (accounts.Accounts, accounts.Accounts, int, *sealevel.BankSysvars, error) {
+func loadBlockAccountsAndUpdateSysvars(
+	accountsDb blockAccountSource,
+	block *b.Block,
+	epochSchedule *sealevel.SysvarEpochSchedule,
+	alpenglowClock bool,
+	parentBankSysvars *sealevel.BankSysvars,
+	planner *preparedDependencyPlanner,
+) (accounts.Accounts, accounts.Accounts, int, *sealevel.BankSysvars, error) {
 	var bankSysvars *sealevel.BankSysvars
 	phaseStart := time.Now()
 	err := resolveAddrTableLookups(accountsDb, block)
 	metrics.GlobalBlockReplay.AccountLoader.AddressTableLookups.AddTimingSince(phaseStart)
 	if err != nil {
 		return nil, nil, 0, bankSysvars, err
+	}
+
+	// Live ALT transactions have no RPC metadata, so their account accesses are
+	// knowable only after lookup resolution. Extract their compact accesses and
+	// build the graph concurrently with account loading and sysvar updates. For
+	// RPC blocks this is a no-op because preparation began safely from static
+	// keys plus TransactionMeta before resolution mutated the execution messages.
+	if planner != nil {
+		planner.tryStartResolved(block)
 	}
 
 	phaseStart = time.Now()
@@ -1008,28 +1032,28 @@ func loadBlockAccountsAndUpdateSysvars(accountsDb blockAccountSource, block *b.B
 }
 
 func recordAccountLoaderBatchStats(dst *metrics.AccountLoader, src accountsdb.BatchReadStats) {
-	dst.RequestedKeys = src.RequestedKeys
-	dst.DurableKeys = src.DurableKeys
-	dst.WorkingSetHits = src.WorkingSetHits
-	dst.InProgressHits = src.InProgressHits
-	dst.PendingFoldHits = src.PendingFoldHits
-	dst.CacheHits = src.CacheHits
-	dst.IndexHits = src.IndexHits
-	dst.IndexMisses = src.IndexMisses
-	dst.UniqueAppendVecs = src.UniqueAppendVecs
-	dst.AppendVecChunks = src.AppendVecChunks
-	dst.AppendVecAccounts = src.AppendVecAccounts
-	dst.OpenFailures = src.OpenFailures
-	dst.ReadFailures = src.ReadFailures
-	dst.RetryAccounts = src.RetryAccounts
-	dst.CommonCacheAdmissions = src.CommonCacheAdmissions
-	dst.CommonCacheAdmissionsSkipped = src.CommonCacheAdmissionsSkipped
-	dst.VoteCacheAdmissions = src.VoteCacheAdmissions
-	dst.VoteCacheAdmissionsSkipped = src.VoteCacheAdmissionsSkipped
-	dst.CachePublicationEpochRejects = src.CachePublicationEpochRejects
-	dst.DecodedAccountObjects = src.DecodedAccountObjects
-	dst.DecodedAccountBytes = src.DecodedAccountBytes
-	dst.PlaceholderObjects = src.PlaceholderObjects
+	dst.RequestedKeys += src.RequestedKeys
+	dst.DurableKeys += src.DurableKeys
+	dst.WorkingSetHits += src.WorkingSetHits
+	dst.InProgressHits += src.InProgressHits
+	dst.PendingFoldHits += src.PendingFoldHits
+	dst.CacheHits += src.CacheHits
+	dst.IndexHits += src.IndexHits
+	dst.IndexMisses += src.IndexMisses
+	dst.UniqueAppendVecs += src.UniqueAppendVecs
+	dst.AppendVecChunks += src.AppendVecChunks
+	dst.AppendVecAccounts += src.AppendVecAccounts
+	dst.OpenFailures += src.OpenFailures
+	dst.ReadFailures += src.ReadFailures
+	dst.RetryAccounts += src.RetryAccounts
+	dst.CommonCacheAdmissions += src.CommonCacheAdmissions
+	dst.CommonCacheAdmissionsSkipped += src.CommonCacheAdmissionsSkipped
+	dst.VoteCacheAdmissions += src.VoteCacheAdmissions
+	dst.VoteCacheAdmissionsSkipped += src.VoteCacheAdmissionsSkipped
+	dst.CachePublicationEpochRejects += src.CachePublicationEpochRejects
+	dst.DecodedAccountObjects += src.DecodedAccountObjects
+	dst.DecodedAccountBytes += src.DecodedAccountBytes
+	dst.PlaceholderObjects += src.PlaceholderObjects
 	dst.WorkingSetLookup.AddTiming(time.Duration(src.WorkingSetLookupNanoseconds))
 	dst.InProgressLookup.AddTiming(time.Duration(src.InProgressNanoseconds))
 	dst.AppendVecPinWait.AddTiming(time.Duration(src.AppendVecPinWaitNanoseconds))
@@ -1054,9 +1078,8 @@ func recordAccountLoaderBatchStats(dst *metrics.AccountLoader, src accountsdb.Ba
 // This ensures the stake cache reflects the actual on-chain state, not potentially outdated
 // data. Fatal error if index file is missing - indicates corrupt/incomplete AccountsDB.
 // NO manifest parameter - derives everything from AccountsDB.
-func setupInitialVoteAcctsAndStakeAccts(acctsDb *accountsdb.AccountsDb, block *b.Block) {
+func setupInitialVoteAcctsAndStakeAccts(acctsDb *accountsdb.AccountsDb, block *b.Block, parentEpoch uint64) {
 	block.VoteTimestamps = make(map[solana.PublicKey]sealevel.BlockTimestamp)
-	block.EpochStakesPerVoteAcct = make(map[solana.PublicKey]uint64)
 
 	// Load stake entries from index file built during snapshot processing
 	// The index is in the accountsDbDir which is parent of AcctsDir
@@ -1149,20 +1172,11 @@ func setupInitialVoteAcctsAndStakeAccts(acctsDb *accountsdb.AccountsDb, block *b
 		mlog.Log.Warnf("vote cache rebuild had errors: %v", err)
 	}
 
-	// Seed EpochStakesPerVoteAcct and TotalEpochStake from the epoch stakes cache,
-	// loaded by buildInitialEpochStakesCache() from the manifest. These are
-	// epoch-effective stakes (warmup/cooldown applied), matching Agave's
-	// get_epoch_stake syscall behavior. The raw AccountsDB scan above uses
-	// delegation.StakeLamports which can differ from effective stake.
-	epochStakes := global.EpochStakes(block.Epoch)
-	if len(epochStakes) == 0 {
-		mlog.Log.Errorf("FATAL: no epoch stakes in cache for epoch %d - "+
-			"buildInitialEpochStakesCache should have loaded these from manifest", block.Epoch)
+	if err := seedEpochStakesForExecution(block, parentEpoch); err != nil {
+		mlog.Log.Errorf("FATAL: %v", err)
 		mlog.Log.Errorf("Available cached epochs: %v", global.GetAllCachedEpochs())
 		os.Exit(1)
 	}
-	maps.Copy(block.EpochStakesPerVoteAcct, epochStakes)
-	block.TotalEpochStake = global.EpochTotalStake(block.Epoch)
 
 	// Diagnostic: one-time startup comparison of raw scan vs epoch-effective totals
 	var rawScanTotal uint64
@@ -1231,7 +1245,7 @@ func configureInitialBlock(acctsDb *accountsdb.AccountsDb,
 	}
 	block.LatestEvictedBlockhash = evictedHash
 
-	setupInitialVoteAcctsAndStakeAccts(acctsDb, block)
+	setupInitialVoteAcctsAndStakeAccts(acctsDb, block, epochSchedule.GetEpoch(block.ParentSlot))
 	configureGlobalCtx(block)
 
 	if global.ManageLeaderSchedule() {
@@ -1271,6 +1285,18 @@ func reconstructFeeRateGovernor(s *state.MithrilState) *sealevel.FeeRateGovernor
 func configureBlock(block *b.Block,
 	lastSlotCtx *sealevel.SlotCtx,
 	epochSchedule *sealevel.SysvarEpochSchedule) error {
+	return configureBlockFromParent(block, lastSlotCtx, epochSchedule, true)
+}
+
+// configureBlockFromParent derives the block's parent-dependent fields from
+// the executed parent context. publishGlobal also publishes the block as the
+// process-wide current slot (configureGlobalCtx); a speculative streaming
+// shell passes false so the global view keeps describing the executed
+// frontier until the complete block is configured.
+func configureBlockFromParent(block *b.Block,
+	lastSlotCtx *sealevel.SlotCtx,
+	epochSchedule *sealevel.SysvarEpochSchedule,
+	publishGlobal bool) error {
 
 	copy(block.ParentBankhash[:], lastSlotCtx.FinalBankhash)
 	block.AcctsLtHash = lastSlotCtx.AcctsLtHash
@@ -1286,7 +1312,9 @@ func configureBlock(block *b.Block,
 		block.LastBlockhash = lastSlotCtx.Blockhash
 	}
 
-	configureGlobalCtx(block)
+	if publishGlobal {
+		configureGlobalCtx(block)
+	}
 
 	if global.ManageLeaderSchedule() {
 		// epoch boundary. do not set leader
@@ -1359,7 +1387,7 @@ func configureInitialBlockFromResume(acctsDb *accountsdb.AccountsDb,
 	// Load vote accounts and populate global caches - same as fresh start
 	// This seeds both block.VoteAccts/VoteTimestamps AND global.VoteCache() from AccountsDB
 	// Required because getTimestampEstimate reads from global.VoteCache()
-	setupInitialVoteAcctsAndStakeAccts(acctsDb, block)
+	setupInitialVoteAcctsAndStakeAccts(acctsDb, block, epochSchedule.GetEpoch(block.ParentSlot))
 	configureGlobalCtx(block)
 
 	// On resume, epoch stakes will be loaded from the persisted state file (not manifest or AccountsDB).
@@ -1671,6 +1699,7 @@ func ReplayBlocks(
 	}
 	// Fresh vote/stake dirty watermark for this run (gates the in-loop unwind).
 	resetVoteStakeDirty()
+	nextLeader := newNextLeaderCursor(identityFromTurbineKey(turbineIdentity))
 	// Create bankhash log file
 	bankhashLogPath := fmt.Sprintf("%s/bankhash.log", acctsDbPath)
 	bankhashLogFile, bankhashLogErr := os.OpenFile(bankhashLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -1722,6 +1751,7 @@ func ReplayBlocks(
 	var unwoundParentBankSysvars *sealevel.BankSysvars
 	var partitionedEpochRewardsEnabled bool
 	var partitionedRewardsInfo *rewards.PartitionedRewardDistributionInfo
+	var rewardsCompletion partitionedRewardsCompletion
 	var featuresActivatedInFirstSlot []*accounts.Account
 	var parentFeaturesActivatedInFirstSlot []*accounts.Account
 
@@ -1773,6 +1803,10 @@ func ReplayBlocks(
 	isFirstSlotInEpoch := epochSchedule.FirstSlotInEpoch(startEpoch) == startSlot
 	replayCtx.CurrentFeatures, featuresActivatedInFirstSlot, parentFeaturesActivatedInFirstSlot = scanAndEnableFeatures(acctsDb, replayCtx, startSlot, isFirstSlotInEpoch)
 	if alpenglowMode {
+		if err := validateAlpenglowRuntimeFeatureSet(replayCtx.CurrentFeatures, startSlot); err != nil {
+			result.Error = err
+			return result
+		}
 		applyAlpenglowRuntimeFeatureOverrides(replayCtx.CurrentFeatures, startSlot)
 	}
 	var initialLtHash *lthash.LtHash
@@ -1877,8 +1911,10 @@ func ReplayBlocks(
 	var windowRepairedSlots int
 	var windowEmptyBlocks int
 	var windowSkippedWithShreds int // skipped slots where the leader sent partial shreds
-	var windowSwitches int          // certificate switches detected this window
+	var windowSwitches int          // certified or parent-linked switch events handled this window
 	var windowSwitchInRAM int       // switches resolved by the in-RAM unwind
+	var windowSwitchSourceOnly int  // switches that only replace the source's queued suffix
+	var windowSwitchRetained int    // speculative switches rejected to retain the rooted branch
 	var windowSwitchFallback int    // switches that fell back to rooted-checkpoint re-replay
 	switchFallbackReasons := make(map[string]int)
 	var promotionHolds int // iterations promotion was fully stalled while finality ran a chunk ahead
@@ -1897,8 +1933,8 @@ func ReplayBlocks(
 	var highestExecutedSlot uint64 // highest slot ProcessBlock has executed; bounds the promotion-gate walk
 	// While partitioned rewards distribute, promotion holds below the boundary
 	// block so a crash-resume always re-runs it (the distribution bookkeeping is
-	// RAM-only and not reconstructible mid-window). Self-clears when the window
-	// completes (NumRewardPartitionsRemaining reaches 0).
+	// RAM-only and not reconstructible mid-window). Release requires a verified
+	// completion bank, committed atomically with the whole rewards window.
 	var rewardsHoldBelowSlot uint64
 	// Alpenglow finality identities captured at observe/ingest time for the promotion
 	// gate (the tracker's own state may be pruned by promotion time). Pruned as slots
@@ -1958,9 +1994,9 @@ func ReplayBlocks(
 			checkpointAfterCommit = consensusOpts.TransactionStatusCheckpointAfterCommit
 		}
 		if hookErr := unrootedTailState.SetTransactionStatusCheckpointHooks(TransactionStatusCheckpointHooks{
-			// Snapshot runs here on the replay loop during fold-job construction;
-			// only its immutable bytes cross to the async worker.
-			Snapshot: transactionStatuses.SnapshotThrough,
+			// Pin the exact immutable view on replay. Sorting and encoding run
+			// on the existing fold worker, after releasing the live cache lock.
+			Capture: transactionStatuses.CaptureSnapshotThrough,
 			Install: func(through uint64, payload []byte) (*state.TransactionStatusCheckpointRef, error) {
 				return PrepareTransactionStatusCheckpoint(acctsDbPath, through, payload)
 			},
@@ -2002,8 +2038,8 @@ func ReplayBlocks(
 	if replayDivergenceFloor > 0 {
 		mlog.Log.Warnf("replay divergence evidence present (earliest slot %d): folds are blocked at that slot until the evidence is cleared after triage", replayDivergenceFloor)
 	}
-	// Switch sweep: detects executed slots contradicted by later decisive
-	// certificates (wrong sibling / certified skip) under execute-on-receipt.
+	// Switch sweep: detects consumed blocks or skips contradicted by decisive
+	// chain decisions, including ancestry discovered after a certificate.
 	switchSweeper := newAlpenglowSwitchSweeper(consensusEngine)
 
 	if TrailingVerifierCfg.Enabled && unrootedTailState != nil {
@@ -2032,6 +2068,10 @@ func ReplayBlocks(
 		mithrilState.LastRootedSlot = promotedThrough
 		mithrilState.LastRootedBankhash = rootedCtx.Bankhash
 		mithrilState.LastRootedContext = rootedCtx
+		if rewardsCompletion.retire(&partitionedRewardsInfo, promotedThrough) {
+			rewardsHoldBelowSlot = 0
+			mlog.Log.Infof("epoch rewards bookkeeping retired through durable slot %d; later fork switches may unwind in memory", promotedThrough)
+		}
 		if transactionStatuses.Root(promotedThrough) {
 			mlog.Log.Infof("transaction status cache reconstructed complete %d-root coverage through durable slot %d",
 				maxTransactionStatusRoots, promotedThrough)
@@ -2139,13 +2179,9 @@ func ReplayBlocks(
 		}
 		promoteThrough := safePromoteTarget(lastRootedWatermark, verifierRequired, verifiedWM, replayDivergenceFloor)
 		// Partitioned-rewards window: hold promotion below the boundary block
-		// until every partition distributes, so a crash-resume re-runs the
-		// boundary and rebuilds the RAM-only distribution bookkeeping.
-		if rewardsHoldBelowSlot > 0 && partitionedRewardsInfo != nil && partitionedRewardsInfo.NumRewardPartitionsRemaining > 0 {
-			if promoteThrough >= rewardsHoldBelowSlot {
-				promoteThrough = rewardsHoldBelowSlot - 1
-			}
-		}
+		// until the completion bank verifies and is eligible to fold, so a
+		// failed distribution re-runs the boundary and rebuilds its bookkeeping.
+		promoteThrough = rewardsCompletion.limitPromotion(partitionedRewardsInfo, rewardsHoldBelowSlot, promoteThrough)
 		if promoteThrough <= mithrilState.LastRootedSlot {
 			// Operator signal: promotion is fully stalled (verifier lag,
 			// divergence floor, or rewards hold) while finality has run at
@@ -2176,6 +2212,8 @@ func ReplayBlocks(
 			mlog.Log.FileOnlyf("alpenglow gate: checked=%d matched=%d no_finality=%d no_local_id=%d",
 				gateStats.checked, gateStats.matched, gateStats.noFinality, gateStats.noLocalID)
 		}
+		// The finality gate can stop before the verified completion bank.
+		promoteThrough = rewardsCompletion.limitPromotion(partitionedRewardsInfo, rewardsHoldBelowSlot, promoteThrough)
 		if promoteThrough <= mithrilState.LastRootedSlot {
 			return false
 		}
@@ -2188,6 +2226,18 @@ func ReplayBlocks(
 			// loop would refuse.
 			if res := promoter.drain(); res != nil {
 				applyFoldOutcome(res)
+			}
+			if rewardsHoldBelowSlot > 0 && partitionedRewardsInfo != nil && promoteThrough >= rewardsHoldBelowSlot {
+				job, jerr := unrootedTailState.buildRewardsCompletionFoldJob(rewardsCompletion.slot)
+				if jerr != nil {
+					mlog.Log.Errorf("rooted-durable: rewards completion fold: %v", jerr)
+					return false
+				}
+				if err := runFoldJob(unrootedTailState.committer, job); err != nil {
+					mlog.Log.Errorf("rooted-durable: rewards completion fold: %v", err)
+					return false
+				}
+				applyFoldOutcome(&foldResult{job: job})
 			}
 			promotedThrough, rootedCtx, perr := unrootedTailState.flush(promoteThrough)
 			if perr != nil {
@@ -2202,7 +2252,13 @@ func ReplayBlocks(
 		// when idle; completions are applied at the top of this function on a
 		// later iteration.
 		if !promoter.inFlight {
-			job, jerr := unrootedTailState.buildFoldJob(promoteThrough, false)
+			var job *foldJob
+			var jerr error
+			if rewardsHoldBelowSlot > 0 && partitionedRewardsInfo != nil && promoteThrough >= rewardsHoldBelowSlot {
+				job, jerr = unrootedTailState.buildRewardsCompletionFoldJob(rewardsCompletion.slot)
+			} else {
+				job, jerr = unrootedTailState.buildFoldJob(promoteThrough, false)
+			}
 			if jerr != nil {
 				mlog.Log.Errorf("rooted-durable: %v; watermark held back", jerr)
 				return false
@@ -2298,6 +2354,9 @@ func ReplayBlocks(
 		opts.InitialAlpenglowBlockID = resumeState.ParentAlpenglowBlockID
 		opts.HasInitialAlpenglowBlockID = true
 	}
+	// Streaming execution needs the turbine batch feed; it is only ever
+	// eligible under Alpenglow with the unrooted tail (see streamingExecutor).
+	opts.TurbineStreamingExecution = StreamingExecutionCfg.Enabled && useTurbine && alpenglowMode && unrootedTailState != nil
 
 	// Apply block fetching options if provided
 	if blockFetchOpts != nil {
@@ -2406,6 +2465,22 @@ func ReplayBlocks(
 			mlog.Log.Warnf("%v — block source rejected the fork rewind", sw)
 			return false
 		}
+		if !parentSwitchNeedsStateUnwind(sw.Slot, currentExecutedAnchorSlot()) {
+			// Trailing skips advance replay's consumed frontier without creating
+			// account-state layers. Finalized ancestry can later require a block
+			// in that range; re-open its source slot and retain the executed bank.
+			for slot := range alpenglowExecutedBlockIDs {
+				if slot >= sw.Slot {
+					delete(alpenglowExecutedBlockIDs, slot)
+				}
+			}
+			replayFrontier = sw.Slot - 1
+			blockStream.SetLastExecutedSlot(replayFrontier)
+			global.SetReplayFrontier(replayFrontier)
+			windowSwitchSourceOnly++
+			mlog.Log.Warnf("%v — re-serving the skipped suffix from slot %d; executed bank remains at slot %d", sw, sw.Slot, currentExecutedAnchorSlot())
+			return true
+		}
 		rs, parentBankSysvars, fallbackReason := tryInLoopUnwind(sw, unrootedTailState, mithrilState, epochSchedule, currentEpoch, partitionedRewardsInfo)
 		if rs == nil {
 			windowSwitchFallback++
@@ -2438,11 +2513,69 @@ func ReplayBlocks(
 			global.SetTransactionCount(*rs.TransactionCount) // drop the discarded fork's txs
 		}
 		blockStream.SetLastExecutedSlot(rs.ParentSlot)
+		replayFrontier = rs.ParentSlot
 		global.SetReplayFrontier(rs.ParentSlot)
 		ResetChainTip()
 		windowSwitchInRAM++
 		mlog.Log.Warnf("%v — unwound in RAM to executed parent slot %d; re-executing the selected chain (in-RAM switches this window: %d)", sw, rs.ParentSlot, windowSwitchInRAM)
 		return true
+	}
+	var sweepWhileWaiting func() *CertifiedSwitch
+	var decisionChanges <-chan struct{}
+	if unrootedTailState != nil && switchSweeper != nil {
+		decisionChanges = switchSweeper.decisionChanges
+		sweepWhileWaiting = func() *CertifiedSwitch {
+			return switchSweeper.sweep(alpenglowExecutedBlockIDs, mithrilState.LastRootedSlot, replayFrontier)
+		}
+	}
+
+	// Streaming execution: while the loop waits for the next complete block,
+	// the executor runs the entry batches of frontier+1 as turbine decodes
+	// them, against a speculative bank on lastSlotCtx. The closures read the
+	// loop's state at call time. streamInput is nil when the feed is off so
+	// the wait keeps its exact pre-streaming behaviour.
+	var streamer *streamingExecutor
+	var streamInput replayStreamer
+	// frontierMark is the timeline record of the last executed block (skips
+	// do not touch it: a child's parent is always a real block); the executor
+	// reads it to attribute a child's open delay to its parent's arrival, its
+	// parent's replay, or the loop itself.
+	var frontierMark streamingFrontierMark
+	if blockStream.StreamEvents() != nil {
+		streamer = newStreamingExecutor(streamingDeps{
+			acctsDb:             acctsDb,
+			feed:                blockStream,
+			epochSchedule:       epochSchedule,
+			txParallelism:       txParallelism,
+			dbgOpts:             dbgOpts,
+			persistedHashes:     persistedHashes,
+			tail:                unrootedTailState,
+			transactionStatuses: transactionStatuses,
+			alpenglowClock:      alpenglowMode,
+			alpenglowMode:       alpenglowMode,
+			unrootedTailUsed:    unrootedTailState != nil,
+			lastSlotCtx:         func() *sealevel.SlotCtx { return lastSlotCtx },
+			frontier:            func() uint64 { return replayFrontier },
+			frontierMark:        func() streamingFrontierMark { return frontierMark },
+			currentFeatures:     func() *features.Features { return replayCtx.CurrentFeatures },
+			currentEpoch:        func() uint64 { return currentEpoch },
+			rewardsInFlight: func() bool {
+				return partitionedRewardsInfo != nil && partitionedRewardsInfo.NumRewardPartitionsRemaining > 0
+			},
+			switchPending: func() bool {
+				return switchSweeper.peek(alpenglowExecutedBlockIDs, mithrilState.LastRootedSlot, replayFrontier) != nil
+			},
+			executedBlockID: func(slot uint64) (solana.Hash, bool) {
+				if id, ok := alpenglowExecutedBlockIDs[slot]; ok {
+					return id, true
+				}
+				return global.AlpenglowBlockID(slot)
+			},
+		})
+		streamInput = streamer
+		defer streamer.shutdown()
+		mlog.Log.Infof("streaming execution enabled: workers=%d min_group_batches=%d max_open=%s",
+			StreamingExecutionCfg.workers(txParallelism), StreamingExecutionCfg.MinGroupBatches, StreamingExecutionCfg.maxOpenAge())
 	}
 
 	for {
@@ -2457,11 +2590,13 @@ func ReplayBlocks(
 		}
 
 		var (
-			block          *b.Block
-			parentSwitch   *blockstream.AlpenglowParentSwitch
-			ingressTimings *b.TurbineIngressTimings
-			waitTime       time.Duration
-			neededAt       time.Time // when replay asked the source for this slot
+			block           *b.Block
+			parentSwitch    *blockstream.AlpenglowParentSwitch
+			certifiedSwitch *CertifiedSwitch
+			ingressTimings  *b.TurbineIngressTimings
+			waitTime        time.Duration
+			neededAt        time.Time // when replay asked the source for this slot
+			admittedAt      time.Time // when the source handed replay this input
 		)
 
 		{
@@ -2495,13 +2630,20 @@ func ReplayBlocks(
 			}
 
 			neededAt = time.Now()
-			block, parentSwitch = blockStream.NextBlockOrAlpenglowParentSwitch(ctx)
+			if frontierMark.waitEnteredAt.IsZero() {
+				// First wait after the last executed block: what precedes it is
+				// that block's post-replay tail (promotion, RPC, stats).
+				frontierMark.waitEnteredAt = neededAt
+			}
+			block, parentSwitch, certifiedSwitch = waitForReplayInput(ctx,
+				blockStream.NextReplayInput, sweepWhileWaiting, decisionChanges, alpenglowSwitchPollInterval, streamInput)
 			if ingress, ok := block.CompleteTurbineReplayAdmission(time.Now()); ok {
 				_ = statsd.Duration(statsd.TurbineReplayAdmission, ingress.ReplayAdmission, nil)
 				ingressTimings = &ingress
 			}
 
-			waitTime = time.Since(neededAt)
+			admittedAt = time.Now()
+			waitTime = admittedAt.Sub(neededAt)
 
 			if stallDone != nil {
 				close(stallDone)
@@ -2509,6 +2651,20 @@ func ReplayBlocks(
 			if ctx.Err() != nil {
 				mlog.Log.Infof("context cancelled while waiting for the next block: %v", ctx.Err())
 				result.WasCancelled = true
+				break
+			}
+			// Any fork switch invalidates a speculative bank above the frontier:
+			// its parent chain is about to be unwound or re-served.
+			if certifiedSwitch != nil || parentSwitch != nil {
+				streamer.discard("fork_switch")
+			}
+			if certifiedSwitch != nil {
+				if handleAlpenglowSwitch(certifiedSwitch, func() bool {
+					blockStream.RewindForAlpenglowSwitch(certifiedSwitch.Slot, certifiedSwitch.Certified)
+					return true
+				}) {
+					continue
+				}
 				break
 			}
 
@@ -2525,6 +2681,7 @@ func ReplayBlocks(
 						result.Error = fmt.Errorf("alpenglow speculative switch at slot %d: block source rejected pre-execution branch selection", parentSwitch.SwitchSlot)
 						break
 					}
+					windowSwitchSourceOnly++
 					mlog.Log.Warnf("ALPENGLOW speculative fork selected before execution: replaced queued suffix from slot %d with child %s at slot %d (replay currently at slot %d; no account-state unwind needed)",
 						parentSwitch.SwitchSlot, parentSwitch.ChildID, parentSwitch.ChildSlot, currentExecutedAnchorSlot())
 					continue
@@ -2546,6 +2703,7 @@ func ReplayBlocks(
 						result.Error = fmt.Errorf("alpenglow speculative switch at slot %d: block source rejected rooted-branch retention", parentSwitch.SwitchSlot)
 						break
 					}
+					windowSwitchRetained++
 					mlog.Log.Warnf("ALPENGLOW rooted branch retained: discarded late speculative child %s at slot %d linking to ancestor %s at slot %d; switch slot %d is already durable through %d",
 						parentSwitch.ChildID, parentSwitch.ChildSlot, parentSwitch.ParentID, parentSwitch.ParentSlot, parentSwitch.SwitchSlot, mithrilState.LastRootedSlot)
 					continue
@@ -2585,10 +2743,16 @@ func ReplayBlocks(
 				continue
 			}
 
+			// A speculative stream may span unresolved slots on the last bank.
+			// An actual intervening block invalidates that assumption before any
+			// validation or bank work can observe speculative global state.
+			streamer.beforeBlock(block)
+
 			// An in-flight source send can race the first quarantine drain. Exact
 			// emitted suffix IDs are hard-tombstoned before that send, so discard
 			// any leaked descendant before it reaches consensus observation.
 			if blockStream.IsObjectivelyInvalidAlpenglowBlock(block) {
+				streamer.discardSlot(block.Slot, "quarantined")
 				mlog.Log.Warnf("replay: discarding quarantined Alpenglow block %s at slot %d before consensus observation",
 					solana.Hash(block.AlpenglowBlockID), block.Slot)
 				continue
@@ -2598,6 +2762,7 @@ func ReplayBlocks(
 				if validationErr := validatePreConsensusTransactionStatuses(
 					transactionStatuses, block, currentExecutedAnchorSlot(),
 				); validationErr != nil {
+					streamer.discardSlot(block.Slot, "status_validation")
 					if !IsAlreadyProcessedTransactionError(validationErr) {
 						result.Error = fmt.Errorf("pre-consensus block validation failed at slot %d: %w", block.Slot, validationErr)
 						mlog.Log.Errorf("%v", result.Error)
@@ -2605,6 +2770,28 @@ func ReplayBlocks(
 					}
 					if quarantineErr := blockStream.QuarantineInvalidAlpenglowBlock(block); quarantineErr != nil {
 						result.Error = fmt.Errorf("pre-consensus block validation failed at slot %d and the source could not quarantine it (%v): %w",
+							block.Slot, quarantineErr, validationErr)
+						mlog.Log.Errorf("%v", result.Error)
+						break
+					}
+					mlog.Log.Warnf("replay: %v; exact Alpenglow candidate quarantined before ObserveBlock/voting", validationErr)
+					continue
+				}
+			}
+
+			// A complete Turbine candidate may carry an invalid reward certificate
+			// and be skipped by the cluster. Reject it before ObserveBlock/voting
+			// or any bank changes, while the selected parent is still untouched.
+			if alpenglowMode && !block.IsSkipped {
+				if validationErr := validatePreConsensusRewardCertificates(block, epochSchedule, block.AlpenglowShredVersion); validationErr != nil {
+					streamer.discardSlot(block.Slot, "reward_certificates")
+					if !IsInvalidRewardCertificateError(validationErr) {
+						result.Error = fmt.Errorf("pre-consensus reward validation failed at slot %d: %w", block.Slot, validationErr)
+						mlog.Log.Errorf("%v", result.Error)
+						break
+					}
+					if quarantineErr := blockStream.QuarantineInvalidAlpenglowBlock(block); quarantineErr != nil {
+						result.Error = fmt.Errorf("pre-consensus reward validation failed at slot %d and the source could not quarantine it (%v): %w",
 							block.Slot, quarantineErr, validationErr)
 						mlog.Log.Errorf("%v", result.Error)
 						break
@@ -2637,16 +2824,16 @@ func ReplayBlocks(
 				}
 			}
 
-			// Execute-on-receipt correction: certificates arriving after a slot
-			// executed can name a different outcome. The sweep reports the first
-			// contradiction. The COMMON path resolves it in RAM: evict the wrong
-			// suffix from the WorkingSet, rebuild execution state from the
-			// retained parent context, and continue the loop. Guarded cases
-			// (reasons below) surface a typed error instead and the node-level
-			// recovery loop re-replays from the rooted checkpoint (repair
-			// re-fetches the certified version either way).
+			// Correct consumed outcomes when the chain-decision version, replay
+			// frontier, or rooted frontier changes. The sweep reports the first
+			// contradiction. Replacing trailing skips only rewinds the source;
+			// replacing executed blocks also unwinds account state to the retained
+			// parent. If that unwind is unavailable, a typed error asks node-level
+			// recovery to re-replay from the rooted checkpoint. Repair fetches the
+			// selected block in either case.
 			if unrootedTailState != nil {
-				if sw := switchSweeper.sweep(alpenglowExecutedBlockIDs, mithrilState.LastRootedSlot, currentExecutedAnchorSlot()); sw != nil {
+				if sw := switchSweeper.sweep(alpenglowExecutedBlockIDs, mithrilState.LastRootedSlot, replayFrontier); sw != nil {
+					streamer.discard("fork_switch")
 					if handleAlpenglowSwitch(sw, func() bool {
 						blockStream.RewindForAlpenglowSwitch(sw.Slot, sw.Certified)
 						return true
@@ -2702,9 +2889,11 @@ func ReplayBlocks(
 
 		// Handle skipped slots - log and continue without execution
 		if block.IsSkipped {
-			// Zero is the explicit locally executed outcome for a skip. Parent-ID
+			streamer.discardSlot(block.Slot, "skipped")
+			// Zero is the explicit locally consumed outcome for a skip. Parent-ID
 			// gap inference is provisional; recording it lets a later certificate
-			// naming a real block trigger the same in-RAM switch as a wrong sibling.
+			// or discovered ancestry require a source rewind and, when necessary,
+			// an account-state unwind.
 			if consensusEngine != nil && unrootedTailState != nil {
 				alpenglowExecutedBlockIDs[block.Slot] = solana.Hash{}
 			}
@@ -2717,7 +2906,7 @@ func ReplayBlocks(
 			// arrivals (leader sent something but the slot never became full).
 			// Full detail (wait) stays in logs.
 			partialShreds, repairedShreds, _, _ := blockStream.TurbineShredObservation(block.Slot)
-			mlog.Log.InfofPrecise("%s", buildSkippedStatsLine(block.Slot, leaderStr, partialShreds, repairedShreds))
+			mlog.Log.InfofPrecise("%s", appendNextLeaderHint(buildSkippedStatsLine(block.Slot, leaderStr, partialShreds, repairedShreds), nextLeader.hint(block.Slot)))
 			if partialShreds > 0 {
 				windowSkippedWithShreds++
 			}
@@ -2729,6 +2918,7 @@ func ReplayBlocks(
 			// A resolved skip still advances replay progress for near-tip mode and
 			// consensus-managed Lightbringer delivery.
 			blockStream.SetLastExecutedSlot(block.Slot)
+			replayFrontier = block.Slot
 			global.SetReplayFrontier(block.Slot)
 			continue // Skip all execution - no state changes for skipped slots
 		}
@@ -2746,6 +2936,11 @@ func ReplayBlocks(
 			record.TransactionParse.AddTiming(ingressTimings.TransactionParse)
 			record.TransactionSigverify.AddTiming(ingressTimings.TransactionSigverify)
 			record.ReplayAdmission.AddTiming(ingressTimings.ReplayAdmission)
+			record.EarlyTransactionParse.AddTiming(ingressTimings.EarlyTransactionParse)
+			record.EarlyTransactionSigverify.AddTiming(ingressTimings.EarlyTransactionSigverify)
+			record.EarlyPreparationWait.AddTiming(ingressTimings.EarlyPreparationWait)
+			record.EarlyVerifiedTransactions = ingressTimings.EarlyVerifiedTransactions
+			record.FullToReady.AddTiming(ingressTimings.FullToReady)
 		}
 		start := time.Now()
 
@@ -2824,6 +3019,7 @@ func ReplayBlocks(
 				boundaryParentCtx = epochBoundaryParentCtx(acctsDb, block, currentEpoch, replayCtx.CurrentFeatures)
 			}
 			partitionedRewardsInfo = handleEpochTransition(acctsDb, partitionedEpochRewardsEnabled, boundaryParentCtx, replayCtx, epochSchedule, replayCtx.CurrentFeatures, block, currentEpoch, rpcc, dbgOpts)
+			rewardsCompletion = partitionedRewardsCompletion{}
 			currentEpoch = block.Epoch
 			justCrossedEpochBoundary = true
 			// While partitioned rewards are distributing, hold durable promotion
@@ -2920,7 +3116,29 @@ func ReplayBlocks(
 		if lastSlotCtx != nil {
 			parentBankSysvars = lastSlotCtx.BankSysvars()
 		}
-		lastSlotCtx, err = ProcessBlock(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, unrootedTailState, transactionStatuses, alpenglowClock, parentBankSysvars)
+		if block.FromLocalProduction {
+			streamer.discardSlot(block.Slot, "local_production")
+			lastSlotCtx, err = adoptLocalLeaderBlock(block, unrootedTailState, transactionStatuses, persistedHashes)
+		} else {
+			// A stream open on this slot finishes the block on its speculative
+			// bank when the block proves to be what it executed; otherwise the
+			// stream is discarded and the block executes whole, exactly as
+			// without streaming.
+			streamed := false
+			if streamer.matches(block.Slot) {
+				var streamedCtx *sealevel.SlotCtx
+				streamedCtx, streamed, err = streamer.finalize(block, parentBankSysvars)
+				if streamed {
+					lastSlotCtx = streamedCtx
+				}
+			} else {
+				streamer.discard("other_block")
+			}
+			if !streamed {
+				streamer.noteWholeBlock(block)
+				lastSlotCtx, err = ProcessBlock(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, unrootedTailState, transactionStatuses, alpenglowClock, parentBankSysvars)
+			}
+		}
 		processBlockEnd := time.Now()
 		metrics.GlobalBlockReplay.ProcessBlock.AddTiming(processBlockEnd.Sub(processBlockStart))
 		if err != nil {
@@ -2932,6 +3150,7 @@ func ReplayBlocks(
 		}
 		// The successful child now owns its derived snapshot. Any later bank uses
 		// lastSlotCtx; the one-shot retained unwind bridge is no longer needed.
+		rewardsCompletion.observeBank(partitionedRewardsInfo, lastSlotCtx.BankSysvars())
 		unwoundParentBankSysvars = nil
 		postProcessBlockStart := processBlockEnd
 		statusViewStart := time.Now()
@@ -2988,6 +3207,11 @@ func ReplayBlocks(
 				break
 			}
 		}
+		recordFullToReplayed(block)
+		// The same instant FullToReplayed ends at: from here to the next wait
+		// entry is this block's post-replay tail, which a child's open timeline
+		// reports as OpenWaitPostReplay.
+		frontierMark = streamingFrontierMark{slot: block.Slot, fullNanos: block.ShredFullNanos, admittedAt: admittedAt, replayedAt: time.Now()}
 
 		if rpcServer != nil {
 			rpcServer.SetSlotCtx(lastSlotCtx)
@@ -3175,7 +3399,7 @@ func ReplayBlocks(
 			readySecsLine = float64(block.ShredFullNanos-neededAt.UnixNano()) / 1e9
 			asmSecsLine = float64(block.ShredFullNanos-block.ShredFirstNanos) / 1e9
 		}
-		mlog.Log.InfofPrecise("%s", buildSlotStatsLine(block.Slot, leaderStr, txnCount, totalCU, execMsLine, hasShreds, readySecsLine, asmSecsLine, block.RepairedShreds))
+		mlog.Log.InfofPrecise("%s", appendNextLeaderHint(buildSlotStatsLine(block.Slot, leaderStr, txnCount, totalCU, execMsLine, hasShreds, readySecsLine, asmSecsLine, block.RepairedShreds), nextLeader.hint(block.Slot)))
 		// Full detail (wait, vote split) stays in file logs for debugging.
 		var voteTxCount int
 		for _, tx := range block.Transactions {
@@ -3199,6 +3423,7 @@ func ReplayBlocks(
 
 		// Track last executed slot for accurate tip distance calculation and mode switching
 		blockStream.SetLastExecutedSlot(block.Slot)
+		replayFrontier = block.Slot
 		global.SetReplayFrontier(block.Slot)
 
 		if !justCrossedEpochBoundary {
@@ -3283,7 +3508,7 @@ func ReplayBlocks(
 					finalizedStr = fmt.Sprintf("%d", lastRootedWatermark)
 				}
 				if windowSwitches > 0 {
-					mlog.Log.InfofPrecise("  consensus: finalized slot %s | switches %d (in-RAM %d, fallback %d)", finalizedStr, windowSwitches, windowSwitchInRAM, windowSwitchFallback)
+					mlog.Log.InfofPrecise("  consensus: finalized slot %s | switches %d (in-RAM %d, source-only %d, retained %d, fallback %d)", finalizedStr, windowSwitches, windowSwitchInRAM, windowSwitchSourceOnly, windowSwitchRetained, windowSwitchFallback)
 					if len(switchFallbackReasons) > 0 {
 						mlog.Log.FileOnlyf("switch fallback reasons this window: %v", switchFallbackReasons)
 					}
@@ -3375,6 +3600,8 @@ func ReplayBlocks(
 				windowSkippedWithShreds = 0
 				windowSwitches = 0
 				windowSwitchInRAM = 0
+				windowSwitchSourceOnly = 0
+				windowSwitchRetained = 0
 				windowSwitchFallback = 0
 				clear(switchFallbackReasons)
 				promotionHolds = 0
@@ -3623,6 +3850,28 @@ type blockTransactionExecutionPlan struct {
 	processedSignatures uint64
 }
 
+// validateBlockTransactionVersions is the authoritative bank-boundary feature
+// check for transactions arriving from any block source. Native Turbine must be
+// able to decode a V1 wire packet before the candidate bank is constructed, so
+// ingress cannot safely decide whether V1 is active. The candidate block's
+// feature snapshot can, and must reject pre-activation V1 before transaction
+// execution can turn UnsupportedVersion into a nil-fee replay invariant panic.
+func validateBlockTransactionVersions(block *b.Block) error {
+	if block == nil {
+		return errors.New("nil block")
+	}
+	v1Active := block.Features != nil && block.Features.IsActive(features.EnableTxV1)
+	if v1Active {
+		return nil
+	}
+	for idx, tx := range block.Transactions {
+		if tx != nil && tx.Message.GetVersion() == solana.MessageVersionV1 {
+			return fmt.Errorf("transaction %d uses V1 before EnableTxV1 activation: %w", idx, TxErrUnsupportedVersion)
+		}
+	}
+	return nil
+}
+
 // planBlockTransactionExecution mirrors Agave's AlreadyProcessed check for
 // transactions presented to one bank. A duplicate message makes the whole
 // block invalid; replay must never silently filter it and compute a bank hash
@@ -3798,10 +4047,14 @@ func lightbringerEntryExecutionBatches(transactions []*solana.Transaction, entry
 			}
 			segmentBatches[batchIdx] = append(segmentBatches[batchIdx], txIdx)
 			for _, roAcct := range readonlyAccounts {
-				lastReadBatch[roAcct] = batchIdx
+				if previous, exists := lastReadBatch[roAcct]; !exists || batchIdx > previous {
+					lastReadBatch[roAcct] = batchIdx
+				}
 			}
 			for _, writeAcct := range writableAccounts {
-				lastWriteBatch[writeAcct] = batchIdx
+				if previous, exists := lastWriteBatch[writeAcct]; !exists || batchIdx > previous {
+					lastWriteBatch[writeAcct] = batchIdx
+				}
 			}
 		}
 		*batches = append(*batches, segmentBatches...)
@@ -3827,28 +4080,35 @@ func lightbringerEntryExecutionBatches(transactions []*solana.Transaction, entry
 	return batches
 }
 
-func parallelTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, block *b.Block, rblock *b.Block, executionPlan blockTransactionExecutionPlan, txParallelism int, dbgOpts *DebugOptions, shouldVerifySignatures bool) (fees.TxFeeInfoAccumulator, uint64) {
+func parallelTxLoop(
+	slotCtx *sealevel.SlotCtx,
+	sigverifyWg *sync.WaitGroup,
+	planner *preparedDependencyPlanner,
+	block *b.Block,
+	executionPlan blockTransactionExecutionPlan,
+	txParallelism int,
+	dbgOpts *DebugOptions,
+	shouldVerifySignatures bool,
+) (fees.TxFeeInfoAccumulator, uint64) {
 	var txFeeAccumulator fees.TxFeeInfoAccumulator
 	txFeeInfos := make([]*fees.TxFeeInfo, len(block.Transactions))
 	txComputeUnitsConsumed := make([]uint64, len(block.Transactions))
 	errs := make([]error, len(block.Transactions))
 
-	plannerBlock := block
-	if rblock.FromLiveStream {
-		plannerBlock = rblock
-	}
-
-	if canUseDependencyPlanner(plannerBlock) {
+	plannerWaitStart := time.Now()
+	dependencyPlan, plannerBuildDuration, plannerAvailable := planner.wait()
+	metrics.GlobalBlockReplay.DependencyPlannerWait.AddTimingSince(plannerWaitStart)
+	if plannerAvailable {
+		metrics.GlobalBlockReplay.DependencyPlannerPrepared = 1
+		metrics.GlobalBlockReplay.DependencyPlannerBuild.AddTiming(plannerBuildDuration)
 		do := make(chan int, len(block.Transactions))
 		done := make(chan int, len(block.Transactions))
 		plannerDone := make(chan struct{})
 		go func() {
 			defer close(plannerDone)
-			plannerStart := time.Now()
-			topsortPlannerStream(plannerBlock, do, done, func() {
-				metrics.GlobalBlockReplay.DependencyPlannerBuild.AddTimingSince(plannerStart)
-			})
-			metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTimingSince(plannerStart)
+			plannerDispatchStart := time.Now()
+			dispatchDependencyPlan(dependencyPlan, do, done)
+			metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTimingSince(plannerDispatchStart)
 		}()
 
 		wg := &sync.WaitGroup{}
@@ -3863,10 +4123,10 @@ func parallelTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, bloc
 					}
 					tx := block.Transactions[idx]
 					var txMeta *rpc.TransactionMeta
-					if idx < len(rblock.TxMetas) {
-						txMeta = rblock.TxMetas[idx]
+					if idx < len(block.TxMetas) {
+						txMeta = block.TxMetas[idx]
 					}
-					txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = ProcessTransaction(slotCtx, sigverifyWg, rblock.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[i], shouldVerifySignatures)
+					txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = ProcessTransaction(slotCtx, sigverifyWg, block.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[i], shouldVerifySignatures)
 					txErr := errs[idx]
 					// check for success-failure return value divergences
 					if txMeta != nil && txErr == nil && txMeta.Err != nil {
@@ -3887,12 +4147,29 @@ func parallelTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, bloc
 		wg.Wait()
 		close(done)
 		<-plannerDone
-	} else if rblock.FromLiveStream {
-		plannerDispatchStart := time.Now()
-		var plannerBuildDuration time.Duration
+	} else if block.FromLiveStream {
+		metrics.GlobalBlockReplay.DependencyPlannerFallback = 1
+		// Include any unsuccessful prepared-planner attempt in the total planner
+		// work, then build all fallback batches before timing dispatch. This
+		// keeps Build and Dispatch comparable across the two planner modes.
+		fallbackBuildStart := time.Now()
+		var executionBatches [][]uint64
+		relaxIntraBatchAccountLocks := block.Features != nil &&
+			block.Features.IsActive(features.RelaxIntraBatchAccountLocks)
+		for _, entry := range block.Entries {
+			executionBatches = append(
+				executionBatches,
+				lightbringerEntryExecutionBatches(block.Transactions, entry, relaxIntraBatchAccountLocks)...,
+			)
+		}
+		plannerBuildDuration += time.Since(fallbackBuildStart)
+		metrics.GlobalBlockReplay.DependencyPlannerBuild.AddTiming(plannerBuildDuration)
+
 		batchWg := &sync.WaitGroup{}
 		workersWg := &sync.WaitGroup{}
-		do := make(chan uint64, txParallelism)
+		// The full-block buffer makes final-wave enqueue non-blocking, matching
+		// the prepared CSR dispatch timer's end boundary.
+		do := make(chan uint64, len(block.Transactions))
 		workersWg.Add(txParallelism)
 		for i := range txParallelism {
 			go func(workerIdx int) {
@@ -3900,10 +4177,10 @@ func parallelTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, bloc
 				for idx := range do {
 					tx := block.Transactions[idx]
 					var txMeta *rpc.TransactionMeta
-					if int(idx) < len(rblock.TxMetas) {
-						txMeta = rblock.TxMetas[idx]
+					if int(idx) < len(block.TxMetas) {
+						txMeta = block.TxMetas[idx]
 					}
-					txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = ProcessTransaction(slotCtx, sigverifyWg, rblock.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[workerIdx], shouldVerifySignatures)
+					txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = ProcessTransaction(slotCtx, sigverifyWg, block.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[workerIdx], shouldVerifySignatures)
 					txErr := errs[idx]
 					if txMeta != nil && txErr == nil && txMeta.Err != nil {
 						mlog.Log.Errorf("[run:%s] DIVERGENCE in slot %d: tx %s succeeded locally but failed onchain: %+v",
@@ -3919,32 +4196,30 @@ func parallelTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, bloc
 			}(i)
 		}
 
-		relaxIntraBatchAccountLocks := rblock.Features != nil &&
-			rblock.Features.IsActive(features.RelaxIntraBatchAccountLocks)
-		for _, entry := range rblock.Entries {
-			plannerBuildStart := time.Now()
-			batches := lightbringerEntryExecutionBatches(rblock.Transactions, entry, relaxIntraBatchAccountLocks)
-			plannerBuildDuration += time.Since(plannerBuildStart)
-			for _, batch := range batches {
-				executable := 0
-				for _, txIdx := range batch {
-					if executionPlan.execute[txIdx] {
-						executable++
-					}
+		plannerDispatchStart := time.Now()
+		for batchIdx, batch := range executionBatches {
+			executable := 0
+			for _, txIdx := range batch {
+				if executionPlan.execute[txIdx] {
+					executable++
 				}
-				batchWg.Add(executable)
-				for _, txIdx := range batch {
-					if executionPlan.execute[txIdx] {
-						do <- txIdx
-					}
-				}
-				batchWg.Wait()
 			}
+			batchWg.Add(executable)
+			for _, txIdx := range batch {
+				if executionPlan.execute[txIdx] {
+					do <- txIdx
+				}
+			}
+			if batchIdx == len(executionBatches)-1 {
+				metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTimingSince(plannerDispatchStart)
+			}
+			batchWg.Wait()
+		}
+		if len(executionBatches) == 0 {
+			metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTimingSince(plannerDispatchStart)
 		}
 		close(do)
 		workersWg.Wait()
-		metrics.GlobalBlockReplay.DependencyPlannerBuild.AddTiming(plannerBuildDuration)
-		metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTimingSince(plannerDispatchStart)
 	} else {
 		panic("dependency planner unavailable for non-Lightbringer block")
 	}
@@ -3979,39 +4254,6 @@ func parallelTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, bloc
 	return txFeeAccumulator, totalComputeUnitsConsumed
 }
 
-// prepareDependencyPlannerBlock preserves unresolved transaction account keys
-// only when the dependency planner needs them. Live replay explicitly plans
-// from the execution block after address-table resolution, and sequential
-// replay has no planner, so cloning either kind would be pure overhead.
-func prepareDependencyPlannerBlock(block *b.Block, txParallelism int) (*b.Block, error) {
-	if block == nil {
-		return nil, errors.New("nil block")
-	}
-	if txParallelism <= 0 || block.FromLiveStream {
-		return block, nil
-	}
-
-	unresolvedBlock := &b.Block{
-		Transactions: make([]*solana.Transaction, len(block.Transactions)),
-		TxMetas:      make([]*rpc.TransactionMeta, len(block.TxMetas)),
-		Slot:         block.Slot,
-		ParentSlot:   block.ParentSlot,
-	}
-	for i := range block.Transactions {
-		clonedTx, err := cloneTransaction(block.Transactions[i])
-		if err != nil {
-			return nil, fmt.Errorf("clone transaction %d in slot %d: %w", i, block.Slot, err)
-		}
-		unresolvedBlock.Transactions[i] = clonedTx
-		if i < len(block.TxMetas) && block.TxMetas[i] != nil {
-			unresolvedBlock.TxMetas[i] = &rpc.TransactionMeta{}
-			*unresolvedBlock.TxMetas[i] = *block.TxMetas[i]
-		}
-	}
-
-	return unresolvedBlock, nil
-}
-
 func ProcessBlock(
 	acctsDb *accountsdb.AccountsDb,
 	block *b.Block,
@@ -4032,6 +4274,9 @@ func ProcessBlock(
 	if block == nil {
 		return nil, errors.New("validate transaction messages: nil block")
 	}
+	if err := validateBlockTransactionVersions(block); err != nil {
+		return nil, fmt.Errorf("validate transaction versions for slot %d: %w", block.Slot, err)
+	}
 	executionPlanStart := time.Now()
 	executionPlan, err := planBlockTransactionExecution(block)
 	metrics.GlobalBlockReplay.TransactionExecutionPlan.AddTimingSince(executionPlanStart)
@@ -4039,88 +4284,46 @@ func ProcessBlock(
 		return nil, fmt.Errorf("validate transaction messages for slot %d: %w", block.Slot, err)
 	}
 	statusValidationStart := time.Now()
-	statusValidationErr := transactionStatuses.validateBlockWithPlan(block, executionPlan)
+	statusValidation, statusValidationErr := transactionStatuses.validateBlockForPublication(block, executionPlan)
 	metrics.GlobalBlockReplay.TransactionStatusValidation.AddTimingSince(statusValidationStart)
 	if statusValidationErr != nil {
 		return nil, fmt.Errorf("validate transaction statuses for slot %d: %w", block.Slot, statusValidationErr)
 	}
-	ctx, task := trace.NewTask(context.Background(), "ProcessBlock")
-	defer task.End()
-	trace.Log(ctx, "slot", fmt.Sprintf("%d", block.Slot))
-	trace.Log(ctx, "txCount", fmt.Sprintf("%d", len(block.Transactions)))
-
-	var replayStage atomic.Value
-	var replayStageSince atomic.Int64
-	setReplayStage := func(stage string) {
-		replayStage.Store(stage)
-		replayStageSince.Store(time.Now().UnixNano())
-	}
-	setReplayStage("clone_transactions")
-
-	replayWatchdogDone := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-
-		var lastLoggedStage string
-		var lastLoggedSince int64
-		for {
-			select {
-			case <-replayWatchdogDone:
-				return
-			case <-ticker.C:
-				stageVal := replayStage.Load()
-				stage, ok := stageVal.(string)
-				if !ok || stage == "" {
-					continue
-				}
-				sinceUnix := replayStageSince.Load()
-				if sinceUnix == 0 {
-					continue
-				}
-				if stage == lastLoggedStage && sinceUnix == lastLoggedSince {
-					continue
-				}
-				stageDuration := time.Since(time.Unix(0, sinceUnix))
-				if stageDuration < 10*time.Second {
-					continue
-				}
-				mlog.Log.Warnf("REPLAY WATCHDOG: slot %d stuck in stage %s for %s | txs=%d | lightbringer=%t",
-					block.Slot, stage, stageDuration.Round(time.Second), len(block.Transactions), block.FromLiveStream)
-				lastLoggedStage = stage
-				lastLoggedSince = sinceUnix
-			}
+	statusPreparation := transactionStatuses.startStatusPreparation(executionPlan)
+	defer func() {
+		// Join before returning so a rejected bank cannot leave work behind or
+		// charge its preparation time to the next block's metrics record.
+		statusPreparation.wait()
+		if statusPreparation != nil {
+			metrics.GlobalBlockReplay.TransactionStatusPreparation.AddTiming(statusPreparation.duration)
 		}
 	}()
-	defer close(replayWatchdogDone)
+
+	// The resumable execution state carries the trace task, stage watchdog and
+	// the SlotCtx; streaming execution drives the same object group by group.
+	exec := newBlockExecution(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, tail, transactionStatuses, alpenglowClock, parentBankSysvars)
+	defer exec.close()
+	exec.setReplayStage("prepare_dependency_planner")
 
 	if SerializedParameterArena != nil {
 		SerializedParameterArena.Reset()
 	}
 
-	var sigverifyWg sync.WaitGroup
-	defer func() {
-		sigverifyJoinStart := time.Now()
-		sigverifyWg.Wait()
-		metrics.GlobalBlockReplay.SignatureVerificationJoin.AddTimingSince(sigverifyJoinStart)
-	}()
 	plannerPreparationStart := time.Now()
-	plannerBlock, err := prepareDependencyPlannerBlock(block, txParallelism)
-	metrics.GlobalBlockReplay.DependencyPlannerPreparation.AddTimingSince(plannerPreparationStart)
-	if err != nil {
-		panic(fmt.Sprintf("unable to prepare dependency planner block for slot %d: %v", block.Slot, err))
+	var planner *preparedDependencyPlanner
+	if txParallelism > 0 {
+		planner = newPreparedDependencyPlanner()
+		// RPC metadata makes unresolved ALT accesses available before lookup
+		// resolution. Live blocks without metadata start preparation immediately
+		// after resolution in loadBlockAccountsAndUpdateSysvars.
+		planner.tryStart(block)
 	}
+	metrics.GlobalBlockReplay.DependencyPlannerPreparation.AddTimingSince(plannerPreparationStart)
 
 	start := time.Now()
-	setReplayStage("load_accounts")
-	loadAcctsRegion := trace.StartRegion(ctx, "LoadBlockAccounts")
-	// In rooted-durable mode, block accounts/sysvars load through the unrooted
-	// tail (overlay→durable) so execution sees confirmed-but-unrooted state.
-	var blockSrc blockAccountSource = acctsDb
-	if tail != nil {
-		blockSrc = tail
-	}
-	accts, parentAccts, accountMapCapacity, bankSysvars, err := loadBlockAccountsAndUpdateSysvars(blockSrc, block, epochSchedule, alpenglowClock, parentBankSysvars)
+	exec.setReplayStage("load_accounts")
+	loadAcctsRegion := trace.StartRegion(exec.ctx, "LoadBlockAccounts")
+	accts, parentAccts, accountMapCapacity, bankSysvars, err := loadBlockAccountsAndUpdateSysvars(exec.blockSrc, block, epochSchedule, alpenglowClock, parentBankSysvars, planner)
 	loadAcctsRegion.End()
 	if err != nil {
 		panic(fmt.Sprintf("unable to load slot accounts and update sysvars: %s", err))
@@ -4131,181 +4334,53 @@ func ProcessBlock(
 	metrics.GlobalBlockReplay.LoadBlockAccounts.AddTimingSince(start)
 
 	slotCtxSetupStart := time.Now()
-	slotCtx := newSlotCtx(block, accts, parentAccts, acctsDb, tail, accountMapCapacity)
-	if err := slotCtx.PublishBankSysvars(bankSysvars); err != nil {
-		return nil, fmt.Errorf("publish bank sysvars at slot %d: %w", block.Slot, err)
+	if err := exec.installSlotCtx(accts, parentAccts, accountMapCapacity, bankSysvars); err != nil {
+		return nil, err
 	}
-	bankEpochScheduleValue, ok := bankSysvars.EpochSchedule()
-	if !ok {
-		return nil, fmt.Errorf("bank-local EpochSchedule sysvar unavailable at slot %d", block.Slot)
-	}
-	bankEpochSchedule := &bankEpochScheduleValue
+	slotCtx := exec.slotCtx
 	if requireAlpenglowBlockFooter(block, slotCtx, alpenglowClock) {
 		if err := validateAlpenglowFooterNanosecondClock(slotCtx, block); err != nil {
 			return nil, err
 		}
 	}
-	slotCtx.TraceCtx = ctx
 	slotCtx.NumSignatures = executionPlan.processedSignatures
 	metrics.GlobalBlockReplay.SlotCtxSetup.AddTimingSince(slotCtxSetupStart)
 	var txFeeAccumulator fees.TxFeeInfoAccumulator
 	var totalComputeUnitsConsumed uint64
 	start = time.Now()
 
-	setReplayStage("tx_loop")
-	txLoopRegion := trace.StartRegion(ctx, "TxLoop")
+	exec.setReplayStage("tx_loop")
+	txLoopRegion := trace.StartRegion(exec.ctx, "TxLoop")
 	shouldVerifySignatures := !block.TransactionSignaturesVerified()
 	if txParallelism > 0 {
-		txFeeAccumulator, totalComputeUnitsConsumed = parallelTxLoop(slotCtx, &sigverifyWg, plannerBlock, block, executionPlan, txParallelism, dbgOpts, shouldVerifySignatures)
+		txFeeAccumulator, totalComputeUnitsConsumed = parallelTxLoop(slotCtx, &exec.sigverifyWg, planner, block, executionPlan, txParallelism, dbgOpts, shouldVerifySignatures)
 	} else {
-		txFeeAccumulator, totalComputeUnitsConsumed = sequentialTxLoop(slotCtx, &sigverifyWg, block, executionPlan, dbgOpts, shouldVerifySignatures)
+		txFeeAccumulator, totalComputeUnitsConsumed = sequentialTxLoop(slotCtx, &exec.sigverifyWg, block, executionPlan, dbgOpts, shouldVerifySignatures)
 	}
 	slotCtx.TotalComputeUnitsConsumed = totalComputeUnitsConsumed
 	txLoopRegion.End()
 	metrics.GlobalBlockReplay.TxLoop.AddTimingSince(start)
 
-	start = time.Now()
-	setReplayStage("distribute_fees")
+	exec.txFeeAccumulator = txFeeAccumulator
+	exec.totalCU = totalComputeUnitsConsumed
+	exec.executionPlan = executionPlan
+	exec.statusPreparation = statusPreparation
+	exec.statusValidation = statusValidation
+	return exec.finalize()
+}
 
-	// distribute tx fees to the slot leader
-	// skip leader handling if there are zero transactions in this block
-	if !global.ManageLeaderSchedule() && block.BlockReward != nil && len(block.Transactions) > 0 {
-		slotCtx.LamportsBurnt = fees.DistributeTxFeesToSlotLeader(acctsDb, slotCtx, block.BlockReward.Leader, &txFeeAccumulator)
-		slotCtx.RecordModifiedAcct(block.BlockReward.Leader)
-	} else if global.ManageLeaderSchedule() && len(block.Transactions) > 0 {
-		slotCtx.LamportsBurnt = fees.DistributeTxFeesToSlotLeader(acctsDb, slotCtx, block.Leader, &txFeeAccumulator)
-		slotCtx.RecordModifiedAcct(block.Leader)
+// recordFullToReplayed measures the vote-path latency replay controls for a
+// turbine block: from the assembler's full-assembly instant (the last shred,
+// carried as ShredFullNanos) to the replay result reaching consensus. Blocks
+// that did not arrive as shreds carry no full instant and record nothing.
+func recordFullToReplayed(block *b.Block) {
+	if block == nil || block.ShredFullNanos <= 0 {
+		return
 	}
-	metrics.GlobalBlockReplay.Reward.AddTimingSince(start)
-
-	start = time.Now()
-	setReplayStage("collect_rent")
-	bankRent, ok := slotCtx.BankSysvars().Rent()
-	if !ok {
-		return nil, fmt.Errorf("bank-local Rent sysvar unavailable at slot %d", block.Slot)
+	fullToReplayed := time.Since(time.Unix(0, block.ShredFullNanos))
+	if fullToReplayed <= 0 {
+		return
 	}
-	rentAccts := rent.CollectRentEagerly(slotCtx, &bankRent, bankEpochSchedule)
-	metrics.GlobalBlockReplay.Rent.AddTimingSince(start)
-
-	start = time.Now()
-	setReplayStage("run_incinerator")
-	runIncinerator(slotCtx)
-	metrics.GlobalBlockReplay.RunIncinerator.AddTimingSince(start)
-
-	// Alpenglow banks set the Clock timestamp from the block footer after execution.
-	if alpenglowClock {
-		footerClockStart := time.Now()
-		if err := applyAlpenglowFooterClock(slotCtx, block, bankEpochSchedule); err != nil {
-			metrics.GlobalBlockReplay.AlpenglowFooterClock.AddTimingSince(footerClockStart)
-			return nil, fmt.Errorf("apply alpenglow footer clock at slot %d: %w", block.Slot, err)
-		}
-		if err := updateAlpenglowNanosecondClockAccount(slotCtx, block); err != nil {
-			metrics.GlobalBlockReplay.AlpenglowFooterClock.AddTimingSince(footerClockStart)
-			return nil, err
-		}
-		metrics.GlobalBlockReplay.AlpenglowFooterClock.AddTimingSince(footerClockStart)
-		voteRewardsStart := time.Now()
-		voteRewardsErr := ApplyAlpenglowVoteRewards(slotCtx, block, bankEpochSchedule, block.SkipRewardCert, block.NotarRewardCert, block.BlockFinalCert, block.AlpenglowShredVersion)
-		metrics.GlobalBlockReplay.AlpenglowVoteRewards.AddTimingSince(voteRewardsStart)
-		if voteRewardsErr != nil {
-			return nil, voteRewardsErr
-		}
-	}
-	if err := finalizeBankSysvars(slotCtx); err != nil {
-		return nil, fmt.Errorf("finalize bank sysvars at slot %d: %w", block.Slot, err)
-	}
-
-	setReplayStage("compile_accounts")
-	start = time.Now()
-	writableAccts, modifiedAccts := compileWritableAndModifiedAccts(slotCtx, block, rentAccts)
-	metrics.GlobalBlockReplay.CompileWritableAndModifiedAccts.AddTimingSince(start)
-	start = time.Now()
-	ensureParentsErr := ensureParentAccountsForModified(slotCtx, modifiedAccts)
-	metrics.GlobalBlockReplay.EnsureParentAccountsForModified.AddTimingSince(start)
-	if ensureParentsErr != nil {
-		return nil, ensureParentsErr
-	}
-
-	start = time.Now()
-	setReplayStage("bankhash")
-	slotCtx.FinalBankhash = bankhash.CalculateBankHash(slotCtx, writableAccts, modifiedAccts, block.ParentBankhash, slotCtx.NumSignatures, block.Blockhash)
-	metrics.GlobalBlockReplay.BankHash.AddTimingSince(start)
-	if alpenglowClock {
-		footerVerificationStart := time.Now()
-		footerVerificationErr := verifyAlpenglowBlockFooter(slotCtx, block, alpenglowClock)
-		metrics.GlobalBlockReplay.AlpenglowFooterVerification.AddTimingSince(footerVerificationStart)
-		if footerVerificationErr != nil {
-			writeFooterBankhashMismatchArtifact(footerVerificationErr, block, slotCtx, writableAccts, modifiedAccts)
-			return nil, footerVerificationErr
-		}
-	}
-
-	// Bankhash consensus enforcement is handled in the replay loop (not here)
-	// because forkchoice is fed after ProcessBlock returns — checking here would
-	// never see votes from recently submitted blocks and could deadlock.
-
-	// Enter critical commit window - panics here may leave AccountsDB inconsistent
-	commitSlot.Store(slotCtx.Slot)
-	commitInProgress.Store(true)
-	blockUpdateStart := time.Now()
-	setReplayStage("store_accounts")
-	persistedSlot := slotCtx.Slot
-	persistedBankhash := append([]byte(nil), slotCtx.FinalBankhash...)
-	persistedBlockSlot := block.Slot
-	stakeIndexDir := filepath.Join(acctsDb.AcctsDir, "..")
-	afterStoreAccounts := func() {
-		if tail != nil {
-			// Rooted-durable: accounts + bankhash are buffered in the overlay and
-			// become durable only on promotion; nothing written here (rooted-only).
-		} else {
-			if berr := acctsDb.StoreBankHashForSlot(persistedSlot, persistedBankhash); berr != nil {
-				mlog.Log.Infof("unable to store bankhash for slot %d", persistedSlot)
-			}
-		}
-		if tail == nil {
-			// Legacy/verify modes (no fork ambiguity): flush per block as before.
-			// Rooted-durable replay flushes at FOLD time instead — entries stay
-			// slot-scoped in RAM so a fork unwind can drop them, and scans merge
-			// the pending set (StreamStakeAccounts) for completeness meanwhile.
-			flushed, err := global.FlushPendingStakePubkeys(stakeIndexDir)
-			if err != nil {
-				mlog.Log.Errorf("failed to flush stake pubkey index: %v", err)
-			} else if flushed > 0 {
-				mlog.Log.Debugf("flushed %d new stake pubkeys to index", flushed)
-			}
-		}
-
-		persistedHashes.Set(persistedBlockSlot, persistedBankhash)
-
-		// Exit critical commit window - AccountsDB is now consistent
-		commitInProgress.Store(false)
-		commitSlot.Store(0)
-	}
-
-	if tail != nil {
-		// Rooted-durable: buffer this slot's writes + bankhash in the RAM overlay
-		// (always, even when empty, so the bankhash is recorded); no durable write.
-		tail.Add(slotCtx.Slot, modifiedAccts, persistedBankhash)
-		afterStoreAccounts()
-	} else if len(modifiedAccts) > 0 {
-		err = acctsDb.StoreAccounts(modifiedAccts, slotCtx.Slot, afterStoreAccounts)
-	}
-	// In rooted-durable mode the callback above is synchronous, so this includes
-	// the complete critical-path overlay publication. Legacy StoreAccounts only
-	// enqueues here; its asynchronous disk work deliberately belongs to no slot's
-	// replay wall time and must never update a later slot's metrics record.
-	metrics.GlobalBlockReplay.BlockUpdateAccounts.AddTimingSince(blockUpdateStart)
-	if err != nil {
-		return slotCtx, err
-	}
-	statusCommitStart := time.Now()
-	statusErr := transactionStatuses.commitBlockWithPlan(block, executionPlan)
-	metrics.GlobalBlockReplay.TransactionStatusCommit.AddTimingSince(statusCommitStart)
-	if statusErr != nil {
-		return nil, fmt.Errorf("commit transaction statuses for slot %d after bank state commit: %w", block.Slot, statusErr)
-	}
-
-	global.IncrTransactionCount(executionPlan.processedTxCount)
-	setReplayStage("done")
-	return slotCtx, err
+	metrics.GlobalBlockReplay.FullToReplayed.AddTiming(fullToReplayed)
+	_ = statsd.Duration(statsd.ReplayFullToReplayed, fullToReplayed, nil)
 }

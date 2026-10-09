@@ -30,6 +30,7 @@ func TestCalculateAndDeductTxFees_Simulation_ReturnsErrorWithoutPanic(t *testing
 			emptyTransactionAccounts(),
 			&sealevel.ComputeBudgetLimits{},
 			features.NewFeaturesDefault(),
+			sealevel.NewDefaultRentSysvar(),
 			true,
 		)
 		assert.Nil(t, fee)
@@ -44,6 +45,7 @@ func TestCalculateAndDeductTxFees_BlockReplay_PanicsOnMissingFeePayer(t *testing
 			emptyTransactionAccounts(),
 			&sealevel.ComputeBudgetLimits{},
 			features.NewFeaturesDefault(),
+			sealevel.NewDefaultRentSysvar(),
 			false,
 		)
 	})
@@ -64,6 +66,7 @@ func TestCalculateAndDeductTxFees_BlockReplay_PanicMessageContainsContext(t *tes
 		emptyTransactionAccounts(),
 		&sealevel.ComputeBudgetLimits{},
 		features.NewFeaturesDefault(),
+		sealevel.NewDefaultRentSysvar(),
 		false,
 	)
 }

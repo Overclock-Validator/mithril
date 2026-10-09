@@ -15,9 +15,10 @@ import (
 )
 
 // CommitLeaderInput contains the state required to freeze a locally forged bank.
-// Despite the historical name, CommitLeaderSlot is deliberately in-memory only:
-// the resulting block must still pass through ProcessBlock and the fork-aware
-// WorkingSet before any state can become durable.
+// CommitLeaderSlot is in-memory only: it mutates the producer SlotCtx and
+// computes the footer bank hash. Replay adopts that SlotCtx; it does not
+// re-execute the block. Durable promotion still goes through the fork-aware
+// WorkingSet after the slot is observed.
 type CommitLeaderInput struct {
 	AcctsDb                 *accountsdb.AccountsDb
 	SlotCtx                 *sealevel.SlotCtx
@@ -91,6 +92,7 @@ func PrepareLeaderSlotSysvars(slotCtx *sealevel.SlotCtx, block *b.Block, alpengl
 
 // CommitLeaderSlot freezes a forged bank and computes the footer bank hash. It
 // does not write AccountsDB, update global replay progress, or bypass forkchoice.
+// Replay later adopts the returned SlotCtx instead of running ProcessBlock.
 func CommitLeaderSlot(in CommitLeaderInput) (*sealevel.SlotCtx, error) {
 	if in.AcctsDb == nil || in.SlotCtx == nil || in.Block == nil {
 		return nil, fmt.Errorf("missing leader finalization input")
@@ -122,10 +124,10 @@ func CommitLeaderSlot(in CommitLeaderInput) (*sealevel.SlotCtx, error) {
 		if err := validateAlpenglowFooterNanosecondClock(slotCtx, block); err != nil {
 			return nil, err
 		}
-		// This is a speculative producer bank until the forged block passes
-		// through ordered replay. Keep its Clock slot-local: publishing it to the
+		// This is a speculative producer bank until the forged block is adopted
+		// in slot order. Keep its Clock slot-local: publishing it to the
 		// global replay cache here would replace the true parent Clock before
-		// ProcessBlock loads the block and would produce a different LtHash.
+		// the next network block loads and would produce a different LtHash.
 		if err := applyAlpenglowFooterClockLocal(slotCtx, block, epochSchedule); err != nil {
 			return nil, err
 		}
@@ -137,9 +139,8 @@ func CommitLeaderSlot(in CommitLeaderInput) (*sealevel.SlotCtx, error) {
 		}
 	}
 
-	if len(block.Transactions) > 0 {
-		slotCtx.LamportsBurnt = fees.DistributeTxFeesToSlotLeader(in.AcctsDb, slotCtx, block.Leader, &in.TxFeeAccumulator)
-		slotCtx.RecordModifiedAcct(block.Leader)
+	if err := distributeBlockTxFees(slotCtx, block, &in.TxFeeAccumulator); err != nil {
+		return nil, err
 	}
 	var rentSysvar *sealevel.SysvarRent
 	if bankSysvars := slotCtx.BankSysvars(); bankSysvars != nil {

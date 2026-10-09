@@ -40,6 +40,16 @@ type LoadAndExecuteTransactionOutput struct {
 	Instrs []sealevel.Instruction
 	// ComputeBudgetLimits contains the compute budget limits computed from instructions.
 	ComputeBudgetLimits *sealevel.ComputeBudgetLimits
+	// LoadedAccountsDataSize is the protocol-accounted size determined by the
+	// account loader. Under SIMD-0186 this includes the 64-byte account base,
+	// address-table overhead, and implicitly loaded programdata accounts.
+	LoadedAccountsDataSize uint32
+	// ProcessedAsNoOp marks the SIMD-0290 result for an ordinary-blockhash
+	// transaction whose fee payer failed validation. Such a transaction has no
+	// account or fee effects, but consumes its requested CU and loaded-data
+	// limits for block-cost accounting and retains the validation error as its
+	// transaction status.
+	ProcessedAsNoOp bool
 }
 
 // TransactionProcessingResult represents the result of processing a transaction

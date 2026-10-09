@@ -45,6 +45,7 @@ type ServeRepairStats struct {
 	DropMalformed      uint64
 	DropHeaderInvalid  uint64
 	DropSignature      uint64
+	DropUnverifiedPeer uint64
 	DropNotFound       uint64
 	DropStoreError     uint64
 	DropOversized      uint64
@@ -53,7 +54,7 @@ type ServeRepairStats struct {
 
 func (s ServeRepairStats) Dropped() uint64 {
 	return s.QueueDrops + s.DropMalformed + s.DropHeaderInvalid + s.DropSignature +
-		s.DropNotFound + s.DropStoreError + s.DropOversized
+		s.DropNotFound + s.DropStoreError + s.DropOversized + s.DropUnverifiedPeer
 }
 
 type serveRepairCounters struct {
@@ -68,6 +69,7 @@ type serveRepairCounters struct {
 	dropMalformed      atomic.Uint64
 	dropHeaderInvalid  atomic.Uint64
 	dropSignature      atomic.Uint64
+	dropUnverifiedPeer atomic.Uint64
 	dropNotFound       atomic.Uint64
 	dropStoreError     atomic.Uint64
 	dropOversized      atomic.Uint64
@@ -193,6 +195,7 @@ type ServeRepairServer struct {
 	store    *ShredSpool
 
 	limits   *serveRepairRateLimits
+	peers    *serveRepairPeers
 	now      func() time.Time
 	counters serveRepairCounters
 
@@ -232,6 +235,7 @@ func NewServeRepairServer(cfg ServeRepairConfig) (*ServeRepairServer, error) {
 		self:     self,
 		store:    cfg.Store,
 		limits:   newServeRepairRateLimits(serveRepairMaxTrackedPeers, now),
+		peers:    newServeRepairPeers(serveRepairMaxTrackedPeers),
 		now:      time.Now,
 	}, nil
 }
@@ -321,6 +325,15 @@ func (s *ServeRepairServer) handlePacket(packet []byte, addr netip.AddrPort, wor
 	if repairproto.IsPong(packet) {
 		if !s.limits.allow(addr, now) {
 			s.counters.rateLimited.Add(1)
+			return
+		}
+		pong, ok := repairproto.DecodePong(packet)
+		if !ok {
+			s.counters.dropSignature.Add(1)
+			return
+		}
+		if !s.peers.accept(pong, addr, now) {
+			s.counters.dropUnverifiedPeer.Add(1)
 			return
 		}
 		s.counters.pongs.Add(1)
@@ -413,6 +426,22 @@ func (s *ServeRepairServer) runWorker(ctx context.Context, work <-chan serveRepa
 }
 
 func (s *ServeRepairServer) serve(work serveRepairWork, response []byte) {
+	verified, ping, pingErr := s.peers.check(serveRepairPeerKey{identity: work.request.Sender, addr: work.addr}, s.identity, s.now())
+	if pingErr != nil {
+		s.counters.sendErrors.Add(1)
+		return
+	}
+	if !verified {
+		s.counters.dropUnverifiedPeer.Add(1)
+		if len(ping) != 0 {
+			if _, err := s.conn.WriteToUDPAddrPort(ping, work.addr); err != nil {
+				s.counters.sendErrors.Add(1)
+			} else {
+				s.counters.pings.Add(1)
+			}
+		}
+		return
+	}
 	var (
 		shred []byte
 		ok    bool
@@ -474,6 +503,7 @@ func (s *ServeRepairServer) Stats() ServeRepairStats {
 		DropMalformed:      s.counters.dropMalformed.Load(),
 		DropHeaderInvalid:  s.counters.dropHeaderInvalid.Load(),
 		DropSignature:      s.counters.dropSignature.Load(),
+		DropUnverifiedPeer: s.counters.dropUnverifiedPeer.Load(),
 		DropNotFound:       s.counters.dropNotFound.Load(),
 		DropStoreError:     s.counters.dropStoreError.Load(),
 		DropOversized:      s.counters.dropOversized.Load(),

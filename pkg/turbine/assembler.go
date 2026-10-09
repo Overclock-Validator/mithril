@@ -10,6 +10,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/statsd"
+	"github.com/Overclock-Validator/mithril/pkg/turbine/internal/rsrecover"
 	"github.com/gagliardetto/solana-go"
 	"github.com/klauspost/reedsolomon"
 )
@@ -43,20 +44,26 @@ const (
 )
 
 type SlotAssembler struct {
-	mu                   sync.Mutex
-	slots                map[uint64]*slotState
-	completedSlots       map[uint64]struct{}
-	knownBlockIDs        map[uint64]solana.Hash
-	rejectedBlockIDs     map[uint64]map[solana.Hash]struct{}
-	protectedKnownIDs    map[uint64]struct{}
-	protectedBlockIDs    map[uint64]struct{}
-	priorityRepairSlots  map[uint64]struct{}
-	priorityRepairOrder  []uint64
-	encoders             map[fecLayout]reedsolomon.Encoder
-	partialShredObs      map[uint64]PartialShredObservation // shreds seen for slots that never became full (retained for skip observability)
-	retentionFloor       uint64                             // when non-zero, slots >= floor are never "too old" (repair catchup holds a window far behind the live edge)
-	edgeScanLag          uint64                             // how far behind the shred edge the freshness-repair scan reaches (0 = repairScanSlotWindow)
-	maxObservedSlot      uint64
+	mu                  sync.Mutex
+	slots               map[uint64]*slotState
+	completedSlots      map[uint64]struct{}
+	knownBlockIDs       map[uint64]solana.Hash
+	rejectedBlockIDs    map[uint64]map[solana.Hash]struct{}
+	protectedKnownIDs   map[uint64]struct{}
+	protectedBlockIDs   map[uint64]struct{}
+	priorityRepairSlots map[uint64]struct{}
+	priorityRepairOrder []uint64
+	encoders            map[fecLayout]reedsolomon.Encoder
+	partialShredObs     map[uint64]PartialShredObservation // shreds seen for slots that never became full (retained for skip observability)
+	retentionFloor      uint64                             // when non-zero, slots >= floor are never "too old" (repair catchup holds a window far behind the live edge)
+	edgeScanLag         uint64                             // how far behind the shred edge the freshness-repair scan reaches (0 = repairScanSlotWindow)
+	maxObservedSlot     uint64
+	// Age sweeps depend on the edge, repair floor, and mutations that can add
+	// old metadata or release a completing generation's protected identities.
+	retentionSwept       bool
+	retentionDirty       bool
+	retentionSweepEdge   uint64
+	retentionSweepFloor  uint64
 	highestFullSlot      uint64 // monotonic: highest slot reconstructed from shreds ("full", Agave SlotMeta/is_full sense)
 	recoveredDataShreds  uint64
 	usefulRepairShreds   uint64 // distinct data shreds delivered BY repair (the throughput signal)
@@ -72,6 +79,16 @@ type SlotAssembler struct {
 	// Configured before ingestion; tests may replace it with a blocking probe.
 	// Production uses the process-wide bounded transaction verifier.
 	verifyTransactions func(context.Context, *block.Block) error
+	entryPrefetch      *entryPrefetchPool
+	// Streaming feed subscriber (see stream.go); nil when nothing consumes
+	// batches before completion.
+	streamSubscriber         chan<- StreamEvent
+	streamDroppedEvents      uint64
+	streamRepairParent       *slotState
+	streamRepairChild        *slotState
+	streamRepairInvalidChild *slotState
+	streamRepairUntil        time.Time
+	streamRepairWake         chan<- struct{}
 }
 
 type SlotRepairRequest struct {
@@ -91,14 +108,15 @@ type PartialShredObservation struct {
 }
 
 type slotState struct {
-	slot        uint64
-	parentSlot  uint64
-	shreds      map[uint32]*Shred
-	fecSets     map[uint32]*fecState
-	lastIndex   uint32
-	haveLast    bool
-	shredVer    uint16
-	firstParent bool
+	pipelineTrace *entryPipelineTrace
+	slot          uint64
+	parentSlot    uint64
+	shreds        map[uint32]*Shred
+	fecSets       map[uint32]*fecState
+	lastIndex     uint32
+	haveLast      bool
+	shredVer      uint16
+	firstParent   bool
 
 	// Observability: when the slot's first shred was accepted, and how many of
 	// its shreds arrived via repair rather than turbine.
@@ -106,12 +124,20 @@ type slotState struct {
 	fullAt         time.Time
 	repairedShreds int
 	// completing makes the immutable full state a single-owner generation token.
-	completing bool
+	completing      bool
+	batchIndex      *entryBatchIndex
+	completeBatches []shredBatchRange
+	prefetch        *slotEntryPrefetch
 	// Assembly failures for this slot (mixed variants/signatures, FEC layout
 	// conflicts, ...). A slot frozen below completion while repair responses
 	// flow is usually poisoned state — the latest error names the poison.
 	errCount int
 	lastErr  string
+	// streamCompleted marks a generation whose complete block was accepted, so
+	// the feed's release event says "completed" rather than "cancelled";
+	// streamCancelReason names the discard path otherwise.
+	streamCompleted    bool
+	streamCancelReason string
 }
 
 func (s *slotState) noteError(err error) {
@@ -120,6 +146,8 @@ func (s *slotState) noteError(err error) {
 }
 
 type slotCompletionWork struct {
+	// Captured under mu: cancelled prefetch readers are not completion inputs.
+	ignorePrefetch     bool
 	state              *slotState
 	queuedAt           time.Time
 	observeCollection  bool
@@ -138,10 +166,11 @@ type processedSlotCompletion struct {
 }
 
 type slotCompletionResult struct {
-	block    *block.Block
-	err      error
-	hydrated bool
-	pending  bool
+	generation StreamGeneration
+	block      *block.Block
+	err        error
+	hydrated   bool
+	pending    bool
 }
 
 type fecLayout struct {
@@ -161,6 +190,7 @@ type fecState struct {
 	haveSig     bool
 	dataVariant byte
 	codeVariant byte
+	rootCache   *authenticatedFECRoot
 }
 
 func NewSlotAssembler() *SlotAssembler {
@@ -174,7 +204,6 @@ func NewSlotAssembler() *SlotAssembler {
 		priorityRepairSlots: make(map[uint64]struct{}),
 		partialShredObs:     make(map[uint64]PartialShredObservation),
 		encoders:            make(map[fecLayout]reedsolomon.Encoder),
-		verifyTransactions:  validateBlockTransactionsContext,
 	}
 }
 
@@ -185,6 +214,7 @@ func (a *SlotAssembler) recordPartialObsLocked(state *slotState) {
 	if state == nil || len(state.shreds) == 0 {
 		return
 	}
+	a.retentionDirty = true
 	a.partialShredObs[state.slot] = PartialShredObservation{
 		DataShreds:     len(state.shreds),
 		RepairedShreds: state.repairedShreds,
@@ -239,6 +269,17 @@ func (a *SlotAssembler) AddShredFrom(shred *Shred, fromRepair bool) (*block.Bloc
 // reconstructable it returns a single immutable completion token; decoding,
 // parsing, and signature verification must happen after this method unlocks.
 func (a *SlotAssembler) addShredFrom(shred *Shred, fromRepair bool) (*slotCompletionWork, error) {
+	return a.addShredFromWithRoot(shred, fromRepair, nil)
+}
+
+// addShredFromWithRoot accepts an optional result from successful authentication
+// of this immutable shred. Unauthenticated callers and spool hydration use nil
+// and retain the normal root-computation fallback.
+func (a *SlotAssembler) addShredFromWithRoot(shred *Shred, fromRepair bool, root *solana.Hash) (*slotCompletionWork, error) {
+	var admissionEntered int64
+	if shred != nil && entryTraceSelected(shred.Slot) {
+		admissionEntered = entryTraceNow()
+	}
 	if shred == nil {
 		return nil, nil
 	}
@@ -262,6 +303,16 @@ func (a *SlotAssembler) addShredFrom(shred *Shred, fromRepair bool) (*slotComple
 		a.ignoredOldShreds++
 		return nil, nil
 	}
+	// Diagnostic only; the deferred observation runs while a.mu is still held.
+	var repairTrace *entryRepairTrace
+	if fromRepair && admissionEntered != 0 {
+		repairTrace = &entryRepairTrace{Event: "repair_admission", Origin: entryTraceOrigin.UnixNano(), Slot: shred.Slot, Index: shred.Index, FEC: shred.FECSetIndex, AdmissionStart: admissionEntered, DeficitBefore: traceFECDeficit(state, shred.FECSetIndex), Outcome: "rejected"}
+		defer func() {
+			repairTrace.ResponseAt = entryTraceNow()
+			repairTrace.DeficitAfter = traceFECDeficit(state, shred.FECSetIndex)
+			emitRepairTrace(*repairTrace)
+		}()
+	}
 	var err error
 	switch shred.Type {
 	case ShredTypeData:
@@ -282,13 +333,27 @@ func (a *SlotAssembler) addShredFrom(shred *Shred, fromRepair bool) (*slotComple
 	}
 	if err != nil {
 		if errors.Is(err, ErrDuplicateShred) {
+			if repairTrace != nil {
+				repairTrace.Outcome = "duplicate"
+			}
 			return nil, nil
 		}
 		state.noteError(err)
 		return nil, err
 	}
+	source := entryShredSource{Path: "non_repair", FEC: shred.FECSetIndex, TriggerIndex: shred.Index, TriggerCoding: shred.Type == ShredTypeCode, TriggerRepair: fromRepair, AdmissionEntered: admissionEntered}
+	if fromRepair {
+		source.Path = "repair"
+	}
+	state.traceAcceptedShred(shred, source)
+	a.notePrefetchShredLocked(state, shred)
 	if state.firstShredAt.IsZero() {
 		state.firstShredAt = time.Now()
+	}
+	if root != nil {
+		if fec := state.fecSets[shred.FECSetIndex]; fec != nil {
+			fec.rememberAuthenticatedRoot(shred, *root)
+		}
 	}
 
 	recovered, err := a.recoverFEC(state, shred.FECSetIndex)
@@ -303,10 +368,18 @@ func (a *SlotAssembler) addShredFrom(shred *Shred, fromRepair bool) (*slotComple
 			return nil, err
 		}
 		if err == nil {
+			source.Path = "fec_recovery"
+			state.traceAcceptedShred(recoveredShred, source)
+			a.notePrefetchShredLocked(state, recoveredShred)
 			a.recoveredDataShreds++
 		}
 	}
 
+	if repairTrace != nil {
+		repairTrace.Outcome = "accepted"
+		repairTrace.Recovered = len(recovered)
+	}
+	a.prefetchEntriesLocked(state)
 	if !state.complete() {
 		return nil, nil
 	}
@@ -318,6 +391,9 @@ func (a *SlotAssembler) claimCompletionLocked(state *slotState, reportNonCanonic
 		return nil
 	}
 	now := time.Now()
+	if state.pipelineTrace != nil {
+		state.pipelineTrace.sealed = true
+	}
 	observeCollection := state.fullAt.IsZero()
 	if observeCollection {
 		state.fullAt = now
@@ -332,6 +408,7 @@ func (a *SlotAssembler) claimCompletionLocked(state *slotState, reportNonCanonic
 	}
 	return &slotCompletionWork{
 		state:              state,
+		ignorePrefetch:     state.prefetch != nil && state.prefetch.released,
 		queuedAt:           now,
 		observeCollection:  observeCollection,
 		reportNonCanonical: reportNonCanonical,
@@ -348,6 +425,7 @@ func (a *SlotAssembler) abortCompletion(work *slotCompletionWork) {
 	}
 	a.mu.Lock()
 	if a.slots[work.state.slot] == work.state && work.state.completing {
+		a.retentionDirty = true
 		work.state.completing = false
 	}
 	a.mu.Unlock()
@@ -363,6 +441,7 @@ func (a *SlotAssembler) processCompletion(ctx context.Context, work *slotComplet
 	if ctx.Err() != nil {
 		return processedSlotCompletion{canceled: true}
 	}
+	ctx = withEntryPipelineTrace(ctx, work.state.pipelineTrace)
 	startedAt := time.Now()
 	timings := block.TurbineIngressTimings{CompletionQueueDelay: startedAt.Sub(work.queuedAt)}
 	_ = statsd.Duration(statsd.TurbineBlockCompletionQueueDelay, timings.CompletionQueueDelay, nil)
@@ -374,19 +453,27 @@ func (a *SlotAssembler) processCompletion(ctx context.Context, work *slotComplet
 	}
 
 	decodeStartedAt := time.Now()
-	var decodeTimings entryDecodeTimings
+	decodeTimings := entryDecodeTimings{ctx: ctx}
+	if work.state.prefetch != nil && !work.ignorePrefetch {
+		decodeTimings.prefetched = work.state.prefetch.batches
+	}
 	blk, parentInfo, roots, err := work.state.decodeBlock(&decodeTimings)
 	decodeTotal := time.Since(decodeStartedAt)
-	decodeOnly := decodeTotal - decodeTimings.transactionParse
+	decodeOnly := decodeTotal - decodeTimings.transactionParse - decodeTimings.prefetchWait
 	if decodeOnly < 0 {
 		decodeOnly = 0
 	}
 	timings.BlockDecode = decodeOnly
 	timings.TransactionParse = decodeTimings.transactionParse
+	timings.EarlyPreparationWait = decodeTimings.prefetchWait
 	_ = statsd.Duration(statsd.TurbineBlockDecode, timings.BlockDecode, nil)
 	_ = statsd.Duration(statsd.TurbineTransactionParse, timings.TransactionParse, nil)
 	processed := processedSlotCompletion{block: blk, parentInfo: parentInfo, roots: roots, err: err, timings: timings}
 	if err != nil {
+		if ctx.Err() != nil {
+			processed.canceled = true
+			processed.err = nil
+		}
 		return processed
 	}
 	if ctx.Err() != nil {
@@ -395,7 +482,12 @@ func (a *SlotAssembler) processCompletion(ctx context.Context, work *slotComplet
 	}
 
 	sigverifyStartedAt := time.Now()
-	processed.err = work.verifyTransactions(ctx, blk)
+	if work.state.prefetch != nil && len(decodeTimings.retained) > 0 {
+		processed.err = verifyDecodedEntryBatchesWithTimings(ctx, blk, decodeTimings.retained, work.state.prefetch.pool.verifier, &decodeTimings)
+	} else {
+		processed.err = work.verifyTransactions(ctx, blk)
+	}
+	earlyEntryTimings(&decodeTimings, work.state.fullAt, &processed.timings)
 	processed.timings.TransactionSigverify = time.Since(sigverifyStartedAt)
 	_ = statsd.Duration(statsd.TurbineTransactionSigverify, processed.timings.TransactionSigverify, nil)
 	if ctx.Err() != nil {
@@ -406,6 +498,13 @@ func (a *SlotAssembler) processCompletion(ctx context.Context, work *slotComplet
 	if processed.err == nil {
 		blk.MarkTransactionSignaturesVerified()
 		processed.completionReadyAt = time.Now()
+		processed.timings.FullToReady = processed.completionReadyAt.Sub(work.state.fullAt)
+		_ = statsd.Duration(statsd.TurbineFullToReady, processed.timings.FullToReady, nil)
+		_ = statsd.Duration(statsd.TurbineEarlyPreparationWait, processed.timings.EarlyPreparationWait, nil)
+		_ = statsd.Duration(statsd.TurbineEarlyTransactionParse, processed.timings.EarlyTransactionParse, nil)
+		_ = statsd.Duration(statsd.TurbineEarlyTransactionSigverify, processed.timings.EarlyTransactionSigverify, nil)
+		_ = statsd.Count(statsd.TurbineEarlyVerifiedTransactions, int64(processed.timings.EarlyVerifiedTransactions), nil)
+		queueEntryPipelineReport(work.state, blk, &decodeTimings, startedAt, processed.completionReadyAt)
 	}
 	return processed
 }
@@ -420,11 +519,22 @@ func (a *SlotAssembler) finalizeCompletion(work *slotCompletionWork, processed p
 		a.mu.Unlock()
 		return nil, nil
 	}
+	// Every terminal outcome releases this generation's retention protection.
+	a.retentionDirty = true
+	if processed.canceled {
+		state.completing = false
+		a.mu.Unlock()
+		return nil, nil
+	}
 	if processed.err != nil {
 		// Retain a deterministic decode/verification failure on the live full
 		// state so catchup diagnostics report poison instead of a missing slot.
 		state.noteError(processed.err)
 		state.completing = false
+		// Diagnostics retain the poisoned slot, not a usable stream. Cancel
+		// readers now; cleanup returns capacity only after they have joined.
+		state.streamCancelReason = "completion_failed"
+		a.releasePrefetchLocked(state)
 		a.mu.Unlock()
 		return nil, processed.err
 	}
@@ -434,6 +544,8 @@ func (a *SlotAssembler) finalizeCompletion(work *slotCompletionWork, processed p
 	if !a.acceptAlpenglowBlockIDLocked(blk) {
 		a.trackNonCanonicalBlockIDLocked(blk)
 		a.recordPartialObsLocked(state)
+		state.streamCancelReason = "non_canonical"
+		a.releasePrefetchLocked(state)
 		delete(a.slots, state.slot)
 		a.mu.Unlock()
 		if work.reportNonCanonical {
@@ -442,6 +554,8 @@ func (a *SlotAssembler) finalizeCompletion(work *slotCompletionWork, processed p
 		return nil, nil
 	}
 
+	state.streamCompleted = true
+	a.releasePrefetchLocked(state)
 	delete(a.slots, state.slot)
 	a.completedSlots[state.slot] = struct{}{}
 	a.trackBlockIDLocked(blk)
@@ -510,6 +624,9 @@ func (a *SlotAssembler) SetKnownAlpenglowBlockID(slot uint64, blockID solana.Has
 	if _, rejected := a.rejectedBlockIDs[slot][blockID]; rejected {
 		return
 	}
+	if _, exists := a.knownBlockIDs[slot]; !exists {
+		a.retentionDirty = true
+	}
 	a.knownBlockIDs[slot] = blockID
 }
 
@@ -530,6 +647,7 @@ func (a *SlotAssembler) RejectAlpenglowBlockID(slot uint64, blockID solana.Hash)
 	if ids == nil {
 		ids = make(map[solana.Hash]struct{})
 		a.rejectedBlockIDs[slot] = ids
+		a.retentionDirty = true
 	}
 	ids[blockID] = struct{}{}
 	if a.knownBlockIDs[slot] == blockID {
@@ -540,8 +658,20 @@ func (a *SlotAssembler) RejectAlpenglowBlockID(slot uint64, blockID solana.Hash)
 func (a *SlotAssembler) ResetSlot(slot uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.streamRepairParent != nil && a.streamRepairParent.slot == slot {
+		a.streamRepairParent = nil
+		a.streamRepairChild = nil
+	}
+	if a.streamRepairChild != nil && a.streamRepairChild.slot == slot {
+		a.streamRepairChild = nil
+	}
 
+	a.retentionDirty = true
 	a.recordPartialObsLocked(a.slots[slot])
+	if state := a.slots[slot]; state != nil {
+		state.streamCancelReason = "reset"
+	}
+	a.releasePrefetchLocked(a.slots[slot])
 	delete(a.slots, slot)
 	delete(a.completedSlots, slot)
 }
@@ -551,8 +681,13 @@ func (a *SlotAssembler) PrioritizeRepairSlot(slot uint64) {
 }
 
 func (a *SlotAssembler) PrioritizeRepairRange(start, end uint64) {
+	a.prioritizeRepairRange(start, end)
+}
+
+// Report only newly installed pins, so repeated replay hints do not wake repair.
+func (a *SlotAssembler) prioritizeRepairRange(start, end uint64) bool {
 	if start == 0 {
-		return
+		return false
 	}
 	if end < start {
 		end = start
@@ -564,11 +699,13 @@ func (a *SlotAssembler) PrioritizeRepairRange(start, end uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	changed := false
 	for slot := start; ; slot++ {
 		if _, completed := a.completedSlots[slot]; !completed {
 			if _, exists := a.priorityRepairSlots[slot]; !exists {
 				a.priorityRepairSlots[slot] = struct{}{}
 				a.priorityRepairOrder = append(a.priorityRepairOrder, slot)
+				changed = true
 			}
 		}
 		if slot == end {
@@ -576,6 +713,7 @@ func (a *SlotAssembler) PrioritizeRepairRange(start, end uint64) {
 		}
 	}
 	a.prunePriorityRepairSlotsLocked()
+	return changed
 }
 
 func (a *SlotAssembler) slotState(slot uint64, version uint16) *slotState {
@@ -635,6 +773,35 @@ func (a *SlotAssembler) slotTooOldLocked(slot uint64) bool {
 }
 
 func (a *SlotAssembler) pruneOldSlotsLocked() {
+	if !a.retentionSwept || a.retentionDirty || a.retentionSweepEdge != a.maxObservedSlot || a.retentionSweepFloor != a.retentionFloor {
+		a.sweepRetentionMapsLocked()
+		a.retentionSwept = true
+		a.retentionDirty = false
+		a.retentionSweepEdge = a.maxObservedSlot
+		a.retentionSweepFloor = a.retentionFloor
+	}
+	// New incomplete generations can exceed the cap without advancing the
+	// edge (especially during catch-up). Never cache the capacity check.
+
+	if len(a.slots) == 0 {
+		return
+	}
+	for len(a.slots) > maxRetainedIncompleteSlotCap {
+		victim, ok := a.capEvictionCandidateLocked()
+		if !ok {
+			return
+		}
+		a.recordPartialObsLocked(a.slots[victim])
+		if state := a.slots[victim]; state != nil {
+			state.streamCancelReason = "evicted"
+		}
+		a.releasePrefetchLocked(a.slots[victim])
+		delete(a.slots, victim)
+		a.evictedSlots++
+	}
+}
+
+func (a *SlotAssembler) sweepRetentionMapsLocked() {
 	if len(a.slots) > 0 && a.maxObservedSlot > maxRetainedIncompleteSlotLag {
 		minSlot := a.maxObservedSlot - maxRetainedIncompleteSlotLag
 		if a.retentionFloor > 0 && a.retentionFloor < minSlot {
@@ -643,6 +810,8 @@ func (a *SlotAssembler) pruneOldSlotsLocked() {
 		for slot, state := range a.slots {
 			if slot < minSlot && !state.completing {
 				a.recordPartialObsLocked(state)
+				state.streamCancelReason = "retention"
+				a.releasePrefetchLocked(a.slots[slot])
 				delete(a.slots, slot)
 				a.evictedSlots++
 			}
@@ -686,18 +855,6 @@ func (a *SlotAssembler) pruneOldSlotsLocked() {
 	}
 	a.prunePriorityRepairSlotsLocked()
 
-	if len(a.slots) == 0 {
-		return
-	}
-	for len(a.slots) > maxRetainedIncompleteSlotCap {
-		victim, ok := a.capEvictionCandidateLocked()
-		if !ok {
-			return
-		}
-		a.recordPartialObsLocked(a.slots[victim])
-		delete(a.slots, victim)
-		a.evictedSlots++
-	}
 }
 
 // capEvictionCandidateLocked chooses state furthest ahead of replay, rather
@@ -809,6 +966,10 @@ func (s *slotState) addDataShred(shred *Shred) error {
 }
 
 func (s *slotState) repairRequest(maxMissing int) (SlotRepairRequest, bool) {
+	return s.repairRequestWithPrefix(maxMissing, false)
+}
+
+func (s *slotState) repairRequestWithPrefix(maxMissing int, prefix bool) (SlotRepairRequest, bool) {
 	req := SlotRepairRequest{Slot: s.slot}
 
 	var maxObserved uint32
@@ -825,7 +986,7 @@ func (s *slotState) repairRequest(maxMissing int) (SlotRepairRequest, bool) {
 		req.HighestDataShredIndex = maxObserved + 1
 	}
 
-	req.MissingDataShreds = s.missingDataForRepair(maxObserved, maxMissing)
+	req.MissingDataShreds = s.missingDataForRepairWithPrefix(maxObserved, maxMissing, prefix)
 
 	if len(req.MissingDataShreds) == 0 && !req.NeedHighestDataShred {
 		return SlotRepairRequest{}, false
@@ -874,6 +1035,10 @@ func (span codedSpan) requestsToUnlock() int {
 // promises more — without that, the tail waits on a HighestWindowIndex
 // round trip to be discovered.
 func (s *slotState) missingDataForRepair(maxObserved uint32, maxMissing int) []uint32 {
+	return s.missingDataForRepairWithPrefix(maxObserved, maxMissing, false)
+}
+
+func (s *slotState) missingDataForRepairWithPrefix(maxObserved uint32, maxMissing int, prefix bool) []uint32 {
 	spans := make([]codedSpan, 0, len(s.fecSets))
 	for _, fec := range s.fecSets {
 		if !fec.haveLayout || fec.layout.dataShreds == 0 {
@@ -933,7 +1098,38 @@ func (s *slotState) missingDataForRepair(maxObserved uint32, maxMissing int) []u
 		return spans[order[a]].start < spans[order[b]].start
 	})
 
+	// For a streaming head, one earliest hole gates every later batch. Move
+	// just that span ahead of cheapest-unlock order; retain deficit capping
+	// and every existing request/admission limit. Without a known layout,
+	// prioritize one earliest missing data index rather than guessing a span.
+	var first []uint32
+	if prefix {
+		earliest := -1
+		for _, i := range order {
+			if earliest < 0 || spans[i].missing[0] < spans[earliest].missing[0] {
+				earliest = i
+			}
+		}
+		if len(uncovered) > 0 && (earliest < 0 || uncovered[0] < spans[earliest].missing[0]) {
+			first = uncovered[:1]
+			uncovered = uncovered[1:]
+		} else if earliest >= 0 {
+			first = spans[earliest].missing[:spans[earliest].requestsToUnlock()]
+			for j, i := range order {
+				if i == earliest {
+					order = append(order[:j], order[j+1:]...)
+					break
+				}
+			}
+		}
+	}
 	missing := make([]uint32, 0, min(maxMissing, 64))
+	for _, index := range first {
+		if len(missing) >= maxMissing {
+			return missing
+		}
+		missing = append(missing, index)
+	}
 	for _, i := range order {
 		span := spans[i]
 		for _, index := range span.missing[:span.requestsToUnlock()] {
@@ -1017,6 +1213,9 @@ func (a *SlotAssembler) trackBlockIDLocked(blk *block.Block) {
 	}
 	if known, ok := a.knownBlockIDs[blk.Slot]; ok && known != (solana.Hash{}) && known != blockID {
 		return
+	}
+	if _, exists := a.knownBlockIDs[blk.Slot]; !exists {
+		a.retentionDirty = true
 	}
 	a.knownBlockIDs[blk.Slot] = blockID
 }
@@ -1219,7 +1418,7 @@ func (a *SlotAssembler) RepairRequestsTiered(maxSlots int, maxMissingPerSlot int
 				HighestDataShredIndex: 0,
 			})
 		}
-		if req, ok := state.repairRequest(maxMissing); ok {
+		if req, ok := state.repairRequestWithPrefix(maxMissing, priorityPin && len(dst) == 0 && a.streamSubscriber != nil); ok {
 			seen[slot] = struct{}{}
 			return append(dst, req)
 		}
@@ -1227,7 +1426,11 @@ func (a *SlotAssembler) RepairRequestsTiered(maxSlots int, maxMissingPerSlot int
 	}
 
 	a.prunePriorityRepairSlotsLocked()
-	for _, slot := range a.priorityRepairOrder {
+	// Pin insertion order is retention policy, not dependency order. An older
+	// parent can be discovered after its child; give that parent the head share.
+	ordered := append([]uint64(nil), a.priorityRepairOrder...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	for _, slot := range ordered {
 		// HEAD FIRST: the first priority slot — the one gating emission —
 		// may list up to repairHeadMaxMissing, several times the per-slot
 		// cap, so its admission share stays full at any response latency.
@@ -1300,20 +1503,47 @@ func (a *SlotAssembler) recoverFEC(state *slotState, fecSetIndex uint32) ([]*Shr
 		}
 		shards[int(layout.dataShreds)+int(pos)] = shard
 	}
-	encoder, err := a.fecEncoder(layout)
-	if err != nil {
-		return nil, err
-	}
-	required := make([]bool, int(layout.dataShreds)+int(layout.codingShreds))
 	var missingData int
+	missingDataIndex := -1
 	for idx := 0; idx < int(layout.dataShreds); idx++ {
 		if fec.data[uint32(idx)] == nil {
-			required[idx] = true
 			missingData++
+			missingDataIndex = idx
 		}
 	}
 	if missingData == 0 {
 		return nil, nil
+	}
+	if missingData == 1 &&
+		layout.dataShreds == rsrecover.DataShards &&
+		layout.codingShreds == rsrecover.CodingShards {
+		presence, err := rsrecover.Presence(shards)
+		if err != nil {
+			return nil, err
+		}
+		dst := make([]byte, layout.shardSize)
+		if err := rsrecover.RecoverOneData(presence, missingDataIndex, shards, dst); err != nil {
+			return nil, fmt.Errorf("recover one FEC data shred slot %d fec_set=%d: %w", state.slot, fecSetIndex, err)
+		}
+		shred, err := fec.recoveredDataShred(uint32(missingDataIndex), dst)
+		if err != nil {
+			return nil, err
+		}
+		shards[missingDataIndex] = dst
+		recovered := []*Shred{shred}
+		if err := a.authenticateRecoveredFEC(fec, shards, recovered); err != nil {
+			return nil, err
+		}
+		return recovered, nil
+	}
+
+	required := make([]bool, int(layout.dataShreds)+int(layout.codingShreds))
+	for idx := 0; idx < int(layout.dataShreds); idx++ {
+		required[idx] = fec.data[uint32(idx)] == nil
+	}
+	encoder, err := a.fecEncoder(layout)
+	if err != nil {
+		return nil, err
 	}
 	if err := encoder.ReconstructSome(shards, required); err != nil {
 		if errors.Is(err, reedsolomon.ErrTooFewShards) {
@@ -1336,6 +1566,9 @@ func (a *SlotAssembler) recoverFEC(state *slotState, fecSetIndex uint32) ([]*Shr
 			return nil, err
 		}
 		recovered = append(recovered, shred)
+	}
+	if err := a.authenticateRecoveredFEC(fec, shards, recovered); err != nil {
+		return nil, err
 	}
 	return recovered, nil
 }
@@ -1498,6 +1731,24 @@ func (s *slotState) complete() bool {
 }
 
 func (s *slotState) orderedShreds() []*Shred {
+	// Normal completed slots contain exactly the contiguous range 0..lastIndex.
+	// Keep the sparse fallback: malformed tails and focused partial-state callers
+	// must not silently lose shreds beyond the last-in-slot marker.
+	if s.haveLast && uint64(len(s.shreds)) == uint64(s.lastIndex)+1 {
+		out := make([]*Shred, len(s.shreds))
+		for idx := range out {
+			shred := s.shreds[uint32(idx)]
+			if shred == nil || shred.Index != uint32(idx) {
+				return s.sortedShreds()
+			}
+			out[idx] = shred
+		}
+		return out
+	}
+	return s.sortedShreds()
+}
+
+func (s *slotState) sortedShreds() []*Shred {
 	indexes := make([]int, 0, len(s.shreds))
 	for idx := range s.shreds {
 		indexes = append(indexes, int(idx))
@@ -1514,7 +1765,7 @@ func (s *slotState) orderedShreds() []*Shred {
 // transaction signature verification. Parent/child identity hints are applied
 // later under the assembler lock so hints learned while this runs still win.
 func (s *slotState) decodeBlock(timings *entryDecodeTimings) (*block.Block, *AlpenglowParentInfo, []solana.Hash, error) {
-	entries, parentInfo, footer, err := decodeEntriesAndAlpenglowMarkersFromDataShreds(s.orderedShreds(), timings)
+	entries, parentInfo, footer, err := decodeEntriesFromOrderedDataShreds(s.orderedShreds(), timings)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -1660,35 +1911,36 @@ func (s *slotState) fecSetMerkleRoots() ([]solana.Hash, error) {
 }
 
 func (f *fecState) merkleRoot() (solana.Hash, bool, error) {
-	for _, idx := range sortedUint32Keys(f.data) {
-		shred := f.data[idx]
-		if shred == nil || shred.Recovered {
-			continue
-		}
-		root, err := shred.MerkleRoot()
-		if err != nil {
-			if errors.Is(err, ErrUnsupportedShred) {
-				continue
+	// Preserve the old lowest-data-index, then lowest-coding-position choice,
+	// including its first error. Unsupported variants and recovered data have
+	// no usable proof. Selecting the minimum needs neither sorting nor scratch.
+	selected := f.data[0]
+	var first uint32
+	// Relative index zero is already the minimum. Repair or legacy/malformed
+	// inputs may lack that proof and still take the general selection path.
+	if !hasMerkleRootProof(selected) || selected.Recovered {
+		selected = nil
+		for idx, shred := range f.data {
+			if hasMerkleRootProof(shred) && !shred.Recovered && (selected == nil || idx < first) {
+				selected, first = shred, idx
 			}
-			return solana.Hash{}, false, err
 		}
-		return root, true, nil
 	}
-	for _, pos := range sortedUint16Keys(f.coding) {
-		shred := f.coding[pos]
-		if shred == nil {
-			continue
-		}
-		root, err := shred.MerkleRoot()
-		if err != nil {
-			if errors.Is(err, ErrUnsupportedShred) {
-				continue
+	if selected == nil {
+		for pos, shred := range f.coding {
+			if hasMerkleRootProof(shred) && (selected == nil || uint32(pos) < first) {
+				selected, first = shred, uint32(pos)
 			}
-			return solana.Hash{}, false, err
 		}
-		return root, true, nil
 	}
-	return solana.Hash{}, false, nil
+	if selected == nil {
+		return solana.Hash{}, false, nil
+	}
+	if cached := f.rootCache; cached != nil && cached.matches(selected) {
+		return cached.root, true, nil
+	}
+	root, err := selected.MerkleRoot()
+	return root, err == nil, err
 }
 
 func merkleTreeRoot(leaves []solana.Hash) solana.Hash {

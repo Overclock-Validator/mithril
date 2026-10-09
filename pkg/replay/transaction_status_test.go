@@ -5,7 +5,9 @@ import (
 	"testing"
 
 	b "github.com/Overclock-Validator/mithril/pkg/block"
+	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/txfixture"
+	"github.com/Overclock-Validator/mithril/pkg/txverify"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/require"
 )
@@ -103,4 +105,58 @@ func TestProcessBlockRejectsDuplicateMessagesBeforeAccountAccess(t *testing.T) {
 	require.True(t, errors.As(err, &duplicateErr))
 	require.Equal(t, uint64(77), duplicateErr.Slot)
 	require.Equal(t, uint64(1), duplicateErr.DuplicateCount)
+}
+
+func TestProcessBlockRejectsV1BeforeFeatureActivationWithoutPanicking(t *testing.T) {
+	wire := txfixture.MustSignedV1Wire(7, 8)
+	tx, err := solana.TransactionFromBytes(wire)
+	require.NoError(t, err)
+	require.Equal(t, solana.MessageVersionV1, tx.Message.GetVersion())
+	require.NoError(t, txverify.SanitizeTransaction(tx))
+	require.NoError(t, txverify.VerifyTransaction(tx))
+
+	for _, txParallelism := range []int{0, 2} {
+		name := "sequential"
+		if txParallelism > 0 {
+			name = "parallel"
+		}
+		t.Run(name, func(t *testing.T) {
+			block := &b.Block{
+				Slot:         78,
+				Features:     features.NewFeaturesDefault(),
+				Transactions: []*solana.Transaction{tx},
+			}
+
+			var processErr error
+			require.NotPanics(t, func() {
+				_, processErr = ProcessBlock(
+					nil,
+					block,
+					nil,
+					txParallelism,
+					nil,
+					nil,
+					nil,
+					NewTransactionStatusCache(),
+					false,
+					nil,
+				)
+			})
+			require.ErrorIs(t, processErr, TxErrUnsupportedVersion)
+			require.ErrorContains(t, processErr, "transaction 0 uses V1 before EnableTxV1 activation")
+		})
+	}
+}
+
+func TestValidateBlockTransactionVersionsUsesCandidateFeatures(t *testing.T) {
+	tx, err := solana.TransactionFromBytes(txfixture.MustSignedV1Wire(8, 0))
+	require.NoError(t, err)
+	block := &b.Block{
+		Features:     features.NewFeaturesDefault(),
+		Transactions: []*solana.Transaction{tx},
+	}
+	require.ErrorIs(t, validateBlockTransactionVersions(block), TxErrUnsupportedVersion)
+
+	block.Features.EnableFeature(features.EnableTxV1, 42)
+	require.NoError(t, validateBlockTransactionVersions(block))
 }

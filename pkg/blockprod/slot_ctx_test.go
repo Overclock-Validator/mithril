@@ -56,7 +56,11 @@ func TestNewLeaderSlotCtxInheritsAcctsLtHashAndFeatures(t *testing.T) {
 	require.True(t, slotCtx.AcctsLtHash.Equals(parentLtHash))
 	require.True(t, slotCtx.Features.IsActive(features.AccountsLtHash))
 	require.True(t, slotCtx.Features.IsActive(features.RemoveAccountsDeltaHash))
-	require.True(t, slotCtx.Features.IsActive(features.FormalizeLoadedTransactionDataSize))
+	require.False(t, slotCtx.Features.IsActive(features.FormalizeLoadedTransactionDataSize))
+	// Leader feature state is an independent, exact clone of its parent bank;
+	// locally enabling a child feature must not mutate the replay parent.
+	slotCtx.Features.EnableFeature(features.FormalizeLoadedTransactionDataSize, 100)
+	require.False(t, parentFeatures.IsActive(features.FormalizeLoadedTransactionDataSize))
 	require.Equal(t, uint64(0), slotCtx.NumSignatures)
 	require.Equal(t, uint64(0), slotCtx.Epoch) // slot 100 with default schedule
 	require.Equal(t, [32]byte{7}, slotCtx.LastBlockhash)

@@ -47,6 +47,44 @@ func TestCalculateAlpenglowRewardSplit(t *testing.T) {
 	assert.Equal(t, validator, leader)
 }
 
+func TestVoteRewardUsesProcessingEpochInflationAcrossEpochBoundary(t *testing.T) {
+	// Reward certificates trail the processing bank by eight slots.  At an
+	// epoch boundary the rewarded stake snapshot belongs to the previous epoch,
+	// but Agave intentionally uses the new bank epoch's inflation budget.
+	state := EpochInflationAccountState{
+		Current: EpochInflationState{
+			Epoch:                      20,
+			MaxPossibleValidatorReward: 20_000,
+			SlotsPerEpoch:              100,
+		},
+		Prev: &EpochInflationState{
+			Epoch:                      19,
+			MaxPossibleValidatorReward: 10_000,
+			SlotsPerEpoch:              100,
+		},
+	}
+
+	inflation, err := voteRewardInflationState(state, 20, 19)
+	require.NoError(t, err)
+	validator, leader := calculateAlpenglowReward(inflation, 1_000, 500)
+	require.Equal(t, uint64(100), validator+leader)
+
+	previousInflation, err := voteRewardInflationState(state, 19, 19)
+	require.NoError(t, err)
+	previousValidator, previousLeader := calculateAlpenglowReward(previousInflation, 1_000, 500)
+	require.Equal(t, uint64(50), previousValidator+previousLeader)
+	require.NotEqual(t, validator+leader, previousValidator+previousLeader)
+}
+
+func TestVoteRewardInflationRequiresProcessingEpoch(t *testing.T) {
+	state := EpochInflationAccountState{
+		Current: EpochInflationState{Epoch: 19},
+	}
+
+	_, err := voteRewardInflationState(state, 20, 19)
+	require.EqualError(t, err, "missing epoch inflation for processing epoch 20 (reward slot epoch 19)")
+}
+
 func TestCalcSlotTimestampNanosInclusiveRange(t *testing.T) {
 	// producer_ns - slot_range_duration(target+1, bank) with constant 200ms:
 	// (bank - target) * alpenglowNsPerSlot

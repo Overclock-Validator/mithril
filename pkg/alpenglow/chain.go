@@ -145,16 +145,31 @@ type ChainTracker struct {
 	// indirect skips, and conflicts. The execute-on-receipt switch sweep gates on
 	// it, so it never misses a contradiction that arose without a new certificate.
 	decisionVersion uint64
+	decisionChanges chan struct{}
 }
 
 // bumpDecisionLocked marks that a decision-relevant change occurred.
-func (t *ChainTracker) bumpDecisionLocked() { t.decisionVersion++ }
+func (t *ChainTracker) bumpDecisionLocked() {
+	t.decisionVersion++
+	select {
+	case t.decisionChanges <- struct{}{}:
+	default:
+	}
+}
 
 // DecisionVersion returns the monotonic decision-change counter.
 func (t *ChainTracker) DecisionVersion() uint64 {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.decisionVersion
+}
+
+// DecisionChanges returns a stable, capacity-one notification channel for the
+// single replay consumer. Notifications are coalesced hints to recheck decision
+// state, not a count of changes. Obtain the channel before checking DecisionVersion
+// so a change between that check and waiting remains buffered. It is never closed.
+func (t *ChainTracker) DecisionChanges() <-chan struct{} {
+	return t.decisionChanges
 }
 
 type chainBlockState struct {
@@ -196,6 +211,7 @@ func NewChainTrackerWithConfig(cfg ChainConfig) *ChainTracker {
 		finalizedBySlot: make(map[uint64]BlockID),
 		conflicts:       make(map[uint64]chainConflict),
 		invalidBlocks:   make(map[BlockID]string),
+		decisionChanges: make(chan struct{}, 1),
 	}
 }
 

@@ -150,6 +150,14 @@ type AlpenglowChainQuery interface {
 	ChainDecisionVersion() uint64
 }
 
+// AlpenglowChainDecisionNotifier optionally wakes replay when chain decisions
+// change. Its stable channel serves one replay consumer and is never closed.
+// Notifications are coalesced hints to rerun the decision sweep; obtain the
+// channel before checking ChainDecisionVersion to avoid missing a wakeup.
+type AlpenglowChainDecisionNotifier interface {
+	ChainDecisionChanges() <-chan struct{}
+}
+
 // AlpenglowWantedBlocksSource surfaces certified-but-unobserved blocks so the
 // block source can steer turbine/repair toward data the cluster has already
 // voted real (cert-driven repair).
@@ -381,7 +389,7 @@ func (e *AlpenglowObserverEngine) EnableVoting(cfg VotingConfig) error {
 	// events, matching Agave's initial_parent_ready selection.
 	if slot, parent, ok := voter.history.HighestParentReadyMatching(func(parent alpenglow.BlockID) bool {
 		return !e.ensureChain().IsObjectivelyInvalidBlock(parent)
-	}); ok && slot > root.Slot {
+	}); ok && slot > root.Slot && (voter.reservation == nil || voter.reservation.recoverThrough == 0) {
 		if !e.ensurePool().RestoreParentReady(slot, parent) {
 			mlog.Log.FileOnlyf("ALPENGLOW voting: ignored persisted ParentReady slot=%d parent=%s because newer root/live tracker state is authoritative", slot, parent)
 		}
@@ -967,11 +975,18 @@ func (e *AlpenglowObserverEngine) injectLocalVote(message alpenglow.VoteMessage,
 	}
 }
 
-// alpenglowVoteActionFloor is the highest slot on which this validator must
-// not initiate a new vote. The pool root is its strict admission boundary;
-// direct finality is included because the pool deliberately retains a short
-// reward-accounting tail behind finality where network votes remain useful.
+// alpenglowVoteActionFloor is the retained pool's strict admission boundary.
+// Network finality is not a voting root: a replayed block may still contribute
+// a notarization to a later fast certificate and its slot+8 reward certificate.
+// The voter also checks its own persisted history root before signing.
 func (e *AlpenglowObserverEngine) alpenglowVoteActionFloor() uint64 {
+	return e.ensurePool().Snapshot().RootSlot
+}
+
+// alpenglowVerifiedFinalityFloor releases crash-recovery reservations. Keep this
+// independent of live vote admission: a retained reward window must not weaken
+// the requirement to pass every slot that may have been signed before a crash.
+func (e *AlpenglowObserverEngine) alpenglowVerifiedFinalityFloor() uint64 {
 	floor := e.ensurePool().Snapshot().RootSlot
 	if finalized := e.ensureChain().Snapshot().LatestDirectFinalizedBlock.Slot; finalized > floor {
 		floor = finalized
@@ -1505,6 +1520,12 @@ func (e *AlpenglowObserverEngine) ChainDecisionVersion() uint64 {
 	return e.ensureChain().DecisionVersion()
 }
 
+// ChainDecisionChanges wakes replay on every decision-version change, including
+// changes derived from newly observed ancestry without another certificate.
+func (e *AlpenglowObserverEngine) ChainDecisionChanges() <-chan struct{} {
+	return e.ensureChain().DecisionChanges()
+}
+
 // AlpenglowWantedBlocks lists certified-but-unobserved blocks for cert-driven
 // repair (ascending, capped).
 func (e *AlpenglowObserverEngine) AlpenglowWantedBlocks(afterSlot uint64, max int) []alpenglow.WantedBlock {
@@ -1528,6 +1549,25 @@ func (e *AlpenglowObserverEngine) PruneAlpenglowBefore(slot uint64) {
 	if slot == 0 {
 		return
 	}
+	// Replay enqueues its completed-block event before publishing a durable
+	// promotion. Retire the pool, execution proof and history on that same
+	// ordered voter stream, so a fast checkpoint cannot overtake the vote.
+	e.voterMu.RLock()
+	voter := e.voter
+	e.voterMu.RUnlock()
+	if voter != nil {
+		if err := voter.enqueue(voterEvent{kind: voterEventDurableRoot, slot: slot}); err != nil {
+			e.latchSafetyError(err)
+		}
+		return
+	}
+	e.applyAlpenglowDurableRoot(slot)
+}
+
+// applyAlpenglowDurableRoot is called by the voter after earlier replay events,
+// or synchronously by an observer without a voting loop. Startup root restore
+// remains a separate, immediate barrier in SetAlpenglowRoot.
+func (e *AlpenglowObserverEngine) applyAlpenglowDurableRoot(slot uint64) alpenglow.BlockID {
 	e.poolOutputMu.Lock()
 	defer e.poolOutputMu.Unlock()
 
@@ -1543,13 +1583,11 @@ func (e *AlpenglowObserverEngine) PruneAlpenglowBefore(slot uint64) {
 	if e.certPool != nil {
 		e.certPool.ObserveFloor(slot)
 	}
-	if err := e.enqueueVoter(voterEvent{kind: voterEventRoot, root: root}); err != nil {
-		e.latchSafetyError(err)
-	}
 	// Replay calls this only after the fold through slot is durably committed.
 	// Keep the transport peer window tied to that local root, not to speculative
 	// certificate finality or the pool's reward-retention floor.
 	e.advanceVotorPeerRoot(slot)
+	return root
 }
 
 func (e *AlpenglowObserverEngine) pruneInvalidBlockIDsBefore(slot uint64) {

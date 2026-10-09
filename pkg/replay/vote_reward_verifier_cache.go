@@ -14,6 +14,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/epochstakes"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
+	"github.com/Overclock-Validator/mithril/pkg/rewardcerts"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -28,6 +29,58 @@ type voteRewardVerifierCacheKey struct {
 type voteRewardVerifierMaterial struct {
 	verifier *alpenglow.CertificateVerifier
 	snapshot epochstakes.Snapshot
+
+	rewardValidationMu   sync.Mutex
+	lastRewardValidation *voteRewardCertificateValidation
+}
+
+// Keep just the latest successful certificate pair. The immutable material
+// fixes the validator epoch and shred version; these bytes and the containing
+// slot fix everything else used by reward certificate validation.
+type voteRewardCertificateValidation struct {
+	slot              uint64
+	skipRaw, notarRaw []byte
+	validated         *rewardcerts.ValidatedRewardCert
+}
+
+func (material *voteRewardVerifierMaterial) validateRewardCertificates(
+	currentSlot uint64,
+	skipRaw, notarRaw []byte,
+	measureTimings bool,
+) (*rewardcerts.ValidatedRewardCert, rewardcerts.RewardCertificateValidationTimings, error) {
+	material.rewardValidationMu.Lock()
+	defer material.rewardValidationMu.Unlock()
+	if cached := material.lastRewardValidation; cached != nil && cached.slot == currentSlot &&
+		bytes.Equal(cached.skipRaw, skipRaw) && bytes.Equal(cached.notarRaw, notarRaw) {
+		return cloneValidatedRewardCert(cached.validated), rewardcerts.RewardCertificateValidationTimings{}, nil
+	}
+	validated, timings, err := rewardcerts.ValidateRewardCertificatesWithVerifier(
+		currentSlot, skipRaw, notarRaw, material.snapshot.Epoch, material.verifier, measureTimings,
+	)
+	if err != nil {
+		return nil, timings, err
+	}
+	material.lastRewardValidation = &voteRewardCertificateValidation{
+		slot:      currentSlot,
+		skipRaw:   bytes.Clone(skipRaw),
+		notarRaw:  bytes.Clone(notarRaw),
+		validated: cloneValidatedRewardCert(validated),
+	}
+	return validated, timings, nil
+}
+
+func cloneValidatedRewardCert(validated *rewardcerts.ValidatedRewardCert) *rewardcerts.ValidatedRewardCert {
+	if validated == nil {
+		return nil
+	}
+	cloned := &rewardcerts.ValidatedRewardCert{
+		RewardSlot: validated.RewardSlot,
+		Validators: make(map[solana.PublicKey]struct{}, len(validated.Validators)),
+	}
+	for validator := range validated.Validators {
+		cloned.Validators[validator] = struct{}{}
+	}
+	return cloned
 }
 
 type voteRewardVerifierCacheEntry struct {

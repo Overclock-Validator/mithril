@@ -54,6 +54,39 @@ func UnmarshalBlockComponent(data []byte) (BlockComponent, error) {
 	return BlockComponent{EntryBatch: entries}, nil
 }
 
+// unmarshalBlockComponentFromShredBatch matches Agave's deserialization of one
+// DATA_COMPLETE batch: decode one component and ignore its outer trailing bytes.
+// See Agave entry/src/block_component_parser.rs and ledger/src/blockstore.rs.
+// Marker fields remain bounded by their declared length and are decoded strictly.
+func unmarshalBlockComponentFromShredBatch(data []byte) (BlockComponent, error) {
+	if len(data) < 8 || (len(data) == 8 && binary.LittleEndian.Uint64(data[:8]) == 0) {
+		return UnmarshalBlockComponent(data)
+	}
+	if binary.LittleEndian.Uint64(data[:8]) == 0 {
+		markerSize, err := blockMarkerPrefixSize(data)
+		if err != nil {
+			return BlockComponent{}, err
+		}
+		return UnmarshalBlockComponent(data[:markerSize])
+	}
+	entries, _, err := decodeEntryBatchPrefix(data)
+	if err != nil {
+		return BlockComponent{}, fmt.Errorf("%w: %w", ErrInvalidBlockComponent, err)
+	}
+	return BlockComponent{EntryBatch: entries}, nil
+}
+
+func blockMarkerPrefixSize(data []byte) (int, error) {
+	if len(data) < 13 {
+		return 0, fmt.Errorf("%w: short marker envelope", ErrInvalidBlockComponent)
+	}
+	innerLen := int(binary.LittleEndian.Uint16(data[11:13]))
+	if innerLen > len(data)-13 {
+		return 0, fmt.Errorf("%w: marker payload length %d exceeds remaining %d", ErrInvalidBlockComponent, innerLen, len(data)-13)
+	}
+	return 13 + innerLen, nil
+}
+
 func marshalEntryBatch(entries []Entry) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := bin.NewEncoderWithEncoding(&buf, bin.EncodingBin)

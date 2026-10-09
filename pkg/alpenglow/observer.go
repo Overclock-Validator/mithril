@@ -95,6 +95,17 @@ type Observer struct {
 	replayBlocks map[uint64]BlockID
 	replayOrder  []uint64
 	replayChecks map[CertificateKey]certificateReplayCheck
+	// Only retained, block-bearing certificates that have not yet been checked
+	// against replay belong here. Checked history stays in certificates and
+	// replayChecks for diagnostics/deduplication, but need not be scanned on
+	// every block (including skipped slots). This is an in-memory observer
+	// index, not voting authorization or durable crash-recovery state.
+	pendingReplayCertificates map[CertificateKey]BlockID
+	// Votes do not change certificate/replay reconciliation. Reuse its exact
+	// statistics until one of those inputs changes instead of scanning every
+	// retained certificate for each incoming vote.
+	pendingStats      certificateReplayPendingStats
+	pendingStatsValid bool
 
 	votesObserved                 uint64
 	certificatesObserved          uint64
@@ -149,11 +160,12 @@ func NewObserverWithConfig(cfg ObserverConfig) *Observer {
 		cfg.MaxTrackedReplayBlocks = DefaultMaxTrackedReplayBlocks
 	}
 	return &Observer{
-		cfg:          cfg,
-		votes:        make(map[VoteMessageKey]VoteMessage),
-		certificates: make(map[CertificateKey]Certificate),
-		replayBlocks: make(map[uint64]BlockID),
-		replayChecks: make(map[CertificateKey]certificateReplayCheck),
+		cfg:                       cfg,
+		votes:                     make(map[VoteMessageKey]VoteMessage),
+		certificates:              make(map[CertificateKey]Certificate),
+		replayBlocks:              make(map[uint64]BlockID),
+		replayChecks:              make(map[CertificateKey]certificateReplayCheck),
+		pendingReplayCertificates: make(map[CertificateKey]BlockID),
 	}
 }
 
@@ -211,6 +223,7 @@ func (o *Observer) ObserveCertificate(cert Certificate) (Observation, error) {
 	key := cert.Key()
 	_, exists := o.certificates[key]
 	if !exists {
+		o.pendingStatsValid = false
 		tracked := o.trackCertificateLocked(key, cert)
 		o.certificatesObserved++
 		o.applyCertificateLocked(cert)
@@ -225,6 +238,7 @@ func (o *Observer) ObserveCertificate(cert Certificate) (Observation, error) {
 func (o *Observer) ObserveReplayBlock(obs ReplayBlockObservation) Observation {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	o.pendingStatsValid = false
 
 	if obs.At.IsZero() {
 		obs.At = time.Now()
@@ -260,8 +274,8 @@ func (o *Observer) ObserveReplayResult(obs ReplayResultObservation) Observation 
 }
 
 func (o *Observer) Snapshot() Snapshot {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	return o.snapshotLocked()
 }
 
@@ -339,12 +353,16 @@ func (o *Observer) trackCertificateLocked(key CertificateKey, cert Certificate) 
 		return false
 	}
 	o.certificates[key] = cert
+	if block, ok := cert.Block(); ok && block.HasHash() {
+		o.pendingReplayCertificates[key] = block
+	}
 	o.certOrder = append(o.certOrder, key)
 	for len(o.certificates) > o.cfg.MaxTrackedCertificates {
 		old := o.certOrder[0]
 		o.certOrder = o.certOrder[1:]
 		delete(o.certificates, old)
 		delete(o.replayChecks, old)
+		delete(o.pendingReplayCertificates, old)
 	}
 	return true
 }
@@ -369,12 +387,10 @@ func (o *Observer) checkReplayBlockCertificatesLocked(block BlockID) {
 	if !block.HasHash() {
 		return
 	}
-	for key, cert := range o.certificates {
-		certBlock, ok := cert.Block()
-		if !ok || certBlock.Slot != block.Slot {
-			continue
+	for key, certBlock := range o.pendingReplayCertificates {
+		if certBlock.Slot == block.Slot {
+			o.checkCertificateReplayLocked(key, o.certificates[key])
 		}
-		o.checkCertificateReplayLocked(key, cert)
 	}
 }
 
@@ -410,6 +426,7 @@ func (o *Observer) checkCertificateReplayLocked(key CertificateKey, cert Certifi
 		}
 	}
 	o.replayChecks[key] = check
+	delete(o.pendingReplayCertificates, key)
 }
 
 type certificateReplayPendingStats struct {
@@ -423,30 +440,24 @@ type certificateReplayPendingStats struct {
 
 func (o *Observer) certificateReplayPendingStatsLocked() certificateReplayPendingStats {
 	var stats certificateReplayPendingStats
-	for key, cert := range o.certificates {
-		if _, checked := o.replayChecks[key]; checked {
-			continue
+	for _, certBlock := range o.pendingReplayCertificates {
+		stats.count++
+		if stats.oldestSlot == 0 || certBlock.Slot < stats.oldestSlot {
+			stats.oldestSlot = certBlock.Slot
 		}
-		certBlock, ok := cert.Block()
-		if ok && certBlock.HasHash() {
-			stats.count++
-			if stats.oldestSlot == 0 || certBlock.Slot < stats.oldestSlot {
-				stats.oldestSlot = certBlock.Slot
-			}
-			if certBlock.Slot > stats.newestSlot {
-				stats.newestSlot = certBlock.Slot
-			}
-			if o.oldestReplayBlockSlot != 0 && certBlock.Slot < o.oldestReplayBlockSlot {
-				stats.preWindow++
-			}
-			if o.oldestReplayBlockSlot != 0 &&
-				o.latestReplayBlockSlot != 0 &&
-				certBlock.Slot >= o.oldestReplayBlockSlot &&
-				certBlock.Slot <= o.latestReplayBlockSlot {
-				stats.mature++
-				if stats.matureOldestSlot == 0 || certBlock.Slot < stats.matureOldestSlot {
-					stats.matureOldestSlot = certBlock.Slot
-				}
+		if certBlock.Slot > stats.newestSlot {
+			stats.newestSlot = certBlock.Slot
+		}
+		if o.oldestReplayBlockSlot != 0 && certBlock.Slot < o.oldestReplayBlockSlot {
+			stats.preWindow++
+		}
+		if o.oldestReplayBlockSlot != 0 &&
+			o.latestReplayBlockSlot != 0 &&
+			certBlock.Slot >= o.oldestReplayBlockSlot &&
+			certBlock.Slot <= o.latestReplayBlockSlot {
+			stats.mature++
+			if stats.matureOldestSlot == 0 || certBlock.Slot < stats.matureOldestSlot {
+				stats.matureOldestSlot = certBlock.Slot
 			}
 		}
 	}
@@ -454,7 +465,11 @@ func (o *Observer) certificateReplayPendingStatsLocked() certificateReplayPendin
 }
 
 func (o *Observer) snapshotLocked() Snapshot {
-	pending := o.certificateReplayPendingStatsLocked()
+	if !o.pendingStatsValid {
+		o.pendingStats = o.certificateReplayPendingStatsLocked()
+		o.pendingStatsValid = true
+	}
+	pending := o.pendingStats
 	return Snapshot{
 		VotesObserved:                      o.votesObserved,
 		CertificatesObserved:               o.certificatesObserved,
