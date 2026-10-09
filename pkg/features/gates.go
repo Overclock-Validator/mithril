@@ -75,6 +75,12 @@ var RaiseBlockLimitsTo100m = FeatureGate{Name: "RaiseBlockLimitsTo100m", Address
 const AlpenglowFeatureGateAddress = "A1pengvuM6JEcyNuTnMqepBKhwHE3N6PmUrdATGawhJS"
 
 var Alpenglow = FeatureGate{Name: "Alpenglow", Address: base58.MustDecodeFromString(AlpenglowFeatureGateAddress)}
+
+// AlpenglowGenesisV1 is the Alpenglow ID at the pinned Agave genesis-v1
+// revision. It is distinct from both the deployed network and the optional
+// dev-context feature-set build. Never substitute one ID in serialized state.
+var AlpenglowGenesisV1 = FeatureGate{Name: "AlpenglowGenesisV1", Address: base58.MustDecodeFromString("mustRekeyVm2QHYB3JPefBiU4BY3Z6JkW2k3Scw5GWP")}
+
 var AlpenglowDevContext = FeatureGate{Name: "AlpenglowDevContext", Address: base58.MustDecodeFromString("8KpruRFrT59jQ9NfFX9DU6j8a1hW7y6xchvZNQ5rxD4P")}
 var ValidatorAdmissionTicket = FeatureGate{Name: "ValidatorAdmissionTicket", Address: base58.MustDecodeFromString("VAT9huvhPjRN9cyrPytq9rwvEJ3J4ADtjdncgZRyANJ")}
 var ReduceSlotTimeTo350ms = FeatureGate{Name: "ReduceSlotTimeTo350ms", Address: base58.MustDecodeFromString("iBRL5RuWhw4yqaAZu96RUULHckHTZAoe2b77qaV38JZ")}
@@ -124,7 +130,7 @@ var AllFeatureGates = []FeatureGate{StopTruncatingStringsInSyscalls, EnableParti
 	ReserveMinimalCUsForBuiltinInstructions, RelaxIntraBatchAccountLocks, MaskOutRentEpochInVmSerialization, RemoveAccountsExecutableFlagChecks,
 	AccountsLtHash, RemoveAccountsDeltaHash, EnableLoaderV4, EnableSbpfV1DeploymentAndExecution, EnableSbpfV2DeploymentAndExecution,
 	EnableSbpfV3DeploymentAndExecution, DisableSbpfV0Execution, ReenableSbpfV0Execution, FormalizeLoadedTransactionDataSize,
-	EnableTxV1, DefineLtdsFeeOnlySemantics, RelaxPostExecMinBalanceCheck, RelaxFeePayerConstraint, RaiseBlockLimitsTo100m, Alpenglow, AlpenglowDevContext,
+	EnableTxV1, DefineLtdsFeeOnlySemantics, RelaxPostExecMinBalanceCheck, RelaxFeePayerConstraint, RaiseBlockLimitsTo100m, Alpenglow, AlpenglowDevContext, AlpenglowGenesisV1,
 	ValidatorAdmissionTicket, ReduceSlotTimeTo350ms, ReduceSlotTimeTo300ms, ReduceSlotTimeTo250ms, ReduceSlotTimeTo200ms, IncreaseCpiAccountInfoLimit,
 	StaticInstructionLimit, PoseidonEnforcePadding, FixAltBn128PairingLengthCheck, DeprecateRentExemptionThreshold,
 	ProvideInstructionDataOffsetInVmR2, SyscallParameterAddressRestrictions, VirtualAddressSpaceAdjustments, AccountDataDirectMapping,

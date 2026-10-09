@@ -11,6 +11,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	a "github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/alpenglow"
+	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/safemath"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/wincode"
@@ -67,6 +68,7 @@ func stageRewardEpochDelegatedStakes(
 	admitted map[solana.PublicKey]uint64,
 	rewardEpochEffectiveStakes map[solana.PublicKey]uint64,
 	replayCtx *ReplayCtx,
+	bankFeatures ...*features.Features,
 ) (*accounts.Account, *accounts.Account, error) {
 	data, err := encodeRewardEpochDelegatedStakes(rewardedEpoch, admitted, rewardEpochEffectiveStakes)
 	if err != nil {
@@ -77,7 +79,7 @@ func stageRewardEpochDelegatedStakes(
 		return nil, nil, fmt.Errorf("rent sysvar unavailable while storing reward epoch delegated stakes")
 	}
 
-	key := RewardEpochDelegatedStakesAccountAddr()
+	key := RewardEpochDelegatedStakesAccountAddr(bankFeatures...)
 	parent, err := acctsDb.GetAccount(readSlot, key)
 	if err != nil {
 		if !errors.Is(err, accountsdb.ErrNoAccount) {

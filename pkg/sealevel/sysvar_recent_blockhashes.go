@@ -115,6 +115,15 @@ func (recentBlockhashes *SysvarRecentBlockhashes) GetLatest() RecentBlockHashesE
 func (recentBlockhashes *SysvarRecentBlockhashes) PushLatest(latest [32]byte, lamportsPerSignature uint64) [32]byte {
 	rbh := *recentBlockhashes
 
+	// Agave's blockhash queue is keyed by hash. Re-registering a hash (e.g.
+	// sleep-mode empty genesis slots) refreshes it instead of duplicating it.
+	for i := range rbh {
+		if rbh[i].Blockhash == latest {
+			rbh = append(rbh[:i], rbh[i+1:]...)
+			break
+		}
+	}
+
 	newEntry := RecentBlockHashesEntry{Blockhash: latest, FeeCalculator: FeeCalculator{LamportsPerSignature: lamportsPerSignature}}
 	var latestEvicted [32]byte
 

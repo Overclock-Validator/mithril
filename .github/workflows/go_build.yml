@@ -45,5 +45,11 @@ jobs:
       - name: Interpreter differential and memory race regressions
         run: go test -race -count=1 ./pkg/sbpf/...
 
+      - name: Native genesis initialization and recovery race regressions
+        run: >-
+          go test -race -p 2 -count=1
+          ./pkg/genesis ./pkg/genesisinit ./pkg/state ./pkg/accountsdb
+          ./pkg/snapshot ./cmd/mithril/genesiscmd
+
       - name: Sealevel interpreter, syscall and vote ownership regressions
         run: go test -race -count=1 ./pkg/sealevel

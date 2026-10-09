@@ -30,6 +30,25 @@ func statusCacheTestBlock(slot uint64, txs ...*solana.Transaction) *b.Block {
 	return &b.Block{Slot: slot, ParentSlot: slot - 1, Transactions: txs}
 }
 
+func TestGenesisTransactionStatusCheckpointAfterRoot(t *testing.T) {
+	cache := NewTransactionStatusCache()
+	for slot := uint64(1); slot <= maxTransactionStatusRoots+1; slot++ {
+		require.NoError(t, cache.CommitBlock(statusCacheTestBlock(slot)))
+		cache.Root(slot)
+		cache.Root(slot) // Repeating the durable watermark must not double count.
+		if slot != 1 && slot != maxTransactionStatusRoots && slot != maxTransactionStatusRoots+1 {
+			continue
+		}
+		data, err := cache.SnapshotThrough(slot)
+		require.NoError(t, err)
+		restored, err := NewTransactionStatusCacheFromSnapshot(data)
+		require.NoError(t, err)
+		require.True(t, restored.CoverageComplete())
+		require.Equal(t, slot, restored.RootedThrough())
+		require.Equal(t, uint16(min(slot, maxTransactionStatusRoots)), restored.rootedSinceSeed)
+	}
+}
+
 func TestTransactionStatusCacheRejectsAncestorMessageWithDifferentSignature(t *testing.T) {
 	cache := NewTransactionStatusCache()
 	parentTx := statusCacheTestTransaction(1, 2, 3)

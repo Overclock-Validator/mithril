@@ -1,0 +1,27 @@
+# Public test fixture only. Supply your validators' own public keys before use.
+# No private keys are generated or read by mithril genesis.
+profile = "agave-alpenglow-development-v1"
+creation_time = "2026-01-01T00:00:00Z"
+
+[[accounts]]
+address = "GgBaCs3N6C7gWXmLDRTdmP5k4iVKaSbuY1hJP6uLrgD"
+lamports = 1000000000
+
+[[validators]]
+identity = "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi"
+vote_account = "8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR"
+stake_account = "CktRuQ2mttgRGkXJtyksdKHjUdc2C4TgDzyB98oEzy8"
+bls_public_key = "a55384b86c60c0e2a13ffdf9087c94495455083acf06ff23d8e7416ee1df1cafccfaad802b527ade7dfe1b02a6bfd79a"
+identity_lamports = 500000000000
+vote_lamports = 2000000000
+stake_lamports = 10000000000
+# All amounts above are separately minted allocations, in lamports.
+# Omitted authorities and collectors resolve to the validator identity.
+# authorized_voter = "..."
+# authorized_withdrawer = "..."
+# stake_staker = "..."
+# stake_withdrawer = "..."
+# inflation_rewards_collector = "..."
+# block_revenue_collector = "..."
+inflation_commission_bps = 0
+block_commission_bps = 0

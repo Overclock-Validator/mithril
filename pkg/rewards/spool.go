@@ -218,6 +218,18 @@ func CleanupPartitionedSpoolFiles(baseDir string, slot uint64, numPartitions uin
 	}
 }
 
+// A restart may re-execute an uncheckpointed boundary. Writers create only
+// nonempty partitions, so remove this attempt's old files before calculating a
+// replacement; otherwise an empty partition could consume stale rewards.
+func resetPartitionedSpoolFiles(baseDir string, slot, numPartitions uint64) error {
+	for p := uint64(0); p < numPartitions; p++ {
+		if err := os.Remove(partitionFilePath(baseDir, slot, uint32(p))); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("reset reward partition %d at slot %d: %w", p, slot, err)
+		}
+	}
+	return nil
+}
+
 // TempSpoolWriter writes reward records to a single temp file (no partition separation).
 // Used in the first phase of reward calculation before partition count is known.
 // NOT thread-safe - should be used with a single-writer pattern.

@@ -40,11 +40,24 @@ type ParentContext struct {
 	HasNanosecondClockAccount  bool
 	UnrootedRead               sealevel.AccountReader
 	TransactionStatuses        *replay.TransactionStatusView
+	GenesisParent              *replay.GenesisReplayBootstrap // only the verified slot-0 parent
+	VoteTimestamps             map[solana.PublicKey]sealevel.BlockTimestamp
 }
 
 // NewLeaderSlotCtx builds a forge-ready slot context at the chain tip.
 func NewLeaderSlotCtx(slot, parentSlot uint64, acctsDb *accountsdb.AccountsDb, parent ParentContext, epochSchedule *sealevel.SysvarEpochSchedule) (*sealevel.SlotCtx, error) {
 	feats := leaderFeatures(parent.Features)
+	var genesisSlotHashes *accounts.Account
+	if parent.GenesisParent != nil {
+		if parent.ParentSlot != parentSlot || !parent.HasParentBlockID || parent.ParentBlockID != (solana.Hash{}) {
+			return nil, fmt.Errorf("genesis leader requires the explicit zero certificate parent")
+		}
+		var err error
+		genesisSlotHashes, err = parent.GenesisParent.FirstChildSlotHashes(slot, parentSlot, parent.ParentBankhash, parent.BankSysvars)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	if parent.BankSysvars != nil {
 		if bankEpochSchedule, ok := parent.BankSysvars.EpochSchedule(); ok {
@@ -103,6 +116,9 @@ func NewLeaderSlotCtx(slot, parentSlot uint64, acctsDb *accountsdb.AccountsDb, p
 	if slotCtx.VoteAccts == nil {
 		slotCtx.VoteAccts = make(map[solana.PublicKey]uint64)
 	}
+	for key, timestamp := range parent.VoteTimestamps {
+		slotCtx.VoteTimestamps[key] = timestamp
+	}
 
 	if parent.BankSysvars != nil {
 		childSysvars, err := parent.BankSysvars.Derive(slot)
@@ -141,12 +157,21 @@ func NewLeaderSlotCtx(slot, parentSlot uint64, acctsDb *accountsdb.AccountsDb, p
 		}); err != nil {
 			return nil, err
 		}
+		if genesisSlotHashes != nil {
+			if err := slotCtx.SetAccount(genesisSlotHashes.Key, genesisSlotHashes); err != nil {
+				return nil, err
+			}
+			childSysvars, err = childSysvars.WithAccounts(genesisSlotHashes)
+			if err != nil {
+				return nil, err
+			}
+		}
 		if err := slotCtx.PublishBankSysvars(childSysvars); err != nil {
 			return nil, fmt.Errorf("publish bank sysvars for leader slot %d: %w", slot, err)
 		}
 	}
 
-	nanoClockAddr := replay.NanosecondClockAccountAddr()
+	nanoClockAddr := replay.NanosecondClockAccountAddr(parent.Features)
 	if parent.HasNanosecondClockAccount {
 		if parent.NanosecondClockAccount == nil {
 			return nil, fmt.Errorf("parent nanosecond clock marked present without an account")

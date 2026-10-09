@@ -6,7 +6,6 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/base58"
 	b "github.com/Overclock-Validator/mithril/pkg/block"
-	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 )
 
@@ -20,7 +19,7 @@ func requireAlpenglowBlockFooter(block *b.Block, slotCtx *sealevel.SlotCtx, alpe
 	if slotCtx == nil || slotCtx.Features == nil {
 		return false
 	}
-	return slotCtx.Features.IsActive(features.Alpenglow) || slotCtx.Features.IsActive(features.AlpenglowDevContext)
+	return alpenglowClockFeatureActive(slotCtx.Features)
 }
 
 // verifyAlpenglowBlockFooter enforces footer presence on Alpenglow turbine blocks and

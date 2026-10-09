@@ -596,7 +596,10 @@ func (a *SlotAssembler) attachAlpenglowIdentityLocked(blk *block.Block, state *s
 		parentKnown = true
 	}
 	blk.SourceParentSlot = parentSlot
-	if parentKnown && parentBlockID != (solana.Hash{}) {
+	// Preserve an explicit slot-0 header's zero ID: genesis's certificate names
+	// (0, 0). Replay still validates it against its verified bootstrap state.
+	// Ordinary zero parent IDs retain their existing absent/invalid behavior.
+	if (parentInfo != nil && parentSlot == 0) || (parentKnown && parentBlockID != (solana.Hash{})) {
 		blk.AlpenglowParentBlockID = parentBlockID
 		blk.HasAlpenglowParentBlockID = true
 	}
@@ -1815,7 +1818,7 @@ func (s *slotState) block(parentBlockID solana.Hash, parentKnown bool) (*block.B
 		parentBlockID = parentInfo.ParentBlockID
 		parentKnown = true
 	}
-	if parentKnown && parentBlockID != (solana.Hash{}) {
+	if (parentInfo != nil && parentSlot == 0) || (parentKnown && parentBlockID != (solana.Hash{})) {
 		blk.AlpenglowParentBlockID = parentBlockID
 		blk.HasAlpenglowParentBlockID = true
 	}
