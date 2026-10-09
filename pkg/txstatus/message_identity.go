@@ -27,11 +27,18 @@ func TransactionMessageHash(tx *solana.Transaction) ([32]byte, error) {
 		return messageHash, fmt.Errorf("serialize transaction message: %w", err)
 	}
 
+	return HashCanonicalMessage(message), nil
+}
+
+// HashCanonicalMessage hashes the exact canonical bytes used for transaction
+// signature verification, including any message-version prefix.
+func HashCanonicalMessage(message []byte) [32]byte {
+	var messageHash [32]byte
 	hasher := blake3.New()
 	_, _ = hasher.Write([]byte(transactionMessageHashDomain))
 	_, _ = hasher.Write(message)
 	hasher.Sum(messageHash[:0])
-	return messageHash, nil
+	return messageHash
 }
 
 // IdentityForTransaction captures both components needed for a status-cache

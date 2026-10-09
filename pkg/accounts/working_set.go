@@ -134,17 +134,37 @@ func (w *WorkingSet) PromotionPrefix(through uint64) []SlotDelta {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
-	var batch []SlotDelta
-	for _, slot := range w.order { // ascending
-		if slot > through {
-			break
-		}
+	return w.promotionChunkLocked(through, len(w.order), true)
+}
+
+// PromotionChunk returns at most maxSlots oldest held slots through the caller's
+// verified promotion bound. Unless allowPartial is set, an incomplete chunk
+// returns nil before allocating or collecting account writes. Selection and
+// collection share one read lock, so pruning cannot change the selected prefix.
+// This only prepares borrowed account pointers; it does not commit, prune, or
+// advance durability. Callers still own finality checks and durable commit order.
+func (w *WorkingSet) PromotionChunk(through uint64, maxSlots int, allowPartial bool) []SlotDelta {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.promotionChunkLocked(through, maxSlots, allowPartial)
+}
+
+func (w *WorkingSet) promotionChunkLocked(through uint64, maxSlots int, allowPartial bool) []SlotDelta {
+	count := 0
+	for count < len(w.order) && count < maxSlots && w.order[count] <= through {
+		count++
+	}
+	if count == 0 || (!allowPartial && count < maxSlots) {
+		return nil
+	}
+	batch := make([]SlotDelta, count)
+	for i, slot := range w.order[:count] {
 		layer := w.bySlot[slot]
 		delta := make([]*Account, 0, len(layer.writes))
 		for _, a := range layer.writes {
 			delta = append(delta, a)
 		}
-		batch = append(batch, SlotDelta{Slot: slot, Delta: delta})
+		batch[i] = SlotDelta{Slot: slot, Delta: delta}
 	}
 	return batch
 }

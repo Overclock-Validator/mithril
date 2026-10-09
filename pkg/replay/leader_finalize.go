@@ -139,9 +139,8 @@ func CommitLeaderSlot(in CommitLeaderInput) (*sealevel.SlotCtx, error) {
 		}
 	}
 
-	if len(block.Transactions) > 0 {
-		slotCtx.LamportsBurnt = fees.DistributeTxFeesToSlotLeader(in.AcctsDb, slotCtx, block.Leader, &in.TxFeeAccumulator)
-		slotCtx.RecordModifiedAcct(block.Leader)
+	if err := distributeBlockTxFees(slotCtx, block, &in.TxFeeAccumulator); err != nil {
+		return nil, err
 	}
 	var rentSysvar *sealevel.SysvarRent
 	if bankSysvars := slotCtx.BankSysvars(); bankSysvars != nil {

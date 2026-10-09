@@ -25,6 +25,7 @@ func ApplyDefaults(v *viper.Viper) {
 	v.SetDefault("validator.tpu_quic_bind_addr", "")
 	v.SetDefault("validator.advertised_ip", "")
 	v.SetDefault("validator.tpu_sigverify_workers", 0)
+	v.SetDefault("validator.wait_to_vote_slot", uint64(0))
 }
 
 // LedgerConfig holds ledger-related configuration (matches Firedancer [ledger] section)
@@ -235,6 +236,9 @@ type ValidatorConfig struct {
 	TPUQUICBindAddr             string `toml:"tpu_quic_bind_addr" mapstructure:"tpu_quic_bind_addr"`
 	AdvertisedIP                string `toml:"advertised_ip" mapstructure:"advertised_ip"`
 	TPUSigverifyWorkers         int    `toml:"tpu_sigverify_workers" mapstructure:"tpu_sigverify_workers"`
+	WaitToVoteSlot              uint64 `toml:"wait_to_vote_slot" mapstructure:"wait_to_vote_slot"` // Minimum slot for new votes; automatic startup cutoff still applies
+	BlockCompletionReserveMs    int    `toml:"block_completion_reserve_ms" mapstructure:"block_completion_reserve_ms"`
+	TPUMaxBufferedTransactions  int    `toml:"tpu_max_buffered_transactions" mapstructure:"tpu_max_buffered_transactions"`
 }
 
 // Config holds all configuration options for Mithril (Firedancer-style hierarchy)

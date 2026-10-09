@@ -411,3 +411,42 @@ func TestOverlayDeltaAccountsIncludesOverride(t *testing.T) {
 	assert.Equal(t, pk(1), delta[0].Key)
 	assert.Equal(t, uint64(99), delta[0].Lamports)
 }
+
+func TestWorkingSetPromotionChunkBoundaries(t *testing.T) {
+	w := NewWorkingSet()
+	for _, slot := range []uint64{5, 7, 9, 11} {
+		w.Add(slot, []*Account{uoAcct(1, slot), uoAcct(2, slot+100)})
+	}
+	for _, tc := range []struct {
+		through uint64
+		limit   int
+		partial bool
+		slots   []uint64
+	}{
+		{4, 2, true, nil}, {5, 2, false, nil}, {7, 2, false, []uint64{5, 7}},
+		{11, 2, false, []uint64{5, 7}}, {9, 4, true, []uint64{5, 7, 9}},
+		{9, 4, false, nil}, {11, 0, true, nil}, {11, -1, false, nil},
+	} {
+		got := w.PromotionChunk(tc.through, tc.limit, tc.partial)
+		var slots []uint64
+		for _, sd := range got {
+			slots = append(slots, sd.Slot)
+			require.Len(t, sd.Delta, 2)
+			for _, acct := range sd.Delta {
+				require.True(t, acct.Lamports == sd.Slot || acct.Lamports == sd.Slot+100)
+			}
+		}
+		require.Equal(t, tc.slots, slots)
+	}
+	// Preparing a job leaves the live suffix intact. Once the caller commits
+	// and promotes a prefix, the next chunk must start at the surviving slot.
+	require.Equal(t, 4, w.HeldSlots())
+	w.PromotePrefix(7)
+	chunk := w.PromotionChunk(11, 2, false)
+	require.Equal(t, []uint64{9, 11}, []uint64{chunk[0].Slot, chunk[1].Slot})
+	require.Zero(t, testing.AllocsPerRun(100, func() {
+		if w.PromotionChunk(9, 2, false) != nil {
+			panic("partial chunk escaped")
+		}
+	}))
+}

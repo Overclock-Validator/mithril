@@ -35,7 +35,13 @@ const (
 	VoteProgramInstrTypeCompactUpdateVoteStateSwitch
 	VoteProgramInstrTypeTowerSync
 	VoteProgramInstrTypeTowerSyncSwitch
-	VoteProgramInstrTypeInitializeAccountV2 = 16
+	VoteProgramInstrTypeInitializeAccountV2       = 16
+	VoteProgramInstrTypeUpdateCommissionCollector = 17
+)
+
+const (
+	CommissionKindInflationRewards uint32 = iota
+	CommissionKindBlockRevenue
 )
 
 var (
@@ -1118,6 +1124,25 @@ func VoteProgramExecute(execCtx *ExecutionCtx) error {
 			)
 		}
 
+	case VoteProgramInstrTypeUpdateCommissionCollector:
+		{
+			kind, decodeErr := decoder.ReadUint32(bin.LE)
+			if decodeErr != nil || kind > CommissionKindBlockRevenue {
+				return InstrErrInvalidInstructionData
+			}
+			if !execCtx.Features.IsActive(features.CustomCommissionCollector) {
+				return InstrErrInvalidInstructionData
+			}
+			if err = instrCtx.CheckNumOfInstructionAccounts(3); err != nil {
+				return err
+			}
+			rent, rentErr := ReadRentSysvar(execCtx)
+			if rentErr != nil {
+				return rentErr
+			}
+			err = VoteProgramUpdateCommissionCollector(execCtx, instrCtx, kind, signers, rent)
+		}
+
 	default: // invalid instruction
 		{
 			err = InstrErrInvalidInstructionData
@@ -1244,6 +1269,54 @@ func resolveVoteCommissionCollector(
 		return solana.PublicKey{}, InstrErrInvalidArgument
 	}
 	return accountKey, nil
+}
+
+// VoteProgramUpdateCommissionCollector mirrors Agave 4.4's
+// vote_state::update_commission_collector: validate the initialized vote state
+// and withdraw authority before checking the collector, then update one field.
+func VoteProgramUpdateCommissionCollector(execCtx *ExecutionCtx, instrCtx *InstructionCtx, kind uint32, signers []solana.PublicKey, rent SysvarRent) error {
+	txCtx := execCtx.TransactionContext
+	voteAccount, err := instrCtx.BorrowInstructionAccount(txCtx, 0)
+	if err != nil {
+		return err
+	}
+	defer voteAccount.Drop()
+
+	// Agave's V4 decoder rejects discriminant zero (retired V0_23_5) as
+	// InvalidAccountData before checking whether the vote state is initialized.
+	if data := voteAccount.Data(); len(data) >= 4 && bin.LE.Uint32(data[:4]) == VoteStateVersionV0_23_5 {
+		return InstrErrInvalidAccountData
+	}
+	versioned, err := UnmarshalVersionedVoteState(voteAccount.Data())
+	if err != nil {
+		return err
+	}
+	// SIMD-0185 defines every successfully decoded V4 state as initialized.
+	if versioned.Type != VoteStateVersionV4 && !versioned.IsInitialized() {
+		return InstrErrUninitializedAccount
+	}
+	voteState := versioned.ConvertToCurrent()
+	if err := verifySigner(voteState.AuthorizedWithdrawer, signers); err != nil {
+		return err
+	}
+	collector, err := resolveVoteCommissionCollector(txCtx, instrCtx, voteAccount.Key(), 1, rent)
+	if err != nil {
+		return err
+	}
+
+	// Convert legacy states with the standard V4 defaults before changing a
+	// collector, so conversion cannot overwrite the newly selected address.
+	v4 := newVoteState4FromCurrent(voteState, voteAccount.Key())
+	switch kind {
+	case CommissionKindInflationRewards:
+		v4.InflationRewardsCollector = collector
+	case CommissionKindBlockRevenue:
+		v4.BlockRevenueCollector = collector
+	default:
+		return InstrErrInvalidInstructionData
+	}
+	updated := &VoteStateVersions{Type: VoteStateVersionV4, V4: *v4}
+	return setVoteAccountState(execCtx, voteAccount, updated.ConvertToCurrent(), execCtx.Features)
 }
 
 func newVoteStateFromVoteInitV2(
@@ -1951,7 +2024,14 @@ func processNewVoteState(voteState *VoteState, newState *deque.Deque[LandedVote]
 	}
 
 	voteState.RootSlot = newRoot
-	voteState.Votes = *newState
+	// newState may be a pooled deque. Own the backing storage before its
+	// caller returns it to the pool: the resulting state can escape into the
+	// shared vote cache after this instruction completes.
+	var owned deque.Deque[LandedVote]
+	for i := 0; i < newState.Len(); i++ {
+		owned.PushBack(newState.At(i))
+	}
+	voteState.Votes = owned
 
 	return nil
 }

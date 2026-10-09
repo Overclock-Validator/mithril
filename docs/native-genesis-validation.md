@@ -111,3 +111,18 @@ validator payouts. Live startup, consensus-based root selection, voting and full
 incremental snapshot production remain future work. The receiver does not vote.
 Complete bank metadata and the coherent account/checkpoint boundary remain
 available to the future snapshot exporter.
+
+## Review against the October 8 development base
+
+Merged `alpenglow-dev` at `a22ea70d383f930d69ab3d5de4f976f032a99908`
+and retained both its execution/dependency preparation path and the native
+genesis parent-bank bootstrap. Updated direct sysvar-loading test calls for
+the dependency planner argument. CI now runs the complete genesis, genesisinit,
+state, AccountsDB and snapshot race suites alongside the existing replay suite.
+
+On macOS arm64 with Go 1.26.4, the complete affected functional suites and
+`go test -race ./pkg/genesis ./pkg/genesisinit ./pkg/state ./pkg/accountsdb
+./pkg/replay ./pkg/snapshot ./pkg/blockprod` passed. The Mithril CLI build,
+`go vet` for genesis/bootstrap/storage/replay and `git diff --check` passed.
+This review used the checked-in oracle fixtures; it did not rerun the live Agave
+oracle or the full repository suite. The scope limits above still apply.

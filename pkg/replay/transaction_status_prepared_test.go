@@ -25,7 +25,9 @@ func TestPreparedCommitRechecksAncestorAfterForkSwitch(t *testing.T) {
 	candidate := statusCacheTestBlock(12, retried, unique)
 	plan, err := planBlockTransactionExecution(candidate)
 	requireNoError(err)
-	requireNoError(cache.validateBlockWithPlan(candidate, plan))
+	validation, err := cache.validateBlockForPublication(candidate, plan)
+	requireNoError(err)
+	prepared := cache.prepareTransactionStatusDelta(plan.messageIdentities)
 
 	requireNoError(cache.Unwind(11))
 	replacement := statusCacheTestBlock(
@@ -34,7 +36,7 @@ func TestPreparedCommitRechecksAncestorAfterForkSwitch(t *testing.T) {
 	)
 	requireNoError(cache.CommitBlock(replacement))
 
-	err = cache.commitBlockWithPlan(candidate, plan)
+	err = cache.commitBlockWithValidation(candidate, plan, prepared, validation)
 	var ancestorErr *AncestorAlreadyProcessedTransactionMessagesError
 	if !errors.As(err, &ancestorErr) {
 		t.Fatalf("prepared commit error = %v, want ancestor AlreadyProcessed", err)
@@ -76,22 +78,26 @@ func TestConcurrentPreparedSiblingCommitsPublishExactlyOne(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cache.validateBlockWithPlan(left, leftPlan); err != nil {
+	leftValidation, err := cache.validateBlockForPublication(left, leftPlan)
+	if err != nil {
 		t.Fatalf("prevalidate left sibling: %v", err)
 	}
-	if err := cache.validateBlockWithPlan(right, rightPlan); err != nil {
+	rightValidation, err := cache.validateBlockForPublication(right, rightPlan)
+	if err != nil {
 		t.Fatalf("prevalidate right sibling: %v", err)
 	}
 
+	leftPrepared := cache.prepareTransactionStatusDelta(leftPlan.messageIdentities)
+	rightPrepared := cache.prepareTransactionStatusDelta(rightPlan.messageIdentities)
 	start := make(chan struct{})
 	results := make(chan error, 2)
 	go func() {
 		<-start
-		results <- cache.commitBlockWithPlan(left, leftPlan)
+		results <- cache.commitBlockWithValidation(left, leftPlan, leftPrepared, leftValidation)
 	}()
 	go func() {
 		<-start
-		results <- cache.commitBlockWithPlan(right, rightPlan)
+		results <- cache.commitBlockWithValidation(right, rightPlan, rightPrepared, rightValidation)
 	}()
 	close(start)
 

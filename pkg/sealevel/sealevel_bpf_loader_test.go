@@ -48,6 +48,7 @@ func TestExecute_Tx_BpfLoader_InitializeBuffer_Success(t *testing.T) {
 	instrData := make([]byte, 4)
 	binary.LittleEndian.AppendUint32(instrData, UpgradeableLoaderInstrTypeInitializeBuffer)
 	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, nil, err)
 
@@ -91,6 +92,7 @@ func TestExecute_Tx_BpfLoader_InitializeBuffer_Buffer_Acct_Already_Initialize_Fa
 	instrData := make([]byte, 4)
 	binary.LittleEndian.AppendUint32(instrData, UpgradeableLoaderInstrTypeInitializeBuffer)
 	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 
 	assert.Equal(t, InstrErrAccountAlreadyInitialized, err)
@@ -143,6 +145,7 @@ func TestExecute_Tx_BpfLoader_Write_Success(t *testing.T) {
 
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, nil, err)
 
@@ -203,6 +206,7 @@ func TestExecute_Tx_BpfLoader_Write_Offset_Too_Large_Failure(t *testing.T) {
 
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrAccountDataTooSmall, err)
 }
@@ -254,6 +258,7 @@ func TestExecute_Tx_BpfLoader_Write_Buffer_Authority_Didnt_Sign_Failure(t *testi
 
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrMissingRequiredSignature, err)
 }
@@ -310,6 +315,7 @@ func TestExecute_Tx_BpfLoader_Write_Incorrect_Authority_Failure(t *testing.T) {
 
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrIncorrectAuthority, err)
 }
@@ -346,8 +352,9 @@ func TestExecute_Tx_BpfLoader_SetAuthority_Not_Enough_Instr_Accts_Failure(t *tes
 
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
-	assert.Equal(t, InstrErrNotEnoughAccountKeys, err)
+	assert.Equal(t, InstrErrMissingAccount, err)
 }
 
 func TestExecute_Tx_BpfLoader_SetAuthority_Buffer_Success(t *testing.T) {
@@ -391,6 +398,7 @@ func TestExecute_Tx_BpfLoader_SetAuthority_Buffer_Success(t *testing.T) {
 
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, nil, err)
 
@@ -445,6 +453,7 @@ func TestExecute_Tx_BpfLoader_SetAuthority_ProgramData_Success(t *testing.T) {
 
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, nil, err)
 
@@ -499,6 +508,7 @@ func TestExecute_Tx_BpfLoader_SetAuthority_Buffer_Immutable_Failure(t *testing.T
 
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrImmutable, err)
 }
@@ -549,6 +559,7 @@ func TestExecute_Tx_BpfLoader_SetAuthority_Buffer_Wrong_Upgrade_Authority_Failur
 
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrIncorrectAuthority, err)
 }
@@ -594,6 +605,7 @@ func TestExecute_Tx_BpfLoader_SetAuthority_Buffer_Authority_Didnt_Sign_Failure(t
 
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrMissingRequiredSignature, err)
 }
@@ -633,6 +645,7 @@ func TestExecute_Tx_BpfLoader_SetAuthority_Buffer_No_New_Authority_Failure(t *te
 
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrIncorrectAuthority, err)
 }
@@ -678,6 +691,7 @@ func TestExecute_Tx_BpfLoader_SetAuthority_Buffer_Uninitialized_Account_Failure(
 
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrInvalidArgument, err)
 }
@@ -723,6 +737,7 @@ func TestExecute_Tx_BpfLoader_SetAuthority_ProgramData_Immutable_Failure(t *test
 
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrImmutable, err)
 }
@@ -768,6 +783,7 @@ func TestExecute_Tx_BpfLoader_SetAuthority_ProgramData_Authority_Didnt_Sign_Fail
 
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrMissingRequiredSignature, err)
 }
@@ -818,6 +834,7 @@ func TestExecute_Tx_BpfLoader_SetAuthority_ProgramData_Wrong_Authority_Failure(t
 
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrIncorrectAuthority, err)
 }
@@ -855,9 +872,10 @@ func TestExecute_Tx_BpfLoader_SetAuthorityChecked_Not_Enough_Instr_Accts_Failure
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	f := features.NewFeaturesDefault()
 	f.EnableFeature(features.EnableBpfLoaderSetAuthorityCheckedIx, 0)
-	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	execCtx := ExecutionCtx{Features: *f, TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
-	assert.Equal(t, InstrErrNotEnoughAccountKeys, err)
+	assert.Equal(t, InstrErrMissingAccount, err)
 }
 
 func TestExecute_Tx_BpfLoader_SetAuthorityChecked_Buffer_Success(t *testing.T) {
@@ -902,7 +920,8 @@ func TestExecute_Tx_BpfLoader_SetAuthorityChecked_Buffer_Success(t *testing.T) {
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	f := features.NewFeaturesDefault()
 	f.EnableFeature(features.EnableBpfLoaderSetAuthorityCheckedIx, 0)
-	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	execCtx := ExecutionCtx{Features: *f, TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, nil, err)
 
@@ -958,7 +977,8 @@ func TestExecute_Tx_BpfLoader_SetAuthorityChecked_ProgramData_Success(t *testing
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	f := features.NewFeaturesDefault()
 	f.EnableFeature(features.EnableBpfLoaderSetAuthorityCheckedIx, 0)
-	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	execCtx := ExecutionCtx{Features: *f, TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, nil, err)
 
@@ -1014,7 +1034,8 @@ func TestExecute_Tx_BpfLoader_SetAuthorityChecked_Buffer_Immutable_Failure(t *te
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	f := features.NewFeaturesDefault()
 	f.EnableFeature(features.EnableBpfLoaderSetAuthorityCheckedIx, 0)
-	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	execCtx := ExecutionCtx{Features: *f, TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrImmutable, err)
 }
@@ -1066,7 +1087,8 @@ func TestExecute_Tx_BpfLoader_SetAuthorityChecked_Buffer_Wrong_Upgrade_Authority
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	f := features.NewFeaturesDefault()
 	f.EnableFeature(features.EnableBpfLoaderSetAuthorityCheckedIx, 0)
-	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	execCtx := ExecutionCtx{Features: *f, TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrIncorrectAuthority, err)
 }
@@ -1113,7 +1135,8 @@ func TestExecute_Tx_BpfLoader_SetAuthorityChecked_Buffer_Authority_Didnt_Sign_Fa
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	f := features.NewFeaturesDefault()
 	f.EnableFeature(features.EnableBpfLoaderSetAuthorityCheckedIx, 0)
-	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	execCtx := ExecutionCtx{Features: *f, TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrMissingRequiredSignature, err)
 }
@@ -1160,7 +1183,8 @@ func TestExecute_Tx_BpfLoader_SetAuthorityChecked_Buffer_New_Authority_Didnt_Sig
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	f := features.NewFeaturesDefault()
 	f.EnableFeature(features.EnableBpfLoaderSetAuthorityCheckedIx, 0)
-	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	execCtx := ExecutionCtx{Features: *f, TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrMissingRequiredSignature, err)
 }
@@ -1207,7 +1231,8 @@ func TestExecute_Tx_BpfLoader_SetAuthorityChecked_Buffer_Uninitialized_Account_F
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	f := features.NewFeaturesDefault()
 	f.EnableFeature(features.EnableBpfLoaderSetAuthorityCheckedIx, 0)
-	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	execCtx := ExecutionCtx{Features: *f, TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrInvalidArgument, err)
 }
@@ -1254,7 +1279,8 @@ func TestExecute_Tx_BpfLoader_SetAuthorityChecked_ProgramData_Immutable_Failure(
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	f := features.NewFeaturesDefault()
 	f.EnableFeature(features.EnableBpfLoaderSetAuthorityCheckedIx, 0)
-	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	execCtx := ExecutionCtx{Features: *f, TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrImmutable, err)
 }
@@ -1301,7 +1327,8 @@ func TestExecute_Tx_BpfLoader_SetAuthorityChecked_ProgramData_Authority_Didnt_Si
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	f := features.NewFeaturesDefault()
 	f.EnableFeature(features.EnableBpfLoaderSetAuthorityCheckedIx, 0)
-	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	execCtx := ExecutionCtx{Features: *f, TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrMissingRequiredSignature, err)
 }
@@ -1348,7 +1375,8 @@ func TestExecute_Tx_BpfLoader_SetAuthorityChecked_ProgramData_New_Authority_Didn
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	f := features.NewFeaturesDefault()
 	f.EnableFeature(features.EnableBpfLoaderSetAuthorityCheckedIx, 0)
-	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	execCtx := ExecutionCtx{Features: *f, TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrMissingRequiredSignature, err)
 }
@@ -1400,7 +1428,8 @@ func TestExecute_Tx_BpfLoader_SetAuthorityChecked_ProgramData_Wrong_Authority_Fa
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	f := features.NewFeaturesDefault()
 	f.EnableFeature(features.EnableBpfLoaderSetAuthorityCheckedIx, 0)
-	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	execCtx := ExecutionCtx{Features: *f, TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrIncorrectAuthority, err)
 }
@@ -1446,6 +1475,7 @@ func TestExecute_Tx_BpfLoader_Close_Buffer_Success(t *testing.T) {
 
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, nil, err)
 
@@ -1502,6 +1532,7 @@ func TestExecute_Tx_BpfLoader_Close_Buffer_Immutable_Failure(t *testing.T) {
 
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrImmutable, err)
 }
@@ -1547,6 +1578,7 @@ func TestExecute_Tx_BpfLoader_Close_Buffer_Authority_Didnt_Sign_Failure(t *testi
 
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrMissingRequiredSignature, err)
 }
@@ -1598,6 +1630,7 @@ func TestExecute_Tx_BpfLoader_Close_Buffer_Wrong_Authority_Failure(t *testing.T)
 
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrIncorrectAuthority, err)
 }
@@ -1636,6 +1669,7 @@ func TestExecute_Tx_BpfLoader_Close_Uninitialized_Success(t *testing.T) {
 
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, nil, err)
 
@@ -1680,6 +1714,7 @@ func TestExecute_Tx_BpfLoader_Close_Recipient_Same_As_Account_Being_Closed_Failu
 
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrInvalidArgument, err)
 }
@@ -1723,8 +1758,9 @@ func TestExecute_Tx_BpfLoader_Close_Buffer_Not_Enough_Accounts(t *testing.T) {
 
 	txCtx := NewTransactionCtx(*transactionAccts, 5, 64)
 	execCtx := ExecutionCtx{TransactionContext: txCtx, ComputeMeter: cu.NewComputeMeterDefault()}
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
-	assert.Equal(t, InstrErrNotEnoughAccountKeys, err)
+	assert.Equal(t, InstrErrMissingAccount, err)
 }
 
 func TestExecute_Tx_BpfLoader_Close_ProgramData_Success(t *testing.T) {
@@ -1787,6 +1823,7 @@ func TestExecute_Tx_BpfLoader_Close_ProgramData_Success(t *testing.T) {
 	clockAcct.Lamports = 1
 	execCtx.Accounts.SetAccount(&SysvarClockAddr, &clockAcct)
 	WriteClockSysvar(&execCtx.Accounts, clock)
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, nil, err)
 
@@ -1861,8 +1898,9 @@ func TestExecute_Tx_BpfLoader_Close_ProgramData_Not_Enough_Accounts_Failure(t *t
 	clockAcct.Lamports = 1
 	execCtx.Accounts.SetAccount(&SysvarClockAddr, &clockAcct)
 	WriteClockSysvar(&execCtx.Accounts, clock)
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
-	assert.Equal(t, InstrErrNotEnoughAccountKeys, err)
+	assert.Equal(t, InstrErrMissingAccount, err)
 }
 
 func TestExecute_Tx_BpfLoader_Close_ProgramData_Program_Acct_Not_Writable_Failure(t *testing.T) {
@@ -1925,6 +1963,7 @@ func TestExecute_Tx_BpfLoader_Close_ProgramData_Program_Acct_Not_Writable_Failur
 	clockAcct.Lamports = 1
 	execCtx.Accounts.SetAccount(&SysvarClockAddr, &clockAcct)
 	WriteClockSysvar(&execCtx.Accounts, clock)
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrInvalidArgument, err)
 }
@@ -1990,6 +2029,7 @@ func TestExecute_Tx_BpfLoader_Close_ProgramData_Program_Acct_Wrong_Owner_Failure
 	clockAcct.Lamports = 1
 	execCtx.Accounts.SetAccount(&SysvarClockAddr, &clockAcct)
 	WriteClockSysvar(&execCtx.Accounts, clock)
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrIncorrectProgramId, err)
 }
@@ -2055,6 +2095,7 @@ func TestExecute_Tx_BpfLoader_Close_ProgramData_Already_Deployed_In_This_Block_F
 	clockAcct.Lamports = 1
 	execCtx.Accounts.SetAccount(&SysvarClockAddr, &clockAcct)
 	WriteClockSysvar(&execCtx.Accounts, clock)
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrInvalidArgument, err)
 }
@@ -2120,6 +2161,7 @@ func TestExecute_Tx_BpfLoader_Close_ProgramData_ProgramData_Not_A_Program_Acct_F
 	clockAcct.Lamports = 1
 	execCtx.Accounts.SetAccount(&SysvarClockAddr, &clockAcct)
 	WriteClockSysvar(&execCtx.Accounts, clock)
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrInvalidArgument, err)
 }
@@ -2185,6 +2227,7 @@ func TestExecute_Tx_BpfLoader_Close_ProgramData_Nonclosable_Account_Failure(t *t
 	clockAcct.Lamports = 1
 	execCtx.Accounts.SetAccount(&SysvarClockAddr, &clockAcct)
 	WriteClockSysvar(&execCtx.Accounts, clock)
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrInvalidArgument, err)
 }
@@ -2265,6 +2308,7 @@ func TestExecute_Tx_BpfLoader_ExtendProgram_Success(t *testing.T) {
 	execCtx.Accounts.SetAccount(&SysvarRentAddr, &rentAcct)
 	WriteRentSysvar(&execCtx.Accounts, rent)
 
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, nil, err)
 
@@ -2367,6 +2411,7 @@ func TestExecute_Tx_BpfLoader_ExtendProgram_Extend_By_Zero_Bytes_Failure(t *test
 	execCtx.Accounts.SetAccount(&SysvarRentAddr, &rentAcct)
 	WriteRentSysvar(&execCtx.Accounts, rent)
 
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrInvalidInstructionData, err)
 }
@@ -2447,6 +2492,7 @@ func TestExecute_Tx_BpfLoader_ExtendProgram_With_Rent_Exemption_Payment_Not_Enou
 	execCtx.Accounts.SetAccount(&SysvarRentAddr, &rentAcct)
 	WriteRentSysvar(&execCtx.Accounts, rent)
 
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrNotEnoughAccountKeys, err)
 }
@@ -2487,8 +2533,8 @@ func TestExecute_Tx_BpfLoader_ExtendProgram_With_Rent_Exemption_Payment_Success(
 	payerPrivateKey, err := solana.NewRandomPrivateKey()
 	assert.NoError(t, err)
 	payerPubkey := payerPrivateKey.PublicKey()
-	payerAcct := accounts.Account{Key: payerPubkey, Lamports: 10, Data: make([]byte, 0), Owner: a.SystemProgramAddr, Executable: false, RentEpoch: 100}
-	origPayerBalance := uint64(10)
+	payerAcct := accounts.Account{Key: payerPubkey, Lamports: 1_000_000, Data: make([]byte, 0), Owner: a.SystemProgramAddr, Executable: false, RentEpoch: 100}
+	origPayerBalance := uint64(1_000_000)
 
 	// program account
 	programPrivKey, err := solana.NewRandomPrivateKey()
@@ -2540,6 +2586,7 @@ func TestExecute_Tx_BpfLoader_ExtendProgram_With_Rent_Exemption_Payment_Success(
 	execCtx.Accounts.SetAccount(&SysvarRentAddr, &rentAcct)
 	WriteRentSysvar(&execCtx.Accounts, rent)
 
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, nil, err)
 
@@ -2666,10 +2713,11 @@ func TestExecute_Tx_BpfLoader_Upgrade_Success(t *testing.T) {
 	rent.ExemptionThreshold = 1
 	rent.BurnPercent = 0
 
-	rentAcct := accounts.Account{}
+	rentAcct := accounts.Account{Lamports: 1}
 	execCtx.Accounts.SetAccount(&SysvarRentAddr, &rentAcct)
 	WriteRentSysvar(&execCtx.Accounts, rent)
 
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, nil, err)
 
@@ -2777,10 +2825,11 @@ func TestExecute_Tx_BpfLoader_Upgrade_Buffer_Wrong_Authority_Failure(t *testing.
 	rent.LamportsPerUint8Year = 1
 	rent.ExemptionThreshold = 1
 	rent.BurnPercent = 0
-	rentAcct := accounts.Account{}
+	rentAcct := accounts.Account{Lamports: 1}
 	execCtx.Accounts.SetAccount(&SysvarRentAddr, &rentAcct)
 	WriteRentSysvar(&execCtx.Accounts, rent)
 
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrIncorrectAuthority, err)
 }
@@ -2885,6 +2934,7 @@ func TestExecute_Tx_BpfLoader_DeployWithMaxDataLen_Success(t *testing.T) {
 	execCtx.Accounts.SetAccount(&SysvarRentAddr, &rentAcct)
 	WriteRentSysvar(&execCtx.Accounts, rent)
 
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, nil, err)
 
@@ -2970,6 +3020,7 @@ func TestExecute_Tx_BpfLoader_Invoke_Bpf_Program_Success(t *testing.T) {
 	execCtx.SlotCtx = new(SlotCtx)
 	execCtx.SlotCtx.Slot = 1337
 
+	initializeLegacyBankFixture(t, &execCtx)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, nil, err)
 }

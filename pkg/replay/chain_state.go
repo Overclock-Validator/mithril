@@ -266,3 +266,14 @@ func ChainTipFeatureActive(gate features.FeatureGate) bool {
 	defer chainTipMu.RUnlock()
 	return chainTipFeatures != nil && chainTipFeatures.IsActive(gate)
 }
+
+// ChainTipFeatures returns an independent feature snapshot for queued transaction
+// preparation. Bank admission checks compatibility again before reuse.
+func ChainTipFeatures() *features.Features {
+	chainTipMu.RLock()
+	defer chainTipMu.RUnlock()
+	if chainTipFeatures == nil {
+		return nil
+	}
+	return chainTipFeatures.Clone()
+}

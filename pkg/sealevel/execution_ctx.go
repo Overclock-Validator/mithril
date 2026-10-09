@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
@@ -19,6 +18,9 @@ import (
 )
 
 type ExecutionCtx struct {
+	// SkipTimingMetrics disables instruction-dispatch timing collection for
+	// leader execution; it never changes instruction validation or CU charging.
+	SkipTimingMetrics        bool
 	Log                      Logger
 	Accounts                 accounts.Accounts
 	TransactionContext       *TransactionCtx
@@ -105,6 +107,50 @@ type SlotCtx struct {
 	bankSysvars              atomic.Pointer[BankSysvars]
 
 	TraceCtx context.Context
+
+	// Speculative execution support (streaming replay). A bank executed before
+	// its block is complete must not publish to process-global state until
+	// the block is accepted, so a discard leaves nothing behind.
+	//
+	// DeferVoteCachePublication buffers global vote-cache puts and deletes in
+	// the pending maps (protected by PendingVoteCacheMu) and turns the
+	// vote/stake dirty marker into VoteStakeDirty; the replay finalize step
+	// publishes them once the bank is accepted.
+	DeferVoteCachePublication bool
+	PendingVoteCacheMu        sync.Mutex
+	PendingVoteCache          map[solana.PublicKey]*VoteStateVersions
+	PendingVoteCacheDeletes   map[solana.PublicKey]struct{}
+	VoteStakeDirty            bool
+	// TrackProgramCacheAdds records every program-cache insertion made while
+	// executing this bank so a discarded bank can evict them again (eviction
+	// only forces a reload from account data, so it is always safe).
+	TrackProgramCacheAdds bool
+	ProgramCacheAddsMu    sync.Mutex
+	ProgramCacheAdds      []solana.PublicKey
+}
+
+// RecordProgramCacheAdd notes a program-cache insertion for later undo when
+// TrackProgramCacheAdds is set.
+func (slotCtx *SlotCtx) RecordProgramCacheAdd(key solana.PublicKey) {
+	if slotCtx == nil || !slotCtx.TrackProgramCacheAdds {
+		return
+	}
+	slotCtx.ProgramCacheAddsMu.Lock()
+	slotCtx.ProgramCacheAdds = append(slotCtx.ProgramCacheAdds, key)
+	slotCtx.ProgramCacheAddsMu.Unlock()
+}
+
+// TakeProgramCacheAdds returns and clears the recorded program-cache
+// insertions.
+func (slotCtx *SlotCtx) TakeProgramCacheAdds() []solana.PublicKey {
+	if slotCtx == nil {
+		return nil
+	}
+	slotCtx.ProgramCacheAddsMu.Lock()
+	defer slotCtx.ProgramCacheAddsMu.Unlock()
+	adds := slotCtx.ProgramCacheAdds
+	slotCtx.ProgramCacheAdds = nil
+	return adds
 }
 
 // BankSysvars returns the immutable sysvar snapshot owned by this bank.
@@ -237,14 +283,14 @@ func (execCtx *ExecutionCtx) PrepareInstruction(ix Instruction, signers []solana
 }
 
 func (execCtx *ExecutionCtx) ProcessInstruction(instrData []byte, instructionAccts []InstructionAccount, programIndices []uint64) error {
-	start := time.Now()
+	start := metrics.StartTiming(!execCtx.SkipTimingMetrics)
 	nextInstrCtx, err := execCtx.TransactionContext.NextInstructionCtx()
 	if err != nil {
 		return err
 	}
 	metrics.GlobalBlockReplay.GetNextIxCtx.AddTimingSince(start)
 
-	start = time.Now()
+	start = metrics.StartTiming(!execCtx.SkipTimingMetrics)
 	nextInstrCtx.Configure(programIndices, instructionAccts, instrData)
 	metrics.GlobalBlockReplay.NextIxCtxConfigure.AddTimingSince(start)
 
@@ -267,7 +313,7 @@ func (execCtx *ExecutionCtx) ProcessInstruction(instrData []byte, instructionAcc
 		})
 	}
 
-	start = time.Now()
+	start = metrics.StartTiming(!execCtx.SkipTimingMetrics)
 	err = execCtx.Push()
 	if err != nil {
 		return err
@@ -283,7 +329,7 @@ func (execCtx *ExecutionCtx) ProcessInstruction(instrData []byte, instructionAcc
 
 	err1 := execCtx.ExecuteInstruction()
 
-	start = time.Now()
+	start = metrics.StartTiming(!execCtx.SkipTimingMetrics)
 	err2 := execCtx.Pop()
 	metrics.GlobalBlockReplay.IxPop.AddTimingSince(start)
 
@@ -304,7 +350,7 @@ func (execCtx *ExecutionCtx) AddModifiedVoteState(pubkey solana.PublicKey, state
 }
 
 func (execCtx *ExecutionCtx) ExecuteInstruction() error {
-	start := time.Now()
+	start := metrics.StartTiming(!execCtx.SkipTimingMetrics)
 
 	txCtx := execCtx.TransactionContext
 	instrCtx, err := txCtx.CurrentInstructionCtx()
@@ -334,7 +380,7 @@ func (execCtx *ExecutionCtx) ExecuteInstruction() error {
 	}
 	metrics.GlobalBlockReplay.ExecIxResolveNativeProgram.AddTimingSince(start)
 
-	start = time.Now()
+	start = metrics.StartTiming(!execCtx.SkipTimingMetrics)
 	err = nativeProgramFn(execCtx)
 	switch nativeProgramStr {
 	case a.SystemProgramAddrStr:

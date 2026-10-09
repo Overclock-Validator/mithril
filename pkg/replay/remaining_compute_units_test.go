@@ -77,7 +77,9 @@ func TestRemainingComputeUnitsPreservesSuccessfulNonceAdvance(t *testing.T) {
 	}
 	program := &sbpf.Program{Text: text, TextBytes: textBytes, TextVA: sbpf.VaddrProgram}
 	require.NoError(t, program.Verify())
-	slotCtx.AccountsDb.AddProgramToCache(programKey, &accountsdb.ProgramCacheEntry{Program: program})
+	entry := &accountsdb.ProgramCacheEntry{Program: program}
+	entry.BindSource(nil, slotCtx.Features)
+	slotCtx.AccountsDb.AddProgramToCache(programKey, entry)
 
 	tx, err := solana.NewTransaction([]solana.Instruction{
 		system.NewAdvanceNonceAccountInstruction(nonceKey, solana.SysVarRecentBlockHashesPubkey, payer).Build(),

@@ -42,7 +42,8 @@ func startSigverifyReporter(ctx context.Context) {
 		// against, and so the resolved backend is recorded even on a node that
 		// exits before the first tick.
 		previous := sigverify.Stats()
-		mlog.NamedFilef("sigverify", "startup: %s", previous)
+		mlog.NamedFilef("sigverify", "startup: %s workers=%d batch_target=%d shred_overlap=%t", previous,
+			sigverify.TransactionWorkers(), sigverify.TransactionBatchTarget(), !sigverify.Cfg.DisableShredOverlap)
 
 		for {
 			select {

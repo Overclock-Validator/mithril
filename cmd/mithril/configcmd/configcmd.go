@@ -158,6 +158,9 @@ authorized_voter_keypair = ""      # BLS derivation signer (empty defaults to id
 authorized_withdrawer_keypair = "" # Authorized withdrawer keypair path (diagnostics only)
 tpu_quic_bind_addr = "0.0.0.0:8004"
 advertised_ip = ""                 # Required only in validator mode; public IP advertised for TPU QUIC
+wait_to_vote_slot = 0             # Minimum slot for new votes; does not bypass recovery checks
+tpu_max_buffered_transactions = 0 # 0 = 131,072 buffered transactions
+block_completion_reserve_ms = 0   # 0 = 75ms local completion/broadcast reserve
 tpu_sigverify_workers = 0          # 0 = GOMAXPROCS
 
 [consensus]
@@ -175,6 +178,9 @@ authorized_voter_keypair = ""                               # Empty defaults to 
 authorized_withdrawer_keypair = ""
 tpu_quic_bind_addr = "0.0.0.0:8004"
 advertised_ip = "" # REQUIRED: public IP advertised for TPU QUIC
+wait_to_vote_slot = 0             # Minimum slot for new votes; does not bypass recovery checks
+tpu_max_buffered_transactions = 0 # 0 = 131,072 buffered transactions
+block_completion_reserve_ms = 0   # 0 = 75ms local completion/broadcast reserve
 tpu_sigverify_workers = 0
 
 [consensus]
@@ -261,7 +267,12 @@ max_rps = 8               # Verifier's own RPC budget (never shares the block-fe
 # ── Replay tuning ────────────────────────────────────────────────────────
 [tuning]
 txpar = 24                # Validator auto-defaults to 2x CPU cores only when unset; explicit 0 = sequential
-sigverify_backend = "auto" # auto|r51|generic|stdlib; stdlib uses Go's crypto/ed25519 impl after strict checks.
+
+[sigverify]
+backend = "auto"          # auto|r51|generic|stdlib
+workers = 0               # 0 = min(2, GOMAXPROCS); explicit value overrides the shared transaction pool
+batch_target = 8          # 4 or 8 signature lanes; available work runs immediately
+disable_shred_overlap = false # Diagnostic fallback: verify after complete block assembly
 
 # ── Mithril's RPC server ─────────────────────────────────────────────────
 [rpc]

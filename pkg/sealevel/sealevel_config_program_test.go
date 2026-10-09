@@ -53,7 +53,7 @@ func TestExecute_Tx_Config_Program_Success(t *testing.T) {
 	acct, err := txCtx.Accounts.GetAccount(1)
 	require.NoError(t, err)
 
-	hasNewData := bytes.HasSuffix(acct.Data, []byte("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))
+	hasNewData := bytes.Equal(acct.Data[:len(instrData)], instrData)
 
 	assert.Equal(t, true, hasNewData)
 }

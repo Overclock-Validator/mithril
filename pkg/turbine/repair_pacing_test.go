@@ -90,7 +90,7 @@ func TestLateResponseMatchedAfterExpiry(t *testing.T) {
 
 	packet := nonceTrailer(777)
 	shred := &Shred{Slot: 42, Index: 3, Type: ShredTypeData}
-	if !c.observeShredResponse(nil, packet, from, shred) {
+	if !observeRepairForTest(c, nil, packet, from, shred) {
 		t.Fatal("late answer must be attributed as a repair delivery")
 	}
 	if c.lateResponses.Load() != 1 {
@@ -104,7 +104,7 @@ func TestLateResponseMatchedAfterExpiry(t *testing.T) {
 	}
 
 	// Second delivery of the same nonce: entry consumed, ordinary broadcast.
-	if c.observeShredResponse(nil, packet, from, shred) {
+	if observeRepairForTest(c, nil, packet, from, shred) {
 		t.Fatal("expired entry must be single-use")
 	}
 }
@@ -122,7 +122,7 @@ func TestLateResponseWrongSlotRejected(t *testing.T) {
 	c.byResponse[repairResponseKey{addr: addrKey, nonce: 900}] = reqKey
 	c.expireOutstanding(time.Now())
 
-	if c.observeShredResponse(nil, nonceTrailer(900), from, &Shred{Slot: 43, Index: 3, Type: ShredTypeData}) {
+	if observeRepairForTest(c, nil, nonceTrailer(900), from, &Shred{Slot: 43, Index: 3, Type: ShredTypeData}) {
 		t.Fatal("wrong-slot late answer must not be attributed as repair")
 	}
 	if c.lateResponses.Load() != 0 {
@@ -165,7 +165,7 @@ func TestNonConformingResponseRejected(t *testing.T) {
 			c.addInflightLocked(tc.key.shred(), time.Now())
 			c.mu.Unlock()
 
-			if c.observeShredResponse(nil, nonceTrailer(111), from, tc.shred) {
+			if observeRepairForTest(c, nil, nonceTrailer(111), from, tc.shred) {
 				t.Fatal("non-conforming answer must not be attributed as a repair delivery")
 			}
 			if c.responses.Load() != 0 || c.lateResponses.Load() != 0 {
@@ -211,7 +211,7 @@ func TestLateHighestResponseFiresFollowups(t *testing.T) {
 	c.byResponse[repairResponseKey{addr: addrKey, nonce: 6}] = reqKey
 	c.expireOutstanding(time.Now())
 
-	if !c.observeShredResponse(conn, nonceTrailer(6), from, &Shred{Slot: 50, Index: 200, Type: ShredTypeData}) {
+	if !observeRepairForTest(c, conn, nonceTrailer(6), from, &Shred{Slot: 50, Index: 200, Type: ShredTypeData}) {
 		t.Fatal("late HWI answer must match")
 	}
 	if c.lateResponses.Load() != 1 || c.responses.Load() != 0 {
@@ -448,7 +448,7 @@ func TestRepairAnswerCancelsSiblingAttempts(t *testing.T) {
 
 	// The ORIGINAL peer answers timely; the sibling is neutral-cancelled.
 	from := &net.UDPAddr{IP: sinkAddr.IP, Port: sinkAddr.Port}
-	if !c.observeShredResponse(conn, nonceTrailer(o0.nonce), from, &Shred{Slot: 60, Index: 3, Type: ShredTypeData}) {
+	if !observeRepairForTest(c, conn, nonceTrailer(o0.nonce), from, &Shred{Slot: 60, Index: 3, Type: ShredTypeData}) {
 		t.Fatal("original attempt's answer must match")
 	}
 	c.mu.Lock()
@@ -568,7 +568,7 @@ func TestFollowupsAreMeteredByTokenBucket(t *testing.T) {
 	// by the primed outstanding entry, leaving a stray token.
 	c.takeRateTokens(repairMaxRequestsPerSecond)
 	c.takeRateTokens(repairMaxRequestsPerSecond)
-	if !c.observeShredResponse(conn, packet, from, shred) {
+	if !observeRepairForTest(c, conn, packet, from, shred) {
 		t.Fatal("response itself must match")
 	}
 	if got := c.requests.Load(); got != 0 {
@@ -580,7 +580,7 @@ func TestFollowupsAreMeteredByTokenBucket(t *testing.T) {
 	c.rateRefillAt = time.Now()
 	c.rateTokens = repairMaxRequestsPerSecond
 	c.mu.Unlock()
-	if !c.observeShredResponse(conn, packet, from, shred) {
+	if !observeRepairForTest(c, conn, packet, from, shred) {
 		t.Fatal("response itself must match")
 	}
 	// A full bucket sends the whole revealed gap: under the adaptive per-peer

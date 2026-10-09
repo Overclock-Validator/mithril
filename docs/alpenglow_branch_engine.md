@@ -84,16 +84,22 @@ verifying-mode diagnostic and the classic non-Alpenglow flow is unchanged.
 
 ### 5. Fork switch: sweep + unwind
 
-Since a slot can execute before its certificate arrives, a later certificate can
-contradict an executed slot (a sibling we lost the shred race on, or a skip over
-a block we ran). The switch sweep (`pkg/replay/alpenglow_switch.go`, gated on new
-certificate arrivals) walks the executed-but-unfolded window and reports the
-first contradiction as a typed `CertifiedSwitch`. When the parent context is
+Replay can consume blocks and provisional skips before decisive certificates
+or newly discovered ancestry select the chain. The switch sweep
+(`pkg/replay/alpenglow_switch.go`) walks the consumed-but-unrooted window when
+the chain-decision version, replay tip, or rooted frontier changes and reports
+the first contradiction as a typed `CertifiedSwitch`. Decision notifications
+wake replay immediately, with a periodic sweep as a fallback. A switch affecting
+only trailing skips rewinds the block source without unwinding account state.
+For an already-executed divergence, when the parent context is
 retained and the span is safe (same epoch, not mid-rewards-distribution), the
 engine unwinds in-RAM (`tryInLoopUnwind` → `WorkingSet.EvictFrom`) and
 re-executes the certified alternative; otherwise it falls back to re-replay from
 the durable rooted checkpoint. The block source's emission frontier is rewound
-in lockstep (`RewindForAlpenglowSwitch`).
+in lockstep (`RewindForAlpenglowSwitch`). If the source has not delivered the
+selected outcome five seconds after a certified rewind, a warning reports the
+required slot/block id, replay and emission frontiers, and repair range. It
+repeats at most every thirty seconds until delivery or a superseding decision.
 
 ### 6. Cert-driven repair
 
@@ -153,6 +159,31 @@ mixed (heterogeneous-client) or Mithril-only cluster identically:
   What voting mode adds lives entirely above this layer: the vote loop and
   timeouts, vote signing/transmission, durable vote-history persistence, and
   standstill participation.
+
+## Replay-observer diagnostics
+
+The observer retains certificate history for deduplication and match/mismatch
+reporting. A separate bounded index contains only retained, block-bearing
+certificates that have not yet been reconciled against replay. Reconciliation
+removes an entry after either a match or mismatch; eviction removes it together
+with the historical certificate. Hashless/skipped replay cannot reconcile a
+block-bearing certificate. Pending counts and age/window statistics retain the
+same semantics, but scan unresolved entries rather than completed history.
+
+This index is disposable, process-local diagnostic state. It neither authorizes
+votes nor substitutes for verified certificates, the chain tracker's finality
+checks, durable signing bounds, vote history, or checkpoint recovery. Those
+checks and persistence contracts are unchanged.
+
+`BenchmarkObserverEmptyReplay` measures observer work for an empty block, with
+or without four preceding skipped slots, against 4,096 retained certificates.
+It covers 0, 32, and 4,096 unresolved entries. On Ryzen 9700X (GOMAXPROCS=8,
+three 300 ms runs), median time for the four-skips-plus-empty case with 32
+unresolved entries was 686.4 µs before the index and 1.87 µs afterward. With
+all 4,096 entries unresolved it was 380.5 → 159.3 µs. These are component
+benchmarks; they exclude execution, certificate cryptography, network delivery,
+and end-to-end FAST inclusion. Live comparisons must account for observer
+history warming after a restart and different leader/skip patterns.
 
 ## What this proves — and does not
 

@@ -125,15 +125,20 @@ func convertVersionedEpochStakesToPersisted(stakes []VersionedEpochStakesPair) m
 			if va.Value.BlsPubkeyCompressed != nil {
 				bls = append([]byte(nil), va.Value.BlsPubkeyCompressed[:]...)
 			}
+			var collector string
+			if va.Value.BlockRevenueCollector != nil {
+				collector = va.Value.BlockRevenueCollector.String()
+			}
 			persisted.VoteAccts[pkStr] = &epochstakes.VoteAccountJSON{
-				Lamports:            va.Value.Lamports,
-				NodePubkey:          base58.Encode(va.Value.NodePubkey[:]),
-				BlsPubkeyCompressed: bls,
-				LastTimestampTs:     va.Value.LastTimestampTs,
-				LastTimestampSlot:   va.Value.LastTimestampSlot,
-				Owner:               base58.Encode(va.Value.Owner[:]),
-				Executable:          va.Value.Executable,
-				RentEpoch:           va.Value.RentEpoch,
+				BlockRevenueCollector: collector,
+				Lamports:              va.Value.Lamports,
+				NodePubkey:            base58.Encode(va.Value.NodePubkey[:]),
+				BlsPubkeyCompressed:   bls,
+				LastTimestampTs:       va.Value.LastTimestampTs,
+				LastTimestampSlot:     va.Value.LastTimestampSlot,
+				Owner:                 base58.Encode(va.Value.Owner[:]),
+				Executable:            va.Value.Executable,
+				RentEpoch:             va.Value.RentEpoch,
 			}
 		}
 

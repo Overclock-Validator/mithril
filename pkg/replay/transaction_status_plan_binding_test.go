@@ -15,9 +15,10 @@ func TestPreparedCommitRejectsTransactionReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	prepared := cache.prepareTransactionStatusDelta(plan.messageIdentities)
 	candidate.Transactions[0] = statusCacheTestTransaction(4, 5, 6)
 
-	err = cache.commitBlockWithPlan(candidate, plan)
+	err = cache.commitBlockWithPreparedDelta(candidate, plan, prepared)
 	if err == nil || err.Error() != "prepared transaction message identities do not match block" {
 		t.Fatalf("commit error = %v, want prepared-plan binding failure", err)
 	}

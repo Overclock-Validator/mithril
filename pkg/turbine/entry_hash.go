@@ -90,14 +90,7 @@ func hashTransactions(txns []solana.Transaction) solana.Hash {
 }
 
 func hashSignatures(signatures [][]byte) solana.Hash {
-	if len(signatures) == 0 {
-		return solana.Hash{}
-	}
-	nodes := merkletree.HashNodes(signatures)
-	if root := nodes.GetRoot(); root != nil {
-		return solana.Hash(*root)
-	}
-	return solana.Hash{}
+	return solana.Hash(merkletree.HashRoot(signatures))
 }
 
 func sha256Hash(data []byte) solana.Hash {

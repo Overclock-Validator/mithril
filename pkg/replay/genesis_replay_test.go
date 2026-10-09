@@ -246,7 +246,7 @@ func testGenesisFirstBlocksAgave(t *testing.T, workers int, signedIngress bool) 
 			}
 			schedule, ok := parentSysvars.EpochSchedule()
 			require.True(t, ok)
-			loaded, _, _, _, err := loadBlockAccountsAndUpdateSysvars(tail, block, &schedule, true, parentSysvars, genesisParent...)
+			loaded, _, _, _, err := loadBlockAccountsAndUpdateSysvars(tail, block, &schedule, true, parentSysvars, nil, genesisParent...)
 			require.NoError(t, err)
 			before := make(map[solana.PublicKey]*accounts.Account)
 			for key, a := range current {
@@ -261,7 +261,7 @@ func testGenesisFirstBlocksAgave(t *testing.T, workers int, signedIngress bool) 
 			if fixture.Slot == 1 {
 				// Ordinary snapshot/resume callers cannot claim genesis's absent
 				// SlotHashes account merely by supplying parent slot zero.
-				_, _, _, _, err := loadBlockAccountsAndUpdateSysvars(tail, block, &schedule, true, parentSysvars)
+				_, _, _, _, err := loadBlockAccountsAndUpdateSysvars(tail, block, &schedule, true, parentSysvars, nil)
 				require.ErrorContains(t, err, "required SlotHashes")
 				bad := *block
 				bad.AcctsLtHash = block.AcctsLtHash.Clone()

@@ -10,6 +10,17 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/turbine"
 )
 
+// repairCatchupHeadInFlight checks ownership in pipeline order so an intake
+// transferring a block to the reorder buffer cannot make it appear lost. A
+// moved frontier also invalidates the monitor's earlier snapshot of the head.
+func (bs *BlockSource) repairCatchupHeadInFlight(waiting uint64) (bool, uint64) {
+	pending := bs.liveDeliveryInFlight(waiting)
+	bs.reorderMu.Lock()
+	defer bs.reorderMu.Unlock()
+	return pending || bs.nextSlotToSend != waiting || bs.reorderBuffer[waiting] != nil ||
+		(bs.replayEmissionBlock != nil && bs.replayEmissionBlock.Slot == waiting), bs.lastEmittedBlockSlot
+}
+
 // repairCatchupActive reports whether the repair-first catchup window is
 // armed (gap slots fill via turbine repair; RPC stays off them).
 func (bs *BlockSource) repairCatchupActive() bool {
@@ -525,12 +536,12 @@ func (bs *BlockSource) driveRepairCatchup(ctx context.Context, receiver *turbine
 			// A stalled head stays on repair — loudly. The counters make the
 			// failure mode readable while the node keeps asking peers.
 			// A completed-slot marker on the waiting head means the block
-			// ASSEMBLED. Three sub-cases, and only one is stale:
+			// ASSEMBLED. Only a block absent from every delivery stage is stale:
 			//   staged   -> assembled-but-blocked on handoff arming; resetting
 			//               would rebuild the same block forever — log WHY it
 			//               is not emitting instead
-			//   buffered -> the emit loop owns it; nothing to do
-			//   neither  -> the block was genuinely lost (dropped after
+			//   queued/buffered/emitting -> the delivery pipeline owns it
+			//   absent   -> the block was genuinely lost (dropped after
 			//               assembly); clear the marker so repair can re-fetch
 			if !receiver.SlotCompleted(waiting) {
 				headCompletedSlot = 0
@@ -543,13 +554,10 @@ func (bs *BlockSource) driveRepairCatchup(ctx context.Context, receiver *turbine
 				headCompletedAt = time.Now()
 			} else if time.Since(headCompletedAt) >= time.Second {
 				staged := bs.stagedLiveBlock(waiting)
-				pendingDelivery := receiver.BlockPendingDelivery(waiting) || bs.liveDeliveryInFlight(waiting)
-				bs.reorderMu.Lock()
-				buffered := bs.reorderBuffer[waiting] != nil
-				emittedAnchor := bs.lastEmittedBlockSlot
-				bs.reorderMu.Unlock()
+				pendingDelivery := receiver.BlockPendingDelivery(waiting)
+				emitterOwnsHead, emittedAnchor := bs.repairCatchupHeadInFlight(waiting)
 				switch {
-				case pendingDelivery:
+				case pendingDelivery || emitterOwnsHead:
 					// The receiver/ordered-emitter pipeline owns it. Under a
 					// repair burst these bounded queues can legitimately hold a
 					// completed block for several seconds; resetting here creates
@@ -568,8 +576,6 @@ func (bs *BlockSource) driveRepairCatchup(ctx context.Context, receiver *turbine
 						mlog.Log.Warnf("repair catchup: head slot %d is ASSEMBLED and staged but not emitting — staged parent %d, runway anchor %d, handoff_slot %d, alpenglow_block_id %v; waiting on handoff arming",
 							waiting, staged.SourceParentSlot, anchor, bs.liveHandoffSlot.Load(), staged.HasAlpenglowBlockID)
 					}
-				case buffered:
-					// Emit loop owns it.
 				default:
 					// Reset BOTH halves of delivery state. Resetting only the
 					// receiver clears its completed marker, but slotDone in the
@@ -577,7 +583,7 @@ func (bs *BlockSource) driveRepairCatchup(ctx context.Context, receiver *turbine
 					// a duplicate and drops it, recreating the marker forever.
 					bs.clearSlotStateForLiveRefetch(waiting)
 					receiver.ResetSlot(waiting)
-					mlog.Log.Warnf("repair catchup: head slot %d carried a completed-slot marker but the block is in neither staging nor the buffer (lost after assembly) — cleared; repair re-fetches the slot", waiting)
+					mlog.Log.Warnf("repair catchup: head slot %d carried a completed-slot marker but the block is absent from staging and the delivery pipeline (lost after assembly) — cleared; repair re-fetches the slot", waiting)
 				}
 			}
 

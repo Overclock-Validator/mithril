@@ -1,11 +1,10 @@
 package blockprod
 
 import (
-	"bytes"
-
 	"github.com/Overclock-Validator/mithril/pkg/costmodel"
+	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/Overclock-Validator/mithril/pkg/statsd"
 	"github.com/Overclock-Validator/mithril/pkg/turbine"
-	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -17,11 +16,12 @@ const entryBatchOverheadBytes = 8 + 8 + 32 + 8
 type EntryBuilder struct {
 	limits costmodel.Limits
 
-	pendingTxns   []solana.Transaction
-	pendingWire   int
-	flushedBytes  int
-	reservedBytes int
-	entryHash     solana.Hash
+	pendingTxns            []solana.Transaction
+	pendingSerializedBytes int
+	pendingWire            int
+	flushedBytes           int
+	reservedBytes          int
+	entryHash              solana.Hash
 }
 
 func NewEntryBuilder(limits costmodel.Limits, entryHash solana.Hash) *EntryBuilder {
@@ -102,32 +102,53 @@ func (b *EntryBuilder) dropReservation() {
 }
 
 // Append adds a forged transaction. The pending entry is held until the next
-// transaction would overflow one FEC set. A short leftover is only emitted by
-// Flush (slot end / Freeze).
+// transaction would overflow the configured batch target. A short leftover is only emitted by
+// Flush (slot end / Freeze). Appended transactions must remain immutable.
 func (b *EntryBuilder) Append(tx solana.Transaction, wireSize int) ([]turbine.Entry, int, bool) {
+	serializedSize, err := serializedTransactionSize(&tx)
+	if err != nil {
+		return nil, 0, false
+	}
+	return b.appendSerialized(tx, wireSize, serializedSize)
+}
+
+// serializedTransactionSize validates the complete transaction, not just its
+// message. In particular, v1 signature-count errors surface only here.
+func serializedTransactionSize(tx *solana.Transaction) (int, error) {
+	wire, err := tx.MarshalBinary()
+	if err != nil {
+		_ = statsd.Count(statsd.BlockProductionEntrySerializationErrors, 1, nil)
+		mlog.Log.Errorf("entry builder: cannot serialize transaction: %v", err)
+		return 0, err
+	}
+	return len(wire), nil
+}
+
+// appendSerialized cannot fail after bank state is applied: the caller has
+// already serialized this exact transaction and must keep it immutable. Keep
+// canonical component size separate from the transport reservation-size hint.
+func (b *EntryBuilder) appendSerialized(tx solana.Transaction, wireSize, serializedSize int) ([]turbine.Entry, int, bool) {
 	if wireSize <= 0 {
-		wire, err := tx.MarshalBinary()
-		if err != nil {
-			return nil, 0, false
-		}
-		wireSize = len(wire)
+		wireSize = serializedSize
 	}
 
 	b.consumeReserved(wireSize)
-	if b.wouldOverflowBatch(wireSize) {
+	if b.wouldOverflowBatch(serializedSize) {
 		flushed, batchBytes := b.flushLocked()
 		b.pendingTxns = append(b.pendingTxns[:0], tx)
+		b.pendingSerializedBytes = serializedSize
 		b.pendingWire = wireSize
 		return flushed, batchBytes, true
 	}
 
 	b.pendingTxns = append(b.pendingTxns, tx)
+	b.pendingSerializedBytes += serializedSize
 	b.pendingWire += wireSize
 	return nil, 0, false
 }
 
 func (b *EntryBuilder) projectedBytes(nextWire int) int {
-	return entryBatchOverheadBytes + b.pendingWire + nextWire
+	return entryBatchOverheadBytes + b.pendingSerializedBytes + nextWire
 }
 
 // Flush emits the current pending transactions as a single PoH entry.
@@ -151,37 +172,10 @@ func (b *EntryBuilder) flushLocked() ([]turbine.Entry, int) {
 		Txns:      txns,
 	}}
 	b.entryHash = entryHash
-	batchBytes, err := marshalEntryBatchBytes(entries)
-	if err != nil {
-		return nil, 0
-	}
-	b.flushedBytes += len(batchBytes)
+	batchBytes := entryBatchOverheadBytes + b.pendingSerializedBytes
+	b.flushedBytes += batchBytes
 	b.pendingTxns = b.pendingTxns[:0]
 	b.pendingWire = 0
-	return entries, len(batchBytes)
-}
-
-func marshalEntryBatchBytes(entries []turbine.Entry) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := bin.NewEncoderWithEncoding(&buf, bin.EncodingBin)
-	if err := enc.WriteUint64(uint64(len(entries)), bin.LE); err != nil {
-		return nil, err
-	}
-	for _, entry := range entries {
-		if err := enc.WriteUint64(entry.NumHashes, bin.LE); err != nil {
-			return nil, err
-		}
-		if err := enc.WriteBytes(entry.Hash[:], false); err != nil {
-			return nil, err
-		}
-		if err := enc.WriteUint64(uint64(len(entry.Txns)), bin.LE); err != nil {
-			return nil, err
-		}
-		for i := range entry.Txns {
-			if err := entry.Txns[i].MarshalWithEncoder(enc); err != nil {
-				return nil, err
-			}
-		}
-	}
-	return buf.Bytes(), nil
+	b.pendingSerializedBytes = 0
+	return entries, batchBytes
 }

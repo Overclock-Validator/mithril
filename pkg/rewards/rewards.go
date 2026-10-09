@@ -43,6 +43,9 @@ type CalculatedStakePoints struct {
 	Points                              wide.Uint128
 	NewCreditsObserved                  uint64
 	ForceCreditsUpdateWithSkippedReward bool
+	// Inactive is set by Alpenglow points calculation when the delegation
+	// has neither effective nor activating stake in the rewarded epoch.
+	Inactive bool
 }
 
 const legacyInflationSlotsPerYear = 78_892_314.984
@@ -697,11 +700,14 @@ func calculateStakePointsAndCredits(
 		}
 		newObserved = max(newObserved, latest.Credits)
 
-		effectiveStake := delegation.StakeActivatingAndDeactivating(
+		status := delegation.StakeActivatingAndDeactivating(
 			rewardedEpoch, stakeHistory, newRateActivationEpoch,
-		).Effective
-		if earnedCredits == 0 || effectiveStake == 0 {
-			return CalculatedStakePoints{NewCreditsObserved: newObserved}
+		)
+		if earnedCredits == 0 || status.Effective == 0 {
+			return CalculatedStakePoints{
+				NewCreditsObserved: newObserved,
+				Inactive:           status.Effective == 0 && status.Activating == 0,
+			}
 		}
 		totalStake := mode.RewardEpochDelegatedStakes[delegation.VoterPubkey]
 		if totalStake == 0 {
@@ -711,7 +717,7 @@ func calculateStakePointsAndCredits(
 			}
 		}
 		points := wide.Uint128FromUint64(earnedCredits).
-			Mul(wide.Uint128FromUint64(effectiveStake)).
+			Mul(wide.Uint128FromUint64(status.Effective)).
 			Div(wide.Uint128FromUint64(totalStake))
 		return CalculatedStakePoints{Points: points, NewCreditsObserved: newObserved}
 	}
@@ -753,12 +759,36 @@ func calculateStakePointsAndCredits(
 	}
 }
 
-func CalculateNumRewardPartitions(numStakingRewards uint64) uint64 {
-	numEligible := numStakingRewards
+func CalculateNumRewardPartitions(numStakingRewards uint64, f *features.Features, epochSchedule *sealevel.SysvarEpochSchedule, slot uint64) uint64 {
+	epoch := epochSchedule.GetEpoch(slot)
+	if epochSchedule.Warmup && epoch < epochSchedule.FirstNormalEpoch {
+		return 1
+	}
+	// Agave's SlotParams write budget follows the slot-time regime. A gate
+	// takes effect in the epoch AFTER activation, and a later activation of a
+	// slower regime must never undo an already effective faster regime.
 	target := uint64(4096)
-	slotsInEpoch := uint64(432000)
-	unclamped := (numEligible + (target - 1)) / target
-	cap := slotsInEpoch / 10
+	if f != nil {
+		for _, transition := range []struct {
+			gate   features.FeatureGate
+			target uint64
+		}{
+			{features.ReduceSlotTimeTo350ms, 3584},
+			{features.ReduceSlotTimeTo300ms, 3072},
+			{features.ReduceSlotTimeTo250ms, 2560},
+			{features.ReduceSlotTimeTo200ms, 2048},
+		} {
+			if activationSlot, ok := f.ActivationSlot(transition.gate); ok && epochSchedule.GetEpoch(activationSlot) < epoch {
+				target = transition.target
+			}
+		}
+	}
+	// Divide before rounding up so large counts cannot overflow.
+	unclamped := numStakingRewards / target
+	if numStakingRewards%target != 0 {
+		unclamped++
+	}
+	cap := max(uint64(1), epochSchedule.SlotsPerEpoch/10)
 	// Agave always schedules at least one distribution block, including when
 	// there are no eligible stake rewards. The empty partition is what advances
 	// EpochRewards from active to inactive on the next block; returning zero here
@@ -789,10 +819,14 @@ func shouldForceCreditsOnly(
 	pointValueRewards, activationEpoch, rewardedEpoch, creditsObserved uint64,
 	mode RewardCalculationMode,
 ) bool {
+	// Agave's skipped-reward credit advance applies only to effective or
+	// activating Alpenglow stakes. Fully cooled stakes must retain their
+	// account bytes, even though their vote account has earned new credits.
+	// The explicit forced-update cases still take precedence.
 	return pcs.ForceCreditsUpdateWithSkippedReward ||
 		pointValueRewards == 0 ||
 		activationEpoch == rewardedEpoch ||
-		(mode.FullAlpenglow && pcs.Points.Eq(wide.Uint128{}) && pcs.NewCreditsObserved != creditsObserved)
+		(mode.FullAlpenglow && !pcs.Inactive && pcs.Points.Eq(wide.Uint128{}) && pcs.NewCreditsObserved != creditsObserved)
 }
 
 // CalculateRewardsStreaming performs a streaming calculation of stake rewards.
@@ -810,6 +844,7 @@ func CalculateRewardsStreaming(
 	blockhash [32]byte,
 	slotCtx *sealevel.SlotCtx,
 	f *features.Features,
+	epochSchedule *sealevel.SysvarEpochSchedule,
 	mode RewardCalculationMode,
 ) (*StreamingRewardsResult, error) {
 	minimum := minimumStakeDelegation(slotCtx)
@@ -1072,7 +1107,7 @@ func CalculateRewardsStreaming(
 
 	// ==================== Calculate numPartitions from ACTUAL count ====================
 	actualRewardCount := uint64(tempWriter.Count())
-	numPartitions := CalculateNumRewardPartitions(actualRewardCount)
+	numPartitions := CalculateNumRewardPartitions(actualRewardCount, f, epochSchedule, slot)
 
 	var totalVotingRewards uint64
 	for _, v := range validatorRewards {

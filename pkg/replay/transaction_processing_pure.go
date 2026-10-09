@@ -3,7 +3,6 @@ package replay
 import (
 	"errors"
 	"math"
-	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/arena"
@@ -39,6 +38,10 @@ type LoadAndExecuteTransactionInput struct {
 	// banks also skip writable-account result materialization; RPC simulation
 	// leaves this false to retain the rich result.
 	LeanResult bool
+	// SkipTimingMetrics omits the detailed transaction and instruction-dispatch
+	// timings for leader execution. Replay and simulation retain their default
+	// instrumentation; program-specific instrumentation is independent.
+	SkipTimingMetrics bool
 	// CapturePreBalances retains pre-fee balances in lean mode. Rich mode
 	// always captures them for RPC compatibility.
 	CapturePreBalances bool
@@ -124,6 +127,10 @@ func feeOnlyRollbackAccountsDataSize(slotCtx *sealevel.SlotCtx, tx *solana.Trans
 }
 
 func LoadAndExecuteTransaction(input LoadAndExecuteTransactionInput) LoadAndExecuteTransactionOutput {
+	return loadAndExecuteTransaction(input, nil)
+}
+
+func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *PreparedTransaction) LoadAndExecuteTransactionOutput {
 	tx := input.Transaction
 	slotCtx := input.SlotCtx
 
@@ -131,64 +138,76 @@ func LoadAndExecuteTransaction(input LoadAndExecuteTransactionInput) LoadAndExec
 		input.Arena.Reset()
 	}
 
-	if tx == nil || slotCtx == nil || slotCtx.Features == nil {
-		return sanitizeFailureOutput()
-	}
-
-	// Match Agave's Bank verification order: once a transaction has decoded as
-	// v1, the feature gate is checked before structural sanitization.
-	if tx.Message.GetVersion() == solana.MessageVersionV1 && !slotCtx.Features.IsActive(features.EnableTxV1) {
-		return LoadAndExecuteTransactionOutput{
-			ProcessingResult: TransactionProcessingResult{
-				TransactionError: &TransactionError{
-					ErrorType:        TransactionErrorUnsupportedVersion,
-					InstructionError: TxErrUnsupportedVersion,
-				},
-			},
+	var instrs []sealevel.Instruction
+	var instructionAcctsPerInstr [][]sealevel.InstructionAccount
+	var txAcctMetas []*solana.AccountMeta
+	var computeBudgetLimits *sealevel.ComputeBudgetLimits
+	var err error
+	start := metrics.StartTiming(false)
+	if prepared != nil {
+		instrs, instructionAcctsPerInstr, txAcctMetas = prepared.instrs, prepared.instructionAccts, prepared.accountMetas
+		computeBudgetLimits = prepared.limits
+	} else {
+		if tx == nil || slotCtx == nil || slotCtx.Features == nil {
+			return sanitizeFailureOutput()
 		}
-	}
-	// Reject malformed transactions before account-indexed code can observe
-	// them. The helper also handles Mithril's already-resolved v0 messages.
-	if err := txverify.SanitizeTransaction(tx); err != nil {
-		return sanitizeFailureOutput()
-	}
-	// Mirror block-replay's StaticInstructionLimit cap so pre-activation
-	// clusters fail mid-execution like Agave instead of SanitizeFailure.
-	if slotCtx.Features.IsActive(features.StaticInstructionLimit) &&
-		len(tx.Message.Instructions) > maxInstrTraceCapacity {
-		return sanitizeFailureOutput()
-	}
 
-	// Parse instructions and account metas
-	start := time.Now()
-	instrs, instructionAcctsPerInstr, txAcctMetas, err := instrsAndAcctMetasFromTx(tx, slotCtx.Features)
-	if err != nil {
-		return LoadAndExecuteTransactionOutput{
-			ProcessingResult: TransactionProcessingResult{
-				TransactionError: &TransactionError{
-					ErrorType:        TransactionErrorSanitizeFailure,
-					InstructionError: err,
+		// Match Agave's Bank verification order: once a transaction has decoded as
+		// v1, the feature gate is checked before structural sanitization.
+		if tx.Message.GetVersion() == solana.MessageVersionV1 && !slotCtx.Features.IsActive(features.EnableTxV1) {
+			return LoadAndExecuteTransactionOutput{
+				ProcessingResult: TransactionProcessingResult{
+					TransactionError: &TransactionError{
+						ErrorType:        TransactionErrorUnsupportedVersion,
+						InstructionError: TxErrUnsupportedVersion,
+					},
 				},
-			},
+			}
 		}
-	}
-	metrics.GlobalBlockReplay.InstructionsAndAccountMetasFromTx.AddTimingSince(start)
+		// Reject malformed transactions before account-indexed code can observe
+		// them. The helper also handles Mithril's already-resolved v0 messages.
+		if err := txverify.SanitizeTransaction(tx); err != nil {
+			return sanitizeFailureOutput()
+		}
+		// Mirror block-replay's StaticInstructionLimit cap so pre-activation
+		// clusters fail mid-execution like Agave instead of SanitizeFailure.
+		if slotCtx.Features.IsActive(features.StaticInstructionLimit) &&
+			len(tx.Message.Instructions) > maxInstrTraceCapacity {
+			return sanitizeFailureOutput()
+		}
 
-	// Compute budget limits
-	start = time.Now()
-	computeBudgetLimits, err := sealevel.ComputeBudgetLimitsForTransaction(tx, instrs, slotCtx.Features)
-	if err != nil {
-		return LoadAndExecuteTransactionOutput{
-			ProcessingResult: TransactionProcessingResult{
-				TransactionError: &TransactionError{
-					ErrorType:        TransactionErrorInstructionError,
-					InstructionError: err,
+		// Parse instructions and account metas
+		start = metrics.StartTiming(!input.SkipTimingMetrics)
+		instrs, instructionAcctsPerInstr, txAcctMetas, err = instrsAndAcctMetasFromTx(tx, slotCtx.Features)
+		if err != nil {
+			return LoadAndExecuteTransactionOutput{
+				ProcessingResult: TransactionProcessingResult{
+					TransactionError: &TransactionError{
+						ErrorType:        TransactionErrorSanitizeFailure,
+						InstructionError: err,
+					},
 				},
-			},
-			Instrs: instrs,
+			}
 		}
+		metrics.GlobalBlockReplay.InstructionsAndAccountMetasFromTx.AddTimingSince(start)
+
+		// Compute budget limits
+		start = metrics.StartTiming(!input.SkipTimingMetrics)
+		computeBudgetLimits, err = sealevel.ComputeBudgetLimitsForTransaction(tx, instrs, slotCtx.Features)
+		if err != nil {
+			return LoadAndExecuteTransactionOutput{
+				ProcessingResult: TransactionProcessingResult{
+					TransactionError: &TransactionError{
+						ErrorType:        TransactionErrorInstructionError,
+						InstructionError: err,
+					},
+				},
+				Instrs: instrs,
+			}
+		}
+		metrics.GlobalBlockReplay.ComputeBudgetExecutionInstructions.AddTimingSince(start)
+
 	}
-	metrics.GlobalBlockReplay.ComputeBudgetExecutionInstructions.AddTimingSince(start)
 
 	// Validate transaction age
 	if !sealevel.IsTransactionAgeValid(tx, instrs, slotCtx) {
@@ -236,7 +255,7 @@ func LoadAndExecuteTransaction(input LoadAndExecuteTransactionInput) LoadAndExec
 	}
 
 	// Load and validate accounts
-	start = time.Now()
+	start = metrics.StartTiming(!input.SkipTimingMetrics)
 	instructionsSysvarIdx := instructionsSysvarAccountIndex(tx)
 	var instrsAcct *accounts.Account
 	if instructionsSysvarIdx >= 0 {
@@ -303,6 +322,7 @@ func LoadAndExecuteTransaction(input LoadAndExecuteTransactionInput) LoadAndExec
 	execCtx.TransactionContext.Signature = tx.Signatures[0]
 	execCtx.TransactionContext.BorrowedAccountArena = input.Arena
 	execCtx.IsSimulation = input.IsSimulation
+	execCtx.SkipTimingMetrics = input.SkipTimingMetrics
 	execCtx.RecordInnerInstructions = input.RecordInnerInstructions
 
 	// Capture pre-balance lamports (before fee deduction)
@@ -332,7 +352,7 @@ func LoadAndExecuteTransaction(input LoadAndExecuteTransactionInput) LoadAndExec
 
 	// Calculate and deduct fees. RentForSlot supplies the exemption
 	// minimum so a rent-exempt payer is rejected before instructions run.
-	start = time.Now()
+	start = metrics.StartTiming(!input.SkipTimingMetrics)
 	txFeeInfo, _, err := fees.CalculateAndDeductTxFees(tx, input.TxMeta, instrs, &execCtx.TransactionContext.Accounts, computeBudgetLimits, slotCtx.Features, fees.RentForSlot(slotCtx), input.IsSimulation)
 	if err != nil {
 		errType, accountIndex := feePayerTransactionError(err)
@@ -355,7 +375,7 @@ func LoadAndExecuteTransaction(input LoadAndExecuteTransactionInput) LoadAndExec
 	metrics.GlobalBlockReplay.CalcAndDeductFees.AddTimingSince(start)
 
 	// Read rent sysvar
-	start = time.Now()
+	start = metrics.StartTiming(!input.SkipTimingMetrics)
 	rentSysvar, err := sealevel.ReadRentSysvar(execCtx)
 	if err != nil {
 		// Rent sysvar unreadable; return cleanly so the RPC worker
@@ -374,18 +394,18 @@ func LoadAndExecuteTransaction(input LoadAndExecuteTransactionInput) LoadAndExec
 	metrics.GlobalBlockReplay.ReadRentSysvar.AddTimingSince(start)
 
 	// Set rent-exempt rent epoch max and compute pre-tx rent states
-	start = time.Now()
+	start = metrics.StartTiming(!input.SkipTimingMetrics)
 	rent.MaybeSetRentExemptRentEpochMax(slotCtx, &rentSysvar, &execCtx.Features, &execCtx.TransactionContext.Accounts)
 	preTxRentStates := rent.NewRentStateInfo(&rentSysvar, execCtx.TransactionContext, &execCtx.Features)
 	metrics.GlobalBlockReplay.PreTxRentStates.AddTimingSince(start)
 
 	// Execute all instructions
 	var instrErr error
-	start = time.Now()
+	start = metrics.StartTiming(!input.SkipTimingMetrics)
 	for instrIdx, instr := range tx.Message.Instructions {
 		execCtx.SetCurrentTopLevelInstr(uint8(instrIdx))
 		if instructionsSysvarIdx >= 0 {
-			ixStart := time.Now()
+			ixStart := metrics.StartTiming(!input.SkipTimingMetrics)
 			err = fixupInstructionsSysvarAcct(execCtx, instructionsSysvarIdx, uint16(instrIdx))
 			if err != nil {
 				instrErr = err
@@ -421,7 +441,7 @@ func LoadAndExecuteTransaction(input LoadAndExecuteTransactionInput) LoadAndExec
 	metrics.GlobalBlockReplay.IxLoop.AddTimingSince(start)
 
 	// Check rent state transitions
-	start = time.Now()
+	start = metrics.StartTiming(!input.SkipTimingMetrics)
 	postTxRentStates := rent.NewRentStateInfo(&rentSysvar, execCtx.TransactionContext, &execCtx.Features)
 	rentStateErr := rent.VerifyRentStateChanges(preTxRentStates, postTxRentStates, execCtx.TransactionContext)
 	metrics.GlobalBlockReplay.PostTxRentStates.AddTimingSince(start)

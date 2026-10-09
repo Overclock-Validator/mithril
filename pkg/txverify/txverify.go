@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/Overclock-Validator/mithril/pkg/sigverify"
+	"github.com/Overclock-Validator/mithril/pkg/txstatus"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -222,6 +223,21 @@ type BatchVerifier struct {
 // Every transaction gets an independent verdict: one bad transaction does not
 // mask the others, so a caller can report precisely which one failed.
 func (v *BatchVerifier) Verify(txs []*solana.Transaction, errs []error) {
+	v.verify(txs, errs, nil)
+}
+
+// VerifyWithMessageIdentities additionally retains identities derived from the
+// same canonical bytes used by signature verification. Only successful verdicts
+// produce usable identities. The output is caller-owned, not verifier scratch.
+func (v *BatchVerifier) VerifyWithMessageIdentities(txs []*solana.Transaction, errs []error, identities []VerifiedMessageIdentity) {
+	if len(identities) != len(txs) {
+		panic("txverify: identities and txs length mismatch")
+	}
+	clear(identities)
+	v.verify(txs, errs, identities)
+}
+
+func (v *BatchVerifier) verify(txs []*solana.Transaction, errs []error, identities []VerifiedMessageIdentity) {
 	if len(errs) != len(txs) {
 		panic("txverify: errs and txs length mismatch")
 	}
@@ -239,6 +255,16 @@ func (v *BatchVerifier) Verify(txs []*solana.Transaction, errs []error) {
 			v.signers = append(v.signers, nil)
 			continue
 		}
+		if identities != nil {
+			identities[i] = VerifiedMessageIdentity{
+				transaction: tx,
+				version:     tx.Message.GetVersion(),
+				identity: txstatus.TransactionMessageIdentity{
+					MessageHash:     txstatus.HashCanonicalMessage(msg),
+					RecentBlockhash: tx.Message.RecentBlockhash,
+				},
+			}
+		}
 		for j := range tx.Signatures {
 			v.batch.Add((*[32]byte)(&signers[j]), msg, tx.Signatures[j][:])
 		}
@@ -247,6 +273,9 @@ func (v *BatchVerifier) Verify(txs []*solana.Transaction, errs []error) {
 	}
 
 	if v.batch.Verify() {
+		for i := range identities {
+			identities[i].verified = errs[i] == nil
+		}
 		return
 	}
 
@@ -256,6 +285,9 @@ func (v *BatchVerifier) Verify(txs []*solana.Transaction, errs []error) {
 			if !v.batch.OK(lane+j) && errs[i] == nil {
 				errs[i] = fmt.Errorf("invalid signature by %s", v.signers[i][j])
 			}
+		}
+		if identities != nil {
+			identities[i].verified = errs[i] == nil
 		}
 		lane += count
 	}

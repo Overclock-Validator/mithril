@@ -5,7 +5,7 @@ go 1.26.4
 replace github.com/gagliardetto/binary => github.com/palmerlao/binary v0.0.0-20250617062159-3054b4d33aed
 
 require (
-	github.com/Overclock-Validator/narya-ed25519 v0.0.0-20260726222623-da0d045dae9d
+	github.com/Overclock-Validator/narya-ed25519 v0.0.0-20260730051143-c265ee966713
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/charmbracelet/bubbles v0.21.1-0.20250623103423-23b8fd6302d7
 	github.com/charmbracelet/bubbletea v1.3.10

@@ -18,7 +18,7 @@ import (
 
 const (
 	defaultVotorBroadcastQueue      = 1024
-	defaultVotorSendWorkers         = 32
+	defaultVotorConnectWorkers      = 32
 	defaultVotorPeerJobQueue        = 16384
 	defaultVotorPeerRefreshInterval = time.Second
 )
@@ -35,7 +35,8 @@ type VotorBroadcasterConfig struct {
 	ShredVersion uint16
 	Peers        VotorPeerSource
 	QueueSize    int
-	Workers      int
+	// Workers bounds concurrent connection attempts. Sends are isolated per connection.
+	Workers int
 }
 
 type VotorBroadcasterStats struct {
@@ -50,28 +51,25 @@ type VotorBroadcasterStats struct {
 	ConnectionAttempts    uint64
 	ConnectionErrors      uint64
 	ConnectionJobsDropped uint64
+	PeerQueueDrops        uint64
+	PeerQueueDiscarded    uint64
+	PeerSendTimeouts      uint64
+	PeerQueueMaxDelay     time.Duration
+	PeerQueues            []VotorPeerQueueStats
 	LastPeerSendError     string
 	LastPeerSendErrorAt   time.Time
 	LastConnectionError   string
 	LastConnectionErrorAt time.Time
 }
 
-type votorPeerJobKind uint8
-
-const (
-	votorPeerJobConnect votorPeerJobKind = iota
-	votorPeerJobSend
-)
-
 type votorPeerJob struct {
-	kind    votorPeerJobKind
-	peer    VotorPeer
-	payload []byte
+	peer VotorPeer
 }
 
 type votorConnection struct {
-	addr string
-	conn *quic.Conn
+	addr   string
+	conn   *quic.Conn
+	sender *votorPeerSender
 }
 
 type votorDial struct {
@@ -109,6 +107,10 @@ type VotorBroadcaster struct {
 	connectionAttempts    atomic.Uint64
 	connectionErrors      atomic.Uint64
 	connectionJobsDropped atomic.Uint64
+	peerQueueDrops        atomic.Uint64
+	peerQueueDiscarded    atomic.Uint64
+	peerSendTimeouts      atomic.Uint64
+	peerQueueMaxDelay     atomic.Int64
 }
 
 func NewVotorBroadcaster(cfg VotorBroadcasterConfig) (*VotorBroadcaster, error) {
@@ -122,7 +124,7 @@ func NewVotorBroadcaster(cfg VotorBroadcasterConfig) (*VotorBroadcaster, error) 
 		cfg.QueueSize = defaultVotorBroadcastQueue
 	}
 	if cfg.Workers <= 0 {
-		cfg.Workers = defaultVotorSendWorkers
+		cfg.Workers = defaultVotorConnectWorkers
 	}
 	certificate, err := newVotorQUICCertificate(cfg.Identity)
 	if err != nil {
@@ -151,7 +153,7 @@ func NewVotorBroadcaster(cfg VotorBroadcasterConfig) (*VotorBroadcaster, error) 
 	}
 	b.wg.Add(2 + cfg.Workers)
 	for range cfg.Workers {
-		go b.sendLoop()
+		go b.connectLoop()
 	}
 	go b.broadcastLoop()
 	// Populate the desired set and queue the first bounded preconnects before
@@ -199,71 +201,43 @@ func (b *VotorBroadcaster) broadcastLoop() {
 				b.recordSendError(VotorPeer{}, fmt.Errorf("encode Votor message: %w", err))
 				continue
 			}
-			peers, skipped := b.connectedPeers()
+			senders, skipped := b.connectedSenders()
 			b.sendsSkipped.Add(uint64(skipped))
-			for _, peer := range peers {
-				job := votorPeerJob{kind: votorPeerJobSend, peer: peer, payload: payload}
-				select {
-				case b.jobs <- job:
-				case <-b.done:
-					return
-				default:
-					b.dropped.Add(1)
-				}
+			job := votorDatagram{payload: payload, queuedAt: time.Now()}
+			for _, sender := range senders {
+				sender.enqueue(job)
 			}
 		}
 	}
 }
 
-func (b *VotorBroadcaster) sendLoop() {
+// Connection attempts never occupy a peer's sender or delay connected peers.
+func (b *VotorBroadcaster) connectLoop() {
 	defer b.wg.Done()
 	for {
 		select {
 		case <-b.done:
 			return
 		case job := <-b.jobs:
-			switch job.kind {
-			case votorPeerJobConnect:
-				b.connectPeer(job.peer.Identity)
-			case votorPeerJobSend:
-				if err := b.send(job.peer, job.payload); err != nil {
-					b.recordSendError(job.peer, err)
-				} else {
-					b.sends.Add(1)
-				}
-			}
+			b.connectPeer(job.peer.Identity)
 		}
 	}
-}
-
-func (b *VotorBroadcaster) send(peer VotorPeer, payload []byte) error {
-	conn, ok := b.establishedConnection(peer)
-	if !ok {
-		b.queueConnect(peer.Identity)
-		return fmt.Errorf("send Votor datagram to %s (%s): no established connection", peer.Identity, peer.Addr)
-	}
-	err := conn.SendDatagram(payload)
-	if err == nil {
-		return nil
-	}
-	var tooLarge *quic.DatagramTooLargeError
-	if !errors.As(err, &tooLarge) {
-		b.dropConnection(peer.Identity, conn)
-		b.queueConnect(peer.Identity)
-	}
-	return fmt.Errorf("send Votor datagram to %s (%s): %w", peer.Identity, peer.Addr, err)
 }
 
 func (b *VotorBroadcaster) peerReconcileLoop() {
 	defer b.wg.Done()
 	ticker := time.NewTicker(defaultVotorPeerRefreshInterval)
 	defer ticker.Stop()
+	watchdog := time.NewTicker(votorSendWatchInterval)
+	defer watchdog.Stop()
 	for {
 		select {
 		case <-b.done:
 			return
 		case <-ticker.C:
 			b.reconcilePeers()
+		case now := <-watchdog.C:
+			b.expirePeerSends(now)
 		}
 	}
 }
@@ -305,9 +279,9 @@ func (b *VotorBroadcaster) reconcilePeers() {
 	}
 }
 
-func (b *VotorBroadcaster) connectedPeers() ([]VotorPeer, int) {
+func (b *VotorBroadcaster) connectedSenders() ([]*votorPeerSender, int) {
 	b.connMu.Lock()
-	peers := make([]VotorPeer, 0, len(b.desired))
+	peers := make([]*votorPeerSender, 0, len(b.desired))
 	skipped := 0
 	for identity, peer := range b.desired {
 		existing, connected := b.conns[identity]
@@ -315,8 +289,7 @@ func (b *VotorBroadcaster) connectedPeers() ([]VotorPeer, int) {
 			skipped++
 			continue
 		}
-		peer.Addr = cloneUDPAddr(peer.Addr)
-		peers = append(peers, peer)
+		peers = append(peers, existing.sender)
 	}
 	b.connMu.Unlock()
 	return peers, skipped
@@ -349,7 +322,7 @@ func (b *VotorBroadcaster) queueConnectLocked(identity solana.PublicKey) {
 	if _, queued := b.connectQueued[identity]; queued || b.dialing[identity] != nil {
 		return
 	}
-	job := votorPeerJob{kind: votorPeerJobConnect, peer: peer}
+	job := votorPeerJob{peer: peer}
 	select {
 	case b.jobs <- job:
 		b.connectQueued[identity] = struct{}{}
@@ -476,7 +449,12 @@ func (b *VotorBroadcaster) connection(peer VotorPeer) (*quic.Conn, error) {
 		return existing.conn, nil
 	}
 	stale := b.conns[peer.Identity].conn
-	b.conns[peer.Identity] = votorConnection{addr: addr, conn: conn}
+	sender := &votorPeerSender{b: b, peer: peer, conn: conn, queue: make(chan votorDatagram, defaultVotorPeerSendQueue), done: make(chan struct{})}
+	b.conns[peer.Identity] = votorConnection{addr: addr, conn: conn, sender: sender}
+	// Close takes connMu before waiting, so no sender can be added after it
+	// observes the closed flag and drains the connection set.
+	b.wg.Add(1)
+	go sender.run()
 	b.connMu.Unlock()
 	if stale != nil {
 		_ = stale.CloseWithError(0, "Votor peer address changed")
@@ -499,12 +477,14 @@ func (b *VotorBroadcaster) Stats() VotorBroadcasterStats {
 	}
 	b.connMu.Lock()
 	connections := 0
+	peerQueues := make([]VotorPeerQueueStats, 0, len(b.conns))
 	for identity, existing := range b.conns {
 		if existing.conn.Context().Err() != nil {
 			delete(b.conns, identity)
 			continue
 		}
 		connections++
+		peerQueues = append(peerQueues, existing.sender.stats())
 	}
 	desiredPeers := len(b.desired)
 	pendingConnections := len(b.connectQueued)
@@ -525,6 +505,11 @@ func (b *VotorBroadcaster) Stats() VotorBroadcasterStats {
 		ConnectionAttempts:    b.connectionAttempts.Load(),
 		ConnectionErrors:      b.connectionErrors.Load(),
 		ConnectionJobsDropped: b.connectionJobsDropped.Load(),
+		PeerQueueDrops:        b.peerQueueDrops.Load(),
+		PeerQueueDiscarded:    b.peerQueueDiscarded.Load(),
+		PeerSendTimeouts:      b.peerSendTimeouts.Load(),
+		PeerQueueMaxDelay:     time.Duration(b.peerQueueMaxDelay.Load()),
+		PeerQueues:            peerQueues,
 		LastPeerSendError:     lastSendError,
 		LastPeerSendErrorAt:   lastSendErrorAt,
 		LastConnectionError:   lastConnectionError,
@@ -542,11 +527,15 @@ func (b *VotorBroadcaster) Close() error {
 		close(b.done)
 		b.connMu.Lock()
 		clear(b.desired)
+		stale := make([]*quic.Conn, 0, len(b.conns))
 		for identity, existing := range b.conns {
-			_ = existing.conn.CloseWithError(0, "Votor broadcaster closed")
+			stale = append(stale, existing.conn)
 			delete(b.conns, identity)
 		}
 		b.connMu.Unlock()
+		for _, conn := range stale {
+			_ = conn.CloseWithError(0, "Votor broadcaster closed")
+		}
 		b.wg.Wait()
 	})
 	return nil

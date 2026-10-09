@@ -104,9 +104,19 @@ func PendingStakeEntriesSnapshot() []accountsdb.StakeIndexEntry {
 	return out
 }
 
+// DropPendingStakePubkeys drops only the discarded bank's slot. A local leader
+// can have pending entries at later slots even while replay is behind it.
+func DropPendingStakePubkeys(slot uint64) int {
+	instance.pendingStakeMutex.Lock()
+	defer instance.pendingStakeMutex.Unlock()
+	dropped := len(instance.pendingStakeBySlot[slot])
+	delete(instance.pendingStakeBySlot, slot)
+	return dropped
+}
+
 // DropPendingStakePubkeysFrom discards pending entries for slots >= fromSlot.
-// Called by the fork-switch unwind so wrong-fork stake entries never reach the
-// durable index. Returns the number of entries dropped.
+// This is a global reset operation. Per-bank discard and replay unwind must
+// use DropPendingStakePubkeys so they preserve independent leader banks.
 func DropPendingStakePubkeysFrom(fromSlot uint64) int {
 	instance.pendingStakeMutex.Lock()
 	defer instance.pendingStakeMutex.Unlock()
