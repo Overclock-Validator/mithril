@@ -48,8 +48,8 @@ func TestContactInfoRoundTripAndSignature(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewContactInfo returned error: %v", err)
 	}
-	if err := contact.SetSocket(socketTagServeRepair, &net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 8008}); err != nil {
-		t.Fatalf("SetSocket serve repair returned error: %v", err)
+	if err := contact.SetServeRepairAddr(&net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 8008}); err != nil {
+		t.Fatalf("SetServeRepairAddr returned error: %v", err)
 	}
 	if err := contact.SetAlpenglowAddr(&net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 8002}); err != nil {
 		t.Fatalf("SetAlpenglowAddr returned error: %v", err)
@@ -101,14 +101,15 @@ func TestContactInfoRoundTripAndSignature(t *testing.T) {
 	}
 }
 
-func TestClientAdvertisesAlpenglowSocket(t *testing.T) {
+func TestClientAdvertisesServiceSockets(t *testing.T) {
 	client, err := NewClient(Config{
-		Entrypoint:    "127.0.0.1:8000",
-		BindAddr:      "0.0.0.0:0",
-		TVUAddr:       "0.0.0.0:8001",
-		AlpenglowAddr: "0.0.0.0:8002",
-		AdvertisedIP:  "203.0.113.10",
-		ShredVersion:  4321,
+		Entrypoint:      "127.0.0.1:8000",
+		BindAddr:        "0.0.0.0:0",
+		TVUAddr:         "0.0.0.0:8001",
+		ServeRepairAddr: "0.0.0.0:8003",
+		AlpenglowAddr:   "0.0.0.0:8002",
+		AdvertisedIP:    "203.0.113.10",
+		ShredVersion:    4321,
 	})
 	if err != nil {
 		t.Fatalf("NewClient returned error: %v", err)
@@ -128,6 +129,12 @@ func TestClientAdvertisesAlpenglowSocket(t *testing.T) {
 	}
 	if got, want := contact.AlpenglowAddr.String(), "203.0.113.10:8002"; got != want {
 		t.Fatalf("alpenglow addr = %s, want %s", got, want)
+	}
+	if contact.ServeRepairAddr == nil {
+		t.Fatalf("expected serve repair socket to be advertised")
+	}
+	if got, want := contact.ServeRepairAddr.String(), "203.0.113.10:8003"; got != want {
+		t.Fatalf("serve repair addr = %s, want %s", got, want)
 	}
 	if contact.TPUVoteAddr != nil || contact.TPUVoteQuicAddr != nil {
 		t.Fatalf("Alpenglow tag 13 must not be duplicated into TPU vote tags 9/12: udp=%v quic=%v", contact.TPUVoteAddr, contact.TPUVoteQuicAddr)
@@ -264,8 +271,8 @@ func TestClientLearnsServiceEndpointsFromEntrypointContactWithoutPullPeer(t *tes
 	if err != nil {
 		t.Fatalf("NewContactInfo: %v", err)
 	}
-	if err := contact.SetSocket(socketTagServeRepair, repair); err != nil {
-		t.Fatalf("SetSocket serve repair: %v", err)
+	if err := contact.SetServeRepairAddr(repair); err != nil {
+		t.Fatalf("SetServeRepairAddr: %v", err)
 	}
 	if err := contact.SetAlpenglowAddr(alpenglow); err != nil {
 		t.Fatalf("SetAlpenglowAddr: %v", err)

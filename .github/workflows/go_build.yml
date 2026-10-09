@@ -47,3 +47,6 @@ jobs:
 
       - name: Sealevel interpreter, syscall and vote ownership regressions
         run: go test -race -count=1 ./pkg/sealevel
+
+      - name: Gossip and networking regressions
+        run: go test -race -p 2 -count=1 ./pkg/gossip ./pkg/repair ./pkg/blockstream

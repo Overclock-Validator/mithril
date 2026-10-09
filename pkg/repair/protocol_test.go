@@ -68,6 +68,58 @@ func TestBuildHighestWindowIndexRequest(t *testing.T) {
 	}
 }
 
+func TestDecodeRequest(t *testing.T) {
+	pub, identity, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey returned error: %v", err)
+	}
+	var recipient gossip.Pubkey
+	for i := range recipient {
+		recipient[i] = byte(31 - i)
+	}
+	packet, err := buildRequest(identity, recipient, repairProtocolHighestWindowIndex, 123, 456, 789, 101112)
+	if err != nil {
+		t.Fatalf("buildRequest returned error: %v", err)
+	}
+
+	request, ok := DecodeRequest(packet)
+	if !ok {
+		t.Fatal("DecodeRequest rejected a valid request")
+	}
+	if request.Kind != RequestHighestWindowIndex || request.Slot != 123 || request.ShredIndex != 456 || request.Nonce != 789 || request.Timestamp != 101112 {
+		t.Fatalf("decoded request = %+v", request)
+	}
+	if string(request.Sender[:]) != string(pub) || request.Recipient != recipient {
+		t.Fatalf("decoded identities = sender %x recipient %x", request.Sender, request.Recipient)
+	}
+	if !VerifySignedRequest(packet, request.Sender) {
+		t.Fatal("decoded request signature did not verify")
+	}
+}
+
+func TestDecodeRequestRejectsNonCanonicalPacket(t *testing.T) {
+	_, identity, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey returned error: %v", err)
+	}
+	packet, err := buildRequest(identity, gossip.Pubkey{}, repairProtocolWindowIndex, 1, 2, 3, 4)
+	if err != nil {
+		t.Fatalf("buildRequest returned error: %v", err)
+	}
+
+	if _, ok := DecodeRequest(packet[:len(packet)-1]); ok {
+		t.Fatal("DecodeRequest accepted a truncated request")
+	}
+	if _, ok := DecodeRequest(append(append([]byte(nil), packet...), 0)); ok {
+		t.Fatal("DecodeRequest accepted trailing bytes")
+	}
+	unsupported := append([]byte(nil), packet...)
+	binary.LittleEndian.PutUint32(unsupported[:4], repairProtocolPong)
+	if _, ok := DecodeRequest(unsupported); ok {
+		t.Fatal("DecodeRequest accepted an unsupported request variant")
+	}
+}
+
 func TestDecodeRepairPingAndBuildPong(t *testing.T) {
 	peerPub, peerIdentity, err := ed25519.GenerateKey(nil)
 	if err != nil {

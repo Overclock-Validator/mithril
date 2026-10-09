@@ -31,6 +31,7 @@ type Config struct {
 	Entrypoint        string
 	BindAddr          string
 	TVUAddr           string
+	ServeRepairAddr   string
 	AlpenglowAddr     string
 	AdvertisedIP      string
 	ShredVersion      uint16
@@ -47,6 +48,7 @@ type Client struct {
 	entrypoint     *net.UDPAddr
 	bindAddr       *net.UDPAddr
 	tvuAddr        *net.UDPAddr
+	serveRepair    *net.UDPAddr
 	alpenglow      *net.UDPAddr
 	identity       ed25519.PrivateKey
 	pubkey         Pubkey
@@ -58,6 +60,7 @@ type Client struct {
 	identityConflictMu        sync.Mutex
 	identityConflictGossip    contactEndpoint
 	identityConflictTVU       contactEndpoint
+	identityConflictRepair    contactEndpoint
 	identityConflictAlpenglow contactEndpoint
 	identityConflictWallclock uint64
 	identityConflictCh        chan error
@@ -174,6 +177,16 @@ func NewClient(cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve TVU address: %w", err)
 	}
+	var serveRepairAddr *net.UDPAddr
+	if cfg.ServeRepairAddr != "" {
+		serveRepairAddr, err = net.ResolveUDPAddr("udp", cfg.ServeRepairAddr)
+		if err != nil {
+			return nil, fmt.Errorf("resolve serve repair address: %w", err)
+		}
+		if serveRepairAddr.Port == 0 {
+			return nil, fmt.Errorf("serve repair address must use a fixed non-zero port")
+		}
+	}
 	var alpenglowAddr *net.UDPAddr
 	if cfg.AlpenglowAddr != "" {
 		alpenglowAddr, err = net.ResolveUDPAddr("udp", cfg.AlpenglowAddr)
@@ -201,6 +214,7 @@ func NewClient(cfg Config) (*Client, error) {
 		entrypoint:         entrypoint,
 		bindAddr:           bindAddr,
 		tvuAddr:            tvuAddr,
+		serveRepair:        serveRepairAddr,
 		alpenglow:          alpenglowAddr,
 		identity:           identity,
 		pubkey:             pubkey,
@@ -256,6 +270,7 @@ func (c *Client) Run(ctx context.Context) error {
 	c.contactMu.RUnlock()
 	if contact != nil {
 		alpenglowAddr := "disabled"
+		serveRepairAddr := "disabled"
 		tpuVoteAddr := "disabled"
 		tpuVoteQuicAddr := "disabled"
 		if contact.AlpenglowAddr != nil {
@@ -267,10 +282,13 @@ func (c *Client) Run(ctx context.Context) error {
 		if contact.TPUVoteQuicAddr != nil {
 			tpuVoteQuicAddr = contact.TPUVoteQuicAddr.String()
 		}
-		mlog.Log.Infof("gossip joined: advertised tvu=%s alpenglow=%s | shred_version=%d",
-			contact.TVUAddr.String(), alpenglowAddr, contact.ShredVer)
-		mlog.Log.FileOnlyf("gossip client listening: local=%s advertised_gossip=%s advertised_tvu=%s advertised_alpenglow=%s advertised_tpu_vote=%s advertised_tpu_vote_quic=%s shred_version=%d client=%s",
-			conn.LocalAddr().String(), contact.GossipAddr.String(), contact.TVUAddr.String(), alpenglowAddr, tpuVoteAddr, tpuVoteQuicAddr, contact.ShredVer, c.cfg.Name)
+		if contact.ServeRepairAddr != nil {
+			serveRepairAddr = contact.ServeRepairAddr.String()
+		}
+		mlog.Log.Infof("gossip joined: advertised tvu=%s serve_repair=%s alpenglow=%s | shred_version=%d",
+			contact.TVUAddr.String(), serveRepairAddr, alpenglowAddr, contact.ShredVer)
+		mlog.Log.FileOnlyf("gossip client listening: local=%s advertised_gossip=%s advertised_tvu=%s advertised_serve_repair=%s advertised_alpenglow=%s advertised_tpu_vote=%s advertised_tpu_vote_quic=%s shred_version=%d client=%s",
+			conn.LocalAddr().String(), contact.GossipAddr.String(), contact.TVUAddr.String(), serveRepairAddr, alpenglowAddr, tpuVoteAddr, tpuVoteQuicAddr, contact.ShredVer, c.cfg.Name)
 	}
 	c.recordPeer(c.entrypoint)
 
@@ -434,6 +452,15 @@ func (c *Client) initializeContact(localGossipAddr *net.UDPAddr) error {
 	contact, err := NewContactInfo(c.pubkey, shredVersion, gossipAddr, tvuAddr)
 	if err != nil {
 		return err
+	}
+	if c.serveRepair != nil {
+		serveRepairAddr := &net.UDPAddr{IP: advertisedIP, Port: c.serveRepair.Port}
+		if serveRepairIP := normalizedIP(c.serveRepair.IP); serveRepairIP != nil && !serveRepairIP.IsUnspecified() {
+			serveRepairAddr.IP = serveRepairIP
+		}
+		if err := contact.SetServeRepairAddr(serveRepairAddr); err != nil {
+			return fmt.Errorf("set serve repair gossip socket: %w", err)
+		}
 	}
 	if c.alpenglow != nil {
 		alpenglowAddr := &net.UDPAddr{IP: advertisedIP, Port: c.alpenglow.Port}
@@ -662,6 +689,7 @@ func (c *Client) observeOwnContactRecord(record contactRecord) {
 	alpenglow := record.Sockets[socketTagAlpenglow]
 	if sameEndpointUDPAddr(record.GossipAddr, local.GossipAddr) &&
 		sameEndpointUDPAddr(record.TVUAddr, local.TVUAddr) &&
+		sameEndpointUDPAddr(record.ServeRepairAddr, local.ServeRepairAddr) &&
 		sameEndpointUDPAddr(alpenglow, local.AlpenglowAddr) {
 		return
 	}
@@ -672,16 +700,18 @@ func (c *Client) observeOwnContactRecord(record contactRecord) {
 	c.identityConflictMu.Lock()
 	sameInstance := record.GossipAddr == c.identityConflictGossip &&
 		record.TVUAddr == c.identityConflictTVU &&
+		record.ServeRepairAddr == c.identityConflictRepair &&
 		alpenglow == c.identityConflictAlpenglow
 	previousWallclock := c.identityConflictWallclock
 	if !sameInstance || previousWallclock == 0 {
 		c.identityConflictGossip = record.GossipAddr
 		c.identityConflictTVU = record.TVUAddr
+		c.identityConflictRepair = record.ServeRepairAddr
 		c.identityConflictAlpenglow = alpenglow
 		c.identityConflictWallclock = record.Wallclock
 		c.identityConflictMu.Unlock()
-		mlog.Log.Warnf("validator identity %s also appeared in gossip at gossip=%s tvu=%s alpenglow=%s; waiting for a newer record to confirm that the other instance is live",
-			solana.PublicKey(c.pubkey).String(), endpointString(record.GossipAddr), endpointString(record.TVUAddr), endpointString(alpenglow))
+		mlog.Log.Warnf("validator identity %s also appeared in gossip at gossip=%s tvu=%s serve_repair=%s alpenglow=%s; waiting for a newer record to confirm that the other instance is live",
+			solana.PublicKey(c.pubkey).String(), endpointString(record.GossipAddr), endpointString(record.TVUAddr), endpointString(record.ServeRepairAddr), endpointString(alpenglow))
 		return
 	}
 	if record.Wallclock <= previousWallclock {
@@ -691,9 +721,9 @@ func (c *Client) observeOwnContactRecord(record contactRecord) {
 	c.identityConflictWallclock = record.Wallclock
 	c.identityConflictMu.Unlock()
 
-	err := fmt.Errorf("%w: %s is publishing conflicting endpoints (ours gossip=%s tvu=%s alpenglow=%s; other gossip=%s tvu=%s alpenglow=%s); stop the other validator before starting Mithril",
-		ErrIdentityInUse, solana.PublicKey(c.pubkey).String(), addrString(local.GossipAddr), addrString(local.TVUAddr), addrString(local.AlpenglowAddr),
-		endpointString(record.GossipAddr), endpointString(record.TVUAddr), endpointString(alpenglow))
+	err := fmt.Errorf("%w: %s is publishing conflicting endpoints (ours gossip=%s tvu=%s serve_repair=%s alpenglow=%s; other gossip=%s tvu=%s serve_repair=%s alpenglow=%s); stop the other validator before starting Mithril",
+		ErrIdentityInUse, solana.PublicKey(c.pubkey).String(), addrString(local.GossipAddr), addrString(local.TVUAddr), addrString(local.ServeRepairAddr), addrString(local.AlpenglowAddr),
+		endpointString(record.GossipAddr), endpointString(record.TVUAddr), endpointString(record.ServeRepairAddr), endpointString(alpenglow))
 	select {
 	case c.identityConflictCh <- err:
 	default:
