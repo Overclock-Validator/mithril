@@ -51,6 +51,7 @@ type RpcServer struct {
 	slotCtx       *sealevel.SlotCtx
 	slotCtxMu     sync.RWMutex
 	healthSlot    func() (uint64, bool)
+	healthReady   bool
 	genesisHash   string
 	identity      string
 
@@ -134,6 +135,7 @@ func fetchAndUnmarshalEpochScheduleSysvar(acctsDb *accountsdb.AccountsDb) *seale
 func (rpcServer *RpcServer) SetSlotCtx(slotCtx *sealevel.SlotCtx) {
 	rpcServer.slotCtxMu.Lock()
 	rpcServer.slotCtx = slotCtx
+	rpcServer.healthReady = slotCtx != nil
 	rpcServer.slotCtxMu.Unlock()
 }
 

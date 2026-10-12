@@ -51,6 +51,10 @@ type SlotCtxSetter interface {
 	SetSlotCtx(slotCtx *sealevel.SlotCtx)
 }
 
+type rpcHealthInvalidator interface {
+	InvalidateHealth()
+}
+
 // BlockFetchOpts contains options for parallel block fetching
 type BlockFetchOpts struct {
 	MaxRPS          int    // Rate limit (requests per second), 0 = use default
@@ -1677,6 +1681,11 @@ func ReplayBlocks(
 	onCancelWriteState OnCancelWriteState, // callback to write state immediately on cancellation (can be nil)
 ) *ReplayResult {
 	result := &ReplayResult{}
+	health, _ := rpcServer.(rpcHealthInvalidator)
+	if health != nil {
+		health.InvalidateHealth()
+		defer health.InvalidateHealth()
+	}
 	alpenglowMode := consensusOpts != nil && consensusOpts.Alpenglow
 	replayFrontier := uint64(0)
 	if startSlot > 0 {
@@ -2481,7 +2490,7 @@ func ReplayBlocks(
 			mlog.Log.Warnf("%v — re-serving the skipped suffix from slot %d; executed bank remains at slot %d", sw, sw.Slot, currentExecutedAnchorSlot())
 			return true
 		}
-		rs, parentBankSysvars, fallbackReason := tryInLoopUnwind(sw, unrootedTailState, mithrilState, epochSchedule, currentEpoch, partitionedRewardsInfo)
+		rs, parentBankSysvars, fallbackReason := tryInLoopUnwind(sw, unrootedTailState, mithrilState, epochSchedule, currentEpoch, partitionedRewardsInfo, health)
 		if rs == nil {
 			windowSwitchFallback++
 			switchFallbackReasons[fallbackReason]++
@@ -3625,6 +3634,11 @@ func ReplayBlocks(
 			metrics.GlobalBlockReplay = metrics.BlockReplay{}
 		}
 
+	}
+
+	// Replay has stopped; cleanup may still wait for folds and worker shutdown.
+	if health != nil {
+		health.InvalidateHealth()
 	}
 
 	// Check if block source stalled (this provides explicit error info)

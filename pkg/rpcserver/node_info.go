@@ -27,9 +27,9 @@ func (rpcServer *RpcServer) GetHealth(ctx context.Context, p jsonrpc.RawParams) 
 	}
 
 	rpcServer.slotCtxMu.RLock()
-	slotCtx, healthSlot := rpcServer.slotCtx, rpcServer.healthSlot
+	slotCtx, healthSlot, ready := rpcServer.slotCtx, rpcServer.healthSlot, rpcServer.healthReady
 	rpcServer.slotCtxMu.RUnlock()
-	if slotCtx == nil || healthSlot == nil {
+	if !ready || slotCtx == nil || healthSlot == nil {
 		return nodeHealth(false, 0, 0)
 	}
 	clusterSlot, fresh := healthSlot()
@@ -40,6 +40,13 @@ func (rpcServer *RpcServer) GetHealth(ctx context.Context, p jsonrpc.RawParams) 
 func (rpcServer *RpcServer) SetHealthSlotSource(source func() (uint64, bool)) {
 	rpcServer.slotCtxMu.Lock()
 	rpcServer.healthSlot = source
+	rpcServer.slotCtxMu.Unlock()
+}
+
+// InvalidateHealth marks replay unavailable without discarding the last RPC bank.
+func (rpcServer *RpcServer) InvalidateHealth() {
+	rpcServer.slotCtxMu.Lock()
+	rpcServer.healthReady = false
 	rpcServer.slotCtxMu.Unlock()
 }
 
