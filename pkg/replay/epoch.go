@@ -441,15 +441,17 @@ func updateEpochStakesAndRefreshVoteCache(leaderScheduleEpoch uint64, b *block.B
 				executable = 1
 			}
 			epochStakes[votePk] = stake
+			collector := voteAcct.BlockRevenueCollector()
 			epochVoteAccounts[votePk] = &epochstakes.VoteAccount{
-				Lamports:            meta.Lamports,
-				NodePubkey:          voteAcct.NodePubkey(),
-				BlsPubkeyCompressed: voteAcct.BlsPubkeyCompressed(),
-				LastTimestampTs:     lastTimestampTs,
-				LastTimestampSlot:   lastTimestampSlot,
-				Owner:               meta.Owner,
-				Executable:          executable,
-				RentEpoch:           meta.RentEpoch,
+				BlockRevenueCollector: &collector,
+				Lamports:              meta.Lamports,
+				NodePubkey:            voteAcct.NodePubkey(),
+				BlsPubkeyCompressed:   voteAcct.BlsPubkeyCompressed(),
+				LastTimestampTs:       lastTimestampTs,
+				LastTimestampSlot:     lastTimestampSlot,
+				Owner:                 meta.Owner,
+				Executable:            executable,
+				RentEpoch:             meta.RentEpoch,
 			}
 		}
 	}

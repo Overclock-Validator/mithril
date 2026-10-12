@@ -1163,7 +1163,10 @@ func (ip *Interpreter) TranslateInput(addr uint64, size uint64) ([]byte, error) 
 	return ip.input[offset : offset+size], nil
 }
 
-func (ip *Interpreter) SetInputRegionData(addr uint64, data []byte, length uint64, writable bool) bool {
+// SetInputRegionData replaces a region's backing and write-fault handler together.
+// CPI ownership changes can install or revoke growth/COW permission, so a nil
+// handler must clear the previous one as well as invalidate cached permissions.
+func (ip *Interpreter) SetInputRegionData(addr uint64, data []byte, length uint64, writable bool, onWrite func(*InputRegion, uint64) error) bool {
 	if addr < VaddrInput || len(ip.inputRegions) == 0 {
 		return false
 	}
@@ -1175,9 +1178,8 @@ func (ip *Interpreter) SetInputRegionData(addr uint64, data []byte, length uint6
 	if addr != VaddrInput+region.Offset || length > region.AddressSpaceReserved {
 		return false
 	}
-	if data != nil {
-		region.Data = data
-	}
+	region.Data = data
+	region.OnWrite = onWrite
 	region.RegionSize = length
 	region.Writable = writable
 	ip.regions[VaddrInput>>32] = emptyRegion
@@ -1185,7 +1187,7 @@ func (ip *Interpreter) SetInputRegionData(addr uint64, data []byte, length uint6
 }
 
 func (ip *Interpreter) SetInputRegionLength(addr uint64, length uint64, writable bool) bool {
-	return ip.SetInputRegionData(addr, nil, length, writable)
+	return ip.SetInputRegionData(addr, nil, length, writable, nil)
 }
 
 func (ip *Interpreter) Translate(addr uint64, size uint64, write bool) ([]byte, error) {
