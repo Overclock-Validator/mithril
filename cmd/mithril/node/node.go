@@ -69,10 +69,14 @@ var (
 		PreRunE: func(cmd *cobra.Command, args []string) error {
 			return initConfigAndBindFlags(cmd)
 		},
-		Run: func(cmd *cobra.Command, args []string) {
-			runLive(cmd, args)
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runLive(cmd, args)
 		},
 	}
+
+	// ErrRetryableBlockFetchStall marks a fetch timeout only after node cleanup
+	// succeeds and the run is qualified for a bounded supervisor restart.
+	ErrRetryableBlockFetchStall = errors.New("retryable block fetch stall")
 
 	bootstrapMode                    string // "auto", "snapshot", "new-snapshot", "new-incremental", or "accountsdb"
 	snapshotArchivePath              string
@@ -1283,13 +1287,17 @@ func buildSnapshotConfig(rpcEndpoints []string) snapshotdl.SnapshotConfig {
 	return cfg
 }
 
-func runLive(c *cobra.Command, args []string) {
+func runLive(c *cobra.Command, args []string) (runErr error) {
 	alpenglowMode := cluster == "alpenglow"
 	if pprofPort != -1 {
 		startPprofHandlers(int(pprofPort))
 	}
 	ctx, cancelRun := context.WithCancel(c.Context())
 	defer cancelRun()
+	var cleanupErr error
+	defer func() {
+		runErr = liveRunExitError(runErr, cleanupErr, ctx.Err() != nil, rpcPort != 0)
+	}()
 
 	// Print the Mithril banner first, before any other output
 	progress.PrintBanner()
@@ -1662,6 +1670,7 @@ func runLive(c *cobra.Command, args []string) {
 		} else {
 			defer func() {
 				if err := lbManager.Stop(10 * time.Second); err != nil {
+					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("stop Lightbringer: %w", err))
 					mlog.Log.Warnf("lightbringer: shutdown error: %v", err)
 				}
 			}()
@@ -1829,7 +1838,7 @@ func runLive(c *cobra.Command, args []string) {
 		}
 		// Run integrity check if we have a state file (warn only, don't fail - user chose force mode)
 		if hasValidState {
-			if err := mithrilState.ValidateAgainstBankhashDB(accountsDb); err != nil {
+			if err := validateRecoveredStateBeforeIntegrity(mithrilState, accountsDb, alpenglowMode, foldRecovery); err != nil {
 				mlog.Log.Errorf("WARNING: integrity check failed: %v", err)
 				mlog.Log.Errorf("WARNING: AccountsDB may be corrupted. Consider using --bootstrap snapshot to rebuild.")
 			}
@@ -2088,7 +2097,7 @@ func runLive(c *cobra.Command, args []string) {
 			}
 
 			// Validate state file matches AccountsDB (detect Ctrl+Z / kill -9 corruption)
-			if err := mithrilState.ValidateAgainstBankhashDB(accountsDb); err != nil {
+			if err := validateRecoveredStateBeforeIntegrity(mithrilState, accountsDb, alpenglowMode, foldRecovery); err != nil {
 				mlog.Log.Errorf("INTEGRITY CHECK FAILED: %v", err)
 				mlog.Log.Infof("AccountsDB appears to have been modified beyond what state file records")
 				mlog.Log.Infof("This usually happens when the process was killed with Ctrl+Z or kill -9")
@@ -2561,6 +2570,14 @@ postBootstrap:
 		}
 	}
 
+	// Register before services with shutdown hooks so they stop before DB close.
+	defer func() {
+		mlog.Log.Infof("Done replaying, closing DB")
+		if err := accountsDb.CloseDb(); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("close accounts database: %w", err))
+		}
+	}()
+
 	var rpcServer *rpcserver.RpcServer
 	if rpcPort < 0 || rpcPort > 65535 {
 		klog.Fatalf("invalid port: %d", rpcPort)
@@ -2623,8 +2640,10 @@ postBootstrap:
 			klog.Fatalf("unable to start consensus engine %q: %v", consensusEngine.Name(), err)
 		}
 		defer func() {
-			if err := consensusEngine.Close(); err != nil {
+			// Close drains the vote writer; a fault may arrive during that drain.
+			if err := errors.Join(consensusEngine.Close(), consensusEngine.AlpenglowSafetyError()); err != nil {
 				mlog.Log.Warnf("consensus engine close failed: %v", err)
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("close consensus engine: %w", err))
 			}
 		}()
 	}
@@ -2708,7 +2727,11 @@ postBootstrap:
 		if err != nil {
 			klog.Fatalf("validator turbine broadcaster: %v", err)
 		}
-		defer broadcaster.Close()
+		defer func() {
+			if err := broadcaster.Close(); err != nil {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("close turbine broadcaster: %w", err))
+			}
+		}()
 
 		controller := blockprod.NewController()
 		topicSink := scheduler.NewWithConfig(controller, scheduler.Config{
@@ -2742,6 +2765,7 @@ postBootstrap:
 			defer cancel()
 			if err := tpuService.Stop(shutdownCtx); err != nil {
 				mlog.Log.Warnf("validator TPU shutdown: %v", err)
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("stop validator TPU: %w", err))
 			}
 		}()
 		tpuAdvertise, err := tpuService.AdvertisedQUICAddr()
@@ -2862,6 +2886,7 @@ postBootstrap:
 				select {
 				case localBlocks <- produced:
 				case <-ctx.Done():
+				case <-leaderStop:
 				}
 			},
 		})
@@ -2941,12 +2966,15 @@ postBootstrap:
 	// (move + scan budgets) and serialized against folds via the store's
 	// internal lock; the rewind horizon pins are what it must never touch.
 	if compactEnabled {
+		compactCtx, stopCompaction := context.WithCancel(ctx)
+		compactDone := make(chan struct{})
 		go func() {
+			defer close(compactDone)
 			ticker := time.NewTicker(10 * time.Minute)
 			defer ticker.Stop()
 			for {
 				select {
-				case <-ctx.Done():
+				case <-compactCtx.Done():
 					return
 				case <-ticker.C:
 					if _, cerr := accountsDb.CompactOnce(compactCfg); cerr != nil {
@@ -2954,6 +2982,10 @@ postBootstrap:
 					}
 				}
 			}
+		}()
+		defer func() {
+			stopCompaction()
+			<-compactDone
 		}()
 	}
 
@@ -3032,12 +3064,14 @@ postBootstrap:
 			}
 			// Record shutdown in history (must be inside this block where shutdownReason is defined)
 			if err := mithrilState.UpdateOnShutdown(accountsPath, result.LastPersistedSlot, result.LastPersistedBankhash, shutdownCtx); err != nil {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("update shutdown state: %w", err))
 				mlog.Log.Errorf("failed to update state file: %v", err)
 			}
 			state.RecordShutdown(accountsPath, result.LastPersistedSlot, base58.Encode(result.LastPersistedBankhash), replay.CurrentRunID, getVersion(), getCommit(), getBranch(), shutdownReason)
 		} else {
 			// No shutdown context - just update slot
 			if err := mithrilState.UpdateOnShutdown(accountsPath, result.LastPersistedSlot, result.LastPersistedBankhash, shutdownCtx); err != nil {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("update shutdown state: %w", err))
 				mlog.Log.Errorf("failed to update state file: %v", err)
 			}
 		}
@@ -3061,8 +3095,21 @@ postBootstrap:
 		})
 	}
 
-	mlog.Log.Infof("Done replaying, closing DB")
-	accountsDb.CloseDb()
+	return result.Error
+}
+
+// liveRunExitError preserves terminal failures and qualifies a fetch timeout for
+// retry only after cleanup succeeds. Cancellation never hides an existing fault.
+func liveRunExitError(runErr, cleanupErr error, cancelled, rpcActive bool) error {
+	if cleanupErr != nil {
+		return errors.Join(runErr, cleanupErr)
+	}
+	// ponytail: RPC has no close/join path; qualify retries only with RPC off
+	// until its database readers can be stopped before AccountsDB closes.
+	if errors.Is(runErr, replay.ErrBlockFetchStalled) && !cancelled && !rpcActive {
+		return fmt.Errorf("%w: %w", ErrRetryableBlockFetchStall, runErr)
+	}
+	return runErr
 }
 
 type turbineEntrypointQuery func(*net.UDPAddr, time.Duration) (gossip.EchoResponse, error)
@@ -3997,6 +4044,38 @@ func mustRecoverFoldState(accountsDb *accountsdb.AccountsDb) accountsdb.Recovery
 		mlog.Log.Infof("fold recovery removed %d undecided orphan file(s)", len(rec.OrphansRemoved))
 	}
 	return rec
+}
+
+// validateRecoveredStateBeforeIntegrity allows an executed RAM-only LastSlot
+// before the first Alpenglow fold, when recovery and the entire bankhash store
+// confirm no fold. The saved tip remains diagnostic; replay starts at snapshot+1.
+func validateRecoveredStateBeforeIntegrity(s *state.MithrilState, db *accountsdb.AccountsDb, alpenglowMode bool, rec accountsdb.RecoveryResult) error {
+	if !alpenglowMode {
+		return s.ValidateAgainstBankhashDB(db)
+	}
+	if rec.DurableThrough < s.LastRootedSlot {
+		return fmt.Errorf("state file shows last_rooted_slot=%d but the store is only durably folded through %d", s.LastRootedSlot, rec.DurableThrough)
+	}
+	if rec.DurableThrough == 0 {
+		if rec.BatchSeq != 0 || len(rec.ResumeCtx) != 0 || rec.RootedBankhash != ([32]byte{}) || rec.RewindInProgress ||
+			s.LastRootedContext != nil || s.LastRootedBankhash != "" {
+			return fmt.Errorf("zero durable frontier has conflicting fold or rooted-state metadata")
+		}
+		iter, err := db.BankHashStore.NewIter(nil)
+		if err != nil {
+			return fmt.Errorf("open bankhash iterator before first fold: %w", err)
+		}
+		nonempty := iter.First()
+		if err := errors.Join(iter.Error(), iter.Close()); err != nil {
+			return fmt.Errorf("check bankhash store before first fold: %w", err)
+		}
+		if !nonempty {
+			return nil
+		}
+		// A legacy store can have per-block rows without fold metadata.
+		// Keep its existing validation instead of granting the empty-store exception.
+	}
+	return s.ValidateAgainstBankhashDB(db)
 }
 
 // adoptRecoveredManifestContextBeforeIntegrity runs before the legacy

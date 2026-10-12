@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -65,5 +67,10 @@ func init() {
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	cobra.CheckErr(cmd.ExecuteContext(ctx))
+	err := cmd.ExecuteContext(ctx)
+	if errors.Is(err, node.ErrRetryableBlockFetchStall) && ctx.Err() == nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(75) // EX_TEMPFAIL: cleanup completed; a bounded supervisor may retry.
+	}
+	cobra.CheckErr(err)
 }
