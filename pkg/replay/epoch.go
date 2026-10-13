@@ -283,7 +283,6 @@ func handleEpochTransition(acctsDb *accountsdb.AccountsDb, partitionedEpochRewar
 	t1 := time.Now()
 
 	updateEpochStakesAndRefreshVoteCache(leaderScheduleEpoch, block, acctsDb, prevSlotCtx.Slot, scanResult, f, epochSchedule)
-	global.PutEpochVoteStateSnapshot(newEpoch, global.VoteCacheSnapshot())
 	t2 := time.Now()
 
 	if global.ManageLeaderSchedule() {
@@ -398,8 +397,17 @@ func updateEpochStakesAndRefreshVoteCache(leaderScheduleEpoch uint64, b *block.B
 		mlog.Log.Errorf("failed to rebuild vote cache at epoch boundary: %v", rebuildErr)
 	}
 
-	// Skip epoch stakes storage if already cached (resume)
-	if hasEpochStakes {
+	// An older checkpoint can have cached this boundary's stakes without its
+	// commission fields. Recompute that new generation from the same durable
+	// parent; historical generations are restored only from their own snapshots.
+	commissionsComplete := true
+	for _, vote := range cachedEpochStakes.VoteAccounts {
+		if vote == nil || vote.InflationRewardsCommissionBps == nil {
+			commissionsComplete = false
+			break
+		}
+	}
+	if hasEpochStakes && commissionsComplete {
 		mlog.Log.Infof("already had EpochStakes for epoch %d", leaderScheduleEpoch)
 		// A restart can retain this generation from a previously attempted
 		// boundary, while configuration still inherits the parent's stakes.
@@ -442,16 +450,18 @@ func updateEpochStakesAndRefreshVoteCache(leaderScheduleEpoch uint64, b *block.B
 			}
 			epochStakes[votePk] = stake
 			collector := voteAcct.BlockRevenueCollector()
+			commission := voteAcct.InflationRewardsCommissionBps()
 			epochVoteAccounts[votePk] = &epochstakes.VoteAccount{
-				BlockRevenueCollector: &collector,
-				Lamports:              meta.Lamports,
-				NodePubkey:            voteAcct.NodePubkey(),
-				BlsPubkeyCompressed:   voteAcct.BlsPubkeyCompressed(),
-				LastTimestampTs:       lastTimestampTs,
-				LastTimestampSlot:     lastTimestampSlot,
-				Owner:                 meta.Owner,
-				Executable:            executable,
-				RentEpoch:             meta.RentEpoch,
+				BlockRevenueCollector:         &collector,
+				InflationRewardsCommissionBps: &commission,
+				Lamports:                      meta.Lamports,
+				NodePubkey:                    voteAcct.NodePubkey(),
+				BlsPubkeyCompressed:           voteAcct.BlsPubkeyCompressed(),
+				LastTimestampTs:               lastTimestampTs,
+				LastTimestampSlot:             lastTimestampSlot,
+				Owner:                         meta.Owner,
+				Executable:                    executable,
+				RentEpoch:                     meta.RentEpoch,
 			}
 		}
 	}

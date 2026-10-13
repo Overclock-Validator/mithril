@@ -33,6 +33,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/blockstream"
 	"github.com/Overclock-Validator/mithril/pkg/config"
 	consensusengine "github.com/Overclock-Validator/mithril/pkg/consensus"
+	"github.com/Overclock-Validator/mithril/pkg/epochstakes"
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
@@ -490,8 +491,16 @@ func refreshManifestSeedFromManifest(accountsPath string, s *state.MithrilState,
 	// ManifestEpochStakes is deliberately cleared after replay starts to release
 	// the large JSON seed.  A later graceful state save persists that cleared
 	// value, so schedule metadata alone does not mean the manifest seed is
-	// complete on restart.  Rehydrate when the stakes payload is absent.
-	if manifestEpochScheduleSeedMatches(s, manifest) &&
+	// complete on restart. Rehydrate when the payload is absent or an older
+	// binary discarded its historical commissions.
+	commissionsComplete := true
+	for _, seed := range s.ManifestEpochStakes {
+		if !epochstakes.HasInflationCommissionMetadata([]byte(seed)) {
+			commissionsComplete = false
+			break
+		}
+	}
+	if commissionsComplete && manifestEpochScheduleSeedMatches(s, manifest) &&
 		s.SnapshotEpoch == snapshotEpoch && len(s.ManifestEpochStakes) > 0 {
 		return
 	}
