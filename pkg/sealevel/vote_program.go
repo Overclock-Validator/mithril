@@ -37,6 +37,8 @@ const (
 	VoteProgramInstrTypeTowerSyncSwitch
 	VoteProgramInstrTypeInitializeAccountV2       = 16
 	VoteProgramInstrTypeUpdateCommissionCollector = 17
+	VoteProgramInstrTypeUpdateCommissionBps       = 18
+	VoteProgramInstrTypeDepositDelegatorRewards   = 19
 )
 
 const (
@@ -1143,6 +1145,40 @@ func VoteProgramExecute(execCtx *ExecutionCtx) error {
 			err = VoteProgramUpdateCommissionCollector(execCtx, instrCtx, kind, signers, rent)
 		}
 
+	case VoteProgramInstrTypeUpdateCommissionBps:
+		{
+			commissionBps, decodeErr := decoder.ReadUint16(bin.LE)
+			if decodeErr != nil {
+				return InstrErrInvalidInstructionData
+			}
+			kind, decodeErr := decoder.ReadUint32(bin.LE)
+			if decodeErr != nil || kind > CommissionKindBlockRevenue {
+				return InstrErrInvalidInstructionData
+			}
+			if !execCtx.Features.IsActive(features.CommissionRateInBasisPoints) ||
+				!execCtx.Features.IsActive(features.DelayCommissionUpdates) {
+				return InstrErrInvalidInstructionData
+			}
+			err = VoteProgramUpdateCommissionBps(execCtx, me, commissionBps, kind, signers)
+		}
+
+	case VoteProgramInstrTypeDepositDelegatorRewards:
+		{
+			deposit, decodeErr := decoder.ReadUint64(bin.LE)
+			if decodeErr != nil {
+				return InstrErrInvalidInstructionData
+			}
+			if !execCtx.Features.IsActive(features.CommissionRateInBasisPoints) ||
+				!execCtx.Features.IsActive(features.CustomCommissionCollector) ||
+				!execCtx.Features.IsActive(features.BlockRevenueSharing) {
+				return InstrErrInvalidInstructionData
+			}
+			if err = instrCtx.CheckNumOfInstructionAccounts(2); err != nil {
+				return err
+			}
+			err = VoteProgramDepositDelegatorRewards(execCtx, instrCtx, deposit, signers)
+		}
+
 	default: // invalid instruction
 		{
 			err = InstrErrInvalidInstructionData
@@ -1516,6 +1552,93 @@ func VoteProgramUpdateCommission(execCtx *ExecutionCtx, voteAcct *BorrowedAccoun
 	err = setVoteAccountState(execCtx, voteAcct, voteState, f)
 
 	return err
+}
+
+// VoteProgramUpdateCommissionBps follows Agave's vote_state::update_commission_bps
+// (SIMD-0291). Unlike the legacy percentage instruction, it has no epoch timing
+// restriction and accepts the full u16 range, including values above 10,000 bps.
+func VoteProgramUpdateCommissionBps(execCtx *ExecutionCtx, voteAcct *BorrowedAccount, commissionBps uint16, kind uint32, signers []solana.PublicKey) error {
+	if kind > CommissionKindBlockRevenue ||
+		(kind == CommissionKindBlockRevenue && !execCtx.Features.IsActive(features.BlockRevenueSharing)) {
+		return InstrErrInvalidInstructionData
+	}
+
+	// Match the checked V4 decoder: retired V0_23_5 is invalid, legacy states
+	// require an authorized voter, and every successfully decoded V4 is initialized.
+	if data := voteAcct.Data(); len(data) >= 4 && bin.LE.Uint32(data[:4]) == VoteStateVersionV0_23_5 {
+		return InstrErrInvalidAccountData
+	}
+	versioned, err := UnmarshalVersionedVoteState(voteAcct.Data())
+	if err != nil {
+		return err
+	}
+	if versioned.Type != VoteStateVersionV4 && !versioned.IsInitialized() {
+		return InstrErrUninitializedAccount
+	}
+	voteState := versioned.ConvertToCurrent()
+	if err := verifySigner(voteState.AuthorizedWithdrawer, signers); err != nil {
+		return err
+	}
+
+	// Apply legacy-to-V4 defaults before setting the requested commission, so
+	// serialization preserves both the new basis points and the other V4 fields.
+	v4 := newVoteState4FromCurrent(voteState, voteAcct.Key())
+	if kind == CommissionKindInflationRewards {
+		v4.InflationRewardsCommissionBps = commissionBps
+	} else {
+		v4.BlockRevenueCommissionBps = commissionBps
+	}
+	updated := &VoteStateVersions{Type: VoteStateVersionV4, V4: *v4}
+	return setVoteAccountState(execCtx, voteAcct, updated.ConvertToCurrent(), execCtx.Features)
+}
+
+// VoteProgramDepositDelegatorRewards follows Agave v4.4.0-beta.0's SIMD-0123
+// path: require an existing V4 state before System Program CPI, then update
+// pending rewards. In particular, even a zero deposit must execute the CPI,
+// and pending-reward overflow is checked after the transfer (and its CU cost).
+func VoteProgramDepositDelegatorRewards(execCtx *ExecutionCtx, instrCtx *InstructionCtx, deposit uint64, signers []solana.PublicKey) error {
+	txCtx := execCtx.TransactionContext
+	voteKey, err := instrCtx.KeyOfInstructionAccount(txCtx, 0)
+	if err != nil {
+		return err
+	}
+	sourceKey, err := instrCtx.KeyOfInstructionAccount(txCtx, 1)
+	if err != nil {
+		return err
+	}
+	if err = verifySigner(sourceKey, signers); err != nil {
+		return err
+	}
+
+	voteAcct, err := instrCtx.BorrowInstructionAccount(txCtx, 0)
+	if err != nil {
+		return err
+	}
+	versioned, err := UnmarshalVersionedVoteState(voteAcct.Data())
+	voteAcct.Drop()
+	if err != nil {
+		return err
+	}
+	// Unlike other V4 operations, a deposit must not migrate a legacy state.
+	// Every successfully decoded V4 is initialized, even with no voters.
+	if versioned.Type != VoteStateVersionV4 {
+		return InstrErrInvalidAccountData
+	}
+
+	if err = execCtx.NativeInvoke(*newTransferInstruction(sourceKey, voteKey, deposit), nil); err != nil {
+		return err
+	}
+
+	voteAcct, err = instrCtx.BorrowInstructionAccount(txCtx, 0)
+	if err != nil {
+		return err
+	}
+	defer voteAcct.Drop()
+	versioned.V4.PendingDelegatorRewards, err = safemath.CheckedAddU64(versioned.V4.PendingDelegatorRewards, deposit)
+	if err != nil {
+		return InstrErrArithmeticOverflow
+	}
+	return setVoteAccountStateV4(execCtx, voteAcct, &versioned.V4, execCtx.Features)
 }
 
 func verifyAndGetVoteState(voteAcct *BorrowedAccount, clock SysvarClock, signers []solana.PublicKey, f features.Features) (*VoteState, error) {
@@ -2087,6 +2210,12 @@ func VoteProgramWithdraw(execCtx *ExecutionCtx, txCtx *TransactionCtx, instrCtx 
 	}
 
 	if remainingBalance == 0 {
+		// Pending delegator rewards are reserved funds, not withdrawer funds.
+		// Agave applies this check independently of the feature gate; legacy
+		// states and accounts predating SIMD-0123 have a zero pending balance.
+		if voteState.v4PendingDelegatorRewards != 0 {
+			return InstrErrInsufficientFunds
+		}
 		var rejectActiveVoteAcctClose bool
 		if len(voteState.EpochCredits) != 0 {
 			lastEpochWithCredits := voteState.EpochCredits[len(voteState.EpochCredits)-1].Epoch
@@ -2109,7 +2238,11 @@ func VoteProgramWithdraw(execCtx *ExecutionCtx, txCtx *TransactionCtx, instrCtx 
 		}
 	} else {
 		minRentExemptBalance := rent.MinimumBalance(uint64(len(voteAcct.Data())))
-		if remainingBalance < minRentExemptBalance {
+		minBalance, err := safemath.CheckedAddU64(minRentExemptBalance, voteState.v4PendingDelegatorRewards)
+		if err != nil {
+			return InstrErrArithmeticOverflow
+		}
+		if remainingBalance < minBalance {
 			return InstrErrInsufficientFunds
 		}
 	}

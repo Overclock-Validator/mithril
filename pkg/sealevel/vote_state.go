@@ -1836,37 +1836,30 @@ func newVoteState4FromCurrent(vs *VoteState, votePubkey solana.PublicKey) *VoteS
 	return vs4
 }
 
+func setVoteAccountStateV4(execCtx *ExecutionCtx, acct *BorrowedAccount, voteState *VoteState4, f features.Features) error {
+	if len(acct.Data()) < VoteStateV4Size {
+		// SIMD-0185 requires a rent-exempt resize, with no legacy fallback.
+		if !acct.IsRentExemptAtDataLength(VoteStateV4Size) {
+			return InstrErrAccountNotRentExempt
+		}
+		if err := acct.SetDataLength(VoteStateV4Size, f); err != nil {
+			return InstrErrAccountNotRentExempt
+		}
+	}
+	versioned := &VoteStateVersions{Type: VoteStateVersionV4, V4: *voteState}
+	execCtx.AddModifiedVoteState(acct.Key(), versioned)
+	voteStateBytes, err := marshalVersionedVoteState(versioned)
+	defer voteStateBufPool.Put(voteStateBytes)
+	if err != nil {
+		return err
+	}
+	return acct.SetState(f, voteStateBytes)
+}
+
 func setVoteAccountState(execCtx *ExecutionCtx, acct *BorrowedAccount, voteState *VoteState, f features.Features) error {
 	var err error
 	if f.IsActive(features.VoteStateV4) {
-		vsz := VoteStateV3Size
-		resizeNeeded := len(acct.Data()) < vsz
-
-		resizeRentExempt := acct.IsRentExemptAtDataLength(uint64(vsz))
-		resizeFailed := false
-
-		if resizeNeeded && resizeRentExempt {
-			err = acct.SetDataLength(VoteStateV3Size, f)
-			if err != nil {
-				resizeFailed = true
-			}
-		}
-
-		// V4: NO V1_14_11 fallback — error on resize failure (per SIMD-0185)
-		if resizeNeeded && (!resizeRentExempt || resizeFailed) {
-			return InstrErrAccountNotRentExempt
-		}
-
-		vs4 := newVoteState4FromCurrent(voteState, acct.Key())
-		newVersioned := &VoteStateVersions{Type: VoteStateVersionV4}
-		newVersioned.V4 = *vs4
-		execCtx.AddModifiedVoteState(acct.Key(), newVersioned)
-		voteStateBytes, err := marshalVersionedVoteState(newVersioned)
-		defer voteStateBufPool.Put(voteStateBytes)
-		if err != nil {
-			return err
-		}
-		return acct.SetState(f, voteStateBytes)
+		return setVoteAccountStateV4(execCtx, acct, newVoteState4FromCurrent(voteState, acct.Key()), f)
 	} else if f.IsActive(features.VoteStateAddVoteLatency) {
 		vsz := VoteStateV3Size
 		resizeNeeded := len(acct.Data()) < vsz
