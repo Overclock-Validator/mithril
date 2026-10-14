@@ -1,0 +1,26 @@
+[Unit]
+Description=Mithril Solana node
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=/mnt/mithril-accounts /mnt/mithril-ledger /mnt/mithril-logs
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+# Change User and paths if your server uses a different account/layout.
+User=ubuntu
+WorkingDirectory=/etc/mithril
+EnvironmentFile=-/etc/mithril/mithril.env
+Environment=TMPDIR=/mnt/mithril-ledger/tmp
+ExecStart=/usr/local/bin/mithril run --config /etc/mithril/config.toml
+Restart=on-failure
+RestartSec=30
+KillSignal=SIGINT
+TimeoutStopSec=300
+LimitNOFILE=1048576
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

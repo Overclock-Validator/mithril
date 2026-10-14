@@ -10,7 +10,7 @@ set -euo pipefail
 # It focuses on the OS installation and security - NOT storage/performance tuning.
 #
 # MODES:
-#   install : Fresh Ubuntu 24.04 install from rescue/live environment (DESTRUCTIVE)
+#   install : Fresh Ubuntu 26.04 install from rescue/live environment (DESTRUCTIVE)
 #   harden  : Safe on existing Ubuntu - user setup, SSH keys, security packages
 #   status  : Show current security configuration (no changes)
 #
@@ -123,7 +123,9 @@ disk_contains_root() {
     local disk="$1"
     local root_dev
     root_dev="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
-    [[ -n "$root_dev" && "$root_dev" == "$disk"* ]]
+    [[ "$root_dev" == /dev/* ]] || return 1
+    # Walk through LVM and RAID too; string prefixes miss their backing disks.
+    lsblk -snrpo NAME "$root_dev" | grep -qxF "$disk"
 }
 
 # Get MAC address for interface
@@ -158,7 +160,16 @@ ensure_user() {
         info "Creating user '$user' (no password)."
         adduser --disabled-password --gecos "" "$user"
     fi
-    usermod -aG sudo "$user" || true
+    # Provider images may already contain a locked-password ubuntu account.
+    # A locked password cannot authenticate sudo, even in the sudo group.
+    if [[ "$(passwd -S "$user" | awk '{print $2}')" == L ]]; then
+        info "Configuring passwordless sudo for key-only admin '$user'."
+        local sudoers="/etc/sudoers.d/mithril-$user"
+        printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$user" > "$sudoers"
+        chmod 0440 "$sudoers"
+        visudo -cf "$sudoers"
+    fi
+    usermod -aG sudo "$user"
 }
 
 get_home() { getent passwd "$1" | cut -d: -f6; }
@@ -181,28 +192,16 @@ validate_ssh_pubkey() {
     local pubkey="$1"
     [[ -n "$pubkey" ]] || die "SSH public key is empty."
 
-    # Accept standard key types including FIDO2/security keys
-    if [[ "$pubkey" =~ ^ssh-ed25519[[:space:]] || \
-          "$pubkey" =~ ^sk-ssh-ed25519@openssh.com[[:space:]] || \
-          "$pubkey" =~ ^ecdsa-sha2-nistp256[[:space:]] || \
-          "$pubkey" =~ ^sk-ecdsa-sha2-nistp256@openssh.com[[:space:]] || \
-          "$pubkey" =~ ^ssh-rsa[[:space:]] ]]; then
-        # Valid format
-        if [[ "$pubkey" =~ ^ssh-rsa[[:space:]] ]]; then
-            warn "RSA key detected. ed25519 is recommended for new keys."
-        fi
-        return 0
+    [[ "$pubkey" != *$'\n'* && "$pubkey" != *$'\r'* ]] || die "Paste a single public key line."
+    local key_file
+    key_file=$(mktemp)
+    printf '%s\n' "$pubkey" > "$key_file"
+    if ! ssh-keygen -l -f "$key_file" >/dev/null 2>&1; then
+        rm -f "$key_file"
+        die "Invalid OpenSSH public key."
     fi
+    rm -f "$key_file"
 
-    warn "That doesn't look like a standard OpenSSH public key line."
-    echo "  Expected formats:"
-    echo "    - ssh-ed25519 AAAA...  (recommended)"
-    echo "    - sk-ssh-ed25519@openssh.com AAAA...  (FIDO2 hardware key)"
-    echo "    - ecdsa-sha2-nistp256 AAAA..."
-    echo "    - ssh-rsa AAAA..."
-    if ! yesno "  Continue anyway?" "n"; then
-        die "Please paste a valid public key line."
-    fi
 }
 
 ensure_pubkey_for_user() {
@@ -241,14 +240,63 @@ sshd_effective() {
 
 apply_sshd_dropin() {
     local disable_password="$1" disable_root="$2"
-    install -d -m 0755 /etc/ssh/sshd_config.d
-    cat > /etc/ssh/sshd_config.d/99-hardening.conf <<EOF
+    local config_dir="${3:-/etc/ssh/sshd_config.d}"
+    local config="${4:-/etc/ssh/sshd_config}"
+    local dropin="$config_dir/00-mithril-hardening.conf" backup effective valid=yes
+    install -d -m 0755 "$config_dir"
+    backup=$(mktemp -d)
+    [[ ! -e "$dropin" ]] || cp -p "$dropin" "$backup/previous"
+    # OpenSSH uses the FIRST value, so a late 99-* file loses to cloud-init.
+    cat > "$dropin" <<EOF
 # Managed by server-setup.sh
 # Remove this file to revert to defaults.
 KbdInteractiveAuthentication no
 $( [[ "$disable_password" == "yes" ]] && echo "PasswordAuthentication no" )
 $( [[ "$disable_root" == "yes" ]] && echo "PermitRootLogin no" )
 EOF
+    chmod 0644 "$dropin"
+    # Validate both global settings and Match rules for this administrator/client.
+    local context client_addr="${SSH_CONNECTION:-}"
+    client_addr=${client_addr%% *}
+    for context in "" "user=${ADMIN_USER:-ubuntu},host=localhost,addr=${client_addr:-127.0.0.1}" "user=root,host=localhost,addr=${client_addr:-127.0.0.1}"; do
+        local args=(-f "$config")
+        [[ -z "$context" ]] || args+=(-C "$context")
+        if ! sshd -f "$config" -t || ! effective=$(sshd "${args[@]}" -T); then
+            valid=no
+            break
+        fi
+        grep -qx 'kbdinteractiveauthentication no' <<< "$effective" || valid=no
+        if [[ "$disable_password" == "yes" ]]; then
+            grep -qx 'passwordauthentication no' <<< "$effective" || valid=no
+        fi
+        if [[ "$disable_root" == "yes" ]]; then
+            grep -qx 'permitrootlogin no' <<< "$effective" || valid=no
+        fi
+    done
+    if [[ "$valid" == yes ]] && systemctl reload ssh; then
+        rm -rf "$backup"
+        return 0
+    fi
+    warn "SSH hardening could not be applied; restoring the previous configuration."
+    if [[ -f "$backup/previous" ]]; then
+        cp -p "$backup/previous" "$dropin"
+    else
+        rm -f "$dropin"
+    fi
+    rm -rf "$backup"
+    return 1
+}
+
+confirm_admin_access() {
+    local home
+    home=$(get_home "$ADMIN_USER")
+    [[ -s "$home/.ssh/authorized_keys" ]] || die "No SSH keys for $ADMIN_USER. Leaving SSH unchanged."
+    echo "  Keep this session open. In a SECOND terminal, log in using the admin key:"
+    echo "    ssh $ADMIN_USER@<server_ip>"
+    echo "  Then confirm administrative access: sudo -v && sudo true"
+    local confirmed
+    read -r -p "  After BOTH commands succeed, type ACCESS VERIFIED: " confirmed
+    [[ "$confirmed" == "ACCESS VERIFIED" ]] || die "Admin access not confirmed. Leaving SSH unchanged."
 }
 
 # ------------------------------------------------------------------------------
@@ -259,7 +307,8 @@ check_security_status() {
     echo
     echo "  Security status:"
     echo "    - sshd installed:      $([[ -x /usr/sbin/sshd ]] && echo yes || echo no)"
-    echo "    - ssh service:         $(systemctl is-enabled ssh 2>/dev/null || echo unknown)"
+    echo "    - ssh service:         $(systemctl is-enabled ssh 2>/dev/null || true)"
+    echo "    - ssh socket:          $(systemctl is-enabled ssh.socket 2>/dev/null || true)"
     echo "    - fail2ban installed:  $([[ -x /usr/bin/fail2ban-client ]] && echo yes || echo no)"
     if [[ -x /usr/bin/fail2ban-client ]]; then
         local f2b_status
@@ -307,10 +356,20 @@ EOF
 
 configure_ufw() {
     # Set secure defaults
-    ufw default deny incoming >/dev/null 2>&1 || true
-    ufw default allow outgoing >/dev/null 2>&1 || true
-    # Allow SSH
-    ufw allow OpenSSH >/dev/null 2>&1 || ufw allow 22/tcp >/dev/null 2>&1 || true
+    ufw default deny incoming >/dev/null
+    ufw default allow outgoing >/dev/null
+    # Preserve access on custom SSH ports and with ssh.socket activation.
+    local ports port
+    ports=$(sshd -T | awk '$1=="port" {print $2}')
+    [[ -n "$ports" ]] || die "Cannot determine SSH ports; refusing firewall changes."
+    for port in $ports; do
+        ufw allow "$port/tcp" >/dev/null
+    done
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+        port=${SSH_CONNECTION##* }
+        [[ "$port" =~ ^[0-9]+$ ]] || die "Invalid active SSH port."
+        ufw allow "$port/tcp" >/dev/null
+    fi
 }
 
 enable_unattended() {
@@ -333,6 +392,7 @@ choose_admin_user() {
         prompt ADMIN_USER "  Enter admin username" ""
         [[ -n "$ADMIN_USER" ]] || die "Username cannot be empty."
     fi
+    [[ "$ADMIN_USER" =~ ^[a-z_][a-z0-9_-]*$ && "$ADMIN_USER" != root ]] || die "Choose a valid non-root admin username."
 }
 
 # ==============================================================================
@@ -430,15 +490,8 @@ mode_harden() {
         echo "  you can lock yourself out."
         echo
         if [[ "$has_keys" == "yes" ]] && yesno "  Disable SSH password login now?" "n"; then
-            apply_sshd_dropin "yes" "yes"
-            # Validate config before restarting to avoid lockout
-            if ! sshd -t 2>/dev/null; then
-                warn "SSH configuration test failed. Reverting changes..."
-                rm -f /etc/ssh/sshd_config.d/99-hardening.conf
-                die "SSH config invalid. Check /etc/ssh/sshd_config for errors."
-            fi
-            systemctl enable ssh >/dev/null 2>&1 || true
-            systemctl restart ssh >/dev/null 2>&1 || true
+            confirm_admin_access
+            apply_sshd_dropin "yes" "yes" || die "SSH settings were not changed. Check earlier directives or Match rules."
             success "Password login disabled (and root SSH login disabled)."
             echo
             echo "  ${YELLOW}NOTE:${NC} You can still log in as '$ADMIN_USER' using your SSH key."
@@ -452,14 +505,9 @@ mode_harden() {
         echo "  ${YELLOW}NOTE:${NC} If you disable root SSH login, you'll need to log in as"
         echo "        '$ADMIN_USER' and use 'sudo' for admin tasks."
         if yesno "  Ensure root SSH login is disabled (recommended)?" "y"; then
-            apply_sshd_dropin "no" "yes"
-            # Validate config before restarting
-            if ! sshd -t 2>/dev/null; then
-                warn "SSH configuration test failed. Reverting changes..."
-                rm -f /etc/ssh/sshd_config.d/99-hardening.conf
-                die "SSH config invalid. Check /etc/ssh/sshd_config for errors."
-            fi
-            systemctl restart ssh >/dev/null 2>&1 || true
+            confirm_admin_access
+            # Preserve password hardening instead of replacing it with root-only settings.
+            apply_sshd_dropin "yes" "yes" || die "SSH settings were not changed. Check earlier directives or Match rules."
             success "Root SSH login disabled."
         fi
     fi
@@ -477,9 +525,9 @@ mode_harden() {
         echo
         echo "  UFW firewall configured with secure defaults:"
         echo "    - Default: deny incoming, allow outgoing"
-        echo "    - SSH (port 22) allowed"
+        echo "    - Configured and active SSH ports allowed"
         if yesno "  Enable ufw firewall now?" "y"; then
-            ufw --force enable >/dev/null || true
+            ufw --force enable >/dev/null
             success "ufw enabled."
         else
             info "ufw configured but left disabled. Enable later with: sudo ufw enable"
@@ -518,9 +566,16 @@ mode_harden() {
 mode_install() {
     is_root || die "Run as root (in rescue/live environment)."
 
-    # Fail-fast: check all required commands before asking questions
+    # Install rescue dependencies BEFORE checking them or touching any disk.
+    need apt-get
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq debootstrap parted dosfstools e2fsprogs util-linux \
+                          grub-efi-amd64 efibootmgr xfsprogs ca-certificates
     need lsblk; need parted; need wipefs; need mkfs.ext4; need mkfs.fat
-    need mount; need umount; need apt-get; need debootstrap
+    need mount; need umount; need debootstrap
+    [[ -f /usr/share/debootstrap/scripts/resolute ]] || \
+        die "This rescue environment's debootstrap does not support Ubuntu 26.04 (resolute). Use a current Ubuntu rescue image or the provider's Ubuntu installer. No disks have been changed."
 
     # Check boot mode
     if ! in_uefi; then
@@ -615,6 +670,7 @@ mode_install() {
     echo
     read -r -p "  Hostname for this server [e.g. mithril-node]: " HOSTNAME
     HOSTNAME="${HOSTNAME:-mithril-node}"
+    [[ "$HOSTNAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || die "Invalid hostname."
 
     echo
     echo "  SSH key for '$ADMIN_USER':"
@@ -805,12 +861,6 @@ mode_install() {
         CONFIRM_TEXT="INSTALL ERASE $OS_DISK ($OS_DISK_SERIAL)"
     confirm_phrase "$CONFIRM_TEXT"
 
-    # Install prerequisites in rescue
-    info "Installing prerequisites in rescue environment..."
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    apt-get install -y -qq debootstrap grub-efi-amd64 efibootmgr xfsprogs
-
     # Partition OS disk
     info "Partitioning OS disk..."
     wipefs -a "$OS_DISK"
@@ -853,21 +903,8 @@ mode_install() {
         mount "$OSDATA_PART" "/mnt$OSDATA_MP"
     fi
 
-    # Ensure debootstrap has Ubuntu 24.04 (noble) script
-    # Debian's debootstrap may not include Ubuntu scripts
-    if [[ ! -f /usr/share/debootstrap/scripts/noble ]]; then
-        info "Downloading Ubuntu 24.04 debootstrap script..."
-        # Download from Ubuntu's debootstrap package
-        local DEBOOTSTRAP_URL="https://changelogs.ubuntu.com/changelogs/pool/main/d/debootstrap/debootstrap_1.0.137ubuntu2/debootstrap-1.0.137ubuntu2/scripts/noble"
-        if ! curl -fsSL "$DEBOOTSTRAP_URL" -o /usr/share/debootstrap/scripts/noble 2>/dev/null; then
-            # Fallback: noble is compatible with gutsy script (same as other Ubuntu releases)
-            warn "Could not download noble script, creating symlink from gutsy..."
-            ln -sf gutsy /usr/share/debootstrap/scripts/noble
-        fi
-    fi
-
-    info "Installing Ubuntu 24.04 (noble) via debootstrap..."
-    debootstrap --arch amd64 noble /mnt http://archive.ubuntu.com/ubuntu/
+    info "Installing Ubuntu 26.04 (resolute) via debootstrap..."
+    debootstrap --arch amd64 --include=ca-certificates resolute /mnt https://archive.ubuntu.com/ubuntu/
 
     mount --bind /dev  /mnt/dev
     mount --bind /dev/pts /mnt/dev/pts
@@ -945,6 +982,10 @@ mode_install() {
         addresses: [${DNS_LIST}]"
     fi
 
+    # Pass the public key as data, including any shell metacharacters in its comment.
+    printf '%s\n' "$SSH_PUBKEY" > /mnt/tmp/mithril-admin.pub
+    chmod 0600 /mnt/tmp/mithril-admin.pub
+
     # Configure installed system
     info "Configuring installed Ubuntu system..."
     chroot /mnt /bin/bash -euxo pipefail <<CHROOT
@@ -953,15 +994,16 @@ export DEBIAN_FRONTEND=noninteractive
 # Add universe repository (needed for fail2ban and other packages)
 # debootstrap only sets up main by default
 cat > /etc/apt/sources.list <<'SOURCES'
-deb http://archive.ubuntu.com/ubuntu noble main restricted universe
-deb http://archive.ubuntu.com/ubuntu noble-updates main restricted universe
-deb http://archive.ubuntu.com/ubuntu noble-security main restricted universe
+deb https://archive.ubuntu.com/ubuntu resolute main restricted universe
+deb https://archive.ubuntu.com/ubuntu resolute-updates main restricted universe
+deb https://security.ubuntu.com/ubuntu resolute-security main restricted universe
 SOURCES
 
 apt-get update -qq
 apt-get install -y -qq linux-generic grub-efi-amd64 openssh-server sudo \
                    fail2ban ufw unattended-upgrades netplan.io xfsprogs \
-                   chrony git curl wget htop iotop nload vim nano tmux
+                   chrony git curl wget ca-certificates build-essential python3 \
+                   htop iotop nload vim nano tmux
 
 # Time synchronization (critical for blockchain nodes)
 systemctl enable chrony >/dev/null 2>&1 || true
@@ -996,27 +1038,38 @@ usermod -aG sudo "$ADMIN_USER" || true
 # Passwordless sudo (no password set, so sudo group alone won't work)
 echo "$ADMIN_USER ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$ADMIN_USER
 chmod 440 /etc/sudoers.d/$ADMIN_USER
+visudo -cf /etc/sudoers.d/$ADMIN_USER
 
 home="\$(getent passwd "$ADMIN_USER" | cut -d: -f6)"
 install -d -m 0700 -o "$ADMIN_USER" -g "$ADMIN_USER" "\$home/.ssh"
 touch "\$home/.ssh/authorized_keys"
 chown "$ADMIN_USER:$ADMIN_USER" "\$home/.ssh/authorized_keys"
 chmod 0600 "\$home/.ssh/authorized_keys"
-grep -qxF "$SSH_PUBKEY" "\$home/.ssh/authorized_keys" || echo "$SSH_PUBKEY" >> "\$home/.ssh/authorized_keys"
+pubkey="\$(cat /tmp/mithril-admin.pub)"
+grep -qxF "\$pubkey" "\$home/.ssh/authorized_keys" || printf '%s\n' "\$pubkey" >> "\$home/.ssh/authorized_keys"
+rm /tmp/mithril-admin.pub
 
 # Netplan (with MAC address matching for reliable interface naming)
 cat > /etc/netplan/01-netcfg.yaml <<'NETPLANEOF'
 $NETPLAN_CONFIG
 NETPLANEOF
+chmod 0600 /etc/netplan/01-netcfg.yaml
 
 # SSH hardening (safe - we just installed the key)
 install -d -m 0755 /etc/ssh/sshd_config.d
-cat > /etc/ssh/sshd_config.d/99-hardening.conf <<EOF
+cat > /etc/ssh/sshd_config.d/00-mithril-hardening.conf <<EOF
 # Managed by server-setup.sh
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 PermitRootLogin $ROOT_SSH_MODE
 EOF
+mkdir -p /run/sshd
+sshd -t
+ssh_effective="\$(sshd -T)"
+grep -qx 'passwordauthentication no' <<< "\$ssh_effective"
+grep -qx 'kbdinteractiveauthentication no' <<< "\$ssh_effective"
+# OpenSSH normalizes prohibit-password to the older without-password spelling.
+grep -qxE 'permitrootlogin $( [[ "$ROOT_SSH_MODE" == no ]] && echo no || echo '(prohibit-password|without-password)' )' <<< "\$ssh_effective"
 
 # fail2ban with systemd backend
 install -d -m 0755 /etc/fail2ban/jail.d
@@ -1089,7 +1142,7 @@ CHROOT2
     echo "  ┌─────────────────────────────────────────────────────────────────────────┐"
     echo "  │ CONFIGURATION SUMMARY                                                   │"
     echo "  ├─────────────────────────────────────────────────────────────────────────┤"
-    echo "  │ [✓] Ubuntu 24.04 LTS (noble) installed"
+    echo "  │ [✓] Ubuntu 26.04 LTS (resolute) installed"
     echo "  │ [✓] Hostname: $HOSTNAME"
     echo "  │ [✓] Admin user: $ADMIN_USER (with sudo access)"
     echo "  │ [✓] SSH key installed for $ADMIN_USER"
@@ -1161,7 +1214,7 @@ show_help() {
 server-setup.sh - Ubuntu server setup for Mithril
 
 Usage:
-  sudo ./server-setup.sh install   # Fresh Ubuntu 24.04 install (ERASES OS disk!)
+  sudo ./server-setup.sh install   # Fresh Ubuntu 26.04 install (ERASES OS disk!)
   sudo ./server-setup.sh harden    # Safe: user + SSH key + security packages
   ./server-setup.sh status         # Show current security status
 
@@ -1173,12 +1226,18 @@ For storage and performance tuning (run AFTER this script):
 EOF
 }
 
-MODE="${1:-}"
-case "$MODE" in
-    install) mode_install ;;
-    harden)  mode_harden ;;
-    status)  mode_status ;;
-    --help|-h|help) show_help; exit 0 ;;
-    "")      show_help; exit 2 ;;
-    *)       die "Unknown mode: $MODE (use install|harden|status)" ;;
-esac
+main() {
+    local mode="${1:-}"
+    case "$mode" in
+        install) mode_install ;;
+        harden)  mode_harden ;;
+        status)  mode_status ;;
+        --help|-h|help) show_help ;;
+        "")      show_help; return 2 ;;
+        *)       die "Unknown mode: $mode (use install|harden|status)" ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
