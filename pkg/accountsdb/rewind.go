@@ -153,6 +153,10 @@ func (db *AccountsDb) RewindToBatchBoundary(throughSlot uint64) (RewindResult, e
 		return res, fmt.Errorf("accountsdb: rewind: store has no fold meta (nothing folded)")
 	}
 	if meta.ThroughSlot == throughSlot {
+		finish := db.beginAccountChange()
+		success := false
+		defer func() { finish(nil, db.durableThrough.Load(), success, true) }() // Derived indexes must rebuild, including on partial failures.
+
 		// This also repairs the in-memory publication state after a prior
 		// WAL-less commit succeeded but its explicit Flush reported an error.
 		db.readCacheEpochMu.Lock()
@@ -176,6 +180,7 @@ func (db *AccountsDb) RewindToBatchBoundary(throughSlot uint64) (RewindResult, e
 		// crashed before moving the undone files aside — finalize any leftover
 		// parked manifests now so recovery stops reporting a rewind in progress.
 		db.finalizeParkedRewindLeftoversLocked(throughSlot)
+		success = true
 		return res, nil // already at the target boundary
 	}
 
@@ -228,6 +233,10 @@ func (db *AccountsDb) RewindToBatchBoundary(throughSlot uint64) (RewindResult, e
 			return res, fmt.Errorf("accountsdb: rewind: fold manifest seq %d missing — cannot unwind past it (horizon GC'd?)", seq)
 		}
 	}
+
+	finish := db.beginAccountChange()
+	success := false
+	defer func() { finish(nil, db.durableThrough.Load(), success, true) }() // Derived indexes must rebuild, including on partial failures.
 
 	// Step 1: park suffix manifests (ascending) so recovery treats the
 	// batches as undone even if we crash mid-rewind.
@@ -318,5 +327,6 @@ func (db *AccountsDb) RewindToBatchBoundary(throughSlot uint64) (RewindResult, e
 	res.NewThrough = target.manifest.ThroughSlot
 	res.ResumeCtx = target.manifest.ResumeCtx
 	mlog.Log.Warnf("accountsdb: REWOUND %d fold batch(es) (%d keys) — durable state restored to slot %d", res.UndoneBatches, res.UndoneKeys, res.NewThrough)
+	success = true
 	return res, nil
 }

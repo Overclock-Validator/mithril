@@ -3,11 +3,13 @@ package rpcserver
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"reflect"
 
 	"github.com/DataDog/zstd"
-	"github.com/Overclock-Validator/mithril/pkg/global"
+	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
+	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/safemath"
 	"github.com/filecoin-project/go-jsonrpc"
@@ -73,18 +75,31 @@ func (rpcServer *RpcServer) GetAccountInfo(ctx context.Context, p jsonrpc.RawPar
 		return GetAccountInfoResp{}, fmt.Errorf("invalid base58 encoding")
 	}
 
-	acct, err := rpcServer.acctsDb.GetAccount(0, pk)
-	if err != nil {
-		return GetAccountInfoResp{}, nil
-	}
-
 	conf, err := parseGetAccountInfoConfMap(params)
 	if err != nil {
 		return GetAccountInfoResp{}, err
 	}
+	rooted, acct, err := rpcServer.readRootedAccount(ctx, pk)
+	if err != nil && !errors.Is(err, accountsdb.ErrNoAccount) {
+		return GetAccountInfoResp{}, fmt.Errorf("read account at rooted slot %d: %w", rooted.Slot, err)
+	}
+	if conf.MinContextSlot > rooted.Slot {
+		return GetAccountInfoResp{}, &MinContextSlotNotReachedError{ContextSlot: rooted.Slot}
+	}
+	if errors.Is(err, accountsdb.ErrNoAccount) {
+		return GetAccountInfoResp{Context: GetAccountInfoRespContext{ApiVersion: "mithril 0.1", Slot: rooted.Slot}}, nil
+	}
 
 	var acctData interface{}
-	acctData, err = encodeAcctDataWithConfig(acct.Data, conf)
+	if conf.EncodingType != nil && *conf.EncodingType == GetAccountEncodingJson && conf.DataSlice != nil {
+		return GetAccountInfoResp{}, fmt.Errorf("cannot use jsonParsed with dataSlice")
+	}
+	if conf.EncodingType != nil && *conf.EncodingType == GetAccountEncodingJson && acct.Owner == addresses.VoteProgramAddr {
+		acctData, err = parsedVoteAccountData(acct.Data, pk)
+	}
+	if acctData == nil || err != nil {
+		acctData, err = encodeAcctDataWithConfig(acct.Data, conf)
+	}
 	if err != nil {
 		return GetAccountInfoResp{}, err
 	}
@@ -97,7 +112,7 @@ func (rpcServer *RpcServer) GetAccountInfo(ctx context.Context, p jsonrpc.RawPar
 		RentEpoch:  acct.RentEpoch,
 		Space:      uint64(len(acct.Data))}
 
-	return GetAccountInfoResp{Context: GetAccountInfoRespContext{ApiVersion: "mithril 0.1", Slot: global.Slot()}, Value: val}, nil
+	return GetAccountInfoResp{Context: GetAccountInfoRespContext{ApiVersion: "mithril 0.1", Slot: rooted.Slot}, Value: val}, nil
 }
 
 func parseGetAccountInfoConfMap(params []interface{}) (*GetAccountInfoConfig, error) {
@@ -117,10 +132,17 @@ func parseGetAccountInfoConfMap(params []interface{}) (*GetAccountInfoConfig, er
 	commitmentObj, ok := confMap["commitment"]
 	if ok {
 		commitmentStr, ok := commitmentObj.(string)
-		if !ok {
+		if !ok || (commitmentStr != "processed" && commitmentStr != "confirmed" && commitmentStr != "finalized") {
 			return nil, fmt.Errorf("invalid commitment")
 		}
 		conf.Commitment = commitmentStr
+	}
+
+	if minContextSlot, ok := confMap["minContextSlot"]; ok {
+		conf.MinContextSlot, err = rpcUint64(minContextSlot, "minContextSlot")
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// encoding type is optional. defaults to base58.
@@ -199,7 +221,7 @@ func parseGetAcctDataEncodingType(encodingStr string) (int, error) {
 		return GetAccountEncodingBase64Zstd, nil
 
 	case "jsonParsed":
-		return GetAccountEncodingBase64, nil
+		return GetAccountEncodingJson, nil
 
 	default:
 		return 0, fmt.Errorf("invalid data encoding %s", encodingStr)
