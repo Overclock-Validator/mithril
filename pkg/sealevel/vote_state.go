@@ -1924,3 +1924,20 @@ func (vs *VoteStateVersions) BlockRevenueCollector() solana.PublicKey {
 	}
 	return vs.NodePubkey()
 }
+
+// InflationRewardsCommissionBps preserves the full commission value when
+// capturing historical epoch stakes. Reward calculation applies the cap.
+func (vs *VoteStateVersions) InflationRewardsCommissionBps() uint16 {
+	switch vs.Type {
+	case VoteStateVersionV4:
+		return vs.V4.InflationRewardsCommissionBps
+	case VoteStateVersionCurrent:
+		return uint16(vs.Current.Commission) * 100
+	case VoteStateVersionV1_14_11:
+		return uint16(vs.V1_14_11.Commission) * 100
+	case VoteStateVersionV0_23_5:
+		return uint16(vs.V0_23_5.Commission) * 100
+	default:
+		panic("invalid vote state version")
+	}
+}
