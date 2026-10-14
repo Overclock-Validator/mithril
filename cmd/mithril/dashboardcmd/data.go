@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/config"
+	"github.com/Overclock-Validator/mithril/pkg/rpcclient"
 	"github.com/Overclock-Validator/mithril/pkg/tui"
 	"github.com/spf13/viper"
 )
@@ -358,7 +359,11 @@ func runDoctorChecks(configFile string, cfg *configData) []checkResult {
 
 	// RPC
 	if len(cfg.rpcEndpoints) > 0 {
-		results = append(results, checkResult{"RPC endpoint", "pass", cfg.rpcEndpoints[0]})
+		results = append(results, checkResult{
+			"RPC endpoint",
+			"pass",
+			rpcclient.SanitizeEndpointForDisplay(cfg.rpcEndpoints[0]),
+		})
 	} else {
 		results = append(results, checkResult{"RPC endpoint", "fail", "no RPC endpoints configured"})
 	}

@@ -191,14 +191,19 @@ func StartTurbinePrewarm(cfg TurbinePrewarmConfig) (*TurbinePrewarm, error) {
 		return nil, fmt.Errorf("prewarm receiver not ready within 15s")
 	}
 
-	go pw.drain(receiver)
+	metricsPublisher := &turbineReceiverMetricsPublisher{}
+	metricsPublisher.publish(receiver, true)
+	go pw.drain(receiver, metricsPublisher)
 	return pw, nil
 }
 
 // drain spools completed blocks (lowest slots win: they are the ones repair
 // cannot fetch cheaply later) and discards receiver errors quietly.
-func (pw *TurbinePrewarm) drain(receiver *turbine.UDPReceiver) {
+func (pw *TurbinePrewarm) drain(receiver *turbine.UDPReceiver, metricsPublisher *turbineReceiverMetricsPublisher) {
 	defer close(pw.done)
+	defer metricsPublisher.publish(receiver, false)
+	statsTicker := time.NewTicker(10 * time.Second)
+	defer statsTicker.Stop()
 	blocks := receiver.Blocks()
 	errs := receiver.Errors()
 	for {
@@ -213,6 +218,8 @@ func (pw *TurbinePrewarm) drain(receiver *turbine.UDPReceiver) {
 				errs = nil
 				continue
 			}
+		case <-statsTicker.C:
+			metricsPublisher.publish(receiver, true)
 		}
 	}
 }
