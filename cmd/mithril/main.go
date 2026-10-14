@@ -10,6 +10,7 @@ import (
 	"github.com/Overclock-Validator/mithril/cmd/mithril/alpenglowcmd"
 	"github.com/Overclock-Validator/mithril/cmd/mithril/configcmd"
 	"github.com/Overclock-Validator/mithril/cmd/mithril/dashboardcmd"
+	"github.com/Overclock-Validator/mithril/cmd/mithril/genesiscmd"
 	"github.com/Overclock-Validator/mithril/cmd/mithril/node"
 	"github.com/Overclock-Validator/mithril/cmd/mithril/setupcmd"
 	"github.com/Overclock-Validator/mithril/cmd/mithril/statecmd"
@@ -51,6 +52,7 @@ func init() {
 	cmd.PersistentFlags().StringVar(&config.ConfigFile, "config", "", "Path to TOML config file")
 
 	cmd.AddCommand(
+		genesiscmd.NewCommand(),
 		&node.Run,                  // Primary command for running Mithril
 		&alpenglowcmd.AlpenglowCmd, // Alpenglow diagnostics and tools
 		&configcmd.ConfigCmd,       // Config management (init, etc.)

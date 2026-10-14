@@ -30,5 +30,5 @@ func alpenglowClockFeatureActive(f *features.Features) bool {
 	if f == nil {
 		return false
 	}
-	return f.IsActive(features.Alpenglow) || f.IsActive(features.AlpenglowDevContext)
+	return f.IsActive(features.Alpenglow) || f.IsActive(features.AlpenglowDevContext) || f.IsActive(features.AlpenglowGenesisV1)
 }

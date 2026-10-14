@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/progress"
+	"github.com/Overclock-Validator/mithril/pkg/state"
 	"github.com/Overclock-Validator/mithril/pkg/statsd"
 	"github.com/Overclock-Validator/mithril/pkg/txstatus"
 	"github.com/cockroachdb/pebble"
@@ -42,6 +44,44 @@ var (
 // This prevents corruption from Ctrl+C or partial downloads.
 // Exported so it can be called early in startup before any failures.
 func CleanAccountsDbDir(accountsDbDir string) {
+	guard, err := prepareSnapshotStore(accountsDbDir)
+	if err != nil {
+		mlog.Log.Errorf("refusing AccountsDB cleanup: %v", err)
+		return
+	}
+	if err := guard.Close(); err != nil {
+		mlog.Log.Errorf("closing AccountsDB cleanup guard: %v", err)
+	}
+}
+
+// prepareSnapshotStore keeps cleanup and subsequent construction under one
+// ownership lease, transferred to the opened database on successful build.
+func prepareSnapshotStore(root string) (_ *accountsdb.AccountsDbStoreGuard, retErr error) {
+	if root == "" {
+		return nil, fmt.Errorf("empty AccountsDB path")
+	}
+	if err := os.MkdirAll(root, 0755); err != nil {
+		return nil, err
+	}
+	guard, err := accountsdb.AcquireExclusiveAccountsDbStore(root)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if retErr != nil {
+			retErr = errors.Join(retErr, guard.Close())
+		}
+	}()
+	if err := state.RejectGenesisLaunch(root); err != nil {
+		return nil, err
+	}
+	if err := cleanAccountsDbDir(root); err != nil {
+		return nil, err
+	}
+	return guard, nil
+}
+
+func cleanAccountsDbDir(accountsDbDir string) error {
 	// List of all files/directories that may be left from a previous incomplete run
 	artifacts := []string{
 		"accounts",
@@ -61,16 +101,19 @@ func CleanAccountsDbDir(accountsDbDir string) {
 	for _, artifact := range artifacts {
 		path := filepath.Join(accountsDbDir, artifact)
 		if err := os.RemoveAll(path); err != nil {
-			mlog.Log.Errorf("failed to remove %s: %v", path, err)
+			return fmt.Errorf("failed to remove %s: %w", path, err)
 		}
 	}
-	partials, _ := filepath.Glob(filepath.Join(accountsDbDir, ".snapshot-status-cache-*.partial"))
+	partials, err := filepath.Glob(filepath.Join(accountsDbDir, ".snapshot-status-cache-*.partial"))
+	if err != nil {
+		return err
+	}
 	for _, partial := range partials {
 		if err := os.Remove(partial); err != nil && !os.IsNotExist(err) {
-			mlog.Log.Errorf("failed to remove stale status-cache partial %s: %v", partial, err)
+			return fmt.Errorf("failed to remove stale status-cache partial %s: %w", partial, err)
 		}
 	}
-
+	return nil
 }
 
 // CleanSnapshotDownloadDir removes old snapshot files based on retention settings.
@@ -261,9 +304,12 @@ func BuildAccountsDbPaths(
 	incrementalSnapshotFile string,
 	accountsDbDir string,
 	dp *progress.DualProgress,
-) (*accountsdb.AccountsDb, *SnapshotManifest, error) {
-	// Clean any leftover artifacts from previous incomplete runs (e.g., Ctrl+C)
-	CleanAccountsDbDir(accountsDbDir)
+) (_ *accountsdb.AccountsDb, _ *SnapshotManifest, retErr error) {
+	guard, err := prepareSnapshotStore(accountsDbDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { retErr = errors.Join(retErr, guard.Close()) }()
 
 	mlog.Log.Infof("Parsing full snapshot manifest...")
 	manifest, err := UnmarshalManifestFromSnapshot(ctx, snapshotFile, accountsDbDir)
@@ -427,7 +473,7 @@ func BuildAccountsDbPaths(
 	}
 	bankhashDb.Close()
 
-	accountsDb, err := accountsdb.OpenDb(accountsDbDir)
+	accountsDb, err := accountsdb.OpenDbWithStoreGuard(accountsDbDir, guard)
 	if err != nil {
 		return nil, nil, err
 	}

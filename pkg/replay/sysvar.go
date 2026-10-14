@@ -6,6 +6,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/duration"
+	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/safemath"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
@@ -31,7 +32,28 @@ func updateClockSysvarForMode(clock *sealevel.SysvarClock, block *block.Block, e
 		return fmt.Errorf("unexpected epoch transition in Clock sysvar: clock epoch %d, block epoch %d at slot %d", epochOld, epochNew, block.Slot)
 	}
 
-	if alpenglowClock {
+	if alpenglowClock && block.Features != nil && !block.Features.IsActive(features.Alpenglow) && block.Features.IsActive(features.AlpenglowGenesisV1) {
+		// The pinned genesis-v1 revision still calls Bank::update_clock at
+		// child-bank creation, before applying its footer. Use this parent's
+		// vote timestamps/stakes, not a process-global cache from another bank.
+		var timestamps []*tsEntry
+		var hasStake bool
+		for key, ts := range block.VoteTimestamps {
+			if ts.Slot > block.Slot || block.Slot-ts.Slot > epochSchedule.SlotsPerEpoch {
+				continue
+			}
+			timestamps = append(timestamps, &tsEntry{pubkey: key, slot: ts.Slot, timestamp: ts.Timestamp})
+			hasStake = hasStake || block.EpochStakesPerVoteAcct[key] != 0
+		}
+		if hasStake {
+			estimate, err := calculateStakeWeightedTimestamp(timestamps, block.EpochStakesPerVoteAcct,
+				block.Slot, duration.NewDurationFromNanos(nsPerSlot), epochSchedule.FirstSlotInEpoch(clock.Epoch), clock.EpochStartTimestamp)
+			if err != nil {
+				return err
+			}
+			clock.UnixTimestamp = max(clock.UnixTimestamp, estimate)
+		}
+	} else if alpenglowClock {
 		// Alpenglow banks populate timestamp fields from the block footer after
 		// execution. At bank start, transactions only see updated slot/epoch
 		// fields while timestamp fields are preserved from the parent bank.
@@ -230,7 +252,7 @@ func finalizeBankSysvars(slotCtx *sealevel.SlotCtx) error {
 		recent.MustUnmarshalWithDecoder(bin.NewBinDecoder(recentAcct.Data))
 	}
 	slotCtx.LatestEvictedBlockhash = recent.PushLatest(slotCtx.Blockhash, slotCtx.FeeRateGovernor.LamportsPerSignature)
-	recentAcct.Data = recent.MustMarshal()
+	recentAcct.Data = paddedSysvarData(recent.MustMarshal(), len(recentAcct.Data))
 
 	historyAcct, err := slotCtx.GetAccount(sealevel.SysvarSlotHistoryAddr)
 	if err != nil {
@@ -299,4 +321,15 @@ func collectSysvarAcctsForAdh(slotCtx *sealevel.SlotCtx) []*accounts.Account {
 		sysvarAccts = append(sysvarAccts, acct)
 	}
 	return sysvarAccts
+}
+
+// Agave recreates sysvar accounts at their allocated size, zeroing unused
+// capacity. Keep that allocation while early banks have only a few entries.
+func paddedSysvarData(data []byte, allocated int) []byte {
+	if len(data) >= allocated {
+		return data
+	}
+	out := make([]byte, allocated)
+	copy(out, data)
+	return out
 }

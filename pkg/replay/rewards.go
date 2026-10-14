@@ -487,6 +487,13 @@ func beginPartitionedEpochRewardsDistribution(acctsDb *accountsdb.AccountsDb, sl
 	partitionedRewardsInfo.SpoolDir = streamResult.SpoolDir
 	partitionedRewardsInfo.SpoolSlot = streamResult.SpoolSlot
 	partitionedRewardsInfo.NumRewardPartitionsRemaining = streamResult.NumPartitions
+	// Pinned Agave's calculate_validator_rewards returns None when there are
+	// no points, and unwrap_or_default supplies a zero PointValue (including
+	// rewards). Later Alpenglow profiles retain a recorded inflation ceiling.
+	if genesisV1AlpenglowMetadata([]*features.Features{f}) && streamResult.TotalPoints.Eq(wide.Uint128{}) {
+		totalRewards = 0
+		partitionedRewardsInfo.TotalStakingRewards = 0
+	}
 
 	maybeDumpEpochCalculatedRewards(dbgOpts, epoch, slot, streamResult)
 	maybeDumpEpochVotingRewardDiff(dbgOpts, rpcc, block, epoch, slot, streamResult.ValidatorRewards)
@@ -584,4 +591,15 @@ func distributePartitionedEpochRewardsForSlot(acctsDb *accountsdb.AccountsDb, pa
 	}
 
 	return distributedAccts, parentDistributedAccts
+}
+
+// distributeEpochRewardsForBlock is shared by streamed replay and genesis replay.
+// Boundary writes and the current reward partition form one bank delta.
+func distributeEpochRewardsForBlock(db *accountsdb.AccountsDb, parent *sealevel.SlotCtx, runtime *ReplayCtx, info *rewards.PartitionedRewardDistributionInfo, b *block.Block) {
+	if info != nil && b.Slot >= info.FirstStakingRewardSlot && info.NumRewardPartitionsRemaining > 0 {
+		updated, before := distributePartitionedEpochRewardsForSlot(db, parent, b.EpochUpdatedAccts, runtime, info, b.Slot, b.BlockHeight)
+		b.EpochUpdatedAccts = append(b.EpochUpdatedAccts, updated...)
+		b.ParentEpochUpdatedAccts = append(b.ParentEpochUpdatedAccts, before...)
+	}
+	b.EpochUpdatedAccts, b.ParentEpochUpdatedAccts = coalesceEpochAccountUpdates(b.EpochUpdatedAccts, b.ParentEpochUpdatedAccts)
 }

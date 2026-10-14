@@ -14,7 +14,9 @@ type Genesis struct {
 	Builtins      []BuiltinProgram
 	RewardPools   []AccountEntry
 	TicksPerSlot  uint64
+	Unused        uint64
 	PohParams     runtime.PohParams
+	Unused2       uint64
 	Fees          runtime.FeeParams
 	Rent          runtime.RentParams
 	Inflation     runtime.InflationParams

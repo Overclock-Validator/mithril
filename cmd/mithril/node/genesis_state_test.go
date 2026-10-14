@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/state"
@@ -130,3 +131,28 @@ func TestLoadBootstrapStateKeepsMarkedCorruptionRebuildable(t *testing.T) {
 
 const testNodeGenesisHash = "87WDnn84R1RVXsaBC4JkugZtLaL2biu6e6kkwx6Z8ruJ"
 const testNodeOldGenesisHash = "HtRW7y9hJZaEBgH8cvUomQQjaXY5vM8J54nqbZJz7MjW"
+
+func TestGenesisLaunchStopsBeforeStartupSideEffects(t *testing.T) {
+	root := t.TempDir()
+	marker := filepath.Join(root, state.GenesisInitializingFileName)
+	if err := os.WriteFile(marker, []byte("interrupted genesis"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Exercise the actual flag/config preflight, including --bootstrap=new-snapshot.
+	originalPath := accountsPath
+	defer func() { accountsPath = originalPath }()
+	flag := Run.Flags().Lookup("accounts-path")
+	oldValue, oldChanged := flag.Value.String(), flag.Changed
+	defer func() { _ = flag.Value.Set(oldValue); flag.Changed = oldChanged }()
+	if err := Run.Flags().Set("accounts-path", root); err != nil {
+		t.Fatal(err)
+	}
+	err := initConfigAndBindFlags(&Run)
+	if err == nil || !strings.Contains(err.Error(), "genesis-origin") {
+		t.Fatalf("expected genesis refusal, got %v", err)
+	}
+	got, err := os.ReadFile(marker)
+	if err != nil || string(got) != "interrupted genesis" {
+		t.Fatalf("startup modified genesis: %s, %v", got, err)
+	}
+}

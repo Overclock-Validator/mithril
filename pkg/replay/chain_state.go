@@ -192,7 +192,7 @@ func UpdateChainTipFromSlotCtxWithBankMetadata(slotCtx *sealevel.SlotCtx, f *fea
 		chainTipLastBlockhash = solana.Hash(slotCtx.Blockhash)
 	}
 	if slotCtx.Accounts != nil {
-		if nanoClock, err := slotCtx.GetAccount(NanosecondClockAccountAddr()); err == nil && nanoClock != nil && nanoClock.Lamports > 0 {
+		if nanoClock, err := slotCtx.GetAccount(NanosecondClockAccountAddr(slotCtx.Features)); err == nil && nanoClock != nil && nanoClock.Lamports > 0 {
 			chainTipNanosecondClockAccount = nanoClock.Clone()
 			chainTipHasNanosecondClockAccount = true
 		}

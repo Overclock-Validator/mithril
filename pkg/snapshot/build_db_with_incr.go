@@ -3,6 +3,7 @@ package snapshot
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -45,9 +46,12 @@ func BuildAccountsDbAuto(
 	blockDir string,
 	snapCfg snapshotdl.SnapshotConfig,
 	dp *progress.DualProgress,
-) (*accountsdb.AccountsDb, *SnapshotManifest, error) {
-	// Clean any leftover artifacts from previous incomplete runs (e.g., Ctrl+C)
-	CleanAccountsDbDir(accountsDbDir)
+) (_ *accountsdb.AccountsDb, _ *SnapshotManifest, retErr error) {
+	guard, err := prepareSnapshotStore(accountsDbDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { retErr = errors.Join(retErr, guard.Close()) }()
 
 	mlog.Log.Infof("Parsing full snapshot manifest...")
 	manifest, err := UnmarshalManifestFromSnapshot(ctx, fullSnapshotFile, accountsDbDir)
@@ -298,7 +302,7 @@ func BuildAccountsDbAuto(
 	}
 	bankhashDb.Close()
 
-	accountsDb, err := accountsdb.OpenDb(accountsDbDir)
+	accountsDb, err := accountsdb.OpenDbWithStoreGuard(accountsDbDir, guard)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -11,6 +11,7 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/cockroachdb/pebble v1.1.5
+	github.com/dsnet/compress v0.0.1
 	github.com/gagliardetto/binary v0.8.0
 	github.com/gagliardetto/solana-go v1.23.0
 	github.com/google/flatbuffers v25.12.19+incompatible
@@ -18,6 +19,7 @@ require (
 	github.com/minio/sha256-simd v1.0.1
 	github.com/mr-tron/base58 v1.2.0
 	github.com/nixberg/chacha-rng-go v0.1.0
+	github.com/pelletier/go-toml/v2 v2.2.4
 	github.com/prometheus/client_golang v1.20.4
 	github.com/quic-go/quic-go v0.59.1
 	github.com/spf13/cobra v1.9.1
@@ -87,7 +89,6 @@ require (
 	github.com/ipfs/go-log/v2 v2.5.1 // indirect
 	github.com/mimoo/StrobeGo v0.0.0-20181016162300-f8f6d4d2b643 // indirect
 	github.com/mmcloughlin/addchain v0.4.0 // indirect
-	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
 	github.com/prometheus/client_model v0.6.2 // Indirect dependency
 	github.com/rpcpool/yellowstone-grpc/examples/golang v0.0.0-20250409203454-bb3a44a2f723
 	github.com/sagikazarmark/locafero v0.11.0 // indirect
