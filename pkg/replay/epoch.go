@@ -396,6 +396,7 @@ func updateEpochStakesAndRefreshVoteCache(leaderScheduleEpoch uint64, b *block.B
 	if rebuildErr != nil {
 		mlog.Log.Errorf("failed to rebuild vote cache at epoch boundary: %v", rebuildErr)
 	}
+	vatActive := f != nil && f.IsActive(features.ValidatorAdmissionTicket)
 
 	// An older checkpoint can have cached this boundary's stakes without its
 	// commission fields. Recompute that new generation from the same durable
@@ -405,6 +406,17 @@ func updateEpochStakesAndRefreshVoteCache(leaderScheduleEpoch uint64, b *block.B
 		if vote == nil || vote.InflationRewardsCommissionBps == nil {
 			commissionsComplete = false
 			break
+		}
+	}
+	// Before VAT, zero-effective-stake voters still supply historical
+	// commissions. A previous attempt may have persisted only effective voters;
+	// this boundary's generation can be rebuilt from the same durable parent.
+	if hasEpochStakes && commissionsComplete && !vatActive {
+		for votePk := range voteMetadata {
+			if _, exists := cachedEpochStakes.VoteAccounts[votePk]; !exists {
+				commissionsComplete = false
+				break
+			}
 		}
 	}
 	if hasEpochStakes && commissionsComplete {
@@ -423,7 +435,7 @@ func updateEpochStakesAndRefreshVoteCache(leaderScheduleEpoch uint64, b *block.B
 	voteCache := global.VoteCache()
 	effectiveStakes := scanResult.EffectiveStakes
 	totalEffectiveStake := scanResult.TotalEffectiveStake
-	if f != nil && f.IsActive(features.ValidatorAdmissionTicket) {
+	if vatActive {
 		minimumBalance, err := minimumVoteAccountBalanceForVAT(f, epochSchedule, slot)
 		if err != nil {
 			panic(err)
@@ -432,11 +444,16 @@ func updateEpochStakesAndRefreshVoteCache(leaderScheduleEpoch uint64, b *block.B
 		mlog.Log.FileOnlyf("VAT epoch stakes: admitted=%d/%d minimum_vote_balance=%d", len(effectiveStakes), len(scanResult.EffectiveStakes), minimumBalance)
 	}
 	epochStakes := make(map[solana.PublicKey]uint64, len(effectiveStakes))
-	epochVoteAccounts := make(map[solana.PublicKey]*epochstakes.VoteAccount, len(effectiveStakes))
-	for votePk, stake := range effectiveStakes {
+	epochVoteAccounts := make(map[solana.PublicKey]*epochstakes.VoteAccount, len(voteMetadata))
+	// Agave v4.4.0-beta.0 runtime/src/stakes.rs:890-900 retains vote-account
+	// metadata when effective stake becomes zero. Only VAT filters those voters
+	// (vote/src/vote_account.rs:220-234). Preserve the pre-VAT commission history
+	// separately from positive execution/leader weights: when rewarding E, key E
+	// holds the rate from the start of E-1, even if stake was inactive then.
+	for votePk, meta := range voteMetadata {
+		stake, hasEffectiveStake := effectiveStakes[votePk]
 		voteAcct, exists := voteCache[votePk]
-		meta, hasMeta := voteMetadata[votePk]
-		if exists && hasMeta {
+		if exists && (!vatActive || hasEffectiveStake) {
 			lastTimestamp := voteAcct.LastTimestamp()
 			var lastTimestampTs int64
 			var lastTimestampSlot uint64
@@ -448,7 +465,9 @@ func updateEpochStakesAndRefreshVoteCache(leaderScheduleEpoch uint64, b *block.B
 			if meta.Executable {
 				executable = 1
 			}
-			epochStakes[votePk] = stake
+			if hasEffectiveStake {
+				epochStakes[votePk] = stake
+			}
 			collector := voteAcct.BlockRevenueCollector()
 			commission := voteAcct.InflationRewardsCommissionBps()
 			epochVoteAccounts[votePk] = &epochstakes.VoteAccount{
