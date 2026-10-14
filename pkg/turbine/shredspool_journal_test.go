@@ -138,6 +138,74 @@ func TestShredSpoolInvalidationWaitsBeforeReplacement(t *testing.T) {
 	}
 }
 
+func TestShredSpoolRepairReadFencesCompletionBeforeTruncating(t *testing.T) {
+	dir := t.TempDir()
+	shred := generatedAlpenglowDataShreds(t)[0]
+	s, err := OpenShredSpool(dir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.AppendShred(shred, shred.Payload) {
+		t.Fatal("append shred")
+	}
+	s.Close()
+	path := s.pathFor(shred.Slot)
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write([]byte("torn")); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err = OpenShredSpool(dir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := gateSpoolJournal(t, s)
+	var release sync.Once
+	t.Cleanup(func() { release.Do(func() { close(gate.release) }); s.Close() })
+	s.MarkComplete(shred.Slot, shred.Index, 1)
+	waitSpoolTest(t, gate.started)
+	done := make(chan struct{})
+	var packet []byte
+	var ok bool
+	go func() { packet, ok, err = s.GetDataShred(shred.Slot, uint64(shred.Index)); close(done) }()
+	select {
+	case <-done:
+		t.Fatal("repair read passed an undrained invalidation")
+	case <-time.After(20 * time.Millisecond):
+	}
+	data, readErr := os.ReadFile(path)
+	if readErr != nil || !bytes.Equal(data, before) {
+		t.Fatalf("file mutated before invalidation: %v", readErr)
+	}
+	release.Do(func() { close(gate.release) })
+	waitSpoolTest(t, done)
+	if err != nil || !ok || !bytes.Equal(packet, shred.Payload) {
+		t.Fatalf("repair read: ok=%v err=%v", ok, err)
+	}
+	s.Close()
+	reopened, err := OpenShredSpool(dir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if _, ok := reopened.IsComplete(shred.Slot); ok {
+		t.Fatal("queued completion resurrected after repair truncated a torn tail")
+	}
+	data, err = os.ReadFile(path)
+	if err != nil || !bytes.Equal(data, before[:len(before)-4]) {
+		t.Fatalf("tail was not repaired: %v", err)
+	}
+}
+
 type faultySpoolJournal struct {
 	*os.File
 	failTruncate bool // only changed while worker is fenced by invalidate's reply
