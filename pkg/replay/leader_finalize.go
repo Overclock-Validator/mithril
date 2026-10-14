@@ -142,6 +142,9 @@ func CommitLeaderSlot(in CommitLeaderInput) (*sealevel.SlotCtx, error) {
 	if err := distributeBlockTxFees(slotCtx, block, &in.TxFeeAccumulator); err != nil {
 		return nil, err
 	}
+	if err := recordBlockFeeReward(block, slotCtx, &in.TxFeeAccumulator); err != nil {
+		return nil, err
+	}
 	var rentSysvar *sealevel.SysvarRent
 	if bankSysvars := slotCtx.BankSysvars(); bankSysvars != nil {
 		if bankRent, ok := bankSysvars.Rent(); ok {

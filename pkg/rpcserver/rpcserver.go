@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
+	b "github.com/Overclock-Validator/mithril/pkg/block"
+	"github.com/Overclock-Validator/mithril/pkg/blockhistory"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/filecoin-project/go-jsonrpc"
@@ -21,7 +23,30 @@ import (
 	"github.com/gagliardetto/solana-go"
 )
 
+// rpcHandler exposes only public RPC methods to go-jsonrpc's reflection-based
+// registration. Internal setters and lifecycle hooks remain Go-only.
+type rpcHandler struct {
+	rpcMethods
+}
+
+type rpcMethods interface {
+	GetAccountInfo(context.Context, jsonrpc.RawParams) (GetAccountInfoResp, error)
+	GetBankHash(context.Context, jsonrpc.RawParams) (string, error)
+	GetBlock(context.Context, jsonrpc.RawParams) (GetBlockResp, error)
+	GetBlockHeight(context.Context, jsonrpc.RawParams) (uint64, error)
+	GetEpochInfo(context.Context, jsonrpc.RawParams) (GetEpochInfoResp, error)
+	GetFirstAvailableBlock(context.Context, jsonrpc.RawParams) (uint64, error)
+	GetGenesisHash(context.Context, jsonrpc.RawParams) (string, error)
+	GetLatestBlockhash(context.Context, jsonrpc.RawParams) (GetLatestBlockhashResp, error)
+	MinimumLedgerSlot(context.Context, jsonrpc.RawParams) (uint64, error)
+	SendTransaction(context.Context, jsonrpc.RawParams) (string, error)
+	SimulateTransaction(context.Context, jsonrpc.RawParams) (SimulateTransactionResp, error)
+}
+
 type RpcServer struct {
+	historyRecoveryMu      sync.RWMutex
+	historyRecoveryPending bool
+
 	isReady       bool
 	rpcService    *jsonrpc.RPCServer
 	serv          *httptest.Server
@@ -31,6 +56,7 @@ type RpcServer struct {
 	slotCtx       *sealevel.SlotCtx
 	slotCtxMu     sync.RWMutex
 	genesisHash   string
+	blockHistory  *blockhistory.Store
 
 	leaderTPUCacheMu         sync.RWMutex
 	leaderTPUByIdentity      map[solana.PublicKey]tpuEndpoint
@@ -48,14 +74,82 @@ type RpcServer struct {
 const maxQuietMethodProbeBody = 64 << 10
 
 var supportedRPCMethods = map[string]struct{}{
-	"getAccountInfo":      {},
-	"getBankHash":         {},
-	"getBlockHeight":      {},
-	"getEpochInfo":        {},
-	"getGenesisHash":      {},
-	"getLatestBlockhash":  {},
-	"sendTransaction":     {},
-	"simulateTransaction": {},
+	"getAccountInfo":         {},
+	"getBankHash":            {},
+	"getBlock":               {},
+	"getBlockHeight":         {},
+	"getEpochInfo":           {},
+	"getFirstAvailableBlock": {},
+	"getGenesisHash":         {},
+	"getLatestBlockhash":     {},
+	"minimumLedgerSlot":      {},
+	"sendTransaction":        {},
+	"simulateTransaction":    {},
+}
+
+func (rpcServer *RpcServer) EnableBlockHistory(dir string, retentionSlots, rootedSlot uint64) error {
+	store, err := blockhistory.Open(dir, retentionSlots)
+	if err != nil {
+		return err
+	}
+	if err := store.SetRooted(rootedSlot); err != nil {
+		return err
+	}
+	rpcServer.blockHistory = store
+	return nil
+}
+
+func (rpcServer *RpcServer) RecordBlockHistory(block *b.Block) error {
+	if rpcServer == nil || rpcServer.blockHistory == nil {
+		return nil
+	}
+	return rpcServer.blockHistory.RecordBlock(block)
+}
+
+func (rpcServer *RpcServer) RecordSkippedBlockHistory(slot uint64) error {
+	if rpcServer == nil || rpcServer.blockHistory == nil {
+		return nil
+	}
+	return rpcServer.blockHistory.RecordSkipped(slot)
+}
+
+func (rpcServer *RpcServer) PrepareBlockHistory(through uint64) error {
+	if rpcServer == nil || rpcServer.blockHistory == nil {
+		return nil
+	}
+	return rpcServer.blockHistory.Prepare(through)
+}
+
+func (rpcServer *RpcServer) SetRootedBlockHistorySlot(slot uint64) error {
+	if rpcServer == nil || rpcServer.blockHistory == nil {
+		return nil
+	}
+	return rpcServer.blockHistory.SetRooted(slot)
+}
+
+func (rpcServer *RpcServer) RewindBlockHistory(slot uint64) error {
+	if rpcServer == nil || rpcServer.blockHistory == nil {
+		return nil
+	}
+	return rpcServer.blockHistory.Rewind(slot)
+}
+
+func (rpcServer *RpcServer) DiscardUnrootedBlockHistory(from uint64) error {
+	if rpcServer == nil || rpcServer.blockHistory == nil {
+		return nil
+	}
+	return rpcServer.blockHistory.DiscardUnrootedFrom(from)
+}
+
+// SetHistoryRecoveryPending blocks history reads during a durable account rewind.
+// Failed recovery leaves the gate closed without deleting retained records.
+func (rpcServer *RpcServer) SetHistoryRecoveryPending(pending bool) {
+	if rpcServer == nil {
+		return
+	}
+	rpcServer.historyRecoveryMu.Lock()
+	defer rpcServer.historyRecoveryMu.Unlock()
+	rpcServer.historyRecoveryPending = pending
 }
 
 func NewRpcServer(acctsDb *accountsdb.AccountsDb, port uint16, epochSchedule *sealevel.SysvarEpochSchedule, genesisHash solana.Hash) *RpcServer {
@@ -77,7 +171,7 @@ func NewRpcServer(acctsDb *accountsdb.AccountsDb, port uint16, epochSchedule *se
 		jsonrpc.WithServerErrors(rpcErrors),
 	)
 
-	rpcServer.rpcService.Register("MithrilRpc", rpcServer)
+	rpcServer.rpcService.Register("MithrilRpc", rpcHandler{rpcServer})
 	rpcServer.acctsDb = acctsDb
 	if epochSchedule != nil {
 		rpcServer.epochSchedule = epochSchedule
