@@ -88,7 +88,11 @@ func TestValidateAlpenglowStartupStateWithAccountsDB(t *testing.T) {
 	db, err := accountsdb.OpenDb(dir)
 	require.NoError(t, err)
 	db.InitCaches()
-	t.Cleanup(db.CloseDb)
+	t.Cleanup(func() {
+		if err := db.CloseDb(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	})
 
 	stored := make(chan struct{})
 	startupAccounts := validAlpenglowStartupAccounts(t, 486_000)

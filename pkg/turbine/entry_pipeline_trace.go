@@ -329,5 +329,5 @@ func traceRepairResponse(rec outstandingRepairRequest, sh *Shred, peer string, l
 	if !entryTraceSelected(sh.Slot) {
 		return
 	}
-	emitRepairTrace(entryRepairTrace{Event: "repair_response", Origin: entryTraceOrigin.UnixNano(), Slot: sh.Slot, Index: rec.key.index, Highest: rec.key.kind == repairRequestHighestWindowIndex, Attempt: rec.key.attempt, Nonce: rec.nonce, Peer: peer, RequestedAt: entryTraceTime(rec.sentAt), ResponseAt: entryTraceNow(), ReturnedIndex: sh.Index, FEC: sh.FECSetIndex, Late: late})
+	emitRepairTrace(entryRepairTrace{Event: "repair_response", Origin: entryTraceOrigin.UnixNano(), Slot: sh.Slot, Index: rec.key.index, Highest: rec.key.kind == repairRequestHighestWindowIndex, Attempt: uint8(rec.key.attempt), Nonce: rec.nonce, Peer: peer, RequestedAt: entryTraceTime(rec.sentAt), ResponseAt: entryTraceNow(), ReturnedIndex: sh.Index, FEC: sh.FECSetIndex, Late: late})
 }

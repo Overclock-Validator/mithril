@@ -166,7 +166,11 @@ func TestStageEpochInflationAccountRollsStateAndCapitalization(t *testing.T) {
 	db, err := accountsdb.OpenDb(dir)
 	require.NoError(t, err)
 	db.InitCaches()
-	t.Cleanup(db.CloseDb)
+	t.Cleanup(func() {
+		if err := db.CloseDb(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	})
 
 	previousRent := sealevel.SysvarCache.Rent.Sysvar
 	rent := sealevel.NewDefaultRentSysvar()
