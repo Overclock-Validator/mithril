@@ -13,6 +13,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
+	"github.com/Overclock-Validator/mithril/pkg/epochstakes"
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
@@ -462,50 +463,42 @@ func minimumStakeDelegation(slotCtx *sealevel.SlotCtx) uint64 {
 	return 1
 }
 
-func selectCommissionVoteState(
-	votePubkey solana.PublicKey,
-	distributionVoteStates map[solana.PublicKey]*sealevel.VoteStateVersions,
-	rewardedEpochVoteStates map[solana.PublicKey]*sealevel.VoteStateVersions,
-	snapshotEpochVoteStates map[solana.PublicKey]*sealevel.VoteStateVersions,
-) *sealevel.VoteStateVersions {
-	if snapshotEpochVoteStates != nil {
-		if voteState := snapshotEpochVoteStates[votePubkey]; voteState != nil {
-			return voteState
-		}
-	}
-
-	if rewardedEpochVoteStates != nil {
-		if voteState := rewardedEpochVoteStates[votePubkey]; voteState != nil {
-			return voteState
-		}
-	}
-
-	return distributionVoteStates[votePubkey]
-}
-
 func buildDelayedCommissionVoteStateCache(
 	distributionVoteStates map[solana.PublicKey]*sealevel.VoteStateVersions,
 	rewardedEpoch uint64,
-) map[solana.PublicKey]*sealevel.VoteStateVersions {
+) (map[solana.PublicKey]*sealevel.VoteStateVersions, error) {
 	if len(distributionVoteStates) == 0 {
-		return nil
+		return nil, nil
 	}
 
-	rewardedEpochVoteStates := global.EpochVoteStateSnapshot(rewardedEpoch)
-	var snapshotEpochVoteStates map[solana.PublicKey]*sealevel.VoteStateVersions
-	if rewardedEpoch > 0 {
-		snapshotEpochVoteStates = global.EpochVoteStateSnapshot(rewardedEpoch - 1)
-	}
-
+	// Agave v4.4.0-beta.0 bank.rs:1826-1846 and
+	// partitioned_epoch_rewards/calculation.rs:737-754 use epoch-stakes keys
+	// E then E+1 when rewarding E. These capture commissions at the starts of
+	// E-1 and E respectively. The persisted snapshots also survive restarts.
+	older, _ := global.EpochStakesSnapshot(rewardedEpoch)
+	newer, _ := global.EpochStakesSnapshot(rewardedEpoch + 1)
 	commissionVoteStates := make(map[solana.PublicKey]*sealevel.VoteStateVersions, len(distributionVoteStates))
-	for votePubkey := range distributionVoteStates {
-		voteState := selectCommissionVoteState(votePubkey, distributionVoteStates, rewardedEpochVoteStates, snapshotEpochVoteStates)
-		if voteState != nil {
-			commissionVoteStates[votePubkey] = voteState
+	for votePubkey, current := range distributionVoteStates {
+		commissionVoteStates[votePubkey] = current
+		for _, snapshot := range []epochstakes.Snapshot{older, newer} {
+			historical, exists := snapshot.VoteAccounts[votePubkey]
+			if !exists {
+				continue
+			}
+			// A missing field in an old checkpoint is not an absent vote
+			// account. Falling back here silently applies a newer commission.
+			if historical == nil || historical.InflationRewardsCommissionBps == nil {
+				return nil, fmt.Errorf("missing historical inflation commission for vote account %s in epoch stakes %d; restore this generation from retained snapshot metadata", votePubkey, snapshot.Epoch)
+			}
+			commissionVoteStates[votePubkey] = &sealevel.VoteStateVersions{
+				Type: sealevel.VoteStateVersionV4,
+				V4:   sealevel.VoteState4{InflationRewardsCommissionBps: *historical.InflationRewardsCommissionBps},
+			}
+			break
 		}
 	}
 
-	return commissionVoteStates
+	return commissionVoteStates, nil
 }
 
 func CalculateRewardPartitionForPubkey(pubkey solana.PublicKey, blockhash [32]byte, numPartitions uint64) uint64 {
@@ -995,7 +988,11 @@ func CalculateRewardsStreaming(
 	pv := PointValue{Rewards: pointValue.Rewards, Points: totalPoints}
 	var commissionVoteStates map[solana.PublicKey]*sealevel.VoteStateVersions
 	if f.IsActive(features.DelayCommissionUpdates) {
-		commissionVoteStates = buildDelayedCommissionVoteStateCache(voteCache, rewardedEpoch)
+		commissionVoteStates, err = buildDelayedCommissionVoteStateCache(voteCache, rewardedEpoch)
+		if err != nil {
+			CleanupPointsSpoolFile(pointsPath)
+			return nil, err
+		}
 	}
 	var voteCommissions map[solana.PublicKey]uint8
 	if !f.IsActive(features.CustomCommissionCollector) && !f.IsActive(features.CommissionRateInBasisPoints) {

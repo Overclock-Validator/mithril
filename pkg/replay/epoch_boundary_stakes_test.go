@@ -11,6 +11,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/block"
+	"github.com/Overclock-Validator/mithril/pkg/epochstakes"
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
@@ -151,4 +152,41 @@ func epochBoundaryStakeDB(t *testing.T, slot uint64, delegations []sealevel.Dele
 		global.ClearPendingStakePubkeys()
 	})
 	return db
+}
+
+func TestEpochBoundaryRestoresCommissionInPreviouslyAttemptedGeneration(t *testing.T) {
+	const newEpoch = uint64(91040)
+	const slot = newEpoch * 54000
+	key := solana.PublicKey{40}
+	db := epochBoundaryStakeDB(t, slot-1, []sealevel.Delegation{{VoterPubkey: key, StakeLamports: 1000, ActivationEpoch: math.MaxUint64, DeactivationEpoch: math.MaxUint64}})
+	vote, err := db.GetAccount(slot-1, key)
+	require.NoError(t, err)
+	vote = vote.Clone()
+	vs, err := sealevel.UnmarshalVersionedVoteState(vote.Data)
+	require.NoError(t, err)
+	vs.V4.InflationRewardsCommissionBps = 1234
+	vote.Data, err = sealevel.MarshalVersionedVoteState(vs)
+	require.NoError(t, err)
+	done := make(chan struct{})
+	require.NoError(t, db.StoreAccounts([]*accounts.Account{vote}, slot-1, func() { close(done) }))
+	<-done
+	schedule := &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 54000, LeaderScheduleSlotOffset: 54000}
+	cacheEpoch := schedule.LeaderScheduleEpoch(slot)
+	t.Cleanup(func() { global.ClearEpochStakes(cacheEpoch) })
+	// A failed attempt on the older binary persisted stake weights but omitted
+	// commissions. This new generation is reproducible from the durable parent.
+	global.PutEpochStakes(cacheEpoch, map[solana.PublicKey]uint64{key: 1000}, map[solana.PublicKey]*epochstakes.VoteAccount{key: {NodePubkey: key}}, 1000)
+	old, _ := global.EpochStakesSnapshot(cacheEpoch)
+	scan := &BoundaryStakeScanResult{VoteAcctStakes: map[solana.PublicKey]uint64{key: 1000}, EffectiveStakes: map[solana.PublicKey]uint64{key: 1000}, TotalEffectiveStake: 1000}
+	b := &block.Block{Slot: slot}
+	updateEpochStakesAndRefreshVoteCache(cacheEpoch, b, db, slot-1, scan, features.NewFeaturesDefault(), schedule)
+	got, _ := global.EpochStakesSnapshot(cacheEpoch)
+	require.Greater(t, got.Generation, old.Generation)
+	require.Equal(t, uint16(1234), *got.VoteAccounts[key].InflationRewardsCommissionBps)
+	require.Equal(t, old.Stakes, got.Stakes)
+	require.Equal(t, got.Stakes, b.EpochStakesPerVoteAcct)
+	// Once complete, this generation must stay immutable on another attempt.
+	updateEpochStakesAndRefreshVoteCache(cacheEpoch, b, db, slot-1, scan, features.NewFeaturesDefault(), schedule)
+	again, _ := global.EpochStakesSnapshot(cacheEpoch)
+	require.Equal(t, got.Generation, again.Generation)
 }

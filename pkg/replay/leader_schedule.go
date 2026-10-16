@@ -1126,9 +1126,11 @@ func buildLocalLeaderScheduleFromVoteCache(
 		}
 
 		// Create a VoteAccount with the NodePubkey
+		collector := vs.BlockRevenueCollector()
 		va := &epochstakes.VoteAccount{
-			NodePubkey:          nodePk,
-			BlsPubkeyCompressed: vs.BlsPubkeyCompressed(),
+			BlockRevenueCollector: &collector,
+			NodePubkey:            nodePk,
+			BlsPubkeyCompressed:   vs.BlsPubkeyCompressed(),
 		}
 		epochVoteAccts[votePk] = va
 		filteredStakes[votePk] = stake

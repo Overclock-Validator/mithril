@@ -1,0 +1,14 @@
+[package]
+name = "mithril-elgamal-fixtures"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+[dependencies]
+solana-zk-sdk = "=8.0.1"
+solana-zk-elgamal-proof-interface = "=1.0.0"
+bytemuck = "1.25"
+serde_json = "1.0"
+hex = "0.4"
+curve25519-dalek = "4.1.3"

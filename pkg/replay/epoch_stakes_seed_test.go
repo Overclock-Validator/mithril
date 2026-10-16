@@ -207,3 +207,37 @@ func persistedEpochStakeJSON(t *testing.T, epoch uint64) string {
 	}
 	return string(data)
 }
+
+func TestResumeRestoresOnlyMissingHistoricalCommissions(t *testing.T) {
+	const epoch = uint64(91030)
+	key := solana.PublicKey{30}
+	encode := func(e uint64, stake uint64, commission *uint16) []byte {
+		cache := epochstakes.NewEpochStakesCache()
+		cache.PutEpoch(e, map[solana.PublicKey]uint64{key: stake}, map[solana.PublicKey]*epochstakes.VoteAccount{key: {Lamports: stake, InflationRewardsCommissionBps: commission}}, stake)
+		raw, err := cache.SerializeEpoch(e)
+		require.NoError(t, err)
+		return raw
+	}
+	resume := &ResumeState{ComputedEpochStakes: map[uint64][]byte{
+		epoch: encode(epoch, 42, nil), epoch + 1: encode(epoch+1, 43, new(uint16(0))), epoch + 2: encode(epoch+2, 44, nil),
+	}}
+	original := append([]byte(nil), resume.ComputedEpochStakes[epoch]...)
+	ms := &state.MithrilState{ManifestEpochStakes: map[uint64]string{
+		epoch: string(encode(epoch, 999, new(uint16(10000)))), epoch + 1: string(encode(epoch+1, 999, new(uint16(5000)))),
+	}}
+	for e := epoch; e <= epoch+2; e++ {
+		global.ClearEpochStakes(e)
+		t.Cleanup(func() { global.ClearEpochStakes(e) })
+	}
+	require.NoError(t, LoadInitialEpochStakesCache(ms, resume, epoch, epoch))
+	old, ok := global.EpochStakesSnapshot(epoch)
+	require.True(t, ok)
+	require.Equal(t, uint16(10000), *old.VoteAccounts[key].InflationRewardsCommissionBps)
+	require.Equal(t, uint64(42), old.Stakes[key])
+	require.Equal(t, uint64(42), old.VoteAccounts[key].Lamports)
+	next, _ := global.EpochStakesSnapshot(epoch + 1)
+	require.Zero(t, *next.VoteAccounts[key].InflationRewardsCommissionBps, "persisted zero is authoritative")
+	future, _ := global.EpochStakesSnapshot(epoch + 2)
+	require.Nil(t, future.VoteAccounts[key].InflationRewardsCommissionBps, "no cross-epoch backfill")
+	require.Equal(t, original, resume.ComputedEpochStakes[epoch], "upgrade must not mutate checkpoint input")
+}

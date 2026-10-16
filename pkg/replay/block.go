@@ -1228,6 +1228,14 @@ func configureInitialBlock(acctsDb *accountsdb.AccountsDb,
 	}
 	block.ParentBankhash = parentBankhash
 	block.ParentSlot = mithrilState.ManifestParentSlot
+	// The first bank inherits the snapshot's newest blockhash just like a
+	// child of an executed bank. Nonce instructions derive their next nonce
+	// from this field, independently of the global chain tip (Agave v4.4.0-beta.0
+	// programs/system/src/system_instruction.rs:46-47).
+	block.LastBlockhash, err = manifestLastBlockhash(mithrilState)
+	if err != nil {
+		return err
+	}
 
 	// LtHash: decode base64, restore with InitWithHash
 	if mithrilState.ManifestAcctsLtHash != "" {
@@ -1273,6 +1281,22 @@ func configureInitialBlock(acctsDb *accountsdb.AccountsDb,
 	setBlockHeight(block)
 
 	return nil
+}
+
+// PopulateManifestSeed stores the blockhash queue newest first. Both the
+// initial chain tip and the first execution context must use that same hash.
+func manifestLastBlockhash(s *state.MithrilState) (solana.Hash, error) {
+	if s == nil || len(s.ManifestRecentBlockhashes) == 0 {
+		return solana.Hash{}, fmt.Errorf("snapshot state is missing manifest_recent_blockhashes")
+	}
+	hash, err := solana.HashFromBase58(s.ManifestRecentBlockhashes[0].Blockhash)
+	if err != nil {
+		return solana.Hash{}, fmt.Errorf("invalid newest manifest blockhash at snapshot slot %d: %w", s.ManifestParentSlot, err)
+	}
+	if hash == (solana.Hash{}) {
+		return solana.Hash{}, fmt.Errorf("zero newest manifest blockhash at snapshot slot %d", s.ManifestParentSlot)
+	}
+	return hash, nil
 }
 
 // reconstructFeeRateGovernor creates a FeeRateGovernor from state file manifest_* fields
@@ -1585,9 +1609,13 @@ func LoadInitialEpochStakesCache(mithrilState *state.MithrilState, resumeState *
 			return fmt.Errorf("resume at epoch %d (snapshot epoch %d) but no persisted epoch stakes found - cannot use stale manifest stakes (need fresh snapshot)", startEpoch, snapshotEpoch)
 		}
 		if len(resumeState.ComputedEpochStakes) > 0 {
+			persisted, err := restorePersistedCommissionMetadata(mithrilState, resumeState.ComputedEpochStakes, startEpoch, snapshotEpoch)
+			if err != nil {
+				return err
+			}
 			// Once replay has crossed a boundary, only its persisted effective
 			// stakes are authoritative; never fall back to the snapshot manifest.
-			for epoch, data := range resumeState.ComputedEpochStakes {
+			for epoch, data := range persisted {
 				loadedEpoch, err := global.DeserializeAndLoadEpochStakes(data)
 				if err != nil {
 					return fmt.Errorf("failed to load persisted epoch %d stakes: %w", epoch, err)
@@ -1851,10 +1879,10 @@ func ReplayBlocks(
 			initialLtHash.InitWithHash(raw)
 		}
 		initialNumSignatures = mithrilState.ManifestSignatureCount
-		if len(mithrilState.ManifestRecentBlockhashes) > 0 {
-			if raw, decodeErr := base58.DecodeFromString(mithrilState.ManifestRecentBlockhashes[0].Blockhash); decodeErr == nil {
-				initialLastBlockhash = solana.Hash(raw)
-			}
+		initialLastBlockhash, err = manifestLastBlockhash(mithrilState)
+		if err != nil {
+			result.Error = err
+			return result
 		}
 	}
 	// Resume checkpoints persist the Alpenglow block ID and chained root, but

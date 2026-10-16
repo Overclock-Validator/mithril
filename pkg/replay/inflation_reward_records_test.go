@@ -12,6 +12,7 @@ import (
 	a "github.com/Overclock-Validator/mithril/pkg/addresses"
 	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/epochrewards"
+	"github.com/Overclock-Validator/mithril/pkg/epochstakes"
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/rewards"
@@ -201,9 +202,11 @@ func TestInflationRewardRecordsUseCalculationTimeCommission(t *testing.T) {
 			db.InitCaches()
 			t.Cleanup(db.CloseDb)
 			global.ClearPendingStakePubkeys()
-			global.ClearEpochVoteStateSnapshots()
 			t.Cleanup(global.ClearPendingStakePubkeys)
-			t.Cleanup(global.ClearEpochVoteStateSnapshots)
+			for _, epoch := range []uint64{70, 71} {
+				global.ClearEpochStakes(epoch)
+				t.Cleanup(func() { global.ClearEpochStakes(epoch) })
+			}
 
 			const slot = uint64(7_100)
 			vote, stake, collector := solana.PublicKey{81}, solana.PublicKey{82}, solana.PublicKey{83}
@@ -243,9 +246,8 @@ func TestInflationRewardRecordsUseCalculationTimeCommission(t *testing.T) {
 			}}
 			if tc.delayed {
 				f.EnableFeature(features.DelayCommissionUpdates, 0)
-				previous := *voteState
-				previous.V4.InflationRewardsCommissionBps = 700
-				global.PutEpochVoteStateSnapshot(69, map[solana.PublicKey]*sealevel.VoteStateVersions{vote: &previous})
+				global.PutEpochStakes(70, map[solana.PublicKey]uint64{vote: 100},
+					map[solana.PublicKey]*epochstakes.VoteAccount{vote: {InflationRewardsCommissionBps: new(uint16(700))}}, 100)
 			}
 			newRateEpoch := uint64(0)
 			pointValueRewards := uint64(1_000)
