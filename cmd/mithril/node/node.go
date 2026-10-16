@@ -1202,7 +1202,10 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		return fmt.Errorf("tuning.common_account_cache_max_mb must be > 0")
 	}
 
-	return nil
+	if err := configureMemoryBudgets(); err != nil {
+		return err
+	}
+	return configureDiskBudget()
 }
 
 // buildSnapshotConfig creates a snapshotdl.SnapshotConfig from the mithril config.
@@ -1365,6 +1368,12 @@ func runLive(c *cobra.Command, args []string) {
 		fmt.Fprintf(os.Stderr, "warning: failed to initialize file logging: %v\n", err)
 	}
 	defer mlog.Shutdown()
+	if nodeMemoryLimit > 0 {
+		debug.SetMemoryLimit(nodeMemoryLimit)
+	}
+	mlog.Log.Infof("Go runtime soft memory limit: %d MiB (tuning.memory_limit_mb overrides GOMEMLIMIT when set)", debug.SetMemoryLimit(-1)>>20)
+	stopMemoryDiagnostics := startMemoryDiagnostics(ctx, mlog.GetLogDir(), heapProfileThreshold)
+	defer stopMemoryDiagnostics()
 
 	// Kill any existing mithril processes to prevent zombie accumulation
 	if killed := killExistingMithrilProcesses(); killed > 0 {
@@ -2357,6 +2366,8 @@ postBootstrap:
 		RewindHorizonBatches: 64,
 		MaxMoveBytesPerCycle: 64 << 20,  // 64 MiB moved per cycle
 		MaxScanBytesPerCycle: 256 << 20, // 256 MiB scanned per cycle
+		MaxFilesPerCycle:     16,
+		MaxDuration:          time.Second,
 	}
 	if v := config.GetInt("storage.rewind_horizon_batches"); v > 0 {
 		compactCfg.RewindHorizonBatches = uint64(v)
@@ -2370,11 +2381,16 @@ postBootstrap:
 	if v := config.GetInt("storage.compact.max_scan_mb"); v > 0 {
 		compactCfg.MaxScanBytesPerCycle = int64(v) << 20
 	}
-	// Background compaction is OFF by default until soaked (it holds the store's
-	// fold lock during each cycle); operators opt in via storage.compact.enabled.
-	compactEnabled := false
+	accountsDb.MinFreeBytes = storageMinFreeBytes
+	// Rooted storage is append-only: reclamation must run during normal replay.
+	// Large segments reclaim dead payload pages without relocating undo records.
+	compactEnabled := alpenglowMode
 	if alpenglowMode && config.IsSet("storage.compact.enabled") {
 		compactEnabled = config.GetBool("storage.compact.enabled")
+	}
+	compactInterval := time.Second
+	if seconds := config.GetInt("storage.compact.interval_seconds"); seconds > 0 {
+		compactInterval = time.Duration(seconds) * time.Second
 	}
 
 	// Crash recovery reconcile: the durable fold frontier (recovered above from
@@ -2949,30 +2965,25 @@ postBootstrap:
 	// out-of-horizon segments and bootstrap appendvecs. Each cycle is bounded
 	// (move + scan budgets) and serialized against folds via the store's
 	// internal lock; the rewind horizon pins are what it must never touch.
+	stopCompactor := func() {}
 	if compactEnabled {
-		go func() {
-			ticker := time.NewTicker(10 * time.Minute)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					if _, cerr := accountsDb.CompactOnce(compactCfg); cerr != nil {
-						mlog.Log.Warnf("compaction cycle failed: %v", cerr)
-					}
-				}
-			}
-		}()
+		stopCompactor = startAccountsCompactor(ctx, accountsDb, compactCfg, compactInterval)
+		defer stopCompactor()
 	}
 
 	startSigverifyReporter(ctx)
+	mlog.Log.Infof("storage space guard enabled (reserve=%d MiB; checked before folds and every second)", storageMinFreeBytes>>20)
+	stopSpaceGuard := startStorageSpaceGuard(ctx, func() error {
+		return checkStorageSpace([]string{accountsPath, blockstorePath, mlog.GetLogDir()}, storageMinFreeBytes, accountsdb.AvailableDiskBytes)
+	}, cancelRun)
+	defer stopSpaceGuard()
 
 	turbineAlpenglowAddr := ""
 	if alpenglowMode {
 		turbineAlpenglowAddr = alpenglowAddrForGossip(alpenglowObserverBindAddr)
 	}
 	result := runReplayWithRecovery(ctx, accountsDb, accountsPath, manifest, resumeState, uint64(startSlot), liveEndSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, uint16(turbineShredVersion), turbineAlpenglowAddr, validatorIdentity, blockstorePath, int(txParallelism), true, useLightbringer, useTurbine, dbgOpts, metricsWriter, slotCtxSetter, mithrilState, blockFetchOpts, consensusOpts, compactCfg.RewindHorizonBatches, replayStartTime)
+	stopCompactor() // join before shutdown closes AccountsDB
 
 	if result.Error != nil {
 		if result.LastPersistedSlot == 0 {
