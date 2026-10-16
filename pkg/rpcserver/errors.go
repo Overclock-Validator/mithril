@@ -15,7 +15,33 @@ const (
 	rpcCodeSendTransactionPreflightFailure jsonrpc.ErrorCode = -32002
 	// -32016 is Agave's reserved code for MinContextSlotNotReached.
 	rpcCodeMinContextSlotNotReached jsonrpc.ErrorCode = -32016
+	rpcCodeBlockNotAvailable        jsonrpc.ErrorCode = -32004
 )
+
+// EpochRewardHistoryUnavailableError distinguishes unknown history from no reward.
+type EpochRewardHistoryUnavailableError struct {
+	Epoch       uint64 `json:"epoch"`
+	ContextSlot uint64 `json:"contextSlot"`
+}
+
+func (e *EpochRewardHistoryUnavailableError) Error() string {
+	return fmt.Sprintf("Epoch reward history is unavailable for epoch %d", e.Epoch)
+}
+
+func (e *EpochRewardHistoryUnavailableError) ToJSONRPCError() (jsonrpc.JSONRPCError, error) {
+	return jsonrpc.JSONRPCError{Code: rpcCodeBlockNotAvailable, Message: e.Error(), Data: e}, nil
+}
+
+func (e *EpochRewardHistoryUnavailableError) FromJSONRPCError(rpcErr jsonrpc.JSONRPCError) error {
+	if rpcErr.Code != rpcCodeBlockNotAvailable {
+		return fmt.Errorf("unexpected code %d for EpochRewardHistoryUnavailableError", rpcErr.Code)
+	}
+	raw, err := json.Marshal(rpcErr.Data)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(raw, e)
+}
 
 type MinContextSlotNotReachedError struct {
 	ContextSlot uint64

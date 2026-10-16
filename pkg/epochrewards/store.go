@@ -34,22 +34,42 @@ type rewardKey struct {
 }
 
 type batch struct {
-	Version uint32   `json:"version"`
-	Through uint64   `json:"through"`
-	Records []Record `json:"records"`
+	Version  uint32          `json:"version"`
+	Through  uint64          `json:"through"`
+	Records  []Record        `json:"records"`
+	Coverage []epochCoverage `json:"coverage,omitempty"`
+}
+
+type coverageKey struct {
+	epoch    uint64
+	complete bool
+}
+
+type epochCoverage struct {
+	Epoch        uint64 `json:"epoch"`
+	Slot         uint64 `json:"slot"`
+	BoundarySlot uint64 `json:"boundarySlot"`
+	Complete     bool   `json:"complete"`
 }
 
 // Store keeps speculative rewards in memory and persists them with the same
 // rooted fold that commits the credited account balances.
 type Store struct {
-	dir            string
-	retentionSlots uint64
-	rooted         atomic.Uint64
-	mu             sync.RWMutex
-	pending        map[rewardKey]Record
-	persisted      map[rewardKey]Record
-	sourceBatch    map[rewardKey]uint64
-	batches        map[uint64][]rewardKey
+	dir               string
+	retentionSlots    uint64
+	rooted            atomic.Uint64
+	mu                sync.RWMutex
+	pending           map[rewardKey]Record
+	persisted         map[rewardKey]Record
+	sourceBatch       map[rewardKey]uint64
+	batches           map[uint64][]rewardKey
+	pendingCoverage   map[coverageKey]epochCoverage
+	coverage          map[coverageKey]epochCoverage
+	coverageBatch     map[coverageKey]uint64
+	readable          uint64
+	unpublished       map[uint64][]Record
+	published         map[rewardKey]Record
+	publishedCoverage map[coverageKey]epochCoverage
 }
 
 // Open loads or creates an epoch reward store.
@@ -61,12 +81,18 @@ func Open(dir string, retentionSlots uint64) (*Store, error) {
 		return nil, fmt.Errorf("create epoch reward directory: %w", err)
 	}
 	store := &Store{
-		dir:            dir,
-		retentionSlots: retentionSlots,
-		pending:        make(map[rewardKey]Record),
-		persisted:      make(map[rewardKey]Record),
-		sourceBatch:    make(map[rewardKey]uint64),
-		batches:        make(map[uint64][]rewardKey),
+		dir:               dir,
+		retentionSlots:    retentionSlots,
+		pending:           make(map[rewardKey]Record),
+		persisted:         make(map[rewardKey]Record),
+		sourceBatch:       make(map[rewardKey]uint64),
+		batches:           make(map[uint64][]rewardKey),
+		pendingCoverage:   make(map[coverageKey]epochCoverage),
+		coverage:          make(map[coverageKey]epochCoverage),
+		coverageBatch:     make(map[coverageKey]uint64),
+		unpublished:       make(map[uint64][]Record),
+		published:         make(map[rewardKey]Record),
+		publishedCoverage: make(map[coverageKey]epochCoverage),
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -103,6 +129,7 @@ func (s *Store) RecordBlock(block *b.Block) error {
 	rewardedEpoch := block.Epoch - 1
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var captured []Record
 	for _, reward := range block.Rewards {
 		if reward.Lamports < 0 || (reward.RewardType != rpc.RewardTypeVoting && reward.RewardType != rpc.RewardTypeStaking) {
 			continue
@@ -114,8 +141,41 @@ func (s *Store) RecordBlock(block *b.Block) error {
 			Amount: uint64(reward.Lamports), PostBalance: reward.PostBalance, Commission: commission,
 		}
 		s.pending[rewardKey{epoch: rewardedEpoch, address: address}] = record
+		captured = append(captured, record)
+	}
+	if len(captured) != 0 {
+		s.unpublished[block.Slot] = captured
 	}
 	return nil
+}
+
+// RecordCoverage records an observed epoch boundary and reward completion.
+// A completion without the matching boundary cannot establish full history.
+func (s *Store) RecordCoverage(epoch, slot uint64, boundary, complete bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	startKey := coverageKey{epoch: epoch}
+	if boundary {
+		s.pendingCoverage[startKey] = epochCoverage{Epoch: epoch, Slot: slot, BoundarySlot: slot}
+	}
+	if !complete {
+		return
+	}
+	start, ok := s.pendingCoverage[startKey]
+	if !ok {
+		start, ok = s.coverage[startKey]
+	}
+	if !ok || start.Slot > slot {
+		return
+	}
+	endKey := coverageKey{epoch: epoch, complete: true}
+	if end, ok := s.pendingCoverage[endKey]; ok && end.BoundarySlot == start.Slot {
+		return
+	}
+	if end, ok := s.coverage[endKey]; ok && end.BoundarySlot == start.Slot {
+		return
+	}
+	s.pendingCoverage[endKey] = epochCoverage{Epoch: epoch, Slot: slot, BoundarySlot: start.Slot, Complete: true}
 }
 
 // Prepare writes rewards through a fold boundary before the fold is committed.
@@ -127,8 +187,14 @@ func (s *Store) Prepare(through uint64) error {
 			records = append(records, record)
 		}
 	}
+	coverage := make([]epochCoverage, 0)
+	for _, event := range s.pendingCoverage {
+		if event.Slot <= through {
+			coverage = append(coverage, event)
+		}
+	}
 	s.mu.RUnlock()
-	if len(records) == 0 {
+	if len(records) == 0 && len(coverage) == 0 {
 		return nil
 	}
 	sort.Slice(records, func(i, j int) bool {
@@ -137,7 +203,13 @@ func (s *Store) Prepare(through uint64) error {
 		}
 		return records[i].Address < records[j].Address
 	})
-	payload := batch{Version: recordVersion, Through: through, Records: records}
+	sort.Slice(coverage, func(i, j int) bool {
+		if coverage[i].Epoch != coverage[j].Epoch {
+			return coverage[i].Epoch < coverage[j].Epoch
+		}
+		return !coverage[i].Complete && coverage[j].Complete
+	})
+	payload := batch{Version: recordVersion, Through: through, Records: records, Coverage: coverage}
 	tmp, err := os.CreateTemp(s.dir, ".epoch-rewards-*")
 	if err != nil {
 		return fmt.Errorf("create epoch reward temp file: %w", err)
@@ -176,18 +248,29 @@ func (s *Store) install(value batch) {
 		keys = append(keys, key)
 	}
 	s.batches[value.Through] = keys
+	for _, event := range value.Coverage {
+		key := coverageKey{epoch: event.Epoch, complete: event.Complete}
+		s.coverage[key] = event
+		s.coverageBatch[key] = value.Through
+	}
 }
 
-// SetRooted advances the durable reward view and prunes stale batches.
+// SetRooted sets the durable reward view and prunes stale batches.
 func (s *Store) SetRooted(slot uint64) error {
 	s.mu.Lock()
 	if slot < s.rooted.Load() {
 		// A failed prune must not expose rewards above the recovered account root.
 		s.rooted.Store(slot)
+		s.resetPublishedLocked()
 	}
 	for key, record := range s.pending {
 		if record.EffectiveSlot <= slot {
 			delete(s.pending, key)
+		}
+	}
+	for key, event := range s.pendingCoverage {
+		if event.Slot <= slot {
+			delete(s.pendingCoverage, key)
 		}
 	}
 	pruneBefore := uint64(0)
@@ -222,6 +305,7 @@ func (s *Store) SetRooted(slot uint64) error {
 			}
 		}
 		delete(s.batches, through)
+		s.removeCoverageBatch(through)
 	}
 	s.mu.Unlock()
 	if removed {
@@ -229,16 +313,46 @@ func (s *Store) SetRooted(slot uint64) error {
 			return err
 		}
 	}
+	s.mu.Lock()
 	s.rooted.Store(slot)
+	s.readable = max(s.readable, slot)
+	for key, record := range s.published {
+		if record.EffectiveSlot <= slot {
+			delete(s.published, key)
+		}
+	}
+	for key, event := range s.publishedCoverage {
+		if event.Slot <= slot {
+			delete(s.publishedCoverage, key)
+		}
+	}
+	for pendingSlot := range s.unpublished {
+		if pendingSlot <= slot {
+			delete(s.unpublished, pendingSlot)
+		}
+	}
+	s.mu.Unlock()
 	return nil
 }
 
 // Rewind removes speculative rewards produced by a discarded fork suffix.
 func (s *Store) Rewind(fromSlot uint64) error {
 	s.mu.Lock()
+	// Invalidate the read overlay before any fallible disk cleanup.
+	s.resetPublishedLocked()
+	for slot := range s.unpublished {
+		if slot >= fromSlot {
+			delete(s.unpublished, slot)
+		}
+	}
 	for key, record := range s.pending {
 		if record.EffectiveSlot >= fromSlot {
 			delete(s.pending, key)
+		}
+	}
+	for key, event := range s.pendingCoverage {
+		if event.Slot >= fromSlot {
+			delete(s.pendingCoverage, key)
 		}
 	}
 	removed := false
@@ -269,6 +383,7 @@ func (s *Store) Rewind(fromSlot uint64) error {
 			}
 		}
 		delete(s.batches, through)
+		s.removeCoverageBatch(through)
 	}
 	s.mu.Unlock()
 	if removed {
@@ -289,6 +404,8 @@ func (s *Store) restoreRetainedRecords(pruneBefore, throughLimit uint64) error {
 	sort.Slice(throughs, func(i, j int) bool { return throughs[i] < throughs[j] })
 	persisted := make(map[rewardKey]Record)
 	sources := make(map[rewardKey]uint64)
+	coverage := make(map[coverageKey]epochCoverage)
+	coverageBatches := make(map[coverageKey]uint64)
 	for _, through := range throughs {
 		value, err := readBatch(s.batchPath(through))
 		if err != nil {
@@ -302,9 +419,55 @@ func (s *Store) restoreRetainedRecords(pruneBefore, throughLimit uint64) error {
 			persisted[key] = record
 			sources[key] = through
 		}
+		for _, event := range value.Coverage {
+			key := coverageKey{epoch: event.Epoch, complete: event.Complete}
+			coverage[key], coverageBatches[key] = event, through
+		}
 	}
 	s.persisted, s.sourceBatch = persisted, sources
+	s.coverage, s.coverageBatch = coverage, coverageBatches
 	return nil
+}
+
+func (s *Store) removeCoverageBatch(through uint64) {
+	for key, source := range s.coverageBatch {
+		if source == through {
+			delete(s.coverage, key)
+			delete(s.coverageBatch, key)
+		}
+	}
+}
+
+// EpochAvailable reports complete, retained history at the durable account root.
+func (s *Store) EpochAvailable(epoch uint64) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.epochAvailableLocked(epoch, s.rooted.Load(), false)
+}
+
+func (s *Store) epochAvailableLocked(epoch, root uint64, published bool) bool {
+	startKey, endKey := coverageKey{epoch: epoch}, coverageKey{epoch: epoch, complete: true}
+	coverage := func(key coverageKey) (epochCoverage, bool) {
+		if published {
+			if event, ok := s.publishedCoverage[key]; ok {
+				return event, event.Slot <= root
+			}
+		}
+		event, ok := s.coverage[key]
+		return event, ok && event.Slot <= s.rooted.Load() && s.coverageBatch[key] <= s.rooted.Load()
+	}
+	start, started := coverage(startKey)
+	end, completed := coverage(endKey)
+	if !started || !completed || start.Slot != start.BoundarySlot || end.BoundarySlot != start.Slot || end.Slot < start.Slot {
+		return false
+	}
+	if start.Slot > root || end.Slot > root {
+		return false
+	}
+	// Retention follows durable folds, not process-local read publication. A
+	// later completion marker cannot certify an expired boundary batch.
+	durable := s.rooted.Load()
+	return durable <= s.retentionSlots || start.Slot > durable-s.retentionSlots
 }
 
 // Get returns an address's reward for an epoch.
@@ -344,6 +507,14 @@ func readBatch(path string) (batch, error) {
 	}
 	if value.Version != recordVersion {
 		return batch{}, fmt.Errorf("unsupported epoch reward version %d", value.Version)
+	}
+	seen := make(map[coverageKey]bool, len(value.Coverage))
+	for _, event := range value.Coverage {
+		key := coverageKey{epoch: event.Epoch, complete: event.Complete}
+		if event.Slot > value.Through || event.BoundarySlot > event.Slot || (!event.Complete && event.BoundarySlot != event.Slot) || seen[key] {
+			return batch{}, fmt.Errorf("invalid epoch reward coverage in batch %d", value.Through)
+		}
+		seen[key] = true
 	}
 	return value, nil
 }

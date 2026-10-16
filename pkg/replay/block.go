@@ -58,6 +58,11 @@ type epochRewardPublisher interface {
 	RewindEpochRewards(fromSlot uint64) error
 }
 
+type epochRewardReadPublisher interface {
+	PublishEpochRewards(slot uint64)
+	ResetEpochRewardView()
+}
+
 // BlockFetchOpts contains options for parallel block fetching
 type BlockFetchOpts struct {
 	MaxRPS          int    // Rate limit (requests per second), 0 = use default
@@ -1686,6 +1691,14 @@ func ReplayBlocks(
 	result := &ReplayResult{}
 	alpenglowMode := consensusOpts != nil && consensusOpts.Alpenglow
 	rewardPublisher, _ := rpcServer.(epochRewardPublisher)
+	rewardReadPublisher, _ := rpcServer.(epochRewardReadPublisher)
+	if rewardReadPublisher != nil {
+		rewardReadPublisher.ResetEpochRewardView()
+		defer rewardReadPublisher.ResetEpochRewardView()
+	}
+	rewardStatusPublisher, _ := rpcServer.(interface {
+		RecordEpochRewardStatus(*b.Block, *sealevel.BankSysvars, bool)
+	})
 	if rewardPublisher != nil {
 		if err := rewardPublisher.RewindEpochRewards(startSlot); err != nil {
 			result.Error = fmt.Errorf("rewind epoch rewards from replay slot %d: %w", startSlot, err)
@@ -2171,6 +2184,11 @@ func ReplayBlocks(
 	// force-folds the trailing partial chunk (epoch-boundary settlement and
 	// shutdown); force=false folds full chunks only.
 	foldRootedPrefix := func(force bool) (halt bool) {
+		defer func() {
+			if halt && rewardReadPublisher != nil {
+				rewardReadPublisher.ResetEpochRewardView()
+			}
+		}()
 		if unrootedTailState == nil {
 			return false
 		}
@@ -2251,6 +2269,13 @@ func ReplayBlocks(
 		promoteThrough = rewardsCompletion.limitPromotion(partitionedRewardsInfo, rewardsHoldBelowSlot, promoteThrough)
 		if promoteThrough <= mithrilState.LastRootedSlot {
 			return false
+		}
+		// Read publication uses the same verified prefix without waiting for disk.
+		// Advisory/disabled verification retains the durable-only read contract.
+		// Select an actual retained bank, not a high-water mark or skipped slot:
+		// finality can end in a skipped prefix before the next epoch's first bank.
+		if !force && result.Error == nil && alpenglowMode && rewardReadPublisher != nil && (verifierRequired || TrailingVerifierCfg.ValidatorFooterHash) {
+			rewardReadPublisher.PublishEpochRewards(unrootedTailState.executedSlotAtOrBefore(promoteThrough))
 		}
 
 		if force {
@@ -2471,6 +2496,9 @@ func ReplayBlocks(
 	// identical; only the source rewind differs (certified sibling re-fetch vs
 	// retaining an already assembled alternate child).
 	handleAlpenglowSwitch := func(sw *CertifiedSwitch, rewindSource func() bool) bool {
+		if rewardReadPublisher != nil {
+			rewardReadPublisher.ResetEpochRewardView()
+		}
 		windowSwitches++
 		if unrootedTailState == nil || promoter == nil {
 			windowSwitchFallback++
@@ -3141,8 +3169,8 @@ func ReplayBlocks(
 
 		// post-epoch boundary rewards distribution
 		if partitionedEpochRewardsEnabled && partitionedRewardsInfo != nil && currentSlot >= partitionedRewardsInfo.FirstStakingRewardSlot && partitionedRewardsInfo.NumRewardPartitionsRemaining > 0 {
-			distributedAccts, parentDistributedAccts := distributePartitionedEpochRewardsForSlot(acctsDb, lastSlotCtx, block.EpochUpdatedAccts, replayCtx, partitionedRewardsInfo, currentSlot, block.BlockHeight)
-			if err := replaceInflationRewardRecords(block, distributedAccts, parentDistributedAccts, rpc.RewardTypeStaking); err != nil {
+			distributedAccts, parentDistributedAccts, stakeCommissions := distributePartitionedEpochRewardsForSlot(acctsDb, lastSlotCtx, block.EpochUpdatedAccts, replayCtx, partitionedRewardsInfo, currentSlot, block.BlockHeight)
+			if err := replaceInflationRewardRecords(block, distributedAccts, parentDistributedAccts, rpc.RewardTypeStaking, stakeCommissions); err != nil {
 				result.Error = err
 				mlog.Log.Errorf("%v", err)
 				break
@@ -3198,6 +3226,9 @@ func ReplayBlocks(
 			if err := rewardPublisher.RecordEpochRewards(block); err != nil {
 				result.Error = fmt.Errorf("record epoch rewards for slot %d: %w", block.Slot, err)
 				break
+			}
+			if rewardStatusPublisher != nil {
+				rewardStatusPublisher.RecordEpochRewardStatus(block, lastSlotCtx.BankSysvars(), partitionedEpochRewardsEnabled)
 			}
 		}
 		// The successful child now owns its derived snapshot. Any later bank uses
@@ -3677,6 +3708,10 @@ func ReplayBlocks(
 			metrics.GlobalBlockReplay = metrics.BlockReplay{}
 		}
 
+	}
+
+	if rewardReadPublisher != nil {
+		rewardReadPublisher.ResetEpochRewardView()
 	}
 
 	// Check if block source stalled (this provides explicit error info)

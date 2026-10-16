@@ -9,7 +9,7 @@ import (
 	"github.com/gagliardetto/solana-go"
 )
 
-const maxInflationRewardAddresses = 5
+const maxInflationRewardAddresses = 32
 
 type inflationRewardConfig struct {
 	Commitment     string  `json:"commitment"`
@@ -26,6 +26,9 @@ type InflationRewardResp struct {
 	Commission    *uint8 `json:"commission"`
 }
 
+// GetInflationReward reads verified canonical rewards. On Alpenglow, confirmed
+// and finalized share this view, which may precede the durable checkpoint.
+// The recovery lock pins its slot, epoch, coverage and records for this request.
 func (rpcServer *RpcServer) GetInflationReward(ctx context.Context, p jsonrpc.RawParams) ([]*InflationRewardResp, error) {
 	rpcServer.historyRecoveryMu.RLock()
 	defer rpcServer.historyRecoveryMu.RUnlock()
@@ -71,7 +74,7 @@ func (rpcServer *RpcServer) GetInflationReward(ctx context.Context, p jsonrpc.Ra
 		return nil, fmt.Errorf("node has no epoch schedule available")
 	}
 
-	contextSlot := rpcServer.epochRewards.RootedSlot()
+	contextSlot := rpcServer.epochRewards.PublishedSlot()
 	if config.MinContextSlot != nil && contextSlot < *config.MinContextSlot {
 		return nil, &MinContextSlotNotReachedError{ContextSlot: contextSlot}
 	}
@@ -83,9 +86,13 @@ func (rpcServer *RpcServer) GetInflationReward(ctx context.Context, p jsonrpc.Ra
 	}
 
 	result := make([]*InflationRewardResp, len(addresses))
+	available := rpcServer.epochRewards.EpochPublished(epoch)
 	for index, address := range addresses {
-		record, ok := rpcServer.epochRewards.Get(epoch, address, false)
+		record, ok := rpcServer.epochRewards.GetPublished(epoch, address)
 		if !ok {
+			if !available {
+				return nil, &EpochRewardHistoryUnavailableError{Epoch: epoch, ContextSlot: contextSlot}
+			}
 			continue
 		}
 		result[index] = &InflationRewardResp{

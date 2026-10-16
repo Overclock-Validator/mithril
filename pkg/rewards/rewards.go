@@ -37,6 +37,7 @@ type PartitionedRewardDistributionInfo struct {
 	NumRewardPartitionsRemaining uint64
 	SpoolDir                     string
 	SpoolSlot                    uint64
+	VoteCommissions              map[solana.PublicKey]uint8
 }
 
 type CalculatedStakePoints struct {
@@ -318,13 +319,13 @@ func DistributeVotingRewards(acctsDb *accountsdb.AccountsDb, validatorRewards ma
 	return updatedAccts, parentUpdatedAccts, totalVotingRewards.Load()
 }
 
-func DistributeStakingRewardsFromSpool(acctsDb *accountsdb.AccountsDb, spoolDir string, spoolSlot uint64, partitionIdx uint64, currentSlot uint64, loader RewardAccountLoader) ([]*accounts.Account, []*accounts.Account, uint64, uint64) {
+func DistributeStakingRewardsFromSpool(acctsDb *accountsdb.AccountsDb, spoolDir string, spoolSlot uint64, partitionIdx uint64, currentSlot uint64, loader RewardAccountLoader, voteCommissions map[solana.PublicKey]uint8) ([]*accounts.Account, []*accounts.Account, uint64, uint64, map[solana.PublicKey]uint8) {
 	reader, err := NewPartitionReader(spoolDir, spoolSlot, uint32(partitionIdx))
 	if err != nil {
 		panic(fmt.Sprintf("unable to open partition %d spool for distribution: %s", partitionIdx, err))
 	}
 	if reader == nil {
-		return nil, nil, 0, 0
+		return nil, nil, 0, 0, nil
 	}
 	defer reader.Close()
 
@@ -341,7 +342,17 @@ func DistributeStakingRewardsFromSpool(acctsDb *accountsdb.AccountsDb, spoolDir 
 	}
 
 	if len(records) == 0 {
-		return nil, nil, 0, 0
+		return nil, nil, 0, 0, nil
+	}
+
+	var stakeCommissions map[solana.PublicKey]uint8
+	if voteCommissions != nil {
+		stakeCommissions = make(map[solana.PublicKey]uint8, len(records))
+		for _, record := range records {
+			if commission, ok := voteCommissions[record.VotePubkey]; ok {
+				stakeCommissions[record.StakePubkey] = commission
+			}
+		}
 	}
 
 	accts := make([]*accounts.Account, len(records))
@@ -435,7 +446,7 @@ func DistributeStakingRewardsFromSpool(acctsDb *accountsdb.AccountsDb, spoolDir 
 		}
 	}
 
-	return accts, parentAccts, distributedLamports.Load(), burnedLamports.Load()
+	return accts, parentAccts, distributedLamports.Load(), burnedLamports.Load(), stakeCommissions
 }
 
 func minimumStakeDelegation(slotCtx *sealevel.SlotCtx) uint64 {
@@ -816,8 +827,11 @@ type StreamingRewardsResult struct {
 	TotalPoints        wide.Uint128
 	TotalStakerRewards uint64
 	ValidatorRewards   map[solana.PublicKey]*atomic.Uint64
-	NumStakeRewards    uint64
-	NumPartitions      uint64
+	// VoteCommissions records selected legacy percentages. Custom collectors
+	// and basis-point commissions do not populate the legacy commission field.
+	VoteCommissions map[solana.PublicKey]uint8
+	NumStakeRewards uint64
+	NumPartitions   uint64
 }
 
 // spoolWriteRequest is sent to the single-writer goroutine for spool writes.
@@ -982,6 +996,18 @@ func CalculateRewardsStreaming(
 	var commissionVoteStates map[solana.PublicKey]*sealevel.VoteStateVersions
 	if f.IsActive(features.DelayCommissionUpdates) {
 		commissionVoteStates = buildDelayedCommissionVoteStateCache(voteCache, rewardedEpoch)
+	}
+	var voteCommissions map[solana.PublicKey]uint8
+	if !f.IsActive(features.CustomCommissionCollector) && !f.IsActive(features.CommissionRateInBasisPoints) {
+		voteCommissions = make(map[solana.PublicKey]uint8, len(voteCache))
+		for votePubkey, selected := range voteCache {
+			if historical := commissionVoteStates[votePubkey]; historical != nil {
+				selected = historical
+			}
+			if selected != nil {
+				voteCommissions[votePubkey] = uint8(voteInflationCommissionBPS(selected, false) / 100)
+			}
+		}
 	}
 
 	tempWriter, err := NewTempSpoolWriter(spoolDir, slot)
@@ -1173,6 +1199,7 @@ func CalculateRewardsStreaming(
 		TotalPoints:        reportedPoints,
 		TotalStakerRewards: phase2TotalStakerRewards,
 		ValidatorRewards:   validatorRewards,
+		VoteCommissions:    voteCommissions,
 		NumStakeRewards:    actualRewardCount,
 		NumPartitions:      numPartitions,
 	}, nil

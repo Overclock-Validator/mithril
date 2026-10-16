@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestStoreKeepsConfirmedAndFinalizedViewsSeparate(t *testing.T) {
+func TestStoreKeepsPendingAndRootedViewsSeparate(t *testing.T) {
 	dir := t.TempDir()
 	store, err := Open(dir, 256)
 	require.NoError(t, err)
@@ -25,27 +25,27 @@ func TestStoreKeepsConfirmedAndFinalizedViewsSeparate(t *testing.T) {
 		}},
 	}))
 
-	confirmed, ok := store.Get(1, address.String(), true)
+	pending, ok := store.Get(1, address.String(), true)
 	require.True(t, ok)
-	require.Equal(t, uint64(42), confirmed.Amount)
-	require.Equal(t, uint64(130), confirmed.EffectiveSlot)
-	require.Equal(t, uint64(1_042), confirmed.PostBalance)
-	require.Equal(t, uint8(7), *confirmed.Commission)
+	require.Equal(t, uint64(42), pending.Amount)
+	require.Equal(t, uint64(130), pending.EffectiveSlot)
+	require.Equal(t, uint64(1_042), pending.PostBalance)
+	require.Equal(t, uint8(7), *pending.Commission)
 	_, ok = store.Get(1, address.String(), false)
 	require.False(t, ok)
 
 	require.NoError(t, store.Prepare(130))
 	require.NoError(t, store.SetRooted(130))
-	finalized, ok := store.Get(1, address.String(), false)
+	rooted, ok := store.Get(1, address.String(), false)
 	require.True(t, ok)
-	require.Equal(t, confirmed, finalized)
+	require.Equal(t, pending, rooted)
 
 	reopened, err := Open(dir, 256)
 	require.NoError(t, err)
 	require.NoError(t, reopened.SetRooted(130))
 	restarted, ok := reopened.Get(1, address.String(), false)
 	require.True(t, ok)
-	require.Equal(t, finalized, restarted)
+	require.Equal(t, rooted, restarted)
 }
 
 func TestStoreHidesPreparedRewardsUntilTheirFoldCommits(t *testing.T) {

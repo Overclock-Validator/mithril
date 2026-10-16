@@ -67,6 +67,7 @@ func TestEpochRewardHTTPAfterDurableRewind(t *testing.T) {
 				return result
 			}
 			want := `[{"epoch":0,"effectiveSlot":4,"amount":2,"postBalance":4,"commission":null}]`
+			unavailable := `{"code":-32004,"message":"Epoch reward history is unavailable for epoch 0","data":{"epoch":0,"contextSlot":2}}`
 			require.JSONEq(t, want, string(call(4)["result"]))
 			// An in-memory fork switch above the durable root must retain its rewards.
 			require.NoError(t, server.RewindEpochRewards(5))
@@ -113,7 +114,7 @@ func TestEpochRewardHTTPAfterDurableRewind(t *testing.T) {
 					// Inspect the side-store watermark independently of the gate; recovery remains halted in production.
 					server.SetHistoryRecoveryPending(false)
 					require.JSONEq(t, `{"code":-32016,"message":"Minimum context slot has not been reached","data":{"contextSlot":2}}`, string(call(4)["error"]))
-					require.JSONEq(t, `[null]`, string(call(2)["result"]))
+					require.JSONEq(t, unavailable, string(call(2)["error"]))
 					return
 				}
 				require.FileExists(t, filepath.Join(dir, "rpc-epoch-rewards", "batch-00000000000000000004.json"), "failed account rewind must retain rewards")
@@ -124,13 +125,13 @@ func TestEpochRewardHTTPAfterDurableRewind(t *testing.T) {
 			// Replay's startup hook must not restore the discarded durable reward.
 			require.NoError(t, server.RewindEpochRewards(s.GetResumeSlot()))
 			require.JSONEq(t, `{"code":-32016,"message":"Minimum context slot has not been reached","data":{"contextSlot":2}}`, string(call(4)["error"]))
-			require.JSONEq(t, `[null]`, string(call(2)["result"]))
+			require.JSONEq(t, unavailable, string(call(2)["error"]))
 
 			// A replacement on the selected fork becomes visible only after its fold.
 			record.Rewards[0].Lamports, record.Rewards[0].PostBalance = 3, 5
 			require.NoError(t, server.RecordEpochRewards(record))
 			require.NoError(t, server.PrepareEpochRewards(4))
-			require.JSONEq(t, `[null]`, string(call(2)["result"]))
+			require.JSONEq(t, unavailable, string(call(2)["error"]))
 			require.NoError(t, server.SetRootedEpochRewardsSlot(4))
 			require.JSONEq(t, `[{"epoch":0,"effectiveSlot":4,"amount":3,"postBalance":5,"commission":null}]`, string(call(4)["result"]))
 		})

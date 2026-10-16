@@ -104,6 +104,27 @@ func (rpcServer *RpcServer) RecordEpochRewards(block *b.Block) error {
 	return rpcServer.epochRewards.RecordBlock(block)
 }
 
+// RecordEpochRewardStatus records coverage from the successfully replayed bank.
+func (rpcServer *RpcServer) RecordEpochRewardStatus(block *b.Block, bank *sealevel.BankSysvars, partitioned bool) {
+	if rpcServer == nil || rpcServer.epochRewards == nil || rpcServer.epochSchedule == nil || block == nil || block.Epoch == 0 {
+		return
+	}
+	if block.ParentSlot >= block.Slot || rpcServer.epochSchedule.GetEpoch(block.Slot) != block.Epoch {
+		return
+	}
+	boundary := rpcServer.epochSchedule.GetEpoch(block.ParentSlot) < block.Epoch
+	complete := false
+	if bank != nil && bank.Slot() == block.Slot {
+		if partitioned {
+			rewards, ok := bank.EpochRewards()
+			complete = ok && !rewards.Active
+		} else {
+			complete = boundary
+		}
+	}
+	rpcServer.epochRewards.RecordCoverage(block.Epoch-1, block.Slot, boundary, complete)
+}
+
 // PrepareEpochRewards stages rewards with the matching durable fold.
 func (rpcServer *RpcServer) PrepareEpochRewards(through uint64) error {
 	if rpcServer == nil || rpcServer.epochRewards == nil {
@@ -114,7 +135,30 @@ func (rpcServer *RpcServer) PrepareEpochRewards(through uint64) error {
 	return rpcServer.epochRewards.Prepare(through)
 }
 
-// SetRootedEpochRewardsSlot advances the durable reward watermark.
+// PublishEpochRewards exposes a prefix that replay has verified as canonical.
+// It is independent of the durable account checkpoint and is not an RPC method.
+func (rpcServer *RpcServer) PublishEpochRewards(slot uint64) {
+	if rpcServer == nil || rpcServer.epochRewards == nil {
+		return
+	}
+	rpcServer.historyRecoveryMu.Lock()
+	defer rpcServer.historyRecoveryMu.Unlock()
+	if !rpcServer.historyRecoveryPending {
+		rpcServer.epochRewards.Publish(slot)
+	}
+}
+
+// ResetEpochRewardView withdraws process-local publication during replay recovery.
+func (rpcServer *RpcServer) ResetEpochRewardView() {
+	if rpcServer == nil || rpcServer.epochRewards == nil {
+		return
+	}
+	rpcServer.historyRecoveryMu.Lock()
+	defer rpcServer.historyRecoveryMu.Unlock()
+	rpcServer.epochRewards.ResetPublished()
+}
+
+// SetRootedEpochRewardsSlot sets the durable reward watermark.
 func (rpcServer *RpcServer) SetRootedEpochRewardsSlot(slot uint64) error {
 	if rpcServer == nil || rpcServer.epochRewards == nil {
 		return nil
@@ -124,7 +168,7 @@ func (rpcServer *RpcServer) SetRootedEpochRewardsSlot(slot uint64) error {
 	return rpcServer.epochRewards.SetRooted(slot)
 }
 
-// RewindEpochRewards drops rewards from a discarded fork suffix.
+// RewindEpochRewards drops speculative rewards from a discarded fork suffix.
 func (rpcServer *RpcServer) RewindEpochRewards(fromSlot uint64) error {
 	if rpcServer == nil || rpcServer.epochRewards == nil {
 		return nil
@@ -143,6 +187,9 @@ func (rpcServer *RpcServer) SetHistoryRecoveryPending(pending bool) {
 	rpcServer.historyRecoveryMu.Lock()
 	defer rpcServer.historyRecoveryMu.Unlock()
 	rpcServer.historyRecoveryPending = pending
+	if pending && rpcServer.epochRewards != nil {
+		rpcServer.epochRewards.ResetPublished()
+	}
 }
 
 func NewRpcServer(acctsDb *accountsdb.AccountsDb, port uint16, epochSchedule *sealevel.SysvarEpochSchedule, genesisHash solana.Hash) *RpcServer {
