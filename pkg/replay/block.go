@@ -1644,18 +1644,16 @@ func (t *persistedTracker) Get() (uint64, []byte) {
 	return slot, out
 }
 
-// settleInFlightFoldAtCapacity turns the async fold worker into bounded
-// backpressure only when the speculative tail crosses its hard cap. A fold
-// already in flight was admitted through every finality/verification gate, so
-// waiting for and applying it is safe. We deliberately do not enqueue work
-// here: no in-flight fold at capacity means the normal loop could not admit
-// one (or its previous fold failed), which remains a fail-closed halt.
+// settleFoldsAtCapacity stops replay while durable writes relieve pressure.
+// admit must use the normal finality/verification gate; no ungated partial fold
+// is allowed here. With no safe progress available, the caller halts closed.
 // It returns whether the tail is still over capacity after settlement.
-func settleInFlightFoldAtCapacity(
+func settleFoldsAtCapacity(
 	tail *unrootedTail,
 	promoter *asyncPromoter,
 	tipSlot uint64,
 	applyFoldOutcome func(*foldResult),
+	admit func() bool, // true means a safety or storage failure requires a halt
 ) bool {
 	if tail == nil || !tail.OverCap() {
 		return false
@@ -1667,10 +1665,20 @@ func settleInFlightFoldAtCapacity(
 	if tail.contexts[tipSlot] == nil {
 		return true
 	}
-	if promoter != nil && promoter.inFlight {
+	for tail.OverCap() {
+		before := tail.overlay.HeldSlots()
+		if admit != nil && admit() {
+			return true
+		}
+		if promoter == nil || !promoter.inFlight {
+			break
+		}
 		res := promoter.drain()
 		if applyFoldOutcome != nil {
 			applyFoldOutcome(res)
+		}
+		if promoter.failure != nil || tail.overlay.HeldSlots() >= before {
+			break
 		}
 	}
 	return tail.OverCap()
@@ -2043,7 +2051,7 @@ func ReplayBlocks(
 			}
 			promoter.stop()
 		}()
-		mlog.Log.FileOnlyf("rooted-durable mode: canonical store stays rooted-only; replayed slots buffer in RAM until rooted (halt cap %d slots); folds run async off the replay loop", unrootedTailHaltCap)
+		mlog.Log.Infof("rooted-durable: fold targets %d slots / %d MiB; retained-state budget %d MiB / %d slots", FoldBatchSlots, FoldMaxBytes>>20, WorkingSetMaxBytes>>20, unrootedTailHaltCap)
 	}
 	// Any stake-index entries still pending from a previous in-process replay
 	// attempt (rooted-checkpoint re-replay after a fork switch or finality
@@ -2130,14 +2138,18 @@ func ReplayBlocks(
 	}
 
 	// applyFoldOutcome applies a completed async fold on the loop thread. A
-	// failed fold only logs: LastRootedSlot did not advance, so the next
-	// iteration rebuilds the same chunk (natural retry); a permanently broken
-	// store surfaces as the OverCap halt (fail-closed).
+	// failed durable write stops replay. Its manifest may already have committed,
+	// so restart recovery must reconcile it before any retry. In particular an
+	// ENOSPC must not retry every slot until vote-history persistence also fails.
 	applyFoldOutcome = func(res *foldResult) {
 		if res == nil {
 			return
 		}
 		if res.err != nil {
+			promoter.failure = res.err
+			if result.Error == nil {
+				result.Error = fmt.Errorf("rooted-durable: storage write failed (last confirmed durable slot %d): %w; restart recovery required", mithrilState.LastRootedSlot, res.err)
+			}
 			mlog.Log.Errorf("rooted-durable: async fold failed: %v", res.err)
 			return
 		}
@@ -2164,6 +2176,9 @@ func ReplayBlocks(
 		if unrootedTailState == nil {
 			return false
 		}
+		if promoter.failure != nil {
+			return true
+		}
 		if safety, ok := consensusEngine.(consensusengine.AlpenglowSafetyStatus); ok {
 			if err := safety.AlpenglowSafetyError(); err != nil {
 				if result.Error == nil {
@@ -2176,6 +2191,9 @@ func ReplayBlocks(
 		// Apply any completed async fold first so the gates below see the
 		// current durable frontier.
 		applyFoldOutcome(promoter.poll())
+		if promoter.failure != nil {
+			return true
+		}
 		if lastRootedWatermark == 0 {
 			return false
 		}
@@ -2252,6 +2270,9 @@ func ReplayBlocks(
 			if res := promoter.drain(); res != nil {
 				applyFoldOutcome(res)
 			}
+			if promoter.failure != nil {
+				return true
+			}
 			if rewardsHoldBelowSlot > 0 && partitionedRewardsInfo != nil && promoteThrough >= rewardsHoldBelowSlot {
 				job, jerr := unrootedTailState.buildRewardsCompletionFoldJob(rewardsCompletion.slot)
 				if jerr != nil {
@@ -2259,19 +2280,19 @@ func ReplayBlocks(
 					return false
 				}
 				if err := runFoldJob(unrootedTailState.committer, job); err != nil {
-					mlog.Log.Errorf("rooted-durable: rewards completion fold: %v", err)
-					return false
+					applyFoldOutcome(&foldResult{job: job, err: err})
+					return true
 				}
 				applyFoldOutcome(&foldResult{job: job})
 			}
 			promotedThrough, rootedCtx, perr := unrootedTailState.flush(promoteThrough)
 			if perr != nil {
-				mlog.Log.Errorf("rooted-durable: forced fold stopped at slot %d: %v", promotedThrough, perr)
+				applyFoldOutcome(&foldResult{err: perr})
 			}
 			if promotedThrough > mithrilState.LastRootedSlot && rootedCtx != nil {
 				applyPromotionBookkeeping(promotedThrough, rootedCtx)
 			}
-			return false
+			return perr != nil
 		}
 		// Async: one chunk in flight at a time. Enqueue the next chunk only
 		// when idle; completions are applied at the top of this function on a
@@ -2289,7 +2310,10 @@ func ReplayBlocks(
 				return false
 			}
 			if job != nil {
-				promoter.enqueue(job)
+				if err := promoter.enqueue(job); err != nil {
+					applyFoldOutcome(&foldResult{job: job, err: err})
+					return true
+				}
 			}
 		}
 		return false
@@ -2475,6 +2499,9 @@ func ReplayBlocks(
 		// durable frontier past the switch slot, mutating source ancestry first
 		// would leave the source on a branch AccountsDB can no longer adopt.
 		applyFoldOutcome(promoter.drain())
+		if promoter.failure != nil {
+			return false
+		}
 		if sw.Slot <= mithrilState.LastRootedSlot {
 			windowSwitchFallback++
 			switchFallbackReasons["durable-overlap"]++
@@ -2718,6 +2745,9 @@ func ReplayBlocks(
 				// afterwards, and halted with no retained rewind boundary.
 				if promoter != nil {
 					applyFoldOutcome(promoter.drain())
+					if promoter.failure != nil {
+						break
+					}
 				}
 				if parentSwitch.SwitchSlot <= mithrilState.LastRootedSlot {
 					windowSwitches++
@@ -3366,12 +3396,17 @@ func ReplayBlocks(
 
 		// Rooted-durable backpressure runs only after this slot is complete and its
 		// resume context is attached. If the async writer is merely slower than
-		// replay, wait for its already-admitted fold and apply it before deciding
-		// the tail is truly stalled. No new fold is admitted here: a still-full
-		// tail remains a fail-closed error.
+		// replay, wait for safe folds before admitting any more account data. Each
+		// additional fold must pass the same gates as normal promotion.
 		if unrootedTailState != nil && unrootedTailState.OverCap() {
 			hadInFlightFold := promoter != nil && promoter.inFlight
-			stillOverCap := settleInFlightFoldAtCapacity(unrootedTailState, promoter, block.Slot, applyFoldOutcome)
+			pressureStart := time.Now()
+			mlog.Log.Infof("rooted-durable: memory/slot backpressure at slot %d (held_slots=%d retained_bytes=%d)", block.Slot, unrootedTailState.overlay.HeldSlots(), unrootedTailState.overlay.RetainedBytes())
+			stillOverCap := settleFoldsAtCapacity(unrootedTailState, promoter, block.Slot, applyFoldOutcome, func() bool { return foldRootedPrefix(false) })
+			mlog.Log.Infof("rooted-durable: backpressure settled in %s (held_slots=%d retained_bytes=%d)", time.Since(pressureStart).Round(time.Millisecond), unrootedTailState.overlay.HeldSlots(), unrootedTailState.overlay.RetainedBytes())
+			if result.Error != nil || promoter.failure != nil {
+				break
+			}
 			if stillOverCap {
 				// Diagnose WHY rooting stalled. Validator mode verifies the footer
 				// bank hash inline and has no trailing-verifier watermark; do not
@@ -3390,7 +3425,7 @@ func ReplayBlocks(
 				if trailingVerifier != nil && TrailingVerifierCfg.Required && lastRootedWatermark > verifiedWM+uint64(FoldBatchSlots) {
 					hint = " — the trailing verifier cannot keep pace with replay (finality is ahead; the verifier fetches every block's execution metas via RPC, which is slow for very large blocks). Options: verifier.required=false to gate folds on certificate finality only, a faster/archival RPC for the verifier, or wait for peer bankhash cross-checking to replace the RPC oracle"
 				}
-				result.Error = fmt.Errorf("rooted-durable: speculative state exceeded %d held slots at slot %d; rooting stalled (%s)%s; halting", unrootedTailHaltCap, block.Slot, diag, hint)
+				result.Error = fmt.Errorf("rooted-durable: speculative state reached capacity at slot %d (held_slots=%d/%d retained_bytes=%d/%d); rooting stalled (%s)%s; halting", block.Slot, unrootedTailState.overlay.HeldSlots(), unrootedTailHaltCap, unrootedTailState.overlay.RetainedBytes(), unrootedTailState.maxBytes, diag, hint)
 				mlog.Log.Errorf("%v", result.Error)
 				break
 			}
@@ -3601,6 +3636,9 @@ func ReplayBlocks(
 				mlog.Log.FileOnlyf("memory detail: alloc %.1fGiB | inuse %.1fGiB | idle %.1fGiB | released %.1fGiB | next_gc %.1fGiB | objs %d | gc_total %d | store_queue %d",
 					float64(mem.HeapAlloc)/gib, float64(mem.HeapInuse)/gib, float64(mem.HeapIdle)/gib,
 					float64(mem.HeapReleased)/gib, float64(mem.NextGC)/gib, mem.HeapObjects, mem.NumGC, acctsDb.StoreQueueLen())
+				if unrootedTailState != nil {
+					mlog.Log.FileOnlyf("working set: held_slots=%d retained_bytes=%d budget_bytes=%d fold_in_flight=%t durable=%d", unrootedTailState.overlay.HeldSlots(), unrootedTailState.overlay.RetainedBytes(), unrootedTailState.maxBytes, promoter.inFlight, mithrilState.LastRootedSlot)
+				}
 				if fetchStats.Attempts > 0 {
 					retryRate := float64(fetchStats.Retries) / float64(fetchStats.Attempts) * 100
 					mlog.Log.FileOnlyf("getBlock fetch: %.1f rps (%d calls) | avg %.0fms | %.0f%% success | retries %.1f%% | errs: na:%d rl:%d bt:%d tr:%d",
