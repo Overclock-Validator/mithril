@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/Overclock-Validator/mithril/pkg/rewards"
+	"github.com/Overclock-Validator/mithril/pkg/safemath"
 	"github.com/filecoin-project/go-jsonrpc"
 	"github.com/gagliardetto/solana-go"
 )
@@ -87,11 +89,30 @@ func (rpcServer *RpcServer) GetInflationReward(ctx context.Context, p jsonrpc.Ra
 
 	result := make([]*InflationRewardResp, len(addresses))
 	available := rpcServer.epochRewards.EpochPublished(epoch)
+	distribution, distributing := rpcServer.epochRewards.PublishedDistribution(epoch)
+	var unavailable error = &EpochRewardHistoryUnavailableError{Epoch: epoch, ContextSlot: contextSlot}
+	boundary := rpcServer.epochSchedule.FirstSlotInEpoch(safemath.SaturatingAddU64(epoch, 1))
+	if boundary < rpcServer.epochRewards.FirstRetainedSlot() {
+		unavailable = &EpochRewardHistoryPrunedError{Message: fmt.Sprintf("Reward history for slot %d has been cleaned up", boundary)}
+	}
+	if len(addresses) == 0 && !available && !distributing {
+		return nil, unavailable
+	}
 	for index, address := range addresses {
 		record, ok := rpcServer.epochRewards.GetPublished(epoch, address)
 		if !ok {
 			if !available {
-				return nil, &EpochRewardHistoryUnavailableError{Epoch: epoch, ContextSlot: contextSlot}
+				if !distributing {
+					return nil, unavailable
+				}
+				partition := rewards.CalculateRewardPartitionForPubkey(solana.MustPublicKeyFromBase58(address), distribution.ParentBlockhash, distribution.NumPartitions)
+				partitionHeight := safemath.SaturatingAddU64(distribution.StartingBlockHeight, partition)
+				if distribution.BlockHeight < partitionHeight {
+					return nil, &EpochRewardsPeriodActiveError{
+						Slot: contextSlot, CurrentBlockHeight: distribution.BlockHeight,
+						RewardsCompleteBlockHeight: safemath.SaturatingAddU64(distribution.StartingBlockHeight, distribution.NumPartitions),
+					}
+				}
 			}
 			continue
 		}

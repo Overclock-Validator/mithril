@@ -217,18 +217,20 @@ func TestEpochRewardAvailabilityHTTP(t *testing.T) {
 		require.NoError(t, json.NewDecoder(response.Body).Decode(&reply))
 		return reply.Result, reply.Error
 	}
-	block := &b.Block{Slot: 256, ParentSlot: 255, Epoch: 2, Rewards: []rpc.BlockReward{
+	block := &b.Block{Slot: 256, ParentSlot: 255, Epoch: 2, BlockHeight: 100, Rewards: []rpc.BlockReward{
 		{Pubkey: address, Lamports: 7, PostBalance: 107, RewardType: rpc.RewardTypeVoting},
 	}}
 	require.NoError(t, server.RecordEpochRewards(block))
-	server.RecordEpochRewardStatus(block, rewardCoverageBank(t, 256, true), true)
+	server.RecordEpochRewardStatus(block, rewardDistributionBank(t, 256, sealevel.SysvarEpochRewards{
+		Active: true, DistributionStartingBlockHeight: 101, NumPartitions: 1,
+	}), true)
 	require.NoError(t, server.PrepareEpochRewards(256))
 	require.NoError(t, server.SetRootedEpochRewardsSlot(256))
 	_, rpcErr := call("getInflationReward", []any{[]string{missing.String()}, map[string]any{"epoch": 1}})
 	require.NotNil(t, rpcErr)
-	require.Equal(t, jsonrpc.ErrorCode(-32004), rpcErr.Code)
-	require.Equal(t, "Epoch reward history is unavailable for epoch 1", rpcErr.Message)
-	require.Equal(t, map[string]any{"epoch": float64(1), "contextSlot": float64(256)}, rpcErr.Data)
+	require.Equal(t, jsonrpc.ErrorCode(-32017), rpcErr.Code)
+	require.Equal(t, "Epoch rewards period still active at slot 256", rpcErr.Message)
+	require.Equal(t, map[string]any{"slot": float64(256), "currentBlockHeight": float64(100), "rewardsCompleteBlockHeight": float64(102)}, rpcErr.Data)
 	_, rpcErr = call("getInflationReward", []any{[]string{address.String(), missing.String()}, map[string]any{"epoch": 1}})
 	require.NotNil(t, rpcErr, "a retained legacy record does not certify a missing address")
 	result, rpcErr := call("getInflationReward", []any{[]string{address.String()}, map[string]any{"epoch": 1}})
@@ -261,7 +263,7 @@ func TestEpochRewardAvailabilityHTTP(t *testing.T) {
 	require.NoError(t, server.SetRootedEpochRewardsSlot(1024))
 	_, rpcErr = call("getInflationReward", []any{[]string{missing.String()}, map[string]any{"epoch": 1}})
 	require.NotNil(t, rpcErr)
-	require.Equal(t, jsonrpc.ErrorCode(-32004), rpcErr.Code)
+	require.Equal(t, jsonrpc.ErrorCode(-32001), rpcErr.Code)
 }
 
 func TestEpochRewardStatusRequiresObservedBoundaryAndSysvar(t *testing.T) {
@@ -284,9 +286,12 @@ func TestEpochRewardStatusRequiresObservedBoundaryAndSysvar(t *testing.T) {
 }
 
 func rewardCoverageBank(t *testing.T, slot uint64, active bool) *sealevel.BankSysvars {
+	return rewardDistributionBank(t, slot, sealevel.SysvarEpochRewards{Active: active})
+}
+
+func rewardDistributionBank(t *testing.T, slot uint64, value sealevel.SysvarEpochRewards) *sealevel.BankSysvars {
 	t.Helper()
 	var encoded bytes.Buffer
-	value := sealevel.SysvarEpochRewards{Active: active}
 	require.NoError(t, value.MarshalWithEncoder(bin.NewBinEncoder(&encoded)))
 	bank, err := sealevel.NewBankSysvars(slot, &accounts.Account{
 		Key: sealevel.SysvarEpochRewardsAddr, Lamports: 1, Owner: addresses.SysvarOwnerAddr, Data: encoded.Bytes(),

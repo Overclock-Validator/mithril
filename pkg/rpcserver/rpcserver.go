@@ -123,6 +123,14 @@ func (rpcServer *RpcServer) RecordEpochRewardStatus(block *b.Block, bank *sealev
 		}
 	}
 	rpcServer.epochRewards.RecordCoverage(block.Epoch-1, block.Slot, boundary, complete)
+	if partitioned && bank != nil && bank.Slot() == block.Slot && block.BlockHeight != 0 {
+		if rewards, ok := bank.EpochRewards(); ok && rewards.Active {
+			rpcServer.epochRewards.RecordDistribution(block.Epoch-1, block.Slot, epochrewards.Distribution{
+				BlockHeight: block.BlockHeight, StartingBlockHeight: rewards.DistributionStartingBlockHeight,
+				NumPartitions: rewards.NumPartitions, ParentBlockhash: rewards.ParentBlockhash,
+			})
+		}
+	}
 }
 
 // PrepareEpochRewards stages rewards with the matching durable fold.

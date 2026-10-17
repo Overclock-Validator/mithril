@@ -2259,13 +2259,9 @@ func ReplayBlocks(
 			verifiedWM = trailingVerifier.VerifiedWatermark()
 		}
 		promoteThrough := safePromoteTarget(lastRootedWatermark, verifierRequired, verifiedWM, replayDivergenceFloor)
-		// Partitioned-rewards window: hold promotion below the boundary block
-		// until the completion bank verifies and is eligible to fold, so a
-		// failed distribution re-runs the boundary and rebuilds its bookkeeping.
-		promoteThrough = rewardsCompletion.limitPromotion(partitionedRewardsInfo, rewardsHoldBelowSlot, promoteThrough)
 		if promoteThrough <= mithrilState.LastRootedSlot {
 			// Operator signal: promotion is fully stalled (verifier lag,
-			// divergence floor, or rewards hold) while finality has run at
+			// or divergence floor) while finality has run at
 			// least a whole fold chunk ahead. Healthy steady state stays 0.
 			if lastRootedWatermark >= mithrilState.LastRootedSlot+uint64(FoldBatchSlots) {
 				promotionHolds++
@@ -2293,17 +2289,23 @@ func ReplayBlocks(
 			mlog.Log.FileOnlyf("alpenglow gate: checked=%d matched=%d no_finality=%d no_local_id=%d",
 				gateStats.checked, gateStats.matched, gateStats.noFinality, gateStats.noLocalID)
 		}
-		// The finality gate can stop before the verified completion bank.
-		promoteThrough = rewardsCompletion.limitPromotion(partitionedRewardsInfo, rewardsHoldBelowSlot, promoteThrough)
-		if promoteThrough <= mithrilState.LastRootedSlot {
-			return false
-		}
 		// Read publication uses the same verified prefix without waiting for disk.
 		// Advisory/disabled verification retains the durable-only read contract.
 		// Select an actual retained bank, not a high-water mark or skipped slot:
 		// finality can end in a skipped prefix before the next epoch's first bank.
+		readThrough, durableThrough := unrootedTailState.rewardPublicationTargets(&rewardsCompletion, partitionedRewardsInfo, rewardsHoldBelowSlot, promoteThrough)
 		if !force && result.Error == nil && alpenglowMode && rewardReadPublisher != nil && (verifierRequired || TrailingVerifierCfg.ValidatorFooterHash) {
-			rewardReadPublisher.PublishEpochRewards(unrootedTailState.executedSlotAtOrBefore(promoteThrough))
+			rewardReadPublisher.PublishEpochRewards(readThrough)
+		}
+		// Only disk checkpoints wait for the whole distribution, so recovery can
+		// replay the boundary and reconstruct its consumed reward spools. Reads
+		// above have already passed execution verification and exact finality.
+		promoteThrough = durableThrough
+		if promoteThrough <= mithrilState.LastRootedSlot {
+			if lastRootedWatermark >= mithrilState.LastRootedSlot+uint64(FoldBatchSlots) {
+				promotionHolds++
+			}
+			return false
 		}
 
 		if force {

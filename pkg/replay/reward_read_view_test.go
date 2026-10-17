@@ -3,8 +3,25 @@ package replay
 import (
 	"testing"
 
+	"github.com/Overclock-Validator/mithril/pkg/rewards"
 	"github.com/stretchr/testify/require"
 )
+
+func TestRewardPublicationDoesNotWaitForDistribution(t *testing.T) {
+	tail := asyncTestTail(nil, 256, 260)
+	info := &rewards.PartitionedRewardDistributionInfo{NumRewardPartitionsRemaining: 1}
+	var completion partitionedRewardsCompletion
+	for _, verified := range []uint64{255, 256, 257, 260} {
+		read, durable := tail.rewardPublicationTargets(&completion, info, 256, verified)
+		require.Equal(t, tail.executedSlotAtOrBefore(verified), read)
+		require.Equal(t, uint64(255), durable, "disk must retain the replayable boundary while rewards are incomplete")
+	}
+	info.NumRewardPartitionsRemaining = 0
+	completion.observeBank(info, testUnwindBankSysvars(t, 260, 100))
+	read, durable := tail.rewardPublicationTargets(&completion, info, 256, 260)
+	require.Equal(t, uint64(260), read)
+	require.Equal(t, uint64(260), durable, "verified completion permits disk promotion")
+}
 
 func TestRewardReadSlotUsesSurvivingExecutedBank(t *testing.T) {
 	tail := asyncTestTail(nil, 255, 257, 260)

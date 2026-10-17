@@ -232,6 +232,9 @@ same reward-read slot. Other RPC methods may still use an older durable view.
 Recovery withdraws the in-memory view, and a restart restores only
 durable history. Retention follows durable checkpoints. Advisory or disabled
 execution verification keeps reward reads on the durable view.
+Credited rewards are readable while other staking partitions are still pending.
+Requests for pending partitions return `-32017` with verified distribution
+progress; pruned history returns `-32001`, and unknown history returns `-32004`.
 
 We're actively expanding RPC method coverage. Upcoming methods include transaction simulation, send transaction, and get leader schedule.
 
