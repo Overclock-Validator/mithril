@@ -4,12 +4,15 @@ import (
 	"context"
 	"crypto/ed25519"
 	"net"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	authpb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/auth"
 	relayerpb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/relayer"
+	sharedpb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/shared"
 	"github.com/gagliardetto/solana-go"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -99,19 +102,86 @@ func (m *mockAuth) RefreshAccessToken(ctx context.Context, req *authpb.RefreshAc
 	return &authpb.RefreshAccessTokenResponse{AccessToken: m.token("access", m.accessTTL)}, nil
 }
 
-// mockRelayer records the metadata of each GetTpuConfigs call.
+// mockRelayer serves a scripted relayer: it records each GetTpuConfigs
+// call's metadata, returns the configured TPU sockets, and streams heartbeats
+// every heartbeatEvery (unless stalled) plus whatever the test sends.
 type mockRelayer struct {
 	relayerpb.UnimplementedRelayerServer
-	mu sync.Mutex
-	md []metadata.MD
+	heartbeatEvery time.Duration
+	send           chan *relayerpb.SubscribePacketsResponse
+	endStream      chan error
+	stall          atomic.Bool
+	subscriptions  atomic.Int32
+
+	mu     sync.Mutex
+	md     []metadata.MD
+	config *relayerpb.GetTpuConfigsResponse
+}
+
+func newMockRelayer(config *relayerpb.GetTpuConfigsResponse) *mockRelayer {
+	return &mockRelayer{
+		heartbeatEvery: 20 * time.Millisecond,
+		send:           make(chan *relayerpb.SubscribePacketsResponse, 16),
+		endStream:      make(chan error, 1),
+		config:         config,
+	}
+}
+
+func (r *mockRelayer) setConfig(config *relayerpb.GetTpuConfigsResponse) {
+	r.mu.Lock()
+	r.config = config
+	r.mu.Unlock()
 }
 
 func (r *mockRelayer) GetTpuConfigs(ctx context.Context, _ *relayerpb.GetTpuConfigsRequest) (*relayerpb.GetTpuConfigsResponse, error) {
 	md, _ := metadata.FromIncomingContext(ctx)
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.md = append(r.md, md)
-	r.mu.Unlock()
-	return &relayerpb.GetTpuConfigsResponse{}, nil
+	if r.config == nil {
+		return &relayerpb.GetTpuConfigsResponse{}, nil
+	}
+	return r.config, nil
+}
+
+func (r *mockRelayer) SubscribePackets(_ *relayerpb.SubscribePacketsRequest, stream relayerpb.Relayer_SubscribePacketsServer) error {
+	md, _ := metadata.FromIncomingContext(stream.Context())
+	if auth := md.Get("authorization"); len(auth) != 1 || !strings.HasPrefix(auth[0], "Bearer access-") {
+		return status.Error(codes.Unauthenticated, "missing bearer")
+	}
+	r.subscriptions.Add(1)
+	if err := stream.SendHeader(metadata.MD{}); err != nil {
+		return err
+	}
+	var heartbeats <-chan time.Time
+	if r.heartbeatEvery > 0 {
+		ticker := time.NewTicker(r.heartbeatEvery)
+		defer ticker.Stop()
+		heartbeats = ticker.C
+	}
+	var count uint64
+	for {
+		select {
+		case <-stream.Context().Done():
+			return nil
+		case err := <-r.endStream:
+			return err
+		case msg := <-r.send:
+			if err := stream.Send(msg); err != nil {
+				return err
+			}
+		case <-heartbeats:
+			if r.stall.Load() {
+				continue
+			}
+			count++
+			if err := stream.Send(&relayerpb.SubscribePacketsResponse{
+				Msg: &relayerpb.SubscribePacketsResponse_Heartbeat{Heartbeat: &sharedpb.Heartbeat{Count: count}},
+			}); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 func (r *mockRelayer) last() metadata.MD {

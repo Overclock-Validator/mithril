@@ -70,7 +70,8 @@ func TestAuthMessageIsBase58PubkeyDashChallenge(t *testing.T) {
 func TestAuthenticateHandshakeAndBearer(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	auth := newMockAuth(func() time.Time { return now })
-	relayer := &mockRelayer{}
+	relayer := newMockRelayer(nil)
+	relayer.heartbeatEvery = 0
 	cfg := serveBufconn(t, func(s *grpc.Server) {
 		authpb.RegisterAuthServiceServer(s, auth)
 		relayerpb.RegisterRelayerServer(s, relayer)
