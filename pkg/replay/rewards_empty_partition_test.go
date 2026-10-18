@@ -79,14 +79,14 @@ func TestSameBankRewardPartitionWaitsForStartingBlockHeight(t *testing.T) {
 		NumRewardPartitionsRemaining: 1,
 	}
 	replayCtx := &ReplayCtx{Capitalization: 12345}
-	updated, parents := distributePartitionedEpochRewardsForSlot(db, nil, []*accounts.Account{activeAccount}, replayCtx, distribution, 11, 100)
+	updated, parents, _ := distributePartitionedEpochRewardsForSlot(db, nil, []*accounts.Account{activeAccount}, replayCtx, distribution, 11, 100)
 
 	require.Equal(t, uint64(1), distribution.NumRewardPartitionsRemaining)
 	require.Equal(t, uint64(12345), replayCtx.Capitalization)
 	require.Empty(t, updated)
 	require.Empty(t, parents)
 
-	updated, parents = distributePartitionedEpochRewardsForSlot(db, nil, []*accounts.Account{activeAccount}, replayCtx, distribution, 11, 101)
+	updated, parents, _ = distributePartitionedEpochRewardsForSlot(db, nil, []*accounts.Account{activeAccount}, replayCtx, distribution, 11, 101)
 
 	require.Zero(t, distribution.NumRewardPartitionsRemaining)
 	require.Equal(t, uint64(12345), replayCtx.Capitalization)

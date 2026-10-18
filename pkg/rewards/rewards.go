@@ -13,6 +13,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
+	"github.com/Overclock-Validator/mithril/pkg/epochstakes"
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
@@ -37,6 +38,7 @@ type PartitionedRewardDistributionInfo struct {
 	NumRewardPartitionsRemaining uint64
 	SpoolDir                     string
 	SpoolSlot                    uint64
+	VoteCommissions              map[solana.PublicKey]uint8
 }
 
 type CalculatedStakePoints struct {
@@ -318,13 +320,13 @@ func DistributeVotingRewards(acctsDb *accountsdb.AccountsDb, validatorRewards ma
 	return updatedAccts, parentUpdatedAccts, totalVotingRewards.Load()
 }
 
-func DistributeStakingRewardsFromSpool(acctsDb *accountsdb.AccountsDb, spoolDir string, spoolSlot uint64, partitionIdx uint64, currentSlot uint64, loader RewardAccountLoader) ([]*accounts.Account, []*accounts.Account, uint64, uint64) {
+func DistributeStakingRewardsFromSpool(acctsDb *accountsdb.AccountsDb, spoolDir string, spoolSlot uint64, partitionIdx uint64, currentSlot uint64, loader RewardAccountLoader, voteCommissions map[solana.PublicKey]uint8) ([]*accounts.Account, []*accounts.Account, uint64, uint64, map[solana.PublicKey]uint8) {
 	reader, err := NewPartitionReader(spoolDir, spoolSlot, uint32(partitionIdx))
 	if err != nil {
 		panic(fmt.Sprintf("unable to open partition %d spool for distribution: %s", partitionIdx, err))
 	}
 	if reader == nil {
-		return nil, nil, 0, 0
+		return nil, nil, 0, 0, nil
 	}
 	defer reader.Close()
 
@@ -341,7 +343,17 @@ func DistributeStakingRewardsFromSpool(acctsDb *accountsdb.AccountsDb, spoolDir 
 	}
 
 	if len(records) == 0 {
-		return nil, nil, 0, 0
+		return nil, nil, 0, 0, nil
+	}
+
+	var stakeCommissions map[solana.PublicKey]uint8
+	if voteCommissions != nil {
+		stakeCommissions = make(map[solana.PublicKey]uint8, len(records))
+		for _, record := range records {
+			if commission, ok := voteCommissions[record.VotePubkey]; ok {
+				stakeCommissions[record.StakePubkey] = commission
+			}
+		}
 	}
 
 	accts := make([]*accounts.Account, len(records))
@@ -435,7 +447,7 @@ func DistributeStakingRewardsFromSpool(acctsDb *accountsdb.AccountsDb, spoolDir 
 		}
 	}
 
-	return accts, parentAccts, distributedLamports.Load(), burnedLamports.Load()
+	return accts, parentAccts, distributedLamports.Load(), burnedLamports.Load(), stakeCommissions
 }
 
 func minimumStakeDelegation(slotCtx *sealevel.SlotCtx) uint64 {
@@ -451,50 +463,42 @@ func minimumStakeDelegation(slotCtx *sealevel.SlotCtx) uint64 {
 	return 1
 }
 
-func selectCommissionVoteState(
-	votePubkey solana.PublicKey,
-	distributionVoteStates map[solana.PublicKey]*sealevel.VoteStateVersions,
-	rewardedEpochVoteStates map[solana.PublicKey]*sealevel.VoteStateVersions,
-	snapshotEpochVoteStates map[solana.PublicKey]*sealevel.VoteStateVersions,
-) *sealevel.VoteStateVersions {
-	if snapshotEpochVoteStates != nil {
-		if voteState := snapshotEpochVoteStates[votePubkey]; voteState != nil {
-			return voteState
-		}
-	}
-
-	if rewardedEpochVoteStates != nil {
-		if voteState := rewardedEpochVoteStates[votePubkey]; voteState != nil {
-			return voteState
-		}
-	}
-
-	return distributionVoteStates[votePubkey]
-}
-
 func buildDelayedCommissionVoteStateCache(
 	distributionVoteStates map[solana.PublicKey]*sealevel.VoteStateVersions,
 	rewardedEpoch uint64,
-) map[solana.PublicKey]*sealevel.VoteStateVersions {
+) (map[solana.PublicKey]*sealevel.VoteStateVersions, error) {
 	if len(distributionVoteStates) == 0 {
-		return nil
+		return nil, nil
 	}
 
-	rewardedEpochVoteStates := global.EpochVoteStateSnapshot(rewardedEpoch)
-	var snapshotEpochVoteStates map[solana.PublicKey]*sealevel.VoteStateVersions
-	if rewardedEpoch > 0 {
-		snapshotEpochVoteStates = global.EpochVoteStateSnapshot(rewardedEpoch - 1)
-	}
-
+	// Agave v4.4.0-beta.0 bank.rs:1826-1846 and
+	// partitioned_epoch_rewards/calculation.rs:737-754 use epoch-stakes keys
+	// E then E+1 when rewarding E. These capture commissions at the starts of
+	// E-1 and E respectively. The persisted snapshots also survive restarts.
+	older, _ := global.EpochStakesSnapshot(rewardedEpoch)
+	newer, _ := global.EpochStakesSnapshot(rewardedEpoch + 1)
 	commissionVoteStates := make(map[solana.PublicKey]*sealevel.VoteStateVersions, len(distributionVoteStates))
-	for votePubkey := range distributionVoteStates {
-		voteState := selectCommissionVoteState(votePubkey, distributionVoteStates, rewardedEpochVoteStates, snapshotEpochVoteStates)
-		if voteState != nil {
-			commissionVoteStates[votePubkey] = voteState
+	for votePubkey, current := range distributionVoteStates {
+		commissionVoteStates[votePubkey] = current
+		for _, snapshot := range []epochstakes.Snapshot{older, newer} {
+			historical, exists := snapshot.VoteAccounts[votePubkey]
+			if !exists {
+				continue
+			}
+			// A missing field in an old checkpoint is not an absent vote
+			// account. Falling back here silently applies a newer commission.
+			if historical == nil || historical.InflationRewardsCommissionBps == nil {
+				return nil, fmt.Errorf("missing historical inflation commission for vote account %s in epoch stakes %d; restore this generation from retained snapshot metadata", votePubkey, snapshot.Epoch)
+			}
+			commissionVoteStates[votePubkey] = &sealevel.VoteStateVersions{
+				Type: sealevel.VoteStateVersionV4,
+				V4:   sealevel.VoteState4{InflationRewardsCommissionBps: *historical.InflationRewardsCommissionBps},
+			}
+			break
 		}
 	}
 
-	return commissionVoteStates
+	return commissionVoteStates, nil
 }
 
 func CalculateRewardPartitionForPubkey(pubkey solana.PublicKey, blockhash [32]byte, numPartitions uint64) uint64 {
@@ -642,6 +646,17 @@ func voteInflationRewardsCollector(votePubkey solana.PublicKey, voteState *seale
 		return voteState.V4.InflationRewardsCollector
 	}
 	return votePubkey
+}
+
+func accumulateVotingReward(validatorRewards map[solana.PublicKey]*atomic.Uint64, votePubkey solana.PublicKey, voteState *sealevel.VoteStateVersions, customCollector bool, amount uint64) {
+	// Zero commission still produces a vote reward record.
+	collector := voteInflationRewardsCollector(votePubkey, voteState, customCollector)
+	accumulator := validatorRewards[collector]
+	if accumulator == nil {
+		accumulator = &atomic.Uint64{}
+		validatorRewards[collector] = accumulator
+	}
+	accumulator.Add(amount)
 }
 
 func calculateStakePointsAndCredits(
@@ -805,8 +820,11 @@ type StreamingRewardsResult struct {
 	TotalPoints        wide.Uint128
 	TotalStakerRewards uint64
 	ValidatorRewards   map[solana.PublicKey]*atomic.Uint64
-	NumStakeRewards    uint64
-	NumPartitions      uint64
+	// VoteCommissions records selected legacy percentages. Custom collectors
+	// and basis-point commissions do not populate the legacy commission field.
+	VoteCommissions map[solana.PublicKey]uint8
+	NumStakeRewards uint64
+	NumPartitions   uint64
 }
 
 // spoolWriteRequest is sent to the single-writer goroutine for spool writes.
@@ -970,7 +988,23 @@ func CalculateRewardsStreaming(
 	pv := PointValue{Rewards: pointValue.Rewards, Points: totalPoints}
 	var commissionVoteStates map[solana.PublicKey]*sealevel.VoteStateVersions
 	if f.IsActive(features.DelayCommissionUpdates) {
-		commissionVoteStates = buildDelayedCommissionVoteStateCache(voteCache, rewardedEpoch)
+		commissionVoteStates, err = buildDelayedCommissionVoteStateCache(voteCache, rewardedEpoch)
+		if err != nil {
+			CleanupPointsSpoolFile(pointsPath)
+			return nil, err
+		}
+	}
+	var voteCommissions map[solana.PublicKey]uint8
+	if !f.IsActive(features.CustomCommissionCollector) && !f.IsActive(features.CommissionRateInBasisPoints) {
+		voteCommissions = make(map[solana.PublicKey]uint8, len(voteCache))
+		for votePubkey, selected := range voteCache {
+			if historical := commissionVoteStates[votePubkey]; historical != nil {
+				selected = historical
+			}
+			if selected != nil {
+				voteCommissions[votePubkey] = uint8(voteInflationCommissionBPS(selected, false) / 100)
+			}
+		}
 	}
 
 	tempWriter, err := NewTempSpoolWriter(spoolDir, slot)
@@ -1084,17 +1118,8 @@ func CalculateRewardsStreaming(
 			return nil, fmt.Errorf("temp spool write failed: %w", err)
 		}
 
-		if splitResult.VoterPortion > 0 {
-			collector := voteInflationRewardsCollector(
-				rec.VotePubkey, voteState, f.IsActive(features.CustomCommissionCollector),
-			)
-			accumulator := validatorRewards[collector]
-			if accumulator == nil {
-				accumulator = &atomic.Uint64{}
-				validatorRewards[collector] = accumulator
-			}
-			accumulator.Add(splitResult.VoterPortion)
-		}
+		accumulateVotingReward(validatorRewards, rec.VotePubkey, voteState,
+			f.IsActive(features.CustomCommissionCollector), splitResult.VoterPortion)
 	}
 
 	pointsReader.Close()
@@ -1171,6 +1196,7 @@ func CalculateRewardsStreaming(
 		TotalPoints:        reportedPoints,
 		TotalStakerRewards: phase2TotalStakerRewards,
 		ValidatorRewards:   validatorRewards,
+		VoteCommissions:    voteCommissions,
 		NumStakeRewards:    actualRewardCount,
 		NumPartitions:      numPartitions,
 	}, nil

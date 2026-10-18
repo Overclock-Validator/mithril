@@ -243,6 +243,79 @@ func TestWorkingBankRejectsUnsupportedV1WithoutCharging(t *testing.T) {
 	assert.Zero(t, env.Bank.TxFeeAccumulator().TotalFees)
 }
 
+func resignWithPayer(t *testing.T, tx *solana.Transaction) {
+	t.Helper()
+	tx.Signatures = nil
+	payerKey := txfixture.PayerPrivateKey()
+	_, err := tx.Sign(func(key solana.PublicKey) *solana.PrivateKey {
+		if key.Equals(txfixture.PayerPubkey()) {
+			return &payerKey
+		}
+		return nil
+	})
+	require.NoError(t, err)
+}
+
+func assertForgeDroppedWithoutCharging(t *testing.T, env *TestEnv, tx *solana.Transaction, want ForgeResult) {
+	t.Helper()
+	wire, err := tx.MarshalBinary()
+	require.NoError(t, err)
+	payerBefore, err := env.SlotCtx.GetAccount(txfixture.PayerPubkey())
+	require.NoError(t, err)
+
+	result, reason := env.Bank.ForgeTransaction(tx, len(wire))
+	assert.Equal(t, want, result)
+	assert.Equal(t, costmodel.ExceedNone, reason)
+	payerAfter, err := env.SlotCtx.GetAccount(txfixture.PayerPubkey())
+	require.NoError(t, err)
+	assert.Equal(t, payerBefore.Lamports, payerAfter.Lamports)
+	assert.Empty(t, env.Bank.ForgedTransactions())
+	assert.Zero(t, env.Bank.TxFeeAccumulator().TotalFees)
+}
+
+func TestWorkingBankRejectsDuplicateAccountKeyWithoutCharging(t *testing.T) {
+	env := NewTestEnv(TestEnvConfig{})
+	defer env.Close()
+
+	// [payer, dest, system] -> [payer, dest, dest, system]: dest is named
+	// twice, which the account lock rules forbid.
+	tx := mustSignedTransfer(t, 1)
+	keys := tx.Message.AccountKeys
+	require.Len(t, keys, 3)
+	tx.Message.AccountKeys = solana.PublicKeySlice{keys[0], keys[1], keys[1], keys[2]}
+	for i := range tx.Message.Instructions {
+		if tx.Message.Instructions[i].ProgramIDIndex == 2 {
+			tx.Message.Instructions[i].ProgramIDIndex = 3
+		}
+	}
+	resignWithPayer(t, tx)
+
+	assertForgeDroppedWithoutCharging(t, env, tx, ForgeDroppedAccountLocks)
+}
+
+func TestWorkingBankRejectsTooManyAccountLocksWithoutCharging(t *testing.T) {
+	env := NewTestEnv(TestEnvConfig{})
+	defer env.Close()
+	require.False(t, env.SlotCtx.Features.IsActive(features.IncreaseTxAccountLockLimit))
+
+	// Three static keys plus 62 looked-up addresses name 65 accounts, one
+	// more than the lock limit without IncreaseTxAccountLockLimit.
+	tx := mustSignedTransfer(t, 1)
+	_, err := tx.Message.SetVersion(solana.MessageVersionV0)
+	require.NoError(t, err)
+	indexes := make(solana.Uint8SliceAsNum, 62)
+	for i := range indexes {
+		indexes[i] = uint8(i)
+	}
+	tx.Message.AddressTableLookups = solana.MessageAddressTableLookupSlice{{
+		AccountKey:      solana.NewWallet().PublicKey(),
+		ReadonlyIndexes: indexes,
+	}}
+	resignWithPayer(t, tx)
+
+	assertForgeDroppedWithoutCharging(t, env, tx, ForgeDroppedAccountLocks)
+}
+
 func TestWorkingBankAcceptsTransferThatDrainsPayerToZero(t *testing.T) {
 	env := NewTestEnv(TestEnvConfig{})
 	defer env.Close()
@@ -265,7 +338,7 @@ func TestWorkingBankAcceptsTransferThatDrainsPayerToZero(t *testing.T) {
 	assert.Equal(t, destBefore.Lamports+transfer, destAfter.Lamports)
 }
 
-func TestWorkingBankDropsTransferThatLeavesPayerBelowRent(t *testing.T) {
+func TestWorkingBankIncludesTransferThatLeavesPayerBelowRentAsFailed(t *testing.T) {
 	env := NewTestEnv(TestEnvConfig{})
 	defer env.Close()
 
@@ -276,14 +349,27 @@ func TestWorkingBankDropsTransferThatLeavesPayerBelowRent(t *testing.T) {
 	destBefore, err := env.SlotCtx.GetAccount(txfixture.DestPubkey())
 	require.NoError(t, err)
 	tx := mustSignedTransfer(t, transfer)
+	// The payer can pay the fee and stay rent exempt, so it passes fee-payer
+	// validation; only the transfer leaves it below rent, which the
+	// post-execution rent-state check reports. That failure is includable.
+	preview := replay.LoadAndExecuteTransaction(replay.LoadAndExecuteTransactionInput{
+		SlotCtx: env.SlotCtx, Transaction: tx, LeanResult: true,
+	})
+	require.NotNil(t, preview.ProcessingResult.TransactionError)
+	require.Equal(t, replay.TransactionErrorInsufficientFundsForRent, preview.ProcessingResult.TransactionError.ErrorType)
+	require.NotNil(t, preview.ExecCtx)
+
 	result, reason := env.Bank.ForgeTransaction(tx, 200)
-	require.Equal(t, ForgeDroppedExecution, result)
+	require.Equal(t, ForgeAccepted, result)
 	require.Equal(t, costmodel.ExceedNone, reason)
 
 	destAfter, err := env.SlotCtx.GetAccount(txfixture.DestPubkey())
 	require.NoError(t, err)
 	assert.Equal(t, destBefore.Lamports, destAfter.Lamports)
-	assert.Empty(t, env.Bank.ForgedTransactions())
+	payerAfter, err := env.SlotCtx.GetAccount(txfixture.PayerPubkey())
+	require.NoError(t, err)
+	assert.Equal(t, transfer+leftover, payerAfter.Lamports, "only the fee is charged")
+	assert.Equal(t, []*solana.Transaction{tx}, env.Bank.ForgedTransactions())
 }
 
 func TestWorkingBankForgesTransfer(t *testing.T) {

@@ -44,15 +44,16 @@ type RentCollector struct {
 }
 
 type VoteAccount struct {
-	Lamports              uint64
-	NodePubkey            solana.PublicKey
-	BlsPubkeyCompressed   *[48]byte
-	BlockRevenueCollector *solana.PublicKey
-	LastTimestampTs       int64
-	LastTimestampSlot     uint64
-	Owner                 solana.PublicKey
-	Executable            byte
-	RentEpoch             uint64
+	Lamports                      uint64
+	NodePubkey                    solana.PublicKey
+	BlsPubkeyCompressed           *[48]byte
+	BlockRevenueCollector         *solana.PublicKey
+	InflationRewardsCommissionBps *uint16
+	LastTimestampTs               int64
+	LastTimestampSlot             uint64
+	Owner                         solana.PublicKey
+	Executable                    byte
+	RentEpoch                     uint64
 }
 
 type VoteAccountsPair struct {
@@ -430,6 +431,8 @@ func (voteAcct *VoteAccount) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 
 			collector := voteState.BlockRevenueCollector()
 			voteAcct.BlockRevenueCollector = &collector
+			commission := voteState.InflationRewardsCommissionBps()
+			voteAcct.InflationRewardsCommissionBps = &commission
 			voteAcct.LastTimestampTs = voteTimestamp.Timestamp
 			voteAcct.LastTimestampSlot = voteTimestamp.Slot
 		}

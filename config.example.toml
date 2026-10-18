@@ -101,6 +101,19 @@ name = "mithril"
     # longer bounded re-execution window after a hard crash. Range 32..512.
     fold_batch_slots = 128
 
+    # Fold sooner when retained account versions reach this byte target (MiB).
+    # Slot versions are indivisible, so the final slot may overshoot the target.
+    fold_max_mb = 4096
+    # Pause replay at slot boundaries to drain safe folds at this retained-state
+    # budget. Halt if finality/verification prevents progress. Includes account
+    # backing-array capacities and estimated bookkeeping, not the entire heap.
+    # Leave RAM headroom for the executing slot, caches, runtime and GC.
+    working_set_max_mb = 16384
+    # Stop admitting folds before they consume this free-space reserve (MiB).
+    # Also monitor accounts, shredstore and log volumes during replay. Leaves
+    # room for vote history, in-flight I/O and graceful recovery/shutdown writes.
+    min_free_mb = 32768
+
     # Account-index Pebble WAL. Set false to remove the WAL write stream
     # entirely: fold manifests then serve as the index redo log and recovery
     # replays them. Keep true until the deployment has soaked.
@@ -112,14 +125,16 @@ name = "mithril"
     # re-bootstrapping from a snapshot. Also pins those batches' files against
     # compaction. At K=128 slots/batch, 64 batches =~ 55 minutes of chain.
     rewind_horizon_batches = 64
+    # Byte-triggered smaller folds shorten the corresponding slot/time span.
 
     # Background compaction: reclaims dead bytes from out-of-horizon segments
     # and bootstrap appendvecs (folds never overwrite, so superseded account
-    # versions accumulate). OFF by default until soaked — each cycle holds the
-    # store's fold lock while it works, so on a latency-sensitive validator keep
-    # the per-cycle budgets small (defaults below) to avoid stalling folds.
+    # versions accumulate). Enabled by default in rooted-durable mode. Large
+    # segments release obsolete payload pages while retaining exact live/undo
+    # records and their offsets. Cycles have bounded scan/file/time budgets.
     #[storage.compact]
-    #    enabled = false
+    #    enabled = true
+    #    interval_seconds = 1
     #    # Move a file's live records only once at least this fraction is dead.
     #    min_dead_fraction = 0.7
     #    # Per-cycle caps on live bytes moved / bytes scanned (MiB). Smaller =
@@ -503,6 +518,10 @@ name = "mithril"
 # The defaults work well for most deployments.
 
 [tuning]
+    # Soft Go runtime memory limit in MiB. 0 preserves GOMEMLIMIT/runtime default.
+    # For a dedicated 128 GiB host, 81920 leaves room for the OS and native memory.
+    # This is not a hard RSS ceiling and cannot reclaim live retained accounts.
+    memory_limit_mb = 0
     # Transaction parallelism for block execution. Validator mode defaults to
     # 2x CPU cores when this key and --txpar are both unset. Verifying mode
     # stays sequential by default; explicit 0 always requests sequential mode.
@@ -595,6 +614,11 @@ name = "mithril"
     [tuning.pprof]
         # Port to serve HTTP pprof endpoint (-1 to disable)
         # port = 6060
+
+        # Capture a heap profile when Go runtime memory exceeds this MiB value.
+        # 0 disables capture. At most once/minute, rotating three files in the
+        # run log directory; no forced GC. Runtime memory is logged every 10s.
+        heap_profile_threshold_mb = 0
 
         # Filename to write CPU profile (for offline analysis with go tool pprof)
         # cpu_profile_path = "/mnt/mithril-data/profiling/cpu.pprof"

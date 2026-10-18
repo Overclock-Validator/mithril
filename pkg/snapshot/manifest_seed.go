@@ -130,15 +130,16 @@ func convertVersionedEpochStakesToPersisted(stakes []VersionedEpochStakesPair) m
 				collector = va.Value.BlockRevenueCollector.String()
 			}
 			persisted.VoteAccts[pkStr] = &epochstakes.VoteAccountJSON{
-				BlockRevenueCollector: collector,
-				Lamports:              va.Value.Lamports,
-				NodePubkey:            base58.Encode(va.Value.NodePubkey[:]),
-				BlsPubkeyCompressed:   bls,
-				LastTimestampTs:       va.Value.LastTimestampTs,
-				LastTimestampSlot:     va.Value.LastTimestampSlot,
-				Owner:                 base58.Encode(va.Value.Owner[:]),
-				Executable:            va.Value.Executable,
-				RentEpoch:             va.Value.RentEpoch,
+				BlockRevenueCollector:         collector,
+				InflationRewardsCommissionBps: va.Value.InflationRewardsCommissionBps,
+				Lamports:                      va.Value.Lamports,
+				NodePubkey:                    base58.Encode(va.Value.NodePubkey[:]),
+				BlsPubkeyCompressed:           bls,
+				LastTimestampTs:               va.Value.LastTimestampTs,
+				LastTimestampSlot:             va.Value.LastTimestampSlot,
+				Owner:                         base58.Encode(va.Value.Owner[:]),
+				Executable:                    va.Value.Executable,
+				RentEpoch:                     va.Value.RentEpoch,
 			}
 		}
 

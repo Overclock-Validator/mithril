@@ -91,6 +91,10 @@ func newGroupExecutionEnv(t *testing.T, txParallelism int, payerLamports uint64)
 		VoteTimestamps:  make(map[solana.PublicKey]sealevel.BlockTimestamp),
 		Replay:          true,
 	}
+	slotHashes := sealevel.SysvarSlotHashes{{Slot: block.Slot - 1, Hash: [32]byte{0x61}}}
+	bankSysvars, err := sealevel.NewBankSysvars(block.Slot,
+		&accounts.Account{Key: sealevel.SysvarSlotHashesAddr, Lamports: 1, Data: slotHashes.MustMarshal()})
+	require.NoError(t, err)
 	source := &memBlockSource{mem: durable}
 	exec := &blockExecution{
 		block:          block,
@@ -99,6 +103,7 @@ func newGroupExecutionEnv(t *testing.T, txParallelism int, payerLamports uint64)
 		slotCtx:        slotCtx,
 		parentAccts:    parent,
 		accts:          overlay,
+		bankSysvars:    bankSysvars,
 		ctx:            context.Background(),
 		setReplayStage: func(string) {},
 		seenMessages:   make(map[[32]byte]int),
@@ -321,13 +326,28 @@ func TestStreamingGroupRejectsUnprocessableTransactions(t *testing.T) {
 	}
 }
 
+func TestStreamingGroupReportsBlockIndex(t *testing.T) {
+	for _, workers := range []int{0, 4} {
+		env := newGroupExecutionEnv(t, workers, 10_000_000)
+		defer env.cleanup()
+		txs := transferTransactions(t, 4, 1)
+		require.NoError(t, env.exec.executeTransactionGroup(txs[:2], nil, false))
+		txs[3].Message.RecentBlockhash = solana.Hash{0xFA}
+		err := env.exec.executeTransactionGroup(txs[2:], nil, false)
+		require.ErrorIs(t, err, TxErrInvalidBlockhash)
+		var unprocessable *UnprocessableTransactionError
+		require.ErrorAs(t, err, &unprocessable)
+		require.Equal(t, 3, unprocessable.Index, "workers %d", workers)
+	}
+}
+
 func TestStreamingGroupRejectsUnresolvedLookupsBeforeExecution(t *testing.T) {
 	for _, workers := range []int{0, 4} {
 		env := newGroupExecutionEnv(t, workers, 10_000_000)
 		defer env.cleanup()
 		txs := decodeTransactions(t, [][]byte{signedV0TransferViaTableWire(t, 1)})
 		err := env.exec.executeTransactionGroup(txs, nil, false)
-		require.ErrorContains(t, err, "unresolved address tables")
+		require.ErrorIs(t, err, TxErrAddressLookupTableNotFound)
 		require.Zero(t, env.exec.slotCtx.TotalComputeUnitsConsumed)
 	}
 }

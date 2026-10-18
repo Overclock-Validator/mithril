@@ -33,6 +33,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/blockstream"
 	"github.com/Overclock-Validator/mithril/pkg/config"
 	consensusengine "github.com/Overclock-Validator/mithril/pkg/consensus"
+	"github.com/Overclock-Validator/mithril/pkg/epochstakes"
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
@@ -490,8 +491,16 @@ func refreshManifestSeedFromManifest(accountsPath string, s *state.MithrilState,
 	// ManifestEpochStakes is deliberately cleared after replay starts to release
 	// the large JSON seed.  A later graceful state save persists that cleared
 	// value, so schedule metadata alone does not mean the manifest seed is
-	// complete on restart.  Rehydrate when the stakes payload is absent.
-	if manifestEpochScheduleSeedMatches(s, manifest) &&
+	// complete on restart. Rehydrate when the payload is absent or an older
+	// binary discarded its historical commissions.
+	commissionsComplete := true
+	for _, seed := range s.ManifestEpochStakes {
+		if !epochstakes.HasInflationCommissionMetadata([]byte(seed)) {
+			commissionsComplete = false
+			break
+		}
+	}
+	if commissionsComplete && manifestEpochScheduleSeedMatches(s, manifest) &&
 		s.SnapshotEpoch == snapshotEpoch && len(s.ManifestEpochStakes) > 0 {
 		return
 	}
@@ -1193,7 +1202,10 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		return fmt.Errorf("tuning.common_account_cache_max_mb must be > 0")
 	}
 
-	return nil
+	if err := configureMemoryBudgets(); err != nil {
+		return err
+	}
+	return configureDiskBudget()
 }
 
 // buildSnapshotConfig creates a snapshotdl.SnapshotConfig from the mithril config.
@@ -1356,6 +1368,12 @@ func runLive(c *cobra.Command, args []string) {
 		fmt.Fprintf(os.Stderr, "warning: failed to initialize file logging: %v\n", err)
 	}
 	defer mlog.Shutdown()
+	if nodeMemoryLimit > 0 {
+		debug.SetMemoryLimit(nodeMemoryLimit)
+	}
+	mlog.Log.Infof("Go runtime soft memory limit: %d MiB (tuning.memory_limit_mb overrides GOMEMLIMIT when set)", debug.SetMemoryLimit(-1)>>20)
+	stopMemoryDiagnostics := startMemoryDiagnostics(ctx, mlog.GetLogDir(), heapProfileThreshold)
+	defer stopMemoryDiagnostics()
 
 	// Kill any existing mithril processes to prevent zombie accumulation
 	if killed := killExistingMithrilProcesses(); killed > 0 {
@@ -2348,6 +2366,8 @@ postBootstrap:
 		RewindHorizonBatches: 64,
 		MaxMoveBytesPerCycle: 64 << 20,  // 64 MiB moved per cycle
 		MaxScanBytesPerCycle: 256 << 20, // 256 MiB scanned per cycle
+		MaxFilesPerCycle:     16,
+		MaxDuration:          time.Second,
 	}
 	if v := config.GetInt("storage.rewind_horizon_batches"); v > 0 {
 		compactCfg.RewindHorizonBatches = uint64(v)
@@ -2361,11 +2381,16 @@ postBootstrap:
 	if v := config.GetInt("storage.compact.max_scan_mb"); v > 0 {
 		compactCfg.MaxScanBytesPerCycle = int64(v) << 20
 	}
-	// Background compaction is OFF by default until soaked (it holds the store's
-	// fold lock during each cycle); operators opt in via storage.compact.enabled.
-	compactEnabled := false
+	accountsDb.MinFreeBytes = storageMinFreeBytes
+	// Rooted storage is append-only: reclamation must run during normal replay.
+	// Large segments reclaim dead payload pages without relocating undo records.
+	compactEnabled := alpenglowMode
 	if alpenglowMode && config.IsSet("storage.compact.enabled") {
 		compactEnabled = config.GetBool("storage.compact.enabled")
+	}
+	compactInterval := time.Second
+	if seconds := config.GetInt("storage.compact.interval_seconds"); seconds > 0 {
+		compactInterval = time.Duration(seconds) * time.Second
 	}
 
 	// Crash recovery reconcile: the durable fold frontier (recovered above from
@@ -2565,7 +2590,16 @@ postBootstrap:
 	if rpcPort < 0 || rpcPort > 65535 {
 		klog.Fatalf("invalid port: %d", rpcPort)
 	} else if rpcPort != 0 {
-		rpcServer = rpcserver.NewRpcServer(accountsDb, uint16(rpcPort), epochScheduleFromState(mithrilState), solana.MustHashFromBase58(networkGenesisHash))
+		schedule := epochScheduleFromState(mithrilState)
+		rpcServer = rpcserver.NewRpcServer(accountsDb, uint16(rpcPort), schedule, solana.MustHashFromBase58(networkGenesisHash))
+		if alpenglowMode {
+			if schedule == nil || schedule.SlotsPerEpoch == 0 || schedule.SlotsPerEpoch > math.MaxUint64/3 {
+				klog.Fatalf("Alpenglow RPC requires a valid epoch schedule")
+			}
+			if err := rpcServer.EnableEpochRewards(filepath.Join(accountsPath, "rpc-epoch-rewards"), 3*schedule.SlotsPerEpoch, mithrilState.LastRootedSlot); err != nil {
+				klog.Fatalf("unable to load RPC epoch rewards: %v", err)
+			}
+		}
 		rpcServer.SetIdentity(validatorIdentityPubkey)
 		rpcServer.Start()
 		mlog.Log.Infof("Started RPC server on port %d", rpcPort)
@@ -2941,30 +2975,25 @@ postBootstrap:
 	// out-of-horizon segments and bootstrap appendvecs. Each cycle is bounded
 	// (move + scan budgets) and serialized against folds via the store's
 	// internal lock; the rewind horizon pins are what it must never touch.
+	stopCompactor := func() {}
 	if compactEnabled {
-		go func() {
-			ticker := time.NewTicker(10 * time.Minute)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					if _, cerr := accountsDb.CompactOnce(compactCfg); cerr != nil {
-						mlog.Log.Warnf("compaction cycle failed: %v", cerr)
-					}
-				}
-			}
-		}()
+		stopCompactor = startAccountsCompactor(ctx, accountsDb, compactCfg, compactInterval)
+		defer stopCompactor()
 	}
 
 	startSigverifyReporter(ctx)
+	mlog.Log.Infof("storage space guard enabled (reserve=%d MiB; checked before folds and every second)", storageMinFreeBytes>>20)
+	stopSpaceGuard := startStorageSpaceGuard(ctx, func() error {
+		return checkStorageSpace([]string{accountsPath, blockstorePath, mlog.GetLogDir()}, storageMinFreeBytes, accountsdb.AvailableDiskBytes)
+	}, cancelRun)
+	defer stopSpaceGuard()
 
 	turbineAlpenglowAddr := ""
 	if alpenglowMode {
 		turbineAlpenglowAddr = alpenglowAddrForGossip(alpenglowObserverBindAddr)
 	}
 	result := runReplayWithRecovery(ctx, accountsDb, accountsPath, manifest, resumeState, uint64(startSlot), liveEndSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, uint16(turbineShredVersion), turbineAlpenglowAddr, validatorIdentity, blockstorePath, int(txParallelism), true, useLightbringer, useTurbine, dbgOpts, metricsWriter, slotCtxSetter, mithrilState, blockFetchOpts, consensusOpts, compactCfg.RewindHorizonBatches, replayStartTime)
+	stopCompactor() // join before shutdown closes AccountsDB
 
 	if result.Error != nil {
 		if result.LastPersistedSlot == 0 {
@@ -4334,7 +4363,11 @@ func completeInterruptedRewind(accountsDbPath string, accountsDb *accountsdb.Acc
 // boundary strictly below divSlot and adopts that boundary's context as the
 // rooted checkpoint. Returns false (caller halts) when no boundary below the
 // divergence is retained or the rewind/reconcile fails.
-func rewindStoreBelowDivergence(accountsDbPath string, accountsDb *accountsdb.AccountsDb, s *state.MithrilState, divSlot uint64, rewindHorizon uint64) bool {
+func rewindStoreBelowDivergence(accountsDbPath string, accountsDb *accountsdb.AccountsDb, s *state.MithrilState, divSlot uint64, rewindHorizon uint64, rpcServer replay.SlotCtxSetter) bool {
+	historyGate, hasHistoryGate := rpcServer.(interface{ SetHistoryRecoveryPending(bool) })
+	if hasHistoryGate {
+		historyGate.SetHistoryRecoveryPending(true)
+	}
 	points, err := accountsDb.ListRewindPoints()
 	if err != nil {
 		mlog.Log.Errorf("fork switch: cannot list rewind boundaries: %v; halting", err)
@@ -4365,12 +4398,21 @@ func rewindStoreBelowDivergence(accountsDbPath string, accountsDb *accountsdb.Ac
 		mlog.Log.Errorf("fork switch: rewind to boundary %d failed: %v; halting", target, err)
 		return false
 	}
+	if rewards, ok := rpcServer.(interface{ SetRootedEpochRewardsSlot(uint64) error }); ok {
+		if err := rewards.SetRootedEpochRewardsSlot(res.NewThrough); err != nil {
+			mlog.Log.Errorf("fork switch: rewind RPC epoch rewards to slot %d: %v; halting", res.NewThrough, err)
+			return false
+		}
+	}
 	if err := adoptRewindResult(accountsDbPath, s, res); err != nil {
 		mlog.Log.Errorf("fork switch: %v; halting", err)
 		return false
 	}
 	mlog.Log.Warnf("fork switch: superseded slot %d was already folded (R=%d); rewound durable state to boundary %d (%d batches / %d keys undone)",
 		divSlot, oldRooted, res.NewThrough, res.UndoneBatches, res.UndoneKeys)
+	if hasHistoryGate {
+		historyGate.SetHistoryRecoveryPending(false)
+	}
 	return true
 }
 
@@ -4599,7 +4641,7 @@ func runReplayWithRecovery(
 		// (this is exactly why durable state deliberately lags and undo pointers
 		// are retained for a horizon). Beyond the horizon -> fail closed.
 		if divSlot <= mithrilState.LastRootedSlot {
-			if !rewindStoreBelowDivergence(accountsDbPath, accountsDb, mithrilState, divSlot, rewindHorizon) {
+			if !rewindStoreBelowDivergence(accountsDbPath, accountsDb, mithrilState, divSlot, rewindHorizon, rpcServer) {
 				break
 			}
 		}

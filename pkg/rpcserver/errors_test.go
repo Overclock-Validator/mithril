@@ -82,6 +82,23 @@ func TestInvalidParamsError_FromJSONRPCError(t *testing.T) {
 	assert.Equal(t, "x", e.Message)
 }
 
+func TestEpochRewardHistoryUnavailableError(t *testing.T) {
+	want := &EpochRewardHistoryUnavailableError{Epoch: 7, ContextSlot: 1_024}
+	rpcErr, err := want.ToJSONRPCError()
+	require.NoError(t, err)
+	raw, err := json.Marshal(rpcErr)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), `"code":-32004`)
+	require.Contains(t, string(raw), `"data":{"epoch":7,"contextSlot":1024}`)
+	var wire jsonrpc.JSONRPCError
+	require.NoError(t, json.Unmarshal(raw, &wire))
+	var got EpochRewardHistoryUnavailableError
+	require.NoError(t, got.FromJSONRPCError(wire))
+	require.Equal(t, *want, got)
+	require.Error(t, got.FromJSONRPCError(jsonrpc.JSONRPCError{Code: -32016}))
+	require.Error(t, got.FromJSONRPCError(jsonrpc.JSONRPCError{Code: -32004, Data: map[string]any{"epoch": "invalid"}}))
+}
+
 func TestNodeUnhealthyErrorWireShape(t *testing.T) {
 	behind := uint64(129)
 	rpcErr, err := (&NodeUnhealthyError{NumSlotsBehind: &behind}).ToJSONRPCError()

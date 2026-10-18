@@ -151,6 +151,7 @@ const (
 	ForgeDroppedCost
 	ForgeDroppedExecution
 	ForgeDroppedAlreadyProcessed
+	ForgeDroppedAccountLocks
 )
 
 func (r ForgeResult) String() string {
@@ -169,6 +170,8 @@ func (r ForgeResult) String() string {
 		return "dropped_execution"
 	case ForgeDroppedAlreadyProcessed:
 		return "dropped_already_processed"
+	case ForgeDroppedAccountLocks:
+		return "dropped_account_locks"
 	default:
 		return "unknown"
 	}
@@ -221,6 +224,17 @@ func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, pre
 	if err != nil {
 		b.RebateSchedule(wireSize)
 		return ForgeDroppedParse, costmodel.ExceedNone
+	}
+	// A transaction that repeats an account or exceeds the account lock limit
+	// can never be processed, and a block containing one is invalid. The check
+	// is static, so do it before the bank lock.
+	var lockFeats *features.Features
+	if b.slotCtx != nil {
+		lockFeats = b.slotCtx.Features
+	}
+	if txErr := replay.ValidateAccountLocks(tx, lockFeats); txErr != nil {
+		b.RebateSchedule(wireSize)
+		return ForgeDroppedAccountLocks, costmodel.ExceedNone
 	}
 	ancestorAlreadyProcessed := false
 	var ancestorStatusErr error
@@ -292,7 +306,7 @@ func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, pre
 		Arena:             b.borrowedAccounts,
 	}, prepared)
 	if output.ProcessingResult.TransactionError != nil {
-		feeInfo, err := replay.ApplyFeesOnlyTransaction(b.slotCtx, tx, output)
+		feeInfo, err := replay.ApplyFailedTransaction(b.slotCtx, tx, output)
 		if err != nil {
 			return ForgeDroppedExecution, costmodel.ExceedNone
 		}
