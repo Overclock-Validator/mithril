@@ -109,6 +109,7 @@ var (
 	validatorInitializeReservation   bool
 	validatorCompletionReserveMs     int
 	validatorMaxBufferedTransactions int
+	harmonicConfig                   harmonicSettings
 
 	// Mode thresholds
 	blockNearTipThreshold        int // Enter near-tip when gap <= this
@@ -1056,6 +1057,14 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		// The authorized withdrawer is deliberately NOT required at runtime —
 		// best practice keeps it offline.
 		mlog.Log.Infof("consensus.mode=validator: Alpenglow TPU ingress, block production, and fail-closed Votor voting enabled")
+	}
+
+	// [harmonic] section — optional block engine integration for leader slots.
+	if harmonicConfig, err = loadHarmonicSettings(); err != nil {
+		return err
+	}
+	if harmonicConfig.enabled && consensusMode != "validator" {
+		return fmt.Errorf("harmonic.enabled=true requires consensus.mode=validator")
 	}
 
 	blockMaxRPS = getInt("block-max-rps", "block.max_rps")
@@ -2785,6 +2794,20 @@ postBootstrap:
 		if err := sharedGossip.SetTPUQUIC(tpuAdvertise); err != nil {
 			mlog.Log.Warnf("validator gossip TPU advertisement: %v", err)
 		}
+		// Harmonic is optional. Without it the leader loop has no hooks and
+		// its banks admit TPU transactions from the start.
+		var leaderHooks blockprod.LeaderHooks
+		if harmonicConfig.enabled {
+			hooks, stopHarmonic, err := startHarmonic(ctx, harmonicConfig, validatorIdentity, validatorVoteAccount, tpuService, sharedGossip,
+				gossip.TPUSockets{QUIC: tpuAdvertise, ForwardsQUIC: tpuAdvertise}, tpuCfg.Pipeline.TxV1Enabled)
+			if err != nil {
+				klog.Fatalf("start Harmonic: %v", err)
+			}
+			// Defers run in reverse: the leader loop, which calls the hooks,
+			// stops first, then Harmonic, then the TPU it submits to.
+			defer stopHarmonic()
+			leaderHooks = hooks
+		}
 
 		// Bind and validate local transports before consuming the durable clean
 		// voting marker. Startup configuration failures must not force recovery.
@@ -2892,6 +2915,8 @@ postBootstrap:
 			},
 			LeaderForSlot: global.LeaderForSlot,
 			RewardCerts:   rewardBuilder,
+			Hooks:         leaderHooks,
+			GateTPU:       leaderHooks != nil,
 			OnBlock: func(produced *block.Block) {
 				select {
 				case localBlocks <- produced:

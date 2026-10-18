@@ -321,6 +321,35 @@ func TestExecutorCrankRunsFirstAndItsFailureFallsBack(t *testing.T) {
 	assert.Equal(t, FlagFailed, report.Flags)
 }
 
+func TestExecutorFallsBackAtOnceWhenTheBlockEngineGoesDown(t *testing.T) {
+	h := startExecutor(t, true, nil)
+	env := gatedBank(t, costmodel.Limits{})
+	h.startSlot(10, env, time.Hour)
+	h.exec.BlockEngineHealthChanged(true)
+	h.sync(t)
+	assert.False(t, env.Bank.TPUAllowed())
+	h.exec.BlockEngineHealthChanged(false)
+	require.Eventually(t, env.Bank.TPUAllowed, time.Second, time.Millisecond, "no block can arrive, so the slot falls back before the threshold")
+	report := h.end(t, 10)
+	assert.Equal(t, ModeFallback, report.Mode)
+	assert.Equal(t, FlagFailed, report.Flags)
+
+	// A running block ends with its stream, in order with its bundles.
+	env = gatedBank(t, costmodel.Limits{})
+	h.startSlot(11, env, time.Hour)
+	h.send(t, bundleEvent(11, 1, false, transfer(t, 1)))
+	h.sync(t)
+	h.exec.BlockEngineHealthChanged(false)
+	h.send(t, bundleEvent(11, 2, false, transfer(t, 2)))
+	h.sync(t)
+	assert.Len(t, env.Bank.ForgedTransactions(), 2)
+	assert.False(t, env.Bank.TPUAllowed())
+	h.send(t, StreamLostEvent{Slot: 11})
+	h.sync(t)
+	assert.True(t, env.Bank.TPUAllowed())
+	assert.Equal(t, ModeFallback, h.end(t, 11).Mode)
+}
+
 func TestExecutorSlotsAreIndependent(t *testing.T) {
 	h := startExecutor(t, true, nil)
 	env10 := gatedBank(t, costmodel.Limits{})

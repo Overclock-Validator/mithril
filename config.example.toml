@@ -362,6 +362,43 @@ name = "mithril"
     block_completion_reserve_ms = 0
 
 # ============================================================================
+# [harmonic] - Harmonic Block Engine (optional, consensus.mode = "validator")
+# ============================================================================
+#
+# When enabled, each leader slot asks the Harmonic block engine for its block
+# and executes the block's bundles in order, with local TPU scheduling closed.
+# A slot falls back to local scheduling when the block engine is unavailable
+# at slot start (immediately), when no block arrives by the middle of the
+# slot, or when the block stops early. Harmonic failures never stop the
+# validator. When disabled, leader slots schedule locally from the start.
+
+[harmonic]
+    enabled = false
+    # Block engine gRPC endpoint (http:// or https://), required when enabled.
+    block_engine_url = ""
+    # Optional TLS server name override for the block engine.
+    block_engine_tls_domain = ""
+    # Optional relayer (remote TPU) endpoint. While it and the block engine
+    # are healthy, gossip advertises the relayer's TPU instead of this one.
+    relayer_url = ""
+    relayer_tls_domain = ""
+    # Development only: false disables TLS certificate verification.
+    tls_cert_verify = true
+    # Block engine scheduling strategy: "fba" (default), "fifo" or "mrev".
+    strategy = "fba"
+
+    # Tip programs, required when enabled. Consult the block engine provider
+    # for the cluster's values. Jito's mainnet programs, for reference:
+    #   tip_payment_program          = "T1pyyaTNZsKv2WcRAB8oVnk93mLJw2XzjtVYqCsaHqt"
+    #   tip_distribution_program     = "4R3gSG8BpU4t19KYj8CfnbtRpnT8gtk4dvTHxVRwc2r7"
+    #   merkle_root_upload_authority = "8F4jGUmxF36vQ6yabnsxX6AQVXdKBhs8kGSUuRKSg8Xt"
+    tip_payment_program = ""
+    tip_distribution_program = ""
+    merkle_root_upload_authority = ""
+    # Validator commission on tips, in basis points (0-10000).
+    commission_bps = 0
+
+# ============================================================================
 # [consensus] - Alpenglow Consensus
 # ============================================================================
 #

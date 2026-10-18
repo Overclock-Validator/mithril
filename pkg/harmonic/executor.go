@@ -116,6 +116,10 @@ type hookMessage struct {
 	ended   uint64
 	abort   bool
 	reason  string
+	// threshold reports that slot's threshold passed.
+	threshold uint64
+	// unhealthy reports the block engine session went down.
+	unhealthy bool
 }
 
 type slotState struct {
@@ -142,14 +146,12 @@ type Executor struct {
 	hooksMu sync.Mutex
 	hooks   []hookMessage
 	wake    chan struct{}
-	// thresholds carries threshold expiries to the executor goroutine.
-	thresholds chan uint64
 }
 
 var _ blockprod.LeaderHooks = (*Executor)(nil)
 
 func NewExecutor(cfg ExecutorConfig) *Executor {
-	return &Executor{cfg: cfg, now: time.Now, wake: make(chan struct{}, 1), thresholds: make(chan uint64, 4)}
+	return &Executor{cfg: cfg, now: time.Now, wake: make(chan struct{}, 1)}
 }
 
 // SlotStarted runs under the leader loop's lock, so it only does what cannot
@@ -190,6 +192,16 @@ func (x *Executor) SlotAborted(slot uint64, reason string) {
 	x.post(hookMessage{ended: slot, abort: true, reason: reason})
 }
 
+// BlockEngineHealthChanged reports the block engine session's health. A
+// session that goes down before the slot's block starts takes the block with
+// it, since it reconnects only after a backoff, so the slot falls back at once
+// rather than at the threshold. A block already running ends with its stream.
+func (x *Executor) BlockEngineHealthChanged(healthy bool) {
+	if !healthy {
+		x.post(hookMessage{unhealthy: true})
+	}
+}
+
 func (x *Executor) post(msg hookMessage) {
 	x.hooksMu.Lock()
 	x.hooks = append(x.hooks, msg)
@@ -209,11 +221,6 @@ func (x *Executor) Run(ctx context.Context) {
 			return
 		case <-x.wake:
 			st = x.drainHooks(st)
-		case slot := <-x.thresholds:
-			st = x.drainHooks(st)
-			if st != nil && st.slot == slot && st.mode == ModeUndecided {
-				x.fallback(st, FlagTimeout)
-			}
 		case e := <-x.cfg.Events:
 			// A slot's start is always queued before its first event, since
 			// the block engine streams only after the notice.
@@ -229,6 +236,18 @@ func (x *Executor) drainHooks(st *slotState) *slotState {
 	x.hooks = nil
 	x.hooksMu.Unlock()
 	for _, msg := range hooks {
+		if msg.threshold != 0 {
+			if st != nil && st.slot == msg.threshold && st.mode == ModeUndecided {
+				x.fallback(st, FlagTimeout)
+			}
+			continue
+		}
+		if msg.unhealthy {
+			if st != nil && st.mode == ModeUndecided {
+				x.stop(st, FlagFailed)
+			}
+			continue
+		}
 		if msg.started != nil {
 			if st != nil && st.mode != ModeDone {
 				x.finish(st, "", false)
@@ -253,10 +272,7 @@ func (x *Executor) armThreshold(st *slotState) {
 	}
 	slot := st.slot
 	st.thresholdTimer = time.AfterFunc(time.Until(st.threshold), func() {
-		select {
-		case x.thresholds <- slot:
-		default:
-		}
+		x.post(hookMessage{threshold: slot})
 	})
 }
 

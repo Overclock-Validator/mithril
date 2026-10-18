@@ -64,6 +64,8 @@ type BlockPipelineStats struct {
 // them, and emits them in order. It is the session's BlockHandler.
 type BlockPipeline struct {
 	events      chan<- BlockEvent
+	done        chan struct{}
+	closeOnce   sync.Once
 	txV1Enabled func() bool
 	current     atomic.Uint64
 	verifier    txverify.BatchVerifier
@@ -78,10 +80,23 @@ type BlockPipeline struct {
 }
 
 // NewBlockPipeline sends events on events, blocking rather than dropping
-// when the executor falls behind. txV1Enabled reports whether the current bank
-// accepts v1 transactions; nil rejects them.
+// when the executor falls behind, until Close. txV1Enabled reports whether the
+// current bank accepts v1 transactions; nil rejects them.
 func NewBlockPipeline(events chan<- BlockEvent, txV1Enabled func() bool) *BlockPipeline {
-	return &BlockPipeline{events: events, txV1Enabled: txV1Enabled, lost: make(map[uint64]bool)}
+	return &BlockPipeline{events: events, done: make(chan struct{}), txV1Enabled: txV1Enabled, lost: make(map[uint64]bool)}
+}
+
+// Close drops every later event, so a stream goroutine blocked on an
+// executor that has stopped returns.
+func (p *BlockPipeline) Close() {
+	p.closeOnce.Do(func() { close(p.done) })
+}
+
+func (p *BlockPipeline) emit(e BlockEvent) {
+	select {
+	case p.events <- e:
+	case <-p.done:
+	}
 }
 
 func (p *BlockPipeline) Stats() BlockPipelineStats {
@@ -114,7 +129,7 @@ func (p *BlockPipeline) StreamLost(slot uint64) {
 	p.mu.Lock()
 	p.lost[slot] = true
 	p.mu.Unlock()
-	p.events <- StreamLostEvent{Slot: slot}
+	p.emit(StreamLostEvent{Slot: slot})
 }
 
 // HandleBlock admits, segments and validates one block message.
@@ -142,17 +157,17 @@ func (p *BlockPipeline) HandleBlock(block *blockpb.Block, arrival time.Time) {
 		seq := p.takeSeq()
 		if err := validateBundle(txs, parsed, parseErrs, bundle); err != nil {
 			p.stats.invalid.Add(1)
-			p.events <- InvalidBundleEvent{Slot: slot, Seq: seq, Arrival: arrival, Reason: err}
+			p.emit(InvalidBundleEvent{Slot: slot, Seq: seq, Arrival: arrival, Reason: err})
 			continue
 		}
 		p.stats.bundles.Add(1)
-		p.events <- BundleEvent{
+		p.emit(BundleEvent{
 			Slot:            slot,
 			Seq:             seq,
 			Arrival:         arrival,
 			RevertProtected: txs[bundle.start].GetBundleId() != 0,
 			Transactions:    append([]*solana.Transaction(nil), parsed[bundle.start:bundle.end]...),
-		}
+		})
 	}
 }
 
