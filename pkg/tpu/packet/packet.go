@@ -13,6 +13,8 @@ const (
 	SourceQUIC Source = iota
 	// SourceRelayer is a relayer forwarding packets to this validator.
 	SourceRelayer
+	// SourceBlockEngine is a block engine streaming packets to this validator.
+	SourceBlockEngine
 	// NumSources is the number of sources.
 	NumSources
 )
@@ -23,6 +25,8 @@ func (s Source) String() string {
 		return "quic"
 	case SourceRelayer:
 		return "relayer"
+	case SourceBlockEngine:
+		return "block_engine"
 	default:
 		return "unknown"
 	}

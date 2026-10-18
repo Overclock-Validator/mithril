@@ -11,6 +11,8 @@ import (
 	"time"
 
 	authpb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/auth"
+	blockpb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/block"
+	blockenginepb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/blockengine"
 	relayerpb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/relayer"
 	sharedpb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/shared"
 	"github.com/gagliardetto/solana-go"
@@ -203,4 +205,137 @@ func serveBufconn(t *testing.T, register func(*grpc.Server)) DialConfig {
 		Endpoint: Endpoint{Target: "bufnet"},
 		Dialer:   func(ctx context.Context, _ string) (net.Conn, error) { return lis.DialContext(ctx) },
 	}
+}
+
+// mockBlockEngine serves a scripted block engine. SubmitLeaderWindowInfo
+// fails with FAILED_PRECONDITION while no block stream is live, as the real
+// one does.
+type mockBlockEngine struct {
+	blockenginepb.UnimplementedBlockEngineValidatorServer
+	packets    chan *blockenginepb.SubscribePacketsResponse
+	blocks     chan *blockpb.Block
+	endBlocks  chan error
+	blocksLive atomic.Int32
+	blockSubs  atomic.Int32
+
+	mu            sync.Mutex
+	strategyErrs  []error
+	noticeErr     error
+	feeInfo       *blockenginepb.BlockBuilderFeeInfoResponse
+	strategies    []blockenginepb.SchedulingStrategy
+	notices       []*blockenginepb.SubmitLeaderWindowInfoRequest
+	blockRequests []*blockenginepb.SubscribeBlocksRequest
+}
+
+func newMockBlockEngine() *mockBlockEngine {
+	return &mockBlockEngine{
+		packets:   make(chan *blockenginepb.SubscribePacketsResponse, 16),
+		blocks:    make(chan *blockpb.Block, 16),
+		endBlocks: make(chan error, 1),
+		feeInfo:   &blockenginepb.BlockBuilderFeeInfoResponse{Pubkey: "11111111111111111111111111111112", Commission: 5},
+	}
+}
+
+func requireBearer(ctx context.Context) error {
+	md, _ := metadata.FromIncomingContext(ctx)
+	if auth := md.Get("authorization"); len(auth) != 1 || !strings.HasPrefix(auth[0], "Bearer access-") {
+		return status.Error(codes.Unauthenticated, "missing bearer")
+	}
+	return nil
+}
+
+func (m *mockBlockEngine) SetStrategy(ctx context.Context, req *blockenginepb.SetStrategyRequest) (*blockenginepb.SetStrategyResponse, error) {
+	if err := requireBearer(ctx); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.strategies = append(m.strategies, req.GetStrategy())
+	if len(m.strategyErrs) > 0 {
+		err := m.strategyErrs[0]
+		m.strategyErrs = m.strategyErrs[1:]
+		return nil, err
+	}
+	return &blockenginepb.SetStrategyResponse{}, nil
+}
+
+func (m *mockBlockEngine) GetBlockBuilderFeeInfo(ctx context.Context, _ *blockenginepb.BlockBuilderFeeInfoRequest) (*blockenginepb.BlockBuilderFeeInfoResponse, error) {
+	if err := requireBearer(ctx); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.feeInfo, nil
+}
+
+func (m *mockBlockEngine) SubmitLeaderWindowInfo(ctx context.Context, req *blockenginepb.SubmitLeaderWindowInfoRequest) (*blockenginepb.SubmitLeaderWindowInfoResponse, error) {
+	if err := requireBearer(ctx); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.notices = append(m.notices, req)
+	if m.noticeErr != nil {
+		return nil, m.noticeErr
+	}
+	if m.blocksLive.Load() == 0 {
+		return nil, status.Error(codes.FailedPrecondition, "no block subscription")
+	}
+	return &blockenginepb.SubmitLeaderWindowInfoResponse{}, nil
+}
+
+func (m *mockBlockEngine) SubscribePackets(_ *blockenginepb.SubscribePacketsRequest, stream blockenginepb.BlockEngineValidator_SubscribePacketsServer) error {
+	if err := requireBearer(stream.Context()); err != nil {
+		return err
+	}
+	if err := stream.SendHeader(metadata.MD{}); err != nil {
+		return err
+	}
+	for {
+		select {
+		case <-stream.Context().Done():
+			return nil
+		case msg := <-m.packets:
+			if err := stream.Send(msg); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func (m *mockBlockEngine) SubscribeBlocks2(req *blockenginepb.SubscribeBlocksRequest, stream blockenginepb.BlockEngineValidator_SubscribeBlocks2Server) error {
+	if err := requireBearer(stream.Context()); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.blockRequests = append(m.blockRequests, req)
+	m.mu.Unlock()
+	m.blockSubs.Add(1)
+	m.blocksLive.Add(1)
+	defer m.blocksLive.Add(-1)
+	if err := stream.SendHeader(metadata.MD{}); err != nil {
+		return err
+	}
+	for {
+		select {
+		case <-stream.Context().Done():
+			return nil
+		case err := <-m.endBlocks:
+			return err
+		case block := <-m.blocks:
+			if err := stream.Send(block); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func (m *mockBlockEngine) noticeSlots() []uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var slots []uint64
+	for _, n := range m.notices {
+		slots = append(slots, n.GetSlot())
+	}
+	return slots
 }

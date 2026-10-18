@@ -18,6 +18,7 @@ import (
 	sharedpb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/shared"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	tpupacket "github.com/Overclock-Validator/mithril/pkg/tpu/packet"
+	"google.golang.org/grpc"
 )
 
 const (
@@ -277,13 +278,21 @@ func (r *RelayerSession) fetchTPUConfig(ctx context.Context, client relayerpb.Re
 	return config, err
 }
 
-// subscribePackets opens the packet stream and waits, for at most 10s, for
-// its response headers; the stream itself has no deadline.
 func subscribePackets(ctx context.Context, client relayerpb.RelayerClient) (relayerpb.Relayer_SubscribePacketsClient, error) {
 	stream, err := client.SubscribePackets(ctx, &relayerpb.SubscribePacketsRequest{})
+	if err == nil {
+		err = awaitHeaders(stream)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("subscribe packets: %w", err)
 	}
+	return stream, nil
+}
+
+// awaitHeaders waits, for at most 10s, for a stream's response headers, which
+// is when a subscription counts as live. The stream itself has no deadline;
+// on a timeout the caller cancels its context.
+func awaitHeaders(stream grpc.ClientStream) error {
 	headers := make(chan error, 1)
 	go func() {
 		_, err := stream.Header()
@@ -291,12 +300,9 @@ func subscribePackets(ctx context.Context, client relayerpb.RelayerClient) (rela
 	}()
 	select {
 	case err := <-headers:
-		if err != nil {
-			return nil, fmt.Errorf("subscribe packets: %w", err)
-		}
-		return stream, nil
+		return err
 	case <-time.After(streamHeaderTimeout):
-		return nil, errors.New("subscribe packets: no response headers within 10s")
+		return errors.New("no response headers within 10s")
 	}
 }
 
