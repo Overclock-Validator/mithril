@@ -143,6 +143,34 @@ var (
 	ReplaySigverifyGroupSignatures = Metric{"replay_sigverify_group_signatures_total"}
 	TurbineReplayAdmission         = Metric{"turbine_replay_admission_duration_seconds"}
 
+	// Harmonic block engine integration. Session and pipeline counters are
+	// exported once a second; slot metrics when each leader slot ends.
+	HarmonicBlockEngineHealthy       = Metric{"harmonic_block_engine_healthy"}
+	HarmonicRelayerConnected         = Metric{"harmonic_relayer_connected"}
+	HarmonicRelayerTPUAdvertised     = Metric{"harmonic_relayer_tpu_advertised"}
+	HarmonicClientIDAdvertised       = Metric{"harmonic_client_id_advertised"}
+	HarmonicSessions                 = Metric{"harmonic_sessions_total"}
+	HarmonicSessionResets            = Metric{"harmonic_session_resets_total"}
+	HarmonicPackets                  = Metric{"harmonic_packets_received_total"}
+	HarmonicPacketsDropped           = Metric{"harmonic_packets_dropped_total"}
+	HarmonicRelayerHeartbeats        = Metric{"harmonic_relayer_heartbeats_total"}
+	HarmonicRelayerInvalidTPUConfigs = Metric{"harmonic_relayer_invalid_tpu_configs_total"}
+	HarmonicBlockEngineErrors        = Metric{"harmonic_block_engine_errors_total"}
+	HarmonicLeaderNotices            = Metric{"harmonic_leader_notices_total"}
+	HarmonicLeaderNoticeRTT          = Metric{"harmonic_leader_notice_rtt_seconds"}
+	HarmonicBlockStreamsLost         = Metric{"harmonic_block_streams_lost_total"}
+	HarmonicBlockMessages            = Metric{"harmonic_block_messages_received_total"}
+	HarmonicBlockMessagesDropped     = Metric{"harmonic_block_messages_dropped_total"}
+	HarmonicBlockBundles             = Metric{"harmonic_block_bundles_received_total"}
+	HarmonicBlockTransactions        = Metric{"harmonic_block_transactions_received_total"}
+	HarmonicSlots                    = Metric{"harmonic_slots_total"}
+	HarmonicSlotEndFlags             = Metric{"harmonic_slot_end_flags_total"}
+	HarmonicSlotBundles              = Metric{"harmonic_slot_bundles_total"}
+	HarmonicTipCranks                = Metric{"harmonic_tip_cranks_total"}
+	// HarmonicFirstBundleDelay is when a leader slot's first block bundle
+	// arrived, after the bank opened, against the threshold at mid-slot.
+	HarmonicFirstBundleDelay = Metric{"harmonic_first_bundle_delay_seconds"}
+
 	SnapshotWorkerPoolUtilization = Metric{"snapshot_worker_pool_utilization"}
 	TasksSetIfSlotHigherQueueSize = Metric{"tasks_set_if_slot_higher_queue_size"}
 	Epoch                         = Metric{"epoch"}
@@ -266,6 +294,30 @@ var MetricToType = map[Metric]metricType{
 	ReplaySigverifyGroupSignatures:              CountT,
 	TurbineReplayAdmission:                      TimingT,
 
+	HarmonicBlockEngineHealthy:       GaugeT,
+	HarmonicRelayerConnected:         GaugeT,
+	HarmonicRelayerTPUAdvertised:     GaugeT,
+	HarmonicClientIDAdvertised:       GaugeT,
+	HarmonicSessions:                 CountT,
+	HarmonicSessionResets:            CountT,
+	HarmonicPackets:                  CountT,
+	HarmonicPacketsDropped:           CountT,
+	HarmonicRelayerHeartbeats:        CountT,
+	HarmonicRelayerInvalidTPUConfigs: CountT,
+	HarmonicBlockEngineErrors:        CountT,
+	HarmonicLeaderNotices:            CountT,
+	HarmonicLeaderNoticeRTT:          TimingT,
+	HarmonicBlockStreamsLost:         CountT,
+	HarmonicBlockMessages:            CountT,
+	HarmonicBlockMessagesDropped:     CountT,
+	HarmonicBlockBundles:             CountT,
+	HarmonicBlockTransactions:        CountT,
+	HarmonicSlots:                    CountT,
+	HarmonicSlotEndFlags:             CountT,
+	HarmonicSlotBundles:              CountT,
+	HarmonicTipCranks:                CountT,
+	HarmonicFirstBundleDelay:         TimingT,
+
 	TestCount: CountT,
 
 	SnapshotWorkerPoolUtilization: GaugeT,
@@ -381,6 +433,30 @@ var MetricToLabels = map[Metric][]string{
 	ReplaySigverifyGroupSignatures:              {},
 	TurbineReplayAdmission:                      {},
 
+	HarmonicBlockEngineHealthy:       {},
+	HarmonicRelayerConnected:         {},
+	HarmonicRelayerTPUAdvertised:     {},
+	HarmonicClientIDAdvertised:       {},
+	HarmonicSessions:                 {"session"},
+	HarmonicSessionResets:            {"session"},
+	HarmonicPackets:                  {"source"},
+	HarmonicPacketsDropped:           {"source", "reason"},
+	HarmonicRelayerHeartbeats:        {},
+	HarmonicRelayerInvalidTPUConfigs: {},
+	HarmonicBlockEngineErrors:        {"kind"},
+	HarmonicLeaderNotices:            {"result"},
+	HarmonicLeaderNoticeRTT:          {},
+	HarmonicBlockStreamsLost:         {},
+	HarmonicBlockMessages:            {},
+	HarmonicBlockMessagesDropped:     {"reason"},
+	HarmonicBlockBundles:             {"result"},
+	HarmonicBlockTransactions:        {},
+	HarmonicSlots:                    {"mode"},
+	HarmonicSlotEndFlags:             {"flag"},
+	HarmonicSlotBundles:              {"result"},
+	HarmonicTipCranks:                {"result"},
+	HarmonicFirstBundleDelay:         {},
+
 	SnapshotWorkerPoolUtilization: {"task"},
 	TasksSetIfSlotHigherQueueSize: {},
 	Epoch:                         {},
@@ -437,6 +513,8 @@ var MetricToBuckets = map[Metric][]float64{
 	TxFailedPublicationPreparation:              turbinePipelineDurationBuckets,
 	TxFailedPayerPublication:                    turbinePipelineDurationBuckets,
 	TxFailedNoncePublication:                    turbinePipelineDurationBuckets,
+	HarmonicLeaderNoticeRTT:                     blockProductionDurationBuckets,
+	HarmonicFirstBundleDelay:                    blockProductionDurationBuckets,
 }
 
 type Prometheusmetrics struct {

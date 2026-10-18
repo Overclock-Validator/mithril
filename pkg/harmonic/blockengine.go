@@ -14,6 +14,7 @@ import (
 	blockpb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/block"
 	blockenginepb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/blockengine"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/Overclock-Validator/mithril/pkg/statsd"
 	tpupacket "github.com/Overclock-Validator/mithril/pkg/tpu/packet"
 	"github.com/Overclock-Validator/mithril/pkg/version"
 	"github.com/gagliardetto/solana-go"
@@ -498,11 +499,15 @@ func (b *BlockEngineSession) takeNotice() *leaderNotice {
 func (b *BlockEngineSession) sendNotice(ctx context.Context, client blockenginepb.BlockEngineValidatorClient, notice *leaderNotice) error {
 	ctx, cancel := context.WithTimeout(ctx, leaderNoticeTimeout)
 	defer cancel()
+	sent := time.Now()
 	_, err := client.SubmitLeaderWindowInfo(ctx, &blockenginepb.SubmitLeaderWindowInfoRequest{
 		Slot:           notice.slot,
 		StartTimestamp: timestamppb.New(b.now()),
 		EndTimestamp:   timestamppb.New(notice.end),
 	})
+	if err == nil {
+		_ = statsd.Duration(statsd.HarmonicLeaderNoticeRTT, time.Since(sent), nil)
+	}
 	return err
 }
 

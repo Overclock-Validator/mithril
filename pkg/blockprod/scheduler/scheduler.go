@@ -265,7 +265,8 @@ func (s *Scheduler) drainLoop(ctx context.Context) {
 		bank := s.tpuBank()
 		s.noteBank(bank)
 		if bank == nil {
-			if !s.wait(ctx, 5*time.Millisecond) {
+			// Polling is how a new bank, or a gated one opening, is noticed.
+			if !s.wait(ctx, time.Millisecond) {
 				return
 			}
 			continue

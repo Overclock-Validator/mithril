@@ -170,7 +170,8 @@ func TestExecutorRunsTheBlockInOrderWithTheTPUClosed(t *testing.T) {
 	assert.Equal(t, []uint64{10}, h.be.notices)
 
 	a, b, c := transfer(t, 1), transfer(t, 2), transfer(t, 3)
-	h.send(t, bundleEvent(10, 1, true, a, b))
+	first := bundleEvent(10, 1, true, a, b)
+	h.send(t, first)
 	h.send(t, bundleEvent(10, 2, false, c))
 	h.sync(t)
 	assert.Equal(t, []*solana.Transaction{a, b, c}, env.Bank.ForgedTransactions())
@@ -180,6 +181,9 @@ func TestExecutorRunsTheBlockInOrderWithTheTPUClosed(t *testing.T) {
 	assert.Equal(t, ModeHarmonic, report.Mode)
 	assert.Equal(t, uint64(2), report.Executed)
 	assert.Zero(t, report.Flags)
+	assert.Equal(t, CrankNotRun, report.Crank, "no crank is configured")
+	assert.True(t, report.Arrived)
+	assert.Less(t, report.FirstArrival, 400*time.Millisecond)
 	assert.Equal(t, []uint64{10, 0}, h.pipeline.current, "the slot stops being current when it ends")
 }
 
@@ -196,6 +200,8 @@ func TestExecutorFallsBackWhenNoBlockArrivesByTheThreshold(t *testing.T) {
 	assert.Equal(t, ModeFallback, report.Mode)
 	assert.Equal(t, FlagTimeout, report.Flags)
 	assert.Equal(t, uint64(1), report.Rejected)
+	assert.True(t, report.Arrived, "a late bundle still records its arrival")
+	assert.GreaterOrEqual(t, report.FirstArrival, 50*time.Millisecond)
 }
 
 func TestExecutorStopTriggers(t *testing.T) {
@@ -306,6 +312,7 @@ func TestExecutorCrankRunsFirstAndItsFailureFallsBack(t *testing.T) {
 	forged := env.Bank.ForgedTransactions()
 	require.Len(t, forged, 3)
 	assert.Equal(t, []*solana.Transaction{crank, first}, forged[:2], "the crank lands before the first block bundle, once")
+	assert.Equal(t, CrankLanded, h.end(t, 10).Crank)
 
 	failing := startExecutor(t, true, func(*blockprod.WorkingBank) ([]*solana.Transaction, error) {
 		return nil, errors.New("tip accounts unreadable")
@@ -319,6 +326,7 @@ func TestExecutorCrankRunsFirstAndItsFailureFallsBack(t *testing.T) {
 	report := failing.end(t, 10)
 	assert.Equal(t, ModeFallback, report.Mode)
 	assert.Equal(t, FlagFailed, report.Flags)
+	assert.Equal(t, CrankFailed, report.Crank)
 }
 
 func TestExecutorFallsBackAtOnceWhenTheBlockEngineGoesDown(t *testing.T) {

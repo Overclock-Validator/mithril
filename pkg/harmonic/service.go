@@ -8,6 +8,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/blockprod"
@@ -83,7 +84,9 @@ type Service struct {
 	executor    *Executor
 	tpu         *TPUAdvertisement
 
+	clientIDAdvertised                       atomic.Bool
 	harmonicClientIDAfter, baseClientIDAfter time.Duration
+	metricsInterval                          time.Duration
 }
 
 func NewService(cfg ServiceConfig) (*Service, error) {
@@ -101,6 +104,7 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		tpu:                   NewTPUAdvertisement(cfg.Gossip, cfg.LocalTPU),
 		harmonicClientIDAfter: harmonicClientIDAfter,
 		baseClientIDAfter:     baseClientIDAfter,
+		metricsInterval:       metricsInterval,
 	}
 	identity := ed25519.PrivateKey(cfg.Tips.Identity)
 	s.blockEngine = NewBlockEngineSession(BlockEngineConfig{
@@ -118,6 +122,7 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		Pipeline:    s.pipeline,
 		Events:      events,
 		Crank:       crank.Builder(s.blockEngine),
+		OnReport:    reportSlot,
 	})
 	if cfg.Relayer.Target != "" {
 		s.relayer = NewRelayerSession(RelayerConfig{
@@ -169,6 +174,7 @@ func (s *Service) Run(ctx context.Context) {
 		run(s.relayer.Run)
 	}
 	run(s.advertiseClientID)
+	run(s.exportMetrics)
 	<-ctx.Done()
 	// The block stream may be blocked on the stopped executor.
 	s.pipeline.Close()
@@ -176,6 +182,7 @@ func (s *Service) Run(ctx context.Context) {
 	if err := s.cfg.Gossip.SetClientID(gossip.ClientIDMithril); err != nil {
 		mlog.Log.Warnf("Harmonic gossip client ID: %v", err)
 	}
+	s.clientIDAdvertised.Store(false)
 }
 
 // advertiseClientID advertises the Harmonic client ID while the block engine
@@ -210,6 +217,7 @@ func (s *Service) advertiseClientID(ctx context.Context) {
 			continue
 		}
 		advertised = want
+		s.clientIDAdvertised.Store(want == gossip.ClientIDMithrilHarmonic)
 		mlog.Log.Infof("Harmonic: advertising gossip client ID %d", want)
 	}
 }

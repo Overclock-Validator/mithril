@@ -376,6 +376,13 @@ func (a *TPUAdvertisement) SetBlockEngineHealthy(healthy bool) error {
 	return a.applyLocked()
 }
 
+// RelayerAdvertised reports whether gossip advertises the relayer's TPU.
+func (a *TPUAdvertisement) RelayerAdvertised() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.advertised != nil
+}
+
 func (a *TPUAdvertisement) applyLocked() error {
 	var want *TPUConfig
 	if a.relayer != nil && a.blockEngineHealth {

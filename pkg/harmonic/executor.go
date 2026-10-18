@@ -68,6 +68,30 @@ func (f EndFlags) String() string {
 	return strings.Join(names, ",")
 }
 
+// CrankResult is what a slot's tip crank did.
+type CrankResult int
+
+const (
+	// CrankNotRun: no block bundle reached execution, or there is no crank.
+	CrankNotRun CrankResult = iota
+	CrankNotNeeded
+	CrankLanded
+	CrankFailed
+)
+
+func (c CrankResult) String() string {
+	switch c {
+	case CrankNotNeeded:
+		return "not_needed"
+	case CrankLanded:
+		return "landed"
+	case CrankFailed:
+		return "failed"
+	default:
+		return "not_run"
+	}
+}
+
 // SlotReport summarizes one leader slot.
 type SlotReport struct {
 	Slot uint64
@@ -78,6 +102,11 @@ type SlotReport struct {
 	// Executed counts bundles that landed; Reverted, the ones that executed
 	// and landed nothing; Rejected, bundles refused without executing.
 	Executed, Reverted, Rejected uint64
+	Crank                        CrankResult
+	// FirstArrival is how long after the bank opened the slot's first block
+	// bundle arrived, admitted or not, if Arrived.
+	FirstArrival time.Duration
+	Arrived      bool
 	// Aborted is set when the leader abandoned the slot, with its reason.
 	Aborted bool
 	Reason  string
@@ -285,8 +314,8 @@ func (x *Executor) finish(st *slotState, reason string, aborted bool) {
 	st.report.Reason = reason
 	st.mode = ModeDone
 	r := st.report
-	mlog.Log.Infof("Harmonic slot %d: mode=%s flags=%s executed=%d reverted=%d rejected=%d aborted=%t%s",
-		r.Slot, r.Mode, r.Flags, r.Executed, r.Reverted, r.Rejected, r.Aborted, reasonSuffix(r.Reason))
+	mlog.Log.Infof("Harmonic slot %d: mode=%s flags=%s executed=%d reverted=%d rejected=%d crank=%s aborted=%t%s",
+		r.Slot, r.Mode, r.Flags, r.Executed, r.Reverted, r.Rejected, r.Crank, r.Aborted, reasonSuffix(r.Reason))
 	if x.cfg.OnReport != nil {
 		x.cfg.OnReport(r)
 	}
@@ -306,16 +335,27 @@ func (x *Executor) handleEvent(st *slotState, e BlockEvent) {
 			x.stop(st, FlagFailed)
 		}
 	case InvalidBundleEvent:
+		x.noteArrival(st, e.Slot, e.Arrival)
 		if !x.admits(st, e.Slot, e.Seq) {
 			return
 		}
 		x.stop(st, FlagFailed)
 	case BundleEvent:
+		x.noteArrival(st, e.Slot, e.Arrival)
 		if !x.admits(st, e.Slot, e.Seq) {
 			return
 		}
 		x.executeBundle(st, e)
 	}
+}
+
+// noteArrival records when the slot's first block bundle arrived.
+func (x *Executor) noteArrival(st *slotState, slot uint64, arrival time.Time) {
+	if st == nil || st.slot != slot || st.report.Arrived || arrival.IsZero() {
+		return
+	}
+	st.report.Arrived = true
+	st.report.FirstArrival = max(arrival.Sub(st.start), 0)
 }
 
 // admits checks a bundle event against the slot state and consumes its
@@ -397,8 +437,13 @@ func (x *Executor) runCrank(st *slotState) bool {
 	}
 	if err != nil {
 		mlog.Log.Infof("Harmonic slot %d: tip crank failed: %v", st.slot, err)
+		st.report.Crank = CrankFailed
 		x.stop(st, FlagFailed)
 		return false
+	}
+	st.report.Crank = CrankNotNeeded
+	if len(txs) > 0 {
+		st.report.Crank = CrankLanded
 	}
 	st.crankDone = true
 	return true

@@ -104,6 +104,7 @@ func startService(t *testing.T) *serviceHarness {
 	})
 	require.NoError(t, err)
 	h.service.harmonicClientIDAfter, h.service.baseClientIDAfter = 100*time.Millisecond, 50*time.Millisecond
+	h.service.metricsInterval = 10 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {

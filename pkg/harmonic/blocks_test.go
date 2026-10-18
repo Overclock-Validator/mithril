@@ -82,6 +82,7 @@ func TestBlockPipelineSegmentsPerMessage(t *testing.T) {
 	fifth := events[4].(BundleEvent)
 	assert.Equal(t, solana.SignatureFromBytes(wireTx(4)[1:65]), fifth.Transactions[0].Signatures[0], "members keep stream order")
 	assert.Equal(t, uint64(7), p.Stats().Bundles)
+	assert.Equal(t, uint64(9), p.Stats().Transactions)
 }
 
 func TestBlockPipelineAdmitsOnlyTheCurrentSlot(t *testing.T) {

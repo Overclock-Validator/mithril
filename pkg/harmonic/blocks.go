@@ -57,6 +57,8 @@ type BlockPipelineStats struct {
 	LostSlot       uint64
 	Bundles        uint64
 	InvalidBundles uint64
+	// Transactions counts the transactions of valid bundles.
+	Transactions uint64
 }
 
 // BlockPipeline turns the block stream into executor events. It admits only
@@ -70,7 +72,7 @@ type BlockPipeline struct {
 	current     atomic.Uint64
 	verifier    txverify.BatchVerifier
 	stats       struct {
-		messages, wrongSlot, lostSlot, bundles, invalid atomic.Uint64
+		messages, wrongSlot, lostSlot, bundles, invalid, transactions atomic.Uint64
 	}
 
 	mu      sync.Mutex
@@ -106,6 +108,7 @@ func (p *BlockPipeline) Stats() BlockPipelineStats {
 		LostSlot:       p.stats.lostSlot.Load(),
 		Bundles:        p.stats.bundles.Load(),
 		InvalidBundles: p.stats.invalid.Load(),
+		Transactions:   p.stats.transactions.Load(),
 	}
 }
 
@@ -161,6 +164,7 @@ func (p *BlockPipeline) HandleBlock(block *blockpb.Block, arrival time.Time) {
 			continue
 		}
 		p.stats.bundles.Add(1)
+		p.stats.transactions.Add(uint64(bundle.end - bundle.start))
 		p.emit(BundleEvent{
 			Slot:            slot,
 			Seq:             seq,
