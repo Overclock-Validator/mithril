@@ -94,6 +94,49 @@ func TestWritableAccountsUsesUnsignedWritableRange(t *testing.T) {
 	assert.Equal(t, []solana.PublicKey{{1}, {3}, {4}}, writableAccounts(tx))
 }
 
+// v0LookupTx has static keys {1} (writable signer), {2} (writable), {3}
+// (readonly), and loads two writable and one readonly address from a table.
+func v0LookupTx(t *testing.T) *solana.Transaction {
+	t.Helper()
+	msg := solana.Message{
+		Header: solana.MessageHeader{
+			NumRequiredSignatures:       1,
+			NumReadonlyUnsignedAccounts: 1,
+		},
+		AccountKeys:  solana.PublicKeySlice{{1}, {2}, {3}},
+		Instructions: []solana.CompiledInstruction{{ProgramIDIndex: 2, Accounts: []uint16{0, 1, 3, 4, 5}}},
+		AddressTableLookups: solana.MessageAddressTableLookupSlice{{
+			AccountKey:      solana.PublicKey{9},
+			WritableIndexes: []uint8{0, 1},
+			ReadonlyIndexes: []uint8{2},
+		}},
+	}
+	_, err := msg.SetVersion(solana.MessageVersionV0)
+	require.NoError(t, err)
+	return &solana.Transaction{Signatures: []solana.Signature{{}}, Message: msg}
+}
+
+func TestWritableAccountsIncludesWritableLookups(t *testing.T) {
+	tx := v0LookupTx(t)
+	// Before resolution only the static keys are known.
+	assert.Equal(t, []solana.PublicKey{{1}, {2}}, writableAccounts(tx))
+
+	require.NoError(t, tx.Message.SetAddressTables(map[solana.PublicKey]solana.PublicKeySlice{
+		{9}: {{0xA}, {0xB}, {0xC}},
+	}))
+	require.NoError(t, tx.Message.ResolveLookups())
+	require.Equal(t, solana.PublicKeySlice{{1}, {2}, {3}, {0xA}, {0xB}, {0xC}}, tx.Message.AccountKeys)
+
+	// The header still describes the static keys only: {3} stays readonly,
+	// the two writable lookups are added and the readonly one is not.
+	assert.Equal(t, []solana.PublicKey{{1}, {2}, {0xA}, {0xB}}, writableAccounts(tx))
+
+	cost, err := EstimateTransactionCost(tx, features.NewFeaturesDefault())
+	require.NoError(t, err)
+	assert.Equal(t, uint64(4*WriteLockUnits), cost.WriteLockCost)
+	assert.Equal(t, []solana.PublicKey{{1}, {2}, {0xA}, {0xB}}, cost.WritableAccounts)
+}
+
 func TestEstimateTransactionCostV1UsesInlineLimits(t *testing.T) {
 	msg := solana.Message{
 		Header: solana.MessageHeader{

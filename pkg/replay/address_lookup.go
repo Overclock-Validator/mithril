@@ -63,3 +63,99 @@ func checkLookupIndexes(active solana.PublicKeySlice, lookup *solana.MessageAddr
 	}
 	return nil
 }
+
+// HasAddressTableLookups reports whether tx is a v0 transaction that loads
+// accounts from address lookup tables.
+func HasAddressTableLookups(tx *solana.Transaction) bool {
+	return tx != nil && tx.Message.GetVersion() == solana.MessageVersionV0 && tx.Message.AddressTableLookups.NumLookups() != 0
+}
+
+// ResolveAddressTableLookups returns a copy of tx whose address-table lookups
+// are resolved for the slot of slotCtx, the bank the transaction executes in.
+//
+// Tables are read from the bank's parent state, never from writes made in the
+// slot itself, and give the same addresses the slot's own state would: a
+// table extended during the slot keeps the new addresses inactive until the
+// slot has passed, because the address lookup table program records the
+// address count at the slot's first extension as the active length; a table
+// deactivated during the slot is still deactivating and usable; and a table
+// created during the slot has no active address yet. Reading the parent also
+// keeps the result independent of which transactions of the slot ran first.
+//
+// Lookups follow the Solana protocol's rules:
+//
+//   - a missing table, or a deactivated one, fails with AddressLookupTableNotFound;
+//   - a table not owned by the address lookup table program fails with
+//     InvalidAddressLookupTableOwner, and one that does not decode with
+//     InvalidAddressLookupTableData;
+//   - an index at or past the table's active length fails with
+//     InvalidAddressLookupTableIndex.
+//
+// tx is never modified: resolution appends the loaded addresses to the account
+// keys, and the original must stay unresolved for entry encoding. The copy
+// serializes identically to the original, since only static keys are encoded.
+// Transactions without lookups are returned as is.
+func ResolveAddressTableLookups(slotCtx *sealevel.SlotCtx, tx *solana.Transaction) (*solana.Transaction, *TransactionError) {
+	if !HasAddressTableLookups(tx) {
+		return tx, nil
+	}
+	if tx.Message.IsResolved() {
+		// Its loaded addresses came from some other bank, which cannot be
+		// vouched for here.
+		return nil, &TransactionError{ErrorType: TransactionErrorSanitizeFailure, InstructionError: TxErrSanitizeFailure}
+	}
+	slotHashes, ok := slotHashesForAddressLookups(slotCtx)
+	if !ok {
+		return nil, &TransactionError{ErrorType: TransactionErrorSanitizeFailure, InstructionError: TxErrSanitizeFailure}
+	}
+
+	tables := make(map[solana.PublicKey]solana.PublicKeySlice, len(tx.Message.AddressTableLookups))
+	for i := range tx.Message.AddressTableLookups {
+		lookup := &tx.Message.AddressTableLookups[i]
+		active, txErr := activeLookupTable(parentLookupTableAccount(slotCtx, lookup.AccountKey), slotCtx.Slot, slotHashes)
+		if txErr == nil {
+			txErr = checkLookupIndexes(active, lookup)
+		}
+		if txErr != nil {
+			return nil, txErr
+		}
+		tables[lookup.AccountKey] = active
+	}
+
+	resolved := *tx
+	resolved.Message = tx.Message
+	resolved.Message.AccountKeys = append(solana.PublicKeySlice(nil), tx.Message.AccountKeys...)
+	if err := resolved.Message.SetAddressTables(tables); err != nil {
+		return nil, &TransactionError{ErrorType: TransactionErrorInvalidAddressLookupTableIndex, InstructionError: TxErrInvalidAddressLookupTableIndex}
+	}
+	if err := resolved.Message.ResolveLookups(); err != nil {
+		return nil, &TransactionError{ErrorType: TransactionErrorInvalidAddressLookupTableIndex, InstructionError: TxErrInvalidAddressLookupTableIndex}
+	}
+	return &resolved, nil
+}
+
+// parentLookupTableAccount reads a table from slotCtx's parent state: the
+// unrooted chain the bank was built on, then durable AccountsDb. It returns
+// nil if the table does not exist there.
+func parentLookupTableAccount(slotCtx *sealevel.SlotCtx, key solana.PublicKey) *accounts.Account {
+	if slotCtx.UnrootedRead == nil && slotCtx.AccountsDb == nil {
+		return nil
+	}
+	acct, err := slotCtx.GetAccountFromAccountsDb(key)
+	if err != nil {
+		return nil
+	}
+	return acct
+}
+
+// slotHashesForAddressLookups prefers the bank's pinned SlotHashes, as the
+// leader's bank carries them, and falls back to the process-wide sysvar cache.
+func slotHashesForAddressLookups(slotCtx *sealevel.SlotCtx) (sealevel.SysvarSlotHashes, bool) {
+	if bankSysvars := slotCtx.BankSysvars(); bankSysvars != nil {
+		return bankSysvars.SlotHashes()
+	}
+	if sealevel.SysvarCache.SlotHashes.Sysvar == nil {
+		return nil, false
+	}
+	return *sealevel.SysvarCache.SlotHashes.Sysvar, true
+}
