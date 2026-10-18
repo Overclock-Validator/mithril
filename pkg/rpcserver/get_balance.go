@@ -25,7 +25,7 @@ func (rpcServer *RpcServer) GetBalance(ctx context.Context, p jsonrpc.RawParams)
 		return GetBalanceResp{}, err
 	}
 
-	params, err := jsonrpc.DecodeParams[[]interface{}](p)
+	params, err := decodeOptionalParams(p)
 	if err != nil {
 		return GetBalanceResp{}, &InvalidParamsError{Message: fmt.Sprintf("decoding params: %v", err)}
 	}
@@ -72,14 +72,11 @@ func parseBalanceConfig(params []interface{}) (*uint64, error) {
 	if !ok {
 		return nil, &InvalidParamsError{Message: "invalid getBalance config"}
 	}
-	if commitment, exists := config["commitment"]; exists {
-		value, ok := commitment.(string)
-		if !ok || (value != "processed" && value != "confirmed" && value != "finalized") {
-			return nil, &InvalidParamsError{Message: "invalid commitment"}
-		}
+	if err := validateRootedCommitment(config["commitment"]); err != nil {
+		return nil, err
 	}
 	value, exists := config["minContextSlot"]
-	if !exists {
+	if !exists || value == nil {
 		return nil, nil
 	}
 	minContextSlot, err := rpcUint64(value, "minContextSlot")

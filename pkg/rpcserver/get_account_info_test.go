@@ -2,12 +2,67 @@ package rpcserver
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
+	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/require"
 )
+
+func TestGetAccountInfoParameterHTTP(t *testing.T) {
+	db := newRPCAccountsDB(t)
+	key := solana.PublicKey{87}
+	_, err := db.CommitBatch([]accounts.SlotDelta{{Slot: 10, Delta: []*accounts.Account{{Key: key, Lamports: 42, Data: []byte("abcd")}}}}, 10, nil, nil)
+	require.NoError(t, err)
+	server := NewRpcServer(db, 0, &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 432000}, solana.Hash{1})
+	require.NoError(t, server.listener.Close())
+	server.SetRootedBankState(10, 10, 0)
+	endpoint := httptest.NewServer(server)
+	t.Cleanup(endpoint.Close)
+	for _, test := range []struct {
+		config string
+		code   int
+		data   string
+	}{
+		{`{"encoding":"base64","minContextSlot":10}`, 0, "YWJjZA=="},
+		{`{"encoding":"base64","minContextSlot":10,"dataSlice":{"offset":1,"length":2}}`, 0, "YmM="},
+		{`{"encoding":"base64","dataSlice":{"offset":18446744073709551615,"length":1}}`, 0, ""},
+		{`{"encoding":"base64","commitment":null,"minContextSlot":null,"dataSlice":null}`, 0, "YWJjZA=="},
+		{`{"minContextSlot":9007199254740993}`, -32016, ""},
+		{`{"minContextSlot":1.0000000000000001}`, -32602, ""},
+		{`{"dataSlice":{"offset":-1,"length":1}}`, -32602, ""},
+		{`{"dataSlice":{"offset":0,"length":1.5}}`, -32602, ""},
+		{`{"dataSlice":{}}`, -32602, ""},
+		{`{"dataSlice":{"offset":0,"length":null}}`, -32602, ""},
+	} {
+		t.Run(test.config, func(t *testing.T) {
+			body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"getAccountInfo","params":[%q,%s]}`, key.String(), test.config)
+			response, err := endpoint.Client().Post(endpoint.URL, "application/json", strings.NewReader(body))
+			require.NoError(t, err)
+			defer response.Body.Close()
+			var got struct {
+				Result GetAccountInfoResp `json:"result"`
+				Error  *struct {
+					Code int `json:"code"`
+				} `json:"error"`
+			}
+			require.NoError(t, json.NewDecoder(response.Body).Decode(&got))
+			if test.code != 0 {
+				require.NotNil(t, got.Error)
+				require.Equal(t, test.code, got.Error.Code)
+				return
+			}
+			require.Nil(t, got.Error)
+			require.Equal(t, uint64(10), got.Result.Context.Slot)
+			require.NotNil(t, got.Result.Value)
+			require.Equal(t, []interface{}{test.data, "base64"}, got.Result.Value.Data)
+		})
+	}
+}
 
 func TestGetAccountInfoAccountExistence(t *testing.T) {
 	for _, state := range []string{"never-created", "funded-empty-data", "deleted"} {

@@ -2,8 +2,9 @@ package rpcserver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"math"
+	"strconv"
 
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
@@ -120,13 +121,10 @@ func parseBlockProductionConfig(params []interface{}) (getBlockProductionConfig,
 	if !ok {
 		return config, &InvalidParamsError{Message: "invalid getBlockProduction config"}
 	}
-	if commitment, exists := values["commitment"]; exists {
-		value, ok := commitment.(string)
-		if !ok || (value != "processed" && value != "confirmed" && value != "finalized") {
-			return config, &InvalidParamsError{Message: "invalid commitment"}
-		}
+	if err := validateRootedCommitment(values["commitment"]); err != nil {
+		return config, err
 	}
-	if raw, exists := values["identity"]; exists {
+	if raw, exists := values["identity"]; exists && raw != nil {
 		value, ok := raw.(string)
 		if !ok {
 			return config, &InvalidParamsError{Message: "invalid identity"}
@@ -137,7 +135,7 @@ func parseBlockProductionConfig(params []interface{}) (getBlockProductionConfig,
 		}
 		config.identity = &identity
 	}
-	if raw, exists := values["range"]; exists {
+	if raw, exists := values["range"]; exists && raw != nil {
 		rangeValues, ok := raw.(map[string]interface{})
 		if !ok {
 			return config, &InvalidParamsError{Message: "invalid range"}
@@ -163,11 +161,15 @@ func parseBlockProductionConfig(params []interface{}) (getBlockProductionConfig,
 }
 
 func rpcUint64(raw interface{}, name string) (uint64, error) {
-	value, ok := raw.(float64)
-	if !ok || value < 0 || value >= math.Exp2(64) || math.Trunc(value) != value {
+	value, ok := raw.(json.Number)
+	if !ok {
 		return 0, &InvalidParamsError{Message: fmt.Sprintf("invalid %s", name)}
 	}
-	return uint64(value), nil
+	parsed, err := strconv.ParseUint(string(value), 10, 64)
+	if err != nil {
+		return 0, &InvalidParamsError{Message: fmt.Sprintf("invalid %s", name)}
+	}
+	return parsed, nil
 }
 
 func slotHistoryBounds(history *sealevel.SysvarSlotHistory) (uint64, uint64, error) {

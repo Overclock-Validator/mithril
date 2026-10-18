@@ -162,6 +162,32 @@ func TestGetVoteAccountsUsesRootedVoteState(t *testing.T) {
 	require.Len(t, cold.Delinquent, 1)
 	require.Equal(t, delinquentVote.String(), cold.Delinquent[0].VotePubkey)
 
+	// A zero distance makes every fixture vote delinquent, including the
+	// initialized vote account with no stake or epoch membership.
+	for _, keep := range []interface{}{true, false, nil} {
+		config := map[string]interface{}{"delinquentSlotDistance": 0, "keepUnstakedDelinquents": keep}
+		all, err := server.GetVoteAccounts(t.Context(), mustRawParams(t, []interface{}{config}))
+		require.NoError(t, err)
+		require.Empty(t, all.Current)
+		if keep == true {
+			require.Len(t, all.Delinquent, 3)
+			require.Equal(t, newVote.String(), all.Delinquent[2].VotePubkey)
+			require.Zero(t, all.Delinquent[2].ActivatedStake)
+			require.False(t, all.Delinquent[2].EpochVoteAccount)
+		} else {
+			require.Len(t, all.Delinquent, 2)
+		}
+		config["votePubkey"] = newVote.String()
+		filtered, err := server.GetVoteAccounts(t.Context(), mustRawParams(t, []interface{}{config}))
+		require.NoError(t, err)
+		require.Empty(t, filtered.Current)
+		if keep == true {
+			require.Len(t, filtered.Delinquent, 1)
+		} else {
+			require.Empty(t, filtered.Delinquent)
+		}
+	}
+
 	// Candidate keys are append-only, but an account that changes owner must
 	// no longer be returned as a vote account.
 	_, err = db.CommitBatch([]accounts.SlotDelta{{Slot: 501, Delta: []*accounts.Account{{
@@ -202,7 +228,6 @@ func TestGetVoteAccountsRejectsInvalidConfig(t *testing.T) {
 		{map[string]interface{}{"commitment": "unknown"}},
 		{map[string]interface{}{"votePubkey": "invalid"}},
 		{map[string]interface{}{"keepUnstakedDelinquents": "yes"}},
-		{map[string]interface{}{"keepUnstakedDelinquents": true}},
 		{map[string]interface{}{"delinquentSlotDistance": 1.5}},
 		{map[string]interface{}{}, map[string]interface{}{}},
 	} {

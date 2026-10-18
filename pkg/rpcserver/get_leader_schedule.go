@@ -10,7 +10,8 @@ import (
 )
 
 type getLeaderScheduleConfig struct {
-	identity *solana.PublicKey
+	identity         *solana.PublicKey
+	keyByVoteAccount bool
 }
 
 func (rpcServer *RpcServer) GetLeaderSchedule(ctx context.Context, p jsonrpc.RawParams) (map[string][]uint64, error) {
@@ -61,15 +62,29 @@ func (rpcServer *RpcServer) GetLeaderSchedule(ctx context.Context, p jsonrpc.Raw
 	slotsInEpoch := rpcServer.epochSchedule.SlotsInEpoch(epoch)
 	schedule := make(map[string][]uint64)
 	for index := uint64(0); index < slotsInEpoch; index++ {
-		leader, ok := global.LeaderForSlot(firstSlot + index)
-		if !ok {
-			return nil, nil
+		scheduledSlot := firstSlot + index
+		var leader, key solana.PublicKey
+		var ok bool
+		if config.keyByVoteAccount {
+			leader, key, ok = global.LeaderForSlotWithVoteAccount(scheduledSlot)
+			if !ok {
+				if _, exists := global.LeaderForSlot(scheduledSlot); exists {
+					return nil, fmt.Errorf("vote-account leader schedule unavailable for slot %d", scheduledSlot)
+				}
+				return nil, nil
+			}
+		} else {
+			leader, ok = global.LeaderForSlot(scheduledSlot)
+			if !ok {
+				return nil, nil
+			}
+			key = leader
 		}
 		if config.identity != nil && leader != *config.identity {
 			continue
 		}
-		key := leader.String()
-		schedule[key] = append(schedule[key], index)
+		keyString := key.String()
+		schedule[keyString] = append(schedule[keyString], index)
 	}
 	return schedule, nil
 }
@@ -83,13 +98,10 @@ func parseLeaderScheduleConfig(raw interface{}) (getLeaderScheduleConfig, error)
 	if !ok {
 		return config, &InvalidParamsError{Message: "invalid getLeaderSchedule config"}
 	}
-	if commitment, exists := values["commitment"]; exists {
-		value, ok := commitment.(string)
-		if !ok || (value != "processed" && value != "confirmed" && value != "finalized") {
-			return config, &InvalidParamsError{Message: "invalid commitment"}
-		}
+	if err := validateRootedCommitment(values["commitment"]); err != nil {
+		return config, err
 	}
-	if raw, exists := values["identity"]; exists {
+	if raw, exists := values["identity"]; exists && raw != nil {
 		value, ok := raw.(string)
 		if !ok {
 			return config, &InvalidParamsError{Message: "invalid identity"}
@@ -100,14 +112,12 @@ func parseLeaderScheduleConfig(raw interface{}) (getLeaderScheduleConfig, error)
 		}
 		config.identity = &identity
 	}
-	if raw, exists := values["keyByVoteAccount"]; exists {
+	if raw, exists := values["keyByVoteAccount"]; exists && raw != nil {
 		value, ok := raw.(bool)
 		if !ok {
 			return config, &InvalidParamsError{Message: "invalid keyByVoteAccount"}
 		}
-		if value {
-			return config, &InvalidParamsError{Message: "keyByVoteAccount is not supported"}
-		}
+		config.keyByVoteAccount = value
 	}
 	return config, nil
 }

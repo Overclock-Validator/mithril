@@ -35,8 +35,9 @@ type VoteAccountInfo struct {
 }
 
 type getVoteAccountsConfig struct {
-	votePubkey             *solana.PublicKey
-	delinquentSlotDistance uint64
+	votePubkey              *solana.PublicKey
+	delinquentSlotDistance  uint64
+	keepUnstakedDelinquents bool
 }
 
 func (rpcServer *RpcServer) GetVoteAccounts(ctx context.Context, p jsonrpc.RawParams) (GetVoteAccountsResp, error) {
@@ -135,7 +136,7 @@ func (rpcServer *RpcServer) GetVoteAccounts(ctx context.Context, p jsonrpc.RawPa
 			}
 			if current {
 				response.Current = append(response.Current, info)
-			} else if info.ActivatedStake > 0 {
+			} else if info.ActivatedStake > 0 || config.keepUnstakedDelinquents {
 				response.Delinquent = append(response.Delinquent, info)
 			}
 		}
@@ -159,13 +160,10 @@ func parseGetVoteAccountsConfig(params []interface{}) (getVoteAccountsConfig, er
 	if !ok {
 		return config, &InvalidParamsError{Message: "invalid getVoteAccounts config"}
 	}
-	if commitment, exists := values["commitment"]; exists {
-		value, ok := commitment.(string)
-		if !ok || (value != "processed" && value != "confirmed" && value != "finalized") {
-			return config, &InvalidParamsError{Message: "invalid commitment"}
-		}
+	if err := validateRootedCommitment(values["commitment"]); err != nil {
+		return config, err
 	}
-	if raw, exists := values["votePubkey"]; exists {
+	if raw, exists := values["votePubkey"]; exists && raw != nil {
 		value, ok := raw.(string)
 		if !ok {
 			return config, &InvalidParamsError{Message: "invalid votePubkey"}
@@ -176,16 +174,14 @@ func parseGetVoteAccountsConfig(params []interface{}) (getVoteAccountsConfig, er
 		}
 		config.votePubkey = &pubkey
 	}
-	if raw, exists := values["keepUnstakedDelinquents"]; exists {
+	if raw, exists := values["keepUnstakedDelinquents"]; exists && raw != nil {
 		value, ok := raw.(bool)
 		if !ok {
 			return config, &InvalidParamsError{Message: "invalid keepUnstakedDelinquents"}
 		}
-		if value {
-			return config, &InvalidParamsError{Message: "keepUnstakedDelinquents is not supported"}
-		}
+		config.keepUnstakedDelinquents = value
 	}
-	if raw, exists := values["delinquentSlotDistance"]; exists {
+	if raw, exists := values["delinquentSlotDistance"]; exists && raw != nil {
 		value, err := rpcUint64(raw, "delinquentSlotDistance")
 		if err != nil {
 			return config, err

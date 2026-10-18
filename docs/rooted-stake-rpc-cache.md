@@ -23,6 +23,24 @@ Memory is proportional to delegated stake accounts. Bootstrap temporarily tracks
 changed keys while loading candidates. Recalculation walks the existing map
 without allocating or copying a whole-cache key list.
 
+## RPC options
+
+`getVoteAccounts`, `getBalance`, `getLeaderSchedule`, `getBlockProduction`, and
+`getAccountInfo` read the published rooted state. They accept `confirmed` and
+`finalized`; `processed` returns an unsupported-commitment error rather than a
+rooted result mislabeled as processed. This does not provide a separate optimistic
+confirmed account view for classic consensus. `getSlot` and `getEpochInfo` keep
+their existing processed-counter support.
+
+`keepUnstakedDelinquents: true` includes unstaked accounts in the delinquent list.
+The default is false. It does not change the current-account list.
+
+`getLeaderSchedule` supports `keyByVoteAccount: true` when the retained schedule
+contains the selected vote account for each leader slot. The `identity` filter
+still selects a node identity. A node-keyed compatibility schedule without vote
+account provenance returns an error for this option; it does not infer a vote
+account from the node identity.
+
 ## Publication and recovery contract
 
 - AccountsDB brackets writes with a process-local version. An odd version,

@@ -32,14 +32,14 @@ func (rpcServer *RpcServer) GetEpochInfo(ctx context.Context, p jsonrpc.RawParam
 		if !ok {
 			return GetEpochInfoResp{}, &InvalidParamsError{Message: "invalid getEpochInfo config"}
 		}
-		if raw, exists := config["commitment"]; exists {
+		if raw, exists := config["commitment"]; exists && raw != nil {
 			value, ok := raw.(string)
 			if !ok || (value != "processed" && value != "confirmed" && value != "finalized") {
 				return GetEpochInfoResp{}, &InvalidParamsError{Message: "invalid commitment"}
 			}
 			commitment = value
 		}
-		if raw, exists := config["minContextSlot"]; exists {
+		if raw, exists := config["minContextSlot"]; exists && raw != nil {
 			value, err := rpcUint64(raw, "minContextSlot")
 			if err != nil {
 				return GetEpochInfoResp{}, err
