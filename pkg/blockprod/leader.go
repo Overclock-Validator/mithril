@@ -101,6 +101,7 @@ type LeaderLoop struct {
 	onBlock          func(*b.Block)
 	commitLeaderSlot func(replay.CommitLeaderInput) (*sealevel.SlotCtx, error)
 	hooks            LeaderHooks
+	holder           SlotHolder
 	gateTPU          bool
 
 	currentSlot   func() uint64
@@ -185,6 +186,7 @@ func NewLeaderLoop(cfg LeaderLoopConfig) *LeaderLoop {
 	if cfg.CompletionReserve <= 0 {
 		cfg.CompletionReserve = leaderBlockCompletionReserve
 	}
+	holder, _ := cfg.Hooks.(SlotHolder)
 	return &LeaderLoop{
 		controller:          cfg.Controller,
 		identity:            cfg.Identity,
@@ -206,6 +208,7 @@ func NewLeaderLoop(cfg LeaderLoopConfig) *LeaderLoop {
 		completionReserve:   cfg.CompletionReserve,
 		now:                 cfg.Now,
 		hooks:               cfg.Hooks,
+		holder:              holder,
 		gateTPU:             cfg.GateTPU && cfg.Hooks != nil,
 		finishedLeaderSlots: make(map[uint64]struct{}),
 		pendingFailures:     make(map[uint64]leaderSlotFailure),
@@ -215,6 +218,10 @@ func NewLeaderLoop(cfg LeaderLoopConfig) *LeaderLoop {
 func (l *LeaderLoop) Run(stop <-chan struct{}) {
 	ticker := time.NewTicker(l.pollInterval)
 	defer ticker.Stop()
+	var released <-chan struct{}
+	if l.holder != nil {
+		released = l.holder.Released()
+	}
 
 	for {
 		select {
@@ -223,6 +230,8 @@ func (l *LeaderLoop) Run(stop <-chan struct{}) {
 			return
 		case scheduledAt := <-ticker.C:
 			l.tickScheduled(scheduledAt)
+		case <-released:
+			l.tick()
 		}
 	}
 }
@@ -263,7 +272,7 @@ func (l *LeaderLoop) tickScheduled(scheduledAt time.Time) {
 			}
 			now = l.now()
 			if l.productionWindow.active {
-				if now.Before(l.productionWindowDeadlineLocked(l.activeSlot)) {
+				if now.Before(l.productionWindowDeadlineLocked(l.activeSlot)) || l.holdActiveSlotLocked(now) {
 					return
 				}
 			} else if wallSlot <= l.activeSlot {
@@ -615,6 +624,14 @@ func (l *LeaderLoop) productionWindowDeadlineLocked(slot uint64) time.Time {
 		reserve = l.slotDuration / 4
 	}
 	return deadline.Add(-reserve)
+}
+
+// holdActiveSlotLocked reports whether the hooks keep the active slot open past
+// its production deadline. The protocol deadline always ends the hold.
+func (l *LeaderLoop) holdActiveSlotLocked(now time.Time) bool {
+	return l.holder != nil &&
+		now.Before(l.productionWindowProtocolDeadlineLocked(l.activeSlot)) &&
+		l.holder.HoldSlot(l.activeSlot)
 }
 
 func (l *LeaderLoop) productionWindowProtocolDeadlineLocked(slot uint64) time.Time {

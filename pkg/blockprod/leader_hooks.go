@@ -22,6 +22,18 @@ type LeaderHooks interface {
 	SlotAborted(slot uint64, reason string)
 }
 
+// SlotHolder is implemented by LeaderHooks that can keep a slot open past its
+// production deadline while they still have work for it. The protocol
+// deadline ends a hold regardless.
+type SlotHolder interface {
+	// HoldSlot reports whether slot must stay open. It runs under the leader
+	// loop's lock and must return promptly.
+	HoldSlot(slot uint64) bool
+	// Released is signaled when a held slot may end, so the loop need not wait
+	// for its next poll.
+	Released() <-chan struct{}
+}
+
 // LeaderSlotInfo describes a leader slot whose working bank is about to be
 // published.
 type LeaderSlotInfo struct {

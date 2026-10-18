@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,8 +40,29 @@ func (f *fakeBlockEngine) NotifyLeaderSlot(slot uint64, _ time.Time) {
 
 // fakePipeline records the current slot and shares the call log.
 type fakePipeline struct {
-	be      *fakeBlockEngine
-	current []uint64
+	be       *fakeBlockEngine
+	current  []uint64
+	inFlight atomic.Bool
+}
+
+func (f *fakePipeline) InFlight() bool {
+	return f.inFlight.Load()
+}
+
+// testClock is a clock tests can move while the executor runs.
+type testClock struct{ nanos atomic.Int64 }
+
+func (c *testClock) now() time.Time  { return time.Unix(0, c.nanos.Load()) }
+func (c *testClock) set(t time.Time) { c.nanos.Store(t.UnixNano()) }
+
+// useClock gives the executor a settable clock, starting at the current time.
+// Call it before the executor sees any slot or event.
+func (h *executorHarness) useClock() (*testClock, time.Time) {
+	clock := &testClock{}
+	now := time.Now()
+	clock.set(now)
+	h.exec.now = clock.now
+	return clock, now
 }
 
 func (f *fakePipeline) SetCurrentSlot(slot uint64) {
@@ -264,8 +286,8 @@ func TestExecutorStopTriggers(t *testing.T) {
 	}
 }
 
-func TestExecutorCutoffAndVoteTail(t *testing.T) {
-	t.Run("a bundle after the cutoff stops the block without falling back", func(t *testing.T) {
+func TestExecutorRunsTheBlockUntilPastTheEndAndDrained(t *testing.T) {
+	t.Run("past its end, the block keeps executing what it receives", func(t *testing.T) {
 		h := startExecutor(t, true, nil)
 		env := gatedBank(t, costmodel.Limits{})
 		h.startSlot(10, env, 80*time.Millisecond)
@@ -273,28 +295,65 @@ func TestExecutorCutoffAndVoteTail(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 		h.send(t, bundleEvent(10, 2, false, transfer(t, 2)))
 		h.sync(t)
-		assert.Len(t, env.Bank.ForgedTransactions(), 1)
-		assert.False(t, env.Bank.TPUAllowed(), "past the cutoff the block is simply over")
-		report := h.end(t, 10)
-		assert.Equal(t, ModeHarmonic, report.Mode)
-		assert.Equal(t, FlagTimeout, report.Flags)
-	})
-	t.Run("a revert in the vote tail lands nothing and the block continues", func(t *testing.T) {
-		h := startExecutor(t, true, nil)
-		env := gatedBank(t, costmodel.Limits{})
-		now := time.Now()
-		h.exec.SlotStarted(blockprod.LeaderSlotInfo{Slot: 10, Bank: env.Bank, Start: now, End: now.Add(time.Second)})
-		h.send(t, bundleEvent(10, 1, false, transfer(t, 1)))
-		h.sync(t)
-		h.exec.now = func() time.Time { return now.Add(time.Second - 10*time.Millisecond) }
-		h.send(t, bundleEvent(10, 2, true, transfer(t, 2), transfer(t, 20_000_000_000)))
-		h.send(t, bundleEvent(10, 3, false, transfer(t, 3)))
-		h.sync(t)
 		assert.Len(t, env.Bank.ForgedTransactions(), 2)
+		assert.False(t, env.Bank.TPUAllowed())
 		report := h.end(t, 10)
 		assert.Equal(t, ModeHarmonic, report.Mode)
 		assert.Zero(t, report.Flags)
-		assert.Equal(t, uint64(1), report.Reverted)
+	})
+	t.Run("the slot is held while a message is in flight, and released once drained", func(t *testing.T) {
+		h := startExecutor(t, true, nil)
+		clock, now := h.useClock()
+		env := gatedBank(t, costmodel.Limits{})
+		h.exec.SlotStarted(blockprod.LeaderSlotInfo{Slot: 10, Bank: env.Bank, Start: now, End: now.Add(time.Second)})
+		assert.False(t, h.exec.HoldSlot(10), "no block is running yet")
+		h.send(t, bundleEvent(10, 1, false, transfer(t, 1)))
+		h.sync(t)
+		h.pipeline.inFlight.Store(true)
+		assert.True(t, h.exec.HoldSlot(10))
+		assert.False(t, h.exec.HoldSlot(11))
+		h.pipeline.inFlight.Store(false)
+		assert.False(t, h.exec.HoldSlot(10), "the buffer is empty")
+
+		// Draining before the end does not release; draining past it does.
+		h.send(t, bundleEvent(10, 2, false, transfer(t, 2)))
+		h.sync(t)
+		select {
+		case <-h.exec.Released():
+			t.Fatal("released before the slot's end")
+		default:
+		}
+		clock.set(now.Add(2 * time.Second))
+		h.send(t, bundleEvent(10, 3, false, transfer(t, 3)))
+		select {
+		case <-h.exec.Released():
+		case <-time.After(2 * time.Second):
+			t.Fatal("not released once past the end and drained")
+		}
+		assert.Len(t, env.Bank.ForgedTransactions(), 3)
+	})
+	t.Run("a revert stops the block, falling back only before the end", func(t *testing.T) {
+		for _, pastEnd := range []bool{false, true} {
+			h := startExecutor(t, true, nil)
+			clock, now := h.useClock()
+			env := gatedBank(t, costmodel.Limits{})
+			h.exec.SlotStarted(blockprod.LeaderSlotInfo{Slot: 10, Bank: env.Bank, Start: now, End: now.Add(time.Second)})
+			h.send(t, bundleEvent(10, 1, false, transfer(t, 1)))
+			h.sync(t)
+			if pastEnd {
+				clock.set(now.Add(2 * time.Second))
+			}
+			h.pipeline.inFlight.Store(true)
+			h.send(t, bundleEvent(10, 2, true, transfer(t, 2), transfer(t, 20_000_000_000)))
+			h.send(t, bundleEvent(10, 3, false, transfer(t, 3)))
+			h.sync(t)
+			assert.Len(t, env.Bank.ForgedTransactions(), 1)
+			assert.False(t, h.exec.HoldSlot(10), "a stopped block holds nothing open")
+			assert.Equal(t, !pastEnd, env.Bank.TPUAllowed())
+			report := h.end(t, 10)
+			assert.Equal(t, FlagReverted, report.Flags)
+			assert.Equal(t, uint64(1), report.Reverted)
+		}
 	})
 }
 

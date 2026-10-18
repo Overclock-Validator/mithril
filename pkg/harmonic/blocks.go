@@ -70,6 +70,7 @@ type BlockPipeline struct {
 	closeOnce   sync.Once
 	txV1Enabled func() bool
 	current     atomic.Uint64
+	inFlight    atomic.Int32
 	verifier    txverify.BatchVerifier
 	stats       struct {
 		messages, wrongSlot, lostSlot, bundles, invalid, transactions atomic.Uint64
@@ -126,6 +127,12 @@ func (p *BlockPipeline) SetCurrentSlot(slot uint64) {
 	}
 }
 
+// InFlight reports whether a current-slot message is being split into
+// bundles whose events are not all sent yet.
+func (p *BlockPipeline) InFlight() bool {
+	return p.inFlight.Load() > 0
+}
+
 // StreamLost marks slot lost: the rest of its block is discarded even after
 // the session reconnects, since nothing says where a new stream resumes.
 func (p *BlockPipeline) StreamLost(slot uint64) {
@@ -137,6 +144,9 @@ func (p *BlockPipeline) StreamLost(slot uint64) {
 
 // HandleBlock admits, segments and validates one block message.
 func (p *BlockPipeline) HandleBlock(block *blockpb.Block, arrival time.Time) {
+	// Until its last event is sent, a message counts as buffered.
+	p.inFlight.Add(1)
+	defer p.inFlight.Add(-1)
 	p.stats.messages.Add(1)
 	slot := block.GetSlot()
 	if current := p.current.Load(); current == 0 || slot != current {

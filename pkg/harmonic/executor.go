@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/blockprod"
@@ -16,9 +17,6 @@ const (
 	// thresholdFraction of the slot's recording window passes before a slot
 	// with no block bundle falls back to local scheduling.
 	thresholdFraction = 0.5
-	// voteTail is the end of the slot in which a reverting block bundle does
-	// not abort the block.
-	voteTail = 20 * time.Millisecond
 )
 
 // SlotMode is a leader slot's admission mode.
@@ -119,10 +117,13 @@ type BlockEngineControl interface {
 	NotifyLeaderSlot(slot uint64, end time.Time)
 }
 
-// SlotTracker is told the current block slot; the block pipeline admits only
-// that slot's messages.
+// SlotTracker is the block pipeline's side of the executor. It is told the
+// current block slot, and admits only that slot's messages.
 type SlotTracker interface {
 	SetCurrentSlot(slot uint64)
+	// InFlight reports whether a message is being split into bundles whose
+	// events are not all sent yet.
+	InFlight() bool
 }
 
 // CrankBuilder returns the transactions that must land before a slot's first
@@ -175,12 +176,56 @@ type Executor struct {
 	hooksMu sync.Mutex
 	hooks   []hookMessage
 	wake    chan struct{}
+
+	// running is the slot whose block is executing, or 0. The leader loop
+	// holds that slot open while block bundles remain.
+	running  atomic.Uint64
+	released chan struct{}
 }
 
-var _ blockprod.LeaderHooks = (*Executor)(nil)
+var (
+	_ blockprod.LeaderHooks = (*Executor)(nil)
+	_ blockprod.SlotHolder  = (*Executor)(nil)
+)
 
 func NewExecutor(cfg ExecutorConfig) *Executor {
-	return &Executor{cfg: cfg, now: time.Now, wake: make(chan struct{}, 1)}
+	return &Executor{cfg: cfg, now: time.Now, wake: make(chan struct{}, 1), released: make(chan struct{}, 1)}
+}
+
+// HoldSlot keeps a running block's slot open while any block bundle received
+// for it has yet to execute: the slot ends once it is past its end and the
+// buffer is empty. It runs on the leader loop's goroutine. A bundle already
+// executing when it returns false still lands, since freezing the bank waits
+// for it.
+func (x *Executor) HoldSlot(slot uint64) bool {
+	return x.running.Load() == slot && (len(x.cfg.Events) > 0 || x.cfg.Pipeline.InFlight())
+}
+
+// Released is signaled when the running block's slot may end.
+func (x *Executor) Released() <-chan struct{} {
+	return x.released
+}
+
+func (x *Executor) signalRelease() {
+	select {
+	case x.released <- struct{}{}:
+	default:
+	}
+}
+
+// endHold stops holding st's slot open.
+func (x *Executor) endHold(st *slotState) {
+	if x.running.CompareAndSwap(st.slot, 0) {
+		x.signalRelease()
+	}
+}
+
+// releaseIfDrained lets the leader loop end a running block's slot as soon as
+// it is past its end and every block bundle received has executed.
+func (x *Executor) releaseIfDrained(st *slotState) {
+	if st != nil && x.running.Load() == st.slot && !x.now().Before(st.end) && !x.HoldSlot(st.slot) {
+		x.signalRelease()
+	}
 }
 
 // SlotStarted runs under the leader loop's lock, so it only does what cannot
@@ -255,6 +300,7 @@ func (x *Executor) Run(ctx context.Context) {
 			// the block engine streams only after the notice.
 			st = x.drainHooks(st)
 			x.handleEvent(st, e)
+			x.releaseIfDrained(st)
 		}
 	}
 }
@@ -309,6 +355,7 @@ func (x *Executor) finish(st *slotState, reason string, aborted bool) {
 	if st.thresholdTimer != nil {
 		st.thresholdTimer.Stop()
 	}
+	x.endHold(st)
 	st.report.Mode = st.mode
 	st.report.Aborted = aborted
 	st.report.Reason = reason
@@ -378,13 +425,7 @@ func (x *Executor) admits(st *slotState, slot, seq uint64) bool {
 }
 
 func (x *Executor) executeBundle(st *slotState, e BundleEvent) {
-	now := x.now()
-	if st.mode == ModeHarmonic && now.After(st.end) {
-		st.report.Rejected++
-		x.stop(st, FlagTimeout)
-		return
-	}
-	if st.mode == ModeUndecided && !now.Before(st.threshold) {
+	if st.mode == ModeUndecided && !x.now().Before(st.threshold) {
 		st.report.Rejected++
 		x.fallback(st, FlagTimeout)
 		return
@@ -395,6 +436,7 @@ func (x *Executor) executeBundle(st *slotState, e BundleEvent) {
 			return
 		}
 		st.mode = ModeHarmonic
+		x.running.Store(st.slot)
 	}
 
 	var result blockprod.ForgeResult
@@ -410,15 +452,14 @@ func (x *Executor) executeBundle(st *slotState, e BundleEvent) {
 		// The bank froze: the slot is over.
 		st.report.Rejected++
 		st.stopped = true
+		x.endHold(st)
 	case blockprod.ForgeDroppedCost:
 		// Execution is serial, so nothing in flight can free room.
 		st.report.Rejected++
 		x.stop(st, FlagFailed)
 	default:
 		st.report.Reverted++
-		if now.Before(st.end.Add(-voteTail)) {
-			x.stop(st, FlagReverted)
-		}
+		x.stop(st, FlagReverted)
 	}
 }
 
@@ -449,11 +490,12 @@ func (x *Executor) runCrank(st *slotState) bool {
 	return true
 }
 
-// stop ends block admission for the slot. Before the cutoff the slot falls
-// back to local scheduling; after it, the block is simply over.
+// stop ends block admission for the slot. Before the slot's end it falls back
+// to local scheduling; after it, the block is simply over.
 func (x *Executor) stop(st *slotState, flag EndFlags) {
 	st.stopped = true
 	st.report.Flags |= flag
+	x.endHold(st)
 	if st.mode == ModeUndecided || (st.mode == ModeHarmonic && x.now().Before(st.end)) {
 		x.fallback(st, 0)
 	}
@@ -463,5 +505,6 @@ func (x *Executor) fallback(st *slotState, flag EndFlags) {
 	st.mode = ModeFallback
 	st.stopped = true
 	st.report.Flags |= flag
+	x.endHold(st)
 	st.bank.AllowTPU()
 }

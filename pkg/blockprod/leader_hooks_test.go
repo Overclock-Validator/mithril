@@ -322,3 +322,61 @@ func TestLeaderHooksSlotAbortedWithoutEndingWhenParentChanges(t *testing.T) {
 	assert.Nil(t, controller.WorkingBank())
 	assert.Nil(t, loop.activeBank)
 }
+
+// holdingHooks keeps the active slot open while hold is set.
+type holdingHooks struct {
+	*recordingHooks
+	hold     bool
+	released chan struct{}
+}
+
+func (h *holdingHooks) HoldSlot(uint64) bool      { return h.hold }
+func (h *holdingHooks) Released() <-chan struct{} { return h.released }
+
+func TestLeaderHoldsTheSlotPastItsDeadlineUntilReleased(t *testing.T) {
+	holding := &holdingHooks{recordingHooks: &recordingHooks{}}
+	require.Same(t, holding, NewLeaderLoop(LeaderLoopConfig{Hooks: holding}).holder)
+
+	ready := time.Unix(1_700_000_000, 0)
+	for _, tc := range []struct {
+		name string
+		slot uint64
+		// at is past the production deadline (125ms after ParentReady for the
+		// window's first slot); the protocol deadline is at 200ms.
+		at       time.Duration
+		release  bool
+		finishes bool
+	}{
+		{"held past the production deadline", 120, 150 * time.Millisecond, false, false},
+		{"released", 121, 150 * time.Millisecond, true, true},
+		{"the protocol deadline ends a hold", 122, 200 * time.Millisecond, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hooks := &recordingHooks{}
+			loop, _, _, delivered := newFinishingLeaderLoop(t, tc.slot, hooks,
+				func(*ParentContext, replay.CommitLeaderInput) error { return nil })
+			holder := &holdingHooks{recordingHooks: hooks, hold: true}
+			loop.holder = holder
+			now := ready.Add(tc.at)
+			loop.now = func() time.Time { return now }
+			loop.currentSlot = func() uint64 { return tc.slot }
+			loop.leaderForSlot = func(uint64) (solana.PublicKey, bool) { return solana.PublicKey{}, false }
+			loop.productionWindow = leaderProductionWindow{
+				active: true, startSlot: tc.slot, endSlot: tc.slot + 3, nextSlot: tc.slot, readyAt: ready,
+			}
+			if tc.release {
+				holder.hold = false
+			}
+
+			loop.tick()
+			if !tc.finishes {
+				assert.NotNil(t, loop.activeBank)
+				assert.Empty(t, hooks.kinds())
+				return
+			}
+			require.True(t, *delivered)
+			assert.Equal(t, []string{"ending"}, hooks.kinds())
+			assert.Nil(t, loop.activeBank)
+		})
+	}
+}
