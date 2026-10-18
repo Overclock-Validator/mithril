@@ -728,6 +728,14 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 		}
 	}
 
+	// A transaction that names an account twice or names more accounts than
+	// the lock limit allows can never be processed, so a block containing one
+	// is invalid. Replay resolves address-table lookups before this point, so
+	// looked-up keys are included.
+	if lockErr := ValidateAccountLocks(tx, slotCtx.Features); lockErr != nil {
+		return nil, 0, lockErr.InstructionError
+	}
+
 	if shouldVerifySignatures {
 		sigverifySnapshot, err := buildSigverifySnapshot(tx, slotCtx.Slot)
 		if err != nil {

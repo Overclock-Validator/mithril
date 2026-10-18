@@ -49,6 +49,12 @@ func requireLockError(t *testing.T, want TransactionErrorType, got *TransactionE
 	t.Helper()
 	require.NotNil(t, got)
 	assert.Equal(t, want, got.ErrorType, "got %s", got.ErrorType.String())
+	switch want {
+	case TransactionErrorTooManyAccountLocks:
+		assert.ErrorIs(t, got.InstructionError, TxErrTooManyAccountLocks)
+	case TransactionErrorAccountLoadedTwice:
+		assert.ErrorIs(t, got.InstructionError, TxErrAccountLoadedTwice)
+	}
 }
 
 func TestTransactionAccountLockLimit(t *testing.T) {

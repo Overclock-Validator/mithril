@@ -1,6 +1,8 @@
 package replay
 
 import (
+	"errors"
+
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/gagliardetto/solana-go"
 )
@@ -14,6 +16,11 @@ const (
 	// accountLockSetThreshold is the key count from which a set beats a
 	// pairwise scan for duplicate detection.
 	accountLockSetThreshold = 32
+)
+
+var (
+	TxErrTooManyAccountLocks = errors.New("TxErrTooManyAccountLocks")
+	TxErrAccountLoadedTwice  = errors.New("TxErrAccountLoadedTwice")
 )
 
 // TransactionAccountLockLimit returns how many accounts a transaction may
@@ -43,10 +50,10 @@ func ValidateAccountLocks(tx *solana.Transaction, f *features.Features) *Transac
 		numAccounts += msg.AddressTableLookups.NumLookups()
 	}
 	if numAccounts > TransactionAccountLockLimit(f) {
-		return &TransactionError{ErrorType: TransactionErrorTooManyAccountLocks}
+		return &TransactionError{ErrorType: TransactionErrorTooManyAccountLocks, InstructionError: TxErrTooManyAccountLocks}
 	}
 	if hasDuplicateAccountKeys(msg.AccountKeys) {
-		return &TransactionError{ErrorType: TransactionErrorAccountLoadedTwice}
+		return &TransactionError{ErrorType: TransactionErrorAccountLoadedTwice, InstructionError: TxErrAccountLoadedTwice}
 	}
 	return nil
 }
