@@ -50,6 +50,17 @@ const defaultFoldBatchSlots = 128
 // better union dedupe and less NVMe wear, more RAM, longer crash re-execution.
 var FoldBatchSlots = defaultFoldBatchSlots
 
+const (
+	DefaultFoldMaxBytes       = uint64(4 << 30)
+	DefaultWorkingSetMaxBytes = uint64(16 << 30)
+)
+
+// These budgets count retained account capacities and bookkeeping, not total
+// process RAM. Leave headroom for the executing bank, caches and GC. A slot is
+// indivisible and can overshoot either budget; GOMEMLIMIT is a separate guard.
+var FoldMaxBytes = DefaultFoldMaxBytes
+var WorkingSetMaxBytes = DefaultWorkingSetMaxBytes
+
 // blockAccountSource is the slot-scoped read API the block loader needs; both
 // AccountsDb and unrootedTail satisfy it, so the loader is mode-agnostic.
 type blockAccountSource interface {
@@ -120,12 +131,14 @@ type unrootedState interface {
 // unrootedTail layers an in-RAM UnrootedOverlay over the durable store: reads
 // resolve overlay→durable, commits buffer until rooted slots promote out.
 type unrootedTail struct {
-	overlay     *accounts.WorkingSet
-	durable     blockAccountSource // the canonical rooted store (for read fall-through)
-	committer   batchCommitter     // durable promotion of rooted slot batches
-	bankhashes  map[uint64][32]byte
-	batchSlots  int    // fold chunk size K
-	stakeIdxDir string // directory of stake_pubkeys.idx; pending stake entries flush here at fold time
+	overlay      *accounts.WorkingSet
+	durable      blockAccountSource // the canonical rooted store (for read fall-through)
+	committer    batchCommitter     // durable promotion of rooted slot batches
+	bankhashes   map[uint64][32]byte
+	batchSlots   int    // fold chunk size K
+	foldMaxBytes uint64 // start a fold before K slots when this byte target is met
+	maxBytes     uint64 // stop admitting slots while retained state exceeds this budget
+	stakeIdxDir  string // directory of stake_pubkeys.idx; pending stake entries flush here at fold time
 	// contexts holds the deep-copied end-of-slot resume context per held slot,
 	// retained until promotion so the context as of the last rooted slot survives for resume.
 	contexts map[uint64]*state.ResumeContext
@@ -146,15 +159,17 @@ func newUnrootedTail(durable blockAccountSource, committer batchCommitter, haltC
 		batchSlots = defaultFoldBatchSlots
 	}
 	return &unrootedTail{
-		overlay:     accounts.NewWorkingSet(),
-		durable:     durable,
-		committer:   committer,
-		bankhashes:  make(map[uint64][32]byte),
-		batchSlots:  batchSlots,
-		stakeIdxDir: stakeIdxDir,
-		contexts:    make(map[uint64]*state.ResumeContext),
-		bankSysvars: make(map[uint64]*sealevel.BankSysvars),
-		haltCap:     haltCap,
+		overlay:      accounts.NewWorkingSet(),
+		durable:      durable,
+		committer:    committer,
+		bankhashes:   make(map[uint64][32]byte),
+		batchSlots:   batchSlots,
+		foldMaxBytes: FoldMaxBytes,
+		maxBytes:     WorkingSetMaxBytes,
+		stakeIdxDir:  stakeIdxDir,
+		contexts:     make(map[uint64]*state.ResumeContext),
+		bankSysvars:  make(map[uint64]*sealevel.BankSysvars),
+		haltCap:      haltCap,
 	}
 }
 
@@ -363,15 +378,15 @@ func (t *unrootedTail) promoteChunked(through uint64, force bool) (uint64, *stat
 // - A completed-but-unapplied fold on exit is identical to the supported
 //   "crash after commit, before state-file update" case: RecoverFoldState
 //   reconciles the store frontier forward on the next start.
-// - A failed fold is retried naturally: LastRootedSlot did not advance, so the
-//   next iteration rebuilds the same chunk. The stake-index flush that already
-//   landed is a harmless superset (second flush is a no-op).
+// - A failed durable write halts replay until recovery reconciles its manifest.
 
 // foldJob is an immutable snapshot of one K-slot fold chunk. Account values
 // reference immutable retained WorkingSet layers; the layers are not removed
 // until this job completes and applies.
 type foldJob struct {
 	chunk                                  []accounts.SlotDelta
+	slotCount                              int
+	retainedBytes                          uint64
 	through                                uint64
 	bankhashes                             map[uint64][32]byte
 	ctx                                    *state.ResumeContext
@@ -397,6 +412,7 @@ type foldResult struct {
 func (t *unrootedTail) buildRewardsCompletionFoldJob(through uint64) (*foldJob, error) {
 	whole := *t
 	whole.batchSlots = t.overlay.HeldSlots()
+	whole.foldMaxBytes = 0 // the rewards completion checkpoint must stay atomic
 	job, err := whole.buildFoldJob(through, true)
 	if err != nil {
 		return nil, err
@@ -420,7 +436,7 @@ func (t *unrootedTail) buildFoldJob(through uint64, force bool, hookOverrides ..
 	// Check chunk eligibility before materializing account-write lists. Replay
 	// calls this on every iteration, including skipped slots; a partial batch
 	// remains in RAM without rescanning all of its accounts each time.
-	chunk := t.overlay.PromotionChunk(through, t.batchSlots, force)
+	chunk := t.overlay.PromotionChunkWithByteLimit(through, t.batchSlots, t.foldMaxBytes, force || t.overMemoryLimit())
 	if len(chunk) == 0 {
 		return nil, nil
 	}
@@ -445,13 +461,19 @@ func (t *unrootedTail) buildFoldJob(through uint64, force bool, hookOverrides ..
 		}
 	}
 	bankhashes := make(map[uint64][32]byte, len(chunk))
+	var retainedBytes uint64
 	for _, sd := range chunk {
+		for _, a := range sd.Delta {
+			retainedBytes += accounts.RetainedAccountBytes(a)
+		}
 		if bh, ok := t.bankhashes[sd.Slot]; ok {
 			bankhashes[sd.Slot] = bh
 		}
 	}
 	return &foldJob{
 		chunk:                                  append([]accounts.SlotDelta(nil), chunk...),
+		slotCount:                              len(chunk),
+		retainedBytes:                          retainedBytes,
 		through:                                through,
 		bankhashes:                             bankhashes,
 		ctx:                                    ctx,
@@ -470,9 +492,13 @@ func runFoldJob(committer batchCommitter, job *foldJob) error {
 	if job == nil {
 		return errors.New("fold job has no resume context")
 	}
-	// Failed folds are rebuilt from the retained tail. Neither a failed result
-	// nor a completed-but-unapplied job should keep checkpoint deltas alive.
-	defer func() { job.transactionStatusSnapshot = nil }()
+	// The overlay owns the versions until apply. Do not also retain an entire
+	// completed batch on the idle worker's stack or its result channel.
+	defer func() {
+		job.transactionStatusSnapshot = nil
+		job.chunk = nil
+		job.ctxJSON = nil
+	}()
 	if job.ctx == nil {
 		return errors.New("fold job has no resume context")
 	}
@@ -550,6 +576,7 @@ type asyncPromoter struct {
 	jobs      chan *foldJob
 	results   chan foldResult
 	inFlight  bool
+	failure   error // latched until reopen/recovery; never retry a failed durable write in place
 	done      chan struct{}
 }
 
@@ -570,8 +597,8 @@ func (p *asyncPromoter) run() {
 		start := time.Now()
 		err := runFoldJob(p.committer, job)
 		if err == nil {
-			mlog.Log.FileOnlyf("async fold: committed %d slots through %d in %s checkpoint_capture=%s checkpoint_encode=%s checkpoint_bytes=%d",
-				len(job.chunk), job.through, time.Since(start).Round(time.Millisecond),
+			mlog.Log.FileOnlyf("async fold: committed %d slots through %d in %s retained_bytes=%d checkpoint_capture=%s checkpoint_encode=%s checkpoint_bytes=%d",
+				job.slotCount, job.through, time.Since(start).Round(time.Millisecond), job.retainedBytes,
 				job.checkpointCaptureTime, job.checkpointEncodeTime, job.checkpointBytes)
 		}
 		p.results <- foldResult{job: job, err: err}
@@ -579,9 +606,13 @@ func (p *asyncPromoter) run() {
 }
 
 // enqueue hands a job to the worker (loop thread; requires !inFlight).
-func (p *asyncPromoter) enqueue(job *foldJob) {
+func (p *asyncPromoter) enqueue(job *foldJob) error {
+	if p.failure != nil {
+		return p.failure
+	}
 	p.jobs <- job
 	p.inFlight = true
+	return nil
 }
 
 // poll returns a completed result without blocking (nil when none / none in
@@ -593,6 +624,7 @@ func (p *asyncPromoter) poll() *foldResult {
 	select {
 	case res := <-p.results:
 		p.inFlight = false
+		p.failure = res.err
 		return &res
 	default:
 		return nil
@@ -608,6 +640,7 @@ func (p *asyncPromoter) drain() *foldResult {
 	}
 	res := <-p.results
 	p.inFlight = false
+	p.failure = res.err
 	return &res
 }
 
@@ -667,7 +700,11 @@ func (t *unrootedTail) unwind(fromSlot uint64) (*state.ResumeContext, *sealevel.
 // OverCap reports whether the unrooted tail has grown past the halt cap, i.e.
 // rooting has stalled and we must stop replay rather than grow RAM unbounded.
 func (t *unrootedTail) OverCap() bool {
-	return t.haltCap > 0 && t.overlay.HeldSlots() > t.haltCap
+	return (t.haltCap > 0 && t.overlay.HeldSlots() > t.haltCap) || t.overMemoryLimit()
+}
+
+func (t *unrootedTail) overMemoryLimit() bool {
+	return t.maxBytes > 0 && t.overlay.RetainedBytes() >= t.maxBytes
 }
 
 // promoteRootedBatched folds held slots <= through in chunks of batchSlots.

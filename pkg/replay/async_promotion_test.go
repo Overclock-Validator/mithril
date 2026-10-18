@@ -3,7 +3,9 @@ package replay
 import (
 	"encoding/json"
 	"errors"
+	"os"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -311,11 +313,11 @@ func TestFoldCapacityBackpressureDrainsOneAdmittedFold(t *testing.T) {
 	tail.Add(3, []*accounts.Account{testAccount(3, 3)}, testHashBytes(3))
 	tail.SetContext(3, &state.ResumeContext{Slot: 3})
 	require.True(t, tail.OverCap())
-	stillOver := settleInFlightFoldAtCapacity(tail, p, 3, func(res *foldResult) {
+	stillOver := settleFoldsAtCapacity(tail, p, 3, func(res *foldResult) {
 		if res != nil && res.err == nil {
 			tail.applyFoldJob(res.job)
 		}
-	})
+	}, nil)
 	require.False(t, stillOver)
 	require.False(t, p.inFlight)
 	require.Equal(t, 1, tail.overlay.HeldSlots())
@@ -344,11 +346,11 @@ func TestFoldCapacityBackpressureFailsClosed(t *testing.T) {
 		defer p.stop()
 		p.enqueue(job)
 
-		stillOver := settleInFlightFoldAtCapacity(tail, p, 3, func(res *foldResult) {
+		stillOver := settleFoldsAtCapacity(tail, p, 3, func(res *foldResult) {
 			if res != nil && res.err == nil {
 				tail.applyFoldJob(res.job)
 			}
-		})
+		}, nil)
 		require.True(t, stillOver, "failed fold must leave the cap halt armed")
 		require.False(t, p.inFlight)
 		require.Equal(t, 3, tail.overlay.HeldSlots())
@@ -365,7 +367,7 @@ func TestFoldCapacityBackpressureFailsClosed(t *testing.T) {
 		p := newAsyncPromoter(fc)
 		defer p.stop()
 
-		require.True(t, settleInFlightFoldAtCapacity(tail, p, 3, nil))
+		require.True(t, settleFoldsAtCapacity(tail, p, 3, nil, nil))
 		require.Empty(t, fc.committed, "capacity handler admitted new fold work")
 	})
 
@@ -383,19 +385,19 @@ func TestFoldCapacityBackpressureFailsClosed(t *testing.T) {
 		p.enqueue(job)
 		tail.Add(3, nil, testHashBytes(3)) // deliberately omit SetContext(3)
 
-		require.True(t, settleInFlightFoldAtCapacity(tail, p, 3, func(res *foldResult) {
+		require.True(t, settleFoldsAtCapacity(tail, p, 3, func(res *foldResult) {
 			if res != nil && res.err == nil {
 				tail.applyFoldJob(res.job)
 			}
-		}))
+		}, nil))
 		require.True(t, p.inFlight, "context-less tip must be rejected before draining hides it")
 		require.Equal(t, 3, tail.overlay.HeldSlots())
 	})
 }
 
-// A failed fold leaves the tail untouched (natural retry: the same chunk
-// rebuilds because nothing advanced) and reports the error via the result.
-func TestAsyncPromoterFailedFoldRetries(t *testing.T) {
+// A failed durable fold leaves the tail untouched and refuses further writes
+// until restart recovery has reconciled any already-published manifest.
+func TestAsyncPromoterFailedFoldRequiresRecovery(t *testing.T) {
 	fc := &fakeCommitter{durable: accounts.NewMemAccounts(), failOn: 5}
 	tail := asyncTestTail(fc, 5, 6, 7)
 	p := newAsyncPromoter(fc)
@@ -409,16 +411,17 @@ func TestAsyncPromoterFailedFoldRetries(t *testing.T) {
 	require.Error(t, res.err)
 	assert.Equal(t, 3, tail.overlay.HeldSlots(), "failed fold must not touch the overlay")
 
-	// Retry after the fault clears: identical chunk rebuilds and succeeds.
+	// Even if the apparent fault clears, in-process retry is unsafe: the
+	// failed call could have durably published a manifest before returning.
 	fc.failOn = 0
 	job2, err := tail.buildFoldJob(7, false)
 	require.NoError(t, err)
 	require.Equal(t, job.through, job2.through, "same chunk rebuilds after a failed fold")
-	p.enqueue(job2)
-	res = p.drain()
-	require.NoError(t, res.err)
-	tail.applyFoldJob(res.job)
-	assert.Equal(t, 1, tail.overlay.HeldSlots())
+	require.ErrorIs(t, p.enqueue(job2), res.err)
+	require.Nil(t, p.drain())
+	require.False(t, p.inFlight)
+	require.Empty(t, fc.committed)
+	assert.Equal(t, 3, tail.overlay.HeldSlots())
 }
 
 // Codex item 5 — the shutdown gate proof: the flush path folds THROUGH THE
@@ -466,4 +469,30 @@ func BenchmarkBuildFoldJobWaitingForBatch(b *testing.B) {
 			b.Fatalf("unexpected fold admission: job=%v err=%v", job, err)
 		}
 	}
+}
+
+func TestAsyncPromoterDiskFullLatchedThroughPoll(t *testing.T) {
+	fc := &fakeCommitter{durable: accounts.NewMemAccounts()}
+	tail := asyncTestTail(fc, 5, 6)
+	writes := 0
+	require.NoError(t, tail.SetTransactionStatusCheckpointHooks(TransactionStatusCheckpointHooks{
+		Capture: func(uint64) (TransactionStatusSnapshot, error) { return testCheckpointBytes([]byte("captured")), nil },
+		Install: func(uint64, []byte) (*state.TransactionStatusCheckpointRef, error) {
+			writes++
+			return nil, &os.PathError{Op: "write", Path: "checkpoint.tmp", Err: syscall.ENOSPC}
+		},
+	}))
+	job, err := tail.buildFoldJob(6, false)
+	require.NoError(t, err)
+	p := newAsyncPromoter(fc)
+	defer p.stop()
+	require.NoError(t, p.enqueue(job))
+	var result *foldResult
+	require.Eventually(t, func() bool { result = p.poll(); return result != nil }, time.Second, time.Millisecond)
+	require.ErrorIs(t, result.err, syscall.ENOSPC)
+	require.ErrorIs(t, p.enqueue(job), syscall.ENOSPC, "a full disk must not trigger another write")
+	require.False(t, p.inFlight)
+	require.Equal(t, 1, writes)
+	require.Empty(t, fc.throughs)
+	require.Equal(t, 2, tail.overlay.HeldSlots())
 }
