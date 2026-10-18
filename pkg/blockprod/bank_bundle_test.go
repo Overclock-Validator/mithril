@@ -1,10 +1,13 @@
 package blockprod
 
 import (
+	"math"
 	"math/rand/v2"
 	"sync"
 	"testing"
 
+	"github.com/Overclock-Validator/mithril/pkg/accounts"
+	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/costmodel"
 	"github.com/Overclock-Validator/mithril/pkg/replay"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
@@ -299,4 +302,102 @@ func TestScratchSlotCtxLeavesBaseUnchanged(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, uint64(1), got.Lamports)
 	assert.Equal(t, before, lamportsOf(t, env, txfixture.PayerPubkey()), "writes stay in the scratch view")
+}
+
+// installNonce puts an initialized nonce account, with the payer as its
+// authority, in the bank and returns its durable nonce.
+func installNonce(t *testing.T, env *TestEnv, key solana.PublicKey) solana.Hash {
+	t.Helper()
+	durableNonce := solana.Hash{0xAA}
+	nonceState := sealevel.NonceStateVersions{
+		Type: sealevel.NonceVersionCurrent,
+		Current: sealevel.NonceData{
+			IsInitialized: true,
+			Authority:     txfixture.PayerPubkey(),
+			DurableNonce:  durableNonce,
+			FeeCalculator: sealevel.FeeCalculator{LamportsPerSignature: 5000},
+		},
+	}
+	data, err := nonceState.Marshal()
+	require.NoError(t, err)
+	require.NoError(t, env.SlotCtx.SetAccount(key, &accounts.Account{
+		Key: key, Lamports: 1_500_000, Owner: addresses.SystemProgramAddr, Data: data, RentEpoch: math.MaxUint64,
+	}))
+	return durableNonce
+}
+
+func nonceTx(t *testing.T, nonce solana.PublicKey, durableNonce solana.Hash, instructions ...solana.Instruction) *solana.Transaction {
+	t.Helper()
+	all := append([]solana.Instruction{
+		system.NewAdvanceNonceAccountInstruction(nonce, solana.SysVarRecentBlockHashesPubkey, txfixture.PayerPubkey()).Build(),
+	}, instructions...)
+	tx, err := solana.NewTransaction(all, durableNonce, solana.TransactionPayer(txfixture.PayerPubkey()))
+	require.NoError(t, err)
+	payerKey := txfixture.PayerPrivateKey()
+	_, err = tx.Sign(func(solana.PublicKey) *solana.PrivateKey { return &payerKey })
+	require.NoError(t, err)
+	return tx
+}
+
+func TestForgeBundleFailureNeitherChargesFeesNorAdvancesNonce(t *testing.T) {
+	nonceKey := solana.PublicKey{0xD9}
+	// A one-byte loaded-data limit makes this a fees-only failure: outside a
+	// bundle it lands, charging the fee and advancing the nonce.
+	failing := func(t *testing.T, durableNonce solana.Hash) *solana.Transaction {
+		return nonceTx(t, nonceKey, durableNonce,
+			computebudget.NewSetLoadedAccountsDataSizeLimitInstruction(1).Build(),
+			transferIx(1, txfixture.PayerPubkey(), txfixture.DestPubkey()))
+	}
+
+	control := NewTestEnv(TestEnvConfig{})
+	defer control.Close()
+	controlNonce := installNonce(t, control, nonceKey)
+	nonceBefore, err := control.SlotCtx.GetAccount(nonceKey)
+	require.NoError(t, err)
+	payerBefore := lamportsOf(t, control, txfixture.PayerPubkey())
+	result, _ := control.Bank.ForgeTransaction(failing(t, controlNonce), 0)
+	require.Equal(t, ForgeAccepted, result, "the control lands as a fees-only failure")
+	nonceAfter, err := control.SlotCtx.GetAccount(nonceKey)
+	require.NoError(t, err)
+	require.NotEqual(t, nonceBefore.Data, nonceAfter.Data, "outside a bundle the nonce advances")
+	require.Equal(t, payerBefore-5_000, lamportsOf(t, control, txfixture.PayerPubkey()), "outside a bundle the fee is charged")
+
+	for name, tc := range map[string]struct {
+		bundle    func(t *testing.T, durableNonce solana.Hash) []*solana.Transaction
+		failingAt int
+	}{
+		"alone": {func(t *testing.T, durableNonce solana.Hash) []*solana.Transaction {
+			return []*solana.Transaction{failing(t, durableNonce)}
+		}, 0},
+		"after a successful transaction": {func(t *testing.T, durableNonce solana.Hash) []*solana.Transaction {
+			return []*solana.Transaction{mustSignedTransfer(t, 3), failing(t, durableNonce)}
+		}, 1},
+		// The durable-nonce transaction succeeds and advances the nonce in the
+		// scratch view; the bundle then fails, so that advance is discarded.
+		"successful, before a failing transaction": {func(t *testing.T, durableNonce solana.Hash) []*solana.Transaction {
+			return []*solana.Transaction{
+				nonceTx(t, nonceKey, durableNonce, transferIx(4, txfixture.PayerPubkey(), txfixture.DestPubkey())),
+				mustSignBankTestTransaction(t, transferIx(20_000_000_000, txfixture.PayerPubkey(), txfixture.DestPubkey())),
+			}
+		}, 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := NewTestEnv(TestEnvConfig{})
+			defer env.Close()
+			durableNonce := installNonce(t, env, nonceKey)
+			nonceBefore, err := env.SlotCtx.GetAccount(nonceKey)
+			require.NoError(t, err)
+			payerBefore := lamportsOf(t, env, txfixture.PayerPubkey())
+			destBefore := lamportsOf(t, env, txfixture.DestPubkey())
+
+			got := env.Bank.ForgeBundle(BundleInput{Transactions: tc.bundle(t, durableNonce)})
+			require.Equal(t, ForgeDroppedExecution, got.Result, "%+v", got)
+			require.Equal(t, tc.failingAt, got.Index, "%v", got.Err)
+			nonceAfter, err := env.SlotCtx.GetAccount(nonceKey)
+			require.NoError(t, err)
+			assert.Equal(t, nonceBefore.Data, nonceAfter.Data, "the nonce is not advanced")
+			assert.Equal(t, nonceBefore.Lamports, nonceAfter.Lamports)
+			requireNothingLanded(t, env, payerBefore, destBefore)
+		})
+	}
 }
