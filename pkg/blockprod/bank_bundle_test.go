@@ -1,12 +1,14 @@
 package blockprod
 
 import (
+	"errors"
 	"math"
 	"math/rand/v2"
 	"sync"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
+	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/costmodel"
 	"github.com/Overclock-Validator/mithril/pkg/replay"
@@ -400,4 +402,35 @@ func TestForgeBundleFailureNeitherChargesFeesNorAdvancesNonce(t *testing.T) {
 			requireNothingLanded(t, env, payerBefore, destBefore)
 		})
 	}
+}
+
+func TestWorkingBankReadAccountSeesSlotWritesThenParentState(t *testing.T) {
+	env := NewTestEnv(TestEnvConfig{})
+	defer env.Close()
+	parentOnly := solana.PublicKey{0x51}
+	env.SlotCtx.AccountsDb = &accountsdb.AccountsDb{}
+	env.SlotCtx.UnrootedRead = parentStateAccounts{parentOnly: {Key: parentOnly, Lamports: 7}}
+
+	acct, ok := env.Bank.ReadAccount(txfixture.PayerPubkey())
+	require.True(t, ok, "written in the slot")
+	assert.Equal(t, uint64(10_000_000_000), acct.Lamports)
+	acct, ok = env.Bank.ReadAccount(parentOnly)
+	require.True(t, ok, "falls back to parent state")
+	assert.Equal(t, uint64(7), acct.Lamports)
+	_, ok = env.Bank.ReadAccount(solana.PublicKey{0x52})
+	assert.False(t, ok, "missing everywhere")
+	require.NoError(t, env.SlotCtx.SetAccount(parentOnly, &accounts.Account{Key: parentOnly}))
+	_, ok = env.Bank.ReadAccount(parentOnly)
+	assert.False(t, ok, "an account the slot emptied does not exist")
+	assert.Equal(t, env.SlotCtx.Epoch, env.Bank.Epoch())
+	assert.Equal(t, txfixture.TestBlockhash(), env.Bank.LastBlockhash())
+}
+
+type parentStateAccounts map[solana.PublicKey]*accounts.Account
+
+func (p parentStateAccounts) GetAccount(_ uint64, pubkey solana.PublicKey) (*accounts.Account, error) {
+	if acct, ok := p[pubkey]; ok {
+		return acct.Clone(), nil
+	}
+	return nil, errors.New("not found")
 }

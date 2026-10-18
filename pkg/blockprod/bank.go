@@ -4,6 +4,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/arena"
 	"github.com/Overclock-Validator/mithril/pkg/costmodel"
 	"github.com/Overclock-Validator/mithril/pkg/features"
@@ -157,6 +158,35 @@ func (b *WorkingBank) TxFeeAccumulator() fees.TxFeeInfoAccumulator {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.txFees
+}
+
+// ReadAccount returns pubkey's account as this bank sees it: as written
+// earlier in the slot, otherwise from parent state. ok is false for an
+// account that does not exist.
+func (b *WorkingBank) ReadAccount(pubkey solana.PublicKey) (*accounts.Account, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.slotCtx == nil {
+		return nil, false
+	}
+	acct, err := b.slotCtx.GetAccount(pubkey)
+	if err != nil && (b.slotCtx.UnrootedRead != nil || b.slotCtx.AccountsDb != nil) {
+		acct, err = b.slotCtx.GetAccountFromAccountsDb(pubkey)
+	}
+	if err != nil || acct == nil || acct.Lamports == 0 {
+		return nil, false
+	}
+	return acct, true
+}
+
+// Epoch is the bank's epoch.
+func (b *WorkingBank) Epoch() uint64 {
+	return b.slotCtx.Epoch
+}
+
+// LastBlockhash is the most recent blockhash the bank accepts: its parent's.
+func (b *WorkingBank) LastBlockhash() solana.Hash {
+	return b.slotCtx.LastBlockhash
 }
 
 // ForgeResult reports whether a transaction was committed into the working bank.

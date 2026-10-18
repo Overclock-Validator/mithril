@@ -189,6 +189,11 @@ func (b *BlockEngineSession) Healthy() bool {
 	return b.healthy
 }
 
+// Strategy is the scheduling strategy the session applies.
+func (b *BlockEngineSession) Strategy() blockenginepb.SchedulingStrategy {
+	return blockenginepb.SchedulingStrategy(b.strategy.Load())
+}
+
 // SetStrategy changes the scheduling strategy. The session reconnects so the
 // block engine applies it.
 func (b *BlockEngineSession) SetStrategy(strategy blockenginepb.SchedulingStrategy) {
