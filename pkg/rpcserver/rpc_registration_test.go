@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -29,12 +31,25 @@ func TestRPCHandlerMethodSet(t *testing.T) {
 }
 
 func TestInternalMethodsAreNotRPC(t *testing.T) {
+	for _, method := range []string{"enableEpochRewards", "setRootedBankState"} {
+		t.Run(method, func(t *testing.T) {
+			testInternalMethodNotRPC(t, method)
+		})
+	}
+}
+
+func testInternalMethodNotRPC(t *testing.T, method string) {
+	t.Helper()
 	for _, mode := range []string{"single", "mixed-batch", "oversized-single", "direct-dispatch"} {
 		t.Run(mode, func(t *testing.T) {
 			rpc := NewRpcServer(nil, 0, &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 32}, solana.Hash{1})
 			t.Cleanup(func() { _ = rpc.listener.Close() })
+			directory := filepath.Join(t.TempDir(), "history")
 			rpc.SetRootedBankState(100, 90, 80)
-			call := map[string]any{"jsonrpc": "2.0", "id": 1, "method": "setRootedBankState", "params": []any{777, 666, 555}}
+			call := map[string]any{"jsonrpc": "2.0", "id": 1, "method": method, "params": []any{777, 666, 555}}
+			if method == "enableEpochRewards" {
+				call["params"] = []any{directory, 100, 0}
+			}
 			if mode == "oversized-single" {
 				call["padding"] = strings.Repeat("x", maxQuietMethodProbeBody+1)
 			}
@@ -80,6 +95,9 @@ func TestInternalMethodsAreNotRPC(t *testing.T) {
 			}
 			if !found || (mode == "mixed-batch" && len(replies) != 2) {
 				t.Fatalf("missing response: %s", result)
+			}
+			if _, err := os.Stat(directory); !os.IsNotExist(err) {
+				t.Fatalf("internal request created history directory: %v", err)
 			}
 			root, _ := rpc.getRootedBankState()
 			if root.Slot != 100 {

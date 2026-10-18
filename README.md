@@ -224,6 +224,7 @@ curl http://YOUR_MITHRIL_IP:8899 -X POST -H "Content-Type: application/json" -d 
 - `getBlockHeight` - Get current block height
 - `getBlockProduction` - Get produced and assigned block counts by validator
 - `getEpochInfo` - Get current epoch info
+- `getInflationReward` - Get retained inflation rewards for an epoch
 - `getGenesisHash` - Get the cluster genesis hash
 - `getLatestBlockhash` - Get recent blockhash
 - `getLeaderSchedule` - Get the leader schedule for an epoch
@@ -231,6 +232,17 @@ curl http://YOUR_MITHRIL_IP:8899 -X POST -H "Content-Type: application/json" -d 
 - `getVoteAccounts` - Get current and delinquent vote accounts
 - `sendTransaction` - Submit a signed transaction
 - `simulateTransaction` - Simulate a transaction
+
+On Alpenglow, `getInflationReward` can publish verified canonical rewards before
+the account checkpoint reaches disk. `confirmed` and `finalized` share that view;
+`processed` is not supported. The default epoch and `minContextSlot` check use the
+same reward-read slot. Other RPC methods may still use an older durable view.
+Recovery withdraws the in-memory view, and a restart restores only
+durable history. Retention follows durable checkpoints. Advisory or disabled
+execution verification keeps reward reads on the durable view.
+Credited rewards are readable while other staking partitions are still pending.
+Requests for pending partitions return `-32017` with verified distribution
+progress; pruned history returns `-32001`, and unknown history returns `-32004`.
 
 `getSlot` accepts an optional config object with `commitment` and `minContextSlot`.
 On Alpenglow, `processed` uses the live replay slot; `confirmed` and `finalized`

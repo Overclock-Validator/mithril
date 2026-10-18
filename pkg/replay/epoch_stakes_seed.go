@@ -37,6 +37,41 @@ type manifestEpochStakeSeed struct {
 	data         []byte
 }
 
+// An older checkpoint may have retained stake weights but discarded commission
+// rates. Recover those fields from the exact same epoch-stakes generation in
+// the snapshot, without replacing the checkpoint's stake or validator metadata.
+func restorePersistedCommissionMetadata(mithrilState *state.MithrilState, persisted map[uint64][]byte, currentEpoch, snapshotEpoch uint64) (map[uint64][]byte, error) {
+	if mithrilState == nil || len(mithrilState.ManifestEpochStakes) == 0 {
+		return persisted, nil
+	}
+	needsRestore := false
+	for _, data := range persisted {
+		if !epochstakes.HasInflationCommissionMetadata(data) {
+			needsRestore = true
+			break
+		}
+	}
+	if !needsRestore {
+		return persisted, nil
+	}
+	seeds, _, err := prepareManifestEpochStakesForRuntime(mithrilState, currentEpoch, snapshotEpoch)
+	if err != nil {
+		return nil, err
+	}
+	restored := maps.Clone(persisted)
+	for _, seed := range seeds {
+		data, exists := restored[seed.runtimeEpoch]
+		if !exists || epochstakes.HasInflationCommissionMetadata(data) {
+			continue
+		}
+		restored[seed.runtimeEpoch], err = epochstakes.RestoreInflationCommissionMetadata(data, seed.data)
+		if err != nil {
+			return nil, fmt.Errorf("restore historical commissions for epoch %d: %w", seed.runtimeEpoch, err)
+		}
+	}
+	return restored, nil
+}
+
 func prepareManifestEpochStakesForRuntime(mithrilState *state.MithrilState, currentEpoch uint64, snapshotEpoch uint64) ([]manifestEpochStakeSeed, bool, error) {
 	if mithrilState == nil || len(mithrilState.ManifestEpochStakes) == 0 {
 		return nil, false, fmt.Errorf("state file missing manifest_epoch_stakes - delete AccountsDB and rebuild from snapshot")

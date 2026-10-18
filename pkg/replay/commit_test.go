@@ -102,7 +102,7 @@ func TestApplySuccessfulTransactionCommitsV1TransferWithInlineBudget(t *testing.
 	assert.Equal(t, destBefore.Lamports+8, destAfter.Lamports)
 }
 
-func TestApplyFeesOnlyTransactionCommitsProcessableLoadFailures(t *testing.T) {
+func TestApplyFailedTransactionCommitsProcessableLoadFailures(t *testing.T) {
 	for _, errType := range []TransactionErrorType{
 		TransactionErrorMaxLoadedAccountsDataSizeExceeded,
 		TransactionErrorInvalidProgramForExecution,
@@ -127,7 +127,7 @@ func TestApplyFeesOnlyTransactionCommitsProcessableLoadFailures(t *testing.T) {
 				},
 			}
 
-			feeInfo, err := ApplyFeesOnlyTransaction(slotCtx, tx, output)
+			feeInfo, err := ApplyFailedTransaction(slotCtx, tx, output)
 			require.NoError(t, err)
 			require.NotNil(t, feeInfo)
 			assert.Equal(t, uint64(5_000), feeInfo.TotalFee)
@@ -138,7 +138,7 @@ func TestApplyFeesOnlyTransactionCommitsProcessableLoadFailures(t *testing.T) {
 	}
 }
 
-func TestApplyFeesOnlyTransactionRejectsUnprocessableError(t *testing.T) {
+func TestApplyFailedTransactionRejectsUnprocessableError(t *testing.T) {
 	slotCtx, cleanup := newCommitTestSlotCtx()
 	defer cleanup()
 	tx, err := solana.TransactionFromBytes(txfixture.MustSignedTransferWire(0))
@@ -153,15 +153,15 @@ func TestApplyFeesOnlyTransactionRejectsUnprocessableError(t *testing.T) {
 		ComputeBudgetLimits: &sealevel.ComputeBudgetLimits{},
 		FeeInfo:             &fees.TxFeeInfo{ExecutionFee: 5_000, TotalFee: 5_000},
 	}
-	feeInfo, err := ApplyFeesOnlyTransaction(slotCtx, tx, output)
+	feeInfo, err := ApplyFailedTransaction(slotCtx, tx, output)
 	assert.Nil(t, feeInfo)
-	assert.ErrorContains(t, err, "not a processable fees-only load failure")
+	assert.ErrorContains(t, err, "not an includable failure")
 	payerAfter, err := slotCtx.GetAccount(txfixture.PayerPubkey())
 	require.NoError(t, err)
 	assert.Equal(t, payerBefore.Lamports, payerAfter.Lamports)
 }
 
-func TestApplyFeesOnlyTransactionRejectsIncompleteProcessingState(t *testing.T) {
+func TestApplyFailedTransactionRejectsIncompleteProcessingState(t *testing.T) {
 	slotCtx, cleanup := newCommitTestSlotCtx()
 	defer cleanup()
 	tx, err := solana.TransactionFromBytes(txfixture.MustSignedTransferWire(0))
@@ -177,7 +177,7 @@ func TestApplyFeesOnlyTransactionRejectsIncompleteProcessingState(t *testing.T) 
 		// FeeInfo intentionally omitted: this output did not complete the
 		// validated fee-payer phase and is unsafe to publish.
 	}
-	feeInfo, err := ApplyFeesOnlyTransaction(slotCtx, tx, output)
+	feeInfo, err := ApplyFailedTransaction(slotCtx, tx, output)
 	assert.Nil(t, feeInfo)
 	assert.ErrorContains(t, err, "missing required processing state")
 	payerAfter, err := slotCtx.GetAccount(txfixture.PayerPubkey())

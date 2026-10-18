@@ -1,12 +1,14 @@
 package replay
 
 import (
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/fees"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
+	"github.com/Overclock-Validator/mithril/pkg/rent"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/gagliardetto/solana-go"
 )
@@ -67,26 +69,51 @@ func ApplySuccessfulTransaction(slotCtx *sealevel.SlotCtx, output LoadAndExecute
 	return applySuccessfulTransactionState(slotCtx, output.ExecCtx, output.ExecutionResult)
 }
 
-// ApplyFeesOnlyTransaction commits the fee-payer and durable-nonce rollback
-// state for an account-load failure that Agave treats as processable. The
-// transaction itself remains failed, but must be recorded in the block.
-func ApplyFeesOnlyTransaction(slotCtx *sealevel.SlotCtx, tx *solana.Transaction, output LoadAndExecuteTransactionOutput) (*fees.TxFeeInfo, error) {
+// includableFailure reports whether a failed transaction was processed, so a
+// leader may record it in the block as failed with only its fee charged: it
+// failed loading accounts after its fee payer was validated (fees-only), or
+// during execution, including the post-execution rent-state check. The same
+// error types raised before execution are not includable, nor are no-ops.
+func includableFailure(output LoadAndExecuteTransactionOutput) bool {
 	txErr := output.ProcessingResult.TransactionError
-	if txErr == nil {
-		return nil, fmt.Errorf("fees-only transaction has no transaction error")
+	if txErr == nil || output.ProcessedAsNoOp {
+		return false
 	}
 	switch txErr.ErrorType {
 	case TransactionErrorMaxLoadedAccountsDataSizeExceeded,
 		TransactionErrorInvalidProgramForExecution,
 		TransactionErrorProgramAccountNotFound:
-	default:
-		return nil, fmt.Errorf("transaction error %s is not a processable fees-only load failure", txErr.ErrorType.String())
+		return true
+	case TransactionErrorInstructionError:
+		// Compute-budget instructions are parsed before execution, which is
+		// the only stage that creates an execution context.
+		return output.ExecCtx != nil
+	case TransactionErrorInsufficientFundsForRent:
+		// The fee-payer rent check before execution reports a plain error; only
+		// the post-execution check reports a rent-state transition.
+		var transition *rent.RentStateTransitionError
+		return errors.As(txErr.InstructionError, &transition)
+	}
+	return false
+}
+
+// ApplyFailedTransaction commits the fee-payer and durable-nonce rollback
+// state of a failed transaction that includableFailure accepts. The
+// transaction itself remains failed, but must be recorded in the block. Any
+// other failure commits nothing.
+func ApplyFailedTransaction(slotCtx *sealevel.SlotCtx, tx *solana.Transaction, output LoadAndExecuteTransactionOutput) (*fees.TxFeeInfo, error) {
+	txErr := output.ProcessingResult.TransactionError
+	if txErr == nil {
+		return nil, fmt.Errorf("failed transaction has no transaction error")
+	}
+	if !includableFailure(output) {
+		return nil, fmt.Errorf("transaction error %s is not an includable failure", txErr.ErrorType.String())
 	}
 	if slotCtx == nil || tx == nil || output.ComputeBudgetLimits == nil || output.FeeInfo == nil {
-		return nil, fmt.Errorf("fees-only transaction is missing required processing state")
+		return nil, fmt.Errorf("failed transaction is missing required processing state")
 	}
 
-	// The load error is the transaction's recorded status, not a failure to
+	// The failure is the transaction's recorded status, not a failure to
 	// publish its fee/nonce effects, so do not return it as an apply error.
 	return handleFailedTx(slotCtx, tx, output.Instrs, output.ComputeBudgetLimits, nil, nil)
 }

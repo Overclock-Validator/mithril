@@ -70,6 +70,9 @@ type AccountsDb struct {
 	// in an in-RAM working set (pkg/accounts) and fold to disk via CommitBatch
 	// once finalized+verified. The Alpenglow node forces this on at startup.
 	RootedDurable bool
+	// MinFreeBytes leaves operational headroom before admitting a fold. Set
+	// before replay starts; zero disables the admission check for offline tools.
+	MinFreeBytes uint64
 
 	// IndexWALDisabled runs the Pebble index without a WAL; the fold manifests
 	// are the index redo log (recovery replays the contiguous manifest run
@@ -78,11 +81,19 @@ type AccountsDb struct {
 
 	// Batch-fold state (segment.go/fold.go/recovery.go). foldMu serializes
 	// CommitBatch, recovery, rewind, and compaction.
-	foldMu         sync.Mutex
-	lastBatchSeq   uint64        // guarded by foldMu; seeded by RecoverFoldState
-	durableThrough atomic.Uint64 // observability: highest durably folded slot
-	foldHooks      foldTestHooks // test-only crash injection
-	compactCursor  string        // guarded by foldMu; scan resume point across CompactOnce cycles
+	foldMu           sync.Mutex
+	lastBatchSeq     uint64        // guarded by foldMu; seeded by RecoverFoldState
+	durableThrough   atomic.Uint64 // observability: highest durably folded slot
+	foldHooks        foldTestHooks // test-only crash injection
+	compactCursor    string        // guarded by foldMu; scan resume point across CompactOnce cycles
+	sparseCursor     string        // independent cursor so bootstrap scanning cannot starve large segments
+	resparseNext     bool          // alternate new and previously sparse segments, even with one-file cycles
+	compactScanSeq   uint64
+	compactScanned   map[uint64]struct{} // successful sparse scans at compactScanSeq; reset when the head changes
+	compactScanClock uint64
+	compactLastScan  map[uint64]uint64 // oldest scan first; a growing directory must not postpone cursor wrap forever
+	compactCycles    uint64            // periodically serve bootstrap and mostly-empty sparse files too
+	compactHooks     compactionTestHooks
 
 	// A list of store requests. They are added to the back as they arrive and
 	// removed from the front as they are persisted.

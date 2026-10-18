@@ -75,7 +75,7 @@ type SegmentManifest struct {
 	ThroughSlot uint64 // inclusive; equals the data file's name slot
 	FileId      uint64
 	DataLen     uint64 // exact data file length
-	DataCRC     uint32 // crc32 (IEEE) of the data file bytes
+	DataCRC     uint32 // crc32 (IEEE) of data; 0 for compact-kind in-place sparse segments
 	Bankhashes  []SlotBankhash
 	Records     []ManifestRecord
 	ResumeCtx   []byte // opaque serialized state.ResumeContext at ThroughSlot

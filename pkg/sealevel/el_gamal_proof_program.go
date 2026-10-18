@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"strings"
-	"unsafe"
 
 	a "github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/cu"
@@ -44,7 +43,7 @@ var ErrInvalidProof = errors.New("invalid proof")
 var ctxObjLens []uint64 = []uint64{
 	0,
 	96,
-	128,
+	192,
 	128,
 	32,
 	104,
@@ -699,7 +698,7 @@ func ElGamalProofProgramExecute(execCtx *ExecutionCtx) error {
 }
 
 func processElGamalProofInstr(instructionData []byte, execCtx *ExecutionCtx) error {
-	if len(instructionData) < 1 {
+	if len(instructionData) < 1 || ElGamalProofInstruction(instructionData[0]) > VerifyBatchedGroupedCiphertext3HandlesValidity {
 		return InstrErrInvalidInstructionData
 	}
 
@@ -721,39 +720,43 @@ func processCloseProofContext(execCtx *ExecutionCtx) error {
 		return err
 	}
 
-	ownerAcct, err := instrCtx.BorrowInstructionAccount(txCtx, 2)
+	isSigner, err := instrCtx.IsInstructionAccountSigner(2)
 	if err != nil {
 		return err
 	}
-
-	if !ownerAcct.IsSigner() {
+	if !isSigner {
 		return InstrErrMissingRequiredSignature
 	}
-
-	ownerPubkey := ownerAcct.Key()
-	ownerAcct.Drop()
-
-	proofContextAcct, err := instrCtx.BorrowInstructionAccount(txCtx, 0)
+	ownerPubkey, err := instrCtx.KeyOfInstructionAccount(txCtx, 2)
 	if err != nil {
 		return err
 	}
-	proofContextAcctPubkey := proofContextAcct.Key()
-	proofContextAcct.Drop()
-
-	destinationAcct, err := instrCtx.BorrowInstructionAccount(txCtx, 1)
+	proofContextAcctPubkey, err := instrCtx.KeyOfInstructionAccount(txCtx, 0)
 	if err != nil {
 		return err
 	}
-	destinationAcctPubkey := destinationAcct.Key()
-	destinationAcct.Drop()
+	destinationAcctPubkey, err := instrCtx.KeyOfInstructionAccount(txCtx, 1)
+	if err != nil {
+		return err
+	}
 
 	if proofContextAcctPubkey == destinationAcctPubkey {
 		return InstrErrInvalidInstructionData
 	}
 
-	proofContextAcct, err = instrCtx.BorrowInstructionAccount(txCtx, 0)
+	proofContextAcct, err := instrCtx.BorrowInstructionAccount(txCtx, 0)
 	if err != nil {
 		return err
+	}
+	defer proofContextAcct.Drop()
+	if proofContextAcct.Owner() != a.ZkElgamalProofProgramAddr {
+		return InstrErrInvalidAccountOwner
+	}
+	if len(proofContextAcct.Data()) < ctxHdrLen {
+		return InstrErrInvalidAccountData
+	}
+	if proofContextAcct.Data()[32] == 0 {
+		return InstrErrUninitializedAccount
 	}
 
 	expectedOwnerPubkey := solana.PublicKeyFromBytes(proofContextAcct.Data()[:32])
@@ -761,10 +764,11 @@ func processCloseProofContext(execCtx *ExecutionCtx) error {
 		return InstrErrInvalidAccountOwner
 	}
 
-	destinationAcct, err = instrCtx.BorrowInstructionAccount(txCtx, 1)
+	destinationAcct, err := instrCtx.BorrowInstructionAccount(txCtx, 1)
 	if err != nil {
 		return err
 	}
+	defer destinationAcct.Drop()
 
 	err = destinationAcct.CheckedAddLamports(proofContextAcct.Lamports(), execCtx.Features)
 	if err != nil {
@@ -781,16 +785,11 @@ func processCloseProofContext(execCtx *ExecutionCtx) error {
 		return err
 	}
 
-	err = proofContextAcct.SetOwner(execCtx.Features, a.SystemProgramAddr)
-
-	proofContextAcct.Drop()
-	destinationAcct.Drop()
-
-	return err
+	return proofContextAcct.SetOwner(execCtx.Features, a.SystemProgramAddr)
 }
 
 func processVerifyProofInstr(instructionData []byte, execCtx *ExecutionCtx) error {
-	if len(instructionData) < 1 {
+	if len(instructionData) < 1 || instructionData[0] == 0 || ElGamalProofInstruction(instructionData[0]) > VerifyBatchedGroupedCiphertext3HandlesValidity {
 		return InstrErrInvalidInstructionData
 	}
 
@@ -814,11 +813,13 @@ func processVerifyProofInstr(instructionData []byte, execCtx *ExecutionCtx) erro
 	// check if proof data comes from a) account, or b) from instruction data
 	if len(instructionData) == instrDataLenWithProofAcct {
 		// case 1: proof data from account
+		if instrCtx == nil {
+			return InstrErrMissingAccount
+		}
 		proofDataAcct, err := instrCtx.BorrowInstructionAccount(txCtx, 0)
 		if err != nil {
 			return err
 		}
-		defer proofDataAcct.Drop()
 
 		proofDataOffset := binary.LittleEndian.Uint32(instructionData[1:5])
 		acctData := proofDataAcct.Data()
@@ -827,11 +828,16 @@ func processVerifyProofInstr(instructionData []byte, execCtx *ExecutionCtx) erro
 		totalLen := ctxLen + proofLen
 
 		if uint64(proofDataOffset)+totalLen > uint64(len(acctData)) {
+			proofDataAcct.Drop()
 			return InstrErrInvalidAccountData
 		}
 
 		context = acctData[proofDataOffset : proofDataOffset+uint32(ctxLen)]
 		proof = acctData[proofDataOffset+uint32(ctxLen) : proofDataOffset+uint32(totalLen)]
+		// Agave releases the proof-data borrow before borrowing context accounts.
+		// Copy the context so an aliased output cannot overwrite the input.
+		context = bytes.Clone(context)
+		proofDataAcct.Drop()
 		numAccessedAccounts = 1
 
 	} else {
@@ -848,25 +854,32 @@ func processVerifyProofInstr(instructionData []byte, execCtx *ExecutionCtx) erro
 
 	err = verifyProof(instructionType, context, proof)
 	if err != nil {
-		return err
+		return InstrErrInvalidInstructionData
 	}
 
-	if instrCtx != nil && instrCtx.NumberOfInstructionAccounts() > uint64(numAccessedAccounts) {
+	// A lone extra account is ignored. Context creation requires both the
+	// writable state account and its authority, as in Agave process_verify_proof.
+	if instrCtx != nil && instrCtx.NumberOfInstructionAccounts() >= numAccessedAccounts+2 {
 		contextStateAuthorityAcct, err := instrCtx.BorrowInstructionAccount(txCtx, numAccessedAccounts+1)
 		if err != nil {
 			return err
 		}
 		contextStateAuthorityPubkey := contextStateAuthorityAcct.Key()
+		contextStateAuthorityAcct.Drop()
 
 		proofContextAcct, err := instrCtx.BorrowInstructionAccount(txCtx, numAccessedAccounts)
 		if err != nil {
 			return err
 		}
+		defer proofContextAcct.Drop()
 
 		if proofContextAcct.Owner() != a.ZkElgamalProofProgramAddr {
 			return InstrErrInvalidAccountOwner
 		}
-		if len(proofContextAcct.Data()) >= ctxHdrLen && proofContextAcct.Data()[32] != 0 {
+		if len(proofContextAcct.Data()) < ctxHdrLen {
+			return InstrErrInvalidAccountData
+		}
+		if proofContextAcct.Data()[32] != 0 {
 			return InstrErrAccountAlreadyInitialized
 		}
 
@@ -890,6 +903,10 @@ func processVerifyProofInstr(instructionData []byte, execCtx *ExecutionCtx) erro
 }
 
 func verifyProof(instructionType ElGamalProofInstruction, context, proof []byte) error {
+	if instructionType == CloseContextState || instructionType > VerifyBatchedGroupedCiphertext3HandlesValidity ||
+		uint64(len(context)) != ctxObjLens[instructionType] || uint64(len(proof)) != proofLens[instructionType] {
+		return ErrInvalidProof
+	}
 	switch instructionType {
 	case VerifyPubkeyValidity:
 		return verifyPubkeyValidity(context, proof)
@@ -916,11 +933,22 @@ func verifyProof(instructionType ElGamalProofInstruction, context, proof []byte)
 	case VerifyPercentageWithCap:
 		return verifyPercentageWithCap(context, proof)
 	default:
-		panic("shouldn't be possible - programming error")
+		return ErrInvalidProof
 	}
 }
 
+// Agave's solana-zk-sdk 8.0.1 uses a global domain followed by the instruction
+// domain. The pre-reenable transcript format is not accepted by that verifier.
+func newElGamalTranscript(instruction string) *merlin.Transcript {
+	transcript := merlin.NewTranscript("solana-zk-elgamal-proof-program-v1")
+	transcript.AppendMessage([]byte("dom-sep"), []byte(instruction))
+	return transcript
+}
+
 func verifyPubkeyValidity(context, proof []byte) error {
+	if !isValidPoint(context[:32]) {
+		return ErrInvalidProof
+	}
 	pubkey := context[:32]
 	proofY := proof[:32]
 	proofZ := proof[32:64]
@@ -943,7 +971,7 @@ func verifyPubkeyValidity(context, proof []byte) error {
 		return ErrInvalidProof
 	}
 
-	transcript := merlin.NewTranscript("pubkey-validity-instruction")
+	transcript := newElGamalTranscript("pubkey-validity-instruction")
 	transcript.AppendMessage([]byte("pubkey"), pubkey)
 	transcript.AppendMessage([]byte("dom-sep"), []byte("pubkey-proof"))
 
@@ -976,6 +1004,9 @@ func verifyPubkeyValidity(context, proof []byte) error {
 }
 
 func verifyZeroCiphertext(context, proof []byte) error {
+	if !isValidPoint(context[:32]) || !isValidPoint(context[32:64]) || !isValidPoint(context[64:96]) {
+		return ErrInvalidProof
+	}
 	pubkey := context[:32]
 	ciphertext := context[32:96]
 
@@ -983,7 +1014,7 @@ func verifyZeroCiphertext(context, proof []byte) error {
 	proofYd := proof[32:64]
 	proofZ := proof[64:96]
 
-	transcript := merlin.NewTranscript("zero-ciphertext-instruction")
+	transcript := newElGamalTranscript("zero-ciphertext-instruction")
 	transcript.AppendMessage([]byte("pubkey"), pubkey)
 	transcript.AppendMessage([]byte("ciphertext"), ciphertext)
 
@@ -1025,7 +1056,7 @@ func verifyZeroCiphertext(context, proof []byte) error {
 
 	transcript.AppendMessage([]byte("dom-sep"), []byte("zero-ciphertext-proof"))
 
-	if !isValidPoint(proofYp) || !isValidPoint(proofYd) {
+	if !isValidPoint(proofYp) {
 		return ErrInvalidProof
 	}
 
@@ -1072,6 +1103,9 @@ func verifyZeroCiphertext(context, proof []byte) error {
 }
 
 func verifyCiphertextCommitmentEquality(context, proof []byte) error {
+	if !isValidPoint(context[:32]) || !isValidPoint(context[32:64]) || !isValidPoint(context[64:96]) || !isValidPoint(context[96:128]) {
+		return ErrInvalidProof
+	}
 	pubkey := context[:32]
 	ciphertext := context[32:96]
 	commitment := context[96:128]
@@ -1083,7 +1117,7 @@ func verifyCiphertextCommitmentEquality(context, proof []byte) error {
 	proofZx := proof[128:160]
 	proofZr := proof[160:192]
 
-	transcript := merlin.NewTranscript("ciphertext-commitment-equality-instruction")
+	transcript := newElGamalTranscript("ciphertext-commitment-equality-instruction")
 	transcript.AppendMessage([]byte("pubkey"), pubkey)
 	transcript.AppendMessage([]byte("ciphertext"), ciphertext)
 	transcript.AppendMessage([]byte("commitment"), commitment)
@@ -1213,6 +1247,9 @@ func verifyCiphertextCommitmentEquality(context, proof []byte) error {
 }
 
 func verifyCiphertextCiphertextEquality(context, proof []byte) error {
+	if !isValidPoint(context[:32]) || !isValidPoint(context[32:64]) || !isValidPoint(context[64:96]) || !isValidPoint(context[96:128]) {
+		return ErrInvalidProof
+	}
 	pubkey1 := context[:32]
 	pubkey2 := context[32:64]
 	ciphertext1 := context[64:128]
@@ -1226,7 +1263,7 @@ func verifyCiphertextCiphertextEquality(context, proof []byte) error {
 	proofZx := proof[160:192]
 	proofZr := proof[192:224]
 
-	transcript := merlin.NewTranscript("ciphertext-ciphertext-equality-instruction")
+	transcript := newElGamalTranscript("ciphertext-ciphertext-equality-instruction")
 	transcript.AppendMessage([]byte("first-pubkey"), pubkey1)
 	transcript.AppendMessage([]byte("second-pubkey"), pubkey2)
 	transcript.AppendMessage([]byte("first-ciphertext"), ciphertext1)
@@ -1391,774 +1428,136 @@ func verifyCiphertextCiphertextEquality(context, proof []byte) error {
 }
 
 func verifyGroupedCiphertext2HandlesValidity(context, proof []byte) error {
-	pubkey1 := context[:32]
-	pubkey2 := context[32:64]
-	commitment := context[64:96]
-	handle1 := context[96:128]
-	handle2 := context[128:160]
-
-	proofY0 := proof[:32]
-	proofY1 := proof[32:64]
-	proofY2 := proof[64:96]
-	proofZr := proof[96:128]
-	proofZx := proof[128:160]
-
-	transcript := merlin.NewTranscript("grouped-ciphertext-validity-2-handles-instruction")
-	transcript.AppendMessage([]byte("first-pubkey"), pubkey1)
-	transcript.AppendMessage([]byte("second-pubkey"), pubkey2)
-
-	var groupedCiphertext []byte
-	groupedCiphertext = append(groupedCiphertext, commitment...)
-	groupedCiphertext = append(groupedCiphertext, handle1...)
-	groupedCiphertext = append(groupedCiphertext, handle2...)
-	transcript.AppendMessage([]byte("grouped-ciphertext"), groupedCiphertext)
-
-	var points [16]*ristretto255.Element
-	pubkey2NotZero := true
-	var ristrettoCompressedZero [32]byte
-	if bytes.Equal(pubkey2, ristrettoCompressedZero[:]) {
-		pubkey2NotZero = false
-
-		if !bytes.Equal(handle2, ristrettoCompressedZero[:]) ||
-			!bytes.Equal(proofY2, ristrettoCompressedZero[:]) {
-			return ErrInvalidProof
-		}
-	}
-
-	if !isValidScalar(proofZr) || !isValidScalar(proofZx) {
-		return ErrInvalidProof
-	}
-
-	var scalarZr ristretto255.Scalar
-	err := scalarZr.Decode(proofZr)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	var scalarZx ristretto255.Scalar
-	err = scalarZx.Decode(proofZx)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	points[0] = &basepointG
-	points[1] = &basepointH
-
-	var y0 ristretto255.Element
-	err = y0.Decode(proofY0)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	points[2] = new(ristretto255.Element)
-	err = points[2].Decode(proofY1)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	points[3] = new(ristretto255.Element)
-	err = points[3].Decode(proofY2)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	points[4] = new(ristretto255.Element)
-	err = points[4].Decode(pubkey1)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	points[5] = new(ristretto255.Element)
-	err = points[5].Decode(commitment)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	points[6] = new(ristretto255.Element)
-	err = points[6].Decode(handle1)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	idx := uint64(7)
-
-	if pubkey2NotZero {
-		points[idx] = new(ristretto255.Element)
-		err = points[idx].Decode(pubkey2)
-		if err != nil {
-			return ErrInvalidProof
-		}
-		idx++
-
-		points[idx] = new(ristretto255.Element)
-		err = points[idx].Decode(handle2)
-		if err != nil {
-			return ErrInvalidProof
-		}
-		idx++
-	}
-
-	transcript.AppendMessage([]byte("dom-sep"), []byte("validity-proof"))
-	var numHandlesBytes [8]byte
-	binary.LittleEndian.PutUint64(numHandlesBytes[:], 2)
-	transcript.AppendMessage([]byte("handles"), numHandlesBytes[:])
-
-	if !isValidPoint(proofY0) || !isValidPoint(proofY1) {
-		return ErrInvalidProof
-	}
-	transcript.AppendMessage([]byte("Y_0"), proofY0)
-	transcript.AppendMessage([]byte("Y_1"), proofY1)
-	transcript.AppendMessage([]byte("Y_2"), proofY2)
-
-	c := transcript.ExtractBytes([]byte("c"), 64)
-	var scalarC ristretto255.Scalar
-	scalarC.FromUniformBytes(c)
-
-	transcript.AppendMessage([]byte("z_x"), proofZx)
-	transcript.AppendMessage([]byte("z_r"), proofZr)
-
-	w := transcript.ExtractBytes([]byte("w"), 64)
-	var scalarW ristretto255.Scalar
-	scalarW.FromUniformBytes(w)
-
-	var scalars [16]*ristretto255.Scalar
-	scalars[0] = new(ristretto255.Scalar)
-	err = scalars[0].Decode(proofZx)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	scalars[1] = new(ristretto255.Scalar)
-	err = scalars[1].Decode(proofZr)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	scalars[2] = new(ristretto255.Scalar)
-	scalars[2].Negate(&scalarW)
-
-	scalars[3] = new(ristretto255.Scalar)
-	scalars[3].Multiply(scalars[2], &scalarW)
-
-	scalars[4] = new(ristretto255.Scalar)
-	scalars[4].Multiply(&scalarZr, &scalarW)
-
-	scalars[5] = new(ristretto255.Scalar)
-	scalars[5].Negate(&scalarC)
-
-	scalars[6] = new(ristretto255.Scalar)
-	scalars[6].Multiply(scalars[5], &scalarW)
-
-	idx = 7
-
-	if pubkey2NotZero {
-		scalars[idx] = new(ristretto255.Scalar)
-		scalars[idx].Multiply(scalars[4], &scalarW)
-		idx++
-
-		scalars[idx] = new(ristretto255.Scalar)
-		scalars[idx].Multiply(scalars[6], &scalarW)
-		idx++
-	}
-
-	var result ristretto255.Element
-	result.VarTimeMultiScalarMult(scalars[:idx], points[:idx])
-
-	if result.Equal(&y0) == 1 {
-		return nil
-	} else {
-		return ErrInvalidProof
-	}
+	return verifyGroupedCiphertextValidity(context, proof, 2, false, "grouped-ciphertext-validity-2-handles-instruction")
 }
 
 func verifyGroupedCiphertext3HandlesValidity(context, proof []byte) error {
-	pubkey1 := context[:32]
-	pubkey2 := context[32:64]
-	pubkey3 := context[64:96]
-	commitment := context[96:128]
-	handle1 := context[128:160]
-	handle2 := context[160:192]
-	handle3 := context[192:224]
-
-	proofY0 := proof[:32]
-	proofY1 := proof[32:64]
-	proofY2 := proof[64:96]
-	proofY3 := proof[96:128]
-	proofZr := proof[128:160]
-	proofZx := proof[160:192]
-
-	transcript := merlin.NewTranscript("grouped-ciphertext-validity-3-handles-instruction")
-	transcript.AppendMessage([]byte("first-pubkey"), pubkey1)
-	transcript.AppendMessage([]byte("second-pubkey"), pubkey2)
-	transcript.AppendMessage([]byte("third-pubkey"), pubkey3)
-
-	var groupedCiphertext []byte
-	groupedCiphertext = append(groupedCiphertext, commitment...)
-	groupedCiphertext = append(groupedCiphertext, handle1...)
-	groupedCiphertext = append(groupedCiphertext, handle2...)
-	groupedCiphertext = append(groupedCiphertext, handle3...)
-	transcript.AppendMessage([]byte("grouped-ciphertext"), groupedCiphertext)
-
-	var scalars [12]*ristretto255.Scalar
-	var points [12]*ristretto255.Element
-
-	for count := 0; count < 12; count++ {
-		scalars[count] = new(ristretto255.Scalar)
-		points[count] = new(ristretto255.Element)
-	}
-
-	if !isValidScalar(proofZr) || !isValidScalar(proofZx) {
-		return ErrInvalidProof
-	}
-
-	var scalarZr ristretto255.Scalar
-	err := scalarZr.Decode(proofZr)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	var scalarZx ristretto255.Scalar
-	err = scalarZx.Decode(proofZx)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	points[0] = &basepointG
-	points[1] = &basepointH
-
-	var y0 ristretto255.Element
-	err = y0.Decode(proofY0)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	err = points[2].Decode(commitment)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	err = points[3].Decode(pubkey1)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	err = points[4].Decode(proofY1)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	err = points[5].Decode(handle1)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	err = points[6].Decode(pubkey2)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	err = points[7].Decode(proofY2)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	err = points[8].Decode(handle2)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	err = points[9].Decode(pubkey3)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	err = points[10].Decode(proofY3)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	err = points[11].Decode(handle3)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	transcript.AppendMessage([]byte("dom-sep"), []byte("validity-proof"))
-	var numHandlesBytes [8]byte
-	binary.LittleEndian.PutUint64(numHandlesBytes[:], 3)
-	transcript.AppendMessage([]byte("handles"), numHandlesBytes[:])
-
-	if !isValidPoint(proofY0) || !isValidPoint(proofY1) || !isValidPoint(proofY2) {
-		return ErrInvalidProof
-	}
-
-	transcript.AppendMessage([]byte("Y_0"), proofY0)
-	transcript.AppendMessage([]byte("Y_1"), proofY1)
-	transcript.AppendMessage([]byte("Y_2"), proofY2)
-	transcript.AppendMessage([]byte("Y_3"), proofY3)
-
-	c := transcript.ExtractBytes([]byte("c"), 64)
-	var scalarC ristretto255.Scalar
-	scalarC.FromUniformBytes(c)
-
-	transcript.AppendMessage([]byte("z_x"), proofZx)
-	transcript.AppendMessage([]byte("z_r"), proofZr)
-
-	w := transcript.ExtractBytes([]byte("w"), 64)
-	var scalarW ristretto255.Scalar
-	scalarW.FromUniformBytes(w)
-
-	scalars[0] = &scalarZx
-	scalars[1] = &scalarZr
-	scalars[2].Negate(&scalarC)
-	scalars[3].Multiply(&scalarZr, &scalarW)
-	scalars[4].Negate(&scalarW)
-	scalars[5].Multiply(scalars[2], &scalarW)
-	scalars[6].Multiply(scalars[3], &scalarW)
-	scalars[7].Multiply(scalars[4], &scalarW)
-	scalars[8].Multiply(scalars[5], &scalarW)
-	scalars[9].Multiply(scalars[6], &scalarW)
-	scalars[10].Multiply(scalars[7], &scalarW)
-	scalars[11].Multiply(scalars[8], &scalarW)
-
-	var result ristretto255.Element
-	result.VarTimeMultiScalarMult(scalars[:], points[:])
-
-	if result.Equal(&y0) == 1 {
-		return nil
-	} else {
-		return ErrInvalidProof
-	}
+	return verifyGroupedCiphertextValidity(context, proof, 3, false, "grouped-ciphertext-validity-3-handles-instruction")
 }
 
 func verifyBatchedGroupedCiphertext2HandlesValidity(context, proof []byte) error {
-	pubkey1 := context[:32]
-	pubkey2 := context[32:64]
-
-	groupedCiphertextLo := context[64:160]
-	commitment := groupedCiphertextLo[:32]
-	handle1 := groupedCiphertextLo[32:64]
-	handle2 := groupedCiphertextLo[64:96]
-
-	groupedCiphertextHi := context[160:256]
-	commitmentHi := groupedCiphertextHi[:32]
-	handle1Hi := groupedCiphertextHi[32:64]
-	handle2Hi := groupedCiphertextHi[64:96]
-
-	proofY0 := proof[:32]
-	proofY1 := proof[32:64]
-	proofY2 := proof[64:96]
-	proofZr := proof[96:128]
-	proofZx := proof[128:160]
-
-	transcript := merlin.NewTranscript("batched-grouped-ciphertext-validity-2-handles-instruction")
-	transcript.AppendMessage([]byte("first-pubkey"), pubkey1)
-	transcript.AppendMessage([]byte("second-pubkey"), pubkey2)
-	transcript.AppendMessage([]byte("grouped-ciphertext-lo"), groupedCiphertextLo)
-	transcript.AppendMessage([]byte("grouped-ciphertext-hi"), groupedCiphertextHi)
-
-	var points [16]*ristretto255.Element
-	pubkey2NotZero := true
-	var ristrettoCompressedZero [32]byte
-	if bytes.Equal(pubkey2, ristrettoCompressedZero[:]) {
-		pubkey2NotZero = false
-
-		if !bytes.Equal(handle2, ristrettoCompressedZero[:]) ||
-			!bytes.Equal(proofY2, ristrettoCompressedZero[:]) ||
-			!bytes.Equal(handle2Hi, ristrettoCompressedZero[:]) {
-			return ErrInvalidProof
-		}
-	}
-
-	if !isValidScalar(proofZr) || !isValidScalar(proofZx) {
-		return ErrInvalidProof
-	}
-
-	var scalarZr ristretto255.Scalar
-	err := scalarZr.Decode(proofZr)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	var scalarZx ristretto255.Scalar
-	err = scalarZx.Decode(proofZx)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	points[0] = &basepointG
-	points[1] = &basepointH
-
-	var y0 ristretto255.Element
-	err = y0.Decode(proofY0)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	points[2] = new(ristretto255.Element)
-	err = points[2].Decode(proofY1)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	points[3] = new(ristretto255.Element)
-	err = points[3].Decode(proofY2)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	points[4] = new(ristretto255.Element)
-	err = points[4].Decode(pubkey1)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	points[5] = new(ristretto255.Element)
-	err = points[5].Decode(commitment)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	points[6] = new(ristretto255.Element)
-	err = points[6].Decode(handle1)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	idx := uint64(7)
-
-	points[idx] = new(ristretto255.Element)
-	err = points[idx].Decode(commitmentHi)
-	if err != nil {
-		return ErrInvalidProof
-	}
-	idx++
-
-	points[idx] = new(ristretto255.Element)
-	err = points[idx].Decode(handle1Hi)
-	if err != nil {
-		return ErrInvalidProof
-	}
-	idx++
-
-	if pubkey2NotZero {
-		points[idx] = new(ristretto255.Element)
-		err = points[idx].Decode(pubkey2)
-		if err != nil {
-			return ErrInvalidProof
-		}
-		idx++
-
-		points[idx] = new(ristretto255.Element)
-		err = points[idx].Decode(handle2)
-		if err != nil {
-			return ErrInvalidProof
-		}
-		idx++
-
-		points[idx] = new(ristretto255.Element)
-		err = points[idx].Decode(handle2Hi)
-		if err != nil {
-			return ErrInvalidProof
-		}
-		idx++
-	}
-
-	transcript.AppendMessage([]byte("dom-sep"), []byte("batched-validity-proof"))
-	var numHandlesBytes [8]byte
-	binary.LittleEndian.PutUint64(numHandlesBytes[:], 2)
-	transcript.AppendMessage([]byte("handles"), numHandlesBytes[:])
-
-	t := transcript.ExtractBytes([]byte("t"), 64)
-	var scalarT ristretto255.Scalar
-	scalarT.FromUniformBytes(t)
-
-	transcript.AppendMessage([]byte("dom-sep"), []byte("validity-proof"))
-	transcript.AppendMessage([]byte("handles"), numHandlesBytes[:])
-
-	if !isValidPoint(proofY0) || !isValidPoint(proofY1) {
-		return ErrInvalidProof
-	}
-	transcript.AppendMessage([]byte("Y_0"), proofY0)
-	transcript.AppendMessage([]byte("Y_1"), proofY1)
-	transcript.AppendMessage([]byte("Y_2"), proofY2)
-
-	c := transcript.ExtractBytes([]byte("c"), 64)
-	var scalarC ristretto255.Scalar
-	scalarC.FromUniformBytes(c)
-
-	transcript.AppendMessage([]byte("z_x"), proofZx)
-	transcript.AppendMessage([]byte("z_r"), proofZr)
-
-	w := transcript.ExtractBytes([]byte("w"), 64)
-	var scalarW ristretto255.Scalar
-	scalarW.FromUniformBytes(w)
-
-	var scalars [16]*ristretto255.Scalar
-	scalars[0] = new(ristretto255.Scalar)
-	err = scalars[0].Decode(proofZx)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	scalars[1] = new(ristretto255.Scalar)
-	err = scalars[1].Decode(proofZr)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	scalars[2] = new(ristretto255.Scalar)
-	scalars[2].Negate(&scalarW)
-
-	scalars[3] = new(ristretto255.Scalar)
-	scalars[3].Multiply(scalars[2], &scalarW)
-
-	scalars[4] = new(ristretto255.Scalar)
-	scalars[4].Multiply(&scalarZr, &scalarW)
-
-	scalars[5] = new(ristretto255.Scalar)
-	scalars[5].Negate(&scalarC)
-
-	scalars[6] = new(ristretto255.Scalar)
-	scalars[6].Multiply(scalars[5], &scalarW)
-
-	idx = 7
-
-	scalars[idx] = new(ristretto255.Scalar)
-	scalars[idx].Multiply(scalars[5], &scalarT)
-	idx++
-
-	scalars[idx] = new(ristretto255.Scalar)
-	scalars[idx].Multiply(scalars[6], &scalarT)
-	idx++
-
-	if pubkey2NotZero {
-		scalars[idx] = new(ristretto255.Scalar)
-		scalars[idx].Multiply(scalars[4], &scalarW)
-		idx++
-
-		scalars[idx] = new(ristretto255.Scalar)
-		scalars[idx].Multiply(scalars[6], &scalarW)
-		idx++
-
-		scalars[idx] = new(ristretto255.Scalar)
-		scalars[idx].Multiply(scalars[8], &scalarW)
-		idx++
-	}
-
-	var result ristretto255.Element
-	result.VarTimeMultiScalarMult(scalars[:idx], points[:idx])
-
-	if result.Equal(&y0) == 1 {
-		return nil
-	} else {
-		return ErrInvalidProof
-	}
+	return verifyGroupedCiphertextValidity(context, proof, 2, true, "batched-grouped-ciphertext-validity-2-handles-instruction")
 }
 
 func verifyBatchedGroupedCiphertext3HandlesValidity(context, proof []byte) error {
-	pubkey1 := context[:32]
-	pubkey2 := context[32:64]
-	pubkey3 := context[64:96]
+	return verifyGroupedCiphertextValidity(context, proof, 3, true, "batched-grouped-ciphertext-validity-3-handles-instruction")
+}
 
-	commitment := context[96:128]
-	handle1 := context[128:160]
-	handle2 := context[160:192]
-	handle3 := context[192:224]
-
-	commitmentHi := context[224:256]
-	handle1Hi := context[256:288]
-	handle2Hi := context[288:320]
-	handle3Hi := context[320:352]
-
-	proofY0 := proof[:32]
-	proofY1 := proof[32:64]
-	proofY2 := proof[64:96]
-	proofY3 := proof[96:128]
-	proofZr := proof[128:160]
-	proofZx := proof[160:192]
-
-	transcript := merlin.NewTranscript("batched-grouped-ciphertext-validity-3-handles-instruction")
-	transcript.AppendMessage([]byte("first-pubkey"), pubkey1)
-	transcript.AppendMessage([]byte("second-pubkey"), pubkey2)
-	transcript.AppendMessage([]byte("third-pubkey"), pubkey3)
-
-	var groupedCiphertextLo []byte
-	groupedCiphertextLo = append(groupedCiphertextLo, commitment...)
-	groupedCiphertextLo = append(groupedCiphertextLo, handle1...)
-	groupedCiphertextLo = append(groupedCiphertextLo, handle2...)
-	groupedCiphertextLo = append(groupedCiphertextLo, handle3...)
-	transcript.AppendMessage([]byte("grouped-ciphertext-lo"), groupedCiphertextLo)
-
-	var groupedCiphertextHi []byte
-	groupedCiphertextHi = append(groupedCiphertextHi, commitmentHi...)
-	groupedCiphertextHi = append(groupedCiphertextHi, handle1Hi...)
-	groupedCiphertextHi = append(groupedCiphertextHi, handle2Hi...)
-	groupedCiphertextHi = append(groupedCiphertextHi, handle3Hi...)
-	transcript.AppendMessage([]byte("grouped-ciphertext-hi"), groupedCiphertextHi)
-
-	var scalars [16]*ristretto255.Scalar
-	var points [16]*ristretto255.Element
-
-	for count := 0; count < 16; count++ {
-		scalars[count] = new(ristretto255.Scalar)
-		points[count] = new(ristretto255.Element)
+// The batched proofs use the same validity relation over C_lo+t*C_hi and
+// D_lo+t*D_hi. Keep one implementation of Agave's verify_direct relation so
+// the optional auditor key and the transcript scalar order cannot drift.
+func verifyGroupedCiphertextValidity(context, proof []byte, handles int, batched bool, instruction string) error {
+	transcript := newElGamalTranscript(instruction)
+	labels := [...]string{"first-pubkey", "second-pubkey", "third-pubkey"}
+	var pubkeys [3]ristretto255.Element
+	for i := 0; i < handles; i++ {
+		encoded := context[i*32 : (i+1)*32]
+		if err := pubkeys[i].Decode(encoded); err != nil {
+			return ErrInvalidProof
+		}
+		// Only the final (auditor) key may be the identity.
+		if i < handles-1 && pubkeys[i].Equal(ristretto255.NewElement()) == 1 {
+			return ErrInvalidProof
+		}
+		transcript.AppendMessage([]byte(labels[i]), encoded)
 	}
 
-	if !isValidScalar(proofZr) || !isValidScalar(proofZx) {
+	ciphertextSize := (handles + 1) * 32
+	lo := context[handles*32 : handles*32+ciphertextSize]
+	var ciphertext [4]ristretto255.Element
+	for i := 0; i <= handles; i++ {
+		if err := ciphertext[i].Decode(lo[i*32 : (i+1)*32]); err != nil {
+			return ErrInvalidProof
+		}
+	}
+	if ciphertext[0].Equal(ristretto255.NewElement()) == 1 {
 		return ErrInvalidProof
 	}
-
-	var scalarZr ristretto255.Scalar
-	err := scalarZr.Decode(proofZr)
-	if err != nil {
-		return ErrInvalidProof
+	var handleCount [8]byte
+	binary.LittleEndian.PutUint64(handleCount[:], uint64(handles))
+	if batched {
+		hi := context[handles*32+ciphertextSize:]
+		var high [4]ristretto255.Element
+		for i := 0; i <= handles; i++ {
+			if err := high[i].Decode(hi[i*32 : (i+1)*32]); err != nil {
+				return ErrInvalidProof
+			}
+		}
+		if high[0].Equal(ristretto255.NewElement()) == 1 {
+			return ErrInvalidProof
+		}
+		transcript.AppendMessage([]byte("grouped-ciphertext-lo"), lo)
+		transcript.AppendMessage([]byte("grouped-ciphertext-hi"), hi)
+		transcript.AppendMessage([]byte("dom-sep"), []byte("batched-validity-proof"))
+		transcript.AppendMessage([]byte("handles"), handleCount[:])
+		var t ristretto255.Scalar
+		t.FromUniformBytes(transcript.ExtractBytes([]byte("t"), 64))
+		for i := 0; i <= handles; i++ {
+			var scaled ristretto255.Element
+			scaled.ScalarMult(&t, &high[i])
+			ciphertext[i].Add(&ciphertext[i], &scaled)
+		}
+	} else {
+		transcript.AppendMessage([]byte("grouped-ciphertext"), lo)
 	}
-
-	var scalarZx ristretto255.Scalar
-	err = scalarZx.Decode(proofZx)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	points[0] = &basepointG
-	points[1] = &basepointH
-
-	var y0 ristretto255.Element
-	err = y0.Decode(proofY0)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	err = points[2].Decode(commitment)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	err = points[3].Decode(pubkey1)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	err = points[4].Decode(proofY1)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	err = points[5].Decode(handle1)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	err = points[6].Decode(pubkey2)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	err = points[7].Decode(proofY2)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	err = points[8].Decode(handle2)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	err = points[9].Decode(pubkey3)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	err = points[10].Decode(proofY3)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	err = points[11].Decode(handle3)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	err = points[12].Decode(commitmentHi)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	err = points[13].Decode(handle1Hi)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	err = points[14].Decode(handle2Hi)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	err = points[15].Decode(handle3Hi)
-	if err != nil {
-		return ErrInvalidProof
-	}
-
-	transcript.AppendMessage([]byte("dom-dep"), []byte("batched-validity-proof"))
-	var numHandlesBytes [8]byte
-	binary.LittleEndian.PutUint64(numHandlesBytes[:], 3)
-	transcript.AppendMessage([]byte("handles"), numHandlesBytes[:])
-
-	t := transcript.ExtractBytes([]byte("t"), 64)
-	var scalarT ristretto255.Scalar
-	scalarT.FromUniformBytes(t)
 
 	transcript.AppendMessage([]byte("dom-sep"), []byte("validity-proof"))
-	transcript.AppendMessage([]byte("handles"), numHandlesBytes[:])
-
-	if !isValidPoint(proofY0) || !isValidPoint(proofY1) || !isValidPoint(proofY2) {
+	transcript.AppendMessage([]byte("handles"), handleCount[:])
+	var ys [4]ristretto255.Element
+	yLabels := [...]string{"Y_0", "Y_1", "Y_2", "Y_3"}
+	for i := 0; i <= handles; i++ {
+		encoded := proof[i*32 : (i+1)*32]
+		if err := ys[i].Decode(encoded); err != nil {
+			return ErrInvalidProof
+		}
+		if i < handles && ys[i].Equal(ristretto255.NewElement()) == 1 {
+			return ErrInvalidProof
+		}
+		transcript.AppendMessage([]byte(yLabels[i]), encoded)
+	}
+	var c, zr, zx ristretto255.Scalar
+	c.FromUniformBytes(transcript.ExtractBytes([]byte("c"), 64))
+	zrBytes := proof[(handles+1)*32 : (handles+2)*32]
+	zxBytes := proof[(handles+2)*32:]
+	if err := zr.Decode(zrBytes); err != nil {
 		return ErrInvalidProof
 	}
+	if err := zx.Decode(zxBytes); err != nil {
+		return ErrInvalidProof
+	}
+	transcript.AppendMessage([]byte("z_r"), zrBytes)
+	transcript.AppendMessage([]byte("z_x"), zxBytes)
+	var w, weight, negC, negOne ristretto255.Scalar
+	w.FromUniformBytes(transcript.ExtractBytes([]byte("w"), 64))
+	weight.Decode(one[:])
+	negOne.Negate(&weight)
+	negC.Negate(&c)
 
-	transcript.AppendMessage([]byte("Y_0"), proofY0)
-	transcript.AppendMessage([]byte("Y_1"), proofY1)
-	transcript.AppendMessage([]byte("Y_2"), proofY2)
-	transcript.AppendMessage([]byte("Y_3"), proofY3)
-
-	c := transcript.ExtractBytes([]byte("c"), 64)
-	var scalarC ristretto255.Scalar
-	scalarC.FromUniformBytes(c)
-
-	transcript.AppendMessage([]byte("z_x"), proofZx)
-	transcript.AppendMessage([]byte("z_r"), proofZr)
-
-	w := transcript.ExtractBytes([]byte("w"), 64)
-	var scalarW ristretto255.Scalar
-	scalarW.FromUniformBytes(w)
-
-	scalars[0] = &scalarZx
-	scalars[1] = &scalarZr
-	scalars[2].Negate(&scalarC)
-	scalars[3].Multiply(&scalarZr, &scalarW)
-	scalars[4].Negate(&scalarW)
-	scalars[5].Multiply(scalars[2], &scalarW)
-	scalars[6].Multiply(scalars[3], &scalarW)
-	scalars[7].Multiply(scalars[4], &scalarW)
-	scalars[8].Multiply(scalars[5], &scalarW)
-	scalars[9].Multiply(scalars[6], &scalarW)
-	scalars[10].Multiply(scalars[7], &scalarW)
-	scalars[11].Multiply(scalars[8], &scalarW)
-	scalars[12].Multiply(scalars[2], &scalarT)
-	scalars[13].Multiply(scalars[5], &scalarT)
-	scalars[14].Multiply(scalars[8], &scalarT)
-	scalars[15].Multiply(scalars[11], &scalarT)
-
+	// z_x*G + z_r*H - c*C - Y_0
+	//   + sum_i w^(i+1) * (z_r*P_i - c*D_i - Y_(i+1)) == 0.
+	scalars := []*ristretto255.Scalar{&zx, &zr, &negC, &negOne}
+	points := []*ristretto255.Element{&basepointG, &basepointH, &ciphertext[0], &ys[0]}
+	var terms [3][3]ristretto255.Scalar
+	for i := 0; i < handles; i++ {
+		weight.Multiply(&weight, &w)
+		terms[i][0].Multiply(&weight, &zr)
+		terms[i][1].Multiply(&weight, &negC)
+		terms[i][2].Negate(&weight)
+		scalars = append(scalars, &terms[i][0], &terms[i][1], &terms[i][2])
+		points = append(points, &pubkeys[i], &ciphertext[i+1], &ys[i+1])
+	}
 	var result ristretto255.Element
-	result.VarTimeMultiScalarMult(scalars[:], points[:])
-
-	if result.Equal(&y0) == 1 {
-		return nil
-	} else {
+	result.VarTimeMultiScalarMult(scalars, points)
+	if result.Equal(ristretto255.NewElement()) != 1 {
 		return ErrInvalidProof
 	}
+	return nil
 }
 
 func verifyPercentageWithCap(context, proof []byte) error {
+	if !isValidPoint(context[:32]) || !isValidPoint(context[32:64]) || !isValidPoint(context[64:96]) {
+		return ErrInvalidProof
+	}
 	percentageCommitment := context[:32]
 	deltaCommitment := context[32:64]
 	claimedCommitment := context[64:96]
@@ -2174,7 +1573,7 @@ func verifyPercentageWithCap(context, proof []byte) error {
 	pepZdelta := proof[192:224]
 	pepZClaimed := proof[224:256]
 
-	transcript := merlin.NewTranscript("percentage-with-cap-instruction")
+	transcript := newElGamalTranscript("percentage-with-cap-instruction")
 	transcript.AppendMessage([]byte("percentage-commitment"), percentageCommitment)
 	transcript.AppendMessage([]byte("delta-commitment"), deltaCommitment)
 	transcript.AppendMessage([]byte("claimed-commitment"), claimedCommitment)
@@ -2245,6 +1644,7 @@ func verifyPercentageWithCap(context, proof []byte) error {
 	scalarC.FromUniformBytes(c)
 
 	transcript.AppendMessage([]byte("z_max"), pmpZmax)
+	transcript.AppendMessage([]byte("c_max_proof"), pmpCmax)
 	transcript.AppendMessage([]byte("z_x"), pepZx)
 	transcript.AppendMessage([]byte("z_delta_real"), pepZdelta)
 	transcript.AppendMessage([]byte("z_claimed"), pepZClaimed)
@@ -2258,7 +1658,8 @@ func verifyPercentageWithCap(context, proof []byte) error {
 
 	var mvb [32]byte
 	copy(mvb[:8], maxValueBytes[:])
-	scalarM := *(*ristretto255.Scalar)(unsafe.Pointer(&mvb[0]))
+	var scalarM ristretto255.Scalar
+	scalarM.Decode(mvb[:])
 
 	var scalarCMax ristretto255.Scalar
 	err = scalarCMax.Decode(pmpCmax)
@@ -2420,8 +1821,13 @@ func verifyBatchedRangeProof(context, proof []byte, ippLen uint) error {
 	if batchLen == 0 {
 		return ErrInvalidProof
 	}
+	// Agave rejects nonzero padding after the first identity commitment.
+	if !bytes.Equal(commitments[batchLen*32:], make([]byte, (maxCommitments-batchLen)*32)) ||
+		!bytes.Equal(bitLengths[batchLen:], make([]byte, maxCommitments-batchLen)) {
+		return ErrInvalidProof
+	}
 
-	transcript := merlin.NewTranscript("batched-range-proof-instruction")
+	transcript := newElGamalTranscript("batched-range-proof-instruction")
 	transcript.AppendMessage([]byte("commitments"), commitments)
 	transcript.AppendMessage([]byte("bit-lengths"), bitLengths)
 
@@ -2431,8 +1837,7 @@ func verifyBatchedRangeProof(context, proof []byte, ippLen uint) error {
 }
 
 func batchedRangeProofValidateBits(bitLen uint64) error {
-	if bitLen == 1 || bitLen == 2 || bitLen == 4 || bitLen == 8 ||
-		bitLen == 16 || bitLen == 32 || bitLen == 64 || bitLen == 128 {
+	if bitLen > 0 && bitLen <= 64 {
 		return nil
 	} else {
 		return ErrInvalidProof
@@ -2791,7 +2196,12 @@ func rangeProofsDelta(nm uint64, y ristretto255.Scalar, z ristretto255.Scalar, z
 		var deltaBytes []byte
 		copyOfDelta.Decode(delta.Encode(deltaBytes))
 
-		scalarSum2 := *(*ristretto255.Scalar)(unsafe.Pointer(&sum2Bytes[0]))
+		// Sum 1+2+...+2^(bits-1), including non-byte-aligned ranges.
+		if rem := bitLens[i] % 8; rem != 0 {
+			sum2Bytes[bitLens[i]/8] = byte((1 << rem) - 1)
+		}
+		var scalarSum2 ristretto255.Scalar
+		scalarSum2.Decode(sum2Bytes[:])
 
 		delta.Multiply(&negExpZ, &scalarSum2)
 		delta.Add(&delta, &copyOfDelta)

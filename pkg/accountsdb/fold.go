@@ -151,6 +151,22 @@ func (db *AccountsDb) CommitBatch(
 	// An all-empty batch (empty blocks) still folds: the manifest records the
 	// batch's bankhashes + resume context and advances the watermark; the data
 	// file is empty and no index entries are written.
+	if db.MinFreeBytes > 0 {
+		// Account for the deduplicated segment, manifest and index writes before
+		// allocating a file ID or writing any data. The reserve covers concurrent
+		// writers and shutdown; this is admission control, not a space reservation.
+		required := uint64(1<<20) + uint64(len(resumeCtx)) + uint64(len(bankhashes))*40
+		for _, v := range union {
+			required += hdrLen + ((uint64(len(v.acct.Data)) + 7) &^ uint64(7)) + manifestRecordSize + 128
+		}
+		available, err := AvailableDiskBytes(db.AcctsDir)
+		if err != nil {
+			return BatchCommitResult{}, err
+		}
+		if err := checkDiskBudget(available, required, db.MinFreeBytes); err != nil {
+			return BatchCommitResult{}, err
+		}
+	}
 
 	// Deterministic segment layout (test reproducibility + stable offsets).
 	keys := make([][32]byte, 0, len(union))

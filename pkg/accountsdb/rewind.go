@@ -287,7 +287,11 @@ func (db *AccountsDb) RewindToBatchBoundary(throughSlot uint64) (RewindResult, e
 		return res, err
 	}
 	db.readCacheEpochMu.Lock()
-	commitErr := batch.Commit(pebble.Sync)
+	writeOpts := pebble.Sync
+	if db.IndexWALDisabled {
+		writeOpts = pebble.NoSync // the explicit Flush below provides durability
+	}
+	commitErr := batch.Commit(writeOpts)
 	if commitErr == nil {
 		db.readCacheEpoch++
 		db.resetReadCachesLocked()
