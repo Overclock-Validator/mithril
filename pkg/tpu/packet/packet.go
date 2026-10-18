@@ -5,19 +5,48 @@ package packet
 // larger buffer is for SIMD-0385 v1 transactions.
 const DataSize = 4096
 
+// Source identifies where a packet entered the TPU.
+type Source uint8
+
+const (
+	// SourceQUIC is this validator's own TPU QUIC listener.
+	SourceQUIC Source = iota
+	// SourceRelayer is a relayer forwarding packets to this validator.
+	SourceRelayer
+	// NumSources is the number of sources.
+	NumSources
+)
+
+func (s Source) String() string {
+	switch s {
+	case SourceQUIC:
+		return "quic"
+	case SourceRelayer:
+		return "relayer"
+	default:
+		return "unknown"
+	}
+}
+
 // Packet is a received TPU transaction payload moving through the pipeline.
 type Packet struct {
 	buf  []byte
 	len  int
 	pool *Pool
 	slot uint32
+	src  Source
 }
 
 // Owned returns a packet that owns its wire bytes.
 func Owned(wire []byte) Packet {
+	return OwnedFrom(wire, SourceQUIC)
+}
+
+// OwnedFrom returns a packet from src that owns its wire bytes.
+func OwnedFrom(wire []byte, src Source) Packet {
 	out := make([]byte, len(wire))
 	copy(out, wire)
-	return Packet{buf: out, len: len(wire)}
+	return Packet{buf: out, len: len(wire), src: src}
 }
 
 // FromPool returns a packet backed by a pooled buffer. Call Release when done.
@@ -34,6 +63,10 @@ func (p Packet) Data() []byte {
 
 func (p Packet) Len() int {
 	return p.len
+}
+
+func (p Packet) Source() Source {
+	return p.src
 }
 
 func (p Packet) Release() {
