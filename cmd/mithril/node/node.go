@@ -579,6 +579,9 @@ func init() {
 	Run.Flags().IntVar(&validatorCompletionReserveMs, "leader-completion-reserve-ms", 0, "Time reserved for leader finalization and broadcast (0 = 75ms default; tune from measured completion times)")
 	Run.Flags().IntVar(&validatorMaxBufferedTransactions, "tpu-max-buffered-transactions", 0, "Maximum queued TPU transactions (0 = 131072 default)")
 
+	// [harmonic] section flags
+	registerHarmonicFlags(Run.Flags())
+
 	// [tuning] section flags
 	Run.Flags().Uint64Var(&paramArenaSizeMB, "param-arena-size-mb", 512, "Size in MB for serialized parameter arena (0 to disable)")
 	Run.Flags().Uint64Var(&borrowedAccountArenaSize, "borrowed-account-arena-size", 1024, "Number of borrowed accounts to preallocate in arena (0 to disable)")
@@ -1060,7 +1063,7 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	}
 
 	// [harmonic] section — optional block engine integration for leader slots.
-	if harmonicConfig, err = loadHarmonicSettings(); err != nil {
+	if harmonicConfig, err = loadHarmonicSettings(optionGetters{getString: getString, getInt64: getInt64, getBool: getBool}); err != nil {
 		return err
 	}
 	if harmonicConfig.enabled && consensusMode != "validator" {

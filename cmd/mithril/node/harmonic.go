@@ -6,13 +6,13 @@ import (
 	"fmt"
 
 	"github.com/Overclock-Validator/mithril/pkg/blockprod"
-	"github.com/Overclock-Validator/mithril/pkg/config"
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
 	"github.com/Overclock-Validator/mithril/pkg/harmonic"
 	blockenginepb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/blockengine"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/tpu"
 	solana "github.com/gagliardetto/solana-go"
+	"github.com/spf13/pflag"
 )
 
 // harmonicSettings is the validated [harmonic] section.
@@ -26,35 +26,59 @@ type harmonicSettings struct {
 	tips harmonic.TipConfig
 }
 
+// registerHarmonicFlags adds a flag for each [harmonic] key.
+func registerHarmonicFlags(flags *pflag.FlagSet) {
+	flags.Bool("harmonic-enabled", false, "Run leader slots from a Harmonic block engine (validator mode)")
+	flags.String("harmonic-block-engine-url", "", "Harmonic block engine URL (http:// or https://)")
+	flags.String("harmonic-block-engine-tls-domain", "", "TLS server name override for the block engine")
+	flags.String("harmonic-relayer-url", "", "Optional Harmonic relayer URL")
+	flags.String("harmonic-relayer-tls-domain", "", "TLS server name override for the relayer")
+	flags.Bool("harmonic-tls-cert-verify", true, "Verify Harmonic TLS certificates (false for development only)")
+	flags.String("harmonic-strategy", "fba", "Block engine scheduling strategy: fba, fifo or mrev")
+	flags.String("harmonic-tip-payment-program", "", "Tip payment program")
+	flags.String("harmonic-tip-distribution-program", "", "Tip distribution program")
+	flags.String("harmonic-merkle-root-upload-authority", "", "Merkle root upload authority for tip distribution accounts")
+	flags.Int64("harmonic-commission-bps", 0, "Validator commission on tips, in basis points (0-10000)")
+}
+
+// optionGetters resolve an option from its CLI flag when set, else from the
+// config file.
+type optionGetters struct {
+	getString func(cliKey, tomlKey string) string
+	getInt64  func(cliKey, tomlKey string) int64
+	getBool   func(cliKey, tomlKey string) bool
+}
+
 // loadHarmonicSettings reads [harmonic]. Harmonic is off unless enabled, and
 // then every key it needs must be valid.
-func loadHarmonicSettings() (harmonicSettings, error) {
-	s := harmonicSettings{enabled: config.GetBool("harmonic.enabled")}
+func loadHarmonicSettings(get optionGetters) (harmonicSettings, error) {
+	s := harmonicSettings{enabled: get.getBool("harmonic-enabled", "harmonic.enabled")}
 	if !s.enabled {
 		return s, nil
 	}
 	var err error
-	if s.blockEngine, err = harmonic.ParseEndpoint(config.GetString("harmonic.block_engine_url"), config.GetString("harmonic.block_engine_tls_domain")); err != nil {
+	if s.blockEngine, err = harmonic.ParseEndpoint(get.getString("harmonic-block-engine-url", "harmonic.block_engine_url"),
+		get.getString("harmonic-block-engine-tls-domain", "harmonic.block_engine_tls_domain")); err != nil {
 		return s, fmt.Errorf("harmonic.block_engine_url: %w", err)
 	}
-	if url := config.GetString("harmonic.relayer_url"); url != "" {
-		if s.relayer, err = harmonic.ParseEndpoint(url, config.GetString("harmonic.relayer_tls_domain")); err != nil {
+	if url := get.getString("harmonic-relayer-url", "harmonic.relayer_url"); url != "" {
+		if s.relayer, err = harmonic.ParseEndpoint(url, get.getString("harmonic-relayer-tls-domain", "harmonic.relayer_tls_domain")); err != nil {
 			return s, fmt.Errorf("harmonic.relayer_url: %w", err)
 		}
 	}
-	s.insecureSkipVerify = !config.GetBool("harmonic.tls_cert_verify")
-	if s.strategy, err = harmonic.ParseStrategy(config.GetString("harmonic.strategy")); err != nil {
+	s.insecureSkipVerify = !get.getBool("harmonic-tls-cert-verify", "harmonic.tls_cert_verify")
+	if s.strategy, err = harmonic.ParseStrategy(get.getString("harmonic-strategy", "harmonic.strategy")); err != nil {
 		return s, fmt.Errorf("harmonic.strategy: %w", err)
 	}
 	for _, key := range []struct {
-		name string
-		dst  *solana.PublicKey
+		flag, name string
+		dst        *solana.PublicKey
 	}{
-		{"harmonic.tip_payment_program", &s.tips.TipPaymentProgram},
-		{"harmonic.tip_distribution_program", &s.tips.TipDistributionProgram},
-		{"harmonic.merkle_root_upload_authority", &s.tips.MerkleRootUploadAuthority},
+		{"harmonic-tip-payment-program", "harmonic.tip_payment_program", &s.tips.TipPaymentProgram},
+		{"harmonic-tip-distribution-program", "harmonic.tip_distribution_program", &s.tips.TipDistributionProgram},
+		{"harmonic-merkle-root-upload-authority", "harmonic.merkle_root_upload_authority", &s.tips.MerkleRootUploadAuthority},
 	} {
-		value := config.GetString(key.name)
+		value := get.getString(key.flag, key.name)
 		if value == "" {
 			return s, fmt.Errorf("%s is required when harmonic.enabled=true", key.name)
 		}
@@ -62,7 +86,7 @@ func loadHarmonicSettings() (harmonicSettings, error) {
 			return s, fmt.Errorf("%s: %w", key.name, err)
 		}
 	}
-	bps := config.GetInt64("harmonic.commission_bps")
+	bps := get.getInt64("harmonic-commission-bps", "harmonic.commission_bps")
 	if bps < 0 || bps > 10_000 {
 		return s, fmt.Errorf("harmonic.commission_bps must be between 0 and 10000, got %d", bps)
 	}

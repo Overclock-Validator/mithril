@@ -371,6 +371,7 @@ name = "mithril"
 # at slot start (immediately), when no block arrives by the middle of the
 # slot, or when the block stops early. Harmonic failures never stop the
 # validator. When disabled, leader slots schedule locally from the start.
+# Every key has a flag: --harmonic-<key>, e.g. --harmonic-block-engine-url.
 
 [harmonic]
     enabled = false

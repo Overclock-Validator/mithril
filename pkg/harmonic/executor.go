@@ -17,7 +17,7 @@ const (
 	// with no block bundle falls back to local scheduling.
 	thresholdFraction = 0.5
 	// voteTail is the end of the slot in which a reverting block bundle does
-	// not abort the block (spec §15.3).
+	// not abort the block.
 	voteTail = 20 * time.Millisecond
 )
 
