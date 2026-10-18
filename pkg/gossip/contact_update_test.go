@@ -222,7 +222,7 @@ func TestClientUpdateContactPublishesACopy(t *testing.T) {
 	before := publishedContact(client)
 	beforeWire := encodeContact(t, before)
 
-	if err := client.SetClientID(15); err != nil {
+	if err := client.SetClientID(ClientIDMithrilHarmonic); err != nil {
 		t.Fatalf("SetClientID: %v", err)
 	}
 	after := publishedContact(client)
@@ -232,7 +232,7 @@ func TestClientUpdateContactPublishesACopy(t *testing.T) {
 	if !bytes.Equal(beforeWire, encodeContact(t, before)) {
 		t.Fatalf("the previously published contact changed")
 	}
-	if after.Version.Client != 15 || before.Version.Client != versionClientMithril {
+	if after.Version.Client != ClientIDMithrilHarmonic || before.Version.Client != versionClientMithril {
 		t.Fatalf("client id after=%#x before=%#x", after.Version.Client, before.Version.Client)
 	}
 	if after.Outset != before.Outset {
@@ -269,7 +269,7 @@ func TestClientAppliesContactUpdatesQueuedBeforeRun(t *testing.T) {
 	if err := client.SetTPUSockets(TPUSockets{QUIC: udp(relayerIP, 11228), ForwardsQUIC: udp(relayerIP, 11229)}); err != nil {
 		t.Fatalf("SetTPUSockets: %v", err)
 	}
-	if err := client.SetClientID(15); err != nil {
+	if err := client.SetClientID(ClientIDMithrilHarmonic); err != nil {
 		t.Fatalf("SetClientID: %v", err)
 	}
 	if err := client.initializeContact(udp(net.ParseIP("127.0.0.1"), 65400)); err != nil {
@@ -279,7 +279,7 @@ func TestClientAppliesContactUpdatesQueuedBeforeRun(t *testing.T) {
 	if got := socketAddr(contact, socketTagTPUQUIC); got.String() != "198.51.100.7:11228" {
 		t.Fatalf("TPU QUIC = %v; queued updates must apply in order", got)
 	}
-	if contact.Version.Client != 15 {
+	if contact.Version.Client != ClientIDMithrilHarmonic {
 		t.Fatalf("client id = %#x", contact.Version.Client)
 	}
 	requireAcceptedByPeers(t, contact)
@@ -361,11 +361,11 @@ func TestClientPushesContactUpdatesImmediately(t *testing.T) {
 	if got := nextPushedClientID(); got != versionClientMithril {
 		t.Fatalf("initial client id = %#x", got)
 	}
-	if err := client.SetClientID(15); err != nil {
+	if err := client.SetClientID(ClientIDMithrilHarmonic); err != nil {
 		t.Fatalf("SetClientID: %v", err)
 	}
 	// The push interval is an hour, so this push comes from the update.
-	if got := nextPushedClientID(); got != 15 {
+	if got := nextPushedClientID(); got != ClientIDMithrilHarmonic {
 		t.Fatalf("pushed client id = %#x, want 15", got)
 	}
 }

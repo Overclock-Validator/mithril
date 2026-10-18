@@ -44,6 +44,14 @@ const (
 	versionClientMithril = 0x4d49
 )
 
+const (
+	// ClientIDMithril is the client ID mithril advertises by default.
+	ClientIDMithril uint16 = versionClientMithril
+	// ClientIDMithrilHarmonic is the client ID mithril advertises while it is
+	// connected to a Harmonic block engine (validator client-ID registry: 15).
+	ClientIDMithrilHarmonic uint16 = 15
+)
+
 type Pubkey [32]byte
 type Signature [64]byte
 type Hash [32]byte
