@@ -321,6 +321,21 @@ func TestStreamingGroupRejectsUnprocessableTransactions(t *testing.T) {
 	}
 }
 
+func TestStreamingGroupReportsBlockIndex(t *testing.T) {
+	for _, workers := range []int{0, 4} {
+		env := newGroupExecutionEnv(t, workers, 10_000_000)
+		defer env.cleanup()
+		txs := transferTransactions(t, 4, 1)
+		require.NoError(t, env.exec.executeTransactionGroup(txs[:2], nil, false))
+		txs[3].Message.RecentBlockhash = solana.Hash{0xFA}
+		err := env.exec.executeTransactionGroup(txs[2:], nil, false)
+		require.ErrorIs(t, err, TxErrInvalidBlockhash)
+		var unprocessable *UnprocessableTransactionError
+		require.ErrorAs(t, err, &unprocessable)
+		require.Equal(t, 3, unprocessable.Index, "workers %d", workers)
+	}
+}
+
 func TestStreamingGroupRejectsUnresolvedLookupsBeforeExecution(t *testing.T) {
 	for _, workers := range []int{0, 4} {
 		env := newGroupExecutionEnv(t, workers, 10_000_000)

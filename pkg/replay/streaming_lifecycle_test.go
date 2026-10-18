@@ -403,6 +403,49 @@ func TestStreamingLifecycleDiscardThenWholeBlock(t *testing.T) {
 	}
 }
 
+// A live block (no RPC metadata) with a transaction whose recent blockhash is
+// unknown is rejected with the streaming path's error, never panics, and is
+// neither finalized nor committed.
+func TestProcessBlockRejectsUnprocessableTransaction(t *testing.T) {
+	for _, txParallelism := range []int{0, 4} {
+		env := newLifecycleEnv(t)
+		txs := transferTransactions(t, 3, 100)
+		txs[1].Message.RecentBlockhash = solana.Hash{0xFA}
+		tail := &lifecycleTail{durable: env.durable}
+		block := env.block(txs)
+		block.MarkTransactionSignaturesVerified()
+		txCountBefore := global.TransactionCount()
+
+		slotCtx, err := ProcessBlock(env.acctsDb, block, env.epochSchedule, txParallelism, nil, &persistedTracker{}, tail, NewTransactionStatusCache(), false, env.parent)
+		require.Nil(t, slotCtx, "txpar %d", txParallelism)
+		require.ErrorIs(t, err, TxErrInvalidBlockhash, "txpar %d", txParallelism)
+		var unprocessable *UnprocessableTransactionError
+		require.ErrorAs(t, err, &unprocessable, "txpar %d", txParallelism)
+		require.Equal(t, 1, unprocessable.Index, "txpar %d", txParallelism)
+		require.Empty(t, tail.added, "txpar %d: a rejected bank commits nothing", txParallelism)
+		require.Equal(t, txCountBefore, global.TransactionCount(), "txpar %d: a rejected bank is not finalized", txParallelism)
+	}
+}
+
+// A transaction that fails at the instruction level is still processed: its
+// fee is charged and the block is accepted.
+func TestProcessBlockChargesInstructionFailures(t *testing.T) {
+	for _, txParallelism := range []int{0, 4} {
+		env := newLifecycleEnv(t)
+		// 900,000 lamports stays rent-exempt (890,880) after the 5,000 fee,
+		// so the fee payer is valid, but the 999,001-lamport transfer fails
+		// in the system program for insufficient funds.
+		_ = env.durable.SetAccountWithoutLock(txfixture.PayerPubkey(), &accounts.Account{
+			Key: txfixture.PayerPubkey(), Lamports: 900_000, Owner: addresses.SystemProgramAddr, RentEpoch: ^uint64(0),
+		})
+		outcome := lifecycleWholeBlock(t, env, transferTransactions(t, 1, 999_000), txParallelism)
+		require.Equal(t, uint64(895_000), outcome.delta[txfixture.PayerPubkey()].Lamports, "txpar %d", txParallelism)
+		if dest, ok := outcome.delta[txfixture.DestPubkey()]; ok {
+			require.Equal(t, uint64(10_000_000), dest.Lamports, "txpar %d", txParallelism)
+		}
+	}
+}
+
 // V0 / address-lookup-table coverage. Resolving lookups mutates the message
 // object (SetAddressTables refuses a second call; ResolveLookups appends to
 // AccountKeys), so a stream must execute its own copies and leave the block's
