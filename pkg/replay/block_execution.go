@@ -347,7 +347,7 @@ func (exec *blockExecution) executeTransactionGroup(txs []*solana.Transaction, i
 	exec.setReplayStage("tx_loop")
 	start := time.Now()
 	txLoopRegion := trace.StartRegion(exec.ctx, "TxLoop")
-	feeInfos, computeUnits, err := exec.runTransactionGroup(txs, execute, shouldVerifySignatures)
+	feeInfos, computeUnits, err := exec.runTransactionGroup(txs, execute, shouldVerifySignatures, base)
 	txLoopRegion.End()
 	metrics.GlobalBlockReplay.TxLoop.AddTimingSince(start)
 	if err != nil {
@@ -440,10 +440,11 @@ func (exec *blockExecution) loadTransactionAccounts(view *b.Block) error {
 }
 
 // runTransactionGroup is parallelTxLoop over a transaction slice with a plan
-// built for the group alone (indices are group-local). Without the planner
+// built for the group alone (indices are group-local; base is the group's
+// block index, used only to report errors). Without the planner
 // (txParallelism <= 1) it runs sequentially, which
 // is always correct because groups are consumed in block order.
-func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execute []bool, shouldVerifySignatures bool) ([]*fees.TxFeeInfo, []uint64, error) {
+func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execute []bool, shouldVerifySignatures bool, base int) ([]*fees.TxFeeInfo, []uint64, error) {
 	slotCtx := exec.slotCtx
 	feeInfos := make([]*fees.TxFeeInfo, len(txs))
 	computeUnits := make([]uint64, len(txs))
@@ -472,7 +473,7 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 			var txErr error
 			feeInfos[idx], computeUnits[idx], txErr = ProcessTransaction(slotCtx, &exec.sigverifyWg, tx, nil, dbgOpts, nil, shouldVerifySignatures)
 			if feeInfos[idx] == nil {
-				return nil, nil, streamingTransactionError(idx, txErr)
+				return nil, nil, unprocessableTransactionError(base+idx, txErr)
 			}
 		}
 		return feeInfos, computeUnits, nil
@@ -514,19 +515,32 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 	<-plannerDone
 	for idx := range txs {
 		if execute[idx] && feeInfos[idx] == nil {
-			return nil, nil, streamingTransactionError(idx, txErrors[idx])
+			return nil, nil, unprocessableTransactionError(base+idx, txErrors[idx])
 		}
 	}
 	return feeInfos, computeUnits, nil
 }
 
-// Instruction failures still carry charged fees and remain valid block entries.
-// A missing fee result means transaction admission failed: discard the bank.
-func streamingTransactionError(index int, err error) error {
+// UnprocessableTransactionError reports the first transaction, by block index,
+// that produced no fee result. Instruction failures still carry charged fees
+// and remain valid block entries. A missing fee result means transaction
+// admission failed: discard the bank.
+type UnprocessableTransactionError struct {
+	Index int
+	Err   error
+}
+
+func (e *UnprocessableTransactionError) Error() string {
+	return fmt.Sprintf("unprocessable transaction %d: %v", e.Index, e.Err)
+}
+
+func (e *UnprocessableTransactionError) Unwrap() error { return e.Err }
+
+func unprocessableTransactionError(index int, err error) error {
 	if err == nil {
 		err = errors.New("missing fee result")
 	}
-	return fmt.Errorf("unprocessable streaming transaction %d: %w", index, err)
+	return &UnprocessableTransactionError{Index: index, Err: err}
 }
 
 // finalize runs the end-of-block phases over the open SlotCtx: fees to the

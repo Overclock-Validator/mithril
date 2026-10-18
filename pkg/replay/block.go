@@ -4108,7 +4108,7 @@ func validatePreConsensusTransactionStatuses(
 	return statuses.validateBlockWithPlan(&candidate, plan)
 }
 
-func sequentialTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, block *b.Block, executionPlan blockTransactionExecutionPlan, dbgOpts *DebugOptions, shouldVerifySignatures bool) (fees.TxFeeInfoAccumulator, uint64) {
+func sequentialTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, block *b.Block, executionPlan blockTransactionExecutionPlan, dbgOpts *DebugOptions, shouldVerifySignatures bool) (fees.TxFeeInfoAccumulator, uint64, error) {
 	var txFeeAccumulator fees.TxFeeInfoAccumulator
 	var totalComputeUnitsConsumed uint64
 	// process & execute each transaction in turn
@@ -4125,7 +4125,7 @@ func sequentialTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, bl
 
 		if txMeta == nil {
 			if txFeeInfo == nil {
-				panic(fmt.Sprintf("txFeeInfo is nil for tx %s in slot %d", tx.Signatures[0], block.Slot))
+				return fees.TxFeeInfoAccumulator{}, 0, unprocessableTransactionError(idx, txErr)
 			}
 			txFeeAccumulator.Add(txFeeInfo)
 			continue
@@ -4155,7 +4155,7 @@ func sequentialTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, bl
 		}
 		txFeeAccumulator.Add(txFeeInfo)
 	}
-	return txFeeAccumulator, totalComputeUnitsConsumed
+	return txFeeAccumulator, totalComputeUnitsConsumed, nil
 }
 
 func lightbringerEntryExecutionBatches(transactions []*solana.Transaction, entry *b.TxEntry, relaxIntraBatchAccountLocks bool) [][]uint64 {
@@ -4244,7 +4244,7 @@ func parallelTxLoop(
 	txParallelism int,
 	dbgOpts *DebugOptions,
 	shouldVerifySignatures bool,
-) (fees.TxFeeInfoAccumulator, uint64) {
+) (fees.TxFeeInfoAccumulator, uint64, error) {
 	var txFeeAccumulator fees.TxFeeInfoAccumulator
 	txFeeInfos := make([]*fees.TxFeeInfo, len(block.Transactions))
 	txComputeUnitsConsumed := make([]uint64, len(block.Transactions))
@@ -4401,12 +4401,17 @@ func parallelTxLoop(
 			} else {
 				mlog.Log.Errorf("  RecentBlockhashes: nil or empty!")
 			}
-			panic(fmt.Sprintf("txFeeInfo is nil - blockhash validation failed for tx %s", tx.Signatures[0]))
+			// With RPC metadata the transaction was processed onchain, so a
+			// missing fee result is a local divergence.
+			if idx < len(block.TxMetas) && block.TxMetas[idx] != nil {
+				panic(fmt.Sprintf("txFeeInfo is nil - blockhash validation failed for tx %s", tx.Signatures[0]))
+			}
+			return fees.TxFeeInfoAccumulator{}, 0, unprocessableTransactionError(idx, errs[idx])
 		}
 		txFeeAccumulator.Add(txFeeInfo)
 	}
 
-	return txFeeAccumulator, totalComputeUnitsConsumed
+	return txFeeAccumulator, totalComputeUnitsConsumed, nil
 }
 
 func ProcessBlock(
@@ -4507,14 +4512,19 @@ func ProcessBlock(
 	exec.setReplayStage("tx_loop")
 	txLoopRegion := trace.StartRegion(exec.ctx, "TxLoop")
 	shouldVerifySignatures := !block.TransactionSignaturesVerified()
+	var txLoopErr error
 	if txParallelism > 0 {
-		txFeeAccumulator, totalComputeUnitsConsumed = parallelTxLoop(slotCtx, &exec.sigverifyWg, planner, block, executionPlan, txParallelism, dbgOpts, shouldVerifySignatures)
+		txFeeAccumulator, totalComputeUnitsConsumed, txLoopErr = parallelTxLoop(slotCtx, &exec.sigverifyWg, planner, block, executionPlan, txParallelism, dbgOpts, shouldVerifySignatures)
 	} else {
-		txFeeAccumulator, totalComputeUnitsConsumed = sequentialTxLoop(slotCtx, &exec.sigverifyWg, block, executionPlan, dbgOpts, shouldVerifySignatures)
+		txFeeAccumulator, totalComputeUnitsConsumed, txLoopErr = sequentialTxLoop(slotCtx, &exec.sigverifyWg, block, executionPlan, dbgOpts, shouldVerifySignatures)
 	}
-	slotCtx.TotalComputeUnitsConsumed = totalComputeUnitsConsumed
 	txLoopRegion.End()
 	metrics.GlobalBlockReplay.TxLoop.AddTimingSince(start)
+	if txLoopErr != nil {
+		// The partially executed SlotCtx is dropped unfinalized.
+		return nil, fmt.Errorf("execute transactions for slot %d: %w", block.Slot, txLoopErr)
+	}
+	slotCtx.TotalComputeUnitsConsumed = totalComputeUnitsConsumed
 
 	exec.txFeeAccumulator = txFeeAccumulator
 	exec.totalCU = totalComputeUnitsConsumed
