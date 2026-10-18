@@ -286,7 +286,7 @@ func TestLeaderWindowRefreshesCorrectedParentReadyWhileWaitingForReplay(t *testi
 	defer func() {
 		loop.mu.Lock()
 		defer loop.mu.Unlock()
-		loop.abortActiveSlotLocked()
+		loop.releaseActiveSlotLocked()
 	}()
 
 	loop.tick()
@@ -582,7 +582,7 @@ func TestLeaderWindowRejectsParentChangeDuringLocalSetup(t *testing.T) {
 	defer func() {
 		loop.mu.Lock()
 		defer loop.mu.Unlock()
-		loop.abortActiveSlotLocked()
+		loop.releaseActiveSlotLocked()
 	}()
 
 	loop.tick()
@@ -706,7 +706,7 @@ func TestLeaderWindowRejectsParentChangeDuringHeaderBroadcast(t *testing.T) {
 	defer func() {
 		loop.mu.Lock()
 		defer loop.mu.Unlock()
-		loop.abortActiveSlotLocked()
+		loop.releaseActiveSlotLocked()
 	}()
 
 	loop.tick()
@@ -806,7 +806,7 @@ func TestLeaderWindowRecheckStartsAdjacentReadyWindowWithoutPollDelay(t *testing
 	defer func() {
 		loop.mu.Lock()
 		defer loop.mu.Unlock()
-		loop.abortActiveSlotLocked()
+		loop.releaseActiveSlotLocked()
 	}()
 
 	loop.tick()

@@ -262,7 +262,7 @@ func (s *Scheduler) drainLoop(ctx context.Context) {
 			return
 		}
 		s.refreshPreparation()
-		bank := s.banks.WorkingBank()
+		bank := s.tpuBank()
 		s.noteBank(bank)
 		if bank == nil {
 			if !s.wait(ctx, 5*time.Millisecond) {
@@ -285,7 +285,7 @@ func (s *Scheduler) drainLoop(ctx context.Context) {
 		}
 
 		// Bank may have been cleared between the nil check and pop.
-		bank = s.banks.WorkingBank()
+		bank = s.tpuBank()
 		s.noteBank(bank)
 		if bank == nil {
 			s.rebuffer(e)
@@ -316,6 +316,16 @@ func (s *Scheduler) drainLoop(ctx context.Context) {
 			s.recordForge(result, reason)
 		}
 	}
+}
+
+// tpuBank returns the working bank while it admits TPU transactions. A gated
+// bank is treated like no bank, so the buffer keeps everything until it opens.
+func (s *Scheduler) tpuBank() *blockprod.WorkingBank {
+	bank := s.banks.WorkingBank()
+	if bank == nil || !bank.TPUAllowed() {
+		return nil
+	}
+	return bank
 }
 
 // popSchedulable pops the highest-reward entry that is not marked skip for gen.

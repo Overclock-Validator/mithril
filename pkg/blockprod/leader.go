@@ -100,6 +100,8 @@ type LeaderLoop struct {
 	canSignSlot      func(uint64) bool
 	onBlock          func(*b.Block)
 	commitLeaderSlot func(replay.CommitLeaderInput) (*sealevel.SlotCtx, error)
+	hooks            LeaderHooks
+	gateTPU          bool
 
 	currentSlot   func() uint64
 	leaderForSlot func(uint64) (solana.PublicKey, bool)
@@ -161,6 +163,10 @@ type LeaderLoopConfig struct {
 	// uses the conservative default; tune only from measured completion times.
 	CompletionReserve time.Duration
 	Now               func() time.Time
+	Hooks             LeaderHooks
+	// GateTPU opens each working bank with TPU admission closed; Hooks must
+	// call WorkingBank.AllowTPU to open it. Ignored without Hooks.
+	GateTPU bool
 }
 
 func NewLeaderLoop(cfg LeaderLoopConfig) *LeaderLoop {
@@ -199,6 +205,8 @@ func NewLeaderLoop(cfg LeaderLoopConfig) *LeaderLoop {
 		slotDuration:        cfg.SlotDuration,
 		completionReserve:   cfg.CompletionReserve,
 		now:                 cfg.Now,
+		hooks:               cfg.Hooks,
+		gateTPU:             cfg.GateTPU && cfg.Hooks != nil,
 		finishedLeaderSlots: make(map[uint64]struct{}),
 		pendingFailures:     make(map[uint64]leaderSlotFailure),
 	}
@@ -246,7 +254,7 @@ func (l *LeaderLoop) tickScheduled(scheduledAt time.Time) {
 		if l.activeBank != nil {
 			if canonical, reason := l.activeParentStillCanonicalLocked(); !canonical {
 				l.rememberLeaderSlotFailureLocked(l.activeSlot, reason, activeLeaderFailureDetail(reason))
-				l.abortActiveSlotLocked()
+				l.abortActiveSlotLocked(reason)
 				if reason == leaderReasonAlreadyResolved || reason == leaderReasonParentReadyMissedWindow {
 					l.failProductionWindowLocked(l.productionWindow.nextSlot, reason, activeLeaderFailureDetail(reason))
 				}
@@ -726,7 +734,14 @@ func (l *LeaderLoop) activeParentStillCanonicalLocked() (bool, string) {
 	return true, ""
 }
 
-func (l *LeaderLoop) abortActiveSlotLocked() {
+func (l *LeaderLoop) abortActiveSlotLocked(reason string) {
+	if l.activeBank != nil && l.hooks != nil {
+		l.hooks.SlotAborted(l.activeSlot, reason)
+	}
+	l.releaseActiveSlotLocked()
+}
+
+func (l *LeaderLoop) releaseActiveSlotLocked() {
 	if l.controller != nil {
 		l.controller.ClearWorkingBank()
 	}
@@ -952,10 +967,13 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 	slot := l.activeSlot
 	if canonical, reason := l.activeParentStillCanonicalLocked(); !canonical {
 		l.failProductionWindowLocked(slot, reason, activeLeaderFailureDetail(reason))
-		l.abortActiveSlotLocked()
+		l.abortActiveSlotLocked(reason)
 		return
 	}
 
+	if l.hooks != nil {
+		l.hooks.SlotEnding(slot)
+	}
 	// Detach first so no new TPU packet can obtain this bank. Freeze then waits
 	// for any packet that already did, closing the footer/entry race.
 	if l.controller != nil {
@@ -964,13 +982,13 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 	l.activeBank.Freeze()
 	if l.activeSink == nil {
 		l.failProductionWindowLocked(slot, leaderReasonFinalizationUnavailable, "entry broadcast sink is unavailable")
-		l.abortActiveSlotLocked()
+		l.abortActiveSlotLocked(leaderReasonFinalizationUnavailable)
 		return
 	}
 	l.activeSink.Wait()
 	if err := l.activeSink.Err(); err != nil {
 		l.failProductionWindowLocked(slot, leaderReasonEntryBroadcastFailed, err.Error())
-		l.abortActiveSlotLocked()
+		l.abortActiveSlotLocked(leaderReasonEntryBroadcastFailed)
 		return
 	}
 
@@ -986,7 +1004,7 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 
 	if l.accountsDb == nil || l.activeSess == nil {
 		l.failProductionWindowLocked(slot, leaderReasonFinalizationUnavailable, "accounts DB or broadcast session is unavailable")
-		l.abortActiveSlotLocked()
+		l.abortActiveSlotLocked(leaderReasonFinalizationUnavailable)
 		return
 	}
 	parentLastBlockhash := l.parentCtx.ParentLastBlockhash
@@ -1030,26 +1048,26 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 		FooterProducerTimeNanos: producerTimeNanos,
 	}); err != nil {
 		l.failProductionWindowLocked(slot, leaderReasonFreezeFailed, err.Error())
-		l.abortActiveSlotLocked()
+		l.abortActiveSlotLocked(leaderReasonFreezeFailed)
 		return
 	}
 
 	if canonical, reason := l.activeParentStillCanonicalLocked(); !canonical {
 		l.failProductionWindowLocked(slot, reason, activeLeaderFailureDetail(reason))
-		l.abortActiveSlotLocked()
+		l.abortActiveSlotLocked(reason)
 		return
 	}
 	footerBankhash := solana.HashFromBytes(l.activeBank.SlotCtx().FinalBankhash)
 	if err := l.activeSess.BroadcastFooter(footerBankhash, producerTimeNanos, footerRewards.Skip, footerRewards.Notar); err != nil {
 		l.failProductionWindowLocked(slot, leaderReasonFooterBroadcastFailed, err.Error())
-		l.abortActiveSlotLocked()
+		l.abortActiveSlotLocked(leaderReasonFooterBroadcastFailed)
 		return
 	}
 	// Ending tick is the last-in-slot shred. Mid-slot entry batches are only
 	// emitted when they fill a FEC set; Freeze already flushed any leftover.
 	if err := l.activeSess.BroadcastEndingTickLast(tickHash); err != nil {
 		l.failProductionWindowLocked(slot, leaderReasonEndingTickBroadcastFailed, err.Error())
-		l.abortActiveSlotLocked()
+		l.abortActiveSlotLocked(leaderReasonEndingTickBroadcastFailed)
 		return
 	}
 	// BroadcastEndingTickLast synchronously hands the final shred batch to the
@@ -1080,7 +1098,7 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 	l.recordLeaderSlotOutcomeLocked(slot, leaderOutcomeBroadcast, leaderReasonComplete,
 		fmt.Sprintf("block=%s parent_slot=%d txns=%d%s", solana.Hash(producedBlock.AlpenglowBlockID).String(), producedBlock.ParentSlot, len(producedBlock.Transactions), timingDetail))
 	l.advanceProductionWindowLocked(slot)
-	l.abortActiveSlotLocked()
+	l.releaseActiveSlotLocked()
 }
 
 func (l *LeaderLoop) advanceProductionWindowLocked(slot uint64) {
@@ -1237,6 +1255,7 @@ func (l *LeaderLoop) startSlotLocked(slot uint64) error {
 		EntryHash:           startEntryHash,
 		Sink:                sink,
 		TransactionStatuses: parentCtx.TransactionStatuses,
+		TPUGated:            l.gateTPU,
 	})
 	if slot > 0 && !sameReplayParentSnapshot(parentCtx, l.parentContext(slot)) {
 		bank.Close()
@@ -1280,6 +1299,9 @@ func (l *LeaderLoop) startSlotLocked(slot uint64) error {
 	l.activeParentID = parentID
 	l.activeParentChainedRoot = parentChainedRoot
 	l.activeParentGeneration = parentCtx.ReplayGeneration
+	if l.hooks != nil {
+		l.hooks.SlotStarted(l.leaderSlotInfoLocked(slot, parentSlot, bank))
+	}
 	if l.controller != nil {
 		l.controller.SetWorkingBank(bank)
 	}

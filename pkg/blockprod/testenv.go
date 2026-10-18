@@ -27,6 +27,7 @@ type TestEnvConfig struct {
 	EntryHash           solana.Hash
 	Sink                BatchSink
 	TransactionStatuses *replay.TransactionStatusView
+	TPUGated            bool
 }
 
 func NewTestEnv(cfg TestEnvConfig) *TestEnv {
@@ -78,6 +79,7 @@ func NewTestEnv(cfg TestEnvConfig) *TestEnv {
 		EntryHash:           entryHash,
 		Sink:                cfg.Sink,
 		TransactionStatuses: statuses,
+		TPUGated:            cfg.TPUGated,
 	})
 	controller := NewController()
 	controller.SetWorkingBank(bank)

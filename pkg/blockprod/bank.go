@@ -2,6 +2,7 @@ package blockprod
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/Overclock-Validator/mithril/pkg/arena"
 	"github.com/Overclock-Validator/mithril/pkg/costmodel"
@@ -49,6 +50,9 @@ type WorkingBank struct {
 	// either phase, so their storage can be reset for the next transaction.
 	borrowedAccounts *arena.Arena[sealevel.BorrowedAccount]
 	preparer         *replay.TransactionPreparer
+	// tpuAllowed admits TPU transactions. It only moves from false to true, so
+	// a TPU source that observed it set never races a later close.
+	tpuAllowed atomic.Bool
 }
 
 type BankConfig struct {
@@ -59,6 +63,8 @@ type BankConfig struct {
 	EntryHash           solana.Hash
 	Sink                BatchSink
 	TransactionStatuses *replay.TransactionStatusView
+	// TPUGated opens the bank with TPU admission closed until AllowTPU.
+	TPUGated bool
 }
 
 func NewWorkingBank(cfg BankConfig) *WorkingBank {
@@ -80,7 +86,7 @@ func NewWorkingBank(cfg BankConfig) *WorkingBank {
 	if cfg.SlotCtx != nil {
 		preparer = replay.NewTransactionPreparer(cfg.SlotCtx.Features)
 	}
-	return &WorkingBank{
+	bank := &WorkingBank{
 		preparer:         preparer,
 		slotCtx:          cfg.SlotCtx,
 		slot:             cfg.Slot,
@@ -94,6 +100,19 @@ func NewWorkingBank(cfg BankConfig) *WorkingBank {
 		seenMessages:     make(map[[32]byte]struct{}),
 		borrowedAccounts: arena.New[sealevel.BorrowedAccount](64),
 	}
+	bank.tpuAllowed.Store(!cfg.TPUGated)
+	return bank
+}
+
+// TPUAllowed reports whether TPU sources may forge into this bank. Other
+// producers forge directly and are not subject to the gate.
+func (b *WorkingBank) TPUAllowed() bool {
+	return b.tpuAllowed.Load()
+}
+
+// AllowTPU opens TPU admission. It is one-way and safe to call repeatedly.
+func (b *WorkingBank) AllowTPU() {
+	b.tpuAllowed.Store(true)
 }
 
 func (b *WorkingBank) Slot() uint64 {
