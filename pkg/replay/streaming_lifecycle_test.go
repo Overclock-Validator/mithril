@@ -438,6 +438,13 @@ func systemTransferData(lamports uint64) []byte {
 // payer and the System program, so the destination is account index 2.
 func signedV0TransferViaTableWire(t *testing.T, seq uint64) []byte {
 	t.Helper()
+	return signedV0TransferViaTableIndexWire(t, seq, 0)
+}
+
+// signedV0TransferViaTableIndexWire is signedV0TransferViaTableWire to entry
+// index of the table.
+func signedV0TransferViaTableIndexWire(t *testing.T, seq uint64, index uint8) []byte {
+	t.Helper()
 	msg := solana.Message{
 		Header:          solana.MessageHeader{NumRequiredSignatures: 1, NumReadonlyUnsignedAccounts: 1},
 		AccountKeys:     solana.PublicKeySlice{txfixture.PayerPubkey(), solana.SystemProgramID},
@@ -447,7 +454,7 @@ func signedV0TransferViaTableWire(t *testing.T, seq uint64) []byte {
 			Accounts:       []uint16{0, 2},
 			Data:           systemTransferData(1_000 + seq),
 		}},
-		AddressTableLookups: solana.MessageAddressTableLookupSlice{{AccountKey: lifecycleTableKey, WritableIndexes: []uint8{0}}},
+		AddressTableLookups: solana.MessageAddressTableLookupSlice{{AccountKey: lifecycleTableKey, WritableIndexes: []uint8{index}}},
 	}
 	_, err := msg.SetVersion(solana.MessageVersionV0)
 	require.NoError(t, err)
@@ -590,4 +597,35 @@ func TestStreamingLifecycleDiscardedV0PrefixResolvesAgainstTheNewParent(t *testi
 
 	reference := lifecycleWholeBlock(t, newLifecycleEnvWithTable(t, destB), decodeTransactions(t, wires), 2)
 	requireSameLifecycleOutcome(t, reference, whole)
+}
+
+// A block whose lookups cannot be resolved is rejected, not a node crash.
+func TestProcessBlockRejectsUnresolvableLookups(t *testing.T) {
+	dest := solana.PublicKey{0xDA}
+	cases := []struct {
+		name  string
+		table func(*accounts.Account)
+		index uint8
+	}{
+		{"uninitialized data", func(a *accounts.Account) { a.Data = make([]byte, sealevel.AddressLookupTableMetaSize) }, 0},
+		{"undecodable data", func(a *accounts.Account) { a.Data = []byte{9, 9, 9} }, 0},
+		{"index past the end", func(*accounts.Account) {}, 5},
+	}
+	for _, tc := range cases {
+		for _, txParallelism := range []int{0, 4} {
+			env := newLifecycleEnvWithTable(t, dest)
+			table := lookupTableAccount(t, dest)
+			tc.table(table)
+			_ = env.durable.SetAccountWithoutLock(lifecycleTableKey, table)
+			txs := decodeTransactions(t, [][]byte{signedV0TransferViaTableIndexWire(t, 1, tc.index)})
+			tail := &lifecycleTail{durable: env.durable}
+			block := env.block(txs)
+			block.MarkTransactionSignaturesVerified()
+
+			slotCtx, err := ProcessBlock(env.acctsDb, block, env.epochSchedule, txParallelism, nil, &persistedTracker{}, tail, NewTransactionStatusCache(), false, env.parent)
+			require.Error(t, err, "%s txpar %d", tc.name, txParallelism)
+			require.Nil(t, slotCtx, "%s txpar %d", tc.name, txParallelism)
+			require.Empty(t, tail.added, "%s txpar %d: a rejected bank commits nothing", tc.name, txParallelism)
+		}
+	}
 }

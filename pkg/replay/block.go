@@ -4350,7 +4350,7 @@ func ProcessBlock(
 	accts, parentAccts, accountMapCapacity, bankSysvars, err := loadBlockAccountsAndUpdateSysvars(exec.blockSrc, block, epochSchedule, alpenglowClock, parentBankSysvars, planner)
 	loadAcctsRegion.End()
 	if err != nil {
-		panic(fmt.Sprintf("unable to load slot accounts and update sysvars: %s", err))
+		return nil, fmt.Errorf("load slot accounts and update sysvars at slot %d: %w", block.Slot, err)
 	}
 	if err := bankSysvars.ValidateForExecution(); err != nil {
 		return nil, fmt.Errorf("invalid bank sysvar snapshot at slot %d: %w", block.Slot, err)
