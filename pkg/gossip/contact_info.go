@@ -30,6 +30,8 @@ const (
 	socketTagGossip          = 0
 	socketTagServeRepairQuic = 1
 	socketTagServeRepair     = 4
+	socketTagTPU             = 5
+	socketTagTPUForwards     = 6
 	socketTagTPUQUICForwards = 7
 	socketTagTPUQUIC         = 8
 	socketTagTPUVote         = 9
@@ -76,6 +78,15 @@ type ContactInfo struct {
 	TPUVoteQuicAddr *net.UDPAddr
 	AlpenglowAddr   *net.UDPAddr
 	Extensions      [][]byte
+}
+
+// TPUSockets are the TPU endpoints a contact publishes. A nil endpoint is not
+// published.
+type TPUSockets struct {
+	UDP          *net.UDPAddr
+	QUIC         *net.UDPAddr
+	ForwardsUDP  *net.UDPAddr
+	ForwardsQUIC *net.UDPAddr
 }
 
 type contactEndpoint struct {
@@ -191,16 +202,61 @@ func (c *ContactInfo) SetTPUQUIC(addr *net.UDPAddr) error {
 	return c.SetSocket(socketTagTPUQUIC, addr)
 }
 
-func (c *ContactInfo) SetSocket(key uint8, addr *net.UDPAddr) error {
+// SetTPUSockets publishes exactly the given TPU endpoints and removes the ones
+// left nil. Nothing changes if an endpoint is invalid.
+func (c *ContactInfo) SetTPUSockets(tpu TPUSockets) error {
+	sockets := [...]struct {
+		key  uint8
+		addr *net.UDPAddr
+	}{
+		{socketTagTPU, tpu.UDP},
+		{socketTagTPUQUIC, tpu.QUIC},
+		{socketTagTPUForwards, tpu.ForwardsUDP},
+		{socketTagTPUQUICForwards, tpu.ForwardsQUIC},
+	}
+	for _, socket := range sockets {
+		if socket.addr == nil {
+			continue
+		}
+		if _, err := socketIP(socket.key, socket.addr); err != nil {
+			return err
+		}
+	}
+	for _, socket := range sockets {
+		if socket.addr == nil {
+			c.RemoveSocket(socket.key)
+			continue
+		}
+		if err := c.SetSocket(socket.key, socket.addr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SetClientID sets the client ID advertised in the contact's version.
+func (c *ContactInfo) SetClientID(id uint16) {
+	c.Version.Client = id
+}
+
+func socketIP(key uint8, addr *net.UDPAddr) (net.IP, error) {
 	if addr == nil {
-		return fmt.Errorf("nil socket for key %d", key)
+		return nil, fmt.Errorf("nil socket for key %d", key)
 	}
 	if addr.Port <= 0 || addr.Port > 0xffff {
-		return fmt.Errorf("invalid port %d for key %d", addr.Port, key)
+		return nil, fmt.Errorf("invalid port %d for key %d", addr.Port, key)
 	}
 	ip := normalizedIP(addr.IP)
 	if ip == nil || ip.IsUnspecified() {
-		return fmt.Errorf("invalid IP %q for key %d", addr.IP.String(), key)
+		return nil, fmt.Errorf("invalid IP %q for key %d", addr.IP.String(), key)
+	}
+	return ip, nil
+}
+
+func (c *ContactInfo) SetSocket(key uint8, addr *net.UDPAddr) error {
+	ip, err := socketIP(key, addr)
+	if err != nil {
+		return err
 	}
 	addrIndex := -1
 	for idx, existing := range c.Addrs {
@@ -230,6 +286,93 @@ func (c *ContactInfo) SetSocket(key uint8, addr *net.UDPAddr) error {
 		}
 		return c.Sockets[i].Port < c.Sockets[j].Port
 	})
+	// The replaced socket may have been the last one on its address.
+	c.pruneUnusedAddrs()
+	return nil
+}
+
+// RemoveSocket stops publishing the socket for key, and its IP address if no
+// other socket uses it.
+func (c *ContactInfo) RemoveSocket(key uint8) {
+	filtered := c.Sockets[:0]
+	for _, entry := range c.Sockets {
+		if entry.Key != key {
+			filtered = append(filtered, entry)
+		}
+	}
+	c.Sockets = filtered
+	switch key {
+	case socketTagGossip:
+		c.GossipAddr = nil
+	case socketTagServeRepair:
+		c.ServeRepairAddr = nil
+	case socketTagTVU:
+		c.TVUAddr = nil
+	case socketTagTPUVote:
+		c.TPUVoteAddr = nil
+	case socketTagTPUVoteQuic:
+		c.TPUVoteQuicAddr = nil
+	case socketTagAlpenglow:
+		c.AlpenglowAddr = nil
+	}
+	c.pruneUnusedAddrs()
+}
+
+// pruneUnusedAddrs drops IP addresses no socket references. Peers reject a
+// contact that lists an unused address.
+func (c *ContactInfo) pruneUnusedAddrs() {
+	used := make([]bool, len(c.Addrs))
+	for _, entry := range c.Sockets {
+		if int(entry.Index) < len(used) {
+			used[entry.Index] = true
+		}
+	}
+	remap := make([]uint8, len(c.Addrs))
+	kept := c.Addrs[:0]
+	for idx, ip := range c.Addrs {
+		if used[idx] {
+			remap[idx] = uint8(len(kept))
+			kept = append(kept, ip)
+		}
+	}
+	c.Addrs = kept
+	for idx := range c.Sockets {
+		c.Sockets[idx].Index = remap[c.Sockets[idx].Index]
+	}
+}
+
+// validateEntries applies the checks peers run on a contact's address and
+// socket lists before accepting it: unique IPv4 addresses, unique socket
+// keys, every socket on a listed address, and every address in use.
+func (c *ContactInfo) validateEntries() error {
+	seen := make(map[[4]byte]struct{}, len(c.Addrs))
+	for _, ip := range c.Addrs {
+		v4 := ip.To4()
+		if v4 == nil {
+			return fmt.Errorf("contact address %s is not IPv4", ip)
+		}
+		if _, dup := seen[[4]byte(v4)]; dup {
+			return fmt.Errorf("duplicate contact address %s", ip)
+		}
+		seen[[4]byte(v4)] = struct{}{}
+	}
+	var keys [256]bool
+	used := make([]bool, len(c.Addrs))
+	for _, entry := range c.Sockets {
+		if keys[entry.Key] {
+			return fmt.Errorf("duplicate socket key %d", entry.Key)
+		}
+		keys[entry.Key] = true
+		if int(entry.Index) >= len(c.Addrs) {
+			return fmt.Errorf("socket key %d uses address index %d of %d", entry.Key, entry.Index, len(c.Addrs))
+		}
+		used[entry.Index] = true
+	}
+	for idx, inUse := range used {
+		if !inUse {
+			return fmt.Errorf("contact address %s is unused", c.Addrs[idx])
+		}
+	}
 	return nil
 }
 
