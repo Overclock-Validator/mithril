@@ -44,12 +44,12 @@ type Config struct {
 type Client struct {
 	cfg Config
 
-	entrypoint     *net.UDPAddr
-	bindAddr       *net.UDPAddr
-	tvuAddr        *net.UDPAddr
-	alpenglow      *net.UDPAddr
-	identity       ed25519.PrivateKey
-	pubkey         Pubkey
+	entrypoint *net.UDPAddr
+	bindAddr   *net.UDPAddr
+	tvuAddr    *net.UDPAddr
+	alpenglow  *net.UDPAddr
+	identity   ed25519.PrivateKey
+	pubkey     Pubkey
 
 	contactMu sync.RWMutex
 	// contact is replaced on every update and never modified once published,
