@@ -1,0 +1,72 @@
+// Authentication service used by the Harmonic validator to obtain access tokens
+// for the block engine and relayer.
+syntax = "proto3";
+
+package auth;
+
+import "google/protobuf/timestamp.proto";
+
+// Role the client is authenticating as.
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  // Harmonic validator role.
+  VALIDATOR = 2;
+}
+
+message GenerateAuthChallengeRequest {
+  // Role the client is attempting to generate tokens for.
+  Role role = 1;
+  // Validator's 32-byte public key.
+  bytes pubkey = 2;
+}
+
+message GenerateAuthChallengeResponse {
+  // Challenge string to be signed by the validator.
+  string challenge = 1;
+}
+
+message GenerateAuthTokensRequest {
+  // The challenge string returned by GenerateAuthChallenge.
+  string challenge = 1;
+  // Validator's 32-byte public key (must match the pubkey from GenerateAuthChallenge).
+  bytes client_pubkey = 2;
+  // 64-byte signature of the challenge signed by the validator's private key.
+  // The validator is expected to sign the challenge prepended with its pubkey:
+  // sign(pubkey, challenge).
+  bytes signed_challenge = 3;
+}
+
+// An auth token with an expiration timestamp.
+message Token {
+  // The token string, used as a Bearer token in the Authorization header.
+  string value = 1;
+  // When this token expires.
+  google.protobuf.Timestamp expires_at_utc = 2;
+}
+
+message GenerateAuthTokensResponse {
+  // Short-lived token used in the Authorization header for API calls.
+  Token access_token = 1;
+  // Longer-lived token used to obtain a fresh access_token via RefreshAccessToken.
+  Token refresh_token = 2;
+}
+
+message RefreshAccessTokenRequest {
+  // Non-expired refresh token obtained from GenerateAuthTokens.
+  string refresh_token = 1;
+}
+
+message RefreshAccessTokenResponse {
+  // Freshly issued access token.
+  Token access_token = 1;
+}
+
+// Issues auth tokens to the Harmonic validator for API access.
+service AuthService {
+  // Returns a challenge; the validator must sign it to prove key ownership.
+  rpc GenerateAuthChallenge(GenerateAuthChallengeRequest) returns (GenerateAuthChallengeResponse) {}
+  // Exchanges a signed challenge for an access/refresh token pair.
+  rpc GenerateAuthTokens(GenerateAuthTokensRequest) returns (GenerateAuthTokensResponse) {}
+  // Refreshes an access token using a non-expired refresh token.
+  rpc RefreshAccessToken(RefreshAccessTokenRequest) returns (RefreshAccessTokenResponse) {}
+}
