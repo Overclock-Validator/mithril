@@ -250,28 +250,44 @@ var (
 	standaloneForge = forgePolicy{admitOnActual: true}
 )
 
-func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, prepared *replay.PreparedTransaction, res EntryReservation, policy forgePolicy) (ForgeResult, costmodel.ExceedReason) {
+// forgeCandidate is a transaction's forge work that needs no bank lock.
+type forgeCandidate struct {
+	// execTx is what executes: tx, or for a v0 transaction with address-table
+	// lookups, a resolved copy. tx itself stays unresolved for entry encoding.
+	execTx *solana.Transaction
+	// prepared is the static preparation, if any, still valid for execTx.
+	prepared                 *replay.PreparedTransaction
+	serializedSize           int
+	messageHash              [32]byte
+	ancestorAlreadyProcessed bool
+	ancestorStatusErr        error
+	cost                     costmodel.TransactionCost
+}
+
+// prepareForge does the lock-free part of forging tx: full-wire validation,
+// the message hash, the account lock rules, the ancestor status lookup,
+// address-table lookups and the cost estimate. Unless it returns
+// ForgeAccepted, tx cannot be forged.
+func (b *WorkingBank) prepareForge(tx *solana.Transaction, wireSize int, prepared *replay.PreparedTransaction) (forgeCandidate, ForgeResult) {
+	c := forgeCandidate{execTx: tx, prepared: prepared}
 	if tx == nil {
-		b.RebateSchedule(res)
-		return ForgeDroppedParse, costmodel.ExceedNone
+		return c, ForgeDroppedParse
 	}
 	// Validate the full wire before execution can charge fees or publish
 	// account changes. Entry append then reuses this measured size and has no
 	// fallible serialization step after commit, including on the prepared path.
-	serializedSize, err := serializedTransactionSize(tx)
+	var err error
+	c.serializedSize, err = serializedTransactionSize(tx)
 	if err != nil {
-		b.RebateSchedule(res)
-		return ForgeDroppedParse, costmodel.ExceedNone
+		return c, ForgeDroppedParse
 	}
-	var messageHash [32]byte
 	if prepared != nil {
-		messageHash = prepared.MessageHash()
+		c.messageHash = prepared.MessageHash()
 	} else {
-		messageHash, err = replay.TransactionMessageHash(tx)
+		c.messageHash, err = replay.TransactionMessageHash(tx)
 	}
 	if err != nil {
-		b.RebateSchedule(res)
-		return ForgeDroppedParse, costmodel.ExceedNone
+		return c, ForgeDroppedParse
 	}
 	// A transaction that repeats an account or exceeds the account lock limit
 	// can never be processed, and a block containing one is invalid. The check
@@ -281,58 +297,76 @@ func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, pre
 		lockFeats = b.slotCtx.Features
 	}
 	if txErr := replay.ValidateAccountLocks(tx, lockFeats); txErr != nil {
-		b.RebateSchedule(res)
-		return ForgeDroppedAccountLocks, costmodel.ExceedNone
+		return c, ForgeDroppedAccountLocks
 	}
-	ancestorAlreadyProcessed := false
-	var ancestorStatusErr error
 	if b.ancestorStatuses == nil {
-		ancestorStatusErr = &replay.IncompleteTransactionStatusCoverageError{}
+		c.ancestorStatusErr = &replay.IncompleteTransactionStatusCoverageError{}
 	} else {
 		// The view is immutable and internally synchronizes its lazy per-blockhash
 		// index. Do that potentially large one-time lookup outside the bank lock.
-		ancestorAlreadyProcessed, ancestorStatusErr = b.ancestorStatuses.ContainsMessage(tx.Message.RecentBlockhash, messageHash)
+		c.ancestorAlreadyProcessed, c.ancestorStatusErr = b.ancestorStatuses.ContainsMessage(tx.Message.RecentBlockhash, c.messageHash)
 	}
 
-	// For a v0 transaction with address-table lookups, execTx is a resolved copy,
-	// while tx stays unresolved for entry encoding.
-	execTx := tx
-	var cost costmodel.TransactionCost
-	if !ancestorAlreadyProcessed && ancestorStatusErr == nil {
+	if !c.ancestorAlreadyProcessed && c.ancestorStatusErr == nil {
 		if replay.HasAddressTableLookups(tx) {
 			// Tables are read from the parent state, which this slot does not
 			// change, so resolve outside the bank lock.
 			resolved, txErr := replay.ResolveAddressTableLookups(b.slotCtx, tx)
 			if txErr != nil {
-				b.RebateSchedule(res)
-				return ForgeDroppedLookup, costmodel.ExceedNone
+				return c, ForgeDroppedLookup
 			}
 			// A loaded address can repeat a static key or another loaded
 			// address, or take the account count past the lock limit.
 			if txErr := replay.ValidateAccountLocks(resolved, lockFeats); txErr != nil {
-				b.RebateSchedule(res)
-				return ForgeDroppedAccountLocks, costmodel.ExceedNone
+				return c, ForgeDroppedAccountLocks
 			}
-			execTx = resolved
+			c.execTx = resolved
 			// Static preparation, if any, was done on the unresolved message.
-			prepared = nil
+			c.prepared = nil
 		}
 		feats := b.slotCtx.Features
 		if feats == nil {
 			f := features.NewFeaturesDefault()
 			feats = f
 		}
-		if prepared != nil {
-			cost = prepared.Cost()
+		if c.prepared != nil {
+			c.cost = c.prepared.Cost()
 		} else {
-			cost, err = costmodel.EstimateTransactionCost(execTx, feats)
+			c.cost, err = costmodel.EstimateTransactionCost(c.execTx, feats)
 		}
 		if err != nil {
-			b.RebateSchedule(res)
-			return ForgeDroppedParse, costmodel.ExceedNone
+			return c, ForgeDroppedParse
 		}
-		cost.WireSize = wireSize
+		c.cost.WireSize = wireSize
 	}
+	return c, ForgeAccepted
+}
+
+// statusLocked rejects a candidate this bank or its ancestors already
+// processed.
+func (b *WorkingBank) statusLocked(c forgeCandidate) ForgeResult {
+	if _, alreadyProcessed := b.seenMessages[c.messageHash]; alreadyProcessed {
+		return ForgeDroppedAlreadyProcessed
+	}
+	if c.ancestorAlreadyProcessed {
+		return ForgeDroppedAlreadyProcessed
+	}
+	if c.ancestorStatusErr != nil {
+		// A live leader is never constructed with incomplete coverage. Preserve a
+		// fail-closed result for isolated callers that bypass LeaderLoop.
+		return ForgeDroppedNoLeader
+	}
+	return ForgeAccepted
+}
+
+func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, prepared *replay.PreparedTransaction, res EntryReservation, policy forgePolicy) (ForgeResult, costmodel.ExceedReason) {
+	c, result := b.prepareForge(tx, wireSize, prepared)
+	if result != ForgeAccepted {
+		b.RebateSchedule(res)
+		return result, costmodel.ExceedNone
+	}
+	cost, serializedSize, messageHash := c.cost, c.serializedSize, c.messageHash
+	execTx, prepared := c.execTx, c.prepared
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -342,16 +376,8 @@ func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, pre
 	if !b.accepting {
 		return ForgeDroppedNoLeader, costmodel.ExceedNone
 	}
-	if _, alreadyProcessed := b.seenMessages[messageHash]; alreadyProcessed {
-		return ForgeDroppedAlreadyProcessed, costmodel.ExceedNone
-	}
-	if ancestorAlreadyProcessed {
-		return ForgeDroppedAlreadyProcessed, costmodel.ExceedNone
-	}
-	if ancestorStatusErr != nil {
-		// A live leader is never constructed with incomplete coverage. Preserve a
-		// fail-closed result for isolated callers that bypass LeaderLoop.
-		return ForgeDroppedNoLeader, costmodel.ExceedNone
+	if result := b.statusLocked(c); result != ForgeAccepted {
+		return result, costmodel.ExceedNone
 	}
 
 	if !policy.admitOnActual {

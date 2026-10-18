@@ -81,6 +81,34 @@ func (b *EntryBuilder) wouldExceedSlot(nextWire int) bool {
 	return b.SlotBytes()+b.admitBytes(nextWire) > maxEntry
 }
 
+// wouldExceedSlotN reports whether appending transactions of these
+// serialized sizes in order, before the bank lock is released, would pass the
+// slot entry-byte budget. It follows the batching appendSerialized does.
+func (b *EntryBuilder) wouldExceedSlotN(sizes []int) bool {
+	maxEntry := int(b.limits.MaxEntryBytes)
+	if maxEntry <= 0 {
+		return false
+	}
+	total := b.SlotBytes()
+	pending, pendingBytes := len(b.pendingTxns), b.pendingSerializedBytes
+	for _, size := range sizes {
+		switch {
+		case pending > 0 && entryBatchOverheadBytes+pendingBytes+size > int(b.limits.MaxBatchBytes):
+			// The pending batch is already counted; the transaction starts a new one.
+			total += entryBatchOverheadBytes + size
+			pending, pendingBytes = 1, size
+		case pending == 0:
+			total += entryBatchOverheadBytes + size
+			pending, pendingBytes = 1, size
+		default:
+			total += size
+			pending++
+			pendingBytes += size
+		}
+	}
+	return total > maxEntry
+}
+
 func (b *EntryBuilder) admitBytes(nextWire int) int {
 	if b.wouldOverflowBatch(nextWire) || len(b.pendingTxns) == 0 {
 		return entryBatchOverheadBytes + nextWire
