@@ -306,7 +306,7 @@ func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, pre
 		Arena:             b.borrowedAccounts,
 	}, prepared)
 	if output.ProcessingResult.TransactionError != nil {
-		feeInfo, err := replay.ApplyFeesOnlyTransaction(b.slotCtx, tx, output)
+		feeInfo, err := replay.ApplyFailedTransaction(b.slotCtx, tx, output)
 		if err != nil {
 			return ForgeDroppedExecution, costmodel.ExceedNone
 		}
