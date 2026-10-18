@@ -211,7 +211,7 @@ func (b *WorkingBank) Forge(wire []byte) (ForgeResult, costmodel.ExceedReason) {
 // ForgeTransaction executes and commits a parsed transaction. The caller must
 // keep it immutable: accepted transactions are retained for entry publication.
 func (b *WorkingBank) ForgeTransaction(tx *solana.Transaction, wireSize int) (ForgeResult, costmodel.ExceedReason) {
-	return b.forgeTransaction(tx, wireSize, nil, EntryReservation{})
+	return b.forgeTransaction(tx, wireSize, nil, EntryReservation{}, tpuForge)
 }
 
 // ForgePreparedTransaction reuses static work from owned, immutable TPU bytes.
@@ -227,10 +227,30 @@ func (b *WorkingBank) ForgeScheduledTransaction(tx *solana.Transaction, wireSize
 	if b.slotCtx == nil || !b.preparer.Matches(prepared, tx, b.slotCtx.Features) {
 		prepared = nil
 	}
-	return b.forgeTransaction(tx, wireSize, prepared, res)
+	return b.forgeTransaction(tx, wireSize, prepared, res, tpuForge)
 }
 
-func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, prepared *replay.PreparedTransaction, res EntryReservation) (ForgeResult, costmodel.ExceedReason) {
+// ForgeStandaloneTransaction forges a Harmonic block transaction that is not
+// revert protected. Unlike TPU forging, block limits are checked against the
+// units execution consumed, so a transaction may request more than the slot
+// has left as long as what it uses fits.
+func (b *WorkingBank) ForgeStandaloneTransaction(tx *solana.Transaction, wireSize int) (ForgeResult, costmodel.ExceedReason) {
+	return b.forgeTransaction(tx, wireSize, nil, EntryReservation{}, standaloneForge)
+}
+
+// forgePolicy selects how a forge path checks block limits.
+type forgePolicy struct {
+	// admitOnActual checks block limits after execution against actual usage
+	// instead of before it against requested units.
+	admitOnActual bool
+}
+
+var (
+	tpuForge        = forgePolicy{}
+	standaloneForge = forgePolicy{admitOnActual: true}
+)
+
+func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, prepared *replay.PreparedTransaction, res EntryReservation, policy forgePolicy) (ForgeResult, costmodel.ExceedReason) {
 	if tx == nil {
 		b.RebateSchedule(res)
 		return ForgeDroppedParse, costmodel.ExceedNone
@@ -334,8 +354,10 @@ func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, pre
 		return ForgeDroppedNoLeader, costmodel.ExceedNone
 	}
 
-	if reason := b.costs.WouldExceed(cost); reason != costmodel.ExceedNone {
-		return ForgeDroppedCost, reason
+	if !policy.admitOnActual {
+		if reason := b.costs.WouldExceed(cost); reason != costmodel.ExceedNone {
+			return ForgeDroppedCost, reason
+		}
 	}
 	if reason := b.admitEntryBytesLocked(serializedSize); reason != costmodel.ExceedNone {
 		return ForgeDroppedCost, reason
@@ -351,6 +373,14 @@ func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, pre
 		SkipTimingMetrics: true,
 		Arena:             b.borrowedAccounts,
 	}, prepared)
+	// Execution only touched transaction-local accounts; nothing is published
+	// until the apply below, so a transaction refused here leaves no trace.
+	execCU, loadedCost := actualExecutionUsage(output)
+	if policy.admitOnActual {
+		if reason := b.costs.WouldExceed(cost.WithActualUsage(execCU, loadedCost)); reason != costmodel.ExceedNone {
+			return ForgeDroppedCost, reason
+		}
+	}
 	if output.ProcessingResult.TransactionError != nil {
 		feeInfo, err := replay.ApplyFailedTransaction(b.slotCtx, execTx, output)
 		if err != nil {
@@ -373,7 +403,6 @@ func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, pre
 	b.numSigs += uint64(tx.Message.Header.NumRequiredSignatures)
 
 	b.costs.Record(cost)
-	execCU, loadedCost := actualExecutionUsage(output)
 	b.costs.Rebate(cost, execCU, loadedCost)
 	if flushed, batchBytes, didFlush := b.entries.appendSerialized(*tx, wireSize, serializedSize); didFlush {
 		b.entryHash = b.entries.CurrentEntryHash()
