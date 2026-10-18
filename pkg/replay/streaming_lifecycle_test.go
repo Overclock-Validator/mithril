@@ -599,33 +599,71 @@ func TestStreamingLifecycleDiscardedV0PrefixResolvesAgainstTheNewParent(t *testi
 	requireSameLifecycleOutcome(t, reference, whole)
 }
 
-// A block whose lookups cannot be resolved is rejected, not a node crash.
-func TestProcessBlockRejectsUnresolvableLookups(t *testing.T) {
+// Every lookup-table case gets the Solana protocol's verdict from ProcessBlock
+// (both tx loops) and from a streaming group. Tables are judged against the
+// block's SlotHashes: the parent's ([6] here) with the parent slot (7) added.
+func TestReplayResolvesLookupTablesByProtocolRules(t *testing.T) {
 	dest := solana.PublicKey{0xDA}
+	deactivatedAt := func(slot uint64) func(*accounts.Account) {
+		return func(a *accounts.Account) { binary.LittleEndian.PutUint64(a.Data[4:12], slot) }
+	}
 	cases := []struct {
 		name  string
 		table func(*accounts.Account)
 		index uint8
+		want  error // nil: the block is accepted
 	}{
-		{"uninitialized data", func(a *accounts.Account) { a.Data = make([]byte, sealevel.AddressLookupTableMetaSize) }, 0},
-		{"undecodable data", func(a *accounts.Account) { a.Data = []byte{9, 9, 9} }, 0},
-		{"index past the end", func(*accounts.Account) {}, 5},
+		{"active", func(*accounts.Account) {}, 0, nil},
+		{"deactivating in the current slot", deactivatedAt(lifecycleSlot), 0, nil},
+		{"deactivated at the parent slot", deactivatedAt(lifecycleParentSlot), 0, nil},
+		{"deactivating, still in SlotHashes", deactivatedAt(lifecycleParentSlot - 1), 0, nil},
+		{"deactivated, gone from SlotHashes", deactivatedAt(2), 0, TxErrAddressLookupTableNotFound},
+		// The source's view of an absent account.
+		{"missing", func(a *accounts.Account) { *a = accounts.Account{Key: lifecycleTableKey} }, 0, TxErrAddressLookupTableNotFound},
+		{"zero lamports with data", func(a *accounts.Account) { a.Lamports = 0 }, 0, TxErrAddressLookupTableNotFound},
+		{"wrong owner", func(a *accounts.Account) { a.Owner = addresses.SystemProgramAddr }, 0, TxErrInvalidAddressLookupTableOwner},
+		{"uninitialized data", func(a *accounts.Account) { a.Data = make([]byte, sealevel.AddressLookupTableMetaSize) }, 0, TxErrInvalidAddressLookupTableData},
+		{"undecodable data", func(a *accounts.Account) { a.Data = []byte{9, 9, 9} }, 0, TxErrInvalidAddressLookupTableData},
+		{"index past the end", func(*accounts.Account) {}, 5, TxErrInvalidAddressLookupTableIndex},
 	}
-	for _, tc := range cases {
+	newEnv := func(t *testing.T, tc int) (*lifecycleEnv, []*solana.Transaction) {
+		env := newLifecycleEnvWithTable(t, dest)
+		table := lookupTableAccount(t, dest)
+		cases[tc].table(table)
+		_ = env.durable.SetAccountWithoutLock(lifecycleTableKey, table)
+		return env, decodeTransactions(t, [][]byte{signedV0TransferViaTableIndexWire(t, 1, cases[tc].index)})
+	}
+	for tc := range cases {
+		name, want := cases[tc].name, cases[tc].want
 		for _, txParallelism := range []int{0, 4} {
-			env := newLifecycleEnvWithTable(t, dest)
-			table := lookupTableAccount(t, dest)
-			tc.table(table)
-			_ = env.durable.SetAccountWithoutLock(lifecycleTableKey, table)
-			txs := decodeTransactions(t, [][]byte{signedV0TransferViaTableIndexWire(t, 1, tc.index)})
+			env, txs := newEnv(t, tc)
 			tail := &lifecycleTail{durable: env.durable}
 			block := env.block(txs)
 			block.MarkTransactionSignaturesVerified()
-
 			slotCtx, err := ProcessBlock(env.acctsDb, block, env.epochSchedule, txParallelism, nil, &persistedTracker{}, tail, NewTransactionStatusCache(), false, env.parent)
-			require.Error(t, err, "%s txpar %d", tc.name, txParallelism)
-			require.Nil(t, slotCtx, "%s txpar %d", tc.name, txParallelism)
-			require.Empty(t, tail.added, "%s txpar %d: a rejected bank commits nothing", tc.name, txParallelism)
+			if want == nil {
+				require.NoError(t, err, "%s txpar %d", name, txParallelism)
+				require.Equal(t, uint64(10_000_000+1_001), lifecycleOutcomeOf(t, slotCtx, tail).delta[dest].Lamports, "%s txpar %d", name, txParallelism)
+				continue
+			}
+			require.ErrorIs(t, err, want, "%s txpar %d", name, txParallelism)
+			require.Nil(t, slotCtx, "%s txpar %d", name, txParallelism)
+			require.Empty(t, tail.added, "%s txpar %d: a rejected bank commits nothing", name, txParallelism)
 		}
+
+		env, txs := newEnv(t, tc)
+		exec := newBlockExecution(env.acctsDb, env.block(nil), env.epochSchedule, 2, nil, &persistedTracker{}, &lifecycleTail{durable: env.durable}, NewTransactionStatusCache(), false, env.parent)
+		require.NoError(t, exec.open())
+		err := exec.executeTransactionGroup(txs, nil, false)
+		exec.close()
+		if want == nil {
+			require.NoError(t, err, "%s streaming", name)
+			destAcct, err := exec.slotCtx.GetAccountShared(dest)
+			require.NoError(t, err)
+			require.Equal(t, uint64(10_000_000+1_001), destAcct.Lamports, "%s streaming", name)
+			continue
+		}
+		require.ErrorIs(t, err, want, "%s streaming", name)
+		require.Zero(t, exec.slotCtx.TotalComputeUnitsConsumed, "%s streaming: nothing executed", name)
 	}
 }

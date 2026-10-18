@@ -91,6 +91,10 @@ func newGroupExecutionEnv(t *testing.T, txParallelism int, payerLamports uint64)
 		VoteTimestamps:  make(map[solana.PublicKey]sealevel.BlockTimestamp),
 		Replay:          true,
 	}
+	slotHashes := sealevel.SysvarSlotHashes{{Slot: block.Slot - 1, Hash: [32]byte{0x61}}}
+	bankSysvars, err := sealevel.NewBankSysvars(block.Slot,
+		&accounts.Account{Key: sealevel.SysvarSlotHashesAddr, Lamports: 1, Data: slotHashes.MustMarshal()})
+	require.NoError(t, err)
 	source := &memBlockSource{mem: durable}
 	exec := &blockExecution{
 		block:          block,
@@ -99,6 +103,7 @@ func newGroupExecutionEnv(t *testing.T, txParallelism int, payerLamports uint64)
 		slotCtx:        slotCtx,
 		parentAccts:    parent,
 		accts:          overlay,
+		bankSysvars:    bankSysvars,
 		ctx:            context.Background(),
 		setReplayStage: func(string) {},
 		seenMessages:   make(map[[32]byte]int),
@@ -327,7 +332,7 @@ func TestStreamingGroupRejectsUnresolvedLookupsBeforeExecution(t *testing.T) {
 		defer env.cleanup()
 		txs := decodeTransactions(t, [][]byte{signedV0TransferViaTableWire(t, 1)})
 		err := env.exec.executeTransactionGroup(txs, nil, false)
-		require.ErrorContains(t, err, "unresolved address tables")
+		require.ErrorIs(t, err, TxErrAddressLookupTableNotFound)
 		require.Zero(t, env.exec.slotCtx.TotalComputeUnitsConsumed)
 	}
 }

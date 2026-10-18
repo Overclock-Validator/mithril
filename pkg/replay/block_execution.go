@@ -390,7 +390,11 @@ func (exec *blockExecution) captureAccountLoader() func() {
 func (exec *blockExecution) loadTransactionAccounts(view *b.Block) error {
 	defer exec.captureAccountLoader()()
 	phaseStart := time.Now()
-	if err := resolveAddrTableLookups(exec.blockSrc, view); err != nil {
+	slotHashes, ok := exec.bankSysvars.SlotHashes()
+	if !ok {
+		return fmt.Errorf("resolve address table lookups at slot %d: bank has no SlotHashes sysvar", view.Slot)
+	}
+	if err := resolveAddrTableLookups(exec.blockSrc, view, slotHashes); err != nil {
 		return fmt.Errorf("resolve address table lookups at slot %d: %w", view.Slot, err)
 	}
 	metrics.GlobalBlockReplay.AccountLoader.AddressTableLookups.AddTimingSince(phaseStart)
