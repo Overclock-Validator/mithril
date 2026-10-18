@@ -280,7 +280,12 @@ func serializeAllEpochStakes() map[uint64][]byte {
 	return result
 }
 
-func resolveAddrTableLookups(accountsDb blockAccountSource, block *b.Block) error {
+// resolveAddrTableLookups resolves the block's lookups in place. Tables are
+// read from the parent state at block.Slot and judged with slotHashes, the
+// SlotHashes of the block's own bank; reading the parent gives the same
+// active addresses the slot's own state would. A lookup that fails to resolve
+// makes the transaction unprocessable and the block invalid.
+func resolveAddrTableLookups(accountsDb blockAccountSource, block *b.Block, slotHashes sealevel.SysvarSlotHashes) error {
 	tables := make(map[solana.PublicKey]solana.PublicKeySlice)
 
 	for _, tx := range block.Transactions {
@@ -292,6 +297,9 @@ func resolveAddrTableLookups(accountsDb blockAccountSource, block *b.Block) erro
 			tables[addrTableKey] = nil
 		}
 	}
+	if len(tables) == 0 {
+		return nil
+	}
 
 	tablesSlice := make([]solana.PublicKey, 0, len(tables))
 	for t := range tables {
@@ -302,26 +310,28 @@ func resolveAddrTableLookups(accountsDb blockAccountSource, block *b.Block) erro
 		return err
 	}
 
-	for i := range tablesSlice {
-		if len(accts[i].Data) == 0 {
-			delete(tables, tablesSlice[i])
+	tableErrs := make(map[solana.PublicKey]*TransactionError)
+	for i, key := range tablesSlice {
+		active, txErr := activeLookupTable(accts[i], block.Slot, slotHashes)
+		if txErr != nil {
+			tableErrs[key] = txErr
 			continue
 		}
-		addrLookupTable, err := sealevel.UnmarshalAddressLookupTable(accts[i].Data)
-		if err != nil {
-			return err
-		}
-		tables[tablesSlice[i]] = addrLookupTable.Addresses
+		tables[key] = active
 	}
 
-txResolveLoop:
-	for _, tx := range block.Transactions {
+	for idx, tx := range block.Transactions {
 		if tx.Message.GetVersion() != solana.MessageVersionV0 || tx.Message.AddressTableLookups.NumLookups() == 0 {
 			continue
 		}
-		for _, addrTableKey := range tx.Message.GetAddressTableLookups().GetTableIDs() {
-			if _, ok := tables[addrTableKey]; !ok {
-				continue txResolveLoop
+		for i := range tx.Message.AddressTableLookups {
+			lookup := &tx.Message.AddressTableLookups[i]
+			txErr := tableErrs[lookup.AccountKey]
+			if txErr == nil {
+				txErr = checkLookupIndexes(tables[lookup.AccountKey], lookup)
+			}
+			if txErr != nil {
+				return fmt.Errorf("resolve address table lookups for transaction %d: %w", idx, txErr.InstructionError)
 			}
 		}
 		err := tx.Message.SetAddressTables(tables)
@@ -571,6 +581,34 @@ func recordSysvarAccountReadStats(dst *metrics.AccountLoader, src accountsdb.Acc
 	}
 }
 
+// blockSlotHashes returns the SlotHashes of the block's bank before its
+// sysvars are installed: the parent's, from the same sources the SlotHashes
+// update below uses, with the parent slot's hash at the front, exactly as
+// that update and PrepareLeaderSlotSysvars derive them.
+func blockSlotHashes(accountsDb blockAccountSource, block *b.Block, parentBankSysvars *sealevel.BankSysvars) (sealevel.SysvarSlotHashes, error) {
+	var slotHashes sealevel.SysvarSlotHashes
+	switch {
+	case parentBankSysvars != nil:
+		parentSlotHashes, ok := parentBankSysvars.SlotHashes()
+		if !ok {
+			return nil, errors.New("SlotHashes sysvar is absent from parent bank snapshot")
+		}
+		slotHashes = append(slotHashes, parentSlotHashes...)
+	case sealevel.SysvarCache.SlotHashes.Sysvar != nil:
+		slotHashes = append(slotHashes, *sealevel.SysvarCache.SlotHashes.Sysvar...)
+	default:
+		acct, err := accountsDb.GetAccount(block.Slot, sealevel.SysvarSlotHashesAddr)
+		if err != nil {
+			return nil, fmt.Errorf("load SlotHashes sysvar: %w", err)
+		}
+		if err := slotHashes.UnmarshalWithDecoder(bin.NewBinDecoder(acct.Data)); err != nil {
+			return nil, fmt.Errorf("decode SlotHashes sysvar: %w", err)
+		}
+	}
+	slotHashes.Update(block.Slot, block.ParentSlot, block.ParentBankhash)
+	return slotHashes, nil
+}
+
 func loadBlockAccountsAndUpdateSysvars(
 	accountsDb blockAccountSource,
 	block *b.Block,
@@ -581,7 +619,11 @@ func loadBlockAccountsAndUpdateSysvars(
 ) (accounts.Accounts, accounts.Accounts, int, *sealevel.BankSysvars, error) {
 	var bankSysvars *sealevel.BankSysvars
 	phaseStart := time.Now()
-	err := resolveAddrTableLookups(accountsDb, block)
+	slotHashes, err := blockSlotHashes(accountsDb, block, parentBankSysvars)
+	if err != nil {
+		return nil, nil, 0, bankSysvars, err
+	}
+	err = resolveAddrTableLookups(accountsDb, block, slotHashes)
 	metrics.GlobalBlockReplay.AccountLoader.AddressTableLookups.AddTimingSince(phaseStart)
 	if err != nil {
 		return nil, nil, 0, bankSysvars, err
@@ -4486,7 +4528,7 @@ func ProcessBlock(
 	accts, parentAccts, accountMapCapacity, bankSysvars, err := loadBlockAccountsAndUpdateSysvars(exec.blockSrc, block, epochSchedule, alpenglowClock, parentBankSysvars, planner)
 	loadAcctsRegion.End()
 	if err != nil {
-		panic(fmt.Sprintf("unable to load slot accounts and update sysvars: %s", err))
+		return nil, fmt.Errorf("load slot accounts and update sysvars at slot %d: %w", block.Slot, err)
 	}
 	if err := bankSysvars.ValidateForExecution(); err != nil {
 		return nil, fmt.Errorf("invalid bank sysvar snapshot at slot %d: %w", block.Slot, err)
