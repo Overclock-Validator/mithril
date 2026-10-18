@@ -265,7 +265,7 @@ func TestWorkingBankAcceptsTransferThatDrainsPayerToZero(t *testing.T) {
 	assert.Equal(t, destBefore.Lamports+transfer, destAfter.Lamports)
 }
 
-func TestWorkingBankDropsTransferThatLeavesPayerBelowRent(t *testing.T) {
+func TestWorkingBankIncludesTransferThatLeavesPayerBelowRentAsFailed(t *testing.T) {
 	env := NewTestEnv(TestEnvConfig{})
 	defer env.Close()
 
@@ -276,14 +276,27 @@ func TestWorkingBankDropsTransferThatLeavesPayerBelowRent(t *testing.T) {
 	destBefore, err := env.SlotCtx.GetAccount(txfixture.DestPubkey())
 	require.NoError(t, err)
 	tx := mustSignedTransfer(t, transfer)
+	// The payer can pay the fee and stay rent exempt, so it passes fee-payer
+	// validation; only the transfer leaves it below rent, which the
+	// post-execution rent-state check reports. That failure is includable.
+	preview := replay.LoadAndExecuteTransaction(replay.LoadAndExecuteTransactionInput{
+		SlotCtx: env.SlotCtx, Transaction: tx, LeanResult: true,
+	})
+	require.NotNil(t, preview.ProcessingResult.TransactionError)
+	require.Equal(t, replay.TransactionErrorInsufficientFundsForRent, preview.ProcessingResult.TransactionError.ErrorType)
+	require.NotNil(t, preview.ExecCtx)
+
 	result, reason := env.Bank.ForgeTransaction(tx, 200)
-	require.Equal(t, ForgeDroppedExecution, result)
+	require.Equal(t, ForgeAccepted, result)
 	require.Equal(t, costmodel.ExceedNone, reason)
 
 	destAfter, err := env.SlotCtx.GetAccount(txfixture.DestPubkey())
 	require.NoError(t, err)
 	assert.Equal(t, destBefore.Lamports, destAfter.Lamports)
-	assert.Empty(t, env.Bank.ForgedTransactions())
+	payerAfter, err := env.SlotCtx.GetAccount(txfixture.PayerPubkey())
+	require.NoError(t, err)
+	assert.Equal(t, transfer+leftover, payerAfter.Lamports, "only the fee is charged")
+	assert.Equal(t, []*solana.Transaction{tx}, env.Bank.ForgedTransactions())
 }
 
 func TestWorkingBankForgesTransfer(t *testing.T) {
