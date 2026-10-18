@@ -26,11 +26,14 @@ type VoteAccount struct {
 	// Nil means an older persisted cache omitted this consensus-critical field.
 	// Legacy vote states explicitly use the scheduled node identity.
 	BlockRevenueCollector *solana.PublicKey
-	LastTimestampTs       int64
-	LastTimestampSlot     uint64
-	Owner                 solana.PublicKey
-	Executable            byte
-	RentEpoch             uint64
+	// Nil means an older checkpoint omitted the historical rate; zero is a
+	// known zero commission and must not fall back to a newer epoch's rate.
+	InflationRewardsCommissionBps *uint16
+	LastTimestampTs               int64
+	LastTimestampSlot             uint64
+	Owner                         solana.PublicKey
+	Executable                    byte
+	RentEpoch                     uint64
 }
 
 // Snapshot is one immutable, atomically published view of an epoch's stake
@@ -179,15 +182,16 @@ type PersistedEpochStakes struct {
 
 // VoteAccountJSON is the JSON-serializable format for vote account metadata.
 type VoteAccountJSON struct {
-	Lamports              uint64 `json:"lamports"`
-	NodePubkey            string `json:"node_pubkey"`
-	BlsPubkeyCompressed   []byte `json:"bls_pubkey_compressed,omitempty"`
-	BlockRevenueCollector string `json:"block_revenue_collector,omitempty"`
-	LastTimestampTs       int64  `json:"last_ts"`
-	LastTimestampSlot     uint64 `json:"last_ts_slot"`
-	Owner                 string `json:"owner"`
-	Executable            byte   `json:"executable"`
-	RentEpoch             uint64 `json:"rent_epoch"`
+	Lamports                      uint64  `json:"lamports"`
+	NodePubkey                    string  `json:"node_pubkey"`
+	BlsPubkeyCompressed           []byte  `json:"bls_pubkey_compressed,omitempty"`
+	BlockRevenueCollector         string  `json:"block_revenue_collector,omitempty"`
+	InflationRewardsCommissionBps *uint16 `json:"inflation_rewards_commission_bps,omitempty"`
+	LastTimestampTs               int64   `json:"last_ts"`
+	LastTimestampSlot             uint64  `json:"last_ts_slot"`
+	Owner                         string  `json:"owner"`
+	Executable                    byte    `json:"executable"`
+	RentEpoch                     uint64  `json:"rent_epoch"`
 }
 
 // SerializeEpoch serializes the stakes for a single epoch to JSON.
@@ -219,15 +223,16 @@ func (cache *EpochStakesCache) SerializeEpoch(epoch uint64) ([]byte, error) {
 				collector = va.BlockRevenueCollector.String()
 			}
 			persisted.VoteAccts[pk.String()] = &VoteAccountJSON{
-				BlockRevenueCollector: collector,
-				Lamports:              va.Lamports,
-				NodePubkey:            va.NodePubkey.String(),
-				BlsPubkeyCompressed:   bls,
-				LastTimestampTs:       va.LastTimestampTs,
-				LastTimestampSlot:     va.LastTimestampSlot,
-				Owner:                 va.Owner.String(),
-				Executable:            va.Executable,
-				RentEpoch:             va.RentEpoch,
+				BlockRevenueCollector:         collector,
+				InflationRewardsCommissionBps: va.InflationRewardsCommissionBps,
+				Lamports:                      va.Lamports,
+				NodePubkey:                    va.NodePubkey.String(),
+				BlsPubkeyCompressed:           bls,
+				LastTimestampTs:               va.LastTimestampTs,
+				LastTimestampSlot:             va.LastTimestampSlot,
+				Owner:                         va.Owner.String(),
+				Executable:                    va.Executable,
+				RentEpoch:                     va.RentEpoch,
 			}
 		}
 	}
@@ -292,15 +297,16 @@ func (cache *EpochStakesCache) DeserializeAndLoadEpoch(data []byte) (uint64, err
 			collector = &key
 		}
 		voteAccounts[pk] = &VoteAccount{
-			BlockRevenueCollector: collector,
-			Lamports:              vaJSON.Lamports,
-			NodePubkey:            nodePubkey,
-			BlsPubkeyCompressed:   bls,
-			LastTimestampTs:       vaJSON.LastTimestampTs,
-			LastTimestampSlot:     vaJSON.LastTimestampSlot,
-			Owner:                 owner,
-			Executable:            vaJSON.Executable,
-			RentEpoch:             vaJSON.RentEpoch,
+			BlockRevenueCollector:         collector,
+			InflationRewardsCommissionBps: vaJSON.InflationRewardsCommissionBps,
+			Lamports:                      vaJSON.Lamports,
+			NodePubkey:                    nodePubkey,
+			BlsPubkeyCompressed:           bls,
+			LastTimestampTs:               vaJSON.LastTimestampTs,
+			LastTimestampSlot:             vaJSON.LastTimestampSlot,
+			Owner:                         owner,
+			Executable:                    vaJSON.Executable,
+			RentEpoch:                     vaJSON.RentEpoch,
 		}
 	}
 
@@ -378,6 +384,10 @@ func cloneVoteAccount(voteAccount *VoteAccount) *VoteAccount {
 		return nil
 	}
 	cloned := *voteAccount
+	if voteAccount.InflationRewardsCommissionBps != nil {
+		commission := *voteAccount.InflationRewardsCommissionBps
+		cloned.InflationRewardsCommissionBps = &commission
+	}
 	if voteAccount.BlockRevenueCollector != nil {
 		collector := *voteAccount.BlockRevenueCollector
 		cloned.BlockRevenueCollector = &collector

@@ -45,6 +45,8 @@ func TestFreshBlockHistoryPreservesSnapshotParentHash(t *testing.T) {
 	first := turbine.BlockFromEntries(parentSlot+4, parentSlot, []turbine.Entry{{Hash: firstHash}})
 	first.Epoch = epoch
 	require.NoError(t, configureInitialBlock(db, first, manifestState, schedule))
+	require.Equal(t, [32]byte(parentHash), first.LastBlockhash, "startup must inherit the snapshot nonce context")
+	executionParentHash := first.LastBlockhash
 	second := &b.Block{Slot: parentSlot + 5, Epoch: epoch, Blockhash: solana.Hash{99}}
 	require.NoError(t, configureBlock(second, &sealevel.SlotCtx{Slot: first.Slot, Epoch: epoch, Blockhash: first.Blockhash}, schedule))
 	require.Equal(t, [32]byte(firstHash), second.LastBlockhash)
@@ -53,7 +55,7 @@ func TestFreshBlockHistoryPreservesSnapshotParentHash(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, store.RecordBlock(blockForHistory(first, parentHash)))
 	require.NoError(t, store.RecordBlock(blockForHistory(second, firstHash)))
-	require.Zero(t, first.LastBlockhash, "history must not alter the execution block's nonce context")
+	require.Equal(t, executionParentHash, first.LastBlockhash, "history must not alter the execution block's nonce context")
 	require.NoError(t, store.Prepare(second.Slot))
 	require.NoError(t, store.SetRooted(second.Slot))
 	reopened, err := blockhistory.Open(dir, 100)

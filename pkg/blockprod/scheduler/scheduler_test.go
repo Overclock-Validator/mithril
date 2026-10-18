@@ -233,6 +233,8 @@ func TestSchedulerSkipsWhenSlotEntryBytesExceeded(t *testing.T) {
 	for sched.Stats().DroppedCost == 0 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
+	// Wait for the drain loop to return any temporarily popped entries.
+	sched.Stop()
 	require.Equal(t, uint64(1), sched.Stats().DroppedCost)
 	require.Equal(t, uint64(1), sched.Stats().DroppedBatchBytes)
 	require.Equal(t, uint64(0), sched.Stats().Accepted)

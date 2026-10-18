@@ -87,17 +87,18 @@ func testStartupAcrossEpochBoundary(t *testing.T, mode string, offset uint64) {
 		require.NoError(t, err)
 		seeds[epoch] = string(data)
 	}
-	parentHash, evictedHash := solana.Hash{1}, solana.Hash{2}
+	parentHash, evictedHash, parentBlockhash := solana.Hash{1}, solana.Hash{2}, solana.Hash{3}
 	ms := &state.MithrilState{
 		ManifestParentSlot: parentSlot, ManifestParentBankhash: parentHash.String(),
 		ManifestEvictedBlockhash: evictedHash.String(), ManifestEpochStakes: seeds,
-		ManifestFeeRateGovernor: &state.ManifestFeeRateGovernorSeed{},
+		ManifestFeeRateGovernor:   &state.ManifestFeeRateGovernorSeed{},
+		ManifestRecentBlockhashes: []state.BlockhashEntry{{Blockhash: parentBlockhash.String()}},
 	}
 	var resume *ResumeState
 	if mode != "snapshot" {
-		recent := sealevel.SysvarRecentBlockhashes{{Blockhash: parentHash}}
+		recent := sealevel.SysvarRecentBlockhashes{{Blockhash: parentBlockhash}}
 		resume = &ResumeState{ParentSlot: parentSlot, ParentBankhash: parentHash[:],
-			RecentBlockhashes: &recent, LastBlockhash: parentHash, EvictedBlockhash: evictedHash}
+			RecentBlockhashes: &recent, LastBlockhash: parentBlockhash, EvictedBlockhash: evictedHash}
 		if mode == "persisted" || mode == "cached" {
 			// A checkpoint whose original snapshot predates its rooted parent.
 			ms.ManifestParentSlot -= 100
@@ -119,12 +120,14 @@ func testStartupAcrossEpochBoundary(t *testing.T, mode string, offset uint64) {
 	parentBankEpoch := initialReplayEpoch(schedule, parentSlot+1, ms.ManifestParentSlot, resume)
 	require.Equal(t, parentEpoch, parentBankEpoch)
 	require.NoError(t, LoadInitialEpochStakesCache(ms, resume, parentBankEpoch, schedule.GetEpoch(ms.ManifestParentSlot)))
-	blk := &b.Block{Slot: parentSlot + 1 + offset, Epoch: enteringEpoch, LastBlockhash: parentHash}
+	blk := &b.Block{Slot: parentSlot + 1 + offset, Epoch: enteringEpoch}
 	if resume == nil {
 		require.NoError(t, configureInitialBlock(db, blk, ms, schedule))
 	} else {
 		require.NoError(t, configureInitialBlockFromResume(db, blk, resume, ms, schedule))
 	}
+	require.Equal(t, [32]byte(parentBlockhash), blk.LastBlockhash)
+	require.Equal(t, [32]byte(parentBlockhash), global.LatestBlockHash())
 	require.Equal(t, voteKey, blk.Leader, "leader preparation must succeed before the epoch transition")
 	require.Equal(t, parentStake, blk.TotalEpochStake, "initial configuration inherits the parent's execution stakes")
 	require.Equal(t, parentStake, blk.EpochStakesPerVoteAcct[voteKey])
