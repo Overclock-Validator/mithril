@@ -203,7 +203,6 @@ func (r ForgeResult) String() string {
 func (b *WorkingBank) Forge(wire []byte) (ForgeResult, costmodel.ExceedReason) {
 	tx, err := solana.TransactionFromBytes(wire)
 	if err != nil {
-		b.RebateSchedule(len(wire))
 		return ForgeDroppedParse, costmodel.ExceedNone
 	}
 	return b.ForgeTransaction(tx, len(wire))
@@ -212,21 +211,28 @@ func (b *WorkingBank) Forge(wire []byte) (ForgeResult, costmodel.ExceedReason) {
 // ForgeTransaction executes and commits a parsed transaction. The caller must
 // keep it immutable: accepted transactions are retained for entry publication.
 func (b *WorkingBank) ForgeTransaction(tx *solana.Transaction, wireSize int) (ForgeResult, costmodel.ExceedReason) {
-	return b.forgeTransaction(tx, wireSize, nil)
+	return b.forgeTransaction(tx, wireSize, nil, EntryReservation{})
 }
 
 // ForgePreparedTransaction reuses static work from owned, immutable TPU bytes.
 // A different bank feature snapshot falls back to the ordinary execution path.
 func (b *WorkingBank) ForgePreparedTransaction(tx *solana.Transaction, wireSize int, prepared *replay.PreparedTransaction) (ForgeResult, costmodel.ExceedReason) {
+	return b.ForgeScheduledTransaction(tx, wireSize, prepared, EntryReservation{})
+}
+
+// ForgeScheduledTransaction forges a transaction whose entry bytes were
+// reserved by PrepareSchedule. It consumes res whatever the result; prepared
+// may be nil.
+func (b *WorkingBank) ForgeScheduledTransaction(tx *solana.Transaction, wireSize int, prepared *replay.PreparedTransaction, res EntryReservation) (ForgeResult, costmodel.ExceedReason) {
 	if b.slotCtx == nil || !b.preparer.Matches(prepared, tx, b.slotCtx.Features) {
 		prepared = nil
 	}
-	return b.forgeTransaction(tx, wireSize, prepared)
+	return b.forgeTransaction(tx, wireSize, prepared, res)
 }
 
-func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, prepared *replay.PreparedTransaction) (ForgeResult, costmodel.ExceedReason) {
+func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, prepared *replay.PreparedTransaction, res EntryReservation) (ForgeResult, costmodel.ExceedReason) {
 	if tx == nil {
-		b.RebateSchedule(wireSize)
+		b.RebateSchedule(res)
 		return ForgeDroppedParse, costmodel.ExceedNone
 	}
 	// Validate the full wire before execution can charge fees or publish
@@ -234,7 +240,7 @@ func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, pre
 	// fallible serialization step after commit, including on the prepared path.
 	serializedSize, err := serializedTransactionSize(tx)
 	if err != nil {
-		b.RebateSchedule(wireSize)
+		b.RebateSchedule(res)
 		return ForgeDroppedParse, costmodel.ExceedNone
 	}
 	var messageHash [32]byte
@@ -244,7 +250,7 @@ func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, pre
 		messageHash, err = replay.TransactionMessageHash(tx)
 	}
 	if err != nil {
-		b.RebateSchedule(wireSize)
+		b.RebateSchedule(res)
 		return ForgeDroppedParse, costmodel.ExceedNone
 	}
 	// A transaction that repeats an account or exceeds the account lock limit
@@ -255,7 +261,7 @@ func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, pre
 		lockFeats = b.slotCtx.Features
 	}
 	if txErr := replay.ValidateAccountLocks(tx, lockFeats); txErr != nil {
-		b.RebateSchedule(wireSize)
+		b.RebateSchedule(res)
 		return ForgeDroppedAccountLocks, costmodel.ExceedNone
 	}
 	ancestorAlreadyProcessed := false
@@ -278,13 +284,13 @@ func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, pre
 			// change, so resolve outside the bank lock.
 			resolved, txErr := replay.ResolveAddressTableLookups(b.slotCtx, tx)
 			if txErr != nil {
-				b.RebateSchedule(wireSize)
+				b.RebateSchedule(res)
 				return ForgeDroppedLookup, costmodel.ExceedNone
 			}
 			// A loaded address can repeat a static key or another loaded
 			// address, or take the account count past the lock limit.
 			if txErr := replay.ValidateAccountLocks(resolved, lockFeats); txErr != nil {
-				b.RebateSchedule(wireSize)
+				b.RebateSchedule(res)
 				return ForgeDroppedAccountLocks, costmodel.ExceedNone
 			}
 			execTx = resolved
@@ -302,7 +308,7 @@ func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, pre
 			cost, err = costmodel.EstimateTransactionCost(execTx, feats)
 		}
 		if err != nil {
-			b.RebateSchedule(wireSize)
+			b.RebateSchedule(res)
 			return ForgeDroppedParse, costmodel.ExceedNone
 		}
 		cost.WireSize = wireSize
@@ -310,12 +316,9 @@ func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, pre
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	included := false
-	defer func() {
-		if !included {
-			b.entries.rebateReserved(wireSize)
-		}
-	}()
+	// The reservation only held budget while the lock was released. The lock
+	// is now held until append, so admission below is checked exactly.
+	b.entries.release(res)
 	if !b.accepting {
 		return ForgeDroppedNoLeader, costmodel.ExceedNone
 	}
@@ -334,7 +337,7 @@ func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, pre
 	if reason := b.costs.WouldExceed(cost); reason != costmodel.ExceedNone {
 		return ForgeDroppedCost, reason
 	}
-	if reason := b.reserveEntryBytesLocked(wireSize); reason != costmodel.ExceedNone {
+	if reason := b.admitEntryBytesLocked(serializedSize); reason != costmodel.ExceedNone {
 		return ForgeDroppedCost, reason
 	}
 	if err := b.preparer.PayerCanFund(b.slotCtx, execTx, prepared); err != nil {
@@ -376,7 +379,6 @@ func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, pre
 		b.entryHash = b.entries.CurrentEntryHash()
 		b.sink.OnEntryBatch(flushed, batchBytes)
 	}
-	included = true
 	return ForgeAccepted, costmodel.ExceedNone
 }
 
@@ -421,32 +423,47 @@ func (b *WorkingBank) ClassifyBuffered(blockhash solana.Hash, messageHash [32]by
 // PrepareSchedule reserves entry bytes at schedule time. If the next
 // transaction would not fit in the current FEC set, the batch is
 // closed and shredded first. If the tx would then exceed the remaining
-// slot entry-byte budget, it is not reserved. A failed/unincludable
-// forge rebates the reservation.
-func (b *WorkingBank) PrepareSchedule(wireSize int) costmodel.ExceedReason {
+// slot entry-byte budget, nothing is reserved. Pass the reservation to
+// ForgeScheduledTransaction, or to RebateSchedule if it is not forged.
+func (b *WorkingBank) PrepareSchedule(wireSize int) (EntryReservation, costmodel.ExceedReason) {
+	return b.PrepareScheduleN([]int{wireSize})
+}
+
+// PrepareScheduleN is PrepareSchedule for transactions forged together, such
+// as a bundle. The reservation covers any split into batches.
+func (b *WorkingBank) PrepareScheduleN(wireSizes []int) (EntryReservation, costmodel.ExceedReason) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if !b.accepting {
-		return costmodel.ExceedNone
+	if !b.accepting || len(wireSizes) == 0 {
+		return EntryReservation{}, costmodel.ExceedNone
 	}
-	return b.reserveEntryBytesLocked(wireSize)
+	if b.entries.wouldOverflowBatch(wireSizes[0]) {
+		b.flushEntriesLocked()
+	}
+	res, ok := b.entries.reserve(wireSizes)
+	if !ok {
+		return EntryReservation{}, costmodel.ExceedBatchBytes
+	}
+	return res, costmodel.ExceedNone
 }
 
 // RebateSchedule releases a schedule-time entry-byte reservation.
-func (b *WorkingBank) RebateSchedule(wireSize int) {
+func (b *WorkingBank) RebateSchedule(res EntryReservation) {
+	if res.bytes == 0 {
+		return
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.entries.rebateReserved(wireSize)
+	b.entries.release(res)
 }
 
-func (b *WorkingBank) reserveEntryBytesLocked(wireSize int) costmodel.ExceedReason {
-	if b.entries.ReservedBytes() > 0 {
-		return costmodel.ExceedNone
-	}
-	if b.entries.wouldOverflowBatch(wireSize) {
+// admitEntryBytesLocked checks the slot entry-byte budget for a transaction
+// appended before the bank lock is released, closing a full batch first.
+func (b *WorkingBank) admitEntryBytesLocked(serializedSize int) costmodel.ExceedReason {
+	if b.entries.wouldOverflowBatch(serializedSize) {
 		b.flushEntriesLocked()
 	}
-	if !b.entries.reserve(wireSize) {
+	if b.entries.wouldExceedSlot(serializedSize) {
 		return costmodel.ExceedBatchBytes
 	}
 	return costmodel.ExceedNone

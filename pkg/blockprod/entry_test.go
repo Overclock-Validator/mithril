@@ -42,11 +42,13 @@ func TestEntryBuilderReservesAndRebatesSlotBytes(t *testing.T) {
 	wire, err := tx.MarshalBinary()
 	require.NoError(t, err)
 
-	require.True(t, builder.reserve(len(wire)))
+	res, ok := builder.reserve([]int{len(wire)})
+	require.True(t, ok)
+	require.Equal(t, entryBatchOverheadBytes+len(wire), res.Bytes())
 	require.Equal(t, entryBatchOverheadBytes+len(wire), builder.SlotBytes())
 	require.Equal(t, builder.SlotBytes(), builder.ReservedBytes())
 
-	builder.rebateReserved(len(wire))
+	builder.release(res)
 	require.Zero(t, builder.SlotBytes())
 	require.Zero(t, builder.ReservedBytes())
 }

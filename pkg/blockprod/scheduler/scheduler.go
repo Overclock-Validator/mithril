@@ -294,7 +294,8 @@ func (s *Scheduler) drainLoop(ctx context.Context) {
 
 		// Close a full FEC set, or refuse, before execute. Slot entry bytes are
 		// a schedule-time budget (shred-safe / SIMD-0525), like Firedancer pack.
-		if reason := bank.PrepareSchedule(e.wireSize); reason != costmodel.ExceedNone {
+		res, reason := bank.PrepareSchedule(e.wireSize)
+		if reason != costmodel.ExceedNone {
 			e.skipGen = s.bankGen
 			s.rebuffer(e)
 			s.recordForge(blockprod.ForgeDroppedCost, reason)
@@ -304,7 +305,7 @@ func (s *Scheduler) drainLoop(ctx context.Context) {
 		// Receive owns the wire and its decoded transaction for the entire queue
 		// lifetime. Execution modifies transaction-local account clones, not
 		// this immutable message, so reuse the decoded transaction across banks.
-		result, reason := bank.ForgePreparedTransaction(e.tx, e.wireSize, e.prepared)
+		result, reason := bank.ForgeScheduledTransaction(e.tx, e.wireSize, e.prepared, res)
 		switch result {
 		case blockprod.ForgeDroppedNoLeader:
 			s.rebuffer(e)

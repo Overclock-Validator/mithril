@@ -12,6 +12,18 @@ import (
 // entry count, num_hashes, hash, and transaction count.
 const entryBatchOverheadBytes = 8 + 8 + 32 + 8
 
+// EntryReservation is slot entry-byte budget held from schedule time, while
+// the bank lock is released, until its transactions are forged or it is
+// rebated. The zero value holds nothing.
+type EntryReservation struct {
+	bytes int
+}
+
+// Bytes is the entry-byte budget the reservation holds.
+func (r EntryReservation) Bytes() int {
+	return r.bytes
+}
+
 // EntryBuilder accumulates forged transactions into Alpenglow-style entry batches.
 type EntryBuilder struct {
 	limits costmodel.Limits
@@ -47,8 +59,8 @@ func (b *EntryBuilder) ReservedBytes() int {
 	return b.reservedBytes
 }
 
-// SlotBytes is flushed entry bytes plus the current pending entry and any
-// in-flight schedule reservation.
+// SlotBytes is flushed entry bytes plus the current pending entry and all
+// outstanding schedule reservations.
 func (b *EntryBuilder) SlotBytes() int {
 	pending := 0
 	if len(b.pendingTxns) > 0 {
@@ -76,25 +88,30 @@ func (b *EntryBuilder) admitBytes(nextWire int) int {
 	return nextWire
 }
 
-func (b *EntryBuilder) reserve(wireSize int) bool {
-	if b.wouldExceedSlot(wireSize) {
-		return false
+// reservationBytes bounds what appending transactions of these sizes can add
+// to the slot however they are split into batches, since each may start one.
+// Holders interleave, so a reservation cannot rely on the current batch.
+func reservationBytes(wireSizes []int) int {
+	n := 0
+	for _, size := range wireSizes {
+		n += entryBatchOverheadBytes + size
 	}
-	b.reservedBytes += b.admitBytes(wireSize)
-	return true
+	return n
 }
 
-func (b *EntryBuilder) rebateReserved(wireSize int) {
-	b.consumeReserved(wireSize)
+func (b *EntryBuilder) reserve(wireSizes []int) (EntryReservation, bool) {
+	n := reservationBytes(wireSizes)
+	if maxEntry := int(b.limits.MaxEntryBytes); maxEntry > 0 && b.SlotBytes()+n > maxEntry {
+		return EntryReservation{}, false
+	}
+	b.reservedBytes += n
+	return EntryReservation{bytes: n}, true
 }
 
-func (b *EntryBuilder) consumeReserved(wireSize int) {
-	n := b.admitBytes(wireSize)
-	if b.reservedBytes < n {
-		b.reservedBytes = 0
-		return
-	}
-	b.reservedBytes -= n
+// release returns a reservation. Freeze and Close drop every reservation, so a
+// holder may release after its bytes are already gone.
+func (b *EntryBuilder) release(r EntryReservation) {
+	b.reservedBytes -= min(r.bytes, b.reservedBytes)
 }
 
 func (b *EntryBuilder) dropReservation() {
@@ -132,7 +149,6 @@ func (b *EntryBuilder) appendSerialized(tx solana.Transaction, wireSize, seriali
 		wireSize = serializedSize
 	}
 
-	b.consumeReserved(wireSize)
 	if b.wouldOverflowBatch(serializedSize) {
 		flushed, batchBytes := b.flushLocked()
 		b.pendingTxns = append(b.pendingTxns[:0], tx)
