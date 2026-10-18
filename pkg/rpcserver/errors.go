@@ -15,7 +15,87 @@ const (
 	rpcCodeSendTransactionPreflightFailure jsonrpc.ErrorCode = -32002
 	// -32016 is Agave's reserved code for MinContextSlotNotReached.
 	rpcCodeMinContextSlotNotReached jsonrpc.ErrorCode = -32016
+	rpcCodeBlockNotAvailable        jsonrpc.ErrorCode = -32004
+	rpcCodeBlockCleanedUp           jsonrpc.ErrorCode = -32001
+	rpcCodeEpochRewardsPeriodActive jsonrpc.ErrorCode = -32017
 )
+
+// EpochRewardHistoryPrunedError identifies requests outside retained history.
+type EpochRewardHistoryPrunedError struct {
+	Message string
+}
+
+func (e *EpochRewardHistoryPrunedError) Error() string {
+	return e.Message
+}
+
+func (e *EpochRewardHistoryPrunedError) ToJSONRPCError() (jsonrpc.JSONRPCError, error) {
+	return jsonrpc.JSONRPCError{Code: rpcCodeBlockCleanedUp, Message: e.Error()}, nil
+}
+
+func (e *EpochRewardHistoryPrunedError) FromJSONRPCError(rpcErr jsonrpc.JSONRPCError) error {
+	if rpcErr.Code != rpcCodeBlockCleanedUp {
+		return fmt.Errorf("unexpected code %d for EpochRewardHistoryPrunedError", rpcErr.Code)
+	}
+	e.Message = rpcErr.Message
+	return nil
+}
+
+// EpochRewardsPeriodActiveError reports the verified reward-distribution progress.
+type EpochRewardsPeriodActiveError struct {
+	Slot                       uint64 `json:"slot"`
+	CurrentBlockHeight         uint64 `json:"currentBlockHeight"`
+	RewardsCompleteBlockHeight uint64 `json:"rewardsCompleteBlockHeight"`
+}
+
+func (e *EpochRewardsPeriodActiveError) Error() string {
+	return fmt.Sprintf("Epoch rewards period still active at slot %d", e.Slot)
+}
+
+func (e *EpochRewardsPeriodActiveError) ToJSONRPCError() (jsonrpc.JSONRPCError, error) {
+	return jsonrpc.JSONRPCError{Code: rpcCodeEpochRewardsPeriodActive, Message: e.Error(), Data: e}, nil
+}
+
+func (e *EpochRewardsPeriodActiveError) FromJSONRPCError(rpcErr jsonrpc.JSONRPCError) error {
+	if rpcErr.Code != rpcCodeEpochRewardsPeriodActive {
+		return fmt.Errorf("unexpected code %d for EpochRewardsPeriodActiveError", rpcErr.Code)
+	}
+	raw, err := json.Marshal(rpcErr.Data)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(raw, e)
+}
+
+var (
+	_ jsonrpc.RPCErrorCodec = (*EpochRewardHistoryPrunedError)(nil)
+	_ jsonrpc.RPCErrorCodec = (*EpochRewardsPeriodActiveError)(nil)
+)
+
+// EpochRewardHistoryUnavailableError distinguishes unknown history from no reward.
+type EpochRewardHistoryUnavailableError struct {
+	Epoch       uint64 `json:"epoch"`
+	ContextSlot uint64 `json:"contextSlot"`
+}
+
+func (e *EpochRewardHistoryUnavailableError) Error() string {
+	return fmt.Sprintf("Epoch reward history is unavailable for epoch %d", e.Epoch)
+}
+
+func (e *EpochRewardHistoryUnavailableError) ToJSONRPCError() (jsonrpc.JSONRPCError, error) {
+	return jsonrpc.JSONRPCError{Code: rpcCodeBlockNotAvailable, Message: e.Error(), Data: e}, nil
+}
+
+func (e *EpochRewardHistoryUnavailableError) FromJSONRPCError(rpcErr jsonrpc.JSONRPCError) error {
+	if rpcErr.Code != rpcCodeBlockNotAvailable {
+		return fmt.Errorf("unexpected code %d for EpochRewardHistoryUnavailableError", rpcErr.Code)
+	}
+	raw, err := json.Marshal(rpcErr.Data)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(raw, e)
+}
 
 type MinContextSlotNotReachedError struct {
 	ContextSlot uint64

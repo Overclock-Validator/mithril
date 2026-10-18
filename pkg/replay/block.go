@@ -51,6 +51,18 @@ type SlotCtxSetter interface {
 	SetSlotCtx(slotCtx *sealevel.SlotCtx)
 }
 
+type epochRewardPublisher interface {
+	RecordEpochRewards(block *b.Block) error
+	PrepareEpochRewards(through uint64) error
+	SetRootedEpochRewardsSlot(slot uint64) error
+	RewindEpochRewards(fromSlot uint64) error
+}
+
+type epochRewardReadPublisher interface {
+	PublishEpochRewards(slot uint64)
+	ResetEpochRewardView()
+}
+
 // BlockFetchOpts contains options for parallel block fetching
 type BlockFetchOpts struct {
 	MaxRPS          int    // Rate limit (requests per second), 0 = use default
@@ -1706,6 +1718,21 @@ func ReplayBlocks(
 ) *ReplayResult {
 	result := &ReplayResult{}
 	alpenglowMode := consensusOpts != nil && consensusOpts.Alpenglow
+	rewardPublisher, _ := rpcServer.(epochRewardPublisher)
+	rewardReadPublisher, _ := rpcServer.(epochRewardReadPublisher)
+	if rewardReadPublisher != nil {
+		rewardReadPublisher.ResetEpochRewardView()
+		defer rewardReadPublisher.ResetEpochRewardView()
+	}
+	rewardStatusPublisher, _ := rpcServer.(interface {
+		RecordEpochRewardStatus(*b.Block, *sealevel.BankSysvars, bool)
+	})
+	if rewardPublisher != nil {
+		if err := rewardPublisher.RewindEpochRewards(startSlot); err != nil {
+			result.Error = fmt.Errorf("rewind epoch rewards from replay slot %d: %w", startSlot, err)
+			return result
+		}
+	}
 	replayFrontier := uint64(0)
 	if startSlot > 0 {
 		replayFrontier = startSlot - 1
@@ -2023,9 +2050,28 @@ func ReplayBlocks(
 			// on the existing fold worker, after releasing the live cache lock.
 			Capture: transactionStatuses.CaptureSnapshotThrough,
 			Install: func(through uint64, payload []byte) (*state.TransactionStatusCheckpointRef, error) {
-				return PrepareTransactionStatusCheckpoint(acctsDbPath, through, payload)
+				ref, err := PrepareTransactionStatusCheckpoint(acctsDbPath, through, payload)
+				if err != nil {
+					return nil, err
+				}
+				if rewardPublisher != nil {
+					if err := rewardPublisher.PrepareEpochRewards(through); err != nil {
+						return nil, fmt.Errorf("prepare epoch rewards: %w", err)
+					}
+				}
+				return ref, nil
 			},
-			AfterCommit: checkpointAfterCommit,
+			AfterCommit: func(ref *state.TransactionStatusCheckpointRef) error {
+				var err error
+				if rewardPublisher != nil {
+					// Forced flushes may commit several chunks before replay applies their results.
+					err = rewardPublisher.SetRootedEpochRewardsSlot(ref.Root)
+				}
+				if checkpointAfterCommit != nil {
+					err = errors.Join(err, checkpointAfterCommit(ref))
+				}
+				return err
+			},
 		}); hookErr != nil {
 			result.Error = fmt.Errorf("configure durable transaction status checkpoints: %w", hookErr)
 			return result
@@ -2093,6 +2139,11 @@ func ReplayBlocks(
 		mithrilState.LastRootedSlot = promotedThrough
 		mithrilState.LastRootedBankhash = rootedCtx.Bankhash
 		mithrilState.LastRootedContext = rootedCtx
+		if rewardPublisher != nil {
+			if err := rewardPublisher.SetRootedEpochRewardsSlot(promotedThrough); err != nil {
+				mlog.Log.Errorf("failed to advance rooted epoch rewards through slot %d: %v", promotedThrough, err)
+			}
+		}
 		if rewardsCompletion.retire(&partitionedRewardsInfo, promotedThrough) {
 			rewardsHoldBelowSlot = 0
 			mlog.Log.Infof("epoch rewards bookkeeping retired through durable slot %d; later fork switches may unwind in memory", promotedThrough)
@@ -2161,6 +2212,11 @@ func ReplayBlocks(
 	// force-folds the trailing partial chunk (epoch-boundary settlement and
 	// shutdown); force=false folds full chunks only.
 	foldRootedPrefix := func(force bool) (halt bool) {
+		defer func() {
+			if halt && rewardReadPublisher != nil {
+				rewardReadPublisher.ResetEpochRewardView()
+			}
+		}()
 		if unrootedTailState == nil {
 			return false
 		}
@@ -2203,13 +2259,9 @@ func ReplayBlocks(
 			verifiedWM = trailingVerifier.VerifiedWatermark()
 		}
 		promoteThrough := safePromoteTarget(lastRootedWatermark, verifierRequired, verifiedWM, replayDivergenceFloor)
-		// Partitioned-rewards window: hold promotion below the boundary block
-		// until the completion bank verifies and is eligible to fold, so a
-		// failed distribution re-runs the boundary and rebuilds its bookkeeping.
-		promoteThrough = rewardsCompletion.limitPromotion(partitionedRewardsInfo, rewardsHoldBelowSlot, promoteThrough)
 		if promoteThrough <= mithrilState.LastRootedSlot {
 			// Operator signal: promotion is fully stalled (verifier lag,
-			// divergence floor, or rewards hold) while finality has run at
+			// or divergence floor) while finality has run at
 			// least a whole fold chunk ahead. Healthy steady state stays 0.
 			if lastRootedWatermark >= mithrilState.LastRootedSlot+uint64(FoldBatchSlots) {
 				promotionHolds++
@@ -2237,9 +2289,22 @@ func ReplayBlocks(
 			mlog.Log.FileOnlyf("alpenglow gate: checked=%d matched=%d no_finality=%d no_local_id=%d",
 				gateStats.checked, gateStats.matched, gateStats.noFinality, gateStats.noLocalID)
 		}
-		// The finality gate can stop before the verified completion bank.
-		promoteThrough = rewardsCompletion.limitPromotion(partitionedRewardsInfo, rewardsHoldBelowSlot, promoteThrough)
+		// Read publication uses the same verified prefix without waiting for disk.
+		// Advisory/disabled verification retains the durable-only read contract.
+		// Select an actual retained bank, not a high-water mark or skipped slot:
+		// finality can end in a skipped prefix before the next epoch's first bank.
+		readThrough, durableThrough := unrootedTailState.rewardPublicationTargets(&rewardsCompletion, partitionedRewardsInfo, rewardsHoldBelowSlot, promoteThrough)
+		if !force && result.Error == nil && alpenglowMode && rewardReadPublisher != nil && (verifierRequired || TrailingVerifierCfg.ValidatorFooterHash) {
+			rewardReadPublisher.PublishEpochRewards(readThrough)
+		}
+		// Only disk checkpoints wait for the whole distribution, so recovery can
+		// replay the boundary and reconstruct its consumed reward spools. Reads
+		// above have already passed execution verification and exact finality.
+		promoteThrough = durableThrough
 		if promoteThrough <= mithrilState.LastRootedSlot {
+			if lastRootedWatermark >= mithrilState.LastRootedSlot+uint64(FoldBatchSlots) {
+				promotionHolds++
+			}
 			return false
 		}
 
@@ -2461,6 +2526,9 @@ func ReplayBlocks(
 	// identical; only the source rewind differs (certified sibling re-fetch vs
 	// retaining an already assembled alternate child).
 	handleAlpenglowSwitch := func(sw *CertifiedSwitch, rewindSource func() bool) bool {
+		if rewardReadPublisher != nil {
+			rewardReadPublisher.ResetEpochRewardView()
+		}
 		windowSwitches++
 		if unrootedTailState == nil || promoter == nil {
 			windowSwitchFallback++
@@ -2519,6 +2587,13 @@ func ReplayBlocks(
 			result.Error = fmt.Errorf("%w: transaction status unwind refused: %v", sw, statusErr)
 			mlog.Log.Warnf("%v", result.Error)
 			return false
+		}
+		if rewardPublisher != nil {
+			if err := rewardPublisher.RewindEpochRewards(sw.Slot); err != nil {
+				result.Error = fmt.Errorf("%w: rewind epoch rewards: %v", sw, err)
+				mlog.Log.Warnf("%v", result.Error)
+				return false
+			}
 		}
 
 		for slot := range alpenglowExecutedBlockIDs {
@@ -3124,7 +3199,12 @@ func ReplayBlocks(
 
 		// post-epoch boundary rewards distribution
 		if partitionedEpochRewardsEnabled && partitionedRewardsInfo != nil && currentSlot >= partitionedRewardsInfo.FirstStakingRewardSlot && partitionedRewardsInfo.NumRewardPartitionsRemaining > 0 {
-			distributedAccts, parentDistributedAccts := distributePartitionedEpochRewardsForSlot(acctsDb, lastSlotCtx, block.EpochUpdatedAccts, replayCtx, partitionedRewardsInfo, currentSlot, block.BlockHeight)
+			distributedAccts, parentDistributedAccts, stakeCommissions := distributePartitionedEpochRewardsForSlot(acctsDb, lastSlotCtx, block.EpochUpdatedAccts, replayCtx, partitionedRewardsInfo, currentSlot, block.BlockHeight)
+			if err := replaceInflationRewardRecords(block, distributedAccts, parentDistributedAccts, rpc.RewardTypeStaking, stakeCommissions); err != nil {
+				result.Error = err
+				mlog.Log.Errorf("%v", err)
+				break
+			}
 			block.EpochUpdatedAccts = append(block.EpochUpdatedAccts, distributedAccts...)
 			block.ParentEpochUpdatedAccts = append(block.ParentEpochUpdatedAccts, parentDistributedAccts...)
 		}
@@ -3171,6 +3251,15 @@ func ReplayBlocks(
 			// Clear any pending stake pubkeys from this failed block
 			global.ClearPendingStakePubkeys()
 			break
+		}
+		if rewardPublisher != nil {
+			if err := rewardPublisher.RecordEpochRewards(block); err != nil {
+				result.Error = fmt.Errorf("record epoch rewards for slot %d: %w", block.Slot, err)
+				break
+			}
+			if rewardStatusPublisher != nil {
+				rewardStatusPublisher.RecordEpochRewardStatus(block, lastSlotCtx.BankSysvars(), partitionedEpochRewardsEnabled)
+			}
 		}
 		// The successful child now owns its derived snapshot. Any later bank uses
 		// lastSlotCtx; the one-shot retained unwind bridge is no longer needed.
@@ -3649,6 +3738,10 @@ func ReplayBlocks(
 			metrics.GlobalBlockReplay = metrics.BlockReplay{}
 		}
 
+	}
+
+	if rewardReadPublisher != nil {
+		rewardReadPublisher.ResetEpochRewardView()
 	}
 
 	// Check if block source stalled (this provides explicit error info)
