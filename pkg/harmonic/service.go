@@ -103,7 +103,7 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 	events := make(chan BlockEvent, blockEventBuffer)
 	s := &Service{
 		cfg:                   cfg,
-		pipeline:              NewBlockPipeline(events, cfg.TxV1Enabled),
+		pipeline:              NewBlockPipeline(events, cfg.TxV1Enabled, cfg.Workers),
 		tpu:                   NewTPUAdvertisement(cfg.Gossip, cfg.LocalTPU),
 		harmonicClientIDAfter: harmonicClientIDAfter,
 		baseClientIDAfter:     baseClientIDAfter,

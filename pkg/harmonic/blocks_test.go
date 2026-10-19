@@ -27,13 +27,16 @@ func blockTx(data []byte, bundleID uint64) *blockpb.Transaction {
 	return &blockpb.Transaction{Transaction: data, BundleId: bundleID}
 }
 
-// collect runs fn and returns every event it emitted.
+// collect runs fn on a pipeline with several workers and returns every event
+// it emitted.
 func collect(t *testing.T, fn func(*BlockPipeline), txV1Enabled func() bool, current uint64) ([]BlockEvent, *BlockPipeline) {
 	t.Helper()
-	events := make(chan BlockEvent, 64)
-	p := NewBlockPipeline(events, txV1Enabled)
+	events := make(chan BlockEvent, 4096)
+	p := NewBlockPipeline(events, txV1Enabled, 4)
 	p.SetCurrentSlot(current)
 	fn(p)
+	require.Eventually(t, func() bool { return !p.InFlight() }, 2*time.Second, time.Millisecond, "messages still in the pipeline")
+	p.Close()
 	close(events)
 	var out []BlockEvent
 	for e := range events {
@@ -171,7 +174,8 @@ func TestBlockPipelineAcceptsWhatIngestMustNotReject(t *testing.T) {
 
 func TestBlockPipelineBlocksRatherThanDrops(t *testing.T) {
 	events := make(chan BlockEvent)
-	p := NewBlockPipeline(events, nil)
+	p := NewBlockPipeline(events, nil, 4)
+	t.Cleanup(p.Close)
 	p.SetCurrentSlot(10)
 	done := make(chan struct{})
 	go func() {
@@ -193,7 +197,8 @@ func TestBlockPipelineBlocksRatherThanDrops(t *testing.T) {
 func TestBlockEngineSessionFeedsThePipeline(t *testing.T) {
 	h := newBlockEngineHarness(t, time.Hour)
 	events := make(chan BlockEvent, 16)
-	pipeline := NewBlockPipeline(events, nil)
+	pipeline := NewBlockPipeline(events, nil, 4)
+	t.Cleanup(pipeline.Close)
 	h.session.cfg.Blocks = pipeline
 	h.start()
 	eventually(t, h.session.Healthy, "healthy")
@@ -224,4 +229,37 @@ func TestBlockEngineSessionFeedsThePipeline(t *testing.T) {
 	h.be.blocks <- blockMsg(50, blockTx(wireTx(4), 0))
 	eventually(t, func() bool { return pipeline.Stats().LostSlot == 1 }, "the lost slot stays discarded after reconnecting")
 	assert.Empty(t, events)
+}
+
+// Messages are parsed and verified in parallel, but their bundles come out in
+// exact stream order, numbered consecutively, with a loss reported after
+// everything received before it.
+func TestBlockPipelineKeepsStreamOrder(t *testing.T) {
+	const messages = 300
+	var want []solana.Signature
+	events, _ := collect(t, func(p *BlockPipeline) {
+		n := uint64(0)
+		for m := range messages {
+			// Varying sizes make workers finish out of order.
+			var txs []*blockpb.Transaction
+			for range 1 + m%7 {
+				n++
+				wire := wireTx(n)
+				txs = append(txs, blockTx(wire, 0))
+				want = append(want, solana.SignatureFromBytes(wire[1:65]))
+			}
+			p.HandleBlock(blockMsg(10, txs...), time.Now())
+		}
+		p.StreamLost(10)
+		p.HandleBlock(blockMsg(10, blockTx(wireTx(n+1), 0)), time.Now())
+	}, nil, 10)
+
+	require.Len(t, events, len(want)+1)
+	for i, sig := range want {
+		bundle, ok := events[i].(BundleEvent)
+		require.Truef(t, ok, "event %d is %#v", i, events[i])
+		assert.Equal(t, uint64(i+1), bundle.Seq)
+		assert.Equal(t, sig, bundle.Transactions[0].Signatures[0], "bundle %d", i+1)
+	}
+	assert.Equal(t, StreamLostEvent{Slot: 10}, events[len(want)], "the loss follows everything received before it")
 }
