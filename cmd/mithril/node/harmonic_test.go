@@ -106,18 +106,21 @@ func TestHarmonicSettings(t *testing.T) {
 	assert.Equal(t, blockenginepb.SchedulingStrategy_SCHEDULING_STRATEGY_FBA, s.strategy)
 	assert.Equal(t, "8F4jGUmxF36vQ6yabnsxX6AQVXdKBhs8kGSUuRKSg8Xt", s.tips.MerkleRootUploadAuthority.String())
 	assert.Zero(t, s.tips.CommissionBps)
+	assert.Equal(t, 8, s.workers, "eight workers by default")
 
 	s, err = loadHarmonicTOML(t, enabledHarmonic(map[string]string{
 		"relayer_url":     `"http://relayer.example.com:11226"`,
 		"tls_cert_verify": "false",
 		"strategy":        `"MREV"`,
 		"commission_bps":  "800",
+		"num_workers":     "4",
 	}))
 	require.NoError(t, err)
 	assert.Equal(t, "relayer.example.com:11226", s.relayer.Target)
 	assert.True(t, s.insecureSkipVerify)
 	assert.Equal(t, blockenginepb.SchedulingStrategy_SCHEDULING_STRATEGY_MREV, s.strategy)
 	assert.Equal(t, uint16(800), s.tips.CommissionBps)
+	assert.Equal(t, 4, s.workers)
 
 	for name, bad := range map[string]map[string]string{
 		"no block engine url":  {"block_engine_url": `""`},
@@ -128,6 +131,8 @@ func TestHarmonicSettings(t *testing.T) {
 		"bad authority":        {"merkle_root_upload_authority": `"not base58"`},
 		"commission over 100%": {"commission_bps": "10001"},
 		"negative commission":  {"commission_bps": "-1"},
+		"no workers":           {"num_workers": "0"},
+		"too many workers":     {"num_workers": "65"},
 	} {
 		_, err := loadHarmonicTOML(t, enabledHarmonic(bad))
 		assert.Errorf(t, err, "%s", name)
@@ -150,6 +155,7 @@ func TestHarmonicFlagsOverrideTheConfigFile(t *testing.T) {
 		"harmonic-tip-distribution-program":     "4R3gSG8BpU4t19KYj8CfnbtRpnT8gtk4dvTHxVRwc2r7",
 		"harmonic-merkle-root-upload-authority": "8F4jGUmxF36vQ6yabnsxX6AQVXdKBhs8kGSUuRKSg8Xt",
 		"harmonic-commission-bps":               "500",
+		"harmonic-num-workers":                  "2",
 	})
 	require.NoError(t, err)
 	assert.True(t, s.enabled)
@@ -163,6 +169,7 @@ func TestHarmonicFlagsOverrideTheConfigFile(t *testing.T) {
 	assert.Equal(t, "4R3gSG8BpU4t19KYj8CfnbtRpnT8gtk4dvTHxVRwc2r7", s.tips.TipDistributionProgram.String())
 	assert.Equal(t, "8F4jGUmxF36vQ6yabnsxX6AQVXdKBhs8kGSUuRKSg8Xt", s.tips.MerkleRootUploadAuthority.String())
 	assert.Equal(t, uint16(500), s.tips.CommissionBps)
+	assert.Equal(t, 2, s.workers)
 
 	// A flag beats the config file, including an explicit false.
 	s, err = loadHarmonic(t, enabledHarmonic(map[string]string{"strategy": `"mrev"`}), map[string]string{"harmonic-strategy": "fba"})

@@ -70,9 +70,10 @@ func TestReportSlotExportsTheSlot(t *testing.T) {
 	revertedBundles := metricDelta(t, "harmonic_slot_bundles_total", "result", "reverted")
 	cranks := metricDelta(t, "harmonic_tip_cranks_total", "result", "landed")
 	arrivals := metricDelta(t, "harmonic_first_bundle_delay_seconds")
+	parallel := metricDelta(t, "harmonic_slot_max_parallel")
 
 	reportSlot(SlotReport{Mode: ModeHarmonic, Flags: FlagReverted | FlagTimeout, Executed: 3, Reverted: 1,
-		Crank: CrankLanded, Arrived: true, FirstArrival: 30 * time.Millisecond})
+		Crank: CrankLanded, Arrived: true, FirstArrival: 30 * time.Millisecond, MaxParallel: 3})
 	assert.Equal(t, 1.0, slots())
 	assert.Equal(t, 1.0, reverted())
 	assert.Equal(t, 1.0, timeout())
@@ -81,6 +82,7 @@ func TestReportSlotExportsTheSlot(t *testing.T) {
 	assert.Equal(t, 1.0, revertedBundles())
 	assert.Equal(t, 1.0, cranks())
 	assert.Equal(t, 1.0, arrivals())
+	assert.Equal(t, 1.0, parallel())
 
 	// A slot that fell back before any bundle has no crank or arrival.
 	reportSlot(SlotReport{Mode: ModeFallback, Flags: FlagUnavailable})

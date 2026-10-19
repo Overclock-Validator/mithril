@@ -107,4 +107,7 @@ func reportSlot(r SlotReport) {
 	if r.Arrived {
 		_ = statsd.Duration(statsd.HarmonicFirstBundleDelay, r.FirstArrival, nil)
 	}
+	if r.MaxParallel > 0 {
+		_ = statsd.Timing(statsd.HarmonicSlotMaxParallel, uint64(r.MaxParallel), nil)
+	}
 }

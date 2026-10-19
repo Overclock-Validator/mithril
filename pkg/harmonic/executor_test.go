@@ -82,15 +82,19 @@ type executorHarness struct {
 
 func startExecutor(t *testing.T, healthy bool, crank CrankBuilder) *executorHarness {
 	t.Helper()
+	return startExecutorWith(t, ExecutorConfig{Crank: crank}, healthy, nil)
+}
+
+// startExecutorWith runs an executor configured by cfg, with the harness's
+// fakes. beforeExecute, if set, runs on a worker before each bundle executes.
+func startExecutorWith(t *testing.T, cfg ExecutorConfig, healthy bool, beforeExecute func(seq uint64)) *executorHarness {
+	t.Helper()
 	be := &fakeBlockEngine{healthy: healthy}
 	h := &executorHarness{be: be, pipeline: &fakePipeline{be: be}, events: make(chan BlockEvent), reports: make(chan SlotReport, 4)}
-	h.exec = NewExecutor(ExecutorConfig{
-		BlockEngine: be,
-		Pipeline:    h.pipeline,
-		Events:      h.events,
-		Crank:       crank,
-		OnReport:    func(r SlotReport) { h.reports <- r },
-	})
+	cfg.BlockEngine, cfg.Pipeline, cfg.Events = be, h.pipeline, h.events
+	cfg.OnReport = func(r SlotReport) { h.reports <- r }
+	h.exec = NewExecutor(cfg)
+	h.exec.beforeExecute = beforeExecute
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -126,10 +130,12 @@ func (h *executorHarness) send(t *testing.T, e BlockEvent) {
 	}
 }
 
-// sync waits until the executor has handled everything sent so far.
+// sync waits until the executor has handled everything sent so far,
+// including the bundles its workers execute.
 func (h *executorHarness) sync(t *testing.T) {
 	t.Helper()
 	h.send(t, StreamLostEvent{Slot: 1 << 63})
+	require.Eventually(t, func() bool { return h.exec.pending.Load() == 0 }, 2*time.Second, time.Millisecond, "bundles still executing")
 }
 
 func (h *executorHarness) end(t *testing.T, slot uint64) SlotReport {
@@ -273,6 +279,7 @@ func TestExecutorStopTriggers(t *testing.T) {
 			for _, e := range tc.events(t) {
 				h.send(t, e)
 			}
+			h.sync(t)
 			later := transfer(t, 4)
 			h.send(t, bundleEvent(10, 99, false, later))
 			h.sync(t)

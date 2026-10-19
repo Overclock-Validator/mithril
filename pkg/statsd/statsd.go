@@ -167,6 +167,8 @@ var (
 	HarmonicSlotEndFlags             = Metric{"harmonic_slot_end_flags_total"}
 	HarmonicSlotBundles              = Metric{"harmonic_slot_bundles_total"}
 	HarmonicTipCranks                = Metric{"harmonic_tip_cranks_total"}
+	// HarmonicSlotMaxParallel is the most block bundles a slot executed at once.
+	HarmonicSlotMaxParallel = Metric{"harmonic_slot_max_parallel"}
 	// HarmonicFirstBundleDelay is when a leader slot's first block bundle
 	// arrived, after the bank opened, against the threshold at mid-slot.
 	HarmonicFirstBundleDelay = Metric{"harmonic_first_bundle_delay_seconds"}
@@ -316,6 +318,7 @@ var MetricToType = map[Metric]metricType{
 	HarmonicSlotEndFlags:             CountT,
 	HarmonicSlotBundles:              CountT,
 	HarmonicTipCranks:                CountT,
+	HarmonicSlotMaxParallel:          TimingT,
 	HarmonicFirstBundleDelay:         TimingT,
 
 	TestCount: CountT,
@@ -455,6 +458,7 @@ var MetricToLabels = map[Metric][]string{
 	HarmonicSlotEndFlags:             {"flag"},
 	HarmonicSlotBundles:              {"result"},
 	HarmonicTipCranks:                {"result"},
+	HarmonicSlotMaxParallel:          {},
 	HarmonicFirstBundleDelay:         {},
 
 	SnapshotWorkerPoolUtilization: {"task"},
@@ -515,6 +519,7 @@ var MetricToBuckets = map[Metric][]float64{
 	TxFailedNoncePublication:                    turbinePipelineDurationBuckets,
 	HarmonicLeaderNoticeRTT:                     blockProductionDurationBuckets,
 	HarmonicFirstBundleDelay:                    blockProductionDurationBuckets,
+	HarmonicSlotMaxParallel:                     {1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64},
 }
 
 type Prometheusmetrics struct {

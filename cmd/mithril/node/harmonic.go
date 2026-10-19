@@ -22,6 +22,7 @@ type harmonicSettings struct {
 	relayer            harmonic.Endpoint
 	insecureSkipVerify bool
 	strategy           blockenginepb.SchedulingStrategy
+	workers            int
 	// tips lacks the vote account and identity, which come from [validator].
 	tips harmonic.TipConfig
 }
@@ -39,6 +40,7 @@ func registerHarmonicFlags(flags *pflag.FlagSet) {
 	flags.String("harmonic-tip-distribution-program", "", "Tip distribution program")
 	flags.String("harmonic-merkle-root-upload-authority", "", "Merkle root upload authority for tip distribution accounts")
 	flags.Int64("harmonic-commission-bps", 0, "Validator commission on tips, in basis points (0-10000)")
+	flags.Int64("harmonic-num-workers", 8, "Threads executing block bundles that do not conflict in parallel")
 }
 
 // optionGetters resolve an option from its CLI flag when set, else from the
@@ -91,6 +93,11 @@ func loadHarmonicSettings(get optionGetters) (harmonicSettings, error) {
 		return s, fmt.Errorf("harmonic.commission_bps must be between 0 and 10000, got %d", bps)
 	}
 	s.tips.CommissionBps = uint16(bps)
+	workers := get.getInt64("harmonic-num-workers", "harmonic.num_workers")
+	if workers < 1 || workers > 64 {
+		return s, fmt.Errorf("harmonic.num_workers must be between 1 and 64, got %d", workers)
+	}
+	s.workers = int(workers)
 	return s, nil
 }
 
@@ -113,6 +120,7 @@ func startHarmonic(ctx context.Context, s harmonicSettings, identity ed25519.Pri
 		Gossip:             gossipClient,
 		LocalTPU:           localTPU,
 		TxV1Enabled:        txV1Enabled,
+		Workers:            s.workers,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -127,7 +135,7 @@ func startHarmonic(ctx context.Context, s harmonicSettings, identity ed25519.Pri
 	if s.relayer.Target != "" {
 		relayer = s.relayer.Target
 	}
-	mlog.Log.Infof("Harmonic enabled: block engine %s, relayer %s, strategy %s", s.blockEngine.Target, relayer, s.strategy)
+	mlog.Log.Infof("Harmonic enabled: block engine %s, relayer %s, strategy %s, workers %d", s.blockEngine.Target, relayer, s.strategy, s.workers)
 	return service.Hooks(), func() {
 		cancel()
 		<-done

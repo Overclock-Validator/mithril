@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/costmodel"
 	"github.com/Overclock-Validator/mithril/pkg/replay"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
@@ -36,30 +35,16 @@ type BundleResult struct {
 	Err error
 }
 
-// ForgeBundle forges a bundle all or nothing. Transactions execute in order
-// against a scratch view of the bank, each seeing the writes of the ones
-// before it, and are only applied once all have succeeded. Any failure,
-// including a fees-only failure, discards the whole bundle.
+// ForgeBundle forges a bundle all or nothing, under the bank lock throughout.
+// Transactions execute in order against a scratch view of the bank, each
+// seeing the writes of the ones before it, and are only applied once all have
+// succeeded. Any failure, including a fees-only failure, discards the whole
+// bundle.
 func (b *WorkingBank) ForgeBundle(in BundleInput) BundleResult {
-	txs := in.Transactions
-	if len(txs) == 0 {
+	p, prepared := b.PrepareBundle(in.Transactions, true)
+	if prepared.Result != ForgeAccepted {
 		b.RebateSchedule(in.Reservation)
-		return BundleResult{Result: ForgeDroppedParse, Index: -1}
-	}
-	candidates := make([]forgeCandidate, len(txs))
-	seen := make(map[[32]byte]struct{}, len(txs))
-	for idx, tx := range txs {
-		c, result := b.prepareForge(tx, 0, nil)
-		if result != ForgeAccepted {
-			b.RebateSchedule(in.Reservation)
-			return BundleResult{Result: result, Index: idx}
-		}
-		if _, dup := seen[c.messageHash]; dup {
-			b.RebateSchedule(in.Reservation)
-			return BundleResult{Result: ForgeDroppedAlreadyProcessed, Index: idx}
-		}
-		seen[c.messageHash] = struct{}{}
-		candidates[idx] = c
+		return prepared
 	}
 
 	b.mu.Lock()
@@ -69,9 +54,9 @@ func (b *WorkingBank) ForgeBundle(in BundleInput) BundleResult {
 	if !b.accepting {
 		return BundleResult{Result: ForgeDroppedNoLeader, Index: -1}
 	}
-	requested := make([]costmodel.TransactionCost, len(candidates))
-	sizes := make([]int, len(candidates))
-	for idx, c := range candidates {
+	requested := make([]costmodel.TransactionCost, len(p.candidates))
+	sizes := make([]int, len(p.candidates))
+	for idx, c := range p.candidates {
 		if result := b.statusLocked(c); result != ForgeAccepted {
 			return BundleResult{Result: result, Index: idx}
 		}
@@ -94,36 +79,12 @@ func (b *WorkingBank) ForgeBundle(in BundleInput) BundleResult {
 	committed := false
 	defer func() {
 		if !committed {
-			b.evictProgramCacheAdds(scratch)
+			evictProgramCacheAdds(scratch)
 		}
 	}()
-	outputs := make([]replay.LoadAndExecuteTransactionOutput, len(txs))
-	actual := make([]costmodel.TransactionCost, len(txs))
-	for idx, c := range candidates {
-		if err := b.preparer.PayerCanFund(scratch, c.execTx, nil); err != nil {
-			return BundleResult{Result: ForgeDroppedExecution, Index: idx, Err: err}
-		}
-		// Every output must outlive the next execution, so none may use the
-		// bank's per-transaction arena.
-		output := b.preparer.LoadAndExecute(replay.LoadAndExecuteTransactionInput{
-			SlotCtx:           scratch,
-			Transaction:       c.execTx,
-			LeanResult:        true,
-			SkipTimingMetrics: true,
-		}, nil)
-		if txErr := output.ProcessingResult.TransactionError; txErr != nil {
-			return BundleResult{Result: ForgeDroppedExecution, Index: idx, Err: transactionErr(txErr)}
-		}
-		if output.ExecCtx == nil {
-			return BundleResult{Result: ForgeDroppedExecution, Index: idx, Err: errors.New("missing execution context")}
-		}
-		txAccounts := &output.ExecCtx.TransactionContext.Accounts
-		if err := accounts.SetTransactionAccounts(scratch.Accounts, txAccounts.Accounts, txAccounts.Touched); err != nil {
-			return BundleResult{Result: ForgeDroppedExecution, Index: idx, Err: err}
-		}
-		execCU, loadedCost := actualExecutionUsage(output)
-		actual[idx] = candidates[idx].cost.WithActualUsage(execCU, loadedCost)
-		outputs[idx] = output
+	outputs, actual, result := b.executeBundleOn(scratch, p.candidates)
+	if result.Result != ForgeAccepted {
+		return result
 	}
 	if in.AdmitOnActual {
 		if reason := b.costs.WouldExceedAll(actual); reason != costmodel.ExceedNone {
@@ -134,31 +95,14 @@ func (b *WorkingBank) ForgeBundle(in BundleInput) BundleResult {
 		return BundleResult{Result: ForgeDroppedExecution, Index: -1, Err: err}
 	}
 	committed = true
-
-	if b.seenMessages == nil {
-		b.seenMessages = make(map[[32]byte]struct{})
-	}
-	for idx, tx := range txs {
-		b.seenMessages[candidates[idx].messageHash] = struct{}{}
-		if outputs[idx].FeeInfo != nil {
-			b.txFees.Add(outputs[idx].FeeInfo)
-		}
-		b.forgedTxs = append(b.forgedTxs, tx)
-		b.numSigs += uint64(tx.Message.Header.NumRequiredSignatures)
-		// Equivalent to recording the requested cost and rebating it.
-		b.costs.Record(actual[idx])
-		if flushed, batchBytes, didFlush := b.entries.appendSerialized(*tx, sizes[idx], sizes[idx]); didFlush {
-			b.entryHash = b.entries.CurrentEntryHash()
-			b.sink.OnEntryBatch(flushed, batchBytes)
-		}
-	}
+	b.recordForgedLocked(in.Transactions, p.candidates, outputs, actual)
 	return BundleResult{Result: ForgeAccepted, Index: -1}
 }
 
 // evictProgramCacheAdds drops programs a discarded scratch execution loaded
 // into the shared program cache. Eviction only forces a reload from account
 // data, so it is always safe.
-func (b *WorkingBank) evictProgramCacheAdds(scratch *sealevel.SlotCtx) {
+func evictProgramCacheAdds(scratch *sealevel.SlotCtx) {
 	for _, key := range scratch.TakeProgramCacheAdds() {
 		if scratch.AccountsDb != nil {
 			scratch.AccountsDb.RemoveProgramFromCache(key)

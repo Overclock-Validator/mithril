@@ -100,7 +100,9 @@ type SlotReport struct {
 	// Executed counts bundles that landed; Reverted, the ones that executed
 	// and landed nothing; Rejected, bundles refused without executing.
 	Executed, Reverted, Rejected uint64
-	Crank                        CrankResult
+	// MaxParallel is the most bundles that executed at once.
+	MaxParallel int
+	Crank       CrankResult
 	// FirstArrival is how long after the bank opened the slot's first block
 	// bundle arrived, admitted or not, if Arrived.
 	FirstArrival time.Duration
@@ -139,6 +141,9 @@ type ExecutorConfig struct {
 	Crank CrankBuilder
 	// OnReport, if set, receives each slot's report.
 	OnReport func(SlotReport)
+	// Workers execute block bundles that do not conflict in parallel. Zero
+	// means one.
+	Workers int
 }
 
 type hookMessage struct {
@@ -163,6 +168,15 @@ type slotState struct {
 	crankDone      bool
 	report         SlotReport
 	thresholdTimer *time.Timer
+
+	sched schedule
+	// running counts bundles executing. After a fallback the TPU opens only
+	// once none are, since they keep their account locks until they finish.
+	running    int
+	tpuOnDrain bool
+	// outstanding counts admitted bundles that have not finished; the leader
+	// loop reads it.
+	outstanding atomic.Int64
 }
 
 // Executor runs each leader slot's Harmonic block: it announces the slot,
@@ -177,9 +191,20 @@ type Executor struct {
 	hooks   []hookMessage
 	wake    chan struct{}
 
-	// running is the slot whose block is executing, or 0. The leader loop
+	workers int
+	work    chan *bundleNode
+	done    chan *bundleNode
+	// busy counts bundles handed to workers and not yet back.
+	busy int
+	// beforeExecute, if set, runs on the worker before each bundle executes.
+	// Tests use it to hold workers.
+	beforeExecute func(seq uint64)
+	// pending counts admitted bundles of any slot that have not finished.
+	pending atomic.Int64
+
+	// holding is the slot whose block is running, or nil. The leader loop
 	// holds that slot open while block bundles remain.
-	running  atomic.Uint64
+	holding  atomic.Pointer[slotState]
 	released chan struct{}
 }
 
@@ -189,16 +214,25 @@ var (
 )
 
 func NewExecutor(cfg ExecutorConfig) *Executor {
-	return &Executor{cfg: cfg, now: time.Now, wake: make(chan struct{}, 1), released: make(chan struct{}, 1)}
+	workers := max(cfg.Workers, 1)
+	return &Executor{
+		cfg:      cfg,
+		now:      time.Now,
+		wake:     make(chan struct{}, 1),
+		workers:  workers,
+		work:     make(chan *bundleNode, workers),
+		done:     make(chan *bundleNode, workers),
+		released: make(chan struct{}, 1),
+	}
 }
 
 // HoldSlot keeps a running block's slot open while any block bundle received
-// for it has yet to execute: the slot ends once it is past its end and the
-// buffer is empty. It runs on the leader loop's goroutine. A bundle already
-// executing when it returns false still lands, since freezing the bank waits
-// for it.
+// for it has yet to finish: the slot ends once it is past its end and the
+// buffer is empty. It runs on the leader loop's goroutine.
 func (x *Executor) HoldSlot(slot uint64) bool {
-	return x.running.Load() == slot && (len(x.cfg.Events) > 0 || x.cfg.Pipeline.InFlight())
+	st := x.holding.Load()
+	return st != nil && st.slot == slot &&
+		(len(x.cfg.Events) > 0 || x.cfg.Pipeline.InFlight() || st.outstanding.Load() > 0)
 }
 
 // Released is signaled when the running block's slot may end.
@@ -215,15 +249,15 @@ func (x *Executor) signalRelease() {
 
 // endHold stops holding st's slot open.
 func (x *Executor) endHold(st *slotState) {
-	if x.running.CompareAndSwap(st.slot, 0) {
+	if x.holding.CompareAndSwap(st, nil) {
 		x.signalRelease()
 	}
 }
 
 // releaseIfDrained lets the leader loop end a running block's slot as soon as
-// it is past its end and every block bundle received has executed.
+// it is past its end and every block bundle received has finished.
 func (x *Executor) releaseIfDrained(st *slotState) {
-	if st != nil && x.running.Load() == st.slot && !x.now().Before(st.end) && !x.HoldSlot(st.slot) {
+	if st != nil && x.holding.Load() == st && !x.now().Before(st.end) && !x.HoldSlot(st.slot) {
 		x.signalRelease()
 	}
 }
@@ -286,8 +320,12 @@ func (x *Executor) post(msg hookMessage) {
 	}
 }
 
-// Run processes slots and block events until ctx ends.
+// Run processes slots and block events until ctx ends. Bundles execute on
+// worker goroutines; everything else, including commits, happens here.
 func (x *Executor) Run(ctx context.Context) {
+	for range x.workers {
+		go x.worker(ctx)
+	}
 	var st *slotState
 	for {
 		select {
@@ -301,6 +339,29 @@ func (x *Executor) Run(ctx context.Context) {
 			st = x.drainHooks(st)
 			x.handleEvent(st, e)
 			x.releaseIfDrained(st)
+		case n := <-x.done:
+			st = x.drainHooks(st)
+			x.complete(n)
+			x.releaseIfDrained(st)
+		}
+	}
+}
+
+func (x *Executor) worker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case n := <-x.work:
+			if x.beforeExecute != nil {
+				x.beforeExecute(n.seq)
+			}
+			n.executed = n.st.bank.ExecuteBundle(n.prepared)
+			select {
+			case x.done <- n:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}
 }
@@ -356,13 +417,14 @@ func (x *Executor) finish(st *slotState, reason string, aborted bool) {
 		st.thresholdTimer.Stop()
 	}
 	x.endHold(st)
+	x.dropPending(st)
 	st.report.Mode = st.mode
 	st.report.Aborted = aborted
 	st.report.Reason = reason
 	st.mode = ModeDone
 	r := st.report
-	mlog.Log.Infof("Harmonic slot %d: mode=%s flags=%s executed=%d reverted=%d rejected=%d crank=%s aborted=%t%s",
-		r.Slot, r.Mode, r.Flags, r.Executed, r.Reverted, r.Rejected, r.Crank, r.Aborted, reasonSuffix(r.Reason))
+	mlog.Log.Infof("Harmonic slot %d: mode=%s flags=%s executed=%d reverted=%d rejected=%d parallel=%d crank=%s aborted=%t%s",
+		r.Slot, r.Mode, r.Flags, r.Executed, r.Reverted, r.Rejected, r.MaxParallel, r.Crank, r.Aborted, reasonSuffix(r.Reason))
 	if x.cfg.OnReport != nil {
 		x.cfg.OnReport(r)
 	}
@@ -392,7 +454,7 @@ func (x *Executor) handleEvent(st *slotState, e BlockEvent) {
 		if !x.admits(st, e.Slot, e.Seq) {
 			return
 		}
-		x.executeBundle(st, e)
+		x.admitBundle(st, e)
 	}
 }
 
@@ -424,7 +486,9 @@ func (x *Executor) admits(st *slotState, slot, seq uint64) bool {
 	return true
 }
 
-func (x *Executor) executeBundle(st *slotState, e BundleEvent) {
+// admitBundle schedules a block bundle. The slot's first one waits for the
+// tip crank, which lands before any block bundle executes.
+func (x *Executor) admitBundle(st *slotState, e BundleEvent) {
 	if st.mode == ModeUndecided && !x.now().Before(st.threshold) {
 		st.report.Rejected++
 		x.fallback(st, FlagTimeout)
@@ -436,30 +500,98 @@ func (x *Executor) executeBundle(st *slotState, e BundleEvent) {
 			return
 		}
 		st.mode = ModeHarmonic
-		x.running.Store(st.slot)
+		x.holding.Store(st)
 	}
+	prepared, result := st.bank.PrepareBundle(e.Transactions, e.RevertProtected)
+	if result.Result != blockprod.ForgeAccepted {
+		// It cannot execute: unparsable, already processed, breaking the
+		// account lock rules, or with lookups that do not resolve.
+		st.report.Rejected++
+		x.stop(st, FlagFailed)
+		return
+	}
+	st.outstanding.Add(1)
+	x.pending.Add(1)
+	st.sched.add(&bundleNode{st: st, seq: e.Seq, prepared: prepared}, prepared.Accounts)
+	x.dispatch(st)
+}
 
-	var result blockprod.ForgeResult
-	if e.RevertProtected {
-		result = st.bank.ForgeBundle(blockprod.BundleInput{Transactions: e.Transactions, AdmitOnActual: true}).Result
-	} else {
-		result, _ = st.bank.ForgeStandaloneTransaction(e.Transactions[0], 0)
+// dispatch hands ready bundles to idle workers.
+func (x *Executor) dispatch(st *slotState) {
+	for !st.stopped && x.busy < x.workers {
+		n := st.sched.next()
+		if n == nil {
+			return
+		}
+		x.busy++
+		st.running++
+		st.report.MaxParallel = max(st.report.MaxParallel, st.running)
+		x.work <- n
 	}
-	switch result {
+}
+
+// complete commits a bundle a worker executed. Bundles commit in the order
+// they finish, which keeps stream order for any two that conflict.
+func (x *Executor) complete(n *bundleNode) {
+	x.busy--
+	st := n.st
+	st.running--
+	if st.mode == ModeDone {
+		// The slot is over; its bank no longer takes bundles.
+		n.executed.Discard()
+		x.finishBundle(n)
+		return
+	}
+	result := st.bank.CommitBundle(n.executed)
+	n.executed = nil
+	switch result.Result {
 	case blockprod.ForgeAccepted:
 		st.report.Executed++
+		x.finishBundle(n)
 	case blockprod.ForgeDroppedNoLeader:
 		// The bank froze: the slot is over.
 		st.report.Rejected++
+		x.finishBundle(n)
 		st.stopped = true
 		x.endHold(st)
+		x.dropPending(st)
 	case blockprod.ForgeDroppedCost:
-		// Execution is serial, so nothing in flight can free room.
+		if st.running > 0 && !st.stopped {
+			// What is executing may still free room.
+			st.sched.retryLater(n)
+			break
+		}
 		st.report.Rejected++
+		x.finishBundle(n)
 		x.stop(st, FlagFailed)
 	default:
 		st.report.Reverted++
+		x.finishBundle(n)
 		x.stop(st, FlagReverted)
+	}
+	if !st.stopped {
+		st.sched.requeueRetries()
+	}
+	if st.running == 0 && st.tpuOnDrain {
+		st.tpuOnDrain = false
+		st.bank.AllowTPU()
+	}
+	x.dispatch(st)
+}
+
+// finishBundle releases a bundle that will not execute again.
+func (x *Executor) finishBundle(n *bundleNode) {
+	n.st.sched.finish(n)
+	n.st.outstanding.Add(-1)
+	x.pending.Add(-1)
+}
+
+// dropPending drops the slot's bundles that are not executing.
+func (x *Executor) dropPending(st *slotState) {
+	if dropped := int64(st.sched.close()); dropped > 0 {
+		st.report.Rejected += uint64(dropped)
+		st.outstanding.Add(-dropped)
+		x.pending.Add(-dropped)
 	}
 }
 
@@ -496,15 +628,24 @@ func (x *Executor) stop(st *slotState, flag EndFlags) {
 	st.stopped = true
 	st.report.Flags |= flag
 	x.endHold(st)
+	x.dropPending(st)
 	if st.mode == ModeUndecided || (st.mode == ModeHarmonic && x.now().Before(st.end)) {
 		x.fallback(st, 0)
 	}
 }
 
+// fallback switches the slot to local scheduling. Bundles still executing
+// keep their account locks until they finish, and the TPU ignores them, so it
+// opens only then.
 func (x *Executor) fallback(st *slotState, flag EndFlags) {
 	st.mode = ModeFallback
 	st.stopped = true
 	st.report.Flags |= flag
 	x.endHold(st)
+	x.dropPending(st)
+	if st.running > 0 {
+		st.tpuOnDrain = true
+		return
+	}
 	st.bank.AllowTPU()
 }

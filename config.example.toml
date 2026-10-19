@@ -398,6 +398,9 @@ name = "mithril"
     merkle_root_upload_authority = ""
     # Validator commission on tips, in basis points (0-10000).
     commission_bps = 0
+    # Threads executing block bundles that do not conflict on accounts in
+    # parallel (1-64). Conflicting bundles always execute in stream order.
+    num_workers = 8
 
 # ============================================================================
 # [consensus] - Alpenglow Consensus

@@ -67,6 +67,9 @@ type ServiceConfig struct {
 	LocalTPU gossip.TPUSockets
 	// TxV1Enabled reports whether the current bank accepts v1 transactions.
 	TxV1Enabled func() bool
+	// Workers execute block bundles that do not conflict in parallel. Zero
+	// means one.
+	Workers int
 	// Dialer replaces the TCP dialer, for tests.
 	Dialer func(ctx context.Context, addr string) (net.Conn, error)
 }
@@ -123,6 +126,7 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		Events:      events,
 		Crank:       crank.Builder(s.blockEngine),
 		OnReport:    reportSlot,
+		Workers:     cfg.Workers,
 	})
 	if cfg.Relayer.Target != "" {
 		s.relayer = NewRelayerSession(RelayerConfig{

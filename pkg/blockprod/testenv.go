@@ -101,6 +101,16 @@ func (e *TestEnv) Close() {
 	}
 }
 
+// Fund creates a system account at key holding lamports.
+func (e *TestEnv) Fund(key solana.PublicKey, lamports uint64) error {
+	return e.SlotCtx.SetAccount(key, &accounts.Account{
+		Key:       key,
+		Lamports:  lamports,
+		Owner:     addresses.SystemProgramAddr,
+		RentEpoch: math.MaxUint64,
+	})
+}
+
 func seedTestAccounts(mem accounts.MemAccounts) {
 	systemAcct := &accounts.Account{
 		Key:        addresses.SystemProgramAddr,

@@ -30,6 +30,7 @@ func ApplyDefaults(v *viper.Viper) {
 	v.SetDefault("harmonic.tls_cert_verify", true)
 	v.SetDefault("harmonic.strategy", "fba")
 	v.SetDefault("harmonic.commission_bps", 0)
+	v.SetDefault("harmonic.num_workers", 8)
 }
 
 // LedgerConfig holds ledger-related configuration (matches Firedancer [ledger] section)
