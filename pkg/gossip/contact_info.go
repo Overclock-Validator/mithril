@@ -87,6 +87,7 @@ type contactEndpoint struct {
 type contactRecord struct {
 	Pubkey          Pubkey
 	Wallclock       uint64
+	Outset          uint64
 	ShredVer        uint16
 	GossipAddr      contactEndpoint
 	ServeRepairAddr contactEndpoint
@@ -370,7 +371,7 @@ func decodeContactRecord(d *decoder) (contactRecord, error) {
 	if record.Wallclock, err = d.varint(10); err != nil {
 		return contactRecord{}, err
 	}
-	if _, err := d.u64(); err != nil {
+	if record.Outset, err = d.u64(); err != nil {
 		return contactRecord{}, err
 	}
 	if record.ShredVer, err = d.u16(); err != nil {
