@@ -152,6 +152,7 @@ const (
 	ForgeDroppedExecution
 	ForgeDroppedAlreadyProcessed
 	ForgeDroppedAccountLocks
+	ForgeDroppedLookup
 )
 
 func (r ForgeResult) String() string {
@@ -172,6 +173,8 @@ func (r ForgeResult) String() string {
 		return "dropped_already_processed"
 	case ForgeDroppedAccountLocks:
 		return "dropped_account_locks"
+	case ForgeDroppedLookup:
+		return "dropped_lookup"
 	default:
 		return "unknown"
 	}
@@ -246,8 +249,29 @@ func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, pre
 		ancestorAlreadyProcessed, ancestorStatusErr = b.ancestorStatuses.ContainsMessage(tx.Message.RecentBlockhash, messageHash)
 	}
 
+	// For a v0 transaction with address-table lookups, execTx is a resolved copy,
+	// while tx stays unresolved for entry encoding.
+	execTx := tx
 	var cost costmodel.TransactionCost
 	if !ancestorAlreadyProcessed && ancestorStatusErr == nil {
+		if replay.HasAddressTableLookups(tx) {
+			// Tables are read from the parent state, which this slot does not
+			// change, so resolve outside the bank lock.
+			resolved, txErr := replay.ResolveAddressTableLookups(b.slotCtx, tx)
+			if txErr != nil {
+				b.RebateSchedule(wireSize)
+				return ForgeDroppedLookup, costmodel.ExceedNone
+			}
+			// A loaded address can repeat a static key or another loaded
+			// address, or take the account count past the lock limit.
+			if txErr := replay.ValidateAccountLocks(resolved, lockFeats); txErr != nil {
+				b.RebateSchedule(wireSize)
+				return ForgeDroppedAccountLocks, costmodel.ExceedNone
+			}
+			execTx = resolved
+			// Static preparation, if any, was done on the unresolved message.
+			prepared = nil
+		}
 		feats := b.slotCtx.Features
 		if feats == nil {
 			f := features.NewFeaturesDefault()
@@ -256,7 +280,7 @@ func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, pre
 		if prepared != nil {
 			cost = prepared.Cost()
 		} else {
-			cost, err = costmodel.EstimateTransactionCost(tx, feats)
+			cost, err = costmodel.EstimateTransactionCost(execTx, feats)
 		}
 		if err != nil {
 			b.RebateSchedule(wireSize)
@@ -294,19 +318,19 @@ func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, pre
 	if reason := b.reserveEntryBytesLocked(wireSize); reason != costmodel.ExceedNone {
 		return ForgeDroppedCost, reason
 	}
-	if err := b.preparer.PayerCanFund(b.slotCtx, tx, prepared); err != nil {
+	if err := b.preparer.PayerCanFund(b.slotCtx, execTx, prepared); err != nil {
 		return ForgeDroppedExecution, costmodel.ExceedNone
 	}
 
 	output := b.preparer.LoadAndExecute(replay.LoadAndExecuteTransactionInput{
 		SlotCtx:           b.slotCtx,
-		Transaction:       tx,
+		Transaction:       execTx,
 		LeanResult:        true,
 		SkipTimingMetrics: true,
 		Arena:             b.borrowedAccounts,
 	}, prepared)
 	if output.ProcessingResult.TransactionError != nil {
-		feeInfo, err := replay.ApplyFailedTransaction(b.slotCtx, tx, output)
+		feeInfo, err := replay.ApplyFailedTransaction(b.slotCtx, execTx, output)
 		if err != nil {
 			return ForgeDroppedExecution, costmodel.ExceedNone
 		}
