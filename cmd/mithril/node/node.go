@@ -167,6 +167,10 @@ var (
 	turbineGossipBindAddr   string
 	turbineAdvertisedIP     string
 	turbineShredVersion     int
+	// turbineShredReceivers get copies of the shreds this validator
+	// broadcasts, and turbineShredRetransmitReceivers of the shreds it relays.
+	turbineShredReceivers           []*net.UDPAddr
+	turbineShredRetransmitReceivers []*net.UDPAddr
 )
 
 func snapshotEpochForState(manifest *snapshot.SnapshotManifest) uint64 {
@@ -628,6 +632,8 @@ func init() {
 	Run.Flags().BoolVar(&blockRPCFallback, "rpc-fallback", false, "Allow RPC to fetch blocks when replay is more than repair-catchup-max-gap-slots behind (default false: shreds via turbine + repair are the only block path)")
 	Run.Flags().StringVar(&turbineAdvertisedIP, "turbine-advertised-ip", "", "Public IP advertised by native turbine gossip (optional)")
 	Run.Flags().IntVar(&turbineShredVersion, "turbine-shred-version", 0, "Shred version for native turbine gossip (0 = discover from entrypoint)")
+	Run.Flags().StringSlice("shred-receiver-address", nil, "Also send every shred this validator broadcasts to this host:port (repeatable), e.g. a block builder")
+	Run.Flags().StringSlice("shred-retransmit-receiver-address", nil, "Also send every shred this node relays to this host:port (repeatable), e.g. a block builder")
 	Run.Flags().IntVar(&blockMaxRPS, "block-max-rps", 0, "Max RPC requests per second for block fetching (0 = use default)")
 	Run.Flags().IntVar(&blockMaxInflight, "block-max-inflight", 0, "Max concurrent block fetch workers (0 = use default)")
 	Run.Flags().IntVar(&blockTipPollIntervalMs, "block-tip-poll-ms", 0, "Tip poll interval in milliseconds (0 = use default)")
@@ -938,6 +944,16 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	turbineGossipBindAddr = getString("turbine-gossip-bind-addr", "turbine.gossip_bind_addr")
 	turbineAdvertisedIP = getString("turbine-advertised-ip", "turbine.advertised_ip")
 	turbineShredVersion = getInt("turbine-shred-version", "turbine.shred_version")
+	shredReceivers, err := parseShredReceivers("turbine.shred_receiver_addresses",
+		getStringSlice("shred-receiver-address", "turbine.shred_receiver_addresses"))
+	if err != nil {
+		return err
+	}
+	turbineShredReceivers = shredReceivers
+	if turbineShredRetransmitReceivers, err = parseShredReceivers("turbine.shred_retransmit_receiver_addresses",
+		getStringSlice("shred-retransmit-receiver-address", "turbine.shred_retransmit_receiver_addresses")); err != nil {
+		return err
+	}
 	repairCatchupMaxGapSlots = getInt("repair-catchup-max-gap-slots", "block.repair_catchup_max_gap_slots")
 	if repairCatchupMaxGapSlots < 0 {
 		repairCatchupMaxGapSlots = 0
@@ -1566,6 +1582,7 @@ func runLive(c *cobra.Command, args []string) {
 				RootSlot:                   func() uint64 { return rootSlot },
 				UseChaCha8:                 true,
 				DedupAddrs:                 false,
+				ShredReceivers:             turbineShredRetransmitReceivers,
 				FloorSlot:                  m.Bank.Slot + 1,
 				ShredSpoolDir:              catchupShredSpoolDir(),
 				RepairMaxRequestsPerSecond: repairMaxRequestsPerSecond,
@@ -2749,7 +2766,8 @@ postBootstrap:
 			UseChaCha8:    true,
 			// Agave treats custom/development clusters as non-deduplicating so
 			// every validator derives the same deterministic Turbine node list.
-			DedupAddrs: false,
+			DedupAddrs:     false,
+			ShredReceivers: turbineShredReceivers,
 		})
 		if err != nil {
 			klog.Fatalf("validator turbine broadcaster: %v", err)
@@ -2963,9 +2981,10 @@ postBootstrap:
 			}
 			return alpenglowEpochSchedule.GetEpoch(slot)
 		},
-		TurbineRootSlot:   global.ReplayFrontier,
-		TurbineUseChaCha8: true,
-		TurbineDedupAddrs: false,
+		TurbineRootSlot:       global.ReplayFrontier,
+		TurbineUseChaCha8:     true,
+		TurbineDedupAddrs:     false,
+		TurbineShredReceivers: turbineShredRetransmitReceivers,
 	}
 	if consensusMode == "validator" {
 		identity := solana.PrivateKey(validatorIdentity).PublicKey()

@@ -478,6 +478,14 @@ name = "mithril"
     # Optional override. Leave at zero/empty to discover from gossip_entrypoint.
     # shred_version = 0
 
+    # Optional host:port receivers that get a copy of every shred, in addition
+    # to normal Turbine operation, such as a block builder's shred listener.
+    # shred_receiver_addresses: shreds of blocks this validator produces.
+    # shred_retransmit_receiver_addresses: shreds this node relays for others.
+    # Also --shred-receiver-address / --shred-retransmit-receiver-address.
+    # shred_receiver_addresses = ["127.0.0.1:8003"]
+    # shred_retransmit_receiver_addresses = ["127.0.0.1:8003"]
+
 
 # ============================================================================
 # [lightbringer] - Lightbringer Sidecar (block.source = "lightbringer")

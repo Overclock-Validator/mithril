@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -103,6 +104,8 @@ type BlockFetchOpts struct {
 	TurbineRootSlot      func() uint64
 	TurbineUseChaCha8    bool
 	TurbineDedupAddrs    bool
+	// TurbineShredReceivers get a copy of every shred this node relays.
+	TurbineShredReceivers []*net.UDPAddr
 }
 
 var SerializedParameterArena *arena.Arena[byte]
@@ -2533,6 +2536,7 @@ func ReplayBlocks(
 		opts.TurbineRootSlot = blockFetchOpts.TurbineRootSlot
 		opts.TurbineUseChaCha8 = blockFetchOpts.TurbineUseChaCha8
 		opts.TurbineDedupAddrs = blockFetchOpts.TurbineDedupAddrs
+		opts.TurbineShredReceivers = blockFetchOpts.TurbineShredReceivers
 
 		// Mode thresholds
 		opts.NearTipThreshold = blockFetchOpts.NearTipThreshold
