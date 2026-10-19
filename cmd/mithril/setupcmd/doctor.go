@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/config"
+	"github.com/Overclock-Validator/mithril/pkg/rpcclient"
 )
 
 func runDoctor() {
@@ -106,7 +107,7 @@ func runDoctor() {
 	rpcEndpoints := config.GetStringSlice("network.rpc")
 	if len(rpcEndpoints) > 0 {
 		ep := rpcEndpoints[0]
-		fmt.Printf("  %s RPC endpoint configured (%s)\n", successStyle.Render("✓"), ep)
+		fmt.Printf("  %s RPC endpoint configured (%s)\n", successStyle.Render("✓"), rpcclient.SanitizeEndpointForDisplay(ep))
 		passed++
 	} else {
 		fmt.Printf("  %s No RPC endpoints configured\n", errorStyle.Render("✗"))
