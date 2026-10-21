@@ -239,6 +239,17 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 		candidates = append(candidates, slow...)
 	}
 
+	// A source manifest may be the only durable copy of its bankhashes.
+	// Flush their WAL before this cycle can remove any such recovery record.
+	for _, c := range candidates {
+		if c.manifestPath != "" {
+			if err := db.BankHashStore.LogData(nil, pebble.Sync); err != nil {
+				return stats, fmt.Errorf("accountsdb: sync bankhashes before compaction: %w", err)
+			}
+			break
+		}
+	}
+
 	var scannedBytes int64
 	started := time.Now()
 	for _, c := range candidates {

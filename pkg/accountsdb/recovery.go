@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/cockroachdb/pebble"
 )
 
 // RecoveryResult reports the durable fold state derived from the store itself
@@ -74,6 +75,9 @@ func (db *AccountsDb) RecoverFoldState() (RecoveryResult, error) {
 			}
 			continue
 		}
+		if _, exists := bySeq[h.BatchSeq]; exists {
+			return res, fmt.Errorf("accountsdb: duplicate active fold sequence %d", h.BatchSeq)
+		}
 		bySeq[h.BatchSeq] = h
 	}
 
@@ -81,6 +85,30 @@ func (db *AccountsDb) RecoverFoldState() (RecoveryResult, error) {
 	frontier := foldMeta{}
 	if haveMeta {
 		frontier = meta
+	}
+
+	// The account index can survive while the separate bankhash WAL loses its
+	// buffered writes. Restore retained committed manifests without replaying
+	// account rows or requiring segments that compaction may have removed.
+	var previousThrough uint64
+	havePrevious := false
+	for _, hdr := range headers {
+		if hdr.BatchSeq == 0 || hdr.BatchSeq > frontier.BatchSeq {
+			continue
+		}
+		manifest, err := ReadSegmentManifest(hdr.Path)
+		if err != nil {
+			return res, fmt.Errorf("accountsdb: read committed fold sequence %d: %w", hdr.BatchSeq, err)
+		}
+		if manifest.ThroughSlot > frontier.ThroughSlot ||
+			(havePrevious && manifest.ThroughSlot <= previousThrough) ||
+			(havePrevious && len(manifest.Bankhashes) > 0 && manifest.Bankhashes[0].Slot <= previousThrough) {
+			return res, fmt.Errorf("accountsdb: inconsistent committed fold range at sequence %d", hdr.BatchSeq)
+		}
+		if err := db.storeManifestBankhashes(manifest); err != nil {
+			return res, err
+		}
+		previousThrough, havePrevious = manifest.ThroughSlot, true
 	}
 
 	// Replay the contiguous run above the frontier.
@@ -98,7 +126,9 @@ func (db *AccountsDb) RecoverFoldState() (RecoveryResult, error) {
 		if err := db.applyManifestToIndex(manifest); err != nil {
 			return res, fmt.Errorf("accountsdb: replay fold manifest seq %d: %w", seq, err)
 		}
-		db.storeManifestBankhashes(manifest)
+		if err := db.storeManifestBankhashes(manifest); err != nil {
+			return res, err
+		}
 		res.ReplayedBatches = append(res.ReplayedBatches, seq)
 		stopSeq = seq
 	}
@@ -191,14 +221,22 @@ func (db *AccountsDb) verifyAndReadManifest(hdr ManifestHeader) (*SegmentManifes
 	return manifest, nil
 }
 
-func (db *AccountsDb) storeManifestBankhashes(m *SegmentManifest) {
+func (db *AccountsDb) storeManifestBankhashes(m *SegmentManifest) error {
+	for i, bh := range m.Bankhashes {
+		if bh.Slot > m.ThroughSlot || (i > 0 && bh.Slot <= m.Bankhashes[i-1].Slot) {
+			return fmt.Errorf("accountsdb: invalid bankhash range in fold sequence %d", m.BatchSeq)
+		}
+	}
 	for _, bh := range m.Bankhashes {
 		var slotBytes [8]byte
 		binary.LittleEndian.PutUint64(slotBytes[:], bh.Slot)
-		if err := db.BankHashStore.Set(slotBytes[:], bh.Bankhash[:], nil); err != nil {
-			mlog.Log.Warnf("accountsdb: recovery bankhash store slot %d: %v", bh.Slot, err)
+		// A rewind can leave a durable row from the old fork. The active
+		// committed manifest, not that advisory row, determines its replacement.
+		if err := db.BankHashStore.Set(slotBytes[:], bh.Bankhash[:], pebble.NoSync); err != nil {
+			return fmt.Errorf("accountsdb: restore bankhash at slot %d: %w", bh.Slot, err)
 		}
 	}
+	return nil
 }
 
 // bootstrapHighFileId reads the write-once sidecar recorded by snapshot build.
