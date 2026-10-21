@@ -139,9 +139,16 @@ var (
 	// The pair is what tells an operator whether batching is actually happening:
 	// a group width stuck near one means work is arriving too thinly to fill a
 	// vector group, which is a throughput ceiling no backend choice can lift.
-	ReplaySigverifyGroup           = Metric{"replay_sigverify_group_duration_seconds"}
-	ReplaySigverifyGroupSignatures = Metric{"replay_sigverify_group_signatures_total"}
-	TurbineReplayAdmission         = Metric{"turbine_replay_admission_duration_seconds"}
+	ReplaySigverifyGroup                  = Metric{"replay_sigverify_group_duration_seconds"}
+	ReplaySigverifyGroupSignatures        = Metric{"replay_sigverify_group_signatures_total"}
+	TurbineReplayAdmission                = Metric{"turbine_replay_admission_duration_seconds"}
+	TransactionHistoryCaptures            = Metric{"transaction_history_captures_total"}
+	TransactionHistoryWrite               = Metric{"transaction_history_write_duration_seconds"}
+	TransactionHistoryPendingWriteStarted = Metric{"transaction_history_pending_write_started_timestamp_seconds"}
+	TransactionHistoryBlocks              = Metric{"transaction_history_candidate_blocks"}
+	TransactionHistoryBytes               = Metric{"transaction_history_logical_bytes"}
+	TransactionHistoryFirstSlot           = Metric{"transaction_history_first_candidate_slot"}
+	TransactionHistoryLastSlot            = Metric{"transaction_history_last_candidate_slot"}
 
 	SnapshotWorkerPoolUtilization = Metric{"snapshot_worker_pool_utilization"}
 	TasksSetIfSlotHigherQueueSize = Metric{"tasks_set_if_slot_higher_queue_size"}
@@ -265,6 +272,13 @@ var MetricToType = map[Metric]metricType{
 	ReplaySigverifyGroup:                        TimingT,
 	ReplaySigverifyGroupSignatures:              CountT,
 	TurbineReplayAdmission:                      TimingT,
+	TransactionHistoryCaptures:                  CountT,
+	TransactionHistoryWrite:                     TimingT,
+	TransactionHistoryPendingWriteStarted:       GaugeT,
+	TransactionHistoryBlocks:                    GaugeT,
+	TransactionHistoryBytes:                     GaugeT,
+	TransactionHistoryFirstSlot:                 GaugeT,
+	TransactionHistoryLastSlot:                  GaugeT,
 
 	TestCount: CountT,
 
@@ -274,16 +288,23 @@ var MetricToType = map[Metric]metricType{
 	Slot:                          GaugeT,
 }
 var MetricToLabels = map[Metric][]string{
-	PreprocessBlock:      {"phase"},
-	TxLoop:               {"phase"},
-	LoadBlockAccounts:    {"phase"},
-	RunIncinerator:       {"phase"},
-	Reward:               {"phase"},
-	Rent:                 {"phase"},
-	BlockUpdateAccounts:  {"phase"},
-	AccountsDeltaHash:    {"phase"},
-	BankHash:             {"phase"},
-	AlpenglowVoteRewards: {"phase"},
+	TransactionHistoryCaptures:            {"result"},
+	TransactionHistoryWrite:               nil,
+	TransactionHistoryPendingWriteStarted: nil,
+	TransactionHistoryBlocks:              nil,
+	TransactionHistoryBytes:               nil,
+	TransactionHistoryFirstSlot:           nil,
+	TransactionHistoryLastSlot:            nil,
+	PreprocessBlock:                       {"phase"},
+	TxLoop:                                {"phase"},
+	LoadBlockAccounts:                     {"phase"},
+	RunIncinerator:                        {"phase"},
+	Reward:                                {"phase"},
+	Rent:                                  {"phase"},
+	BlockUpdateAccounts:                   {"phase"},
+	AccountsDeltaHash:                     {"phase"},
+	BankHash:                              {"phase"},
+	AlpenglowVoteRewards:                  {"phase"},
 
 	VoteRewardValidatorPreparation:       {"phase"},
 	VoteRewardSkipCertificateValidation:  {"phase"},
@@ -404,6 +425,7 @@ var turbinePipelineDurationBuckets = []float64{
 // The generic Timing metrics predate unit-specific naming and retain the
 // Prometheus defaults for compatibility.
 var MetricToBuckets = map[Metric][]float64{
+	TransactionHistoryWrite:                     turbinePipelineDurationBuckets,
 	BlockProductionParentReadyAge:               blockProductionDurationBuckets,
 	BlockProductionStartCutoffLate:              blockProductionDurationBuckets,
 	BlockProductionStartDecisionTickDeliveryLag: blockProductionDurationBuckets,
