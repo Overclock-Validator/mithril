@@ -167,6 +167,14 @@ func (c *ContactInfo) SetAlpenglowAddr(addr *net.UDPAddr) error {
 	return nil
 }
 
+func (c *ContactInfo) SetServeRepairAddr(addr *net.UDPAddr) error {
+	if err := c.SetSocket(socketTagServeRepair, addr); err != nil {
+		return err
+	}
+	c.ServeRepairAddr = cloneUDPAddr(addr)
+	return nil
+}
+
 func (c *ContactInfo) SetTPUVoteAddr(addr *net.UDPAddr) error {
 	if err := c.SetSocket(socketTagTPUVote, addr); err != nil {
 		return err
