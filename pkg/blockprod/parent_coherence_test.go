@@ -56,7 +56,7 @@ func TestLeaderStartPinsIdentityFromReplaySnapshot(t *testing.T) {
 	global.SetAlpenglowBlockID(parentSlot, solana.Hash{9})
 	global.SetAlpenglowChainedMerkleRoot(parentSlot, solana.Hash{8})
 	loop := NewLeaderLoop(LeaderLoopConfig{
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: &captureBroadcaster{},
 		ParentContext: func(uint64) ParentContext {
 			return parent
@@ -81,7 +81,7 @@ func TestLeaderStartRejectsGenerationSwitchWhileOpening(t *testing.T) {
 	reads := 0
 	broadcaster := &captureBroadcaster{}
 	loop := NewLeaderLoop(LeaderLoopConfig{
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: broadcaster,
 		ParentContext: func(uint64) ParentContext {
 			reads++
@@ -111,7 +111,7 @@ func TestLeaderRestartsOnGenerationOnlyForkSwitch(t *testing.T) {
 	parent := coherentTestParentContext(parentSlot, solana.Hash{3})
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:  NewController(),
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: &captureBroadcaster{},
 		CurrentSlot: func() uint64 { return slot },
 		LeaderForSlot: func(candidate uint64) (solana.PublicKey, bool) {
@@ -168,7 +168,7 @@ func TestLeaderSuppressesFooterIfGenerationSwitchesDuringCommit(t *testing.T) {
 	})
 	blockDelivered := false
 	loop := NewLeaderLoop(LeaderLoopConfig{
-		Identity:      identity,
+		Identity:      identityHolder(identity),
 		AccountsDb:    &accountsdb.AccountsDb{},
 		EpochSchedule: &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 1_000},
 		ParentContext: func(uint64) ParentContext { return parent },

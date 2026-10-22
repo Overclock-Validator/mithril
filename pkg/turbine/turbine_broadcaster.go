@@ -23,7 +23,7 @@ type TurbineBroadcaster struct {
 	mu sync.Mutex
 
 	conn   *net.UDPConn
-	self   solana.PublicKey
+	self   func() solana.PublicKey
 	peers  TVUPeerSource
 	stakes func(uint64) map[solana.PublicKey]uint64
 	epoch  func(uint64) uint64
@@ -36,13 +36,14 @@ type TurbineBroadcaster struct {
 	receivers  []*net.UDPAddr
 
 	cacheSlot  uint64
+	cacheSelf  solana.PublicKey
 	cacheValid bool
 	cacheNodes *ClusterNodes
 }
 
 type TurbineBroadcasterConfig struct {
 	BindAddr      string
-	Self          solana.PublicKey
+	Self          func() solana.PublicKey // this node's identity, read per shred so set-identity moves the broadcast tree
 	Peers         TVUPeerSource
 	Stakes        func(slot uint64) map[solana.PublicKey]uint64
 	EpochForSlot  func(slot uint64) uint64
@@ -72,6 +73,9 @@ func NewTurbineBroadcaster(cfg TurbineBroadcasterConfig) (*TurbineBroadcaster, e
 		if err != nil {
 			return nil, fmt.Errorf("open turbine broadcast udp socket: %w", err)
 		}
+	}
+	if cfg.Self == nil {
+		return nil, fmt.Errorf("turbine broadcast: self identity is required")
 	}
 	leaderSlots := cfg.LeaderSlots
 	if leaderSlots == 0 {
@@ -143,7 +147,7 @@ func (b *TurbineBroadcaster) broadcastDestinations(shredID ShredID, nodes *Clust
 	if b.leaderForSlot != nil && b.peers != nil {
 		nextSlot := shredID.Slot + b.leaderSlots
 		nextLeader, ok := b.leaderForSlot(nextSlot)
-		if ok && nextLeader != b.self {
+		if ok && nextLeader != b.self() {
 			if addr, ok := b.peers.LookupTVU(nextLeader); ok {
 				if addr, ok := broadcastTVUUDP(addr); ok {
 					if len(dests) == 0 || dests[0].String() != addr.String() {
@@ -159,7 +163,8 @@ func (b *TurbineBroadcaster) broadcastDestinations(shredID ShredID, nodes *Clust
 func (b *TurbineBroadcaster) clusterNodesForSlot(slot uint64) *ClusterNodes {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.cacheNodes != nil && b.cacheValid && b.cacheSlot == slot {
+	self := b.self()
+	if b.cacheNodes != nil && b.cacheValid && b.cacheSlot == slot && b.cacheSelf == self {
 		return b.cacheNodes
 	}
 	stakes := map[solana.PublicKey]uint64{}
@@ -173,7 +178,7 @@ func (b *TurbineBroadcaster) clusterNodesForSlot(slot uint64) *ClusterNodes {
 		selfTVU = b.peers.SelfTVUAddr()
 	}
 	b.cacheNodes = NewBroadcastClusterNodes(ClusterNodesConfig{
-		Self:         b.self,
+		Self:         self,
 		SelfTVU:      selfTVU,
 		TVUPeers:     tvuPeers,
 		Stakes:       stakes,
@@ -181,6 +186,7 @@ func (b *TurbineBroadcaster) clusterNodesForSlot(slot uint64) *ClusterNodes {
 		UseChaCha8:   b.useChaCha8,
 	})
 	b.cacheSlot = slot
+	b.cacheSelf = self
 	b.cacheValid = true
 	return b.cacheNodes
 }

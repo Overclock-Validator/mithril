@@ -83,7 +83,7 @@ func TestLeaderHooksSlotStartedBeforeBankIsPublished(t *testing.T) {
 	hooks := &recordingHooks{controller: controller}
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:    controller,
-		Identity:      txfixture.PayerPrivateKey(),
+		Identity:      identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster:   &captureBroadcaster{},
 		ParentContext: func(uint64) ParentContext { return parent },
 		Now:           func() time.Time { return now },
@@ -124,7 +124,7 @@ func TestLeaderGateTPUIsIgnoredWithoutHooks(t *testing.T) {
 	global.SetAlpenglowChainedMerkleRoot(slot-1, solana.Hash{2})
 	parent := coherentTestParentContext(slot-1, solana.Hash{3})
 	loop := NewLeaderLoop(LeaderLoopConfig{
-		Identity:      txfixture.PayerPrivateKey(),
+		Identity:      identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster:   &captureBroadcaster{},
 		ParentContext: func(uint64) ParentContext { return parent },
 		GateTPU:       true,
@@ -146,7 +146,7 @@ func TestLeaderHooksSkipSlotsThatFailToOpen(t *testing.T) {
 	reads := 0
 	hooks := &recordingHooks{}
 	loop := NewLeaderLoop(LeaderLoopConfig{
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: &captureBroadcaster{},
 		ParentContext: func(uint64) ParentContext {
 			reads++
@@ -210,7 +210,7 @@ func newFinishingLeaderLoop(t *testing.T, slot uint64, hooks *recordingHooks, co
 	delivered := false
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:    controller,
-		Identity:      identity,
+		Identity:      identityHolder(identity),
 		AccountsDb:    &accountsdb.AccountsDb{},
 		EpochSchedule: &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 1_000},
 		ParentContext: func(uint64) ParentContext { return parent },
@@ -285,7 +285,7 @@ func TestLeaderHooksSlotAbortedWithoutEndingWhenParentChanges(t *testing.T) {
 
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:  controller,
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		CurrentSlot: func() uint64 { return activeSlot },
 		LeaderForSlot: func(slot uint64) (solana.PublicKey, bool) {
 			if slot == startSlot {

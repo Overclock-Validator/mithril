@@ -2,20 +2,20 @@ package harmonic
 
 import (
 	"context"
-	"crypto/ed25519"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	authpb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/auth"
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 )
 
 // TokenSource keeps one endpoint's tokens fresh and publishes the access
 // token through its Bearer.
 type TokenSource struct {
 	client   authpb.AuthServiceClient
-	identity ed25519.PrivateKey
+	identity *identity.Holder
 	bearer   Bearer
 	now      func() time.Time
 	after    func(time.Duration) <-chan time.Time
@@ -28,10 +28,12 @@ type TokenSource struct {
 	tokens Tokens
 }
 
-func NewTokenSource(client authpb.AuthServiceClient, identity ed25519.PrivateKey) *TokenSource {
+// NewTokenSource authenticates as holder's current identity, and again after
+// every set-identity swap while Run is running.
+func NewTokenSource(client authpb.AuthServiceClient, holder *identity.Holder) *TokenSource {
 	return &TokenSource{
 		client:   client,
-		identity: identity,
+		identity: holder,
 		now:      time.Now,
 		after:    time.After,
 		reauth:   make(chan struct{}, 1),
@@ -52,7 +54,7 @@ func (s *TokenSource) Tokens() Tokens {
 
 // Authenticate replaces the tokens with a fresh pair.
 func (s *TokenSource) Authenticate(ctx context.Context) error {
-	tokens, err := Authenticate(ctx, s.client, s.identity)
+	tokens, err := Authenticate(ctx, s.client, s.identity.Current().PrivateKey())
 	if err == nil {
 		err = s.checkUnexpired(tokens.Access, tokens.Refresh)
 	}
@@ -83,6 +85,8 @@ func (s *TokenSource) Invalidate() {
 // authentication fails. A failed refresh falls back to authenticating again.
 // Call Authenticate first.
 func (s *TokenSource) Run(ctx context.Context) error {
+	// Tokens are bound to the pubkey that authenticated; a swap needs new ones.
+	defer s.identity.OnSwap(func(_, _ *identity.Keypair) { s.Invalidate() })()
 	for {
 		tokens := s.Tokens()
 		now := s.now()

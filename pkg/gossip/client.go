@@ -2,7 +2,6 @@ package gossip
 
 import (
 	"context"
-	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -12,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/gagliardetto/solana-go"
 )
@@ -34,7 +34,7 @@ type Config struct {
 	AlpenglowAddr     string
 	AdvertisedIP      string
 	ShredVersion      uint16
-	Identity          ed25519.PrivateKey
+	Identity          *identity.Holder // signs this node's gossip; nil runs with an ephemeral identity
 	PushInterval      time.Duration
 	PingInterval      time.Duration
 	EntrypointTimeout time.Duration
@@ -48,8 +48,7 @@ type Client struct {
 	bindAddr   *net.UDPAddr
 	tvuAddr    *net.UDPAddr
 	alpenglow  *net.UDPAddr
-	identity   ed25519.PrivateKey
-	pubkey     Pubkey
+	identity   *identity.Holder
 
 	contactMu sync.RWMutex
 	// contact is replaced on every update and never modified once published,
@@ -185,19 +184,9 @@ func NewClient(cfg Config) (*Client, error) {
 			return nil, fmt.Errorf("resolve Alpenglow address: %w", err)
 		}
 	}
-	identity := cfg.Identity
-	if len(identity) == 0 {
-		_, identity, err = ed25519.GenerateKey(rand.Reader)
-		if err != nil {
-			return nil, fmt.Errorf("generate gossip identity: %w", err)
-		}
-	}
-	if len(identity) != ed25519.PrivateKeySize {
-		return nil, fmt.Errorf("invalid gossip identity size %d", len(identity))
-	}
-	pubkey, err := pubkeyFromPrivateKey(identity)
+	holder, err := identity.HolderOrEphemeral(cfg.Identity)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("gossip identity: %w", err)
 	}
 
 	return &Client{
@@ -206,8 +195,7 @@ func NewClient(cfg Config) (*Client, error) {
 		bindAddr:           bindAddr,
 		tvuAddr:            tvuAddr,
 		alpenglow:          alpenglowAddr,
-		identity:           identity,
-		pubkey:             pubkey,
+		identity:           holder,
 		identityConflictCh: make(chan error, 1),
 		contactChanged:     make(chan struct{}, 1),
 		peers:              make(map[udpAddrKey]knownPeer),
@@ -218,11 +206,38 @@ func NewClient(cfg Config) (*Client, error) {
 }
 
 func (c *Client) Pubkey() Pubkey {
-	return c.pubkey
+	return Pubkey(c.identity.PublicKey())
 }
 
-func (c *Client) Identity() ed25519.PrivateKey {
-	return append(ed25519.PrivateKey(nil), c.identity...)
+// Identity is the holder this client signs with. Components that share the
+// client's gossip identity, such as turbine retransmit and repair, read it.
+func (c *Client) Identity() *identity.Holder {
+	return c.identity
+}
+
+// adoptIdentity restarts this client's contact under the new identity, as
+// Agave's ClusterInfo::set_keypair does. A fresh outset and wallclock make
+// CRDS values the previous owner of the identity published before the swap
+// stale, so they cannot trip the identity-conflict check.
+func (c *Client) adoptIdentity(prev, next *identity.Keypair) {
+	c.contactMu.Lock()
+	if c.contact != nil {
+		contact := c.contact.CloneWithWallclock(wallclockMillis())
+		contact.Pubkey = Pubkey(next.PublicKey())
+		contact.Outset = uint64(time.Now().UnixMicro())
+		c.contact = contact
+	}
+	c.contactMu.Unlock()
+
+	c.identityConflictMu.Lock()
+	c.identityConflictGossip = contactEndpoint{}
+	c.identityConflictTVU = contactEndpoint{}
+	c.identityConflictAlpenglow = contactEndpoint{}
+	c.identityConflictWallclock = 0
+	c.identityConflictMu.Unlock()
+
+	mlog.Log.Infof("gossip identity changed from %s to %s; advertising new contact info", prev.PublicKey(), next.PublicKey())
+	c.notifyContactChanged()
 }
 
 func (c *Client) ShredVersion() uint16 {
@@ -256,6 +271,7 @@ func (c *Client) Run(ctx context.Context) error {
 	if err := c.initializeContact(conn.LocalAddr().(*net.UDPAddr)); err != nil {
 		return err
 	}
+	defer c.identity.OnSwap(c.adoptIdentity)()
 	c.contactMu.RLock()
 	contact := c.contact
 	c.contactMu.RUnlock()
@@ -435,11 +451,15 @@ func (c *Client) UpdateContact(fn func(*ContactInfo) error) error {
 		return err
 	}
 	c.contact = next
+	c.notifyContactChanged()
+	return nil
+}
+
+func (c *Client) notifyContactChanged() {
 	select {
 	case c.contactChanged <- struct{}{}:
 	default:
 	}
-	return nil
 }
 
 func updatedContact(current *ContactInfo, fn func(*ContactInfo) error) (*ContactInfo, error) {
@@ -495,7 +515,7 @@ func (c *Client) initializeContact(localGossipAddr *net.UDPAddr) error {
 		tvuAddr.IP = tvuIP
 	}
 
-	contact, err := NewContactInfo(c.pubkey, shredVersion, gossipAddr, tvuAddr)
+	contact, err := NewContactInfo(Pubkey(c.identity.PublicKey()), shredVersion, gossipAddr, tvuAddr)
 	if err != nil {
 		return err
 	}
@@ -522,22 +542,29 @@ func (c *Client) initializeContact(localGossipAddr *net.UDPAddr) error {
 	return nil
 }
 
-func (c *Client) currentContactValue() (CrdsValue, error) {
+// currentContactValue signs the contact with the current identity. The pubkey
+// is taken from the same keypair that signs, so a swap racing this call can
+// never publish one identity's contact under another's signature.
+func (c *Client) currentContactValue() (CrdsValue, *identity.Keypair, error) {
 	c.contactMu.RLock()
 	contact := c.contact
 	c.contactMu.RUnlock()
 	if contact == nil {
-		return CrdsValue{}, fmt.Errorf("gossip contact info is not initialized")
+		return CrdsValue{}, nil, fmt.Errorf("gossip contact info is not initialized")
 	}
-	return signCrdsContactInfo(contact.CloneWithWallclock(wallclockMillis()), c.identity)
+	kp := c.identity.Current()
+	value := contact.CloneWithWallclock(wallclockMillis())
+	value.Pubkey = Pubkey(kp.PublicKey())
+	signed, err := signCrdsContactInfo(value, kp.PrivateKey())
+	return signed, kp, err
 }
 
 func (c *Client) pushContact(conn *net.UDPConn) error {
-	value, err := c.currentContactValue()
+	value, kp, err := c.currentContactValue()
 	if err != nil {
 		return err
 	}
-	packet, err := encodePushMessage(c.pubkey, []CrdsValue{value})
+	packet, err := encodePushMessage(Pubkey(kp.PublicKey()), []CrdsValue{value})
 	if err != nil {
 		return err
 	}
@@ -553,11 +580,11 @@ func (c *Client) pushContact(conn *net.UDPConn) error {
 }
 
 func (c *Client) sendPullResponse(conn *net.UDPConn, addr *net.UDPAddr) error {
-	value, err := c.currentContactValue()
+	value, kp, err := c.currentContactValue()
 	if err != nil {
 		return err
 	}
-	packet, err := encodePullResponse(c.pubkey, []CrdsValue{value})
+	packet, err := encodePullResponse(Pubkey(kp.PublicKey()), []CrdsValue{value})
 	if err != nil {
 		return err
 	}
@@ -574,7 +601,7 @@ func (c *Client) sendPullResponse(conn *net.UDPConn, addr *net.UDPAddr) error {
 // filter), bootstrapping our peer/repair set. Peers ping us first if we're not yet
 // ponged; we answer pings, so repeated ticks converge. Best-effort per peer.
 func (c *Client) sendPullRequests(conn *net.UDPConn) error {
-	value, err := c.currentContactValue()
+	value, _, err := c.currentContactValue()
 	if err != nil {
 		return err
 	}
@@ -613,7 +640,7 @@ func (c *Client) sendPullRequests(conn *net.UDPConn) error {
 const maxPullRequestsPerTick = 8
 
 func (c *Client) sendPing(conn *net.UDPConn, addr *net.UDPAddr) error {
-	ping, err := newPing(c.identity)
+	ping, err := newPing(c.identity.Current().PrivateKey())
 	if err != nil {
 		return err
 	}
@@ -630,7 +657,7 @@ func (c *Client) sendPong(conn *net.UDPConn, ping Ping, addr *net.UDPAddr) error
 	if !ping.Verify() {
 		return nil
 	}
-	pong, err := newPong(ping, c.identity)
+	pong, err := newPong(ping, c.identity.Current().PrivateKey())
 	if err != nil {
 		return err
 	}
@@ -699,7 +726,7 @@ func (c *Client) handleContactRecord(record contactRecord, shredVersion uint16) 
 	// copies of our own contact as harmless, but confirm two increasing foreign
 	// wallclocks before stopping so a stale record from a previous run cannot
 	// trip a fresh process.
-	if record.Pubkey == c.pubkey {
+	if record.Pubkey == c.Pubkey() {
 		c.observeOwnContactRecord(record)
 		return
 	}
@@ -747,7 +774,7 @@ func (c *Client) observeOwnContactRecord(record contactRecord) {
 		c.identityConflictWallclock = record.Wallclock
 		c.identityConflictMu.Unlock()
 		mlog.Log.Warnf("validator identity %s also appeared in gossip at gossip=%s tvu=%s alpenglow=%s; waiting for a newer record to confirm that the other instance is live",
-			solana.PublicKey(c.pubkey).String(), endpointString(record.GossipAddr), endpointString(record.TVUAddr), endpointString(alpenglow))
+			c.identity.PublicKey().String(), endpointString(record.GossipAddr), endpointString(record.TVUAddr), endpointString(alpenglow))
 		return
 	}
 	if record.Wallclock <= previousWallclock {
@@ -758,7 +785,7 @@ func (c *Client) observeOwnContactRecord(record contactRecord) {
 	c.identityConflictMu.Unlock()
 
 	err := fmt.Errorf("%w: %s is publishing conflicting endpoints (ours gossip=%s tvu=%s alpenglow=%s; other gossip=%s tvu=%s alpenglow=%s); stop the other validator before starting Mithril",
-		ErrIdentityInUse, solana.PublicKey(c.pubkey).String(), addrString(local.GossipAddr), addrString(local.TVUAddr), addrString(local.AlpenglowAddr),
+		ErrIdentityInUse, c.identity.PublicKey().String(), addrString(local.GossipAddr), addrString(local.TVUAddr), addrString(local.AlpenglowAddr),
 		endpointString(record.GossipAddr), endpointString(record.TVUAddr), endpointString(alpenglow))
 	select {
 	case c.identityConflictCh <- err:

@@ -2,7 +2,6 @@ package harmonic
 
 import (
 	"context"
-	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -16,6 +15,7 @@ import (
 	authpb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/auth"
 	relayerpb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/relayer"
 	sharedpb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/shared"
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	tpupacket "github.com/Overclock-Validator/mithril/pkg/tpu/packet"
 	"google.golang.org/grpc"
@@ -92,7 +92,7 @@ func parseRelayerSocket(socket *sharedpb.Socket, name string) (netip.AddrPort, e
 type RelayerConfig struct {
 	Endpoint           Endpoint
 	InsecureSkipVerify bool
-	Identity           ed25519.PrivateKey
+	Identity           *identity.Holder
 	Packets            PacketSink
 	// OnStatus is called from the session goroutine with the relayer's TPU
 	// config whenever it becomes usable or changes, and with nil whenever it

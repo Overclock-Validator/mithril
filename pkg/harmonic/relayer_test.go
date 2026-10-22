@@ -130,7 +130,7 @@ func startRelayerSession(t *testing.T, config *relayerpb.GetTpuConfigsResponse, 
 	h.session = NewRelayerSession(RelayerConfig{
 		Endpoint:         dial.Endpoint,
 		Dialer:           dial.Dialer,
-		Identity:         rfc8032Key(t),
+		Identity:         identityHolder(t, rfc8032Key(t)),
 		Packets:          h.packets,
 		OnStatus:         h.statuses.record,
 		ConfigInterval:   configInterval,

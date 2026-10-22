@@ -77,7 +77,7 @@ func TestAuthenticateHandshakeAndBearer(t *testing.T) {
 		relayerpb.RegisterRelayerServer(s, relayer)
 	})
 	identity := rfc8032Key(t)
-	tokens := NewTokenSource(nil, identity)
+	tokens := NewTokenSource(nil, identityHolder(t, identity))
 	cfg.Credentials = tokens.Bearer()
 	conn, err := Dial(context.Background(), cfg)
 	require.NoError(t, err)
@@ -159,7 +159,7 @@ func TestAuthenticateRejectsBadResponses(t *testing.T) {
 			conn, err := Dial(context.Background(), cfg)
 			require.NoError(t, err)
 			defer conn.Close()
-			tokens := NewTokenSource(authpb.NewAuthServiceClient(conn), rfc8032Key(t))
+			tokens := NewTokenSource(authpb.NewAuthServiceClient(conn), identityHolder(t, rfc8032Key(t)))
 			tokens.now = func() time.Time { return now }
 			tokens.bearer.Set("stale")
 
@@ -209,7 +209,7 @@ func startTokenSource(t *testing.T, auth *mockAuth, now time.Time) (*TokenSource
 	conn, err := Dial(context.Background(), cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { conn.Close() })
-	tokens := NewTokenSource(authpb.NewAuthServiceClient(conn), rfc8032Key(t))
+	tokens := NewTokenSource(authpb.NewAuthServiceClient(conn), identityHolder(t, rfc8032Key(t)))
 	timers := newFakeTimers()
 	tokens.now = func() time.Time { return now }
 	tokens.after = timers.after

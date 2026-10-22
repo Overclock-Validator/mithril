@@ -2,7 +2,6 @@ package harmonic
 
 import (
 	"context"
-	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"net"
@@ -109,11 +108,10 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		baseClientIDAfter:     baseClientIDAfter,
 		metricsInterval:       metricsInterval,
 	}
-	identity := ed25519.PrivateKey(cfg.Tips.Identity)
 	s.blockEngine = NewBlockEngineSession(BlockEngineConfig{
 		Endpoint:           cfg.BlockEngine,
 		InsecureSkipVerify: cfg.InsecureSkipVerify,
-		Identity:           identity,
+		Identity:           cfg.Tips.Identity,
 		Strategy:           cfg.Strategy,
 		Packets:            cfg.TPU,
 		Blocks:             s.pipeline,
@@ -132,7 +130,7 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		s.relayer = NewRelayerSession(RelayerConfig{
 			Endpoint:           cfg.Relayer,
 			InsecureSkipVerify: cfg.InsecureSkipVerify,
-			Identity:           identity,
+			Identity:           cfg.Tips.Identity,
 			Packets:            cfg.TPU,
 			OnStatus:           s.relayerStatusChanged,
 			Dialer:             cfg.Dialer,

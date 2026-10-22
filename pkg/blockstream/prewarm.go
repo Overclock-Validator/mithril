@@ -2,7 +2,6 @@ package blockstream
 
 import (
 	"context"
-	"crypto/ed25519"
 	"fmt"
 	"net"
 	"sort"
@@ -11,6 +10,7 @@ import (
 
 	b "github.com/Overclock-Validator/mithril/pkg/block"
 	gossipclient "github.com/Overclock-Validator/mithril/pkg/gossip"
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/turbine"
 	"github.com/gagliardetto/solana-go"
@@ -63,7 +63,7 @@ type TurbinePrewarmConfig struct {
 	AdvertisedIP     string
 	ShredVersion     uint16
 	AlpenglowAddr    string
-	Identity         ed25519.PrivateKey
+	Identity         *identity.Holder // nil gossips under an ephemeral identity
 	LeaderForSlot    turbine.LeaderForSlotFunc
 	StakesForSlot    func(slot uint64) map[solana.PublicKey]uint64
 	EpochForSlot     func(slot uint64) uint64

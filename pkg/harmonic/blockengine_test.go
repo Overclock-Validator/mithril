@@ -90,7 +90,7 @@ func newBlockEngineHarness(t *testing.T, feeInfoInterval time.Duration) *blockEn
 	h.session = NewBlockEngineSession(BlockEngineConfig{
 		Endpoint:        dial.Endpoint,
 		Dialer:          dial.Dialer,
-		Identity:        rfc8032Key(t),
+		Identity:        identityHolder(t, rfc8032Key(t)),
 		Packets:         h.packets,
 		Blocks:          h.blocks,
 		OnHealth:        h.health.record,

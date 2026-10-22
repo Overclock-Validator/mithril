@@ -2,7 +2,6 @@ package harmonic
 
 import (
 	"context"
-	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"net"
@@ -13,6 +12,7 @@ import (
 	authpb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/auth"
 	blockpb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/block"
 	blockenginepb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/blockengine"
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/statsd"
 	tpupacket "github.com/Overclock-Validator/mithril/pkg/tpu/packet"
@@ -70,7 +70,7 @@ func ParseFeeInfo(resp *blockenginepb.BlockBuilderFeeInfoResponse) (FeeInfo, err
 type BlockEngineConfig struct {
 	Endpoint           Endpoint
 	InsecureSkipVerify bool
-	Identity           ed25519.PrivateKey
+	Identity           *identity.Holder
 	// Strategy defaults to FBA.
 	Strategy blockenginepb.SchedulingStrategy
 	Packets  PacketSink

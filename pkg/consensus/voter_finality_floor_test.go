@@ -374,7 +374,7 @@ func TestAlpenglowVotingEnabledAfterReplayRestoresAllExecutionProvenForkVotes(t 
 	authorized := voterTestKey(92)
 	voteAccount := solana.PublicKey(voterTestKey(93).Public().(ed25519.PublicKey))
 	set := voterTestValidatorSet(t, identity, authorized, voteAccount)
-	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234, AlpenglowIdentity: identity})
+	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234, AlpenglowIdentity: identityHolder(t, identity)})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, engine.Close()) })
 	engine.SetAlpenglowEpochLookup(func(uint64) uint64 { return set.Epoch })
@@ -402,7 +402,6 @@ func TestAlpenglowVotingEnabledAfterReplayRestoresAllExecutionProvenForkVotes(t 
 		require.NoError(t, engine.OnReplayResult(context.Background(), SlotReplayResult{Slot: blockID.Slot, Source: "test"}))
 	}
 	require.NoError(t, engine.EnableVoting(VotingConfig{
-		Identity:        identity,
 		AuthorizedVoter: authorized,
 		VoteAccount:     voteAccount,
 		HistoryDir:      historyDir,
@@ -505,7 +504,7 @@ func newStoppedFloorTestVoter(t *testing.T, root alpenglow.BlockID) (*AlpenglowO
 	voteAccount := solana.PublicKey(voterTestKey(83).Public().(ed25519.PublicKey))
 	set := voterTestValidatorSet(t, identity, authorized, voteAccount)
 
-	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234, AlpenglowIdentity: identity})
+	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234, AlpenglowIdentity: identityHolder(t, identity)})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, engine.Close()) })
 	engine.SetAlpenglowEpochLookup(func(uint64) uint64 { return set.Epoch })
@@ -513,7 +512,6 @@ func newStoppedFloorTestVoter(t *testing.T, root alpenglow.BlockID) (*AlpenglowO
 	engine.SetAlpenglowRoot(root)
 
 	voter, err := newAlpenglowVoter(engine, VotingConfig{
-		Identity:        identity,
 		AuthorizedVoter: authorized,
 		VoteAccount:     voteAccount,
 		HistoryDir:      t.TempDir(),

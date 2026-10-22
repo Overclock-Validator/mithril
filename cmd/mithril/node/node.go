@@ -37,6 +37,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/lightbringer"
 	"github.com/Overclock-Validator/mithril/pkg/lthash"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
@@ -418,19 +419,24 @@ func loadBootstrapStateWith(
 	return validState, nil
 }
 
-func loadValidatorIdentityKeypair(path string) (ed25519.PrivateKey, string, error) {
+// loadValidatorIdentity holds the configured identity keypair, or a fresh
+// ephemeral one when none is configured. Every subsystem reads the node
+// identity from this one holder, so set-identity replaces it in one place.
+func loadValidatorIdentity(path string) (holder *identity.Holder, configured bool, err error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
-		return nil, "", nil
+		holder, err = identity.NewEphemeralHolder()
+		return holder, false, err
 	}
 	key, err := solana.PrivateKeyFromSolanaKeygenFile(path)
 	if err != nil {
-		return nil, "", fmt.Errorf("load validator identity keypair %s: %w", path, err)
+		return nil, false, fmt.Errorf("load validator identity keypair %s: %w", path, err)
 	}
-	if len(key) != ed25519.PrivateKeySize {
-		return nil, "", fmt.Errorf("validator identity keypair %s has invalid private key size %d", path, len(key))
+	holder, err = identity.NewHolder(ed25519.PrivateKey(key))
+	if err != nil {
+		return nil, false, fmt.Errorf("validator identity keypair %s: %w", path, err)
 	}
-	return ed25519.PrivateKey(append([]byte(nil), key...)), key.PublicKey().String(), nil
+	return holder, true, nil
 }
 
 func loadValidatorKeypairPubkey(label, path string) (string, error) {
@@ -1506,7 +1512,7 @@ func runLive(c *cobra.Command, args []string) {
 	var lbManager *lightbringer.Manager
 	useLightbringer := blockSource == "lightbringer"
 	useTurbine := blockSource == "turbine"
-	validatorIdentity, validatorIdentityPubkey, err := loadValidatorIdentityKeypair(validatorIdentityKeypair)
+	validatorIdentity, validatorIdentityConfigured, err := loadValidatorIdentity(validatorIdentityKeypair)
 	if err != nil {
 		klog.Fatalf("%v", err)
 	}
@@ -1646,9 +1652,10 @@ func runLive(c *cobra.Command, args []string) {
 		}
 		validatorVoteAccount = votePubkey
 		if validatorAuthorizedVoterKeypair == "" {
-			if len(validatorIdentity) == ed25519.PrivateKeySize {
-				validatorAuthorizedVoter = append(ed25519.PrivateKey(nil), validatorIdentity...)
-				mlog.Log.Infof("validator vote account configured: %s (authorized voter defaults to identity %s, matching Agave)", votePubkey, validatorIdentityPubkey)
+			// Left empty, the authorized voter is the identity holder's key and
+			// follows set-identity swaps.
+			if validatorIdentityConfigured {
+				mlog.Log.Infof("validator vote account configured: %s (authorized voter defaults to identity %s, matching Agave)", votePubkey, validatorIdentity.PublicKey())
 			}
 		} else {
 			authorizedVoter, authorizedVoterPubkey, err := loadValidatorPrivateKey("authorized voter", validatorAuthorizedVoterKeypair)
@@ -1666,8 +1673,8 @@ func runLive(c *cobra.Command, args []string) {
 		}
 		mlog.Log.FileOnlyf("validator authorized withdrawer configured: %s", withdrawerPubkey)
 	}
-	if validatorIdentityPubkey != "" {
-		mlog.Log.Infof("validator identity configured for native gossip: %s", validatorIdentityPubkey)
+	if validatorIdentityConfigured {
+		mlog.Log.Infof("validator identity configured for native gossip: %s", validatorIdentity.PublicKey())
 	} else if useTurbine && alpenglowObserverBindAddr != "" {
 		mlog.Log.Warnf("ALPENGLOW observer: no validator.identity_keypair configured; native gossip will use an ephemeral identity and may not receive staked Votor traffic")
 	}
@@ -2744,7 +2751,7 @@ postBootstrap:
 				}
 			}
 		}()
-		go monitorValidatorIdentityOwnership(ctx, rpcEndpoints, solana.PrivateKey(validatorIdentity).PublicKey(), sharedGossip, cancelRun)
+		go monitorValidatorIdentityOwnership(ctx, rpcEndpoints, validatorIdentity, sharedGossip, cancelRun)
 
 		epochSchedule := alpenglowEpochSchedule
 		global.SetWallClockSlotDuration(blockprod.AlpenglowSlotDuration)
@@ -2758,7 +2765,7 @@ postBootstrap:
 		mlog.Log.Infof("ALPENGLOW voting startup watermark: wall_clock=%d configured_wait_to_vote=%d wait_to_vote=%d", startupWallSlot, validatorWaitToVoteSlot, waitToVoteSlot)
 
 		broadcaster, err := turbine.NewTurbineBroadcaster(turbine.TurbineBroadcasterConfig{
-			Self:          solana.PrivateKey(validatorIdentity).PublicKey(),
+			Self:          validatorIdentity.PublicKey,
 			Peers:         sharedGossip,
 			Stakes:        turbineStakesForSlot,
 			EpochForSlot:  epochSchedule.GetEpoch,
@@ -2832,9 +2839,7 @@ postBootstrap:
 
 		// Bind and validate local transports before consuming the durable clean
 		// voting marker. Startup configuration failures must not force recovery.
-		identityPubkey := solana.PrivateKey(validatorIdentity).PublicKey()
 		if err := consensusEngine.EnableVoting(consensusengine.VotingConfig{
-			Identity:                  validatorIdentity,
 			AuthorizedVoter:           validatorAuthorizedVoter,
 			VoteAccount:               validatorVoteAccount,
 			HistoryDir:                blockstorePath,
@@ -2854,8 +2859,9 @@ postBootstrap:
 			Peers: func(validators []alpenglow.ValidatorStake) []alpenglow.VotorPeer {
 				peers := make([]alpenglow.VotorPeer, 0, len(validators))
 				seen := make(map[solana.PublicKey]struct{}, len(validators))
+				self := validatorIdentity.PublicKey()
 				for _, validator := range validators {
-					if validator.Stake == 0 || validator.NodePubkey == identityPubkey {
+					if validator.Stake == 0 || validator.NodePubkey == self {
 						continue
 					}
 					addr, ok := sharedGossip.LookupAlpenglow(validator.NodePubkey)
@@ -2883,7 +2889,7 @@ postBootstrap:
 		leaderDone := make(chan struct{})
 		leaderLoop := blockprod.NewLeaderLoop(blockprod.LeaderLoopConfig{
 			Controller:        controller,
-			Identity:          solana.PrivateKey(validatorIdentity),
+			Identity:          validatorIdentity,
 			AccountsDb:        accountsDb,
 			Broadcaster:       broadcaster,
 			ShredVersion:      uint16(turbineShredVersion),
@@ -2987,11 +2993,10 @@ postBootstrap:
 		TurbineShredReceivers: turbineShredRetransmitReceivers,
 	}
 	if consensusMode == "validator" {
-		identity := solana.PrivateKey(validatorIdentity).PublicKey()
 		blockFetchOpts.LocalBlocks = localBlocks
 		blockFetchOpts.LocalLeaderForSlot = func(slot uint64) bool {
 			leader, ok := global.LeaderForSlot(slot)
-			return ok && leader == identity
+			return ok && leader == validatorIdentity.PublicKey()
 		}
 	}
 
@@ -3812,22 +3817,33 @@ const (
 // healthy. Passive gossip cannot always observe the winning record after its
 // own endpoint has been displaced, so use the already-configured RPC view as
 // an independent ownership check and stop cleanly instead of stalling replay.
-func monitorValidatorIdentityOwnership(ctx context.Context, rpcEndpoints []string, identity solana.PublicKey, client *gossip.Client, cancel context.CancelFunc) {
-	if len(rpcEndpoints) == 0 || client == nil || cancel == nil {
+//
+// The monitor follows the identity holder. A set-identity swap restarts the
+// grace period: until our fresh ContactInfo propagates, the cluster may still
+// advertise the previous owner of the new identity.
+func monitorValidatorIdentityOwnership(ctx context.Context, rpcEndpoints []string, holder *identity.Holder, client *gossip.Client, cancel context.CancelFunc) {
+	if len(rpcEndpoints) == 0 || holder == nil || client == nil || cancel == nil {
 		return
 	}
-	grace := time.NewTimer(validatorIdentityOwnershipGrace)
-	defer grace.Stop()
-	select {
-	case <-ctx.Done():
-		return
-	case <-grace.C:
-	}
-
 	ticker := time.NewTicker(validatorIdentityOwnershipPollInterval)
 	defer ticker.Stop()
+	identity := holder.PublicKey()
+	checkAfter := time.Now().Add(validatorIdentityOwnershipGrace)
 	conflicts := 0
 	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if current := holder.PublicKey(); current != identity {
+			identity, conflicts = current, 0
+			checkAfter = time.Now().Add(validatorIdentityOwnershipGrace)
+		}
+		if time.Now().Before(checkAfter) {
+			continue
+		}
+
 		expected := client.AdvertisedGossipAddr()
 		if expected != nil {
 			lookupCtx, lookupCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -3852,12 +3868,6 @@ func monitorValidatorIdentityOwnership(ctx context.Context, rpcEndpoints []strin
 				mlog.Log.Warnf("validator identity ownership check: cluster currently advertises gossip=%s for %s, expected %s (confirmation %d/%d)",
 					observed, identity.String(), expected.String(), conflicts, validatorIdentityConflictConfirmations)
 			}
-		}
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
 		}
 	}
 }
@@ -4469,7 +4479,7 @@ func runReplayWithRecovery(
 	turbineAdvertisedIP string,
 	turbineShredVersion uint16,
 	turbineAlpenglowAddr string,
-	turbineIdentity ed25519.PrivateKey,
+	turbineIdentity *identity.Holder,
 	blockDir string,
 	txParallelism int,
 	isLive bool,

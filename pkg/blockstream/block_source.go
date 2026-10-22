@@ -2,7 +2,6 @@ package blockstream
 
 import (
 	"context"
-	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +17,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/block"
 	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/rpcclient"
 	"github.com/Overclock-Validator/mithril/pkg/turbine"
@@ -51,7 +51,7 @@ type BlockSourceOpts struct {
 	// TurbineStreamingExecution subscribes replay's streaming executor to the
 	// assembler's decoded-batch feed (StreamEvents). Off by default.
 	TurbineStreamingExecution bool
-	TurbineIdentity           ed25519.PrivateKey
+	TurbineIdentity           *identity.Holder
 	LeaderForSlot             func(slot uint64) (solana.PublicKey, bool)
 	TurbineStakesForSlot      func(slot uint64) map[solana.PublicKey]uint64
 	TurbineEpochForSlot       func(slot uint64) uint64
@@ -418,7 +418,7 @@ type BlockSource struct {
 	turbineShredVersion          uint16
 	turbineAlpenglowAddr         string
 	turbineAlpenglowBlockIDHints bool
-	turbineIdentity              ed25519.PrivateKey
+	turbineIdentity              *identity.Holder
 	leaderForSlot                func(slot uint64) (solana.PublicKey, bool)
 	turbineStakesForSlot         func(slot uint64) map[solana.PublicKey]uint64
 	turbineEpochForSlot          func(slot uint64) uint64
@@ -782,7 +782,7 @@ func NewBlockSource(opts *BlockSourceOpts) *BlockSource {
 		turbineAlpenglowAddr:           opts.TurbineAlpenglowAddr,
 		turbineAlpenglowBlockIDHints:   opts.TurbineAlpenglowBlockIDHints,
 		streamEvents:                   newStreamEventChannel(opts),
-		turbineIdentity:                clonePrivateKey(opts.TurbineIdentity),
+		turbineIdentity:                opts.TurbineIdentity,
 		leaderForSlot:                  opts.LeaderForSlot,
 		turbineStakesForSlot:           opts.TurbineStakesForSlot,
 		turbineEpochForSlot:            opts.TurbineEpochForSlot,
@@ -868,13 +868,6 @@ func NewBlockSource(opts *BlockSourceOpts) *BlockSource {
 	}
 
 	return bs
-}
-
-func clonePrivateKey(key ed25519.PrivateKey) ed25519.PrivateKey {
-	if len(key) == 0 {
-		return nil
-	}
-	return append(ed25519.PrivateKey(nil), key...)
 }
 
 func (bs *BlockSource) SetKnownAlpenglowBlockID(slot uint64, blockID solana.Hash) {
