@@ -1749,6 +1749,67 @@ func settleFoldsAtCapacity(
 	return tail.OverCap()
 }
 
+// verifierCapacityBatch selects actual retained banks, not slot distance.
+// through must already satisfy finality, divergence and ordinary verifier lag.
+func verifierCapacityBatch(tail *unrootedTail, through uint64) bool {
+	chunk := tail.overlay.PromotionChunk(through, tail.batchSlots, false)
+	if len(chunk) == 0 {
+		return false
+	}
+	top := chunk[len(chunk)-1].Slot
+	// Verification may finish after the first settlement attempt. An already
+	// verified batch must still get another ordinary fold attempt.
+	return tail.contexts[top] != nil
+}
+
+// waitForVerifierProgress polls until the caller's verification or settlement
+// condition is satisfied. An already-running durable write still has to
+// finish; these deadlines bound verifier waiting, not storage-worker shutdown.
+// Only contiguous verified progress extends the idle deadline.
+func waitForVerifierProgress(ctx context.Context, idleTimeout, maxWait time.Duration, watermark func() uint64, settle func() (bool, error)) (bool, error) {
+	waitCtx, cancel := context.WithTimeout(ctx, maxWait)
+	defer cancel()
+	verified := watermark()
+	idle := time.NewTimer(idleTimeout)
+	defer idle.Stop()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := waitCtx.Err(); err != nil {
+			return true, err
+		}
+		select {
+		case <-idle.C:
+			return true, context.DeadlineExceeded
+		default:
+		}
+		over, err := settle()
+		if err != nil || !over {
+			return over, err
+		}
+		current := watermark()
+		if err := waitCtx.Err(); err != nil {
+			return true, err
+		}
+		select {
+		case <-idle.C:
+			return true, context.DeadlineExceeded
+		default:
+		}
+		if current > verified {
+			verified = current
+			idle.Reset(idleTimeout)
+		}
+		select {
+		case <-waitCtx.Done():
+			return true, waitCtx.Err()
+		case <-idle.C:
+			return true, context.DeadlineExceeded
+		case <-ticker.C:
+		}
+	}
+}
+
 func ReplayBlocks(
 	ctx context.Context,
 	acctsDb *accountsdb.AccountsDb,
@@ -3632,6 +3693,53 @@ func ReplayBlocks(
 			pressureStart := time.Now()
 			mlog.Log.Infof("rooted-durable: memory/slot backpressure at slot %d (held_slots=%d retained_bytes=%d)", block.Slot, unrootedTailState.overlay.HeldSlots(), unrootedTailState.overlay.RetainedBytes())
 			stillOverCap := settleFoldsAtCapacity(unrootedTailState, promoter, block.Slot, applyFoldOutcome, func() bool { return foldRootedPrefix(false) })
+			// A required verifier may catch up without admitting another bank.
+			// Wait only for a full retained batch that is already final and old
+			// enough for ordinary verification. Reward holds may need replay progress,
+			// so they retain the existing fail-closed behavior.
+			if stillOverCap && result.Error == nil && promoter.failure == nil &&
+				trailingVerifier != nil && TrailingVerifierCfg.Required && rewardsHoldBelowSlot == 0 &&
+				unrootedTailState.contexts[block.Slot] != nil {
+				trailingVerifier.mu.Lock()
+				eligibleThrough := uint64(0)
+				if trailingVerifier.executedTip >= trailingVerifier.cfg.LagSlots {
+					eligibleThrough = trailingVerifier.executedTip - trailingVerifier.cfg.LagSlots
+				}
+				trailingVerifier.mu.Unlock()
+				eligibleThrough = safePromoteTarget(lastRootedWatermark, true, eligibleThrough, replayDivergenceFloor)
+				if consensusEngine != nil {
+					// This is only an eligibility query. Actual writes still pass
+					// the complete normal promotion path on every retry.
+					var eligibilityStats alpenglowGateStats
+					var gateErr error
+					eligibleThrough, gateErr = alpenglowPromotionGate(consensusEngine,
+						alpenglowFooterFinalized, alpenglowExecutedBlockIDs, alpenglowForced,
+						mithrilState.LastRootedSlot, eligibleThrough, highestExecutedSlot, &eligibilityStats)
+					if gateErr != nil {
+						var mismatch *AlpenglowFinalityMismatch
+						if errors.As(gateErr, &mismatch) {
+							recordAlpenglowEvidence(mithrilState, mismatch)
+						}
+						result.Error = fmt.Errorf("ALPENGLOW SAFETY: %w; refusing verifier capacity wait", gateErr)
+						break
+					}
+				}
+				if verifierCapacityBatch(unrootedTailState, eligibleThrough) {
+					var waitErr error
+					stillOverCap, waitErr = waitForVerifierProgress(ctx, 30*time.Second, 120*time.Second, trailingVerifier.VerifiedWatermark, func() (bool, error) {
+						over := settleFoldsAtCapacity(unrootedTailState, promoter, block.Slot, applyFoldOutcome, func() bool { return foldRootedPrefix(false) })
+						return over, errors.Join(result.Error, promoter.failure)
+					})
+					if ctx.Err() != nil {
+						result.WasCancelled = true
+						break
+					}
+					if waitErr != nil && !errors.Is(waitErr, context.DeadlineExceeded) {
+						result.Error = waitErr
+						break
+					}
+				}
+			}
 			mlog.Log.Infof("rooted-durable: backpressure settled in %s (held_slots=%d retained_bytes=%d)", time.Since(pressureStart).Round(time.Millisecond), unrootedTailState.overlay.HeldSlots(), unrootedTailState.overlay.RetainedBytes())
 			if result.Error != nil || promoter.failure != nil {
 				break
