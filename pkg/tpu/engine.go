@@ -2,12 +2,12 @@ package tpu
 
 import (
 	"context"
-	"crypto/ed25519"
 	"fmt"
 	"net"
 	"runtime"
 	"time"
 
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/packet"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/pipeline"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/quicserver"
@@ -20,7 +20,7 @@ type Config struct {
 	Name         string
 	ListenAddr   string
 	AdvertisedIP string
-	Identity     ed25519.PrivateKey
+	Identity     *identity.Holder
 	QUIC         quicserver.ServerConfig
 	Pipeline     pipeline.Config
 }
@@ -70,8 +70,8 @@ func (c Config) normalized() Config {
 // Start launches the TPU QUIC server wired into the ingress pipeline.
 func Start(ctx context.Context, cfg Config) (*TPU, error) {
 	cfg = cfg.normalized()
-	if len(cfg.Identity) != ed25519.PrivateKeySize {
-		return nil, fmt.Errorf("invalid TPU identity key size %d", len(cfg.Identity))
+	if cfg.Identity == nil {
+		return nil, fmt.Errorf("TPU identity is required")
 	}
 
 	udpAddr, err := net.ResolveUDPAddr("udp", cfg.ListenAddr)
@@ -106,8 +106,8 @@ func Start(ctx context.Context, cfg Config) (*TPU, error) {
 	}, nil
 }
 
-func (t *TPU) Identity() ed25519.PrivateKey {
-	return append(ed25519.PrivateKey(nil), t.cfg.Identity...)
+func (t *TPU) Identity() *identity.Holder {
+	return t.cfg.Identity
 }
 
 func (t *TPU) ListenAddr() *net.UDPAddr {

@@ -2,7 +2,6 @@ package replay
 
 import (
 	"context"
-	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -33,6 +32,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/fees"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/lthash"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
@@ -128,17 +128,6 @@ func GenerateRunID() string {
 		return fmt.Sprintf("%08x", time.Now().UnixNano()&0xFFFFFFFF)
 	}
 	return hex.EncodeToString(b)
-}
-
-func identityFromTurbineKey(priv ed25519.PrivateKey) solana.PublicKey {
-	if len(priv) != ed25519.PrivateKeySize {
-		return solana.PublicKey{}
-	}
-	pub, ok := priv.Public().(ed25519.PublicKey)
-	if !ok {
-		return solana.PublicKey{}
-	}
-	return solana.PublicKeyFromBytes(pub)
 }
 
 // IsCommitInProgress returns true if we're in the critical commit window.
@@ -1756,7 +1745,7 @@ func ReplayBlocks(
 	turbineAdvertisedIP string,
 	turbineShredVersion uint16,
 	turbineAlpenglowAddr string,
-	turbineIdentity ed25519.PrivateKey,
+	turbineIdentity *identity.Holder,
 	blockDir string,
 	txParallelism int,
 	isLive bool,
@@ -1804,7 +1793,7 @@ func ReplayBlocks(
 	}
 	// Fresh vote/stake dirty watermark for this run (gates the in-loop unwind).
 	resetVoteStakeDirty()
-	nextLeader := newNextLeaderCursor(identityFromTurbineKey(turbineIdentity))
+	nextLeader := newNextLeaderCursor(turbineIdentity)
 	// Create bankhash log file
 	bankhashLogPath := fmt.Sprintf("%s/bankhash.log", acctsDbPath)
 	bankhashLogFile, bankhashLogErr := os.OpenFile(bankhashLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)

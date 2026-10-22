@@ -88,7 +88,7 @@ func startService(t *testing.T) *serviceHarness {
 		TipDistributionProgram:    mainnetTipDistribution,
 		MerkleRootUploadAuthority: majorMerkleAuthority,
 		VoteAccount:               majorVote,
-		Identity:                  solana.PrivateKey(rfc8032Key(t)),
+		Identity:                  identityHolder(t, rfc8032Key(t)),
 	}
 	var err error
 	h.crank, err = NewTipCrank(tips)

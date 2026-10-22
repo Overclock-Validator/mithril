@@ -9,6 +9,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/blockprod"
 	blockenginepb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/blockengine"
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -42,8 +43,8 @@ type TipConfig struct {
 	// CommissionBps is the validator's commission on tips, 0 to 10000.
 	CommissionBps uint16
 	// Identity pays for and signs the crank; it must be an authorized voter
-	// of VoteAccount.
-	Identity solana.PrivateKey
+	// of VoteAccount. Each Build uses the identity current when it starts.
+	Identity *identity.Holder
 }
 
 // TipPaymentConfig is the tip payment program's config account.
@@ -95,7 +96,7 @@ func NewTipCrank(cfg TipConfig) (*TipCrank, error) {
 		return nil, errors.New("tip crank needs both tip programs and the vote account")
 	case cfg.CommissionBps > maxCommissionBps:
 		return nil, fmt.Errorf("tip commission %d bps is over %d", cfg.CommissionBps, maxCommissionBps)
-	case len(cfg.Identity) != 64:
+	case cfg.Identity == nil:
 		return nil, errors.New("tip crank needs the identity key")
 	}
 	c := &TipCrank{cfg: cfg}
@@ -158,24 +159,27 @@ func (c *TipCrank) Build(state TipState, fee FeeInfo, memo string) ([]*solana.Tr
 	needInit := !ok || solana.PublicKeyFromBytes(tdaAcct.Owner[:]) != c.cfg.TipDistributionProgram
 	needChange := config.TipReceiver != tda || config.BlockBuilder != fee.Pubkey || config.CommissionPct != fee.Commission
 
+	signer := c.cfg.Identity.Current()
+	payer := signer.PublicKey()
 	var instructions [][]solana.Instruction
 	if needInit {
-		instructions = append(instructions, []solana.Instruction{c.initTipDistributionAccount(tda, bump)})
+		instructions = append(instructions, []solana.Instruction{c.initTipDistributionAccount(tda, bump, payer)})
 	}
 	if needChange {
 		instructions = append(instructions, []solana.Instruction{
-			c.changeTipReceiver(config, tda),
-			c.changeBlockBuilder(config, tda, fee),
+			c.changeTipReceiver(config, tda, payer),
+			c.changeBlockBuilder(config, tda, fee, payer),
 			solana.NewInstruction(memoProgram, solana.AccountMetaSlice{}, []byte(memo)),
 		})
 	}
+	key := solana.PrivateKey(signer.PrivateKey())
 	txs := make([]*solana.Transaction, 0, len(instructions))
 	for _, ixs := range instructions {
-		tx, err := solana.NewTransaction(ixs, state.LastBlockhash(), solana.TransactionPayer(c.cfg.Identity.PublicKey()))
+		tx, err := solana.NewTransaction(ixs, state.LastBlockhash(), solana.TransactionPayer(payer))
 		if err != nil {
 			return nil, err
 		}
-		if _, err := tx.Sign(func(solana.PublicKey) *solana.PrivateKey { return &c.cfg.Identity }); err != nil {
+		if _, err := tx.Sign(func(solana.PublicKey) *solana.PrivateKey { return &key }); err != nil {
 			return nil, err
 		}
 		txs = append(txs, tx)
@@ -183,7 +187,7 @@ func (c *TipCrank) Build(state TipState, fee FeeInfo, memo string) ([]*solana.Tr
 	return txs, nil
 }
 
-func (c *TipCrank) initTipDistributionAccount(tda solana.PublicKey, bump uint8) solana.Instruction {
+func (c *TipCrank) initTipDistributionAccount(tda solana.PublicKey, bump uint8, payer solana.PublicKey) solana.Instruction {
 	data := append([]byte(nil), initTipDistributionDiscriminator...)
 	data = append(data, c.cfg.MerkleRootUploadAuthority[:]...)
 	data = binary.LittleEndian.AppendUint16(data, c.cfg.CommissionBps)
@@ -192,7 +196,7 @@ func (c *TipCrank) initTipDistributionAccount(tda solana.PublicKey, bump uint8) 
 		solana.NewAccountMeta(c.distributionConfig, false, false),
 		solana.NewAccountMeta(tda, true, false),
 		solana.NewAccountMeta(c.cfg.VoteAccount, false, false),
-		solana.NewAccountMeta(c.cfg.Identity.PublicKey(), true, true),
+		solana.NewAccountMeta(payer, true, true),
 		solana.NewAccountMeta(solana.SystemProgramID, false, false),
 	}, data)
 }
@@ -200,7 +204,7 @@ func (c *TipCrank) initTipDistributionAccount(tda solana.PublicKey, bump uint8) 
 // tipPaymentAccounts is the layout both tip payment instructions use: the
 // config, three instruction-specific accounts, the tip accounts, and the
 // signer, all writable.
-func (c *TipCrank) tipPaymentAccounts(first, second, third solana.PublicKey) solana.AccountMetaSlice {
+func (c *TipCrank) tipPaymentAccounts(first, second, third, payer solana.PublicKey) solana.AccountMetaSlice {
 	metas := solana.AccountMetaSlice{
 		solana.NewAccountMeta(c.config, true, false),
 		solana.NewAccountMeta(first, true, false),
@@ -210,21 +214,21 @@ func (c *TipCrank) tipPaymentAccounts(first, second, third solana.PublicKey) sol
 	for _, tip := range c.tipAccounts {
 		metas = append(metas, solana.NewAccountMeta(tip, true, false))
 	}
-	return append(metas, solana.NewAccountMeta(c.cfg.Identity.PublicKey(), true, true))
+	return append(metas, solana.NewAccountMeta(payer, true, true))
 }
 
-func (c *TipCrank) changeTipReceiver(config TipPaymentConfig, tda solana.PublicKey) solana.Instruction {
+func (c *TipCrank) changeTipReceiver(config TipPaymentConfig, tda, payer solana.PublicKey) solana.Instruction {
 	return solana.NewInstruction(c.cfg.TipPaymentProgram,
-		c.tipPaymentAccounts(config.TipReceiver, tda, config.BlockBuilder),
+		c.tipPaymentAccounts(config.TipReceiver, tda, config.BlockBuilder, payer),
 		append([]byte(nil), changeTipReceiverDiscriminator...))
 }
 
-func (c *TipCrank) changeBlockBuilder(config TipPaymentConfig, tda solana.PublicKey, fee FeeInfo) solana.Instruction {
+func (c *TipCrank) changeBlockBuilder(config TipPaymentConfig, tda solana.PublicKey, fee FeeInfo, payer solana.PublicKey) solana.Instruction {
 	data := append([]byte(nil), changeBlockBuilderDiscriminator...)
 	data = binary.LittleEndian.AppendUint64(data, fee.Commission)
 	// The tip receiver changed in the instruction before.
 	return solana.NewInstruction(c.cfg.TipPaymentProgram,
-		c.tipPaymentAccounts(tda, config.BlockBuilder, fee.Pubkey), data)
+		c.tipPaymentAccounts(tda, config.BlockBuilder, fee.Pubkey, payer), data)
 }
 
 // MemoForStrategy is the 3-byte code a Harmonic crank records for strategy.

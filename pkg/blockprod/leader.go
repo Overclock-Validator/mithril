@@ -12,6 +12,7 @@ import (
 	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/costmodel"
 	"github.com/Overclock-Validator/mithril/pkg/global"
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/replay"
 	"github.com/Overclock-Validator/mithril/pkg/rewardcerts"
@@ -87,7 +88,7 @@ type RewardCertBuilder interface {
 
 type LeaderLoop struct {
 	controller       *Controller
-	identity         solana.PrivateKey
+	identity         *identity.Holder
 	accountsDb       *accountsdb.AccountsDb
 	broadcaster      turbine.PacketBroadcaster
 	shredVersion     uint16
@@ -141,7 +142,7 @@ type leaderProductionWindow struct {
 
 type LeaderLoopConfig struct {
 	Controller       *Controller
-	Identity         solana.PrivateKey
+	Identity         *identity.Holder // read when a slot starts; the slot keeps that identity across a swap
 	AccountsDb       *accountsdb.AccountsDb
 	Broadcaster      turbine.PacketBroadcaster
 	ShredVersion     uint16
@@ -1227,8 +1228,10 @@ func (l *LeaderLoop) startSlotLocked(slot uint64) error {
 
 	parentChainedRoot := parentCtx.ParentChainedMerkleRoot
 
+	// The whole slot is produced and signed under the identity it opened with.
+	leaderKey := l.identity.Current()
 	session := turbine.NewBroadcastSession(turbine.BroadcastSessionConfig{
-		Leader:                  l.identity,
+		Leader:                  solana.PrivateKey(leaderKey.PrivateKey()),
 		Slot:                    slot,
 		ParentSlot:              parentSlot,
 		ParentBlockID:           parentID,
@@ -1267,7 +1270,7 @@ func (l *LeaderLoop) startSlotLocked(slot uint64) error {
 	bank := NewWorkingBank(BankConfig{
 		SlotCtx:             slotCtx,
 		Slot:                slot,
-		Leader:              l.identity.PublicKey(),
+		Leader:              leaderKey.PublicKey(),
 		Limits:              limits,
 		EntryHash:           startEntryHash,
 		Sink:                sink,

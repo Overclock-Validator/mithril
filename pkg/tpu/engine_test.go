@@ -2,11 +2,10 @@ package tpu
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
 	"testing"
 	"time"
 
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/packet"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/pipeline"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/sink"
@@ -14,7 +13,7 @@ import (
 )
 
 func TestTPUStartStop(t *testing.T) {
-	_, identity, err := ed25519.GenerateKey(rand.Reader)
+	holder, err := identity.NewEphemeralHolder()
 	if err != nil {
 		t.Fatalf("GenerateKey: %v", err)
 	}
@@ -22,7 +21,7 @@ func TestTPUStartStop(t *testing.T) {
 	svc, err := Start(context.Background(), Config{
 		Name:       "test-tpu",
 		ListenAddr: "127.0.0.1:0",
-		Identity:   identity,
+		Identity:   holder,
 	})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -44,7 +43,7 @@ func TestTPUStartStop(t *testing.T) {
 }
 
 func TestTPUSubmitFeedsPipelineUntilStopped(t *testing.T) {
-	_, identity, err := ed25519.GenerateKey(rand.Reader)
+	holder, err := identity.NewEphemeralHolder()
 	if err != nil {
 		t.Fatalf("GenerateKey: %v", err)
 	}
@@ -52,7 +51,7 @@ func TestTPUSubmitFeedsPipelineUntilStopped(t *testing.T) {
 	svc, err := Start(context.Background(), Config{
 		Name:       "test-tpu",
 		ListenAddr: "127.0.0.1:0",
-		Identity:   identity,
+		Identity:   holder,
 		Pipeline:   pipeline.Config{SigverifyWorkers: 1, Sink: recv},
 	})
 	if err != nil {

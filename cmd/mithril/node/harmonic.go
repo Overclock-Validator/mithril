@@ -2,13 +2,13 @@ package node
 
 import (
 	"context"
-	"crypto/ed25519"
 	"fmt"
 
 	"github.com/Overclock-Validator/mithril/pkg/blockprod"
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
 	"github.com/Overclock-Validator/mithril/pkg/harmonic"
 	blockenginepb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/blockengine"
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/tpu"
 	solana "github.com/gagliardetto/solana-go"
@@ -104,12 +104,12 @@ func loadHarmonicSettings(get optionGetters) (harmonicSettings, error) {
 // startHarmonic runs the Harmonic service until the returned stop function,
 // which waits for it to finish. The service's hooks must be given to the
 // leader loop with GateTPU set.
-func startHarmonic(ctx context.Context, s harmonicSettings, identity ed25519.PrivateKey, voteAccount solana.PublicKey,
+func startHarmonic(ctx context.Context, s harmonicSettings, holder *identity.Holder, voteAccount solana.PublicKey,
 	tpuService *tpu.TPU, gossipClient *gossip.Client, localTPU gossip.TPUSockets, txV1Enabled func() bool,
 ) (blockprod.LeaderHooks, func(), error) {
 	tips := s.tips
 	tips.VoteAccount = voteAccount
-	tips.Identity = solana.PrivateKey(identity)
+	tips.Identity = holder
 	service, err := harmonic.NewService(harmonic.ServiceConfig{
 		BlockEngine:        s.blockEngine,
 		Relayer:            s.relayer,

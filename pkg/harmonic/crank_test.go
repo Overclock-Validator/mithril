@@ -1,6 +1,7 @@
 package harmonic
 
 import (
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -74,7 +75,7 @@ func majorCrank(t *testing.T, identity solana.PrivateKey) (*TipCrank, *fakeTipSt
 		TipDistributionProgram:    mainnetTipDistribution,
 		MerkleRootUploadAuthority: majorMerkleAuthority,
 		VoteAccount:               majorVote,
-		Identity:                  identity,
+		Identity:                  identityHolder(t, ed25519.PrivateKey(identity)),
 	})
 	require.NoError(t, err)
 	state := &fakeTipState{epoch: 1037, blockhash: solana.Hash{7}, accounts: map[solana.PublicKey]*accounts.Account{
@@ -298,14 +299,14 @@ func TestTipCrankRefusesToBuildFromBadState(t *testing.T) {
 		},
 	}
 	for name, setup := range cases {
-		_, state := majorCrank(t, crank.cfg.Identity)
+		_, state := majorCrank(t, solana.PrivateKey(crank.cfg.Identity.Current().PrivateKey()))
 		txs, err := crank.Build(state, setup(state), "FBA")
 		assert.Errorf(t, err, "%s", name)
 		assert.Emptyf(t, txs, "%s", name)
 	}
 
 	_, err := NewTipCrank(TipConfig{TipPaymentProgram: mainnetTipPayment, TipDistributionProgram: mainnetTipDistribution,
-		VoteAccount: majorVote, CommissionBps: 10_001, Identity: newIdentity(t)})
+		VoteAccount: majorVote, CommissionBps: 10_001, Identity: identityHolder(t, ed25519.PrivateKey(newIdentity(t)))})
 	assert.Error(t, err, "commission over 100%")
 }
 

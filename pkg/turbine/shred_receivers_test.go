@@ -35,7 +35,7 @@ func TestTurbineBroadcasterSendsToShredReceivers(t *testing.T) {
 	leaderPub, leaderKey := testIdentity(t)
 	rootPub, _ := testIdentity(t)
 	b, err := NewTurbineBroadcaster(TurbineBroadcasterConfig{
-		Self:  leaderPub,
+		Self:  func() solana.PublicKey { return leaderPub },
 		Peers: &mutableTVUPeers{peers: []gossip.TVUPeer{{Pubkey: gossip.Pubkey(rootPub), TVUAddr: root.LocalAddr().(*net.UDPAddr)}}},
 		Stakes: func(uint64) map[solana.PublicKey]uint64 {
 			return map[solana.PublicKey]uint64{leaderPub: 1, rootPub: 1}
@@ -100,7 +100,7 @@ func TestRetransmitterSendsToShredReceivers(t *testing.T) {
 			receiver := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8003}
 			sender := newCaptureBatchSender()
 			retransmitter, err := newRetransmitterWithSenders(RetransmitConfig{
-				Identity:       identities[self],
+				Identity:       identityHolder(t, identities[self]),
 				Peers:          &mutableTVUPeers{peers: allPeers},
 				Stakes:         func(uint64) map[solana.PublicKey]uint64 { return stakes },
 				UseChaCha8:     true,

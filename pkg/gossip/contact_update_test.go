@@ -304,7 +304,7 @@ func TestClientContactUpdatesDoNotRaceWithPushes(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for range 500 {
-			if _, err := client.currentContactValue(); err != nil {
+			if _, _, err := client.currentContactValue(); err != nil {
 				t.Errorf("currentContactValue: %v", err)
 				return
 			}
