@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/Overclock-Validator/mithril/pkg/tpu/packet"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/pipeline"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/quicserver"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/sink"
@@ -134,6 +135,16 @@ func (t *TPU) AdvertisedQUICAddr() (*net.UDPAddr, error) {
 		return nil, fmt.Errorf("could not determine advertised TPU IP")
 	}
 	return &net.UDPAddr{IP: ip, Port: local.Port}, nil
+}
+
+// Submit copies a transaction from outside the QUIC listener, such as a
+// relayer, into the ingress pipeline. It never blocks, and returns false if
+// the packet was dropped because ingress is full or the TPU has stopped.
+func (t *TPU) Submit(wire []byte, src packet.Source) bool {
+	if t == nil || t.pipeline == nil {
+		return false
+	}
+	return t.pipeline.Submit(packet.OwnedFrom(wire, src))
 }
 
 func (t *TPU) Stats() Stats {

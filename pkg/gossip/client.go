@@ -44,16 +44,20 @@ type Config struct {
 type Client struct {
 	cfg Config
 
-	entrypoint     *net.UDPAddr
-	bindAddr       *net.UDPAddr
-	tvuAddr        *net.UDPAddr
-	alpenglow      *net.UDPAddr
-	identity       ed25519.PrivateKey
-	pubkey         Pubkey
-	pendingTPUQUIC *net.UDPAddr
+	entrypoint *net.UDPAddr
+	bindAddr   *net.UDPAddr
+	tvuAddr    *net.UDPAddr
+	alpenglow  *net.UDPAddr
+	identity   ed25519.PrivateKey
+	pubkey     Pubkey
 
 	contactMu sync.RWMutex
-	contact   *ContactInfo
+	// contact is replaced on every update and never modified once published,
+	// so readers may use it after releasing contactMu.
+	contact *ContactInfo
+	// pendingContact holds updates made before Run initializes contact.
+	pendingContact []func(*ContactInfo) error
+	contactChanged chan struct{}
 
 	identityConflictMu        sync.Mutex
 	identityConflictGossip    contactEndpoint
@@ -205,6 +209,7 @@ func NewClient(cfg Config) (*Client, error) {
 		identity:           identity,
 		pubkey:             pubkey,
 		identityConflictCh: make(chan error, 1),
+		contactChanged:     make(chan struct{}, 1),
 		peers:              make(map[udpAddrKey]knownPeer),
 		repairPeers:        make(map[Pubkey]RepairPeer),
 		tvuPeers:           make(map[Pubkey]TVUPeer),
@@ -313,6 +318,10 @@ func (c *Client) Run(ctx context.Context) error {
 			if err := c.pushContact(conn); err != nil {
 				return err
 			}
+		case <-c.contactChanged:
+			if err := c.pushContact(conn); err != nil {
+				return err
+			}
 		case <-pingTicker.C:
 			_ = c.sendPing(conn, c.entrypoint)
 			// Pull peers' CRDS tables so discovery isn't purely passive (fixes
@@ -380,13 +389,68 @@ func (c *Client) RepairPeers() []RepairPeer {
 // SetTPUQUIC updates the TPU QUIC endpoints published in this client's CRDS contact.
 // It may be called before Run has initialized the contact record.
 func (c *Client) SetTPUQUIC(addr *net.UDPAddr) error {
+	addr = cloneUDPAddr(addr)
+	return c.UpdateContact(func(contact *ContactInfo) error {
+		return contact.SetTPUQUIC(addr)
+	})
+}
+
+// SetTPUSockets publishes exactly the given TPU endpoints; see
+// ContactInfo.SetTPUSockets.
+func (c *Client) SetTPUSockets(tpu TPUSockets) error {
+	tpu = TPUSockets{
+		UDP:          cloneUDPAddr(tpu.UDP),
+		QUIC:         cloneUDPAddr(tpu.QUIC),
+		ForwardsUDP:  cloneUDPAddr(tpu.ForwardsUDP),
+		ForwardsQUIC: cloneUDPAddr(tpu.ForwardsQUIC),
+	}
+	return c.UpdateContact(func(contact *ContactInfo) error {
+		return contact.SetTPUSockets(tpu)
+	})
+}
+
+// SetClientID sets the client ID advertised in this client's contact.
+func (c *Client) SetClientID(id uint16) error {
+	return c.UpdateContact(func(contact *ContactInfo) error {
+		contact.SetClientID(id)
+		return nil
+	})
+}
+
+// UpdateContact applies fn to a copy of this client's contact and publishes
+// the copy, so a concurrent push never sees a partial update, then pushes it
+// without waiting for the next push interval. Nothing changes if fn fails or
+// leaves the contact in a form peers reject. Updates made before Run
+// initializes the contact are applied in order when it does. fn runs with the
+// contact lock held and must not call back into the client.
+func (c *Client) UpdateContact(fn func(*ContactInfo) error) error {
 	c.contactMu.Lock()
 	defer c.contactMu.Unlock()
 	if c.contact == nil {
-		c.pendingTPUQUIC = cloneUDPAddr(addr)
+		c.pendingContact = append(c.pendingContact, fn)
 		return nil
 	}
-	return c.contact.SetTPUQUIC(addr)
+	next, err := updatedContact(c.contact, fn)
+	if err != nil {
+		return err
+	}
+	c.contact = next
+	select {
+	case c.contactChanged <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func updatedContact(current *ContactInfo, fn func(*ContactInfo) error) (*ContactInfo, error) {
+	next := current.CloneWithWallclock(current.Wallclock)
+	if err := fn(next); err != nil {
+		return nil, err
+	}
+	if err := next.validateEntries(); err != nil {
+		return nil, err
+	}
+	return next, nil
 }
 
 func (c *Client) initializeContact(localGossipAddr *net.UDPAddr) error {
@@ -445,14 +509,16 @@ func (c *Client) initializeContact(localGossipAddr *net.UDPAddr) error {
 		}
 	}
 	c.contactMu.Lock()
-	if c.pendingTPUQUIC != nil {
-		if err := contact.SetTPUQUIC(c.pendingTPUQUIC); err != nil {
-			c.contactMu.Unlock()
-			return fmt.Errorf("set pending TPU QUIC gossip socket: %w", err)
+	defer c.contactMu.Unlock()
+	for _, fn := range c.pendingContact {
+		next, err := updatedContact(contact, fn)
+		if err != nil {
+			return fmt.Errorf("apply pending gossip contact update: %w", err)
 		}
+		contact = next
 	}
+	c.pendingContact = nil
 	c.contact = contact
-	c.contactMu.Unlock()
 	return nil
 }
 

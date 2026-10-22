@@ -32,6 +32,21 @@ func TestSinkAcceptsTransfer(t *testing.T) {
 	assert.Equal(t, uint64(1), stats.InPackets)
 }
 
+func TestSinkDropsWhileBankIsTPUGated(t *testing.T) {
+	env := blockprod.NewTestEnv(blockprod.TestEnvConfig{TPUGated: true})
+	defer env.Close()
+
+	sink := NewSink(env.Controller)
+	sink.Receive(packet.Owned(txfixture.MustSignedTransferWire(0)))
+	assert.Equal(t, uint64(1), sink.Stats().DroppedNoBank)
+	assert.Empty(t, env.Bank.ForgedTransactions())
+
+	env.Bank.AllowTPU()
+	sink.Receive(packet.Owned(txfixture.MustSignedTransferWire(0)))
+	assert.Equal(t, uint64(1), sink.Stats().Accepted)
+	assert.Len(t, env.Bank.ForgedTransactions(), 1)
+}
+
 func TestSinkCountsAlreadyProcessed(t *testing.T) {
 	env := blockprod.NewTestEnv(blockprod.TestEnvConfig{})
 	defer env.Close()

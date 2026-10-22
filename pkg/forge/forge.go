@@ -57,7 +57,7 @@ func (s *Sink) Receive(pkt packet.Packet) {
 	s.mu.Unlock()
 
 	bank := s.banks.WorkingBank()
-	if bank == nil {
+	if bank == nil || !bank.TPUAllowed() {
 		s.mu.Lock()
 		s.stats.DroppedNoBank++
 		s.mu.Unlock()

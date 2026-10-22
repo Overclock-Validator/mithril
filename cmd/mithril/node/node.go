@@ -109,6 +109,7 @@ var (
 	validatorInitializeReservation   bool
 	validatorCompletionReserveMs     int
 	validatorMaxBufferedTransactions int
+	harmonicConfig                   harmonicSettings
 
 	// Mode thresholds
 	blockNearTipThreshold        int // Enter near-tip when gap <= this
@@ -166,6 +167,10 @@ var (
 	turbineGossipBindAddr   string
 	turbineAdvertisedIP     string
 	turbineShredVersion     int
+	// turbineShredReceivers get copies of the shreds this validator
+	// broadcasts, and turbineShredRetransmitReceivers of the shreds it relays.
+	turbineShredReceivers           []*net.UDPAddr
+	turbineShredRetransmitReceivers []*net.UDPAddr
 )
 
 func snapshotEpochForState(manifest *snapshot.SnapshotManifest) uint64 {
@@ -578,6 +583,9 @@ func init() {
 	Run.Flags().IntVar(&validatorCompletionReserveMs, "leader-completion-reserve-ms", 0, "Time reserved for leader finalization and broadcast (0 = 75ms default; tune from measured completion times)")
 	Run.Flags().IntVar(&validatorMaxBufferedTransactions, "tpu-max-buffered-transactions", 0, "Maximum queued TPU transactions (0 = 131072 default)")
 
+	// [harmonic] section flags
+	registerHarmonicFlags(Run.Flags())
+
 	// [tuning] section flags
 	Run.Flags().Uint64Var(&paramArenaSizeMB, "param-arena-size-mb", 512, "Size in MB for serialized parameter arena (0 to disable)")
 	Run.Flags().Uint64Var(&borrowedAccountArenaSize, "borrowed-account-arena-size", 1024, "Number of borrowed accounts to preallocate in arena (0 to disable)")
@@ -624,6 +632,8 @@ func init() {
 	Run.Flags().BoolVar(&blockRPCFallback, "rpc-fallback", false, "Allow RPC to fetch blocks when replay is more than repair-catchup-max-gap-slots behind (default false: shreds via turbine + repair are the only block path)")
 	Run.Flags().StringVar(&turbineAdvertisedIP, "turbine-advertised-ip", "", "Public IP advertised by native turbine gossip (optional)")
 	Run.Flags().IntVar(&turbineShredVersion, "turbine-shred-version", 0, "Shred version for native turbine gossip (0 = discover from entrypoint)")
+	Run.Flags().StringSlice("shred-receiver-address", nil, "Also send every shred this validator broadcasts to this host:port (repeatable), e.g. a block builder")
+	Run.Flags().StringSlice("shred-retransmit-receiver-address", nil, "Also send every shred this node relays to this host:port (repeatable), e.g. a block builder")
 	Run.Flags().IntVar(&blockMaxRPS, "block-max-rps", 0, "Max RPC requests per second for block fetching (0 = use default)")
 	Run.Flags().IntVar(&blockMaxInflight, "block-max-inflight", 0, "Max concurrent block fetch workers (0 = use default)")
 	Run.Flags().IntVar(&blockTipPollIntervalMs, "block-tip-poll-ms", 0, "Tip poll interval in milliseconds (0 = use default)")
@@ -934,6 +944,16 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	turbineGossipBindAddr = getString("turbine-gossip-bind-addr", "turbine.gossip_bind_addr")
 	turbineAdvertisedIP = getString("turbine-advertised-ip", "turbine.advertised_ip")
 	turbineShredVersion = getInt("turbine-shred-version", "turbine.shred_version")
+	shredReceivers, err := parseShredReceivers("turbine.shred_receiver_addresses",
+		getStringSlice("shred-receiver-address", "turbine.shred_receiver_addresses"))
+	if err != nil {
+		return err
+	}
+	turbineShredReceivers = shredReceivers
+	if turbineShredRetransmitReceivers, err = parseShredReceivers("turbine.shred_retransmit_receiver_addresses",
+		getStringSlice("shred-retransmit-receiver-address", "turbine.shred_retransmit_receiver_addresses")); err != nil {
+		return err
+	}
 	repairCatchupMaxGapSlots = getInt("repair-catchup-max-gap-slots", "block.repair_catchup_max_gap_slots")
 	if repairCatchupMaxGapSlots < 0 {
 		repairCatchupMaxGapSlots = 0
@@ -1056,6 +1076,14 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		// The authorized withdrawer is deliberately NOT required at runtime —
 		// best practice keeps it offline.
 		mlog.Log.Infof("consensus.mode=validator: Alpenglow TPU ingress, block production, and fail-closed Votor voting enabled")
+	}
+
+	// [harmonic] section — optional block engine integration for leader slots.
+	if harmonicConfig, err = loadHarmonicSettings(optionGetters{getString: getString, getInt64: getInt64, getBool: getBool}); err != nil {
+		return err
+	}
+	if harmonicConfig.enabled && consensusMode != "validator" {
+		return fmt.Errorf("harmonic.enabled=true requires consensus.mode=validator")
 	}
 
 	blockMaxRPS = getInt("block-max-rps", "block.max_rps")
@@ -1554,6 +1582,7 @@ func runLive(c *cobra.Command, args []string) {
 				RootSlot:                   func() uint64 { return rootSlot },
 				UseChaCha8:                 true,
 				DedupAddrs:                 false,
+				ShredReceivers:             turbineShredRetransmitReceivers,
 				FloorSlot:                  m.Bank.Slot + 1,
 				ShredSpoolDir:              catchupShredSpoolDir(),
 				RepairMaxRequestsPerSecond: repairMaxRequestsPerSecond,
@@ -2737,7 +2766,8 @@ postBootstrap:
 			UseChaCha8:    true,
 			// Agave treats custom/development clusters as non-deduplicating so
 			// every validator derives the same deterministic Turbine node list.
-			DedupAddrs: false,
+			DedupAddrs:     false,
+			ShredReceivers: turbineShredReceivers,
 		})
 		if err != nil {
 			klog.Fatalf("validator turbine broadcaster: %v", err)
@@ -2784,6 +2814,20 @@ postBootstrap:
 		}
 		if err := sharedGossip.SetTPUQUIC(tpuAdvertise); err != nil {
 			mlog.Log.Warnf("validator gossip TPU advertisement: %v", err)
+		}
+		// Harmonic is optional. Without it the leader loop has no hooks and
+		// its banks admit TPU transactions from the start.
+		var leaderHooks blockprod.LeaderHooks
+		if harmonicConfig.enabled {
+			hooks, stopHarmonic, err := startHarmonic(ctx, harmonicConfig, validatorIdentity, validatorVoteAccount, tpuService, sharedGossip,
+				gossip.TPUSockets{QUIC: tpuAdvertise, ForwardsQUIC: tpuAdvertise}, tpuCfg.Pipeline.TxV1Enabled)
+			if err != nil {
+				klog.Fatalf("start Harmonic: %v", err)
+			}
+			// Defers run in reverse: the leader loop, which calls the hooks,
+			// stops first, then Harmonic, then the TPU it submits to.
+			defer stopHarmonic()
+			leaderHooks = hooks
 		}
 
 		// Bind and validate local transports before consuming the durable clean
@@ -2892,6 +2936,8 @@ postBootstrap:
 			},
 			LeaderForSlot: global.LeaderForSlot,
 			RewardCerts:   rewardBuilder,
+			Hooks:         leaderHooks,
+			GateTPU:       leaderHooks != nil,
 			OnBlock: func(produced *block.Block) {
 				select {
 				case localBlocks <- produced:
@@ -2935,9 +2981,10 @@ postBootstrap:
 			}
 			return alpenglowEpochSchedule.GetEpoch(slot)
 		},
-		TurbineRootSlot:   global.ReplayFrontier,
-		TurbineUseChaCha8: true,
-		TurbineDedupAddrs: false,
+		TurbineRootSlot:       global.ReplayFrontier,
+		TurbineUseChaCha8:     true,
+		TurbineDedupAddrs:     false,
+		TurbineShredReceivers: turbineShredRetransmitReceivers,
 	}
 	if consensusMode == "validator" {
 		identity := solana.PrivateKey(validatorIdentity).PublicKey()
@@ -3125,23 +3172,7 @@ func getVersion() string {
 // getCommit returns the git commit hash, preferring ldflags but falling back to
 // runtime/debug.BuildInfo for dev builds.
 func getCommit() string {
-	// If set via ldflags (release builds), use that
-	if version.GitCommit != "" && version.GitCommit != "unknown" {
-		return version.GitCommit
-	}
-	// Fallback to runtime/debug for dev builds (go build without ldflags)
-	if info, ok := debug.ReadBuildInfo(); ok {
-		for _, setting := range info.Settings {
-			if setting.Key == "vcs.revision" {
-				// Return short hash (8 chars) for consistency
-				if len(setting.Value) > 8 {
-					return setting.Value[:8]
-				}
-				return setting.Value
-			}
-		}
-	}
-	return "unknown"
+	return version.Commit()
 }
 
 // getBranch returns the git branch name, preferring ldflags but falling back to

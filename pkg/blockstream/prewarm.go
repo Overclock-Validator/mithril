@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"fmt"
+	"net"
 	"sort"
 	"sync"
 	"time"
@@ -69,8 +70,10 @@ type TurbinePrewarmConfig struct {
 	RootSlot         func() uint64
 	UseChaCha8       bool
 	DedupAddrs       bool
-	FloorSlot        uint64 // resume frontier: spool floor and assembler retention floor
-	MaxSpoolBlocks   int
+	// ShredReceivers get a copy of every shred the prewarm relays.
+	ShredReceivers []*net.UDPAddr
+	FloorSlot      uint64 // resume frontier: spool floor and assembler retention floor
+	MaxSpoolBlocks int
 	// ShredSpoolDir: shared on-disk shred spool. Everything the prewarm
 	// hears goes to disk too, so even blocks beyond the in-RAM spool cap
 	// hydrate later instead of re-repairing.
@@ -119,13 +122,14 @@ func StartTurbinePrewarm(cfg TurbinePrewarmConfig) (*TurbinePrewarm, error) {
 	}
 	if cfg.StakesForSlot != nil {
 		if err := receiver.SetRetransmit(turbine.RetransmitConfig{
-			Identity:     client.Identity(),
-			Peers:        client,
-			Stakes:       cfg.StakesForSlot,
-			EpochForSlot: cfg.EpochForSlot,
-			RootSlot:     cfg.RootSlot,
-			UseChaCha8:   cfg.UseChaCha8,
-			DedupAddrs:   cfg.DedupAddrs,
+			Identity:       client.Identity(),
+			Peers:          client,
+			Stakes:         cfg.StakesForSlot,
+			EpochForSlot:   cfg.EpochForSlot,
+			RootSlot:       cfg.RootSlot,
+			UseChaCha8:     cfg.UseChaCha8,
+			DedupAddrs:     cfg.DedupAddrs,
+			ShredReceivers: cfg.ShredReceivers,
 		}); err != nil {
 			cancel()
 			return nil, fmt.Errorf("prewarm retransmit setup: %w", err)

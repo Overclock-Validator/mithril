@@ -56,6 +56,9 @@ type RetransmitConfig struct {
 	DedupAddrs   bool
 	Workers      int
 	QueueDepth   int
+	// ShredReceivers get a copy of every shred this node relays, in addition
+	// to its Turbine children, such as a block builder on the same host.
+	ShredReceivers []*net.UDPAddr
 }
 
 type retransmitWork struct {
@@ -179,6 +182,8 @@ type Retransmitter struct {
 	parentSourceDirectLeader atomic.Uint64
 	parentSourceRepairSocket atomic.Uint64
 	parentSourceUnexplained  atomic.Uint64
+	shredReceiverSent        atomic.Uint64
+	shredReceiverFailed      atomic.Uint64
 	rootDistance             [maxTurbineHops]atomic.Uint64
 }
 
@@ -216,9 +221,13 @@ type RetransmitStats struct {
 	ParentSourceRepairSocket uint64
 	ParentSourceUnexplained  uint64
 	SendBufferBytes          int
-	LastSendDiagnostic       string
-	LastParentDiagnostic     string
-	RootDistance             [maxTurbineHops]uint64
+	// ShredReceiverSent and ShredReceiverFailed count copies to the
+	// configured shred receivers.
+	ShredReceiverSent    uint64
+	ShredReceiverFailed  uint64
+	LastSendDiagnostic   string
+	LastParentDiagnostic string
+	RootDistance         [maxTurbineHops]uint64
 }
 
 func NewRetransmitter(cfg RetransmitConfig) (*Retransmitter, error) {
@@ -497,9 +506,22 @@ func (r *Retransmitter) send(work retransmitWork, sender packetBatchSender, scra
 	}
 	if len(peers) == 0 {
 		r.noPeers.Add(1)
+	} else {
+		r.sendToPeers(work.packet, peers, sender)
+	}
+	// After the fanout, so receivers never delay it. A leaf forwards too.
+	r.sendToShredReceivers(work.packet, sender)
+}
+
+func (r *Retransmitter) sendToShredReceivers(packet []byte, sender packetBatchSender) {
+	receivers := r.cfg.ShredReceivers
+	if len(receivers) == 0 {
 		return
 	}
-	r.sendToPeers(work.packet, peers, sender)
+	sent, _ := sender.Send(packet, receivers)
+	sent = min(max(sent, 0), len(receivers))
+	r.shredReceiverSent.Add(uint64(sent))
+	r.shredReceiverFailed.Add(uint64(len(receivers) - sent))
 }
 
 func (r *Retransmitter) sendToPeers(packet []byte, peers []*net.UDPAddr, sender packetBatchSender) {
@@ -789,6 +811,8 @@ func (r *Retransmitter) Stats() RetransmitStats {
 		ParentSourceRepairSocket: r.parentSourceRepairSocket.Load(),
 		ParentSourceUnexplained:  r.parentSourceUnexplained.Load(),
 		SendBufferBytes:          r.sendBufferBytes,
+		ShredReceiverSent:        r.shredReceiverSent.Load(),
+		ShredReceiverFailed:      r.shredReceiverFailed.Load(),
 	}
 	r.diagnosticMu.Lock()
 	stats.LastSendDiagnostic = r.lastSendDiag
