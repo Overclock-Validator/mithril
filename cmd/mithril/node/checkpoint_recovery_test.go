@@ -1,6 +1,7 @@
 package node
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -44,7 +45,11 @@ func testDurableStatusContext(t *testing.T, accountsDbPath string, root uint64) 
 	require.NoError(t, err)
 	return &state.ResumeContext{
 		Slot:                        root,
-		Bankhash:                    fmt.Sprintf("bank-%d", root),
+		Bankhash:                    tipID.String(),
+		Blockhash:                   tipID.String(),
+		AcctsLtHash:                 base64.StdEncoding.EncodeToString(make([]byte, 2048)),
+		RecentBlockhashes:           []state.BlockhashEntry{{Blockhash: tipID.String()}},
+		EvictedBlockhash:            solana.Hash{0xee}.String(),
 		AlpenglowBlockID:            tipID.String(),
 		AlpenglowChainedMerkleRoot:  solana.Hash{0xcc}.String(),
 		TransactionStatusCheckpoint: ref,

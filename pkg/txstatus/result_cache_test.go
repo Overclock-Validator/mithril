@@ -34,10 +34,128 @@ func resultTestCache(t *testing.T) *ResultCache {
 	return c
 }
 
+func TestResultCacheForwardChangeClassification(t *testing.T) {
+	for _, mode := range []string{"stable", "publish", "gap", "root", "unwind", "reset", "invalidate", "lineage", "foreign", "generation-wrap", "generation-only", "tip-identity", "root-identity"} {
+		t.Run(mode, func(t *testing.T) {
+			cache := resultTestCache(t)
+			resultTestPublish(t, cache, resultTestID(1, 0))
+			if mode == "generation-wrap" {
+				cache.generation = ^uint64(0)
+			}
+			view, err := cache.Lookup(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := false
+			switch mode {
+			case "publish", "generation-wrap":
+				resultTestPublish(t, cache, resultTestID(2, 0))
+				want = true
+			case "gap":
+				if err := cache.Publish(ResultBank{ID: resultTestID(2, 0), Parent: cache.tip()}); !errors.Is(err, ErrResultUnavailable) {
+					t.Fatal(err)
+				}
+				want = true
+			case "root":
+				if err := cache.Root(resultTestID(1, 0)); err != nil {
+					t.Fatal(err)
+				}
+				want = true
+			case "unwind":
+				if err := cache.Unwind(resultTestID(0, 0)); err != nil {
+					t.Fatal(err)
+				}
+				resultTestPublish(t, cache, resultTestID(2, 0))
+			case "reset":
+				if err := cache.Reset(resultTestID(0, 0)); err != nil {
+					t.Fatal(err)
+				}
+				resultTestPublish(t, cache, resultTestID(2, 0))
+			case "invalidate":
+				cache.Invalidate()
+			case "lineage":
+				if err := cache.Publish(ResultBank{ID: resultTestID(2, 0), Parent: resultTestID(0, 0)}); !errors.Is(err, ErrResultLineage) {
+					t.Fatal(err)
+				}
+			case "foreign":
+				other := resultTestCache(t)
+				resultTestPublish(t, other, resultTestID(1, 0))
+				view, err = other.Lookup(nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				resultTestPublish(t, cache, resultTestID(2, 0))
+			case "generation-only":
+				view.Generation--
+			case "tip-identity":
+				view.Tip.Blockhash[0]++
+				if err := cache.Root(resultTestID(1, 0)); err != nil {
+					t.Fatal(err)
+				}
+			case "root-identity":
+				view.Root.Blockhash[0]++
+				resultTestPublish(t, cache, resultTestID(2, 0))
+			}
+			if got := cache.ChangedOnlyForward(view); got != want {
+				t.Fatalf("forward classification = %t, want %t", got, want)
+			}
+		})
+	}
+}
+
 func resultTestPublish(t *testing.T, c *ResultCache, id ResultBankID, results ...SignatureResult) {
 	t.Helper()
 	if err := c.Publish(ResultBank{ID: id, Parent: c.tip(), Results: results, Complete: true}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestResultCacheHistoryViewOwnsKnownOutcomesAcrossGap(t *testing.T) {
+	c := resultTestCache(t)
+	signature, missing := resultTestSignature(1), resultTestSignature(2)
+	errorJSON := json.RawMessage(`{"InstructionError":[1,{"Custom":1}]}`)
+	resultTestPublish(t, c, resultTestID(1, 0), SignatureResult{Signature: signature, Error: errorJSON})
+	if err := c.Publish(ResultBank{ID: resultTestID(2, 0), Parent: c.tip()}); !errors.Is(err, ErrResultUnavailable) {
+		t.Fatal(err)
+	}
+	query := []solana.Signature{signature, missing, signature}
+	strict, err := c.Lookup(query)
+	if !errors.Is(err, ErrResultUnavailable) || strict.Results != nil {
+		t.Fatal("strict lookup exposed an uncertain partial batch", strict, err)
+	}
+	view, uncertain, err := c.LookupForHistory(query)
+	if err != nil || !uncertain || len(view.Results) != 3 || !view.Results[0].Found ||
+		view.Results[1].Found || !view.Results[2].Found || !bytes.Equal(view.Results[0].Error, errorJSON) {
+		t.Fatal("history lookup lost known outcomes or uncertainty", view, uncertain, err)
+	}
+	view.Results[0].Error[0] = '!'
+	if !bytes.Equal(view.Results[2].Error, errorJSON) {
+		t.Fatal("duplicate output positions share mutable error bytes")
+	}
+	known, uncertain, err := c.LookupForHistory([]solana.Signature{signature})
+	if err != nil || uncertain || !bytes.Equal(known.Results[0].Error, errorJSON) {
+		t.Fatal("caller mutation changed retained outcome", known, uncertain, err)
+	}
+	if empty, uncertain, err := c.LookupForHistory(nil); err != nil || uncertain || empty.Results == nil {
+		t.Fatal("empty history query became uncertain", empty, uncertain, err)
+	}
+	if view, uncertain, err := c.LookupForHistory(make([]solana.Signature, 257)); !errors.Is(err, ErrResultInput) || uncertain || view.Results != nil {
+		t.Fatal("oversized history query bypassed input limit", view, uncertain, err)
+	}
+	for _, lineage := range []bool{false, true} {
+		t.Run(map[bool]string{false: "invalidated", true: "bad-lineage"}[lineage], func(t *testing.T) {
+			cache := resultTestCache(t)
+			if lineage {
+				if err := cache.Publish(ResultBank{ID: resultTestID(2, 0), Parent: resultTestID(1, 0)}); !errors.Is(err, ErrResultLineage) {
+					t.Fatal(err)
+				}
+			} else {
+				cache.Invalidate()
+			}
+			if view, uncertain, err := cache.LookupForHistory(query); !errors.Is(err, ErrResultUnavailable) || uncertain || view.Results != nil {
+				t.Fatal("history view bypassed cache invalidation", view, uncertain, err)
+			}
+		})
 	}
 }
 

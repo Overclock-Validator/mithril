@@ -7,17 +7,19 @@ import (
 	"fmt"
 
 	"github.com/Overclock-Validator/mithril/pkg/blockhistory"
+	"github.com/Overclock-Validator/mithril/pkg/transactionhistory"
 	"github.com/filecoin-project/go-jsonrpc"
 	"github.com/gagliardetto/solana-go/rpc"
 )
 
 type GetBlockResp struct {
-	BlockHeight       uint64                `json:"blockHeight"`
-	BlockTime         *int64                `json:"blockTime"`
-	Blockhash         string                `json:"blockhash"`
-	PreviousBlockhash string                `json:"previousBlockhash"`
-	ParentSlot        uint64                `json:"parentSlot"`
-	Rewards           []blockRewardResponse `json:"rewards,omitzero"`
+	BlockHeight       uint64                       `json:"blockHeight"`
+	BlockTime         *int64                       `json:"blockTime"`
+	Blockhash         string                       `json:"blockhash"`
+	PreviousBlockhash string                       `json:"previousBlockhash"`
+	ParentSlot        uint64                       `json:"parentSlot"`
+	Rewards           []blockRewardResponse        `json:"rewards,omitzero"`
+	Transactions      []historyTransactionResponse `json:"transactions,omitzero"`
 }
 
 type blockRewardResponse struct {
@@ -56,11 +58,6 @@ func (rpcServer *RpcServer) GetFirstAvailableBlock(ctx context.Context, p jsonrp
 }
 
 func (rpcServer *RpcServer) GetBlock(ctx context.Context, p jsonrpc.RawParams) (GetBlockResp, error) {
-	rpcServer.historyRecoveryMu.RLock()
-	defer rpcServer.historyRecoveryMu.RUnlock()
-	if rpcServer.historyRecoveryPending {
-		return GetBlockResp{}, errors.New("RPC history is unavailable during account recovery")
-	}
 	params, err := jsonrpc.DecodeParams[[]json.RawMessage](p)
 	if err != nil {
 		return GetBlockResp{}, &InvalidParamsError{Message: fmt.Sprintf("decoding params: %v", err)}
@@ -72,26 +69,66 @@ func (rpcServer *RpcServer) GetBlock(ctx context.Context, p jsonrpc.RawParams) (
 	if err := json.Unmarshal(params[0], &slot); err != nil || slot == nil {
 		return GetBlockResp{}, &InvalidParamsError{Message: "invalid slot"}
 	}
-	details, showRewards, err := validateBlockConfig(params)
+	config, err := validateBlockConfig(params)
 	if err != nil {
 		return GetBlockResp{}, err
+	}
+	if config.details != "none" {
+		if rpcServer.transactionHistory == nil {
+			return GetBlockResp{}, &InvalidParamsError{Message: fmt.Sprintf("getBlock transactionDetails: %s is not supported because transactions are not retained", config.details)}
+		}
+		if config.details != "full" {
+			return GetBlockResp{}, &InvalidParamsError{Message: "transaction history supports full and none transactionDetails"}
+		}
+		if config.encoding != "json" && config.encoding != "base64" {
+			return GetBlockResp{}, &InvalidParamsError{Message: "transaction history supports json and base64 encoding"}
+		}
+		if err := acquireHistoryResponse(ctx); err != nil {
+			return GetBlockResp{}, err
+		}
+		record, block, err := rpcServer.readTransactionHistoryBlock(ctx, *slot)
+		if err != nil {
+			return GetBlockResp{}, blockHistoryRPCError(*slot, err)
+		}
+		response := blockHistoryResponse(record, config.rewards)
+		response.Transactions = make([]historyTransactionResponse, len(block.Records))
+		for i, record := range block.Records {
+			if err := ctx.Err(); err != nil {
+				return GetBlockResp{}, err
+			}
+			response.Transactions[i], err = encodeHistoryTransaction(record, config.encoding, config.maxVersion)
+			if err != nil {
+				return GetBlockResp{}, blockHistoryRPCError(*slot, err)
+			}
+		}
+		return response, nil
+	}
+	rpcServer.historyRecoveryMu.RLock()
+	defer rpcServer.historyRecoveryMu.RUnlock()
+	if rpcServer.historyRecoveryPending {
+		return GetBlockResp{}, errors.New("RPC history is unavailable during account recovery")
 	}
 	if rpcServer.blockHistory == nil {
 		return GetBlockResp{}, errors.New("node has no retained block history")
 	}
-	if details != "none" {
-		return GetBlockResp{}, &InvalidParamsError{Message: fmt.Sprintf("getBlock transactionDetails: %s is not supported because transactions are not retained", details)}
-	}
 	record, err := rpcServer.blockHistory.Get(*slot)
-	if errors.Is(err, blockhistory.ErrSlotSkipped) {
-		return GetBlockResp{}, &SlotSkippedError{Slot: *slot}
-	}
-	if errors.Is(err, blockhistory.ErrNotAvailable) {
-		return GetBlockResp{}, &BlockNotAvailableError{Slot: *slot}
-	}
 	if err != nil {
-		return GetBlockResp{}, err
+		return GetBlockResp{}, blockHistoryRPCError(*slot, err)
 	}
+	return blockHistoryResponse(record, config.rewards), nil
+}
+
+func blockHistoryRPCError(slot uint64, err error) error {
+	if errors.Is(err, blockhistory.ErrSlotSkipped) {
+		return &SlotSkippedError{Slot: slot}
+	}
+	if errors.Is(err, blockhistory.ErrNotAvailable) || errors.Is(err, transactionhistory.ErrUnavailable) {
+		return &BlockNotAvailableError{Slot: slot}
+	}
+	return err
+}
+
+func blockHistoryResponse(record blockhistory.Record, showRewards bool) GetBlockResp {
 	response := GetBlockResp{
 		BlockHeight:       record.BlockHeight,
 		BlockTime:         record.BlockTime,
@@ -105,7 +142,7 @@ func (rpcServer *RpcServer) GetBlock(ctx context.Context, p jsonrpc.RawParams) (
 			response.Rewards[i] = blockRewardResponse{BlockReward: reward, Commission: reward.Commission}
 		}
 	}
-	return response, nil
+	return response
 }
 
 func requireNoParams(p jsonrpc.RawParams, method string) error {
@@ -122,7 +159,14 @@ func requireNoParams(p jsonrpc.RawParams, method string) error {
 	return nil
 }
 
-func validateBlockConfig(params []json.RawMessage) (string, bool, error) {
+type blockHistoryConfig struct {
+	encoding   string
+	details    string
+	rewards    bool
+	maxVersion *uint8
+}
+
+func validateBlockConfig(params []json.RawMessage) (blockHistoryConfig, error) {
 	var config struct {
 		Encoding                       *string `json:"encoding"`
 		TransactionDetails             *string `json:"transactionDetails"`
@@ -134,19 +178,19 @@ func validateBlockConfig(params []json.RawMessage) (string, bool, error) {
 		if err := json.Unmarshal(params[1], &config); err != nil {
 			var fieldError *json.UnmarshalTypeError
 			if errors.As(err, &fieldError) && fieldError.Field != "" {
-				return "", false, &InvalidParamsError{Message: "invalid " + fieldError.Field}
+				return blockHistoryConfig{}, &InvalidParamsError{Message: "invalid " + fieldError.Field}
 			}
 			// The legacy config form is an encoding string.
 			var encoding string
 			if err := json.Unmarshal(params[1], &encoding); err != nil {
-				return "", false, &InvalidParamsError{Message: "invalid getBlock config"}
+				return blockHistoryConfig{}, &InvalidParamsError{Message: "invalid getBlock config"}
 			}
 			config.Encoding = &encoding
 		}
 	}
 	if config.Commitment != nil {
 		if value := *config.Commitment; value != "confirmed" && value != "finalized" {
-			return "", false, &InvalidParamsError{Message: "getBlock requires confirmed or finalized commitment"}
+			return blockHistoryConfig{}, &InvalidParamsError{Message: "getBlock requires confirmed or finalized commitment"}
 		}
 	}
 	encoding := "json"
@@ -156,10 +200,10 @@ func validateBlockConfig(params []json.RawMessage) (string, bool, error) {
 	switch encoding {
 	case "binary", "base58", "base64", "json", "jsonParsed":
 	default:
-		return "", false, &InvalidParamsError{Message: "invalid encoding"}
+		return blockHistoryConfig{}, &InvalidParamsError{Message: "invalid encoding"}
 	}
 	if (encoding == "binary" || encoding == "base58") && config.MaxSupportedTransactionVersion != nil && *config.MaxSupportedTransactionVersion >= 1 {
-		return "", false, &InvalidParamsError{Message: "base58 encoding is not supported with maxSupportedTransactionVersion >= 1"}
+		return blockHistoryConfig{}, &InvalidParamsError{Message: "base58 encoding is not supported with maxSupportedTransactionVersion >= 1"}
 	}
 	details := "full"
 	if config.TransactionDetails != nil {
@@ -168,11 +212,11 @@ func validateBlockConfig(params []json.RawMessage) (string, bool, error) {
 	switch details {
 	case "full", "none", "signatures", "accounts":
 	default:
-		return "", false, &InvalidParamsError{Message: "invalid transactionDetails"}
+		return blockHistoryConfig{}, &InvalidParamsError{Message: "invalid transactionDetails"}
 	}
 	showRewards := true
 	if config.Rewards != nil {
 		showRewards = *config.Rewards
 	}
-	return details, showRewards, nil
+	return blockHistoryConfig{encoding: encoding, details: details, rewards: showRewards, maxVersion: config.MaxSupportedTransactionVersion}, nil
 }

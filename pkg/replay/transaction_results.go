@@ -210,6 +210,19 @@ func (s *TransactionResultSession) endReplay(publisher SlotCtxSetter, completed 
 	}
 }
 
+func publishRootedTransactionResults(session *TransactionResultSession, publisher SlotCtxSetter, through uint64, rooted *state.ResumeContext) {
+	if err := session.root(through, rooted); err != nil {
+		mlog.Log.Debugf("transaction results unavailable at durable root %d: %v", through, err)
+	}
+	if publisher != nil {
+		var count uint64
+		if rooted.TransactionCount != nil {
+			count = *rooted.TransactionCount
+		}
+		publisher.SetRootedBankState(through, rooted.BlockHeight, count)
+	}
+}
+
 func (s *TransactionResultSession) validateReplay(opts *ConsensusOpts, fetch *BlockFetchOpts) error {
 	if s == nil {
 		return nil

@@ -76,13 +76,13 @@ type InnerInstructionGroup struct {
 // InnerInstruction matches Agave's UiCompiledInstruction. `Data` is
 // base58-encoded; `StackHeight` is nil when not tracked. `StackHeight`
 // is `Option<u32>` in Agave's wire format; using *uint32 here so the
-// field's JSON-number range matches the spec exactly even though
-// real-world CPI depth never exceeds the 4-deep cap.
+// field's JSON-number range matches the spec exactly. Accounts uses a
+// non-byte slice so encoding/json emits numbers rather than base64.
 type InnerInstruction struct {
-	ProgramIdIndex uint8   `json:"programIdIndex"`
-	Accounts       []uint8 `json:"accounts"`
-	Data           string  `json:"data"`
-	StackHeight    *uint32 `json:"stackHeight"`
+	ProgramIdIndex uint8    `json:"programIdIndex"`
+	Accounts       []uint16 `json:"accounts"`
+	Data           string   `json:"data"`
+	StackHeight    *uint32  `json:"stackHeight"`
 }
 
 type ReplacementBlockhashPayload struct {
@@ -786,7 +786,7 @@ func renderRequestedAccounts(conf simulateTransactionConfig, execCtx *sealevel.E
 // renderInnerInstructions converts replay's inner-instruction shape into
 // the typed payload clients expect. Field encoding matches Agave:
 //   - data: base58 (not base64) — what UiCompiledInstruction emits
-//   - stackHeight: nil when not tracked, *uint8 when known
+//   - stackHeight: nil when not tracked, *uint32 when known
 func renderInnerInstructions(lists []replay.InnerInstructionsList) []InnerInstructionGroup {
 	if len(lists) == 0 {
 		return []InnerInstructionGroup{}
@@ -795,8 +795,10 @@ func renderInnerInstructions(lists []replay.InnerInstructionsList) []InnerInstru
 	for _, l := range lists {
 		instrs := make([]InnerInstruction, 0, len(l.Instructions))
 		for _, ix := range l.Instructions {
-			accts := make([]uint8, len(ix.Accounts))
-			copy(accts, ix.Accounts)
+			accts := make([]uint16, len(ix.Accounts))
+			for i, index := range ix.Accounts {
+				accts[i] = uint16(index)
+			}
 			entry := InnerInstruction{
 				ProgramIdIndex: ix.ProgramIdIndex,
 				Accounts:       accts,

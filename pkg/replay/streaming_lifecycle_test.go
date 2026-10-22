@@ -265,11 +265,17 @@ func lifecycleStream(t *testing.T, env *lifecycleEnv, txs []*solana.Transaction,
 
 func lifecycleStreamCapture(t *testing.T, env *lifecycleEnv, txs []*solana.Transaction, splits []int, suffixTxs int, workers int, capture *blockMetadataCapture) (lifecycleOutcome, *streamingExecutor) {
 	t.Helper()
+	return lifecycleStreamResults(t, env, txs, splits, suffixTxs, workers, capture, nil)
+}
+
+func lifecycleStreamResults(t *testing.T, env *lifecycleEnv, txs []*solana.Transaction, splits []int, suffixTxs int, workers int, capture *blockMetadataCapture, results *blockResultCapture) (lifecycleOutcome, *streamingExecutor) {
+	t.Helper()
 	tail := &lifecycleTail{durable: env.durable}
 	statuses := NewTransactionStatusCache()
 	shell := env.block(nil)
 	exec := newBlockExecution(env.acctsDb, shell, env.epochSchedule, workers, nil, &persistedTracker{}, tail, statuses, false, env.parent)
 	exec.metadata = capture
+	exec.results = results
 	require.NoError(t, exec.open())
 	exec.slotCtx.DeferVoteCachePublication = true
 	exec.slotCtx.TrackProgramCacheAdds = true
