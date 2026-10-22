@@ -5,6 +5,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/Overclock-Validator/mithril/pkg/adminrpc"
 	"github.com/Overclock-Validator/mithril/pkg/alpenglow"
 	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/gagliardetto/solana-go"
@@ -99,4 +100,34 @@ func TestVoterRejectsSwapToUnreadableHistory(t *testing.T) {
 	require.Equal(t, blsPublicKey(t, oldKey), voter.signer.PublicKeyCompressed())
 	// The voter still holds and can persist its own history.
 	require.NoError(t, voter.saveHistory())
+}
+
+func TestAdminSetIdentityVoteHistoryRequirement(t *testing.T) {
+	oldKey, newKey := voterTestKey(91), voterTestKey(92)
+	oldNode := solana.PublicKey(oldKey.Public().(ed25519.PublicKey))
+	newNode := solana.PublicKey(newKey.Public().(ed25519.PublicKey))
+	holder, voter, dir := newIdentitySwapTestVoter(t, oldKey, nil)
+	service := &adminrpc.IdentityService{
+		Holder:              holder,
+		StakedNodes:         func() (map[solana.PublicKey]uint64, bool) { return map[solana.PublicKey]uint64{oldNode: 1}, true },
+		VoteHistoryRequired: func(solana.PublicKey) bool { return true },
+		LoadVoteHistory: func(node solana.PublicKey) error {
+			_, err := alpenglow.LoadVoteHistory(dir, node)
+			return err
+		},
+	}
+
+	// The new identity's vote account has voted and it has no history here.
+	err := service.SetIdentity(newKey, false, true)
+	require.ErrorContains(t, err, "Unable to load vote history file for identity "+newNode.String())
+	require.Equal(t, oldNode, holder.PublicKey())
+	require.Equal(t, oldNode, voter.node)
+
+	// Not requiring it creates the history, which the voter then writes.
+	require.NoError(t, service.SetIdentity(newKey, false, false))
+	require.Equal(t, newNode, holder.PublicKey())
+	require.Equal(t, newNode, voter.node)
+	require.NoError(t, voter.saveHistory())
+	_, err = alpenglow.LoadVoteHistory(dir, newNode)
+	require.NoError(t, err)
 }
