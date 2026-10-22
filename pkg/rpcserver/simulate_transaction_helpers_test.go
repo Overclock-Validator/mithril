@@ -65,7 +65,7 @@ func TestRenderInnerInstructions_AgaveWireShape(t *testing.T) {
 	require.Len(t, out[0].Instructions, 1)
 	got := out[0].Instructions[0]
 	assert.Equal(t, uint8(4), got.ProgramIdIndex)
-	assert.Equal(t, []uint8{1, 2}, got.Accounts)
+	assert.Equal(t, []uint16{1, 2}, got.Accounts)
 	assert.Equal(t, "Ldp", got.Data, "data must be base58-encoded, not base64")
 	require.NotNil(t, got.StackHeight)
 	assert.Equal(t, uint32(2), *got.StackHeight, "stackHeight must serialize as Option<u32> per Agave wire format")
@@ -73,7 +73,7 @@ func TestRenderInnerInstructions_AgaveWireShape(t *testing.T) {
 	// JSON shape sanity: round-trip and confirm keys.
 	raw, err := json.Marshal(out)
 	require.NoError(t, err)
-	for _, want := range []string{`"index":0`, `"programIdIndex":4`, `"data":"Ldp"`, `"stackHeight":2`} {
+	for _, want := range []string{`"index":0`, `"programIdIndex":4`, `"accounts":[1,2]`, `"data":"Ldp"`, `"stackHeight":2`} {
 		assert.Contains(t, string(raw), want)
 	}
 }

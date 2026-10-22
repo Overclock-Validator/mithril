@@ -315,6 +315,19 @@ func tryInLoopUnwind(
 	currentEpoch uint64,
 	partitionedRewardsInfo *rewards.PartitionedRewardDistributionInfo,
 ) (*ResumeState, *sealevel.BankSysvars, string) {
+	return tryInLoopUnwindWithResults(sw, tail, mithrilState, epochSchedule, currentEpoch, partitionedRewardsInfo, nil, nil)
+}
+
+func tryInLoopUnwindWithResults(
+	sw *CertifiedSwitch,
+	tail *unrootedTail,
+	mithrilState *state.MithrilState,
+	epochSchedule *sealevel.SysvarEpochSchedule,
+	currentEpoch uint64,
+	partitionedRewardsInfo *rewards.PartitionedRewardDistributionInfo,
+	results *TransactionResultSession,
+	publisher SlotCtxSetter,
+) (*ResumeState, *sealevel.BankSysvars, string) {
 	if tail == nil || sw.Slot == 0 {
 		return nil, nil, unwindFallbackNilTail
 	}
@@ -342,6 +355,7 @@ func tryInLoopUnwind(
 		return nil, nil, unwindFallbackVoteStakeDirty
 	}
 
+	setResultRecoveryPending(results, publisher, true)
 	ctx, bankSysvars := tail.unwind(sw.Slot)
 	if ctx == nil && sw.Slot-1 == mithrilState.LastRootedSlot && mithrilState.LastRootedContext != nil {
 		// The durable boundary carries a persisted ResumeContext, but deliberately

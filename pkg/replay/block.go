@@ -40,6 +40,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/state"
 	"github.com/Overclock-Validator/mithril/pkg/statsd"
+	"github.com/Overclock-Validator/mithril/pkg/txstatus"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
@@ -1777,6 +1778,25 @@ func ReplayBlocks(
 	onCancelWriteState OnCancelWriteState, // callback to write state immediately on cancellation (can be nil)
 ) *ReplayResult {
 	result := &ReplayResult{}
+	var transactionHistory *TransactionHistorySession
+	var transactionResults *TransactionResultSession
+	if consensusOpts != nil {
+		transactionHistory = consensusOpts.TransactionHistory
+		transactionResults = consensusOpts.TransactionResults
+	}
+	if err := transactionHistory.validateReplay(consensusOpts, blockFetchOpts); err != nil {
+		result.Error = err
+		return result
+	}
+	// A retry may proceed while an older candidate is being persisted. Only
+	// the shared canonical read guard decides whether that candidate is usable.
+	defer transactionHistory.discard()
+	if err := transactionResults.validateReplay(consensusOpts, blockFetchOpts); err != nil {
+		result.Error = err
+		return result
+	}
+	completedResultsAttempt := false
+	defer func() { transactionResults.endReplay(rpcServer, completedResultsAttempt) }()
 	historyPublisher, _ := rpcServer.(blockHistoryPublisher)
 	alpenglowMode := consensusOpts != nil && consensusOpts.Alpenglow
 	rewardPublisher, _ := rpcServer.(epochRewardPublisher)
@@ -1951,6 +1971,9 @@ func ReplayBlocks(
 	// block publishes a fully coherent parent. Restoring only those hashes here
 	// would mix them with sysvar/fee state that is restored while configuring the
 	// first block (and may never run across an initial certified-skip span).
+	if err := transactionResults.checkParent(txstatus.ResultBankID{Slot: expectedStatusRoot, Blockhash: initialLastBlockhash}); err != nil {
+		mlog.Log.Debugf("transaction results unavailable at replay parent %d: %v", expectedStatusRoot, err)
+	}
 	InitChainTip(initialLtHash, replayCtx.CurrentFeatures, initialNumSignatures, initialLastBlockhash, transactionStatuses.View())
 	partitionedEpochRewardsEnabled = replayCtx.CurrentFeatures.IsActive(features.EnablePartitionedEpochReward) || replayCtx.CurrentFeatures.IsActive(features.EnablePartitionedEpochRewardsSuperfeature)
 
@@ -2219,13 +2242,7 @@ func ReplayBlocks(
 				mlog.Log.Errorf("failed to advance rooted epoch rewards through slot %d: %v", promotedThrough, err)
 			}
 		}
-		if rpcServer != nil {
-			var transactionCount uint64
-			if rootedCtx.TransactionCount != nil {
-				transactionCount = *rootedCtx.TransactionCount
-			}
-			rpcServer.SetRootedBankState(promotedThrough, rootedCtx.BlockHeight, transactionCount)
-		}
+		publishRootedTransactionResults(transactionResults, rpcServer, promotedThrough, rootedCtx)
 		if rewardsCompletion.retire(&partitionedRewardsInfo, promotedThrough) {
 			rewardsHoldBelowSlot = 0
 			mlog.Log.Infof("epoch rewards bookkeeping retired through durable slot %d; later fork switches may unwind in memory", promotedThrough)
@@ -2681,7 +2698,7 @@ func ReplayBlocks(
 			mlog.Log.Warnf("%v — re-serving the skipped suffix from slot %d; executed bank remains at slot %d", sw, sw.Slot, currentExecutedAnchorSlot())
 			return true
 		}
-		rs, parentBankSysvars, fallbackReason := tryInLoopUnwind(sw, unrootedTailState, mithrilState, epochSchedule, currentEpoch, partitionedRewardsInfo)
+		rs, parentBankSysvars, fallbackReason := tryInLoopUnwindWithResults(sw, unrootedTailState, mithrilState, epochSchedule, currentEpoch, partitionedRewardsInfo, transactionResults, rpcServer)
 		if rs == nil {
 			windowSwitchFallback++
 			switchFallbackReasons[fallbackReason]++
@@ -2723,6 +2740,7 @@ func ReplayBlocks(
 		replayFrontier = rs.ParentSlot
 		global.SetReplayFrontier(rs.ParentSlot)
 		ResetChainTip()
+		transactionResults.finishUnwind(rpcServer, rs)
 		windowSwitchInRAM++
 		mlog.Log.Warnf("%v — unwound in RAM to executed parent slot %d; re-executing the selected chain (in-RAM switches this window: %d)", sw, rs.ParentSlot, windowSwitchInRAM)
 		return true
@@ -2758,6 +2776,8 @@ func ReplayBlocks(
 			persistedHashes:     persistedHashes,
 			tail:                unrootedTailState,
 			transactionStatuses: transactionStatuses,
+			transactionHistory:  transactionHistory,
+			transactionResults:  transactionResults,
 			alpenglowClock:      alpenglowMode,
 			alpenglowMode:       alpenglowMode,
 			unrootedTailUsed:    unrootedTailState != nil,
@@ -2785,11 +2805,18 @@ func ReplayBlocks(
 			StreamingExecutionCfg.workers(txParallelism), StreamingExecutionCfg.MinGroupBatches, StreamingExecutionCfg.maxOpenAge())
 	}
 
+	var transactionHistoryError error
 	for {
 		// The collector is per replay attempt. Discarded candidates, skipped
 		// slots, and typed-recovery exits must never leak timings into the next
 		// successfully written slot (including a later ReplayBlocks invocation).
 		metrics.GlobalBlockReplay = metrics.BlockReplay{}
+		if transactionHistoryError == nil {
+			if err := transactionHistory.wait(ctx); err != nil && ctx.Err() == nil {
+				transactionHistoryError = err
+				mlog.Log.Warnf("transaction history recording disabled: %v", err)
+			}
+		}
 		if ctx.Err() != nil {
 			mlog.Log.Infof("context cancelled, stopping replay: %v", ctx.Err())
 			result.WasCancelled = true
@@ -3346,6 +3373,8 @@ func ReplayBlocks(
 			parentBankSysvars = lastSlotCtx.BankSysvars()
 		}
 		if block.FromLocalProduction {
+			transactionHistory.disable(errors.New("transaction history encountered a locally produced block"))
+			transactionResults.disable()
 			streamer.discardSlot(block.Slot, "local_production")
 			lastSlotCtx, err = adoptLocalLeaderBlock(block, unrootedTailState, transactionStatuses, persistedHashes)
 		} else {
@@ -3365,7 +3394,7 @@ func ReplayBlocks(
 			}
 			if !streamed {
 				streamer.noteWholeBlock(block)
-				lastSlotCtx, err = ProcessBlock(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, unrootedTailState, transactionStatuses, alpenglowClock, parentBankSysvars)
+				lastSlotCtx, err = processBlockWithCaptures(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, unrootedTailState, transactionStatuses, alpenglowClock, parentBankSysvars, transactionHistory, transactionResults)
 			}
 		}
 		processBlockEnd := time.Now()
@@ -3453,6 +3482,10 @@ func ReplayBlocks(
 				mlog.Log.Errorf("%v", result.Error)
 				break
 			}
+		}
+		transactionHistory.acceptBlock(block)
+		if err := transactionResults.acceptBlock(block); err != nil {
+			mlog.Log.Debugf("transaction results unavailable at slot %d: %v", block.Slot, err)
 		}
 		recordFullToReplayed(block)
 		// The same instant FullToReplayed ends at: from here to the next wait
@@ -3885,6 +3918,7 @@ func ReplayBlocks(
 
 	}
 
+	transactionResults.replayStopped(rpcServer, result.Error)
 	if rewardReadPublisher != nil {
 		rewardReadPublisher.ResetEpochRewardView()
 	}
@@ -3953,6 +3987,8 @@ func ReplayBlocks(
 	// Serialize all epoch stakes for persistence
 	result.ComputedEpochStakes = serializeAllEpochStakes()
 
+	transactionResults.replayStopped(rpcServer, result.Error)
+	completedResultsAttempt = true
 	return result
 }
 
@@ -4215,7 +4251,7 @@ func validatePreConsensusTransactionStatuses(
 	return statuses.validateBlockWithPlan(&candidate, plan)
 }
 
-func sequentialTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, block *b.Block, executionPlan blockTransactionExecutionPlan, dbgOpts *DebugOptions, shouldVerifySignatures bool, metadata *transactionMetadataGroup) (fees.TxFeeInfoAccumulator, uint64, error) {
+func sequentialTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, block *b.Block, executionPlan blockTransactionExecutionPlan, dbgOpts *DebugOptions, shouldVerifySignatures bool, metadata *transactionMetadataGroup, results transactionResultGroup) (fees.TxFeeInfoAccumulator, uint64, error) {
 	var txFeeAccumulator fees.TxFeeInfoAccumulator
 	var totalComputeUnitsConsumed uint64
 	// process & execute each transaction in turn
@@ -4227,7 +4263,7 @@ func sequentialTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, bl
 		if block.TxMetas != nil {
 			txMeta = block.TxMetas[idx]
 		}
-		txFeeInfo, txComputeUnitsConsumed, txErr := processTransaction(slotCtx, sigverifyWg, tx, txMeta, dbgOpts, nil, shouldVerifySignatures, metadata.transaction(idx))
+		txFeeInfo, txComputeUnitsConsumed, txErr := processTransactionWithResult(slotCtx, sigverifyWg, tx, txMeta, dbgOpts, nil, shouldVerifySignatures, metadata.transaction(idx), results.transaction(idx))
 		totalComputeUnitsConsumed += txComputeUnitsConsumed
 
 		if txMeta == nil {
@@ -4352,6 +4388,7 @@ func parallelTxLoop(
 	dbgOpts *DebugOptions,
 	shouldVerifySignatures bool,
 	metadata *transactionMetadataGroup,
+	results transactionResultGroup,
 ) (fees.TxFeeInfoAccumulator, uint64, error) {
 	var txFeeAccumulator fees.TxFeeInfoAccumulator
 	txFeeInfos := make([]*fees.TxFeeInfo, len(block.Transactions))
@@ -4389,7 +4426,7 @@ func parallelTxLoop(
 					if idx < len(block.TxMetas) {
 						txMeta = block.TxMetas[idx]
 					}
-					txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = processTransaction(slotCtx, sigverifyWg, block.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[i], shouldVerifySignatures, metadata.transaction(idx))
+					txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = processTransactionWithResult(slotCtx, sigverifyWg, block.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[i], shouldVerifySignatures, metadata.transaction(idx), results.transaction(idx))
 					txErr := errs[idx]
 					// check for success-failure return value divergences
 					if txMeta != nil && txErr == nil && txMeta.Err != nil {
@@ -4443,7 +4480,7 @@ func parallelTxLoop(
 					if int(idx) < len(block.TxMetas) {
 						txMeta = block.TxMetas[idx]
 					}
-					txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = processTransaction(slotCtx, sigverifyWg, block.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[workerIdx], shouldVerifySignatures, metadata.transaction(int(idx)))
+					txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = processTransactionWithResult(slotCtx, sigverifyWg, block.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[workerIdx], shouldVerifySignatures, metadata.transaction(int(idx)), results.transaction(int(idx)))
 					txErr := errs[idx]
 					if txMeta != nil && txErr == nil && txMeta.Err != nil {
 						mlog.Log.Errorf("[run:%s] DIVERGENCE in slot %d: tx %s succeeded locally but failed onchain: %+v",
@@ -4542,6 +4579,47 @@ func ProcessBlock(
 	return processBlock(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, tail, transactionStatuses, alpenglowClock, parentBankSysvars, nil)
 }
 
+func processBlockWithHistory(
+	acctsDb *accountsdb.AccountsDb,
+	block *b.Block,
+	epochSchedule *sealevel.SysvarEpochSchedule,
+	txParallelism int,
+	dbgOpts *DebugOptions,
+	persistedHashes *persistedTracker,
+	tail unrootedState,
+	transactionStatuses *TransactionStatusCache,
+	alpenglowClock bool,
+	parentBankSysvars *sealevel.BankSysvars,
+	history *TransactionHistorySession,
+) (slotCtx *sealevel.SlotCtx, err error) {
+	return processBlockWithCaptures(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, tail, transactionStatuses, alpenglowClock, parentBankSysvars, history, nil)
+}
+
+func processBlockWithCaptures(
+	acctsDb *accountsdb.AccountsDb,
+	block *b.Block,
+	epochSchedule *sealevel.SysvarEpochSchedule,
+	txParallelism int,
+	dbgOpts *DebugOptions,
+	persistedHashes *persistedTracker,
+	tail unrootedState,
+	transactionStatuses *TransactionStatusCache,
+	alpenglowClock bool,
+	parentBankSysvars *sealevel.BankSysvars,
+	history *TransactionHistorySession,
+	resultSession *TransactionResultSession,
+) (slotCtx *sealevel.SlotCtx, err error) {
+	capture := history.begin()
+	results := resultSession.begin()
+	defer func() {
+		if err != nil || slotCtx == nil {
+			history.finish(capture, false)
+			resultSession.discardCapture(results)
+		}
+	}()
+	return processBlockWithResults(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, tail, transactionStatuses, alpenglowClock, parentBankSysvars, capture, results)
+}
+
 func processBlock(
 	acctsDb *accountsdb.AccountsDb,
 	block *b.Block,
@@ -4554,6 +4632,23 @@ func processBlock(
 	alpenglowClock bool,
 	parentBankSysvars *sealevel.BankSysvars,
 	metadata *blockMetadataCapture,
+) (*sealevel.SlotCtx, error) {
+	return processBlockWithResults(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, tail, transactionStatuses, alpenglowClock, parentBankSysvars, metadata, nil)
+}
+
+func processBlockWithResults(
+	acctsDb *accountsdb.AccountsDb,
+	block *b.Block,
+	epochSchedule *sealevel.SysvarEpochSchedule,
+	txParallelism int,
+	dbgOpts *DebugOptions,
+	persistedHashes *persistedTracker,
+	tail unrootedState,
+	transactionStatuses *TransactionStatusCache,
+	alpenglowClock bool,
+	parentBankSysvars *sealevel.BankSysvars,
+	metadata *blockMetadataCapture,
+	results *blockResultCapture,
 ) (*sealevel.SlotCtx, error) {
 	if metadata != nil {
 		*metadata = blockMetadataCapture{}
@@ -4590,6 +4685,7 @@ func processBlock(
 	// the SlotCtx; streaming execution drives the same object group by group.
 	exec := newBlockExecution(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, tail, transactionStatuses, alpenglowClock, parentBankSysvars)
 	exec.metadata = metadata
+	exec.results = results
 	defer exec.close()
 	exec.setReplayStage("prepare_dependency_planner")
 
@@ -4641,11 +4737,12 @@ func processBlock(
 	txLoopRegion := trace.StartRegion(exec.ctx, "TxLoop")
 	shouldVerifySignatures := !block.TransactionSignaturesVerified()
 	groupMetadata := metadata.beginGroup(slotCtx, block.Transactions, txParallelism)
+	groupResults := results.beginGroup(len(block.Transactions))
 	var txLoopErr error
 	if txParallelism > 0 {
-		txFeeAccumulator, totalComputeUnitsConsumed, txLoopErr = parallelTxLoop(slotCtx, &exec.sigverifyWg, planner, block, executionPlan, txParallelism, dbgOpts, shouldVerifySignatures, groupMetadata)
+		txFeeAccumulator, totalComputeUnitsConsumed, txLoopErr = parallelTxLoop(slotCtx, &exec.sigverifyWg, planner, block, executionPlan, txParallelism, dbgOpts, shouldVerifySignatures, groupMetadata, groupResults)
 	} else {
-		txFeeAccumulator, totalComputeUnitsConsumed, txLoopErr = sequentialTxLoop(slotCtx, &exec.sigverifyWg, block, executionPlan, dbgOpts, shouldVerifySignatures, groupMetadata)
+		txFeeAccumulator, totalComputeUnitsConsumed, txLoopErr = sequentialTxLoop(slotCtx, &exec.sigverifyWg, block, executionPlan, dbgOpts, shouldVerifySignatures, groupMetadata, groupResults)
 	}
 	txLoopRegion.End()
 	metrics.GlobalBlockReplay.TxLoop.AddTimingSince(start)

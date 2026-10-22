@@ -112,6 +112,8 @@ type streamingDeps struct {
 	persistedHashes     *persistedTracker
 	tail                unrootedState
 	transactionStatuses *TransactionStatusCache
+	transactionHistory  *TransactionHistorySession
+	transactionResults  *TransactionResultSession
 	alpenglowClock      bool
 
 	lastSlotCtx func() *sealevel.SlotCtx
@@ -571,8 +573,12 @@ func (s *streamingExecutor) openStream(header *turbine.StreamBatch) {
 	// whole-block open would have.
 	sysvarCacheAtOpen := sealevel.SysvarCache
 	exec := newBlockExecution(d.acctsDb, shell, d.epochSchedule, StreamingExecutionCfg.workers(d.txParallelism), d.dbgOpts, d.persistedHashes, d.tail, d.transactionStatuses, d.alpenglowClock, last.BankSysvars())
+	exec.metadata = d.transactionHistory.begin()
+	exec.results = d.transactionResults.begin()
 	if err := exec.open(); err != nil {
 		exec.close()
+		d.transactionHistory.finish(exec.metadata, false)
+		d.transactionResults.discardCapture(exec.results)
 		sealevel.SysvarCache = sysvarCacheAtOpen
 		mlog.Log.Warnf("streaming: slot %d not opened: %v", shell.Slot, err)
 		return
@@ -805,6 +811,8 @@ func (s *streamingExecutor) discard(reason string) {
 	exec := cur.exec
 	if exec != nil {
 		exec.close()
+		s.deps.transactionHistory.finish(exec.metadata, false)
+		s.deps.transactionResults.discardCapture(exec.results)
 		if exec.slotCtx != nil {
 			exec.slotCtx.TrackProgramCacheAdds = false
 			for _, key := range exec.slotCtx.TakeProgramCacheAdds() {

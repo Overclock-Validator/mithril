@@ -68,7 +68,11 @@ type ResultView struct {
 	Tip, Root  ResultBankID
 	Generation uint64
 	Results    []CachedResult
+	lineage    *resultLineage
 }
+
+// resultLineage is a non-zero-sized identity retained by outstanding views.
+type resultLineage byte
 
 type resultBank struct {
 	id, parent ResultBankID
@@ -93,6 +97,7 @@ type ResultCache struct {
 	rooted      int
 	base, root  ResultBankID
 	generation  uint64
+	lineage     *resultLineage
 	charged     uint64
 	limit       uint64
 	unavailable bool
@@ -104,7 +109,7 @@ func NewResultCache(parent ResultBankID) (*ResultCache, error) {
 	if parent.Blockhash.IsZero() {
 		return nil, ErrResultLineage
 	}
-	return &ResultCache{base: parent, root: parent, charged: resultScaffold, limit: resultCacheBytes}, nil
+	return &ResultCache{base: parent, root: parent, lineage: new(resultLineage), charged: resultScaffold, limit: resultCacheBytes}, nil
 }
 
 // Invalidate closes optional result availability until authoritative Reset.
@@ -255,6 +260,7 @@ func (c *ResultCache) Unwind(parent ResultBankID) error {
 	}
 	clear(c.banks[keep:c.count])
 	c.count = keep
+	c.lineage = new(resultLineage)
 	c.generation++
 	return nil
 }
@@ -272,6 +278,7 @@ func (c *ResultCache) Reset(parent ResultBankID) error {
 	c.results = nil
 	c.count, c.rooted, c.base, c.root = 0, 0, parent, parent
 	c.charged, c.unavailable = resultScaffold, false
+	c.lineage = new(resultLineage)
 	c.generation++
 	return nil
 }
@@ -282,15 +289,29 @@ func (c *ResultCache) Reset(parent ResultBankID) error {
 // Root is an exact selected identity, and orphan keys are removed during Unwind.
 // Therefore slot comparison is sufficient only for the already selected map.
 func (c *ResultCache) Lookup(signatures []solana.Signature) (ResultView, error) {
+	view, uncertain, err := c.LookupForHistory(signatures)
+	if err != nil {
+		return ResultView{}, err
+	}
+	if uncertain {
+		return ResultView{}, ErrResultUnavailable
+	}
+	return view, nil
+}
+
+// LookupForHistory returns an owned cache view for canonical history lookup.
+// The boolean marks misses made uncertain by retained incomplete banks. Every
+// such miss must be resolved from history before the caller returns the batch.
+func (c *ResultCache) LookupForHistory(signatures []solana.Signature) (ResultView, bool, error) {
 	if len(signatures) > 256 {
-		return ResultView{}, ErrResultInput
+		return ResultView{}, false, ErrResultInput
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.unavailable {
-		return ResultView{}, ErrResultUnavailable
+		return ResultView{}, false, ErrResultUnavailable
 	}
-	view := ResultView{Tip: c.tip(), Root: c.root, Generation: c.generation, Results: make([]CachedResult, len(signatures))}
+	view := ResultView{Tip: c.tip(), Root: c.root, Generation: c.generation, Results: make([]CachedResult, len(signatures)), lineage: c.lineage}
 	gap, missing := false, false
 	for i := range c.count {
 		gap = gap || !c.banks[i].complete
@@ -305,10 +326,19 @@ func (c *ResultCache) Lookup(signatures []solana.Signature) (ResultView, error) 
 		}
 		missing = missing || !ok
 	}
-	if gap && missing {
-		return ResultView{}, ErrResultUnavailable
-	}
-	return view, nil
+	return view, gap && missing, nil
+}
+
+// ChangedOnlyForward reports a changed view produced only by accepted appends
+// or root advances. Recovery, unwind and invalidation never qualify for retry.
+func (c *ResultCache) ChangedOnlyForward(view ResultView) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	tip := c.tip()
+	return !c.unavailable && view.lineage != nil && view.lineage == c.lineage &&
+		c.generation != view.Generation && (tip.Slot > view.Tip.Slot || c.root.Slot > view.Root.Slot) &&
+		(tip.Slot > view.Tip.Slot || tip == view.Tip) &&
+		(c.root.Slot > view.Root.Slot || c.root == view.Root)
 }
 
 func resultCharge(results []SignatureResult) (uint64, error) {
@@ -349,6 +379,7 @@ func (c *ResultCache) index(id ResultBankID) int {
 
 func (c *ResultCache) invalidate(err error) error {
 	c.unavailable = true
+	c.lineage = new(resultLineage)
 	c.generation++
 	return err
 }
