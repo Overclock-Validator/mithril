@@ -3043,6 +3043,21 @@ postBootstrap:
 	if alpenglowMode {
 		turbineAlpenglowAddr = alpenglowAddrForGossip(alpenglowObserverBindAddr)
 	}
+	// Agave's admin RPC. Started after voting is enabled so the voter's
+	// identity updater is registered before any set-identity can arrive.
+	if blockstorePath != "" {
+		adminServer, err := startAdminRPC(blockstorePath, validatorIdentity, accountsDb, validatorVoteAccount, turbineStakesForSlot)
+		if err != nil {
+			mlog.Log.Warnf("admin RPC unavailable, set-identity is disabled: %v", err)
+		} else {
+			mlog.Log.Infof("admin RPC listening on %s", adminServer.Path())
+			defer func() {
+				if err := adminServer.Close(); err != nil {
+					mlog.Log.Warnf("admin RPC close: %v", err)
+				}
+			}()
+		}
+	}
 	result := runReplayWithRecovery(ctx, accountsDb, accountsPath, manifest, resumeState, uint64(startSlot), liveEndSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, uint16(turbineShredVersion), turbineAlpenglowAddr, validatorIdentity, blockstorePath, int(txParallelism), true, useLightbringer, useTurbine, dbgOpts, metricsWriter, slotCtxSetter, mithrilState, blockFetchOpts, consensusOpts, compactCfg.RewindHorizonBatches, replayStartTime)
 	stopCompactor() // join before shutdown closes AccountsDB
 
