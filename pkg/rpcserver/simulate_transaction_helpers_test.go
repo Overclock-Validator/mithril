@@ -84,6 +84,21 @@ func TestRenderInnerInstructions_EmptyReturnsEmptyArray(t *testing.T) {
 	assert.Len(t, out, 0)
 }
 
+func TestRenderInnerInstructionsAccountIndices(t *testing.T) {
+	for _, indices := range [][]uint8{nil, {}, {0, 255}} {
+		out := renderInnerInstructions([]replay.InnerInstructionsList{{Instructions: []replay.CompiledInstruction{{Accounts: indices}}}})
+		raw, err := json.Marshal(out[0].Instructions[0])
+		require.NoError(t, err)
+		var fields map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(raw, &fields))
+		if len(indices) == 0 {
+			require.JSONEq(t, `[]`, string(fields["accounts"]))
+		} else {
+			require.JSONEq(t, `[0,255]`, string(fields["accounts"]))
+		}
+	}
+}
+
 func TestParseSimulateConfig_MinContextSlot(t *testing.T) {
 	params := []interface{}{
 		"unused-tx-string",
