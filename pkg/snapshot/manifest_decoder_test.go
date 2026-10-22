@@ -71,3 +71,40 @@ func TestManifestSeedPreservesFeeCollectors(t *testing.T) {
 		require.Equal(t, destination, *got.VoteAccounts[vote].BlockRevenueCollector)
 	}
 }
+
+func TestManifestCommissionSurvivesDecodeAndSeed(t *testing.T) {
+	for _, version := range []uint32{sealevel.VoteStateVersionV0_23_5, sealevel.VoteStateVersionV1_14_11, sealevel.VoteStateVersionCurrent, sealevel.VoteStateVersionV4} {
+		for _, bps := range []uint16{0, 1200, 10000, 1234} {
+			want := bps
+			vote := &sealevel.VoteStateVersions{Type: version}
+			if version == sealevel.VoteStateVersionV4 {
+				vote.V4.InflationRewardsCommissionBps = bps
+			} else {
+				want = (bps / 100) * 100
+				vote.V0_23_5.Commission = byte(bps / 100)
+				vote.V1_14_11.Commission = byte(bps / 100)
+				vote.Current.Commission = byte(bps / 100)
+			}
+			var wire, account bytes.Buffer
+			require.NoError(t, vote.MarshalWithEncoder(bin.NewBinEncoder(&wire)))
+			enc := bin.NewBinEncoder(&account)
+			require.NoError(t, enc.WriteUint64(42, bin.LE))
+			require.NoError(t, enc.WriteUint64(uint64(wire.Len()), bin.LE))
+			require.NoError(t, enc.WriteBytes(wire.Bytes(), false))
+			require.NoError(t, enc.WriteBytes(make([]byte, 32), false))
+			require.NoError(t, enc.WriteByte(0))
+			require.NoError(t, enc.WriteUint64(0, bin.LE))
+			var decoded VoteAccount
+			require.NoError(t, decoded.UnmarshalWithDecoder(bin.NewBinDecoder(account.Bytes())))
+			require.NotNil(t, decoded.InflationRewardsCommissionBps)
+			require.Equal(t, want, *decoded.InflationRewardsCommissionBps)
+			key := solana.PublicKey{31}
+			seeds := convertVersionedEpochStakesToPersisted([]VersionedEpochStakesPair{{Epoch: 1058, Val: VersionedEpochStakes{TotalStake: 42, Stakes: Stake{VoteAccounts: []VoteAccountsPair{{Key: key, Stake: 42, Value: decoded}}}}}})
+			cache := epochstakes.NewEpochStakesCache()
+			_, err := cache.DeserializeAndLoadEpoch([]byte(seeds[1058]))
+			require.NoError(t, err)
+			got, _ := cache.Snapshot(1058)
+			require.Equal(t, want, *got.VoteAccounts[key].InflationRewardsCommissionBps)
+		}
+	}
+}

@@ -51,6 +51,7 @@ func CleanAccountsDbDir(accountsDbDir string) {
 		// so retaining them would waste space and make stale diagnostics look
 		// actionable.
 		"transaction-status-checkpoints",
+		"rpc-epoch-rewards",
 		"mithril_db",
 		"mithril_db_log_shards",
 		"bankhash_db",

@@ -286,3 +286,19 @@ func TestLoadEpochInflationAccountStateForReplayFallsBackToSpeculativeParent(t *
 	require.NoError(t, err)
 	require.Equal(t, parentState, loaded)
 }
+
+func TestEpochInflationBudgetTestnet451964256(t *testing.T) {
+	// Frozen inputs at the epoch 1058 -> 1059 boundary and Agave's on-chain
+	// vote_reward_account value. A one-ULP pow difference changes this by 1.
+	schedule := &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 432000, LeaderScheduleSlotOffset: 432000, Warmup: true, FirstNormalEpoch: 14, FirstNormalSlot: 524256}
+	f := features.NewFeaturesDefault()
+	f.EnableFeature(features.PicoInflation, 49772256)
+	f.EnableFeature(features.ReduceSlotTimeTo350ms, 426476256)
+	f.EnableFeature(features.ReduceSlotTimeTo300ms, 427340256)
+	f.EnableFeature(features.ReduceSlotTimeTo250ms, 428204256)
+	f.EnableFeature(features.ReduceSlotTimeTo200ms, 429068256)
+	inflation := rewards.Inflation{Initial: 0.15, Terminal: 0.015, Taper: 0.15}
+	got := newEpochInflationState(schedule, &inflation, 2139687087758323546, 387145715402013, 1059, 157784629.968, f)
+	require.Equal(t, uint64(392970281850805), got.MaxPossibleValidatorReward)
+	require.Equal(t, uint64(1059), got.Epoch)
+}

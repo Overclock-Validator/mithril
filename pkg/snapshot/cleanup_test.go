@@ -9,12 +9,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestCleanAccountsDbDirRemovesTransactionStatusCheckpoints(t *testing.T) {
+func TestCleanAccountsDbDirRemovesReplaySidecars(t *testing.T) {
 	root := t.TempDir()
 	checkpointDir := filepath.Join(root, "transaction-status-checkpoints")
+	rewardDir := filepath.Join(root, "rpc-epoch-rewards")
 	require.NoError(t, os.MkdirAll(checkpointDir, 0o755))
+	require.NoError(t, os.MkdirAll(rewardDir, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(checkpointDir, "stale.bin"), []byte("stale"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(rewardDir, "stale.json"), []byte("stale"), 0o644))
 
 	CleanAccountsDbDir(root)
 	assert.NoDirExists(t, checkpointDir)
+	assert.NoDirExists(t, rewardDir)
 }

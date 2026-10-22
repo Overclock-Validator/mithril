@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
+	b "github.com/Overclock-Validator/mithril/pkg/block"
+	"github.com/Overclock-Validator/mithril/pkg/epochrewards"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/filecoin-project/go-jsonrpc"
@@ -21,7 +23,28 @@ import (
 	"github.com/gagliardetto/solana-go"
 )
 
+// rpcHandler exposes only public RPC methods to go-jsonrpc's reflection-based
+// registration. Internal setters and lifecycle hooks remain Go-only.
+type rpcHandler struct {
+	rpcMethods
+}
+
+type rpcMethods interface {
+	GetAccountInfo(context.Context, jsonrpc.RawParams) (GetAccountInfoResp, error)
+	GetBankHash(context.Context, jsonrpc.RawParams) (string, error)
+	GetBlockHeight(context.Context, jsonrpc.RawParams) (uint64, error)
+	GetEpochInfo(context.Context, jsonrpc.RawParams) (GetEpochInfoResp, error)
+	GetGenesisHash(context.Context, jsonrpc.RawParams) (string, error)
+	GetInflationReward(context.Context, jsonrpc.RawParams) ([]*InflationRewardResp, error)
+	GetLatestBlockhash(context.Context, jsonrpc.RawParams) (GetLatestBlockhashResp, error)
+	SendTransaction(context.Context, jsonrpc.RawParams) (string, error)
+	SimulateTransaction(context.Context, jsonrpc.RawParams) (SimulateTransactionResp, error)
+}
+
 type RpcServer struct {
+	historyRecoveryMu      sync.RWMutex
+	historyRecoveryPending bool
+
 	isReady       bool
 	rpcService    *jsonrpc.RPCServer
 	serv          *httptest.Server
@@ -31,6 +54,7 @@ type RpcServer struct {
 	slotCtx       *sealevel.SlotCtx
 	slotCtxMu     sync.RWMutex
 	genesisHash   string
+	epochRewards  *epochrewards.Store
 
 	leaderTPUCacheMu         sync.RWMutex
 	leaderTPUByIdentity      map[solana.PublicKey]tpuEndpoint
@@ -53,9 +77,127 @@ var supportedRPCMethods = map[string]struct{}{
 	"getBlockHeight":      {},
 	"getEpochInfo":        {},
 	"getGenesisHash":      {},
+	"getInflationReward":  {},
 	"getLatestBlockhash":  {},
 	"sendTransaction":     {},
 	"simulateTransaction": {},
+}
+
+// EnableEpochRewards attaches durable Alpenglow reward history to the RPC server.
+func (rpcServer *RpcServer) EnableEpochRewards(dir string, retentionSlots, rootedSlot uint64) error {
+	store, err := epochrewards.Open(dir, retentionSlots)
+	if err != nil {
+		return err
+	}
+	if err := store.SetRooted(rootedSlot); err != nil {
+		return err
+	}
+	rpcServer.epochRewards = store
+	return nil
+}
+
+// RecordEpochRewards records rewards from a successfully replayed block.
+func (rpcServer *RpcServer) RecordEpochRewards(block *b.Block) error {
+	if rpcServer == nil || rpcServer.epochRewards == nil {
+		return nil
+	}
+	return rpcServer.epochRewards.RecordBlock(block)
+}
+
+// RecordEpochRewardStatus records coverage from the successfully replayed bank.
+func (rpcServer *RpcServer) RecordEpochRewardStatus(block *b.Block, bank *sealevel.BankSysvars, partitioned bool) {
+	if rpcServer == nil || rpcServer.epochRewards == nil || rpcServer.epochSchedule == nil || block == nil || block.Epoch == 0 {
+		return
+	}
+	if block.ParentSlot >= block.Slot || rpcServer.epochSchedule.GetEpoch(block.Slot) != block.Epoch {
+		return
+	}
+	boundary := rpcServer.epochSchedule.GetEpoch(block.ParentSlot) < block.Epoch
+	complete := false
+	if bank != nil && bank.Slot() == block.Slot {
+		if partitioned {
+			rewards, ok := bank.EpochRewards()
+			complete = ok && !rewards.Active
+		} else {
+			complete = boundary
+		}
+	}
+	rpcServer.epochRewards.RecordCoverage(block.Epoch-1, block.Slot, boundary, complete)
+	if partitioned && bank != nil && bank.Slot() == block.Slot && block.BlockHeight != 0 {
+		if rewards, ok := bank.EpochRewards(); ok && rewards.Active {
+			rpcServer.epochRewards.RecordDistribution(block.Epoch-1, block.Slot, epochrewards.Distribution{
+				BlockHeight: block.BlockHeight, StartingBlockHeight: rewards.DistributionStartingBlockHeight,
+				NumPartitions: rewards.NumPartitions, ParentBlockhash: rewards.ParentBlockhash,
+			})
+		}
+	}
+}
+
+// PrepareEpochRewards stages rewards with the matching durable fold.
+func (rpcServer *RpcServer) PrepareEpochRewards(through uint64) error {
+	if rpcServer == nil || rpcServer.epochRewards == nil {
+		return nil
+	}
+	rpcServer.historyRecoveryMu.Lock()
+	defer rpcServer.historyRecoveryMu.Unlock()
+	return rpcServer.epochRewards.Prepare(through)
+}
+
+// PublishEpochRewards exposes a prefix that replay has verified as canonical.
+// It is independent of the durable account checkpoint and is not an RPC method.
+func (rpcServer *RpcServer) PublishEpochRewards(slot uint64) {
+	if rpcServer == nil || rpcServer.epochRewards == nil {
+		return
+	}
+	rpcServer.historyRecoveryMu.Lock()
+	defer rpcServer.historyRecoveryMu.Unlock()
+	if !rpcServer.historyRecoveryPending {
+		rpcServer.epochRewards.Publish(slot)
+	}
+}
+
+// ResetEpochRewardView withdraws process-local publication during replay recovery.
+func (rpcServer *RpcServer) ResetEpochRewardView() {
+	if rpcServer == nil || rpcServer.epochRewards == nil {
+		return
+	}
+	rpcServer.historyRecoveryMu.Lock()
+	defer rpcServer.historyRecoveryMu.Unlock()
+	rpcServer.epochRewards.ResetPublished()
+}
+
+// SetRootedEpochRewardsSlot sets the durable reward watermark.
+func (rpcServer *RpcServer) SetRootedEpochRewardsSlot(slot uint64) error {
+	if rpcServer == nil || rpcServer.epochRewards == nil {
+		return nil
+	}
+	rpcServer.historyRecoveryMu.Lock()
+	defer rpcServer.historyRecoveryMu.Unlock()
+	return rpcServer.epochRewards.SetRooted(slot)
+}
+
+// RewindEpochRewards drops speculative rewards from a discarded fork suffix.
+func (rpcServer *RpcServer) RewindEpochRewards(fromSlot uint64) error {
+	if rpcServer == nil || rpcServer.epochRewards == nil {
+		return nil
+	}
+	rpcServer.historyRecoveryMu.Lock()
+	defer rpcServer.historyRecoveryMu.Unlock()
+	return rpcServer.epochRewards.Rewind(fromSlot)
+}
+
+// SetHistoryRecoveryPending blocks history reads during a durable account rewind.
+// Failed recovery leaves the gate closed without deleting retained records.
+func (rpcServer *RpcServer) SetHistoryRecoveryPending(pending bool) {
+	if rpcServer == nil {
+		return
+	}
+	rpcServer.historyRecoveryMu.Lock()
+	defer rpcServer.historyRecoveryMu.Unlock()
+	rpcServer.historyRecoveryPending = pending
+	if pending && rpcServer.epochRewards != nil {
+		rpcServer.epochRewards.ResetPublished()
+	}
 }
 
 func NewRpcServer(acctsDb *accountsdb.AccountsDb, port uint16, epochSchedule *sealevel.SysvarEpochSchedule, genesisHash solana.Hash) *RpcServer {
@@ -77,7 +219,7 @@ func NewRpcServer(acctsDb *accountsdb.AccountsDb, port uint16, epochSchedule *se
 		jsonrpc.WithServerErrors(rpcErrors),
 	)
 
-	rpcServer.rpcService.Register("MithrilRpc", rpcServer)
+	rpcServer.rpcService.Register("MithrilRpc", rpcHandler{rpcServer})
 	rpcServer.acctsDb = acctsDb
 	if epochSchedule != nil {
 		rpcServer.epochSchedule = epochSchedule

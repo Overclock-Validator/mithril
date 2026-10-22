@@ -31,6 +31,8 @@ type Stats struct {
 	EvictedCapacity         uint64
 	DroppedExpired          uint64
 	DroppedAlreadyProcessed uint64
+	DroppedAccountLocks     uint64
+	DroppedLookup           uint64
 	Accepted                uint64
 	DroppedNoBank           uint64
 	DroppedCost             uint64
@@ -362,6 +364,10 @@ func (s *Scheduler) recordForge(result blockprod.ForgeResult, reason costmodel.E
 		s.stats.DroppedExecution++
 	case blockprod.ForgeDroppedAlreadyProcessed:
 		s.stats.DroppedAlreadyProcessed++
+	case blockprod.ForgeDroppedAccountLocks:
+		s.stats.DroppedAccountLocks++
+	case blockprod.ForgeDroppedLookup:
+		s.stats.DroppedLookup++
 	default:
 		s.stats.DroppedNoBank++
 	}

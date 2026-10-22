@@ -13,10 +13,11 @@ import (
 // writes) instead of a full rescan. Siblings are never materialized as state:
 // a switch unwinds this suffix and re-executes the certified block.
 type WorkingSet struct {
-	mu     sync.RWMutex
-	bySlot map[uint64]*slotLayer
-	order  []uint64               // held slots, ascending
-	flat   map[[32]byte]flatEntry // newest unrooted value per key
+	mu            sync.RWMutex
+	bySlot        map[uint64]*slotLayer
+	order         []uint64               // held slots, ascending
+	flat          map[[32]byte]flatEntry // newest unrooted value per key
+	retainedBytes uint64                 // account capacities plus estimated per-version bookkeeping
 }
 
 type flatEntry struct {
@@ -25,12 +26,23 @@ type flatEntry struct {
 }
 
 type slotLayer struct {
-	slot   uint64
-	writes map[[32]byte]*Account
+	slot          uint64
+	writes        map[[32]byte]*Account
+	retainedBytes uint64
 	// undo records, one per FIRST write of a key in this slot: what the flat
 	// entry pointed at before this slot overwrote it. Applying a suffix's
 	// undos newest-layer-first restores the flat map exactly.
 	undo []undoPtr
+}
+
+// Include account structs, map entries and undo records as well as the backing
+// array capacity. This is a conservative budget, not a measurement of the heap;
+// shared account values in different slots are deliberately counted per version.
+const workingSetVersionOverhead = 512
+
+// RetainedAccountBytes estimates the cost of one immutable working-set version.
+func RetainedAccountBytes(a *Account) uint64 {
+	return uint64(cap(a.Data)) + workingSetVersionOverhead
 }
 
 type undoPtr struct {
@@ -66,6 +78,14 @@ func (w *WorkingSet) Add(slot uint64, delta []*Account) {
 			continue
 		}
 		key := [32]byte(a.Key)
+		if previous, exists := layer.writes[key]; exists {
+			cost := RetainedAccountBytes(previous)
+			layer.retainedBytes -= cost
+			w.retainedBytes -= cost
+		}
+		cost := RetainedAccountBytes(a)
+		layer.retainedBytes += cost
+		w.retainedBytes += cost
 		if _, again := layer.writes[key]; !again {
 			// First write of this key in this slot: journal what flat held.
 			if e, exists := w.flat[key]; exists && e.slot != slot {
@@ -88,6 +108,13 @@ func (w *WorkingSet) HeldSlots() int {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	return len(w.order)
+}
+
+// RetainedBytes includes every buffered slot version, not only newest keys.
+func (w *WorkingSet) RetainedBytes() uint64 {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.retainedBytes
 }
 
 // Lookup returns the newest unrooted value for pubkey (nil, false if none held).
@@ -134,7 +161,7 @@ func (w *WorkingSet) PromotionPrefix(through uint64) []SlotDelta {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
-	return w.promotionChunkLocked(through, len(w.order), true)
+	return w.promotionChunkLocked(through, len(w.order), 0, true)
 }
 
 // PromotionChunk returns at most maxSlots oldest held slots through the caller's
@@ -144,17 +171,30 @@ func (w *WorkingSet) PromotionPrefix(through uint64) []SlotDelta {
 // This only prepares borrowed account pointers; it does not commit, prune, or
 // advance durability. Callers still own finality checks and durable commit order.
 func (w *WorkingSet) PromotionChunk(through uint64, maxSlots int, allowPartial bool) []SlotDelta {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	return w.promotionChunkLocked(through, maxSlots, allowPartial)
+	return w.PromotionChunkWithByteLimit(through, maxSlots, 0, allowPartial)
 }
 
-func (w *WorkingSet) promotionChunkLocked(through uint64, maxSlots int, allowPartial bool) []SlotDelta {
+// PromotionChunkWithByteLimit admits a shorter chunk once maxBytes is reached.
+// Slots are atomic: the last slot may overshoot the byte target. The caller's
+// verified through bound is always respected, including under memory pressure.
+// Zero maxBytes preserves slot-only batching.
+func (w *WorkingSet) PromotionChunkWithByteLimit(through uint64, maxSlots int, maxBytes uint64, allowPartial bool) []SlotDelta {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.promotionChunkLocked(through, maxSlots, maxBytes, allowPartial)
+}
+
+func (w *WorkingSet) promotionChunkLocked(through uint64, maxSlots int, maxBytes uint64, allowPartial bool) []SlotDelta {
 	count := 0
+	var bytes uint64
 	for count < len(w.order) && count < maxSlots && w.order[count] <= through {
+		bytes += w.bySlot[w.order[count]].retainedBytes
 		count++
+		if maxBytes > 0 && bytes >= maxBytes {
+			break
+		}
 	}
-	if count == 0 || (!allowPartial && count < maxSlots) {
+	if count == 0 || (!allowPartial && count < maxSlots && (maxBytes == 0 || bytes < maxBytes)) {
 		return nil
 	}
 	batch := make([]SlotDelta, count)
@@ -187,6 +227,7 @@ func (w *WorkingSet) PromotePrefix(through uint64) {
 				delete(w.flat, key) // no surviving held writer -> durable
 			}
 		}
+		w.retainedBytes -= w.bySlot[slot].retainedBytes
 		delete(w.bySlot, slot)
 	}
 	w.order = kept
@@ -245,6 +286,7 @@ func (w *WorkingSet) EvictFrom(slot uint64) {
 		}
 	}
 	for _, s := range suffix {
+		w.retainedBytes -= w.bySlot[s].retainedBytes
 		delete(w.bySlot, s)
 	}
 	w.order = w.order[:cut]
@@ -256,10 +298,20 @@ func (w *WorkingSet) CheckInvariants() error {
 	defer w.mu.RUnlock()
 
 	want := make(map[[32]byte]flatEntry)
+	var retainedBytes uint64
 	for _, slot := range w.order {
+		var layerBytes uint64
 		for key, acct := range w.bySlot[slot].writes {
 			want[key] = flatEntry{slot: slot, acct: acct}
+			layerBytes += RetainedAccountBytes(acct)
 		}
+		if layerBytes != w.bySlot[slot].retainedBytes {
+			return errInvariant("slot retained bytes", w.bySlot[slot].retainedBytes, layerBytes)
+		}
+		retainedBytes += layerBytes
+	}
+	if retainedBytes != w.retainedBytes {
+		return errInvariant("retained bytes", w.retainedBytes, retainedBytes)
 	}
 	if len(want) != len(w.flat) {
 		return errInvariant("flat size", len(w.flat), len(want))
