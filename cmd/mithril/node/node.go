@@ -2600,6 +2600,11 @@ postBootstrap:
 				klog.Fatalf("unable to load RPC epoch rewards: %v", err)
 			}
 		}
+		retentionSlots := schedule.SlotsPerEpoch * 2
+		if err := enableRPCBlockHistory(rpcServer, alpenglowMode, filepath.Join(accountsPath, "rpc-block-history"), retentionSlots, mithrilState.LastRootedSlot); err != nil {
+			klog.Fatalf("enable RPC block history: %v", err)
+		}
+		publishRPCBankState(rpcServer, mithrilState)
 		rpcServer.Start()
 		mlog.Log.Infof("Started RPC server on port %d", rpcPort)
 	}
@@ -4403,6 +4408,12 @@ func rewindStoreBelowDivergence(accountsDbPath string, accountsDb *accountsdb.Ac
 			return false
 		}
 	}
+	if history, ok := rpcServer.(interface{ RewindBlockHistory(uint64) error }); ok {
+		if err := history.RewindBlockHistory(res.NewThrough); err != nil {
+			mlog.Log.Errorf("fork switch: rewind RPC block history to slot %d: %v; halting", res.NewThrough, err)
+			return false
+		}
+	}
 	if err := adoptRewindResult(accountsDbPath, s, res); err != nil {
 		mlog.Log.Errorf("fork switch: %v; halting", err)
 		return false
@@ -4644,10 +4655,18 @@ func runReplayWithRecovery(
 				break
 			}
 		}
+		if history, ok := rpcServer.(interface{ RewindBlockHistory(uint64) error }); ok {
+			if err := history.RewindBlockHistory(mithrilState.LastRootedSlot); err != nil {
+				result.Error = fmt.Errorf("fork switch: rewind RPC block history to slot %d: %w", mithrilState.LastRootedSlot, err)
+				mlog.Log.Errorf("%v; halting", result.Error)
+				break
+			}
+		}
 		if mithrilState.LastRootedContext == nil {
 			mlog.Log.Errorf("fork switch: no rooted checkpoint context to re-replay from; halting")
 			break
 		}
+		publishRPCBankState(rpcServer, mithrilState)
 		if mithrilState.LastRootedSlot > prevRooted { // progress since last attempt -> fresh budget
 			attempt = 0
 			prevRooted = mithrilState.LastRootedSlot
@@ -4686,4 +4705,25 @@ func runReplayWithRecovery(
 		result = replay.ReplayBlocks(ctx, accountsDb, accountsDbPath, mithrilState, rs, retryStart, endSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, turbineShredVersion, turbineAlpenglowAddr, turbineIdentity, blockDir, txParallelism, isLive, useLightbringer, useTurbine, dbgOpts, metricsWriter, rpcServer, blockFetchOpts, consensusOpts, onCancelWriteState)
 	}
 	return result
+}
+
+type rpcBankStateSetter interface {
+	SetRootedBankState(slot, blockHeight, transactionCount uint64)
+}
+
+func publishRPCBankState(rpcServer rpcBankStateSetter, mithrilState *state.MithrilState) {
+	if rpcServer == nil || mithrilState == nil {
+		return
+	}
+	rootedSlot := mithrilState.ManifestParentSlot
+	rootedBlockHeight := mithrilState.ManifestBlockHeight
+	rootedTransactionCount := mithrilState.ManifestTransactionCount
+	if rootedCtx := mithrilState.LastRootedContext; rootedCtx != nil {
+		rootedSlot = rootedCtx.Slot
+		rootedBlockHeight = rootedCtx.BlockHeight
+		if rootedCtx.TransactionCount != nil {
+			rootedTransactionCount = *rootedCtx.TransactionCount
+		}
+	}
+	rpcServer.SetRootedBankState(rootedSlot, rootedBlockHeight, rootedTransactionCount)
 }
