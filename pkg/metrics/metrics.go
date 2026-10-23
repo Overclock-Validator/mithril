@@ -379,6 +379,10 @@ type BlockReplay struct {
 	DependencyPlannerPreparation Timing
 	LoadBlockAccounts            Timing
 	SlotCtxSetup                 Timing
+	// Reset is synchronous bank-start work, nested within ProcessBlock. Bytes
+	// counts the previously reserved prefix actually cleared, not capacity.
+	SerializedParameterArenaReset      Timing
+	SerializedParameterArenaResetBytes uint64
 	// DependencyPlannerBuild is measured account-extraction plus graph/batch
 	// construction work, independent of which planner route a block uses and
 	// excluding goroutine scheduling delay. On the prepared route some or all

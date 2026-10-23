@@ -1,0 +1,99 @@
+Account replacement and parameter arena follow-up — 2026-10-23
+
+Implemented on 7layer/account-data-ownership-performance.
+Code candidate: 706e7491. Comparison baseline: 8a59ded9.
+Both inherit the interpreter, immutable-source validation, unstaked-leaf, and
+vote-account finalization improvements through e2bc4b28. This experiment isolates
+the additional account replacement change; it is not a fresh alpenglow-dev versus
+all-improvements comparison.
+
+Changes
+- Bound arena AllocN slice capacity to the reservation. Appends cannot overwrite
+  adjacent allocations or dirty an unreserved suffix that Reset would miss.
+  Also reject overflowing reservation sizes without advancing the arena index.
+- Record SerializedParameterArenaReset elapsed time and bytes cleared at the
+  existing reset boundary in both streaming and whole-block replay. This is
+  nested bank-start work, not an additional additive top-level phase.
+- When SetData replaces all data on a shared account, clone the account header
+  without allocating/copying the old data that would immediately be discarded.
+  Ordinary Touch still deep-copies. Existing validation order, resize accounting,
+  touched/shared flags, and borrowed replacement-buffer lifetime are preserved.
+  Clone metrics now report actual copied bytes (zero for a header-only clone).
+- Keep the existing block-end detachment copy. This patch does not make parameter
+  buffers independently owned and does not authorize removing that copy.
+
+Validation
+All runs were on allnodes-ryzen9700x-fra, AMD Ryzen 7 9700X, Go 1.27.2,
+GOEXPERIMENT=arenas, GOAMD64=v1, PGO off, standard linker.
+Full arena, SBF/loader, Sealevel and replay package tests passed. Focused race
+checks, affected-package vet, the four pinned conformance fixtures, and the
+expanded BPF/CPI/arithmetic/Token-2022 result checks passed. Exact workload CU
+matched between builds. Mainnet comparison checked bank hashes, transaction
+counts and rounded logged CU; it did not have exact per-slot CU totals.
+
+Isolated operation benchmarks
+CPU 4, GOMAXPROCS=1, node stopped, five samples of 5,000 iterations per version.
+Fixture construction is outside timing; identical account flags/state are reset
+inside each iteration. These are SetData costs, not whole-invocation speedups.
+Median shared-account replacement:
+  165 B: 42.99 -> 23.93 ns; 304 -> 128 B/op
+  4 KiB: 839.00 -> 23.09 ns; 4,224 -> 128 B/op
+  64 KiB: 9,841.00 -> 22.93 ns; 65,664 -> 128 B/op
+All three remove one allocation (2 -> 1), p=0.008, n=5. Five samples support the
+rank test but are insufficient for benchstat's 95% interval. Private and repeated
+replacement cases had no regression. Expanded invocation benchmarks had no
+statistically significant regression and identical CU. Token-2022 timing moved
+by roughly -3%, but these fixtures use private accounts; that small movement is
+not evidence of the shared-account-copy saving. Native system and vote checks
+(six samples of 20,000 iterations) also showed no regression.
+
+Controlled mainnet replay
+One run per build, baseline then candidate, same retained checkpoint and slots
+460441060–460441334: 275 blocks each, with first 32 omitted from timing summaries
+(243 measured blocks). CPU 0–7, GOMAXPROCS=8, txpar=8, same config/features and
+logging. No new snapshot. All 275 execution bank hashes, transaction counts,
+and rounded CU values matched, with footer verification enabled.
+
+Mean milliseconds, baseline -> candidate:
+  Transaction execution (TxLoop): 22.823 -> 22.495 (-1.44%)
+  Total slot replay:               42.619 -> 41.696 (-2.17%)
+  Account loading:                 5.856 ->  5.177 (-11.59%)
+  Parameter arena reset:           2.437 ->  2.430 (-0.28%)
+
+This is a modest observed improvement from a single pass per build. Account
+loading, an unchanged path, accounts for much of the total movement, so do not
+attribute the entire -2.17% to this optimization or claim statistical confidence
+for a general end-to-end improvement. Historical shreds were obtained through
+repair/cache; neither run streamed any of these blocks. Rounded source wait was
+zero in the measured interval. These numbers do not measure live network delay.
+
+Higher-CU blocks, mean total replay milliseconds:
+  25–40M CU (12 blocks): 97.70 -> 95.35
+  >=40M CU (one block): 140.54 -> 140.77
+The high-CU sample is too small to generalize.
+
+Arena finding
+Both builds cleared exactly the same bytes per measured block: average 143.78
+MiB, p95 277.83 MiB, maximum 471.05 MiB. Reset consumed about 2.43 ms/block,
+5.8% of candidate slot replay time. Bounded parallel clearing is a worthwhile
+next experiment; this evidence does not yet justify double buffering or an
+ownership redesign. Timing the once-per-bank reset exposed a wall-time cost
+that its small fraction of parallel aggregate CPU did not convey.
+
+Separate profiles
+CPU and allocation profiles were collected in distinct two-second diagnostic
+runs of shared 64-KiB replacement, not during timing comparisons. The old profile
+attributes nearly all allocated bytes to Account.Clone, with memmove and memory
+clearing prominent in CPU. The candidate allocates only the account header;
+allocation/GC and access checks remain. Total allocation volumes across these
+profiles cannot be compared directly because adaptive iteration counts differ.
+Use B/op above to compare allocation cost. These are focused synthetic profiles,
+not a new mainnet-wide hotspot ranking.
+
+Artifacts
+Raw benchmarks, benchstat reports, profiles, fixed-block JSONL, exact hashes,
+runner scripts and summaries are retained under:
+  /srv/mithril-mainnet-20261022/account-data/
+  deployments/mithril-mainnet-fra-20261022/account-data/ (local workspace)
+The normal mainnet service was restored after every measurement. The candidate
+was used only in bounded tests; the normal runtime binary was not replaced.

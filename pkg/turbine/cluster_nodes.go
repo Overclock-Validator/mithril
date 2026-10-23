@@ -33,12 +33,13 @@ type clusterNode struct {
 
 // ClusterNodes implements Agave's broadcast-stage turbine peer selection.
 type ClusterNodes struct {
-	selfPubkey  solana.PublicKey
-	nodes       []clusterNode
-	selfIndex   int
-	shuffle     *WeightedShuffle
-	shufflePool sync.Pool
-	useChaCha8  bool
+	selfPubkey   solana.PublicKey
+	nodes        []clusterNode
+	selfIndex    int
+	shuffle      *WeightedShuffle
+	shufflePool  sync.Pool
+	useChaCha8   bool
+	unstakedLeaf bool // guaranteed depth-two leaf at dataPlaneFanout
 }
 
 type ClusterNodesConfig struct {
@@ -75,12 +76,21 @@ func newClusterNodes(cfg ClusterNodesConfig, broadcast bool) *ClusterNodes {
 	if broadcast && selfIndex >= 0 {
 		shuffle.RemoveIndex(selfIndex)
 	}
+	// Positive shuffle weights precede every zero-weight node. Even after
+	// removing a positive-weight leader, self is beyond the first fanout when
+	// this lower bound holds. Every such position has its first child beyond
+	// fanout*(fanout+1), so a cluster no larger than that has no descendants.
+	// Count actual shuffle weights: overflowed stake weights also become zeros.
+	unstakedLeaf := !broadcast && selfIndex >= 0 && nodes[selfIndex].stake == 0 &&
+		len(nodes)-len(shuffle.zeros)-1 > dataPlaneFanout &&
+		len(nodes) <= dataPlaneFanout*(dataPlaneFanout+1)
 	return &ClusterNodes{
-		selfPubkey: cfg.Self,
-		nodes:      nodes,
-		selfIndex:  selfIndex,
-		shuffle:    shuffle,
-		useChaCha8: cfg.UseChaCha8,
+		selfPubkey:   cfg.Self,
+		nodes:        nodes,
+		selfIndex:    selfIndex,
+		shuffle:      shuffle,
+		useChaCha8:   cfg.UseChaCha8,
+		unstakedLeaf: unstakedLeaf,
 	}
 }
 
@@ -101,6 +111,12 @@ func (c *ClusterNodes) retransmitPeersInto(leader solana.PublicKey, shred ShredI
 	}
 	if leader == c.selfPubkey {
 		return 0, nil, ErrRetransmitLoopback
+	}
+	if fanout == dataPlaneFanout && c.unstakedLeaf {
+		if dst == nil {
+			dst = []*net.UDPAddr{}
+		}
+		return 2, dst[:0], nil
 	}
 	shuffle := c.borrowRetransmitShuffle(leader)
 	defer c.releaseRetransmitShuffle(shuffle)

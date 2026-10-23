@@ -267,14 +267,16 @@ type ProgramCacheEntry struct {
 	// Executables are reusable across banks only for identical source and loader
 	// features. Slot alone is not a version: competing forks can deploy at the
 	// same slot. Fields are immutable after cache publication.
-	sourceBytes    []byte
-	sourceBound    bool
-	sourceFeatures features.Features
+	sourceBytes     []byte
+	sourceBound     bool
+	sourceFeatures  features.Features
+	validatedSource atomic.Pointer[immutableProgramSource]
 }
 
 // BindSource must be called before publishing the entry; published bindings
 // must never be mutated, including when another bank replaces the cache key.
 func (entry *ProgramCacheEntry) BindSource(source []byte, f *features.Features) {
+	entry.validatedSource.Store(nil)
 	entry.sourceBytes = bytes.Clone(source)
 	entry.sourceBound = true
 	entry.sourceFeatures = *f.Clone()

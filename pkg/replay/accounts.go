@@ -55,9 +55,9 @@ func GetAndResetCloneStats() CloneStats {
 	}
 }
 
-func recordTxAcctCowClone(acct *accounts.Account) {
+func recordTxAcctCowClone(dataBytes uint64) {
 	TxAcctsCloned.Add(1)
-	TxAcctsClonedBytes.Add(uint64(len(acct.Data)))
+	TxAcctsClonedBytes.Add(dataBytes)
 }
 
 func loadAndValidateTxAccts(slotCtx *sealevel.SlotCtx, txAcctMetas []*solana.AccountMeta, tx *solana.Transaction, instrs []sealevel.Instruction, instrsAcct *accounts.Account, loadedAcctBytesLimit uint32) (*sealevel.TransactionAccounts, []*solana.AccountMeta, uint32, error) {

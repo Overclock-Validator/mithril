@@ -248,7 +248,17 @@ func ApplyAlpenglowVoteRewards(
 		_, inFinal := finalSigners[votePubkey]
 
 		var applied bool
-		if inReward {
+		if inReward && inFinal {
+			applied, err = applyVoteRewardAndFinalCertToAccount(
+				acct, rewardSlot, rewardSlotTimestampNs, finalSlot, finalSlotTimestampNs,
+				currentEpoch, migrationEpoch, inflationState, totalStake,
+				rewardEpochStakes[votePubkey], &leaderRewardAccum,
+			)
+			if err != nil {
+				mlog.Log.Infof("slot %d vote rewards: skip %s: %v", block.Slot, votePubkey, err)
+				continue
+			}
+		} else if inReward {
 			applied, err = applyVoteRewardToAccount(
 				acct,
 				rewardSlot,
@@ -265,7 +275,7 @@ func ApplyAlpenglowVoteRewards(
 				continue
 			}
 		}
-		if inFinal {
+		if inFinal && !inReward {
 			if err := applyFinalCertToAccount(acct, finalSlot, finalSlotTimestampNs); err != nil {
 				mlog.Log.Infof("slot %d vote rewards: skip %s: %v", block.Slot, votePubkey, err)
 				continue
@@ -413,14 +423,69 @@ func applyVoteRewardToAccount(
 		return false, fmt.Errorf("unsupported vote state version %d", versioned.Type)
 	}
 
-	maybeUpdateVotesV4(&versioned.V4, rewardSlot, rewardSlotTimestampNs)
+	applyVoteRewardToState(&versioned.V4, rewardSlot, rewardSlotTimestampNs,
+		currentEpoch, migrationEpoch, inflation, totalStake, validatorStake, leaderRewardAccum)
+
+	if err := sealevel.WriteVersionedVoteStateInPlace(acct.Data, versioned); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func applyVoteRewardToState(
+	state *sealevel.VoteState4,
+	rewardSlot uint64, rewardSlotTimestampNs int64,
+	currentEpoch, migrationEpoch uint64,
+	inflation EpochInflationState,
+	totalStake, validatorStake uint64,
+	leaderRewardAccum *uint64,
+) {
+	maybeUpdateVotesV4(state, rewardSlot, rewardSlotTimestampNs)
 	validatorReward, leaderReward := calculateAlpenglowReward(inflation, totalStake, validatorStake)
 	*leaderRewardAccum += leaderReward
 	if validatorReward > 0 {
-		incrementAlpenglowCredits(&versioned.V4.EpochCredits, migrationEpoch, currentEpoch, validatorReward)
+		incrementAlpenglowCredits(&state.EpochCredits, migrationEpoch, currentEpoch, validatorReward)
+	}
+}
+
+// applyVoteRewardAndFinalCertToAccount applies overlapping certificate updates in
+// reward-then-finalization order.
+func applyVoteRewardAndFinalCertToAccount(
+	acct *accounts.Account,
+	rewardSlot uint64, rewardSlotTimestampNs int64,
+	finalSlot uint64, finalSlotTimestampNs int64,
+	currentEpoch, migrationEpoch uint64,
+	inflation EpochInflationState,
+	totalStake, validatorStake uint64,
+	leaderRewardAccum *uint64,
+) (bool, error) {
+	versioned, err := sealevel.UnmarshalVersionedVoteState(acct.Data)
+	if err != nil {
+		return false, err
+	}
+	if versioned.Type != sealevel.VoteStateVersionV4 {
+		return false, fmt.Errorf("unsupported vote state version %d", versioned.Type)
+	}
+	leaderBefore := *leaderRewardAccum
+	applyVoteRewardToState(&versioned.V4, rewardSlot, rewardSlotTimestampNs,
+		currentEpoch, migrationEpoch, inflation, totalStake, validatorStake, leaderRewardAccum)
+	maybeUpdateRootV4(&versioned.V4, finalSlot)
+	maybeUpdateVotesV4(&versioned.V4, finalSlot, finalSlotTimestampNs)
+	if err := sealevel.WriteVersionedVoteStateInPlace(acct.Data, versioned); err == nil {
+		return true, nil
 	}
 
-	if err := sealevel.WriteVersionedVoteStateInPlace(acct.Data, versioned); err != nil {
+	// Finalization keeps the single vote and credit history sizes unchanged and
+	// can only grow the root option. Thus a successful combined write also means
+	// the intermediate reward state would fit. On failure, the writer leaves data
+	// untouched: replay the original sequence to retain its exact error, partial
+	// account write and leader accumulation behavior for undersized accounts.
+	*leaderRewardAccum = leaderBefore
+	if _, err := applyVoteRewardToAccount(acct, rewardSlot, rewardSlotTimestampNs,
+		currentEpoch, migrationEpoch, inflation, totalStake, validatorStake, leaderRewardAccum); err != nil {
+		return false, err
+	}
+	if err := applyFinalCertToAccount(acct, finalSlot, finalSlotTimestampNs); err != nil {
 		return false, err
 	}
 	return true, nil

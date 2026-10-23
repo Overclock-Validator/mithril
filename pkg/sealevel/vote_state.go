@@ -1742,6 +1742,9 @@ func marshalVersionedVoteState(voteStateVersions *VoteStateVersions) ([]byte, er
 
 	err := voteStateVersions.MarshalWithEncoder(encoder)
 	if err != nil {
+		if sbpf.UsePool {
+			voteStateBufPool.Put(buffer.Bytes())
+		}
 		return nil, err
 	} else {
 		return buffer.Bytes(), nil
@@ -1761,10 +1764,18 @@ func WriteVersionedVoteStateInPlace(data []byte, voteStateVersions *VoteStateVer
 		return err
 	}
 	if len(marshaled) > len(data) {
+		if sbpf.UsePool {
+			voteStateBufPool.Put(marshaled)
+		}
 		return fmt.Errorf("vote state serialized length %d exceeds account data capacity %d", len(marshaled), len(data))
 	}
 	copy(data, marshaled)
 	clear(data[len(marshaled):])
+	if sbpf.UsePool {
+		// The destination owns its copy. Public MarshalVersionedVoteState
+		// still transfers ownership instead of recycling its output.
+		voteStateBufPool.Put(marshaled)
+	}
 	return nil
 }
 

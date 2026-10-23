@@ -4524,9 +4524,7 @@ func ProcessBlock(
 	defer exec.close()
 	exec.setReplayStage("prepare_dependency_planner")
 
-	if SerializedParameterArena != nil {
-		SerializedParameterArena.Reset()
-	}
+	resetSerializedParameterArena()
 
 	plannerPreparationStart := time.Now()
 	var planner *preparedDependencyPlanner

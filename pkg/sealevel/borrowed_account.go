@@ -54,12 +54,15 @@ func (acct *BorrowedAccount) SetData(features features.Features, data []byte) er
 	if err != nil {
 		return err
 	}
-	err = acct.Touch()
+	replacedAcct, err := acct.TxCtx.Accounts.touchForDataReplacement(acct.IndexInTransaction)
 	if err != nil {
 		return err
 	}
 
+	acct.Account = replacedAcct
 	acct.UpdateAccountsResizeDelta(newLen)
+	// Preserve the existing borrowed-buffer lifetime. The block-end account
+	// copy must still detach this data before the parameter arena is reset.
 	acct.Account.SetData(data)
 
 	return nil

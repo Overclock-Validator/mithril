@@ -17,12 +17,14 @@ type TxReturnData struct {
 }
 
 type TransactionAccounts struct {
-	Accounts          []*accounts.Account
-	Shared            []bool
-	Locked            []bool
-	Touched           []bool
-	AcctMetas         []*AccountMeta
-	OnFirstWriteClone func(*accounts.Account)
+	Accounts  []*accounts.Account
+	Shared    []bool
+	Locked    []bool
+	Touched   []bool
+	AcctMetas []*AccountMeta
+	// OnFirstWriteClone receives the number of data bytes actually copied.
+	// Replacing all data clones the account header only and reports zero.
+	OnFirstWriteClone func(dataBytes uint64)
 }
 
 type TransactionCtx struct {
@@ -306,16 +308,36 @@ func (txAccounts *TransactionAccounts) Unlock(idx uint64) {
 }
 
 func (txAccounts *TransactionAccounts) Touch(idx uint64) (*accounts.Account, error) {
+	return txAccounts.touch(idx, true)
+}
+
+// touchForDataReplacement keeps the old data reference only long enough for
+// SetData to account for its length and replace it. The caller must not mutate
+// that data. Ordinary writes must use Touch, which detaches shared data.
+func (txAccounts *TransactionAccounts) touchForDataReplacement(idx uint64) (*accounts.Account, error) {
+	return txAccounts.touch(idx, false)
+}
+
+func (txAccounts *TransactionAccounts) touch(idx uint64, copyData bool) (*accounts.Account, error) {
 	if len(txAccounts.Touched) == 0 || idx > uint64(len(txAccounts.Touched)-1) {
 		return nil, InstrErrNotEnoughAccountKeys
 	}
 
 	if txAccounts.Shared[idx] {
-		clonedAcct := txAccounts.Accounts[idx].Clone()
+		original := txAccounts.Accounts[idx]
+		var clonedAcct *accounts.Account
+		var copiedBytes uint64
+		if copyData {
+			clonedAcct = original.Clone()
+			copiedBytes = uint64(len(original.Data))
+		} else {
+			header := *original
+			clonedAcct = &header
+		}
 		txAccounts.Accounts[idx] = clonedAcct
 		txAccounts.Shared[idx] = false
 		if txAccounts.OnFirstWriteClone != nil {
-			txAccounts.OnFirstWriteClone(clonedAcct)
+			txAccounts.OnFirstWriteClone(copiedBytes)
 		}
 	}
 
