@@ -1549,9 +1549,12 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 		}
 
 		start := time.Now()
-		programDataAcct, err := execCtx.SlotCtx.GetAccount(programAcctState.Program.ProgramDataAddress)
+		// Program loading only reads this immutable bank-visible account. The
+		// ELF loader owns its relocated bytes, and BindSource copies on cache
+		// insertion; cache hits still compare the full source and feature set.
+		programDataAcct, err := execCtx.SlotCtx.GetAccountShared(programAcctState.Program.ProgramDataAddress)
 		if err != nil {
-			programDataAcct, err = execCtx.SlotCtx.GetAccountFromAccountsDb(programAcctState.Program.ProgramDataAddress)
+			programDataAcct, err = execCtx.SlotCtx.getAccountFromAccountsDbReadOnly(programAcctState.Program.ProgramDataAddress)
 			if err != nil {
 				return InstrErrUnsupportedProgramId
 			}
