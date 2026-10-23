@@ -224,11 +224,13 @@ curl http://YOUR_MITHRIL_IP:8899 -X POST -H "Content-Type: application/json" -d 
 - `getBlockHeight` - Get current block height
 - `getBlockProduction` - Get produced and assigned block counts by validator
 - `getBlock` - Get retained block summaries or recorded transactions
+- `getBlocks` - List produced slots across a retained rooted range
 - `getEpochInfo` - Get current epoch info
 - `getInflationReward` - Get retained inflation rewards for an epoch
 - `getGenesisHash` - Get the cluster genesis hash
 - `getLatestBlockhash` - Get recent blockhash
 - `getLeaderSchedule` - Get the leader schedule for an epoch
+- `getMultipleAccounts` - Read up to 100 accounts from one rooted view
 - `getSignatureStatuses` - Look up recent signature outcomes or retained receipts
 - `getSlot` - Get the slot at the requested commitment (defaults to finalized)
 - `getVoteAccounts` - Get current and delinquent vote accounts
@@ -256,6 +258,9 @@ Full transaction responses and recent signature statuses are separate opt-in
 settings for an Alpenglow verifying node. See [transaction history and signature
 statuses](docs/transaction-history.md) for setup, supported fields, retention and
 failure behavior.
+
+See [block-range and multi-account queries](docs/rpc-queries.md) for their
+HTTP transport, supported encodings, retention behavior and resource limits.
 
 ### Current Limitations
 
