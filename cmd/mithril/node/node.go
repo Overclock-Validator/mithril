@@ -550,7 +550,7 @@ func init() {
 	// [replay] section flags
 	Run.Flags().Int64Var(&txParallelism, "txpar", 0, "Transaction execution workers (>0 enables topsort parallelism; explicit 0 is sequential; unset validator mode defaults to 2x CPU cores)")
 	Run.Flags().Int64Var(&numReplaySlots, "num-slots", 0, "Number of slots to replay (0 = run continuously)")
-	Run.Flags().BoolVar(&replay.StreamingExecutionCfg.Enabled, "streaming-execution", false,
+	Run.Flags().BoolVar(&replay.StreamingExecutionCfg.Enabled, "streaming-execution", true,
 		"Execute Turbine blocks while their shreds arrive (Alpenglow validator/verifying modes only; the complete block remains authoritative and any mismatch falls back to whole-block execution)")
 	Run.Flags().IntVar(&replay.StreamingExecutionCfg.Workers, "streaming-workers", 0,
 		"Streaming execution workers per transaction group (0 = min(txpar, 4))")
@@ -836,10 +836,8 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		rpcEndpoints = getStringSlice("rpc", "rpc.rpc")
 	}
 
-	// Cluster selects the protocol path as well as protecting against
-	// mainnet/testnet AccountsDB mixups. Alpenglow uses certificate forkchoice
-	// and rooted speculative replay; the established clusters retain the
-	// classic verifying flow.
+	// Cluster protects chain identity. The protocol can be selected separately
+	// for established networks after their Alpenglow activation.
 	cluster = getString("cluster", "network.cluster")
 	if cluster == "" {
 		cluster = "alpenglow"
@@ -851,7 +849,7 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 			return err
 		}
 	}
-	alpenglowMode, err := alpenglowModeForCluster(cluster)
+	alpenglowMode, err := resolveProtocolMode(cluster, config.GetString("consensus.protocol"))
 	if err != nil {
 		return err
 	}
@@ -1185,7 +1183,7 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	}
 	resolvedSigverifyBackend = resolved
 	sbpf.UsePool = getBool("use-pool", "tuning.use_pool")
-	// [tuning] streaming execution (off by default; Alpenglow turbine only).
+	// [tuning] streaming execution (on by default; Alpenglow turbine only).
 	replay.StreamingExecutionCfg.Enabled = getBool("streaming-execution", "tuning.streaming_execution")
 	replay.StreamingExecutionCfg.Workers = getInt("streaming-workers", "tuning.streaming_workers")
 	replay.StreamingExecutionCfg.MinGroupBatches = getInt("streaming-min-group-batches", "tuning.streaming_min_group_batches")
@@ -1296,7 +1294,10 @@ func buildSnapshotConfig(rpcEndpoints []string) snapshotdl.SnapshotConfig {
 }
 
 func runLive(c *cobra.Command, args []string) {
-	alpenglowMode := cluster == "alpenglow"
+	alpenglowMode, protocolErr := resolveProtocolMode(cluster, config.GetString("consensus.protocol"))
+	if protocolErr != nil {
+		klog.Fatalf("%v", protocolErr)
+	}
 	if pprofPort != -1 {
 		startPprofHandlers(int(pprofPort))
 	}
@@ -2570,7 +2571,7 @@ postBootstrap:
 
 	// Write replay timings to run-specific log directory
 	replayTimingsPath := filepath.Join(mlog.GetLogDir(), "replay_timings.jsonl")
-	metricsWriter, metricsWriterCleanup, err := createBufWriter(replayTimingsPath)
+	metricsWriter, metricsWriterCleanup, err := createReplayTimingsWriter(replayTimingsPath)
 	if err != nil {
 		klog.Fatalf("unable to create replay timings writer: %v", err)
 	}

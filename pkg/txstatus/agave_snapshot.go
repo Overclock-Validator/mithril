@@ -157,9 +157,9 @@ func skipTransactionError(r *wincode.Reader) error {
 			return fmt.Errorf("read instruction index: %w", err)
 		}
 		return skipInstructionError(r)
-	case 29, // DuplicateInstruction(u8)
-		30, // InsufficientFundsForRent { account_index: u8 }
-		34: // ProgramExecutionTemporarilyRestricted { account_index: u8 }
+	case 30, // DuplicateInstruction(u8)
+		31, // InsufficientFundsForRent { account_index: u8 }
+		35: // ProgramExecutionTemporarilyRestricted { account_index: u8 }
 		if _, err := r.ReadU8(); err != nil {
 			return fmt.Errorf("read transaction error %d payload: %w", tag, err)
 		}

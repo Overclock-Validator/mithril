@@ -6,6 +6,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/duration"
+	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/safemath"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
@@ -38,7 +39,7 @@ func updateClockSysvarForMode(clock *sealevel.SysvarClock, block *block.Block, e
 	} else if global.CalcUnixTimeForClockSysvar() {
 		firstSlotInEpoch := epochSchedule.FirstSlotInEpoch(clock.Epoch)
 		epochStartTimestamp := clock.EpochStartTimestamp
-		timestampEstimate := getTimestampEstimate(block.Slot, firstSlotInEpoch, epochStartTimestamp, epochSchedule)
+		timestampEstimate := getTimestampEstimate(block.Slot, firstSlotInEpoch, epochStartTimestamp, epochSchedule, block.Features)
 		if timestampEstimate > clock.UnixTimestamp {
 			clock.UnixTimestamp = timestampEstimate
 		}
@@ -105,23 +106,26 @@ type tsEntry struct {
 	timestamp int64
 }
 
-func getTimestampEstimate(slot uint64, epochStartTimestampSlot uint64, epochStartTimestamp int64, epochSchedule *sealevel.SysvarEpochSchedule) int64 {
+func getTimestampEstimate(slot uint64, epochStartTimestampSlot uint64, epochStartTimestamp int64, epochSchedule *sealevel.SysvarEpochSchedule, f *features.Features) int64 {
 	slotsPerEpoch := epochSchedule.SlotsPerEpoch
 	voteAccts := global.VoteCache()
 
 	recentTimestamps := make([]*tsEntry, 0, len(voteAccts))
 	for addr, voteAcct := range voteAccts {
 		lastTs := voteAcct.LastTimestamp()
-		slotDelta := safemath.SaturatingSubU64(slot, lastTs.Slot)
+		if lastTs.Slot > slot {
+			continue
+		}
+		slotDelta := slot - lastTs.Slot
 		if slotDelta <= slotsPerEpoch {
 			recentTimestamps = append(recentTimestamps, &tsEntry{pubkey: addr, slot: lastTs.Slot, timestamp: lastTs.Timestamp})
 		}
 	}
 
-	slotDuration := duration.NewDurationFromNanos(nsPerSlot)
+	elapsed := clockSlotElapsed(epochSchedule, f)
 	epoch := epochSchedule.GetEpoch(slot)
 	stakes := global.EpochStakes(epoch)
-	timestampEstimate, err := calculateStakeWeightedTimestamp(recentTimestamps, stakes, slot, slotDuration, epochStartTimestampSlot, epochStartTimestamp)
+	timestampEstimate, err := calculateStakeWeightedTimestampWithElapsed(recentTimestamps, stakes, slot, elapsed, epochStartTimestampSlot, epochStartTimestamp)
 	if err != nil {
 		panic(err)
 	}
@@ -137,11 +141,17 @@ func calculateStakeWeightedTimestamp(
 	epochStartSlot uint64,
 	epochStartTimestamp int64) (int64, error) {
 
+	return calculateStakeWeightedTimestampWithElapsed(recentTimestamps, stakes, slot, func(from, to uint64) duration.Duration {
+		return slotDuration.SaturatingMul(uint32(safemath.SaturatingSubU64(to, from)))
+	}, epochStartSlot, epochStartTimestamp)
+}
+
+func calculateStakeWeightedTimestampWithElapsed(recentTimestamps []*tsEntry, stakes map[solana.PublicKey]uint64, slot uint64, elapsed func(uint64, uint64) duration.Duration, epochStartSlot uint64, epochStartTimestamp int64) (int64, error) {
 	var stakePerTimestamp btree.Map[int64, wide.Uint128]
 	var totalStake wide.Uint128
 
 	for _, r := range recentTimestamps {
-		offset := slotDuration.SaturatingMul(uint32(safemath.SaturatingSubU64(slot, r.slot)))
+		offset := elapsed(r.slot, slot)
 		estimate := safemath.SaturatingAddI64(r.timestamp, int64(offset.Secs))
 
 		stake := stakes[r.pubkey]
@@ -181,7 +191,7 @@ func calculateStakeWeightedTimestamp(
 		}
 	}
 
-	pohEstimateOffset := slotDuration.SaturatingMul(uint32(safemath.SaturatingSubU64(slot, epochStartSlot)))
+	pohEstimateOffset := elapsed(epochStartSlot, slot)
 
 	estimateOffset := duration.NewDurationFromSecs(
 		safemath.SaturatingSubU64(uint64(estimate), uint64(epochStartTimestamp)),

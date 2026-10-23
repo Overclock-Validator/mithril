@@ -221,6 +221,7 @@ type LogConfig struct {
 
 // ConsensusConfig holds Alpenglow consensus configuration.
 type ConsensusConfig struct {
+	Protocol                  string `toml:"protocol" mapstructure:"protocol"`                                         // Optional alpenglow/classic override of cluster defaults
 	Mode                      string `toml:"mode" mapstructure:"mode"`                                                 // "verifying" or Alpenglow-only active "validator"
 	AlpenglowObserverBindAddr string `toml:"alpenglow_observer_bind_addr" mapstructure:"alpenglow_observer_bind_addr"` // Optional passive Alpenglow Votor QUIC listener
 	AlpenglowMaxMessageBytes  int64  `toml:"alpenglow_max_message_bytes" mapstructure:"alpenglow_max_message_bytes"`   // Max Votor QUIC datagram payload size

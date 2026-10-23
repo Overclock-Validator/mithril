@@ -1866,7 +1866,7 @@ func ReplayBlocks(
 	expectedStatusRoot := mithrilState.ManifestParentSlot
 	var statusParentBlockID solana.Hash
 	var hasStatusParentBlockID bool
-	var statusCheckpoint *state.TransactionStatusCheckpointRef
+	statusCheckpoint := mithrilState.LastTransactionStatusCheckpoint
 	if resumeState != nil {
 		expectedStatusRoot = resumeState.ParentSlot
 		statusParentBlockID = resumeState.ParentAlpenglowBlockID
@@ -3312,7 +3312,7 @@ func ReplayBlocks(
 			}
 			if !streamed {
 				streamer.noteWholeBlock(block)
-				lastSlotCtx, err = ProcessBlock(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, unrootedTailState, transactionStatuses, alpenglowClock, parentBankSysvars)
+				lastSlotCtx, err = ProcessBlock(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, optionalUnrootedState(unrootedTailState), transactionStatuses, alpenglowClock, parentBankSysvars)
 			}
 		}
 		processBlockEnd := time.Now()
@@ -3463,6 +3463,10 @@ func ReplayBlocks(
 			metrics.GlobalBlockReplay.ResumeContext.AddTimingSince(resumeContextStart)
 		}
 
+		if unrootedTailState == nil {
+			transactionStatuses.Root(block.Slot)
+		}
+
 		// Clear ManifestEpochStakes after first replayed slot past snapshot
 		// This frees memory and ensures we don't use stale manifest data on restart
 		if block.Slot > mithrilState.SnapshotSlot && len(mithrilState.ManifestEpochStakes) > 0 {
@@ -3512,6 +3516,13 @@ func ReplayBlocks(
 
 			// Serialize all epoch stakes for persistence
 			result.ComputedEpochStakes = serializeAllEpochStakes()
+
+			if unrootedTailState == nil {
+				if err := saveClassicTransactionStatuses(acctsDbPath, mithrilState, transactionStatuses, result.LastPersistedSlot); err != nil {
+					result.Error = err
+					break
+				}
+			}
 
 			// Write state immediately via callback (eliminates timing window for hard kills)
 			if onCancelWriteState != nil {
@@ -3852,6 +3863,12 @@ func ReplayBlocks(
 
 	acctsDb.WaitForStoreWorker()
 	result.LastPersistedSlot, result.LastPersistedBankhash = persistedHashes.Get()
+	if unrootedTailState == nil && result.LastPersistedSlot > 0 {
+		if err := saveClassicTransactionStatuses(acctsDbPath, mithrilState, transactionStatuses, result.LastPersistedSlot); err != nil {
+			result.Error = err
+		}
+	}
+
 	result.LastBlockHeight = global.BlockHeight()
 
 	// Capture resume context from the last slot context (if available)

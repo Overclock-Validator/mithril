@@ -2,6 +2,7 @@ package txstatus
 
 import (
 	"encoding/binary"
+	"fmt"
 	"os"
 	"testing"
 )
@@ -21,7 +22,7 @@ func TestDecodeAgaveSnapshot(t *testing.T) {
 	}
 
 	ok := encU32(0)
-	duplicateInstruction := append(append(encU32(1), encU32(29)...), byte(7))
+	duplicateInstruction := append(append(encU32(1), encU32(30)...), byte(7))
 	customInstruction := append(append(append(append(encU32(1), encU32(8)...), byte(2)), encU32(25)...), encU32(0xdecafbad)...)
 	borshInstruction := append(append(append(append(encU32(1), encU32(8)...), byte(3)), encU32(44)...), encString("io")...)
 	unitError := append(encU32(1), encU32(6)...)
@@ -153,4 +154,32 @@ func encU32(v uint32) []byte {
 
 func encU64(v uint64) []byte {
 	return binary.LittleEndian.AppendUint64(nil, v)
+}
+
+// Agave runtime/src/serde_snapshot/status_cache.rs preserves the deprecated
+// WouldExceedAccountDataTotalLimit at tag 29. Payload variants follow it.
+func TestDecodeAgaveSnapshotTransactionErrorPayloadBoundaries(t *testing.T) {
+	for _, tag := range []uint32{29, 30, 31, 32, 34, 35, 36} {
+		t.Run(fmt.Sprintf("tag_%d", tag), func(t *testing.T) {
+			result := append(encU32(1), encU32(tag)...)
+			if tag == 30 || tag == 31 || tag == 35 {
+				result = append(result, 7)
+			}
+			var hash [32]byte
+			var first, second [CachedKeySize]byte
+			first[0], second[0] = 0xa1, 0xb2
+			data := append(encU64(1), encU64(42)...)
+			data = append(data, 1)
+			data = append(data, encU64(1)...)
+			data = appendStatus(data, hash, 0, []encodedKey{{first, result}, {second, encU32(0)}})
+			deltas, err := DecodeAgaveSnapshot(data)
+			if err != nil {
+				t.Fatalf("tag %d: %v", tag, err)
+			}
+			keys := deltas[0].Statuses[0].Keys
+			if len(keys) != 2 || keys[0] != first || keys[1] != second {
+				t.Fatalf("tag %d: keys corrupted", tag)
+			}
+		})
+	}
 }

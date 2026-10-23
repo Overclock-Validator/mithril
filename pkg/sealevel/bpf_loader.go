@@ -664,6 +664,7 @@ func serializeParametersAligned(execCtx *ExecutionCtx) ([]byte, []uint64, uint64
 
 	preLens := make([]uint64, len(accts))
 	accountMetadatas := make([]serializedAcctMetadata, len(accts))
+	maskRentEpoch := execCtx.Features.IsActive(features.MaskOutRentEpochInVmSerialization)
 	var inputRegions []sbpf.InputRegion
 	var regionStart uint64
 	var hostRegionStart uint64
@@ -761,15 +762,13 @@ func serializeParametersAligned(execCtx *ExecutionCtx) ([]byte, []uint64, uint64
 				// data in account
 				copy(serializedData[l+88:l+88+len(borrowedAcct.Data())], borrowedAcct.Data())
 
-				// zero the padding
-				paddingStart := l + 88 + len(borrowedAcct.Data())
-				paddingEnd := l + 88 + len(borrowedAcct.Data()) + int(MaxPermittedDataIncrease+alignmentOffset)
-				clear(serializedData[paddingStart:paddingEnd])
+				// Growth space and alignment padding are already zero: make returns
+				// zeroed storage, and the arena clears used storage on Reset.
 			}
 
 			// rent epoch
 			var rentEpoch uint64
-			if execCtx.Features.IsActive(features.MaskOutRentEpochInVmSerialization) {
+			if maskRentEpoch {
 				rentEpoch = math.MaxUint64
 			} else {
 				rentEpoch = borrowedAcct.RentEpoch()
@@ -1549,9 +1548,12 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 		}
 
 		start := time.Now()
-		programDataAcct, err := execCtx.SlotCtx.GetAccount(programAcctState.Program.ProgramDataAddress)
+		// Program loading only reads this immutable bank-visible account. The
+		// ELF loader owns its relocated bytes, and BindSource copies on cache
+		// insertion; cache hits still compare the full source and feature set.
+		programDataAcct, err := execCtx.SlotCtx.GetAccountShared(programAcctState.Program.ProgramDataAddress)
 		if err != nil {
-			programDataAcct, err = execCtx.SlotCtx.GetAccountFromAccountsDb(programAcctState.Program.ProgramDataAddress)
+			programDataAcct, err = execCtx.SlotCtx.getAccountFromAccountsDbReadOnly(programAcctState.Program.ProgramDataAddress)
 			if err != nil {
 				return InstrErrUnsupportedProgramId
 			}
