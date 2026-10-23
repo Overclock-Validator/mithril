@@ -665,6 +665,12 @@ func (accountsDb *AccountsDb) readIndexedAccountWithDataLimit(pubkey solana.Publ
 // Returns a slice of the same length as the input with results matching indexes, nil if not found.
 // Returns clones to avoid data races with the store worker.
 func (accountsDb *AccountsDb) getStoreInProgressAccounts(pks []solana.PublicKey) []*accounts.Account {
+	// A nil budget cannot refuse a reservation.
+	out, _ := accountsDb.getStoreInProgressAccountsWithBudget(pks, nil)
+	return out
+}
+
+func (accountsDb *AccountsDb) getStoreInProgressAccountsWithBudget(pks []solana.PublicKey, budget *accountDataBudget) ([]*accounts.Account, error) {
 	defer trace.StartRegion(context.Background(), "getStoreInProgressAccounts").End()
 	out := make([]*accounts.Account, len(pks))
 	accountsDb.inProgressStoreRequestsMu.Lock()
@@ -677,11 +683,14 @@ func (accountsDb *AccountsDb) getStoreInProgressAccounts(pks []solana.PublicKey)
 				continue // Already found.
 			}
 			if acct := sr.m[pks[i]]; acct != nil {
+				if err := budget.reserve(uint64(len(acct.Data))); err != nil {
+					return nil, err
+				}
 				out[i] = acct.Clone()
 			}
 		}
 	}
-	return out
+	return out, nil
 }
 
 func (accountsDb *AccountsDb) StoreAccounts(
