@@ -98,9 +98,9 @@ func TestAsyncHistoryBlockedWriteDoesNotDelayVotesAndCleanCloseDrains(t *testing
 
 func TestAsyncHistoryFailureIsStickyAndReportedWithoutMoreSubmissions(t *testing.T) {
 	cfg := reservedTestConfig(t.TempDir())
-	h := alpenglow.NewVoteHistory(voterTestValidatorSet(t, cfg.Identity, cfg.AuthorizedVoter, cfg.VoteAccount).Validators[0].NodePubkey, 39)
+	h := alpenglow.NewVoteHistory(voterTestValidatorSet(t, voterTestKey(11), cfg.AuthorizedVoter, cfg.VoteAccount).Validators[0].NodePubkey, 39)
 	h.ReservationRequired = true
-	snapshot, err := alpenglow.PrepareReservedVoteHistory(h, cfg.Identity)
+	snapshot, err := alpenglow.PrepareReservedVoteHistory(h, voterTestKey(11))
 	require.NoError(t, err)
 	diskErr := errors.New("injected disk failure")
 	reported := make(chan error, 1)
@@ -119,10 +119,10 @@ func TestAsyncHistoryFailureIsStickyAndReportedWithoutMoreSubmissions(t *testing
 
 func TestAsyncHistoryFailureStopsVoterAndPreventsCleanMarker(t *testing.T) {
 	cfg := reservedTestConfig(t.TempDir())
-	e, err := NewEngine(Config{AlpenglowIdentity: cfg.Identity, AlpenglowShredVersion: 0x1234})
+	e, err := NewEngine(Config{AlpenglowIdentity: identityHolder(t, voterTestKey(11)), AlpenglowShredVersion: 0x1234})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = e.Close() })
-	set := voterTestValidatorSet(t, cfg.Identity, cfg.AuthorizedVoter, cfg.VoteAccount)
+	set := voterTestValidatorSet(t, voterTestKey(11), cfg.AuthorizedVoter, cfg.VoteAccount)
 	e.SetAlpenglowEpochLookup(cfg.EpochForSlot)
 	require.NoError(t, e.SetAlpenglowValidatorSet(set))
 	root := alpenglow.BlockID{Slot: 39, Hash: solana.Hash{39}}

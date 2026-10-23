@@ -27,11 +27,11 @@ func BenchmarkRetransmitPipeline(b *testing.B) {
 	for _, count := range []int{90, 512} {
 		b.Run(fmt.Sprint(count), func(b *testing.B) {
 			nodes, leader, key := relayAllocationNodes(count, true)
-			r, err := newRetransmitterWithSenders(RetransmitConfig{Identity: key, Peers: &mutableTVUPeers{}, Stakes: func(uint64) map[solana.PublicKey]uint64 { return nil }, QueueDepth: 256}, []packetBatchSender{&discardRelaySender{}})
+			r, err := newRetransmitterWithSenders(RetransmitConfig{Identity: identityHolder(b, key), Peers: &mutableTVUPeers{}, Stakes: func(uint64) map[solana.PublicKey]uint64 { return nil }, QueueDepth: 256}, []packetBatchSender{&discardRelaySender{}})
 			if err != nil {
 				b.Fatal(err)
 			}
-			r.cache[10] = cachedRetransmitNodes{asof: time.Now().Add(time.Hour), nodes: nodes}
+			r.cache[10] = cachedRetransmitNodes{asof: time.Now().Add(time.Hour), self: r.cfg.Identity.PublicKey(), nodes: nodes}
 			ctx, cancel := context.WithCancel(context.Background())
 			done := make(chan struct{})
 			go func() { r.Run(ctx); close(done) }()

@@ -45,7 +45,7 @@ func TestLeaderLoopActivatesAndFinishesSlot(t *testing.T) {
 	global.SetAlpenglowChainedMerkleRoot(41, solana.Hash{2})
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:  controller,
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: bc,
 		CurrentSlot: slot.Load,
 		LeaderForSlot: func(s uint64) (solana.PublicKey, bool) {
@@ -90,7 +90,7 @@ func TestLeaderLoopDoesNotBackfillMissedSlotsAheadOfReplay(t *testing.T) {
 	global.SetAlpenglowChainedMerkleRoot(44, solana.Hash{2})
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:  controller,
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: bc,
 		CurrentSlot: wallSlot.Load,
 		LeaderForSlot: func(s uint64) (solana.PublicKey, bool) {

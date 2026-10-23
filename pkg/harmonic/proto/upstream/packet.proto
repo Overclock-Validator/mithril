@@ -1,0 +1,47 @@
+// Transaction packet types received by the validator from the block engine and relayer.
+syntax = "proto3";
+
+package packet;
+
+// A batch of transaction packets.
+message PacketBatch {
+  repeated Packet packets = 1;
+}
+
+// A single transaction packet with metadata.
+message Packet {
+  // Raw transaction bytes.
+  bytes data = 1;
+  // Packet metadata.
+  Meta meta = 2;
+}
+
+// Packet metadata mirroring solana_sdk::packet::Meta.
+message Meta {
+  // Number of valid bytes in the packet data.
+  uint64 size = 1;
+  // Source IP address.
+  string addr = 2;
+  // Source port.
+  uint32 port = 3;
+  // Packet processing flags.
+  PacketFlags flags = 4;
+  // Stake of the sending node (0 if unknown).
+  uint64 sender_stake = 5;
+}
+
+// Boolean flags that influence how the validator processes a packet.
+message PacketFlags {
+  // Packet should be dropped.
+  bool discard = 1;
+  // Packet was forwarded from another node (not received directly).
+  bool forwarded = 2;
+  // Packet is a repair request.
+  bool repair = 3;
+  // Packet contains a simple vote transaction.
+  bool simple_vote_tx = 4;
+  // Packet is a tracer used for debugging.
+  bool tracer_packet = 5;
+  // Packet originated from a staked node.
+  bool from_staked_node = 6;
+}

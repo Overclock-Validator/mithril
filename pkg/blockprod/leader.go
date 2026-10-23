@@ -12,6 +12,7 @@ import (
 	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/costmodel"
 	"github.com/Overclock-Validator/mithril/pkg/global"
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/replay"
 	"github.com/Overclock-Validator/mithril/pkg/rewardcerts"
@@ -87,7 +88,7 @@ type RewardCertBuilder interface {
 
 type LeaderLoop struct {
 	controller       *Controller
-	identity         solana.PrivateKey
+	identity         *identity.Holder
 	accountsDb       *accountsdb.AccountsDb
 	broadcaster      turbine.PacketBroadcaster
 	shredVersion     uint16
@@ -100,6 +101,9 @@ type LeaderLoop struct {
 	canSignSlot      func(uint64) bool
 	onBlock          func(*b.Block)
 	commitLeaderSlot func(replay.CommitLeaderInput) (*sealevel.SlotCtx, error)
+	hooks            LeaderHooks
+	holder           SlotHolder
+	gateTPU          bool
 
 	currentSlot   func() uint64
 	leaderForSlot func(uint64) (solana.PublicKey, bool)
@@ -138,7 +142,7 @@ type leaderProductionWindow struct {
 
 type LeaderLoopConfig struct {
 	Controller       *Controller
-	Identity         solana.PrivateKey
+	Identity         *identity.Holder // read when a slot starts; the slot keeps that identity across a swap
 	AccountsDb       *accountsdb.AccountsDb
 	Broadcaster      turbine.PacketBroadcaster
 	ShredVersion     uint16
@@ -161,6 +165,10 @@ type LeaderLoopConfig struct {
 	// uses the conservative default; tune only from measured completion times.
 	CompletionReserve time.Duration
 	Now               func() time.Time
+	Hooks             LeaderHooks
+	// GateTPU opens each working bank with TPU admission closed; Hooks must
+	// call WorkingBank.AllowTPU to open it. Ignored without Hooks.
+	GateTPU bool
 }
 
 func NewLeaderLoop(cfg LeaderLoopConfig) *LeaderLoop {
@@ -179,6 +187,7 @@ func NewLeaderLoop(cfg LeaderLoopConfig) *LeaderLoop {
 	if cfg.CompletionReserve <= 0 {
 		cfg.CompletionReserve = leaderBlockCompletionReserve
 	}
+	holder, _ := cfg.Hooks.(SlotHolder)
 	return &LeaderLoop{
 		controller:          cfg.Controller,
 		identity:            cfg.Identity,
@@ -199,6 +208,9 @@ func NewLeaderLoop(cfg LeaderLoopConfig) *LeaderLoop {
 		slotDuration:        cfg.SlotDuration,
 		completionReserve:   cfg.CompletionReserve,
 		now:                 cfg.Now,
+		hooks:               cfg.Hooks,
+		holder:              holder,
+		gateTPU:             cfg.GateTPU && cfg.Hooks != nil,
 		finishedLeaderSlots: make(map[uint64]struct{}),
 		pendingFailures:     make(map[uint64]leaderSlotFailure),
 	}
@@ -207,6 +219,10 @@ func NewLeaderLoop(cfg LeaderLoopConfig) *LeaderLoop {
 func (l *LeaderLoop) Run(stop <-chan struct{}) {
 	ticker := time.NewTicker(l.pollInterval)
 	defer ticker.Stop()
+	var released <-chan struct{}
+	if l.holder != nil {
+		released = l.holder.Released()
+	}
 
 	for {
 		select {
@@ -215,6 +231,8 @@ func (l *LeaderLoop) Run(stop <-chan struct{}) {
 			return
 		case scheduledAt := <-ticker.C:
 			l.tickScheduled(scheduledAt)
+		case <-released:
+			l.tick()
 		}
 	}
 }
@@ -246,7 +264,7 @@ func (l *LeaderLoop) tickScheduled(scheduledAt time.Time) {
 		if l.activeBank != nil {
 			if canonical, reason := l.activeParentStillCanonicalLocked(); !canonical {
 				l.rememberLeaderSlotFailureLocked(l.activeSlot, reason, activeLeaderFailureDetail(reason))
-				l.abortActiveSlotLocked()
+				l.abortActiveSlotLocked(reason)
 				if reason == leaderReasonAlreadyResolved || reason == leaderReasonParentReadyMissedWindow {
 					l.failProductionWindowLocked(l.productionWindow.nextSlot, reason, activeLeaderFailureDetail(reason))
 				}
@@ -255,7 +273,7 @@ func (l *LeaderLoop) tickScheduled(scheduledAt time.Time) {
 			}
 			now = l.now()
 			if l.productionWindow.active {
-				if now.Before(l.productionWindowDeadlineLocked(l.activeSlot)) {
+				if now.Before(l.productionWindowDeadlineLocked(l.activeSlot)) || l.holdActiveSlotLocked(now) {
 					return
 				}
 			} else if wallSlot <= l.activeSlot {
@@ -609,6 +627,14 @@ func (l *LeaderLoop) productionWindowDeadlineLocked(slot uint64) time.Time {
 	return deadline.Add(-reserve)
 }
 
+// holdActiveSlotLocked reports whether the hooks keep the active slot open past
+// its production deadline. The protocol deadline always ends the hold.
+func (l *LeaderLoop) holdActiveSlotLocked(now time.Time) bool {
+	return l.holder != nil &&
+		now.Before(l.productionWindowProtocolDeadlineLocked(l.activeSlot)) &&
+		l.holder.HoldSlot(l.activeSlot)
+}
+
 func (l *LeaderLoop) productionWindowProtocolDeadlineLocked(slot uint64) time.Time {
 	if !l.productionWindow.active || slot < l.productionWindow.startSlot {
 		return time.Time{}
@@ -726,7 +752,14 @@ func (l *LeaderLoop) activeParentStillCanonicalLocked() (bool, string) {
 	return true, ""
 }
 
-func (l *LeaderLoop) abortActiveSlotLocked() {
+func (l *LeaderLoop) abortActiveSlotLocked(reason string) {
+	if l.activeBank != nil && l.hooks != nil {
+		l.hooks.SlotAborted(l.activeSlot, reason)
+	}
+	l.releaseActiveSlotLocked()
+}
+
+func (l *LeaderLoop) releaseActiveSlotLocked() {
 	if l.controller != nil {
 		l.controller.ClearWorkingBank()
 	}
@@ -952,10 +985,13 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 	slot := l.activeSlot
 	if canonical, reason := l.activeParentStillCanonicalLocked(); !canonical {
 		l.failProductionWindowLocked(slot, reason, activeLeaderFailureDetail(reason))
-		l.abortActiveSlotLocked()
+		l.abortActiveSlotLocked(reason)
 		return
 	}
 
+	if l.hooks != nil {
+		l.hooks.SlotEnding(slot)
+	}
 	// Detach first so no new TPU packet can obtain this bank. Freeze then waits
 	// for any packet that already did, closing the footer/entry race.
 	if l.controller != nil {
@@ -964,13 +1000,13 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 	l.activeBank.Freeze()
 	if l.activeSink == nil {
 		l.failProductionWindowLocked(slot, leaderReasonFinalizationUnavailable, "entry broadcast sink is unavailable")
-		l.abortActiveSlotLocked()
+		l.abortActiveSlotLocked(leaderReasonFinalizationUnavailable)
 		return
 	}
 	l.activeSink.Wait()
 	if err := l.activeSink.Err(); err != nil {
 		l.failProductionWindowLocked(slot, leaderReasonEntryBroadcastFailed, err.Error())
-		l.abortActiveSlotLocked()
+		l.abortActiveSlotLocked(leaderReasonEntryBroadcastFailed)
 		return
 	}
 
@@ -986,7 +1022,7 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 
 	if l.accountsDb == nil || l.activeSess == nil {
 		l.failProductionWindowLocked(slot, leaderReasonFinalizationUnavailable, "accounts DB or broadcast session is unavailable")
-		l.abortActiveSlotLocked()
+		l.abortActiveSlotLocked(leaderReasonFinalizationUnavailable)
 		return
 	}
 	parentLastBlockhash := l.parentCtx.ParentLastBlockhash
@@ -1030,26 +1066,26 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 		FooterProducerTimeNanos: producerTimeNanos,
 	}); err != nil {
 		l.failProductionWindowLocked(slot, leaderReasonFreezeFailed, err.Error())
-		l.abortActiveSlotLocked()
+		l.abortActiveSlotLocked(leaderReasonFreezeFailed)
 		return
 	}
 
 	if canonical, reason := l.activeParentStillCanonicalLocked(); !canonical {
 		l.failProductionWindowLocked(slot, reason, activeLeaderFailureDetail(reason))
-		l.abortActiveSlotLocked()
+		l.abortActiveSlotLocked(reason)
 		return
 	}
 	footerBankhash := solana.HashFromBytes(l.activeBank.SlotCtx().FinalBankhash)
 	if err := l.activeSess.BroadcastFooter(footerBankhash, producerTimeNanos, footerRewards.Skip, footerRewards.Notar); err != nil {
 		l.failProductionWindowLocked(slot, leaderReasonFooterBroadcastFailed, err.Error())
-		l.abortActiveSlotLocked()
+		l.abortActiveSlotLocked(leaderReasonFooterBroadcastFailed)
 		return
 	}
 	// Ending tick is the last-in-slot shred. Mid-slot entry batches are only
 	// emitted when they fill a FEC set; Freeze already flushed any leftover.
 	if err := l.activeSess.BroadcastEndingTickLast(tickHash); err != nil {
 		l.failProductionWindowLocked(slot, leaderReasonEndingTickBroadcastFailed, err.Error())
-		l.abortActiveSlotLocked()
+		l.abortActiveSlotLocked(leaderReasonEndingTickBroadcastFailed)
 		return
 	}
 	// BroadcastEndingTickLast synchronously hands the final shred batch to the
@@ -1080,7 +1116,7 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 	l.recordLeaderSlotOutcomeLocked(slot, leaderOutcomeBroadcast, leaderReasonComplete,
 		fmt.Sprintf("block=%s parent_slot=%d txns=%d%s", solana.Hash(producedBlock.AlpenglowBlockID).String(), producedBlock.ParentSlot, len(producedBlock.Transactions), timingDetail))
 	l.advanceProductionWindowLocked(slot)
-	l.abortActiveSlotLocked()
+	l.releaseActiveSlotLocked()
 }
 
 func (l *LeaderLoop) advanceProductionWindowLocked(slot uint64) {
@@ -1192,8 +1228,10 @@ func (l *LeaderLoop) startSlotLocked(slot uint64) error {
 
 	parentChainedRoot := parentCtx.ParentChainedMerkleRoot
 
+	// The whole slot is produced and signed under the identity it opened with.
+	leaderKey := l.identity.Current()
 	session := turbine.NewBroadcastSession(turbine.BroadcastSessionConfig{
-		Leader:                  l.identity,
+		Leader:                  solana.PrivateKey(leaderKey.PrivateKey()),
 		Slot:                    slot,
 		ParentSlot:              parentSlot,
 		ParentBlockID:           parentID,
@@ -1232,11 +1270,12 @@ func (l *LeaderLoop) startSlotLocked(slot uint64) error {
 	bank := NewWorkingBank(BankConfig{
 		SlotCtx:             slotCtx,
 		Slot:                slot,
-		Leader:              l.identity.PublicKey(),
+		Leader:              leaderKey.PublicKey(),
 		Limits:              limits,
 		EntryHash:           startEntryHash,
 		Sink:                sink,
 		TransactionStatuses: parentCtx.TransactionStatuses,
+		TPUGated:            l.gateTPU,
 	})
 	if slot > 0 && !sameReplayParentSnapshot(parentCtx, l.parentContext(slot)) {
 		bank.Close()
@@ -1280,6 +1319,9 @@ func (l *LeaderLoop) startSlotLocked(slot uint64) error {
 	l.activeParentID = parentID
 	l.activeParentChainedRoot = parentChainedRoot
 	l.activeParentGeneration = parentCtx.ReplayGeneration
+	if l.hooks != nil {
+		l.hooks.SlotStarted(l.leaderSlotInfoLocked(slot, parentSlot, bank))
+	}
 	if l.controller != nil {
 		l.controller.SetWorkingBank(bank)
 	}

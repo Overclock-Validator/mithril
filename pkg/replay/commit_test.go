@@ -861,3 +861,29 @@ func newCommitTestSlotCtx() (*sealevel.SlotCtx, func()) {
 		sealevel.SysvarCache.Rent.Sysvar = prevRent
 	}
 }
+
+func TestApplySuccessfulTransactionsChecksEveryResultFirst(t *testing.T) {
+	slotCtx, cleanup := newCommitTestSlotCtx()
+	defer cleanup()
+	tx, err := solana.TransactionFromBytes(txfixture.MustSignedTransferWire(0))
+	require.NoError(t, err)
+	valid := LoadAndExecuteTransaction(LoadAndExecuteTransactionInput{SlotCtx: slotCtx, Transaction: tx, LeanResult: true})
+	require.Nil(t, valid.ProcessingResult.TransactionError)
+	failed := LoadAndExecuteTransactionOutput{ProcessingResult: TransactionProcessingResult{
+		TransactionError: &TransactionError{ErrorType: TransactionErrorInstructionError},
+	}}
+	payerBefore, err := slotCtx.GetAccount(txfixture.PayerPubkey())
+	require.NoError(t, err)
+
+	err = ApplySuccessfulTransactions(slotCtx, []LoadAndExecuteTransactionOutput{valid, failed})
+	require.ErrorContains(t, err, "transaction 1")
+	payer, err := slotCtx.GetAccount(txfixture.PayerPubkey())
+	require.NoError(t, err)
+	assert.Equal(t, payerBefore.Lamports, payer.Lamports, "nothing is applied when any result fails its check")
+	assert.Empty(t, slotCtx.ModifiedAccts)
+
+	require.NoError(t, ApplySuccessfulTransactions(slotCtx, []LoadAndExecuteTransactionOutput{valid}))
+	payer, err = slotCtx.GetAccount(txfixture.PayerPubkey())
+	require.NoError(t, err)
+	assert.Less(t, payer.Lamports, payerBefore.Lamports)
+}
