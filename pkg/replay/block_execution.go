@@ -209,6 +209,13 @@ func (exec *blockExecution) installSlotCtx(accts accounts.Accounts, parentAccts 
 	return nil
 }
 
+// streamingOverlayKeys sizes a streamed bank's account overlay and write
+// maps. The bank opens on a shell block with no transactions, so its own
+// account count would give the overlay a single lock shard, which every
+// transaction worker and the end-of-block writers then share. Mainnet blocks
+// load about 2,000 accounts and write about 1,800.
+const streamingOverlayKeys = 4096
+
 // open performs the bank-start work that needs only the parent state: the
 // parent sysvar pin and this bank's Clock/SlotHashes derivation, the parent
 // snapshot for whatever transactions the block currently carries (none for a
@@ -226,7 +233,7 @@ func (exec *blockExecution) open() error {
 	start := time.Now()
 	exec.setReplayStage("load_accounts")
 	loadAcctsRegion := trace.StartRegion(exec.ctx, "LoadBlockAccounts")
-	accts, parentAccts, accountMapCapacity, bankSysvars, err := loadBlockAccountsAndUpdateSysvars(exec.blockSrc, block, exec.epochSchedule, exec.alpenglowClock, exec.parentBankSysvars, nil)
+	accts, parentAccts, accountMapCapacity, bankSysvars, err := loadBlockAccountsAndUpdateSysvars(exec.blockSrc, block, exec.epochSchedule, exec.alpenglowClock, exec.parentBankSysvars, nil, streamingOverlayKeys)
 	loadAcctsRegion.End()
 	if err != nil {
 		return fmt.Errorf("load slot accounts and update sysvars at slot %d: %w", block.Slot, err)

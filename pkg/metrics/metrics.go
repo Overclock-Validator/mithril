@@ -443,6 +443,9 @@ type BlockReplay struct {
 	LtHashDeletedAccounts   uint64
 	LtHashOldDataBytes      uint64
 	LtHashNewDataBytes      uint64
+	// LtHashUnchangedDataBytes is the data of modified accounts whose new
+	// value hashes like their parent's, so they contribute no delta.
+	LtHashUnchangedDataBytes uint64
 
 	// Tx-level latencies summed for all the txs in a block.
 	InstructionsAndAccountMetasFromTx  Timing

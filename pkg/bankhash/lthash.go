@@ -59,6 +59,7 @@ func calculateDeltaLtHash(slotCtx *sealevel.SlotCtx, modifiedAccts []*accounts.A
 		metrics.GlobalBlockReplay.LtHashDeletedAccounts = 0
 		metrics.GlobalBlockReplay.LtHashOldDataBytes = 0
 		metrics.GlobalBlockReplay.LtHashNewDataBytes = 0
+		metrics.GlobalBlockReplay.LtHashUnchangedDataBytes = 0
 		dedupeStart = time.Now()
 	}
 	modifiedAccts = dedupeModifiedAccts(modifiedAccts)
@@ -123,17 +124,19 @@ func calculateDeltaLtHash(slotCtx *sealevel.SlotCtx, modifiedAccts []*accounts.A
 		metrics.GlobalBlockReplay.LtHashDeletedAccounts = totals.deletedAccounts
 		metrics.GlobalBlockReplay.LtHashOldDataBytes = totals.oldDataBytes
 		metrics.GlobalBlockReplay.LtHashNewDataBytes = totals.newDataBytes
+		metrics.GlobalBlockReplay.LtHashUnchangedDataBytes = totals.unchangedDataBytes
 	}
 
 	return &deltaHash
 }
 
 type ltHashWorkerStats struct {
-	unchangedAccounts uint64
-	createdAccounts   uint64
-	deletedAccounts   uint64
-	oldDataBytes      uint64
-	newDataBytes      uint64
+	unchangedAccounts  uint64
+	createdAccounts    uint64
+	deletedAccounts    uint64
+	oldDataBytes       uint64
+	newDataBytes       uint64
+	unchangedDataBytes uint64
 }
 
 func (stats *ltHashWorkerStats) add(other ltHashWorkerStats) {
@@ -142,6 +145,7 @@ func (stats *ltHashWorkerStats) add(other ltHashWorkerStats) {
 	stats.deletedAccounts += other.deletedAccounts
 	stats.oldDataBytes += other.oldDataBytes
 	stats.newDataBytes += other.newDataBytes
+	stats.unchangedDataBytes += other.unchangedDataBytes
 }
 
 // dedupeModifiedAccts collapses duplicate keys, keeping each key's last
@@ -216,6 +220,7 @@ func accumulateSingleDeltaLtHash(
 	// LtHash. A rent-epoch-only write therefore has an exact zero delta.
 	if acctsLtHashEqual(modifiedAcct, previousAcct) {
 		stats.unchangedAccounts++
+		stats.unchangedDataBytes += uint64(len(modifiedAcct.Data))
 		return
 	}
 

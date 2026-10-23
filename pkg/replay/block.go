@@ -608,6 +608,7 @@ func loadBlockAccountsAndUpdateSysvars(
 	alpenglowClock bool,
 	parentBankSysvars *sealevel.BankSysvars,
 	planner *preparedDependencyPlanner,
+	minOverlayKeys int,
 ) (accounts.Accounts, accounts.Accounts, int, *sealevel.BankSysvars, error) {
 	var bankSysvars *sealevel.BankSysvars
 	phaseStart := time.Now()
@@ -637,7 +638,7 @@ func loadBlockAccountsAndUpdateSysvars(
 	// absence) in the same batch snapshot as all other execution accounts. This
 	// preserves both the footer bounds anchor and the AccountsLtHash before-image.
 	dedupedAccts = includeAlpenglowParentStateAccounts(dedupedAccts, alpenglowClock)
-	publicationCapacity := publicationMapCapacity(block, uniqueWritableAccounts, alpenglowClock)
+	publicationCapacity := max(publicationMapCapacity(block, uniqueWritableAccounts, alpenglowClock), minOverlayKeys)
 	metrics.GlobalBlockReplay.AccountLoader.DedupeBlockAccounts.AddTimingSince(phaseStart)
 	ctx := context.Background()
 	phaseStart = time.Now()
@@ -660,7 +661,7 @@ func loadBlockAccountsAndUpdateSysvars(
 
 	// accts is a branch-local overlay over the pristine parent snapshot; execution
 	// copy-on-writes, so parentAccts stays pristine for LtHash "before" values.
-	accts := accounts.NewOverlayAccountsWithSizing(parentAccts, numAccts, publicationCapacity)
+	accts := accounts.NewOverlayAccountsWithSizing(parentAccts, max(numAccts, minOverlayKeys), publicationCapacity)
 	if parentBankSysvars != nil {
 		if parentBankSysvars.Slot() != block.ParentSlot {
 			return nil, nil, 0, nil, fmt.Errorf(
@@ -3917,14 +3918,7 @@ func compileWritableAndModifiedAccts(slotCtx *sealevel.SlotCtx, block *b.Block, 
 		}
 	}
 	modifiedAccts := make([]*accounts.Account, 0, len(slotCtx.ModifiedAccts)+len(block.UpdatedAccts)+len(rentAccts)+4)
-
-	for pk := range slotCtx.ModifiedAccts {
-		acct, err := slotCtx.GetAccount(pk)
-		if err != nil {
-			mlog.Log.Infof("compileWritableAndModifiedAccts: unable to get %s", acct.Key)
-		}
-		modifiedAccts = append(modifiedAccts, acct)
-	}
+	modifiedAccts = appendModifiedAccountCopies(modifiedAccts, slotCtx)
 
 	for _, eua := range block.EpochUpdatedAccts {
 		if eua == nil {
@@ -3961,6 +3955,63 @@ func compileWritableAndModifiedAccts(slotCtx *sealevel.SlotCtx, block *b.Block, 
 	modifiedAccts = append(modifiedAccts, sysvarAccts...)
 
 	return writableAccts, modifiedAccts
+}
+
+// modifiedAccountCopyMaxWorkers bounds the goroutines copying modified
+// accounts, and modifiedAccountsPerCopyWorker keeps small slots on fewer.
+const (
+	modifiedAccountCopyMaxWorkers = 8
+	modifiedAccountsPerCopyWorker = 128
+)
+
+// appendModifiedAccountCopies appends a copy of every account the slot
+// modified. The copies detach account data from buffers execution reuses
+// (without direct mapping, a program's account data aliases the slot's
+// serialized-parameter arena, which the next bank resets) before the values
+// are hashed and published. A mainnet slot copies a few thousand accounts and
+// several MB, and each copy is independent, so they are split across workers.
+// A modified account missing from the slot is an invariant violation; it
+// panics on the calling goroutine, where replay's recovery reports it.
+func appendModifiedAccountCopies(dst []*accounts.Account, slotCtx *sealevel.SlotCtx) []*accounts.Account {
+	keys := make([]solana.PublicKey, 0, len(slotCtx.ModifiedAccts))
+	for pk := range slotCtx.ModifiedAccts {
+		keys = append(keys, pk)
+	}
+	base := len(dst)
+	dst = append(dst, make([]*accounts.Account, len(keys))...)
+	copies := dst[base:]
+	workers := max(1, min(modifiedAccountCopyMaxWorkers, runtime.GOMAXPROCS(0), (len(keys)+modifiedAccountsPerCopyWorker-1)/modifiedAccountsPerCopyWorker))
+	chunk := (len(keys) + workers - 1) / workers
+	errs := make([]error, workers)
+	copyRange := func(worker int) {
+		for i := worker * chunk; i < min(len(keys), (worker+1)*chunk); i++ {
+			acct, err := slotCtx.GetAccount(keys[i])
+			if err != nil {
+				errs[worker] = fmt.Errorf("unable to get %s: %w", keys[i], err)
+				return
+			}
+			copies[i] = acct
+		}
+	}
+	if workers == 1 {
+		copyRange(0)
+	} else {
+		var wg sync.WaitGroup
+		for worker := range workers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				copyRange(worker)
+			}()
+		}
+		wg.Wait()
+	}
+	for _, err := range errs {
+		if err != nil {
+			panic(fmt.Sprintf("compileWritableAndModifiedAccts: %v", err))
+		}
+	}
+	return dst
 }
 
 // EncodeRecentBlockhashes deep-copies the RecentBlockhashes sysvar into the
@@ -4526,7 +4577,7 @@ func ProcessBlock(
 	start := time.Now()
 	exec.setReplayStage("load_accounts")
 	loadAcctsRegion := trace.StartRegion(exec.ctx, "LoadBlockAccounts")
-	accts, parentAccts, accountMapCapacity, bankSysvars, err := loadBlockAccountsAndUpdateSysvars(exec.blockSrc, block, epochSchedule, alpenglowClock, parentBankSysvars, planner)
+	accts, parentAccts, accountMapCapacity, bankSysvars, err := loadBlockAccountsAndUpdateSysvars(exec.blockSrc, block, epochSchedule, alpenglowClock, parentBankSysvars, planner, 0)
 	loadAcctsRegion.End()
 	if err != nil {
 		return nil, fmt.Errorf("load slot accounts and update sysvars at slot %d: %w", block.Slot, err)
