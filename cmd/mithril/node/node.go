@@ -2601,6 +2601,7 @@ postBootstrap:
 			}
 		}
 		publishRPCBankState(rpcServer, mithrilState)
+		rpcServer.SetIdentity(validatorIdentityPubkey)
 		rpcServer.Start()
 		mlog.Log.Infof("Started RPC server on port %d", rpcPort)
 	}
