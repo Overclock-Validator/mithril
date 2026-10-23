@@ -22,7 +22,8 @@ import (
 )
 
 func TestParseSendTransactionConfig_Defaults(t *testing.T) {
-	conf := parseSendTransactionConfig([]interface{}{"tx"})
+	conf, err := parseSendTransactionConfig([]json.RawMessage{json.RawMessage(`"tx"`)})
+	require.NoError(t, err)
 	assert.Equal(t, "base58", conf.encoding)
 	assert.False(t, conf.skipPreflight)
 	assert.Nil(t, conf.maxRetries)
