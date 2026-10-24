@@ -68,15 +68,16 @@ func parentSwitchNeedsStateUnwind(switchSlot, executedAnchor uint64) bool {
 // historical name is retained because node recovery treats both as the same
 // unwind/replay operation.
 type CertifiedSwitch struct {
-	Slot         uint64
-	Executed     solana.Hash // zero when the local slot was treated as skipped
-	Certified    solana.Hash // zero for a finalized skip or a parent-linked switch
-	Skip         bool        // finalized skip contradicts a locally executed block
-	ParentLinked bool        // speculative child links to an older emitted ancestor
-	ParentSlot   uint64
-	ParentID     solana.Hash
-	ChildSlot    uint64
-	ChildID      solana.Hash
+	Slot           uint64
+	Executed       solana.Hash // zero when the local slot was treated as skipped
+	Certified      solana.Hash // zero for a finalized skip or a parent-linked switch
+	Skip           bool        // finalized skip contradicts a locally executed block
+	ParentLinked   bool        // speculative child links to an older emitted ancestor
+	ParentSlot     uint64
+	ParentID       solana.Hash
+	ChildSlot      uint64
+	ChildID        solana.Hash
+	ParentRecovery *blockstream.AlpenglowParentSwitchRecovery
 }
 
 func (e *CertifiedSwitch) Error() string {

@@ -4737,6 +4737,9 @@ func runReplayWithRecovery(
 			mlog.Log.Errorf("fork switch: cannot rebuild resume context: %v; halting", err)
 			break
 		}
+		if certSwitch != nil && certSwitch.ParentLinked {
+			rs.ParentSwitchRecovery = certSwitch.ParentRecovery
+		}
 		mlog.Log.Warnf("fork switch: %s; re-replaying the selected chain from rooted slot %d (attempt %d/%d)",
 			recoveryReason, retryStart-1, attempt, maxForkSwitchRetries)
 		result = replay.ReplayBlocks(ctx, accountsDb, accountsDbPath, mithrilState, rs, retryStart, endSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, turbineShredVersion, turbineAlpenglowAddr, turbineIdentity, blockDir, txParallelism, isLive, useLightbringer, useTurbine, dbgOpts, metricsWriter, rpcServer, blockFetchOpts, consensusOpts, onCancelWriteState)
