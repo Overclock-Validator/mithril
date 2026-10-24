@@ -123,7 +123,6 @@ func TestBatchAbsenceConcurrentFoldsAndRewind(t *testing.T) {
 	}
 	// Guard against a vacuous run: the absence cache must actually have served.
 	require.NotZero(t, negativeHits.Load(), "stress run never hit the absence cache")
-	t.Logf("negative-cache hits during the run: %d", negativeHits.Load())
 
 	// Final state, read fresh: everything present with its committed value.
 	out, err := db.GetAccountsBatch(context.Background(), slot, keys)
