@@ -3264,7 +3264,7 @@ func ReplayBlocks(
 
 		// post-epoch boundary rewards distribution
 		if partitionedEpochRewardsEnabled && partitionedRewardsInfo != nil && currentSlot >= partitionedRewardsInfo.FirstStakingRewardSlot && partitionedRewardsInfo.NumRewardPartitionsRemaining > 0 {
-			distributedAccts, parentDistributedAccts, stakeCommissions := distributePartitionedEpochRewardsForSlot(acctsDb, lastSlotCtx, block.EpochUpdatedAccts, replayCtx, partitionedRewardsInfo, currentSlot, block.BlockHeight)
+			distributedAccts, parentDistributedAccts, stakeCommissions := distributePartitionedEpochRewardsForSlot(acctsDb, lastSlotCtx, block.EpochUpdatedAccts, replayCtx, partitionedRewardsInfo, currentSlot, block.BlockHeight, block.Epoch)
 			if err := replaceInflationRewardRecords(block, distributedAccts, parentDistributedAccts, rpc.RewardTypeStaking, stakeCommissions); err != nil {
 				result.Error = err
 				mlog.Log.Errorf("%v", err)
