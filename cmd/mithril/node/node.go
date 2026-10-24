@@ -561,7 +561,7 @@ func init() {
 	// [replay] section flags
 	Run.Flags().Int64Var(&txParallelism, "txpar", 0, "Transaction execution workers (>0 enables topsort parallelism; explicit 0 is sequential; unset validator mode defaults to 2x CPU cores)")
 	Run.Flags().Int64Var(&numReplaySlots, "num-slots", 0, "Number of slots to replay (0 = run continuously)")
-	Run.Flags().BoolVar(&replay.StreamingExecutionCfg.Enabled, "streaming-execution", false,
+	Run.Flags().BoolVar(&replay.StreamingExecutionCfg.Enabled, "streaming-execution", true,
 		"Execute Turbine blocks while their shreds arrive (Alpenglow validator/verifying modes only; the complete block remains authoritative and any mismatch falls back to whole-block execution)")
 	Run.Flags().IntVar(&replay.StreamingExecutionCfg.Workers, "streaming-workers", 0,
 		"Streaming execution workers per transaction group (0 = min(txpar, 4))")
@@ -1219,7 +1219,7 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	}
 	resolvedSigverifyBackend = resolved
 	sbpf.UsePool = getBool("use-pool", "tuning.use_pool")
-	// [tuning] streaming execution (off by default; Alpenglow turbine only).
+	// [tuning] streaming execution (on by default; Alpenglow turbine only).
 	replay.StreamingExecutionCfg.Enabled = getBool("streaming-execution", "tuning.streaming_execution")
 	replay.StreamingExecutionCfg.Workers = getInt("streaming-workers", "tuning.streaming_workers")
 	replay.StreamingExecutionCfg.MinGroupBatches = getInt("streaming-min-group-batches", "tuning.streaming_min_group_batches")
