@@ -244,6 +244,19 @@ func txParallelismForMode(mode string, configured int64, explicitlySet bool, cpu
 	return int64(cpuCount * 2)
 }
 
+// Shreds-only Alpenglow full nodes validate execution against the footer committed
+// by the certified block identity. RPC-backed sources retain the trailing oracle.
+// Required stays true so explicitly enabling the RPC verifier also gates folds
+// unless the operator explicitly opts into advisory comparisons.
+func defaultVerifierConfigForBlockSource(alpenglow bool, source string, rpcFallback bool) replay.VerifierConfig {
+	cfg := replay.TrailingVerifierDefaults()
+	if alpenglow && source == "turbine" && !rpcFallback {
+		cfg.Enabled = false
+		cfg.CertifiedFooterHash = true
+	}
+	return cfg
+}
+
 // A full validator validates the block it will vote on by executing it and
 // comparing the resulting bank hash with the footer committed by the
 // certificate's double-Merkle block id. Fetching finalized getBlock metadata
@@ -252,7 +265,7 @@ func verifierConfigForConsensusMode(mode string, cfg replay.VerifierConfig) repl
 	if mode == "validator" {
 		cfg.Enabled = false
 		cfg.Required = false
-		cfg.ValidatorFooterHash = true
+		cfg.CertifiedFooterHash = true
 	}
 	return cfg
 }
@@ -2368,8 +2381,8 @@ postBootstrap:
 	if config.IsSet("storage.fork_aware") {
 		mlog.Log.Warnf("storage.fork_aware was removed: the working-set suffix engine handles fork switches via unwind+re-execute — delete the key")
 	}
-	// [verifier]: the trailing execution verifier (dual-watermark second leg).
-	vcfg := replay.TrailingVerifierDefaults()
+	// [verifier]: optional RPC cross-check for shreds-only Alpenglow full nodes.
+	vcfg := defaultVerifierConfigForBlockSource(alpenglowMode, blockSource, blockRPCFallback)
 	if config.IsSet("verifier.enabled") {
 		vcfg.Enabled = config.GetBool("verifier.enabled")
 	}
