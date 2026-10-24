@@ -11,8 +11,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Both revisions run this identical benchmark. All reads use a real Pebble
-// index; setup and periodic publication-epoch changes are outside timing.
+// Reads use a real Pebble index; setup and periodic publication-epoch changes
+// are outside timing.
 func BenchmarkBatchRepeatedAbsences(b *testing.B) {
 	for _, missing := range []int{0, 256, 512} {
 		for _, changeEpoch := range []bool{false, true} {

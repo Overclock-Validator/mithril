@@ -2,10 +2,11 @@ package accountsdb
 
 import (
 	"fmt"
+	"testing"
+
 	"github.com/cockroachdb/pebble"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/require"
-	"testing"
 )
 
 func TestCompactionLiveRecords(t *testing.T) {
