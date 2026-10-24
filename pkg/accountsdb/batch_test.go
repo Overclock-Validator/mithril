@@ -96,7 +96,8 @@ func TestGetAccountsBatchStatsAndSmallBatchAdmissions(t *testing.T) {
 	_, second, err := db.GetAccountsBatchSharedWithStats(context.Background(), 100, keys)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(2), second.CacheHits, "small batch should reuse admitted common and vote accounts")
-	assert.Equal(t, uint64(1), second.IndexMisses, "negative entries are deliberately not cached yet")
+	assert.Zero(t, second.IndexMisses)
+	assert.Equal(t, uint64(1), second.NegativeCacheHits)
 }
 
 func TestLargeBatchSelectivelyAdmitsReusableAccounts(t *testing.T) {
