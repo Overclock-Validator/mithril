@@ -197,6 +197,8 @@ type OnCancelWriteState func(result *ReplayResult) error
 // ResumeState contains the state needed to properly configure the first block when resuming.
 // This is passed to ReplayBlocks when resuming from a previous run.
 type ResumeState struct {
+	// Only populated for an in-process speculative fork retry; not persisted.
+	ParentSwitchRecovery *blockstream.AlpenglowParentSwitchRecovery
 	// ParentSlot is the slot of the last successfully replayed block (= state.LastSlot)
 	ParentSlot uint64
 	// ParentBlockHeight is the block height of the last successfully replayed block.
@@ -2164,11 +2166,11 @@ func ReplayBlocks(
 		stopCapture := beginTxCapture()
 		defer stopCapture()
 		if !TrailingVerifierCfg.Required {
-			mlog.Log.Warnf("trailing verifier running in ADVISORY mode (verifier.required=false): folds are NOT gated on execution verification")
+			mlog.Log.Warnf("trailing verifier running in ADVISORY mode (verifier.required=false): folds are NOT gated on the RPC cross-check")
 		}
-		mlog.Log.FileOnlyf("trailing verifier active: lag=%d slots, budget=%d rps — folds gate on min(finality, verified)", TrailingVerifierCfg.LagSlots, TrailingVerifierCfg.MaxRPS)
-	} else if unrootedTailState != nil && TrailingVerifierCfg.ValidatorFooterHash {
-		mlog.Log.Infof("validator execution verification: RPC block metadata is disabled; received Alpenglow blocks must match their certified footer bank hash before certificate-finalized state can fold")
+		mlog.Log.FileOnlyf("trailing verifier active: lag=%d slots, budget=%d rps, required=%t, certified_footer=%t", TrailingVerifierCfg.LagSlots, TrailingVerifierCfg.MaxRPS, TrailingVerifierCfg.Required, TrailingVerifierCfg.CertifiedFooterHash)
+	} else if unrootedTailState != nil && TrailingVerifierCfg.CertifiedFooterHash {
+		mlog.Log.Infof("certified-footer execution verification: RPC block metadata is disabled; received Alpenglow blocks must match their certified footer bank hash before certificate-finalized state can fold")
 	} else if unrootedTailState != nil {
 		mlog.Log.Warnf("trailing verifier DISABLED: folds gate on certificate finality only — certificates attest block data, not execution; a mithril-side execution divergence would fold to disk undetected")
 	}
@@ -2287,10 +2289,8 @@ func ReplayBlocks(
 		if lastRootedWatermark == 0 {
 			return false
 		}
-		// In verifying mode the trailing verifier is the external execution
-		// oracle; a divergence halts regardless of finality progress. Validator
-		// mode has already enforced certified-footer/local bank-hash parity in
-		// ProcessBlock and therefore has no trailing verifier here.
+		// An enabled RPC cross-check halts on divergence regardless of finality
+		// progress, including when configured as an advisory diagnostic.
 		if trailingVerifier != nil {
 			if div := trailingVerifier.Failure(); div != nil {
 				recordReplayDivergenceEvidence(mithrilState, div)
@@ -2301,10 +2301,9 @@ func ReplayBlocks(
 				return true
 			}
 		}
-		// Verifying mode uses the dual watermark: certificate finality AND the
-		// trailing verifier. Validator mode needs certificate finality only here
-		// because every received block already passed certified-footer/local
-		// bank-hash parity. Neither mode folds at/past a divergence floor.
+		// A required RPC cross-check adds its watermark to certificate finality.
+		// Certified-footer nodes already checked execution before committing each
+		// received block. Neither policy folds at/past a divergence floor.
 		verifierRequired := trailingVerifier != nil && TrailingVerifierCfg.Required
 		verifiedWM := uint64(0)
 		if verifierRequired {
@@ -2346,7 +2345,7 @@ func ReplayBlocks(
 		// Select an actual retained bank, not a high-water mark or skipped slot:
 		// finality can end in a skipped prefix before the next epoch's first bank.
 		readThrough, durableThrough := unrootedTailState.rewardPublicationTargets(&rewardsCompletion, partitionedRewardsInfo, rewardsHoldBelowSlot, promoteThrough)
-		if !force && result.Error == nil && alpenglowMode && rewardReadPublisher != nil && (verifierRequired || TrailingVerifierCfg.ValidatorFooterHash) {
+		if !force && result.Error == nil && alpenglowMode && rewardReadPublisher != nil && (verifierRequired || TrailingVerifierCfg.CertifiedFooterHash) {
 			rewardReadPublisher.PublishEpochRewards(readThrough)
 		}
 		// Only disk checkpoints wait for the whole distribution, so recovery can
@@ -2501,6 +2500,9 @@ func ReplayBlocks(
 	if alpenglowMode && resumeState != nil && resumeState.HasParentAlpenglowBlockID {
 		opts.InitialAlpenglowBlockID = resumeState.ParentAlpenglowBlockID
 		opts.HasInitialAlpenglowBlockID = true
+	}
+	if alpenglowMode && resumeState != nil {
+		opts.ParentSwitchRecovery = resumeState.ParentSwitchRecovery
 	}
 	// Streaming execution needs the turbine batch feed; it is only ever
 	// eligible under Alpenglow with the unrooted tail (see streamingExecutor).
@@ -2873,13 +2875,14 @@ func ReplayBlocks(
 					continue
 				}
 				sw := &CertifiedSwitch{
-					Slot:         parentSwitch.SwitchSlot,
-					Executed:     alpenglowExecutedBlockIDs[parentSwitch.SwitchSlot],
-					ParentLinked: true,
-					ParentSlot:   parentSwitch.ParentSlot,
-					ParentID:     parentSwitch.ParentID,
-					ChildSlot:    parentSwitch.ChildSlot,
-					ChildID:      parentSwitch.ChildID,
+					Slot:           parentSwitch.SwitchSlot,
+					Executed:       alpenglowExecutedBlockIDs[parentSwitch.SwitchSlot],
+					ParentLinked:   true,
+					ParentSlot:     parentSwitch.ParentSlot,
+					ParentID:       parentSwitch.ParentID,
+					ChildSlot:      parentSwitch.ChildSlot,
+					ChildID:        parentSwitch.ChildID,
+					ParentRecovery: blockStream.ParentSwitchRecovery(*parentSwitch),
 				}
 				if handleAlpenglowSwitch(sw, func() bool {
 					return blockStream.RewindForAlpenglowParentSwitch(*parentSwitch)
@@ -3532,7 +3535,7 @@ func ReplayBlocks(
 				break
 			}
 			if stillOverCap {
-				// Diagnose WHY rooting stalled. Validator mode verifies the footer
+				// Diagnose WHY rooting stalled. Certified-footer mode verifies the footer
 				// bank hash inline and has no trailing-verifier watermark; do not
 				// misreport that safe path as verified=0.
 				verifiedWM := uint64(0)
@@ -3540,14 +3543,14 @@ func ReplayBlocks(
 				if trailingVerifier != nil {
 					verifiedWM = trailingVerifier.VerifiedWatermark()
 					verifiedDiag = fmt.Sprintf("%d", verifiedWM)
-				} else if TrailingVerifierCfg.ValidatorFooterHash {
+				} else if TrailingVerifierCfg.CertifiedFooterHash {
 					verifiedDiag = "n/a/footer-inline"
 				}
 				diag := fmt.Sprintf("durable=%d finality=%d verified=%s replay=%d fold_in_flight=%t",
 					mithrilState.LastRootedSlot, lastRootedWatermark, verifiedDiag, block.Slot, hadInFlightFold)
 				hint := ""
 				if trailingVerifier != nil && TrailingVerifierCfg.Required && lastRootedWatermark > verifiedWM+uint64(FoldBatchSlots) {
-					hint = " — the trailing verifier cannot keep pace with replay (finality is ahead; the verifier fetches every block's execution metas via RPC, which is slow for very large blocks). Options: verifier.required=false to gate folds on certificate finality only, a faster/archival RPC for the verifier, or wait for peer bankhash cross-checking to replace the RPC oracle"
+					hint = " — the required RPC cross-check cannot keep pace with replay; use a faster RPC endpoint or the default certified-footer policy with Alpenglow shreds-only Turbine"
 				}
 				result.Error = fmt.Errorf("rooted-durable: speculative state reached capacity at slot %d (held_slots=%d/%d retained_bytes=%d/%d); rooting stalled (%s)%s; halting", block.Slot, unrootedTailState.overlay.HeldSlots(), unrootedTailHaltCap, unrootedTailState.overlay.RetainedBytes(), unrootedTailState.maxBytes, diag, hint)
 				mlog.Log.Errorf("%v", result.Error)

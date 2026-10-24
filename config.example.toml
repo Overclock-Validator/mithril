@@ -191,8 +191,8 @@ name = "mithril"
     # Where to stream new blocks from. Empty selects the protocol default:
     # "turbine" for Alpenglow, "rpc" for classic clusters.
     #   "turbine"      - Native UDP turbine shred receiver (the LIVE mode, and
-    #                    the DEFAULT). Uses RPC for catchup, hands off to
-    #                    reconstructed shreds near tip. Shreds carry the
+    #                    the DEFAULT). Uses repair for missing shreds, including
+    #                    catchup, unless rpc_fallback is enabled. Shreds carry the
     #                    Alpenglow block ids and footer certificates that gate
     #                    durable state.
     #   "rpc"          - Fetch blocks via getBlock RPC calls. CATCH-UP/DEBUG
@@ -414,7 +414,9 @@ name = "mithril"
     # Node mode:
     #   "verifying" - DEFAULT. Non-voting: observe, execute, and verify the
     #                 cluster. Fork choice is identical to validator mode
-    #                 (there is exactly one fork-choice algorithm).
+    #                 (there is exactly one fork-choice algorithm). Shreds-only
+    #                 Alpenglow Turbine nodes validate certified footer bank hashes
+    #                 without an RPC cross-check by default; no voting keys needed.
     #   "validator" - Enforces the full voting-deployment shape at startup:
     #                 validator.identity_keypair, validator.vote_account_keypair,
     #                 block.source = "turbine", turbine.gossip_entrypoint, and
@@ -583,8 +585,9 @@ name = "mithril"
     # entry batches while its remaining shreds arrive, on a speculative bank
     # over the executed parent. The complete block stays authoritative — the
     # executed prefix must be the block's own transactions (pointer identity)
-    # or the bank is discarded and the block executes whole. Off by default.
-    # streaming_execution = false
+    # or the bank is discarded and the block executes whole. On by default;
+    # set false to use whole-block execution only.
+    # streaming_execution = true
     # Execution workers per streaming group (0 = min(txpar, 4)).
     # streaming_workers = 0
     # Contiguous decoded batches to accumulate before a group executes
@@ -900,24 +903,26 @@ name = "mithril"
 # [verifier] - Trailing Execution Verifier
 # ============================================================================
 #
-# In verifying mode, the trailing verifier is an external execution oracle:
-# it re-derives each executed slot's per-transaction results (fee, status,
-# pre/post balances) from RPC getBlock metadata at finalized commitment and
-# compares them against what replay produced. Durable folds then gate on
-# min(certificate finality, verified watermark) — nothing reaches disk
-# unverified. On a confirmed mismatch the node halts and records evidence;
-# restarts refuse to fold past the disputed slot until the evidence is
-# cleared after triage. Full validator mode never fetches RPC blocks: it
-# executes received blocks locally, requires the resulting bank hash to match
-# the footer committed by the certified block id, and folds on certificate
-# finality. The settings below therefore apply to verifying mode only.
+# Alpenglow full nodes using block.source="turbine" with rpc_fallback=false
+# validate each received block against its footer bank hash and require certificate
+# finality and matching block identities before durable folds. This applies to
+# voting validators and non-voting verifying nodes. The RPC cross-check is off by
+# default on this path. Classic and RPC-backed sources retain their old defaults.
+#
+# Non-voting nodes may explicitly enable the RPC cross-check below. It compares
+# transaction results (fee, status, pre/post balances) against finalized getBlock
+# metadata. Required checks add the RPC verified watermark to the fold gate.
+# A confirmed mismatch halts even in advisory mode and persists divergence evidence;
+# restarts cannot fold past it until triage. Voting validators ignore these options.
 
 [verifier]
-    enabled = true
+    # Omit to select the source-dependent default above. Existing explicit true
+    # settings continue to enable RPC comparisons; remove them to use the default.
+    # enabled = true
 
-    # Gate folds on the verified watermark. false = advisory only (folds gate
-    # on certificate finality alone — an execution divergence would reach disk
-    # undetected; use only for debugging).
+    # When enabled, gate folds on the RPC verified watermark (default true).
+    # false allows comparisons to lag durable state. Certified-footer checks still
+    # apply on shreds-only Alpenglow; other sources then lack that execution guard.
     required = true
 
     # Verify slots this far behind the executed tip (lets the RPC's finalized

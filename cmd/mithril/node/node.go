@@ -244,6 +244,19 @@ func txParallelismForMode(mode string, configured int64, explicitlySet bool, cpu
 	return int64(cpuCount * 2)
 }
 
+// Shreds-only Alpenglow full nodes validate execution against the footer committed
+// by the certified block identity. RPC-backed sources retain the trailing oracle.
+// Required stays true so explicitly enabling the RPC verifier also gates folds
+// unless the operator explicitly opts into advisory comparisons.
+func defaultVerifierConfigForBlockSource(alpenglow bool, source string, rpcFallback bool) replay.VerifierConfig {
+	cfg := replay.TrailingVerifierDefaults()
+	if alpenglow && source == "turbine" && !rpcFallback {
+		cfg.Enabled = false
+		cfg.CertifiedFooterHash = true
+	}
+	return cfg
+}
+
 // A full validator validates the block it will vote on by executing it and
 // comparing the resulting bank hash with the footer committed by the
 // certificate's double-Merkle block id. Fetching finalized getBlock metadata
@@ -252,7 +265,7 @@ func verifierConfigForConsensusMode(mode string, cfg replay.VerifierConfig) repl
 	if mode == "validator" {
 		cfg.Enabled = false
 		cfg.Required = false
-		cfg.ValidatorFooterHash = true
+		cfg.CertifiedFooterHash = true
 	}
 	return cfg
 }
@@ -561,7 +574,7 @@ func init() {
 	// [replay] section flags
 	Run.Flags().Int64Var(&txParallelism, "txpar", 0, "Transaction execution workers (>0 enables topsort parallelism; explicit 0 is sequential; unset validator mode defaults to 2x CPU cores)")
 	Run.Flags().Int64Var(&numReplaySlots, "num-slots", 0, "Number of slots to replay (0 = run continuously)")
-	Run.Flags().BoolVar(&replay.StreamingExecutionCfg.Enabled, "streaming-execution", false,
+	Run.Flags().BoolVar(&replay.StreamingExecutionCfg.Enabled, "streaming-execution", true,
 		"Execute Turbine blocks while their shreds arrive (Alpenglow validator/verifying modes only; the complete block remains authoritative and any mismatch falls back to whole-block execution)")
 	Run.Flags().IntVar(&replay.StreamingExecutionCfg.Workers, "streaming-workers", 0,
 		"Streaming execution workers per transaction group (0 = min(txpar, 4))")
@@ -1219,7 +1232,7 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	}
 	resolvedSigverifyBackend = resolved
 	sbpf.UsePool = getBool("use-pool", "tuning.use_pool")
-	// [tuning] streaming execution (off by default; Alpenglow turbine only).
+	// [tuning] streaming execution (on by default; Alpenglow turbine only).
 	replay.StreamingExecutionCfg.Enabled = getBool("streaming-execution", "tuning.streaming_execution")
 	replay.StreamingExecutionCfg.Workers = getInt("streaming-workers", "tuning.streaming_workers")
 	replay.StreamingExecutionCfg.MinGroupBatches = getInt("streaming-min-group-batches", "tuning.streaming_min_group_batches")
@@ -2368,8 +2381,8 @@ postBootstrap:
 	if config.IsSet("storage.fork_aware") {
 		mlog.Log.Warnf("storage.fork_aware was removed: the working-set suffix engine handles fork switches via unwind+re-execute — delete the key")
 	}
-	// [verifier]: the trailing execution verifier (dual-watermark second leg).
-	vcfg := replay.TrailingVerifierDefaults()
+	// [verifier]: optional RPC cross-check for shreds-only Alpenglow full nodes.
+	vcfg := defaultVerifierConfigForBlockSource(alpenglowMode, blockSource, blockRPCFallback)
 	if config.IsSet("verifier.enabled") {
 		vcfg.Enabled = config.GetBool("verifier.enabled")
 	}
@@ -4736,6 +4749,9 @@ func runReplayWithRecovery(
 		if err != nil {
 			mlog.Log.Errorf("fork switch: cannot rebuild resume context: %v; halting", err)
 			break
+		}
+		if certSwitch != nil && certSwitch.ParentLinked {
+			rs.ParentSwitchRecovery = certSwitch.ParentRecovery
 		}
 		mlog.Log.Warnf("fork switch: %s; re-replaying the selected chain from rooted slot %d (attempt %d/%d)",
 			recoveryReason, retryStart-1, attempt, maxForkSwitchRetries)

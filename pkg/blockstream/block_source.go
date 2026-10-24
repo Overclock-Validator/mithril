@@ -85,6 +85,9 @@ type BlockSourceOpts struct {
 	// has emitted its first post-resume block.
 	InitialAlpenglowBlockID    solana.Hash
 	HasInitialAlpenglowBlockID bool
+	// In-process rooted recovery retains the exact, already-assembled child
+	// that selected a speculative branch. It is not a certificate decision.
+	ParentSwitchRecovery *AlpenglowParentSwitchRecovery
 	// RepairCatchupMaxGapSlots: when resuming behind the live shred edge by at
 	// most this many slots, fill the gap via turbine repair instead of RPC
 	// getBlock (0 disables). Repaired shreds carry block ids + footer certs, so
@@ -363,8 +366,9 @@ type BlockSource struct {
 	// replay replaces a certified suffix or quarantines an invalid emission.
 	alpenglowQuarantineFrom      atomic.Uint64
 	alpenglowParentSwitchCh      chan AlpenglowParentSwitch
-	pendingAlpenglowParentSwitch *AlpenglowParentSwitch    // guarded by reorderMu
-	alpenglowRewindWait          alpenglowRewindDiagnostic // guarded by reorderMu
+	pendingAlpenglowParentSwitch *AlpenglowParentSwitch         // guarded by reorderMu
+	parentSwitchRecovery         *AlpenglowParentSwitchRecovery // guarded by reorderMu
+	alpenglowRewindWait          alpenglowRewindDiagnostic      // guarded by reorderMu
 	maxPending                   int
 
 	// Slot state tracking (prevents duplicates)
@@ -821,6 +825,13 @@ func NewBlockSource(opts *BlockSourceOpts) *BlockSource {
 	// Initialize stats reset time for RPS calculation
 	bs.statsResetTime.Store(time.Now().Unix())
 	bs.confirmSlotAbsent = bs.confirmSlotAbsentViaRPC
+	if recovery := opts.ParentSwitchRecovery; recovery != nil &&
+		bs.sourceType == BlockSourceTurbine && bs.turbineAlpenglowBlockIDHints &&
+		recovery.valid() && recovery.Selection.SwitchSlot >= opts.StartSlot &&
+		bs.observeAlpenglowCandidateBlock(recovery.Child) {
+		copy := *recovery
+		bs.parentSwitchRecovery = &copy
+	}
 	if opts.HasInitialAlpenglowBlockID && opts.StartSlot > 0 && opts.TurbineAlpenglowBlockIDHints {
 		anchorSlot := opts.StartSlot - 1
 		bs.lastEmittedBlockSlot = anchorSlot
@@ -2144,7 +2155,11 @@ func (bs *BlockSource) RewindForAlpenglowSwitch(slot uint64, certified solana.Ha
 // event after replay accepts the replacement branch. The alternate child and
 // already-buffered descendants are retained; the discarded source suffix is
 // cleared and ordered emission is kicked from the restored parent anchor.
+// Like RewindForAlpenglowSwitch it holds certifiedRewindMu, so its streamChan
+// and resultQueue sends cannot race their close at shutdown.
 func (bs *BlockSource) RewindForAlpenglowParentSwitch(event AlpenglowParentSwitch) bool {
+	bs.certifiedRewindMu.Lock()
+	defer bs.certifiedRewindMu.Unlock()
 	if bs.stopped.Load() || event.SwitchSlot == 0 || event.ParentSlot+1 != event.SwitchSlot || event.ChildSlot < event.SwitchSlot {
 		return false
 	}
@@ -2958,6 +2973,7 @@ func (bs *BlockSource) emitOrderedBlocks() {
 				// recovery has drained every already-emitted descendant.
 				break
 			}
+			bs.restoreAlpenglowParentSelectionLocked()
 			if bs.applyAlpenglowDecisionLocked() {
 				continue
 			}
