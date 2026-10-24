@@ -28,6 +28,7 @@ type Interpreter struct {
 	ro             []byte
 	stack          Stack
 	heap           []byte
+	heapBuffer     *byteBuffer
 	input          []byte
 	inputRegions   []InputRegion
 	inputDataVaddr uint64
@@ -85,7 +86,7 @@ func newHeap() []byte {
 var (
 	heapPool = &sync.Pool{
 		New: func() interface{} {
-			return newHeap()
+			return &byteBuffer{data: newHeap()}
 		},
 	}
 )
@@ -96,12 +97,15 @@ var (
 // In other words, Run may only be called once per interpreter.
 func NewInterpreter(p *Program, opts *VMOpts) *Interpreter {
 	var heap []byte
+	var hb *byteBuffer
 	if UsePool {
-		heap = heapPool.Get().([]byte)
+		hb = heapPool.Get().(*byteBuffer)
+		heap = hb.data
 		if len(heap) < opts.HeapMax {
 			heap = slices.Grow(heap, opts.HeapMax-len(heap))
 		}
 		heap = heap[:opts.HeapMax]
+		hb.data = heap
 		// Buffers in the pool are zeroed (for their dirty range) in Finish, so
 		// no clear is needed here.
 	} else {
@@ -115,6 +119,7 @@ func NewInterpreter(p *Program, opts *VMOpts) *Interpreter {
 		ro:                p.RO,
 		stack:             NewStack(p.SbpfVersion, opts.DisableStackFrameGaps),
 		heap:              heap,
+		heapBuffer:        hb,
 		input:             opts.Input,
 		inputRegions:      opts.InputRegions,
 		inputDataVaddr:    opts.InputDataVaddr,
@@ -142,25 +147,24 @@ func (ip *Interpreter) initRegions() {
 	for i := range ip.dirtyLo {
 		ip.dirtyLo[i] = math.MaxUint64
 		ip.dirtyHi[i] = 0
-		ip.regions[i].gapShift = 63
 	}
 	if len(ip.ro) != 0 {
 		idx := VaddrProgram >> 32
 		if ip.sbpfVersion.EnableLowerRodataVaddr() {
 			idx = 0
 		}
-		ip.regions[idx] = memRegion{base: unsafe.Pointer(&ip.ro[0]), rlen: uint64(len(ip.ro)), gapShift: 63}
+		ip.regions[idx] = memRegion{base: unsafe.Pointer(&ip.ro[0]), rlen: uint64(len(ip.ro))}
 	}
 	if len(ip.stack.mem) != 0 {
-		r := memRegion{base: unsafe.Pointer(&ip.stack.mem[0]), rlen: StackMax, wlen: StackMax, gapShift: 63}
+		r := memRegion{base: unsafe.Pointer(&ip.stack.mem[0]), rlen: StackMax, wlen: StackMax}
 		if ip.stack.stackFrameGaps {
-			r.gapShift = 12 // log2(StackFrameSize)
+			r.gapBit = StackFrameSize
 			r.gapMask = GapMask
 		}
 		ip.regions[VaddrStack>>32] = r
 	}
 	if len(ip.heap) != 0 {
-		ip.regions[VaddrHeap>>32] = memRegion{base: unsafe.Pointer(&ip.heap[0]), rlen: uint64(len(ip.heap)), wlen: uint64(len(ip.heap)), gapShift: 63}
+		ip.regions[VaddrHeap>>32] = memRegion{base: unsafe.Pointer(&ip.heap[0]), rlen: uint64(len(ip.heap)), wlen: uint64(len(ip.heap))}
 	}
 	// Finish relies on complete write tracking before returning pooled storage.
 	// Larger heaps (or a future larger stack) must use translateInternal's byte
@@ -172,7 +176,7 @@ func (ip *Interpreter) initRegions() {
 		}
 	}
 	if len(ip.inputRegions) == 0 && len(ip.input) != 0 {
-		ip.regions[VaddrInput>>32] = memRegion{base: unsafe.Pointer(&ip.input[0]), rlen: uint64(len(ip.input)), wlen: uint64(len(ip.input)), gapShift: 63}
+		ip.regions[VaddrInput>>32] = memRegion{base: unsafe.Pointer(&ip.input[0]), rlen: uint64(len(ip.input)), wlen: uint64(len(ip.input))}
 	}
 }
 
@@ -182,7 +186,7 @@ func (ip *Interpreter) Finish() {
 		if hi > lo {
 			clear(ip.heap[lo:hi])
 		}
-		heapPool.Put(ip.heap)
+		heapPool.Put(ip.heapBuffer)
 	}
 	ip.stack.MarkDirty(ip.dirtyRange(VaddrStack>>32, StackMax))
 	ip.stack.Finish()
@@ -1118,7 +1122,7 @@ func (ip *Interpreter) translateInputRegion(offset, size uint64, write bool) (un
 		cacheLen = min(cacheLen, uint64(len(region.Data)))
 	}
 	if cacheLen != 0 {
-		cached := memRegion{base: base, start: region.Offset, rlen: cacheLen, gapShift: 63}
+		cached := memRegion{base: base, start: region.Offset, rlen: cacheLen}
 		if region.Writable {
 			cached.wlen = cacheLen
 		}
