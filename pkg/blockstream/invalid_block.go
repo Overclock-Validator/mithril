@@ -26,12 +26,15 @@ var ErrBlockNotQuarantinable = errors.New("block is not a quarantinable live Alp
 // fails closed rather than re-authorizing invalid transaction contents.
 //
 // Only replay's serialized recovery path may call this method. It must not
-// overlap RewindForAlpenglowSwitch: replay owns the shared emission gate, and
-// the certified rewind's shutdown mutex does not serialize quarantine calls.
+// overlap RewindForAlpenglowSwitch: replay owns the shared emission gate.
+// certifiedRewindMu only keeps this call's resultQueue wake from racing the
+// queue's close at shutdown; it does not arbitrate the two recovery methods.
 func (bs *BlockSource) QuarantineInvalidAlpenglowBlock(blk *b.Block) error {
 	if bs == nil || blk == nil {
 		return fmt.Errorf("%w: nil source or block", ErrBlockNotQuarantinable)
 	}
+	bs.certifiedRewindMu.Lock()
+	defer bs.certifiedRewindMu.Unlock()
 	if bs.stopped.Load() {
 		return fmt.Errorf("%w: block source is stopped", ErrBlockNotQuarantinable)
 	}

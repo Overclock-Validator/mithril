@@ -2157,7 +2157,11 @@ func (bs *BlockSource) RewindForAlpenglowSwitch(slot uint64, certified solana.Ha
 // event after replay accepts the replacement branch. The alternate child and
 // already-buffered descendants are retained; the discarded source suffix is
 // cleared and ordered emission is kicked from the restored parent anchor.
+// Like RewindForAlpenglowSwitch it holds certifiedRewindMu, so its streamChan
+// and resultQueue sends cannot race their close at shutdown.
 func (bs *BlockSource) RewindForAlpenglowParentSwitch(event AlpenglowParentSwitch) bool {
+	bs.certifiedRewindMu.Lock()
+	defer bs.certifiedRewindMu.Unlock()
 	if bs.stopped.Load() || event.SwitchSlot == 0 || event.ParentSlot+1 != event.SwitchSlot || event.ChildSlot < event.SwitchSlot {
 		return false
 	}
