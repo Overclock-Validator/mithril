@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime/trace"
@@ -413,6 +414,10 @@ func (accountsDb *AccountsDb) getStoredAccount(slot uint64, pubkey solana.Public
 
 // getStoredAccountPinned requires appendVecReadMu to be held for reading.
 func (accountsDb *AccountsDb) getStoredAccountPinned(slot uint64, pubkey solana.PublicKey) (*accounts.Account, error) {
+	return accountsDb.getStoredAccountPinnedWithDataLimit(slot, pubkey, math.MaxUint64)
+}
+
+func (accountsDb *AccountsDb) getStoredAccountPinnedWithDataLimit(slot uint64, pubkey solana.PublicKey, maxDataBytes uint64) (*accounts.Account, error) {
 	if accountsDb.Index == nil {
 		return nil, ErrNoAccount
 	}
@@ -420,17 +425,20 @@ func (accountsDb *AccountsDb) getStoredAccountPinned(slot uint64, pubkey solana.
 	cachedAcct, hasAcct, cacheEpoch := accountsDb.getCachedAccountAndEpoch(pubkey)
 	if hasAcct {
 		r.End()
+		if cachedAcct != nil && uint64(len(cachedAcct.Data)) > maxDataBytes {
+			return nil, accountDataLimitError(uint64(len(cachedAcct.Data)), maxDataBytes)
+		}
 		return cachedAcct, nil
 	}
 	r.End()
 
 	defer trace.StartRegion(context.Background(), "GetStoredAccountDisk").End()
-	acct, err := accountsDb.readIndexedAccount(pubkey)
+	acct, err := accountsDb.readIndexedAccountWithDataLimit(pubkey, maxDataBytes)
 	if err == ErrNoAccount {
 		return nil, ErrNoAccount
 	}
 	if err != nil {
-		if acct, err = accountsDb.readIndexedAccount(pubkey); err != nil {
+		if acct, err = accountsDb.readIndexedAccountWithDataLimit(pubkey, maxDataBytes); err != nil {
 			if err == ErrNoAccount {
 				return nil, ErrNoAccount
 			}
@@ -596,6 +604,10 @@ func (accountsDb *AccountsDb) pendingFoldContainsLocked(pubkey solana.PublicKey)
 
 // readIndexedAccount performs one index-fetch + file-read attempt.
 func (accountsDb *AccountsDb) readIndexedAccount(pubkey solana.PublicKey) (*accounts.Account, error) {
+	return accountsDb.readIndexedAccountWithDataLimit(pubkey, math.MaxUint64)
+}
+
+func (accountsDb *AccountsDb) readIndexedAccountWithDataLimit(pubkey solana.PublicKey, maxDataBytes uint64) (*accounts.Account, error) {
 	acctIdxEntryBytes, c, err := accountsDb.Index.Get(pubkey[:])
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
@@ -622,10 +634,12 @@ func (accountsDb *AccountsDb) readIndexedAccount(pubkey solana.PublicKey) (*acco
 		return nil, fmt.Errorf("seek %s@%d: %w", appendVecFileName, acctIdxEntry.Offset, err)
 	}
 
-	acct, err := unmarshalAcctFromAppendVecAcctHeader(appendVecFile)
+	var appendVecAcct AppendVecAccount
+	err = appendVecAcct.unmarshal(appendVecFile, maxDataBytes)
 	if err != nil {
 		return nil, fmt.Errorf("unmarshal account at %s@%d: %w", appendVecFileName, acctIdxEntry.Offset, err)
 	}
+	acct := appendVecAcct.ToAccount()
 	if acct.Key != pubkey {
 		return nil, fmt.Errorf("record at %s@%d holds %s (stale index entry)", appendVecFileName, acctIdxEntry.Offset, acct.Key)
 	}

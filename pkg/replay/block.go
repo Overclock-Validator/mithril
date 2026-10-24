@@ -4143,7 +4143,7 @@ func validatePreConsensusTransactionStatuses(
 	return statuses.validateBlockWithPlan(&candidate, plan)
 }
 
-func sequentialTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, block *b.Block, executionPlan blockTransactionExecutionPlan, dbgOpts *DebugOptions, shouldVerifySignatures bool) (fees.TxFeeInfoAccumulator, uint64, error) {
+func sequentialTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, block *b.Block, executionPlan blockTransactionExecutionPlan, dbgOpts *DebugOptions, shouldVerifySignatures bool, metadata *transactionMetadataGroup) (fees.TxFeeInfoAccumulator, uint64, error) {
 	var txFeeAccumulator fees.TxFeeInfoAccumulator
 	var totalComputeUnitsConsumed uint64
 	// process & execute each transaction in turn
@@ -4155,7 +4155,7 @@ func sequentialTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, bl
 		if block.TxMetas != nil {
 			txMeta = block.TxMetas[idx]
 		}
-		txFeeInfo, txComputeUnitsConsumed, txErr := ProcessTransaction(slotCtx, sigverifyWg, tx, txMeta, dbgOpts, nil, shouldVerifySignatures)
+		txFeeInfo, txComputeUnitsConsumed, txErr := processTransaction(slotCtx, sigverifyWg, tx, txMeta, dbgOpts, nil, shouldVerifySignatures, metadata.transaction(idx))
 		totalComputeUnitsConsumed += txComputeUnitsConsumed
 
 		if txMeta == nil {
@@ -4279,6 +4279,7 @@ func parallelTxLoop(
 	txParallelism int,
 	dbgOpts *DebugOptions,
 	shouldVerifySignatures bool,
+	metadata *transactionMetadataGroup,
 ) (fees.TxFeeInfoAccumulator, uint64, error) {
 	var txFeeAccumulator fees.TxFeeInfoAccumulator
 	txFeeInfos := make([]*fees.TxFeeInfo, len(block.Transactions))
@@ -4316,7 +4317,7 @@ func parallelTxLoop(
 					if idx < len(block.TxMetas) {
 						txMeta = block.TxMetas[idx]
 					}
-					txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = ProcessTransaction(slotCtx, sigverifyWg, block.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[i], shouldVerifySignatures)
+					txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = processTransaction(slotCtx, sigverifyWg, block.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[i], shouldVerifySignatures, metadata.transaction(idx))
 					txErr := errs[idx]
 					// check for success-failure return value divergences
 					if txMeta != nil && txErr == nil && txMeta.Err != nil {
@@ -4370,7 +4371,7 @@ func parallelTxLoop(
 					if int(idx) < len(block.TxMetas) {
 						txMeta = block.TxMetas[idx]
 					}
-					txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = ProcessTransaction(slotCtx, sigverifyWg, block.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[workerIdx], shouldVerifySignatures)
+					txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = processTransaction(slotCtx, sigverifyWg, block.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[workerIdx], shouldVerifySignatures, metadata.transaction(int(idx)))
 					txErr := errs[idx]
 					if txMeta != nil && txErr == nil && txMeta.Err != nil {
 						mlog.Log.Errorf("[run:%s] DIVERGENCE in slot %d: tx %s succeeded locally but failed onchain: %+v",
@@ -4466,6 +4467,25 @@ func ProcessBlock(
 	alpenglowClock bool,
 	parentBankSysvars *sealevel.BankSysvars,
 ) (*sealevel.SlotCtx, error) {
+	return processBlock(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, tail, transactionStatuses, alpenglowClock, parentBankSysvars, nil)
+}
+
+func processBlock(
+	acctsDb *accountsdb.AccountsDb,
+	block *b.Block,
+	epochSchedule *sealevel.SysvarEpochSchedule,
+	txParallelism int,
+	dbgOpts *DebugOptions,
+	persistedHashes *persistedTracker,
+	tail unrootedState,
+	transactionStatuses *TransactionStatusCache,
+	alpenglowClock bool,
+	parentBankSysvars *sealevel.BankSysvars,
+	metadata *blockMetadataCapture,
+) (*sealevel.SlotCtx, error) {
+	if metadata != nil {
+		*metadata = blockMetadataCapture{}
+	}
 	if block == nil {
 		return nil, errors.New("validate transaction messages: nil block")
 	}
@@ -4497,6 +4517,7 @@ func ProcessBlock(
 	// The resumable execution state carries the trace task, stage watchdog and
 	// the SlotCtx; streaming execution drives the same object group by group.
 	exec := newBlockExecution(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, tail, transactionStatuses, alpenglowClock, parentBankSysvars)
+	exec.metadata = metadata
 	defer exec.close()
 	exec.setReplayStage("prepare_dependency_planner")
 
@@ -4547,11 +4568,12 @@ func ProcessBlock(
 	exec.setReplayStage("tx_loop")
 	txLoopRegion := trace.StartRegion(exec.ctx, "TxLoop")
 	shouldVerifySignatures := !block.TransactionSignaturesVerified()
+	groupMetadata := metadata.beginGroup(slotCtx, block.Transactions, txParallelism)
 	var txLoopErr error
 	if txParallelism > 0 {
-		txFeeAccumulator, totalComputeUnitsConsumed, txLoopErr = parallelTxLoop(slotCtx, &exec.sigverifyWg, planner, block, executionPlan, txParallelism, dbgOpts, shouldVerifySignatures)
+		txFeeAccumulator, totalComputeUnitsConsumed, txLoopErr = parallelTxLoop(slotCtx, &exec.sigverifyWg, planner, block, executionPlan, txParallelism, dbgOpts, shouldVerifySignatures, groupMetadata)
 	} else {
-		txFeeAccumulator, totalComputeUnitsConsumed, txLoopErr = sequentialTxLoop(slotCtx, &exec.sigverifyWg, block, executionPlan, dbgOpts, shouldVerifySignatures)
+		txFeeAccumulator, totalComputeUnitsConsumed, txLoopErr = sequentialTxLoop(slotCtx, &exec.sigverifyWg, block, executionPlan, dbgOpts, shouldVerifySignatures, groupMetadata)
 	}
 	txLoopRegion.End()
 	metrics.GlobalBlockReplay.TxLoop.AddTimingSince(start)
@@ -4559,6 +4581,7 @@ func ProcessBlock(
 		// The partially executed SlotCtx is dropped unfinalized.
 		return nil, fmt.Errorf("execute transactions for slot %d: %w", block.Slot, txLoopErr)
 	}
+	metadata.finishGroup(groupMetadata)
 	slotCtx.TotalComputeUnitsConsumed = totalComputeUnitsConsumed
 
 	exec.txFeeAccumulator = txFeeAccumulator

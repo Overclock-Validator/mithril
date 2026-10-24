@@ -2,6 +2,9 @@ package rpcserver
 
 import (
 	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
@@ -126,4 +129,35 @@ func TestUiAmountStringForRaw_LargeAmountModerateDecimals(t *testing.T) {
 	// 9007199254740993 is 2^53 + 1, the first integer not exactly
 	// representable in float64. The string path must still be exact.
 	assert.Equal(t, "9007199254.740993", uiAmountStringForRaw(9007199254740993, 6))
+}
+
+func TestUiAmountForRaw_JSON(t *testing.T) {
+	for _, tc := range []struct {
+		amount   uint64
+		decimals uint8
+		numeric  string
+		text     string
+	}{
+		{0, 0, "0", "0"},
+		{1, 0, "1", "1"},
+		{1, 19, "1e-19", "0.0000000000000000001"},
+		{1, 20, "null", "0.00000000000000000001"},
+		{0, 20, "null", "0"},
+		{^uint64(0), 20, "null", "0.18446744073709551615"},
+		{^uint64(0), 25, "null", "0.0000018446744073709551615"},
+		{1, 255, "null", "0." + strings.Repeat("0", 254) + "1"},
+	} {
+		t.Run(fmt.Sprintf("%d/%d", tc.amount, tc.decimals), func(t *testing.T) {
+			mint := solana.PublicKey{1}
+			balances := extractTokenBalances(
+				[]*accounts.Account{makeTokenAccount(t, mint, solana.PublicKey{2}, tc.amount)},
+				map[solana.PublicKey]uint8{mint: tc.decimals},
+			)
+			require.Len(t, balances, 1)
+			raw, err := json.Marshal(balances[0].UiTokenAmount)
+			require.NoError(t, err)
+			want := fmt.Sprintf(`{"amount":"%d","decimals":%d,"uiAmount":%s,"uiAmountString":%q}`, tc.amount, tc.decimals, tc.numeric, tc.text)
+			assert.JSONEq(t, want, string(raw))
+		})
+	}
 }

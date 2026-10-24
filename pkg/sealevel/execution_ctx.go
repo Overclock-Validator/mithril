@@ -38,6 +38,11 @@ type ExecutionCtx struct {
 	RecordInnerInstructions bool
 	currentTopLevelInstrIdx uint8
 	InnerInstrs             []RecordedInnerInstr
+	// InnerInstructionsCaptureError marks an unavailable optional capture,
+	// independently of the instruction's execution result.
+	InnerInstructionsCaptureError error
+	boundedInnerInstructions      bool
+	innerInstructionBytes         int
 
 	serializedAccountMetadataStack [][]serializedAcctMetadata
 }
@@ -298,24 +303,15 @@ func (execCtx *ExecutionCtx) ProcessInstruction(instrData []byte, instructionAcc
 	// an active top-level frame and recording is enabled. Stack height
 	// before Push reflects parent depth: 0 = top-level, >=1 = CPI.
 	if execCtx.RecordInnerInstructions && len(programIndices) > 0 && execCtx.StackHeight() >= 1 {
-		acctIdxs := make([]uint8, 0, len(instructionAccts))
-		for _, ia := range instructionAccts {
-			acctIdxs = append(acctIdxs, uint8(ia.IndexInTransaction))
-		}
-		dataCopy := make([]byte, len(instrData))
-		copy(dataCopy, instrData)
-		execCtx.InnerInstrs = append(execCtx.InnerInstrs, RecordedInnerInstr{
-			TopLevelIdx:    execCtx.currentTopLevelInstrIdx,
-			StackHeight:    uint8(execCtx.StackHeight() + 1),
-			ProgramIdIndex: uint8(programIndices[0]),
-			Accounts:       acctIdxs,
-			Data:           dataCopy,
-		})
+		execCtx.recordInnerInstruction(instrData, instructionAccts, uint8(programIndices[0]))
 	}
 
 	start = metrics.StartTiming(!execCtx.SkipTimingMetrics)
 	err = execCtx.Push()
 	if err != nil {
+		// Failed pushes have different trace-retention semantics across failure
+		// paths. Do not publish an attempted invocation as complete metadata.
+		execCtx.invalidateInnerInstructionCapture(err)
 		return err
 	}
 	metrics.GlobalBlockReplay.IxPush.AddTimingSince(start)

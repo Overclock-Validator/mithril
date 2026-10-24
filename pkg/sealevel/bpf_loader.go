@@ -1442,8 +1442,10 @@ func normalizeProgramRunErr(err error) error {
 	if _, ok := solanaErrCode(err); ok {
 		return err
 	}
-	if IsCustomErr(err) {
-		return err
+	for cause := err; cause != nil; cause = errors.Unwrap(cause) {
+		if IsCustomErr(cause) {
+			return cause
+		}
 	}
 	return InstrErrProgramFailedToComplete
 }

@@ -381,15 +381,13 @@ func TestTransactionError_MarshalJSON_InstructionError(t *testing.T) {
 
 // TestTransactionError_MarshalJSON_CustomCarriesShape verifies the
 // {"InstructionError":[idx, {"Custom":N}]} object shape Agave uses for
-// program-defined error codes. Mithril does not yet preserve the program-
-// specific u32, so the inner code is 0 — but the SHAPE is correct so
-// Anchor / web3.js parsers don't break on the response.
+// program-defined error codes, including a real custom code of zero.
 func TestTransactionError_MarshalJSON_CustomCarriesShape(t *testing.T) {
 	idx := uint8(0)
 	got, err := json.Marshal(&TransactionError{
 		ErrorType:        TransactionErrorInstructionError,
 		InstructionIndex: &idx,
-		InstructionError: sealevel.InstrErrCustom,
+		InstructionError: sealevel.InstrErrCustomCode{Code: 0},
 	})
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"InstructionError":[0,{"Custom":0}]}`, string(got))
