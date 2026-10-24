@@ -2,6 +2,7 @@ package rpcserver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/filecoin-project/go-jsonrpc"
@@ -9,24 +10,23 @@ import (
 )
 
 func (rpcServer *RpcServer) GetBankHash(ctx context.Context, p jsonrpc.RawParams) (string, error) {
-	params, err := jsonrpc.DecodeParams[[]interface{}](p)
+	params, err := jsonrpc.DecodeParams[[]json.RawMessage](p)
 	if err != nil {
-		return "", fmt.Errorf("decoding params: %w", err)
+		return "", &InvalidParamsError{Message: fmt.Sprintf("decoding params: %v", err)}
 	}
 
-	if len(params) < 1 {
-		return "", fmt.Errorf("getBankHash requires a slot number as first parameter")
+	if len(params) != 1 {
+		return "", &InvalidParamsError{Message: "getBankHash requires one slot"}
 	}
 
-	slotFloat, ok := params[0].(float64)
-	if !ok {
-		return "", fmt.Errorf("getBankHash requires a slot number as first parameter")
+	var slot *uint64
+	if err := json.Unmarshal(params[0], &slot); err != nil || slot == nil {
+		return "", &InvalidParamsError{Message: "getBankHash requires an unsigned integer slot"}
 	}
 
-	slot := uint64(slotFloat)
-	bankHash, err := rpcServer.acctsDb.GetBankHashForSlot(slot)
+	bankHash, err := rpcServer.acctsDb.GetBankHashForSlot(*slot)
 	if err != nil {
-		return "", fmt.Errorf("unable to retrieve bankhash for slot %d", slot)
+		return "", fmt.Errorf("unable to retrieve bankhash for slot %d", *slot)
 	}
 
 	return base58.Encode(bankHash), nil

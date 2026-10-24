@@ -3,6 +3,7 @@ package rpcserver
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -129,26 +130,30 @@ func (rpcServer *RpcServer) SimulateTransaction(ctx context.Context, p jsonrpc.R
 	metrics.GlobalSimulate.TotalCalls.Inc()
 	defer metrics.GlobalSimulate.HandlerLatency.AddTimingSince(time.Now())
 
-	params, err := jsonrpc.DecodeParams[[]interface{}](p)
+	params, err := jsonrpc.DecodeParams[[]json.RawMessage](p)
 	if err != nil {
 		return SimulateTransactionResp{}, &InvalidParamsError{Message: fmt.Sprintf("decoding params: %v", err)}
 	}
 
-	if len(params) < 1 {
+	if len(params) < 1 || len(params) > 2 {
 		return SimulateTransactionResp{}, &InvalidParamsError{Message: "simulateTransaction requires a transaction string as first parameter"}
 	}
 
-	txStr, ok := params[0].(string)
-	if !ok {
+	var transaction *string
+	if err := json.Unmarshal(params[0], &transaction); err != nil || transaction == nil {
 		return SimulateTransactionResp{}, &InvalidParamsError{Message: "simulateTransaction requires a transaction string as first parameter"}
 	}
 
-	conf := parseSimulateConfig(params)
+	txStr := *transaction
+	conf, err := parseSimulateConfig(params)
+	if err != nil {
+		return SimulateTransactionResp{}, err
+	}
 
 	// Validate the encoding name BEFORE attempting tx decode so a bad
 	// encoding surfaces as "unsupported encoding: …" not "failed to decode".
 	// Agave order: into_binary_encoding() runs before decode_and_deserialize.
-	if conf.encoding != "" && conf.encoding != "base58" && conf.encoding != "base64" {
+	if conf.encoding != "base58" && conf.encoding != "base64" {
 		return SimulateTransactionResp{}, &InvalidParamsError{
 			Message: fmt.Sprintf("unsupported encoding: %s", conf.encoding),
 		}
@@ -209,9 +214,13 @@ func (rpcServer *RpcServer) SimulateTransaction(ctx context.Context, p jsonrpc.R
 		}
 	}
 
-	if conf.minContextSlot != nil && global.Slot() < *conf.minContextSlot {
+	slotCtx := rpcServer.getSlotCtx()
+	if slotCtx == nil {
+		return SimulateTransactionResp{}, fmt.Errorf("node is not ready for simulation")
+	}
+	if conf.minContextSlot != nil && slotCtx.Slot < *conf.minContextSlot {
 		return SimulateTransactionResp{}, &MinContextSlotNotReachedError{
-			ContextSlot: *conf.minContextSlot,
+			ContextSlot: slotCtx.Slot,
 		}
 	}
 
@@ -225,16 +234,11 @@ func (rpcServer *RpcServer) SimulateTransaction(ctx context.Context, p jsonrpc.R
 		}
 	}
 
-	slotCtx := rpcServer.getSlotCtx()
-	if slotCtx == nil {
-		return SimulateTransactionResp{}, fmt.Errorf("node is not ready for simulation")
-	}
-
 	// ALT resolve runs before sigVerify so the failure response carries the
 	// resolved loadedAddresses, not empty arrays.
 	if err := replay.ResolveAddrTableLookupsForTx(ctx, rpcServer.acctsDb, slotCtx.Slot, tx); err != nil {
 		metrics.GlobalSimulate.AddressLookupFails.Inc()
-		return earlyFailResponse("AddressLookupTableNotFound", replacementBlockhash, conf, tx), nil
+		return earlyFailResponse("AddressLookupTableNotFound", replacementBlockhash, conf, tx, slotCtx.Slot), nil
 	}
 
 	// RuntimeTransaction::try_create sanitizes unconditionally in Agave's
@@ -260,7 +264,7 @@ func (rpcServer *RpcServer) SimulateTransaction(ctx context.Context, p jsonrpc.R
 	if conf.sigVerify {
 		err = txverify.VerifyTransaction(tx)
 		if err != nil {
-			return earlyFailResponse("SignatureFailure", replacementBlockhash, conf, tx), nil
+			return earlyFailResponse("SignatureFailure", replacementBlockhash, conf, tx, slotCtx.Slot), nil
 		}
 	}
 
@@ -294,7 +298,7 @@ func (rpcServer *RpcServer) SimulateTransaction(ctx context.Context, p jsonrpc.R
 	resp := SimulateTransactionResp{
 		Context: SimulateTransactionRespContext{
 			ApiVersion: "mithril 0.1",
-			Slot:       global.Slot(),
+			Slot:       slotCtx.Slot,
 		},
 		Value: SimulateTransactionRespValue{
 			Logs:                 ptrSlice(logs),
@@ -432,61 +436,54 @@ func (rpcServer *RpcServer) SimulateTransaction(ctx context.Context, p jsonrpc.R
 	return resp, nil
 }
 
-func parseSimulateConfig(params []interface{}) simulateTransactionConfig {
+func parseSimulateConfig(params []json.RawMessage) (simulateTransactionConfig, error) {
 	conf := simulateTransactionConfig{
-		encoding: "base64",
+		encoding: "base58",
 	}
 
 	if len(params) < 2 {
-		return conf
+		return conf, nil
 	}
 
-	confMap, ok := params[1].(map[string]interface{})
-	if !ok {
-		return conf
+	var options struct {
+		SigVerify              *bool   `json:"sigVerify"`
+		ReplaceRecentBlockhash *bool   `json:"replaceRecentBlockhash"`
+		Encoding               *string `json:"encoding"`
+		Commitment             *string `json:"commitment"`
+		MinContextSlot         *uint64 `json:"minContextSlot"`
+		InnerInstructions      *bool   `json:"innerInstructions"`
+		Accounts               *struct {
+			Addresses []string `json:"addresses"`
+			Encoding  string   `json:"encoding"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(params[1], &options); err != nil {
+		return conf, &InvalidParamsError{Message: fmt.Sprintf("invalid simulateTransaction config: %v", err)}
 	}
 
-	if sigVerify, ok := confMap["sigVerify"].(bool); ok {
-		conf.sigVerify = sigVerify
+	if options.SigVerify != nil {
+		conf.sigVerify = *options.SigVerify
 	}
-
-	if replaceRecentBlockhash, ok := confMap["replaceRecentBlockhash"].(bool); ok {
-		conf.replaceRecentBlockhash = replaceRecentBlockhash
+	if options.ReplaceRecentBlockhash != nil {
+		conf.replaceRecentBlockhash = *options.ReplaceRecentBlockhash
 	}
-
-	if encoding, ok := confMap["encoding"].(string); ok {
-		conf.encoding = encoding
+	if options.Encoding != nil {
+		conf.encoding = *options.Encoding
 	}
-
-	if commitment, ok := confMap["commitment"].(string); ok {
-		conf.commitment = commitment
+	if options.Commitment != nil {
+		conf.commitment = *options.Commitment
 	}
-
-	if minSlot, ok := confMap["minContextSlot"].(float64); ok && minSlot >= 0 {
-		v := uint64(minSlot)
-		conf.minContextSlot = &v
+	conf.minContextSlot = options.MinContextSlot
+	if options.InnerInstructions != nil {
+		conf.innerInstructions = *options.InnerInstructions
 	}
-
-	if innerInstr, ok := confMap["innerInstructions"].(bool); ok {
-		conf.innerInstructions = innerInstr
-	}
-
-	if accountsObj, ok := confMap["accounts"].(map[string]interface{}); ok {
-		acctConf := &simulateAccountsConfig{}
-		if addresses, ok := accountsObj["addresses"].([]interface{}); ok {
-			for _, addr := range addresses {
-				if addrStr, ok := addr.(string); ok {
-					acctConf.addresses = append(acctConf.addresses, addrStr)
-				}
-			}
+	if options.Accounts != nil {
+		conf.accounts = &simulateAccountsConfig{
+			addresses: options.Accounts.Addresses,
+			encoding:  options.Accounts.Encoding,
 		}
-		if encoding, ok := accountsObj["encoding"].(string); ok {
-			acctConf.encoding = encoding
-		}
-		conf.accounts = acctConf
 	}
-
-	return conf
+	return conf, nil
 }
 
 // postBalancesFromExecCtx returns the lamport balance of every account key
@@ -678,7 +675,7 @@ func clampReturnData(data []byte) []byte {
 // completed (sigVerify-fail path), the resolved writable/readonly arrays
 // are emitted. For pre-ALT failures (ALT-not-found), tx may be nil or
 // not-yet-resolved, in which case loadedAddresses is the empty payload.
-func earlyFailResponse(errStr string, replacementBlockhash *ReplacementBlockhashPayload, conf simulateTransactionConfig, tx *solana.Transaction) SimulateTransactionResp {
+func earlyFailResponse(errStr string, replacementBlockhash *ReplacementBlockhashPayload, conf simulateTransactionConfig, tx *solana.Transaction, slot uint64) SimulateTransactionResp {
 	zeroUnits := uint64(0)
 	zeroSize := uint32(0)
 	emptyLogs := []string{}
@@ -689,7 +686,7 @@ func earlyFailResponse(errStr string, replacementBlockhash *ReplacementBlockhash
 	resp := SimulateTransactionResp{
 		Context: SimulateTransactionRespContext{
 			ApiVersion: "mithril 0.1",
-			Slot:       global.Slot(),
+			Slot:       slot,
 		},
 		Value: SimulateTransactionRespValue{
 			Err:                    errStr,
