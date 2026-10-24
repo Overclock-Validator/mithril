@@ -11,10 +11,6 @@ type fastFlags struct {
 	explicitSext   bool
 	disableLddw    bool
 	staticSyscalls bool
-	// fastCalls: callTargets[pc] >= 0 implies the immediate is not a syscall,
-	// so an internal call can skip Run's syscall lookup (see
-	// Program.ResolveCallTargetsExcluding).
-	fastCalls bool
 }
 
 func (ip *Interpreter) fastFlags() fastFlags {
@@ -26,7 +22,6 @@ func (ip *Interpreter) fastFlags() fastFlags {
 		explicitSext:   v.ExplicitSignExtensionOfResults(),
 		disableLddw:    v.DisableLddw(),
 		staticSyscalls: v.EnableStaticSyscalls(),
-		fastCalls:      ip.callTargetsExcludeSyscalls && len(ip.callTargets) == len(ip.text),
 	}
 }
 
@@ -45,7 +40,6 @@ func sext32(explicit bool, val int32) uint64 {
 // pc or an exhausted budget) and Run handles that instruction itself.
 func (ip *Interpreter) runFast(r *[16]uint64, pc int64, due, budget uint64, f fastFlags) (int64, uint64) {
 	text := ip.text
-	callTargets := ip.callTargets
 	stack := &ip.stack
 	for {
 		if uint64(pc) >= uint64(len(text)) || due == budget {
@@ -397,24 +391,15 @@ func (ip *Interpreter) runFast(r *[16]uint64, pc int64, due, budget uint64, f fa
 		case OpArsh64Reg:
 			r[ins.Dst()] = uint64(int64(r[ins.Dst()]) >> (r[ins.Src()]))
 		case OpCall:
-			// Internal calls only; syscalls and unresolved targets take Run's path.
-			var target int64
-			if f.staticSyscalls {
-				if ins.Src() != 1 {
-					return pc, due
-				}
-				target = ip.sbpfVersion.CalculateCallImmTargetPC(pc, ins.Imm())
-				if target < 0 || target >= int64(len(text)) {
-					return pc, due
-				}
-			} else {
-				if !f.fastCalls {
-					return pc, due
-				}
-				target = callTargets[pc]
-				if target < 0 {
-					return pc, due
-				}
+			// Legacy call immediates may name a syscall in the invocation's
+			// registry, even if they resolved internally at load time. Keep
+			// that lookup on Run's path. Static calls encode the distinction.
+			if !f.staticSyscalls || ins.Src() != 1 {
+				return pc, due
+			}
+			target := ip.sbpfVersion.CalculateCallImmTargetPC(pc, ins.Imm())
+			if target < 0 || target >= int64(len(text)) {
+				return pc, due
 			}
 			// Stack.Push, inlined (it exceeds the inlining budget).
 			n := len(stack.shadow)

@@ -36,11 +36,7 @@ var noSyscalls = SyscallRegistry(func(uint32) (Syscall, bool) { return nil, fals
 // resolveCallTargetsIfSupported precomputes internal call targets on trees
 // that have Program.ResolveCallTargets (the loader does this at load time);
 // it is a no-op on the baseline tree so the same benchmark code runs on both.
-func resolveCallTargetsIfSupported(p *Program, reg SyscallRegistry) {
-	if r, ok := any(p).(interface{ ResolveCallTargetsExcluding(SyscallRegistry) }); ok {
-		r.ResolveCallTargetsExcluding(reg)
-		return
-	}
+func resolveCallTargetsIfSupported(p *Program) {
 	if r, ok := any(p).(interface{ ResolveCallTargets() }); ok {
 		r.ResolveCallTargets()
 	}
@@ -146,7 +142,7 @@ func benchLoop(b *testing.B, p *Program, insnsPerRun uint64) {
 	if err := p.Verify(); err != nil {
 		b.Fatal(err)
 	}
-	resolveCallTargetsIfSupported(p, noSyscalls)
+	resolveCallTargetsIfSupported(p)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
