@@ -255,16 +255,19 @@ func (accum *loadedAcctSizeAccumulatorSimd186) collectAcct(acct *accounts.Accoun
 			if !accum.wasAlreadyCounted(programDataAddr) {
 				// program data account not being found is not an error. Agave instead ignores it.
 				programDataAcct, err := accum.slotCtx.GetAccountShared(programDataAddr)
+				var programDataLen uint64
 				if err != nil {
 					if accum.slotCtx.UnrootedRead == nil && accum.slotCtx.AccountsDb == nil {
 						return nil
 					}
-					programDataAcct, err = accum.slotCtx.GetAccountFromAccountsDb(programDataAddr)
+					programDataLen, err = accum.slotCtx.GetAccountDataLenFromAccountsDb(programDataAddr)
 					if err != nil {
 						return nil
 					}
+				} else {
+					programDataLen = uint64(len(programDataAcct.Data))
 				}
-				accum.accumulator = safemath.SaturatingAddU64(accum.accumulator, safemath.SaturatingAddU64(txAcctBaseSize, uint64(len(programDataAcct.Data))))
+				accum.accumulator = safemath.SaturatingAddU64(accum.accumulator, safemath.SaturatingAddU64(txAcctBaseSize, programDataLen))
 				if accum.accumulator > accum.limit {
 					return TxErrMaxLoadedAccountsDataSizeExceeded
 				}
