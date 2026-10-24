@@ -1,0 +1,2 @@
+# Unified patch context intentionally prefixes Go tabs and blank lines with a space.
+scripts/toolchain/go1.27.2/interpreter-offset.patch -whitespace

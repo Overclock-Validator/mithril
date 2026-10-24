@@ -49,3 +49,8 @@ docs/snapshot-integration-handoff*.txt
 # Claude Code settings
 .claude/
 .direnv
+
+# Isolated optional linker cache and build provenance
+/.build/
+/mithril.layout.json
+/scripts/__pycache__/

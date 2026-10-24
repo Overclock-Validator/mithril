@@ -1,3 +1,4 @@
+GO ?= go
 VERSION ?= dev
 GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 GIT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
@@ -8,16 +9,22 @@ LDFLAGS := -X github.com/Overclock-Validator/mithril/pkg/version.Version=$(VERSI
            -X github.com/Overclock-Validator/mithril/pkg/version.GitBranch=$(GIT_BRANCH) \
            -X github.com/Overclock-Validator/mithril/pkg/version.BuildDate=$(BUILD_DATE)
 
-.PHONY: build release clean server-setup disk-setup tune conformance-vectors test-conformance-elf test-conformance-vm-programs test-conformance-sbpf test-conformance-precompiles
+.PHONY: build build-zen5 release clean server-setup disk-setup tune conformance-vectors test-conformance-elf test-conformance-vm-programs test-conformance-sbpf test-conformance-precompiles
 
 build:
 	go build -ldflags "$(LDFLAGS)" -o mithril ./cmd/mithril
+	rm -f mithril.layout.json
+
+# Requires the measured Go 1.27.2 Linux/amd64 toolchain; verifies final placement.
+build-zen5:
+	python3 scripts/zen5-build.py --go "$(GO)" --output mithril -- build -ldflags "$(LDFLAGS)" ./cmd/mithril
 
 release:
 	go build -ldflags "$(LDFLAGS) -s -w" -o mithril ./cmd/mithril
+	rm -f mithril.layout.json
 
 clean:
-	rm -f mithril
+	rm -f mithril mithril.layout.json
 
 # Server setup scripts (require sudo - run as: sudo make server-setup ...)
 server-setup:

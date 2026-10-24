@@ -106,10 +106,12 @@ type MithrilState struct {
 	// =========================================================================
 	// Current Position (where we left off)
 	// =========================================================================
-	LastSlot        uint64 `json:"last_slot,omitempty"`         // Last successfully replayed slot (the replayed tip)
-	LastEpoch       uint64 `json:"last_epoch,omitempty"`        // Epoch of last replayed slot
-	LastBankhash    string `json:"last_bankhash,omitempty"`     // Bankhash of last replayed slot (base58)
-	LastBlockHeight uint64 `json:"last_block_height,omitempty"` // Block height of last replayed slot
+	// LastTransactionStatusCheckpoint belongs to the durable classic replay tip.
+	LastTransactionStatusCheckpoint *TransactionStatusCheckpointRef `json:"last_transaction_status_checkpoint,omitempty"`
+	LastSlot                        uint64                          `json:"last_slot,omitempty"`         // Last successfully replayed slot (the replayed tip)
+	LastEpoch                       uint64                          `json:"last_epoch,omitempty"`        // Epoch of last replayed slot
+	LastBankhash                    string                          `json:"last_bankhash,omitempty"`     // Bankhash of last replayed slot (base58)
+	LastBlockHeight                 uint64                          `json:"last_block_height,omitempty"` // Block height of last replayed slot
 
 	// Rooted-durable watermark: the canonical store holds only rooted (finalized) slots
 	// through here while replay runs ahead in RAM. Resume starts at the next slot. Zero = legacy.

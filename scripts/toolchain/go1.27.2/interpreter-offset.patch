@@ -1,0 +1,49 @@
+--- a/cmd/link/internal/ld/data.go
++++ b/cmd/link/internal/ld/data.go
+@@ -2866,6 +2866,16 @@
+ 	align := ldr.SymAlign(s)
+ 	align = max(align, int32(Funcalign))
+ 	va = uint64(Rnd(int64(va), int64(align)))
++	// Mithril's Zen 5 profile uses an explicit function-entry offset. Keep
++	// padding after Run stable so comparisons can move it independently of
++	// surrounding functions. The build checks the address after external linking.
++	mithrilTarget := *FlagMithrilInterpreterOffset >= 0 && ldr.SymName(s) == "github.com/Overclock-Validator/mithril/pkg/sbpf.(*Interpreter).Run"
++	if mithrilTarget {
++		if !ctxt.IsAMD64() || align > 32 {
++			Exitf("Mithril interpreter placement requires amd64 and function alignment <= 32")
++		}
++		va = uint64(Rnd(int64(va), 64)) + uint64(*FlagMithrilInterpreterOffset)
++	}
+ 	if sect.Align < align {
+ 		sect.Align = align
+ 	}
+@@ -2952,6 +2962,9 @@
+ 	}
+ 
+ 	va += funcsize
++	if mithrilTarget {
++		va = uint64(Rnd(int64(va+uint64(32-*FlagMithrilInterpreterOffset)), 64))
++	}
+ 
+ 	return sect, n, va
+ }
+--- a/cmd/link/internal/ld/main.go
++++ b/cmd/link/internal/ld/main.go
+@@ -109,6 +109,7 @@
+ 	FlagTextAddr      = flag.Int64("T", -1, "set the start address of text symbols")
+ 	FlagDataAddr      = flag.Int64("D", -1, "set the start address of data symbols")
+ 	FlagFuncAlign     = flag.Int("funcalign", 0, "set function align to `N` bytes")
++	FlagMithrilInterpreterOffset = flag.Int("mithril-interpreter-offset", -1, "Mithril Interpreter.Run offset within a 64-byte boundary (-1 disables)")
+ 	flagEntrySymbol   = flag.String("E", "", "set `entry` symbol name")
+ 	flagPruneWeakMap  = flag.Bool("pruneweakmap", true, "prune weak mapinit refs")
+ 	flagRandLayout    = flag.Int64("randlayout", 0, "randomize function layout")
+@@ -258,6 +259,9 @@
+ 	}
+ 	if *FlagRound != -1 && (*FlagRound < 4096 || !isPowerOfTwo(*FlagRound)) {
+ 		Exitf("invalid -R value 0x%x", *FlagRound)
++	}
++	if *FlagMithrilInterpreterOffset != -1 && *FlagMithrilInterpreterOffset != 0 && *FlagMithrilInterpreterOffset != 32 {
++		Exitf("invalid -mithril-interpreter-offset value %d", *FlagMithrilInterpreterOffset)
+ 	}
+ 	if *FlagFuncAlign != 0 && !isPowerOfTwo(int64(*FlagFuncAlign)) {
+ 		Exitf("invalid -funcalign value %d", *FlagFuncAlign)
