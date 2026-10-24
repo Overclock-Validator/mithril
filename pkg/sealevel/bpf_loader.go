@@ -80,6 +80,7 @@ const upgradeableLoaderSizeOfBufferMetaData = 37
 const upgradeableLoaderSizeOfProgram = 36
 const upgradeableLoaderSizeOfProgramDataMetaData = 45
 const upgradeableLoaderSizeOfUninitialized = 4
+const minimumExtendProgramBytes = 10 * 1024
 
 func upgradeableLoaderSizeOfProgramData(programLen uint64) uint64 {
 	return safemath.SaturatingAddU64(upgradeableLoaderSizeOfProgramDataMetaData, programLen)
@@ -2792,6 +2793,17 @@ func UpgradeableLoaderExtendProgram(execCtx *ExecutionCtx, txCtx *TransactionCtx
 	if newLen > MaxPermittedDataLength {
 		//mlog.Log.Debugf("Extended ProgramData length of %d bytes exceeds max account data length of %d bytes", newLen, MaxPermittedDataLength)
 		return InstrErrInvalidRealloc
+	}
+
+	if execCtx.Features.IsActive(features.LoaderV3MinimumExtendProgramSize) {
+		// SIMD-0431: Agave requires at least 10 KiB, except when a smaller
+		// extension fills all remaining space up to the account size limit.
+		// Keep this after the size-limit check and before reading Clock so
+		// invalid instructions return the same error as Agave.
+		headroom := safemath.SaturatingSubU64(MaxPermittedDataLength, oldLen)
+		if additionalBytes < minimumExtendProgramBytes && uint64(additionalBytes) != headroom {
+			return InstrErrInvalidArgument
+		}
 	}
 
 	clock, err := ReadClockSysvar(execCtx)

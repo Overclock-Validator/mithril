@@ -989,21 +989,27 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 		return
 	}
 
+	phaseStartedAt := time.Now()
 	if l.hooks != nil {
 		l.hooks.SlotEnding(slot)
 	}
+	slotEndingDuration := time.Since(phaseStartedAt)
+	phaseStartedAt = time.Now()
 	// Detach first so no new TPU packet can obtain this bank. Freeze then waits
 	// for any packet that already did, closing the footer/entry race.
 	if l.controller != nil {
 		l.controller.ClearWorkingBank()
 	}
 	l.activeBank.Freeze()
+	freezeDuration := time.Since(phaseStartedAt)
 	if l.activeSink == nil {
 		l.failProductionWindowLocked(slot, leaderReasonFinalizationUnavailable, "entry broadcast sink is unavailable")
 		l.abortActiveSlotLocked(leaderReasonFinalizationUnavailable)
 		return
 	}
+	phaseStartedAt = time.Now()
 	l.activeSink.Wait()
+	entryDrainDuration := time.Since(phaseStartedAt)
 	if err := l.activeSink.Err(); err != nil {
 		l.failProductionWindowLocked(slot, leaderReasonEntryBroadcastFailed, err.Error())
 		l.abortActiveSlotLocked(leaderReasonEntryBroadcastFailed)
@@ -1016,9 +1022,11 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 	footerTimestamp := int64(producerTimeNanos / 1_000_000_000)
 
 	var footerRewards rewardcerts.RewardCertificates
+	phaseStartedAt = time.Now()
 	if l.rewardCerts != nil {
 		footerRewards = l.rewardCerts.BuildForLeaderSlot(slot)
 	}
+	rewardCertDuration := time.Since(phaseStartedAt)
 
 	if l.accountsDb == nil || l.activeSess == nil {
 		l.failProductionWindowLocked(slot, leaderReasonFinalizationUnavailable, "accounts DB or broadcast session is unavailable")
@@ -1030,6 +1038,7 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 		parentLastBlockhash = l.parentCtx.ParentLastEntryHash
 	}
 
+	phaseStartedAt = time.Now()
 	producedBlock := BuildLeaderBlock(LeaderBlockInput{
 		Bank:                l.activeBank,
 		ParentSlot:          l.parentCtx.ParentSlot,
@@ -1050,11 +1059,14 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 		producedBlock.AlpenglowParentBlockID = l.activeParentID
 		producedBlock.HasAlpenglowParentBlockID = true
 	}
+	buildBlockDuration := time.Since(phaseStartedAt)
 
 	commitLeaderSlot := replay.CommitLeaderSlot
 	if l.commitLeaderSlot != nil {
 		commitLeaderSlot = l.commitLeaderSlot
 	}
+	var bankTimings replay.LeaderFinalizationTimings
+	phaseStartedAt = time.Now()
 	if _, err := commitLeaderSlot(replay.CommitLeaderInput{
 		AcctsDb:                 l.accountsDb,
 		SlotCtx:                 l.activeBank.SlotCtx(),
@@ -1064,11 +1076,13 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 		AlpenglowShredVersion:   l.shredVersion,
 		FooterTimestamp:         footerTimestamp,
 		FooterProducerTimeNanos: producerTimeNanos,
+		Timings:                 &bankTimings,
 	}); err != nil {
 		l.failProductionWindowLocked(slot, leaderReasonFreezeFailed, err.Error())
 		l.abortActiveSlotLocked(leaderReasonFreezeFailed)
 		return
 	}
+	commitDuration := time.Since(phaseStartedAt)
 
 	if canonical, reason := l.activeParentStillCanonicalLocked(); !canonical {
 		l.failProductionWindowLocked(slot, reason, activeLeaderFailureDetail(reason))
@@ -1076,13 +1090,16 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 		return
 	}
 	footerBankhash := solana.HashFromBytes(l.activeBank.SlotCtx().FinalBankhash)
+	phaseStartedAt = time.Now()
 	if err := l.activeSess.BroadcastFooter(footerBankhash, producerTimeNanos, footerRewards.Skip, footerRewards.Notar); err != nil {
 		l.failProductionWindowLocked(slot, leaderReasonFooterBroadcastFailed, err.Error())
 		l.abortActiveSlotLocked(leaderReasonFooterBroadcastFailed)
 		return
 	}
+	footerDuration := time.Since(phaseStartedAt)
 	// Ending tick is the last-in-slot shred. Mid-slot entry batches are only
 	// emitted when they fill a FEC set; Freeze already flushed any leftover.
+	phaseStartedAt = time.Now()
 	if err := l.activeSess.BroadcastEndingTickLast(tickHash); err != nil {
 		l.failProductionWindowLocked(slot, leaderReasonEndingTickBroadcastFailed, err.Error())
 		l.abortActiveSlotLocked(leaderReasonEndingTickBroadcastFailed)
@@ -1092,6 +1109,7 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 	// packet broadcaster. Capture protocol timing now, before local bookkeeping
 	// and OnBlock backpressure can delay the leader loop.
 	networkCompletedAt := l.now()
+	endingTickDuration := time.Since(phaseStartedAt)
 	timingDetail := l.productionTimingDetailLocked(slot, finalizationStartedAt, networkCompletedAt)
 	if slot > 0 {
 		parentSlot := producedBlock.ParentSlot
@@ -1113,6 +1131,13 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 			timingDetail += fmt.Sprintf(" local_handoff_ms=%d", l.now().Sub(handoffStartedAt).Milliseconds())
 		}
 	}
+	// Format diagnostics only after network completion and local handoff;
+	// phase timers do not participate in protocol/deadline calculations.
+	ms := func(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
+	timingDetail += fmt.Sprintf(" slot_ending_ms=%.3f freeze_ms=%.3f entry_drain_ms=%.3f reward_certs_ms=%.3f"+
+		" build_block_ms=%.3f bank_commit_ms=%.3f footer_broadcast_ms=%.3f ending_tick_broadcast_ms=%.3f",
+		ms(slotEndingDuration), ms(freezeDuration), ms(entryDrainDuration), ms(rewardCertDuration),
+		ms(buildBlockDuration), ms(commitDuration), ms(footerDuration), ms(endingTickDuration)) + bankTimings.String()
 	l.recordLeaderSlotOutcomeLocked(slot, leaderOutcomeBroadcast, leaderReasonComplete,
 		fmt.Sprintf("block=%s parent_slot=%d txns=%d%s", solana.Hash(producedBlock.AlpenglowBlockID).String(), producedBlock.ParentSlot, len(producedBlock.Transactions), timingDetail))
 	l.advanceProductionWindowLocked(slot)
