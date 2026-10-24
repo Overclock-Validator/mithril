@@ -254,10 +254,16 @@ func lifecycleWholeBlock(t *testing.T, env *lifecycleEnv, txs []*solana.Transact
 // execute at finalize.
 func lifecycleStream(t *testing.T, env *lifecycleEnv, txs []*solana.Transaction, splits []int, suffixTxs int, workers int) (lifecycleOutcome, *streamingExecutor) {
 	t.Helper()
+	return lifecycleStreamCapture(t, env, txs, splits, suffixTxs, workers, nil)
+}
+
+func lifecycleStreamCapture(t *testing.T, env *lifecycleEnv, txs []*solana.Transaction, splits []int, suffixTxs int, workers int, capture *blockMetadataCapture) (lifecycleOutcome, *streamingExecutor) {
+	t.Helper()
 	tail := &lifecycleTail{durable: env.durable}
 	statuses := NewTransactionStatusCache()
 	shell := env.block(nil)
 	exec := newBlockExecution(env.acctsDb, shell, env.epochSchedule, workers, nil, &persistedTracker{}, tail, statuses, false, env.parent)
+	exec.metadata = capture
 	require.NoError(t, exec.open())
 	exec.slotCtx.DeferVoteCachePublication = true
 	exec.slotCtx.TrackProgramCacheAdds = true

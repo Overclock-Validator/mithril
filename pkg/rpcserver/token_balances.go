@@ -12,7 +12,7 @@ import (
 
 // SPL Token program IDs.
 var (
-	splTokenProgramID    = solana.MustPublicKeyFromBase58("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+	splTokenProgramID     = solana.MustPublicKeyFromBase58("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 	splToken2022ProgramID = solana.MustPublicKeyFromBase58("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
 )
 
@@ -20,14 +20,14 @@ var (
 // the legacy program and Token-2022 (Token-2022 stores extension data
 // past byte 165, but the leading account state has the same layout).
 const (
-	tokenAccountSize       = 165
-	tokenAccountMintOffset = 0
-	tokenAccountOwnerOffset = 32
+	tokenAccountSize         = 165
+	tokenAccountMintOffset   = 0
+	tokenAccountOwnerOffset  = 32
 	tokenAccountAmountOffset = 64
 	// Mint account layout: 82 bytes for legacy SPL Token. decimals lives at
 	// offset 44 (mintAuthorityOption 4 + mintAuthority 32 + supply 8 = 44).
-	mintAccountSize     = 82
-	mintDecimalsOffset  = 44
+	mintAccountSize    = 82
+	mintDecimalsOffset = 44
 )
 
 // isTokenProgramOwner reports whether an account is owned by either the
@@ -128,8 +128,12 @@ func publicKeyFromOffset(data []byte, off int) solana.PublicKey {
 
 // uiAmountForRaw returns the raw token amount divided by 10^decimals as
 // a float64. Matches Agave's lossy float conversion; precision suffers
-// for amounts > 2^53 but this is the wire contract.
+// for amounts > 2^53 but this is the wire contract. On its 64-bit targets,
+// Agave's checked integer power yields null when decimals is at least 20.
 func uiAmountForRaw(amount uint64, decimals uint8) *float64 {
+	if decimals >= 20 {
+		return nil
+	}
 	if decimals == 0 {
 		v := float64(amount)
 		return &v
@@ -195,4 +199,3 @@ func tokenBalancesFromAccounts(txAccts []*accounts.Account, db *accountsdb.Accou
 	mintDecimals := fetchMintDecimals(txAccts, db, slot)
 	return extractTokenBalances(txAccts, mintDecimals)
 }
-
