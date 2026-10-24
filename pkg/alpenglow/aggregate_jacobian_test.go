@@ -81,6 +81,95 @@ func TestJacobianAggregationMatchesAffine(t *testing.T) {
 	}
 }
 
+func randomG2(rng *rand.Rand, n int) []bls12381.G2Affine {
+	_, _, _, g2 := bls12381.Generators()
+	out := make([]bls12381.G2Affine, n)
+	for i := range out {
+		s := new(big.Int).Rand(rng, new(big.Int).Lsh(big.NewInt(1), 255))
+		out[i].ScalarMultiplication(&g2, s)
+	}
+	return out
+}
+
+func affineChainG2(points []bls12381.G2Affine) bls12381.G2Affine {
+	var aggregate bls12381.G2Affine
+	aggregate.SetInfinity()
+	for i := range points {
+		aggregate.Add(&aggregate, &points[i])
+	}
+	return aggregate
+}
+
+// jacobianSplitG2 mirrors the vote pool: two tallies accumulated in Jacobian
+// form (AddMixed per vote), combined with AddAssign at assembly, converted once.
+func jacobianSplitG2(points []bls12381.G2Affine, split int) bls12381.G2Affine {
+	var base, fallback, acc bls12381.G2Jac
+	for i := range points {
+		if i < split {
+			base.AddMixed(&points[i])
+		} else {
+			fallback.AddMixed(&points[i])
+		}
+	}
+	acc.AddAssign(&base)
+	acc.AddAssign(&fallback)
+	var aggregate bls12381.G2Affine
+	aggregate.FromJacobian(&acc)
+	return aggregate
+}
+
+func TestJacobianSignatureAggregationMatchesAffine(t *testing.T) {
+	rng := rand.New(rand.NewSource(11))
+	base := randomG2(rng, 24)
+	var neg0 bls12381.G2Affine
+	neg0.Neg(&base[0])
+	var inf bls12381.G2Affine
+	inf.SetInfinity()
+	cases := [][]bls12381.G2Affine{
+		{}, base[:1], base, {base[1], base[1]}, {base[0], neg0}, {base[0], base[2], neg0},
+		{inf, base[3], inf}, {inf}, {base[4], base[4], base[4], base[5]},
+	}
+	for i := 0; i < 30; i++ {
+		var pts []bls12381.G2Affine
+		for j := 0; j < 1+rng.Intn(20); j++ {
+			p := base[rng.Intn(len(base))]
+			switch rng.Intn(5) {
+			case 0:
+				p.Neg(&p)
+			case 1:
+				p = inf
+			}
+			pts = append(pts, p)
+		}
+		cases = append(cases, pts)
+	}
+	for i, pts := range cases {
+		want := affineChainG2(pts)
+		// Every split point: base-only, fallback-only and mixed tallies,
+		// including a base tally that cancels against the fallback one.
+		for split := 0; split <= len(pts); split++ {
+			got := jacobianSplitG2(pts, split)
+			if !want.Equal(&got) || want.RawBytes() != got.RawBytes() {
+				t.Fatalf("case %d split %d: affine %v != jacobian %v", i, split, want, got)
+			}
+		}
+	}
+}
+
+func BenchmarkSignatureAggregation(b *testing.B) {
+	pts := randomG2(rand.New(rand.NewSource(1)), 1000)
+	b.Run("affine", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			affineChainG2(pts)
+		}
+	})
+	b.Run("jacobian", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			jacobianSplitG2(pts, len(pts)/2)
+		}
+	})
+}
+
 func BenchmarkPubkeyAggregation(b *testing.B) {
 	pts := randomG1(rand.New(rand.NewSource(1)), 1000)
 	b.Run("affine", func(b *testing.B) {
