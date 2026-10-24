@@ -25,17 +25,15 @@ func (rpcServer *RpcServer) GetEpochInfo(ctx context.Context, p jsonrpc.RawParam
 
 	_ = params
 
-	epoch := global.Epoch()
 	slot := global.Slot()
-	firstSlotInEpoch := rpcServer.epochSchedule.FirstSlotInEpoch(epoch)
-	slotIndex := slot - firstSlotInEpoch
+	epoch, slotIndex := rpcServer.epochSchedule.GetEpochAndSlotIndex(slot)
 
 	resp := GetEpochInfoResp{
-		AbsoluteSlot:     global.Slot(),
+		AbsoluteSlot:     slot,
 		BlockHeight:      global.BlockHeight(),
-		Epoch:            global.Epoch(),
+		Epoch:            epoch,
 		SlotIndex:        slotIndex,
-		SlotsInEpoch:     432000,
+		SlotsInEpoch:     rpcServer.epochSchedule.SlotsInEpoch(epoch),
 		TransactionCount: global.TransactionCount(),
 	}
 
