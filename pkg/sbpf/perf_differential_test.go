@@ -329,6 +329,11 @@ func writeDifferentialDump(t *testing.T, w io.Writer, n int) {
 		// Equal representation of every version, independent of RNG consumption.
 		ver := uint32(i % 4)
 		p := genProgram(rng, ver)
+		// SBPF_DIFF_RESOLVE=1 runs the same programs with loader-style call
+		// target resolution, so internal calls take the resolved fast path.
+		if os.Getenv("SBPF_DIFF_RESOLVE") != "" {
+			p.ResolveCallTargetsExcluding(diffRegistry)
+		}
 		generated++
 		if err := p.Verify(); err != nil {
 			fmt.Fprintf(w, "%d ver=%d VERIFY_FAIL %v\n", i, ver, err)

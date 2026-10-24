@@ -52,6 +52,8 @@ type Interpreter struct {
 	// callTargets[pc] is the resolved internal-function target of the `call imm`
 	// at pc (or -1). Computed once per Program at load time.
 	callTargets []int64
+	// callTargetsExcludeSyscalls: see Program.CallTargetsExcludeSyscalls.
+	callTargetsExcludeSyscalls bool
 
 	// Fast-path translation table indexed by (vaddr >> 32); see fastmem.go.
 	regions [numFastRegions]memRegion
@@ -136,6 +138,8 @@ func NewInterpreter(p *Program, opts *VMOpts) *Interpreter {
 		programId:         opts.ProgramId,
 		txSignature:       opts.TxSignature,
 		callTargets:       p.CallTargets,
+
+		callTargetsExcludeSyscalls: p.CallTargetsExcludeSyscalls,
 	}
 	ip.initRegions()
 	return ip
@@ -305,6 +309,7 @@ func (ip *Interpreter) Run() (ret uint64, cuConsumed uint64, err error) {
 	pqr := ip.sbpfVersion.EnablePqr()
 	staticSyscalls := ip.sbpfVersion.EnableStaticSyscalls()
 	callTargets := ip.callTargets
+	fast := ip.fastFlags()
 
 	// Instruction metering (mirrors Agave's due_insn_count / previous_instruction_meter):
 	// count executed instructions locally and only sync with the shared compute
@@ -337,6 +342,12 @@ func (ip *Interpreter) Run() (ret uint64, cuConsumed uint64, err error) {
 
 mainLoop:
 	for i := 0; true; i++ {
+		// Common instructions run in the call-free loop; it returns at the
+		// first instruction that needs the general path below.
+		if !tracing {
+			pc, due = ip.runFast(&r, pc, due, budget, fast)
+		}
+
 		// Fetch
 		if pc < 0 || pc >= int64(len(text)) {
 			flushDue()
