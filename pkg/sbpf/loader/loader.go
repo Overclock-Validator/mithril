@@ -171,10 +171,6 @@ func (l *Loader) getProgram() *sbpf.Program {
 		Funcs:       l.funcs,
 		SbpfVersion: l.sbpfVersion(),
 	}
-	if l.syscalls != nil {
-		p.ResolveCallTargetsExcluding(l.syscalls)
-	} else {
-		p.ResolveCallTargets()
-	}
+	p.ResolveCallTargets()
 	return p
 }

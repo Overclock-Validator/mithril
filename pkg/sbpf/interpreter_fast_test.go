@@ -89,7 +89,7 @@ func TestFastLoopMatchesRunAcrossBudgets(t *testing.T) {
 		if p.Verify() != nil {
 			continue
 		}
-		resolveCallTargetsIfSupported(p, diffRegistry)
+		resolveCallTargetsIfSupported(p)
 		seed := rng.Int63()
 		full := runWithFastLoop(t, p, false, 1<<20, seed)
 		var used uint64
@@ -118,7 +118,7 @@ func verifiedProgram(t *testing.T, text []Slot, ver uint32, funcs map[uint32]int
 	if err := p.Verify(); err != nil {
 		t.Fatalf("verify: %v", err)
 	}
-	resolveCallTargetsIfSupported(p, diffRegistry)
+	resolveCallTargetsIfSupported(p)
 	return p
 }
 
@@ -188,7 +188,7 @@ func TestFastLoopInvalidPC(t *testing.T) {
 			"jump before start": {slot(OpMov64Imm, 1, 0, 0, 1), slot(OpJa, 0, 0, -5, 0), slot(OpExit, 0, 0, 0, 0)},
 		} {
 			p := mkProgram(text, ver)
-			resolveCallTargetsIfSupported(p, diffRegistry)
+			resolveCallTargetsIfSupported(p)
 			for _, b := range []uint64{0, 1, 2, 100} {
 				requireSameWithAndWithoutFastLoop(t, fmt.Sprintf("%s v%d", name, ver), p, b, 2)
 			}
@@ -218,7 +218,7 @@ func BenchmarkSyscallAlternation(b *testing.B) {
 			if err := p.Verify(); err != nil {
 				b.Fatal(err)
 			}
-			resolveCallTargetsIfSupported(p, diffRegistry)
+			resolveCallTargetsIfSupported(p)
 			input := make([]byte, 700)
 			b.ReportAllocs()
 			b.ResetTimer()

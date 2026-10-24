@@ -52,8 +52,6 @@ type Interpreter struct {
 	// callTargets[pc] is the resolved internal-function target of the `call imm`
 	// at pc (or -1). Computed once per Program at load time.
 	callTargets []int64
-	// callTargetsExcludeSyscalls: see Program.CallTargetsExcludeSyscalls.
-	callTargetsExcludeSyscalls bool
 
 	// Fast-path translation table indexed by (vaddr >> 32); see fastmem.go.
 	regions [numFastRegions]memRegion
@@ -138,8 +136,6 @@ func NewInterpreter(p *Program, opts *VMOpts) *Interpreter {
 		programId:         opts.ProgramId,
 		txSignature:       opts.TxSignature,
 		callTargets:       p.CallTargets,
-
-		callTargetsExcludeSyscalls: p.CallTargetsExcludeSyscalls,
 	}
 	ip.initRegions()
 	return ip

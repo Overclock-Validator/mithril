@@ -336,7 +336,7 @@ func writeDifferentialDump(t *testing.T, w io.Writer, n int) {
 		}
 		verified++
 		verifiedByVersion[ver]++
-		resolveCallTargetsIfSupported(p, diffRegistry)
+		resolveCallTargetsIfSupported(p)
 		input := make([]byte, 700)
 		for j := range input {
 			input[j] = byte(j)
