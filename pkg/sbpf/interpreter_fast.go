@@ -1,5 +1,8 @@
 package sbpf
 
+// useFastLoop lets tests compare Run with and without runFast.
+var useFastLoop = true
+
 // fastFlags holds the SBPF version gates runFast needs, hoisted out of the loop.
 type fastFlags struct {
 	jmp32          bool
