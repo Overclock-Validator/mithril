@@ -440,7 +440,13 @@ func (bs *BlockSource) runTurbineStream() {
 		// so a post-restart gap had no repair drive to fill it.
 		if bs.sourceType == BlockSourceTurbine && (bs.repairCatchupMaxGapSlots > 0 || !bs.rpcFallbackEnabled) {
 			bs.repairCatchupPending.Store(true)
-			go bs.runRepairCatchup(streamCtx, receiver)
+			// Join it with the stream: repair catchup enqueues staged blocks
+			// on resultQueue, which Start closes after liveStreamWg drains.
+			bs.liveStreamWg.Add(1)
+			go func() {
+				defer bs.liveStreamWg.Done()
+				bs.runRepairCatchup(streamCtx, receiver)
+			}()
 		}
 
 		if gossipClient != nil {
