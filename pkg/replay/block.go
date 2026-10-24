@@ -205,6 +205,8 @@ type OnCancelWriteState func(result *ReplayResult) error
 // ResumeState contains the state needed to properly configure the first block when resuming.
 // This is passed to ReplayBlocks when resuming from a previous run.
 type ResumeState struct {
+	// Only populated for an in-process speculative fork retry; not persisted.
+	ParentSwitchRecovery *blockstream.AlpenglowParentSwitchRecovery
 	// ParentSlot is the slot of the last successfully replayed block (= state.LastSlot)
 	ParentSlot uint64
 	// ParentBlockHeight is the block height of the last successfully replayed block.
@@ -2511,6 +2513,9 @@ func ReplayBlocks(
 		opts.InitialAlpenglowBlockID = resumeState.ParentAlpenglowBlockID
 		opts.HasInitialAlpenglowBlockID = true
 	}
+	if alpenglowMode && resumeState != nil {
+		opts.ParentSwitchRecovery = resumeState.ParentSwitchRecovery
+	}
 	// Streaming execution needs the turbine batch feed; it is only ever
 	// eligible under Alpenglow with the unrooted tail (see streamingExecutor).
 	opts.TurbineStreamingExecution = StreamingExecutionCfg.Enabled && useTurbine && alpenglowMode && unrootedTailState != nil
@@ -2881,13 +2886,14 @@ func ReplayBlocks(
 					continue
 				}
 				sw := &CertifiedSwitch{
-					Slot:         parentSwitch.SwitchSlot,
-					Executed:     alpenglowExecutedBlockIDs[parentSwitch.SwitchSlot],
-					ParentLinked: true,
-					ParentSlot:   parentSwitch.ParentSlot,
-					ParentID:     parentSwitch.ParentID,
-					ChildSlot:    parentSwitch.ChildSlot,
-					ChildID:      parentSwitch.ChildID,
+					Slot:           parentSwitch.SwitchSlot,
+					Executed:       alpenglowExecutedBlockIDs[parentSwitch.SwitchSlot],
+					ParentLinked:   true,
+					ParentSlot:     parentSwitch.ParentSlot,
+					ParentID:       parentSwitch.ParentID,
+					ChildSlot:      parentSwitch.ChildSlot,
+					ChildID:        parentSwitch.ChildID,
+					ParentRecovery: blockStream.ParentSwitchRecovery(*parentSwitch),
 				}
 				if handleAlpenglowSwitch(sw, func() bool {
 					return blockStream.RewindForAlpenglowParentSwitch(*parentSwitch)
