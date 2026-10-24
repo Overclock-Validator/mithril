@@ -344,7 +344,7 @@ mainLoop:
 	for i := 0; true; i++ {
 		// Common instructions run in the call-free loop; it returns at the
 		// first instruction that needs the general path below.
-		if !tracing {
+		if !tracing && useFastLoop {
 			pc, due = ip.runFast(&r, pc, due, budget, fast)
 		}
 
