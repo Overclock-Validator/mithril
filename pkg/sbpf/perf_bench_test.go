@@ -37,6 +37,10 @@ var noSyscalls = SyscallRegistry(func(uint32) (Syscall, bool) { return nil, fals
 // that have Program.ResolveCallTargets (the loader does this at load time);
 // it is a no-op on the baseline tree so the same benchmark code runs on both.
 func resolveCallTargetsIfSupported(p *Program) {
+	if r, ok := any(p).(interface{ ResolveCallTargetsExcluding(SyscallRegistry) }); ok {
+		r.ResolveCallTargetsExcluding(noSyscalls)
+		return
+	}
 	if r, ok := any(p).(interface{ ResolveCallTargets() }); ok {
 		r.ResolveCallTargets()
 	}

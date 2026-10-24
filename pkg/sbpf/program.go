@@ -17,6 +17,9 @@ type Program struct {
 	// CallTargets[pc] holds the resolved internal function target for a
 	// `call imm` slot at pc (non-static-syscall versions), or -1.
 	CallTargets []int64
+	// CallTargetsExcludeSyscalls records that no CallTargets entry names a
+	// registered syscall hash, so callers may skip the syscall lookup.
+	CallTargetsExcludeSyscalls bool
 }
 
 // ResolveCallTargets precomputes CallTargets from Funcs so the interpreter
@@ -36,6 +39,25 @@ func (p *Program) ResolveCallTargets() {
 		}
 	}
 	p.CallTargets = targets
+	p.CallTargetsExcludeSyscalls = false
+}
+
+// ResolveCallTargetsExcluding is ResolveCallTargets with every slot whose
+// immediate is a syscall in reg left unresolved. Run resolves syscalls before
+// internal functions, so this does not change Run; it lets the interpreter take
+// a resolved target without its own syscall lookup. The loader rejects such
+// collisions already; this keeps the guarantee local to the call target table.
+func (p *Program) ResolveCallTargetsExcluding(reg SyscallRegistry) {
+	p.ResolveCallTargets()
+	if p.CallTargets == nil {
+		return
+	}
+	for pc, t := range p.CallTargets {
+		if t >= 0 && reg.ExistsByHash(p.Text[pc].Uimm()) {
+			p.CallTargets[pc] = -1
+		}
+	}
+	p.CallTargetsExcludeSyscalls = true
 }
 
 func (p *Program) MemoryBytes() uint64 {
