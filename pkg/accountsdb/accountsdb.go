@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"maps"
 	"os"
 	"path/filepath"
 	"runtime/trace"
@@ -267,21 +266,25 @@ type ProgramCacheEntry struct {
 	// Executables are reusable across banks only for identical source and loader
 	// features. Slot alone is not a version: competing forks can deploy at the
 	// same slot. Fields are immutable after cache publication.
-	sourceBytes    []byte
-	sourceBound    bool
-	sourceFeatures features.Features
+	sourceBytes     []byte
+	sourceBound     bool
+	sourceFeatures  features.Features
+	matchedFeatures atomic.Pointer[matchedFeatureSet]
+	validatedSource atomic.Pointer[immutableProgramSource]
 }
 
 // BindSource must be called before publishing the entry; published bindings
 // must never be mutated, including when another bank replaces the cache key.
 func (entry *ProgramCacheEntry) BindSource(source []byte, f *features.Features) {
+	entry.matchedFeatures.Store(nil)
+	entry.validatedSource.Store(nil)
 	entry.sourceBytes = bytes.Clone(source)
 	entry.sourceBound = true
 	entry.sourceFeatures = *f.Clone()
 }
 
 func (entry *ProgramCacheEntry) MatchesSource(source []byte, f *features.Features) bool {
-	return entry != nil && entry.sourceBound && bytes.Equal(entry.sourceBytes, source) && maps.Equal(entry.sourceFeatures, *f)
+	return entry != nil && entry.sourceBound && bytes.Equal(entry.sourceBytes, source) && entry.sourceFeaturesMatch(f)
 }
 
 func programCacheCapacityUnits() int {

@@ -200,6 +200,38 @@ func TestReadOnlyAccountSourceFallbackAndBankSysvars(t *testing.T) {
 	require.Equal(t, reads, source.shared.Load())
 }
 
+func TestReadOnlyProgramLocalMutationStillRevalidates(t *testing.T) {
+	w := expandedProgramWorkloads(t)[0]
+	_, data := upgradeableReadFixture(t, w)
+	source := &programReadSource{}
+	source.account.Store(data)
+	run := upgradeableReadRunner(t, w, false, source, data)
+	for range 3 {
+		_, err := run()
+		require.NoError(t, err)
+	}
+	// Reuse the same account and backing allocation, but mutate the local ELF.
+	// A local account must never receive the immutable-source optimization.
+	data.Data[upgradeableLoaderSizeOfProgramDataMetaData] = 0
+	_, err := run()
+	require.ErrorIs(t, err, InstrErrUnsupportedProgramId)
+	require.Zero(t, source.shared.Load())
+}
+
+func TestProgramAccountSourceProvenance(t *testing.T) {
+	key := benchPubkey(0x92)
+	source := &programReadSource{}
+	source.account.Store(&accounts.Account{Key: key, Data: []byte{1, 2, 3}})
+	ctx := &SlotCtx{UnrootedRead: source}
+	_, immutable, err := ctx.getProgramAccountSource(key)
+	require.NoError(t, err)
+	require.True(t, immutable)
+	ctx.UnrootedRead = ownedProgramReadSource{source}
+	_, immutable, err = ctx.getProgramAccountSource(key)
+	require.NoError(t, err)
+	require.False(t, immutable)
+}
+
 func BenchmarkUpgradeableProgramRead(b *testing.B) {
 	for _, w := range expandedProgramWorkloads(b) {
 		b.Run(w.name, func(b *testing.B) {
