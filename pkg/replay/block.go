@@ -44,7 +44,6 @@ import (
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
-	"github.com/panjf2000/ants/v2"
 )
 
 // SlotCtxSetter is implemented by types that accept a SlotCtx update (e.g. RpcServer).
@@ -1148,68 +1147,7 @@ func setupInitialVoteAcctsAndStakeAccts(acctsDb *accountsdb.AccountsDb, block *b
 	}
 	mlog.Log.Infof("Loading vote and stake caches (aggregate-only mode, %d stake accounts)", len(stakeEntries))
 
-	var wg sync.WaitGroup
-
-	// Shared aggregated stake totals - built directly from AccountsDB scan
-	// Thread-safe: each worker builds local map, then merges under mutex
-	voteAcctStakes := make(map[solana.PublicKey]uint64)
-	var voteAcctStakesMu sync.Mutex
-
-	// Stake worker pool reads stake accounts and aggregates totals directly
-	const maxBatchSize = 2000
-	stakeAcctWorkerPool, _ := ants.NewPoolWithFunc(runtime.NumCPU()*2, func(i interface{}) {
-		defer wg.Done()
-
-		batch := i.([]accountsdb.StakeIndexEntry)
-
-		// Build local aggregation for this batch
-		localStakes := make(map[solana.PublicKey]uint64)
-
-		for _, entry := range batch {
-			// Read from AccountsDB
-			stakeAcct, err := acctsDb.GetAccount(block.Slot, entry.Pubkey)
-			if err != nil {
-				continue // Account not found or closed
-			}
-
-			stakeState, err := sealevel.UnmarshalStakeState(stakeAcct.Data)
-			if err != nil {
-				continue // Invalid stake state
-			}
-
-			// Only count delegated stake accounts (status must be "Stake")
-			if stakeState.Status != sealevel.StakeStateV2StatusStake {
-				continue
-			}
-
-			// Aggregate stake by vote account
-			delegation := stakeState.Stake.Stake.Delegation
-			localStakes[delegation.VoterPubkey] += delegation.StakeLamports
-		}
-
-		// Merge local aggregation into shared map under lock
-		voteAcctStakesMu.Lock()
-		for voter, stake := range localStakes {
-			voteAcctStakes[voter] += stake
-		}
-		voteAcctStakesMu.Unlock()
-	})
-
-	// Submit FileId-aligned batches for sequential appendvec I/O
-	batchStart := 0
-	for i := 1; i <= len(stakeEntries); i++ {
-		flush := i == len(stakeEntries) ||
-			stakeEntries[i].FileId != stakeEntries[batchStart].FileId ||
-			i-batchStart >= maxBatchSize
-		if flush && i > batchStart {
-			wg.Add(1)
-			stakeAcctWorkerPool.Invoke(stakeEntries[batchStart:i])
-			batchStart = i
-		}
-	}
-
-	wg.Wait()
-	stakeAcctWorkerPool.Release()
+	voteAcctStakes := loadStakeAccountTotals(acctsDb, block.Slot, stakeEntries)
 
 	// Load vote accounts from AccountsDB into vote cache
 	if err := RebuildVoteCacheFromAccountsDB(acctsDb, block.Slot, voteAcctStakes, 0); err != nil {
