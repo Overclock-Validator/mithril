@@ -469,25 +469,13 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 	// slot must also equal the filename slot — the read path builds the file
 	// name from the entry's slot, so a mismatched entry could not be served
 	// from the output file and is safest left untouched.
-	liveIdx := make([]int, 0, len(idxEntries))
+	liveIdx, err := db.compactionLiveRecords(c, pubkeys, idxEntries)
+	if err != nil {
+		return false, 0, err
+	}
 	var liveBytes int64
-	for i := range idxEntries {
-		cur, closer, gerr := db.Index.Get(pubkeys[i][:])
-		if gerr != nil {
-			if gerr == pebble.ErrNotFound {
-				continue
-			}
-			return false, 0, gerr
-		}
-		curEntry, derr := UnmarshalAcctIdxEntry(cur)
-		closer.Close()
-		if derr != nil {
-			return false, 0, derr
-		}
-		if curEntry.FileId == c.fileId && curEntry.Offset == idxEntries[i].Offset && curEntry.Slot == c.slot {
-			liveIdx = append(liveIdx, i)
-			liveBytes += recordLenAt(data, idxEntries[i].Offset)
-		}
+	for _, i := range liveIdx {
+		liveBytes += recordLenAt(data, idxEntries[i].Offset)
 	}
 
 	if len(data) == 0 || len(liveIdx) == 0 {
