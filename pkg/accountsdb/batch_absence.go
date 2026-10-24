@@ -21,6 +21,9 @@ func (db *AccountsDb) batchAccountAbsentLocked(key solana.PublicKey) bool {
 // never read/decode errors or zero-lamport records. Folds and legacy writes
 // advance readCacheEpoch; rewind also clears caches. A pending fold may expose
 // a newer account than that snapshot, so those keys cannot be admitted.
+// Epoch capture, cache probing and snapshot creation must share the epoch read
+// lock. Writers must publish pending-fold state and advance the epoch before
+// committing index changes; admission rechecks both under the epoch write lock.
 func (db *AccountsDb) cacheBatchAbsences(keys []solana.PublicKey, cold []int, found, admit []bool, epoch uint64) {
 	eligible := false
 	for i, idx := range cold {
