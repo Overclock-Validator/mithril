@@ -2636,6 +2636,10 @@ postBootstrap:
 				klog.Fatalf("unable to load RPC epoch rewards: %v", err)
 			}
 		}
+		retentionSlots := schedule.SlotsPerEpoch * 2
+		if err := enableRPCBlockHistory(rpcServer, alpenglowMode, filepath.Join(accountsPath, "rpc-block-history"), retentionSlots, mithrilState.LastRootedSlot); err != nil {
+			klog.Fatalf("enable RPC block history: %v", err)
+		}
 		rpcServer.Start()
 		mlog.Log.Infof("Started RPC server on port %d", rpcPort)
 	}
@@ -4459,6 +4463,12 @@ func rewindStoreBelowDivergence(accountsDbPath string, accountsDb *accountsdb.Ac
 			return false
 		}
 	}
+	if history, ok := rpcServer.(interface{ RewindBlockHistory(uint64) error }); ok {
+		if err := history.RewindBlockHistory(res.NewThrough); err != nil {
+			mlog.Log.Errorf("fork switch: rewind RPC block history to slot %d: %v; halting", res.NewThrough, err)
+			return false
+		}
+	}
 	if err := adoptRewindResult(accountsDbPath, s, res); err != nil {
 		mlog.Log.Errorf("fork switch: %v; halting", err)
 		return false
@@ -4697,6 +4707,13 @@ func runReplayWithRecovery(
 		// are retained for a horizon). Beyond the horizon -> fail closed.
 		if divSlot <= mithrilState.LastRootedSlot {
 			if !rewindStoreBelowDivergence(accountsDbPath, accountsDb, mithrilState, divSlot, rewindHorizon, rpcServer) {
+				break
+			}
+		}
+		if history, ok := rpcServer.(interface{ RewindBlockHistory(uint64) error }); ok {
+			if err := history.RewindBlockHistory(mithrilState.LastRootedSlot); err != nil {
+				result.Error = fmt.Errorf("fork switch: rewind RPC block history to slot %d: %w", mithrilState.LastRootedSlot, err)
+				mlog.Log.Errorf("%v; halting", result.Error)
 				break
 			}
 		}

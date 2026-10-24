@@ -52,6 +52,7 @@ func CleanAccountsDbDir(accountsDbDir string) {
 		// actionable.
 		"transaction-status-checkpoints",
 		"rpc-epoch-rewards",
+		"rpc-block-history",
 		"mithril_db",
 		"mithril_db_log_shards",
 		"bankhash_db",
