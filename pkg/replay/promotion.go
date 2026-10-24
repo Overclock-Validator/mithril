@@ -197,6 +197,35 @@ func (t *unrootedTail) GetAccount(slot uint64, pubkey solana.PublicKey) (*accoun
 	return a.Clone(), nil
 }
 
+// GetAccountShared resolves the same parent-bank version as GetAccount without
+// cloning it. The returned account and its data are immutable: consumers must
+// not modify them or hand them to transaction execution as mutable accounts.
+// Overlay publication and durable cache replacement preserve existing readers;
+// the referenced Go allocation remains live for the duration of a program load.
+func (t *unrootedTail) GetAccountShared(slot uint64, pubkey solana.PublicKey) (*accounts.Account, error) {
+	if a, ok := t.overlay.Lookup([32]byte(pubkey)); ok {
+		return a, nil
+	}
+	return t.durable.GetAccount(slot, pubkey)
+}
+
+// GetAccountDataLen preserves overlay precedence without cloning account data.
+// The overlay and durable read-cache values are immutable parent-bank versions;
+// returning only a scalar leaves mutable GetAccount ownership unchanged.
+func (t *unrootedTail) GetAccountDataLen(slot uint64, pubkey solana.PublicKey) (uint64, error) {
+	if a, ok := t.overlay.Lookup([32]byte(pubkey)); ok {
+		return uint64(len(a.Data)), nil
+	}
+	a, err := t.durable.GetAccount(slot, pubkey)
+	if err != nil {
+		return 0, err
+	}
+	if a == nil {
+		return 0, accountsdb.ErrNoAccount
+	}
+	return uint64(len(a.Data)), nil
+}
+
 func (t *unrootedTail) GetAccountWithStats(slot uint64, pubkey solana.PublicKey) (*accounts.Account, accountsdb.AccountReadStats, error) {
 	var stats accountsdb.AccountReadStats
 	lookupStart := time.Now()
