@@ -35,9 +35,11 @@ func sext32(explicit bool, val int32) uint64 {
 // runFast executes the common instructions of Run without any calls, so that
 // the loop state stays in registers. Each instruction is either executed with
 // exactly Run's semantics (meter check, due++, effect, next pc) or not touched:
-// runFast returns pc/due at the first instruction it cannot complete (calls,
-// exits, slow memory translation, zero divisors, cold opcodes, an out-of-range
-// pc or an exhausted budget) and Run handles that instruction itself.
+// runFast returns pc/due at the first instruction it cannot complete and Run
+// handles that instruction itself: syscalls, legacy (v0-v2) calls, callx, the
+// entry frame's exit, a full shadow stack, slow memory translation, zero
+// divisors, cold opcodes, an out-of-range pc or call target, or an exhausted
+// budget. Static (v3) internal calls and returns from inner frames stay here.
 func (ip *Interpreter) runFast(r *[16]uint64, pc int64, due, budget uint64, f fastFlags) (int64, uint64) {
 	text := ip.text
 	stack := &ip.stack
