@@ -98,6 +98,7 @@ type Receiver struct {
 	connsByIP   map[string]int
 	connsByPeer map[solana.PublicKey]int
 	stats       ReceiverStats
+	handlers    sync.WaitGroup
 }
 
 type receiverConnection struct {
@@ -202,6 +203,7 @@ func (r *Receiver) Close() error {
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
+		r.handlers.Wait()
 		return nil
 	}
 	r.closed = true
@@ -222,6 +224,7 @@ func (r *Receiver) Close() error {
 	for _, conn := range conns {
 		_ = conn.CloseWithError(0, "alpenglow receiver closed")
 	}
+	r.handlers.Wait()
 	if errors.Is(err, quic.ErrServerClosed) {
 		return nil
 	}
@@ -235,6 +238,7 @@ func (r *Receiver) Stats() ReceiverStats {
 }
 
 func (r *Receiver) handleConn(ctx context.Context, conn *quic.Conn, peer solana.PublicKey) {
+	defer r.handlers.Done()
 	defer r.removeConn(conn)
 	defer conn.CloseWithError(0, "alpenglow receiver done")
 
@@ -424,6 +428,9 @@ func (r *Receiver) addConn(conn *quic.Conn, peer solana.PublicKey) bool {
 	r.conns[conn] = receiverConnection{remoteIP: remoteIP, peer: peer}
 	r.connsByIP[remoteIP]++
 	r.connsByPeer[peer]++
+	// Close sets closed under this lock before waiting, so no handler can be
+	// added after shutdown begins, even if Run has just accepted a connection.
+	r.handlers.Add(1)
 	r.mu.Unlock()
 	return true
 }

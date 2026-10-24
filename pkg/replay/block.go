@@ -148,6 +148,9 @@ func formatBlockSourceStatus(fetchStats blockstream.FetchStatsSnapshot) string {
 	return fetchStats.SourceStatus
 }
 
+// ErrBlockFetchStalled identifies a fetch timeout after replay cleanup.
+var ErrBlockFetchStalled = errors.New("block fetch stalled")
+
 // ReplayResult contains the result of a replay operation, including shutdown state
 type ReplayResult struct {
 	// LastPersistedSlot is the last slot whose state was successfully persisted to AccountsDB
@@ -1759,6 +1762,20 @@ func ReplayBlocks(
 	onCancelWriteState OnCancelWriteState, // callback to write state immediately on cancellation (can be nil)
 ) *ReplayResult {
 	result := &ReplayResult{}
+	var blockStream *blockstream.BlockSource
+	var foldFailed bool
+	// Register first so safety checks and every existing cleanup defer run
+	// before the fetch timeout can become a retry-eligible error.
+	defer func() {
+		if result.Error == nil && !result.WasCancelled && ctx.Err() == nil &&
+			blockStream != nil && blockStream.FetchStalled() {
+			if foldFailed {
+				result.Error = fmt.Errorf("block fetch stalled - no progress for %v", blockStream.StallTimeout())
+			} else {
+				result.Error = fmt.Errorf("%w - no progress for %v", ErrBlockFetchStalled, blockStream.StallTimeout())
+			}
+		}
+	}()
 	alpenglowMode := consensusOpts != nil && consensusOpts.Alpenglow
 	rewardPublisher, _ := rpcServer.(epochRewardPublisher)
 	rewardReadPublisher, _ := rpcServer.(epochRewardReadPublisher)
@@ -2157,12 +2174,29 @@ func ReplayBlocks(
 
 	if TrailingVerifierCfg.Enabled && unrootedTailState != nil {
 		trailingVerifier = newTrailingVerifier(&rpcVerificationSource{rpcc: rpcclient.NewRpcClient(rpcEndpoints[0])}, TrailingVerifierCfg)
-		go trailingVerifier.Run(ctx)
+		verifyCtx, stopVerifier := context.WithCancel(ctx)
+		verifierDone := make(chan struct{})
+		go func() {
+			defer close(verifierDone)
+			trailingVerifier.Run(verifyCtx)
+		}()
 		// Publish a run-local tx-capture registry for the verifier's lifetime and
 		// unpublish it on return, so no other run (a later re-replay, a test, a
 		// sim) shares or inherits this run's capture state.
 		stopCapture := beginTxCapture()
-		defer stopCapture()
+		defer func() {
+			stopVerifier()
+			<-verifierDone
+			stopCapture()
+			// An in-flight RPC check can discover divergence during shutdown.
+			if div := trailingVerifier.Failure(); div != nil {
+				recordReplayDivergenceEvidence(mithrilState, div)
+				// A cancellation save may predate this evidence. Persist it again,
+				// and let divergence override any earlier recoverable fork switch.
+				result.StateWrittenOnCancel = false
+				result.Error = fmt.Errorf("replay verification failed during shutdown: %w", div)
+			}
+		}()
 		if !TrailingVerifierCfg.Required {
 			mlog.Log.Warnf("trailing verifier running in ADVISORY mode (verifier.required=false): folds are NOT gated on execution verification")
 		}
@@ -2231,6 +2265,7 @@ func ReplayBlocks(
 			return
 		}
 		if res.err != nil {
+			foldFailed = true
 			promoter.failure = res.err
 			if result.Error == nil {
 				result.Error = fmt.Errorf("rooted-durable: storage write failed (last confirmed durable slot %d): %w; restart recovery required", mithrilState.LastRootedSlot, res.err)
@@ -2240,6 +2275,7 @@ func ReplayBlocks(
 		}
 		rootedCtx := unrootedTailState.applyFoldJob(res.job)
 		if rootedCtx == nil {
+			foldFailed = true
 			mlog.Log.Errorf("rooted-durable: fold through slot %d returned no resume context; watermark held back", res.job.through)
 			return
 		}
@@ -2375,6 +2411,7 @@ func ReplayBlocks(
 			if rewardsHoldBelowSlot > 0 && partitionedRewardsInfo != nil && promoteThrough >= rewardsHoldBelowSlot {
 				job, jerr := unrootedTailState.buildRewardsCompletionFoldJob(rewardsCompletion.slot)
 				if jerr != nil {
+					foldFailed = true
 					mlog.Log.Errorf("rooted-durable: rewards completion fold: %v", jerr)
 					return false
 				}
@@ -2405,6 +2442,7 @@ func ReplayBlocks(
 				job, jerr = unrootedTailState.buildFoldJob(promoteThrough, false)
 			}
 			if jerr != nil {
+				foldFailed = true
 				mlog.Log.Errorf("rooted-durable: %v; watermark held back", jerr)
 				return false
 			}
@@ -2547,7 +2585,7 @@ func ReplayBlocks(
 		}
 	}
 
-	blockStream := blockstream.NewBlockSource(opts)
+	blockStream = blockstream.NewBlockSource(opts)
 
 	if !isLive {
 		blockStream.DownloadInitialBlocks()
@@ -2892,6 +2930,8 @@ func ReplayBlocks(
 			if block == nil {
 				if result.Error == nil {
 					switch {
+					case blockStream.FetchStalled():
+						// Leave shutdown-only safety findings room to set Error.
 					case blockStream.Stalled():
 						result.Error = fmt.Errorf("block fetch stalled - no progress for %v", blockStream.StallTimeout())
 					case isLive && !blockStream.Completed():
@@ -3817,8 +3857,8 @@ func ReplayBlocks(
 		rewardReadPublisher.ResetEpochRewardView()
 	}
 
-	// Check if block source stalled (this provides explicit error info)
-	if blockStream.Stalled() && result.Error == nil {
+	// Keep unavailable-history handling unchanged; exact timeouts classify last.
+	if blockStream.Stalled() && !blockStream.FetchStalled() && result.Error == nil {
 		result.Error = fmt.Errorf("block fetch stalled - no progress for %v", blockStream.StallTimeout())
 	}
 
@@ -3838,6 +3878,7 @@ func ReplayBlocks(
 		stateChanged := mithrilState.LastRootedSlot > preFlushRooted || len(mithrilState.AlpenglowEvidence) > preFlushEvidence
 		if result.StateWrittenOnCancel && onCancelWriteState != nil && stateChanged {
 			if err := onCancelWriteState(result); err != nil {
+				result.StateWrittenOnCancel = false
 				mlog.Log.Errorf("failed to re-write state after shutdown flush (recovery reconcile will cover it): %v", err)
 			}
 		}

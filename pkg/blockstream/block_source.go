@@ -2581,14 +2581,25 @@ func (bs *BlockSource) getMaxTipFromAllRpcs(timeout time.Duration) uint64 {
 func (bs *BlockSource) worker(wg *sync.WaitGroup, id int) {
 	defer wg.Done()
 
-	for slot := range bs.workQueue {
+	for {
+		var slot uint64
+		select {
+		case slot = <-bs.workQueue:
+		case <-bs.stopChan:
+			return
+		}
 		// Check for shutdown
 		if bs.stopped.Load() {
 			return
 		}
 
-		// Wait for rate limiter
-		bs.rateLimiter.Wait(context.Background())
+		// The limiter always has a positive burst. Stop must interrupt queued
+		// reservations rather than wait for them and start another RPC fetch.
+		reservation := bs.rateLimiter.Reserve()
+		if bs.waitForStopOrTimeout(reservation.Delay()) || bs.stopped.Load() {
+			reservation.Cancel()
+			return
+		}
 
 		// Lightbringer handoff may have become active after this slot was queued.
 		// If so, skip the RPC fetch and let the stream source satisfy the slot.
@@ -3675,7 +3686,8 @@ func (bs *BlockSource) Start() {
 	// a rooted fork recovery. Keeping the close idempotent lets that external
 	// teardown race safely with an ordinary scheduler completion.
 	bs.Stop()
-	close(bs.workQueue)
+	// Replay may still schedule while consuming buffered blocks after Stop.
+	// Workers exit via stopChan; keeping this queue open avoids racing senders.
 	wg.Wait()
 	bs.liveStreamWg.Wait()
 	bs.backgroundWg.Wait()
@@ -3846,6 +3858,11 @@ func (bs *BlockSource) BufferDepth() int {
 // When true, the caller should trigger a graceful shutdown to preserve AccountsDB state.
 func (bs *BlockSource) Stalled() bool {
 	return bs.stallError.Load()
+}
+
+// FetchStalled reports only the fetch-progress timeout, not unavailable history.
+func (bs *BlockSource) FetchStalled() bool {
+	return bs.stopReasonEnum() == blockSourceStopReasonStalled
 }
 
 // StallTimeout returns the configured stall timeout duration.

@@ -214,17 +214,21 @@ func (accountsDb *AccountsDb) WaitForStoreWorker() {
 	accountsDb.storeWorkerDone = nil
 }
 
-func (accountsDb *AccountsDb) CloseDb() {
+// CloseDb waits for the store worker and closes both databases, returning any close errors.
+func (accountsDb *AccountsDb) CloseDb() error {
 	accountsDb.WaitForStoreWorker()
 	mlog.Log.Infof("CloseDb: syncing and closing Index...")
-	if err := accountsDb.Index.Close(); err != nil {
-		mlog.Log.Errorf("CloseDb: Index.Close() error: %v", err)
+	indexErr := accountsDb.Index.Close()
+	if indexErr != nil {
+		mlog.Log.Errorf("CloseDb: Index.Close() error: %v", indexErr)
 	}
 	mlog.Log.Infof("CloseDb: syncing and closing BankHashStore...")
-	if err := accountsDb.BankHashStore.Close(); err != nil {
-		mlog.Log.Errorf("CloseDb: BankHashStore.Close() error: %v", err)
+	bankHashErr := accountsDb.BankHashStore.Close()
+	if bankHashErr != nil {
+		mlog.Log.Errorf("CloseDb: BankHashStore.Close() error: %v", bankHashErr)
 	}
 	mlog.Log.Infof("CloseDb: done\n") // extra newline for spacing after close
+	return errors.Join(indexErr, bankHashErr)
 }
 
 func (accountsDb *AccountsDb) InitCaches() {
