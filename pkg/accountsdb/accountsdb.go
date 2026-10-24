@@ -50,6 +50,10 @@ type AccountsDb struct {
 	pendingFold      map[[32]byte]dedupedVersion
 	commonAdmission  *commonCacheAdmission
 	batchHooks       batchReadTestHooks
+	// Batch-only absence cache. Both fields use readCacheEpochMu; entries are
+	// valid only for the exact publication epoch in which absence was observed.
+	batchAbsentEpoch uint64
+	batchAbsent      map[solana.PublicKey]struct{}
 
 	// appendVecReadMu pins appendvec paths from before an index snapshot until
 	// its file reads complete. Compaction/rewind take the write side across an
@@ -755,6 +759,7 @@ func (accountsDb *AccountsDb) refreshReadCacheEntries(accts []*accounts.Account)
 
 // resetReadCachesLocked requires readCacheEpochMu for writing.
 func (accountsDb *AccountsDb) resetReadCachesLocked() {
+	clear(accountsDb.batchAbsent)
 	accountsDb.CommonAcctsCache.Clear()
 	accountsDb.VoteAcctCache.Clear()
 	accountsDb.programCacheMu.Lock()
