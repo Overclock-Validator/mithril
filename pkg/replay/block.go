@@ -47,9 +47,11 @@ import (
 	"github.com/panjf2000/ants/v2"
 )
 
-// SlotCtxSetter is implemented by types that accept a SlotCtx update (e.g. RpcServer).
+// SlotCtxSetter is implemented by the RPC server so replay can publish both
+// its live execution bank and the latest bank durably folded into AccountsDB.
 type SlotCtxSetter interface {
 	SetSlotCtx(slotCtx *sealevel.SlotCtx)
+	SetRootedBankState(slot, blockHeight, transactionCount uint64)
 }
 
 type epochRewardPublisher interface {
@@ -62,6 +64,10 @@ type epochRewardPublisher interface {
 type epochRewardReadPublisher interface {
 	PublishEpochRewards(slot uint64)
 	ResetEpochRewardView()
+}
+
+type rpcHealthInvalidator interface {
+	InvalidateHealth()
 }
 
 // BlockFetchOpts contains options for parallel block fetching
@@ -1759,6 +1765,11 @@ func ReplayBlocks(
 	onCancelWriteState OnCancelWriteState, // callback to write state immediately on cancellation (can be nil)
 ) *ReplayResult {
 	result := &ReplayResult{}
+	health, _ := rpcServer.(rpcHealthInvalidator)
+	if health != nil {
+		health.InvalidateHealth()
+		defer health.InvalidateHealth()
+	}
 	alpenglowMode := consensusOpts != nil && consensusOpts.Alpenglow
 	rewardPublisher, _ := rpcServer.(epochRewardPublisher)
 	rewardReadPublisher, _ := rpcServer.(epochRewardReadPublisher)
@@ -2186,6 +2197,13 @@ func ReplayBlocks(
 				mlog.Log.Errorf("failed to advance rooted epoch rewards through slot %d: %v", promotedThrough, err)
 			}
 		}
+		if rpcServer != nil {
+			var transactionCount uint64
+			if rootedCtx.TransactionCount != nil {
+				transactionCount = *rootedCtx.TransactionCount
+			}
+			rpcServer.SetRootedBankState(promotedThrough, rootedCtx.BlockHeight, transactionCount)
+		}
 		if rewardsCompletion.retire(&partitionedRewardsInfo, promotedThrough) {
 			rewardsHoldBelowSlot = 0
 			mlog.Log.Infof("epoch rewards bookkeeping retired through durable slot %d; later fork switches may unwind in memory", promotedThrough)
@@ -2548,6 +2566,10 @@ func ReplayBlocks(
 	}
 
 	blockStream := blockstream.NewBlockSource(opts)
+	if health, ok := rpcServer.(interface{ SetHealthSlotSource(func() (uint64, bool)) }); ok && isLive {
+		health.SetHealthSlotSource(blockStream.HealthSlot)
+		defer health.SetHealthSlotSource(func() (uint64, bool) { return 0, false })
+	}
 
 	if !isLive {
 		blockStream.DownloadInitialBlocks()
@@ -2635,7 +2657,7 @@ func ReplayBlocks(
 			mlog.Log.Warnf("%v — re-serving the skipped suffix from slot %d; executed bank remains at slot %d", sw, sw.Slot, currentExecutedAnchorSlot())
 			return true
 		}
-		rs, parentBankSysvars, fallbackReason := tryInLoopUnwind(sw, unrootedTailState, mithrilState, epochSchedule, currentEpoch, partitionedRewardsInfo)
+		rs, parentBankSysvars, fallbackReason := tryInLoopUnwind(sw, unrootedTailState, mithrilState, epochSchedule, currentEpoch, partitionedRewardsInfo, health)
 		if rs == nil {
 			windowSwitchFallback++
 			switchFallbackReasons[fallbackReason]++
@@ -3393,6 +3415,9 @@ func ReplayBlocks(
 
 		if rpcServer != nil {
 			rpcServer.SetSlotCtx(lastSlotCtx)
+			if unrootedTailState == nil {
+				rpcServer.SetRootedBankState(block.Slot, global.BlockHeight(), global.TransactionCount())
+			}
 		}
 
 		replayCtx.Capitalization -= lastSlotCtx.LamportsBurnt
@@ -3815,6 +3840,11 @@ func ReplayBlocks(
 
 	if rewardReadPublisher != nil {
 		rewardReadPublisher.ResetEpochRewardView()
+	}
+
+	// Replay has stopped; cleanup may still wait for folds and worker shutdown.
+	if health != nil {
+		health.InvalidateHealth()
 	}
 
 	// Check if block source stalled (this provides explicit error info)
