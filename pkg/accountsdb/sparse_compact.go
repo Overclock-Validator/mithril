@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-
-	"github.com/cockroachdb/pebble"
 )
 
 const sparseCompactionMinSize = int64(8 << 20)
@@ -26,7 +24,7 @@ type deadPayload struct{ offset, length int64 }
 // A crash before the marker leaves the original fold intact; a crash after it
 // leaves some or all dead pages allocated. Either state is safe and retryable.
 // Caller holds foldMu and has excluded every in-horizon/parked whole-file pin.
-func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte) (reclaimed, scanned int64, deleted bool, err error) {
+func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte, indexCache *sparseIndexCache) (reclaimed, scanned int64, deleted bool, err error) {
 	m, err := ReadSegmentManifest(c.manifestPath)
 	if err != nil {
 		return 0, 0, false, err
@@ -78,21 +76,15 @@ func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte)
 			foundUndo++
 			keep = true
 		}
-		entry, closer, getErr := db.Index.Get(r.Pubkey[:])
-		if getErr == nil {
-			current, decodeErr := UnmarshalAcctIdxEntryValue(entry)
-			closer.Close()
-			if decodeErr != nil {
-				return 0, scanned, false, decodeErr
-			}
-			if current.FileId == c.fileId {
-				if current.Offset != r.Offset || current.Slot != c.slot {
-					return 0, scanned, false, fmt.Errorf("index location disagrees with source for %x", r.Pubkey)
-				}
-				keep = true
-			}
-		} else if getErr != pebble.ErrNotFound {
+		current, found, getErr := indexCache.lookup(db, r.Pubkey)
+		if getErr != nil {
 			return 0, scanned, false, getErr
+		}
+		if found && current.FileId == c.fileId {
+			if current.Offset != r.Offset || current.Slot != c.slot {
+				return 0, scanned, false, fmt.Errorf("index location disagrees with source for %x", r.Pubkey)
+			}
+			keep = true
 		}
 		if keep {
 			retained++
@@ -116,6 +108,9 @@ func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte)
 		db.appendVecReadMu.Lock()
 		err := removeSourceFiles(db.AcctsDir, path, c.manifestPath)
 		db.appendVecReadMu.Unlock()
+		if err == nil {
+			db.trackRemovedLocked(path, c.manifestPath)
+		}
 		return before, scanned, err == nil, err
 	}
 	if m.Kind != ManifestKindCompact || m.DataCRC != 0 {
@@ -143,7 +138,11 @@ func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte)
 		return 0, scanned, false, err
 	}
 	after, err := allocatedFileBytes(f)
-	return max(int64(0), before-after), scanned, false, err
+	if err != nil {
+		return 0, scanned, false, err
+	}
+	db.trackAllocatedLocked(c.name, after)
+	return max(int64(0), before-after), scanned, false, nil
 }
 
 type compactionTestHooks struct {

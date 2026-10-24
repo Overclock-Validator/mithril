@@ -150,6 +150,9 @@ func (db *AccountsDb) finalizeParkedRewindLeftoversLocked(throughSlot uint64) {
 func (db *AccountsDb) RewindToBatchBoundary(throughSlot uint64) (RewindResult, error) {
 	db.foldMu.Lock()
 	defer db.foldMu.Unlock()
+	// Recovery, rewind and their forensic moves change the directory outside
+	// compaction's tracking; the next compaction cycle rescans it.
+	defer db.invalidateCompactionInventoryLocked()
 	db.appendVecReadMu.Lock()
 	defer db.appendVecReadMu.Unlock()
 

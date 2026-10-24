@@ -183,6 +183,9 @@ func (db *AccountsDb) PendingRewindTarget() (uint64, error) {
 func (db *AccountsDb) RewindToBatchBoundaryAndPersist(target uint64, persist func(RewindResult) error) (RewindResult, error) {
 	db.foldMu.Lock()
 	defer db.foldMu.Unlock()
+	// Recovery, rewind and their forensic moves change the directory outside
+	// compaction's tracking; the next compaction cycle rescans it.
+	defer db.invalidateCompactionInventoryLocked()
 	db.appendVecReadMu.Lock()
 	defer db.appendVecReadMu.Unlock()
 	if persist == nil {

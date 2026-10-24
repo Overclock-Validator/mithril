@@ -84,8 +84,15 @@ type AccountsDb struct {
 	compactLastScan  map[uint64]uint64 // oldest scan first; a growing directory must not postpone cursor wrap forever
 	compactCycles    uint64            // periodically serve bootstrap and mostly-empty sparse files too
 	compactHooks     compactionTestHooks
-	rewindPending    bool // guarded by foldMu until lowered state is saved
-	rewindHooks      rewindTestHooks
+	// compactInventory is the in-memory view of the accounts directory that
+	// compaction scans (nil = rebuild from the directory); compactPinCache holds
+	// pins computed from unchanged retained manifests. Both guarded by foldMu.
+	compactInventory      *compactionInventory
+	compactInventoryDrift uint64
+	compactPinCache       *compactionPinCache
+	compactCRCBuf         []byte // reused to stream retained manifests through their CRC
+	rewindPending         bool   // guarded by foldMu until lowered state is saved
+	rewindHooks           rewindTestHooks
 
 	// A list of store requests. They are added to the back as they arrive and
 	// removed from the front as they are persisted.

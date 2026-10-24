@@ -189,6 +189,14 @@ func (db *AccountsDb) CommitBatch(
 	// segment is never materialized in RAM — only the bufio buffer is. Record
 	// offsets are the byte position before each record.
 	dataName := filepath.Join(db.AcctsDir, SegmentDataName(throughSlot, fileId))
+	// Until the commit succeeds, a failure may leave a data file or manifest
+	// that compaction's inventory does not know about: rebuild it then.
+	committed := false
+	defer func() {
+		if !committed {
+			db.invalidateCompactionInventoryLocked()
+		}
+	}()
 	f, err := os.OpenFile(dataName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return BatchCommitResult{}, err
@@ -233,6 +241,7 @@ func (db *AccountsDb) CommitBatch(
 	if err := fsyncDir(db.AcctsDir); err != nil {
 		return BatchCommitResult{}, err
 	}
+	db.trackDataFileLocked(filepath.Base(dataName))
 	fire(db.foldHooks.afterSegmentFsync)
 	dataCRC := crc.Sum32()
 
@@ -283,6 +292,7 @@ func (db *AccountsDb) CommitBatch(
 	if err := WriteSegmentManifest(db.AcctsDir, manifest); err != nil {
 		return BatchCommitResult{}, err
 	}
+	db.trackManifestLocked(segmentManifestPath(db.AcctsDir, manifest.ThroughSlot, manifest.FileId))
 	fire(db.foldHooks.afterManifestRename)
 
 	// (6) Advisory bankhash rows; recoverable from the manifest, so NoSync.
@@ -332,6 +342,7 @@ func (db *AccountsDb) CommitBatch(
 	// (8) Publish.
 	db.lastBatchSeq = batchSeq
 	db.durableThrough.Store(throughSlot)
+	committed = true
 
 	return BatchCommitResult{
 		BatchSeq:    batchSeq,

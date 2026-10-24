@@ -54,6 +54,9 @@ type RecoveryResult struct {
 func (db *AccountsDb) RecoverFoldState() (RecoveryResult, error) {
 	db.foldMu.Lock()
 	defer db.foldMu.Unlock()
+	// Recovery, rewind and their forensic moves change the directory outside
+	// compaction's tracking; the next compaction cycle rescans it.
+	defer db.invalidateCompactionInventoryLocked()
 
 	res := RecoveryResult{}
 
