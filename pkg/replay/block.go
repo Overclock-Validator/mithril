@@ -4026,7 +4026,7 @@ func newSlotCtx(block *b.Block, accts accounts.Accounts, parentAccts accounts.Ac
 	}
 	// Guard: a nil *unrootedTail stored in the AccountReader interface would be a
 	// non-nil typed-nil and break the nil check in GetAccountFromAccountsDb.
-	if tail != nil {
+	if tail := normalizeUnrootedState(tail); tail != nil {
 		slotCtx.UnrootedRead = tail
 	}
 

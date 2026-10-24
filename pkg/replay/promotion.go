@@ -128,6 +128,17 @@ type unrootedState interface {
 	OverCap() bool
 }
 
+// normalizeUnrootedState preserves the disabled-tail sentinel when a classic
+// replay caller passes its nil *unrootedTail through an interface. Otherwise
+// reads and commits would select the overlay path and dereference that nil
+// pointer instead of using AccountsDB. Other implementations remain intact.
+func normalizeUnrootedState(tail unrootedState) unrootedState {
+	if concrete, ok := tail.(*unrootedTail); ok && concrete == nil {
+		return nil
+	}
+	return tail
+}
+
 // unrootedTail layers an in-RAM UnrootedOverlay over the durable store: reads
 // resolve overlay→durable, commits buffer until rooted slots promote out.
 type unrootedTail struct {
