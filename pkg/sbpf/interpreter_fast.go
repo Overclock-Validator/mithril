@@ -5,7 +5,6 @@ var useFastLoop = true
 
 // fastFlags holds the SBPF version gates runFast needs, hoisted out of the loop.
 type fastFlags struct {
-	jmp32          bool
 	moveMem        bool
 	pqr            bool
 	swapSub        bool
@@ -21,7 +20,6 @@ type fastFlags struct {
 func (ip *Interpreter) fastFlags() fastFlags {
 	v := ip.sbpfVersion
 	return fastFlags{
-		jmp32:          v.EnableJmp32(),
 		moveMem:        v.MoveMemoryInstructionClasses(),
 		pqr:            v.EnablePqr(),
 		swapSub:        v.SwapSubRegImmOperands(),
@@ -54,11 +52,9 @@ func (ip *Interpreter) runFast(r *[16]uint64, pc int64, due, budget uint64, f fa
 			return pc, due
 		}
 		ins := text[pc]
-		op := ins.Op()
-		if f.jmp32 && op&0x07 == ClassPqr {
-			return pc, due
-		}
-		switch op {
+		// No case below is in the jmp32/pqr class (TestRunFastCaseClasses), so
+		// those opcodes reach default and return to Run, which checks jmp32.
+		switch ins.Op() {
 		case OpLdxb:
 			if f.moveMem {
 				return pc, due
