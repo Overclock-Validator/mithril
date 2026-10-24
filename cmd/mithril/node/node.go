@@ -2636,6 +2636,7 @@ postBootstrap:
 				klog.Fatalf("unable to load RPC epoch rewards: %v", err)
 			}
 		}
+		rpcServer.SetIdentity(validatorIdentityPubkey)
 		rpcServer.Start()
 		mlog.Log.Infof("Started RPC server on port %d", rpcPort)
 	}

@@ -31,12 +31,28 @@ func TestRPCHandlerMethodSet(t *testing.T) {
 }
 
 func TestInternalMethodsAreNotRPC(t *testing.T) {
+	for _, method := range []string{"enableEpochRewards", "setIdentity", "invalidateHealth"} {
+		t.Run(method, func(t *testing.T) {
+			testInternalMethodNotRPC(t, method)
+		})
+	}
+}
+
+func testInternalMethodNotRPC(t *testing.T, method string) {
+	t.Helper()
 	for _, mode := range []string{"single", "mixed-batch", "oversized-single", "direct-dispatch"} {
 		t.Run(mode, func(t *testing.T) {
 			rpc := NewRpcServer(nil, 0, &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 32}, solana.Hash{1})
 			t.Cleanup(func() { _ = rpc.listener.Close() })
 			directory := filepath.Join(t.TempDir(), "history")
-			call := map[string]any{"jsonrpc": "2.0", "id": 1, "method": "enableEpochRewards", "params": []any{directory, 100, 0}}
+			rpc.SetIdentity("before")
+			rpc.SetSlotCtx(&sealevel.SlotCtx{Slot: 1})
+			call := map[string]any{"jsonrpc": "2.0", "id": 1, "method": method, "params": []any{"after"}}
+			if method == "invalidateHealth" {
+				call["params"] = []any{}
+			} else if method == "enableEpochRewards" {
+				call["params"] = []any{directory, 100, 0}
+			}
 			if mode == "oversized-single" {
 				call["padding"] = strings.Repeat("x", maxQuietMethodProbeBody+1)
 			}
@@ -85,6 +101,12 @@ func TestInternalMethodsAreNotRPC(t *testing.T) {
 			}
 			if _, err := os.Stat(directory); !os.IsNotExist(err) {
 				t.Fatalf("internal request created history directory: %v", err)
+			}
+			if rpc.identity != "before" {
+				t.Fatalf("internal request changed identity: %q", rpc.identity)
+			}
+			if !rpc.healthReady {
+				t.Fatal("internal request invalidated health")
 			}
 		})
 	}
