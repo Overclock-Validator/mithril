@@ -226,9 +226,7 @@ func (exec *blockExecution) open() error {
 	defer exec.captureAccountLoader()()
 	block := exec.block
 	exec.setReplayStage("prepare_dependency_planner")
-	if SerializedParameterArena != nil {
-		SerializedParameterArena.Reset()
-	}
+	resetSerializedParameterArena()
 
 	start := time.Now()
 	exec.setReplayStage("load_accounts")
