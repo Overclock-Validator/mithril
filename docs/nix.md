@@ -43,7 +43,7 @@ or add any config keys via `services.mithril.config.settings`.
               # Config schema (typed)
               configSchema = {
                 name = "mithril";
-                networkCluster = "mainnet-beta";
+                networkCluster = "mainnet";
                 networkRpc = [ "https://api.mainnet-beta.solana.com" ];
                 blockSource = "rpc";
               };
@@ -88,7 +88,7 @@ or add any config keys via `services.mithril.config.settings`.
               # Config generation (system paths)
               configSchema = {
                 name = "mithril";
-                networkCluster = "mainnet-beta";
+                networkCluster = "mainnet";
                 networkRpc = [ "https://api.mainnet-beta.solana.com" ];
               };
 
@@ -124,7 +124,7 @@ or add any config keys via `services.mithril.config.settings`.
               # Generates ${XDG_CONFIG_HOME}/mithril/config.toml
               configSchema = {
                 name = "mithril";
-                networkCluster = "mainnet-beta";
+                networkCluster = "mainnet";
                 networkRpc = [ "https://api.mainnet-beta.solana.com" ];
               };
             };

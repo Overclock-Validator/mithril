@@ -17,7 +17,7 @@ const (
 
 func TestEnsureLedgerChainBindingInitializesEmptyLedger(t *testing.T) {
 	dir := t.TempDir()
-	transition, err := EnsureLedgerChainBinding(dir, "alpenglow", testNewGenesis, "")
+	transition, err := EnsureLedgerChainBinding(dir, "mainnet", testNewGenesis, "")
 	if err != nil {
 		t.Fatalf("ensure binding: %v", err)
 	}
@@ -28,7 +28,7 @@ func TestEnsureLedgerChainBindingInitializesEmptyLedger(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load binding: %v", err)
 	}
-	if binding == nil || binding.Cluster != "alpenglow" || binding.GenesisHash != testNewGenesis {
+	if binding == nil || binding.Cluster != "mainnet" || binding.GenesisHash != testNewGenesis {
 		t.Fatalf("binding = %+v", binding)
 	}
 }
@@ -38,7 +38,7 @@ func TestEnsureLedgerChainBindingFailsClosedForUnboundVotes(t *testing.T) {
 	history := "vote_history-validator.mithril.json"
 	writeLedgerFixture(t, filepath.Join(dir, history), "signed-old-votes")
 
-	_, err := EnsureLedgerChainBinding(dir, "alpenglow", testNewGenesis, "")
+	_, err := EnsureLedgerChainBinding(dir, "mainnet", testNewGenesis, "")
 	if !errors.Is(err, ErrUnboundLedgerArtifacts) {
 		t.Fatalf("error = %v, want ErrUnboundLedgerArtifacts", err)
 	}
@@ -53,7 +53,7 @@ func TestEnsureLedgerChainBindingSameGenesisPreservesArtifacts(t *testing.T) {
 	writeLedgerFixture(t, filepath.Join(dir, "vote_history-validator.mithril.json"), "signed-votes")
 	writeLedgerFixture(t, filepath.Join(dir, "catchup-spool", "s42.shreds"), "shreds")
 
-	transition, err := EnsureLedgerChainBinding(dir, "alpenglow", testOldGenesis, testOldGenesis)
+	transition, err := EnsureLedgerChainBinding(dir, "mainnet", testOldGenesis, testOldGenesis)
 	if err != nil {
 		t.Fatalf("ensure legacy binding: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestEnsureLedgerChainBindingSameGenesisPreservesArtifacts(t *testing.T) {
 
 	// A subsequent same-genesis snapshot rebuild has a stored binding and must
 	// retain the same voting record and prewarmed shreds.
-	transition, err = EnsureLedgerChainBinding(dir, "alpenglow", testOldGenesis, "")
+	transition, err = EnsureLedgerChainBinding(dir, "mainnet", testOldGenesis, "")
 	if err != nil {
 		t.Fatalf("ensure stored binding: %v", err)
 	}
@@ -82,10 +82,10 @@ func TestEnsureLedgerChainBindingMismatchQuarantinesOnlyScopedArtifacts(t *testi
 	writeLedgerFixture(t, filepath.Join(dir, "catchup-spool", "s11643075.shreds"), "old-shreds")
 	writeLedgerFixture(t, filepath.Join(dir, "operator-notes.txt"), "keep me")
 
-	if _, err := EnsureLedgerChainBinding(dir, "alpenglow", testOldGenesis, testOldGenesis); err != nil {
+	if _, err := EnsureLedgerChainBinding(dir, "mainnet", testOldGenesis, testOldGenesis); err != nil {
 		t.Fatalf("establish old binding: %v", err)
 	}
-	transition, err := EnsureLedgerChainBinding(dir, "alpenglow", testNewGenesis, "")
+	transition, err := EnsureLedgerChainBinding(dir, "mainnet", testNewGenesis, "")
 	if err != nil {
 		t.Fatalf("transition binding: %v", err)
 	}
@@ -130,13 +130,13 @@ func TestEnsureLedgerChainBindingResumesPartialQuarantine(t *testing.T) {
 	dir := t.TempDir()
 	writeLedgerFixture(t, filepath.Join(dir, "vote_history-validator.mithril.json"), "signed-old-votes")
 	writeLedgerFixture(t, filepath.Join(dir, "catchup-spool", "s42.shreds"), "old-shreds")
-	if _, err := EnsureLedgerChainBinding(dir, "alpenglow", testOldGenesis, testOldGenesis); err != nil {
+	if _, err := EnsureLedgerChainBinding(dir, "mainnet", testOldGenesis, testOldGenesis); err != nil {
 		t.Fatalf("establish old binding: %v", err)
 	}
 
 	injected := errors.New("injected rename failure")
 	renames := 0
-	_, err := ensureLedgerChainBinding(dir, "alpenglow", testNewGenesis, "", ledgerTransitionOps{
+	_, err := ensureLedgerChainBinding(dir, "mainnet", testNewGenesis, "", ledgerTransitionOps{
 		rename: func(oldPath, newPath string) error {
 			renames++
 			if renames == 2 {
@@ -164,7 +164,7 @@ func TestEnsureLedgerChainBindingResumesPartialQuarantine(t *testing.T) {
 		t.Fatalf("old binding was not preserved at partial failure: binding=%+v err=%v", binding, loadErr)
 	}
 
-	transition, err := EnsureLedgerChainBinding(dir, "alpenglow", testNewGenesis, "")
+	transition, err := EnsureLedgerChainBinding(dir, "mainnet", testNewGenesis, "")
 	if err != nil {
 		t.Fatalf("resume partial transition: %v", err)
 	}
@@ -183,12 +183,12 @@ func TestEnsureLedgerChainBindingResumesPartialQuarantine(t *testing.T) {
 func TestEnsureLedgerChainBindingResumesBeforeBindingCommit(t *testing.T) {
 	dir := t.TempDir()
 	writeLedgerFixture(t, filepath.Join(dir, "vote_history-validator.mithril.json"), "signed-old-votes")
-	if _, err := EnsureLedgerChainBinding(dir, "alpenglow", testOldGenesis, testOldGenesis); err != nil {
+	if _, err := EnsureLedgerChainBinding(dir, "mainnet", testOldGenesis, testOldGenesis); err != nil {
 		t.Fatalf("establish old binding: %v", err)
 	}
 
 	injected := errors.New("injected binding commit failure")
-	_, err := ensureLedgerChainBinding(dir, "alpenglow", testNewGenesis, "", ledgerTransitionOps{
+	_, err := ensureLedgerChainBinding(dir, "mainnet", testNewGenesis, "", ledgerTransitionOps{
 		rename: func(oldPath, newPath string) error {
 			if filepath.Base(oldPath) == ledgerTransitionIntentFileName && filepath.Base(newPath) == LedgerChainBindingFileName {
 				return injected
@@ -213,7 +213,7 @@ func TestEnsureLedgerChainBindingResumesBeforeBindingCommit(t *testing.T) {
 		t.Fatalf("durable provenance missing before binding commit: %v", err)
 	}
 
-	transition, err := EnsureLedgerChainBinding(dir, "alpenglow", testNewGenesis, "")
+	transition, err := EnsureLedgerChainBinding(dir, "mainnet", testNewGenesis, "")
 	if err != nil {
 		t.Fatalf("resume pre-commit transition: %v", err)
 	}
@@ -230,12 +230,12 @@ func TestEnsureLedgerChainBindingResumesBeforeBindingCommit(t *testing.T) {
 func TestEnsureLedgerChainBindingPendingTransitionRejectsUnjournaledArtifact(t *testing.T) {
 	dir := t.TempDir()
 	writeLedgerFixture(t, filepath.Join(dir, "vote_history-validator.mithril.json"), "signed-old-votes")
-	if _, err := EnsureLedgerChainBinding(dir, "alpenglow", testOldGenesis, testOldGenesis); err != nil {
+	if _, err := EnsureLedgerChainBinding(dir, "mainnet", testOldGenesis, testOldGenesis); err != nil {
 		t.Fatalf("establish old binding: %v", err)
 	}
 
 	injected := errors.New("pause transition")
-	_, err := ensureLedgerChainBinding(dir, "alpenglow", testNewGenesis, "", ledgerTransitionOps{
+	_, err := ensureLedgerChainBinding(dir, "mainnet", testNewGenesis, "", ledgerTransitionOps{
 		rename: func(oldPath, newPath string) error {
 			return injected
 		},
@@ -245,7 +245,7 @@ func TestEnsureLedgerChainBindingPendingTransitionRejectsUnjournaledArtifact(t *
 	}
 	writeLedgerFixture(t, filepath.Join(dir, "vote_history-unexpected.mithril.json"), "unjournaled-old-votes")
 
-	_, err = EnsureLedgerChainBinding(dir, "alpenglow", testNewGenesis, "")
+	_, err = EnsureLedgerChainBinding(dir, "mainnet", testNewGenesis, "")
 	if err == nil {
 		t.Fatal("retry accepted an unjournaled live artifact")
 	}
@@ -276,7 +276,7 @@ func TestEnsureLedgerChainBindingSerializesOnLedgerLock(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		close(started)
-		_, err := EnsureLedgerChainBinding(dir, "alpenglow", testNewGenesis, "")
+		_, err := EnsureLedgerChainBinding(dir, "mainnet", testNewGenesis, "")
 		done <- err
 	}()
 	<-started
@@ -302,7 +302,7 @@ func TestEnsureLedgerChainBindingSerializesOnLedgerLock(t *testing.T) {
 func TestEnsureLedgerChainBindingConcurrentSameTarget(t *testing.T) {
 	dir := t.TempDir()
 	writeLedgerFixture(t, filepath.Join(dir, "vote_history-validator.mithril.json"), "signed-old-votes")
-	if _, err := EnsureLedgerChainBinding(dir, "alpenglow", testOldGenesis, testOldGenesis); err != nil {
+	if _, err := EnsureLedgerChainBinding(dir, "mainnet", testOldGenesis, testOldGenesis); err != nil {
 		t.Fatalf("establish old binding: %v", err)
 	}
 
@@ -316,7 +316,7 @@ func TestEnsureLedgerChainBindingConcurrentSameTarget(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			transition, err := EnsureLedgerChainBinding(dir, "alpenglow", testNewGenesis, "")
+			transition, err := EnsureLedgerChainBinding(dir, "mainnet", testNewGenesis, "")
 			if err != nil {
 				errs <- err
 				return
@@ -348,10 +348,10 @@ func TestEnsureLedgerChainBindingConcurrentSameTarget(t *testing.T) {
 
 func TestEnsureLedgerChainBindingRejectsConflictingLegacyAssertion(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := EnsureLedgerChainBinding(dir, "alpenglow", testNewGenesis, ""); err != nil {
+	if _, err := EnsureLedgerChainBinding(dir, "mainnet", testNewGenesis, ""); err != nil {
 		t.Fatalf("establish binding: %v", err)
 	}
-	_, err := EnsureLedgerChainBinding(dir, "alpenglow", testNewGenesis, testOldGenesis)
+	_, err := EnsureLedgerChainBinding(dir, "mainnet", testNewGenesis, testOldGenesis)
 	if err == nil {
 		t.Fatal("conflicting explicit legacy genesis was accepted")
 	}
@@ -364,7 +364,7 @@ func TestEnsureLedgerChainBindingRejectsConflictingLegacyAssertion(t *testing.T)
 func TestEnsureLedgerChainBindingRejectsMalformedGenesisBeforeFilesystemUse(t *testing.T) {
 	t.Run("current", func(t *testing.T) {
 		dir := t.TempDir()
-		if _, err := EnsureLedgerChainBinding(dir, "alpenglow", "../../escape", ""); err == nil {
+		if _, err := EnsureLedgerChainBinding(dir, "mainnet", "../../escape", ""); err == nil {
 			t.Fatal("malformed current genesis was accepted")
 		}
 		if entries, err := os.ReadDir(dir); err != nil || len(entries) != 0 {
@@ -375,7 +375,7 @@ func TestEnsureLedgerChainBindingRejectsMalformedGenesisBeforeFilesystemUse(t *t
 	t.Run("legacy assertion", func(t *testing.T) {
 		dir := t.TempDir()
 		writeLedgerFixture(t, filepath.Join(dir, "vote_history-validator.mithril.json"), "signed-votes")
-		if _, err := EnsureLedgerChainBinding(dir, "alpenglow", testNewGenesis, "not-a-hash"); err == nil {
+		if _, err := EnsureLedgerChainBinding(dir, "mainnet", testNewGenesis, "not-a-hash"); err == nil {
 			t.Fatal("malformed legacy genesis was accepted")
 		}
 		assertFileContents(t, filepath.Join(dir, "vote_history-validator.mithril.json"), "signed-votes")
@@ -383,10 +383,10 @@ func TestEnsureLedgerChainBindingRejectsMalformedGenesisBeforeFilesystemUse(t *t
 
 	t.Run("stored binding", func(t *testing.T) {
 		dir := t.TempDir()
-		malformed := `{"version":1,"cluster":"alpenglow","genesis_hash":"../../escape"}`
+		malformed := `{"version":1,"cluster":"mainnet","genesis_hash":"../../escape"}`
 		writeLedgerFixture(t, filepath.Join(dir, LedgerChainBindingFileName), malformed)
 		writeLedgerFixture(t, filepath.Join(dir, "catchup-spool", "s42.shreds"), "shreds")
-		if _, err := EnsureLedgerChainBinding(dir, "alpenglow", testNewGenesis, ""); err == nil {
+		if _, err := EnsureLedgerChainBinding(dir, "mainnet", testNewGenesis, ""); err == nil {
 			t.Fatal("malformed stored genesis was accepted")
 		}
 		assertFileContents(t, filepath.Join(dir, "catchup-spool", "s42.shreds"), "shreds")

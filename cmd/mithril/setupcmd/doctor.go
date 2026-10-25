@@ -49,15 +49,18 @@ func runDoctor() {
 
 	// 2. Cluster and protocol path.
 	total++
-	cluster := config.GetString("network.cluster")
-	if cluster == "alpenglow" || cluster == "mainnet-beta" || cluster == "testnet" || cluster == "devnet" {
-		fmt.Printf("  %s Network: %s\n", successStyle.Render("✓"), cluster)
-		passed++
-	} else if cluster == "" {
-		fmt.Printf("  %s Network: alpenglow (default; network.cluster not set)\n", successStyle.Render("✓"))
-		passed++
+	cluster, clusterErr := config.ResolveCluster(config.GetString("network.cluster"), config.GetString("network.genesis_hash"))
+	if clusterErr != nil {
+		fmt.Printf("  %s Invalid cluster: %v\n", errorStyle.Render("✗"), clusterErr)
 	} else {
-		fmt.Printf("  %s Invalid cluster: %s\n", errorStyle.Render("✗"), cluster)
+		note := ""
+		if config.GetString("network.cluster") == "" {
+			note = " (default; network.cluster not set)"
+		} else if cluster.Custom {
+			note = " (custom)"
+		}
+		fmt.Printf("  %s Network: %s%s, Alpenglow, genesis %s\n", successStyle.Render("✓"), cluster.Name, note, cluster.GenesisHash)
+		passed++
 	}
 
 	// 2b. Node mode — "verifying" (non-voting) is the default; "validator"
@@ -70,16 +73,14 @@ func runDoctor() {
 		passed++
 	case "validator":
 		var missing []string
-		if cluster != "alpenglow" {
-			missing = append(missing, "network.cluster=alpenglow")
-		}
 		if config.GetString("validator.identity_keypair") == "" {
 			missing = append(missing, "validator.identity_keypair")
 		}
 		if config.GetString("validator.vote_account_keypair") == "" {
 			missing = append(missing, "validator.vote_account_keypair")
 		}
-		if config.GetString("turbine.gossip_entrypoint") == "" {
+		if config.GetString("turbine.gossip_entrypoint") == "" && (clusterErr != nil || cluster.Custom) {
+			// Built-in clusters default to their public entrypoint.
 			missing = append(missing, "turbine.gossip_entrypoint")
 		}
 		if config.GetString("consensus.alpenglow_observer_bind_addr") == "" {
