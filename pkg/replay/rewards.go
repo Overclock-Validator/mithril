@@ -529,7 +529,7 @@ func beginPartitionedEpochRewardsDistribution(acctsDb *accountsdb.AccountsDb, sl
 		capitalizingEpochRewards(voteRewardsDistributed, streamResult.TotalStakerRewards)
 }
 
-func distributePartitionedEpochRewardsForSlot(acctsDb *accountsdb.AccountsDb, parentCtx *sealevel.SlotCtx, stagedEpochAccts []*accounts.Account, epochCtx *ReplayCtx, partitionedEpochRewardsInfo *rewards.PartitionedRewardDistributionInfo, currentSlot uint64, currentBlockHeight uint64) ([]*accounts.Account, []*accounts.Account, map[solana.PublicKey]uint8) {
+func distributePartitionedEpochRewardsForSlot(acctsDb *accountsdb.AccountsDb, parentCtx *sealevel.SlotCtx, stagedEpochAccts []*accounts.Account, epochCtx *ReplayCtx, partitionedEpochRewardsInfo *rewards.PartitionedRewardDistributionInfo, currentSlot uint64, currentBlockHeight uint64, currentEpoch uint64) ([]*accounts.Account, []*accounts.Account, map[solana.PublicKey]uint8) {
 	rewardLoader := epochRewardAccountLoader(acctsDb, currentSlot, parentCtx, stagedEpochAccts)
 	epochRewardsAcct, err := rewardLoader(sealevel.SysvarEpochRewardsAddr)
 	if err != nil {
@@ -550,7 +550,18 @@ func distributePartitionedEpochRewardsForSlot(acctsDb *accountsdb.AccountsDb, pa
 
 	partitionIdx := currentBlockHeight - epochRewards.DistributionStartingBlockHeight
 
-	distributedAccts, parentDistributedAccts, distributedLamports, burnedLamports, stakeCommissions := rewards.DistributeStakingRewardsFromSpool(acctsDb, partitionedEpochRewardsInfo.SpoolDir, partitionedEpochRewardsInfo.SpoolSlot, partitionIdx, currentSlot, rewardLoader, partitionedEpochRewardsInfo.VoteCommissions)
+	distributionConfig := rewards.StakeRewardDistributionConfig{RewardedEpoch: safemath.SaturatingSubU64(currentEpoch, 1)}
+	if epochCtx.CurrentFeatures != nil && epochCtx.CurrentFeatures.IsActive(features.RelaxPostExecMinBalanceCheck) {
+		rentAcct, err := rewardLoader(sealevel.SysvarRentAddr)
+		if err != nil {
+			panic(fmt.Sprintf("unable to get distribution bank Rent sysvar: %s", err))
+		}
+		if err := distributionConfig.Rent.UnmarshalWithDecoder(bin.NewBinDecoder(rentAcct.Data)); err != nil {
+			panic(fmt.Sprintf("unable to decode distribution bank Rent sysvar: %s", err))
+		}
+		distributionConfig.AdjustDelegationsForRent = true
+	}
+	distributedAccts, parentDistributedAccts, distributedLamports, burnedLamports, stakeCommissions := rewards.DistributeStakingRewardsFromSpool(acctsDb, partitionedEpochRewardsInfo.SpoolDir, partitionedEpochRewardsInfo.SpoolSlot, partitionIdx, currentSlot, rewardLoader, partitionedEpochRewardsInfo.VoteCommissions, distributionConfig)
 	parentDistributedAccts = append(parentDistributedAccts, epochRewardsAcct.Clone())
 
 	// EpochRewards sysvar advances by distributed + burned (matching Agave/FD),
