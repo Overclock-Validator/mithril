@@ -13,8 +13,8 @@ const LightbringerQuietDefault = true
 func ApplyDefaults(v *viper.Viper) {
 	v.SetDefault("lightbringer.quiet", LightbringerQuietDefault)
 	// network.cluster and block.source default in the run command itself
-	// (Alpenglow/turbine, classic/RPC) — NOT here, because the lightbringer
-	// auto-switch needs to distinguish "operator chose a source" from "defaulted".
+	// (mainnet, turbine), NOT here, because the lightbringer auto-switch needs
+	// to distinguish "operator chose a source" from "defaulted".
 	v.SetDefault("consensus.mode", "verifying")
 	v.SetDefault("consensus.alpenglow_observer_bind_addr", "")
 	v.SetDefault("consensus.alpenglow_bls_dst", "")

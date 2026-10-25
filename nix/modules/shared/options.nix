@@ -219,9 +219,19 @@
       };
 
       networkCluster = lib.mkOption {
-        type = lib.types.enum ["mainnet-beta" "testnet" "devnet"];
-        default = "mainnet-beta";
-        description = "Solana cluster.";
+        type = lib.types.strMatching "[a-z0-9][a-z0-9._-]{0,63}";
+        default = "mainnet";
+        description = ''
+          Solana cluster: "mainnet" ("mainnet-beta" is an alias), "testnet", "devnet",
+          or a custom name for a private cluster. Every cluster runs Alpenglow. A custom
+          cluster also needs networkGenesisHash and a turbine gossip entrypoint.
+        '';
+      };
+
+      networkGenesisHash = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Expected genesis hash. Required for a custom cluster; must match the built-in genesis otherwise.";
       };
 
       networkRpc = lib.mkOption {

@@ -122,7 +122,7 @@ func runConfigInit() {
 	fmt.Println()
 	fmt.Println("Next steps:")
 	fmt.Println("  1. Edit the [storage] paths for your setup")
-	fmt.Println("  2. Set [network].rpc and [turbine].gossip_entrypoint for your Alpenglow cluster")
+	fmt.Println("  2. Set [network].cluster and [network].rpc (a custom cluster also needs genesis_hash and [turbine].gossip_entrypoint)")
 	if initValidator {
 		fmt.Println("  3. Set [validator] identity_keypair, vote_account_keypair, and advertised_ip —")
 		fmt.Println("     validator mode refuses to start without them")
@@ -213,8 +213,9 @@ rewind_horizon_batches = 64 # Fold batches of undo pointers kept actionable (~55
 
 # ── Network ──────────────────────────────────────────────────────────────
 [network]
-cluster = "alpenglow"     # Also supports mainnet-beta/testnet/devnet in verifying-only RPC mode
-rpc = ["https://rpc.ag.validator1.net"]  # First = primary, rest = fallbacks. Validator mode uses it for control-plane data (tip/stakes/snapshots), never blocks; verifying mode may use block RPC.
+cluster = "mainnet"       # "mainnet" | "testnet" | "devnet" | custom name; all run Alpenglow
+# genesis_hash = ""       # REQUIRED for a custom cluster; must match the built-in genesis otherwise
+rpc = ["https://api.mainnet-beta.solana.com"]  # First = primary, rest = fallbacks. Validator mode uses it for control-plane data (tip/stakes/snapshots), never blocks; verifying mode may use block RPC.
 
 # ── Block source ─────────────────────────────────────────────────────────
 [block]
@@ -238,7 +239,7 @@ near_tip_lookahead = 2
 
 # ── Turbine (native shred receiver; source = "turbine") ──────────────────
 [turbine]
-gossip_entrypoint = ""    # REQUIRED for turbine: a gossip entrypoint of your Alpenglow cluster (host:port)
+gossip_entrypoint = ""    # Empty = the built-in cluster's public entrypoint; REQUIRED for a custom cluster (host:port)
 gossip_bind_addr = "0.0.0.0:65401"  # Local gossip UDP port (open inbound); empty = OS-assigned
 # Gossip-connected nodes automatically retransmit verified broadcast shreds to their Agave-compatible downstream Turbine peers; repair responses are never forwarded.
 # advertised_ip = ""      # Public IP peers reach you at; empty = auto-detect via the entrypoint's IP-echo
