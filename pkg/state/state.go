@@ -1,10 +1,14 @@
 package state
 
 import (
+	"bytes"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
@@ -293,6 +297,74 @@ type ResumeContext struct {
 	// Startup and rewind consume it before replay; ResumeState intentionally does
 	// not copy it into the bank execution context.
 	TransactionStatusCheckpoint *TransactionStatusCheckpointRef `json:"transaction_status_checkpoint,omitempty"`
+	// DelegatedStake is the delegated stake per vote account, summed over
+	// stake accounts in the Stake state, in durable state as of Slot. Startup
+	// uses it instead of scanning every stake account. nil means the context
+	// predates the field or the totals were not tracked, and startup scans.
+	DelegatedStake *DelegatedStakeTotals `json:"delegated_stake,omitempty"`
+}
+
+// VoteDelegation is one vote account's delegated stake and the number of
+// stake accounts delegating it.
+type VoteDelegation struct {
+	Stake    uint64
+	Accounts uint64
+}
+
+// DelegatedStakeTotals is a compact encoding of delegations per vote
+// account: Votes records of a 32-byte vote account key, an 8-byte stake and
+// an 8-byte account count (little-endian), sorted by key, base64-encoded in
+// Packed.
+type DelegatedStakeTotals struct {
+	Votes  int    `json:"votes"`
+	Packed string `json:"packed"`
+}
+
+const delegatedStakeRecordBytes = 32 + 8 + 8
+
+// EncodeDelegatedStake encodes per-vote-account delegations for a resume
+// context.
+func EncodeDelegatedStake(totals map[[32]byte]VoteDelegation) *DelegatedStakeTotals {
+	keys := make([][32]byte, 0, len(totals))
+	for key := range totals {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i][:], keys[j][:]) < 0 })
+	raw := make([]byte, 0, len(keys)*delegatedStakeRecordBytes)
+	for _, key := range keys {
+		raw = append(raw, key[:]...)
+		raw = binary.LittleEndian.AppendUint64(raw, totals[key].Stake)
+		raw = binary.LittleEndian.AppendUint64(raw, totals[key].Accounts)
+	}
+	return &DelegatedStakeTotals{Votes: len(keys), Packed: base64.StdEncoding.EncodeToString(raw)}
+}
+
+// Decode returns the delegations, or an error when the encoding is
+// inconsistent.
+func (d *DelegatedStakeTotals) Decode() (map[[32]byte]VoteDelegation, error) {
+	if d == nil {
+		return nil, fmt.Errorf("no delegated stake totals")
+	}
+	raw, err := base64.StdEncoding.DecodeString(d.Packed)
+	if err != nil {
+		return nil, fmt.Errorf("decode delegated stake totals: %w", err)
+	}
+	if d.Votes < 0 || len(raw) != d.Votes*delegatedStakeRecordBytes {
+		return nil, fmt.Errorf("delegated stake totals: %d bytes for %d vote accounts", len(raw), d.Votes)
+	}
+	totals := make(map[[32]byte]VoteDelegation, d.Votes)
+	for off := 0; off < len(raw); off += delegatedStakeRecordBytes {
+		var key [32]byte
+		copy(key[:], raw[off:off+32])
+		if _, dup := totals[key]; dup {
+			return nil, fmt.Errorf("delegated stake totals: duplicate vote account")
+		}
+		totals[key] = VoteDelegation{
+			Stake:    binary.LittleEndian.Uint64(raw[off+32 : off+40]),
+			Accounts: binary.LittleEndian.Uint64(raw[off+40 : off+48]),
+		}
+	}
+	return totals, nil
 }
 
 // SnapshotInfo contains metadata about a downloaded snapshot file.

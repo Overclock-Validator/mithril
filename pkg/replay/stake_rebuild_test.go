@@ -85,7 +85,7 @@ func TestStakeRebuildPreservesIndividualReadResults(t *testing.T) {
 			r.accounts[solana.PublicKey{5}].Lamports = 0
 			entries = append(entries, entries[0]) // Preserve duplicate-key behavior.
 			want := map[solana.PublicKey]uint64{voter: 1 + 5 + 6 + 7 + 1}
-			require.Equal(t, want, loadStakeAccountTotals(r, 100, entries))
+			require.Equal(t, want, stakesOf(loadStakeAccountTotals(r, 100, entries)))
 			if !failBatch {
 				require.Equal(t, []solana.PublicKey{{2}, {5}}, r.gets)
 			} else {
@@ -97,7 +97,7 @@ func TestStakeRebuildPreservesIndividualReadResults(t *testing.T) {
 			// Rebuild after a rewind must reread the current account version,
 			// even with the same snapshot-era index entries.
 			r.accounts[solana.PublicKey{6}] = rebuildTestStake(t, solana.PublicKey{6}, solana.PublicKey{8}, 20)
-			require.Equal(t, map[solana.PublicKey]uint64{voter: 14, {8}: 20}, loadStakeAccountTotals(r, 90, entries))
+			require.Equal(t, map[solana.PublicKey]uint64{voter: 14, {8}: 20}, stakesOf(loadStakeAccountTotals(r, 90, entries)))
 		})
 	}
 }
@@ -115,7 +115,7 @@ func TestStakeRebuildBatchesAreBoundedAndKeepFileLocality(t *testing.T) {
 		entries = append(entries, accountsdb.StakeIndexEntry{Pubkey: key, FileId: fileID})
 		r.accounts[key] = rebuildTestStake(t, key, solana.PublicKey{9}, 1)
 	}
-	require.Equal(t, map[solana.PublicKey]uint64{{9}: 4005}, loadStakeAccountTotals(r, 100, entries))
+	require.Equal(t, map[solana.PublicKey]uint64{{9}: 4005}, stakesOf(loadStakeAccountTotals(r, 100, entries)))
 	require.Len(t, r.batches, 4)
 	sort.Slice(r.batches, func(i, j int) bool {
 		return binary.LittleEndian.Uint32(r.batches[i][0][:]) < binary.LittleEndian.Uint32(r.batches[j][0][:])
@@ -125,7 +125,7 @@ func TestStakeRebuildBatchesAreBoundedAndKeepFileLocality(t *testing.T) {
 	}
 	require.Empty(t, r.gets)
 	r.batches = nil
-	require.Empty(t, loadStakeAccountTotals(r, 100, nil))
+	require.Empty(t, stakesOf(loadStakeAccountTotals(r, 100, nil)))
 	require.Empty(t, r.batches)
 }
 
@@ -137,7 +137,7 @@ func TestStakeRebuildReadsStoredAccounts(t *testing.T) {
 	for _, entry := range entries {
 		db.CommonAcctsCache.Delete(entry.Pubkey)
 	}
-	require.Equal(t, map[solana.PublicKey]uint64{voter: 700, {8}: 300}, loadStakeAccountTotals(db, 100, entries))
+	require.Equal(t, map[solana.PublicKey]uint64{voter: 700, {8}: 300}, stakesOf(loadStakeAccountTotals(db, 100, entries)))
 }
 
 // Both ranges must overlap, while each range has only one batch outstanding.
@@ -179,7 +179,7 @@ func TestStakeRebuildOverlapsTwoBoundedRanges(t *testing.T) {
 					want += uint64(i + 1)
 				}
 				done := make(chan map[solana.PublicKey]uint64, 1)
-				go func() { done <- loadStakeAccountTotals(r, 100, entries) }()
+				go func() { done <- stakesOf(loadStakeAccountTotals(r, 100, entries)) }()
 				for i := 0; i < 2; i++ {
 					select {
 					case <-r.started:
@@ -205,4 +205,12 @@ func TestStakeRebuildOverlapsTwoBoundedRanges(t *testing.T) {
 			})
 		}
 	}
+}
+
+func stakesOf(totals map[solana.PublicKey]voteDelegation) map[solana.PublicKey]uint64 {
+	out := make(map[solana.PublicKey]uint64, len(totals))
+	for voter, d := range totals {
+		out[voter] = d.stake
+	}
+	return out
 }

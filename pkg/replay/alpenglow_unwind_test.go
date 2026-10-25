@@ -39,10 +39,14 @@ func testUnwindBankSysvars(t *testing.T, slot uint64, epochRewardsMarker uint64)
 // (configureInitialBlockFromResume or the ReplayBlocks seed path), (3) restore
 // it on the in-loop unwind, and (4) bump the count below.
 func TestResumeContextFieldTripwire(t *testing.T) {
-	// TransactionStatusCheckpoint is the one durability-only field: startup and
+	// TransactionStatusCheckpoint is a durability-only field: startup and
 	// rewind consume it before ResumeState is built. It intentionally does not
 	// enter bank execution state, but remains part of this conscious field count.
-	const wired = 24 // 23 execution fields + 1 durability-only checkpoint ref
+	// DelegatedStake is mapped into ResumeState and seeds the first replay's
+	// initial-block stake setup (startStartupStakeScan). Only fold contexts carry
+	// it; the in-loop unwind's retained contexts never do, so that path rescans
+	// durable state as mainline always did, and the fold tracker keeps running.
+	const wired = 25 // 23 execution fields + checkpoint ref + delegated stake totals
 	if n := reflect.TypeOf(state.ResumeContext{}).NumField(); n != wired {
 		t.Fatalf("state.ResumeContext has %d fields but %d are wired through the resume/unwind restoration path — wire the new field(s) end-to-end, then update this count", n, wired)
 	}
@@ -99,6 +103,7 @@ func TestResumeStateFromRootedContextRoundTrip(t *testing.T) {
 		InflationFoundation:        0.05,
 		InflationFoundationTerm:    7,
 		TransactionCount:           &txc,
+		DelegatedStake:             encodeDelegatedStake(map[solana.PublicKey]voteDelegation{{7}: {stake: 70, accounts: 2}}),
 	}
 
 	rs, err := ResumeStateFromRootedContext(rc, map[uint64]string{2: "c3Rha2Vz"})
@@ -134,6 +139,7 @@ func TestResumeStateFromRootedContextRoundTrip(t *testing.T) {
 	assert.Equal(t, float64(7), rs.InflationFoundationTerm)
 	require.NotNil(t, rs.TransactionCount)
 	assert.Equal(t, uint64(123456), *rs.TransactionCount)
+	assert.Equal(t, map[solana.PublicKey]voteDelegation{{7}: {stake: 70, accounts: 2}}, rs.DelegatedStake)
 	assert.Equal(t, []byte("c3Rha2Vz"), rs.ComputedEpochStakes[2])
 }
 

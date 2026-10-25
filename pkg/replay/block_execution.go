@@ -725,6 +725,7 @@ func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
 	if tail != nil {
 		// Rooted-durable: buffer this slot's writes + bankhash in the RAM overlay
 		// (always, even when empty, so the bankhash is recorded); no durable write.
+		recordSlotStakeChange(tail, slotCtx, modifiedAccts)
 		tail.Add(slotCtx.Slot, modifiedAccts, persistedBankhash)
 		afterStoreAccounts()
 	} else if len(modifiedAccts) > 0 {

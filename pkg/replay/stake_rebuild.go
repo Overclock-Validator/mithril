@@ -6,7 +6,6 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
-	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -17,9 +16,10 @@ type stakeAccountReader interface {
 
 const stakeRebuildBatchSize = 2000
 
-// loadStakeAccountTotals reads the current database view during startup cache
-// initialization. Index entries provide keys and locality hints, never cached stake data.
-func loadStakeAccountTotals(db stakeAccountReader, slot uint64, entries []accountsdb.StakeIndexEntry) map[solana.PublicKey]uint64 {
+// loadStakeAccountTotals sums delegated stake and delegating accounts per vote
+// account from the current database view. Index entries provide keys and
+// locality hints, never cached stake data.
+func loadStakeAccountTotals(db stakeAccountReader, slot uint64, entries []accountsdb.StakeIndexEntry) map[solana.PublicKey]voteDelegation {
 	if len(entries) <= 2*stakeRebuildBatchSize {
 		return loadStakeAccountRange(db, slot, entries)
 	}
@@ -33,7 +33,7 @@ func loadStakeAccountTotals(db stakeAccountReader, slot uint64, entries []accoun
 	if boundary < len(entries) && entries[boundary].FileId != entries[boundary-1].FileId {
 		mid = boundary
 	}
-	var left map[solana.PublicKey]uint64
+	var left map[solana.PublicKey]voteDelegation
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -42,15 +42,18 @@ func loadStakeAccountTotals(db stakeAccountReader, slot uint64, entries []accoun
 	}()
 	right := loadStakeAccountRange(db, slot, entries[mid:])
 	wg.Wait()
-	for voter, stake := range right {
-		left[voter] += stake
+	for voter, d := range right {
+		l := left[voter]
+		l.stake += d.stake
+		l.accounts += d.accounts
+		left[voter] = l
 	}
 	return left
 }
 
-func loadStakeAccountRange(db stakeAccountReader, slot uint64, entries []accountsdb.StakeIndexEntry) map[solana.PublicKey]uint64 {
+func loadStakeAccountRange(db stakeAccountReader, slot uint64, entries []accountsdb.StakeIndexEntry) map[solana.PublicKey]voteDelegation {
 	const maxBatchSize = stakeRebuildBatchSize
-	totals := make(map[solana.PublicKey]uint64)
+	totals := make(map[solana.PublicKey]voteDelegation)
 	keys := make([]solana.PublicKey, 0, maxBatchSize)
 	for start := 0; start < len(entries); {
 		end := start + 1
@@ -79,12 +82,12 @@ func loadStakeAccountRange(db stakeAccountReader, slot uint64, entries []account
 					continue
 				}
 			}
-			stake, err := sealevel.UnmarshalStakeState(acct.Data)
-			if err != nil || stake.Status != sealevel.StakeStateV2StatusStake {
-				continue
+			if voter, lamports, ok := scannedDelegation(acct); ok {
+				d := totals[voter]
+				d.stake += lamports
+				d.accounts++
+				totals[voter] = d
 			}
-			delegation := stake.Stake.Stake.Delegation
-			totals[delegation.VoterPubkey] += delegation.StakeLamports
 		}
 		start = end
 	}
