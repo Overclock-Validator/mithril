@@ -359,7 +359,7 @@ func resolveBatchAccountLocations(
 		pks,
 		cold,
 		out,
-		batchIndexIteratorWorkers(len(cold)),
+		limitBatchWorkers(ctx, batchIndexIteratorWorkers(len(cold))),
 	)
 }
 
@@ -529,11 +529,27 @@ func missingAccount(pubkey solana.PublicKey) *accounts.Account {
 // goroutines. The first error stops new work and is returned after active jobs
 // drain. This bounds both goroutine count and scheduler traffic independently
 // of block size.
+type batchWorkerLimitKey struct{}
+
+// WithBatchWorkerLimit caps the goroutines each batch read made with ctx may
+// run at once, so a background reader (account prefetch) cannot crowd out the
+// transaction loop. A limit of zero or less leaves the defaults.
+func WithBatchWorkerLimit(ctx context.Context, n int) context.Context {
+	return context.WithValue(ctx, batchWorkerLimitKey{}, n)
+}
+
+func limitBatchWorkers(ctx context.Context, workers int) int {
+	if n, ok := ctx.Value(batchWorkerLimitKey{}).(int); ok && n > 0 {
+		return min(workers, n)
+	}
+	return workers
+}
+
 func runBatchWorkers(ctx context.Context, count int, work func(int) error) error {
 	if count == 0 {
 		return nil
 	}
-	workerCount := min(count, max(1, runtime.GOMAXPROCS(0)*2))
+	workerCount := limitBatchWorkers(ctx, min(count, max(1, runtime.GOMAXPROCS(0)*2)))
 	var next atomic.Uint64
 	var stopped atomic.Bool
 	var firstErr error

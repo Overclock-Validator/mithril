@@ -668,3 +668,24 @@ func legacyAccountsBatchForBenchmark(ctx context.Context, db *AccountsDb, slot u
 	wg.Wait()
 	return out, firstErr
 }
+
+func TestBatchWorkerLimitCapsConcurrency(t *testing.T) {
+	var running, peak atomic.Int32
+	work := func(int) error {
+		n := running.Add(1)
+		for {
+			p := peak.Load()
+			if n <= p || peak.CompareAndSwap(p, n) {
+				break
+			}
+		}
+		time.Sleep(time.Millisecond)
+		running.Add(-1)
+		return nil
+	}
+	require.NoError(t, runBatchWorkers(WithBatchWorkerLimit(context.Background(), 2), 64, work))
+	assert.LessOrEqual(t, peak.Load(), int32(2))
+	assert.Equal(t, 2, limitBatchWorkers(WithBatchWorkerLimit(context.Background(), 2), 8))
+	assert.Equal(t, 8, limitBatchWorkers(WithBatchWorkerLimit(context.Background(), 0), 8), "zero leaves the default")
+	assert.Equal(t, 8, limitBatchWorkers(context.Background(), 8))
+}

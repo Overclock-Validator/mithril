@@ -2658,6 +2658,19 @@ func ReplayBlocks(
 	if len(opts.RepairPeerSeeds) > 0 {
 		mlog.Log.Infof("repair: seeding %d peers remembered from the previous run", len(opts.RepairPeerSeeds))
 	}
+	var prefetcher *accountPrefetcher
+	if accountPrefetchEnabled {
+		var src blockAccountSource = acctsDb
+		if unrootedTailState != nil {
+			src = unrootedTailState
+		}
+		prefetcher = newAccountPrefetcher(src, accountPrefetchAhead, accountPrefetchWorkers)
+		prefetcher.db, prefetcher.tipWarm = acctsDb, tipWarmEnabled
+		defer prefetcher.Close()
+		defer prefetcher.installRefsHook()()
+		blockStream.SetReplayEmitHook(prefetcher.Offer)
+		mlog.Log.Infof("account prefetch: on, %d slot ahead of replay, %d storage workers, programs preloaded, tip warming %t", prefetcher.ahead, prefetcher.workers, prefetcher.tipWarm)
+	}
 
 	if !isLive {
 		blockStream.DownloadInitialBlocks()
@@ -2813,7 +2826,12 @@ func ReplayBlocks(
 	// parent's replay, or the loop itself.
 	var frontierMark streamingFrontierMark
 	if blockStream.StreamEvents() != nil {
+		var onStreamOpen func(uint64)
+		if prefetcher != nil {
+			onStreamOpen = prefetcher.Started
+		}
 		streamer = newStreamingExecutor(streamingDeps{
+			onOpen:              onStreamOpen,
 			acctsDb:             acctsDb,
 			feed:                blockStream,
 			epochSchedule:       epochSchedule,
@@ -3232,6 +3250,9 @@ func ReplayBlocks(
 		// Notify block source we're starting execution - in near-tip mode this
 		// triggers fetching N+1 so RPC latency overlaps with execution time
 		blockStream.NotifyBlockStart(block.Slot)
+		if prefetcher != nil {
+			prefetcher.Started(block.Slot)
+		}
 
 		currentSlot = block.Slot
 		block.Epoch = epochSchedule.GetEpoch(currentSlot)
@@ -3390,6 +3411,9 @@ func ReplayBlocks(
 		}
 
 		block.Features = replayCtx.CurrentFeatures
+		if prefetcher != nil {
+			prefetcher.SetFeatures(block.Features)
+		}
 
 		// post-epoch boundary rewards distribution
 		if partitionedEpochRewardsEnabled && partitionedRewardsInfo != nil && currentSlot >= partitionedRewardsInfo.FirstStakingRewardSlot && partitionedRewardsInfo.NumRewardPartitionsRemaining > 0 {

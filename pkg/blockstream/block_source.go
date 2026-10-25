@@ -299,6 +299,10 @@ type BlockSource struct {
 	startedAt           time.Time
 	lastGoodRepairPeers atomic.Pointer[[]gossip.RepairPeer]
 
+	// replayEmitHook, when set, sees every block just before it is queued
+	// for replay, while the block source still owns it (SetReplayEmitHook).
+	replayEmitHook atomic.Pointer[func(*b.Block)]
+
 	rpcClients []*rpcclient.RpcClient // All RPC clients for block fetching (index 0 = primary)
 	streamChan chan *b.Block
 	// replayEmissionWg covers the unlocked channel-send window. Add happens
@@ -2691,7 +2695,18 @@ func (bs *BlockSource) worker(wg *sync.WaitGroup, id int) {
 	}
 }
 
+// SetReplayEmitHook installs fn to be called with each block just before it is
+// queued for replay. fn runs on the emitting goroutine before replay can see
+// the block, so it may read the block but must not keep references into it
+// or block for long. Install it before Start.
+func (bs *BlockSource) SetReplayEmitHook(fn func(*b.Block)) {
+	bs.replayEmitHook.Store(&fn)
+}
+
 func (bs *BlockSource) emitReplayBlock(blk *b.Block) bool {
+	if hook := bs.replayEmitHook.Load(); hook != nil && blk != nil {
+		(*hook)(blk)
+	}
 	select {
 	case bs.streamChan <- blk:
 		return true

@@ -1383,6 +1383,78 @@ func executeProgramFromSource(execCtx *ExecutionCtx, programAddr solana.PublicKe
 	return executeLoadedProgram(execCtx, program, syscallRegistry)
 }
 
+// PreloadProgram loads, verifies and caches the executable for a program's
+// source under cacheKey (the programdata address for upgradeable programs, the
+// program address otherwise) unless the cache already holds an entry for that
+// key, and reports whether it loaded one. Replay's
+// account prefetch calls it outside any transaction for programs a queued
+// block will invoke. Execution still validates the bank-visible loader
+// metadata and matches the cached entry against the exact source and feature
+// set on every use, so a preload from state a later transaction upgrades, or
+// from an abandoned fork, is only a cache miss. source must be immutable: a
+// shared parent account's data that no one mutates.
+func PreloadProgram(db *accountsdb.AccountsDb, cacheKey solana.PublicKey, source []byte, f *features.Features) bool {
+	if db == nil || f == nil {
+		return false
+	}
+	// Any cached entry is left alone: checking it against source would mean
+	// comparing the whole program on every queued block. Execution matches
+	// the entry before use and reloads one that went stale, as without
+	// preloading; only a program upgraded since it was cached misses out.
+	if _, ok := db.MaybeGetProgramFromCache(cacheKey); ok {
+		return false
+	}
+	syscallRegistry := sbpf.SyscallRegistry(func(u uint32) (sbpf.Syscall, bool) {
+		return Syscalls(f, false, u)
+	})
+	l, err := loader.NewLoaderWithSyscalls(source, syscallRegistry, false, f)
+	if err != nil {
+		return false
+	}
+	program, err := l.Load()
+	if err != nil || program.Verify() != nil {
+		return false
+	}
+	entry := &accountsdb.ProgramCacheEntry{Program: program}
+	entry.BindSource(source, f)
+	db.AddProgramToCache(cacheKey, entry)
+	return true
+}
+
+// PreloadSource returns the cache key and executable source a program account
+// names, as BpfLoaderProgramExecute would resolve them for slot: the
+// programdata account for upgradeable programs (via readProgramData), the
+// program account itself for the v2 and deprecated loaders. ok is false for
+// anything else, including programdata deployed at or after slot.
+func PreloadSource(programKey solana.PublicKey, program *accounts.Account, slot uint64, readProgramData func(solana.PublicKey) *accounts.Account) (cacheKey solana.PublicKey, source []byte, ok bool) {
+	if program == nil || program.Lamports == 0 || !program.Executable {
+		return solana.PublicKey{}, nil, false
+	}
+	switch solana.PublicKeyFromBytes(program.Owner[:]) {
+	case a.BpfLoader2Addr, a.BpfLoaderDeprecatedAddr:
+		if len(program.Data) == 0 {
+			return solana.PublicKey{}, nil, false
+		}
+		return programKey, program.Data, true
+	case a.BpfLoaderUpgradeableAddr:
+		state, err := UnmarshalUpgradeableLoaderState(program.Data)
+		if err != nil || state.Type != UpgradeableLoaderStateTypeProgram {
+			return solana.PublicKey{}, nil, false
+		}
+		dataKey := state.Program.ProgramDataAddress
+		programData := readProgramData(dataKey)
+		if programData == nil || len(programData.Data) < upgradeableLoaderSizeOfProgramDataMetaData {
+			return solana.PublicKey{}, nil, false
+		}
+		dataState, err := UnmarshalUpgradeableLoaderState(programData.Data)
+		if err != nil || dataState.Type != UpgradeableLoaderStateTypeProgramData || dataState.ProgramData.Slot >= slot {
+			return solana.PublicKey{}, nil, false
+		}
+		return dataKey, programData.Data[upgradeableLoaderSizeOfProgramDataMetaData:], true
+	}
+	return solana.PublicKey{}, nil, false
+}
+
 // All loader cache insertions must pass through this helper. A speculative
 // stream records replacements for eviction on discard; the previous program is
 // then reloaded from authoritative account data, never retained from that stream.
