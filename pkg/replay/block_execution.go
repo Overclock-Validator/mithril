@@ -528,38 +528,46 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 
 	metrics.GlobalBlockReplay.DependencyPlannerPrepared = 1
 	txErrors := make([]error, len(txs))
-	do := make(chan int, len(txs))
-	done := make(chan int, len(txs))
-	plannerDone := make(chan struct{})
-	go func() {
-		defer close(plannerDone)
-		plannerDispatchStart := time.Now()
-		dispatchDependencyPlan(plan, do, done)
-		metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTimingSince(plannerDispatchStart)
-	}()
-
-	wg := &sync.WaitGroup{}
-	wg.Add(workers)
-	for i := 0; i < workers; i++ {
-		go func(workerIdx int) {
-			defer wg.Done()
-			var workerArena *arena.Arena[sealevel.BorrowedAccount]
-			if workerIdx < len(sealevel.BorrowedAccountArenas) {
-				workerArena = sealevel.BorrowedAccountArenas[workerIdx]
-			}
-			for idx := range do {
-				if !execute[idx] {
-					done <- idx
-					continue
-				}
-				feeInfos[idx], computeUnits[idx], txErrors[idx] = ProcessTransaction(slotCtx, &exec.sigverifyWg, txs[idx], nil, dbgOpts, workerArena, shouldVerifySignatures)
-				done <- idx
-			}
-		}(i)
+	processTx := func(workerIdx, idx int) {
+		if !execute[idx] {
+			return
+		}
+		var workerArena *arena.Arena[sealevel.BorrowedAccount]
+		if workerIdx < len(sealevel.BorrowedAccountArenas) {
+			workerArena = sealevel.BorrowedAccountArenas[workerIdx]
+		}
+		feeInfos[idx], computeUnits[idx], txErrors[idx] = ProcessTransaction(slotCtx, &exec.sigverifyWg, txs[idx], nil, dbgOpts, workerArena, shouldVerifySignatures)
 	}
-	wg.Wait()
-	close(done)
-	<-plannerDone
+	if directDispatch {
+		plannerDispatchStart := time.Now()
+		runDependencyPlan(plan, workers, scheduleFor(txs), processTx)
+		metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTimingSince(plannerDispatchStart)
+	} else {
+		do := make(chan int, len(txs))
+		done := make(chan int, len(txs))
+		plannerDone := make(chan struct{})
+		go func() {
+			defer close(plannerDone)
+			plannerDispatchStart := time.Now()
+			dispatchDependencyPlan(plan, do, done)
+			metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTimingSince(plannerDispatchStart)
+		}()
+
+		wg := &sync.WaitGroup{}
+		wg.Add(workers)
+		for i := 0; i < workers; i++ {
+			go func(workerIdx int) {
+				defer wg.Done()
+				for idx := range do {
+					processTx(workerIdx, idx)
+					done <- idx
+				}
+			}(i)
+		}
+		wg.Wait()
+		close(done)
+		<-plannerDone
+	}
 	for idx := range txs {
 		if execute[idx] && feeInfos[idx] == nil {
 			return nil, nil, unprocessableTransactionError(base+idx, txErrors[idx])

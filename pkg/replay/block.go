@@ -4531,52 +4531,60 @@ func parallelTxLoop(
 	if plannerAvailable {
 		metrics.GlobalBlockReplay.DependencyPlannerPrepared = 1
 		metrics.GlobalBlockReplay.DependencyPlannerBuild.AddTiming(plannerBuildDuration)
-		do := make(chan int, len(block.Transactions))
-		done := make(chan int, len(block.Transactions))
-		plannerDone := make(chan struct{})
-		go func() {
-			defer close(plannerDone)
-			plannerDispatchStart := time.Now()
-			dispatchDependencyPlan(dependencyPlan, do, done)
-			metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTimingSince(plannerDispatchStart)
-		}()
-
-		wg := &sync.WaitGroup{}
-		wg.Add(txParallelism)
-		for i := range txParallelism {
-			go func() {
-				defer wg.Done()
-				for idx := range do {
-					if !executionPlan.execute[idx] {
-						done <- idx
-						continue
-					}
-					tx := block.Transactions[idx]
-					var txMeta *rpc.TransactionMeta
-					if idx < len(block.TxMetas) {
-						txMeta = block.TxMetas[idx]
-					}
-					txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = ProcessTransaction(slotCtx, sigverifyWg, block.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[i], shouldVerifySignatures)
-					txErr := errs[idx]
-					// check for success-failure return value divergences
-					if txMeta != nil && txErr == nil && txMeta.Err != nil {
-						mlog.Log.Errorf("[run:%s] DIVERGENCE in slot %d: tx %s succeeded locally but failed onchain: %+v",
-							CurrentRunID, block.Slot, tx.Signatures[0], txMeta.Err)
-						panic(fmt.Sprintf("tx %s return value divergence: txErr was nil, but onchain err was %+v", tx.Signatures[0], txMeta.Err))
-					} else if txMeta != nil && txErr != nil && txMeta.Err == nil {
-						mlog.Log.Errorf("[run:%s] DIVERGENCE in slot %d: tx %s failed locally (%v) but succeeded onchain",
-							CurrentRunID, block.Slot, tx.Signatures[0], txErr)
-						panic(fmt.Sprintf("tx %s return value divergence: txErr was %+v (%s), but onchain err was nil", tx.Signatures[0], txErr, txErr))
-					}
-					done <- idx
-				}
-
-			}()
+		processTx := func(worker, idx int) {
+			if !executionPlan.execute[idx] {
+				return
+			}
+			tx := block.Transactions[idx]
+			var txMeta *rpc.TransactionMeta
+			if idx < len(block.TxMetas) {
+				txMeta = block.TxMetas[idx]
+			}
+			txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = ProcessTransaction(slotCtx, sigverifyWg, block.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[worker], shouldVerifySignatures)
+			txErr := errs[idx]
+			// check for success-failure return value divergences
+			if txMeta != nil && txErr == nil && txMeta.Err != nil {
+				mlog.Log.Errorf("[run:%s] DIVERGENCE in slot %d: tx %s succeeded locally but failed onchain: %+v",
+					CurrentRunID, block.Slot, tx.Signatures[0], txMeta.Err)
+				panic(fmt.Sprintf("tx %s return value divergence: txErr was nil, but onchain err was %+v", tx.Signatures[0], txMeta.Err))
+			} else if txMeta != nil && txErr != nil && txMeta.Err == nil {
+				mlog.Log.Errorf("[run:%s] DIVERGENCE in slot %d: tx %s failed locally (%v) but succeeded onchain",
+					CurrentRunID, block.Slot, tx.Signatures[0], txErr)
+				panic(fmt.Sprintf("tx %s return value divergence: txErr was %+v (%s), but onchain err was nil", tx.Signatures[0], txErr, txErr))
+			}
 		}
 
-		wg.Wait()
-		close(done)
-		<-plannerDone
+		if directDispatch {
+			plannerDispatchStart := time.Now()
+			runDependencyPlan(dependencyPlan, txParallelism, scheduleFor(block.Transactions), processTx)
+			metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTimingSince(plannerDispatchStart)
+		} else {
+			do := make(chan int, len(block.Transactions))
+			done := make(chan int, len(block.Transactions))
+			plannerDone := make(chan struct{})
+			go func() {
+				defer close(plannerDone)
+				plannerDispatchStart := time.Now()
+				dispatchDependencyPlan(dependencyPlan, do, done)
+				metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTimingSince(plannerDispatchStart)
+			}()
+
+			wg := &sync.WaitGroup{}
+			wg.Add(txParallelism)
+			for i := range txParallelism {
+				go func() {
+					defer wg.Done()
+					for idx := range do {
+						processTx(i, idx)
+						done <- idx
+					}
+				}()
+			}
+
+			wg.Wait()
+			close(done)
+			<-plannerDone
+		}
 	} else if block.FromLiveStream {
 		metrics.GlobalBlockReplay.DependencyPlannerFallback = 1
 		// Include any unsuccessful prepared-planner attempt in the total planner
