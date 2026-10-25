@@ -11,21 +11,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestAlpenglowModeForCluster(t *testing.T) {
-	alpenglow, err := alpenglowModeForCluster("alpenglow")
-	require.NoError(t, err)
-	require.True(t, alpenglow)
-
-	for _, cluster := range []string{"mainnet-beta", "testnet", "devnet"} {
-		classic, err := alpenglowModeForCluster(cluster)
-		require.NoError(t, err)
-		require.False(t, classic, cluster)
-	}
-
-	_, err = alpenglowModeForCluster("localnet")
-	require.Error(t, err)
-}
-
 func TestResolveTurbineShredVersion(t *testing.T) {
 	called := false
 	query := func(addr *net.UDPAddr, timeout time.Duration) (gossip.EchoResponse, error) {
@@ -58,11 +43,6 @@ func TestResolveTurbineShredVersionReportsDiscoveryErrors(t *testing.T) {
 	require.ErrorIs(t, err, want)
 }
 
-func TestDefaultBlockSourceForProtocolMode(t *testing.T) {
-	require.Equal(t, "turbine", defaultBlockSourceForMode(true))
-	require.Equal(t, "rpc", defaultBlockSourceForMode(false))
-}
-
 func TestValidatorModeUsesLocalFooterBankHashInsteadOfRPCVerifier(t *testing.T) {
 	cfg := replay.TrailingVerifierDefaults()
 	got := verifierConfigForConsensusMode("validator", cfg)
@@ -77,6 +57,6 @@ func TestTxParallelismForMode(t *testing.T) {
 	require.Equal(t, int64(32), txParallelismForMode("validator", 0, false, 16))
 	require.Equal(t, int64(0), txParallelismForMode("validator", 0, true, 16), "explicit sequential validator mode must be preserved")
 	require.Equal(t, int64(7), txParallelismForMode("validator", 7, true, 16))
-	require.Equal(t, int64(0), txParallelismForMode("verifying", 0, false, 16), "non-Alpenglow verifying flow must remain unchanged")
+	require.Equal(t, int64(0), txParallelismForMode("verifying", 0, false, 16), "verifying flow must remain unchanged")
 	require.Equal(t, int64(2), txParallelismForMode("validator", 0, false, 0), "invalid CPU discovery gets a safe minimum")
 }

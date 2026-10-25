@@ -766,9 +766,9 @@ func menuOptionsFor(section, key string) []editOption {
 	switch section + "." + key {
 	case "network.cluster":
 		return []editOption{
-			{label: "mainnet-beta", value: "mainnet-beta"},
-			{label: "testnet", value: "testnet"},
-			{label: "devnet", value: "devnet"},
+			{label: "mainnet", value: "mainnet", desc: "Alpenglow"},
+			{label: "testnet", value: "testnet", desc: "Alpenglow"},
+			{label: "devnet", value: "devnet", desc: "Alpenglow"},
 		}
 	case "block.source":
 		return []editOption{

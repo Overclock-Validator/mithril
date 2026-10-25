@@ -115,9 +115,9 @@ type editModel struct {
 }
 
 func newEditModel(cf string, v *viper.Viper) editModel {
-	cluster := v.GetString("network.cluster")
+	cluster := config.CanonicalClusterName(v.GetString("network.cluster"))
 	if cluster == "" {
-		cluster = "alpenglow"
+		cluster = config.DefaultCluster
 	}
 	rpcSlice := v.GetStringSlice("network.rpc")
 	rpcEndpoint := ""
@@ -274,21 +274,15 @@ func (m editModel) currentItems() []edItem {
 			{label: "Save & exit", value: "save"},
 		}
 	case edScrCluster:
-		if m.v.GetString("consensus.mode") == "validator" {
-			return []edItem{
-				{label: "alpenglow", value: "alpenglow", desc: "Required for validator and block-production mode"},
-				{isSep: true},
-				{label: "← Back", value: "_back"},
-			}
+		// Every cluster runs Alpenglow; the choice only names the chain.
+		var items []edItem
+		for _, c := range config.BuiltinClusters() {
+			items = append(items, edItem{label: c.Name, value: c.Name, desc: "Alpenglow, genesis " + c.GenesisHash[:8] + "…"})
 		}
-		return []edItem{
-			{label: "alpenglow", value: "alpenglow", desc: "Certificate fork choice and speculative replay"},
-			{label: "mainnet-beta", value: "mainnet-beta", desc: "Classic verifying-only RPC replay"},
-			{label: "testnet", value: "testnet", desc: "Classic verifying-only RPC replay"},
-			{label: "devnet", value: "devnet", desc: "Classic verifying-only RPC replay"},
-			{isSep: true},
-			{label: "← Back", value: "_back"},
+		if !isBuiltinCluster(m.cluster) {
+			items = append([]edItem{{label: m.cluster, value: m.cluster, desc: "Custom cluster (network.genesis_hash from config)"}}, items...)
 		}
+		return append(items, edItem{isSep: true}, edItem{label: "← Back", value: "_back"})
 	case edScrLightbringer:
 		items := []edItem{
 			{label: "Disable", value: "disable", desc: "Use RPC only"},
@@ -636,6 +630,10 @@ func (m *editModel) saveConfig() {
 
 	content := string(data)
 	content = setTomlValue(content, "network", "cluster", fmt.Sprintf("%q", m.cluster))
+	if isBuiltinCluster(m.cluster) && m.v.GetString("network.genesis_hash") != "" {
+		// A custom cluster's genesis would make a built-in cluster refuse to start.
+		content = setTomlValue(content, "network", "genesis_hash", `""`)
+	}
 	// Preserve failover RPC endpoints — update first, keep rest
 	rpcArray := m.rpcFull
 	if len(rpcArray) > 0 {
@@ -685,11 +683,7 @@ func (m *editModel) saveConfig() {
 		// Only force a source change if no external lightbringer_endpoint is
 		// configured. External LB mode (enabled=false + endpoint set) is valid.
 		if m.v.GetString("block.lightbringer_endpoint") == "" {
-			source := "rpc"
-			if m.cluster == "alpenglow" {
-				source = "turbine"
-			}
-			content = setTomlValue(content, "block", "source", fmt.Sprintf("%q", source))
+			content = setTomlValue(content, "block", "source", `"turbine"`)
 		}
 		if strings.Contains(content, "[lightbringer]") {
 			content = setTomlValue(content, "lightbringer", "enabled", "false")
@@ -981,4 +975,9 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return s[:max-3] + "..."
+}
+
+func isBuiltinCluster(name string) bool {
+	c, err := config.ResolveCluster(name, "")
+	return err == nil && !c.Custom
 }

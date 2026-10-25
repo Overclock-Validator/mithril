@@ -17,12 +17,16 @@ While Mithril is already functional and runs reliably for many use cases, it is 
 
 The `run` command starts Mithril as a live full node - it bootstraps from a Solana snapshot and continuously verifies new blocks as they are produced.
 
-This branch supports two protocol paths. `network.cluster = "alpenglow"` (the default) uses native turbine, certificate-driven fork choice, speculative replay, and rooted-durable storage. `mainnet-beta`, `testnet`, and `devnet` retain Mithril's established verifying-only RPC replay and per-slot AccountsDB persistence. Validator/block-production mode is deliberately available only on Alpenglow; the classic clusters remain verifying nodes.
+Every cluster runs Alpenglow: native turbine, certificate-driven fork choice, speculative replay, and rooted-durable storage. `network.cluster` names the chain: `mainnet` (the default; `mainnet-beta` is accepted as an alias), `testnet`, or `devnet`. Each built-in cluster carries its genesis hash and public gossip entrypoint, and startup refuses an RPC endpoint whose genesis belongs to another cluster.
+
+A custom (private) cluster uses any other name and must supply `network.genesis_hash`, `network.rpc`, and `turbine.gossip_entrypoint` itself; the shred version is discovered from the entrypoint unless `turbine.shred_version` is set. State files and ledger artifacts are bound to the genesis hash, so a node never mixes state across clusters.
 
 Mithril in its `alpenglow-dev` branch can be run via a command of the following form:
 ```
-./mithril run   --bootstrap new-snapshot   --cluster alpenglow   --accounts-path /mnt/mithril-ag-accounts   --ledger-path /mnt/mithril-ag-ledger   --block-source turbine   --turbine-bind-addr 0.0.0.0:8025   --turbine-gossip-entrypoint 74.50.90.234:9000   --turbine-gossip-bind-addr 0.0.0.0:8020   --turbine-advertised-ip X.Y.X.Y  --consensus-mode validator   --alpenglow-observer-bind-addr 0.0.0.0:8010   --tpu-quic-bind-addr 0.0.0.0:8011   --validator-advertised-ip X.Y.X.Y   --identity-keypair ./validator-keypair.json   --vote-account-keypair ./vote-account-keypair.json   --rpc https://rpc.ag.validator1.net
+./mithril run   --bootstrap new-snapshot   --cluster mainnet   --accounts-path /mnt/mithril-accounts   --ledger-path /mnt/mithril-ledger   --block-source turbine   --turbine-bind-addr 0.0.0.0:8025   --turbine-gossip-bind-addr 0.0.0.0:8020   --turbine-advertised-ip X.Y.X.Y  --consensus-mode validator   --alpenglow-observer-bind-addr 0.0.0.0:8010   --tpu-quic-bind-addr 0.0.0.0:8011   --validator-advertised-ip X.Y.X.Y   --identity-keypair ./validator-keypair.json   --vote-account-keypair ./vote-account-keypair.json   --rpc https://your-rpc.example.com
 ```
+
+For a custom cluster add `--cluster <name> --genesis-hash <base58 genesis> --turbine-gossip-entrypoint <host:port>`.
 
 ### Nix (NixOS / nix-darwin / Home Manager)
 

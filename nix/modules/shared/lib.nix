@@ -36,6 +36,7 @@
       };
       network = {
         cluster = cfg.configSchema.networkCluster;
+        genesis_hash = cfg.configSchema.networkGenesisHash;
         rpc = cfg.configSchema.networkRpc;
       };
       block = {
