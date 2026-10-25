@@ -23,7 +23,6 @@ func newFoldTestDb(t testing.TB) (*AccountsDb, string) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "bootstrap_high_file_id"), make([]byte, 8), 0o644))
 	db, err := OpenDb(dir)
 	require.NoError(t, err)
-	db.RootedDurable = true // production storage mode (node.go forces it on)
 	db.InitCaches()
 	return db, dir
 }
@@ -33,7 +32,6 @@ func reopenFoldTestDb(t *testing.T, db *AccountsDb, dir string) *AccountsDb {
 	db.CloseDb()
 	re, err := OpenDb(dir)
 	require.NoError(t, err)
-	re.RootedDurable = true
 	re.InitCaches()
 	return re
 }

@@ -30,9 +30,7 @@ func TestDistributeVotingRewardsBuildsOnStagedAccount(t *testing.T) {
 		Owner:     a.VoteProgramAddr,
 		RentEpoch: 0,
 	}
-	stored := make(chan struct{})
-	require.NoError(t, db.StoreAccounts([]*accounts.Account{parent}, 10, func() { close(stored) }))
-	<-stored
+	seedDurableAccounts(t, db, []*accounts.Account{parent}, 10)
 
 	const vatDebit = uint64(800_000_000)
 	const votingReward = uint64(123_456_789)
@@ -43,10 +41,8 @@ func TestDistributeVotingRewardsBuildsOnStagedAccount(t *testing.T) {
 	reward.Store(votingReward)
 	validatorRewards := map[solana.PublicKey]*atomic.Uint64{votePubkey: reward}
 
-	// Production Alpenglow replay is rooted-durable, so StoreAccounts is a
-	// no-op until the slot folds. The staged loader is therefore the only
-	// source of the same-bank VAT debit.
-	db.RootedDurable = true
+	// AccountsDB changes only when the slot folds, so the staged loader is the
+	// only source of the same-bank VAT debit.
 	updated, immediateParents, distributed := DistributeVotingRewards(
 		db, validatorRewards, 11,
 		func(pubkey solana.PublicKey) (*accounts.Account, error) {
