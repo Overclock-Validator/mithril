@@ -34,9 +34,8 @@ import (
 // the check cannot alias across files.
 //
 // Concurrency: runs under foldMu, so it is serialized against CommitBatch,
-// recovery, and rewind. It requires rooted-durable mode because the legacy
-// direct-store path writes the index without foldMu and would race the
-// liveness scan. Concurrent READERS are safe: the source file is unlinked only
+// recovery, and rewind, which are the only index writers. Concurrent READERS
+// are safe: the source file is unlinked only
 // after the moved index entries are durable, and a reader that loses the race
 // (fetched the old entry, then the file vanished) retries once with a fresh
 // index entry (getStoredAccount).
@@ -101,9 +100,6 @@ type compactCandidate struct {
 // CompactOnce runs one bounded compaction cycle and returns what it did.
 func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 	stats := CompactStats{}
-	if !db.RootedDurable {
-		return stats, fmt.Errorf("accountsdb: compaction requires rooted-durable mode (the direct store path writes the index outside foldMu)")
-	}
 	if cfg.RewindHorizonBatches == 0 {
 		cfg.RewindHorizonBatches = 1
 	}

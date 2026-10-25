@@ -31,7 +31,6 @@ func TestEpochRewardHTTPAfterDurableRewind(t *testing.T) {
 			require.NoError(t, os.WriteFile(filepath.Join(dir, "bootstrap_high_file_id"), make([]byte, 8), 0o644))
 			db, err := accountsdb.OpenDb(dir)
 			require.NoError(t, err)
-			db.RootedDurable = true
 			db.InitCaches()
 			t.Cleanup(db.CloseDb)
 			address := solana.PublicKey{91}

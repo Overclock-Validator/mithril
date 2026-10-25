@@ -61,7 +61,7 @@ func TestRewardDistributionUsesBankRentAndFeatureGate(t *testing.T) {
 			require.NoError(t, spool.Close())
 			info := &rewards.PartitionedRewardDistributionInfo{SpoolDir: spool.SpoolDir(), SpoolSlot: spool.Slot(), NumRewardPartitionsRemaining: 1}
 			ctx := &ReplayCtx{CurrentFeatures: f, Capitalization: 12345}
-			updated, _, _ := distributePartitionedEpochRewardsForSlot(&accountsdb.AccountsDb{RootedDurable: true}, parent, staged, ctx, info, 460944096, 100, 1067)
+			updated, _, _ := distributePartitionedEpochRewardsForSlot(&accountsdb.AccountsDb{}, parent, staged, ctx, info, 460944096, 100, 1067)
 			require.Len(t, updated, 2)
 			got, err := sealevel.UnmarshalStakeState(updated[0].Data)
 			require.NoError(t, err)

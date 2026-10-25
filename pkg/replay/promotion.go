@@ -112,9 +112,9 @@ func getAccountsBatchSharedWithStats(ctx context.Context, source blockAccountSou
 	return out, accountsdb.BatchReadStats{RequestedKeys: uint64(len(pks)), DurableKeys: uint64(len(pks))}, err
 }
 
-// unrootedState is the in-RAM speculative-state engine the replay loop drives in
-// rooted-durable mode: reads resolve speculative→durable, commits buffer in RAM,
-// rooted slots promote to disk. Implemented by unrootedTail (linear) and forkTail
+// unrootedState is the in-RAM speculative-state engine the replay loop drives:
+// reads resolve speculative→durable, commits buffer in RAM, rooted slots
+// promote to disk. Implemented by unrootedTail (linear) and forkTail
 // (fork-aware, over forkCoordinator).
 type unrootedState interface {
 	blockAccountSource
@@ -128,10 +128,9 @@ type unrootedState interface {
 	OverCap() bool
 }
 
-// normalizeUnrootedState preserves the disabled-tail sentinel when a classic
-// replay caller passes its nil *unrootedTail through an interface. Otherwise
-// reads and commits would select the overlay path and dereference that nil
-// pointer instead of using AccountsDB. Other implementations remain intact.
+// normalizeUnrootedState turns a nil *unrootedTail passed through the interface
+// into a nil interface, so a missing tail is detected instead of dereferenced.
+// Other implementations remain intact.
 func normalizeUnrootedState(tail unrootedState) unrootedState {
 	if concrete, ok := tail.(*unrootedTail); ok && concrete == nil {
 		return nil

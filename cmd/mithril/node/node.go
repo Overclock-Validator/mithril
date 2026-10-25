@@ -595,7 +595,8 @@ func init() {
 	Run.Flags().BoolVar(&sigverify.Cfg.DisableShredOverlap, "sigverify-disable-shred-overlap", false,
 		"Defer Turbine transaction decoding and signature verification until all block shreds arrive")
 	Run.Flags().BoolVar(&sbpf.UsePool, "use-pool", true, "Disable to allocate fresh slices")
-	Run.Flags().IntVar(&accountsdb.StoreAccountsWorkers, "store-accounts-workers", 128, "Number of workers to write account updates")
+	Run.Flags().Int("store-accounts-workers", 0, "Removed: accounts reach disk only through folds")
+	_ = Run.Flags().MarkDeprecated("store-accounts-workers", "accounts reach disk only through folds; the flag has no effect")
 	Run.Flags().IntVar(&accountsdb.ProgramCacheMaxMB, "program-cache-max-mb", accountsdb.DefaultProgramCacheMaxMB, "Maximum approximate SBPF program cache size in MiB")
 	Run.Flags().IntVar(&accountsdb.CommonAccountCacheMaxMB, "common-account-cache-max-mb", accountsdb.DefaultCommonAccountCacheMaxMB, "Approximate retained decoded account cache weight budget in MiB")
 	Run.Flags().Int64Var(&rewindToSlot, "rewind-to-slot", 0, "Rewind durable account state to the fold batch boundary at this slot before replaying (must be a retained boundary; run once to list boundaries on mismatch)")
@@ -1217,7 +1218,9 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	if ms := getInt("streaming-max-open-ms", "tuning.streaming_max_open_ms"); ms > 0 {
 		replay.StreamingExecutionCfg.MaxOpenAge = time.Duration(ms) * time.Millisecond
 	}
-	accountsdb.StoreAccountsWorkers = getInt("store-accounts-workers", "tuning.store_accounts_workers")
+	if config.IsSet("tuning.store_accounts_workers") {
+		mlog.Log.Warnf("tuning.store_accounts_workers was removed (accounts reach disk only through folds); delete the key")
+	}
 	accountsdb.ProgramCacheMaxMB = getInt("program-cache-max-mb", "tuning.program_cache_max_mb")
 	if accountsdb.ProgramCacheMaxMB <= 0 {
 		return fmt.Errorf("tuning.program_cache_max_mb must be > 0")
@@ -2274,7 +2277,6 @@ postBootstrap:
 	if config.IsSet("storage.rooted_durable") && !config.GetBool("storage.rooted_durable") {
 		klog.Fatalf("storage.rooted_durable=false is not supported: every cluster runs Alpenglow rooted-durable storage (delete the key)")
 	}
-	accountsDb.RootedDurable = true
 	if config.IsSet("storage.fork_aware") {
 		mlog.Log.Warnf("storage.fork_aware was removed: the working-set suffix engine handles fork switches via unwind+re-execute — delete the key")
 	}
@@ -2894,10 +2896,7 @@ postBootstrap:
 		}
 	}
 
-	consensusOpts := &replay.ConsensusOpts{
-		Alpenglow: true,
-		Engine:    consensusEngine,
-	}
+	consensusOpts := &replay.ConsensusOpts{Engine: consensusEngine}
 	consensusOpts.TransactionStatusCheckpointAfterCommit = func(selected *state.TransactionStatusCheckpointRef) error {
 		removed, err := cleanupRetainedTransactionStatusCheckpoints(
 			accountsPath, accountsDb, compactCfg.RewindHorizonBatches, selected,
@@ -4364,11 +4363,10 @@ func rewindStoreBelowDivergence(accountsDbPath string, accountsDb *accountsdb.Ac
 // maxForkSwitchRetries bounds fork-aware dump-then-repair re-replays per run.
 const maxForkSwitchRetries = 3
 
-// runReplayWithRecovery wraps replay.ReplayBlocks with panic recovery.
-// It distinguishes between:
-// - Panics during commit (commitInProgress=true): AccountsDB may be corrupted, marks state as corrupted
-// - Panics outside commit (divergence): AccountsDB is safe, logs helpful message
-// After handling, it re-panics to propagate the error.
+// runReplayWithRecovery wraps replay.ReplayBlocks with panic recovery. Replay
+// only buffers slots in the unrooted tail; AccountsDB changes solely through
+// crash-safe folds, so a replay panic never leaves it half-written. The handler
+// logs debug context and re-panics to propagate the error.
 func runReplayWithRecovery(
 	ctx context.Context,
 	accountsDb *accountsdb.AccountsDb,
@@ -4466,24 +4464,7 @@ func runReplayWithRecovery(
 	defer func() {
 		if r := recover(); r != nil {
 			runID := replay.CurrentRunID
-			if replay.IsCommitInProgress() {
-				commitSlot := replay.GetCommitSlot()
-				mlog.Log.Errorf("[run:%s] FATAL: Panic during commit at slot %d - AccountsDB may be corrupted", runID, commitSlot)
-				mlog.Log.Errorf("[run:%s] Panic occurred between StoreAccounts and StoreBankHashForSlot", runID)
-				// Mark state as corrupted so next startup knows to rebuild
-				if mithrilState != nil {
-					reason := fmt.Sprintf("panic during commit at slot %d: %v", commitSlot, r)
-					if err := mithrilState.MarkCorrupted(accountsDbPath, reason); err != nil {
-						mlog.Log.Errorf("[run:%s] Failed to mark state as corrupted: %v", runID, err)
-					} else {
-						// Record corruption in history
-						state.RecordCorrupted(accountsDbPath, mithrilState.LastSlot, mithrilState.LastBankhash, runID, getVersion(), getCommit(), getBranch(), reason)
-					}
-				}
-			} else {
-				mlog.Log.Errorf("[run:%s] Panic during replay (outside commit window) - AccountsDB is SAFE", runID)
-				mlog.Log.Errorf("[run:%s] This appears to be a divergence panic. You can resume from the last persisted slot.", runID)
-			}
+			mlog.Log.Errorf("[run:%s] Panic during replay; AccountsDB changes only through folds and is intact. Resume continues from the last rooted slot.", runID)
 			// Print debug info and paths
 			mlog.Log.Errorf("[run:%s] Debug info:", runID)
 			if mithrilState != nil {
@@ -4507,7 +4488,7 @@ func runReplayWithRecovery(
 	}()
 
 	result = replay.ReplayBlocks(ctx, accountsDb, accountsDbPath, mithrilState, resumeState, startSlot, endSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, turbineShredVersion, turbineAlpenglowAddr, turbineIdentity, blockDir, txParallelism, isLive, useLightbringer, useTurbine, dbgOpts, metricsWriter, rpcServer, blockFetchOpts, consensusOpts, onCancelWriteState)
-	if consensusOpts == nil || !consensusOpts.Alpenglow {
+	if consensusOpts == nil {
 		return result
 	}
 

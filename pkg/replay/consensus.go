@@ -5,12 +5,11 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/state"
 )
 
-// ConsensusOpts selects replay's protocol semantics and optionally carries the
-// Alpenglow certificate engine. Alpenglow with a nil Engine uses delegated
-// (RPC-attested) finality; a nil opts value is classic verifying replay.
+// ConsensusOpts optionally carries the Alpenglow certificate engine. Replay is
+// always Alpenglow; a nil Engine (or nil opts) uses delegated (RPC-attested)
+// finality.
 type ConsensusOpts struct {
-	Alpenglow bool
-	Engine    consensusengine.Engine
+	Engine consensusengine.Engine
 
 	// TransactionStatusCheckpointAfterCommit performs advisory sidecar
 	// retention after AccountsDB has durably selected a checkpoint reference.

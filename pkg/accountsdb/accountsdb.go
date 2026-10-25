@@ -1,9 +1,7 @@
 package accountsdb
 
 import (
-	"bufio"
 	"bytes"
-	"container/list"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -25,7 +23,6 @@ import (
 	"github.com/cockroachdb/pebble"
 	"github.com/gagliardetto/solana-go"
 	"github.com/maypok86/otter"
-	"golang.org/x/sync/errgroup"
 )
 
 type AccountsDb struct {
@@ -53,14 +50,10 @@ type AccountsDb struct {
 
 	// appendVecReadMu pins appendvec paths from before an index snapshot until
 	// its file reads complete. Compaction/rewind take the write side across an
-	// index move plus source unlink, and the legacy mutable store takes it while
-	// writing, so a batch never falls through to a different logical epoch.
+	// index move plus source unlink, so a batch never falls through to a
+	// different logical epoch.
 	appendVecReadMu sync.RWMutex
 
-	// RootedDurable keeps the canonical store rooted-only: replayed slots buffer
-	// in an in-RAM working set (pkg/accounts) and fold to disk via CommitBatch
-	// once finalized+verified. The Alpenglow node forces this on at startup.
-	RootedDurable bool
 	// MinFreeBytes leaves operational headroom before admitting a fold. Set
 	// before replay starts; zero disables the admission check for offline tools.
 	MinFreeBytes uint64
@@ -85,29 +78,6 @@ type AccountsDb struct {
 	compactLastScan  map[uint64]uint64 // oldest scan first; a growing directory must not postpone cursor wrap forever
 	compactCycles    uint64            // periodically serve bootstrap and mostly-empty sparse files too
 	compactHooks     compactionTestHooks
-
-	// A list of store requests. They are added to the back as they arrive and
-	// removed from the front as they are persisted.
-	inProgressStoreRequestsMu sync.Mutex
-	inProgressStoreRequests   *list.List
-	storeRequestChan          chan *list.Element
-	storeWorkerDone           chan struct{}
-}
-
-type storeRequest struct {
-	accts []*accounts.Account
-	slot  uint64
-	m     map[solana.PublicKey]*accounts.Account
-	cb    func()
-}
-
-func (accountsDb *AccountsDb) StoreQueueLen() int {
-	if accountsDb.inProgressStoreRequests == nil {
-		return 0
-	}
-	accountsDb.inProgressStoreRequestsMu.Lock()
-	defer accountsDb.inProgressStoreRequestsMu.Unlock()
-	return accountsDb.inProgressStoreRequests.Len()
 }
 
 // silentLogger implements pebble.Logger but discards all messages.
@@ -120,7 +90,6 @@ func (silentLogger) Fatalf(format string, args ...any) { log.Fatalf(format, args
 var (
 	ErrNoAccount = errors.New("ErrNoAccount")
 
-	StoreAccountsWorkers    = 128
 	ProgramCacheMaxMB       = DefaultProgramCacheMaxMB
 	CommonAccountCacheMaxMB = DefaultCommonAccountCacheMaxMB
 )
@@ -192,30 +161,10 @@ func OpenDb(accountsDbDir string) (*AccountsDb, error) {
 	accountsDb := &AccountsDb{
 		IndexWALDisabled: DisableIndexWAL, Index: db, BankHashStore: bankhashDb, AcctsDir: appendVecsDir}
 	accountsDb.LargestFileId.Store(largestFileId)
-
-	accountsDb.inProgressStoreRequests = list.New()
-	accountsDb.storeRequestChan = make(chan *list.Element)
-	accountsDb.storeWorkerDone = make(chan struct{})
-	go accountsDb.storeWorker()
-
 	return accountsDb, nil
 }
 
-// Turns down the store worker. AccountsDb cannot accept writes after this.
-// Should not be called concurrently.
-func (accountsDb *AccountsDb) WaitForStoreWorker() {
-	if accountsDb.storeWorkerDone == nil {
-		mlog.Log.Infof("AccountsDb: async store worker already done.")
-		return
-	}
-	mlog.Log.Infof("AccountsDb: waiting for async store worker...")
-	close(accountsDb.storeRequestChan)
-	<-accountsDb.storeWorkerDone
-	accountsDb.storeWorkerDone = nil
-}
-
 func (accountsDb *AccountsDb) CloseDb() {
-	accountsDb.WaitForStoreWorker()
 	mlog.Log.Infof("CloseDb: syncing and closing Index...")
 	if err := accountsDb.Index.Close(); err != nil {
 		mlog.Log.Errorf("CloseDb: Index.Close() error: %v", err)
@@ -229,9 +178,6 @@ func (accountsDb *AccountsDb) CloseDb() {
 
 func (accountsDb *AccountsDb) InitCaches() {
 	var err error
-	if accountsDb.inProgressStoreRequests == nil {
-		accountsDb.inProgressStoreRequests = list.New()
-	}
 	accountsDb.commonAdmission = newCommonCacheAdmission()
 	accountsDb.VoteAcctCache, err = otter.MustBuilder[solana.PublicKey, *accounts.Account](2500).
 		Cost(func(key solana.PublicKey, acct *accounts.Account) uint32 {
@@ -358,14 +304,12 @@ type AccountReadStats struct {
 	WorkingSetLookupNanoseconds      uint64
 	CloneNanoseconds                 uint64
 	AppendVecPinWaitNanoseconds      uint64
-	InProgressNanoseconds            uint64
 	ReadCacheEpochWaitNanoseconds    uint64
 	CacheLookupNanoseconds           uint64
 	IndexAndAppendVecReadNanoseconds uint64
 	CachePublicationWaitNanoseconds  uint64
 	CachePublicationNanoseconds      uint64
 	WorkingSetHit                    bool
-	InProgressHit                    bool
 	PendingFoldHit                   bool
 	CacheHit                         bool
 	DurableRead                      bool
@@ -378,10 +322,6 @@ func (accountsDb *AccountsDb) GetAccount(slot uint64, pubkey solana.PublicKey) (
 	}
 	accountsDb.appendVecReadMu.RLock()
 	defer accountsDb.appendVecReadMu.RUnlock()
-	accts := accountsDb.getStoreInProgressAccounts([]solana.PublicKey{pubkey})
-	if accts[0] != nil {
-		return accts[0], nil
-	}
 	return accountsDb.getStoredAccountPinned(slot, pubkey)
 }
 
@@ -394,13 +334,6 @@ func (accountsDb *AccountsDb) GetAccountWithStats(slot uint64, pubkey solana.Pub
 	accountsDb.appendVecReadMu.RLock()
 	stats.AppendVecPinWaitNanoseconds = uint64(time.Since(start).Nanoseconds())
 	defer accountsDb.appendVecReadMu.RUnlock()
-	start = time.Now()
-	accts := accountsDb.getStoreInProgressAccounts([]solana.PublicKey{pubkey})
-	stats.InProgressNanoseconds = uint64(time.Since(start).Nanoseconds())
-	if accts[0] != nil {
-		stats.InProgressHit = true
-		return accts[0], stats, nil
-	}
 	acct, err := accountsDb.getStoredAccountPinnedWithStats(slot, pubkey, &stats)
 	return acct, stats, err
 }
@@ -634,97 +567,13 @@ func (accountsDb *AccountsDb) readIndexedAccount(pubkey solana.PublicKey) (*acco
 	return acct, nil
 }
 
-// Returns a slice of the same length as the input with results matching indexes, nil if not found.
-// Returns clones to avoid data races with the store worker.
-func (accountsDb *AccountsDb) getStoreInProgressAccounts(pks []solana.PublicKey) []*accounts.Account {
-	defer trace.StartRegion(context.Background(), "getStoreInProgressAccounts").End()
-	out := make([]*accounts.Account, len(pks))
-	accountsDb.inProgressStoreRequestsMu.Lock()
-	defer accountsDb.inProgressStoreRequestsMu.Unlock()
-	// Start with newest first.
-	for e := accountsDb.inProgressStoreRequests.Back(); e != nil; e = e.Prev() {
-		sr := e.Value.(storeRequest)
-		for i := range len(pks) {
-			if out[i] != nil {
-				continue // Already found.
-			}
-			if acct := sr.m[pks[i]]; acct != nil {
-				out[i] = acct.Clone()
-			}
-		}
-	}
-	return out
-}
-
-func (accountsDb *AccountsDb) StoreAccounts(
-	accts []*accounts.Account,
-	slot uint64,
-	cb func(),
-) error {
-	// Rooted-durable (the only mode of the Alpenglow-only build): direct stores
-	// are no-ops. Every write reaches disk exclusively via the fold path
-	// (CommitBatch) once finalized+verified — epoch-boundary code that still
-	// calls StoreAccounts directly is redundant with the slot delta it also
-	// feeds (block.EpochUpdatedAccts), and writing here would violate
-	// "durable state is rooted-only".
-	if accountsDb.RootedDurable {
-		if cb != nil {
-			cb()
-		}
-		return nil
-	}
-	for _, acct := range accts {
-		if acct == nil {
-			continue
-		}
-		acct.Slot = slot
-	}
-
-	m := make(map[solana.PublicKey]*accounts.Account, len(accts))
-	for _, a := range accts {
-		if a == nil {
-			continue
-		}
-		m[a.Key] = a
-	}
-	// Must not hold lock during channel send to avoid deadlock with storeWorker.
-	accountsDb.appendVecReadMu.Lock()
-	accountsDb.inProgressStoreRequestsMu.Lock()
-	element := accountsDb.inProgressStoreRequests.PushBack(storeRequest{accts: accts, slot: slot, m: m, cb: cb})
-	accountsDb.inProgressStoreRequestsMu.Unlock()
-	accountsDb.appendVecReadMu.Unlock()
-	accountsDb.storeRequestChan <- element
-	return nil
-}
-
-func (accountsDb *AccountsDb) storeAccountsSync(accts []*accounts.Account, slot uint64) {
-	defer trace.StartRegion(context.Background(), "StoreAccounts").End()
-	// The request is still present in the in-progress overlay, so publish its
-	// cache epoch before disk I/O. New readers see the overlay; older readers
-	// cannot publish stale values after this bump.
-	accountsDb.refreshReadCaches(accts)
-	accountsDb.appendVecReadMu.Lock()
-	defer accountsDb.appendVecReadMu.Unlock()
-	if StoreAccountsWorkers == 1 {
-		accountsDb.storeAccountsInternal(accts, slot)
-	} else {
-		accountsDb.parallelStoreAccounts(StoreAccountsWorkers, accts, slot)
-	}
-}
-
-// refreshReadCaches keeps already-hot common entries coherent after a store,
-// but does not admit every account in a large fold: doing so turns the retained
-// byte budget into an expensive write-only churn loop. Vote accounts retain their
-// dedicated cache. Deleted and owner-transitioned entries are evicted from the
-// cache that can no longer serve them.
-func (accountsDb *AccountsDb) refreshReadCaches(accts []*accounts.Account) {
-	accountsDb.readCacheEpochMu.Lock()
-	defer accountsDb.readCacheEpochMu.Unlock()
-	accountsDb.readCacheEpoch++
-	accountsDb.refreshReadCacheEntries(accts)
-}
-
-// refreshReadCacheEntries uses only concurrent-safe ordinary Otter operations.
+// refreshReadCacheEntries keeps already-hot common entries coherent after a
+// fold, but does not admit every account in a large fold: doing so turns the
+// retained byte budget into an expensive write-only churn loop. Vote accounts
+// retain their dedicated cache. Deleted and owner-transitioned entries are
+// evicted from the cache that can no longer serve them.
+//
+// It uses only concurrent-safe ordinary Otter operations.
 // CommitBatch may call it without readCacheEpochMu while pendingFold masks every
 // changed key; Clear remains confined to resetReadCachesLocked.
 func (accountsDb *AccountsDb) refreshReadCacheEntries(accts []*accounts.Account) {
@@ -761,255 +610,6 @@ func (accountsDb *AccountsDb) resetReadCachesLocked() {
 	accountsDb.commonAdmission = newCommonCacheAdmission()
 }
 
-func (accountsDb *AccountsDb) storeWorker() {
-	defer close(accountsDb.storeWorkerDone)
-	for elt := range accountsDb.storeRequestChan {
-		sr := elt.Value.(storeRequest)
-		accountsDb.storeAccountsSync(sr.accts, sr.slot)
-		if sr.cb != nil {
-			sr.cb()
-		}
-		// Remove after callback so DrainStoreQueue waits for callbacks (e.g. index flush) to complete
-		accountsDb.inProgressStoreRequestsMu.Lock()
-		accountsDb.inProgressStoreRequests.Remove(elt)
-		accountsDb.inProgressStoreRequestsMu.Unlock()
-	}
-}
-
-func (accountsDb *AccountsDb) storeAccountsInternal(accts []*accounts.Account, slot uint64) {
-	fileId := accountsDb.LargestFileId.Add(1)
-	appendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, slot, fileId)
-	appendVecFile, err := os.OpenFile(appendVecFileName, os.O_RDWR|os.O_CREATE, 0666)
-	if err != nil {
-		//mlog.Log.Debugf("unable to open appendvec file %s for writing to accountsdb", appendVecFileName)
-		panic(err)
-	}
-	defer appendVecFile.Close()
-
-	appendVecAcctsBuf := new(bytes.Buffer)
-	writer := new(bytes.Buffer)
-	var acctIdxEntryBuf [24]byte
-
-	for _, acct := range accts {
-		if acct == nil {
-			continue
-		}
-
-		// create index entry, encode it and write it to the index kv store
-		// offset field is specified as the current num of bytes written to the appendvec buffer.
-		writer.Reset()
-
-		indexEntry := AccountIndexEntry{Slot: slot, FileId: fileId, Offset: uint64(appendVecAcctsBuf.Len())}
-		indexEntry.Marshal(&acctIdxEntryBuf)
-
-		// if an entry already existed in the index for this account, very often we can simply make the state update
-		// in-place, i.e. into the account's existing appendvec blob.
-		// we can make the account state update in-place iff the existing version's data length is the same as the
-		// new version's data length, which is the case about 98% of the time.
-		// if not, then we write out a new appendvec.
-		existingacctIdxEntryBuf, c, err := accountsDb.Index.Get(acct.Key[:])
-		if err == nil {
-			acctIdxEntry, err := UnmarshalAcctIdxEntry(existingacctIdxEntryBuf)
-			if err != nil {
-				panic("failed to unmarshal AccountIndexEntry from index kv database")
-			}
-			c.Close()
-
-			existingAppendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, acctIdxEntry.Slot, acctIdxEntry.FileId)
-			existingAppendVecFile, err := os.OpenFile(existingAppendVecFileName, os.O_RDWR, 0666)
-			if err != nil {
-				panic(err)
-			}
-
-			_, err = existingAppendVecFile.Seek(int64(acctIdxEntry.Offset), 0)
-			if err != nil {
-				panic(err)
-			}
-
-			existingAcct, err := unmarshalAcctFromAppendVecAcctHeader(existingAppendVecFile)
-			if err != nil {
-				panic(fmt.Sprintf("failed to unmarshal account from appendvec file %s: %s", existingAppendVecFileName, err))
-			}
-
-			if len(acct.Data) == len(existingAcct.Data) {
-				newAppendVecAcct := AppendVecAccount{DataLen: uint64(len(acct.Data)), Pubkey: acct.Key, Lamports: acct.Lamports,
-					RentEpoch: acct.RentEpoch, Owner: acct.Owner, Executable: acct.Executable, Data: acct.Data}
-
-				_, err = existingAppendVecFile.Seek(int64(acctIdxEntry.Offset), 0)
-				if err != nil {
-					panic(err)
-				}
-
-				err = newAppendVecAcct.Marshal(existingAppendVecFile)
-				if err != nil {
-					panic(fmt.Sprintf("error marshaling appendvec for storage: %s", err))
-				}
-
-				existingAppendVecFile.Close()
-				continue
-			}
-		}
-
-		err = accountsDb.Index.Set(acct.Key[:], acctIdxEntryBuf[:], &pebble.WriteOptions{})
-		if err != nil {
-			panic(fmt.Sprintf("unable to add acct for %s to acctsdb: %v", acct.Key, err))
-		}
-
-		// marshal up the account as an appendvec style account and write it to the buffer
-		appendVecAcct := AppendVecAccount{DataLen: uint64(len(acct.Data)), Pubkey: acct.Key, Lamports: acct.Lamports,
-			RentEpoch: acct.RentEpoch, Owner: acct.Owner, Executable: acct.Executable, Data: acct.Data}
-
-		err = appendVecAcct.Marshal(appendVecAcctsBuf)
-		if err != nil {
-			panic(fmt.Sprintf("unable to add acct for %s to acctsdb: %v", acct.Key, err))
-		}
-	}
-
-	// write the appendvecs data into the file
-	_, err = appendVecFile.Write(appendVecAcctsBuf.Bytes())
-	if err != nil {
-		panic(err)
-	}
-}
-
-// parallelStoreAccounts makes n workers which process a list of
-// accounts in parallel. One worker receives accounts to add to a new
-// appendvec file. The remaining workers do the following:
-// for each account they receive:
-// 1. Check the existing accounts length
-// 2. If the length of the new account data is the same, overwrite the existing account
-// 3. Otherwise, pass it on to be added to a new appendvec.
-func (accountsDb *AccountsDb) parallelStoreAccounts(n int, accts []*accounts.Account, slot uint64) {
-	if n < 2 {
-		panic(fmt.Sprintf("AccountsDb.parallelStoreAccounts: n=%d must be >= 2", n))
-	}
-
-	acctsChan := make(chan *accounts.Account, len(accts))
-	for i := range len(accts) {
-		if accts[i] == nil {
-			continue
-		}
-		acctsChan <- accts[i]
-	}
-	close(acctsChan)
-
-	// Assumes that none of the accounts overlap in the same appendvec file.
-	lengthChangedAccounts := make(chan *accounts.Account)
-	overwriteOrPassGroup, ctx := errgroup.WithContext(context.Background())
-	for range n - 1 {
-		overwriteOrPassGroup.Go(func() error {
-			for acct := range acctsChan {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				err := func(a *accounts.Account) error {
-					existingacctIdxEntryBuf, c, err := accountsDb.Index.Get(a.Key[:])
-					if errors.Is(err, pebble.ErrNotFound) {
-						lengthChangedAccounts <- a
-						return nil
-					}
-					if err != nil {
-						return fmt.Errorf("reading from index: %w", err)
-					}
-					existingIdxEntry, err := UnmarshalAcctIdxEntry(existingacctIdxEntryBuf)
-					c.Close()
-					if err != nil {
-						return fmt.Errorf("unmarshaling index entry: %w", err)
-					}
-
-					existingAppendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, existingIdxEntry.Slot, existingIdxEntry.FileId)
-					existingAppendVecFile, err := os.OpenFile(existingAppendVecFileName, os.O_RDWR, 0666)
-					if err != nil {
-						return fmt.Errorf("open %s: %w", existingAppendVecFileName, err)
-					}
-					defer existingAppendVecFile.Close()
-
-					existingDataLen, err := GetAppendVecDataLen(existingAppendVecFile, existingIdxEntry.Offset)
-					if err != nil {
-						return fmt.Errorf("GetAppendVecDataLen %s: %w", existingAppendVecFileName, err)
-					}
-
-					if uint64(len(a.Data)) != existingDataLen {
-						lengthChangedAccounts <- a
-						return nil
-					}
-
-					_, err = existingAppendVecFile.Seek(int64(existingIdxEntry.Offset), 0)
-					if err != nil {
-						return fmt.Errorf("seek %s %d: %w", existingAppendVecFileName, existingIdxEntry.Offset, err)
-					}
-					newAppendVecAcct := AppendVecAccount{
-						DataLen:    uint64(len(a.Data)),
-						Pubkey:     a.Key,
-						Lamports:   a.Lamports,
-						RentEpoch:  a.RentEpoch,
-						Owner:      a.Owner,
-						Executable: a.Executable,
-						Data:       a.Data,
-					}
-					err = newAppendVecAcct.Marshal(existingAppendVecFile)
-					if err != nil {
-						return fmt.Errorf("marshaling appendvec: %w", err)
-					}
-					return nil
-				}(acct)
-				if err != nil {
-					return fmt.Errorf("reading account key=%s: %w", acct.Key.String(), err)
-				}
-			}
-			return nil
-		})
-	}
-	newAppendVecGroup := errgroup.Group{}
-	newAppendVecGroup.Go(func() error {
-		fileId := accountsDb.LargestFileId.Add(1)
-		appendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, slot, fileId)
-		appendVecFile, err := os.OpenFile(appendVecFileName, os.O_RDWR|os.O_CREATE, 0666)
-		if err != nil {
-			return err
-		}
-		defer appendVecFile.Close()
-		appendVecWriter := bufio.NewWriter(appendVecFile)
-		defer appendVecWriter.Flush()
-
-		appendVecFileOffset := uint64(0)
-		var acctIdxEntryBuf [24]byte
-
-		for acct := range lengthChangedAccounts {
-			indexEntry := AccountIndexEntry{Slot: slot, FileId: fileId, Offset: appendVecFileOffset}
-			indexEntry.Marshal(&acctIdxEntryBuf)
-			err = accountsDb.Index.Set(acct.Key[:], acctIdxEntryBuf[:], &pebble.WriteOptions{})
-			if err != nil {
-				return fmt.Errorf("unable to add acct for %s to acctsdb: %v", acct.Key, err)
-			}
-
-			appendVecAcct := AppendVecAccount{
-				DataLen:    uint64(len(acct.Data)),
-				Pubkey:     acct.Key,
-				Lamports:   acct.Lamports,
-				RentEpoch:  acct.RentEpoch,
-				Owner:      acct.Owner,
-				Executable: acct.Executable,
-				Data:       acct.Data,
-			}
-			l, err := appendVecAcct.MarshalReturningLength(appendVecWriter)
-			if err != nil {
-				return fmt.Errorf("unable to add acct for %s to acctsdb: %v", acct.Key, err)
-			}
-			appendVecFileOffset += uint64(l)
-		}
-
-		return nil
-	})
-
-	e1 := overwriteOrPassGroup.Wait()
-	close(lengthChangedAccounts)
-	e2 := newAppendVecGroup.Wait()
-	if err := errors.Join(e1, e2); err != nil {
-		panic(err)
-	}
-}
-
 func (accountsDb *AccountsDb) GetBankHashForSlot(slot uint64) ([]byte, error) {
 	var slotBytes [8]byte
 	binary.LittleEndian.PutUint64(slotBytes[:], slot)
@@ -1021,12 +621,6 @@ func (accountsDb *AccountsDb) GetBankHashForSlot(slot uint64) ([]byte, error) {
 	copy(out, bh)
 	c.Close()
 	return out, nil
-}
-
-func (accountsDb *AccountsDb) StoreBankHashForSlot(slot uint64, bankHash []byte) error {
-	var slotBytes [8]byte
-	binary.LittleEndian.PutUint64(slotBytes[:], slot)
-	return accountsDb.BankHashStore.Set(slotBytes[:], bankHash, &pebble.WriteOptions{})
 }
 
 func (accountsDb *AccountsDb) KeysBetweenPrefixes(startPrefix uint64, endPrefix uint64) []solana.PublicKey {

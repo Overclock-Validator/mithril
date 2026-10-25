@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"runtime/trace"
 	"sync"
 	"sync/atomic"
@@ -108,12 +107,9 @@ func newBlockExecution(
 		parentBankSysvars:   parentBankSysvars,
 		seenMessages:        make(map[[32]byte]int),
 	}
-	// In rooted-durable mode, block accounts/sysvars load through the unrooted
-	// tail (overlay→durable) so execution sees confirmed-but-unrooted state.
-	exec.blockSrc = acctsDb
-	if tail != nil {
-		exec.blockSrc = tail
-	}
+	// Block accounts/sysvars load through the unrooted tail (overlay→durable)
+	// so execution sees confirmed-but-unrooted state.
+	exec.blockSrc = tail
 
 	ctx, task := trace.NewTask(context.Background(), "ProcessBlock")
 	exec.ctx, exec.task = ctx, task
@@ -557,7 +553,6 @@ func unprocessableTransactionError(index int, err error) error {
 func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
 	block := exec.block
 	slotCtx := exec.slotCtx
-	acctsDb := exec.acctsDb
 	tail := exec.tail
 	setReplayStage := exec.setReplayStage
 	alpenglowClock := exec.alpenglowClock
@@ -642,60 +637,15 @@ func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
 	// because forkchoice is fed after ProcessBlock returns — checking here would
 	// never see votes from recently submitted blocks and could deadlock.
 
-	// Enter critical commit window - panics here may leave AccountsDB inconsistent
-	commitSlot.Store(slotCtx.Slot)
-	commitInProgress.Store(true)
 	blockUpdateStart := time.Now()
 	setReplayStage("store_accounts")
-	persistedSlot := slotCtx.Slot
 	persistedBankhash := append([]byte(nil), slotCtx.FinalBankhash...)
-	persistedBlockSlot := block.Slot
-	stakeIndexDir := filepath.Join(acctsDb.AcctsDir, "..")
-	afterStoreAccounts := func() {
-		if tail != nil {
-			// Rooted-durable: accounts + bankhash are buffered in the overlay and
-			// become durable only on promotion; nothing written here (rooted-only).
-		} else {
-			if berr := acctsDb.StoreBankHashForSlot(persistedSlot, persistedBankhash); berr != nil {
-				mlog.Log.Infof("unable to store bankhash for slot %d", persistedSlot)
-			}
-		}
-		if tail == nil {
-			// Legacy/verify modes (no fork ambiguity): flush per block as before.
-			// Rooted-durable replay flushes at FOLD time instead — entries stay
-			// slot-scoped in RAM so a fork unwind can drop them, and scans merge
-			// the pending set (StreamStakeAccounts) for completeness meanwhile.
-			flushed, err := global.FlushPendingStakePubkeys(stakeIndexDir)
-			if err != nil {
-				mlog.Log.Errorf("failed to flush stake pubkey index: %v", err)
-			} else if flushed > 0 {
-				mlog.Log.Debugf("flushed %d new stake pubkeys to index", flushed)
-			}
-		}
-
-		persistedHashes.Set(persistedBlockSlot, persistedBankhash)
-
-		// Exit critical commit window - AccountsDB is now consistent
-		commitInProgress.Store(false)
-		commitSlot.Store(0)
-	}
-
-	if tail != nil {
-		// Rooted-durable: buffer this slot's writes + bankhash in the RAM overlay
-		// (always, even when empty, so the bankhash is recorded); no durable write.
-		tail.Add(slotCtx.Slot, modifiedAccts, persistedBankhash)
-		afterStoreAccounts()
-	} else if len(modifiedAccts) > 0 {
-		err = acctsDb.StoreAccounts(modifiedAccts, slotCtx.Slot, afterStoreAccounts)
-	}
-	// In rooted-durable mode the callback above is synchronous, so this includes
-	// the complete critical-path overlay publication. Legacy StoreAccounts only
-	// enqueues here; its asynchronous disk work deliberately belongs to no slot's
-	// replay wall time and must never update a later slot's metrics record.
+	// Buffer this slot's writes + bankhash in the unrooted tail (always, even
+	// when empty, so the bankhash is recorded). Nothing reaches disk here: rooted
+	// slots become durable only when promotion folds them.
+	tail.Add(slotCtx.Slot, modifiedAccts, persistedBankhash)
+	persistedHashes.Set(block.Slot, persistedBankhash)
 	metrics.GlobalBlockReplay.BlockUpdateAccounts.AddTimingSince(blockUpdateStart)
-	if err != nil {
-		return slotCtx, err
-	}
 	statusCommitStart := time.Now()
 	statusWaitStart := time.Now()
 	preparedStatuses := exec.statusPreparation.wait()

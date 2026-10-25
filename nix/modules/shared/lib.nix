@@ -71,7 +71,6 @@
         param_arena_size_mb = cfg.configSchema.tuningParamArenaSizeMb;
         borrowed_account_arena_size = cfg.configSchema.tuningBorrowedAccountArenaSize;
         use_pool = cfg.configSchema.tuningUsePool;
-        store_accounts_workers = cfg.configSchema.tuningStoreAccountsWorkers;
         program_cache_max_mb = cfg.configSchema.tuningProgramCacheMaxMb;
         pprof = {
           port = cfg.configSchema.tuningPprofPort;

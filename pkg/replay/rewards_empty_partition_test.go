@@ -69,9 +69,7 @@ func TestSameBankRewardPartitionWaitsForStartingBlockHeight(t *testing.T) {
 	stale.Active = false
 	staleAccount := activeAccount.Clone()
 	staleAccount.Data = encodeEpochRewardsForTest(t, stale)
-	stored := make(chan struct{})
-	require.NoError(t, db.StoreAccounts([]*accounts.Account{staleAccount}, 10, func() { close(stored) }))
-	<-stored
+	seedDurableAccounts(t, db, []*accounts.Account{staleAccount}, 10)
 
 	distribution := &rewards.PartitionedRewardDistributionInfo{
 		SpoolDir:                     dir,
@@ -102,7 +100,6 @@ func TestSameBankRewardPartitionWaitsForStartingBlockHeight(t *testing.T) {
 	require.NotNil(t, sealevel.SysvarCache.EpochRewards.Sysvar)
 	require.False(t, sealevel.SysvarCache.EpochRewards.Sysvar.Active)
 
-	db.WaitForStoreWorker()
 	persisted, err := db.GetAccount(11, sealevel.SysvarEpochRewardsAddr)
 	require.NoError(t, err)
 	require.False(t, decodeEpochRewardsForTest(t, persisted.Data).Active)

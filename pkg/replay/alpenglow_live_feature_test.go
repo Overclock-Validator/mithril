@@ -34,14 +34,12 @@ func TestLiveAlpenglowFeatureAccountEnablesVoteRewardProcessing(t *testing.T) {
 	featureData, err := features.MarshalFeatureAcct(&features.FeatureAcct{ActivatedAt: &featureActivationSlot})
 	require.NoError(t, err)
 	liveFeatureAddress := base58.MustDecodeFromString("A1pengvuM6JEcyNuTnMqepBKhwHE3N6PmUrdATGawhJS")
-	stored := make(chan struct{})
-	require.NoError(t, db.StoreAccounts([]*accounts.Account{{
+	seedDurableAccounts(t, db, []*accounts.Account{{
 		Key:      liveFeatureAddress,
 		Lamports: 1,
 		Data:     featureData,
 		Owner:    a.FeatureAddr,
-	}}, activationSlot, func() { close(stored) }))
-	<-stored
+	}}, activationSlot)
 
 	active, _, _ := scanAndEnableFeatures(db, &ReplayCtx{}, replaySlot, false)
 	require.True(t, active.IsActive(features.Alpenglow))

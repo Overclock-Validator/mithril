@@ -96,9 +96,6 @@ func stageRewardEpochDelegatedStakes(
 		Executable: false,
 		RentEpoch:  0,
 	}
-	if err := acctsDb.StoreAccounts([]*accounts.Account{updated}, storeSlot, nil); err != nil {
-		return nil, nil, fmt.Errorf("store reward epoch delegated stakes account: %w", err)
-	}
 	if updated.Lamports >= parent.Lamports {
 		replayCtx.Capitalization = safemath.SaturatingAddU64(replayCtx.Capitalization, updated.Lamports-parent.Lamports)
 	} else {
@@ -166,9 +163,6 @@ func applyAlpenglowBoundaryVAT(
 	updated = append(updated, incinerator.Clone())
 	toStore = append(toStore, incinerator)
 
-	if err := acctsDb.StoreAccounts(toStore, storeSlot, nil); err != nil {
-		return nil, nil, fmt.Errorf("store epoch VAT accounts: %w", err)
-	}
 	return updated, parents, nil
 }
 

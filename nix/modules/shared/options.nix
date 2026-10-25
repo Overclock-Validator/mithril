@@ -378,12 +378,6 @@
         description = "Enable pool allocator for slices.";
       };
 
-      tuningStoreAccountsWorkers = lib.mkOption {
-        type = lib.types.int;
-        default = 128;
-        description = "Store accounts workers.";
-      };
-
       tuningProgramCacheMaxMb = lib.mkOption {
         type = lib.types.int;
         default = 1024;

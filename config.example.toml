@@ -634,9 +634,6 @@ name = "mithril"
     # Enable/disable pool allocator for slices
     use_pool = true
 
-    # Number of goroutines to store modified accounts at the end of each block
-    store_accounts_workers = 128
-
     # Approximate maximum retained SBPF program cache size in MiB.
     program_cache_max_mb = 1024
 

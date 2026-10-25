@@ -71,12 +71,10 @@ func testStartupAcrossEpochBoundary(t *testing.T, mode string, offset uint64) {
 	var rewardData bytes.Buffer
 	epochRewards := &sealevel.SysvarEpochRewards{}
 	require.NoError(t, epochRewards.MarshalWithEncoder(bin.NewBinEncoder(&rewardData)))
-	done := make(chan struct{})
-	require.NoError(t, db.StoreAccounts([]*accounts.Account{
+	seedDurableAccounts(t, db, []*accounts.Account{
 		{Key: sealevel.SysvarStakeHistoryAddr, Lamports: 1, Data: make([]byte, 16392)},
 		{Key: sealevel.SysvarEpochRewardsAddr, Lamports: 1, Data: rewardData.Bytes()},
-	}, parentSlot, func() { close(done) }))
-	<-done
+	}, parentSlot)
 
 	seeds := make(map[uint64]string)
 	for epoch, stake := range map[uint64]uint64{parentEpoch: 111, enteringEpoch: parentStake} {
