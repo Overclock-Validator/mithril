@@ -655,8 +655,11 @@ const (
 	repairCatchupBarrenCooldown  = 30 * time.Minute
 	repairCatchupDecisionTimeout = 15 * time.Second
 	repairCatchupPollInterval    = 250 * time.Millisecond
-	repairCatchupWindowSlots     = uint64(64) // matches the assembler's per-call priority range
-	repairCatchupStallWarnEvery  = 60 * time.Second
+	// repairCatchupSpoolScan bounds how far past the frontier the catchup
+	// monitor looks for consecutive complete spooled slots.
+	repairCatchupSpoolScan      = 4096
+	repairCatchupWindowSlots    = uint64(64) // matches the assembler's per-call priority range
+	repairCatchupStallWarnEvery = 60 * time.Second
 	// Post-handoff live blocks farther than this beyond the waiting slot go
 	// to the CAPPED staging buffer instead of the reorder buffer: during a
 	// long catchup the live edge runs hundreds of slots ahead, and feeding

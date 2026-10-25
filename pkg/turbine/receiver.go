@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -347,9 +348,98 @@ func (r *UDPReceiver) ShredObservation(slot uint64) (PartialShredObservation, bo
 	return r.assembler.ShredObservation(slot)
 }
 
-// SetRetentionFloor pins the assembler's age cutoff for repair catchup: slots
-// >= floor stay accepted however far they trail the live edge. 0 restores the
-// normal lag-based retention.
+// SpoolCompleteThrough returns the last slot of the run of consecutive slots
+// starting at from that the on-disk spool's journal proves complete, checking
+// at most limit slots; ok is false when from itself is not complete.
+//
+// Consecutive complete slots are not necessarily one chain: a slot the
+// cluster skipped can sit in the spool complete (an abandoned fork's block)
+// next to a later block whose parent is older. A complete slot T in the
+// window whose parent P is below T-1 shows that P+1..T-1 are not on T's
+// branch, so the run is cut back to P (and ok is false when P is below from).
+// Replaying the skipped block would otherwise put the next block on a fork
+// switch at a skipped slot. Which branch wins is left to the live drive.
+func (r *UDPReceiver) SpoolCompleteThrough(from, limit uint64) (last uint64, ok bool) {
+	if r.spool == nil || from == 0 || limit == 0 {
+		return 0, false
+	}
+	for slot := from; slot-from < limit; slot++ {
+		if _, complete := r.spool.IsComplete(slot); !complete {
+			break
+		}
+		last, ok = slot, true
+	}
+	if !ok {
+		return 0, false
+	}
+	for slot, parent := range r.spool.CompleteParents(from+1, from+limit-1) {
+		if parent+1 >= slot || parent >= last {
+			continue
+		}
+		if parent < from {
+			return 0, false
+		}
+		last = parent
+	}
+	return last, ok
+}
+
+// DiscardSpooledSkippedSlots discards complete spooled slots at or after from
+// that a later complete spooled block (within limit slots of from) links
+// past: the cluster skipped them on the branch that continued, so serving
+// them from the spool would replay an abandoned block and force a fork switch
+// at a skipped slot. A discarded slot is what an operator who moves its spool
+// file aside gets: the block source sees the later block's parent link and
+// skips the range provisionally, and repair fetches the slot again if
+// certificates name it. A skipped range is discarded only whole and only when
+// no spooled block builds on any slot in it; otherwise it is contested and
+// kept, and SpoolCompleteThrough stops before it.
+//
+// from-1 must be the rooted slot (the first catch-up pass starts right after
+// it). A spooled block whose parent is older than that slot skips a finalized
+// block, so it is abandoned: it is discarded itself and is never evidence
+// against other slots.
+func (r *UDPReceiver) DiscardSpooledSkippedSlots(from, limit uint64) []uint64 {
+	if r.spool == nil || from == 0 || limit == 0 {
+		return nil
+	}
+	parents := r.spool.CompleteParents(from, from+limit-1)
+	built := make(map[uint64]bool, len(parents))
+	for _, parent := range parents {
+		built[parent] = true
+	}
+	skipped := make(map[uint64]bool)
+	for slot, parent := range parents {
+		if parent < from-1 {
+			skipped[slot] = true // skips the rooted slot
+			continue
+		}
+		var run []uint64
+		contested := false
+		for gap := max(parent+1, from); gap < slot; gap++ {
+			if _, complete := parents[gap]; complete {
+				run = append(run, gap)
+				contested = contested || built[gap]
+			}
+		}
+		if contested {
+			continue
+		}
+		for _, gap := range run {
+			skipped[gap] = true
+		}
+	}
+	discard := make([]uint64, 0, len(skipped))
+	for slot := range skipped {
+		discard = append(discard, slot)
+	}
+	slices.Sort(discard)
+	for _, slot := range discard {
+		r.ResetSlotAndDiscardSpool(slot)
+	}
+	return discard
+}
+
 // SetShredSpool attaches the on-disk shred spool. Must be called before Run.
 func (r *UDPReceiver) SetShredSpool(spool *ShredSpool) {
 	r.spool = spool
@@ -384,6 +474,9 @@ func (r *UDPReceiver) SetHydrationWindow(lo, hi uint64) {
 	}
 }
 
+// SetRetentionFloor pins the assembler's age cutoff for repair catchup: slots
+// >= floor stay accepted however far they trail the live edge. 0 restores the
+// normal lag-based retention.
 func (r *UDPReceiver) SetRetentionFloor(slot uint64) {
 	r.assembler.SetRetentionFloor(slot)
 }

@@ -41,6 +41,7 @@ type ShredSpool struct {
 	seen            map[uint64]map[spoolShredKey]struct{} // distinct shreds appended this run
 	validated       map[uint64]bool                       // adopted files whose record tail was checked this run
 	complete        map[uint64]SpoolSlotMeta
+	parents         map[uint64]uint64       // parent slot of complete slots, read lazily from a data shred
 	journal         *spoolCompletionJournal // ordered completeness hints (complete.idx)
 	journalOverflow bool                    // Close must retry the current hints after queue overflow
 	bytes           int64
@@ -106,6 +107,7 @@ func OpenShredSpool(dir string, maxBytes int64) (*ShredSpool, error) {
 		seen:      make(map[uint64]map[spoolShredKey]struct{}),
 		validated: make(map[uint64]bool),
 		complete:  make(map[uint64]SpoolSlotMeta),
+		parents:   make(map[uint64]uint64),
 		maxBytes:  maxBytes,
 	}
 	entries, err := os.ReadDir(dir)
@@ -407,6 +409,7 @@ func (s *ShredSpool) dropSlotLocked(slot uint64) bool {
 // journal hints have been superseded. A failed fence leaves the file intact.
 func (s *ShredSpool) invalidateCompleteLocked(slot uint64) error {
 	delete(s.complete, slot)
+	delete(s.parents, slot)
 	if s.journal != nil {
 		return s.journal.invalidate(slot)
 	}
@@ -516,6 +519,78 @@ func (s *ShredSpool) readSlotLocked(slot uint64) ([][]byte, error) {
 	}
 	s.validated[slot] = true
 	return packets, nil
+}
+
+// CompleteParents returns the parent slot of every complete spooled slot in
+// [lo, hi], read from the slot's first intact data shred and cached until the
+// slot is discarded. Slots whose parent cannot be read are left out.
+func (s *ShredSpool) CompleteParents(lo, hi uint64) map[uint64]uint64 {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[uint64]uint64)
+	for slot := range s.complete {
+		if slot < lo || slot > hi {
+			continue
+		}
+		parent, ok := s.parents[slot]
+		if !ok {
+			parent, ok = s.readParentLocked(slot)
+			if !ok {
+				continue
+			}
+			s.parents[slot] = parent
+		}
+		out[slot] = parent
+	}
+	return out
+}
+
+// readParentLocked scans the slot file up to its first intact data shred of
+// that slot. It stops at a torn or corrupt record without repairing it;
+// readSlotLocked owns tail truncation.
+func (s *ShredSpool) readParentLocked(slot uint64) (uint64, bool) {
+	if sf := s.open[slot]; sf != nil {
+		_ = sf.w.Flush()
+	}
+	f, err := os.Open(s.pathFor(slot))
+	if err != nil {
+		return 0, false
+	}
+	defer f.Close()
+	r := bufio.NewReader(f)
+	var magic [len(spoolFileMagic)]byte
+	if _, err := io.ReadFull(r, magic[:]); err != nil || magic != spoolFileMagic {
+		return 0, false
+	}
+	var header [spoolRecordHeaderSize]byte
+	for {
+		if _, err := io.ReadFull(r, header[:]); err != nil {
+			return 0, false
+		}
+		n := binary.LittleEndian.Uint32(header[:4])
+		if n == 0 || n > packetDataSize {
+			return 0, false
+		}
+		packet := make([]byte, n)
+		if _, err := io.ReadFull(r, packet); err != nil {
+			return 0, false
+		}
+		if crc32.ChecksumIEEE(packet) != binary.LittleEndian.Uint32(header[4:]) {
+			return 0, false
+		}
+		shred, err := ParseShred(packet)
+		if err != nil || shred.Type != ShredTypeData || shred.Slot != slot {
+			continue
+		}
+		// An offset of zero or past the slot is malformed, not a parent.
+		if shred.ParentOffset == 0 || uint64(shred.ParentOffset) > slot {
+			return 0, false
+		}
+		return shred.ParentSlot(), true
+	}
 }
 
 // SetFloor advances the retention floor, deleting slot files strictly below
