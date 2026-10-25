@@ -2545,6 +2545,7 @@ func ReplayBlocks(
 			TurbineAlpenglowAddr: turbineAlpenglowAddr,
 			TurbineIdentity:      turbineIdentity,
 			LeaderForSlot:        global.LeaderForSlot,
+			RepairPeerSeeds:      repairPeerSeedsFromState(mithrilState),
 			BackupRpcEndpoints:   rpcBackups,
 			StartSlot:            startSlot,
 			EndSlot:              endSlot,
@@ -2648,6 +2649,15 @@ func ReplayBlocks(
 	}
 
 	blockStream := blockstream.NewBlockSource(opts)
+	// Every state save records the repair peers that served this run well, so
+	// the next start can repair before gossip rediscovers peers.
+	state.SetRepairPeerHintsProvider(func() []state.RepairPeerHint {
+		return repairPeerHints(blockStream.GoodRepairPeers(rememberedRepairPeers))
+	})
+	defer state.SetRepairPeerHintsProvider(nil)
+	if len(opts.RepairPeerSeeds) > 0 {
+		mlog.Log.Infof("repair: seeding %d peers remembered from the previous run", len(opts.RepairPeerSeeds))
+	}
 
 	if !isLive {
 		blockStream.DownloadInitialBlocks()

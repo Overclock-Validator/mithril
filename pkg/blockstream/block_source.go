@@ -105,6 +105,10 @@ type BlockSourceOpts struct {
 	// receiver (see TurbinePrewarm), injected into the staging buffer at
 	// construction so the catchup handoff can arm from them immediately.
 	PrewarmBlocks []*b.Block
+	// RepairPeerSeeds are peers that served repair in an earlier run (from
+	// the state file). They join gossip's repair peers until gossip has found
+	// enough of its own, so a restarted node repairs immediately.
+	RepairPeerSeeds []gossip.RepairPeer
 	// LocalBlocks carries fully frozen blocks from this node's producer. The
 	// source owns the consumer for exactly its own lifetime, avoiding stale
 	// consumers across a replay/fork-recovery restart. Replay adopts the
@@ -288,6 +292,13 @@ type BlockSourceStats struct {
 }
 
 type BlockSource struct {
+	// Repair peers remembered across restarts (RepairPeerSeeds,
+	// GoodRepairPeers). lastGoodRepairPeers keeps the latest non-empty list
+	// so a shutdown save still has it after the receiver is torn down.
+	repairPeerSeeds     []gossip.RepairPeer
+	startedAt           time.Time
+	lastGoodRepairPeers atomic.Pointer[[]gossip.RepairPeer]
+
 	rpcClients []*rpcclient.RpcClient // All RPC clients for block fetching (index 0 = primary)
 	streamChan chan *b.Block
 	// replayEmissionWg covers the unlocked channel-send window. Add happens
@@ -739,6 +750,8 @@ func NewBlockSource(opts *BlockSourceOpts) *BlockSource {
 	}
 
 	bs := &BlockSource{
+		repairPeerSeeds:                opts.RepairPeerSeeds,
+		startedAt:                      time.Now(),
 		rpcClients:                     rpcClients,
 		streamChan:                     make(chan *b.Block, streamChanBuffer),
 		startSlot:                      opts.StartSlot,
@@ -4119,4 +4132,42 @@ func (bs *BlockSource) ResetStats() {
 	bs.totalTipPollFails.Store(0)
 	// Reset the stats window start time for RPS calculation
 	bs.statsResetTime.Store(time.Now().Unix())
+}
+
+const (
+	// Seeds stay in the repair peer list until gossip lists this many peers
+	// or this long after the source starts, whichever comes first.
+	repairPeerSeedEnough = 64
+	repairPeerSeedWindow = 2 * time.Minute
+	// A peer is remembered if it answered a repair request this recently;
+	// at most goodRepairPeerKeep of the best are kept.
+	goodRepairPeerWindow = 10 * time.Minute
+	goodRepairPeerKeep   = 64
+)
+
+// repairPeerSource is gossip's repair peer list plus this run's seeds.
+func (bs *BlockSource) repairPeerSource(gossipPeers func() []gossip.RepairPeer) func() []gossip.RepairPeer {
+	return turbine.SeededRepairPeers(gossipPeers, bs.repairPeerSeeds, repairPeerSeedEnough, bs.startedAt.Add(repairPeerSeedWindow))
+}
+
+// GoodRepairPeers returns up to maxPeers repair peers that recently answered,
+// best first: the live receiver's list when it has one, else the last
+// non-empty list it reported.
+func (bs *BlockSource) GoodRepairPeers(maxPeers int) []gossip.RepairPeer {
+	bs.alpenglowMu.Lock()
+	receiver := bs.activeTurbineReceiver
+	bs.alpenglowMu.Unlock()
+	var peers []gossip.RepairPeer
+	if receiver != nil {
+		peers = receiver.GoodRepairPeers(goodRepairPeerKeep, goodRepairPeerWindow)
+	}
+	if len(peers) > 0 {
+		bs.lastGoodRepairPeers.Store(&peers)
+	} else if last := bs.lastGoodRepairPeers.Load(); last != nil {
+		peers = *last
+	}
+	if maxPeers > 0 && len(peers) > maxPeers {
+		peers = peers[:maxPeers]
+	}
+	return peers
 }

@@ -770,6 +770,7 @@ func (bs *BlockSource) driveRepairCatchup(ctx context.Context, receiver *turbine
 		if time.Since(lastPeerTableLog) >= 60*time.Second {
 			lastPeerTableLog = time.Now()
 			logRepairPeerTable(receiver, fmt.Sprintf("catchup head %d", waiting))
+			bs.GoodRepairPeers(1) // refresh the list a shutdown save falls back to
 			if quality := repairPeerQualityLine(receiver); quality != "" {
 				mlog.NamedFilef("catchup", "peer quality: %s", quality)
 			}

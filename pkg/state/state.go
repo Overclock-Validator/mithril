@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
@@ -168,6 +169,12 @@ type MithrilState struct {
 	// Key: epoch number (leader schedule epoch), Value: JSON-serialized epoch stakes
 	// These are NOT loaded from manifest - they are computed during replay and persisted.
 	ComputedEpochStakes map[uint64]string `json:"computed_epoch_stakes,omitempty"`
+
+	// RepairPeerHints are peers that recently served repair, saved so a
+	// restarted node can repair before gossip rediscovers peers. Hints only
+	// seed the repair peer list; they never affect replay or bank state, and
+	// a stale hint just stops being selected.
+	RepairPeerHints []RepairPeerHint `json:"repair_peer_hints,omitempty"`
 
 	// =========================================================================
 	// Legacy fields - kept for backwards compatibility
@@ -367,6 +374,26 @@ func (d *DelegatedStakeTotals) Decode() (map[[32]byte]VoteDelegation, error) {
 	return totals, nil
 }
 
+// RepairPeerHint is one remembered repair peer: its identity (repair
+// requests are addressed to it) and serve-repair UDP address.
+type RepairPeerHint struct {
+	Pubkey string `json:"pubkey"` // base58
+	Addr   string `json:"addr"`   // host:port
+}
+
+var repairPeerHintsProvider atomic.Pointer[func() []RepairPeerHint]
+
+// SetRepairPeerHintsProvider installs fn to supply current repair peer hints
+// on every Save; nil removes it. Saves keep the previous hints when fn has
+// none (for example right after startup).
+func SetRepairPeerHintsProvider(fn func() []RepairPeerHint) {
+	if fn == nil {
+		repairPeerHintsProvider.Store(nil)
+		return
+	}
+	repairPeerHintsProvider.Store(&fn)
+}
+
 // SnapshotInfo contains metadata about a downloaded snapshot file.
 type SnapshotInfo struct {
 	Path     string `json:"path"`
@@ -404,6 +431,11 @@ func LoadState(accountsDbDir string) (*MithrilState, error) {
 // Save writes the state to the accountsdb directory.
 func (s *MithrilState) Save(accountsDbDir string) error {
 	stateFile := filepath.Join(accountsDbDir, StateFileName)
+	if provider := repairPeerHintsProvider.Load(); provider != nil {
+		if hints := (*provider)(); len(hints) > 0 {
+			s.RepairPeerHints = hints
+		}
+	}
 
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
