@@ -884,7 +884,7 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 			return err
 		}
 	}
-	alpenglowMode, err := alpenglowModeForCluster(cluster)
+	alpenglowMode, err := resolveProtocolMode(cluster, config.GetString("consensus.protocol"))
 	if err != nil {
 		return err
 	}
@@ -1354,7 +1354,10 @@ func buildSnapshotConfig(rpcEndpoints []string) snapshotdl.SnapshotConfig {
 }
 
 func runLive(c *cobra.Command, args []string) {
-	alpenglowMode := cluster == "alpenglow"
+	alpenglowMode, protocolErr := resolveProtocolMode(cluster, config.GetString("consensus.protocol"))
+	if protocolErr != nil {
+		klog.Fatalf("%v", protocolErr)
+	}
 	if pprofPort != -1 {
 		startPprofHandlers(int(pprofPort))
 	}
@@ -2393,7 +2396,7 @@ postBootstrap:
 		mlog.Log.Warnf("storage.fork_aware was removed: the working-set suffix engine handles fork switches via unwind+re-execute — delete the key")
 	}
 	// [verifier]: the trailing execution verifier (dual-watermark second leg).
-	vcfg := replay.TrailingVerifierDefaults()
+	vcfg := defaultVerifierConfigForBlockSource(alpenglowMode, blockSource, blockRPCFallback)
 	if config.IsSet("verifier.enabled") {
 		vcfg.Enabled = config.GetBool("verifier.enabled")
 	}
@@ -4783,4 +4786,13 @@ func runReplayWithRecovery(
 		result = replay.ReplayBlocks(ctx, accountsDb, accountsDbPath, mithrilState, rs, retryStart, endSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, turbineShredVersion, turbineAlpenglowAddr, turbineIdentity, blockDir, txParallelism, isLive, useLightbringer, useTurbine, dbgOpts, metricsWriter, rpcServer, blockFetchOpts, consensusOpts, onCancelWriteState)
 	}
 	return result
+}
+
+func defaultVerifierConfigForBlockSource(alpenglow bool, source string, rpcFallback bool) replay.VerifierConfig {
+	cfg := replay.TrailingVerifierDefaults()
+	if alpenglow && source == "turbine" && !rpcFallback {
+		cfg.Enabled = false
+		cfg.ValidatorFooterHash = true
+	}
+	return cfg
 }
