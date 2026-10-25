@@ -42,7 +42,6 @@ func TestSavedStakeTotalsBoundToDurableStakeIndex(t *testing.T) {
 			require.NoError(t, err)
 			defer func() { db.CloseDb() }()
 			db.InitCaches()
-			db.RootedDurable = true
 
 			stakeOwner := [32]byte(addresses.StakeProgramAddr)
 			voter, aKey, bKey := solana.PublicKey{7}, solana.PublicKey{1}, solana.PublicKey{2}
@@ -80,7 +79,6 @@ func TestSavedStakeTotalsBoundToDurableStakeIndex(t *testing.T) {
 			db, err = accountsdb.OpenDb(dir)
 			require.NoError(t, err)
 			db.InitCaches()
-			db.RootedDurable = true
 			recovered, err := db.RecoverFoldState()
 			require.NoError(t, err)
 			var ctx state.ResumeContext

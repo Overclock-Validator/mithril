@@ -223,15 +223,12 @@ func TestInflationRewardRecordsUseCalculationTimeCommission(t *testing.T) {
 			stakeData := make([]byte, 200)
 			copy(stakeData, encoded.Bytes())
 			stakeAccount := &accounts.Account{Key: stake, Lamports: 1_000, Owner: a.StakeProgramAddr, Data: stakeData}
-			stored := make(chan struct{})
-			require.NoError(t, db.StoreAccounts([]*accounts.Account{
+			seedDurableAccounts(t, db, []*accounts.Account{
 				stakeAccount, {Key: collector, Lamports: 1_000, Owner: a.VoteProgramAddr},
-			}, slot, func() { close(stored) }))
-			<-stored
+			}, slot)
 			global.EnqueuePendingStakePubkey(slot, stake)
 			_, err = global.FlushPendingStakePubkeysThrough(dir, slot)
 			require.NoError(t, err)
-			db.RootedDurable = true
 
 			f := &features.Features{}
 			if tc.basisPoints {
