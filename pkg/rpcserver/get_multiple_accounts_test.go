@@ -192,8 +192,6 @@ func TestGetMultipleAccountsEncodingsAndExactConfig(t *testing.T) {
 		require.Equal(t, -32016, rpcErr.Code)
 		require.Equal(t, uint64(42), rpcErr.Data.ContextSlot)
 	}
-	body := getBlockHistoryHTTPCall(t, endpoint, "getMultipleAccounts", `[[],{"encoding":"jsonParsed"}]`)
-	requireGetBlockHistoryError(t, body, -32602, "getMultipleAccounts jsonParsed is not supported")
 }
 
 func TestGetMultipleAccountsSDKLookupTableConsumer(t *testing.T) {

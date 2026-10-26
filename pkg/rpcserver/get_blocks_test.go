@@ -159,23 +159,43 @@ func (ctx *blocksReadContext) Err() error {
 	return ctx.Context.Err()
 }
 
-func TestGetBlocksRejectsPublicationChanges(t *testing.T) {
+func TestGetBlocksPublicationChanges(t *testing.T) {
 	for _, changeVersion := range []bool{false, true} {
 		server, original := getBlocksFixture(t)
 		original.Close()
+		var calls int
 		endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ctx := &blocksReadContext{Context: r.Context(), action: func() { server.SetRootedBankState(12, 2, 0) }}
+			owner := newResponseOwner(r.Context(), w, server.queryResponses, time.Now().Add(historyResponseTimeout))
+			defer func() {
+				require.NoError(t, owner.release())
+				calls = owner.calls
+			}()
+			ctx := &blocksReadContext{Context: context.WithValue(r.Context(), queryResponseKey{}, owner), action: func() { server.SetRootedBankState(12, 2, 0) }}
 			if changeVersion {
 				ctx.action = func() {
 					if _, err := server.acctsDb.CommitBatch([]accounts.SlotDelta{{Slot: 13, Delta: []*accounts.Account{{Key: solana.PublicKey{205}, Lamports: 13}}}}, 13, nil, nil); err != nil {
 						t.Errorf("change committed version: %v", err)
 					}
+					// This publication deliberately never finishes. Expire only
+					// the owner's absolute bound, not the context or network write.
+					owner.deadline = time.Now().Add(10 * time.Millisecond)
 				}
 			}
-			server.ServeHTTP(w, r.WithContext(ctx))
+			server.rpcService.ServeHTTP(w, r.WithContext(ctx))
 		}))
-		requireGetBlockHistoryError(t, getBlockHistoryHTTPCall(t, endpoint, "getBlocks", `[10,12]`), -32004, "Block not available for slot 10")
+		started := time.Now()
+		body := getBlockHistoryHTTPCall(t, endpoint, "getBlocks", `[10,12]`)
+		if changeVersion {
+			require.NotContains(t, body, "result")
+			require.Contains(t, string(body["error"]), context.DeadlineExceeded.Error())
+			require.Less(t, time.Since(started), time.Second)
+		} else {
+			require.NotContains(t, body, "error", "a harmless publication refresh must permit one fresh selection")
+			require.JSONEq(t, `[10,12]`, string(body["result"]))
+		}
 		endpoint.Close()
+		require.Equal(t, 1, calls)
+		require.Zero(t, len(server.queryResponses))
 	}
 	server, _ := getBlocksFixture(t)
 	ctx, cancel := context.WithCancel(t.Context())

@@ -43,15 +43,23 @@ Base64 is the default. Explicit `base58`, legacy `binary`, `base64` and
 `base64+zstd` encodings are supported. Base58 and binary are limited to 128 bytes
 of selected data. `dataSlice` requires unsigned integer `offset` and `length`;
 `space` continues to report the account's full data length. `minContextSlot`
-returns `-32016` when the selected root is behind the requested slot. Parsed JSON
-is not supported by this bounded multi-account method. The single-account
-method keeps its separate legacy binary default and parsed-vote support.
+returns `-32016` when the selected root is behind the requested slot.
+`jsonParsed` uses the same vote-account parser as `getAccountInfo`, including
+the V4 BLS public key. Unsupported or malformed account data falls back to
+base64. Parsed encoding cannot be combined with `dataSlice`. The single-account
+method keeps its separate legacy binary default.
 
 Each request has a 16 MiB full-account-data budget. Slicing does not reduce the
 charge. Duplicate occurrences, attempted cold decodes and discarded publication
 retries count toward it. Reads refuse data beyond the remaining budget before
 copying or allocating its body. This is not a whole-process memory limit;
 encoding buffers and data already in caches are separate.
+
+Parsed requests also have a 32 MiB aggregate budget for JSON-encoded account
+values, counting duplicates, nulls and base64 fallbacks. The fixed response
+envelope is separate. Values are measured after encoding; decoder allocations
+remain proportional to the charged input, and one value's encoding scratch space
+is not covered by this output budget. This is not a whole-process memory limit.
 
 ## Admission and recovery
 
