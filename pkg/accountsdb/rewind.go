@@ -27,7 +27,7 @@ type RewindPoint struct {
 // ListRewindPoints returns the available batch boundaries, ascending. Only
 // committed batches qualify (BatchSeq <= the fold meta watermark).
 func (db *AccountsDb) ListRewindPoints() ([]RewindPoint, error) {
-	db.foldMu.Lock()
+	db.foldMu.LockAs("list_rewind_points")
 	defer db.foldMu.Unlock()
 
 	meta, haveMeta, err := db.readFoldMeta()
@@ -148,12 +148,12 @@ func (db *AccountsDb) finalizeParkedRewindLeftoversLocked(throughSlot uint64) {
 // not reconcile an external state file; node callers must use
 // RewindToBatchBoundaryAndPersist.
 func (db *AccountsDb) RewindToBatchBoundary(throughSlot uint64) (RewindResult, error) {
-	db.foldMu.Lock()
+	db.foldMu.LockAs("rewind")
 	defer db.foldMu.Unlock()
 	// Recovery, rewind and their forensic moves change the directory outside
 	// compaction's tracking; the next compaction cycle rescans it.
 	defer db.invalidateCompactionInventoryLocked()
-	db.appendVecReadMu.Lock()
+	db.appendVecReadMu.LockAs("rewind")
 	defer db.appendVecReadMu.Unlock()
 
 	intent, err := db.readRewindIntentLocked()
@@ -186,7 +186,7 @@ func (db *AccountsDb) rewindToBatchBoundaryLocked(throughSlot uint64) (RewindRes
 	if meta.ThroughSlot == throughSlot {
 		// This also repairs the in-memory publication state after a prior
 		// WAL-less commit succeeded but its explicit Flush reported an error.
-		db.readCacheEpochMu.Lock()
+		db.readCacheEpochMu.LockAs("rewind")
 		db.readCacheEpoch++
 		db.resetReadCachesLocked()
 		db.readCacheEpochMu.Unlock()
@@ -312,7 +312,7 @@ func (db *AccountsDb) rewindToBatchBoundaryLocked(throughSlot uint64) (RewindRes
 	}), nil); err != nil {
 		return res, err
 	}
-	db.readCacheEpochMu.Lock()
+	db.readCacheEpochMu.LockAs("rewind")
 	writeOpts := pebble.Sync
 	if db.IndexWALDisabled {
 		writeOpts = pebble.NoSync // the explicit Flush below provides durability

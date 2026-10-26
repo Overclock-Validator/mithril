@@ -52,7 +52,7 @@ type RecoveryResult struct {
 // It returns the recovered watermark plus the manifest-carried bankhash and
 // resume context at R, which the caller reconciles against the state file.
 func (db *AccountsDb) RecoverFoldState() (RecoveryResult, error) {
-	db.foldMu.Lock()
+	db.foldMu.LockAs("recovery")
 	defer db.foldMu.Unlock()
 	// Recovery, rewind and their forensic moves change the directory outside
 	// compaction's tracking; the next compaction cycle rescans it.

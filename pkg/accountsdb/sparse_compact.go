@@ -105,7 +105,7 @@ func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte,
 		return 0, scanned, false, nil
 	}
 	if retained == 0 {
-		db.appendVecReadMu.Lock()
+		db.appendVecReadMu.LockAs("compaction")
 		err := removeSourceFiles(db.AcctsDir, path, c.manifestPath)
 		db.appendVecReadMu.Unlock()
 		if err == nil {
@@ -124,7 +124,7 @@ func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte,
 	}
 	// Drain readers holding older index snapshots before punching any bytes.
 	// foldMu prevents new index generations while the plan is applied.
-	db.appendVecReadMu.Lock()
+	db.appendVecReadMu.LockAs("compaction")
 	defer db.appendVecReadMu.Unlock()
 	for _, span := range dead {
 		if err := punchDeadPayload(f, span.offset, span.length); err != nil {

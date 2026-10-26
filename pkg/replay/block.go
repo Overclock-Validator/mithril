@@ -2678,11 +2678,13 @@ func ReplayBlocks(
 			StreamingExecutionCfg.workers(txParallelism), StreamingExecutionCfg.MinGroupBatches, StreamingExecutionCfg.maxOpenAge())
 	}
 
+	lastRowAt := time.Now()
 	for {
 		// The collector is per replay attempt. Discarded candidates, skipped
 		// slots, and typed-recovery exits must never leak timings into the next
 		// successfully written slot (including a later ReplayBlocks invocation).
 		metrics.GlobalBlockReplay = metrics.BlockReplay{}
+		iterationStart := time.Now()
 		if ctx.Err() != nil {
 			mlog.Log.Infof("context cancelled, stopping replay: %v", ctx.Err())
 			result.WasCancelled = true
@@ -3054,6 +3056,7 @@ func ReplayBlocks(
 			record.FullToReady.AddTiming(ingressTimings.FullToReady)
 		}
 		start := time.Now()
+		foldBusyAtStart := promoter.busyThrough(start)
 
 		// Notify block source we're starting execution - in near-tip mode this
 		// triggers fetching N+1 so RPC latency overlaps with execution time
@@ -3104,7 +3107,12 @@ func ReplayBlocks(
 				if lastSlotCtx != nil {
 					boundaryParentSlot = lastSlotCtx.Slot
 				}
-				if foldRootedPrefix(true) {
+				settleStart := time.Now()
+				halted := foldRootedPrefix(true)
+				forcedFoldSettlement.Observe(time.Since(settleStart), func() string {
+					return fmt.Sprintf("slot %d: folded the rooted prefix synchronously before an epoch-boundary scan", block.Slot)
+				})
+				if halted {
 					break
 				}
 				if err := requireDurableEpochBoundaryParent(block.Slot, boundaryParentSlot, mithrilState.LastRootedSlot); err != nil {
@@ -3232,6 +3240,7 @@ func ReplayBlocks(
 		if lastSlotCtx != nil {
 			parentBankSysvars = lastSlotCtx.BankSysvars()
 		}
+		wholeBlock := false
 		if block.FromLocalProduction {
 			streamer.discardSlot(block.Slot, "local_production")
 			lastSlotCtx, err = adoptLocalLeaderBlock(block, unrootedTailState, transactionStatuses, persistedHashes)
@@ -3253,10 +3262,14 @@ func ReplayBlocks(
 			if !streamed {
 				streamer.noteWholeBlock(block)
 				lastSlotCtx, err = ProcessBlock(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, unrootedTailState, transactionStatuses, alpenglowClock, parentBankSysvars)
+				wholeBlock = true
 			}
 		}
 		processBlockEnd := time.Now()
 		metrics.GlobalBlockReplay.ProcessBlock.AddTiming(processBlockEnd.Sub(processBlockStart))
+		if wholeBlock && err == nil {
+			recordProcessBlockUnstaged(processBlockEnd.Sub(processBlockStart), block.Slot)
+		}
 		if err != nil {
 			mlog.Log.Errorf("error encountered during block replay: %s\n", err)
 			result.Error = err
@@ -3475,6 +3488,9 @@ func ReplayBlocks(
 			mlog.Log.Infof("rooted-durable: memory/slot backpressure at slot %d (held_slots=%d retained_bytes=%d)", block.Slot, unrootedTailState.overlay.HeldSlots(), unrootedTailState.overlay.RetainedBytes())
 			stillOverCap := settleFoldsAtCapacity(unrootedTailState, promoter, block.Slot, applyFoldOutcome, func() bool { return foldRootedPrefix(false) })
 			mlog.Log.Infof("rooted-durable: backpressure settled in %s (held_slots=%d retained_bytes=%d)", time.Since(pressureStart).Round(time.Millisecond), unrootedTailState.overlay.HeldSlots(), unrootedTailState.overlay.RetainedBytes())
+			foldBackpressure.Observe(time.Since(pressureStart), func() string {
+				return fmt.Sprintf("slot %d: replay waited for folds (fold in flight: %t, held_slots=%d, retained_bytes=%d)", block.Slot, hadInFlightFold, unrootedTailState.overlay.HeldSlots(), unrootedTailState.overlay.RetainedBytes())
+			})
 			if result.Error != nil || promoter.failure != nil {
 				break
 			}
@@ -3508,6 +3524,9 @@ func ReplayBlocks(
 		metrics.GlobalBlockReplay.PostProcessBlock.AddTiming(slotReplayEnd.Sub(postProcessBlockStart))
 		slotReplayDuration := slotReplayEnd.Sub(start)
 		metrics.GlobalBlockReplay.SlotReplay.AddTiming(slotReplayDuration)
+		if promoter != nil {
+			metrics.GlobalBlockReplay.FoldOverlap.AddTiming(promoter.busyThrough(slotReplayEnd) - foldBusyAtStart)
+		}
 
 		txnCount := len(block.Transactions)
 		totalCU := lastSlotCtx.TotalComputeUnitsConsumed
@@ -3747,6 +3766,10 @@ func ReplayBlocks(
 		}
 		{
 			metrics.GlobalBlockReplay.Slot = block.Slot
+			rowAt := time.Now()
+			recordUnrootedTail(unrootedTailState)
+			recordReplayLoopClosure(rowAt, lastRowAt, iterationStart, waitTime, slotReplayEnd, block.Slot)
+			lastRowAt = rowAt
 			if metricsWriter != nil {
 				encoder := json.NewEncoder(metricsWriter)
 				err := encoder.Encode(metrics.GlobalBlockReplay)
@@ -4495,9 +4518,9 @@ func ProcessBlock(
 	// the SlotCtx; streaming execution drives the same object group by group.
 	exec := newBlockExecution(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, tail, transactionStatuses, alpenglowClock, parentBankSysvars)
 	defer exec.close()
-	exec.setReplayStage("prepare_dependency_planner")
-
+	exec.setReplayStage("parameter_arena")
 	resetSerializedParameterArena()
+	exec.setReplayStage("prepare_dependency_planner")
 
 	plannerPreparationStart := time.Now()
 	var planner *preparedDependencyPlanner

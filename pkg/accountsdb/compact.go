@@ -120,7 +120,7 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 		cfg.MaxFilesPerCycle = 16
 	}
 
-	db.foldMu.Lock()
+	db.foldMu.LockAs("compaction")
 	defer db.foldMu.Unlock()
 	// A cycle that stops early (error or panic) after it started reclaiming
 	// files may have changed some the inventory has not recorded yet; the next
@@ -543,7 +543,7 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 	if len(data) == 0 || len(liveIdx) == 0 {
 		// Fully dead (or empty bankhash-only segment past the horizon): no
 		// index state references it; drop source + its manifest.
-		db.appendVecReadMu.Lock()
+		db.appendVecReadMu.LockAs("compaction")
 		err := removeSourceFiles(db.AcctsDir, srcPath, c.manifestPath)
 		db.appendVecReadMu.Unlock()
 		if err != nil {
@@ -627,7 +627,7 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 	// because compact manifests are not replayed at recovery. Exclude snapshot
 	// readers from this short move-to-unlink window, so each sees either the old
 	// path or the new path and never needs a cross-epoch per-key fallback.
-	db.appendVecReadMu.Lock()
+	db.appendVecReadMu.LockAs("compaction")
 	defer db.appendVecReadMu.Unlock()
 	batch := db.Index.NewBatch()
 	defer batch.Close()

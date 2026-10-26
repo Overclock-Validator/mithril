@@ -165,7 +165,7 @@ func (db *AccountsDb) beginRewindIntentLocked(target uint64) error {
 // PendingRewindTarget returns an exact, validated intent target (zero if none).
 // Legacy parked manifests without an intent are handled separately by startup.
 func (db *AccountsDb) PendingRewindTarget() (uint64, error) {
-	db.foldMu.Lock()
+	db.foldMu.LockAs("rewind_intent")
 	defer db.foldMu.Unlock()
 	in, err := db.readRewindIntentLocked()
 	if err != nil || in == nil {
@@ -181,12 +181,12 @@ func (db *AccountsDb) PendingRewindTarget() (uint64, error) {
 // The intent is cleared only after persist succeeds, including on a retry after
 // index rollback/forensic cleanup. Ordinary recovery defers to this intent.
 func (db *AccountsDb) RewindToBatchBoundaryAndPersist(target uint64, persist func(RewindResult) error) (RewindResult, error) {
-	db.foldMu.Lock()
+	db.foldMu.LockAs("rewind")
 	defer db.foldMu.Unlock()
 	// Recovery, rewind and their forensic moves change the directory outside
 	// compaction's tracking; the next compaction cycle rescans it.
 	defer db.invalidateCompactionInventoryLocked()
-	db.appendVecReadMu.Lock()
+	db.appendVecReadMu.LockAs("rewind")
 	defer db.appendVecReadMu.Unlock()
 	if persist == nil {
 		return RewindResult{}, fmt.Errorf("rewind requires durable state callback")

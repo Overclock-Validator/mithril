@@ -3005,9 +3005,11 @@ postBootstrap:
 	}
 	if alpenglowMode {
 		consensusOpts.TransactionStatusCheckpointAfterCommit = func(selected *state.TransactionStatusCheckpointRef) error {
+			run := transactionStatusCleanupTask.Start()
 			removed, err := cleanupRetainedTransactionStatusCheckpoints(
 				accountsPath, accountsDb, compactCfg.RewindHorizonBatches, selected,
 			)
+			run.EndErr(err, func() string { return fmt.Sprintf("removed %d file(s)", len(removed)) })
 			if err == nil && len(removed) > 0 {
 				mlog.Log.FileOnlyf("transaction-status checkpoint retention removed %d file(s) outside the %d-batch rewind horizon",
 					len(removed), compactCfg.RewindHorizonBatches)

@@ -19,6 +19,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/features"
+	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/sbpf"
 	"github.com/cockroachdb/pebble"
@@ -44,7 +45,7 @@ type AccountsDb struct {
 	// Pebble index commit. Readers use that view for changed keys while the
 	// index and caches catch up, so the expensive durable commit does not hold
 	// this mutex and old snapshot reads still cannot publish stale cache bytes.
-	readCacheEpochMu sync.RWMutex
+	readCacheEpochMu metrics.TimedRWMutex
 	readCacheEpoch   uint64
 	pendingFold      map[[32]byte]dedupedVersion
 	commonAdmission  *commonCacheAdmission
@@ -54,7 +55,7 @@ type AccountsDb struct {
 	// its file reads complete. Compaction/rewind take the write side across an
 	// index move plus source unlink, and the legacy mutable store takes it while
 	// writing, so a batch never falls through to a different logical epoch.
-	appendVecReadMu sync.RWMutex
+	appendVecReadMu metrics.TimedRWMutex
 
 	// RootedDurable keeps the canonical store rooted-only: replayed slots buffer
 	// in an in-RAM working set (pkg/accounts) and fold to disk via CommitBatch
@@ -71,7 +72,7 @@ type AccountsDb struct {
 
 	// Batch-fold state (segment.go/fold.go/recovery.go). foldMu serializes
 	// CommitBatch, recovery, rewind, and compaction.
-	foldMu           sync.Mutex
+	foldMu           metrics.TimedMutex
 	lastBatchSeq     uint64        // guarded by foldMu; seeded by RecoverFoldState
 	durableThrough   atomic.Uint64 // observability: highest durably folded slot
 	foldHooks        foldTestHooks // test-only crash injection
@@ -186,13 +187,15 @@ func OpenDb(accountsDbDir string) (*AccountsDb, error) {
 	largestFileId := binary.LittleEndian.Uint64(largestFileIdBytes)
 
 	indexDir := filepath.Join(accountsDbDir, "mithril_db")
-	db, err := pebble.Open(indexDir, NewAccountsIndexPebbleOptions(silentLogger{}))
+	indexOpts := NewAccountsIndexPebbleOptions(silentLogger{})
+	indexOpts.EventListener = pebbleEventListener("index")
+	db, err := pebble.Open(indexDir, indexOpts)
 	if err != nil {
 		return nil, fmt.Errorf("opening indexDir=%s: %w", indexDir, err)
 	}
 
 	bankhashDir := filepath.Join(accountsDbDir, "bankhash_db")
-	bankhashDb, err := pebble.Open(bankhashDir, &pebble.Options{Logger: silentLogger{}})
+	bankhashDb, err := pebble.Open(bankhashDir, &pebble.Options{Logger: silentLogger{}, EventListener: pebbleEventListener("bankhash")})
 	if err != nil {
 		return nil, fmt.Errorf("opening bankhashDir=%s: %w", bankhashDir, err)
 	}
@@ -200,6 +203,7 @@ func OpenDb(accountsDbDir string) (*AccountsDb, error) {
 	accountsDb := &AccountsDb{
 		IndexWALDisabled: DisableIndexWAL, Index: db, BankHashStore: bankhashDb, AcctsDir: appendVecsDir}
 	accountsDb.LargestFileId.Store(largestFileId)
+	accountsDb.bindLockDiagnostics()
 
 	accountsDb.inProgressStoreRequests = list.New()
 	accountsDb.storeRequestChan = make(chan *list.Element)
@@ -700,7 +704,7 @@ func (accountsDb *AccountsDb) StoreAccounts(
 		m[a.Key] = a
 	}
 	// Must not hold lock during channel send to avoid deadlock with storeWorker.
-	accountsDb.appendVecReadMu.Lock()
+	accountsDb.appendVecReadMu.LockAs("legacy_store")
 	accountsDb.inProgressStoreRequestsMu.Lock()
 	element := accountsDb.inProgressStoreRequests.PushBack(storeRequest{accts: accts, slot: slot, m: m, cb: cb})
 	accountsDb.inProgressStoreRequestsMu.Unlock()
@@ -715,7 +719,7 @@ func (accountsDb *AccountsDb) storeAccountsSync(accts []*accounts.Account, slot 
 	// cache epoch before disk I/O. New readers see the overlay; older readers
 	// cannot publish stale values after this bump.
 	accountsDb.refreshReadCaches(accts)
-	accountsDb.appendVecReadMu.Lock()
+	accountsDb.appendVecReadMu.LockAs("legacy_store")
 	defer accountsDb.appendVecReadMu.Unlock()
 	if StoreAccountsWorkers == 1 {
 		accountsDb.storeAccountsInternal(accts, slot)
@@ -730,7 +734,7 @@ func (accountsDb *AccountsDb) storeAccountsSync(accts []*accounts.Account, slot 
 // dedicated cache. Deleted and owner-transitioned entries are evicted from the
 // cache that can no longer serve them.
 func (accountsDb *AccountsDb) refreshReadCaches(accts []*accounts.Account) {
-	accountsDb.readCacheEpochMu.Lock()
+	accountsDb.readCacheEpochMu.LockAs("cache_refresh")
 	defer accountsDb.readCacheEpochMu.Unlock()
 	accountsDb.readCacheEpoch++
 	accountsDb.refreshReadCacheEntries(accts)

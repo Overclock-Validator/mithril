@@ -54,9 +54,12 @@ type blockExecution struct {
 	ctx            context.Context
 	task           *trace.Task
 	setReplayStage func(string)
-	watchdogDone   chan struct{}
-	sigverifyWg    sync.WaitGroup
-	closed         bool
+	// recordStages writes the stage totals into this block's metrics; called
+	// once, when the bank finalizes.
+	recordStages func()
+	watchdogDone chan struct{}
+	sigverifyWg  sync.WaitGroup
+	closed       bool
 
 	// Whole-block inputs to the tail, set by ProcessBlock.
 	executionPlan     blockTransactionExecutionPlan
@@ -122,9 +125,43 @@ func newBlockExecution(
 
 	var replayStage atomic.Value
 	var replayStageSince atomic.Int64
+	// Stage accounting: each change ends the previous stage, so the stages tile
+	// the bank's execution. Streaming changes stages from executor goroutines.
+	var (
+		stageMu    sync.Mutex
+		stageName  string
+		stageStart time.Time
+		stageTimes = make(map[string]time.Duration, 16)
+	)
 	exec.setReplayStage = func(stage string) {
+		stageMu.Lock()
+		now := time.Now()
 		replayStage.Store(stage)
-		replayStageSince.Store(time.Now().UnixNano())
+		replayStageSince.Store(now.UnixNano())
+		if stageName != "" {
+			stageTimes[stageName] += now.Sub(stageStart)
+		}
+		stageName, stageStart = stage, now
+		stageMu.Unlock()
+	}
+	exec.recordStages = func() {
+		stageMu.Lock()
+		defer stageMu.Unlock()
+		if stageName != "" {
+			now := time.Now()
+			stageTimes[stageName] += now.Sub(stageStart)
+			stageStart = now
+		}
+		if metrics.GlobalBlockReplay.ReplayStages == nil {
+			metrics.GlobalBlockReplay.ReplayStages = make(map[string]metrics.Timing, len(stageTimes))
+		}
+		for name, d := range stageTimes {
+			t := metrics.GlobalBlockReplay.ReplayStages[name]
+			t.Count++
+			t.SumNanoseconds += uint64(d)
+			metrics.GlobalBlockReplay.ReplayStages[name] = t
+		}
+		clear(stageTimes)
 	}
 
 	exec.watchdogDone = make(chan struct{})
@@ -225,7 +262,7 @@ const streamingOverlayKeys = 4096
 func (exec *blockExecution) open() error {
 	defer exec.captureAccountLoader()()
 	block := exec.block
-	exec.setReplayStage("prepare_dependency_planner")
+	exec.setReplayStage("parameter_arena")
 	resetSerializedParameterArena()
 
 	start := time.Now()
@@ -713,5 +750,6 @@ func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
 
 	global.IncrTransactionCount(executionPlan.processedTxCount)
 	setReplayStage("done")
+	exec.recordStages()
 	return slotCtx, err
 }

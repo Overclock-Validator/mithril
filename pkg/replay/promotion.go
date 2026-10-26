@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/global"
+	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/state"
@@ -528,10 +530,32 @@ func (t *unrootedTail) buildFoldJob(through uint64, force bool, hookOverrides ..
 // runFoldJob performs the durable half of a fold (worker-safe: no tail
 // state). Stake-index entries flush (fsync'd) BEFORE the batch commit — see
 // promoteRootedBatched for why that order is a correctness requirement.
-func runFoldJob(committer batchCommitter, job *foldJob) error {
+// foldJobTask budgets one background fold: stake-index flush, CommitBatch and
+// the transaction-status checkpoint cleanup after it.
+var foldJobTask = metrics.Background("replay.fold_job", 2*time.Second)
+
+func runFoldJob(committer batchCommitter, job *foldJob) (err error) {
 	if job == nil {
 		return errors.New("fold job has no resume context")
 	}
+	run := foldJobTask.Start()
+	through := job.through
+	// Sequential steps of the fold, logged once per fold and in over-budget
+	// warnings: checkpoint preparation, stake-index flush, CommitBatch (with its
+	// own breakdown) and the checkpoint cleanup after it.
+	var prepare, stakeFlush, commit, cleanup time.Duration
+	var result accountsdb.BatchCommitResult
+	describe := func() string {
+		return fmt.Sprintf("fold through slot %d: %d keys, %d MiB | checkpoint_prepare=%s stake_flush=%s commit=%s (%s) cleanup=%s",
+			through, result.Keys, result.Bytes>>20, prepare.Round(time.Microsecond), stakeFlush.Round(time.Microsecond),
+			commit.Round(time.Microsecond), result.Timings, cleanup.Round(time.Microsecond))
+	}
+	defer func() {
+		total := run.EndErr(err, describe)
+		if err == nil {
+			mlog.Log.FileOnlyf("fold timing: total=%s %s", total.Round(time.Microsecond), describe())
+		}
+	}()
 	// The overlay owns the versions until apply. Do not also retain an entire
 	// completed batch on the idle worker's stack or its result channel.
 	defer func() {
@@ -543,6 +567,7 @@ func runFoldJob(committer batchCommitter, job *foldJob) error {
 		return errors.New("fold job has no resume context")
 	}
 	var selectedCheckpoint *state.TransactionStatusCheckpointRef
+	step := time.Now()
 	if job.installTransactionStatusCheckpoint != nil {
 		start := time.Now()
 		payload, err := encodeTransactionStatusCheckpoint(job.transactionStatusSnapshot)
@@ -569,20 +594,28 @@ func runFoldJob(committer batchCommitter, job *foldJob) error {
 		return fmt.Errorf("fold chunk through slot %d: marshal resume context: %w", job.through, err)
 	}
 	job.ctxJSON = ctxJSON
+	prepare = time.Since(step)
 
+	step = time.Now()
 	if job.stakeIdxDir != "" {
 		if _, err := global.FlushPendingStakePubkeysThrough(job.stakeIdxDir, job.through); err != nil {
 			return fmt.Errorf("fold chunk through slot %d: flush stake index: %w", job.through, err)
 		}
 	}
-	if _, err := committer.CommitBatch(job.chunk, job.through, job.bankhashes, job.ctxJSON); err != nil {
+	stakeFlush = time.Since(step)
+	step = time.Now()
+	result, err = committer.CommitBatch(job.chunk, job.through, job.bankhashes, job.ctxJSON)
+	commit = time.Since(step)
+	if err != nil {
 		return fmt.Errorf("fold chunk through slot %d: %w", job.through, err)
 	}
+	step = time.Now()
 	if job.afterTransactionStatusCheckpointCommit != nil {
 		if err := job.afterTransactionStatusCheckpointCommit(selectedCheckpoint); err != nil {
 			mlog.Log.Warnf("fold chunk through slot %d: transaction status checkpoint cleanup failed after durable commit: %v", job.through, err)
 		}
 	}
+	cleanup = time.Since(step)
 	return nil
 }
 
@@ -618,6 +651,39 @@ type asyncPromoter struct {
 	inFlight  bool
 	failure   error // latched until reopen/recovery; never retry a failed durable write in place
 	done      chan struct{}
+
+	// Worker busy time, for measuring overlap with replay.
+	busyMu    sync.Mutex
+	busyTotal time.Duration
+	busySince time.Time // zero while idle
+}
+
+// busyThrough returns the worker's cumulative busy time up to now.
+func (p *asyncPromoter) busyThrough(now time.Time) time.Duration {
+	if p == nil {
+		return 0
+	}
+	p.busyMu.Lock()
+	defer p.busyMu.Unlock()
+	total := p.busyTotal
+	if !p.busySince.IsZero() && now.After(p.busySince) {
+		total += now.Sub(p.busySince)
+	}
+	return total
+}
+
+func (p *asyncPromoter) setBusy(busy bool) {
+	now := time.Now()
+	p.busyMu.Lock()
+	defer p.busyMu.Unlock()
+	if busy {
+		p.busySince = now
+		return
+	}
+	if !p.busySince.IsZero() {
+		p.busyTotal += now.Sub(p.busySince)
+		p.busySince = time.Time{}
+	}
 }
 
 func newAsyncPromoter(committer batchCommitter) *asyncPromoter {
@@ -635,7 +701,9 @@ func (p *asyncPromoter) run() {
 	defer close(p.done)
 	for job := range p.jobs {
 		start := time.Now()
+		p.setBusy(true)
 		err := runFoldJob(p.committer, job)
+		p.setBusy(false)
 		if err == nil {
 			mlog.Log.FileOnlyf("async fold: committed %d slots through %d in %s retained_bytes=%d checkpoint_capture=%s checkpoint_encode=%s checkpoint_bytes=%d",
 				job.slotCount, job.through, time.Since(start).Round(time.Millisecond), job.retainedBytes,

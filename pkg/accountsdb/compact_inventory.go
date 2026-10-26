@@ -9,7 +9,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
+	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 )
 
@@ -230,4 +232,19 @@ func (inv *compactionInventory) diff(fresh *compactionInventory) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// Lock diagnostics budgets. foldMu serializes folds against compaction,
+// recovery and rewind, so a long hold delays folding; appendVecReadMu and
+// readCacheEpochMu sit on the account read path, so short waits matter.
+var (
+	foldLockStat       = metrics.Lock("accountsdb.fold", 250*time.Millisecond, time.Second)
+	appendVecLockStat  = metrics.Lock("accountsdb.append_vec_read", 20*time.Millisecond, 100*time.Millisecond)
+	cacheEpochLockStat = metrics.Lock("accountsdb.read_cache_epoch", 10*time.Millisecond, 50*time.Millisecond)
+)
+
+func (db *AccountsDb) bindLockDiagnostics() {
+	db.foldMu.Bind(foldLockStat)
+	db.appendVecReadMu.Bind(appendVecLockStat)
+	db.readCacheEpochMu.Bind(cacheEpochLockStat)
 }
