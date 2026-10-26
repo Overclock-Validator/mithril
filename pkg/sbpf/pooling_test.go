@@ -97,7 +97,7 @@ func BenchmarkVMCreateAndFinish(b *testing.B) {
 func TestPooledHeapDirtyBitmapBoundary(t *testing.T) {
 	oldUsePool, oldPool := UsePool, heapPool
 	UsePool = true
-	heapPool = &sync.Pool{New: func() any { return newHeap() }}
+	heapPool = &sync.Pool{New: func() any { return &byteBuffer{data: newHeap()} }}
 	t.Cleanup(func() { UsePool, heapPool = oldUsePool, oldPool })
 	for _, size := range []int{fastDirtyBytes, fastDirtyBytes + 1, 2 * fastDirtyBytes} {
 		for _, ver := range []uint32{sbpfver.SbpfVersionV0, sbpfver.SbpfVersionV2, sbpfver.SbpfVersionV3} {

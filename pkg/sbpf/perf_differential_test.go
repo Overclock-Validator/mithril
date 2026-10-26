@@ -388,8 +388,10 @@ func writeDifferentialDump(t *testing.T, w io.Writer, n int) {
 		ip.Finish()
 		if os.Getenv("SBPF_CHECK_POOL_ZERO") != "" {
 			// The buffers just returned to the pool must be all-zero.
-			st := stackMemPool.Get().([]byte)
-			hp := heapPool.Get().([]byte)
+			stHolder := stackMemPool.Get().(*byteBuffer)
+			st := stHolder.data
+			hpHolder := heapPool.Get().(*byteBuffer)
+			hp := hpHolder.data
 			for j, b := range st[:StackMax] {
 				if b != 0 {
 					t.Fatalf("program %d: pooled stack not zeroed at %d", i, j)
@@ -400,8 +402,8 @@ func writeDifferentialDump(t *testing.T, w io.Writer, n int) {
 					t.Fatalf("program %d: pooled heap not zeroed at %d", i, j)
 				}
 			}
-			stackMemPool.Put(st)
-			heapPool.Put(hp)
+			stackMemPool.Put(stHolder)
+			heapPool.Put(hpHolder)
 		}
 	}
 	for ver, count := range verifiedByVersion {

@@ -80,6 +80,7 @@ const upgradeableLoaderSizeOfBufferMetaData = 37
 const upgradeableLoaderSizeOfProgram = 36
 const upgradeableLoaderSizeOfProgramDataMetaData = 45
 const upgradeableLoaderSizeOfUninitialized = 4
+const minimumExtendProgramBytes = 10 * 1024
 
 func upgradeableLoaderSizeOfProgramData(programLen uint64) uint64 {
 	return safemath.SaturatingAddU64(upgradeableLoaderSizeOfProgramDataMetaData, programLen)
@@ -664,6 +665,7 @@ func serializeParametersAligned(execCtx *ExecutionCtx) ([]byte, []uint64, uint64
 
 	preLens := make([]uint64, len(accts))
 	accountMetadatas := make([]serializedAcctMetadata, len(accts))
+	maskRentEpoch := execCtx.Features.IsActive(features.MaskOutRentEpochInVmSerialization)
 	var inputRegions []sbpf.InputRegion
 	var regionStart uint64
 	var hostRegionStart uint64
@@ -761,15 +763,13 @@ func serializeParametersAligned(execCtx *ExecutionCtx) ([]byte, []uint64, uint64
 				// data in account
 				copy(serializedData[l+88:l+88+len(borrowedAcct.Data())], borrowedAcct.Data())
 
-				// zero the padding
-				paddingStart := l + 88 + len(borrowedAcct.Data())
-				paddingEnd := l + 88 + len(borrowedAcct.Data()) + int(MaxPermittedDataIncrease+alignmentOffset)
-				clear(serializedData[paddingStart:paddingEnd])
+				// Growth space and alignment padding are already zero: make returns
+				// zeroed storage, and the arena clears used storage on Reset.
 			}
 
 			// rent epoch
 			var rentEpoch uint64
-			if execCtx.Features.IsActive(features.MaskOutRentEpochInVmSerialization) {
+			if maskRentEpoch {
 				rentEpoch = math.MaxUint64
 			} else {
 				rentEpoch = borrowedAcct.RentEpoch()
@@ -1376,7 +1376,7 @@ func executeProgramFromBytes(execCtx *ExecutionCtx, programAddr solana.PublicKey
 // then reloaded from authoritative account data, never retained from that stream.
 // Replay must discard its stream before executing a different bank.
 func addProgramToCache(execCtx *ExecutionCtx, programAddr solana.PublicKey, entry *accountsdb.ProgramCacheEntry) {
-	if execCtx.SlotCtx == nil || execCtx.SlotCtx.AccountsDb == nil {
+	if execCtx.IsSimulation || execCtx.SlotCtx == nil || execCtx.SlotCtx.AccountsDb == nil {
 		return
 	}
 	execCtx.SlotCtx.AccountsDb.AddProgramToCache(programAddr, entry)
@@ -1498,7 +1498,9 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 	if !programAcct.IsExecutable() {
 		return InstrErrUnsupportedProgramId
 	}
-	if programAcct.Lamports() == 0 {
+	// The loader already validated the real account; legacy metadata-only
+	// program stubs deliberately carry zero lamports.
+	if programAcct.Lamports() == 0 && !programAcct.Account.IsDummy {
 		return InstrErrUnsupportedProgramId
 	}
 
@@ -1551,9 +1553,12 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 		}
 
 		start := time.Now()
-		programDataAcct, err := execCtx.SlotCtx.GetAccount(programAcctState.Program.ProgramDataAddress)
+		// Program loading only reads this immutable bank-visible account. The
+		// ELF loader owns its relocated bytes, and BindSource copies on cache
+		// insertion; cache hits still compare the full source and feature set.
+		programDataAcct, err := execCtx.SlotCtx.GetAccountShared(programAcctState.Program.ProgramDataAddress)
 		if err != nil {
-			programDataAcct, err = execCtx.SlotCtx.GetAccountFromAccountsDb(programAcctState.Program.ProgramDataAddress)
+			programDataAcct, err = execCtx.SlotCtx.getAccountFromAccountsDbReadOnly(programAcctState.Program.ProgramDataAddress)
 			if err != nil {
 				return InstrErrUnsupportedProgramId
 			}
@@ -2691,7 +2696,9 @@ func UpgradeableLoaderClose(execCtx *ExecutionCtx, txCtx *TransactionCtx, instrC
 					if err != nil {
 						return err
 					}
-					execCtx.SlotCtx.AccountsDb.RemoveProgramFromCache(closeKey)
+					if !execCtx.IsSimulation {
+						execCtx.SlotCtx.AccountsDb.RemoveProgramFromCache(closeKey)
+					}
 				}
 
 			default:
@@ -2792,6 +2799,17 @@ func UpgradeableLoaderExtendProgram(execCtx *ExecutionCtx, txCtx *TransactionCtx
 	if newLen > MaxPermittedDataLength {
 		//mlog.Log.Debugf("Extended ProgramData length of %d bytes exceeds max account data length of %d bytes", newLen, MaxPermittedDataLength)
 		return InstrErrInvalidRealloc
+	}
+
+	if execCtx.Features.IsActive(features.LoaderV3MinimumExtendProgramSize) {
+		// SIMD-0431: Agave requires at least 10 KiB, except when a smaller
+		// extension fills all remaining space up to the account size limit.
+		// Keep this after the size-limit check and before reading Clock so
+		// invalid instructions return the same error as Agave.
+		headroom := safemath.SaturatingSubU64(MaxPermittedDataLength, oldLen)
+		if additionalBytes < minimumExtendProgramBytes && uint64(additionalBytes) != headroom {
+			return InstrErrInvalidArgument
+		}
 	}
 
 	clock, err := ReadClockSysvar(execCtx)

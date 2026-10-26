@@ -50,10 +50,20 @@ func (c Config) normalized() Config {
 
 // Stats aggregates per-stage counters.
 type Stats struct {
-	Ingress   IngressStats
+	Ingress IngressStats
+	// Submitted counts Submit calls by packet source. Accepted packets are
+	// also counted in Ingress.
+	Submitted [packet.NumSources]SubmitStats
 	Dedup     dedup.Stats
 	Sigverify SigverifyStats
 	Sink      sink.Stats
+}
+
+// SubmitStats counts packets handed to Submit from one source.
+type SubmitStats struct {
+	Enqueued      uint64
+	DroppedFull   uint64
+	DroppedClosed uint64
 }
 
 type IngressStats struct {
@@ -77,6 +87,10 @@ type Pipeline struct {
 	cfg      Config
 	stopOnce sync.Once
 	wg       sync.WaitGroup
+
+	// closeMu orders Submit against Stop closing ingress.
+	closeMu sync.RWMutex
+	closed  bool
 }
 
 // Start launches the pipeline stages and returns the ingress send channel for QUIC.
@@ -127,6 +141,14 @@ func (p *Pipeline) Stats() Stats {
 			DroppedSigverify: atomic.LoadUint64(&p.stats.Sigverify.DroppedSigverify),
 		},
 	}
+	for src := range stats.Submitted {
+		counts := &p.stats.Submitted[src]
+		stats.Submitted[src] = SubmitStats{
+			Enqueued:      atomic.LoadUint64(&counts.Enqueued),
+			DroppedFull:   atomic.LoadUint64(&counts.DroppedFull),
+			DroppedClosed: atomic.LoadUint64(&counts.DroppedClosed),
+		}
+	}
 	if noop, ok := p.cfg.Sink.(*sink.Noop); ok {
 		stats.Sink = noop.Snapshot()
 	}
@@ -137,9 +159,36 @@ func (p *Pipeline) IngressStats() *IngressStats {
 	return &p.stats.Ingress
 }
 
+// Submit hands a packet from outside the QUIC listener to ingress without
+// blocking, and takes ownership of it. It returns false, releasing the
+// packet, if ingress is full or the pipeline has stopped.
+func (p *Pipeline) Submit(pkt packet.Packet) bool {
+	src := pkt.Source()
+	if src >= packet.NumSources {
+		src = packet.SourceQUIC
+	}
+	counts := &p.stats.Submitted[src]
+	p.closeMu.RLock()
+	defer p.closeMu.RUnlock()
+	if p.closed {
+		atomic.AddUint64(&counts.DroppedClosed, 1)
+		pkt.Release()
+		return false
+	}
+	if !TryEnqueue(p.ingress, pkt, &p.stats.Ingress) {
+		atomic.AddUint64(&counts.DroppedFull, 1)
+		return false
+	}
+	atomic.AddUint64(&counts.Enqueued, 1)
+	return true
+}
+
 func (p *Pipeline) Stop() {
 	p.stopOnce.Do(func() {
+		p.closeMu.Lock()
+		p.closed = true
 		close(p.ingress)
+		p.closeMu.Unlock()
 		p.wg.Wait()
 	})
 }

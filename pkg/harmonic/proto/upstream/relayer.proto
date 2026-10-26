@@ -1,0 +1,42 @@
+// Relayer/TPU proxy interface for the Harmonic validator.
+syntax = "proto3";
+
+import "packet.proto";
+import "shared.proto";
+
+package relayer;
+
+// Request for the relayer's TPU socket configuration.
+message GetTpuConfigsRequest {}
+
+// TPU socket addresses that the validator should advertise in gossip.
+message GetTpuConfigsResponse {
+  // Relayer's TPU socket for regular transactions.
+  shared.Socket tpu = 1;
+  // Relayer's TPU forward socket for forwarded transactions.
+  shared.Socket tpu_forward = 2;
+}
+
+// Request to subscribe to the relayer's packet stream.
+message SubscribePacketsRequest {}
+
+// Multiplexed stream of packet batches and keepalive heartbeats.
+message SubscribePacketsResponse {
+  // Timestamp of when this message was sent.
+  shared.Header header = 1;
+  oneof msg {
+    // Keepalive heartbeat when no packets are available.
+    shared.Heartbeat heartbeat = 2;
+    // Batch of transaction packets received at the relayer's TPU ports.
+    packet.PacketBatch batch = 3;
+  }
+}
+
+// Relayer service providing TPU proxy for the Harmonic validator.
+service Relayer {
+  // Fetch the relayer's TPU and TPU-forward socket addresses.
+  rpc GetTpuConfigs (GetTpuConfigsRequest) returns (GetTpuConfigsResponse) {}
+
+  // Subscribe to a stream of packets arriving at the relayer's TPU ports.
+  rpc SubscribePackets (SubscribePacketsRequest) returns (stream SubscribePacketsResponse) {}
+}

@@ -1,0 +1,127 @@
+// Block engine interface for the Harmonic validator.
+syntax = "proto3";
+
+import "packet.proto";
+import "shared.proto";
+import "bundle.proto";
+import "block.proto";
+import "google/protobuf/timestamp.proto";
+
+package block_engine;
+
+// Request to subscribe to the block engine's packet stream.
+message SubscribePacketsRequest {}
+
+// A batch of packets forwarded by the block engine.
+message SubscribePacketsResponse {
+  // Timestamp of when the batch was sent.
+  shared.Header header = 1;
+  // Transaction packet batch.
+  packet.PacketBatch batch = 2;
+}
+
+// Request to subscribe to the block engine's bundle stream.
+message SubscribeBundlesRequest {}
+
+// Request to subscribe to the block engine's block stream.
+message SubscribeBlocksRequest {
+  string version = 1;
+  string commit_hash = 2;
+}
+
+// One or more bundles forwarded by the block engine.
+message SubscribeBundlesResponse {
+  // Bundles with their server-assigned UUIDs.
+  repeated bundle.BundleUuid bundles = 1;
+}
+
+// Request for the block builder's fee configuration.
+message BlockBuilderFeeInfoRequest {}
+
+// Fee configuration for the block builder.
+message BlockBuilderFeeInfoResponse {
+  // Block builder's tip-receiving pubkey.
+  string pubkey = 1;
+  // Tip commission percentage (0-100).
+  uint64 commission = 2;
+}
+
+// Notifies the block engine of the validator's upcoming leader slot.
+message SubmitLeaderWindowInfoRequest {
+  // When the leader request is sent.
+  google.protobuf.Timestamp start_timestamp = 1;
+  // The leader slot number.
+  uint64 slot = 2;
+  // When the leader slot ends.
+  google.protobuf.Timestamp end_timestamp = 3;
+}
+
+message SubmitLeaderWindowInfoResponse {}
+
+// Scheduling strategy the block engine runs for this validator session.
+enum SchedulingStrategy {
+  SCHEDULING_STRATEGY_UNSPECIFIED = 0;
+  // First-in, first-out: continuous arrival-order sequencing.
+  SCHEDULING_STRATEGY_FIFO = 1;
+  // Frequent batch auction: discrete batches ordered by priority fees and tips.
+  SCHEDULING_STRATEGY_FBA = 2;
+  // Maximum revenue strategy: continuous streaming with revenue-prioritizing selection.
+  SCHEDULING_STRATEGY_MREV = 3;
+}
+
+// Selects the scheduling strategy for this validator session.
+message SetStrategyRequest {
+  SchedulingStrategy strategy = 1;
+}
+
+message SetStrategyResponse {}
+
+// Request for available block engine endpoints.
+message GetBlockEngineEndpointRequest {}
+
+// A block engine endpoint.
+message BlockEngineEndpoint {
+  // gRPC URL, e.g. https://mainnet.block-engine.jito.wtf
+  string block_engine_url = 1;
+  // ShredStream receiver address (host:port), e.g. shredstream.mainnet.block-engine.jito.wtf:1002
+  string shredstream_receiver_address = 2;
+}
+
+// Available block engine endpoints.
+message GetBlockEngineEndpointResponse {
+  // Anycast endpoint that routes to the nearest block engine.
+  BlockEngineEndpoint global_endpoint = 1;
+  // Region-specific endpoints for direct connection.
+  repeated BlockEngineEndpoint regioned_endpoints = 2;
+}
+
+// Service consumed by the Harmonic validator to stream packets and bundles
+// from the block engine.
+service BlockEngineValidator {
+  // Subscribe to a stream of transaction packets.
+  rpc SubscribePackets (SubscribePacketsRequest) returns (stream SubscribePacketsResponse) {}
+
+  // Subscribe to a stream of simulated and profitable bundles.
+  rpc SubscribeBundles (SubscribeBundlesRequest) returns (stream SubscribeBundlesResponse) {}
+
+  // Subscribe to bundles (v2).
+  rpc SubscribeBundles2 (SubscribeBundlesRequest) returns (stream SubscribeBundlesResponse) {}
+
+  // Deprecated: use SubscribeBlocks2.
+  rpc SubscribeBlocks (SubscribeBlocksRequest) returns (stream SubscribeBundlesResponse) {}
+
+  // Subscribe to blocks with explicit bundle boundaries.
+  rpc SubscribeBlocks2 (SubscribeBlocksRequest) returns (stream block.Block) {}
+
+  // Returns the block builder's tip pubkey and commission.
+  rpc GetBlockBuilderFeeInfo (BlockBuilderFeeInfoRequest) returns (BlockBuilderFeeInfoResponse) {}
+
+  // Report the validator's upcoming leader slot to the block engine.
+  rpc SubmitLeaderWindowInfo (SubmitLeaderWindowInfoRequest) returns (SubmitLeaderWindowInfoResponse) {}
+
+  // Discover available block engine endpoints for optimal region selection.
+  rpc GetBlockEngineEndpoints (GetBlockEngineEndpointRequest) returns (GetBlockEngineEndpointResponse) {}
+
+  // Set the scheduling strategy for this validator session.
+  rpc SetStrategy (SetStrategyRequest) returns (SetStrategyResponse) {}
+}

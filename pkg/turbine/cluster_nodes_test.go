@@ -107,14 +107,14 @@ func TestTurbineBroadcasterHonorsDedupAddrs(t *testing.T) {
 	}
 
 	development, err := NewTurbineBroadcaster(TurbineBroadcasterConfig{
-		Self: self, Peers: peers, Stakes: stakes, DedupAddrs: false,
+		Self: func() solana.PublicKey { return self }, Peers: peers, Stakes: stakes, DedupAddrs: false,
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, development.Close()) })
 	require.Equal(t, 2, countRoutable(development.clusterNodesForSlot(10)))
 
 	publicCluster, err := NewTurbineBroadcaster(TurbineBroadcasterConfig{
-		Self: self, Peers: peers, Stakes: stakes, DedupAddrs: true,
+		Self: func() solana.PublicKey { return self }, Peers: peers, Stakes: stakes, DedupAddrs: true,
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, publicCluster.Close()) })
@@ -126,7 +126,7 @@ func TestTurbineBroadcasterRefreshesPeersEachSlot(t *testing.T) {
 	peer := solana.PublicKey{2}
 	source := &mutableTVUPeers{}
 	broadcaster, err := NewTurbineBroadcaster(TurbineBroadcasterConfig{
-		Self:  self,
+		Self:  func() solana.PublicKey { return self },
 		Peers: source,
 		Stakes: func(uint64) map[solana.PublicKey]uint64 {
 			return map[solana.PublicKey]uint64{peer: 1}
@@ -152,7 +152,7 @@ func TestTurbineBroadcasterRefreshesPeersEachSlot(t *testing.T) {
 }
 
 func TestTurbineBroadcasterFailsWithoutRoute(t *testing.T) {
-	broadcaster, err := NewTurbineBroadcaster(TurbineBroadcasterConfig{Self: solana.PublicKey{1}})
+	broadcaster, err := NewTurbineBroadcaster(TurbineBroadcasterConfig{Self: func() solana.PublicKey { return solana.PublicKey{1} }})
 	require.NoError(t, err)
 	defer broadcaster.Close()
 	packet := make([]byte, shredIndexOffset+5)
