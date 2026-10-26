@@ -318,6 +318,7 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 		logger = logRecorder
 	}
 	execCtx := newExecCtx(slotCtx, transactionAccts, computeBudgetLimits, logger)
+	execCtx.SkipStableLogs = logRecorder == nil
 	execCtx.TransactionContext.AllInstructions = instrs
 	execCtx.TransactionContext.Signature = tx.Signatures[0]
 	execCtx.TransactionContext.BorrowedAccountArena = input.Arena

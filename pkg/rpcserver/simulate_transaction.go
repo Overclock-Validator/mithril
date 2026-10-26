@@ -8,14 +8,13 @@ import (
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
-	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
-	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/replay"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/txverify"
 	"github.com/filecoin-project/go-jsonrpc"
 	"github.com/gagliardetto/solana-go"
+	"github.com/gagliardetto/solana-go/sysvar"
 	"github.com/mr-tron/base58"
 )
 
@@ -226,11 +225,19 @@ func (rpcServer *RpcServer) SimulateTransaction(ctx context.Context, p jsonrpc.R
 
 	var replacementBlockhash *ReplacementBlockhashPayload
 	if conf.replaceRecentBlockhash {
-		latestBlockhash := global.LatestBlockHash()
-		tx.Message.RecentBlockhash = solana.Hash(latestBlockhash)
+		bank := replay.ChainTipParentContext()
+		// Replay publishes the tip before the RPC execution context. Require
+		// the same bank-owned sysvars, not just a matching slot on another fork.
+		if bank.BankSysvars == nil || bank.BankSysvars != slotCtx.BankSysvars() || bank.Slot != slotCtx.Slot || bank.LastBlockhash != solana.Hash(slotCtx.Blockhash) || bank.LastBlockhash == (solana.Hash{}) || (bank.Slot > 0 && bank.BlockHeight == 0) {
+			return SimulateTransactionResp{}, fmt.Errorf("simulation blockhash context is not available for slot %d", slotCtx.Slot)
+		}
+		if bank.BlockHeight > ^uint64(0)-sysvar.MaxProcessingAge {
+			return SimulateTransactionResp{}, fmt.Errorf("blockhash expiry height overflows at slot %d", slotCtx.Slot)
+		}
+		tx.Message.RecentBlockhash = bank.LastBlockhash
 		replacementBlockhash = &ReplacementBlockhashPayload{
-			Blockhash:            base58.Encode(latestBlockhash[:]),
-			LastValidBlockHeight: global.BlockHeight(),
+			Blockhash:            bank.LastBlockhash.String(),
+			LastValidBlockHeight: bank.BlockHeight + sysvar.MaxProcessingAge,
 		}
 	}
 
@@ -276,11 +283,14 @@ func (rpcServer *RpcServer) SimulateTransaction(ctx context.Context, p jsonrpc.R
 		RecordInnerInstructions: conf.innerInstructions,
 	})
 	preAccountSnapshots, postAccountSnapshots := simulationAccountSnapshotsForOutput(slotCtx, tx, output)
-	preBalances := output.PreBalances
+	preBalances := balancesFromAccountSnapshots(preAccountSnapshots)
 	if preBalances == nil {
-		preBalances = balancesFromAccountSnapshots(preAccountSnapshots)
+		preBalances = output.PreBalances
 	}
-	postBalances := postBalancesFromExecCtx(output.ExecCtx)
+	var postBalances []uint64
+	if output.ExecCtx != nil {
+		postBalances = balancesFromAccountSnapshots(postAccountSnapshots)
+	}
 	if postBalances == nil {
 		postBalances = nonExecutedSimulationPostBalances(output, preBalances)
 	}
@@ -551,6 +561,20 @@ func simulationAccountSnapshotsForOutput(
 	if post == nil {
 		post = pre
 	}
+	// The legacy loader can substitute metadata-only program accounts. Those
+	// are execution details, not the account balances observed in this bank.
+	restorePrograms := func(snapshot []*accounts.Account) []*accounts.Account {
+		result := append([]*accounts.Account(nil), snapshot...)
+		for i, acct := range result {
+			if acct != nil && acct.IsDummy {
+				if original, err := slotCtx.GetAccountShared(acct.Key); err == nil {
+					result[i] = original
+				}
+			}
+		}
+		return result
+	}
+	pre, post = restorePrograms(pre), restorePrograms(post)
 	return pre, post
 }
 
@@ -727,12 +751,12 @@ func ptrSliceTokenBalance(s []TokenBalancePayload) *[]TokenBalancePayload {
 // renderRequestedAccounts builds the response slice for `accounts.addresses`
 // in caller-specified order. Lookup precedence:
 //  1. post-execution transaction context (most up-to-date for tx accounts)
-//  2. accountsdb fallback (for addresses NOT touched by the tx)
+//  2. account-reader fallback (for addresses not touched by the transaction)
 //
 // Each entry is nil (JSON null) when the address can't be resolved.
 // Always returns a slice of length len(conf.accounts.addresses), matching
 // Agave so clients can index by request order.
-func renderRequestedAccounts(conf simulateTransactionConfig, execCtx *sealevel.ExecutionCtx, db *accountsdb.AccountsDb, slot uint64) *[]*AccountInfoPayload {
+func renderRequestedAccounts(conf simulateTransactionConfig, execCtx *sealevel.ExecutionCtx, reader sealevel.AccountReader, slot uint64) *[]*AccountInfoPayload {
 	accts := make([]*AccountInfoPayload, len(conf.accounts.addresses))
 	encodingType := GetAccountEncodingBase64
 	if conf.accounts.encoding != "" {
@@ -749,14 +773,14 @@ func renderRequestedAccounts(conf simulateTransactionConfig, execCtx *sealevel.E
 		var resolved *accounts.Account
 		if execCtx != nil {
 			for idx, acct := range execCtx.TransactionContext.Accounts.Accounts {
-				if acct.Key == pk {
+				if acct.Key == pk && !acct.IsDummy {
 					resolved = execCtx.TransactionContext.Accounts.Accounts[idx]
 					break
 				}
 			}
 		}
-		if resolved == nil && db != nil {
-			if dbAcct, dbErr := db.GetAccount(slot, pk); dbErr == nil {
+		if resolved == nil && reader != nil {
+			if dbAcct, dbErr := reader.GetAccount(slot, pk); dbErr == nil {
 				resolved = dbAcct
 			}
 		}
