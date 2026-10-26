@@ -135,7 +135,13 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 		db.compactLastScan = make(map[uint64]uint64)
 	}
 
-	pinned, manifestByFileId, err := db.compactionPinSet(meta.BatchSeq, cfg.RewindHorizonBatches)
+	// foldMu keeps fold/rewind/compaction mutations out of this directory
+	// snapshot. Pins and candidates can share it; only candidates need sorting.
+	entries, err := readCompactionDirectory(db.AcctsDir)
+	if err != nil {
+		return stats, err
+	}
+	pinned, manifestByFileId, err := db.compactionPinSet(meta.BatchSeq, cfg.RewindHorizonBatches, entries)
 	if err != nil {
 		return stats, err
 	}
@@ -149,10 +155,6 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 	}
 
 	bootstrapHigh := db.bootstrapHighFileId()
-	entries, err := os.ReadDir(db.AcctsDir)
-	if err != nil {
-		return stats, err
-	}
 	candidates := make([]compactCandidate, 0, len(entries))
 	for _, e := range entries {
 		name := e.Name()
@@ -172,6 +174,15 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 		manifest, hasManifest := manifestByFileId[fileId]
 		if !hasManifest && fileId > bootstrapHigh {
 			continue // undecided orphan — recovery's to delete, not ours
+		}
+		if !hasManifest {
+			if len(pinned.records[fileId]) > 0 {
+				continue // bootstrap undo targets cannot be relocated
+			}
+			// Bootstrap files always sort into the slow queue, irrespective
+			// of size/allocation. Stat only the few selected by the budget.
+			candidates = append(candidates, compactCandidate{name: name, slot: slot, fileId: fileId})
+			continue
 		}
 		info, ierr := e.Info()
 		if ierr != nil {
@@ -245,6 +256,16 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 		if stats.LiveBytesMoved >= cfg.MaxMoveBytesPerCycle || scannedBytes >= cfg.MaxScanBytesPerCycle || stats.CandidatesScanned >= cfg.MaxFilesPerCycle ||
 			(cfg.MaxDuration > 0 && stats.CandidatesScanned > 0 && time.Since(started) >= cfg.MaxDuration) {
 			break
+		}
+		if c.manifestPath == "" {
+			info, err := os.Lstat(filepath.Join(db.AcctsDir, c.name))
+			if err != nil {
+				continue
+			}
+			c.size, c.allocated = info.Size(), allocatedBytesFromInfo(info)
+			if c.allocated < sparseCompactionMinSize {
+				delete(db.compactLastScan, c.fileId)
+			}
 		}
 		switch compactCandidateKey(c)[0] {
 		case '0':
@@ -333,13 +354,24 @@ type compactionPins struct {
 	records map[uint64]map[uint64][32]byte
 }
 
+// readCompactionDirectory avoids sorting every bootstrap appendvec just to
+// discard most of them. CompactOnce sorts eligible candidates explicitly.
+func readCompactionDirectory(path string) ([]os.DirEntry, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return f.ReadDir(-1)
+}
+
 // compactionPinSet returns whole-file and exact undo-record pins (I5) plus a
 // fileId -> header map for every current (non-parked) manifest.
 //
 // Whole-file pins: in-horizon segments including the target (BatchSeq >=
 // head-horizon), and parked ".rewound" segments and undo targets. Other undo
 // targets pin individual records, allowing sparse reclamation without relocation.
-func (db *AccountsDb) compactionPinSet(headSeq, horizon uint64) (*compactionPins, map[uint64]ManifestHeader, error) {
+func (db *AccountsDb) compactionPinSet(headSeq, horizon uint64, entries []os.DirEntry) (*compactionPins, map[uint64]ManifestHeader, error) {
 	horizonFloor := uint64(0)
 	if headSeq > horizon {
 		horizonFloor = headSeq - horizon
@@ -348,10 +380,6 @@ func (db *AccountsDb) compactionPinSet(headSeq, horizon uint64) (*compactionPins
 	manifestByFileId := make(map[uint64]ManifestHeader)
 	retainedSeqs := make(map[uint64]bool)
 
-	entries, err := os.ReadDir(db.AcctsDir)
-	if err != nil {
-		return nil, nil, err
-	}
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() || strings.HasSuffix(name, segManifestTmpSuffix) {
@@ -441,25 +469,13 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 	// slot must also equal the filename slot — the read path builds the file
 	// name from the entry's slot, so a mismatched entry could not be served
 	// from the output file and is safest left untouched.
-	liveIdx := make([]int, 0, len(idxEntries))
+	liveIdx, err := db.compactionLiveRecords(c, pubkeys, idxEntries)
+	if err != nil {
+		return false, 0, err
+	}
 	var liveBytes int64
-	for i := range idxEntries {
-		cur, closer, gerr := db.Index.Get(pubkeys[i][:])
-		if gerr != nil {
-			if gerr == pebble.ErrNotFound {
-				continue
-			}
-			return false, 0, gerr
-		}
-		curEntry, derr := UnmarshalAcctIdxEntry(cur)
-		closer.Close()
-		if derr != nil {
-			return false, 0, derr
-		}
-		if curEntry.FileId == c.fileId && curEntry.Offset == idxEntries[i].Offset && curEntry.Slot == c.slot {
-			liveIdx = append(liveIdx, i)
-			liveBytes += recordLenAt(data, idxEntries[i].Offset)
-		}
+	for _, i := range liveIdx {
+		liveBytes += recordLenAt(data, idxEntries[i].Offset)
 	}
 
 	if len(data) == 0 || len(liveIdx) == 0 {

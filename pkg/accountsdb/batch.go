@@ -70,6 +70,7 @@ type BatchReadStats struct {
 	InProgressHits    uint64
 	PendingFoldHits   uint64
 	CacheHits         uint64
+	NegativeCacheHits uint64
 	IndexHits         uint64
 	IndexMisses       uint64
 	UniqueAppendVecs  uint64
@@ -178,6 +179,12 @@ func (db *AccountsDb) getAccountsBatchWithStats(ctx context.Context, slot uint64
 				stats.PlaceholderObjects++
 			}
 			out[i] = batchAccountOrPlaceholder(pk, acct)
+			continue
+		}
+		if db.batchAccountAbsentLocked(pk) {
+			stats.NegativeCacheHits++
+			stats.PlaceholderObjects++
+			out[i] = missingAccount(pk)
 			continue
 		}
 		cold = append(cold, i)
@@ -299,6 +306,7 @@ func (db *AccountsDb) getAccountsBatchWithStats(ctx context.Context, slot uint64
 	db.appendVecReadMu.RUnlock()
 	appendVecPinned = false
 	phaseStart = time.Now()
+	db.cacheBatchAbsences(pks, cold, found, admitCommon, cacheEpoch)
 	publicationJobs := cold[:0]
 	for _, idx := range cold {
 		acct := decodedForCache[idx]
