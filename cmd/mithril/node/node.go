@@ -4290,7 +4290,7 @@ func retainedTransactionStatusCheckpointRefs(accountsDb *accountsdb.AccountsDb, 
 		}
 	}
 
-	headers, err := accountsdb.ListFoldManifests(accountsDb.AcctsDir)
+	headers, parkedPaths, err := accountsdb.ListFoldAndParkedManifests(accountsDb.AcctsDir)
 	if err != nil {
 		return nil, fmt.Errorf("list retained fold manifests: %w", err)
 	}
@@ -4315,15 +4315,7 @@ func retainedTransactionStatusCheckpointRefs(accountsDb *accountsdb.AccountsDb, 
 	// Parked manifests remain in the AccountsDB segment directory only while a
 	// rewind is incomplete. Completed forensic manifests live under rewound/
 	// and are no longer actionable, so they do not pin sidecars forever.
-	entries, err := os.ReadDir(accountsDb.AcctsDir)
-	if err != nil {
-		return nil, fmt.Errorf("scan parked fold manifests: %w", err)
-	}
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".manifest.rewound") {
-			continue
-		}
-		path := filepath.Join(accountsDb.AcctsDir, entry.Name())
+	for _, path := range parkedPaths {
 		manifest, err := accountsdb.ReadSegmentManifest(path)
 		if err != nil {
 			return nil, fmt.Errorf("read parked fold manifest %s: %w", path, err)
