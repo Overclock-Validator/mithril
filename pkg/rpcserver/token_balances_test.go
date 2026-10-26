@@ -20,9 +20,10 @@ func makeTokenAccount(t *testing.T, mint, owner solana.PublicKey, amount uint64)
 	copy(data[tokenAccountMintOffset:], mint[:])
 	copy(data[tokenAccountOwnerOffset:], owner[:])
 	binary.LittleEndian.PutUint64(data[tokenAccountAmountOffset:], amount)
+	data[108] = 1
 	var ownerArr [32]byte
 	copy(ownerArr[:], splTokenProgramID[:])
-	return &accounts.Account{Owner: ownerArr, Data: data}
+	return &accounts.Account{Owner: ownerArr, Lamports: 1, Data: data}
 }
 
 func TestExtractTokenBalances_DecodesMintOwnerAmount(t *testing.T) {
