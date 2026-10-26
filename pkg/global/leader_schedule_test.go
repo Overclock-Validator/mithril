@@ -55,6 +55,7 @@ func TestEpochLeaderScheduleConcurrentReadsAndReplacement(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < 1_000; j++ {
 				LeaderForSlot(start)
+				NextSlotForLeader(testLeader(1), start)
 			}
 		}()
 	}
@@ -88,5 +89,29 @@ func TestNextSlotForLeaderAcrossEpochs(t *testing.T) {
 	}
 	if _, ok := NextSlotForLeader(ours, 201); ok {
 		t.Fatalf("expected no later slot for ours")
+	}
+}
+
+func TestNextLeaderCachedMissIsInvalidatedByScheduleReplacement(t *testing.T) {
+	SetLeaderSchedule(nil)
+	t.Cleanup(func() { SetLeaderSchedule(nil) })
+	ours, other := testLeader(7), testLeader(8)
+	SetLeaderScheduleForEpoch(1, testLeaderSchedule(other, 100))
+	for i := 0; i < 2; i++ {
+		if _, ok := NextSlotForLeader(ours, 100); ok {
+			t.Fatal("unexpected leader before replacement")
+		}
+	}
+	SetLeaderScheduleForEpoch(1, testLeaderSchedule(ours, 100))
+	if slot, ok := NextSlotForLeader(ours, 100); !ok || slot != 100 {
+		t.Fatalf("replacement hidden by cached miss: %d,%t", slot, ok)
+	}
+	SetLeaderScheduleForEpoch(1, nil)
+	if _, ok := NextSlotForLeader(ours, 100); ok {
+		t.Fatal("removed schedule remains visible")
+	}
+	SetLeaderSchedule(testLeaderSchedule(ours, 200))
+	if slot, ok := NextSlotForLeader(ours, 100); !ok || slot != 200 {
+		t.Fatalf("legacy replacement: %d,%t", slot, ok)
 	}
 }
