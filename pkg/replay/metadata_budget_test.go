@@ -272,6 +272,8 @@ func TestMetadataBudgetStreamingExhaustionPreservesExecution(t *testing.T) {
 	wireSize, err := txverify.TransactionWireSize(txs[0])
 	require.NoError(t, err)
 	charge := uint64(metadataRecordBaseCharge - solana.MaxTransactionSizeV1 + wireSize + len(txs[0].Message.AccountKeys)*metadataRecordKeyCharge)
+	// Native transfers now capture two stable logs, including per-entry overhead.
+	charge += uint64(2*32 + len("Program "+solana.SystemProgramID.String()+" invoke [1]") + len("Program "+solana.SystemProgramID.String()+" success"))
 	for _, workers := range []int{0, 4} {
 		t.Run(fmt.Sprintf("workers%d", workers), func(t *testing.T) {
 			var outcomes [2]groupExecutionOutcome

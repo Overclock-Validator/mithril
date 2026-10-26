@@ -80,6 +80,37 @@ func (t *CostTracker) WouldExceed(cost TransactionCost) ExceedReason {
 	return ExceedNone
 }
 
+// WouldExceedAll returns whether admitting every cost together, such as a
+// bundle, would breach a limit. Usage only grows as costs are recorded, so the
+// combined total breaches a limit exactly when recording them one by one would.
+func (t *CostTracker) WouldExceedAll(costs []TransactionCost) ExceedReason {
+	var blockCost, allocated uint64
+	var accounts map[solana.PublicKey]uint64
+	for _, cost := range costs {
+		sum := cost.Sum()
+		blockCost += sum
+		allocated += cost.AllocatedAccountsDataSize
+		for _, pk := range cost.WritableAccounts {
+			if accounts == nil {
+				accounts = make(map[solana.PublicKey]uint64, len(cost.WritableAccounts))
+			}
+			accounts[pk] += sum
+		}
+	}
+	if t.blockCost+blockCost > t.limits.BlockCost {
+		return ExceedBlockCost
+	}
+	for pk, add := range accounts {
+		if t.perWritableAccountCost[pk]+add > t.limits.WritableAccountCost {
+			return ExceedWritableAccountCost
+		}
+	}
+	if t.allocatedDataSizeDelta+allocated > t.limits.AllocatedDataSizeDelta {
+		return ExceedAllocatedDataSize
+	}
+	return ExceedNone
+}
+
 // Record commits cost after a transaction is forged into the working bank.
 func (t *CostTracker) Record(cost TransactionCost) {
 	sum := cost.Sum()

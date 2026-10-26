@@ -87,13 +87,19 @@ func TestTransactionMetadataRealLogsPreserveExecution(t *testing.T) {
 					require.NoError(t, capture.Err)
 					require.NotNil(t, capture.Record)
 					require.Equal(t, units, capture.Record.ComputeUnitsConsumed)
-					logs := capture.Record.LogMessages
-					// These are actual syscall messages, not a claim that runtime
-					// invoke/success/failure stable logs are implemented.
-					require.Equal(t, []string{
+					program := tx.Message.AccountKeys[tx.Message.Instructions[1].ProgramIDIndex].String()
+					logs := []string{
+						"Program " + solana.SystemProgramID.String() + " invoke [1]",
+						"Program " + solana.SystemProgramID.String() + " success",
+						"Program " + program + " invoke [1]",
 						"Program log: Signed by " + txfixture.PayerPubkey().String(),
 						`Program log: Memo (len 12): "metadata log"`,
-					}, logs)
+						"Program " + program + " success",
+					}
+					if tc.failed {
+						logs = append(logs, "Program "+solana.SystemProgramID.String()+" invoke [1]", "Program "+solana.SystemProgramID.String()+" failed: invalid instruction data")
+					}
+					require.Equal(t, logs, capture.Record.LogMessages)
 					if tc.failed {
 						require.JSONEq(t, `{"InstructionError":[2,"InvalidInstructionData"]}`, string(capture.Record.Error))
 					} else {
@@ -196,7 +202,8 @@ func TestTransactionMetadataNativeTransferHasNoSyscallLogs(t *testing.T) {
 	require.NotNil(t, fee)
 	require.NoError(t, capture.Err)
 	require.NotNil(t, capture.Record)
-	// Native invoke/success stable logs are not currently emitted.
-	require.NotNil(t, capture.Record.LogMessages)
-	require.Empty(t, capture.Record.LogMessages)
+	require.Equal(t, []string{
+		"Program " + solana.SystemProgramID.String() + " invoke [1]",
+		"Program " + solana.SystemProgramID.String() + " success",
+	}, capture.Record.LogMessages)
 }

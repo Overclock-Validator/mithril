@@ -2,8 +2,6 @@ package quicserver_test
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/hex"
 	"net"
 	"strings"
@@ -62,7 +60,7 @@ func spawnWithPipeline(
 ) (*quicserver.SpawnServerResult, *pipeline.Pipeline, *sink.Noop) {
 	t.Helper()
 
-	_, identity, err := ed25519.GenerateKey(rand.Reader)
+	identity, err := newTestIdentity()
 	require.NoError(t, err)
 
 	noop := &sink.Noop{}
@@ -188,7 +186,7 @@ func TestServerRejectsTransactionAboveV1Limit(t *testing.T) {
 }
 
 func TestServerRejectsTransportLimitsThatExceedPool(t *testing.T) {
-	_, identity, err := ed25519.GenerateKey(rand.Reader)
+	identity, err := newTestIdentity()
 	require.NoError(t, err)
 	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 	require.NoError(t, err)
@@ -249,7 +247,7 @@ func TestServerDiscardsInvalidTransaction(t *testing.T) {
 }
 
 func TestServerRefusesConnectionsBeyondCap(t *testing.T) {
-	_, identity, err := ed25519.GenerateKey(rand.Reader)
+	identity, err := newTestIdentity()
 	require.NoError(t, err)
 
 	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
@@ -310,7 +308,7 @@ func TestServerRefusesConnectionsBeyondCap(t *testing.T) {
 }
 
 func TestBenchClientEndToEnd(t *testing.T) {
-	_, identity, err := ed25519.GenerateKey(rand.Reader)
+	identity, err := newTestIdentity()
 	require.NoError(t, err)
 
 	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
@@ -348,7 +346,7 @@ func TestBenchClientEndToEnd(t *testing.T) {
 }
 
 func TestServerRefusesConnectionsBeyondPerIPCap(t *testing.T) {
-	_, identity, err := ed25519.GenerateKey(rand.Reader)
+	identity, err := newTestIdentity()
 	require.NoError(t, err)
 
 	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})

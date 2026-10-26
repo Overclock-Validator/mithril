@@ -24,7 +24,7 @@ type transactionMetadata struct {
 	PreBalances       []uint64
 	PostBalances      []uint64
 	InnerInstructions []InnerInstructionsList
-	// LogMessages currently contains syscall output, not the complete runtime
+	// LogMessages contains syscall and invocation/result output, not the complete runtime
 	// log stream. It must not be served as standard RPC logMessages yet.
 	LogMessages          []string
 	ComputeUnitsConsumed uint64

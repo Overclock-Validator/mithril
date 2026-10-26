@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/Overclock-Validator/mithril/pkg/global"
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -104,22 +105,32 @@ const (
 
 // nextLeaderCursor caches the next scheduled slot for this node's identity
 // so the per-slot line can show a countdown without rescanning every slot.
+// A set-identity swap changes the holder's pubkey and restarts the scan.
 type nextLeaderCursor struct {
+	holder   *identity.Holder
 	identity solana.PublicKey
 	next     uint64
 	ok       bool
 	lookup   func(solana.PublicKey, uint64) (uint64, bool)
 }
 
-func newNextLeaderCursor(identity solana.PublicKey) *nextLeaderCursor {
-	if identity.IsZero() {
+func newNextLeaderCursor(holder *identity.Holder) *nextLeaderCursor {
+	if holder == nil {
 		return nil
 	}
-	return &nextLeaderCursor{identity: identity}
+	return &nextLeaderCursor{holder: holder}
 }
 
 func (c *nextLeaderCursor) hint(slot uint64) string {
-	if c == nil || c.identity.IsZero() {
+	if c == nil {
+		return ""
+	}
+	if c.holder != nil {
+		if current := c.holder.PublicKey(); current != c.identity {
+			c.identity, c.ok = current, false
+		}
+	}
+	if c.identity.IsZero() {
 		return ""
 	}
 	lookup := c.lookup
