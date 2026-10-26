@@ -3,6 +3,7 @@ package sealevel
 import (
 	"encoding/binary"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
@@ -99,6 +100,16 @@ func TestStableInstructionLogsDisabledAvoidsFormatting(t *testing.T) {
 	require.Equal(t, baseline, disabled, "discard policy adds no formatting allocations")
 	require.LessOrEqual(t, disabled, float64(6), "Go 1.27 native execution baseline excludes stable-message formatting")
 	t.Logf("disabled native instruction allocations: %g", disabled)
+}
+
+func TestStableInstructionLogsRespectBoundedRecorder(t *testing.T) {
+	ctx, _, instructionAccounts, data := stableLogTestContext()
+	bounded := NewBoundedLogRecorder()
+	bounded.Log(strings.Repeat("x", maxRecordedLogBytes-1))
+	ctx.Log = bounded
+	require.NoError(t, ctx.ProcessInstruction(data, instructionAccounts, []uint64{0}))
+	require.Len(t, bounded.Logs, 2)
+	require.Equal(t, "Log truncated", bounded.Logs[1])
 }
 
 func TestStableInstructionFailureFormatting(t *testing.T) {
