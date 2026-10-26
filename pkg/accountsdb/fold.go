@@ -9,13 +9,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/cockroachdb/pebble/v2"
-	"golang.org/x/sync/errgroup"
 )
 
 // metaKeyLastBatch is the Pebble index key holding the fold commit watermark
@@ -184,6 +182,19 @@ func (db *AccountsDb) CommitBatch(
 	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i][:], keys[j][:]) < 0 })
 
 	clock.step(&timings.Dedupe)
+	// (4a) Undo pointers need only the sorted keys, and the index does not
+	// change until step 7, so capture them while the segment is written.
+	var undo []undoEntry
+	var undoErr error
+	undoDone := make(chan struct{})
+	go func() {
+		defer close(undoDone)
+		start := time.Now()
+		undo, undoErr = db.captureUndoEntries(keys)
+		timings.UndoLookup = time.Since(start)
+	}()
+	// Every return waits, so the capture never outlives this call (or the index).
+	defer func() { <-undoDone }()
 	// (2) fileId allocation; persist high-water BEFORE the first data byte (I7).
 	fileId := db.nextFileId(0)
 	if err := db.persistLargestFileId(); err != nil {
@@ -252,34 +263,20 @@ func (db *AccountsDb) CommitBatch(
 	fire(db.foldHooks.afterSegmentFsync)
 	dataCRC := crc.Sum32()
 
-	// (4) Undo pointers: the index entry each key had before this batch. Bloom
-	// filters make misses cheap; bounded parallelism keeps fold latency down.
+	// (4b) Undo pointers: the index entry each key had before this batch,
+	// captured concurrently with the segment write above.
 	clock.step(&timings.SegmentWrite)
+	<-undoDone
+	if undoErr != nil {
+		return BatchCommitResult{}, fmt.Errorf("accountsdb: capture undo pointers: %w", undoErr)
+	}
 	prevs := make([]ManifestRecord, len(records))
 	copy(prevs, records)
-	var g errgroup.Group
-	g.SetLimit(max(4, runtime.NumCPU()/2))
 	for i := range prevs {
-		g.Go(func() error {
-			val, closer, err := db.Index.Get(prevs[i].Pubkey[:])
-			if err != nil {
-				if err == pebble.ErrNotFound {
-					return nil // PrevValid stays false
-				}
-				return err
-			}
-			entry, derr := UnmarshalAcctIdxEntry(val)
-			closer.Close()
-			if derr != nil {
-				return derr
-			}
+		if undo[i].valid {
 			prevs[i].PrevValid = true
-			prevs[i].Prev = *entry
-			return nil
-		})
-	}
-	if err := g.Wait(); err != nil {
-		return BatchCommitResult{}, fmt.Errorf("accountsdb: capture undo pointers: %w", err)
+			prevs[i].Prev = undo[i].entry
+		}
 	}
 
 	clock.step(&timings.UndoCapture)
