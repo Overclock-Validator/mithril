@@ -2,11 +2,11 @@ package blockstream
 
 import (
 	"context"
-	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -17,6 +17,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/block"
 	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/rpcclient"
 	"github.com/Overclock-Validator/mithril/pkg/turbine"
@@ -49,14 +50,16 @@ type BlockSourceOpts struct {
 	TurbineAlpenglowBlockIDHints bool
 	// TurbineStreamingExecution subscribes replay's streaming executor to the
 	// assembler's decoded-batch feed (StreamEvents). Off by default.
-	TurbineStreamingExecution   bool
-	TurbineIdentity             ed25519.PrivateKey
-	LeaderForSlot               func(slot uint64) (solana.PublicKey, bool)
-	TurbineStakesForSlot        func(slot uint64) map[solana.PublicKey]uint64
-	TurbineEpochForSlot         func(slot uint64) uint64
-	TurbineRootSlot             func() uint64
-	TurbineUseChaCha8           bool
-	TurbineDedupAddrs           bool
+	TurbineStreamingExecution bool
+	TurbineIdentity           *identity.Holder
+	LeaderForSlot             func(slot uint64) (solana.PublicKey, bool)
+	TurbineStakesForSlot      func(slot uint64) map[solana.PublicKey]uint64
+	TurbineEpochForSlot       func(slot uint64) uint64
+	TurbineRootSlot           func() uint64
+	TurbineUseChaCha8         bool
+	TurbineDedupAddrs         bool
+	// TurbineShredReceivers get a copy of every shred this node relays.
+	TurbineShredReceivers       []*net.UDPAddr
 	LocalLeaderForSlot          func(slot uint64) bool
 	GossipClient                *gossip.Client
 	AlpenglowDecisionSource     func(anchorSlot uint64) (alpenglow.ChainDecision, bool)
@@ -318,15 +321,17 @@ type BlockSource struct {
 	maxInflight int
 
 	// Tip tracking
-	confirmedTip      atomic.Uint64
-	processedTip      atomic.Uint64 // Processed commitment tip (super tip)
-	tipAtSlot         atomic.Uint64 // What slot we had executed when tip was measured
-	lastExecutedSlot  atomic.Uint64 // Replay's consumed frontier, including skips (set by SetLastExecutedSlot)
-	tipSafetyMargin   uint64
-	tipPollInterval   time.Duration
-	lastTipUpdate     atomic.Int64  // Unix timestamp of last successful tip poll
-	tipPollFailures   atomic.Uint64 // Consecutive tip poll failures
-	totalTipPollFails atomic.Uint64 // Total tip poll failures (for stats)
+	confirmedTip          atomic.Uint64
+	observedConfirmedTip  atomic.Uint64 // Latest confirmed slot returned by a configured RPC
+	processedTip          atomic.Uint64 // Processed commitment tip (super tip)
+	tipAtSlot             atomic.Uint64 // What slot we had executed when tip was measured
+	lastExecutedSlot      atomic.Uint64 // Replay's consumed frontier, including skips (set by SetLastExecutedSlot)
+	tipSafetyMargin       uint64
+	tipPollInterval       time.Duration
+	lastTipUpdate         atomic.Int64  // Unix timestamp of last tip update (poll or fetched block)
+	lastObservedTipUpdate atomic.Int64  // Unix timestamp of last successful confirmed-tip RPC poll
+	tipPollFailures       atomic.Uint64 // Consecutive tip poll failures
+	totalTipPollFails     atomic.Uint64 // Total tip poll failures (for stats)
 
 	// Reorder buffer
 	reorderMu     sync.Mutex
@@ -415,13 +420,14 @@ type BlockSource struct {
 	turbineShredVersion          uint16
 	turbineAlpenglowAddr         string
 	turbineAlpenglowBlockIDHints bool
-	turbineIdentity              ed25519.PrivateKey
+	turbineIdentity              *identity.Holder
 	leaderForSlot                func(slot uint64) (solana.PublicKey, bool)
 	turbineStakesForSlot         func(slot uint64) map[solana.PublicKey]uint64
 	turbineEpochForSlot          func(slot uint64) uint64
 	turbineRootSlot              func() uint64
 	turbineUseChaCha8            bool
 	turbineDedupAddrs            bool
+	turbineShredReceivers        []*net.UDPAddr
 	localLeaderForSlot           func(slot uint64) bool
 	localBlocks                  <-chan *b.Block
 	gossipClient                 *gossip.Client
@@ -778,13 +784,14 @@ func NewBlockSource(opts *BlockSourceOpts) *BlockSource {
 		turbineAlpenglowAddr:           opts.TurbineAlpenglowAddr,
 		turbineAlpenglowBlockIDHints:   opts.TurbineAlpenglowBlockIDHints,
 		streamEvents:                   newStreamEventChannel(opts),
-		turbineIdentity:                clonePrivateKey(opts.TurbineIdentity),
+		turbineIdentity:                opts.TurbineIdentity,
 		leaderForSlot:                  opts.LeaderForSlot,
 		turbineStakesForSlot:           opts.TurbineStakesForSlot,
 		turbineEpochForSlot:            opts.TurbineEpochForSlot,
 		turbineRootSlot:                opts.TurbineRootSlot,
 		turbineUseChaCha8:              opts.TurbineUseChaCha8,
 		turbineDedupAddrs:              opts.TurbineDedupAddrs,
+		turbineShredReceivers:          opts.TurbineShredReceivers,
 		localLeaderForSlot:             opts.LocalLeaderForSlot,
 		localBlocks:                    opts.LocalBlocks,
 		gossipClient:                   opts.GossipClient,
@@ -863,13 +870,6 @@ func NewBlockSource(opts *BlockSourceOpts) *BlockSource {
 	}
 
 	return bs
-}
-
-func clonePrivateKey(key ed25519.PrivateKey) ed25519.PrivateKey {
-	if len(key) == 0 {
-		return nil
-	}
-	return append(ed25519.PrivateKey(nil), key...)
 }
 
 func (bs *BlockSource) SetKnownAlpenglowBlockID(slot uint64, blockID solana.Hash) {
@@ -2477,10 +2477,19 @@ func (bs *BlockSource) NotifyBlockStart(slot uint64) {
 // This allows accurate distance calculation: tip - tipAtSlot is precise at measurement time.
 func (bs *BlockSource) updateTipSnapshot(confirmedTip uint64) {
 	slotAtTip := bs.lastExecutedSlot.Load()
+	now := time.Now().Unix()
 
 	bs.confirmedTip.Store(confirmedTip)
 	bs.tipAtSlot.Store(slotAtTip)
-	bs.lastTipUpdate.Store(time.Now().Unix())
+	bs.lastTipUpdate.Store(now)
+	bs.observedConfirmedTip.Store(confirmedTip)
+	bs.lastObservedTipUpdate.Store(now)
+}
+
+// HealthSlot returns a recently observed network tip, not a replay-derived estimate.
+func (bs *BlockSource) HealthSlot() (uint64, bool) {
+	updated := bs.lastObservedTipUpdate.Load()
+	return bs.observedConfirmedTip.Load(), updated > 0 && time.Since(time.Unix(updated, 0)) <= max(30*time.Second, 2*bs.tipPollInterval)
 }
 
 // RefreshTipsForSummary triggers an async refresh of both confirmed and processed tips.
@@ -2527,9 +2536,12 @@ func (bs *BlockSource) RefreshTipsForSummary() {
 
 		// Store results
 		if maxConfirmed > 0 {
+			now := time.Now().Unix()
 			bs.confirmedTip.Store(maxConfirmed)
 			bs.tipAtSlot.Store(slotAtTip)
-			bs.lastTipUpdate.Store(time.Now().Unix())
+			bs.lastTipUpdate.Store(now)
+			bs.observedConfirmedTip.Store(maxConfirmed)
+			bs.lastObservedTipUpdate.Store(now)
 			bs.tipPollFailures.Store(0)
 		}
 		if maxProcessed > 0 {

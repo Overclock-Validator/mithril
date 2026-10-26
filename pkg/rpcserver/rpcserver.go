@@ -45,12 +45,15 @@ type rpcMethods interface {
 	GetFirstAvailableBlock(context.Context, jsonrpc.RawParams) (uint64, error)
 	GetGenesisHash(context.Context, jsonrpc.RawParams) (string, error)
 	GetInflationReward(context.Context, jsonrpc.RawParams) ([]*InflationRewardResp, error)
+	GetHealth(context.Context, jsonrpc.RawParams) (string, error)
+	GetIdentity(context.Context, jsonrpc.RawParams) (GetIdentityResp, error)
 	GetLatestBlockhash(context.Context, jsonrpc.RawParams) (GetLatestBlockhashResp, error)
 	GetLeaderSchedule(context.Context, jsonrpc.RawParams) (map[string][]uint64, error)
 	GetSignatureStatuses(context.Context, jsonrpc.RawParams) (GetSignatureStatusesResp, error)
 	GetSlot(context.Context, jsonrpc.RawParams) (uint64, error)
 	GetTransaction(context.Context, jsonrpc.RawParams) (*GetTransactionResp, error)
 	GetVoteAccounts(context.Context, jsonrpc.RawParams) (GetVoteAccountsResp, error)
+	GetVersion(context.Context, jsonrpc.RawParams) (GetVersionResp, error)
 	MinimumLedgerSlot(context.Context, jsonrpc.RawParams) (uint64, error)
 	SendTransaction(context.Context, jsonrpc.RawParams) (string, error)
 	SimulateTransaction(context.Context, jsonrpc.RawParams) (SimulateTransactionResp, error)
@@ -68,10 +71,15 @@ type RpcServer struct {
 	epochSchedule *sealevel.SysvarEpochSchedule
 	slotCtx       *sealevel.SlotCtx
 	slotCtxMu     sync.RWMutex
+	healthSlot    func() (uint64, bool)
+	healthReady   bool
 	genesisHash   string
 	epochRewards  *epochrewards.Store
 	blockHistory  *blockhistory.Store
 	rootedBank    atomic.Pointer[rootedBankState]
+	identity      string
+
+	identitySource func() string
 
 	stakeCacheOnce              sync.Once
 	stakeCache                  rootedStakeCache
@@ -120,12 +128,15 @@ var supportedRPCMethods = map[string]struct{}{
 	"getFirstAvailableBlock": {},
 	"getGenesisHash":         {},
 	"getInflationReward":     {},
+	"getHealth":              {},
+	"getIdentity":            {},
 	"getLatestBlockhash":     {},
 	"getLeaderSchedule":      {},
 	"getSignatureStatuses":   {},
 	"getSlot":                {},
 	"getTransaction":         {},
 	"getVoteAccounts":        {},
+	"getVersion":             {},
 	"minimumLedgerSlot":      {},
 	"sendTransaction":        {},
 	"simulateTransaction":    {},
@@ -433,6 +444,13 @@ func fetchAndUnmarshalEpochScheduleSysvar(acctsDb *accountsdb.AccountsDb) *seale
 func (rpcServer *RpcServer) SetSlotCtx(slotCtx *sealevel.SlotCtx) {
 	rpcServer.slotCtxMu.Lock()
 	rpcServer.slotCtx = slotCtx
+	rpcServer.healthReady = slotCtx != nil
+	rpcServer.slotCtxMu.Unlock()
+}
+
+func (rpcServer *RpcServer) SetIdentity(identity string) {
+	rpcServer.slotCtxMu.Lock()
+	rpcServer.identity = identity
 	rpcServer.slotCtxMu.Unlock()
 }
 

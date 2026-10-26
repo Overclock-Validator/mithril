@@ -246,7 +246,7 @@ func TestTryInLoopUnwindFallsBackWhenVoteStakeDirty(t *testing.T) {
 	// carries the parent's transaction count so the discarded fork's txs can be
 	// dropped from the running count.
 	resetVoteStakeDirty()
-	rs, bankSysvars, _ := tryInLoopUnwind(sw, newTail(), mithrilState, sched, epoch, nil)
+	rs, bankSysvars, _ := tryInLoopUnwind(sw, newTail(), mithrilState, sched, epoch, nil, nil)
 	require.NotNil(t, rs, "clean unwind should succeed in-loop")
 	require.NotNil(t, bankSysvars, "clean unwind returns its exact parent sysvars")
 	assert.Equal(t, uint64(7), bankSysvars.Slot())
@@ -260,7 +260,7 @@ func TestTryInLoopUnwindFallsBackWhenVoteStakeDirty(t *testing.T) {
 	// A global cache was mutated in the UNWOUND suffix (at the switch slot):
 	// the unwind cannot roll the caches back -> must fall back (nil).
 	markVoteStakeDirty(8)
-	rs, _, reason := tryInLoopUnwind(sw, newTail(), mithrilState, sched, epoch, nil)
+	rs, _, reason := tryInLoopUnwind(sw, newTail(), mithrilState, sched, epoch, nil, nil)
 	assert.Nil(t, rs, "dirty cache in the unwound suffix must force the rooted re-replay fallback")
 	assert.Equal(t, unwindFallbackVoteStakeDirty, reason)
 	resetVoteStakeDirty()
@@ -270,7 +270,7 @@ func TestTryInLoopUnwindFallsBackWhenVoteStakeDirty(t *testing.T) {
 	// cache from durable, which cannot see the retained suffix's writes — the
 	// reload would REGRESS the cache below live account state.
 	markVoteStakeDirty(7) // retained slot; rooted watermark is 0
-	rs, _, reason = tryInLoopUnwind(sw, newTail(), mithrilState, sched, epoch, nil)
+	rs, _, reason = tryInLoopUnwind(sw, newTail(), mithrilState, sched, epoch, nil, nil)
 	assert.Nil(t, rs, "dirty cache in the retained suffix must also force the fallback")
 	assert.Equal(t, unwindFallbackVoteStakeDirty, reason)
 	resetVoteStakeDirty()
@@ -279,7 +279,7 @@ func TestTryInLoopUnwindFallsBackWhenVoteStakeDirty(t *testing.T) {
 	// durable and reload-from-durable is exact again -> fast path allowed.
 	markVoteStakeDirty(7)
 	rootedPast := &state.MithrilState{LastRootedSlot: 7}
-	rs, _, _ = tryInLoopUnwind(sw, newTail(), rootedPast, sched, epoch, nil)
+	rs, _, _ = tryInLoopUnwind(sw, newTail(), rootedPast, sched, epoch, nil, nil)
 	require.NotNil(t, rs, "dirtiness at/below the rooted watermark is durably folded — fast path is safe")
 	resetVoteStakeDirty()
 }
@@ -351,7 +351,7 @@ func TestTryInLoopUnwindGuardMatrix(t *testing.T) {
 // assertUnwindOK asserts the in-RAM unwind proceeds (no fallback reason).
 func assertUnwindOK(t *testing.T, sw *CertifiedSwitch, tail *unrootedTail, ms *state.MithrilState, sched *sealevel.SysvarEpochSchedule, epoch uint64, ri *rewards.PartitionedRewardDistributionInfo) {
 	t.Helper()
-	rs, bankSysvars, reason := tryInLoopUnwind(sw, tail, ms, sched, epoch, ri)
+	rs, bankSysvars, reason := tryInLoopUnwind(sw, tail, ms, sched, epoch, ri, nil)
 	require.NotNil(t, rs, "expected in-RAM unwind to proceed, got fallback %q", reason)
 	require.NotNil(t, bankSysvars)
 	assert.Empty(t, reason)
@@ -360,7 +360,7 @@ func assertUnwindOK(t *testing.T, sw *CertifiedSwitch, tail *unrootedTail, ms *s
 // assertUnwindFallback asserts the unwind falls back (any reason).
 func assertUnwindFallback(t *testing.T, sw *CertifiedSwitch, tail *unrootedTail, ms *state.MithrilState, sched *sealevel.SysvarEpochSchedule, epoch uint64, ri *rewards.PartitionedRewardDistributionInfo) {
 	t.Helper()
-	rs, bankSysvars, reason := tryInLoopUnwind(sw, tail, ms, sched, epoch, ri)
+	rs, bankSysvars, reason := tryInLoopUnwind(sw, tail, ms, sched, epoch, ri, nil)
 	assert.Nil(t, rs)
 	assert.Nil(t, bankSysvars)
 	assert.NotEmpty(t, reason, "fallback must carry a reason for the instrumentation")
@@ -370,7 +370,7 @@ func assertUnwindFallback(t *testing.T, sw *CertifiedSwitch, tail *unrootedTail,
 // instrumented reason operators will see.
 func assertUnwindFallbackReason(t *testing.T, want string, sw *CertifiedSwitch, tail *unrootedTail, ms *state.MithrilState, sched *sealevel.SysvarEpochSchedule, epoch uint64, ri *rewards.PartitionedRewardDistributionInfo) {
 	t.Helper()
-	rs, bankSysvars, reason := tryInLoopUnwind(sw, tail, ms, sched, epoch, ri)
+	rs, bankSysvars, reason := tryInLoopUnwind(sw, tail, ms, sched, epoch, ri, nil)
 	assert.Nil(t, rs)
 	assert.Nil(t, bankSysvars)
 	assert.Equal(t, want, reason)

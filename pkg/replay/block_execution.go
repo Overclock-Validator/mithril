@@ -97,6 +97,7 @@ func newBlockExecution(
 	alpenglowClock bool,
 	parentBankSysvars *sealevel.BankSysvars,
 ) *blockExecution {
+	tail = normalizeUnrootedState(tail)
 	exec := &blockExecution{
 		acctsDb:             acctsDb,
 		block:               block,

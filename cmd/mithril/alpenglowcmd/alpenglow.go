@@ -12,6 +12,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/alpenglow"
 	"github.com/Overclock-Validator/mithril/pkg/config"
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/turbine"
 	"github.com/gagliardetto/solana-go"
 	"github.com/spf13/cobra"
@@ -93,16 +94,20 @@ func runProbe(cmd *cobra.Command, _ []string) error {
 		ctx, cancel = context.WithTimeout(ctx, opts.duration)
 		defer cancel()
 	}
-	identity, identityPubkey, err := loadProbeIdentity(opts.identityKeypair)
+	probeKey, identityPubkey, err := loadProbeIdentity(opts.identityKeypair)
 	if err != nil {
 		return err
 	}
-	if len(identity) == 0 {
-		_, identity, err = ed25519.GenerateKey(rand.Reader)
+	if len(probeKey) == 0 {
+		_, probeKey, err = ed25519.GenerateKey(rand.Reader)
 		if err != nil {
 			return fmt.Errorf("generate ephemeral probe identity: %w", err)
 		}
-		identityPubkey = solana.PublicKey(identity.Public().(ed25519.PublicKey)).String()
+		identityPubkey = solana.PublicKey(probeKey.Public().(ed25519.PublicKey)).String()
+	}
+	probeIdentity, err := identity.NewHolder(probeKey)
+	if err != nil {
+		return fmt.Errorf("probe identity: %w", err)
 	}
 
 	observer := alpenglow.NewObserver()
@@ -111,7 +116,7 @@ func runProbe(cmd *cobra.Command, _ []string) error {
 		BindAddr:        opts.alpenglowBind,
 		MaxMessageBytes: opts.maxMessageBytes,
 		ShredVersion:    opts.shredVersion,
-		Identity:        identity,
+		Identity:        probeIdentity,
 		LogInterval:     0,
 		OnMessage: func(msg alpenglow.Message) {
 			seedTurbineBlockIDFromVotor(turbineReceiver, msg)
@@ -139,18 +144,18 @@ func runProbe(cmd *cobra.Command, _ []string) error {
 		AlpenglowAddr: advertisedAlpenglowAddr,
 		AdvertisedIP:  opts.advertisedIP,
 		ShredVersion:  opts.shredVersion,
-		Identity:      identity,
+		Identity:      probeIdentity,
 		Name:          gossip.ClientName,
 	})
 	if err != nil {
 		return err
 	}
-	localIdentity := solana.PublicKey(identity.Public().(ed25519.PublicKey))
+	localIdentity := solana.PublicKey(probeKey.Public().(ed25519.PublicKey))
 	// A passive probe still exercises the outbound half of the protocol by
 	// establishing authenticated datagram connections. It never enqueues a
 	// message, so no vote or certificate can be emitted.
 	votorBroadcaster, err := alpenglow.NewVotorBroadcaster(alpenglow.VotorBroadcasterConfig{
-		Identity:     identity,
+		Identity:     probeIdentity,
 		ShredVersion: opts.shredVersion,
 		Peers: func() []alpenglow.VotorPeer {
 			contacts := gossipClient.AlpenglowPeers()

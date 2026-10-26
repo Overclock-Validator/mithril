@@ -9,28 +9,30 @@ import (
 	"fmt"
 	"math/big"
 	"time"
+
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 )
 
-func newServerTLSConfig(identity ed25519.PrivateKey) (*tls.Config, error) {
-	if len(identity) != ed25519.PrivateKeySize {
-		return nil, fmt.Errorf("invalid identity key size %d", len(identity))
-	}
-
-	cert, err := newIdentityCertificate(identity)
-	if err != nil {
-		return nil, err
-	}
-
+// newServerTLSConfig presents the most recently refreshed identity
+// certificate on every handshake, so a set-identity swap rotates the TPU
+// certificate without rebinding the listeners.
+func newServerTLSConfig(certs *identity.Derived[tls.Certificate]) *tls.Config {
 	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		ClientAuth:   tls.RequireAnyClientCert,
-		MinVersion:   tls.VersionTLS13,
-		NextProtos:   []string{ALPNTPUProtocolID},
-	}, nil
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			cert := certs.Get()
+			return &cert, nil
+		},
+		ClientAuth: tls.RequireAnyClientCert,
+		MinVersion: tls.VersionTLS13,
+		NextProtos: []string{ALPNTPUProtocolID},
+	}
 }
 
-func newIdentityCertificate(identity ed25519.PrivateKey) (tls.Certificate, error) {
-	pub := identity.Public().(ed25519.PublicKey)
+func newIdentityCertificate(key ed25519.PrivateKey) (tls.Certificate, error) {
+	if len(key) != ed25519.PrivateKeySize {
+		return tls.Certificate{}, fmt.Errorf("invalid identity key size %d", len(key))
+	}
+	pub := key.Public().(ed25519.PublicKey)
 
 	template := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
@@ -45,7 +47,7 @@ func newIdentityCertificate(identity ed25519.PrivateKey) (tls.Certificate, error
 		BasicConstraintsValid: true,
 	}
 
-	certDER, err := x509.CreateCertificate(rand.Reader, template, template, pub, identity)
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, pub, key)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
@@ -56,7 +58,7 @@ func newIdentityCertificate(identity ed25519.PrivateKey) (tls.Certificate, error
 
 	return tls.Certificate{
 		Certificate: [][]byte{certDER},
-		PrivateKey:  identity,
+		PrivateKey:  key,
 		Leaf:        leaf,
 	}, nil
 }

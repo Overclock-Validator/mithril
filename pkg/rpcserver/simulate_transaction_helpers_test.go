@@ -100,27 +100,30 @@ func TestRenderInnerInstructionsAccountIndices(t *testing.T) {
 }
 
 func TestParseSimulateConfig_MinContextSlot(t *testing.T) {
-	params := []interface{}{
-		"unused-tx-string",
-		map[string]interface{}{"minContextSlot": float64(417500000)},
+	params := []json.RawMessage{
+		json.RawMessage(`"unused-tx-string"`),
+		json.RawMessage(`{"minContextSlot":417500000}`),
 	}
-	conf := parseSimulateConfig(params)
+	conf, err := parseSimulateConfig(params)
+	require.NoError(t, err)
 	if assert.NotNil(t, conf.minContextSlot) {
 		assert.Equal(t, uint64(417500000), *conf.minContextSlot)
 	}
 }
 
 func TestParseSimulateConfig_Commitment(t *testing.T) {
-	params := []interface{}{
-		"unused-tx-string",
-		map[string]interface{}{"commitment": "confirmed"},
+	params := []json.RawMessage{
+		json.RawMessage(`"unused-tx-string"`),
+		json.RawMessage(`{"commitment":"confirmed"}`),
 	}
-	conf := parseSimulateConfig(params)
+	conf, err := parseSimulateConfig(params)
+	require.NoError(t, err)
 	assert.Equal(t, "confirmed", conf.commitment)
 }
 
 func TestParseSimulateConfig_DefaultsOmitOptional(t *testing.T) {
-	conf := parseSimulateConfig([]interface{}{"unused", map[string]interface{}{}})
+	conf, err := parseSimulateConfig([]json.RawMessage{json.RawMessage(`"unused"`), json.RawMessage(`{}`)})
+	require.NoError(t, err)
 	assert.Nil(t, conf.minContextSlot)
 	assert.Empty(t, conf.commitment)
 }

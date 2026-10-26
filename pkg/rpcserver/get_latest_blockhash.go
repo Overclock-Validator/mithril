@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/Overclock-Validator/mithril/pkg/global"
+	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/filecoin-project/go-jsonrpc"
-	"github.com/mr-tron/base58"
+	bin "github.com/gagliardetto/binary"
+	"github.com/gagliardetto/solana-go"
+	"github.com/gagliardetto/solana-go/sysvar"
 )
 
 type GetLatestBlockhashRespContext struct {
@@ -24,17 +26,42 @@ type GetLatestBlockhashResp struct {
 }
 
 func (rpcServer *RpcServer) GetLatestBlockhash(ctx context.Context, p jsonrpc.RawParams) (GetLatestBlockhashResp, error) {
-	params, err := jsonrpc.DecodeParams[[]interface{}](p)
+	config, err := parseBankReadConfig(ctx, "getLatestBlockhash", p)
 	if err != nil {
-		return GetLatestBlockhashResp{}, fmt.Errorf("decoding params: %w", err)
+		return GetLatestBlockhashResp{}, err
 	}
 
-	_ = params
-
-	latestBlockhash := global.LatestBlockHash()
-	latestBlockhashStr := base58.Encode(latestBlockhash[:])
-	lastValidBlockheight := global.BlockHeight() + 150
-
-	val := &GetLatestBlockhashRespValue{Blockhash: latestBlockhashStr, LastValidBlockHeight: lastValidBlockheight}
-	return GetLatestBlockhashResp{Context: GetLatestBlockhashRespContext{Slot: global.Slot()}, Value: val}, nil
+	var slot, height uint64
+	var blockhash solana.Hash
+	if config.Commitment != nil && *config.Commitment == "processed" {
+		bank, err := rpcServer.processedBankContext()
+		if err != nil {
+			return GetLatestBlockhashResp{}, err
+		}
+		slot, height, blockhash = bank.Slot, bank.BlockHeight, bank.LastBlockhash
+	} else {
+		bank, acct, err := rpcServer.readRootedAccount(ctx, solana.PublicKey(sealevel.SysvarRecentBlockHashesAddr))
+		if err != nil {
+			return GetLatestBlockhashResp{}, fmt.Errorf("read rooted recent blockhashes: %w", err)
+		}
+		var recent sealevel.SysvarRecentBlockhashes
+		if err := recent.UnmarshalWithDecoder(bin.NewBinDecoder(acct.Data)); err != nil {
+			return GetLatestBlockhashResp{}, fmt.Errorf("decode rooted recent blockhashes: %w", err)
+		}
+		if len(recent) == 0 {
+			return GetLatestBlockhashResp{}, fmt.Errorf("node has no recent blockhash available")
+		}
+		slot, height, blockhash = bank.Slot, bank.BlockHeight, solana.Hash(recent[0].Blockhash)
+	}
+	if blockhash == (solana.Hash{}) || (slot > 0 && height == 0) {
+		return GetLatestBlockhashResp{}, fmt.Errorf("node has no blockhash context available for slot %d", slot)
+	}
+	if config.MinContextSlot != nil && slot < *config.MinContextSlot {
+		return GetLatestBlockhashResp{}, &MinContextSlotNotReachedError{ContextSlot: slot}
+	}
+	if height > ^uint64(0)-sysvar.MaxProcessingAge {
+		return GetLatestBlockhashResp{}, fmt.Errorf("blockhash expiry height overflows at slot %d", slot)
+	}
+	value := &GetLatestBlockhashRespValue{Blockhash: blockhash.String(), LastValidBlockHeight: height + sysvar.MaxProcessingAge}
+	return GetLatestBlockhashResp{Context: GetLatestBlockhashRespContext{Slot: slot}, Value: value}, nil
 }

@@ -2,7 +2,6 @@ package replay
 
 import (
 	"context"
-	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -11,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -32,6 +32,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/fees"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/lthash"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
@@ -54,6 +55,10 @@ type SlotCtxSetter interface {
 	SetRootedBankState(slot, blockHeight, transactionCount uint64)
 }
 
+type rootedExecutionBankSetter interface {
+	SetRootedExecutionBank(*ChainTipSnapshot)
+}
+
 type epochRewardPublisher interface {
 	RecordEpochRewards(block *b.Block) error
 	PrepareEpochRewards(through uint64) error
@@ -72,6 +77,10 @@ type blockHistoryPublisher interface {
 	PrepareBlockHistory(through uint64) error
 	SetRootedBlockHistorySlot(slot uint64) error
 	DiscardUnrootedBlockHistory(from uint64) error
+}
+
+type rpcHealthInvalidator interface {
+	InvalidateHealth()
 }
 
 // BlockFetchOpts contains options for parallel block fetching
@@ -114,6 +123,8 @@ type BlockFetchOpts struct {
 	TurbineRootSlot      func() uint64
 	TurbineUseChaCha8    bool
 	TurbineDedupAddrs    bool
+	// TurbineShredReceivers get a copy of every shred this node relays.
+	TurbineShredReceivers []*net.UDPAddr
 }
 
 var SerializedParameterArena *arena.Arena[byte]
@@ -136,17 +147,6 @@ func GenerateRunID() string {
 		return fmt.Sprintf("%08x", time.Now().UnixNano()&0xFFFFFFFF)
 	}
 	return hex.EncodeToString(b)
-}
-
-func identityFromTurbineKey(priv ed25519.PrivateKey) solana.PublicKey {
-	if len(priv) != ed25519.PrivateKeySize {
-		return solana.PublicKey{}
-	}
-	pub, ok := priv.Public().(ed25519.PublicKey)
-	if !ok {
-		return solana.PublicKey{}
-	}
-	return solana.PublicKeyFromBytes(pub)
 }
 
 // IsCommitInProgress returns true if we're in the critical commit window.
@@ -1770,6 +1770,7 @@ func waitForVerifierProgress(ctx context.Context, idleTimeout, maxWait time.Dura
 	waitCtx, cancel := context.WithTimeout(ctx, maxWait)
 	defer cancel()
 	verified := watermark()
+	idleDeadline := time.Now().Add(idleTimeout)
 	idle := time.NewTimer(idleTimeout)
 	defer idle.Stop()
 	ticker := time.NewTicker(25 * time.Millisecond)
@@ -1778,10 +1779,8 @@ func waitForVerifierProgress(ctx context.Context, idleTimeout, maxWait time.Dura
 		if err := waitCtx.Err(); err != nil {
 			return true, err
 		}
-		select {
-		case <-idle.C:
+		if !time.Now().Before(idleDeadline) {
 			return true, context.DeadlineExceeded
-		default:
 		}
 		over, err := settle()
 		if err != nil || !over {
@@ -1791,14 +1790,14 @@ func waitForVerifierProgress(ctx context.Context, idleTimeout, maxWait time.Dura
 		if err := waitCtx.Err(); err != nil {
 			return true, err
 		}
-		select {
-		case <-idle.C:
+		now := time.Now()
+		if !now.Before(idleDeadline) {
 			return true, context.DeadlineExceeded
-		default:
 		}
 		if current > verified {
 			verified = current
-			idle.Reset(idleTimeout)
+			idleDeadline = now.Add(idleTimeout)
+			idle.Reset(time.Until(idleDeadline))
 		}
 		select {
 		case <-waitCtx.Done():
@@ -1825,7 +1824,7 @@ func ReplayBlocks(
 	turbineAdvertisedIP string,
 	turbineShredVersion uint16,
 	turbineAlpenglowAddr string,
-	turbineIdentity ed25519.PrivateKey,
+	turbineIdentity *identity.Holder,
 	blockDir string,
 	txParallelism int,
 	isLive bool,
@@ -1859,6 +1858,11 @@ func ReplayBlocks(
 	completedResultsAttempt := false
 	defer func() { transactionResults.endReplay(rpcServer, completedResultsAttempt) }()
 	historyPublisher, _ := rpcServer.(blockHistoryPublisher)
+	health, _ := rpcServer.(rpcHealthInvalidator)
+	if health != nil {
+		health.InvalidateHealth()
+		defer health.InvalidateHealth()
+	}
 	alpenglowMode := consensusOpts != nil && consensusOpts.Alpenglow
 	rewardPublisher, _ := rpcServer.(epochRewardPublisher)
 	rewardReadPublisher, _ := rpcServer.(epochRewardReadPublisher)
@@ -1893,7 +1897,7 @@ func ReplayBlocks(
 	}
 	// Fresh vote/stake dirty watermark for this run (gates the in-loop unwind).
 	resetVoteStakeDirty()
-	nextLeader := newNextLeaderCursor(identityFromTurbineKey(turbineIdentity))
+	nextLeader := newNextLeaderCursor(turbineIdentity)
 	// Create bankhash log file
 	bankhashLogPath := fmt.Sprintf("%s/bankhash.log", acctsDbPath)
 	bankhashLogFile, bankhashLogErr := os.OpenFile(bankhashLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -2304,6 +2308,9 @@ func ReplayBlocks(
 			}
 		}
 		publishRootedTransactionResults(transactionResults, rpcServer, promotedThrough, rootedCtx)
+		if publisher, ok := rpcServer.(rootedExecutionBankSetter); ok && unrootedTailState != nil {
+			publisher.SetRootedExecutionBank(unrootedTailState.rootedExecutionBank)
+		}
 		if rewardsCompletion.retire(&partitionedRewardsInfo, promotedThrough) {
 			rewardsHoldBelowSlot = 0
 			mlog.Log.Infof("epoch rewards bookkeeping retired through durable slot %d; later fork switches may unwind in memory", promotedThrough)
@@ -2643,6 +2650,7 @@ func ReplayBlocks(
 		opts.TurbineRootSlot = blockFetchOpts.TurbineRootSlot
 		opts.TurbineUseChaCha8 = blockFetchOpts.TurbineUseChaCha8
 		opts.TurbineDedupAddrs = blockFetchOpts.TurbineDedupAddrs
+		opts.TurbineShredReceivers = blockFetchOpts.TurbineShredReceivers
 
 		// Mode thresholds
 		opts.NearTipThreshold = blockFetchOpts.NearTipThreshold
@@ -2665,6 +2673,10 @@ func ReplayBlocks(
 	}
 
 	blockStream := blockstream.NewBlockSource(opts)
+	if health, ok := rpcServer.(interface{ SetHealthSlotSource(func() (uint64, bool)) }); ok && isLive {
+		health.SetHealthSlotSource(blockStream.HealthSlot)
+		defer health.SetHealthSlotSource(func() (uint64, bool) { return 0, false })
+	}
 
 	if !isLive {
 		blockStream.DownloadInitialBlocks()
@@ -2759,7 +2771,7 @@ func ReplayBlocks(
 			mlog.Log.Warnf("%v — re-serving the skipped suffix from slot %d; executed bank remains at slot %d", sw, sw.Slot, currentExecutedAnchorSlot())
 			return true
 		}
-		rs, parentBankSysvars, fallbackReason := tryInLoopUnwindWithResults(sw, unrootedTailState, mithrilState, epochSchedule, currentEpoch, partitionedRewardsInfo, transactionResults, rpcServer)
+		rs, parentBankSysvars, fallbackReason := tryInLoopUnwindWithResults(sw, unrootedTailState, mithrilState, epochSchedule, currentEpoch, partitionedRewardsInfo, transactionResults, rpcServer, health)
 		if rs == nil {
 			windowSwitchFallback++
 			switchFallbackReasons[fallbackReason]++
@@ -3412,7 +3424,7 @@ func ReplayBlocks(
 
 		// post-epoch boundary rewards distribution
 		if partitionedEpochRewardsEnabled && partitionedRewardsInfo != nil && currentSlot >= partitionedRewardsInfo.FirstStakingRewardSlot && partitionedRewardsInfo.NumRewardPartitionsRemaining > 0 {
-			distributedAccts, parentDistributedAccts, stakeCommissions := distributePartitionedEpochRewardsForSlot(acctsDb, lastSlotCtx, block.EpochUpdatedAccts, replayCtx, partitionedRewardsInfo, currentSlot, block.BlockHeight)
+			distributedAccts, parentDistributedAccts, stakeCommissions := distributePartitionedEpochRewardsForSlot(acctsDb, lastSlotCtx, block.EpochUpdatedAccts, replayCtx, partitionedRewardsInfo, currentSlot, block.BlockHeight, block.Epoch)
 			if err := replaceInflationRewardRecords(block, distributedAccts, parentDistributedAccts, rpc.RewardTypeStaking, stakeCommissions); err != nil {
 				result.Error = err
 				mlog.Log.Errorf("%v", err)
@@ -3558,6 +3570,9 @@ func ReplayBlocks(
 			rpcServer.SetSlotCtx(lastSlotCtx)
 			if unrootedTailState == nil {
 				rpcServer.SetRootedBankState(block.Slot, global.BlockHeight(), global.TransactionCount())
+				if publisher, ok := rpcServer.(rootedExecutionBankSetter); ok {
+					publisher.SetRootedExecutionBank(rpcExecutionBankContext(lastSlotCtx))
+				}
 			}
 		}
 
@@ -3619,6 +3634,9 @@ func ReplayBlocks(
 				resumeCtx.PrevLamportsPerSig = lastSlotCtx.FeeRateGovernor.PrevLamportsPerSignature
 			}
 			unrootedTailState.SetContext(block.Slot, resumeCtx, lastSlotCtx.BankSysvars())
+			if _, ok := rpcServer.(rootedExecutionBankSetter); ok {
+				unrootedTailState.executionBanks[block.Slot] = rpcExecutionBankContext(lastSlotCtx)
+			}
 			metrics.GlobalBlockReplay.ResumeContext.AddTimingSince(resumeContextStart)
 		}
 
@@ -4031,6 +4049,11 @@ func ReplayBlocks(
 		rewardReadPublisher.ResetEpochRewardView()
 	}
 
+	// Replay has stopped; cleanup may still wait for folds and worker shutdown.
+	if health != nil {
+		health.InvalidateHealth()
+	}
+
 	// Check if block source stalled (this provides explicit error info)
 	if blockStream.Stalled() && result.Error == nil {
 		result.Error = fmt.Errorf("block fetch stalled - no progress for %v", blockStream.StallTimeout())
@@ -4242,7 +4265,7 @@ func newSlotCtx(block *b.Block, accts accounts.Accounts, parentAccts accounts.Ac
 	}
 	// Guard: a nil *unrootedTail stored in the AccountReader interface would be a
 	// non-nil typed-nil and break the nil check in GetAccountFromAccountsDb.
-	if tail != nil {
+	if tail := normalizeUnrootedState(tail); tail != nil {
 		slotCtx.UnrootedRead = tail
 	}
 

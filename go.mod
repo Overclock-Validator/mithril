@@ -1,6 +1,6 @@
 module github.com/Overclock-Validator/mithril
 
-go 1.26.4
+go 1.27.2
 
 replace github.com/gagliardetto/binary => github.com/palmerlao/binary v0.0.0-20250617062159-3054b4d33aed
 

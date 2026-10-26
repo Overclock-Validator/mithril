@@ -314,8 +314,9 @@ func tryInLoopUnwind(
 	epochSchedule *sealevel.SysvarEpochSchedule,
 	currentEpoch uint64,
 	partitionedRewardsInfo *rewards.PartitionedRewardDistributionInfo,
+	health rpcHealthInvalidator,
 ) (*ResumeState, *sealevel.BankSysvars, string) {
-	return tryInLoopUnwindWithResults(sw, tail, mithrilState, epochSchedule, currentEpoch, partitionedRewardsInfo, nil, nil)
+	return tryInLoopUnwindWithResults(sw, tail, mithrilState, epochSchedule, currentEpoch, partitionedRewardsInfo, nil, nil, health)
 }
 
 func tryInLoopUnwindWithResults(
@@ -327,6 +328,7 @@ func tryInLoopUnwindWithResults(
 	partitionedRewardsInfo *rewards.PartitionedRewardDistributionInfo,
 	results *TransactionResultSession,
 	publisher SlotCtxSetter,
+	health rpcHealthInvalidator,
 ) (*ResumeState, *sealevel.BankSysvars, string) {
 	if tail == nil || sw.Slot == 0 {
 		return nil, nil, unwindFallbackNilTail
@@ -356,6 +358,11 @@ func tryInLoopUnwindWithResults(
 	}
 
 	setResultRecoveryPending(results, publisher, true)
+	// Invalidate before eviction, even if rebuilding the retained bank fails
+	// and the caller must restart from its durable checkpoint.
+	if health != nil {
+		health.InvalidateHealth()
+	}
 	ctx, bankSysvars := tail.unwind(sw.Slot)
 	if ctx == nil && sw.Slot-1 == mithrilState.LastRootedSlot && mithrilState.LastRootedContext != nil {
 		// The durable boundary carries a persisted ResumeContext, but deliberately
