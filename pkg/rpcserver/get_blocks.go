@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"math"
+	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/blockhistory"
 	"github.com/filecoin-project/go-jsonrpc"
@@ -25,16 +26,63 @@ func (server *RpcServer) GetBlocks(ctx context.Context, p jsonrpc.RawParams) ([]
 	if err := acquireQueryResponse(ctx); err != nil {
 		return nil, err
 	}
-	server.historyRecoveryMu.RLock()
+	var previous historyReadStamp
+	for attempt := 0; ; attempt++ {
+		slots, err := server.getBlocksOnce(ctx, start, end, config, &previous)
+		if err != errHistoryViewChanged {
+			return slots, err
+		}
+		if attempt == 1 {
+			return nil, &BlockNotAvailableError{Slot: start}
+		}
+		if err := waitForRootedPublication(ctx); err != nil {
+			return nil, err
+		}
+	}
+}
+
+// getBlocksOnce waits for initial publication without consuming a scan attempt.
+// Every wait releases the recovery gate and retains the request's original deadline.
+func (server *RpcServer) getBlocksOnce(ctx context.Context, start uint64, end *uint64, config blocksConfig, previous *historyReadStamp) ([]uint64, error) {
+	owner := ctx.Value(queryResponseKey{}).(*historyResponseOwner) // GetBlocks already acquired this HTTP owner.
+	var stamp historyReadStamp
+	for {
+		if !time.Now().Before(owner.deadline) {
+			return nil, context.DeadlineExceeded
+		}
+		server.historyRecoveryMu.RLock()
+		if server.historyRecoveryPending || server.blockHistory == nil || server.acctsDb == nil {
+			server.historyRecoveryMu.RUnlock()
+			return nil, &BlockNotAvailableError{Slot: start}
+		}
+		bank := server.rootedBank.Load()
+		version, stable := server.acctsDb.CommittedAccountVersion()
+		if !stable && version&1 == 0 {
+			// A version may have changed during the first observation. A still
+			// even, unreadable version is uncertain/failed, not an active write.
+			version, stable = server.acctsDb.CommittedAccountVersion()
+		}
+		stamp = historyReadStamp{bank: bank, version: version, durable: server.acctsDb.DurableThrough()}
+		historyRoot := server.blockHistory.Rooted()
+		valid := stable && server.historyStampValid(stamp)
+		if bank == nil || (!stable && version&1 == 0) || historyRoot < bank.Slot ||
+			(stamp.durable != 0 && stamp.durable < bank.Slot) ||
+			(previous.bank != nil && (bank.Slot < previous.bank.Slot || stamp.durable < previous.durable)) ||
+			(valid && historyRoot > bank.Slot && historyRoot > stamp.durable) {
+			server.historyRecoveryMu.RUnlock()
+			return nil, &BlockNotAvailableError{Slot: start}
+		}
+		*previous = stamp
+		if valid && !server.rootedPublicationPending(bank.Slot) && historyRoot == bank.Slot {
+			break
+		}
+		server.historyRecoveryMu.RUnlock()
+		if err := waitForRootedPublication(ctx); err != nil {
+			return nil, err
+		}
+	}
 	defer server.historyRecoveryMu.RUnlock()
-	if server.historyRecoveryPending || server.blockHistory == nil || server.acctsDb == nil {
-		return nil, &BlockNotAvailableError{Slot: start}
-	}
-	bank := server.rootedBank.Load()
-	version, stable := server.acctsDb.CommittedAccountVersion()
-	if bank == nil || !stable || server.rootedPublicationPending(bank.Slot) || server.blockHistory.Rooted() != bank.Slot {
-		return nil, &BlockNotAvailableError{Slot: start}
-	}
+	bank, version := stamp.bank, stamp.version
 	if config.MinContextSlot != nil && bank.Slot < *config.MinContextSlot {
 		return nil, &MinContextSlotNotReachedError{ContextSlot: bank.Slot}
 	}
@@ -50,9 +98,19 @@ func (server *RpcServer) GetBlocks(ctx context.Context, p jsonrpc.RawParams) ([]
 		return nil, &InvalidParamsError{Message: "slot range too large; max 500000"}
 	}
 	slots, unavailable, err := server.blockHistory.Blocks(ctx, start, last, bank.Slot)
+	if err != nil && err != blockhistory.ErrNotAvailable {
+		return nil, blockHistoryRPCError(unavailable, err)
+	}
 	latest, stable := server.acctsDb.CommittedAccountVersion()
 	if !stable || latest != version || server.rootedBank.Load() != bank ||
 		server.rootedPublicationPending(bank.Slot) || server.blockHistory.Rooted() != bank.Slot {
+		current, durable := server.rootedBank.Load(), server.acctsDb.DurableThrough()
+		if current != nil && current.Slot >= bank.Slot && durable >= stamp.durable && server.blockHistory.Rooted() >= bank.Slot {
+			*previous = historyReadStamp{bank: current, version: latest, durable: durable}
+			if (!stable && latest&1 != 0) || server.historyReadChange(stamp) == errHistoryViewChanged {
+				return nil, errHistoryViewChanged
+			}
+		}
 		return nil, &BlockNotAvailableError{Slot: start}
 	}
 	if err != nil {

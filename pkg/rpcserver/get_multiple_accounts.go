@@ -13,6 +13,8 @@ import (
 
 const maxMultipleAccountsDataBytes = 16 << 20
 
+const maxMultipleAccountsParsedBytes = 32 << 20
+
 // GetMultipleAccountsResp preserves request order and one rooted context.
 type GetMultipleAccountsResp struct {
 	Context GetAccountInfoRespContext  `json:"context"`
@@ -50,10 +52,6 @@ func (rpcServer *RpcServer) GetMultipleAccounts(ctx context.Context, p jsonrpc.R
 	if err != nil {
 		return GetMultipleAccountsResp{}, err
 	}
-	// Parsed account decoding is not covered by this method's data budget.
-	if conf.EncodingType != nil && *conf.EncodingType == GetAccountEncodingJson {
-		return GetMultipleAccountsResp{}, &InvalidParamsError{Message: "getMultipleAccounts jsonParsed is not supported"}
-	}
 	if err := acquireQueryResponse(ctx); err != nil {
 		return GetMultipleAccountsResp{}, err
 	}
@@ -70,6 +68,7 @@ func (rpcServer *RpcServer) GetMultipleAccounts(ctx context.Context, p jsonrpc.R
 	}
 	response := GetMultipleAccountsResp{Context: GetAccountInfoRespContext{ApiVersion: "mithril 0.1", Slot: rooted.Slot},
 		Value: make([]*GetAccountInfoRespValue, len(keys))}
+	parsedRemaining := maxMultipleAccountsParsedBytes
 	for i, acct := range accountSet {
 		if err := ctx.Err(); err != nil {
 			return GetMultipleAccountsResp{}, err
@@ -78,6 +77,21 @@ func (rpcServer *RpcServer) GetMultipleAccounts(ctx context.Context, p jsonrpc.R
 		if err != nil {
 			return GetMultipleAccountsResp{}, err
 		}
+		if conf.EncodingType != nil && *conf.EncodingType == GetAccountEncodingJson {
+			// Charge actual JSON values, including duplicates, nulls and base64
+			// fallbacks. This bounds retained output, not marshal scratch space.
+			encoded, err := json.Marshal(response.Value[i])
+			if err != nil {
+				return GetMultipleAccountsResp{}, err
+			}
+			if len(encoded) > parsedRemaining {
+				return GetMultipleAccountsResp{}, &InvalidParamsError{Message: "getMultipleAccounts exceeds 32 MiB parsed response budget"}
+			}
+			parsedRemaining -= len(encoded)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return GetMultipleAccountsResp{}, err
 	}
 	return response, nil
 }

@@ -424,6 +424,9 @@ func (voteState *VoteState0_23_5) UnmarshalWithDecoder(decoder *bin.Decoder) err
 	if err != nil {
 		return err
 	}
+	if numLockouts > uint64(decoder.Remaining()/12) {
+		return InstrErrInvalidAccountData
+	}
 
 	voteState.Votes.Clear()
 	voteState.Votes.SetBaseCap(int(numLockouts))
@@ -452,6 +455,9 @@ func (voteState *VoteState0_23_5) UnmarshalWithDecoder(decoder *bin.Decoder) err
 	numEpochCredits, err := decoder.ReadUint64(bin.LE)
 	if err != nil {
 		return err
+	}
+	if numEpochCredits > uint64(decoder.Remaining()/24) {
+		return InstrErrInvalidAccountData
 	}
 
 	for count := uint64(0); count < numEpochCredits; count++ {
@@ -747,6 +753,9 @@ func (voteState *VoteState1_14_11) UnmarshalWithDecoder(decoder *bin.Decoder) er
 	if err != nil {
 		return err
 	}
+	if numLockouts > uint64(decoder.Remaining()/12) {
+		return InstrErrInvalidAccountData
+	}
 
 	voteState.Votes.Clear()
 	voteState.Votes.SetBaseCap(int(numLockouts))
@@ -785,6 +794,9 @@ func (voteState *VoteState1_14_11) UnmarshalWithDecoder(decoder *bin.Decoder) er
 	numEpochCredits, err := decoder.ReadUint64(bin.LE)
 	if err != nil {
 		return err
+	}
+	if numEpochCredits > uint64(decoder.Remaining()/24) {
+		return InstrErrInvalidAccountData
 	}
 
 	for count := uint64(0); count < numEpochCredits; count++ {
@@ -894,6 +906,9 @@ func (voteState *VoteState) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 	if err != nil {
 		return err
 	}
+	if numLockouts > uint64(decoder.Remaining()/13) {
+		return InstrErrInvalidAccountData
+	}
 
 	voteState.Votes.Clear()
 	voteState.Votes.SetBaseCap(int(numLockouts))
@@ -932,6 +947,9 @@ func (voteState *VoteState) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 	numEpochCredits, err := decoder.ReadUint64(bin.LE)
 	if err != nil {
 		return err
+	}
+	if numEpochCredits > uint64(decoder.Remaining()/24) {
+		return InstrErrInvalidAccountData
 	}
 
 	voteState.EpochCredits = slices.Grow(voteState.EpochCredits, int(numEpochCredits))
@@ -1081,6 +1099,9 @@ func (voteState *VoteState4) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 	if err != nil {
 		return err
 	}
+	if numLockouts > uint64(decoder.Remaining()/13) {
+		return InstrErrInvalidAccountData
+	}
 
 	voteState.Votes.Clear()
 	voteState.Votes.SetBaseCap(int(numLockouts))
@@ -1114,6 +1135,9 @@ func (voteState *VoteState4) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 	numEpochCredits, err := decoder.ReadUint64(bin.LE)
 	if err != nil {
 		return err
+	}
+	if numEpochCredits > uint64(decoder.Remaining()/24) {
+		return InstrErrInvalidAccountData
 	}
 
 	voteState.EpochCredits = slices.Grow(voteState.EpochCredits, int(numEpochCredits))
