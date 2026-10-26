@@ -77,13 +77,21 @@ func TestTransactionResultsLifecycleOwnerWiring(t *testing.T) {
 }
 
 type resultPublicationProbe struct {
-	pending bool
-	root    uint64
-	onGate  func(bool)
-	onRoot  func(uint64)
+	pending      bool
+	root         uint64
+	onGate       func(bool)
+	onRoot       func(uint64)
+	onInvalidate func()
+	invalidated  bool
 }
 
 func (*resultPublicationProbe) SetSlotCtx(*sealevel.SlotCtx) {}
+func (p *resultPublicationProbe) InvalidateHealth() {
+	if p.onInvalidate != nil {
+		p.onInvalidate()
+	}
+	p.invalidated = true
+}
 func (p *resultPublicationProbe) SetHistoryRecoveryPending(pending bool) {
 	if p.onGate != nil {
 		p.onGate(pending)
@@ -222,8 +230,15 @@ func TestTransactionResultsLifecycleTailUnwind(t *testing.T) {
 					require.True(t, view.Results[0].Found)
 				}
 			}
+			publisher.onInvalidate = func() {
+				require.Equal(t, mode != "disabled", publisher.pending)
+				account, err := tail.GetAccount(0, testKey(1))
+				require.NoError(t, err)
+				require.Equal(t, uint64(81), account.Lamports, "health must invalidate before account eviction")
+			}
 			rs, _, reason := tryInLoopUnwindWithResults(&CertifiedSwitch{Slot: 8}, tail, &state.MithrilState{},
-				&sealevel.SysvarEpochSchedule{SlotsPerEpoch: 432000}, 0, nil, session, publisher)
+				&sealevel.SysvarEpochSchedule{SlotsPerEpoch: 432000}, 0, nil, session, publisher, publisher)
+			require.True(t, publisher.invalidated)
 			account, err := tail.GetAccount(0, testKey(1))
 			require.NoError(t, err)
 			require.Equal(t, uint64(71), account.Lamports)

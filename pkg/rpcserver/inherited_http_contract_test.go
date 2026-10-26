@@ -17,12 +17,15 @@ import (
 
 func TestInheritedRPCParameterHTTPContract(t *testing.T) {
 	fixture := transactionOptionsServer(t)
-	db := newRPCBankHashDB(t)
+	db := fixture.acctsDb
 	hash := [32]byte{12}
 	require.NoError(t, db.StoreBankHashForSlot(9007199254740993, hash[:]))
 	server := NewRpcServer(db, 0, &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 432000}, solana.Hash{1})
 	require.NoError(t, server.listener.Close())
-	server.slotCtx = fixture.slotCtx
+	server.SetSlotCtx(fixture.slotCtx)
+	root := fixture.rootedBank.Load()
+	server.SetRootedBankState(root.Slot, root.BlockHeight, root.TransactionCount)
+	server.SetRootedExecutionBank(root.executionBank)
 	endpoint := httptest.NewServer(server)
 	t.Cleanup(endpoint.Close)
 	client := endpoint.Client()

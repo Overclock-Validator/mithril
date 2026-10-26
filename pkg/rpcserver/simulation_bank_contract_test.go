@@ -25,13 +25,14 @@ func TestSimulationReplacementBlockhashBankContext(t *testing.T) {
 		global.SetBlockHeight(oldHeight)
 		replay.ResetChainTip()
 	})
-	bank := server.slotCtx
-	bank.Blockhash = [32]byte{2}
-	sysvars, err := sealevel.NewBankSysvars(bank.Slot)
+	metadata := simulationBankFixtureAt(t, 150, solana.Hash{2}, 6000)
+	metadata.BlockHeight = 90
+	bank, err := newSimulationBankContext(metadata, server.acctsDb, server.acctsDb)
 	require.NoError(t, err)
-	require.NoError(t, bank.PublishBankSysvars(sysvars))
+	bank.UnrootedRead = nil
+	server.SetSlotCtx(bank)
 	_, wire := testLegacyTransaction(t)
-	params := mustRawParams(t, []any{base58.Encode(wire), map[string]any{"replaceRecentBlockhash": true}})
+	params := mustRawParams(t, []any{base58.Encode(wire), map[string]any{"commitment": "processed", "replaceRecentBlockhash": true}})
 
 	for _, tc := range []struct {
 		name     string
@@ -56,9 +57,12 @@ func TestSimulationReplacementBlockhashBankContext(t *testing.T) {
 	}
 
 	t.Run("HTTP", func(t *testing.T) {
-		rpc := NewRpcServer(nil, 0, &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 512}, solana.Hash{1})
+		rpc := NewRpcServer(server.acctsDb, 0, &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 512}, solana.Hash{1})
 		require.NoError(t, rpc.listener.Close())
 		rpc.SetSlotCtx(bank)
+		root := server.rootedBank.Load()
+		rpc.SetRootedBankState(root.Slot, root.BlockHeight, root.TransactionCount)
+		rpc.SetRootedExecutionBank(root.executionBank)
 		endpoint := httptest.NewServer(rpc)
 		t.Cleanup(endpoint.Close)
 		client := endpoint.Client()
@@ -82,10 +86,9 @@ func TestSimulationReplacementBlockhashBankContext(t *testing.T) {
 	_, err = server.SimulateTransaction(t.Context(), params)
 	require.Error(t, err, "missing bank metadata must not fall back to unrelated process globals")
 
-	other := &sealevel.SlotCtx{Slot: bank.Slot, Blockhash: bank.Blockhash}
-	otherSysvars, err := sealevel.NewBankSysvars(bank.Slot)
+	other, err := newSimulationBankContext(simulationBankFixtureAt(t, bank.Slot, solana.Hash(bank.Blockhash), 6000), server.acctsDb, server.acctsDb)
 	require.NoError(t, err)
-	require.NoError(t, other.PublishBankSysvars(otherSysvars))
+	other.UnrootedRead = nil
 	replay.UpdateChainTipFromSlotCtxWithBankMetadata(other, bank.Features, nil, replay.ChainTipIdentity{}, replay.ChainTipBankMetadata{BlockHeight: 90})
 	_, err = server.SimulateTransaction(t.Context(), params)
 	require.Error(t, err, "the same slot number does not establish the same bank generation")

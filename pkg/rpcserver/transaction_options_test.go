@@ -5,11 +5,10 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/Overclock-Validator/mithril/pkg/accounts"
-	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/global"
-	"github.com/Overclock-Validator/mithril/pkg/sealevel"
+	"github.com/Overclock-Validator/mithril/pkg/replay"
 	"github.com/filecoin-project/go-jsonrpc"
+	"github.com/gagliardetto/solana-go"
 	"github.com/mr-tron/base58"
 	"github.com/stretchr/testify/require"
 )
@@ -17,18 +16,13 @@ import (
 func transactionOptionsServer(t *testing.T) *RpcServer {
 	t.Helper()
 	oldSlot := global.Slot()
-	oldRecent := sealevel.SysvarCache.RecentBlockHashes.Sysvar
-	t.Cleanup(func() {
-		global.SetSlot(oldSlot)
-		sealevel.SysvarCache.RecentBlockHashes.Sysvar = oldRecent
-	})
+	t.Cleanup(func() { global.SetSlot(oldSlot) })
 	global.SetSlot(150)
-	empty := sealevel.SysvarRecentBlockhashes{}
-	sealevel.SysvarCache.RecentBlockHashes.Sysvar = &empty
-	return &RpcServer{slotCtx: &sealevel.SlotCtx{
-		Slot: 150, Features: features.NewFeaturesDefault(), Accounts: accounts.NewMemAccounts(),
-		FeeRateGovernor: &sealevel.FeeRateGovernor{},
-	}}
+	server := transactionBankServer(t)
+	bank := replay.ChainTipParentContext()
+	server.SetRootedBankState(bank.Slot, bank.BlockHeight, 0)
+	server.SetRootedExecutionBank(&bank)
+	return server
 }
 
 func TestTransactionOptionsSimulationEncoding(t *testing.T) {
@@ -108,7 +102,15 @@ func TestTransactionOptionsUseSelectedBank(t *testing.T) {
 
 func TestTransactionOptionsExactMinimum(t *testing.T) {
 	s := transactionOptionsServer(t)
-	s.slotCtx.Slot = 1 << 53
+	bank := simulationBankFixtureAt(t, 1<<53, solana.Hash{12}, 6000)
+	bank.BlockHeight = 120
+	ctx, err := newSimulationBankContext(bank, s.acctsDb, s.acctsDb)
+	require.NoError(t, err)
+	ctx.UnrootedRead = nil
+	replay.UpdateChainTipFromSlotCtxWithBankMetadata(ctx, ctx.Features, nil, replay.ChainTipIdentity{}, replay.ChainTipBankMetadata{BlockHeight: bank.BlockHeight})
+	s.SetSlotCtx(ctx)
+	s.SetRootedBankState(bank.Slot, bank.BlockHeight, 0)
+	s.SetRootedExecutionBank(bank)
 	_, wire := testLegacyTransaction(t)
 	params := mustRawParams(t, []any{base58.Encode(wire), map[string]any{"minContextSlot": uint64(1<<53) + 1}})
 	_, sendErr := s.SendTransaction(t.Context(), params)

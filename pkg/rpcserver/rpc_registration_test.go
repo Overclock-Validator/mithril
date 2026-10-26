@@ -31,7 +31,7 @@ func TestRPCHandlerMethodSet(t *testing.T) {
 }
 
 func TestInternalMethodsAreNotRPC(t *testing.T) {
-	for _, method := range []string{"enableEpochRewards", "enableBlockHistory", "setRootedBankState", "setIdentity", "setIdentitySource", "invalidateHealth"} {
+	for _, method := range []string{"enableEpochRewards", "enableBlockHistory", "setRootedBankState", "setRootedExecutionBank", "setIdentity", "setIdentitySource", "invalidateHealth"} {
 		t.Run(method, func(t *testing.T) {
 			testInternalMethodNotRPC(t, method)
 		})
