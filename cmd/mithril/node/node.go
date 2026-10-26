@@ -842,9 +842,6 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	// cluster runs Alpenglow certificate fork choice and rooted-durable replay.
 	cluster = getString("cluster", "network.cluster")
 	clusterGenesisHash = getString("genesis-hash", "network.genesis_hash")
-	if strings.TrimSpace(cluster) == "" {
-		mlog.Log.Infof("network.cluster not set; defaulting to %q", config.DefaultCluster)
-	}
 	var err error
 	clusterInfo, err = config.ResolveCluster(cluster, clusterGenesisHash)
 	if err != nil {
@@ -940,7 +937,6 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 			return fmt.Errorf("custom network.cluster %q requires turbine.gossip_entrypoint", cluster)
 		}
 		turbineGossipEntrypoint = clusterInfo.GossipEntrypoint
-		mlog.Log.Infof("turbine.gossip_entrypoint not set; using the %s entrypoint %s", cluster, turbineGossipEntrypoint)
 	}
 	turbineGossipBindAddr = getString("turbine-gossip-bind-addr", "turbine.gossip_bind_addr")
 	turbineAdvertisedIP = getString("turbine-advertised-ip", "turbine.advertised_ip")
@@ -1445,7 +1441,6 @@ func runLive(c *cobra.Command, args []string) {
 	if err := clusterInfo.CheckGenesis(networkGenesisHash); err != nil {
 		klog.Fatalf("FATAL: %v", err)
 	}
-	mlog.Log.Infof("network.cluster=%s genesis=%s: Alpenglow rooted-durable replay", cluster, shortHash(networkGenesisHash))
 
 	mithrilState, err := loadBootstrapState(accountsPath, bootstrapMode)
 	if err != nil {
@@ -3202,6 +3197,11 @@ func printStartupInfo(commandName string) {
 		modeLabel = "validator (voting and block production active)"
 	}
 	fmt.Printf("  Mode:         %s%s%s\n", gold, modeLabel, reset)
+	clusterNote := ""
+	if clusterInfo.Custom {
+		clusterNote = ", custom"
+	}
+	fmt.Printf("  Cluster:      %s%s%s %s(genesis %s%s)%s\n", gold, cluster, reset, dim, shortHash(clusterInfo.GenesisHash), clusterNote, reset)
 
 	// Bootstrap mode with description
 	var bootstrapDesc string
