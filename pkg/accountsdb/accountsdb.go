@@ -30,8 +30,8 @@ import (
 type AccountsDb struct {
 	Index            *pebble.DB
 	BankHashStore    *pebble.DB
-	AcctsDir         string // primary shard's accounts dir; its parent is the metadata dir
-	Shards           *Shards
+	AcctsDir         string   // primary accounts directory; its parent holds the metadata
+	AcctsDirs        []string // every accounts directory, primary first; see accounts_dirs.go
 	LargestFileId    atomic.Uint64
 	VoteAcctCache    *WeightedCache[solana.PublicKey, *accounts.Account]
 	CommonAcctsCache *commonAccountCache
@@ -72,22 +72,19 @@ type AccountsDb struct {
 
 	// Batch-fold state (segment.go/fold.go/recovery.go). foldMu serializes
 	// CommitBatch, recovery, rewind, and compaction.
-	foldMu               metrics.TimedMutex
-	lastBatchSeq         uint64                    // guarded by foldMu; seeded by RecoverFoldState
-	durableThrough       atomic.Uint64             // observability: highest durably folded slot
-	foldHooks            foldTestHooks             // test-only crash injection
-	coalescedFiles       sync.Map                  // file ID -> physical path; immutable compact outputs
-	coalescedScans       map[uint64]*coalescedScan // guarded by foldMu
-	coalescedCompactHook func(string) error        // test-only crash injection
-	compactCursor        string                    // guarded by foldMu; scan resume point across CompactOnce cycles
-	sparseCursor         string                    // independent cursor so bootstrap scanning cannot starve large segments
-	resparseNext         bool                      // alternate new and previously sparse segments, even with one-file cycles
-	compactScanSeq       uint64
-	compactScanned       map[uint64]struct{} // successful sparse scans at compactScanSeq; reset when the head changes
-	compactScanClock     uint64
-	compactLastScan      map[uint64]uint64 // oldest scan first; a growing directory must not postpone cursor wrap forever
-	compactCycles        uint64            // periodically serve bootstrap and mostly-empty sparse files too
-	compactHooks         compactionTestHooks
+	foldMu           metrics.TimedMutex
+	lastBatchSeq     uint64        // guarded by foldMu; seeded by RecoverFoldState
+	durableThrough   atomic.Uint64 // observability: highest durably folded slot
+	foldHooks        foldTestHooks // test-only crash injection
+	compactCursor    string        // guarded by foldMu; scan resume point across CompactOnce cycles
+	sparseCursor     string        // independent cursor so bootstrap scanning cannot starve large segments
+	resparseNext     bool          // alternate new and previously sparse segments, even with one-file cycles
+	compactScanSeq   uint64
+	compactScanned   map[uint64]struct{} // successful sparse scans at compactScanSeq; reset when the head changes
+	compactScanClock uint64
+	compactLastScan  map[uint64]uint64 // oldest scan first; a growing directory must not postpone cursor wrap forever
+	compactCycles    uint64            // periodically serve bootstrap and mostly-empty sparse files too
+	compactHooks     compactionTestHooks
 	// compactInventory is the in-memory view of the accounts directory that
 	// compaction scans (nil = rebuild from the directory); compactPinCache holds
 	// pins computed from unchanged retained manifests. Both guarded by foldMu.
@@ -171,38 +168,29 @@ func OpenDbPaths(accountsPaths []string) (*AccountsDb, error) {
 		return nil, err
 	}
 	// The first path holds all metadata (index, manifest, state); every path
-	// holds an "accounts" dir with that disk's shard data.
+	// holds an "accounts" dir with that disk's share of the appendvecs.
 	accountsDbDir := accountsPaths[0]
-
-	// num_shards records the shard count the DB was built with.
-	b, err := os.ReadFile(filepath.Join(accountsDbDir, "num_shards"))
-	legacy := os.IsNotExist(err) && len(accountsPaths) == 1
-	if legacy {
-		b = make([]byte, 8)
-		binary.LittleEndian.PutUint64(b, 1)
-		err = nil
+	// The per-disk big-file layout (num_shards, accounts/data) was replaced
+	// before release; such a store must be rebuilt from a snapshot.
+	if _, err := os.Stat(filepath.Join(accountsDbDir, "num_shards")); err == nil {
+		return nil, fmt.Errorf("AccountsDB at %s uses the retired per-disk big-file layout; rebuild it from a snapshot", accountsDbDir)
 	}
+	built, err := readAccountsDirCount(accountsDbDir)
 	if err != nil {
-		return nil, fmt.Errorf("reading num_shards: %w", err)
-	}
-	if len(b) != 8 {
-		return nil, fmt.Errorf("num_shards: expected 8 bytes, got %d", len(b))
-	}
-	numShards := int(binary.LittleEndian.Uint64(b))
-	if numShards != len(accountsPaths) {
-		return nil, fmt.Errorf("configured %d accounts dir(s) but AccountsDB was built with %d shard(s); rebuild required", len(accountsPaths), numShards)
-	}
-
-	shardDirs := make([]string, len(accountsPaths))
-	for i, p := range accountsPaths {
-		shardDirs[i] = filepath.Join(p, "accounts")
-	}
-
-	// check for existence of the primary 'accounts' directory, which holds the appendvecs
-	appendVecsDir := shardDirs[0]
-	if _, err := os.Stat(appendVecsDir); err != nil {
 		return nil, err
 	}
+	if built != len(accountsPaths) {
+		return nil, fmt.Errorf("configured %d accounts directories but the AccountsDB was built with %d; rebuild required", len(accountsPaths), built)
+	}
+	// check for existence of the 'accounts' directories, which hold the appendvecs
+	appendVecsDirs := make([]string, len(accountsPaths))
+	for i, p := range accountsPaths {
+		appendVecsDirs[i] = filepath.Join(p, "accounts")
+		if _, err := os.Stat(appendVecsDirs[i]); err != nil {
+			return nil, err
+		}
+	}
+	appendVecsDir := appendVecsDirs[0]
 
 	indexDir := filepath.Join(accountsDbDir, "mithril_db")
 	opts := NewAccountsIndexPebbleOptions(silentLogger{})
@@ -227,10 +215,7 @@ func OpenDbPaths(accountsPaths []string) (*AccountsDb, error) {
 	}
 
 	accountsDb := &AccountsDb{
-		IndexWALDisabled: DisableIndexWAL, Index: db, BankHashStore: bankhashDb, AcctsDir: appendVecsDir}
-	if !legacy {
-		accountsDb.Shards = newShards(shardDirs)
-	}
+		IndexWALDisabled: DisableIndexWAL, Index: db, BankHashStore: bankhashDb, AcctsDir: appendVecsDir, AcctsDirs: appendVecsDirs}
 	largestBytes, err := os.ReadFile(filepath.Join(accountsDbDir, "largest_file_id"))
 	if err != nil || len(largestBytes) != 8 {
 		bankhashDb.Close()
@@ -240,11 +225,6 @@ func OpenDbPaths(accountsPaths []string) (*AccountsDb, error) {
 	accountsDb.LargestFileId.Store(binary.LittleEndian.Uint64(largestBytes))
 	accountsDb.bindLockDiagnostics()
 
-	if err := accountsDb.loadCoalescedFiles(); err != nil {
-		bankhashDb.Close()
-		db.Close()
-		return nil, err
-	}
 	accountsDb.inProgressStoreRequests = list.New()
 	accountsDb.storeRequestChan = make(chan *list.Element)
 	accountsDb.storeWorkerDone = make(chan struct{})

@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
-	"path/filepath"
 )
 
 const sparseCompactionMinSize = int64(8 << 20)
@@ -38,7 +37,7 @@ func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte,
 		(m.Kind != ManifestKindFold && m.Kind != ManifestKindCompact) {
 		return 0, scanned, false, fmt.Errorf("manifest does not describe source %s", c.name)
 	}
-	path := filepath.Join(db.AcctsDir, c.name)
+	path := c.path
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		return 0, scanned, false, err
@@ -106,7 +105,7 @@ func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte,
 	}
 	if retained == 0 {
 		db.appendVecReadMu.LockAs("compaction")
-		err := removeSourceFiles(db.AcctsDir, path, c.manifestPath)
+		err := removeSourceFiles(path, c.manifestPath)
 		db.appendVecReadMu.Unlock()
 		if err == nil {
 			db.trackRemovedLocked(path, c.manifestPath)

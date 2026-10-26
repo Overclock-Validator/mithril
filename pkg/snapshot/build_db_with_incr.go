@@ -65,18 +65,11 @@ func BuildAccountsDbAuto(
 
 	start := time.Now()
 
-	shardDirs := make([]string, len(accountsPaths))
-	for i, p := range accountsPaths {
-		shardDirs[i] = filepath.Join(p, "accounts")
-		if err = os.MkdirAll(shardDirs[i], 0775); err != nil {
-			return nil, nil, err
-		}
-	}
-	shardFiles, err := openShardBigFiles(shardDirs)
+	appendVecDirs, err := makeAppendVecDirs(accountsPaths)
 	if err != nil {
-		return nil, nil, fmt.Errorf("opening shard big files: %w", err)
+		return nil, nil, err
 	}
-	defer shardFiles.close() // also drain and release writers on bootstrap errors
+	defer appendVecDirs.close()
 	logSnapshotBootstrapTuning()
 
 	defer ants.Release()
@@ -97,7 +90,7 @@ func BuildAccountsDbAuto(
 		entries: make([]accountsdb.StakeIndexEntry, 0, 1000000), // Pre-allocate for ~1M stake accounts
 	}
 
-	pools, err := initWorkerPools(wg, sl, manifest, incrementalManifest, shardFiles, stakeCollector)
+	pools, err := initWorkerPools(wg, sl, manifest, incrementalManifest, appendVecDirs, stakeCollector)
 	if err != nil {
 		return nil, nil, fmt.Errorf("initializing worker pools: %w", err)
 	}
@@ -262,10 +255,15 @@ func BuildAccountsDbAuto(
 	// Workers have drained; release their pools before the memory-intensive sort.
 	pools.Release()
 
-	// flush and close every shard's big file now that all appends are done
-	if err := shardFiles.close(); err != nil {
-		return nil, nil, fmt.Errorf("closing shard big files: %w", err)
-	}
+	// Make the unpacked appendvecs durable while the index flush runs.
+	appendVecsSynced := make(chan error, 1)
+	go func() { appendVecsSynced <- appendVecDirs.syncAll() }()
+	defer func() {
+		select {
+		case <-appendVecsSynced:
+		default:
+		}
+	}()
 
 	// Show indexing progress for shard flush
 	indexProgress := progress.NewIndexingProgress("Flush (shard logs)")
@@ -280,12 +278,15 @@ func BuildAccountsDbAuto(
 	}
 	index.Close()
 
-	if err := writeShardMetadata(accountsDbDir, len(shardDirs)); err != nil {
+	if err := <-appendVecsSynced; err != nil {
+		return nil, nil, err
+	}
+	if err := accountsdb.WriteAccountsDirCount(accountsDbDir, len(accountsPaths)); err != nil {
 		return nil, nil, err
 	}
 
 	var largestFileIdBytes [8]byte
-	binary.LittleEndian.PutUint64(largestFileIdBytes[:], uint64(len(shardDirs)-1))
+	binary.LittleEndian.PutUint64(largestFileIdBytes[:], appendVecDirs.largest.Load())
 	if err := os.WriteFile(filepath.Join(accountsDbDir, "largest_file_id"), largestFileIdBytes[:], 0644); err != nil {
 		return nil, nil, err
 	}

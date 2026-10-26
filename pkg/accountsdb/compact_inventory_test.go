@@ -45,7 +45,7 @@ func requirePinsMatchUncached(t *testing.T, db *AccountsDb, horizon uint64) {
 	defer db.foldMu.Unlock()
 	meta, _, err := db.readFoldMeta()
 	require.NoError(t, err)
-	inv, err := scanCompactionInventory(db.AcctsDir)
+	inv, err := db.scanCompactionInventory()
 	require.NoError(t, err)
 	cached, cachedHeaders, err := db.compactionPinSet(meta.BatchSeq, horizon, inv)
 	require.NoError(t, err)

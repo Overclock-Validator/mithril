@@ -94,19 +94,17 @@ name = "mithril"
     # Put this on your fastest NVMe due to heavy random I/O.
     accounts = "/mnt/mithril-accounts"
 
-    # For multi-disk setups, accounts may instead be a list of directories, one
-    # per physical disk. The snapshot unpack shards append-vecs across them so
-    # aggregate write throughput approaches the sum of the disks. The first entry
-    # also holds the shared metadata (account index, manifest, state); the others
-    # hold only their disk's shard of the account data. The number and order of
-    # the directories are fixed at build time (the order identifies the shards);
-    # changing either requires rebuilding the AccountsDB. Account data written
-    # after the snapshot (folds, compaction) goes to the first directory, so leave
-    # it room beyond snapshot_shard_min_free_mb.
+    # With several NVMe disks, accounts may instead be a list of directories, one
+    # per disk. The snapshot unpack spreads appendvec files across them, sending
+    # each file to the disk with the fewest bytes still being written, so write
+    # throughput approaches the sum of the disks. The first entry also holds the
+    # index, manifest, state and every fold segment; the others hold only their
+    # share of the snapshot's appendvecs (and their compaction outputs). The
+    # number of directories is fixed at build time: changing it requires a
+    # rebuild. One directory is the ordinary single-disk layout.
     #   accounts = [
-    #       "/mnt/nvme0/mithril-accounts",  # primary: metadata + shard 0
-    #       "/mnt/nvme1/mithril-accounts",  # shard 1
-    #       "/mnt/nvme2/mithril-accounts",  # shard 2
+    #       "/mnt/nvme0/mithril-accounts",  # primary: metadata, folds, a share of the snapshot
+    #       "/mnt/nvme1/mithril-accounts",
     #   ]
 
     # Fold batch size K: rooted (finalized+verified) slots fold to disk K at a
@@ -640,19 +638,11 @@ name = "mithril"
     # 0 (default) = one per CPU.
     # flush_sort_workers = 0
 
-    # Write the snapshot append-vec big files with O_DIRECT, bypassing the OS page
-    # cache. On a ~460GB unpack the buffered path churns hundreds of GB of dirty
-    # pages, which evicts the zstd-decode working set; O_DIRECT avoids that and
-    # gives a modest (~6%) unpack speedup that grows on low-RAM boxes. Off by
-    # default (buffered is the safe choice). Requires a filesystem that supports
-    # O_DIRECT (ext4/xfs; not tmpfs).
-    # snapshot_directio = false
-
-    # With several accounts directories, stop placing snapshot data on a
+    # With several accounts directories, stop placing unpacked snapshot data on a
     # filesystem once its free space falls to this many MiB, and send the rest to
-    # the other directories. This lets disks of different sizes each fill to
-    # capacity. Ignored with a single accounts directory.
-    # snapshot_shard_min_free_mb = 16384
+    # the other directories, so disks of different sizes each fill to capacity.
+    # Ignored with a single accounts directory.
+    # snapshot_accounts_dir_min_free_mb = 16384
 
     # Size in MB for serialized parameter arena (0 to disable)
     param_arena_size_mb = 512

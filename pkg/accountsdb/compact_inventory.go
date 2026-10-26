@@ -51,28 +51,41 @@ var compactionInventoryVerifyCycles uint64 = 600
 // entries come from external deletion and fail closed on their own.
 var compactionInventoryStrict bool
 
-func scanCompactionInventory(dir string) (*compactionInventory, error) {
+// scanCompactionInventory lists every accounts directory. Manifests live in
+// the primary; a data file counts only in the directory its file ID maps to.
+func (db *AccountsDb) scanCompactionInventory() (*compactionInventory, error) {
+	inv := &compactionInventory{data: make(map[string]inventoryDataFile), manifests: make(map[string]struct{})}
+	for _, dir := range db.AccountsDirs() {
+		if err := db.scanCompactionInventoryDir(inv, dir); err != nil {
+			return nil, err
+		}
+	}
+	return inv, nil
+}
+
+func (db *AccountsDb) scanCompactionInventoryDir(inv *compactionInventory, dir string) error {
 	f, err := os.Open(dir)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	entries, err := f.ReadDir(-1)
 	f.Close()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	inv := &compactionInventory{data: make(map[string]inventoryDataFile), manifests: make(map[string]struct{})}
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() {
 			continue
 		}
 		if isTrackedManifestName(name) {
-			inv.manifests[name] = struct{}{}
+			if dir == db.AcctsDir {
+				inv.manifests[name] = struct{}{}
+			}
 			continue
 		}
 		slot, fileId, ok := parseDataFileName(name)
-		if !ok {
+		if !ok || db.appendVecDir(fileId) != dir {
 			continue
 		}
 		info, ierr := e.Info()
@@ -81,7 +94,7 @@ func scanCompactionInventory(dir string) (*compactionInventory, error) {
 		}
 		inv.data[name] = inventoryDataFile{slot: slot, fileId: fileId, size: info.Size(), allocated: allocatedBytesFromInfo(info)}
 	}
-	return inv, nil
+	return nil
 }
 
 func isTrackedManifestName(name string) bool {
@@ -99,7 +112,7 @@ func (db *AccountsDb) compactionInventoryLocked() (*compactionInventory, error) 
 		inv.cycles++
 		return inv, nil
 	}
-	fresh, err := scanCompactionInventory(db.AcctsDir)
+	fresh, err := db.scanCompactionInventory()
 	if err != nil {
 		db.compactInventory = nil
 		return nil, err
@@ -169,7 +182,7 @@ func (db *AccountsDb) trackDataFileLocked(name string) {
 		return
 	}
 	slot, fileId, ok := parseDataFileName(name)
-	info, err := os.Lstat(filepath.Join(db.AcctsDir, name))
+	info, err := os.Lstat(filepath.Join(db.appendVecDir(fileId), name))
 	if !ok || err != nil {
 		db.invalidateCompactionInventoryLocked()
 		return

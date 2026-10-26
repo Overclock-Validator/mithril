@@ -69,19 +69,18 @@ type DebugConfig struct {
 
 // DevelopmentConfig holds development/tuning configuration (matches Firedancer [development] section)
 type DevelopmentConfig struct {
-	ZstdDecoderConcurrency        int         `toml:"zstd_decoder_concurrency" mapstructure:"zstd_decoder_concurrency"`                 // was: zstd-decoder-concurrency
-	MaxConcurrentFlushers         int         `toml:"max_concurrent_flushers" mapstructure:"max_concurrent_flushers"`                   // was: max-concurrent-flushers
-	FlushSortWorkers              int         `toml:"flush_sort_workers" mapstructure:"flush_sort_workers"`                             // Snapshot index-flush concurrent sort workers (0 = NumCPU)
-	SnapshotDirectIO              bool        `toml:"snapshot_directio" mapstructure:"snapshot_directio"`                               // Write snapshot big files with O_DIRECT (bypasses page cache)
-	SnapshotShardMinFreeMB        int         `toml:"snapshot_shard_min_free_mb" mapstructure:"snapshot_shard_min_free_mb"`             // Multi-dir unpack: per-filesystem free-space reserve in MiB
-	SnapshotAppendVecWorkers      int         `toml:"snapshot_append_vec_workers" mapstructure:"snapshot_append_vec_workers"`           // Snapshot appendvec write workers
-	SnapshotIndexBuilderWorkers   int         `toml:"snapshot_index_builder_workers" mapstructure:"snapshot_index_builder_workers"`     // Snapshot index parsing workers
-	SnapshotIndexCommitterWorkers int         `toml:"snapshot_index_committer_workers" mapstructure:"snapshot_index_committer_workers"` // Snapshot index shard enqueue workers
-	SnapshotIndexShards           int         `toml:"snapshot_index_shards" mapstructure:"snapshot_index_shards"`                       // Snapshot account-index shard count
-	SnapshotIndexTempDir          string      `toml:"snapshot_index_temp_dir" mapstructure:"snapshot_index_temp_dir"`                   // Optional temp dir for snapshot index shard logs/SST staging
-	ParamArenaSizeMB              uint64      `toml:"param_arena_size_mb" mapstructure:"param_arena_size_mb"`                           // was: param-arena-size-mb
-	BorrowedAccountArenaSize      uint64      `toml:"borrowed_account_arena_size" mapstructure:"borrowed_account_arena_size"`           // was: borrowed-account-arena-size
-	UsePool                       bool        `toml:"use_pool" mapstructure:"use_pool"`                                                 // was: use-pool
+	ZstdDecoderConcurrency        int         `toml:"zstd_decoder_concurrency" mapstructure:"zstd_decoder_concurrency"`                   // was: zstd-decoder-concurrency
+	MaxConcurrentFlushers         int         `toml:"max_concurrent_flushers" mapstructure:"max_concurrent_flushers"`                     // was: max-concurrent-flushers
+	FlushSortWorkers              int         `toml:"flush_sort_workers" mapstructure:"flush_sort_workers"`                               // Snapshot index-flush concurrent sort workers (0 = NumCPU)
+	SnapshotAccountsDirMinFreeMB  int         `toml:"snapshot_accounts_dir_min_free_mb" mapstructure:"snapshot_accounts_dir_min_free_mb"` // Multi-dir unpack: per-filesystem free-space reserve in MiB
+	SnapshotAppendVecWorkers      int         `toml:"snapshot_append_vec_workers" mapstructure:"snapshot_append_vec_workers"`             // Snapshot appendvec write workers
+	SnapshotIndexBuilderWorkers   int         `toml:"snapshot_index_builder_workers" mapstructure:"snapshot_index_builder_workers"`       // Snapshot index parsing workers
+	SnapshotIndexCommitterWorkers int         `toml:"snapshot_index_committer_workers" mapstructure:"snapshot_index_committer_workers"`   // Snapshot index shard enqueue workers
+	SnapshotIndexShards           int         `toml:"snapshot_index_shards" mapstructure:"snapshot_index_shards"`                         // Snapshot account-index shard count
+	SnapshotIndexTempDir          string      `toml:"snapshot_index_temp_dir" mapstructure:"snapshot_index_temp_dir"`                     // Optional temp dir for snapshot index shard logs/SST staging
+	ParamArenaSizeMB              uint64      `toml:"param_arena_size_mb" mapstructure:"param_arena_size_mb"`                             // was: param-arena-size-mb
+	BorrowedAccountArenaSize      uint64      `toml:"borrowed_account_arena_size" mapstructure:"borrowed_account_arena_size"`             // was: borrowed-account-arena-size
+	UsePool                       bool        `toml:"use_pool" mapstructure:"use_pool"`                                                   // was: use-pool
 	Pprof                         PprofConfig `toml:"pprof" mapstructure:"pprof"`
 	ProgramCacheMaxMB             int         `toml:"program_cache_max_mb" mapstructure:"program_cache_max_mb"`               // Approximate SBPF program cache size in MiB
 	CommonAccountCacheMaxMB       int         `toml:"common_account_cache_max_mb" mapstructure:"common_account_cache_max_mb"` // Retained decoded account cache budget in MiB

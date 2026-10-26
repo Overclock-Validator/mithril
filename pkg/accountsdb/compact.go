@@ -90,7 +90,6 @@ const (
 type compactCandidate struct {
 	name          string
 	path          string
-	coalesced     bool // snapshot data file or kind-3 output; see compactCoalesced
 	slot          uint64
 	fileId        uint64
 	size          int64
@@ -193,13 +192,6 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 		}
 	}
 
-	// Coalesced evacuation relocates records, so any pin on its source (whole
-	// file or a single undo record) invalidates in-progress scan state.
-	for id := range db.coalescedScans {
-		if _, ok := pinned.whole[id]; ok || len(pinned.records[id]) > 0 {
-			delete(db.coalescedScans, id)
-		}
-	}
 	bootstrapHigh := db.bootstrapHighFileId()
 	candidates := make([]compactCandidate, 0, len(inv.data))
 	for name, file := range inv.data {
@@ -221,34 +213,14 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 		// Small files and bootstrap appendvecs still use relocation compaction.
 		// Only manifest-backed large files support reclaiming individual dead
 		// payloads while keeping all undo pointers at their original offsets.
-		// Coalesced outputs are evacuated, never sparsified: any pin holds them whole.
-		_, coalesced := db.coalescedFiles.Load(fileId)
-		if len(pinned.records[fileId]) > 0 && (coalesced || !hasManifest || file.size < sparseCompactionMinSize || !sparseCompactionSupported) {
+		if len(pinned.records[fileId]) > 0 && (!hasManifest || file.size < sparseCompactionMinSize || !sparseCompactionSupported) {
 			continue
 		}
 		candidates = append(candidates, compactCandidate{
-			name: name, path: filepath.Join(db.AcctsDir, name), slot: slot, fileId: fileId, size: file.size, allocated: allocated, manifestPath: manifest.Path,
-			coalesced:     coalesced,
+			name: name, path: filepath.Join(db.appendVecDir(fileId), name), slot: slot, fileId: fileId, size: file.size, allocated: allocated, manifestPath: manifest.Path,
 			alreadySparse: (manifest.Kind == ManifestKindCompact && manifest.DataCRC == 0) || db.compactLastScan[fileId] != 0,
 			scanOrder:     db.compactLastScan[fileId],
 		})
-	}
-	if db.Shards != nil {
-		for i, dir := range db.Shards.dirs {
-			id := uint64(i)
-			if _, ok := pinned.whole[id]; ok || len(pinned.records[id]) > 0 {
-				continue
-			}
-			path := filepath.Join(dir, "data")
-			info, e := os.Stat(path)
-			if os.IsNotExist(e) {
-				continue
-			}
-			if e != nil {
-				return stats, e
-			}
-			candidates = append(candidates, compactCandidate{name: fmt.Sprintf("snapshot-%020d", id), path: path, fileId: id, size: info.Size(), coalesced: true})
-		}
 	}
 	db.compactCycles++
 	queue := newCompactCandidateQueue(candidates, db.sparseCursor, db.compactCursor, db.resparseNext, db.compactCycles%8 == 0)
@@ -276,23 +248,6 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 			db.resparseNext = false
 		default:
 			db.compactCursor = compactCandidateKey(c)
-		}
-		if c.coalesced {
-			stats.CandidatesScanned++
-			indexCache = sparseIndexCache{} // evacuation moves index locations
-			r, e := db.compactCoalesced(c, cfg.MaxScanBytesPerCycle-scannedBytes, cfg.MaxMoveBytesPerCycle-stats.LiveBytesMoved, cfg.MinDeadFraction, stats.LiveBytesMoved == 0)
-			if e != nil {
-				return stats, fmt.Errorf("accountsdb: compact %s: %w", c.name, e)
-			}
-			scannedBytes += r.scanned
-			stats.LiveBytesMoved += r.moved
-			stats.BytesReclaimed += r.freed - r.moved
-			if r.moved > 0 {
-				stats.FilesCompacted++
-			} else if r.deleted {
-				stats.FilesDeleted++
-			}
-			continue
 		}
 		stats.CandidatesScanned++
 		if c.manifestPath != "" && c.size >= sparseCompactionMinSize && sparseCompactionSupported {
@@ -359,7 +314,7 @@ func compactCandidateLess(a, b compactCandidate) bool {
 }
 
 func compactCandidateClass(c compactCandidate) byte {
-	if !c.coalesced && c.manifestPath != "" && c.allocated >= sparseCompactionMinSize {
+	if c.manifestPath != "" && c.allocated >= sparseCompactionMinSize {
 		if c.alreadySparse {
 			// Hole punching retains record headers and edge pages. Repeatedly
 			// walking a multi-GB logical file with only a few percent allocated
@@ -456,7 +411,7 @@ func (db *AccountsDb) compactionPinSet(headSeq, horizon uint64, inv *compactionI
 		dataName := strings.TrimSuffix(strings.TrimSuffix(name, ".rewound"), segManifestSuffix)
 		slot, fileID, validName := parseDataFileName(dataName)
 		if !validName || hdr.FileId != fileID || hdr.ThroughSlot != slot ||
-			(hdr.Kind != ManifestKindFold && hdr.Kind != ManifestKindCompact && hdr.Kind != ManifestKindCoalescedCompact) ||
+			(hdr.Kind != ManifestKindFold && hdr.Kind != ManifestKindCompact) ||
 			(hdr.Kind != ManifestKindFold && hdr.BatchSeq != 0) ||
 			(hdr.Kind == ManifestKindFold && hdr.BatchSeq == 0) {
 			return nil, nil, fmt.Errorf("cannot establish rewind pins: invalid manifest header %s", name)
@@ -546,7 +501,7 @@ type compactionPinCache struct {
 // acted=false means the file was left alone (too live). liveBytesMoved==0 with
 // acted=true means the fully-dead fast path (source deleted, nothing written).
 func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (bool, int64, error) {
-	srcPath := filepath.Join(db.AcctsDir, c.name)
+	srcPath := c.path
 	data, err := os.ReadFile(srcPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -556,7 +511,7 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 		return false, 0, err
 	}
 
-	pubkeys, idxEntries, _, err := BuildIndexEntriesFromAppendVecs(data, uint64(len(data)), c.slot, c.fileId, 0)
+	pubkeys, idxEntries, _, err := BuildIndexEntriesFromAppendVecs(data, uint64(len(data)), c.slot, c.fileId)
 	if err != nil {
 		return false, 0, err
 	}
@@ -590,7 +545,7 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 		// Fully dead (or empty bankhash-only segment past the horizon): no
 		// index state references it; drop source + its manifest.
 		db.appendVecReadMu.LockAs("compaction")
-		err := removeSourceFiles(db.AcctsDir, srcPath, c.manifestPath)
+		err := removeSourceFiles(srcPath, c.manifestPath)
 		db.appendVecReadMu.Unlock()
 		if err != nil {
 			return false, 0, err
@@ -606,7 +561,8 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 
 	// Allocate the output fileId, persisting the high-water mark before the
 	// first data byte (I7 — a crash must never lead to fileId reuse).
-	newFileId := db.nextFileId(0)
+	// The output stays on the source's disk; its manifest lives in the primary.
+	newFileId := db.nextFileId(int(c.fileId % db.dirCount()))
 	if err := db.persistLargestFileId(); err != nil {
 		return false, 0, err
 	}
@@ -628,7 +584,7 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 	}
 
 	outName := SegmentDataName(c.slot, newFileId)
-	outPath := filepath.Join(db.AcctsDir, outName)
+	outPath := db.appendVecPath(c.slot, newFileId)
 	f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return false, 0, err
@@ -644,7 +600,7 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 	if err := f.Close(); err != nil {
 		return false, 0, err
 	}
-	if err := fsyncDir(db.AcctsDir); err != nil {
+	if err := fsyncDir(filepath.Dir(outPath)); err != nil {
 		return false, 0, err
 	}
 	db.trackDataFileLocked(outName)
@@ -698,7 +654,7 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 		}
 	}
 
-	if err := removeSourceFiles(db.AcctsDir, srcPath, c.manifestPath); err != nil {
+	if err := removeSourceFiles(srcPath, c.manifestPath); err != nil {
 		return false, 0, err
 	}
 	db.trackRemovedLocked(srcPath, c.manifestPath)
@@ -722,7 +678,7 @@ func recordLenAt(data []byte, off uint64) int64 {
 	return recLen
 }
 
-func removeSourceFiles(acctsDir, srcPath, manifestPath string) error {
+func removeSourceFiles(srcPath, manifestPath string) error {
 	if err := os.Remove(srcPath); err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -730,8 +686,14 @@ func removeSourceFiles(acctsDir, srcPath, manifestPath string) error {
 		if err := os.Remove(manifestPath); err != nil && !os.IsNotExist(err) {
 			return err
 		}
+		// A secondary-directory data file's manifest lives in the primary.
+		if filepath.Dir(manifestPath) != filepath.Dir(srcPath) {
+			if err := fsyncDir(filepath.Dir(manifestPath)); err != nil {
+				return err
+			}
+		}
 	}
-	return fsyncDir(acctsDir)
+	return fsyncDir(filepath.Dir(srcPath))
 }
 
 func humanBytes(n int64) string {

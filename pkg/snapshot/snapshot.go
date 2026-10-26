@@ -71,12 +71,11 @@ type appendVecCopyingTask struct {
 }
 
 type indexEntryBuilderTask struct {
-	Data       []byte
-	FileSize   uint64
-	Slot       uint64
-	FileId     uint64
-	BaseOffset uint64
-	BufRef     *[]byte // pooled buffer backing Data; returned once parsed
+	Data     []byte
+	FileSize uint64
+	Slot     uint64
+	FileId   uint64
+	BufRef   *[]byte // pooled buffer backing Data; returned once parsed
 }
 
 type indexEntryCommitterTask struct {

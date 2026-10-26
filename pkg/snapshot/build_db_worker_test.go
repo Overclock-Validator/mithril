@@ -51,16 +51,13 @@ func TestSnapshotWorkerParseFailurePropagatesAfterDrain(t *testing.T) {
 	manifest.AccountsDb.Storages = map[uint64]SlotAcctVecs{
 		slot: {Slot: slot, AcctVecs: []AcctVec{{Id: fileID, FileSize: uint64(len(malformed))}}},
 	}
-	shardFiles, err := openShardBigFiles([]string{filepath.Join(accountsDir, "accounts")})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, shardFiles.close()) })
 	wg := &sync.WaitGroup{}
 	pools, err := initWorkerPools(
 		wg,
 		shardLogger,
 		manifest,
 		nil,
-		shardFiles,
+		testAppendVecDirs(t, accountsDir),
 		&stakeIndexCollector{},
 	)
 	require.NoError(t, err)
@@ -138,12 +135,10 @@ func TestSnapshotWorkersSupportArchiveSizedAppendVecs(t *testing.T) {
 			shardLogger := NewShardLogger(1, t.TempDir())
 			closeShardLogger := sync.OnceFunc(func() { require.NoError(t, shardLogger.Close(context.Background())) })
 			t.Cleanup(closeShardLogger)
-			shardFiles, err := openShardBigFiles([]string{filepath.Join(accountsDir, "accounts")})
-			require.NoError(t, err)
-			t.Cleanup(func() { require.NoError(t, shardFiles.close()) })
 			wg := &sync.WaitGroup{}
 			stakes := &stakeIndexCollector{}
-			pools, err := initWorkerPools(wg, shardLogger, tt.full, tt.incremental, shardFiles, stakes)
+			dirs := testAppendVecDirs(t, accountsDir)
+			pools, err := initWorkerPools(wg, shardLogger, tt.full, tt.incremental, dirs, stakes)
 			require.NoError(t, err)
 			t.Cleanup(pools.Release)
 			require.NoError(t, invokeSnapshotTask(wg, pools.appendVecCopying, appendVecCopyingTask{
@@ -161,12 +156,21 @@ func TestSnapshotWorkersSupportArchiveSizedAppendVecs(t *testing.T) {
 				logged += sh.logSize
 			}
 			require.Equal(t, tt.wantEntries*(32+vlen), logged)
+			require.Equal(t, fileID, dirs.largest.Load())
 			require.Len(t, stakes.entries, tt.wantEntries)
 			for i, entry := range stakes.entries {
 				require.Equal(t, keys[i], entry.Pubkey)
-				require.Equal(t, uint64(0), entry.FileId) // shard 0, segment 0: the coalesced data file
+				require.Equal(t, fileID, entry.FileId)
 				require.Equal(t, uint64(i)*oneAccountSize, entry.Offset)
 			}
 		})
 	}
+}
+
+func testAppendVecDirs(t *testing.T, accountsDbDir string) *appendVecDirs {
+	t.Helper()
+	dirs, err := makeAppendVecDirs([]string{accountsDbDir})
+	require.NoError(t, err)
+	t.Cleanup(dirs.close)
+	return dirs
 }
