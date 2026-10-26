@@ -2872,6 +2872,14 @@ func ReplayBlocks(
 				continue
 			}
 
+			if rejected, err := quarantineMissingAlpenglowFooter(block, streamer, blockStream.QuarantineInvalidAlpenglowBlock); err != nil {
+				result.Error = err
+				mlog.Log.Errorf("%v", err)
+				break
+			} else if rejected {
+				continue
+			}
+
 			if !block.IsSkipped {
 				if validationErr := validatePreConsensusTransactionStatuses(
 					transactionStatuses, block, currentExecutedAnchorSlot(),
