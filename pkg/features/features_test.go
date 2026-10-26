@@ -39,6 +39,11 @@ func TestDiscardUnexpectedDataCompleteShredsFeatureGate(t *testing.T) {
 	assert.Contains(t, AllFeatureGates, DiscardUnexpectedDataCompleteShreds)
 }
 
+func TestLoaderV3MinimumExtendProgramSizeFeatureGate(t *testing.T) {
+	assert.Equal(t, base58.MustDecodeFromString("YbbRLkvenrocjGPGyoQE4wjnvYzTgfsk38NFmcYK7a5"), LoaderV3MinimumExtendProgramSize.Address)
+	assert.Contains(t, AllFeatureGates, LoaderV3MinimumExtendProgramSize)
+}
+
 func TestDisableFeesSysvarFeatureGate(t *testing.T) {
 	assert.Equal(t, "DisableFeesSysvar", DisableFeesSysvar.Name)
 	assert.Equal(t, base58.MustDecodeFromString("JAN1trEUEtZjgXYzNBYHU9DYd7GnThhXfFP7SzPXkPsG"), DisableFeesSysvar.Address)

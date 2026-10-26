@@ -26,6 +26,11 @@ func ApplyDefaults(v *viper.Viper) {
 	v.SetDefault("validator.advertised_ip", "")
 	v.SetDefault("validator.tpu_sigverify_workers", 0)
 	v.SetDefault("validator.wait_to_vote_slot", uint64(0))
+	v.SetDefault("harmonic.enabled", false)
+	v.SetDefault("harmonic.tls_cert_verify", true)
+	v.SetDefault("harmonic.strategy", "fba")
+	v.SetDefault("harmonic.commission_bps", 0)
+	v.SetDefault("harmonic.num_workers", 8)
 }
 
 // LedgerConfig holds ledger-related configuration (matches Firedancer [ledger] section)

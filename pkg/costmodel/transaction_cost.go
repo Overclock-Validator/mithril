@@ -33,6 +33,15 @@ func (c TransactionCost) Sum() uint64 {
 		c.LoadedAccountsDataSizeCost
 }
 
+// WithActualUsage replaces the requested execution and loaded-accounts cost
+// with what execution consumed. Recording it is the same as recording c and
+// rebating it, so a check made after execution can admit on actual usage.
+func (c TransactionCost) WithActualUsage(actualExec, actualLoaded uint64) TransactionCost {
+	c.ProgramsExecutionCost = actualExec
+	c.LoadedAccountsDataSizeCost = actualLoaded
+	return c
+}
+
 // EstimateTransactionCost applies the protocol cost model to a parsed transaction.
 func EstimateTransactionCost(tx *solana.Transaction, feats *features.Features) (TransactionCost, error) {
 	if tx == nil {
@@ -134,6 +143,10 @@ func countWriteLocks(tx *solana.Transaction) uint64 {
 	return uint64(len(writableAccounts(tx)))
 }
 
+// writableAccounts returns the accounts tx write-locks. For a v0 message with
+// resolved address-table lookups, the header describes only the static keys,
+// and the writable looked-up addresses follow them; an unresolved message only
+// contributes its static keys, so cost it after resolution.
 func writableAccounts(tx *solana.Transaction) []solana.PublicKey {
 	if tx == nil {
 		return nil
@@ -141,8 +154,21 @@ func writableAccounts(tx *solana.Transaction) []solana.PublicKey {
 	hdr := tx.Message.Header
 	numSigners := int(hdr.NumRequiredSignatures)
 	numKeys := len(tx.Message.AccountKeys)
+	var writableLookups []solana.PublicKey
+	if tx.Message.GetVersion() == solana.MessageVersionV0 && tx.Message.IsResolved() {
+		numStatic := numKeys - tx.Message.AddressTableLookups.NumLookups()
+		if numStatic < 0 {
+			numStatic = 0
+		}
+		lookupEnd := numStatic + tx.Message.AddressTableLookups.NumWritableLookups()
+		if lookupEnd > numKeys {
+			lookupEnd = numKeys
+		}
+		writableLookups = tx.Message.AccountKeys[numStatic:lookupEnd]
+		numKeys = numStatic
+	}
 	if numKeys == 0 {
-		return nil
+		return append([]solana.PublicKey(nil), writableLookups...)
 	}
 	numWritableSigners := numSigners - int(hdr.NumReadonlySignedAccounts)
 	if numWritableSigners < 0 {
@@ -152,7 +178,7 @@ func writableAccounts(tx *solana.Transaction) []solana.PublicKey {
 	if numWritableNonSigners < 0 {
 		numWritableNonSigners = 0
 	}
-	out := make([]solana.PublicKey, 0, numWritableSigners+numWritableNonSigners)
+	out := make([]solana.PublicKey, 0, numWritableSigners+numWritableNonSigners+len(writableLookups))
 	for i := 0; i < numWritableSigners && i < numKeys; i++ {
 		out = append(out, tx.Message.AccountKeys[i])
 	}
@@ -164,7 +190,7 @@ func writableAccounts(tx *solana.Transaction) []solana.PublicKey {
 	for i := start; i < end; i++ {
 		out = append(out, tx.Message.AccountKeys[i])
 	}
-	return out
+	return append(out, writableLookups...)
 }
 
 func estimateAllocDelta(instrs []sealevel.Instruction, feats *features.Features) uint64 {

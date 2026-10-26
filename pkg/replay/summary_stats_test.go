@@ -50,7 +50,7 @@ func TestNextLeaderHint(t *testing.T) {
 	assert.Equal(t, "ours", c.hint(110))
 	assert.Equal(t, "next 200 ~18s", c.hint(111))
 	assert.Equal(t, "", c.hint(201))
-	assert.Equal(t, "", newNextLeaderCursor(solana.PublicKey{}).hint(1))
+	assert.Equal(t, "", newNextLeaderCursor(nil).hint(1))
 	assert.Equal(t,
 		"slot 1 | leader abcd...xyz | ours",
 		appendNextLeaderHint("slot 1 | leader abcd...xyz", "ours"))

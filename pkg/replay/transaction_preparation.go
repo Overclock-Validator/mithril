@@ -78,6 +78,11 @@ func (p *TransactionPreparer) Prepare(tx *solana.Transaction) *PreparedTransacti
 	if p == nil || tx == nil {
 		return nil
 	}
+	// Account metas and cost depend on the bank the lookups resolve against, so
+	// a transaction with address-table lookups is prepared at execution.
+	if HasAddressTableLookups(tx) {
+		return nil
+	}
 	if tx.Message.GetVersion() == solana.MessageVersionV1 && !p.feats.IsActive(features.EnableTxV1) {
 		return nil
 	}
