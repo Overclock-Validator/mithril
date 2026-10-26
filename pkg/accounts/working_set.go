@@ -18,6 +18,7 @@ type WorkingSet struct {
 	order         []uint64               // held slots, ascending
 	flat          map[[32]byte]flatEntry // newest unrooted value per key
 	retainedBytes uint64                 // account capacities plus estimated per-version bookkeeping
+	revision      uint64                 // changes under mu with every visible account-view mutation
 }
 
 type flatEntry struct {
@@ -66,6 +67,7 @@ func NewWorkingSet() *WorkingSet {
 func (w *WorkingSet) Add(slot uint64, delta []*Account) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.revision++
 
 	layer, ok := w.bySlot[slot]
 	if !ok {
@@ -101,6 +103,14 @@ func (w *WorkingSet) Add(slot uint64, delta []*Account) {
 			w.flat[key] = flatEntry{slot: slot, acct: a}
 		}
 	}
+}
+
+// Revision identifies one account view for this WorkingSet's lifetime. Capture
+// it when publishing a completed bank, then check it around request-local reads.
+func (w *WorkingSet) Revision() uint64 {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.revision
 }
 
 // HeldSlots reports the number of buffered unrooted slots (for RAM bounding).
@@ -215,6 +225,10 @@ func (w *WorkingSet) promotionChunkLocked(through uint64, maxSlots int, maxBytes
 func (w *WorkingSet) PromotePrefix(through uint64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if len(w.order) == 0 || w.order[0] > through {
+		return
+	}
+	w.revision++
 
 	kept := make([]uint64, 0, len(w.order))
 	for _, slot := range w.order {
@@ -264,6 +278,7 @@ func (w *WorkingSet) EvictFrom(slot uint64) {
 	if len(suffix) == 0 {
 		return
 	}
+	w.revision++
 
 	// Apply undos newest layer first: for keys written in several evicted
 	// layers, the OLDEST layer's undo applies last and wins — restoring the

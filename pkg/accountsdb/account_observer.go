@@ -2,6 +2,23 @@ package accountsdb
 
 import "github.com/Overclock-Validator/mithril/pkg/accounts"
 
+type legacyBankCommit struct {
+	slot, version uint64
+	hash          [32]byte
+}
+
+// CommittedLegacyBankVersion binds a completed asynchronous account write to
+// its successful bankhash callback. Old bankhash bytes alone cannot establish
+// that a later same-slot account replacement has finished correctly.
+func (db *AccountsDb) CommittedLegacyBankVersion(slot uint64, hash [32]byte) (uint64, bool) {
+	if db.RootedDurable {
+		return 0, false
+	}
+	version, stable := db.CommittedAccountVersion()
+	bank := db.legacyBank.Load()
+	return version, stable && bank != nil && bank.slot == slot && bank.version == version && bank.hash == hash && db.accountCommittedSlot.Load() == slot
+}
+
 // AccountStateObserver maintains disposable derived state, not durable state.
 // Calls are serialized after a successful write, before its version becomes
 // readable. Reset is true on rewind, recovery, or any failed/partial write.

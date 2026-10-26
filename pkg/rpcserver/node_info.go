@@ -54,6 +54,8 @@ func (rpcServer *RpcServer) SetIdentitySource(source func() string) {
 func (rpcServer *RpcServer) InvalidateHealth() {
 	rpcServer.slotCtxMu.Lock()
 	rpcServer.healthReady = false
+	rpcServer.executionGeneration++
+	rpcServer.executionInvalidated = true
 	rpcServer.slotCtxMu.Unlock()
 }
 
