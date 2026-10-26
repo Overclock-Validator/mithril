@@ -18,18 +18,19 @@ func passiveVotorSender(t *testing.T) (*VotorBroadcaster, *votorPeerSender, *Rec
 	t.Helper()
 	serverIdentity := ed25519.NewKeyFromSeed(bytesOf(181, ed25519.SeedSize))
 	r, err := NewReceiver(ReceiverConfig{
-		BindAddr: "127.0.0.1:0", Identity: serverIdentity, LogInterval: -1,
+		BindAddr: "127.0.0.1:0", Identity: identityHolder(t, serverIdentity), LogInterval: -1,
 		AdmitPeer: func(solana.PublicKey) bool { return true },
 	}, NewObserver())
 	require.NoError(t, err)
 	runVotorReceiver(t, r)
-	cert, err := newVotorQUICCertificate(ed25519.NewKeyFromSeed(bytesOf(182, ed25519.SeedSize)))
+	certs, err := newVotorQUICCertificates(identityHolder(t, ed25519.NewKeyFromSeed(bytesOf(182, ed25519.SeedSize))))
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	peer := VotorPeer{Identity: testVotorPubkey(serverIdentity), Addr: r.Addr().(*net.UDPAddr)}
 	b := &VotorBroadcaster{
 		ctx: ctx, cancel: cancel, done: make(chan struct{}),
-		tlsConfig:  &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{VotorQUICALPN}, MinVersion: tls.VersionTLS13, InsecureSkipVerify: true},
+		certs:      certs,
+		tlsConfig:  &tls.Config{NextProtos: []string{VotorQUICALPN}, MinVersion: tls.VersionTLS13, InsecureSkipVerify: true},
 		quicConfig: newVotorQUICConfig(),
 		jobs:       make(chan votorPeerJob, 2), desired: map[solana.PublicKey]VotorPeer{peer.Identity: peer},
 		conns: make(map[solana.PublicKey]votorConnection), dialing: make(map[solana.PublicKey]*votorDial), connectQueued: make(map[solana.PublicKey]struct{}),

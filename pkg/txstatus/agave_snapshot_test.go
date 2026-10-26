@@ -63,6 +63,65 @@ func TestDecodeAgaveSnapshot(t *testing.T) {
 	}
 }
 
+// Wire tags come from SerdeTransactionError in Agave v4.2, commit
+// 961d762037f1e92a022e8f369cf7ca79ca703b88,
+// runtime/src/serde_snapshot/status_cache.rs. In particular, tag 29 is the
+// unit variant WouldExceedAccountDataTotalLimit, not DuplicateInstruction.
+func TestDecodeAgaveSnapshotTransactionErrorVariants(t *testing.T) {
+	for tag := uint32(0); tag <= 38; tag++ {
+		t.Run(fmt.Sprintf("tag_%d", tag), func(t *testing.T) {
+			result := append(encU32(1), encU32(tag)...)
+			switch tag {
+			case 8: // InstructionError(7, Custom(0xdecafbad))
+				result = append(result, 7)
+				result = append(result, encU32(25)...)
+				result = append(result, encU32(0xdecafbad)...)
+			case 30, 31, 35: // DuplicateInstruction, InsufficientFundsForRent, ProgramExecutionTemporarilyRestricted
+				result = append(result, 0xa5)
+			}
+			firstKey := [CachedKeySize]byte{0x11}
+			nextKey := [CachedKeySize]byte{0xee, 0xdd, 0xcc, 0xbb}
+			data := append(encU64(2), encU64(42)...)
+			data = append(data, 1)
+			data = append(data, encU64(1)...)
+			data = appendStatus(data, [32]byte{9}, 3, []encodedKey{
+				{firstKey, result},
+				{nextKey, encU32(0)},
+			})
+			data = append(data, encU64(43)...)
+			data = append(data, 0)
+			data = append(data, encU64(0)...)
+			deltas, err := DecodeAgaveSnapshot(data)
+			if err != nil {
+				t.Fatalf("decode Agave transaction error %d: %v", tag, err)
+			}
+			if len(deltas) != 2 || deltas[1].Slot != 43 || deltas[1].IsRoot || len(deltas[0].Statuses) != 1 {
+				t.Fatalf("transaction error %d corrupted subsequent slot: %+v", tag, deltas)
+			}
+			keys := deltas[0].Statuses[0].Keys
+			if len(keys) != 2 || keys[0] != firstKey || keys[1] != nextKey {
+				t.Fatalf("transaction error %d corrupted cached keys: %x", tag, keys)
+			}
+		})
+	}
+}
+
+func TestDecodeAgaveSnapshotRejectsMissingTransactionErrorPayload(t *testing.T) {
+	for _, tag := range []uint32{30, 31, 35} {
+		t.Run(fmt.Sprintf("tag_%d", tag), func(t *testing.T) {
+			data := append(encU64(1), encU64(42)...)
+			data = append(data, 1)
+			data = append(data, encU64(1)...)
+			data = appendStatus(data, [32]byte{}, 0, []encodedKey{
+				{[CachedKeySize]byte{}, append(encU32(1), encU32(tag)...)},
+			})
+			if _, err := DecodeAgaveSnapshot(data); err == nil {
+				t.Fatal("accepted a transaction error without its account/instruction index")
+			}
+		})
+	}
+}
+
 func TestDecodeAgaveSnapshotRejectsMalformed(t *testing.T) {
 	var hash [32]byte
 	var key [CachedKeySize]byte

@@ -24,7 +24,7 @@ func newPacingTestClient(t *testing.T) *repairClient {
 	if err != nil {
 		t.Fatalf("generate identity: %v", err)
 	}
-	c.identity = priv
+	c.identity = identityHolder(t, priv)
 	c.timeoutNanos.Store(int64(repairMinRequestTimeout))
 	return c
 }

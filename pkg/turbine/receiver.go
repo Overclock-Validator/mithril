@@ -2,7 +2,6 @@ package turbine
 
 import (
 	"context"
-	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"net"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/sigverify"
 	"github.com/gagliardetto/solana-go"
 )
@@ -160,11 +160,10 @@ func (r *UDPReceiver) SetRetransmit(cfg RetransmitConfig) error {
 	if r.leaderForSlot == nil {
 		return errors.New("turbine retransmit requires a leader-for-slot source")
 	}
-	if len(cfg.Identity) != ed25519.PrivateKeySize {
-		return fmt.Errorf("turbine retransmit identity has invalid size %d", len(cfg.Identity))
+	if cfg.Identity == nil {
+		return errors.New("turbine retransmit requires an identity")
 	}
 	cp := cfg
-	cp.Identity = append(ed25519.PrivateKey(nil), cfg.Identity...)
 	r.retransmitCfg = &cp
 	return nil
 }
@@ -202,8 +201,10 @@ func (r *UDPReceiver) noteFirstShred(slot uint64) {
 	}
 }
 
-func (r *UDPReceiver) SetRepairPeerSource(identity ed25519.PrivateKey, source func() []gossip.RepairPeer) error {
-	client, err := newRepairClient(identity, source)
+// SetRepairPeerSource enables repair. Requests are signed with holder's
+// current identity; a nil holder repairs under an ephemeral identity.
+func (r *UDPReceiver) SetRepairPeerSource(holder *identity.Holder, source func() []gossip.RepairPeer) error {
+	client, err := newRepairClient(holder, source)
 	if err != nil {
 		return err
 	}

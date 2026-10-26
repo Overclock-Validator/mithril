@@ -365,13 +365,14 @@ func (bs *BlockSource) runTurbineStream() {
 		if gossipClient != nil {
 			if bs.turbineStakesForSlot != nil {
 				if err := receiver.SetRetransmit(turbine.RetransmitConfig{
-					Identity:     gossipClient.Identity(),
-					Peers:        gossipClient,
-					Stakes:       bs.turbineStakesForSlot,
-					EpochForSlot: bs.turbineEpochForSlot,
-					RootSlot:     bs.turbineRootSlot,
-					UseChaCha8:   bs.turbineUseChaCha8,
-					DedupAddrs:   bs.turbineDedupAddrs,
+					Identity:       gossipClient.Identity(),
+					Peers:          gossipClient,
+					Stakes:         bs.turbineStakesForSlot,
+					EpochForSlot:   bs.turbineEpochForSlot,
+					RootSlot:       bs.turbineRootSlot,
+					UseChaCha8:     bs.turbineUseChaCha8,
+					DedupAddrs:     bs.turbineDedupAddrs,
+					ShredReceivers: bs.turbineShredReceivers,
 				}); err != nil {
 					cancelStream()
 					bs.handleLiveShredStreamClosed(fmt.Sprintf("native turbine retransmit setup failed: %v", err))

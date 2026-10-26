@@ -166,7 +166,8 @@ func skipTransactionError(r *wincode.Reader) error {
 		return nil
 	default:
 		// All remaining v4.2 variants are unit variants. The highest is
-		// CommitCancelled (38).
+		// CommitCancelled (38). WouldExceedAccountDataTotalLimit (29) and
+		// ResanitizationNeeded (34) also have no payload.
 		if tag <= 38 {
 			return nil
 		}

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/gagliardetto/solana-go"
 	"github.com/quic-go/quic-go"
 )
@@ -87,6 +88,14 @@ func newVotorQUICCertificate(identity ed25519.PrivateKey) (tls.Certificate, erro
 		PrivateKey:  priv,
 		Leaf:        cert,
 	}, nil
+}
+
+// newVotorQUICCertificates caches the Votor certificate for holder's identity.
+// Owners register its Refresh as an identity updater.
+func newVotorQUICCertificates(holder *identity.Holder) (*identity.Derived[tls.Certificate], error) {
+	return identity.NewDerived(holder, func(kp *identity.Keypair) (tls.Certificate, error) {
+		return newVotorQUICCertificate(kp.PrivateKey())
+	})
 }
 
 // votorPeerIdentity extracts the validator identity from an authenticated TLS

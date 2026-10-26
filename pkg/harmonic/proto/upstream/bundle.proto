@@ -1,0 +1,23 @@
+// Bundle types received by the validator from the block engine.
+syntax = "proto3";
+
+import "packet.proto";
+import "shared.proto";
+
+package bundle;
+
+// An ordered list of transactions that must execute sequentially and atomically.
+message Bundle {
+  // Timestamp of when this bundle was created.
+  shared.Header header = 2;
+  // Transactions in execution order.
+  repeated packet.Packet packets = 3;
+}
+
+// A Bundle paired with its server-assigned identifier.
+message BundleUuid {
+  // The bundle contents.
+  bundle.Bundle bundle = 1;
+  // Unique identifier assigned by the block engine.
+  string uuid = 2;
+}

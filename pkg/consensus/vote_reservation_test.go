@@ -15,15 +15,15 @@ import (
 )
 
 func reservedTestConfig(dir string) VotingConfig {
-	return VotingConfig{Identity: voterTestKey(11), AuthorizedVoter: voterTestKey(12), VoteAccount: solana.PublicKey(voterTestKey(13).Public().(ed25519.PublicKey)), HistoryDir: dir, Genesis: solana.Hash{1}, ReservedHistory: true, InitializeVoteReservation: true, WaitToVoteSlot: 40, ReadyToVote: func(uint64) bool { return true }, EpochForSlot: func(uint64) uint64 { return 7 }, Peers: func([]alpenglow.ValidatorStake) []alpenglow.VotorPeer { return nil }}
+	return VotingConfig{AuthorizedVoter: voterTestKey(12), VoteAccount: solana.PublicKey(voterTestKey(13).Public().(ed25519.PublicKey)), HistoryDir: dir, Genesis: solana.Hash{1}, ReservedHistory: true, InitializeVoteReservation: true, WaitToVoteSlot: 40, ReadyToVote: func(uint64) bool { return true }, EpochForSlot: func(uint64) uint64 { return 7 }, Peers: func([]alpenglow.ValidatorStake) []alpenglow.VotorPeer { return nil }}
 }
 
 func openReservedTestVoter(t *testing.T, cfg VotingConfig, root uint64) (*alpenglowVoter, error) {
 	t.Helper()
-	e, err := NewEngine(Config{AlpenglowIdentity: cfg.Identity, AlpenglowShredVersion: 0x1234})
+	e, err := NewEngine(Config{AlpenglowIdentity: identityHolder(t, voterTestKey(11)), AlpenglowShredVersion: 0x1234})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, e.Close()) })
-	set := voterTestValidatorSet(t, cfg.Identity, cfg.AuthorizedVoter, cfg.VoteAccount)
+	set := voterTestValidatorSet(t, voterTestKey(11), cfg.AuthorizedVoter, cfg.VoteAccount)
 	e.SetAlpenglowEpochLookup(cfg.EpochForSlot)
 	require.NoError(t, e.SetAlpenglowValidatorSet(set))
 	block := alpenglow.BlockID{Slot: root, Hash: solana.Hash{byte(root)}}
@@ -210,7 +210,7 @@ func TestSigningReservationUncertainWriteSurvivesRestart(t *testing.T) {
 	r.through.Store(record.Through)
 	wrote := make(chan struct{}, 1)
 	r.persist = func(next alpenglow.VoteReservation) error {
-		err := alpenglow.SaveVoteReservation(cfg.HistoryDir, next, cfg.Identity)
+		err := alpenglow.SaveVoteReservation(cfg.HistoryDir, next, voterTestKey(11))
 		select {
 		case wrote <- struct{}{}:
 		default:
@@ -229,7 +229,7 @@ func TestSigningReservationUncertainWriteSurvivesRestart(t *testing.T) {
 	durable, err := alpenglow.LoadVoteReservation(cfg.HistoryDir, v.node)
 	require.NoError(t, err)
 	require.Greater(t, durable.Through, record.Through)
-	require.ErrorContains(t, r.seal(cfg.HistoryDir, v.history, cfg.Identity), "uncertain")
+	require.ErrorContains(t, r.seal(cfg.HistoryDir, v.history, voterTestKey(11)), "uncertain")
 	crashReservedTestVoter(t, v)
 	cfg.InitializeVoteReservation = false
 	resumed, err := openReservedTestVoter(t, cfg, 39)

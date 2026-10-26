@@ -11,6 +11,7 @@ import (
 	"github.com/Overclock-Validator/mithril/cmd/mithril/configcmd"
 	"github.com/Overclock-Validator/mithril/cmd/mithril/dashboardcmd"
 	"github.com/Overclock-Validator/mithril/cmd/mithril/node"
+	"github.com/Overclock-Validator/mithril/cmd/mithril/setidentitycmd"
 	"github.com/Overclock-Validator/mithril/cmd/mithril/setupcmd"
 	"github.com/Overclock-Validator/mithril/cmd/mithril/statecmd"
 	"github.com/Overclock-Validator/mithril/cmd/mithril/statuscmd"
@@ -59,6 +60,7 @@ func init() {
 		&setupcmd.DoctorCmd,        // System health check
 		&statuscmd.StatusCmd,       // Node status
 		&dashboardcmd.DashboardCmd, // Interactive dashboard
+		setidentitycmd.Command(),   // Admin RPC: set the running validator's identity
 	)
 }
 

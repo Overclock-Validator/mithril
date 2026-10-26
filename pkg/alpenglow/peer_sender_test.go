@@ -28,7 +28,7 @@ func testVotorBlockedPeer(t *testing.T, action string) {
 	makeReceiver := func(seed byte, record bool) (*Receiver, solana.PublicKey) {
 		identity := ed25519.NewKeyFromSeed(bytesOf(seed, ed25519.SeedSize))
 		r, err := NewReceiver(ReceiverConfig{
-			BindAddr: "127.0.0.1:0", Identity: identity, LogInterval: -1,
+			BindAddr: "127.0.0.1:0", Identity: identityHolder(t, identity), LogInterval: -1,
 			MaxDatagramsPerSecond: 100000,
 			AdmitPeer:             func(solana.PublicKey) bool { return true },
 			AdmitMessage: func(_ solana.PublicKey, m Message) (Message, bool) {
@@ -83,7 +83,7 @@ func testVotorBlockedPeer(t *testing.T, action string) {
 	goodPeer := VotorPeer{Identity: goodID, Addr: goodReceiver.Addr().(*net.UDPAddr)}
 	peers := newMutableVotorPeers([]VotorPeer{badPeer, goodPeer})
 	b, err := NewVotorBroadcaster(VotorBroadcasterConfig{
-		Identity: ed25519.NewKeyFromSeed(bytesOf(193, ed25519.SeedSize)),
+		Identity: identityHolder(t, ed25519.NewKeyFromSeed(bytesOf(193, ed25519.SeedSize))),
 		Peers:    peers.Snapshot,
 		Workers:  defaultVotorConnectWorkers,
 	})

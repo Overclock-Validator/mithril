@@ -48,16 +48,22 @@ func (a *Arena[T]) AllocN(n uint64) ([]T, bool) {
 
 	for {
 		current := atomic.LoadUint64(&a.index)
-		if current+n > a.capacity {
+		if n > a.capacity-current {
 			// Fallback to heap allocation
 			return make([]T, n), false
 		}
 		if atomic.CompareAndSwapUint64(&a.index, current, current+n) {
-			return a.pool[current : current+n], true
+			return a.pool[current : current+n : current+n], true
 		}
 	}
 }
 
+// Used returns the number of elements reserved since the last reset.
+func (a *Arena[T]) Used() uint64 {
+	return atomic.LoadUint64(&a.index)
+}
+
+// Reset requires all users of the previous allocations to have finished.
 func (a *Arena[T]) Reset() {
 	clear(a.pool[:atomic.LoadUint64(&a.index)])
 	a.index = 0
