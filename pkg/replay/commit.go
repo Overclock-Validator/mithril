@@ -63,10 +63,40 @@ func applySuccessfulTransactionState(slotCtx *sealevel.SlotCtx, execCtx *sealeve
 // LoadAndExecuteTransaction result into slotCtx. Divergence checks are
 // skipped; callers must only pass outputs with no TransactionError.
 func ApplySuccessfulTransaction(slotCtx *sealevel.SlotCtx, output LoadAndExecuteTransactionOutput) error {
+	if err := checkSuccessfulTransaction(slotCtx, output); err != nil {
+		return err
+	}
+	return applySuccessfulTransactionState(slotCtx, output.ExecCtx, output.ExecutionResult)
+}
+
+// ApplySuccessfulTransactions commits successful results in order. It checks
+// every result before applying any, so either all of them land or none do.
+func ApplySuccessfulTransactions(slotCtx *sealevel.SlotCtx, outputs []LoadAndExecuteTransactionOutput) error {
+	for idx, output := range outputs {
+		if err := checkSuccessfulTransaction(slotCtx, output); err != nil {
+			return fmt.Errorf("transaction %d: %w", idx, err)
+		}
+	}
+	for idx, output := range outputs {
+		// The checks above cover every applySuccessfulTransactionState error.
+		if err := applySuccessfulTransactionState(slotCtx, output.ExecCtx, output.ExecutionResult); err != nil {
+			panic(fmt.Sprintf("transaction %d failed to apply after its checks passed: %v", idx, err))
+		}
+	}
+	return nil
+}
+
+func checkSuccessfulTransaction(slotCtx *sealevel.SlotCtx, output LoadAndExecuteTransactionOutput) error {
 	if output.ProcessingResult.TransactionError != nil {
 		return fmt.Errorf("cannot apply failed transaction: %s", output.ProcessingResult.TransactionError.ErrorType.String())
 	}
-	return applySuccessfulTransactionState(slotCtx, output.ExecCtx, output.ExecutionResult)
+	if output.ExecCtx == nil {
+		return fmt.Errorf("missing execution context")
+	}
+	if output.ExecutionResult == nil && !accountsDeltaHashRemoved(slotCtx) {
+		return fmt.Errorf("missing execution result while accounts delta hash is enabled")
+	}
+	return nil
 }
 
 // includableFailure reports whether a failed transaction was processed, so a

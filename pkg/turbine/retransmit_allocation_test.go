@@ -135,9 +135,9 @@ func TestRetransmitPacketPoolOwnership(t *testing.T) {
 
 func TestRetransmitQueuedPacketOwnsInput(t *testing.T) {
 	nodes, leader, key := relayAllocationNodes(90, true)
-	r, err := newRetransmitterWithSenders(RetransmitConfig{Identity: key, Peers: &mutableTVUPeers{}, Stakes: func(uint64) map[solana.PublicKey]uint64 { return nil }, QueueDepth: 1}, []packetBatchSender{newCaptureBatchSender()})
+	r, err := newRetransmitterWithSenders(RetransmitConfig{Identity: identityHolder(t, key), Peers: &mutableTVUPeers{}, Stakes: func(uint64) map[solana.PublicKey]uint64 { return nil }, QueueDepth: 1}, []packetBatchSender{newCaptureBatchSender()})
 	require.NoError(t, err)
-	r.cache[10] = cachedRetransmitNodes{asof: time.Now(), nodes: nodes}
+	r.cache[10] = cachedRetransmitNodes{asof: time.Now(), self: r.cfg.Identity.PublicKey(), nodes: nodes}
 	packet := bytes.Repeat([]byte{3}, dataPayloadSize)
 	packet[0] = 1
 	shred := &Shred{Slot: 10, Index: 1, Type: ShredTypeData, Payload: packet}
@@ -200,9 +200,9 @@ func TestRetransmitPoolLeaseSurvivesSendRetries(t *testing.T) {
 	require.Less(t, id.Index, uint32(10000))
 	want := bytes.Repeat([]byte{7}, dataPayloadSize)
 	sender := &borrowedRelaySender{t: t, want: want, entered: make(chan struct{}), resume: make(chan struct{})}
-	r, err := newRetransmitterWithSenders(RetransmitConfig{Identity: key, Peers: &mutableTVUPeers{}, Stakes: func(uint64) map[solana.PublicKey]uint64 { return nil }}, []packetBatchSender{sender})
+	r, err := newRetransmitterWithSenders(RetransmitConfig{Identity: identityHolder(t, key), Peers: &mutableTVUPeers{}, Stakes: func(uint64) map[solana.PublicKey]uint64 { return nil }}, []packetBatchSender{sender})
 	require.NoError(t, err)
-	r.cache[10] = cachedRetransmitNodes{asof: time.Now(), nodes: nodes}
+	r.cache[10] = cachedRetransmitNodes{asof: time.Now(), self: r.cfg.Identity.PublicKey(), nodes: nodes}
 	packet, owner := r.copyPacket(want)
 	var scratch [dataPlaneFanout]*net.UDPAddr
 	done := make(chan struct{})
@@ -234,9 +234,9 @@ func TestRetransmitPoolLeaseSurvivesSendRetries(t *testing.T) {
 
 func TestRetransmitConcurrentSubmitAndStop(t *testing.T) {
 	nodes, leader, key := relayAllocationNodes(90, true)
-	r, err := newRetransmitterWithSenders(RetransmitConfig{Identity: key, Peers: &mutableTVUPeers{}, Stakes: func(uint64) map[solana.PublicKey]uint64 { return nil }, QueueDepth: 8}, []packetBatchSender{&discardRelaySender{}, &discardRelaySender{}})
+	r, err := newRetransmitterWithSenders(RetransmitConfig{Identity: identityHolder(t, key), Peers: &mutableTVUPeers{}, Stakes: func(uint64) map[solana.PublicKey]uint64 { return nil }, QueueDepth: 8}, []packetBatchSender{&discardRelaySender{}, &discardRelaySender{}})
 	require.NoError(t, err)
-	r.cache[10] = cachedRetransmitNodes{asof: time.Now(), nodes: nodes}
+	r.cache[10] = cachedRetransmitNodes{asof: time.Now(), self: r.cfg.Identity.PublicKey(), nodes: nodes}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { r.Run(ctx); close(done) }()

@@ -41,8 +41,8 @@ A sealed record is an executed candidate, not proof of finality or durable
 storage. Retention, canonical selection and history RPC activation are separate
 consumers of these records.
 
-Captured logs contain syscall messages, not the complete runtime invoke/success/
-failure stream. They must not be returned as complete standard RPC
+Captured logs include syscall and invocation/result messages, but not the complete
+runtime stream. They must not be returned as complete standard RPC
 `logMessages`. Token-2022 extension presence is classified, but extension-aware
 UI conversion is not part of raw balance capture.
 

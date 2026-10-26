@@ -20,7 +20,7 @@ func TestLeaderLoopHoldsSlotUntilWallAdvances(t *testing.T) {
 
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:  NewController(),
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: &captureBroadcaster{},
 		CurrentSlot: func() uint64 { return wallSlot },
 		LeaderForSlot: func(s uint64) (solana.PublicKey, bool) {
@@ -64,7 +64,7 @@ func TestLeaderLoopPinsParentTransactionStatusesIntoWorkingBank(t *testing.T) {
 	controller := NewController()
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:  controller,
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: &captureBroadcaster{},
 		CurrentSlot: func() uint64 { return slot },
 		LeaderForSlot: func(candidate uint64) (solana.PublicKey, bool) {
@@ -95,7 +95,7 @@ func TestLeaderLoopDoesNotRestartFinishedWallSlot(t *testing.T) {
 
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:  NewController(),
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: &captureBroadcaster{},
 		CurrentSlot: func() uint64 { return wallSlot },
 		LeaderForSlot: func(s uint64) (solana.PublicKey, bool) {

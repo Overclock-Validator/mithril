@@ -20,7 +20,9 @@ import (
 type ExecutionCtx struct {
 	// SkipTimingMetrics disables instruction-dispatch timing collection for
 	// leader execution; it never changes instruction validation or CU charging.
-	SkipTimingMetrics        bool
+	SkipTimingMetrics bool
+	// SkipStableLogs avoids formatting messages when the caller discards logs.
+	SkipStableLogs           bool
 	Log                      Logger
 	Accounts                 accounts.Accounts
 	TransactionContext       *TransactionCtx
@@ -376,8 +378,25 @@ func (execCtx *ExecutionCtx) ExecuteInstruction() error {
 	}
 	metrics.GlobalBlockReplay.ExecIxResolveNativeProgram.AddTimingSince(start)
 
+	var programKey solana.PublicKey
+	recordLogs := execCtx.Log != nil && !execCtx.SkipStableLogs
+	if recordLogs {
+		var keyErr error
+		programKey, keyErr = instrCtx.LastProgramKey(txCtx)
+		recordLogs = keyErr == nil && !isPrecompile(programKey) && programKey != a.Secp256r1PrecompileAddr
+		if recordLogs {
+			execCtx.Log.Log(fmt.Sprintf("Program %s invoke [%d]", programKey, execCtx.StackHeight()))
+		}
+	}
 	start = metrics.StartTiming(!execCtx.SkipTimingMetrics)
 	err = nativeProgramFn(execCtx)
+	if recordLogs {
+		if err == nil {
+			execCtx.Log.Log(fmt.Sprintf("Program %s success", programKey))
+		} else {
+			execCtx.Log.Log(fmt.Sprintf("Program %s failed: %s", programKey, instructionErrorLogMessage(err)))
+		}
+	}
 	switch nativeProgramStr {
 	case a.SystemProgramAddrStr:
 		metrics.GlobalBlockReplay.ExecIxNativeProgramSystem.AddTimingSince(start)
@@ -534,6 +553,42 @@ func (slotCtx *SlotCtx) GetAccountFromAccountsDb(pubkey solana.PublicKey) (*acco
 	} else {
 		return acct, nil
 	}
+}
+
+// getAccountFromAccountsDbReadOnly is restricted to program loading. The caller
+// must not mutate the account or its data, or pass them to mutable execution.
+// Keep bank sysvar precedence and fall back to the ordinary owned read for
+// sources that do not explicitly support immutable shared accounts.
+func (slotCtx *SlotCtx) getAccountFromAccountsDbReadOnly(pubkey solana.PublicKey) (*accounts.Account, error) {
+	if slotCtx.BankSysvars() == nil || !IsBankSysvarAccount(pubkey) {
+		if reader, ok := slotCtx.UnrootedRead.(interface {
+			GetAccountShared(uint64, solana.PublicKey) (*accounts.Account, error)
+		}); ok {
+			return reader.GetAccountShared(slotCtx.Slot, pubkey)
+		}
+	}
+	return slotCtx.GetAccountFromAccountsDb(pubkey)
+}
+
+// GetAccountDataLenFromAccountsDb resolves the same parent-bank version as
+// GetAccountFromAccountsDb, but allows a read source to return only its length.
+// No account or writable data buffer escapes this metadata-only operation.
+func (slotCtx *SlotCtx) GetAccountDataLenFromAccountsDb(pubkey solana.PublicKey) (uint64, error) {
+	if slotCtx.BankSysvars() == nil || !IsBankSysvarAccount(pubkey) {
+		if reader, ok := slotCtx.UnrootedRead.(interface {
+			GetAccountDataLen(uint64, solana.PublicKey) (uint64, error)
+		}); ok {
+			return reader.GetAccountDataLen(slotCtx.Slot, pubkey)
+		}
+	}
+	acct, err := slotCtx.GetAccountFromAccountsDb(pubkey)
+	if err != nil {
+		return 0, err
+	}
+	if acct == nil {
+		return 0, accountsdb.ErrNoAccount
+	}
+	return uint64(len(acct.Data)), nil
 }
 
 func (slotCtx *SlotCtx) SetAccount(pubkey solana.PublicKey, acct *accounts.Account) error {

@@ -1,0 +1,26 @@
+// Common types shared across Harmonic validator proto definitions.
+syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
+
+package shared;
+
+// Timestamp header attached to streaming responses.
+message Header {
+  // When this message was generated.
+  google.protobuf.Timestamp ts = 1;
+}
+
+// Keepalive signal sent on streaming RPCs.
+message Heartbeat {
+  // Monotonically increasing counter.
+  uint64 count = 1;
+}
+
+// Network socket address.
+message Socket {
+  // IPv4 or IPv6 address.
+  string ip = 1;
+  // Port number.
+  int64 port = 2;
+}

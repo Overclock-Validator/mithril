@@ -48,7 +48,7 @@ func TestLeaderWindowAcceptsVerifiedOlderParentReady(t *testing.T) {
 
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:  NewController(),
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: &captureBroadcaster{},
 		CurrentSlot: func() uint64 { return leaderSlot },
 		LeaderForSlot: func(slot uint64) (solana.PublicKey, bool) {
@@ -85,7 +85,7 @@ func TestLeaderWindowUsesParentReadyDeadlineInsteadOfLiveSlot(t *testing.T) {
 
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:  NewController(),
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: &captureBroadcaster{},
 		CurrentSlot: func() uint64 { return wallSlot },
 		Now:         func() time.Time { return now },
@@ -131,7 +131,7 @@ func TestLeaderWindowStartsFromParentReadyBeforeLiveClockBoundary(t *testing.T) 
 
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:  NewController(),
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: &captureBroadcaster{},
 		CurrentSlot: func() uint64 { return currentStart },
 		Now:         func() time.Time { return now },
@@ -195,7 +195,7 @@ func TestLeaderWindowEarlyParentReadyWaitsForReplay(t *testing.T) {
 
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:  NewController(),
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: &captureBroadcaster{},
 		CurrentSlot: func() uint64 { return nextStart - 1 },
 		Now:         func() time.Time { return now },
@@ -260,7 +260,7 @@ func TestLeaderWindowRefreshesCorrectedParentReadyWhileWaitingForReplay(t *testi
 
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:  NewController(),
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: &captureBroadcaster{},
 		CurrentSlot: func() uint64 { return nextStart - 1 },
 		Now:         func() time.Time { return now },
@@ -286,7 +286,7 @@ func TestLeaderWindowRefreshesCorrectedParentReadyWhileWaitingForReplay(t *testi
 	defer func() {
 		loop.mu.Lock()
 		defer loop.mu.Unlock()
-		loop.abortActiveSlotLocked()
+		loop.releaseActiveSlotLocked()
 	}()
 
 	loop.tick()
@@ -369,7 +369,7 @@ func TestLeaderWindowEarlyParentReadyHonorsExactDeadline(t *testing.T) {
 	global.SetAlpenglowChainedMerkleRoot(selected.Slot, solana.Hash{4})
 
 	loop := NewLeaderLoop(LeaderLoopConfig{
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		CurrentSlot: func() uint64 { return nextStart - 1 },
 		Now:         func() time.Time { return now },
 		LeaderForSlot: func(slot uint64) (solana.PublicKey, bool) {
@@ -421,7 +421,7 @@ func TestLeaderWindowRechecksCutoffAfterReplayGate(t *testing.T) {
 
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:  NewController(),
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: broadcaster,
 		CurrentSlot: func() uint64 { return leaderSlot - 1 },
 		Now:         func() time.Time { return now },
@@ -487,7 +487,7 @@ func TestLeaderWindowRejectsCutoffCrossedDuringLocalSetup(t *testing.T) {
 
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:  controller,
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: broadcaster,
 		CurrentSlot: func() uint64 { return leaderSlot - 1 },
 		Now:         func() time.Time { return now },
@@ -550,7 +550,7 @@ func TestLeaderWindowRejectsParentChangeDuringLocalSetup(t *testing.T) {
 
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:  controller,
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: broadcaster,
 		CurrentSlot: func() uint64 { return leaderSlot - 1 },
 		Now:         func() time.Time { return now },
@@ -582,7 +582,7 @@ func TestLeaderWindowRejectsParentChangeDuringLocalSetup(t *testing.T) {
 	defer func() {
 		loop.mu.Lock()
 		defer loop.mu.Unlock()
-		loop.abortActiveSlotLocked()
+		loop.releaseActiveSlotLocked()
 	}()
 
 	loop.tick()
@@ -622,7 +622,7 @@ func TestLeaderWindowRejectsCutoffCrossedDuringHeaderBroadcast(t *testing.T) {
 
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:  controller,
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: broadcaster,
 		CurrentSlot: func() uint64 { return leaderSlot - 1 },
 		Now:         func() time.Time { return now },
@@ -679,7 +679,7 @@ func TestLeaderWindowRejectsParentChangeDuringHeaderBroadcast(t *testing.T) {
 
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:  controller,
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: broadcaster,
 		CurrentSlot: func() uint64 { return leaderSlot - 1 },
 		Now:         func() time.Time { return now },
@@ -706,7 +706,7 @@ func TestLeaderWindowRejectsParentChangeDuringHeaderBroadcast(t *testing.T) {
 	defer func() {
 		loop.mu.Lock()
 		defer loop.mu.Unlock()
-		loop.abortActiveSlotLocked()
+		loop.releaseActiveSlotLocked()
 	}()
 
 	loop.tick()
@@ -734,7 +734,7 @@ func TestLeaderWindowLookaheadIsBoundedToNextWindow(t *testing.T) {
 	self := txfixture.PayerPubkey()
 	other := solana.NewWallet().PublicKey()
 	loop := NewLeaderLoop(LeaderLoopConfig{
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		CurrentSlot: func() uint64 { return futureStart - alpenglow.LeaderWindowSlots - 1 },
 		LeaderForSlot: func(slot uint64) (solana.PublicKey, bool) {
 			if slot == futureStart {
@@ -776,7 +776,7 @@ func TestLeaderWindowRecheckStartsAdjacentReadyWindowWithoutPollDelay(t *testing
 
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:  controller,
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: &captureBroadcaster{},
 		CurrentSlot: func() uint64 { return currentStart },
 		Now:         func() time.Time { return now },
@@ -806,7 +806,7 @@ func TestLeaderWindowRecheckStartsAdjacentReadyWindowWithoutPollDelay(t *testing
 	defer func() {
 		loop.mu.Lock()
 		defer loop.mu.Unlock()
-		loop.abortActiveSlotLocked()
+		loop.releaseActiveSlotLocked()
 	}()
 
 	loop.tick()
@@ -891,7 +891,7 @@ func TestLeaderWindowStartsNextSlotDespiteLiveSlotJump(t *testing.T) {
 
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:  NewController(),
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: &captureBroadcaster{},
 		CurrentSlot: func() uint64 { return leaderSlot + 3 },
 		Now:         func() time.Time { return now },
@@ -946,7 +946,7 @@ func TestLeaderSlotReplayReadyOtherLeaderParent(t *testing.T) {
 	other := solana.NewWallet().PublicKey()
 
 	loop := &LeaderLoop{
-		identity: txfixture.PayerPrivateKey(),
+		identity: identityHolder(txfixture.PayerPrivateKey()),
 		leaderForSlot: func(slot uint64) (solana.PublicKey, bool) {
 			switch slot {
 			case 44:
@@ -976,7 +976,7 @@ func TestLeaderSlotReplayReadyOwnParentRequiresReplay(t *testing.T) {
 	self := txfixture.PayerPubkey()
 
 	loop := &LeaderLoop{
-		identity:            txfixture.PayerPrivateKey(),
+		identity:            identityHolder(txfixture.PayerPrivateKey()),
 		finishedLeaderSlots: map[uint64]struct{}{42: {}},
 		leaderForSlot: func(slot uint64) (solana.PublicKey, bool) {
 			if slot == 42 || slot == 43 {
@@ -1010,7 +1010,7 @@ func TestLeaderLoopDoesNotAttemptLeaderUntilOtherParentReplayed(t *testing.T) {
 
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:  NewController(),
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: &captureBroadcaster{},
 		CurrentSlot: func() uint64 { return wallSlot },
 		LeaderForSlot: func(slot uint64) (solana.PublicKey, bool) {
@@ -1049,7 +1049,7 @@ func TestLeaderLoopNeverBackfillsMissedLeaderSlot(t *testing.T) {
 
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:  NewController(),
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: &captureBroadcaster{},
 		CurrentSlot: func() uint64 { return 50 },
 		LeaderForSlot: func(slot uint64) (solana.PublicKey, bool) {
@@ -1072,7 +1072,7 @@ func TestLeaderLoopRecordsExpiredLocalLeaderGateFailure(t *testing.T) {
 	global.SetReplayFrontier(43)
 
 	loop := NewLeaderLoop(LeaderLoopConfig{
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		CurrentSlot: func() uint64 { return wallSlot },
 		LeaderForSlot: func(slot uint64) (solana.PublicKey, bool) {
 			return self, slot == 45
@@ -1100,7 +1100,7 @@ func TestLeaderAfterSkippedSlotsUsesActualReplayedParent(t *testing.T) {
 
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:  NewController(),
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: &captureBroadcaster{},
 		CurrentSlot: func() uint64 { return leaderSlot },
 		LeaderForSlot: func(slot uint64) (solana.PublicKey, bool) {
@@ -1130,7 +1130,7 @@ func TestLeaderRestartsWhenReplayParentChangesBeforeFreeze(t *testing.T) {
 
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:  NewController(),
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: &captureBroadcaster{},
 		CurrentSlot: func() uint64 { return leaderSlot },
 		LeaderForSlot: func(slot uint64) (solana.PublicKey, bool) {
@@ -1162,7 +1162,7 @@ func TestLeaderAbortsWhenOwnSlotAlreadyResolved(t *testing.T) {
 
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:  NewController(),
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: &captureBroadcaster{},
 		CurrentSlot: func() uint64 { return leaderSlot },
 		LeaderForSlot: func(slot uint64) (solana.PublicKey, bool) {
