@@ -8,9 +8,11 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/alpenglow"
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/gagliardetto/solana-go"
 )
@@ -35,11 +37,12 @@ var (
 type VotingPeerSource func(validators []alpenglow.ValidatorStake) []alpenglow.VotorPeer
 
 // VotingConfig contains the operator-held material and network discovery
-// boundary required to activate voting. VoteAccount is the on-chain vote
-// account address; AuthorizedVoter is the Ed25519 signer from which its BLS key
-// was registered.
+// boundary required to activate voting. The node identity is the consensus
+// engine's identity holder. VoteAccount is the on-chain vote account address;
+// AuthorizedVoter is the Ed25519 signer from which its BLS key was registered.
+// An empty AuthorizedVoter means the identity is the authorized voter, as
+// Agave defaults it, and the BLS key then follows set-identity swaps.
 type VotingConfig struct {
-	Identity                  ed25519.PrivateKey
 	AuthorizedVoter           ed25519.PrivateKey
 	VoteAccount               solana.PublicKey
 	HistoryDir                string
@@ -104,6 +107,7 @@ const (
 	voterEventRoot
 	voterEventNetworkCertificate
 	voterEventDurableRoot
+	voterEventSetIdentity
 )
 
 type voterEvent struct {
@@ -114,7 +118,20 @@ type voterEvent struct {
 	set         alpenglow.ValidatorSet
 	root        alpenglow.BlockID
 	certificate alpenglow.Certificate
+	rebind      *identityRebind
 }
+
+// identityRebind hands a set-identity swap to the voter loop, which owns the
+// vote history. Whichever side claims it first decides its fate: the loop
+// applies it, or the waiting updater abandons it after a timeout, so an
+// abandoned swap can never be applied behind the holder's back.
+type identityRebind struct {
+	next    *identity.Keypair
+	claimed atomic.Bool
+	done    chan error
+}
+
+const voterIdentityUpdateTimeout = 10 * time.Second
 
 type pendingVotorBlock struct {
 	block  alpenglow.BlockID
@@ -124,12 +141,19 @@ type pendingVotorBlock struct {
 // alpenglowVoter is a single-threaded port of Agave's Votor event handler. All
 // history decisions run on loop; validator-set snapshots are protected only so
 // the outbound peer callback can read them from broadcast workers.
+//
+// identity is the holder snapshot the vote history is bound to and signed
+// with. Only rebindIdentity, on the loop, changes it and node; broadcast
+// workers read node under setsMu. followIdentity is set when the authorized
+// voter defaulted to the identity, so a swap re-derives the BLS signer.
 type alpenglowVoter struct {
 	engine            *AlpenglowObserverEngine
-	identity          ed25519.PrivateKey
+	identity          *identity.Keypair
 	node              solana.PublicKey
 	voteAccount       solana.PublicKey
 	signer            *alpenglow.BLSSigner
+	followIdentity    bool
+	unregisterKey     func()
 	historyDir        string
 	historyLock       *os.File
 	reservation       *signingReservation
@@ -191,11 +215,16 @@ func newAlpenglowVoterWithStart(engine *AlpenglowObserverEngine, cfg VotingConfi
 	if engine == nil {
 		return nil, fmt.Errorf("enable Alpenglow voting: nil consensus engine")
 	}
-	if len(cfg.Identity) != ed25519.PrivateKeySize {
-		return nil, fmt.Errorf("enable Alpenglow voting: validator identity keypair is required")
+	if engine.identity == nil {
+		return nil, fmt.Errorf("enable Alpenglow voting: consensus engine has no validator identity")
 	}
-	if len(cfg.AuthorizedVoter) != ed25519.PrivateKeySize {
-		return nil, fmt.Errorf("enable Alpenglow voting: authorized-voter keypair is required")
+	bound := engine.identity.Current()
+	followIdentity := len(cfg.AuthorizedVoter) == 0
+	authorizedVoter := cfg.AuthorizedVoter
+	if followIdentity {
+		authorizedVoter = bound.PrivateKey()
+	} else if len(authorizedVoter) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("enable Alpenglow voting: authorized-voter keypair has invalid size %d", len(authorizedVoter))
 	}
 	if cfg.VoteAccount == (solana.PublicKey{}) {
 		return nil, fmt.Errorf("enable Alpenglow voting: vote account is required")
@@ -206,17 +235,10 @@ func newAlpenglowVoterWithStart(engine *AlpenglowObserverEngine, cfg VotingConfi
 	if cfg.EpochForSlot == nil || cfg.Peers == nil {
 		return nil, fmt.Errorf("enable Alpenglow voting: epoch and peer sources are required")
 	}
-	if len(engine.identity) != ed25519.PrivateKeySize {
-		return nil, fmt.Errorf("enable Alpenglow voting: consensus engine has no validator transport identity")
-	}
 	if cfg.SlotDuration <= 0 {
 		cfg.SlotDuration = defaultAlpenglowSlotDur
 	}
-	node := solana.PublicKey(cfg.Identity.Public().(ed25519.PublicKey))
-	engineNode := solana.PublicKey(engine.identity.Public().(ed25519.PublicKey))
-	if node != engineNode {
-		return nil, fmt.Errorf("enable Alpenglow voting: identity %s does not match consensus transport identity %s", node, engineNode)
-	}
+	node := bound.PublicKey()
 	historyLock, err := alpenglow.LockVoteHistory(cfg.HistoryDir, node)
 	if err != nil {
 		return nil, err
@@ -243,7 +265,7 @@ func newAlpenglowVoterWithStart(engine *AlpenglowObserverEngine, cfg VotingConfi
 			}
 		}
 		history = alpenglow.NewVoteHistory(node, root.Slot)
-		if err := alpenglow.SaveVoteHistory(cfg.HistoryDir, history, cfg.Identity); err != nil {
+		if err := alpenglow.SaveVoteHistory(cfg.HistoryDir, history, bound.PrivateKey()); err != nil {
 			return nil, fmt.Errorf("initialize Alpenglow vote history: %w", err)
 		}
 		mlog.Log.FileOnlyf("ALPENGLOW voting: created new vote history for %s at root %d; do not reuse this vote account on another validator", node, root.Slot)
@@ -253,7 +275,7 @@ func newAlpenglowVoterWithStart(engine *AlpenglowObserverEngine, cfg VotingConfi
 	}
 	var reservation *signingReservation
 	if cfg.ReservedHistory {
-		reservation, err = openSigningReservation(cfg, node, engine.shredVersion, history)
+		reservation, err = openSigningReservation(cfg, bound, authorizedVoter, engine.shredVersion, history)
 		if err != nil {
 			return nil, err
 		}
@@ -265,20 +287,21 @@ func newAlpenglowVoterWithStart(engine *AlpenglowObserverEngine, cfg VotingConfi
 	}
 	if history.Root < root.Slot {
 		history.SetRoot(root.Slot)
-		if err := alpenglow.SaveVoteHistory(cfg.HistoryDir, history, cfg.Identity); err != nil {
+		if err := alpenglow.SaveVoteHistory(cfg.HistoryDir, history, bound.PrivateKey()); err != nil {
 			return nil, fmt.Errorf("advance Alpenglow vote-history root: %w", err)
 		}
 	}
-	signer, err := alpenglow.DeriveBLSSigner(cfg.AuthorizedVoter)
+	signer, err := alpenglow.DeriveBLSSigner(authorizedVoter)
 	if err != nil {
 		return nil, fmt.Errorf("derive authorized-voter BLS key: %w", err)
 	}
 	v := &alpenglowVoter{
 		engine:          engine,
-		identity:        append(ed25519.PrivateKey(nil), cfg.Identity...),
+		identity:        bound,
 		node:            node,
 		voteAccount:     cfg.VoteAccount,
 		signer:          signer,
+		followIdentity:  followIdentity,
 		historyDir:      cfg.HistoryDir,
 		historyLock:     historyLock,
 		reservation:     reservation,
@@ -309,7 +332,7 @@ func newAlpenglowVoterWithStart(engine *AlpenglowObserverEngine, cfg VotingConfi
 		v.sets[set.Epoch] = cloneValidatorSet(set)
 	}
 	broadcaster, err := alpenglow.NewVotorBroadcaster(alpenglow.VotorBroadcasterConfig{
-		Identity:     cfg.Identity,
+		Identity:     engine.identity,
 		ShredVersion: engine.shredVersion,
 		Peers: func() []alpenglow.VotorPeer {
 			validators := v.votorTransportValidators()
@@ -389,6 +412,14 @@ func (v *alpenglowVoter) loop() {
 				}
 			}
 		case event := <-v.events:
+			if event.kind == voterEventSetIdentity {
+				// A rejected swap leaves the voter on its current identity
+				// and is not a safety fault.
+				if event.rebind.claimed.CompareAndSwap(false, true) {
+					event.rebind.done <- v.rebindIdentity(event.rebind.next)
+				}
+				continue
+			}
 			if err := v.handle(event); err != nil {
 				v.engine.latchSafetyError(fmt.Errorf("voting engine: %w", err))
 				mlog.Log.Errorf("ALPENGLOW VOTING SAFETY: %v", err)
@@ -1203,13 +1234,13 @@ func (v *alpenglowVoter) isIdentityStaked(slot uint64) bool {
 // an immutable queued snapshot only. The latter relies on the signing reservation.
 func (v *alpenglowVoter) saveHistory() error {
 	if v.historyWriter != nil {
-		snapshot, err := alpenglow.PrepareReservedVoteHistory(v.history, v.identity)
+		snapshot, err := alpenglow.PrepareReservedVoteHistory(v.history, v.identity.PrivateKey())
 		if err != nil {
 			return err
 		}
 		return v.historyWriter.submit(snapshot)
 	}
-	if err := alpenglow.SaveVoteHistory(v.historyDir, v.history, v.identity); err != nil {
+	if err := alpenglow.SaveVoteHistory(v.historyDir, v.history, v.identity.PrivateKey()); err != nil {
 		return fmt.Errorf("persist vote history before consensus publication: %w", err)
 	}
 	return nil
@@ -1422,6 +1453,9 @@ func (v *alpenglowVoter) close() error {
 		return nil
 	}
 	v.shutdownOnce.Do(func() {
+		if v.unregisterKey != nil {
+			v.unregisterKey()
+		}
 		v.closeOnce.Do(func() { close(v.done) })
 		v.wg.Wait()
 		if v.reservation != nil {
@@ -1434,7 +1468,7 @@ func (v *alpenglowVoter) close() error {
 			floor := v.engine.alpenglowVerifiedFinalityFloor()
 			if v.shutdownErr == nil && v.engine.safetyError() == nil && floor >= v.reservation.recoverThrough {
 				v.history.SetRoot(floor)
-				v.shutdownErr = v.reservation.seal(v.historyDir, v.history, v.identity)
+				v.shutdownErr = v.reservation.seal(v.historyDir, v.history, v.identity.PrivateKey())
 				if v.shutdownErr == nil {
 					mlog.Log.Infof("ALPENGLOW signing reservation: clean history sealed at root=%d through=%d", v.history.Root, v.reservation.through.Load())
 				}
@@ -1443,6 +1477,116 @@ func (v *alpenglowVoter) close() error {
 		v.shutdownErr = errors.Join(v.shutdownErr, v.broadcaster.Close(), v.historyLock.Close())
 	})
 	return v.shutdownErr
+}
+
+// updateIdentity is the voter's identity updater. Like Agave's
+// VotorEvent::SetIdentity it moves voting onto the new identity's vote
+// history, but it runs before the holder commits and blocks until the loop
+// has adopted next, so a failure aborts the swap.
+func (v *alpenglowVoter) updateIdentity(next *identity.Keypair) error {
+	rebind := &identityRebind{next: next, done: make(chan error, 1)}
+	if err := v.enqueue(voterEvent{kind: voterEventSetIdentity, rebind: rebind}); err != nil {
+		return err
+	}
+	timer := time.NewTimer(voterIdentityUpdateTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-rebind.done:
+		return err
+	case <-v.done:
+	case <-timer.C:
+	}
+	if rebind.claimed.CompareAndSwap(false, true) {
+		return fmt.Errorf("Alpenglow voter did not take identity %s within %s", next.PublicKey(), voterIdentityUpdateTimeout)
+	}
+	// The loop claimed the rebind first and always reports its result.
+	return <-rebind.done
+}
+
+// rebindIdentity binds voting to next's vote history, loading it or creating
+// it at the current root as Agave does. Every fallible step runs before any
+// voter state changes, so an error leaves the voter on its current identity.
+func (v *alpenglowVoter) rebindIdentity(next *identity.Keypair) error {
+	node := next.PublicKey()
+	if node == v.node {
+		v.identity = next
+		return nil
+	}
+	if v.reservation != nil {
+		return fmt.Errorf("reserved vote history is bound to identity %s; restart the validator to vote as %s", v.node, node)
+	}
+	signer := v.signer
+	if v.followIdentity {
+		var err error
+		if signer, err = alpenglow.DeriveBLSSigner(next.PrivateKey()); err != nil {
+			return fmt.Errorf("derive authorized-voter BLS key for %s: %w", node, err)
+		}
+	}
+	history, historyLock, err := openSynchronousVoteHistory(v.historyDir, next, v.history.Root)
+	if err != nil {
+		return err
+	}
+
+	previous := v.node
+	previousLock := v.historyLock
+	v.setsMu.Lock()
+	v.node = node
+	v.setsMu.Unlock()
+	v.identity = next
+	v.signer = signer
+	v.history = history
+	v.historyLock = historyLock
+	// Restoration and pending blocks belong to the previous history; keep only
+	// pending blocks the new history has neither rooted nor voted on.
+	clear(v.restored)
+	for slot := range v.pending {
+		if slot <= history.Root || history.VotedAt(slot) {
+			delete(v.pending, slot)
+		}
+	}
+	if err := previousLock.Close(); err != nil {
+		mlog.Log.Warnf("ALPENGLOW voting: release vote-history lock for %s: %v", previous, err)
+	}
+	mlog.Log.Warnf("ALPENGLOW voting: identity changed from %s to %s (vote history root=%d)", previous, node, history.Root)
+	return nil
+}
+
+// openSynchronousVoteHistory locks and loads kp's vote history in dir,
+// creating it at root when none exists. Unreadable or reserved history is
+// refused rather than reset, as at startup.
+func openSynchronousVoteHistory(dir string, kp *identity.Keypair, root uint64) (*alpenglow.VoteHistory, *os.File, error) {
+	node := kp.PublicKey()
+	historyLock, err := alpenglow.LockVoteHistory(dir, node)
+	if err != nil {
+		return nil, nil, err
+	}
+	keepLock := false
+	defer func() {
+		if !keepLock {
+			historyLock.Close()
+		}
+	}()
+	if _, err := os.Stat(alpenglow.VoteReservationFilename(dir, node)); !errors.Is(err, os.ErrNotExist) {
+		return nil, nil, fmt.Errorf("existing or unreadable vote reservation for %s requires reserved history mode", node)
+	}
+	history, err := alpenglow.LoadVoteHistory(dir, node)
+	switch {
+	case errors.Is(err, alpenglow.ErrVoteHistoryNotFound):
+		history = alpenglow.NewVoteHistory(node, root)
+		mlog.Log.FileOnlyf("ALPENGLOW voting: created new vote history for %s at root %d; do not reuse this vote account on another validator", node, root)
+	case err != nil:
+		return nil, nil, fmt.Errorf("refuse unsafe vote-history reset for %s: %w", node, err)
+	case history.ReservationRequired:
+		return nil, nil, fmt.Errorf("reserved vote history for %s cannot be opened in synchronous mode", node)
+	}
+	if history.Root < root {
+		history.SetRoot(root)
+	}
+	if err := alpenglow.SaveVoteHistory(dir, history, kp.PrivateKey()); err != nil {
+		return nil, nil, fmt.Errorf("persist Alpenglow vote history for %s: %w", node, err)
+	}
+	keepLock = true
+	return history, historyLock, nil
 }
 
 func pendingContains(blocks []pendingVotorBlock, candidate pendingVotorBlock) bool {

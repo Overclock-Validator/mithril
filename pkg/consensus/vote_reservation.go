@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/alpenglow"
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/gagliardetto/solana-go"
 )
@@ -51,11 +52,14 @@ type signingReservation struct {
 	persist        func(alpenglow.VoteReservation) error
 }
 
-func openSigningReservation(cfg VotingConfig, node solana.PublicKey, shredVersion uint16, history *alpenglow.VoteHistory) (*signingReservation, error) {
+// openSigningReservation binds a reservation to signing, the identity whose
+// history it protects. Reserved voters never change identity in place.
+func openSigningReservation(cfg VotingConfig, signing *identity.Keypair, authorizedVoter ed25519.PrivateKey, shredVersion uint16, history *alpenglow.VoteHistory) (*signingReservation, error) {
 	if cfg.Genesis == (solana.Hash{}) {
 		return nil, errors.New("reserved voting requires the bound genesis hash")
 	}
-	expected := alpenglow.VoteReservation{Version: 1, Node: node, VoteAccount: cfg.VoteAccount, AuthorizedVoter: solana.PublicKey(cfg.AuthorizedVoter.Public().(ed25519.PublicKey)), Genesis: cfg.Genesis, ShredVersion: shredVersion}
+	node := signing.PublicKey()
+	expected := alpenglow.VoteReservation{Version: 1, Node: node, VoteAccount: cfg.VoteAccount, AuthorizedVoter: solana.PublicKey(authorizedVoter.Public().(ed25519.PublicKey)), Genesis: cfg.Genesis, ShredVersion: shredVersion}
 	record, err := alpenglow.LoadVoteReservation(cfg.HistoryDir, node)
 	initializing := errors.Is(err, os.ErrNotExist)
 	if initializing {
@@ -69,7 +73,7 @@ func openSigningReservation(cfg VotingConfig, node solana.PublicKey, shredVersio
 			record.Through = max(record.Through, slot)
 		}
 		// The baseline is made durable before the first reservation is created.
-		if err := alpenglow.SaveVoteHistory(cfg.HistoryDir, history, cfg.Identity); err != nil {
+		if err := alpenglow.SaveVoteHistory(cfg.HistoryDir, history, signing.PrivateKey()); err != nil {
 			return nil, err
 		}
 	} else if err != nil {
@@ -88,7 +92,7 @@ func openSigningReservation(cfg VotingConfig, node solana.PublicKey, shredVersio
 	}
 	r := &signingReservation{record: record, recoverThrough: record.Through, leaderThrough: record.Through, wake: make(chan struct{}, 1), changed: make(chan struct{}, 1), stop: make(chan struct{}), done: make(chan struct{})}
 	r.persist = func(next alpenglow.VoteReservation) error {
-		return alpenglow.SaveVoteReservation(cfg.HistoryDir, next, cfg.Identity)
+		return alpenglow.SaveVoteReservation(cfg.HistoryDir, next, signing.PrivateKey())
 	}
 	if initializing {
 		r.recoverThrough = 0
@@ -113,7 +117,7 @@ func openSigningReservation(cfg VotingConfig, node solana.PublicKey, shredVersio
 	}
 	history.ReservationRequired = true
 	// Version 2 is deliberately rejected by older binaries that do not enforce H.
-	if err := alpenglow.SaveVoteHistory(cfg.HistoryDir, history, cfg.Identity); err != nil {
+	if err := alpenglow.SaveVoteHistory(cfg.HistoryDir, history, signing.PrivateKey()); err != nil {
 		return nil, err
 	}
 	r.through.Store(r.record.Through)

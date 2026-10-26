@@ -320,7 +320,15 @@ func DistributeVotingRewards(acctsDb *accountsdb.AccountsDb, validatorRewards ma
 	return updatedAccts, parentUpdatedAccts, totalVotingRewards.Load()
 }
 
-func DistributeStakingRewardsFromSpool(acctsDb *accountsdb.AccountsDb, spoolDir string, spoolSlot uint64, partitionIdx uint64, currentSlot uint64, loader RewardAccountLoader, voteCommissions map[solana.PublicKey]uint8) ([]*accounts.Account, []*accounts.Account, uint64, uint64, map[solana.PublicKey]uint8) {
+// StakeRewardDistributionConfig carries the distribution bank's rent rules.
+// SIMD-0392 uses current rent, not the reserve recorded in the stake's metadata.
+type StakeRewardDistributionConfig struct {
+	AdjustDelegationsForRent bool
+	Rent                     sealevel.SysvarRent
+	RewardedEpoch            uint64
+}
+
+func DistributeStakingRewardsFromSpool(acctsDb *accountsdb.AccountsDb, spoolDir string, spoolSlot uint64, partitionIdx uint64, currentSlot uint64, loader RewardAccountLoader, voteCommissions map[solana.PublicKey]uint8, config StakeRewardDistributionConfig) ([]*accounts.Account, []*accounts.Account, uint64, uint64, map[solana.PublicKey]uint8) {
 	reader, err := NewPartitionReader(spoolDir, spoolSlot, uint32(partitionIdx))
 	if err != nil {
 		panic(fmt.Sprintf("unable to open partition %d spool for distribution: %s", partitionIdx, err))
@@ -405,18 +413,33 @@ func DistributeStakingRewardsFromSpool(acctsDb *accountsdb.AccountsDb, spoolDir 
 		stakeState.Stake.Stake.CreditsObserved = rec.CreditsObserved
 		stakeState.Stake.Stake.Delegation.StakeLamports = safemath.SaturatingAddU64(stakeState.Stake.Stake.Delegation.StakeLamports, rec.RewardLamports)
 
-		err = sealevel.MarshalStakeStakeInto(stakeState, stakeAcct.Data)
-		if err != nil {
-			// Re-encode failure — matches Agave DistributionError::UnableToSetState
-			mlog.Log.Warnf("spool distribution: stake state encode failed for %s, %d lamports burned: %v", rec.StakePubkey, rec.RewardLamports, err)
-			burnedLamports.Add(rec.RewardLamports)
-			return
-		}
-
 		stakeAcct.Lamports, err = safemath.CheckedAddU64(stakeAcct.Lamports, rec.RewardLamports)
 		if err != nil {
 			// Arithmetic overflow — matches Agave DistributionError::ArithmeticOverflow
 			mlog.Log.Warnf("spool distribution: lamports overflow for %s, %d lamports burned: %v", rec.StakePubkey, rec.RewardLamports, err)
+			burnedLamports.Add(rec.RewardLamports)
+			return
+		}
+
+		if config.AdjustDelegationsForRent {
+			// Agave's adjust_delegation_for_rent applies even to credits-only
+			// records. A withdrawn, inactive stake may still have a delegation
+			// larger than its balance; never count rent as delegated lamports.
+			delegation := &stakeState.Stake.Stake.Delegation
+			minimumBalance := config.Rent.MinimumBalance(uint64(len(stakeAcct.Data)))
+			newDelegation := min(delegation.StakeLamports, safemath.SaturatingSubU64(stakeAcct.Lamports, minimumBalance))
+			if newDelegation != delegation.StakeLamports {
+				delegation.StakeLamports = newDelegation
+				if newDelegation == 0 {
+					delegation.DeactivationEpoch = config.RewardedEpoch
+				}
+			}
+		}
+
+		err = sealevel.MarshalStakeStakeInto(stakeState, stakeAcct.Data)
+		if err != nil {
+			// Re-encode failure — matches Agave DistributionError::UnableToSetState
+			mlog.Log.Warnf("spool distribution: stake state encode failed for %s, %d lamports burned: %v", rec.StakePubkey, rec.RewardLamports, err)
 			burnedLamports.Add(rec.RewardLamports)
 			return
 		}

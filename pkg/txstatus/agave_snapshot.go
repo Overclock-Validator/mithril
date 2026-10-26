@@ -157,16 +157,17 @@ func skipTransactionError(r *wincode.Reader) error {
 			return fmt.Errorf("read instruction index: %w", err)
 		}
 		return skipInstructionError(r)
-	case 29, // DuplicateInstruction(u8)
-		30, // InsufficientFundsForRent { account_index: u8 }
-		34: // ProgramExecutionTemporarilyRestricted { account_index: u8 }
+	case 30, // DuplicateInstruction(u8)
+		31, // InsufficientFundsForRent { account_index: u8 }
+		35: // ProgramExecutionTemporarilyRestricted { account_index: u8 }
 		if _, err := r.ReadU8(); err != nil {
 			return fmt.Errorf("read transaction error %d payload: %w", tag, err)
 		}
 		return nil
 	default:
 		// All remaining v4.2 variants are unit variants. The highest is
-		// InstructionsSysvarOverflow (38).
+		// CommitCancelled (38). WouldExceedAccountDataTotalLimit (29) and
+		// ResanitizationNeeded (34) also have no payload.
 		if tag <= 38 {
 			return nil
 		}
