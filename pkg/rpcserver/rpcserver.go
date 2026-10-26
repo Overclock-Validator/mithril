@@ -62,6 +62,8 @@ type RpcServer struct {
 	epochRewards  *epochrewards.Store
 	identity      string
 
+	identitySource func() string
+
 	leaderTPUCacheMu         sync.RWMutex
 	leaderTPUByIdentity      map[solana.PublicKey]tpuEndpoint
 	leaderTPUCacheUpdatedAt  time.Time
@@ -265,7 +267,9 @@ func (rpcServer *RpcServer) SetSlotCtx(slotCtx *sealevel.SlotCtx) {
 }
 
 func (rpcServer *RpcServer) SetIdentity(identity string) {
+	rpcServer.slotCtxMu.Lock()
 	rpcServer.identity = identity
+	rpcServer.slotCtxMu.Unlock()
 }
 
 func (rpcServer *RpcServer) getSlotCtx() *sealevel.SlotCtx {
