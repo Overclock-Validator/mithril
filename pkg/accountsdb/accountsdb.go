@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/trace"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -212,20 +211,18 @@ func OpenDbPaths(accountsPaths []string) (*AccountsDb, error) {
 	}
 	opts.Cache = pebble.NewCache(int64(IndexCacheMaxMB) << 20)
 	opts.EventListener = pebbleEventListener("index")
-	db, err := pebble.Open(indexDir, opts)
+	db, err := openUpgradingPebble(indexDir, opts)
 	if opts.Cache != nil {
 		opts.Cache.Unref()
 	}
 	if err != nil {
-		if strings.Contains(err.Error(), "format major version") {
-			return nil, fmt.Errorf("opening indexDir=%s: %w (an AccountsDB built by an older Mithril cannot be opened: rebuild it from a snapshot)", indexDir, err)
-		}
 		return nil, fmt.Errorf("opening indexDir=%s: %w", indexDir, err)
 	}
 
 	bankhashDir := filepath.Join(accountsDbDir, "bankhash_db")
-	bankhashDb, err := pebble.Open(bankhashDir, &pebble.Options{Logger: silentLogger{}, EventListener: pebbleEventListener("bankhash")})
+	bankhashDb, err := openUpgradingPebble(bankhashDir, &pebble.Options{Logger: silentLogger{}, EventListener: pebbleEventListener("bankhash")})
 	if err != nil {
+		db.Close()
 		return nil, fmt.Errorf("opening bankhashDir=%s: %w", bankhashDir, err)
 	}
 
