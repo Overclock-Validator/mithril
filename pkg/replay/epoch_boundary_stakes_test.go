@@ -138,9 +138,7 @@ func epochBoundaryStakeDB(t *testing.T, slot uint64, delegations []sealevel.Dele
 		require.NoError(t, err)
 		accts = append(accts, &accounts.Account{Key: voteKey, Owner: addresses.VoteProgramAddr, Lamports: 1_000_000_000, Data: voteData})
 	}
-	done := make(chan struct{})
-	require.NoError(t, db.StoreAccounts(accts, slot, func() { close(done) }))
-	<-done
+	seedDurableAccounts(t, db, accts, slot)
 	_, err = global.FlushPendingStakePubkeys(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -167,9 +165,7 @@ func TestEpochBoundaryRestoresCommissionInPreviouslyAttemptedGeneration(t *testi
 	vs.V4.InflationRewardsCommissionBps = 1234
 	vote.Data, err = sealevel.MarshalVersionedVoteState(vs)
 	require.NoError(t, err)
-	done := make(chan struct{})
-	require.NoError(t, db.StoreAccounts([]*accounts.Account{vote}, slot-1, func() { close(done) }))
-	<-done
+	seedDurableAccounts(t, db, []*accounts.Account{vote}, slot-1)
 	schedule := &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 54000, LeaderScheduleSlotOffset: 54000}
 	cacheEpoch := schedule.LeaderScheduleEpoch(slot)
 	t.Cleanup(func() { global.ClearEpochStakes(cacheEpoch) })

@@ -639,7 +639,7 @@ func BenchmarkCommonCacheBulkAdmission(b *testing.B) {
 // legacyAccountsBatchForBenchmark preserves the previous implementation only
 // as a benchmark baseline: one goroutine per cold key, gated by a semaphore.
 func legacyAccountsBatchForBenchmark(ctx context.Context, db *AccountsDb, slot uint64, keys []solana.PublicKey) ([]*accounts.Account, error) {
-	out := db.getStoreInProgressAccounts(keys)
+	out := make([]*accounts.Account, len(keys))
 	sem := make(chan struct{}, runtime.GOMAXPROCS(0)*2)
 	var wg sync.WaitGroup
 	var firstErr error

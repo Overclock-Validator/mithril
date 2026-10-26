@@ -515,10 +515,6 @@ func beginPartitionedEpochRewardsDistribution(acctsDb *accountsdb.AccountsDb, sl
 	newEpochRewards.MustMarshalWithEncoder(encoder)
 	copy(epochRewardsAcct.Data, writer.Bytes())
 
-	err = acctsDb.StoreAccounts([]*accounts.Account{epochRewardsAcct}, slot, nil)
-	if err != nil {
-		panic(fmt.Sprintf("unable to update EpochRewards sysvar to acctsdb: %s", err))
-	}
 	sealevel.SysvarCache.EpochRewards.Acct = epochRewardsAcct
 	sealevel.SysvarCache.EpochRewards.Sysvar = &newEpochRewards
 
@@ -581,10 +577,6 @@ func distributePartitionedEpochRewardsForSlot(acctsDb *accountsdb.AccountsDb, pa
 	epochRewards.MustMarshalWithEncoder(encoder)
 	copy(epochRewardsAcct.Data, writer.Bytes())
 
-	err = acctsDb.StoreAccounts([]*accounts.Account{epochRewardsAcct}, currentSlot, nil)
-	if err != nil {
-		panic(fmt.Sprintf("unable to update EpochRewards sysvar to acctsdb: %s", err))
-	}
 	sealevel.SysvarCache.EpochRewards.Acct = epochRewardsAcct
 	sealevel.SysvarCache.EpochRewards.Sysvar = &epochRewards
 

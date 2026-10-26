@@ -20,15 +20,15 @@
 # --turbine-gossip-entrypoint / --alpenglow-observer-bind-addr /
 # --identity-keypair / --rpc on the command line.
 #
-#   [network]   cluster = "alpenglow"   +   rpc = ["https://your-rpc"]
+#   [network]   cluster = "mainnet"     +   rpc = ["https://your-rpc"]
 #   [block]     source  = "turbine"     +   turbine_bind_addr = "0.0.0.0:8001"
-#   [turbine]   gossip_entrypoint = "<cluster gossip host:port>"   (REQUIRED)
+#   [turbine]   gossip_entrypoint = "<cluster gossip host:port>"   (custom clusters)
 #   [consensus] alpenglow_observer_bind_addr = "0.0.0.0:8010"      (Votor QUIC)
 #   [validator] identity_keypair = "/path/to/validator-keypair.json"
 #
 # Alpenglow supports "verifying" (default; non-voting) and "validator" modes.
 # Validator mode enables TPU ingress and block production but does not cast
-# votes yet. mainnet-beta/testnet/devnet retain the classic verifying-only flow.
+# votes yet. Every cluster (mainnet, testnet, devnet, custom) runs Alpenglow.
 # Generate a per-type starter config: mithril config init [--validator]
 # ----------------------------------------------------------------------------
 
@@ -167,19 +167,29 @@ name = "mithril"
 # probes the primary and restores to it when healthy.
 
 [network]
-    # Solana cluster. Defaults to "alpenglow". Alpenglow uses certificate fork
-    # choice and rooted speculative replay. "mainnet-beta", "testnet", and
-    # "devnet" use the established verifying-only RPC replay path.
-    cluster = "alpenglow"
+    # Solana cluster: "mainnet" (default; "mainnet-beta" is an alias),
+    # "testnet", "devnet", or a custom name for a private cluster. Every
+    # cluster runs Alpenglow certificate fork choice and rooted-durable replay;
+    # the name only selects the chain. Built-in clusters carry their genesis
+    # hash and public gossip entrypoint, and startup refuses an RPC endpoint
+    # whose genesis belongs to another cluster.
+    cluster = "mainnet"
+
+    # Expected genesis hash. REQUIRED for a custom cluster, which also needs
+    # rpc below and [turbine].gossip_entrypoint. Optional for built-in
+    # clusters, where it must match the built-in genesis. State files and
+    # ledger artifacts are bound to this genesis, so state never crosses
+    # clusters.
+    # genesis_hash = ""
 
     # RPC endpoints in priority order (first = primary, rest = fallbacks)
     #
     # Example with primary + fallback:
     #   rpc = [
-    #       "https://your-primary-alpenglow-rpc.example.com",  # Primary
-    #       "https://your-fallback-alpenglow-rpc.example.com"  # Fallback
+    #       "https://your-primary-rpc.example.com",  # Primary
+    #       "https://your-fallback-rpc.example.com"  # Fallback
     #   ]
-    rpc = ["https://rpc.ag.validator1.net"]
+    rpc = ["https://api.mainnet-beta.solana.com"]
 
 # ============================================================================
 # [block] - Block Source & Streaming
@@ -188,8 +198,7 @@ name = "mithril"
 # Block source configuration. See also [lightbringer] below for sidecar settings.
 
 [block]
-    # Where to stream new blocks from. Empty selects the protocol default:
-    # "turbine" for Alpenglow, "rpc" for classic clusters.
+    # Where to stream new blocks from. Empty selects "turbine".
     #   "turbine"      - Native UDP turbine shred receiver (the LIVE mode, and
     #                    the DEFAULT). Uses RPC for catchup, hands off to
     #                    reconstructed shreds near tip. Shreds carry the
@@ -322,7 +331,6 @@ name = "mithril"
 # In validator mode ([consensus].mode = "validator") the identity keypair AND
 # vote-account address are REQUIRED — the node refuses to start without them.
 # The authorized withdrawer keypair is NOT needed at runtime: keep it OFFLINE.
-# Validator mode is supported only with network.cluster = "alpenglow".
 
 [validator]
     # identity_keypair = "/path/to/validator-keypair.json"
@@ -407,8 +415,7 @@ name = "mithril"
 # ============================================================================
 #
 # On Alpenglow, blocks execute immediately on receipt and certificates are the
-# source of truth for fork choice and durable-state promotion. Classic clusters
-# do not start this engine and retain the established verifying-only flow.
+# source of truth for fork choice and durable-state promotion on every cluster.
 
 [consensus]
     # Node mode:
@@ -454,11 +461,10 @@ name = "mithril"
 # validator.identity_keypair before forwarding.
 
 [turbine]
-    # Solana gossip entrypoint of your Alpenglow cluster (host:port). REQUIRED
-    # for a live turbine deployment: Mithril contacts it to discover the shred
-    # version and to advertise its turbine/TVU + observer sockets into the
-    # turbine tree. Without it the node cannot join the tree and will not
-    # receive shreds. Example:
+    # Solana gossip entrypoint (host:port). Mithril contacts it to discover the
+    # shred version and to advertise its turbine/TVU + observer sockets into
+    # the turbine tree. Empty uses the built-in cluster's public entrypoint;
+    # REQUIRED for a custom cluster. Example:
     # gossip_entrypoint = "1.2.3.4:9000"
     gossip_entrypoint = ""
 
@@ -627,9 +633,6 @@ name = "mithril"
 
     # Enable/disable pool allocator for slices
     use_pool = true
-
-    # Number of goroutines to store modified accounts at the end of each block
-    store_accounts_workers = 128
 
     # Approximate maximum retained SBPF program cache size in MiB.
     program_cache_max_mb = 1024

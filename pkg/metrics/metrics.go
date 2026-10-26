@@ -49,7 +49,6 @@ type AccountLoader struct {
 	SysvarLastRestartSlotRead   Timing
 
 	WorkingSetLookup     Timing
-	InProgressLookup     Timing
 	AppendVecPinWait     Timing
 	ReadCacheEpochWait   Timing
 	CacheLookup          Timing
@@ -63,7 +62,6 @@ type AccountLoader struct {
 	SysvarWorkingSetLookup      Timing
 	SysvarClone                 Timing
 	SysvarAppendVecPinWait      Timing
-	SysvarInProgressLookup      Timing
 	SysvarReadCacheEpochWait    Timing
 	SysvarCacheLookup           Timing
 	SysvarIndexAndAppendVecRead Timing
@@ -75,7 +73,6 @@ type AccountLoader struct {
 	ParentAccounts uint64
 
 	WorkingSetHits    uint64
-	InProgressHits    uint64
 	PendingFoldHits   uint64
 	CacheHits         uint64
 	IndexHits         uint64
@@ -99,7 +96,6 @@ type AccountLoader struct {
 
 	SysvarReads                        uint64
 	SysvarWorkingSetHits               uint64
-	SysvarInProgressHits               uint64
 	SysvarPendingFoldHits              uint64
 	SysvarCacheHits                    uint64
 	SysvarDurableReads                 uint64
@@ -133,8 +129,6 @@ func (dst *AccountLoader) Accumulate(src AccountLoader) {
 	dst.SysvarLastRestartSlotRead.SumNanoseconds += src.SysvarLastRestartSlotRead.SumNanoseconds
 	dst.WorkingSetLookup.Count += src.WorkingSetLookup.Count
 	dst.WorkingSetLookup.SumNanoseconds += src.WorkingSetLookup.SumNanoseconds
-	dst.InProgressLookup.Count += src.InProgressLookup.Count
-	dst.InProgressLookup.SumNanoseconds += src.InProgressLookup.SumNanoseconds
 	dst.AppendVecPinWait.Count += src.AppendVecPinWait.Count
 	dst.AppendVecPinWait.SumNanoseconds += src.AppendVecPinWait.SumNanoseconds
 	dst.ReadCacheEpochWait.Count += src.ReadCacheEpochWait.Count
@@ -159,8 +153,6 @@ func (dst *AccountLoader) Accumulate(src AccountLoader) {
 	dst.SysvarClone.SumNanoseconds += src.SysvarClone.SumNanoseconds
 	dst.SysvarAppendVecPinWait.Count += src.SysvarAppendVecPinWait.Count
 	dst.SysvarAppendVecPinWait.SumNanoseconds += src.SysvarAppendVecPinWait.SumNanoseconds
-	dst.SysvarInProgressLookup.Count += src.SysvarInProgressLookup.Count
-	dst.SysvarInProgressLookup.SumNanoseconds += src.SysvarInProgressLookup.SumNanoseconds
 	dst.SysvarReadCacheEpochWait.Count += src.SysvarReadCacheEpochWait.Count
 	dst.SysvarReadCacheEpochWait.SumNanoseconds += src.SysvarReadCacheEpochWait.SumNanoseconds
 	dst.SysvarCacheLookup.Count += src.SysvarCacheLookup.Count
@@ -175,7 +167,6 @@ func (dst *AccountLoader) Accumulate(src AccountLoader) {
 	dst.DurableKeys += src.DurableKeys
 	dst.ParentAccounts += src.ParentAccounts
 	dst.WorkingSetHits += src.WorkingSetHits
-	dst.InProgressHits += src.InProgressHits
 	dst.PendingFoldHits += src.PendingFoldHits
 	dst.CacheHits += src.CacheHits
 	dst.IndexHits += src.IndexHits
@@ -196,7 +187,6 @@ func (dst *AccountLoader) Accumulate(src AccountLoader) {
 	dst.PlaceholderObjects += src.PlaceholderObjects
 	dst.SysvarReads += src.SysvarReads
 	dst.SysvarWorkingSetHits += src.SysvarWorkingSetHits
-	dst.SysvarInProgressHits += src.SysvarInProgressHits
 	dst.SysvarPendingFoldHits += src.SysvarPendingFoldHits
 	dst.SysvarCacheHits += src.SysvarCacheHits
 	dst.SysvarDurableReads += src.SysvarDurableReads

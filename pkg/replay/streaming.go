@@ -118,14 +118,12 @@ type streamingDeps struct {
 	frontier    func() uint64
 	// frontierMark reports the last executed block's replay and full instants
 	// (timeline only; nil when the loop does not track it).
-	frontierMark     func() streamingFrontierMark
-	currentFeatures  func() *features.Features
-	currentEpoch     func() uint64
-	rewardsInFlight  func() bool
-	switchPending    func() bool
-	executedBlockID  func(slot uint64) (solana.Hash, bool)
-	alpenglowMode    bool
-	unrootedTailUsed bool
+	frontierMark    func() streamingFrontierMark
+	currentFeatures func() *features.Features
+	currentEpoch    func() uint64
+	rewardsInFlight func() bool
+	switchPending   func() bool
+	executedBlockID func(slot uint64) (solana.Hash, bool)
 }
 
 type streamingGroup struct {
@@ -509,8 +507,8 @@ func (s *streamingExecutor) tryOpen() {
 // the reason it may not.
 func (s *streamingExecutor) eligibility(header *turbine.StreamBatch) string {
 	d := s.deps
-	if !d.alpenglowMode || !d.unrootedTailUsed || d.tail == nil {
-		return "requires alpenglow rooted-durable replay"
+	if d.tail == nil {
+		return "requires the unrooted tail"
 	}
 	if d.feed.StreamStatusOf(header.Generation) != turbine.StreamActive {
 		return "generation no longer active"

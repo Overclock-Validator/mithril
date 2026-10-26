@@ -24,7 +24,6 @@ func TestByteTriggeredFoldsRecoverAndRewind(t *testing.T) {
 		}
 	})
 	db.InitCaches()
-	db.RootedDurable = true
 	tail := newUnrootedTail(db, db, 512, 128, "")
 	tail.foldMaxBytes = 16 << 10
 	for s := uint64(1); s <= 5; s++ {
@@ -45,7 +44,6 @@ func TestByteTriggeredFoldsRecoverAndRewind(t *testing.T) {
 	db, err = accountsdb.OpenDb(dir)
 	require.NoError(t, err)
 	db.InitCaches()
-	db.RootedDurable = true
 	recovered, err := db.RecoverFoldState()
 	require.NoError(t, err)
 	require.Equal(t, uint64(4), recovered.DurableThrough)

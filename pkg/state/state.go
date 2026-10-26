@@ -53,7 +53,7 @@ type MithrilState struct {
 	BuildCompleted time.Time     `json:"build_completed_at,omitempty"` // When AccountsDB build finished
 	BuildStartedAt time.Time     `json:"build_started_at,omitempty"`   // When bootstrap started
 	BuildMode      string        `json:"build_mode,omitempty"`         // "auto", "snapshot", "new-snapshot", "accountsdb"
-	Cluster        string        `json:"cluster,omitempty"`            // "mainnet-beta", "testnet", "devnet"
+	Cluster        string        `json:"cluster,omitempty"`            // canonical cluster name ("mainnet", "testnet", "devnet", or custom); lineage is bound by GenesisHash
 	GenesisHash    string        `json:"genesis_hash,omitempty"`       // Base58 genesis hash from RPC
 
 	// Corruption tracking - set when integrity check fails
@@ -660,7 +660,7 @@ type NewReadyStateOpts struct {
 	IncrSlot         uint64
 	BuildMode        string // "auto", "snapshot", "new-snapshot", "accountsdb"
 	BuildStartedAt   time.Time
-	Cluster          string // "mainnet-beta", "testnet", "devnet"
+	Cluster          string // canonical cluster name ("mainnet", "testnet", "devnet", or custom); lineage is bound by GenesisHash
 	GenesisHash      string // Base58 genesis hash
 	WriterVersion    string // Semver tag
 	WriterCommit     string // Git commit hash

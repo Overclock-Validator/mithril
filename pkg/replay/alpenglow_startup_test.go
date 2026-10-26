@@ -90,14 +90,12 @@ func TestValidateAlpenglowStartupStateWithAccountsDB(t *testing.T) {
 	db.InitCaches()
 	t.Cleanup(db.CloseDb)
 
-	stored := make(chan struct{})
 	startupAccounts := validAlpenglowStartupAccounts(t, 486_000)
 	toStore := make([]*accounts.Account, 0, len(startupAccounts))
 	for _, acct := range startupAccounts {
 		toStore = append(toStore, acct)
 	}
-	require.NoError(t, db.StoreAccounts(toStore, 486_000, func() { close(stored) }))
-	<-stored
+	seedDurableAccounts(t, db, toStore, 486_000)
 
 	require.NoError(t, ValidateAlpenglowStartupState(db, 975_511))
 }

@@ -39,7 +39,6 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
 	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/lightbringer"
-	"github.com/Overclock-Validator/mithril/pkg/lthash"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/progress"
 	"github.com/Overclock-Validator/mithril/pkg/replay"
@@ -82,7 +81,9 @@ var (
 	accountsPath                     string
 	scratchDirectory                 string
 	rpcEndpoints                     []string
-	cluster                          string // "alpenglow", "mainnet-beta", "testnet", or "devnet"
+	cluster                          string // canonical cluster name: "mainnet", "testnet", "devnet", or a custom name
+	clusterInfo                      config.Cluster
+	clusterGenesisHash               string // required for custom clusters; must match the built-in genesis otherwise
 	legacyGenesisHash                string // explicit lineage for pre-binding AccountsDB/ledger artifacts
 	blockSource                      string // "turbine", "rpc", or "lightbringer"
 	lightbringerEndpoint             string
@@ -213,26 +214,8 @@ func epochForStateSlot(s *state.MithrilState, slot uint64) uint64 {
 	return 0
 }
 
-func alpenglowModeForCluster(cluster string) (bool, error) {
-	switch cluster {
-	case "alpenglow":
-		return true, nil
-	case "mainnet-beta", "testnet", "devnet":
-		return false, nil
-	default:
-		return false, fmt.Errorf("invalid network.cluster %q - must be 'alpenglow', 'mainnet-beta', 'testnet', or 'devnet'", cluster)
-	}
-}
-
-func defaultBlockSourceForMode(alpenglow bool) string {
-	if alpenglow {
-		return "turbine"
-	}
-	return "rpc"
-}
-
 // txParallelismForMode gives full-validator replay a usable default without
-// changing the classic verifying flow. Zero remains a meaningful, supported
+// changing the verifying flow. Zero remains a meaningful, supported
 // operator choice when it was explicitly supplied through CLI or config.
 func txParallelismForMode(mode string, configured int64, explicitlySet bool, cpuCount int) int64 {
 	if mode != "validator" || explicitlySet || configured != 0 {
@@ -552,7 +535,8 @@ func init() {
 
 	// [network] section flags
 	Run.Flags().StringSliceVarP(&rpcEndpoints, "rpc", "r", []string{}, "URL(s) for RPC endpoint(s) - can specify multiple")
-	Run.Flags().StringVar(&cluster, "cluster", "", "Solana cluster: 'alpenglow' (default), 'mainnet-beta', 'testnet', or 'devnet'")
+	Run.Flags().StringVar(&cluster, "cluster", "", "Solana cluster: 'mainnet' (default; alias 'mainnet-beta'), 'testnet', 'devnet', or a custom name (requires --genesis-hash); all run Alpenglow")
+	Run.Flags().StringVar(&clusterGenesisHash, "genesis-hash", "", "Expected genesis hash; required for a custom cluster, must match the built-in genesis otherwise")
 	Run.Flags().StringVar(&legacyGenesisHash, "legacy-genesis-hash", "", "Genesis hash owning legacy unbound AccountsDB/ledger artifacts (one-time re-genesis safety acknowledgement)")
 
 	// [rpc] section flags (Mithril's RPC server)
@@ -611,7 +595,8 @@ func init() {
 	Run.Flags().BoolVar(&sigverify.Cfg.DisableShredOverlap, "sigverify-disable-shred-overlap", false,
 		"Defer Turbine transaction decoding and signature verification until all block shreds arrive")
 	Run.Flags().BoolVar(&sbpf.UsePool, "use-pool", true, "Disable to allocate fresh slices")
-	Run.Flags().IntVar(&accountsdb.StoreAccountsWorkers, "store-accounts-workers", 128, "Number of workers to write account updates")
+	Run.Flags().Int("store-accounts-workers", 0, "Removed: accounts reach disk only through folds")
+	_ = Run.Flags().MarkDeprecated("store-accounts-workers", "accounts reach disk only through folds; the flag has no effect")
 	Run.Flags().IntVar(&accountsdb.ProgramCacheMaxMB, "program-cache-max-mb", accountsdb.DefaultProgramCacheMaxMB, "Maximum approximate SBPF program cache size in MiB")
 	Run.Flags().IntVar(&accountsdb.CommonAccountCacheMaxMB, "common-account-cache-max-mb", accountsdb.DefaultCommonAccountCacheMaxMB, "Approximate retained decoded account cache weight budget in MiB")
 	Run.Flags().Int64Var(&rewindToSlot, "rewind-to-slot", 0, "Rewind durable account state to the fold batch boundary at this slot before replaying (must be a retained boundary; run once to list boundaries on mismatch)")
@@ -852,14 +837,19 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		rpcEndpoints = getStringSlice("rpc", "rpc.rpc")
 	}
 
-	// Cluster selects the protocol path as well as protecting against
-	// mainnet/testnet AccountsDB mixups. Alpenglow uses certificate forkchoice
-	// and rooted speculative replay; the established clusters retain the
-	// classic verifying flow.
+	// Cluster names the chain and protects against mixing AccountsDB and
+	// ledger state across chains. It never selects a replay path: every
+	// cluster runs Alpenglow certificate fork choice and rooted-durable replay.
 	cluster = getString("cluster", "network.cluster")
-	if cluster == "" {
-		cluster = "alpenglow"
-		mlog.Log.Infof("network.cluster not set; defaulting to %q", cluster)
+	clusterGenesisHash = getString("genesis-hash", "network.genesis_hash")
+	var err error
+	clusterInfo, err = config.ResolveCluster(cluster, clusterGenesisHash)
+	if err != nil {
+		return err
+	}
+	cluster = clusterInfo.Name
+	if clusterInfo.Custom && len(rpcEndpoints) == 0 {
+		return fmt.Errorf("custom network.cluster %q requires network.rpc", cluster)
 	}
 	legacyGenesisHash = strings.TrimSpace(getString("legacy-genesis-hash", "network.legacy_genesis_hash"))
 	if legacyGenesisHash != "" {
@@ -867,11 +857,6 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 			return err
 		}
 	}
-	alpenglowMode, err := alpenglowModeForCluster(cluster)
-	if err != nil {
-		return err
-	}
-
 	// Must be decided before any OpenDb call: with the WAL off, the fold
 	// manifests are the index redo log (recovery replays them).
 	if config.IsSet("storage.index_wal") && !config.GetBool("storage.index_wal") {
@@ -928,13 +913,13 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	blockSource = getString("block-source", "block.source")
 	blockSourceExplicit := blockSource != "" // operator chose (flag or config) vs defaulted
 	if blockSource == "" {
-		blockSource = defaultBlockSourceForMode(alpenglowMode)
+		blockSource = "turbine"
 	}
 	// RPC is a catch-up/debug source on Alpenglow, not a live one: RPC blocks
 	// carry no Alpenglow block ids or footer certificates, so certificate
 	// gating cannot adjudicate their identity near tip, and durable folds only
 	// advance if certificates arrive some other way (the Votor QUIC listener).
-	if alpenglowMode && blockSource == "rpc" {
+	if blockSource == "rpc" {
 		if alpenglowObserverBindAddr == "" {
 			mlog.Log.Warnf("block source \"rpc\" with no consensus.alpenglow_observer_bind_addr: no certificate feed exists, so durable folds will NOT advance (fail-closed halt once the in-RAM tail fills); use block source \"turbine\" for live operation")
 		} else {
@@ -947,6 +932,12 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		turbineBindAddr = config.GetString("turbine.bind_addr")
 	}
 	turbineGossipEntrypoint = getString("turbine-gossip-entrypoint", "turbine.gossip_entrypoint")
+	if turbineGossipEntrypoint == "" && blockSource == "turbine" {
+		if clusterInfo.Custom {
+			return fmt.Errorf("custom network.cluster %q requires turbine.gossip_entrypoint", cluster)
+		}
+		turbineGossipEntrypoint = clusterInfo.GossipEntrypoint
+	}
 	turbineGossipBindAddr = getString("turbine-gossip-bind-addr", "turbine.gossip_bind_addr")
 	turbineAdvertisedIP = getString("turbine-advertised-ip", "turbine.advertised_ip")
 	turbineShredVersion = getInt("turbine-shred-version", "turbine.shred_version")
@@ -1055,9 +1046,6 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	// Validator mode: enforce the complete block-production and voting shape.
 	if consensusMode == "validator" {
 		var missing []string
-		if !alpenglowMode {
-			missing = append(missing, "network.cluster=alpenglow (classic clusters remain verifying-only)")
-		}
 		if validatorIdentityKeypair == "" {
 			missing = append(missing, "validator.identity_keypair (signs gossip/turbine and authenticates Votor QUIC)")
 		}
@@ -1226,7 +1214,9 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	if ms := getInt("streaming-max-open-ms", "tuning.streaming_max_open_ms"); ms > 0 {
 		replay.StreamingExecutionCfg.MaxOpenAge = time.Duration(ms) * time.Millisecond
 	}
-	accountsdb.StoreAccountsWorkers = getInt("store-accounts-workers", "tuning.store_accounts_workers")
+	if config.IsSet("tuning.store_accounts_workers") {
+		mlog.Log.Warnf("tuning.store_accounts_workers was removed (accounts reach disk only through folds); delete the key")
+	}
 	accountsdb.ProgramCacheMaxMB = getInt("program-cache-max-mb", "tuning.program_cache_max_mb")
 	if accountsdb.ProgramCacheMaxMB <= 0 {
 		return fmt.Errorf("tuning.program_cache_max_mb must be > 0")
@@ -1293,9 +1283,9 @@ func buildSnapshotConfig(rpcEndpoints []string) snapshotdl.SnapshotConfig {
 	}
 	if config.IsSet("snapshot.min_node_version") {
 		cfg.MinNodeVersion = config.GetString("snapshot.min_node_version")
-	} else if cluster == "alpenglow" {
-		// The public Alpenglow test cluster advertises Agave/Votor node versions in
-		// the 0.x series; the mainnet default of 3.0.0 would filter every source.
+	} else if clusterInfo.Custom {
+		// Private Alpenglow clusters advertise Agave/Votor node versions in the
+		// 0.x series; the mainnet default of 3.0.0 would filter every source.
 		cfg.MinNodeVersion = "0.3.0"
 	}
 	if config.IsSet("snapshot.allowed_node_versions") {
@@ -1330,7 +1320,6 @@ func buildSnapshotConfig(rpcEndpoints []string) snapshotdl.SnapshotConfig {
 }
 
 func runLive(c *cobra.Command, args []string) {
-	alpenglowMode := cluster == "alpenglow"
 	if pprofPort != -1 {
 		startPprofHandlers(int(pprofPort))
 	}
@@ -1443,11 +1432,14 @@ func runLive(c *cobra.Command, args []string) {
 	// describe any mutation. Fetch genesis exactly once and carry that value
 	// through every fresh ready-state write below.
 	if len(rpcEndpoints) == 0 {
-		rpcEndpoints = []string{"https://api.mainnet-beta.solana.com"}
+		rpcEndpoints = []string{clusterInfo.RPC}
 	}
 	networkGenesisHash := fetchGenesisHash(ctx)
 	if networkGenesisHash == "" {
 		klog.Fatalf("FATAL: could not confirm the RPC genesis hash; refusing startup because AccountsDB, shred spool, and vote-history lineage cannot be validated")
+	}
+	if err := clusterInfo.CheckGenesis(networkGenesisHash); err != nil {
+		klog.Fatalf("FATAL: %v", err)
 	}
 
 	mithrilState, err := loadBootstrapState(accountsPath, bootstrapMode)
@@ -1867,19 +1859,17 @@ func runLive(c *cobra.Command, args []string) {
 		refreshManifestSeedFromManifest(accountsPath, mithrilState, manifest)
 		// Restore the durable fold frontier (index tail + NoSync bankhash rows)
 		// from the manifests before the integrity check reads those rows.
-		if alpenglowMode {
+		foldRecovery = mustRecoverFoldState(accountsDb)
+		foldRecovered = true
+		if foldRecovery.RewindInProgress {
+			if mithrilState == nil {
+				klog.Fatalf("interrupted durable rewind has no state context to reconcile; re-bootstrap with --bootstrap snapshot")
+			}
+			completeInterruptedRewind(accountsPath, accountsDb, mithrilState)
 			foldRecovery = mustRecoverFoldState(accountsDb)
-			foldRecovered = true
-			if foldRecovery.RewindInProgress {
-				if mithrilState == nil {
-					klog.Fatalf("interrupted durable rewind has no state context to reconcile; re-bootstrap with --bootstrap snapshot")
-				}
-				completeInterruptedRewind(accountsPath, accountsDb, mithrilState)
-				foldRecovery = mustRecoverFoldState(accountsDb)
-			}
-			if err := adoptRecoveredManifestContextBeforeIntegrity(accountsPath, mithrilState, foldRecovery); err != nil {
-				klog.Fatalf("fold manifest checkpoint at durable slot %d is invalid: %v; re-bootstrap with --bootstrap snapshot", foldRecovery.DurableThrough, err)
-			}
+		}
+		if err := adoptRecoveredManifestContextBeforeIntegrity(accountsPath, mithrilState, foldRecovery); err != nil {
+			klog.Fatalf("fold manifest checkpoint at durable slot %d is invalid: %v; re-bootstrap with --bootstrap snapshot", foldRecovery.DurableThrough, err)
 		}
 		// Run integrity check if we have a state file (warn only, don't fail - user chose force mode)
 		if hasValidState {
@@ -2129,16 +2119,14 @@ func runLive(c *cobra.Command, args []string) {
 			// rows) from the manifests BEFORE the integrity check reads those
 			// rows — otherwise a hard kill that dropped a NoSync bankhash row
 			// would falsely condemn a healthy store and force a re-bootstrap.
-			if alpenglowMode {
+			foldRecovery = mustRecoverFoldState(accountsDb)
+			foldRecovered = true
+			if foldRecovery.RewindInProgress {
+				completeInterruptedRewind(accountsPath, accountsDb, mithrilState)
 				foldRecovery = mustRecoverFoldState(accountsDb)
-				foldRecovered = true
-				if foldRecovery.RewindInProgress {
-					completeInterruptedRewind(accountsPath, accountsDb, mithrilState)
-					foldRecovery = mustRecoverFoldState(accountsDb)
-				}
-				if err := adoptRecoveredManifestContextBeforeIntegrity(accountsPath, mithrilState, foldRecovery); err != nil {
-					klog.Fatalf("fold manifest checkpoint at durable slot %d is invalid: %v; re-bootstrap with --bootstrap snapshot", foldRecovery.DurableThrough, err)
-				}
+			}
+			if err := adoptRecoveredManifestContextBeforeIntegrity(accountsPath, mithrilState, foldRecovery); err != nil {
+				klog.Fatalf("fold manifest checkpoint at durable slot %d is invalid: %v; re-bootstrap with --bootstrap snapshot", foldRecovery.DurableThrough, err)
 			}
 
 			// Validate state file matches AccountsDB (detect Ctrl+Z / kill -9 corruption)
@@ -2227,26 +2215,17 @@ postBootstrap:
 			mlog.Log.Infof("state file snapshot_slot (%d) doesn't match manifest (%d), ignoring state file",
 				mithrilState.SnapshotSlot, manifest.Bank.Slot)
 			mithrilState = nil
-		} else if alpenglowMode && mithrilState.LastRootedContext != nil {
+		} else if mithrilState.LastRootedContext != nil {
 			// Rooted-durable resume: durable position is the last rooted slot; the in-RAM
 			// slots above it were lost. Resume from the slot after the last rooted slot
 			// (GetResumeSlot returns it when LastRootedSlot > 0).
 			startSlot = int64(mithrilState.GetResumeSlot())
-		} else if !alpenglowMode && mithrilState.LastSlot > 0 {
-			// Validate last_slot is reasonable
-			if mithrilState.LastSlot < manifest.Bank.Slot {
-				mlog.Log.Infof("state file last_slot (%d) is before snapshot slot (%d), ignoring",
-					mithrilState.LastSlot, manifest.Bank.Slot)
-				mithrilState = nil
-			} else {
-				startSlot = int64(mithrilState.LastSlot + 1)
-			}
 		}
 	}
 
 	// Create ResumeState if we have resume context from state file
 	var resumeState *replay.ResumeState
-	if alpenglowMode && mithrilState != nil && mithrilState.LastRootedContext != nil {
+	if mithrilState != nil && mithrilState.LastRootedContext != nil {
 		// Rooted-durable resume: build from the context as of the last rooted slot
 		// (durable), not the Last* fields at the replayed tip (lost in RAM on restart).
 		rs, err := replay.ResumeStateFromRootedContext(mithrilState.LastRootedContext, mithrilState.ComputedEpochStakes)
@@ -2256,77 +2235,6 @@ postBootstrap:
 		} else {
 			resumeState = rs
 			mlog.Log.Infof("rooted-durable resume: continuing from rooted slot R=%d (durable checkpoint)", mithrilState.LastRootedContext.Slot)
-		}
-	} else if !alpenglowMode && mithrilState != nil && mithrilState.HasResumeData() {
-		// Decode parent bankhash
-		parentBankhash, err := base58.Decode(mithrilState.LastBankhash)
-		if err != nil {
-			mlog.Log.Errorf("failed to decode last_bankhash from state file: %v", err)
-			mlog.Log.Infof("will start fresh from snapshot")
-			mithrilState = nil
-		} else {
-			// Decode AcctsLtHash
-			ltHashBytes, err := base64.StdEncoding.DecodeString(mithrilState.LastAcctsLtHash)
-			if err != nil {
-				mlog.Log.Errorf("failed to decode accts_lt_hash from state file: %v", err)
-				mlog.Log.Infof("will start fresh from snapshot")
-				mithrilState = nil
-			} else {
-				ltHash := &lthash.LtHash{}
-				ltHash.InitWithHash(ltHashBytes)
-
-				resumeState = &replay.ResumeState{
-					ParentSlot:               mithrilState.LastSlot,
-					ParentBlockHeight:        mithrilState.LastBlockHeight,
-					ParentBankhash:           parentBankhash,
-					AcctsLtHash:              ltHash,
-					LamportsPerSignature:     mithrilState.LastLamportsPerSignature,
-					PrevLamportsPerSignature: mithrilState.LastPrevLamportsPerSig,
-					NumSignatures:            mithrilState.LastNumSignatures,
-					// ReplayCtx fields
-					Capitalization:          mithrilState.LastCapitalization,
-					SlotsPerYear:            mithrilState.LastSlotsPerYear,
-					InflationInitial:        mithrilState.LastInflationInitial,
-					InflationTerminal:       mithrilState.LastInflationTerminal,
-					InflationTaper:          mithrilState.LastInflationTaper,
-					InflationFoundation:     mithrilState.LastInflationFoundation,
-					InflationFoundationTerm: mithrilState.LastInflationFoundationTerm,
-				}
-
-				// Decode blockhash context
-				if mithrilState.LastRecentBlockhashes != nil && len(mithrilState.LastRecentBlockhashes) > 0 {
-					recentBlockhashes := replay.DecodeRecentBlockhashes(mithrilState.LastRecentBlockhashes)
-					resumeState.RecentBlockhashes = &recentBlockhashes
-
-					if mithrilState.LastEvictedBlockhash != "" {
-						evictedBytes, err := base58.Decode(mithrilState.LastEvictedBlockhash)
-						if err == nil && len(evictedBytes) == 32 {
-							copy(resumeState.EvictedBlockhash[:], evictedBytes)
-						}
-					}
-
-					if mithrilState.LastBlockhash != "" {
-						lastBhBytes, err := base58.Decode(mithrilState.LastBlockhash)
-						if err == nil && len(lastBhBytes) == 32 {
-							copy(resumeState.LastBlockhash[:], lastBhBytes)
-						}
-					}
-				}
-
-				// Decode SlotHashes context (vote program needs accurate slot→hash mappings)
-				if mithrilState.LastSlotHashes != nil && len(mithrilState.LastSlotHashes) > 0 {
-					slotHashes := replay.DecodeSlotHashes(mithrilState.LastSlotHashes)
-					resumeState.SlotHashes = &slotHashes
-				}
-
-				// Load persisted epoch stakes - required for correct leader schedule
-				if mithrilState.ComputedEpochStakes != nil && len(mithrilState.ComputedEpochStakes) > 0 {
-					resumeState.ComputedEpochStakes = make(map[uint64][]byte, len(mithrilState.ComputedEpochStakes))
-					for epoch, data := range mithrilState.ComputedEpochStakes {
-						resumeState.ComputedEpochStakes[epoch] = []byte(data)
-					}
-				}
-			}
 		}
 	}
 
@@ -2356,15 +2264,14 @@ postBootstrap:
 	accountsDb.InitCaches()
 
 	// Alpenglow buffers replayed slots in a fork-aware WorkingSet and folds only
-	// finalized prefixes. Classic verifying mode retains the established
-	// per-slot AccountsDB persistence path.
+	// finalized prefixes. Every cluster runs Alpenglow, so rooted-durable
+	// storage is always on.
 	if config.IsSet("storage.durable_commit") {
 		klog.Fatalf("storage.durable_commit was removed: batch folds replaced the per-slot redo-log commit path — delete the key (rooted-durable batching is always on)")
 	}
-	if config.IsSet("storage.rooted_durable") && config.GetBool("storage.rooted_durable") != alpenglowMode {
-		klog.Fatalf("storage.rooted_durable must be %t for network.cluster=%s", alpenglowMode, cluster)
+	if config.IsSet("storage.rooted_durable") && !config.GetBool("storage.rooted_durable") {
+		klog.Fatalf("storage.rooted_durable=false is not supported: every cluster runs Alpenglow rooted-durable storage (delete the key)")
 	}
-	accountsDb.RootedDurable = alpenglowMode
 	if config.IsSet("storage.fork_aware") {
 		mlog.Log.Warnf("storage.fork_aware was removed: the working-set suffix engine handles fork switches via unwind+re-execute — delete the key")
 	}
@@ -2385,7 +2292,7 @@ postBootstrap:
 	vcfg = verifierConfigForConsensusMode(consensusMode, vcfg)
 	replay.TrailingVerifierCfg = vcfg
 
-	if foldBatch := config.GetInt("storage.fold_batch_slots"); alpenglowMode && foldBatch > 0 {
+	if foldBatch := config.GetInt("storage.fold_batch_slots"); foldBatch > 0 {
 		replay.FoldBatchSlots = min(max(foldBatch, 32), 512)
 		if replay.FoldBatchSlots != foldBatch {
 			mlog.Log.Warnf("storage.fold_batch_slots=%d clamped to %d (allowed range 32..512)", foldBatch, replay.FoldBatchSlots)
@@ -2420,8 +2327,8 @@ postBootstrap:
 	accountsDb.MinFreeBytes = storageMinFreeBytes
 	// Rooted storage is append-only: reclamation must run during normal replay.
 	// Large segments reclaim dead payload pages without relocating undo records.
-	compactEnabled := alpenglowMode
-	if alpenglowMode && config.IsSet("storage.compact.enabled") {
+	compactEnabled := true
+	if config.IsSet("storage.compact.enabled") {
 		compactEnabled = config.GetBool("storage.compact.enabled")
 	}
 	compactInterval := time.Second
@@ -2434,7 +2341,7 @@ postBootstrap:
 	// graceful shutdown and is stale after a hard kill) is reconciled against
 	// the in-memory state watermark. Fresh-build paths fall through to the
 	// recovery call here, which is a no-op on a store with no manifests.
-	if alpenglowMode && mithrilState != nil {
+	if mithrilState != nil {
 		if !foldRecovered {
 			foldRecovery = mustRecoverFoldState(accountsDb)
 			foldRecovered = true
@@ -2492,9 +2399,6 @@ postBootstrap:
 	// the verifier halted at). Runs after fold recovery so the boundary set is
 	// authoritative; replay then re-executes forward from the boundary.
 	if rewindToSlot > 0 {
-		if !alpenglowMode {
-			klog.Fatalf("--rewind-to-slot is available only in Alpenglow rooted-durable mode")
-		}
 		if mithrilState == nil {
 			klog.Fatalf("--rewind-to-slot=%d: no state file to reconcile (fresh bootstrap has nothing to rewind)", rewindToSlot)
 		}
@@ -2525,7 +2429,7 @@ postBootstrap:
 	// Rooted-durable resume needs a context at the last rooted slot. The fold
 	// manifest is the primary source (handled above); the state file is the
 	// fallback for stores from before the first fold.
-	if alpenglowMode && mithrilState != nil && mithrilState.LastRootedSlot > 0 {
+	if mithrilState != nil && mithrilState.LastRootedSlot > 0 {
 		if mithrilState.LastRootedContext == nil || mithrilState.LastRootedContext.Slot != mithrilState.LastRootedSlot {
 			ctxSlot := uint64(0)
 			if mithrilState.LastRootedContext != nil {
@@ -2545,40 +2449,36 @@ postBootstrap:
 	// Startup is the one point at which replay/folds are certainly quiescent.
 	// Bound sidecar retention immediately, including after a crash before the
 	// next fold's post-commit cleanup could run.
-	if alpenglowMode {
-		var currentRef *state.TransactionStatusCheckpointRef
-		if mithrilState != nil && mithrilState.LastRootedContext != nil {
-			currentRef = mithrilState.LastRootedContext.TransactionStatusCheckpoint
-		}
-		if removed, gerr := cleanupRetainedTransactionStatusCheckpoints(accountsPath, accountsDb, compactCfg.RewindHorizonBatches, currentRef); gerr != nil {
-			mlog.Log.Warnf("transaction-status checkpoint startup cleanup failed: %v", gerr)
-		} else if len(removed) > 0 {
-			mlog.Log.Infof("transaction-status checkpoint startup cleanup removed %d unreferenced file(s)", len(removed))
-		}
+	var currentRef *state.TransactionStatusCheckpointRef
+	if mithrilState != nil && mithrilState.LastRootedContext != nil {
+		currentRef = mithrilState.LastRootedContext.TransactionStatusCheckpoint
+	}
+	if removed, gerr := cleanupRetainedTransactionStatusCheckpoints(accountsPath, accountsDb, compactCfg.RewindHorizonBatches, currentRef); gerr != nil {
+		mlog.Log.Warnf("transaction-status checkpoint startup cleanup failed: %v", gerr)
+	} else if len(removed) > 0 {
+		mlog.Log.Infof("transaction-status checkpoint startup cleanup removed %d unreferenced file(s)", len(removed))
 	}
 
 	// Fold recovery and an operator rewind can move the durable watermark after
 	// the initial state-file decode above. Rebuild the Alpenglow start position
 	// from the reconciled context so replay never starts from a stale watermark.
-	if alpenglowMode {
-		startSlot = int64(manifest.Bank.Slot + 1)
-		resumeState = nil
-		if mithrilState != nil && mithrilState.LastRootedContext != nil {
-			rs, rerr := replay.ResumeStateFromRootedContext(mithrilState.LastRootedContext, mithrilState.ComputedEpochStakes)
-			if rerr != nil {
-				klog.Fatalf("cannot rebuild reconciled Alpenglow resume state at rooted slot %d: %v", mithrilState.LastRootedContext.Slot, rerr)
-			}
-			resumeState = rs
-			startSlot = int64(mithrilState.LastRootedContext.Slot + 1)
-			mlog.Log.Infof("rooted-durable replay start reconciled to R=%d", mithrilState.LastRootedContext.Slot)
+	startSlot = int64(manifest.Bank.Slot + 1)
+	resumeState = nil
+	if mithrilState != nil && mithrilState.LastRootedContext != nil {
+		rs, rerr := replay.ResumeStateFromRootedContext(mithrilState.LastRootedContext, mithrilState.ComputedEpochStakes)
+		if rerr != nil {
+			klog.Fatalf("cannot rebuild reconciled Alpenglow resume state at rooted slot %d: %v", mithrilState.LastRootedContext.Slot, rerr)
 		}
-		if endSlot != -1 {
-			liveEndSlot = uint64(endSlot)
-		} else if numReplaySlots != 0 {
-			liveEndSlot = uint64(startSlot + numReplaySlots)
-		} else {
-			liveEndSlot = uint64(math.MaxUint64)
-		}
+		resumeState = rs
+		startSlot = int64(mithrilState.LastRootedContext.Slot + 1)
+		mlog.Log.Infof("rooted-durable replay start reconciled to R=%d", mithrilState.LastRootedContext.Slot)
+	}
+	if endSlot != -1 {
+		liveEndSlot = uint64(endSlot)
+	} else if numReplaySlots != 0 {
+		liveEndSlot = uint64(startSlot + numReplaySlots)
+	} else {
+		liveEndSlot = uint64(math.MaxUint64)
 	}
 
 	// Validate the exact local parent bank before opening operational RPC and
@@ -2587,22 +2487,20 @@ postBootstrap:
 	// consensus. In particular, an Alpenglow cluster setting is not evidence that
 	// the snapshot has crossed Alpenglow genesis: the deployed feature and its
 	// consensus metadata must be present in AccountsDB.
-	if alpenglowMode {
-		if startSlot < 1 {
-			klog.Fatalf("Alpenglow replay has invalid start slot %d", startSlot)
-		}
-		parentSlot := uint64(startSlot - 1)
-		if err := replay.ValidateAlpenglowStartupState(accountsDb, parentSlot); err != nil {
-			klog.Fatalf("Alpenglow startup safety check failed: %v", err)
-		}
-		mlog.Log.Infof(
-			"Alpenglow startup safety check passed at parent slot %d (feature=%s alpenclock=%s vote_reward=%s)",
-			parentSlot,
-			features.AlpenglowFeatureGateAddress,
-			replay.NanosecondClockAccountAddr(),
-			replay.VoteRewardAccountAddr(),
-		)
+	if startSlot < 1 {
+		klog.Fatalf("Alpenglow replay has invalid start slot %d", startSlot)
 	}
+	parentSlot := uint64(startSlot - 1)
+	if err := replay.ValidateAlpenglowStartupState(accountsDb, parentSlot); err != nil {
+		klog.Fatalf("Alpenglow startup safety check failed: %v", err)
+	}
+	mlog.Log.Infof(
+		"Alpenglow startup safety check passed at parent slot %d (feature=%s alpenclock=%s vote_reward=%s)",
+		parentSlot,
+		features.AlpenglowFeatureGateAddress,
+		replay.NanosecondClockAccountAddr(),
+		replay.VoteRewardAccountAddr(),
+	)
 
 	// Write replay timings to run-specific log directory
 	replayTimingsPath := filepath.Join(mlog.GetLogDir(), "replay_timings.jsonl")
@@ -2628,76 +2526,69 @@ postBootstrap:
 	} else if rpcPort != 0 {
 		schedule := epochScheduleFromState(mithrilState)
 		rpcServer = rpcserver.NewRpcServer(accountsDb, uint16(rpcPort), schedule, solana.MustHashFromBase58(networkGenesisHash))
-		if alpenglowMode {
-			if schedule == nil || schedule.SlotsPerEpoch == 0 || schedule.SlotsPerEpoch > math.MaxUint64/3 {
-				klog.Fatalf("Alpenglow RPC requires a valid epoch schedule")
-			}
-			if err := rpcServer.EnableEpochRewards(filepath.Join(accountsPath, "rpc-epoch-rewards"), 3*schedule.SlotsPerEpoch, mithrilState.LastRootedSlot); err != nil {
-				klog.Fatalf("unable to load RPC epoch rewards: %v", err)
-			}
+		if schedule == nil || schedule.SlotsPerEpoch == 0 || schedule.SlotsPerEpoch > math.MaxUint64/3 {
+			klog.Fatalf("Alpenglow RPC requires a valid epoch schedule")
+		}
+		if err := rpcServer.EnableEpochRewards(filepath.Join(accountsPath, "rpc-epoch-rewards"), 3*schedule.SlotsPerEpoch, mithrilState.LastRootedSlot); err != nil {
+			klog.Fatalf("unable to load RPC epoch rewards: %v", err)
 		}
 		rpcServer.Start()
 		mlog.Log.Infof("Started RPC server on port %d", rpcPort)
 	}
 
-	// The Alpenglow observer is forkchoice authority in both Alpenglow modes.
-	// Classic clusters deliberately run without a certificate engine and keep
-	// their verifying-only replay semantics.
+	// The Alpenglow observer is forkchoice authority in both consensus modes.
 	var consensusEngine *consensusengine.AlpenglowObserverEngine
-	var alpenglowEpochSchedule *sealevel.SysvarEpochSchedule
-	if alpenglowMode {
-		alpenglowEpochSchedule = epochScheduleFromState(mithrilState)
-		if alpenglowEpochSchedule == nil {
-			klog.Fatalf("Alpenglow consensus requires an epoch schedule in the snapshot/state seed")
-		}
-		consensusEngine, err = consensusengine.NewEngine(consensusengine.Config{
-			AlpenglowObserverBindAddr: alpenglowObserverBindAddr,
-			AlpenglowMaxMessageBytes:  alpenglowMaxMessageBytes,
-			AlpenglowBLSDST:           alpenglowBLSDST,
-			AlpenglowShredVersion:     uint16(turbineShredVersion),
-			AlpenglowIdentity:         validatorIdentity,
-		})
-		if err != nil {
-			klog.Fatalf("unable to create consensus engine: %v", err)
-		}
-		root := alpenglow.BlockID{}
-		if startSlot > 0 {
-			root.Slot = uint64(startSlot - 1)
-		}
-		if resumeState != nil {
-			root.Slot = resumeState.ParentSlot
-			if resumeState.HasParentAlpenglowBlockID {
-				root.Hash = resumeState.ParentAlpenglowBlockID
-			}
-		}
-		// Load the same persisted/manifest stake view replay will use before the
-		// receiver or broadcaster can make an admission decision. This is crucial
-		// on AccountsDB resume, where global epoch stakes are otherwise populated
-		// only inside ReplayBlocks after the network services have started.
-		replayStartEpoch := alpenglowEpochSchedule.GetEpoch(uint64(startSlot))
-		snapshotEpoch := alpenglowEpochSchedule.GetEpoch(mithrilState.ManifestParentSlot)
-		if err := replay.LoadInitialEpochStakesCache(mithrilState, resumeState, replayStartEpoch, snapshotEpoch); err != nil {
-			klog.Fatalf("load Alpenglow epoch stakes before Votor startup: %v", err)
-		}
-		// Publish the lookup and cached VAT/rank sets before opening the QUIC
-		// listener. Otherwise an admitted validator is briefly indistinguishable
-		// from an unstaked TLS peer and every startup connection is rejected.
-		consensusEngine.SetAlpenglowEpochLookup(alpenglowEpochSchedule.GetEpoch)
-		rootEpoch := alpenglowEpochSchedule.GetEpoch(root.Slot)
-		installed, rootInstalled := replay.InstallCachedAlpenglowValidatorSets(consensusEngine, rootEpoch)
-		if !rootInstalled {
-			klog.Fatalf("unable to install the Alpenglow validator set for Votor root slot %d epoch %d before transport startup (installed %d other cached set(s))", root.Slot, rootEpoch, installed)
-		}
-		consensusEngine.SetAlpenglowRoot(root)
-		if err := consensusEngine.Start(ctx); err != nil {
-			klog.Fatalf("unable to start consensus engine %q: %v", consensusEngine.Name(), err)
-		}
-		defer func() {
-			if err := consensusEngine.Close(); err != nil {
-				mlog.Log.Warnf("consensus engine close failed: %v", err)
-			}
-		}()
+	alpenglowEpochSchedule := epochScheduleFromState(mithrilState)
+	if alpenglowEpochSchedule == nil {
+		klog.Fatalf("Alpenglow consensus requires an epoch schedule in the snapshot/state seed")
 	}
+	consensusEngine, err = consensusengine.NewEngine(consensusengine.Config{
+		AlpenglowObserverBindAddr: alpenglowObserverBindAddr,
+		AlpenglowMaxMessageBytes:  alpenglowMaxMessageBytes,
+		AlpenglowBLSDST:           alpenglowBLSDST,
+		AlpenglowShredVersion:     uint16(turbineShredVersion),
+		AlpenglowIdentity:         validatorIdentity,
+	})
+	if err != nil {
+		klog.Fatalf("unable to create consensus engine: %v", err)
+	}
+	root := alpenglow.BlockID{}
+	if startSlot > 0 {
+		root.Slot = uint64(startSlot - 1)
+	}
+	if resumeState != nil {
+		root.Slot = resumeState.ParentSlot
+		if resumeState.HasParentAlpenglowBlockID {
+			root.Hash = resumeState.ParentAlpenglowBlockID
+		}
+	}
+	// Load the same persisted/manifest stake view replay will use before the
+	// receiver or broadcaster can make an admission decision. This is crucial
+	// on AccountsDB resume, where global epoch stakes are otherwise populated
+	// only inside ReplayBlocks after the network services have started.
+	replayStartEpoch := alpenglowEpochSchedule.GetEpoch(uint64(startSlot))
+	snapshotEpoch := alpenglowEpochSchedule.GetEpoch(mithrilState.ManifestParentSlot)
+	if err := replay.LoadInitialEpochStakesCache(mithrilState, resumeState, replayStartEpoch, snapshotEpoch); err != nil {
+		klog.Fatalf("load Alpenglow epoch stakes before Votor startup: %v", err)
+	}
+	// Publish the lookup and cached VAT/rank sets before opening the QUIC
+	// listener. Otherwise an admitted validator is briefly indistinguishable
+	// from an unstaked TLS peer and every startup connection is rejected.
+	consensusEngine.SetAlpenglowEpochLookup(alpenglowEpochSchedule.GetEpoch)
+	rootEpoch := alpenglowEpochSchedule.GetEpoch(root.Slot)
+	installed, rootInstalled := replay.InstallCachedAlpenglowValidatorSets(consensusEngine, rootEpoch)
+	if !rootInstalled {
+		klog.Fatalf("unable to install the Alpenglow validator set for Votor root slot %d epoch %d before transport startup (installed %d other cached set(s))", root.Slot, rootEpoch, installed)
+	}
+	consensusEngine.SetAlpenglowRoot(root)
+	if err := consensusEngine.Start(ctx); err != nil {
+		klog.Fatalf("unable to start consensus engine %q: %v", consensusEngine.Name(), err)
+	}
+	defer func() {
+		if err := consensusEngine.Close(); err != nil {
+			mlog.Log.Warnf("consensus engine close failed: %v", err)
+		}
+	}()
 	var turbineStakesForSlot func(slot uint64) map[solana.PublicKey]uint64
 	if alpenglowEpochSchedule != nil {
 		turbineStakesForSlot = func(slot uint64) map[solana.PublicKey]uint64 {
@@ -3000,21 +2891,16 @@ postBootstrap:
 		}
 	}
 
-	consensusOpts := &replay.ConsensusOpts{
-		Alpenglow: alpenglowMode,
-		Engine:    consensusEngine,
-	}
-	if alpenglowMode {
-		consensusOpts.TransactionStatusCheckpointAfterCommit = func(selected *state.TransactionStatusCheckpointRef) error {
-			removed, err := cleanupRetainedTransactionStatusCheckpoints(
-				accountsPath, accountsDb, compactCfg.RewindHorizonBatches, selected,
-			)
-			if err == nil && len(removed) > 0 {
-				mlog.Log.FileOnlyf("transaction-status checkpoint retention removed %d file(s) outside the %d-batch rewind horizon",
-					len(removed), compactCfg.RewindHorizonBatches)
-			}
-			return err
+	consensusOpts := &replay.ConsensusOpts{Engine: consensusEngine}
+	consensusOpts.TransactionStatusCheckpointAfterCommit = func(selected *state.TransactionStatusCheckpointRef) error {
+		removed, err := cleanupRetainedTransactionStatusCheckpoints(
+			accountsPath, accountsDb, compactCfg.RewindHorizonBatches, selected,
+		)
+		if err == nil && len(removed) > 0 {
+			mlog.Log.FileOnlyf("transaction-status checkpoint retention removed %d file(s) outside the %d-batch rewind horizon",
+				len(removed), compactCfg.RewindHorizonBatches)
 		}
+		return err
 	}
 
 	var slotCtxSetter replay.SlotCtxSetter
@@ -3040,9 +2926,7 @@ postBootstrap:
 	defer stopSpaceGuard()
 
 	turbineAlpenglowAddr := ""
-	if alpenglowMode {
-		turbineAlpenglowAddr = alpenglowAddrForGossip(alpenglowObserverBindAddr)
-	}
+	turbineAlpenglowAddr = alpenglowAddrForGossip(alpenglowObserverBindAddr)
 	// Agave's admin RPC. Started after voting is enabled so the voter's
 	// identity updater is registered before any set-identity can arrive.
 	if blockstorePath != "" {
@@ -3313,6 +3197,11 @@ func printStartupInfo(commandName string) {
 		modeLabel = "validator (voting and block production active)"
 	}
 	fmt.Printf("  Mode:         %s%s%s\n", gold, modeLabel, reset)
+	clusterNote := ""
+	if clusterInfo.Custom {
+		clusterNote = ", custom"
+	}
+	fmt.Printf("  Cluster:      %s%s%s %s(genesis %s%s)%s\n", gold, cluster, reset, dim, shortHash(clusterInfo.GenesisHash), clusterNote, reset)
 
 	// Bootstrap mode with description
 	var bootstrapDesc string
@@ -4474,11 +4363,10 @@ func rewindStoreBelowDivergence(accountsDbPath string, accountsDb *accountsdb.Ac
 // maxForkSwitchRetries bounds fork-aware dump-then-repair re-replays per run.
 const maxForkSwitchRetries = 3
 
-// runReplayWithRecovery wraps replay.ReplayBlocks with panic recovery.
-// It distinguishes between:
-// - Panics during commit (commitInProgress=true): AccountsDB may be corrupted, marks state as corrupted
-// - Panics outside commit (divergence): AccountsDB is safe, logs helpful message
-// After handling, it re-panics to propagate the error.
+// runReplayWithRecovery wraps replay.ReplayBlocks with panic recovery. Replay
+// only buffers slots in the unrooted tail; AccountsDB changes solely through
+// crash-safe folds, so a replay panic never leaves it half-written. The handler
+// logs debug context and re-panics to propagate the error.
 func runReplayWithRecovery(
 	ctx context.Context,
 	accountsDb *accountsdb.AccountsDb,
@@ -4576,24 +4464,7 @@ func runReplayWithRecovery(
 	defer func() {
 		if r := recover(); r != nil {
 			runID := replay.CurrentRunID
-			if replay.IsCommitInProgress() {
-				commitSlot := replay.GetCommitSlot()
-				mlog.Log.Errorf("[run:%s] FATAL: Panic during commit at slot %d - AccountsDB may be corrupted", runID, commitSlot)
-				mlog.Log.Errorf("[run:%s] Panic occurred between StoreAccounts and StoreBankHashForSlot", runID)
-				// Mark state as corrupted so next startup knows to rebuild
-				if mithrilState != nil {
-					reason := fmt.Sprintf("panic during commit at slot %d: %v", commitSlot, r)
-					if err := mithrilState.MarkCorrupted(accountsDbPath, reason); err != nil {
-						mlog.Log.Errorf("[run:%s] Failed to mark state as corrupted: %v", runID, err)
-					} else {
-						// Record corruption in history
-						state.RecordCorrupted(accountsDbPath, mithrilState.LastSlot, mithrilState.LastBankhash, runID, getVersion(), getCommit(), getBranch(), reason)
-					}
-				}
-			} else {
-				mlog.Log.Errorf("[run:%s] Panic during replay (outside commit window) - AccountsDB is SAFE", runID)
-				mlog.Log.Errorf("[run:%s] This appears to be a divergence panic. You can resume from the last persisted slot.", runID)
-			}
+			mlog.Log.Errorf("[run:%s] Panic during replay; AccountsDB changes only through folds and is intact. Resume continues from the last rooted slot.", runID)
 			// Print debug info and paths
 			mlog.Log.Errorf("[run:%s] Debug info:", runID)
 			if mithrilState != nil {
@@ -4617,7 +4488,7 @@ func runReplayWithRecovery(
 	}()
 
 	result = replay.ReplayBlocks(ctx, accountsDb, accountsDbPath, mithrilState, resumeState, startSlot, endSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, turbineShredVersion, turbineAlpenglowAddr, turbineIdentity, blockDir, txParallelism, isLive, useLightbringer, useTurbine, dbgOpts, metricsWriter, rpcServer, blockFetchOpts, consensusOpts, onCancelWriteState)
-	if consensusOpts == nil || !consensusOpts.Alpenglow {
+	if consensusOpts == nil {
 		return result
 	}
 

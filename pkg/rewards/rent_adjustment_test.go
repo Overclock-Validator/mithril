@@ -59,7 +59,7 @@ func TestEpoch1067RentAdjustmentBankHash(t *testing.T) {
 			}))
 			require.NoError(t, spool.Close())
 			updated, _, paid, burned, _ := DistributeStakingRewardsFromSpool(
-				&accountsdb.AccountsDb{RootedDurable: true}, spool.SpoolDir(), spool.Slot(), 0, fixture.Slot,
+				&accountsdb.AccountsDb{}, spool.SpoolDir(), spool.Slot(), 0, fixture.Slot,
 				func(solana.PublicKey) (*accounts.Account, error) { return parent, nil }, nil,
 				StakeRewardDistributionConfig{AdjustDelegationsForRent: adjust, Rent: fixture.Rent, RewardedEpoch: fixture.RewardedEpoch})
 			require.Zero(t, paid)
@@ -119,7 +119,7 @@ func TestDistributeStakingRewardsAdjustsDelegationForRent(t *testing.T) {
 			}))
 			require.NoError(t, spool.Close())
 			updated, parents, distributed, burned, _ := DistributeStakingRewardsFromSpool(
-				&accountsdb.AccountsDb{RootedDurable: true}, spool.SpoolDir(), spool.Slot(), 0, 460944096,
+				&accountsdb.AccountsDb{}, spool.SpoolDir(), spool.Slot(), 0, 460944096,
 				func(pubkey solana.PublicKey) (*accounts.Account, error) {
 					require.Equal(t, key, pubkey)
 					return parent, nil

@@ -67,7 +67,6 @@ type BatchReadStats struct {
 	DurableKeys   uint64
 
 	WorkingSetHits    uint64
-	InProgressHits    uint64
 	PendingFoldHits   uint64
 	CacheHits         uint64
 	IndexHits         uint64
@@ -90,7 +89,6 @@ type BatchReadStats struct {
 	PlaceholderObjects    uint64
 
 	WorkingSetLookupNanoseconds     uint64
-	InProgressNanoseconds           uint64
 	AppendVecPinWaitNanoseconds     uint64
 	ReadCacheEpochWaitNanoseconds   uint64
 	CacheLookupNanoseconds          uint64
@@ -149,9 +147,7 @@ func (db *AccountsDb) getAccountsBatchWithStats(ctx context.Context, slot uint64
 		}
 	}()
 
-	phaseStart = time.Now()
-	out := db.getStoreInProgressAccounts(pks)
-	stats.InProgressNanoseconds = uint64(time.Since(phaseStart).Nanoseconds())
+	out := make([]*accounts.Account, len(pks))
 	cold := make([]int, 0, len(pks))
 	var indexSnapshot *pebble.Snapshot
 	var cacheEpoch uint64
@@ -164,10 +160,6 @@ func (db *AccountsDb) getAccountsBatchWithStats(ctx context.Context, slot uint64
 	cacheEpoch = db.readCacheEpoch
 	admission = db.commonAdmission
 	for i, pk := range pks {
-		if out[i] != nil {
-			stats.InProgressHits++
-			continue
-		}
 		if acct, ok, pending := db.getCachedAccountLocked(pk); ok {
 			if pending {
 				stats.PendingFoldHits++

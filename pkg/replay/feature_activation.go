@@ -76,12 +76,6 @@ func scanAndEnableFeatures(acctsDb *accountsdb.AccountsDb, replayCtx *ReplayCtx,
 		}
 	}
 
-	if len(modifiedAccts) != 0 {
-		if err := acctsDb.StoreAccounts(modifiedAccts, slot, nil); err != nil {
-			panic(err)
-		}
-	}
-
 	for _, featureAcct := range modifiedAccts {
 		if f.IsActive(features.DeprecateRentExemptionThreshold) && featureAcct.Key == features.DeprecateRentExemptionThreshold.Address {
 			modifiedRentAcct, parentRentAcct, err := applyDeprecateRentExemptionThresholdActivation(acctsDb, slot)
@@ -133,9 +127,6 @@ func applyDeprecateRentExemptionThresholdActivation(acctsDb *accountsdb.Accounts
 
 	newRentSysvarBytes := rentSysvar.MustMarshal()
 	copy(rentAcct.Data, newRentSysvarBytes)
-	if err := acctsDb.StoreAccounts([]*accounts.Account{rentAcct}, slot, nil); err != nil {
-		return nil, nil, err
-	}
 
 	sealevel.SysvarCache.Rent.Sysvar = &rentSysvar
 	sealevel.SysvarCache.Rent.Acct = rentAcct
@@ -507,10 +498,6 @@ func applyReplaceSplTokenWithPTokenActivation(
 
 	acctsDb.RemoveProgramFromCache(splTokenProgramID)
 
-	if err := acctsDb.StoreAccounts(migration.modifiedAccts, slot, nil); err != nil {
-		return nil, nil, err
-	}
-
 	return migration.modifiedAccts, migration.parentAccts, nil
 }
 
@@ -564,10 +551,6 @@ func applyUpgradeBpfStakeProgramToV5Activation(
 	}
 
 	acctsDb.RemoveProgramFromCache(programDataAddress)
-
-	if err := acctsDb.StoreAccounts(migration.modifiedAccts, slot, nil); err != nil {
-		return nil, nil, err
-	}
 
 	return migration.modifiedAccts, migration.parentAccts, nil
 }
