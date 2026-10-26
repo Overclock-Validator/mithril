@@ -2,7 +2,6 @@ package alpenglow
 
 import (
 	"context"
-	"crypto/ed25519"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -11,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/gagliardetto/solana-go"
 	"github.com/quic-go/quic-go"
@@ -31,7 +31,9 @@ type VotorPeer struct {
 type VotorPeerSource func() []VotorPeer
 
 type VotorBroadcasterConfig struct {
-	Identity     ed25519.PrivateKey
+	// Identity authenticates outbound connections. A set-identity swap
+	// replaces the client certificate and drops every outbound connection.
+	Identity     *identity.Holder
 	ShredVersion uint16
 	Peers        VotorPeerSource
 	QueueSize    int
@@ -79,6 +81,8 @@ type votorDial struct {
 type VotorBroadcaster struct {
 	shredVersion          uint16
 	peers                 VotorPeerSource
+	certs                 *identity.Derived[tls.Certificate]
+	unregisterKey         func()
 	tlsConfig             *tls.Config
 	quicConfig            *quic.Config
 	ctx                   context.Context
@@ -114,7 +118,7 @@ type VotorBroadcaster struct {
 }
 
 func NewVotorBroadcaster(cfg VotorBroadcasterConfig) (*VotorBroadcaster, error) {
-	if len(cfg.Identity) != ed25519.PrivateKeySize {
+	if cfg.Identity == nil {
 		return nil, fmt.Errorf("Votor broadcaster: validator identity is required")
 	}
 	if cfg.Peers == nil {
@@ -126,7 +130,7 @@ func NewVotorBroadcaster(cfg VotorBroadcasterConfig) (*VotorBroadcaster, error) 
 	if cfg.Workers <= 0 {
 		cfg.Workers = defaultVotorConnectWorkers
 	}
-	certificate, err := newVotorQUICCertificate(cfg.Identity)
+	certs, err := newVotorQUICCertificates(cfg.Identity)
 	if err != nil {
 		return nil, fmt.Errorf("Votor broadcaster certificate: %w", err)
 	}
@@ -134,8 +138,8 @@ func NewVotorBroadcaster(cfg VotorBroadcasterConfig) (*VotorBroadcaster, error) 
 	b := &VotorBroadcaster{
 		shredVersion: cfg.ShredVersion,
 		peers:        cfg.Peers,
+		certs:        certs,
 		tlsConfig: &tls.Config{
-			Certificates:       []tls.Certificate{certificate},
 			NextProtos:         []string{VotorQUICALPN},
 			MinVersion:         tls.VersionTLS13,
 			InsecureSkipVerify: true, // The validator SPKI is checked explicitly after the handshake.
@@ -160,7 +164,33 @@ func NewVotorBroadcaster(cfg VotorBroadcasterConfig) (*VotorBroadcaster, error) 
 	// returning. Consensus messages therefore never drive peer discovery.
 	b.reconcilePeers()
 	go b.peerReconcileLoop()
+	b.unregisterKey = cfg.Identity.RegisterUpdater("Votor broadcaster", b.UpdateKey)
 	return b, nil
+}
+
+// UpdateKey mirrors Agave's Votor KeyUpdateNotifier: once it returns, new
+// dials present next and no outbound connection authenticated with another
+// identity remains. Dropped peers reconnect through the normal connect queue.
+func (b *VotorBroadcaster) UpdateKey(next *identity.Keypair) error {
+	if err := b.certs.Refresh(next); err != nil {
+		return err
+	}
+	b.connMu.Lock()
+	stale := make([]*quic.Conn, 0, len(b.conns))
+	for peer, existing := range b.conns {
+		stale = append(stale, existing.conn)
+		delete(b.conns, peer)
+	}
+	if !b.closed.Load() {
+		for peer := range b.desired {
+			b.queueConnectLocked(peer)
+		}
+	}
+	b.connMu.Unlock()
+	for _, conn := range stale {
+		_ = conn.CloseWithError(0, "Votor identity changed")
+	}
+	return nil
 }
 
 // Enqueue broadcasts a vote or certificate to every currently desired Votor
@@ -409,7 +439,10 @@ func (b *VotorBroadcaster) connection(peer VotorPeer) (*quic.Conn, error) {
 	}
 
 	b.connectionAttempts.Add(1)
-	conn, err := quic.DialAddr(ctx, addr, b.tlsConfig.Clone(), b.quicConfig.Clone())
+	tlsConfig := b.tlsConfig.Clone()
+	dialIdentity := b.certs.Keypair()
+	tlsConfig.Certificates = []tls.Certificate{b.certs.Get()}
+	conn, err := quic.DialAddr(ctx, addr, tlsConfig, b.quicConfig.Clone())
 	if err != nil {
 		return nil, fmt.Errorf("connect Votor peer %s (%s): %w", peer.Identity, peer.Addr, err)
 	}
@@ -436,6 +469,13 @@ func (b *VotorBroadcaster) connection(peer VotorPeer) (*quic.Conn, error) {
 		b.connMu.Unlock()
 		_ = conn.CloseWithError(0, "Votor broadcaster closed")
 		return nil, fmt.Errorf("Votor broadcaster is closed")
+	}
+	if b.certs.Keypair() != dialIdentity {
+		// UpdateKey ran during the handshake; this connection carries the
+		// replaced identity.
+		b.connMu.Unlock()
+		_ = conn.CloseWithError(0, "Votor identity changed")
+		return nil, fmt.Errorf("connect Votor peer %s (%s): local identity changed during handshake", peer.Identity, peer.Addr)
 	}
 	current, desired := b.desired[peer.Identity]
 	if !desired || current.Addr.String() != addr {
@@ -522,6 +562,9 @@ func (b *VotorBroadcaster) Close() error {
 		return nil
 	}
 	b.closeOnce.Do(func() {
+		if b.unregisterKey != nil {
+			b.unregisterKey()
+		}
 		b.closed.Store(true)
 		b.cancel()
 		close(b.done)

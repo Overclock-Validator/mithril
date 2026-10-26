@@ -2,7 +2,6 @@ package replay
 
 import (
 	"context"
-	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -11,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -32,6 +32,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/fees"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/lthash"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
@@ -111,6 +112,8 @@ type BlockFetchOpts struct {
 	TurbineRootSlot      func() uint64
 	TurbineUseChaCha8    bool
 	TurbineDedupAddrs    bool
+	// TurbineShredReceivers get a copy of every shred this node relays.
+	TurbineShredReceivers []*net.UDPAddr
 }
 
 var SerializedParameterArena *arena.Arena[byte]
@@ -133,17 +136,6 @@ func GenerateRunID() string {
 		return fmt.Sprintf("%08x", time.Now().UnixNano()&0xFFFFFFFF)
 	}
 	return hex.EncodeToString(b)
-}
-
-func identityFromTurbineKey(priv ed25519.PrivateKey) solana.PublicKey {
-	if len(priv) != ed25519.PrivateKeySize {
-		return solana.PublicKey{}
-	}
-	pub, ok := priv.Public().(ed25519.PublicKey)
-	if !ok {
-		return solana.PublicKey{}
-	}
-	return solana.PublicKeyFromBytes(pub)
 }
 
 // IsCommitInProgress returns true if we're in the critical commit window.
@@ -1761,7 +1753,7 @@ func ReplayBlocks(
 	turbineAdvertisedIP string,
 	turbineShredVersion uint16,
 	turbineAlpenglowAddr string,
-	turbineIdentity ed25519.PrivateKey,
+	turbineIdentity *identity.Holder,
 	blockDir string,
 	txParallelism int,
 	isLive bool,
@@ -1810,7 +1802,7 @@ func ReplayBlocks(
 	}
 	// Fresh vote/stake dirty watermark for this run (gates the in-loop unwind).
 	resetVoteStakeDirty()
-	nextLeader := newNextLeaderCursor(identityFromTurbineKey(turbineIdentity))
+	nextLeader := newNextLeaderCursor(turbineIdentity)
 	// Create bankhash log file
 	bankhashLogPath := fmt.Sprintf("%s/bankhash.log", acctsDbPath)
 	bankhashLogFile, bankhashLogErr := os.OpenFile(bankhashLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -2556,6 +2548,7 @@ func ReplayBlocks(
 		opts.TurbineRootSlot = blockFetchOpts.TurbineRootSlot
 		opts.TurbineUseChaCha8 = blockFetchOpts.TurbineUseChaCha8
 		opts.TurbineDedupAddrs = blockFetchOpts.TurbineDedupAddrs
+		opts.TurbineShredReceivers = blockFetchOpts.TurbineShredReceivers
 
 		// Mode thresholds
 		opts.NearTipThreshold = blockFetchOpts.NearTipThreshold
@@ -3315,7 +3308,7 @@ func ReplayBlocks(
 
 		// post-epoch boundary rewards distribution
 		if partitionedEpochRewardsEnabled && partitionedRewardsInfo != nil && currentSlot >= partitionedRewardsInfo.FirstStakingRewardSlot && partitionedRewardsInfo.NumRewardPartitionsRemaining > 0 {
-			distributedAccts, parentDistributedAccts, stakeCommissions := distributePartitionedEpochRewardsForSlot(acctsDb, lastSlotCtx, block.EpochUpdatedAccts, replayCtx, partitionedRewardsInfo, currentSlot, block.BlockHeight)
+			distributedAccts, parentDistributedAccts, stakeCommissions := distributePartitionedEpochRewardsForSlot(acctsDb, lastSlotCtx, block.EpochUpdatedAccts, replayCtx, partitionedRewardsInfo, currentSlot, block.BlockHeight, block.Epoch)
 			if err := replaceInflationRewardRecords(block, distributedAccts, parentDistributedAccts, rpc.RewardTypeStaking, stakeCommissions); err != nil {
 				result.Error = err
 				mlog.Log.Errorf("%v", err)
@@ -4086,7 +4079,7 @@ func newSlotCtx(block *b.Block, accts accounts.Accounts, parentAccts accounts.Ac
 	}
 	// Guard: a nil *unrootedTail stored in the AccountReader interface would be a
 	// non-nil typed-nil and break the nil check in GetAccountFromAccountsDb.
-	if tail != nil {
+	if tail := normalizeUnrootedState(tail); tail != nil {
 		slotCtx.UnrootedRead = tail
 	}
 

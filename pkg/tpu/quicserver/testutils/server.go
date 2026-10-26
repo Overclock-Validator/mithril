@@ -6,8 +6,6 @@ package testutils
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
 	"flag"
 	"fmt"
 	"net"
@@ -18,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/tpu"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/pipeline"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/quicserver"
@@ -78,7 +77,7 @@ func RunServer(ctx context.Context, opts ServerOptions) error {
 		return fmt.Errorf("parse listen address: %w", err)
 	}
 
-	_, identity, err := ed25519.GenerateKey(rand.Reader)
+	holder, err := identity.NewEphemeralHolder()
 	if err != nil {
 		return fmt.Errorf("generate server identity: %w", err)
 	}
@@ -86,7 +85,7 @@ func RunServer(ctx context.Context, opts ServerOptions) error {
 	tpuCfg := tpu.Config{
 		Name:       "testutils-tpu",
 		ListenAddr: udpAddr.String(),
-		Identity:   identity,
+		Identity:   holder,
 		QUIC:       opts.Config,
 		Pipeline:   opts.Pipeline,
 	}

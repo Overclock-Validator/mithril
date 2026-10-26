@@ -54,7 +54,8 @@ func TestAdoptLocalLeaderBlockUsesProducerSlotCtx(t *testing.T) {
 
 	block := &b.Block{Slot: 20, ParentSlot: 19, FromLocalProduction: true}
 	persisted := &persistedTracker{}
-	got, err := adoptLocalLeaderBlock(block, nil, NewTransactionStatusCache(), persisted)
+	var tail *unrootedTail // classic replay passes a typed nil through the interface
+	got, err := adoptLocalLeaderBlock(block, tail, NewTransactionStatusCache(), persisted)
 	require.NoError(t, err)
 	require.Same(t, slotCtx, got)
 

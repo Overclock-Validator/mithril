@@ -862,8 +862,10 @@ func verifyBLSSignature(pubkey bls12381.G1Affine, payload []byte, signature bls1
 }
 
 func aggregateVerificationTerm(set ValidatorSet, ranks []bool, payload []byte) (blsVerifyTerm, bool, error) {
-	var aggregate bls12381.G1Affine
-	aggregate.SetInfinity()
+	// Accumulate in Jacobian coordinates and convert once: an affine Add per
+	// signer pays a field inversion each time. Same group element, and affine
+	// coordinates are unique (TestJacobianAggregationMatchesAffine).
+	var acc bls12381.G1Jac
 	var signerCount int
 	for rank, included := range ranks {
 		if !included {
@@ -876,12 +878,14 @@ func aggregateVerificationTerm(set ValidatorSet, ranks []bool, payload []byte) (
 		if err != nil {
 			return blsVerifyTerm{}, false, fmt.Errorf("alpenglow verifier: invalid BLS pubkey at rank %d: %w", rank, err)
 		}
-		aggregate.Add(&aggregate, &pubkey)
+		acc.AddMixed(&pubkey)
 		signerCount++
 	}
 	if signerCount == 0 {
 		return blsVerifyTerm{}, false, nil
 	}
+	var aggregate bls12381.G1Affine
+	aggregate.FromJacobian(&acc)
 	message, err := bls12381.HashToG2(payload, []byte(blsHashToPointDST))
 	if err != nil {
 		return blsVerifyTerm{}, false, fmt.Errorf("alpenglow verifier: hash vote payload to BLS G2: %w", err)

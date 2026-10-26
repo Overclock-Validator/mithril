@@ -2,8 +2,6 @@ package bench
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
 	"fmt"
 	"net"
 	"os"
@@ -11,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/packet"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/quicserver"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/quicserver/testutils"
@@ -79,7 +78,7 @@ func RunQUIC(ctx context.Context, opts QUICOptions) (Result, error) {
 	}
 	defer udpConn.Close()
 
-	_, identity, err := ed25519.GenerateKey(rand.Reader)
+	holder, err := identity.NewEphemeralHolder()
 	if err != nil {
 		return Result{}, fmt.Errorf("generate identity: %w", err)
 	}
@@ -94,7 +93,7 @@ func RunQUIC(ctx context.Context, opts QUICOptions) (Result, error) {
 		ctx,
 		"bench-tpu-quic",
 		[]quicserver.QuicSocket{quicserver.QuicSocketFromUDP(udpConn)},
-		identity,
+		holder,
 		cfg,
 	)
 	if err != nil {

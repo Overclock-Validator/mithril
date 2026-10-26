@@ -2,7 +2,6 @@ package alpenglow
 
 import (
 	"context"
-	"crypto/ed25519"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -10,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/gagliardetto/solana-go"
 	"github.com/quic-go/quic-go"
@@ -33,8 +33,9 @@ type ReceiverConfig struct {
 	ShredVersion    uint16
 	// Identity binds the QUIC certificate's Ed25519 public key to the validator
 	// identity, allowing Agave's staked A2A admission to recognize this node.
-	// Empty retains an ephemeral certificate for passive observer mode.
-	Identity              ed25519.PrivateKey
+	// The certificate follows set-identity swaps for new connections. Nil
+	// retains an ephemeral certificate for passive observer mode.
+	Identity              *identity.Holder
 	Decode                DecodeOptions
 	LogInterval           time.Duration
 	MaxConnections        int
@@ -88,6 +89,8 @@ type Receiver struct {
 	cfg      ReceiverConfig
 	observer *Observer
 	listener *quic.Listener
+	// unregisterKey removes the certificate updater from the identity holder.
+	unregisterKey func()
 
 	mu          sync.Mutex
 	closed      bool
@@ -108,28 +111,39 @@ func NewReceiver(cfg ReceiverConfig, observer *Observer) (*Receiver, error) {
 		observer = NewObserver()
 	}
 
-	cert, err := newVotorQUICCertificate(cfg.Identity)
+	holder, err := identity.HolderOrEphemeral(cfg.Identity)
+	if err != nil {
+		return nil, fmt.Errorf("Alpenglow Votor QUIC identity: %w", err)
+	}
+	certs, err := newVotorQUICCertificates(holder)
 	if err != nil {
 		return nil, fmt.Errorf("create Alpenglow Votor QUIC certificate: %w", err)
 	}
 
 	listener, err := quic.ListenAddr(cfg.BindAddr, &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		ClientAuth:   tls.RequireAnyClientCert,
-		NextProtos:   []string{VotorQUICALPN},
-		MinVersion:   tls.VersionTLS13,
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			cert := certs.Get()
+			return &cert, nil
+		},
+		ClientAuth: tls.RequireAnyClientCert,
+		NextProtos: []string{VotorQUICALPN},
+		MinVersion: tls.VersionTLS13,
 	}, newVotorQUICConfig())
 	if err != nil {
 		return nil, fmt.Errorf("listen for Alpenglow Votor QUIC on %s: %w", cfg.BindAddr, err)
 	}
 
+	// New connections present the swapped identity once the updater returns;
+	// accepted connections keep the identity they authenticated with.
+	unregisterKey := holder.RegisterUpdater("Votor receiver", certs.Refresh)
 	return &Receiver{
-		cfg:         cfg,
-		observer:    observer,
-		listener:    listener,
-		conns:       make(map[*quic.Conn]receiverConnection),
-		connsByIP:   make(map[string]int),
-		connsByPeer: make(map[solana.PublicKey]int),
+		cfg:           cfg,
+		observer:      observer,
+		listener:      listener,
+		unregisterKey: unregisterKey,
+		conns:         make(map[*quic.Conn]receiverConnection),
+		connsByIP:     make(map[string]int),
+		connsByPeer:   make(map[solana.PublicKey]int),
 	}, nil
 }
 
@@ -191,6 +205,9 @@ func (r *Receiver) Close() error {
 		return nil
 	}
 	r.closed = true
+	if r.unregisterKey != nil {
+		r.unregisterKey()
+	}
 	listener := r.listener
 	conns := make([]*quic.Conn, 0, len(r.conns))
 	for conn := range r.conns {
