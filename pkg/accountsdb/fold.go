@@ -121,6 +121,10 @@ func (db *AccountsDb) CommitBatch(
 	db.foldMu.Lock()
 	defer db.foldMu.Unlock()
 
+	if db.rewindPending {
+		return BatchCommitResult{}, fmt.Errorf("accountsdb: pending rewind state must be persisted before folding")
+	}
+
 	// (1) Union-dedupe, newest wins. Deltas MUST arrive strictly ascending by
 	// slot: newest-wins depends on iterating in order so a later slot's version
 	// overwrites an earlier one. Validate it so a future fork-aware caller can

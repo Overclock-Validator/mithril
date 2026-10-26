@@ -147,6 +147,7 @@ func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte)
 }
 
 type compactionTestHooks struct {
+	afterHistoryFloor func()
 	afterSparseMarker func()
 	afterSparsePunch  func()
 }

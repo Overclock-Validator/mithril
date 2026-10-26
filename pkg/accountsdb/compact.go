@@ -123,6 +123,10 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 	db.foldMu.Lock()
 	defer db.foldMu.Unlock()
 
+	if db.rewindPending {
+		return stats, fmt.Errorf("accountsdb: pending rewind state must be persisted before compaction")
+	}
+
 	meta, _, err := db.readFoldMeta()
 	if err != nil {
 		return stats, err
@@ -139,6 +143,30 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 	if err != nil {
 		return stats, err
 	}
+
+	floor, err := db.compactionHistoryFloor(meta.BatchSeq, cfg.RewindHorizonBatches)
+	if err != nil {
+		return stats, err
+	}
+	if floor > 0 {
+		var boundary foldMeta
+		for _, h := range manifestByFileId {
+			if h.Kind == ManifestKindFold && h.BatchSeq == floor {
+				if boundary.BatchSeq != 0 {
+					return stats, fmt.Errorf("ambiguous compaction history boundary %d", floor)
+				}
+				boundary = foldMeta{BatchSeq: h.BatchSeq, ThroughSlot: h.ThroughSlot, FileId: h.FileId}
+			}
+		}
+		if boundary.BatchSeq == 0 {
+			return stats, fmt.Errorf("missing compaction history boundary %d", floor)
+		}
+		if err := db.persistCompactionHistoryFloor(boundary); err != nil {
+			return stats, err
+		}
+	}
+
+	fire(db.compactHooks.afterHistoryFloor)
 
 	// Retiring a fold manifest (even a fully-dead file) requires its index
 	// frontier to survive a crash. WAL-off folds otherwise rely on that redo log.
@@ -340,9 +368,17 @@ type compactionPins struct {
 // head-horizon), and parked ".rewound" segments and undo targets. Other undo
 // targets pin individual records, allowing sparse reclamation without relocation.
 func (db *AccountsDb) compactionPinSet(headSeq, horizon uint64) (*compactionPins, map[uint64]ManifestHeader, error) {
-	horizonFloor := uint64(0)
-	if headSeq > horizon {
-		horizonFloor = headSeq - horizon
+	horizonFloor, err := db.compactionHistoryFloor(headSeq, horizon)
+	if err != nil {
+		return nil, nil, err
+	}
+	retained, err := db.readCompactionHistoryFloor()
+	if err != nil {
+		return nil, nil, err
+	}
+	validationFloor := horizonFloor
+	if retained.BatchSeq != 0 {
+		validationFloor = retained.BatchSeq
 	}
 	pinned := &compactionPins{whole: make(map[uint64]struct{}), records: make(map[uint64]map[uint64][32]byte)}
 	manifestByFileId := make(map[uint64]ManifestHeader)
@@ -381,13 +417,18 @@ func (db *AccountsDb) compactionPinSet(headSeq, horizon uint64) (*compactionPins
 			continue
 		}
 		// Keep the target boundary itself as well as all undoable batches.
-		if parked || hdr.BatchSeq >= horizonFloor {
+		if parked || hdr.BatchSeq >= validationFloor {
 			retainedSeqs[hdr.BatchSeq] = true
-			pinned.whole[hdr.FileId] = struct{}{}
 			m, merr := ReadSegmentManifest(path)
 			if merr != nil {
 				return nil, nil, fmt.Errorf("cannot establish rewind pins from %s: %w", name, merr)
 			}
+			// Validate the previously promised range before expiring more history.
+			// A new head must not silently age out a missing/corrupt retained fold.
+			if !parked && hdr.BatchSeq < horizonFloor {
+				continue
+			}
+			pinned.whole[hdr.FileId] = struct{}{}
 			if !parked && hdr.BatchSeq == horizonFloor {
 				continue // boundary's own undo pointers are outside the horizon
 			}
@@ -410,7 +451,7 @@ func (db *AccountsDb) compactionPinSet(headSeq, horizon uint64) (*compactionPins
 	}
 	// Never interpret a missing/corrupted in-horizon fold as an empty undo log.
 	// In particular a damaged header must not silently age itself out of pins.
-	for seq := max(uint64(1), horizonFloor); seq <= headSeq && seq != 0; seq++ {
+	for seq := max(uint64(1), validationFloor); seq <= headSeq && seq != 0; seq++ {
 		if !retainedSeqs[seq] {
 			return nil, nil, fmt.Errorf("cannot establish rewind pins: missing fold manifest seq %d", seq)
 		}

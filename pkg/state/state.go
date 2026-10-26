@@ -371,12 +371,17 @@ func (s *MithrilState) Save(accountsDbDir string) error {
 		return fmt.Errorf("failed to rename state file: %w", err)
 	}
 	// Make the rename itself durable.
-	if dir, err := os.Open(accountsDbDir); err == nil {
-		syncErr := dir.Sync()
-		dir.Close()
-		if syncErr != nil {
-			return fmt.Errorf("failed to fsync state directory: %w", syncErr)
-		}
+	dir, err := os.Open(accountsDbDir)
+	if err != nil {
+		return fmt.Errorf("failed to open state directory for fsync: %w", err)
+	}
+	syncErr := dir.Sync()
+	closeErr := dir.Close()
+	if syncErr != nil {
+		return fmt.Errorf("failed to fsync state directory: %w", syncErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("failed to close state directory: %w", closeErr)
 	}
 
 	return nil

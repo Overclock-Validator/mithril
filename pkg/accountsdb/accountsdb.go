@@ -84,6 +84,8 @@ type AccountsDb struct {
 	compactLastScan  map[uint64]uint64 // oldest scan first; a growing directory must not postpone cursor wrap forever
 	compactCycles    uint64            // periodically serve bootstrap and mostly-empty sparse files too
 	compactHooks     compactionTestHooks
+	rewindPending    bool // guarded by foldMu until lowered state is saved
+	rewindHooks      rewindTestHooks
 
 	// A list of store requests. They are added to the back as they arrive and
 	// removed from the front as they are persisted.

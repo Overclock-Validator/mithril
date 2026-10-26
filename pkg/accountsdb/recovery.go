@@ -30,7 +30,8 @@ type RecoveryResult struct {
 	// OrphansRemoved lists files deleted as undecided leftovers (segments
 	// without a durable manifest, tmp manifests, torn manifests).
 	OrphansRemoved []string
-	// RewindInProgress is true when parked ".rewound" manifests remain — a
+	// RewindInProgress is true when a durable rewind intent or parked
+	// ".rewound" manifests remain — a
 	// RewindToBatchBoundary was interrupted. The store may already sit at the
 	// rewound boundary (index meta rolled back) while the state file still names
 	// the pre-rewind slot; the caller adopts the store's boundary rather than
@@ -59,6 +60,19 @@ func (db *AccountsDb) RecoverFoldState() (RecoveryResult, error) {
 	meta, haveMeta, err := db.readFoldMeta()
 	if err != nil {
 		return res, err
+	}
+
+	// An explicit intent takes precedence over forward recovery and orphan GC.
+	// At a partial parking boundary, the remaining suffix is still needed to undo.
+	intent, err := db.readRewindIntentLocked()
+	if err != nil {
+		return res, err
+	}
+	if intent != nil {
+		db.rewindPending = true
+		res.DurableThrough, res.BatchSeq = meta.ThroughSlot, meta.BatchSeq
+		res.RewindInProgress = true
+		return res, nil
 	}
 
 	headers, err := ListFoldManifests(db.AcctsDir)
