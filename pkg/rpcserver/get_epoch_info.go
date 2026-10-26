@@ -63,15 +63,14 @@ func (rpcServer *RpcServer) GetEpochInfo(ctx context.Context, p jsonrpc.RawParam
 	if minContextSlot != nil && slot < *minContextSlot {
 		return GetEpochInfoResp{}, &MinContextSlotNotReachedError{ContextSlot: slot}
 	}
-	epoch := rpcServer.epochSchedule.GetEpoch(slot)
-	slotIndex := slot - rpcServer.epochSchedule.FirstSlotInEpoch(epoch)
+	epoch, slotIndex := rpcServer.epochSchedule.GetEpochAndSlotIndex(slot)
 
 	resp := GetEpochInfoResp{
 		AbsoluteSlot:     slot,
 		BlockHeight:      blockHeight,
 		Epoch:            epoch,
 		SlotIndex:        slotIndex,
-		SlotsInEpoch:     432000,
+		SlotsInEpoch:     rpcServer.epochSchedule.SlotsInEpoch(epoch),
 		TransactionCount: transactionCount,
 	}
 
