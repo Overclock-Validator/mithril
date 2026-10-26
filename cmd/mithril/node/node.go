@@ -2511,12 +2511,11 @@ postBootstrap:
 			klog.Fatalf("--rewind-to-slot=%d is not a checkpoint-valid retained fold boundary\navailable checkpoint-valid fold boundaries: %s",
 				rewindToSlot, formatRewindPoints(validPoints))
 		}
-		res, rerr := accountsDb.RewindToBatchBoundary(uint64(rewindToSlot))
+		res, rerr := accountsDb.RewindToBatchBoundaryAndPersist(uint64(rewindToSlot), func(res accountsdb.RewindResult) error {
+			return persistRewindResult(accountsPath, mithrilState, res)
+		})
 		if rerr != nil {
 			klog.Fatalf("--rewind-to-slot=%d failed: %v\navailable checkpoint-valid fold boundaries: %s", rewindToSlot, rerr, formatRewindPoints(validPoints))
-		}
-		if err := adoptRewindResult(accountsPath, mithrilState, res); err != nil {
-			klog.Fatalf("--rewind-to-slot=%d: %v; re-bootstrap with --bootstrap snapshot", rewindToSlot, err)
 		}
 		mlog.Log.Warnf("rewound durable state to fold boundary at slot %d (%d batches / %d keys undone); replay resumes from slot %d",
 			res.NewThrough, res.UndoneBatches, res.UndoneKeys, mithrilState.GetResumeSlot())
@@ -3006,9 +3005,11 @@ postBootstrap:
 	}
 	if alpenglowMode {
 		consensusOpts.TransactionStatusCheckpointAfterCommit = func(selected *state.TransactionStatusCheckpointRef) error {
+			run := transactionStatusCleanupTask.Start()
 			removed, err := cleanupRetainedTransactionStatusCheckpoints(
 				accountsPath, accountsDb, compactCfg.RewindHorizonBatches, selected,
 			)
+			run.EndErr(err, func() string { return fmt.Sprintf("removed %d file(s)", len(removed)) })
 			if err == nil && len(removed) > 0 {
 				mlog.Log.FileOnlyf("transaction-status checkpoint retention removed %d file(s) outside the %d-batch rewind horizon",
 					len(removed), compactCfg.RewindHorizonBatches)
@@ -4291,7 +4292,7 @@ func retainedTransactionStatusCheckpointRefs(accountsDb *accountsdb.AccountsDb, 
 		}
 	}
 
-	headers, err := accountsdb.ListFoldManifests(accountsDb.AcctsDir)
+	headers, parkedPaths, err := accountsdb.ListFoldAndParkedManifests(accountsDb.AcctsDir)
 	if err != nil {
 		return nil, fmt.Errorf("list retained fold manifests: %w", err)
 	}
@@ -4316,15 +4317,7 @@ func retainedTransactionStatusCheckpointRefs(accountsDb *accountsdb.AccountsDb, 
 	// Parked manifests remain in the AccountsDB segment directory only while a
 	// rewind is incomplete. Completed forensic manifests live under rewound/
 	// and are no longer actionable, so they do not pin sidecars forever.
-	entries, err := os.ReadDir(accountsDb.AcctsDir)
-	if err != nil {
-		return nil, fmt.Errorf("scan parked fold manifests: %w", err)
-	}
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".manifest.rewound") {
-			continue
-		}
-		path := filepath.Join(accountsDb.AcctsDir, entry.Name())
+	for _, path := range parkedPaths {
 		manifest, err := accountsdb.ReadSegmentManifest(path)
 		if err != nil {
 			return nil, fmt.Errorf("read parked fold manifest %s: %w", path, err)
@@ -4384,32 +4377,58 @@ func adoptRewindResult(accountsDbPath string, s *state.MithrilState, res account
 	return nil
 }
 
-// completeInterruptedRewind finishes a rewind that crashed mid-flight (parked
-// ".rewound" manifests remain). It rewinds to the highest retained boundary
-// below the parked suffix — RewindToBatchBoundary is idempotent, so this works
-// whether the crash landed before the meta rollback (does the full rewind now)
-// or after it (a no-op that just finalizes the leftovers) — and adopts that
-// boundary as the rooted checkpoint. Fatals only when nothing is left to finish
-// the rewind with.
+// Persist a copy first so a failed save cannot publish a usable in-memory
+// checkpoint. The AccountsDB intent remains until this durable save succeeds.
+func persistRewindResult(path string, s *state.MithrilState, res accountsdb.RewindResult) error {
+	next := *s
+	if err := adoptRewindResult(path, &next, res); err != nil {
+		return err
+	}
+	if err := next.Save(path); err != nil {
+		return fmt.Errorf("persist rewound state: %w", err)
+	}
+	*s = next
+	return nil
+}
+
+// completeInterruptedRewind completes an exact durable intent first. Legacy
+// parked suffixes without an intent use the highest retained non-parked boundary.
+// Both paths save the lowered checkpoint before allowing forward replay.
 func completeInterruptedRewind(accountsDbPath string, accountsDb *accountsdb.AccountsDb, mithrilState *state.MithrilState) {
 	points, err := accountsDb.ListRewindPoints()
 	if err != nil || len(points) == 0 {
 		klog.Fatalf("interrupted rewind detected but no retained fold boundary remains to complete it; re-bootstrap with --bootstrap snapshot")
 	}
-	// The rewind parks every batch above its target, so the highest still-present
-	// (non-parked) boundary IS the target.
+	// A new intent fixes the target even before the first manifest is parked.
+	// Only legacy interruptions infer it from the remaining boundaries.
+	target, intentErr := accountsDb.PendingRewindTarget()
+	if intentErr != nil {
+		klog.Fatalf("invalid pending rewind intent: %v", intentErr)
+	}
 	targetPoint := points[len(points)-1]
-	target := targetPoint.ThroughSlot
+	if target != 0 {
+		found := false
+		for _, point := range points {
+			if point.ThroughSlot == target {
+				targetPoint, found = point, true
+				break
+			}
+		}
+		if !found {
+			klog.Fatalf("pending rewind target %d is not retained", target)
+		}
+	} else {
+		target = targetPoint.ThroughSlot
+	}
 	if err := validateTransactionStatusRewindPoint(accountsDbPath, accountsDb, targetPoint); err != nil {
 		klog.Fatalf("interrupted rewind target at slot %d has an invalid transaction-status checkpoint: %v; re-bootstrap with --bootstrap snapshot", target, err)
 	}
 	oldRooted := mithrilState.LastRootedSlot
-	res, rerr := accountsDb.RewindToBatchBoundary(target)
+	res, rerr := accountsDb.RewindToBatchBoundaryAndPersist(target, func(res accountsdb.RewindResult) error {
+		return persistRewindResult(accountsDbPath, mithrilState, res)
+	})
 	if rerr != nil {
 		klog.Fatalf("could not complete interrupted rewind to slot %d: %v; re-run --rewind-to-slot=%d", target, rerr, target)
-	}
-	if aerr := adoptRewindResult(accountsDbPath, mithrilState, res); aerr != nil {
-		klog.Fatalf("interrupted rewind at slot %d: %v; re-run --rewind-to-slot=%d", res.NewThrough, aerr, target)
 	}
 	mlog.Log.Warnf("completed interrupted rewind: durable state at fold boundary %d (state file said %d)", res.NewThrough, oldRooted)
 }
@@ -4448,21 +4467,19 @@ func rewindStoreBelowDivergence(accountsDbPath string, accountsDb *accountsdb.Ac
 		return false
 	}
 	oldRooted := s.LastRootedSlot
-	res, err := accountsDb.RewindToBatchBoundary(target)
+	res, err := accountsDb.RewindToBatchBoundaryAndPersist(target, func(res accountsdb.RewindResult) error {
+		if rewards, ok := rpcServer.(interface{ SetRootedEpochRewardsSlot(uint64) error }); ok {
+			if err := rewards.SetRootedEpochRewardsSlot(res.NewThrough); err != nil {
+				return fmt.Errorf("rewind RPC epoch rewards: %w", err)
+			}
+		}
+		return persistRewindResult(accountsDbPath, s, res)
+	})
 	if err != nil {
 		mlog.Log.Errorf("fork switch: rewind to boundary %d failed: %v; halting", target, err)
 		return false
 	}
-	if rewards, ok := rpcServer.(interface{ SetRootedEpochRewardsSlot(uint64) error }); ok {
-		if err := rewards.SetRootedEpochRewardsSlot(res.NewThrough); err != nil {
-			mlog.Log.Errorf("fork switch: rewind RPC epoch rewards to slot %d: %v; halting", res.NewThrough, err)
-			return false
-		}
-	}
-	if err := adoptRewindResult(accountsDbPath, s, res); err != nil {
-		mlog.Log.Errorf("fork switch: %v; halting", err)
-		return false
-	}
+
 	mlog.Log.Warnf("fork switch: superseded slot %d was already folded (R=%d); rewound durable state to boundary %d (%d batches / %d keys undone)",
 		divSlot, oldRooted, res.NewThrough, res.UndoneBatches, res.UndoneKeys)
 	if hasHistoryGate {

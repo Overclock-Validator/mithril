@@ -44,7 +44,6 @@ import (
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
-	"github.com/panjf2000/ants/v2"
 )
 
 // SlotCtxSetter is implemented by types that accept a SlotCtx update (e.g. RpcServer).
@@ -608,6 +607,7 @@ func loadBlockAccountsAndUpdateSysvars(
 	alpenglowClock bool,
 	parentBankSysvars *sealevel.BankSysvars,
 	planner *preparedDependencyPlanner,
+	minOverlayKeys int,
 ) (accounts.Accounts, accounts.Accounts, int, *sealevel.BankSysvars, error) {
 	var bankSysvars *sealevel.BankSysvars
 	phaseStart := time.Now()
@@ -637,7 +637,7 @@ func loadBlockAccountsAndUpdateSysvars(
 	// absence) in the same batch snapshot as all other execution accounts. This
 	// preserves both the footer bounds anchor and the AccountsLtHash before-image.
 	dedupedAccts = includeAlpenglowParentStateAccounts(dedupedAccts, alpenglowClock)
-	publicationCapacity := publicationMapCapacity(block, uniqueWritableAccounts, alpenglowClock)
+	publicationCapacity := max(publicationMapCapacity(block, uniqueWritableAccounts, alpenglowClock), minOverlayKeys)
 	metrics.GlobalBlockReplay.AccountLoader.DedupeBlockAccounts.AddTimingSince(phaseStart)
 	ctx := context.Background()
 	phaseStart = time.Now()
@@ -660,7 +660,7 @@ func loadBlockAccountsAndUpdateSysvars(
 
 	// accts is a branch-local overlay over the pristine parent snapshot; execution
 	// copy-on-writes, so parentAccts stays pristine for LtHash "before" values.
-	accts := accounts.NewOverlayAccountsWithSizing(parentAccts, numAccts, publicationCapacity)
+	accts := accounts.NewOverlayAccountsWithSizing(parentAccts, max(numAccts, minOverlayKeys), publicationCapacity)
 	if parentBankSysvars != nil {
 		if parentBankSysvars.Slot() != block.ParentSlot {
 			return nil, nil, 0, nil, fmt.Errorf(
@@ -1147,68 +1147,7 @@ func setupInitialVoteAcctsAndStakeAccts(acctsDb *accountsdb.AccountsDb, block *b
 	}
 	mlog.Log.Infof("Loading vote and stake caches (aggregate-only mode, %d stake accounts)", len(stakeEntries))
 
-	var wg sync.WaitGroup
-
-	// Shared aggregated stake totals - built directly from AccountsDB scan
-	// Thread-safe: each worker builds local map, then merges under mutex
-	voteAcctStakes := make(map[solana.PublicKey]uint64)
-	var voteAcctStakesMu sync.Mutex
-
-	// Stake worker pool reads stake accounts and aggregates totals directly
-	const maxBatchSize = 2000
-	stakeAcctWorkerPool, _ := ants.NewPoolWithFunc(runtime.NumCPU()*2, func(i interface{}) {
-		defer wg.Done()
-
-		batch := i.([]accountsdb.StakeIndexEntry)
-
-		// Build local aggregation for this batch
-		localStakes := make(map[solana.PublicKey]uint64)
-
-		for _, entry := range batch {
-			// Read from AccountsDB
-			stakeAcct, err := acctsDb.GetAccount(block.Slot, entry.Pubkey)
-			if err != nil {
-				continue // Account not found or closed
-			}
-
-			stakeState, err := sealevel.UnmarshalStakeState(stakeAcct.Data)
-			if err != nil {
-				continue // Invalid stake state
-			}
-
-			// Only count delegated stake accounts (status must be "Stake")
-			if stakeState.Status != sealevel.StakeStateV2StatusStake {
-				continue
-			}
-
-			// Aggregate stake by vote account
-			delegation := stakeState.Stake.Stake.Delegation
-			localStakes[delegation.VoterPubkey] += delegation.StakeLamports
-		}
-
-		// Merge local aggregation into shared map under lock
-		voteAcctStakesMu.Lock()
-		for voter, stake := range localStakes {
-			voteAcctStakes[voter] += stake
-		}
-		voteAcctStakesMu.Unlock()
-	})
-
-	// Submit FileId-aligned batches for sequential appendvec I/O
-	batchStart := 0
-	for i := 1; i <= len(stakeEntries); i++ {
-		flush := i == len(stakeEntries) ||
-			stakeEntries[i].FileId != stakeEntries[batchStart].FileId ||
-			i-batchStart >= maxBatchSize
-		if flush && i > batchStart {
-			wg.Add(1)
-			stakeAcctWorkerPool.Invoke(stakeEntries[batchStart:i])
-			batchStart = i
-		}
-	}
-
-	wg.Wait()
-	stakeAcctWorkerPool.Release()
+	voteAcctStakes := loadStakeAccountTotals(acctsDb, block.Slot, stakeEntries)
 
 	// Load vote accounts from AccountsDB into vote cache
 	if err := RebuildVoteCacheFromAccountsDB(acctsDb, block.Slot, voteAcctStakes, 0); err != nil {
@@ -2739,11 +2678,13 @@ func ReplayBlocks(
 			StreamingExecutionCfg.workers(txParallelism), StreamingExecutionCfg.MinGroupBatches, StreamingExecutionCfg.maxOpenAge())
 	}
 
+	lastRowAt := time.Now()
 	for {
 		// The collector is per replay attempt. Discarded candidates, skipped
 		// slots, and typed-recovery exits must never leak timings into the next
 		// successfully written slot (including a later ReplayBlocks invocation).
 		metrics.GlobalBlockReplay = metrics.BlockReplay{}
+		iterationStart := time.Now()
 		if ctx.Err() != nil {
 			mlog.Log.Infof("context cancelled, stopping replay: %v", ctx.Err())
 			result.WasCancelled = true
@@ -3115,6 +3056,7 @@ func ReplayBlocks(
 			record.FullToReady.AddTiming(ingressTimings.FullToReady)
 		}
 		start := time.Now()
+		foldBusyAtStart := promoter.busyThrough(start)
 
 		// Notify block source we're starting execution - in near-tip mode this
 		// triggers fetching N+1 so RPC latency overlaps with execution time
@@ -3165,7 +3107,12 @@ func ReplayBlocks(
 				if lastSlotCtx != nil {
 					boundaryParentSlot = lastSlotCtx.Slot
 				}
-				if foldRootedPrefix(true) {
+				settleStart := time.Now()
+				halted := foldRootedPrefix(true)
+				forcedFoldSettlement.Observe(time.Since(settleStart), func() string {
+					return fmt.Sprintf("slot %d: folded the rooted prefix synchronously before an epoch-boundary scan", block.Slot)
+				})
+				if halted {
 					break
 				}
 				if err := requireDurableEpochBoundaryParent(block.Slot, boundaryParentSlot, mithrilState.LastRootedSlot); err != nil {
@@ -3293,6 +3240,7 @@ func ReplayBlocks(
 		if lastSlotCtx != nil {
 			parentBankSysvars = lastSlotCtx.BankSysvars()
 		}
+		wholeBlock := false
 		if block.FromLocalProduction {
 			streamer.discardSlot(block.Slot, "local_production")
 			lastSlotCtx, err = adoptLocalLeaderBlock(block, unrootedTailState, transactionStatuses, persistedHashes)
@@ -3314,10 +3262,14 @@ func ReplayBlocks(
 			if !streamed {
 				streamer.noteWholeBlock(block)
 				lastSlotCtx, err = ProcessBlock(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, unrootedTailState, transactionStatuses, alpenglowClock, parentBankSysvars)
+				wholeBlock = true
 			}
 		}
 		processBlockEnd := time.Now()
 		metrics.GlobalBlockReplay.ProcessBlock.AddTiming(processBlockEnd.Sub(processBlockStart))
+		if wholeBlock && err == nil {
+			recordProcessBlockUnstaged(processBlockEnd.Sub(processBlockStart), block.Slot)
+		}
 		if err != nil {
 			mlog.Log.Errorf("error encountered during block replay: %s\n", err)
 			result.Error = err
@@ -3536,6 +3488,9 @@ func ReplayBlocks(
 			mlog.Log.Infof("rooted-durable: memory/slot backpressure at slot %d (held_slots=%d retained_bytes=%d)", block.Slot, unrootedTailState.overlay.HeldSlots(), unrootedTailState.overlay.RetainedBytes())
 			stillOverCap := settleFoldsAtCapacity(unrootedTailState, promoter, block.Slot, applyFoldOutcome, func() bool { return foldRootedPrefix(false) })
 			mlog.Log.Infof("rooted-durable: backpressure settled in %s (held_slots=%d retained_bytes=%d)", time.Since(pressureStart).Round(time.Millisecond), unrootedTailState.overlay.HeldSlots(), unrootedTailState.overlay.RetainedBytes())
+			foldBackpressure.Observe(time.Since(pressureStart), func() string {
+				return fmt.Sprintf("slot %d: replay waited for folds (fold in flight: %t, held_slots=%d, retained_bytes=%d)", block.Slot, hadInFlightFold, unrootedTailState.overlay.HeldSlots(), unrootedTailState.overlay.RetainedBytes())
+			})
 			if result.Error != nil || promoter.failure != nil {
 				break
 			}
@@ -3569,6 +3524,9 @@ func ReplayBlocks(
 		metrics.GlobalBlockReplay.PostProcessBlock.AddTiming(slotReplayEnd.Sub(postProcessBlockStart))
 		slotReplayDuration := slotReplayEnd.Sub(start)
 		metrics.GlobalBlockReplay.SlotReplay.AddTiming(slotReplayDuration)
+		if promoter != nil {
+			metrics.GlobalBlockReplay.FoldOverlap.AddTiming(promoter.busyThrough(slotReplayEnd) - foldBusyAtStart)
+		}
 
 		txnCount := len(block.Transactions)
 		totalCU := lastSlotCtx.TotalComputeUnitsConsumed
@@ -3808,6 +3766,10 @@ func ReplayBlocks(
 		}
 		{
 			metrics.GlobalBlockReplay.Slot = block.Slot
+			rowAt := time.Now()
+			recordUnrootedTail(unrootedTailState)
+			recordReplayLoopClosure(rowAt, lastRowAt, iterationStart, waitTime, slotReplayEnd, block.Slot)
+			lastRowAt = rowAt
 			if metricsWriter != nil {
 				encoder := json.NewEncoder(metricsWriter)
 				err := encoder.Encode(metrics.GlobalBlockReplay)
@@ -3917,14 +3879,7 @@ func compileWritableAndModifiedAccts(slotCtx *sealevel.SlotCtx, block *b.Block, 
 		}
 	}
 	modifiedAccts := make([]*accounts.Account, 0, len(slotCtx.ModifiedAccts)+len(block.UpdatedAccts)+len(rentAccts)+4)
-
-	for pk := range slotCtx.ModifiedAccts {
-		acct, err := slotCtx.GetAccount(pk)
-		if err != nil {
-			mlog.Log.Infof("compileWritableAndModifiedAccts: unable to get %s", acct.Key)
-		}
-		modifiedAccts = append(modifiedAccts, acct)
-	}
+	modifiedAccts = appendModifiedAccountCopies(modifiedAccts, slotCtx)
 
 	for _, eua := range block.EpochUpdatedAccts {
 		if eua == nil {
@@ -3961,6 +3916,63 @@ func compileWritableAndModifiedAccts(slotCtx *sealevel.SlotCtx, block *b.Block, 
 	modifiedAccts = append(modifiedAccts, sysvarAccts...)
 
 	return writableAccts, modifiedAccts
+}
+
+// modifiedAccountCopyMaxWorkers bounds the goroutines copying modified
+// accounts, and modifiedAccountsPerCopyWorker keeps small slots on fewer.
+const (
+	modifiedAccountCopyMaxWorkers = 8
+	modifiedAccountsPerCopyWorker = 128
+)
+
+// appendModifiedAccountCopies appends a copy of every account the slot
+// modified. The copies detach account data from buffers execution reuses
+// (without direct mapping, a program's account data aliases the slot's
+// serialized-parameter arena, which the next bank resets) before the values
+// are hashed and published. A mainnet slot copies a few thousand accounts and
+// several MB, and each copy is independent, so they are split across workers.
+// A modified account missing from the slot is an invariant violation; it
+// panics on the calling goroutine, where replay's recovery reports it.
+func appendModifiedAccountCopies(dst []*accounts.Account, slotCtx *sealevel.SlotCtx) []*accounts.Account {
+	keys := make([]solana.PublicKey, 0, len(slotCtx.ModifiedAccts))
+	for pk := range slotCtx.ModifiedAccts {
+		keys = append(keys, pk)
+	}
+	base := len(dst)
+	dst = append(dst, make([]*accounts.Account, len(keys))...)
+	copies := dst[base:]
+	workers := max(1, min(modifiedAccountCopyMaxWorkers, runtime.GOMAXPROCS(0), (len(keys)+modifiedAccountsPerCopyWorker-1)/modifiedAccountsPerCopyWorker))
+	chunk := (len(keys) + workers - 1) / workers
+	errs := make([]error, workers)
+	copyRange := func(worker int) {
+		for i := worker * chunk; i < min(len(keys), (worker+1)*chunk); i++ {
+			acct, err := slotCtx.GetAccount(keys[i])
+			if err != nil {
+				errs[worker] = fmt.Errorf("unable to get %s: %w", keys[i], err)
+				return
+			}
+			copies[i] = acct
+		}
+	}
+	if workers == 1 {
+		copyRange(0)
+	} else {
+		var wg sync.WaitGroup
+		for worker := range workers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				copyRange(worker)
+			}()
+		}
+		wg.Wait()
+	}
+	for _, err := range errs {
+		if err != nil {
+			panic(fmt.Sprintf("compileWritableAndModifiedAccts: %v", err))
+		}
+	}
+	return dst
 }
 
 // EncodeRecentBlockhashes deep-copies the RecentBlockhashes sysvar into the
@@ -4506,11 +4518,9 @@ func ProcessBlock(
 	// the SlotCtx; streaming execution drives the same object group by group.
 	exec := newBlockExecution(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, tail, transactionStatuses, alpenglowClock, parentBankSysvars)
 	defer exec.close()
+	exec.setReplayStage("parameter_arena")
+	resetSerializedParameterArena()
 	exec.setReplayStage("prepare_dependency_planner")
-
-	if SerializedParameterArena != nil {
-		SerializedParameterArena.Reset()
-	}
 
 	plannerPreparationStart := time.Now()
 	var planner *preparedDependencyPlanner
@@ -4526,7 +4536,7 @@ func ProcessBlock(
 	start := time.Now()
 	exec.setReplayStage("load_accounts")
 	loadAcctsRegion := trace.StartRegion(exec.ctx, "LoadBlockAccounts")
-	accts, parentAccts, accountMapCapacity, bankSysvars, err := loadBlockAccountsAndUpdateSysvars(exec.blockSrc, block, epochSchedule, alpenglowClock, parentBankSysvars, planner)
+	accts, parentAccts, accountMapCapacity, bankSysvars, err := loadBlockAccountsAndUpdateSysvars(exec.blockSrc, block, epochSchedule, alpenglowClock, parentBankSysvars, planner, 0)
 	loadAcctsRegion.End()
 	if err != nil {
 		return nil, fmt.Errorf("load slot accounts and update sysvars at slot %d: %w", block.Slot, err)

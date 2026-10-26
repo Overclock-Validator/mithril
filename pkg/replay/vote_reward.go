@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -16,8 +18,16 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/rewardcerts"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
+	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 )
+
+// Vote-account reward updates split across workers once a block rewards at
+// least two workers' worth of accounts (about 660 per mainnet block today).
+const voteAccountsPerWorker = 64
+
+// maxVoteAccountWorkers caps the workers; tests set it to 1 for the serial reference.
+var maxVoteAccountWorkers = 8
 
 var agMigrationEpochCredit = sealevel.EpochCredits{
 	Epoch:       math.MaxUint64,
@@ -180,11 +190,16 @@ func ApplyAlpenglowVoteRewards(
 		if rewardDetails != nil {
 			validationStart = time.Now()
 		}
-		validatedFinal, err := rewardcerts.ValidateDecodedBlockFinalCertificateWithVerifier(
-			fc,
-			finalEpoch,
-			verifierMaterial.verifier,
-		)
+		// The pre-consensus preflight may already have validated these exact inputs
+		// in the background; otherwise validate here as before.
+		validatedFinal, prefetched := takeFinalCertPrefetch(block.Slot, finalCertRaw, finalEpoch, verifierMaterial)
+		if !prefetched {
+			validatedFinal, err = rewardcerts.ValidateDecodedBlockFinalCertificateWithVerifier(
+				fc,
+				finalEpoch,
+				verifierMaterial.verifier,
+			)
+		}
 		if rewardDetails != nil {
 			rewardDetails.FinalCertificateValidation.AddTimingSince(validationStart)
 		}
@@ -230,59 +245,23 @@ func ApplyAlpenglowVoteRewards(
 		accountMutationStart = time.Now()
 	}
 
-	var leaderRewardAccum uint64
-	var voteAccountsUpdated int
-	var leaderUpdatedInUnion bool
-
-	for votePubkey := range unionVotePubkeys(rewardValidators, finalSigners) {
-		// Read the live in-slot account (reflecting same-slot transaction writes such as a
-		// Vote Withdraw) and fall back to the persisted parent state otherwise. Rewards are
-		// then a normal in-slot account write: SetAccount + RecordModifiedAcct, and the
-		// end-of-slot batch lt-hash computes -h(parent)+h(final) once from the true parent.
-		acct, err := loadAccountLiveOrParentForReplay(slotCtx, votePubkey)
-		if err != nil {
-			mlog.Log.Infof("slot %d vote rewards: skip missing vote account %s: %v", block.Slot, votePubkey, err)
-			continue
-		}
-		_, inReward := rewardValidators[votePubkey]
-		_, inFinal := finalSigners[votePubkey]
-
-		var applied bool
-		if inReward {
-			applied, err = applyVoteRewardToAccount(
-				acct,
-				rewardSlot,
-				rewardSlotTimestampNs,
-				currentEpoch,
-				migrationEpoch,
-				inflationState,
-				totalStake,
-				rewardEpochStakes[votePubkey],
-				&leaderRewardAccum,
-			)
-			if err != nil {
-				mlog.Log.Infof("slot %d vote rewards: skip %s: %v", block.Slot, votePubkey, err)
-				continue
-			}
-		}
-		if inFinal {
-			if err := applyFinalCertToAccount(acct, finalSlot, finalSlotTimestampNs); err != nil {
-				mlog.Log.Infof("slot %d vote rewards: skip %s: %v", block.Slot, votePubkey, err)
-				continue
-			}
-			applied = true
-		}
-		if !applied {
-			continue
-		}
-		if err := slotCtx.SetAccount(votePubkey, acct); err != nil {
-			return fmt.Errorf("slot %d vote rewards: set account %s: %w", block.Slot, votePubkey, err)
-		}
-		slotCtx.RecordModifiedAcct(votePubkey)
-		voteAccountsUpdated++
-		if votePubkey == leaderVote {
-			leaderUpdatedInUnion = true
-		}
+	leaderRewardAccum, voteAccountsUpdated, leaderUpdatedInUnion, err := applyVoteAccountUpdates(slotCtx, &voteAccountUpdate{
+		slot:                  block.Slot,
+		rewardValidators:      rewardValidators,
+		finalSigners:          finalSigners,
+		rewardSlot:            rewardSlot,
+		rewardSlotTimestampNs: rewardSlotTimestampNs,
+		finalSlot:             finalSlot,
+		finalSlotTimestampNs:  finalSlotTimestampNs,
+		currentEpoch:          currentEpoch,
+		migrationEpoch:        migrationEpoch,
+		inflation:             inflationState,
+		totalStake:            totalStake,
+		stakes:                rewardEpochStakes,
+		leaderVote:            leaderVote,
+	})
+	if err != nil {
+		return err
 	}
 
 	if leaderRewardAccum > 0 {
@@ -292,7 +271,7 @@ func ApplyAlpenglowVoteRewards(
 		// Read the live account so the leader reward stacks on top of any update the union loop
 		// (or a same-slot transaction) already applied to the leader's vote account, mirroring
 		// single-map Occupied/Vacant handling.
-		acct, err := loadAccountLiveOrParentForReplay(slotCtx, leaderVote)
+		acct, parent, err := loadAccountLiveOrParentForReplay(slotCtx, leaderVote)
 		if err != nil {
 			return fmt.Errorf("slot %d vote rewards: load leader vote %s: %w", block.Slot, leaderVote, err)
 		}
@@ -302,6 +281,9 @@ func ApplyAlpenglowVoteRewards(
 		}
 		if !applied {
 			return fmt.Errorf("slot %d vote rewards: leader vote %s: apply returned false", block.Slot, leaderVote)
+		}
+		if parent != nil {
+			recordParentImage(slotCtx, leaderVote, parent)
 		}
 		if err := slotCtx.SetAccount(leaderVote, acct); err != nil {
 			return fmt.Errorf("slot %d vote rewards: set leader vote %s: %w", block.Slot, leaderVote, err)
@@ -319,18 +301,200 @@ func ApplyAlpenglowVoteRewards(
 	return nil
 }
 
-func loadAccountLiveOrParentForReplay(slotCtx *sealevel.SlotCtx, pubkey solana.PublicKey) (*accounts.Account, error) {
+// voteAccountUpdate is the per-block input for crediting vote accounts.
+type voteAccountUpdate struct {
+	slot                                        uint64
+	rewardValidators, finalSigners              map[solana.PublicKey]struct{}
+	rewardSlot, finalSlot                       uint64
+	rewardSlotTimestampNs, finalSlotTimestampNs int64
+	currentEpoch, migrationEpoch                uint64
+	inflation                                   EpochInflationState
+	totalStake                                  uint64
+	stakes                                      map[solana.PublicKey]uint64
+	leaderVote                                  solana.PublicKey
+}
+
+// applyVoteAccountUpdates credits every rewarded or final-certificate vote
+// account and records it as modified. It returns the leader's accumulated
+// reward, the number of accounts written and whether the leader's vote account
+// was one of them.
+func applyVoteAccountUpdates(slotCtx *sealevel.SlotCtx, u *voteAccountUpdate) (uint64, int, bool, error) {
+	var leaderRewardAccum uint64
+	var voteAccountsUpdated int
+	var leaderUpdatedInUnion bool
+
+	// updateVoteAccount applies the reward and/or final-certificate credit to one
+	// vote account and stores it. It returns the account, nil when it is not
+	// written.
+	updateVoteAccount := func(votePubkey solana.PublicKey, leaderAccum *uint64) (*creditedVoteAccount, error) {
+		// Read the live in-slot account (reflecting same-slot transaction writes such as a
+		// Vote Withdraw) and fall back to the persisted parent state otherwise. Rewards are
+		// then a normal in-slot account write: SetAccount + RecordModifiedAcct, and the
+		// end-of-slot batch lt-hash computes -h(parent)+h(final) once from the true parent.
+		acct, parent, err := loadAccountLiveOrParentForReplay(slotCtx, votePubkey)
+		if err != nil {
+			mlog.Log.Infof("slot %d vote rewards: skip missing vote account %s: %v", u.slot, votePubkey, err)
+			return nil, nil
+		}
+		_, inReward := u.rewardValidators[votePubkey]
+		_, inFinal := u.finalSigners[votePubkey]
+
+		var applied bool
+		if inReward && inFinal {
+			applied, err = applyVoteRewardAndFinalCertToAccount(
+				acct, u.rewardSlot, u.rewardSlotTimestampNs, u.finalSlot, u.finalSlotTimestampNs,
+				u.currentEpoch, u.migrationEpoch, u.inflation, u.totalStake,
+				u.stakes[votePubkey], leaderAccum,
+			)
+			if err != nil {
+				mlog.Log.Infof("slot %d vote rewards: skip %s: %v", u.slot, votePubkey, err)
+				return nil, nil
+			}
+		} else if inReward {
+			applied, err = applyVoteRewardToAccount(
+				acct,
+				u.rewardSlot,
+				u.rewardSlotTimestampNs,
+				u.currentEpoch,
+				u.migrationEpoch,
+				u.inflation,
+				u.totalStake,
+				u.stakes[votePubkey],
+				leaderAccum,
+			)
+			if err != nil {
+				mlog.Log.Infof("slot %d vote rewards: skip %s: %v", u.slot, votePubkey, err)
+				return nil, nil
+			}
+		}
+		if inFinal && !inReward {
+			if err := applyFinalCertToAccount(acct, u.finalSlot, u.finalSlotTimestampNs); err != nil {
+				mlog.Log.Infof("slot %d vote rewards: skip %s: %v", u.slot, votePubkey, err)
+				return nil, nil
+			}
+			applied = true
+		}
+		if !applied {
+			return nil, nil
+		}
+		if err := slotCtx.SetAccount(votePubkey, acct); err != nil {
+			return nil, fmt.Errorf("slot %d vote rewards: set account %s: %w", u.slot, votePubkey, err)
+		}
+		return &creditedVoteAccount{key: votePubkey, parent: parent}, nil
+	}
+
+	// Vote accounts are independent: each is read, updated and stored on its own,
+	// through the sharded in-slot overlay. The only shared value is the leader's
+	// reward sum, and its wrapping uint64 additions commute, so per-worker partial
+	// sums give the serial result. Parent images go to the unsharded parent set,
+	// so they are recorded after the join. This runs after the block's
+	// transactions, when replay's workers are otherwise idle.
+	union := unionVotePubkeys(u.rewardValidators, u.finalSigners)
+	votePubkeys := make([]solana.PublicKey, 0, len(union))
+	for votePubkey := range union {
+		votePubkeys = append(votePubkeys, votePubkey)
+	}
+	workers := 1
+	if len(votePubkeys) >= 2*voteAccountsPerWorker {
+		workers = min(runtime.GOMAXPROCS(0), maxVoteAccountWorkers, len(votePubkeys)/voteAccountsPerWorker)
+	}
+	type voteAccountChunk struct {
+		leaderReward uint64
+		written      []creditedVoteAccount
+		err          error
+	}
+	chunks := make([]voteAccountChunk, workers)
+	updateChunk := func(w int) {
+		chunk := &chunks[w]
+		keys := votePubkeys[w*len(votePubkeys)/workers : (w+1)*len(votePubkeys)/workers]
+		chunk.written = make([]creditedVoteAccount, 0, len(keys))
+		for _, votePubkey := range keys {
+			credited, err := updateVoteAccount(votePubkey, &chunk.leaderReward)
+			if err != nil {
+				chunk.err = err
+				return
+			}
+			if credited != nil {
+				chunk.written = append(chunk.written, *credited)
+			}
+		}
+	}
+	if workers == 1 {
+		updateChunk(0)
+	} else {
+		var wg sync.WaitGroup
+		for w := 1; w < workers; w++ {
+			wg.Add(1)
+			go func(w int) {
+				defer wg.Done()
+				updateChunk(w)
+			}(w)
+		}
+		updateChunk(0)
+		wg.Wait()
+	}
+	for i := range chunks {
+		if chunks[i].err != nil {
+			return 0, 0, false, chunks[i].err
+		}
+	}
+	for i := range chunks {
+		leaderRewardAccum += chunks[i].leaderReward
+		for _, update := range chunks[i].written {
+			if update.parent != nil {
+				recordParentImage(slotCtx, update.key, update.parent)
+			}
+			slotCtx.RecordModifiedAcct(update.key)
+			voteAccountsUpdated++
+			if update.key == u.leaderVote {
+				leaderUpdatedInUnion = true
+			}
+		}
+	}
+	return leaderRewardAccum, voteAccountsUpdated, leaderUpdatedInUnion, nil
+}
+
+// creditedVoteAccount is a written vote account, with the parent value its
+// new value was derived from when that came from the account source.
+type creditedVoteAccount struct {
+	key    solana.PublicKey
+	parent *accounts.Account
+}
+
+// loadAccountLiveOrParentForReplay returns a mutable copy of the account as
+// the bank currently sees it: the in-slot value when this slot wrote it, else
+// the parent value, which it then also returns as read so the caller can
+// record it as the account's parent image (see recordParentImage). It only
+// reads the bank, so it is safe for concurrent use.
+func loadAccountLiveOrParentForReplay(slotCtx *sealevel.SlotCtx, pubkey solana.PublicKey) (acct, parent *accounts.Account, err error) {
 	if slotCtx == nil {
-		return nil, fmt.Errorf("missing slot context")
+		return nil, nil, fmt.Errorf("missing slot context")
 	}
 	if acct, err := slotCtx.GetAccount(pubkey); err == nil && acct != nil {
-		return acct, nil
+		return acct, nil, nil
 	}
-	acct, err := slotCtx.GetAccountFromAccountsDb(pubkey)
+	parent, err = slotCtx.GetAccountFromAccountsDb(pubkey)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return acct.Clone(), nil
+	return parent.Clone(), parent, nil
+}
+
+// recordParentImage keeps parent, read from the account source for an
+// account the bank is about to write, as that account's parent image when the
+// bank has none yet. ensureParentAccountsForModified would otherwise read and
+// copy it again for the LtHash, the only reader of parent images of accounts
+// no transaction loaded; without the LtHash it is skipped, as that function
+// is. parent must never be mutated: callers modify a copy.
+func recordParentImage(slotCtx *sealevel.SlotCtx, pubkey solana.PublicKey, parent *accounts.Account) {
+	if slotCtx.ParentAccts == nil || slotCtx.Features == nil || !slotCtx.Features.IsActive(features.AccountsLtHash) {
+		return
+	}
+	key := [32]byte(pubkey)
+	if _, err := slotCtx.ParentAccts.GetAccount(&key); err == nil {
+		return
+	}
+	_ = slotCtx.ParentAccts.SetAccount(&key, parent)
 }
 
 func unionVotePubkeys(rewardValidators, finalSigners map[solana.PublicKey]struct{}) map[solana.PublicKey]struct{} {
@@ -396,6 +560,24 @@ func leaderVotePubkey(
 	return leaderVote, nil
 }
 
+// Decoding into a new VoteStateVersions allocates every version layout (about
+// 6.6 KB) for a 344-byte V4 state, once or twice per credited vote account in
+// every block. The reward path decodes into pooled zeroed values instead; none
+// is retained past the in-place write.
+var voteStateScratch = sync.Pool{New: func() any { return new(sealevel.VoteStateVersions) }}
+
+// decodeVoteStateScratch matches sealevel.UnmarshalVersionedVoteState. The
+// caller returns the value to voteStateScratch once it is done with it.
+func decodeVoteStateScratch(data []byte) (*sealevel.VoteStateVersions, error) {
+	versioned := voteStateScratch.Get().(*sealevel.VoteStateVersions)
+	*versioned = sealevel.VoteStateVersions{}
+	if err := versioned.UnmarshalWithDecoder(bin.NewBinDecoder(data)); err != nil {
+		voteStateScratch.Put(versioned)
+		return nil, sealevel.InstrErrInvalidAccountData
+	}
+	return versioned, nil
+}
+
 func applyVoteRewardToAccount(
 	acct *accounts.Account,
 	rewardSlot uint64,
@@ -405,22 +587,79 @@ func applyVoteRewardToAccount(
 	totalStake, validatorStake uint64,
 	leaderRewardAccum *uint64,
 ) (bool, error) {
-	versioned, err := sealevel.UnmarshalVersionedVoteState(acct.Data)
+	versioned, err := decodeVoteStateScratch(acct.Data)
 	if err != nil {
 		return false, err
 	}
+	defer voteStateScratch.Put(versioned)
 	if versioned.Type != sealevel.VoteStateVersionV4 {
 		return false, fmt.Errorf("unsupported vote state version %d", versioned.Type)
 	}
 
-	maybeUpdateVotesV4(&versioned.V4, rewardSlot, rewardSlotTimestampNs)
+	applyVoteRewardToState(&versioned.V4, rewardSlot, rewardSlotTimestampNs,
+		currentEpoch, migrationEpoch, inflation, totalStake, validatorStake, leaderRewardAccum)
+
+	if err := sealevel.WriteVersionedVoteStateInPlace(acct.Data, versioned); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func applyVoteRewardToState(
+	state *sealevel.VoteState4,
+	rewardSlot uint64, rewardSlotTimestampNs int64,
+	currentEpoch, migrationEpoch uint64,
+	inflation EpochInflationState,
+	totalStake, validatorStake uint64,
+	leaderRewardAccum *uint64,
+) {
+	maybeUpdateVotesV4(state, rewardSlot, rewardSlotTimestampNs)
 	validatorReward, leaderReward := calculateAlpenglowReward(inflation, totalStake, validatorStake)
 	*leaderRewardAccum += leaderReward
 	if validatorReward > 0 {
-		incrementAlpenglowCredits(&versioned.V4.EpochCredits, migrationEpoch, currentEpoch, validatorReward)
+		incrementAlpenglowCredits(&state.EpochCredits, migrationEpoch, currentEpoch, validatorReward)
+	}
+}
+
+// applyVoteRewardAndFinalCertToAccount applies overlapping certificate updates in
+// reward-then-finalization order.
+func applyVoteRewardAndFinalCertToAccount(
+	acct *accounts.Account,
+	rewardSlot uint64, rewardSlotTimestampNs int64,
+	finalSlot uint64, finalSlotTimestampNs int64,
+	currentEpoch, migrationEpoch uint64,
+	inflation EpochInflationState,
+	totalStake, validatorStake uint64,
+	leaderRewardAccum *uint64,
+) (bool, error) {
+	versioned, err := decodeVoteStateScratch(acct.Data)
+	if err != nil {
+		return false, err
+	}
+	defer voteStateScratch.Put(versioned)
+	if versioned.Type != sealevel.VoteStateVersionV4 {
+		return false, fmt.Errorf("unsupported vote state version %d", versioned.Type)
+	}
+	leaderBefore := *leaderRewardAccum
+	applyVoteRewardToState(&versioned.V4, rewardSlot, rewardSlotTimestampNs,
+		currentEpoch, migrationEpoch, inflation, totalStake, validatorStake, leaderRewardAccum)
+	maybeUpdateRootV4(&versioned.V4, finalSlot)
+	maybeUpdateVotesV4(&versioned.V4, finalSlot, finalSlotTimestampNs)
+	if err := sealevel.WriteVersionedVoteStateInPlace(acct.Data, versioned); err == nil {
+		return true, nil
 	}
 
-	if err := sealevel.WriteVersionedVoteStateInPlace(acct.Data, versioned); err != nil {
+	// Finalization keeps the single vote and credit history sizes unchanged and
+	// can only grow the root option. Thus a successful combined write also means
+	// the intermediate reward state would fit. On failure, the writer leaves data
+	// untouched: replay the original sequence to retain its exact error, partial
+	// account write and leader accumulation behavior for undersized accounts.
+	*leaderRewardAccum = leaderBefore
+	if _, err := applyVoteRewardToAccount(acct, rewardSlot, rewardSlotTimestampNs,
+		currentEpoch, migrationEpoch, inflation, totalStake, validatorStake, leaderRewardAccum); err != nil {
+		return false, err
+	}
+	if err := applyFinalCertToAccount(acct, finalSlot, finalSlotTimestampNs); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -481,10 +720,11 @@ func maybeUpdateVotesV4(vs *sealevel.VoteState4, slot uint64, slotTimestampNs in
 }
 
 func applyFinalCertToAccount(acct *accounts.Account, finalSlot uint64, finalSlotTimestampNs int64) error {
-	versioned, err := sealevel.UnmarshalVersionedVoteState(acct.Data)
+	versioned, err := decodeVoteStateScratch(acct.Data)
 	if err != nil {
 		return err
 	}
+	defer voteStateScratch.Put(versioned)
 	if versioned.Type != sealevel.VoteStateVersionV4 {
 		return fmt.Errorf("unsupported vote state version %d", versioned.Type)
 	}

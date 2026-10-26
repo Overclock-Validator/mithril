@@ -1341,11 +1341,23 @@ func executeLoadedProgram(execCtx *ExecutionCtx, program *sbpf.Program, syscallR
 }
 
 func executeProgramFromBytes(execCtx *ExecutionCtx, programAddr solana.PublicKey, programData []byte, syscallRegistry sbpf.SyscallRegistry) error {
+	return executeProgramFromSource(execCtx, programAddr, programData, syscallRegistry, false)
+}
+
+func executeProgramFromSource(execCtx *ExecutionCtx, programAddr solana.PublicKey, programData []byte, syscallRegistry sbpf.SyscallRegistry, immutable bool) error {
 	start := time.Now()
 	// The caller has already validated the bank-visible loader metadata. Never
 	// let a global cache hit bypass that validation or select a different fork.
-	if entry, ok := execCtx.SlotCtx.AccountsDb.MaybeGetProgramFromCache(programAddr); ok && entry.MatchesSource(programData, &execCtx.Features) {
-		return executeLoadedProgram(execCtx, entry.Program, syscallRegistry)
+	if entry, ok := execCtx.SlotCtx.AccountsDb.MaybeGetProgramFromCache(programAddr); ok {
+		var matches bool
+		if immutable {
+			matches = entry.MatchesImmutableSource(programData, &execCtx.Features)
+		} else {
+			matches = entry.MatchesSource(programData, &execCtx.Features)
+		}
+		if matches {
+			return executeLoadedProgram(execCtx, entry.Program, syscallRegistry)
+		}
 	}
 	loader, err := loader.NewLoaderWithSyscalls(programData, syscallRegistry, false, &execCtx.Features)
 	if err != nil {
@@ -1501,6 +1513,7 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 	}
 
 	var programBytes []byte
+	var immutableProgramBytes bool
 	var programAcctKey solana.PublicKey
 
 	programOwner := programAcct.Owner()
@@ -1551,10 +1564,11 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 		start := time.Now()
 		// Program loading only reads this immutable bank-visible account. The
 		// ELF loader owns its relocated bytes, and BindSource copies on cache
-		// insertion; cache hits still compare the full source and feature set.
+		// insertion. Only explicitly immutable parent sources can reuse a prior
+		// source comparison; transaction-local accounts retain full validation.
 		programDataAcct, err := execCtx.SlotCtx.GetAccountShared(programAcctState.Program.ProgramDataAddress)
 		if err != nil {
-			programDataAcct, err = execCtx.SlotCtx.getAccountFromAccountsDbReadOnly(programAcctState.Program.ProgramDataAddress)
+			programDataAcct, immutableProgramBytes, err = execCtx.SlotCtx.getProgramAccountSource(programAcctState.Program.ProgramDataAddress)
 			if err != nil {
 				return InstrErrUnsupportedProgramId
 			}
@@ -1594,7 +1608,7 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 		return Syscalls(&execCtx.Features, false, u)
 	})
 
-	err = executeProgramFromBytes(execCtx, programAcctKey, programBytes, syscallRegistry)
+	err = executeProgramFromSource(execCtx, programAcctKey, programBytes, syscallRegistry, immutableProgramBytes)
 
 	return err
 }

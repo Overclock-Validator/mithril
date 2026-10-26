@@ -63,6 +63,26 @@ func (a *Arena[T]) Used() uint64 {
 	return atomic.LoadUint64(&a.index)
 }
 
+// Capacity returns the number of items the arena holds before falling back to the heap.
+func (a *Arena[T]) Capacity() uint64 {
+	return a.capacity
+}
+
+// ResetPaced is Reset done in chunks of at most chunk items, calling pause
+// between chunks, so a background caller can spread the clearing out instead
+// of using all memory bandwidth at once. Same requirements as Reset.
+func (a *Arena[T]) ResetPaced(chunk uint64, pause func()) {
+	used := atomic.LoadUint64(&a.index)
+	for start := uint64(0); start < used; start += chunk {
+		end := min(start+chunk, used)
+		clear(a.pool[start:end])
+		if end < used {
+			pause()
+		}
+	}
+	a.index = 0
+}
+
 // Reset requires all users of the previous allocations to have finished.
 func (a *Arena[T]) Reset() {
 	clear(a.pool[:atomic.LoadUint64(&a.index)])
