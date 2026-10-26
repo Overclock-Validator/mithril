@@ -14,7 +14,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -348,7 +348,7 @@ func TestRefreshReadCachesIsScanResistantAndCoherent(t *testing.T) {
 	db.refreshReadCaches([]*accounts.Account{updated})
 	got, ok := db.CommonAcctsCache.Get(key)
 	require.True(t, ok)
-	assert.Same(t, updated, got, "resident common entry must be refreshed")
+	assert.Equal(t, updated, got, "resident common entry must be refreshed")
 
 	vote := &accounts.Account{Key: key, Lamports: 30, Owner: addresses.VoteProgramAddr}
 	db.refreshReadCaches([]*accounts.Account{vote})

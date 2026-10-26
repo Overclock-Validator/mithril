@@ -3728,6 +3728,7 @@ func ReplayBlocks(
 
 		txnCount := len(block.Transactions)
 		totalCU := lastSlotCtx.TotalComputeUnitsConsumed
+		metrics.GlobalBlockReplay.ComputeUnitsConsumed = totalCU
 
 		// Get leader from block (set by configureBlock in live mode, or by block source in verify mode)
 		leaderStr := "unknown"

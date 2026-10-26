@@ -257,7 +257,8 @@ func TestFoldsWriteDelegatedStakeIntoResumeContext(t *testing.T) {
 		tracker := newStakeTotalsTracker(initial, members)
 		overlay := accounts.NewWorkingSet()
 		contexts := map[uint64]*state.ResumeContext{}
-		for slot, amt := range map[uint64]uint64{5: 20, 6: 30} {
+		for _, input := range [][2]uint64{{5, 20}, {6, 30}} {
+			slot, amt := input[0], input[1]
 			ctx := parentOf(amt - 10)
 			ctx.Slot = slot
 			tracker.recordSlot(slot, ctx, []*accounts.Account{write(amt)}, nil, func(solana.PublicKey) *accounts.Account { return nil })

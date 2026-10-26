@@ -11,7 +11,6 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
-	"github.com/maypok86/otter"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -72,9 +71,7 @@ func TestPreloadSourceResolvesLikeExecution(t *testing.T) {
 
 func TestPreloadProgramCachesOnceAndMatchesExecution(t *testing.T) {
 	elf := fixtures.Load(t, "sbpf", "noop_aligned.so")
-	cache, err := otter.MustBuilder[solana.PublicKey, *accountsdb.ProgramCacheEntry](64).
-		Cost(func(solana.PublicKey, *accountsdb.ProgramCacheEntry) uint32 { return 1 }).Build()
-	require.NoError(t, err)
+	cache := accountsdb.NewWeightedCache[solana.PublicKey, *accountsdb.ProgramCacheEntry](64, func(solana.PublicKey, *accountsdb.ProgramCacheEntry) uint32 { return 1 })
 	t.Cleanup(cache.Close)
 	db := &accountsdb.AccountsDb{ProgramCache: cache}
 	f := features.NewFeaturesDefault()

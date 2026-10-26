@@ -23,9 +23,8 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/sbpf"
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/gagliardetto/solana-go"
-	"github.com/maypok86/otter"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -35,9 +34,9 @@ type AccountsDb struct {
 	AcctsDir         string // primary shard's accounts dir; its parent is the metadata dir
 	Shards           *Shards
 	LargestFileId    atomic.Uint64
-	VoteAcctCache    otter.Cache[solana.PublicKey, *accounts.Account]
-	CommonAcctsCache otter.Cache[solana.PublicKey, *accounts.Account]
-	ProgramCache     otter.Cache[solana.PublicKey, *ProgramCacheEntry]
+	VoteAcctCache    *WeightedCache[solana.PublicKey, *accounts.Account]
+	CommonAcctsCache *commonAccountCache
+	ProgramCache     *WeightedCache[solana.PublicKey, *ProgramCacheEntry]
 	// Otter permits concurrent ordinary operations but not Clear. Rewind takes
 	// the write side; hot-path program cache operations take the read side.
 	programCacheMu sync.RWMutex
@@ -124,11 +123,12 @@ func (accountsDb *AccountsDb) StoreQueueLen() int {
 	return accountsDb.inProgressStoreRequests.Len()
 }
 
-// silentLogger implements pebble.Logger but discards all messages.
+// silentLogger suppresses informational messages while retaining errors and fatal failures.
 // This suppresses verbose WAL recovery messages on startup.
 type silentLogger struct{}
 
 func (silentLogger) Infof(format string, args ...any)  {}
+func (silentLogger) Errorf(format string, args ...any) { log.Printf(format, args...) }
 func (silentLogger) Fatalf(format string, args ...any) { log.Fatalf(format, args...) }
 
 var (
@@ -206,9 +206,16 @@ func OpenDbPaths(accountsPaths []string) (*AccountsDb, error) {
 	}
 
 	indexDir := filepath.Join(accountsDbDir, "mithril_db")
-	indexOpts := NewAccountsIndexPebbleOptions(silentLogger{})
-	indexOpts.EventListener = pebbleEventListener("index")
-	db, err := pebble.Open(indexDir, indexOpts)
+	opts := NewAccountsIndexPebbleOptions(silentLogger{})
+	if err := ValidateCacheSettings(); err != nil {
+		return nil, err
+	}
+	opts.Cache = pebble.NewCache(int64(IndexCacheMaxMB) << 20)
+	opts.EventListener = pebbleEventListener("index")
+	db, err := pebble.Open(indexDir, opts)
+	if opts.Cache != nil {
+		opts.Cache.Unref()
+	}
 	if err != nil {
 		if strings.Contains(err.Error(), "format major version") {
 			return nil, fmt.Errorf("opening indexDir=%s: %w (an AccountsDB built by an older Mithril cannot be opened: rebuild it from a snapshot)", indexDir, err)
@@ -276,37 +283,17 @@ func (accountsDb *AccountsDb) CloseDb() {
 }
 
 func (accountsDb *AccountsDb) InitCaches() {
-	var err error
 	if accountsDb.inProgressStoreRequests == nil {
 		accountsDb.inProgressStoreRequests = list.New()
 	}
 	accountsDb.commonAdmission = newCommonCacheAdmission()
-	accountsDb.VoteAcctCache, err = otter.MustBuilder[solana.PublicKey, *accounts.Account](2500).
-		Cost(func(key solana.PublicKey, acct *accounts.Account) uint32 {
-			return 1
-		}).
-		Build()
-	if err != nil {
-		panic(err)
-	}
-
-	accountsDb.ProgramCache, err = otter.MustBuilder[solana.PublicKey, *ProgramCacheEntry](programCacheCapacityUnits()).
-		Cost(func(key solana.PublicKey, progEntry *ProgramCacheEntry) uint32 {
-			return progEntry.CostUnits()
-		}).
-		Build()
-	if err != nil {
-		panic(err)
-	}
-
-	accountsDb.CommonAcctsCache, err = otter.MustBuilder[solana.PublicKey, *accounts.Account](commonAccountCacheCapacityBytes()).
-		Cost(func(key solana.PublicKey, acct *accounts.Account) uint32 {
-			return commonAccountCacheCost(acct)
-		}).
-		Build()
-	if err != nil {
-		panic(err)
-	}
+	accountsDb.VoteAcctCache = NewWeightedCache(2500, func(key solana.PublicKey, acct *accounts.Account) uint32 {
+		return 1
+	})
+	accountsDb.ProgramCache = NewWeightedCache(uint64(programCacheCapacityUnits()), func(key solana.PublicKey, progEntry *ProgramCacheEntry) uint32 {
+		return progEntry.CostUnits()
+	})
+	accountsDb.CommonAcctsCache = newCommonAccountCache(uint64(commonAccountCacheCapacityBytes()), CommonAccountCacheLayout != "flat")
 }
 
 type ProgramCacheEntry struct {
@@ -337,10 +324,25 @@ func (entry *ProgramCacheEntry) MatchesSource(source []byte, f *features.Feature
 }
 
 func programCacheCapacityUnits() int {
-	if ProgramCacheMaxMB <= 0 {
-		return DefaultProgramCacheMaxMB
+	mb := ProgramCacheMaxMB
+	if mb <= 0 {
+		mb = DefaultProgramCacheMaxMB
 	}
-	return ProgramCacheMaxMB
+	scale := (1 << 20) / programCacheUnitBytes()
+	maxInt := int(^uint(0) >> 1)
+	if mb > maxInt/scale {
+		return maxInt
+	}
+	return mb * scale
+}
+
+// Experimental fine accounting retains the same configured byte budget.
+// The switch is fixed for the lifetime of a process/cache.
+func programCacheUnitBytes() int {
+	if ProgramCacheAccounting == "kib" {
+		return 1024
+	}
+	return programCacheCostUnitBytes
 }
 
 func commonAccountCacheCapacityBytes() int {
@@ -371,7 +373,11 @@ func (entry *ProgramCacheEntry) CostUnits() uint32 {
 		return 1
 	}
 	bytes := entry.Program.MemoryBytes() + uint64(len(entry.sourceBytes))
-	units := (bytes + programCacheCostUnitBytes - 1) / programCacheCostUnitBytes
+	unit := uint64(programCacheUnitBytes())
+	units := bytes / unit
+	if bytes%unit != 0 {
+		units++
+	}
 	if units == 0 {
 		return 1
 	}
@@ -565,8 +571,9 @@ func (accountsDb *AccountsDb) getCachedAccountLocked(pubkey solana.PublicKey) (*
 	if version, ok := accountsDb.pendingFold[[32]byte(pubkey)]; ok {
 		return version.acct, true, true
 	}
-	if acct, ok := accountsDb.VoteAcctCache.Get(pubkey); ok {
-		return acct, true, false
+	voteAcct, voteHit := accountsDb.VoteAcctCache.Get(pubkey)
+	if voteHit {
+		return voteAcct, true, false
 	}
 	acct, ok := accountsDb.CommonAcctsCache.Get(pubkey)
 	return acct, ok, false

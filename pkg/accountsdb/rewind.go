@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 )
 
 // Rewind support (types + discovery). RewindToBatchBoundary — applying undo

@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	"golang.org/x/sync/errgroup"
 )
 

@@ -359,9 +359,10 @@ type StreamingExecution struct {
 
 // Metrics for replaying a single block
 type BlockReplay struct {
-	Slot           uint64
-	AccountLoader  AccountLoader
-	TurbineIngress TurbineIngress
+	ComputeUnitsConsumed uint64
+	Slot                 uint64
+	AccountLoader        AccountLoader
+	TurbineIngress       TurbineIngress
 
 	// RewardCertificatePreflight runs before consensus admission and bank replay,
 	// outside SlotReplay, which starts after the candidate is admitted.

@@ -18,7 +18,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/progress"
 	"github.com/Overclock-Validator/mithril/pkg/statsd"
 	"github.com/Overclock-Validator/mithril/pkg/txstatus"
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/panjf2000/ants/v2"
 )
 
@@ -998,7 +998,7 @@ func ingestSSTFiles(indexDir, logsDir string) (*pebble.DB, error) {
 		return nil, fmt.Errorf("filepath.Glob(%s): unexpectedly globbed 0 SST files!", glob)
 	}
 
-	err = db.Ingest(sstFiles)
+	err = db.Ingest(context.Background(), sstFiles)
 	if err != nil {
 		return nil, fmt.Errorf("ingesting SSTs: %w", err)
 	}

@@ -15,7 +15,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/progress"
 	"github.com/Overclock-Validator/mithril/pkg/rpcclient"
 	"github.com/Overclock-Validator/mithril/pkg/snapshotdl"
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/panjf2000/ants/v2"
 )
 

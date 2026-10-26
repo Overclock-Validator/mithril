@@ -16,9 +16,9 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
-	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
-	"github.com/cockroachdb/pebble/sstable"
-	"github.com/cockroachdb/pebble/vfs"
+	"github.com/cockroachdb/pebble/v2/objstorage/objstorageprovider"
+	"github.com/cockroachdb/pebble/v2/sstable"
+	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/gagliardetto/solana-go"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
@@ -182,7 +182,7 @@ func sortPairs(pairs []shardRequest) {
 // first entry per key (highest slot) and skipping duplicates.
 func (s *shard) writeSST(pairs []shardRequest) error {
 	sstFilename := fmt.Sprintf("%s.sst", s.file.Name())
-	sstFile, err := vfs.Default.Create(sstFilename)
+	sstFile, err := vfs.Default.Create(sstFilename, vfs.WriteCategoryUnspecified)
 	if err != nil {
 		return fmt.Errorf("create %s: %w", sstFilename, err)
 	}

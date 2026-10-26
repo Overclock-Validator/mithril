@@ -98,8 +98,11 @@ name = "mithril"
     # per physical disk. The snapshot unpack shards append-vecs across them so
     # aggregate write throughput approaches the sum of the disks. The first entry
     # also holds the shared metadata (account index, manifest, state); the others
-    # hold only their disk's shard of the account data. The number of directories
-    # is fixed at build time - changing it requires rebuilding the AccountsDB.
+    # hold only their disk's shard of the account data. The number and order of
+    # the directories are fixed at build time (the order identifies the shards);
+    # changing either requires rebuilding the AccountsDB. Account data written
+    # after the snapshot (folds, compaction) goes to the first directory, so leave
+    # it room beyond snapshot_shard_min_free_mb.
     #   accounts = [
     #       "/mnt/nvme0/mithril-accounts",  # primary: metadata + shard 0
     #       "/mnt/nvme1/mithril-accounts",  # shard 1
@@ -593,10 +596,10 @@ name = "mithril"
 
     # Streaming execution (Alpenglow, native turbine only): execute a block's
     # entry batches while its remaining shreds arrive, on a speculative bank
-    # over the executed parent. The complete block stays authoritative — the
+    # over the executed parent. The complete block stays authoritative: the
     # executed prefix must be the block's own transactions (pointer identity)
-    # or the bank is discarded and the block executes whole. Off by default.
-    # streaming_execution = false
+    # or the bank is discarded and the block executes whole. On by default.
+    # streaming_execution = true
     # Execution workers per streaming group (0 = min(txpar, 4)).
     # streaming_workers = 0
     # Contiguous decoded batches to accumulate before a group executes
@@ -669,6 +672,20 @@ name = "mithril"
     # Approximate retained decoded account cache weight budget in MiB. Large block scans
     # pass through a bounded two-hit admission filter before using this budget.
     common_account_cache_max_mb = 256
+
+    # Pebble block cache for the account locator index (not account payloads).
+    # Keep the old default until choosing a memory budget for your workload.
+    index_cache_max_mb = 8
+
+    # flat: original weighted account cache.
+    # tiered: reserve 1/16 for empty accounts and 1/8 for accounts <=200 bytes.
+    # expanded: reserve 1/6 for empty accounts and 1/2 for accounts <=200 bytes.
+    # Reservations split common_account_cache_max_mb; they do not add a budget.
+    common_account_cache_layout = "flat"
+
+    # mib retains the previous rounded weights; kib bills at 1KiB precision.
+    # Both use program_cache_max_mb as the same total approximate byte budget.
+    program_cache_accounting = "mib"
 
     # [tuning.pprof] - CPU/Memory Profiling
     #

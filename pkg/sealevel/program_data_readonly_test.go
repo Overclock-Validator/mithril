@@ -13,7 +13,6 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
-	"github.com/maypok86/otter"
 	"github.com/stretchr/testify/require"
 )
 
@@ -62,10 +61,7 @@ func upgradeableReadFixture(t testing.TB, w programWorkload) (accounts.Account, 
 func upgradeableReadRunner(t testing.TB, w programWorkload, vasa bool, reader AccountReader, local *accounts.Account) func() (*ExecutionCtx, error) {
 	t.Helper()
 	program, _ := upgradeableReadFixture(t, w)
-	cache, err := otter.MustBuilder[solana.PublicKey, *accountsdb.ProgramCacheEntry](1024).
-		Cost(func(solana.PublicKey, *accountsdb.ProgramCacheEntry) uint32 { return 1 }).Build()
-	require.NoError(t, err)
-	t.Cleanup(cache.Close)
+	cache := accountsdb.NewWeightedCache[solana.PublicKey, *accountsdb.ProgramCacheEntry](1024, func(solana.PublicKey, *accountsdb.ProgramCacheEntry) uint32 { return 1 })
 	db := &accountsdb.AccountsDb{ProgramCache: cache}
 	return func() (*ExecutionCtx, error) {
 		list := make([]accounts.Account, len(w.accts)+1)

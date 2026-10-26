@@ -12,7 +12,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/util"
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 )
 
 // Compaction reclaims dead bytes from the append-only store. Folds never

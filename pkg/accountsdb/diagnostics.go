@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 )
 
 // FoldTimings splits one CommitBatch into its sequential steps. They are
