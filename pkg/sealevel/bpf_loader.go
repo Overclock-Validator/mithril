@@ -573,21 +573,21 @@ func directMappedAccountData(execCtx *ExecutionCtx, acct *BorrowedAccount, reser
 	return data, false, nil, nil
 }
 
-func serializeParametersAligned(execCtx *ExecutionCtx) ([]byte, []uint64, uint64, []serializedAcctMetadata, []sbpf.InputRegion, error) {
+func serializeParametersAligned(execCtx *ExecutionCtx) ([]byte, uint64, []serializedAcctMetadata, []sbpf.InputRegion, error) {
 	txCtx := execCtx.TransactionContext
 	instrCtx, err := txCtx.CurrentInstructionCtx()
 	if err != nil {
-		return nil, nil, 0, nil, nil, err
+		return nil, 0, nil, nil, err
 	}
 
 	numIxAccts := instrCtx.NumberOfInstructionAccounts()
 	if numIxAccts > MaxInstructionAccounts {
-		return nil, nil, 0, nil, nil, InstrErrMaxAccountsExceeded
+		return nil, 0, nil, nil, InstrErrMaxAccountsExceeded
 	}
 
 	programAcct, err := instrCtx.BorrowLastProgramAccount(txCtx)
 	if err != nil {
-		return nil, nil, 0, nil, nil, err
+		return nil, 0, nil, nil, err
 	}
 	programId := programAcct.Key()
 	programAcct.Drop()
@@ -605,14 +605,14 @@ func serializeParametersAligned(execCtx *ExecutionCtx) ([]byte, []uint64, uint64
 	for instrAcctIdx := uint64(0); instrAcctIdx < instrCtx.NumberOfInstructionAccounts(); instrAcctIdx++ {
 		isDupe, idxInCallee, err := instrCtx.IsInstructionAccountDuplicate(instrAcctIdx)
 		if err != nil {
-			return nil, nil, 0, nil, nil, err
+			return nil, 0, nil, nil, err
 		}
 		if isDupe {
 			accts[int(instrAcctIdx)] = serializeAcct{isDuplicate: true, indexOfAcct: idxInCallee}
 		} else {
 			acct, err := instrCtx.BorrowInstructionAccount(txCtx, instrAcctIdx)
 			if err != nil {
-				return nil, nil, 0, nil, nil, err
+				return nil, 0, nil, nil, err
 			}
 
 			accts[int(instrAcctIdx)] = serializeAcct{indexOfAcct: instrAcctIdx, acct: acct}
@@ -663,10 +663,13 @@ func serializeParametersAligned(execCtx *ExecutionCtx) ([]byte, []uint64, uint64
 	}
 	serializedData = binary.LittleEndian.AppendUint64(serializedData, uint64(len(accts)))
 
-	preLens := make([]uint64, len(accts))
 	accountMetadatas := make([]serializedAcctMetadata, len(accts))
 	maskRentEpoch := execCtx.Features.IsActive(features.MaskOutRentEpochInVmSerialization)
 	var inputRegions []sbpf.InputRegion
+	if vasa {
+		// At most one metadata and one data region per account, plus the tail.
+		inputRegions = make([]sbpf.InputRegion, 0, 2*len(accts)+1)
+	}
 	var regionStart uint64
 	var hostRegionStart uint64
 	virtualOffset := uint64(8)
@@ -678,7 +681,6 @@ func serializeParametersAligned(execCtx *ExecutionCtx) ([]byte, []uint64, uint64
 			serializedData = serializedData[:l+8]
 			position := acct.indexOfAcct
 			serializedData[l] = byte(position)
-			preLens[i] = preLens[position]
 			accountMetadatas[i] = accountMetadatas[position]
 			virtualOffset += 8
 		} else { // not a duplicate
@@ -730,7 +732,6 @@ func serializeParametersAligned(execCtx *ExecutionCtx) ([]byte, []uint64, uint64
 			binary.LittleEndian.PutUint64(serializedData[l+72:l+80], borrowedAcct.Lamports())
 
 			// acct data len
-			preLens[i] = dataLen
 			binary.LittleEndian.PutUint64(serializedData[l+80:l+88], dataLen)
 			accountMetadatas[i] = serializedAcctMetadata{
 				originalDataLen: dataLen,
@@ -746,7 +747,7 @@ func serializeParametersAligned(execCtx *ExecutionCtx) ([]byte, []uint64, uint64
 				if directMapping {
 					data, writable, onWrite, err := directMappedAccountData(execCtx, borrowedAcct, reserved)
 					if err != nil {
-						return nil, nil, 0, nil, nil, err
+						return nil, 0, nil, nil, err
 					}
 					appendVasaAccountDataRegion(&inputRegions, dataStart, 0, dataLen, reserved, writable, int(acct.indexOfAcct), data, onWrite)
 					hostRegionStart = uint64(l) + 88 + (bpfAlignOfU128 - alignmentOffset)
@@ -800,10 +801,10 @@ func serializeParametersAligned(execCtx *ExecutionCtx) ([]byte, []uint64, uint64
 		panic(fmt.Sprintf("mismatch between serialized data and expected length: len(serializedData) = %d, expected size = %d", uint64(len(serializedData)), size))
 	}
 
-	return serializedData, preLens, instructionDataOffset, accountMetadatas, inputRegions, nil
+	return serializedData, instructionDataOffset, accountMetadatas, inputRegions, nil
 }
 
-func deserializeParametersAligned(execCtx *ExecutionCtx, parameterBytes []byte, preLens []uint64) error {
+func deserializeParametersAligned(execCtx *ExecutionCtx, parameterBytes []byte, accountMetadatas []serializedAcctMetadata) error {
 	txCtx := execCtx.TransactionContext
 	instrCtx, err := txCtx.CurrentInstructionCtx()
 	if err != nil {
@@ -816,7 +817,7 @@ func deserializeParametersAligned(execCtx *ExecutionCtx, parameterBytes []byte, 
 
 	off += 8 // number of accounts
 	for instrAcctIdx := uint64(0); instrAcctIdx < instrCtx.NumberOfInstructionAccounts(); instrAcctIdx++ {
-		preLen := preLens[instrAcctIdx]
+		preLen := accountMetadatas[instrAcctIdx].originalDataLen
 
 		isDupe, _, err := instrCtx.IsInstructionAccountDuplicate(instrAcctIdx)
 		if err != nil {
@@ -937,33 +938,32 @@ func deserializeParametersAligned(execCtx *ExecutionCtx, parameterBytes []byte, 
 	return nil
 }
 
-func serializeParametersUnaligned(execCtx *ExecutionCtx) ([]byte, []uint64, uint64, []serializedAcctMetadata, []sbpf.InputRegion, error) {
+func serializeParametersUnaligned(execCtx *ExecutionCtx) ([]byte, uint64, []serializedAcctMetadata, []sbpf.InputRegion, error) {
 	txCtx := execCtx.TransactionContext
 	instrCtx, err := txCtx.CurrentInstructionCtx()
 	if err != nil {
-		return nil, nil, 0, nil, nil, err
+		return nil, 0, nil, nil, err
 	}
 
 	numIxAccts := instrCtx.NumberOfInstructionAccounts()
 	if numIxAccts > MaxInstructionAccounts {
-		return nil, nil, 0, nil, nil, InstrErrMaxAccountsExceeded
+		return nil, 0, nil, nil, InstrErrMaxAccountsExceeded
 	}
 
 	programAcct, err := instrCtx.BorrowLastProgramAccount(txCtx)
 	if err != nil {
-		return nil, nil, 0, nil, nil, err
+		return nil, 0, nil, nil, err
 	}
 	programId := programAcct.Key()
 	programAcct.Drop()
 
 	instrData := instrCtx.Data
-	var preLens []uint64
 
 	accts := make([]serializeAcct, 0, instrCtx.NumberOfInstructionAccounts())
 	for instrAcctIdx := uint64(0); instrAcctIdx < instrCtx.NumberOfInstructionAccounts(); instrAcctIdx++ {
 		isDupe, idxInCallee, err := instrCtx.IsInstructionAccountDuplicate(instrAcctIdx)
 		if err != nil {
-			return nil, nil, 0, nil, nil, err
+			return nil, 0, nil, nil, err
 		}
 		if isDupe {
 			sa := serializeAcct{isDuplicate: true, indexOfAcct: idxInCallee}
@@ -971,7 +971,7 @@ func serializeParametersUnaligned(execCtx *ExecutionCtx) ([]byte, []uint64, uint
 		} else {
 			acct, err := instrCtx.BorrowInstructionAccount(txCtx, instrAcctIdx)
 			if err != nil {
-				return nil, nil, 0, nil, nil, err
+				return nil, 0, nil, nil, err
 			}
 			defer acct.Drop()
 
@@ -1018,6 +1018,10 @@ func serializeParametersUnaligned(execCtx *ExecutionCtx) ([]byte, []uint64, uint
 	serializedData = binary.LittleEndian.AppendUint64(serializedData, uint64(len(accts)))
 	accountMetadatas := make([]serializedAcctMetadata, 0, len(accts))
 	var inputRegions []sbpf.InputRegion
+	if vasa {
+		// At most one metadata and one data region per account, plus the tail.
+		inputRegions = make([]sbpf.InputRegion, 0, 2*len(accts)+1)
+	}
 	var regionStart uint64
 	var hostRegionStart uint64
 	virtualOffset := uint64(8)
@@ -1029,7 +1033,6 @@ func serializeParametersUnaligned(execCtx *ExecutionCtx) ([]byte, []uint64, uint
 		if acct.isDuplicate { // duplicate
 			position := acct.indexOfAcct
 			serializedData = append(serializedData, byte(position))
-			preLens = append(preLens, preLens[position])
 			accountMetadatas = append(accountMetadatas, accountMetadatas[position])
 			virtualOffset++
 		} else { // not a duplicate
@@ -1057,7 +1060,6 @@ func serializeParametersUnaligned(execCtx *ExecutionCtx) ([]byte, []uint64, uint
 
 			// acct data len
 			dataLen := uint64(len(borrowedAcct.Data()))
-			preLens = append(preLens, dataLen)
 			serializedData = binary.LittleEndian.AppendUint64(serializedData, dataLen)
 			accountMetadatas = append(accountMetadatas, serializedAcctMetadata{
 				originalDataLen: dataLen,
@@ -1073,7 +1075,7 @@ func serializeParametersUnaligned(execCtx *ExecutionCtx) ([]byte, []uint64, uint
 				if directMapping {
 					data, writable, onWrite, err := directMappedAccountData(execCtx, borrowedAcct, dataLen)
 					if err != nil {
-						return nil, nil, 0, nil, nil, err
+						return nil, 0, nil, nil, err
 					}
 					appendVasaAccountDataRegion(&inputRegions, dataStart, 0, dataLen, dataLen, writable, int(acct.indexOfAcct), data, onWrite)
 					hostRegionStart = uint64(l) + 51
@@ -1133,10 +1135,10 @@ func serializeParametersUnaligned(execCtx *ExecutionCtx) ([]byte, []uint64, uint
 		panic("mismatch between serialized data and expected length")
 	}
 
-	return serializedData, preLens, instructionDataOffset, accountMetadatas, inputRegions, nil
+	return serializedData, instructionDataOffset, accountMetadatas, inputRegions, nil
 }
 
-func deserializeParametersUnaligned(execCtx *ExecutionCtx, parameterBytes []byte, preLens []uint64) error {
+func deserializeParametersUnaligned(execCtx *ExecutionCtx, parameterBytes []byte, accountMetadatas []serializedAcctMetadata) error {
 	txCtx := execCtx.TransactionContext
 	instrCtx, err := txCtx.CurrentInstructionCtx()
 	if err != nil {
@@ -1149,7 +1151,7 @@ func deserializeParametersUnaligned(execCtx *ExecutionCtx, parameterBytes []byte
 
 	off += 8 // number of accounts
 	for instrAcctIdx := uint64(0); instrAcctIdx < instrCtx.NumberOfInstructionAccounts(); instrAcctIdx++ {
-		preLen := preLens[instrAcctIdx]
+		preLen := accountMetadatas[instrAcctIdx].originalDataLen
 
 		isDupe, _, err := instrCtx.IsInstructionAccountDuplicate(instrAcctIdx)
 		if err != nil {
@@ -1263,18 +1265,17 @@ func executeLoadedProgram(execCtx *ExecutionCtx, program *sbpf.Program, syscallR
 	}
 
 	var parameterBytes []byte
-	var preLens []uint64
 	var instrDataOffset uint64
 	var accountMetadatas []serializedAcctMetadata
 	var inputRegions []sbpf.InputRegion
 
 	if isLoaderDeprecated {
-		parameterBytes, preLens, instrDataOffset, accountMetadatas, inputRegions, err = serializeParametersUnaligned(execCtx)
+		parameterBytes, instrDataOffset, accountMetadatas, inputRegions, err = serializeParametersUnaligned(execCtx)
 		if err != nil {
 			return err
 		}
 	} else {
-		parameterBytes, preLens, instrDataOffset, accountMetadatas, inputRegions, err = serializeParametersAligned(execCtx)
+		parameterBytes, instrDataOffset, accountMetadatas, inputRegions, err = serializeParametersAligned(execCtx)
 		if err != nil {
 			return err
 		}
@@ -1325,12 +1326,12 @@ func executeLoadedProgram(execCtx *ExecutionCtx, program *sbpf.Program, syscallR
 	// deserialize data
 	if runErr == nil {
 		if isLoaderDeprecated {
-			err = deserializeParametersUnaligned(execCtx, parameterBytes, preLens)
+			err = deserializeParametersUnaligned(execCtx, parameterBytes, accountMetadatas)
 			if err != nil {
 				return InstrErrInvalidArgument
 			}
 		} else {
-			err = deserializeParametersAligned(execCtx, parameterBytes, preLens)
+			err = deserializeParametersAligned(execCtx, parameterBytes, accountMetadatas)
 			if err != nil {
 				return InstrErrInvalidArgument
 			}
