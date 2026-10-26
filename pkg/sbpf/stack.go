@@ -34,6 +34,8 @@ type Stack struct {
 	mem                []byte
 	sp                 uint64
 	shadow             []Frame
+	memBuffer          *byteBuffer
+	shadowBuffer       *frameBuffer
 	dynamicStackFrames bool
 	stackFrameGaps     bool
 	// dirtyLo/dirtyHi bound the physical byte range of mem that may have been
@@ -65,6 +67,10 @@ const StackDepth = 64
 
 var GapMask = uint64(0xFFFFFFFFFFFFF000)
 
+// Pool holders avoid boxing slice headers on each return to sync.Pool.
+type byteBuffer struct{ data []byte }
+type frameBuffer struct{ data []Frame }
+
 func newStackMem() []byte {
 	return make([]byte, StackMax)
 }
@@ -78,31 +84,37 @@ var (
 	UsePool = true
 
 	stackMemPool = &sync.Pool{New: func() interface{} {
-		return newStackMem()
+		return &byteBuffer{data: newStackMem()}
 	}}
 
 	stackShadowPool = &sync.Pool{New: func() interface{} {
-		return newStackShadow()
+		return &frameBuffer{data: newStackShadow()}
 	}}
 )
 
 func NewStack(sbpfVer sbpfver.SbpfVersion, disableStackFrameGaps bool) Stack {
 	var m []byte
 	var sh []Frame
+	var mb *byteBuffer
+	var sb *frameBuffer
 	if UsePool {
-		m = stackMemPool.Get().([]byte)
-		sh = stackShadowPool.Get().([]Frame)
+		mb = stackMemPool.Get().(*byteBuffer)
+		sb = stackShadowPool.Get().(*frameBuffer)
+		m = mb.data
+		sh = sb.data
 	} else {
 		m = newStackMem()
 		sh = newStackShadow()
 	}
 
 	s := Stack{
-		mem:     m,
-		sp:      VaddrStack,
-		shadow:  sh,
-		dirtyLo: StackMax,
-		dirtyHi: 0,
+		mem:          m,
+		sp:           VaddrStack,
+		shadow:       sh,
+		memBuffer:    mb,
+		shadowBuffer: sb,
+		dirtyLo:      StackMax,
+		dirtyHi:      0,
 	}
 
 	var sz uint64
@@ -126,11 +138,13 @@ func (s *Stack) Finish() {
 		if s.dirtyHi > s.dirtyLo {
 			clear(s.mem[s.dirtyLo:s.dirtyHi])
 		}
-		stackMemPool.Put(s.mem)
+		s.memBuffer.data = s.mem
+		stackMemPool.Put(s.memBuffer)
 		s.shadow = s.shadow[:StackDepth]
 		clear(s.shadow[:max(s.maxDepth, 1)])
 		s.shadow = s.shadow[:1]
-		stackShadowPool.Put(s.shadow)
+		s.shadowBuffer.data = s.shadow
+		stackShadowPool.Put(s.shadowBuffer)
 	}
 }
 

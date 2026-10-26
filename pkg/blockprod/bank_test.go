@@ -803,7 +803,8 @@ func TestPrepareScheduleClosesFullFECBatch(t *testing.T) {
 	require.Empty(t, sink.batches)
 	require.Equal(t, 1, env.Bank.EntryBuilder().PendingCount())
 
-	require.Equal(t, costmodel.ExceedNone, env.Bank.PrepareSchedule(200))
+	_, reason = env.Bank.PrepareSchedule(200)
+	require.Equal(t, costmodel.ExceedNone, reason)
 	require.Len(t, sink.batches, 1)
 	require.Zero(t, env.Bank.EntryBuilder().PendingCount())
 }
@@ -820,11 +821,14 @@ func TestPrepareScheduleReservesAndRebatesWhenNotIncluded(t *testing.T) {
 	require.Greater(t, included, 0)
 	require.Zero(t, env.Bank.EntryBuilder().ReservedBytes())
 
-	require.Equal(t, costmodel.ExceedNone, env.Bank.PrepareSchedule(len(wire)))
+	res, reason := env.Bank.PrepareSchedule(len(wire))
+	require.Equal(t, costmodel.ExceedNone, reason)
 	require.Greater(t, env.Bank.EntryBytes(), included)
 	require.Greater(t, env.Bank.EntryBuilder().ReservedBytes(), 0)
 
-	result, reason = env.Bank.Forge(wire)
+	tx, err := solana.TransactionFromBytes(wire)
+	require.NoError(t, err)
+	result, reason = env.Bank.ForgeScheduledTransaction(tx, len(wire), nil, res)
 	require.Equal(t, ForgeDroppedAlreadyProcessed, result)
 	require.Equal(t, costmodel.ExceedNone, reason)
 	require.Equal(t, included, env.Bank.EntryBytes())
@@ -839,7 +843,8 @@ func TestPrepareScheduleRejectsSlotEntryBudget(t *testing.T) {
 	defer env.Close()
 
 	wire := txfixture.MustSignedTransferWire(0)
-	require.Equal(t, costmodel.ExceedBatchBytes, env.Bank.PrepareSchedule(len(wire)))
+	_, reason := env.Bank.PrepareSchedule(len(wire))
+	require.Equal(t, costmodel.ExceedBatchBytes, reason)
 	require.Zero(t, env.Bank.EntryBytes())
 	result, reason := env.Bank.Forge(wire)
 	assert.Equal(t, ForgeDroppedCost, result)
@@ -938,15 +943,13 @@ func TestWorkingBankSerializationFailureDoesNotCommit(t *testing.T) {
 			require.NoError(t, err)
 			payerBalance, destBalance := payer.Lamports, dest.Lamports
 			hash := env.Bank.EntryHash()
-			require.Equal(t, costmodel.ExceedNone, env.Bank.PrepareSchedule(len(wire)))
+			res, reason := env.Bank.PrepareSchedule(len(wire))
+			require.Equal(t, costmodel.ExceedNone, reason)
 			require.Positive(t, env.Bank.EntryBuilder().ReservedBytes())
-			var result ForgeResult
-			var reason costmodel.ExceedReason
-			if mode == "prepared" {
-				result, reason = env.Bank.ForgePreparedTransaction(tx, len(wire), prepared)
-			} else {
-				result, reason = env.Bank.ForgeTransaction(tx, len(wire))
+			if mode != "prepared" {
+				prepared = nil
 			}
+			result, reason := env.Bank.ForgeScheduledTransaction(tx, len(wire), prepared, res)
 			require.Equal(t, ForgeDroppedParse, result)
 			require.Equal(t, costmodel.ExceedNone, reason)
 			payer, err = env.SlotCtx.GetAccount(txfixture.PayerPubkey())

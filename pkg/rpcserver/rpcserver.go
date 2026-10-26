@@ -70,6 +70,8 @@ type RpcServer struct {
 	rootedBank    atomic.Pointer[rootedBankState]
 	identity      string
 
+	identitySource func() string
+
 	stakeCacheOnce  sync.Once
 	stakeCache      rootedStakeCache
 	voteRecordsOnce sync.Once
@@ -372,7 +374,9 @@ func (rpcServer *RpcServer) SetSlotCtx(slotCtx *sealevel.SlotCtx) {
 }
 
 func (rpcServer *RpcServer) SetIdentity(identity string) {
+	rpcServer.slotCtxMu.Lock()
 	rpcServer.identity = identity
+	rpcServer.slotCtxMu.Unlock()
 }
 
 func (rpcServer *RpcServer) getSlotCtx() *sealevel.SlotCtx {

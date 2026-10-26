@@ -27,6 +27,7 @@ type TestEnvConfig struct {
 	EntryHash           solana.Hash
 	Sink                BatchSink
 	TransactionStatuses *replay.TransactionStatusView
+	TPUGated            bool
 }
 
 func NewTestEnv(cfg TestEnvConfig) *TestEnv {
@@ -78,6 +79,7 @@ func NewTestEnv(cfg TestEnvConfig) *TestEnv {
 		EntryHash:           entryHash,
 		Sink:                cfg.Sink,
 		TransactionStatuses: statuses,
+		TPUGated:            cfg.TPUGated,
 	})
 	controller := NewController()
 	controller.SetWorkingBank(bank)
@@ -97,6 +99,16 @@ func (e *TestEnv) Close() {
 	if e.cleanup != nil {
 		e.cleanup()
 	}
+}
+
+// Fund creates a system account at key holding lamports.
+func (e *TestEnv) Fund(key solana.PublicKey, lamports uint64) error {
+	return e.SlotCtx.SetAccount(key, &accounts.Account{
+		Key:       key,
+		Lamports:  lamports,
+		Owner:     addresses.SystemProgramAddr,
+		RentEpoch: math.MaxUint64,
+	})
 }
 
 func seedTestAccounts(mem accounts.MemAccounts) {

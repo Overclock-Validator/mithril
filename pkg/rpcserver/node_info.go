@@ -43,6 +43,13 @@ func (rpcServer *RpcServer) SetHealthSlotSource(source func() (uint64, bool)) {
 	rpcServer.slotCtxMu.Unlock()
 }
 
+// SetIdentitySource supplies the current node identity; nil uses SetIdentity.
+func (rpcServer *RpcServer) SetIdentitySource(source func() string) {
+	rpcServer.slotCtxMu.Lock()
+	rpcServer.identitySource = source
+	rpcServer.slotCtxMu.Unlock()
+}
+
 // InvalidateHealth marks replay unavailable without discarding the last RPC bank.
 func (rpcServer *RpcServer) InvalidateHealth() {
 	rpcServer.slotCtxMu.Lock()
@@ -72,10 +79,16 @@ func (rpcServer *RpcServer) GetIdentity(ctx context.Context, p jsonrpc.RawParams
 	if err := validateNoParams(ctx, "getIdentity", p); err != nil {
 		return GetIdentityResp{}, err
 	}
-	if rpcServer.identity == "" {
+	rpcServer.slotCtxMu.RLock()
+	identity, source := rpcServer.identity, rpcServer.identitySource
+	rpcServer.slotCtxMu.RUnlock()
+	if source != nil {
+		identity = source()
+	}
+	if identity == "" {
 		return GetIdentityResp{}, errors.New("validator identity is not configured")
 	}
-	return GetIdentityResp{Identity: rpcServer.identity}, nil
+	return GetIdentityResp{Identity: identity}, nil
 }
 
 func validateNoParams(ctx context.Context, method string, p jsonrpc.RawParams) error {

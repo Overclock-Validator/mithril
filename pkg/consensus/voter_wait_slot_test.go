@@ -15,14 +15,14 @@ func waitSlotTestVoter(t *testing.T, cutoff uint64) *alpenglowVoter {
 	voteAccount := solana.PublicKey(voterTestKey(13).Public().(ed25519.PublicKey))
 	set := voterTestValidatorSet(t, identity, authorized, voteAccount)
 	root := alpenglow.BlockID{Slot: 39, Hash: solana.Hash{0x39}}
-	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234, AlpenglowIdentity: identity})
+	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234, AlpenglowIdentity: identityHolder(t, identity)})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, engine.Close()) })
 	engine.SetAlpenglowEpochLookup(func(uint64) uint64 { return set.Epoch })
 	require.NoError(t, engine.SetAlpenglowValidatorSet(set))
 	engine.SetAlpenglowRoot(root)
 	voter, err := newAlpenglowVoterUnstarted(engine, VotingConfig{
-		Identity: identity, AuthorizedVoter: authorized, VoteAccount: voteAccount,
+		AuthorizedVoter: authorized, VoteAccount: voteAccount,
 		HistoryDir: t.TempDir(), EpochForSlot: func(uint64) uint64 { return set.Epoch },
 		Peers:          func([]alpenglow.ValidatorStake) []alpenglow.VotorPeer { return nil },
 		WaitToVoteSlot: cutoff, ReadyToVote: func(uint64) bool { return true },

@@ -19,10 +19,10 @@ func newOrderingTestVoter(t *testing.T, reserved bool) (*AlpenglowObserverEngine
 	cfg.ReservedHistory = reserved
 	cfg.InitializeVoteReservation = reserved
 	root := alpenglow.BlockID{Slot: 39, Hash: solana.Hash{39}}
-	e, err := NewEngine(Config{AlpenglowIdentity: cfg.Identity, AlpenglowShredVersion: 0x1234})
+	e, err := NewEngine(Config{AlpenglowIdentity: identityHolder(t, voterTestKey(11)), AlpenglowShredVersion: 0x1234})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, e.Close()) })
-	set := voterTestValidatorSet(t, cfg.Identity, cfg.AuthorizedVoter, cfg.VoteAccount)
+	set := voterTestValidatorSet(t, voterTestKey(11), cfg.AuthorizedVoter, cfg.VoteAccount)
 	e.SetAlpenglowEpochLookup(cfg.EpochForSlot)
 	require.NoError(t, e.SetAlpenglowValidatorSet(set))
 	e.SetAlpenglowRoot(root)

@@ -200,7 +200,7 @@ func TestRetransmitterVerifiesParentResignsAndDeduplicates(t *testing.T) {
 	peerSource := &mutableTVUPeers{peers: allPeers}
 	sender := newCaptureBatchSender()
 	retransmitter, err := newRetransmitterWithSenders(RetransmitConfig{
-		Identity: identities[self],
+		Identity: identityHolder(t, identities[self]),
 		Peers:    peerSource,
 		Stakes: func(uint64) map[solana.PublicKey]uint64 {
 			return stakes
@@ -282,7 +282,7 @@ func TestRetransmitterRejectsInvalidParentSignature(t *testing.T) {
 
 	sender := newCaptureBatchSender()
 	retransmitter, err := newRetransmitterWithSenders(RetransmitConfig{
-		Identity:   selfKey,
+		Identity:   identityHolder(t, selfKey),
 		Peers:      peers,
 		Stakes:     func(uint64) map[solana.PublicKey]uint64 { return stakes },
 		UseChaCha8: true,
