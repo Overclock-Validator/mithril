@@ -31,7 +31,7 @@ func TestRPCHandlerMethodSet(t *testing.T) {
 }
 
 func TestInternalMethodsAreNotRPC(t *testing.T) {
-	for _, method := range []string{"enableEpochRewards", "enableBlockHistory", "setRootedBankState"} {
+	for _, method := range []string{"enableEpochRewards", "enableBlockHistory", "setRootedBankState", "setIdentity", "setIdentitySource", "invalidateHealth"} {
 		t.Run(method, func(t *testing.T) {
 			testInternalMethodNotRPC(t, method)
 		})
@@ -46,9 +46,15 @@ func testInternalMethodNotRPC(t *testing.T, method string) {
 			t.Cleanup(func() { _ = rpc.listener.Close() })
 			directory := filepath.Join(t.TempDir(), "history")
 			rpc.SetRootedBankState(100, 90, 80)
+			rpc.SetIdentity("before")
+			rpc.SetSlotCtx(&sealevel.SlotCtx{Slot: 1})
 			call := map[string]any{"jsonrpc": "2.0", "id": 1, "method": method, "params": []any{777, 666, 555}}
 			if method == "enableEpochRewards" || method == "enableBlockHistory" {
 				call["params"] = []any{directory, 100, 0}
+			} else if method == "setIdentity" {
+				call["params"] = []any{"after"}
+			} else if method == "invalidateHealth" {
+				call["params"] = []any{}
 			}
 			if mode == "oversized-single" {
 				call["padding"] = strings.Repeat("x", maxQuietMethodProbeBody+1)
@@ -102,6 +108,12 @@ func testInternalMethodNotRPC(t *testing.T, method string) {
 			root, _ := rpc.getRootedBankState()
 			if root.Slot != 100 {
 				t.Fatalf("internal request changed rooted bank: %d", root.Slot)
+			}
+			if rpc.identity != "before" {
+				t.Fatalf("internal request changed identity: %q", rpc.identity)
+			}
+			if !rpc.healthReady {
+				t.Fatal("internal request invalidated health")
 			}
 		})
 	}

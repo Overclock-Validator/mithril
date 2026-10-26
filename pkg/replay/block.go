@@ -74,6 +74,10 @@ type blockHistoryPublisher interface {
 	DiscardUnrootedBlockHistory(from uint64) error
 }
 
+type rpcHealthInvalidator interface {
+	InvalidateHealth()
+}
+
 // BlockFetchOpts contains options for parallel block fetching
 type BlockFetchOpts struct {
 	MaxRPS          int    // Rate limit (requests per second), 0 = use default
@@ -1770,6 +1774,11 @@ func ReplayBlocks(
 ) *ReplayResult {
 	result := &ReplayResult{}
 	historyPublisher, _ := rpcServer.(blockHistoryPublisher)
+	health, _ := rpcServer.(rpcHealthInvalidator)
+	if health != nil {
+		health.InvalidateHealth()
+		defer health.InvalidateHealth()
+	}
 	alpenglowMode := consensusOpts != nil && consensusOpts.Alpenglow
 	rewardPublisher, _ := rpcServer.(epochRewardPublisher)
 	rewardReadPublisher, _ := rpcServer.(epochRewardReadPublisher)
@@ -2580,6 +2589,10 @@ func ReplayBlocks(
 	}
 
 	blockStream := blockstream.NewBlockSource(opts)
+	if health, ok := rpcServer.(interface{ SetHealthSlotSource(func() (uint64, bool)) }); ok && isLive {
+		health.SetHealthSlotSource(blockStream.HealthSlot)
+		defer health.SetHealthSlotSource(func() (uint64, bool) { return 0, false })
+	}
 
 	if !isLive {
 		blockStream.DownloadInitialBlocks()
@@ -2674,7 +2687,7 @@ func ReplayBlocks(
 			mlog.Log.Warnf("%v — re-serving the skipped suffix from slot %d; executed bank remains at slot %d", sw, sw.Slot, currentExecutedAnchorSlot())
 			return true
 		}
-		rs, parentBankSysvars, fallbackReason := tryInLoopUnwind(sw, unrootedTailState, mithrilState, epochSchedule, currentEpoch, partitionedRewardsInfo)
+		rs, parentBankSysvars, fallbackReason := tryInLoopUnwind(sw, unrootedTailState, mithrilState, epochSchedule, currentEpoch, partitionedRewardsInfo, health)
 		if rs == nil {
 			windowSwitchFallback++
 			switchFallbackReasons[fallbackReason]++
@@ -3883,6 +3896,9 @@ func ReplayBlocks(
 	}
 
 	// Check if block source stalled (this provides explicit error info)
+	if health != nil {
+		health.InvalidateHealth()
+	}
 	if blockStream.Stalled() && result.Error == nil {
 		result.Error = fmt.Errorf("block fetch stalled - no progress for %v", blockStream.StallTimeout())
 	}
