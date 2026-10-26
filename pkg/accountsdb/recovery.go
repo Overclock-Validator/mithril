@@ -157,6 +157,12 @@ func (db *AccountsDb) RecoverFoldState() (RecoveryResult, error) {
 				res.DurableThrough = manifest.ThroughSlot
 				res.BatchSeq = manifest.BatchSeq
 				res.ResumeCtx = manifest.ResumeCtx
+				// A head that was already applied keeps the bankhash rows its fold
+				// wrote without a sync; restore them, since startup validates the
+				// rooted slot's row.
+				if len(res.ReplayedBatches) == 0 {
+					db.storeManifestBankhashes(manifest)
+				}
 				for _, bh := range manifest.Bankhashes {
 					if bh.Slot == manifest.ThroughSlot {
 						res.RootedBankhash = bh.Bankhash
