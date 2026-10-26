@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/features"
-	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -17,12 +16,7 @@ func TestSimulateTransactionRejectsSanitizeFailureWithoutSigVerify(t *testing.T)
 	wire, err := tx.MarshalBinary()
 	require.NoError(t, err)
 
-	rpcServer := &RpcServer{
-		slotCtx: &sealevel.SlotCtx{
-			Slot:     123,
-			Features: features.NewFeaturesDefault(),
-		},
-	}
+	rpcServer := transactionOptionsServer(t)
 
 	_, err = rpcServer.SimulateTransaction(
 		context.Background(),
@@ -44,14 +38,8 @@ func TestSimulateTransactionSanitizesBeforeV1FeatureGate(t *testing.T) {
 	wire, err := tx.MarshalBinary()
 	require.NoError(t, err)
 
-	featureSet := features.NewFeaturesDefault()
-	require.False(t, featureSet.IsActive(features.EnableTxV1))
-	rpcServer := &RpcServer{
-		slotCtx: &sealevel.SlotCtx{
-			Slot:     123,
-			Features: featureSet,
-		},
-	}
+	rpcServer := transactionOptionsServer(t)
+	require.False(t, rpcServer.rootedBank.Load().executionBank.Features.IsActive(features.EnableTxV1))
 
 	_, err = rpcServer.SimulateTransaction(
 		context.Background(),

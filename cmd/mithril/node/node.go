@@ -37,6 +37,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/lightbringer"
 	"github.com/Overclock-Validator/mithril/pkg/lthash"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
@@ -110,6 +111,7 @@ var (
 	validatorInitializeReservation   bool
 	validatorCompletionReserveMs     int
 	validatorMaxBufferedTransactions int
+	harmonicConfig                   harmonicSettings
 
 	// Mode thresholds
 	blockNearTipThreshold        int // Enter near-tip when gap <= this
@@ -169,6 +171,10 @@ var (
 	turbineGossipBindAddr   string
 	turbineAdvertisedIP     string
 	turbineShredVersion     int
+	// turbineShredReceivers get copies of the shreds this validator
+	// broadcasts, and turbineShredRetransmitReceivers of the shreds it relays.
+	turbineShredReceivers           []*net.UDPAddr
+	turbineShredRetransmitReceivers []*net.UDPAddr
 )
 
 func snapshotEpochForState(manifest *snapshot.SnapshotManifest) uint64 {
@@ -416,19 +422,24 @@ func loadBootstrapStateWith(
 	return validState, nil
 }
 
-func loadValidatorIdentityKeypair(path string) (ed25519.PrivateKey, string, error) {
+// loadValidatorIdentity holds the configured identity keypair, or a fresh
+// ephemeral one when none is configured. Every subsystem reads the node
+// identity from this one holder, so set-identity replaces it in one place.
+func loadValidatorIdentity(path string) (holder *identity.Holder, configured bool, err error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
-		return nil, "", nil
+		holder, err = identity.NewEphemeralHolder()
+		return holder, false, err
 	}
 	key, err := solana.PrivateKeyFromSolanaKeygenFile(path)
 	if err != nil {
-		return nil, "", fmt.Errorf("load validator identity keypair %s: %w", path, err)
+		return nil, false, fmt.Errorf("load validator identity keypair %s: %w", path, err)
 	}
-	if len(key) != ed25519.PrivateKeySize {
-		return nil, "", fmt.Errorf("validator identity keypair %s has invalid private key size %d", path, len(key))
+	holder, err = identity.NewHolder(ed25519.PrivateKey(key))
+	if err != nil {
+		return nil, false, fmt.Errorf("validator identity keypair %s: %w", path, err)
 	}
-	return ed25519.PrivateKey(append([]byte(nil), key...)), key.PublicKey().String(), nil
+	return holder, true, nil
 }
 
 func loadValidatorKeypairPubkey(label, path string) (string, error) {
@@ -586,6 +597,9 @@ func init() {
 	Run.Flags().IntVar(&validatorCompletionReserveMs, "leader-completion-reserve-ms", 0, "Time reserved for leader finalization and broadcast (0 = 75ms default; tune from measured completion times)")
 	Run.Flags().IntVar(&validatorMaxBufferedTransactions, "tpu-max-buffered-transactions", 0, "Maximum queued TPU transactions (0 = 131072 default)")
 
+	// [harmonic] section flags
+	registerHarmonicFlags(Run.Flags())
+
 	// [tuning] section flags
 	Run.Flags().Uint64Var(&paramArenaSizeMB, "param-arena-size-mb", 512, "Size in MB for serialized parameter arena (0 to disable)")
 	Run.Flags().Uint64Var(&borrowedAccountArenaSize, "borrowed-account-arena-size", 1024, "Number of borrowed accounts to preallocate in arena (0 to disable)")
@@ -632,6 +646,8 @@ func init() {
 	Run.Flags().BoolVar(&blockRPCFallback, "rpc-fallback", false, "Allow RPC to fetch blocks when replay is more than repair-catchup-max-gap-slots behind (default false: shreds via turbine + repair are the only block path)")
 	Run.Flags().StringVar(&turbineAdvertisedIP, "turbine-advertised-ip", "", "Public IP advertised by native turbine gossip (optional)")
 	Run.Flags().IntVar(&turbineShredVersion, "turbine-shred-version", 0, "Shred version for native turbine gossip (0 = discover from entrypoint)")
+	Run.Flags().StringSlice("shred-receiver-address", nil, "Also send every shred this validator broadcasts to this host:port (repeatable), e.g. a block builder")
+	Run.Flags().StringSlice("shred-retransmit-receiver-address", nil, "Also send every shred this node relays to this host:port (repeatable), e.g. a block builder")
 	Run.Flags().IntVar(&blockMaxRPS, "block-max-rps", 0, "Max RPC requests per second for block fetching (0 = use default)")
 	Run.Flags().IntVar(&blockMaxInflight, "block-max-inflight", 0, "Max concurrent block fetch workers (0 = use default)")
 	Run.Flags().IntVar(&blockTipPollIntervalMs, "block-tip-poll-ms", 0, "Tip poll interval in milliseconds (0 = use default)")
@@ -955,6 +971,16 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	turbineGossipBindAddr = getString("turbine-gossip-bind-addr", "turbine.gossip_bind_addr")
 	turbineAdvertisedIP = getString("turbine-advertised-ip", "turbine.advertised_ip")
 	turbineShredVersion = getInt("turbine-shred-version", "turbine.shred_version")
+	shredReceivers, err := parseShredReceivers("turbine.shred_receiver_addresses",
+		getStringSlice("shred-receiver-address", "turbine.shred_receiver_addresses"))
+	if err != nil {
+		return err
+	}
+	turbineShredReceivers = shredReceivers
+	if turbineShredRetransmitReceivers, err = parseShredReceivers("turbine.shred_retransmit_receiver_addresses",
+		getStringSlice("shred-retransmit-receiver-address", "turbine.shred_retransmit_receiver_addresses")); err != nil {
+		return err
+	}
 	repairCatchupMaxGapSlots = getInt("repair-catchup-max-gap-slots", "block.repair_catchup_max_gap_slots")
 	if repairCatchupMaxGapSlots < 0 {
 		repairCatchupMaxGapSlots = 0
@@ -1077,6 +1103,14 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		// The authorized withdrawer is deliberately NOT required at runtime —
 		// best practice keeps it offline.
 		mlog.Log.Infof("consensus.mode=validator: Alpenglow TPU ingress, block production, and fail-closed Votor voting enabled")
+	}
+
+	// [harmonic] section — optional block engine integration for leader slots.
+	if harmonicConfig, err = loadHarmonicSettings(optionGetters{getString: getString, getInt64: getInt64, getBool: getBool}); err != nil {
+		return err
+	}
+	if harmonicConfig.enabled && consensusMode != "validator" {
+		return fmt.Errorf("harmonic.enabled=true requires consensus.mode=validator")
 	}
 
 	blockMaxRPS = getInt("block-max-rps", "block.max_rps")
@@ -1505,7 +1539,7 @@ func runLive(c *cobra.Command, args []string) {
 	var lbManager *lightbringer.Manager
 	useLightbringer := blockSource == "lightbringer"
 	useTurbine := blockSource == "turbine"
-	validatorIdentity, validatorIdentityPubkey, err := loadValidatorIdentityKeypair(validatorIdentityKeypair)
+	validatorIdentity, validatorIdentityConfigured, err := loadValidatorIdentity(validatorIdentityKeypair)
 	if err != nil {
 		klog.Fatalf("%v", err)
 	}
@@ -1581,6 +1615,7 @@ func runLive(c *cobra.Command, args []string) {
 				RootSlot:                   func() uint64 { return rootSlot },
 				UseChaCha8:                 true,
 				DedupAddrs:                 false,
+				ShredReceivers:             turbineShredRetransmitReceivers,
 				FloorSlot:                  m.Bank.Slot + 1,
 				ShredSpoolDir:              catchupShredSpoolDir(),
 				RepairMaxRequestsPerSecond: repairMaxRequestsPerSecond,
@@ -1644,9 +1679,10 @@ func runLive(c *cobra.Command, args []string) {
 		}
 		validatorVoteAccount = votePubkey
 		if validatorAuthorizedVoterKeypair == "" {
-			if len(validatorIdentity) == ed25519.PrivateKeySize {
-				validatorAuthorizedVoter = append(ed25519.PrivateKey(nil), validatorIdentity...)
-				mlog.Log.Infof("validator vote account configured: %s (authorized voter defaults to identity %s, matching Agave)", votePubkey, validatorIdentityPubkey)
+			// Left empty, the authorized voter is the identity holder's key and
+			// follows set-identity swaps.
+			if validatorIdentityConfigured {
+				mlog.Log.Infof("validator vote account configured: %s (authorized voter defaults to identity %s, matching Agave)", votePubkey, validatorIdentity.PublicKey())
 			}
 		} else {
 			authorizedVoter, authorizedVoterPubkey, err := loadValidatorPrivateKey("authorized voter", validatorAuthorizedVoterKeypair)
@@ -1664,8 +1700,8 @@ func runLive(c *cobra.Command, args []string) {
 		}
 		mlog.Log.FileOnlyf("validator authorized withdrawer configured: %s", withdrawerPubkey)
 	}
-	if validatorIdentityPubkey != "" {
-		mlog.Log.Infof("validator identity configured for native gossip: %s", validatorIdentityPubkey)
+	if validatorIdentityConfigured {
+		mlog.Log.Infof("validator identity configured for native gossip: %s", validatorIdentity.PublicKey())
 	} else if useTurbine && alpenglowObserverBindAddr != "" {
 		mlog.Log.Warnf("ALPENGLOW observer: no validator.identity_keypair configured; native gossip will use an ephemeral identity and may not receive staked Votor traffic")
 	}
@@ -2646,6 +2682,8 @@ postBootstrap:
 			klog.Fatalf("enable RPC block history: %v", err)
 		}
 		publishRPCBankState(rpcServer, mithrilState)
+		publishRPCExecutionBank(ctx, rpcServer, accountsDb, mithrilState, resumeState, alpenglowMode)
+		rpcServer.SetIdentitySource(func() string { return validatorIdentity.PublicKey().String() })
 		if err := rpcServer.Start(); err != nil {
 			klog.Fatalf("start RPC server: %v", err)
 		}
@@ -2770,7 +2808,7 @@ postBootstrap:
 				}
 			}
 		}()
-		go monitorValidatorIdentityOwnership(ctx, rpcEndpoints, solana.PrivateKey(validatorIdentity).PublicKey(), sharedGossip, cancelRun)
+		go monitorValidatorIdentityOwnership(ctx, rpcEndpoints, validatorIdentity, sharedGossip, cancelRun)
 
 		epochSchedule := alpenglowEpochSchedule
 		global.SetWallClockSlotDuration(blockprod.AlpenglowSlotDuration)
@@ -2784,7 +2822,7 @@ postBootstrap:
 		mlog.Log.Infof("ALPENGLOW voting startup watermark: wall_clock=%d configured_wait_to_vote=%d wait_to_vote=%d", startupWallSlot, validatorWaitToVoteSlot, waitToVoteSlot)
 
 		broadcaster, err := turbine.NewTurbineBroadcaster(turbine.TurbineBroadcasterConfig{
-			Self:          solana.PrivateKey(validatorIdentity).PublicKey(),
+			Self:          validatorIdentity.PublicKey,
 			Peers:         sharedGossip,
 			Stakes:        turbineStakesForSlot,
 			EpochForSlot:  epochSchedule.GetEpoch,
@@ -2792,7 +2830,8 @@ postBootstrap:
 			UseChaCha8:    true,
 			// Agave treats custom/development clusters as non-deduplicating so
 			// every validator derives the same deterministic Turbine node list.
-			DedupAddrs: false,
+			DedupAddrs:     false,
+			ShredReceivers: turbineShredReceivers,
 		})
 		if err != nil {
 			klog.Fatalf("validator turbine broadcaster: %v", err)
@@ -2840,12 +2879,24 @@ postBootstrap:
 		if err := sharedGossip.SetTPUQUIC(tpuAdvertise); err != nil {
 			mlog.Log.Warnf("validator gossip TPU advertisement: %v", err)
 		}
+		// Harmonic is optional. Without it the leader loop has no hooks and
+		// its banks admit TPU transactions from the start.
+		var leaderHooks blockprod.LeaderHooks
+		if harmonicConfig.enabled {
+			hooks, stopHarmonic, err := startHarmonic(ctx, harmonicConfig, validatorIdentity, validatorVoteAccount, tpuService, sharedGossip,
+				gossip.TPUSockets{QUIC: tpuAdvertise, ForwardsQUIC: tpuAdvertise}, tpuCfg.Pipeline.TxV1Enabled)
+			if err != nil {
+				klog.Fatalf("start Harmonic: %v", err)
+			}
+			// Defers run in reverse: the leader loop, which calls the hooks,
+			// stops first, then Harmonic, then the TPU it submits to.
+			defer stopHarmonic()
+			leaderHooks = hooks
+		}
 
 		// Bind and validate local transports before consuming the durable clean
 		// voting marker. Startup configuration failures must not force recovery.
-		identityPubkey := solana.PrivateKey(validatorIdentity).PublicKey()
 		if err := consensusEngine.EnableVoting(consensusengine.VotingConfig{
-			Identity:                  validatorIdentity,
 			AuthorizedVoter:           validatorAuthorizedVoter,
 			VoteAccount:               validatorVoteAccount,
 			HistoryDir:                blockstorePath,
@@ -2865,8 +2916,9 @@ postBootstrap:
 			Peers: func(validators []alpenglow.ValidatorStake) []alpenglow.VotorPeer {
 				peers := make([]alpenglow.VotorPeer, 0, len(validators))
 				seen := make(map[solana.PublicKey]struct{}, len(validators))
+				self := validatorIdentity.PublicKey()
 				for _, validator := range validators {
-					if validator.Stake == 0 || validator.NodePubkey == identityPubkey {
+					if validator.Stake == 0 || validator.NodePubkey == self {
 						continue
 					}
 					addr, ok := sharedGossip.LookupAlpenglow(validator.NodePubkey)
@@ -2894,7 +2946,7 @@ postBootstrap:
 		leaderDone := make(chan struct{})
 		leaderLoop := blockprod.NewLeaderLoop(blockprod.LeaderLoopConfig{
 			Controller:        controller,
-			Identity:          solana.PrivateKey(validatorIdentity),
+			Identity:          validatorIdentity,
 			AccountsDb:        accountsDb,
 			Broadcaster:       broadcaster,
 			ShredVersion:      uint16(turbineShredVersion),
@@ -2947,6 +2999,8 @@ postBootstrap:
 			},
 			LeaderForSlot: global.LeaderForSlot,
 			RewardCerts:   rewardBuilder,
+			Hooks:         leaderHooks,
+			GateTPU:       leaderHooks != nil,
 			OnBlock: func(produced *block.Block) {
 				select {
 				case localBlocks <- produced:
@@ -2990,16 +3044,16 @@ postBootstrap:
 			}
 			return alpenglowEpochSchedule.GetEpoch(slot)
 		},
-		TurbineRootSlot:   global.ReplayFrontier,
-		TurbineUseChaCha8: true,
-		TurbineDedupAddrs: false,
+		TurbineRootSlot:       global.ReplayFrontier,
+		TurbineUseChaCha8:     true,
+		TurbineDedupAddrs:     false,
+		TurbineShredReceivers: turbineShredRetransmitReceivers,
 	}
 	if consensusMode == "validator" {
-		identity := solana.PrivateKey(validatorIdentity).PublicKey()
 		blockFetchOpts.LocalBlocks = localBlocks
 		blockFetchOpts.LocalLeaderForSlot = func(slot uint64) bool {
 			leader, ok := global.LeaderForSlot(slot)
-			return ok && leader == identity
+			return ok && leader == validatorIdentity.PublicKey()
 		}
 	}
 
@@ -3047,6 +3101,21 @@ postBootstrap:
 	turbineAlpenglowAddr := ""
 	if alpenglowMode {
 		turbineAlpenglowAddr = alpenglowAddrForGossip(alpenglowObserverBindAddr)
+	}
+	// Agave's admin RPC. Started after voting is enabled so the voter's
+	// identity updater is registered before any set-identity can arrive.
+	if blockstorePath != "" {
+		adminServer, err := startAdminRPC(blockstorePath, validatorIdentity, accountsDb, validatorVoteAccount, turbineStakesForSlot)
+		if err != nil {
+			mlog.Log.Warnf("admin RPC unavailable, set-identity is disabled: %v", err)
+		} else {
+			mlog.Log.Infof("admin RPC listening on %s", adminServer.Path())
+			defer func() {
+				if err := adminServer.Close(); err != nil {
+					mlog.Log.Warnf("admin RPC close: %v", err)
+				}
+			}()
+		}
 	}
 	result := runReplayWithRecovery(ctx, accountsDb, accountsPath, manifest, resumeState, uint64(startSlot), liveEndSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, uint16(turbineShredVersion), turbineAlpenglowAddr, validatorIdentity, blockstorePath, int(txParallelism), true, useLightbringer, useTurbine, dbgOpts, metricsWriter, slotCtxSetter, mithrilState, blockFetchOpts, consensusOpts, compactCfg.RewindHorizonBatches, replayStartTime)
 	stopCompactor() // join before shutdown closes AccountsDB
@@ -3189,23 +3258,7 @@ func getVersion() string {
 // getCommit returns the git commit hash, preferring ldflags but falling back to
 // runtime/debug.BuildInfo for dev builds.
 func getCommit() string {
-	// If set via ldflags (release builds), use that
-	if version.GitCommit != "" && version.GitCommit != "unknown" {
-		return version.GitCommit
-	}
-	// Fallback to runtime/debug for dev builds (go build without ldflags)
-	if info, ok := debug.ReadBuildInfo(); ok {
-		for _, setting := range info.Settings {
-			if setting.Key == "vcs.revision" {
-				// Return short hash (8 chars) for consistency
-				if len(setting.Value) > 8 {
-					return setting.Value[:8]
-				}
-				return setting.Value
-			}
-		}
-	}
-	return "unknown"
+	return version.Commit()
 }
 
 // getBranch returns the git branch name, preferring ldflags but falling back to
@@ -3845,22 +3898,33 @@ const (
 // healthy. Passive gossip cannot always observe the winning record after its
 // own endpoint has been displaced, so use the already-configured RPC view as
 // an independent ownership check and stop cleanly instead of stalling replay.
-func monitorValidatorIdentityOwnership(ctx context.Context, rpcEndpoints []string, identity solana.PublicKey, client *gossip.Client, cancel context.CancelFunc) {
-	if len(rpcEndpoints) == 0 || client == nil || cancel == nil {
+//
+// The monitor follows the identity holder. A set-identity swap restarts the
+// grace period: until our fresh ContactInfo propagates, the cluster may still
+// advertise the previous owner of the new identity.
+func monitorValidatorIdentityOwnership(ctx context.Context, rpcEndpoints []string, holder *identity.Holder, client *gossip.Client, cancel context.CancelFunc) {
+	if len(rpcEndpoints) == 0 || holder == nil || client == nil || cancel == nil {
 		return
 	}
-	grace := time.NewTimer(validatorIdentityOwnershipGrace)
-	defer grace.Stop()
-	select {
-	case <-ctx.Done():
-		return
-	case <-grace.C:
-	}
-
 	ticker := time.NewTicker(validatorIdentityOwnershipPollInterval)
 	defer ticker.Stop()
+	identity := holder.PublicKey()
+	checkAfter := time.Now().Add(validatorIdentityOwnershipGrace)
 	conflicts := 0
 	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if current := holder.PublicKey(); current != identity {
+			identity, conflicts = current, 0
+			checkAfter = time.Now().Add(validatorIdentityOwnershipGrace)
+		}
+		if time.Now().Before(checkAfter) {
+			continue
+		}
+
 		expected := client.AdvertisedGossipAddr()
 		if expected != nil {
 			lookupCtx, lookupCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -3885,12 +3949,6 @@ func monitorValidatorIdentityOwnership(ctx context.Context, rpcEndpoints []strin
 				mlog.Log.Warnf("validator identity ownership check: cluster currently advertises gossip=%s for %s, expected %s (confirmation %d/%d)",
 					observed, identity.String(), expected.String(), conflicts, validatorIdentityConflictConfirmations)
 			}
-		}
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
 		}
 	}
 }
@@ -4505,7 +4563,7 @@ func runReplayWithRecovery(
 	turbineAdvertisedIP string,
 	turbineShredVersion uint16,
 	turbineAlpenglowAddr string,
-	turbineIdentity ed25519.PrivateKey,
+	turbineIdentity *identity.Holder,
 	blockDir string,
 	txParallelism int,
 	isLive bool,
@@ -4764,6 +4822,7 @@ func runReplayWithRecovery(
 			mlog.Log.Errorf("fork switch: cannot rebuild resume context: %v; halting", err)
 			break
 		}
+		publishRPCExecutionBank(ctx, rpcServer, accountsDb, mithrilState, rs, consensusOpts != nil && consensusOpts.Alpenglow)
 		mlog.Log.Warnf("fork switch: %s; re-replaying the selected chain from rooted slot %d (attempt %d/%d)",
 			recoveryReason, retryStart-1, attempt, maxForkSwitchRetries)
 		result = replay.ReplayBlocks(ctx, accountsDb, accountsDbPath, mithrilState, rs, retryStart, endSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, turbineShredVersion, turbineAlpenglowAddr, turbineIdentity, blockDir, txParallelism, isLive, useLightbringer, useTurbine, dbgOpts, metricsWriter, rpcServer, blockFetchOpts, consensusOpts, onCancelWriteState)
@@ -4799,6 +4858,23 @@ func finishReplayRecovery(rpcServer replay.SlotCtxSetter, s *state.MithrilState,
 
 type rpcBankStateSetter interface {
 	SetRootedBankState(slot, blockHeight, transactionCount uint64)
+}
+
+// publishRPCExecutionBank follows scalar-root publication. Reconstruction is
+// optional: unavailable execution metadata must not prevent ordinary replay.
+func publishRPCExecutionBank(ctx context.Context, server replay.SlotCtxSetter, db *accountsdb.AccountsDb, s *state.MithrilState, resume *replay.ResumeState, alpenglow bool) {
+	publisher, ok := server.(interface {
+		SetRootedExecutionBank(*replay.ChainTipSnapshot)
+	})
+	if !ok {
+		return
+	}
+	bank, err := replay.RootedRPCBankContext(ctx, db, s, resume, alpenglow)
+	if err != nil {
+		mlog.Log.Debugf("rooted RPC execution parameters unavailable: %v", err)
+		return
+	}
+	publisher.SetRootedExecutionBank(bank)
 }
 
 func publishRPCBankState(rpcServer rpcBankStateSetter, mithrilState *state.MithrilState) {

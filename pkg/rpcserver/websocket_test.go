@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/require"
@@ -22,6 +21,7 @@ func TestWebSocketControlValidation(t *testing.T) {
 	for _, method := range []string{"xrpc.cancel", "xrpc.ch.val", "xrpc.ch.close"} {
 		t.Run(method, func(t *testing.T) {
 			server := NewRpcServer(nil, 0, &sealevel.SysvarEpochSchedule{}, solana.Hash{1})
+			server.SetRootedBankState(100, 70, 0)
 			require.NoError(t, server.listener.Close())
 			endpoint := httptest.NewServer(server)
 			t.Cleanup(endpoint.Close)
@@ -71,7 +71,7 @@ func TestWebSocketControlValidation(t *testing.T) {
 					payload := make([]byte, int(header[1]))
 					_, err = io.ReadFull(reader, payload)
 					require.NoError(t, err)
-					require.JSONEq(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":7,"result":%d}`, global.BlockHeight()), string(payload))
+					require.JSONEq(t, `{"jsonrpc":"2.0","id":7,"result":70}`, string(payload))
 				})
 			}
 		})

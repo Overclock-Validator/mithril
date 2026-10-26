@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
-	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
+	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -30,17 +30,10 @@ const (
 	mintDecimalsOffset = 44
 )
 
-// isTokenProgramOwner reports whether an account is owned by either the
-// legacy SPL Token program or Token-2022. Both programs use the same
-// account layout for the leading 165 bytes.
-func isTokenProgramOwner(owner [32]byte) bool {
-	return owner == [32]byte(splTokenProgramID) || owner == [32]byte(splToken2022ProgramID)
-}
-
 // extractTokenBalances walks the supplied transaction accounts and emits
 // a TokenBalancePayload for each one that is recognized as an SPL Token
 // account. mintDecimals is consulted for the per-mint decimal count;
-// callers populate it from accountsdb. Missing decimals fall back to 0
+// callers populate it from the selected bank. Missing decimals fall back to 0
 // rather than skipping the account so pre/post arrays stay aligned with
 // the transaction's account index.
 func extractTokenBalances(
@@ -52,10 +45,7 @@ func extractTokenBalances(
 	}
 	out := make([]TokenBalancePayload, 0)
 	for idx, acct := range txAccts {
-		if acct == nil || !isTokenProgramOwner(acct.Owner) {
-			continue
-		}
-		if len(acct.Data) < tokenAccountSize {
+		if !sealevel.IsInitializedTokenAccount(acct) {
 			continue
 		}
 		mint := publicKeyFromOffset(acct.Data, tokenAccountMintOffset)
@@ -85,24 +75,27 @@ func extractTokenBalances(
 }
 
 // fetchMintDecimals collects the unique mints referenced by token
-// accounts in txAccts and looks each one up in accountsdb to extract its
+// accounts in txAccts and looks each one up in the captured bank to extract its
 // decimals byte. Mints that fail the size check or aren't found are
 // omitted; callers default missing entries to 0.
 func fetchMintDecimals(
 	txAccts []*accounts.Account,
-	db *accountsdb.AccountsDb,
+	reader sealevel.AccountReader,
 	slot uint64,
 ) map[solana.PublicKey]uint8 {
 	out := make(map[solana.PublicKey]uint8)
-	if db == nil {
+	if reader == nil {
 		return out
+	}
+	byKey := make(map[solana.PublicKey]*accounts.Account, len(txAccts))
+	for _, acct := range txAccts {
+		if acct != nil {
+			byKey[acct.Key] = acct
+		}
 	}
 	seen := make(map[solana.PublicKey]struct{})
 	for _, acct := range txAccts {
-		if acct == nil || !isTokenProgramOwner(acct.Owner) {
-			continue
-		}
-		if len(acct.Data) < tokenAccountSize {
+		if !sealevel.IsInitializedTokenAccount(acct) {
 			continue
 		}
 		mint := publicKeyFromOffset(acct.Data, tokenAccountMintOffset)
@@ -111,8 +104,15 @@ func fetchMintDecimals(
 		}
 		seen[mint] = struct{}{}
 
-		mintAcct, err := db.GetAccount(slot, mint)
-		if err != nil || mintAcct == nil || len(mintAcct.Data) < mintAccountSize {
+		mintAcct := byKey[mint]
+		if mintAcct == nil {
+			var err error
+			mintAcct, err = reader.GetAccount(slot, mint)
+			if err != nil {
+				continue
+			}
+		}
+		if mintAcct == nil || len(mintAcct.Data) < mintAccountSize {
 			continue
 		}
 		out[mint] = mintAcct.Data[mintDecimalsOffset]
@@ -189,13 +189,13 @@ func pow10Float(n uint8) float64 {
 // failure path) so the response emits JSON null, matching Agave's
 // behavior on early-fail paths. Returns an empty slice for explicitly
 // empty input or non-token transactions.
-func tokenBalancesFromAccounts(txAccts []*accounts.Account, db *accountsdb.AccountsDb, slot uint64) []TokenBalancePayload {
+func tokenBalancesFromAccounts(txAccts []*accounts.Account, reader sealevel.AccountReader, slot uint64) []TokenBalancePayload {
 	if txAccts == nil {
 		return nil
 	}
 	if len(txAccts) == 0 {
 		return []TokenBalancePayload{}
 	}
-	mintDecimals := fetchMintDecimals(txAccts, db, slot)
+	mintDecimals := fetchMintDecimals(txAccts, reader, slot)
 	return extractTokenBalances(txAccts, mintDecimals)
 }

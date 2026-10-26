@@ -213,7 +213,7 @@ func TestFinalVoteGuardSeesInvalidationAfterEligibilityCheck(t *testing.T) {
 	root := alpenglow.BlockID{Slot: 39, Hash: solana.Hash{0x39}}
 	blockID := alpenglow.BlockID{Slot: 40, Hash: solana.Hash{0x40}}
 
-	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234, AlpenglowIdentity: identity})
+	engine, err := NewEngine(Config{AlpenglowShredVersion: 0x1234, AlpenglowIdentity: identityHolder(t, identity)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +225,6 @@ func TestFinalVoteGuardSeesInvalidationAfterEligibilityCheck(t *testing.T) {
 	engine.SetAlpenglowRoot(root)
 
 	voter, err := newAlpenglowVoter(engine, VotingConfig{
-		Identity:        identity,
 		AuthorizedVoter: authorized,
 		VoteAccount:     voteAccount,
 		HistoryDir:      t.TempDir(),

@@ -98,3 +98,40 @@ func TestEpochRewardHistoryUnavailableError(t *testing.T) {
 	require.Error(t, got.FromJSONRPCError(jsonrpc.JSONRPCError{Code: -32016}))
 	require.Error(t, got.FromJSONRPCError(jsonrpc.JSONRPCError{Code: -32004, Data: map[string]any{"epoch": "invalid"}}))
 }
+
+func TestNodeUnhealthyErrorWireShape(t *testing.T) {
+	behind := uint64(129)
+	rpcErr, err := (&NodeUnhealthyError{NumSlotsBehind: &behind}).ToJSONRPCError()
+	require.NoError(t, err)
+	require.Equal(t, jsonrpc.ErrorCode(-32005), rpcErr.Code)
+	require.Equal(t, "Node is behind by 129 slots", rpcErr.Message)
+
+	raw, err := json.Marshal(rpcErr)
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), `"data":{"numSlotsBehind":129}`)
+
+	withoutDistance, err := (&NodeUnhealthyError{}).ToJSONRPCError()
+	require.NoError(t, err)
+	raw, err = json.Marshal(withoutDistance)
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), `"data":{"numSlotsBehind":null}`)
+}
+
+func TestNodeUnhealthyErrorFromJSONRPCError(t *testing.T) {
+	var decoded NodeUnhealthyError
+	require.NoError(t, decoded.FromJSONRPCError(jsonrpc.JSONRPCError{
+		Code: -32005,
+		Data: map[string]interface{}{"numSlotsBehind": float64(42)},
+	}))
+	require.NotNil(t, decoded.NumSlotsBehind)
+	assert.Equal(t, uint64(42), *decoded.NumSlotsBehind)
+
+	require.NoError(t, decoded.FromJSONRPCError(jsonrpc.JSONRPCError{Code: -32005}))
+	assert.Nil(t, decoded.NumSlotsBehind)
+	require.NoError(t, decoded.FromJSONRPCError(jsonrpc.JSONRPCError{
+		Code: -32005,
+		Data: map[string]interface{}{"numSlotsBehind": nil},
+	}))
+	assert.Nil(t, decoded.NumSlotsBehind)
+	assert.Error(t, decoded.FromJSONRPCError(jsonrpc.JSONRPCError{Code: 1}))
+}

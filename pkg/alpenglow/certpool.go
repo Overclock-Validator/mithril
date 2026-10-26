@@ -111,14 +111,12 @@ type CertPoolSnapshot struct {
 type tally struct {
 	pending  map[uint16]map[[sha256.Size]byte]VoteMessage // unverified candidates, by rank and signature
 	verified map[uint16]struct{}                          // ranks folded into the aggregate
-	aggSig   bls12381.G2Affine                            // sum of verified signatures
+	aggSig   bls12381.G2Jac                               // sum of verified signatures; Jacobian (zero value is infinity) so each vote avoids an inversion
 	stake    uint64                                       // verified stake
 }
 
 func newTally() *tally {
-	t := &tally{pending: make(map[uint16]map[[sha256.Size]byte]VoteMessage), verified: make(map[uint16]struct{})}
-	t.aggSig.SetInfinity()
-	return t
+	return &tally{pending: make(map[uint16]map[[sha256.Size]byte]VoteMessage), verified: make(map[uint16]struct{})}
 }
 
 func (t *tally) candidateStake(set *ValidatorSet) uint64 {
@@ -1127,7 +1125,7 @@ func (p *CertPool) verifyAndFoldTallyWithLockReleased(slot uint64, ps *poolSlot,
 		}
 
 		// Reuse the exact signature point authenticated by verifyBatch.
-		tl.aggSig.Add(&tl.aggSig, &good[i].sig)
+		tl.aggSig.AddMixed(&good[i].sig)
 		tl.verified[msg.Rank] = struct{}{}
 		tl.stake += set.Validators[msg.Rank].Stake
 		ps.verifiedHash[dk] = append(seen, msg.Vote.BlockHash)
@@ -1325,10 +1323,9 @@ func randomizedAggregatePairingMultiExpOK(members []parsedBatchVote, payload []b
 }
 
 func randomizedAggregatePairingScalarOK(members []parsedBatchVote, payload []byte) (bool, error) {
-	var aggPub bls12381.G1Affine
-	var aggSig bls12381.G2Affine
-	aggPub.SetInfinity()
-	aggSig.SetInfinity()
+	// Jacobian accumulators: one inversion per aggregate, not one per member.
+	var accPub bls12381.G1Jac
+	var accSig bls12381.G2Jac
 	for i := range members {
 		coefficient, err := randomNonzeroBatchCoefficient()
 		if err != nil {
@@ -1338,9 +1335,13 @@ func randomizedAggregatePairingScalarOK(members []parsedBatchVote, payload []byt
 		var weightedSig bls12381.G2Affine
 		weightedPub.ScalarMultiplication(&members[i].pubkey, coefficient)
 		weightedSig.ScalarMultiplication(&members[i].sig, coefficient)
-		aggPub.Add(&aggPub, &weightedPub)
-		aggSig.Add(&aggSig, &weightedSig)
+		accPub.AddMixed(&weightedPub)
+		accSig.AddMixed(&weightedSig)
 	}
+	var aggPub bls12381.G1Affine
+	var aggSig bls12381.G2Affine
+	aggPub.FromJacobian(&accPub)
+	aggSig.FromJacobian(&accSig)
 	return aggregatePairingOK(aggPub, payload, aggSig), nil
 }
 
@@ -1381,13 +1382,12 @@ func aggregatePairingOK(aggPub bls12381.G1Affine, payload []byte, aggSig bls1238
 func (p *CertPool) assembleLocked(slot uint64, target certTarget, base, fb *tally, set *ValidatorSet, verifiedStake uint64) (Certificate, error) {
 	length := len(set.Validators)
 	baseRanks := make([]bool, length)
-	var aggSig bls12381.G2Affine
-	aggSig.SetInfinity()
+	var aggSigJac bls12381.G2Jac
 	if base != nil {
 		for rank := range base.verified {
 			baseRanks[int(rank)] = true
 		}
-		aggSig.Add(&aggSig, &base.aggSig)
+		aggSigJac.AddAssign(&base.aggSig)
 	}
 	var bitmap []byte
 	var err error
@@ -1401,7 +1401,7 @@ func (p *CertPool) assembleLocked(slot uint64, target certTarget, base, fb *tall
 			}
 			fbRanks[int(rank)] = true
 		}
-		aggSig.Add(&aggSig, &fb.aggSig)
+		aggSigJac.AddAssign(&fb.aggSig)
 		bitmap, err = EncodeSignerStoreBitmap(SignerBitmap{Encoding: SignerBitmapBase3, Length: length, Base: baseRanks, Fallback: fbRanks})
 	} else {
 		bitmap, err = EncodeSignerStoreBitmap(SignerBitmap{Encoding: SignerBitmapBase2, Length: length, Base: baseRanks})
@@ -1410,6 +1410,8 @@ func (p *CertPool) assembleLocked(slot uint64, target certTarget, base, fb *tall
 		return Certificate{}, err
 	}
 
+	var aggSig bls12381.G2Affine
+	aggSig.FromJacobian(&aggSigJac)
 	raw := aggSig.RawBytes()
 	cert := Certificate{
 		Type:              target.certType,

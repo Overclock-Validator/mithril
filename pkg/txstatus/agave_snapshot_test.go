@@ -2,6 +2,7 @@ package txstatus
 
 import (
 	"encoding/binary"
+	"fmt"
 	"os"
 	"testing"
 )
@@ -21,7 +22,7 @@ func TestDecodeAgaveSnapshot(t *testing.T) {
 	}
 
 	ok := encU32(0)
-	duplicateInstruction := append(append(encU32(1), encU32(29)...), byte(7))
+	duplicateInstruction := append(append(encU32(1), encU32(30)...), byte(7))
 	customInstruction := append(append(append(append(encU32(1), encU32(8)...), byte(2)), encU32(25)...), encU32(0xdecafbad)...)
 	borshInstruction := append(append(append(append(encU32(1), encU32(8)...), byte(3)), encU32(44)...), encString("io")...)
 	unitError := append(encU32(1), encU32(6)...)
@@ -59,6 +60,65 @@ func TestDecodeAgaveSnapshot(t *testing.T) {
 	}
 	if deltas[1].Slot != 45 || deltas[1].IsRoot || len(deltas[1].Statuses) != 0 {
 		t.Fatalf("unexpected second delta: %+v", deltas[1])
+	}
+}
+
+// Wire tags come from SerdeTransactionError in Agave v4.2, commit
+// 961d762037f1e92a022e8f369cf7ca79ca703b88,
+// runtime/src/serde_snapshot/status_cache.rs. In particular, tag 29 is the
+// unit variant WouldExceedAccountDataTotalLimit, not DuplicateInstruction.
+func TestDecodeAgaveSnapshotTransactionErrorVariants(t *testing.T) {
+	for tag := uint32(0); tag <= 38; tag++ {
+		t.Run(fmt.Sprintf("tag_%d", tag), func(t *testing.T) {
+			result := append(encU32(1), encU32(tag)...)
+			switch tag {
+			case 8: // InstructionError(7, Custom(0xdecafbad))
+				result = append(result, 7)
+				result = append(result, encU32(25)...)
+				result = append(result, encU32(0xdecafbad)...)
+			case 30, 31, 35: // DuplicateInstruction, InsufficientFundsForRent, ProgramExecutionTemporarilyRestricted
+				result = append(result, 0xa5)
+			}
+			firstKey := [CachedKeySize]byte{0x11}
+			nextKey := [CachedKeySize]byte{0xee, 0xdd, 0xcc, 0xbb}
+			data := append(encU64(2), encU64(42)...)
+			data = append(data, 1)
+			data = append(data, encU64(1)...)
+			data = appendStatus(data, [32]byte{9}, 3, []encodedKey{
+				{firstKey, result},
+				{nextKey, encU32(0)},
+			})
+			data = append(data, encU64(43)...)
+			data = append(data, 0)
+			data = append(data, encU64(0)...)
+			deltas, err := DecodeAgaveSnapshot(data)
+			if err != nil {
+				t.Fatalf("decode Agave transaction error %d: %v", tag, err)
+			}
+			if len(deltas) != 2 || deltas[1].Slot != 43 || deltas[1].IsRoot || len(deltas[0].Statuses) != 1 {
+				t.Fatalf("transaction error %d corrupted subsequent slot: %+v", tag, deltas)
+			}
+			keys := deltas[0].Statuses[0].Keys
+			if len(keys) != 2 || keys[0] != firstKey || keys[1] != nextKey {
+				t.Fatalf("transaction error %d corrupted cached keys: %x", tag, keys)
+			}
+		})
+	}
+}
+
+func TestDecodeAgaveSnapshotRejectsMissingTransactionErrorPayload(t *testing.T) {
+	for _, tag := range []uint32{30, 31, 35} {
+		t.Run(fmt.Sprintf("tag_%d", tag), func(t *testing.T) {
+			data := append(encU64(1), encU64(42)...)
+			data = append(data, 1)
+			data = append(data, encU64(1)...)
+			data = appendStatus(data, [32]byte{}, 0, []encodedKey{
+				{[CachedKeySize]byte{}, append(encU32(1), encU32(tag)...)},
+			})
+			if _, err := DecodeAgaveSnapshot(data); err == nil {
+				t.Fatal("accepted a transaction error without its account/instruction index")
+			}
+		})
 	}
 }
 
@@ -153,4 +213,51 @@ func encU32(v uint32) []byte {
 
 func encU64(v uint64) []byte {
 	return binary.LittleEndian.AppendUint64(nil, v)
+}
+
+func TestAgaveSnapshotTransactionErrorPayloadAlignment(t *testing.T) {
+	for tag := uint32(0); tag <= 38; tag++ {
+		t.Run(fmt.Sprintf("tag_%d", tag), func(t *testing.T) {
+			result := append(encU32(1), encU32(tag)...)
+			switch tag {
+			case 8: // InstructionError(u8, Custom(u32)).
+				result = append(result, 2)
+				result = append(result, encU32(25)...)
+				result = append(result, encU32(0xdecafbad)...)
+			case 30, 31, 35: // The snapshot SerdeTransactionError payload variants.
+				result = append(result, 9)
+			}
+			checkSnapshotResultAlignment(t, result)
+		})
+	}
+	t.Run("borsh_string", func(t *testing.T) {
+		result := append(encU32(1), encU32(8)...)
+		result = append(result, 3)
+		result = append(result, encU32(44)...)
+		result = append(result, encString("io")...)
+		checkSnapshotResultAlignment(t, result)
+	})
+}
+
+func checkSnapshotResultAlignment(t *testing.T, result []byte) {
+	t.Helper()
+	first := [CachedKeySize]byte{1}
+	second := [CachedKeySize]byte{2}
+	second[CachedKeySize-1] = 0xe8
+	nextResult := append(encU32(1), encU32(0)...)
+	data := append(encU64(1), encU64(42)...)
+	data = append(data, 1)
+	data = append(data, encU64(1)...)
+	data = appendStatus(data, [32]byte{3}, 1, []encodedKey{{first, result}, {second, nextResult}})
+	deltas, err := DecodeAgaveSnapshot(data)
+	if err != nil {
+		t.Fatalf("decode valid snapshot result: %v", err)
+	}
+	if len(deltas) != 1 || len(deltas[0].Statuses) != 1 {
+		t.Fatalf("unexpected slot/status count: %+v", deltas)
+	}
+	keys := deltas[0].Statuses[0].Keys
+	if len(keys) != 2 || keys[0] != first || keys[1] != second {
+		t.Fatalf("result payload changed subsequent keys: %x", keys)
+	}
 }

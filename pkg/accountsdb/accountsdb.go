@@ -49,6 +49,7 @@ type AccountsDb struct {
 	accountStateUncertain atomic.Bool
 	accountObserversMu    sync.Mutex
 	accountObservers      map[AccountStateObserver]struct{}
+	legacyBank            atomic.Pointer[legacyBankCommit]
 
 	// readCacheEpochMu protects the cache epoch and the pending fold view.
 	// CommitBatch publishes its immutable newest-wins union here before the
@@ -1067,7 +1068,14 @@ func (accountsDb *AccountsDb) GetBankHashForSlot(slot uint64) ([]byte, error) {
 func (accountsDb *AccountsDb) StoreBankHashForSlot(slot uint64, bankHash []byte) error {
 	var slotBytes [8]byte
 	binary.LittleEndian.PutUint64(slotBytes[:], slot)
-	return accountsDb.BankHashStore.Set(slotBytes[:], bankHash, &pebble.WriteOptions{})
+	version := accountsDb.accountStateVersion.Load()
+	if err := accountsDb.BankHashStore.Set(slotBytes[:], bankHash, &pebble.WriteOptions{}); err != nil {
+		return err
+	}
+	if !accountsDb.RootedDurable && len(bankHash) == 32 && version&1 == 0 && version == accountsDb.accountStateVersion.Load() && accountsDb.accountCommittedSlot.Load() == slot {
+		accountsDb.legacyBank.Store(&legacyBankCommit{slot: slot, version: version, hash: [32]byte(bankHash)})
+	}
+	return nil
 }
 
 func (accountsDb *AccountsDb) KeysBetweenPrefixes(startPrefix uint64, endPrefix uint64) []solana.PublicKey {

@@ -33,6 +33,15 @@ func (c TransactionCost) Sum() uint64 {
 		c.LoadedAccountsDataSizeCost
 }
 
+// WithActualUsage replaces the requested execution and loaded-accounts cost
+// with what execution consumed. Recording it is the same as recording c and
+// rebating it, so a check made after execution can admit on actual usage.
+func (c TransactionCost) WithActualUsage(actualExec, actualLoaded uint64) TransactionCost {
+	c.ProgramsExecutionCost = actualExec
+	c.LoadedAccountsDataSizeCost = actualLoaded
+	return c
+}
+
 // EstimateTransactionCost applies the protocol cost model to a parsed transaction.
 func EstimateTransactionCost(tx *solana.Transaction, feats *features.Features) (TransactionCost, error) {
 	if tx == nil {

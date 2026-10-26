@@ -119,7 +119,7 @@ func newVotorAdmissionTestEngine(t *testing.T, configuredIdentity ed25519.Privat
 	localIdentity := voterTestKey(70)
 	authorized := voterTestKey(71)
 	voteAccount := solana.PublicKey(voterTestKey(72).Public().(ed25519.PublicKey))
-	engine, err := NewEngine(Config{AlpenglowIdentity: configuredIdentity})
+	engine, err := NewEngine(Config{AlpenglowIdentity: identityHolder(t, configuredIdentity)})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, engine.Close()) })
 	engine.SetAlpenglowEpochLookup(func(slot uint64) uint64 { return slot / votorAdmissionTestEpochSlots })

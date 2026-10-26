@@ -21,6 +21,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/blockhistory"
 	"github.com/Overclock-Validator/mithril/pkg/epochrewards"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/Overclock-Validator/mithril/pkg/replay"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/transactionhistory"
 	"github.com/Overclock-Validator/mithril/pkg/txstatus"
@@ -48,12 +49,15 @@ type rpcMethods interface {
 	GetFirstAvailableBlock(context.Context, jsonrpc.RawParams) (uint64, error)
 	GetGenesisHash(context.Context, jsonrpc.RawParams) (string, error)
 	GetInflationReward(context.Context, jsonrpc.RawParams) ([]*InflationRewardResp, error)
+	GetHealth(context.Context, jsonrpc.RawParams) (string, error)
+	GetIdentity(context.Context, jsonrpc.RawParams) (GetIdentityResp, error)
 	GetLatestBlockhash(context.Context, jsonrpc.RawParams) (GetLatestBlockhashResp, error)
 	GetLeaderSchedule(context.Context, jsonrpc.RawParams) (map[string][]uint64, error)
 	GetSignatureStatuses(context.Context, jsonrpc.RawParams) (GetSignatureStatusesResp, error)
 	GetSlot(context.Context, jsonrpc.RawParams) (uint64, error)
 	GetTransaction(context.Context, jsonrpc.RawParams) (*GetTransactionResp, error)
 	GetVoteAccounts(context.Context, jsonrpc.RawParams) (GetVoteAccountsResp, error)
+	GetVersion(context.Context, jsonrpc.RawParams) (GetVersionResp, error)
 	MinimumLedgerSlot(context.Context, jsonrpc.RawParams) (uint64, error)
 	SendTransaction(context.Context, jsonrpc.RawParams) (string, error)
 	SimulateTransaction(context.Context, jsonrpc.RawParams) (SimulateTransactionResp, error)
@@ -63,18 +67,26 @@ type RpcServer struct {
 	historyRecoveryMu      sync.RWMutex
 	historyRecoveryPending bool
 
-	isReady       bool
-	rpcService    *jsonrpc.RPCServer
-	serv          *httptest.Server
-	listener      net.Listener
-	acctsDb       *accountsdb.AccountsDb
-	epochSchedule *sealevel.SysvarEpochSchedule
-	slotCtx       *sealevel.SlotCtx
-	slotCtxMu     sync.RWMutex
-	genesisHash   string
-	epochRewards  *epochrewards.Store
-	blockHistory  *blockhistory.Store
-	rootedBank    atomic.Pointer[rootedBankState]
+	isReady              bool
+	rpcService           *jsonrpc.RPCServer
+	serv                 *httptest.Server
+	listener             net.Listener
+	acctsDb              *accountsdb.AccountsDb
+	epochSchedule        *sealevel.SysvarEpochSchedule
+	slotCtx              *sealevel.SlotCtx
+	slotCtxMu            sync.RWMutex
+	healthSlot           func() (uint64, bool)
+	healthReady          bool
+	executionGeneration  uint64
+	executionInvalidated bool
+	simulationOnce       sync.Once
+	simulationCalls      chan struct{}
+	genesisHash          string
+	epochRewards         *epochrewards.Store
+	blockHistory         *blockhistory.Store
+	rootedBank           atomic.Pointer[rootedBankState]
+	identity             string
+	identitySource       func() string
 
 	stakeCacheOnce              sync.Once
 	stakeCache                  rootedStakeCache
@@ -108,6 +120,9 @@ type rootedBankState struct {
 	Slot             uint64
 	BlockHeight      uint64
 	TransactionCount uint64
+	executionBank    *replay.ChainTipSnapshot
+	executionVersion uint64
+	executionReady   bool
 }
 
 const maxQuietMethodProbeBody = 64 << 10
@@ -125,12 +140,15 @@ var supportedRPCMethods = map[string]struct{}{
 	"getFirstAvailableBlock": {},
 	"getGenesisHash":         {},
 	"getInflationReward":     {},
+	"getHealth":              {},
+	"getIdentity":            {},
 	"getLatestBlockhash":     {},
 	"getLeaderSchedule":      {},
 	"getSignatureStatuses":   {},
 	"getSlot":                {},
 	"getTransaction":         {},
 	"getVoteAccounts":        {},
+	"getVersion":             {},
 	"minimumLedgerSlot":      {},
 	"sendTransaction":        {},
 	"simulateTransaction":    {},
@@ -315,6 +333,39 @@ func (rpcServer *RpcServer) SetRootedBankState(slot, blockHeight, transactionCou
 	})
 }
 
+// SetRootedExecutionBank completes the matching durable publication. An old or
+// incomplete bank must never replace a newer root's execution parameters.
+func (rpcServer *RpcServer) SetRootedExecutionBank(bank *replay.ChainTipSnapshot) {
+	if rpcServer == nil || bank == nil {
+		return
+	}
+	for {
+		root := rpcServer.rootedBank.Load()
+		if root == nil || root.Slot != bank.Slot || root.BlockHeight != bank.BlockHeight {
+			return
+		}
+		next := *root
+		next.executionBank = bank
+		if rpcServer.acctsDb != nil {
+			next.executionVersion, next.executionReady = rpcServer.acctsDb.CommittedAccountVersion()
+			// A restored snapshot has no process-local write yet. Later legacy
+			// publications must bind the account version to this exact bankhash,
+			// even when the asynchronous queue drained before publication.
+			if !rpcServer.acctsDb.RootedDurable && next.executionVersion != 0 {
+				next.executionVersion, next.executionReady = rpcServer.legacySimulationVersion(bank)
+			}
+			next.executionReady = next.executionReady && !rpcServer.rootedPublicationPending(bank.Slot)
+		}
+		if rpcServer.rootedBank.CompareAndSwap(root, &next) {
+			rpcServer.slotCtxMu.Lock()
+			rpcServer.executionGeneration++
+			rpcServer.executionInvalidated = false
+			rpcServer.slotCtxMu.Unlock()
+			return
+		}
+	}
+}
+
 func (rpcServer *RpcServer) getRootedBankState() (rootedBankState, bool) {
 	rooted := rpcServer.rootedBank.Load()
 	if rooted == nil {
@@ -453,6 +504,15 @@ func fetchAndUnmarshalEpochScheduleSysvar(acctsDb *accountsdb.AccountsDb) *seale
 func (rpcServer *RpcServer) SetSlotCtx(slotCtx *sealevel.SlotCtx) {
 	rpcServer.slotCtxMu.Lock()
 	rpcServer.slotCtx = slotCtx
+	rpcServer.healthReady = slotCtx != nil
+	rpcServer.executionGeneration++
+	rpcServer.executionInvalidated = slotCtx == nil
+	rpcServer.slotCtxMu.Unlock()
+}
+
+func (rpcServer *RpcServer) SetIdentity(identity string) {
+	rpcServer.slotCtxMu.Lock()
+	rpcServer.identity = identity
 	rpcServer.slotCtxMu.Unlock()
 }
 

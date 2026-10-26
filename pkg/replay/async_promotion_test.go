@@ -24,6 +24,34 @@ type slowCommitter struct {
 	delay time.Duration
 }
 
+func TestExecutionBankMetadataFollowsPromotionAndUnwind(t *testing.T) {
+	for _, mode := range []string{"async", "forced"} {
+		t.Run(mode, func(t *testing.T) {
+			fc := &fakeCommitter{durable: accounts.NewMemAccounts()}
+			tail := asyncTestTail(fc, 5, 6, 7)
+			atSix, atSeven := &ChainTipSnapshot{Slot: 6}, &ChainTipSnapshot{Slot: 7}
+			tail.executionBanks[6], tail.executionBanks[7] = atSix, atSeven
+			if mode == "async" {
+				job, err := tail.buildFoldJob(6, false)
+				require.NoError(t, err)
+				require.Same(t, atSix, job.executionBank)
+				require.NoError(t, runFoldJob(fc, job))
+				tail.applyFoldJob(job)
+			} else {
+				through, _, err := tail.flush(6)
+				require.NoError(t, err)
+				require.Equal(t, uint64(6), through)
+			}
+			require.Same(t, atSix, tail.rootedExecutionBank)
+			require.NotContains(t, tail.executionBanks, uint64(6))
+			require.Same(t, atSeven, tail.executionBanks[7])
+			tail.unwind(7)
+			require.Empty(t, tail.executionBanks)
+			require.Same(t, atSix, tail.rootedExecutionBank)
+		})
+	}
+}
+
 func TestFoldJobCapturesStatusOnLoopAndReferenceRidesManifest(t *testing.T) {
 	rootDir := t.TempDir()
 	fc := &fakeCommitter{durable: accounts.NewMemAccounts()}
