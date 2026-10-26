@@ -26,7 +26,7 @@ func TestLeaderLoopWaitsForParentBlockID(t *testing.T) {
 	wallSlot.Store(slot)
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:  controller,
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		Broadcaster: bc,
 		CurrentSlot: wallSlot.Load,
 		LeaderForSlot: func(s uint64) (solana.PublicKey, bool) {
@@ -68,7 +68,7 @@ func TestLeaderLoopWaitsForParentBlockID(t *testing.T) {
 func TestLeaderProductionFailsClosedAtEpochTransition(t *testing.T) {
 	global.SetReplayFrontier(9)
 	loop := NewLeaderLoop(LeaderLoopConfig{
-		Identity:      txfixture.PayerPrivateKey(),
+		Identity:      identityHolder(txfixture.PayerPrivateKey()),
 		EpochSchedule: &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 10},
 		ParentContext: func(uint64) ParentContext {
 			return ParentContext{ParentSlot: 9, ParentBankhash: solana.Hash{1}}
@@ -83,7 +83,7 @@ func TestLeaderProductionFailsClosedAtEpochTransition(t *testing.T) {
 func TestLeaderProductionFailsClosedDuringPartitionedRewards(t *testing.T) {
 	global.SetReplayFrontier(8)
 	loop := NewLeaderLoop(LeaderLoopConfig{
-		Identity:      txfixture.PayerPrivateKey(),
+		Identity:      identityHolder(txfixture.PayerPrivateKey()),
 		EpochSchedule: &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 10},
 		ParentContext: func(uint64) ParentContext {
 			return ParentContext{ParentSlot: 8, ParentBankhash: solana.Hash{1}, EpochRewardsActive: true}
@@ -109,7 +109,7 @@ func TestLeaderProductionRequiresCompleteTransactionStatuses(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			global.SetReplayFrontier(8)
 			loop := NewLeaderLoop(LeaderLoopConfig{
-				Identity: txfixture.PayerPrivateKey(),
+				Identity: identityHolder(txfixture.PayerPrivateKey()),
 				ParentContext: func(uint64) ParentContext {
 					return ParentContext{
 						ParentSlot:          8,

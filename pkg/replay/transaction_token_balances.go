@@ -186,14 +186,10 @@ func isTokenProgram(key solana.PublicKey) bool {
 // Agave balance collector. They classify initialized token accounts, not their
 // extension payloads; UI conversion is deliberately outside this raw capture.
 func decodeTokenAccount(account *accounts.Account) (transactionTokenFact, bool) {
-	if account == nil || account.Lamports == 0 || !isTokenProgram(account.Owner) {
+	if !sealevel.IsInitializedTokenAccount(account) {
 		return transactionTokenFact{}, false
 	}
 	data := account.Data
-	validSize := len(data) == 165 || (account.Owner == solana.Token2022ProgramID && len(data) > 165 && len(data) != 355 && data[165] == 2)
-	if !validSize || data[108] == 0 {
-		return transactionTokenFact{}, false
-	}
 	return transactionTokenFact{
 		Mint:      solana.PublicKey(data[:32]),
 		Owner:     solana.PublicKey(data[32:64]),

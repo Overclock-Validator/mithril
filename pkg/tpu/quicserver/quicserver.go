@@ -2,7 +2,7 @@ package quicserver
 
 import (
 	"context"
-	"crypto/ed25519"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/packet"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/pipeline"
 	"github.com/quic-go/quic-go"
@@ -37,30 +38,34 @@ type SpawnServerResult struct {
 	Done       <-chan struct{}
 	KeyUpdater KeyUpdater
 	cancel     context.CancelFunc
+	// unregister removes KeyUpdater from the identity holder.
+	unregister func()
 }
 
 // KeyUpdater mirrors agave's streamer::quic::EndpointKeyUpdater.
 type KeyUpdater interface {
-	UpdateKey(identity ed25519.PrivateKey) error
+	UpdateKey(next *identity.Keypair) error
 }
 
 type endpointKeyUpdater struct {
-	cfg ServerConfig
+	certs *identity.Derived[tls.Certificate]
 }
 
-func (u *endpointKeyUpdater) UpdateKey(identity ed25519.PrivateKey) error {
-	// quic-go listeners do not support in-place TLS rotation; validate the new
-	// identity and require callers to re-spawn the server to apply it.
-	_, err := newServerTLSConfig(identity)
-	return err
+// UpdateKey builds the certificate for next. The listeners' TLS config reads
+// it per handshake, so new connections present next once this returns; open
+// connections keep the identity they authenticated with, as in Agave.
+func (u *endpointKeyUpdater) UpdateKey(next *identity.Keypair) error {
+	return u.certs.Refresh(next)
 }
 
-// Spawn starts a bounded QUIC TPU server on the provided sockets.
+// Spawn starts a bounded QUIC TPU server on the provided sockets. The server
+// presents holder's current identity and registers its KeyUpdater on holder
+// until Close.
 func Spawn(
 	ctx context.Context,
 	name string,
 	sockets []QuicSocket,
-	identity ed25519.PrivateKey,
+	holder *identity.Holder,
 	cfg ServerConfig,
 ) (*SpawnServerResult, error) {
 	if len(sockets) == 0 {
@@ -74,10 +79,16 @@ func Spawn(
 	if cfg.StreamReceiveWindowSize < cfg.MaxStreamDataBytes {
 		return nil, &ServerError{Op: "configure transport", Err: fmt.Errorf("stream receive window %d is smaller than max stream data bytes %d", cfg.StreamReceiveWindowSize, cfg.MaxStreamDataBytes)}
 	}
-	tlsConf, err := newServerTLSConfig(identity)
+	if holder == nil {
+		return nil, &ServerError{Op: "configure tls", Err: errors.New("no identity provided")}
+	}
+	certs, err := identity.NewDerived(holder, func(kp *identity.Keypair) (tls.Certificate, error) {
+		return newIdentityCertificate(kp.PrivateKey())
+	})
 	if err != nil {
 		return nil, &ServerError{Op: "configure tls", Err: err}
 	}
+	tlsConf := newServerTLSConfig(certs)
 
 	stats := &ServerStats{}
 	stats.QuicEndpointsCount.Store(uint64(len(sockets)))
@@ -99,7 +110,8 @@ func Spawn(
 		listeners = append(listeners, ln)
 	}
 
-	updater := &endpointKeyUpdater{cfg: cfg}
+	updater := &endpointKeyUpdater{certs: certs}
+	unregister := holder.RegisterUpdater("TPU QUIC "+name, updater.UpdateKey)
 
 	done := make(chan struct{})
 	srv := &runtimeServer{
@@ -122,6 +134,7 @@ func Spawn(
 		Done:       done,
 		KeyUpdater: updater,
 		cancel:     cancel,
+		unregister: unregister,
 	}, nil
 }
 
@@ -336,6 +349,9 @@ func netipFromAddr(addr net.Addr) (netip.AddrPort, bool) {
 
 // Close shuts down listeners and waits for the server goroutines to exit.
 func (r *SpawnServerResult) Close(ctx context.Context) error {
+	if r.unregister != nil {
+		r.unregister()
+	}
 	if r.cancel != nil {
 		r.cancel()
 	}

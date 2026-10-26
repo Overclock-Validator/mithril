@@ -60,7 +60,7 @@ func TestExpiredScannerParksAtMaxUint64CurrentWindow(t *testing.T) {
 
 	self := txfixture.PayerPubkey()
 	loop := NewLeaderLoop(LeaderLoopConfig{
-		Identity: txfixture.PayerPrivateKey(),
+		Identity: identityHolder(txfixture.PayerPrivateKey()),
 		LeaderForSlot: func(uint64) (solana.PublicKey, bool) {
 			return self, true
 		},
@@ -84,7 +84,7 @@ func TestIntrawindowMissedWindowClosesRemainderBeforeBankStarts(t *testing.T) {
 	self := txfixture.PayerPubkey()
 
 	loop := NewLeaderLoop(LeaderLoopConfig{
-		Identity: txfixture.PayerPrivateKey(),
+		Identity: identityHolder(txfixture.PayerPrivateKey()),
 		Now:      func() time.Time { return now },
 		LeaderForSlot: func(slot uint64) (solana.PublicKey, bool) {
 			if slot == startSlot {
@@ -132,7 +132,7 @@ func TestActiveIntrawindowMissedWindowAbortsAndClosesRemainder(t *testing.T) {
 
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		Controller:  controller,
-		Identity:    txfixture.PayerPrivateKey(),
+		Identity:    identityHolder(txfixture.PayerPrivateKey()),
 		CurrentSlot: func() uint64 { return activeSlot },
 		LeaderForSlot: func(slot uint64) (solana.PublicKey, bool) {
 			if slot == startSlot {

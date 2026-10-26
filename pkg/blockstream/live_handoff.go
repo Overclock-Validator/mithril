@@ -236,7 +236,12 @@ func (bs *BlockSource) liveHandoffReplayGapOK() (bool, uint64, uint64, uint64, u
 	if tip > lastExecuted {
 		gap = tip - lastExecuted
 	}
-	return gap <= maxGap, gap, maxGap, tip, lastExecuted
+	// With RPC block fetch disabled, the staged Turbine runway is the only
+	// way replay can advance. Waiting for replay to enter the smaller arm
+	// window deadlocks after repair catchup yields to near-tip mode. Keep
+	// the gap guard for RPC-backed sources; near-tip and parent-connected
+	// runway checks still apply to every handoff.
+	return !bs.rpcBlockFetchAllowed() || gap <= maxGap, gap, maxGap, tip, lastExecuted
 }
 
 func liveDefaultHandoffLastSlot(waitingSlot uint64) uint64 {
