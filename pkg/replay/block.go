@@ -2688,6 +2688,8 @@ func ReplayBlocks(
 		defer prefetcher.installRefsHook()()
 		blockStream.SetReplayEmitHook(prefetcher.Offer)
 		mlog.Log.Infof("account prefetch: on, %d slot ahead of replay, %d storage workers, programs preloaded, tip warming %t", prefetcher.ahead, prefetcher.workers, prefetcher.tipWarm)
+	} else {
+		mlog.Log.Infof("account prefetch: off (MITHRIL_ACCOUNT_PREFETCH=0)")
 	}
 
 	if !isLive {

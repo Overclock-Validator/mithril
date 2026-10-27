@@ -18,8 +18,8 @@ import (
 	"github.com/gagliardetto/solana-go"
 )
 
-// Account prefetch (MITHRIL_ACCOUNT_PREFETCH=1) reads the accounts of the block
-// queued after the one replay is executing, and loads and verifies the programs
+// Account prefetch (on by default; MITHRIL_ACCOUNT_PREFETCH=0 turns it off)
+// reads the accounts of the block queued after the one replay is executing, and loads and verifies the programs
 // it invokes, through the same unrooted-tail source replay loads from. Results
 // are discarded: durable reads publish into AccountsDB's read caches and the
 // program cache, so the block's own load finds them there. It only uses the
@@ -37,7 +37,7 @@ import (
 // every decoded batch (turbine.StreamAccountRefs) before publishing it, and
 // whole-block jobs for such blocks are built from those summaries.
 var (
-	accountPrefetchEnabled = os.Getenv("MITHRIL_ACCOUNT_PREFETCH") == "1"
+	accountPrefetchEnabled = os.Getenv("MITHRIL_ACCOUNT_PREFETCH") != "0"
 	tipWarmEnabled         = os.Getenv("MITHRIL_TIP_WARM") == "1"
 )
 

@@ -28,10 +28,13 @@ Budgets are approximate and are not a process memory cap.
 
 ## Prefetch
 
-Account prefetch is off by default. `MITHRIL_ACCOUNT_PREFETCH=1` reads the
-accounts of the next queued block and preloads its programs while the current block executes. On machines
-with little memory for the page cache, `MITHRIL_TIP_WARM=1` additionally warms
-each block's transaction batches as they arrive at the tip.
+Account prefetch is on by default: while a block executes, Mithril reads the
+accounts of the next queued block and preloads its programs, so the block finds
+them in the read caches instead of storage. It only uses the ordinary read paths
+and cannot change what replay executes. `MITHRIL_ACCOUNT_PREFETCH=0` turns it
+off (the startup log says which). On machines with little memory for the page
+cache, `MITHRIL_TIP_WARM=1` additionally warms each block's transaction batches
+as they arrive at the tip.
 
 ## Upgrading
 
