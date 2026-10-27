@@ -36,7 +36,7 @@ type VerifierConfig struct {
 	LagSlots            uint64 // don't attempt verification until executedTip - LagSlots
 	MaxRPS              int    // verifier's own RPC budget (never shares block fetch)
 	Required            bool   // gate folds on the verified watermark
-	ValidatorFooterHash bool   // validator mode uses certified footer/local bank-hash parity, never RPC blocks
+	CertifiedFooterHash bool   // require certified footer/local bank-hash parity for received blocks
 }
 
 // TrailingVerifierDefaults returns the default configuration: enabled,

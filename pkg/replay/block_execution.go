@@ -672,7 +672,7 @@ func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
 	metrics.GlobalBlockReplay.BankHash.AddTimingSince(start)
 	if alpenglowClock {
 		footerVerificationStart := time.Now()
-		footerVerificationErr := verifyAlpenglowBlockFooter(slotCtx, block, alpenglowClock)
+		footerVerificationErr := verifyAlpenglowBlockFooter(slotCtx, block, alpenglowClock, TrailingVerifierCfg.CertifiedFooterHash)
 		metrics.GlobalBlockReplay.AlpenglowFooterVerification.AddTimingSince(footerVerificationStart)
 		if footerVerificationErr != nil {
 			writeFooterBankhashMismatchArtifact(footerVerificationErr, block, slotCtx, writableAccts, modifiedAccts)
