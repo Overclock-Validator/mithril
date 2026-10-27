@@ -78,7 +78,7 @@ type CompactStats struct {
 	FilesDeleted      int // fully-dead fast path (no bytes moved)
 	FilesSparsified   int // dead payload pages released without moving live/undo records
 	LiveBytesMoved    int64
-	BytesReclaimed    int64 // net bytes freed; may be negative during bounded evacuation
+	BytesReclaimed    int64 // source bytes freed (compacted + deleted)
 }
 
 const (
@@ -217,7 +217,7 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 			continue
 		}
 		candidates = append(candidates, compactCandidate{
-			name: name, path: filepath.Join(db.appendVecDir(fileId), name), slot: slot, fileId: fileId, size: file.size, allocated: allocated, manifestPath: manifest.Path,
+			name: name, slot: slot, fileId: fileId, size: file.size, allocated: allocated, manifestPath: manifest.Path,
 			alreadySparse: (manifest.Kind == ManifestKindCompact && manifest.DataCRC == 0) || db.compactLastScan[fileId] != 0,
 			scanOrder:     db.compactLastScan[fileId],
 		})
@@ -240,6 +240,9 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 		if !ok {
 			break
 		}
+		// Paths are not part of candidate ordering. Construct one only for a
+		// selected file, rather than for every entry in the inventory.
+		c.path = filepath.Join(db.appendVecDir(c.fileId), c.name)
 		switch compactCandidateClass(c) {
 		case '0':
 			db.sparseCursor = compactCandidateKey(c)
@@ -520,25 +523,13 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 	// slot must also equal the filename slot — the read path builds the file
 	// name from the entry's slot, so a mismatched entry could not be served
 	// from the output file and is safest left untouched.
-	liveIdx := make([]int, 0, len(idxEntries))
+	liveIdx, err := db.compactionLiveRecords(c, pubkeys, idxEntries)
+	if err != nil {
+		return false, 0, err
+	}
 	var liveBytes int64
-	for i := range idxEntries {
-		cur, closer, gerr := db.Index.Get(pubkeys[i][:])
-		if gerr != nil {
-			if gerr == pebble.ErrNotFound {
-				continue
-			}
-			return false, 0, gerr
-		}
-		curEntry, derr := UnmarshalAcctIdxEntry(cur)
-		closer.Close()
-		if derr != nil {
-			return false, 0, derr
-		}
-		if curEntry.FileId == c.fileId && curEntry.Offset == idxEntries[i].Offset && curEntry.Slot == c.slot {
-			liveIdx = append(liveIdx, i)
-			liveBytes += recordLenAt(data, idxEntries[i].Offset)
-		}
+	for _, i := range liveIdx {
+		liveBytes += recordLenAt(data, idxEntries[i].Offset)
 	}
 
 	if len(data) == 0 || len(liveIdx) == 0 {
@@ -697,9 +688,6 @@ func removeSourceFiles(srcPath, manifestPath string) error {
 }
 
 func humanBytes(n int64) string {
-	if n < 0 {
-		return "-" + humanBytes(-n)
-	}
 	switch {
 	case n >= 1<<30:
 		return fmt.Sprintf("%.1fGiB", float64(n)/float64(1<<30))

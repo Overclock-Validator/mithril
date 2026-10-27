@@ -78,6 +78,7 @@ type AccountLoader struct {
 	InProgressHits    uint64
 	PendingFoldHits   uint64
 	CacheHits         uint64
+	NegativeCacheHits uint64
 	IndexHits         uint64
 	IndexMisses       uint64
 	UniqueAppendVecs  uint64
@@ -178,6 +179,7 @@ func (dst *AccountLoader) Accumulate(src AccountLoader) {
 	dst.InProgressHits += src.InProgressHits
 	dst.PendingFoldHits += src.PendingFoldHits
 	dst.CacheHits += src.CacheHits
+	dst.NegativeCacheHits += src.NegativeCacheHits
 	dst.IndexHits += src.IndexHits
 	dst.IndexMisses += src.IndexMisses
 	dst.UniqueAppendVecs += src.UniqueAppendVecs

@@ -383,12 +383,12 @@ func (t *unrootedTail) recordStakeChange(slotCtx *sealevel.SlotCtx, modified []*
 	if t.stakeTotals == nil {
 		return
 	}
-	readStored := func(key solana.PublicKey) *accounts.Account {
+	readStored := func(key solana.PublicKey) (*accounts.Account, error) {
 		acct, err := t.GetAccount(slotCtx.Slot, key)
-		if err != nil {
-			return nil
+		if errors.Is(err, accountsdb.ErrNoAccount) {
+			return nil, nil
 		}
-		return acct
+		return acct, err
 	}
 	t.stakeTotals.recordSlot(slotCtx.Slot, slotCtx, modified, global.PendingStakePubkeysForSlot(slotCtx.Slot), readStored)
 }
@@ -543,11 +543,8 @@ func (t *unrootedTail) buildFoldJob(through uint64, force bool, hookOverrides ..
 		return nil, fmt.Errorf("fold chunk through slot %d: no resume context recorded for chunk-top slot", through)
 	}
 	ctx = cloneResumeContextForFold(ctx)
-	stakeTotals, haveStakeTotals := t.stakeTotals.totalsThrough(through)
-	ctx.DelegatedStake = nil
-	if haveStakeTotals {
-		ctx.DelegatedStake = encodeDelegatedStake(stakeTotals)
-	}
+	stakeTotals, encodedStakeTotals := t.stakeTotals.encodedThrough(through)
+	ctx.DelegatedStake = encodedStakeTotals
 	var snapshot TransactionStatusSnapshot
 	var captureTime time.Duration
 	if hooks.Capture != nil {
@@ -968,11 +965,8 @@ func promoteRootedBatchedWithStakeTotals(
 			break
 		}
 		ctx = cloneResumeContextForFold(ctx)
-		chunkStakeTotals, haveStakeTotals := stakeTotals.totalsThrough(chunkThrough)
-		ctx.DelegatedStake = nil
-		if haveStakeTotals {
-			ctx.DelegatedStake = encodeDelegatedStake(chunkStakeTotals)
-		}
+		chunkStakeTotals, encodedStakeTotals := stakeTotals.encodedThrough(chunkThrough)
+		ctx.DelegatedStake = encodedStakeTotals
 		var selectedCheckpoint *state.TransactionStatusCheckpointRef
 		if hooks.Capture != nil {
 			snapshot, serr := hooks.Capture(chunkThrough)

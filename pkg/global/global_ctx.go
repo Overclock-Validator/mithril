@@ -548,6 +548,15 @@ func FlushPendingStakePubkeysThrough(accountsDbDir string, through uint64) (int,
 	return len(pending), nil
 }
 
+// ResetStakePubkeyIndexCache forgets the loaded index, so the next
+// LoadStakePubkeyIndex reads the file. The cache is not keyed by directory;
+// tests that load indexes from different directories reset it.
+func ResetStakePubkeyIndexCache() {
+	instance.pendingStakeMutex.Lock()
+	instance.cachedStakeEntries = nil
+	instance.pendingStakeMutex.Unlock()
+}
+
 // ClearPendingStakePubkeys discards any pending stake pubkeys without writing them.
 // Used for rollback on failed block replay.
 func ClearPendingStakePubkeys() {

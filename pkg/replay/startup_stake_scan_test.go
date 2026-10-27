@@ -16,17 +16,17 @@ func TestStartupStakeScanHandoff(t *testing.T) {
 	dbA := &accountsdb.AccountsDb{AcctsDir: filepath.Join(t.TempDir(), "accounts")}
 	dbB := &accountsdb.AccountsDb{AcctsDir: filepath.Join(t.TempDir(), "accounts")}
 
-	startStartupStakeScan(dbA, nil)
+	startStartupStakeScan(dbA, nil, stakeIndexDigest{})
 	_, err := takeStartupStakeScan(dbA)
 	require.Error(t, err, "the background result, including its error, is handed over")
 	assert.Nil(t, pendingStartupStakeScan.Load(), "a result is taken once")
 
-	startStartupStakeScan(dbA, nil)
+	startStartupStakeScan(dbA, nil, stakeIndexDigest{})
 	_, err = takeStartupStakeScan(dbB)
 	require.Error(t, err, "a scan of another AccountsDB is never used; this one scans dbB itself")
 	assert.Nil(t, pendingStartupStakeScan.Load())
 
-	startStartupStakeScan(dbA, nil)
+	startStartupStakeScan(dbA, nil, stakeIndexDigest{})
 	finishStartupStakeScan()
 	assert.Nil(t, pendingStartupStakeScan.Load(), "an unconsumed scan is waited out and cleared")
 	finishStartupStakeScan() // no-op when none is pending

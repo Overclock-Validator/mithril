@@ -55,7 +55,3 @@ func (c *WeightedCache[K, V]) Delete(key K) {
 func (c *WeightedCache[K, V]) Clear() {
 	c.cache.InvalidateAll()
 }
-
-// Close is a no-op: Otter v2 caches hold no background goroutines (v1 caches
-// had to be closed), so there is nothing to release.
-func (c *WeightedCache[K, V]) Close() {}

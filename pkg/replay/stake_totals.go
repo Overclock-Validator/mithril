@@ -2,7 +2,10 @@ package replay
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -40,6 +43,14 @@ import (
 // turn the scan result at the previous boundary into the scan result at this
 // one, so each fold's resume context carries exactly what a scan of that
 // boundary would compute.
+//
+// "A scan of that boundary" assumes the index holds exactly the tracked
+// members. The index file is appended before the fold that makes its slots
+// durable and is never cut back, so after a crash between the two, or a
+// durable rewind, it can hold keys the saved totals never counted (a scan
+// then reads them). Each context therefore also records a digest of the key
+// set its totals cover, and startup trusts saved totals only when the index
+// it loads has that digest; otherwise it scans.
 
 // voteDelegation is a vote account's delegated stake and the number of index
 // accounts delegating it. The count keeps a vote account whose delegations
@@ -52,11 +63,49 @@ type voteDelegationChange struct {
 	stake, accounts int64
 }
 
+// stakeIndexDigest identifies a set of stake index keys regardless of order
+// or duplicates in the file: the key count and the lane-wise sum of each key's
+// SHA-256.
+type stakeIndexDigest struct {
+	keys uint64
+	sum  [4]uint64
+}
+
+func (d *stakeIndexDigest) add(key solana.PublicKey) {
+	h := sha256.Sum256(key[:])
+	d.keys++
+	for i := range d.sum {
+		d.sum[i] += binary.LittleEndian.Uint64(h[8*i:])
+	}
+}
+
+func (d stakeIndexDigest) hex() string {
+	var raw [32]byte
+	for i, v := range d.sum {
+		binary.LittleEndian.PutUint64(raw[8*i:], v)
+	}
+	return hex.EncodeToString(raw[:])
+}
+
+// digestStakeIndex digests the deduplicated entries LoadStakePubkeyIndex
+// returns.
+func digestStakeIndex(entries []accountsdb.StakeIndexEntry) stakeIndexDigest {
+	var d stakeIndexDigest
+	for _, entry := range entries {
+		d.add(entry.Pubkey)
+	}
+	return d
+}
+
 // stakeIndexMembers is the stake pubkey index's key set: the keys loaded at
-// startup (sorted) plus keys added by replayed slots.
+// startup (sorted) plus keys added by replayed slots. digest covers the
+// startup keys and those added by committed slots; uncommitted holds the
+// keys each later slot added first.
 type stakeIndexMembers struct {
-	base  []solana.PublicKey
-	added map[solana.PublicKey]uint64 // key -> first slot that enqueued it
+	base        []solana.PublicKey
+	added       map[solana.PublicKey]uint64 // key -> first slot that enqueued it
+	digest      stakeIndexDigest
+	uncommitted map[uint64][]solana.PublicKey
 }
 
 func newStakeIndexMembers(entries []accountsdb.StakeIndexEntry) *stakeIndexMembers {
@@ -65,7 +114,7 @@ func newStakeIndexMembers(entries []accountsdb.StakeIndexEntry) *stakeIndexMembe
 		base[i] = entry.Pubkey
 	}
 	sort.Slice(base, func(i, j int) bool { return bytes.Compare(base[i][:], base[j][:]) < 0 })
-	return &stakeIndexMembers{base: base, added: make(map[solana.PublicKey]uint64)}
+	return &stakeIndexMembers{base: base, added: make(map[solana.PublicKey]uint64), digest: digestStakeIndex(entries)}
 }
 
 func (m *stakeIndexMembers) contains(key solana.PublicKey) bool {
@@ -78,7 +127,14 @@ func (m *stakeIndexMembers) contains(key solana.PublicKey) bool {
 
 func (m *stakeIndexMembers) add(slot uint64, key solana.PublicKey) {
 	if !m.contains(key) {
+		if m.added == nil {
+			m.added = make(map[solana.PublicKey]uint64)
+		}
+		if m.uncommitted == nil {
+			m.uncommitted = make(map[uint64][]solana.PublicKey)
+		}
 		m.added[key] = slot
+		m.uncommitted[slot] = append(m.uncommitted[slot], key)
 	}
 }
 
@@ -87,6 +143,34 @@ func (m *stakeIndexMembers) dropFrom(from uint64) {
 	for key, slot := range m.added {
 		if slot >= from {
 			delete(m.added, key)
+		}
+	}
+	for slot := range m.uncommitted {
+		if slot >= from {
+			delete(m.uncommitted, slot)
+		}
+	}
+}
+
+// digestThrough is the digest of the members as of slot through.
+func (m *stakeIndexMembers) digestThrough(through uint64) stakeIndexDigest {
+	d := m.digest
+	for slot, keys := range m.uncommitted {
+		if slot <= through {
+			for _, key := range keys {
+				d.add(key)
+			}
+		}
+	}
+	return d
+}
+
+// commitThrough folds the keys of slots <= through into digest.
+func (m *stakeIndexMembers) commitThrough(through uint64) {
+	m.digest = m.digestThrough(through)
+	for slot := range m.uncommitted {
+		if slot <= through {
+			delete(m.uncommitted, slot)
 		}
 	}
 }
@@ -120,8 +204,9 @@ func newStakeTotalsTracker(initial map[solana.PublicKey]voteDelegation, members 
 // recordSlot computes and records a replayed slot's change. modified are the
 // accounts the slot writes (as stored), enqueued the keys the slot added to
 // the stake index, and readStored returns an account's stored record as of
-// the slot's parent (nil when absent).
-func (t *stakeTotalsTracker) recordSlot(slot uint64, slotCtx *sealevel.SlotCtx, modified []*accounts.Account, enqueued []solana.PublicKey, readStored func(solana.PublicKey) *accounts.Account) {
+// the slot's parent (nil when absent; an error when it cannot be read, which
+// stops the tracker).
+func (t *stakeTotalsTracker) recordSlot(slot uint64, slotCtx *sealevel.SlotCtx, modified []*accounts.Account, enqueued []solana.PublicKey, readStored func(solana.PublicKey) (*accounts.Account, error)) {
 	if t == nil || t.broken {
 		return
 	}
@@ -152,6 +237,13 @@ func (t *stakeTotalsTracker) recordSlot(slot uint64, slotCtx *sealevel.SlotCtx, 
 			continue
 		}
 		key := acct.Key
+		if _, dup := counted[key]; dup {
+			continue
+		}
+		if counted == nil {
+			counted = make(map[solana.PublicKey]struct{})
+		}
+		counted[key] = struct{}{}
 		// Fast exact filter: a record can count only if its data starts with
 		// the Stake status. When neither the new record nor the stored old one
 		// does, the account cannot change the totals and its index membership
@@ -162,13 +254,6 @@ func (t *stakeTotalsTracker) recordSlot(slot uint64, slotCtx *sealevel.SlotCtx, 
 		if !mayDelegate(acct.Data) && parentIsStored && !mayDelegate(parent.Data) {
 			continue
 		}
-		if _, dup := counted[key]; dup {
-			continue
-		}
-		if counted == nil {
-			counted = make(map[solana.PublicKey]struct{})
-		}
-		counted[key] = struct{}{}
 		memberBefore := t.members.contains(key)
 		_, enqueuedNow := addedNow[key]
 		memberAfter := memberBefore || enqueuedNow
@@ -182,7 +267,12 @@ func (t *stakeTotalsTracker) recordSlot(slot uint64, slotCtx *sealevel.SlotCtx, 
 			}
 			old := parent
 			if !parentIsStored {
-				old = readStored(key)
+				stored, err := readStored(key)
+				if err != nil {
+					t.disable("slot %d: reading stored stake index account %s: %v", slot, key, err)
+					return
+				}
+				old = stored
 			}
 			if vote, stake, ok := scannedDelegation(old); ok {
 				add(vote, -int64(stake), -1)
@@ -200,6 +290,17 @@ func (t *stakeTotalsTracker) recordSlot(slot uint64, slotCtx *sealevel.SlotCtx, 
 	} else {
 		delete(t.pending, slot)
 	}
+}
+
+// encodedThrough is totalsThrough(through) encoded for a fold's resume
+// context, bound to the stake index members as of through (nil when the
+// totals are not tracked).
+func (t *stakeTotalsTracker) encodedThrough(through uint64) (map[solana.PublicKey]voteDelegation, *state.DelegatedStakeTotals) {
+	totals, ok := t.totalsThrough(through)
+	if !ok {
+		return nil, nil
+	}
+	return totals, encodeDelegatedStake(totals, t.members.digestThrough(through))
 }
 
 // totalsThrough returns the durable totals with the pending changes of every
@@ -248,6 +349,7 @@ func (t *stakeTotalsTracker) commitThrough(through uint64, totals map[solana.Pub
 			delete(t.pending, slot)
 		}
 	}
+	t.members.commitThrough(through)
 }
 
 // dropFrom discards unwound slots >= from: their changes and the index keys
@@ -273,26 +375,50 @@ func (t *stakeTotalsTracker) disable(format string, args ...any) {
 	mlog.Log.Warnf("delegated stake totals: no longer tracked this run; fold boundaries from here on carry none: "+format, args...)
 }
 
-// encodeDelegatedStake converts totals to their resume-context encoding.
-func encodeDelegatedStake(totals map[solana.PublicKey]voteDelegation) *state.DelegatedStakeTotals {
+// encodeDelegatedStake converts totals, and the digest of the stake index key
+// set they cover, to their resume-context encoding.
+func encodeDelegatedStake(totals map[solana.PublicKey]voteDelegation, index stakeIndexDigest) *state.DelegatedStakeTotals {
 	raw := make(map[[32]byte]state.VoteDelegation, len(totals))
 	for vote, d := range totals {
 		raw[[32]byte(vote)] = state.VoteDelegation{Stake: d.stake, Accounts: d.accounts}
 	}
-	return state.EncodeDelegatedStake(raw)
+	encoded := state.EncodeDelegatedStake(raw)
+	encoded.IndexKeys, encoded.IndexDigest = index.keys, index.hex()
+	return encoded
 }
 
-// decodeDelegatedStake converts a resume context's totals back.
-func decodeDelegatedStake(encoded *state.DelegatedStakeTotals) (map[solana.PublicKey]voteDelegation, error) {
+// decodeDelegatedStake converts a resume context's totals back, with the
+// digest of the stake index key set they cover. Totals without that binding
+// are refused: nothing says which index they match.
+func decodeDelegatedStake(encoded *state.DelegatedStakeTotals) (map[solana.PublicKey]voteDelegation, stakeIndexDigest, error) {
 	raw, err := encoded.Decode()
 	if err != nil {
-		return nil, err
+		return nil, stakeIndexDigest{}, err
+	}
+	index, err := decodeStakeIndexDigest(encoded)
+	if err != nil {
+		return nil, stakeIndexDigest{}, err
 	}
 	totals := make(map[solana.PublicKey]voteDelegation, len(raw))
 	for vote, d := range raw {
 		totals[solana.PublicKey(vote)] = voteDelegation{stake: d.Stake, accounts: d.Accounts}
 	}
-	return totals, nil
+	return totals, index, nil
+}
+
+func decodeStakeIndexDigest(encoded *state.DelegatedStakeTotals) (stakeIndexDigest, error) {
+	if encoded.IndexDigest == "" {
+		return stakeIndexDigest{}, errors.New("no stake index binding")
+	}
+	raw, err := hex.DecodeString(encoded.IndexDigest)
+	if err != nil || len(raw) != 32 {
+		return stakeIndexDigest{}, fmt.Errorf("bad stake index digest %q", encoded.IndexDigest)
+	}
+	d := stakeIndexDigest{keys: encoded.IndexKeys}
+	for i := range d.sum {
+		d.sum[i] = binary.LittleEndian.Uint64(raw[8*i:])
+	}
+	return d, nil
 }
 
 // delegationStakes is the per-vote-account stake the vote cache rebuild takes:

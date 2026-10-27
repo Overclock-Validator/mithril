@@ -247,7 +247,10 @@ type ResumeState struct {
 	// DelegatedStake is the delegated stake per vote account in durable state
 	// as of the resume slot, from the rooted context. nil = the context did not
 	// carry it (or it failed to decode); startup scans the stake accounts.
-	DelegatedStake map[solana.PublicKey]voteDelegation
+	// DelegatedStakeIndex is the stake index key set it was computed over:
+	// startup uses it only if the index it loads has that key set.
+	DelegatedStake      map[solana.PublicKey]voteDelegation
+	DelegatedStakeIndex stakeIndexDigest
 
 	// ComputedEpochStakes contains epoch stakes computed at boundaries.
 	// Key: epoch number (the leader schedule epoch), Value: serialized JSON
@@ -1085,6 +1088,7 @@ func recordAccountLoaderBatchStats(dst *metrics.AccountLoader, src accountsdb.Ba
 	dst.InProgressHits += src.InProgressHits
 	dst.PendingFoldHits += src.PendingFoldHits
 	dst.CacheHits += src.CacheHits
+	dst.NegativeCacheHits += src.NegativeCacheHits
 	dst.IndexHits += src.IndexHits
 	dst.IndexMisses += src.IndexMisses
 	dst.UniqueAppendVecs += src.UniqueAppendVecs
@@ -1142,18 +1146,32 @@ var verifyStakeTotals = os.Getenv("MITHRIL_VERIFY_STAKE_TOTALS") == "1"
 
 // startStartupStakeScan prepares the delegated stake totals the first block's
 // setup takes. saved are the totals from the rooted context being resumed
-// (nil on a snapshot boot or when the context has none).
-func startStartupStakeScan(acctsDb *accountsdb.AccountsDb, saved map[solana.PublicKey]voteDelegation) {
+// (nil on a snapshot boot or when the context has none), computed over the
+// stake index key set savedIndex.
+func startStartupStakeScan(acctsDb *accountsdb.AccountsDb, saved map[solana.PublicKey]voteDelegation, savedIndex stakeIndexDigest) {
 	scan := &startupStakeScan{db: acctsDb, done: make(chan struct{})}
 	pendingStartupStakeScan.Store(scan)
-	if saved != nil && !verifyStakeTotals {
-		mlog.Log.Infof("delegated stake totals: using the rooted context's totals (%d vote accounts); no stake scan", len(saved))
-		scan.totals = saved
-		close(scan.done)
-		return
-	}
 	go func() {
 		defer close(scan.done)
+		if saved != nil {
+			// The index can hold keys the saved totals never counted (appended
+			// before a fold that did not commit, or kept across a rewind); a
+			// scan reads those, so the totals stand for it only on the same
+			// key set.
+			entries, err := global.LoadStakePubkeyIndex(filepath.Join(acctsDb.AcctsDir, ".."))
+			if err != nil {
+				scan.err = err
+				return
+			}
+			if index := digestStakeIndex(entries); index != savedIndex {
+				mlog.Log.Warnf("delegated stake totals: the stake index (%d keys) is not the key set the rooted context's totals cover (%d keys); scanning the stake accounts", index.keys, savedIndex.keys)
+				saved = nil
+			} else if !verifyStakeTotals {
+				mlog.Log.Infof("delegated stake totals: using the rooted context's totals (%d vote accounts); no stake scan", len(saved))
+				scan.totals = saved
+				return
+			}
+		}
 		scan.totals, scan.err = scanDelegatedStake(acctsDb)
 		if scan.err != nil || saved == nil {
 			return
@@ -1846,15 +1864,16 @@ func ReplayBlocks(
 	firstReplay := !replayBlocksEntered.Swap(true)
 	if acctsDb != nil {
 		var saved map[solana.PublicKey]voteDelegation
+		var savedIndex stakeIndexDigest
 		if resumeState != nil {
-			saved = resumeState.DelegatedStake
+			saved, savedIndex = resumeState.DelegatedStake, resumeState.DelegatedStakeIndex
 			if saved == nil && firstReplay {
 				// An older binary's context, or a fold written after the tracker
 				// stopped trusting its totals: scan, as mainline always did.
 				mlog.Log.Warnf("resume from slot %d: the rooted context has no delegated stake totals; scanning the stake accounts", resumeState.ParentSlot)
 			}
 		}
-		startStartupStakeScan(acctsDb, saved)
+		startStartupStakeScan(acctsDb, saved, savedIndex)
 		defer finishStartupStakeScan()
 	}
 	alpenglowMode := consensusOpts != nil && consensusOpts.Alpenglow
@@ -2664,8 +2683,7 @@ func ReplayBlocks(
 		if unrootedTailState != nil {
 			src = unrootedTailState
 		}
-		prefetcher = newAccountPrefetcher(src, accountPrefetchAhead, accountPrefetchWorkers)
-		prefetcher.db, prefetcher.tipWarm = acctsDb, tipWarmEnabled
+		prefetcher = newAccountPrefetcher(src, acctsDb, accountPrefetchAhead, accountPrefetchWorkers, tipWarmEnabled)
 		defer prefetcher.Close()
 		defer prefetcher.installRefsHook()()
 		blockStream.SetReplayEmitHook(prefetcher.Offer)

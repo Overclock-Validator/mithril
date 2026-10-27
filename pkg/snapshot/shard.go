@@ -49,7 +49,6 @@ type shard struct {
 	file     *os.File
 	requests chan shardRequest
 	logSize  int
-	parent   *ShardLogger // parent for progress reporting
 }
 
 // NewShardLogger creates a new ShardLogger with the specified number of
@@ -72,7 +71,7 @@ func NewShardLogger(numShards int, filePrefix string) *ShardLogger {
 
 	sl.wg.Add(numShards)
 	for i := range numShards {
-		sl.shards[i] = newShard(i, filePrefix, sl)
+		sl.shards[i] = newShard(i, filePrefix)
 		go sl.shards[i].processRequests(sl.wg)
 	}
 
@@ -80,7 +79,7 @@ func NewShardLogger(numShards int, filePrefix string) *ShardLogger {
 }
 
 // newShard creates a new shard with the given ID
-func newShard(id int, filePrefix string, parent *ShardLogger) *shard {
+func newShard(id int, filePrefix string) *shard {
 	filename := filepath.Join(filePrefix, fmt.Sprintf("%03d", id))
 	file, err := os.Create(filename)
 	if err != nil {
@@ -92,7 +91,6 @@ func newShard(id int, filePrefix string, parent *ShardLogger) *shard {
 		writer:   bufio.NewWriter(file),
 		file:     file,
 		requests: make(chan shardRequest, 100),
-		parent:   parent,
 	}
 
 	return s

@@ -72,7 +72,6 @@ func TestPreloadSourceResolvesLikeExecution(t *testing.T) {
 func TestPreloadProgramCachesOnceAndMatchesExecution(t *testing.T) {
 	elf := fixtures.Load(t, "sbpf", "noop_aligned.so")
 	cache := accountsdb.NewWeightedCache[solana.PublicKey, *accountsdb.ProgramCacheEntry](64, func(solana.PublicKey, *accountsdb.ProgramCacheEntry) uint32 { return 1 })
-	t.Cleanup(cache.Close)
 	db := &accountsdb.AccountsDb{ProgramCache: cache}
 	f := features.NewFeaturesDefault()
 	key := benchPubkey(0x96)

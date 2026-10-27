@@ -524,6 +524,11 @@ func (s *ShredSpool) readSlotLocked(slot uint64) ([][]byte, error) {
 // CompleteParents returns the parent slot of every complete spooled slot in
 // [lo, hi], read from the slot's first intact data shred and cached until the
 // slot is discarded. Slots whose parent cannot be read are left out.
+//
+// This is the shred header's parent. An Alpenglow UpdateParent marker in the
+// block's entries can name an older parent, which this does not see: such a
+// skip is not detected here, and the block source handles the parent change
+// as it would without the spool.
 func (s *ShredSpool) CompleteParents(lo, hi uint64) map[uint64]uint64 {
 	if s == nil {
 		return nil

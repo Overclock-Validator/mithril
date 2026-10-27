@@ -39,6 +39,7 @@ var (
 	// Test hooks; production reads statfs every refresh interval.
 	dirAvailableBytes      = accountsdb.AvailableDiskBytes
 	dirFreeRefreshInterval = 250 * time.Millisecond
+	dirSyncFilesystem      = syncFilesystem
 )
 
 func openAppendVecDirs(dirs []string) (*appendVecDirs, error) {
@@ -165,7 +166,7 @@ func (d *appendVecDirs) close() {
 // directories themselves. Run it before the build is reported complete.
 func (d *appendVecDirs) syncAll() error {
 	for _, dir := range d.dirs {
-		if err := syncFilesystem(dir); err != nil {
+		if err := dirSyncFilesystem(dir); err != nil {
 			return fmt.Errorf("syncing %s: %w", dir, err)
 		}
 		if err := syncDir(dir); err != nil {
@@ -173,6 +174,23 @@ func (d *appendVecDirs) syncAll() error {
 		}
 	}
 	return nil
+}
+
+// startSync runs syncAll in the background, overlapping the index flush. The
+// returned wait reports its result and may be called any number of times. A
+// build defers it right away, so no return path, including an error, leaves
+// the sync running over directories a retry or cleanup may be touching.
+func (d *appendVecDirs) startSync() (wait func() error) {
+	done := make(chan struct{})
+	var err error
+	go func() {
+		err = d.syncAll()
+		close(done)
+	}()
+	return func() error {
+		<-done
+		return err
+	}
 }
 
 // syncBuildMetadata fsyncs the small files a completed build writes next to the

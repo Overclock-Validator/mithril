@@ -80,11 +80,11 @@ func (w *stakeWorld) apply(t *testing.T, tracker *stakeTotalsTracker, s stakeSlo
 		require.NoError(t, parents.SetAccountWithoutLock(acct.Key, parent))
 	}
 	slotCtx := &sealevel.SlotCtx{Slot: s.slot, ParentAccts: parents}
-	readStored := func(key solana.PublicKey) *accounts.Account {
+	readStored := func(key solana.PublicKey) (*accounts.Account, error) {
 		if stored, ok := w.stored[key]; ok {
-			return stored.Clone()
+			return stored.Clone(), nil
 		}
-		return nil
+		return nil, nil
 	}
 	tracker.recordSlot(s.slot, slotCtx, s.writes, s.enqueue, readStored)
 	for _, acct := range s.writes {
@@ -197,7 +197,7 @@ func TestStakeTotalsTrackerStopsWithoutParentImage(t *testing.T) {
 	members := newStakeIndexMembers([]accountsdb.StakeIndexEntry{{Pubkey: solana.PublicKey{1}}})
 	tracker := newStakeTotalsTracker(map[solana.PublicKey]voteDelegation{}, members)
 	slotCtx := &sealevel.SlotCtx{Slot: 1, ParentAccts: accounts.NewMemAccountsWithLen(0)}
-	tracker.recordSlot(1, slotCtx, []*accounts.Account{{Key: solana.PublicKey{1}, Lamports: 1}}, nil, func(solana.PublicKey) *accounts.Account { return nil })
+	tracker.recordSlot(1, slotCtx, []*accounts.Account{{Key: solana.PublicKey{1}, Lamports: 1}}, nil, func(solana.PublicKey) (*accounts.Account, error) { return nil, nil })
 	_, ok := tracker.totalsThrough(1)
 	assert.False(t, ok, "a slot whose change cannot be computed stops the tracker instead of guessing")
 }
@@ -207,14 +207,21 @@ func TestDelegatedStakeEncodingRoundTrip(t *testing.T) {
 		{1}: {stake: 5, accounts: 2},
 		{2}: {stake: 0, accounts: 1},
 	}
-	encoded := encodeDelegatedStake(totals)
+	index := digestStakeIndex([]accountsdb.StakeIndexEntry{{Pubkey: solana.PublicKey{3}}, {Pubkey: solana.PublicKey{4}}})
+	encoded := encodeDelegatedStake(totals, index)
 	raw, err := json.Marshal(&state.ResumeContext{Slot: 9, DelegatedStake: encoded})
 	require.NoError(t, err)
 	var ctx state.ResumeContext
 	require.NoError(t, json.Unmarshal(raw, &ctx))
-	decoded, err := decodeDelegatedStake(ctx.DelegatedStake)
+	decoded, decodedIndex, err := decodeDelegatedStake(ctx.DelegatedStake)
 	require.NoError(t, err)
 	assert.Equal(t, totals, decoded)
+	assert.Equal(t, index, decodedIndex)
+
+	unbound := *encoded
+	unbound.IndexKeys, unbound.IndexDigest = 0, ""
+	_, _, err = decodeDelegatedStake(&unbound)
+	assert.Error(t, err, "totals without a stake index binding are not used")
 
 	var old state.ResumeContext
 	require.NoError(t, json.Unmarshal([]byte(`{"slot":9}`), &old))
@@ -248,7 +255,7 @@ func TestFoldsWriteDelegatedStakeIntoResumeContext(t *testing.T) {
 		var ctx state.ResumeContext
 		require.NoError(t, json.Unmarshal(raw, &ctx))
 		require.NotNil(t, ctx.DelegatedStake)
-		totals, err := decodeDelegatedStake(ctx.DelegatedStake)
+		totals, _, err := decodeDelegatedStake(ctx.DelegatedStake)
 		require.NoError(t, err)
 		return totals
 	}
@@ -261,7 +268,7 @@ func TestFoldsWriteDelegatedStakeIntoResumeContext(t *testing.T) {
 			slot, amt := input[0], input[1]
 			ctx := parentOf(amt - 10)
 			ctx.Slot = slot
-			tracker.recordSlot(slot, ctx, []*accounts.Account{write(amt)}, nil, func(solana.PublicKey) *accounts.Account { return nil })
+			tracker.recordSlot(slot, ctx, []*accounts.Account{write(amt)}, nil, func(solana.PublicKey) (*accounts.Account, error) { return nil, nil })
 			overlay.Add(slot, []*accounts.Account{write(amt)})
 			contexts[slot] = &state.ResumeContext{Slot: slot}
 		}
@@ -281,7 +288,7 @@ func TestFoldsWriteDelegatedStakeIntoResumeContext(t *testing.T) {
 		tail.stakeTotals = newStakeTotalsTracker(initial, members)
 		ctx := parentOf(10)
 		ctx.Slot = 7
-		tail.stakeTotals.recordSlot(7, ctx, []*accounts.Account{write(25)}, nil, func(solana.PublicKey) *accounts.Account { return nil })
+		tail.stakeTotals.recordSlot(7, ctx, []*accounts.Account{write(25)}, nil, func(solana.PublicKey) (*accounts.Account, error) { return nil, nil })
 		tail.Add(7, []*accounts.Account{write(25)}, testHashBytes(7))
 		tail.SetContext(7, &state.ResumeContext{Slot: 7})
 
@@ -335,8 +342,29 @@ func TestStakeTotalsTrackerCountsDuplicateWritesOnce(t *testing.T) {
 	ctx := &sealevel.SlotCtx{Slot: 5, ParentAccts: parents}
 	first := stakeAcct(t, key, 100, stakeOwner, sealevel.StakeStateV2StatusStake, vote, 15)
 	last := stakeAcct(t, key, 100, stakeOwner, sealevel.StakeStateV2StatusStake, vote, 40)
-	tracker.recordSlot(5, ctx, []*accounts.Account{first, last}, nil, func(solana.PublicKey) *accounts.Account { return nil })
+	tracker.recordSlot(5, ctx, []*accounts.Account{first, last}, nil, func(solana.PublicKey) (*accounts.Account, error) { return nil, nil })
 	totals, ok := tracker.totalsThrough(5)
 	require.True(t, ok)
 	assert.Equal(t, voteDelegation{stake: 40, accounts: 1}, totals[vote])
+}
+
+// A final non-delegating value must suppress an intermediate Stake record,
+// even when the final value and parent both take the cheap non-stake filter.
+func TestStakeTotalsTrackerNewestNonStakeSuppressesDuplicate(t *testing.T) {
+	stakeOwner := [32]byte(addresses.StakeProgramAddr)
+	vote, key := solana.PublicKey{0xb3}, solana.PublicKey{0xc3}
+	members := newStakeIndexMembers([]accountsdb.StakeIndexEntry{{Pubkey: key}})
+	tracker := newStakeTotalsTracker(map[solana.PublicKey]voteDelegation{}, members)
+	parent := stakeAcct(t, key, 100, stakeOwner, sealevel.StakeStateV2StatusUninitialized, vote, 0)
+	parents := accounts.NewMemAccountsWithLen(1)
+	require.NoError(t, parents.SetAccountWithoutLock(key, parent))
+	ctx := &sealevel.SlotCtx{Slot: 5, ParentAccts: parents}
+	intermediate := stakeAcct(t, key, 100, stakeOwner, sealevel.StakeStateV2StatusStake, vote, 40)
+	final := parent.Clone()
+	tracker.recordSlot(5, ctx, []*accounts.Account{intermediate, final}, nil, func(solana.PublicKey) (*accounts.Account, error) {
+		return parent, nil
+	})
+	totals, ok := tracker.totalsThrough(5)
+	require.True(t, ok)
+	require.Empty(t, totals, "the superseded Stake record must not contribute delegated stake")
 }

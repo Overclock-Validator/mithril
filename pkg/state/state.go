@@ -325,6 +325,13 @@ type VoteDelegation struct {
 type DelegatedStakeTotals struct {
 	Votes  int    `json:"votes"`
 	Packed string `json:"packed"`
+	// IndexKeys and IndexDigest identify the stake pubkey index key set the
+	// totals were computed over (an order-independent digest, hex). The index
+	// file can hold keys the totals never saw (it is appended before a fold
+	// commits and is not cut back by a rewind), so startup uses the totals
+	// only when the index it loads has this exact key set.
+	IndexKeys   uint64 `json:"index_keys,omitempty"`
+	IndexDigest string `json:"index_digest,omitempty"`
 }
 
 const delegatedStakeRecordBytes = 32 + 8 + 8

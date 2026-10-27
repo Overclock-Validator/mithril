@@ -22,9 +22,11 @@ type TransactionAccounts struct {
 	Locked    []bool
 	Touched   []bool
 	AcctMetas []*AccountMeta
-	// OnFirstWriteClone receives the deep copy installed by a shared account's
-	// first write. While it is set, SetData also deep-copies, so the callback
-	// always sees detached old data.
+	// OnFirstWriteClone, when set, receives the deep copy installed by a
+	// shared account's first write, and SetData then deep-copies too, so the
+	// callback always sees detached old data. Replay does not set it; the
+	// replacement tests use it as the reference deep-copy path that the
+	// header-only path must match.
 	OnFirstWriteClone func(*accounts.Account)
 	// OnFirstWriteDetach observes each shared account's first write: its old
 	// data length and the data bytes copied, which is zero when SetData

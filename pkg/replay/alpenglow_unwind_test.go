@@ -103,7 +103,7 @@ func TestResumeStateFromRootedContextRoundTrip(t *testing.T) {
 		InflationFoundation:        0.05,
 		InflationFoundationTerm:    7,
 		TransactionCount:           &txc,
-		DelegatedStake:             encodeDelegatedStake(map[solana.PublicKey]voteDelegation{{7}: {stake: 70, accounts: 2}}),
+		DelegatedStake:             encodeDelegatedStake(map[solana.PublicKey]voteDelegation{{7}: {stake: 70, accounts: 2}}, stakeIndexDigest{keys: 2}),
 	}
 
 	rs, err := ResumeStateFromRootedContext(rc, map[uint64]string{2: "c3Rha2Vz"})

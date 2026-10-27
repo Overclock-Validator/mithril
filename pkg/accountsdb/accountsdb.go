@@ -50,6 +50,10 @@ type AccountsDb struct {
 	pendingFold      map[[32]byte]dedupedVersion
 	commonAdmission  *commonCacheAdmission
 	batchHooks       batchReadTestHooks
+	// Batch-only absence cache. Both fields use readCacheEpochMu; entries are
+	// valid only for the exact publication epoch in which absence was observed.
+	batchAbsentEpoch uint64
+	batchAbsent      map[solana.PublicKey]struct{}
 
 	// appendVecReadMu pins appendvec paths from before an index snapshot until
 	// its file reads complete. Compaction/rewind take the write side across an
@@ -138,7 +142,7 @@ var (
 const (
 	indexPebbleMemTableSize                = 64 << 20
 	indexPebbleMemTableStopWritesThreshold = 4
-	DefaultCommonAccountCacheMaxMB         = 256
+	DefaultCommonAccountCacheMaxMB         = 768
 	DefaultProgramCacheMaxMB               = 1024
 	programCacheCostUnitBytes              = 1 << 20
 	commonAccountCacheEntryOverheadBytes   = 256
@@ -217,10 +221,13 @@ func OpenDbPaths(accountsPaths []string) (*AccountsDb, error) {
 	accountsDb := &AccountsDb{
 		IndexWALDisabled: DisableIndexWAL, Index: db, BankHashStore: bankhashDb, AcctsDir: appendVecsDir, AcctsDirs: appendVecsDirs}
 	largestBytes, err := os.ReadFile(filepath.Join(accountsDbDir, "largest_file_id"))
-	if err != nil || len(largestBytes) != 8 {
+	if err == nil && len(largestBytes) != 8 {
+		err = fmt.Errorf("expected 8 bytes, found %d", len(largestBytes))
+	}
+	if err != nil {
 		bankhashDb.Close()
 		db.Close()
-		return nil, fmt.Errorf("reading largest_file_id: expected 8 bytes: %v", err)
+		return nil, fmt.Errorf("reading largest_file_id: %w", err)
 	}
 	accountsDb.LargestFileId.Store(binary.LittleEndian.Uint64(largestBytes))
 	accountsDb.bindLockDiagnostics()
@@ -305,21 +312,12 @@ func programCacheCapacityUnits() int {
 	if mb <= 0 {
 		mb = DefaultProgramCacheMaxMB
 	}
-	scale := (1 << 20) / programCacheUnitBytes()
+	scale := (1 << 20) / programCacheCostUnitBytes
 	maxInt := int(^uint(0) >> 1)
 	if mb > maxInt/scale {
 		return maxInt
 	}
 	return mb * scale
-}
-
-// Experimental fine accounting retains the same configured byte budget.
-// The switch is fixed for the lifetime of a process/cache.
-func programCacheUnitBytes() int {
-	if ProgramCacheAccounting == "kib" {
-		return 1024
-	}
-	return programCacheCostUnitBytes
 }
 
 func commonAccountCacheCapacityBytes() int {
@@ -350,7 +348,7 @@ func (entry *ProgramCacheEntry) CostUnits() uint32 {
 		return 1
 	}
 	bytes := entry.Program.MemoryBytes() + uint64(len(entry.sourceBytes))
-	unit := uint64(programCacheUnitBytes())
+	unit := uint64(programCacheCostUnitBytes)
 	units := bytes / unit
 	if bytes%unit != 0 {
 		units++
@@ -789,6 +787,7 @@ func (accountsDb *AccountsDb) refreshReadCacheEntries(accts []*accounts.Account)
 
 // resetReadCachesLocked requires readCacheEpochMu for writing.
 func (accountsDb *AccountsDb) resetReadCachesLocked() {
+	clear(accountsDb.batchAbsent)
 	accountsDb.CommonAcctsCache.Clear()
 	accountsDb.VoteAcctCache.Clear()
 	accountsDb.programCacheMu.Lock()
@@ -813,7 +812,7 @@ func (accountsDb *AccountsDb) storeWorker() {
 }
 
 func (accountsDb *AccountsDb) storeAccountsInternal(accts []*accounts.Account, slot uint64) {
-	fileId := accountsDb.nextFileId(accountsDb.chooseShard())
+	fileId := accountsDb.nextFileId(0)
 	appendVecFileName := accountsDb.appendVecPath(slot, fileId)
 	appendVecFile, err := os.OpenFile(appendVecFileName, os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
@@ -998,7 +997,7 @@ func (accountsDb *AccountsDb) parallelStoreAccounts(n int, accts []*accounts.Acc
 	}
 	newAppendVecGroup := errgroup.Group{}
 	newAppendVecGroup.Go(func() error {
-		fileId := accountsDb.nextFileId(accountsDb.chooseShard())
+		fileId := accountsDb.nextFileId(0)
 		appendVecFileName := accountsDb.appendVecPath(slot, fileId)
 		appendVecFile, err := os.OpenFile(appendVecFileName, os.O_RDWR|os.O_CREATE, 0666)
 		if err != nil {

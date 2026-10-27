@@ -73,9 +73,6 @@ func (db *AccountsDb) appendVecPath(slot, fileId uint64) string {
 	return filepath.Join(db.appendVecDir(fileId), SegmentDataName(slot, fileId))
 }
 
-// chooseShard picks the directory for a legacy direct store: the primary.
-func (db *AccountsDb) chooseShard() int { return 0 }
-
 // nextFileId returns a fresh file ID stored in directory dir (0 = primary).
 // It advances the shared high-water mark; callers persist it before writing
 // the first data byte (I7).

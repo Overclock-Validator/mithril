@@ -5,6 +5,7 @@ import (
 
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func refsTestKey(b byte) solana.PublicKey {
@@ -49,4 +50,43 @@ func TestSetStreamRefsHook(t *testing.T) {
 	assert.Equal(t, uint64(42), got)
 	SetStreamRefsHook(nil)
 	assert.Nil(t, streamRefsHook.Load())
+}
+
+// A block decoded at completion (not by the early batch decode) is summarized
+// for the prefetcher before it is returned.
+func TestDecodeBlockSummarizesForPrefetch(t *testing.T) {
+	leader := testShredLeader(t)
+	gen := ShredGenerator{Slot: 100, ParentSlot: 99, Version: 7, ReferenceTick: 63}
+	var (
+		chainedRoot      = solana.Hash{5}
+		nextData, nextCo uint32
+	)
+	state := &slotState{slot: 100, parentSlot: 99, shredVer: 7, shreds: map[uint32]*Shred{}}
+	for _, component := range buildAlpenglowSlot(t) {
+		packets, root, newData, newCode, err := gen.MakeShredsFromData(leader, component.payload, component.isLastInSlot, chainedRoot, nextData, nextCo)
+		require.NoError(t, err)
+		chainedRoot, nextData, nextCo = root, newData, newCode
+		for _, packet := range packets {
+			shred, err := ParseShred(packet)
+			require.NoError(t, err)
+			if shred.Type == ShredTypeData {
+				state.shreds[shred.Index] = shred
+			}
+		}
+	}
+	defer SetStreamRefsHook(nil)
+	var gotSlot uint64
+	var got *StreamAccountRefs
+	SetStreamRefsHook(func(slot uint64, refs *StreamAccountRefs) { gotSlot, got = slot, refs })
+	blk, _, _, err := state.decodeBlock(nil)
+	require.NoError(t, err)
+	require.NotEmpty(t, blk.Transactions)
+	require.NotNil(t, got, "the completion decode summarizes the block")
+	assert.Equal(t, uint64(100), gotSlot)
+	assert.Same(t, got, blk.AccountPrefetchRefs())
+	for _, tx := range blk.Transactions {
+		for _, k := range tx.Message.AccountKeys {
+			assert.Contains(t, got.Keys, k)
+		}
+	}
 }

@@ -661,21 +661,17 @@ name = "mithril"
 
     # Approximate retained decoded account cache weight budget in MiB. Large block scans
     # pass through a bounded two-hit admission filter before using this budget.
-    common_account_cache_max_mb = 256
+    common_account_cache_max_mb = 768
 
     # Pebble block cache for the account locator index (not account payloads).
-    # Keep the old default until choosing a memory budget for your workload.
-    index_cache_max_mb = 8
+    index_cache_max_mb = 256
 
-    # flat: original weighted account cache.
-    # tiered: reserve 1/16 for empty accounts and 1/8 for accounts <=200 bytes.
-    # expanded: reserve 1/6 for empty accounts and 1/2 for accounts <=200 bytes.
+    # fixed (default): up to 16 MiB for empty accounts and 64 MiB for accounts
+    #   <=200 bytes (at most 1/8 and 1/4 of the budget), the rest for larger
+    #   accounts (where a bigger cache keeps paying off).
+    # flat: one weighted cache for every account size.
     # Reservations split common_account_cache_max_mb; they do not add a budget.
-    common_account_cache_layout = "flat"
-
-    # mib retains the previous rounded weights; kib bills at 1KiB precision.
-    # Both use program_cache_max_mb as the same total approximate byte budget.
-    program_cache_accounting = "mib"
+    common_account_cache_layout = "fixed"
 
     # [tuning.pprof] - CPU/Memory Profiling
     #
@@ -950,9 +946,13 @@ name = "mithril"
 # executes received blocks locally, requires the resulting bank hash to match
 # the footer committed by the certified block id, and folds on certificate
 # finality. The settings below therefore apply to verifying mode only.
+#
+# Default: on, except for Alpenglow on turbine without RPC fallback, where
+# blocks are checked against the bank hash in their certified footer instead
+# and the RPC verifier is off. Setting enabled here overrides that default.
 
 [verifier]
-    enabled = true
+    # enabled = true
 
     # Gate folds on the verified watermark. false = advisory only (folds gate
     # on certificate finality alone — an execution divergence would reach disk

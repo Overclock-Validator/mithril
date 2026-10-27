@@ -619,8 +619,7 @@ func init() {
 	Run.Flags().IntVar(&accountsdb.ProgramCacheMaxMB, "program-cache-max-mb", accountsdb.DefaultProgramCacheMaxMB, "Maximum approximate SBPF program cache size in MiB")
 	Run.Flags().IntVar(&accountsdb.CommonAccountCacheMaxMB, "common-account-cache-max-mb", accountsdb.DefaultCommonAccountCacheMaxMB, "Approximate retained decoded account cache weight budget in MiB")
 	Run.Flags().IntVar(&accountsdb.IndexCacheMaxMB, "index-cache-max-mb", accountsdb.DefaultIndexCacheMaxMB, "Pebble account-index block cache capacity in MiB")
-	Run.Flags().StringVar(&accountsdb.CommonAccountCacheLayout, "common-account-cache-layout", "flat", "Account cache layout: flat, tiered (1/16 empty, 1/8 small), expanded (1/6 empty, 1/2 small); shares use the common cache budget")
-	Run.Flags().StringVar(&accountsdb.ProgramCacheAccounting, "program-cache-accounting", "mib", "Program cache weight precision: mib or kib; both retain the configured byte budget")
+	Run.Flags().StringVar(&accountsdb.CommonAccountCacheLayout, "common-account-cache-layout", "fixed", "Account cache layout: fixed (up to 16 MiB empty and 64 MiB small accounts, the rest larger ones) or flat (one cache for every size)")
 	Run.Flags().Int64Var(&rewindToSlot, "rewind-to-slot", 0, "Rewind durable account state to the fold batch boundary at this slot before replaying (must be a retained boundary; run once to list boundaries on mismatch)")
 
 	// [tuning.pprof] section flags

@@ -80,7 +80,7 @@ func CleanAccountsDbDirs(accountsPaths []string) {
 			mlog.Log.Errorf("failed to remove %s: %v", path, err)
 		}
 	}
-	// remove the accounts dir on the other shard disks too
+	// remove the accounts dir in the other accounts directories too
 	for _, p := range accountsPaths[1:] {
 		path := filepath.Join(p, "accounts")
 		if err := os.RemoveAll(path); err != nil {
@@ -311,7 +311,7 @@ func BuildAccountsDbPaths(
 	if err := accountsdb.ValidateAccountsPaths(accountsPaths); err != nil {
 		return nil, nil, err
 	}
-	// The first path holds all metadata; every path holds a shard's accounts dir.
+	// The first path holds all metadata; every path holds an accounts dir with its share of the appendvecs.
 	accountsDbDir := accountsPaths[0]
 	// Clean any leftover artifacts from previous incomplete runs (e.g., Ctrl+C)
 	CleanAccountsDbDirs(accountsPaths)
@@ -425,14 +425,8 @@ func BuildAccountsDbPaths(
 	pools.Release()
 
 	// Make the unpacked appendvecs durable while the index flush runs.
-	appendVecsSynced := make(chan error, 1)
-	go func() { appendVecsSynced <- appendVecDirs.syncAll() }()
-	defer func() {
-		select {
-		case <-appendVecsSynced:
-		default:
-		}
-	}()
+	waitAppendVecsSynced := appendVecDirs.startSync()
+	defer waitAppendVecsSynced()
 
 	mlog.Log.Debugf("done processing snapshots in %s.", fmtDuration(time.Since(start)))
 
@@ -454,7 +448,7 @@ func BuildAccountsDbPaths(
 
 	mlog.Log.Infof("Snapshot processed in %s.", fmtDuration(time.Since(start)))
 
-	if err := <-appendVecsSynced; err != nil {
+	if err := waitAppendVecsSynced(); err != nil {
 		return nil, nil, err
 	}
 	if err := accountsdb.WriteAccountsDirCount(accountsDbDir, len(accountsPaths)); err != nil {
@@ -588,10 +582,6 @@ func readTar(
 		}
 	}
 
-	var totalTarNext, totalReadCopy, totalDispatch time.Duration
-	var entryCount int
-	var bytesOut int64
-	readTarStart := time.Now()
 	for {
 		if pools != nil {
 			if workerErr := pools.Err(); workerErr != nil {
@@ -604,9 +594,7 @@ func readTar(
 			cleanupPartial("cancelled")
 			return ctx.Err()
 		}
-		t0 := time.Now()
 		header, err := tarReader.Next()
-		totalTarNext += time.Since(t0)
 		if err == io.EOF {
 			break
 		} else if err != nil {
@@ -636,18 +624,14 @@ func readTar(
 			return fmt.Errorf("snapshot archive contains appendvec %q but no worker pool is available", header.Name)
 		}
 		bufs := pools.tarBufs
-		t1 := time.Now()
 		bp := bufs.get(int(header.Size))
 		_, err = io.ReadFull(tarReader, *bp)
-		totalReadCopy += time.Since(t1)
 		if err != nil {
 			mlog.Log.Errorf("err reading tar entry data: %s\n", err)
 			cleanupPartial("read error")
 			bufs.put(bp)
 			return err
 		}
-		entryCount++
-		bytesOut += header.Size
 		statsd.Count(statsd.SnapshotTarBytesRead, header.Size, nil)
 
 		// Update extract progress
@@ -656,13 +640,7 @@ func readTar(
 		}
 
 		task := appendVecCopyingTask{Buf: *bp, BufRef: bp, Filename: header.Name, FromIncrementalSnapshot: options.isIncremental}
-		if pools == nil {
-			cleanupPartial("worker pool unavailable")
-			return fmt.Errorf("snapshot archive contains appendvec %q but no worker pool is available", header.Name)
-		}
-		t2 := time.Now()
 		err = invokeSnapshotTask(wg, pools.appendVecCopying, task)
-		totalDispatch += time.Since(t2)
 		if err != nil {
 			mlog.Log.Errorf("error calling appendVecCopyingPool.Invoke: %v", err)
 			bufs.put(bp)
@@ -681,15 +659,6 @@ func readTar(
 		cleanupPartial("status cache commit error")
 		return err
 	}
-
-	elapsed := time.Since(readTarStart)
-	mibps := 0.0
-	if elapsed > 0 {
-		mibps = float64(bytesOut) / (1 << 20) / elapsed.Seconds()
-	}
-	mlog.Log.Infof("readTar timing: entries=%d bytesOut=%dMB elapsed=%s avgMiBps=%.0f tarNext=%s readCopy=%s dispatch=%s",
-		entryCount, bytesOut/(1<<20), fmtDuration(elapsed), mibps,
-		fmtDuration(totalTarNext), fmtDuration(totalReadCopy), fmtDuration(totalDispatch))
 
 	// Successfully processed the entire tar — finalize by renaming from .partial
 	if err := FinalizePartialDownload(savePath); err != nil {
@@ -943,7 +912,8 @@ func initWorkerPools(
 			return
 		}
 		if uint64(len(appendVecBytes)) < fileSize {
-			panic(fmt.Sprintf("appendvec blob (%d bytes) shorter than manifest fileSize (%d)", len(appendVecBytes), fileSize))
+			workerErrors.Record(fmt.Errorf("appendvec slot=%d file_id=%d is %d bytes, shorter than its manifest size %d", slot, origFileId, len(appendVecBytes), fileSize))
+			return
 		}
 
 		dir, fileId := appendVecDirs.place(origFileId, int(fileSize))

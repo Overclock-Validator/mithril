@@ -69,6 +69,7 @@ type BatchReadStats struct {
 	InProgressHits    uint64
 	PendingFoldHits   uint64
 	CacheHits         uint64
+	NegativeCacheHits uint64
 	IndexHits         uint64
 	IndexMisses       uint64
 	UniqueAppendVecs  uint64
@@ -177,6 +178,12 @@ func (db *AccountsDb) getAccountsBatchWithStats(ctx context.Context, slot uint64
 				stats.PlaceholderObjects++
 			}
 			out[i] = batchAccountOrPlaceholder(pk, acct)
+			continue
+		}
+		if db.batchAccountAbsentLocked(pk) {
+			stats.NegativeCacheHits++
+			stats.PlaceholderObjects++
+			out[i] = missingAccount(pk)
 			continue
 		}
 		cold = append(cold, i)
@@ -298,6 +305,7 @@ func (db *AccountsDb) getAccountsBatchWithStats(ctx context.Context, slot uint64
 	db.appendVecReadMu.RUnlock()
 	appendVecPinned = false
 	phaseStart = time.Now()
+	db.cacheBatchAbsences(pks, cold, found, admitCommon, cacheEpoch)
 	publicationJobs := cold[:0]
 	for _, idx := range cold {
 		acct := decodedForCache[idx]
@@ -525,10 +533,6 @@ func missingAccount(pubkey solana.PublicKey) *accounts.Account {
 	return &accounts.Account{Key: pubkey, Owner: systemProgramAddr, RentEpoch: math.MaxUint64}
 }
 
-// runBatchWorkers executes count indexed jobs using at most 2*GOMAXPROCS
-// goroutines. The first error stops new work and is returned after active jobs
-// drain. This bounds both goroutine count and scheduler traffic independently
-// of block size.
 type batchWorkerLimitKey struct{}
 
 // WithBatchWorkerLimit caps the goroutines each batch read made with ctx may
@@ -545,6 +549,10 @@ func limitBatchWorkers(ctx context.Context, workers int) int {
 	return workers
 }
 
+// runBatchWorkers executes count indexed jobs using at most 2*GOMAXPROCS
+// goroutines (fewer under WithBatchWorkerLimit). The first error stops new work
+// and is returned after active jobs drain. This bounds both goroutine count and
+// scheduler traffic independently of block size.
 func runBatchWorkers(ctx context.Context, count int, work func(int) error) error {
 	if count == 0 {
 		return nil

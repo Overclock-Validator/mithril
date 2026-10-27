@@ -45,12 +45,13 @@ func newCommonAccountCache(budget uint64, enabled bool) *commonAccountCache {
 		return c
 	}
 	// Split the existing budget, never add a second independent full budget.
-	// Reserve modest small tiers: large program-data accounts must still fit
-	// the large tier and its per-entry admission ceiling.
-	emptyShare, smallShare := budget/16, budget/8
-	if CommonAccountCacheLayout == "expanded" {
-		emptyShare, smallShare = budget/6, budget/2
-	}
+	// Measured on mainnet catch-up: every empty account read fits in about
+	// 6 MiB and small-account reuse stops improving near 32-64 MiB, while the
+	// large tier keeps gaining up to ~1 GiB. Give the small tiers fixed caps
+	// (a modest share of a small budget, so large program-data accounts still
+	// fit the large tier and its per-entry admission ceiling) and the large
+	// tier the rest.
+	emptyShare, smallShare := min(budget/8, 16<<20), min(budget/4, 64<<20)
 
 	emptyN := int(emptyShare/commonTierShards/uint64(unsafe.Sizeof(commonTierHeader{}))/commonTierWays) * commonTierWays
 	smallN := int(smallShare/commonTierShards/uint64(unsafe.Sizeof(commonTierSmall{}))/commonTierWays) * commonTierWays
@@ -226,4 +227,3 @@ func (c *commonAccountCache) Clear() {
 		c.shards[i].mu.Unlock()
 	}
 }
-func (c *commonAccountCache) Close() { c.large.Close() }

@@ -68,16 +68,6 @@ func TestCommonTiersCollisionAndConcurrentAccess(t *testing.T) {
 	wg.Wait()
 	c.Clear()
 }
-func TestFineProgramCapacityPreservesBudget(t *testing.T) {
-	old, oldAccounting := ProgramCacheMaxMB, ProgramCacheAccounting
-	defer func() { ProgramCacheMaxMB, ProgramCacheAccounting = old, oldAccounting }()
-	ProgramCacheMaxMB = 1024
-	ProgramCacheAccounting = "mib"
-	require.Equal(t, 1024, programCacheCapacityUnits())
-	ProgramCacheAccounting = "kib"
-	require.Equal(t, 1048576, programCacheCapacityUnits())
-}
-
 func TestCommonTiersUseEmptySlotsBeforeEviction(t *testing.T) {
 	c := newCommonAccountCache(1<<20, true)
 	keys := []solana.PublicKey{}
@@ -104,31 +94,33 @@ func TestCommonTiersUseEmptySlotsBeforeEviction(t *testing.T) {
 }
 
 func TestCommonTiersBudgetAndLargeEntryAdmission(t *testing.T) {
-	const budget = 16 << 20
+	const budget = 32 << 20
 	c := newCommonAccountCache(budget, true)
 	total := c.large.maxWeight
 	for i := range c.shards {
 		total += uint64(len(c.shards[i].empty))*uint64(unsafe.Sizeof(commonTierHeader{})) + uint64(len(c.shards[i].small))*uint64(unsafe.Sizeof(commonTierSmall{}))
 	}
 	require.LessOrEqual(t, total, uint64(budget))
-	require.Equal(t, uint64(13*budget/16), c.large.maxWeight)
+	require.Equal(t, uint64(5*budget/8), c.large.maxWeight)
 	k := solana.PublicKey{27}
 	a := &accounts.Account{Key: k, Data: make([]byte, 1<<20)}
 	require.True(t, c.Set(k, a), "tiering must retain a large entry admitted by the original budget")
 	require.True(t, c.Has(k))
 }
 
-func TestExpandedCommonCacheBudget(t *testing.T) {
-	old := CommonAccountCacheLayout
-	defer func() { CommonAccountCacheLayout = old }()
-	CommonAccountCacheLayout = "expanded"
-	c := newCommonAccountCache(24<<20, true)
-	defer c.Close()
-	require.Equal(t, uint64(8<<20), c.large.maxWeight)
-	var allocated uint64
-	for i := range c.shards {
-		s := &c.shards[i]
-		allocated += uint64(len(s.empty))*uint64(unsafe.Sizeof(commonTierHeader{})) + uint64(len(s.small))*uint64(unsafe.Sizeof(commonTierSmall{}))
+// The tiered cache caps the empty and small tiers at 16 and 64 MiB (an eighth
+// and a quarter of a small budget) and gives the large tier the rest.
+func TestFixedCommonCacheBudget(t *testing.T) {
+	for _, tc := range []struct{ budget, large uint64 }{
+		{768 << 20, (768 - 16 - 64) << 20},
+		{64 << 20, 64<<20 - 8<<20 - 16<<20},
+	} {
+		c := newCommonAccountCache(tc.budget, true)
+		require.Equal(t, tc.large, c.large.maxWeight)
+		total := c.large.maxWeight
+		for i := range c.shards {
+			total += uint64(len(c.shards[i].empty))*uint64(unsafe.Sizeof(commonTierHeader{})) + uint64(len(c.shards[i].small))*uint64(unsafe.Sizeof(commonTierSmall{}))
+		}
+		require.LessOrEqual(t, total, tc.budget)
 	}
-	require.LessOrEqual(t, allocated+c.large.maxWeight, uint64(24<<20))
 }

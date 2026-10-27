@@ -51,6 +51,15 @@ const (
 	accountPrefetchPartialQueue = 1024
 	accountPrefetchMergeMax     = 64 // queued batches of one slot merged into one read
 	accountPrefetchLogEvery     = 500
+	// accountPrefetchStreamedKeep is how many slots a streamed mark outlives
+	// the executing slot.
+	accountPrefetchStreamedKeep = 4096
+	// accountPrefetchRefsWindow bounds how far past the executing slot batch
+	// summaries are kept (catch-up delivers blocks up to 256 slots ahead).
+	// During a long catch-up the live edge keeps decoding blocks far ahead of
+	// replay; without the bound their summaries would accumulate until replay
+	// reached them.
+	accountPrefetchRefsWindow = 256
 )
 
 type accountPrefetcher struct {
@@ -71,9 +80,15 @@ type accountPrefetcher struct {
 	exited  chan struct{}
 
 	// refs holds each slot's batch summaries from the decode workers until the
-	// block is offered (decode workers and the block source).
-	refsMu sync.Mutex
-	refs   map[uint64][]*turbine.StreamAccountRefs
+	// block is offered (decode workers and the block source). streamed marks
+	// slots that had a decoded batch, even after Started dropped their
+	// summaries. The block's FromLiveStream flag remains authoritative when
+	// these bounded, consumable marks are gone. startedLocked
+	// is started as seen under refsMu, so Offer and Started agree on it.
+	refsMu        sync.Mutex
+	refs          map[uint64][]*turbine.StreamAccountRefs
+	streamed      map[uint64]struct{}
+	startedLocked uint64
 
 	// Keys and programs tip warming already warmed per slot (worker only).
 	partialSeen, partialPrograms map[uint64]map[solana.PublicKey]struct{}
@@ -106,10 +121,12 @@ type accountPrefetchLookup struct {
 	indexes []uint8
 }
 
-func newAccountPrefetcher(src blockAccountSource, ahead uint64, workers int) *accountPrefetcher {
+func newAccountPrefetcher(src blockAccountSource, db *accountsdb.AccountsDb, ahead uint64, workers int, tipWarm bool) *accountPrefetcher {
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &accountPrefetcher{
 		src:             src,
+		db:              db,
+		tipWarm:         tipWarm,
 		ahead:           max(ahead, 1),
 		workers:         workers,
 		jobs:            make(chan accountPrefetchJob, accountPrefetchQueue),
@@ -119,6 +136,7 @@ func newAccountPrefetcher(src blockAccountSource, ahead uint64, workers int) *ac
 		cancel:          cancel,
 		exited:          make(chan struct{}),
 		refs:            make(map[uint64][]*turbine.StreamAccountRefs),
+		streamed:        make(map[uint64]struct{}),
 		partialSeen:     make(map[uint64]map[solana.PublicKey]struct{}),
 		partialPrograms: make(map[uint64]map[solana.PublicKey]struct{}),
 	}
@@ -140,12 +158,12 @@ func (p *accountPrefetcher) OfferStreamRefs(slot uint64, refs *turbine.StreamAcc
 	if refs == nil {
 		return
 	}
-	started := p.started.Load()
-	if slot > started {
-		p.refsMu.Lock()
+	p.refsMu.Lock()
+	p.streamed[slot] = struct{}{}
+	if slot > p.startedLocked && (p.startedLocked == 0 || slot <= p.startedLocked+accountPrefetchRefsWindow) {
 		p.refs[slot] = append(p.refs[slot], refs)
-		p.refsMu.Unlock()
 	}
+	p.refsMu.Unlock()
 	if !p.tipWarm {
 		return
 	}
@@ -166,18 +184,37 @@ func (p *accountPrefetcher) Offer(blk *b.Block) {
 	p.refsMu.Lock()
 	refs := p.refs[blk.Slot]
 	delete(p.refs, blk.Slot)
+	_, streamed := p.streamed[blk.Slot]
+	delete(p.streamed, blk.Slot)
+	late := blk.Slot <= p.startedLocked
 	p.refsMu.Unlock()
 	p.offered.Add(1)
+	if late {
+		// Replay (or a stream) already began it: not worth warming, and its
+		// transactions may be in use.
+		p.late.Add(1)
+		return
+	}
 	if len(p.jobs) == cap(p.jobs) {
 		p.dropped.Add(1)
 		return
 	}
 	var job accountPrefetchJob
-	if len(refs) > 0 {
+	switch {
+	case blk.AccountPrefetchRefs() != nil:
+		// Completion owns this immutable copy even when decode ran beyond
+		// the live-batch retention window. Never reread shared messages.
+		job = mergeRefs(blk.Slot, []*turbine.StreamAccountRefs{blk.AccountPrefetchRefs()}, nil, nil)
+	case len(refs) > 0:
 		job = mergeRefs(blk.Slot, refs, nil, nil)
-	} else {
-		// No decoded batches: the block did not come through turbine, so no
-		// stream shares its transactions.
+	case streamed || blk.FromLiveStream:
+		// Its summaries are gone; its transactions are a stream's.
+		p.late.Add(1)
+		return
+	default:
+		// The block is not from the live stream and has no decoded-batch
+		// marker. Copy its references before the block source hands it to
+		// replay; missing summaries alone do not establish ownership.
 		job = snapshotAccountPrefetchJob(blk)
 	}
 	select {
@@ -190,11 +227,19 @@ func (p *accountPrefetcher) Offer(blk *b.Block) {
 // Started records that replay began executing slot: blocks at or below it are
 // no longer worth warming, and blocks up to slot+ahead may now be warmed.
 func (p *accountPrefetcher) Started(slot uint64) {
-	p.started.Store(slot)
 	p.refsMu.Lock()
+	p.started.Store(slot)
+	p.startedLocked = slot
 	for s := range p.refs {
 		if s <= slot {
 			delete(p.refs, s)
+		}
+	}
+	// Marks are dropped only long after their slot, so one that replay passed
+	// and then returned to (a rewind) is still known as streamed.
+	for s := range p.streamed {
+		if s+accountPrefetchStreamedKeep < slot {
+			delete(p.streamed, s)
 		}
 	}
 	p.refsMu.Unlock()

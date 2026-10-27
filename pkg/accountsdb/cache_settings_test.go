@@ -6,17 +6,14 @@ import (
 )
 
 func TestCacheSettingsValidation(t *testing.T) {
-	oldIndex, oldLayout, oldAccounting := IndexCacheMaxMB, CommonAccountCacheLayout, ProgramCacheAccounting
+	oldIndex, oldLayout := IndexCacheMaxMB, CommonAccountCacheLayout
 	t.Cleanup(func() {
-		IndexCacheMaxMB, CommonAccountCacheLayout, ProgramCacheAccounting = oldIndex, oldLayout, oldAccounting
+		IndexCacheMaxMB, CommonAccountCacheLayout = oldIndex, oldLayout
 	})
-	for _, layout := range []string{"flat", "tiered", "expanded"} {
-		for _, accounting := range []string{"mib", "kib"} {
-			IndexCacheMaxMB = 512
-			CommonAccountCacheLayout = layout
-			ProgramCacheAccounting = accounting
-			require.NoError(t, ValidateCacheSettings())
-		}
+	for _, layout := range []string{"fixed", "flat"} {
+		IndexCacheMaxMB = 512
+		CommonAccountCacheLayout = layout
+		require.NoError(t, ValidateCacheSettings())
 	}
 	IndexCacheMaxMB = 0
 	require.Error(t, ValidateCacheSettings())
@@ -25,9 +22,6 @@ func TestCacheSettingsValidation(t *testing.T) {
 	IndexCacheMaxMB = int(^uint(0) >> 1)
 	require.Error(t, ValidateCacheSettings())
 	IndexCacheMaxMB = 512
-	CommonAccountCacheLayout = "unknown"
-	require.Error(t, ValidateCacheSettings())
-	CommonAccountCacheLayout = "flat"
-	ProgramCacheAccounting = "unknown"
+	CommonAccountCacheLayout = "tiered"
 	require.Error(t, ValidateCacheSettings())
 }

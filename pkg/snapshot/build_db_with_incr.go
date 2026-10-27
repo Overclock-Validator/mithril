@@ -48,7 +48,7 @@ func BuildAccountsDbAuto(
 	if err := accountsdb.ValidateAccountsPaths(accountsPaths); err != nil {
 		return nil, nil, err
 	}
-	// The first path holds all metadata; every path holds a shard's accounts dir.
+	// The first path holds all metadata; every path holds an accounts dir with its share of the appendvecs.
 	accountsDbDir := accountsPaths[0]
 	// Clean any leftover artifacts from previous incomplete runs (e.g., Ctrl+C)
 	CleanAccountsDbDirs(accountsPaths)
@@ -256,14 +256,8 @@ func BuildAccountsDbAuto(
 	pools.Release()
 
 	// Make the unpacked appendvecs durable while the index flush runs.
-	appendVecsSynced := make(chan error, 1)
-	go func() { appendVecsSynced <- appendVecDirs.syncAll() }()
-	defer func() {
-		select {
-		case <-appendVecsSynced:
-		default:
-		}
-	}()
+	waitAppendVecsSynced := appendVecDirs.startSync()
+	defer waitAppendVecsSynced()
 
 	// Show indexing progress for shard flush
 	indexProgress := progress.NewIndexingProgress("Flush (shard logs)")
@@ -278,7 +272,7 @@ func BuildAccountsDbAuto(
 	}
 	index.Close()
 
-	if err := <-appendVecsSynced; err != nil {
+	if err := waitAppendVecsSynced(); err != nil {
 		return nil, nil, err
 	}
 	if err := accountsdb.WriteAccountsDirCount(accountsDbDir, len(accountsPaths)); err != nil {

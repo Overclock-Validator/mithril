@@ -150,8 +150,8 @@ func ResumeStateFromRootedContext(rc *state.ResumeContext, epochStakes map[uint6
 	}
 	if rc.DelegatedStake != nil {
 		// Optional: a bad encoding only costs the startup scan it would save.
-		if totals, err := decodeDelegatedStake(rc.DelegatedStake); err == nil {
-			rs.DelegatedStake = totals
+		if totals, index, err := decodeDelegatedStake(rc.DelegatedStake); err == nil {
+			rs.DelegatedStake, rs.DelegatedStakeIndex = totals, index
 		} else {
 			mlog.Log.Warnf("rooted context slot %d: ignoring saved delegated stake totals: %v", rc.Slot, err)
 		}

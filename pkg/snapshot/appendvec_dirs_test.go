@@ -3,9 +3,11 @@ package snapshot
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -140,4 +142,47 @@ func TestCleanAccountsDbDirsRemovesEveryAccountsDir(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(keep, "accounts"), 0o755))
 	CleanAccountsDbDirs([]string{keep, keep})
 	require.DirExists(t, filepath.Join(keep, "accounts"))
+}
+
+// A build that fails after starting the appendvec sync (a shard-log or
+// ingestion error) returns only once the sync has finished, and the sync's
+// own error is still reported to a successful build.
+func TestAppendVecSyncJoinedOnEveryReturn(t *testing.T) {
+	oldSync := dirSyncFilesystem
+	t.Cleanup(func() { dirSyncFilesystem = oldSync })
+	release := make(chan struct{})
+	var syncing, synced atomic.Int32
+	dirSyncFilesystem = func(string) error {
+		syncing.Add(1)
+		<-release
+		synced.Add(1)
+		return nil
+	}
+	dirs, err := makeAppendVecDirs([]string{t.TempDir(), t.TempDir()})
+	require.NoError(t, err)
+	t.Cleanup(dirs.close)
+
+	errIngest := errors.New("ingest failed")
+	build := func() error {
+		wait := dirs.startSync()
+		defer wait()
+		require.Eventually(t, func() bool { return syncing.Load() == 1 }, time.Second, time.Millisecond)
+		return errIngest
+	}
+	returned := make(chan error, 1)
+	go func() { returned <- build() }()
+	select {
+	case <-returned:
+		t.Fatal("the build returned while its sync was still running")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	require.ErrorIs(t, <-returned, errIngest)
+	require.Equal(t, int32(2), synced.Load(), "both directories synced before the build returned")
+
+	errSync := errors.New("sync failed")
+	dirSyncFilesystem = func(string) error { return errSync }
+	wait := dirs.startSync()
+	require.ErrorIs(t, wait(), errSync)
+	require.ErrorIs(t, wait(), errSync, "a second wait reports the same result")
 }

@@ -225,8 +225,6 @@ func (r *UDPReceiver) SetRepairRequestRate(perSecond int) {
 	}
 }
 
-// RepairPeerReport returns the busiest repair peers' service records (sent,
-// timely/late/timeout, latency, score) for file-log peer tables.
 // GoodRepairPeers returns up to maxPeers current repair peers that answered
 // within window, best first, for remembering across restarts.
 func (r *UDPReceiver) GoodRepairPeers(maxPeers int, window time.Duration) []gossip.RepairPeer {
@@ -236,6 +234,8 @@ func (r *UDPReceiver) GoodRepairPeers(maxPeers int, window time.Duration) []goss
 	return r.repairClient.goodPeers(maxPeers, window)
 }
 
+// RepairPeerReport returns the busiest repair peers' service records (sent,
+// timely/late/timeout, latency, score) for file-log peer tables.
 func (r *UDPReceiver) RepairPeerReport(maxPeers int) []RepairPeerReport {
 	if r.repairClient == nil {
 		return nil

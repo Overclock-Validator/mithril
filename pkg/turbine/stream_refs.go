@@ -3,30 +3,15 @@ package turbine
 import (
 	"sync/atomic"
 
+	"github.com/Overclock-Validator/mithril/pkg/block"
+
 	"github.com/gagliardetto/solana-go"
 )
 
-// StreamAccountRefs copies the accounts a decoded transaction batch names:
-// every static account key and top-level program (in order, not deduplicated:
-// it is built on the receive path, so it only copies), and its address-table
-// lookups. The decode worker builds it before the batch is published, from
-// transactions nothing else can touch yet; it never changes afterwards and
-// consumers must not modify it. Replay later resolves address tables into the
-// batch's own messages, so readers outside the stream must use this copy,
-// never the transactions.
-type StreamAccountRefs struct {
-	Keys     []solana.PublicKey
-	Programs []solana.PublicKey
-	Tables   []solana.PublicKey
-	Lookups  []StreamLookup
-}
-
-// StreamLookup is one address-table lookup: an index into Tables and the
-// selected entries (writable then read-only).
-type StreamLookup struct {
-	Table   int
-	Indexes []uint8
-}
+// StreamAccountRefs and StreamLookup are immutable decoded references shared
+// with completed blocks. See block.AccountPrefetchRefs for ownership rules.
+type StreamAccountRefs = block.AccountPrefetchRefs
+type StreamLookup = block.AccountPrefetchLookup
 
 var streamRefsHook atomic.Pointer[func(slot uint64, refs *StreamAccountRefs)]
 

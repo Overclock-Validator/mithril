@@ -98,7 +98,7 @@ func TestAccountPrefetchMissingTableStillWarmsStaticKeys(t *testing.T) {
 
 func TestAccountPrefetchWindow(t *testing.T) {
 	src := &prefetchRecordingSource{accts: map[solana.PublicKey]*accounts.Account{}}
-	p := newAccountPrefetcher(src, 2, 0)
+	p := newAccountPrefetcher(src, nil, 2, 0, false)
 	defer p.Close()
 	tx := lookupTestTx(t)
 	offer := func(slot uint64) { p.Offer(&b.Block{Slot: slot, Transactions: []*solana.Transaction{tx}}) }
@@ -125,7 +125,7 @@ func TestAccountPrefetchWindow(t *testing.T) {
 // never closed under a prefetch read; later offers neither block nor panic.
 func TestAccountPrefetchCloseWaitsForReads(t *testing.T) {
 	src := &blockingPrefetchSource{entered: make(chan struct{}, 1)}
-	p := newAccountPrefetcher(src, 1, 0)
+	p := newAccountPrefetcher(src, nil, 1, 0, false)
 	p.Started(99)
 	p.Offer(&b.Block{Slot: 100, Transactions: []*solana.Transaction{lookupTestTx(t)}})
 	<-src.entered
@@ -167,7 +167,7 @@ func (s *blockingPrefetchSource) GetAccountsBatch(ctx context.Context, _ uint64,
 // rewriting.
 func TestAccountPrefetchUsesDecodeSummaries(t *testing.T) {
 	src := &prefetchRecordingSource{accts: map[solana.PublicKey]*accounts.Account{}}
-	p := newAccountPrefetcher(src, 1, 0)
+	p := newAccountPrefetcher(src, nil, 1, 0, false)
 	defer p.Close()
 	p.Started(9)
 	p.OfferStreamRefs(10, &turbine.StreamAccountRefs{Keys: []solana.PublicKey{testPk(1), testPk(2)}})
@@ -179,11 +179,56 @@ func TestAccountPrefetchUsesDecodeSummaries(t *testing.T) {
 	assert.Zero(t, p.partialOffered.Load(), "without tip warming batches are only recorded")
 }
 
+// Summaries of blocks far past the executing slot (the live edge during a
+// long catch-up) are not kept, so they cannot accumulate.
+func TestAccountPrefetchBoundsRetainedSummaries(t *testing.T) {
+	src := &prefetchRecordingSource{accts: map[solana.PublicKey]*accounts.Account{}}
+	p := newAccountPrefetcher(src, nil, 1, 0, false)
+	defer p.Close()
+	p.Started(100)
+	refs := &turbine.StreamAccountRefs{Keys: []solana.PublicKey{testPk(1)}}
+	p.OfferStreamRefs(100+accountPrefetchRefsWindow, refs)
+	p.OfferStreamRefs(100+accountPrefetchRefsWindow+1, refs)
+	p.refsMu.Lock()
+	defer p.refsMu.Unlock()
+	assert.Len(t, p.refs, 1)
+	assert.Contains(t, p.refs, uint64(100+accountPrefetchRefsWindow))
+}
+
+// A stream opening for a slot drops its summaries; when the complete block
+// then arrives, its transactions belong to the stream and must not be read,
+// even though no summary is left to say it came through turbine.
+func TestAccountPrefetchNeverReadsStreamedTransactions(t *testing.T) {
+	src := &prefetchRecordingSource{accts: map[solana.PublicKey]*accounts.Account{}}
+	p := newAccountPrefetcher(src, nil, 2, 0, false)
+	defer p.Close()
+	p.Started(9)
+	p.OfferStreamRefs(10, &turbine.StreamAccountRefs{Keys: []solana.PublicKey{testPk(1)}})
+	p.OfferStreamRefs(11, &turbine.StreamAccountRefs{Keys: []solana.PublicKey{testPk(2)}})
+	p.Started(10) // the stream for 10 opens
+	p.Offer(&b.Block{Slot: 10, Transactions: []*solana.Transaction{lookupTestTx(t)}})
+	assert.Equal(t, uint64(1), p.late.Load(), "a started slot is late at the offer")
+
+	// The next slot keeps its summaries and is warmed from them.
+	p.Offer(&b.Block{Slot: 11, Transactions: []*solana.Transaction{lookupTestTx(t)}})
+	require.Eventually(t, func() bool { return p.warmed.Load() == 1 }, time.Second, time.Millisecond)
+	assert.Equal(t, [][]solana.PublicKey{{testPk(2)}}, src.recorded())
+
+	// A summarized slot that lost its summaries (a stream for it opened and
+	// replay then went back) is still never read from its transactions.
+	p.OfferStreamRefs(13, &turbine.StreamAccountRefs{Keys: []solana.PublicKey{testPk(3)}})
+	p.Started(13)
+	p.Started(11)
+	p.Offer(&b.Block{Slot: 13, Transactions: []*solana.Transaction{lookupTestTx(t)}})
+	assert.Equal(t, uint64(2), p.late.Load())
+	assert.Equal(t, uint64(1), p.warmed.Load())
+	assert.Len(t, src.recorded(), 1, "nothing read from the transactions")
+}
+
 // A whole-block job waiting for its turn does not hold up tip warming.
 func TestAccountPrefetchWaitingJobDoesNotBlockTipWarming(t *testing.T) {
 	src := &prefetchRecordingSource{accts: map[solana.PublicKey]*accounts.Account{}}
-	p := newAccountPrefetcher(src, 1, 0)
-	p.tipWarm = true
+	p := newAccountPrefetcher(src, nil, 1, 0, true)
 	defer p.Close()
 	p.Started(10)
 	p.Offer(&b.Block{Slot: 20, Transactions: []*solana.Transaction{lookupTestTx(t)}}) // far ahead
@@ -204,8 +249,7 @@ func TestAccountPrefetchSnapshotCollectsTopLevelPrograms(t *testing.T) {
 // whole-block jobs.
 func TestAccountPrefetchTipWarming(t *testing.T) {
 	src := &prefetchRecordingSource{accts: map[solana.PublicKey]*accounts.Account{}}
-	p := newAccountPrefetcher(src, 1, 0)
-	p.tipWarm = true
+	p := newAccountPrefetcher(src, nil, 1, 0, true)
 	defer p.Close()
 	k := func(b byte) solana.PublicKey { return testPk(b) }
 	refs := func(keys ...solana.PublicKey) *turbine.StreamAccountRefs {
@@ -255,4 +299,46 @@ func TestAccountPrefetchTipWarmingMergesAndFilters(t *testing.T) {
 	assert.Equal(t, uint64(2), p.tipFiltered.Load())
 	untouched := p.withoutTipWarmed(accountPrefetchJob{slot: 12, keys: []solana.PublicKey{k(1)}})
 	assert.Equal(t, []solana.PublicKey{k(1)}, untouched.keys, "another slot is not filtered")
+}
+
+// Completion summaries must survive decode ahead of the bounded live-batch
+// window, without inspecting transactions that replay may later mutate.
+func TestAccountPrefetchCompletedBlockBeyondWindow(t *testing.T) {
+	src := &prefetchRecordingSource{accts: map[solana.PublicKey]*accounts.Account{}}
+	p := newAccountPrefetcher(src, nil, 1, 0, false)
+	defer p.Close()
+	p.Started(100)
+	slot := uint64(100 + accountPrefetchRefsWindow + 1)
+	refs := &turbine.StreamAccountRefs{Keys: []solana.PublicKey{testPk(7)}}
+	p.OfferStreamRefs(slot, refs)
+	p.refsMu.Lock()
+	assert.Empty(t, p.refs)
+	p.refsMu.Unlock()
+	blk := &b.Block{Slot: slot, FromLiveStream: true, Transactions: []*solana.Transaction{lookupTestTx(t)}}
+	blk.SetAccountPrefetchRefs(refs)
+	p.Started(slot - 1)
+	// A concurrent executor may change the original messages. The retained
+	// completion summary must be the only data Offer reads.
+	done := make(chan struct{})
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				blk.Transactions[0].Message.AccountKeys[0] = testPk(9)
+			}
+		}
+	}()
+	p.Offer(blk)
+	close(done)
+	<-exited
+	require.Eventually(t, func() bool { return p.warmed.Load() == 1 }, time.Second, time.Millisecond)
+	assert.Equal(t, [][]solana.PublicKey{{testPk(7)}}, src.recorded())
+	assert.Zero(t, p.late.Load())
+	p.Started(slot)
+	p.Offer(blk)
+	assert.Equal(t, uint64(1), p.late.Load(), "completed summaries do not bypass the started-slot gate")
 }

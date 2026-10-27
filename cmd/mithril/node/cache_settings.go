@@ -25,11 +25,10 @@ func configureCacheSettings(cmd *cobra.Command) error {
 		return fmt.Errorf("tuning.index_cache_max_mb must be an integer MiB count: %w", err)
 	}
 	layout := cacheOption(cmd, "common-account-cache-layout", "tuning.common_account_cache_layout")
-	accounting := cacheOption(cmd, "program-cache-accounting", "tuning.program_cache_accounting")
-	oldIndex, oldLayout, oldAccounting := accountsdb.IndexCacheMaxMB, accountsdb.CommonAccountCacheLayout, accountsdb.ProgramCacheAccounting
-	accountsdb.IndexCacheMaxMB, accountsdb.CommonAccountCacheLayout, accountsdb.ProgramCacheAccounting = index, layout, accounting
+	oldIndex, oldLayout := accountsdb.IndexCacheMaxMB, accountsdb.CommonAccountCacheLayout
+	accountsdb.IndexCacheMaxMB, accountsdb.CommonAccountCacheLayout = index, layout
 	if err := accountsdb.ValidateCacheSettings(); err != nil {
-		accountsdb.IndexCacheMaxMB, accountsdb.CommonAccountCacheLayout, accountsdb.ProgramCacheAccounting = oldIndex, oldLayout, oldAccounting
+		accountsdb.IndexCacheMaxMB, accountsdb.CommonAccountCacheLayout = oldIndex, oldLayout
 		return err
 	}
 	return nil
