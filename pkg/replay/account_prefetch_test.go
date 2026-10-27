@@ -195,6 +195,57 @@ func TestAccountPrefetchBoundsRetainedSummaries(t *testing.T) {
 	assert.Contains(t, p.refs, uint64(100+accountPrefetchRefsWindow))
 }
 
+// Streamed marks stay bounded when decode runs far ahead of replay (long
+// catch-up) or before replay begins, and pruning keeps them bounded as
+// replay advances.
+func TestAccountPrefetchBoundsStreamedMarks(t *testing.T) {
+	src := &prefetchRecordingSource{accts: map[solana.PublicKey]*accounts.Account{}}
+	refs := &turbine.StreamAccountRefs{Keys: []solana.PublicKey{testPk(1)}}
+	marks := func(p *accountPrefetcher) int {
+		p.refsMu.Lock()
+		defer p.refsMu.Unlock()
+		return len(p.streamed)
+	}
+
+	before := newAccountPrefetcher(src, nil, 1, 0, false)
+	defer before.Close()
+	for s := uint64(1); s <= 100_000; s++ {
+		before.OfferStreamRefs(s, refs)
+	}
+	assert.Equal(t, accountPrefetchStreamedKeep, marks(before), "before replay begins")
+
+	p := newAccountPrefetcher(src, nil, 1, 0, false)
+	defer p.Close()
+	p.Started(100)
+	for s := uint64(101); s <= 100_100; s++ {
+		p.OfferStreamRefs(s, refs)
+	}
+	assert.Equal(t, accountPrefetchStreamedKeep, marks(p), "only marks within the window ahead of replay")
+	p.refsMu.Lock()
+	assert.Contains(t, p.streamed, uint64(100+accountPrefetchStreamedKeep))
+	assert.NotContains(t, p.streamed, uint64(101+accountPrefetchStreamedKeep))
+	p.refsMu.Unlock()
+
+	// Replay advances while decode stays ahead; every replayed slot was
+	// streamed, so marks behind replay are kept for the window, then pruned.
+	for slot := uint64(101); slot <= 100+3*accountPrefetchStreamedKeep; slot++ {
+		p.Started(slot)
+		p.OfferStreamRefs(slot+accountPrefetchStreamedKeep, refs)
+	}
+	last := uint64(100 + 3*accountPrefetchStreamedKeep)
+	assert.LessOrEqual(t, marks(p), 2*accountPrefetchStreamedKeep+1)
+	p.refsMu.Lock()
+	assert.Contains(t, p.streamed, last-accountPrefetchStreamedKeep, "kept for the window behind replay")
+	assert.NotContains(t, p.streamed, last-accountPrefetchStreamedKeep-1)
+	p.refsMu.Unlock()
+
+	// A rewind within the window still finds the marks of slots replay passed.
+	p.Started(last - 10)
+	p.refsMu.Lock()
+	assert.Contains(t, p.streamed, last-5)
+	p.refsMu.Unlock()
+}
+
 // A stream opening for a slot drops its summaries; when the complete block
 // then arrives, its transactions belong to the stream and must not be read,
 // even though no summary is left to say it came through turbine.

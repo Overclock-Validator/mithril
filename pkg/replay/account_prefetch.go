@@ -52,7 +52,8 @@ const (
 	accountPrefetchMergeMax     = 64 // queued batches of one slot merged into one read
 	accountPrefetchLogEvery     = 500
 	// accountPrefetchStreamedKeep is how many slots a streamed mark outlives
-	// the executing slot.
+	// the executing slot, and how far past it marks are recorded (before
+	// replay begins, how many marks are recorded at most).
 	accountPrefetchStreamedKeep = 4096
 	// accountPrefetchRefsWindow bounds how far past the executing slot batch
 	// summaries are kept (catch-up delivers blocks up to 256 slots ahead).
@@ -89,6 +90,8 @@ type accountPrefetcher struct {
 	refs          map[uint64][]*turbine.StreamAccountRefs
 	streamed      map[uint64]struct{}
 	startedLocked uint64
+	// streamedFloor: no streamed mark is below it (Started prunes up to it).
+	streamedFloor uint64
 
 	// Keys and programs tip warming already warmed per slot (worker only).
 	partialSeen, partialPrograms map[uint64]map[solana.PublicKey]struct{}
@@ -159,7 +162,15 @@ func (p *accountPrefetcher) OfferStreamRefs(slot uint64, refs *turbine.StreamAcc
 		return
 	}
 	p.refsMu.Lock()
-	p.streamed[slot] = struct{}{}
+	// Marks are bounded like the summaries, so decode far ahead of replay
+	// (catch-up) cannot grow the map. A block decoded beyond the bound still
+	// cannot be read from its transactions: the assembler attaches its
+	// completion summary, which Offer uses first, and a live block carries
+	// FromLiveStream.
+	if slot >= p.streamedFloor && (p.startedLocked == 0 && len(p.streamed) < accountPrefetchStreamedKeep ||
+		p.startedLocked != 0 && slot <= p.startedLocked+accountPrefetchStreamedKeep) {
+		p.streamed[slot] = struct{}{}
+	}
 	if slot > p.startedLocked && (p.startedLocked == 0 || slot <= p.startedLocked+accountPrefetchRefsWindow) {
 		p.refs[slot] = append(p.refs[slot], refs)
 	}
@@ -236,12 +247,24 @@ func (p *accountPrefetcher) Started(slot uint64) {
 		}
 	}
 	// Marks are dropped only long after their slot, so one that replay passed
-	// and then returned to (a rewind) is still known as streamed.
-	for s := range p.streamed {
-		if s+accountPrefetchStreamedKeep < slot {
+	// and then returned to (a rewind) is still known as streamed. Only the
+	// slots replay advanced past are visited, not every mark.
+	var floor uint64
+	if slot > accountPrefetchStreamedKeep {
+		floor = slot - accountPrefetchStreamedKeep
+	}
+	if floor > p.streamedFloor && floor-p.streamedFloor > uint64(len(p.streamed)) {
+		for s := range p.streamed {
+			if s < floor {
+				delete(p.streamed, s)
+			}
+		}
+	} else {
+		for s := p.streamedFloor; s < floor; s++ {
 			delete(p.streamed, s)
 		}
 	}
+	p.streamedFloor = floor
 	p.refsMu.Unlock()
 	select {
 	case p.turn <- struct{}{}:
