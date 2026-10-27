@@ -244,6 +244,13 @@ type ResumeState struct {
 	// TransactionCount as of the resume slot. nil = the source context predates
 	// the field (seed from the snapshot manifest, approximate); non-nil is exact.
 	TransactionCount *uint64
+	// DelegatedStake is the delegated stake per vote account in durable state
+	// as of the resume slot, from the rooted context. nil = the context did not
+	// carry it (or it failed to decode); startup scans the stake accounts.
+	// DelegatedStakeIndex is the stake index key set it was computed over:
+	// startup uses it only if the index it loads has that key set.
+	DelegatedStake      map[solana.PublicKey]voteDelegation
+	DelegatedStakeIndex stakeIndexDigest
 
 	// ComputedEpochStakes contains epoch stakes computed at boundaries.
 	// Key: epoch number (the leader schedule epoch), Value: serialized JSON
@@ -1081,6 +1088,7 @@ func recordAccountLoaderBatchStats(dst *metrics.AccountLoader, src accountsdb.Ba
 	dst.InProgressHits += src.InProgressHits
 	dst.PendingFoldHits += src.PendingFoldHits
 	dst.CacheHits += src.CacheHits
+	dst.NegativeCacheHits += src.NegativeCacheHits
 	dst.IndexHits += src.IndexHits
 	dst.IndexMisses += src.IndexMisses
 	dst.UniqueAppendVecs += src.UniqueAppendVecs
@@ -1110,6 +1118,157 @@ func recordAccountLoaderBatchStats(dst *metrics.AccountLoader, src accountsdb.Ba
 	dst.CachePublication.AddTiming(time.Duration(src.CachePublicationNanoseconds))
 }
 
+// startupStakeScan is the aggregation of delegated stake per vote account
+// that startup needs from durable state. ReplayBlocks starts it as soon as
+// durable state is final (after any startup rewind), so its reads overlap
+// the wait for the first block; the first block's setup takes the result
+// instead of scanning inline. Durable reads do not depend on a slot.
+type startupStakeScan struct {
+	db     *accountsdb.AccountsDb
+	done   chan struct{}
+	totals map[solana.PublicKey]voteDelegation
+	err    error
+}
+
+var pendingStartupStakeScan atomic.Pointer[startupStakeScan]
+
+// replayBlocksEntered marks that this process has started replay once.
+var replayBlocksEntered atomic.Bool
+
+// configuredStakeTotals is the delegated stake the last initial-block setup
+// used: durable state's totals, from which the fold tracker starts.
+var configuredStakeTotals map[solana.PublicKey]voteDelegation
+
+// MITHRIL_VERIFY_STAKE_TOTALS=1: on a resume with saved totals, also scan and
+// stop the node if the two differ in any vote account's stake or delegation
+// count.
+var verifyStakeTotals = os.Getenv("MITHRIL_VERIFY_STAKE_TOTALS") == "1"
+
+// startStartupStakeScan prepares the delegated stake totals the first block's
+// setup takes. saved are the totals from the rooted context being resumed
+// (nil on a snapshot boot or when the context has none), computed over the
+// stake index key set savedIndex.
+func startStartupStakeScan(acctsDb *accountsdb.AccountsDb, saved map[solana.PublicKey]voteDelegation, savedIndex stakeIndexDigest) {
+	scan := &startupStakeScan{db: acctsDb, done: make(chan struct{})}
+	pendingStartupStakeScan.Store(scan)
+	go func() {
+		defer close(scan.done)
+		if saved != nil {
+			// The index can hold keys the saved totals never counted (appended
+			// before a fold that did not commit, or kept across a rewind); a
+			// scan reads those, so the totals stand for it only on the same
+			// key set.
+			entries, err := global.LoadStakePubkeyIndex(filepath.Join(acctsDb.AcctsDir, ".."))
+			if err != nil {
+				scan.err = err
+				return
+			}
+			if index := digestStakeIndex(entries); index != savedIndex {
+				mlog.Log.Warnf("delegated stake totals: the stake index (%d keys) is not the key set the rooted context's totals cover (%d keys); scanning the stake accounts", index.keys, savedIndex.keys)
+				saved = nil
+			} else if !verifyStakeTotals {
+				mlog.Log.Infof("delegated stake totals: using the rooted context's totals (%d vote accounts); no stake scan", len(saved))
+				scan.totals = saved
+				return
+			}
+		}
+		scan.totals, scan.err = scanDelegatedStake(acctsDb)
+		if scan.err != nil || saved == nil {
+			return
+		}
+		if diff := diffDelegatedStake(saved, scan.totals); diff != "" {
+			mlog.Log.Errorf("FATAL: delegated stake totals saved in the rooted context differ from a full scan: %s", diff)
+			os.Exit(1)
+		}
+		mlog.Log.Infof("delegated stake totals: verified, the rooted context's totals equal a full scan (%d vote accounts)", len(saved))
+	}()
+}
+
+// trackedStakeTotals, while replay runs with a stake totals tracker, returns
+// durable state's tracked totals (unrootedTail.durableStakeTotals).
+var trackedStakeTotals func() (map[solana.PublicKey]voteDelegation, bool)
+
+// takeStartupStakeScan returns the background scan's result for acctsDb. With
+// none pending (a later reconfiguration: the replay loop re-runs the initial
+// block setup after a fork switch it unwound in RAM) it returns the tracked
+// totals of durable state, which equal a scan of the last applied fold
+// boundary, instead of scanning every stake account on the loop thread (about
+// 12 s at the tip). It scans only when nothing is tracked (tests, or a run
+// whose tracker stopped).
+func takeStartupStakeScan(acctsDb *accountsdb.AccountsDb) (map[solana.PublicKey]voteDelegation, error) {
+	if scan := pendingStartupStakeScan.Swap(nil); scan != nil {
+		<-scan.done
+		if scan.db == acctsDb {
+			return scan.totals, scan.err
+		}
+	}
+	if trackedStakeTotals != nil {
+		if totals, ok := trackedStakeTotals(); ok {
+			if verifyStakeTotals {
+				if scanned, err := scanDelegatedStake(acctsDb); err == nil {
+					if diff := diffDelegatedStake(totals, scanned); diff != "" {
+						// A fold committed but not yet applied on the loop thread
+						// can put the scan one boundary ahead; report, do not stop.
+						mlog.Log.Errorf("delegated stake totals: tracked durable totals differ from a full scan at reconfiguration: %s", diff)
+					} else {
+						mlog.Log.Infof("delegated stake totals: verified at reconfiguration, tracked durable totals equal a full scan (%d vote accounts)", len(totals))
+					}
+				}
+			}
+			mlog.Log.Infof("delegated stake totals: using the tracked durable totals (%d vote accounts); no stake scan", len(totals))
+			return totals, nil
+		}
+	}
+	return scanDelegatedStake(acctsDb)
+}
+
+// finishStartupStakeScan waits out an unconsumed background scan, so replay
+// never returns (and AccountsDB never closes) under its reads.
+func finishStartupStakeScan() {
+	if scan := pendingStartupStakeScan.Swap(nil); scan != nil {
+		<-scan.done
+	}
+}
+
+// scanDelegatedStake reproduces mainline's startup stake aggregation exactly:
+// for every key in the stake pubkey index (built during snapshot processing,
+// extended at fold time, never shrunk), read the account as stored in
+// AccountsDB and, if its data decodes as a Stake-state delegation, add the
+// delegation to its vote account. Lamports and owner are not checked: a
+// zero-lamport record still holding Stake data counts, as it did with the
+// original per-key GetAccount reads. The batch read returns a placeholder for
+// zero-lamport accounts, so those are re-read with GetAccount to get the
+// stored record. Each vote account also gets the number of delegating
+// accounts, so one whose delegations sum to zero stake is kept.
+func scanDelegatedStake(acctsDb *accountsdb.AccountsDb) (map[solana.PublicKey]voteDelegation, error) {
+	// Entries are sorted by (FileId, Offset) for appendvec locality.
+	acctsDbDir := filepath.Join(acctsDb.AcctsDir, "..")
+	stakeEntries, err := global.LoadStakePubkeyIndex(acctsDbDir)
+	if err != nil {
+		return nil, err
+	}
+	start := time.Now()
+	mlog.Log.Infof("Loading vote and stake caches (aggregate-only mode, %d stake accounts)", len(stakeEntries))
+
+	totals := loadStakeAccountTotals(acctsDb, 0, stakeEntries)
+	mlog.Log.Infof("stake scan: %d stake accounts, %d vote accounts with delegations, %s", len(stakeEntries), len(totals), time.Since(start).Round(time.Millisecond))
+	return totals, nil
+}
+
+// scannedDelegation is mainline's per-account rule: the stored data decodes as
+// a Stake-state delegation, whatever the lamports and owner.
+func scannedDelegation(stored *accounts.Account) (solana.PublicKey, uint64, bool) {
+	if stored == nil {
+		return solana.PublicKey{}, 0, false
+	}
+	stakeState, err := sealevel.UnmarshalStakeState(stored.Data)
+	if err != nil || stakeState.Status != sealevel.StakeStateV2StatusStake {
+		return solana.PublicKey{}, 0, false
+	}
+	delegation := stakeState.Stake.Stake.Delegation
+	return delegation.VoterPubkey, delegation.StakeLamports, true
+}
+
 // setupInitialVoteAcctsAndStakeAccts populates the vote and stake caches at startup.
 //
 // For stake accounts, we read ALL delegation fields from AccountsDB rather than trusting
@@ -1124,13 +1283,11 @@ func recordAccountLoaderBatchStats(dst *metrics.AccountLoader, src accountsdb.Ba
 func setupInitialVoteAcctsAndStakeAccts(acctsDb *accountsdb.AccountsDb, block *b.Block, parentEpoch uint64) {
 	block.VoteTimestamps = make(map[solana.PublicKey]sealevel.BlockTimestamp)
 
-	// Load stake entries from index file built during snapshot processing
-	// The index is in the accountsDbDir which is parent of AcctsDir
-	// Entries are sorted by (FileId, Offset) for sequential appendvec I/O
-	acctsDbDir := filepath.Join(acctsDb.AcctsDir, "..")
-	stakeEntries, err := global.LoadStakePubkeyIndex(acctsDbDir)
+	waitStart := time.Now()
+	totals, err := takeStartupStakeScan(acctsDb)
 	if err != nil {
 		// Fatal error - stake index is required for resume and must exist
+		acctsDbDir := filepath.Join(acctsDb.AcctsDir, "..")
 		mlog.Log.Errorf("=======================================================")
 		mlog.Log.Errorf("FATAL: stake_pubkeys.idx missing or corrupt: %v", err)
 		mlog.Log.Errorf("=======================================================")
@@ -1145,9 +1302,9 @@ func setupInitialVoteAcctsAndStakeAccts(acctsDb *accountsdb.AccountsDb, block *b
 		mlog.Log.Errorf("=======================================================")
 		os.Exit(1)
 	}
-	mlog.Log.Infof("Loading vote and stake caches (aggregate-only mode, %d stake accounts)", len(stakeEntries))
-
-	voteAcctStakes := loadStakeAccountTotals(acctsDb, block.Slot, stakeEntries)
+	mlog.Log.Infof("vote and stake caches: stake totals ready for slot %d after waiting %s", block.Slot, time.Since(waitStart).Round(time.Millisecond))
+	configuredStakeTotals = totals
+	voteAcctStakes := delegationStakes(totals)
 
 	// Load vote accounts from AccountsDB into vote cache
 	if err := RebuildVoteCacheFromAccountsDB(acctsDb, block.Slot, voteAcctStakes, 0); err != nil {
@@ -1698,6 +1855,27 @@ func ReplayBlocks(
 	onCancelWriteState OnCancelWriteState, // callback to write state immediately on cancellation (can be nil)
 ) *ReplayResult {
 	result := &ReplayResult{}
+	// Node startup finishes any rewind and reconciles durable state before
+	// calling ReplayBlocks, so the first block's stake scan can start now and
+	// overlap block-source startup and the wait for the first block.
+	// Only the process's first replay resumes from disk; a fork-switch retry
+	// re-enters with the in-memory rooted context, which before the first fold
+	// after a snapshot boot has no totals, and scans as mainline always did.
+	firstReplay := !replayBlocksEntered.Swap(true)
+	if acctsDb != nil {
+		var saved map[solana.PublicKey]voteDelegation
+		var savedIndex stakeIndexDigest
+		if resumeState != nil {
+			saved, savedIndex = resumeState.DelegatedStake, resumeState.DelegatedStakeIndex
+			if saved == nil && firstReplay {
+				// An older binary's context, or a fold written after the tracker
+				// stopped trusting its totals: scan, as mainline always did.
+				mlog.Log.Warnf("resume from slot %d: the rooted context has no delegated stake totals; scanning the stake accounts", resumeState.ParentSlot)
+			}
+		}
+		startStartupStakeScan(acctsDb, saved, savedIndex)
+		defer finishStartupStakeScan()
+	}
 	alpenglowMode := consensusOpts != nil && consensusOpts.Alpenglow
 	rewardPublisher, _ := rpcServer.(epochRewardPublisher)
 	rewardReadPublisher, _ := rpcServer.(epochRewardReadPublisher)
@@ -2022,6 +2200,8 @@ func ReplayBlocks(
 	var applyFoldOutcome func(res *foldResult) // assigned below, used by the exit drain
 	if acctsDb.RootedDurable {
 		unrootedTailState = newUnrootedTail(acctsDb, acctsDb, unrootedTailHaltCap, FoldBatchSlots, filepath.Join(acctsDb.AcctsDir, ".."))
+		trackedStakeTotals = unrootedTailState.durableStakeTotals
+		defer func() { trackedStakeTotals = nil }()
 		var checkpointAfterCommit func(*state.TransactionStatusCheckpointRef) error
 		if consensusOpts != nil {
 			checkpointAfterCommit = consensusOpts.TransactionStatusCheckpointAfterCommit
@@ -2384,6 +2564,7 @@ func ReplayBlocks(
 			TurbineAlpenglowAddr: turbineAlpenglowAddr,
 			TurbineIdentity:      turbineIdentity,
 			LeaderForSlot:        global.LeaderForSlot,
+			RepairPeerSeeds:      repairPeerSeedsFromState(mithrilState),
 			BackupRpcEndpoints:   rpcBackups,
 			StartSlot:            startSlot,
 			EndSlot:              endSlot,
@@ -2487,6 +2668,29 @@ func ReplayBlocks(
 	}
 
 	blockStream := blockstream.NewBlockSource(opts)
+	// Every state save records the repair peers that served this run well, so
+	// the next start can repair before gossip rediscovers peers.
+	state.SetRepairPeerHintsProvider(func() []state.RepairPeerHint {
+		return repairPeerHints(blockStream.GoodRepairPeers(rememberedRepairPeers))
+	})
+	defer state.SetRepairPeerHintsProvider(nil)
+	if len(opts.RepairPeerSeeds) > 0 {
+		mlog.Log.Infof("repair: seeding %d peers remembered from the previous run", len(opts.RepairPeerSeeds))
+	}
+	var prefetcher *accountPrefetcher
+	if accountPrefetchEnabled {
+		var src blockAccountSource = acctsDb
+		if unrootedTailState != nil {
+			src = unrootedTailState
+		}
+		prefetcher = newAccountPrefetcher(src, acctsDb, accountPrefetchAhead, accountPrefetchWorkers, tipWarmEnabled)
+		defer prefetcher.Close()
+		defer prefetcher.installRefsHook()()
+		blockStream.SetReplayEmitHook(prefetcher.Offer)
+		mlog.Log.Infof("account prefetch: on, %d slot ahead of replay, %d storage workers, programs preloaded, tip warming %t", prefetcher.ahead, prefetcher.workers, prefetcher.tipWarm)
+	} else {
+		mlog.Log.Infof("account prefetch: off (MITHRIL_ACCOUNT_PREFETCH=0)")
+	}
 
 	if !isLive {
 		blockStream.DownloadInitialBlocks()
@@ -2642,7 +2846,12 @@ func ReplayBlocks(
 	// parent's replay, or the loop itself.
 	var frontierMark streamingFrontierMark
 	if blockStream.StreamEvents() != nil {
+		var onStreamOpen func(uint64)
+		if prefetcher != nil {
+			onStreamOpen = prefetcher.Started
+		}
 		streamer = newStreamingExecutor(streamingDeps{
+			onOpen:              onStreamOpen,
 			acctsDb:             acctsDb,
 			feed:                blockStream,
 			epochSchedule:       epochSchedule,
@@ -3061,6 +3270,9 @@ func ReplayBlocks(
 		// Notify block source we're starting execution - in near-tip mode this
 		// triggers fetching N+1 so RPC latency overlaps with execution time
 		blockStream.NotifyBlockStart(block.Slot)
+		if prefetcher != nil {
+			prefetcher.Started(block.Slot)
+		}
 
 		currentSlot = block.Slot
 		block.Epoch = epochSchedule.GetEpoch(currentSlot)
@@ -3085,6 +3297,9 @@ func ReplayBlocks(
 			mlog.Log.Errorf("Triggering graceful shutdown to preserve AccountsDB state.")
 			result.Error = configErr
 			break
+		}
+		if initialBlockConfigured && unrootedTailState != nil {
+			unrootedTailState.initStakeTotals(acctsDb, configuredStakeTotals)
 		}
 		// Log replay start message once, after initial configuration completes
 		if !replayStartLogged {
@@ -3216,6 +3431,9 @@ func ReplayBlocks(
 		}
 
 		block.Features = replayCtx.CurrentFeatures
+		if prefetcher != nil {
+			prefetcher.SetFeatures(block.Features)
+		}
 
 		// post-epoch boundary rewards distribution
 		if partitionedEpochRewardsEnabled && partitionedRewardsInfo != nil && currentSlot >= partitionedRewardsInfo.FirstStakingRewardSlot && partitionedRewardsInfo.NumRewardPartitionsRemaining > 0 {
@@ -3530,6 +3748,7 @@ func ReplayBlocks(
 
 		txnCount := len(block.Transactions)
 		totalCU := lastSlotCtx.TotalComputeUnitsConsumed
+		metrics.GlobalBlockReplay.ComputeUnitsConsumed = totalCU
 
 		// Get leader from block (set by configureBlock in live mode, or by block source in verify mode)
 		leaderStr := "unknown"
@@ -3719,9 +3938,10 @@ func ReplayBlocks(
 					if cloneStats.AcctsLoaded > 0 {
 						cloneRatio = float64(cloneStats.AcctsCloned) / float64(cloneStats.AcctsLoaded) * 100
 					}
-					mlog.Log.FileOnlyf("account COW: %.1f%% cloned (%d/%d accts) | %.1fMB loaded, %.1fMB cloned, %.1fMB modified",
+					mlog.Log.FileOnlyf("account COW: %.1f%% cloned (%d/%d accts) | %.1fMB loaded, %.1fMB cloned, %.1fMB modified, %.1fMB replaced uncopied",
 						cloneRatio, cloneStats.AcctsCloned, cloneStats.AcctsLoaded,
-						float64(cloneStats.AcctsLoadedBytes)/1024/1024, float64(cloneStats.AcctsClonedBytes)/1024/1024, float64(cloneStats.AcctsTouchedBytes)/1024/1024)
+						float64(cloneStats.AcctsLoadedBytes)/1024/1024, float64(cloneStats.AcctsClonedBytes)/1024/1024, float64(cloneStats.AcctsTouchedBytes)/1024/1024,
+						float64(cloneStats.AcctsReplacedBytes)/1024/1024)
 				}
 				mlog.Log.FileOnlyf("memory detail: alloc %.1fGiB | inuse %.1fGiB | idle %.1fGiB | released %.1fGiB | next_gc %.1fGiB | objs %d | gc_total %d | store_queue %d",
 					float64(mem.HeapAlloc)/gib, float64(mem.HeapInuse)/gib, float64(mem.HeapIdle)/gib,

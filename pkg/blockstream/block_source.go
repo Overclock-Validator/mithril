@@ -105,6 +105,10 @@ type BlockSourceOpts struct {
 	// receiver (see TurbinePrewarm), injected into the staging buffer at
 	// construction so the catchup handoff can arm from them immediately.
 	PrewarmBlocks []*b.Block
+	// RepairPeerSeeds are peers that served repair in an earlier run (from
+	// the state file). They join gossip's repair peers until gossip has found
+	// enough of its own, so a restarted node repairs immediately.
+	RepairPeerSeeds []gossip.RepairPeer
 	// LocalBlocks carries fully frozen blocks from this node's producer. The
 	// source owns the consumer for exactly its own lifetime, avoiding stale
 	// consumers across a replay/fork-recovery restart. Replay adopts the
@@ -288,6 +292,17 @@ type BlockSourceStats struct {
 }
 
 type BlockSource struct {
+	// Repair peers remembered across restarts (RepairPeerSeeds,
+	// GoodRepairPeers). lastGoodRepairPeers keeps the latest non-empty list
+	// so a shutdown save still has it after the receiver is torn down.
+	repairPeerSeeds     []gossip.RepairPeer
+	startedAt           time.Time
+	lastGoodRepairPeers atomic.Pointer[[]gossip.RepairPeer]
+
+	// replayEmitHook, when set, sees every block just before it is queued
+	// for replay, while the block source still owns it (SetReplayEmitHook).
+	replayEmitHook atomic.Pointer[func(*b.Block)]
+
 	rpcClients []*rpcclient.RpcClient // All RPC clients for block fetching (index 0 = primary)
 	streamChan chan *b.Block
 	// replayEmissionWg covers the unlocked channel-send window. Add happens
@@ -644,8 +659,11 @@ const (
 	repairCatchupBarrenCooldown  = 30 * time.Minute
 	repairCatchupDecisionTimeout = 15 * time.Second
 	repairCatchupPollInterval    = 250 * time.Millisecond
-	repairCatchupWindowSlots     = uint64(64) // matches the assembler's per-call priority range
-	repairCatchupStallWarnEvery  = 60 * time.Second
+	// repairCatchupSpoolScan bounds how far past the frontier the catchup
+	// monitor looks for consecutive complete spooled slots.
+	repairCatchupSpoolScan      = 4096
+	repairCatchupWindowSlots    = uint64(64) // matches the assembler's per-call priority range
+	repairCatchupStallWarnEvery = 60 * time.Second
 	// Post-handoff live blocks farther than this beyond the waiting slot go
 	// to the CAPPED staging buffer instead of the reorder buffer: during a
 	// long catchup the live edge runs hundreds of slots ahead, and feeding
@@ -739,6 +757,8 @@ func NewBlockSource(opts *BlockSourceOpts) *BlockSource {
 	}
 
 	bs := &BlockSource{
+		repairPeerSeeds:                opts.RepairPeerSeeds,
+		startedAt:                      time.Now(),
 		rpcClients:                     rpcClients,
 		streamChan:                     make(chan *b.Block, streamChanBuffer),
 		startSlot:                      opts.StartSlot,
@@ -2675,7 +2695,18 @@ func (bs *BlockSource) worker(wg *sync.WaitGroup, id int) {
 	}
 }
 
+// SetReplayEmitHook installs fn to be called with each block just before it is
+// queued for replay. fn runs on the emitting goroutine before replay can see
+// the block, so it may read the block but must not keep references into it
+// or block for long. Install it before Start.
+func (bs *BlockSource) SetReplayEmitHook(fn func(*b.Block)) {
+	bs.replayEmitHook.Store(&fn)
+}
+
 func (bs *BlockSource) emitReplayBlock(blk *b.Block) bool {
+	if hook := bs.replayEmitHook.Load(); hook != nil && blk != nil {
+		(*hook)(blk)
+	}
 	select {
 	case bs.streamChan <- blk:
 		return true
@@ -4119,4 +4150,42 @@ func (bs *BlockSource) ResetStats() {
 	bs.totalTipPollFails.Store(0)
 	// Reset the stats window start time for RPS calculation
 	bs.statsResetTime.Store(time.Now().Unix())
+}
+
+const (
+	// Seeds stay in the repair peer list until gossip lists this many peers
+	// or this long after the source starts, whichever comes first.
+	repairPeerSeedEnough = 64
+	repairPeerSeedWindow = 2 * time.Minute
+	// A peer is remembered if it answered a repair request this recently;
+	// at most goodRepairPeerKeep of the best are kept.
+	goodRepairPeerWindow = 10 * time.Minute
+	goodRepairPeerKeep   = 64
+)
+
+// repairPeerSource is gossip's repair peer list plus this run's seeds.
+func (bs *BlockSource) repairPeerSource(gossipPeers func() []gossip.RepairPeer) func() []gossip.RepairPeer {
+	return turbine.SeededRepairPeers(gossipPeers, bs.repairPeerSeeds, repairPeerSeedEnough, bs.startedAt.Add(repairPeerSeedWindow))
+}
+
+// GoodRepairPeers returns up to maxPeers repair peers that recently answered,
+// best first: the live receiver's list when it has one, else the last
+// non-empty list it reported.
+func (bs *BlockSource) GoodRepairPeers(maxPeers int) []gossip.RepairPeer {
+	bs.alpenglowMu.Lock()
+	receiver := bs.activeTurbineReceiver
+	bs.alpenglowMu.Unlock()
+	var peers []gossip.RepairPeer
+	if receiver != nil {
+		peers = receiver.GoodRepairPeers(goodRepairPeerKeep, goodRepairPeerWindow)
+	}
+	if len(peers) > 0 {
+		bs.lastGoodRepairPeers.Store(&peers)
+	} else if last := bs.lastGoodRepairPeers.Load(); last != nil {
+		peers = *last
+	}
+	if maxPeers > 0 && len(peers) > maxPeers {
+		peers = peers[:maxPeers]
+	}
+	return peers
 }

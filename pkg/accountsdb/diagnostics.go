@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 )
 
 // FoldTimings splits one CommitBatch into its sequential steps. They are
@@ -18,7 +18,8 @@ type FoldTimings struct {
 	Dedupe       time.Duration // newest-wins union of the batch's slot deltas, disk budget check
 	FileID       time.Duration // fileId allocation and its fsynced high-water mark
 	SegmentWrite time.Duration // segment file write, fsync and directory fsync
-	UndoCapture  time.Duration // previous index entries of every key (Pebble reads)
+	UndoCapture  time.Duration // waiting for the undo capture after the segment write
+	UndoLookup   time.Duration // the undo capture itself; it overlaps the steps from dedupe on, so not part of the sum
 	Manifest     time.Duration // manifest tmp write, fsync, rename and directory fsync
 	BankhashRows time.Duration // advisory bankhash rows (unsynced)
 	IndexCommit  time.Duration // publication and the synced Pebble index batch
@@ -26,8 +27,8 @@ type FoldTimings struct {
 }
 
 func (t FoldTimings) String() string {
-	return fmt.Sprintf("lock_wait=%s dedupe=%s file_id=%s segment_write=%s undo_capture=%s manifest=%s bankhash_rows=%s index_commit=%s cache_refresh=%s",
-		r(t.LockWait), r(t.Dedupe), r(t.FileID), r(t.SegmentWrite), r(t.UndoCapture), r(t.Manifest), r(t.BankhashRows), r(t.IndexCommit), r(t.CacheRefresh))
+	return fmt.Sprintf("lock_wait=%s dedupe=%s file_id=%s segment_write=%s undo_capture=%s manifest=%s bankhash_rows=%s index_commit=%s cache_refresh=%s undo_lookup=%s",
+		r(t.LockWait), r(t.Dedupe), r(t.FileID), r(t.SegmentWrite), r(t.UndoCapture), r(t.Manifest), r(t.BankhashRows), r(t.IndexCommit), r(t.CacheRefresh), r(t.UndoLookup))
 }
 
 func r(d time.Duration) time.Duration { return d.Round(time.Microsecond) }

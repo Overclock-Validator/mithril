@@ -109,6 +109,7 @@ type Block struct {
 	// transactionDerivedState contains only trusted, nonserialized data derived
 	// from this exact in-memory block (and is shared by its shallow copies).
 	transactionDerivedState *transactionDerivedState
+	accountPrefetchRefs     *AccountPrefetchRefs
 	// turbineReplayAdmissionStart is deliberately private and monotonic. It
 	// exists only on the exact in-memory block handed from Turbine to replay,
 	// so serialized/RPC blocks cannot inject or preserve an admission clock.

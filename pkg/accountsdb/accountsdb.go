@@ -22,20 +22,20 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/sbpf"
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/gagliardetto/solana-go"
-	"github.com/maypok86/otter"
 	"golang.org/x/sync/errgroup"
 )
 
 type AccountsDb struct {
 	Index            *pebble.DB
 	BankHashStore    *pebble.DB
-	AcctsDir         string
+	AcctsDir         string   // primary accounts directory; its parent holds the metadata
+	AcctsDirs        []string // every accounts directory, primary first; see accounts_dirs.go
 	LargestFileId    atomic.Uint64
-	VoteAcctCache    otter.Cache[solana.PublicKey, *accounts.Account]
-	CommonAcctsCache otter.Cache[solana.PublicKey, *accounts.Account]
-	ProgramCache     otter.Cache[solana.PublicKey, *ProgramCacheEntry]
+	VoteAcctCache    *WeightedCache[solana.PublicKey, *accounts.Account]
+	CommonAcctsCache *commonAccountCache
+	ProgramCache     *WeightedCache[solana.PublicKey, *ProgramCacheEntry]
 	// Otter permits concurrent ordinary operations but not Clear. Rewind takes
 	// the write side; hot-path program cache operations take the read side.
 	programCacheMu sync.RWMutex
@@ -50,6 +50,10 @@ type AccountsDb struct {
 	pendingFold      map[[32]byte]dedupedVersion
 	commonAdmission  *commonCacheAdmission
 	batchHooks       batchReadTestHooks
+	// Batch-only absence cache. Both fields use readCacheEpochMu; entries are
+	// valid only for the exact publication epoch in which absence was observed.
+	batchAbsentEpoch uint64
+	batchAbsent      map[solana.PublicKey]struct{}
 
 	// appendVecReadMu pins appendvec paths from before an index snapshot until
 	// its file reads complete. Compaction/rewind take the write side across an
@@ -119,11 +123,12 @@ func (accountsDb *AccountsDb) StoreQueueLen() int {
 	return accountsDb.inProgressStoreRequests.Len()
 }
 
-// silentLogger implements pebble.Logger but discards all messages.
+// silentLogger suppresses informational messages while retaining errors and fatal failures.
 // This suppresses verbose WAL recovery messages on startup.
 type silentLogger struct{}
 
 func (silentLogger) Infof(format string, args ...any)  {}
+func (silentLogger) Errorf(format string, args ...any) { log.Printf(format, args...) }
 func (silentLogger) Fatalf(format string, args ...any) { log.Fatalf(format, args...) }
 
 var (
@@ -137,7 +142,7 @@ var (
 const (
 	indexPebbleMemTableSize                = 64 << 20
 	indexPebbleMemTableStopWritesThreshold = 4
-	DefaultCommonAccountCacheMaxMB         = 256
+	DefaultCommonAccountCacheMaxMB         = 768
 	DefaultProgramCacheMaxMB               = 1024
 	programCacheCostUnitBytes              = 1 << 20
 	commonAccountCacheEntryOverheadBytes   = 256
@@ -159,50 +164,72 @@ func NewAccountsIndexPebbleOptions(logger pebble.Logger) *pebble.Options {
 }
 
 func OpenDb(accountsDbDir string) (*AccountsDb, error) {
-	// check for existence of the 'accounts' directory, which holds the appendvecs
-	appendVecsDir := fmt.Sprintf("%s/accounts", accountsDbDir)
-	_, err := os.Stat(appendVecsDir)
+	return OpenDbPaths([]string{accountsDbDir})
+}
+
+func OpenDbPaths(accountsPaths []string) (*AccountsDb, error) {
+	if err := ValidateAccountsPaths(accountsPaths); err != nil {
+		return nil, err
+	}
+	// The first path holds all metadata (index, manifest, state); every path
+	// holds an "accounts" dir with that disk's share of the appendvecs.
+	accountsDbDir := accountsPaths[0]
+	// The per-disk big-file layout (num_shards, accounts/data) was replaced
+	// before release; such a store must be rebuilt from a snapshot.
+	if _, err := os.Stat(filepath.Join(accountsDbDir, "num_shards")); err == nil {
+		return nil, fmt.Errorf("AccountsDB at %s uses the retired per-disk big-file layout; rebuild it from a snapshot", accountsDbDir)
+	}
+	built, err := readAccountsDirCount(accountsDbDir)
 	if err != nil {
 		return nil, err
 	}
-
-	// attempt to open largest_file_id file
-	largestFileIdFn := fmt.Sprintf("%s/largest_file_id", accountsDbDir)
-	lfi, err := os.Open(largestFileIdFn)
-	if err != nil {
-		mlog.Log.Infof("failed to open %s\n", largestFileIdFn)
-		return nil, err
+	if built != len(accountsPaths) {
+		return nil, fmt.Errorf("configured %d accounts directories but the AccountsDB was built with %d; rebuild required", len(accountsPaths), built)
 	}
-
-	largestFileIdBytes := make([]byte, 8)
-	bytesRead, err := lfi.Read(largestFileIdBytes)
-	if err != nil {
-		mlog.Log.Infof("error reading %s: %s\n", largestFileIdFn, err)
-		return nil, err
-	} else if bytesRead != 8 {
-		mlog.Log.Infof("error reading %s: expected 8 bytes, got %d\n", largestFileIdFn, bytesRead)
-		return nil, fmt.Errorf("only got %d bytes", bytesRead)
+	// check for existence of the 'accounts' directories, which hold the appendvecs
+	appendVecsDirs := make([]string, len(accountsPaths))
+	for i, p := range accountsPaths {
+		appendVecsDirs[i] = filepath.Join(p, "accounts")
+		if _, err := os.Stat(appendVecsDirs[i]); err != nil {
+			return nil, err
+		}
 	}
-
-	largestFileId := binary.LittleEndian.Uint64(largestFileIdBytes)
+	appendVecsDir := appendVecsDirs[0]
 
 	indexDir := filepath.Join(accountsDbDir, "mithril_db")
-	indexOpts := NewAccountsIndexPebbleOptions(silentLogger{})
-	indexOpts.EventListener = pebbleEventListener("index")
-	db, err := pebble.Open(indexDir, indexOpts)
+	opts := NewAccountsIndexPebbleOptions(silentLogger{})
+	if err := ValidateCacheSettings(); err != nil {
+		return nil, err
+	}
+	opts.Cache = pebble.NewCache(int64(IndexCacheMaxMB) << 20)
+	opts.EventListener = pebbleEventListener("index")
+	db, err := openUpgradingPebble(indexDir, opts)
+	if opts.Cache != nil {
+		opts.Cache.Unref()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("opening indexDir=%s: %w", indexDir, err)
 	}
 
 	bankhashDir := filepath.Join(accountsDbDir, "bankhash_db")
-	bankhashDb, err := pebble.Open(bankhashDir, &pebble.Options{Logger: silentLogger{}, EventListener: pebbleEventListener("bankhash")})
+	bankhashDb, err := openUpgradingPebble(bankhashDir, &pebble.Options{Logger: silentLogger{}, EventListener: pebbleEventListener("bankhash")})
 	if err != nil {
+		db.Close()
 		return nil, fmt.Errorf("opening bankhashDir=%s: %w", bankhashDir, err)
 	}
 
 	accountsDb := &AccountsDb{
-		IndexWALDisabled: DisableIndexWAL, Index: db, BankHashStore: bankhashDb, AcctsDir: appendVecsDir}
-	accountsDb.LargestFileId.Store(largestFileId)
+		IndexWALDisabled: DisableIndexWAL, Index: db, BankHashStore: bankhashDb, AcctsDir: appendVecsDir, AcctsDirs: appendVecsDirs}
+	largestBytes, err := os.ReadFile(filepath.Join(accountsDbDir, "largest_file_id"))
+	if err == nil && len(largestBytes) != 8 {
+		err = fmt.Errorf("expected 8 bytes, found %d", len(largestBytes))
+	}
+	if err != nil {
+		bankhashDb.Close()
+		db.Close()
+		return nil, fmt.Errorf("reading largest_file_id: %w", err)
+	}
+	accountsDb.LargestFileId.Store(binary.LittleEndian.Uint64(largestBytes))
 	accountsDb.bindLockDiagnostics()
 
 	accountsDb.inProgressStoreRequests = list.New()
@@ -240,37 +267,17 @@ func (accountsDb *AccountsDb) CloseDb() {
 }
 
 func (accountsDb *AccountsDb) InitCaches() {
-	var err error
 	if accountsDb.inProgressStoreRequests == nil {
 		accountsDb.inProgressStoreRequests = list.New()
 	}
 	accountsDb.commonAdmission = newCommonCacheAdmission()
-	accountsDb.VoteAcctCache, err = otter.MustBuilder[solana.PublicKey, *accounts.Account](2500).
-		Cost(func(key solana.PublicKey, acct *accounts.Account) uint32 {
-			return 1
-		}).
-		Build()
-	if err != nil {
-		panic(err)
-	}
-
-	accountsDb.ProgramCache, err = otter.MustBuilder[solana.PublicKey, *ProgramCacheEntry](programCacheCapacityUnits()).
-		Cost(func(key solana.PublicKey, progEntry *ProgramCacheEntry) uint32 {
-			return progEntry.CostUnits()
-		}).
-		Build()
-	if err != nil {
-		panic(err)
-	}
-
-	accountsDb.CommonAcctsCache, err = otter.MustBuilder[solana.PublicKey, *accounts.Account](commonAccountCacheCapacityBytes()).
-		Cost(func(key solana.PublicKey, acct *accounts.Account) uint32 {
-			return commonAccountCacheCost(acct)
-		}).
-		Build()
-	if err != nil {
-		panic(err)
-	}
+	accountsDb.VoteAcctCache = NewWeightedCache(2500, func(key solana.PublicKey, acct *accounts.Account) uint32 {
+		return 1
+	})
+	accountsDb.ProgramCache = NewWeightedCache(uint64(programCacheCapacityUnits()), func(key solana.PublicKey, progEntry *ProgramCacheEntry) uint32 {
+		return progEntry.CostUnits()
+	})
+	accountsDb.CommonAcctsCache = newCommonAccountCache(uint64(commonAccountCacheCapacityBytes()), CommonAccountCacheLayout != "flat")
 }
 
 type ProgramCacheEntry struct {
@@ -301,10 +308,16 @@ func (entry *ProgramCacheEntry) MatchesSource(source []byte, f *features.Feature
 }
 
 func programCacheCapacityUnits() int {
-	if ProgramCacheMaxMB <= 0 {
-		return DefaultProgramCacheMaxMB
+	mb := ProgramCacheMaxMB
+	if mb <= 0 {
+		mb = DefaultProgramCacheMaxMB
 	}
-	return ProgramCacheMaxMB
+	scale := (1 << 20) / programCacheCostUnitBytes
+	maxInt := int(^uint(0) >> 1)
+	if mb > maxInt/scale {
+		return maxInt
+	}
+	return mb * scale
 }
 
 func commonAccountCacheCapacityBytes() int {
@@ -335,7 +348,11 @@ func (entry *ProgramCacheEntry) CostUnits() uint32 {
 		return 1
 	}
 	bytes := entry.Program.MemoryBytes() + uint64(len(entry.sourceBytes))
-	units := (bytes + programCacheCostUnitBytes - 1) / programCacheCostUnitBytes
+	unit := uint64(programCacheCostUnitBytes)
+	units := bytes / unit
+	if bytes%unit != 0 {
+		units++
+	}
 	if units == 0 {
 		return 1
 	}
@@ -529,8 +546,9 @@ func (accountsDb *AccountsDb) getCachedAccountLocked(pubkey solana.PublicKey) (*
 	if version, ok := accountsDb.pendingFold[[32]byte(pubkey)]; ok {
 		return version.acct, true, true
 	}
-	if acct, ok := accountsDb.VoteAcctCache.Get(pubkey); ok {
-		return acct, true, false
+	voteAcct, voteHit := accountsDb.VoteAcctCache.Get(pubkey)
+	if voteHit {
+		return voteAcct, true, false
 	}
 	acct, ok := accountsDb.CommonAcctsCache.Get(pubkey)
 	return acct, ok, false
@@ -626,7 +644,7 @@ func (accountsDb *AccountsDb) readIndexedAccount(pubkey solana.PublicKey) (*acco
 		return nil, fmt.Errorf("unmarshal index entry: %w", err)
 	}
 
-	appendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, acctIdxEntry.Slot, acctIdxEntry.FileId)
+	appendVecFileName := accountsDb.appendVecPath(acctIdxEntry.Slot, acctIdxEntry.FileId)
 
 	appendVecFile, err := os.Open(appendVecFileName)
 	if err != nil {
@@ -769,6 +787,7 @@ func (accountsDb *AccountsDb) refreshReadCacheEntries(accts []*accounts.Account)
 
 // resetReadCachesLocked requires readCacheEpochMu for writing.
 func (accountsDb *AccountsDb) resetReadCachesLocked() {
+	clear(accountsDb.batchAbsent)
 	accountsDb.CommonAcctsCache.Clear()
 	accountsDb.VoteAcctCache.Clear()
 	accountsDb.programCacheMu.Lock()
@@ -793,8 +812,8 @@ func (accountsDb *AccountsDb) storeWorker() {
 }
 
 func (accountsDb *AccountsDb) storeAccountsInternal(accts []*accounts.Account, slot uint64) {
-	fileId := accountsDb.LargestFileId.Add(1)
-	appendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, slot, fileId)
+	fileId := accountsDb.nextFileId(0)
+	appendVecFileName := accountsDb.appendVecPath(slot, fileId)
 	appendVecFile, err := os.OpenFile(appendVecFileName, os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
 		//mlog.Log.Debugf("unable to open appendvec file %s for writing to accountsdb", appendVecFileName)
@@ -831,7 +850,7 @@ func (accountsDb *AccountsDb) storeAccountsInternal(accts []*accounts.Account, s
 			}
 			c.Close()
 
-			existingAppendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, acctIdxEntry.Slot, acctIdxEntry.FileId)
+			existingAppendVecFileName := accountsDb.appendVecPath(acctIdxEntry.Slot, acctIdxEntry.FileId)
 			existingAppendVecFile, err := os.OpenFile(existingAppendVecFileName, os.O_RDWR, 0666)
 			if err != nil {
 				panic(err)
@@ -933,7 +952,7 @@ func (accountsDb *AccountsDb) parallelStoreAccounts(n int, accts []*accounts.Acc
 						return fmt.Errorf("unmarshaling index entry: %w", err)
 					}
 
-					existingAppendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, existingIdxEntry.Slot, existingIdxEntry.FileId)
+					existingAppendVecFileName := accountsDb.appendVecPath(existingIdxEntry.Slot, existingIdxEntry.FileId)
 					existingAppendVecFile, err := os.OpenFile(existingAppendVecFileName, os.O_RDWR, 0666)
 					if err != nil {
 						return fmt.Errorf("open %s: %w", existingAppendVecFileName, err)
@@ -978,8 +997,8 @@ func (accountsDb *AccountsDb) parallelStoreAccounts(n int, accts []*accounts.Acc
 	}
 	newAppendVecGroup := errgroup.Group{}
 	newAppendVecGroup.Go(func() error {
-		fileId := accountsDb.LargestFileId.Add(1)
-		appendVecFileName := fmt.Sprintf("%s/%d.%d", accountsDb.AcctsDir, slot, fileId)
+		fileId := accountsDb.nextFileId(0)
+		appendVecFileName := accountsDb.appendVecPath(slot, fileId)
 		appendVecFile, err := os.OpenFile(appendVecFileName, os.O_RDWR|os.O_CREATE, 0666)
 		if err != nil {
 			return err

@@ -1,6 +1,6 @@
 package accountsdb
 
-import "github.com/cockroachdb/pebble"
+import "github.com/cockroachdb/pebble/v2"
 
 // Bound scratch memory independently of segment size. Once full, uncached keys
 // still get their normal index lookup; no record or validation is skipped.

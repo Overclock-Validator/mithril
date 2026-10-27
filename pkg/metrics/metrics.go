@@ -78,6 +78,7 @@ type AccountLoader struct {
 	InProgressHits    uint64
 	PendingFoldHits   uint64
 	CacheHits         uint64
+	NegativeCacheHits uint64
 	IndexHits         uint64
 	IndexMisses       uint64
 	UniqueAppendVecs  uint64
@@ -178,6 +179,7 @@ func (dst *AccountLoader) Accumulate(src AccountLoader) {
 	dst.InProgressHits += src.InProgressHits
 	dst.PendingFoldHits += src.PendingFoldHits
 	dst.CacheHits += src.CacheHits
+	dst.NegativeCacheHits += src.NegativeCacheHits
 	dst.IndexHits += src.IndexHits
 	dst.IndexMisses += src.IndexMisses
 	dst.UniqueAppendVecs += src.UniqueAppendVecs
@@ -359,9 +361,10 @@ type StreamingExecution struct {
 
 // Metrics for replaying a single block
 type BlockReplay struct {
-	Slot           uint64
-	AccountLoader  AccountLoader
-	TurbineIngress TurbineIngress
+	ComputeUnitsConsumed uint64
+	Slot                 uint64
+	AccountLoader        AccountLoader
+	TurbineIngress       TurbineIngress
 
 	// RewardCertificatePreflight runs before consensus admission and bank replay,
 	// outside SlotReplay, which starts after the candidate is admitted.

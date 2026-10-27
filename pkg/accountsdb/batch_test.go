@@ -14,7 +14,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -96,7 +96,8 @@ func TestGetAccountsBatchStatsAndSmallBatchAdmissions(t *testing.T) {
 	_, second, err := db.GetAccountsBatchSharedWithStats(context.Background(), 100, keys)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(2), second.CacheHits, "small batch should reuse admitted common and vote accounts")
-	assert.Equal(t, uint64(1), second.IndexMisses, "negative entries are deliberately not cached yet")
+	assert.Zero(t, second.IndexMisses)
+	assert.Equal(t, uint64(1), second.NegativeCacheHits)
 }
 
 func TestLargeBatchSelectivelyAdmitsReusableAccounts(t *testing.T) {
@@ -348,7 +349,7 @@ func TestRefreshReadCachesIsScanResistantAndCoherent(t *testing.T) {
 	db.refreshReadCaches([]*accounts.Account{updated})
 	got, ok := db.CommonAcctsCache.Get(key)
 	require.True(t, ok)
-	assert.Same(t, updated, got, "resident common entry must be refreshed")
+	assert.Equal(t, updated, got, "resident common entry must be refreshed")
 
 	vote := &accounts.Account{Key: key, Lamports: 30, Owner: addresses.VoteProgramAddr}
 	db.refreshReadCaches([]*accounts.Account{vote})
@@ -667,4 +668,25 @@ func legacyAccountsBatchForBenchmark(ctx context.Context, db *AccountsDb, slot u
 	}
 	wg.Wait()
 	return out, firstErr
+}
+
+func TestBatchWorkerLimitCapsConcurrency(t *testing.T) {
+	var running, peak atomic.Int32
+	work := func(int) error {
+		n := running.Add(1)
+		for {
+			p := peak.Load()
+			if n <= p || peak.CompareAndSwap(p, n) {
+				break
+			}
+		}
+		time.Sleep(time.Millisecond)
+		running.Add(-1)
+		return nil
+	}
+	require.NoError(t, runBatchWorkers(WithBatchWorkerLimit(context.Background(), 2), 64, work))
+	assert.LessOrEqual(t, peak.Load(), int32(2))
+	assert.Equal(t, 2, limitBatchWorkers(WithBatchWorkerLimit(context.Background(), 2), 8))
+	assert.Equal(t, 8, limitBatchWorkers(WithBatchWorkerLimit(context.Background(), 0), 8), "zero leaves the default")
+	assert.Equal(t, 8, limitBatchWorkers(context.Background(), 8))
 }

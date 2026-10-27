@@ -249,29 +249,31 @@ func (db *AccountsDb) removeUnreferencedDataFiles() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	entries, err := os.ReadDir(db.AcctsDir)
-	if err != nil {
-		return nil, err
-	}
 	var removed []string
-	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() || filepath.Ext(name) != "" && !isDataFileName(name) {
-			continue
+	for _, dir := range db.AccountsDirs() {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return removed, err
 		}
-		_, fileId, ok := parseDataFileName(name)
-		if !ok || fileId <= bootstrapHigh {
-			continue
+		for _, e := range entries {
+			name := e.Name()
+			if e.IsDir() || filepath.Ext(name) != "" && !isDataFileName(name) {
+				continue
+			}
+			_, fileId, ok := parseDataFileName(name)
+			if !ok || fileId <= bootstrapHigh || db.appendVecDir(fileId) != dir {
+				continue
+			}
+			if _, ok := referenced[fileId]; ok {
+				continue
+			}
+			p := filepath.Join(dir, name)
+			if rerr := os.Remove(p); rerr != nil && !os.IsNotExist(rerr) {
+				return removed, rerr
+			}
+			mlog.Log.Warnf("accountsdb: removed orphan segment %s (no manifest — commit never decided)", name)
+			removed = append(removed, p)
 		}
-		if _, ok := referenced[fileId]; ok {
-			continue
-		}
-		p := filepath.Join(db.AcctsDir, name)
-		if rerr := os.Remove(p); rerr != nil && !os.IsNotExist(rerr) {
-			return removed, rerr
-		}
-		mlog.Log.Warnf("accountsdb: removed orphan segment %s (no manifest — commit never decided)", name)
-		removed = append(removed, p)
 	}
 	return removed, nil
 }

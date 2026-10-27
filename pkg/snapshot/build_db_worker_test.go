@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
@@ -58,16 +57,15 @@ func TestSnapshotWorkerParseFailurePropagatesAfterDrain(t *testing.T) {
 		shardLogger,
 		manifest,
 		nil,
-		accountsDir,
-		&atomic.Uint64{},
+		testAppendVecDirs(t, accountsDir),
 		&stakeIndexCollector{},
 	)
 	require.NoError(t, err)
 	t.Cleanup(pools.Release)
 
 	err = invokeSnapshotTask(wg, pools.appendVecCopying, appendVecCopyingTask{
-		Filename:  "accounts/20.21",
-		TarBuffer: bytes.NewBuffer(malformed),
+		Filename: "accounts/20.21",
+		Buf:      malformed,
 	})
 	require.NoError(t, err)
 	require.ErrorContains(t, waitForSnapshotWorkers(wg, pools), "truncated appendvec account data")
@@ -138,13 +136,13 @@ func TestSnapshotWorkersSupportArchiveSizedAppendVecs(t *testing.T) {
 			closeShardLogger := sync.OnceFunc(func() { require.NoError(t, shardLogger.Close(context.Background())) })
 			t.Cleanup(closeShardLogger)
 			wg := &sync.WaitGroup{}
-			largestFileID := &atomic.Uint64{}
 			stakes := &stakeIndexCollector{}
-			pools, err := initWorkerPools(wg, shardLogger, tt.full, tt.incremental, accountsDir, largestFileID, stakes)
+			dirs := testAppendVecDirs(t, accountsDir)
+			pools, err := initWorkerPools(wg, shardLogger, tt.full, tt.incremental, dirs, stakes)
 			require.NoError(t, err)
 			t.Cleanup(pools.Release)
 			require.NoError(t, invokeSnapshotTask(wg, pools.appendVecCopying, appendVecCopyingTask{
-				Filename: "accounts/20.21", TarBuffer: bytes.NewBuffer(tt.data), FromIncrementalSnapshot: tt.fromIncr,
+				Filename: "accounts/20.21", Buf: tt.data, FromIncrementalSnapshot: tt.fromIncr,
 			}))
 			err = waitForSnapshotWorkers(wg, pools)
 			if tt.wantErr != "" {
@@ -153,8 +151,12 @@ func TestSnapshotWorkersSupportArchiveSizedAppendVecs(t *testing.T) {
 			}
 			require.NoError(t, err)
 			closeShardLogger()
-			require.Equal(t, int64(tt.wantEntries*(32+vlen)), shardLogger.TotalBytes())
-			require.Equal(t, fileID, largestFileID.Load())
+			logged := 0
+			for _, sh := range shardLogger.shards {
+				logged += sh.logSize
+			}
+			require.Equal(t, tt.wantEntries*(32+vlen), logged)
+			require.Equal(t, fileID, dirs.largest.Load())
 			require.Len(t, stakes.entries, tt.wantEntries)
 			for i, entry := range stakes.entries {
 				require.Equal(t, keys[i], entry.Pubkey)
@@ -163,4 +165,12 @@ func TestSnapshotWorkersSupportArchiveSizedAppendVecs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func testAppendVecDirs(t *testing.T, accountsDbDir string) *appendVecDirs {
+	t.Helper()
+	dirs, err := makeAppendVecDirs([]string{accountsDbDir})
+	require.NoError(t, err)
+	t.Cleanup(dirs.close)
+	return dirs
 }

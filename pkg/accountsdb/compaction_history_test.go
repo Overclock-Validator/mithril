@@ -2,7 +2,7 @@ package accountsdb
 
 import (
 	"fmt"
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/require"
 	"os"
