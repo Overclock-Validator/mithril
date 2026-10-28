@@ -2,106 +2,76 @@ package sealevel
 
 import (
 	"bytes"
-	"fmt"
-	"math/rand"
+	"encoding/binary"
 	"testing"
 )
 
-var studySinkC []SolAccountInfoC
-var studySinkRust []SolAccountInfoRust
-
-func TestCPIDecodeCompleteRecords(t *testing.T) {
-	rng := rand.New(rand.NewSource(330))
-	for i := 0; i < 10000; i++ {
-		c := make([]byte, SolAccountInfoCSize)
-		rng.Read(c)
-		var a, b SolAccountInfoC
-		if err := a.Unmarshal(bytes.NewReader(c)); err != nil {
-			t.Fatal(err)
-		}
-		decodeAccountInfoC(&b, c)
-		if a != b {
-			t.Fatal("C mismatch")
-		}
-		r := make([]byte, SolAccountInfoRustSize)
-		rng.Read(r)
-		var x, y SolAccountInfoRust
-		if err := x.Unmarshal(bytes.NewReader(r)); err != nil {
-			t.Fatal(err)
-		}
-		decodeAccountInfoRust(&y, r)
-		if x != y {
-			t.Fatal("Rust mismatch")
-		}
+// putFields writes distinct little-endian values at the given offsets: an
+// 8-byte value at each u64 offset and a byte at each flag offset.
+func putFields(size int, u64Offsets, flagOffsets []int) []byte {
+	b := make([]byte, size)
+	for i := range b {
+		b[i] = 0xee // padding the decoders must ignore
 	}
+	for i, off := range u64Offsets {
+		binary.LittleEndian.PutUint64(b[off:], 0x0102030405060700+uint64(i))
+	}
+	for i, off := range flagOffsets {
+		b[off] = byte(i + 1)
+	}
+	return b
 }
-func BenchmarkCPIDecode(b *testing.B) {
-	for _, n := range []int{8, 32} {
-		for _, abi := range []string{"C", "Rust"} {
-			for _, mode := range []string{"reader", "direct"} {
-				b.Run(fmt.Sprintf("%s/%d/%s", abi, n, mode), func(b *testing.B) {
-					size := SolAccountInfoCSize
-					if abi == "Rust" {
-						size = SolAccountInfoRustSize
-					}
-					data := make([]byte, n*size)
-					rand.New(rand.NewSource(330)).Read(data)
-					b.ReportAllocs()
-					b.ResetTimer()
-					for k := 0; k < b.N; k++ {
-						if abi == "C" {
-							out := make([]SolAccountInfoC, n)
-							if mode == "reader" {
-								r := bytes.NewReader(data)
-								for i := range out {
-									if err := out[i].Unmarshal(r); err != nil {
-										b.Fatal(err)
-									}
-								}
-							} else {
-								for i := range out {
-									decodeAccountInfoC(&out[i], data[i*size:(i+1)*size])
-								}
-							}
-							studySinkC = out
-						} else {
-							out := make([]SolAccountInfoRust, n)
-							if mode == "reader" {
-								r := bytes.NewReader(data)
-								for i := range out {
-									if err := out[i].Unmarshal(r); err != nil {
-										b.Fatal(err)
-									}
-								}
-							} else {
-								for i := range out {
-									decodeAccountInfoRust(&out[i], data[i*size:(i+1)*size])
-								}
-							}
-							studySinkRust = out
-						}
-					}
-				})
-			}
-		}
+
+// Each record decodes every field from its ABI offset (the Solana C and Rust
+// AccountInfo layouts and the Rust Rc<RefCell<..>> layouts), and Unmarshal
+// reads the same record.
+func TestCPIRecordLayouts(t *testing.T) {
+	c := putFields(SolAccountInfoCSize, []int{0, 8, 16, 24, 32, 40}, []int{48, 49, 50})
+	c[49] = 0 // a zero flag decodes as false
+	wantC := SolAccountInfoC{KeyAddr: 0x0102030405060700, LamportsAddr: 0x0102030405060701, DataLen: 0x0102030405060702,
+		DataAddr: 0x0102030405060703, OwnerAddr: 0x0102030405060704, RentEpoch: 0x0102030405060705,
+		IsSigner: true, IsWritable: false, Executable: true}
+	var gotC, readC SolAccountInfoC
+	gotC.decode(c)
+	if err := readC.Unmarshal(bytes.NewReader(c)); err != nil || gotC != wantC || readC != wantC {
+		t.Fatalf("C AccountInfo: decode %+v, Unmarshal %+v (%v), want %+v", gotC, readC, err, wantC)
+	}
+
+	r := putFields(SolAccountInfoRustSize, []int{0, 8, 16, 24, 32}, []int{40, 41, 42})
+	wantRust := SolAccountInfoRust{PubkeyAddr: 0x0102030405060700, LamportsBoxAddr: 0x0102030405060701, DataBoxAddr: 0x0102030405060702,
+		OwnerAddr: 0x0102030405060703, RentEpoch: 0x0102030405060704, IsSigner: 1, IsWritable: 2, Executable: 3}
+	var gotRust, readRust SolAccountInfoRust
+	gotRust.decode(r)
+	if err := readRust.Unmarshal(bytes.NewReader(r)); err != nil || gotRust != wantRust || readRust != wantRust {
+		t.Fatalf("Rust AccountInfo: decode %+v, Unmarshal %+v (%v), want %+v", gotRust, readRust, err, wantRust)
+	}
+
+	cell := putFields(RefCellRustSize, []int{0, 8, 16, 24}, nil)
+	wantCell := RefCellRust{Strong: 0x0102030405060700, Weak: 0x0102030405060701, Borrow: 0x0102030405060702, Addr: 0x0102030405060703}
+	var gotCell, readCell RefCellRust
+	gotCell.decode(cell)
+	if err := readCell.Unmarshal(bytes.NewReader(cell)); err != nil || gotCell != wantCell || readCell != wantCell {
+		t.Fatalf("RefCell: decode %+v, Unmarshal %+v (%v), want %+v", gotCell, readCell, err, wantCell)
+	}
+
+	vec := putFields(RefCellVecRustSize, []int{0, 8, 16, 24, 32}, nil)
+	wantVec := RefCellVecRust{Strong: 0x0102030405060700, Weak: 0x0102030405060701, Borrow: 0x0102030405060702,
+		Addr: 0x0102030405060703, Len: 0x0102030405060704}
+	var gotVec, readVec RefCellVecRust
+	gotVec.decode(vec)
+	if err := readVec.Unmarshal(bytes.NewReader(vec)); err != nil || gotVec != wantVec || readVec != wantVec {
+		t.Fatalf("RefCell<Vec>: decode %+v, Unmarshal %+v (%v), want %+v", gotVec, readVec, err, wantVec)
 	}
 }
 
-func TestCPIDecodeRefCells(t *testing.T) {
-	rng := rand.New(rand.NewSource(331))
-	for i := 0; i < 10000; i++ {
-		data := make([]byte, RefCellVecRustSize)
-		rng.Read(data)
-		var cell RefCellRust
-		var vec RefCellVecRust
-		if err := cell.Unmarshal(bytes.NewReader(data)); err != nil {
-			t.Fatal(err)
+// decode needs a complete record; a short slice is a caller bug and panics
+// rather than decoding zeros.
+func TestCPIRecordDecodeRejectsShortInput(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("decoding a short record did not panic")
 		}
-		if err := vec.Unmarshal(bytes.NewReader(data)); err != nil {
-			t.Fatal(err)
-		}
-		if cell != decodeRefCellRust(data) || vec != decodeRefCellVecRust(data) {
-			t.Fatal("RefCell mismatch")
-		}
-	}
+	}()
+	var info SolAccountInfoC
+	info.decode(make([]byte, SolAccountInfoCSize-1))
 }

@@ -335,17 +335,23 @@ func (accountInfo *SolAccountInfoC) Unmarshal(buf io.Reader) error {
 		return err
 	}
 
-	accountInfo.KeyAddr = binary.LittleEndian.Uint64(acctInfoBytes[:8])
-	accountInfo.LamportsAddr = binary.LittleEndian.Uint64(acctInfoBytes[8:16])
-	accountInfo.DataLen = binary.LittleEndian.Uint64(acctInfoBytes[16:24])
-	accountInfo.DataAddr = binary.LittleEndian.Uint64(acctInfoBytes[24:32])
-	accountInfo.OwnerAddr = binary.LittleEndian.Uint64(acctInfoBytes[32:40])
-	accountInfo.RentEpoch = binary.LittleEndian.Uint64(acctInfoBytes[40:48])
-	accountInfo.IsSigner = acctInfoBytes[48] != 0
-	accountInfo.IsWritable = acctInfoBytes[49] != 0
-	accountInfo.Executable = acctInfoBytes[50] != 0
-
+	accountInfo.decode(acctInfoBytes[:])
 	return nil
+}
+
+// decode reads the record from b, which must hold at least SolAccountInfoCSize
+// bytes.
+func (accountInfo *SolAccountInfoC) decode(b []byte) {
+	_ = b[SolAccountInfoCSize-1]
+	accountInfo.KeyAddr = binary.LittleEndian.Uint64(b[:8])
+	accountInfo.LamportsAddr = binary.LittleEndian.Uint64(b[8:16])
+	accountInfo.DataLen = binary.LittleEndian.Uint64(b[16:24])
+	accountInfo.DataAddr = binary.LittleEndian.Uint64(b[24:32])
+	accountInfo.OwnerAddr = binary.LittleEndian.Uint64(b[32:40])
+	accountInfo.RentEpoch = binary.LittleEndian.Uint64(b[40:48])
+	accountInfo.IsSigner = b[48] != 0
+	accountInfo.IsWritable = b[49] != 0
+	accountInfo.Executable = b[50] != 0
 }
 
 func (accountInfo *SolAccountInfoRust) Unmarshal(buf io.Reader) error {
@@ -357,16 +363,22 @@ func (accountInfo *SolAccountInfoRust) Unmarshal(buf io.Reader) error {
 		return err
 	}
 
-	accountInfo.PubkeyAddr = binary.LittleEndian.Uint64(accountInfoBytes[:8])
-	accountInfo.LamportsBoxAddr = binary.LittleEndian.Uint64(accountInfoBytes[8:16])
-	accountInfo.DataBoxAddr = binary.LittleEndian.Uint64(accountInfoBytes[16:24])
-	accountInfo.OwnerAddr = binary.LittleEndian.Uint64(accountInfoBytes[24:32])
-	accountInfo.RentEpoch = binary.LittleEndian.Uint64(accountInfoBytes[32:40])
-	accountInfo.IsSigner = accountInfoBytes[40]
-	accountInfo.IsWritable = accountInfoBytes[41]
-	accountInfo.Executable = accountInfoBytes[42]
-
+	accountInfo.decode(accountInfoBytes[:])
 	return nil
+}
+
+// decode reads the record from b, which must hold at least
+// SolAccountInfoRustSize bytes.
+func (accountInfo *SolAccountInfoRust) decode(b []byte) {
+	_ = b[SolAccountInfoRustSize-1]
+	accountInfo.PubkeyAddr = binary.LittleEndian.Uint64(b[:8])
+	accountInfo.LamportsBoxAddr = binary.LittleEndian.Uint64(b[8:16])
+	accountInfo.DataBoxAddr = binary.LittleEndian.Uint64(b[16:24])
+	accountInfo.OwnerAddr = binary.LittleEndian.Uint64(b[24:32])
+	accountInfo.RentEpoch = binary.LittleEndian.Uint64(b[32:40])
+	accountInfo.IsSigner = b[40]
+	accountInfo.IsWritable = b[41]
+	accountInfo.Executable = b[42]
 }
 
 func (refCell *RefCellRust) Unmarshal(buf io.Reader) error {
@@ -377,12 +389,18 @@ func (refCell *RefCellRust) Unmarshal(buf io.Reader) error {
 		return err
 	}
 
-	refCell.Strong = binary.LittleEndian.Uint64(refCellBytes[:8])
-	refCell.Weak = binary.LittleEndian.Uint64(refCellBytes[8:16])
-	refCell.Borrow = binary.LittleEndian.Uint64(refCellBytes[16:24])
-	refCell.Addr = binary.LittleEndian.Uint64(refCellBytes[24:32])
-
+	refCell.decode(refCellBytes[:])
 	return nil
+}
+
+// decode reads the record from b, which must hold at least RefCellRustSize
+// bytes.
+func (refCell *RefCellRust) decode(b []byte) {
+	_ = b[RefCellRustSize-1]
+	refCell.Strong = binary.LittleEndian.Uint64(b[:8])
+	refCell.Weak = binary.LittleEndian.Uint64(b[8:16])
+	refCell.Borrow = binary.LittleEndian.Uint64(b[16:24])
+	refCell.Addr = binary.LittleEndian.Uint64(b[24:32])
 }
 
 func (refCellVec *RefCellVecRust) Unmarshal(buf io.Reader) error {
@@ -394,13 +412,19 @@ func (refCellVec *RefCellVecRust) Unmarshal(buf io.Reader) error {
 		return err
 	}
 
-	refCellVec.Strong = binary.LittleEndian.Uint64(refCellVecBytes[:8])
-	refCellVec.Weak = binary.LittleEndian.Uint64(refCellVecBytes[8:16])
-	refCellVec.Borrow = binary.LittleEndian.Uint64(refCellVecBytes[16:24])
-	refCellVec.Addr = binary.LittleEndian.Uint64(refCellVecBytes[24:32])
-	refCellVec.Len = binary.LittleEndian.Uint64(refCellVecBytes[32:40])
-
+	refCellVec.decode(refCellVecBytes[:])
 	return nil
+}
+
+// decode reads the record from b, which must hold at least RefCellVecRustSize
+// bytes.
+func (refCellVec *RefCellVecRust) decode(b []byte) {
+	_ = b[RefCellVecRustSize-1]
+	refCellVec.Strong = binary.LittleEndian.Uint64(b[:8])
+	refCellVec.Weak = binary.LittleEndian.Uint64(b[8:16])
+	refCellVec.Borrow = binary.LittleEndian.Uint64(b[16:24])
+	refCellVec.Addr = binary.LittleEndian.Uint64(b[24:32])
+	refCellVec.Len = binary.LittleEndian.Uint64(b[32:40])
 }
 
 func (psi *ProcessedSiblingInstruction) Unmarshal(buf io.Reader) error {

@@ -419,10 +419,10 @@ func translateAccountInfosC(vm sbpf.VM, accountInfosAddr, accountInfosLen uint64
 		return nil, nil, err
 	}
 
+	// Translate returned exactly accountInfosLen complete records.
 	accountInfos := make([]SolAccountInfoC, accountInfosLen)
 	for i := range accountInfos {
-		start := i * SolAccountInfoCSize
-		decodeAccountInfoC(&accountInfos[i], accountInfosData[start:start+SolAccountInfoCSize])
+		accountInfos[i].decode(accountInfosData[i*SolAccountInfoCSize:])
 	}
 
 	err = checkAccountInfos(execCtx, uint64(len(accountInfos)))
@@ -463,10 +463,10 @@ func translateAccountInfosRust(vm sbpf.VM, accountInfosAddr, accountInfosLen uin
 		return nil, nil, err
 	}
 
+	// Translate returned exactly accountInfosLen complete records.
 	accountInfos := make([]SolAccountInfoRust, accountInfosLen)
 	for i := range accountInfos {
-		start := i * SolAccountInfoRustSize
-		decodeAccountInfoRust(&accountInfos[i], accountInfosData[start:start+SolAccountInfoRustSize])
+		accountInfos[i].decode(accountInfosData[i*SolAccountInfoRustSize:])
 	}
 
 	err = checkAccountInfos(execCtx, uint64(len(accountInfos)))
@@ -594,7 +594,8 @@ func callerAccountFromAccountInfoRust(vm sbpf.VM, execCtx *ExecutionCtx, indexIn
 		return CallerAccount{}, err
 	}
 
-	lamportsBox := decodeRefCellRust(lamportsBoxData)
+	var lamportsBox RefCellRust
+	lamportsBox.decode(lamportsBoxData)
 
 	if execCtx.Features.IsActive(features.SyscallParameterAddressRestrictions) {
 		if err = checkAccountInfoPointer(lamportsBox.Addr, accountMetadata.vmLamportsAddr); err != nil {
@@ -621,7 +622,8 @@ func callerAccountFromAccountInfoRust(vm sbpf.VM, execCtx *ExecutionCtx, indexIn
 		return CallerAccount{}, err
 	}
 
-	dataBox := decodeRefCellVecRust(dataBoxBytes)
+	var dataBox RefCellVecRust
+	dataBox.decode(dataBoxBytes)
 
 	originalDataLen := dataBox.Len
 	if usesSerializedAccountMetadata {

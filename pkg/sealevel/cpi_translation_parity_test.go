@@ -4,17 +4,19 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"reflect"
+	"testing"
+
 	"github.com/Overclock-Validator/mithril/pkg/cu"
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/safemath"
 	"github.com/Overclock-Validator/mithril/pkg/sbpf"
 	"github.com/gagliardetto/solana-go"
-	"reflect"
-	"testing"
 )
 
-// Frozen pre-candidate translators retain reader decoding, so differential tests
-// cover output, error precedence, CU consumption and VM access order together.
+// Reference translators keep the earlier per-record io.Reader loop, so the
+// differential test below checks that decoding from the translated slice keeps
+// the output, error precedence, CU consumption and VM access order.
 func referenceAccountInfosC(vm sbpf.VM, accountInfosAddr, accountInfosLen uint64) ([]SolAccountInfoC, []solana.PublicKey, error) {
 	size := safemath.SaturatingMulU64(accountInfosLen, SolAccountInfoCSize)
 	execCtx := executionCtx(vm)
@@ -205,7 +207,11 @@ func TestCPIDecodeTranslationParity(t *testing.T) {
 	}
 }
 
-var translationKeysSink []solana.PublicKey
+var (
+	translatedInfosC    []SolAccountInfoC
+	translatedInfosRust []SolAccountInfoRust
+	translatedKeys      []solana.PublicKey
+)
 
 func BenchmarkCPITranslateAccountInfos(b *testing.B) {
 	for _, rust := range []bool{false, true} {
@@ -231,15 +237,15 @@ func BenchmarkCPITranslateAccountInfos(b *testing.B) {
 						var err error
 						if rust {
 							if reference {
-								studySinkRust, translationKeysSink, err = referenceAccountInfosRust(vm, sbpf.VaddrInput, uint64(n))
+								translatedInfosRust, translatedKeys, err = referenceAccountInfosRust(vm, sbpf.VaddrInput, uint64(n))
 							} else {
-								studySinkRust, translationKeysSink, err = translateAccountInfosRust(vm, sbpf.VaddrInput, uint64(n))
+								translatedInfosRust, translatedKeys, err = translateAccountInfosRust(vm, sbpf.VaddrInput, uint64(n))
 							}
 						} else {
 							if reference {
-								studySinkC, translationKeysSink, err = referenceAccountInfosC(vm, sbpf.VaddrInput, uint64(n))
+								translatedInfosC, translatedKeys, err = referenceAccountInfosC(vm, sbpf.VaddrInput, uint64(n))
 							} else {
-								studySinkC, translationKeysSink, err = translateAccountInfosC(vm, sbpf.VaddrInput, uint64(n))
+								translatedInfosC, translatedKeys, err = translateAccountInfosC(vm, sbpf.VaddrInput, uint64(n))
 							}
 						}
 						if err != nil {
