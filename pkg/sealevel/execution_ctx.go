@@ -254,6 +254,9 @@ func (execCtx *ExecutionCtx) PrepareInstruction(ix Instruction, signers []solana
 	}
 
 	var instructionAccounts []InstructionAccount
+	if len(duplicateIndices) != 0 {
+		instructionAccounts = make([]InstructionAccount, 0, len(duplicateIndices))
+	}
 	for _, duplicateIndex := range duplicateIndices {
 		if duplicateIndex > uint64(len(dedupInstructionAccounts)-1) {
 			return nil, nil, InstrErrNotEnoughAccountKeys

@@ -419,16 +419,10 @@ func translateAccountInfosC(vm sbpf.VM, accountInfosAddr, accountInfosLen uint64
 		return nil, nil, err
 	}
 
-	reader := bytes.NewReader(accountInfosData)
-	accountInfos := make([]SolAccountInfoC, 0, accountInfosLen)
-
-	for count := uint64(0); count < accountInfosLen; count++ {
-		var acctInfo SolAccountInfoC
-		err = acctInfo.Unmarshal(reader)
-		if err != nil {
-			return nil, nil, err
-		}
-		accountInfos = append(accountInfos, acctInfo)
+	accountInfos := make([]SolAccountInfoC, accountInfosLen)
+	for i := range accountInfos {
+		start := i * SolAccountInfoCSize
+		decodeAccountInfoC(&accountInfos[i], accountInfosData[start:start+SolAccountInfoCSize])
 	}
 
 	err = checkAccountInfos(execCtx, uint64(len(accountInfos)))
@@ -469,16 +463,10 @@ func translateAccountInfosRust(vm sbpf.VM, accountInfosAddr, accountInfosLen uin
 		return nil, nil, err
 	}
 
-	reader := bytes.NewReader(accountInfosData)
-	accountInfos := make([]SolAccountInfoRust, 0, accountInfosLen)
-
-	for count := uint64(0); count < accountInfosLen; count++ {
-		var acctInfo SolAccountInfoRust
-		err = acctInfo.Unmarshal(reader)
-		if err != nil {
-			return nil, nil, err
-		}
-		accountInfos = append(accountInfos, acctInfo)
+	accountInfos := make([]SolAccountInfoRust, accountInfosLen)
+	for i := range accountInfos {
+		start := i * SolAccountInfoRustSize
+		decodeAccountInfoRust(&accountInfos[i], accountInfosData[start:start+SolAccountInfoRustSize])
 	}
 
 	err = checkAccountInfos(execCtx, uint64(len(accountInfos)))
@@ -606,13 +594,7 @@ func callerAccountFromAccountInfoRust(vm sbpf.VM, execCtx *ExecutionCtx, indexIn
 		return CallerAccount{}, err
 	}
 
-	reader := bytes.NewReader(lamportsBoxData)
-
-	var lamportsBox RefCellRust
-	err = lamportsBox.Unmarshal(reader)
-	if err != nil {
-		return CallerAccount{}, err
-	}
+	lamportsBox := decodeRefCellRust(lamportsBoxData)
 
 	if execCtx.Features.IsActive(features.SyscallParameterAddressRestrictions) {
 		if err = checkAccountInfoPointer(lamportsBox.Addr, accountMetadata.vmLamportsAddr); err != nil {
@@ -639,13 +621,7 @@ func callerAccountFromAccountInfoRust(vm sbpf.VM, execCtx *ExecutionCtx, indexIn
 		return CallerAccount{}, err
 	}
 
-	reader.Reset(dataBoxBytes)
-
-	var dataBox RefCellVecRust
-	err = dataBox.Unmarshal(reader)
-	if err != nil {
-		return CallerAccount{}, err
-	}
+	dataBox := decodeRefCellVecRust(dataBoxBytes)
 
 	originalDataLen := dataBox.Len
 	if usesSerializedAccountMetadata {
@@ -888,7 +864,7 @@ func translateAndUpdateAccountsC(vm sbpf.VM, instructionAccts []InstructionAccou
 		return nil, err
 	}
 
-	accounts := make(TranslatedAccounts, 0)
+	accounts := make(TranslatedAccounts, 0, len(instructionAccts)+1)
 
 	idx := len(programIndices) - 1
 	if idx < 0 {
@@ -997,7 +973,7 @@ func translateAndUpdateAccountsRust(vm sbpf.VM, instructionAccts []InstructionAc
 		return nil, err
 	}
 
-	accounts := make(TranslatedAccounts, 0)
+	accounts := make(TranslatedAccounts, 0, len(instructionAccts)+1)
 
 	idx := len(programIndices) - 1
 	if idx < 0 {
