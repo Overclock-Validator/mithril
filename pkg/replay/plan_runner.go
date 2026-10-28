@@ -11,23 +11,24 @@ import (
 	"github.com/gagliardetto/solana-go"
 )
 
-// Direct dispatch, off unless MITHRIL_DIRECT_DISPATCH=1: the worker that
+// Direct dispatch, on unless MITHRIL_DIRECT_DISPATCH=0: the worker that
 // commits a transaction releases its dependents itself instead of reporting to
 // a dispatcher goroutine. Each transaction keeps an atomic count of
 // uncommitted prerequisites; the committing worker decrements its dependents'
 // counts after the commit, runs the first that becomes ready itself, and
 // queues any others for idle workers. This removes two goroutine hand-offs
 // (worker to dispatcher, dispatcher to worker) from every link of a dependency
-// chain. Dependents are still released only after the commit.
-var directDispatch = os.Getenv("MITHRIL_DIRECT_DISPATCH") == "1"
+// chain. Dependents are still released only after the commit. With =0 the
+// dispatcher goroutine schedules every transaction, as before.
+var directDispatch = os.Getenv("MITHRIL_DIRECT_DISPATCH") != "0"
 
-// Critical-path-first scheduling (direct dispatch), off unless
-// MITHRIL_READY_PRIORITY=1: each transaction's height is the length of the
+// Critical-path-first scheduling (direct dispatch), on unless
+// MITHRIL_READY_PRIORITY=0: each transaction's height is the length of the
 // longest chain of dependents below it. Ready transactions are taken highest
 // first instead of in arrival order, and a committing worker continues with
 // its highest newly ready dependent, so a transaction on the block's longest
 // chain does not wait behind ready work that nothing depends on.
-var readyPriority = os.Getenv("MITHRIL_READY_PRIORITY") == "1"
+var readyPriority = os.Getenv("MITHRIL_READY_PRIORITY") != "0"
 
 // With MITHRIL_READY_PRIORITY_CU=1, heights weigh each transaction by its
 // requested compute (requestedKCU) instead of counting transactions, so one
