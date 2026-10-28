@@ -3,6 +3,7 @@ package replay
 import (
 	"context"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -99,7 +100,7 @@ type accountPrefetcher struct {
 	offered, dropped, late, warmed                                                        atomic.Uint64
 	partialOffered, partialDropped, partialStale, partialWarmed, partialKeys, tipFiltered atomic.Uint64
 	keys, durable, storage, nanos                                                         atomic.Uint64
-	programs, preloaded                                                                   atomic.Uint64
+	programs, preloaded, invoked                                                          atomic.Uint64
 }
 
 // accountPrefetchJob is a block's account references, copied from data
@@ -475,12 +476,12 @@ func (p *accountPrefetcher) warmJob(job accountPrefetchJob, whole bool) {
 	if len(job.tables) > 0 {
 		keys = append(keys[:len(keys):len(keys)], p.lookupTableKeys(ctx, job)...)
 	}
-	_, stats, err := getAccountsBatchSharedWithStats(ctx, p.src, job.slot, keys)
+	accts, stats, err := getAccountsBatchSharedWithStats(ctx, p.src, job.slot, keys)
 	if err != nil {
 		return
 	}
-	if p.db != nil && len(job.programs) > 0 {
-		p.preloadPrograms(ctx, job)
+	if p.db != nil {
+		p.preloadPrograms(ctx, job, keys, accts)
 	}
 	if !whole {
 		return
@@ -490,26 +491,38 @@ func (p *accountPrefetcher) warmJob(job accountPrefetchJob, whole bool) {
 	p.storage.Add(stats.IndexHits + stats.IndexMisses)
 	p.nanos.Add(uint64(time.Since(start).Nanoseconds()))
 	if n := p.warmed.Add(1); n%accountPrefetchLogEvery == 0 {
-		mlog.Log.Infof("account prefetch: %d blocks warmed, %d late, %d dropped of %d offered | per block %.0f keys, %.0f past the working set, %.0f to storage, %.2f ms | programs %.1f per block, %.2f preloaded | tip warming: %d batches warmed (%d keys), %d stale, %d dropped of %d offered, %d whole-block keys skipped",
+		mlog.Log.Infof("account prefetch: %d blocks warmed, %d late, %d dropped of %d offered | per block %.0f keys, %.0f past the working set, %.0f to storage, %.2f ms | programs %.1f per block (%.1f not top-level), %.2f preloaded | tip warming: %d batches warmed (%d keys), %d stale, %d dropped of %d offered, %d whole-block keys skipped",
 			n, p.late.Load(), p.dropped.Load(), p.offered.Load(),
 			float64(p.keys.Load())/float64(n), float64(p.durable.Load())/float64(n),
 			float64(p.storage.Load())/float64(n), float64(p.nanos.Load())/float64(n)/1e6,
-			float64(p.programs.Load())/float64(n), float64(p.preloaded.Load())/float64(n),
+			float64(p.programs.Load())/float64(n), float64(p.invoked.Load())/float64(n), float64(p.preloaded.Load())/float64(n),
 			p.partialWarmed.Load(), p.partialKeys.Load(), p.partialStale.Load(), p.partialDropped.Load(), p.partialOffered.Load(), p.tipFiltered.Load())
 	}
 }
 
-// preloadPrograms compiles the executables of the block's top-level programs
-// that the program cache does not already hold for their current source.
-func (p *accountPrefetcher) preloadPrograms(ctx context.Context, job accountPrefetchJob) {
+// preloadPrograms compiles the executables of the block's programs that the
+// program cache does not already hold for their current source: its top-level
+// programs, and the programs among the accounts it loads (keys, read as accts),
+// which is where every program a transaction invokes from another program must
+// be. Neither kind is known to be invoked, so a preload may be unused; it only
+// warms the cache.
+func (p *accountPrefetcher) preloadPrograms(ctx context.Context, job accountPrefetchJob, keys []solana.PublicKey, loaded []*accounts.Account) {
 	f := p.features.Load()
 	if f == nil {
 		return
 	}
-	accts, _, err := getAccountsBatchSharedWithStats(ctx, p.src, job.slot, job.programs)
-	if err != nil || len(accts) != len(job.programs) {
-		return
+	var accts []*accounts.Account
+	if len(job.programs) > 0 {
+		var err error
+		accts, _, err = getAccountsBatchSharedWithStats(ctx, p.src, job.slot, job.programs)
+		if err != nil || len(accts) != len(job.programs) {
+			return
+		}
 	}
+	invoked, invokedAccts := loadedPrograms(job.programs, keys, loaded)
+	p.invoked.Add(uint64(len(invoked)))
+	programs := append(job.programs[:len(job.programs):len(job.programs)], invoked...)
+	accts = append(accts, invokedAccts...)
 	readProgramData := func(key solana.PublicKey) *accounts.Account {
 		out, _, err := getAccountsBatchSharedWithStats(ctx, p.src, job.slot, []solana.PublicKey{key})
 		if err != nil || len(out) != 1 {
@@ -518,7 +531,7 @@ func (p *accountPrefetcher) preloadPrograms(ctx context.Context, job accountPref
 		return out[0]
 	}
 	for i, acct := range accts {
-		cacheKey, source, ok := sealevel.PreloadSource(job.programs[i], acct, job.slot, readProgramData)
+		cacheKey, source, ok := sealevel.PreloadSource(programs[i], acct, job.slot, readProgramData)
 		if !ok {
 			continue
 		}
@@ -527,6 +540,34 @@ func (p *accountPrefetcher) preloadPrograms(ctx context.Context, job accountPref
 			p.preloaded.Add(1)
 		}
 	}
+}
+
+// loadedPrograms returns the programs among the loaded accounts (keys, read
+// as loaded) that are not top-level programs, with their accounts.
+func loadedPrograms(top, keys []solana.PublicKey, loaded []*accounts.Account) ([]solana.PublicKey, []*accounts.Account) {
+	if len(loaded) != len(keys) {
+		return nil, nil
+	}
+	var programs []solana.PublicKey
+	var accts []*accounts.Account
+	for i, acct := range loaded {
+		if acct == nil || !acct.Executable || !preloadableLoader(acct.Owner) || slices.Contains(top, keys[i]) {
+			continue
+		}
+		programs = append(programs, keys[i])
+		accts = append(accts, acct)
+	}
+	return programs, accts
+}
+
+// preloadableLoader reports whether owner is a loader whose programs
+// sealevel.PreloadSource can resolve.
+func preloadableLoader(owner [32]byte) bool {
+	switch solana.PublicKey(owner) {
+	case addresses.BpfLoaderUpgradeableAddr, addresses.BpfLoader2Addr, addresses.BpfLoaderDeprecatedAddr:
+		return true
+	}
+	return false
 }
 
 // lookupTableKeys returns the addresses the block's lookups select from the
