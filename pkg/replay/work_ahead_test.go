@@ -649,8 +649,10 @@ func TestWorkAheadProgramPredictor(t *testing.T) {
 
 	saved := workAheadPredict
 	savedGain := workAheadMinGain
-	defer func() { workAheadPredict, workAheadMinGain = saved, savedGain }()
+	savedUnchanged := workAheadUnchanged
+	defer func() { workAheadPredict, workAheadMinGain, workAheadUnchanged = saved, savedGain, savedUnchanged }()
 	workAheadPredict = "program"
+	workAheadUnchanged = false // this test is about failure prediction only
 	workAheadMinGain = 0
 	if !w.predictFailureFor(1, 2) || w.predictFailureFor(2, 1) {
 		t.Fatal("the program predictor must flag the bot combination and not the plain swap")
@@ -962,9 +964,11 @@ func resetUnchangedStats() {
 // it wrote back with identical content counts as changed, because its commit
 // installs a new version. No write originals are needed.
 func TestWorkAheadUnchangedLearningVersionOnly(t *testing.T) {
-	saved, savedValue := workAheadUnchanged, workAheadValueCheck
-	defer func() { workAheadUnchanged, workAheadValueCheck = saved, savedValue }()
-	workAheadUnchanged, workAheadValueCheck = true, false
+	saved, savedValue, savedRole := workAheadUnchanged, workAheadValueCheck, workAheadUnchangedByRole
+	defer func() {
+		workAheadUnchanged, workAheadValueCheck, workAheadUnchangedByRole = saved, savedValue, savedRole
+	}()
+	workAheadUnchanged, workAheadValueCheck, workAheadUnchangedByRole = true, false, false
 	resetUnchangedStats()
 	program, payer, untouched, rewritten := testPk(0x81), testPk(0x82), testPk(0x83), testPk(0x84)
 	commit := func(touchUntouched bool) {
@@ -1001,9 +1005,11 @@ func TestWorkAheadUnchangedLearningVersionOnly(t *testing.T) {
 // one equal to its version before the write, is unchanged; the payer is skipped.
 // Overtaking needs every shared account predicted unchanged and the payer not shared.
 func TestWorkAheadUnchangedLearning(t *testing.T) {
-	saved, savedValue := workAheadUnchanged, workAheadValueCheck
-	defer func() { workAheadUnchanged, workAheadValueCheck = saved, savedValue }()
-	workAheadUnchanged, workAheadValueCheck = true, true
+	saved, savedValue, savedRole := workAheadUnchanged, workAheadValueCheck, workAheadUnchangedByRole
+	defer func() {
+		workAheadUnchanged, workAheadValueCheck, workAheadUnchangedByRole = saved, savedValue, savedRole
+	}()
+	workAheadUnchanged, workAheadValueCheck, workAheadUnchangedByRole = true, true, false
 	resetUnchangedStats()
 	program, payer, config, pool := testPk(0x71), testPk(0x72), testPk(0x73), testPk(0x74)
 	original := &accounts.Account{Key: config, Lamports: 5, Data: []byte{9}}
