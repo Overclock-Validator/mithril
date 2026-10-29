@@ -2,12 +2,19 @@ package replay
 
 import (
 	"encoding/csv"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
 
+	b "github.com/Overclock-Validator/mithril/pkg/block"
+	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/rewards"
+	"github.com/Overclock-Validator/mithril/pkg/rpcclient"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/require"
 )
@@ -70,6 +77,10 @@ func TestWriteEpochBoundaryCalculatedRewards(t *testing.T) {
 	require.Equal(t, uint64(1), artifact.Totals.CreditsOnlyCount)
 	require.Equal(t, uint64(10), artifact.Totals.TotalLamports)
 
+	info, err := os.Stat(csvPath)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0600), info.Mode().Perm())
+
 	file, err := os.Open(csvPath)
 	require.NoError(t, err)
 	defer file.Close()
@@ -82,4 +93,77 @@ func TestWriteEpochBoundaryCalculatedRewards(t *testing.T) {
 		{"reward", "Staking", "CktRuQ4VpYxVgLJYPGn9tD6xLdjvxRKqGZo4PMBVXsfS", "6QWeT6FpJrm8AF1btu6WH2k2Xhq6t5vbheKVfQavmeoZ", "7", "100", "42", "0"},
 		{"credits_update_only", "Staking", "cGfHiC6Kgg3FpFZvgwGcswsCRtp4aBP2fzuXRQPizuN", "6QWeT6FpJrm8AF1btu6WH2k2Xhq6t5vbheKVfQavmeoZ", "0", "200", "77", "1"},
 	}, rows)
+}
+
+func TestPrivateArtifactPublicationIsAtomic(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "artifact.json")
+	require.NoError(t, os.WriteFile(path, []byte("old"), 0o644))
+
+	file, err := openPrivateArtifact(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { discardPrivateArtifact(file) })
+	_, err = file.Write([]byte("new"))
+	require.NoError(t, err)
+
+	visible, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, "old", string(visible), "partial temp content became visible before publication")
+
+	require.NoError(t, publishPrivateArtifact(file, path))
+	visible, err = os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, "new", string(visible))
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+}
+
+func TestEpochVotingRewardArtifactRedactsRPCSecretsAndTightensMode(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.WriteString(w, "not-json")
+	}))
+	t.Cleanup(server.Close)
+
+	endpoint, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	endpoint.User = url.UserPassword("rpc-user", "RPC_PASSWORD")
+	endpoint.Path = "/private/RPC_PATH_SECRET"
+	endpoint.RawQuery = "api-key=RPC_QUERY_SECRET"
+
+	logBase := t.TempDir()
+	require.NoError(t, mlog.Initialize(mlog.LogConfig{Dir: logBase, ToStdout: false}, "reward-redaction-test"))
+	t.Cleanup(mlog.Shutdown)
+
+	const slot = uint64(777)
+	rewardsDir := filepath.Join(mlog.GetLogDir(), "rewards")
+	require.NoError(t, os.MkdirAll(rewardsDir, 0755))
+	artifactPath := filepath.Join(rewardsDir, "epoch_boundary_voting_rewards_slot_777.json")
+	require.NoError(t, os.WriteFile(artifactPath, []byte("old content"), 0644))
+	require.NoError(t, os.Chmod(artifactPath, 0644))
+
+	dbgOpts, err := NewDebugOptions(nil, nil, true)
+	require.NoError(t, err)
+	maybeDumpEpochVotingRewardDiff(
+		dbgOpts,
+		rpcclient.NewRpcClient(endpoint.String()),
+		&b.Block{},
+		9,
+		slot,
+		map[solana.PublicKey]*atomic.Uint64{},
+	)
+
+	contents, err := os.ReadFile(artifactPath)
+	require.NoError(t, err)
+	text := string(contents)
+	for _, secret := range []string{"rpc-user", "RPC_PASSWORD", "private", "RPC_PATH_SECRET", "RPC_QUERY_SECRET"} {
+		require.NotContains(t, text, secret)
+	}
+	require.Contains(t, text, endpoint.Scheme+"://"+endpoint.Host)
+	require.Contains(t, text, `"rpc_confirmed_error"`)
+
+	info, err := os.Stat(artifactPath)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0600), info.Mode().Perm())
 }

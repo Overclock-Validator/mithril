@@ -8,6 +8,7 @@ import (
 
 	gossipclient "github.com/Overclock-Validator/mithril/pkg/gossip"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/Overclock-Validator/mithril/pkg/statsd"
 	"github.com/Overclock-Validator/mithril/pkg/turbine"
 	"github.com/gagliardetto/solana-go"
 )
@@ -298,8 +299,35 @@ func (bs *BlockSource) rejectInvalidTurbineBlockState(slot uint64, blockID solan
 	}
 }
 
+type turbineReceiverMetricsPublisher struct {
+	previous statsd.TurbineReceiverSnapshot
+}
+
+func (p *turbineReceiverMetricsPublisher) publish(receiver *turbine.UDPReceiver, active bool) turbine.ReceiverStats {
+	current := receiver.Stats()
+	snapshot := statsd.TurbineReceiverSnapshot{
+		Packets:         current.Packets,
+		DataShreds:      current.DataShreds,
+		BlocksEmitted:   current.BlocksEmitted,
+		ParseErrors:     current.ParseErrors,
+		SignatureErrors: current.SignatureErrors,
+		MissingLeaders:  current.MissingLeaders,
+		AssemblyErrors:  current.AssemblyErrors,
+		ActiveSlots:     current.ActiveSlots,
+		LastPacketUnix:  current.LastPacketUnix,
+		LastDataSlot:    current.LastDataSlot,
+		LastBlockUnix:   current.LastBlockUnix,
+		LastBlockSlot:   current.LastBlockSlot,
+	}
+	statsd.SendTurbineReceiverMetrics(snapshot, p.previous, active)
+	p.previous = snapshot
+	return current
+}
+
 func (bs *BlockSource) runTurbineStream() {
 	defer bs.liveStreamWg.Done()
+	statsd.SetTurbineReceiverActive(false)
+	defer statsd.SetTurbineReceiverActive(false)
 
 	backoff := liveRetryBackoff
 	for {
@@ -345,6 +373,7 @@ func (bs *BlockSource) runTurbineStream() {
 		}
 
 		receiver := turbine.NewUDPReceiver(bs.turbineBindAddr)
+		metricsPublisher := &turbineReceiverMetricsPublisher{}
 		receiver.SetLeaderForSlot(bs.leaderForSlot)
 		receiver.SetShredVersion(bs.turbineShredVersion)
 		receiver.SetFirstShredSink(bs.alpenglowFirstShredSink)
@@ -431,6 +460,7 @@ func (bs *BlockSource) runTurbineStream() {
 		}
 
 		mlog.Log.Infof("Native turbine receiver listening on %s", bs.turbineBindAddr)
+		metricsPublisher.publish(receiver, true)
 		bs.liveStreamConnected.Store(true)
 		bs.liveLastRecvUnix.Store(time.Now().Unix())
 		backoff = liveRetryBackoff
@@ -487,6 +517,7 @@ func (bs *BlockSource) runTurbineStream() {
 					statsTicker.Stop()
 					cancelStream()
 					<-streamDone
+					metricsPublisher.publish(receiver, false)
 					return
 				}
 			case err, ok := <-receiver.Errors():
@@ -502,7 +533,7 @@ func (bs *BlockSource) runTurbineStream() {
 					}
 				}
 			case <-statsTicker.C:
-				stats := receiver.Stats()
+				stats := metricsPublisher.publish(receiver, true)
 				lastPacketAge := "never"
 				if stats.LastPacketUnix != 0 {
 					lastPacketAge = time.Since(time.Unix(stats.LastPacketUnix, 0)).Round(time.Second).String()
@@ -544,6 +575,7 @@ func (bs *BlockSource) runTurbineStream() {
 				statsTicker.Stop()
 				cancelStream()
 				<-streamDone
+				metricsPublisher.publish(receiver, false)
 				return
 			}
 		}
@@ -555,6 +587,7 @@ func (bs *BlockSource) runTurbineStream() {
 				streamErr = err
 			}
 		}
+		metricsPublisher.publish(receiver, false)
 		if streamErr == nil && bs.stopped.Load() {
 			return
 		}

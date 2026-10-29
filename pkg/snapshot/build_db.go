@@ -308,6 +308,9 @@ func BuildAccountsDbPaths(
 	accountsPaths []string,
 	dp *progress.DualProgress,
 ) (*accountsdb.AccountsDb, *SnapshotManifest, error) {
+	finishBootstrap := statsd.BeginSnapshotBootstrap()
+	defer finishBootstrap()
+
 	if err := accountsdb.ValidateAccountsPaths(accountsPaths); err != nil {
 		return nil, nil, err
 	}

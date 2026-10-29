@@ -35,19 +35,42 @@
     then "go_1_${builtins.elemAt goVersion 1}"
     else "go_${builtins.elemAt goVersion 0}_${builtins.elemAt goVersion 1}";
   goFor = pkgs:
-    if builtins.hasAttr goAttr pkgs
-    then pkgs.${goAttr}
-    else pkgs.go;
+    assert versionString == "1.27.3";
+    (
+      if builtins.hasAttr goAttr pkgs
+      then pkgs.${goAttr}
+      else pkgs.go_1_26
+    ).overrideAttrs (old: {
+      version = "1.27.3";
+      src = pkgs.fetchurl {
+        url = "https://go.dev/dl/go1.27.3.src.tar.gz";
+        hash = "sha256-bndJA1zzYPBrJXXRYup535/ajvZxiJ5cN1+OUHd/Jrs=";
+      };
+      # The pinned nixpkgs has a compatible bootstrap but an older vendor patch.
+      patches = builtins.map
+        (patch:
+          if nixpkgs.lib.hasSuffix "go_no_vendor_checks-1.26.patch" (toString patch)
+          then pkgs.fetchurl {
+            url = "https://raw.githubusercontent.com/NixOS/nixpkgs/67a70befab1966b026701e8e94cf19b1543075c5/pkgs/development/compilers/go/go_no_vendor_checks-1.27.patch";
+            hash = "sha256-aTpc6kAX9bAyMMAHqzldcb2EEseCpke7QlJuQ1Bk6jc=";
+          }
+          else patch)
+        old.patches;
+    });
 in {
   packages = forAllSystems (
     system: let
       pkgs = import nixpkgs {inherit system;};
-      mithril = pkgs.buildGoModule {
+      go = goFor pkgs;
+      buildGoModule = pkgs.buildGoModule.override {inherit go;};
+      mithril = buildGoModule {
         pname = "mithril";
         version = "0.0.0";
         src = self;
-        subPackages = ["cmd/mithril"];
-        vendorHash = "sha256-BVgVVvRAllEfb8D6Mh6NSaeLLOx6zeXwY4QyCwP0veo=";
+        subPackages = [
+          "cmd/mithril"
+        ];
+        vendorHash = "sha256-M8n72lWRa1QwY5virSIGQxa1QGSYogYfD0F3lCsuclk=";
         nativeBuildInputs = [pkgs.pkg-config];
         buildInputs = [pkgs.zstd];
         env = {
