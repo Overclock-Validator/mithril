@@ -35,17 +35,27 @@
     then "go_1_${builtins.elemAt goVersion 1}"
     else "go_${builtins.elemAt goVersion 0}_${builtins.elemAt goVersion 1}";
   goFor = pkgs:
-    assert versionString == "1.27.2";
+    assert versionString == "1.27.3";
     (
       if builtins.hasAttr goAttr pkgs
       then pkgs.${goAttr}
-      else pkgs.go
-    ).overrideAttrs (_: {
-      version = "1.27.2";
+      else pkgs.go_1_26
+    ).overrideAttrs (old: {
+      version = "1.27.3";
       src = pkgs.fetchurl {
-        url = "https://go.dev/dl/go1.27.2.src.tar.gz";
-        hash = "sha256-A0ldorpkiU1A9cSZLklFT6eLUGkGBP+Stq//UIG3bmI=";
+        url = "https://go.dev/dl/go1.27.3.src.tar.gz";
+        hash = "sha256-bndJA1zzYPBrJXXRYup535/ajvZxiJ5cN1+OUHd/Jrs=";
       };
+      # The pinned nixpkgs has a compatible bootstrap but an older vendor patch.
+      patches = builtins.map
+        (patch:
+          if nixpkgs.lib.hasSuffix "go_no_vendor_checks-1.26.patch" (toString patch)
+          then pkgs.fetchurl {
+            url = "https://raw.githubusercontent.com/NixOS/nixpkgs/67a70befab1966b026701e8e94cf19b1543075c5/pkgs/development/compilers/go/go_no_vendor_checks-1.27.patch";
+            hash = "sha256-aTpc6kAX9bAyMMAHqzldcb2EEseCpke7QlJuQ1Bk6jc=";
+          }
+          else patch)
+        old.patches;
     });
 in {
   packages = forAllSystems (
