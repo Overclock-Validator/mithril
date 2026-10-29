@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
+	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/cockroachdb/pebble/v2"
 )
 
@@ -181,6 +182,11 @@ func (db *AccountsDb) CommitBatch(
 	}
 	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i][:], keys[j][:]) < 0 })
 
+	finish := db.beginAccountChange()
+	var committedAccounts []*accounts.Account
+	committed := false
+	defer func() { finish(committedAccounts, throughSlot, committed, false) }()
+
 	clock.step(&timings.Dedupe)
 	// (4a) Undo pointers need only the sorted keys, and the index does not
 	// change until step 7, so capture them while the segment is written.
@@ -209,7 +215,6 @@ func (db *AccountsDb) CommitBatch(
 	dataName := filepath.Join(db.AcctsDir, SegmentDataName(throughSlot, fileId))
 	// Until the commit succeeds, a failure may leave a data file or manifest
 	// that compaction's inventory does not know about: rebuild it then.
-	committed := false
 	defer func() {
 		if !committed {
 			db.invalidateCompactionInventoryLocked()
@@ -227,7 +232,10 @@ func (db *AccountsDb) CommitBatch(
 	segErr := func() error {
 		for _, k := range keys {
 			v := union[k]
-			records = append(records, ManifestRecord{Pubkey: k, Offset: dataLen, OwnerSlot: v.ownerSlot})
+			records = append(records, ManifestRecord{
+				Pubkey: k, Offset: dataLen, OwnerSlot: v.ownerSlot,
+				Vote: v.acct.Lamports > 0 && v.acct.Owner == addresses.VoteProgramAddr,
+			})
 			ava := AppendVecAccount{
 				DataLen:    uint64(len(v.acct.Data)),
 				Pubkey:     v.acct.Key,
@@ -343,6 +351,9 @@ func (db *AccountsDb) CommitBatch(
 	clock.step(&timings.IndexCommit)
 	db.refreshReadCacheEntries(live)
 
+	// Advance the watermark before removing pendingFold so rooted readers keep
+	// waiting until the matching bank state is published.
+	db.durableThrough.Store(throughSlot)
 	db.readCacheEpochMu.LockAs("fold_publication")
 	db.pendingFold = nil
 	db.readCacheEpochMu.Unlock()
@@ -350,8 +361,7 @@ func (db *AccountsDb) CommitBatch(
 
 	// (8) Publish.
 	db.lastBatchSeq = batchSeq
-	db.durableThrough.Store(throughSlot)
-	committed = true
+	committedAccounts, committed = live, true
 	clock.step(&timings.CacheRefresh)
 
 	return BatchCommitResult{
@@ -378,6 +388,11 @@ func (db *AccountsDb) applyManifestToIndex(m *SegmentManifest) error {
 		entry.Marshal(&idxBuf)
 		if err := batch.Set(r.Pubkey[:], idxBuf[:], nil); err != nil {
 			return err
+		}
+		if r.Vote {
+			if err := batch.Set(voteIndexKey(r.Pubkey), nil, nil); err != nil {
+				return err
+			}
 		}
 	}
 	if err := batch.Set(metaKeyLastBatch, encodeFoldMeta(foldMeta{

@@ -58,7 +58,7 @@ func TestSnapshotWorkerParseFailurePropagatesAfterDrain(t *testing.T) {
 		manifest,
 		nil,
 		testAppendVecDirs(t, accountsDir),
-		&stakeIndexCollector{},
+		&snapshotAccountCollector{},
 	)
 	require.NoError(t, err)
 	t.Cleanup(pools.Release)
@@ -136,7 +136,7 @@ func TestSnapshotWorkersSupportArchiveSizedAppendVecs(t *testing.T) {
 			closeShardLogger := sync.OnceFunc(func() { require.NoError(t, shardLogger.Close(context.Background())) })
 			t.Cleanup(closeShardLogger)
 			wg := &sync.WaitGroup{}
-			stakes := &stakeIndexCollector{}
+			stakes := &snapshotAccountCollector{}
 			dirs := testAppendVecDirs(t, accountsDir)
 			pools, err := initWorkerPools(wg, shardLogger, tt.full, tt.incremental, dirs, stakes)
 			require.NoError(t, err)
@@ -157,8 +157,8 @@ func TestSnapshotWorkersSupportArchiveSizedAppendVecs(t *testing.T) {
 			}
 			require.Equal(t, tt.wantEntries*(32+vlen), logged)
 			require.Equal(t, fileID, dirs.largest.Load())
-			require.Len(t, stakes.entries, tt.wantEntries)
-			for i, entry := range stakes.entries {
+			require.Len(t, stakes.stakeEntries, tt.wantEntries)
+			for i, entry := range stakes.stakeEntries {
 				require.Equal(t, keys[i], entry.Pubkey)
 				require.Equal(t, fileID, entry.FileId)
 				require.Equal(t, uint64(i)*oneAccountSize, entry.Offset)

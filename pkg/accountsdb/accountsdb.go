@@ -34,11 +34,20 @@ type AccountsDb struct {
 	AcctsDirs        []string // every accounts directory, primary first; see accounts_dirs.go
 	LargestFileId    atomic.Uint64
 	VoteAcctCache    *WeightedCache[solana.PublicKey, *accounts.Account]
+	voteIndexMu      sync.Mutex
 	CommonAcctsCache *commonAccountCache
 	ProgramCache     *WeightedCache[solana.PublicKey, *ProgramCacheEntry]
 	// Otter permits concurrent ordinary operations but not Clear. Rewind takes
 	// the write side; hot-path program cache operations take the read side.
 	programCacheMu sync.RWMutex
+
+	// Coherent, process-local derived views of committed account state.
+	accountStateMu        sync.Mutex
+	accountStateVersion   atomic.Uint64
+	accountCommittedSlot  atomic.Uint64
+	accountStateUncertain atomic.Bool
+	accountObserversMu    sync.Mutex
+	accountObservers      map[AccountStateObserver]struct{}
 
 	// readCacheEpochMu protects the cache epoch and the pending fold view.
 	// CommitBatch publishes its immutable newest-wins union here before the
@@ -121,6 +130,11 @@ func (accountsDb *AccountsDb) StoreQueueLen() int {
 	accountsDb.inProgressStoreRequestsMu.Lock()
 	defer accountsDb.inProgressStoreRequestsMu.Unlock()
 	return accountsDb.inProgressStoreRequests.Len()
+}
+
+// DurableThrough returns the highest slot whose fold is fully committed.
+func (accountsDb *AccountsDb) DurableThrough() uint64 {
+	return accountsDb.durableThrough.Load()
 }
 
 // silentLogger suppresses informational messages while retaining errors and fatal failures.
@@ -739,11 +753,15 @@ func (accountsDb *AccountsDb) storeAccountsSync(accts []*accounts.Account, slot 
 	accountsDb.refreshReadCaches(accts)
 	accountsDb.appendVecReadMu.LockAs("legacy_store")
 	defer accountsDb.appendVecReadMu.Unlock()
+	finish := accountsDb.beginAccountChange()
+	success := false
+	defer func() { finish(accts, slot, success, false) }()
 	if StoreAccountsWorkers == 1 {
 		accountsDb.storeAccountsInternal(accts, slot)
 	} else {
 		accountsDb.parallelStoreAccounts(StoreAccountsWorkers, accts, slot)
 	}
+	success = true
 }
 
 // refreshReadCaches keeps already-hot common entries coherent after a store,
