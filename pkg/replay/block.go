@@ -63,6 +63,10 @@ type epochRewardReadPublisher interface {
 	ResetEpochRewardView()
 }
 
+type rpcHealthInvalidator interface {
+	InvalidateHealth()
+}
+
 // BlockFetchOpts contains options for parallel block fetching
 type BlockFetchOpts struct {
 	MaxRPS          int    // Rate limit (requests per second), 0 = use default
@@ -1855,6 +1859,11 @@ func ReplayBlocks(
 	onCancelWriteState OnCancelWriteState, // callback to write state immediately on cancellation (can be nil)
 ) *ReplayResult {
 	result := &ReplayResult{}
+	health, _ := rpcServer.(rpcHealthInvalidator)
+	if health != nil {
+		health.InvalidateHealth()
+		defer health.InvalidateHealth()
+	}
 	// Node startup finishes any rewind and reconciles durable state before
 	// calling ReplayBlocks, so the first block's stake scan can start now and
 	// overlap block-source startup and the wait for the first block.
@@ -2668,6 +2677,10 @@ func ReplayBlocks(
 	}
 
 	blockStream := blockstream.NewBlockSource(opts)
+	if health, ok := rpcServer.(interface{ SetHealthSlotSource(func() (uint64, bool)) }); ok && isLive {
+		health.SetHealthSlotSource(blockStream.HealthSlot)
+		defer health.SetHealthSlotSource(func() (uint64, bool) { return 0, false })
+	}
 	// Every state save records the repair peers that served this run well, so
 	// the next start can repair before gossip rediscovers peers.
 	state.SetRepairPeerHintsProvider(func() []state.RepairPeerHint {
@@ -2778,7 +2791,7 @@ func ReplayBlocks(
 			mlog.Log.Warnf("%v — re-serving the skipped suffix from slot %d; executed bank remains at slot %d", sw, sw.Slot, currentExecutedAnchorSlot())
 			return true
 		}
-		rs, parentBankSysvars, fallbackReason := tryInLoopUnwind(sw, unrootedTailState, mithrilState, epochSchedule, currentEpoch, partitionedRewardsInfo)
+		rs, parentBankSysvars, fallbackReason := tryInLoopUnwind(sw, unrootedTailState, mithrilState, epochSchedule, currentEpoch, partitionedRewardsInfo, health)
 		if rs == nil {
 			windowSwitchFallback++
 			switchFallbackReasons[fallbackReason]++
@@ -4005,6 +4018,11 @@ func ReplayBlocks(
 
 	if rewardReadPublisher != nil {
 		rewardReadPublisher.ResetEpochRewardView()
+	}
+
+	// Replay has stopped; cleanup may still wait for folds and worker shutdown.
+	if health != nil {
+		health.InvalidateHealth()
 	}
 
 	// Check if block source stalled (this provides explicit error info)

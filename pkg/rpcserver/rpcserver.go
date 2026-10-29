@@ -36,7 +36,10 @@ type rpcMethods interface {
 	GetEpochInfo(context.Context, jsonrpc.RawParams) (GetEpochInfoResp, error)
 	GetGenesisHash(context.Context, jsonrpc.RawParams) (string, error)
 	GetInflationReward(context.Context, jsonrpc.RawParams) ([]*InflationRewardResp, error)
+	GetHealth(context.Context, jsonrpc.RawParams) (string, error)
+	GetIdentity(context.Context, jsonrpc.RawParams) (GetIdentityResp, error)
 	GetLatestBlockhash(context.Context, jsonrpc.RawParams) (GetLatestBlockhashResp, error)
+	GetVersion(context.Context, jsonrpc.RawParams) (GetVersionResp, error)
 	SendTransaction(context.Context, jsonrpc.RawParams) (string, error)
 	SimulateTransaction(context.Context, jsonrpc.RawParams) (SimulateTransactionResp, error)
 }
@@ -53,8 +56,13 @@ type RpcServer struct {
 	epochSchedule *sealevel.SysvarEpochSchedule
 	slotCtx       *sealevel.SlotCtx
 	slotCtxMu     sync.RWMutex
+	healthSlot    func() (uint64, bool)
+	healthReady   bool
 	genesisHash   string
 	epochRewards  *epochrewards.Store
+	identity      string
+
+	identitySource func() string
 
 	leaderTPUCacheMu         sync.RWMutex
 	leaderTPUByIdentity      map[solana.PublicKey]tpuEndpoint
@@ -78,7 +86,10 @@ var supportedRPCMethods = map[string]struct{}{
 	"getEpochInfo":        {},
 	"getGenesisHash":      {},
 	"getInflationReward":  {},
+	"getHealth":           {},
+	"getIdentity":         {},
 	"getLatestBlockhash":  {},
+	"getVersion":          {},
 	"sendTransaction":     {},
 	"simulateTransaction": {},
 }
@@ -251,6 +262,13 @@ func fetchAndUnmarshalEpochScheduleSysvar(acctsDb *accountsdb.AccountsDb) *seale
 func (rpcServer *RpcServer) SetSlotCtx(slotCtx *sealevel.SlotCtx) {
 	rpcServer.slotCtxMu.Lock()
 	rpcServer.slotCtx = slotCtx
+	rpcServer.healthReady = slotCtx != nil
+	rpcServer.slotCtxMu.Unlock()
+}
+
+func (rpcServer *RpcServer) SetIdentity(identity string) {
+	rpcServer.slotCtxMu.Lock()
+	rpcServer.identity = identity
 	rpcServer.slotCtxMu.Unlock()
 }
 
