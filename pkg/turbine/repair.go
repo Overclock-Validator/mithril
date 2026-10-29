@@ -197,6 +197,11 @@ type RepairStats struct {
 	Errors      uint64
 	Outstanding int
 	Peers       int
+	// PeerInflight includes sends still signing, before request registration.
+	// A transient excess over Outstanding is normal; a persistent excess can
+	// explain admission stalls even when no registered requests remain.
+	PeerInflight int
+	PerPeerCap   int
 	// Peers that answered a request within repairResponderWindow — the
 	// number that separates "cluster serves this range" from "only N nodes
 	// still retain it".
@@ -226,7 +231,7 @@ type repairRequestKey struct {
 	// different peers — head-slot fanout AND fast-retry (a stale attempt
 	// spawns the next one). Monotonic per shred; keyed so each attempt has
 	// its own outstanding entry and nonce.
-	attempt uint8
+	attempt uint64
 }
 
 // shredKey identifies a missing shred independent of which attempt is asking
@@ -247,7 +252,7 @@ func (k repairRequestKey) shred() shredKey {
 // decision is O(1) instead of an O(outstanding) scan per missing shred.
 type shredInflight struct {
 	concurrent  uint8
-	nextAttempt uint8
+	nextAttempt uint64
 	lastSentAt  time.Time
 }
 
@@ -401,7 +406,7 @@ func (c *repairClient) run(ctx context.Context, conn *net.UDPConn, assembler *Sl
 
 // Keep periodic scans for retries/freshness. Coalesce urgent hints and bound
 // scan frequency; all sends still use the existing token bucket, admission,
-// retry, fanout and peer budgets. The loop remains the sole sender.
+// retry, fanout and peer budgets, shared with response-driven followup sends.
 func runRepairSchedule(ctx context.Context, wake <-chan struct{}, interval, minSpacing time.Duration, scan func()) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -804,19 +809,20 @@ func (c *repairClient) cancelSlotRequests(slot uint64) {
 }
 
 // cancelShredRequestsLocked retires the handful of concurrent attempts for a
-// single shred in O(attempts), not O(all outstanding). It must be called with
-// c.mu held.
+// single shred. It must be called with c.mu held.
+// ponytail: scans all issued attempts in this generation; track active IDs
+// separately only if long-lived generations make cancellation costly.
 func (c *repairClient) cancelShredRequestsLocked(sk shredKey) {
 	inf := c.inflight[sk]
 	if inf == nil {
 		return
 	}
-	for attempt := 0; attempt < int(inf.nextAttempt); attempt++ {
+	for attempt := uint64(0); attempt < inf.nextAttempt; attempt++ {
 		key := repairRequestKey{
 			kind:    sk.kind,
 			slot:    sk.slot,
 			index:   sk.index,
-			attempt: uint8(attempt),
+			attempt: attempt,
 		}
 		req, ok := c.outstanding[key]
 		if !ok {
@@ -883,7 +889,7 @@ func (c *repairClient) sendShredAttempt(conn *net.UDPConn, peers []gossip.Repair
 		c.mu.Unlock()
 		return false
 	}
-	attempt := uint8(0)
+	attempt := uint64(0)
 	if inf := c.inflight[sk]; inf != nil {
 		attempt = inf.nextAttempt
 	}
@@ -893,16 +899,19 @@ func (c *repairClient) sendShredAttempt(conn *net.UDPConn, peers []gossip.Repair
 	// microseconds; at tens of thousands of req/s, holding the lock across it
 	// serialized every send against the response-processing path
 	// (matchShredResponse needs the same lock) and could stall the UDP
-	// receive loop into kernel drops. The reserve is enough for coherence: a
-	// response for this attempt cannot arrive until after we WriteToUDP below,
-	// which is strictly after we register outstanding/byResponse.
+	// receive loop into kernel drops. Revalidate the reservation after signing:
+	// broadcast admission or reset may cancel it meanwhile. Register the request
+	// before the UDP write so this attempt's response can find it.
 	c.addInflightLocked(sk, now)
+	reservation := c.inflight[sk]
 	c.notePeerSentLocked(addrKey)
 	c.mu.Unlock()
 
 	undoReserve := func() {
 		c.mu.Lock()
-		c.decInflightLocked(sk)
+		if c.inflight[sk] == reservation {
+			c.decInflightLocked(sk)
+		}
 		c.notePeerSendAbortedLocked(addrKey)
 		c.mu.Unlock()
 	}
@@ -926,6 +935,14 @@ func (c *repairClient) sendShredAttempt(conn *net.UDPConn, peers []gossip.Repair
 
 	responseKey := repairResponseKey{addr: addrKey, nonce: nonce}
 	c.mu.Lock()
+	// Broadcast/FEC admission or a slot reset may cancel this generation while
+	// signing. Do not resurrect its attempt key and overwrite a newer request.
+	// Cancellation only releases registered peer charges.
+	if c.inflight[sk] != reservation {
+		c.notePeerSendAbortedLocked(addrKey)
+		c.mu.Unlock()
+		return false
+	}
 	c.outstanding[key] = outstandingRepairRequest{
 		key:       key,
 		nonce:     nonce,
@@ -943,18 +960,21 @@ func (c *repairClient) sendShredAttempt(conn *net.UDPConn, peers []gossip.Repair
 		traceBinding = entryRepairTrace{Peer: peer.Addr.String(), Nonce: nonce}
 	}
 	if _, err := conn.WriteToUDP(packet, peer.Addr); err != nil {
-		traceRepairSend(slot, index, kind, attempt, traceStart, false, traceBinding)
+		traceRepairSend(slot, index, kind, uint8(attempt), traceStart, false, traceBinding)
 		c.mu.Lock()
-		delete(c.outstanding, key)
-		delete(c.byResponse, responseKey)
-		c.decInflightLocked(sk)
-		c.notePeerSendAbortedLocked(addrKey)
+		// Cancellation/expiry may already have released the registered charge.
+		if req, ok := c.outstanding[key]; ok && c.inflight[sk] == reservation && req.nonce == nonce && req.addr == addrKey {
+			delete(c.outstanding, key)
+			delete(c.byResponse, responseKey)
+			c.decInflightLocked(sk)
+			c.notePeerSendAbortedLocked(addrKey)
+		}
 		c.mu.Unlock()
 		c.errors.Add(1)
 		return false
 	}
 
-	traceRepairSend(slot, index, kind, attempt, traceStart, true, traceBinding)
+	traceRepairSend(slot, index, kind, uint8(attempt), traceStart, true, traceBinding)
 	c.requests.Add(1)
 	return true
 }
@@ -1503,12 +1523,15 @@ func (c *repairClient) stats() RepairStats {
 	c.mu.Lock()
 	outstanding := len(c.outstanding)
 	responding := 0
+	peerInflight := 0
 	for _, rec := range c.perPeer {
+		peerInflight += rec.inflight
 		if rec.lastMatched.After(cutoff) {
 			responding++
 		}
 	}
 	avgResponseMillis := int64(c.respLatencyEWMA * 1000)
+	perPeerCap := c.adaptivePerPeerCapLocked(peers)
 	c.mu.Unlock()
 	return RepairStats{
 		Requests:          c.requests.Load(),
@@ -1519,6 +1542,8 @@ func (c *repairClient) stats() RepairStats {
 		Errors:            c.errors.Load(),
 		Outstanding:       outstanding,
 		Peers:             peers,
+		PeerInflight:      peerInflight,
+		PerPeerCap:        perPeerCap,
 		RespondingPeers:   responding,
 		LateResponses:     c.lateResponses.Load(),
 		TimeoutMillis:     int64(time.Duration(c.timeoutNanos.Load()) / time.Millisecond),

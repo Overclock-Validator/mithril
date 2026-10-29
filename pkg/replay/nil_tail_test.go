@@ -64,7 +64,7 @@ func TestProcessBlockTypedNilTailPersistsClassicBank(t *testing.T) {
 	db, err := accountsdb.OpenDb(dir)
 	require.NoError(t, err)
 	db.InitCaches()
-	t.Cleanup(db.CloseDb)
+	t.Cleanup(func() { require.NoError(t, db.CloseDb()) })
 	stored := make(chan struct{})
 	require.NoError(t, db.StoreAccounts(env.durable.AllAccounts(), lifecycleParentSlot, func() { close(stored) }))
 	<-stored
