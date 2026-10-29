@@ -382,7 +382,7 @@ func (bs *BlockSource) runTurbineStream() {
 					continue
 				}
 			}
-			if err := receiver.SetRepairPeerSource(gossipClient.Identity(), gossipClient.RepairPeers); err == nil {
+			if err := receiver.SetRepairPeerSource(gossipClient.Identity(), bs.repairPeerSource(gossipClient.RepairPeers)); err == nil {
 				receiver.SetRepairRequestRate(bs.repairMaxRequestsPerSecond)
 			} else {
 				cancelStream()

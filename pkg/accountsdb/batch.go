@@ -8,7 +8,6 @@ import (
 	"io"
 	"math"
 	"os"
-	"path/filepath"
 	"runtime"
 	"sort"
 	"sync"
@@ -17,7 +16,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/gagliardetto/solana-go"
 	"golang.org/x/sync/errgroup"
 )
@@ -70,6 +69,7 @@ type BatchReadStats struct {
 	InProgressHits    uint64
 	PendingFoldHits   uint64
 	CacheHits         uint64
+	NegativeCacheHits uint64
 	IndexHits         uint64
 	IndexMisses       uint64
 	UniqueAppendVecs  uint64
@@ -180,6 +180,12 @@ func (db *AccountsDb) getAccountsBatchWithStats(ctx context.Context, slot uint64
 			out[i] = batchAccountOrPlaceholder(pk, acct)
 			continue
 		}
+		if db.batchAccountAbsentLocked(pk) {
+			stats.NegativeCacheHits++
+			stats.PlaceholderObjects++
+			out[i] = missingAccount(pk)
+			continue
+		}
 		cold = append(cold, i)
 	}
 	stats.CacheLookupNanoseconds = uint64(time.Since(phaseStart).Nanoseconds())
@@ -253,7 +259,7 @@ func (db *AccountsDb) getAccountsBatchWithStats(ctx context.Context, slot uint64
 	err = runBatchWorkers(ctx, len(chunks), func(job int) error {
 		chunk := chunks[job]
 		jobStats := &chunkStats[job]
-		path := filepath.Join(db.AcctsDir, fmt.Sprintf("%d.%d", chunk.id.slot, chunk.id.fileID))
+		path := db.appendVecPath(chunk.id.slot, chunk.id.fileID)
 		file, openErr := os.Open(path)
 		if openErr != nil {
 			jobStats.openFailures++
@@ -299,6 +305,7 @@ func (db *AccountsDb) getAccountsBatchWithStats(ctx context.Context, slot uint64
 	db.appendVecReadMu.RUnlock()
 	appendVecPinned = false
 	phaseStart = time.Now()
+	db.cacheBatchAbsences(pks, cold, found, admitCommon, cacheEpoch)
 	publicationJobs := cold[:0]
 	for _, idx := range cold {
 		acct := decodedForCache[idx]
@@ -360,7 +367,7 @@ func resolveBatchAccountLocations(
 		pks,
 		cold,
 		out,
-		batchIndexIteratorWorkers(len(cold)),
+		limitBatchWorkers(ctx, batchIndexIteratorWorkers(len(cold))),
 	)
 }
 
@@ -526,15 +533,31 @@ func missingAccount(pubkey solana.PublicKey) *accounts.Account {
 	return &accounts.Account{Key: pubkey, Owner: systemProgramAddr, RentEpoch: math.MaxUint64}
 }
 
+type batchWorkerLimitKey struct{}
+
+// WithBatchWorkerLimit caps the goroutines each batch read made with ctx may
+// run at once, so a background reader (account prefetch) cannot crowd out the
+// transaction loop. A limit of zero or less leaves the defaults.
+func WithBatchWorkerLimit(ctx context.Context, n int) context.Context {
+	return context.WithValue(ctx, batchWorkerLimitKey{}, n)
+}
+
+func limitBatchWorkers(ctx context.Context, workers int) int {
+	if n, ok := ctx.Value(batchWorkerLimitKey{}).(int); ok && n > 0 {
+		return min(workers, n)
+	}
+	return workers
+}
+
 // runBatchWorkers executes count indexed jobs using at most 2*GOMAXPROCS
-// goroutines. The first error stops new work and is returned after active jobs
-// drain. This bounds both goroutine count and scheduler traffic independently
-// of block size.
+// goroutines (fewer under WithBatchWorkerLimit). The first error stops new work
+// and is returned after active jobs drain. This bounds both goroutine count and
+// scheduler traffic independently of block size.
 func runBatchWorkers(ctx context.Context, count int, work func(int) error) error {
 	if count == 0 {
 		return nil
 	}
-	workerCount := min(count, max(1, runtime.GOMAXPROCS(0)*2))
+	workerCount := limitBatchWorkers(ctx, min(count, max(1, runtime.GOMAXPROCS(0)*2)))
 	var next atomic.Uint64
 	var stopped atomic.Bool
 	var firstErr error
