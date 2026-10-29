@@ -20,7 +20,9 @@ import (
 type ExecutionCtx struct {
 	// SkipTimingMetrics disables instruction-dispatch timing collection for
 	// leader execution; it never changes instruction validation or CU charging.
-	SkipTimingMetrics        bool
+	SkipTimingMetrics bool
+	// SkipStableLogs avoids formatting messages when the caller discards logs.
+	SkipStableLogs           bool
 	Log                      Logger
 	Accounts                 accounts.Accounts
 	TransactionContext       *TransactionCtx
@@ -38,6 +40,11 @@ type ExecutionCtx struct {
 	RecordInnerInstructions bool
 	currentTopLevelInstrIdx uint8
 	InnerInstrs             []RecordedInnerInstr
+	// InnerInstructionsCaptureError marks an unavailable optional capture,
+	// independently of the instruction's execution result.
+	InnerInstructionsCaptureError error
+	boundedInnerInstructions      bool
+	innerInstructionBytes         int
 
 	serializedAccountMetadataStack [][]serializedAcctMetadata
 }
@@ -298,24 +305,15 @@ func (execCtx *ExecutionCtx) ProcessInstruction(instrData []byte, instructionAcc
 	// an active top-level frame and recording is enabled. Stack height
 	// before Push reflects parent depth: 0 = top-level, >=1 = CPI.
 	if execCtx.RecordInnerInstructions && len(programIndices) > 0 && execCtx.StackHeight() >= 1 {
-		acctIdxs := make([]uint8, 0, len(instructionAccts))
-		for _, ia := range instructionAccts {
-			acctIdxs = append(acctIdxs, uint8(ia.IndexInTransaction))
-		}
-		dataCopy := make([]byte, len(instrData))
-		copy(dataCopy, instrData)
-		execCtx.InnerInstrs = append(execCtx.InnerInstrs, RecordedInnerInstr{
-			TopLevelIdx:    execCtx.currentTopLevelInstrIdx,
-			StackHeight:    uint8(execCtx.StackHeight() + 1),
-			ProgramIdIndex: uint8(programIndices[0]),
-			Accounts:       acctIdxs,
-			Data:           dataCopy,
-		})
+		execCtx.recordInnerInstruction(instrData, instructionAccts, uint8(programIndices[0]))
 	}
 
 	start = metrics.StartTiming(!execCtx.SkipTimingMetrics)
 	err = execCtx.Push()
 	if err != nil {
+		// Failed pushes have different trace-retention semantics across failure
+		// paths. Do not publish an attempted invocation as complete metadata.
+		execCtx.invalidateInnerInstructionCapture(err)
 		return err
 	}
 	metrics.GlobalBlockReplay.IxPush.AddTimingSince(start)
@@ -380,8 +378,25 @@ func (execCtx *ExecutionCtx) ExecuteInstruction() error {
 	}
 	metrics.GlobalBlockReplay.ExecIxResolveNativeProgram.AddTimingSince(start)
 
+	var programKey solana.PublicKey
+	recordLogs := execCtx.Log != nil && !execCtx.SkipStableLogs
+	if recordLogs {
+		var keyErr error
+		programKey, keyErr = instrCtx.LastProgramKey(txCtx)
+		recordLogs = keyErr == nil && !isPrecompile(programKey) && programKey != a.Secp256r1PrecompileAddr
+		if recordLogs {
+			execCtx.Log.Log(fmt.Sprintf("Program %s invoke [%d]", programKey, execCtx.StackHeight()))
+		}
+	}
 	start = metrics.StartTiming(!execCtx.SkipTimingMetrics)
 	err = nativeProgramFn(execCtx)
+	if recordLogs {
+		if err == nil {
+			execCtx.Log.Log(fmt.Sprintf("Program %s success", programKey))
+		} else {
+			execCtx.Log.Log(fmt.Sprintf("Program %s failed: %s", programKey, instructionErrorLogMessage(err)))
+		}
+	}
 	switch nativeProgramStr {
 	case a.SystemProgramAddrStr:
 		metrics.GlobalBlockReplay.ExecIxNativeProgramSystem.AddTimingSince(start)

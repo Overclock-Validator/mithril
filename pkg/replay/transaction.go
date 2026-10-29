@@ -703,6 +703,13 @@ func processTransactionComputeUnits(execCtx *sealevel.ExecutionCtx) uint64 {
 }
 
 func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, tx *solana.Transaction, txMeta *rpc.TransactionMeta, dbgOpts *DebugOptions, arena *arena.Arena[sealevel.BorrowedAccount], shouldVerifySignatures bool) (*fees.TxFeeInfo, uint64, error) {
+	return processTransaction(slotCtx, sigverifyWg, tx, txMeta, dbgOpts, arena, shouldVerifySignatures, nil)
+}
+
+func processTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, tx *solana.Transaction, txMeta *rpc.TransactionMeta, dbgOpts *DebugOptions, arena *arena.Arena[sealevel.BorrowedAccount], shouldVerifySignatures bool, capture *transactionMetadataCapture) (feeInfo *fees.TxFeeInfo, computeUnits uint64, executionErr error) {
+	if capture != nil {
+		*capture = transactionMetadataCapture{budget: capture.budget}
+	}
 	if trace.IsEnabled() && slotCtx.TraceCtx != nil {
 		regionType := "ProcessTransaction"
 		if tx.IsVote() {
@@ -753,6 +760,11 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 		defer mlog.Log.DisableInfLogging()
 	}
 
+	var metadata *transactionMetadata
+	if capture != nil {
+		metadata, capture.Err = prepareTransactionMetadata(slotCtx, tx, capture.budget)
+	}
+
 	// Execute via pure function
 	input := LoadAndExecuteTransactionInput{
 		SlotCtx:     slotCtx,
@@ -762,10 +774,23 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 		LeanResult:  true,
 		// On-chain metadata and the trailing verifier are the only replay
 		// consumers of pre-balances. Ordinary production transactions skip it.
-		CapturePreBalances: txMeta != nil || captureTx,
-		RecordLogs:         debugTx,
+		CapturePreBalances:      txMeta != nil || captureTx,
+		RecordLogs:              debugTx || metadata != nil,
+		boundedMetadata:         metadata != nil,
+		RecordInnerInstructions: metadata != nil,
 	}
 	output := LoadAndExecuteTransaction(input)
+	if metadata != nil {
+		defer func() {
+			if feeInfo == nil {
+				return
+			}
+			capture.Err = metadata.finish(slotCtx, tx, output, feeInfo.TotalFee, capture.budget)
+			if capture.Err == nil {
+				capture.Record = metadata
+			}
+		}()
+	}
 
 	execCtx := output.ExecCtx
 	instrs := output.Instrs
