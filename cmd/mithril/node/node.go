@@ -4624,7 +4624,14 @@ func runReplayWithRecovery(
 		var recoveryReason string
 		var certSwitch *replay.CertifiedSwitch
 		var finMismatch *replay.AlpenglowFinalityMismatch
+		var specMismatch *replay.SpeculationFooterMismatch
 		switch {
+		case errors.As(result.Error, &specMismatch):
+			// Work-ahead is already off; a plain re-replay that mismatches again
+			// is an ordinary footer mismatch and halts below.
+			divSlot = specMismatch.Slot
+			key = fmt.Sprintf("spec:%d", specMismatch.Slot)
+			recoveryReason = fmt.Sprintf("footer bank hash mismatch at slot %d in a block with work-ahead early executions (work-ahead now off)", specMismatch.Slot)
 		case errors.As(result.Error, &certSwitch):
 			// Execute-on-receipt ran the wrong sibling (or a certified-skipped
 			// slot), or a later parent-linked child exposed a competing

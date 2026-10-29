@@ -52,10 +52,18 @@ func verifyFooterBankHash(slotCtx *sealevel.SlotCtx, block *b.Block) error {
 	if bytes.Equal(block.ExpectedBankhash[:], slotCtx.FinalBankhash) {
 		return nil
 	}
-	return fmt.Errorf(
-		"slot %d footer bank hash mismatch: footer=%s computed=%s",
-		block.Slot,
-		base58.Encode(block.ExpectedBankhash[:]),
-		base58.Encode(slotCtx.FinalBankhash),
-	)
+	return &FooterBankhashMismatch{Slot: block.Slot, Footer: block.ExpectedBankhash, Computed: append([]byte(nil), slotCtx.FinalBankhash...)}
+}
+
+// FooterBankhashMismatch: the locally computed bank hash differs from the
+// leader's footer bank hash.
+type FooterBankhashMismatch struct {
+	Slot     uint64
+	Footer   [32]byte
+	Computed []byte
+}
+
+func (e *FooterBankhashMismatch) Error() string {
+	return fmt.Sprintf("slot %d footer bank hash mismatch: footer=%s computed=%s",
+		e.Slot, base58.Encode(e.Footer[:]), base58.Encode(e.Computed))
 }

@@ -34,6 +34,18 @@ type ExecutionCtx struct {
 	SlotCtx                  *SlotCtx
 	ModifiedVoteStates       map[solana.PublicKey]*VoteStateVersions
 	IsSimulation             bool
+	// Speculative marks an execution whose result may be discarded: it never
+	// publishes to the shared program cache; its program cache misses compile a
+	// private entry.
+	Speculative bool
+	// SpeculativeCancel is private to an attempt already rejected by replay.
+	SpeculativeCancel *atomic.Bool
+	// PrivateParameters serializes instruction parameters into heap buffers
+	// instead of the bank's parameter arena.
+	PrivateParameters bool
+	// PrivatePrograms makes every program load bypass the shared program cache
+	// (diagnostic).
+	PrivatePrograms bool
 
 	// RecordInnerInstructions enables capture of CPI instructions into
 	// InnerInstrs. Off by default; the simulate handler enables it when

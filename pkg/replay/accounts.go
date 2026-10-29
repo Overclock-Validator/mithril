@@ -64,7 +64,18 @@ func recordTxAcctCowClone(oldDataLen, copiedBytes uint64) {
 	TxAcctsReplacedBytes.Add(oldDataLen - copiedBytes)
 }
 
-func loadAndValidateTxAccts(slotCtx *sealevel.SlotCtx, txAcctMetas []*solana.AccountMeta, tx *solana.Transaction, instrs []sealevel.Instruction, instrsAcct *accounts.Account, loadedAcctBytesLimit uint32) (*sealevel.TransactionAccounts, []*solana.AccountMeta, uint32, error) {
+// sharedAccount is how the loaders read an account: from overrides when the
+// key is there (an early execution's predicted accounts, so every check sees
+// the account the execution and the turn's validation see), else from slot
+// state.
+func sharedAccount(slotCtx *sealevel.SlotCtx, overrides map[solana.PublicKey]*accounts.Account, key solana.PublicKey) (*accounts.Account, error) {
+	if acct, ok := overrides[key]; ok {
+		return acct, nil
+	}
+	return slotCtx.GetAccountShared(key)
+}
+
+func loadAndValidateTxAccts(slotCtx *sealevel.SlotCtx, txAcctMetas []*solana.AccountMeta, tx *solana.Transaction, instrs []sealevel.Instruction, instrsAcct *accounts.Account, loadedAcctBytesLimit uint32, overrides map[solana.PublicKey]*accounts.Account) (*sealevel.TransactionAccounts, []*solana.AccountMeta, uint32, error) {
 	var loadedBytesAccumulator uint32
 	if txAcctMetas == nil {
 		var err error
@@ -105,13 +116,13 @@ func loadAndValidateTxAccts(slotCtx *sealevel.SlotCtx, txAcctMetas []*solana.Acc
 			acct = instrsAcct
 			isInstructionsSysvarAcct = true
 		} else if !slotCtx.Features.IsActive(features.DisableAccountLoaderSpecialCase) && slices.Contains(programIdIdxs, uint64(idx)) && !acctMeta.IsWritable && !instrContainsAcctMeta {
-			tmp, err := slotCtx.GetAccountShared(acctMeta.PublicKey)
+			tmp, err := sharedAccount(slotCtx, overrides, acctMeta.PublicKey)
 			if err != nil {
 				return nil, nil, loadedBytesAccumulator, err
 			}
 			acct = &accounts.Account{Key: acctMeta.PublicKey, Owner: tmp.Owner, Executable: true, IsDummy: true}
 		} else {
-			acct, err = slotCtx.GetAccountShared(acctMeta.PublicKey)
+			acct, err = sharedAccount(slotCtx, overrides, acctMeta.PublicKey)
 			if err != nil {
 				return nil, nil, loadedBytesAccumulator, err
 			}
@@ -149,7 +160,7 @@ func loadAndValidateTxAccts(slotCtx *sealevel.SlotCtx, txAcctMetas []*solana.Acc
 			continue
 		}
 
-		programAcct, err := slotCtx.GetAccountShared(instr.ProgramId)
+		programAcct, err := sharedAccount(slotCtx, overrides, instr.ProgramId)
 		if err != nil {
 			return nil, nil, loadedBytesAccumulator, TxErrProgramAccountNotFound
 		}
@@ -170,7 +181,7 @@ func loadAndValidateTxAccts(slotCtx *sealevel.SlotCtx, txAcctMetas []*solana.Acc
 		_, exists := validatedLoaders[owner]
 		if !exists {
 			var ownerAcct *accounts.Account
-			ownerAcct, err = slotCtx.GetAccountShared(owner)
+			ownerAcct, err = sharedAccount(slotCtx, overrides, owner)
 			if err != nil {
 				ownerAcct, err = slotCtx.GetAccountFromAccountsDb(owner)
 				if err != nil {
@@ -205,6 +216,7 @@ type loadedAcctSizeAccumulatorSimd186 struct {
 	acctKeys              []solana.PublicKey
 	additionalLoadedAccts map[solana.PublicKey]struct{}
 	slotCtx               *sealevel.SlotCtx
+	overrides             map[solana.PublicKey]*accounts.Account
 }
 
 func NewLoadedAcctSizeAccumulatorSimd186(
@@ -285,7 +297,7 @@ func (accum *loadedAcctSizeAccumulatorSimd186) collectAcct(acct *accounts.Accoun
 // the immutable parent to inspect its lamports without copying program bytes.
 // Keep the legacy metadata-only read unchanged before feature activation.
 func (accum *loadedAcctSizeAccumulatorSimd186) programDataLen(key solana.PublicKey, floorActive bool) (uint64, bool) {
-	acct, err := accum.slotCtx.GetAccountShared(key)
+	acct, err := sharedAccount(accum.slotCtx, accum.overrides, key)
 	if err != nil {
 		if accum.slotCtx.UnrootedRead == nil && accum.slotCtx.AccountsDb == nil {
 			return 0, false
@@ -309,7 +321,7 @@ func isLoaderAcct(owner solana.PublicKey) bool {
 		owner == addresses.LoaderV4Addr
 }
 
-func loadAndValidateTxAcctsSimd186(slotCtx *sealevel.SlotCtx, txAcctMetas []*solana.AccountMeta, tx *solana.Transaction, instrs []sealevel.Instruction, instrsAcct *accounts.Account, loadedAcctBytesLimit uint32) (*sealevel.TransactionAccounts, []*solana.AccountMeta, uint32, error) {
+func loadAndValidateTxAcctsSimd186(slotCtx *sealevel.SlotCtx, txAcctMetas []*solana.AccountMeta, tx *solana.Transaction, instrs []sealevel.Instruction, instrsAcct *accounts.Account, loadedAcctBytesLimit uint32, overrides map[solana.PublicKey]*accounts.Account) (*sealevel.TransactionAccounts, []*solana.AccountMeta, uint32, error) {
 	if txAcctMetas == nil {
 		var err error
 		txAcctMetas, err = tx.AccountMetaList()
@@ -322,6 +334,7 @@ func loadAndValidateTxAcctsSimd186(slotCtx *sealevel.SlotCtx, txAcctMetas []*sol
 	accumulator := NewLoadedAcctSizeAccumulatorSimd186(slotCtx,
 		uint64(loadedAcctBytesLimit),
 		acctKeys)
+	accumulator.overrides = overrides
 
 	addrTableLookupCost := safemath.SaturatingMulU64(uint64(len(tx.Message.AddressTableLookups)), addrLookupTableBaseSize)
 	err := accumulator.add(addrTableLookupCost)
@@ -341,7 +354,7 @@ func loadAndValidateTxAcctsSimd186(slotCtx *sealevel.SlotCtx, txAcctMetas []*sol
 			}
 			acct = instrsAcct
 		} else {
-			acct, err = slotCtx.GetAccountShared(pubkey)
+			acct, err = sharedAccount(slotCtx, overrides, pubkey)
 			if err != nil && slotCtx.AccountsDb != nil {
 				// Fall back to full accountsdb so native programs
 				// (System, BPF Loader, etc.) and other always-on
@@ -437,7 +450,7 @@ func loadAndValidateTxAcctsSimd186(slotCtx *sealevel.SlotCtx, txAcctMetas []*sol
 		// Fallback if not in cache or out of bounds
 		if programAcct == nil {
 			var err error
-			programAcct, err = slotCtx.GetAccountShared(instr.ProgramId)
+			programAcct, err = sharedAccount(slotCtx, overrides, instr.ProgramId)
 			if err != nil {
 				programAcct, err = slotCtx.GetAccountFromAccountsDb(instr.ProgramId)
 				if err != nil {
