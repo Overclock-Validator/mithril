@@ -27,7 +27,7 @@ func TestVotorBroadcasterPreconnectsBeforeFirstMessageAndDeliversDatagram(t *tes
 	received := make(chan receivedMessage, 1)
 	receiver, err := NewReceiver(ReceiverConfig{
 		BindAddr:     "127.0.0.1:0",
-		Identity:     serverIdentity,
+		Identity:     identityHolder(t, serverIdentity),
 		ShredVersion: 0x1234,
 		LogInterval:  -1,
 		AdmitPeer:    func(peer solana.PublicKey) bool { return peer == clientPubkey },
@@ -42,7 +42,7 @@ func TestVotorBroadcasterPreconnectsBeforeFirstMessageAndDeliversDatagram(t *tes
 	peerAddr, ok := receiver.Addr().(*net.UDPAddr)
 	require.True(t, ok)
 	broadcaster, err := NewVotorBroadcaster(VotorBroadcasterConfig{
-		Identity:     clientIdentity,
+		Identity:     identityHolder(t, clientIdentity),
 		ShredVersion: 0x1234,
 		Peers: func() []VotorPeer {
 			return []VotorPeer{{Identity: serverPubkey, Addr: cloneUDPAddr(peerAddr)}}
@@ -91,7 +91,7 @@ func TestVotorBroadcasterRejectsUnexpectedServerIdentity(t *testing.T) {
 	clientIdentity := ed25519.NewKeyFromSeed(bytesOf(43, ed25519.SeedSize))
 	receiver, err := NewReceiver(ReceiverConfig{
 		BindAddr:    "127.0.0.1:0",
-		Identity:    serverIdentity,
+		Identity:    identityHolder(t, serverIdentity),
 		LogInterval: -1,
 		AdmitPeer:   func(solana.PublicKey) bool { return true },
 	}, NewObserver())
@@ -100,7 +100,7 @@ func TestVotorBroadcasterRejectsUnexpectedServerIdentity(t *testing.T) {
 
 	peerAddr := receiver.Addr().(*net.UDPAddr)
 	broadcaster, err := NewVotorBroadcaster(VotorBroadcasterConfig{
-		Identity: clientIdentity,
+		Identity: identityHolder(t, clientIdentity),
 		Peers: func() []VotorPeer {
 			return []VotorPeer{{Identity: expectedPubkey, Addr: cloneUDPAddr(peerAddr)}}
 		},
@@ -162,7 +162,7 @@ func TestVotorBroadcasterAcceptsAgaveStyleUntrustedServerCertificate(t *testing.
 
 	peerAddr := listener.Addr().(*net.UDPAddr)
 	broadcaster, err := NewVotorBroadcaster(VotorBroadcasterConfig{
-		Identity: clientIdentity,
+		Identity: identityHolder(t, clientIdentity),
 		Peers: func() []VotorPeer {
 			return []VotorPeer{{Identity: serverPubkey, Addr: cloneUDPAddr(peerAddr)}}
 		},
@@ -193,7 +193,7 @@ func TestVotorBroadcasterDeduplicatesPeerIdentity(t *testing.T) {
 	clientIdentity := ed25519.NewKeyFromSeed(bytesOf(52, ed25519.SeedSize))
 	receiver, err := NewReceiver(ReceiverConfig{
 		BindAddr:    "127.0.0.1:0",
-		Identity:    serverIdentity,
+		Identity:    identityHolder(t, serverIdentity),
 		LogInterval: -1,
 		AdmitPeer:   func(solana.PublicKey) bool { return true },
 	}, NewObserver())
@@ -202,7 +202,7 @@ func TestVotorBroadcasterDeduplicatesPeerIdentity(t *testing.T) {
 
 	peerAddr := receiver.Addr().(*net.UDPAddr)
 	broadcaster, err := NewVotorBroadcaster(VotorBroadcasterConfig{
-		Identity: clientIdentity,
+		Identity: identityHolder(t, clientIdentity),
 		Peers: func() []VotorPeer {
 			peer := VotorPeer{Identity: serverPubkey, Addr: cloneUDPAddr(peerAddr)}
 			return []VotorPeer{peer, peer}
@@ -230,7 +230,7 @@ func TestVotorBroadcasterReusesProactiveConnectionForConcurrentMessages(t *testi
 	clientIdentity := ed25519.NewKeyFromSeed(bytesOf(72, ed25519.SeedSize))
 	receiver, err := NewReceiver(ReceiverConfig{
 		BindAddr:              "127.0.0.1:0",
-		Identity:              serverIdentity,
+		Identity:              identityHolder(t, serverIdentity),
 		LogInterval:           -1,
 		MaxDatagramsPerSecond: 50,
 		AdmitPeer:             func(solana.PublicKey) bool { return true },
@@ -240,7 +240,7 @@ func TestVotorBroadcasterReusesProactiveConnectionForConcurrentMessages(t *testi
 
 	peerAddr := receiver.Addr().(*net.UDPAddr)
 	broadcaster, err := NewVotorBroadcaster(VotorBroadcasterConfig{
-		Identity: clientIdentity,
+		Identity: identityHolder(t, clientIdentity),
 		Peers: func() []VotorPeer {
 			return []VotorPeer{{Identity: serverPubkey, Addr: cloneUDPAddr(peerAddr)}}
 		},
@@ -268,7 +268,7 @@ func TestVotorBroadcasterClosesDepartedPeer(t *testing.T) {
 	clientIdentity := ed25519.NewKeyFromSeed(bytesOf(82, ed25519.SeedSize))
 	receiver, err := NewReceiver(ReceiverConfig{
 		BindAddr:    "127.0.0.1:0",
-		Identity:    serverIdentity,
+		Identity:    identityHolder(t, serverIdentity),
 		LogInterval: -1,
 		AdmitPeer:   func(solana.PublicKey) bool { return true },
 	}, NewObserver())
@@ -277,7 +277,7 @@ func TestVotorBroadcasterClosesDepartedPeer(t *testing.T) {
 
 	peers := newMutableVotorPeers([]VotorPeer{{Identity: serverPubkey, Addr: receiver.Addr().(*net.UDPAddr)}})
 	broadcaster, err := NewVotorBroadcaster(VotorBroadcasterConfig{
-		Identity: clientIdentity,
+		Identity: identityHolder(t, clientIdentity),
 		Peers:    peers.Snapshot,
 		Workers:  1,
 	})
@@ -304,7 +304,7 @@ func TestVotorBroadcasterReplacesChangedPeerAddress(t *testing.T) {
 	newReceiver := func() *Receiver {
 		receiver, err := NewReceiver(ReceiverConfig{
 			BindAddr:    "127.0.0.1:0",
-			Identity:    serverIdentity,
+			Identity:    identityHolder(t, serverIdentity),
 			LogInterval: -1,
 			AdmitPeer:   func(solana.PublicKey) bool { return true },
 		}, NewObserver())
@@ -318,7 +318,7 @@ func TestVotorBroadcasterReplacesChangedPeerAddress(t *testing.T) {
 	secondAddr := secondReceiver.Addr().(*net.UDPAddr)
 	peers := newMutableVotorPeers([]VotorPeer{{Identity: serverPubkey, Addr: firstAddr}})
 	broadcaster, err := NewVotorBroadcaster(VotorBroadcasterConfig{
-		Identity: clientIdentity,
+		Identity: identityHolder(t, clientIdentity),
 		Peers:    peers.Snapshot,
 		Workers:  1,
 	})
@@ -351,7 +351,7 @@ func TestVotorBroadcasterRetriesConnectionWithoutMessageTraffic(t *testing.T) {
 
 	peers := newMutableVotorPeers([]VotorPeer{{Identity: expectedServerPubkey, Addr: peerAddr}})
 	broadcaster, err := NewVotorBroadcaster(VotorBroadcasterConfig{
-		Identity: clientIdentity,
+		Identity: identityHolder(t, clientIdentity),
 		Peers:    peers.Snapshot,
 		Workers:  1,
 	})
@@ -361,7 +361,7 @@ func TestVotorBroadcasterRetriesConnectionWithoutMessageTraffic(t *testing.T) {
 
 	correctReceiver, err := NewReceiver(ReceiverConfig{
 		BindAddr:    bindAddr,
-		Identity:    expectedServerIdentity,
+		Identity:    identityHolder(t, expectedServerIdentity),
 		LogInterval: -1,
 		AdmitPeer:   func(solana.PublicKey) bool { return true },
 	}, NewObserver())
@@ -388,7 +388,7 @@ func TestVotorBroadcasterReconcileDoesNotQueueDuplicateConnects(t *testing.T) {
 	}
 	source := newMutableVotorPeers(peers)
 	broadcaster, err := NewVotorBroadcaster(VotorBroadcasterConfig{
-		Identity: ed25519.NewKeyFromSeed(bytesOf(90, ed25519.SeedSize)),
+		Identity: identityHolder(t, ed25519.NewKeyFromSeed(bytesOf(90, ed25519.SeedSize))),
 		Peers:    source.Snapshot,
 		Workers:  1,
 	})

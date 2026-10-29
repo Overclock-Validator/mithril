@@ -80,16 +80,17 @@ func ParseBlockSource(raw string) (string, error) {
 type Config struct {
 	Profile Profile
 
-	MetricsURL          string // Mithril Prometheus metrics endpoint.
-	RPCURL              string // Mithril JSON-RPC endpoint.
-	LogDir              string // Mithril log directory (optional).
-	AccountsDir         string // AccountsDB directory (optional).
-	SnapshotsDir        string // Snapshot directory (optional).
-	ShredstoreDir       string // Shredstore directory (optional).
-	StatePath           string // Mithril state file (optional).
-	ReplayPath          string // replay_timings.jsonl path (optional).
-	PprofURL            string // pprof endpoint (optional).
-	ReferenceRPCURL     string // Trusted external Solana RPC for slots-behind cross-checks (optional; process-configured only).
+	MetricsURL          string   // Mithril Prometheus metrics endpoint.
+	RPCURL              string   // Mithril JSON-RPC endpoint.
+	LogDir              string   // Mithril log directory (optional).
+	AccountsDir         string   // AccountsDB directory (optional).
+	AccountsDirs        []string // AccountsDB directories, primary first (optional).
+	SnapshotsDir        string   // Snapshot directory (optional).
+	ShredstoreDir       string   // Shredstore directory (optional).
+	StatePath           string   // Mithril state file (optional).
+	ReplayPath          string   // replay_timings.jsonl path (optional).
+	PprofURL            string   // pprof endpoint (optional).
+	ReferenceRPCURL     string   // Trusted external Solana RPC for slots-behind cross-checks (optional; process-configured only).
 	ReplayP99WarnMs     float64
 	SlotsBehindWarn     uint64
 	DiskWarnPercent     float64

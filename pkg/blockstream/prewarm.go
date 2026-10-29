@@ -2,14 +2,15 @@ package blockstream
 
 import (
 	"context"
-	"crypto/ed25519"
 	"fmt"
+	"net"
 	"sort"
 	"sync"
 	"time"
 
 	b "github.com/Overclock-Validator/mithril/pkg/block"
 	gossipclient "github.com/Overclock-Validator/mithril/pkg/gossip"
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/turbine"
 	"github.com/gagliardetto/solana-go"
@@ -62,15 +63,17 @@ type TurbinePrewarmConfig struct {
 	AdvertisedIP     string
 	ShredVersion     uint16
 	AlpenglowAddr    string
-	Identity         ed25519.PrivateKey
+	Identity         *identity.Holder // nil gossips under an ephemeral identity
 	LeaderForSlot    turbine.LeaderForSlotFunc
 	StakesForSlot    func(slot uint64) map[solana.PublicKey]uint64
 	EpochForSlot     func(slot uint64) uint64
 	RootSlot         func() uint64
 	UseChaCha8       bool
 	DedupAddrs       bool
-	FloorSlot        uint64 // resume frontier: spool floor and assembler retention floor
-	MaxSpoolBlocks   int
+	// ShredReceivers get a copy of every shred the prewarm relays.
+	ShredReceivers []*net.UDPAddr
+	FloorSlot      uint64 // resume frontier: spool floor and assembler retention floor
+	MaxSpoolBlocks int
 	// ShredSpoolDir: shared on-disk shred spool. Everything the prewarm
 	// hears goes to disk too, so even blocks beyond the in-RAM spool cap
 	// hydrate later instead of re-repairing.
@@ -119,13 +122,14 @@ func StartTurbinePrewarm(cfg TurbinePrewarmConfig) (*TurbinePrewarm, error) {
 	}
 	if cfg.StakesForSlot != nil {
 		if err := receiver.SetRetransmit(turbine.RetransmitConfig{
-			Identity:     client.Identity(),
-			Peers:        client,
-			Stakes:       cfg.StakesForSlot,
-			EpochForSlot: cfg.EpochForSlot,
-			RootSlot:     cfg.RootSlot,
-			UseChaCha8:   cfg.UseChaCha8,
-			DedupAddrs:   cfg.DedupAddrs,
+			Identity:       client.Identity(),
+			Peers:          client,
+			Stakes:         cfg.StakesForSlot,
+			EpochForSlot:   cfg.EpochForSlot,
+			RootSlot:       cfg.RootSlot,
+			UseChaCha8:     cfg.UseChaCha8,
+			DedupAddrs:     cfg.DedupAddrs,
+			ShredReceivers: cfg.ShredReceivers,
 		}); err != nil {
 			cancel()
 			return nil, fmt.Errorf("prewarm retransmit setup: %w", err)

@@ -78,7 +78,7 @@ func translateInstructionC(vm sbpf.VM, addr uint64) (Instruction, error) {
 
 	accountMetaReader := bytes.NewReader(accountMetasData)
 
-	var accountMetas []SolAccountMetaC
+	accountMetas := make([]SolAccountMetaC, 0, ix.AccountsLen)
 	for count := uint64(0); count < ix.AccountsLen; count++ {
 		var am SolAccountMetaC
 		err = am.Unmarshal(accountMetaReader)
@@ -392,7 +392,7 @@ type inputRegionLengthUpdater interface {
 }
 
 type inputRegionDataUpdater interface {
-	SetInputRegionData(addr uint64, data []byte, length uint64, writable bool) bool
+	SetInputRegionData(addr uint64, data []byte, length uint64, writable bool, onWrite func(*sbpf.InputRegion, uint64) error) bool
 }
 
 func translateSerializedAccountData(vm sbpf.VM, execCtx *ExecutionCtx, addr, size uint64) ([]byte, error) {
@@ -850,21 +850,20 @@ func updateCallerAccountRegion(vm sbpf.VM, execCtx *ExecutionCtx, callerAcct *Ca
 
 	writable := calleeAcct.DataCanBeChanged(execCtx.Features) == nil
 	if accountDataDirectMappingActive(execCtx) {
-		// A direct-mapped account can still reference the transaction's shared
-		// parent state here.  Keep the caller region read-only in that case so
-		// its existing OnWrite hook performs the first-write clone.  Marking the
-		// region writable would let the caller mutate the shared backing slice
-		// without setting TransactionAccounts.Touched, so the successful write
-		// would be omitted from publication and the accounts LtHash.
-		if calleeAcct.IndexInTransaction < uint64(len(calleeAcct.TxCtx.Accounts.Shared)) &&
-			calleeAcct.TxCtx.Accounts.Shared[calleeAcct.IndexInTransaction] {
-			writable = false
-		}
 		updater, ok := vm.(inputRegionDataUpdater)
 		if !ok {
 			return nil
 		}
-		if !updater.SetInputRegionData(callerAcct.VmDataAddr, calleeAcct.Data(), uint64(len(calleeAcct.Data())), writable) {
+		// CPI may change ownership as well as data. Rebuild the growth/COW
+		// handler from the returned account, as Agave's
+		// update_caller_account_region/create_memory_region_of_account do.
+		// Newly owned accounts need a handler; accounts no longer owned must
+		// lose it. Shared accounts remain read-only until their first write.
+		data, writable, onWrite, err := directMappedAccountData(execCtx, calleeAcct, reserved)
+		if err != nil {
+			return err
+		}
+		if !updater.SetInputRegionData(callerAcct.VmDataAddr, data, uint64(len(data)), writable, onWrite) {
 			return InstrErrMissingAccount
 		}
 	} else {

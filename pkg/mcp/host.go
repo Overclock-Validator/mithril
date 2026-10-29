@@ -127,6 +127,15 @@ func collectHostHealthWith(ctx context.Context, cfg Config, metrics *MetricsSumm
 		out.Storage = append(out.Storage, item)
 		addCheck("disk_"+target.name, status, evidence)
 	}
+	for i, path := range cfg.AccountsDirs {
+		if path == cfg.AccountsDir {
+			continue
+		}
+		name := fmt.Sprintf("accounts_%d", i+1)
+		item, status, evidence := assessStoragePath(ctx, name, path, cfg.DiskWarnPercent, cfg.DiskCriticalPercent, diskProbe)
+		out.Storage = append(out.Storage, item)
+		addCheck("disk_"+name, status, evidence)
+	}
 
 	out.Memory.NodeRSSBytes = nil
 	out.Memory.NodeVirtualBytes = nil

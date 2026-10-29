@@ -385,6 +385,7 @@ type infoOutput struct {
 	PprofOrigin            string               `json:"pprof_origin,omitempty"`
 	LogDir                 string               `json:"log_dir,omitempty"`
 	AccountsDir            string               `json:"accounts_dir,omitempty"`
+	AccountsDirs           []string             `json:"accounts_dirs,omitempty"`
 	SnapshotsDir           string               `json:"snapshots_dir,omitempty"`
 	ShredstoreDir          string               `json:"shredstore_dir,omitempty"`
 	StatePath              string               `json:"state_path,omitempty"`
@@ -453,6 +454,7 @@ func registerInfoTool(server *mcpsdk.Server, cfg Config) {
 			RPCOrigin:            configuredOrigin(cfg.RPCURL),
 			LogDir:               cfg.LogDir,
 			AccountsDir:          cfg.AccountsDir,
+			AccountsDirs:         cfg.AccountsDirs,
 			SnapshotsDir:         cfg.SnapshotsDir,
 			ShredstoreDir:        cfg.ShredstoreDir,
 			StatePath:            cfg.StatePath,

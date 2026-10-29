@@ -394,13 +394,14 @@ func (bs *BlockSource) runTurbineStream() {
 		if gossipClient != nil {
 			if bs.turbineStakesForSlot != nil {
 				if err := receiver.SetRetransmit(turbine.RetransmitConfig{
-					Identity:     gossipClient.Identity(),
-					Peers:        gossipClient,
-					Stakes:       bs.turbineStakesForSlot,
-					EpochForSlot: bs.turbineEpochForSlot,
-					RootSlot:     bs.turbineRootSlot,
-					UseChaCha8:   bs.turbineUseChaCha8,
-					DedupAddrs:   bs.turbineDedupAddrs,
+					Identity:       gossipClient.Identity(),
+					Peers:          gossipClient,
+					Stakes:         bs.turbineStakesForSlot,
+					EpochForSlot:   bs.turbineEpochForSlot,
+					RootSlot:       bs.turbineRootSlot,
+					UseChaCha8:     bs.turbineUseChaCha8,
+					DedupAddrs:     bs.turbineDedupAddrs,
+					ShredReceivers: bs.turbineShredReceivers,
 				}); err != nil {
 					cancelStream()
 					bs.handleLiveShredStreamClosed(fmt.Sprintf("native turbine retransmit setup failed: %v", err))
@@ -410,7 +411,7 @@ func (bs *BlockSource) runTurbineStream() {
 					continue
 				}
 			}
-			if err := receiver.SetRepairPeerSource(gossipClient.Identity(), gossipClient.RepairPeers); err == nil {
+			if err := receiver.SetRepairPeerSource(gossipClient.Identity(), bs.repairPeerSource(gossipClient.RepairPeers)); err == nil {
 				receiver.SetRepairRequestRate(bs.repairMaxRequestsPerSecond)
 			} else {
 				cancelStream()

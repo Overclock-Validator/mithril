@@ -35,16 +35,16 @@
     then "go_1_${builtins.elemAt goVersion 1}"
     else "go_${builtins.elemAt goVersion 0}_${builtins.elemAt goVersion 1}";
   goFor = pkgs:
-    assert versionString == "1.26.6";
+    assert versionString == "1.27.2";
     (
       if builtins.hasAttr goAttr pkgs
       then pkgs.${goAttr}
       else pkgs.go
     ).overrideAttrs (_: {
-      version = "1.26.6";
+      version = "1.27.2";
       src = pkgs.fetchurl {
-        url = "https://go.dev/dl/go1.26.6.src.tar.gz";
-        hash = "sha256-oHIcVMaIkBRI13rZs+x+p8R0cwdV/4kTgukuy5P/LLE=";
+        url = "https://go.dev/dl/go1.27.2.src.tar.gz";
+        hash = "sha256-A0ldorpkiU1A9cSZLklFT6eLUGkGBP+Stq//UIG3bmI=";
       };
     });
 in {
@@ -60,7 +60,7 @@ in {
         subPackages = [
           "cmd/mithril"
         ];
-        vendorHash = "sha256-6IQPqBlFnsvFParPAajkypnF9jBykOiQBdtb9+gQTFI=";
+        vendorHash = "sha256-M8n72lWRa1QwY5virSIGQxa1QGSYogYfD0F3lCsuclk=";
         nativeBuildInputs = [pkgs.pkg-config];
         buildInputs = [pkgs.zstd];
         env = {

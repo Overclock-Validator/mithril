@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"net"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
@@ -23,7 +24,7 @@ func newPacingTestClient(t *testing.T) *repairClient {
 	if err != nil {
 		t.Fatalf("generate identity: %v", err)
 	}
-	c.identity = priv
+	c.identity = identityHolder(t, priv)
 	c.timeoutNanos.Store(int64(repairMinRequestTimeout))
 	return c
 }
@@ -537,6 +538,11 @@ func TestAdmissionCapBoundsOutstanding(t *testing.T) {
 // (the scan covers the slot on its own cadence), a full one sends the
 // followup cap plus the reserved chained probe and keeps the remainder.
 func TestFollowupsAreMeteredByTokenBucket(t *testing.T) {
+	// Response admission must not refill the bucket just because the test is slow.
+	synctest.Test(t, testFollowupsAreMeteredByTokenBucket)
+}
+
+func testFollowupsAreMeteredByTokenBucket(t *testing.T) {
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -564,15 +570,17 @@ func TestFollowupsAreMeteredByTokenBucket(t *testing.T) {
 	}
 
 	c, from, packet, shred := prime()
-	// Drain the bucket. Two calls: the admission cap trims the first grant
-	// by the primed outstanding entry, leaving a stray token.
-	c.takeRateTokens(repairMaxRequestsPerSecond)
+	// Drain the initial allowance without advancing the clock.
 	c.takeRateTokens(repairMaxRequestsPerSecond)
 	if !observeRepairForTest(c, conn, packet, from, shred) {
 		t.Fatal("response itself must match")
 	}
 	if got := c.requests.Load(); got != 0 {
 		t.Fatalf("drained bucket sent %d followups, want 0", got)
+	}
+	time.Sleep(time.Millisecond)
+	if got, want := c.takeRateTokens(repairMaxRequestsPerSecond), repairMaxRequestsPerSecond/1000; got != want {
+		t.Fatalf("refilled bucket granted %d tokens, want %d after 1 ms", got, want)
 	}
 
 	c, from, packet, shred = prime()

@@ -80,8 +80,9 @@ func resolvedConfigWithOverrides(overrides resolvedConfigOverrides) (mcp.Config,
 		if err != nil {
 			return mcp.Config{}, err
 		}
-		if !accountsEnvSet && configured.Accounts != "" {
+		if !accountsEnvSet && len(configured.AccountsDirs) != 0 {
 			sp.Accounts = configured.Accounts
+			cfg.AccountsDirs = configured.AccountsDirs
 		}
 		if !snapshotsEnvSet && configured.Snapshots != "" {
 			sp.Snapshots = configured.Snapshots
@@ -106,6 +107,9 @@ func resolvedConfigWithOverrides(overrides resolvedConfigOverrides) (mcp.Config,
 	}
 	if !accountsEnvSet {
 		cfg.AccountsDir = sp.Accounts
+	}
+	if len(cfg.AccountsDirs) == 0 && cfg.AccountsDir != "" {
+		cfg.AccountsDirs = []string{cfg.AccountsDir}
 	}
 	if !snapshotsEnvSet {
 		cfg.SnapshotsDir = sp.Snapshots
@@ -142,6 +146,11 @@ func resolvedConfigWithOverrides(overrides resolvedConfigOverrides) (mcp.Config,
 			return mcp.Config{}, fmt.Errorf("%s must be absolute so MCP client launch directories cannot change it", name)
 		}
 	}
+	for _, path := range cfg.AccountsDirs {
+		if !filepath.IsAbs(path) {
+			return mcp.Config{}, errors.New("MCP accounts directories must be absolute so MCP client launch directories cannot change them")
+		}
+	}
 	if cfg.BlockSource != "" {
 		source, err := mcp.ParseBlockSource(cfg.BlockSource)
 		if err != nil {
@@ -155,13 +164,14 @@ func resolvedConfigWithOverrides(overrides resolvedConfigOverrides) (mcp.Config,
 // configuredNodeSettings contains node settings that affect MCP's local
 // observation targets.
 type configuredNodeSettings struct {
-	Accounts    string
-	Snapshots   string
-	Shredstore  string
-	Logs        string
-	BlockSource string
-	RPCPort     int
-	PprofPort   int64
+	Accounts     string
+	AccountsDirs []string
+	Snapshots    string
+	Shredstore   string
+	Logs         string
+	BlockSource  string
+	RPCPort      int
+	PprofPort    int64
 }
 
 func configuredNodeBlockSource(v *viper.Viper) (string, error) {
@@ -178,6 +188,16 @@ func configuredNodeBlockSource(v *viper.Viper) (string, error) {
 		defaultSource = "rpc"
 	default:
 		return "", fmt.Errorf("invalid network.cluster %q - must be 'alpenglow', 'mainnet-beta', 'testnet', or 'devnet'", cluster)
+	}
+
+	switch protocol := v.GetString("consensus.protocol"); protocol {
+	case "":
+	case "alpenglow":
+		defaultSource = "turbine"
+	case "classic":
+		defaultSource = "rpc"
+	default:
+		return "", fmt.Errorf("invalid consensus.protocol %q: expected alpenglow or classic", protocol)
 	}
 
 	source := v.GetString("block.source")
@@ -205,9 +225,13 @@ func nodeSettingsFromConfig(path string) (configuredNodeSettings, error) {
 	if err := v.ReadInConfig(); err != nil {
 		return configuredNodeSettings{}, fmt.Errorf("read MCP node config %q: %w", path, err)
 	}
-	accounts := v.GetString("storage.accounts")
-	if accounts == "" {
-		accounts = v.GetString("ledger.accounts_path")
+	accountsDirs := v.GetStringSlice("storage.accounts")
+	if len(accountsDirs) == 0 {
+		accountsDirs = v.GetStringSlice("ledger.accounts_path")
+	}
+	accounts := ""
+	if len(accountsDirs) != 0 {
+		accounts = accountsDirs[0]
 	}
 	snapshots := v.GetString("snapshot.download_path")
 	if snapshots == "" {
@@ -229,13 +253,14 @@ func nodeSettingsFromConfig(path string) (configuredNodeSettings, error) {
 	rpcPort := 0
 	pprofPort := int64(-1)
 	settings := configuredNodeSettings{
-		Accounts:    accounts,
-		Snapshots:   snapshots,
-		Shredstore:  shredstore,
-		Logs:        "/mnt/mithril-logs",
-		BlockSource: blockSource,
-		RPCPort:     rpcPort,
-		PprofPort:   pprofPort,
+		Accounts:     accounts,
+		AccountsDirs: accountsDirs,
+		Snapshots:    snapshots,
+		Shredstore:   shredstore,
+		Logs:         "/mnt/mithril-logs",
+		BlockSource:  blockSource,
+		RPCPort:      rpcPort,
+		PprofPort:    pprofPort,
 	}
 	if v.InConfig("storage.logs") {
 		settings.Logs = v.GetString("storage.logs")

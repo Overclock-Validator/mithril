@@ -117,7 +117,7 @@ func Initialize(cfg LogConfig, runID string) error {
 	if len(shortRunID) > 8 {
 		shortRunID = shortRunID[:8]
 	}
-	shortCommit := version.GitCommit
+	shortCommit := version.Commit()
 	if len(shortCommit) > 7 {
 		shortCommit = shortCommit[:7]
 	}

@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/global"
+	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/state"
@@ -49,6 +52,17 @@ const defaultFoldBatchSlots = 128
 // set by node startup before ReplayBlocks. Zero uses the default. Larger K =
 // better union dedupe and less NVMe wear, more RAM, longer crash re-execution.
 var FoldBatchSlots = defaultFoldBatchSlots
+
+const (
+	DefaultFoldMaxBytes       = uint64(4 << 30)
+	DefaultWorkingSetMaxBytes = uint64(16 << 30)
+)
+
+// These budgets count retained account capacities and bookkeeping, not total
+// process RAM. Leave headroom for the executing bank, caches and GC. A slot is
+// indivisible and can overshoot either budget; GOMEMLIMIT is a separate guard.
+var FoldMaxBytes = DefaultFoldMaxBytes
+var WorkingSetMaxBytes = DefaultWorkingSetMaxBytes
 
 // blockAccountSource is the slot-scoped read API the block loader needs; both
 // AccountsDb and unrootedTail satisfy it, so the loader is mode-agnostic.
@@ -117,15 +131,28 @@ type unrootedState interface {
 	OverCap() bool
 }
 
+// normalizeUnrootedState preserves the disabled-tail sentinel when a classic
+// replay caller passes its nil *unrootedTail through an interface. Otherwise
+// reads and commits would select the overlay path and dereference that nil
+// pointer instead of using AccountsDB. Other implementations remain intact.
+func normalizeUnrootedState(tail unrootedState) unrootedState {
+	if concrete, ok := tail.(*unrootedTail); ok && concrete == nil {
+		return nil
+	}
+	return tail
+}
+
 // unrootedTail layers an in-RAM UnrootedOverlay over the durable store: reads
 // resolve overlay→durable, commits buffer until rooted slots promote out.
 type unrootedTail struct {
-	overlay     *accounts.WorkingSet
-	durable     blockAccountSource // the canonical rooted store (for read fall-through)
-	committer   batchCommitter     // durable promotion of rooted slot batches
-	bankhashes  map[uint64][32]byte
-	batchSlots  int    // fold chunk size K
-	stakeIdxDir string // directory of stake_pubkeys.idx; pending stake entries flush here at fold time
+	overlay      *accounts.WorkingSet
+	durable      blockAccountSource // the canonical rooted store (for read fall-through)
+	committer    batchCommitter     // durable promotion of rooted slot batches
+	bankhashes   map[uint64][32]byte
+	batchSlots   int    // fold chunk size K
+	foldMaxBytes uint64 // start a fold before K slots when this byte target is met
+	maxBytes     uint64 // stop admitting slots while retained state exceeds this budget
+	stakeIdxDir  string // directory of stake_pubkeys.idx; pending stake entries flush here at fold time
 	// contexts holds the deep-copied end-of-slot resume context per held slot,
 	// retained until promotion so the context as of the last rooted slot survives for resume.
 	contexts map[uint64]*state.ResumeContext
@@ -138,6 +165,11 @@ type unrootedTail struct {
 	bankSysvars map[uint64]*sealevel.BankSysvars
 	haltCap     int // halt replay if held slots exceed this (rooting stalled)
 
+	// stakeTotals carries durable state's delegated stake totals across folds
+	// into each fold's resume context (stake_totals.go). nil until the initial
+	// block's setup supplies the starting totals.
+	stakeTotals *stakeTotalsTracker
+
 	transactionStatusCheckpointHooks TransactionStatusCheckpointHooks
 }
 
@@ -146,15 +178,17 @@ func newUnrootedTail(durable blockAccountSource, committer batchCommitter, haltC
 		batchSlots = defaultFoldBatchSlots
 	}
 	return &unrootedTail{
-		overlay:     accounts.NewWorkingSet(),
-		durable:     durable,
-		committer:   committer,
-		bankhashes:  make(map[uint64][32]byte),
-		batchSlots:  batchSlots,
-		stakeIdxDir: stakeIdxDir,
-		contexts:    make(map[uint64]*state.ResumeContext),
-		bankSysvars: make(map[uint64]*sealevel.BankSysvars),
-		haltCap:     haltCap,
+		overlay:      accounts.NewWorkingSet(),
+		durable:      durable,
+		committer:    committer,
+		bankhashes:   make(map[uint64][32]byte),
+		batchSlots:   batchSlots,
+		foldMaxBytes: FoldMaxBytes,
+		maxBytes:     WorkingSetMaxBytes,
+		stakeIdxDir:  stakeIdxDir,
+		contexts:     make(map[uint64]*state.ResumeContext),
+		bankSysvars:  make(map[uint64]*sealevel.BankSysvars),
+		haltCap:      haltCap,
 	}
 }
 
@@ -180,6 +214,35 @@ func (t *unrootedTail) GetAccount(slot uint64, pubkey solana.PublicKey) (*accoun
 		return a, err
 	}
 	return a.Clone(), nil
+}
+
+// GetAccountShared resolves the same parent-bank version as GetAccount without
+// cloning it. The returned account and its data are immutable: consumers must
+// not modify them or hand them to transaction execution as mutable accounts.
+// Overlay publication and durable cache replacement preserve existing readers;
+// the referenced Go allocation remains live for the duration of a program load.
+func (t *unrootedTail) GetAccountShared(slot uint64, pubkey solana.PublicKey) (*accounts.Account, error) {
+	if a, ok := t.overlay.Lookup([32]byte(pubkey)); ok {
+		return a, nil
+	}
+	return t.durable.GetAccount(slot, pubkey)
+}
+
+// GetAccountDataLen preserves overlay precedence without cloning account data.
+// The overlay and durable read-cache values are immutable parent-bank versions;
+// returning only a scalar leaves mutable GetAccount ownership unchanged.
+func (t *unrootedTail) GetAccountDataLen(slot uint64, pubkey solana.PublicKey) (uint64, error) {
+	if a, ok := t.overlay.Lookup([32]byte(pubkey)); ok {
+		return uint64(len(a.Data)), nil
+	}
+	a, err := t.durable.GetAccount(slot, pubkey)
+	if err != nil {
+		return 0, err
+	}
+	if a == nil {
+		return 0, accountsdb.ErrNoAccount
+	}
+	return uint64(len(a.Data)), nil
 }
 
 func (t *unrootedTail) GetAccountWithStats(slot uint64, pubkey solana.PublicKey) (*accounts.Account, accountsdb.AccountReadStats, error) {
@@ -283,6 +346,53 @@ func (t *unrootedTail) GetAccountsBatchSharedWithStats(ctx context.Context, slot
 	return out, stats, nil
 }
 
+// initStakeTotals starts tracking from the totals of durable state that the
+// initial block's setup used. A tracker already running (a reconfiguration
+// within the same run) keeps its state.
+func (t *unrootedTail) initStakeTotals(acctsDb *accountsdb.AccountsDb, totals map[solana.PublicKey]voteDelegation) {
+	if t.stakeTotals != nil || totals == nil || acctsDb == nil {
+		return
+	}
+	entries, err := global.LoadStakePubkeyIndex(filepath.Join(acctsDb.AcctsDir, ".."))
+	if err != nil {
+		mlog.Log.Warnf("delegated stake totals: not tracked this run, stake index unavailable: %v", err)
+		return
+	}
+	t.stakeTotals = newStakeTotalsTracker(totals, newStakeIndexMembers(entries))
+}
+
+// durableStakeTotals returns a copy of the delegated stake totals of durable
+// state at the last applied fold boundary (what scanDelegatedStake reads), or
+// false when they are not tracked this run. Loop thread only: folds apply
+// their totals on the loop thread too.
+func (t *unrootedTail) durableStakeTotals() (map[solana.PublicKey]voteDelegation, bool) {
+	if t == nil || t.stakeTotals == nil || t.stakeTotals.broken {
+		return nil, false
+	}
+	out := make(map[solana.PublicKey]voteDelegation, len(t.stakeTotals.durable))
+	for vote, d := range t.stakeTotals.durable {
+		out[vote] = d
+	}
+	return out, true
+}
+
+// recordStakeChange records a replayed slot's change in delegated stake,
+// before Add buffers the slot's writes (old records are read as of the
+// slot's parent).
+func (t *unrootedTail) recordStakeChange(slotCtx *sealevel.SlotCtx, modified []*accounts.Account) {
+	if t.stakeTotals == nil {
+		return
+	}
+	readStored := func(key solana.PublicKey) (*accounts.Account, error) {
+		acct, err := t.GetAccount(slotCtx.Slot, key)
+		if errors.Is(err, accountsdb.ErrNoAccount) {
+			return nil, nil
+		}
+		return acct, err
+	}
+	t.stakeTotals.recordSlot(slotCtx.Slot, slotCtx, modified, global.PendingStakePubkeysForSlot(slotCtx.Slot), readStored)
+}
+
 // Add buffers a replayed slot's writes + bankhash in the overlay; it becomes
 // durable only via promote(). Resume context is attached separately (SetContext).
 func (t *unrootedTail) Add(slot uint64, delta []*accounts.Account, bankhash []byte) {
@@ -322,7 +432,7 @@ func (t *unrootedTail) flush(through uint64) (uint64, *state.ResumeContext, erro
 }
 
 func (t *unrootedTail) promoteChunked(through uint64, force bool) (uint64, *state.ResumeContext, error) {
-	promotedThrough, err := promoteRootedBatched(t.overlay, through, t.bankhashes, t.contexts, t.committer, t.batchSlots, t.stakeIdxDir, force, t.transactionStatusCheckpointHooks)
+	promotedThrough, err := promoteRootedBatchedWithStakeTotals(t.overlay, through, t.bankhashes, t.contexts, t.committer, t.batchSlots, t.stakeIdxDir, force, t.stakeTotals, t.transactionStatusCheckpointHooks)
 	if promotedThrough == 0 {
 		return 0, nil, err
 	}
@@ -363,18 +473,19 @@ func (t *unrootedTail) promoteChunked(through uint64, force bool) (uint64, *stat
 // - A completed-but-unapplied fold on exit is identical to the supported
 //   "crash after commit, before state-file update" case: RecoverFoldState
 //   reconciles the store frontier forward on the next start.
-// - A failed fold is retried naturally: LastRootedSlot did not advance, so the
-//   next iteration rebuilds the same chunk. The stake-index flush that already
-//   landed is a harmless superset (second flush is a no-op).
+// - A failed durable write halts replay until recovery reconciles its manifest.
 
 // foldJob is an immutable snapshot of one K-slot fold chunk. Account values
 // reference immutable retained WorkingSet layers; the layers are not removed
 // until this job completes and applies.
 type foldJob struct {
 	chunk                                  []accounts.SlotDelta
+	slotCount                              int
+	retainedBytes                          uint64
 	through                                uint64
 	bankhashes                             map[uint64][32]byte
 	ctx                                    *state.ResumeContext
+	stakeTotals                            map[solana.PublicKey]voteDelegation // the totals ctx carries (nil: none)
 	ctxJSON                                []byte
 	stakeIdxDir                            string
 	transactionStatusSnapshot              TransactionStatusSnapshot
@@ -397,6 +508,7 @@ type foldResult struct {
 func (t *unrootedTail) buildRewardsCompletionFoldJob(through uint64) (*foldJob, error) {
 	whole := *t
 	whole.batchSlots = t.overlay.HeldSlots()
+	whole.foldMaxBytes = 0 // the rewards completion checkpoint must stay atomic
 	job, err := whole.buildFoldJob(through, true)
 	if err != nil {
 		return nil, err
@@ -420,7 +532,7 @@ func (t *unrootedTail) buildFoldJob(through uint64, force bool, hookOverrides ..
 	// Check chunk eligibility before materializing account-write lists. Replay
 	// calls this on every iteration, including skipped slots; a partial batch
 	// remains in RAM without rescanning all of its accounts each time.
-	chunk := t.overlay.PromotionChunk(through, t.batchSlots, force)
+	chunk := t.overlay.PromotionChunkWithByteLimit(through, t.batchSlots, t.foldMaxBytes, force || t.overMemoryLimit())
 	if len(chunk) == 0 {
 		return nil, nil
 	}
@@ -431,6 +543,8 @@ func (t *unrootedTail) buildFoldJob(through uint64, force bool, hookOverrides ..
 		return nil, fmt.Errorf("fold chunk through slot %d: no resume context recorded for chunk-top slot", through)
 	}
 	ctx = cloneResumeContextForFold(ctx)
+	stakeTotals, encodedStakeTotals := t.stakeTotals.encodedThrough(through)
+	ctx.DelegatedStake = encodedStakeTotals
 	var snapshot TransactionStatusSnapshot
 	var captureTime time.Duration
 	if hooks.Capture != nil {
@@ -445,16 +559,23 @@ func (t *unrootedTail) buildFoldJob(through uint64, force bool, hookOverrides ..
 		}
 	}
 	bankhashes := make(map[uint64][32]byte, len(chunk))
+	var retainedBytes uint64
 	for _, sd := range chunk {
+		for _, a := range sd.Delta {
+			retainedBytes += accounts.RetainedAccountBytes(a)
+		}
 		if bh, ok := t.bankhashes[sd.Slot]; ok {
 			bankhashes[sd.Slot] = bh
 		}
 	}
 	return &foldJob{
 		chunk:                                  append([]accounts.SlotDelta(nil), chunk...),
+		slotCount:                              len(chunk),
+		retainedBytes:                          retainedBytes,
 		through:                                through,
 		bankhashes:                             bankhashes,
 		ctx:                                    ctx,
+		stakeTotals:                            stakeTotals,
 		stakeIdxDir:                            t.stakeIdxDir,
 		transactionStatusSnapshot:              snapshot,
 		checkpointCaptureTime:                  captureTime,
@@ -466,17 +587,44 @@ func (t *unrootedTail) buildFoldJob(through uint64, force bool, hookOverrides ..
 // runFoldJob performs the durable half of a fold (worker-safe: no tail
 // state). Stake-index entries flush (fsync'd) BEFORE the batch commit — see
 // promoteRootedBatched for why that order is a correctness requirement.
-func runFoldJob(committer batchCommitter, job *foldJob) error {
+// foldJobTask budgets one background fold: stake-index flush, CommitBatch and
+// the transaction-status checkpoint cleanup after it.
+var foldJobTask = metrics.Background("replay.fold_job", 2*time.Second)
+
+func runFoldJob(committer batchCommitter, job *foldJob) (err error) {
 	if job == nil {
 		return errors.New("fold job has no resume context")
 	}
-	// Failed folds are rebuilt from the retained tail. Neither a failed result
-	// nor a completed-but-unapplied job should keep checkpoint deltas alive.
-	defer func() { job.transactionStatusSnapshot = nil }()
+	run := foldJobTask.Start()
+	through := job.through
+	// Sequential steps of the fold, logged once per fold and in over-budget
+	// warnings: checkpoint preparation, stake-index flush, CommitBatch (with its
+	// own breakdown) and the checkpoint cleanup after it.
+	var prepare, stakeFlush, commit, cleanup time.Duration
+	var result accountsdb.BatchCommitResult
+	describe := func() string {
+		return fmt.Sprintf("fold through slot %d: %d keys, %d MiB | checkpoint_prepare=%s stake_flush=%s commit=%s (%s) cleanup=%s",
+			through, result.Keys, result.Bytes>>20, prepare.Round(time.Microsecond), stakeFlush.Round(time.Microsecond),
+			commit.Round(time.Microsecond), result.Timings, cleanup.Round(time.Microsecond))
+	}
+	defer func() {
+		total := run.EndErr(err, describe)
+		if err == nil {
+			mlog.Log.FileOnlyf("fold timing: total=%s %s", total.Round(time.Microsecond), describe())
+		}
+	}()
+	// The overlay owns the versions until apply. Do not also retain an entire
+	// completed batch on the idle worker's stack or its result channel.
+	defer func() {
+		job.transactionStatusSnapshot = nil
+		job.chunk = nil
+		job.ctxJSON = nil
+	}()
 	if job.ctx == nil {
 		return errors.New("fold job has no resume context")
 	}
 	var selectedCheckpoint *state.TransactionStatusCheckpointRef
+	step := time.Now()
 	if job.installTransactionStatusCheckpoint != nil {
 		start := time.Now()
 		payload, err := encodeTransactionStatusCheckpoint(job.transactionStatusSnapshot)
@@ -503,20 +651,28 @@ func runFoldJob(committer batchCommitter, job *foldJob) error {
 		return fmt.Errorf("fold chunk through slot %d: marshal resume context: %w", job.through, err)
 	}
 	job.ctxJSON = ctxJSON
+	prepare = time.Since(step)
 
+	step = time.Now()
 	if job.stakeIdxDir != "" {
 		if _, err := global.FlushPendingStakePubkeysThrough(job.stakeIdxDir, job.through); err != nil {
 			return fmt.Errorf("fold chunk through slot %d: flush stake index: %w", job.through, err)
 		}
 	}
-	if _, err := committer.CommitBatch(job.chunk, job.through, job.bankhashes, job.ctxJSON); err != nil {
+	stakeFlush = time.Since(step)
+	step = time.Now()
+	result, err = committer.CommitBatch(job.chunk, job.through, job.bankhashes, job.ctxJSON)
+	commit = time.Since(step)
+	if err != nil {
 		return fmt.Errorf("fold chunk through slot %d: %w", job.through, err)
 	}
+	step = time.Now()
 	if job.afterTransactionStatusCheckpointCommit != nil {
 		if err := job.afterTransactionStatusCheckpointCommit(selectedCheckpoint); err != nil {
 			mlog.Log.Warnf("fold chunk through slot %d: transaction status checkpoint cleanup failed after durable commit: %v", job.through, err)
 		}
 	}
+	cleanup = time.Since(step)
 	return nil
 }
 
@@ -524,6 +680,7 @@ func runFoldJob(committer batchCommitter, job *foldJob) error {
 // the now-durable prefix and the per-slot maps prune. Returns the rooted
 // context (the job snapshot — identical to what the manifest carries).
 func (t *unrootedTail) applyFoldJob(job *foldJob) *state.ResumeContext {
+	t.stakeTotals.commitThrough(job.through, job.stakeTotals)
 	t.overlay.PromotePrefix(job.through)
 	for s := range t.bankhashes {
 		if s <= job.through {
@@ -550,7 +707,41 @@ type asyncPromoter struct {
 	jobs      chan *foldJob
 	results   chan foldResult
 	inFlight  bool
+	failure   error // latched until reopen/recovery; never retry a failed durable write in place
 	done      chan struct{}
+
+	// Worker busy time, for measuring overlap with replay.
+	busyMu    sync.Mutex
+	busyTotal time.Duration
+	busySince time.Time // zero while idle
+}
+
+// busyThrough returns the worker's cumulative busy time up to now.
+func (p *asyncPromoter) busyThrough(now time.Time) time.Duration {
+	if p == nil {
+		return 0
+	}
+	p.busyMu.Lock()
+	defer p.busyMu.Unlock()
+	total := p.busyTotal
+	if !p.busySince.IsZero() && now.After(p.busySince) {
+		total += now.Sub(p.busySince)
+	}
+	return total
+}
+
+func (p *asyncPromoter) setBusy(busy bool) {
+	now := time.Now()
+	p.busyMu.Lock()
+	defer p.busyMu.Unlock()
+	if busy {
+		p.busySince = now
+		return
+	}
+	if !p.busySince.IsZero() {
+		p.busyTotal += now.Sub(p.busySince)
+		p.busySince = time.Time{}
+	}
 }
 
 func newAsyncPromoter(committer batchCommitter) *asyncPromoter {
@@ -568,10 +759,12 @@ func (p *asyncPromoter) run() {
 	defer close(p.done)
 	for job := range p.jobs {
 		start := time.Now()
+		p.setBusy(true)
 		err := runFoldJob(p.committer, job)
+		p.setBusy(false)
 		if err == nil {
-			mlog.Log.FileOnlyf("async fold: committed %d slots through %d in %s checkpoint_capture=%s checkpoint_encode=%s checkpoint_bytes=%d",
-				len(job.chunk), job.through, time.Since(start).Round(time.Millisecond),
+			mlog.Log.FileOnlyf("async fold: committed %d slots through %d in %s retained_bytes=%d checkpoint_capture=%s checkpoint_encode=%s checkpoint_bytes=%d",
+				job.slotCount, job.through, time.Since(start).Round(time.Millisecond), job.retainedBytes,
 				job.checkpointCaptureTime, job.checkpointEncodeTime, job.checkpointBytes)
 		}
 		p.results <- foldResult{job: job, err: err}
@@ -579,9 +772,13 @@ func (p *asyncPromoter) run() {
 }
 
 // enqueue hands a job to the worker (loop thread; requires !inFlight).
-func (p *asyncPromoter) enqueue(job *foldJob) {
+func (p *asyncPromoter) enqueue(job *foldJob) error {
+	if p.failure != nil {
+		return p.failure
+	}
 	p.jobs <- job
 	p.inFlight = true
+	return nil
 }
 
 // poll returns a completed result without blocking (nil when none / none in
@@ -593,6 +790,7 @@ func (p *asyncPromoter) poll() *foldResult {
 	select {
 	case res := <-p.results:
 		p.inFlight = false
+		p.failure = res.err
 		return &res
 	default:
 		return nil
@@ -608,6 +806,7 @@ func (p *asyncPromoter) drain() *foldResult {
 	}
 	res := <-p.results
 	p.inFlight = false
+	p.failure = res.err
 	return &res
 }
 
@@ -627,6 +826,7 @@ func (p *asyncPromoter) stop() {
 // the caller validates the pair and falls back to rooted-checkpoint re-replay.
 func (t *unrootedTail) unwind(fromSlot uint64) (*state.ResumeContext, *sealevel.BankSysvars) {
 	t.overlay.EvictFrom(fromSlot)
+	t.stakeTotals.dropFrom(fromSlot)
 	// Only replay-owned held slots are unwound. A future local leader bank
 	// is not part of this tail and must retain its pending stake entries.
 	for s := range t.bankhashes {
@@ -667,7 +867,11 @@ func (t *unrootedTail) unwind(fromSlot uint64) (*state.ResumeContext, *sealevel.
 // OverCap reports whether the unrooted tail has grown past the halt cap, i.e.
 // rooting has stalled and we must stop replay rather than grow RAM unbounded.
 func (t *unrootedTail) OverCap() bool {
-	return t.haltCap > 0 && t.overlay.HeldSlots() > t.haltCap
+	return (t.haltCap > 0 && t.overlay.HeldSlots() > t.haltCap) || t.overMemoryLimit()
+}
+
+func (t *unrootedTail) overMemoryLimit() bool {
+	return t.maxBytes > 0 && t.overlay.RetainedBytes() >= t.maxBytes
 }
 
 // promoteRootedBatched folds held slots <= through in chunks of batchSlots.
@@ -702,6 +906,24 @@ func promoteRootedBatched(
 	batchSlots int,
 	stakeIdxDir string,
 	force bool,
+	hookOverrides ...TransactionStatusCheckpointHooks,
+) (promotedThrough uint64, err error) {
+	return promoteRootedBatchedWithStakeTotals(overlay, through, bankhashes, contexts, committer, batchSlots, stakeIdxDir, force, nil, hookOverrides...)
+}
+
+// promoteRootedBatchedWithStakeTotals is promoteRootedBatched that also writes
+// stakeTotals' totals for each chunk into the chunk's resume context and
+// commits them once the chunk is durable.
+func promoteRootedBatchedWithStakeTotals(
+	overlay *accounts.WorkingSet,
+	through uint64,
+	bankhashes map[uint64][32]byte,
+	contexts map[uint64]*state.ResumeContext,
+	committer batchCommitter,
+	batchSlots int,
+	stakeIdxDir string,
+	force bool,
+	stakeTotals *stakeTotalsTracker,
 	hookOverrides ...TransactionStatusCheckpointHooks,
 ) (promotedThrough uint64, err error) {
 	hooks, err := resolveTransactionStatusCheckpointHooks(TransactionStatusCheckpointHooks{}, hookOverrides)
@@ -743,6 +965,8 @@ func promoteRootedBatched(
 			break
 		}
 		ctx = cloneResumeContextForFold(ctx)
+		chunkStakeTotals, encodedStakeTotals := stakeTotals.encodedThrough(chunkThrough)
+		ctx.DelegatedStake = encodedStakeTotals
 		var selectedCheckpoint *state.TransactionStatusCheckpointRef
 		if hooks.Capture != nil {
 			snapshot, serr := hooks.Capture(chunkThrough)
@@ -800,6 +1024,7 @@ func promoteRootedBatched(
 		// Publish the exact context selected by the committed manifest. The caller
 		// returns this context into MithrilState after the overlay apply.
 		contexts[chunkThrough] = ctx
+		stakeTotals.commitThrough(chunkThrough, chunkStakeTotals)
 
 		overlay.PromotePrefix(chunkThrough)
 		for _, sd := range chunk {
@@ -861,6 +1086,10 @@ func cloneResumeContextForFold(ctx *state.ResumeContext) *state.ResumeContext {
 	if ctx.TransactionStatusCheckpoint != nil {
 		ref := *ctx.TransactionStatusCheckpoint
 		clone.TransactionStatusCheckpoint = &ref
+	}
+	if ctx.DelegatedStake != nil {
+		totals := *ctx.DelegatedStake
+		clone.DelegatedStake = &totals
 	}
 	return &clone
 }

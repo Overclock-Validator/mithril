@@ -146,7 +146,7 @@ func TestClientConfirmsLiveDuplicateIdentityBeforeSignaling(t *testing.T) {
 		AlpenglowAddr: "0.0.0.0:8002",
 		AdvertisedIP:  "203.0.113.10",
 		ShredVersion:  4321,
-		Identity:      identity,
+		Identity:      identityHolder(t, identity),
 	})
 	if err != nil {
 		t.Fatalf("NewClient returned error: %v", err)
@@ -159,7 +159,7 @@ func TestClientConfirmsLiveDuplicateIdentityBeforeSignaling(t *testing.T) {
 	localWallclock := client.contact.Wallclock
 	client.contactMu.RUnlock()
 	foreign, err := NewContactInfo(
-		client.pubkey,
+		client.Pubkey(),
 		4321,
 		&net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 9000},
 		&net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 9001},
@@ -206,7 +206,7 @@ func TestClientLearnsAlpenglowEndpointFromSignedContact(t *testing.T) {
 		Entrypoint:   "127.0.0.1:8000",
 		BindAddr:     "0.0.0.0:0",
 		ShredVersion: 4321,
-		Identity:     localIdentity,
+		Identity:     identityHolder(t, localIdentity),
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -246,7 +246,7 @@ func TestClientLearnsServiceEndpointsFromEntrypointContactWithoutPullPeer(t *tes
 		Entrypoint:   entrypoint.String(),
 		BindAddr:     "0.0.0.0:0",
 		ShredVersion: 4321,
-		Identity:     localIdentity,
+		Identity:     identityHolder(t, localIdentity),
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -302,7 +302,7 @@ func TestClientIgnoresEchoedAndStaleOwnContactRecords(t *testing.T) {
 		AlpenglowAddr: "0.0.0.0:8002",
 		AdvertisedIP:  "203.0.113.10",
 		ShredVersion:  4321,
-		Identity:      identity,
+		Identity:      identityHolder(t, identity),
 	})
 	if err != nil {
 		t.Fatalf("NewClient returned error: %v", err)
@@ -316,7 +316,7 @@ func TestClientIgnoresEchoedAndStaleOwnContactRecords(t *testing.T) {
 	client.contactMu.RUnlock()
 	client.handleContactRecord(contactRecordFromInfo(t, local, identity), 4321)
 
-	stale, err := NewContactInfo(client.pubkey, 4321,
+	stale, err := NewContactInfo(client.Pubkey(), 4321,
 		&net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 9000},
 		&net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 9001})
 	if err != nil {

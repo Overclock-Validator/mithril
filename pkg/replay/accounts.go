@@ -20,8 +20,9 @@ var (
 	TxAcctsLoadedBytes atomic.Uint64 // Total bytes referenced by tx contexts
 
 	// Per-transaction copy-on-write clone stats (first write in TransactionAccounts.Touch)
-	TxAcctsCloned      atomic.Uint64 // Total accounts cloned on first write
-	TxAcctsClonedBytes atomic.Uint64 // Total bytes cloned on first write
+	TxAcctsCloned        atomic.Uint64 // Total accounts cloned on first write
+	TxAcctsClonedBytes   atomic.Uint64 // Total bytes cloned on first write
+	TxAcctsReplacedBytes atomic.Uint64 // Old bytes SetData replaced on first write without cloning
 
 	// Per-transaction modification stats (touched in handleModifiedAccounts)
 	TxAcctsTouched      atomic.Uint64 // Total accounts actually modified
@@ -33,31 +34,34 @@ var (
 
 // CloneStats holds account clone/modify metrics for reporting
 type CloneStats struct {
-	AcctsLoaded       uint64 // Accounts loaded into tx contexts
-	AcctsLoadedBytes  uint64 // Bytes referenced by tx contexts
-	AcctsCloned       uint64 // Accounts loaded (cloned)
-	AcctsClonedBytes  uint64 // Bytes cloned
-	AcctsTouched      uint64 // Accounts modified
-	AcctsTouchedBytes uint64 // Bytes of modified accounts
-	TxCount           uint64 // Number of transactions
+	AcctsLoaded        uint64 // Accounts loaded into tx contexts
+	AcctsLoadedBytes   uint64 // Bytes referenced by tx contexts
+	AcctsCloned        uint64 // Accounts loaded (cloned)
+	AcctsClonedBytes   uint64 // Bytes cloned
+	AcctsReplacedBytes uint64 // Old bytes replaced without cloning
+	AcctsTouched       uint64 // Accounts modified
+	AcctsTouchedBytes  uint64 // Bytes of modified accounts
+	TxCount            uint64 // Number of transactions
 }
 
 // GetAndResetCloneStats returns current clone stats and resets counters
 func GetAndResetCloneStats() CloneStats {
 	return CloneStats{
-		AcctsLoaded:       TxAcctsLoaded.Swap(0),
-		AcctsLoadedBytes:  TxAcctsLoadedBytes.Swap(0),
-		AcctsCloned:       TxAcctsCloned.Swap(0),
-		AcctsClonedBytes:  TxAcctsClonedBytes.Swap(0),
-		AcctsTouched:      TxAcctsTouched.Swap(0),
-		AcctsTouchedBytes: TxAcctsTouchedBytes.Swap(0),
-		TxCount:           TxCount.Swap(0),
+		AcctsLoaded:        TxAcctsLoaded.Swap(0),
+		AcctsLoadedBytes:   TxAcctsLoadedBytes.Swap(0),
+		AcctsCloned:        TxAcctsCloned.Swap(0),
+		AcctsClonedBytes:   TxAcctsClonedBytes.Swap(0),
+		AcctsReplacedBytes: TxAcctsReplacedBytes.Swap(0),
+		AcctsTouched:       TxAcctsTouched.Swap(0),
+		AcctsTouchedBytes:  TxAcctsTouchedBytes.Swap(0),
+		TxCount:            TxCount.Swap(0),
 	}
 }
 
-func recordTxAcctCowClone(acct *accounts.Account) {
+func recordTxAcctCowClone(oldDataLen, copiedBytes uint64) {
 	TxAcctsCloned.Add(1)
-	TxAcctsClonedBytes.Add(uint64(len(acct.Data)))
+	TxAcctsClonedBytes.Add(copiedBytes)
+	TxAcctsReplacedBytes.Add(oldDataLen - copiedBytes)
 }
 
 func loadAndValidateTxAccts(slotCtx *sealevel.SlotCtx, txAcctMetas []*solana.AccountMeta, tx *solana.Transaction, instrs []sealevel.Instruction, instrsAcct *accounts.Account, loadedAcctBytesLimit uint32) (*sealevel.TransactionAccounts, []*solana.AccountMeta, uint32, error) {
@@ -133,7 +137,7 @@ func loadAndValidateTxAccts(slotCtx *sealevel.SlotCtx, txAcctMetas []*solana.Acc
 
 	transactionAccts := sealevel.NewTransactionAccountsFromRefs(acctsForTx, acctsShared)
 	transactionAccts.AcctMetas = convertedAcctMetas
-	transactionAccts.OnFirstWriteClone = recordTxAcctCowClone
+	transactionAccts.OnFirstWriteDetach = recordTxAcctCowClone
 	TxAcctsLoaded.Add(loadedAcctCount)
 	TxAcctsLoadedBytes.Add(loadedAcctBytes)
 
@@ -255,16 +259,19 @@ func (accum *loadedAcctSizeAccumulatorSimd186) collectAcct(acct *accounts.Accoun
 			if !accum.wasAlreadyCounted(programDataAddr) {
 				// program data account not being found is not an error. Agave instead ignores it.
 				programDataAcct, err := accum.slotCtx.GetAccountShared(programDataAddr)
+				var programDataLen uint64
 				if err != nil {
 					if accum.slotCtx.UnrootedRead == nil && accum.slotCtx.AccountsDb == nil {
 						return nil
 					}
-					programDataAcct, err = accum.slotCtx.GetAccountFromAccountsDb(programDataAddr)
+					programDataLen, err = accum.slotCtx.GetAccountDataLenFromAccountsDb(programDataAddr)
 					if err != nil {
 						return nil
 					}
+				} else {
+					programDataLen = uint64(len(programDataAcct.Data))
 				}
-				accum.accumulator = safemath.SaturatingAddU64(accum.accumulator, safemath.SaturatingAddU64(txAcctBaseSize, uint64(len(programDataAcct.Data))))
+				accum.accumulator = safemath.SaturatingAddU64(accum.accumulator, safemath.SaturatingAddU64(txAcctBaseSize, programDataLen))
 				if accum.accumulator > accum.limit {
 					return TxErrMaxLoadedAccountsDataSizeExceeded
 				}
@@ -390,7 +397,7 @@ func loadAndValidateTxAcctsSimd186(slotCtx *sealevel.SlotCtx, txAcctMetas []*sol
 
 	transactionAccts := sealevel.NewTransactionAccountsFromRefs(acctsForTx, acctsShared)
 	transactionAccts.AcctMetas = convertedAcctMetas
-	transactionAccts.OnFirstWriteClone = recordTxAcctCowClone
+	transactionAccts.OnFirstWriteDetach = recordTxAcctCowClone
 	TxAcctsLoaded.Add(loadedAcctCount)
 	TxAcctsLoadedBytes.Add(loadedAcctBytes)
 

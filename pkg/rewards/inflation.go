@@ -1,10 +1,6 @@
 package rewards
 
-import (
-	"math"
-
-	bin "github.com/gagliardetto/binary"
-)
+import bin "github.com/gagliardetto/binary"
 
 type Inflation struct {
 	Initial        float64
@@ -48,7 +44,7 @@ func (inflation *Inflation) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 }
 
 func (inflation *Inflation) Total(year float64) float64 {
-	tapered := inflation.Initial * (math.Pow(1.0-inflation.Taper, year))
+	tapered := inflation.Initial * inflationPow(1.0-inflation.Taper, year)
 	if tapered > inflation.Terminal {
 		return tapered
 	} else {

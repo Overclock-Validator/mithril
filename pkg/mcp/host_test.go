@@ -69,6 +69,28 @@ func TestCollectHostHealthSkipsUnconfiguredStorage(t *testing.T) {
 	}
 }
 
+func TestCollectHostHealthChecksEveryAccountsDirectory(t *testing.T) {
+	cfg := Config{AccountsDir: "/primary", AccountsDirs: []string{"/primary", "/secondary"}}
+	var probes []string
+	out := collectHostHealthWith(context.Background(), cfg.normalized(),
+		&MetricsSummary{ProcessRSSBytes: uint64Pointer(1)},
+		&ShutdownStateSummary{Stage: stringPointer("ready")},
+		func(path string) *progress.DiskInfo {
+			probes = append(probes, path)
+			used := uint64(50)
+			if path == "/secondary" {
+				used = 99
+			}
+			return &progress.DiskInfo{Path: path, TotalBytes: 100, UsedBytes: used}
+		}, time.Now())
+	if len(probes) != 2 || probes[0] != "/primary" || probes[1] != "/secondary" {
+		t.Fatalf("accounts probes = %v", probes)
+	}
+	if out.Status != diagnosticCritical || out.Storage[len(out.Storage)-1].Path != "/secondary" {
+		t.Fatalf("secondary disk pressure was not reported: %+v", out)
+	}
+}
+
 func TestReadHostCgroupMemoryLocalAndUnlimited(t *testing.T) {
 	dir := writeCgroupFixture(t, map[string]string{
 		"memory.current":      "512\n",

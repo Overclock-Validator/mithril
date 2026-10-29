@@ -200,6 +200,10 @@ func TestResolvedConfigMatchesNodeBlockSourceRules(t *testing.T) {
 		toml string
 		want string
 	}{
+		{name: "Alpenglow protocol on testnet", toml: "[network]\ncluster = 'testnet'\n[consensus]\nprotocol = 'alpenglow'\n", want: "turbine"},
+		{name: "classic protocol on Alpenglow", toml: "[network]\ncluster = 'alpenglow'\n[consensus]\nprotocol = 'classic'\n", want: "rpc"},
+		{name: "explicit source overrides protocol", toml: "[consensus]\nprotocol = 'classic'\n[block]\nsource = 'turbine'\n", want: "turbine"},
+		{name: "lightbringer overrides protocol", toml: "[consensus]\nprotocol = 'classic'\n[lightbringer]\nenabled = true\n", want: "lightbringer"},
 		{
 			name: "omitted cluster and source",
 			toml: "[storage]\naccounts = '/node/accounts'\n",
@@ -264,6 +268,7 @@ func TestResolvedConfigRejectsInvalidNodeClusterOrBlockSource(t *testing.T) {
 		toml    string
 		wantErr string
 	}{
+		{name: "protocol", toml: "[consensus]\nprotocol = 'unknown'\n", wantErr: "invalid consensus.protocol"},
 		{
 			name:    "cluster",
 			toml:    "[network]\ncluster = 'localnet'\n",
