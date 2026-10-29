@@ -7,6 +7,8 @@ import (
 	"math/bits"
 	"slices"
 	"sort"
+	"sync"
+	"sync/atomic"
 
 	"github.com/Overclock-Validator/mithril/pkg/epochstakes"
 	"github.com/Overclock-Validator/mithril/pkg/safemath"
@@ -21,8 +23,21 @@ type slotLeader struct {
 	hasVoteAccount bool
 }
 
+// LeaderSchedule owns an immutable slot map after construction.
 type LeaderSchedule struct {
 	lsMap map[uint64]slotLeader
+
+	// Next-slot queries are telemetry for the current node identity. Retain at
+	// most one identity's sorted slots per schedule, including an empty result.
+	// A replacement schedule gets a fresh cache; an identity change replaces
+	// the bounded entry. The atomic fast path does not hold the fill mutex.
+	nextLeader   atomic.Pointer[leaderIdentitySlots]
+	nextLeaderMu sync.Mutex
+}
+
+type leaderIdentitySlots struct {
+	identity solana.PublicKey
+	slots    []uint64
 }
 
 func NewLeaderScheduleFromKeyedSlots(ls map[solana.PublicKey][]uint64, epochStartSlot uint64) *LeaderSchedule {
@@ -343,18 +358,34 @@ func (ls *LeaderSchedule) NextSlotForLeader(identity solana.PublicKey, from uint
 	if ls == nil {
 		return 0, false
 	}
-	var best uint64
-	found := false
+	cached := ls.nextLeader.Load()
+	if cached == nil || cached.identity != identity {
+		cached = ls.slotsForIdentity(identity)
+	}
+	i := sort.Search(len(cached.slots), func(i int) bool { return cached.slots[i] >= from })
+	if i == len(cached.slots) {
+		return 0, false
+	}
+	return cached.slots[i], true
+}
+
+// slotsForIdentity performs one exact scan for a new identity. No account,
+// leader, vote-account or consensus state is changed by this telemetry cache.
+func (ls *LeaderSchedule) slotsForIdentity(identity solana.PublicKey) *leaderIdentitySlots {
+	ls.nextLeaderMu.Lock()
+	defer ls.nextLeaderMu.Unlock()
+	if cached := ls.nextLeader.Load(); cached != nil && cached.identity == identity {
+		return cached
+	}
+	cached := &leaderIdentitySlots{identity: identity}
 	for slot, leader := range ls.lsMap {
-		if leader.nodePubkey != identity || slot < from {
-			continue
-		}
-		if !found || slot < best {
-			best = slot
-			found = true
+		if leader.nodePubkey == identity {
+			cached.slots = append(cached.slots, slot)
 		}
 	}
-	return best, found
+	slices.Sort(cached.slots)
+	ls.nextLeader.Store(cached)
+	return cached
 }
 
 // LeaderForSlotWithVoteAccount returns the coherent node and vote-account pair

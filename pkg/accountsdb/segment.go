@@ -475,6 +475,57 @@ func ListFoldManifests(acctsDir string) ([]ManifestHeader, error) {
 	return out, nil
 }
 
+// ListFoldAndParkedManifests collects active fold headers and parked manifest
+// paths in one directory pass. It has the same active-header validation and
+// ordering as ListFoldManifests. Callers must validate retained manifest bodies
+// and all parked manifests before using this list to remove checkpoint files.
+// Like ReadDir, this is a directory observation, not a transactional snapshot.
+func ListFoldAndParkedManifests(acctsDir string) ([]ManifestHeader, []string, error) {
+	dir, err := os.Open(acctsDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer dir.Close()
+	var out []ManifestHeader
+	var parked []string
+	// Do not sort or retain hundreds of thousands of unrelated appendvec entries.
+	// Only the small resulting manifest set needs sorting.
+	for {
+		entries, readErr := dir.ReadDir(1024)
+		if readErr != nil && readErr != io.EOF {
+			return nil, nil, readErr
+		}
+		for _, e := range entries {
+			name := e.Name()
+			if e.IsDir() {
+				continue
+			}
+			if strings.HasSuffix(name, segManifestRewoundSuffix) {
+				parked = append(parked, filepath.Join(acctsDir, name))
+				continue
+			}
+			if !strings.HasSuffix(name, segManifestSuffix) || strings.HasSuffix(name, segManifestTmpSuffix) {
+				continue
+			}
+			path := filepath.Join(acctsDir, name)
+			hdr, err := readManifestHeader(path)
+			if err != nil {
+				out = append(out, ManifestHeader{Path: path})
+				continue
+			}
+			if hdr.Kind == ManifestKindFold {
+				out = append(out, hdr)
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].BatchSeq < out[j].BatchSeq })
+	sort.Strings(parked)
+	return out, parked, nil
+}
+
 // listAllManifestFileIds returns the fileId of every manifest-backed data file
 // (fold and compact, including rewound manifests) for orphan classification.
 func listAllManifestFileIds(acctsDir string) (map[uint64]struct{}, error) {

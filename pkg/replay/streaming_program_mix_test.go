@@ -58,9 +58,6 @@ func TestStreamingLifecycleProgramMutations(t *testing.T) {
 			setup := func() (*lifecycleEnv, []*solana.Transaction) {
 				env := newLifecycleEnv(t)
 				env.acctsDb.InitCaches()
-				t.Cleanup(env.acctsDb.ProgramCache.Close)
-				t.Cleanup(env.acctsDb.VoteAcctCache.Close)
-				t.Cleanup(env.acctsDb.CommonAcctsCache.Close)
 				put := func(pk solana.PublicKey, owner solana.PublicKey, data []byte, executable bool) {
 					require.NoError(t, env.durable.SetAccountWithoutLock(pk, &accounts.Account{Key: pk, Owner: owner, Lamports: 100_000_000, Data: data, Executable: executable, RentEpoch: ^uint64(0)}))
 				}

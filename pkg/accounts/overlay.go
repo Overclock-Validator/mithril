@@ -68,6 +68,11 @@ func overlayShardCount(length int) int {
 	return shardCount
 }
 
+// ShardCount reports how many lock shards the overlay's delta is split over.
+func (o *OverlayAccounts) ShardCount() int {
+	return len(o.shards)
+}
+
 func (o *OverlayAccounts) shardForKey(pubkey [32]byte) *overlayAccountShard {
 	if len(o.shards) == 1 {
 		return &o.shards[0]

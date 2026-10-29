@@ -80,6 +80,8 @@ var (
 	snapshotArchivePath              string
 	incrementalSnapshotFilename      string
 	accountsPath                     string
+	accountsPaths                    []string
+	snapshotAccountsDirMinFreeMB     int
 	scratchDirectory                 string
 	rpcEndpoints                     []string
 	cluster                          string // "alpenglow", "mainnet-beta", "testnet", or "devnet"
@@ -547,7 +549,7 @@ func init() {
 	Run.Flags().StringVar(&snapshotDlPath, "download-snapshot-path", "", "Directory for discovered/downloaded snapshots")
 
 	// [ledger] section flags
-	Run.Flags().StringVarP(&accountsPath, "accounts-path", "o", "", "Output path for writing AccountsDB data to")
+	Run.Flags().StringSliceVarP(&accountsPaths, "accounts-path", "o", []string{}, "Output path(s) for writing AccountsDB data to - one dir per disk shard, can specify multiple")
 	Run.Flags().StringVar(&blockstorePath, "ledger-path", "/tmp/blocks", "Path containing slot.json files")
 
 	// [network] section flags
@@ -561,7 +563,7 @@ func init() {
 	// [replay] section flags
 	Run.Flags().Int64Var(&txParallelism, "txpar", 0, "Transaction execution workers (>0 enables topsort parallelism; explicit 0 is sequential; unset validator mode defaults to 2x CPU cores)")
 	Run.Flags().Int64Var(&numReplaySlots, "num-slots", 0, "Number of slots to replay (0 = run continuously)")
-	Run.Flags().BoolVar(&replay.StreamingExecutionCfg.Enabled, "streaming-execution", false,
+	Run.Flags().BoolVar(&replay.StreamingExecutionCfg.Enabled, "streaming-execution", true,
 		"Execute Turbine blocks while their shreds arrive (Alpenglow validator/verifying modes only; the complete block remains authoritative and any mismatch falls back to whole-block execution)")
 	Run.Flags().IntVar(&replay.StreamingExecutionCfg.Workers, "streaming-workers", 0,
 		"Streaming execution workers per transaction group (0 = min(txpar, 4))")
@@ -597,6 +599,8 @@ func init() {
 	Run.Flags().Uint64Var(&borrowedAccountArenaSize, "borrowed-account-arena-size", 1024, "Number of borrowed accounts to preallocate in arena (0 to disable)")
 	Run.Flags().IntVar(&snapshot.ZstdDecoderConcurrency, "zstd-decoder-concurrency", runtime.NumCPU(), "Zstd decoder concurrency")
 	Run.Flags().IntVar(&snapshot.MaxConcurrentFlushers, "max-concurrent-flushers", snapshot.DefaultSnapshotMaxConcurrentFlushers, "Bound for number of log shards to flush to Accounts DB Index at once")
+	Run.Flags().IntVar(&snapshot.SnapshotFlushSortWorkers, "flush-sort-workers", snapshot.DefaultSnapshotFlushSortWorkers, "Snapshot index-flush concurrent sort workers (0 = one per CPU)")
+	Run.Flags().IntVar(&snapshotAccountsDirMinFreeMB, "snapshot-accounts-dir-min-free-mb", snapshot.DefaultSnapshotAccountsDirMinFreeMB, "With several accounts directories, stop placing unpacked snapshot data on a filesystem once its free space reaches this many MiB")
 	Run.Flags().IntVar(&snapshot.SnapshotAppendVecCopyingWorkers, "snapshot-append-vec-workers", snapshot.DefaultSnapshotAppendVecCopyingWorkers, "Snapshot bootstrap appendvec write workers")
 	Run.Flags().IntVar(&snapshot.SnapshotIndexEntryBuilderWorkers, "snapshot-index-builder-workers", snapshot.DefaultSnapshotIndexEntryBuilderWorkers, "Snapshot bootstrap account-index parser workers")
 	Run.Flags().IntVar(&snapshot.SnapshotIndexEntryCommitterWorkers, "snapshot-index-committer-workers", snapshot.DefaultSnapshotIndexEntryCommitterWorkers, "Snapshot bootstrap account-index shard enqueue workers")
@@ -614,6 +618,8 @@ func init() {
 	Run.Flags().IntVar(&accountsdb.StoreAccountsWorkers, "store-accounts-workers", 128, "Number of workers to write account updates")
 	Run.Flags().IntVar(&accountsdb.ProgramCacheMaxMB, "program-cache-max-mb", accountsdb.DefaultProgramCacheMaxMB, "Maximum approximate SBPF program cache size in MiB")
 	Run.Flags().IntVar(&accountsdb.CommonAccountCacheMaxMB, "common-account-cache-max-mb", accountsdb.DefaultCommonAccountCacheMaxMB, "Approximate retained decoded account cache weight budget in MiB")
+	Run.Flags().IntVar(&accountsdb.IndexCacheMaxMB, "index-cache-max-mb", accountsdb.DefaultIndexCacheMaxMB, "Pebble account-index block cache capacity in MiB")
+	Run.Flags().StringVar(&accountsdb.CommonAccountCacheLayout, "common-account-cache-layout", "fixed", "Account cache layout: fixed (up to 16 MiB empty and 64 MiB small accounts, the rest larger ones) or flat (one cache for every size)")
 	Run.Flags().Int64Var(&rewindToSlot, "rewind-to-slot", 0, "Rewind durable account state to the fold batch boundary at this slot before replaying (must be a retained boundary; run once to list boundaries on mismatch)")
 
 	// [tuning.pprof] section flags
@@ -829,13 +835,25 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	if incrementalSnapshotFilename == "" {
 		incrementalSnapshotFilename = getString("incremental-snapshot", "ledger.incremental_snapshot")
 	}
-	accountsPath = getString("accounts-path", "storage.accounts")
-	if accountsPath == "" {
-		accountsPath = getString("accounts-path", "ledger.accounts_path")
+	// storage.accounts is a list of one dir per disk shard; the single-disk case
+	// is just a slice of one. A scalar string in TOML is accepted too (viper casts
+	// it to a 1-element slice), and the --accounts-path CLI flag takes 1+ dirs.
+	accountsPaths = getStringSlice("accounts-path", "storage.accounts")
+	if len(accountsPaths) == 0 {
+		accountsPaths = getStringSlice("accounts-path", "ledger.accounts_path")
 	}
-	// Check write permission early to fail fast with helpful error
-	if err := checkDirWritable(accountsPath, "AccountsDB"); err != nil {
+	if len(accountsPaths) == 0 {
+		return fmt.Errorf("no accounts path configured (set storage.accounts)")
+	}
+	if err := accountsdb.ValidateAccountsPaths(accountsPaths); err != nil {
 		return err
+	}
+	accountsPath = accountsPaths[0]
+	// Check write permission early to fail fast with helpful error
+	for _, p := range accountsPaths {
+		if err := checkDirWritable(p, "AccountsDB"); err != nil {
+			return err
+		}
 	}
 	blockstorePath = getString("ledger-path", "storage.shredstore")
 	if blockstorePath == "" && config.IsSet("storage.blockstore") {
@@ -867,7 +885,7 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 			return err
 		}
 	}
-	alpenglowMode, err := alpenglowModeForCluster(cluster)
+	alpenglowMode, err := resolveProtocolMode(cluster, config.GetString("consensus.protocol"))
 	if err != nil {
 		return err
 	}
@@ -1181,6 +1199,12 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 
 	snapshot.ZstdDecoderConcurrency = getInt("zstd-decoder-concurrency", "tuning.zstd_decoder_concurrency")
 	snapshot.MaxConcurrentFlushers = getInt("max-concurrent-flushers", "tuning.max_concurrent_flushers")
+	snapshot.SnapshotFlushSortWorkers = getInt("flush-sort-workers", "tuning.flush_sort_workers")
+	snapshotAccountsDirMinFreeMB = getInt("snapshot-accounts-dir-min-free-mb", "tuning.snapshot_accounts_dir_min_free_mb")
+	if snapshotAccountsDirMinFreeMB < 0 {
+		return fmt.Errorf("tuning.snapshot_accounts_dir_min_free_mb must be >= 0, got %d", snapshotAccountsDirMinFreeMB)
+	}
+	snapshot.SnapshotAccountsDirMinFreeBytes = uint64(snapshotAccountsDirMinFreeMB) << 20
 	snapshot.SnapshotAppendVecCopyingWorkers = getInt("snapshot-append-vec-workers", "tuning.snapshot_append_vec_workers")
 	snapshot.SnapshotIndexEntryBuilderWorkers = getInt("snapshot-index-builder-workers", "tuning.snapshot_index_builder_workers")
 	snapshot.SnapshotIndexEntryCommitterWorkers = getInt("snapshot-index-committer-workers", "tuning.snapshot_index_committer_workers")
@@ -1219,7 +1243,7 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	}
 	resolvedSigverifyBackend = resolved
 	sbpf.UsePool = getBool("use-pool", "tuning.use_pool")
-	// [tuning] streaming execution (off by default; Alpenglow turbine only).
+	// [tuning] streaming execution (on by default; Alpenglow turbine only).
 	replay.StreamingExecutionCfg.Enabled = getBool("streaming-execution", "tuning.streaming_execution")
 	replay.StreamingExecutionCfg.Workers = getInt("streaming-workers", "tuning.streaming_workers")
 	replay.StreamingExecutionCfg.MinGroupBatches = getInt("streaming-min-group-batches", "tuning.streaming_min_group_batches")
@@ -1234,6 +1258,10 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	accountsdb.CommonAccountCacheMaxMB = getInt("common-account-cache-max-mb", "tuning.common_account_cache_max_mb")
 	if accountsdb.CommonAccountCacheMaxMB <= 0 {
 		return fmt.Errorf("tuning.common_account_cache_max_mb must be > 0")
+	}
+
+	if err := configureCacheSettings(cmd); err != nil {
+		return err
 	}
 
 	if err := configureMemoryBudgets(); err != nil {
@@ -1330,7 +1358,10 @@ func buildSnapshotConfig(rpcEndpoints []string) snapshotdl.SnapshotConfig {
 }
 
 func runLive(c *cobra.Command, args []string) {
-	alpenglowMode := cluster == "alpenglow"
+	alpenglowMode, protocolErr := resolveProtocolMode(cluster, config.GetString("consensus.protocol"))
+	if protocolErr != nil {
+		klog.Fatalf("%v", protocolErr)
+	}
 	if pprofPort != -1 {
 		startPprofHandlers(int(pprofPort))
 	}
@@ -1832,7 +1863,7 @@ func runLive(c *cobra.Command, args []string) {
 		// Build directly from the specified files (BuildAccountsDbPaths handles AccountsDB cleanup internally)
 		// NOTE: We do NOT clean snapshot files in explicit mode - user wants to keep their explicit snapshots
 		dp := progress.NewDualProgress()
-		accountsDb, manifest, err = snapshot.BuildAccountsDbPaths(ctx, snapshotArchivePath, incrementalSnapshotFilename, accountsPath, dp)
+		accountsDb, manifest, err = snapshot.BuildAccountsDbPaths(ctx, snapshotArchivePath, incrementalSnapshotFilename, accountsPaths, dp)
 		if err != nil {
 			klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
 		}
@@ -1856,7 +1887,7 @@ func runLive(c *cobra.Command, args []string) {
 			mlog.Log.Infof("WARNING: no state file found, AccountsDB may be from incomplete build")
 		}
 		mlog.Log.Infof("Resuming from existing AccountsDB at slot %d", accountsDBSlot)
-		accountsDb, err = accountsdb.OpenDb(accountsPath)
+		accountsDb, err = accountsdb.OpenDbPaths(accountsPaths)
 		if err != nil {
 			klog.Fatalf("failed to open AccountsDB at %s: %v", accountsPath, err)
 		}
@@ -1903,7 +1934,7 @@ func runLive(c *cobra.Command, args []string) {
 				state.RecordRebuild(accountsPath, 0, "", getVersion(), getCommit(), getBranch(), "new-snapshot mode (no prior state)")
 			}
 			mlog.Log.Infof("Cleaning up previous AccountsDB artifacts in %s", accountsPath)
-			snapshot.CleanAccountsDbDir(accountsPath)
+			snapshot.CleanAccountsDbDirs(accountsPaths)
 		}
 		// Clean existing snapshots (respecting retention setting)
 		if snapshotDownloadPath != "" {
@@ -1914,7 +1945,7 @@ func runLive(c *cobra.Command, args []string) {
 			mlog.Log.Infof("Cleaning up existing snapshot files in %s (keeping %d)", snapshotDownloadPath, maxSnapshots)
 			snapshot.CleanSnapshotDownloadDir(snapshotDownloadPath, maxSnapshots)
 		}
-		accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPath, blockstorePath)
+		accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPaths, blockstorePath)
 		if err != nil {
 			klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
 		}
@@ -1949,9 +1980,9 @@ func runLive(c *cobra.Command, args []string) {
 				state.RecordRebuild(accountsPath, 0, "", getVersion(), getCommit(), getBranch(), "new-incremental mode (no prior state)")
 			}
 			mlog.Log.Infof("Cleaning up previous AccountsDB artifacts in %s", accountsPath)
-			snapshot.CleanAccountsDbDir(accountsPath)
+			snapshot.CleanAccountsDbDirs(accountsPaths)
 		}
-		accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPath, blockstorePath, rpcEndpoints)
+		accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPaths, blockstorePath, rpcEndpoints)
 		if err != nil {
 			klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
 		}
@@ -1975,7 +2006,7 @@ func runLive(c *cobra.Command, args []string) {
 				state.RecordRebuild(accountsPath, 0, "", getVersion(), getCommit(), getBranch(), "snapshot mode (no prior state)")
 			}
 			mlog.Log.Infof("Cleaning up previous AccountsDB artifacts in %s", accountsPath)
-			snapshot.CleanAccountsDbDir(accountsPath)
+			snapshot.CleanAccountsDbDirs(accountsPaths)
 		}
 
 		// Check for existing fresh snapshot
@@ -1988,7 +2019,7 @@ func runLive(c *cobra.Command, args []string) {
 		if existingSnap != nil {
 			// Reuse existing snapshot
 			mlog.Log.Infof("Reusing existing snapshot file at slot %d", existingSnap.slot)
-			accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPath, blockstorePath, rpcEndpoints)
+			accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPaths, blockstorePath, rpcEndpoints)
 		} else {
 			// Download fresh
 			mlog.Log.Infof("no fresh snapshot file found, downloading new one")
@@ -2000,7 +2031,7 @@ func runLive(c *cobra.Command, args []string) {
 				}
 				snapshot.CleanSnapshotDownloadDir(snapshotDownloadPath, maxSnapshots)
 			}
-			accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPath, blockstorePath)
+			accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPaths, blockstorePath)
 		}
 		if err != nil {
 			klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
@@ -2078,7 +2109,7 @@ func runLive(c *cobra.Command, args []string) {
 						// mithrilState is guaranteed non-nil here (we prompted because it was stale)
 						state.RecordRebuild(accountsPath, mithrilState.LastSlot, mithrilState.LastBankhash, getVersion(), getCommit(), getBranch(), "user chose rebuild (stale AccountsDB)")
 						mlog.Log.Infof("Cleaning up previous AccountsDB artifacts in %s", accountsPath)
-						snapshot.CleanAccountsDbDir(accountsPath)
+						snapshot.CleanAccountsDbDirs(accountsPaths)
 					}
 					// choice 3 forces a fresh download: skip the local-reuse check.
 					if choice == 2 {
@@ -2086,7 +2117,7 @@ func runLive(c *cobra.Command, args []string) {
 					}
 					if existingSnap != nil {
 						mlog.Log.Infof("Reusing existing snapshot file at slot %d", existingSnap.slot)
-						accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPath, blockstorePath, rpcEndpoints)
+						accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPaths, blockstorePath, rpcEndpoints)
 					} else {
 						// Clean up old snapshot files
 						if snapshotDownloadPath != "" {
@@ -2096,7 +2127,7 @@ func runLive(c *cobra.Command, args []string) {
 							}
 							snapshot.CleanSnapshotDownloadDir(snapshotDownloadPath, maxSnapshots)
 						}
-						accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPath, blockstorePath)
+						accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPaths, blockstorePath)
 					}
 					if err != nil {
 						klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
@@ -2115,7 +2146,7 @@ func runLive(c *cobra.Command, args []string) {
 			mlog.Log.Infof("mode=auto: Resuming from existing AccountsDB at slot %d", accountsDBSlot)
 			// Record resume in history
 			state.RecordResume(accountsPath, mithrilState.LastSlot, mithrilState.LastBankhash, replay.CurrentRunID, getVersion(), getCommit(), getBranch())
-			accountsDb, err = accountsdb.OpenDb(accountsPath)
+			accountsDb, err = accountsdb.OpenDbPaths(accountsPaths)
 			if err != nil {
 				klog.Fatalf("failed to open AccountsDB at %s: %v", accountsPath, err)
 			}
@@ -2187,14 +2218,14 @@ func runLive(c *cobra.Command, args []string) {
 					state.RecordRebuild(accountsPath, 0, "", getVersion(), getCommit(), getBranch(), reason)
 				}
 				mlog.Log.Infof("Cleaning up previous AccountsDB artifacts in %s", accountsPath)
-				snapshot.CleanAccountsDbDir(accountsPath)
+				snapshot.CleanAccountsDbDirs(accountsPaths)
 			}
 
 			// Check for existing fresh snapshot
 			existingSnap := detectFreshSnapshot(snapshotDownloadPath, fullThreshold, rpcEndpoints, ctx)
 			if existingSnap != nil {
 				mlog.Log.Infof("Reusing existing snapshot file at slot %d", existingSnap.slot)
-				accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPath, blockstorePath, rpcEndpoints)
+				accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPaths, blockstorePath, rpcEndpoints)
 			} else {
 				// Clean up old snapshot files based on retention settings
 				maxSnapshots := config.GetInt("snapshot.max_full_snapshots")
@@ -2202,7 +2233,7 @@ func runLive(c *cobra.Command, args []string) {
 					maxSnapshots = 1 // default: keep 1 snapshot
 				}
 				snapshot.CleanSnapshotDownloadDir(snapshotDownloadPath, maxSnapshots)
-				accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPath, blockstorePath)
+				accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPaths, blockstorePath)
 			}
 			if err != nil {
 				klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
@@ -2369,7 +2400,7 @@ postBootstrap:
 		mlog.Log.Warnf("storage.fork_aware was removed: the working-set suffix engine handles fork switches via unwind+re-execute — delete the key")
 	}
 	// [verifier]: the trailing execution verifier (dual-watermark second leg).
-	vcfg := replay.TrailingVerifierDefaults()
+	vcfg := defaultVerifierConfigForBlockSource(alpenglowMode, blockSource, blockRPCFallback)
 	if config.IsSet("verifier.enabled") {
 		vcfg.Enabled = config.GetBool("verifier.enabled")
 	}
@@ -2511,12 +2542,11 @@ postBootstrap:
 			klog.Fatalf("--rewind-to-slot=%d is not a checkpoint-valid retained fold boundary\navailable checkpoint-valid fold boundaries: %s",
 				rewindToSlot, formatRewindPoints(validPoints))
 		}
-		res, rerr := accountsDb.RewindToBatchBoundary(uint64(rewindToSlot))
+		res, rerr := accountsDb.RewindToBatchBoundaryAndPersist(uint64(rewindToSlot), func(res accountsdb.RewindResult) error {
+			return persistRewindResult(accountsPath, mithrilState, res)
+		})
 		if rerr != nil {
 			klog.Fatalf("--rewind-to-slot=%d failed: %v\navailable checkpoint-valid fold boundaries: %s", rewindToSlot, rerr, formatRewindPoints(validPoints))
-		}
-		if err := adoptRewindResult(accountsPath, mithrilState, res); err != nil {
-			klog.Fatalf("--rewind-to-slot=%d: %v; re-bootstrap with --bootstrap snapshot", rewindToSlot, err)
 		}
 		mlog.Log.Warnf("rewound durable state to fold boundary at slot %d (%d batches / %d keys undone); replay resumes from slot %d",
 			res.NewThrough, res.UndoneBatches, res.UndoneKeys, mithrilState.GetResumeSlot())
@@ -3010,9 +3040,11 @@ postBootstrap:
 	}
 	if alpenglowMode {
 		consensusOpts.TransactionStatusCheckpointAfterCommit = func(selected *state.TransactionStatusCheckpointRef) error {
+			run := transactionStatusCleanupTask.Start()
 			removed, err := cleanupRetainedTransactionStatusCheckpoints(
 				accountsPath, accountsDb, compactCfg.RewindHorizonBatches, selected,
 			)
+			run.EndErr(err, func() string { return fmt.Sprintf("removed %d file(s)", len(removed)) })
 			if err == nil && len(removed) > 0 {
 				mlog.Log.FileOnlyf("transaction-status checkpoint retention removed %d file(s) outside the %d-batch rewind horizon",
 					len(removed), compactCfg.RewindHorizonBatches)
@@ -3940,7 +3972,7 @@ func queryLatestSnapshotSlot(ctx context.Context, rpcEndpoints []string) (uint64
 }
 
 // buildFromExistingSnapshot builds AccountsDB from an existing downloaded snapshot file.
-func buildFromExistingSnapshot(ctx context.Context, snap *snapshotInfo, snapshotDir, accountsPath, blockstorePath string, rpcEndpoints []string) (*accountsdb.AccountsDb, *snapshot.SnapshotManifest, error) {
+func buildFromExistingSnapshot(ctx context.Context, snap *snapshotInfo, snapshotDir string, accountsPaths []string, blockstorePath string, rpcEndpoints []string) (*accountsdb.AccountsDb, *snapshot.SnapshotManifest, error) {
 	snapCfg := buildSnapshotConfig(rpcEndpoints)
 
 	// Construct full path to snapshot file
@@ -3950,7 +3982,7 @@ func buildFromExistingSnapshot(ctx context.Context, snap *snapshotInfo, snapshot
 	// Create progress display for extract
 	dp := progress.NewDualProgress()
 
-	accountsDb, manifest, err := snapshot.BuildAccountsDbAuto(ctx, fullSnapshotPath, snapshotDir, int(snap.slot), int(snap.slot), accountsPath, rpcEndpoints, blockstorePath, snapCfg, dp)
+	accountsDb, manifest, err := snapshot.BuildAccountsDbAuto(ctx, fullSnapshotPath, snapshotDir, int(snap.slot), int(snap.slot), accountsPaths, rpcEndpoints, blockstorePath, snapCfg, dp)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to build AccountsDB from snapshot: %w", err)
 	}
@@ -3960,7 +3992,7 @@ func buildFromExistingSnapshot(ctx context.Context, snap *snapshotInfo, snapshot
 }
 
 // downloadAndBuildFromSnapshot finds, downloads, and builds AccountsDB from a snapshot
-func downloadAndBuildFromSnapshot(ctx context.Context, rpcEndpoints []string, snapshotDownloadPath, accountsPath, blockstorePath string) (*accountsdb.AccountsDb, *snapshot.SnapshotManifest, error) {
+func downloadAndBuildFromSnapshot(ctx context.Context, rpcEndpoints []string, snapshotDownloadPath string, accountsPaths []string, blockstorePath string) (*accountsdb.AccountsDb, *snapshot.SnapshotManifest, error) {
 	snapCfg := buildSnapshotConfig(rpcEndpoints)
 	fullSnapshotDlStart := time.Now()
 	fullSnapshotInfo, err := snapshotdl.GetSnapshotURLWithInfo(ctx, snapCfg)
@@ -3984,7 +4016,7 @@ func downloadAndBuildFromSnapshot(ctx context.Context, rpcEndpoints []string, sn
 	// Create progress display for snapshot download and extract
 	dp := progress.NewDualProgress()
 
-	accountsDb, manifest, err := snapshot.BuildAccountsDbAuto(ctx, fullSnapshotURL, snapshotDownloadPath, fullSnapshotSlot, fullSnapshotInfo.ReferenceSlot, accountsPath, rpcEndpoints, blockstorePath, snapCfg, dp)
+	accountsDb, manifest, err := snapshot.BuildAccountsDbAuto(ctx, fullSnapshotURL, snapshotDownloadPath, fullSnapshotSlot, fullSnapshotInfo.ReferenceSlot, accountsPaths, rpcEndpoints, blockstorePath, snapCfg, dp)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to build AccountsDB from snapshot: %w", err)
 	}
@@ -4295,7 +4327,7 @@ func retainedTransactionStatusCheckpointRefs(accountsDb *accountsdb.AccountsDb, 
 		}
 	}
 
-	headers, err := accountsdb.ListFoldManifests(accountsDb.AcctsDir)
+	headers, parkedPaths, err := accountsdb.ListFoldAndParkedManifests(accountsDb.AcctsDir)
 	if err != nil {
 		return nil, fmt.Errorf("list retained fold manifests: %w", err)
 	}
@@ -4320,15 +4352,7 @@ func retainedTransactionStatusCheckpointRefs(accountsDb *accountsdb.AccountsDb, 
 	// Parked manifests remain in the AccountsDB segment directory only while a
 	// rewind is incomplete. Completed forensic manifests live under rewound/
 	// and are no longer actionable, so they do not pin sidecars forever.
-	entries, err := os.ReadDir(accountsDb.AcctsDir)
-	if err != nil {
-		return nil, fmt.Errorf("scan parked fold manifests: %w", err)
-	}
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".manifest.rewound") {
-			continue
-		}
-		path := filepath.Join(accountsDb.AcctsDir, entry.Name())
+	for _, path := range parkedPaths {
 		manifest, err := accountsdb.ReadSegmentManifest(path)
 		if err != nil {
 			return nil, fmt.Errorf("read parked fold manifest %s: %w", path, err)
@@ -4388,32 +4412,58 @@ func adoptRewindResult(accountsDbPath string, s *state.MithrilState, res account
 	return nil
 }
 
-// completeInterruptedRewind finishes a rewind that crashed mid-flight (parked
-// ".rewound" manifests remain). It rewinds to the highest retained boundary
-// below the parked suffix — RewindToBatchBoundary is idempotent, so this works
-// whether the crash landed before the meta rollback (does the full rewind now)
-// or after it (a no-op that just finalizes the leftovers) — and adopts that
-// boundary as the rooted checkpoint. Fatals only when nothing is left to finish
-// the rewind with.
+// Persist a copy first so a failed save cannot publish a usable in-memory
+// checkpoint. The AccountsDB intent remains until this durable save succeeds.
+func persistRewindResult(path string, s *state.MithrilState, res accountsdb.RewindResult) error {
+	next := *s
+	if err := adoptRewindResult(path, &next, res); err != nil {
+		return err
+	}
+	if err := next.Save(path); err != nil {
+		return fmt.Errorf("persist rewound state: %w", err)
+	}
+	*s = next
+	return nil
+}
+
+// completeInterruptedRewind completes an exact durable intent first. Legacy
+// parked suffixes without an intent use the highest retained non-parked boundary.
+// Both paths save the lowered checkpoint before allowing forward replay.
 func completeInterruptedRewind(accountsDbPath string, accountsDb *accountsdb.AccountsDb, mithrilState *state.MithrilState) {
 	points, err := accountsDb.ListRewindPoints()
 	if err != nil || len(points) == 0 {
 		klog.Fatalf("interrupted rewind detected but no retained fold boundary remains to complete it; re-bootstrap with --bootstrap snapshot")
 	}
-	// The rewind parks every batch above its target, so the highest still-present
-	// (non-parked) boundary IS the target.
+	// A new intent fixes the target even before the first manifest is parked.
+	// Only legacy interruptions infer it from the remaining boundaries.
+	target, intentErr := accountsDb.PendingRewindTarget()
+	if intentErr != nil {
+		klog.Fatalf("invalid pending rewind intent: %v", intentErr)
+	}
 	targetPoint := points[len(points)-1]
-	target := targetPoint.ThroughSlot
+	if target != 0 {
+		found := false
+		for _, point := range points {
+			if point.ThroughSlot == target {
+				targetPoint, found = point, true
+				break
+			}
+		}
+		if !found {
+			klog.Fatalf("pending rewind target %d is not retained", target)
+		}
+	} else {
+		target = targetPoint.ThroughSlot
+	}
 	if err := validateTransactionStatusRewindPoint(accountsDbPath, accountsDb, targetPoint); err != nil {
 		klog.Fatalf("interrupted rewind target at slot %d has an invalid transaction-status checkpoint: %v; re-bootstrap with --bootstrap snapshot", target, err)
 	}
 	oldRooted := mithrilState.LastRootedSlot
-	res, rerr := accountsDb.RewindToBatchBoundary(target)
+	res, rerr := accountsDb.RewindToBatchBoundaryAndPersist(target, func(res accountsdb.RewindResult) error {
+		return persistRewindResult(accountsDbPath, mithrilState, res)
+	})
 	if rerr != nil {
 		klog.Fatalf("could not complete interrupted rewind to slot %d: %v; re-run --rewind-to-slot=%d", target, rerr, target)
-	}
-	if aerr := adoptRewindResult(accountsDbPath, mithrilState, res); aerr != nil {
-		klog.Fatalf("interrupted rewind at slot %d: %v; re-run --rewind-to-slot=%d", res.NewThrough, aerr, target)
 	}
 	mlog.Log.Warnf("completed interrupted rewind: durable state at fold boundary %d (state file said %d)", res.NewThrough, oldRooted)
 }
@@ -4452,25 +4502,21 @@ func rewindStoreBelowDivergence(accountsDbPath string, accountsDb *accountsdb.Ac
 		return false
 	}
 	oldRooted := s.LastRootedSlot
-	res, err := accountsDb.RewindToBatchBoundary(target)
+	res, err := accountsDb.RewindToBatchBoundaryAndPersist(target, func(res accountsdb.RewindResult) error {
+		if rewards, ok := rpcServer.(interface{ SetRootedEpochRewardsSlot(uint64) error }); ok {
+			if err := rewards.SetRootedEpochRewardsSlot(res.NewThrough); err != nil {
+				return fmt.Errorf("rewind RPC epoch rewards: %w", err)
+			}
+		}
+		if history, ok := rpcServer.(interface{ RewindBlockHistory(uint64) error }); ok {
+			if err := history.RewindBlockHistory(res.NewThrough); err != nil {
+				return fmt.Errorf("rewind RPC block history: %w", err)
+			}
+		}
+		return persistRewindResult(accountsDbPath, s, res)
+	})
 	if err != nil {
 		mlog.Log.Errorf("fork switch: rewind to boundary %d failed: %v; halting", target, err)
-		return false
-	}
-	if rewards, ok := rpcServer.(interface{ SetRootedEpochRewardsSlot(uint64) error }); ok {
-		if err := rewards.SetRootedEpochRewardsSlot(res.NewThrough); err != nil {
-			mlog.Log.Errorf("fork switch: rewind RPC epoch rewards to slot %d: %v; halting", res.NewThrough, err)
-			return false
-		}
-	}
-	if history, ok := rpcServer.(interface{ RewindBlockHistory(uint64) error }); ok {
-		if err := history.RewindBlockHistory(res.NewThrough); err != nil {
-			mlog.Log.Errorf("fork switch: rewind RPC block history to slot %d: %v; halting", res.NewThrough, err)
-			return false
-		}
-	}
-	if err := adoptRewindResult(accountsDbPath, s, res); err != nil {
-		mlog.Log.Errorf("fork switch: %v; halting", err)
 		return false
 	}
 	mlog.Log.Warnf("fork switch: superseded slot %d was already folded (R=%d); rewound durable state to boundary %d (%d batches / %d keys undone)",
@@ -4759,4 +4805,13 @@ func runReplayWithRecovery(
 		result = replay.ReplayBlocks(ctx, accountsDb, accountsDbPath, mithrilState, rs, retryStart, endSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, turbineShredVersion, turbineAlpenglowAddr, turbineIdentity, blockDir, txParallelism, isLive, useLightbringer, useTurbine, dbgOpts, metricsWriter, rpcServer, blockFetchOpts, consensusOpts, onCancelWriteState)
 	}
 	return result
+}
+
+func defaultVerifierConfigForBlockSource(alpenglow bool, source string, rpcFallback bool) replay.VerifierConfig {
+	cfg := replay.TrailingVerifierDefaults()
+	if alpenglow && source == "turbine" && !rpcFallback {
+		cfg.Enabled = false
+		cfg.ValidatorFooterHash = true
+	}
+	return cfg
 }

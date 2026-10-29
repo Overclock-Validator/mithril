@@ -269,6 +269,10 @@ func TestCalculateDeltaLtHashFastPathMetrics(t *testing.T) {
 	if replayMetrics.LtHashNewDataBytes != uint64(len(created.Data)+len(newest.Data)) {
 		t.Fatalf("new hashed data bytes = %d, want %d", replayMetrics.LtHashNewDataBytes, len(created.Data)+len(newest.Data))
 	}
+	// Zero-to-zero accounts carry no hashed data, so only the two live ones count.
+	if replayMetrics.LtHashUnchangedDataBytes != uint64(len(oldUnchanged.Data)+len(oldRent.Data)) {
+		t.Fatalf("unchanged data bytes = %d, want %d", replayMetrics.LtHashUnchangedDataBytes, len(oldUnchanged.Data)+len(oldRent.Data))
+	}
 	if replayMetrics.LtHashDedupe.Count != 1 || replayMetrics.LtHashWorkerCompute.Count != 1 || replayMetrics.LtHashPartialReduce.Count != 1 {
 		t.Fatalf("phase timing counts = %d/%d/%d, want 1/1/1",
 			replayMetrics.LtHashDedupe.Count, replayMetrics.LtHashWorkerCompute.Count, replayMetrics.LtHashPartialReduce.Count)
