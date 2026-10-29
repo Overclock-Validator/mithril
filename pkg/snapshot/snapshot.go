@@ -65,7 +65,8 @@ func UnmarshalManifestFromSnapshot(ctx context.Context, filename string, account
 
 type appendVecCopyingTask struct {
 	Filename                string
-	TarBuffer               *bytes.Buffer
+	Buf                     []byte
+	BufRef                  *[]byte // pooled buffer backing Buf; returned after indexing
 	FromIncrementalSnapshot bool
 }
 
@@ -74,6 +75,7 @@ type indexEntryBuilderTask struct {
 	FileSize uint64
 	Slot     uint64
 	FileId   uint64
+	BufRef   *[]byte // pooled buffer backing Data; returned once parsed
 }
 
 type indexEntryCommitterTask struct {

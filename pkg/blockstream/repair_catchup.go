@@ -141,6 +141,7 @@ func (bs *BlockSource) runRepairCatchup(ctx context.Context, receiver *turbine.U
 	// repair threshold waits for shreds instead of starting an RPC catchup
 	// it would abandon.
 	first := true
+	spoolSkipsChecked := false
 	releaseHold := func() {
 		if first {
 			first = false
@@ -173,10 +174,27 @@ func (bs *BlockSource) runRepairCatchup(ctx context.Context, receiver *turbine.U
 			}
 		}
 
+		// Once, before anything is served: a spooled block the cluster
+		// skipped (a later spooled block links past it) would replay an
+		// abandoned branch and halt on the fork switch at every restart.
+		if !spoolSkipsChecked {
+			spoolSkipsChecked = true
+			if dropped := receiver.DiscardSpooledSkippedSlots(from, repairCatchupSpoolScan); len(dropped) > 0 {
+				mlog.Log.Infof("repair catchup: discarded spooled slots %v: a later spooled block links past them (skipped on its branch); repair fetches them again if certificates name them", dropped)
+			}
+		}
+
 		// Tip signal: turbine's shred edge or the RPC confirmed tip,
-		// whichever is ahead. On the first pass, wait a bounded window for
-		// any signal before releasing the RPC hold.
+		// whichever is ahead. Blocks the spool already holds complete from
+		// the frontier count too: a restarted node can replay those at once
+		// instead of waiting for gossip and turbine to wake. On the first
+		// pass, wait a bounded window for any signal before releasing the RPC
+		// hold.
 		edge := bs.repairCatchupEdge(receiver)
+		spoolEdge, spoolReady := receiver.SpoolCompleteThrough(from, repairCatchupSpoolScan)
+		if spoolReady && spoolEdge > edge {
+			edge = spoolEdge
+		}
 		if edge == 0 && first {
 			deadline := time.Now().Add(repairCatchupDecisionTimeout)
 			for edge == 0 && time.Now().Before(deadline) && !bs.stopped.Load() && ctx.Err() == nil {
@@ -219,7 +237,9 @@ func (bs *BlockSource) runRepairCatchup(ctx context.Context, receiver *turbine.U
 		if eligible {
 			shredEdge, _ = receiver.ShredEdges()
 			repairPeers = receiver.Stats().Repair.Peers
-			turbineReady = shredEdge > 0 && repairPeers > 0
+			// Complete spooled blocks at the frontier need neither: the drive
+			// hydrates them from disk, and repair takes over when turbine wakes.
+			turbineReady = (shredEdge > 0 && repairPeers > 0) || spoolReady
 		}
 
 		if !eligible || !turbineReady {
@@ -266,6 +286,9 @@ func (bs *BlockSource) runRepairCatchup(ctx context.Context, receiver *turbine.U
 		bs.repairCatchupUntil.Store(edge)
 		receiver.SetRetentionFloor(from)
 		releaseHold()
+		if spoolReady && (shredEdge == 0 || repairPeers == 0) {
+			mlog.Log.Infof("repair catchup: slots %d..%d are complete in the shred spool; replaying them before turbine is up (shreds received: %v, repair peers: %d)", from, spoolEdge, shredEdge > 0, repairPeers)
+		}
 		mlog.Log.Infof("repair catchup: filling slots %d..%d (%d slots) via turbine repair", from, edge, gap)
 
 		if done := bs.driveRepairCatchup(ctx, receiver, from, edge); done {
@@ -770,6 +793,7 @@ func (bs *BlockSource) driveRepairCatchup(ctx context.Context, receiver *turbine
 		if time.Since(lastPeerTableLog) >= 60*time.Second {
 			lastPeerTableLog = time.Now()
 			logRepairPeerTable(receiver, fmt.Sprintf("catchup head %d", waiting))
+			bs.GoodRepairPeers(1) // refresh the list a shutdown save falls back to
 			if quality := repairPeerQualityLine(receiver); quality != "" {
 				mlog.NamedFilef("catchup", "peer quality: %s", quality)
 			}

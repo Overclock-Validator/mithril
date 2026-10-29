@@ -94,6 +94,19 @@ name = "mithril"
     # Put this on your fastest NVMe due to heavy random I/O.
     accounts = "/mnt/mithril-accounts"
 
+    # With several NVMe disks, accounts may instead be a list of directories, one
+    # per disk. The snapshot unpack spreads appendvec files across them, sending
+    # each file to the disk with the fewest bytes still being written, so write
+    # throughput approaches the sum of the disks. The first entry also holds the
+    # index, manifest, state and every fold segment; the others hold only their
+    # share of the snapshot's appendvecs (and their compaction outputs). The
+    # number of directories is fixed at build time: changing it requires a
+    # rebuild. One directory is the ordinary single-disk layout.
+    #   accounts = [
+    #       "/mnt/nvme0/mithril-accounts",  # primary: metadata, folds, a share of the snapshot
+    #       "/mnt/nvme1/mithril-accounts",
+    #   ]
+
     # Fold batch size K: rooted (finalized+verified) slots fold to disk K at a
     # time as ONE union-deduped sequential segment with ONE fsync. Larger K =
     # fewer, larger writes (less NVMe wear: hot accounts written once per K
@@ -581,10 +594,10 @@ name = "mithril"
 
     # Streaming execution (Alpenglow, native turbine only): execute a block's
     # entry batches while its remaining shreds arrive, on a speculative bank
-    # over the executed parent. The complete block stays authoritative — the
+    # over the executed parent. The complete block stays authoritative: the
     # executed prefix must be the block's own transactions (pointer identity)
-    # or the bank is discarded and the block executes whole. Off by default.
-    # streaming_execution = false
+    # or the bank is discarded and the block executes whole. On by default.
+    # streaming_execution = true
     # Execution workers per streaming group (0 = min(txpar, 4)).
     # streaming_workers = 0
     # Contiguous decoded batches to accumulate before a group executes
@@ -608,7 +621,8 @@ name = "mithril"
     snapshot_index_committer_workers = 64
 
     # Number of temporary account-index shard logs/SSTs.
-    snapshot_index_shards = 64
+    # More shards reduce per-flusher sort memory when entries are evenly spread.
+    snapshot_index_shards = 256
 
     # Optional temp directory for snapshot index shard logs/SST staging.
     # This can move tens of GB of temporary write/read churn off the AccountsDB
@@ -617,7 +631,18 @@ name = "mithril"
     snapshot_index_temp_dir = ""
 
     # Bound for number of index shards to convert to SSTs at once.
+    # Lower this to reduce concurrent sort memory at the cost of throughput.
     max_concurrent_flushers = 8
+
+    # Concurrent sort workers used during the index flush.
+    # 0 (default) = one per CPU.
+    # flush_sort_workers = 0
+
+    # With several accounts directories, stop placing unpacked snapshot data on a
+    # filesystem once its free space falls to this many MiB, and send the rest to
+    # the other directories, so disks of different sizes each fill to capacity.
+    # Ignored with a single accounts directory.
+    # snapshot_accounts_dir_min_free_mb = 16384
 
     # Size in MB for serialized parameter arena (0 to disable)
     param_arena_size_mb = 512
@@ -636,7 +661,17 @@ name = "mithril"
 
     # Approximate retained decoded account cache weight budget in MiB. Large block scans
     # pass through a bounded two-hit admission filter before using this budget.
-    common_account_cache_max_mb = 256
+    common_account_cache_max_mb = 768
+
+    # Pebble block cache for the account locator index (not account payloads).
+    index_cache_max_mb = 256
+
+    # fixed (default): up to 16 MiB for empty accounts and 64 MiB for accounts
+    #   <=200 bytes (at most 1/8 and 1/4 of the budget), the rest for larger
+    #   accounts (where a bigger cache keeps paying off).
+    # flat: one weighted cache for every account size.
+    # Reservations split common_account_cache_max_mb; they do not add a budget.
+    common_account_cache_layout = "fixed"
 
     # [tuning.pprof] - CPU/Memory Profiling
     #
@@ -911,9 +946,13 @@ name = "mithril"
 # executes received blocks locally, requires the resulting bank hash to match
 # the footer committed by the certified block id, and folds on certificate
 # finality. The settings below therefore apply to verifying mode only.
+#
+# Default: on, except for Alpenglow on turbine without RPC fallback, where
+# blocks are checked against the bank hash in their certified footer instead
+# and the RPC verifier is off. Setting enabled here overrides that default.
 
 [verifier]
-    enabled = true
+    # enabled = true
 
     # Gate folds on the verified watermark. false = advisory only (folds gate
     # on certificate finality alone — an execution divergence would reach disk

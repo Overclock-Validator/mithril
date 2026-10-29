@@ -45,7 +45,7 @@ func TestSerializeParametersAlignedZeroPadding(t *testing.T) {
 				if mapping == "direct" {
 					ctx.Features.EnableFeature(features.AccountDataDirectMapping, 0)
 				}
-				golden, _, _, _, _, err := serializeParametersAligned(ctx)
+				golden, _, _, _, err := serializeParametersAligned(ctx)
 				require.NoError(t, err)
 				golden = bytes.Clone(golden)
 				var parameterArena *arena.Arena[byte]
@@ -72,7 +72,8 @@ func TestSerializeParametersAlignedZeroPadding(t *testing.T) {
 					} else {
 						ctx.Features.DisableFeature(features.MaskOutRentEpochInVmSerialization)
 					}
-					data, lengths, _, _, _, err := serializeParametersAligned(ctx)
+					data, _, metas, _, err := serializeParametersAligned(ctx)
+					lengths := originalDataLens(metas)
 					require.NoError(t, err)
 					require.Equal(t, []uint64{5, 5, 5}, lengths)
 					offset := 8
@@ -119,7 +120,8 @@ func BenchmarkSerializeParametersAligned(b *testing.B) {
 				b.ReportAllocs()
 				b.ResetTimer()
 				for range b.N {
-					data, lengths, _, _, _, err := serializeParametersAligned(ctx)
+					data, _, metas, _, err := serializeParametersAligned(ctx)
+					lengths := originalDataLens(metas)
 					if err != nil || len(lengths) != count+1 || len(data) == 0 {
 						b.Fatalf("serialization: %v, accounts=%d, bytes=%d", err, len(lengths), len(data))
 					}
@@ -130,4 +132,12 @@ func BenchmarkSerializeParametersAligned(b *testing.B) {
 			})
 		}
 	}
+}
+
+func originalDataLens(metas []serializedAcctMetadata) []uint64 {
+	lens := make([]uint64, len(metas))
+	for i, m := range metas {
+		lens[i] = m.originalDataLen
+	}
+	return lens
 }

@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/gagliardetto/solana-go"
 )
 

@@ -15,7 +15,6 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/sbpf"
 	"github.com/Overclock-Validator/mithril/pkg/sbpf/loader"
 	"github.com/gagliardetto/solana-go"
-	"github.com/maypok86/otter"
 	"github.com/stretchr/testify/require"
 )
 
@@ -122,9 +121,7 @@ func workloadRunner(t testing.TB, w programWorkload, vasa bool) func() (*Executi
 	prog, err := l.Load()
 	require.NoError(t, err)
 	require.NoError(t, prog.Verify())
-	cache, err := otter.MustBuilder[solana.PublicKey, *accountsdb.ProgramCacheEntry](1024).Cost(func(solana.PublicKey, *accountsdb.ProgramCacheEntry) uint32 { return 1 }).Build()
-	require.NoError(t, err)
-	t.Cleanup(cache.Close)
+	cache := accountsdb.NewWeightedCache[solana.PublicKey, *accountsdb.ProgramCacheEntry](1024, func(solana.PublicKey, *accountsdb.ProgramCacheEntry) uint32 { return 1 })
 	db := &accountsdb.AccountsDb{ProgramCache: cache}
 	entry := &accountsdb.ProgramCacheEntry{Program: prog}
 	entry.BindSource(w.elf, f)
