@@ -528,6 +528,8 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 
 	metrics.GlobalBlockReplay.DependencyPlannerPrepared = 1
 	txErrors := make([]error, len(txs))
+	timings := newWorkerTransactionTimings(workers)
+	defer timings.merge()
 	processTx := func(workerIdx, idx int) {
 		if !execute[idx] {
 			return
@@ -536,7 +538,7 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 		if workerIdx < len(sealevel.BorrowedAccountArenas) {
 			workerArena = sealevel.BorrowedAccountArenas[workerIdx]
 		}
-		feeInfos[idx], computeUnits[idx], txErrors[idx] = ProcessTransaction(slotCtx, &exec.sigverifyWg, txs[idx], nil, dbgOpts, workerArena, shouldVerifySignatures)
+		feeInfos[idx], computeUnits[idx], txErrors[idx] = processTransactionWithTimings(slotCtx, &exec.sigverifyWg, txs[idx], nil, dbgOpts, workerArena, shouldVerifySignatures, timings.at(workerIdx))
 	}
 	if directDispatch {
 		metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTiming(runDependencyPlan(plan, workers, scheduleFor(txs), processTx))

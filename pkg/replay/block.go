@@ -4531,6 +4531,8 @@ func parallelTxLoop(
 	if plannerAvailable {
 		metrics.GlobalBlockReplay.DependencyPlannerPrepared = 1
 		metrics.GlobalBlockReplay.DependencyPlannerBuild.AddTiming(plannerBuildDuration)
+		timings := newWorkerTransactionTimings(txParallelism)
+		defer timings.merge()
 		processTx := func(worker, idx int) {
 			if !executionPlan.execute[idx] {
 				return
@@ -4540,7 +4542,7 @@ func parallelTxLoop(
 			if idx < len(block.TxMetas) {
 				txMeta = block.TxMetas[idx]
 			}
-			txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = ProcessTransaction(slotCtx, sigverifyWg, block.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[worker], shouldVerifySignatures)
+			txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = processTransactionWithTimings(slotCtx, sigverifyWg, block.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[worker], shouldVerifySignatures, timings.at(worker))
 			txErr := errs[idx]
 			// check for success-failure return value divergences
 			if txMeta != nil && txErr == nil && txMeta.Err != nil {

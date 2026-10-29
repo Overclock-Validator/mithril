@@ -18,6 +18,8 @@ import (
 )
 
 type ExecutionCtx struct {
+	// TimingRecorder is owned by the executing worker; it is cleared before results escape.
+	TimingRecorder *metrics.TransactionTimings
 	// SkipTimingMetrics disables instruction-dispatch timing collection for
 	// leader execution; it never changes instruction validation or CU charging.
 	SkipTimingMetrics        bool
@@ -291,11 +293,11 @@ func (execCtx *ExecutionCtx) ProcessInstruction(instrData []byte, instructionAcc
 	if err != nil {
 		return err
 	}
-	metrics.GlobalBlockReplay.GetNextIxCtx.AddTimingSince(start)
+	execCtx.TimingRecorder.AddTimingSince(metrics.TransactionGetNextIxCtx, start)
 
 	start = metrics.StartTiming(!execCtx.SkipTimingMetrics)
 	nextInstrCtx.Configure(programIndices, instructionAccts, instrData)
-	metrics.GlobalBlockReplay.NextIxCtxConfigure.AddTimingSince(start)
+	execCtx.TimingRecorder.AddTimingSince(metrics.TransactionNextIxCtxConfigure, start)
 
 	// Capture this invocation as an inner instruction when nested under
 	// an active top-level frame and recording is enabled. Stack height
@@ -321,7 +323,7 @@ func (execCtx *ExecutionCtx) ProcessInstruction(instrData []byte, instructionAcc
 	if err != nil {
 		return err
 	}
-	metrics.GlobalBlockReplay.IxPush.AddTimingSince(start)
+	execCtx.TimingRecorder.AddTimingSince(metrics.TransactionIxPush, start)
 
 	if len(programIndices) > 0 {
 		programKey, keyErr := execCtx.TransactionContext.KeyOfAccountAtIndex(programIndices[len(programIndices)-1])
@@ -334,7 +336,7 @@ func (execCtx *ExecutionCtx) ProcessInstruction(instrData []byte, instructionAcc
 
 	start = metrics.StartTiming(!execCtx.SkipTimingMetrics)
 	err2 := execCtx.Pop()
-	metrics.GlobalBlockReplay.IxPop.AddTimingSince(start)
+	execCtx.TimingRecorder.AddTimingSince(metrics.TransactionIxPop, start)
 
 	if err1 != nil {
 		return err1
@@ -381,31 +383,31 @@ func (execCtx *ExecutionCtx) ExecuteInstruction() error {
 	if err != nil { // unrecognised builtin
 		return err
 	}
-	metrics.GlobalBlockReplay.ExecIxResolveNativeProgram.AddTimingSince(start)
+	execCtx.TimingRecorder.AddTimingSince(metrics.TransactionExecIxResolveNativeProgram, start)
 
 	start = metrics.StartTiming(!execCtx.SkipTimingMetrics)
 	err = nativeProgramFn(execCtx)
 	switch nativeProgramStr {
 	case a.SystemProgramAddrStr:
-		metrics.GlobalBlockReplay.ExecIxNativeProgramSystem.AddTimingSince(start)
+		execCtx.TimingRecorder.AddTimingSince(metrics.TransactionExecIxNativeProgramSystem, start)
 	case a.StakeProgramAddrStr:
-		metrics.GlobalBlockReplay.ExecIxNativeProgramStake.AddTimingSince(start)
+		execCtx.TimingRecorder.AddTimingSince(metrics.TransactionExecIxNativeProgramStake, start)
 	case a.VoteProgramAddrStr:
-		metrics.GlobalBlockReplay.ExecIxNativeProgramVote.AddTimingSince(start)
+		execCtx.TimingRecorder.AddTimingSince(metrics.TransactionExecIxNativeProgramVote, start)
 	case a.ComputeBudgetProgramAddrStr:
-		metrics.GlobalBlockReplay.ExecIxNativeProgramComputeBudget.AddTimingSince(start)
+		execCtx.TimingRecorder.AddTimingSince(metrics.TransactionExecIxNativeProgramComputeBudget, start)
 	case a.BpfLoader2AddrStr:
-		metrics.GlobalBlockReplay.ExecIxNativeProgramBpfLoader2.AddTimingSince(start)
+		execCtx.TimingRecorder.AddTimingSince(metrics.TransactionExecIxNativeProgramBpfLoader2, start)
 	case a.BpfLoaderDeprecatedAddrStr:
-		metrics.GlobalBlockReplay.ExecIxNativeProgramBpfLoaderDeprecated.AddTimingSince(start)
+		execCtx.TimingRecorder.AddTimingSince(metrics.TransactionExecIxNativeProgramBpfLoaderDeprecated, start)
 	case a.BpfLoaderUpgradeableAddrStr:
-		metrics.GlobalBlockReplay.ExecIxNativeProgramBpfLoaderUpgradeable.AddTimingSince(start)
+		execCtx.TimingRecorder.AddTimingSince(metrics.TransactionExecIxNativeProgramBpfLoaderUpgradeable, start)
 	case a.ZkElgamalProofProgramAddrStr:
-		metrics.GlobalBlockReplay.ExecIxNativeProgramZkElgamalProof.AddTimingSince(start)
+		execCtx.TimingRecorder.AddTimingSince(metrics.TransactionExecIxNativeProgramZkElgamalProof, start)
 	case a.Ed25519PrecompileAddrStr:
-		metrics.GlobalBlockReplay.ExecIxNativeProgramEd25519Precompile.AddTimingSince(start)
+		execCtx.TimingRecorder.AddTimingSince(metrics.TransactionExecIxNativeProgramEd25519Precompile, start)
 	case a.Secp256kPrecompileAddrStr:
-		metrics.GlobalBlockReplay.ExecIxNativeProgramSecp256kPrecompile.AddTimingSince(start)
+		execCtx.TimingRecorder.AddTimingSince(metrics.TransactionExecIxNativeProgramSecp256kPrecompile, start)
 	}
 
 	return err
