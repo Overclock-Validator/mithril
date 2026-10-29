@@ -1,6 +1,7 @@
 package snapshotdl
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -36,6 +37,45 @@ func suppressStdlogOutput() func() {
 		stdlog.SetFlags(oldFlags)
 		stdlog.SetPrefix(oldPrefix)
 		stdlogMu.Unlock()
+	}
+}
+
+// logProbeReport writes the snapshot finder's node discovery report to
+// Mithril's log. The report prints through the stdlib logger, which the
+// caller's suppressStdlogOutput (still holding stdlogMu) has discarded.
+func logProbeReport(stats *rpc.ProbeStats, cfg rpc.FilterConfig) {
+	w := &mlogLineWriter{}
+	stdlog.SetOutput(w)
+	stdlog.SetFlags(0)
+	stdlog.SetPrefix("")
+	stats.PrintReport(cfg)
+	w.flush()
+	stdlog.SetOutput(io.Discard)
+}
+
+// mlogLineWriter forwards each complete non-empty line to mlog.
+type mlogLineWriter struct{ buf []byte }
+
+func (w *mlogLineWriter) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p...)
+	for {
+		i := bytes.IndexByte(w.buf, '\n')
+		if i < 0 {
+			return len(p), nil
+		}
+		w.logLine(w.buf[:i])
+		w.buf = w.buf[i+1:]
+	}
+}
+
+func (w *mlogLineWriter) flush() {
+	w.logLine(w.buf)
+	w.buf = nil
+}
+
+func (w *mlogLineWriter) logLine(line []byte) {
+	if len(bytes.TrimSpace(line)) > 0 {
+		mlog.Log.Infof("%s", line)
 	}
 }
 
@@ -723,7 +763,7 @@ func GetSnapshotURL(ctx context.Context, snapCfg SnapshotConfig) (string, int, i
 			MinVersion:      cfg.MinNodeVersion,
 			AllowedVersions: cfg.AllowedNodeVersions,
 		}
-		stats.PrintReport(filterCfg)
+		logProbeReport(stats, filterCfg)
 	}
 
 	// Step 5: Get snapshot URL from best nodes (with configurable fallback)
@@ -877,7 +917,7 @@ func GetSnapshotURLWithInfo(ctx context.Context, snapCfg SnapshotConfig) (*Snaps
 			MinVersion:      cfg.MinNodeVersion,
 			AllowedVersions: cfg.AllowedNodeVersions,
 		}
-		stats.PrintReport(filterCfg)
+		logProbeReport(stats, filterCfg)
 	}
 
 	// Step 5: Get snapshot URL from best nodes (with configurable fallback)
@@ -1039,7 +1079,7 @@ func DownloadSnapshotWithConfig(ctx context.Context, path string, snapCfg Snapsh
 			MinVersion:      cfg.MinNodeVersion,
 			AllowedVersions: cfg.AllowedNodeVersions,
 		}
-		stats.PrintReport(filterCfg)
+		logProbeReport(stats, filterCfg)
 	}
 
 	// Step 5: Download snapshot from best nodes (with configurable fallback)
@@ -1157,7 +1197,7 @@ func DownloadIncrementalSnapshotWithConfig(path string, referenceSlot int, fullS
 			MinVersion:      cfg.MinNodeVersion,
 			AllowedVersions: cfg.AllowedNodeVersions,
 		}
-		stats.PrintReport(filterCfg)
+		logProbeReport(stats, filterCfg)
 	}
 
 	// Step 3: Filter to only nodes with matching incremental base slot FIRST
@@ -1427,7 +1467,7 @@ func GetIncrementalSnapshotURL(fullSnapshotURL string, referenceSlot int, fullSn
 			MinVersion:      cfg.MinNodeVersion,
 			AllowedVersions: cfg.AllowedNodeVersions,
 		}
-		stats.PrintReport(filterCfg)
+		logProbeReport(stats, filterCfg)
 	}
 
 	// Step 2.1: Filter to only nodes with matching base slot FIRST (before threshold filtering)

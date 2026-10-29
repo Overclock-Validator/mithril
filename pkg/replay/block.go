@@ -44,7 +44,6 @@ import (
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
-	"github.com/panjf2000/ants/v2"
 )
 
 // SlotCtxSetter is implemented by types that accept a SlotCtx update (e.g. RpcServer).
@@ -249,6 +248,13 @@ type ResumeState struct {
 	// TransactionCount as of the resume slot. nil = the source context predates
 	// the field (seed from the snapshot manifest, approximate); non-nil is exact.
 	TransactionCount *uint64
+	// DelegatedStake is the delegated stake per vote account in durable state
+	// as of the resume slot, from the rooted context. nil = the context did not
+	// carry it (or it failed to decode); startup scans the stake accounts.
+	// DelegatedStakeIndex is the stake index key set it was computed over:
+	// startup uses it only if the index it loads has that key set.
+	DelegatedStake      map[solana.PublicKey]voteDelegation
+	DelegatedStakeIndex stakeIndexDigest
 
 	// ComputedEpochStakes contains epoch stakes computed at boundaries.
 	// Key: epoch number (the leader schedule epoch), Value: serialized JSON
@@ -612,6 +618,7 @@ func loadBlockAccountsAndUpdateSysvars(
 	alpenglowClock bool,
 	parentBankSysvars *sealevel.BankSysvars,
 	planner *preparedDependencyPlanner,
+	minOverlayKeys int,
 ) (accounts.Accounts, accounts.Accounts, int, *sealevel.BankSysvars, error) {
 	var bankSysvars *sealevel.BankSysvars
 	phaseStart := time.Now()
@@ -641,7 +648,7 @@ func loadBlockAccountsAndUpdateSysvars(
 	// absence) in the same batch snapshot as all other execution accounts. This
 	// preserves both the footer bounds anchor and the AccountsLtHash before-image.
 	dedupedAccts = includeAlpenglowParentStateAccounts(dedupedAccts, alpenglowClock)
-	publicationCapacity := publicationMapCapacity(block, uniqueWritableAccounts, alpenglowClock)
+	publicationCapacity := max(publicationMapCapacity(block, uniqueWritableAccounts, alpenglowClock), minOverlayKeys)
 	metrics.GlobalBlockReplay.AccountLoader.DedupeBlockAccounts.AddTimingSince(phaseStart)
 	ctx := context.Background()
 	phaseStart = time.Now()
@@ -664,7 +671,7 @@ func loadBlockAccountsAndUpdateSysvars(
 
 	// accts is a branch-local overlay over the pristine parent snapshot; execution
 	// copy-on-writes, so parentAccts stays pristine for LtHash "before" values.
-	accts := accounts.NewOverlayAccountsWithSizing(parentAccts, numAccts, publicationCapacity)
+	accts := accounts.NewOverlayAccountsWithSizing(parentAccts, max(numAccts, minOverlayKeys), publicationCapacity)
 	if parentBankSysvars != nil {
 		if parentBankSysvars.Slot() != block.ParentSlot {
 			return nil, nil, 0, nil, fmt.Errorf(
@@ -1085,6 +1092,7 @@ func recordAccountLoaderBatchStats(dst *metrics.AccountLoader, src accountsdb.Ba
 	dst.InProgressHits += src.InProgressHits
 	dst.PendingFoldHits += src.PendingFoldHits
 	dst.CacheHits += src.CacheHits
+	dst.NegativeCacheHits += src.NegativeCacheHits
 	dst.IndexHits += src.IndexHits
 	dst.IndexMisses += src.IndexMisses
 	dst.UniqueAppendVecs += src.UniqueAppendVecs
@@ -1114,6 +1122,157 @@ func recordAccountLoaderBatchStats(dst *metrics.AccountLoader, src accountsdb.Ba
 	dst.CachePublication.AddTiming(time.Duration(src.CachePublicationNanoseconds))
 }
 
+// startupStakeScan is the aggregation of delegated stake per vote account
+// that startup needs from durable state. ReplayBlocks starts it as soon as
+// durable state is final (after any startup rewind), so its reads overlap
+// the wait for the first block; the first block's setup takes the result
+// instead of scanning inline. Durable reads do not depend on a slot.
+type startupStakeScan struct {
+	db     *accountsdb.AccountsDb
+	done   chan struct{}
+	totals map[solana.PublicKey]voteDelegation
+	err    error
+}
+
+var pendingStartupStakeScan atomic.Pointer[startupStakeScan]
+
+// replayBlocksEntered marks that this process has started replay once.
+var replayBlocksEntered atomic.Bool
+
+// configuredStakeTotals is the delegated stake the last initial-block setup
+// used: durable state's totals, from which the fold tracker starts.
+var configuredStakeTotals map[solana.PublicKey]voteDelegation
+
+// MITHRIL_VERIFY_STAKE_TOTALS=1: on a resume with saved totals, also scan and
+// stop the node if the two differ in any vote account's stake or delegation
+// count.
+var verifyStakeTotals = os.Getenv("MITHRIL_VERIFY_STAKE_TOTALS") == "1"
+
+// startStartupStakeScan prepares the delegated stake totals the first block's
+// setup takes. saved are the totals from the rooted context being resumed
+// (nil on a snapshot boot or when the context has none), computed over the
+// stake index key set savedIndex.
+func startStartupStakeScan(acctsDb *accountsdb.AccountsDb, saved map[solana.PublicKey]voteDelegation, savedIndex stakeIndexDigest) {
+	scan := &startupStakeScan{db: acctsDb, done: make(chan struct{})}
+	pendingStartupStakeScan.Store(scan)
+	go func() {
+		defer close(scan.done)
+		if saved != nil {
+			// The index can hold keys the saved totals never counted (appended
+			// before a fold that did not commit, or kept across a rewind); a
+			// scan reads those, so the totals stand for it only on the same
+			// key set.
+			entries, err := global.LoadStakePubkeyIndex(filepath.Join(acctsDb.AcctsDir, ".."))
+			if err != nil {
+				scan.err = err
+				return
+			}
+			if index := digestStakeIndex(entries); index != savedIndex {
+				mlog.Log.Warnf("delegated stake totals: the stake index (%d keys) is not the key set the rooted context's totals cover (%d keys); scanning the stake accounts", index.keys, savedIndex.keys)
+				saved = nil
+			} else if !verifyStakeTotals {
+				mlog.Log.Infof("delegated stake totals: using the rooted context's totals (%d vote accounts); no stake scan", len(saved))
+				scan.totals = saved
+				return
+			}
+		}
+		scan.totals, scan.err = scanDelegatedStake(acctsDb)
+		if scan.err != nil || saved == nil {
+			return
+		}
+		if diff := diffDelegatedStake(saved, scan.totals); diff != "" {
+			mlog.Log.Errorf("FATAL: delegated stake totals saved in the rooted context differ from a full scan: %s", diff)
+			os.Exit(1)
+		}
+		mlog.Log.Infof("delegated stake totals: verified, the rooted context's totals equal a full scan (%d vote accounts)", len(saved))
+	}()
+}
+
+// trackedStakeTotals, while replay runs with a stake totals tracker, returns
+// durable state's tracked totals (unrootedTail.durableStakeTotals).
+var trackedStakeTotals func() (map[solana.PublicKey]voteDelegation, bool)
+
+// takeStartupStakeScan returns the background scan's result for acctsDb. With
+// none pending (a later reconfiguration: the replay loop re-runs the initial
+// block setup after a fork switch it unwound in RAM) it returns the tracked
+// totals of durable state, which equal a scan of the last applied fold
+// boundary, instead of scanning every stake account on the loop thread (about
+// 12 s at the tip). It scans only when nothing is tracked (tests, or a run
+// whose tracker stopped).
+func takeStartupStakeScan(acctsDb *accountsdb.AccountsDb) (map[solana.PublicKey]voteDelegation, error) {
+	if scan := pendingStartupStakeScan.Swap(nil); scan != nil {
+		<-scan.done
+		if scan.db == acctsDb {
+			return scan.totals, scan.err
+		}
+	}
+	if trackedStakeTotals != nil {
+		if totals, ok := trackedStakeTotals(); ok {
+			if verifyStakeTotals {
+				if scanned, err := scanDelegatedStake(acctsDb); err == nil {
+					if diff := diffDelegatedStake(totals, scanned); diff != "" {
+						// A fold committed but not yet applied on the loop thread
+						// can put the scan one boundary ahead; report, do not stop.
+						mlog.Log.Errorf("delegated stake totals: tracked durable totals differ from a full scan at reconfiguration: %s", diff)
+					} else {
+						mlog.Log.Infof("delegated stake totals: verified at reconfiguration, tracked durable totals equal a full scan (%d vote accounts)", len(totals))
+					}
+				}
+			}
+			mlog.Log.Infof("delegated stake totals: using the tracked durable totals (%d vote accounts); no stake scan", len(totals))
+			return totals, nil
+		}
+	}
+	return scanDelegatedStake(acctsDb)
+}
+
+// finishStartupStakeScan waits out an unconsumed background scan, so replay
+// never returns (and AccountsDB never closes) under its reads.
+func finishStartupStakeScan() {
+	if scan := pendingStartupStakeScan.Swap(nil); scan != nil {
+		<-scan.done
+	}
+}
+
+// scanDelegatedStake reproduces mainline's startup stake aggregation exactly:
+// for every key in the stake pubkey index (built during snapshot processing,
+// extended at fold time, never shrunk), read the account as stored in
+// AccountsDB and, if its data decodes as a Stake-state delegation, add the
+// delegation to its vote account. Lamports and owner are not checked: a
+// zero-lamport record still holding Stake data counts, as it did with the
+// original per-key GetAccount reads. The batch read returns a placeholder for
+// zero-lamport accounts, so those are re-read with GetAccount to get the
+// stored record. Each vote account also gets the number of delegating
+// accounts, so one whose delegations sum to zero stake is kept.
+func scanDelegatedStake(acctsDb *accountsdb.AccountsDb) (map[solana.PublicKey]voteDelegation, error) {
+	// Entries are sorted by (FileId, Offset) for appendvec locality.
+	acctsDbDir := filepath.Join(acctsDb.AcctsDir, "..")
+	stakeEntries, err := global.LoadStakePubkeyIndex(acctsDbDir)
+	if err != nil {
+		return nil, err
+	}
+	start := time.Now()
+	mlog.Log.Infof("Loading vote and stake caches (aggregate-only mode, %d stake accounts)", len(stakeEntries))
+
+	totals := loadStakeAccountTotals(acctsDb, 0, stakeEntries)
+	mlog.Log.Infof("stake scan: %d stake accounts, %d vote accounts with delegations, %s", len(stakeEntries), len(totals), time.Since(start).Round(time.Millisecond))
+	return totals, nil
+}
+
+// scannedDelegation is mainline's per-account rule: the stored data decodes as
+// a Stake-state delegation, whatever the lamports and owner.
+func scannedDelegation(stored *accounts.Account) (solana.PublicKey, uint64, bool) {
+	if stored == nil {
+		return solana.PublicKey{}, 0, false
+	}
+	stakeState, err := sealevel.UnmarshalStakeState(stored.Data)
+	if err != nil || stakeState.Status != sealevel.StakeStateV2StatusStake {
+		return solana.PublicKey{}, 0, false
+	}
+	delegation := stakeState.Stake.Stake.Delegation
+	return delegation.VoterPubkey, delegation.StakeLamports, true
+}
+
 // setupInitialVoteAcctsAndStakeAccts populates the vote and stake caches at startup.
 //
 // For stake accounts, we read ALL delegation fields from AccountsDB rather than trusting
@@ -1128,13 +1287,11 @@ func recordAccountLoaderBatchStats(dst *metrics.AccountLoader, src accountsdb.Ba
 func setupInitialVoteAcctsAndStakeAccts(acctsDb *accountsdb.AccountsDb, block *b.Block, parentEpoch uint64) {
 	block.VoteTimestamps = make(map[solana.PublicKey]sealevel.BlockTimestamp)
 
-	// Load stake entries from index file built during snapshot processing
-	// The index is in the accountsDbDir which is parent of AcctsDir
-	// Entries are sorted by (FileId, Offset) for sequential appendvec I/O
-	acctsDbDir := filepath.Join(acctsDb.AcctsDir, "..")
-	stakeEntries, err := global.LoadStakePubkeyIndex(acctsDbDir)
+	waitStart := time.Now()
+	totals, err := takeStartupStakeScan(acctsDb)
 	if err != nil {
 		// Fatal error - stake index is required for resume and must exist
+		acctsDbDir := filepath.Join(acctsDb.AcctsDir, "..")
 		mlog.Log.Errorf("=======================================================")
 		mlog.Log.Errorf("FATAL: stake_pubkeys.idx missing or corrupt: %v", err)
 		mlog.Log.Errorf("=======================================================")
@@ -1149,70 +1306,9 @@ func setupInitialVoteAcctsAndStakeAccts(acctsDb *accountsdb.AccountsDb, block *b
 		mlog.Log.Errorf("=======================================================")
 		os.Exit(1)
 	}
-	mlog.Log.Infof("Loading vote and stake caches (aggregate-only mode, %d stake accounts)", len(stakeEntries))
-
-	var wg sync.WaitGroup
-
-	// Shared aggregated stake totals - built directly from AccountsDB scan
-	// Thread-safe: each worker builds local map, then merges under mutex
-	voteAcctStakes := make(map[solana.PublicKey]uint64)
-	var voteAcctStakesMu sync.Mutex
-
-	// Stake worker pool reads stake accounts and aggregates totals directly
-	const maxBatchSize = 2000
-	stakeAcctWorkerPool, _ := ants.NewPoolWithFunc(runtime.NumCPU()*2, func(i interface{}) {
-		defer wg.Done()
-
-		batch := i.([]accountsdb.StakeIndexEntry)
-
-		// Build local aggregation for this batch
-		localStakes := make(map[solana.PublicKey]uint64)
-
-		for _, entry := range batch {
-			// Read from AccountsDB
-			stakeAcct, err := acctsDb.GetAccount(block.Slot, entry.Pubkey)
-			if err != nil {
-				continue // Account not found or closed
-			}
-
-			stakeState, err := sealevel.UnmarshalStakeState(stakeAcct.Data)
-			if err != nil {
-				continue // Invalid stake state
-			}
-
-			// Only count delegated stake accounts (status must be "Stake")
-			if stakeState.Status != sealevel.StakeStateV2StatusStake {
-				continue
-			}
-
-			// Aggregate stake by vote account
-			delegation := stakeState.Stake.Stake.Delegation
-			localStakes[delegation.VoterPubkey] += delegation.StakeLamports
-		}
-
-		// Merge local aggregation into shared map under lock
-		voteAcctStakesMu.Lock()
-		for voter, stake := range localStakes {
-			voteAcctStakes[voter] += stake
-		}
-		voteAcctStakesMu.Unlock()
-	})
-
-	// Submit FileId-aligned batches for sequential appendvec I/O
-	batchStart := 0
-	for i := 1; i <= len(stakeEntries); i++ {
-		flush := i == len(stakeEntries) ||
-			stakeEntries[i].FileId != stakeEntries[batchStart].FileId ||
-			i-batchStart >= maxBatchSize
-		if flush && i > batchStart {
-			wg.Add(1)
-			stakeAcctWorkerPool.Invoke(stakeEntries[batchStart:i])
-			batchStart = i
-		}
-	}
-
-	wg.Wait()
-	stakeAcctWorkerPool.Release()
+	mlog.Log.Infof("vote and stake caches: stake totals ready for slot %d after waiting %s", block.Slot, time.Since(waitStart).Round(time.Millisecond))
+	configuredStakeTotals = totals
+	voteAcctStakes := delegationStakes(totals)
 
 	// Load vote accounts from AccountsDB into vote cache
 	if err := RebuildVoteCacheFromAccountsDB(acctsDb, block.Slot, voteAcctStakes, 0); err != nil {
@@ -1768,6 +1864,27 @@ func ReplayBlocks(
 		health.InvalidateHealth()
 		defer health.InvalidateHealth()
 	}
+	// Node startup finishes any rewind and reconciles durable state before
+	// calling ReplayBlocks, so the first block's stake scan can start now and
+	// overlap block-source startup and the wait for the first block.
+	// Only the process's first replay resumes from disk; a fork-switch retry
+	// re-enters with the in-memory rooted context, which before the first fold
+	// after a snapshot boot has no totals, and scans as mainline always did.
+	firstReplay := !replayBlocksEntered.Swap(true)
+	if acctsDb != nil {
+		var saved map[solana.PublicKey]voteDelegation
+		var savedIndex stakeIndexDigest
+		if resumeState != nil {
+			saved, savedIndex = resumeState.DelegatedStake, resumeState.DelegatedStakeIndex
+			if saved == nil && firstReplay {
+				// An older binary's context, or a fold written after the tracker
+				// stopped trusting its totals: scan, as mainline always did.
+				mlog.Log.Warnf("resume from slot %d: the rooted context has no delegated stake totals; scanning the stake accounts", resumeState.ParentSlot)
+			}
+		}
+		startStartupStakeScan(acctsDb, saved, savedIndex)
+		defer finishStartupStakeScan()
+	}
 	alpenglowMode := consensusOpts != nil && consensusOpts.Alpenglow
 	rewardPublisher, _ := rpcServer.(epochRewardPublisher)
 	rewardReadPublisher, _ := rpcServer.(epochRewardReadPublisher)
@@ -2092,6 +2209,8 @@ func ReplayBlocks(
 	var applyFoldOutcome func(res *foldResult) // assigned below, used by the exit drain
 	if acctsDb.RootedDurable {
 		unrootedTailState = newUnrootedTail(acctsDb, acctsDb, unrootedTailHaltCap, FoldBatchSlots, filepath.Join(acctsDb.AcctsDir, ".."))
+		trackedStakeTotals = unrootedTailState.durableStakeTotals
+		defer func() { trackedStakeTotals = nil }()
 		var checkpointAfterCommit func(*state.TransactionStatusCheckpointRef) error
 		if consensusOpts != nil {
 			checkpointAfterCommit = consensusOpts.TransactionStatusCheckpointAfterCommit
@@ -2454,6 +2573,7 @@ func ReplayBlocks(
 			TurbineAlpenglowAddr: turbineAlpenglowAddr,
 			TurbineIdentity:      turbineIdentity,
 			LeaderForSlot:        global.LeaderForSlot,
+			RepairPeerSeeds:      repairPeerSeedsFromState(mithrilState),
 			BackupRpcEndpoints:   rpcBackups,
 			StartSlot:            startSlot,
 			EndSlot:              endSlot,
@@ -2560,6 +2680,29 @@ func ReplayBlocks(
 	if health, ok := rpcServer.(interface{ SetHealthSlotSource(func() (uint64, bool)) }); ok && isLive {
 		health.SetHealthSlotSource(blockStream.HealthSlot)
 		defer health.SetHealthSlotSource(func() (uint64, bool) { return 0, false })
+	}
+	// Every state save records the repair peers that served this run well, so
+	// the next start can repair before gossip rediscovers peers.
+	state.SetRepairPeerHintsProvider(func() []state.RepairPeerHint {
+		return repairPeerHints(blockStream.GoodRepairPeers(rememberedRepairPeers))
+	})
+	defer state.SetRepairPeerHintsProvider(nil)
+	if len(opts.RepairPeerSeeds) > 0 {
+		mlog.Log.Infof("repair: seeding %d peers remembered from the previous run", len(opts.RepairPeerSeeds))
+	}
+	var prefetcher *accountPrefetcher
+	if accountPrefetchEnabled {
+		var src blockAccountSource = acctsDb
+		if unrootedTailState != nil {
+			src = unrootedTailState
+		}
+		prefetcher = newAccountPrefetcher(src, acctsDb, accountPrefetchAhead, accountPrefetchWorkers, tipWarmEnabled)
+		defer prefetcher.Close()
+		defer prefetcher.installRefsHook()()
+		blockStream.SetReplayEmitHook(prefetcher.Offer)
+		mlog.Log.Infof("account prefetch: on, %d slot ahead of replay, %d storage workers, programs preloaded, tip warming %t", prefetcher.ahead, prefetcher.workers, prefetcher.tipWarm)
+	} else {
+		mlog.Log.Infof("account prefetch: off (MITHRIL_ACCOUNT_PREFETCH=0)")
 	}
 
 	if !isLive {
@@ -2716,7 +2859,12 @@ func ReplayBlocks(
 	// parent's replay, or the loop itself.
 	var frontierMark streamingFrontierMark
 	if blockStream.StreamEvents() != nil {
+		var onStreamOpen func(uint64)
+		if prefetcher != nil {
+			onStreamOpen = prefetcher.Started
+		}
 		streamer = newStreamingExecutor(streamingDeps{
+			onOpen:              onStreamOpen,
 			acctsDb:             acctsDb,
 			feed:                blockStream,
 			epochSchedule:       epochSchedule,
@@ -2752,11 +2900,13 @@ func ReplayBlocks(
 			StreamingExecutionCfg.workers(txParallelism), StreamingExecutionCfg.MinGroupBatches, StreamingExecutionCfg.maxOpenAge())
 	}
 
+	lastRowAt := time.Now()
 	for {
 		// The collector is per replay attempt. Discarded candidates, skipped
 		// slots, and typed-recovery exits must never leak timings into the next
 		// successfully written slot (including a later ReplayBlocks invocation).
 		metrics.GlobalBlockReplay = metrics.BlockReplay{}
+		iterationStart := time.Now()
 		if ctx.Err() != nil {
 			mlog.Log.Infof("context cancelled, stopping replay: %v", ctx.Err())
 			result.WasCancelled = true
@@ -2932,6 +3082,14 @@ func ReplayBlocks(
 				streamer.discardSlot(block.Slot, "quarantined")
 				mlog.Log.Warnf("replay: discarding quarantined Alpenglow block %s at slot %d before consensus observation",
 					solana.Hash(block.AlpenglowBlockID), block.Slot)
+				continue
+			}
+
+			if rejected, err := quarantineMissingAlpenglowFooter(block, alpenglowMode, streamer, blockStream.QuarantineInvalidAlpenglowBlock); err != nil {
+				result.Error = err
+				mlog.Log.Errorf("%v", err)
+				break
+			} else if rejected {
 				continue
 			}
 
@@ -3120,10 +3278,14 @@ func ReplayBlocks(
 			record.FullToReady.AddTiming(ingressTimings.FullToReady)
 		}
 		start := time.Now()
+		foldBusyAtStart := promoter.busyThrough(start)
 
 		// Notify block source we're starting execution - in near-tip mode this
 		// triggers fetching N+1 so RPC latency overlaps with execution time
 		blockStream.NotifyBlockStart(block.Slot)
+		if prefetcher != nil {
+			prefetcher.Started(block.Slot)
+		}
 
 		currentSlot = block.Slot
 		block.Epoch = epochSchedule.GetEpoch(currentSlot)
@@ -3149,6 +3311,9 @@ func ReplayBlocks(
 			result.Error = configErr
 			break
 		}
+		if initialBlockConfigured && unrootedTailState != nil {
+			unrootedTailState.initStakeTotals(acctsDb, configuredStakeTotals)
+		}
 		// Log replay start message once, after initial configuration completes
 		if !replayStartLogged {
 			fmt.Println()
@@ -3170,7 +3335,12 @@ func ReplayBlocks(
 				if lastSlotCtx != nil {
 					boundaryParentSlot = lastSlotCtx.Slot
 				}
-				if foldRootedPrefix(true) {
+				settleStart := time.Now()
+				halted := foldRootedPrefix(true)
+				forcedFoldSettlement.Observe(time.Since(settleStart), func() string {
+					return fmt.Sprintf("slot %d: folded the rooted prefix synchronously before an epoch-boundary scan", block.Slot)
+				})
+				if halted {
 					break
 				}
 				if err := requireDurableEpochBoundaryParent(block.Slot, boundaryParentSlot, mithrilState.LastRootedSlot); err != nil {
@@ -3274,6 +3444,9 @@ func ReplayBlocks(
 		}
 
 		block.Features = replayCtx.CurrentFeatures
+		if prefetcher != nil {
+			prefetcher.SetFeatures(block.Features)
+		}
 
 		// post-epoch boundary rewards distribution
 		if partitionedEpochRewardsEnabled && partitionedRewardsInfo != nil && currentSlot >= partitionedRewardsInfo.FirstStakingRewardSlot && partitionedRewardsInfo.NumRewardPartitionsRemaining > 0 {
@@ -3298,6 +3471,7 @@ func ReplayBlocks(
 		if lastSlotCtx != nil {
 			parentBankSysvars = lastSlotCtx.BankSysvars()
 		}
+		wholeBlock := false
 		if block.FromLocalProduction {
 			streamer.discardSlot(block.Slot, "local_production")
 			lastSlotCtx, err = adoptLocalLeaderBlock(block, unrootedTailState, transactionStatuses, persistedHashes)
@@ -3319,10 +3493,14 @@ func ReplayBlocks(
 			if !streamed {
 				streamer.noteWholeBlock(block)
 				lastSlotCtx, err = ProcessBlock(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, unrootedTailState, transactionStatuses, alpenglowClock, parentBankSysvars)
+				wholeBlock = true
 			}
 		}
 		processBlockEnd := time.Now()
 		metrics.GlobalBlockReplay.ProcessBlock.AddTiming(processBlockEnd.Sub(processBlockStart))
+		if wholeBlock && err == nil {
+			recordProcessBlockUnstaged(processBlockEnd.Sub(processBlockStart), block.Slot)
+		}
 		if err != nil {
 			mlog.Log.Errorf("error encountered during block replay: %s\n", err)
 			result.Error = err
@@ -3541,6 +3719,9 @@ func ReplayBlocks(
 			mlog.Log.Infof("rooted-durable: memory/slot backpressure at slot %d (held_slots=%d retained_bytes=%d)", block.Slot, unrootedTailState.overlay.HeldSlots(), unrootedTailState.overlay.RetainedBytes())
 			stillOverCap := settleFoldsAtCapacity(unrootedTailState, promoter, block.Slot, applyFoldOutcome, func() bool { return foldRootedPrefix(false) })
 			mlog.Log.Infof("rooted-durable: backpressure settled in %s (held_slots=%d retained_bytes=%d)", time.Since(pressureStart).Round(time.Millisecond), unrootedTailState.overlay.HeldSlots(), unrootedTailState.overlay.RetainedBytes())
+			foldBackpressure.Observe(time.Since(pressureStart), func() string {
+				return fmt.Sprintf("slot %d: replay waited for folds (fold in flight: %t, held_slots=%d, retained_bytes=%d)", block.Slot, hadInFlightFold, unrootedTailState.overlay.HeldSlots(), unrootedTailState.overlay.RetainedBytes())
+			})
 			if result.Error != nil || promoter.failure != nil {
 				break
 			}
@@ -3574,9 +3755,13 @@ func ReplayBlocks(
 		metrics.GlobalBlockReplay.PostProcessBlock.AddTiming(slotReplayEnd.Sub(postProcessBlockStart))
 		slotReplayDuration := slotReplayEnd.Sub(start)
 		metrics.GlobalBlockReplay.SlotReplay.AddTiming(slotReplayDuration)
+		if promoter != nil {
+			metrics.GlobalBlockReplay.FoldOverlap.AddTiming(promoter.busyThrough(slotReplayEnd) - foldBusyAtStart)
+		}
 
 		txnCount := len(block.Transactions)
 		totalCU := lastSlotCtx.TotalComputeUnitsConsumed
+		metrics.GlobalBlockReplay.ComputeUnitsConsumed = totalCU
 
 		// Get leader from block (set by configureBlock in live mode, or by block source in verify mode)
 		leaderStr := "unknown"
@@ -3766,9 +3951,10 @@ func ReplayBlocks(
 					if cloneStats.AcctsLoaded > 0 {
 						cloneRatio = float64(cloneStats.AcctsCloned) / float64(cloneStats.AcctsLoaded) * 100
 					}
-					mlog.Log.FileOnlyf("account COW: %.1f%% cloned (%d/%d accts) | %.1fMB loaded, %.1fMB cloned, %.1fMB modified",
+					mlog.Log.FileOnlyf("account COW: %.1f%% cloned (%d/%d accts) | %.1fMB loaded, %.1fMB cloned, %.1fMB modified, %.1fMB replaced uncopied",
 						cloneRatio, cloneStats.AcctsCloned, cloneStats.AcctsLoaded,
-						float64(cloneStats.AcctsLoadedBytes)/1024/1024, float64(cloneStats.AcctsClonedBytes)/1024/1024, float64(cloneStats.AcctsTouchedBytes)/1024/1024)
+						float64(cloneStats.AcctsLoadedBytes)/1024/1024, float64(cloneStats.AcctsClonedBytes)/1024/1024, float64(cloneStats.AcctsTouchedBytes)/1024/1024,
+						float64(cloneStats.AcctsReplacedBytes)/1024/1024)
 				}
 				mlog.Log.FileOnlyf("memory detail: alloc %.1fGiB | inuse %.1fGiB | idle %.1fGiB | released %.1fGiB | next_gc %.1fGiB | objs %d | gc_total %d | store_queue %d",
 					float64(mem.HeapAlloc)/gib, float64(mem.HeapInuse)/gib, float64(mem.HeapIdle)/gib,
@@ -3813,6 +3999,10 @@ func ReplayBlocks(
 		}
 		{
 			metrics.GlobalBlockReplay.Slot = block.Slot
+			rowAt := time.Now()
+			recordUnrootedTail(unrootedTailState)
+			recordReplayLoopClosure(rowAt, lastRowAt, iterationStart, waitTime, slotReplayEnd, block.Slot)
+			lastRowAt = rowAt
 			if metricsWriter != nil {
 				encoder := json.NewEncoder(metricsWriter)
 				err := encoder.Encode(metrics.GlobalBlockReplay)
@@ -3927,14 +4117,7 @@ func compileWritableAndModifiedAccts(slotCtx *sealevel.SlotCtx, block *b.Block, 
 		}
 	}
 	modifiedAccts := make([]*accounts.Account, 0, len(slotCtx.ModifiedAccts)+len(block.UpdatedAccts)+len(rentAccts)+4)
-
-	for pk := range slotCtx.ModifiedAccts {
-		acct, err := slotCtx.GetAccount(pk)
-		if err != nil {
-			mlog.Log.Infof("compileWritableAndModifiedAccts: unable to get %s", acct.Key)
-		}
-		modifiedAccts = append(modifiedAccts, acct)
-	}
+	modifiedAccts = appendModifiedAccountCopies(modifiedAccts, slotCtx)
 
 	for _, eua := range block.EpochUpdatedAccts {
 		if eua == nil {
@@ -3971,6 +4154,63 @@ func compileWritableAndModifiedAccts(slotCtx *sealevel.SlotCtx, block *b.Block, 
 	modifiedAccts = append(modifiedAccts, sysvarAccts...)
 
 	return writableAccts, modifiedAccts
+}
+
+// modifiedAccountCopyMaxWorkers bounds the goroutines copying modified
+// accounts, and modifiedAccountsPerCopyWorker keeps small slots on fewer.
+const (
+	modifiedAccountCopyMaxWorkers = 8
+	modifiedAccountsPerCopyWorker = 128
+)
+
+// appendModifiedAccountCopies appends a copy of every account the slot
+// modified. The copies detach account data from buffers execution reuses
+// (without direct mapping, a program's account data aliases the slot's
+// serialized-parameter arena, which the next bank resets) before the values
+// are hashed and published. A mainnet slot copies a few thousand accounts and
+// several MB, and each copy is independent, so they are split across workers.
+// A modified account missing from the slot is an invariant violation; it
+// panics on the calling goroutine, where replay's recovery reports it.
+func appendModifiedAccountCopies(dst []*accounts.Account, slotCtx *sealevel.SlotCtx) []*accounts.Account {
+	keys := make([]solana.PublicKey, 0, len(slotCtx.ModifiedAccts))
+	for pk := range slotCtx.ModifiedAccts {
+		keys = append(keys, pk)
+	}
+	base := len(dst)
+	dst = append(dst, make([]*accounts.Account, len(keys))...)
+	copies := dst[base:]
+	workers := max(1, min(modifiedAccountCopyMaxWorkers, runtime.GOMAXPROCS(0), (len(keys)+modifiedAccountsPerCopyWorker-1)/modifiedAccountsPerCopyWorker))
+	chunk := (len(keys) + workers - 1) / workers
+	errs := make([]error, workers)
+	copyRange := func(worker int) {
+		for i := worker * chunk; i < min(len(keys), (worker+1)*chunk); i++ {
+			acct, err := slotCtx.GetAccount(keys[i])
+			if err != nil {
+				errs[worker] = fmt.Errorf("unable to get %s: %w", keys[i], err)
+				return
+			}
+			copies[i] = acct
+		}
+	}
+	if workers == 1 {
+		copyRange(0)
+	} else {
+		var wg sync.WaitGroup
+		for worker := range workers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				copyRange(worker)
+			}()
+		}
+		wg.Wait()
+	}
+	for _, err := range errs {
+		if err != nil {
+			panic(fmt.Sprintf("compileWritableAndModifiedAccts: %v", err))
+		}
+	}
+	return dst
 }
 
 // EncodeRecentBlockhashes deep-copies the RecentBlockhashes sysvar into the
@@ -4516,11 +4756,9 @@ func ProcessBlock(
 	// the SlotCtx; streaming execution drives the same object group by group.
 	exec := newBlockExecution(acctsDb, block, epochSchedule, txParallelism, dbgOpts, persistedHashes, tail, transactionStatuses, alpenglowClock, parentBankSysvars)
 	defer exec.close()
+	exec.setReplayStage("parameter_arena")
+	resetSerializedParameterArena()
 	exec.setReplayStage("prepare_dependency_planner")
-
-	if SerializedParameterArena != nil {
-		SerializedParameterArena.Reset()
-	}
 
 	plannerPreparationStart := time.Now()
 	var planner *preparedDependencyPlanner
@@ -4536,7 +4774,7 @@ func ProcessBlock(
 	start := time.Now()
 	exec.setReplayStage("load_accounts")
 	loadAcctsRegion := trace.StartRegion(exec.ctx, "LoadBlockAccounts")
-	accts, parentAccts, accountMapCapacity, bankSysvars, err := loadBlockAccountsAndUpdateSysvars(exec.blockSrc, block, epochSchedule, alpenglowClock, parentBankSysvars, planner)
+	accts, parentAccts, accountMapCapacity, bankSysvars, err := loadBlockAccountsAndUpdateSysvars(exec.blockSrc, block, epochSchedule, alpenglowClock, parentBankSysvars, planner, 0)
 	loadAcctsRegion.End()
 	if err != nil {
 		return nil, fmt.Errorf("load slot accounts and update sysvars at slot %d: %w", block.Slot, err)

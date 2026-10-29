@@ -30,7 +30,8 @@ type RecoveryResult struct {
 	// OrphansRemoved lists files deleted as undecided leftovers (segments
 	// without a durable manifest, tmp manifests, torn manifests).
 	OrphansRemoved []string
-	// RewindInProgress is true when parked ".rewound" manifests remain — a
+	// RewindInProgress is true when a durable rewind intent or parked
+	// ".rewound" manifests remain — a
 	// RewindToBatchBoundary was interrupted. The store may already sit at the
 	// rewound boundary (index meta rolled back) while the state file still names
 	// the pre-rewind slot; the caller adopts the store's boundary rather than
@@ -51,14 +52,30 @@ type RecoveryResult struct {
 // It returns the recovered watermark plus the manifest-carried bankhash and
 // resume context at R, which the caller reconciles against the state file.
 func (db *AccountsDb) RecoverFoldState() (RecoveryResult, error) {
-	db.foldMu.Lock()
+	db.foldMu.LockAs("recovery")
 	defer db.foldMu.Unlock()
+	// Recovery, rewind and their forensic moves change the directory outside
+	// compaction's tracking; the next compaction cycle rescans it.
+	defer db.invalidateCompactionInventoryLocked()
 
 	res := RecoveryResult{}
 
 	meta, haveMeta, err := db.readFoldMeta()
 	if err != nil {
 		return res, err
+	}
+
+	// An explicit intent takes precedence over forward recovery and orphan GC.
+	// At a partial parking boundary, the remaining suffix is still needed to undo.
+	intent, err := db.readRewindIntentLocked()
+	if err != nil {
+		return res, err
+	}
+	if intent != nil {
+		db.rewindPending = true
+		res.DurableThrough, res.BatchSeq = meta.ThroughSlot, meta.BatchSeq
+		res.RewindInProgress = true
+		return res, nil
 	}
 
 	headers, err := ListFoldManifests(db.AcctsDir)
@@ -140,6 +157,12 @@ func (db *AccountsDb) RecoverFoldState() (RecoveryResult, error) {
 				res.DurableThrough = manifest.ThroughSlot
 				res.BatchSeq = manifest.BatchSeq
 				res.ResumeCtx = manifest.ResumeCtx
+				// A head that was already applied keeps the bankhash rows its fold
+				// wrote without a sync; restore them, since startup validates the
+				// rooted slot's row.
+				if len(res.ReplayedBatches) == 0 {
+					db.storeManifestBankhashes(manifest)
+				}
 				for _, bh := range manifest.Bankhashes {
 					if bh.Slot == manifest.ThroughSlot {
 						res.RootedBankhash = bh.Bankhash
@@ -226,29 +249,31 @@ func (db *AccountsDb) removeUnreferencedDataFiles() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	entries, err := os.ReadDir(db.AcctsDir)
-	if err != nil {
-		return nil, err
-	}
 	var removed []string
-	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() || filepath.Ext(name) != "" && !isDataFileName(name) {
-			continue
+	for _, dir := range db.AccountsDirs() {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return removed, err
 		}
-		_, fileId, ok := parseDataFileName(name)
-		if !ok || fileId <= bootstrapHigh {
-			continue
+		for _, e := range entries {
+			name := e.Name()
+			if e.IsDir() || filepath.Ext(name) != "" && !isDataFileName(name) {
+				continue
+			}
+			_, fileId, ok := parseDataFileName(name)
+			if !ok || fileId <= bootstrapHigh || db.appendVecDir(fileId) != dir {
+				continue
+			}
+			if _, ok := referenced[fileId]; ok {
+				continue
+			}
+			p := filepath.Join(dir, name)
+			if rerr := os.Remove(p); rerr != nil && !os.IsNotExist(rerr) {
+				return removed, rerr
+			}
+			mlog.Log.Warnf("accountsdb: removed orphan segment %s (no manifest — commit never decided)", name)
+			removed = append(removed, p)
 		}
-		if _, ok := referenced[fileId]; ok {
-			continue
-		}
-		p := filepath.Join(db.AcctsDir, name)
-		if rerr := os.Remove(p); rerr != nil && !os.IsNotExist(rerr) {
-			return removed, rerr
-		}
-		mlog.Log.Warnf("accountsdb: removed orphan segment %s (no manifest — commit never decided)", name)
-		removed = append(removed, p)
 	}
 	return removed, nil
 }
