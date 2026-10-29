@@ -2,6 +2,7 @@ package features
 
 import (
 	"fmt"
+	"sync/atomic"
 
 	"github.com/Overclock-Validator/mithril/pkg/base58"
 )
@@ -17,6 +18,14 @@ type FeatureActivationInfo struct {
 }
 
 type Features map[FeatureGate]FeatureActivationInfo
+
+// mutations counts in-place changes to any Features map. A caller that compared
+// a map earlier can tell, from the same map object and an unchanged count, that
+// it still holds the same activations without walking it again.
+var mutations atomic.Uint64
+
+// Mutations returns the number of in-place Features changes made so far.
+func Mutations() uint64 { return mutations.Load() }
 
 func NewFeaturesDefault() *Features {
 	newMap := make(Features, 0)
@@ -37,10 +46,12 @@ func (f *Features) Clone() *Features {
 
 func (f *Features) EnableFeature(gate FeatureGate, activationSlot uint64) {
 	(*f)[gate] = FeatureActivationInfo{Enabled: true, ActivationSlot: activationSlot}
+	mutations.Add(1)
 }
 
 func (f *Features) DisableFeature(gate FeatureGate) {
 	(*f)[gate] = FeatureActivationInfo{Enabled: false}
+	mutations.Add(1)
 }
 
 func (f *Features) IsActive(gate FeatureGate) bool {

@@ -118,6 +118,9 @@ type streamingDeps struct {
 
 	lastSlotCtx func() *sealevel.SlotCtx
 	frontier    func() uint64
+	// onOpen, when set, is told the slot of each stream that opens (account
+	// prefetch tracks the slot replay is executing).
+	onOpen func(slot uint64)
 	// frontierMark reports the last executed block's replay and full instants
 	// (timeline only; nil when the loop does not track it).
 	frontierMark     func() streamingFrontierMark
@@ -617,6 +620,9 @@ func (s *streamingExecutor) openStream(header *turbine.StreamBatch) {
 		}
 	}
 	s.current = cur
+	if d.onOpen != nil {
+		d.onOpen(header.Slot)
+	}
 	metrics.GlobalBlockReplay.StreamingExecution.Opened = 1
 	d.feed.PrioritizeStreamRepair(header.Generation)
 	mlog.Log.FileOnlyf("streaming: opened slot %d on parent %d | %s", shell.Slot, header.ParentSlot, cur.openTimeline())

@@ -560,14 +560,23 @@ func (slotCtx *SlotCtx) GetAccountFromAccountsDb(pubkey solana.PublicKey) (*acco
 // Keep bank sysvar precedence and fall back to the ordinary owned read for
 // sources that do not explicitly support immutable shared accounts.
 func (slotCtx *SlotCtx) getAccountFromAccountsDbReadOnly(pubkey solana.PublicKey) (*accounts.Account, error) {
+	acct, _, err := slotCtx.getProgramAccountSource(pubkey)
+	return acct, err
+}
+
+// The bool proves the source explicitly supports immutable shared accounts.
+// Merely returning an owned account is insufficient for identity-based reuse.
+func (slotCtx *SlotCtx) getProgramAccountSource(pubkey solana.PublicKey) (*accounts.Account, bool, error) {
 	if slotCtx.BankSysvars() == nil || !IsBankSysvarAccount(pubkey) {
 		if reader, ok := slotCtx.UnrootedRead.(interface {
 			GetAccountShared(uint64, solana.PublicKey) (*accounts.Account, error)
 		}); ok {
-			return reader.GetAccountShared(slotCtx.Slot, pubkey)
+			acct, err := reader.GetAccountShared(slotCtx.Slot, pubkey)
+			return acct, true, err
 		}
 	}
-	return slotCtx.GetAccountFromAccountsDb(pubkey)
+	acct, err := slotCtx.GetAccountFromAccountsDb(pubkey)
+	return acct, false, err
 }
 
 // GetAccountDataLenFromAccountsDb resolves the same parent-bank version as

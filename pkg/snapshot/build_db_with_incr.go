@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
@@ -16,7 +15,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/progress"
 	"github.com/Overclock-Validator/mithril/pkg/rpcclient"
 	"github.com/Overclock-Validator/mithril/pkg/snapshotdl"
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/panjf2000/ants/v2"
 )
 
@@ -40,14 +39,19 @@ func BuildAccountsDbAuto(
 	snapshotDownloadPath string,
 	fullSnapshotSlot int,
 	referenceSlot int,
-	accountsDbDir string,
+	accountsPaths []string,
 	rpcEndpoints []string,
 	blockDir string,
 	snapCfg snapshotdl.SnapshotConfig,
 	dp *progress.DualProgress,
 ) (*accountsdb.AccountsDb, *SnapshotManifest, error) {
+	if err := accountsdb.ValidateAccountsPaths(accountsPaths); err != nil {
+		return nil, nil, err
+	}
+	// The first path holds all metadata; every path holds an accounts dir with its share of the appendvecs.
+	accountsDbDir := accountsPaths[0]
 	// Clean any leftover artifacts from previous incomplete runs (e.g., Ctrl+C)
-	CleanAccountsDbDir(accountsDbDir)
+	CleanAccountsDbDirs(accountsPaths)
 
 	mlog.Log.Infof("Parsing full snapshot manifest...")
 	manifest, err := UnmarshalManifestFromSnapshot(ctx, fullSnapshotFile, accountsDbDir)
@@ -61,16 +65,16 @@ func BuildAccountsDbAuto(
 
 	start := time.Now()
 
-	appendVecsOutputDir := filepath.Join(accountsDbDir, "accounts")
-	if err = os.MkdirAll(appendVecsOutputDir, 0775); err != nil {
+	appendVecDirs, err := makeAppendVecDirs(accountsPaths)
+	if err != nil {
 		return nil, nil, err
 	}
+	defer appendVecDirs.close()
 	logSnapshotBootstrapTuning()
 
 	defer ants.Release()
 
 	incrementalManifest := &SnapshotManifest{}
-	var largestFileId atomic.Uint64
 	wg := &sync.WaitGroup{}
 
 	numShards := snapshotIndexShards()
@@ -86,7 +90,7 @@ func BuildAccountsDbAuto(
 		stakeEntries: make([]accountsdb.StakeIndexEntry, 0, 1000000), // Pre-allocate for ~1M stake accounts
 	}
 
-	pools, err := initWorkerPools(wg, sl, manifest, incrementalManifest, accountsDbDir, &largestFileId, accountCollector)
+	pools, err := initWorkerPools(wg, sl, manifest, incrementalManifest, appendVecDirs, accountCollector)
 	if err != nil {
 		return nil, nil, fmt.Errorf("initializing worker pools: %w", err)
 	}
@@ -248,6 +252,13 @@ func BuildAccountsDbAuto(
 		return nil, nil, err
 	}
 
+	// Workers have drained; release their pools before the memory-intensive sort.
+	pools.Release()
+
+	// Make the unpacked appendvecs durable while the index flush runs.
+	waitAppendVecsSynced := appendVecDirs.startSync()
+	defer waitAppendVecsSynced()
+
 	// Show indexing progress for shard flush
 	indexProgress := progress.NewIndexingProgress("Flush (shard logs)")
 	indexProgress.Start(numShards)
@@ -261,12 +272,16 @@ func BuildAccountsDbAuto(
 	}
 	index.Close()
 
-	var largestFileIdBytes [8]byte
-	binary.LittleEndian.PutUint64(largestFileIdBytes[:], largestFileId.Load())
+	if err := waitAppendVecsSynced(); err != nil {
+		return nil, nil, err
+	}
+	if err := accountsdb.WriteAccountsDirCount(accountsDbDir, len(accountsPaths)); err != nil {
+		return nil, nil, err
+	}
 
-	path := filepath.Join(accountsDbDir, "largest_file_id")
-	if err := os.WriteFile(path, largestFileIdBytes[:], 0644); err != nil {
-		mlog.Log.Errorf("error while writing largest file ID=%d to %s: %s", largestFileId.Load(), path, err)
+	var largestFileIdBytes [8]byte
+	binary.LittleEndian.PutUint64(largestFileIdBytes[:], appendVecDirs.largest.Load())
+	if err := os.WriteFile(filepath.Join(accountsDbDir, "largest_file_id"), largestFileIdBytes[:], 0644); err != nil {
 		return nil, nil, err
 	}
 
@@ -290,6 +305,9 @@ func BuildAccountsDbAuto(
 	if err := accountsdb.WriteStakePubkeyIndex(stakeIndexPath, accountCollector.stakeEntries); err != nil {
 		return nil, nil, fmt.Errorf("writing stake pubkey index: %w", err)
 	}
+	if err := syncBuildMetadata(accountsDbDir); err != nil {
+		return nil, nil, fmt.Errorf("syncing AccountsDB metadata: %w", err)
+	}
 
 	bankhashDir := filepath.Join(accountsDbDir, "bankhash_db")
 	bankhashDb, err := pebble.Open(bankhashDir, &pebble.Options{})
@@ -298,7 +316,7 @@ func BuildAccountsDbAuto(
 	}
 	bankhashDb.Close()
 
-	accountsDb, err := accountsdb.OpenDb(accountsDbDir)
+	accountsDb, err := accountsdb.OpenDbPaths(accountsPaths)
 	if err != nil {
 		return nil, nil, err
 	}

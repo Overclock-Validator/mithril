@@ -14,8 +14,8 @@ import (
 	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/transactionhistory"
 	"github.com/Overclock-Validator/mithril/pkg/txstatus"
-	"github.com/cockroachdb/pebble"
-	"github.com/cockroachdb/pebble/vfs"
+	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/require"
 )
@@ -49,7 +49,8 @@ func (file *historyReselectionFile) ReadAt(data []byte, offset int64) (int, erro
 	for {
 		frame, more := frames.Next()
 		lookup = lookup || strings.HasSuffix(frame.Function, ".(*AccountsDb).GetBankHashForSlot")
-		dataBlock = dataBlock || strings.HasSuffix(frame.Function, ".(*singleLevelIterator).loadBlock")
+		dataBlock = dataBlock || (strings.HasPrefix(frame.Function, "github.com/cockroachdb/pebble/v2/sstable.(*singleLevelIterator[") &&
+			strings.HasSuffix(frame.Function, "]).loadDataBlock"))
 		if !more {
 			break
 		}
