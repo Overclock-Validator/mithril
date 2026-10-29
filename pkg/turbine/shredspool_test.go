@@ -321,3 +321,217 @@ func TestShredSpoolCompletenessJournal(t *testing.T) {
 		t.Fatalf("no complete slots expected, got %d", third.CompleteSlots())
 	}
 }
+
+// The catchup monitor starts from the run of complete spooled slots at the
+// frontier; a gap or an incomplete slot ends the run.
+func TestSpoolCompleteThrough(t *testing.T) {
+	spool, err := OpenShredSpool(t.TempDir(), 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer spool.Close()
+	r := NewUDPReceiver("127.0.0.1:0")
+	if _, ok := r.SpoolCompleteThrough(100, 10); ok {
+		t.Fatalf("no spool attached must report nothing")
+	}
+	r.SetShredSpool(spool)
+	for _, slot := range []uint64{100, 101, 102, 104} {
+		spool.MarkComplete(slot, 9, 10)
+	}
+	spool.Append(103, []byte("partial")) // spooled but never proven complete
+
+	if last, ok := r.SpoolCompleteThrough(100, 10); !ok || last != 102 {
+		t.Fatalf("run from 100 = %d, %v; want 102, true", last, ok)
+	}
+	if last, ok := r.SpoolCompleteThrough(100, 2); !ok || last != 101 {
+		t.Fatalf("limited run from 100 = %d, %v; want 101, true", last, ok)
+	}
+	if _, ok := r.SpoolCompleteThrough(103, 10); ok {
+		t.Fatalf("an incomplete frontier slot must not start a run")
+	}
+	if last, ok := r.SpoolCompleteThrough(104, 10); !ok || last != 104 {
+		t.Fatalf("run from 104 = %d, %v; want 104, true", last, ok)
+	}
+}
+
+// spoolDataShredPacket is a minimal legacy data shred of slot whose header
+// names parent: enough for ParseShred and the spool's parent lookup.
+func spoolDataShredPacket(slot, parent uint64, index uint32) []byte {
+	packet := make([]byte, dataHeaderSize+8)
+	packet[shredVariantOffset] = legacyDataVariant
+	binary.LittleEndian.PutUint64(packet[shredSlotOffset:], slot)
+	binary.LittleEndian.PutUint32(packet[shredIndexOffset:], index)
+	binary.LittleEndian.PutUint16(packet[dataParentOffsetOffset:], uint16(slot-parent))
+	binary.LittleEndian.PutUint16(packet[dataSizeOffset:], uint16(len(packet)))
+	return packet
+}
+
+func spoolCompleteBlock(t *testing.T, spool *ShredSpool, slot, parent uint64) {
+	t.Helper()
+	spool.Append(slot, spoolDataShredPacket(slot, parent, 0))
+	spool.MarkComplete(slot, 0, 1)
+}
+
+// Mainnet halt: 919 (the last slot of a leader run) was received complete, the
+// cluster skipped it, and 920 links to 918. Catch-up must neither claim 919
+// as part of a replayable run nor serve it on restart.
+func TestSpoolCatchupSkipsSlotALaterBlockLinksPast(t *testing.T) {
+	spool, err := OpenShredSpool(t.TempDir(), 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer spool.Close()
+	r := NewUDPReceiver("127.0.0.1:0")
+	r.SetShredSpool(spool)
+	spoolCompleteBlock(t, spool, 918, 917)
+	spoolCompleteBlock(t, spool, 919, 918)
+	spoolCompleteBlock(t, spool, 920, 918)
+
+	if got := spool.CompleteParents(918, 920); got[918] != 917 || got[919] != 918 || got[920] != 918 || len(got) != 3 {
+		t.Fatalf("parents = %v", got)
+	}
+	if last, ok := r.SpoolCompleteThrough(918, 10); !ok || last != 918 {
+		t.Fatalf("run from 918 = %d, %v; want 918, true (919 is skipped on 920's branch)", last, ok)
+	}
+	if _, ok := r.SpoolCompleteThrough(919, 10); ok {
+		t.Fatalf("a run must not start at a slot a later spooled block links past")
+	}
+	if last, ok := r.SpoolCompleteThrough(918, 2); !ok || last != 919 {
+		t.Fatalf("run from 918 limited to 2 = %d, %v; want 919, true (920 is outside the window)", last, ok)
+	}
+
+	if dropped := r.DiscardSpooledSkippedSlots(919, 10); len(dropped) != 1 || dropped[0] != 919 {
+		t.Fatalf("discarded %v, want [919]", dropped)
+	}
+	if spool.HasSlot(919) {
+		t.Fatalf("919 must be gone from the spool")
+	}
+	if _, complete := spool.IsComplete(919); complete {
+		t.Fatalf("919 must not stay complete")
+	}
+	if _, complete := spool.IsComplete(920); !complete {
+		t.Fatalf("920 must be kept")
+	}
+	if dropped := r.DiscardSpooledSkippedSlots(919, 10); len(dropped) != 0 {
+		t.Fatalf("second pass discarded %v", dropped)
+	}
+
+	// A different block for 919 that 920 builds on is a normal chain again;
+	// the cached parent of the discarded block must not survive.
+	spoolCompleteBlock(t, spool, 919, 917)
+	spool.DiscardSlot(920)
+	spoolCompleteBlock(t, spool, 920, 919)
+	if got := spool.CompleteParents(919, 920); got[919] != 917 || got[920] != 919 {
+		t.Fatalf("parents after replacement = %v", got)
+	}
+	if last, ok := r.SpoolCompleteThrough(919, 10); !ok || last != 920 {
+		t.Fatalf("run from 919 = %d, %v; want 920, true", last, ok)
+	}
+}
+
+// 921 links past 919..920 while 920 builds on 919: two competing branches.
+// Catch-up stops before the contested range and leaves the choice to the live
+// drive; the spool keeps both branches whole (dropping only the dead end 920
+// would replay 919 and halt the same way).
+func TestSpoolCatchupKeepsContestedSlot(t *testing.T) {
+	spool, err := OpenShredSpool(t.TempDir(), 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer spool.Close()
+	r := NewUDPReceiver("127.0.0.1:0")
+	r.SetShredSpool(spool)
+	spoolCompleteBlock(t, spool, 918, 917)
+	spoolCompleteBlock(t, spool, 919, 918)
+	spoolCompleteBlock(t, spool, 920, 919)
+	spoolCompleteBlock(t, spool, 921, 918)
+
+	if dropped := r.DiscardSpooledSkippedSlots(918, 10); len(dropped) != 0 {
+		t.Fatalf("discarded %v, want none (920 builds on 919, so 919..920 is a contested branch)", dropped)
+	}
+	if last, ok := r.SpoolCompleteThrough(918, 10); !ok || last != 918 {
+		t.Fatalf("run from 918 = %d, %v; want 918, true", last, ok)
+	}
+	if !spool.HasSlot(919) || !spool.HasSlot(920) || !spool.HasSlot(921) {
+		t.Fatalf("both branches must stay spooled")
+	}
+	// Slots below from are never touched; with 920 rooted, 921 (built on 918)
+	// skips the root and is the only one discarded.
+	if dropped := r.DiscardSpooledSkippedSlots(921, 10); len(dropped) != 1 || dropped[0] != 921 {
+		t.Fatalf("discarded %v, want [921]", dropped)
+	}
+	if !spool.HasSlot(919) || !spool.HasSlot(920) {
+		t.Fatalf("slots below the frontier must stay spooled")
+	}
+}
+
+// Blocks without a readable data shred (journal entries only) give no parent
+// and leave the run as the journal states it.
+func TestSpoolCompleteParentsIgnoresUnreadableSlots(t *testing.T) {
+	spool, err := OpenShredSpool(t.TempDir(), 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer spool.Close()
+	spool.MarkComplete(500, 9, 10)
+	spool.Append(501, []byte("not a shred"))
+	spool.MarkComplete(501, 9, 10)
+	if got := spool.CompleteParents(0, 1000); len(got) != 0 {
+		t.Fatalf("parents = %v, want none", got)
+	}
+}
+
+// A spooled block that skips the rooted slot (from-1) is abandoned: it is
+// discarded, including at the frontier, and its link is not evidence against
+// the canonical next block.
+func TestSpoolCatchupIgnoresBlocksSkippingTheRoot(t *testing.T) {
+	spool, err := OpenShredSpool(t.TempDir(), 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer spool.Close()
+	r := NewUDPReceiver("127.0.0.1:0")
+	r.SetShredSpool(spool)
+	// Rooted 918; canonical 919 builds on it; 920 links to 917, skipping the root.
+	spoolCompleteBlock(t, spool, 919, 918)
+	spoolCompleteBlock(t, spool, 920, 917)
+	if dropped := r.DiscardSpooledSkippedSlots(919, 10); len(dropped) != 1 || dropped[0] != 920 {
+		t.Fatalf("discarded %v, want [920]", dropped)
+	}
+	if _, complete := spool.IsComplete(919); !complete {
+		t.Fatalf("the canonical 919 must be kept")
+	}
+
+	// The frontier block itself skipping the root is discarded too.
+	spool2, err := OpenShredSpool(t.TempDir(), 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer spool2.Close()
+	r2 := NewUDPReceiver("127.0.0.1:0")
+	r2.SetShredSpool(spool2)
+	spoolCompleteBlock(t, spool2, 919, 916)
+	if dropped := r2.DiscardSpooledSkippedSlots(919, 10); len(dropped) != 1 || dropped[0] != 919 {
+		t.Fatalf("discarded %v, want [919]", dropped)
+	}
+}
+
+// A malformed parent offset (zero, or past the slot) gives no parent rather
+// than parent 0, which would make the block "link past" every earlier slot.
+func TestSpoolParentRejectsMalformedOffsets(t *testing.T) {
+	spool, err := OpenShredSpool(t.TempDir(), 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer spool.Close()
+	bad := spoolDataShredPacket(50, 0, 0)
+	binary.LittleEndian.PutUint16(bad[dataParentOffsetOffset:], 60) // offset beyond the slot
+	spool.Append(50, bad)
+	spool.MarkComplete(50, 0, 1)
+	zero := spoolDataShredPacket(51, 51, 0) // offset 0
+	spool.Append(51, zero)
+	spool.MarkComplete(51, 0, 1)
+	if got := spool.CompleteParents(0, 100); len(got) != 0 {
+		t.Fatalf("parents = %v, want none", got)
+	}
+}

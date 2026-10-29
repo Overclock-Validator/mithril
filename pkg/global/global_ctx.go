@@ -103,6 +103,19 @@ func PendingStakeEntriesSnapshot() []accountsdb.StakeIndexEntry {
 	return out
 }
 
+// PendingStakePubkeysForSlot returns the stake pubkeys enqueued while
+// executing slot (copies; duplicates possible).
+func PendingStakePubkeysForSlot(slot uint64) []solana.PublicKey {
+	instance.pendingStakeMutex.Lock()
+	defer instance.pendingStakeMutex.Unlock()
+	entries := instance.pendingStakeBySlot[slot]
+	out := make([]solana.PublicKey, len(entries))
+	for i, entry := range entries {
+		out[i] = entry.Pubkey
+	}
+	return out
+}
+
 // DropPendingStakePubkeys drops only the discarded bank's slot. A local leader
 // can have pending entries at later slots even while replay is behind it.
 func DropPendingStakePubkeys(slot uint64) int {
@@ -533,6 +546,15 @@ func FlushPendingStakePubkeysThrough(accountsDbDir string, through uint64) (int,
 	instance.pendingStakeMutex.Unlock()
 
 	return len(pending), nil
+}
+
+// ResetStakePubkeyIndexCache forgets the loaded index, so the next
+// LoadStakePubkeyIndex reads the file. The cache is not keyed by directory;
+// tests that load indexes from different directories reset it.
+func ResetStakePubkeyIndexCache() {
+	instance.pendingStakeMutex.Lock()
+	instance.cachedStakeEntries = nil
+	instance.pendingStakeMutex.Unlock()
 }
 
 // ClearPendingStakePubkeys discards any pending stake pubkeys without writing them.

@@ -197,6 +197,12 @@ func (p *entryPrefetchPool) run() {
 		if batch.err == nil && !batch.marker {
 			batch.transactions = entryBatchTransactions(batch.entries)
 		}
+		// Summarize and hand over before publication: once ready closes, replay
+		// may resolve address tables into these messages, and the hook must have
+		// seen every batch of a block before the block can be emitted.
+		if refsHook := streamRefsHook.Load(); refsHook != nil && batch.err == nil && !batch.marker && len(batch.transactions) > 0 {
+			(*refsHook)(s.slot, SummarizeAccountRefs(batch.transactions))
+		}
 		if batch.err == nil && !batch.marker && f.ctx.Err() == nil {
 			txs := batch.transactions
 			if len(txs) > 0 {

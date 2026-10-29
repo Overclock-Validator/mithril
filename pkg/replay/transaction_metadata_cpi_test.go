@@ -14,7 +14,6 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/gagliardetto/solana-go"
-	"github.com/maypok86/otter"
 	"github.com/stretchr/testify/require"
 )
 
@@ -26,10 +25,7 @@ func transactionMetadataCPIFixture(t *testing.T, removeADH bool) (*sealevel.Slot
 	if removeADH {
 		ctx.Features.EnableFeature(features.RemoveAccountsDeltaHash, 0)
 	}
-	cache, err := otter.MustBuilder[solana.PublicKey, *accountsdb.ProgramCacheEntry](1024).
-		Cost(func(solana.PublicKey, *accountsdb.ProgramCacheEntry) uint32 { return 1 }).Build()
-	require.NoError(t, err)
-	t.Cleanup(cache.Close)
+	cache := accountsdb.NewWeightedCache[solana.PublicKey, *accountsdb.ProgramCacheEntry](1024, func(solana.PublicKey, *accountsdb.ProgramCacheEntry) uint32 { return 1 })
 	ctx.AccountsDb = &accountsdb.AccountsDb{ProgramCache: cache}
 	put := func(key, owner solana.PublicKey, data []byte, executable bool) {
 		require.NoError(t, ctx.Accounts.SetAccount((*[32]byte)(&key), &accounts.Account{

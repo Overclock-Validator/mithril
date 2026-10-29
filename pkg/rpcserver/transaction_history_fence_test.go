@@ -13,8 +13,8 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/transactionhistory"
-	"github.com/cockroachdb/pebble"
-	"github.com/cockroachdb/pebble/vfs"
+	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/require"
 )

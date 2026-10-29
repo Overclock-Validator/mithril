@@ -1,13 +1,13 @@
 package snapshot
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,7 +18,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/progress"
 	"github.com/Overclock-Validator/mithril/pkg/statsd"
 	"github.com/Overclock-Validator/mithril/pkg/txstatus"
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/gagliardetto/solana-go"
 	"github.com/panjf2000/ants/v2"
 )
@@ -27,8 +27,13 @@ const (
 	DefaultSnapshotIndexEntryCommitterWorkers = 64
 	DefaultSnapshotIndexEntryBuilderWorkers   = 64
 	DefaultSnapshotAppendVecCopyingWorkers    = 32
-	DefaultSnapshotIndexShards                = 64
+	DefaultSnapshotIndexShards                = 256
 	DefaultSnapshotMaxConcurrentFlushers      = 8
+	// DefaultSnapshotFlushSortWorkers == 0 means "auto": use runtime.NumCPU().
+	DefaultSnapshotFlushSortWorkers = 0
+	// DefaultSnapshotAccountsDirMinFreeMB is the free space a multi-directory
+	// unpack leaves on each accounts filesystem before placing files elsewhere.
+	DefaultSnapshotAccountsDirMinFreeMB = 16 << 10
 )
 
 var (
@@ -36,13 +41,21 @@ var (
 	SnapshotIndexEntryBuilderWorkers   = DefaultSnapshotIndexEntryBuilderWorkers
 	SnapshotAppendVecCopyingWorkers    = DefaultSnapshotAppendVecCopyingWorkers
 	SnapshotIndexShards                = DefaultSnapshotIndexShards
+	SnapshotFlushSortWorkers           = DefaultSnapshotFlushSortWorkers
+	SnapshotAccountsDirMinFreeBytes    = uint64(DefaultSnapshotAccountsDirMinFreeMB) << 20
 	SnapshotIndexTempDir               string
 )
 
 // CleanAccountsDbDir removes all artifacts from a previous incomplete snapshot run.
 // This prevents corruption from Ctrl+C or partial downloads.
 // Exported so it can be called early in startup before any failures.
-func CleanAccountsDbDir(accountsDbDir string) {
+func CleanAccountsDbDir(accountsDbDir string) { CleanAccountsDbDirs([]string{accountsDbDir}) }
+
+func CleanAccountsDbDirs(accountsPaths []string) {
+	if err := accountsdb.ValidateAccountsPaths(accountsPaths); err != nil {
+		mlog.Log.Errorf("refusing AccountsDB cleanup: %v", err)
+		return
+	}
 	// List of all files/directories that may be left from a previous incomplete run
 	artifacts := []string{
 		"accounts",
@@ -58,16 +71,25 @@ func CleanAccountsDbDir(accountsDbDir string) {
 		"mithril_db_log_shards",
 		"bankhash_db",
 		"largest_file_id",
+		"num_shards", // retired big-file layout
+		accountsdb.AccountsDirCountFile,
 		"manifest",
 		"mithril_state.json", // State file for tracking valid builds and replay progress
 	}
 	for _, artifact := range artifacts {
-		path := filepath.Join(accountsDbDir, artifact)
+		path := filepath.Join(accountsPaths[0], artifact)
 		if err := os.RemoveAll(path); err != nil {
 			mlog.Log.Errorf("failed to remove %s: %v", path, err)
 		}
 	}
-	partials, _ := filepath.Glob(filepath.Join(accountsDbDir, ".snapshot-status-cache-*.partial"))
+	// remove the accounts dir in the other accounts directories too
+	for _, p := range accountsPaths[1:] {
+		path := filepath.Join(p, "accounts")
+		if err := os.RemoveAll(path); err != nil {
+			mlog.Log.Errorf("failed to remove %s: %v", path, err)
+		}
+	}
+	partials, _ := filepath.Glob(filepath.Join(accountsPaths[0], ".snapshot-status-cache-*.partial"))
 	for _, partial := range partials {
 		if err := os.Remove(partial); err != nil && !os.IsNotExist(err) {
 			mlog.Log.Errorf("failed to remove stale status-cache partial %s: %v", partial, err)
@@ -217,19 +239,42 @@ func snapshotMaxConcurrentFlushers() int {
 	return positiveOrDefault(MaxConcurrentFlushers, DefaultSnapshotMaxConcurrentFlushers)
 }
 
+// snapshotFlushSortWorkers is how many shard buffers may be sorted concurrently
+// during the index flush. 0 (the default) means auto: one per logical CPU.
+func snapshotFlushSortWorkers() int {
+	if SnapshotFlushSortWorkers > 0 {
+		return SnapshotFlushSortWorkers
+	}
+	return runtime.NumCPU()
+}
+
 func logSnapshotBootstrapTuning() {
 	indexTempDir := SnapshotIndexTempDir
 	if indexTempDir == "" {
 		indexTempDir = "(accountsdb)"
 	}
-	mlog.Log.Infof("Snapshot bootstrap tuning: append_vec_workers=%d index_builder_workers=%d index_committer_workers=%d index_shards=%d max_concurrent_flushers=%d zstd_decoder_concurrency=%d index_temp_dir=%s",
+	mlog.Log.Infof("Snapshot bootstrap tuning: append_vec_workers=%d index_builder_workers=%d index_committer_workers=%d index_shards=%d max_concurrent_flushers=%d flush_sort_workers=%d zstd_decoder_concurrency=%d index_temp_dir=%s",
 		snapshotAppendVecCopyingWorkers(),
 		snapshotIndexEntryBuilderWorkers(),
 		snapshotIndexEntryCommitterWorkers(),
 		snapshotIndexShards(),
 		snapshotMaxConcurrentFlushers(),
+		snapshotFlushSortWorkers(),
 		ZstdDecoderConcurrency,
 		indexTempDir)
+}
+
+// makeAppendVecDirs creates each path's accounts directory and the placer
+// that spreads unpacked appendvecs across them.
+func makeAppendVecDirs(accountsPaths []string) (*appendVecDirs, error) {
+	dirs := make([]string, len(accountsPaths))
+	for i, p := range accountsPaths {
+		dirs[i] = filepath.Join(p, "accounts")
+		if err := os.MkdirAll(dirs[i], 0775); err != nil {
+			return nil, err
+		}
+	}
+	return openAppendVecDirs(dirs)
 }
 
 func prepareSnapshotIndexWorkDir(accountsDbDir string) (string, func(), error) {
@@ -262,11 +307,16 @@ func BuildAccountsDbPaths(
 	ctx context.Context,
 	snapshotFile string,
 	incrementalSnapshotFile string,
-	accountsDbDir string,
+	accountsPaths []string,
 	dp *progress.DualProgress,
 ) (*accountsdb.AccountsDb, *SnapshotManifest, error) {
+	if err := accountsdb.ValidateAccountsPaths(accountsPaths); err != nil {
+		return nil, nil, err
+	}
+	// The first path holds all metadata; every path holds an accounts dir with its share of the appendvecs.
+	accountsDbDir := accountsPaths[0]
 	// Clean any leftover artifacts from previous incomplete runs (e.g., Ctrl+C)
-	CleanAccountsDbDir(accountsDbDir)
+	CleanAccountsDbDirs(accountsPaths)
 
 	mlog.Log.Infof("Parsing full snapshot manifest...")
 	manifest, err := UnmarshalManifestFromSnapshot(ctx, snapshotFile, accountsDbDir)
@@ -293,15 +343,15 @@ func BuildAccountsDbPaths(
 
 	start := time.Now()
 
-	appendVecsOutputDir := filepath.Join(accountsDbDir, "accounts")
-	if err = os.MkdirAll(appendVecsOutputDir, 0775); err != nil {
+	appendVecDirs, err := makeAppendVecDirs(accountsPaths)
+	if err != nil {
 		return nil, nil, err
 	}
+	defer appendVecDirs.close()
 	logSnapshotBootstrapTuning()
 
 	defer ants.Release()
 
-	var largestFileId atomic.Uint64
 	wg := &sync.WaitGroup{}
 
 	logsDir, cleanupIndexWorkDir, err := prepareSnapshotIndexWorkDir(accountsDbDir)
@@ -317,7 +367,7 @@ func BuildAccountsDbPaths(
 		stakeEntries: make([]accountsdb.StakeIndexEntry, 0, 1000000), // Pre-allocate for ~1M stake accounts
 	}
 
-	pools, err := initWorkerPools(wg, sl, manifest, incrementalManifest, accountsDbDir, &largestFileId, accountCollector)
+	pools, err := initWorkerPools(wg, sl, manifest, incrementalManifest, appendVecDirs, accountCollector)
 	if err != nil {
 		return nil, nil, fmt.Errorf("initializing worker pools: %w", err)
 	}
@@ -373,6 +423,13 @@ func BuildAccountsDbPaths(
 		}
 	}
 
+	// Workers have drained; release their pools before the memory-intensive sort.
+	pools.Release()
+
+	// Make the unpacked appendvecs durable while the index flush runs.
+	waitAppendVecsSynced := appendVecDirs.startSync()
+	defer waitAppendVecsSynced()
+
 	mlog.Log.Debugf("done processing snapshots in %s.", fmtDuration(time.Since(start)))
 
 	// Show indexing progress for shard flush (no gap between DualProgress and this)
@@ -393,12 +450,16 @@ func BuildAccountsDbPaths(
 
 	mlog.Log.Infof("Snapshot processed in %s.", fmtDuration(time.Since(start)))
 
-	var largestFileIdBytes [8]byte
-	binary.LittleEndian.PutUint64(largestFileIdBytes[:], largestFileId.Load())
+	if err := waitAppendVecsSynced(); err != nil {
+		return nil, nil, err
+	}
+	if err := accountsdb.WriteAccountsDirCount(accountsDbDir, len(accountsPaths)); err != nil {
+		return nil, nil, err
+	}
 
-	path := filepath.Join(accountsDbDir, "largest_file_id")
-	if err := os.WriteFile(path, largestFileIdBytes[:], 0644); err != nil {
-		mlog.Log.Errorf("error while writing largest file ID=%d to %s: %s", largestFileId.Load(), path, err)
+	var largestFileIdBytes [8]byte
+	binary.LittleEndian.PutUint64(largestFileIdBytes[:], appendVecDirs.largest.Load())
+	if err := os.WriteFile(filepath.Join(accountsDbDir, "largest_file_id"), largestFileIdBytes[:], 0644); err != nil {
 		return nil, nil, err
 	}
 
@@ -422,6 +483,9 @@ func BuildAccountsDbPaths(
 	if err := accountsdb.WriteStakePubkeyIndex(stakeIndexPath, accountCollector.stakeEntries); err != nil {
 		return nil, nil, fmt.Errorf("writing stake pubkey index: %w", err)
 	}
+	if err := syncBuildMetadata(accountsDbDir); err != nil {
+		return nil, nil, fmt.Errorf("syncing AccountsDB metadata: %w", err)
+	}
 
 	bankhashDir := filepath.Join(accountsDbDir, "bankhash_db")
 	bankhashDb, err := pebble.Open(bankhashDir, &pebble.Options{})
@@ -430,7 +494,7 @@ func BuildAccountsDbPaths(
 	}
 	bankhashDb.Close()
 
-	accountsDb, err := accountsdb.OpenDb(accountsDbDir)
+	accountsDb, err := accountsdb.OpenDbPaths(accountsPaths)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -461,6 +525,32 @@ type readTarOptions struct {
 	// Atomically retain the raw snapshots/status_cache member here. A
 	// successfully consumed incremental archive replaces the full seed.
 	statusCachePath string
+}
+
+// tarBufPool recycles the byte buffers that appendvec data is read into, saving
+// ~420k allocations totalling ~470 GB. A buffer returns to the pool once the index
+// builder is done reading it. Owned by snapshotWorkerPools so it may be GCed after
+// snapshot unpacking.
+type tarBufPool struct{ sync.Pool }
+
+func newTarBufPool() *tarBufPool {
+	return &tarBufPool{Pool: sync.Pool{New: func() any { b := []byte(nil); return &b }}}
+}
+
+func (p *tarBufPool) get(size int) *[]byte {
+	bp := p.Get().(*[]byte)
+	if cap(*bp) < size {
+		*bp = make([]byte, size)
+	} else {
+		*bp = (*bp)[:size]
+	}
+	return bp
+}
+
+func (p *tarBufPool) put(bp *[]byte) {
+	if bp != nil {
+		p.Put(bp)
+	}
 }
 
 func readTar(
@@ -535,28 +625,31 @@ func readTar(
 			continue
 		}
 
-		writer := bytes.NewBuffer(make([]byte, 0, header.Size))
-		tarBytesRead, err := io.Copy(writer, tarReader)
-		if err != nil {
-			mlog.Log.Errorf("err copying data to reader: %s\n", err)
-			cleanupPartial("copy error")
-			return err
-		}
-		statsd.Count(statsd.SnapshotTarBytesRead, tarBytesRead, nil)
-
-		// Update extract progress
-		if dp != nil {
-			dp.Extract.Add(tarBytesRead)
-		}
-
-		task := appendVecCopyingTask{TarBuffer: writer, Filename: header.Name, FromIncrementalSnapshot: options.isIncremental}
 		if pools == nil {
 			cleanupPartial("worker pool unavailable")
 			return fmt.Errorf("snapshot archive contains appendvec %q but no worker pool is available", header.Name)
 		}
+		bufs := pools.tarBufs
+		bp := bufs.get(int(header.Size))
+		_, err = io.ReadFull(tarReader, *bp)
+		if err != nil {
+			mlog.Log.Errorf("err reading tar entry data: %s\n", err)
+			cleanupPartial("read error")
+			bufs.put(bp)
+			return err
+		}
+		statsd.Count(statsd.SnapshotTarBytesRead, header.Size, nil)
+
+		// Update extract progress
+		if dp != nil {
+			dp.Extract.Add(header.Size)
+		}
+
+		task := appendVecCopyingTask{Buf: *bp, BufRef: bp, Filename: header.Name, FromIncrementalSnapshot: options.isIncremental}
 		err = invokeSnapshotTask(wg, pools.appendVecCopying, task)
 		if err != nil {
 			mlog.Log.Errorf("error calling appendVecCopyingPool.Invoke: %v", err)
+			bufs.put(bp)
 			cleanupPartial("pool error")
 			return err
 		}
@@ -588,6 +681,7 @@ type snapshotWorkerPools struct {
 	indexEntryBuilder   *ants.PoolWithFunc
 	indexEntryCommitter *ants.PoolWithFunc
 	errors              *snapshotWorkerErrors
+	tarBufs             *tarBufPool
 }
 
 type snapshotWorkerErrors struct {
@@ -677,14 +771,14 @@ func initWorkerPools(
 	sl *ShardLogger,
 	manifest *SnapshotManifest,
 	incrementalManifest *SnapshotManifest,
-	accountsDbDir string,
-	largestFileId *atomic.Uint64,
+	appendVecDirs *appendVecDirs,
 	accountCollector *snapshotAccountCollector,
 ) (*snapshotWorkerPools, error) {
 	indexEntryCommitterWorkers := snapshotIndexEntryCommitterWorkers()
 	indexEntryBuilderWorkers := snapshotIndexEntryBuilderWorkers()
 	appendVecCopyingWorkers := snapshotAppendVecCopyingWorkers()
 	workerErrors := &snapshotWorkerErrors{}
+	tarBufs := newTarBufPool()
 
 	indexEntryCommitterPool, err := ants.NewPoolWithFunc(indexEntryCommitterWorkers, func(i any) {
 		tasks := indexEntryCommitterInProgress.Add(1)
@@ -718,10 +812,11 @@ func initWorkerPools(
 		defer wg.Done()
 		defer indexEntryBuilderInProgress.Add(-1)
 		defer workerErrors.Recover("index entry builder")
+		task := i.(indexEntryBuilderTask)
+		defer tarBufs.put(task.BufRef)
 		if workerErrors.Err() != nil {
 			return
 		}
-		task := i.(indexEntryBuilderTask)
 		pubkeys, entries, stakeEntries, votePubkeys, err := accountsdb.BuildIndexEntriesFromAppendVecs(task.Data, task.FileSize, task.Slot, task.FileId)
 		if err != nil {
 			workerErrors.Record(fmt.Errorf("building index entries: %w", err))
@@ -750,46 +845,28 @@ func initWorkerPools(
 		defer wg.Done()
 		defer appendVecCopyingInProgress.Add(-1)
 		defer workerErrors.Recover("appendvec copying")
+		task := i.(appendVecCopyingTask)
+		handedOff := false
+		defer func() {
+			if !handedOff {
+				tarBufs.put(task.BufRef)
+			}
+		}()
 		if workerErrors.Err() != nil {
 			return
 		}
-		task := i.(appendVecCopyingTask)
 		filename := task.Filename
-		writer := task.TarBuffer
+		appendVecBytes := task.Buf
 
-		outFilename := filepath.Join(accountsDbDir, filename)
-
-		// validate that the path doesn't escape accountsDbDir (via '../' sequences)
-		cleanPath := filepath.Clean(outFilename)
-		if !strings.HasPrefix(cleanPath, filepath.Clean(accountsDbDir)+string(os.PathSeparator)) {
+		cleanName := filepath.Clean(filename)
+		if filepath.IsAbs(filename) || !strings.HasPrefix(cleanName, "accounts/") || strings.Count(cleanName, "/") != 1 {
 			workerErrors.Record(fmt.Errorf("invalid path in tar archive: %s", filename))
 			return
 		}
-
-		appendVecBytes := writer.Bytes()
-		err := os.WriteFile(cleanPath, appendVecBytes, 0644)
-		if err != nil {
-			workerErrors.Record(fmt.Errorf("writing appendvec %s: %w", cleanPath, err))
+		var slot, origFileId uint64
+		if n, err := fmt.Sscanf(filepath.Base(filename), "%d.%d", &slot, &origFileId); n != 2 || err != nil {
+			workerErrors.Record(fmt.Errorf("failed to parse appendvec filename=%s: %v", filename, err))
 			return
-		}
-
-		var slot, fileId uint64
-		if n, err := fmt.Sscanf(filepath.Base(filename), "%d.%d", &slot, &fileId); n != 2 || err != nil {
-			workerErrors.Record(fmt.Errorf(
-				"failed to parse slot and file from filename=%s basename=%s; parsed n=%d arguments (expected 2) and had err=%v",
-				filename, filepath.Base(filename), n, err))
-			return
-		}
-
-		for {
-			prevLargestFileId := largestFileId.Load()
-			if fileId <= prevLargestFileId {
-				break
-			}
-			swapped := largestFileId.CompareAndSwap(prevLargestFileId, fileId)
-			if swapped {
-				break
-			}
 		}
 
 		// find the relevant appendvec storage info. use the info from the incremental
@@ -804,7 +881,7 @@ func initWorkerPools(
 			}
 			sourceManifest = incrementalManifest
 			for _, av := range incrementalManifest.AccountsDb.Storages[slot].AcctVecs {
-				if av.Id == fileId {
+				if av.Id == origFileId {
 					fileSize = av.FileSize
 					usedIncrementalSnapshotVal = true
 					break
@@ -814,7 +891,7 @@ func initWorkerPools(
 
 		if !usedIncrementalSnapshotVal {
 			for _, av := range manifest.AccountsDb.Storages[slot].AcctVecs {
-				if av.Id == fileId {
+				if av.Id == origFileId {
 					fileSize = av.FileSize
 					break
 				}
@@ -830,13 +907,27 @@ func initWorkerPools(
 		if len(sourceManifest.AccountsDb.Storages) == 0 {
 			fileSize = uint64(len(appendVecBytes))
 		} else if fileSize == 0 {
-			workerErrors.Record(fmt.Errorf("manifest has no file size for appendvec slot=%d file_id=%d", slot, fileId))
+			workerErrors.Record(fmt.Errorf("manifest has no file size for appendvec slot=%d file_id=%d", slot, origFileId))
+			return
+		}
+		if uint64(len(appendVecBytes)) < fileSize {
+			workerErrors.Record(fmt.Errorf("appendvec slot=%d file_id=%d is %d bytes, shorter than its manifest size %d", slot, origFileId, len(appendVecBytes), fileSize))
 			return
 		}
 
-		nextTask := indexEntryBuilderTask{Data: appendVecBytes, FileSize: fileSize, Slot: slot, FileId: fileId}
+		dir, fileId := appendVecDirs.place(origFileId, int(fileSize))
+		outPath := filepath.Join(appendVecDirs.dirs[dir], accountsdb.SegmentDataName(slot, fileId))
+		err := os.WriteFile(outPath, appendVecBytes[:fileSize], 0644)
+		appendVecDirs.finish(dir, int(fileSize))
+		if err != nil {
+			workerErrors.Record(fmt.Errorf("writing appendvec %s: %w", outPath, err))
+			return
+		}
+
+		nextTask := indexEntryBuilderTask{Data: appendVecBytes, FileSize: fileSize, Slot: slot, FileId: fileId, BufRef: task.BufRef}
 		statsd.Timing(statsd.TasksAppendVecCopyingLatency, uint64(time.Since(start)), nil)
 		err = invokeSnapshotTask(wg, indexEntryBuilderPool, nextTask)
+		handedOff = err == nil
 		if err != nil {
 			workerErrors.Record(fmt.Errorf("submitting index entry builder task: %w", err))
 		}
@@ -852,13 +943,25 @@ func initWorkerPools(
 		indexEntryBuilderPool,
 		indexEntryCommitterPool,
 		workerErrors,
+		tarBufs,
 	}, nil
 }
 
 func (p *snapshotWorkerPools) Release() {
-	p.appendVecCopying.Release()
-	p.indexEntryBuilder.Release()
-	p.indexEntryCommitter.Release()
+	// Call only after waitForSnapshotWorkers. Idempotent for deferred cleanup.
+	if p.appendVecCopying != nil {
+		p.appendVecCopying.Release()
+		p.appendVecCopying = nil
+	}
+	if p.indexEntryBuilder != nil {
+		p.indexEntryBuilder.Release()
+		p.indexEntryBuilder = nil
+	}
+	if p.indexEntryCommitter != nil {
+		p.indexEntryCommitter.Release()
+		p.indexEntryCommitter = nil
+	}
+	p.tarBufs = nil
 }
 
 // Ingest SSTs into a fresh pebble DB and return it.
@@ -877,7 +980,7 @@ func ingestSSTFiles(indexDir, logsDir string) (*pebble.DB, error) {
 		return nil, fmt.Errorf("filepath.Glob(%s): unexpectedly globbed 0 SST files!", glob)
 	}
 
-	err = db.Ingest(sstFiles)
+	err = db.Ingest(context.Background(), sstFiles)
 	if err != nil {
 		return nil, fmt.Errorf("ingesting SSTs: %w", err)
 	}

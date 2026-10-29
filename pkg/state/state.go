@@ -1,10 +1,15 @@
 package state
 
 import (
+	"bytes"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
@@ -165,6 +170,12 @@ type MithrilState struct {
 	// These are NOT loaded from manifest - they are computed during replay and persisted.
 	ComputedEpochStakes map[uint64]string `json:"computed_epoch_stakes,omitempty"`
 
+	// RepairPeerHints are peers that recently served repair, saved so a
+	// restarted node can repair before gossip rediscovers peers. Hints only
+	// seed the repair peer list; they never affect replay or bank state, and
+	// a stale hint just stops being selected.
+	RepairPeerHints []RepairPeerHint `json:"repair_peer_hints,omitempty"`
+
 	// =========================================================================
 	// Legacy fields - kept for backwards compatibility
 	// =========================================================================
@@ -293,6 +304,101 @@ type ResumeContext struct {
 	// Startup and rewind consume it before replay; ResumeState intentionally does
 	// not copy it into the bank execution context.
 	TransactionStatusCheckpoint *TransactionStatusCheckpointRef `json:"transaction_status_checkpoint,omitempty"`
+	// DelegatedStake is the delegated stake per vote account, summed over
+	// stake accounts in the Stake state, in durable state as of Slot. Startup
+	// uses it instead of scanning every stake account. nil means the context
+	// predates the field or the totals were not tracked, and startup scans.
+	DelegatedStake *DelegatedStakeTotals `json:"delegated_stake,omitempty"`
+}
+
+// VoteDelegation is one vote account's delegated stake and the number of
+// stake accounts delegating it.
+type VoteDelegation struct {
+	Stake    uint64
+	Accounts uint64
+}
+
+// DelegatedStakeTotals is a compact encoding of delegations per vote
+// account: Votes records of a 32-byte vote account key, an 8-byte stake and
+// an 8-byte account count (little-endian), sorted by key, base64-encoded in
+// Packed.
+type DelegatedStakeTotals struct {
+	Votes  int    `json:"votes"`
+	Packed string `json:"packed"`
+	// IndexKeys and IndexDigest identify the stake pubkey index key set the
+	// totals were computed over (an order-independent digest, hex). The index
+	// file can hold keys the totals never saw (it is appended before a fold
+	// commits and is not cut back by a rewind), so startup uses the totals
+	// only when the index it loads has this exact key set.
+	IndexKeys   uint64 `json:"index_keys,omitempty"`
+	IndexDigest string `json:"index_digest,omitempty"`
+}
+
+const delegatedStakeRecordBytes = 32 + 8 + 8
+
+// EncodeDelegatedStake encodes per-vote-account delegations for a resume
+// context.
+func EncodeDelegatedStake(totals map[[32]byte]VoteDelegation) *DelegatedStakeTotals {
+	keys := make([][32]byte, 0, len(totals))
+	for key := range totals {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i][:], keys[j][:]) < 0 })
+	raw := make([]byte, 0, len(keys)*delegatedStakeRecordBytes)
+	for _, key := range keys {
+		raw = append(raw, key[:]...)
+		raw = binary.LittleEndian.AppendUint64(raw, totals[key].Stake)
+		raw = binary.LittleEndian.AppendUint64(raw, totals[key].Accounts)
+	}
+	return &DelegatedStakeTotals{Votes: len(keys), Packed: base64.StdEncoding.EncodeToString(raw)}
+}
+
+// Decode returns the delegations, or an error when the encoding is
+// inconsistent.
+func (d *DelegatedStakeTotals) Decode() (map[[32]byte]VoteDelegation, error) {
+	if d == nil {
+		return nil, fmt.Errorf("no delegated stake totals")
+	}
+	raw, err := base64.StdEncoding.DecodeString(d.Packed)
+	if err != nil {
+		return nil, fmt.Errorf("decode delegated stake totals: %w", err)
+	}
+	if d.Votes < 0 || len(raw) != d.Votes*delegatedStakeRecordBytes {
+		return nil, fmt.Errorf("delegated stake totals: %d bytes for %d vote accounts", len(raw), d.Votes)
+	}
+	totals := make(map[[32]byte]VoteDelegation, d.Votes)
+	for off := 0; off < len(raw); off += delegatedStakeRecordBytes {
+		var key [32]byte
+		copy(key[:], raw[off:off+32])
+		if _, dup := totals[key]; dup {
+			return nil, fmt.Errorf("delegated stake totals: duplicate vote account")
+		}
+		totals[key] = VoteDelegation{
+			Stake:    binary.LittleEndian.Uint64(raw[off+32 : off+40]),
+			Accounts: binary.LittleEndian.Uint64(raw[off+40 : off+48]),
+		}
+	}
+	return totals, nil
+}
+
+// RepairPeerHint is one remembered repair peer: its identity (repair
+// requests are addressed to it) and serve-repair UDP address.
+type RepairPeerHint struct {
+	Pubkey string `json:"pubkey"` // base58
+	Addr   string `json:"addr"`   // host:port
+}
+
+var repairPeerHintsProvider atomic.Pointer[func() []RepairPeerHint]
+
+// SetRepairPeerHintsProvider installs fn to supply current repair peer hints
+// on every Save; nil removes it. Saves keep the previous hints when fn has
+// none (for example right after startup).
+func SetRepairPeerHintsProvider(fn func() []RepairPeerHint) {
+	if fn == nil {
+		repairPeerHintsProvider.Store(nil)
+		return
+	}
+	repairPeerHintsProvider.Store(&fn)
 }
 
 // SnapshotInfo contains metadata about a downloaded snapshot file.
@@ -332,6 +438,11 @@ func LoadState(accountsDbDir string) (*MithrilState, error) {
 // Save writes the state to the accountsdb directory.
 func (s *MithrilState) Save(accountsDbDir string) error {
 	stateFile := filepath.Join(accountsDbDir, StateFileName)
+	if provider := repairPeerHintsProvider.Load(); provider != nil {
+		if hints := (*provider)(); len(hints) > 0 {
+			s.RepairPeerHints = hints
+		}
+	}
 
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
@@ -371,12 +482,17 @@ func (s *MithrilState) Save(accountsDbDir string) error {
 		return fmt.Errorf("failed to rename state file: %w", err)
 	}
 	// Make the rename itself durable.
-	if dir, err := os.Open(accountsDbDir); err == nil {
-		syncErr := dir.Sync()
-		dir.Close()
-		if syncErr != nil {
-			return fmt.Errorf("failed to fsync state directory: %w", syncErr)
-		}
+	dir, err := os.Open(accountsDbDir)
+	if err != nil {
+		return fmt.Errorf("failed to open state directory for fsync: %w", err)
+	}
+	syncErr := dir.Sync()
+	closeErr := dir.Close()
+	if syncErr != nil {
+		return fmt.Errorf("failed to fsync state directory: %w", syncErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("failed to close state directory: %w", closeErr)
 	}
 
 	return nil

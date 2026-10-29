@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/filecoin-project/go-jsonrpc"
 	"github.com/mr-tron/base58"
 	"github.com/stretchr/testify/require"
