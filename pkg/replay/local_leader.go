@@ -74,6 +74,7 @@ func adoptLocalLeaderBlock(
 	modified := collectAdoptAccounts(slotCtx, block)
 	bankhash := append([]byte(nil), slotCtx.FinalBankhash...)
 	if tail := normalizeUnrootedState(tail); tail != nil {
+		recordSlotStakeChange(tail, slotCtx, modified)
 		tail.Add(slotCtx.Slot, modified, bankhash)
 	}
 	if persistedHashes != nil {

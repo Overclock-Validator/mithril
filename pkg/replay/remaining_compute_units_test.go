@@ -27,9 +27,6 @@ func TestRemainingComputeUnitsPreservesSuccessfulNonceAdvance(t *testing.T) {
 	slotCtx.Features.EnableFeature(features.RemoveAccountsDeltaHash, 0)
 	slotCtx.AccountsDb = &accountsdb.AccountsDb{}
 	slotCtx.AccountsDb.InitCaches()
-	t.Cleanup(slotCtx.AccountsDb.ProgramCache.Close)
-	t.Cleanup(slotCtx.AccountsDb.VoteAcctCache.Close)
-	t.Cleanup(slotCtx.AccountsDb.CommonAcctsCache.Close)
 
 	payer := txfixture.PayerPubkey()
 	nonceKey := solana.PublicKey{0xD6}

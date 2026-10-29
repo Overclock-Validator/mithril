@@ -78,7 +78,7 @@ func translateInstructionC(vm sbpf.VM, addr uint64) (Instruction, error) {
 
 	accountMetaReader := bytes.NewReader(accountMetasData)
 
-	var accountMetas []SolAccountMetaC
+	accountMetas := make([]SolAccountMetaC, 0, ix.AccountsLen)
 	for count := uint64(0); count < ix.AccountsLen; count++ {
 		var am SolAccountMetaC
 		err = am.Unmarshal(accountMetaReader)
