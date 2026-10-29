@@ -5,6 +5,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
@@ -15,19 +16,29 @@ import (
 // commits a transaction releases its dependents itself instead of reporting to
 // a dispatcher goroutine. Each transaction keeps an atomic count of
 // uncommitted prerequisites; the committing worker decrements its dependents'
-// counts after the commit, runs the first that becomes ready itself, and
-// queues any others for idle workers. This removes two goroutine hand-offs
-// (worker to dispatcher, dispatcher to worker) from every link of a dependency
-// chain. Dependents are still released only after the commit. With =0 the
-// dispatcher goroutine schedules every transaction, as before.
+// counts after the commit, keeps one newly ready dependent to run next itself
+// (its continuation), and queues any others for idle workers. This removes two
+// goroutine hand-offs (worker to dispatcher, dispatcher to worker) from every
+// link of a dependency chain. Dependents are still released only after the
+// commit. With =0 the dispatcher goroutine schedules every transaction in
+// arrival order, as before.
+//
+// A continuation runs without consulting the shared queue, so the order is not
+// a global priority order: a worker can continue its own chain while
+// higher-priority work waits in the queue for another worker. With
+// MITHRIL_READY_PRIORITY=0 the continuation is the first dependent released
+// and the queue is first in, first out; that is still not the dispatcher's
+// order, which only MITHRIL_DIRECT_DISPATCH=0 restores.
 var directDispatch = os.Getenv("MITHRIL_DIRECT_DISPATCH") != "0"
 
 // Critical-path-first scheduling (direct dispatch), on unless
 // MITHRIL_READY_PRIORITY=0: each transaction's height is the length of the
-// longest chain of dependents below it. Ready transactions are taken highest
-// first instead of in arrival order, and a committing worker continues with
-// its highest newly ready dependent, so a transaction on the block's longest
-// chain does not wait behind ready work that nothing depends on.
+// longest chain of dependents below it. Idle workers take queued transactions
+// highest first instead of in arrival order, and a committing worker's
+// continuation is its highest newly ready dependent, so a transaction on the
+// block's longest chain does not wait behind ready work that nothing depends
+// on. Priority orders the queue and each continuation choice, not the whole
+// block (see direct dispatch above).
 var readyPriority = os.Getenv("MITHRIL_READY_PRIORITY") != "0"
 
 // With MITHRIL_READY_PRIORITY_CU=1, heights weigh each transaction by its
@@ -150,11 +161,22 @@ func requestedKCU(tx *solana.Transaction) int32 {
 
 // runDependencyPlan executes every transaction of plan on the given number of
 // workers. process(worker, tx) executes and commits tx; it returns only after
-// the commit, and dependents are released only then.
-func runDependencyPlan(plan *dependencyPlan, workers int, sched planSchedule, process func(worker, tx int)) {
+// the commit, and dependents are released only then. It returns the time from
+// its start until the final transaction became ready, the counterpart of the
+// dispatcher's DependencyPlannerDispatch (which ends once the final wave is
+// enqueued, before it executes).
+func runDependencyPlan(plan *dependencyPlan, workers int, sched planSchedule, process func(worker, tx int)) time.Duration {
 	n := len(plan.inDegree)
 	if n == 0 {
-		return
+		return 0
+	}
+	start := time.Now()
+	var readied atomic.Int64 // transactions made ready so far
+	var dispatched atomic.Int64
+	markReady := func(count int64) {
+		if readied.Add(count) == int64(n) {
+			dispatched.Store(int64(time.Since(start)))
+		}
 	}
 	remaining := make([]atomic.Int32, n)
 	ready := make(chan int, n)
@@ -182,11 +204,14 @@ func runDependencyPlan(plan *dependencyPlan, workers int, sched planSchedule, pr
 	for tx, degree := range plan.inDegree {
 		remaining[tx].Store(int32(degree))
 	}
+	initial := int64(0)
 	for tx, degree := range plan.inDegree {
 		if degree == 0 {
 			enqueue(tx)
+			initial++
 		}
 	}
+	markReady(initial)
 
 	var wg sync.WaitGroup
 	wg.Add(workers)
@@ -209,6 +234,7 @@ func runDependencyPlan(plan *dependencyPlan, workers int, sched planSchedule, pr
 					if remaining[dependent].Add(-1) != 0 {
 						continue
 					}
+					markReady(1)
 					switch {
 					case next < 0:
 						next = int(dependent)
@@ -226,4 +252,5 @@ func runDependencyPlan(plan *dependencyPlan, workers int, sched planSchedule, pr
 		}()
 	}
 	wg.Wait()
+	return time.Duration(dispatched.Load())
 }

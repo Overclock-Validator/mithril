@@ -4555,9 +4555,8 @@ func parallelTxLoop(
 		}
 
 		if directDispatch {
-			plannerDispatchStart := time.Now()
-			runDependencyPlan(dependencyPlan, txParallelism, scheduleFor(block.Transactions), processTx)
-			metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTimingSince(plannerDispatchStart)
+			metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTiming(
+				runDependencyPlan(dependencyPlan, txParallelism, scheduleFor(block.Transactions), processTx))
 		} else {
 			do := make(chan int, len(block.Transactions))
 			done := make(chan int, len(block.Transactions))

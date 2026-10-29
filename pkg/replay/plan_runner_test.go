@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
@@ -142,4 +143,65 @@ func randomPlannerTransactions(rng *rand.Rand, count, keys int) []plannerTransac
 		})
 	}
 	return transactions
+}
+
+// runOrder runs plan on one worker and returns the order transactions ran in.
+func runOrder(plan *dependencyPlan, priority bool) []int {
+	var order []int
+	runDependencyPlan(plan, 1, planSchedule{priority: priority}, func(_, tx int) { order = append(order, tx) })
+	return order
+}
+
+// The runner's actual policy on one worker: queued work is taken highest first
+// with priority and in arrival order without it, and a committing worker runs
+// its own newly ready dependent before anything queued, even queued work with a
+// greater height.
+func TestRunDependencyPlanOrder(t *testing.T) {
+	a, b, c, d := testPk(1), testPk(2), testPk(3), testPk(4)
+	write := func(keys ...solana.PublicKey) plannerTransactionAccounts {
+		return newPlannerTransactionAccounts(len(keys), func(add func(solana.PublicKey, bool)) {
+			for _, k := range keys {
+				add(k, true)
+			}
+		})
+	}
+	// 0 -> 1 on a (height 2); 2 -> 3 -> 4 on b (height 3).
+	plan := func() *dependencyPlan {
+		return buildDependencyPlan([]plannerTransactionAccounts{write(a), write(a), write(b), write(b), write(b)})
+	}
+	if got, want := runOrder(plan(), true), []int{2, 3, 4, 0, 1}; !slices.Equal(got, want) {
+		t.Fatalf("priority: order %v, want the taller chain first %v", got, want)
+	}
+	if got, want := runOrder(plan(), false), []int{0, 1, 2, 3, 4}; !slices.Equal(got, want) {
+		t.Fatalf("no priority: order %v, want arrival order with continuations %v", got, want)
+	}
+
+	// 0 -> 1 -> 2 on c and 3 -> 4 -> 5 on d: equal heights, so 0 is taken
+	// first. Its continuation 1 (height 2) then runs before the queued 3
+	// (height 3): priority is not a global order.
+	tied := buildDependencyPlan([]plannerTransactionAccounts{write(c), write(c), write(c), write(d), write(d), write(d)})
+	if got, want := runOrder(tied, true), []int{0, 1, 2, 3, 4, 5}; !slices.Equal(got, want) {
+		t.Fatalf("continuation: order %v, want %v", got, want)
+	}
+}
+
+// The returned dispatch time ends when the final transaction becomes ready,
+// before it executes, matching the dispatcher's DependencyPlannerDispatch.
+func TestRunDependencyPlanDispatchTime(t *testing.T) {
+	a := testPk(1)
+	write := newPlannerTransactionAccounts(1, func(add func(solana.PublicKey, bool)) { add(a, true) })
+	plan := buildDependencyPlan([]plannerTransactionAccounts{write, write})
+	const finalRun = 50 * time.Millisecond
+	start := time.Now()
+	dispatched := runDependencyPlan(plan, 1, planSchedule{}, func(_, tx int) {
+		if tx == 1 {
+			time.Sleep(finalRun)
+		}
+	})
+	if total := time.Since(start); dispatched <= 0 || dispatched > total-finalRun {
+		t.Fatalf("dispatch time %v, total %v: must end before the final transaction runs", dispatched, total)
+	}
+	if runDependencyPlan(&dependencyPlan{}, 1, planSchedule{}, func(int, int) {}) != 0 {
+		t.Fatal("an empty plan has no dispatch time")
+	}
 }

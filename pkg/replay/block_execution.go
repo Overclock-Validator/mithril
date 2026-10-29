@@ -539,9 +539,7 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 		feeInfos[idx], computeUnits[idx], txErrors[idx] = ProcessTransaction(slotCtx, &exec.sigverifyWg, txs[idx], nil, dbgOpts, workerArena, shouldVerifySignatures)
 	}
 	if directDispatch {
-		plannerDispatchStart := time.Now()
-		runDependencyPlan(plan, workers, scheduleFor(txs), processTx)
-		metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTimingSince(plannerDispatchStart)
+		metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTiming(runDependencyPlan(plan, workers, scheduleFor(txs), processTx))
 	} else {
 		do := make(chan int, len(txs))
 		done := make(chan int, len(txs))
