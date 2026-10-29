@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"os"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
@@ -131,15 +132,22 @@ func GetAppendVecDataLen(f *os.File, offset uint64) (uint64, error) {
 }
 
 func (acct *AppendVecAccount) Unmarshal(buf io.Reader) error {
+	return acct.unmarshal(buf, math.MaxUint64)
+}
+
+func (acct *AppendVecAccount) unmarshal(buf io.Reader, maxDataBytes uint64) error {
 	var err error
 	var hdrBytes [hdrLen]byte
-	_, err = buf.Read(hdrBytes[:])
+	_, err = io.ReadFull(buf, hdrBytes[:])
 	if err != nil {
 		return err
 	}
 
 	acct.WriteVersion = binary.LittleEndian.Uint64(hdrBytes[:8])
 	acct.DataLen = binary.LittleEndian.Uint64(hdrBytes[8:16])
+	if acct.DataLen > maxDataBytes {
+		return accountDataLimitError(acct.DataLen, maxDataBytes)
+	}
 	copy(acct.Pubkey[:], hdrBytes[16:48])
 	acct.Lamports = binary.LittleEndian.Uint64(hdrBytes[48:56])
 	acct.RentEpoch = binary.LittleEndian.Uint64(hdrBytes[56:64])
@@ -149,7 +157,7 @@ func (acct *AppendVecAccount) Unmarshal(buf io.Reader) error {
 	copy(acct.Hash[:], hdrBytes[104:136])
 
 	acct.Data = make([]byte, acct.DataLen)
-	_, err = buf.Read(acct.Data)
+	_, err = io.ReadFull(buf, acct.Data)
 
 	return err
 }

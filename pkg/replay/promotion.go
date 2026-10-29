@@ -71,6 +71,12 @@ type blockAccountSource interface {
 	GetAccountsBatch(ctx context.Context, slot uint64, pks []solana.PublicKey) ([]*accounts.Account, error)
 }
 
+// boundedAccountReader rejects oversized data before copying or decoding it.
+// Optional metadata must not fall back to an unbounded read when unavailable.
+type boundedAccountReader interface {
+	GetAccountWithDataLimit(slot uint64, pubkey solana.PublicKey, maxDataBytes uint64) (*accounts.Account, error)
+}
+
 // sharedBlockAccountSource is the read-only fast path used solely to build a
 // block's immutable parent snapshot. Public reads retain their owned-copy
 // semantics; implementations may return cache/WorkingSet-backed pointers here.
@@ -212,6 +218,29 @@ func (t *unrootedTail) GetAccount(slot uint64, pubkey solana.PublicKey) (*accoun
 	a, err := t.durable.GetAccount(slot, pubkey)
 	if err != nil || a == nil {
 		return a, err
+	}
+	return a.Clone(), nil
+}
+
+// GetAccountWithDataLimit preserves unrooted precedence and owned-copy results
+// while checking the data size before either layer can copy or decode it.
+func (t *unrootedTail) GetAccountWithDataLimit(slot uint64, pubkey solana.PublicKey, maxDataBytes uint64) (*accounts.Account, error) {
+	if a, ok := t.overlay.Lookup([32]byte(pubkey)); ok {
+		if uint64(len(a.Data)) > maxDataBytes {
+			return nil, fmt.Errorf("%w: %d bytes exceeds %d", accountsdb.ErrAccountDataLimit, len(a.Data), maxDataBytes)
+		}
+		return a.Clone(), nil
+	}
+	reader, ok := t.durable.(boundedAccountReader)
+	if !ok {
+		return nil, errors.New("durable account reader does not support bounded reads")
+	}
+	a, err := reader.GetAccountWithDataLimit(slot, pubkey, maxDataBytes)
+	if err != nil || a == nil {
+		return a, err
+	}
+	if uint64(len(a.Data)) > maxDataBytes {
+		return nil, fmt.Errorf("%w: %d bytes exceeds %d", accountsdb.ErrAccountDataLimit, len(a.Data), maxDataBytes)
 	}
 	return a.Clone(), nil
 }
