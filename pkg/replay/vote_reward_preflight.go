@@ -41,6 +41,10 @@ func validatePreConsensusRewardCertificates(
 	if block == nil {
 		return fmt.Errorf("reward certificate preflight: missing block")
 	}
+	if !block.IsSkipped {
+		// Overlap the final-certificate check with this one and with execution.
+		startFinalCertPrefetch(block, epochSchedule, shredVersion)
+	}
 	if block.IsSkipped || (len(block.SkipRewardCert) == 0 && len(block.NotarRewardCert) == 0) {
 		return nil
 	}

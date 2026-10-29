@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 )
 
 // Rewind support (types + discovery). RewindToBatchBoundary — applying undo
@@ -27,7 +27,7 @@ type RewindPoint struct {
 // ListRewindPoints returns the available batch boundaries, ascending. Only
 // committed batches qualify (BatchSeq <= the fold meta watermark).
 func (db *AccountsDb) ListRewindPoints() ([]RewindPoint, error) {
-	db.foldMu.Lock()
+	db.foldMu.LockAs("list_rewind_points")
 	defer db.foldMu.Unlock()
 
 	meta, haveMeta, err := db.readFoldMeta()
@@ -37,13 +37,20 @@ func (db *AccountsDb) ListRewindPoints() ([]RewindPoint, error) {
 	if !haveMeta {
 		return nil, nil
 	}
+	floor, err := db.readCompactionHistoryFloor()
+	if err != nil {
+		return nil, err
+	}
+	if floor.BatchSeq > meta.BatchSeq {
+		return nil, fmt.Errorf("compaction history boundary exceeds committed head")
+	}
 	headers, err := ListFoldManifests(db.AcctsDir)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]RewindPoint, 0, len(headers))
 	for _, h := range headers {
-		if h.BatchSeq == 0 || h.BatchSeq > meta.BatchSeq {
+		if h.BatchSeq == 0 || h.BatchSeq > meta.BatchSeq || h.BatchSeq < floor.BatchSeq {
 			continue
 		}
 		pt := RewindPoint{BatchSeq: h.BatchSeq, ThroughSlot: h.ThroughSlot}
@@ -137,13 +144,30 @@ func (db *AccountsDb) finalizeParkedRewindLeftoversLocked(throughSlot uint64) {
 // Crash-safe and idempotent: suffix manifests are parked as ".rewound" first
 // (recovery ignores them; a re-run picks them back up), then ONE index batch
 // applies all undo pointers + the meta rollback atomically, then the undone
-// segment files move to rewound/ for forensics.
+// segment files move to rewound/ for forensics. This low-level method does
+// not reconcile an external state file; node callers must use
+// RewindToBatchBoundaryAndPersist.
 func (db *AccountsDb) RewindToBatchBoundary(throughSlot uint64) (RewindResult, error) {
-	db.foldMu.Lock()
+	db.foldMu.LockAs("rewind")
 	defer db.foldMu.Unlock()
-	db.appendVecReadMu.Lock()
+	// Recovery, rewind and their forensic moves change the directory outside
+	// compaction's tracking; the next compaction cycle rescans it.
+	defer db.invalidateCompactionInventoryLocked()
+	db.appendVecReadMu.LockAs("rewind")
 	defer db.appendVecReadMu.Unlock()
 
+	intent, err := db.readRewindIntentLocked()
+	if err != nil {
+		return RewindResult{}, err
+	}
+	if intent != nil || db.rewindPending {
+		return RewindResult{}, fmt.Errorf("accountsdb: pending rewind requires durable state persistence")
+	}
+
+	return db.rewindToBatchBoundaryLocked(throughSlot)
+}
+
+func (db *AccountsDb) rewindToBatchBoundaryLocked(throughSlot uint64) (RewindResult, error) {
 	res := RewindResult{}
 	meta, haveMeta, err := db.readFoldMeta()
 	if err != nil {
@@ -152,10 +176,17 @@ func (db *AccountsDb) RewindToBatchBoundary(throughSlot uint64) (RewindResult, e
 	if !haveMeta {
 		return res, fmt.Errorf("accountsdb: rewind: store has no fold meta (nothing folded)")
 	}
+	floor, err := db.readCompactionHistoryFloor()
+	if err != nil {
+		return res, err
+	}
+	if floor.BatchSeq > meta.BatchSeq {
+		return res, fmt.Errorf("compaction history boundary exceeds committed head")
+	}
 	if meta.ThroughSlot == throughSlot {
 		// This also repairs the in-memory publication state after a prior
 		// WAL-less commit succeeded but its explicit Flush reported an error.
-		db.readCacheEpochMu.Lock()
+		db.readCacheEpochMu.LockAs("rewind")
 		db.readCacheEpoch++
 		db.resetReadCachesLocked()
 		db.readCacheEpochMu.Unlock()
@@ -219,6 +250,9 @@ func (db *AccountsDb) RewindToBatchBoundary(throughSlot uint64) (RewindResult, e
 		return res, fmt.Errorf("accountsdb: rewind: no fold boundary at slot %d within the retained horizon (see ListRewindPoints)", throughSlot)
 	}
 	seqT := target.manifest.BatchSeq
+	if seqT < floor.BatchSeq {
+		return res, fmt.Errorf("rewind target %d is below expired-history boundary %d", seqT, floor.BatchSeq)
+	}
 	if seqT >= meta.BatchSeq {
 		return res, fmt.Errorf("accountsdb: rewind: boundary seq %d is not below the committed head seq %d", seqT, meta.BatchSeq)
 	}
@@ -241,6 +275,7 @@ func (db *AccountsDb) RewindToBatchBoundary(throughSlot uint64) (RewindResult, e
 			return res, fmt.Errorf("accountsdb: rewind: park manifest seq %d: %w", seq, err)
 		}
 		sm.path = parked
+		fire(db.rewindHooks.afterPark)
 	}
 	if err := fsyncDir(db.AcctsDir); err != nil {
 		return res, err
@@ -277,7 +312,7 @@ func (db *AccountsDb) RewindToBatchBoundary(throughSlot uint64) (RewindResult, e
 	}), nil); err != nil {
 		return res, err
 	}
-	db.readCacheEpochMu.Lock()
+	db.readCacheEpochMu.LockAs("rewind")
 	writeOpts := pebble.Sync
 	if db.IndexWALDisabled {
 		writeOpts = pebble.NoSync // the explicit Flush below provides durability
@@ -291,11 +326,14 @@ func (db *AccountsDb) RewindToBatchBoundary(throughSlot uint64) (RewindResult, e
 	if commitErr != nil {
 		return res, commitErr
 	}
+	fire(db.rewindHooks.beforeIndexFlush)
 	if db.IndexWALDisabled {
 		if err := db.Index.Flush(); err != nil {
 			return res, err
 		}
 	}
+
+	fire(db.rewindHooks.afterIndex)
 
 	// Step 3: move the undone segments + parked manifests aside (forensics).
 	rewoundDir := filepath.Join(db.AcctsDir, "rewound")
