@@ -96,13 +96,13 @@ Mithril requires a C compiler for the zstd compression library:
 sudo apt-get update && sudo apt-get install -y build-essential
 ```
 
-**Step 4: Install Go 1.26.4**
+**Step 4: Install Go 1.27.2**
 
-Mithril pins Go 1.26.4 (see `go.mod`); this is the version CI builds with. Go's "green tea" garbage collector (since 1.25) gives better performance for memory-intensive applications like Mithril.
+Mithril pins Go 1.27.2 (see `go.mod`); this is the version CI builds with. Go's "green tea" garbage collector (since 1.25) gives better performance for memory-intensive applications like Mithril.
 
 ```bash
 # Set Go version and detect architecture
-GO_VERSION="1.26.4"
+GO_VERSION="1.27.2"
 case $(uname -m) in
     x86_64)  GOARCH="amd64" ;;
     aarch64) GOARCH="arm64" ;;
@@ -222,7 +222,19 @@ curl http://YOUR_MITHRIL_IP:8899 -X POST -H "Content-Type: application/json" -d 
 - `getBankHash` - Get bankhash for a slot (Mithril extension, not standard Solana RPC)
 - `getBlockHeight` - Get current block height
 - `getEpochInfo` - Get current epoch info
+- `getInflationReward` - Get retained inflation rewards for an epoch
 - `getLatestBlockhash` - Get recent blockhash
+
+On Alpenglow, `getInflationReward` can publish verified canonical rewards before
+the account checkpoint reaches disk. `confirmed` and `finalized` share that view;
+`processed` is not supported. The default epoch and `minContextSlot` check use the
+same reward-read slot. Other RPC methods may still use an older durable view.
+Recovery withdraws the in-memory view, and a restart restores only
+durable history. Retention follows durable checkpoints. Advisory or disabled
+execution verification keeps reward reads on the durable view.
+Credited rewards are readable while other staking partitions are still pending.
+Requests for pending partitions return `-32017` with verified distribution
+progress; pruned history returns `-32001`, and unknown history returns `-32004`.
 
 We're actively expanding RPC method coverage. Upcoming methods include transaction simulation, send transaction, and get leader schedule.
 

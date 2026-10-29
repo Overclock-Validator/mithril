@@ -2,6 +2,7 @@ package replay
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
@@ -28,6 +29,33 @@ type CommitLeaderInput struct {
 	AlpenglowShredVersion   uint16
 	FooterTimestamp         int64
 	FooterProducerTimeNanos uint64
+	// Timings optionally receives diagnostic durations. These never affect
+	// the bank state, footer timestamp, or finalization decisions.
+	Timings *LeaderFinalizationTimings
+}
+
+// LeaderFinalizationTimings breaks down bank freezing for the leader's
+// broadcast log. Durations use the monotonic clock and are local to one slot.
+type LeaderFinalizationTimings struct {
+	PrepareSysvars     time.Duration
+	FooterClock        time.Duration
+	VoteRewards        time.Duration
+	DistributeFees     time.Duration
+	CollectRent        time.Duration
+	Incinerator        time.Duration
+	FinalizeSysvars    time.Duration
+	CompileAccounts    time.Duration
+	LoadParentAccounts time.Duration
+	BankHash           time.Duration
+}
+
+func (t LeaderFinalizationTimings) String() string {
+	ms := func(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
+	return fmt.Sprintf(" commit_prepare_sysvars_ms=%.3f commit_footer_clock_ms=%.3f commit_vote_rewards_ms=%.3f"+
+		" commit_fees_ms=%.3f commit_rent_ms=%.3f commit_incinerator_ms=%.3f commit_finalize_sysvars_ms=%.3f"+
+		" commit_compile_accounts_ms=%.3f commit_parent_accounts_ms=%.3f commit_bankhash_ms=%.3f",
+		ms(t.PrepareSysvars), ms(t.FooterClock), ms(t.VoteRewards), ms(t.DistributeFees), ms(t.CollectRent),
+		ms(t.Incinerator), ms(t.FinalizeSysvars), ms(t.CompileAccounts), ms(t.LoadParentAccounts), ms(t.BankHash))
 }
 
 // PrepareLeaderSlotSysvars derives the child bank's dynamic sysvars from the
@@ -97,6 +125,11 @@ func CommitLeaderSlot(in CommitLeaderInput) (*sealevel.SlotCtx, error) {
 	if in.AcctsDb == nil || in.SlotCtx == nil || in.Block == nil {
 		return nil, fmt.Errorf("missing leader finalization input")
 	}
+	var timings LeaderFinalizationTimings
+	if in.Timings != nil {
+		defer func() { *in.Timings = timings }()
+	}
+	phaseStartedAt := time.Now()
 	slotCtx, block := in.SlotCtx, in.Block
 	bankSysvars := slotCtx.BankSysvars()
 	if bankSysvars == nil {
@@ -120,7 +153,9 @@ func CommitLeaderSlot(in CommitLeaderInput) (*sealevel.SlotCtx, error) {
 			return nil, err
 		}
 	}
+	timings.PrepareSysvars = time.Since(phaseStartedAt)
 	if in.AlpenglowClock {
+		phaseStartedAt = time.Now()
 		if err := validateAlpenglowFooterNanosecondClock(slotCtx, block); err != nil {
 			return nil, err
 		}
@@ -134,15 +169,20 @@ func CommitLeaderSlot(in CommitLeaderInput) (*sealevel.SlotCtx, error) {
 		if err := updateAlpenglowNanosecondClockAccount(slotCtx, block); err != nil {
 			return nil, err
 		}
+		timings.FooterClock = time.Since(phaseStartedAt)
+		phaseStartedAt = time.Now()
 		if err := ApplyAlpenglowVoteRewards(slotCtx, block, epochSchedule, block.SkipRewardCert, block.NotarRewardCert, block.BlockFinalCert, in.AlpenglowShredVersion); err != nil {
 			return nil, err
 		}
+		timings.VoteRewards = time.Since(phaseStartedAt)
 	}
 
-	if len(block.Transactions) > 0 {
-		slotCtx.LamportsBurnt = fees.DistributeTxFeesToSlotLeader(in.AcctsDb, slotCtx, block.Leader, &in.TxFeeAccumulator)
-		slotCtx.RecordModifiedAcct(block.Leader)
+	phaseStartedAt = time.Now()
+	if err := distributeBlockTxFees(slotCtx, block, &in.TxFeeAccumulator); err != nil {
+		return nil, err
 	}
+	timings.DistributeFees = time.Since(phaseStartedAt)
+	phaseStartedAt = time.Now()
 	var rentSysvar *sealevel.SysvarRent
 	if bankSysvars := slotCtx.BankSysvars(); bankSysvars != nil {
 		if bankRent, ok := bankSysvars.Rent(); ok {
@@ -153,17 +193,28 @@ func CommitLeaderSlot(in CommitLeaderInput) (*sealevel.SlotCtx, error) {
 		return nil, fmt.Errorf("leader slot %d has no bank-local Rent sysvar", slotCtx.Slot)
 	}
 	rentAccts := rent.CollectRentEagerly(slotCtx, rentSysvar, epochSchedule)
+	timings.CollectRent = time.Since(phaseStartedAt)
+	phaseStartedAt = time.Now()
 	runIncinerator(slotCtx)
+	timings.Incinerator = time.Since(phaseStartedAt)
+	phaseStartedAt = time.Now()
 	if err := finishLeaderSysvars(slotCtx, block); err != nil {
 		return nil, err
 	}
+	timings.FinalizeSysvars = time.Since(phaseStartedAt)
+	phaseStartedAt = time.Now()
 	writable, modified := compileLeaderAccounts(slotCtx, block, rentAccts)
+	timings.CompileAccounts = time.Since(phaseStartedAt)
+	phaseStartedAt = time.Now()
 	if err := ensureParentAccountsForModified(slotCtx, modified); err != nil {
 		return nil, err
 	}
+	timings.LoadParentAccounts = time.Since(phaseStartedAt)
+	phaseStartedAt = time.Now()
 	slotCtx.FinalBankhash = bankhash.CalculateBankHash(slotCtx, writable, modified, block.ParentBankhash, block.NumSignatures, block.Blockhash)
 	copy(block.ExpectedBankhash[:], slotCtx.FinalBankhash)
 	block.HasExpectedBankhash = true
+	timings.BankHash = time.Since(phaseStartedAt)
 	return slotCtx, nil
 }
 

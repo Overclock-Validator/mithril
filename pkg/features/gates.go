@@ -94,7 +94,7 @@ var VoteStateV4 = FeatureGate{Name: "VoteStateV4", Address: base58.MustDecodeFro
 var BlsPubkeyManagementInVoteAccount = FeatureGate{Name: "BlsPubkeyManagementInVoteAccount", Address: base58.MustDecodeFromString("AnAP9zPV4KL7czAPQbFhpDKV2tx7g4UGNbK9wvXwjaRo")}
 var CommissionRateInBasisPoints = FeatureGate{Name: "CommissionRateInBasisPoints", Address: base58.MustDecodeFromString("Eg7tXEwMZzS98xaZ1YHUbdRHsaYZiCsSaR6sKgxreoaj")}
 var CustomCommissionCollector = FeatureGate{Name: "CustomCommissionCollector", Address: base58.MustDecodeFromString("3HcSrCTGXTUnrTueHi4DAwNuMxZSsm5xui2Ax3mgxHqf")}
-var BlockRevenueSharing = FeatureGate{Name: "BlockRevenueSharing", Address: base58.MustDecodeFromString("B1ockRevenueSharing111111111111111111111111")}
+var BlockRevenueSharing = FeatureGate{Name: "BlockRevenueSharing", Address: base58.MustDecodeFromString("7MYx95UBiJufqnumyN7HfskJ9vKdcGMmhreVguqrE97K")}
 var VoteAccountInitializeV2 = FeatureGate{Name: "VoteAccountInitializeV2", Address: base58.MustDecodeFromString("VoteAccount1nitia1izeV211111111111111111111")}
 var RelaxProgramdataAccountCheckMigration = FeatureGate{Name: "RelaxProgramdataAccountCheckMigration", Address: base58.MustDecodeFromString("rexav5eNTUSNT1K2N7cfRjnthwhcP5BC25v2tA4rW4h")}
 var ReplaceSplTokenWithPToken = FeatureGate{Name: "ReplaceSplTokenWithPToken", Address: base58.MustDecodeFromString("ptokFjwyJtrwCa9Kgo9xoDS59V4QccBGEaRFnRPnSdP")}
@@ -109,6 +109,7 @@ var UpgradeBpfStakeProgramToV5 = FeatureGate{Name: "UpgradeBpfStakeProgramToV5",
 var DelayCommissionUpdates = FeatureGate{Name: "DelayCommissionUpdates", Address: base58.MustDecodeFromString("76dHtohc2s5dR3ahJyBxs7eJJVipFkaPdih9CLgTTb4B")}
 var ValidateChainedBlockId = FeatureGate{Name: "ValidateChainedBlockId", Address: base58.MustDecodeFromString("vcmrbYbiMVKaq1snKP6eCacNDcr6qZvpCNUjmk6gxvZ")}
 var DiscardUnexpectedDataCompleteShreds = FeatureGate{Name: "DiscardUnexpectedDataCompleteShreds", Address: base58.MustDecodeFromString("dcomRRWHXP1FVWPqi9Mm4oxJhF4ehC795SvAtUdA9os")}
+var LoaderV3MinimumExtendProgramSize = FeatureGate{Name: "LoaderV3MinimumExtendProgramSize", Address: base58.MustDecodeFromString("YbbRLkvenrocjGPGyoQE4wjnvYzTgfsk38NFmcYK7a5")}
 
 var AllFeatureGates = []FeatureGate{StopTruncatingStringsInSyscalls, EnablePartitionedEpochReward, EnablePartitionedEpochRewardsSuperfeature,
 	LastRestartSlotSysvar, Libsecp256k1FailOnBadCount, Libsecp256k1FailOnBadCount2, EnableBpfLoaderSetAuthorityCheckedIx,
@@ -131,4 +132,4 @@ var AllFeatureGates = []FeatureGate{StopTruncatingStringsInSyscalls, EnableParti
 	VoteStateV4, BlsPubkeyManagementInVoteAccount, CommissionRateInBasisPoints, CustomCommissionCollector, BlockRevenueSharing, VoteAccountInitializeV2,
 	RelaxProgramdataAccountCheckMigration, ReplaceSplTokenWithPToken, CreateAccountAllowPrefund,
 	RemoveSimpleVoteFromCostModel, DisableZkElgamalProofProgram, ReenableZkElgamalProofProgram, AltBn128LittleEndian, EnableAltBn128G2Syscalls,
-	EnableBls12_381Syscall, UpgradeBpfStakeProgramToV5, DelayCommissionUpdates, ValidateChainedBlockId, DiscardUnexpectedDataCompleteShreds}
+	EnableBls12_381Syscall, UpgradeBpfStakeProgramToV5, DelayCommissionUpdates, ValidateChainedBlockId, DiscardUnexpectedDataCompleteShreds, LoaderV3MinimumExtendProgramSize}

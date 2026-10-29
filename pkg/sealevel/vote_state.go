@@ -1836,37 +1836,30 @@ func newVoteState4FromCurrent(vs *VoteState, votePubkey solana.PublicKey) *VoteS
 	return vs4
 }
 
+func setVoteAccountStateV4(execCtx *ExecutionCtx, acct *BorrowedAccount, voteState *VoteState4, f features.Features) error {
+	if len(acct.Data()) < VoteStateV4Size {
+		// SIMD-0185 requires a rent-exempt resize, with no legacy fallback.
+		if !acct.IsRentExemptAtDataLength(VoteStateV4Size) {
+			return InstrErrAccountNotRentExempt
+		}
+		if err := acct.SetDataLength(VoteStateV4Size, f); err != nil {
+			return InstrErrAccountNotRentExempt
+		}
+	}
+	versioned := &VoteStateVersions{Type: VoteStateVersionV4, V4: *voteState}
+	execCtx.AddModifiedVoteState(acct.Key(), versioned)
+	voteStateBytes, err := marshalVersionedVoteState(versioned)
+	defer voteStateBufPool.Put(voteStateBytes)
+	if err != nil {
+		return err
+	}
+	return acct.SetState(f, voteStateBytes)
+}
+
 func setVoteAccountState(execCtx *ExecutionCtx, acct *BorrowedAccount, voteState *VoteState, f features.Features) error {
 	var err error
 	if f.IsActive(features.VoteStateV4) {
-		vsz := VoteStateV3Size
-		resizeNeeded := len(acct.Data()) < vsz
-
-		resizeRentExempt := acct.IsRentExemptAtDataLength(uint64(vsz))
-		resizeFailed := false
-
-		if resizeNeeded && resizeRentExempt {
-			err = acct.SetDataLength(VoteStateV3Size, f)
-			if err != nil {
-				resizeFailed = true
-			}
-		}
-
-		// V4: NO V1_14_11 fallback — error on resize failure (per SIMD-0185)
-		if resizeNeeded && (!resizeRentExempt || resizeFailed) {
-			return InstrErrAccountNotRentExempt
-		}
-
-		vs4 := newVoteState4FromCurrent(voteState, acct.Key())
-		newVersioned := &VoteStateVersions{Type: VoteStateVersionV4}
-		newVersioned.V4 = *vs4
-		execCtx.AddModifiedVoteState(acct.Key(), newVersioned)
-		voteStateBytes, err := marshalVersionedVoteState(newVersioned)
-		defer voteStateBufPool.Put(voteStateBytes)
-		if err != nil {
-			return err
-		}
-		return acct.SetState(f, voteStateBytes)
+		return setVoteAccountStateV4(execCtx, acct, newVoteState4FromCurrent(voteState, acct.Key()), f)
 	} else if f.IsActive(features.VoteStateAddVoteLatency) {
 		vsz := VoteStateV3Size
 		resizeNeeded := len(acct.Data()) < vsz
@@ -1920,5 +1913,31 @@ func setVoteAccountState(execCtx *ExecutionCtx, acct *BorrowedAccount, voteState
 		}
 		err = acct.SetState(f, voteStateBytes)
 		return err
+	}
+}
+
+// BlockRevenueCollector returns the SIMD-0232 destination to capture alongside
+// epoch stakes. Pre-V4 vote states pay the scheduled node identity.
+func (vs *VoteStateVersions) BlockRevenueCollector() solana.PublicKey {
+	if vs.Type == VoteStateVersionV4 {
+		return vs.V4.BlockRevenueCollector
+	}
+	return vs.NodePubkey()
+}
+
+// InflationRewardsCommissionBps preserves the full commission value when
+// capturing historical epoch stakes. Reward calculation applies the cap.
+func (vs *VoteStateVersions) InflationRewardsCommissionBps() uint16 {
+	switch vs.Type {
+	case VoteStateVersionV4:
+		return vs.V4.InflationRewardsCommissionBps
+	case VoteStateVersionCurrent:
+		return uint16(vs.Current.Commission) * 100
+	case VoteStateVersionV1_14_11:
+		return uint16(vs.V1_14_11.Commission) * 100
+	case VoteStateVersionV0_23_5:
+		return uint16(vs.V0_23_5.Commission) * 100
+	default:
+		panic("invalid vote state version")
 	}
 }

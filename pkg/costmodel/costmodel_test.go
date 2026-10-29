@@ -1,6 +1,7 @@
 package costmodel
 
 import (
+	"math/rand/v2"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
@@ -92,6 +93,49 @@ func TestWritableAccountsUsesUnsignedWritableRange(t *testing.T) {
 	}}
 
 	assert.Equal(t, []solana.PublicKey{{1}, {3}, {4}}, writableAccounts(tx))
+}
+
+// v0LookupTx has static keys {1} (writable signer), {2} (writable), {3}
+// (readonly), and loads two writable and one readonly address from a table.
+func v0LookupTx(t *testing.T) *solana.Transaction {
+	t.Helper()
+	msg := solana.Message{
+		Header: solana.MessageHeader{
+			NumRequiredSignatures:       1,
+			NumReadonlyUnsignedAccounts: 1,
+		},
+		AccountKeys:  solana.PublicKeySlice{{1}, {2}, {3}},
+		Instructions: []solana.CompiledInstruction{{ProgramIDIndex: 2, Accounts: []uint16{0, 1, 3, 4, 5}}},
+		AddressTableLookups: solana.MessageAddressTableLookupSlice{{
+			AccountKey:      solana.PublicKey{9},
+			WritableIndexes: []uint8{0, 1},
+			ReadonlyIndexes: []uint8{2},
+		}},
+	}
+	_, err := msg.SetVersion(solana.MessageVersionV0)
+	require.NoError(t, err)
+	return &solana.Transaction{Signatures: []solana.Signature{{}}, Message: msg}
+}
+
+func TestWritableAccountsIncludesWritableLookups(t *testing.T) {
+	tx := v0LookupTx(t)
+	// Before resolution only the static keys are known.
+	assert.Equal(t, []solana.PublicKey{{1}, {2}}, writableAccounts(tx))
+
+	require.NoError(t, tx.Message.SetAddressTables(map[solana.PublicKey]solana.PublicKeySlice{
+		{9}: {{0xA}, {0xB}, {0xC}},
+	}))
+	require.NoError(t, tx.Message.ResolveLookups())
+	require.Equal(t, solana.PublicKeySlice{{1}, {2}, {3}, {0xA}, {0xB}, {0xC}}, tx.Message.AccountKeys)
+
+	// The header still describes the static keys only: {3} stays readonly,
+	// the two writable lookups are added and the readonly one is not.
+	assert.Equal(t, []solana.PublicKey{{1}, {2}, {0xA}, {0xB}}, writableAccounts(tx))
+
+	cost, err := EstimateTransactionCost(tx, features.NewFeaturesDefault())
+	require.NoError(t, err)
+	assert.Equal(t, uint64(4*WriteLockUnits), cost.WriteLockCost)
+	assert.Equal(t, []solana.PublicKey{{1}, {2}, {0xA}, {0xB}}, cost.WritableAccounts)
 }
 
 func TestEstimateTransactionCostV1UsesInlineLimits(t *testing.T) {
@@ -283,4 +327,138 @@ func TestPackEntryBytesMaxChargesEveryFECSetInBatch(t *testing.T) {
 	assert.Equal(t, want, PackEntryBytesMax(shreds, MaxMicroblockBytes))
 	assert.Equal(t, want, PackEntryBytesMax(shreds+DataShredsPerFECSet-1, MaxMicroblockBytes))
 	assert.Zero(t, PackEntryBytesMax(shreds-DataShredsPerFECSet, MaxMicroblockBytes))
+}
+
+func execCost(units, alloc uint64, writable ...solana.PublicKey) TransactionCost {
+	return TransactionCost{ProgramsExecutionCost: units, AllocatedAccountsDataSize: alloc, WritableAccounts: writable}
+}
+
+func TestCostTrackerWouldExceedAllChecksCombinedTotals(t *testing.T) {
+	a, b := solana.PublicKey{1}, solana.PublicKey{2}
+	limits := Limits{BlockCost: 1000, WritableAccountCost: 600, AllocatedDataSizeDelta: 100}
+
+	tracker := NewCostTracker(limits)
+	tracker.Record(execCost(300, 0, a))
+	assert.Equal(t, ExceedNone, tracker.WouldExceedAll(nil))
+	assert.Equal(t, ExceedNone, tracker.WouldExceedAll([]TransactionCost{execCost(300, 0, a), execCost(400, 0, b)}),
+		"exactly at the block limit is allowed")
+
+	// Each cost fits alone; together they pass a limit, counting recorded usage.
+	bundle := []TransactionCost{execCost(400, 0, b), execCost(400, 0, b)}
+	for _, cost := range bundle {
+		require.Equal(t, ExceedNone, tracker.WouldExceed(cost))
+	}
+	assert.Equal(t, ExceedBlockCost, tracker.WouldExceedAll(bundle))
+
+	shared := []TransactionCost{execCost(200, 0, a), execCost(200, 0, a)}
+	disjoint := []TransactionCost{execCost(200, 0, a), execCost(200, 0, b)}
+	assert.Equal(t, ExceedWritableAccountCost, tracker.WouldExceedAll(shared))
+	assert.Equal(t, ExceedNone, tracker.WouldExceedAll(disjoint))
+
+	allocated := []TransactionCost{execCost(10, 60), execCost(10, 60)}
+	assert.Equal(t, ExceedAllocatedDataSize, tracker.WouldExceedAll(allocated))
+	assert.Equal(t, ExceedNone, tracker.WouldExceedAll(allocated[:1]))
+
+	// Checking never records.
+	assert.Equal(t, uint64(300), tracker.BlockCost())
+	assert.Equal(t, uint64(300), tracker.WritableAccountCost(a))
+	assert.Zero(t, tracker.WritableAccountCost(b))
+	assert.Zero(t, tracker.AllocatedDataSizeDelta())
+}
+
+func TestCostTrackerWouldExceedAllMatchesSequentialRecording(t *testing.T) {
+	rng := rand.New(rand.NewPCG(1, 2))
+	keys := []solana.PublicKey{{1}, {2}, {3}}
+	randomCost := func() TransactionCost {
+		var writable []solana.PublicKey
+		for _, key := range keys {
+			if rng.IntN(2) == 0 {
+				writable = append(writable, key)
+			}
+		}
+		return execCost(50+rng.Uint64N(550), rng.Uint64N(80), writable...)
+	}
+	var fitting, breaching int
+	for trial := range 2000 {
+		limits := Limits{
+			BlockCost:              500 + rng.Uint64N(2500),
+			WritableAccountCost:    300 + rng.Uint64N(1200),
+			AllocatedDataSizeDelta: rng.Uint64N(200),
+		}
+		aggregate, sequential := NewCostTracker(limits), NewCostTracker(limits)
+		for range rng.IntN(3) {
+			cost := randomCost()
+			if aggregate.WouldExceed(cost) == ExceedNone {
+				aggregate.Record(cost)
+				sequential.Record(cost)
+			}
+		}
+		bundle := make([]TransactionCost, 1+rng.IntN(5))
+		for i := range bundle {
+			bundle[i] = randomCost()
+		}
+
+		fits := true
+		for _, cost := range bundle {
+			if sequential.WouldExceed(cost) != ExceedNone {
+				fits = false
+				break
+			}
+			sequential.Record(cost)
+		}
+		require.Equalf(t, fits, aggregate.WouldExceedAll(bundle) == ExceedNone, "trial %d", trial)
+		if fits {
+			fitting++
+		} else {
+			breaching++
+		}
+	}
+	require.Greater(t, fitting, 200)
+	require.Greater(t, breaching, 200)
+}
+
+func TestWithActualUsageRecordsLikeRecordAndRebate(t *testing.T) {
+	a, b := solana.PublicKey{1}, solana.PublicKey{2}
+	requested := TransactionCost{
+		SignatureCost:              720,
+		WriteLockCost:              600,
+		DataBytesCost:              3,
+		ProgramsExecutionCost:      200_000,
+		LoadedAccountsDataSizeCost: 16_000,
+		AllocatedAccountsDataSize:  10,
+		WritableAccounts:           []solana.PublicKey{a, b},
+	}
+	for _, usage := range [][2]uint64{{1_000, 8}, {200_000, 16_000}, {250_000, 20_000}} {
+		rebated, direct := NewCostTracker(DefaultLimits()), NewCostTracker(DefaultLimits())
+		rebated.Record(requested)
+		rebated.Rebate(requested, usage[0], usage[1])
+		actual := requested.WithActualUsage(usage[0], usage[1])
+		direct.Record(actual)
+
+		assert.Equal(t, rebated.BlockCost(), direct.BlockCost())
+		assert.Equal(t, rebated.WritableAccountCost(a), direct.WritableAccountCost(a))
+		assert.Equal(t, rebated.WritableAccountCost(b), direct.WritableAccountCost(b))
+		assert.Equal(t, rebated.AllocatedDataSizeDelta(), direct.AllocatedDataSizeDelta())
+		assert.Equal(t, uint64(720+600+3)+usage[0]+usage[1], actual.Sum())
+	}
+	assert.Equal(t, uint64(200_000), requested.ProgramsExecutionCost, "the requested cost is not modified")
+}
+
+func TestWouldExceedAllAdmitsOnActualUsage(t *testing.T) {
+	a := solana.PublicKey{1}
+	tracker := NewCostTracker(Limits{BlockCost: 1_000_000, WritableAccountCost: 600_000, AllocatedDataSizeDelta: 100})
+	requested := TransactionCost{SignatureCost: 720, ProgramsExecutionCost: 400_000, WritableAccounts: []solana.PublicKey{a}}
+	bundle := []TransactionCost{requested, requested, requested}
+
+	// Requested units exceed both the account and block limits...
+	require.Equal(t, ExceedBlockCost, tracker.WouldExceedAll(bundle))
+	// ...but what execution consumed fits.
+	actual := make([]TransactionCost, len(bundle))
+	for i, cost := range bundle {
+		actual[i] = cost.WithActualUsage(50_000, 0)
+	}
+	require.Equal(t, ExceedNone, tracker.WouldExceedAll(actual))
+	// Actual usage still has to fit.
+	actual[1] = bundle[1].WithActualUsage(560_000, 0)
+	require.Equal(t, ExceedWritableAccountCost, tracker.WouldExceedAll(actual))
 }

@@ -35,7 +35,6 @@ type GlobalCtx struct {
 	cachedStakeEntries         []accountsdb.StakeIndexEntry            // Parsed+sorted index, populated on first load
 	entriesFlushedSinceCompact int                                     // Appended entries since last compaction
 	voteCache                  map[solana.PublicKey]*sealevel.VoteStateVersions
-	epochVoteStateSnapshots    map[uint64]map[solana.PublicKey]*sealevel.VoteStateVersions
 	epochStakes                *epochstakes.EpochStakesCache
 	slotsConfirmed             map[uint64]struct{}
 	leaderSchedule             *leaderschedule.LeaderSchedule // compatibility schedule installed by SetLeaderSchedule
@@ -100,6 +99,19 @@ func PendingStakeEntriesSnapshot() []accountsdb.StakeIndexEntry {
 	var out []accountsdb.StakeIndexEntry
 	for _, entries := range instance.pendingStakeBySlot {
 		out = append(out, entries...)
+	}
+	return out
+}
+
+// PendingStakePubkeysForSlot returns the stake pubkeys enqueued while
+// executing slot (copies; duplicates possible).
+func PendingStakePubkeysForSlot(slot uint64) []solana.PublicKey {
+	instance.pendingStakeMutex.Lock()
+	defer instance.pendingStakeMutex.Unlock()
+	entries := instance.pendingStakeBySlot[slot]
+	out := make([]solana.PublicKey, len(entries))
+	for i, entry := range entries {
+		out[i] = entry.Pubkey
 	}
 	return out
 }
@@ -184,50 +196,6 @@ func VoteCacheSnapshot() map[solana.PublicKey]*sealevel.VoteStateVersions {
 		snapshot[pk] = voteState
 	}
 	return snapshot
-}
-
-func PutEpochVoteStateSnapshot(epoch uint64, snapshot map[solana.PublicKey]*sealevel.VoteStateVersions) {
-	instance.voteCacheMutex.Lock()
-	defer instance.voteCacheMutex.Unlock()
-
-	if instance.epochVoteStateSnapshots == nil {
-		instance.epochVoteStateSnapshots = make(map[uint64]map[solana.PublicKey]*sealevel.VoteStateVersions)
-	}
-
-	snapshotCopy := make(map[solana.PublicKey]*sealevel.VoteStateVersions, len(snapshot))
-	for pk, voteState := range snapshot {
-		snapshotCopy[pk] = voteState
-	}
-	instance.epochVoteStateSnapshots[epoch] = snapshotCopy
-
-	for cachedEpoch := range instance.epochVoteStateSnapshots {
-		if cachedEpoch+2 < epoch {
-			delete(instance.epochVoteStateSnapshots, cachedEpoch)
-		}
-	}
-}
-
-func EpochVoteStateSnapshot(epoch uint64) map[solana.PublicKey]*sealevel.VoteStateVersions {
-	instance.voteCacheMutex.RLock()
-	defer instance.voteCacheMutex.RUnlock()
-
-	snapshot := instance.epochVoteStateSnapshots[epoch]
-	if snapshot == nil {
-		return nil
-	}
-
-	snapshotCopy := make(map[solana.PublicKey]*sealevel.VoteStateVersions, len(snapshot))
-	for pk, voteState := range snapshot {
-		snapshotCopy[pk] = voteState
-	}
-	return snapshotCopy
-}
-
-func ClearEpochVoteStateSnapshots() {
-	instance.voteCacheMutex.Lock()
-	defer instance.voteCacheMutex.Unlock()
-
-	instance.epochVoteStateSnapshots = nil
 }
 
 func PutEpochStakesEntry(epoch uint64, pubkey solana.PublicKey, stake uint64, voteAcct *epochstakes.VoteAccount) {
@@ -578,6 +546,15 @@ func FlushPendingStakePubkeysThrough(accountsDbDir string, through uint64) (int,
 	instance.pendingStakeMutex.Unlock()
 
 	return len(pending), nil
+}
+
+// ResetStakePubkeyIndexCache forgets the loaded index, so the next
+// LoadStakePubkeyIndex reads the file. The cache is not keyed by directory;
+// tests that load indexes from different directories reset it.
+func ResetStakePubkeyIndexCache() {
+	instance.pendingStakeMutex.Lock()
+	instance.cachedStakeEntries = nil
+	instance.pendingStakeMutex.Unlock()
 }
 
 // ClearPendingStakePubkeys discards any pending stake pubkeys without writing them.

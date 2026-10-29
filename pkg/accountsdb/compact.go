@@ -8,25 +8,26 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/util"
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 )
 
 // Compaction reclaims dead bytes from the append-only store. Folds never
 // overwrite: every re-written account leaves its previous version behind as
 // dead bytes in an older segment or bootstrap appendvec. CompactOnce scans
 // mostly-dead files and moves the still-live records into a fresh output file
-// (1 source -> 1 output), then deletes the source.
+// (1 source -> 1 output), then deletes the source. Large manifest-backed files
+// instead release obsolete payload pages in place; see sparsifyFile.
 //
 // The pin rule (invariant I5) is what keeps rewind sound: a file is untouchable
-// while it is inside the rewind horizon — either it IS an in-horizon fold
-// segment, or an in-horizon fold's undo pointer (ManifestRecord.Prev) names it.
-// Once the horizon ages past a batch, its undo targets stop being needed and
-// the files become ordinary candidates. Bootstrap appendvecs are never pinned
-// by seq (they predate all folds) and compact like any other file once their
-// live fraction decays — that is where the bulk of long-run reclaim comes from.
+// while it is inside the rewind horizon, including the target boundary itself.
+// An older file named by an in-horizon undo pointer cannot be relocated, but
+// sparse reclamation may free other obsolete payloads in it while preserving
+// every referenced record at its exact location. Bootstrap/small files retain
+// the conservative whole-file pin for undo references.
 //
 // Liveness is exact, not heuristic: a record is live iff the index still maps
 // its pubkey to this exact (fileId, offset). FileIds are never reused (I7), so
@@ -49,8 +50,8 @@ import (
 
 // CompactionConfig bounds one CompactOnce cycle.
 type CompactionConfig struct {
-	// RewindHorizonBatches pins the newest N fold batches and every file their
-	// undo pointers name. Must match (or exceed) the operational rewind
+	// RewindHorizonBatches pins the newest N fold batches, their target boundary
+	// and every record their undo pointers name. Must match the operational rewind
 	// horizon. Clamped to >= 1 so the committed head fold is always pinned.
 	RewindHorizonBatches uint64
 	// MinDeadFraction is the dead-byte fraction a file must reach before its
@@ -63,6 +64,11 @@ type CompactionConfig struct {
 	// churn bound; mostly-live files cost a scan but yield no move). Progress
 	// across cycles is kept by a directory cursor. Default 1GB.
 	MaxScanBytesPerCycle int64
+	// MaxFilesPerCycle and MaxDuration bound metadata-only reclamation work.
+	// A single candidate can exceed the duration; it is never interrupted in
+	// the middle of publishing its durable reclamation marker.
+	MaxFilesPerCycle int
+	MaxDuration      time.Duration
 }
 
 // CompactStats reports one CompactOnce cycle.
@@ -70,6 +76,7 @@ type CompactStats struct {
 	CandidatesScanned int
 	FilesCompacted    int
 	FilesDeleted      int // fully-dead fast path (no bytes moved)
+	FilesSparsified   int // dead payload pages released without moving live/undo records
 	LiveBytesMoved    int64
 	BytesReclaimed    int64 // source bytes freed (compacted + deleted)
 }
@@ -81,11 +88,15 @@ const (
 )
 
 type compactCandidate struct {
-	name         string
-	slot         uint64
-	fileId       uint64
-	size         int64
-	manifestPath string // the source's own manifest; "" for bootstrap appendvecs
+	name          string
+	path          string
+	slot          uint64
+	fileId        uint64
+	size          int64
+	allocated     int64
+	manifestPath  string // the source's own manifest; "" for bootstrap appendvecs
+	alreadySparse bool
+	scanOrder     uint64
 }
 
 // CompactOnce runs one bounded compaction cycle and returns what it did.
@@ -106,75 +117,166 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 	if cfg.MaxScanBytesPerCycle <= 0 {
 		cfg.MaxScanBytesPerCycle = defaultMaxScanBytesPerCycle
 	}
+	if cfg.MaxFilesPerCycle <= 0 {
+		cfg.MaxFilesPerCycle = 16
+	}
 
-	db.foldMu.Lock()
+	db.foldMu.LockAs("compaction")
 	defer db.foldMu.Unlock()
+	// A cycle that stops early (error or panic) after it started reclaiming
+	// files may have changed some the inventory has not recorded yet; the next
+	// cycle rescans the directory. Failures before that point (pin setup, the
+	// history floor, which lives in the index) change no files, so a store
+	// whose pin setup keeps failing does not rescan on every cycle.
+	touchedFiles, completed := false, false
+	defer func() {
+		if touchedFiles && !completed {
+			db.invalidateCompactionInventoryLocked()
+		}
+	}()
+
+	if db.rewindPending {
+		return stats, fmt.Errorf("accountsdb: pending rewind state must be persisted before compaction")
+	}
 
 	meta, _, err := db.readFoldMeta()
 	if err != nil {
 		return stats, err
 	}
+	if db.compactScanned == nil || db.compactScanSeq != meta.BatchSeq {
+		db.compactScanSeq = meta.BatchSeq
+		db.compactScanned = make(map[uint64]struct{})
+	}
+	if db.compactLastScan == nil {
+		db.compactLastScan = make(map[uint64]uint64)
+	}
 
-	pinned, manifestByFileId, err := db.compactionPinSet(meta.BatchSeq, cfg.RewindHorizonBatches)
+	inv, err := db.compactionInventoryLocked()
 	if err != nil {
 		return stats, err
+	}
+	pinned, manifestByFileId, err := db.compactionPinSet(meta.BatchSeq, cfg.RewindHorizonBatches, inv)
+	if err != nil {
+		return stats, err
+	}
+
+	floor, err := db.compactionHistoryFloor(meta.BatchSeq, cfg.RewindHorizonBatches)
+	if err != nil {
+		return stats, err
+	}
+	if floor > 0 {
+		var boundary foldMeta
+		for _, h := range manifestByFileId {
+			if h.Kind == ManifestKindFold && h.BatchSeq == floor {
+				if boundary.BatchSeq != 0 {
+					return stats, fmt.Errorf("ambiguous compaction history boundary %d", floor)
+				}
+				boundary = foldMeta{BatchSeq: h.BatchSeq, ThroughSlot: h.ThroughSlot, FileId: h.FileId}
+			}
+		}
+		if boundary.BatchSeq == 0 {
+			return stats, fmt.Errorf("missing compaction history boundary %d", floor)
+		}
+		if err := db.persistCompactionHistoryFloor(boundary); err != nil {
+			return stats, err
+		}
+	}
+
+	fire(db.compactHooks.afterHistoryFloor)
+
+	// Retiring a fold manifest (even a fully-dead file) requires its index
+	// frontier to survive a crash. WAL-off folds otherwise rely on that redo log.
+	if db.IndexWALDisabled {
+		if err := db.Index.Flush(); err != nil {
+			return stats, err
+		}
 	}
 
 	bootstrapHigh := db.bootstrapHighFileId()
-	entries, err := os.ReadDir(db.AcctsDir)
-	if err != nil {
-		return stats, err
-	}
-	candidates := make([]compactCandidate, 0, len(entries))
-	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() {
+	candidates := make([]compactCandidate, 0, len(inv.data))
+	for name, file := range inv.data {
+		slot, fileId := file.slot, file.fileId
+		if _, isPinned := pinned.whole[fileId]; isPinned {
 			continue
 		}
-		slot, fileId, ok := parseDataFileName(name)
-		if !ok {
-			continue
+		if _, scanned := db.compactScanned[fileId]; scanned {
+			continue // no liveness or rewind-pin change since the successful scan
 		}
-		if _, isPinned := pinned[fileId]; isPinned {
-			continue
-		}
-		mpath, hasManifest := manifestByFileId[fileId]
+		manifest, hasManifest := manifestByFileId[fileId]
 		if !hasManifest && fileId > bootstrapHigh {
 			continue // undecided orphan — recovery's to delete, not ours
 		}
-		info, ierr := e.Info()
-		if ierr != nil {
+		allocated := file.allocated
+		if allocated < sparseCompactionMinSize {
+			delete(db.compactLastScan, fileId)
+		}
+		// Small files and bootstrap appendvecs still use relocation compaction.
+		// Only manifest-backed large files support reclaiming individual dead
+		// payloads while keeping all undo pointers at their original offsets.
+		if len(pinned.records[fileId]) > 0 && (!hasManifest || file.size < sparseCompactionMinSize || !sparseCompactionSupported) {
 			continue
 		}
 		candidates = append(candidates, compactCandidate{
-			name: name, slot: slot, fileId: fileId, size: info.Size(), manifestPath: mpath,
+			name: name, slot: slot, fileId: fileId, size: file.size, allocated: allocated, manifestPath: manifest.Path,
+			alreadySparse: (manifest.Kind == ManifestKindCompact && manifest.DataCRC == 0) || db.compactLastScan[fileId] != 0,
+			scanOrder:     db.compactLastScan[fileId],
 		})
 	}
-	// Deterministic order + resume after the previous cycle's cursor so large
-	// directories make steady progress instead of rescanning the same prefix.
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].name < candidates[j].name })
-	if db.compactCursor != "" {
-		rotated := make([]compactCandidate, 0, len(candidates))
-		var before []compactCandidate
-		for _, c := range candidates {
-			if c.name > db.compactCursor {
-				rotated = append(rotated, c)
-			} else {
-				before = append(before, c)
-			}
-		}
-		candidates = append(rotated, before...)
-	}
+	db.compactCycles++
+	queue := newCompactCandidateQueue(candidates, db.sparseCursor, db.compactCursor, db.resparseNext, db.compactCycles%8 == 0)
 
+	// This cache is private to the foldMu-protected cycle. Sparse reclamation
+	// never changes index locations; relocation below invalidates it.
+	var indexCache sparseIndexCache
 	var scannedBytes int64
-	for _, c := range candidates {
-		if stats.LiveBytesMoved >= cfg.MaxMoveBytesPerCycle || scannedBytes >= cfg.MaxScanBytesPerCycle {
+	started := time.Now()
+	touchedFiles = true
+	for {
+		if stats.LiveBytesMoved >= cfg.MaxMoveBytesPerCycle || scannedBytes >= cfg.MaxScanBytesPerCycle || stats.CandidatesScanned >= cfg.MaxFilesPerCycle ||
+			(cfg.MaxDuration > 0 && stats.CandidatesScanned > 0 && time.Since(started) >= cfg.MaxDuration) {
 			break
 		}
-		db.compactCursor = c.name
-		scannedBytes += c.size
+		c, ok := queue.next()
+		if !ok {
+			break
+		}
+		// Paths are not part of candidate ordering. Construct one only for a
+		// selected file, rather than for every entry in the inventory.
+		c.path = filepath.Join(db.appendVecDir(c.fileId), c.name)
+		switch compactCandidateClass(c) {
+		case '0':
+			db.sparseCursor = compactCandidateKey(c)
+			db.resparseNext = true
+		case '1':
+			db.resparseNext = false
+		default:
+			db.compactCursor = compactCandidateKey(c)
+		}
 		stats.CandidatesScanned++
+		if c.manifestPath != "" && c.size >= sparseCompactionMinSize && sparseCompactionSupported {
+			reclaimed, scanned, deleted, err := db.sparsifyFile(c, pinned.records[c.fileId], &indexCache)
+			scannedBytes += scanned
+			if err != nil {
+				return stats, fmt.Errorf("accountsdb: sparsify %s: %w", c.name, err)
+			}
+			db.compactScanned[c.fileId] = struct{}{}
+			db.compactScanClock++
+			db.compactLastScan[c.fileId] = db.compactScanClock
+			if deleted {
+				delete(db.compactLastScan, c.fileId)
+			}
+			stats.BytesReclaimed += reclaimed
+			if deleted {
+				stats.FilesDeleted++
+			} else if reclaimed > 0 {
+				stats.FilesSparsified++
+			}
+			continue
+		}
+		scannedBytes += c.size
 
+		// compactFile may publish new index locations. Never reuse values across it.
+		indexCache = sparseIndexCache{}
 		acted, moved, err := db.compactFile(c, cfg.MinDeadFraction)
 		if err != nil {
 			return stats, fmt.Errorf("accountsdb: compact %s: %w", c.name, err)
@@ -191,67 +293,210 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 			stats.BytesReclaimed += c.size - moved
 		}
 	}
-	if stats.FilesCompacted > 0 || stats.FilesDeleted > 0 {
-		mlog.Log.Infof("accountsdb: compaction cycle — %d scanned, %d compacted, %d deleted, %s live moved, %s reclaimed",
-			stats.CandidatesScanned, stats.FilesCompacted, stats.FilesDeleted,
+	completed = true
+	if stats.FilesCompacted > 0 || stats.FilesDeleted > 0 || stats.FilesSparsified > 0 {
+		mlog.Log.Infof("accountsdb: compaction cycle — %d scanned, %d compacted, %d sparsified, %d deleted, %s live moved, %s reclaimed",
+			stats.CandidatesScanned, stats.FilesCompacted, stats.FilesSparsified, stats.FilesDeleted,
 			humanBytes(stats.LiveBytesMoved), humanBytes(stats.BytesReclaimed))
 	}
 	return stats, nil
 }
 
-// compactionPinSet returns the fileIds compaction must not touch (I5) plus a
-// fileId -> manifest-path map for every current (non-parked) manifest.
-//
-// Pinned: in-horizon fold segments (BatchSeq > head-horizon), every file an
-// in-horizon undo pointer names, and — unconditionally — parked ".rewound"
-// manifests' segments and undo targets (an interrupted rewind resumes through
-// them at the next startup; compaction must not pull files out from under it).
-func (db *AccountsDb) compactionPinSet(headSeq, horizon uint64) (map[uint64]struct{}, map[uint64]string, error) {
-	horizonFloor := uint64(0)
-	if headSeq > horizon {
-		horizonFloor = headSeq - horizon
+// All keys have the same two-byte prefix shape (class + ':'). Compare the
+// class and existing name separately instead of building two strings for every
+// sort comparison. Retry scan order still takes precedence within class '1'.
+func compactCandidateLess(a, b compactCandidate) bool {
+	ac, bc := compactCandidateClass(a), compactCandidateClass(b)
+	if ac != bc {
+		return ac < bc
 	}
-	pinned := make(map[uint64]struct{})
-	manifestByFileId := make(map[uint64]string)
+	if ac == '1' && a.scanOrder != b.scanOrder {
+		return a.scanOrder < b.scanOrder
+	}
+	return a.name < b.name
+}
 
-	entries, err := os.ReadDir(db.AcctsDir)
+func compactCandidateClass(c compactCandidate) byte {
+	if c.manifestPath != "" && c.allocated >= sparseCompactionMinSize {
+		if c.alreadySparse {
+			// Hole punching retains record headers and edge pages. Repeatedly
+			// walking a multi-GB logical file with only a few percent allocated
+			// is expensive and seldom releases much. Keep it in the periodic
+			// slow queue; reserve fast retries for substantial payload remains.
+			if c.allocated >= c.size/10 {
+				return '1'
+			}
+			return '2'
+		}
+		return '0'
+	}
+	return '2'
+}
+
+// Cursor encoding is unchanged; only the hot sort/classification paths avoid
+// constructing it. Cursors are still compared using the original string key.
+func compactCandidateKey(c compactCandidate) string {
+	switch compactCandidateClass(c) {
+	case '0':
+		return "0:" + c.name
+	case '1':
+		return "1:" + c.name
+	default:
+		return "2:" + c.name
+	}
+}
+
+func rotateCompactCandidates(candidates []compactCandidate, cursor string) []compactCandidate {
+	i := sort.Search(len(candidates), func(i int) bool { return compactCandidateKey(candidates[i]) > cursor })
+	rotated := make([]compactCandidate, 0, len(candidates))
+	rotated = append(rotated, candidates[i:]...)
+	return append(rotated, candidates[:i]...)
+}
+
+type compactionPins struct {
+	whole map[uint64]struct{}
+	// fileId -> offset -> expected account key. Undo references retain exact
+	// records, not every obsolete account that happens to share their file.
+	records map[uint64]map[uint64][32]byte
+}
+
+// compactionPinSet returns whole-file and exact undo-record pins (I5) plus a
+// fileId -> header map for every current (non-parked) manifest.
+//
+// Whole-file pins: in-horizon segments including the target (BatchSeq >=
+// head-horizon), and parked ".rewound" segments and undo targets. Other undo
+// targets pin individual records, allowing sparse reclamation without relocation.
+//
+// Integrity is checked exactly as when every cycle re-read the full manifests:
+// every header is read and validated, and every retained manifest's whole body
+// is checked against its CRC trailer each cycle (streamed through a reusable
+// buffer). Only the decoding is reused: pins are recomputed from the full
+// manifests (about 65 x 3 MiB on mainnet) unless every retained manifest's
+// name, complete header, size, mtime and verified CRC, and both floors, equal
+// those of the last full decode, which changes about once per fold. The
+// returned maps are shared with later cycles: read only.
+func (db *AccountsDb) compactionPinSet(headSeq, horizon uint64, inv *compactionInventory) (*compactionPins, map[uint64]ManifestHeader, error) {
+	horizonFloor, err := db.compactionHistoryFloor(headSeq, horizon)
 	if err != nil {
 		return nil, nil, err
 	}
-	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() || strings.HasSuffix(name, segManifestTmpSuffix) {
-			continue
-		}
+	retained, err := db.readCompactionHistoryFloor()
+	if err != nil {
+		return nil, nil, err
+	}
+	validationFloor := horizonFloor
+	if retained.BatchSeq != 0 {
+		validationFloor = retained.BatchSeq
+	}
+	manifestByFileId := make(map[uint64]ManifestHeader)
+	retainedSeqs := make(map[uint64]bool)
+
+	names := make([]string, 0, len(inv.manifests))
+	for name := range inv.manifests {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	type retainedManifest struct {
+		name, path string
+		hdr        ManifestHeader
+		parked     bool
+	}
+	var keep []retainedManifest
+	var sig strings.Builder
+	fmt.Fprintf(&sig, "%d/%d", horizonFloor, validationFloor)
+	for _, name := range names {
 		parked := strings.HasSuffix(name, segManifestRewoundSuffix)
-		if !parked && !strings.HasSuffix(name, segManifestSuffix) {
-			continue
-		}
 		path := filepath.Join(db.AcctsDir, name)
 		hdr, herr := readManifestHeader(path)
 		if herr != nil {
-			continue // torn — recovery quarantines; its data file stays untouched (no manifest entry -> orphan rule)
+			return nil, nil, fmt.Errorf("cannot establish rewind pins from %s: %w", name, herr)
+		}
+		dataName := strings.TrimSuffix(strings.TrimSuffix(name, ".rewound"), segManifestSuffix)
+		slot, fileID, validName := parseDataFileName(dataName)
+		if !validName || hdr.FileId != fileID || hdr.ThroughSlot != slot ||
+			(hdr.Kind != ManifestKindFold && hdr.Kind != ManifestKindCompact) ||
+			(hdr.Kind != ManifestKindFold && hdr.BatchSeq != 0) ||
+			(hdr.Kind == ManifestKindFold && hdr.BatchSeq == 0) {
+			return nil, nil, fmt.Errorf("cannot establish rewind pins: invalid manifest header %s", name)
 		}
 		if !parked {
-			manifestByFileId[hdr.FileId] = path
+			manifestByFileId[hdr.FileId] = hdr
 		}
 		if hdr.Kind != ManifestKindFold {
 			continue
 		}
-		if parked || hdr.BatchSeq > horizonFloor {
-			pinned[hdr.FileId] = struct{}{}
-			m, merr := ReadSegmentManifest(path)
+		// Keep the target boundary itself as well as all undoable batches.
+		if parked || hdr.BatchSeq >= validationFloor {
+			info, serr := os.Lstat(path)
+			if serr != nil {
+				return nil, nil, fmt.Errorf("cannot establish rewind pins from %s: %w", name, serr)
+			}
+			crc, cerr := db.verifyManifestCRC(path)
+			if cerr != nil {
+				db.compactPinCache = nil
+				return nil, nil, fmt.Errorf("cannot establish rewind pins from %s: %w", name, cerr)
+			}
+			fmt.Fprintf(&sig, "|%s:%d:%d:%d:%d:%d:%d:%d:%d:%d:%08x", name, hdr.Kind, hdr.BatchSeq, hdr.FromSlot, hdr.ThroughSlot,
+				hdr.FileId, hdr.DataLen, hdr.DataCRC, info.Size(), info.ModTime().UnixNano(), crc)
+			keep = append(keep, retainedManifest{name: name, path: path, hdr: hdr, parked: parked})
+			retainedSeqs[hdr.BatchSeq] = true
+		}
+	}
+
+	pinned := (*compactionPins)(nil)
+	if cache := db.compactPinCache; cache != nil && cache.sig == sig.String() {
+		pinned = cache.pinned
+	} else {
+		pinned = &compactionPins{whole: make(map[uint64]struct{}), records: make(map[uint64]map[uint64][32]byte)}
+		for _, k := range keep {
+			m, merr := ReadSegmentManifest(k.path)
 			if merr != nil {
-				continue // segment itself stays pinned; undo targets unknown but recovery will quarantine this manifest
+				db.compactPinCache = nil
+				return nil, nil, fmt.Errorf("cannot establish rewind pins from %s: %w", k.name, merr)
+			}
+			// Validate the previously promised range before expiring more history.
+			// A new head must not silently age out a missing/corrupt retained fold.
+			if !k.parked && k.hdr.BatchSeq < horizonFloor {
+				continue
+			}
+			pinned.whole[k.hdr.FileId] = struct{}{}
+			if !k.parked && k.hdr.BatchSeq == horizonFloor {
+				continue // boundary's own undo pointers are outside the horizon
 			}
 			for i := range m.Records {
 				if m.Records[i].PrevValid {
-					pinned[m.Records[i].Prev.FileId] = struct{}{}
+					r := m.Records[i]
+					if k.parked {
+						pinned.whole[r.Prev.FileId] = struct{}{}
+					}
+					if pinned.records[r.Prev.FileId] == nil {
+						pinned.records[r.Prev.FileId] = make(map[uint64][32]byte)
+					}
+					if key, exists := pinned.records[r.Prev.FileId][r.Prev.Offset]; exists && key != r.Pubkey {
+						db.compactPinCache = nil
+						return nil, nil, fmt.Errorf("conflicting undo pointers for file %d offset %d", r.Prev.FileId, r.Prev.Offset)
+					}
+					pinned.records[r.Prev.FileId][r.Prev.Offset] = r.Pubkey
 				}
 			}
 		}
+		db.compactPinCache = &compactionPinCache{sig: sig.String(), pinned: pinned}
+	}
+	// Never interpret a missing/corrupted in-horizon fold as an empty undo log.
+	// In particular a damaged header must not silently age itself out of pins.
+	for seq := max(uint64(1), validationFloor); seq <= headSeq && seq != 0; seq++ {
+		if !retainedSeqs[seq] {
+			return nil, nil, fmt.Errorf("cannot establish rewind pins: missing fold manifest seq %d", seq)
+		}
 	}
 	return pinned, manifestByFileId, nil
+}
+
+// compactionPinCache holds the last computed pins and the retained-manifest
+// signature they were computed from. Guarded by foldMu.
+type compactionPinCache struct {
+	sig    string
+	pinned *compactionPins
 }
 
 // compactFile scans one candidate and, if dead enough, moves its live records
@@ -259,10 +504,11 @@ func (db *AccountsDb) compactionPinSet(headSeq, horizon uint64) (map[uint64]stru
 // acted=false means the file was left alone (too live). liveBytesMoved==0 with
 // acted=true means the fully-dead fast path (source deleted, nothing written).
 func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (bool, int64, error) {
-	srcPath := filepath.Join(db.AcctsDir, c.name)
+	srcPath := c.path
 	data, err := os.ReadFile(srcPath)
 	if err != nil {
 		if os.IsNotExist(err) {
+			db.invalidateCompactionInventoryLocked()
 			return false, 0, nil // raced an external cleanup; nothing to do
 		}
 		return false, 0, err
@@ -277,36 +523,25 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 	// slot must also equal the filename slot — the read path builds the file
 	// name from the entry's slot, so a mismatched entry could not be served
 	// from the output file and is safest left untouched.
-	liveIdx := make([]int, 0, len(idxEntries))
+	liveIdx, err := db.compactionLiveRecords(c, pubkeys, idxEntries)
+	if err != nil {
+		return false, 0, err
+	}
 	var liveBytes int64
-	for i := range idxEntries {
-		cur, closer, gerr := db.Index.Get(pubkeys[i][:])
-		if gerr != nil {
-			if gerr == pebble.ErrNotFound {
-				continue
-			}
-			return false, 0, gerr
-		}
-		curEntry, derr := UnmarshalAcctIdxEntry(cur)
-		closer.Close()
-		if derr != nil {
-			return false, 0, derr
-		}
-		if curEntry.FileId == c.fileId && curEntry.Offset == idxEntries[i].Offset && curEntry.Slot == c.slot {
-			liveIdx = append(liveIdx, i)
-			liveBytes += recordLenAt(data, idxEntries[i].Offset)
-		}
+	for _, i := range liveIdx {
+		liveBytes += recordLenAt(data, idxEntries[i].Offset)
 	}
 
 	if len(data) == 0 || len(liveIdx) == 0 {
 		// Fully dead (or empty bankhash-only segment past the horizon): no
 		// index state references it; drop source + its manifest.
-		db.appendVecReadMu.Lock()
-		err := removeSourceFiles(db.AcctsDir, srcPath, c.manifestPath)
+		db.appendVecReadMu.LockAs("compaction")
+		err := removeSourceFiles(srcPath, c.manifestPath)
 		db.appendVecReadMu.Unlock()
 		if err != nil {
 			return false, 0, err
 		}
+		db.trackRemovedLocked(srcPath, c.manifestPath)
 		return true, 0, nil
 	}
 
@@ -317,7 +552,8 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 
 	// Allocate the output fileId, persisting the high-water mark before the
 	// first data byte (I7 — a crash must never lead to fileId reuse).
-	newFileId := db.LargestFileId.Add(1)
+	// The output stays on the source's disk; its manifest lives in the primary.
+	newFileId := db.nextFileId(int(c.fileId % db.dirCount()))
 	if err := db.persistLargestFileId(); err != nil {
 		return false, 0, err
 	}
@@ -339,7 +575,7 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 	}
 
 	outName := SegmentDataName(c.slot, newFileId)
-	outPath := filepath.Join(db.AcctsDir, outName)
+	outPath := db.appendVecPath(c.slot, newFileId)
 	f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return false, 0, err
@@ -355,9 +591,10 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 	if err := f.Close(); err != nil {
 		return false, 0, err
 	}
-	if err := fsyncDir(db.AcctsDir); err != nil {
+	if err := fsyncDir(filepath.Dir(outPath)); err != nil {
 		return false, 0, err
 	}
+	db.trackDataFileLocked(outName)
 
 	// The compact manifest's only durable job is marking the output non-orphan;
 	// recovery never replays it (a crash before the index move leaves the
@@ -376,13 +613,14 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 	if err := WriteSegmentManifest(db.AcctsDir, manifest); err != nil {
 		return false, 0, err
 	}
+	db.trackManifestLocked(segmentManifestPath(db.AcctsDir, manifest.ThroughSlot, manifest.FileId))
 
 	// Move the index entries in one batch, then make the move durable BEFORE
 	// unlinking the source — with the WAL off that means an explicit Flush,
 	// because compact manifests are not replayed at recovery. Exclude snapshot
 	// readers from this short move-to-unlink window, so each sees either the old
 	// path or the new path and never needs a cross-epoch per-key fallback.
-	db.appendVecReadMu.Lock()
+	db.appendVecReadMu.LockAs("compaction")
 	defer db.appendVecReadMu.Unlock()
 	batch := db.Index.NewBatch()
 	defer batch.Close()
@@ -407,9 +645,10 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 		}
 	}
 
-	if err := removeSourceFiles(db.AcctsDir, srcPath, c.manifestPath); err != nil {
+	if err := removeSourceFiles(srcPath, c.manifestPath); err != nil {
 		return false, 0, err
 	}
+	db.trackRemovedLocked(srcPath, c.manifestPath)
 	return true, int64(buf.Len()), nil
 }
 
@@ -430,7 +669,7 @@ func recordLenAt(data []byte, off uint64) int64 {
 	return recLen
 }
 
-func removeSourceFiles(acctsDir, srcPath, manifestPath string) error {
+func removeSourceFiles(srcPath, manifestPath string) error {
 	if err := os.Remove(srcPath); err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -438,8 +677,14 @@ func removeSourceFiles(acctsDir, srcPath, manifestPath string) error {
 		if err := os.Remove(manifestPath); err != nil && !os.IsNotExist(err) {
 			return err
 		}
+		// A secondary-directory data file's manifest lives in the primary.
+		if filepath.Dir(manifestPath) != filepath.Dir(srcPath) {
+			if err := fsyncDir(filepath.Dir(manifestPath)); err != nil {
+				return err
+			}
+		}
 	}
-	return fsyncDir(acctsDir)
+	return fsyncDir(filepath.Dir(srcPath))
 }
 
 func humanBytes(n int64) string {

@@ -13,7 +13,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v4
         with:
-          go-version: 1.26.4
+          go-version: 1.27.2
 
       - name: Build
         run: go build -v ./cmd/mithril
@@ -31,7 +31,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v4
         with:
-          go-version: 1.26.4
+          go-version: 1.27.2
 
       - name: Voting, checkpoint, streaming and scheduler race regressions
         # Run the complete affected package suites, including subprocess crash
@@ -39,6 +39,7 @@ jobs:
         run: >-
           go test -race -p 2 -count=1
           ./pkg/alpenglow ./pkg/consensus ./pkg/replay ./pkg/rewards
+          ./pkg/rpcserver ./pkg/epochrewards
           ./pkg/turbine ./pkg/sigverify ./pkg/blockprod/...
           ./cmd/mithril/node ./cmd/mithril/configcmd
 

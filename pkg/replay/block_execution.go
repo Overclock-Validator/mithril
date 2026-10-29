@@ -54,9 +54,12 @@ type blockExecution struct {
 	ctx            context.Context
 	task           *trace.Task
 	setReplayStage func(string)
-	watchdogDone   chan struct{}
-	sigverifyWg    sync.WaitGroup
-	closed         bool
+	// recordStages writes the stage totals into this block's metrics; called
+	// once, when the bank finalizes.
+	recordStages func()
+	watchdogDone chan struct{}
+	sigverifyWg  sync.WaitGroup
+	closed       bool
 
 	// Whole-block inputs to the tail, set by ProcessBlock.
 	executionPlan     blockTransactionExecutionPlan
@@ -94,6 +97,7 @@ func newBlockExecution(
 	alpenglowClock bool,
 	parentBankSysvars *sealevel.BankSysvars,
 ) *blockExecution {
+	tail = normalizeUnrootedState(tail)
 	exec := &blockExecution{
 		acctsDb:             acctsDb,
 		block:               block,
@@ -121,9 +125,43 @@ func newBlockExecution(
 
 	var replayStage atomic.Value
 	var replayStageSince atomic.Int64
+	// Stage accounting: each change ends the previous stage, so the stages tile
+	// the bank's execution. Streaming changes stages from executor goroutines.
+	var (
+		stageMu    sync.Mutex
+		stageName  string
+		stageStart time.Time
+		stageTimes = make(map[string]time.Duration, 16)
+	)
 	exec.setReplayStage = func(stage string) {
+		stageMu.Lock()
+		now := time.Now()
 		replayStage.Store(stage)
-		replayStageSince.Store(time.Now().UnixNano())
+		replayStageSince.Store(now.UnixNano())
+		if stageName != "" {
+			stageTimes[stageName] += now.Sub(stageStart)
+		}
+		stageName, stageStart = stage, now
+		stageMu.Unlock()
+	}
+	exec.recordStages = func() {
+		stageMu.Lock()
+		defer stageMu.Unlock()
+		if stageName != "" {
+			now := time.Now()
+			stageTimes[stageName] += now.Sub(stageStart)
+			stageStart = now
+		}
+		if metrics.GlobalBlockReplay.ReplayStages == nil {
+			metrics.GlobalBlockReplay.ReplayStages = make(map[string]metrics.Timing, len(stageTimes))
+		}
+		for name, d := range stageTimes {
+			t := metrics.GlobalBlockReplay.ReplayStages[name]
+			t.Count++
+			t.SumNanoseconds += uint64(d)
+			metrics.GlobalBlockReplay.ReplayStages[name] = t
+		}
+		clear(stageTimes)
 	}
 
 	exec.watchdogDone = make(chan struct{})
@@ -208,6 +246,13 @@ func (exec *blockExecution) installSlotCtx(accts accounts.Accounts, parentAccts 
 	return nil
 }
 
+// streamingOverlayKeys sizes a streamed bank's account overlay and write
+// maps. The bank opens on a shell block with no transactions, so its own
+// account count would give the overlay a single lock shard, which every
+// transaction worker and the end-of-block writers then share. Mainnet blocks
+// load about 2,000 accounts and write about 1,800.
+const streamingOverlayKeys = 4096
+
 // open performs the bank-start work that needs only the parent state: the
 // parent sysvar pin and this bank's Clock/SlotHashes derivation, the parent
 // snapshot for whatever transactions the block currently carries (none for a
@@ -217,15 +262,13 @@ func (exec *blockExecution) installSlotCtx(accts accounts.Accounts, parentAccts 
 func (exec *blockExecution) open() error {
 	defer exec.captureAccountLoader()()
 	block := exec.block
-	exec.setReplayStage("prepare_dependency_planner")
-	if SerializedParameterArena != nil {
-		SerializedParameterArena.Reset()
-	}
+	exec.setReplayStage("parameter_arena")
+	resetSerializedParameterArena()
 
 	start := time.Now()
 	exec.setReplayStage("load_accounts")
 	loadAcctsRegion := trace.StartRegion(exec.ctx, "LoadBlockAccounts")
-	accts, parentAccts, accountMapCapacity, bankSysvars, err := loadBlockAccountsAndUpdateSysvars(exec.blockSrc, block, exec.epochSchedule, exec.alpenglowClock, exec.parentBankSysvars, nil)
+	accts, parentAccts, accountMapCapacity, bankSysvars, err := loadBlockAccountsAndUpdateSysvars(exec.blockSrc, block, exec.epochSchedule, exec.alpenglowClock, exec.parentBankSysvars, nil, streamingOverlayKeys)
 	loadAcctsRegion.End()
 	if err != nil {
 		return fmt.Errorf("load slot accounts and update sysvars at slot %d: %w", block.Slot, err)
@@ -347,7 +390,7 @@ func (exec *blockExecution) executeTransactionGroup(txs []*solana.Transaction, i
 	exec.setReplayStage("tx_loop")
 	start := time.Now()
 	txLoopRegion := trace.StartRegion(exec.ctx, "TxLoop")
-	feeInfos, computeUnits, err := exec.runTransactionGroup(txs, execute, shouldVerifySignatures)
+	feeInfos, computeUnits, err := exec.runTransactionGroup(txs, execute, shouldVerifySignatures, base)
 	txLoopRegion.End()
 	metrics.GlobalBlockReplay.TxLoop.AddTimingSince(start)
 	if err != nil {
@@ -390,7 +433,11 @@ func (exec *blockExecution) captureAccountLoader() func() {
 func (exec *blockExecution) loadTransactionAccounts(view *b.Block) error {
 	defer exec.captureAccountLoader()()
 	phaseStart := time.Now()
-	if err := resolveAddrTableLookups(exec.blockSrc, view); err != nil {
+	slotHashes, ok := exec.bankSysvars.SlotHashes()
+	if !ok {
+		return fmt.Errorf("resolve address table lookups at slot %d: bank has no SlotHashes sysvar", view.Slot)
+	}
+	if err := resolveAddrTableLookups(exec.blockSrc, view, slotHashes); err != nil {
 		return fmt.Errorf("resolve address table lookups at slot %d: %w", view.Slot, err)
 	}
 	metrics.GlobalBlockReplay.AccountLoader.AddressTableLookups.AddTimingSince(phaseStart)
@@ -440,10 +487,11 @@ func (exec *blockExecution) loadTransactionAccounts(view *b.Block) error {
 }
 
 // runTransactionGroup is parallelTxLoop over a transaction slice with a plan
-// built for the group alone (indices are group-local). Without the planner
+// built for the group alone (indices are group-local; base is the group's
+// block index, used only to report errors). Without the planner
 // (txParallelism <= 1) it runs sequentially, which
 // is always correct because groups are consumed in block order.
-func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execute []bool, shouldVerifySignatures bool) ([]*fees.TxFeeInfo, []uint64, error) {
+func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execute []bool, shouldVerifySignatures bool, base int) ([]*fees.TxFeeInfo, []uint64, error) {
 	slotCtx := exec.slotCtx
 	feeInfos := make([]*fees.TxFeeInfo, len(txs))
 	computeUnits := make([]uint64, len(txs))
@@ -472,7 +520,7 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 			var txErr error
 			feeInfos[idx], computeUnits[idx], txErr = ProcessTransaction(slotCtx, &exec.sigverifyWg, tx, nil, dbgOpts, nil, shouldVerifySignatures)
 			if feeInfos[idx] == nil {
-				return nil, nil, streamingTransactionError(idx, txErr)
+				return nil, nil, unprocessableTransactionError(base+idx, txErr)
 			}
 		}
 		return feeInfos, computeUnits, nil
@@ -514,19 +562,32 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 	<-plannerDone
 	for idx := range txs {
 		if execute[idx] && feeInfos[idx] == nil {
-			return nil, nil, streamingTransactionError(idx, txErrors[idx])
+			return nil, nil, unprocessableTransactionError(base+idx, txErrors[idx])
 		}
 	}
 	return feeInfos, computeUnits, nil
 }
 
-// Instruction failures still carry charged fees and remain valid block entries.
-// A missing fee result means transaction admission failed: discard the bank.
-func streamingTransactionError(index int, err error) error {
+// UnprocessableTransactionError reports the first transaction, by block index,
+// that produced no fee result. Instruction failures still carry charged fees
+// and remain valid block entries. A missing fee result means transaction
+// admission failed: discard the bank.
+type UnprocessableTransactionError struct {
+	Index int
+	Err   error
+}
+
+func (e *UnprocessableTransactionError) Error() string {
+	return fmt.Sprintf("unprocessable transaction %d: %v", e.Index, e.Err)
+}
+
+func (e *UnprocessableTransactionError) Unwrap() error { return e.Err }
+
+func unprocessableTransactionError(index int, err error) error {
 	if err == nil {
 		err = errors.New("missing fee result")
 	}
-	return fmt.Errorf("unprocessable streaming transaction %d: %w", index, err)
+	return &UnprocessableTransactionError{Index: index, Err: err}
 }
 
 // finalize runs the end-of-block phases over the open SlotCtx: fees to the
@@ -552,14 +613,8 @@ func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
 	start := time.Now()
 	setReplayStage("distribute_fees")
 
-	// distribute tx fees to the slot leader
-	// skip leader handling if there are zero transactions in this block
-	if !global.ManageLeaderSchedule() && block.BlockReward != nil && len(block.Transactions) > 0 {
-		slotCtx.LamportsBurnt = fees.DistributeTxFeesToSlotLeader(acctsDb, slotCtx, block.BlockReward.Leader, &txFeeAccumulator)
-		slotCtx.RecordModifiedAcct(block.BlockReward.Leader)
-	} else if global.ManageLeaderSchedule() && len(block.Transactions) > 0 {
-		slotCtx.LamportsBurnt = fees.DistributeTxFeesToSlotLeader(acctsDb, slotCtx, block.Leader, &txFeeAccumulator)
-		slotCtx.RecordModifiedAcct(block.Leader)
+	if err := distributeBlockTxFees(slotCtx, block, &txFeeAccumulator); err != nil {
+		return nil, err
 	}
 	metrics.GlobalBlockReplay.Reward.AddTimingSince(start)
 
@@ -670,6 +725,7 @@ func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
 	if tail != nil {
 		// Rooted-durable: buffer this slot's writes + bankhash in the RAM overlay
 		// (always, even when empty, so the bankhash is recorded); no durable write.
+		recordSlotStakeChange(tail, slotCtx, modifiedAccts)
 		tail.Add(slotCtx.Slot, modifiedAccts, persistedBankhash)
 		afterStoreAccounts()
 	} else if len(modifiedAccts) > 0 {
@@ -695,5 +751,6 @@ func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
 
 	global.IncrTransactionCount(executionPlan.processedTxCount)
 	setReplayStage("done")
+	exec.recordStages()
 	return slotCtx, err
 }

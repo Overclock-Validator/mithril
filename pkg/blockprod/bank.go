@@ -2,7 +2,9 @@ package blockprod
 
 import (
 	"sync"
+	"sync/atomic"
 
+	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/arena"
 	"github.com/Overclock-Validator/mithril/pkg/costmodel"
 	"github.com/Overclock-Validator/mithril/pkg/features"
@@ -49,6 +51,9 @@ type WorkingBank struct {
 	// either phase, so their storage can be reset for the next transaction.
 	borrowedAccounts *arena.Arena[sealevel.BorrowedAccount]
 	preparer         *replay.TransactionPreparer
+	// tpuAllowed admits TPU transactions. It only moves from false to true, so
+	// a TPU source that observed it set never races a later close.
+	tpuAllowed atomic.Bool
 }
 
 type BankConfig struct {
@@ -59,6 +64,8 @@ type BankConfig struct {
 	EntryHash           solana.Hash
 	Sink                BatchSink
 	TransactionStatuses *replay.TransactionStatusView
+	// TPUGated opens the bank with TPU admission closed until AllowTPU.
+	TPUGated bool
 }
 
 func NewWorkingBank(cfg BankConfig) *WorkingBank {
@@ -80,7 +87,7 @@ func NewWorkingBank(cfg BankConfig) *WorkingBank {
 	if cfg.SlotCtx != nil {
 		preparer = replay.NewTransactionPreparer(cfg.SlotCtx.Features)
 	}
-	return &WorkingBank{
+	bank := &WorkingBank{
 		preparer:         preparer,
 		slotCtx:          cfg.SlotCtx,
 		slot:             cfg.Slot,
@@ -94,6 +101,19 @@ func NewWorkingBank(cfg BankConfig) *WorkingBank {
 		seenMessages:     make(map[[32]byte]struct{}),
 		borrowedAccounts: arena.New[sealevel.BorrowedAccount](64),
 	}
+	bank.tpuAllowed.Store(!cfg.TPUGated)
+	return bank
+}
+
+// TPUAllowed reports whether TPU sources may forge into this bank. Other
+// producers forge directly and are not subject to the gate.
+func (b *WorkingBank) TPUAllowed() bool {
+	return b.tpuAllowed.Load()
+}
+
+// AllowTPU opens TPU admission. It is one-way and safe to call repeatedly.
+func (b *WorkingBank) AllowTPU() {
+	b.tpuAllowed.Store(true)
 }
 
 func (b *WorkingBank) Slot() uint64 {
@@ -140,6 +160,35 @@ func (b *WorkingBank) TxFeeAccumulator() fees.TxFeeInfoAccumulator {
 	return b.txFees
 }
 
+// ReadAccount returns pubkey's account as this bank sees it: as written
+// earlier in the slot, otherwise from parent state. ok is false for an
+// account that does not exist.
+func (b *WorkingBank) ReadAccount(pubkey solana.PublicKey) (*accounts.Account, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.slotCtx == nil {
+		return nil, false
+	}
+	acct, err := b.slotCtx.GetAccount(pubkey)
+	if err != nil && (b.slotCtx.UnrootedRead != nil || b.slotCtx.AccountsDb != nil) {
+		acct, err = b.slotCtx.GetAccountFromAccountsDb(pubkey)
+	}
+	if err != nil || acct == nil || acct.Lamports == 0 {
+		return nil, false
+	}
+	return acct, true
+}
+
+// Epoch is the bank's epoch.
+func (b *WorkingBank) Epoch() uint64 {
+	return b.slotCtx.Epoch
+}
+
+// LastBlockhash is the most recent blockhash the bank accepts: its parent's.
+func (b *WorkingBank) LastBlockhash() solana.Hash {
+	return b.slotCtx.LastBlockhash
+}
+
 // ForgeResult reports whether a transaction was committed into the working bank.
 type ForgeResult int
 
@@ -151,6 +200,8 @@ const (
 	ForgeDroppedCost
 	ForgeDroppedExecution
 	ForgeDroppedAlreadyProcessed
+	ForgeDroppedAccountLocks
+	ForgeDroppedLookup
 )
 
 func (r ForgeResult) String() string {
@@ -169,6 +220,10 @@ func (r ForgeResult) String() string {
 		return "dropped_execution"
 	case ForgeDroppedAlreadyProcessed:
 		return "dropped_already_processed"
+	case ForgeDroppedAccountLocks:
+		return "dropped_account_locks"
+	case ForgeDroppedLookup:
+		return "dropped_lookup"
 	default:
 		return "unknown"
 	}
@@ -178,7 +233,6 @@ func (r ForgeResult) String() string {
 func (b *WorkingBank) Forge(wire []byte) (ForgeResult, costmodel.ExceedReason) {
 	tx, err := solana.TransactionFromBytes(wire)
 	if err != nil {
-		b.RebateSchedule(len(wire))
 		return ForgeDroppedParse, costmodel.ExceedNone
 	}
 	return b.ForgeTransaction(tx, len(wire))
@@ -187,112 +241,204 @@ func (b *WorkingBank) Forge(wire []byte) (ForgeResult, costmodel.ExceedReason) {
 // ForgeTransaction executes and commits a parsed transaction. The caller must
 // keep it immutable: accepted transactions are retained for entry publication.
 func (b *WorkingBank) ForgeTransaction(tx *solana.Transaction, wireSize int) (ForgeResult, costmodel.ExceedReason) {
-	return b.forgeTransaction(tx, wireSize, nil)
+	return b.forgeTransaction(tx, wireSize, nil, EntryReservation{}, tpuForge)
 }
 
 // ForgePreparedTransaction reuses static work from owned, immutable TPU bytes.
 // A different bank feature snapshot falls back to the ordinary execution path.
 func (b *WorkingBank) ForgePreparedTransaction(tx *solana.Transaction, wireSize int, prepared *replay.PreparedTransaction) (ForgeResult, costmodel.ExceedReason) {
+	return b.ForgeScheduledTransaction(tx, wireSize, prepared, EntryReservation{})
+}
+
+// ForgeScheduledTransaction forges a transaction whose entry bytes were
+// reserved by PrepareSchedule. It consumes res whatever the result; prepared
+// may be nil.
+func (b *WorkingBank) ForgeScheduledTransaction(tx *solana.Transaction, wireSize int, prepared *replay.PreparedTransaction, res EntryReservation) (ForgeResult, costmodel.ExceedReason) {
 	if b.slotCtx == nil || !b.preparer.Matches(prepared, tx, b.slotCtx.Features) {
 		prepared = nil
 	}
-	return b.forgeTransaction(tx, wireSize, prepared)
+	return b.forgeTransaction(tx, wireSize, prepared, res, tpuForge)
 }
 
-func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, prepared *replay.PreparedTransaction) (ForgeResult, costmodel.ExceedReason) {
+// ForgeStandaloneTransaction forges a Harmonic block transaction that is not
+// revert protected. Unlike TPU forging, block limits are checked against the
+// units execution consumed, so a transaction may request more than the slot
+// has left as long as what it uses fits.
+func (b *WorkingBank) ForgeStandaloneTransaction(tx *solana.Transaction, wireSize int) (ForgeResult, costmodel.ExceedReason) {
+	return b.forgeTransaction(tx, wireSize, nil, EntryReservation{}, standaloneForge)
+}
+
+// forgePolicy selects how a forge path checks block limits.
+type forgePolicy struct {
+	// admitOnActual checks block limits after execution against actual usage
+	// instead of before it against requested units.
+	admitOnActual bool
+}
+
+var (
+	tpuForge        = forgePolicy{}
+	standaloneForge = forgePolicy{admitOnActual: true}
+)
+
+// forgeCandidate is a transaction's forge work that needs no bank lock.
+type forgeCandidate struct {
+	// execTx is what executes: tx, or for a v0 transaction with address-table
+	// lookups, a resolved copy. tx itself stays unresolved for entry encoding.
+	execTx *solana.Transaction
+	// prepared is the static preparation, if any, still valid for execTx.
+	prepared                 *replay.PreparedTransaction
+	serializedSize           int
+	messageHash              [32]byte
+	ancestorAlreadyProcessed bool
+	ancestorStatusErr        error
+	cost                     costmodel.TransactionCost
+}
+
+// prepareForge does the lock-free part of forging tx: full-wire validation,
+// the message hash, the account lock rules, the ancestor status lookup,
+// address-table lookups and the cost estimate. Unless it returns
+// ForgeAccepted, tx cannot be forged.
+func (b *WorkingBank) prepareForge(tx *solana.Transaction, wireSize int, prepared *replay.PreparedTransaction) (forgeCandidate, ForgeResult) {
+	c := forgeCandidate{execTx: tx, prepared: prepared}
 	if tx == nil {
-		b.RebateSchedule(wireSize)
-		return ForgeDroppedParse, costmodel.ExceedNone
+		return c, ForgeDroppedParse
 	}
 	// Validate the full wire before execution can charge fees or publish
 	// account changes. Entry append then reuses this measured size and has no
 	// fallible serialization step after commit, including on the prepared path.
-	serializedSize, err := serializedTransactionSize(tx)
+	var err error
+	c.serializedSize, err = serializedTransactionSize(tx)
 	if err != nil {
-		b.RebateSchedule(wireSize)
-		return ForgeDroppedParse, costmodel.ExceedNone
+		return c, ForgeDroppedParse
 	}
-	var messageHash [32]byte
 	if prepared != nil {
-		messageHash = prepared.MessageHash()
+		c.messageHash = prepared.MessageHash()
 	} else {
-		messageHash, err = replay.TransactionMessageHash(tx)
+		c.messageHash, err = replay.TransactionMessageHash(tx)
 	}
 	if err != nil {
-		b.RebateSchedule(wireSize)
-		return ForgeDroppedParse, costmodel.ExceedNone
+		return c, ForgeDroppedParse
 	}
-	ancestorAlreadyProcessed := false
-	var ancestorStatusErr error
+	// A transaction that repeats an account or exceeds the account lock limit
+	// can never be processed, and a block containing one is invalid. The check
+	// is static, so do it before the bank lock.
+	var lockFeats *features.Features
+	if b.slotCtx != nil {
+		lockFeats = b.slotCtx.Features
+	}
+	if txErr := replay.ValidateAccountLocks(tx, lockFeats); txErr != nil {
+		return c, ForgeDroppedAccountLocks
+	}
 	if b.ancestorStatuses == nil {
-		ancestorStatusErr = &replay.IncompleteTransactionStatusCoverageError{}
+		c.ancestorStatusErr = &replay.IncompleteTransactionStatusCoverageError{}
 	} else {
 		// The view is immutable and internally synchronizes its lazy per-blockhash
 		// index. Do that potentially large one-time lookup outside the bank lock.
-		ancestorAlreadyProcessed, ancestorStatusErr = b.ancestorStatuses.ContainsMessage(tx.Message.RecentBlockhash, messageHash)
+		c.ancestorAlreadyProcessed, c.ancestorStatusErr = b.ancestorStatuses.ContainsMessage(tx.Message.RecentBlockhash, c.messageHash)
 	}
 
-	var cost costmodel.TransactionCost
-	if !ancestorAlreadyProcessed && ancestorStatusErr == nil {
+	if !c.ancestorAlreadyProcessed && c.ancestorStatusErr == nil {
+		if replay.HasAddressTableLookups(tx) {
+			// Tables are read from the parent state, which this slot does not
+			// change, so resolve outside the bank lock.
+			resolved, txErr := replay.ResolveAddressTableLookups(b.slotCtx, tx)
+			if txErr != nil {
+				return c, ForgeDroppedLookup
+			}
+			// A loaded address can repeat a static key or another loaded
+			// address, or take the account count past the lock limit.
+			if txErr := replay.ValidateAccountLocks(resolved, lockFeats); txErr != nil {
+				return c, ForgeDroppedAccountLocks
+			}
+			c.execTx = resolved
+			// Static preparation, if any, was done on the unresolved message.
+			c.prepared = nil
+		}
 		feats := b.slotCtx.Features
 		if feats == nil {
 			f := features.NewFeaturesDefault()
 			feats = f
 		}
-		if prepared != nil {
-			cost = prepared.Cost()
+		if c.prepared != nil {
+			c.cost = c.prepared.Cost()
 		} else {
-			cost, err = costmodel.EstimateTransactionCost(tx, feats)
+			c.cost, err = costmodel.EstimateTransactionCost(c.execTx, feats)
 		}
 		if err != nil {
-			b.RebateSchedule(wireSize)
-			return ForgeDroppedParse, costmodel.ExceedNone
+			return c, ForgeDroppedParse
 		}
-		cost.WireSize = wireSize
+		c.cost.WireSize = wireSize
 	}
+	return c, ForgeAccepted
+}
+
+// statusLocked rejects a candidate this bank or its ancestors already
+// processed.
+func (b *WorkingBank) statusLocked(c forgeCandidate) ForgeResult {
+	if _, alreadyProcessed := b.seenMessages[c.messageHash]; alreadyProcessed {
+		return ForgeDroppedAlreadyProcessed
+	}
+	if c.ancestorAlreadyProcessed {
+		return ForgeDroppedAlreadyProcessed
+	}
+	if c.ancestorStatusErr != nil {
+		// A live leader is never constructed with incomplete coverage. Preserve a
+		// fail-closed result for isolated callers that bypass LeaderLoop.
+		return ForgeDroppedNoLeader
+	}
+	return ForgeAccepted
+}
+
+func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, prepared *replay.PreparedTransaction, res EntryReservation, policy forgePolicy) (ForgeResult, costmodel.ExceedReason) {
+	c, result := b.prepareForge(tx, wireSize, prepared)
+	if result != ForgeAccepted {
+		b.RebateSchedule(res)
+		return result, costmodel.ExceedNone
+	}
+	cost, serializedSize, messageHash := c.cost, c.serializedSize, c.messageHash
+	execTx, prepared := c.execTx, c.prepared
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	included := false
-	defer func() {
-		if !included {
-			b.entries.rebateReserved(wireSize)
-		}
-	}()
+	// The reservation only held budget while the lock was released. The lock
+	// is now held until append, so admission below is checked exactly.
+	b.entries.release(res)
 	if !b.accepting {
 		return ForgeDroppedNoLeader, costmodel.ExceedNone
 	}
-	if _, alreadyProcessed := b.seenMessages[messageHash]; alreadyProcessed {
-		return ForgeDroppedAlreadyProcessed, costmodel.ExceedNone
-	}
-	if ancestorAlreadyProcessed {
-		return ForgeDroppedAlreadyProcessed, costmodel.ExceedNone
-	}
-	if ancestorStatusErr != nil {
-		// A live leader is never constructed with incomplete coverage. Preserve a
-		// fail-closed result for isolated callers that bypass LeaderLoop.
-		return ForgeDroppedNoLeader, costmodel.ExceedNone
+	if result := b.statusLocked(c); result != ForgeAccepted {
+		return result, costmodel.ExceedNone
 	}
 
-	if reason := b.costs.WouldExceed(cost); reason != costmodel.ExceedNone {
+	if !policy.admitOnActual {
+		if reason := b.costs.WouldExceed(cost); reason != costmodel.ExceedNone {
+			return ForgeDroppedCost, reason
+		}
+	}
+	if reason := b.admitEntryBytesLocked(serializedSize); reason != costmodel.ExceedNone {
 		return ForgeDroppedCost, reason
 	}
-	if reason := b.reserveEntryBytesLocked(wireSize); reason != costmodel.ExceedNone {
-		return ForgeDroppedCost, reason
-	}
-	if err := b.preparer.PayerCanFund(b.slotCtx, tx, prepared); err != nil {
+	if err := b.preparer.PayerCanFund(b.slotCtx, execTx, prepared); err != nil {
 		return ForgeDroppedExecution, costmodel.ExceedNone
 	}
 
 	output := b.preparer.LoadAndExecute(replay.LoadAndExecuteTransactionInput{
 		SlotCtx:           b.slotCtx,
-		Transaction:       tx,
+		Transaction:       execTx,
 		LeanResult:        true,
 		SkipTimingMetrics: true,
 		Arena:             b.borrowedAccounts,
 	}, prepared)
+	// Execution only touched transaction-local accounts; nothing is published
+	// until the apply below, so a transaction refused here leaves no trace.
+	execCU, loadedCost := actualExecutionUsage(output)
+	if policy.admitOnActual {
+		if reason := b.costs.WouldExceed(cost.WithActualUsage(execCU, loadedCost)); reason != costmodel.ExceedNone {
+			return ForgeDroppedCost, reason
+		}
+	}
 	if output.ProcessingResult.TransactionError != nil {
-		feeInfo, err := replay.ApplyFeesOnlyTransaction(b.slotCtx, tx, output)
+		feeInfo, err := replay.ApplyFailedTransaction(b.slotCtx, execTx, output)
 		if err != nil {
 			return ForgeDroppedExecution, costmodel.ExceedNone
 		}
@@ -313,13 +459,11 @@ func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, pre
 	b.numSigs += uint64(tx.Message.Header.NumRequiredSignatures)
 
 	b.costs.Record(cost)
-	execCU, loadedCost := actualExecutionUsage(output)
 	b.costs.Rebate(cost, execCU, loadedCost)
 	if flushed, batchBytes, didFlush := b.entries.appendSerialized(*tx, wireSize, serializedSize); didFlush {
 		b.entryHash = b.entries.CurrentEntryHash()
 		b.sink.OnEntryBatch(flushed, batchBytes)
 	}
-	included = true
 	return ForgeAccepted, costmodel.ExceedNone
 }
 
@@ -364,32 +508,47 @@ func (b *WorkingBank) ClassifyBuffered(blockhash solana.Hash, messageHash [32]by
 // PrepareSchedule reserves entry bytes at schedule time. If the next
 // transaction would not fit in the current FEC set, the batch is
 // closed and shredded first. If the tx would then exceed the remaining
-// slot entry-byte budget, it is not reserved. A failed/unincludable
-// forge rebates the reservation.
-func (b *WorkingBank) PrepareSchedule(wireSize int) costmodel.ExceedReason {
+// slot entry-byte budget, nothing is reserved. Pass the reservation to
+// ForgeScheduledTransaction, or to RebateSchedule if it is not forged.
+func (b *WorkingBank) PrepareSchedule(wireSize int) (EntryReservation, costmodel.ExceedReason) {
+	return b.PrepareScheduleN([]int{wireSize})
+}
+
+// PrepareScheduleN is PrepareSchedule for transactions forged together, such
+// as a bundle. The reservation covers any split into batches.
+func (b *WorkingBank) PrepareScheduleN(wireSizes []int) (EntryReservation, costmodel.ExceedReason) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if !b.accepting {
-		return costmodel.ExceedNone
+	if !b.accepting || len(wireSizes) == 0 {
+		return EntryReservation{}, costmodel.ExceedNone
 	}
-	return b.reserveEntryBytesLocked(wireSize)
+	if b.entries.wouldOverflowBatch(wireSizes[0]) {
+		b.flushEntriesLocked()
+	}
+	res, ok := b.entries.reserve(wireSizes)
+	if !ok {
+		return EntryReservation{}, costmodel.ExceedBatchBytes
+	}
+	return res, costmodel.ExceedNone
 }
 
 // RebateSchedule releases a schedule-time entry-byte reservation.
-func (b *WorkingBank) RebateSchedule(wireSize int) {
+func (b *WorkingBank) RebateSchedule(res EntryReservation) {
+	if res.bytes == 0 {
+		return
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.entries.rebateReserved(wireSize)
+	b.entries.release(res)
 }
 
-func (b *WorkingBank) reserveEntryBytesLocked(wireSize int) costmodel.ExceedReason {
-	if b.entries.ReservedBytes() > 0 {
-		return costmodel.ExceedNone
-	}
-	if b.entries.wouldOverflowBatch(wireSize) {
+// admitEntryBytesLocked checks the slot entry-byte budget for a transaction
+// appended before the bank lock is released, closing a full batch first.
+func (b *WorkingBank) admitEntryBytesLocked(serializedSize int) costmodel.ExceedReason {
+	if b.entries.wouldOverflowBatch(serializedSize) {
 		b.flushEntriesLocked()
 	}
-	if !b.entries.reserve(wireSize) {
+	if b.entries.wouldExceedSlot(serializedSize) {
 		return costmodel.ExceedBatchBytes
 	}
 	return costmodel.ExceedNone

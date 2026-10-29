@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -486,6 +487,7 @@ func beginPartitionedEpochRewardsDistribution(acctsDb *accountsdb.AccountsDb, sl
 
 	partitionedRewardsInfo.SpoolDir = streamResult.SpoolDir
 	partitionedRewardsInfo.SpoolSlot = streamResult.SpoolSlot
+	partitionedRewardsInfo.VoteCommissions = streamResult.VoteCommissions
 	partitionedRewardsInfo.NumRewardPartitionsRemaining = streamResult.NumPartitions
 
 	maybeDumpEpochCalculatedRewards(dbgOpts, epoch, slot, streamResult)
@@ -493,6 +495,9 @@ func beginPartitionedEpochRewardsDistribution(acctsDb *accountsdb.AccountsDb, sl
 
 	rewardLoader := epochRewardAccountLoader(acctsDb, slot, slotCtx, stagedEpochAccts)
 	updatedAccts, parentUpdatedAccts, voteRewardsDistributed := rewards.DistributeVotingRewards(acctsDb, streamResult.ValidatorRewards, slot, rewardLoader)
+	if err := replaceInflationRewardRecords(block, updatedAccts, parentUpdatedAccts, rpc.RewardTypeVoting, streamResult.VoteCommissions); err != nil {
+		panic(err)
+	}
 
 	newEpochRewards := sealevel.SysvarEpochRewards{DistributionStartingBlockHeight: block.BlockHeight + 1,
 		NumPartitions: streamResult.NumPartitions, ParentBlockhash: block.LastBlockhash,
@@ -524,7 +529,7 @@ func beginPartitionedEpochRewardsDistribution(acctsDb *accountsdb.AccountsDb, sl
 		capitalizingEpochRewards(voteRewardsDistributed, streamResult.TotalStakerRewards)
 }
 
-func distributePartitionedEpochRewardsForSlot(acctsDb *accountsdb.AccountsDb, parentCtx *sealevel.SlotCtx, stagedEpochAccts []*accounts.Account, epochCtx *ReplayCtx, partitionedEpochRewardsInfo *rewards.PartitionedRewardDistributionInfo, currentSlot uint64, currentBlockHeight uint64) ([]*accounts.Account, []*accounts.Account) {
+func distributePartitionedEpochRewardsForSlot(acctsDb *accountsdb.AccountsDb, parentCtx *sealevel.SlotCtx, stagedEpochAccts []*accounts.Account, epochCtx *ReplayCtx, partitionedEpochRewardsInfo *rewards.PartitionedRewardDistributionInfo, currentSlot uint64, currentBlockHeight uint64, currentEpoch uint64) ([]*accounts.Account, []*accounts.Account, map[solana.PublicKey]uint8) {
 	rewardLoader := epochRewardAccountLoader(acctsDb, currentSlot, parentCtx, stagedEpochAccts)
 	epochRewardsAcct, err := rewardLoader(sealevel.SysvarEpochRewardsAddr)
 	if err != nil {
@@ -540,12 +545,23 @@ func distributePartitionedEpochRewardsForSlot(acctsDb *accountsdb.AccountsDb, pa
 	// FirstStakingRewardSlot while its block height is still one before the
 	// distribution start recorded in the freshly staged EpochRewards sysvar.
 	if currentBlockHeight < epochRewards.DistributionStartingBlockHeight {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	partitionIdx := currentBlockHeight - epochRewards.DistributionStartingBlockHeight
 
-	distributedAccts, parentDistributedAccts, distributedLamports, burnedLamports := rewards.DistributeStakingRewardsFromSpool(acctsDb, partitionedEpochRewardsInfo.SpoolDir, partitionedEpochRewardsInfo.SpoolSlot, partitionIdx, currentSlot, rewardLoader)
+	distributionConfig := rewards.StakeRewardDistributionConfig{RewardedEpoch: safemath.SaturatingSubU64(currentEpoch, 1)}
+	if epochCtx.CurrentFeatures != nil && epochCtx.CurrentFeatures.IsActive(features.RelaxPostExecMinBalanceCheck) {
+		rentAcct, err := rewardLoader(sealevel.SysvarRentAddr)
+		if err != nil {
+			panic(fmt.Sprintf("unable to get distribution bank Rent sysvar: %s", err))
+		}
+		if err := distributionConfig.Rent.UnmarshalWithDecoder(bin.NewBinDecoder(rentAcct.Data)); err != nil {
+			panic(fmt.Sprintf("unable to decode distribution bank Rent sysvar: %s", err))
+		}
+		distributionConfig.AdjustDelegationsForRent = true
+	}
+	distributedAccts, parentDistributedAccts, distributedLamports, burnedLamports, stakeCommissions := rewards.DistributeStakingRewardsFromSpool(acctsDb, partitionedEpochRewardsInfo.SpoolDir, partitionedEpochRewardsInfo.SpoolSlot, partitionIdx, currentSlot, rewardLoader, partitionedEpochRewardsInfo.VoteCommissions, distributionConfig)
 	parentDistributedAccts = append(parentDistributedAccts, epochRewardsAcct.Clone())
 
 	// EpochRewards sysvar advances by distributed + burned (matching Agave/FD),
@@ -583,5 +599,49 @@ func distributePartitionedEpochRewardsForSlot(acctsDb *accountsdb.AccountsDb, pa
 		mlog.Log.Warnf("partition %d: distributed=%d burned=%d", partitionIdx, distributedLamports, burnedLamports)
 	}
 
-	return distributedAccts, parentDistributedAccts
+	return distributedAccts, parentDistributedAccts, stakeCommissions
+}
+
+func replaceInflationRewardRecords(block *block.Block, updated, parents []*accounts.Account, rewardType rpc.RewardType, commissions map[solana.PublicKey]uint8) error {
+	if block == nil {
+		return fmt.Errorf("record %s rewards: nil block", rewardType)
+	}
+	if len(updated) != len(parents) {
+		return fmt.Errorf("record %s rewards at slot %d: %d updated accounts, %d parents", rewardType, block.Slot, len(updated), len(parents))
+	}
+	records := make([]rpc.BlockReward, 0, len(updated))
+	for index, account := range updated {
+		if account == nil || account.Key == sealevel.SysvarEpochRewardsAddr {
+			continue
+		}
+		parent := parents[index]
+		if parent == nil {
+			return fmt.Errorf("record %s rewards at slot %d: account %s has no parent", rewardType, block.Slot, account.Key)
+		}
+		if account.Lamports < parent.Lamports {
+			return fmt.Errorf("record %s rewards at slot %d: account %s balance decreased from %d to %d", rewardType, block.Slot, account.Key, parent.Lamports, account.Lamports)
+		}
+		amount := account.Lamports - parent.Lamports
+		if amount > math.MaxInt64 {
+			return fmt.Errorf("record %s rewards at slot %d: account %s reward %d overflows int64", rewardType, block.Slot, account.Key, amount)
+		}
+		if rewardType == rpc.RewardTypeStaking && amount == 0 {
+			continue
+		}
+		var commission *uint8
+		if value, ok := commissions[account.Key]; ok {
+			commission = &value
+		}
+		records = append(records, rpc.BlockReward{
+			Pubkey: account.Key, Lamports: int64(amount), PostBalance: account.Lamports, RewardType: rewardType, Commission: commission,
+		})
+	}
+	kept := block.Rewards[:0]
+	for _, reward := range block.Rewards {
+		if reward.RewardType != rewardType {
+			kept = append(kept, reward)
+		}
+	}
+	block.Rewards = append(kept, records...)
+	return nil
 }

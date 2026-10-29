@@ -9,12 +9,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
+	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
-	"github.com/cockroachdb/pebble"
-	"golang.org/x/sync/errgroup"
+	"github.com/cockroachdb/pebble/v2"
 )
 
 // metaKeyLastBatch is the Pebble index key holding the fold commit watermark
@@ -89,6 +88,7 @@ type BatchCommitResult struct {
 	ThroughSlot uint64
 	Keys        int
 	Bytes       int64
+	Timings     FoldTimings
 }
 
 type dedupedVersion struct {
@@ -118,8 +118,15 @@ func (db *AccountsDb) CommitBatch(
 	bankhashes map[uint64][32]byte,
 	resumeCtx []byte,
 ) (BatchCommitResult, error) {
-	db.foldMu.Lock()
+	var timings FoldTimings
+	clock := stepClock{last: time.Now()}
+	db.foldMu.LockAs("fold")
 	defer db.foldMu.Unlock()
+	clock.step(&timings.LockWait)
+
+	if db.rewindPending {
+		return BatchCommitResult{}, fmt.Errorf("accountsdb: pending rewind state must be persisted before folding")
+	}
 
 	// (1) Union-dedupe, newest wins. Deltas MUST arrive strictly ascending by
 	// slot: newest-wins depends on iterating in order so a later slot's version
@@ -150,6 +157,22 @@ func (db *AccountsDb) CommitBatch(
 	// An all-empty batch (empty blocks) still folds: the manifest records the
 	// batch's bankhashes + resume context and advances the watermark; the data
 	// file is empty and no index entries are written.
+	if db.MinFreeBytes > 0 {
+		// Account for the deduplicated segment, manifest and index writes before
+		// allocating a file ID or writing any data. The reserve covers concurrent
+		// writers and shutdown; this is admission control, not a space reservation.
+		required := uint64(1<<20) + uint64(len(resumeCtx)) + uint64(len(bankhashes))*40
+		for _, v := range union {
+			required += hdrLen + ((uint64(len(v.acct.Data)) + 7) &^ uint64(7)) + manifestRecordSize + 128
+		}
+		available, err := AvailableDiskBytes(db.AcctsDir)
+		if err != nil {
+			return BatchCommitResult{}, err
+		}
+		if err := checkDiskBudget(available, required, db.MinFreeBytes); err != nil {
+			return BatchCommitResult{}, err
+		}
+	}
 
 	// Deterministic segment layout (test reproducibility + stable offsets).
 	keys := make([][32]byte, 0, len(union))
@@ -158,8 +181,22 @@ func (db *AccountsDb) CommitBatch(
 	}
 	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i][:], keys[j][:]) < 0 })
 
+	clock.step(&timings.Dedupe)
+	// (4a) Undo pointers need only the sorted keys, and the index does not
+	// change until step 7, so capture them while the segment is written.
+	var undo []undoEntry
+	var undoErr error
+	undoDone := make(chan struct{})
+	go func() {
+		defer close(undoDone)
+		start := time.Now()
+		undo, undoErr = db.captureUndoEntries(keys)
+		timings.UndoLookup = time.Since(start)
+	}()
+	// Every return waits, so the capture never outlives this call (or the index).
+	defer func() { <-undoDone }()
 	// (2) fileId allocation; persist high-water BEFORE the first data byte (I7).
-	fileId := db.LargestFileId.Add(1)
+	fileId := db.nextFileId(0)
 	if err := db.persistLargestFileId(); err != nil {
 		return BatchCommitResult{}, err
 	}
@@ -168,7 +205,16 @@ func (db *AccountsDb) CommitBatch(
 	// updating a running CRC and byte count as we go, so the fully serialized
 	// segment is never materialized in RAM — only the bufio buffer is. Record
 	// offsets are the byte position before each record.
+	clock.step(&timings.FileID)
 	dataName := filepath.Join(db.AcctsDir, SegmentDataName(throughSlot, fileId))
+	// Until the commit succeeds, a failure may leave a data file or manifest
+	// that compaction's inventory does not know about: rebuild it then.
+	committed := false
+	defer func() {
+		if !committed {
+			db.invalidateCompactionInventoryLocked()
+		}
+	}()
 	f, err := os.OpenFile(dataName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return BatchCommitResult{}, err
@@ -213,38 +259,27 @@ func (db *AccountsDb) CommitBatch(
 	if err := fsyncDir(db.AcctsDir); err != nil {
 		return BatchCommitResult{}, err
 	}
+	db.trackDataFileLocked(filepath.Base(dataName))
 	fire(db.foldHooks.afterSegmentFsync)
 	dataCRC := crc.Sum32()
 
-	// (4) Undo pointers: the index entry each key had before this batch. Bloom
-	// filters make misses cheap; bounded parallelism keeps fold latency down.
+	// (4b) Undo pointers: the index entry each key had before this batch,
+	// captured concurrently with the segment write above.
+	clock.step(&timings.SegmentWrite)
+	<-undoDone
+	if undoErr != nil {
+		return BatchCommitResult{}, fmt.Errorf("accountsdb: capture undo pointers: %w", undoErr)
+	}
 	prevs := make([]ManifestRecord, len(records))
 	copy(prevs, records)
-	var g errgroup.Group
-	g.SetLimit(max(4, runtime.NumCPU()/2))
 	for i := range prevs {
-		g.Go(func() error {
-			val, closer, err := db.Index.Get(prevs[i].Pubkey[:])
-			if err != nil {
-				if err == pebble.ErrNotFound {
-					return nil // PrevValid stays false
-				}
-				return err
-			}
-			entry, derr := UnmarshalAcctIdxEntry(val)
-			closer.Close()
-			if derr != nil {
-				return derr
-			}
+		if undo[i].valid {
 			prevs[i].PrevValid = true
-			prevs[i].Prev = *entry
-			return nil
-		})
-	}
-	if err := g.Wait(); err != nil {
-		return BatchCommitResult{}, fmt.Errorf("accountsdb: capture undo pointers: %w", err)
+			prevs[i].Prev = undo[i].entry
+		}
 	}
 
+	clock.step(&timings.UndoCapture)
 	// (5) Manifest: once this rename is durable the commit is decided.
 	batchSeq := db.lastBatchSeq + 1
 	manifest := &SegmentManifest{
@@ -263,8 +298,10 @@ func (db *AccountsDb) CommitBatch(
 	if err := WriteSegmentManifest(db.AcctsDir, manifest); err != nil {
 		return BatchCommitResult{}, err
 	}
+	db.trackManifestLocked(segmentManifestPath(db.AcctsDir, manifest.ThroughSlot, manifest.FileId))
 	fire(db.foldHooks.afterManifestRename)
 
+	clock.step(&timings.Manifest)
 	// (6) Advisory bankhash rows; recoverable from the manifest, so NoSync.
 	for slot, bh := range bankhashes {
 		var slotBytes [8]byte
@@ -280,20 +317,21 @@ func (db *AccountsDb) CommitBatch(
 		live = append(live, union[k].acct)
 	}
 
+	clock.step(&timings.BankhashRows)
 	// (7) Publish the immutable changed-key view and advance the cache epoch
 	// under a short lock. While pendingFold is installed, readers resolve every
 	// changed key from the new union; unchanged keys are identical on both sides
 	// of the atomic Pebble commit. This lets the expensive index fsync and cache
 	// refresh proceed without blocking account loaders.
 	fire(db.foldHooks.beforeIndexCommit)
-	db.readCacheEpochMu.Lock()
+	db.readCacheEpochMu.LockAs("fold_publication")
 	db.pendingFold = union
 	db.readCacheEpoch++
 	db.readCacheEpochMu.Unlock()
 	fire(db.foldHooks.afterPublicationStart)
 
 	if err := db.applyManifestToIndex(manifest); err != nil {
-		db.readCacheEpochMu.Lock()
+		db.readCacheEpochMu.LockAs("fold_publication")
 		db.pendingFold = nil
 		db.readCacheEpochMu.Unlock()
 		return BatchCommitResult{}, err
@@ -302,9 +340,10 @@ func (db *AccountsDb) CommitBatch(
 	// Old readers captured the preceding epoch and therefore cannot publish
 	// stale values. New readers use pendingFold for changed keys until these
 	// ordinary concurrent-safe cache operations finish.
+	clock.step(&timings.IndexCommit)
 	db.refreshReadCacheEntries(live)
 
-	db.readCacheEpochMu.Lock()
+	db.readCacheEpochMu.LockAs("fold_publication")
 	db.pendingFold = nil
 	db.readCacheEpochMu.Unlock()
 	fire(db.foldHooks.afterIndexCommit)
@@ -312,6 +351,8 @@ func (db *AccountsDb) CommitBatch(
 	// (8) Publish.
 	db.lastBatchSeq = batchSeq
 	db.durableThrough.Store(throughSlot)
+	committed = true
+	clock.step(&timings.CacheRefresh)
 
 	return BatchCommitResult{
 		BatchSeq:    batchSeq,
@@ -319,6 +360,7 @@ func (db *AccountsDb) CommitBatch(
 		ThroughSlot: throughSlot,
 		Keys:        len(records),
 		Bytes:       int64(dataLen),
+		Timings:     timings,
 	}, nil
 }
 

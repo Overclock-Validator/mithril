@@ -54,7 +54,15 @@ func MaybeAdvanceNonceAccountForFailedTx(slotCtx *SlotCtx, tx *solana.Transactio
 	noncePk := instr.Accounts[0].Pubkey
 	nonceAcct, err := slotCtx.GetAccount(noncePk)
 	if err != nil {
-		return solana.PublicKey{}, false
+		// A leader bank starts empty, so an account the slot has not written
+		// yet is read from parent state, as handleFailedTx does for the payer.
+		if slotCtx.UnrootedRead == nil && slotCtx.AccountsDb == nil {
+			return solana.PublicKey{}, false
+		}
+		nonceAcct, err = slotCtx.GetAccountFromAccountsDb(noncePk)
+		if err != nil {
+			return solana.PublicKey{}, false
+		}
 	}
 
 	nonceStateVersions, err := UnmarshalNonceStateVersions(nonceAcct.Data)

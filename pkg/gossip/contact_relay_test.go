@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -331,7 +332,7 @@ func waitForGossip(t *testing.T, label string, check func() bool) {
 	t.Fatal("timed out: " + label)
 }
 
-func runRelayClient(t *testing.T, seed string, key ed25519.PrivateKey) (*Client, func()) {
+func runRelayClient(t *testing.T, seed string, key *identity.Holder) (*Client, func()) {
 	t.Helper()
 	socket, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
 	if err != nil {
@@ -446,11 +447,15 @@ func FuzzContactRelayPackets(f *testing.F) {
 	}
 	f.Add(packet)
 	f.Add([]byte{0, 0, 0, 0})
+	holder, err := identity.NewHolder(localKey)
+	if err != nil {
+		f.Fatal(err)
+	}
 	f.Fuzz(func(t *testing.T, packet []byte) {
 		if len(packet) > packetDataSize {
 			return
 		}
-		client, err := NewClient(Config{Entrypoint: "127.0.0.1:8000", Identity: localKey, ShredVersion: 4321})
+		client, err := NewClient(Config{Entrypoint: "127.0.0.1:8000", Identity: holder, ShredVersion: 4321})
 		if err != nil {
 			t.Fatal(err)
 		}

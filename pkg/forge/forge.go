@@ -24,6 +24,8 @@ type Stats struct {
 	DroppedCost             uint64
 	DroppedExecution        uint64
 	DroppedAlreadyProcessed uint64
+	DroppedAccountLocks     uint64
+	DroppedLookup           uint64
 	DroppedBlockCost        uint64
 	DroppedAccountCost      uint64
 	DroppedAllocCost        uint64
@@ -55,7 +57,7 @@ func (s *Sink) Receive(pkt packet.Packet) {
 	s.mu.Unlock()
 
 	bank := s.banks.WorkingBank()
-	if bank == nil {
+	if bank == nil || !bank.TPUAllowed() {
 		s.mu.Lock()
 		s.stats.DroppedNoBank++
 		s.mu.Unlock()
@@ -79,6 +81,10 @@ func (s *Sink) Receive(pkt packet.Packet) {
 		s.stats.DroppedExecution++
 	case blockprod.ForgeDroppedAlreadyProcessed:
 		s.stats.DroppedAlreadyProcessed++
+	case blockprod.ForgeDroppedAccountLocks:
+		s.stats.DroppedAccountLocks++
+	case blockprod.ForgeDroppedLookup:
+		s.stats.DroppedLookup++
 	default:
 		s.stats.DroppedNoBank++
 	}

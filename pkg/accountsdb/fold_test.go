@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -288,6 +288,35 @@ func TestRecoverFoldStateIdempotent(t *testing.T) {
 	assert.Equal(t, first.BatchSeq, second.BatchSeq)
 	assert.Empty(t, second.ReplayedBatches)
 	assert.Empty(t, second.OrphansRemoved)
+}
+
+// The bankhash rows of an already-applied head are written without a sync, so a
+// crash can lose them while the index and manifest survive. Recovery restores
+// them from the manifest instead of leaving startup validation to fail.
+func TestRecoverFoldStateRestoresAppliedHeadBankhash(t *testing.T) {
+	db, dir := newFoldTestDb(t)
+	_, err := db.CommitBatch(foldDeltas(
+		accounts.SlotDelta{Slot: 104, Delta: []*accounts.Account{foldAcct(1, 1, nil)}},
+	), 105, map[uint64][32]byte{104: bh(104), 105: bh(105)}, []byte("ctx"))
+	require.NoError(t, err)
+	for _, slot := range []uint64{104, 105} {
+		var key [8]byte
+		binary.LittleEndian.PutUint64(key[:], slot)
+		require.NoError(t, db.BankHashStore.Delete(key[:], pebble.Sync))
+	}
+
+	db = reopenFoldTestDb(t, db, dir)
+	defer db.CloseDb()
+	res, err := db.RecoverFoldState()
+	require.NoError(t, err)
+	assert.Empty(t, res.ReplayedBatches, "the head was already applied")
+	assert.Equal(t, uint64(105), res.DurableThrough)
+	for _, slot := range []uint64{104, 105} {
+		got, err := db.GetBankHashForSlot(slot)
+		require.NoError(t, err, "slot %d", slot)
+		want := bh(slot)
+		assert.Equal(t, want[:], got, "slot %d", slot)
+	}
 }
 
 // A gap in the BatchSeq run bounds recovery: contiguous manifests replay, and

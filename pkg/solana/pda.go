@@ -3,6 +3,7 @@ package solana
 import (
 	"crypto/sha256"
 	"errors"
+	"sync"
 
 	"filippo.io/edwards25519"
 )
@@ -47,8 +48,43 @@ func CreateProgramAddressBytes(seeds [][]byte, programID []byte) ([]byte, error)
 }
 
 // IsOnCurve checks if 'b' is on the ed25519 curve
+// The on-curve check (a field square root) is most of a PDA derivation's cost,
+// and programs derive the same addresses over and over. It is a pure function of
+// the 32 bytes, so recent answers are remembered, in shards that are simply
+// emptied when full to bound memory.
+const (
+	onCurveMemoShards     = 64
+	onCurveMemoShardLimit = 4096
+)
+
+var onCurveMemo [onCurveMemoShards]struct {
+	mu sync.RWMutex
+	m  map[[32]byte]bool
+}
+
 func IsOnCurve(b []byte) bool {
-	_, err := new(edwards25519.Point).SetBytes(b)
-	onCurve := err == nil
+	if len(b) != 32 {
+		return isOnCurve(b)
+	}
+	key := [32]byte(b)
+	shard := &onCurveMemo[key[0]%onCurveMemoShards]
+	shard.mu.RLock()
+	onCurve, ok := shard.m[key]
+	shard.mu.RUnlock()
+	if ok {
+		return onCurve
+	}
+	onCurve = isOnCurve(b)
+	shard.mu.Lock()
+	if shard.m == nil || len(shard.m) >= onCurveMemoShardLimit {
+		shard.m = make(map[[32]byte]bool, onCurveMemoShardLimit)
+	}
+	shard.m[key] = onCurve
+	shard.mu.Unlock()
 	return onCurve
+}
+
+func isOnCurve(b []byte) bool {
+	_, err := new(edwards25519.Point).SetBytes(b)
+	return err == nil
 }

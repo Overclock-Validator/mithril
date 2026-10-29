@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	narya "github.com/Overclock-Validator/narya-ed25519/ed25519"
 	"github.com/gagliardetto/solana-go"
 	"golang.org/x/net/ipv4"
@@ -47,7 +48,9 @@ type retransmitRepairPeerSource interface {
 // RetransmitConfig supplies the live gossip and epoch-stake view needed to
 // derive this validator's position in Agave's deterministic Turbine tree.
 type RetransmitConfig struct {
-	Identity     ed25519.PrivateKey
+	// Identity places this node in the Turbine tree and re-signs Alpenglow
+	// shreds; it is read per shred so a set-identity swap takes effect at once.
+	Identity     *identity.Holder
 	Peers        TVUPeerSource
 	Stakes       func(slot uint64) map[solana.PublicKey]uint64
 	EpochForSlot func(slot uint64) uint64
@@ -56,6 +59,9 @@ type RetransmitConfig struct {
 	DedupAddrs   bool
 	Workers      int
 	QueueDepth   int
+	// ShredReceivers get a copy of every shred this node relays, in addition
+	// to its Turbine children, such as a block builder on the same host.
+	ShredReceivers []*net.UDPAddr
 }
 
 type retransmitWork struct {
@@ -73,6 +79,7 @@ type retransmitPacket [packetDataSize]byte
 
 type cachedRetransmitNodes struct {
 	asof  time.Time
+	self  solana.PublicKey
 	nodes *ClusterNodes
 }
 
@@ -179,6 +186,8 @@ type Retransmitter struct {
 	parentSourceDirectLeader atomic.Uint64
 	parentSourceRepairSocket atomic.Uint64
 	parentSourceUnexplained  atomic.Uint64
+	shredReceiverSent        atomic.Uint64
+	shredReceiverFailed      atomic.Uint64
 	rootDistance             [maxTurbineHops]atomic.Uint64
 }
 
@@ -216,9 +225,13 @@ type RetransmitStats struct {
 	ParentSourceRepairSocket uint64
 	ParentSourceUnexplained  uint64
 	SendBufferBytes          int
-	LastSendDiagnostic       string
-	LastParentDiagnostic     string
-	RootDistance             [maxTurbineHops]uint64
+	// ShredReceiverSent and ShredReceiverFailed count copies to the
+	// configured shred receivers.
+	ShredReceiverSent    uint64
+	ShredReceiverFailed  uint64
+	LastSendDiagnostic   string
+	LastParentDiagnostic string
+	RootDistance         [maxTurbineHops]uint64
 }
 
 func NewRetransmitter(cfg RetransmitConfig) (*Retransmitter, error) {
@@ -255,8 +268,8 @@ func NewRetransmitter(cfg RetransmitConfig) (*Retransmitter, error) {
 }
 
 func newRetransmitterWithSenders(cfg RetransmitConfig, senders []packetBatchSender) (*Retransmitter, error) {
-	if len(cfg.Identity) != ed25519.PrivateKeySize {
-		return nil, fmt.Errorf("turbine retransmit identity has invalid size %d", len(cfg.Identity))
+	if cfg.Identity == nil {
+		return nil, errors.New("turbine retransmit requires an identity")
 	}
 	if cfg.Peers == nil {
 		return nil, errors.New("turbine retransmit peer source is required")
@@ -271,12 +284,8 @@ func newRetransmitterWithSenders(cfg RetransmitConfig, senders []packetBatchSend
 	if queueDepth <= 0 {
 		queueDepth = defaultRetransmitQueueDepth
 	}
-	pubkey := cfg.Identity.Public().(ed25519.PublicKey)
-	var self solana.PublicKey
-	copy(self[:], pubkey)
 	return &Retransmitter{
 		cfg:     cfg,
-		self:    self,
 		queue:   make(chan retransmitWork, queueDepth),
 		senders: senders,
 		cache:   make(map[uint64]cachedRetransmitNodes),
@@ -368,7 +377,7 @@ func (r *Retransmitter) SubmitFrom(packet []byte, shred *Shred, leader solana.Pu
 		r.oldShreds.Add(1)
 		return nil
 	}
-	if leader == r.self {
+	if leader == r.cfg.Identity.PublicKey() {
 		r.loopbacks.Add(1)
 		return nil
 	}
@@ -401,7 +410,7 @@ func (r *Retransmitter) SubmitFrom(packet []byte, shred *Shred, leader solana.Pu
 	}
 	out, storage := r.copyPacket(packet[:packetSize])
 	if root != nil {
-		signature := ed25519.Sign(r.cfg.Identity, root[:])
+		signature := r.cfg.Identity.Current().Sign(root[:])
 		copy(out[offset:offset+ed25519.SignatureSize], signature)
 		r.resignedShreds.Add(1)
 	}
@@ -497,9 +506,22 @@ func (r *Retransmitter) send(work retransmitWork, sender packetBatchSender, scra
 	}
 	if len(peers) == 0 {
 		r.noPeers.Add(1)
+	} else {
+		r.sendToPeers(work.packet, peers, sender)
+	}
+	// After the fanout, so receivers never delay it. A leaf forwards too.
+	r.sendToShredReceivers(work.packet, sender)
+}
+
+func (r *Retransmitter) sendToShredReceivers(packet []byte, sender packetBatchSender) {
+	receivers := r.cfg.ShredReceivers
+	if len(receivers) == 0 {
 		return
 	}
-	r.sendToPeers(work.packet, peers, sender)
+	sent, _ := sender.Send(packet, receivers)
+	sent = min(max(sent, 0), len(receivers))
+	r.shredReceiverSent.Add(uint64(sent))
+	r.shredReceiverFailed.Add(uint64(len(receivers) - sent))
 }
 
 func (r *Retransmitter) sendToPeers(packet []byte, peers []*net.UDPAddr, sender packetBatchSender) {
@@ -576,14 +598,15 @@ func (r *Retransmitter) clusterNodesForSlot(slot uint64) *ClusterNodes {
 		key = r.cfg.EpochForSlot(slot)
 	}
 	now := time.Now()
+	self := r.cfg.Identity.PublicKey()
 	r.cacheMu.Lock()
 	defer r.cacheMu.Unlock()
-	if entry, ok := r.cache[key]; ok && now.Sub(entry.asof) < retransmitNodesCacheTTL {
+	if entry, ok := r.cache[key]; ok && entry.self == self && now.Sub(entry.asof) < retransmitNodesCacheTTL {
 		return entry.nodes
 	}
 	stakes := r.cfg.Stakes(slot)
 	nodes := NewRetransmitClusterNodes(ClusterNodesConfig{
-		Self:         r.self,
+		Self:         self,
 		SelfTVU:      r.cfg.Peers.SelfTVUAddr(),
 		TVUPeers:     r.cfg.Peers.TVUPeers(),
 		Stakes:       stakes,
@@ -600,7 +623,7 @@ func (r *Retransmitter) clusterNodesForSlot(slot uint64) *ClusterNodes {
 		}
 		delete(r.cache, oldestKey)
 	}
-	r.cache[key] = cachedRetransmitNodes{asof: now, nodes: nodes}
+	r.cache[key] = cachedRetransmitNodes{asof: now, self: self, nodes: nodes}
 	return nodes
 }
 
@@ -789,6 +812,8 @@ func (r *Retransmitter) Stats() RetransmitStats {
 		ParentSourceRepairSocket: r.parentSourceRepairSocket.Load(),
 		ParentSourceUnexplained:  r.parentSourceUnexplained.Load(),
 		SendBufferBytes:          r.sendBufferBytes,
+		ShredReceiverSent:        r.shredReceiverSent.Load(),
+		ShredReceiverFailed:      r.shredReceiverFailed.Load(),
 	}
 	r.diagnosticMu.Lock()
 	stats.LastSendDiagnostic = r.lastSendDiag

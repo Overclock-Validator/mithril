@@ -233,6 +233,8 @@ func TestSchedulerSkipsWhenSlotEntryBytesExceeded(t *testing.T) {
 	for sched.Stats().DroppedCost == 0 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
+	// Wait for the drain loop to return any temporarily popped entries.
+	sched.Stop()
 	require.Equal(t, uint64(1), sched.Stats().DroppedCost)
 	require.Equal(t, uint64(1), sched.Stats().DroppedBatchBytes)
 	require.Equal(t, uint64(0), sched.Stats().Accepted)
@@ -299,4 +301,37 @@ func TestClassifyBufferedExpired(t *testing.T) {
 	defer env.Close()
 	require.Equal(t, blockprod.BufferedExpired, env.Bank.ClassifyBuffered(solana.Hash{0x01}, [32]byte{}))
 	require.Equal(t, blockprod.BufferedKeep, env.Bank.ClassifyBuffered(txfixture.TestBlockhash(), [32]byte{0xab}))
+}
+
+func TestSchedulerHoldsGatedBankUntilAllowTPU(t *testing.T) {
+	env := blockprod.NewTestEnv(blockprod.TestEnvConfig{TPUGated: true})
+	defer env.Close()
+
+	sched := New(env.Controller)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sched.Start(ctx)
+	defer sched.Stop()
+
+	sched.Receive(packet.Owned(txfixture.MustSignedTransferWire(0)))
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for sched.Buffered() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	require.Equal(t, 1, sched.Buffered())
+
+	// A published but gated bank is treated like no bank.
+	time.Sleep(50 * time.Millisecond)
+	require.Equal(t, 1, sched.Buffered())
+	require.Equal(t, uint64(0), sched.Stats().Accepted)
+	require.Empty(t, env.Bank.ForgedTransactions())
+
+	env.Bank.AllowTPU()
+
+	deadline = time.Now().Add(2 * time.Second)
+	for sched.Stats().Accepted == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	require.Equal(t, uint64(1), sched.Stats().Accepted)
+	require.Len(t, env.Bank.ForgedTransactions(), 1)
 }
