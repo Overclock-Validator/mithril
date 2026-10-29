@@ -33,7 +33,7 @@ const (
 // extractTokenBalances walks the supplied transaction accounts and emits
 // a TokenBalancePayload for each one that is recognized as an SPL Token
 // account. mintDecimals is consulted for the per-mint decimal count;
-// callers populate it from the supplied account reader. Missing decimals fall back to 0
+// callers populate it from the selected bank. Missing decimals fall back to 0
 // rather than skipping the account so pre/post arrays stay aligned with
 // the transaction's account index.
 func extractTokenBalances(
@@ -75,7 +75,7 @@ func extractTokenBalances(
 }
 
 // fetchMintDecimals collects the unique mints referenced by token
-// accounts in txAccts and looks each one up in the supplied account view to extract its
+// accounts in txAccts and looks each one up in the captured bank to extract its
 // decimals byte. Mints that fail the size check or aren't found are
 // omitted; callers default missing entries to 0.
 func fetchMintDecimals(

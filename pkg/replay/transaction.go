@@ -707,6 +707,13 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 }
 
 func processTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, tx *solana.Transaction, txMeta *rpc.TransactionMeta, dbgOpts *DebugOptions, arena *arena.Arena[sealevel.BorrowedAccount], shouldVerifySignatures bool, capture *transactionMetadataCapture) (feeInfo *fees.TxFeeInfo, computeUnits uint64, executionErr error) {
+	return processTransactionWithResult(slotCtx, sigverifyWg, tx, txMeta, dbgOpts, arena, shouldVerifySignatures, capture, nil)
+}
+
+func processTransactionWithResult(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, tx *solana.Transaction, txMeta *rpc.TransactionMeta, dbgOpts *DebugOptions, arena *arena.Arena[sealevel.BorrowedAccount], shouldVerifySignatures bool, capture *transactionMetadataCapture, result *transactionResultCapture) (feeInfo *fees.TxFeeInfo, computeUnits uint64, executionErr error) {
+	if result != nil {
+		*result = transactionResultCapture{}
+	}
 	if capture != nil {
 		*capture = transactionMetadataCapture{budget: capture.budget}
 	}
@@ -780,6 +787,13 @@ func processTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 		RecordInnerInstructions: metadata != nil,
 	}
 	output := LoadAndExecuteTransaction(input)
+	if result != nil {
+		defer func() {
+			if feeInfo != nil {
+				result.finish(tx, output.ProcessingResult.TransactionError)
+			}
+		}()
+	}
 	if metadata != nil {
 		defer func() {
 			if feeInfo == nil {

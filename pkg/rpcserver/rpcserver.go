@@ -20,7 +20,10 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/blockhistory"
 	"github.com/Overclock-Validator/mithril/pkg/epochrewards"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/Overclock-Validator/mithril/pkg/replay"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
+	"github.com/Overclock-Validator/mithril/pkg/transactionhistory"
+	"github.com/Overclock-Validator/mithril/pkg/txstatus"
 	"github.com/filecoin-project/go-jsonrpc"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
@@ -47,7 +50,9 @@ type rpcMethods interface {
 	GetIdentity(context.Context, jsonrpc.RawParams) (GetIdentityResp, error)
 	GetLatestBlockhash(context.Context, jsonrpc.RawParams) (GetLatestBlockhashResp, error)
 	GetLeaderSchedule(context.Context, jsonrpc.RawParams) (map[string][]uint64, error)
+	GetSignatureStatuses(context.Context, jsonrpc.RawParams) (GetSignatureStatusesResp, error)
 	GetSlot(context.Context, jsonrpc.RawParams) (uint64, error)
+	GetTransaction(context.Context, jsonrpc.RawParams) (*GetTransactionResp, error)
 	GetVoteAccounts(context.Context, jsonrpc.RawParams) (GetVoteAccountsResp, error)
 	GetVersion(context.Context, jsonrpc.RawParams) (GetVersionResp, error)
 	MinimumLedgerSlot(context.Context, jsonrpc.RawParams) (uint64, error)
@@ -59,34 +64,44 @@ type RpcServer struct {
 	historyRecoveryMu      sync.RWMutex
 	historyRecoveryPending bool
 
-	isReady       bool
-	rpcService    *jsonrpc.RPCServer
-	serv          *httptest.Server
-	listener      net.Listener
-	acctsDb       *accountsdb.AccountsDb
-	epochSchedule *sealevel.SysvarEpochSchedule
-	slotCtx       *sealevel.SlotCtx
-	slotCtxMu     sync.RWMutex
-	healthSlot    func() (uint64, bool)
-	healthReady   bool
-	genesisHash   string
-	epochRewards  *epochrewards.Store
-	blockHistory  *blockhistory.Store
-	rootedBank    atomic.Pointer[rootedBankState]
-	identity      string
+	isReady              bool
+	rpcService           *jsonrpc.RPCServer
+	serv                 *httptest.Server
+	listener             net.Listener
+	acctsDb              *accountsdb.AccountsDb
+	epochSchedule        *sealevel.SysvarEpochSchedule
+	slotCtx              *sealevel.SlotCtx
+	slotCtxMu            sync.RWMutex
+	healthSlot           func() (uint64, bool)
+	healthReady          bool
+	executionGeneration  uint64
+	executionInvalidated bool
+	simulationOnce       sync.Once
+	simulationCalls      chan struct{}
+	genesisHash          string
+	epochRewards         *epochrewards.Store
+	blockHistory         *blockhistory.Store
+	rootedBank           atomic.Pointer[rootedBankState]
+	identity             string
+	identitySource       func() string
 
-	identitySource func() string
-
-	stakeCacheOnce  sync.Once
-	stakeCache      rootedStakeCache
-	voteRecordsOnce sync.Once
-	voteRecords     rootedVoteRecordCache
+	stakeCacheOnce              sync.Once
+	stakeCache                  rootedStakeCache
+	voteRecordsOnce             sync.Once
+	voteRecords                 rootedVoteRecordCache
+	transactionHistory          *transactionhistory.Store
+	transactionHistoryReads     chan struct{}
+	transactionHistoryResponses chan struct{}
+	queryResponses              chan struct{}
+	resultCache                 *txstatus.ResultCache
+	lifecycleMu                 sync.Mutex
+	lifecycle                   *rpcServerLifecycle
+	lifecycleStopped            bool
 
 	leaderTPUCacheMu         sync.RWMutex
 	leaderTPUByIdentity      map[solana.PublicKey]tpuEndpoint
 	leaderTPUCacheUpdatedAt  time.Time
 	clusterNodesRefreshEvery time.Duration
-	clusterNodesRefreshOnce  sync.Once
 
 	clusterRPCEndpoints []string
 	clusterNodesFetcher clusterNodesFetcher
@@ -102,6 +117,9 @@ type rootedBankState struct {
 	Slot             uint64
 	BlockHeight      uint64
 	TransactionCount uint64
+	executionBank    *replay.ChainTipSnapshot
+	executionVersion uint64
+	executionReady   bool
 }
 
 const maxQuietMethodProbeBody = 64 << 10
@@ -121,7 +139,9 @@ var supportedRPCMethods = map[string]struct{}{
 	"getIdentity":            {},
 	"getLatestBlockhash":     {},
 	"getLeaderSchedule":      {},
+	"getSignatureStatuses":   {},
 	"getSlot":                {},
+	"getTransaction":         {},
 	"getVoteAccounts":        {},
 	"getVersion":             {},
 	"minimumLedgerSlot":      {},
@@ -308,6 +328,39 @@ func (rpcServer *RpcServer) SetRootedBankState(slot, blockHeight, transactionCou
 	})
 }
 
+// SetRootedExecutionBank completes the matching durable publication. An old or
+// incomplete bank must never replace a newer root's execution parameters.
+func (rpcServer *RpcServer) SetRootedExecutionBank(bank *replay.ChainTipSnapshot) {
+	if rpcServer == nil || bank == nil {
+		return
+	}
+	for {
+		root := rpcServer.rootedBank.Load()
+		if root == nil || root.Slot != bank.Slot || root.BlockHeight != bank.BlockHeight {
+			return
+		}
+		next := *root
+		next.executionBank = bank
+		if rpcServer.acctsDb != nil {
+			next.executionVersion, next.executionReady = rpcServer.acctsDb.CommittedAccountVersion()
+			// A restored snapshot has no process-local write yet. Later legacy
+			// publications must bind the account version to this exact bankhash,
+			// even when the asynchronous queue drained before publication.
+			if !rpcServer.acctsDb.RootedDurable && next.executionVersion != 0 {
+				next.executionVersion, next.executionReady = rpcServer.legacySimulationVersion(bank)
+			}
+			next.executionReady = next.executionReady && !rpcServer.rootedPublicationPending(bank.Slot)
+		}
+		if rpcServer.rootedBank.CompareAndSwap(root, &next) {
+			rpcServer.slotCtxMu.Lock()
+			rpcServer.executionGeneration++
+			rpcServer.executionInvalidated = false
+			rpcServer.slotCtxMu.Unlock()
+			return
+		}
+	}
+}
+
 func (rpcServer *RpcServer) getRootedBankState() (rootedBankState, bool) {
 	rooted := rpcServer.rootedBank.Load()
 	if rooted == nil {
@@ -382,7 +435,7 @@ func waitForRootedPublication(ctx context.Context) error {
 
 func NewRpcServer(acctsDb *accountsdb.AccountsDb, port uint16, epochSchedule *sealevel.SysvarEpochSchedule, genesisHash solana.Hash) *RpcServer {
 	var err error
-	rpcServer := &RpcServer{genesisHash: genesisHash.String()}
+	rpcServer := &RpcServer{genesisHash: genesisHash.String(), queryResponses: make(chan struct{}, 2)}
 
 	addrStr := fmt.Sprintf("0.0.0.0:%d", port)
 	rpcServer.listener, err = net.Listen("tcp", addrStr)
@@ -432,6 +485,8 @@ func (rpcServer *RpcServer) SetSlotCtx(slotCtx *sealevel.SlotCtx) {
 	rpcServer.slotCtxMu.Lock()
 	rpcServer.slotCtx = slotCtx
 	rpcServer.healthReady = slotCtx != nil
+	rpcServer.executionGeneration++
+	rpcServer.executionInvalidated = slotCtx == nil
 	rpcServer.slotCtxMu.Unlock()
 }
 
@@ -447,15 +502,32 @@ func (rpcServer *RpcServer) getSlotCtx() *sealevel.SlotCtx {
 	return rpcServer.slotCtx
 }
 
-func (rpcServer *RpcServer) Start() {
-	rpcServer.startClusterNodesRefreshLoop()
-	go http.Serve(rpcServer.listener, rpcServer)
-}
-
 func (rpcServer *RpcServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Match go-jsonrpc's upgrade dispatch so optional owned profiles cannot
+	// create hijacked connections that Shutdown cannot join.
+	if rpcServer.requiresHTTPOnly() && strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade") {
+		http.Error(w, "optional RPC profile requires HTTP without upgrades", http.StatusBadRequest)
+		return
+	}
 	if quietNonRPCProbe(w, r) || writeQuietRPCProbeError(w, r) {
 		return
 	}
+	// Mixed batches share a deadline across both response owners.
+	deadline := time.Now().Add(historyResponseTimeout)
+	queryResponse := newResponseOwner(r.Context(), w, rpcServer.queryResponses, deadline)
+	if queryResponse != nil {
+		r = r.WithContext(context.WithValue(r.Context(), queryResponseKey{}, queryResponse))
+	}
+	var historyResponse *historyResponseOwner
+	if rpcServer.transactionHistory != nil {
+		historyResponse = newResponseOwner(r.Context(), w, rpcServer.transactionHistoryResponses, deadline)
+		r = r.WithContext(context.WithValue(r.Context(), historyResponseKey{}, historyResponse))
+	}
+	defer func() {
+		if err := finalizeResponseOwners(queryResponse, historyResponse); err != nil {
+			mlog.Log.Debugf("RPC response write failed: %v", err)
+		}
+	}()
 	rpcServer.rpcService.ServeHTTP(w, r)
 }
 
@@ -604,27 +676,31 @@ func readQuietMethodProbeBody(r *http.Request) ([]byte, bool) {
 	return body, true
 }
 
-func (rpcServer *RpcServer) startClusterNodesRefreshLoop() {
-	rpcServer.clusterNodesRefreshOnce.Do(func() {
-		if rpcServer.clusterNodesFetcher == nil && len(rpcServer.clusterRPCEndpoints) == 0 {
-			return
+func (rpcServer *RpcServer) startClusterNodesRefreshLoop(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
+	if rpcServer.clusterNodesFetcher == nil && len(rpcServer.clusterRPCEndpoints) == 0 {
+		close(done)
+		return done
+	}
+	go func() {
+		defer close(done)
+		if err := rpcServer.refreshLeaderTPUCache(ctx); err != nil && ctx.Err() == nil {
+			mlog.Log.Warnf("sendTransaction: initial cluster node refresh failed: %v", err)
 		}
-
-		go func() {
-			if err := rpcServer.refreshLeaderTPUCache(context.Background()); err != nil {
-				mlog.Log.Warnf("sendTransaction: initial cluster node refresh failed: %v", err)
-			}
-
-			ticker := time.NewTicker(rpcServer.clusterNodesRefreshInterval())
-			defer ticker.Stop()
-
-			for range ticker.C {
-				if err := rpcServer.refreshLeaderTPUCache(context.Background()); err != nil {
+		ticker := time.NewTicker(rpcServer.clusterNodesRefreshInterval())
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := rpcServer.refreshLeaderTPUCache(ctx); err != nil && ctx.Err() == nil {
 					mlog.Log.Warnf("sendTransaction: periodic cluster node refresh failed: %v", err)
 				}
 			}
-		}()
-	})
+		}
+	}()
+	return done
 }
 
 func (rpcServer *RpcServer) clusterNodesRefreshInterval() time.Duration {

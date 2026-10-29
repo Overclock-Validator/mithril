@@ -223,13 +223,16 @@ curl http://YOUR_MITHRIL_IP:8899 -X POST -H "Content-Type: application/json" -d 
 - `getBankHash` - Get bankhash for a slot (Mithril extension, not standard Solana RPC)
 - `getBlockHeight` - Get current block height
 - `getBlockProduction` - Get produced and assigned block counts by validator
+- `getBlock` - Get retained block summaries or recorded transactions
 - `getEpochInfo` - Get current epoch info
 - `getInflationReward` - Get retained inflation rewards for an epoch
 - `getGenesisHash` - Get the cluster genesis hash
 - `getLatestBlockhash` - Get recent blockhash
 - `getLeaderSchedule` - Get the leader schedule for an epoch
+- `getSignatureStatuses` - Look up recent signature outcomes or retained receipts
 - `getSlot` - Get the slot at the requested commitment (defaults to finalized)
 - `getVoteAccounts` - Get current and delinquent vote accounts
+- `getTransaction` - Get a recorded transaction by its first signature
 - `sendTransaction` - Submit a signed transaction
 - `simulateTransaction` - Simulate a transaction
 
@@ -248,6 +251,11 @@ progress; pruned history returns `-32001`, and unknown history returns `-32004`.
 On Alpenglow, `processed` uses the live replay slot; `confirmed` and `finalized`
 use the published rooted slot. If that slot is below `minContextSlot`, the request
 returns error `-32016` with the available slot in `data.contextSlot`.
+
+Full transaction responses and recent signature statuses are separate opt-in
+settings for an Alpenglow verifying node. See [transaction history and signature
+statuses](docs/transaction-history.md) for setup, supported fields, retention and
+failure behavior.
 
 ### Current Limitations
 

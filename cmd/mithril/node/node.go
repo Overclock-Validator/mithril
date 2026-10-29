@@ -54,6 +54,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/statsd"
 	"github.com/Overclock-Validator/mithril/pkg/tpu"
 	"github.com/Overclock-Validator/mithril/pkg/turbine"
+	"github.com/Overclock-Validator/mithril/pkg/txstatus"
 	"github.com/Overclock-Validator/mithril/pkg/version"
 	solana "github.com/gagliardetto/solana-go"
 	solrpc "github.com/gagliardetto/solana-go/rpc"
@@ -147,7 +148,9 @@ var (
 	paramArenaSizeMB         uint64
 	borrowedAccountArenaSize uint64
 
-	rpcPort int
+	rpcPort               int
+	rpcTransactionHistory transactionHistoryConfig
+	rpcSignatureStatuses  bool
 
 	// Lightbringer sidecar config
 	lightbringerEnabled          bool
@@ -559,6 +562,11 @@ func init() {
 
 	// [rpc] section flags (Mithril's RPC server)
 	Run.Flags().IntVar(&rpcPort, "rpc-port", 0, "RPC server port. Default off.")
+	Run.Flags().BoolVar(&rpcTransactionHistory.Enabled, "rpc-transaction-history", false, "Retain full transaction history on an Alpenglow verifying node; RPC becomes HTTP-only")
+	Run.Flags().BoolVar(&rpcSignatureStatuses, "rpc-signature-statuses", false, "Serve bounded recent signature outcomes on an Alpenglow verifying node; RPC becomes HTTP-only")
+	Run.Flags().Int64Var(&rpcTransactionHistory.RetentionSlots, "rpc-transaction-history-slots", 16384, "Maximum transaction history age in slots")
+	Run.Flags().Int64Var(&rpcTransactionHistory.MaxMiB, "rpc-transaction-history-max-mib", 1024, "Logical transaction history budget in MiB (not a physical disk quota)")
+	Run.Flags().Int64Var(&rpcTransactionHistory.ReserveMiB, "rpc-transaction-history-reserve-mib", 2048, "Minimum free disk space for transaction history writes in MiB")
 
 	// [replay] section flags
 	Run.Flags().Int64Var(&txParallelism, "txpar", 0, "Transaction execution workers (>0 enables topsort parallelism; explicit 0 is sequential; unset validator mode defaults to 2x CPU cores)")
@@ -914,6 +922,19 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		// scheduled block production on the shared verified consensus pipeline.
 	default:
 		return fmt.Errorf("unknown consensus.mode %q (valid: \"verifying\", \"validator\")", consensusMode)
+	}
+	rpcTransactionHistory = transactionHistoryConfig{
+		Enabled:        getBool("rpc-transaction-history", "rpc.transaction_history"),
+		RetentionSlots: getInt64("rpc-transaction-history-slots", "rpc.transaction_history_slots"),
+		MaxMiB:         getInt64("rpc-transaction-history-max-mib", "rpc.transaction_history_max_mib"),
+		ReserveMiB:     getInt64("rpc-transaction-history-reserve-mib", "rpc.transaction_history_reserve_mib"),
+	}
+	rpcSignatureStatuses = getBool("rpc-signature-statuses", "rpc.signature_statuses")
+	if err := validateSignatureStatuses(rpcSignatureStatuses, cluster, consensusMode, rpcPort); err != nil {
+		return err
+	}
+	if err := rpcTransactionHistory.validate(cluster, consensusMode, rpcPort); err != nil {
+		return err
 	}
 	resolvedTxParallelism := txParallelismForMode(consensusMode, txParallelism, txParallelismExplicit, runtime.NumCPU())
 	if resolvedTxParallelism != txParallelism {
@@ -1361,6 +1382,12 @@ func runLive(c *cobra.Command, args []string) {
 	alpenglowMode, protocolErr := resolveProtocolMode(cluster, config.GetString("consensus.protocol"))
 	if protocolErr != nil {
 		klog.Fatalf("%v", protocolErr)
+	}
+	if err := validateSignatureStatuses(rpcSignatureStatuses, cluster, consensusMode, rpcPort); err != nil {
+		klog.Fatalf("invalid signature status configuration: %v", err)
+	}
+	if err := rpcTransactionHistory.validate(cluster, consensusMode, rpcPort); err != nil {
+		klog.Fatalf("invalid transaction history configuration: %v", err)
 	}
 	if pprofPort != -1 {
 		startPprofHandlers(int(pprofPort))
@@ -2652,12 +2679,26 @@ postBootstrap:
 		}
 	}
 
+	resultCache, resultSession, resultErr := newNodeTransactionResults(rpcSignatureStatuses,
+		cluster, consensusMode, rpcPort, mithrilState, resumeState)
+	if resultErr != nil {
+		klog.Fatalf("unable to initialize signature statuses: %v", resultErr)
+	}
+	historyStore, historySession, historyErr := openNodeTransactionHistory(rpcTransactionHistory,
+		cluster, consensusMode, rpcPort, accountsPath, networkGenesisHash)
+	if historyErr != nil {
+		klog.Fatalf("unable to open transaction history: %v", historyErr)
+	}
 	var rpcServer *rpcserver.RpcServer
 	if rpcPort < 0 || rpcPort > 65535 {
 		klog.Fatalf("invalid port: %d", rpcPort)
 	} else if rpcPort != 0 {
 		schedule := epochScheduleFromState(mithrilState)
 		rpcServer = rpcserver.NewRpcServer(accountsDb, uint16(rpcPort), schedule, solana.MustHashFromBase58(networkGenesisHash))
+		rpcServer.InitTransactionHistory(historyStore)
+		if err := rpcServer.InitTransactionResults(resultCache); err != nil {
+			klog.Fatalf("configure signature statuses: %v", err)
+		}
 		if alpenglowMode {
 			if schedule == nil || schedule.SlotsPerEpoch == 0 || schedule.SlotsPerEpoch > math.MaxUint64/3 {
 				klog.Fatalf("Alpenglow RPC requires a valid epoch schedule")
@@ -2671,9 +2712,19 @@ postBootstrap:
 			klog.Fatalf("enable RPC block history: %v", err)
 		}
 		publishRPCBankState(rpcServer, mithrilState)
+		publishRPCExecutionBank(ctx, rpcServer, accountsDb, mithrilState, resumeState, alpenglowMode)
 		rpcServer.SetIdentitySource(func() string { return validatorIdentity.PublicKey().String() })
-		rpcServer.Start()
+		if err := rpcServer.Start(); err != nil {
+			klog.Fatalf("start RPC server: %v", err)
+		}
 		mlog.Log.Infof("Started RPC server on port %d", rpcPort)
+		if resultCache != nil {
+			mlog.Log.Infof("Signature statuses enabled: HTTP only, bounded recent outcomes; retained gaps may return unavailable")
+		}
+		if historyStore != nil {
+			mlog.Log.Infof("Transaction history enabled: HTTP only, retention_slots=%d logical_budget_mib=%d free_reserve_mib=%d",
+				rpcTransactionHistory.RetentionSlots, rpcTransactionHistory.MaxMiB, rpcTransactionHistory.ReserveMiB)
+		}
 	}
 
 	// The Alpenglow observer is forkchoice authority in both Alpenglow modes.
@@ -3037,8 +3088,10 @@ postBootstrap:
 	}
 
 	consensusOpts := &replay.ConsensusOpts{
-		Alpenglow: alpenglowMode,
-		Engine:    consensusEngine,
+		Alpenglow:          alpenglowMode,
+		Engine:             consensusEngine,
+		TransactionHistory: historySession,
+		TransactionResults: resultSession,
 	}
 	if alpenglowMode {
 		consensusOpts.TransactionStatusCheckpointAfterCommit = func(selected *state.TransactionStatusCheckpointRef) error {
@@ -3196,7 +3249,14 @@ postBootstrap:
 	}
 
 	mlog.Log.Infof("Done replaying, closing DB")
+	rpcJoined, rpcCloseErr := stopNodeOptionalRPC(rpcServer, historySession, historyStore, resultSession)
+	if !rpcJoined {
+		klog.Fatalf("optional RPC shutdown did not join all users; databases left open until process exit: %v", rpcCloseErr)
+	}
 	accountsDb.CloseDb()
+	if rpcCloseErr != nil {
+		klog.Fatalf("optional RPC shutdown failed: %v", rpcCloseErr)
+	}
 }
 
 type turbineEntrypointQuery func(*net.UDPAddr, time.Duration) (gossip.EchoResponse, error)
@@ -4521,12 +4581,8 @@ func rewindStoreBelowDivergence(accountsDbPath string, accountsDb *accountsdb.Ac
 		mlog.Log.Errorf("fork switch: rewind to boundary %d failed: %v; halting", target, err)
 		return false
 	}
-
 	mlog.Log.Warnf("fork switch: superseded slot %d was already folded (R=%d); rewound durable state to boundary %d (%d batches / %d keys undone)",
 		divSlot, oldRooted, res.NewThrough, res.UndoneBatches, res.UndoneKeys)
-	if hasHistoryGate {
-		historyGate.SetHistoryRecoveryPending(false)
-	}
 	return true
 }
 
@@ -4569,6 +4625,11 @@ func runReplayWithRecovery(
 	replayStartTime time.Time, // Start time for resume context
 ) *replay.ReplayResult {
 	var result *replay.ReplayResult
+	var transactionResults *replay.TransactionResultSession
+	if consensusOpts != nil {
+		transactionResults = consensusOpts.TransactionResults
+	}
+	defer transactionResults.Invalidate()
 
 	// Create callback to write state immediately on cancellation
 	// This eliminates the timing window between bankhash persistence and state file update
@@ -4735,6 +4796,9 @@ func runReplayWithRecovery(
 		if key == "" { // neither retryable branch-switch/finality-mismatch type
 			break
 		}
+		if gate, ok := rpcServer.(interface{ SetHistoryRecoveryPending(bool) }); ok {
+			gate.SetHistoryRecoveryPending(true)
+		}
 		if seenDiv[key] {
 			if certSwitch != nil {
 				mlog.Log.Errorf("fork switch: repeated branch selection at slot %d after re-replay — recovery did not converge; halting", divSlot)
@@ -4754,7 +4818,8 @@ func runReplayWithRecovery(
 		// store to the newest retained fold boundary BELOW the divergence first
 		// (this is exactly why durable state deliberately lags and undo pointers
 		// are retained for a horizon). Beyond the horizon -> fail closed.
-		if divSlot <= mithrilState.LastRootedSlot {
+		rewound := divSlot <= mithrilState.LastRootedSlot
+		if rewound {
 			if !rewindStoreBelowDivergence(accountsDbPath, accountsDb, mithrilState, divSlot, rewindHorizon, rpcServer) {
 				break
 			}
@@ -4770,7 +4835,6 @@ func runReplayWithRecovery(
 			mlog.Log.Errorf("fork switch: no rooted checkpoint context to re-replay from; halting")
 			break
 		}
-		publishRPCBankState(rpcServer, mithrilState)
 		if mithrilState.LastRootedSlot > prevRooted { // progress since last attempt -> fresh budget
 			attempt = 0
 			prevRooted = mithrilState.LastRootedSlot
@@ -4799,11 +4863,12 @@ func runReplayWithRecovery(
 				stakes[e] = string(b)
 			}
 		}
-		rs, err := replay.ResumeStateFromRootedContext(mithrilState.LastRootedContext, stakes)
+		rs, err := finishReplayRecovery(rpcServer, mithrilState, transactionResults, stakes, rewound)
 		if err != nil {
 			mlog.Log.Errorf("fork switch: cannot rebuild resume context: %v; halting", err)
 			break
 		}
+		publishRPCExecutionBank(ctx, rpcServer, accountsDb, mithrilState, rs, consensusOpts != nil && consensusOpts.Alpenglow)
 		mlog.Log.Warnf("fork switch: %s; re-replaying the selected chain from rooted slot %d (attempt %d/%d)",
 			recoveryReason, retryStart-1, attempt, maxForkSwitchRetries)
 		result = replay.ReplayBlocks(ctx, accountsDb, accountsDbPath, mithrilState, rs, retryStart, endSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, turbineShredVersion, turbineAlpenglowAddr, turbineIdentity, blockDir, txParallelism, isLive, useLightbringer, useTurbine, dbgOpts, metricsWriter, rpcServer, blockFetchOpts, consensusOpts, onCancelWriteState)
@@ -4811,8 +4876,51 @@ func runReplayWithRecovery(
 	return result
 }
 
+// finishReplayRecovery reopens history after resume-state reconstruction and
+// RPC publication. Optional result-cache failures do not veto recovery.
+func finishReplayRecovery(rpcServer replay.SlotCtxSetter, s *state.MithrilState, results *replay.TransactionResultSession, stakes map[uint64]string, rewound bool) (*replay.ResumeState, error) {
+	if s == nil || s.LastRootedContext == nil || s.LastRootedContext.Slot != s.LastRootedSlot {
+		return nil, fmt.Errorf("rooted resume context does not match the durable root")
+	}
+	rs, err := replay.ResumeStateFromRootedContext(s.LastRootedContext, stakes)
+	if err != nil {
+		return nil, err
+	}
+	parent := txstatus.ResultBankID{Slot: rs.ParentSlot, Blockhash: rs.LastBlockhash}
+	if rewound {
+		err = results.Reset(parent)
+	} else {
+		err = results.Unwind(parent)
+	}
+	if err != nil {
+		mlog.Log.Debugf("transaction results unavailable after account recovery: %v", err)
+	}
+	publishRPCBankState(rpcServer, s)
+	if gate, ok := rpcServer.(interface{ SetHistoryRecoveryPending(bool) }); ok {
+		gate.SetHistoryRecoveryPending(false)
+	}
+	return rs, nil
+}
+
 type rpcBankStateSetter interface {
 	SetRootedBankState(slot, blockHeight, transactionCount uint64)
+}
+
+// publishRPCExecutionBank follows scalar-root publication. Reconstruction is
+// optional: unavailable execution metadata must not prevent ordinary replay.
+func publishRPCExecutionBank(ctx context.Context, server replay.SlotCtxSetter, db *accountsdb.AccountsDb, s *state.MithrilState, resume *replay.ResumeState, alpenglow bool) {
+	publisher, ok := server.(interface {
+		SetRootedExecutionBank(*replay.ChainTipSnapshot)
+	})
+	if !ok {
+		return
+	}
+	bank, err := replay.RootedRPCBankContext(ctx, db, s, resume, alpenglow)
+	if err != nil {
+		mlog.Log.Debugf("rooted RPC execution parameters unavailable: %v", err)
+		return
+	}
+	publisher.SetRootedExecutionBank(bank)
 }
 
 func publishRPCBankState(rpcServer rpcBankStateSetter, mithrilState *state.MithrilState) {

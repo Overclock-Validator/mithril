@@ -76,13 +76,13 @@ type InnerInstructionGroup struct {
 // InnerInstruction matches Agave's UiCompiledInstruction. `Data` is
 // base58-encoded; `StackHeight` is nil when not tracked. `StackHeight`
 // is `Option<u32>` in Agave's wire format; using *uint32 here so the
-// field's JSON-number range matches the spec exactly even though
-// real-world CPI depth never exceeds the 4-deep cap.
+// field's JSON-number range matches the spec exactly. Accounts uses a
+// non-byte slice so encoding/json emits numbers rather than base64.
 type InnerInstruction struct {
-	ProgramIdIndex uint8   `json:"programIdIndex"`
-	Accounts       []uint8 `json:"accounts"`
-	Data           string  `json:"data"`
-	StackHeight    *uint32 `json:"stackHeight"`
+	ProgramIdIndex uint8    `json:"programIdIndex"`
+	Accounts       []uint16 `json:"accounts"`
+	Data           string   `json:"data"`
+	StackHeight    *uint32  `json:"stackHeight"`
 }
 
 type ReplacementBlockhashPayload struct {
@@ -125,7 +125,7 @@ type simulateAccountsConfig struct {
 	encoding  string
 }
 
-func (rpcServer *RpcServer) SimulateTransaction(ctx context.Context, p jsonrpc.RawParams) (SimulateTransactionResp, error) {
+func (rpcServer *RpcServer) SimulateTransaction(ctx context.Context, p jsonrpc.RawParams) (response SimulateTransactionResp, responseErr error) {
 	metrics.GlobalSimulate.TotalCalls.Inc()
 	defer metrics.GlobalSimulate.HandlerLatency.AddTimingSince(time.Now())
 
@@ -213,28 +213,43 @@ func (rpcServer *RpcServer) SimulateTransaction(ctx context.Context, p jsonrpc.R
 		}
 	}
 
-	slotCtx := rpcServer.getSlotCtx()
-	if slotCtx == nil {
-		return SimulateTransactionResp{}, fmt.Errorf("node is not ready for simulation")
+	release, err := rpcServer.acquireSimulation(ctx)
+	if err != nil {
+		return SimulateTransactionResp{}, err
 	}
-	if conf.minContextSlot != nil && slotCtx.Slot < *conf.minContextSlot {
-		return SimulateTransactionResp{}, &MinContextSlotNotReachedError{
-			ContextSlot: slotCtx.Slot,
+	defer release()
+	var responseKeys []solana.PublicKey
+	if conf.accounts != nil {
+		for _, address := range conf.accounts.addresses {
+			if key, err := solana.PublicKeyFromBase58(address); err == nil {
+				responseKeys = append(responseKeys, key)
+			}
 		}
 	}
+	slotCtx, resolved, view, bank, lookupErr, err := rpcServer.prepareSimulation(ctx, tx, conf.commitment, conf.minContextSlot, responseKeys, true)
+	if err != nil {
+		return SimulateTransactionResp{}, err
+	}
+	defer func() {
+		if view.err != nil {
+			response, responseErr = SimulateTransactionResp{}, view.err
+		} else if err := ctx.Err(); err != nil {
+			response, responseErr = SimulateTransactionResp{}, err
+		}
+	}()
 
 	var replacementBlockhash *ReplacementBlockhashPayload
 	if conf.replaceRecentBlockhash {
-		bank := replay.ChainTipParentContext()
-		// Replay publishes the tip before the RPC execution context. Require
-		// the same bank-owned sysvars, not just a matching slot on another fork.
-		if bank.BankSysvars == nil || bank.BankSysvars != slotCtx.BankSysvars() || bank.Slot != slotCtx.Slot || bank.LastBlockhash != solana.Hash(slotCtx.Blockhash) || bank.LastBlockhash == (solana.Hash{}) || (bank.Slot > 0 && bank.BlockHeight == 0) {
+		if bank.Slot > 0 && bank.BlockHeight == 0 {
 			return SimulateTransactionResp{}, fmt.Errorf("simulation blockhash context is not available for slot %d", slotCtx.Slot)
 		}
 		if bank.BlockHeight > ^uint64(0)-sysvar.MaxProcessingAge {
 			return SimulateTransactionResp{}, fmt.Errorf("blockhash expiry height overflows at slot %d", slotCtx.Slot)
 		}
 		tx.Message.RecentBlockhash = bank.LastBlockhash
+		if resolved != nil {
+			resolved.Message.RecentBlockhash = bank.LastBlockhash
+		}
 		replacementBlockhash = &ReplacementBlockhashPayload{
 			Blockhash:            bank.LastBlockhash.String(),
 			LastValidBlockHeight: bank.BlockHeight + sysvar.MaxProcessingAge,
@@ -243,10 +258,11 @@ func (rpcServer *RpcServer) SimulateTransaction(ctx context.Context, p jsonrpc.R
 
 	// ALT resolve runs before sigVerify so the failure response carries the
 	// resolved loadedAddresses, not empty arrays.
-	if err := replay.ResolveAddrTableLookupsForTx(ctx, rpcServer.acctsDb, slotCtx.Slot, tx); err != nil {
+	if lookupErr != nil {
 		metrics.GlobalSimulate.AddressLookupFails.Inc()
-		return earlyFailResponse("AddressLookupTableNotFound", replacementBlockhash, conf, tx, slotCtx.Slot), nil
+		return earlyFailResponse(lookupErr, replacementBlockhash, conf, tx, slotCtx.Slot), nil
 	}
+	tx = resolved
 
 	// RuntimeTransaction::try_create sanitizes unconditionally in Agave's
 	// simulateTransaction path. Do the same after ALT resolution so malformed
@@ -316,8 +332,8 @@ func (rpcServer *RpcServer) SimulateTransaction(ctx context.Context, p jsonrpc.R
 			InnerInstructions:    nil,
 			PreBalances:          ptrSlice(preBalances),
 			PostBalances:         ptrSlice(postBalances),
-			PreTokenBalances:     ptrSliceTokenBalance(tokenBalancesFromAccounts(preAccountSnapshots, rpcServer.acctsDb, slotCtx.Slot)),
-			PostTokenBalances:    ptrSliceTokenBalance(tokenBalancesFromAccounts(postAccountSnapshots, rpcServer.acctsDb, slotCtx.Slot)),
+			PreTokenBalances:     ptrSliceTokenBalance(tokenBalancesFromAccounts(preAccountSnapshots, view, slotCtx.Slot)),
+			PostTokenBalances:    ptrSliceTokenBalance(tokenBalancesFromAccounts(postAccountSnapshots, view, slotCtx.Slot)),
 			LoadedAddresses:      loadedAddressesFromTx(tx),
 		},
 	}
@@ -439,7 +455,7 @@ func (rpcServer *RpcServer) SimulateTransaction(ctx context.Context, p jsonrpc.R
 			nullAccounts := make([]*AccountInfoPayload, len(conf.accounts.addresses))
 			resp.Value.Accounts = &nullAccounts
 		} else {
-			resp.Value.Accounts = renderRequestedAccounts(conf, output.ExecCtx, rpcServer.acctsDb, slotCtx.Slot)
+			resp.Value.Accounts = renderRequestedAccounts(conf, output.ExecCtx, view, slotCtx.Slot)
 		}
 	}
 
@@ -481,6 +497,9 @@ func parseSimulateConfig(params []json.RawMessage) (simulateTransactionConfig, e
 		conf.encoding = *options.Encoding
 	}
 	if options.Commitment != nil {
+		if err := validateTransactionCommitment(*options.Commitment); err != nil {
+			return conf, err
+		}
 		conf.commitment = *options.Commitment
 	}
 	conf.minContextSlot = options.MinContextSlot
@@ -699,7 +718,7 @@ func clampReturnData(data []byte) []byte {
 // completed (sigVerify-fail path), the resolved writable/readonly arrays
 // are emitted. For pre-ALT failures (ALT-not-found), tx may be nil or
 // not-yet-resolved, in which case loadedAddresses is the empty payload.
-func earlyFailResponse(errStr string, replacementBlockhash *ReplacementBlockhashPayload, conf simulateTransactionConfig, tx *solana.Transaction, slot uint64) SimulateTransactionResp {
+func earlyFailResponse(errStr any, replacementBlockhash *ReplacementBlockhashPayload, conf simulateTransactionConfig, tx *solana.Transaction, slot uint64) SimulateTransactionResp {
 	zeroUnits := uint64(0)
 	zeroSize := uint32(0)
 	emptyLogs := []string{}
@@ -751,7 +770,7 @@ func ptrSliceTokenBalance(s []TokenBalancePayload) *[]TokenBalancePayload {
 // renderRequestedAccounts builds the response slice for `accounts.addresses`
 // in caller-specified order. Lookup precedence:
 //  1. post-execution transaction context (most up-to-date for tx accounts)
-//  2. account-reader fallback (for addresses not touched by the transaction)
+//  2. captured bank accounts (for addresses NOT touched by the tx)
 //
 // Each entry is nil (JSON null) when the address can't be resolved.
 // Always returns a slice of length len(conf.accounts.addresses), matching
@@ -807,7 +826,7 @@ func renderRequestedAccounts(conf simulateTransactionConfig, execCtx *sealevel.E
 // renderInnerInstructions converts replay's inner-instruction shape into
 // the typed payload clients expect. Field encoding matches Agave:
 //   - data: base58 (not base64) — what UiCompiledInstruction emits
-//   - stackHeight: nil when not tracked, *uint8 when known
+//   - stackHeight: nil when not tracked, *uint32 when known
 func renderInnerInstructions(lists []replay.InnerInstructionsList) []InnerInstructionGroup {
 	if len(lists) == 0 {
 		return []InnerInstructionGroup{}
@@ -816,8 +835,10 @@ func renderInnerInstructions(lists []replay.InnerInstructionsList) []InnerInstru
 	for _, l := range lists {
 		instrs := make([]InnerInstruction, 0, len(l.Instructions))
 		for _, ix := range l.Instructions {
-			accts := make([]uint8, len(ix.Accounts))
-			copy(accts, ix.Accounts)
+			accts := make([]uint16, len(ix.Accounts))
+			for i, index := range ix.Accounts {
+				accts[i] = uint16(index)
+			}
 			entry := InnerInstruction{
 				ProgramIdIndex: ix.ProgramIdIndex,
 				Accounts:       accts,

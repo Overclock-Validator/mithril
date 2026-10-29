@@ -83,6 +83,7 @@ type blockExecution struct {
 	accountLoader metrics.AccountLoader
 
 	metadata *blockMetadataCapture
+	results  *blockResultCapture
 }
 
 // newBlockExecution installs the per-bank trace task, the stage watchdog and
@@ -220,6 +221,9 @@ func (exec *blockExecution) close() {
 	}
 	if exec.task != nil {
 		exec.task.End()
+	}
+	if exec.results != nil && !exec.results.sealed {
+		exec.results.fail(errors.New("block execution did not finish"))
 	}
 	if exec.metadata != nil && exec.metadata.Record == nil {
 		exec.metadata.fail(errors.New("block execution did not finish"))
@@ -511,6 +515,7 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 		return nil, nil, errors.New("streaming group has unresolved address tables")
 	}
 	metadata := exec.metadata.beginGroup(slotCtx, txs, workers)
+	results := exec.results.beginGroup(len(txs))
 	var plan *dependencyPlan
 	if workers > 1 {
 		plannerBuildStart := time.Now()
@@ -524,7 +529,7 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 				continue
 			}
 			var txErr error
-			feeInfos[idx], computeUnits[idx], txErr = processTransaction(slotCtx, &exec.sigverifyWg, tx, nil, dbgOpts, nil, shouldVerifySignatures, metadata.transaction(idx))
+			feeInfos[idx], computeUnits[idx], txErr = processTransactionWithResult(slotCtx, &exec.sigverifyWg, tx, nil, dbgOpts, nil, shouldVerifySignatures, metadata.transaction(idx), results.transaction(idx))
 			if feeInfos[idx] == nil {
 				return nil, nil, unprocessableTransactionError(base+idx, txErr)
 			}
@@ -559,7 +564,7 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 					done <- idx
 					continue
 				}
-				feeInfos[idx], computeUnits[idx], txErrors[idx] = processTransaction(slotCtx, &exec.sigverifyWg, txs[idx], nil, dbgOpts, workerArena, shouldVerifySignatures, metadata.transaction(idx))
+				feeInfos[idx], computeUnits[idx], txErrors[idx] = processTransactionWithResult(slotCtx, &exec.sigverifyWg, txs[idx], nil, dbgOpts, workerArena, shouldVerifySignatures, metadata.transaction(idx), results.transaction(idx))
 				done <- idx
 			}
 		}(i)
@@ -762,9 +767,10 @@ func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
 
 	global.IncrTransactionCount(executionPlan.processedTxCount)
 	setReplayStage("done")
-	if exec.metadata != nil {
+	if exec.metadata != nil || exec.results != nil {
 		exec.sigverifyWg.Wait()
 		exec.metadata.seal(block, slotCtx)
+		exec.results.seal(block)
 	}
 	exec.recordStages()
 	return slotCtx, err

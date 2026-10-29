@@ -128,6 +128,8 @@ func TestBlockHistoryHTTPAfterDurableRewind(t *testing.T) {
 				require.True(t, rewindStoreBelowDivergence(dir, db, s, 3, 100, server))
 			}
 			require.Equal(t, uint64(2), s.LastRootedSlot)
+			_, err = finishReplayRecovery(server, s, nil, nil, true)
+			require.NoError(t, err)
 			require.JSONEq(t, `{"code":-32004,"message":"Block not available for slot 4"}`, string(call(blockRequest)["error"]))
 		})
 	}
