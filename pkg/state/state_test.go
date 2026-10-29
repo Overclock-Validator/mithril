@@ -225,3 +225,34 @@ func TestStateFileWithRemovedAuthorizedVotersFieldStillLoads(t *testing.T) {
 		t.Fatalf("LastSlot = %d, want 123", st.LastSlot)
 	}
 }
+
+func TestSaveRecordsRepairPeerHints(t *testing.T) {
+	dir := t.TempDir()
+	s := &MithrilState{StateSchemaVersion: CurrentStateSchemaVersion, Stage: "ready"}
+	hints := []RepairPeerHint{{Pubkey: "11111111111111111111111111111111", Addr: "10.0.0.1:8008"}}
+	SetRepairPeerHintsProvider(func() []RepairPeerHint { return hints })
+	defer SetRepairPeerHintsProvider(nil)
+	if err := s.Save(dir); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	loaded, err := LoadState(dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !reflect.DeepEqual(loaded.RepairPeerHints, hints) {
+		t.Fatalf("hints after save = %+v, want %+v", loaded.RepairPeerHints, hints)
+	}
+
+	// A save with no current peers keeps the previous hints.
+	SetRepairPeerHintsProvider(func() []RepairPeerHint { return nil })
+	if err := loaded.Save(dir); err != nil {
+		t.Fatalf("second save: %v", err)
+	}
+	again, err := LoadState(dir)
+	if err != nil {
+		t.Fatalf("second load: %v", err)
+	}
+	if !reflect.DeepEqual(again.RepairPeerHints, hints) {
+		t.Fatalf("hints after empty save = %+v, want %+v", again.RepairPeerHints, hints)
+	}
+}

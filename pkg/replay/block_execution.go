@@ -54,9 +54,12 @@ type blockExecution struct {
 	ctx            context.Context
 	task           *trace.Task
 	setReplayStage func(string)
-	watchdogDone   chan struct{}
-	sigverifyWg    sync.WaitGroup
-	closed         bool
+	// recordStages writes the stage totals into this block's metrics; called
+	// once, when the bank finalizes.
+	recordStages func()
+	watchdogDone chan struct{}
+	sigverifyWg  sync.WaitGroup
+	closed       bool
 
 	// Whole-block inputs to the tail, set by ProcessBlock.
 	executionPlan     blockTransactionExecutionPlan
@@ -124,9 +127,43 @@ func newBlockExecution(
 
 	var replayStage atomic.Value
 	var replayStageSince atomic.Int64
+	// Stage accounting: each change ends the previous stage, so the stages tile
+	// the bank's execution. Streaming changes stages from executor goroutines.
+	var (
+		stageMu    sync.Mutex
+		stageName  string
+		stageStart time.Time
+		stageTimes = make(map[string]time.Duration, 16)
+	)
 	exec.setReplayStage = func(stage string) {
+		stageMu.Lock()
+		now := time.Now()
 		replayStage.Store(stage)
-		replayStageSince.Store(time.Now().UnixNano())
+		replayStageSince.Store(now.UnixNano())
+		if stageName != "" {
+			stageTimes[stageName] += now.Sub(stageStart)
+		}
+		stageName, stageStart = stage, now
+		stageMu.Unlock()
+	}
+	exec.recordStages = func() {
+		stageMu.Lock()
+		defer stageMu.Unlock()
+		if stageName != "" {
+			now := time.Now()
+			stageTimes[stageName] += now.Sub(stageStart)
+			stageStart = now
+		}
+		if metrics.GlobalBlockReplay.ReplayStages == nil {
+			metrics.GlobalBlockReplay.ReplayStages = make(map[string]metrics.Timing, len(stageTimes))
+		}
+		for name, d := range stageTimes {
+			t := metrics.GlobalBlockReplay.ReplayStages[name]
+			t.Count++
+			t.SumNanoseconds += uint64(d)
+			metrics.GlobalBlockReplay.ReplayStages[name] = t
+		}
+		clear(stageTimes)
 	}
 
 	exec.watchdogDone = make(chan struct{})
@@ -214,6 +251,13 @@ func (exec *blockExecution) installSlotCtx(accts accounts.Accounts, parentAccts 
 	return nil
 }
 
+// streamingOverlayKeys sizes a streamed bank's account overlay and write
+// maps. The bank opens on a shell block with no transactions, so its own
+// account count would give the overlay a single lock shard, which every
+// transaction worker and the end-of-block writers then share. Mainnet blocks
+// load about 2,000 accounts and write about 1,800.
+const streamingOverlayKeys = 4096
+
 // open performs the bank-start work that needs only the parent state: the
 // parent sysvar pin and this bank's Clock/SlotHashes derivation, the parent
 // snapshot for whatever transactions the block currently carries (none for a
@@ -223,15 +267,13 @@ func (exec *blockExecution) installSlotCtx(accts accounts.Accounts, parentAccts 
 func (exec *blockExecution) open() error {
 	defer exec.captureAccountLoader()()
 	block := exec.block
-	exec.setReplayStage("prepare_dependency_planner")
-	if SerializedParameterArena != nil {
-		SerializedParameterArena.Reset()
-	}
+	exec.setReplayStage("parameter_arena")
+	resetSerializedParameterArena()
 
 	start := time.Now()
 	exec.setReplayStage("load_accounts")
 	loadAcctsRegion := trace.StartRegion(exec.ctx, "LoadBlockAccounts")
-	accts, parentAccts, accountMapCapacity, bankSysvars, err := loadBlockAccountsAndUpdateSysvars(exec.blockSrc, block, exec.epochSchedule, exec.alpenglowClock, exec.parentBankSysvars, nil)
+	accts, parentAccts, accountMapCapacity, bankSysvars, err := loadBlockAccountsAndUpdateSysvars(exec.blockSrc, block, exec.epochSchedule, exec.alpenglowClock, exec.parentBankSysvars, nil, streamingOverlayKeys)
 	loadAcctsRegion.End()
 	if err != nil {
 		return fmt.Errorf("load slot accounts and update sysvars at slot %d: %w", block.Slot, err)
@@ -691,6 +733,7 @@ func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
 	if tail != nil {
 		// Rooted-durable: buffer this slot's writes + bankhash in the RAM overlay
 		// (always, even when empty, so the bankhash is recorded); no durable write.
+		recordSlotStakeChange(tail, slotCtx, modifiedAccts)
 		tail.Add(slotCtx.Slot, modifiedAccts, persistedBankhash)
 		afterStoreAccounts()
 	} else if len(modifiedAccts) > 0 {
@@ -720,5 +763,6 @@ func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
 		exec.sigverifyWg.Wait()
 		exec.metadata.seal(block, slotCtx)
 	}
+	exec.recordStages()
 	return slotCtx, err
 }

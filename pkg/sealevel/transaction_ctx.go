@@ -17,12 +17,21 @@ type TxReturnData struct {
 }
 
 type TransactionAccounts struct {
-	Accounts          []*accounts.Account
-	Shared            []bool
-	Locked            []bool
-	Touched           []bool
-	AcctMetas         []*AccountMeta
+	Accounts  []*accounts.Account
+	Shared    []bool
+	Locked    []bool
+	Touched   []bool
+	AcctMetas []*AccountMeta
+	// OnFirstWriteClone, when set, receives the deep copy installed by a
+	// shared account's first write, and SetData then deep-copies too, so the
+	// callback always sees detached old data. Replay does not set it; the
+	// replacement tests use it as the reference deep-copy path that the
+	// header-only path must match.
 	OnFirstWriteClone func(*accounts.Account)
+	// OnFirstWriteDetach observes each shared account's first write: its old
+	// data length and the data bytes copied, which is zero when SetData
+	// replaces all data. It is telemetry only and must not touch tx state.
+	OnFirstWriteDetach func(oldDataLen, copiedBytes uint64)
 }
 
 type TransactionCtx struct {
@@ -312,13 +321,59 @@ func (txAccounts *TransactionAccounts) Touch(idx uint64) (*accounts.Account, err
 
 	if txAccounts.Shared[idx] {
 		clonedAcct := txAccounts.Accounts[idx].Clone()
+		copiedBytes := uint64(len(clonedAcct.Data))
 		txAccounts.Accounts[idx] = clonedAcct
 		txAccounts.Shared[idx] = false
 		if txAccounts.OnFirstWriteClone != nil {
 			txAccounts.OnFirstWriteClone(clonedAcct)
 		}
+		if txAccounts.OnFirstWriteDetach != nil {
+			txAccounts.OnFirstWriteDetach(copiedBytes, copiedBytes)
+		}
 	}
 
 	txAccounts.Touched[idx] = true
 	return txAccounts.Accounts[idx], nil
+}
+
+// replaceData makes data the indexed account's entire data, marks the account
+// touched and returns it with its old data length. A shared account gets a new
+// Account header that points at data: copying its old data, as Touch does,
+// would be discarded immediately. The caller has already validated the
+// replacement, and data keeps its existing lifetime: the slot's final account
+// copies detach it before publication.
+func (txAccounts *TransactionAccounts) replaceData(idx uint64, data []byte) (*accounts.Account, uint64, error) {
+	if txAccounts.OnFirstWriteClone != nil {
+		// The legacy callback may mutate or retain the clone, so keep the
+		// original Touch, measure, replace sequence exactly.
+		acct, err := txAccounts.Touch(idx)
+		if err != nil {
+			return nil, 0, err
+		}
+		oldLen := uint64(len(acct.Data))
+		acct.SetData(data)
+		return acct, oldLen, nil
+	}
+
+	if len(txAccounts.Touched) == 0 || idx > uint64(len(txAccounts.Touched)-1) {
+		return nil, 0, InstrErrNotEnoughAccountKeys
+	}
+
+	acct := txAccounts.Accounts[idx]
+	oldLen := uint64(len(acct.Data))
+	if txAccounts.Shared[idx] {
+		replaced := *acct
+		replaced.Data = data
+		acct = &replaced
+		txAccounts.Accounts[idx] = acct
+		txAccounts.Shared[idx] = false
+		if txAccounts.OnFirstWriteDetach != nil {
+			txAccounts.OnFirstWriteDetach(oldLen, 0)
+		}
+	} else {
+		acct.SetData(data)
+	}
+
+	txAccounts.Touched[idx] = true
+	return acct, oldLen, nil
 }
