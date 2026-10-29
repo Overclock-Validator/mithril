@@ -136,6 +136,10 @@ func (acct *AppendVecAccount) Unmarshal(buf io.Reader) error {
 }
 
 func (acct *AppendVecAccount) unmarshal(buf io.Reader, maxDataBytes uint64) error {
+	return acct.unmarshalWithBudget(buf, maxDataBytes, nil)
+}
+
+func (acct *AppendVecAccount) unmarshalWithBudget(buf io.Reader, maxDataBytes uint64, budget *accountDataBudget) error {
 	var err error
 	var hdrBytes [hdrLen]byte
 	_, err = io.ReadFull(buf, hdrBytes[:])
@@ -147,6 +151,9 @@ func (acct *AppendVecAccount) unmarshal(buf io.Reader, maxDataBytes uint64) erro
 	acct.DataLen = binary.LittleEndian.Uint64(hdrBytes[8:16])
 	if acct.DataLen > maxDataBytes {
 		return accountDataLimitError(acct.DataLen, maxDataBytes)
+	}
+	if err := budget.reserve(acct.DataLen); err != nil {
+		return err
 	}
 	copy(acct.Pubkey[:], hdrBytes[16:48])
 	acct.Lamports = binary.LittleEndian.Uint64(hdrBytes[48:56])

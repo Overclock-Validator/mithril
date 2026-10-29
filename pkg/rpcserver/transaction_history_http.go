@@ -53,8 +53,8 @@ func acquireHistoryResponse(ctx context.Context) error {
 	return owner.acquire(ctx, transactionhistory.ErrUnavailable)
 }
 
-// acquireQueryResponse limits signature-status payloads to two concurrent HTTP
-// responses and two calls per request.
+// acquireQueryResponse shares two HTTP response permits and two calls per
+// request between getBlocks, getMultipleAccounts and getSignatureStatuses.
 func acquireQueryResponse(ctx context.Context) error {
 	owner, _ := ctx.Value(queryResponseKey{}).(*historyResponseOwner)
 	return owner.acquire(ctx, errQueryResponseUnavailable)

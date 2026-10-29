@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -37,9 +38,11 @@ type rpcHandler struct {
 
 type rpcMethods interface {
 	GetAccountInfo(context.Context, jsonrpc.RawParams) (GetAccountInfoResp, error)
+	GetMultipleAccounts(context.Context, jsonrpc.RawParams) (GetMultipleAccountsResp, error)
 	GetBalance(context.Context, jsonrpc.RawParams) (GetBalanceResp, error)
 	GetBankHash(context.Context, jsonrpc.RawParams) (string, error)
 	GetBlock(context.Context, jsonrpc.RawParams) (GetBlockResp, error)
+	GetBlocks(context.Context, jsonrpc.RawParams) ([]uint64, error)
 	GetBlockHeight(context.Context, jsonrpc.RawParams) (uint64, error)
 	GetBlockProduction(context.Context, jsonrpc.RawParams) (GetBlockProductionResp, error)
 	GetEpochInfo(context.Context, jsonrpc.RawParams) (GetEpochInfoResp, error)
@@ -126,9 +129,11 @@ const maxQuietMethodProbeBody = 64 << 10
 
 var supportedRPCMethods = map[string]struct{}{
 	"getAccountInfo":         {},
+	"getMultipleAccounts":    {},
 	"getBalance":             {},
 	"getBankHash":            {},
 	"getBlock":               {},
+	"getBlocks":              {},
 	"getBlockHeight":         {},
 	"getBlockProduction":     {},
 	"getEpochInfo":           {},
@@ -383,6 +388,10 @@ func (rpcServer *RpcServer) readRootedAccount(ctx context.Context, pubkey solana
 }
 
 func (rpcServer *RpcServer) readRootedAccounts(ctx context.Context, pubkeys []solana.PublicKey) (rootedBankState, []*accounts.Account, error) {
+	return rpcServer.readRootedAccountsWithBudget(ctx, pubkeys, nil)
+}
+
+func (rpcServer *RpcServer) readRootedAccountsWithBudget(ctx context.Context, pubkeys []solana.PublicKey, remaining *uint64) (rootedBankState, []*accounts.Account, error) {
 	for {
 		bank := rpcServer.rootedBank.Load()
 		if bank == nil {
@@ -399,7 +408,18 @@ func (rpcServer *RpcServer) readRootedAccounts(ctx context.Context, pubkeys []so
 			}
 			continue
 		}
-		accounts, stats, err := rpcServer.acctsDb.GetAccountsBatchSharedWithStats(ctx, rooted.Slot, pubkeys)
+		var accountSet []*accounts.Account
+		var stats accountsdb.BatchReadStats
+		var err error
+		if remaining == nil {
+			accountSet, stats, err = rpcServer.acctsDb.GetAccountsBatchSharedWithStats(ctx, rooted.Slot, pubkeys)
+		} else {
+			accountSet, stats, err = rpcServer.acctsDb.GetAccountsBatchSharedWithDataLimit(ctx, rooted.Slot, pubkeys, *remaining)
+			*remaining -= stats.DataBytesCharged
+			if errors.Is(err, accountsdb.ErrAccountDataLimit) {
+				return rooted, nil, err
+			}
+		}
 		latest, stable := rpcServer.acctsDb.CommittedAccountVersion()
 		if !stable || latest != version || rpcServer.rootedBank.Load() != bank || stats.PendingFoldHits > 0 ||
 			rpcServer.rootedPublicationPending(rooted.Slot) {
@@ -408,7 +428,7 @@ func (rpcServer *RpcServer) readRootedAccounts(ctx context.Context, pubkeys []so
 			}
 			continue
 		}
-		return rooted, accounts, err
+		return rooted, accountSet, err
 	}
 }
 

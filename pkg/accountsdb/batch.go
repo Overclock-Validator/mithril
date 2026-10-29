@@ -88,6 +88,10 @@ type BatchReadStats struct {
 	DecodedAccountObjects uint64
 	DecodedAccountBytes   uint64
 	PlaceholderObjects    uint64
+	// DataBytesCharged is the monotonic full-data charge of a bounded call,
+	// including failed decodes and duplicate occurrences, even on error.
+	// It is zero for unbounded callers and is not an allocation/RSS counter.
+	DataBytesCharged uint64
 
 	WorkingSetLookupNanoseconds     uint64
 	InProgressNanoseconds           uint64
@@ -132,6 +136,21 @@ func (db *AccountsDb) GetAccountsBatchSharedWithStats(ctx context.Context, slot 
 }
 
 func (db *AccountsDb) getAccountsBatchWithStats(ctx context.Context, slot uint64, pks []solana.PublicKey) ([]*accounts.Account, BatchReadStats, error) {
+	return db.getAccountsBatchWithBudget(ctx, slot, pks, nil)
+}
+
+// GetAccountsBatchSharedWithDataLimit keeps the coherent batch snapshot and
+// appendvec pin, but refuses full account data beyond maxDataBytes before copies
+// or decoding. Shared cache values and duplicate output positions also count.
+// Returned values remain immutable; the charge is reported even on failure.
+func (db *AccountsDb) GetAccountsBatchSharedWithDataLimit(ctx context.Context, slot uint64, pks []solana.PublicKey, maxDataBytes uint64) ([]*accounts.Account, BatchReadStats, error) {
+	budget := &accountDataBudget{limit: maxDataBytes}
+	out, stats, err := db.getAccountsBatchWithBudget(ctx, slot, pks, budget)
+	stats.DataBytesCharged = budget.charged.Load()
+	return out, stats, err
+}
+
+func (db *AccountsDb) getAccountsBatchWithBudget(ctx context.Context, slot uint64, pks []solana.PublicKey, budget *accountDataBudget) ([]*accounts.Account, BatchReadStats, error) {
 	stats := BatchReadStats{RequestedKeys: uint64(len(pks)), DurableKeys: uint64(len(pks))}
 	if len(pks) == 0 {
 		return nil, stats, nil
@@ -150,8 +169,11 @@ func (db *AccountsDb) getAccountsBatchWithStats(ctx context.Context, slot uint64
 	}()
 
 	phaseStart = time.Now()
-	out := db.getStoreInProgressAccounts(pks)
+	out, err := db.getStoreInProgressAccountsWithBudget(pks, budget)
 	stats.InProgressNanoseconds = uint64(time.Since(phaseStart).Nanoseconds())
+	if err != nil {
+		return nil, stats, err
+	}
 	cold := make([]int, 0, len(pks))
 	var indexSnapshot *pebble.Snapshot
 	var cacheEpoch uint64
@@ -169,6 +191,12 @@ func (db *AccountsDb) getAccountsBatchWithStats(ctx context.Context, slot uint64
 			continue
 		}
 		if acct, ok, pending := db.getCachedAccountLocked(pk); ok {
+			if acct != nil {
+				if err := budget.reserve(uint64(len(acct.Data))); err != nil {
+					db.readCacheEpochMu.RUnlock()
+					return nil, stats, err
+				}
+			}
 			if pending {
 				stats.PendingFoldHits++
 			} else {
@@ -271,7 +299,7 @@ func (db *AccountsDb) getAccountsBatchWithStats(ctx context.Context, slot uint64
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			acct, readErr := readBatchAccountAt(file, path, location)
+			acct, readErr := readBatchAccountAtWithBudget(file, path, location, budget)
 			if readErr != nil {
 				jobStats.readFailures++
 				return readErr
@@ -507,14 +535,20 @@ func nextPubkey(key solana.PublicKey, out *[32]byte) bool {
 }
 
 func readBatchAccountAt(file *os.File, path string, location batchAccountLocation) (*accounts.Account, error) {
+	return readBatchAccountAtWithBudget(file, path, location, nil)
+}
+
+func readBatchAccountAtWithBudget(file *os.File, path string, location batchAccountLocation, budget *accountDataBudget) (*accounts.Account, error) {
 	if location.entry.Offset > math.MaxInt64 {
 		return nil, fmt.Errorf("account offset %d overflows int64", location.entry.Offset)
 	}
 	offset := int64(location.entry.Offset)
-	acct, err := unmarshalAcctFromAppendVecAcctHeader(io.NewSectionReader(file, offset, math.MaxInt64-offset))
+	var encoded AppendVecAccount
+	err := encoded.unmarshalWithBudget(io.NewSectionReader(file, offset, math.MaxInt64-offset), math.MaxUint64, budget)
 	if err != nil {
 		return nil, fmt.Errorf("unmarshal account at %s@%d: %w", path, location.entry.Offset, err)
 	}
+	acct := encoded.ToAccount()
 	if acct.Key != location.pubkey {
 		return nil, fmt.Errorf("record at %s@%d holds %s (stale index entry)", path, location.entry.Offset, acct.Key)
 	}
