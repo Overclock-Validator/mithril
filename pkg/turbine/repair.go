@@ -2,8 +2,6 @@ package turbine
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
 	"fmt"
 	"net"
 	"sort"
@@ -13,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	repairproto "github.com/Overclock-Validator/mithril/pkg/repair"
 )
 
@@ -310,7 +309,7 @@ type RepairPeerReport struct {
 
 type repairClient struct {
 	priorityWake chan struct{} // initialized before the receiver starts; coalesced hints
-	identity     ed25519.PrivateKey
+	identity     *identity.Holder
 	peerSource   RepairPeerSource
 
 	mu          sync.Mutex
@@ -367,23 +366,17 @@ type repairClient struct {
 	errors        atomic.Uint64
 }
 
-func newRepairClient(identity ed25519.PrivateKey, peerSource RepairPeerSource) (*repairClient, error) {
-	var err error
-	if len(identity) == 0 {
-		_, identity, err = ed25519.GenerateKey(rand.Reader)
-		if err != nil {
-			return nil, fmt.Errorf("generate repair identity: %w", err)
-		}
-	}
-	if len(identity) != ed25519.PrivateKeySize {
-		return nil, fmt.Errorf("invalid repair identity size %d", len(identity))
+func newRepairClient(holder *identity.Holder, peerSource RepairPeerSource) (*repairClient, error) {
+	holder, err := identity.HolderOrEphemeral(holder)
+	if err != nil {
+		return nil, fmt.Errorf("repair identity: %w", err)
 	}
 	if peerSource == nil {
 		return nil, fmt.Errorf("repair peer source is required")
 	}
 	c := &repairClient{
 		priorityWake: make(chan struct{}, 1),
-		identity:     append(ed25519.PrivateKey(nil), identity...),
+		identity:     holder,
 		peerSource:   peerSource,
 		outstanding:  make(map[repairRequestKey]outstandingRepairRequest),
 		byResponse:   make(map[repairResponseKey]repairRequestKey),
@@ -591,7 +584,7 @@ func (c *repairClient) handleRepairPing(conn *net.UDPConn, packet []byte, from *
 		return false
 	}
 	c.pings.Add(1)
-	pong, err := repairproto.BuildPong(c.identity, ping)
+	pong, err := repairproto.BuildPong(c.identity.Current().PrivateKey(), ping)
 	if err != nil {
 		c.errors.Add(1)
 		return true
@@ -930,9 +923,9 @@ func (c *repairClient) sendShredAttempt(conn *net.UDPConn, peers []gossip.Repair
 	)
 	switch kind {
 	case repairRequestWindowIndex:
-		packet, nonce, err = repairproto.NewWindowIndexRequest(c.identity, peer.Pubkey, slot, uint64(index))
+		packet, nonce, err = repairproto.NewWindowIndexRequest(c.identity.Current().PrivateKey(), peer.Pubkey, slot, uint64(index))
 	case repairRequestHighestWindowIndex:
-		packet, nonce, err = repairproto.NewHighestWindowIndexRequest(c.identity, peer.Pubkey, slot, uint64(index))
+		packet, nonce, err = repairproto.NewHighestWindowIndexRequest(c.identity.Current().PrivateKey(), peer.Pubkey, slot, uint64(index))
 	}
 	if err != nil {
 		undoReserve()

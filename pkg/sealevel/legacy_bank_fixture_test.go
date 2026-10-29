@@ -4,8 +4,6 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/gagliardetto/solana-go"
-	"github.com/maypok86/otter"
-	"github.com/stretchr/testify/require"
 	"testing"
 )
 
@@ -22,9 +20,7 @@ func initializeLegacyBankFixture(t *testing.T, ctx *ExecutionCtx) {
 			t.Logf("program logs: %#v", ctx.Log)
 		}
 	})
-	cache, err := otter.MustBuilder[solana.PublicKey, *accountsdb.ProgramCacheEntry](1024).Cost(func(solana.PublicKey, *accountsdb.ProgramCacheEntry) uint32 { return 1 }).Build()
-	require.NoError(t, err)
-	t.Cleanup(cache.Close)
+	cache := accountsdb.NewWeightedCache[solana.PublicKey, *accountsdb.ProgramCacheEntry](1024, func(solana.PublicKey, *accountsdb.ProgramCacheEntry) uint32 { return 1 })
 	if ctx.Accounts == nil {
 		ctx.Accounts = accounts.NewMemAccounts()
 	}

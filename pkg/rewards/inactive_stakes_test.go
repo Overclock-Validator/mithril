@@ -112,7 +112,7 @@ func TestEpoch116InactiveStakeBankHash(t *testing.T) {
 		&sealevel.SlotCtx{Features: f}, f, &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 54000}, RewardCalculationMode{FullAlpenglow: true})
 	require.NoError(t, err)
 	updated, _, distributed, burned, _ := DistributeStakingRewardsFromSpool(
-		db, result.SpoolDir, result.SpoolSlot, 0, 6264001, nil, result.VoteCommissions)
+		db, result.SpoolDir, result.SpoolSlot, 0, 6264001, nil, result.VoteCommissions, StakeRewardDistributionConfig{})
 	require.Zero(t, distributed)
 	require.Zero(t, burned)
 	require.Equal(t, fixture.ExpectedBankhash, calculateHash(updated))

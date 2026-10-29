@@ -37,6 +37,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/lightbringer"
 	"github.com/Overclock-Validator/mithril/pkg/lthash"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
@@ -83,6 +84,8 @@ var (
 	snapshotArchivePath              string
 	incrementalSnapshotFilename      string
 	accountsPath                     string
+	accountsPaths                    []string
+	snapshotAccountsDirMinFreeMB     int
 	scratchDirectory                 string
 	rpcEndpoints                     []string
 	cluster                          string // "alpenglow", "mainnet-beta", "testnet", or "devnet"
@@ -113,6 +116,7 @@ var (
 	validatorInitializeReservation   bool
 	validatorCompletionReserveMs     int
 	validatorMaxBufferedTransactions int
+	harmonicConfig                   harmonicSettings
 
 	// Mode thresholds
 	blockNearTipThreshold        int // Enter near-tip when gap <= this
@@ -170,6 +174,10 @@ var (
 	turbineGossipBindAddr   string
 	turbineAdvertisedIP     string
 	turbineShredVersion     int
+	// turbineShredReceivers get copies of the shreds this validator
+	// broadcasts, and turbineShredRetransmitReceivers of the shreds it relays.
+	turbineShredReceivers           []*net.UDPAddr
+	turbineShredRetransmitReceivers []*net.UDPAddr
 )
 
 func snapshotEpochForState(manifest *snapshot.SnapshotManifest) uint64 {
@@ -417,19 +425,24 @@ func loadBootstrapStateWith(
 	return validState, nil
 }
 
-func loadValidatorIdentityKeypair(path string) (ed25519.PrivateKey, string, error) {
+// loadValidatorIdentity holds the configured identity keypair, or a fresh
+// ephemeral one when none is configured. Every subsystem reads the node
+// identity from this one holder, so set-identity replaces it in one place.
+func loadValidatorIdentity(path string) (holder *identity.Holder, configured bool, err error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
-		return nil, "", nil
+		holder, err = identity.NewEphemeralHolder()
+		return holder, false, err
 	}
 	key, err := solana.PrivateKeyFromSolanaKeygenFile(path)
 	if err != nil {
-		return nil, "", fmt.Errorf("load validator identity keypair %s: %w", path, err)
+		return nil, false, fmt.Errorf("load validator identity keypair %s: %w", path, err)
 	}
-	if len(key) != ed25519.PrivateKeySize {
-		return nil, "", fmt.Errorf("validator identity keypair %s has invalid private key size %d", path, len(key))
+	holder, err = identity.NewHolder(ed25519.PrivateKey(key))
+	if err != nil {
+		return nil, false, fmt.Errorf("validator identity keypair %s: %w", path, err)
 	}
-	return ed25519.PrivateKey(append([]byte(nil), key...)), key.PublicKey().String(), nil
+	return holder, true, nil
 }
 
 func loadValidatorKeypairPubkey(label, path string) (string, error) {
@@ -540,7 +553,7 @@ func init() {
 	Run.Flags().StringVar(&snapshotDlPath, "download-snapshot-path", "", "Directory for discovered/downloaded snapshots")
 
 	// [ledger] section flags
-	Run.Flags().StringVarP(&accountsPath, "accounts-path", "o", "", "Output path for writing AccountsDB data to")
+	Run.Flags().StringSliceVarP(&accountsPaths, "accounts-path", "o", []string{}, "Output path(s) for writing AccountsDB data to - one dir per disk shard, can specify multiple")
 	Run.Flags().StringVar(&blockstorePath, "ledger-path", "/tmp/blocks", "Path containing slot.json files")
 
 	// [network] section flags
@@ -554,7 +567,7 @@ func init() {
 	// [replay] section flags
 	Run.Flags().Int64Var(&txParallelism, "txpar", 0, "Transaction execution workers (>0 enables topsort parallelism; explicit 0 is sequential; unset validator mode defaults to 2x CPU cores)")
 	Run.Flags().Int64Var(&numReplaySlots, "num-slots", 0, "Number of slots to replay (0 = run continuously)")
-	Run.Flags().BoolVar(&replay.StreamingExecutionCfg.Enabled, "streaming-execution", false,
+	Run.Flags().BoolVar(&replay.StreamingExecutionCfg.Enabled, "streaming-execution", true,
 		"Execute Turbine blocks while their shreds arrive (Alpenglow validator/verifying modes only; the complete block remains authoritative and any mismatch falls back to whole-block execution)")
 	Run.Flags().IntVar(&replay.StreamingExecutionCfg.Workers, "streaming-workers", 0,
 		"Streaming execution workers per transaction group (0 = min(txpar, 4))")
@@ -582,11 +595,16 @@ func init() {
 	Run.Flags().IntVar(&validatorCompletionReserveMs, "leader-completion-reserve-ms", 0, "Time reserved for leader finalization and broadcast (0 = 75ms default; tune from measured completion times)")
 	Run.Flags().IntVar(&validatorMaxBufferedTransactions, "tpu-max-buffered-transactions", 0, "Maximum queued TPU transactions (0 = 131072 default)")
 
+	// [harmonic] section flags
+	registerHarmonicFlags(Run.Flags())
+
 	// [tuning] section flags
 	Run.Flags().Uint64Var(&paramArenaSizeMB, "param-arena-size-mb", 512, "Size in MB for serialized parameter arena (0 to disable)")
 	Run.Flags().Uint64Var(&borrowedAccountArenaSize, "borrowed-account-arena-size", 1024, "Number of borrowed accounts to preallocate in arena (0 to disable)")
 	Run.Flags().IntVar(&snapshot.ZstdDecoderConcurrency, "zstd-decoder-concurrency", runtime.NumCPU(), "Zstd decoder concurrency")
 	Run.Flags().IntVar(&snapshot.MaxConcurrentFlushers, "max-concurrent-flushers", snapshot.DefaultSnapshotMaxConcurrentFlushers, "Bound for number of log shards to flush to Accounts DB Index at once")
+	Run.Flags().IntVar(&snapshot.SnapshotFlushSortWorkers, "flush-sort-workers", snapshot.DefaultSnapshotFlushSortWorkers, "Snapshot index-flush concurrent sort workers (0 = one per CPU)")
+	Run.Flags().IntVar(&snapshotAccountsDirMinFreeMB, "snapshot-accounts-dir-min-free-mb", snapshot.DefaultSnapshotAccountsDirMinFreeMB, "With several accounts directories, stop placing unpacked snapshot data on a filesystem once its free space reaches this many MiB")
 	Run.Flags().IntVar(&snapshot.SnapshotAppendVecCopyingWorkers, "snapshot-append-vec-workers", snapshot.DefaultSnapshotAppendVecCopyingWorkers, "Snapshot bootstrap appendvec write workers")
 	Run.Flags().IntVar(&snapshot.SnapshotIndexEntryBuilderWorkers, "snapshot-index-builder-workers", snapshot.DefaultSnapshotIndexEntryBuilderWorkers, "Snapshot bootstrap account-index parser workers")
 	Run.Flags().IntVar(&snapshot.SnapshotIndexEntryCommitterWorkers, "snapshot-index-committer-workers", snapshot.DefaultSnapshotIndexEntryCommitterWorkers, "Snapshot bootstrap account-index shard enqueue workers")
@@ -604,6 +622,8 @@ func init() {
 	Run.Flags().IntVar(&accountsdb.StoreAccountsWorkers, "store-accounts-workers", 128, "Number of workers to write account updates")
 	Run.Flags().IntVar(&accountsdb.ProgramCacheMaxMB, "program-cache-max-mb", accountsdb.DefaultProgramCacheMaxMB, "Maximum approximate SBPF program cache size in MiB")
 	Run.Flags().IntVar(&accountsdb.CommonAccountCacheMaxMB, "common-account-cache-max-mb", accountsdb.DefaultCommonAccountCacheMaxMB, "Approximate retained decoded account cache weight budget in MiB")
+	Run.Flags().IntVar(&accountsdb.IndexCacheMaxMB, "index-cache-max-mb", accountsdb.DefaultIndexCacheMaxMB, "Pebble account-index block cache capacity in MiB")
+	Run.Flags().StringVar(&accountsdb.CommonAccountCacheLayout, "common-account-cache-layout", "fixed", "Account cache layout: fixed (up to 16 MiB empty and 64 MiB small accounts, the rest larger ones) or flat (one cache for every size)")
 	Run.Flags().Int64Var(&rewindToSlot, "rewind-to-slot", 0, "Rewind durable account state to the fold batch boundary at this slot before replaying (must be a retained boundary; run once to list boundaries on mismatch)")
 
 	// [tuning.pprof] section flags
@@ -628,6 +648,8 @@ func init() {
 	Run.Flags().BoolVar(&blockRPCFallback, "rpc-fallback", false, "Allow RPC to fetch blocks when replay is more than repair-catchup-max-gap-slots behind (default false: shreds via turbine + repair are the only block path)")
 	Run.Flags().StringVar(&turbineAdvertisedIP, "turbine-advertised-ip", "", "Public IP advertised by native turbine gossip (optional)")
 	Run.Flags().IntVar(&turbineShredVersion, "turbine-shred-version", 0, "Shred version for native turbine gossip (0 = discover from entrypoint)")
+	Run.Flags().StringSlice("shred-receiver-address", nil, "Also send every shred this validator broadcasts to this host:port (repeatable), e.g. a block builder")
+	Run.Flags().StringSlice("shred-retransmit-receiver-address", nil, "Also send every shred this node relays to this host:port (repeatable), e.g. a block builder")
 	Run.Flags().IntVar(&blockMaxRPS, "block-max-rps", 0, "Max RPC requests per second for block fetching (0 = use default)")
 	Run.Flags().IntVar(&blockMaxInflight, "block-max-inflight", 0, "Max concurrent block fetch workers (0 = use default)")
 	Run.Flags().IntVar(&blockTipPollIntervalMs, "block-tip-poll-ms", 0, "Tip poll interval in milliseconds (0 = use default)")
@@ -817,13 +839,25 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	if incrementalSnapshotFilename == "" {
 		incrementalSnapshotFilename = getString("incremental-snapshot", "ledger.incremental_snapshot")
 	}
-	accountsPath = getString("accounts-path", "storage.accounts")
-	if accountsPath == "" {
-		accountsPath = getString("accounts-path", "ledger.accounts_path")
+	// storage.accounts is a list of one dir per disk shard; the single-disk case
+	// is just a slice of one. A scalar string in TOML is accepted too (viper casts
+	// it to a 1-element slice), and the --accounts-path CLI flag takes 1+ dirs.
+	accountsPaths = getStringSlice("accounts-path", "storage.accounts")
+	if len(accountsPaths) == 0 {
+		accountsPaths = getStringSlice("accounts-path", "ledger.accounts_path")
 	}
-	// Check write permission early to fail fast with helpful error
-	if err := checkDirWritable(accountsPath, "AccountsDB"); err != nil {
+	if len(accountsPaths) == 0 {
+		return fmt.Errorf("no accounts path configured (set storage.accounts)")
+	}
+	if err := accountsdb.ValidateAccountsPaths(accountsPaths); err != nil {
 		return err
+	}
+	accountsPath = accountsPaths[0]
+	// Check write permission early to fail fast with helpful error
+	for _, p := range accountsPaths {
+		if err := checkDirWritable(p, "AccountsDB"); err != nil {
+			return err
+		}
 	}
 	blockstorePath = getString("ledger-path", "storage.shredstore")
 	if blockstorePath == "" && config.IsSet("storage.blockstore") {
@@ -855,7 +889,7 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 			return err
 		}
 	}
-	alpenglowMode, err := alpenglowModeForCluster(cluster)
+	alpenglowMode, err := resolveProtocolMode(cluster, config.GetString("consensus.protocol"))
 	if err != nil {
 		return err
 	}
@@ -938,6 +972,16 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	turbineGossipBindAddr = getString("turbine-gossip-bind-addr", "turbine.gossip_bind_addr")
 	turbineAdvertisedIP = getString("turbine-advertised-ip", "turbine.advertised_ip")
 	turbineShredVersion = getInt("turbine-shred-version", "turbine.shred_version")
+	shredReceivers, err := parseShredReceivers("turbine.shred_receiver_addresses",
+		getStringSlice("shred-receiver-address", "turbine.shred_receiver_addresses"))
+	if err != nil {
+		return err
+	}
+	turbineShredReceivers = shredReceivers
+	if turbineShredRetransmitReceivers, err = parseShredReceivers("turbine.shred_retransmit_receiver_addresses",
+		getStringSlice("shred-retransmit-receiver-address", "turbine.shred_retransmit_receiver_addresses")); err != nil {
+		return err
+	}
 	repairCatchupMaxGapSlots = getInt("repair-catchup-max-gap-slots", "block.repair_catchup_max_gap_slots")
 	if repairCatchupMaxGapSlots < 0 {
 		repairCatchupMaxGapSlots = 0
@@ -1062,6 +1106,14 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		mlog.Log.Infof("consensus.mode=validator: Alpenglow TPU ingress, block production, and fail-closed Votor voting enabled")
 	}
 
+	// [harmonic] section — optional block engine integration for leader slots.
+	if harmonicConfig, err = loadHarmonicSettings(optionGetters{getString: getString, getInt64: getInt64, getBool: getBool}); err != nil {
+		return err
+	}
+	if harmonicConfig.enabled && consensusMode != "validator" {
+		return fmt.Errorf("harmonic.enabled=true requires consensus.mode=validator")
+	}
+
 	blockMaxRPS = getInt("block-max-rps", "block.max_rps")
 	blockMaxInflight = getInt("block-max-inflight", "block.max_inflight")
 	blockTipPollIntervalMs = getInt("block-tip-poll-ms", "block.tip_poll_interval_ms")
@@ -1151,6 +1203,12 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 
 	snapshot.ZstdDecoderConcurrency = getInt("zstd-decoder-concurrency", "tuning.zstd_decoder_concurrency")
 	snapshot.MaxConcurrentFlushers = getInt("max-concurrent-flushers", "tuning.max_concurrent_flushers")
+	snapshot.SnapshotFlushSortWorkers = getInt("flush-sort-workers", "tuning.flush_sort_workers")
+	snapshotAccountsDirMinFreeMB = getInt("snapshot-accounts-dir-min-free-mb", "tuning.snapshot_accounts_dir_min_free_mb")
+	if snapshotAccountsDirMinFreeMB < 0 {
+		return fmt.Errorf("tuning.snapshot_accounts_dir_min_free_mb must be >= 0, got %d", snapshotAccountsDirMinFreeMB)
+	}
+	snapshot.SnapshotAccountsDirMinFreeBytes = uint64(snapshotAccountsDirMinFreeMB) << 20
 	snapshot.SnapshotAppendVecCopyingWorkers = getInt("snapshot-append-vec-workers", "tuning.snapshot_append_vec_workers")
 	snapshot.SnapshotIndexEntryBuilderWorkers = getInt("snapshot-index-builder-workers", "tuning.snapshot_index_builder_workers")
 	snapshot.SnapshotIndexEntryCommitterWorkers = getInt("snapshot-index-committer-workers", "tuning.snapshot_index_committer_workers")
@@ -1189,7 +1247,7 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	}
 	resolvedSigverifyBackend = resolved
 	sbpf.UsePool = getBool("use-pool", "tuning.use_pool")
-	// [tuning] streaming execution (off by default; Alpenglow turbine only).
+	// [tuning] streaming execution (on by default; Alpenglow turbine only).
 	replay.StreamingExecutionCfg.Enabled = getBool("streaming-execution", "tuning.streaming_execution")
 	replay.StreamingExecutionCfg.Workers = getInt("streaming-workers", "tuning.streaming_workers")
 	replay.StreamingExecutionCfg.MinGroupBatches = getInt("streaming-min-group-batches", "tuning.streaming_min_group_batches")
@@ -1204,6 +1262,10 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	accountsdb.CommonAccountCacheMaxMB = getInt("common-account-cache-max-mb", "tuning.common_account_cache_max_mb")
 	if accountsdb.CommonAccountCacheMaxMB <= 0 {
 		return fmt.Errorf("tuning.common_account_cache_max_mb must be > 0")
+	}
+
+	if err := configureCacheSettings(cmd); err != nil {
+		return err
 	}
 
 	if err := configureMemoryBudgets(); err != nil {
@@ -1300,7 +1362,10 @@ func buildSnapshotConfig(rpcEndpoints []string) snapshotdl.SnapshotConfig {
 }
 
 func runLive(c *cobra.Command, args []string) (runErr error) {
-	alpenglowMode := cluster == "alpenglow"
+	alpenglowMode, protocolErr := resolveProtocolMode(cluster, config.GetString("consensus.protocol"))
+	if protocolErr != nil {
+		klog.Fatalf("%v", protocolErr)
+	}
 	if pprofPort != -1 {
 		startPprofHandlers(int(pprofPort))
 	}
@@ -1486,7 +1551,7 @@ func runLive(c *cobra.Command, args []string) (runErr error) {
 	var lbManager *lightbringer.Manager
 	useLightbringer := blockSource == "lightbringer"
 	useTurbine := blockSource == "turbine"
-	validatorIdentity, validatorIdentityPubkey, err := loadValidatorIdentityKeypair(validatorIdentityKeypair)
+	validatorIdentity, validatorIdentityConfigured, err := loadValidatorIdentity(validatorIdentityKeypair)
 	if err != nil {
 		klog.Fatalf("%v", err)
 	}
@@ -1562,6 +1627,7 @@ func runLive(c *cobra.Command, args []string) (runErr error) {
 				RootSlot:                   func() uint64 { return rootSlot },
 				UseChaCha8:                 true,
 				DedupAddrs:                 false,
+				ShredReceivers:             turbineShredRetransmitReceivers,
 				FloorSlot:                  m.Bank.Slot + 1,
 				ShredSpoolDir:              catchupShredSpoolDir(),
 				RepairMaxRequestsPerSecond: repairMaxRequestsPerSecond,
@@ -1625,9 +1691,10 @@ func runLive(c *cobra.Command, args []string) (runErr error) {
 		}
 		validatorVoteAccount = votePubkey
 		if validatorAuthorizedVoterKeypair == "" {
-			if len(validatorIdentity) == ed25519.PrivateKeySize {
-				validatorAuthorizedVoter = append(ed25519.PrivateKey(nil), validatorIdentity...)
-				mlog.Log.Infof("validator vote account configured: %s (authorized voter defaults to identity %s, matching Agave)", votePubkey, validatorIdentityPubkey)
+			// Left empty, the authorized voter is the identity holder's key and
+			// follows set-identity swaps.
+			if validatorIdentityConfigured {
+				mlog.Log.Infof("validator vote account configured: %s (authorized voter defaults to identity %s, matching Agave)", votePubkey, validatorIdentity.PublicKey())
 			}
 		} else {
 			authorizedVoter, authorizedVoterPubkey, err := loadValidatorPrivateKey("authorized voter", validatorAuthorizedVoterKeypair)
@@ -1645,8 +1712,8 @@ func runLive(c *cobra.Command, args []string) (runErr error) {
 		}
 		mlog.Log.FileOnlyf("validator authorized withdrawer configured: %s", withdrawerPubkey)
 	}
-	if validatorIdentityPubkey != "" {
-		mlog.Log.Infof("validator identity configured for native gossip: %s", validatorIdentityPubkey)
+	if validatorIdentityConfigured {
+		mlog.Log.Infof("validator identity configured for native gossip: %s", validatorIdentity.PublicKey())
 	} else if useTurbine && alpenglowObserverBindAddr != "" {
 		mlog.Log.Warnf("ALPENGLOW observer: no validator.identity_keypair configured; native gossip will use an ephemeral identity and may not receive staked Votor traffic")
 	}
@@ -1805,7 +1872,7 @@ func runLive(c *cobra.Command, args []string) (runErr error) {
 		// Build directly from the specified files (BuildAccountsDbPaths handles AccountsDB cleanup internally)
 		// NOTE: We do NOT clean snapshot files in explicit mode - user wants to keep their explicit snapshots
 		dp := progress.NewDualProgress()
-		accountsDb, manifest, err = snapshot.BuildAccountsDbPaths(ctx, snapshotArchivePath, incrementalSnapshotFilename, accountsPath, dp)
+		accountsDb, manifest, err = snapshot.BuildAccountsDbPaths(ctx, snapshotArchivePath, incrementalSnapshotFilename, accountsPaths, dp)
 		if err != nil {
 			klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
 		}
@@ -1829,7 +1896,7 @@ func runLive(c *cobra.Command, args []string) (runErr error) {
 			mlog.Log.Infof("WARNING: no state file found, AccountsDB may be from incomplete build")
 		}
 		mlog.Log.Infof("Resuming from existing AccountsDB at slot %d", accountsDBSlot)
-		accountsDb, err = accountsdb.OpenDb(accountsPath)
+		accountsDb, err = accountsdb.OpenDbPaths(accountsPaths)
 		if err != nil {
 			klog.Fatalf("failed to open AccountsDB at %s: %v", accountsPath, err)
 		}
@@ -1876,7 +1943,7 @@ func runLive(c *cobra.Command, args []string) (runErr error) {
 				state.RecordRebuild(accountsPath, 0, "", getVersion(), getCommit(), getBranch(), "new-snapshot mode (no prior state)")
 			}
 			mlog.Log.Infof("Cleaning up previous AccountsDB artifacts in %s", accountsPath)
-			snapshot.CleanAccountsDbDir(accountsPath)
+			snapshot.CleanAccountsDbDirs(accountsPaths)
 		}
 		// Clean existing snapshots (respecting retention setting)
 		if snapshotDownloadPath != "" {
@@ -1887,7 +1954,7 @@ func runLive(c *cobra.Command, args []string) (runErr error) {
 			mlog.Log.Infof("Cleaning up existing snapshot files in %s (keeping %d)", snapshotDownloadPath, maxSnapshots)
 			snapshot.CleanSnapshotDownloadDir(snapshotDownloadPath, maxSnapshots)
 		}
-		accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPath, blockstorePath)
+		accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPaths, blockstorePath)
 		if err != nil {
 			klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
 		}
@@ -1922,9 +1989,9 @@ func runLive(c *cobra.Command, args []string) (runErr error) {
 				state.RecordRebuild(accountsPath, 0, "", getVersion(), getCommit(), getBranch(), "new-incremental mode (no prior state)")
 			}
 			mlog.Log.Infof("Cleaning up previous AccountsDB artifacts in %s", accountsPath)
-			snapshot.CleanAccountsDbDir(accountsPath)
+			snapshot.CleanAccountsDbDirs(accountsPaths)
 		}
-		accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPath, blockstorePath, rpcEndpoints)
+		accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPaths, blockstorePath, rpcEndpoints)
 		if err != nil {
 			klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
 		}
@@ -1948,7 +2015,7 @@ func runLive(c *cobra.Command, args []string) (runErr error) {
 				state.RecordRebuild(accountsPath, 0, "", getVersion(), getCommit(), getBranch(), "snapshot mode (no prior state)")
 			}
 			mlog.Log.Infof("Cleaning up previous AccountsDB artifacts in %s", accountsPath)
-			snapshot.CleanAccountsDbDir(accountsPath)
+			snapshot.CleanAccountsDbDirs(accountsPaths)
 		}
 
 		// Check for existing fresh snapshot
@@ -1961,7 +2028,7 @@ func runLive(c *cobra.Command, args []string) (runErr error) {
 		if existingSnap != nil {
 			// Reuse existing snapshot
 			mlog.Log.Infof("Reusing existing snapshot file at slot %d", existingSnap.slot)
-			accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPath, blockstorePath, rpcEndpoints)
+			accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPaths, blockstorePath, rpcEndpoints)
 		} else {
 			// Download fresh
 			mlog.Log.Infof("no fresh snapshot file found, downloading new one")
@@ -1973,7 +2040,7 @@ func runLive(c *cobra.Command, args []string) (runErr error) {
 				}
 				snapshot.CleanSnapshotDownloadDir(snapshotDownloadPath, maxSnapshots)
 			}
-			accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPath, blockstorePath)
+			accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPaths, blockstorePath)
 		}
 		if err != nil {
 			klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
@@ -2051,7 +2118,7 @@ func runLive(c *cobra.Command, args []string) (runErr error) {
 						// mithrilState is guaranteed non-nil here (we prompted because it was stale)
 						state.RecordRebuild(accountsPath, mithrilState.LastSlot, mithrilState.LastBankhash, getVersion(), getCommit(), getBranch(), "user chose rebuild (stale AccountsDB)")
 						mlog.Log.Infof("Cleaning up previous AccountsDB artifacts in %s", accountsPath)
-						snapshot.CleanAccountsDbDir(accountsPath)
+						snapshot.CleanAccountsDbDirs(accountsPaths)
 					}
 					// choice 3 forces a fresh download: skip the local-reuse check.
 					if choice == 2 {
@@ -2059,7 +2126,7 @@ func runLive(c *cobra.Command, args []string) (runErr error) {
 					}
 					if existingSnap != nil {
 						mlog.Log.Infof("Reusing existing snapshot file at slot %d", existingSnap.slot)
-						accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPath, blockstorePath, rpcEndpoints)
+						accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPaths, blockstorePath, rpcEndpoints)
 					} else {
 						// Clean up old snapshot files
 						if snapshotDownloadPath != "" {
@@ -2069,7 +2136,7 @@ func runLive(c *cobra.Command, args []string) (runErr error) {
 							}
 							snapshot.CleanSnapshotDownloadDir(snapshotDownloadPath, maxSnapshots)
 						}
-						accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPath, blockstorePath)
+						accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPaths, blockstorePath)
 					}
 					if err != nil {
 						klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
@@ -2088,7 +2155,7 @@ func runLive(c *cobra.Command, args []string) (runErr error) {
 			mlog.Log.Infof("mode=auto: Resuming from existing AccountsDB at slot %d", accountsDBSlot)
 			// Record resume in history
 			state.RecordResume(accountsPath, mithrilState.LastSlot, mithrilState.LastBankhash, replay.CurrentRunID, getVersion(), getCommit(), getBranch())
-			accountsDb, err = accountsdb.OpenDb(accountsPath)
+			accountsDb, err = accountsdb.OpenDbPaths(accountsPaths)
 			if err != nil {
 				klog.Fatalf("failed to open AccountsDB at %s: %v", accountsPath, err)
 			}
@@ -2160,14 +2227,14 @@ func runLive(c *cobra.Command, args []string) (runErr error) {
 					state.RecordRebuild(accountsPath, 0, "", getVersion(), getCommit(), getBranch(), reason)
 				}
 				mlog.Log.Infof("Cleaning up previous AccountsDB artifacts in %s", accountsPath)
-				snapshot.CleanAccountsDbDir(accountsPath)
+				snapshot.CleanAccountsDbDirs(accountsPaths)
 			}
 
 			// Check for existing fresh snapshot
 			existingSnap := detectFreshSnapshot(snapshotDownloadPath, fullThreshold, rpcEndpoints, ctx)
 			if existingSnap != nil {
 				mlog.Log.Infof("Reusing existing snapshot file at slot %d", existingSnap.slot)
-				accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPath, blockstorePath, rpcEndpoints)
+				accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPaths, blockstorePath, rpcEndpoints)
 			} else {
 				// Clean up old snapshot files based on retention settings
 				maxSnapshots := config.GetInt("snapshot.max_full_snapshots")
@@ -2175,7 +2242,7 @@ func runLive(c *cobra.Command, args []string) (runErr error) {
 					maxSnapshots = 1 // default: keep 1 snapshot
 				}
 				snapshot.CleanSnapshotDownloadDir(snapshotDownloadPath, maxSnapshots)
-				accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPath, blockstorePath)
+				accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPaths, blockstorePath)
 			}
 			if err != nil {
 				klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
@@ -2342,7 +2409,7 @@ postBootstrap:
 		mlog.Log.Warnf("storage.fork_aware was removed: the working-set suffix engine handles fork switches via unwind+re-execute — delete the key")
 	}
 	// [verifier]: the trailing execution verifier (dual-watermark second leg).
-	vcfg := replay.TrailingVerifierDefaults()
+	vcfg := defaultVerifierConfigForBlockSource(alpenglowMode, blockSource, blockRPCFallback)
 	if config.IsSet("verifier.enabled") {
 		vcfg.Enabled = config.GetBool("verifier.enabled")
 	}
@@ -2484,12 +2551,11 @@ postBootstrap:
 			klog.Fatalf("--rewind-to-slot=%d is not a checkpoint-valid retained fold boundary\navailable checkpoint-valid fold boundaries: %s",
 				rewindToSlot, formatRewindPoints(validPoints))
 		}
-		res, rerr := accountsDb.RewindToBatchBoundary(uint64(rewindToSlot))
+		res, rerr := accountsDb.RewindToBatchBoundaryAndPersist(uint64(rewindToSlot), func(res accountsdb.RewindResult) error {
+			return persistRewindResult(accountsPath, mithrilState, res)
+		})
 		if rerr != nil {
 			klog.Fatalf("--rewind-to-slot=%d failed: %v\navailable checkpoint-valid fold boundaries: %s", rewindToSlot, rerr, formatRewindPoints(validPoints))
-		}
-		if err := adoptRewindResult(accountsPath, mithrilState, res); err != nil {
-			klog.Fatalf("--rewind-to-slot=%d: %v; re-bootstrap with --bootstrap snapshot", rewindToSlot, err)
 		}
 		mlog.Log.Warnf("rewound durable state to fold boundary at slot %d (%d batches / %d keys undone); replay resumes from slot %d",
 			res.NewThrough, res.UndoneBatches, res.UndoneKeys, mithrilState.GetResumeSlot())
@@ -2734,7 +2800,7 @@ postBootstrap:
 				}
 			}
 		}()
-		go monitorValidatorIdentityOwnership(ctx, rpcEndpoints, solana.PrivateKey(validatorIdentity).PublicKey(), sharedGossip, cancelRun)
+		go monitorValidatorIdentityOwnership(ctx, rpcEndpoints, validatorIdentity, sharedGossip, cancelRun)
 
 		epochSchedule := alpenglowEpochSchedule
 		global.SetWallClockSlotDuration(blockprod.AlpenglowSlotDuration)
@@ -2748,7 +2814,7 @@ postBootstrap:
 		mlog.Log.Infof("ALPENGLOW voting startup watermark: wall_clock=%d configured_wait_to_vote=%d wait_to_vote=%d", startupWallSlot, validatorWaitToVoteSlot, waitToVoteSlot)
 
 		broadcaster, err := turbine.NewTurbineBroadcaster(turbine.TurbineBroadcasterConfig{
-			Self:          solana.PrivateKey(validatorIdentity).PublicKey(),
+			Self:          validatorIdentity.PublicKey,
 			Peers:         sharedGossip,
 			Stakes:        turbineStakesForSlot,
 			EpochForSlot:  epochSchedule.GetEpoch,
@@ -2756,7 +2822,8 @@ postBootstrap:
 			UseChaCha8:    true,
 			// Agave treats custom/development clusters as non-deduplicating so
 			// every validator derives the same deterministic Turbine node list.
-			DedupAddrs: false,
+			DedupAddrs:     false,
+			ShredReceivers: turbineShredReceivers,
 		})
 		if err != nil {
 			klog.Fatalf("validator turbine broadcaster: %v", err)
@@ -2809,12 +2876,24 @@ postBootstrap:
 		if err := sharedGossip.SetTPUQUIC(tpuAdvertise); err != nil {
 			mlog.Log.Warnf("validator gossip TPU advertisement: %v", err)
 		}
+		// Harmonic is optional. Without it the leader loop has no hooks and
+		// its banks admit TPU transactions from the start.
+		var leaderHooks blockprod.LeaderHooks
+		if harmonicConfig.enabled {
+			hooks, stopHarmonic, err := startHarmonic(ctx, harmonicConfig, validatorIdentity, validatorVoteAccount, tpuService, sharedGossip,
+				gossip.TPUSockets{QUIC: tpuAdvertise, ForwardsQUIC: tpuAdvertise}, tpuCfg.Pipeline.TxV1Enabled)
+			if err != nil {
+				klog.Fatalf("start Harmonic: %v", err)
+			}
+			// Defers run in reverse: the leader loop, which calls the hooks,
+			// stops first, then Harmonic, then the TPU it submits to.
+			defer stopHarmonic()
+			leaderHooks = hooks
+		}
 
 		// Bind and validate local transports before consuming the durable clean
 		// voting marker. Startup configuration failures must not force recovery.
-		identityPubkey := solana.PrivateKey(validatorIdentity).PublicKey()
 		if err := consensusEngine.EnableVoting(consensusengine.VotingConfig{
-			Identity:                  validatorIdentity,
 			AuthorizedVoter:           validatorAuthorizedVoter,
 			VoteAccount:               validatorVoteAccount,
 			HistoryDir:                blockstorePath,
@@ -2834,8 +2913,9 @@ postBootstrap:
 			Peers: func(validators []alpenglow.ValidatorStake) []alpenglow.VotorPeer {
 				peers := make([]alpenglow.VotorPeer, 0, len(validators))
 				seen := make(map[solana.PublicKey]struct{}, len(validators))
+				self := validatorIdentity.PublicKey()
 				for _, validator := range validators {
-					if validator.Stake == 0 || validator.NodePubkey == identityPubkey {
+					if validator.Stake == 0 || validator.NodePubkey == self {
 						continue
 					}
 					addr, ok := sharedGossip.LookupAlpenglow(validator.NodePubkey)
@@ -2863,7 +2943,7 @@ postBootstrap:
 		leaderDone := make(chan struct{})
 		leaderLoop := blockprod.NewLeaderLoop(blockprod.LeaderLoopConfig{
 			Controller:        controller,
-			Identity:          solana.PrivateKey(validatorIdentity),
+			Identity:          validatorIdentity,
 			AccountsDb:        accountsDb,
 			Broadcaster:       broadcaster,
 			ShredVersion:      uint16(turbineShredVersion),
@@ -2916,6 +2996,8 @@ postBootstrap:
 			},
 			LeaderForSlot: global.LeaderForSlot,
 			RewardCerts:   rewardBuilder,
+			Hooks:         leaderHooks,
+			GateTPU:       leaderHooks != nil,
 			OnBlock: func(produced *block.Block) {
 				select {
 				case localBlocks <- produced:
@@ -2960,16 +3042,16 @@ postBootstrap:
 			}
 			return alpenglowEpochSchedule.GetEpoch(slot)
 		},
-		TurbineRootSlot:   global.ReplayFrontier,
-		TurbineUseChaCha8: true,
-		TurbineDedupAddrs: false,
+		TurbineRootSlot:       global.ReplayFrontier,
+		TurbineUseChaCha8:     true,
+		TurbineDedupAddrs:     false,
+		TurbineShredReceivers: turbineShredRetransmitReceivers,
 	}
 	if consensusMode == "validator" {
-		identity := solana.PrivateKey(validatorIdentity).PublicKey()
 		blockFetchOpts.LocalBlocks = localBlocks
 		blockFetchOpts.LocalLeaderForSlot = func(slot uint64) bool {
 			leader, ok := global.LeaderForSlot(slot)
-			return ok && leader == identity
+			return ok && leader == validatorIdentity.PublicKey()
 		}
 	}
 
@@ -2979,9 +3061,11 @@ postBootstrap:
 	}
 	if alpenglowMode {
 		consensusOpts.TransactionStatusCheckpointAfterCommit = func(selected *state.TransactionStatusCheckpointRef) error {
+			run := transactionStatusCleanupTask.Start()
 			removed, err := cleanupRetainedTransactionStatusCheckpoints(
 				accountsPath, accountsDb, compactCfg.RewindHorizonBatches, selected,
 			)
+			run.EndErr(err, func() string { return fmt.Sprintf("removed %d file(s)", len(removed)) })
 			if err == nil && len(removed) > 0 {
 				mlog.Log.FileOnlyf("transaction-status checkpoint retention removed %d file(s) outside the %d-batch rewind horizon",
 					len(removed), compactCfg.RewindHorizonBatches)
@@ -3015,6 +3099,21 @@ postBootstrap:
 	turbineAlpenglowAddr := ""
 	if alpenglowMode {
 		turbineAlpenglowAddr = alpenglowAddrForGossip(alpenglowObserverBindAddr)
+	}
+	// Agave's admin RPC. Started after voting is enabled so the voter's
+	// identity updater is registered before any set-identity can arrive.
+	if blockstorePath != "" {
+		adminServer, err := startAdminRPC(blockstorePath, validatorIdentity, accountsDb, validatorVoteAccount, turbineStakesForSlot)
+		if err != nil {
+			mlog.Log.Warnf("admin RPC unavailable, set-identity is disabled: %v", err)
+		} else {
+			mlog.Log.Infof("admin RPC listening on %s", adminServer.Path())
+			defer func() {
+				if err := adminServer.Close(); err != nil {
+					mlog.Log.Warnf("admin RPC close: %v", err)
+				}
+			}()
+		}
 	}
 	result := runReplayWithRecovery(ctx, accountsDb, accountsPath, manifest, resumeState, uint64(startSlot), liveEndSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, uint16(turbineShredVersion), turbineAlpenglowAddr, validatorIdentity, blockstorePath, int(txParallelism), true, useLightbringer, useTurbine, dbgOpts, metricsWriter, slotCtxSetter, mithrilState, blockFetchOpts, consensusOpts, compactCfg.RewindHorizonBatches, replayStartTime)
 	stopCompactor() // join before shutdown closes AccountsDB
@@ -3165,23 +3264,7 @@ func getVersion() string {
 // getCommit returns the git commit hash, preferring ldflags but falling back to
 // runtime/debug.BuildInfo for dev builds.
 func getCommit() string {
-	// If set via ldflags (release builds), use that
-	if version.GitCommit != "" && version.GitCommit != "unknown" {
-		return version.GitCommit
-	}
-	// Fallback to runtime/debug for dev builds (go build without ldflags)
-	if info, ok := debug.ReadBuildInfo(); ok {
-		for _, setting := range info.Settings {
-			if setting.Key == "vcs.revision" {
-				// Return short hash (8 chars) for consistency
-				if len(setting.Value) > 8 {
-					return setting.Value[:8]
-				}
-				return setting.Value
-			}
-		}
-	}
-	return "unknown"
+	return version.Commit()
 }
 
 // getBranch returns the git branch name, preferring ldflags but falling back to
@@ -3821,22 +3904,33 @@ const (
 // healthy. Passive gossip cannot always observe the winning record after its
 // own endpoint has been displaced, so use the already-configured RPC view as
 // an independent ownership check and stop cleanly instead of stalling replay.
-func monitorValidatorIdentityOwnership(ctx context.Context, rpcEndpoints []string, identity solana.PublicKey, client *gossip.Client, cancel context.CancelFunc) {
-	if len(rpcEndpoints) == 0 || client == nil || cancel == nil {
+//
+// The monitor follows the identity holder. A set-identity swap restarts the
+// grace period: until our fresh ContactInfo propagates, the cluster may still
+// advertise the previous owner of the new identity.
+func monitorValidatorIdentityOwnership(ctx context.Context, rpcEndpoints []string, holder *identity.Holder, client *gossip.Client, cancel context.CancelFunc) {
+	if len(rpcEndpoints) == 0 || holder == nil || client == nil || cancel == nil {
 		return
 	}
-	grace := time.NewTimer(validatorIdentityOwnershipGrace)
-	defer grace.Stop()
-	select {
-	case <-ctx.Done():
-		return
-	case <-grace.C:
-	}
-
 	ticker := time.NewTicker(validatorIdentityOwnershipPollInterval)
 	defer ticker.Stop()
+	identity := holder.PublicKey()
+	checkAfter := time.Now().Add(validatorIdentityOwnershipGrace)
 	conflicts := 0
 	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if current := holder.PublicKey(); current != identity {
+			identity, conflicts = current, 0
+			checkAfter = time.Now().Add(validatorIdentityOwnershipGrace)
+		}
+		if time.Now().Before(checkAfter) {
+			continue
+		}
+
 		expected := client.AdvertisedGossipAddr()
 		if expected != nil {
 			lookupCtx, lookupCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -3861,12 +3955,6 @@ func monitorValidatorIdentityOwnership(ctx context.Context, rpcEndpoints []strin
 				mlog.Log.Warnf("validator identity ownership check: cluster currently advertises gossip=%s for %s, expected %s (confirmation %d/%d)",
 					observed, identity.String(), expected.String(), conflicts, validatorIdentityConflictConfirmations)
 			}
-		}
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
 		}
 	}
 }
@@ -3920,7 +4008,7 @@ func queryLatestSnapshotSlot(ctx context.Context, rpcEndpoints []string) (uint64
 }
 
 // buildFromExistingSnapshot builds AccountsDB from an existing downloaded snapshot file.
-func buildFromExistingSnapshot(ctx context.Context, snap *snapshotInfo, snapshotDir, accountsPath, blockstorePath string, rpcEndpoints []string) (*accountsdb.AccountsDb, *snapshot.SnapshotManifest, error) {
+func buildFromExistingSnapshot(ctx context.Context, snap *snapshotInfo, snapshotDir string, accountsPaths []string, blockstorePath string, rpcEndpoints []string) (*accountsdb.AccountsDb, *snapshot.SnapshotManifest, error) {
 	snapCfg := buildSnapshotConfig(rpcEndpoints)
 
 	// Construct full path to snapshot file
@@ -3930,7 +4018,7 @@ func buildFromExistingSnapshot(ctx context.Context, snap *snapshotInfo, snapshot
 	// Create progress display for extract
 	dp := progress.NewDualProgress()
 
-	accountsDb, manifest, err := snapshot.BuildAccountsDbAuto(ctx, fullSnapshotPath, snapshotDir, int(snap.slot), int(snap.slot), accountsPath, rpcEndpoints, blockstorePath, snapCfg, dp)
+	accountsDb, manifest, err := snapshot.BuildAccountsDbAuto(ctx, fullSnapshotPath, snapshotDir, int(snap.slot), int(snap.slot), accountsPaths, rpcEndpoints, blockstorePath, snapCfg, dp)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to build AccountsDB from snapshot: %w", err)
 	}
@@ -3940,7 +4028,7 @@ func buildFromExistingSnapshot(ctx context.Context, snap *snapshotInfo, snapshot
 }
 
 // downloadAndBuildFromSnapshot finds, downloads, and builds AccountsDB from a snapshot
-func downloadAndBuildFromSnapshot(ctx context.Context, rpcEndpoints []string, snapshotDownloadPath, accountsPath, blockstorePath string) (*accountsdb.AccountsDb, *snapshot.SnapshotManifest, error) {
+func downloadAndBuildFromSnapshot(ctx context.Context, rpcEndpoints []string, snapshotDownloadPath string, accountsPaths []string, blockstorePath string) (*accountsdb.AccountsDb, *snapshot.SnapshotManifest, error) {
 	snapCfg := buildSnapshotConfig(rpcEndpoints)
 	fullSnapshotDlStart := time.Now()
 	fullSnapshotInfo, err := snapshotdl.GetSnapshotURLWithInfo(ctx, snapCfg)
@@ -3964,7 +4052,7 @@ func downloadAndBuildFromSnapshot(ctx context.Context, rpcEndpoints []string, sn
 	// Create progress display for snapshot download and extract
 	dp := progress.NewDualProgress()
 
-	accountsDb, manifest, err := snapshot.BuildAccountsDbAuto(ctx, fullSnapshotURL, snapshotDownloadPath, fullSnapshotSlot, fullSnapshotInfo.ReferenceSlot, accountsPath, rpcEndpoints, blockstorePath, snapCfg, dp)
+	accountsDb, manifest, err := snapshot.BuildAccountsDbAuto(ctx, fullSnapshotURL, snapshotDownloadPath, fullSnapshotSlot, fullSnapshotInfo.ReferenceSlot, accountsPaths, rpcEndpoints, blockstorePath, snapCfg, dp)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to build AccountsDB from snapshot: %w", err)
 	}
@@ -4307,7 +4395,7 @@ func retainedTransactionStatusCheckpointRefs(accountsDb *accountsdb.AccountsDb, 
 		}
 	}
 
-	headers, err := accountsdb.ListFoldManifests(accountsDb.AcctsDir)
+	headers, parkedPaths, err := accountsdb.ListFoldAndParkedManifests(accountsDb.AcctsDir)
 	if err != nil {
 		return nil, fmt.Errorf("list retained fold manifests: %w", err)
 	}
@@ -4332,15 +4420,7 @@ func retainedTransactionStatusCheckpointRefs(accountsDb *accountsdb.AccountsDb, 
 	// Parked manifests remain in the AccountsDB segment directory only while a
 	// rewind is incomplete. Completed forensic manifests live under rewound/
 	// and are no longer actionable, so they do not pin sidecars forever.
-	entries, err := os.ReadDir(accountsDb.AcctsDir)
-	if err != nil {
-		return nil, fmt.Errorf("scan parked fold manifests: %w", err)
-	}
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".manifest.rewound") {
-			continue
-		}
-		path := filepath.Join(accountsDb.AcctsDir, entry.Name())
+	for _, path := range parkedPaths {
 		manifest, err := accountsdb.ReadSegmentManifest(path)
 		if err != nil {
 			return nil, fmt.Errorf("read parked fold manifest %s: %w", path, err)
@@ -4400,32 +4480,58 @@ func adoptRewindResult(accountsDbPath string, s *state.MithrilState, res account
 	return nil
 }
 
-// completeInterruptedRewind finishes a rewind that crashed mid-flight (parked
-// ".rewound" manifests remain). It rewinds to the highest retained boundary
-// below the parked suffix — RewindToBatchBoundary is idempotent, so this works
-// whether the crash landed before the meta rollback (does the full rewind now)
-// or after it (a no-op that just finalizes the leftovers) — and adopts that
-// boundary as the rooted checkpoint. Fatals only when nothing is left to finish
-// the rewind with.
+// Persist a copy first so a failed save cannot publish a usable in-memory
+// checkpoint. The AccountsDB intent remains until this durable save succeeds.
+func persistRewindResult(path string, s *state.MithrilState, res accountsdb.RewindResult) error {
+	next := *s
+	if err := adoptRewindResult(path, &next, res); err != nil {
+		return err
+	}
+	if err := next.Save(path); err != nil {
+		return fmt.Errorf("persist rewound state: %w", err)
+	}
+	*s = next
+	return nil
+}
+
+// completeInterruptedRewind completes an exact durable intent first. Legacy
+// parked suffixes without an intent use the highest retained non-parked boundary.
+// Both paths save the lowered checkpoint before allowing forward replay.
 func completeInterruptedRewind(accountsDbPath string, accountsDb *accountsdb.AccountsDb, mithrilState *state.MithrilState) {
 	points, err := accountsDb.ListRewindPoints()
 	if err != nil || len(points) == 0 {
 		klog.Fatalf("interrupted rewind detected but no retained fold boundary remains to complete it; re-bootstrap with --bootstrap snapshot")
 	}
-	// The rewind parks every batch above its target, so the highest still-present
-	// (non-parked) boundary IS the target.
+	// A new intent fixes the target even before the first manifest is parked.
+	// Only legacy interruptions infer it from the remaining boundaries.
+	target, intentErr := accountsDb.PendingRewindTarget()
+	if intentErr != nil {
+		klog.Fatalf("invalid pending rewind intent: %v", intentErr)
+	}
 	targetPoint := points[len(points)-1]
-	target := targetPoint.ThroughSlot
+	if target != 0 {
+		found := false
+		for _, point := range points {
+			if point.ThroughSlot == target {
+				targetPoint, found = point, true
+				break
+			}
+		}
+		if !found {
+			klog.Fatalf("pending rewind target %d is not retained", target)
+		}
+	} else {
+		target = targetPoint.ThroughSlot
+	}
 	if err := validateTransactionStatusRewindPoint(accountsDbPath, accountsDb, targetPoint); err != nil {
 		klog.Fatalf("interrupted rewind target at slot %d has an invalid transaction-status checkpoint: %v; re-bootstrap with --bootstrap snapshot", target, err)
 	}
 	oldRooted := mithrilState.LastRootedSlot
-	res, rerr := accountsDb.RewindToBatchBoundary(target)
+	res, rerr := accountsDb.RewindToBatchBoundaryAndPersist(target, func(res accountsdb.RewindResult) error {
+		return persistRewindResult(accountsDbPath, mithrilState, res)
+	})
 	if rerr != nil {
 		klog.Fatalf("could not complete interrupted rewind to slot %d: %v; re-run --rewind-to-slot=%d", target, rerr, target)
-	}
-	if aerr := adoptRewindResult(accountsDbPath, mithrilState, res); aerr != nil {
-		klog.Fatalf("interrupted rewind at slot %d: %v; re-run --rewind-to-slot=%d", res.NewThrough, aerr, target)
 	}
 	mlog.Log.Warnf("completed interrupted rewind: durable state at fold boundary %d (state file said %d)", res.NewThrough, oldRooted)
 }
@@ -4464,21 +4570,19 @@ func rewindStoreBelowDivergence(accountsDbPath string, accountsDb *accountsdb.Ac
 		return false
 	}
 	oldRooted := s.LastRootedSlot
-	res, err := accountsDb.RewindToBatchBoundary(target)
+	res, err := accountsDb.RewindToBatchBoundaryAndPersist(target, func(res accountsdb.RewindResult) error {
+		if rewards, ok := rpcServer.(interface{ SetRootedEpochRewardsSlot(uint64) error }); ok {
+			if err := rewards.SetRootedEpochRewardsSlot(res.NewThrough); err != nil {
+				return fmt.Errorf("rewind RPC epoch rewards: %w", err)
+			}
+		}
+		return persistRewindResult(accountsDbPath, s, res)
+	})
 	if err != nil {
 		mlog.Log.Errorf("fork switch: rewind to boundary %d failed: %v; halting", target, err)
 		return false
 	}
-	if rewards, ok := rpcServer.(interface{ SetRootedEpochRewardsSlot(uint64) error }); ok {
-		if err := rewards.SetRootedEpochRewardsSlot(res.NewThrough); err != nil {
-			mlog.Log.Errorf("fork switch: rewind RPC epoch rewards to slot %d: %v; halting", res.NewThrough, err)
-			return false
-		}
-	}
-	if err := adoptRewindResult(accountsDbPath, s, res); err != nil {
-		mlog.Log.Errorf("fork switch: %v; halting", err)
-		return false
-	}
+
 	mlog.Log.Warnf("fork switch: superseded slot %d was already folded (R=%d); rewound durable state to boundary %d (%d batches / %d keys undone)",
 		divSlot, oldRooted, res.NewThrough, res.UndoneBatches, res.UndoneKeys)
 	if hasHistoryGate {
@@ -4510,7 +4614,7 @@ func runReplayWithRecovery(
 	turbineAdvertisedIP string,
 	turbineShredVersion uint16,
 	turbineAlpenglowAddr string,
-	turbineIdentity ed25519.PrivateKey,
+	turbineIdentity *identity.Holder,
 	blockDir string,
 	txParallelism int,
 	isLive bool,
@@ -4758,4 +4862,13 @@ func runReplayWithRecovery(
 		result = replay.ReplayBlocks(ctx, accountsDb, accountsDbPath, mithrilState, rs, retryStart, endSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, turbineShredVersion, turbineAlpenglowAddr, turbineIdentity, blockDir, txParallelism, isLive, useLightbringer, useTurbine, dbgOpts, metricsWriter, rpcServer, blockFetchOpts, consensusOpts, onCancelWriteState)
 	}
 	return result
+}
+
+func defaultVerifierConfigForBlockSource(alpenglow bool, source string, rpcFallback bool) replay.VerifierConfig {
+	cfg := replay.TrailingVerifierDefaults()
+	if alpenglow && source == "turbine" && !rpcFallback {
+		cfg.Enabled = false
+		cfg.ValidatorFooterHash = true
+	}
+	return cfg
 }

@@ -2,7 +2,6 @@ package sealevel
 
 import (
 	"bytes"
-	"slices"
 
 	//"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/cu"
@@ -144,13 +143,9 @@ func SyscallGetProcessedSiblingInstructionImpl(vm sbpf.VM, index, metaAddr, prog
 	var reverseIndexAtStackHeight uint64
 	var instrCtxFound *InstructionCtx
 
-	traceIdxs := make([]uint64, 0)
-	for i := range instrTraceLen {
-		traceIdxs = append(traceIdxs, i)
-	}
-	slices.Reverse(traceIdxs)
-
-	for _, indexInTrace := range traceIdxs {
+	// Walk the trace newest first.
+	for i := instrTraceLen; i > 0; i-- {
+		indexInTrace := i - 1
 		instrCtx, err := txCtx.InstructionCtxAtIndexInTrace(indexInTrace)
 		if err != nil {
 			return syscallErr(err)

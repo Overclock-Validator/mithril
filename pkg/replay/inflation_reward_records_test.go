@@ -275,7 +275,7 @@ func TestInflationRewardRecordsUseCalculationTimeCommission(t *testing.T) {
 				db, calculated.SpoolDir, slot, 0, slot+1, func(key solana.PublicKey) (*accounts.Account, error) {
 					require.Equal(t, stake, key)
 					return currentStake, nil
-				}, calculated.VoteCommissions)
+				}, calculated.VoteCommissions, rewards.StakeRewardDistributionConfig{})
 			require.Zero(t, burned)
 			wantStakingAmount, wantRecords := uint64(1_000)-tc.wantVotingRewards, 2
 			if tc.disabledInflation {

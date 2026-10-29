@@ -78,6 +78,7 @@ type AccountLoader struct {
 	InProgressHits    uint64
 	PendingFoldHits   uint64
 	CacheHits         uint64
+	NegativeCacheHits uint64
 	IndexHits         uint64
 	IndexMisses       uint64
 	UniqueAppendVecs  uint64
@@ -178,6 +179,7 @@ func (dst *AccountLoader) Accumulate(src AccountLoader) {
 	dst.InProgressHits += src.InProgressHits
 	dst.PendingFoldHits += src.PendingFoldHits
 	dst.CacheHits += src.CacheHits
+	dst.NegativeCacheHits += src.NegativeCacheHits
 	dst.IndexHits += src.IndexHits
 	dst.IndexMisses += src.IndexMisses
 	dst.UniqueAppendVecs += src.UniqueAppendVecs
@@ -359,13 +361,44 @@ type StreamingExecution struct {
 
 // Metrics for replaying a single block
 type BlockReplay struct {
-	Slot           uint64
-	AccountLoader  AccountLoader
-	TurbineIngress TurbineIngress
+	ComputeUnitsConsumed uint64
+	Slot                 uint64
+	AccountLoader        AccountLoader
+	TurbineIngress       TurbineIngress
 
 	// RewardCertificatePreflight runs before consensus admission and bank replay,
 	// outside SlotReplay, which starts after the candidate is admitted.
 	RewardCertificatePreflight Timing
+
+	// Replay-loop closure, so time outside SlotReplay cannot go unseen.
+	// SinceLastRow is the wall time since the previous row was written. It is
+	// this block's loop iteration plus the gap since the previous timestamp,
+	// including row export and iterations that wrote no row. The iteration tiles
+	// as LoopSourceWait (the source call, including any streaming callbacks) +
+	// LoopBeforeReplay (setup, admission, switches and preflight) +
+	// SlotReplay + LoopAfterReplay (consensus hand-off, promotion, logging and
+	// stats before this row). Source-call time is not necessarily idle time.
+	SinceLastRow     Timing
+	LoopIteration    Timing
+	LoopSourceWait   Timing
+	LoopBeforeReplay Timing
+	LoopAfterReplay  Timing
+	// ReplayStages tiles bank execution by the replay watchdog's stages: each
+	// stage change ends the previous stage, so the stages never overlap.
+	// Whole-block execution reports ProcessBlockUnstaged, the part of
+	// ProcessBlock before the first stage and after the last. For a streamed
+	// block the stages also cover waiting for its shreds (streaming_wait).
+	ReplayStages         map[string]Timing `json:",omitempty"`
+	ProcessBlockUnstaged Timing
+
+	// FoldOverlap is how much of this block's SlotReplay overlapped background
+	// fold work, which competes for CPU, the index and the disk. Comparing blocks
+	// with and without overlap measures that interference. UnrootedRetainedBytes
+	// and UnrootedHeldSlots are the unfolded tail after this block; replay stops
+	// admitting blocks when either reaches its cap.
+	FoldOverlap           Timing
+	UnrootedRetainedBytes uint64
+	UnrootedHeldSlots     uint64
 
 	// Exact slot wall-clock closure: SlotReplay equals the sum of the disjoint
 	// PreprocessBlock, ProcessBlock, and PostProcessBlock intervals. The more
@@ -443,6 +476,9 @@ type BlockReplay struct {
 	LtHashDeletedAccounts   uint64
 	LtHashOldDataBytes      uint64
 	LtHashNewDataBytes      uint64
+	// LtHashUnchangedDataBytes is the data of modified accounts whose new
+	// value hashes like their parent's, so they contribute no delta.
+	LtHashUnchangedDataBytes uint64
 
 	// Tx-level latencies summed for all the txs in a block.
 	InstructionsAndAccountMetasFromTx  Timing

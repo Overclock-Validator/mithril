@@ -1782,6 +1782,20 @@ func (s *slotState) decodeBlock(timings *entryDecodeTimings) (*block.Block, *Alp
 
 	blk := BlockFromEntries(s.slot, effectiveParentSlot, entries)
 	blk.AlpenglowShredVersion = s.shredVer
+	// Summarize the block for account prefetch before it is published, as the
+	// early batch decode does. The early decode is bounded to a few slots, so
+	// in catch-up many blocks are decoded only here; without a summary the
+	// prefetcher must skip them (it never reads a live block's transactions).
+	// Batches decoded early may already be in a stream, but streams execute
+	// copies (block.ExecutionCopies) and never mutate these objects, and the
+	// block is not yet published to replay, so reading them here is safe.
+	if refsHook := streamRefsHook.Load(); refsHook != nil && len(blk.Transactions) > 0 {
+		refs := SummarizeAccountRefs(blk.Transactions)
+		// Retain the same immutable summary with the completed block. Decode
+		// can run farther ahead than the prefetcher's bounded live-batch map.
+		blk.SetAccountPrefetchRefs(refs)
+		(*refsHook)(s.slot, refs)
+	}
 	if footer != nil {
 		blk.HasAlpenglowFooter = true
 		blk.SkipRewardCert = append([]byte(nil), footer.SkipRewardCert...)

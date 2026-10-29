@@ -540,6 +540,51 @@ func (slotCtx *SlotCtx) GetAccountFromAccountsDb(pubkey solana.PublicKey) (*acco
 	}
 }
 
+// getAccountFromAccountsDbReadOnly is restricted to program loading. The caller
+// must not mutate the account or its data, or pass them to mutable execution.
+// Keep bank sysvar precedence and fall back to the ordinary owned read for
+// sources that do not explicitly support immutable shared accounts.
+func (slotCtx *SlotCtx) getAccountFromAccountsDbReadOnly(pubkey solana.PublicKey) (*accounts.Account, error) {
+	acct, _, err := slotCtx.getProgramAccountSource(pubkey)
+	return acct, err
+}
+
+// The bool proves the source explicitly supports immutable shared accounts.
+// Merely returning an owned account is insufficient for identity-based reuse.
+func (slotCtx *SlotCtx) getProgramAccountSource(pubkey solana.PublicKey) (*accounts.Account, bool, error) {
+	if slotCtx.BankSysvars() == nil || !IsBankSysvarAccount(pubkey) {
+		if reader, ok := slotCtx.UnrootedRead.(interface {
+			GetAccountShared(uint64, solana.PublicKey) (*accounts.Account, error)
+		}); ok {
+			acct, err := reader.GetAccountShared(slotCtx.Slot, pubkey)
+			return acct, true, err
+		}
+	}
+	acct, err := slotCtx.GetAccountFromAccountsDb(pubkey)
+	return acct, false, err
+}
+
+// GetAccountDataLenFromAccountsDb resolves the same parent-bank version as
+// GetAccountFromAccountsDb, but allows a read source to return only its length.
+// No account or writable data buffer escapes this metadata-only operation.
+func (slotCtx *SlotCtx) GetAccountDataLenFromAccountsDb(pubkey solana.PublicKey) (uint64, error) {
+	if slotCtx.BankSysvars() == nil || !IsBankSysvarAccount(pubkey) {
+		if reader, ok := slotCtx.UnrootedRead.(interface {
+			GetAccountDataLen(uint64, solana.PublicKey) (uint64, error)
+		}); ok {
+			return reader.GetAccountDataLen(slotCtx.Slot, pubkey)
+		}
+	}
+	acct, err := slotCtx.GetAccountFromAccountsDb(pubkey)
+	if err != nil {
+		return 0, err
+	}
+	if acct == nil {
+		return 0, accountsdb.ErrNoAccount
+	}
+	return uint64(len(acct.Data)), nil
+}
+
 func (slotCtx *SlotCtx) SetAccount(pubkey solana.PublicKey, acct *accounts.Account) error {
 	pk := [32]byte(pubkey)
 	err := slotCtx.Accounts.SetAccount(&pk, acct)

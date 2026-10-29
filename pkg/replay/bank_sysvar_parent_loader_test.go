@@ -133,10 +133,19 @@ func TestParentDerivedBankLoadsLifecycleSysvarsFromExactSnapshot(t *testing.T) {
 		SlotsPerEpoch:            100,
 		LeaderScheduleSlotOffset: 0, // deliberately stale external schedule
 	}
-	_, parentAccts, _, childSnapshot, err := loadBlockAccountsAndUpdateSysvars(
-		&parentSnapshotOnlySource{t: t}, block, epochSchedule, true, parentSnapshot, nil,
+	accts, parentAccts, _, childSnapshot, err := loadBlockAccountsAndUpdateSysvars(
+		&parentSnapshotOnlySource{t: t}, block, epochSchedule, true, parentSnapshot, nil, 0,
 	)
 	require.NoError(t, err)
+	// A bank opened on a transaction-free block sizes its overlay from a
+	// handful of keys: one lock shard, unless the caller asks for more, as a
+	// streamed bank does.
+	require.Equal(t, 1, accts.(*accounts.OverlayAccounts).ShardCount())
+	streamedAccts, _, _, _, err := loadBlockAccountsAndUpdateSysvars(
+		&parentSnapshotOnlySource{t: t}, block, epochSchedule, true, parentSnapshot, nil, streamingOverlayKeys,
+	)
+	require.NoError(t, err)
+	require.Equal(t, 64, streamedAccts.(*accounts.OverlayAccounts).ShardCount())
 
 	childClock, ok := childSnapshot.Clock()
 	require.True(t, ok)

@@ -2,7 +2,6 @@ package turbine
 
 import (
 	"context"
-	"crypto/ed25519"
 	"encoding/binary"
 	"errors"
 	"net"
@@ -70,7 +69,7 @@ func TestRepairIncomingAdmissionReservation(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				sender := gossip.Pubkey(c.identity.Public().(ed25519.PublicKey))
+				sender := gossip.Pubkey(c.identity.PublicKey())
 				if n != 160 || !repairproto.VerifySignedRequest(wire[:n], sender) {
 					t.Fatal("initial request was not an authenticated repair packet")
 				}

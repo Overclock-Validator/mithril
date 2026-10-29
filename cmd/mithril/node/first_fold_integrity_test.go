@@ -11,9 +11,9 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/state"
-	"github.com/cockroachdb/pebble"
-	"github.com/cockroachdb/pebble/vfs"
-	"github.com/cockroachdb/pebble/vfs/errorfs"
+	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/vfs"
+	"github.com/cockroachdb/pebble/v2/vfs/errorfs"
 	"github.com/mr-tron/base58"
 	"github.com/stretchr/testify/require"
 )
@@ -152,8 +152,8 @@ func TestValidateRecoveredStateBeforeIntegrityLegacyAlpenglow(t *testing.T) {
 
 func TestValidateRecoveredStateBeforeIntegrityIteratorError(t *testing.T) {
 	var inject atomic.Bool
-	fs := errorfs.Wrap(vfs.NewMem(), errorfs.InjectorFunc(func(op errorfs.Op, path string) error {
-		if inject.Load() && strings.HasSuffix(path, ".sst") && op.OpKind() == errorfs.OpKindRead {
+	fs := errorfs.Wrap(vfs.NewMem(), errorfs.InjectorFunc(func(op errorfs.Op) error {
+		if inject.Load() && strings.HasSuffix(op.Path, ".sst") && op.Kind.ReadOrWrite() == errorfs.OpIsRead {
 			return errorfs.ErrInjected
 		}
 		return nil

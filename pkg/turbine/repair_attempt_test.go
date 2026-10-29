@@ -1,7 +1,6 @@
 package turbine
 
 import (
-	"crypto/ed25519"
 	"crypto/rand"
 	"io"
 	"net"
@@ -28,7 +27,7 @@ func sendLongLivedRepairForTest(t *testing.T, target int) (*repairClient, *net.U
 	if err != nil {
 		t.Fatal(err)
 	}
-	copy(peers[0].Pubkey[:], c.identity.Public().(ed25519.PublicKey))
+	peers[0].Pubkey = gossip.Pubkey(c.identity.PublicKey())
 	pol := headPolicy(1)
 	start := time.Now()
 	for c.requests.Load() < uint64(target) && time.Since(start) < 5*time.Minute {
@@ -75,7 +74,7 @@ func TestRepairAttemptReuseDuringSigning(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		copy(peers[0].Pubkey[:], c.identity.Public().(ed25519.PublicKey))
+		peers[0].Pubkey = gossip.Pubkey(c.identity.PublicKey())
 		previous := rand.Reader
 		gate := &repairNoncePause{reader: previous, started: make(chan struct{}), release: make(chan struct{})}
 		rand.Reader = gate

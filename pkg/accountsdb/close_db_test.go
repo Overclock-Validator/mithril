@@ -6,9 +6,9 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/cockroachdb/pebble"
-	"github.com/cockroachdb/pebble/vfs"
-	"github.com/cockroachdb/pebble/vfs/errorfs"
+	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/vfs"
+	"github.com/cockroachdb/pebble/v2/vfs/errorfs"
 )
 
 // TestCloseDbReturnsStoreCloseErrors arms empty WALs only after both stores open,
@@ -31,8 +31,8 @@ func TestCloseDbReturnsStoreCloseErrors(t *testing.T) {
 			var armed atomic.Bool
 			var indexWrites, bankWrites atomic.Int32
 			openStore := func(name string, fail bool, injected error, writes *atomic.Int32) (*pebble.DB, error) {
-				fs := errorfs.Wrap(vfs.NewMem(), errorfs.InjectorFunc(func(op errorfs.Op, path string) error {
-					if !armed.Load() || op != errorfs.OpFileWrite || !strings.HasSuffix(path, ".log") {
+				fs := errorfs.Wrap(vfs.NewMem(), errorfs.InjectorFunc(func(op errorfs.Op) error {
+					if !armed.Load() || op.Kind != errorfs.OpFileWrite || !strings.HasSuffix(op.Path, ".log") {
 						return nil
 					}
 					writes.Add(1)

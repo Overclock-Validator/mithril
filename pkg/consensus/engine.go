@@ -3,7 +3,6 @@ package consensus
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/alpenglow"
 	"github.com/Overclock-Validator/mithril/pkg/block"
+	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/gagliardetto/solana-go"
 )
@@ -189,9 +189,9 @@ type Engine interface {
 type Config struct {
 	AlpenglowObserverBindAddr string
 	AlpenglowMaxMessageBytes  int64
-	AlpenglowBLSDST           string             // BLS hash-to-curve DST; empty keeps the default (must match cluster's solana-bls version)
-	AlpenglowShredVersion     uint16             // included in each Alpenglow BLS vote-signing payload
-	AlpenglowIdentity         ed25519.PrivateKey // validator identity for staked Votor QUIC; empty is passive observer mode
+	AlpenglowBLSDST           string           // BLS hash-to-curve DST; empty keeps the default (must match cluster's solana-bls version)
+	AlpenglowShredVersion     uint16           // included in each Alpenglow BLS vote-signing payload
+	AlpenglowIdentity         *identity.Holder // validator identity for staked Votor QUIC and voting; nil is passive observer mode
 }
 
 // NewEngine constructs the Alpenglow observer engine — the only consensus
@@ -208,7 +208,7 @@ func NewEngine(cfg Config) (*AlpenglowObserverEngine, error) {
 		receiverBindAddr:        strings.TrimSpace(cfg.AlpenglowObserverBindAddr),
 		receiverMaxMessageBytes: cfg.AlpenglowMaxMessageBytes,
 		shredVersion:            cfg.AlpenglowShredVersion,
-		identity:                append(ed25519.PrivateKey(nil), cfg.AlpenglowIdentity...),
+		identity:                cfg.AlpenglowIdentity,
 		recentBlockIDs:          make(map[uint64]solana.Hash),
 		invalidBlockIDs:         make(map[alpenglow.BlockID]struct{}),
 		observedReplayBlocks:    make(map[uint64]alpenglow.ReplayBlockObservation),
@@ -235,7 +235,7 @@ type AlpenglowObserverEngine struct {
 	receiverBindAddr        string
 	receiverMaxMessageBytes int64
 	shredVersion            uint16
-	identity                ed25519.PrivateKey
+	identity                *identity.Holder
 	receiver                *alpenglow.Receiver
 	voterMu                 sync.RWMutex
 	voter                   *alpenglowVoter
@@ -422,6 +422,7 @@ func (e *AlpenglowObserverEngine) EnableVoting(cfg VotingConfig) error {
 	// Start while voterMu is still held: Close cannot observe and close an
 	// unstarted voter, while the loop can safely wait for this short lock hold.
 	voter.start()
+	voter.unregisterKey = e.identity.RegisterUpdater("Alpenglow voter", voter.updateIdentity)
 	e.voterMu.Unlock()
 	e.validatorSetsMu.RUnlock()
 	if err := e.drainPendingSafeToNotar(); err != nil {
@@ -659,7 +660,7 @@ func (e *AlpenglowObserverEngine) observeVotorMessage(msg alpenglow.Message) {
 // when it falls inside Agave's vote-verification window. The local identity
 // must itself be in that merged set or this endpoint remains fail-closed.
 func (e *AlpenglowObserverEngine) admitVotorPeer(peer solana.PublicKey) bool {
-	if peer == (solana.PublicKey{}) || len(e.identity) != ed25519.PrivateKeySize {
+	if peer == (solana.PublicKey{}) || e.identity == nil {
 		return false
 	}
 	epochs, ok := e.votorPeerEpochs()
@@ -667,7 +668,7 @@ func (e *AlpenglowObserverEngine) admitVotorPeer(peer solana.PublicKey) bool {
 		return false
 	}
 
-	local := solana.PublicKey(e.identity.Public().(ed25519.PublicKey))
+	local := e.identity.PublicKey()
 	e.validatorSetsMu.RLock()
 	defer e.validatorSetsMu.RUnlock()
 	localAdmitted := validatorIdentityInEpochs(e.validatorRanks, epochs, local)

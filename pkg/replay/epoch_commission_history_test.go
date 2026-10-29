@@ -170,7 +170,7 @@ func TestEpochBoundaryDelayedCommissionForReactivatedStake(t *testing.T) {
 			var paidStake uint64
 			for partition := uint64(0); partition < result.NumPartitions; partition++ {
 				stakes, parents, paid, burned, _ := rewards.DistributeStakingRewardsFromSpool(
-					db, result.SpoolDir, result.SpoolSlot, partition, distributionSlot+1+partition, nil, result.VoteCommissions)
+					db, result.SpoolDir, result.SpoolSlot, partition, distributionSlot+1+partition, nil, result.VoteCommissions, rewards.StakeRewardDistributionConfig{})
 				require.Zero(t, burned)
 				paidStake += paid
 				for i, acct := range stakes {
