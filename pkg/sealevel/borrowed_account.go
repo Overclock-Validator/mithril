@@ -54,13 +54,13 @@ func (acct *BorrowedAccount) SetData(features features.Features, data []byte) er
 	if err != nil {
 		return err
 	}
-	err = acct.Touch()
+	replacedAcct, oldLen, err := acct.TxCtx.Accounts.replaceData(acct.IndexInTransaction, data)
 	if err != nil {
 		return err
 	}
 
-	acct.UpdateAccountsResizeDelta(newLen)
-	acct.Account.SetData(data)
+	acct.Account = replacedAcct
+	acct.TxCtx.AccountsResizeDelta = (acct.TxCtx.AccountsResizeDelta + int64(newLen)) - int64(oldLen)
 
 	return nil
 }

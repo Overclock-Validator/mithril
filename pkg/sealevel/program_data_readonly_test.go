@@ -13,7 +13,6 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
-	"github.com/maypok86/otter"
 	"github.com/stretchr/testify/require"
 )
 
@@ -62,10 +61,7 @@ func upgradeableReadFixture(t testing.TB, w programWorkload) (accounts.Account, 
 func upgradeableReadRunner(t testing.TB, w programWorkload, vasa bool, reader AccountReader, local *accounts.Account) func() (*ExecutionCtx, error) {
 	t.Helper()
 	program, _ := upgradeableReadFixture(t, w)
-	cache, err := otter.MustBuilder[solana.PublicKey, *accountsdb.ProgramCacheEntry](1024).
-		Cost(func(solana.PublicKey, *accountsdb.ProgramCacheEntry) uint32 { return 1 }).Build()
-	require.NoError(t, err)
-	t.Cleanup(cache.Close)
+	cache := accountsdb.NewWeightedCache[solana.PublicKey, *accountsdb.ProgramCacheEntry](1024, func(solana.PublicKey, *accountsdb.ProgramCacheEntry) uint32 { return 1 })
 	db := &accountsdb.AccountsDb{ProgramCache: cache}
 	return func() (*ExecutionCtx, error) {
 		list := make([]accounts.Account, len(w.accts)+1)
@@ -198,6 +194,38 @@ func TestReadOnlyAccountSourceFallbackAndBankSysvars(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, want, got)
 	require.Equal(t, reads, source.shared.Load())
+}
+
+func TestReadOnlyProgramLocalMutationStillRevalidates(t *testing.T) {
+	w := expandedProgramWorkloads(t)[0]
+	_, data := upgradeableReadFixture(t, w)
+	source := &programReadSource{}
+	source.account.Store(data)
+	run := upgradeableReadRunner(t, w, false, source, data)
+	for range 3 {
+		_, err := run()
+		require.NoError(t, err)
+	}
+	// Reuse the same account and backing allocation, but mutate the local ELF.
+	// A local account must never receive the immutable-source optimization.
+	data.Data[upgradeableLoaderSizeOfProgramDataMetaData] = 0
+	_, err := run()
+	require.ErrorIs(t, err, InstrErrUnsupportedProgramId)
+	require.Zero(t, source.shared.Load())
+}
+
+func TestProgramAccountSourceProvenance(t *testing.T) {
+	key := benchPubkey(0x92)
+	source := &programReadSource{}
+	source.account.Store(&accounts.Account{Key: key, Data: []byte{1, 2, 3}})
+	ctx := &SlotCtx{UnrootedRead: source}
+	_, immutable, err := ctx.getProgramAccountSource(key)
+	require.NoError(t, err)
+	require.True(t, immutable)
+	ctx.UnrootedRead = ownedProgramReadSource{source}
+	_, immutable, err = ctx.getProgramAccountSource(key)
+	require.NoError(t, err)
+	require.False(t, immutable)
 }
 
 func BenchmarkUpgradeableProgramRead(b *testing.B) {
