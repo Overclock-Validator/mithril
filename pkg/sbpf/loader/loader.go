@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/sbpf"
@@ -21,9 +22,16 @@ var ErrOutOfBounds = errors.New("value out of bounds")
 // TODO Fuzz
 // TODO Differential fuzz against rbpf
 
+// Allocation-saving parse paths, on by default. MITHRIL_ELF_DIRECT_STRINGS=0
+// reads strings through the ReaderAt again, and MITHRIL_ELF_ITER_SCRATCH=0
+// decodes table entries through a fresh array, for comparisons.
+var directELFStrings = os.Getenv("MITHRIL_ELF_DIRECT_STRINGS") != "0"
+var iteratorScratch = os.Getenv("MITHRIL_ELF_ITER_SCRATCH") != "0"
+
 // Loader is based on solana_rbpf::elf_parser
 type Loader struct {
 	// File containing ELF
+	input    []byte // Same backing bytes as rd; retained only for the loader lifetime.
 	rd       io.ReaderAt
 	fileSize uint64
 
@@ -87,6 +95,7 @@ func NewLoaderFromBytes(buf []byte) (*Loader, error) {
 		return nil, fmt.Errorf("ELF file too large")
 	}
 	l := &Loader{
+		input:    buf,
 		rd:       bytes.NewReader(buf),
 		fileSize: uint64(len(buf)),
 	}
@@ -101,6 +110,7 @@ func NewLoaderWithSyscalls(buf []byte, syscalls sbpf.SyscallRegistry, elfDeployC
 	minVer, maxVer := sbpfver.GetMinAndMaxSbpfVersions(f)
 
 	l := &Loader{
+		input:           buf,
 		rd:              bytes.NewReader(buf),
 		fileSize:        uint64(len(buf)),
 		syscalls:        syscalls,
