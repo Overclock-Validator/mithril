@@ -63,7 +63,7 @@ func (hasher *AccountHasher) HashInto(dst *LtHash, acct *accounts.Account) {
 
 	// BLAKE3's XOF writes directly into the reusable LtHash. The previous
 	// implementation first allocated a separate 2 KiB output and copied it.
-	_, _ = hasher.hasher.Digest().Read(dst.bytes())
+	readXOF(hasher.hasher.Digest(), (*[2 * numElements]byte)(dst.bytes()))
 }
 
 func (ltHash *LtHash) InitWithAcct(acct *accounts.Account) *LtHash {
