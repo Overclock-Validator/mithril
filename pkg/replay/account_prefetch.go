@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,14 +41,21 @@ import (
 var (
 	accountPrefetchEnabled = os.Getenv("MITHRIL_ACCOUNT_PREFETCH") != "0"
 	tipWarmEnabled         = os.Getenv("MITHRIL_TIP_WARM") == "1"
+	// accountPrefetchWorkers bounds the storage goroutines of one warm-up read,
+	// so it takes one or two cores from the transaction loop, not all of them.
+	// MITHRIL_ACCOUNT_PREFETCH_WORKERS (1-8) overrides the default of 2.
+	accountPrefetchWorkers = func() int {
+		n, err := strconv.Atoi(os.Getenv("MITHRIL_ACCOUNT_PREFETCH_WORKERS"))
+		if err != nil || n < 1 || n > 8 {
+			return 2
+		}
+		return n
+	}()
 )
 
 const (
 	// accountPrefetchAhead is how many slots past the executing one are warmed.
-	accountPrefetchAhead = 1
-	// accountPrefetchWorkers bounds the storage goroutines of one warm-up read,
-	// so it takes one or two cores from the transaction loop, not all of them.
-	accountPrefetchWorkers      = 2
+	accountPrefetchAhead        = 1
 	accountPrefetchQueue        = 128
 	accountPrefetchPartialQueue = 1024
 	accountPrefetchMergeMax     = 64 // queued batches of one slot merged into one read
