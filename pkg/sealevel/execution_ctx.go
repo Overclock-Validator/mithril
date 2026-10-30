@@ -14,6 +14,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/lthash"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
+	"github.com/Overclock-Validator/mithril/pkg/spinlock"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -609,7 +610,7 @@ func (slotCtx *SlotCtx) RecordModifiedAccountStates(accountStates []*accounts.Ac
 	if len(accountStates) != len(touched) {
 		panic("account states/touched length mismatch")
 	}
-	slotCtx.AcctMapsMu.Lock()
+	spinlock.Lock(slotCtx.AcctMapsMu)
 	defer slotCtx.AcctMapsMu.Unlock()
 	for idx, acct := range accountStates {
 		if touched[idx] {

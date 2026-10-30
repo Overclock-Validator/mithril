@@ -293,3 +293,45 @@ func TestOverlayParentMissDoesNotBlockOtherShard(t *testing.T) {
 		t.Fatal("parent fallback read did not finish")
 	}
 }
+
+func TestOverlayParentMissDoesNotBlockSameKeyWrite(t *testing.T) {
+	parent := &blockingOverlayParent{
+		MemAccounts: NewMemAccounts(),
+		started:     make(chan struct{}),
+		release:     make(chan struct{}),
+	}
+	overlay := NewOverlayAccountsWithLen(parent, 1<<14)
+	key := transactionBatchTestKey(1)
+
+	getDone := make(chan struct{})
+	go func() {
+		_, _ = overlay.GetAccount((*[32]byte)(&key))
+		close(getDone)
+	}()
+	<-parent.started
+
+	released := false
+	defer func() {
+		if !released {
+			close(parent.release)
+		}
+	}()
+
+	writeDone := make(chan struct{})
+	go func() {
+		overlay.setTransactionAccounts([]*Account{{Key: key, Lamports: 3}}, []bool{true})
+		close(writeDone)
+	}()
+	select {
+	case <-writeDone:
+	case <-time.After(time.Second):
+		t.Fatal("same-key write blocked behind a parent read")
+	}
+	acct, err := overlay.GetAccount((*[32]byte)(&key))
+	require.NoError(t, err)
+	assert.Equal(t, uint64(3), acct.Lamports)
+
+	close(parent.release)
+	released = true
+	<-getDone
+}
