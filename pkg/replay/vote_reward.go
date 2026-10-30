@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
+	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/epochstakes"
 	"github.com/Overclock-Validator/mithril/pkg/features"
@@ -466,6 +468,11 @@ type creditedVoteAccount struct {
 // the parent value, which it then also returns as read so the caller can
 // record it as the account's parent image (see recordParentImage). It only
 // reads the bank, so it is safe for concurrent use.
+//
+// The parent is borrowed rather than copied twice (on by default;
+// MITHRIL_VOTE_PARENT_SHARED=0 reads an owned parent and copies it).
+var voteParentSharedEnabled = os.Getenv("MITHRIL_VOTE_PARENT_SHARED") != "0"
+
 func loadAccountLiveOrParentForReplay(slotCtx *sealevel.SlotCtx, pubkey solana.PublicKey) (acct, parent *accounts.Account, err error) {
 	if slotCtx == nil {
 		return nil, nil, fmt.Errorf("missing slot context")
@@ -473,9 +480,29 @@ func loadAccountLiveOrParentForReplay(slotCtx *sealevel.SlotCtx, pubkey solana.P
 	if acct, err := slotCtx.GetAccount(pubkey); err == nil && acct != nil {
 		return acct, nil, nil
 	}
+	// Parent data may be borrowed only from a source that explicitly promises
+	// immutable shared accounts. Keep a private header and one mutable deep copy;
+	// neither the reward update nor parent-header bookkeeping can mutate source.
+	// SlotCtx preserves pinned bank sysvars and non-sharing source fallbacks.
+	if voteParentSharedEnabled {
+		shared, readErr := slotCtx.ParentAccountReadOnly(pubkey)
+		if readErr != nil {
+			return nil, nil, readErr
+		}
+		if shared == nil {
+			return nil, nil, accountsdb.ErrNoAccount
+		}
+		header := *shared
+		return shared.Clone(), &header, nil
+	}
 	parent, err = slotCtx.GetAccountFromAccountsDb(pubkey)
 	if err != nil {
 		return nil, nil, err
+	}
+	// A source may report absence as a nil account without an error; callers
+	// skip a missing vote account, so report it as missing rather than panic.
+	if parent == nil {
+		return nil, nil, accountsdb.ErrNoAccount
 	}
 	return parent.Clone(), parent, nil
 }

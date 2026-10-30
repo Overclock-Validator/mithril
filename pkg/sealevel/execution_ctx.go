@@ -546,13 +546,30 @@ func (slotCtx *SlotCtx) GetAccountFromAccountsDb(pubkey solana.PublicKey) (*acco
 	}
 }
 
-// getAccountFromAccountsDbReadOnly is restricted to program loading. The caller
-// must not mutate the account or its data, or pass them to mutable execution.
+// getAccountFromAccountsDbReadOnly is restricted to program loading and parent
+// images (ParentAccountReadOnly). The caller must not mutate the account or its
+// data, or pass them to mutable execution.
 // Keep bank sysvar precedence and fall back to the ordinary owned read for
 // sources that do not explicitly support immutable shared accounts.
 func (slotCtx *SlotCtx) getAccountFromAccountsDbReadOnly(pubkey solana.PublicKey) (*accounts.Account, error) {
 	acct, _, err := slotCtx.getProgramAccountSource(pubkey)
 	return acct, err
+}
+
+// ParentAccountReadOnly resolves the same parent-bank version as
+// GetAccountFromAccountsDb, borrowing an immutable account only from sources
+// that explicitly support shared reads. Bank sysvar snapshots retain precedence.
+// Callers must not mutate the returned header or data; Clone makes a writable
+// account, and copying the header permits private bookkeeping without copying
+// the immutable payload. Retained parent data must never be mutated or recycled.
+func (slotCtx *SlotCtx) ParentAccountReadOnly(pubkey solana.PublicKey) (*accounts.Account, error) {
+	acct, err := slotCtx.getAccountFromAccountsDbReadOnly(pubkey)
+	if err != nil || acct != nil {
+		return acct, err
+	}
+	// Preserve the owning fallback if a shared-capable source has no shared
+	// value but can still resolve the account through its ordinary read.
+	return slotCtx.GetAccountFromAccountsDb(pubkey)
 }
 
 // The bool proves the source explicitly supports immutable shared accounts.
