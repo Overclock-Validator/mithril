@@ -13,6 +13,7 @@ import (
 	//"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/safemath"
 	"github.com/Overclock-Validator/mithril/pkg/sbpf"
+	mithrilsolana "github.com/Overclock-Validator/mithril/pkg/solana"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -258,11 +259,12 @@ func translateSigners(vm sbpf.VM, programId solana.PublicKey, signersSeedsAddr, 
 			seedBytes = append(seedBytes, seedFragmentMem)
 		}
 
-		pubkey, err := solana.CreateProgramAddress(seedBytes, programId)
+		// The PDA syscalls' derivation, whose on-curve check is memoized.
+		pubkey, err := mithrilsolana.CreateProgramAddressBytes(seedBytes, programId[:])
 		if err != nil {
 			return nil, PubkeyErrInvalidSeeds
 		}
-		pdas = append(pdas, pubkey)
+		pdas = append(pdas, solana.PublicKeyFromBytes(pubkey))
 	}
 
 	return pdas, nil
