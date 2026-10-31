@@ -1281,8 +1281,6 @@ func scannedDelegation(stored *accounts.Account) (solana.PublicKey, uint64, bool
 // data. Fatal error if index file is missing - indicates corrupt/incomplete AccountsDB.
 // NO manifest parameter - derives everything from AccountsDB.
 func setupInitialVoteAcctsAndStakeAccts(acctsDb *accountsdb.AccountsDb, block *b.Block, parentEpoch uint64) {
-	block.VoteTimestamps = make(map[solana.PublicKey]sealevel.BlockTimestamp)
-
 	waitStart := time.Now()
 	totals, err := takeStartupStakeScan(acctsDb)
 	if err != nil {
@@ -1330,16 +1328,34 @@ func setupInitialVoteAcctsAndStakeAccts(acctsDb *accountsdb.AccountsDb, block *b
 		mlog.Log.Infof("startup stake check: rawScanTotal=%d matches epochEffectiveTotal (all stakes fully warmed up)", rawScanTotal)
 	}
 
-	// Derive VoteTimestamps from ALL vote accounts in cache (including zero-stake)
-	// This matches original manifest behavior where all vote accounts had timestamps populated
+	block.VoteTimestamps = voteTimestampsFromCache()
+}
+
+// voteTimestampsFromCache derives VoteTimestamps from ALL vote accounts in the
+// cache (including zero-stake). This matches original manifest behavior where
+// all vote accounts had timestamps populated.
+func voteTimestampsFromCache() map[solana.PublicKey]sealevel.BlockTimestamp {
+	timestamps := make(map[solana.PublicKey]sealevel.BlockTimestamp)
 	for pk, voteState := range global.VoteCache() {
 		if voteState != nil {
 			ts := voteState.LastTimestamp()
 			if ts != nil {
-				block.VoteTimestamps[pk] = *ts
+				timestamps[pk] = *ts
 			}
 		}
 	}
+	return timestamps
+}
+
+// resumeVoteAndStakeAfterUnwind is setupInitialVoteAcctsAndStakeAccts for a
+// block configured right after an in-loop fork unwind. The unwind already
+// left the vote cache and the tail's stake totals describing the retained
+// parent, which may be unrooted, so reloading either from durable AccountsDB
+// would regress them. Only the block's own fields are derived. Epoch stakes
+// are unchanged: the unwind never crosses an epoch boundary.
+func resumeVoteAndStakeAfterUnwind(block *b.Block, parentEpoch uint64) error {
+	block.VoteTimestamps = voteTimestampsFromCache()
+	return seedEpochStakesForExecution(block, parentEpoch)
 }
 
 func configureInitialBlock(acctsDb *accountsdb.AccountsDb,
@@ -1526,11 +1542,16 @@ func ensureStakeHistorySysvarCached(acctsDb *accountsdb.AccountsDb, slot uint64)
 // configureInitialBlockFromResume configures the first block when resuming from a previous run.
 // Unlike configureInitialBlock which uses snapshot manifest data, this uses the ResumeState
 // which contains the actual parent slot/bankhash from the last replayed slot.
+// inLoopUnwind marks the first block after an in-loop fork unwind: replay is
+// resuming from a retained, possibly unrooted parent within the same process
+// and epoch rather than from durable state, so the process-global caches that
+// the unwind already restored are kept instead of rebuilt.
 func configureInitialBlockFromResume(acctsDb *accountsdb.AccountsDb,
 	block *b.Block,
 	resumeState *ResumeState,
 	mithrilState *state.MithrilState,
-	epochSchedule *sealevel.SysvarEpochSchedule) error {
+	epochSchedule *sealevel.SysvarEpochSchedule,
+	inLoopUnwind bool) error {
 
 	// Use resume state for parent info (the actual last replayed slot)
 	copy(block.ParentBankhash[:], resumeState.ParentBankhash)
@@ -1547,10 +1568,16 @@ func configureInitialBlockFromResume(acctsDb *accountsdb.AccountsDb,
 	block.PrevFeeRateGovernor = prevFeeRateGovernor
 	block.PrevNumSignatures = resumeState.NumSignatures
 
-	// Load vote accounts and populate global caches - same as fresh start
-	// This seeds both block.VoteAccts/VoteTimestamps AND global.VoteCache() from AccountsDB
-	// Required because getTimestampEstimate reads from global.VoteCache()
-	setupInitialVoteAcctsAndStakeAccts(acctsDb, block, epochSchedule.GetEpoch(block.ParentSlot))
+	if inLoopUnwind {
+		if err := resumeVoteAndStakeAfterUnwind(block, epochSchedule.GetEpoch(block.ParentSlot)); err != nil {
+			return err
+		}
+	} else {
+		// Load vote accounts and populate global caches - same as fresh start
+		// This seeds both block.VoteAccts/VoteTimestamps AND global.VoteCache() from AccountsDB
+		// Required because getTimestampEstimate reads from global.VoteCache()
+		setupInitialVoteAcctsAndStakeAccts(acctsDb, block, epochSchedule.GetEpoch(block.ParentSlot))
+	}
 	configureGlobalCtx(block)
 
 	// On resume, epoch stakes will be loaded from the persisted state file (not manifest or AccountsDB).
@@ -1560,16 +1587,23 @@ func configureInitialBlockFromResume(acctsDb *accountsdb.AccountsDb,
 		return fmt.Errorf("failed to ensure stake history sysvar cached: %w", err)
 	}
 
-	// Handle leader schedule
+	// Handle leader schedule. After an in-loop unwind the epoch's schedule is
+	// already installed (the unwind stays within the epoch); rebuild it only
+	// if it is somehow missing.
 	if global.ManageLeaderSchedule() {
-		_, err := PrepareLeaderScheduleLocal(block.Epoch, epochSchedule, "")
-		if err != nil {
-			panic(err)
-		}
 		var exists bool
-		block.Leader, exists = global.LeaderForSlot(block.Slot)
+		if inLoopUnwind {
+			block.Leader, exists = global.LeaderForSlot(block.Slot)
+		}
 		if !exists {
-			return fmt.Errorf("unable to find leader for slot %d", block.Slot)
+			_, err := PrepareLeaderScheduleLocal(block.Epoch, epochSchedule, "")
+			if err != nil {
+				panic(err)
+			}
+			block.Leader, exists = global.LeaderForSlot(block.Slot)
+			if !exists {
+				return fmt.Errorf("unable to find leader for slot %d", block.Slot)
+			}
 		}
 	}
 
@@ -1908,8 +1942,6 @@ func ReplayBlocks(
 	if CurrentRunID == "" {
 		CurrentRunID = GenerateRunID()
 	}
-	// Fresh vote/stake dirty watermark for this run (gates the in-loop unwind).
-	resetVoteStakeDirty()
 	nextLeader := newNextLeaderCursor(turbineIdentity)
 	// Create bankhash log file
 	bankhashLogPath := fmt.Sprintf("%s/bankhash.log", acctsDbPath)
@@ -2202,6 +2234,10 @@ func ReplayBlocks(
 		unrootedTailState = newUnrootedTail(acctsDb, acctsDb, unrootedTailHaltCap, FoldBatchSlots, filepath.Join(acctsDb.AcctsDir, ".."))
 		trackedStakeTotals = unrootedTailState.durableStakeTotals
 		defer func() { trackedStakeTotals = nil }()
+		// Each run starts from caches loaded from durable state, so the
+		// previous run's vote-cache undo records describe nothing.
+		voteJournal.reset(true)
+		defer voteJournal.reset(false)
 		var checkpointAfterCommit func(*state.TransactionStatusCheckpointRef) error
 		if consensusOpts != nil {
 			checkpointAfterCommit = consensusOpts.TransactionStatusCheckpointAfterCommit
@@ -3278,13 +3314,15 @@ func ReplayBlocks(
 		block.Epoch = epochSchedule.GetEpoch(currentSlot)
 		var configErr error
 		initialBlockConfigured := lastSlotCtx == nil
+		// Only an in-loop fork unwind supplies the retained parent's sysvars.
+		resumedInLoop := initialBlockConfigured && unwoundParentBankSysvars != nil
 		// Use lastSlotCtx == nil to detect first block, not currentSlot == startSlot.
 		// This handles the case where startSlot (or slots after it) are skipped -
 		// the first emitted block might have slot > startSlot.
 		if initialBlockConfigured {
 			if resumeState != nil {
 				// RESUME: Use resume state + state file (for static fields)
-				configErr = configureInitialBlockFromResume(acctsDb, block, resumeState, mithrilState, epochSchedule)
+				configErr = configureInitialBlockFromResume(acctsDb, block, resumeState, mithrilState, epochSchedule, resumedInLoop)
 			} else {
 				// FRESH START: Use state file manifest_* fields
 				configErr = configureInitialBlock(acctsDb, block, mithrilState, epochSchedule)
@@ -3298,7 +3336,7 @@ func ReplayBlocks(
 			result.Error = configErr
 			break
 		}
-		if initialBlockConfigured && unrootedTailState != nil {
+		if initialBlockConfigured && !resumedInLoop && unrootedTailState != nil {
 			unrootedTailState.initStakeTotals(acctsDb, configuredStakeTotals)
 		}
 		// Log replay start message once, after initial configuration completes

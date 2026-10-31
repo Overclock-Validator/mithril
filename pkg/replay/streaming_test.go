@@ -358,7 +358,6 @@ func TestStreamingDiscardUndoesGlobalSideEffects(t *testing.T) {
 	slotCtx.DeferVoteCachePublication = true
 	voteKey := solana.PublicKey{9}
 	putVoteCacheItem(slotCtx, voteKey, &sealevel.VoteStateVersions{})
-	markSlotVoteStakeDirty(slotCtx)
 	require.Nil(t, global.VoteCacheItem(voteKey), "deferred put stays off the global cache")
 	before := len(global.PendingStakeEntriesSnapshot())
 	global.EnqueuePendingStakePubkey(slot, solana.PublicKey{8})
@@ -366,7 +365,6 @@ func TestStreamingDiscardUndoesGlobalSideEffects(t *testing.T) {
 
 	h.exec.discard("test")
 	require.Nil(t, slotCtx.PendingVoteCache)
-	require.False(t, slotCtx.VoteStakeDirty)
 	require.Nil(t, global.VoteCacheItem(voteKey))
 	require.Len(t, global.PendingStakeEntriesSnapshot(), before, "the stream's stake index entries are dropped")
 	require.False(t, h.exec.matches(slot))
