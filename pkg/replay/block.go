@@ -3826,6 +3826,16 @@ func ReplayBlocks(
 		}
 		mlog.Log.FileOnlyf("slot %d detail | leader %s | txns v:%d nv:%d | exec %.3fs | wait %.3fs | total %.3fs",
 			block.Slot, leaderStr, voteTxCount, txnCount-voteTxCount, slotReplayDuration.Seconds(), waitTime.Seconds(), (waitTime + slotReplayDuration).Seconds())
+		// Distance from the tip: the leader stamps its footer when it finishes
+		// the block, so footer -> replayed is how far behind the producer this
+		// node's executed state is, split into propagation (footer -> full)
+		// and local replay. Leader clock skew shifts a leader's values; the
+		// spread across its slots is still exact.
+		if hasShreds && block.FooterProducerTimeNanos > 0 && block.FooterProducerTimeNanos <= uint64(math.MaxInt64) {
+			footer := int64(block.FooterProducerTimeNanos)
+			mlog.Log.FileOnlyf("slot %d tip | leader %s | footer->first %+.1fms | footer->full %+.1fms | footer->replayed %+.1fms",
+				block.Slot, leaderStr, float64(block.ShredFirstNanos-footer)/1e6, float64(block.ShredFullNanos-footer)/1e6, float64(time.Now().UnixNano()-footer)/1e6)
+		}
 
 		// Write bankhash to log file
 		if bankhashLogFile != nil {
