@@ -13,6 +13,7 @@ import (
 	//"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/safemath"
 	"github.com/Overclock-Validator/mithril/pkg/sbpf"
+	mithrilsolana "github.com/Overclock-Validator/mithril/pkg/solana"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -258,11 +259,12 @@ func translateSigners(vm sbpf.VM, programId solana.PublicKey, signersSeedsAddr, 
 			seedBytes = append(seedBytes, seedFragmentMem)
 		}
 
-		pubkey, err := solana.CreateProgramAddress(seedBytes, programId)
+		// The PDA syscalls' derivation, whose on-curve check is memoized.
+		pubkey, err := mithrilsolana.CreateProgramAddressBytes(seedBytes, programId[:])
 		if err != nil {
 			return nil, PubkeyErrInvalidSeeds
 		}
-		pdas = append(pdas, pubkey)
+		pdas = append(pdas, solana.PublicKeyFromBytes(pubkey))
 	}
 
 	return pdas, nil
@@ -419,16 +421,10 @@ func translateAccountInfosC(vm sbpf.VM, accountInfosAddr, accountInfosLen uint64
 		return nil, nil, err
 	}
 
-	reader := bytes.NewReader(accountInfosData)
-	accountInfos := make([]SolAccountInfoC, 0, accountInfosLen)
-
-	for count := uint64(0); count < accountInfosLen; count++ {
-		var acctInfo SolAccountInfoC
-		err = acctInfo.Unmarshal(reader)
-		if err != nil {
-			return nil, nil, err
-		}
-		accountInfos = append(accountInfos, acctInfo)
+	// Translate returned exactly accountInfosLen complete records.
+	accountInfos := make([]SolAccountInfoC, accountInfosLen)
+	for i := range accountInfos {
+		accountInfos[i].decode(accountInfosData[i*SolAccountInfoCSize:])
 	}
 
 	err = checkAccountInfos(execCtx, uint64(len(accountInfos)))
@@ -469,16 +465,10 @@ func translateAccountInfosRust(vm sbpf.VM, accountInfosAddr, accountInfosLen uin
 		return nil, nil, err
 	}
 
-	reader := bytes.NewReader(accountInfosData)
-	accountInfos := make([]SolAccountInfoRust, 0, accountInfosLen)
-
-	for count := uint64(0); count < accountInfosLen; count++ {
-		var acctInfo SolAccountInfoRust
-		err = acctInfo.Unmarshal(reader)
-		if err != nil {
-			return nil, nil, err
-		}
-		accountInfos = append(accountInfos, acctInfo)
+	// Translate returned exactly accountInfosLen complete records.
+	accountInfos := make([]SolAccountInfoRust, accountInfosLen)
+	for i := range accountInfos {
+		accountInfos[i].decode(accountInfosData[i*SolAccountInfoRustSize:])
 	}
 
 	err = checkAccountInfos(execCtx, uint64(len(accountInfos)))
@@ -606,13 +596,8 @@ func callerAccountFromAccountInfoRust(vm sbpf.VM, execCtx *ExecutionCtx, indexIn
 		return CallerAccount{}, err
 	}
 
-	reader := bytes.NewReader(lamportsBoxData)
-
 	var lamportsBox RefCellRust
-	err = lamportsBox.Unmarshal(reader)
-	if err != nil {
-		return CallerAccount{}, err
-	}
+	lamportsBox.decode(lamportsBoxData)
 
 	if execCtx.Features.IsActive(features.SyscallParameterAddressRestrictions) {
 		if err = checkAccountInfoPointer(lamportsBox.Addr, accountMetadata.vmLamportsAddr); err != nil {
@@ -639,13 +624,8 @@ func callerAccountFromAccountInfoRust(vm sbpf.VM, execCtx *ExecutionCtx, indexIn
 		return CallerAccount{}, err
 	}
 
-	reader.Reset(dataBoxBytes)
-
 	var dataBox RefCellVecRust
-	err = dataBox.Unmarshal(reader)
-	if err != nil {
-		return CallerAccount{}, err
-	}
+	dataBox.decode(dataBoxBytes)
 
 	originalDataLen := dataBox.Len
 	if usesSerializedAccountMetadata {
@@ -888,7 +868,7 @@ func translateAndUpdateAccountsC(vm sbpf.VM, instructionAccts []InstructionAccou
 		return nil, err
 	}
 
-	accounts := make(TranslatedAccounts, 0)
+	accounts := make(TranslatedAccounts, 0, len(instructionAccts)+1)
 
 	idx := len(programIndices) - 1
 	if idx < 0 {
@@ -997,7 +977,7 @@ func translateAndUpdateAccountsRust(vm sbpf.VM, instructionAccts []InstructionAc
 		return nil, err
 	}
 
-	accounts := make(TranslatedAccounts, 0)
+	accounts := make(TranslatedAccounts, 0, len(instructionAccts)+1)
 
 	idx := len(programIndices) - 1
 	if idx < 0 {

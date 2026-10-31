@@ -420,3 +420,20 @@ func BenchmarkVoteRewardCredit664(b *testing.B) {
 		})
 	}
 }
+
+// nilParentReader reports every account as absent without an error.
+type nilParentReader struct{}
+
+func (nilParentReader) GetAccount(uint64, solana.PublicKey) (*accounts.Account, error) {
+	return nil, nil
+}
+
+// A source that reports absence as (nil, nil) must yield a missing-account
+// error, which the reward pass skips, not a nil dereference.
+func TestLoadAccountLiveOrParentNilParentIsMissing(t *testing.T) {
+	slotCtx := &sealevel.SlotCtx{Accounts: accounts.NewMemAccounts(), UnrootedRead: nilParentReader{}}
+	acct, parent, err := loadAccountLiveOrParentForReplay(slotCtx, solana.PublicKey{0xfe})
+	require.ErrorIs(t, err, accountsdb.ErrNoAccount)
+	require.Nil(t, acct)
+	require.Nil(t, parent)
+}
