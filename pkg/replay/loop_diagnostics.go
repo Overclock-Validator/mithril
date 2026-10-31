@@ -35,7 +35,7 @@ func recordUnrootedTail(tail *unrootedTail) {
 	metrics.GlobalBlockReplay.UnrootedRetainedBytes = bytes
 	metrics.GlobalBlockReplay.UnrootedHeldSlots = slots
 	unrootedRetainedLevel.Observe(bytes, tail.maxBytes)
-	unrootedHeldLevel.Observe(slots, uint64(max(tail.haltCap, 0)))
+	unrootedHeldLevel.Observe(slots, tail.slotLimit())
 }
 
 // recordReplayLoopClosure writes the loop timings for the row about to be
