@@ -114,6 +114,35 @@ func TestSparseCompactionRefusesUnknownRewindPins(t *testing.T) {
 	require.ErrorContains(t, err, "cannot establish rewind pins")
 }
 
+// Readers that arrive while dead pages are punched resolve the current index
+// and must not wait for the punches or the fsync: the drain barrier is only
+// acquired, not held.
+func TestSparseCompactionDoesNotBlockReadersWhilePunching(t *testing.T) {
+	db, _ := newFoldTestDb(t)
+	defer db.CloseDb()
+	big := bytes.Repeat([]byte{0x5a}, 16<<20)
+	commitTestBatch(t, db, 110, foldAcct(1, 10, big), foldAcct(2, 20, []byte("keep")))
+	commitTestBatch(t, db, 120, foldAcct(1, 11, nil))
+	commitTestBatch(t, db, 130, foldAcct(1, 12, nil))
+	commitTestBatch(t, db, 140, foldAcct(1, 13, nil))
+	punched := 0
+	db.compactHooks.afterSparsePunch = func() {
+		punched++
+		read := make(chan uint64, 1)
+		go func() { read <- mustColdRead(t, db, 140, solana.PublicKey{2}).Lamports }()
+		select {
+		case lamports := <-read:
+			require.Equal(t, uint64(20), lamports)
+		case <-time.After(5 * time.Second):
+			t.Fatal("a cold read blocked behind sparse punching")
+		}
+	}
+	stats, err := db.CompactOnce(CompactionConfig{RewindHorizonBatches: 1})
+	require.NoError(t, err)
+	require.Positive(t, punched, "the fixture must exercise the punch path")
+	require.Equal(t, 1, stats.FilesSparsified)
+}
+
 func TestSparseCompactionWaitsForOlderIndexReaders(t *testing.T) {
 	db, _ := newFoldTestDb(t)
 	defer db.CloseDb()

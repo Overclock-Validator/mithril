@@ -122,9 +122,16 @@ func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte,
 		db.compactHooks.afterSparseMarker()
 	}
 	// Drain readers holding older index snapshots before punching any bytes.
-	// foldMu prevents new index generations while the plan is applied.
+	// foldMu prevents new index generations while the plan is applied, so a
+	// reader that takes the read side after this barrier resolves locations
+	// from the current index, which references no dead payload (liveness is
+	// exact and pinned undo records are kept). The barrier therefore only
+	// needs to be acquired, not held: holding it across the punches and the
+	// fsync blocked every cold account read for the whole operation (up to
+	// 16 ms per file, a few hundred ms of reader wait a minute on mainnet). A
+	// sequential scanner sees a dead payload's old bytes or zeros either way.
 	db.appendVecReadMu.LockAs("compaction")
-	defer db.appendVecReadMu.Unlock()
+	db.appendVecReadMu.Unlock()
 	for _, span := range dead {
 		if err := punchDeadPayload(f, span.offset, span.length); err != nil {
 			return 0, scanned, false, err
