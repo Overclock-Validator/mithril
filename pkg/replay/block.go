@@ -2784,6 +2784,7 @@ func ReplayBlocks(
 		if rs.TransactionCount != nil {
 			global.SetTransactionCount(*rs.TransactionCount) // drop the discarded fork's txs
 		}
+		global.SetCompletedBank(global.CompletedBank{Slot: rs.ParentSlot, BlockHeight: rs.ParentBlockHeight, TransactionCount: global.TransactionCount()})
 		blockStream.SetLastExecutedSlot(rs.ParentSlot)
 		replayFrontier = rs.ParentSlot
 		global.SetReplayFrontier(rs.ParentSlot)
@@ -3485,6 +3486,7 @@ func ReplayBlocks(
 		metrics.GlobalBlockReplay.ChainTipUpdate.AddTimingSince(chainTipStart)
 
 		global.SetBlockHeight(block.BlockHeight)
+		global.SetCompletedBank(global.CompletedBank{Slot: block.Slot, BlockHeight: block.BlockHeight, TransactionCount: global.TransactionCount()})
 		if trailingVerifier != nil {
 			trailingVerifier.Record(buildSlotDigest(block))
 		}

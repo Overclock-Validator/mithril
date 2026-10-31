@@ -13,6 +13,7 @@ import (
 
 func TestGetEpochInfoSchedule(t *testing.T) {
 	savedSlot, savedEpoch := global.Slot(), global.Epoch()
+	global.ResetCompletedBank()
 	t.Cleanup(func() {
 		global.SetSlot(savedSlot)
 		global.SetEpoch(savedEpoch)
@@ -76,4 +77,39 @@ func TestGetEpochInfoSchedule(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Replay sets the slot when a block starts, adds its transactions during
+// execution and sets the block height when it completes. getEpochInfo must
+// report the last completed bank, not a mix of it and the executing block.
+func TestGetEpochInfoReportsOneCompletedBank(t *testing.T) {
+	savedSlot, savedHeight, savedCount := global.Slot(), global.BlockHeight(), global.TransactionCount()
+	t.Cleanup(func() {
+		global.SetSlot(savedSlot)
+		global.SetBlockHeight(savedHeight)
+		global.SetTransactionCount(savedCount)
+		global.ResetCompletedBank()
+	})
+	schedule := sealevel.SysvarEpochSchedule{SlotsPerEpoch: 32, LeaderScheduleSlotOffset: 32}
+	server := NewRpcServer(nil, 0, &schedule, solana.Hash{1})
+	require.NoError(t, server.listener.Close())
+	endpoint := httptest.NewServer(server)
+	t.Cleanup(endpoint.Close)
+	client := solanarpc.New(endpoint.URL)
+
+	global.SetCompletedBank(global.CompletedBank{Slot: 70, BlockHeight: 60, TransactionCount: 1000})
+	// The next block has started and executed some transactions.
+	global.SetSlot(71)
+	global.SetBlockHeight(60)
+	global.SetTransactionCount(1250)
+
+	got, err := client.GetEpochInfo(t.Context(), solanarpc.CommitmentProcessed)
+	require.NoError(t, err)
+	require.EqualValues(t, 70, got.AbsoluteSlot)
+	require.EqualValues(t, 60, got.BlockHeight)
+	require.NotNil(t, got.TransactionCount)
+	require.EqualValues(t, 1000, *got.TransactionCount)
+	require.EqualValues(t, 2, got.Epoch)
+	require.EqualValues(t, 6, got.SlotIndex)
+	require.EqualValues(t, 32, got.SlotsInEpoch)
 }
