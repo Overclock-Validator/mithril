@@ -117,6 +117,12 @@ const (
 	commonAccountCacheEntryOverheadBytes   = 256
 )
 
+// indexPebbleMaxOpenFiles sizes the index's table cache. Pebble's default of
+// 1000 is below the table count of a mainnet index (about 2,400), so random
+// account lookups and the startup stake scan kept closing and reopening
+// tables, rereading their index and filter blocks.
+const indexPebbleMaxOpenFiles = 8192
+
 // DisableIndexWAL (storage.index_wal=false) runs the account index without a
 // Pebble WAL: the fold manifests are the index redo log, and recovery replays
 // the contiguous manifest run above the committed fold meta. Set before
@@ -129,6 +135,7 @@ func NewAccountsIndexPebbleOptions(logger pebble.Logger) *pebble.Options {
 		MemTableSize:                indexPebbleMemTableSize,
 		MemTableStopWritesThreshold: indexPebbleMemTableStopWritesThreshold,
 		DisableWAL:                  DisableIndexWAL,
+		MaxOpenFiles:                indexPebbleMaxOpenFiles,
 	}
 }
 
