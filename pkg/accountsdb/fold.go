@@ -120,7 +120,11 @@ func (db *AccountsDb) CommitBatch(
 ) (BatchCommitResult, error) {
 	var timings FoldTimings
 	clock := stepClock{last: time.Now()}
+	// Announce the wait so a compaction cycle holding foldMu stops at its next
+	// file boundary instead of finishing its whole budget first.
+	db.foldWaiters.Add(1)
 	db.foldMu.LockAs("fold")
+	db.foldWaiters.Add(-1)
 	defer db.foldMu.Unlock()
 	clock.step(&timings.LockWait)
 
