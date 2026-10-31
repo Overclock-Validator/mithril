@@ -823,7 +823,6 @@ func (s *streamingExecutor) discard(reason string) {
 			// entries at later slots.
 			exec.slotCtx.PendingVoteCache = nil
 			exec.slotCtx.PendingVoteCacheDeletes = nil
-			exec.slotCtx.VoteStakeDirty = false
 		}
 	}
 	global.DropPendingStakePubkeys(cur.slot)

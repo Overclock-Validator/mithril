@@ -39,7 +39,7 @@ func TestStartupAcrossEpochBoundary(t *testing.T) {
 		testStartupAcrossEpochBoundary(t, mode, offset)
 		return
 	}
-	for _, mode := range []string{"snapshot", "resume", "persisted", "cached"} {
+	for _, mode := range []string{"snapshot", "resume", "persisted", "cached", "inloop"} {
 		for _, offset := range []uint64{0, 3} {
 			t.Run(fmt.Sprintf("%s/skipped_%d", mode, offset), func(t *testing.T) {
 				cmd := exec.Command(os.Args[0], "-test.run=^TestStartupAcrossEpochBoundary$", "-test.v")
@@ -121,10 +121,20 @@ func testStartupAcrossEpochBoundary(t *testing.T, mode string, offset uint64) {
 	require.Equal(t, parentEpoch, parentBankEpoch)
 	require.NoError(t, LoadInitialEpochStakesCache(ms, resume, parentBankEpoch, schedule.GetEpoch(ms.ManifestParentSlot)))
 	blk := &b.Block{Slot: parentSlot + 1 + offset, Epoch: enteringEpoch}
+	// A cache entry no durable reload would produce: the in-loop resume must
+	// keep it (the unwind already restored the cache), every other resume must
+	// rebuild it from AccountsDB.
+	planted := &sealevel.VoteStateVersions{}
+	global.PutVoteCacheItem(voteKey, planted)
 	if resume == nil {
 		require.NoError(t, configureInitialBlock(db, blk, ms, schedule))
 	} else {
-		require.NoError(t, configureInitialBlockFromResume(db, blk, resume, ms, schedule))
+		require.NoError(t, configureInitialBlockFromResume(db, blk, resume, ms, schedule, mode == "inloop"))
+	}
+	if mode == "inloop" {
+		require.Same(t, planted, global.VoteCacheItem(voteKey), "an in-loop resume keeps the unwound vote cache")
+	} else {
+		require.NotSame(t, planted, global.VoteCacheItem(voteKey), "a durable resume rebuilds the vote cache")
 	}
 	require.Equal(t, [32]byte(parentBlockhash), blk.LastBlockhash)
 	require.Equal(t, [32]byte(parentBlockhash), global.LatestBlockHash())
@@ -132,6 +142,9 @@ func testStartupAcrossEpochBoundary(t *testing.T, mode string, offset uint64) {
 	require.Equal(t, parentStake, blk.TotalEpochStake, "initial configuration inherits the parent's execution stakes")
 	require.Equal(t, parentStake, blk.EpochStakesPerVoteAcct[voteKey])
 	require.Equal(t, mode == "cached", global.HasEpochStakes(enteringEpoch+1))
+	if mode == "inloop" {
+		return // an in-loop unwind never crosses an epoch boundary
+	}
 
 	f := features.NewFeaturesDefault()
 	blk.Features = f

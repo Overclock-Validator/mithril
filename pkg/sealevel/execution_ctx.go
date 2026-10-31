@@ -113,14 +113,12 @@ type SlotCtx struct {
 	// the block is accepted, so a discard leaves nothing behind.
 	//
 	// DeferVoteCachePublication buffers global vote-cache puts and deletes in
-	// the pending maps (protected by PendingVoteCacheMu) and turns the
-	// vote/stake dirty marker into VoteStakeDirty; the replay finalize step
-	// publishes them once the bank is accepted.
+	// the pending maps (protected by PendingVoteCacheMu); the replay finalize
+	// step publishes them once the bank is accepted.
 	DeferVoteCachePublication bool
 	PendingVoteCacheMu        sync.Mutex
 	PendingVoteCache          map[solana.PublicKey]*VoteStateVersions
 	PendingVoteCacheDeletes   map[solana.PublicKey]struct{}
-	VoteStakeDirty            bool
 	// TrackProgramCacheAdds records every program-cache insertion made while
 	// executing this bank so a discarded bank can evict them again (eviction
 	// only forces a reload from account data, so it is always safe).

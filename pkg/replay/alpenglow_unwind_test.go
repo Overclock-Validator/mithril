@@ -202,24 +202,10 @@ func TestResolveInitialTransactionCount(t *testing.T) {
 	assert.True(t, exact, "explicit zero must not fall back to the manifest")
 }
 
-// The vote/stake dirty watermark is a monotonic max, reset per run.
-func TestVoteStakeDirtyWatermark(t *testing.T) {
-	resetVoteStakeDirty()
-	assert.Equal(t, uint64(0), voteStakeDirtySlot.Load())
-	markVoteStakeDirty(100)
-	markVoteStakeDirty(50) // lower — monotonic max holds
-	assert.Equal(t, uint64(100), voteStakeDirtySlot.Load())
-	markVoteStakeDirty(150)
-	assert.Equal(t, uint64(150), voteStakeDirtySlot.Load())
-	resetVoteStakeDirty()
-	assert.Equal(t, uint64(0), voteStakeDirtySlot.Load())
-}
-
-// The in-loop unwind proceeds when the unwound suffix left the global vote/stake
-// caches untouched, but falls back to the rooted-checkpoint re-replay when a
-// slot in that suffix mutated them (P1) — the unwind can only roll back account
-// state, not those process-global caches.
-func TestTryInLoopUnwindFallsBackWhenVoteStakeDirty(t *testing.T) {
+// The in-loop unwind proceeds whatever the suffix wrote to the vote cache: it
+// undoes the unwound slots' vote-cache writes and keeps the retained ones, so
+// the cache matches the retained parent without a reload from durable state.
+func TestTryInLoopUnwindRestoresVoteCache(t *testing.T) {
 	previousEpochRewards := sealevel.SysvarCache.EpochRewards
 	t.Cleanup(func() {
 		sealevel.SysvarCache.EpochRewards.Sysvar = previousEpochRewards.Sysvar
@@ -227,6 +213,8 @@ func TestTryInLoopUnwindFallsBackWhenVoteStakeDirty(t *testing.T) {
 	})
 	staleEpochRewards := &sealevel.SysvarEpochRewards{DistributedRewards: 999}
 	sealevel.SysvarCache.EpochRewards.Sysvar = staleEpochRewards
+	voteJournal.reset(true)
+	t.Cleanup(func() { voteJournal.reset(false) })
 
 	// A resume context the rebuild accepts: base58 bankhash + base64 lt-hash
 	// (1024 uint16 elements = 2048 bytes).
@@ -237,24 +225,37 @@ func TestTryInLoopUnwindFallsBackWhenVoteStakeDirty(t *testing.T) {
 		AcctsLtHash:      base64.StdEncoding.EncodeToString(make([]byte, 2048)),
 		TransactionCount: &ctxTxCount,
 	}
-	newTail := func() *unrootedTail {
-		tail := newUnrootedTail(&fakeDurable{}, &fakeCommitter{durable: accounts.NewMemAccounts()}, 512, 1, "")
-		tail.Add(7, []*accounts.Account{testAccount(1, 71)}, testHashBytes(7))
-		tail.SetContext(7, validCtx, testUnwindBankSysvars(t, 7, 700))
-		return tail
-	}
+	tail := newUnrootedTail(&fakeDurable{}, &fakeCommitter{durable: accounts.NewMemAccounts()}, 512, 1, "")
+	tail.Add(7, []*accounts.Account{testAccount(1, 71)}, testHashBytes(7))
+	tail.SetContext(7, validCtx, testUnwindBankSysvars(t, 7, 700))
+	tail.Add(8, []*accounts.Account{testAccount(1, 81)}, testHashBytes(8))
 	sched := &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 432000, LeaderScheduleSlotOffset: 432000}
 	sw := &CertifiedSwitch{Slot: 8, Executed: swHash(1), Certified: swHash(2)}
 	epoch := sched.GetEpoch(8) // 0 with these params
-	mithrilState := &state.MithrilState{}
 
-	// Clean: the in-loop unwind succeeds (evict slot 8+, resume from slot 7) and
-	// carries the parent's transaction count so the discarded fork's txs can be
-	// dropped from the running count.
-	resetVoteStakeDirty()
-	rs, bankSysvars, _ := tryInLoopUnwind(sw, newTail(), mithrilState, sched, epoch, nil)
-	require.NotNil(t, rs, "clean unwind should succeed in-loop")
-	require.NotNil(t, bankSysvars, "clean unwind returns its exact parent sysvars")
+	// Slot 7 (retained, unrooted) and slot 8 (unwound) both write vote state.
+	retainedKey, unwoundKey, leaderKey := solana.PublicKey{0xE1}, solana.PublicKey{0xE2}, solana.PublicKey{0xE3}
+	t.Cleanup(func() {
+		global.DeleteVoteCacheItem(retainedKey)
+		global.DeleteVoteCacheItem(unwoundKey)
+		global.DeleteVoteCacheItem(leaderKey)
+	})
+	original := &sealevel.VoteStateVersions{}
+	global.PutVoteCacheItem(retainedKey, original)
+	slot7 := &sealevel.SlotCtx{Slot: 7}
+	slot8 := &sealevel.SlotCtx{Slot: 8}
+	retainedWrite := &sealevel.VoteStateVersions{}
+	putVoteCacheItem(slot7, retainedKey, retainedWrite)
+	putVoteCacheItem(slot8, retainedKey, &sealevel.VoteStateVersions{})
+	putVoteCacheItem(slot8, unwoundKey, &sealevel.VoteStateVersions{})
+	// A local leader bank at a later slot is not part of the tail.
+	leaderWrite := &sealevel.VoteStateVersions{}
+	putVoteCacheItem(&sealevel.SlotCtx{Slot: 20}, leaderKey, leaderWrite)
+
+	rs, bankSysvars, reason := tryInLoopUnwind(sw, tail, &state.MithrilState{}, sched, epoch, nil)
+	require.Empty(t, reason)
+	require.NotNil(t, rs, "vote writes no longer force the rooted re-replay fallback")
+	require.NotNil(t, bankSysvars, "the unwind returns its exact parent sysvars")
 	assert.Equal(t, uint64(7), bankSysvars.Slot())
 	retainedEpochRewards, ok := bankSysvars.EpochRewards()
 	require.True(t, ok)
@@ -263,31 +264,13 @@ func TestTryInLoopUnwindFallsBackWhenVoteStakeDirty(t *testing.T) {
 	require.NotNil(t, rs.TransactionCount, "unwind carries the parent's tx count for restore")
 	assert.Equal(t, uint64(999), *rs.TransactionCount)
 
-	// A global cache was mutated in the UNWOUND suffix (at the switch slot):
-	// the unwind cannot roll the caches back -> must fall back (nil).
-	markVoteStakeDirty(8)
-	rs, _, reason := tryInLoopUnwind(sw, newTail(), mithrilState, sched, epoch, nil)
-	assert.Nil(t, rs, "dirty cache in the unwound suffix must force the rooted re-replay fallback")
-	assert.Equal(t, unwindFallbackVoteStakeDirty, reason)
-	resetVoteStakeDirty()
-
-	// A cache write in the RETAINED suffix (below the switch slot but above the
-	// rooted watermark) is just as unsafe: the resume path reloads the vote
-	// cache from durable, which cannot see the retained suffix's writes — the
-	// reload would REGRESS the cache below live account state.
-	markVoteStakeDirty(7) // retained slot; rooted watermark is 0
-	rs, _, reason = tryInLoopUnwind(sw, newTail(), mithrilState, sched, epoch, nil)
-	assert.Nil(t, rs, "dirty cache in the retained suffix must also force the fallback")
-	assert.Equal(t, unwindFallbackVoteStakeDirty, reason)
-	resetVoteStakeDirty()
-
-	// Once the rooted watermark passes the dirty slot, the write is folded into
-	// durable and reload-from-durable is exact again -> fast path allowed.
-	markVoteStakeDirty(7)
-	rootedPast := &state.MithrilState{LastRootedSlot: 7}
-	rs, _, _ = tryInLoopUnwind(sw, newTail(), rootedPast, sched, epoch, nil)
-	require.NotNil(t, rs, "dirtiness at/below the rooted watermark is durably folded — fast path is safe")
-	resetVoteStakeDirty()
+	assert.Same(t, retainedWrite, global.VoteCacheItem(retainedKey), "the retained slot's write survives")
+	_, present := global.VoteCacheItemOK(unwoundKey)
+	assert.False(t, present, "a vote account the unwound slot created is gone again")
+	assert.Same(t, leaderWrite, global.VoteCacheItem(leaderKey), "a leader bank's write outside the tail survives")
+	acct, err := tail.GetAccount(8, testAccount(1, 0).Key)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(71), acct.Lamports, "abandoned account writes are removed")
 }
 
 // Every unsafe-unwind guard falls back to the rooted-checkpoint re-replay
@@ -309,7 +292,6 @@ func TestTryInLoopUnwindGuardMatrix(t *testing.T) {
 	}
 	sched := &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 432000, LeaderScheduleSlotOffset: 432000}
 	mithrilState := &state.MithrilState{}
-	resetVoteStakeDirty()
 
 	// Nil tail / zero slot are inert.
 	assertUnwindFallback(t, &CertifiedSwitch{Slot: 8}, nil, mithrilState, sched, 0, nil)
