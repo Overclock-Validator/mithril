@@ -63,6 +63,35 @@ type epochRewardReadPublisher interface {
 	ResetEpochRewardView()
 }
 
+type rpcHealthInvalidator interface {
+	InvalidateHealth()
+}
+
+type alpenglowCertifiedTip interface {
+	AlpenglowCertifiedTip() (slot uint64, at time.Time, ok bool)
+}
+
+// healthTipMaxAge is how old the latest certificate may be and still count as
+// the network tip, matching the block source's RPC tip freshness.
+const healthTipMaxAge = 30 * time.Second
+
+// networkHealthSlot is the highest recently observed network tip: the latest
+// verified Votor certificate and the configured RPCs' confirmed slot. Either
+// source alone is enough, so health does not depend on an outside RPC.
+func networkHealthSlot(certs alpenglowCertifiedTip, rpcTip func() (uint64, bool)) (uint64, bool) {
+	var tip uint64
+	fresh := false
+	if certs != nil {
+		if slot, at, ok := certs.AlpenglowCertifiedTip(); ok && time.Since(at) <= healthTipMaxAge {
+			tip, fresh = slot, true
+		}
+	}
+	if slot, ok := rpcTip(); ok {
+		tip, fresh = max(tip, slot), true
+	}
+	return tip, fresh
+}
+
 // BlockFetchOpts contains options for parallel block fetching
 type BlockFetchOpts struct {
 	MaxRPS          int    // Rate limit (requests per second), 0 = use default
@@ -1831,6 +1860,11 @@ func ReplayBlocks(
 	onCancelWriteState OnCancelWriteState, // callback to write state immediately on cancellation (can be nil)
 ) *ReplayResult {
 	result := &ReplayResult{}
+	health, _ := rpcServer.(rpcHealthInvalidator)
+	if health != nil {
+		health.InvalidateHealth()
+		defer health.InvalidateHealth()
+	}
 	// Node startup finishes any rewind and reconciles durable state before
 	// calling ReplayBlocks, so the first block's stake scan can start now and
 	// overlap block-source startup and the wait for the first block.
@@ -2630,6 +2664,11 @@ func ReplayBlocks(
 	}
 
 	blockStream := blockstream.NewBlockSource(opts)
+	if health, ok := rpcServer.(interface{ SetHealthSlotSource(func() (uint64, bool)) }); ok && isLive {
+		certs, _ := consensusEngine.(alpenglowCertifiedTip)
+		health.SetHealthSlotSource(func() (uint64, bool) { return networkHealthSlot(certs, blockStream.HealthSlot) })
+		defer health.SetHealthSlotSource(func() (uint64, bool) { return 0, false })
+	}
 	// Every state save records the repair peers that served this run well, so
 	// the next start can repair before gossip rediscovers peers.
 	state.SetRepairPeerHintsProvider(func() []state.RepairPeerHint {
@@ -2733,7 +2772,7 @@ func ReplayBlocks(
 			mlog.Log.Warnf("%v — re-serving the skipped suffix from slot %d; executed bank remains at slot %d", sw, sw.Slot, currentExecutedAnchorSlot())
 			return true
 		}
-		rs, parentBankSysvars, fallbackReason := tryInLoopUnwind(sw, unrootedTailState, mithrilState, epochSchedule, currentEpoch, partitionedRewardsInfo)
+		rs, parentBankSysvars, fallbackReason := tryInLoopUnwind(sw, unrootedTailState, mithrilState, epochSchedule, currentEpoch, partitionedRewardsInfo, health)
 		if rs == nil {
 			windowSwitchFallback++
 			switchFallbackReasons[fallbackReason]++
@@ -2771,6 +2810,7 @@ func ReplayBlocks(
 		if rs.TransactionCount != nil {
 			global.SetTransactionCount(*rs.TransactionCount) // drop the discarded fork's txs
 		}
+		global.SetCompletedBank(global.CompletedBank{Slot: rs.ParentSlot, BlockHeight: rs.ParentBlockHeight, TransactionCount: global.TransactionCount()})
 		blockStream.SetLastExecutedSlot(rs.ParentSlot)
 		replayFrontier = rs.ParentSlot
 		global.SetReplayFrontier(rs.ParentSlot)
@@ -3472,6 +3512,7 @@ func ReplayBlocks(
 		metrics.GlobalBlockReplay.ChainTipUpdate.AddTimingSince(chainTipStart)
 
 		global.SetBlockHeight(block.BlockHeight)
+		global.SetCompletedBank(global.CompletedBank{Slot: block.Slot, BlockHeight: block.BlockHeight, TransactionCount: global.TransactionCount()})
 		if trailingVerifier != nil {
 			trailingVerifier.Record(buildSlotDigest(block))
 		}
@@ -3937,6 +3978,11 @@ func ReplayBlocks(
 
 	if rewardReadPublisher != nil {
 		rewardReadPublisher.ResetEpochRewardView()
+	}
+
+	// Replay has stopped; cleanup may still wait for folds and worker shutdown.
+	if health != nil {
+		health.InvalidateHealth()
 	}
 
 	// Check if block source stalled (this provides explicit error info)
