@@ -2234,10 +2234,16 @@ func ReplayBlocks(
 		unrootedTailState = newUnrootedTail(acctsDb, acctsDb, unrootedTailHaltCap, FoldBatchSlots, filepath.Join(acctsDb.AcctsDir, ".."))
 		trackedStakeTotals = unrootedTailState.durableStakeTotals
 		defer func() { trackedStakeTotals = nil }()
-		// Each run starts from caches loaded from durable state, so the
-		// previous run's vote-cache undo records describe nothing.
+		// Each run starts from caches loaded from durable state. On exit,
+		// undo every write above the durable root (records of folded slots
+		// are already dropped): a failed bank may have published before
+		// failing, and the next run's vote-cache rebuild updates keys rather
+		// than replacing the map, so it must start from the root's cache.
 		voteJournal.reset(true)
-		defer voteJournal.reset(false)
+		defer func() {
+			voteJournal.unwindFrom(0, nil)
+			voteJournal.reset(false)
+		}()
 		var checkpointAfterCommit func(*state.TransactionStatusCheckpointRef) error
 		if consensusOpts != nil {
 			checkpointAfterCommit = consensusOpts.TransactionStatusCheckpointAfterCommit
