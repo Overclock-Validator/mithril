@@ -866,8 +866,11 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		return err
 	}
 	cluster = clusterInfo.Name
-	if clusterInfo.Custom && len(rpcEndpoints) == 0 {
-		return fmt.Errorf("custom network.cluster %q requires network.rpc", cluster)
+	if len(rpcEndpoints) == 0 {
+		if clusterInfo.Custom {
+			return fmt.Errorf("custom network.cluster %q requires network.rpc", cluster)
+		}
+		rpcEndpoints = []string{clusterInfo.RPC}
 	}
 	legacyGenesisHash = strings.TrimSpace(getString("legacy-genesis-hash", "network.legacy_genesis_hash"))
 	if legacyGenesisHash != "" {
@@ -950,12 +953,6 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		turbineBindAddr = config.GetString("turbine.bind_addr")
 	}
 	turbineGossipEntrypoint = getString("turbine-gossip-entrypoint", "turbine.gossip_entrypoint")
-	if turbineGossipEntrypoint == "" && blockSource == "turbine" {
-		if clusterInfo.Custom {
-			return fmt.Errorf("custom network.cluster %q requires turbine.gossip_entrypoint", cluster)
-		}
-		turbineGossipEntrypoint = clusterInfo.GossipEntrypoint
-	}
 	turbineGossipBindAddr = getString("turbine-gossip-bind-addr", "turbine.gossip_bind_addr")
 	turbineAdvertisedIP = getString("turbine-advertised-ip", "turbine.advertised_ip")
 	turbineShredVersion = getInt("turbine-shred-version", "turbine.shred_version")
@@ -1047,6 +1044,14 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 			return fmt.Errorf("block.source=lightbringer requires RPC endpoints for catchup (set network.rpc)")
 		}
 	case "turbine":
+		// Defaulted here, after Lightbringer may have taken over the source, so
+		// a node fed by Lightbringer never needs a native Turbine entrypoint.
+		if turbineGossipEntrypoint == "" {
+			if clusterInfo.Custom {
+				return fmt.Errorf("custom network.cluster %q requires turbine.gossip_entrypoint", cluster)
+			}
+			turbineGossipEntrypoint = clusterInfo.GossipEntrypoint
+		}
 		if turbineBindAddr == "" {
 			turbineBindAddr = "0.0.0.0:8001" // documented default shred port
 			mlog.Log.Infof("turbine bind address not set; defaulting to %s", turbineBindAddr)
@@ -1459,9 +1464,6 @@ func runLive(c *cobra.Command, args []string) {
 	// it before Lightbringer can open ledger storage and before history records
 	// describe any mutation. Fetch genesis exactly once and carry that value
 	// through every fresh ready-state write below.
-	if len(rpcEndpoints) == 0 {
-		rpcEndpoints = []string{clusterInfo.RPC}
-	}
 	networkGenesisHash := fetchGenesisHash(ctx)
 	if networkGenesisHash == "" {
 		klog.Fatalf("FATAL: could not confirm the RPC genesis hash; refusing startup because AccountsDB, shred spool, and vote-history lineage cannot be validated")
