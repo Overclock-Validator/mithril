@@ -17,9 +17,13 @@ package turbine
 // with no shreds (a leader that never produced) is not pinned, so nothing is
 // probed for blocks that may never exist.
 
+// Blocks stream back to back, so the next slot's first shred often arrives a
+// few milliseconds after its parent is emitted. A head with no shreds yet is
+// therefore remembered, and its first accepted shred installs the pin.
+
 // prioritizeObservedRepairSlot pins slot for priority repair when it holds at
-// least one accepted shred and is not complete. It reports whether a new pin
-// was installed.
+// least one accepted shred and is not complete, or arranges for its first
+// shred to pin it. It reports whether a new pin was installed.
 func (a *SlotAssembler) prioritizeObservedRepairSlot(slot uint64) bool {
 	if slot == 0 {
 		return false
@@ -27,12 +31,38 @@ func (a *SlotAssembler) prioritizeObservedRepairSlot(slot uint64) bool {
 	a.mu.Lock()
 	state := a.slots[slot]
 	_, completed := a.completedSlots[slot]
-	observed := state != nil && !state.firstShredAt.IsZero() && !state.completing
+	observed := state != nil && !state.firstShredAt.IsZero()
+	completing := state != nil && state.completing
+	if !observed && !completed {
+		a.pendingHeadRepairPin = slot
+	} else if a.pendingHeadRepairPin == slot {
+		a.pendingHeadRepairPin = 0
+	}
 	a.mu.Unlock()
-	if !observed || completed {
+	if !observed || completed || completing {
 		return false
 	}
 	return a.prioritizeRepairRange(slot, slot)
+}
+
+// notePendingHeadRepairPinLocked installs the pending emission-head pin when
+// that slot accepts its first shred. Called with a.mu held; the repair wake is
+// the same nonblocking, coalesced send the child lookahead uses.
+func (a *SlotAssembler) notePendingHeadRepairPinLocked(state *slotState) {
+	if a.pendingHeadRepairPin == 0 || state == nil || state.slot != a.pendingHeadRepairPin {
+		return
+	}
+	a.pendingHeadRepairPin = 0
+	if _, exists := a.priorityRepairSlots[state.slot]; exists {
+		return
+	}
+	a.priorityRepairSlots[state.slot] = struct{}{}
+	a.priorityRepairOrder = append(a.priorityRepairOrder, state.slot)
+	a.prunePriorityRepairSlotsLocked()
+	select {
+	case a.streamRepairWake <- struct{}{}:
+	default:
+	}
 }
 
 // PrioritizeObservedRepairSlot pins the next slot to emit for repair once

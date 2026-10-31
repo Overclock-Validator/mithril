@@ -34,6 +34,40 @@ func TestPrioritizeObservedRepairSlotPinsObservedHeaderlessSlot(t *testing.T) {
 	}
 }
 
+// The next slot's first shred usually lands just after its parent is emitted:
+// the head is remembered and that first shred installs the pin and wakes
+// repair, without waiting for another emitter pass.
+func TestPendingHeadRepairPinInstallsOnFirstShred(t *testing.T) {
+	assembler := NewSlotAssembler()
+	wake := make(chan struct{}, 1)
+	assembler.streamRepairWake = wake
+	if assembler.prioritizeObservedRepairSlot(301) {
+		t.Fatal("pinned a slot before any shred arrived")
+	}
+	if _, err := assembler.AddShred(&Shred{Variant: legacyDataVariant, Type: ShredTypeData, Slot: 301, Index: 40, Version: 1, ParentOffset: 1, Data: []byte{1}}); err != nil {
+		t.Fatalf("AddShred: %v", err)
+	}
+	select {
+	case <-wake:
+	default:
+		t.Fatal("first shred of the pending head did not wake repair")
+	}
+	if _, pinned := assembler.priorityRepairSlots[301]; !pinned {
+		t.Fatal("first shred of the pending head did not install its pin")
+	}
+	if assembler.pendingHeadRepairPin != 0 {
+		t.Fatalf("pending pin not cleared: %d", assembler.pendingHeadRepairPin)
+	}
+	// Another slot's first shred does not consume a newer pending head.
+	assembler.prioritizeObservedRepairSlot(305)
+	if _, err := assembler.AddShred(&Shred{Variant: legacyDataVariant, Type: ShredTypeData, Slot: 304, Index: 0, Version: 1, ParentOffset: 1, Data: []byte{1}}); err != nil {
+		t.Fatalf("AddShred: %v", err)
+	}
+	if _, pinned := assembler.priorityRepairSlots[304]; pinned || assembler.pendingHeadRepairPin != 305 {
+		t.Fatalf("pin went to slot 304 or the pending head was lost: pending=%d", assembler.pendingHeadRepairPin)
+	}
+}
+
 // A slot with no shreds may never be produced (skipped leader): no pin, so
 // repair does not probe it.
 func TestPrioritizeObservedRepairSlotSkipsUnobservedAndCompletedSlots(t *testing.T) {
