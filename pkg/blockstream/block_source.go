@@ -3196,9 +3196,12 @@ func (bs *BlockSource) emitOrderedBlocks() {
 
 		gapWaitingSlot, gapFirstBufferedSlot, gapFirstBufferedParentSlot, gapBufferedCount, shouldFallbackToRPC = bs.detectLiveGapLocked()
 		bs.maybeLogReorderGapLocked()
+		emissionHead := bs.nextSlotToSend
 		bs.reorderMu.Unlock()
 		if gapWaitingSlot != 0 {
 			bs.prioritizeTurbineRepairForLiveGap(gapWaitingSlot, gapFirstBufferedParentSlot)
+		} else {
+			bs.prioritizeTurbineRepairForEmissionHead(emissionHead)
 		}
 		bs.maybeRescueStalledCatchupSlot()
 		if shouldFallbackToRPC {
