@@ -2786,7 +2786,9 @@ func ReplayBlocks(
 		// before rewinding the block source: if the applied fold moved the
 		// durable frontier past the switch slot, mutating source ancestry first
 		// would leave the source on a branch AccountsDB can no longer adopt.
+		switchStart := time.Now()
 		applyFoldOutcome(promoter.drain())
+		foldDrain := time.Since(switchStart)
 		if promoter.failure != nil {
 			return false
 		}
@@ -2820,7 +2822,9 @@ func ReplayBlocks(
 			mlog.Log.Warnf("%v — re-serving the skipped suffix from slot %d; executed bank remains at slot %d", sw, sw.Slot, currentExecutedAnchorSlot())
 			return true
 		}
+		unwindStart := time.Now()
 		rs, parentBankSysvars, fallbackReason := tryInLoopUnwind(sw, unrootedTailState, mithrilState, epochSchedule, currentEpoch, partitionedRewardsInfo)
+		unwindTime := time.Since(unwindStart)
 		if rs == nil {
 			windowSwitchFallback++
 			switchFallbackReasons[fallbackReason]++
@@ -2863,7 +2867,8 @@ func ReplayBlocks(
 		global.SetReplayFrontier(rs.ParentSlot)
 		ResetChainTip()
 		windowSwitchInRAM++
-		mlog.Log.Warnf("%v — unwound in RAM to executed parent slot %d; re-executing the selected chain (in-RAM switches this window: %d)", sw, rs.ParentSlot, windowSwitchInRAM)
+		mlog.Log.Warnf("%v — unwound in RAM to executed parent slot %d; re-executing the selected chain (in-RAM switches this window: %d; fold drain %s, unwind %s, switch total %s)",
+			sw, rs.ParentSlot, windowSwitchInRAM, foldDrain.Round(time.Microsecond), unwindTime.Round(time.Microsecond), time.Since(switchStart).Round(time.Microsecond))
 		return true
 	}
 	var sweepWhileWaiting func() *CertifiedSwitch
