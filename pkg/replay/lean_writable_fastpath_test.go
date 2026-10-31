@@ -238,9 +238,9 @@ func TestLeanWritableFastPathRejectsFailedOutputBeforePublication(t *testing.T) 
 
 func TestLeanWritableFastPathPreservesWritableStakeAndVoteBookkeeping(t *testing.T) {
 	global.ClearPendingStakePubkeys()
-	resetVoteStakeDirty()
+	voteJournal.reset(true)
 	defer global.ClearPendingStakePubkeys()
-	defer resetVoteStakeDirty()
+	defer voteJournal.reset(false)
 
 	slotCtx, cleanup := newCommitTestSlotCtx()
 	defer cleanup()
@@ -297,7 +297,7 @@ func TestLeanWritableFastPathPreservesWritableStakeAndVoteBookkeeping(t *testing
 	pending := global.PendingStakeEntriesSnapshot()
 	require.Len(t, pending, 1)
 	assert.Equal(t, stakeKey, pending[0].Pubkey)
-	assert.Equal(t, slotCtx.Slot, voteStakeDirtySlot.Load())
+	assert.Equal(t, 1, voteJournal.heldSlots(), "the vote-cache eviction is recorded for unwind")
 	assert.NotContains(t, slotCtx.ModifiedAccts, stakeKey, "untouched state must not be published")
 	assert.NotContains(t, slotCtx.ModifiedAccts, voteKey, "untouched state must not be published")
 }

@@ -149,8 +149,6 @@ func TestRewardsRetirementWaitsForSuccessfulFold(t *testing.T) {
 }
 
 func TestRewardsRetirementAllowsExactParentUnwind(t *testing.T) {
-	resetVoteStakeDirty()
-	t.Cleanup(resetVoteStakeDirty)
 	info := &rewards.PartitionedRewardDistributionInfo{}
 	var completed partitionedRewardsCompletion
 	completed.observeBank(info, testUnwindBankSysvars(t, 5, 50))
@@ -168,7 +166,6 @@ func TestRewardsRetirementAllowsExactParentUnwind(t *testing.T) {
 	require.Nil(t, rs)
 	require.Equal(t, unwindFallbackRewardsWindow, reason)
 	ms.LastRootedSlot = 5
-	markVoteStakeDirty(5) // completed reward writes are also below the durable root
 	require.True(t, completed.retire(&info, ms.LastRootedSlot))
 	rs, restored, reason := tryInLoopUnwind(sw, tail, ms, sched, 0, info)
 	require.Empty(t, reason)
