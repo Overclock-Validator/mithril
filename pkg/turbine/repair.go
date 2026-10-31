@@ -329,9 +329,11 @@ type repairClient struct {
 	headPeers headRepairPeers
 	// Fastest reliable responders for head requests (mu-guarded, rebuilt with
 	// ranked) and the head retry timer (repair loop only); see repair_tip.go.
-	fastHead       []gossip.RepairPeer
-	fastHeadCursor uint64
-	headRetryTimer *time.Timer
+	fastHead         []gossip.RepairPeer
+	fastHeadCursor   uint64
+	fastHeadEligible bool
+	headRetryTimer   *time.Timer
+	headRetryDue     time.Time
 
 	peerCacheMu sync.Mutex
 	peerCache   []gossip.RepairPeer
@@ -398,6 +400,7 @@ func (c *repairClient) wakePriority() {
 }
 
 func (c *repairClient) run(ctx context.Context, conn *net.UDPConn, assembler *SlotAssembler) {
+	defer c.stopHeadRetryWake()
 	runRepairSchedule(ctx, c.priorityWake, repairScanInterval, 20*time.Millisecond, func() {
 		c.expireOutstanding(time.Now())
 		c.repairOnce(conn, assembler)
@@ -466,20 +469,25 @@ func (c *repairClient) repairOnce(conn *net.UDPConn, assembler *SlotAssembler) {
 	// completion (full missing count, before the admission-share truncation
 	// caps the listing this scan may send).
 	var headPol *retryPolicy
+	headEndgame, fastEligible := false, false
 	if len(priority) > 0 {
 		missing := len(priority[0].MissingDataShreds)
 		p := headPolicy(missing)
-		if missing <= repairRetryHeadNearMissing {
-			// Near completion a silent peer gates emission: retry after a
-			// few round trips rather than the fixed tier interval.
+		// In the endgame (the only head tier that sends concurrent attempts,
+		// so the only one whose retry interval acts) a silent peer gates
+		// emission: retry after a few round trips, not the fixed interval.
+		if missing <= repairHeadFanoutMaxMissing {
 			p.retryInterval = c.headRetryInterval(p.retryInterval)
+			headEndgame = true
 		}
+		fastEligible = missing <= repairRetryHeadNearMissing
 		headPol = &p
 		// Head admission share: the head stays strictly first in line, but
 		// may hold at most its share of the admission window — the remainder
 		// keeps prefilling the window slots and patching the live edge.
 		c.boundHeadToAdmissionShare(&priority[0], p.maxConcurrent)
 	}
+	c.setFastHeadEligible(fastEligible)
 
 	// Size the token grant by roughly what this scan could put on the wire
 	// (the retry policy usually sends far less — covered shreds no-op — and
@@ -515,7 +523,7 @@ func (c *repairClient) repairOnce(conn *net.UDPConn, assembler *SlotAssembler) {
 	// sized by the edge's actual demand, so a blocked head is never capped
 	// below what the edge can use; leftover head budget flows to the edge.
 	spent := c.sendTier(conn, peers, priority, splitRepairBudget(budget, edgeDemand), headPol, acct)
-	if headPol != nil {
+	if headEndgame {
 		c.armHeadRetryWake(headPol.retryInterval)
 	}
 	spent += c.sendTier(conn, peers, edge, budget-spent, nil, acct)

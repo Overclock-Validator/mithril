@@ -3200,9 +3200,10 @@ func (bs *BlockSource) emitOrderedBlocks() {
 		bs.reorderMu.Unlock()
 		if gapWaitingSlot != 0 {
 			bs.prioritizeTurbineRepairForLiveGap(gapWaitingSlot, gapFirstBufferedParentSlot)
-		} else {
-			bs.prioritizeTurbineRepairForEmissionHead(emissionHead)
 		}
+		// Every pass, so the assembler's pending head always names the
+		// current head and a passed slot can never be pinned late.
+		bs.prioritizeTurbineRepairForEmissionHead(emissionHead)
 		bs.maybeRescueStalledCatchupSlot()
 		if shouldFallbackToRPC {
 			bs.handleDetectedLiveGap(gapWaitingSlot, gapFirstBufferedSlot, gapFirstBufferedParentSlot, gapBufferedCount)

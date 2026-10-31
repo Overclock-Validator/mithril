@@ -33,10 +33,12 @@ func (a *SlotAssembler) prioritizeObservedRepairSlot(slot uint64) bool {
 	_, completed := a.completedSlots[slot]
 	observed := state != nil && !state.firstShredAt.IsZero()
 	completing := state != nil && state.completing
+	// The pending pin only ever names the current head: a head that moved
+	// on (skipped, or emitted by another path) must not be pinned when a
+	// late shred for it arrives.
+	a.pendingHeadRepairPin = 0
 	if !observed && !completed {
 		a.pendingHeadRepairPin = slot
-	} else if a.pendingHeadRepairPin == slot {
-		a.pendingHeadRepairPin = 0
 	}
 	a.mu.Unlock()
 	if !observed || completed || completing {
