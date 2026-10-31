@@ -85,6 +85,9 @@ type BlockSourceOpts struct {
 	// has emitted its first post-resume block.
 	InitialAlpenglowBlockID    solana.Hash
 	HasInitialAlpenglowBlockID bool
+	// AlpenglowRecovery preserves the old source's branch selection when
+	// replay must reconstruct account state from its rooted checkpoint.
+	AlpenglowRecovery *AlpenglowRecoveryState
 	// RepairCatchupMaxGapSlots: when resuming behind the live shred edge by at
 	// most this many slots, fill the gap via turbine repair instead of RPC
 	// getBlock (0 disables). Repaired shreds carry block ids + footer certs, so
@@ -850,6 +853,7 @@ func NewBlockSource(opts *BlockSourceOpts) *BlockSource {
 		bs.emittedAlpenglowBlockIDOrder = append(bs.emittedAlpenglowBlockIDOrder, anchorSlot)
 		mlog.Log.Infof("ALPENGLOW resume anchor: seeded block id %s at rooted slot %d", opts.InitialAlpenglowBlockID, anchorSlot)
 	}
+	bs.restoreAlpenglowRecoveryState(opts.AlpenglowRecovery, opts.StartSlot)
 
 	// Prewarm handover: blocks the boot-time receiver collected while the
 	// AccountsDB built. Staged now so the handoff runway can arm the moment

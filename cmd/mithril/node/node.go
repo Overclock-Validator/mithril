@@ -3109,19 +3109,7 @@ postBootstrap:
 			// Calculate epoch for the last persisted slot
 			lastEpoch := epochForStateSlot(mithrilState, result.LastPersistedSlot)
 			// Determine shutdown reason
-			shutdownReason := state.ShutdownReasonCompleted
-			if result.WasCancelled {
-				shutdownReason = state.ShutdownReasonNormal
-			} else if result.Error != nil {
-				if strings.Contains(result.Error.Error(), "stall") {
-					shutdownReason = state.ShutdownReasonStall
-				} else if strings.Contains(result.Error.Error(), "leader schedule") {
-					shutdownReason = state.ShutdownReasonLeaderSchedule
-				} else {
-					// Include the actual error for easier debugging
-					shutdownReason = fmt.Sprintf("%s: %v", state.ShutdownReasonError, result.Error)
-				}
-			}
+			shutdownReason := replayShutdownReason(result)
 
 			shutdownCtx = &state.ShutdownContext{
 				RunID:          replay.CurrentRunID,
@@ -4676,6 +4664,10 @@ func runReplayWithRecovery(
 	// Repeating the same selection after replay means recovery did not converge and
 	// fails closed. The retry budget resets when the rooted watermark advances.
 	seenDiv := make(map[string]bool)
+	var retryBlockFetchOpts replay.BlockFetchOpts
+	if blockFetchOpts != nil {
+		retryBlockFetchOpts = *blockFetchOpts
+	}
 	attempt := 0
 	var prevRooted uint64
 	if mithrilState != nil {
@@ -4787,7 +4779,11 @@ func runReplayWithRecovery(
 		}
 		mlog.Log.Warnf("fork switch: %s; re-replaying the selected chain from rooted slot %d (attempt %d/%d)",
 			recoveryReason, retryStart-1, attempt, maxForkSwitchRetries)
-		result = replay.ReplayBlocks(ctx, accountsDb, accountsDbPath, mithrilState, rs, retryStart, endSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, turbineShredVersion, turbineAlpenglowAddr, turbineIdentity, blockDir, txParallelism, isLive, useLightbringer, useTurbine, dbgOpts, metricsWriter, rpcServer, blockFetchOpts, consensusOpts, onCancelWriteState)
+		// Rebuilding account/vote/stake state must not forget the source's
+		// accepted fork. Restore its exclusions before any spooled block can
+		// emit; the shared consensus engine can still override them with certs.
+		retryBlockFetchOpts.AlpenglowRecovery = result.AlpenglowRecovery
+		result = replay.ReplayBlocks(ctx, accountsDb, accountsDbPath, mithrilState, rs, retryStart, endSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, turbineShredVersion, turbineAlpenglowAddr, turbineIdentity, blockDir, txParallelism, isLive, useLightbringer, useTurbine, dbgOpts, metricsWriter, rpcServer, &retryBlockFetchOpts, consensusOpts, onCancelWriteState)
 	}
 	return result
 }

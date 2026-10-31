@@ -92,6 +92,8 @@ type BlockFetchOpts struct {
 	// ShredSpoolDir: on-disk verified-shred spool shared by prewarm and the
 	// block source (empty = disabled).
 	ShredSpoolDir string
+	// Branch selection retained when rebuilding replay from a rooted checkpoint.
+	AlpenglowRecovery *blockstream.AlpenglowRecoveryState
 	// LocalBlocks carries fully frozen blocks produced by this validator. Replay
 	// adopts the already-mutated leader SlotCtx and does not re-execute.
 	LocalBlocks          <-chan *b.Block
@@ -159,6 +161,9 @@ type ReplayResult struct {
 	WasCancelled bool
 	// Error contains any error that occurred during replay
 	Error error
+	// Source selection must survive an in-process retry along with the shared
+	// consensus engine, or the spool can re-emit the branch we just discarded.
+	AlpenglowRecovery *blockstream.AlpenglowRecoveryState
 
 	// Resume context - populated on graceful shutdown (Ctrl+C) for proper resume
 	LastAcctsLtHash          *lthash.LtHash // LtHash at end of last persisted slot
@@ -2307,6 +2312,7 @@ func ReplayBlocks(
 		}
 		if rewardsCompletion.retire(&partitionedRewardsInfo, promotedThrough) {
 			rewardsHoldBelowSlot = 0
+			unrootedTailState.reserveRewardWindow(0)
 			mlog.Log.Infof("epoch rewards bookkeeping retired through durable slot %d; later fork switches may unwind in memory", promotedThrough)
 		}
 		if transactionStatuses.Root(promotedThrough) {
@@ -2444,7 +2450,7 @@ func ReplayBlocks(
 		if consensusEngine != nil {
 			gated, gerr := alpenglowPromotionGate(consensusEngine,
 				alpenglowFooterFinalized, alpenglowExecutedBlockIDs, alpenglowForced,
-				mithrilState.LastRootedSlot, promoteThrough, highestExecutedSlot, &gateStats)
+				alpenglowPromotionFloor(mithrilState.LastRootedSlot, startSlot), promoteThrough, highestExecutedSlot, &gateStats)
 			promoteThrough = gated
 			if gerr != nil {
 				var mismatch *AlpenglowFinalityMismatch
@@ -2636,6 +2642,7 @@ func ReplayBlocks(
 		opts.RepairMaxRequestsPerSecond = blockFetchOpts.RepairMaxRequestsPerSecond
 		opts.DisableRPCBlockFetch = blockFetchOpts.DisableRPCBlockFetch
 		opts.ShredSpoolDir = blockFetchOpts.ShredSpoolDir
+		opts.AlpenglowRecovery = blockFetchOpts.AlpenglowRecovery
 		opts.LocalLeaderForSlot = blockFetchOpts.LocalLeaderForSlot
 		opts.LocalBlocks = blockFetchOpts.LocalBlocks
 		opts.GossipClient = blockFetchOpts.GossipClient
@@ -2708,6 +2715,7 @@ func ReplayBlocks(
 	defer func() {
 		blockStream.Stop()
 		<-blockStreamDone
+		result.AlpenglowRecovery = blockStream.CaptureAlpenglowRecoveryState()
 	}()
 
 	var skippedSlotsCount int // Track skipped slots for 100-slot summary
@@ -3363,12 +3371,16 @@ func ReplayBlocks(
 			// remaining partitions would be silently skipped and the first
 			// re-executed distribution slot would diverge. Holding keeps the
 			// boundary in the re-execution window so a resume rebuilds the
-			// bookkeeping by re-running it. Costs tail RAM for the window length
-			// (bounded by the OverCap halt if a huge stake count exceeds it —
-			// fail-closed; reconstructing from the EpochRewards sysvar is the
-			// eventual lift for mainnet-scale partition counts).
+			// bookkeeping by re-running it. Reserve the known bank count for
+			// this atomic window, in addition to normal finality lag. The byte
+			// budget remains enforced even if distribution cannot complete.
 			if partitionedRewardsInfo != nil && partitionedRewardsInfo.NumRewardPartitionsRemaining > 0 {
 				rewardsHoldBelowSlot = block.Slot
+				if unrootedTailState != nil {
+					unrootedTailState.reserveRewardWindow(partitionedRewardsInfo.NumRewardPartitionsRemaining)
+					mlog.Log.Infof("epoch rewards retention: slot limit=%d (normal=%d window=%d), retained-byte budget=%d MiB",
+						unrootedTailState.slotLimit(), unrootedTailState.haltCap, unrootedTailState.rewardWindowSlots, unrootedTailState.maxBytes>>20)
+				}
 				mlog.Log.Infof("epoch boundary: holding durable promotion below slot %d until %d reward partitions distribute",
 					block.Slot, partitionedRewardsInfo.NumRewardPartitionsRemaining)
 			}
@@ -3730,7 +3742,7 @@ func ReplayBlocks(
 				if trailingVerifier != nil && TrailingVerifierCfg.Required && lastRootedWatermark > verifiedWM+uint64(FoldBatchSlots) {
 					hint = " — the trailing verifier cannot keep pace with replay (finality is ahead; the verifier fetches every block's execution metas via RPC, which is slow for very large blocks). Options: verifier.required=false to gate folds on certificate finality only, a faster/archival RPC for the verifier, or wait for peer bankhash cross-checking to replace the RPC oracle"
 				}
-				result.Error = fmt.Errorf("rooted-durable: speculative state reached capacity at slot %d (held_slots=%d/%d retained_bytes=%d/%d); rooting stalled (%s)%s; halting", block.Slot, unrootedTailState.overlay.HeldSlots(), unrootedTailHaltCap, unrootedTailState.overlay.RetainedBytes(), unrootedTailState.maxBytes, diag, hint)
+				result.Error = fmt.Errorf("rooted-durable: speculative state reached capacity at slot %d (held_slots=%d/%d retained_bytes=%d/%d); rooting stalled (%s)%s; halting", block.Slot, unrootedTailState.overlay.HeldSlots(), unrootedTailState.slotLimit(), unrootedTailState.overlay.RetainedBytes(), unrootedTailState.maxBytes, diag, hint)
 				mlog.Log.Errorf("%v", result.Error)
 				break
 			}

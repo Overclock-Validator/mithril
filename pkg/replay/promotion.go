@@ -14,13 +14,15 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/Overclock-Validator/mithril/pkg/safemath"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/state"
 	"github.com/gagliardetto/solana-go"
 )
 
-// unrootedTailHaltCap bounds the in-RAM unrooted tail; replay halts if held slots
-// exceed it rather than growing RAM unbounded (~16x normal rooting lag).
+// unrootedTailHaltCap bounds ordinary rooting lag. A partitioned-rewards
+// window reserves its known bank count in addition to this allowance; the
+// retained-byte budget remains enforced throughout.
 const unrootedTailHaltCap = 512
 
 // batchCommitter durably folds a batch of rooted slots into the canonical
@@ -164,6 +166,10 @@ type unrootedTail struct {
 	// by the abandoned suffix.
 	bankSysvars map[uint64]*sealevel.BankSysvars
 	haltCap     int // halt replay if held slots exceed this (rooting stalled)
+	// rewardWindowSlots reserves the boundary bank plus its distribution banks
+	// until the completion bank is durably folded. It must not shrink as the
+	// RAM-only distribution counter decreases: those banks are still retained.
+	rewardWindowSlots uint64
 
 	// stakeTotals carries durable state's delegated stake totals across folds
 	// into each fold's resume context (stake_totals.go). nil until the initial
@@ -864,10 +870,28 @@ func (t *unrootedTail) unwind(fromSlot uint64) (*state.ResumeContext, *sealevel.
 	return ctx, t.bankSysvars[ctxSlot]
 }
 
-// OverCap reports whether the unrooted tail has grown past the halt cap, i.e.
-// rooting has stalled and we must stop replay rather than grow RAM unbounded.
+// reserveRewardWindow is called once at the boundary, before distributing any
+// partitions, and with zero only after the completion fold becomes durable.
+// Distribution starts at boundary block height + 1, so skipped slots do not
+// consume this reservation. Normal finality lag still has a bounded allowance.
+func (t *unrootedTail) reserveRewardWindow(partitions uint64) {
+	t.rewardWindowSlots = 0
+	if partitions > 0 {
+		t.rewardWindowSlots = safemath.SaturatingAddU64(partitions, 1)
+	}
+}
+
+func (t *unrootedTail) slotLimit() uint64 {
+	if t.haltCap <= 0 {
+		return 0
+	}
+	return safemath.SaturatingAddU64(uint64(t.haltCap), t.rewardWindowSlots)
+}
+
+// OverCap enforces both the finite bank allowance and the unchanged byte
+// budget, including while an atomic rewards window prevents promotion.
 func (t *unrootedTail) OverCap() bool {
-	return (t.haltCap > 0 && t.overlay.HeldSlots() > t.haltCap) || t.overMemoryLimit()
+	return (t.haltCap > 0 && uint64(t.overlay.HeldSlots()) > t.slotLimit()) || t.overMemoryLimit()
 }
 
 func (t *unrootedTail) overMemoryLimit() bool {
