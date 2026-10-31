@@ -114,9 +114,10 @@ func TestSparseCompactionRefusesUnknownRewindPins(t *testing.T) {
 	require.ErrorContains(t, err, "cannot establish rewind pins")
 }
 
-// Readers that arrive while dead pages are punched resolve the current index
-// and must not wait for the punches or the fsync: the drain barrier is only
-// acquired, not held.
+// Readers that arrive between punches resolve the current index and must not
+// wait on appendVecReadMu for the remaining punches or the fsync: the drain
+// barrier is only acquired, not held. (The kernel may still briefly order a
+// read against one in-progress punch of the same file; that is not tested.)
 func TestSparseCompactionDoesNotBlockReadersWhilePunching(t *testing.T) {
 	db, _ := newFoldTestDb(t)
 	defer db.CloseDb()
@@ -125,14 +126,31 @@ func TestSparseCompactionDoesNotBlockReadersWhilePunching(t *testing.T) {
 	commitTestBatch(t, db, 120, foldAcct(1, 11, nil))
 	commitTestBatch(t, db, 130, foldAcct(1, 12, nil))
 	commitTestBatch(t, db, 140, foldAcct(1, 13, nil))
+	type readResult struct {
+		lamports uint64
+		err      error
+	}
 	punched := 0
 	db.compactHooks.afterSparsePunch = func() {
 		punched++
-		read := make(chan uint64, 1)
-		go func() { read <- mustColdRead(t, db, 140, solana.PublicKey{2}).Lamports }()
+		key := solana.PublicKey{2}
+		db.CommonAcctsCache.Delete(key)
+		db.VoteAcctCache.Delete(key)
+		// Buffered so the reader never blocks on send if the test times out;
+		// assertions stay on the test goroutine.
+		read := make(chan readResult, 1)
+		go func() {
+			acct, err := db.GetAccount(140, key)
+			if err != nil {
+				read <- readResult{err: err}
+				return
+			}
+			read <- readResult{lamports: acct.Lamports}
+		}()
 		select {
-		case lamports := <-read:
-			require.Equal(t, uint64(20), lamports)
+		case r := <-read:
+			require.NoError(t, r.err)
+			require.Equal(t, uint64(20), r.lamports)
 		case <-time.After(5 * time.Second):
 			t.Fatal("a cold read blocked behind sparse punching")
 		}
