@@ -107,6 +107,19 @@ func (j *voteCacheJournal) unwindFrom(fromSlot uint64, owned func(slot uint64) b
 	return restored
 }
 
+// hasRecordsFrom reports whether any slot >= fromSlot that match accepts has
+// records.
+func (j *voteCacheJournal) hasRecordsFrom(fromSlot uint64, match func(slot uint64) bool) bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	for slot, undo := range j.slots {
+		if slot >= fromSlot && len(undo) > 0 && match(slot) {
+			return true
+		}
+	}
+	return false
+}
+
 // dropThrough forgets the records of slots <= through once they are durable.
 func (j *voteCacheJournal) dropThrough(through uint64) {
 	j.mu.Lock()

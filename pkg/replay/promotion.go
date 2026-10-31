@@ -877,6 +877,19 @@ func (t *unrootedTail) unwind(fromSlot uint64) (*state.ResumeContext, *sealevel.
 	return ctx, t.bankSysvars[ctxSlot]
 }
 
+// retainedParentSlot is the slot unwind(fromSlot) would resume from: the
+// highest held slot with a retained context below fromSlot.
+func (t *unrootedTail) retainedParentSlot(fromSlot uint64) (uint64, bool) {
+	var parent uint64
+	found := false
+	for s := range t.contexts {
+		if s < fromSlot && (!found || s > parent) {
+			parent, found = s, true
+		}
+	}
+	return parent, found
+}
+
 // reserveRewardWindow is called once at the boundary, before distributing any
 // partitions, and with zero only after the completion fold becomes durable.
 // Distribution starts at boundary block height + 1, so skipped slots do not

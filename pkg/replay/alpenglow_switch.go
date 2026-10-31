@@ -268,6 +268,7 @@ func waitForReplayInput(
 const (
 	unwindFallbackNilTail        = "nil-tail"
 	unwindFallbackCrossEpoch     = "cross-epoch"
+	unwindFallbackForeignVotes   = "foreign-vote-writes"
 	unwindFallbackRewardsWindow  = "rewards-window"
 	unwindFallbackMissingContext = "missing-context"
 	unwindFallbackMissingSysvars = "missing-bank-sysvars"
@@ -299,12 +300,29 @@ func tryInLoopUnwind(
 		// cannot be reconstructed safely without re-running the epoch boundary.
 		return nil, nil, unwindFallbackRewardsWindow
 	}
-	// Vote and stake writes need no guard. The unwind undoes the suffix's
-	// vote-cache writes from voteJournal and drops its slot-keyed stake
-	// bookkeeping, and the in-loop resume keeps the resulting caches instead
-	// of reloading them from durable AccountsDB (which cannot see the retained
-	// unrooted slots). Epoch-scoped stake state cannot change inside the span:
-	// cross-epoch unwinds were refused above.
+	// The slot numbers above can share an epoch while the retained parent is
+	// in the previous one (the epoch opened with skipped slots and the first
+	// executed block of the new epoch is being discarded). Its epoch
+	// transition would be evicted and never rerun, so check the parent too.
+	if parent, ok := tail.retainedParentSlot(sw.Slot); ok && epochSchedule.GetEpoch(parent) != currentEpoch {
+		return nil, nil, unwindFallbackCrossEpoch
+	}
+	// The unwind undoes vote-cache writes only for slots the tail holds. A
+	// local leader bank publishes at its own slot outside the tail, so its
+	// writes at or above the switch slot cannot be attributed to the selected
+	// or the abandoned branch; reload from durable instead.
+	if voteJournal.hasRecordsFrom(sw.Slot, func(slot uint64) bool {
+		_, held := tail.bankhashes[slot]
+		return !held
+	}) {
+		return nil, nil, unwindFallbackForeignVotes
+	}
+	// Otherwise vote and stake writes need no guard. The unwind undoes the
+	// suffix's vote-cache writes from voteJournal and drops its slot-keyed
+	// stake bookkeeping, and the in-loop resume keeps the resulting caches
+	// instead of reloading them from durable AccountsDB (which cannot see the
+	// retained unrooted slots). Epoch-scoped stake state cannot change inside
+	// the span: cross-epoch unwinds were refused above.
 	ctx, bankSysvars := tail.unwind(sw.Slot)
 	if ctx == nil && sw.Slot-1 == mithrilState.LastRootedSlot && mithrilState.LastRootedContext != nil {
 		// The durable boundary carries a persisted ResumeContext, but deliberately

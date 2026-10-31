@@ -234,11 +234,10 @@ func TestTryInLoopUnwindRestoresVoteCache(t *testing.T) {
 	epoch := sched.GetEpoch(8) // 0 with these params
 
 	// Slot 7 (retained, unrooted) and slot 8 (unwound) both write vote state.
-	retainedKey, unwoundKey, leaderKey := solana.PublicKey{0xE1}, solana.PublicKey{0xE2}, solana.PublicKey{0xE3}
+	retainedKey, unwoundKey := solana.PublicKey{0xE1}, solana.PublicKey{0xE2}
 	t.Cleanup(func() {
 		global.DeleteVoteCacheItem(retainedKey)
 		global.DeleteVoteCacheItem(unwoundKey)
-		global.DeleteVoteCacheItem(leaderKey)
 	})
 	original := &sealevel.VoteStateVersions{}
 	global.PutVoteCacheItem(retainedKey, original)
@@ -248,9 +247,6 @@ func TestTryInLoopUnwindRestoresVoteCache(t *testing.T) {
 	putVoteCacheItem(slot7, retainedKey, retainedWrite)
 	putVoteCacheItem(slot8, retainedKey, &sealevel.VoteStateVersions{})
 	putVoteCacheItem(slot8, unwoundKey, &sealevel.VoteStateVersions{})
-	// A local leader bank at a later slot is not part of the tail.
-	leaderWrite := &sealevel.VoteStateVersions{}
-	putVoteCacheItem(&sealevel.SlotCtx{Slot: 20}, leaderKey, leaderWrite)
 
 	rs, bankSysvars, reason := tryInLoopUnwind(sw, tail, &state.MithrilState{}, sched, epoch, nil)
 	require.Empty(t, reason)
@@ -267,7 +263,6 @@ func TestTryInLoopUnwindRestoresVoteCache(t *testing.T) {
 	assert.Same(t, retainedWrite, global.VoteCacheItem(retainedKey), "the retained slot's write survives")
 	_, present := global.VoteCacheItemOK(unwoundKey)
 	assert.False(t, present, "a vote account the unwound slot created is gone again")
-	assert.Same(t, leaderWrite, global.VoteCacheItem(leaderKey), "a leader bank's write outside the tail survives")
 	acct, err := tail.GetAccount(8, testAccount(1, 0).Key)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(71), acct.Lamports, "abandoned account writes are removed")
@@ -384,4 +379,55 @@ func TestUnwindPreservesPendingLeaderStakeEntries(t *testing.T) {
 		}
 		require.Equal(t, slot == 12, found)
 	}
+}
+
+// The switch slots can share an epoch while the retained parent is in the
+// previous one: the epoch opened with skipped slots and the first executed
+// block of the new epoch is being discarded. Its epoch transition would be
+// evicted and never rerun, so the unwind must fall back.
+func TestTryInLoopUnwindRefusesParentInPreviousEpoch(t *testing.T) {
+	voteJournal.reset(true)
+	t.Cleanup(func() { voteJournal.reset(false) })
+	sched := &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 100, LeaderScheduleSlotOffset: 100}
+	tail := newUnrootedTail(&fakeDurable{}, &fakeCommitter{durable: accounts.NewMemAccounts()}, 512, 1, "")
+	tail.Add(99, []*accounts.Account{testAccount(1, 99)}, testHashBytes(99))
+	tail.SetContext(99, &state.ResumeContext{Slot: 99, Bankhash: base58.Encode(make([]byte, 32)), AcctsLtHash: base64.StdEncoding.EncodeToString(make([]byte, 2048))}, testUnwindBankSysvars(t, 99, 1))
+	tail.Add(103, []*accounts.Account{testAccount(1, 103)}, testHashBytes(103))
+	sw := &CertifiedSwitch{Slot: 103}
+	rs, _, reason := tryInLoopUnwind(sw, tail, &state.MithrilState{}, sched, sched.GetEpoch(103), nil)
+	require.Nil(t, rs)
+	assert.Equal(t, unwindFallbackCrossEpoch, reason)
+	acct, err := tail.GetAccount(103, testAccount(1, 0).Key)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(103), acct.Lamports, "a refused unwind leaves the tail untouched")
+}
+
+// Vote-cache writes the tail does not own (a local leader bank's, at its own
+// slot) at or above the switch slot cannot be attributed to either branch, so
+// the unwind falls back to the durable reload. Foreign records below the
+// switch slot are not affected by the switch.
+func TestTryInLoopUnwindRefusesForeignVoteWritesInSpan(t *testing.T) {
+	voteJournal.reset(true)
+	t.Cleanup(func() { voteJournal.reset(false) })
+	key := solana.PublicKey{0xE7}
+	t.Cleanup(func() { global.DeleteVoteCacheItem(key) })
+	sched := &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 432000, LeaderScheduleSlotOffset: 432000}
+	newTail := func() *unrootedTail {
+		tail := newUnrootedTail(&fakeDurable{}, &fakeCommitter{durable: accounts.NewMemAccounts()}, 512, 1, "")
+		tail.Add(7, []*accounts.Account{testAccount(1, 71)}, testHashBytes(7))
+		tail.SetContext(7, &state.ResumeContext{Slot: 7, Bankhash: base58.Encode(make([]byte, 32)), AcctsLtHash: base64.StdEncoding.EncodeToString(make([]byte, 2048))}, testUnwindBankSysvars(t, 7, 700))
+		tail.Add(8, []*accounts.Account{testAccount(1, 81)}, testHashBytes(8))
+		return tail
+	}
+	sw := &CertifiedSwitch{Slot: 8}
+
+	putVoteCacheItem(&sealevel.SlotCtx{Slot: 5}, key, &sealevel.VoteStateVersions{})
+	rs, _, reason := tryInLoopUnwind(sw, newTail(), &state.MithrilState{}, sched, 0, nil)
+	require.NotNil(t, rs, "a foreign record below the switch slot does not block the unwind")
+	require.Empty(t, reason)
+
+	putVoteCacheItem(&sealevel.SlotCtx{Slot: 20}, key, &sealevel.VoteStateVersions{})
+	rs, _, reason = tryInLoopUnwind(sw, newTail(), &state.MithrilState{}, sched, 0, nil)
+	require.Nil(t, rs)
+	assert.Equal(t, unwindFallbackForeignVotes, reason)
 }
