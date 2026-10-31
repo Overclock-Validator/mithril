@@ -79,6 +79,7 @@ type CompactStats struct {
 	FilesSparsified   int // dead payload pages released without moving live/undo records
 	LiveBytesMoved    int64
 	BytesReclaimed    int64 // source bytes freed (compacted + deleted)
+	YieldedToFold     bool  // the cycle stopped early because a fold was waiting
 }
 
 const (
@@ -234,6 +235,15 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 	for {
 		if stats.LiveBytesMoved >= cfg.MaxMoveBytesPerCycle || scannedBytes >= cfg.MaxScanBytesPerCycle || stats.CandidatesScanned >= cfg.MaxFilesPerCycle ||
 			(cfg.MaxDuration > 0 && stats.CandidatesScanned > 0 && time.Since(started) >= cfg.MaxDuration) {
+			break
+		}
+		// A fold is waiting for foldMu: end the cycle at this file boundary,
+		// as the duration budget does. Replay waits on folds at fork switches
+		// and epoch boundaries; the cursors resume the scan next cycle. At
+		// least one file per cycle keeps compaction progressing under
+		// back-to-back folds.
+		if stats.CandidatesScanned > 0 && db.foldWaiters.Load() > 0 {
+			stats.YieldedToFold = true
 			break
 		}
 		c, ok := queue.next()
