@@ -327,6 +327,11 @@ type repairClient struct {
 	ranked    []gossip.RepairPeer
 	rankedAt  time.Time
 	headPeers headRepairPeers
+	// Fastest reliable responders for head requests (mu-guarded, rebuilt with
+	// ranked) and the head retry timer (repair loop only); see repair_tip.go.
+	fastHead       []gossip.RepairPeer
+	fastHeadCursor uint64
+	headRetryTimer *time.Timer
 
 	peerCacheMu sync.Mutex
 	peerCache   []gossip.RepairPeer
@@ -462,7 +467,13 @@ func (c *repairClient) repairOnce(conn *net.UDPConn, assembler *SlotAssembler) {
 	// caps the listing this scan may send).
 	var headPol *retryPolicy
 	if len(priority) > 0 {
-		p := headPolicy(len(priority[0].MissingDataShreds))
+		missing := len(priority[0].MissingDataShreds)
+		p := headPolicy(missing)
+		if missing <= repairRetryHeadNearMissing {
+			// Near completion a silent peer gates emission: retry after a
+			// few round trips rather than the fixed tier interval.
+			p.retryInterval = c.headRetryInterval(p.retryInterval)
+		}
 		headPol = &p
 		// Head admission share: the head stays strictly first in line, but
 		// may hold at most its share of the admission window — the remainder
@@ -504,6 +515,9 @@ func (c *repairClient) repairOnce(conn *net.UDPConn, assembler *SlotAssembler) {
 	// sized by the edge's actual demand, so a blocked head is never capped
 	// below what the edge can use; leftover head budget flows to the edge.
 	spent := c.sendTier(conn, peers, priority, splitRepairBudget(budget, edgeDemand), headPol, acct)
+	if headPol != nil {
+		c.armHeadRetryWake(headPol.retryInterval)
+	}
 	spent += c.sendTier(conn, peers, edge, budget-spent, nil, acct)
 	// Parent/normal repair and freshness keep first claim on every token.
 	if haveChild {
@@ -1081,6 +1095,9 @@ func (c *repairClient) nextPeerForRequestLocked(peers []gossip.RepairPeer, reque
 		if peer, ok := c.pickHeadResponderLocked(peers, cap, request); ok {
 			return peer, true
 		}
+		if peer, ok := c.pickFastHeadPeerLocked(peers, cap, request); ok {
+			return peer, true
+		}
 		if peer, ok := c.pickResponderLocked(peers, cap); ok {
 			return peer, true
 		}
@@ -1175,6 +1192,7 @@ func (c *repairClient) rebuildRankedLocked(peers []gossip.RepairPeer, now time.T
 	for _, sp := range responders[:keep] {
 		c.ranked = append(c.ranked, sp.peer)
 	}
+	c.rebuildFastHeadLocked(peers, now)
 }
 
 // notePeerSentLocked and the outcome noters maintain the per-peer service
