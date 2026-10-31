@@ -369,6 +369,33 @@ func TestCompactThresholdAndBudget(t *testing.T) {
 	assert.Equal(t, uint64(500), mustColdRead(t, db2, 140, solana.PublicKey{5}).Lamports)
 }
 
+// A fold waiting on foldMu ends the compaction cycle at the next file
+// boundary, after at least one file, and the next cycle resumes the scan.
+func TestCompactYieldsToWaitingFold(t *testing.T) {
+	db, _ := newFoldTestDb(t)
+	defer db.CloseDb()
+	big := make([]byte, 2048)
+	commitTestBatch(t, db, 110, foldAcct(1, 100, big), foldAcct(4, 400, []byte("live-a")))
+	commitTestBatch(t, db, 120, foldAcct(1, 101, big), foldAcct(5, 500, []byte("live-b")))
+	commitTestBatch(t, db, 130, foldAcct(1, 102, big))
+	commitTestBatch(t, db, 140, foldAcct(1, 103, big))
+	cfg := CompactionConfig{RewindHorizonBatches: 1, MinDeadFraction: 0.5}
+
+	db.foldWaiters.Add(1)
+	stats, err := db.CompactOnce(cfg)
+	db.foldWaiters.Add(-1)
+	require.NoError(t, err)
+	assert.Equal(t, 1, stats.CandidatesScanned, "a waiting fold stops the cycle after one file")
+	assert.True(t, stats.YieldedToFold)
+
+	stats, err = db.CompactOnce(cfg)
+	require.NoError(t, err)
+	assert.False(t, stats.YieldedToFold)
+	assert.Equal(t, 1, stats.FilesCompacted, "the next cycle compacts the file the yield skipped")
+	assert.Equal(t, uint64(400), mustColdRead(t, db, 140, solana.PublicKey{4}).Lamports)
+	assert.Equal(t, uint64(500), mustColdRead(t, db, 140, solana.PublicKey{5}).Lamports)
+}
+
 // Bootstrap appendvecs (no manifest, fileId <= bootstrap high-water) compact
 // like any other file; undecided orphans above the high-water mark are left
 // for recovery.

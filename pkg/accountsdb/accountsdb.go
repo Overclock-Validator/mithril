@@ -77,6 +77,7 @@ type AccountsDb struct {
 	// Batch-fold state (segment.go/fold.go/recovery.go). foldMu serializes
 	// CommitBatch, recovery, rewind, and compaction.
 	foldMu           metrics.TimedMutex
+	foldWaiters      atomic.Int32  // folds blocked on foldMu; compaction yields between files
 	lastBatchSeq     uint64        // guarded by foldMu; seeded by RecoverFoldState
 	durableThrough   atomic.Uint64 // observability: highest durably folded slot
 	foldHooks        foldTestHooks // test-only crash injection
