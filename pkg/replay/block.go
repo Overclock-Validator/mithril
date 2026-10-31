@@ -67,6 +67,31 @@ type rpcHealthInvalidator interface {
 	InvalidateHealth()
 }
 
+type alpenglowCertifiedTip interface {
+	AlpenglowCertifiedTip() (slot uint64, at time.Time, ok bool)
+}
+
+// healthTipMaxAge is how old the latest certificate may be and still count as
+// the network tip, matching the block source's RPC tip freshness.
+const healthTipMaxAge = 30 * time.Second
+
+// networkHealthSlot is the highest recently observed network tip: the latest
+// verified Votor certificate and the configured RPCs' confirmed slot. Either
+// source alone is enough, so health does not depend on an outside RPC.
+func networkHealthSlot(certs alpenglowCertifiedTip, rpcTip func() (uint64, bool)) (uint64, bool) {
+	var tip uint64
+	fresh := false
+	if certs != nil {
+		if slot, at, ok := certs.AlpenglowCertifiedTip(); ok && time.Since(at) <= healthTipMaxAge {
+			tip, fresh = slot, true
+		}
+	}
+	if slot, ok := rpcTip(); ok {
+		tip, fresh = max(tip, slot), true
+	}
+	return tip, fresh
+}
+
 // BlockFetchOpts contains options for parallel block fetching
 type BlockFetchOpts struct {
 	MaxRPS          int    // Rate limit (requests per second), 0 = use default
@@ -2640,7 +2665,8 @@ func ReplayBlocks(
 
 	blockStream := blockstream.NewBlockSource(opts)
 	if health, ok := rpcServer.(interface{ SetHealthSlotSource(func() (uint64, bool)) }); ok && isLive {
-		health.SetHealthSlotSource(blockStream.HealthSlot)
+		certs, _ := consensusEngine.(alpenglowCertifiedTip)
+		health.SetHealthSlotSource(func() (uint64, bool) { return networkHealthSlot(certs, blockStream.HealthSlot) })
 		defer health.SetHealthSlotSource(func() (uint64, bool) { return 0, false })
 	}
 	// Every state save records the repair peers that served this run well, so

@@ -293,6 +293,9 @@ type AlpenglowObserverEngine struct {
 	liveClockMu              sync.Mutex
 	liveClockSlot            uint64
 	liveClockAt              time.Time
+	certifiedTipMu           sync.Mutex
+	certifiedTipSlot         uint64
+	certifiedTipAt           time.Time
 	// Pool transitions and downstream chain delivery are one ordered stream.
 	poolOutputMu sync.Mutex
 	// invalidActionMu linearizes new block-target votes against objective
@@ -491,6 +494,29 @@ func (e *AlpenglowObserverEngine) AlpenglowLiveSlot() (uint64, bool) {
 		return ^uint64(0), true
 	}
 	return slot + elapsedSlots, true
+}
+
+// noteCertifiedTip records a certificate that arrived over Votor and passed
+// BLS and stake verification. Block footer certificates are not recorded:
+// during catch-up they are old, and would make the network look caught up.
+func (e *AlpenglowObserverEngine) noteCertifiedTip(slot uint64) {
+	e.certifiedTipMu.Lock()
+	if slot >= e.certifiedTipSlot {
+		e.certifiedTipSlot = slot
+		e.certifiedTipAt = time.Now()
+	}
+	e.certifiedTipMu.Unlock()
+}
+
+// AlpenglowCertifiedTip returns the highest slot of a verified certificate
+// received over Votor and when it arrived. A certificate needs a stake
+// supermajority, so unlike AlpenglowLiveSlot (which also follows first
+// shreds, and a leader can sign one for its own future slot) no single
+// leader can move this ahead of the network.
+func (e *AlpenglowObserverEngine) AlpenglowCertifiedTip() (uint64, time.Time, bool) {
+	e.certifiedTipMu.Lock()
+	defer e.certifiedTipMu.Unlock()
+	return e.certifiedTipSlot, e.certifiedTipAt, !e.certifiedTipAt.IsZero()
 }
 
 func (e *AlpenglowObserverEngine) ObserveBlock(_ context.Context, obs BlockObservation) error {
@@ -787,6 +813,7 @@ func (e *AlpenglowObserverEngine) admitVotorMessage(msg alpenglow.Message) (alpe
 		// BLS/stake verification, so it is a safe live-clock anchor even when
 		// the logical certificate was already cached from another source.
 		e.noteAlpenglowLiveSlot(verified.Slot)
+		e.noteCertifiedTip(verified.Slot)
 		// A logical certificate can be cached before this particular wire proof
 		// arrives (for example from a block footer). Only attribute network
 		// confirmation when the exact signature+bitmap received over Votor QUIC
@@ -1241,6 +1268,7 @@ func (e *AlpenglowObserverEngine) replayPendingCertsForEpoch(epoch uint64) {
 		}
 		if pending.fromNetwork {
 			e.noteNetworkCertificate(verified)
+			e.noteCertifiedTip(verified.Slot)
 		}
 		e.acceptVerifiedCertificate(verified)
 	}
