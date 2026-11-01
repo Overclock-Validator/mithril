@@ -315,7 +315,7 @@ func handleEpochTransition(acctsDb *accountsdb.AccountsDb, partitionedEpochRewar
 		// after a snapshot restore.
 		if alpenglowActive && rewardedEpoch >= migrationEpoch {
 			updated, parent, err := stageRewardEpochDelegatedStakes(
-				acctsDb, prevSlotCtx.Slot, block.Slot, rewardedEpoch,
+				acctsDb, prevSlotCtx.Slot, rewardedEpoch,
 				admitted, scanResult.RewardEpochEffectiveStakes, replayCtx,
 			)
 			if err != nil {
@@ -327,7 +327,7 @@ func handleEpochTransition(acctsDb *accountsdb.AccountsDb, partitionedEpochRewar
 
 		if alpenglowActive && f.IsActive(features.ValidatorAdmissionTicket) {
 			updated, parents, err := applyAlpenglowBoundaryVAT(
-				acctsDb, prevSlotCtx.Slot, block.Slot,
+				acctsDb, prevSlotCtx.Slot,
 				alpenglowVATBurnPerEpoch(f, epochSchedule, block.Slot), admitted,
 			)
 			if err != nil {
