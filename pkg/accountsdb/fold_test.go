@@ -329,9 +329,14 @@ func TestRecoverFoldStateStopsAtGapAndRemovesAbove(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	// Rewind the index to "nothing applied" and delete seq 2's manifest to
+	// Rewind the index to "nothing applied" (no watermark and no entries, as
+	// an index commit writes both at once) and delete seq 2's manifest to
 	// create a gap: seq 1 must replay, seq 3 must be treated as undecided.
 	require.NoError(t, db.Index.Delete(metaKeyLastBatch, pebble.Sync))
+	for i := range 3 {
+		key := solana.PublicKey{byte(i + 1)}
+		require.NoError(t, db.Index.Delete(key[:], pebble.Sync))
+	}
 	headers, err := ListFoldManifests(db.AcctsDir)
 	require.NoError(t, err)
 	require.Len(t, headers, 3)
