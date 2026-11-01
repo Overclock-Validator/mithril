@@ -372,6 +372,17 @@ func (accountsDb *AccountsDb) MaybeGetProgramFromCache(pubkey solana.PublicKey) 
 	return accountsDb.ProgramCache.Get(pubkey)
 }
 
+// ProgramCached reports whether the program cache holds an entry for pubkey
+// without counting the lookup as an access for its eviction policy.
+func (accountsDb *AccountsDb) ProgramCached(pubkey solana.PublicKey) bool {
+	if accountsDb == nil {
+		return false
+	}
+	accountsDb.programCacheMu.RLock()
+	defer accountsDb.programCacheMu.RUnlock()
+	return accountsDb.ProgramCache.Has(pubkey)
+}
+
 func (accountsDb *AccountsDb) AddProgramToCache(pubkey solana.PublicKey, programEntry *ProgramCacheEntry) {
 	accountsDb.programCacheMu.RLock()
 	defer accountsDb.programCacheMu.RUnlock()

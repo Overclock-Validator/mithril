@@ -896,6 +896,9 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		accountsdb.DisableIndexWAL = true
 		mlog.Log.Warnf("storage.index_wal=false: account index runs without a Pebble WAL; fold manifests serve as the index redo log")
 	}
+	if reason := lthash.XOFFallbackReason(); reason != "" {
+		mlog.Log.Warnf("account hashing: AVX-512 output path disabled, using blake3.Digest.Read: %s", reason)
+	}
 
 	// [rpc] section - Mithril's RPC server
 	rpcPort = getInt("rpc-port", "rpc.port")

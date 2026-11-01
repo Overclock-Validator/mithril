@@ -48,9 +48,54 @@ var NewReservedAcctsSet = map[solana.PublicKey]struct{}{
 	a.SysvarOwnerAddr:           {},
 }
 
+// sysvarAddrs and nativeProgramAddrs are the keys IsSysvar and
+// IsNativeProgram accept. The writability filter below is built from the same
+// tables, so it cannot miss one.
+var sysvarAddrs = [...]solana.PublicKey{
+	SysvarClockAddr, SysvarEpochScheduleAddr, SysvarFeesAddr, SysvarInstructionsAddr,
+	SysvarRecentBlockHashesAddr, SysvarRentAddr, a.SysvarRewardsAddr, SysvarSlotHashesAddr,
+	SysvarSlotHistoryAddr, SysvarStakeHistoryAddr,
+}
+
+var nativeProgramAddrs = [...]solana.PublicKey{
+	a.SystemProgramAddr, a.BpfLoaderUpgradeableAddr, a.BpfLoader2Addr, a.BpfLoaderDeprecatedAddr,
+	a.VoteProgramAddr, a.StakeProgramAddr, a.ConfigProgramAddr, a.StakeProgramConfigAddr,
+	a.NativeLoaderAddr,
+}
+
+// writabilityFilter has a bit set for the low 12 bits of every key IsWritable
+// can demote (native programs, sysvars, reserved keys, the secp256r1
+// precompile). A key whose bit is clear is none of them, so IsWritable skips
+// the comparisons; a set bit only means the full check runs.
+var writabilityFilter = func() (filter [64]uint64) {
+	add := func(k solana.PublicKey) {
+		i := writabilityFilterIndex(&k)
+		filter[i>>6] |= 1 << (i & 63)
+	}
+	for _, k := range sysvarAddrs {
+		add(k)
+	}
+	for _, k := range nativeProgramAddrs {
+		add(k)
+	}
+	for k := range NewReservedAcctsSet {
+		add(k)
+	}
+	add(a.Secp256r1PrecompileAddr)
+	return filter
+}()
+
+func writabilityFilterIndex(k *solana.PublicKey) uint {
+	return uint(k[0]) | uint(k[1]&0x0f)<<8
+}
+
 func IsWritable(am *AccountMeta, f *features.Features) bool {
 	if !am.IsWritable {
 		return false
+	}
+
+	if i := writabilityFilterIndex(&am.Pubkey); writabilityFilter[i>>6]&(1<<(i&63)) == 0 {
+		return true
 	}
 
 	if IsNativeProgram(am.Pubkey) || IsSysvar(am.Pubkey) {
@@ -73,27 +118,21 @@ func IsWritable(am *AccountMeta, f *features.Features) bool {
 }
 
 func IsSysvar(pubkey solana.PublicKey) bool {
-	if pubkey == SysvarClockAddr || pubkey == SysvarEpochScheduleAddr ||
-		pubkey == SysvarFeesAddr || pubkey == SysvarInstructionsAddr ||
-		pubkey == SysvarRecentBlockHashesAddr || pubkey == SysvarRentAddr ||
-		pubkey == a.SysvarRewardsAddr || pubkey == SysvarSlotHashesAddr ||
-		pubkey == SysvarSlotHistoryAddr || pubkey == SysvarStakeHistoryAddr {
-		return true
-	} else {
-		return false
+	for i := range sysvarAddrs {
+		if pubkey == sysvarAddrs[i] {
+			return true
+		}
 	}
+	return false
 }
 
 func IsNativeProgram(pubkey solana.PublicKey) bool {
-	if pubkey == a.SystemProgramAddr || pubkey == a.BpfLoaderUpgradeableAddr ||
-		pubkey == a.BpfLoader2Addr || pubkey == a.BpfLoaderDeprecatedAddr ||
-		pubkey == a.VoteProgramAddr || pubkey == a.StakeProgramAddr ||
-		pubkey == a.ConfigProgramAddr || pubkey == a.StakeProgramConfigAddr ||
-		pubkey == a.NativeLoaderAddr {
-		return true
-	} else {
-		return false
+	for i := range nativeProgramAddrs {
+		if pubkey == nativeProgramAddrs[i] {
+			return true
+		}
 	}
+	return false
 }
 
 func InstructionAcctsFromAccountMetas(instrAcctMetas []AccountMeta, txAccounts TransactionAccounts) []InstructionAccount {

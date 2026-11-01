@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"math"
+	"os"
 
 	a "github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/cu"
@@ -229,7 +230,15 @@ func (lookupTableMeta *LookupTableMeta) MarshalWithEncoder(encoder *bin.Encoder)
 	return err
 }
 
+// Reserve the decoded address slice at its validated length (on by default;
+// MITHRIL_ALT_EXACT_CAPACITY=0 restores append growth for comparisons).
+var exactAddressLookupTableCapacity = os.Getenv("MITHRIL_ALT_EXACT_CAPACITY") != "0"
+
 func UnmarshalAddressLookupTable(data []byte) (*AddressLookupTable, error) {
+	return unmarshalAddressLookupTable(data, exactAddressLookupTableCapacity)
+}
+
+func unmarshalAddressLookupTable(data []byte, exactCapacity bool) (*AddressLookupTable, error) {
 	addrLookupTable := new(AddressLookupTable)
 	decoder := bin.NewBinDecoder(data)
 
@@ -265,6 +274,12 @@ func UnmarshalAddressLookupTable(data []byte) (*AddressLookupTable, error) {
 	}
 
 	var addrs []solana.PublicKey
+	if exactCapacity && rawAddrDataLen != 0 {
+		// The validated wire length gives the exact count. Keep owned storage,
+		// but avoid geometrically growing and copying it as keys are decoded.
+		// Preserve nil addresses for an empty table.
+		addrs = make([]solana.PublicKey, 0, rawAddrDataLen/solana.PublicKeyLength)
+	}
 
 	for pos := 0; pos < len(rawAddrData); pos += solana.PublicKeyLength {
 		pkBytes := rawAddrData[pos : pos+solana.PublicKeyLength]

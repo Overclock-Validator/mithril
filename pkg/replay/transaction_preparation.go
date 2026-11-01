@@ -41,8 +41,8 @@ func NewTransactionPreparer(f *features.Features) *TransactionPreparer {
 		return nil
 	}
 	clone := f.Clone()
-	gates := make([]features.FeatureGate, 0, len(*clone))
-	for gate := range *clone {
+	gates := make([]features.FeatureGate, 0, clone.Len())
+	for gate := range clone.All() {
 		gates = append(gates, gate)
 	}
 	sort.Slice(gates, func(i, j int) bool {
@@ -54,7 +54,7 @@ func NewTransactionPreparer(f *features.Features) *TransactionPreparer {
 	h := sha256.New()
 	var value [8]byte
 	for _, gate := range gates {
-		info := (*clone)[gate]
+		info, _ := clone.Info(gate)
 		h.Write(gate.Address[:])
 		binary.LittleEndian.PutUint64(value[:], uint64(len(gate.Name)))
 		h.Write(value[:])
