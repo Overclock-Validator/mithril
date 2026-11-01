@@ -69,7 +69,7 @@ func TestSparseCompactionRetainsExactLiveAndUndoRecords(t *testing.T) {
 				// reader; only obsolete payload bytes can differ.
 				data, err := os.ReadFile(source)
 				require.NoError(t, err)
-				keys, _, _, err := BuildIndexEntriesFromAppendVecs(data, uint64(len(data)), 110, r1.FileId)
+				keys, _, _, _, err := BuildIndexEntriesFromAppendVecs(data, uint64(len(data)), 110, r1.FileId)
 				require.NoError(t, err)
 				require.Len(t, keys, 3)
 				_, err = db.RewindToBatchBoundary(130)

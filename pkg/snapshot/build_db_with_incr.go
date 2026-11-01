@@ -85,12 +85,12 @@ func BuildAccountsDbAuto(
 	defer cleanupIndexWorkDir()
 	sl := NewShardLogger(numShards, logsDir)
 
-	// Create stake pubkey collector for building stake index during appendvec processing
-	stakeCollector := &stakeIndexCollector{
-		entries: make([]accountsdb.StakeIndexEntry, 0, 1000000), // Pre-allocate for ~1M stake accounts
+	// Collect stake and vote pubkeys while parsing appendvecs.
+	accountCollector := &snapshotAccountCollector{
+		stakeEntries: make([]accountsdb.StakeIndexEntry, 0, 1000000), // Pre-allocate for ~1M stake accounts
 	}
 
-	pools, err := initWorkerPools(wg, sl, manifest, incrementalManifest, appendVecDirs, stakeCollector)
+	pools, err := initWorkerPools(wg, sl, manifest, incrementalManifest, appendVecDirs, accountCollector)
 	if err != nil {
 		return nil, nil, fmt.Errorf("initializing worker pools: %w", err)
 	}
@@ -302,7 +302,7 @@ func BuildAccountsDbAuto(
 
 	// Write stake pubkey index file (with appendvec location hints)
 	stakeIndexPath := filepath.Join(accountsDbDir, "stake_pubkeys.idx")
-	if err := accountsdb.WriteStakePubkeyIndex(stakeIndexPath, stakeCollector.entries); err != nil {
+	if err := accountsdb.WriteStakePubkeyIndex(stakeIndexPath, accountCollector.stakeEntries); err != nil {
 		return nil, nil, fmt.Errorf("writing stake pubkey index: %w", err)
 	}
 	if err := syncBuildMetadata(accountsDbDir); err != nil {
@@ -319,6 +319,10 @@ func BuildAccountsDbAuto(
 	accountsDb, err := accountsdb.OpenDbPaths(accountsPaths)
 	if err != nil {
 		return nil, nil, err
+	}
+	if err := accountsDb.SeedVoteAccountPubkeys(accountCollector.votePubkeys); err != nil {
+		accountsDb.CloseDb()
+		return nil, nil, fmt.Errorf("seeding vote pubkey index: %w", err)
 	}
 
 	rpcClient := rpcclient.NewRpcClient(rpcEndpoints[0])

@@ -3,12 +3,12 @@ package rpcserver
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
-	"reflect"
 
 	"github.com/DataDog/zstd"
-	"github.com/Overclock-Validator/mithril/pkg/global"
-	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
+	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/safemath"
 	"github.com/filecoin-project/go-jsonrpc"
 	"github.com/gagliardetto/solana-go"
@@ -54,7 +54,7 @@ const (
 )
 
 func (rpcServer *RpcServer) GetAccountInfo(ctx context.Context, p jsonrpc.RawParams) (GetAccountInfoResp, error) {
-	params, err := jsonrpc.DecodeParams[[]interface{}](p)
+	params, err := decodeOptionalParams(p)
 	if err != nil {
 		return GetAccountInfoResp{}, fmt.Errorf("decoding params: %w", err)
 	}
@@ -73,18 +73,31 @@ func (rpcServer *RpcServer) GetAccountInfo(ctx context.Context, p jsonrpc.RawPar
 		return GetAccountInfoResp{}, fmt.Errorf("invalid base58 encoding")
 	}
 
-	acct, err := rpcServer.acctsDb.GetAccount(0, pk)
-	if err != nil {
-		return GetAccountInfoResp{}, nil
-	}
-
 	conf, err := parseGetAccountInfoConfMap(params)
 	if err != nil {
-		return GetAccountInfoResp{}, err
+		return GetAccountInfoResp{}, &InvalidParamsError{Message: err.Error()}
+	}
+	rooted, acct, err := rpcServer.readRootedAccount(ctx, pk)
+	if err != nil && !errors.Is(err, accountsdb.ErrNoAccount) {
+		return GetAccountInfoResp{}, fmt.Errorf("read account at rooted slot %d: %w", rooted.Slot, err)
+	}
+	if conf.MinContextSlot > rooted.Slot {
+		return GetAccountInfoResp{}, &MinContextSlotNotReachedError{ContextSlot: rooted.Slot}
+	}
+	if errors.Is(err, accountsdb.ErrNoAccount) {
+		return GetAccountInfoResp{Context: GetAccountInfoRespContext{ApiVersion: "mithril 0.1", Slot: rooted.Slot}}, nil
 	}
 
 	var acctData interface{}
-	acctData, err = encodeAcctDataWithConfig(acct.Data, conf)
+	if conf.EncodingType != nil && *conf.EncodingType == GetAccountEncodingJson && conf.DataSlice != nil {
+		return GetAccountInfoResp{}, fmt.Errorf("cannot use jsonParsed with dataSlice")
+	}
+	if conf.EncodingType != nil && *conf.EncodingType == GetAccountEncodingJson && acct.Owner == addresses.VoteProgramAddr {
+		acctData, err = parsedVoteAccountData(acct.Data, pk)
+	}
+	if acctData == nil || err != nil {
+		acctData, err = encodeAcctDataWithConfig(acct.Data, conf)
+	}
 	if err != nil {
 		return GetAccountInfoResp{}, err
 	}
@@ -97,11 +110,11 @@ func (rpcServer *RpcServer) GetAccountInfo(ctx context.Context, p jsonrpc.RawPar
 		RentEpoch:  acct.RentEpoch,
 		Space:      uint64(len(acct.Data))}
 
-	return GetAccountInfoResp{Context: GetAccountInfoRespContext{ApiVersion: "mithril 0.1", Slot: global.Slot()}, Value: val}, nil
+	return GetAccountInfoResp{Context: GetAccountInfoRespContext{ApiVersion: "mithril 0.1", Slot: rooted.Slot}, Value: val}, nil
 }
 
 func parseGetAccountInfoConfMap(params []interface{}) (*GetAccountInfoConfig, error) {
-	if len(params) < 2 {
+	if len(params) < 2 || params[1] == nil {
 		return &GetAccountInfoConfig{}, nil
 	}
 
@@ -113,19 +126,23 @@ func parseGetAccountInfoConfMap(params []interface{}) (*GetAccountInfoConfig, er
 
 	conf := &GetAccountInfoConfig{}
 
-	// commitment is optional
-	commitmentObj, ok := confMap["commitment"]
-	if ok {
-		commitmentStr, ok := commitmentObj.(string)
-		if !ok {
-			return nil, fmt.Errorf("invalid commitment")
+	if err := validateRootedCommitment(confMap["commitment"]); err != nil {
+		return nil, err
+	}
+	if commitment, ok := confMap["commitment"].(string); ok {
+		conf.Commitment = commitment
+	}
+
+	if minContextSlot, ok := confMap["minContextSlot"]; ok && minContextSlot != nil {
+		conf.MinContextSlot, err = rpcUint64(minContextSlot, "minContextSlot")
+		if err != nil {
+			return nil, err
 		}
-		conf.Commitment = commitmentStr
 	}
 
 	// encoding type is optional. defaults to base58.
 	encodingObj, ok := confMap["encoding"]
-	if ok {
+	if ok && encodingObj != nil {
 		encodingStr, ok := encodingObj.(string)
 		if ok {
 			var encodingType int
@@ -141,8 +158,7 @@ func parseGetAccountInfoConfMap(params []interface{}) (*GetAccountInfoConfig, er
 
 	// dataSlice is optional. if present, it must contain both 'length' and 'offset' fields.
 	dataSliceObj, ok := confMap["dataSlice"]
-	if ok {
-		mlog.Log.Infof("dataSliceObj: %+v, type: %s", dataSliceObj, reflect.TypeOf(dataSliceObj))
+	if ok && dataSliceObj != nil {
 		dsMap, ok := dataSliceObj.(map[string]interface{})
 		if ok {
 			conf.DataSlice, err = parseDataSlice(dsMap)
@@ -161,30 +177,22 @@ func parseDataSlice(dataSlice map[string]interface{}) (*GetAccountInfoDataSlice,
 	lengthObj, hasLen := dataSlice["length"]
 	offsetObj, hasOffset := dataSlice["offset"]
 
-	if hasLen && !hasOffset {
+	if !hasOffset {
 		return nil, fmt.Errorf("missing dataSlice field offset")
-	} else if !hasLen && hasOffset {
+	} else if !hasLen {
 		return nil, fmt.Errorf("missing dataSlice field length")
 	}
 
-	ds := &GetAccountInfoDataSlice{}
-	if hasLen == hasOffset && hasLen {
-		length, ok := lengthObj.(float64)
-		if !ok {
-			return nil, fmt.Errorf("invalid dataSlice length, expected usize, got %s", reflect.TypeOf(lengthObj))
-		}
-		offset, ok := offsetObj.(float64)
-		if !ok {
-			return nil, fmt.Errorf("invalid dataSlice offset, expected usize, got %s", reflect.TypeOf(offsetObj))
-		}
-
-		lengthUint := uint64(length)
-		offsetUint := uint64(offset)
-		ds.Len = &lengthUint
-		ds.Offset = &offsetUint
+	length, err := rpcUint64(lengthObj, "dataSlice length")
+	if err != nil {
+		return nil, err
+	}
+	offset, err := rpcUint64(offsetObj, "dataSlice offset")
+	if err != nil {
+		return nil, err
 	}
 
-	return ds, nil
+	return &GetAccountInfoDataSlice{Len: &length, Offset: &offset}, nil
 }
 
 func parseGetAcctDataEncodingType(encodingStr string) (int, error) {
@@ -199,7 +207,7 @@ func parseGetAcctDataEncodingType(encodingStr string) (int, error) {
 		return GetAccountEncodingBase64Zstd, nil
 
 	case "jsonParsed":
-		return GetAccountEncodingBase64, nil
+		return GetAccountEncodingJson, nil
 
 	default:
 		return 0, fmt.Errorf("invalid data encoding %s", encodingStr)
