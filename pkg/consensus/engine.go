@@ -1699,19 +1699,19 @@ func (e *AlpenglowObserverEngine) AlpenglowSafetyError() error {
 }
 
 func (e *AlpenglowObserverEngine) Close() error {
+	// Stop and join message admission before sealing the final voting history.
+	var err error
+	if e.receiver != nil {
+		err = e.receiver.Close()
+	}
 	e.voterMu.Lock()
 	voter := e.voter
 	e.voter = nil
 	e.voterMu.Unlock()
 	if voter != nil {
-		if err := voter.close(); err != nil {
-			return err
-		}
+		err = errors.Join(err, voter.close())
 	}
-	if e.receiver != nil {
-		return e.receiver.Close()
-	}
-	return nil
+	return err
 }
 
 func (e *AlpenglowObserverEngine) ensureObserver() *alpenglow.Observer {

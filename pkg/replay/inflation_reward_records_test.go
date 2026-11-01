@@ -200,7 +200,7 @@ func TestInflationRewardRecordsUseCalculationTimeCommission(t *testing.T) {
 			db, err := accountsdb.OpenDb(dir)
 			require.NoError(t, err)
 			db.InitCaches()
-			t.Cleanup(db.CloseDb)
+			t.Cleanup(func() { require.NoError(t, db.CloseDb()) })
 			global.ClearPendingStakePubkeys()
 			t.Cleanup(global.ClearPendingStakePubkeys)
 			for _, epoch := range []uint64{70, 71} {

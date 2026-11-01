@@ -33,7 +33,7 @@ func TestEpochRewardHTTPAfterDurableRewind(t *testing.T) {
 			require.NoError(t, err)
 			db.RootedDurable = true
 			db.InitCaches()
-			t.Cleanup(db.CloseDb)
+			t.Cleanup(func() { require.NoError(t, db.CloseDb()) })
 			address := solana.PublicKey{91}
 			var tip *state.ResumeContext
 			for _, slot := range []uint64{2, 4} {

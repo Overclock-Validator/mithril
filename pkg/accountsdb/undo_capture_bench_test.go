@@ -39,7 +39,11 @@ func pointLookupUndo(db *AccountsDb, keys [][32]byte) ([]undoEntry, error) {
 
 func benchUndoDb(b *testing.B, indexed, folded int) (*AccountsDb, [][32]byte) {
 	db, _ := newFoldTestDb(b)
-	b.Cleanup(db.CloseDb)
+	b.Cleanup(func() {
+		if err := db.CloseDb(); err != nil {
+			b.Fatal(err)
+		}
+	})
 	rng := rand.New(rand.NewSource(7))
 	all := make([][32]byte, indexed)
 	var buf [24]byte

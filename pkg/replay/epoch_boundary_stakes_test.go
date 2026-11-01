@@ -111,7 +111,11 @@ func epochBoundaryStakeDB(t *testing.T, slot uint64, delegations []sealevel.Dele
 	db, err := accountsdb.OpenDb(dir)
 	require.NoError(t, err)
 	db.InitCaches()
-	t.Cleanup(db.CloseDb)
+	t.Cleanup(func() {
+		if err := db.CloseDb(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	})
 
 	global.ClearPendingStakePubkeys()
 	var accts []*accounts.Account

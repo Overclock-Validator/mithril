@@ -37,7 +37,11 @@ func TestSameBankRewardPartitionWaitsForStartingBlockHeight(t *testing.T) {
 	db, err := accountsdb.OpenDb(dir)
 	require.NoError(t, err)
 	db.InitCaches()
-	t.Cleanup(db.CloseDb)
+	t.Cleanup(func() {
+		if err := db.CloseDb(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	})
 
 	previousCacheAcct := sealevel.SysvarCache.EpochRewards.Acct
 	previousCacheSysvar := sealevel.SysvarCache.EpochRewards.Sysvar
