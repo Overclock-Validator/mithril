@@ -144,3 +144,88 @@ func TestAccountPrefetchPreloadSkipsPartialRead(t *testing.T) {
 	}
 	assert.Equal(t, uint64(0), p.invoked.Load())
 }
+
+// referencedPrograms returns n v2 programs with the given source, as the
+// accounts a block lists without invoking them.
+func referencedPrograms(first byte, n int, source []byte) ([]solana.PublicKey, []*accounts.Account) {
+	keys := make([]solana.PublicKey, n)
+	accts := make([]*accounts.Account, n)
+	for i := range n {
+		keys[i] = solana.PublicKey{first, byte(i)}
+		accts[i] = &accounts.Account{Key: keys[i], Owner: addresses.BpfLoader2Addr, Lamports: 1, Executable: true, Data: source}
+	}
+	return keys, accts
+}
+
+// Preloads of programs a block only lists stop after preloadReferencedAttempts
+// compile attempts, failed ones included, or once their source would exceed
+// preloadReferencedBytes. Top-level programs are not bounded.
+func TestAccountPrefetchPreloadBudget(t *testing.T) {
+	elf := fixtures.Load(t, "sbpf", "noop_aligned.so")
+	cachedCount := func(db *accountsdb.AccountsDb, keys []solana.PublicKey) int {
+		n := 0
+		for _, key := range keys {
+			if _, ok := db.MaybeGetProgramFromCache(key); ok {
+				n++
+			}
+		}
+		return n
+	}
+
+	failing, failingAccts := referencedPrograms(0xB1, preloadReferencedAttempts, []byte("not an elf"))
+	valid, validAccts := referencedPrograms(0xB2, 4, elf)
+	p, db := preloadPrefetcher(&prefetchRecordingSource{})
+	p.preloadPrograms(context.Background(), accountPrefetchJob{slot: 50}, append(failing, valid...), append(failingAccts, validAccts...))
+	assert.Zero(t, cachedCount(db, valid), "failed attempts count against the bound")
+	assert.Equal(t, uint64(1), p.overBudget.Load())
+
+	big, bigAccts := referencedPrograms(0xB3, 2, make([]byte, preloadReferencedBytes/2+1))
+	p, db = preloadPrefetcher(&prefetchRecordingSource{})
+	p.preloadPrograms(context.Background(), accountPrefetchJob{slot: 50}, append(big, valid...), append(bigAccts, validAccts...))
+	assert.Zero(t, cachedCount(db, valid), "source bytes count against the bound")
+	assert.Equal(t, uint64(1), p.overBudget.Load())
+
+	top, topAccts := referencedPrograms(0xB4, preloadReferencedAttempts+4, elf)
+	src := &prefetchRecordingSource{accts: map[solana.PublicKey]*accounts.Account{}}
+	for i, key := range top {
+		src.accts[key] = topAccts[i]
+	}
+	p, db = preloadPrefetcher(src)
+	p.preloadPrograms(context.Background(), accountPrefetchJob{slot: 50, programs: top}, nil, nil)
+	assert.Equal(t, len(top), cachedCount(db, top), "top-level programs are not bounded")
+	assert.Zero(t, p.overBudget.Load())
+}
+
+// cancellingSource cancels the preload's context when it serves the read of
+// one key, as Close would during that read.
+type cancellingSource struct {
+	prefetchRecordingSource
+	key    solana.PublicKey
+	cancel context.CancelFunc
+}
+
+func (s *cancellingSource) GetAccountsBatch(ctx context.Context, slot uint64, pks []solana.PublicKey) ([]*accounts.Account, error) {
+	if len(pks) == 1 && pks[0] == s.key {
+		s.cancel()
+	}
+	return s.prefetchRecordingSource.GetAccountsBatch(ctx, slot, pks)
+}
+
+// Cancellation during a programdata read prevents that program's compile and
+// every later one.
+func TestAccountPrefetchPreloadStopsWhenCancelled(t *testing.T) {
+	elf := fixtures.Load(t, "sbpf", "noop_aligned.so")
+	w := newPreloadAccounts(t, elf)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p, db := preloadPrefetcher(&cancellingSource{prefetchRecordingSource: prefetchRecordingSource{accts: w.accts}, key: w.programData, cancel: cancel})
+	p.ctx = ctx
+	p.warmJob(snapshotAccountPrefetchJob(&b.Block{Slot: 50, Transactions: []*solana.Transaction{w.tx(t)}}), true)
+
+	_, ok := db.MaybeGetProgramFromCache(w.top)
+	assert.True(t, ok, "the top-level program, preloaded before the cancellation, stays cached")
+	for name, key := range map[string]solana.PublicKey{"whose programdata read was cancelled": w.programData, "after the cancellation": w.viaTable} {
+		_, ok := db.MaybeGetProgramFromCache(key)
+		assert.False(t, ok, "program %s was compiled", name)
+	}
+}

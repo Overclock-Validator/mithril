@@ -108,7 +108,7 @@ type accountPrefetcher struct {
 	offered, dropped, late, warmed                                                        atomic.Uint64
 	partialOffered, partialDropped, partialStale, partialWarmed, partialKeys, tipFiltered atomic.Uint64
 	keys, durable, storage, nanos                                                         atomic.Uint64
-	programs, preloaded, invoked                                                          atomic.Uint64
+	programs, preloaded, invoked, overBudget                                              atomic.Uint64
 }
 
 // accountPrefetchJob is a block's account references, copied from data
@@ -499,21 +499,36 @@ func (p *accountPrefetcher) warmJob(job accountPrefetchJob, whole bool) {
 	p.storage.Add(stats.IndexHits + stats.IndexMisses)
 	p.nanos.Add(uint64(time.Since(start).Nanoseconds()))
 	if n := p.warmed.Add(1); n%accountPrefetchLogEvery == 0 {
-		mlog.Log.Infof("account prefetch: %d blocks warmed, %d late, %d dropped of %d offered | per block %.0f keys, %.0f past the working set, %.0f to storage, %.2f ms | programs %.1f per block (%.1f not top-level), %.2f preloaded | tip warming: %d batches warmed (%d keys), %d stale, %d dropped of %d offered, %d whole-block keys skipped",
+		mlog.Log.Infof("account prefetch: %d blocks warmed, %d late, %d dropped of %d offered | per block %.0f keys, %.0f past the working set, %.0f to storage, %.2f ms | programs %.1f per block (%.1f not top-level), %.2f preloaded, %d jobs over budget | tip warming: %d batches warmed (%d keys), %d stale, %d dropped of %d offered, %d whole-block keys skipped",
 			n, p.late.Load(), p.dropped.Load(), p.offered.Load(),
 			float64(p.keys.Load())/float64(n), float64(p.durable.Load())/float64(n),
 			float64(p.storage.Load())/float64(n), float64(p.nanos.Load())/float64(n)/1e6,
-			float64(p.programs.Load())/float64(n), float64(p.invoked.Load())/float64(n), float64(p.preloaded.Load())/float64(n),
+			float64(p.programs.Load())/float64(n), float64(p.invoked.Load())/float64(n), float64(p.preloaded.Load())/float64(n), p.overBudget.Load(),
 			p.partialWarmed.Load(), p.partialKeys.Load(), p.partialStale.Load(), p.partialDropped.Load(), p.partialOffered.Load(), p.tipFiltered.Load())
 	}
 }
+
+// preloadReferencedAttempts and preloadReferencedBytes bound, per job, the
+// preloads of programs the block only lists as accounts: compile attempts,
+// failed ones included, and their source bytes. A block can list many
+// executables it never invokes, and each preload costs a compile and a
+// program-cache slot. Top-level programs are not bounded: executing the block
+// compiles any that miss the cache anyway. Mainnet blocks list about 14 such
+// programs and compile about 3.5 programs in all, mostly while the cache is
+// cold, so the bound rarely applies; work it skips is left to execution, which
+// compiles on demand the programs it actually invokes.
+const (
+	preloadReferencedAttempts = 16
+	preloadReferencedBytes    = 16 << 20
+)
 
 // preloadPrograms compiles the executables of the block's programs that the
 // program cache does not already hold for their current source: its top-level
 // programs, and the programs among the accounts it loads (keys, read as accts),
 // which is where every program a transaction invokes from another program must
 // be. Neither kind is known to be invoked, so a preload may be unused; it only
-// warms the cache.
+// warms the cache. Cancellation stops it between programs and before a
+// compile, not during one.
 func (p *accountPrefetcher) preloadPrograms(ctx context.Context, job accountPrefetchJob, keys []solana.PublicKey, loaded []*accounts.Account) {
 	f := p.features.Load()
 	if f == nil {
@@ -538,12 +553,29 @@ func (p *accountPrefetcher) preloadPrograms(ctx context.Context, job accountPref
 		}
 		return out[0]
 	}
+	attempts, sourceBytes := 0, 0
 	for i, acct := range accts {
+		if ctx.Err() != nil {
+			return
+		}
 		cacheKey, source, ok := sealevel.PreloadSource(programs[i], acct, job.slot, readProgramData)
 		if !ok {
 			continue
 		}
 		p.programs.Add(1)
+		if ctx.Err() != nil {
+			return
+		}
+		// Only compiles count against the bound. The check is quiet, so the
+		// cache's eviction policy sees just PreloadProgram's own lookup.
+		if i >= len(job.programs) && !p.db.ProgramCached(cacheKey) { // referenced, not top-level
+			if attempts == preloadReferencedAttempts || sourceBytes+len(source) > preloadReferencedBytes {
+				p.overBudget.Add(1)
+				return // the remaining candidates are referenced too
+			}
+			attempts++
+			sourceBytes += len(source)
+		}
 		if sealevel.PreloadProgram(p.db, cacheKey, source, f) {
 			p.preloaded.Add(1)
 		}
