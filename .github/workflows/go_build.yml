@@ -48,3 +48,11 @@ jobs:
 
       - name: Sealevel interpreter, syscall and vote ownership regressions
         run: go test -race -count=1 ./pkg/sealevel
+
+      - name: Account hashing, accelerated and portable
+        # The AVX-512 output tests skip on runners without AVX-512F; the
+        # layout guard, the startup output check and the purego build run
+        # everywhere.
+        run: |
+          go test -race -count=1 ./pkg/lthash
+          go test -count=1 -tags purego ./pkg/lthash

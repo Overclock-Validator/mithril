@@ -5,15 +5,86 @@ package lthash
 import (
 	"bytes"
 	"math/rand"
+	"os"
+	"reflect"
 	"testing"
 	"unsafe"
 
 	"github.com/zeebo/blake3"
+	"golang.org/x/sys/cpu"
 )
 
+// requireAVX512XOF skips a test of the AVX-512 output path on a machine that
+// does not use it, or fails it under MITHRIL_TEST_REQUIRE_AVX512=1, so a run
+// meant to cover that path cannot pass by skipping it.
 func requireAVX512XOF(t testing.TB) {
-	if !useAVX512XOF {
-		t.Skip("no AVX-512F on this machine")
+	if useAVX512XOF {
+		return
+	}
+	reason := "no AVX-512F on this machine"
+	switch {
+	case !cpu.X86.HasAVX512F:
+	case xofFallbackReason != "":
+		reason = xofFallbackReason
+	default:
+		reason = "MITHRIL_LTHASH_XOF_AVX512=0"
+	}
+	if os.Getenv("MITHRIL_TEST_REQUIRE_AVX512") == "1" {
+		t.Fatal(reason)
+	}
+	t.Skip(reason)
+}
+
+// The layout guard accepts the pinned blake3.Digest and rejects a digest whose
+// equally sized fields are rearranged, which the size assertions cannot see.
+func TestDigestLayoutGuard(t *testing.T) {
+	if !digestLayoutMatches(reflect.TypeFor[blake3.Digest]()) {
+		t.Fatal("blake3.Digest does not match digestState")
+	}
+	type rearranged struct {
+		counter uint64
+		chain   [8]uint32
+		buf     [16]uint32
+		blen    uint32
+		flags   uint32
+		block   [16]uint32
+		bufn    int
+	}
+	if unsafe.Sizeof(rearranged{}) != unsafe.Sizeof(digestState{}) {
+		t.Fatal("test digest must have digestState's size")
+	}
+	if digestLayoutMatches(reflect.TypeFor[rearranged]()) {
+		t.Fatal("a rearranged digest passed the layout guard")
+	}
+}
+
+// The startup output check rejects an implementation that writes the wrong
+// output or leaves the digest at the wrong position, and accepts Digest.Read.
+func TestXOFOutputCheck(t *testing.T) {
+	read := func(d *blake3.Digest, out *[2 * numElements]byte) { _, _ = d.Read(out[:]) }
+	if !xofMatchesDigestRead(read) {
+		t.Fatal("Digest.Read failed the output check")
+	}
+	wrong := func(d *blake3.Digest, out *[2 * numElements]byte) {
+		read(d, out)
+		out[2*numElements-1] ^= 1
+	}
+	if xofMatchesDigestRead(wrong) {
+		t.Fatal("wrong output passed the output check")
+	}
+	misplaced := func(d *blake3.Digest, out *[2 * numElements]byte) {
+		read(d, out)
+		_, _ = d.Read(make([]byte, 1))
+	}
+	if xofMatchesDigestRead(misplaced) {
+		t.Fatal("a misplaced digest passed the output check")
+	}
+}
+
+func TestXOFAVX512PassesStartupCheck(t *testing.T) {
+	requireAVX512XOF(t)
+	if xofFallbackReason != "" || !xofMatchesDigestRead(readXOFAVX512) {
+		t.Fatalf("AVX-512 output path failed its startup check: %q", xofFallbackReason)
 	}
 }
 
