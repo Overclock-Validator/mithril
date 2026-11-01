@@ -1893,14 +1893,14 @@ func runLive(c *cobra.Command, args []string) {
 		refreshManifestSeedFromManifest(accountsPath, mithrilState, manifest)
 		// Restore the durable fold frontier (index tail + NoSync bankhash rows)
 		// from the manifests before the integrity check reads those rows.
-		foldRecovery = mustRecoverFoldState(accountsDb)
+		foldRecovery = mustRecoverFoldState(accountsDb, mithrilState)
 		foldRecovered = true
 		if foldRecovery.RewindInProgress {
 			if mithrilState == nil {
 				klog.Fatalf("interrupted durable rewind has no state context to reconcile; re-bootstrap with --bootstrap snapshot")
 			}
 			completeInterruptedRewind(accountsPath, accountsDb, mithrilState)
-			foldRecovery = mustRecoverFoldState(accountsDb)
+			foldRecovery = mustRecoverFoldState(accountsDb, mithrilState)
 		}
 		if err := adoptRecoveredManifestContextBeforeIntegrity(accountsPath, mithrilState, foldRecovery); err != nil {
 			klog.Fatalf("fold manifest checkpoint at durable slot %d is invalid: %v; re-bootstrap with --bootstrap snapshot", foldRecovery.DurableThrough, err)
@@ -2153,11 +2153,11 @@ func runLive(c *cobra.Command, args []string) {
 			// rows) from the manifests BEFORE the integrity check reads those
 			// rows — otherwise a hard kill that dropped a NoSync bankhash row
 			// would falsely condemn a healthy store and force a re-bootstrap.
-			foldRecovery = mustRecoverFoldState(accountsDb)
+			foldRecovery = mustRecoverFoldState(accountsDb, mithrilState)
 			foldRecovered = true
 			if foldRecovery.RewindInProgress {
 				completeInterruptedRewind(accountsPath, accountsDb, mithrilState)
-				foldRecovery = mustRecoverFoldState(accountsDb)
+				foldRecovery = mustRecoverFoldState(accountsDb, mithrilState)
 			}
 			if err := adoptRecoveredManifestContextBeforeIntegrity(accountsPath, mithrilState, foldRecovery); err != nil {
 				klog.Fatalf("fold manifest checkpoint at durable slot %d is invalid: %v; re-bootstrap with --bootstrap snapshot", foldRecovery.DurableThrough, err)
@@ -2377,7 +2377,7 @@ postBootstrap:
 	// recovery call here, which is a no-op on a store with no manifests.
 	if mithrilState != nil {
 		if !foldRecovered {
-			foldRecovery = mustRecoverFoldState(accountsDb)
+			foldRecovery = mustRecoverFoldState(accountsDb, mithrilState)
 			foldRecovered = true
 		}
 		rec := foldRecovery
@@ -3994,7 +3994,14 @@ func createBufWriter(filename string) (io.Writer, func(), error) {
 // rows, and fatals on error. Safe on a freshly built store (no manifests ->
 // empty result). Callers run it before ValidateAgainstBankhashDB so the
 // integrity check observes the manifest-restored bankhash rows.
-func mustRecoverFoldState(accountsDb *accountsdb.AccountsDb) accountsdb.RecoveryResult {
+func mustRecoverFoldState(accountsDb *accountsdb.AccountsDb, s *state.MithrilState) accountsdb.RecoveryResult {
+	history, err := accountsDb.InspectFoldHistory()
+	if err != nil {
+		klog.Fatalf("fold recovery failed: %v", err)
+	}
+	if err := refuseClassicStore(history, s); err != nil {
+		klog.Fatalf("%v", err)
+	}
 	rec, rerr := accountsDb.RecoverFoldState()
 	if rerr != nil {
 		klog.Fatalf("fold recovery failed: %v", rerr)
@@ -4006,6 +4013,19 @@ func mustRecoverFoldState(accountsDb *accountsdb.AccountsDb) accountsdb.Recovery
 		mlog.Log.Infof("fold recovery removed %d undecided orphan file(s)", len(rec.OrphansRemoved))
 	}
 	return rec
+}
+
+// refuseClassicStore rejects a store written by the removed classic replay
+// path that RecoverFoldState cannot recognize itself. RecoverFoldState refuses
+// a store whose own files show classic writes (accountsdb.ErrClassicStore),
+// which needs the bootstrap boundary the snapshot build records. An older
+// store without that boundary never folded under rooted-durable replay, so
+// replay progress recorded past its snapshot came from classic writes.
+func refuseClassicStore(h accountsdb.FoldHistory, s *state.MithrilState) error {
+	if h.Folded || h.KnownBootstrap || s == nil || s.LastSlot <= s.SnapshotSlot {
+		return nil
+	}
+	return fmt.Errorf("%w: the state file records replay through slot %d past snapshot slot %d, and the store has no fold history", accountsdb.ErrClassicStore, s.LastSlot, s.SnapshotSlot)
 }
 
 // adoptRecoveredManifestContextBeforeIntegrity runs before the legacy
