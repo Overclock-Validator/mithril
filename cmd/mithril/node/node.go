@@ -3995,7 +3995,7 @@ func createBufWriter(filename string) (io.Writer, func(), error) {
 // empty result). Callers run it before ValidateAgainstBankhashDB so the
 // integrity check observes the manifest-restored bankhash rows.
 func mustRecoverFoldState(accountsDb *accountsdb.AccountsDb, s *state.MithrilState) accountsdb.RecoveryResult {
-	history, err := accountsDb.InspectFoldHistory()
+	history, err := accountsDb.InspectFoldProvenance()
 	if err != nil {
 		klog.Fatalf("fold recovery failed: %v", err)
 	}

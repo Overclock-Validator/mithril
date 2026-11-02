@@ -1,9 +1,12 @@
 package accountsdb
 
 import (
+	"bytes"
 	"encoding/binary"
+	"io"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
@@ -97,6 +100,9 @@ func TestRecoverFoldStateRefusesClassicWritesAfterAFold(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, FoldHistory{Folded: true, KnownBootstrap: true, UnfoldedFiles: 1, ClassicFiles: 1, LiveFiles: 1}, h)
 	assert.True(t, h.ClassicWrites())
+	p, err := db.InspectFoldProvenance()
+	require.NoError(t, err)
+	assert.Equal(t, FoldHistory{Folded: true, KnownBootstrap: true}, p, "provenance does not scan account files")
 
 	_, err = db.RecoverFoldState()
 	require.ErrorIs(t, err, ErrClassicStore)
@@ -170,4 +176,58 @@ func TestFoldHistoryWithoutClassicWrites(t *testing.T) {
 	assert.False(t, h.ClassicWrites())
 	_, err = db.RecoverFoldState()
 	require.NoError(t, err)
+}
+
+// failingReadSeeker fails every read at or past failAt with EIO, as a bad
+// sector would.
+type failingReadSeeker struct {
+	*bytes.Reader
+	failAt int64
+}
+
+func (f *failingReadSeeker) Read(p []byte) (int, error) {
+	pos, _ := f.Seek(0, io.SeekCurrent)
+	if pos >= f.failAt {
+		return 0, syscall.EIO
+	}
+	if limit := f.failAt - pos; int64(len(p)) > limit {
+		p = p[:limit]
+	}
+	return f.Reader.Read(p)
+}
+
+// The liveness scan finds a live record behind a payload larger than its
+// read buffer and treats a torn tail as the end of the file, but a read
+// error is returned rather than read as "no live account": recovery would
+// otherwise delete a file the index points into.
+func TestIndexPointsIntoFileReadErrors(t *testing.T) {
+	db, _ := newFoldTestDb(t)
+	defer db.CloseDb()
+	const fileId = 9
+	dead := foldAcct(1, 1, make([]byte, 2<<20))
+	live := foldAcct(2, 900, []byte("classic!"))
+	var file bytes.Buffer
+	for _, acct := range []*accounts.Account{dead, live} {
+		rec := AppendVecAccount{DataLen: uint64(len(acct.Data)), Pubkey: acct.Key, Lamports: acct.Lamports, Owner: acct.Owner, Data: acct.Data}
+		require.NoError(t, rec.Marshal(&file))
+	}
+	liveOffset := int64(hdrLen + len(dead.Data))
+	var entry [24]byte
+	AccountIndexEntry{Slot: 110, FileId: fileId, Offset: uint64(liveOffset)}.Marshal(&entry)
+	require.NoError(t, db.Index.Set(live.Key[:], entry[:], nil))
+	data := file.Bytes()
+
+	found, err := db.indexPointsIntoFile(bytes.NewReader(data), int64(len(data)), fileId)
+	require.NoError(t, err)
+	assert.True(t, found, "the scan seeks past the large payload to the live record")
+
+	torn := data[:liveOffset+hdrLen-1]
+	found, err = db.indexPointsIntoFile(bytes.NewReader(torn), int64(len(torn)), fileId)
+	require.NoError(t, err)
+	assert.False(t, found, "a torn header ends the scan")
+
+	for _, failAt := range []int64{0, hdrLen / 2, liveOffset + 1} {
+		_, err = db.indexPointsIntoFile(&failingReadSeeker{bytes.NewReader(data), failAt}, int64(len(data)), fileId)
+		require.ErrorIs(t, err, syscall.EIO, "a read error at offset %d must stop recovery", failAt)
+	}
 }

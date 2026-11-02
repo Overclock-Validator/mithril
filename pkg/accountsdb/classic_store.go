@@ -75,10 +75,19 @@ func (h FoldHistory) ClassicWrites() bool {
 func (db *AccountsDb) InspectFoldHistory() (FoldHistory, error) {
 	db.foldMu.LockAs("inspect_fold_history")
 	defer db.foldMu.Unlock()
-	return db.inspectFoldHistoryLocked()
+	return db.inspectFoldHistoryLocked(true)
 }
 
-func (db *AccountsDb) inspectFoldHistoryLocked() (FoldHistory, error) {
+// InspectFoldProvenance reads only Folded and KnownBootstrap, leaving the file
+// counts zero. It does not open account files: RecoverFoldState scans them
+// itself before it removes anything.
+func (db *AccountsDb) InspectFoldProvenance() (FoldHistory, error) {
+	db.foldMu.LockAs("inspect_fold_history")
+	defer db.foldMu.Unlock()
+	return db.inspectFoldHistoryLocked(false)
+}
+
+func (db *AccountsDb) inspectFoldHistoryLocked(scanFiles bool) (FoldHistory, error) {
 	var h FoldHistory
 	_, haveMeta, err := db.readFoldMeta()
 	if err != nil {
@@ -99,7 +108,7 @@ func (db *AccountsDb) inspectFoldHistoryLocked() (FoldHistory, error) {
 	h.Folded = haveMeta || intent != nil || len(referenced) > 0 || tmp
 	bootstrapHigh := db.bootstrapHighFileId()
 	h.KnownBootstrap = bootstrapHigh != ^uint64(0)
-	if !h.KnownBootstrap {
+	if !h.KnownBootstrap || !scanFiles {
 		return h, nil
 	}
 	for _, dir := range db.AccountsDirs() {
@@ -139,20 +148,32 @@ func (db *AccountsDb) inspectFoldHistoryLocked() (FoldHistory, error) {
 }
 
 // indexPointsInto reports whether the index locates any account recorded in
-// the data file at path in that file. It reads record headers only and stops
-// at the first live account, at the end of the file, or at a torn or
-// unparseable record, which no complete writer left.
+// the data file at path in that file. It stops at the first live account, at
+// the end of the file, or at a torn or unparseable record, which no complete
+// writer left.
 func (db *AccountsDb) indexPointsInto(path string, fileId uint64) (bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return false, err
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return false, err
+	}
+	return db.indexPointsIntoFile(f, info.Size(), fileId)
+}
+
+// indexPointsIntoFile reads record headers from f, whose length is size, and
+// seeks over payloads that are not already buffered. The record bounds are
+// checked against size, so a read error is never mistaken for the end of the
+// file: it is returned, and recovery stops before it deletes anything.
+func (db *AccountsDb) indexPointsIntoFile(f io.ReadSeeker, size int64, fileId uint64) (bool, error) {
 	r := bufio.NewReaderSize(f, 1<<20)
 	var hdr [hdrLen]byte
-	for {
+	for off := int64(0); off+hdrLen <= size; {
 		if _, err := io.ReadFull(r, hdr[:]); err != nil {
-			return false, nil
+			return false, fmt.Errorf("read account header at offset %d: %w", off, err)
 		}
 		dataLen := binary.LittleEndian.Uint64(hdr[dataLenOffset:])
 		if dataLen > maxAccountDataLen {
@@ -168,10 +189,18 @@ func (db *AccountsDb) indexPointsInto(path string, fileId uint64) (bool, error) 
 		} else if !errors.Is(err, pebble.ErrNotFound) {
 			return false, err
 		}
-		if _, err := r.Discard(int(util.AlignUp(dataLen, 8))); err != nil {
-			return false, nil
+		skip := int64(util.AlignUp(dataLen, 8))
+		off += hdrLen + skip
+		if skip <= int64(r.Buffered()) {
+			r.Discard(int(skip))
+			continue
 		}
+		if _, err := f.Seek(off, io.SeekStart); err != nil {
+			return false, fmt.Errorf("seek to account header at offset %d: %w", off, err)
+		}
+		r.Reset(f)
 	}
+	return false, nil
 }
 
 func (db *AccountsDb) hasBankHashRow(slot uint64) (bool, error) {
