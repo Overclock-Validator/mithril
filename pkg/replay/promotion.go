@@ -452,6 +452,7 @@ func (t *unrootedTail) promoteChunked(through uint64, force bool) (uint64, *stat
 			delete(t.bankSysvars, s)
 		}
 	}
+	voteJournal.dropThrough(promotedThrough)
 	return promotedThrough, ctx, err
 }
 
@@ -702,6 +703,7 @@ func (t *unrootedTail) applyFoldJob(job *foldJob) *state.ResumeContext {
 			delete(t.bankSysvars, s)
 		}
 	}
+	voteJournal.dropThrough(job.through)
 	return job.ctx
 }
 
@@ -829,8 +831,14 @@ func (p *asyncPromoter) stop() {
 // snapshot of the last surviving executed slot so the replay loop can rebuild
 // execution state and re-run the certified version. Either result may be nil;
 // the caller validates the pair and falls back to rooted-checkpoint re-replay.
+// The suffix's account writes, vote-cache writes and stake bookkeeping are all
+// undone, so the global caches describe the retained parent afterwards.
 func (t *unrootedTail) unwind(fromSlot uint64) (*state.ResumeContext, *sealevel.BankSysvars) {
 	t.overlay.EvictFrom(fromSlot)
+	voteJournal.unwindFrom(fromSlot, func(slot uint64) bool {
+		_, held := t.bankhashes[slot]
+		return held
+	})
 	t.stakeTotals.dropFrom(fromSlot)
 	// Only replay-owned held slots are unwound. A future local leader bank
 	// is not part of this tail and must retain its pending stake entries.
@@ -867,6 +875,19 @@ func (t *unrootedTail) unwind(fromSlot uint64) (*state.ResumeContext, *sealevel.
 		return nil, nil
 	}
 	return ctx, t.bankSysvars[ctxSlot]
+}
+
+// retainedParentSlot is the slot unwind(fromSlot) would resume from: the
+// highest held slot with a retained context below fromSlot.
+func (t *unrootedTail) retainedParentSlot(fromSlot uint64) (uint64, bool) {
+	var parent uint64
+	found := false
+	for s := range t.contexts {
+		if s < fromSlot && (!found || s > parent) {
+			parent, found = s, true
+		}
+	}
+	return parent, found
 }
 
 // reserveRewardWindow is called once at the boundary, before distributing any

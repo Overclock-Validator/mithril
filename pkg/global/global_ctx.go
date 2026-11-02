@@ -173,6 +173,15 @@ func VoteCacheItem(pubkey solana.PublicKey) *sealevel.VoteStateVersions {
 	return instance.voteCache[pubkey]
 }
 
+// VoteCacheItemOK is VoteCacheItem that also reports whether the key is
+// present, so a caller can restore an entry exactly (including a nil value).
+func VoteCacheItemOK(pubkey solana.PublicKey) (*sealevel.VoteStateVersions, bool) {
+	instance.voteCacheMutex.RLock()
+	defer instance.voteCacheMutex.RUnlock()
+	voteState, ok := instance.voteCache[pubkey]
+	return voteState, ok
+}
+
 func DeleteVoteCacheItem(pubkey solana.PublicKey) {
 	instance.voteCacheMutex.Lock()
 	defer instance.voteCacheMutex.Unlock()

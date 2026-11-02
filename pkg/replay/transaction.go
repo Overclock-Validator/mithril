@@ -299,7 +299,6 @@ func recordStakeAndVoteAccount(slotCtx *sealevel.SlotCtx, execCtx *sealevel.Exec
 	if acct.Lamports == 0 || acct.Owner != a.VoteProgramAddr {
 		if voteCacheHas(slotCtx, acct.Key) {
 			deleteVoteCacheItem(slotCtx, acct.Key)
-			markSlotVoteStakeDirty(slotCtx) // global cache mutated — gates in-loop unwind
 		}
 	} else if modifiedVoteAccts {
 		recordVoteTimestampAndSlot(slotCtx, acct)
@@ -307,19 +306,21 @@ func recordStakeAndVoteAccount(slotCtx *sealevel.SlotCtx, execCtx *sealevel.Exec
 		if wasModified {
 			putVoteCacheItem(slotCtx, acct.Key, newVersionedVoteState)
 		}
-		markSlotVoteStakeDirty(slotCtx)
 	}
 
+	// Stake bookkeeping is slot-keyed (pending index entries and the unrooted
+	// tail's stake totals), so an in-loop unwind drops it with the slot.
 	if acct.Owner == a.StakeProgramAddr {
 		recordStakeDelegation(slotCtx.Slot, acct)
-		markSlotVoteStakeDirty(slotCtx)
 	}
 }
 
 // The vote cache is process-global. A bank executed speculatively (streaming
 // replay) defers its puts/deletes into the SlotCtx so a discard leaves the
 // cache untouched; publishDeferredVoteCache applies them once the bank is
-// accepted. Non-deferring banks publish immediately, exactly as before.
+// accepted. Non-deferring banks publish immediately, exactly as before. Every
+// published change is first recorded in voteJournal under its slot so an
+// in-loop fork unwind can undo it.
 
 func voteCacheHas(slotCtx *sealevel.SlotCtx, key solana.PublicKey) bool {
 	if slotCtx.DeferVoteCachePublication {
@@ -337,6 +338,7 @@ func voteCacheHas(slotCtx *sealevel.SlotCtx, key solana.PublicKey) bool {
 
 func putVoteCacheItem(slotCtx *sealevel.SlotCtx, key solana.PublicKey, state *sealevel.VoteStateVersions) {
 	if !slotCtx.DeferVoteCachePublication {
+		voteJournal.record(slotCtx.Slot, key)
 		global.PutVoteCacheItem(key, state)
 		return
 	}
@@ -351,6 +353,7 @@ func putVoteCacheItem(slotCtx *sealevel.SlotCtx, key solana.PublicKey, state *se
 
 func deleteVoteCacheItem(slotCtx *sealevel.SlotCtx, key solana.PublicKey) {
 	if !slotCtx.DeferVoteCachePublication {
+		voteJournal.record(slotCtx.Slot, key)
 		global.DeleteVoteCacheItem(key)
 		return
 	}
@@ -363,20 +366,10 @@ func deleteVoteCacheItem(slotCtx *sealevel.SlotCtx, key solana.PublicKey) {
 	delete(slotCtx.PendingVoteCache, key)
 }
 
-func markSlotVoteStakeDirty(slotCtx *sealevel.SlotCtx) {
-	if slotCtx.DeferVoteCachePublication {
-		slotCtx.PendingVoteCacheMu.Lock()
-		slotCtx.VoteStakeDirty = true
-		slotCtx.PendingVoteCacheMu.Unlock()
-		return
-	}
-	markVoteStakeDirty(slotCtx.Slot)
-}
-
 // publishDeferredVoteCache applies a speculative bank's buffered vote-cache
-// changes and dirty marker. It is called by the streaming finalize step after
-// the complete block has been matched to the executed prefix and is a no-op
-// for banks that published immediately.
+// changes. It is called by the streaming finalize step after the complete
+// block has been matched to the executed prefix and is a no-op for banks that
+// published immediately.
 func publishDeferredVoteCache(slotCtx *sealevel.SlotCtx) {
 	if slotCtx == nil || !slotCtx.DeferVoteCachePublication {
 		return
@@ -384,20 +377,17 @@ func publishDeferredVoteCache(slotCtx *sealevel.SlotCtx) {
 	slotCtx.PendingVoteCacheMu.Lock()
 	puts := slotCtx.PendingVoteCache
 	deletes := slotCtx.PendingVoteCacheDeletes
-	dirty := slotCtx.VoteStakeDirty
 	slotCtx.PendingVoteCache = nil
 	slotCtx.PendingVoteCacheDeletes = nil
-	slotCtx.VoteStakeDirty = false
 	slotCtx.DeferVoteCachePublication = false
 	slotCtx.PendingVoteCacheMu.Unlock()
 	for key := range deletes {
+		voteJournal.record(slotCtx.Slot, key)
 		global.DeleteVoteCacheItem(key)
 	}
 	for key, state := range puts {
+		voteJournal.record(slotCtx.Slot, key)
 		global.PutVoteCacheItem(key, state)
-	}
-	if dirty {
-		markVoteStakeDirty(slotCtx.Slot)
 	}
 }
 
