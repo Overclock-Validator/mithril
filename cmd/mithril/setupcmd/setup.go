@@ -148,8 +148,9 @@ func newSetupModel() setupModel {
 		screen:         scrMode,
 		cpuCores:       runtime.NumCPU(),
 		disks:          DetectDisks(),
-		cluster:        "alpenglow",
-		rpcEndpoint:    "https://rpc.ag.validator1.net",
+		cluster:        config.DefaultCluster,
+		rpcEndpoint:    defaultClusterProfile().RPC,
+		gossipEntry:    defaultClusterProfile().GossipEntrypoint,
 		lbQuiet:        config.LightbringerQuietDefault,
 		accountsPath:   storage.Accounts,
 		snapshotsPath:  storage.Snapshots,
@@ -261,18 +262,12 @@ func (m setupModel) currentItems() []menuItem {
 			menuBack(),
 		}
 	case scrCluster:
-		if m.nodeType == "validator" {
-			return []menuItem{
-				menuOptionDesc("alpenglow", "alpenglow", "Required for validator and block-production mode"),
-				menuSeparator(),
-				menuBack(),
-			}
-		}
+		// Every cluster runs Alpenglow. Custom (private) clusters need an
+		// explicit genesis hash and are configured by editing config.toml.
 		return []menuItem{
-			menuOptionDesc("alpenglow", "alpenglow", "Certificate fork choice and speculative replay"),
-			menuOptionDesc("mainnet-beta", "mainnet-beta", "Classic verifying-only RPC replay"),
-			menuOptionDesc("testnet", "testnet", "Classic verifying-only RPC replay"),
-			menuOptionDesc("devnet", "devnet", "Classic verifying-only RPC replay"),
+			menuOptionDesc("mainnet", "mainnet", "Production Solana network (Alpenglow)"),
+			menuOptionDesc("testnet", "testnet", "Test network (Alpenglow)"),
+			menuOptionDesc("devnet", "devnet", "Development network (Alpenglow)"),
 			menuSeparator(),
 			menuBack(),
 		}
@@ -417,15 +412,9 @@ func (m setupModel) handleSelect(value string) (tea.Model, tea.Cmd) {
 
 	case scrCluster:
 		m.cluster = value
-		switch value {
-		case "mainnet-beta":
-			m.rpcEndpoint = "https://api.mainnet-beta.solana.com"
-		case "testnet":
-			m.rpcEndpoint = "https://api.testnet.solana.com"
-		case "devnet":
-			m.rpcEndpoint = "https://api.devnet.solana.com"
-		case "alpenglow":
-			m.rpcEndpoint = "https://rpc.ag.validator1.net"
+		if c, err := config.ResolveCluster(value, ""); err == nil {
+			m.rpcEndpoint = c.RPC
+			m.gossipEntry = c.GossipEntrypoint
 		}
 		m.pushInput(scrRPC)
 
@@ -434,13 +423,9 @@ func (m setupModel) handleSelect(value string) (tea.Model, tea.Cmd) {
 		if !m.enableLB {
 			m.lbQuiet = config.LightbringerQuietDefault // Reset dependent state so disable→re-enable starts clean.
 		}
-		if m.enableLB || m.cluster == "alpenglow" {
-			// Lightbringer needs its gossip entrypoint; Alpenglow's default
-			// turbine source needs one to join the shred tree.
-			m.pushInput(scrGossip)
-		} else {
-			m.pushInput(scrStorage)
-		}
+		// Lightbringer needs its gossip entrypoint; the default turbine
+		// source needs one to join the shred tree.
+		m.pushInput(scrGossip)
 
 	case scrBootstrap:
 		m.bootstrapMode = value
@@ -664,13 +649,11 @@ func (m *setupModel) validateAndApplyInput() bool {
 func (m *setupModel) advanceFromInput() {
 	switch m.screen {
 	case scrRPC:
-		if m.nodeType == "validator" || (m.mode == "quick" && m.cluster == "alpenglow") {
+		if m.nodeType == "validator" || m.mode == "quick" {
 			// Turbine (the default source, and the only valid one for a
 			// validator) needs a gossip entrypoint; validators never use the
 			// Lightbringer sidecar.
 			m.pushInput(scrGossip)
-		} else if m.mode == "quick" {
-			m.pushMenu(scrReview) // classic quick-start defaults to RPC
 		} else {
 			m.pushMenu(scrLightbringer) // Full Config lets user enable the sidecar
 		}
@@ -843,10 +826,8 @@ func (m setupModel) View() string {
 				summary += " · quiet logs"
 			}
 			rows = append(rows, []string{"Lightbringer", summary})
-		} else if m.cluster == "alpenglow" {
-			rows = append(rows, []string{"Block source", "turbine (gossip: " + m.gossipEntry + ")"})
 		} else {
-			rows = append(rows, []string{"Block source", "rpc"})
+			rows = append(rows, []string{"Block source", "turbine (gossip: " + m.gossipEntry + ")"})
 		}
 		if m.mode == "quick" {
 			rows = append(rows, []string{"AccountsDB", m.accountsPath + " (default)"})
@@ -940,15 +921,13 @@ func (m setupModel) generateConfig() (tea.Model, tea.Cmd) {
 	cfg.WriteString("[block]\n")
 	if m.enableLB {
 		cfg.WriteString("source = \"lightbringer\"\n")
-	} else if m.cluster == "alpenglow" {
+	} else {
 		cfg.WriteString("source = \"turbine\"\n")
 		cfg.WriteString("turbine_bind_addr = \"0.0.0.0:8001\"\n")
-	} else {
-		cfg.WriteString("source = \"rpc\"\n")
 	}
 	fmt.Fprintf(&cfg, "max_rps = %s\n", m.blockMaxRPS)
 	fmt.Fprintf(&cfg, "max_inflight = %s\n\n", m.blockInflight)
-	if !m.enableLB && m.cluster == "alpenglow" {
+	if !m.enableLB {
 		cfg.WriteString("[turbine]\n")
 		fmt.Fprintf(&cfg, "gossip_entrypoint = %q\n\n", m.gossipEntry)
 	}
@@ -1044,8 +1023,9 @@ snapshots = "/mnt/mithril-ledger/snapshots"   # ~100GB for full + incremental
 logs = "/mnt/mithril-logs"                    # Log files (created if missing)
 
 [network]
-cluster = "alpenglow"  # mainnet-beta/testnet/devnet use classic verifying-only RPC replay
-rpc = ["https://rpc.ag.validator1.net"]
+cluster = "mainnet"  # "mainnet" | "testnet" | "devnet" | custom name (all Alpenglow)
+# genesis_hash = ""  # Required for a custom cluster; optional check otherwise
+rpc = ["https://api.mainnet-beta.solana.com"]
 
 [block]
 # "turbine" is the live mode: shreds carry the Alpenglow block ids and footer
@@ -1058,7 +1038,7 @@ max_rps = 8
 max_inflight = 8
 
 [turbine]
-gossip_entrypoint = ""     # REQUIRED for turbine: a gossip entrypoint of your Alpenglow cluster
+gossip_entrypoint = ""     # Empty = the cluster's public entrypoint; REQUIRED for a custom cluster
 # gossip_bind_addr = "0.0.0.0:65401"
 # advertised_ip = "203.0.113.10"
 # shred_version = 0
@@ -1146,4 +1126,9 @@ func SetupIsFirstScreen(m tea.Model) bool {
 		return sm.screen == scrMode
 	}
 	return false
+}
+
+func defaultClusterProfile() config.Cluster {
+	c, _ := config.ResolveCluster(config.DefaultCluster, "")
+	return c
 }

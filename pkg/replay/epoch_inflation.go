@@ -225,9 +225,6 @@ func stageEpochInflationAccount(
 		Executable: false,
 		RentEpoch:  0,
 	}
-	if err := acctsDb.StoreAccounts([]*accounts.Account{updated}, storeSlot, nil); err != nil {
-		return nil, nil, fmt.Errorf("store vote reward account at slot %d: %w", storeSlot, err)
-	}
 	if updated.Lamports >= parent.Lamports {
 		replayCtx.Capitalization = safemath.SaturatingAddU64(replayCtx.Capitalization, updated.Lamports-parent.Lamports)
 	} else {

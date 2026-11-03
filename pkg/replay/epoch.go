@@ -246,10 +246,6 @@ func updateStakeHistorySysvar(acctsDb *accountsdb.AccountsDb, block *block.Block
 	newStakeHistoryBytes := buf.Bytes()
 	copy(stakeHistoryAcct.Data, newStakeHistoryBytes)
 
-	err = acctsDb.StoreAccounts([]*accounts.Account{stakeHistoryAcct}, prevSlotCtx.Slot, nil)
-	if err != nil {
-		panic(fmt.Sprintf("error storing new StakeHistory sysvar to accountsdb: %s", err))
-	}
 	block.EpochUpdatedAccts = append(block.EpochUpdatedAccts, stakeHistoryAcct.Clone())
 
 	return &stakeHistory
@@ -319,7 +315,7 @@ func handleEpochTransition(acctsDb *accountsdb.AccountsDb, partitionedEpochRewar
 		// after a snapshot restore.
 		if alpenglowActive && rewardedEpoch >= migrationEpoch {
 			updated, parent, err := stageRewardEpochDelegatedStakes(
-				acctsDb, prevSlotCtx.Slot, block.Slot, rewardedEpoch,
+				acctsDb, prevSlotCtx.Slot, rewardedEpoch,
 				admitted, scanResult.RewardEpochEffectiveStakes, replayCtx,
 			)
 			if err != nil {
@@ -331,7 +327,7 @@ func handleEpochTransition(acctsDb *accountsdb.AccountsDb, partitionedEpochRewar
 
 		if alpenglowActive && f.IsActive(features.ValidatorAdmissionTicket) {
 			updated, parents, err := applyAlpenglowBoundaryVAT(
-				acctsDb, prevSlotCtx.Slot, block.Slot,
+				acctsDb, prevSlotCtx.Slot,
 				alpenglowVATBurnPerEpoch(f, epochSchedule, block.Slot), admitted,
 			)
 			if err != nil {
