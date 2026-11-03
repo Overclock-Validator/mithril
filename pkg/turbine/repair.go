@@ -327,6 +327,13 @@ type repairClient struct {
 	ranked    []gossip.RepairPeer
 	rankedAt  time.Time
 	headPeers headRepairPeers
+	// Fastest reliable responders for head requests (mu-guarded, rebuilt with
+	// ranked) and the head retry timer (repair loop only); see repair_tip.go.
+	fastHead         []gossip.RepairPeer
+	fastHeadCursor   uint64
+	fastHeadEligible bool
+	headRetryTimer   *time.Timer
+	headRetryDue     time.Time
 
 	peerCacheMu sync.Mutex
 	peerCache   []gossip.RepairPeer
@@ -393,6 +400,7 @@ func (c *repairClient) wakePriority() {
 }
 
 func (c *repairClient) run(ctx context.Context, conn *net.UDPConn, assembler *SlotAssembler) {
+	defer c.stopHeadRetryWake()
 	runRepairSchedule(ctx, c.priorityWake, repairScanInterval, 20*time.Millisecond, func() {
 		c.expireOutstanding(time.Now())
 		c.repairOnce(conn, assembler)
@@ -461,14 +469,25 @@ func (c *repairClient) repairOnce(conn *net.UDPConn, assembler *SlotAssembler) {
 	// completion (full missing count, before the admission-share truncation
 	// caps the listing this scan may send).
 	var headPol *retryPolicy
+	headEndgame, fastEligible := false, false
 	if len(priority) > 0 {
-		p := headPolicy(len(priority[0].MissingDataShreds))
+		missing := len(priority[0].MissingDataShreds)
+		p := headPolicy(missing)
+		// In the endgame (the only head tier that sends concurrent attempts,
+		// so the only one whose retry interval acts) a silent peer gates
+		// emission: retry after a few round trips, not the fixed interval.
+		if missing <= repairHeadFanoutMaxMissing {
+			p.retryInterval = c.headRetryInterval(p.retryInterval)
+			headEndgame = true
+		}
+		fastEligible = missing <= repairRetryHeadNearMissing
 		headPol = &p
 		// Head admission share: the head stays strictly first in line, but
 		// may hold at most its share of the admission window — the remainder
 		// keeps prefilling the window slots and patching the live edge.
 		c.boundHeadToAdmissionShare(&priority[0], p.maxConcurrent)
 	}
+	c.setFastHeadEligible(fastEligible)
 
 	// Size the token grant by roughly what this scan could put on the wire
 	// (the retry policy usually sends far less — covered shreds no-op — and
@@ -504,6 +523,9 @@ func (c *repairClient) repairOnce(conn *net.UDPConn, assembler *SlotAssembler) {
 	// sized by the edge's actual demand, so a blocked head is never capped
 	// below what the edge can use; leftover head budget flows to the edge.
 	spent := c.sendTier(conn, peers, priority, splitRepairBudget(budget, edgeDemand), headPol, acct)
+	if headEndgame {
+		c.armHeadRetryWake(headPol.retryInterval)
+	}
 	spent += c.sendTier(conn, peers, edge, budget-spent, nil, acct)
 	// Parent/normal repair and freshness keep first claim on every token.
 	if haveChild {
@@ -1081,6 +1103,9 @@ func (c *repairClient) nextPeerForRequestLocked(peers []gossip.RepairPeer, reque
 		if peer, ok := c.pickHeadResponderLocked(peers, cap, request); ok {
 			return peer, true
 		}
+		if peer, ok := c.pickFastHeadPeerLocked(peers, cap, request); ok {
+			return peer, true
+		}
 		if peer, ok := c.pickResponderLocked(peers, cap); ok {
 			return peer, true
 		}
@@ -1175,6 +1200,7 @@ func (c *repairClient) rebuildRankedLocked(peers []gossip.RepairPeer, now time.T
 	for _, sp := range responders[:keep] {
 		c.ranked = append(c.ranked, sp.peer)
 	}
+	c.rebuildFastHeadLocked(peers, now)
 }
 
 // notePeerSentLocked and the outcome noters maintain the per-peer service

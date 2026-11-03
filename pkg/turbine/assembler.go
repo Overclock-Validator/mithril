@@ -89,6 +89,10 @@ type SlotAssembler struct {
 	streamRepairInvalidChild *slotState
 	streamRepairUntil        time.Time
 	streamRepairWake         chan<- struct{}
+	// pendingHeadRepairPin is the emission head that had no shreds when the
+	// block source asked to pin it; its first shred installs the pin
+	// (emission_head_repair.go).
+	pendingHeadRepairPin uint64
 }
 
 type SlotRepairRequest struct {
@@ -349,6 +353,7 @@ func (a *SlotAssembler) addShredFromWithRoot(shred *Shred, fromRepair bool, root
 	a.notePrefetchShredLocked(state, shred)
 	if state.firstShredAt.IsZero() {
 		state.firstShredAt = time.Now()
+		a.notePendingHeadRepairPinLocked(state)
 	}
 	if root != nil {
 		if fec := state.fecSets[shred.FECSetIndex]; fec != nil {
