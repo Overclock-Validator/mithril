@@ -90,8 +90,20 @@ type Client struct {
 	txPingMessages   atomic.Uint64
 	txPongMessages   atomic.Uint64
 	txPullResponses  atomic.Uint64
+	txPullRequests   atomic.Uint64
 	lastRxUnix       atomic.Int64
 	lastTxUnix       atomic.Int64
+
+	startedAt               time.Time
+	monitoringEnabled       atomic.Bool
+	monitoring              atomic.Pointer[MonitoringSnapshot]
+	monitoringMu            sync.Mutex
+	monitoringPeers         [8]monitoredPeer
+	socketGeneration        atomic.Uint64
+	udpPayloadEnabled       atomic.Bool
+	udpPayload              atomic.Pointer[udpPayloadRecorder]
+	decodeMonitoringEnabled atomic.Bool
+	decodeMonitoring        atomic.Pointer[decodeMonitoringRecorder]
 }
 
 type knownPeer struct {
@@ -139,6 +151,7 @@ type Stats struct {
 	TxPingMessages   uint64
 	TxPongMessages   uint64
 	TxPullResponses  uint64
+	TxPullRequests   uint64
 	LastRxUnix       int64
 	LastTxUnix       int64
 	Peers            int
@@ -202,6 +215,7 @@ func NewClient(cfg Config) (*Client, error) {
 		repairPeers:        make(map[Pubkey]RepairPeer),
 		tvuPeers:           make(map[Pubkey]TVUPeer),
 		alpenglowPeers:     make(map[Pubkey]AlpenglowPeer),
+		startedAt:          time.Now().UTC(),
 	}, nil
 }
 
@@ -261,11 +275,25 @@ func (c *Client) AdvertisedGossipAddr() *net.UDPAddr {
 }
 
 func (c *Client) Run(ctx context.Context) error {
+	c.monitoring.Store(nil)
+	defer c.monitoring.Store(nil)
 	conn, err := net.ListenUDP("udp", c.bindAddr)
 	if err != nil {
 		return fmt.Errorf("bind gossip socket %s: %w", c.bindAddr, err)
 	}
 	defer conn.Close()
+	socketGeneration := c.nextSocketGeneration()
+	if c.decodeMonitoringEnabled.Load() && socketGeneration != 0 {
+		recorder := &decodeMonitoringRecorder{conn: conn, generation: socketGeneration, startedAt: time.Now()}
+		c.decodeMonitoring.Store(recorder)
+		defer c.decodeMonitoring.CompareAndSwap(recorder, nil)
+	}
+	var payload *udpPayloadRecorder
+	if c.udpPayloadEnabled.Load() && socketGeneration != 0 {
+		payload = &udpPayloadRecorder{conn: conn, generation: socketGeneration, startedAt: time.Now()}
+		c.udpPayload.Store(payload)
+		defer c.udpPayload.CompareAndSwap(payload, nil)
+	}
 	BoostUDPReceiveBuffer(conn, GossipUDPReceiveBufferBytes, "gossip client")
 
 	if err := c.initializeContact(conn.LocalAddr().(*net.UDPAddr)); err != nil {
@@ -304,13 +332,13 @@ func (c *Client) Run(ctx context.Context) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- c.recvLoop(ctx, conn)
+		errCh <- c.recvLoop(ctx, conn, payload)
 	}()
 
-	if err := c.pushContact(conn); err != nil {
+	if err := c.pushContact(conn, payload); err != nil {
 		return err
 	}
-	_ = c.sendPing(conn, c.entrypoint)
+	_ = c.sendPing(conn, c.entrypoint, payload)
 
 	pushTicker := time.NewTicker(c.cfg.PushInterval)
 	defer pushTicker.Stop()
@@ -331,20 +359,21 @@ func (c *Client) Run(ctx context.Context) error {
 		case err := <-c.identityConflictCh:
 			return err
 		case <-pushTicker.C:
-			if err := c.pushContact(conn); err != nil {
+			if err := c.pushContact(conn, payload); err != nil {
 				return err
 			}
 		case <-c.contactChanged:
-			if err := c.pushContact(conn); err != nil {
+			if err := c.pushContact(conn, payload); err != nil {
 				return err
 			}
 		case <-pingTicker.C:
-			_ = c.sendPing(conn, c.entrypoint)
+			_ = c.sendPing(conn, c.entrypoint, payload)
 			// Pull peers' CRDS tables so discovery isn't purely passive (fixes
 			// peers=1). Peers ping us first if unponged; we answer, so this converges.
-			_ = c.sendPullRequests(conn)
+			_ = c.sendPullRequests(conn, payload)
 		case <-statsTicker.C:
 			stats := c.Stats()
+			c.publishMonitoringWithSocket(time.Now(), stats, conn, socketGeneration)
 			mlog.Log.FileOnlyf("gossip client stats: rx=%d tx=%d peers=%d repair_peers=%d decode_errors=%d tx_errors=%d pings=%d/%d pongs=%d/%d contacts_rx=%d contacts_accepted=%d pull_requests=%d pull_responses=%d last_rx=%s last_tx=%s",
 				stats.RxPackets, stats.TxPackets, stats.Peers, stats.RepairPeers, stats.RxDecodeErrors, stats.TxErrors,
 				stats.RxPings, stats.TxPingMessages, stats.RxPongs, stats.TxPongMessages,
@@ -378,6 +407,7 @@ func (c *Client) Stats() Stats {
 		TxPingMessages:   c.txPingMessages.Load(),
 		TxPongMessages:   c.txPongMessages.Load(),
 		TxPullResponses:  c.txPullResponses.Load(),
+		TxPullRequests:   c.txPullRequests.Load(),
 		LastRxUnix:       c.lastRxUnix.Load(),
 		LastTxUnix:       c.lastTxUnix.Load(),
 		Peers:            peers,
@@ -559,7 +589,7 @@ func (c *Client) currentContactValue() (CrdsValue, *identity.Keypair, error) {
 	return signed, kp, err
 }
 
-func (c *Client) pushContact(conn *net.UDPConn) error {
+func (c *Client) pushContact(conn *net.UDPConn, payload *udpPayloadRecorder) error {
 	value, kp, err := c.currentContactValue()
 	if err != nil {
 		return err
@@ -569,7 +599,7 @@ func (c *Client) pushContact(conn *net.UDPConn) error {
 		return err
 	}
 	for _, peer := range c.currentPeers() {
-		if err := sendUDP(conn, packet, peer); err != nil {
+		if err := sendUDP(conn, packet, peer, payload); err != nil {
 			c.txErrors.Add(1)
 			return err
 		}
@@ -579,7 +609,7 @@ func (c *Client) pushContact(conn *net.UDPConn) error {
 	return nil
 }
 
-func (c *Client) sendPullResponse(conn *net.UDPConn, addr *net.UDPAddr) error {
+func (c *Client) sendPullResponse(conn *net.UDPConn, addr *net.UDPAddr, payload *udpPayloadRecorder) error {
 	value, kp, err := c.currentContactValue()
 	if err != nil {
 		return err
@@ -588,7 +618,7 @@ func (c *Client) sendPullResponse(conn *net.UDPConn, addr *net.UDPAddr) error {
 	if err != nil {
 		return err
 	}
-	if err := sendUDP(conn, packet, addr); err != nil {
+	if err := sendUDP(conn, packet, addr, payload); err != nil {
 		c.txErrors.Add(1)
 		return err
 	}
@@ -600,7 +630,7 @@ func (c *Client) sendPullResponse(conn *net.UDPConn, addr *net.UDPAddr) error {
 // sendPullRequests asks every known peer to dump its CRDS table (match-everything
 // filter), bootstrapping our peer/repair set. Peers ping us first if we're not yet
 // ponged; we answer pings, so repeated ticks converge. Best-effort per peer.
-func (c *Client) sendPullRequests(conn *net.UDPConn) error {
+func (c *Client) sendPullRequests(conn *net.UDPConn, payload *udpPayloadRecorder) error {
 	value, _, err := c.currentContactValue()
 	if err != nil {
 		return err
@@ -613,38 +643,47 @@ func (c *Client) sendPullRequests(conn *net.UDPConn) error {
 	if err != nil {
 		return err
 	}
+	c.sendPullRequestPacket(conn, packet, c.currentPeers(), binary.LittleEndian.Uint64(seedBytes[:]), payload)
+	return nil
+}
+
+func (c *Client) sendPullRequestPacket(conn *net.UDPConn, packet []byte, peers []*net.UDPAddr, seed uint64, payload *udpPayloadRecorder) {
 	// Pull from a bounded window each tick rather than flooding every peer (avoids
 	// peers rate-limiting our gossip, which the shared turbine path relies on). Start
 	// offset is derived from the random seed so the window rotates over time.
-	peers := c.currentPeers()
 	if len(peers) == 0 {
-		return nil
+		return
 	}
-	start := int(binary.LittleEndian.Uint64(seedBytes[:]) % uint64(len(peers)))
+	start := int(seed % uint64(len(peers)))
 	n := maxPullRequestsPerTick
 	if n > len(peers) {
 		n = len(peers)
 	}
 	for i := 0; i < n; i++ {
-		if err := sendUDP(conn, packet, peers[(start+i)%len(peers)]); err != nil {
-			c.txErrors.Add(1)
-			continue
-		}
-		c.recordTx()
+		c.recordPullRequestWrite(sendUDP(conn, packet, peers[(start+i)%len(peers)], payload))
 	}
-	return nil
+}
+
+// A nil error records the local write result, not delivery or a full datagram.
+func (c *Client) recordPullRequestWrite(err error) {
+	if err != nil {
+		c.txErrors.Add(1)
+		return
+	}
+	c.recordTx()
+	addUDPPayloadBytes(&c.txPullRequests, 1, 1)
 }
 
 // maxPullRequestsPerTick bounds outbound CRDS pull requests per ping tick so a
 // large peer table doesn't turn into a gossip flood.
 const maxPullRequestsPerTick = 8
 
-func (c *Client) sendPing(conn *net.UDPConn, addr *net.UDPAddr) error {
+func (c *Client) sendPing(conn *net.UDPConn, addr *net.UDPAddr, payload *udpPayloadRecorder) error {
 	ping, err := newPing(c.identity.Current().PrivateKey())
 	if err != nil {
 		return err
 	}
-	if err := sendUDP(conn, encodePingMessage(ping), addr); err != nil {
+	if err := sendUDP(conn, encodePingMessage(ping), addr, payload); err != nil {
 		c.txErrors.Add(1)
 		return err
 	}
@@ -653,7 +692,7 @@ func (c *Client) sendPing(conn *net.UDPConn, addr *net.UDPAddr) error {
 	return nil
 }
 
-func (c *Client) sendPong(conn *net.UDPConn, ping Ping, addr *net.UDPAddr) error {
+func (c *Client) sendPong(conn *net.UDPConn, ping Ping, addr *net.UDPAddr, payload *udpPayloadRecorder) error {
 	if !ping.Verify() {
 		return nil
 	}
@@ -661,7 +700,7 @@ func (c *Client) sendPong(conn *net.UDPConn, ping Ping, addr *net.UDPAddr) error
 	if err != nil {
 		return err
 	}
-	if err := sendUDP(conn, encodePongMessage(pong), addr); err != nil {
+	if err := sendUDP(conn, encodePongMessage(pong), addr, payload); err != nil {
 		c.txErrors.Add(1)
 		return err
 	}
@@ -670,10 +709,11 @@ func (c *Client) sendPong(conn *net.UDPConn, ping Ping, addr *net.UDPAddr) error
 	return nil
 }
 
-func (c *Client) recvLoop(ctx context.Context, conn *net.UDPConn) error {
+func (c *Client) recvLoop(ctx context.Context, conn *net.UDPConn, payload *udpPayloadRecorder) error {
 	buf := make([]byte, packetDataSize)
 	for {
 		n, addr, err := conn.ReadFromUDP(buf)
+		payload.recordReceived(conn, n, len(buf))
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return nil
@@ -682,25 +722,34 @@ func (c *Client) recvLoop(ctx context.Context, conn *net.UDPConn) error {
 		}
 		c.rxPackets.Add(1)
 		c.lastRxUnix.Store(time.Now().Unix())
-		if err := c.handlePacket(conn, buf[:n], addr); err != nil {
+		if err := c.handlePacket(conn, buf[:n], addr, payload); err != nil {
 			c.rxDecodeErrors.Add(1)
 			continue
 		}
 	}
 }
 
-func (c *Client) handlePacket(conn *net.UDPConn, packet []byte, from *net.UDPAddr) error {
+func (c *Client) handlePacket(conn *net.UDPConn, packet []byte, from *net.UDPAddr, payload *udpPayloadRecorder) error {
 	shredVersion := c.ShredVersion()
-	decoded, err := decodePacketWithContactHandler(packet, func(record contactRecord) {
+	recorder := c.decodeMonitoring.Load()
+	var observation PacketDecodeObservation
+	var output *PacketDecodeObservation
+	if recorder != nil && recorder.conn == conn {
+		output = &observation
+	}
+	decoded, err := decodePacketWithObservation(packet, func(record contactRecord) {
 		c.handleContactRecord(record, shredVersion)
-	})
+	}, output)
+	if output != nil {
+		recorder.record(observation)
+	}
 	if err != nil {
 		return err
 	}
 	switch decoded.Kind {
 	case packetPing:
 		c.rxPings.Add(1)
-		return c.sendPong(conn, decoded.Ping, from)
+		return c.sendPong(conn, decoded.Ping, from, payload)
 	case packetPong:
 		c.rxPongs.Add(1)
 		if decoded.Pong.Verify() {
@@ -710,14 +759,14 @@ func (c *Client) handlePacket(conn *net.UDPConn, packet []byte, from *net.UDPAdd
 		c.rxContacts.Add(uint64(decoded.ContactCount))
 	case packetPullRequest:
 		c.rxPullRequests.Add(1)
-		return c.sendPullResponse(conn, from)
+		return c.sendPullResponse(conn, from, payload)
 	}
 	return nil
 }
 
-func (c *Client) handleContactRecord(record contactRecord, shredVersion uint16) {
+func (c *Client) handleContactRecord(record contactRecord, shredVersion uint16) bool {
 	if record.ShredVer != shredVersion || !record.GossipAddr.ok {
-		return
+		return false
 	}
 	// CRDS is keyed by validator identity. If another process publishes that
 	// same identity with different sockets, its newer ContactInfo replaces ours
@@ -728,7 +777,7 @@ func (c *Client) handleContactRecord(record contactRecord, shredVersion uint16) 
 	// trip a fresh process.
 	if record.Pubkey == c.Pubkey() {
 		c.observeOwnContactRecord(record)
-		return
+		return false
 	}
 	// The entrypoint is commonly a validator itself. Do not add its gossip
 	// socket to the rotating pull-peer table, but retain the service endpoints
@@ -740,6 +789,10 @@ func (c *Client) handleContactRecord(record contactRecord, shredVersion uint16) 
 	c.recordTVUPeerRecord(record)
 	c.recordAlpenglowPeerRecord(record)
 	c.acceptedContacts.Add(1)
+	if c.monitoringEnabled.Load() {
+		c.observeMonitoringPeer(record, time.Now())
+	}
+	return true
 }
 
 func (c *Client) observeOwnContactRecord(record contactRecord) {

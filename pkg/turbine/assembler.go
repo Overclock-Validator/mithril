@@ -58,6 +58,7 @@ type SlotAssembler struct {
 	retentionFloor      uint64                             // when non-zero, slots >= floor are never "too old" (repair catchup holds a window far behind the live edge)
 	edgeScanLag         uint64                             // how far behind the shred edge the freshness-repair scan reaches (0 = repairScanSlotWindow)
 	maxObservedSlot     uint64
+	hasObserved         bool
 	// Age sweeps depend on the edge, repair floor, and mutations that can add
 	// old metadata or release a completing generation's protected identities.
 	retentionSwept       bool
@@ -65,6 +66,8 @@ type SlotAssembler struct {
 	retentionSweepEdge   uint64
 	retentionSweepFloor  uint64
 	highestFullSlot      uint64 // monotonic: highest slot reconstructed from shreds ("full", Agave SlotMeta/is_full sense)
+	highestFullAt        time.Time
+	hasReconstructed     bool
 	recoveredDataShreds  uint64
 	usefulRepairShreds   uint64 // distinct data shreds delivered BY repair (the throughput signal)
 	nonCanonicalBlockIDs uint64
@@ -96,6 +99,18 @@ type SlotRepairRequest struct {
 	MissingDataShreds     []uint32
 	NeedHighestDataShred  bool
 	HighestDataShredIndex uint32
+}
+
+// ShredFrontiers reports assembler-session high-water marks, with explicit
+// presence for slot zero. ObservedSlot comes from shred headers before assembly
+// checks; ReconstructedSlot has all data shreds but may fail block decoding or
+// verification. Neither is a recent or verified chain tip.
+type ShredFrontiers struct {
+	ObservedSlot      uint64
+	ReconstructedSlot uint64
+	HasObserved       bool
+	HasReconstructed  bool
+	ReconstructedAt   time.Time // Original high-water completion date, before decoding.
 }
 
 // PartialShredObservation records what arrived for a slot that never became
@@ -285,6 +300,7 @@ func (a *SlotAssembler) addShredFromWithRoot(shred *Shred, fromRepair bool, root
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.hasObserved = true
 	if shred.Slot > a.maxObservedSlot {
 		a.maxObservedSlot = shred.Slot
 	}
@@ -397,9 +413,11 @@ func (a *SlotAssembler) claimCompletionLocked(state *slotState, reportNonCanonic
 	observeCollection := state.fullAt.IsZero()
 	if observeCollection {
 		state.fullAt = now
-		if state.slot > a.highestFullSlot {
+		if !a.hasReconstructed || state.slot > a.highestFullSlot {
 			a.highestFullSlot = state.slot
+			a.highestFullAt = now
 		}
+		a.hasReconstructed = true
 	}
 	state.completing = true
 	verifyTransactions := a.verifyTransactions
@@ -615,6 +633,20 @@ func (a *SlotAssembler) ShredEdges() (latestShredSlot, highestFullSlot uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.maxObservedSlot, a.highestFullSlot
+}
+
+// ShredFrontiers returns a detached snapshot of session maxima. Resetting or
+// pruning an individual slot does not clear these observations.
+func (a *SlotAssembler) ShredFrontiers() ShredFrontiers {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return ShredFrontiers{
+		ObservedSlot:      a.maxObservedSlot,
+		ReconstructedSlot: a.highestFullSlot,
+		HasObserved:       a.hasObserved,
+		HasReconstructed:  a.hasReconstructed,
+		ReconstructedAt:   a.highestFullAt,
+	}
 }
 
 func (a *SlotAssembler) SetKnownAlpenglowBlockID(slot uint64, blockID solana.Hash) {

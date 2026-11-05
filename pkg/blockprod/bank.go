@@ -456,6 +456,7 @@ func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, pre
 		b.txFees.Add(output.FeeInfo)
 	}
 	b.forgedTxs = append(b.forgedTxs, tx)
+	b.slotCtx.TransactionCounts.Record(tx.IsVote(), output.ProcessingResult.TransactionError != nil, execCU)
 	b.numSigs += uint64(tx.Message.Header.NumRequiredSignatures)
 
 	b.costs.Record(cost)

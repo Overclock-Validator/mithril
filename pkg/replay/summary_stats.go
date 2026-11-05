@@ -220,10 +220,10 @@ func buildSkippedStatsLine(slot uint64, leader string, partialShreds, repairedSh
 	return line
 }
 
-// processRSSBytes reads the resident set size on Linux (/proc/self/statm,
+// ProcessRSSBytes reads the resident set size on Linux (/proc/self/statm,
 // second field, pages). Returns 0 (omit from output) where unavailable —
 // stats must not fabricate on other platforms.
-func processRSSBytes() uint64 {
+func ProcessRSSBytes() uint64 {
 	data, err := os.ReadFile("/proc/self/statm")
 	if err != nil {
 		return 0

@@ -60,39 +60,40 @@ type VotingConfig struct {
 // NetworkLandedVotes counts unique persisted votes whose rank appeared in the
 // exact BLS-verified certificate proof received over Votor QUIC.
 type VotingStats struct {
-	HistorySnapshotsSubmitted      uint64                          `json:"history_snapshots_submitted,omitempty"`
-	HistorySnapshotsWritten        uint64                          `json:"history_snapshots_written,omitempty"`
-	HistorySnapshotsCoalesced      uint64                          `json:"history_snapshots_coalesced,omitempty"`
-	ReservedHistory                bool                            `json:"reserved_history"`
-	SigningReservedThrough         uint64                          `json:"signing_reserved_through,omitempty"`
-	RecoveryThrough                uint64                          `json:"recovery_through,omitempty"`
-	Enabled                        bool                            `json:"enabled"`
-	VotesCastThisRun               uint64                          `json:"votes_cast_this_run"`
-	NetworkLandedVotes             uint64                          `json:"network_landed_votes"`
-	LastNetworkLandedSlot          uint64                          `json:"last_network_landed_slot,omitempty"`
-	LastNetworkLandedVoteType      alpenglow.VoteType              `json:"last_network_landed_vote_type,omitempty"`
-	LastNetworkCertificateType     alpenglow.CertificateType       `json:"last_network_certificate_type,omitempty"`
-	LastNetworkLandedAt            time.Time                       `json:"last_network_landed_at,omitempty"`
-	BroadcastMessagesQueued        uint64                          `json:"broadcast_messages_queued"`
-	BroadcastMessagesDropped       uint64                          `json:"broadcast_messages_dropped"`
-	BroadcastPeerSends             uint64                          `json:"broadcast_peer_sends"`
-	BroadcastPeerSendsSkipped      uint64                          `json:"broadcast_peer_sends_skipped"`
-	BroadcastPeerSendErrors        uint64                          `json:"broadcast_peer_send_errors"`
-	BroadcastPeerQueueDrops        uint64                          `json:"broadcast_peer_queue_drops"`
-	BroadcastPeerQueueDiscarded    uint64                          `json:"broadcast_peer_queue_discarded"`
-	BroadcastPeerSendTimeouts      uint64                          `json:"broadcast_peer_send_timeouts"`
-	BroadcastPeerQueueMaxDelay     time.Duration                   `json:"broadcast_peer_queue_max_delay_ns"`
-	BroadcastPeerQueues            []alpenglow.VotorPeerQueueStats `json:"broadcast_peer_queues,omitempty"`
-	BroadcastDesiredPeers          int                             `json:"broadcast_desired_peers"`
-	BroadcastActiveConnections     int                             `json:"broadcast_active_connections"`
-	BroadcastPendingConnections    int                             `json:"broadcast_pending_connections"`
-	BroadcastConnectionAttempts    uint64                          `json:"broadcast_connection_attempts"`
-	BroadcastConnectionErrors      uint64                          `json:"broadcast_connection_errors"`
-	BroadcastConnectionJobsDropped uint64                          `json:"broadcast_connection_jobs_dropped"`
-	BroadcastLastPeerSendError     string                          `json:"broadcast_last_peer_send_error,omitempty"`
-	BroadcastLastPeerSendErrorAt   time.Time                       `json:"broadcast_last_peer_send_error_at,omitempty"`
-	BroadcastLastConnectionError   string                          `json:"broadcast_last_connection_error,omitempty"`
-	BroadcastLastConnectionErrorAt time.Time                       `json:"broadcast_last_connection_error_at,omitempty"`
+	HistorySnapshotsSubmitted      uint64                                   `json:"history_snapshots_submitted,omitempty"`
+	HistorySnapshotsWritten        uint64                                   `json:"history_snapshots_written,omitempty"`
+	HistorySnapshotsCoalesced      uint64                                   `json:"history_snapshots_coalesced,omitempty"`
+	ReservedHistory                bool                                     `json:"reserved_history"`
+	SigningReservedThrough         uint64                                   `json:"signing_reserved_through,omitempty"`
+	RecoveryThrough                uint64                                   `json:"recovery_through,omitempty"`
+	Enabled                        bool                                     `json:"enabled"`
+	VotesCastThisRun               uint64                                   `json:"votes_cast_this_run"`
+	NetworkLandedVotes             uint64                                   `json:"network_landed_votes"`
+	LastNetworkLandedSlot          uint64                                   `json:"last_network_landed_slot,omitempty"`
+	LastNetworkLandedVoteType      alpenglow.VoteType                       `json:"last_network_landed_vote_type,omitempty"`
+	LastNetworkCertificateType     alpenglow.CertificateType                `json:"last_network_certificate_type,omitempty"`
+	LastNetworkLandedAt            time.Time                                `json:"last_network_landed_at,omitempty"`
+	BroadcastMessagesQueued        uint64                                   `json:"broadcast_messages_queued"`
+	BroadcastMessagesDropped       uint64                                   `json:"broadcast_messages_dropped"`
+	BroadcastPeerSends             uint64                                   `json:"broadcast_peer_sends"`
+	BroadcastApplicationPayload    *alpenglow.ApplicationPayloadObservation `json:"broadcast_application_payload,omitempty"`
+	BroadcastPeerSendsSkipped      uint64                                   `json:"broadcast_peer_sends_skipped"`
+	BroadcastPeerSendErrors        uint64                                   `json:"broadcast_peer_send_errors"`
+	BroadcastPeerQueueDrops        uint64                                   `json:"broadcast_peer_queue_drops"`
+	BroadcastPeerQueueDiscarded    uint64                                   `json:"broadcast_peer_queue_discarded"`
+	BroadcastPeerSendTimeouts      uint64                                   `json:"broadcast_peer_send_timeouts"`
+	BroadcastPeerQueueMaxDelay     time.Duration                            `json:"broadcast_peer_queue_max_delay_ns"`
+	BroadcastPeerQueues            []alpenglow.VotorPeerQueueStats          `json:"broadcast_peer_queues,omitempty"`
+	BroadcastDesiredPeers          int                                      `json:"broadcast_desired_peers"`
+	BroadcastActiveConnections     int                                      `json:"broadcast_active_connections"`
+	BroadcastPendingConnections    int                                      `json:"broadcast_pending_connections"`
+	BroadcastConnectionAttempts    uint64                                   `json:"broadcast_connection_attempts"`
+	BroadcastConnectionErrors      uint64                                   `json:"broadcast_connection_errors"`
+	BroadcastConnectionJobsDropped uint64                                   `json:"broadcast_connection_jobs_dropped"`
+	BroadcastLastPeerSendError     string                                   `json:"broadcast_last_peer_send_error,omitempty"`
+	BroadcastLastPeerSendErrorAt   time.Time                                `json:"broadcast_last_peer_send_error_at,omitempty"`
+	BroadcastLastConnectionError   string                                   `json:"broadcast_last_connection_error,omitempty"`
+	BroadcastLastConnectionErrorAt time.Time                                `json:"broadcast_last_connection_error_at,omitempty"`
 }
 
 type voterEventKind uint8
@@ -192,6 +193,7 @@ type alpenglowVoter struct {
 	landed            map[alpenglow.VoteMessageKey]struct{}
 	stats             VotingStats
 	lastStatsLog      time.Time
+	monitoring        atomic.Pointer[VotingObservation]
 	// beforeVoteGuard is a deterministic test seam for invalidation races. It
 	// is nil in production.
 	beforeVoteGuard func(alpenglow.BlockID)
@@ -332,8 +334,9 @@ func newAlpenglowVoterWithStart(engine *AlpenglowObserverEngine, cfg VotingConfi
 		v.sets[set.Epoch] = cloneValidatorSet(set)
 	}
 	broadcaster, err := alpenglow.NewVotorBroadcaster(alpenglow.VotorBroadcasterConfig{
-		Identity:     engine.identity,
-		ShredVersion: engine.shredVersion,
+		RecordApplicationPayload: engine.votorPayloadMonitoring,
+		Identity:                 engine.identity,
+		ShredVersion:             engine.shredVersion,
 		Peers: func() []alpenglow.VotorPeer {
 			validators := v.votorTransportValidators()
 			if len(validators) == 0 {
@@ -1373,6 +1376,7 @@ func (v *alpenglowVoter) snapshot() VotingStats {
 		stats.BroadcastMessagesQueued = broadcast.MessagesQueued
 		stats.BroadcastMessagesDropped = broadcast.MessagesDropped
 		stats.BroadcastPeerSends = broadcast.PeerSends
+		stats.BroadcastApplicationPayload = broadcast.ApplicationPayload
 		stats.BroadcastPeerSendsSkipped = broadcast.PeerSendsSkipped
 		stats.BroadcastPeerSendErrors = broadcast.PeerSendErrors
 		stats.BroadcastPeerQueueDrops = broadcast.PeerQueueDrops
@@ -1400,6 +1404,7 @@ func (v *alpenglowVoter) maybeLogStats() {
 	}
 	v.lastStatsLog = time.Now()
 	stats := v.snapshot()
+	v.publishMonitoring(stats)
 	mlog.Log.FileOnlyf("alpenglow voting stats: votes_cast_this_run=%d network_landed=%d last_landed_slot=%d broadcast_queued=%d broadcast_dropped=%d peer_sends=%d peer_sends_skipped=%d peer_send_errors=%d peer_queue_drops=%d peer_queue_discarded=%d peer_send_timeouts=%d peer_queue_max_delay=%s desired_peers=%d active_connections=%d pending_connections=%d connection_attempts=%d connection_errors=%d connection_jobs_dropped=%d reserved_history=%t signing_through=%d recovery_through=%d history_submitted=%d history_written=%d history_coalesced=%d",
 		stats.VotesCastThisRun,
 		stats.NetworkLandedVotes,
@@ -1536,6 +1541,9 @@ func (v *alpenglowVoter) rebindIdentity(next *identity.Keypair) error {
 	v.signer = signer
 	v.history = history
 	v.historyLock = historyLock
+	if v.engine.monitoringEnabled {
+		v.publishMonitoring(v.snapshot())
+	}
 	// Restoration and pending blocks belong to the previous history; keep only
 	// pending blocks the new history has neither rooted nor voted on.
 	clear(v.restored)

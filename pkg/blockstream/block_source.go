@@ -298,9 +298,13 @@ type BlockSource struct {
 	// Repair peers remembered across restarts (RepairPeerSeeds,
 	// GoodRepairPeers). lastGoodRepairPeers keeps the latest non-empty list
 	// so a shutdown save still has it after the receiver is torn down.
-	repairPeerSeeds     []gossip.RepairPeer
-	startedAt           time.Time
-	lastGoodRepairPeers atomic.Pointer[[]gossip.RepairPeer]
+	repairPeerSeeds      []gossip.RepairPeer
+	startedAt            time.Time
+	lastGoodRepairPeers  atomic.Pointer[[]gossip.RepairPeer]
+	monitoringEnabled    bool // Configured before Start; sampling belongs to the stream owner.
+	turbineObservation   atomic.Pointer[TurbineObservation]
+	receptionObservation atomic.Pointer[ReceptionObservation]
+	monitoredGossip      atomic.Pointer[gossip.Client]
 
 	// replayEmitHook, when set, sees every block just before it is queued
 	// for replay, while the block source still owns it (SetReplayEmitHook).
@@ -1617,6 +1621,9 @@ func (bs *BlockSource) liveDeliveryInFlight(slot uint64) bool {
 
 func (bs *BlockSource) handleLiveShredStreamClosed(reason string) int {
 	bs.liveStreamConnected.Store(false)
+	bs.turbineObservation.Store(nil)
+	bs.receptionObservation.Store(nil)
+	bs.monitoredGossip.Store(nil)
 	bs.clearLiveStreamCancel()
 	// A dead stream ends any repair-catchup attempt: the receiver (and its
 	// retention floor) is gone; the interrupted-handoff path below forces RPC.
@@ -3134,7 +3141,10 @@ func (bs *BlockSource) emitOrderedBlocks() {
 
 				bs.reorderMu.Lock()
 				bs.alpenglowRewindWait.served(rewindGeneration, blk)
-				bs.nextSlotToSend++
+				// Replay may have advanced the cursor while the send was unlocked.
+				if bs.nextSlotToSend == blk.Slot {
+					bs.nextSlotToSend++
+				}
 				bs.replayEmissionBlock = nil
 				bs.replayEmissionWg.Done()
 			} else if bs.skippedSlots[bs.nextSlotToSend] {
@@ -3734,6 +3744,7 @@ func (bs *BlockSource) Stop() {
 		return
 	}
 	bs.stopped.Store(true)
+	bs.monitoredGossip.Store(nil)
 	bs.stopOnce.Do(func() {
 		close(bs.stopChan)
 	})

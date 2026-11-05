@@ -23,6 +23,7 @@ type UDPReceiver struct {
 	Addr string
 
 	assembler *SlotAssembler
+	reception *receptionMonitoring // Opt-in; configured before Run.
 	// A reset must be atomic with respect to both network ingestion and spool
 	// hydration. Otherwise a hydrator can read a soon-to-be-discarded file,
 	// lose the race with ResetSlot, and feed its stale packets straight back
@@ -122,9 +123,10 @@ type ReceiverStats struct {
 	HydratedFromDisk uint64
 	// Signature verification: ed25519 ops actually run vs shreds authenticated
 	// off the per-FEC-set merkle root cache (one signed root covers ~64 shreds).
-	SigVerifies     uint64
-	SigVerifyCached uint64
-	Retransmit      RetransmitStats
+	SigVerifies       uint64
+	SigVerifyCached   uint64
+	RetransmitEnabled bool
+	Retransmit        RetransmitStats
 }
 
 // Repair catchup is packet-processing heavy (wire decode, Merkle proof,
@@ -322,6 +324,12 @@ func (r *UDPReceiver) RejectAlpenglowBlockIDAndDiscardSlot(slot uint64, blockID 
 // slot with any accepted shred, and highest slot that became full.
 func (r *UDPReceiver) ShredEdges() (latestShredSlot, highestFullSlot uint64) {
 	return r.assembler.ShredEdges()
+}
+
+// ShredFrontiers returns the assembler's session maxima and their presence.
+// A newly constructed receiver starts with neither frontier observed.
+func (r *UDPReceiver) ShredFrontiers() ShredFrontiers {
+	return r.assembler.ShredFrontiers()
 }
 
 // ShredObservation reports partial shred arrivals for a slot that never
@@ -599,6 +607,7 @@ func (r *UDPReceiver) Stats() ReceiverStats {
 		SigVerifies:           sigVerifies,
 		SigVerifyCached:       sigHits,
 		Retransmit:            r.retransmitStats(),
+		RetransmitEnabled:     r.retransmitter != nil,
 	}
 }
 
@@ -791,11 +800,12 @@ func (r *UDPReceiver) readPackets(ctx context.Context, conn *net.UDPConn, onRepa
 }
 
 func (r *UDPReceiver) processPacket(ctx context.Context, conn *net.UDPConn, packet []byte, addr *net.UDPAddr, onRepairSocket bool) bool {
+	receivedAt := time.Now()
 	r.packets.Add(1)
 	if onRepairSocket {
 		r.repairSocketPackets.Add(1)
 	}
-	r.lastPacketUnix.Store(time.Now().Unix())
+	r.lastPacketUnix.Store(receivedAt.Unix())
 	if r.repairClient != nil && r.repairClient.handleRepairPing(conn, packet, addr) {
 		return true
 	}
@@ -878,6 +888,9 @@ func (r *UDPReceiver) processPacket(ctx context.Context, conn *net.UDPConn, pack
 			}
 			return true
 		}
+	}
+	if r.reception != nil && !onRepairSocket && authenticatedRoot != nil {
+		r.reception.observe(shred.Slot, receivedAt)
 	}
 	if r.repairClient != nil {
 		// A leader-valid broadcast with a forged upstream signature is not an
