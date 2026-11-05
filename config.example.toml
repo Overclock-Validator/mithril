@@ -760,6 +760,10 @@ name = "mithril"
 # ============================================================================
 
 [reporting]
+    # The Prometheus HTTP listener defaults to :9090. Disable it when the
+    # node should not expose that listener (or use --no-metrics-server).
+    # no_metrics_server = true
+
     # Replay timings (JSONL latency records per block) are automatically written
     # to replay_timings.jsonl in each run's log directory.
 
