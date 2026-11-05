@@ -59,6 +59,7 @@ func BuildAccountsDbAuto(
 		return nil, nil, fmt.Errorf("reading snapshot manifest: %v", err)
 	}
 	mlog.Log.Infof("Parsed full snapshot manifest")
+	dp.ManifestParsed(false, manifest.Bank.Slot)
 	if OnFullSnapshotManifestParsed != nil {
 		OnFullSnapshotManifestParsed(manifest)
 	}
@@ -212,6 +213,7 @@ func BuildAccountsDbAuto(
 		// Copy the manifest so the worker pool's pointer has the value.
 		*incrementalManifest = *incrementalManifestCopy
 		mlog.Log.FileOnlyf("Parsed incremental snapshot manifest")
+		dp.ManifestParsed(true, incrementalManifestCopy.Bank.Slot)
 		if OnIncrementalManifestParsed != nil {
 			OnIncrementalManifestParsed(incrementalManifestCopy)
 		}
@@ -232,14 +234,33 @@ func BuildAccountsDbAuto(
 			}
 		}
 
+		kind := "local"
+		if strings.HasPrefix(incrementalSnapshotPath, "http://") || strings.HasPrefix(incrementalSnapshotPath, "https://") {
+			kind = "remote"
+		}
+		incrementalProgress := dp.NewIncrementalProgress(incrementalManifest.Bank.Slot, kind)
+		if incrementalProgress != nil {
+			incrementalProgress.Start()
+		}
 		err = readTar(ctx, wg, incrementalSnapshotPath, pools, readTarOptions{
 			savePath:        incrSavePath,
 			isIncremental:   true,
+			progress:        incrementalProgress,
 			statusCachePath: retainedStatusCachePath(accountsDbDir),
 		})
 		workerErr = waitForSnapshotWorkers(wg, pools)
 		if workerErr != nil {
+			if incrementalProgress != nil {
+				incrementalProgress.Interrupt(workerErr)
+			}
 			return nil, nil, fmt.Errorf("processing incremental snapshot workers: %w", workerErr)
+		}
+		if incrementalProgress != nil {
+			if err != nil {
+				incrementalProgress.Interrupt(err)
+			} else {
+				incrementalProgress.Stop()
+			}
 		}
 		// Check if we should retry
 		if err == nil {
@@ -262,9 +283,9 @@ func BuildAccountsDbAuto(
 	// Show indexing progress for shard flush
 	indexProgress := progress.NewIndexingProgress("Flush (shard logs)")
 	indexProgress.Start(numShards)
-	sl.CloseWithProgress(ctx, func(completed, total int) {
-		indexProgress.Update(completed, total)
-	})
+	if err := closeSnapshotShardLogger(ctx, sl, indexProgress); err != nil {
+		return nil, nil, err
+	}
 	indexDir := filepath.Join(accountsDbDir, "mithril_db")
 	index, err := ingestSSTFiles(indexDir, logsDir)
 	if err != nil {

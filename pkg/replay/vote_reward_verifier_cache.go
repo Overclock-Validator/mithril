@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/alpenglow"
+	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/epochstakes"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
@@ -32,6 +33,47 @@ type voteRewardVerifierMaterial struct {
 
 	rewardValidationMu   sync.Mutex
 	lastRewardValidation *voteRewardCertificateValidation
+	// One fixed dashboard subject; guarded by rewardValidationMu. This caches
+	// a scalar admission lookup, not signer maps or mutable epoch material.
+	observationSubject      solana.PublicKey
+	observationAdmission    b.CertificateMembership
+	hasObservationAdmission bool
+}
+
+// warmed returns only material already built for this exact publication. It
+// neither builds validators nor changes cache retention on monitoring's behalf.
+func (cache *voteRewardVerifierMaterialCache) warmed(epoch uint64, shredVersion uint16) *voteRewardVerifierMaterial {
+	snapshot, ok := global.EpochStakesSnapshot(epoch)
+	if !ok {
+		return nil
+	}
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	return cache.entries[voteRewardVerifierCacheKey{epoch: epoch, generation: snapshot.Generation, shredVersion: shredVersion}].material
+}
+
+func (material *voteRewardVerifierMaterial) observationMembership(subject solana.PublicKey, target uint64) b.CertificateMembership {
+	if material == nil {
+		return b.CertificateMembership{TargetSlot: target}
+	}
+	material.rewardValidationMu.Lock()
+	defer material.rewardValidationMu.Unlock()
+	if !material.hasObservationAdmission || material.observationSubject != subject {
+		admission := b.CertificateMembership{TargetEpoch: material.snapshot.Epoch, MaterialGeneration: material.snapshot.Generation}
+		if set, ok := material.verifier.ValidatorSetForEpoch(material.snapshot.Epoch); ok {
+			admission.AdmissionKnown = true
+			for _, validator := range set.Validators {
+				if validator.VoteAccount == subject {
+					admission.Eligible, admission.EpochIdentity, admission.Rank = true, validator.NodePubkey, validator.Rank
+					break
+				}
+			}
+		}
+		material.observationSubject, material.observationAdmission, material.hasObservationAdmission = subject, admission, true
+	}
+	value := material.observationAdmission
+	value.TargetSlot = target
+	return value
 }
 
 // Keep just the latest successful certificate pair. The immutable material
@@ -75,6 +117,7 @@ func cloneValidatedRewardCert(validated *rewardcerts.ValidatedRewardCert) *rewar
 	}
 	cloned := &rewardcerts.ValidatedRewardCert{
 		RewardSlot: validated.RewardSlot,
+		Epoch:      validated.Epoch,
 		Validators: make(map[solana.PublicKey]struct{}, len(validated.Validators)),
 	}
 	for validator := range validated.Validators {

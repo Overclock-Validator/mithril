@@ -12,6 +12,7 @@ import (
 // ValidatedRewardCert is a BLS-verified union of validators from skip/notar reward certs.
 type ValidatedRewardCert struct {
 	RewardSlot uint64
+	Epoch      uint64
 	Validators map[solana.PublicKey]struct{}
 }
 
@@ -143,6 +144,7 @@ func validateRewardCertificates(
 	}
 	return &ValidatedRewardCert{
 		RewardSlot: *rewardSlot,
+		Epoch:      validatorSet.Epoch,
 		Validators: validators,
 	}, timings, nil
 }

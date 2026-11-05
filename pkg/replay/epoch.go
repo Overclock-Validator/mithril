@@ -431,12 +431,14 @@ func updateEpochStakesAndRefreshVoteCache(leaderScheduleEpoch uint64, b *block.B
 	voteCache := global.VoteCache()
 	effectiveStakes := scanResult.EffectiveStakes
 	totalEffectiveStake := scanResult.TotalEffectiveStake
+	selection := epochstakes.SelectionUnfiltered
 	if vatActive {
 		minimumBalance, err := minimumVoteAccountBalanceForVAT(f, epochSchedule, slot)
 		if err != nil {
 			panic(err)
 		}
 		effectiveStakes, totalEffectiveStake = filterEpochStakesForVAT(effectiveStakes, voteCache, voteMetadata, minimumBalance)
+		selection = epochstakes.SelectionVATFiltered
 		mlog.Log.FileOnlyf("VAT epoch stakes: admitted=%d/%d minimum_vote_balance=%d", len(effectiveStakes), len(scanResult.EffectiveStakes), minimumBalance)
 	}
 	epochStakes := make(map[solana.PublicKey]uint64, len(effectiveStakes))
@@ -480,7 +482,7 @@ func updateEpochStakesAndRefreshVoteCache(leaderScheduleEpoch uint64, b *block.B
 			}
 		}
 	}
-	global.PutEpochStakes(leaderScheduleEpoch, epochStakes, epochVoteAccounts, totalEffectiveStake)
+	global.PutEpochStakesWithSelection(leaderScheduleEpoch, epochStakes, epochVoteAccounts, totalEffectiveStake, selection)
 
 	// Epoch-stake maps are immutable bank snapshot state and are shared by every
 	// slot in an epoch (including a concurrently forged leader bank). Allocate a

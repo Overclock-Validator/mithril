@@ -66,8 +66,11 @@ type BlockObservation struct {
 type SlotReplayResult struct {
 	Slot     uint64
 	Bankhash [32]byte
-	Source   string
-	At       time.Time
+	// AlpenglowBlockID is optional exact-identity evidence for monitoring.
+	// A zero value preserves older callers without inventing a timing join.
+	AlpenglowBlockID [32]byte
+	Source           string
+	At               time.Time
 }
 
 type AlpenglowBlockIDSink func(slot uint64, blockID solana.Hash)
@@ -187,11 +190,13 @@ type Engine interface {
 }
 
 type Config struct {
-	AlpenglowObserverBindAddr string
-	AlpenglowMaxMessageBytes  int64
-	AlpenglowBLSDST           string           // BLS hash-to-curve DST; empty keeps the default (must match cluster's solana-bls version)
-	AlpenglowShredVersion     uint16           // included in each Alpenglow BLS vote-signing payload
-	AlpenglowIdentity         *identity.Holder // validator identity for staked Votor QUIC and voting; nil is passive observer mode
+	MonitoringEnabled             bool // publish bounded voter observations from its owner loop
+	VotorPayloadMonitoringEnabled bool // default-off QUIC application-byte accounting
+	AlpenglowObserverBindAddr     string
+	AlpenglowMaxMessageBytes      int64
+	AlpenglowBLSDST               string           // BLS hash-to-curve DST; empty keeps the default (must match cluster's solana-bls version)
+	AlpenglowShredVersion         uint16           // included in each Alpenglow BLS vote-signing payload
+	AlpenglowIdentity             *identity.Holder // validator identity for staked Votor QUIC and voting; nil is passive observer mode
 }
 
 // NewEngine constructs the Alpenglow observer engine — the only consensus
@@ -201,6 +206,8 @@ func NewEngine(cfg Config) (*AlpenglowObserverEngine, error) {
 	verifier := alpenglow.NewCertificateVerifier()
 	verifier.SetShredVersion(cfg.AlpenglowShredVersion)
 	e := &AlpenglowObserverEngine{
+		monitoringEnabled:       cfg.MonitoringEnabled || cfg.VotorPayloadMonitoringEnabled,
+		votorPayloadMonitoring:  cfg.VotorPayloadMonitoringEnabled,
 		observer:                alpenglow.NewObserver(),
 		chain:                   newAlpenglowObserverChainTracker(),
 		pool:                    alpenglow.NewConsensusPool(alpenglow.DefaultConsensusPoolConfig()),
@@ -225,6 +232,8 @@ func NewEngine(cfg Config) (*AlpenglowObserverEngine, error) {
 }
 
 type AlpenglowObserverEngine struct {
+	monitoringEnabled       bool
+	votorPayloadMonitoring  bool
 	observedBlocks          atomic.Uint64
 	replayedSlots           atomic.Uint64
 	observer                *alpenglow.Observer
@@ -326,12 +335,13 @@ func (e *AlpenglowObserverEngine) Start(ctx context.Context) error {
 	}
 
 	receiver, err := alpenglow.NewReceiver(alpenglow.ReceiverConfig{
-		BindAddr:        e.receiverBindAddr,
-		MaxMessageBytes: e.receiverMaxMessageBytes,
-		ShredVersion:    e.shredVersion,
-		Identity:        e.identity,
-		AdmitPeer:       e.admitVotorPeer,
-		AdmitMessage:    e.admitAuthenticatedVotorMessage,
+		RecordApplicationPayload: e.votorPayloadMonitoring,
+		BindAddr:                 e.receiverBindAddr,
+		MaxMessageBytes:          e.receiverMaxMessageBytes,
+		ShredVersion:             e.shredVersion,
+		Identity:                 e.identity,
+		AdmitPeer:                e.admitVotorPeer,
+		AdmitMessage:             e.admitAuthenticatedVotorMessage,
 	}, observer)
 	if err != nil {
 		return err

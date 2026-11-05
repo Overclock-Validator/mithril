@@ -207,6 +207,12 @@ func PutEpochStakes(epoch uint64, stakes map[solana.PublicKey]uint64, voteAccts 
 	return instance.epochStakes.PutEpoch(epoch, stakes, voteAccts, totalStake)
 }
 
+// PutEpochStakesWithSelection atomically replaces all stake material and its
+// selection provenance for epoch.
+func PutEpochStakesWithSelection(epoch uint64, stakes map[solana.PublicKey]uint64, voteAccts map[solana.PublicKey]*epochstakes.VoteAccount, totalStake uint64, selection epochstakes.Selection) uint64 {
+	return instance.epochStakes.PutEpochWithSelection(epoch, stakes, voteAccts, totalStake, selection)
+}
+
 // EpochStakesSnapshot returns one coherent, immutable view of epoch.
 func EpochStakesSnapshot(epoch uint64) (epochstakes.Snapshot, bool) {
 	return instance.epochStakes.Snapshot(epoch)
@@ -342,6 +348,23 @@ func SetLeaderScheduleForEpoch(epoch uint64, ls *leaderschedule.LeaderSchedule) 
 		instance.leaderSchedules = make(map[uint64]*leaderschedule.LeaderSchedule)
 	}
 	instance.leaderSchedules[epoch] = ls
+}
+
+// LeaderSchedulesForEpochs captures the requested schedule pointers together.
+// Missing schedules are nil; a legacy singleton is returned for each epoch.
+// The caller bounds epochs and must check each schedule's slot lookup result.
+func LeaderSchedulesForEpochs(epochs []uint64) []*leaderschedule.LeaderSchedule {
+	instance.leaderScheduleMutex.RLock()
+	defer instance.leaderScheduleMutex.RUnlock()
+	schedules := make([]*leaderschedule.LeaderSchedule, len(epochs))
+	for i, epoch := range epochs {
+		if instance.leaderSchedule != nil {
+			schedules[i] = instance.leaderSchedule
+		} else {
+			schedules[i] = instance.leaderSchedules[epoch]
+		}
+	}
+	return schedules
 }
 
 func LeaderForSlot(slot uint64) (solana.PublicKey, bool) {
