@@ -1,0 +1,35 @@
+[Unit]
+Description=Mithril read-only dashboard reader
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=exec
+User=mithril-dashboard
+Group=mithril-dashboard
+SupplementaryGroups=mithril-dashboard-feed
+ExecStart=/usr/local/bin/mithril-dashboard --node-socket /run/mithril-dashboard-feed/dashboard.sock --listen 127.0.0.1:8080 --public-origin https://dashboard.example.com
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+SystemCallArchitectures=native
+SystemCallFilter=~@mount
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+InaccessiblePaths=/srv/mithril-node /run/mithril-node
+MemoryMax=256M
+MemorySwapMax=0
+CPUQuota=50%
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

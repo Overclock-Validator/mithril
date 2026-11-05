@@ -242,6 +242,13 @@ progress; pruned history returns `-32001`, and unknown history returns `-32004`.
 
 We're actively expanding RPC method coverage. Upcoming methods include transaction simulation, send transaction, and get leader schedule.
 
+### Dashboard API
+
+Mithril can provide an opt-in, read-only status feed for a separate dashboard
+in validator or verifying mode. See the [dashboard API setup and security
+notes](docs/dashboard-api.md#private-setup). The API does not include a UI or
+control the node.
+
 ### Current Limitations
 
 - **RPC still required**: live near-tip blocks stream from turbine shreds, but RPC `getBlock` is still used for catchup and by the trailing execution verifier (Alpenglow certificates attest block *data*, not execution results, so an external oracle cross-checks execution until peer bankhash cross-checking lands).
