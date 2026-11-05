@@ -8,6 +8,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
+	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/fees"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
@@ -220,6 +221,23 @@ func TestProcessTransactionSIMD0290InvalidPayerNoOp(t *testing.T) {
 	assert.Zero(t, feeInfo.TotalFee)
 	assert.Equal(t, uint64(12_345), computeUnits)
 	payerAfter, err := slotCtx.GetAccount(txfixture.PayerPubkey())
+	require.NoError(t, err)
+	assert.Equal(t, payerBefore, payerAfter.Lamports)
+	assert.Empty(t, slotCtx.ModifiedAccts)
+
+	block := &b.Block{Transactions: []*solana.Transaction{tx}}
+	plan := blockTransactionExecutionPlan{execute: []bool{true}}
+	feeTotal, recordedCU, err := sequentialTxLoop(slotCtx, &sigverify, block, plan, nil, false)
+	sigverify.Wait()
+	require.NoError(t, err)
+	assert.Zero(t, feeTotal.TotalFees)
+	assert.Equal(t, uint64(12_345), recordedCU)
+	assert.Equal(t, uint64(1), slotCtx.TransactionCounts.Total)
+	assert.Equal(t, uint64(1), slotCtx.TransactionCounts.NonVote)
+	assert.Equal(t, uint64(1), slotCtx.TransactionCounts.Failed)
+	assert.Equal(t, uint64(1), slotCtx.TransactionCounts.NonVoteFailed)
+	assert.Equal(t, uint64(12_345), slotCtx.TransactionCounts.ComputeUnits)
+	payerAfter, err = slotCtx.GetAccount(txfixture.PayerPubkey())
 	require.NoError(t, err)
 	assert.Equal(t, payerBefore, payerAfter.Lamports)
 	assert.Empty(t, slotCtx.ModifiedAccts)

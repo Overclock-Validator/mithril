@@ -218,9 +218,15 @@ func TestRetransmitterVerifiesParentResignsAndDeduplicates(t *testing.T) {
 	t.Cleanup(func() {
 		cancel()
 		<-done
+		var payloadBytes uint64
+		for _, call := range sender.packets() {
+			payloadBytes += uint64(len(call.packet)) * uint64(len(call.peers))
+		}
+		require.Equal(t, payloadBytes, retransmitter.Stats().SentPayloadBytes)
 	})
 
-	require.NoError(t, retransmitter.Submit(packet, shred, leaderPub, false))
+	wire := append(append([]byte(nil), packet...), 1, 2, 3, 4)
+	require.NoError(t, retransmitter.Submit(wire, shred, leaderPub, false))
 	select {
 	case <-sender.wake:
 	case <-time.After(time.Second):
@@ -229,6 +235,7 @@ func TestRetransmitterVerifiesParentResignsAndDeduplicates(t *testing.T) {
 	sent := sender.packets()
 	require.Len(t, sent, 1)
 	require.NotEmpty(t, sent[0].peers)
+	require.Len(t, sent[0].packet, len(shred.Payload), "only the canonical payload is relayed and counted")
 	forwarded, err := ParseShred(sent[0].packet)
 	require.NoError(t, err)
 	forwardedSignature, err := forwarded.RetransmitterSignature()
@@ -301,6 +308,7 @@ func TestRetransmitterRejectsInvalidParentSignature(t *testing.T) {
 	require.True(t, errors.Is(err, ErrInvalidRetransmitterSignature))
 	stats := retransmitter.Stats()
 	require.Equal(t, uint64(1), stats.InvalidParentSignatures)
+	require.Zero(t, stats.SentPayloadBytes)
 	require.Equal(t, uint64(1), stats.ParentDiagnosticSamples)
 	require.Equal(t, uint64(1), stats.ParentSignerFound)
 	require.Equal(t, uint64(0), stats.ParentSignerNotFound)
@@ -423,6 +431,83 @@ func TestReceiverRejectsWrongShredVersion(t *testing.T) {
 	require.Equal(t, uint64(0), receiver.Stats().DataShreds)
 }
 
+func TestRetransmitSentPayloadBytes(t *testing.T) {
+	peers := []*net.UDPAddr{{Port: 8001}, {Port: 8002}, {Port: 8003}, {Port: 8004}}
+	for _, test := range []struct {
+		name    string
+		results []scriptedSendResult
+		payload []byte
+		peers   []*net.UDPAddr
+		bytes   uint64
+		packets uint64
+	}{
+		{name: "full", payload: []byte{1, 2, 3}, peers: peers, bytes: 12, packets: 4},
+		{name: "full_with_error", results: []scriptedSendResult{{sent: 4, err: syscall.ENOBUFS}}, payload: []byte{1, 2, 3}, peers: peers, bytes: 12, packets: 4},
+		{name: "retry_prefixes", results: []scriptedSendResult{{sent: 2}, {sent: 1, err: syscall.ENOBUFS}, {sent: 1}}, payload: []byte{1, 2, 3}, peers: peers, bytes: 12, packets: 4},
+		{name: "exhausted", results: []scriptedSendResult{{err: syscall.ENOBUFS}, {err: syscall.ENOBUFS}, {err: syscall.ENOBUFS}}, payload: []byte{1, 2, 3}, peers: peers},
+		{name: "negative_then_retry", results: []scriptedSendResult{{sent: -1, err: syscall.ENOBUFS}, {sent: 2}, {sent: 2}}, payload: []byte{1, 2, 3}, peers: peers, bytes: 12, packets: 4},
+		{name: "over_report", results: []scriptedSendResult{{sent: 5}}, payload: []byte{1, 2, 3}, peers: peers, packets: 4},
+		{name: "over_report_with_error", results: []scriptedSendResult{{sent: 5, err: syscall.ENOBUFS}}, payload: []byte{1, 2, 3}, peers: peers, packets: 4},
+		{name: "valid_prefix_then_over_report", results: []scriptedSendResult{{sent: 2}, {sent: 3}}, payload: []byte{1, 2, 3}, peers: peers, bytes: 6, packets: 4},
+		{name: "empty_payload", peers: peers, packets: 4},
+		{name: "no_peers", payload: []byte{1, 2, 3}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			r := &Retransmitter{}
+			sender := &scriptedBatchSender{results: test.results}
+			r.sendToPeers(test.payload, test.peers, sender)
+			stats := r.Stats()
+			require.Equal(t, test.bytes, stats.SentPayloadBytes)
+			require.Equal(t, test.packets, stats.SentPackets, "legacy packet accounting is unchanged")
+		})
+	}
+
+	r := &Retransmitter{cfg: RetransmitConfig{ShredReceivers: peers}}
+	sender := &scriptedBatchSender{}
+	r.sendToShredReceivers([]byte{1, 2, 3}, sender)
+	require.Equal(t, uint64(4), r.Stats().ShredReceiverSent)
+	require.Zero(t, r.Stats().SentPayloadBytes, "auxiliary copies are not peer traffic")
+	r.sendToPeers([]byte{1, 2, 3}, peers[:2], sender)
+	r.sendToPeers([]byte{1, 2, 3, 4, 5}, peers[:2], sender)
+	require.Equal(t, uint64(16), r.Stats().SentPayloadBytes, "payload lengths are counted separately")
+	require.Zero(t, (&Retransmitter{}).Stats().SentPayloadBytes)
+	require.Zero(t, (*Retransmitter)(nil).Stats().SentPayloadBytes)
+}
+
+func TestRetransmitSentPayloadBytesConcurrentStats(t *testing.T) {
+	r := &Retransmitter{}
+	peers := []*net.UDPAddr{{Port: 8001}, {Port: 8002}}
+	var writers sync.WaitGroup
+	t.Cleanup(writers.Wait)
+	for range 2 {
+		writers.Add(1)
+		go func() {
+			defer writers.Done()
+			for range 100 {
+				r.sendToPeers([]byte{1, 2, 3}, peers, &discardRelaySender{})
+			}
+		}()
+	}
+	for range 100 {
+		require.LessOrEqual(t, r.Stats().SentPayloadBytes, uint64(1200))
+	}
+	writers.Wait()
+	require.Equal(t, uint64(1200), r.Stats().SentPayloadBytes)
+}
+
+func TestReceiverRetransmitPayloadPresence(t *testing.T) {
+	r := NewUDPReceiver("127.0.0.1:0")
+	require.False(t, r.Stats().RetransmitEnabled)
+	r.retransmitter = &Retransmitter{}
+	stats := r.Stats()
+	require.True(t, stats.RetransmitEnabled)
+	require.Zero(t, stats.Retransmit.SentPayloadBytes)
+	r.retransmitter.sendToPeers([]byte{1, 2, 3}, []*net.UDPAddr{{Port: 8001}, {Port: 8002}}, &discardRelaySender{})
+	stats = r.Stats()
+	require.True(t, stats.RetransmitEnabled)
+	require.Equal(t, uint64(6), stats.Retransmit.SentPayloadBytes)
+}
+
 func TestReceiverNeverRetransmitsDedicatedRepairSocketPackets(t *testing.T) {
 	leaderPub, leaderKey := testIdentity(t)
 	gen := ShredGenerator{Slot: 93, ParentSlot: 92, Version: 7}
@@ -442,6 +527,7 @@ func TestReceiverNeverRetransmitsDedicatedRepairSocketPackets(t *testing.T) {
 	require.Equal(t, uint64(1), stats.Retransmit.RepairShreds)
 	require.Equal(t, uint64(0), stats.Retransmit.Submitted)
 	require.Equal(t, uint64(0), stats.Retransmit.QueueDrops)
+	require.Zero(t, stats.Retransmit.SentPayloadBytes)
 }
 
 func TestRetransmitterSignatureOffsetForDataAndCodingShreds(t *testing.T) {

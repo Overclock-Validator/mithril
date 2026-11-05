@@ -37,10 +37,11 @@ func TestAdoptLocalLeaderBlockUsesProducerSlotCtx(t *testing.T) {
 	key := solana.PublicKey{0x11}
 	acct := &accounts.Account{Key: key, Lamports: 42, Data: []byte{9}}
 	slotCtx := &sealevel.SlotCtx{
-		Slot:          20,
-		Accounts:      accounts.NewMemAccounts(),
-		ModifiedAccts: map[solana.PublicKey]bool{key: true},
-		FinalBankhash: append([]byte{8}, make([]byte, 31)...),
+		Slot:              20,
+		TransactionCounts: sealevel.BankTransactionCounts{Total: 1, NonVote: 1, ComputeUnits: 150},
+		Accounts:          accounts.NewMemAccounts(),
+		ModifiedAccts:     map[solana.PublicKey]bool{key: true},
+		FinalBankhash:     append([]byte{8}, make([]byte, 31)...),
 	}
 	require.NoError(t, slotCtx.SetAccount(key, acct))
 	bankSysvars, err := sealevel.NewBankSysvars(20, &accounts.Account{
@@ -53,17 +54,26 @@ func TestAdoptLocalLeaderBlockUsesProducerSlotCtx(t *testing.T) {
 	RegisterLocalLeaderCommit(slotCtx)
 
 	block := &b.Block{Slot: 20, ParentSlot: 19, FromLocalProduction: true}
+	subject := solana.PublicKey{7}
+	block.EnableCertificateObservation(subject)
+	observation := b.CertificateObservation{VoteAccount: subject, Reward: b.CertificateMembership{Included: true}}
+	block.RecordCertificateObservation(observation)
 	persisted := &persistedTracker{}
 	var tail *unrootedTail // classic replay passes a typed nil through the interface
 	got, err := adoptLocalLeaderBlock(block, tail, NewTransactionStatusCache(), persisted)
 	require.NoError(t, err)
 	require.Same(t, slotCtx, got)
+	require.Equal(t, uint64(150), got.TransactionCounts.ComputeUnits, "adoption retains actual producer execution work")
+	require.Zero(t, got.TotalComputeUnitsConsumed, "the older replay-only field is not populated by production")
+	captured, ok := block.CertificateObservation()
+	require.True(t, ok)
+	require.Equal(t, observation, captured, "adoption must not clear the producer's compact result")
 
 	slot, hash := persisted.Get()
 	require.Equal(t, uint64(20), slot)
 	require.Equal(t, slotCtx.FinalBankhash, hash)
 
-	_, ok := TakeLocalLeaderCommit(20)
+	_, ok = TakeLocalLeaderCommit(20)
 	require.False(t, ok, "adopt must consume the registered SlotCtx")
 }
 

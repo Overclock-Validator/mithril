@@ -147,6 +147,7 @@ func transferTransactions(t *testing.T, n int, firstSeq uint64) []*solana.Transa
 }
 
 type groupExecutionOutcome struct {
+	counts              sealevel.BankTransactionCounts
 	payer, dest         uint64
 	fees                uint64
 	cu                  uint64
@@ -171,6 +172,7 @@ func runGroups(t *testing.T, txParallelism int, payerLamports uint64, txs []*sol
 	parentPayer, err := env.parent.GetAccountWithoutLock(txfixture.PayerPubkey())
 	require.NoError(t, err)
 	return groupExecutionOutcome{
+		counts:              env.exec.slotCtx.TransactionCounts,
 		payer:               env.lamports(t, txfixture.PayerPubkey()),
 		dest:                env.lamports(t, txfixture.DestPubkey()),
 		fees:                env.exec.txFeeAccumulator.TotalFees,
@@ -246,6 +248,7 @@ func TestExecuteTransactionGroupMatchesWholeBlock(t *testing.T) {
 		require.Equal(t, reference.sigs, single.sigs)
 		require.Equal(t, reference.executeMask, single.executeMask)
 		require.Equal(t, reference.modified, single.modified)
+		require.Equal(t, sealevel.BankTransactionCounts{Total: 48, NonVote: 48, Failed: 46, NonVoteFailed: 46, ComputeUnits: single.cu}, single.counts)
 		require.Equal(t, uint64(payerLamports), single.parentPayerLamports, "parent image must stay pristine")
 
 		rng := rand.New(rand.NewSource(int64(7 + txParallelism)))
@@ -277,6 +280,7 @@ func TestExecuteTransactionGroupRejectsDuplicatesAcrossGroups(t *testing.T) {
 	// The rejected group must not have been recorded or executed.
 	require.Len(t, env.exec.transactions, 2)
 	require.Equal(t, uint64(2), env.exec.processedTxCount)
+	require.Equal(t, uint64(2), env.exec.slotCtx.TransactionCounts.Total)
 }
 
 func TestExecuteTransactionGroupRejectsV1BeforeActivation(t *testing.T) {

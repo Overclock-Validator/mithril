@@ -98,7 +98,9 @@ func TestLeaderFailedTransactionsMatchReplay(t *testing.T) {
 		tx       func(t *testing.T) *solana.Transaction
 		included bool
 	}{
-		{name: "success", tx: func(t *testing.T) *solana.Transaction { return mustSignBankTestTransaction(t, transfer(1, txfixture.DestPubkey())) }, included: true},
+		{name: "success", tx: func(t *testing.T) *solana.Transaction {
+			return mustSignBankTestTransaction(t, transfer(1, txfixture.DestPubkey()))
+		}, included: true},
 		{name: "instruction error", tx: func(t *testing.T) *solana.Transaction {
 			return mustSignBankTestTransaction(t, transfer(20_000_000_000, txfixture.DestPubkey()))
 		}, included: true},
@@ -129,11 +131,18 @@ func TestLeaderFailedTransactionsMatchReplay(t *testing.T) {
 			if tc.payer != 0 {
 				setPayerLamports(t, validator, tc.payer)
 			}
-			feeInfo, _, _ := replay.ProcessTransaction(validator.SlotCtx, &sync.WaitGroup{}, tx, nil, nil, nil, false)
+			feeInfo, computeUnits, _ := replay.ProcessTransaction(validator.SlotCtx, &sync.WaitGroup{}, tx, nil, nil, nil, false)
 			require.Equal(t, tc.included, feeInfo != nil, "replay must accept exactly what the leader includes")
 			if !tc.included {
+				assert.Zero(t, leader.SlotCtx.TransactionCounts)
 				return
 			}
+			if tc.name == "success" {
+				require.Positive(t, computeUnits)
+			}
+			assert.Equal(t, uint64(1), leader.SlotCtx.TransactionCounts.Total)
+			assert.False(t, leader.SlotCtx.TransactionCounts.Saturated)
+			assert.Equal(t, computeUnits, leader.SlotCtx.TransactionCounts.ComputeUnits)
 			assert.Equal(t, feeInfo.TotalFee, leader.Bank.TxFeeAccumulator().TotalFees)
 			for _, key := range []solana.PublicKey{txfixture.PayerPubkey(), txfixture.DestPubkey(), newAccount} {
 				assert.Equal(t, bankLamports(t, validator.SlotCtx, key), bankLamports(t, leader.SlotCtx, key), "%s", key)

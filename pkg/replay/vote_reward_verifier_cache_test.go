@@ -9,10 +9,26 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/epochstakes"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
+	"github.com/Overclock-Validator/mithril/pkg/rewardcerts"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestCloneValidatedRewardCertPreservesMetadataAndCopiesValidators(t *testing.T) {
+	var vote solana.PublicKey
+	vote[0] = 1
+	original := &rewardcerts.ValidatedRewardCert{
+		RewardSlot: 123,
+		Epoch:      4,
+		Validators: map[solana.PublicKey]struct{}{vote: {}},
+	}
+	clone := cloneValidatedRewardCert(original)
+	require.Equal(t, original, clone)
+	delete(clone.Validators, vote)
+	assert.Contains(t, original.Validators, vote)
+	assert.Nil(t, cloneValidatedRewardCert(nil))
+}
 
 func TestVoteRewardVerifierCacheReusesIdenticalAndRejectsChangedEpochMaterial(t *testing.T) {
 	const epoch = uint64(9_000_000_017)

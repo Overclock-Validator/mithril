@@ -18,6 +18,9 @@ jobs:
       - name: Build
         run: go build -v ./cmd/mithril
 
+      - name: Build dashboard reader
+        run: go build -v ./cmd/mithril-dashboard
+
   regression-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -33,13 +36,43 @@ jobs:
         with:
           go-version: 1.27.3
 
+      - name: Dashboard data-owner race regressions
+        run: |
+          set -euo pipefail
+          full_log="$(mktemp "$RUNNER_TEMP/dashboard-owners-full.XXXXXX")"
+          focused_log="$(mktemp "$RUNNER_TEMP/dashboard-owners-focused.XXXXXX")"
+          trap 'rm -f "$full_log" "$focused_log"' EXIT
+          timeout 360s go test -race -p 1 -count=1 -timeout=120s -v \
+            ./pkg/metrics ./pkg/snapshot \
+            ./pkg/accountsdb ./pkg/gossip ./pkg/harmonic | tee "$full_log"
+          timeout 360s go test -race -p 1 -count=1 -timeout=120s -v \
+            -run '^TestQueuePressureNativeBounds$' \
+            ./pkg/tpu/... | tee "$focused_log"
+          for name in \
+            TestHostSamplerLinuxCapture TestProcessRSSBreakdownLiveLinux \
+            TestDashboardManifestFailureDoesNotPublish TestDashboardManifestBuilderPublishesOnlySuccessfulParses \
+            TestAutoBuilderStopsBeforeIngestOnShardFailure \
+            TestCommonTiersTransitionsAndOwnership TestCommonTiersCollisionAndConcurrentAccess \
+            TestCompactionLiveRecords TestCompactComparatorLegacyEquivalence \
+            TestMonitoringConcurrentReadersAndPublisher TestMonitoringPeersRequireVerifiedMatchingContact \
+            TestPullRequestPacketLoopCountsActualWrites; do
+            grep -q "^--- PASS: $name " "$full_log"
+          done
+          for name in \
+            TestQueuePressureNativeBounds; do
+            grep -q "^--- PASS: $name " "$focused_log"
+          done
+
       - name: Voting, checkpoint, streaming and scheduler race regressions
-        # Run the complete affected package suites, including subprocess crash
+        # Run these complete package suites, including subprocess crash
         # recovery and cancellation tests.
         run: >-
           go test -race -p 2 -count=1
           ./pkg/alpenglow ./pkg/consensus ./pkg/replay ./pkg/rewards
           ./pkg/rpcserver ./pkg/epochrewards
+          ./pkg/dashboard/... ./pkg/blockstream
+          ./pkg/block ./pkg/epochstakes ./pkg/global ./pkg/leaderschedule
+          ./pkg/progress ./pkg/rewardcerts ./pkg/state
           ./pkg/turbine ./pkg/sigverify ./pkg/blockprod/...
           ./cmd/mithril/node ./cmd/mithril/configcmd
 
