@@ -67,6 +67,14 @@ func BenchmarkRetransmitPipeline(b *testing.B) {
 			if r.queueDrops.Load() != 0 {
 				b.Fatal("unexpected queue drop")
 			}
+			stats := r.Stats()
+			if stats.Submitted != uint64(b.N) || stats.TargetPackets != stats.PacketAttempts || stats.PacketAttempts != stats.SentPackets || stats.SendErrors != 0 {
+				b.Fatal("benchmark did not complete the expected no-error relay work")
+			}
+			b.ReportMetric(float64(stats.Submitted)/float64(b.N), "submitted/op")
+			b.ReportMetric(float64(stats.SentPackets)/float64(b.N), "accepted-packets/op")
+			b.ReportMetric(float64(stats.SentShreds)/float64(b.N), "nonempty-batches/op")
+			b.ReportMetric(float64(stats.NoPeers)/float64(b.N), "no-peers/op")
 		})
 	}
 }

@@ -183,6 +183,7 @@ func (env *lifecycleEnv) block(txs []*solana.Transaction) *b.Block {
 }
 
 type lifecycleOutcome struct {
+	counts        sealevel.BankTransactionCounts
 	bankhash      []byte
 	numSignatures uint64
 	computeUnits  uint64
@@ -202,6 +203,7 @@ func lifecycleOutcomeOf(t *testing.T, slotCtx *sealevel.SlotCtx, tail *lifecycle
 	}
 	require.Contains(t, delta, txfixture.PayerPubkey())
 	return lifecycleOutcome{
+		counts:        slotCtx.TransactionCounts,
 		bankhash:      append([]byte(nil), slotCtx.FinalBankhash...),
 		numSignatures: slotCtx.NumSignatures,
 		computeUnits:  slotCtx.TotalComputeUnitsConsumed,
@@ -216,6 +218,8 @@ func requireSameLifecycleOutcome(t *testing.T, want, got lifecycleOutcome) {
 	require.Equal(t, want.bankhash, got.bankhash, "bank hash")
 	require.Equal(t, want.numSignatures, got.numSignatures)
 	require.Equal(t, want.computeUnits, got.computeUnits)
+	require.Equal(t, want.counts, got.counts)
+	require.Equal(t, want.computeUnits, got.counts.ComputeUnits)
 	require.Equal(t, want.lamportsBurnt, got.lamportsBurnt)
 	wantKeys := make([]string, 0, len(want.delta))
 	for key := range want.delta {
@@ -324,6 +328,7 @@ func TestStreamingLifecycleMatchesWholeBlock(t *testing.T) {
 	txCountBefore := global.TransactionCount()
 
 	whole := lifecycleWholeBlock(t, newLifecycleEnv(t), txs, 0)
+	require.Equal(t, sealevel.BankTransactionCounts{Total: 12, NonVote: 12, Failed: 10, NonVoteFailed: 10, ComputeUnits: whole.computeUnits}, whole.counts)
 	require.Equal(t, txCountBefore+uint64(len(txs)), global.TransactionCount())
 	wholeParallel := lifecycleWholeBlock(t, newLifecycleEnv(t), txs, 4)
 	requireSameLifecycleOutcome(t, whole, wholeParallel)

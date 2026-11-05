@@ -26,6 +26,22 @@ func waitForBlockSourceCondition(t *testing.T, condition func() bool) {
 	t.Fatal("timed out waiting for block source condition")
 }
 
+func TestPrewarmHandoverReturnsSortedSpool(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+	pw := &TurbinePrewarm{done: done, cancel: func() {}, dropped: 2, spool: map[uint64]*b.Block{
+		9: {Slot: 9}, 3: {Slot: 3},
+	}}
+	blocks, dropped := pw.Handover()
+	if len(blocks) != 2 || blocks[0].Slot != 3 || blocks[1].Slot != 9 || dropped != 2 {
+		t.Fatalf("unexpected handover: blocks=%v dropped=%d", blocks, dropped)
+	}
+	blocks, dropped = pw.Handover()
+	if len(blocks) != 0 || dropped != 2 {
+		t.Fatalf("repeated handover returned prior blocks: blocks=%v dropped=%d", blocks, dropped)
+	}
+}
+
 // A rooted Alpenglow fork recovery starts a replacement BlockSource in the
 // same process and reuses the configured TVU address. The abandoned source
 // must synchronously release that socket first; otherwise every replacement

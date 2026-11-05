@@ -26,11 +26,12 @@ func TestVotorBroadcasterPreconnectsBeforeFirstMessageAndDeliversDatagram(t *tes
 	}
 	received := make(chan receivedMessage, 1)
 	receiver, err := NewReceiver(ReceiverConfig{
-		BindAddr:     "127.0.0.1:0",
-		Identity:     identityHolder(t, serverIdentity),
-		ShredVersion: 0x1234,
-		LogInterval:  -1,
-		AdmitPeer:    func(peer solana.PublicKey) bool { return peer == clientPubkey },
+		RecordApplicationPayload: true,
+		BindAddr:                 "127.0.0.1:0",
+		Identity:                 identityHolder(t, serverIdentity),
+		ShredVersion:             0x1234,
+		LogInterval:              -1,
+		AdmitPeer:                func(peer solana.PublicKey) bool { return peer == clientPubkey },
 		AdmitMessage: func(peer solana.PublicKey, message Message) (Message, bool) {
 			received <- receivedMessage{peer: peer, message: message}
 			return Message{}, false
@@ -42,8 +43,9 @@ func TestVotorBroadcasterPreconnectsBeforeFirstMessageAndDeliversDatagram(t *tes
 	peerAddr, ok := receiver.Addr().(*net.UDPAddr)
 	require.True(t, ok)
 	broadcaster, err := NewVotorBroadcaster(VotorBroadcasterConfig{
-		Identity:     identityHolder(t, clientIdentity),
-		ShredVersion: 0x1234,
+		RecordApplicationPayload: true,
+		Identity:                 identityHolder(t, clientIdentity),
+		ShredVersion:             0x1234,
 		Peers: func() []VotorPeer {
 			return []VotorPeer{{Identity: serverPubkey, Addr: cloneUDPAddr(peerAddr)}}
 		},
@@ -81,6 +83,17 @@ func TestVotorBroadcasterPreconnectsBeforeFirstMessageAndDeliversDatagram(t *tes
 		return stats.PeerSends == 1 && stats.Connections == 1
 	}, time.Second, 10*time.Millisecond)
 	require.EqualValues(t, 1, receiver.Stats().DatagramsReceived)
+	wireVote := vote
+	wireVote.ShredVersion = 0x1234
+	wire, err := EncodeMessage(wireVote)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		bytes := broadcaster.Stats().ApplicationPayload
+		return bytes != nil && bytes.Known && bytes.Bytes == uint64(len(wire))
+	}, time.Second, time.Millisecond)
+	rx, known := receiver.ApplicationPayloadObservation()
+	require.True(t, known && rx.Known)
+	require.EqualValues(t, len(wire), rx.Bytes)
 }
 
 func TestVotorBroadcasterRejectsUnexpectedServerIdentity(t *testing.T) {

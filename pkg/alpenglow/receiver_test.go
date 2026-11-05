@@ -18,9 +18,10 @@ func TestReceiverDecodesVotorVoteFromQUICDatagram(t *testing.T) {
 	clientPubkey := testVotorPubkey(clientIdentity)
 	observer := NewObserver()
 	receiver, err := NewReceiver(ReceiverConfig{
-		BindAddr:     "127.0.0.1:0",
-		ShredVersion: 0x1234,
-		LogInterval:  -1,
+		RecordApplicationPayload: true,
+		BindAddr:                 "127.0.0.1:0",
+		ShredVersion:             0x1234,
+		LogInterval:              -1,
 		AdmitPeer: func(peer solana.PublicKey) bool {
 			return peer == clientPubkey
 		},
@@ -46,6 +47,9 @@ func TestReceiverDecodesVotorVoteFromQUICDatagram(t *testing.T) {
 	require.EqualValues(t, 1, stats.MessagesDecoded)
 	require.EqualValues(t, 1, stats.VotesDecoded)
 	require.EqualValues(t, 42, stats.LatestVoteSlot)
+	bytes, known := receiver.ApplicationPayloadObservation()
+	require.True(t, known && bytes.Known)
+	require.EqualValues(t, len(payload), bytes.Bytes)
 }
 
 func TestReceiverAcceptsAgaveStyleUntrustedCertificateSignature(t *testing.T) {
@@ -226,12 +230,16 @@ func TestReceiverLimitsConnectionsPerAuthenticatedPeer(t *testing.T) {
 
 	first := dialVotorQUIC(t, receiver.Addr().String(), clientIdentity)
 	second := dialVotorQUIC(t, receiver.Addr().String(), clientIdentity)
-	third := dialVotorQUIC(t, receiver.Addr().String(), clientIdentity)
 	t.Cleanup(func() {
 		_ = first.CloseWithError(0, "test done")
 		_ = second.CloseWithError(0, "test done")
-		_ = third.CloseWithError(0, "test done")
 	})
+	require.Eventually(t, func() bool {
+		return receiver.Stats().ConnectionsAccepted == 2
+	}, 2*time.Second, 10*time.Millisecond)
+
+	third := dialVotorQUIC(t, receiver.Addr().String(), clientIdentity)
+	t.Cleanup(func() { _ = third.CloseWithError(0, "test done") })
 
 	require.Eventually(t, func() bool {
 		stats := receiver.Stats()
@@ -247,9 +255,10 @@ func TestReceiverCountsMalformedVotorDatagram(t *testing.T) {
 	clientIdentity := ed25519.NewKeyFromSeed(bytesOf(7, ed25519.SeedSize))
 	observer := NewObserver()
 	receiver, err := NewReceiver(ReceiverConfig{
-		BindAddr:    "127.0.0.1:0",
-		LogInterval: -1,
-		AdmitPeer:   func(solana.PublicKey) bool { return true },
+		RecordApplicationPayload: true,
+		BindAddr:                 "127.0.0.1:0",
+		LogInterval:              -1,
+		AdmitPeer:                func(solana.PublicKey) bool { return true },
 	}, observer)
 	require.NoError(t, err)
 	runVotorReceiver(t, receiver)
@@ -261,15 +270,19 @@ func TestReceiverCountsMalformedVotorDatagram(t *testing.T) {
 		return receiver.Stats().DecodeErrors == 1
 	}, 2*time.Second, 10*time.Millisecond)
 	require.Zero(t, observer.Snapshot().VotesObserved)
+	bytes, known := receiver.ApplicationPayloadObservation()
+	require.True(t, known && bytes.Known)
+	require.EqualValues(t, 1, bytes.Bytes)
 }
 
 func TestReceiverDatagramRateLimit(t *testing.T) {
 	clientIdentity := ed25519.NewKeyFromSeed(bytesOf(8, ed25519.SeedSize))
 	receiver, err := NewReceiver(ReceiverConfig{
-		BindAddr:              "127.0.0.1:0",
-		LogInterval:           -1,
-		MaxDatagramsPerSecond: 1,
-		AdmitPeer:             func(solana.PublicKey) bool { return true },
+		RecordApplicationPayload: true,
+		BindAddr:                 "127.0.0.1:0",
+		LogInterval:              -1,
+		MaxDatagramsPerSecond:    1,
+		AdmitPeer:                func(solana.PublicKey) bool { return true },
 	}, NewObserver())
 	require.NoError(t, err)
 	runVotorReceiver(t, receiver)
@@ -286,6 +299,9 @@ func TestReceiverDatagramRateLimit(t *testing.T) {
 		stats := receiver.Stats()
 		return stats.DatagramsReceived == 1 && stats.RateLimitedDatagrams == 1
 	}, 2*time.Second, 10*time.Millisecond)
+	bytes, known := receiver.ApplicationPayloadObservation()
+	require.True(t, known && bytes.Known)
+	require.EqualValues(t, 2*len(payload), bytes.Bytes)
 }
 
 func runVotorReceiver(t *testing.T, receiver *Receiver) {
