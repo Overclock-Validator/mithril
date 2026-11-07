@@ -19,7 +19,7 @@ func TestNetworkMonitoringUsesBoundedImmutableObservations(t *testing.T) {
 		ParseErrors: 5, SignatureErrors: 6, UsefulRepairShreds: 7, SpooledRepairShreds: 8,
 		LastPacketUnix: now.Unix(), Repair: turbine.RepairStats{Requests: 9, Responses: 10, LateResponses: 11, Timeouts: 12, Errors: 13}}
 	frontiers := turbine.ShredFrontiers{HasObserved: true, HasReconstructed: true, ObservedSlot: 123, ReconstructedSlot: 120}
-	bs.publishTurbineObservation(now, now, 1, true, stats, frontiers)
+	bs.publishTurbineObservation(now, now, 1, true, stats, frontiers, turbine.ReceiverSocketMemory{}, false)
 	if bs.turbineObservation.Load() != nil {
 		t.Fatal("disabled monitoring published a sample")
 	}
@@ -47,7 +47,7 @@ func TestNetworkMonitoringUsesBoundedImmutableObservations(t *testing.T) {
 	stats.EvictedSlots, stats.IgnoredOldShreds, stats.SigVerifies, stats.SigVerifyCached = 14, 15, 16, 17
 	stats.Repair.Outstanding, stats.Repair.Peers, stats.Repair.RespondingPeers = 18, 19, 20
 	stats.RetransmitEnabled, stats.Retransmit.SentPayloadBytes = true, 1<<53+2
-	bs.publishTurbineObservation(now, now.Add(-time.Minute), 1, true, stats, frontiers)
+	bs.publishTurbineObservation(now, now.Add(-time.Minute), 1, true, stats, frontiers, turbine.ReceiverSocketMemory{}, false)
 	s, _ = bs.NetworkSnapshot()
 	want := TurbineObservation{SampledAt: now.UTC(), StartedAt: now.Add(-time.Minute).UTC(), Session: 1,
 		Packets: stats.Packets, DataShreds: 3, CodingShreds: 4, ParseErrors: 5, SignatureErrors: 6, MissingLeaders: 21, ShredVersionMismatch: 1<<53 + 3,
@@ -80,7 +80,7 @@ func TestNetworkMonitoringUsesBoundedImmutableObservations(t *testing.T) {
 	if next, _ := bs.NetworkSnapshot(); next.Turbine != nil {
 		t.Fatal("reconnected receiver inherited the previous session")
 	}
-	bs.publishTurbineObservation(now.Add(time.Minute), now.Add(time.Minute), 2, false, turbine.ReceiverStats{}, turbine.ShredFrontiers{})
+	bs.publishTurbineObservation(now.Add(time.Minute), now.Add(time.Minute), 2, false, turbine.ReceiverStats{}, turbine.ShredFrontiers{}, turbine.ReceiverSocketMemory{}, false)
 	if next, _ := bs.NetworkSnapshot(); next.Turbine.RetransmitEnabled || next.Turbine.PeerPayloadBytes != 0 {
 		t.Fatal("replacement receiver inherited relay presence or bytes")
 	}
@@ -108,7 +108,7 @@ func TestNetworkMonitoringConcurrentPublication(t *testing.T) {
 	}
 	for i := range 1000 {
 		bs.setMonitoredGossip(&gossip.Client{})
-		bs.publishTurbineObservation(now, now, 1, true, turbine.ReceiverStats{Packets: uint64(i)}, turbine.ShredFrontiers{HasObserved: true, ObservedSlot: uint64(i)})
+		bs.publishTurbineObservation(now, now, 1, true, turbine.ReceiverStats{Packets: uint64(i)}, turbine.ShredFrontiers{HasObserved: true, ObservedSlot: uint64(i)}, turbine.ReceiverSocketMemory{}, false)
 	}
 	readers.Wait()
 }
