@@ -6,8 +6,9 @@ reverse-proxy and isolation requirements.
 
 `mithril-dashboard` reads a private status feed from one Mithril process and
 serves a read-only API. It does not start, restart or configure the node. The
-feed is disabled unless the node's socket is configured with
-`--dashboard-socket` or `dashboard.socket`.
+feed is disabled by default. Enable it with `dashboard.enabled` or
+`--dashboard-enabled`, or configure a socket explicitly with
+`dashboard.socket` or `--dashboard-socket`.
 Even with the feed disabled, this checkout records bank-level transaction
 classification and compute-unit counters during replay and block production.
 Their production overhead has not been established; disabling the feed is not
@@ -71,6 +72,46 @@ For field definitions, optional routes, and the WebSocket contract, see the
 [API reference](dashboard-api-reference.md).
 
 ## Private setup
+
+### Optional configuration-driven Linux service
+
+The example Linux service can start the separate reader automatically when the
+node creates its feed socket. This requires one-time operator provisioning:
+
+1. Create an unprivileged reader account and dedicated
+   `mithril-dashboard-feed` group. Give the reader only the feed group, and
+   verify it cannot access the node's keys, databases, processes or other IPC.
+2. Provision `/run/mithril-dashboard-feed` owned by the node's effective
+   user and the feed group, with exact mode `2710`. Arrange for the directory
+   to be recreated on reboot. Review trusted ancestors, ACLs and labels.
+3. Install the example reader service and
+   [path unit](../examples/dashboard/mithril-dashboard.path), adapting the
+   reader's account, executable and inaccessible paths. Enable the path unit
+   with `systemctl enable --now mithril-dashboard.path`. Verify the service
+   isolation as described below before using it on a validator.
+
+After provisioning, enable the feed in the node configuration:
+
+```toml
+[dashboard]
+enabled = true
+```
+
+The equivalent flag is `--dashboard-enabled`. This Linux-only profile uses
+`/run/mithril-dashboard-feed/dashboard.sock` and group
+`mithril-dashboard-feed`; it cannot be combined with a nonempty socket or
+socket-group setting. The node needs a planned restart to apply the change.
+This example uses one fixed socket and reader port per host. For multiple
+nodes, configure separate sockets, reader units and ports manually.
+The path unit starts the reader when the socket appears. The reader defaults to
+loopback and the private profile; other local processes may still reach it.
+Stopping the node leaves the reader running with unavailable or stale data.
+An unclean node exit can leave a socket that must be inspected before removal.
+If repeated starts hit systemd's start limit, the path unit can fail and must be
+inspected and restarted by the operator. This does not install a service or
+publish a URL.
+
+The following manual setup remains available on supported platforms.
 
 Build both executables from the same checkout:
 
@@ -250,7 +291,9 @@ just its public fields.
 
 For a new fixed-user deployment, copy the complete
 [reader unit](../examples/dashboard/mithril-dashboard.service) only after
-adapting its origin, paths and account names. It does not create accounts, enable
+adapting its paths and account names. It defaults to the private profile; add
+`--public-origin` only after configuring the HTTPS proxy and reviewing the
+public disclosure below. It does not create accounts, enable
 the node feed, install a service or restart the validator.
 It assumes an existing unprivileged `mithril-dashboard` account whose only
 additional group is `mithril-dashboard-feed`, an executable at the shown path,

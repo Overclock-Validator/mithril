@@ -768,6 +768,13 @@ name = "mithril"
     # to replay_timings.jsonl in each run's log directory.
 
 # ============================================================================
+# [dashboard] - Optional local dashboard feed
+# ============================================================================
+[dashboard]
+    # Linux service profile; provision the reader and feed directory first.
+    # enabled = true
+
+# ============================================================================
 # [snapshot] - Snapshot Download Settings
 # ============================================================================
 
