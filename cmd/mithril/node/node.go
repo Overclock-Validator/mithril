@@ -90,6 +90,7 @@ var (
 	legacyGenesisHash                string // explicit lineage for pre-binding AccountsDB/ledger artifacts
 	dashboardSocket                  string
 	dashboardSocketGroup             string
+	dashboardEnabled                 bool
 	dashboardHostResources           bool
 	disableMetricsServer             bool
 	blockSource                      string // "turbine", "rpc", or "lightbringer"
@@ -551,7 +552,8 @@ func init() {
 	Run.Flags().BoolVar(&disableMetricsServer, "no-metrics-server", false, "Disable the Prometheus HTTP listener (default :9090)")
 	Run.Flags().StringVar(&dashboardSocket, "dashboard-socket", "", "Private read-only dashboard socket (mode 0700 parent by default; default off)")
 	Run.Flags().StringVar(&dashboardSocketGroup, "dashboard-socket-group", "", "Dedicated Linux feed group (requires a node-owned mode 2710 socket directory)")
-	Run.Flags().BoolVar(&dashboardHostResources, "dashboard-host-resources", false, "Collect visible-host CPU/load/memory in the private dashboard feed (requires --dashboard-socket; default off)")
+	Run.Flags().BoolVar(&dashboardEnabled, "dashboard-enabled", false, "Enable the provisioned Linux dashboard feed")
+	Run.Flags().BoolVar(&dashboardHostResources, "dashboard-host-resources", false, "Collect visible-host CPU/load/memory in the private dashboard feed (requires a dashboard feed; default off)")
 
 	// [replay] section flags
 	Run.Flags().Int64Var(&txParallelism, "txpar", 0, "Transaction execution workers (>0 enables topsort parallelism; explicit 0 is sequential; unset validator mode defaults to 2x CPU cores)")
@@ -902,6 +904,12 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	disableMetricsServer = getBool("no-metrics-server", "reporting.no_metrics_server")
 	dashboardSocket = getString("dashboard-socket", "dashboard.socket")
 	dashboardSocketGroup = getString("dashboard-socket-group", "dashboard.socket_group")
+	dashboardEnabled = getBool("dashboard-enabled", "dashboard.enabled")
+	var dashboardErr error
+	dashboardSocket, dashboardSocketGroup, dashboardErr = dashboardFeedConfig(dashboardEnabled, dashboardSocket, dashboardSocketGroup, runtime.GOOS)
+	if dashboardErr != nil {
+		return dashboardErr
+	}
 	dashboardHostResources = getBool("dashboard-host-resources", "dashboard.host_resources")
 	if err := validateDashboardHostResources(dashboardHostResources, dashboardSocket); err != nil {
 		return err

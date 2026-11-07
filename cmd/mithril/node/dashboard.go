@@ -56,9 +56,22 @@ func (d *nodeDashboard) configureHostResources(enabled bool) {
 	}
 }
 
+func dashboardFeedConfig(enabled bool, socket, group, goos string) (string, string, error) {
+	if !enabled {
+		return socket, group, nil
+	}
+	if goos != "linux" {
+		return "", "", fmt.Errorf("dashboard.enabled requires the provisioned Linux service")
+	}
+	if socket != "" || group != "" {
+		return "", "", fmt.Errorf("dashboard.enabled cannot be combined with dashboard.socket or dashboard.socket_group")
+	}
+	return "/run/mithril-dashboard-feed/dashboard.sock", "mithril-dashboard-feed", nil
+}
+
 func validateDashboardHostResources(enabled bool, socket string) error {
 	if enabled && strings.TrimSpace(socket) == "" {
-		return fmt.Errorf("dashboard.host_resources requires dashboard.socket")
+		return fmt.Errorf("dashboard.host_resources requires a dashboard feed")
 	}
 	return nil
 }

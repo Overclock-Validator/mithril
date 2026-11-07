@@ -8,7 +8,8 @@ Type=exec
 User=mithril-dashboard
 Group=mithril-dashboard
 SupplementaryGroups=mithril-dashboard-feed
-ExecStart=/usr/local/bin/mithril-dashboard --node-socket /run/mithril-dashboard-feed/dashboard.sock --listen 127.0.0.1:8080 --public-origin https://dashboard.example.com
+# Loopback is not authentication; other local users can access the private API.
+ExecStart=/usr/local/bin/mithril-dashboard --node-socket /run/mithril-dashboard-feed/dashboard.sock --listen 127.0.0.1:8080
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=15
