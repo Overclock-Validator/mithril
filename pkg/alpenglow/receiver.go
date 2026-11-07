@@ -90,7 +90,6 @@ type Receiver struct {
 	cfg      ReceiverConfig
 	observer *Observer
 	listener *quic.Listener
-	socket   *net.UDPConn
 	// unregisterKey removes the certificate updater from the identity holder.
 	unregisterKey func()
 
@@ -124,17 +123,7 @@ func NewReceiver(cfg ReceiverConfig, observer *Observer) (*Receiver, error) {
 		return nil, fmt.Errorf("create Alpenglow Votor QUIC certificate: %w", err)
 	}
 
-	// Match quic.ListenAddr's concrete UDP bind, retaining ownership so the
-	// diagnostics owner can read accounting without inspecting QUIC internals.
-	addr, err := net.ResolveUDPAddr("udp", cfg.BindAddr)
-	if err != nil {
-		return nil, fmt.Errorf("listen for Alpenglow Votor QUIC on %s: %w", cfg.BindAddr, err)
-	}
-	socket, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		return nil, fmt.Errorf("listen for Alpenglow Votor QUIC on %s: %w", cfg.BindAddr, err)
-	}
-	listener, err := quic.Listen(socket, &tls.Config{
+	listener, err := quic.ListenAddr(cfg.BindAddr, &tls.Config{
 		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 			cert := certs.Get()
 			return &cert, nil
@@ -144,7 +133,7 @@ func NewReceiver(cfg ReceiverConfig, observer *Observer) (*Receiver, error) {
 		MinVersion: tls.VersionTLS13,
 	}, newVotorQUICConfig())
 	if err != nil {
-		return nil, fmt.Errorf("listen for Alpenglow Votor QUIC on %s: %w", cfg.BindAddr, errors.Join(err, socket.Close()))
+		return nil, fmt.Errorf("listen for Alpenglow Votor QUIC on %s: %w", cfg.BindAddr, err)
 	}
 
 	// New connections present the swapped identity once the updater returns;
@@ -159,7 +148,6 @@ func NewReceiver(cfg ReceiverConfig, observer *Observer) (*Receiver, error) {
 		cfg:              cfg,
 		observer:         observer,
 		listener:         listener,
-		socket:           socket,
 		unregisterKey:    unregisterKey,
 		conns:            make(map[*quic.Conn]receiverConnection),
 		connsByIP:        make(map[string]int),
@@ -243,13 +231,7 @@ func (r *Receiver) Close() error {
 		_ = conn.CloseWithError(0, "alpenglow receiver closed")
 	}
 	if errors.Is(err, quic.ErrServerClosed) {
-		err = nil
-	}
-	if r.socket != nil {
-		closeErr := r.socket.Close()
-		if !errors.Is(closeErr, net.ErrClosed) {
-			err = errors.Join(err, closeErr)
-		}
+		return nil
 	}
 	return err
 }
