@@ -8,9 +8,6 @@ service. It does not read keys, node configuration, or a local validator feed.
 go run ./cmd/mithril-dashboard-collect --profile alpenglow --output /existing/private-directory/cluster.json
 ```
 
-Add `--performance-sample` for one recent RPC sample, or
-`--performance-history` for up to 120 samples.
-
 Provision the directory and reader group separately. The cache is written with
 mode `0640`; a setgid directory can supply the intended reader group. A scheduler
 may invoke the command periodically (for example once per minute). Do not run it
