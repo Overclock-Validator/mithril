@@ -40,7 +40,7 @@ func TestProgressFoldPublishesFrontierWithoutNextBlock(t *testing.T) {
 	p.completed(CompletedBlock{At: time.Now().Add(-time.Minute), Slot: 39}, 31, true)
 	before, _ := p.Snapshot()
 	for _, phase := range []string{"running", "halted"} {
-		p.settledOutcomes(39, CertificateOutcomeSummary{}, LeaderOutcomeSummary{}, SlotHistorySummary{}, ChainActivitySummary{}, EpochOutcomeSummary{Through: 39}, RewardHealthSummary{})
+		p.settledOutcomes(39, CertificateOutcomeSummary{}, LeaderOutcomeSummary{}, SlotHistorySummary{}, ChainActivitySummary{}, EpochOutcomeSummary{Through: 39}, PaymentOutcomeSummary{}, RewardHealthSummary{})
 		if folded, _ := p.Snapshot(); !folded.UpdatedAt.After(before.UpdatedAt) {
 			t.Fatal("fold retained old source timestamp")
 		}

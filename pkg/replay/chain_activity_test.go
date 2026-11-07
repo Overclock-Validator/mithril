@@ -52,7 +52,7 @@ func TestChainActivityCountsExactIntervalNotReplaySpeed(t *testing.T) {
 
 	p := &Progress{}
 	p.begin(10, nil)
-	p.settledOutcomes(22, r.Snapshot(), LeaderOutcomeSummary{}, r.slotSnapshot(22), s, EpochOutcomeSummary{}, RewardHealthSummary{})
+	p.settledOutcomes(22, r.Snapshot(), LeaderOutcomeSummary{}, r.slotSnapshot(22), s, EpochOutcomeSummary{}, PaymentOutcomeSummary{}, RewardHealthSummary{})
 	p.rewound()
 	got, _ := p.Snapshot()
 	require.Equal(t, s, got.ChainActivity, "speculative rewind preserves committed activity")

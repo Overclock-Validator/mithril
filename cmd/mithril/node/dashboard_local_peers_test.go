@@ -246,7 +246,7 @@ func TestDashboardLocalPeersConstructorOptIn(t *testing.T) {
 				})
 				path := filepath.Join(dir, "feed.sock")
 				d := startNodeDashboard(context.Background(), time.Now(), path, "", "peer-option", "isolated", role,
-					true, false, false, true, false, enabled)
+					true, false, false, true, false, enabled, false, false)
 				if d == nil || d.localPeers != enabled {
 					t.Fatal("constructor did not preserve the explicit option")
 				}

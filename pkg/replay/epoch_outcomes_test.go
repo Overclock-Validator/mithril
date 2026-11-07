@@ -70,7 +70,7 @@ func TestEpochOutcomesBoundaryAndRewardDelay(t *testing.T) {
 	require.Equal(t, uint64(32), previous.Produced, "prior value is detached")
 	p := &Progress{}
 	p.begin(0, nil)
-	p.settledOutcomes(39, r.Snapshot(), LeaderOutcomeSummary{}, SlotHistorySummary{}, ChainActivitySummary{}, s, RewardHealthSummary{})
+	p.settledOutcomes(39, r.Snapshot(), LeaderOutcomeSummary{}, SlotHistorySummary{}, ChainActivitySummary{}, s, PaymentOutcomeSummary{}, RewardHealthSummary{})
 	p.begin(40, nil)
 	reset, _ := p.Snapshot()
 	require.Equal(t, EpochOutcomeSummary{}, reset.EpochOutcomes)

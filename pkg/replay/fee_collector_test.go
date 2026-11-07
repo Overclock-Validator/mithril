@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
+	"math"
 	"os"
 	"sync"
 	"testing"
@@ -78,7 +80,22 @@ func TestFeeCollectorSlot449810864(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, ctx.PublishBankSysvars(bankSysvars))
 	block := &b.Block{Slot: fixture.Slot, Epoch: fixture.Epoch, Leader: fixture.Leader, Features: f}
+	block.EnablePaymentObservation(fixture.Leader, fixture.Vote)
+	block.EnableSelectedEconomics()
 	require.NoError(t, distributeBlockTxFees(ctx, block, &fixture.Fees))
+	economics, enabled := block.SelectedEconomics()
+	require.True(t, enabled)
+	require.True(t, economics.FeesKnown)
+	require.True(t, economics.FeeBurnKnown)
+	require.Equal(t, uint64(72500), economics.FeeBurnLamports)
+	require.Equal(t, b.SelectedFeeFacts{ExecutionLamports: 145000, PriorityLamports: 2, TotalLamports: 145002}, economics.Fees)
+	payment, ok := block.PaymentObservation()
+	require.True(t, ok)
+	require.True(t, payment.FeesKnown)
+	require.Equal(t, fixture.Fees.TotalFees, payment.Fees)
+	require.Equal(t, uint64(72502), payment.FeeDeposited)
+	require.Equal(t, uint64(72500), payment.FeeBurned)
+	require.Equal(t, *historical.BlockRevenueCollector, payment.FeeCollector)
 	require.Equal(t, uint64(72500), ctx.LamportsBurnt)
 	leaderAfter, err := ctx.GetAccount(fixture.Leader)
 	require.NoError(t, err)
@@ -138,4 +155,100 @@ func TestTransactionFeeCollectorRequiresHistoricalMetadata(t *testing.T) {
 	got, _, err := transactionFeeCollector(block)
 	require.NoError(t, err)
 	require.Equal(t, node, got)
+}
+
+func TestSelectedFeeZeroAndInvalidAccumulator(t *testing.T) {
+	block := new(b.Block)
+	block.EnableSelectedEconomics()
+	// The real zero-fee path needs no collector, account database or vote key.
+	require.NoError(t, distributeBlockTxFees(nil, block, new(fees.TxFeeInfoAccumulator)))
+	got, enabled := block.SelectedEconomics()
+	require.True(t, enabled)
+	require.True(t, got.FeesKnown)
+	require.True(t, got.FeeBurnKnown)
+	require.Zero(t, got.FeeBurnLamports)
+	require.Zero(t, got.Fees)
+	_, paymentEnabled := block.PaymentObservation()
+	require.False(t, paymentEnabled)
+	// Preserve the existing early-return behavior, but never call an invalid
+	// triple a known zero observation.
+	require.NoError(t, distributeBlockTxFees(nil, block, &fees.TxFeeInfoAccumulator{ExecutionFees: 1}))
+	got, enabled = block.SelectedEconomics()
+	require.True(t, enabled)
+	require.Equal(t, b.SelectedEconomics{}, got)
+}
+
+type selectedFeeFailingStore struct{ accounts.Accounts }
+
+var errSelectedFeeStore = errors.New("selected fee fixture store failure")
+
+func (selectedFeeFailingStore) SetAccount(*[32]byte, *accounts.Account) error {
+	return errSelectedFeeStore
+}
+
+func TestSelectedFeeDistributionOutcomes(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		before       uint64
+		failStore    bool
+		wantBurn     uint64
+		wantIncrease uint64
+	}{
+		{name: "collector_deposit", before: 1000000, wantBurn: 50, wantIncrease: 50},
+		{name: "collector_overflow_burn", before: math.MaxUint64, wantBurn: 100},
+		{name: "store_error", before: 1000000, failStore: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			leader := solana.PublicKey{41}
+			mem := accounts.NewMemAccounts()
+			require.NoError(t, mem.SetAccountWithoutLock(leader, &accounts.Account{Key: leader, Lamports: tc.before}))
+			f := features.NewFeaturesDefault()
+			f.EnableFeature(features.RewardFullPriorityFee, 0)
+			ctx := &sealevel.SlotCtx{Slot: 17, Features: f, Accounts: mem, ParentAccts: accounts.NewMemAccounts(),
+				AcctMapsMu: new(sync.Mutex), ModifiedAccts: map[solana.PublicKey]bool{}, WritableAccts: map[solana.PublicKey]bool{}}
+			rent := sealevel.NewDefaultRentSysvar()
+			sysvars, err := sealevel.NewBankSysvars(ctx.Slot, &accounts.Account{Key: sealevel.SysvarRentAddr, Data: rent.MustMarshal()})
+			require.NoError(t, err)
+			require.NoError(t, ctx.PublishBankSysvars(sysvars))
+			block := &b.Block{Slot: ctx.Slot, Leader: leader, Features: f}
+			block.EnableSelectedEconomics()
+			block.RecordSelectedFees(1, 0, 1)
+			if tc.failStore {
+				ctx.Accounts = selectedFeeFailingStore{Accounts: mem}
+			}
+			err = distributeBlockTxFees(ctx, block, &fees.TxFeeInfoAccumulator{ExecutionFees: 100, TotalFees: 100})
+			got, enabled := block.SelectedEconomics()
+			require.True(t, enabled)
+			if tc.failStore {
+				require.ErrorIs(t, err, errSelectedFeeStore)
+				require.Equal(t, b.SelectedEconomics{}, got, "failed distribution retained a previous result")
+			} else {
+				require.NoError(t, err)
+				require.True(t, got.FeesKnown)
+				require.Equal(t, b.SelectedFeeFacts{ExecutionLamports: 100, TotalLamports: 100}, got.Fees)
+				require.Equal(t, tc.wantBurn, ctx.LamportsBurnt)
+			}
+			after, err := mem.GetAccountWithoutLock(leader)
+			require.NoError(t, err)
+			require.Equal(t, tc.before+tc.wantIncrease, after.Lamports)
+		})
+	}
+}
+
+func TestSelectedFeeCollectorErrorClearsPriorResult(t *testing.T) {
+	global.SetLeaderSchedule(nil)
+	t.Cleanup(func() { global.ClearEpochStakes(0); global.SetLeaderSchedule(nil) })
+	leader, vote := solana.PublicKey{41}, solana.PublicKey{42}
+	f := features.NewFeaturesDefault()
+	f.EnableFeature(features.CustomCommissionCollector, 0)
+	global.PutEpochStakes(0, map[solana.PublicKey]uint64{vote: 1},
+		map[solana.PublicKey]*epochstakes.VoteAccount{vote: {NodePubkey: leader}}, 1)
+	block := &b.Block{Leader: leader, Features: f}
+	block.EnableSelectedEconomics()
+	block.RecordSelectedFees(1, 0, 1)
+	err := distributeBlockTxFees(nil, block, &fees.TxFeeInfoAccumulator{ExecutionFees: 100, TotalFees: 100})
+	require.ErrorContains(t, err, "missing historical block revenue collector")
+	got, enabled := block.SelectedEconomics()
+	require.True(t, enabled)
+	require.Equal(t, b.SelectedEconomics{}, got)
 }
