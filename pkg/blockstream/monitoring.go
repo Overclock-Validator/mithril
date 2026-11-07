@@ -40,44 +40,53 @@ type ReceptionObservation struct {
 // node-run total. Data/coding shred counts precede signature verification.
 // Repair responses and late responses are separate matched-response counters.
 type TurbineObservation struct {
-	SampledAt            time.Time
-	StartedAt            time.Time
-	Session              uint64
-	Packets              uint64
-	DataShreds           uint64
-	CodingShreds         uint64
-	ParseErrors          uint64
-	SignatureErrors      uint64
-	MissingLeaders       uint64
-	ShredVersionMismatch uint64
-	UsefulRepairShreds   uint64
-	SpooledRepairShreds  uint64
-	LastPacketAt         time.Time
-	RepairEnabled        bool
-	RepairRequests       uint64
-	RepairResponses      uint64
-	RepairLateResponses  uint64
-	RepairTimeouts       uint64
-	RepairErrors         uint64
-	Frontiers            turbine.ShredFrontiers
-	BlocksEmitted        uint64
-	RecoveredData        uint64
-	AssemblyErrors       uint64
-	ActiveSlots          int
-	EvictedSlots         uint64
-	IgnoredOldShreds     uint64
-	SigVerifies          uint64
-	SigVerifyCached      uint64
-	RetransmitEnabled    bool
-	PeerPayloadBytes     uint64
-	RepairOutstanding    int
-	RepairPeers          int
-	RepairResponding     int
+	SampledAt              time.Time
+	StartedAt              time.Time
+	Session                uint64
+	Packets                uint64
+	DataShreds             uint64
+	CodingShreds           uint64
+	ParseErrors            uint64
+	SignatureErrors        uint64
+	MissingLeaders         uint64
+	ShredVersionMismatch   uint64
+	UsefulRepairShreds     uint64
+	SpooledRepairShreds    uint64
+	LastPacketAt           time.Time
+	RepairEnabled          bool
+	RepairRequests         uint64
+	RepairResponses        uint64
+	RepairLateResponses    uint64
+	RepairTimeouts         uint64
+	RepairErrors           uint64
+	Frontiers              turbine.ShredFrontiers
+	BlocksEmitted          uint64
+	RecoveredData          uint64
+	AssemblyErrors         uint64
+	ActiveSlots            int
+	EvictedSlots           uint64
+	IgnoredOldShreds       uint64
+	SigVerifies            uint64
+	SigVerifyCached        uint64
+	RetransmitEnabled      bool
+	PeerPayloadBytes       uint64
+	RepairOutstanding      int
+	RepairPeers            int
+	RepairResponding       int
+	SocketMemory           turbine.ReceiverSocketMemory
+	SocketMemoryObserved   bool
+	SocketMemoryObservedAt time.Time
 }
 
 // EnableMonitoring opts into bounded publication by the stream owner.
 // Call only before Start; readers never initialize or sample the receiver.
 func (bs *BlockSource) EnableMonitoring() { bs.monitoringEnabled = true }
+
+// EnableSocketMemoryMonitoring opts into receiver-owned socket observations.
+func (bs *BlockSource) EnableSocketMemoryMonitoring() { bs.socketMemoryMonitoring = true }
+
+// SetGossipObserver selects a monitoring attachment before Start.
+func (bs *BlockSource) SetGossipObserver(observer func(*gossip.Client)) { bs.gossipObserver = observer }
 
 // NetworkSnapshot copies bounded scalars without receiver calls, I/O, map scans
 // or reset-on-read counters. A stopped or unmonitored source is unavailable.
@@ -155,10 +164,20 @@ func (bs *BlockSource) setMonitoredGossip(client *gossip.Client) {
 	}
 	client.EnableMonitoring()
 	bs.monitoredGossip.Store(client)
+	if bs.gossipObserver != nil && !bs.stopped.Load() {
+		bs.gossipObserver(client)
+	}
+}
+
+func (bs *BlockSource) observeTurbineSocketMemory(receiver *turbine.UDPReceiver) (turbine.ReceiverSocketMemory, bool) {
+	if !bs.monitoringEnabled || !bs.socketMemoryMonitoring {
+		return turbine.ReceiverSocketMemory{}, false
+	}
+	return receiver.ObserveSocketMemory()
 }
 
 // publishTurbineObservation reuses the receiver owner's existing stats read.
-func (bs *BlockSource) publishTurbineObservation(now, started time.Time, session uint64, repair bool, stats turbine.ReceiverStats, frontiers turbine.ShredFrontiers) {
+func (bs *BlockSource) publishTurbineObservation(now, started time.Time, session uint64, repair bool, stats turbine.ReceiverStats, frontiers turbine.ShredFrontiers, socketMemory turbine.ReceiverSocketMemory, socketMemoryObserved bool) {
 	if !bs.monitoringEnabled {
 		return
 	}
@@ -175,6 +194,10 @@ func (bs *BlockSource) publishTurbineObservation(now, started time.Time, session
 		IgnoredOldShreds: stats.IgnoredOldShreds, SigVerifies: stats.SigVerifies, SigVerifyCached: stats.SigVerifyCached,
 		RetransmitEnabled: stats.RetransmitEnabled, PeerPayloadBytes: stats.Retransmit.SentPayloadBytes,
 		RepairOutstanding: stats.Repair.Outstanding, RepairPeers: stats.Repair.Peers, RepairResponding: stats.Repair.RespondingPeers,
+		SocketMemory: socketMemory, SocketMemoryObserved: socketMemoryObserved,
+	}
+	if socketMemoryObserved {
+		s.SocketMemoryObservedAt = now
 	}
 	if stats.LastPacketUnix != 0 {
 		s.LastPacketAt = time.Unix(stats.LastPacketUnix, 0).UTC()

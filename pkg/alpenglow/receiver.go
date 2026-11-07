@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/identity"
+	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/gagliardetto/solana-go"
 	"github.com/quic-go/quic-go"
@@ -234,6 +235,11 @@ func (r *Receiver) Close() error {
 		return nil
 	}
 	return err
+}
+
+// ObserveSocketMemory reports unavailable because the QUIC listener owns its socket.
+func (r *Receiver) ObserveSocketMemory() metrics.SocketObservation {
+	return metrics.SocketObservation{Reason: metrics.SocketNotProvided}
 }
 
 func (r *Receiver) Stats() ReceiverStats {

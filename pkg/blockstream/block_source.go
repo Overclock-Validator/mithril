@@ -298,13 +298,15 @@ type BlockSource struct {
 	// Repair peers remembered across restarts (RepairPeerSeeds,
 	// GoodRepairPeers). lastGoodRepairPeers keeps the latest non-empty list
 	// so a shutdown save still has it after the receiver is torn down.
-	repairPeerSeeds      []gossip.RepairPeer
-	startedAt            time.Time
-	lastGoodRepairPeers  atomic.Pointer[[]gossip.RepairPeer]
-	monitoringEnabled    bool // Configured before Start; sampling belongs to the stream owner.
-	turbineObservation   atomic.Pointer[TurbineObservation]
-	receptionObservation atomic.Pointer[ReceptionObservation]
-	monitoredGossip      atomic.Pointer[gossip.Client]
+	repairPeerSeeds        []gossip.RepairPeer
+	startedAt              time.Time
+	lastGoodRepairPeers    atomic.Pointer[[]gossip.RepairPeer]
+	monitoringEnabled      bool // Configured before Start; sampling belongs to the stream owner.
+	socketMemoryMonitoring bool // Configured before Start.
+	turbineObservation     atomic.Pointer[TurbineObservation]
+	receptionObservation   atomic.Pointer[ReceptionObservation]
+	monitoredGossip        atomic.Pointer[gossip.Client]
+	gossipObserver         func(*gossip.Client)
 
 	// replayEmitHook, when set, sees every block just before it is queued
 	// for replay, while the block source still owns it (SetReplayEmitHook).

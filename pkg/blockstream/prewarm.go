@@ -30,13 +30,15 @@ type TurbinePrewarm struct {
 	done     chan struct{}
 	receiver *turbine.UDPReceiver
 
-	mu        sync.Mutex
-	spool     map[uint64]*b.Block
-	floor     uint64
-	probeNext uint64 // next frontier slot the rolling probe will pin
-	capacity  int
-	dropped   int
-	stopped   bool
+	mu               sync.Mutex
+	spool            map[uint64]*b.Block
+	floor            uint64
+	probeNext        uint64 // next frontier slot the rolling probe will pin
+	capacity         int
+	dropped          int
+	stopped          bool
+	observeHandover  func(TurbinePrewarmHandoverObservation)
+	handoverObserved bool
 }
 
 // prewarmProbeSlots: the replay frontier slots the prewarm actively repairs
@@ -81,6 +83,10 @@ type TurbinePrewarmConfig struct {
 	// RepairMaxRequestsPerSecond mirrors the BlockSource's repair rate
 	// ceiling override (0 = default).
 	RepairMaxRequestsPerSecond int
+	// GossipObserver receives the bootstrap client without sampling it.
+	GossipObserver func(*gossipclient.Client)
+	// ObserveHandover receives one summary after the first handover.
+	ObserveHandover func(TurbinePrewarmHandoverObservation)
 }
 
 // StartTurbinePrewarm joins gossip, starts a shred receiver with the
@@ -159,15 +165,19 @@ func StartTurbinePrewarm(cfg TurbinePrewarmConfig) (*TurbinePrewarm, error) {
 	}
 
 	pw := &TurbinePrewarm{
-		cancel:    cancel,
-		done:      make(chan struct{}),
-		receiver:  receiver,
-		spool:     make(map[uint64]*b.Block),
-		floor:     cfg.FloorSlot,
-		probeNext: cfg.FloorSlot + prewarmProbeSlots,
-		capacity:  cfg.MaxSpoolBlocks,
+		cancel:          cancel,
+		done:            make(chan struct{}),
+		receiver:        receiver,
+		spool:           make(map[uint64]*b.Block),
+		floor:           cfg.FloorSlot,
+		probeNext:       cfg.FloorSlot + prewarmProbeSlots,
+		capacity:        cfg.MaxSpoolBlocks,
+		observeHandover: cfg.ObserveHandover,
 	}
 
+	if cfg.GossipObserver != nil {
+		cfg.GossipObserver(client)
+	}
 	go func() {
 		if err := client.Run(ctx); err != nil && ctx.Err() == nil {
 			mlog.Log.FileOnlyf("turbine prewarm gossip exited: %v", err)
@@ -266,7 +276,7 @@ func (pw *TurbinePrewarm) add(blk *b.Block) {
 // BlockSource) and returns the spooled blocks in ascending slot order,
 // along with how many overflowed the spool.
 func (pw *TurbinePrewarm) Handover() ([]*b.Block, int) {
-	pw.logProbeOutcome() // before Stop: receiver stats die with the receiver
+	repair, repairKnown := pw.logProbeOutcome() // before Stop: receiver stats die with the receiver
 	pw.Stop()
 	pw.mu.Lock()
 	blocks := make([]*b.Block, 0, len(pw.spool))
@@ -276,7 +286,16 @@ func (pw *TurbinePrewarm) Handover() ([]*b.Block, int) {
 	sort.Slice(blocks, func(i, j int) bool { return blocks[i].Slot < blocks[j].Slot })
 	pw.spool = nil
 	dropped := pw.dropped
+	observe := pw.observeHandover
+	var observation TurbinePrewarmHandoverObservation
+	var known bool
+	if observe != nil {
+		observation, known = pw.handoverObservationLocked(blocks, repair, repairKnown)
+	}
 	pw.mu.Unlock()
+	if known {
+		observe(observation)
+	}
 	return blocks, dropped
 }
 
@@ -285,12 +304,12 @@ func (pw *TurbinePrewarm) Handover() ([]*b.Block, int) {
 // the response statistics say about the peer set's headroom for the
 // configurable rate ceiling. One console line; the per-peer table goes to
 // the repair-peers file log.
-func (pw *TurbinePrewarm) logProbeOutcome() {
+func (pw *TurbinePrewarm) logProbeOutcome() (TurbinePrewarmRepairObservation, bool) {
 	pw.mu.Lock()
 	receiver, floor, stopped := pw.receiver, pw.floor, pw.stopped
 	pw.mu.Unlock()
 	if receiver == nil || stopped {
-		return
+		return TurbinePrewarmRepairObservation{}, false
 	}
 	completed := 0
 	if floor > 0 {
@@ -301,10 +320,24 @@ func (pw *TurbinePrewarm) logProbeOutcome() {
 		}
 	}
 	r := receiver.Stats().Repair
+	var repair TurbinePrewarmRepairObservation
+	var repairKnown bool
+	if pw.observeHandover != nil {
+		sampledAt := time.Now()
+		pw.mu.Lock()
+		repairKnown = !pw.stopped
+		pw.mu.Unlock()
+		if repairKnown {
+			repair = TurbinePrewarmRepairObservation{
+				SampledAt: sampledAt, Requests: r.Requests, Responses: r.Responses,
+				LateResponses: r.LateResponses, Timeouts: r.Timeouts,
+			}
+		}
+	}
 	outcomes := r.Responses + r.LateResponses + r.Timeouts
 	if r.Requests == 0 || outcomes == 0 {
 		mlog.Log.FileOnlyf("prewarm repair probe: no repair traffic during boot (requests %d) — no rate assessment", r.Requests)
-		return
+		return repair, repairKnown
 	}
 	timeoutPct := 100 * r.Timeouts / outcomes
 	var verdict string
@@ -322,6 +355,7 @@ func (pw *TurbinePrewarm) logProbeOutcome() {
 		completed, prewarmProbeSlots, r.Responses, r.LateResponses, r.Timeouts, timeoutPct,
 		r.AvgResponseMillis, r.RespondingPeers, r.Peers, verdict)
 	logRepairPeerTable(receiver, "boot probe")
+	return repair, repairKnown
 }
 
 // Stop tears the prewarm receiver and gossip session down and waits for the

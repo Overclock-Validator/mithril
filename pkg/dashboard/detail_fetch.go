@@ -2,10 +2,31 @@ package dashboard
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 )
+
+func parseDetailRemaining(value string, freshFor time.Duration) (time.Duration, error) {
+	milliseconds, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || milliseconds < 1 || milliseconds > int64(freshFor/time.Millisecond) || strconv.FormatInt(milliseconds, 10) != value {
+		return 0, errors.New("source_invalid")
+	}
+	return time.Duration(milliseconds) * time.Millisecond, nil
+}
+
+// detailHTTPClient isolates each reader's connection pool and request limits.
+func detailHTTPClient(transport *http.Transport, connections int, timeout time.Duration) *http.Client {
+	transport = transport.Clone()
+	transport.Proxy = nil
+	transport.MaxResponseHeaderBytes = 4096
+	transport.MaxConnsPerHost, transport.MaxIdleConnsPerHost, transport.MaxIdleConns = connections, connections, connections
+	transport.DisableKeepAlives = true
+	return &http.Client{Transport: transport, Timeout: timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+}
 
 // fetchDetail reads a bounded detail response without extending its source lease.
 func fetchDetail(parent context.Context, client *http.Client, path string, maxBytes int, headers http.Header,

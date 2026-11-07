@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/identity"
+	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/packet"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/pipeline"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/quicserver"
@@ -152,6 +153,14 @@ func (t *TPU) Stats() Stats {
 		QUIC:     t.server.Stats,
 		Pipeline: t.pipeline.Stats(),
 	}
+}
+
+// ObserveSocketMemory reads accounting from the already-owned UDP socket.
+func (t *TPU) ObserveSocketMemory() metrics.SocketObservation {
+	if t == nil {
+		return metrics.SocketObservation{Reason: metrics.SocketNotProvided}
+	}
+	return metrics.ObserveUDPSocketMemory(t.conn)
 }
 
 // ObserveStreamReadPayload copies an opted-in server counter without socket I/O.

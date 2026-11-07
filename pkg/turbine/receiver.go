@@ -41,12 +41,14 @@ type UDPReceiver struct {
 	// Alpenglow variant can reset a slot and assemble its replacement while
 	// the first delivery is still crossing Blocks(); acknowledging the first
 	// must not make the replacement look lost to the catchup watchdog.
-	pendingBlocksMu sync.Mutex
-	pendingBlocks   map[uint64]int // slot -> deliveries waiting in Blocks()
-	errs            chan error
-	ready           chan error
-	once            sync.Once
-	readyOnce       sync.Once
+	pendingBlocksMu   sync.Mutex
+	pendingBlocks     map[uint64]int // slot -> deliveries waiting in Blocks()
+	errs              chan error
+	ready             chan error
+	once              sync.Once
+	readyOnce         sync.Once
+	socketMemory      receiverSocketMemoryOwner
+	recordSocketReads bool // Startup-only optional dashboard accounting.
 
 	spool       *ShredSpool
 	hydrLo      atomic.Uint64
@@ -675,6 +677,9 @@ func (r *UDPReceiver) Run(ctx context.Context) error {
 		gossip.BoostUDPReceiveBuffer(repairConn, gossip.TurbineUDPReceiveBufferBytes, "turbine repair receiver")
 	}
 
+	socketGeneration := r.attachSocketMemoryOwners(liveConn, repairConn)
+	defer r.detachSocketMemoryOwners(socketGeneration)
+
 	var retransmitDone chan struct{}
 	if r.retransmitCfg != nil {
 		r.retransmitter, err = NewRetransmitter(*r.retransmitCfg)
@@ -785,8 +790,12 @@ func (r *UDPReceiver) Run(ctx context.Context) error {
 
 func (r *UDPReceiver) readPackets(ctx context.Context, conn *net.UDPConn, onRepairSocket bool) error {
 	buf := make([]byte, packetDataSize)
+	activity := r.socketReadCounter(conn, onRepairSocket)
 	for {
 		n, addr, err := conn.ReadFromUDP(buf)
+		if activity != nil && n > 0 {
+			activity.add(uint64(n))
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
