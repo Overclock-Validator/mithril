@@ -29,6 +29,12 @@ full-epoch rate or a FAST score, and it may differ from external dashboards.
 
 ## Connecting a dashboard
 
+For optional cluster-wide data, run the separate
+[`mithril-dashboard-collect` command](../cmd/mithril-dashboard-collect/README.md)
+and pass its output to the public reader with `--cluster-file`. The command
+collects from fixed public sources; the reader only reads the resulting file.
+Cluster collection is separate from the linked node's own status.
+
 After the [public profile](#public-profile) and its HTTPS proxy are configured,
 a dashboard can read one node from that origin:
 
@@ -119,6 +125,35 @@ Build both executables from the same checkout:
 go build -o mithril ./cmd/mithril
 go build -o mithril-dashboard ./cmd/mithril-dashboard
 ```
+
+To include network details, enable `--dashboard-network-details` on the
+node and `--network-details` on the reader. The reader also requires a public
+profile and `--public-resources`; the node option requires an enabled
+dashboard feed. Values can be unavailable when their source is not
+running or has not produced a fresh observation. Interface counters also
+require `--dashboard-host-resources` on the node.
+
+To include machine topology and process history, enable
+`--dashboard-machine-details` and `--dashboard-host-resources` on the node,
+and `--machine-details` with `--public-resources` on the public reader.
+These observations are optional and can be unavailable or stale.
+
+To collect visible cgroup limits, counters and pressure, enable
+`--dashboard-cgroup-resources` on the node. Public readers also need
+`--public-resources`; the data appears in the advanced status profile.
+These observations describe the visible local cgroup, not necessarily the
+effective limits imposed by its ancestors.
+
+To include locally observed signed peer contacts, enable
+`--dashboard-local-peers` and `--dashboard-network-details` on the node,
+and `--local-peers` on the public reader. The bounded peer details omit
+network endpoints; a missing or stale capture is not an empty peer list.
+
+For aggregate history, pass `--history-dir /absolute/private/path` to the
+public reader. The reader stores up to 30 days of sampled public data in this
+dedicated directory; it must be owned by the reader and private (mode 0700).
+Resource history is included only with `--public-resources`. History starts
+when enabled and does not reconstruct observations from before that time.
 
 Without release build flags, the dashboard feed reports `0.0.0-dev`; the CLI
 may show `dev`. The displayed commit may identify only the base revision when
