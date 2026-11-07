@@ -261,7 +261,11 @@ an SSH tunnel, with the same local and remote port. If a request supplies an
 Origin, it must use HTTP or HTTPS and match the request Host and port. Requests
 without an Origin are also accepted; these checks do not authenticate clients.
 The reader does not serve HTML or accept a separate UI origin. Forwarded headers
-do not bypass Host or Origin checks.
+do not bypass Host or Origin checks. This private profile refuses any request
+carrying a proxy header (`Forwarded`, `Via`, `X-Forwarded-*` or `X-Real-IP`):
+a proxy's default upstream Host is the loopback listener itself, so the Host
+check alone would admit remote clients that send no Origin. Put a reverse proxy
+only in front of the public profile below.
 
 ## Public profile
 
