@@ -308,13 +308,16 @@ func TestPublicHTTPSProxy(t *testing.T) {
 	}()
 	client := proxy.Client()
 	client.Timeout = 2 * time.Second
-	getState := func() PublicSnapshot {
+	getState := func() (PublicSnapshot, bool) {
 		t.Helper()
 		resp, err := client.Get(origin + "/api/v1/status")
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			return PublicSnapshot{}, false
+		}
 		if resp.StatusCode != http.StatusOK || resp.Header.Get("Cache-Control") != "no-store" {
 			t.Fatalf("proxy status: %d, %v", resp.StatusCode, resp.Header)
 		}
@@ -322,14 +325,14 @@ func TestPublicHTTPSProxy(t *testing.T) {
 		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 			t.Fatal(err)
 		}
-		return result
+		return result, true
 	}
 	await := func(state, run string) {
 		t.Helper()
 		deadline := time.Now().Add(4 * time.Second)
 		for time.Now().Before(deadline) {
-			v := getState()
-			if v.SourceState == state && (run == "" || v.Node != nil && v.Node.RunID == run) {
+			v, ok := getState()
+			if ok && v.SourceState == state && (run == "" || v.Node != nil && v.Node.RunID == run) {
 				return
 			}
 			time.Sleep(50 * time.Millisecond)
