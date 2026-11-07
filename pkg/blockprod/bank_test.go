@@ -144,6 +144,7 @@ func TestWorkingBankIncludesAndChargesFeesOnlyLoadFailure(t *testing.T) {
 	})
 	require.NotNil(t, preview.ProcessingResult.TransactionError)
 	assert.Equal(t, replay.TransactionErrorMaxLoadedAccountsDataSizeExceeded, preview.ProcessingResult.TransactionError.ErrorType)
+	assert.Zero(t, env.SlotCtx.TransactionCounts, "execution without commit is not chain activity")
 
 	payerBefore, err := env.SlotCtx.GetAccount(txfixture.PayerPubkey())
 	require.NoError(t, err)
@@ -172,6 +173,8 @@ func TestWorkingBankIncludesAndChargesFeesOnlyLoadFailure(t *testing.T) {
 	payerAfterRetry, err := env.SlotCtx.GetAccount(txfixture.PayerPubkey())
 	require.NoError(t, err)
 	assert.Equal(t, payerAfter.Lamports, payerAfterRetry.Lamports)
+	assert.Equal(t, uint64(1), env.SlotCtx.TransactionCounts.Total)
+	assert.Equal(t, uint64(1), env.SlotCtx.TransactionCounts.NonVoteFailed)
 }
 
 func TestWorkingBankIncludesV1DefaultLoadedLimitAsFeesOnly(t *testing.T) {

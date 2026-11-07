@@ -74,7 +74,7 @@ func configureMemoryBudgets() error {
 // memory growth. Profiles are opt-in, rate-limited, and rotate over three files
 // in the run directory. Do not force GC: that would perturb the workload being
 // diagnosed. Heap profiles describe allocations as of the latest completed GC.
-func startMemoryDiagnostics(parent context.Context, dir string, threshold uint64) func() {
+func startMemoryDiagnostics(parent context.Context, dir string, threshold uint64, dashboard *nodeDashboard) func() {
 	ctx, cancel := context.WithCancel(parent)
 	done := make(chan struct{})
 	go func() {
@@ -95,10 +95,14 @@ func startMemoryDiagnostics(parent context.Context, dir string, threshold uint64
 				runtime.ReadMemStats(&mem)
 				used := mem.Sys - mem.HeapReleased
 				mlog.Log.FileOnlyf("runtime memory: heap_bytes=%d go_bytes=%d next_gc_bytes=%d gc_total=%d memory_limit_bytes=%d", mem.HeapAlloc, used, mem.NextGC, mem.NumGC, debug.SetMemoryLimit(-1))
+				var pressure *metrics.RuntimeWindow
 				if now.Sub(lastSummary) >= diagnosticsSummaryEvery {
 					lastSummary = now
-					logDiagnosticsSummary(sampler.Sample())
+					window := sampler.Sample()
+					logDiagnosticsSummary(window)
+					pressure = &window
 				}
+				dashboard.observeRuntime(now, mem, pressure)
 				if now.Sub(lastAllocationSummary) >= allocationSummaryEvery {
 					lastAllocationSummary = now
 					logAllocationSummary(allocations)

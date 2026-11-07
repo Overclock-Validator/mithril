@@ -518,6 +518,7 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 			if feeInfos[idx] == nil {
 				return nil, nil, unprocessableTransactionError(base+idx, txErr)
 			}
+			slotCtx.TransactionCounts.Record(tx.IsVote(), txErr != nil, computeUnits[idx])
 		}
 		return feeInfos, computeUnits, nil
 	}
@@ -567,6 +568,9 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 	for idx := range txs {
 		if execute[idx] && feeInfos[idx] == nil {
 			return nil, nil, unprocessableTransactionError(base+idx, txErrors[idx])
+		}
+		if execute[idx] {
+			slotCtx.TransactionCounts.Record(txs[idx].IsVote(), txErrors[idx] != nil, computeUnits[idx])
 		}
 	}
 	return feeInfos, computeUnits, nil

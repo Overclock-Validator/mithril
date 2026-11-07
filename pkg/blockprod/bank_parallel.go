@@ -266,6 +266,8 @@ func (b *WorkingBank) recordForgedLocked(txs []*solana.Transaction, candidates [
 			b.txFees.Add(outputs[idx].FeeInfo)
 		}
 		b.forgedTxs = append(b.forgedTxs, tx)
+		computeUnits, _ := actualExecutionUsage(outputs[idx])
+		b.slotCtx.TransactionCounts.Record(tx.IsVote(), outputs[idx].ProcessingResult.TransactionError != nil, computeUnits)
 		b.numSigs += uint64(tx.Message.Header.NumRequiredSignatures)
 		// Equivalent to recording the requested cost and rebating it.
 		b.costs.Record(actual[idx])

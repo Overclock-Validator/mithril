@@ -157,6 +157,7 @@ type Retransmitter struct {
 	submitted                atomic.Uint64
 	sentShreds               atomic.Uint64
 	sentPackets              atomic.Uint64
+	sentPayloadBytes         atomic.Uint64
 	targetPackets            atomic.Uint64
 	packetAttempts           atomic.Uint64
 	unsentPackets            atomic.Uint64
@@ -192,9 +193,12 @@ type Retransmitter struct {
 }
 
 type RetransmitStats struct {
-	Submitted                uint64
-	SentShreds               uint64
-	SentPackets              uint64 // datagrams accepted by the local kernel
+	Submitted   uint64
+	SentShreds  uint64
+	SentPackets uint64 // datagrams accepted by the local kernel
+	// SentPayloadBytes counts peer payload bytes reported accepted by valid
+	// batch results. It excludes auxiliary receivers and is not delivery proof.
+	SentPayloadBytes         uint64
 	TargetPackets            uint64 // original downstream destinations
 	PacketAttempts           uint64 // target packets plus retry attempts
 	UnsentPackets            uint64 // destinations left after bounded retries
@@ -541,6 +545,9 @@ func (r *Retransmitter) sendToPeers(packet []byte, peers []*net.UDPAddr, sender 
 			r.retryPackets.Add(uint64(requested))
 		}
 		sent, err := sender.Send(packet, remaining)
+		if sent > 0 && sent <= requested {
+			r.sentPayloadBytes.Add(uint64(sent) * uint64(len(packet)))
+		}
 		if sent < 0 || sent > requested {
 			err = fmt.Errorf("invalid batch sender result: sent %d of %d: %w", sent, requested, err)
 			sent = min(max(sent, 0), requested)
@@ -782,6 +789,7 @@ func (r *Retransmitter) Stats() RetransmitStats {
 		Submitted:                r.submitted.Load(),
 		SentShreds:               r.sentShreds.Load(),
 		SentPackets:              r.sentPackets.Load(),
+		SentPayloadBytes:         r.sentPayloadBytes.Load(),
 		TargetPackets:            r.targetPackets.Load(),
 		PacketAttempts:           r.packetAttempts.Load(),
 		UnsentPackets:            r.unsentPackets.Load(),

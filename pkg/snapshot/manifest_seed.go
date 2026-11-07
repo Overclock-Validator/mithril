@@ -35,6 +35,12 @@ func PopulateManifestSeed(s *state.MithrilState, m *SnapshotManifest) {
 	s.ManifestParentSlot = m.Bank.Slot
 	s.ManifestParentBankhash = base58.Encode(m.Bank.Hash[:])
 	s.ManifestBlockHeight = m.Bank.BlockHeight
+	// A replacement (including an incremental manifest) must not inherit an
+	// older target if its own value is missing or wider than uint64.
+	s.ManifestNsPerSlot = 0
+	if m.Bank.NsPerSlot.Hi == 0 && m.Bank.NsPerSlot.Lo != 0 {
+		s.ManifestNsPerSlot = m.Bank.NsPerSlot.Lo
+	}
 
 	// LtHash: use Hash() method, encode as base64
 	if m.LtHash != nil {

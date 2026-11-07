@@ -87,23 +87,27 @@ type RewardCertBuilder interface {
 }
 
 type LeaderLoop struct {
-	controller       *Controller
-	identity         *identity.Holder
-	accountsDb       *accountsdb.AccountsDb
-	broadcaster      turbine.PacketBroadcaster
-	shredVersion     uint16
-	userAgent        []byte
-	rewardCerts      RewardCertBuilder
-	epochSchedule    *sealevel.SysvarEpochSchedule
-	alpenglowClock   bool
-	parentContext    func(uint64) ParentContext
-	productionParent func(uint64) alpenglow.BlockProductionParent
-	canSignSlot      func(uint64) bool
-	onBlock          func(*b.Block)
-	commitLeaderSlot func(replay.CommitLeaderInput) (*sealevel.SlotCtx, error)
-	hooks            LeaderHooks
-	holder           SlotHolder
-	gateTPU          bool
+	controller         *Controller
+	identity           *identity.Holder
+	accountsDb         *accountsdb.AccountsDb
+	broadcaster        turbine.PacketBroadcaster
+	shredVersion       uint16
+	userAgent          []byte
+	rewardCerts        RewardCertBuilder
+	epochSchedule      *sealevel.SysvarEpochSchedule
+	alpenglowClock     bool
+	parentContext      func(uint64) ParentContext
+	productionParent   func(uint64) alpenglow.BlockProductionParent
+	canSignSlot        func(uint64) bool
+	onBlock            func(*b.Block)
+	commitLeaderSlot   func(replay.CommitLeaderInput) (*sealevel.SlotCtx, error)
+	observeTerminal    func(LeaderTerminalObservation)
+	observeParentReady func(LeaderParentReadyObservation)
+	hooks              LeaderHooks
+	holder             SlotHolder
+	gateTPU            bool
+
+	certificateObservationVoteAccount solana.PublicKey
 
 	currentSlot   func() uint64
 	leaderForSlot func(uint64) (solana.PublicKey, bool)
@@ -153,8 +157,18 @@ type LeaderLoopConfig struct {
 	ProductionParent func(slot uint64) alpenglow.BlockProductionParent
 	CanSignSlot      func(slot uint64) bool
 	OnBlock          func(*b.Block)
-	CurrentSlot      func() uint64
-	LeaderForSlot    func(uint64) (solana.PublicKey, bool)
+	// ObserveTerminal receives accepted local terminal events under the leader
+	// lock. It must return promptly and must not re-enter the leader loop.
+	ObserveTerminal func(LeaderTerminalObservation)
+	// ObserveParentReady receives selected own-window parent notifications under
+	// the leader lock. It must return promptly and must not re-enter the loop.
+	ObserveParentReady func(LeaderParentReadyObservation)
+
+	// CertificateObservationVoteAccount enables private compact capture for a
+	// fixed public account; speculative production does not publish outcomes.
+	CertificateObservationVoteAccount solana.PublicKey
+	CurrentSlot                       func() uint64
+	LeaderForSlot                     func(uint64) (solana.PublicKey, bool)
 	// ParentBlockID is retained for source compatibility and ignored. Parent
 	// identity is supplied atomically by ParentContext.
 	ParentBlockID func(parentSlot uint64) (solana.Hash, bool)
@@ -189,6 +203,8 @@ func NewLeaderLoop(cfg LeaderLoopConfig) *LeaderLoop {
 	}
 	holder, _ := cfg.Hooks.(SlotHolder)
 	return &LeaderLoop{
+		certificateObservationVoteAccount: cfg.CertificateObservationVoteAccount,
+
 		controller:          cfg.Controller,
 		identity:            cfg.Identity,
 		accountsDb:          cfg.AccountsDb,
@@ -201,6 +217,8 @@ func NewLeaderLoop(cfg LeaderLoopConfig) *LeaderLoop {
 		productionParent:    cfg.ProductionParent,
 		canSignSlot:         cfg.CanSignSlot,
 		onBlock:             cfg.OnBlock,
+		observeTerminal:     cfg.ObserveTerminal,
+		observeParentReady:  cfg.ObserveParentReady,
 		currentSlot:         cfg.CurrentSlot,
 		leaderForSlot:       cfg.LeaderForSlot,
 		rewardCerts:         cfg.RewardCerts,
@@ -528,6 +546,7 @@ func (l *LeaderLoop) recordParentReadyActivationLocked(parent alpenglow.BlockPro
 	mlog.Log.InfofPrecise("ALPENGLOW block production: parent-ready activation=%s parent=%s replay_frontier=%d live_slot=%d%s",
 		activation, parent.Parent.String(), global.ReplayFrontier(), wallSlot,
 		l.productionStartTimingDetailLocked(l.productionWindow.startSlot, now))
+	l.observeParentReadyLocked(parent, activation, now)
 	return status == "on_time"
 }
 
@@ -663,16 +682,16 @@ func (l *LeaderLoop) failProductionWindowLocked(slot uint64, reason, detail stri
 
 func (l *LeaderLoop) failProductionWindowWithTerminalLocked(slot uint64, terminal, cause, detail string) {
 	if !l.productionWindow.active {
-		l.recordLeaderSlotOutcomeWithTerminalLocked(slot, leaderOutcomeMissed, cause, terminal, cause, detail)
+		l.recordLeaderSlotOutcomeWithTerminalLocked(slot, leaderOutcomeMissed, cause, terminal, cause, detail, nil)
 		return
 	}
 	end := l.productionWindow.endSlot
-	l.recordLeaderSlotOutcomeWithTerminalLocked(slot, leaderOutcomeMissed, cause, terminal, cause, detail)
+	l.recordLeaderSlotOutcomeWithTerminalLocked(slot, leaderOutcomeMissed, cause, terminal, cause, detail, nil)
 	for remaining := slot; remaining < end; {
 		remaining++
 		l.recordLeaderSlotOutcomeWithTerminalLocked(remaining, leaderOutcomeMissed, leaderReasonPreviousSlotMissed,
 			leaderReasonPreviousSlotMissed, cause,
-			fmt.Sprintf("cannot chain local slot %d after missed slot %d", remaining, slot))
+			fmt.Sprintf("cannot chain local slot %d after missed slot %d", remaining, slot), nil)
 	}
 	l.productionWindow = leaderProductionWindow{}
 }
@@ -880,15 +899,15 @@ func (l *LeaderLoop) reportExpiredLeaderSlotsLocked(wallSlot uint64) {
 			}
 		}
 		l.recordLeaderSlotOutcomeWithTerminalLocked(slot, leaderOutcomeMissed, failure.reason,
-			leaderReasonLiveClockAdvanced, failure.reason, failure.detail)
+			leaderReasonLiveClockAdvanced, failure.reason, failure.detail, nil)
 	}
 }
 
 func (l *LeaderLoop) recordLeaderSlotOutcomeLocked(slot uint64, outcome, reason, detail string) {
-	l.recordLeaderSlotOutcomeWithTerminalLocked(slot, outcome, reason, reason, reason, detail)
+	l.recordLeaderSlotOutcomeWithTerminalLocked(slot, outcome, reason, reason, reason, detail, nil)
 }
 
-func (l *LeaderLoop) recordLeaderSlotOutcomeWithTerminalLocked(slot uint64, outcome, reason, terminal, cause, detail string) {
+func (l *LeaderLoop) recordLeaderSlotOutcomeWithTerminalLocked(slot uint64, outcome, reason, terminal, cause, detail string, finalization *LeaderFinalizationObservation) {
 	if slot == 0 || l.isLeaderSlotFinishedLocked(slot) {
 		return
 	}
@@ -914,6 +933,7 @@ func (l *LeaderLoop) recordLeaderSlotOutcomeWithTerminalLocked(slot uint64, outc
 	}
 	l.markLeaderSlotFinished(slot)
 	delete(l.pendingFailures, slot)
+	l.observeLeaderTerminalLocked(slot, outcome, reason, terminal, cause, finalization)
 }
 
 func (l *LeaderLoop) isLeaderSlotFinishedLocked(slot uint64) bool {
@@ -1055,6 +1075,7 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 	producedBlock.FooterProducerTimeNanos = producerTimeNanos
 	producedBlock.HasAlpenglowFooter = true
 	producedBlock.AlpenglowShredVersion = l.shredVersion
+	producedBlock.EnableCertificateObservation(l.certificateObservationVoteAccount)
 	if slot > 0 {
 		producedBlock.AlpenglowParentBlockID = l.activeParentID
 		producedBlock.HasAlpenglowParentBlockID = true
@@ -1138,8 +1159,15 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 		" build_block_ms=%.3f bank_commit_ms=%.3f footer_broadcast_ms=%.3f ending_tick_broadcast_ms=%.3f",
 		ms(slotEndingDuration), ms(freezeDuration), ms(entryDrainDuration), ms(rewardCertDuration),
 		ms(buildBlockDuration), ms(commitDuration), ms(footerDuration), ms(endingTickDuration)) + bankTimings.String()
-	l.recordLeaderSlotOutcomeLocked(slot, leaderOutcomeBroadcast, leaderReasonComplete,
-		fmt.Sprintf("block=%s parent_slot=%d txns=%d%s", solana.Hash(producedBlock.AlpenglowBlockID).String(), producedBlock.ParentSlot, len(producedBlock.Transactions), timingDetail))
+	var observedFinalization *LeaderFinalizationObservation
+	if l.observeTerminal != nil {
+		observedFinalization = &LeaderFinalizationObservation{SlotEnding: slotEndingDuration, Freeze: freezeDuration, EntryDrain: entryDrainDuration,
+			RewardCertificates: rewardCertDuration, BuildBlock: buildBlockDuration, BankCommit: commitDuration,
+			FooterBroadcast: footerDuration, EndingTickBroadcast: endingTickDuration, BankPhasesKnown: l.commitLeaderSlot == nil, Bank: bankTimings}
+		observedFinalization.WindowCompletion, observedFinalization.WindowCompletionKnown = l.windowCompletionObservationLocked(slot, finalizationStartedAt, networkCompletedAt)
+	}
+	l.recordLeaderSlotOutcomeWithTerminalLocked(slot, leaderOutcomeBroadcast, leaderReasonComplete, leaderReasonComplete, leaderReasonComplete,
+		fmt.Sprintf("block=%s parent_slot=%d txns=%d%s", solana.Hash(producedBlock.AlpenglowBlockID).String(), producedBlock.ParentSlot, len(producedBlock.Transactions), timingDetail), observedFinalization)
 	l.advanceProductionWindowLocked(slot)
 	l.releaseActiveSlotLocked()
 }

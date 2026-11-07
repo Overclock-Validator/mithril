@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
@@ -27,6 +28,7 @@ import (
 // registration. Internal setters and lifecycle hooks remain Go-only.
 type rpcHandler struct {
 	rpcMethods
+	monitoring *atomic.Pointer[requestMetrics]
 }
 
 type rpcMethods interface {
@@ -42,19 +44,24 @@ type rpcMethods interface {
 }
 
 type RpcServer struct {
+	monitoring             atomic.Pointer[requestMetrics]
+	serving                atomic.Bool
 	historyRecoveryMu      sync.RWMutex
 	historyRecoveryPending bool
 
-	isReady       bool
-	rpcService    *jsonrpc.RPCServer
-	serv          *httptest.Server
-	listener      net.Listener
-	acctsDb       *accountsdb.AccountsDb
-	epochSchedule *sealevel.SysvarEpochSchedule
-	slotCtx       *sealevel.SlotCtx
-	slotCtxMu     sync.RWMutex
-	genesisHash   string
-	epochRewards  *epochrewards.Store
+	isReady          bool
+	rpcService       *jsonrpc.RPCServer
+	serv             *httptest.Server
+	listener         net.Listener
+	acctsDb          *accountsdb.AccountsDb
+	epochSchedule    *sealevel.SysvarEpochSchedule
+	slotCtx          *sealevel.SlotCtx
+	slotCtxMu        sync.RWMutex
+	hasPublishedSlot bool
+	publishedSlot    uint64
+	publishedAt      time.Time
+	genesisHash      string
+	epochRewards     *epochrewards.Store
 
 	leaderTPUCacheMu         sync.RWMutex
 	leaderTPUByIdentity      map[solana.PublicKey]tpuEndpoint
@@ -219,7 +226,7 @@ func NewRpcServer(acctsDb *accountsdb.AccountsDb, port uint16, epochSchedule *se
 		jsonrpc.WithServerErrors(rpcErrors),
 	)
 
-	rpcServer.rpcService.Register("MithrilRpc", rpcHandler{rpcServer})
+	rpcServer.rpcService.Register("MithrilRpc", rpcHandler{rpcMethods: rpcServer, monitoring: &rpcServer.monitoring})
 	rpcServer.acctsDb = acctsDb
 	if epochSchedule != nil {
 		rpcServer.epochSchedule = epochSchedule
@@ -251,6 +258,12 @@ func fetchAndUnmarshalEpochScheduleSysvar(acctsDb *accountsdb.AccountsDb) *seale
 func (rpcServer *RpcServer) SetSlotCtx(slotCtx *sealevel.SlotCtx) {
 	rpcServer.slotCtxMu.Lock()
 	rpcServer.slotCtx = slotCtx
+	rpcServer.hasPublishedSlot = slotCtx != nil
+	rpcServer.publishedSlot = 0
+	if slotCtx != nil {
+		rpcServer.publishedSlot = slotCtx.Slot
+	}
+	rpcServer.publishedAt = time.Now().UTC()
 	rpcServer.slotCtxMu.Unlock()
 }
 
@@ -262,7 +275,11 @@ func (rpcServer *RpcServer) getSlotCtx() *sealevel.SlotCtx {
 
 func (rpcServer *RpcServer) Start() {
 	rpcServer.startClusterNodesRefreshLoop()
-	go http.Serve(rpcServer.listener, rpcServer)
+	rpcServer.serving.Store(true)
+	go func() {
+		defer rpcServer.serving.Store(false)
+		_ = http.Serve(rpcServer.listener, rpcServer)
+	}()
 }
 
 func (rpcServer *RpcServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
