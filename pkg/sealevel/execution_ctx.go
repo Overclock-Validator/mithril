@@ -23,7 +23,9 @@ type ExecutionCtx struct {
 	TimingRecorder *metrics.TransactionTimings
 	// SkipTimingMetrics disables instruction-dispatch timing collection for
 	// leader execution; it never changes instruction validation or CU charging.
-	SkipTimingMetrics        bool
+	SkipTimingMetrics bool
+	// SkipStableLogs avoids formatting messages when the caller discards logs.
+	SkipStableLogs           bool
 	Log                      Logger
 	Accounts                 accounts.Accounts
 	TransactionContext       *TransactionCtx
@@ -386,8 +388,25 @@ func (execCtx *ExecutionCtx) ExecuteInstruction() error {
 	}
 	execCtx.TimingRecorder.AddTimingSince(metrics.TransactionExecIxResolveNativeProgram, start)
 
+	var programKey solana.PublicKey
+	recordLogs := execCtx.Log != nil && !execCtx.SkipStableLogs
+	if recordLogs {
+		var keyErr error
+		programKey, keyErr = instrCtx.LastProgramKey(txCtx)
+		recordLogs = keyErr == nil && !isPrecompile(programKey) && programKey != a.Secp256r1PrecompileAddr
+		if recordLogs {
+			execCtx.Log.Log(fmt.Sprintf("Program %s invoke [%d]", programKey, execCtx.StackHeight()))
+		}
+	}
 	start = metrics.StartTiming(!execCtx.SkipTimingMetrics)
 	err = nativeProgramFn(execCtx)
+	if recordLogs {
+		if err == nil {
+			execCtx.Log.Log(fmt.Sprintf("Program %s success", programKey))
+		} else {
+			execCtx.Log.Log(fmt.Sprintf("Program %s failed: %s", programKey, instructionErrorLogMessage(err)))
+		}
+	}
 	switch nativeProgramStr {
 	case a.SystemProgramAddrStr:
 		execCtx.TimingRecorder.AddTimingSince(metrics.TransactionExecIxNativeProgramSystem, start)

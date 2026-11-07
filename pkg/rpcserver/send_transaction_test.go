@@ -22,7 +22,8 @@ import (
 )
 
 func TestParseSendTransactionConfig_Defaults(t *testing.T) {
-	conf := parseSendTransactionConfig([]interface{}{"tx"})
+	conf, err := parseSendTransactionConfig([]json.RawMessage{json.RawMessage(`"tx"`)})
+	require.NoError(t, err)
 	assert.Equal(t, "base58", conf.encoding)
 	assert.False(t, conf.skipPreflight)
 	assert.Nil(t, conf.maxRetries)
@@ -124,6 +125,12 @@ func TestSendTransaction_PreflightSignatureFailure(t *testing.T) {
 			Features: features.NewFeaturesDefault(),
 		},
 	}
+	forwarded := 0
+	rpcServer.transactionSender = func(context.Context, []byte, tpuEndpoint) error {
+		forwarded++
+		return nil
+	}
+	t.Cleanup(func() { assert.Zero(t, forwarded, "signature failures must never reach TPU forwarding") })
 
 	tx, wire := testLegacyTransaction(t)
 	_, err := rpcServer.SendTransaction(
