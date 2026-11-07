@@ -22,8 +22,9 @@ type LeaderForSlotFunc func(slot uint64) (solana.PublicKey, bool)
 type UDPReceiver struct {
 	Addr string
 
-	assembler *SlotAssembler
-	reception *receptionMonitoring // Opt-in; configured before Run.
+	assembler    *SlotAssembler
+	reception    *receptionMonitoring // Opt-in; configured before Run.
+	shredHistory *ShredHistoryHandle  // Opt-in; configured before Run.
 	// A reset must be atomic with respect to both network ingestion and spool
 	// hydration. Otherwise a hydrator can read a soon-to-be-discarded file,
 	// lose the race with ResetSlot, and feed its stale packets straight back
@@ -175,6 +176,13 @@ func (r *UDPReceiver) SetRetransmit(cfg RetransmitConfig) error {
 
 func (r *UDPReceiver) SetLeaderForSlot(fn LeaderForSlotFunc) {
 	r.leaderForSlot = fn
+}
+
+// SetShredHistoryBeforeRun attaches one registered handle before Run starts.
+// A nil handle disables receipt history. Do not replace it during Run or share
+// it with another receiver; Run retires it after its producers have joined.
+func (r *UDPReceiver) SetShredHistoryBeforeRun(handle *ShredHistoryHandle) {
+	r.shredHistory = handle
 }
 
 // SetFirstShredSink registers the Votor early-crashed-leader signal. The sink
@@ -635,6 +643,10 @@ func (r *UDPReceiver) signalReady(err error) {
 }
 
 func (r *UDPReceiver) Run(ctx context.Context) error {
+	if handle := r.shredHistory; handle != nil {
+		// This last defer also covers startup failures before readers exist.
+		defer handle.Retire()
+	}
 	defer r.once.Do(func() {
 		close(r.blocks)
 		close(r.errs)
@@ -676,7 +688,6 @@ func (r *UDPReceiver) Run(ctx context.Context) error {
 		defer repairConn.Close()
 		gossip.BoostUDPReceiveBuffer(repairConn, gossip.TurbineUDPReceiveBufferBytes, "turbine repair receiver")
 	}
-
 	socketGeneration := r.attachSocketMemoryOwners(liveConn, repairConn)
 	defer r.detachSocketMemoryOwners(socketGeneration)
 
@@ -900,6 +911,22 @@ func (r *UDPReceiver) processPacket(ctx context.Context, conn *net.UDPConn, pack
 	}
 	if r.reception != nil && !onRepairSocket && authenticatedRoot != nil {
 		r.reception.observe(shred.Slot, receivedAt)
+	}
+	if r.shredHistory != nil && authenticatedRoot != nil {
+		origin := ShredHistoryTVU
+		if onRepairSocket {
+			origin = ShredHistoryRepairUnmatched
+			if matchedRepair {
+				origin = ShredHistoryRepairMatched
+			}
+		}
+		// Count admitted occurrences before spool/assembly deduplication. The
+		// recorder owns bounded refusal accounting; it cannot affect admission.
+		r.shredHistory.TryReceipt(ShredHistoryReceipt{
+			At: receivedAt, Root: *authenticatedRoot, Slot: shred.Slot,
+			Index: shred.Index, FECSetIndex: shred.FECSetIndex,
+			Version: shred.Version, Variant: shred.Variant, Origin: origin,
+		})
 	}
 	if r.repairClient != nil {
 		// A leader-valid broadcast with a forged upstream signature is not an

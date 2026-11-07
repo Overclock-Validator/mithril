@@ -83,7 +83,8 @@ func (c *Client) EnableMonitoring() {
 	}
 }
 
-// EnableSocketMemoryMonitoring opts into low-rate owner socket observations.
+// EnableSocketMemoryMonitoring separately opts into low-rate kernel reads from
+// the actual Run owner. Ordinary monitoring does not enable these reads.
 func (c *Client) EnableSocketMemoryMonitoring() {
 	if c != nil {
 		c.socketMemoryEnabled.Store(true)

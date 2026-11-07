@@ -1,10 +1,8 @@
 package dashboard
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -67,18 +65,7 @@ func newLocalPeerReader(client *http.Client, gate *atomic.Pointer[localPeerGate]
 }
 
 func (r *localPeerReader) run(ctx context.Context) {
-	defer close(r.done)
-	defer r.client.CloseIdleConnections()
-	for ctx.Err() == nil {
-		r.collect(ctx)
-		timer := time.NewTimer(10 * time.Second)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return
-		case <-timer.C:
-		}
-	}
+	runDetailReader(ctx, r.done, r.client, 10*time.Second, r.collect)
 }
 
 func (r *localPeerReader) collect(ctx context.Context) {
@@ -207,21 +194,9 @@ func (r *localPeerReader) collect(ctx context.Context) {
 }
 
 func decodeLocalPeerFailure(body []byte) string {
-	var failure struct {
-		SchemaVersion int    `json:"schema_version"`
-		Family        string `json:"family"`
-		State         string `json:"state"`
-		Reason        string `json:"reason"`
-	}
-	if len(body) > 512 || json.Unmarshal(body, &failure) != nil || failure.SchemaVersion != 1 ||
-		failure.Family != "local_peers" || failure.State != "unavailable" || networkDetailReason(failure.Reason) != failure.Reason || failure.Reason == "invalid_request" {
-		return "source_invalid"
-	}
-	canonical, err := json.Marshal(failure)
-	if err != nil || !bytes.Equal(body, canonical) {
-		return "source_invalid"
-	}
-	return failure.Reason
+	return decodeDetailFailure(body, "local_peers", func(reason string) bool {
+		return reason != "invalid_request" && networkDetailReason(reason) == reason
+	})
 }
 
 func (c *collector) admitLocalPeers(r *localPeerReader, reply localPeerReply) (time.Duration, bool) {

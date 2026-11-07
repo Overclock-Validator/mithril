@@ -46,7 +46,7 @@ func (c *stepClock) step(into *time.Duration) {
 // pebbleEventListener reports one Pebble store's flushes, compactions, write
 // stalls and slow disk operations into the diagnostics summary, with warnings
 // for any write stall or slow disk operation and for unusually long jobs.
-func pebbleEventListener(store string) *pebble.EventListener {
+func pebbleEventListener(store string, observation *writeStallRecorder) *pebble.EventListener {
 	flush := metrics.Background("pebble."+store+".flush", 2*time.Second)
 	compaction := metrics.Background("pebble."+store+".compaction", 10*time.Second)
 	stall := metrics.Background("pebble."+store+".write_stall", time.Millisecond)
@@ -81,14 +81,18 @@ func pebbleEventListener(store string) *pebble.EventListener {
 		WriteStallBegin: func(info pebble.WriteStallBeginInfo) {
 			reason := info.Reason
 			stallReason.Store(&reason)
-			stallStart.Store(time.Now().UnixNano())
+			now := time.Now()
+			stallStart.Store(now.UnixNano())
+			observation.begin(now, reason)
 		},
 		WriteStallEnd: func() {
 			start := stallStart.Swap(0)
 			if start == 0 {
 				return
 			}
-			stall.Observe(time.Since(time.Unix(0, start)), func() string {
+			now := time.Now()
+			observation.end(now)
+			stall.Observe(now.Sub(time.Unix(0, start)), func() string {
 				if p := stallReason.Load(); p != nil {
 					return "writes blocked: " + *p
 				}

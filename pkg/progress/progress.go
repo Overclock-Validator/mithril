@@ -253,6 +253,7 @@ type DualProgress struct {
 	terminal            *DualProgressObservation
 	incremental         bool
 	incrementalProgress func(uint64, string) *DualProgress
+	indexingProgress    func() *IndexingProgress
 	manifestObserver    func(bool, uint64, time.Time)
 }
 
@@ -349,6 +350,42 @@ func (d *DualProgress) NewIncrementalProgress(slot uint64, kind string) *DualPro
 	}
 	next.incremental = true
 	return next
+}
+
+// SetIndexingProgress configures a per-build constructor before archive Start.
+func (d *DualProgress) SetIndexingProgress(create func() *IndexingProgress) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.started {
+		return false
+	}
+	d.indexingProgress = create
+	return true
+}
+
+// NewIndexingProgress preserves the ordinary display when observation is off
+// or the archive owner is not successfully stopped and joined.
+func (d *DualProgress) NewIndexingProgress() *IndexingProgress {
+	if d != nil {
+		d.mu.Lock()
+		create, ready := d.indexingProgress, d.started && d.done && !d.interrupted
+		d.mu.Unlock()
+		if create != nil && ready {
+			select {
+			case <-d.doneCh:
+				if next := create(); next != nil {
+					next.mu.Lock()
+					started := next.started
+					next.mu.Unlock()
+					if !started {
+						return next
+					}
+				}
+			default:
+			}
+		}
+	}
+	return NewIndexingProgress("Flush (shard logs)")
 }
 
 func (d *DualProgress) observationLocked(state string, now time.Time) (DualProgressObservation, bool) {
@@ -601,14 +638,90 @@ func (d *DualProgress) IsInterrupted() bool {
 
 // IndexingProgress tracks shard flush progress
 type IndexingProgress struct {
-	label     string
-	total     int
-	completed atomic.Int32
-	startTime time.Time
-	output    io.Writer
-	useColor  bool
-	mu        sync.Mutex
-	started   bool
+	label       string
+	total       int
+	completed   atomic.Int32
+	startTime   time.Time
+	output      io.Writer
+	useColor    bool
+	mu          sync.Mutex
+	started     bool
+	observer    func(IndexingProgressObservation)
+	observation *IndexingProgressObservation
+}
+
+// IndexingProgressObservation counts successful shard-write function returns,
+// not finalized SST files, durability or bootstrap readiness. The separate
+// SSTIngestReturnedAt event records only a later successful ingestion return.
+type IndexingProgressObservation struct {
+	StartedAt, CapturedAt time.Time
+	SSTIngestReturnedAt   time.Time
+	State                 string
+	Completed, Total      uint32
+}
+
+// SetObserver is startup-only. Callbacks must store a detached value promptly
+// without I/O or calling this display. They run outside its lock.
+func (p *IndexingProgress) SetObserver(observer func(IndexingProgressObservation)) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.started {
+		return false
+	}
+	p.observer = observer
+	return true
+}
+
+func (p *IndexingProgress) observationLocked(completed, total int, state string) (func(IndexingProgressObservation), IndexingProgressObservation) {
+	if p.observer == nil || !p.started || total < 1 || total > 1000 || completed < 0 || completed > total ||
+		p.observation != nil && (p.observation.State != "active" || p.observation.Total != uint32(total)) {
+		return nil, IndexingProgressObservation{}
+	}
+	if state == "active" && p.observation != nil && uint32(completed) <= p.observation.Completed {
+		return nil, IndexingProgressObservation{}
+	}
+	o := IndexingProgressObservation{StartedAt: p.startTime, CapturedAt: time.Now(), State: state, Completed: uint32(completed), Total: uint32(total)}
+	if p.observation != nil {
+		o.Completed = max(o.Completed, p.observation.Completed)
+	}
+	p.observation = &o
+	return p.observer, o
+}
+
+// RecordResult records only the actual CloseWithProgress return. It does not
+// fill a missing count or infer successful SST finalization from a nil error.
+func (p *IndexingProgress) RecordResult(err error) {
+	p.mu.Lock()
+	state := "returned"
+	if err != nil {
+		state = "error"
+	}
+	completed, total := int(p.completed.Load()), p.total
+	if p.observation != nil {
+		completed, total = int(p.observation.Completed), int(p.observation.Total)
+	}
+	callback, o := p.observationLocked(completed, total, state)
+	p.mu.Unlock()
+	if callback != nil {
+		callback(o)
+	}
+}
+
+// RecordSSTIngestReturn records a successful ingestSSTFiles return once, without
+// changing the flush result, counts or original terminal date. It does not imply
+// that later synchronization or database opening has completed.
+func (p *IndexingProgress) RecordSSTIngestReturn() {
+	p.mu.Lock()
+	if p.observer == nil || p.observation == nil || p.observation.State == "active" || !p.observation.SSTIngestReturnedAt.IsZero() {
+		p.mu.Unlock()
+		return
+	}
+	o := *p.observation
+	o.SSTIngestReturnedAt = time.Now()
+	p.observation = &o
+	callback := p.observer
+	p.mu.Unlock()
+	callback(o)
 }
 
 // NewIndexingProgress creates a new indexing progress display
@@ -625,17 +738,32 @@ func NewIndexingProgress(label string) *IndexingProgress {
 // Start initializes the display with total count
 func (p *IndexingProgress) Start(total int) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	if p.started && p.observer != nil {
+		p.mu.Unlock()
+		return
+	}
 	p.total = total
 	p.started = true
 	p.startTime = time.Now()
+	callback, o := p.observationLocked(0, total, "active")
+	p.mu.Unlock()
+	if callback != nil {
+		callback(o)
+	}
 	// Don't reserve a line here - first Update will render in place
 }
 
 // Update updates progress and re-renders
 func (p *IndexingProgress) Update(completed, total int) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	var callback func(IndexingProgressObservation)
+	var o IndexingProgressObservation
+	defer func() {
+		p.mu.Unlock()
+		if callback != nil {
+			callback(o)
+		}
+	}()
 
 	if !p.started {
 		return
@@ -643,6 +771,7 @@ func (p *IndexingProgress) Update(completed, total int) {
 
 	prevCompleted := p.completed.Swap(int32(completed))
 	p.total = total
+	callback, o = p.observationLocked(completed, total, "active")
 
 	// On first update (prevCompleted was 0), just clear current line
 	// On subsequent updates, move up first then clear

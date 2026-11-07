@@ -23,7 +23,7 @@ type deadPayload struct{ offset, length int64 }
 // A crash before the marker leaves the original fold intact; a crash after it
 // leaves some or all dead pages allocated. Either state is safe and retryable.
 // Caller holds foldMu and has excluded every in-horizon/parked whole-file pin.
-func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte, indexCache *sparseIndexCache) (reclaimed, scanned int64, deleted bool, err error) {
+func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte, indexCache *sparseIndexCache, observation *compactionLivenessScan) (reclaimed, scanned int64, deleted bool, err error) {
 	m, err := ReadSegmentManifest(c.manifestPath)
 	if err != nil {
 		return 0, 0, false, err
@@ -50,6 +50,7 @@ func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte,
 	var dead []deadPayload
 	retained, foundUndo := 0, 0
 	var next uint64
+	var liveBytes, undoBytes, holeBytes uint64
 	for _, r := range m.Records {
 		if r.Offset != next || r.Offset > m.DataLen || m.DataLen-r.Offset < hdrLen {
 			return 0, scanned, false, fmt.Errorf("invalid record offset %d in %s", r.Offset, c.name)
@@ -79,11 +80,19 @@ func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte,
 		if getErr != nil {
 			return 0, scanned, false, getErr
 		}
-		if found && current.FileId == c.fileId {
+		currentLive := found && current.FileId == c.fileId
+		if currentLive {
 			if current.Offset != r.Offset || current.Slot != c.slot {
 				return 0, scanned, false, fmt.Errorf("index location disagrees with source for %x", r.Pubkey)
 			}
 			keep = true
+		}
+		if observation != nil {
+			if currentLive {
+				liveBytes += next - r.Offset
+			} else if keep {
+				undoBytes += next - r.Offset
+			}
 		}
 		if keep {
 			retained++
@@ -95,10 +104,16 @@ func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte,
 		end := (int64(r.Offset) + hdrLen + int64(length)) &^ int64(4095)
 		if end > start {
 			dead = append(dead, deadPayload{start, end - start})
+			if observation != nil {
+				holeBytes += uint64(end - start)
+			}
 		}
 	}
 	if next != m.DataLen || foundUndo != len(undo) {
 		return 0, scanned, false, fmt.Errorf("manifest does not cover source or all undo records")
+	}
+	if observation != nil {
+		*observation = compactionLivenessScan{complete: true, examined: m.DataLen, live: liveBytes, undo: undoBytes, holes: holeBytes}
 	}
 	if retained > 0 && len(dead) == 0 {
 		return 0, scanned, false, nil

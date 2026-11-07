@@ -71,6 +71,9 @@ type ServiceConfig struct {
 	Workers int
 	// Dialer replaces the TCP dialer, for tests.
 	Dialer func(ctx context.Context, addr string) (net.Conn, error)
+	// Observe receives detached measurements on the existing metrics owner.
+	// It must return promptly without I/O. Nil disables these observations.
+	Observe func(ServiceObservation)
 }
 
 // Service runs a validator's Harmonic integration: the block engine and
@@ -89,6 +92,8 @@ type Service struct {
 	clientIDAdvertised                       atomic.Bool
 	harmonicClientIDAfter, baseClientIDAfter time.Duration
 	metricsInterval                          time.Duration
+	observationStartedAt                     time.Time
+	lastSlot                                 atomic.Pointer[SlotObservation]
 }
 
 func NewService(cfg ServiceConfig) (*Service, error) {
@@ -118,12 +123,17 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		OnHealth:           s.blockEngineHealthChanged,
 		Dialer:             cfg.Dialer,
 	})
+	onReport := reportSlot
+	if cfg.Observe != nil {
+		s.observationStartedAt = time.Now()
+		onReport = s.observeSlotReport
+	}
 	s.executor = NewExecutor(ExecutorConfig{
 		BlockEngine: s.blockEngine,
 		Pipeline:    s.pipeline,
 		Events:      events,
 		Crank:       crank.Builder(s.blockEngine),
-		OnReport:    reportSlot,
+		OnReport:    onReport,
 		Workers:     cfg.Workers,
 	})
 	if cfg.Relayer.Target != "" {

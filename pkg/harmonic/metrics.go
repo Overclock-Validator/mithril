@@ -69,10 +69,15 @@ func (s *Service) publishStats(last statsSnapshot) statsSnapshot {
 	countDelta(statsd.HarmonicBlockBundles, p.InvalidBundles, prevP.InvalidBundles, "invalid")
 	countDelta(statsd.HarmonicBlockTransactions, p.Transactions, prevP.Transactions)
 
-	setGauge(statsd.HarmonicBlockEngineHealthy, s.blockEngine.Healthy())
-	setGauge(statsd.HarmonicRelayerConnected, s.relayer != nil && s.relayer.Status() != nil)
-	setGauge(statsd.HarmonicRelayerTPUAdvertised, s.tpu.RelayerAdvertised())
-	setGauge(statsd.HarmonicClientIDAdvertised, s.clientIDAdvertised.Load())
+	healthy := s.blockEngine.Healthy()
+	relayerUsable := s.relayer != nil && s.relayer.Status() != nil
+	relayerAdvertised := s.tpu.RelayerAdvertised()
+	clientIDAdvertised := s.clientIDAdvertised.Load()
+	setGauge(statsd.HarmonicBlockEngineHealthy, healthy)
+	setGauge(statsd.HarmonicRelayerConnected, relayerUsable)
+	setGauge(statsd.HarmonicRelayerTPUAdvertised, relayerAdvertised)
+	setGauge(statsd.HarmonicClientIDAdvertised, clientIDAdvertised)
+	s.observeStats(now, healthy, relayerUsable, relayerAdvertised, clientIDAdvertised)
 	return now
 }
 

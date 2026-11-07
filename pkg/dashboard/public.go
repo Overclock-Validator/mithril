@@ -25,6 +25,7 @@ type PublicSnapshot struct {
 	Resources     *PublicResources  `json:"resources,omitempty"`
 	Startup       *PublicStartup    `json:"startup,omitempty"`
 	Peers         *PublicPeers      `json:"peers,omitempty"`
+	Harmonic      *PublicHarmonic   `json:"harmonic,omitempty"`
 }
 
 // PublicNode identifies the linked node and its configured capabilities.
@@ -69,6 +70,7 @@ type PublicReplay struct {
 	SlotHistory           *PublicSlotHistory         `json:"slot_history,omitempty"`
 	ChainActivity         *PublicChainActivity       `json:"chain_activity,omitempty"`
 	EpochOutcomes         *PublicEpochOutcomes       `json:"epoch_outcomes,omitempty"`
+	PaymentOutcomes       *PublicPaymentOutcomes     `json:"payment_outcomes,omitempty"`
 	RewardHealth          *PublicRewardHealth        `json:"reward_health,omitempty"`
 	AccountFacts          *PublicAccountFacts        `json:"account_facts,omitempty"`
 }
@@ -149,12 +151,13 @@ type PublicBlock struct {
 // PublicConsensus separates verified progress from unverified receiver activity.
 type PublicConsensus struct {
 	PublicObservation
-	NotarizedSlot    *uint64         `json:"notarized_slot,string"`
-	FinalizedSlot    *uint64         `json:"direct_finalized_slot,string"`
-	FinalizedBlockID *string         `json:"direct_finalized_block_id"`
-	VotingEnabled    bool            `json:"voting_enabled"`
-	SafetyFault      *bool           `json:"safety_fault,omitempty"`
-	Receiver         *PublicReceiver `json:"receiver,omitempty"`
+	NotarizedSlot    *uint64               `json:"notarized_slot,string"`
+	FinalizedSlot    *uint64               `json:"direct_finalized_slot,string"`
+	FinalizedBlockID *string               `json:"direct_finalized_block_id"`
+	VotingEnabled    bool                  `json:"voting_enabled"`
+	SafetyFault      *bool                 `json:"safety_fault,omitempty"`
+	BlockLifecycle   *PublicBlockLifecycle `json:"block_lifecycle,omitempty"`
+	Receiver         *PublicReceiver       `json:"receiver,omitempty"`
 }
 
 // PublicReceiver contains the allowlisted receiver counters.
@@ -172,19 +175,20 @@ type PublicReceiver struct {
 // Activity counters span the voter instance, including any identity changes.
 type PublicVoting struct {
 	PublicObservation
-	ActivityScope      string     `json:"activity_scope"`
-	Identity           string     `json:"identity"`
-	VoteAccount        string     `json:"vote_account"`
-	Epoch              *uint64    `json:"epoch,string"`
-	RootSlot           *uint64    `json:"root_slot,string"`
-	KeyEligible        *bool      `json:"key_eligible"`
-	AdmittedStake      *uint64    `json:"admitted_stake_lamports,string"`
-	TotalAdmittedStake *uint64    `json:"total_admitted_stake_lamports,string"`
-	VotesCast          uint64     `json:"votes_cast_this_run,string"`
-	NetworkLanded      uint64     `json:"network_landed_votes,string"`
-	LastNetworkSlot    *uint64    `json:"last_network_landed_slot,string"`
-	LastNetworkAt      *time.Time `json:"last_network_landed_at,omitempty"`
-	JoinedLive         *bool      `json:"joined_live,omitempty"`
+	NextEpochSigner    *PublicNextEpochSigner `json:"next_epoch_signer,omitempty"`
+	ActivityScope      string                 `json:"activity_scope"`
+	Identity           string                 `json:"identity"`
+	VoteAccount        string                 `json:"vote_account"`
+	Epoch              *uint64                `json:"epoch,string"`
+	RootSlot           *uint64                `json:"root_slot,string"`
+	KeyEligible        *bool                  `json:"key_eligible"`
+	AdmittedStake      *uint64                `json:"admitted_stake_lamports,string"`
+	TotalAdmittedStake *uint64                `json:"total_admitted_stake_lamports,string"`
+	VotesCast          uint64                 `json:"votes_cast_this_run,string"`
+	NetworkLanded      uint64                 `json:"network_landed_votes,string"`
+	LastNetworkSlot    *uint64                `json:"last_network_landed_slot,string"`
+	LastNetworkAt      *time.Time             `json:"last_network_landed_at,omitempty"`
+	JoinedLive         *bool                  `json:"joined_live,omitempty"`
 }
 
 // PublicRPC reports configured service observations, not request contents.
@@ -336,16 +340,16 @@ func validCertificateOutcomeWindow(c *CertificateOutcomes, durable *uint64) bool
 
 // encodePublicSnapshot explicitly copies permitted fields. Optional resource
 // aggregates are already projected; raw recovery hashes and diagnostics stay private.
-func encodePublicSnapshot(s *Snapshot, state string, now time.Time, throughput *PublicThroughput, resources *PublicResources, peers *PublicPeers) ([]byte, error) {
-	return encodePublicSnapshotProfile(s, state, now, throughput, resources, peers, 0)
+func encodePublicSnapshot(s *Snapshot, state string, now time.Time, throughput *PublicThroughput, resources *PublicResources, peers *PublicPeers, harmonic *PublicHarmonic) ([]byte, error) {
+	return encodePublicSnapshotProfile(s, state, now, throughput, resources, peers, harmonic, 0)
 }
 
 // The default profile stays readable by existing strict v1 clients. New
 // optional fields are sent only to clients that explicitly request them.
-func encodePublicSnapshotProfile(s *Snapshot, state string, now time.Time, throughput *PublicThroughput, resources *PublicResources, peers *PublicPeers, manifestProfile int) ([]byte, error) {
+func encodePublicSnapshotProfile(s *Snapshot, state string, now time.Time, throughput *PublicThroughput, resources *PublicResources, peers *PublicPeers, harmonic *PublicHarmonic, manifestProfile int) ([]byte, error) {
 	if resources != nil && manifestProfile != 4 {
 		legacy := *resources
-		legacy.Cgroup = nil
+		legacy.Cgroup, legacy.Compaction = nil, nil
 		resources = &legacy
 	}
 	p := PublicSnapshot{SchemaVersion: 1, SourceState: state, CollectorAt: now, Resources: resources, Peers: peers}
@@ -356,12 +360,18 @@ func encodePublicSnapshotProfile(s *Snapshot, state string, now time.Time, throu
 		p.SourceState = "unavailable"
 	}
 	if s != nil && state != "unavailable" {
+		if resources != nil && manifestProfile == 4 {
+			p.Harmonic = harmonic
+		}
 		p.Throughput = throughput
 		p.Startup = publicStartup(s, state, now)
 		if manifestProfile == 0 {
 			p.Startup.SnapshotManifests = nil
 		} else if manifestProfile == 1 && p.Startup.SnapshotManifests != nil {
 			p.Startup.SnapshotManifests.ReadyMarker = nil
+		}
+		if manifestProfile != 4 {
+			p.Startup.SnapshotShardFlush = nil
 		}
 		network := "unknown"
 		switch s.Network {
@@ -391,6 +401,9 @@ func encodePublicSnapshotProfile(s *Snapshot, state string, now time.Time, throu
 			p.Consensus = &PublicConsensus{PublicObservation: publicObservation(c.SampledAt, state, now),
 				NotarizedSlot: c.NotarizedSlot,
 				FinalizedSlot: c.FinalizedSlot, FinalizedBlockID: c.FinalizedBlockID, VotingEnabled: c.VotingEnabled}
+			if manifestProfile == 4 {
+				p.Consensus.BlockLifecycle = publicBlockLifecycle(s, state, now)
+			}
 			if (manifestProfile == 3 || manifestProfile == 4) && c.SafetyFault != nil {
 				fault := *c.SafetyFault
 				p.Consensus.SafetyFault = &fault
@@ -416,6 +429,9 @@ func encodePublicSnapshotProfile(s *Snapshot, state string, now time.Time, throu
 					observed := at.UTC()
 					p.Voting.LastNetworkAt = &observed
 				}
+				if manifestProfile == 4 {
+					p.Voting.NextEpochSigner = publicNextEpochSigner(s, state, now)
+				}
 				if v.JoinedLive != nil {
 					joined := *v.JoinedLive
 					p.Voting.JoinedLive = &joined
@@ -424,6 +440,9 @@ func encodePublicSnapshotProfile(s *Snapshot, state string, now time.Time, throu
 		}
 		if p.Replay != nil {
 			p.Replay.EpochOutcomes = publicEpochOutcomes(s, p.Voting, state, now)
+			if manifestProfile == 4 {
+				p.Replay.PaymentOutcomes = publicPaymentOutcomes(s, p.Voting, state, now)
+			}
 			p.Replay.RewardHealth = publicRewardHealth(s, p.Voting, state, now)
 			p.Replay.AccountFacts = publicAccountFacts(s, state, now)
 		}

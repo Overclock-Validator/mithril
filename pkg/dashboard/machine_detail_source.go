@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -27,47 +26,8 @@ type machineDetailReply struct {
 	remainingMilliseconds int64
 }
 
-func validMachineDigest(value string) bool {
-	if len(value) != 64 {
-		return false
-	}
-	for _, c := range value {
-		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
-			return false
-		}
-	}
-	return true
-}
-
 func parseMachineDetailQuery(raw string, force bool) (generation string, page int, pageRequest, ok bool) {
-	if raw == "" {
-		return "", 0, false, !force
-	}
-	first, second, found := strings.Cut(raw, "&")
-	if len(raw) > 128 || !found || strings.Contains(second, "&") {
-		return "", 0, false, false
-	}
-	var pageText string
-	for _, part := range [...]string{first, second} {
-		switch {
-		case strings.HasPrefix(part, "generation=") && generation == "":
-			generation = strings.TrimPrefix(part, "generation=")
-		case strings.HasPrefix(part, "page=") && pageText == "":
-			pageText = strings.TrimPrefix(part, "page=")
-		default:
-			return "", 0, false, false
-		}
-	}
-	if !validMachineDigest(generation) || pageText == "" || len(pageText) > 3 || len(pageText) > 1 && pageText[0] == '0' {
-		return "", 0, false, false
-	}
-	for _, c := range pageText {
-		if c < '0' || c > '9' {
-			return "", 0, false, false
-		}
-	}
-	page, err := strconv.Atoi(pageText)
-	return generation, page, true, err == nil && page < machineMaxPages
+	return parseDetailQuery(raw, force, machineMaxPages)
 }
 
 // MachineDetailCapture shares an immutable, already encoded owner capture.

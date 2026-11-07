@@ -34,47 +34,60 @@ type ReceptionObservation struct {
 	Session            uint64
 	WindowMilliseconds uint64
 	Progress           turbine.ReceptionSnapshot
+	history            *turbine.ShredHistoryHandle
+}
+
+// ShredHistoryTarget returns the original receiver's optional history handle.
+// It is not the successful-session counter and is never resolved on read.
+func (r ReceptionObservation) ShredHistoryTarget() *turbine.ShredHistoryHandle { return r.history }
+
+// MarkReceptionHistoryUnknown records a first completion whose original
+// receiver context is missing, without selecting a replacement receiver.
+func (bs *BlockSource) MarkReceptionHistoryUnknown() bool {
+	return bs != nil && bs.shredHistory.MarkMarkerUnknown()
 }
 
 // TurbineObservation is cumulative within (SourceStartedAt, Session), not a
 // node-run total. Data/coding shred counts precede signature verification.
 // Repair responses and late responses are separate matched-response counters.
 type TurbineObservation struct {
-	SampledAt              time.Time
-	StartedAt              time.Time
-	Session                uint64
-	Packets                uint64
-	DataShreds             uint64
-	CodingShreds           uint64
-	ParseErrors            uint64
-	SignatureErrors        uint64
-	MissingLeaders         uint64
-	ShredVersionMismatch   uint64
-	UsefulRepairShreds     uint64
-	SpooledRepairShreds    uint64
-	LastPacketAt           time.Time
-	RepairEnabled          bool
-	RepairRequests         uint64
-	RepairResponses        uint64
-	RepairLateResponses    uint64
-	RepairTimeouts         uint64
-	RepairErrors           uint64
-	Frontiers              turbine.ShredFrontiers
-	BlocksEmitted          uint64
-	RecoveredData          uint64
-	AssemblyErrors         uint64
-	ActiveSlots            int
-	EvictedSlots           uint64
-	IgnoredOldShreds       uint64
-	SigVerifies            uint64
-	SigVerifyCached        uint64
-	RetransmitEnabled      bool
-	PeerPayloadBytes       uint64
-	RepairOutstanding      int
-	RepairPeers            int
-	RepairResponding       int
-	SocketMemory           turbine.ReceiverSocketMemory
-	SocketMemoryObserved   bool
+	SampledAt            time.Time
+	StartedAt            time.Time
+	Session              uint64
+	Packets              uint64
+	DataShreds           uint64
+	CodingShreds         uint64
+	ParseErrors          uint64
+	SignatureErrors      uint64
+	MissingLeaders       uint64
+	ShredVersionMismatch uint64
+	UsefulRepairShreds   uint64
+	SpooledRepairShreds  uint64
+	LastPacketAt         time.Time
+	RepairEnabled        bool
+	RepairRequests       uint64
+	RepairResponses      uint64
+	RepairLateResponses  uint64
+	RepairTimeouts       uint64
+	RepairErrors         uint64
+	Frontiers            turbine.ShredFrontiers
+	BlocksEmitted        uint64
+	RecoveredData        uint64
+	AssemblyErrors       uint64
+	ActiveSlots          int
+	EvictedSlots         uint64
+	IgnoredOldShreds     uint64
+	SigVerifies          uint64
+	SigVerifyCached      uint64
+	RetransmitEnabled    bool
+	PeerPayloadBytes     uint64
+	RepairOutstanding    int
+	RepairPeers          int
+	RepairResponding     int
+	SocketMemory         turbine.ReceiverSocketMemory
+	SocketMemoryObserved bool
+	// SocketMemoryObservedAt retains the owner's monotonic clock for detail
+	// freshness when an unsupported-platform socket getter has no own clock.
 	SocketMemoryObservedAt time.Time
 }
 
@@ -82,10 +95,12 @@ type TurbineObservation struct {
 // Call only before Start; readers never initialize or sample the receiver.
 func (bs *BlockSource) EnableMonitoring() { bs.monitoringEnabled = true }
 
-// EnableSocketMemoryMonitoring opts into receiver-owned socket observations.
+// EnableSocketMemoryMonitoring opts into receiver-owned socket OS reads.
+// Call only before Start, together with EnableMonitoring.
 func (bs *BlockSource) EnableSocketMemoryMonitoring() { bs.socketMemoryMonitoring = true }
 
-// SetGossipObserver selects a monitoring attachment before Start.
+// SetGossipObserver selects a monitoring-only attachment callback before Start.
+// With monitoring enabled it receives the chosen client, never a nil detach.
 func (bs *BlockSource) SetGossipObserver(observer func(*gossip.Client)) { bs.gossipObserver = observer }
 
 // NetworkSnapshot copies bounded scalars without receiver calls, I/O, map scans
@@ -129,12 +144,12 @@ func (bs *BlockSource) NetworkSnapshot() (NetworkSnapshot, bool) {
 	return s, true
 }
 
-func (bs *BlockSource) publishReceptionObservation(started time.Time, session uint64, progress turbine.ReceptionSnapshot) {
+func (bs *BlockSource) publishReceptionObservation(started time.Time, session uint64, progress turbine.ReceptionSnapshot, history *turbine.ShredHistoryHandle) {
 	if !bs.monitoringEnabled {
 		return
 	}
 	bs.receptionObservation.Store(&ReceptionObservation{StartedAt: started.UTC(), Session: session,
-		WindowMilliseconds: uint64(turbine.ReceptionWindow / time.Millisecond), Progress: progress})
+		WindowMilliseconds: uint64(turbine.ReceptionWindow / time.Millisecond), Progress: progress, history: history})
 }
 
 // CachedReceptionObservation copies the connected source's existing TVU cache.

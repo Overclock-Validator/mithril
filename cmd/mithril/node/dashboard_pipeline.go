@@ -8,6 +8,46 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/tpu"
 )
 
+// The feed owns this detached copy. Attachment time is not counter-zero time;
+// replacement can lower the counts and no continuity or rate is inferred.
+type schedulerBudgetObservation struct {
+	service                *tpu.TPU
+	owner                  *scheduler.Scheduler
+	runID, genesis         string
+	nodeStarted, sampledAt time.Time
+	value                  dashboard.ProductionSchedulerDetail
+}
+
+func (d *nodeDashboard) observeSchedulerBudget(service *tpu.TPU, owner *scheduler.Scheduler, node dashboard.Snapshot, stats scheduler.Stats, sampledAt time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.productionDetails || service == nil || owner == nil || d.tpu != service || d.scheduler != owner ||
+		node.Mode != "validator" || !node.Alpenglow || d.state.Mode != node.Mode || d.state.Alpenglow != node.Alpenglow ||
+		node.RunID != d.state.RunID || !node.StartedAt.Equal(d.state.StartedAt) ||
+		node.GenesisHash == nil || d.state.GenesisHash == nil || *node.GenesisHash != *d.state.GenesisHash {
+		return
+	}
+	if previous := d.schedulerBudget; previous != nil && previous.owner == owner && previous.service == service && previous.sampledAt.After(sampledAt) {
+		return
+	}
+	d.schedulerBudget = &schedulerBudgetObservation{service: service, owner: owner, runID: node.RunID,
+		genesis: *node.GenesisHash, nodeStarted: node.StartedAt, sampledAt: sampledAt,
+		value: dashboard.ProductionSchedulerDetail{Scope: "attached_scheduler_snapshot", SampledAt: sampledAt.UTC(),
+			BlockCost: stats.DroppedBlockCost, AccountCost: stats.DroppedAccountCost,
+			AllocatedData: stats.DroppedAllocCost, EntryBytes: stats.DroppedBatchBytes}}
+}
+
+// Requires d.mu. Return the original observation, never a redated record.
+func (d *nodeDashboard) schedulerBudgetFor(binding dashboard.ProductionDetailBinding, now time.Time) *schedulerBudgetObservation {
+	o := d.schedulerBudget
+	if o == nil || o.service != d.tpu || o.owner != d.scheduler || o.runID != binding.RunID ||
+		!o.nodeStarted.Equal(binding.NodeStartedAt) || o.genesis != binding.GenesisHash ||
+		now.Before(o.sampledAt) || !o.sampledAt.Add(dashboard.ProductionDetailFreshFor).After(now) {
+		return nil
+	}
+	return o
+}
+
 // pipelineMeasurement copies the existing service observations. The caller
 // binds StartedAt to this TPU/scheduler pair and samples outside viewer paths.
 // A negative queue observation is unknown, not zero or an unsigned conversion.

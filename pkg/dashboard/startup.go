@@ -11,6 +11,41 @@ type PublicStartup struct {
 	SnapshotManifests  *PublicSnapshotManifests  `json:"snapshot_manifests,omitempty"`
 	SnapshotArchive    *PublicSnapshotArchive    `json:"snapshot_archive,omitempty"`
 	IncrementalArchive *PublicIncrementalArchive `json:"incremental_archive,omitempty"`
+	SnapshotShardFlush *PublicSnapshotShardFlush `json:"snapshot_shard_flush,omitempty"`
+}
+
+// SnapshotShardFlush reports successful shard-write function returns and the
+// aggregate flush call's result, not SST durability or bootstrap readiness.
+type SnapshotShardFlush struct {
+	Attempt             uint64     `json:"attempt,string"`
+	StartedAt           time.Time  `json:"started_at"`
+	SampledAt           time.Time  `json:"sampled_at"`
+	Phase               string     `json:"phase"`
+	FullSnapshotSlot    uint64     `json:"full_snapshot_slot,string"`
+	IncrementalSlot     *uint64    `json:"incremental_slot,string"`
+	CompletedShards     uint32     `json:"completed_shards,string"`
+	TotalShards         uint32     `json:"total_shards,string"`
+	SSTIngestReturnedAt *time.Time `json:"sst_ingest_returned_at,omitempty"`
+}
+
+type PublicSnapshotShardFlush struct {
+	PublicObservation
+	Attempt             uint64     `json:"attempt,string"`
+	StartedAt           time.Time  `json:"started_at"`
+	Phase               string     `json:"phase"`
+	FullSnapshotSlot    uint64     `json:"full_snapshot_slot,string"`
+	IncrementalSlot     *uint64    `json:"incremental_slot,string"`
+	CompletedShards     uint32     `json:"completed_shards,string"`
+	TotalShards         uint32     `json:"total_shards,string"`
+	SSTIngestReturnedAt *time.Time `json:"sst_ingest_returned_at,omitempty"`
+}
+
+func validSnapshotShardFlush(a *SnapshotShardFlush) bool {
+	return a != nil && a.Attempt != 0 && validReplayDetailTime(a.StartedAt) && validReplayDetailTime(a.SampledAt) &&
+		!a.SampledAt.Before(a.StartedAt) && (a.Phase == "active" || a.Phase == "returned" || a.Phase == "error") &&
+		a.TotalShards >= 1 && a.TotalShards <= 1000 && a.CompletedShards <= a.TotalShards &&
+		(a.IncrementalSlot == nil || *a.IncrementalSlot > a.FullSnapshotSlot) &&
+		(a.SSTIngestReturnedAt == nil || a.Phase != "active" && validReplayDetailTime(*a.SSTIngestReturnedAt) && !a.SSTIngestReturnedAt.Before(a.SampledAt))
 }
 
 // SnapshotManifestParse is the successful return of a manifest parse. It does
@@ -178,11 +213,25 @@ func publicStartup(s *Snapshot, state string, now time.Time) *PublicStartup {
 			CompressedInputBytes: a.CompressedInputBytes, CompressedReportedTotal: copySlot(a.CompressedReportedTotal),
 			AccountPayloadBytes: a.AccountPayloadBytes}
 	}
-	if s.IncrementalArchive == nil {
+	if s.SnapshotShardFlush == nil && s.IncrementalArchive == nil {
 		p.SnapshotArchive = archive(s.SnapshotArchive)
-	} else if s.SnapshotArchive == nil && s.IncrementalArchive.IncrementalSlot > s.IncrementalArchive.FullSnapshotSlot {
+	} else if s.SnapshotShardFlush == nil && s.SnapshotArchive == nil && s.IncrementalArchive.IncrementalSlot > s.IncrementalArchive.FullSnapshotSlot {
 		if a := archive(&s.IncrementalArchive.SnapshotArchive); a != nil {
 			p.IncrementalArchive = &PublicIncrementalArchive{PublicSnapshotArchive: *a, IncrementalSlot: s.IncrementalArchive.IncrementalSlot}
+		}
+	}
+	if a := s.SnapshotShardFlush; a != nil && s.SnapshotArchive == nil && s.IncrementalArchive == nil &&
+		validSnapshotShardFlush(a) && withinRun(a.StartedAt) && withinRun(a.SampledAt) && (a.SSTIngestReturnedAt == nil || withinRun(*a.SSTIngestReturnedAt)) {
+		observation := PublicObservation{State: state, SampledAt: a.SampledAt}
+		if state == "fresh" && now.Sub(a.SampledAt) > StaleAfter {
+			observation.State = "stale"
+		}
+		p.SnapshotShardFlush = &PublicSnapshotShardFlush{PublicObservation: observation,
+			Attempt: a.Attempt, StartedAt: a.StartedAt, Phase: a.Phase, FullSnapshotSlot: a.FullSnapshotSlot,
+			IncrementalSlot: copySlot(a.IncrementalSlot), CompletedShards: a.CompletedShards, TotalShards: a.TotalShards}
+		if a.SSTIngestReturnedAt != nil {
+			at := *a.SSTIngestReturnedAt
+			p.SnapshotShardFlush.SSTIngestReturnedAt = &at
 		}
 	}
 	if r := s.Recovery; r != nil && withinRun(r.SelectedAt) {

@@ -19,15 +19,27 @@ type accountsCompactor interface {
 // compactionTask budgets one compaction cycle, which holds the fold lock.
 var compactionTask = metrics.Background("accountsdb.compaction", 500*time.Millisecond)
 
-func startAccountsCompactor(parent context.Context, db accountsCompactor, cfg accountsdb.CompactionConfig, interval time.Duration) func() {
+func startAccountsCompactor(parent context.Context, db accountsCompactor, cfg accountsdb.CompactionConfig, interval time.Duration, monitor *compactionMonitor) func() {
 	ctx, cancel := context.WithCancel(parent)
 	done := make(chan struct{})
+	var session time.Time
+	if monitor != nil {
+		session = time.Now()
+		monitor.latest.Store(nil)
+	}
 	mlog.Log.Infof("accountsdb: background compaction enabled (interval=%s rewind_horizon=%d batches)", interval, cfg.RewindHorizonBatches)
 	go func() {
 		defer close(done)
 		for ctx.Err() == nil {
 			run := compactionTask.Start()
+			var started time.Time
+			if monitor != nil {
+				started = time.Now()
+			}
 			stats, err := db.CompactOnce(cfg)
+			if monitor != nil {
+				monitor.completed(session, started, time.Now(), stats, err)
+			}
 			run.EndErr(err, func() string {
 				return fmt.Sprintf("%d scanned, %d compacted, %d sparsified, %d deleted, %d bytes moved", stats.CandidatesScanned, stats.FilesCompacted, stats.FilesSparsified, stats.FilesDeleted, stats.LiveBytesMoved)
 			})

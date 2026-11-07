@@ -593,6 +593,9 @@ func (a *SlotAssembler) finalizeCompletion(work *slotCompletionWork, processed p
 	if onComplete != nil {
 		onComplete(state.slot, lastIndex, lastIndex+1)
 	}
+	processed.timings.AssemblyFirstAcceptedAt = state.firstShredAt
+	processed.timings.AssemblyFullAt = state.fullAt
+	processed.timings.ReadyAt = processed.completionReadyAt
 	blk.MarkTurbineIngressTimings(processed.timings)
 	admissionStart := processed.completionReadyAt
 	if admissionStart.IsZero() {

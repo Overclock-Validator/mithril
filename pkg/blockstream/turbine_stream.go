@@ -413,6 +413,13 @@ func (bs *BlockSource) runTurbineStream() {
 			}
 		}
 		streamDone := make(chan error, 1)
+		var historyHandle *turbine.ShredHistoryHandle
+		if bs.shredHistory != nil {
+			if handle, ok := bs.shredHistory.RegisterSource(turbine.ShredHistoryLive, receiverStartedAt); ok {
+				historyHandle = handle
+				receiver.SetShredHistoryBeforeRun(handle)
+			}
+		}
 		go func() {
 			streamDone <- receiver.Run(streamCtx)
 		}()
@@ -531,7 +538,7 @@ func (bs *BlockSource) runTurbineStream() {
 				}
 			case <-receptionTicks:
 				if progress, ok := receiver.ReceptionSnapshot(); ok {
-					bs.publishReceptionObservation(receiverStartedAt, session, progress)
+					bs.publishReceptionObservation(receiverStartedAt, session, progress, historyHandle)
 				} else {
 					bs.receptionObservation.Store(nil)
 				}
