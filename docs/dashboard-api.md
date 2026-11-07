@@ -178,12 +178,17 @@ command or set `no_metrics_server = true` in `[reporting]`; otherwise restrict
 it with host or network controls. The dashboard reader's loopback binding and
 reverse proxy do not secure that listener.
 
-The socket is mode `0600`; its immediate parent must be a private directory.
-Use a trusted parent path, not a directory writable by other accounts. The feed
-refuses to replace an existing path. Graceful shutdown removes its socket. After
-an unclean node exit, confirm that no process is using the old socket before
-removing that socket alone. A feed setup failure is logged and does not stop the
-node.
+The socket is mode `0600`; its immediate parent must be a private directory
+owned by the node's user. Use a trusted parent path, not a directory writable by
+other accounts. Graceful shutdown removes its socket. After an unclean node exit
+(for example SIGKILL or an out-of-memory kill), the next start replaces the old
+socket only if it is owned by the node's user and nothing accepts connections on
+it; any other existing path is left in place and the feed stays off. A feed setup
+failure is logged and does not stop the node.
+
+The feed serves one request per connection and accepts at most four connections
+per second, so a feed client cannot make the node spend more than that serving
+it. The reader polls once per second.
 
 Unix socket paths have platform-specific length limits. If a long path causes a
 bind error, choose a shorter trusted directory and use the same socket path for
@@ -206,8 +211,7 @@ directory must contain only disposable runtime files, never ledger, account or
 signing data: systemd removes it when the service stops. This does not itself
 configure automatic restart, and does not clean the path when a wrapper keeps
 the service running while restarting only its child. Check ownership, permissions
-and reader reconnection for the actual service configuration. For other setups,
-retain the manual inspection step above. See the
+and reader reconnection for the actual service configuration. See the
 [systemd runtime-directory documentation](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#RuntimeDirectory=).
 
 Keep the executable name `mithril-dashboard`: the node's existing startup process
