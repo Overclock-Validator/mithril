@@ -2,6 +2,7 @@ package replay
 
 import (
 	"fmt"
+	"math"
 
 	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/features"
@@ -37,7 +38,12 @@ func transactionFeeCollector(block *b.Block) (collector, vote solana.PublicKey, 
 }
 
 func distributeBlockTxFees(slotCtx *sealevel.SlotCtx, block *b.Block, accumulated *fees.TxFeeInfoAccumulator) error {
+	block.ResetSelectedFees()
+	valid := accumulated.ExecutionFees <= math.MaxUint64-accumulated.PriorityFees && accumulated.ExecutionFees+accumulated.PriorityFees == accumulated.TotalFees
 	if accumulated.TotalFees == 0 {
+		block.RecordFeePayment(0, 0, solana.PublicKey{}, valid)
+		block.RecordSelectedFees(accumulated.ExecutionFees, accumulated.PriorityFees, accumulated.TotalFees)
+		block.RecordSelectedFeeBurn(0)
 		return nil
 	}
 	collector, vote, err := transactionFeeCollector(block)
@@ -45,5 +51,10 @@ func distributeBlockTxFees(slotCtx *sealevel.SlotCtx, block *b.Block, accumulate
 		return fmt.Errorf("resolve fee collector at slot %d: %w", block.Slot, err)
 	}
 	slotCtx.LamportsBurnt, err = fees.DistributeTxFees(slotCtx, collector, vote, accumulated)
+	if err == nil {
+		block.RecordFeePayment(accumulated.TotalFees, slotCtx.LamportsBurnt, collector, valid)
+		block.RecordSelectedFees(accumulated.ExecutionFees, accumulated.PriorityFees, accumulated.TotalFees)
+		block.RecordSelectedFeeBurn(slotCtx.LamportsBurnt)
+	}
 	return err
 }

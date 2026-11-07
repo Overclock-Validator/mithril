@@ -36,6 +36,17 @@ type AccountsDb struct {
 	// Otter permits concurrent ordinary operations but not Clear. Rewind takes
 	// the write side; hot-path program cache operations take the read side.
 	programCacheMu sync.RWMutex
+	// A terminal saturated generation disables observation instead of wrapping
+	// to a generation that a dashboard may still retain.
+	cacheObservationGeneration atomic.Uint64
+	// Activity configuration and recorder-instance identity use readCacheEpochMu.
+	// Clear advances observation generation but retains these recorder totals.
+	cacheActivityEnabled  bool
+	cacheActivityInstance uint64
+	// Completed accepted program-cache Set calls, including updates. The
+	// program lock pins this counter's cache instance; Clear does not reset it.
+	programCacheAcceptedSets atomic.Uint64
+	programCacheRefusedSets  atomic.Uint64
 
 	// readCacheEpochMu protects the cache epoch and the pending fold view.
 	// CommitBatch publishes its immutable newest-wins union here before the
@@ -217,14 +228,42 @@ func (accountsDb *AccountsDb) CloseDb() {
 }
 
 func (accountsDb *AccountsDb) InitCaches() {
+	accountsDb.initCaches(nil)
+}
+
+// InitCachesWithActivity chooses optional lookup/policy-removal recording before
+// constructing caches. It adds hot-path accounting only when explicitly enabled.
+// Subsequent InitCaches calls preserve this choice; Clear preserves its totals.
+func (accountsDb *AccountsDb) InitCachesWithActivity(enabled bool) {
+	accountsDb.initCaches(&enabled)
+}
+
+func (accountsDb *AccountsDb) initCaches(recordActivity *bool) {
+	accountsDb.readCacheEpochMu.Lock()
+	defer accountsDb.readCacheEpochMu.Unlock()
+	accountsDb.programCacheMu.Lock()
+	defer accountsDb.programCacheMu.Unlock()
+	generation := accountsDb.cacheObservationGeneration.Load()
+	accountsDb.cacheObservationGeneration.Store(0)
+	accountsDb.cacheActivityInstance = 0
+	accountsDb.programCacheAcceptedSets.Store(0)
+	accountsDb.programCacheRefusedSets.Store(0)
+	if recordActivity != nil {
+		accountsDb.cacheActivityEnabled = *recordActivity
+	}
 	accountsDb.commonAdmission = newCommonCacheAdmission()
-	accountsDb.VoteAcctCache = NewWeightedCache(2500, func(key solana.PublicKey, acct *accounts.Account) uint32 {
+	accountsDb.VoteAcctCache = newWeightedCache(2500, func(key solana.PublicKey, acct *accounts.Account) uint32 {
 		return 1
-	})
-	accountsDb.ProgramCache = NewWeightedCache(uint64(programCacheCapacityUnits()), func(key solana.PublicKey, progEntry *ProgramCacheEntry) uint32 {
+	}, accountsDb.cacheActivityEnabled)
+	accountsDb.ProgramCache = newWeightedCache(uint64(programCacheCapacityUnits()), func(key solana.PublicKey, progEntry *ProgramCacheEntry) uint32 {
 		return progEntry.CostUnits()
-	})
-	accountsDb.CommonAcctsCache = newCommonAccountCache(uint64(commonAccountCacheCapacityBytes()), CommonAccountCacheLayout != "flat")
+	}, accountsDb.cacheActivityEnabled)
+	accountsDb.CommonAcctsCache = newCommonAccountCacheWithActivity(uint64(commonAccountCacheCapacityBytes()), CommonAccountCacheLayout != "flat", accountsDb.cacheActivityEnabled)
+	next := nextCacheObservationGeneration(generation)
+	if accountsDb.cacheActivityEnabled && next != ^uint64(0) {
+		accountsDb.cacheActivityInstance = next
+	}
+	accountsDb.cacheObservationGeneration.Store(next)
 }
 
 type ProgramCacheEntry struct {
@@ -333,7 +372,14 @@ func (accountsDb *AccountsDb) ProgramCached(pubkey solana.PublicKey) bool {
 func (accountsDb *AccountsDb) AddProgramToCache(pubkey solana.PublicKey, programEntry *ProgramCacheEntry) {
 	accountsDb.programCacheMu.RLock()
 	defer accountsDb.programCacheMu.RUnlock()
-	accountsDb.ProgramCache.Set(pubkey, programEntry)
+	accepted := accountsDb.ProgramCache.Set(pubkey, programEntry)
+	if accountsDb.cacheActivityEnabled {
+		if accepted {
+			recordProgramSet(&accountsDb.programCacheAcceptedSets)
+		} else {
+			recordProgramSet(&accountsDb.programCacheRefusedSets)
+		}
+	}
 }
 
 func (accountsDb *AccountsDb) RemoveProgramFromCache(pubkey solana.PublicKey) {
@@ -648,6 +694,7 @@ func (accountsDb *AccountsDb) refreshReadCacheEntries(accts []*accounts.Account)
 
 // resetReadCachesLocked requires readCacheEpochMu for writing.
 func (accountsDb *AccountsDb) resetReadCachesLocked() {
+	accountsDb.cacheObservationGeneration.Store(nextCacheObservationGeneration(accountsDb.cacheObservationGeneration.Load()))
 	clear(accountsDb.batchAbsent)
 	accountsDb.CommonAcctsCache.Clear()
 	accountsDb.VoteAcctCache.Clear()

@@ -1,6 +1,7 @@
 package accountsdb
 
 import (
+	"math"
 	"sync"
 	"unsafe"
 
@@ -28,21 +29,32 @@ type commonTierSmall struct {
 	data [200]byte
 }
 type commonTierShard struct {
-	mu    sync.Mutex
-	empty []commonTierHeader
-	small []commonTierSmall
+	mu                   sync.Mutex
+	emptyUsed, smallUsed uint64
+	empty                []commonTierHeader
+	small                []commonTierSmall
+	activity             [4]uint64 // empty/small lookup hits, then capacity replacements
+	activitySaturated    bool
 }
 type commonAccountCache struct {
-	large   *WeightedCache[solana.PublicKey, *accounts.Account]
-	enabled bool
-	shards  [commonTierShards]commonTierShard
+	large          *WeightedCache[solana.PublicKey, *accounts.Account]
+	enabled        bool
+	recordActivity bool
+	shards         [commonTierShards]commonTierShard
+	// Immutable capacities avoid scanning the fixed tiers for monitoring.
+	budgetBytes, emptyCapacity, smallCapacity uint64
 }
 
 func newCommonAccountCache(budget uint64, enabled bool) *commonAccountCache {
-	c := &commonAccountCache{enabled: enabled}
+	return newCommonAccountCacheWithActivity(budget, enabled, false)
+}
+
+func newCommonAccountCacheWithActivity(budget uint64, enabled, recordActivity bool) *commonAccountCache {
+	budget = max(budget, 1) // Match WeightedCache's effective minimum budget.
+	c := &commonAccountCache{enabled: enabled, budgetBytes: budget, recordActivity: recordActivity}
 	if !enabled || budget < 1<<20 {
 		c.enabled = false
-		c.large = NewWeightedCache(budget, func(_ solana.PublicKey, a *accounts.Account) uint32 { return commonAccountCacheCost(a) })
+		c.large = newWeightedCache(budget, func(_ solana.PublicKey, a *accounts.Account) uint32 { return commonAccountCacheCost(a) }, recordActivity)
 		return c
 	}
 	// Split the existing budget, never add a second independent full budget.
@@ -56,11 +68,13 @@ func newCommonAccountCache(budget uint64, enabled bool) *commonAccountCache {
 
 	emptyN := int(emptyShare/commonTierShards/uint64(unsafe.Sizeof(commonTierHeader{}))/commonTierWays) * commonTierWays
 	smallN := int(smallShare/commonTierShards/uint64(unsafe.Sizeof(commonTierSmall{}))/commonTierWays) * commonTierWays
+	c.emptyCapacity = uint64(emptyN) * commonTierShards
+	c.smallCapacity = uint64(smallN) * commonTierShards
 	for i := range c.shards {
 		c.shards[i].empty = make([]commonTierHeader, emptyN)
 		c.shards[i].small = make([]commonTierSmall, smallN)
 	}
-	c.large = NewWeightedCache(budget-emptyShare-smallShare, func(_ solana.PublicKey, a *accounts.Account) uint32 { return commonAccountCacheCost(a) })
+	c.large = newWeightedCache(budget-emptyShare-smallShare, func(_ solana.PublicKey, a *accounts.Account) uint32 { return commonAccountCacheCost(a) }, recordActivity)
 	return c
 }
 func (c *commonAccountCache) locate(k solana.PublicKey) (*commonTierShard, uint64) {
@@ -84,12 +98,14 @@ func (s *commonTierShard) remove(k solana.PublicKey, hash uint64) {
 	for i := start; i < start+commonTierWays; i++ {
 		if s.empty[i].used && s.empty[i].key == k {
 			s.empty[i].used = false
+			s.emptyUsed--
 		}
 	}
 	start = tierStart(hash, len(s.small))
 	for i := start; i < start+commonTierWays; i++ {
 		if s.small[i].used && s.small[i].key == k {
 			s.small[i].used = false
+			s.smallUsed--
 		}
 	}
 }
@@ -110,6 +126,9 @@ func (c *commonAccountCache) Get(k solana.PublicKey) (a *accounts.Account, ok bo
 		e := &s.empty[i]
 		if e.used && e.key == k {
 			e.recent = true
+			if c.recordActivity {
+				s.recordActivity(0)
+			}
 			hit = *e
 			s.mu.Unlock()
 			return hit.account(nil), true
@@ -120,6 +139,9 @@ func (c *commonAccountCache) Get(k solana.PublicKey) (a *accounts.Account, ok bo
 		e := &s.small[i]
 		if e.used && e.key == k {
 			e.recent = true
+			if c.recordActivity {
+				s.recordActivity(1)
+			}
 			hit = e.commonTierHeader
 			copy(data[:hit.length], e.data[:])
 			s.mu.Unlock()
@@ -184,6 +206,12 @@ func (c *commonAccountCache) Set(k solana.PublicKey, a *accounts.Account) (ok bo
 			}
 		}
 	emptyFound:
+		if c.recordActivity && s.empty[chosen].used {
+			s.recordActivity(2)
+		}
+		if !s.empty[chosen].used {
+			s.emptyUsed++
+		}
 		s.empty[chosen] = tierHeader(k, a)
 		return true
 	}
@@ -207,9 +235,25 @@ func (c *commonAccountCache) Set(k solana.PublicKey, a *accounts.Account) (ok bo
 	}
 smallFound:
 	e := &s.small[chosen]
+	if c.recordActivity && e.used {
+		s.recordActivity(3)
+	}
+	if !e.used {
+		s.smallUsed++
+	}
 	e.commonTierHeader = tierHeader(k, a)
 	copy(e.data[:], a.Data)
 	return true
+}
+
+// recordActivity runs under the shard's existing lock, never a new hot-path
+// mutex or atomic. Saturation makes the observed aggregate unknown, not wrapped.
+func (s *commonTierShard) recordActivity(index int) {
+	if s.activity[index] == math.MaxUint64 {
+		s.activitySaturated = true
+		return
+	}
+	s.activity[index]++
 }
 func (c *commonAccountCache) Delete(k solana.PublicKey) {
 	if !c.enabled {
@@ -234,9 +278,28 @@ func (c *commonAccountCache) Clear() {
 	for i := range c.shards {
 		clear(c.shards[i].empty)
 		clear(c.shards[i].small)
+		c.shards[i].emptyUsed, c.shards[i].smallUsed = 0, 0
 	}
 	c.large.Clear()
 	for i := len(c.shards) - 1; i >= 0; i-- {
 		c.shards[i].mu.Unlock()
 	}
+}
+
+// fixedOccupancy is approximate across shards. A busy shard makes the whole
+// pair unknown; monitoring never waits for a shard or scans its slot arrays.
+func (c *commonAccountCache) fixedOccupancy() (empty, small uint64, known bool) {
+	if !c.enabled {
+		return 0, 0, true
+	}
+	for i := range c.shards {
+		s := &c.shards[i]
+		if !s.mu.TryLock() {
+			return 0, 0, false
+		}
+		empty += s.emptyUsed
+		small += s.smallUsed
+		s.mu.Unlock()
+	}
+	return empty, small, true
 }

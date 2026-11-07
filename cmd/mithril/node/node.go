@@ -93,6 +93,9 @@ var (
 	dashboardEnabled                 bool
 	dashboardHostResources           bool
 	dashboardCgroupResources         bool
+	dashboardReplayDetails           bool
+	dashboardCacheDetails            bool
+	dashboardCacheActivity           bool
 	dashboardNetworkDetails          bool
 	dashboardMachineDetails          bool
 	dashboardLocalPeers              bool
@@ -559,6 +562,9 @@ func init() {
 	Run.Flags().BoolVar(&dashboardEnabled, "dashboard-enabled", false, "Enable the provisioned Linux dashboard feed")
 	Run.Flags().BoolVar(&dashboardHostResources, "dashboard-host-resources", false, "Collect visible-host CPU/load/memory in the private dashboard feed (requires a dashboard feed; default off)")
 	Run.Flags().BoolVar(&dashboardCgroupResources, "dashboard-cgroup-resources", false, "Collect visible domain-cgroup settings, counters and pressure in the private dashboard feed (requires a dashboard feed; default off)")
+	Run.Flags().BoolVar(&dashboardReplayDetails, "dashboard-replay-details", false, "Retain bounded replay diagnostics and rooted-bank history for the private dashboard feed (requires a dashboard feed; default off)")
+	Run.Flags().BoolVar(&dashboardCacheDetails, "dashboard-cache-details", false, "Include AccountsDB read-cache observations (requires a dashboard feed; default off)")
+	Run.Flags().BoolVar(&dashboardCacheActivity, "dashboard-cache-activity", false, "Record optional cache lookup and eviction counters (requires --dashboard-cache-details; default off)")
 	Run.Flags().BoolVar(&dashboardNetworkDetails, "dashboard-network-details", false, "Include network observations in the private dashboard feed (requires a dashboard feed; default off)")
 	Run.Flags().BoolVar(&dashboardMachineDetails, "dashboard-machine-details", false, "Collect bounded machine topology, sampled thread affinity and RSS history (requires a dashboard feed and --dashboard-host-resources; default off)")
 	Run.Flags().BoolVar(&dashboardLocalPeers, "dashboard-local-peers", false, "Retain bounded local signed-contact metadata without network endpoints (requires a dashboard feed and --dashboard-network-details; default off)")
@@ -920,6 +926,18 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	}
 	dashboardHostResources = getBool("dashboard-host-resources", "dashboard.host_resources")
 	dashboardCgroupResources = getBool("dashboard-cgroup-resources", "dashboard.cgroup_resources")
+	dashboardReplayDetails = getBool("dashboard-replay-details", "dashboard.replay_details")
+	dashboardCacheDetails = getBool("dashboard-cache-details", "dashboard.cache_details")
+	dashboardCacheActivity = getBool("dashboard-cache-activity", "dashboard.cache_activity")
+	if dashboardCacheActivity && !dashboardCacheDetails {
+		return fmt.Errorf("dashboard.cache_activity requires dashboard.cache_details")
+	}
+	if err := validateDashboardCacheDetails(dashboardCacheDetails, dashboardSocket); err != nil {
+		return err
+	}
+	if err := validateDashboardReplayDetails(dashboardReplayDetails, dashboardSocket); err != nil {
+		return err
+	}
 	if err := validateDashboardCgroupResources(dashboardCgroupResources, dashboardSocket); err != nil {
 		return err
 	}
@@ -1485,8 +1503,9 @@ func runLive(c *cobra.Command, args []string) {
 	if killed := killExistingMithrilProcesses(); killed > 0 {
 		fmt.Printf("  ⚠ Killed %d existing mithril process(es)\n\n", killed)
 	}
-	dashboard := startNodeDashboard(ctx, runStartedAt, dashboardSocket, dashboardSocketGroup, replay.CurrentRunID, cluster, consensusMode, true, rpcPort != 0, dashboardHostResources, dashboardNetworkDetails, dashboardMachineDetails, dashboardLocalPeers)
+	dashboard := startNodeDashboard(ctx, runStartedAt, dashboardSocket, dashboardSocketGroup, replay.CurrentRunID, cluster, consensusMode, true, rpcPort != 0, dashboardHostResources, dashboardNetworkDetails, dashboardMachineDetails, dashboardLocalPeers, dashboardReplayDetails, dashboardCacheDetails)
 	dashboard.configureCgroupResources(dashboardCgroupResources)
+	dashboard.configureCacheActivity(dashboardCacheActivity)
 	defer dashboard.close()
 	dashboard.storagePaths(accountsPath, blockstorePath)
 	stopMemoryDiagnostics := startMemoryDiagnostics(ctx, mlog.GetLogDir(), heapProfileThreshold, dashboard)
@@ -2359,7 +2378,10 @@ postBootstrap:
 	if liveEndSlot != uint64(math.MaxUint64) {
 		mlog.Log.Infof("finite replay: startSlot=%d endSlot=%d", startSlot, liveEndSlot)
 	}
-	accountsDb.InitCaches()
+	accountsDb.InitCachesWithActivity(dashboard.cacheActivityEnabled())
+	if !dashboard.attachCacheOwner(accountsDb) {
+		mlog.Log.Warnf("dashboard cache observations unavailable: owner attachment refused")
+	}
 
 	// Alpenglow buffers replayed slots in a fork-aware WorkingSet and folds only
 	// finalized prefixes. Every cluster runs Alpenglow, so rooted-durable
@@ -2897,6 +2919,7 @@ postBootstrap:
 		}
 		leaderLoop := blockprod.NewLeaderLoop(blockprod.LeaderLoopConfig{
 			CertificateObservationVoteAccount: certificateObservationVoteAccount,
+			CaptureSelectedSlotFacts:          dashboard != nil && dashboardReplayDetails,
 
 			Controller:        controller,
 			Identity:          validatorIdentity,
