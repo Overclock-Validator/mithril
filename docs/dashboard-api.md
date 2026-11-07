@@ -423,9 +423,7 @@ stops. An old sample may still display historical contacts with their dated age.
 This is a bounded sample, not a full gossip directory or a cluster health map.
 
 Public status JSON has a 32 KiB cap; the private node-to-reader status snapshot
-has a separate 33 KiB cap. Optional detail routes have their own documented
-limits, including up to 2 MiB for locally observed peers. Oversized input still
-fails closed, and status collection remains once per second.
+has a separate 33 KiB cap. Oversized input still fails closed, and status collection remains once per second.
 
 ### Releases and rollback
 

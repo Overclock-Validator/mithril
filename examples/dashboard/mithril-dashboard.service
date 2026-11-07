@@ -21,10 +21,29 @@ ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
 SystemCallArchitectures=native
-SystemCallFilter=~@mount
+# Denied calls fail with EPERM instead of killing the reader (the Go runtime
+# tolerates a refused setrlimit, for example).
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 IPAddressDeny=any
+# localhost still reaches every loopback service, including the node's
+# JSON-RPC and the Prometheus :9090 listener; restrict those separately.
 IPAddressAllow=localhost
 InaccessiblePaths=/srv/mithril-node /run/mithril-node
 MemoryMax=256M
