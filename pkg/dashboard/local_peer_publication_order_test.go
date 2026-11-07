@@ -10,7 +10,7 @@ import (
 	"golang.org/x/time/rate"
 )
 
-func TestLocalPeerGateBeforeStatusFailsClosed(t *testing.T) {
+func TestLocalPeerPollPublishesGateBeforeStatus(t *testing.T) {
 	path, body := fixtureFeed(t)
 	c := newCollector(path)
 	c.public, c.publicOptions = true, PublicOptions{LocalPeers: true}
@@ -52,9 +52,41 @@ func TestLocalPeerGateBeforeStatusFailsClosed(t *testing.T) {
 	if !snapshot.SampledAt.After(now.UTC()) {
 		snapshot.SampledAt = now.UTC().Add(time.Nanosecond)
 	}
-	gate := advanceLocalPeerStatusGate(gateA, &snapshot, "", time.Now(), gateA.nodeEpoch+1)
-	gateB := &gate
-	c.localPeerGate.Store(gateB)
+	setFixture(t, body, snapshot)
+	c.display = &nodeDisplayOwner{}
+	c.display.mu.Lock()
+	locked := true
+	done := make(chan struct{})
+	defer func() {
+		if locked {
+			c.display.mu.Unlock()
+		}
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Error("paused status poll did not exit")
+		}
+	}()
+	go func() { defer close(done); c.poll(context.Background(), time.Now().UTC()) }()
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	var gateB *localPeerGate
+waitForGate:
+	for {
+		select {
+		case <-done:
+			t.Fatal("poll exited before the paused publication")
+		case <-deadline.C:
+			t.Fatal("new peer gate was not published")
+		case <-ticker.C:
+			if gate := c.localPeerGate.Load(); gate != nil && (gate.nodeEpoch != gateA.nodeEpoch || gate.revision != gateA.revision) {
+				gateB = gate
+				break waitForGate
+			}
+		}
+	}
 	if c.latest.Load() != frameA {
 		t.Fatal("test did not reach the gate-before-frame interval")
 	}
@@ -64,9 +96,17 @@ func TestLocalPeerGateBeforeStatusFailsClosed(t *testing.T) {
 	if response := request(); response.Code != http.StatusServiceUnavailable || response.Header().Get(statusRemainingHeader) != "" {
 		t.Fatalf("peer response crossed unmatched status publication: status=%d", response.Code)
 	}
-	frameB := *frameA
-	frameB.fence.nodeEpoch, frameB.fence.families[statusPeers] = gateB.nodeEpoch, gateB.revision
-	c.latest.Store(&frameB)
+	c.display.mu.Unlock()
+	locked = false
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("status poll did not complete")
+	}
+	if frameB := c.latest.Load(); frameB == nil || frameB == frameA ||
+		frameB.statusStamp(statusPeers) != (statusStamp{gateB.nodeEpoch, gateB.revision}) {
+		t.Fatal("new status frame did not match the peer gate")
+	}
 	if response := request(); response.Code != http.StatusOK || response.Header().Get(statusRemainingHeader) == "" {
 		t.Fatalf("matching peer response unavailable after publication: status=%d", response.Code)
 	}

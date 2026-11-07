@@ -77,7 +77,7 @@ func TestStatusCapRepeatedSampleKeepsWallBound(t *testing.T) {
 }
 
 func TestStatusCapBlockedWebSocket(t *testing.T) {
-	for _, profile := range []int{0, 3} {
+	for _, profile := range []int{0, 3, 4} {
 		t.Run(strconv.Itoa(profile), func(t *testing.T) {
 			now := time.Now()
 			c := newCollector("/unused")
@@ -132,7 +132,7 @@ func TestStatusCapBlockedWebSocket(t *testing.T) {
 
 func TestStatusCapUnavailableProfiles(t *testing.T) {
 	now := time.Now()
-	frame := &frameSet{freshUntil: now.Add(time.Second), safetyUnavailable: true, lease: newStatusFrameLease(now.Add(time.Second)),
+	frame := &frameSet{freshUntil: now.Add(time.Second), safetyUnavailable: true, advancedUnavailable: true, lease: newStatusFrameLease(now.Add(time.Second)),
 		clockOrigin: now, clockUncertain: &atomic.Bool{}}
 	frame.lease.tighten(now.Add(-time.Second), now.Round(0).Add(-time.Second))
 	if _, ok := frame.remainingStatus(0, now); ok {
@@ -141,6 +141,9 @@ func TestStatusCapUnavailableProfiles(t *testing.T) {
 	if remaining, ok := frame.remainingStatus(3, now); !ok || remaining != 0 {
 		t.Fatal("unavailable v3 profile inherited a fresh lease")
 	}
+	if remaining, ok := frame.remainingStatus(4, now); !ok || remaining != 0 {
+		t.Fatal("unavailable advanced profile inherited a fresh lease")
+	}
 	legacy := &frameSet{}
 	if remaining, ok := legacy.remainingStatus(0, now); !ok || remaining != 0 {
 		t.Fatal("legacy unavailable frame behavior changed")
@@ -148,7 +151,7 @@ func TestStatusCapUnavailableProfiles(t *testing.T) {
 }
 
 func TestStatusCapHealthyWebSocketUpdate(t *testing.T) {
-	for _, profile := range []int{0, 3} {
+	for _, profile := range []int{0, 3, 4} {
 		t.Run(strconv.Itoa(profile), func(t *testing.T) {
 			now := time.Now()
 			c := newCollector("/unused")

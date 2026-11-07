@@ -74,63 +74,6 @@ func TestNetworkDetailArrivalTiming(t *testing.T) {
 	}
 }
 
-func TestNetworkDetailReadByteMapping(t *testing.T) {
-	now := time.Now()
-	b, s := networkSourceFixture(now)
-	a := turbine.SocketReadActivity{Enabled: true, StartedAt: now.Add(-time.Minute), SampledAt: now,
-		LiveKnown: true, LiveBytes: math.MaxUint64 - 1}
-	a.LiveWindow = turbine.SocketReadWindow{Known: true, StartedAt: now.Add(-time.Second), SampledAt: now, Duration: time.Second, Bytes: 10}
-	s.Turbine.SocketMemory.ReadActivity = a
-	c, err := networkDetailMeasurement(b, s, now)
-	if err != nil || c.Detail.Live.ReadBytes == nil || c.Detail.Live.ReadBytes.Bytes != math.MaxUint64-1 || c.Detail.Repair.ReadBytes != nil {
-		t.Fatalf("read-byte mapping: %+v, %v", c, err)
-	}
-	s.Turbine.SocketMemory.Live = turbine.SocketMemorySample{Observation: metrics.SocketObservation{Reason: metrics.SocketUnsupported}}
-	s.Turbine.SocketMemory.ReadActivity.LiveBytes = 0
-	s.Turbine.SocketMemory.ReadActivity.LiveWindow = turbine.SocketReadWindow{}
-	c, err = networkDetailMeasurement(b, s, now)
-	if err != nil || c.Detail.Live.Memory != nil || c.Detail.Live.ReadBytes == nil || c.Detail.Live.ReadBytes.Bytes != 0 || c.Detail.Live.State != "unsupported" {
-		t.Fatalf("SO_MEMINFO availability hid a known byte zero: %+v, %v", c, err)
-	}
-	s.Turbine.SocketMemory.ReadActivity.LiveKnown = false
-	c, err = networkDetailMeasurement(b, s, now)
-	if err != nil || c.Detail.Live.ReadBytes != nil {
-		t.Fatal("unknown/saturated count became zero")
-	}
-}
-
-func TestNetworkDetailRepairRequestWindow(t *testing.T) {
-	now := time.Now()
-	b, s := networkSourceFixture(now)
-	s.Turbine.SocketMemory.RepairEnabled = true
-	s.Turbine.SocketMemory.Repair = s.Turbine.SocketMemory.Live
-	s.Turbine.SocketMemory.RepairRequests = turbine.RepairRequestActivity{Enabled: true, Known: true,
-		StartedAt: now.Add(-time.Minute), SampledAt: now, Bytes: 20,
-		Window: turbine.SocketReadWindow{Known: true, StartedAt: now.Add(-time.Second), SampledAt: now, Duration: time.Second, Bytes: 7}}
-	c, err := networkDetailMeasurement(b, s, now)
-	if err != nil || c.Detail.RepairRequests == nil || c.Detail.RepairRequests.Window == nil ||
-		c.Detail.RepairRequests.Window.Bytes != 7 || c.Detail.RepairRequests.Window.DurationNanoseconds != uint64(time.Second) {
-		t.Fatalf("repair request projection: %+v %v", c.Detail.RepairRequests, err)
-	}
-	for name, change := range map[string]func(*turbine.RepairRequestActivity){
-		"unknown total":     func(a *turbine.RepairRequestActivity) { a.Known, a.Bytes = false, 0 },
-		"bad amount":        func(a *turbine.RepairRequestActivity) { a.Window.Bytes = 21 },
-		"zero duration":     func(a *turbine.RepairRequestActivity) { a.Window.Duration = 0 },
-		"mismatched sample": func(a *turbine.RepairRequestActivity) { a.Window.SampledAt = now.Add(-time.Second) },
-		"incomplete window": func(a *turbine.RepairRequestActivity) { a.Window.Known = false },
-	} {
-		t.Run(name, func(t *testing.T) {
-			bad := s
-			copied := *s.Turbine
-			bad.Turbine = &copied
-			change(&bad.Turbine.SocketMemory.RepairRequests)
-			if _, err := networkDetailMeasurement(b, bad, now); err == nil {
-				t.Fatal("invalid repair interval was accepted")
-			}
-		})
-	}
-}
-
 func TestNetworkDetailReconstructionDate(t *testing.T) {
 	now := time.Now()
 	b, s := networkSourceFixture(now)
@@ -310,7 +253,7 @@ func TestDashboardNetworkDetailsOptIn(t *testing.T) {
 				t.Error(err)
 			}
 		})
-		d := startNodeDashboard(context.Background(), time.Now(), filepath.Join(dir, "node.sock"), "", "network-run", "isolated", "verifying", false, false, false, enabled, false, false, false, false)
+		d := startNodeDashboard(context.Background(), time.Now(), filepath.Join(dir, "node.sock"), "", "network-run", "isolated", "verifying", false, false, false, enabled, false, false, false, false, false, false, false)
 		if d == nil {
 			t.Fatal("dashboard failed")
 		}

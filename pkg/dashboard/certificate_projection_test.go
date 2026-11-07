@@ -98,7 +98,7 @@ func TestCertificateOutcomeAndFullPublicHistoryFitBudget(t *testing.T) {
 		s.Replay.ExecutedComputeUnits = s.Replay.ExecutedTransactions
 		throughput = acc.Observe(&s, "fresh", s.SampledAt)
 	}
-	b, err := encodePublicSnapshot(&s, "fresh", s.SampledAt, &throughput, nil, nil)
+	b, err := encodePublicSnapshot(&s, "fresh", s.SampledAt, &throughput, nil, nil, nil)
 	if err != nil || len(b) > MaxSnapshotBytes || len(throughput.History) != throughputSamples-1 {
 		t.Fatalf("public history plus outcomes: bytes=%d err=%v", len(b), err)
 	}
