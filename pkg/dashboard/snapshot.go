@@ -13,7 +13,7 @@ import (
 const (
 	// SchemaVersion identifies the Mithril status payload format.
 	SchemaVersion = 1
-	// MaxSnapshotBytes bounds public status and detail pages that use it.
+	// MaxSnapshotBytes bounds the public status payload.
 	MaxSnapshotBytes = 32 << 10
 	// MaxPrivateSnapshotBytes bounds the node-to-reader snapshot separately.
 	MaxPrivateSnapshotBytes = 33 << 10

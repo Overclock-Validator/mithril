@@ -3256,7 +3256,9 @@ func ReplayBlocks(
 			blockStream.SetLastExecutedSlot(block.Slot)
 			replayFrontier = block.Slot
 			global.SetReplayFrontier(block.Slot)
-			progress.observeNextAssignment(time.Now(), turbineIdentity, block.Slot, epochSchedule)
+			if progress != nil {
+				progress.observeNextAssignment(time.Now(), turbineIdentity, block.Slot, epochSchedule)
+			}
 			progress.skipped(mithrilState.LastRootedSlot, mithrilState.LastRootedBankhash != "")
 			continue // Skip all execution - no state changes for skipped slots
 		}
@@ -3822,11 +3824,17 @@ func ReplayBlocks(
 			asmSecsLine = float64(block.ShredFullNanos-block.ShredFirstNanos) / 1e9
 		}
 		mlog.Log.InfofPrecise("%s", appendNextLeaderHint(buildSlotStatsLine(block.Slot, leaderStr, txnCount, totalCU, execMsLine, hasShreds, readySecsLine, asmSecsLine, block.RepairedShreds), nextLeader.hint(block.Slot)))
-		// Full detail (wait, vote split) stays in file logs for debugging.
-		var voteTxCount int
-		for _, tx := range block.Transactions {
-			if tx.IsVote() {
-				voteTxCount++
+		// Full detail (wait, vote split) stays in file logs for debugging. The
+		// bank's counts already classified every transaction; rescan only when
+		// they do not cover this block.
+		counts := lastSlotCtx.TransactionCounts
+		voteTxCount := int(counts.Total - counts.NonVote)
+		if counts.Saturated || counts.Total != uint64(txnCount) {
+			voteTxCount = 0
+			for _, tx := range block.Transactions {
+				if tx.IsVote() {
+					voteTxCount++
+				}
 			}
 		}
 		mlog.Log.FileOnlyf("slot %d detail | leader %s | txns v:%d nv:%d | exec %.3fs | wait %.3fs | total %.3fs",

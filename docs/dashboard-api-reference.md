@@ -160,11 +160,7 @@ the original sample-age deadline and, when present, the private source lease;
 repeated requests cannot renew it. Clients must subtract the monotonic time
 elapsed since immediately before their HTTP request and treat the status as
 stale once the lease expires. Stale or unavailable status has no lease header;
-an expired cached fresh status returns 503 without a lease. This lease is
-separate from detail capture and retention leases and does not extend them.
-Live detail responses that carry both a status and a detail lease require both
-to remain valid; neither lease renews the other. Explicitly addressed historical
-records have their own retention rules and do not become live observations.
+an expired cached fresh status returns 503 without a lease.
 The reader may shorten a previously observed deadline when a later private-feed
 response supplies a shorter bound. It cannot retract a response already sent.
 WebSocket closure cannot guarantee when buffered data reaches a client. Clients

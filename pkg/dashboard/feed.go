@@ -18,6 +18,17 @@ import (
 	"time"
 
 	"golang.org/x/net/netutil"
+	"golang.org/x/time/rate"
+)
+
+// The reader polls once per SampleInterval. Accepting more requests than this
+// only lets a feed client spend node CPU; excess connections wait in the
+// listen backlog instead of being parsed.
+const (
+	feedRequestsPerSecond       = 4
+	feedRequestBurst            = 4
+	detailFeedRequestsPerSecond = 64
+	detailFeedRequestBurst      = 16
 )
 
 // Feed samples once per second, independently of reader requests. Readers only
@@ -66,8 +77,10 @@ type DetailSamplers struct {
 	LocalPeers     LocalPeerSampler
 }
 
-// ListenFeed requires an existing private directory. It never removes an
-// existing socket: a stale path must be inspected by the operator before reuse.
+// ListenFeed requires an existing private directory owned by the node. It
+// replaces only a stale socket owned by the node that refuses connections, as
+// left by an exit that skipped Close (SIGKILL, OOM, os.Exit); any other existing
+// path is left in place and the listen fails.
 // The sampler must return a bounded immutable copy without I/O or long-held locks.
 func ListenFeed(parent context.Context, path string, sample func() Snapshot) (*Feed, error) {
 	return listenFeed(parent, path, "", false, sample, DetailSamplers{})
@@ -123,9 +136,12 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 		if err != nil {
 			return nil, fmt.Errorf("inspect dashboard socket directory: %w", err)
 		}
-		if !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
-			return nil, errors.New("dashboard socket directory must be private (mode 0700)")
+		if !info.IsDir() || info.Mode().Perm()&0o077 != 0 || !ownedByEffectiveUser(info) {
+			return nil, errors.New("dashboard socket directory must be private (mode 0700) and owned by the node")
 		}
+	}
+	if err := removeStaleFeedSocket(path); err != nil {
+		return nil, err
 	}
 	listener, err := net.Listen("unix", path)
 	if err != nil {
@@ -344,9 +360,20 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 	if f.localPeers != nil {
 		go f.localPeers.run(ctx)
 	}
+	// One request per connection, so the accept rate bounds the request rate.
+	f.server.SetKeepAlivesEnabled(false)
+	requestRate, requestBurst := feedRequestsPerSecond, feedRequestBurst
+	if details.Replay != nil || details.Cache != nil || details.SelectedWindow != nil || details.RootedHistory != nil ||
+		details.HeldSchedules != nil || details.Network != nil || details.NodeNetwork != nil || details.Machine != nil ||
+		details.LocalPeers != nil || details.Production != nil || details.Storage != nil || details.Reception != nil {
+		// Replay detail can contain 128 pages; its reader has a 12-second deadline.
+		requestRate, requestBurst = detailFeedRequestsPerSecond, detailFeedRequestBurst
+	}
+	limited := &rateLimitedListener{Listener: listener, ctx: ctx,
+		limiter: rate.NewLimiter(rate.Limit(requestRate), requestBurst)}
 	go func() {
 		defer close(f.served)
-		if err := f.server.Serve(netutil.LimitListener(listener, 4)); err != nil && ctx.Err() == nil {
+		if err := f.server.Serve(netutil.LimitListener(limited, 4)); err != nil && ctx.Err() == nil {
 			slog.Warn("dashboard feed listener stopped unexpectedly", "component", "dashboard", "entrypoint", "private_feed")
 		}
 		cancel()
@@ -369,6 +396,50 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 		}
 	}()
 	return f, nil
+}
+
+// rateLimitedListener delays Accept until the limiter allows another
+// connection. Cancelling ctx (Feed.Close) ends a pending wait.
+type rateLimitedListener struct {
+	net.Listener
+	ctx     context.Context
+	limiter *rate.Limiter
+}
+
+func (l *rateLimitedListener) Accept() (net.Conn, error) {
+	if err := l.limiter.Wait(l.ctx); err != nil {
+		return nil, net.ErrClosed
+	}
+	return l.Listener.Accept()
+}
+
+// removeStaleFeedSocket unlinks a socket that is owned by the node and refuses
+// connections. Regular files, symlinks, other owners and live listeners are left
+// for net.Listen to reject.
+func removeStaleFeedSocket(path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect existing dashboard socket: %w", err)
+	}
+	if info.Mode().Type() != os.ModeSocket || !ownedByEffectiveUser(info) {
+		return nil
+	}
+	conn, err := net.DialTimeout("unix", path, time.Second)
+	if err == nil {
+		conn.Close()
+		return nil
+	}
+	if !isConnectionRefused(err) {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove stale dashboard socket: %w", err)
+	}
+	slog.Info("dashboard feed replaced a stale socket", "component", "dashboard", "entrypoint", "private_feed")
+	return nil
 }
 
 func (f *Feed) Close() {

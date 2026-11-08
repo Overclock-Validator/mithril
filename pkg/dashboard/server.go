@@ -1312,9 +1312,20 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 	return err
 }
 
+// proxyHeaders mark a request relayed by a proxy. A proxy's default upstream
+// Host (for example nginx's $proxy_host) is the loopback listener itself, so
+// the Host check alone would admit Origin-less remote clients.
+var proxyHeaders = [...]string{"Forwarded", "Via", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-Ip"}
+
 // Checking Host as well as Origin prevents a rebinding hostname from reaching
-// a loopback listener. Forwarded headers are deliberately not trusted.
+// a loopback listener. Forwarded headers are never trusted, and the private
+// profile refuses proxied requests: only the public profile is for proxies.
 func allowedRequest(r *http.Request, port string) bool {
+	for _, name := range proxyHeaders {
+		if _, ok := r.Header[name]; ok {
+			return false
+		}
+	}
 	host, p, err := net.SplitHostPort(r.Host)
 	if err != nil || p != port {
 		return false
