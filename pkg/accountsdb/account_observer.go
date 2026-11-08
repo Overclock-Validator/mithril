@@ -51,6 +51,9 @@ func (db *AccountsDb) beginAccountChange() func([]*accounts.Account, uint64, boo
 	db.accountStateVersion.Add(1)
 	return func(changed []*accounts.Account, slot uint64, success, reset bool) {
 		version := db.accountStateVersion.Load() + 1
+		if reset || !success {
+			db.voteIndexInvalidations.Add(1)
+		}
 		db.accountObserversMu.Lock()
 		for observer := range db.accountObservers {
 			observer.AccountsChanged(version, changed, reset || !success)

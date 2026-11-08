@@ -1,8 +1,10 @@
 package accountsdb
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/cockroachdb/pebble/v2"
@@ -25,6 +27,8 @@ func voteIndexKey(pubkey solana.PublicKey) []byte {
 // SeedVoteAccountPubkeys seeds a freshly built snapshot index with vote-program
 // account candidates observed while parsing its appendvecs.
 func (db *AccountsDb) SeedVoteAccountPubkeys(pubkeys []solana.PublicKey) error {
+	db.voteIndexMu.Lock()
+	defer db.voteIndexMu.Unlock()
 	batch := db.Index.NewBatch()
 	defer batch.Close()
 	for _, pubkey := range pubkeys {
@@ -35,70 +39,105 @@ func (db *AccountsDb) SeedVoteAccountPubkeys(pubkeys []solana.PublicKey) error {
 	if err := batch.Set(voteIndexReadyKey, nil, nil); err != nil {
 		return err
 	}
-	if err := batch.Commit(pebble.Sync); err != nil {
+	writeOpts := pebble.Sync
+	if db.IndexWALDisabled {
+		writeOpts = pebble.NoSync
+	}
+	if err := batch.Commit(writeOpts); err != nil {
 		return err
 	}
 	if db.IndexWALDisabled {
-		return db.Index.Flush()
+		if err := db.Index.Flush(); err != nil {
+			return err
+		}
 	}
+	db.voteIndexChecked = true
+	db.voteIndexGeneration = db.voteIndexInvalidations.Load()
+	db.voteIndexResume = nil
+	db.voteIndexPending = nil
 	return nil
 }
 
-// VoteAccountPubkeys returns every known vote-account candidate. Existing
-// stores built before this index was added are migrated once, on first use.
+// VoteAccountPubkeys returns every known vote-account candidate. The index is
+// checked on first use after opening a store or rewinding it.
 func (db *AccountsDb) VoteAccountPubkeys(ctx context.Context) ([]solana.PublicKey, error) {
-	db.voteIndexMu.Lock()
+	locked := db.voteIndexMu.TryLock()
+	if !locked {
+		ticker := time.NewTicker(10 * time.Millisecond)
+		for !locked {
+			select {
+			case <-ctx.Done():
+				ticker.Stop()
+				return nil, ctx.Err()
+			case <-ticker.C:
+				locked = db.voteIndexMu.TryLock()
+			}
+		}
+		ticker.Stop()
+	}
 	defer db.voteIndexMu.Unlock()
-	if _, closer, err := db.Index.Get(voteIndexReadyKey); err == nil {
-		if err := closer.Close(); err != nil {
-			return nil, err
-		}
-	} else if err == pebble.ErrNotFound {
-		if err := db.migrateVoteIndex(ctx); err != nil {
-			return nil, err
-		}
-	} else {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	for {
+		generation := db.voteIndexInvalidations.Load()
+		if generation != db.voteIndexGeneration {
+			db.voteIndexChecked = false
+			db.voteIndexResume = nil
+			db.voteIndexPending = nil
+			db.voteIndexGeneration = generation
+		}
+		// An older binary may have changed accounts without maintaining this index.
+		// Verify once per open even if an on-disk ready marker survived a downgrade.
+		if !db.voteIndexChecked {
+			if err := db.migrateVoteIndex(ctx); err != nil {
+				return nil, err
+			}
+			db.voteIndexChecked = true
+		}
 
-	iter, err := db.Index.NewIter(&pebble.IterOptions{
-		LowerBound: []byte(voteIndexPrefix),
-		UpperBound: []byte("\x00mithril.vote/"),
-	})
-	if err != nil {
-		return nil, err
-	}
-	var pubkeys []solana.PublicKey
-	for iter.First(); iter.Valid(); iter.Next() {
-		if err := ctx.Err(); err != nil {
-			iter.Close()
+		iter, err := db.Index.NewIter(&pebble.IterOptions{
+			LowerBound: []byte(voteIndexPrefix),
+			UpperBound: []byte("\x00mithril.vote/"),
+		})
+		if err != nil {
 			return nil, err
 		}
-		key := iter.Key()
-		if len(key) != len(voteIndexPrefix)+32 {
-			iter.Close()
-			return nil, fmt.Errorf("invalid vote-index key length %d", len(key))
+		var pubkeys []solana.PublicKey
+		for iter.First(); iter.Valid(); iter.Next() {
+			if err := ctx.Err(); err != nil {
+				iter.Close()
+				return nil, err
+			}
+			key := iter.Key()
+			if len(key) != len(voteIndexPrefix)+32 {
+				iter.Close()
+				return nil, fmt.Errorf("invalid vote-index key length %d", len(key))
+			}
+			pubkeys = append(pubkeys, solana.PublicKeyFromBytes(key[len(voteIndexPrefix):]))
 		}
-		pubkeys = append(pubkeys, solana.PublicKeyFromBytes(key[len(voteIndexPrefix):]))
+		iterErr := iter.Error()
+		closeErr := iter.Close()
+		if iterErr != nil {
+			return nil, iterErr
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		if db.voteIndexInvalidations.Load() == generation {
+			return pubkeys, nil
+		}
 	}
-	iterErr := iter.Error()
-	closeErr := iter.Close()
-	if iterErr != nil {
-		return nil, iterErr
-	}
-	return pubkeys, closeErr
 }
 
-// migrateVoteIndex scans an older store once. Finalized folds can run during
-// the scan: they add their new vote candidates to the same append-only index.
+// migrateVoteIndex scans stored accounts. Finalized folds can run during the
+// scan: they add their new vote candidates to the same append-only index.
 func (db *AccountsDb) migrateVoteIndex(ctx context.Context) error {
 	iter, err := db.Index.NewIter(nil)
 	if err != nil {
 		return err
 	}
 	defer iter.Close()
-	batch := db.Index.NewBatch()
-	defer batch.Close()
 	keys := make([]solana.PublicKey, 0, 512)
 	flush := func() error {
 		if len(keys) == 0 {
@@ -110,15 +149,20 @@ func (db *AccountsDb) migrateVoteIndex(ctx context.Context) error {
 		}
 		for i, account := range accounts {
 			if account != nil && account.Lamports > 0 && account.Owner == addresses.VoteProgramAddr {
-				if err := batch.Set(voteIndexKey(keys[i]), nil, nil); err != nil {
-					return err
-				}
+				db.voteIndexPending = append(db.voteIndexPending, keys[i])
 			}
 		}
+		last := keys[len(keys)-1]
+		db.voteIndexResume = &last
 		keys = keys[:0]
 		return nil
 	}
-	for iter.First(); iter.Valid(); iter.Next() {
+	if db.voteIndexResume == nil {
+		iter.First()
+	} else if iter.SeekGE(db.voteIndexResume[:]) && bytes.Equal(iter.Key(), db.voteIndexResume[:]) {
+		iter.Next()
+	}
+	for ; iter.Valid(); iter.Next() {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -140,14 +184,29 @@ func (db *AccountsDb) migrateVoteIndex(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	batch := db.Index.NewBatch()
+	defer batch.Close()
+	for _, key := range db.voteIndexPending {
+		if err := batch.Set(voteIndexKey(key), nil, nil); err != nil {
+			return err
+		}
+	}
 	if err := batch.Set(voteIndexReadyKey, nil, nil); err != nil {
 		return err
 	}
-	if err := batch.Commit(pebble.Sync); err != nil {
+	writeOpts := pebble.Sync
+	if db.IndexWALDisabled {
+		writeOpts = pebble.NoSync
+	}
+	if err := batch.Commit(writeOpts); err != nil {
 		return err
 	}
 	if db.IndexWALDisabled {
-		return db.Index.Flush()
+		if err := db.Index.Flush(); err != nil {
+			return err
+		}
 	}
+	db.voteIndexResume = nil
+	db.voteIndexPending = nil
 	return nil
 }

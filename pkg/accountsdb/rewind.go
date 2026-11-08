@@ -153,6 +153,9 @@ func (db *AccountsDb) RewindToBatchBoundary(throughSlot uint64) (RewindResult, e
 	// Recovery, rewind and their forensic moves change the directory outside
 	// compaction's tracking; the next compaction cycle rescans it.
 	defer db.invalidateCompactionInventoryLocked()
+	// Migration reads appendvecs while holding voteIndexMu; take it first.
+	db.voteIndexMu.Lock()
+	defer db.voteIndexMu.Unlock()
 	db.appendVecReadMu.LockAs("rewind")
 	defer db.appendVecReadMu.Unlock()
 
@@ -168,6 +171,9 @@ func (db *AccountsDb) RewindToBatchBoundary(throughSlot uint64) (RewindResult, e
 }
 
 func (db *AccountsDb) rewindToBatchBoundaryLocked(throughSlot uint64) (RewindResult, error) {
+	db.voteIndexChecked = false
+	db.voteIndexResume = nil
+	db.voteIndexPending = nil
 	res := RewindResult{}
 	meta, haveMeta, err := db.readFoldMeta()
 	if err != nil {
@@ -295,6 +301,10 @@ func (db *AccountsDb) rewindToBatchBoundaryLocked(throughSlot uint64) (RewindRes
 	// entry) + the meta rollback. Atomic under Pebble.
 	batch := db.Index.NewBatch()
 	defer batch.Close()
+	// Restored accounts may predate the vote-index migration. Rebuild on demand.
+	if err := batch.Delete(voteIndexReadyKey, nil); err != nil {
+		return res, err
+	}
 	var idxBuf [24]byte
 	for seq := meta.BatchSeq; seq > seqT; seq-- {
 		m := bySeq[seq].manifest

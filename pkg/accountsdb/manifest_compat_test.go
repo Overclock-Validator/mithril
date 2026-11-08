@@ -93,6 +93,13 @@ func TestManifestRecoveryDerivesVoteCandidates(t *testing.T) {
 			recovered, err := db.RecoverFoldState()
 			require.NoError(t, err)
 			require.Equal(t, []uint64{1}, recovered.ReplayedBatches)
+			_, closer, err := db.Index.Get(voteIndexKey(vote.Key))
+			require.NoError(t, err)
+			require.NoError(t, closer.Close())
+			for _, a := range []*accounts.Account{closed, ordinary} {
+				_, _, err = db.Index.Get(voteIndexKey(a.Key))
+				require.ErrorIs(t, err, pebble.ErrNotFound)
+			}
 			got, err := db.VoteAccountPubkeys(context.Background())
 			require.NoError(t, err)
 			require.Equal(t, []solana.PublicKey{vote.Key}, got)

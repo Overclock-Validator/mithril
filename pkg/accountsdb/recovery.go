@@ -55,6 +55,11 @@ type RecoveryResult struct {
 func (db *AccountsDb) RecoverFoldState() (RecoveryResult, error) {
 	db.foldMu.LockAs("recovery")
 	defer db.foldMu.Unlock()
+	db.voteIndexMu.Lock()
+	defer db.voteIndexMu.Unlock()
+	db.voteIndexChecked = false
+	db.voteIndexResume = nil
+	db.voteIndexPending = nil
 	finish := db.beginAccountChange()
 	success := false
 	defer func() { finish(nil, db.durableThrough.Load(), success, true) }() // Derived indexes must rebuild, including on partial failures.

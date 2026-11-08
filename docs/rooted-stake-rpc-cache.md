@@ -10,6 +10,12 @@ write touches that account. The cache owns the RPC fields and up to five credit
 entries, not account buffers. Stake totals, epoch membership and delinquency are
 applied per request. Returned credit slices are copies owned by the caller.
 
+The first unfiltered request after startup, recovery or rewind also scans the
+account index to refresh vote-account candidates. This can take
+longer on large stores; cancelled scans can resume after the last completed batch
+on the next request unless the account view was invalidated. Reopening or
+rewinding the database starts a fresh scan.
+
 The writer only invalidates touched vote records; it performs no additional vote
 decoding or I/O. Rewind, recovery and failed writes clear all parsed records. Loads
 check the account version under the invalidation lock before entering the cache,

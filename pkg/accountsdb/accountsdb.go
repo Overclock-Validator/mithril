@@ -25,15 +25,20 @@ import (
 )
 
 type AccountsDb struct {
-	Index            *pebble.DB
-	BankHashStore    *pebble.DB
-	AcctsDir         string   // primary accounts directory; its parent holds the metadata
-	AcctsDirs        []string // every accounts directory, primary first; see accounts_dirs.go
-	LargestFileId    atomic.Uint64
-	VoteAcctCache    *WeightedCache[solana.PublicKey, *accounts.Account]
-	voteIndexMu      sync.Mutex
-	CommonAcctsCache *commonAccountCache
-	ProgramCache     *WeightedCache[solana.PublicKey, *ProgramCacheEntry]
+	Index                  *pebble.DB
+	BankHashStore          *pebble.DB
+	AcctsDir               string   // primary accounts directory; its parent holds the metadata
+	AcctsDirs              []string // every accounts directory, primary first; see accounts_dirs.go
+	LargestFileId          atomic.Uint64
+	VoteAcctCache          *WeightedCache[solana.PublicKey, *accounts.Account]
+	voteIndexMu            sync.Mutex
+	voteIndexChecked       bool // guarded by voteIndexMu; reset when the database is reopened
+	voteIndexResume        *solana.PublicKey
+	voteIndexPending       []solana.PublicKey
+	voteIndexGeneration    uint64
+	voteIndexInvalidations atomic.Uint64
+	CommonAcctsCache       *commonAccountCache
+	ProgramCache           *WeightedCache[solana.PublicKey, *ProgramCacheEntry]
 	// Otter permits concurrent ordinary operations but not Clear. Rewind takes
 	// the write side; hot-path program cache operations take the read side.
 	programCacheMu sync.RWMutex
