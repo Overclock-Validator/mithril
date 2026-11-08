@@ -25,8 +25,10 @@ import (
 // only lets a feed client spend node CPU; excess connections wait in the
 // listen backlog instead of being parsed.
 const (
-	feedRequestsPerSecond = 4
-	feedRequestBurst      = 4
+	feedRequestsPerSecond       = 4
+	feedRequestBurst            = 4
+	detailFeedRequestsPerSecond = 64
+	detailFeedRequestBurst      = 16
 )
 
 // Feed samples once per second, independently of reader requests. Readers only
@@ -304,8 +306,14 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 	}
 	// One request per connection, so the accept rate bounds the request rate.
 	f.server.SetKeepAlivesEnabled(false)
+	requestRate, requestBurst := feedRequestsPerSecond, feedRequestBurst
+	if details.Replay != nil || details.Cache != nil || details.SelectedWindow != nil || details.RootedHistory != nil ||
+		details.HeldSchedules != nil || details.Network != nil || details.NodeNetwork != nil || details.Machine != nil || details.LocalPeers != nil {
+		// Replay detail can contain 128 pages; its reader has a 12-second deadline.
+		requestRate, requestBurst = detailFeedRequestsPerSecond, detailFeedRequestBurst
+	}
 	limited := &rateLimitedListener{Listener: listener, ctx: ctx,
-		limiter: rate.NewLimiter(feedRequestsPerSecond, feedRequestBurst)}
+		limiter: rate.NewLimiter(rate.Limit(requestRate), requestBurst)}
 	go func() {
 		defer close(f.served)
 		if err := f.server.Serve(netutil.LimitListener(limited, 4)); err != nil && ctx.Err() == nil {
