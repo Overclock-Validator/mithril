@@ -19,7 +19,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/mr-tron/base58"
 )
 
@@ -29,21 +28,20 @@ var testVotes = []string{fixtureKey(1), fixtureKey(2), fixtureKey(3), fixtureKey
 var testIdentities = []string{fixtureKey(5), fixtureKey(6), fixtureKey(7), fixtureKey(8)}
 
 type fixture struct {
-	now                time.Time
-	solstat            map[string]any
-	titan              map[string]any
-	peers              map[string]any
-	genesisAfter       string
-	epochAfter         uint64
-	infoAfter          map[string]any
-	status             map[string]int
-	body               map[string]string
-	lanternRetry       bool
-	lanternFirst       any
-	lanternEmptySecond bool
-	performance        any
-	performanceCalls   atomic.Int32
-	performanceLimit   int
+	now              time.Time
+	solstat          map[string]any
+	titan            map[string]any
+	genesisAfter     string
+	epochAfter       uint64
+	infoAfter        map[string]any
+	status           map[string]int
+	body             map[string]string
+	performance      any
+	performanceCalls atomic.Int32
+	performanceLimit int
+	invalidGossip    bool
+	clockAdvance     time.Duration
+	clockOffset      atomic.Int64
 }
 
 func newFixture() *fixture {
@@ -62,7 +60,6 @@ func newFixture() *fixture {
 		windows[window] = map[string]any{"actual_slots": 20, "coverage": map[string]any{"first_block_slot": 100, "last_block_slot": 119, "first_observed_at": now.Add(-10 * time.Second), "last_observed_at": now}, "voters": map[string]any{testVotes[0]: []any{10, 9, 1, 90}, testVotes[1]: []any{10, 9, 1, 90}, testVotes[2]: []any{8, 7, 1, 87.5}, testVotes[3]: []any{0, 0, 0, nil}}}
 	}
 	f.titan = map[string]any{"epoch": 1, "cluster": map[string]any{"id": "alpenglow", "genesis": GenesisHash, "vote_account": testVotes[0]}, "observation_source": map[string]any{"genesis": GenesisHash}, "overview": map[string]any{"observed_at": now}, "roster": roster, "windows": windows}
-	f.peers = map[string]any{"root": 115, "identity": testIdentities, "ip": []string{"8.8.8.8", "8.8.4.4", "1.1.1.1", "9.9.9.9"}, "country": []string{"US", "DE", "ZZ", "GB"}, "heard_ago": []uint64{1, 1, 1, 121000}}
 	return f
 }
 
@@ -78,7 +75,6 @@ func marshal(t *testing.T, v any) []byte {
 func (f *fixture) collector(t *testing.T) (*collector, *bytes.Buffer) {
 	t.Helper()
 	var genesisCalls, epochCalls atomic.Int32
-	upgrader := websocket.Upgrader{}
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if code := f.status[r.URL.Path]; code != 0 {
 			w.WriteHeader(code)
@@ -87,40 +83,6 @@ func (f *fixture) collector(t *testing.T) (*collector, *bytes.Buffer) {
 		if body, ok := f.body[r.URL.Path]; ok {
 			w.Header().Set("Content-Type", "application/json")
 			io.WriteString(w, body)
-			return
-		}
-		if r.URL.Path == "/websocket" {
-			conn, err := upgrader.Upgrade(w, r, nil)
-			if err != nil {
-				return
-			}
-			defer conn.Close()
-			var request struct {
-				Topic string `json:"topic"`
-				Key   string `json:"key"`
-				ID    int    `json:"id"`
-			}
-			if conn.ReadJSON(&request) != nil {
-				return
-			}
-			if request.Topic != "peers" || request.Key != "gossip" {
-				t.Error("unexpected mutable websocket request")
-				return
-			}
-			if f.lanternRetry {
-				if conn.WriteJSON(map[string]any{"topic": "peers", "key": "gossip", "id": request.ID, "value": f.lanternFirst}) != nil || conn.ReadJSON(&request) != nil {
-					return
-				}
-				if request.Topic != "peers" || request.Key != "gossip" || request.ID != 2 {
-					t.Error("unexpected retry request")
-					return
-				}
-			}
-			var value any = f.peers
-			if f.lanternEmptySecond {
-				value = nil
-			}
-			conn.WriteJSON(map[string]any{"topic": "peers", "key": "gossip", "id": request.ID, "value": value})
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -134,8 +96,11 @@ func (f *fixture) collector(t *testing.T) (*collector, *bytes.Buffer) {
 			switch req.Method {
 			case "getGenesisHash":
 				result = GenesisHash
-				if genesisCalls.Add(1) > 1 && f.genesisAfter != "" {
-					result = f.genesisAfter
+				if genesisCalls.Add(1) > 1 {
+					f.clockOffset.Store(int64(f.clockAdvance))
+					if f.genesisAfter != "" {
+						result = f.genesisAfter
+					}
 				}
 			case "getEpochInfo":
 				epoch := uint64(1)
@@ -154,12 +119,16 @@ func (f *fixture) collector(t *testing.T) (*collector, *bytes.Buffer) {
 				}
 				result = map[string]any{"current": current, "delinquent": []voteAccount{}}
 			case "getClusterNodes":
+				if f.invalidGossip {
+					result = nil
+					break
+				}
 				var nodes []rpcNode
 				for i, id := range testIdentities {
 					addr := "8.8.8.8:8001"
 					nodes = append(nodes, rpcNode{id, &addr})
 					if i > 0 {
-						addr = "9.9.9.9:8001"
+						addr = "127.0.0.1:8001"
 						nodes[i].Gossip = &addr
 					}
 				}
@@ -199,7 +168,7 @@ func (f *fixture) collector(t *testing.T) (*collector, *bytes.Buffer) {
 	transport := &http.Transport{DialContext: dial, TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	t.Cleanup(transport.CloseIdleConnections)
 	var logs bytes.Buffer
-	c := &collector{http: &http.Client{Transport: transport, Timeout: time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, ws: &websocket.Dialer{NetDialContext: dial, TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, HandshakeTimeout: time.Second}, now: func() time.Time { return f.now }, runID: "fixture", log: slog.New(slog.NewJSONHandler(&logs, nil)).With("entry_point", "collector", "run_id", "fixture")}
+	c := &collector{http: &http.Client{Transport: transport, Timeout: time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, now: func() time.Time { return f.now.Add(time.Duration(f.clockOffset.Load())) }, runID: "fixture", log: slog.New(slog.NewJSONHandler(&logs, nil)).With("entry_point", "collector", "run_id", "fixture")}
 	return c, &logs
 }
 
@@ -235,6 +204,9 @@ func TestCollectBoundSourcesExactCountsAndCountries(t *testing.T) {
 		}
 		if p.State != want {
 			t.Fatalf("provider %s state %q != %q (%s)", p.ID, p.State, want, p.Reason)
+		}
+		if p.ID == "geoip" && (p.Binding != "rpc_gossip_local_geoip" || p.SourceTimeKind != "response") {
+			t.Fatalf("unexpected country provenance: %+v", p)
 		}
 	}
 	puffin := provider(&s, "puffin")
@@ -272,11 +244,11 @@ func TestCollectBoundSourcesExactCountsAndCountries(t *testing.T) {
 				t.Fatalf("zero-opportunity score/rank: %+v", x)
 			}
 		}
-		if i == 0 && v.CountryCode != "US" {
+		if i == 0 && (v.CountryCode != "US" || v.CountrySource != "dbip") {
 			t.Fatal("matched country not retained")
 		}
 		if i > 0 && v.CountryCode != "" {
-			t.Fatalf("mismatched/unknown/old country leaked: %+v", v)
+			t.Fatalf("private gossip address received a country: %+v", v)
 		}
 	}
 	encoded := marshal(t, s)
@@ -299,6 +271,37 @@ func TestCollectBoundSourcesExactCountsAndCountries(t *testing.T) {
 		if event["run_id"] != "fixture" || event["entry_point"] != "collector" {
 			t.Fatalf("uncorrelated event: %s", line)
 		}
+	}
+}
+
+func TestCountryGossipResponseAge(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		advance time.Duration
+		state   string
+	}{
+		{"recent", 45 * time.Second, "fresh"},
+		{"expired", MaxAge + time.Second, "stale"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture()
+			f.clockAdvance = tc.advance
+			s, _ := collectFixture(t, f)
+			p := provider(&s, "geoip")
+			if p.State != tc.state {
+				t.Fatalf("geoip state = %q, want %q", p.State, tc.state)
+			}
+			if tc.state == "fresh" && (p.SourceAt == nil || !p.SourceAt.Equal(f.now) || p.SourceTimeKind != "response") {
+				t.Fatalf("gossip response timestamp not retained: %+v", p)
+			}
+			if tc.state == "stale" {
+				for _, row := range s.Validators {
+					if row.CountryCode != "" {
+						t.Fatal("stale gossip produced a country")
+					}
+				}
+			}
+		})
 	}
 }
 
@@ -538,75 +541,6 @@ func TestRPCReferenceGeometryAndBinding(t *testing.T) {
 	}
 }
 
-func TestCollectRetriesUnreadyLanternResponse(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		stale      bool
-		staysStale bool
-		incomplete bool
-		empty      bool
-	}{{"not yet collected", false, false, false, false}, {"cached previous epoch", true, false, false, false},
-		{"previous epoch after retry", true, true, false, false}, {"incomplete retry", true, false, true, false},
-		{"still empty after retry", false, false, false, true}} {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newFixture()
-			f.lanternRetry = true
-			f.lanternEmptySecond = tc.empty
-			if tc.stale {
-				previous := make(map[string]any, len(f.peers))
-				for key, value := range f.peers {
-					previous[key] = value
-				}
-				previous["root"] = uint64(99)
-				f.lanternFirst = previous
-			}
-			if tc.staysStale {
-				f.peers["root"] = uint64(99)
-			}
-			if tc.incomplete {
-				delete(f.peers, "country")
-			}
-			c, _ := f.collector(t)
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
-			s, err := c.collect(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			p := provider(&s, "lantern")
-			if tc.empty {
-				if p.State != "unavailable" || p.Reason != "request_failed" {
-					t.Fatalf("empty Lantern retry: state=%s reason=%s", p.State, p.Reason)
-				}
-				return
-			}
-			if tc.staysStale || tc.incomplete {
-				if p.State != "invalid" || p.Reason != "invalid_payload" {
-					t.Fatalf("invalid Lantern retry: state=%s reason=%s", p.State, p.Reason)
-				}
-				return
-			}
-			if p.State != "fresh" || p.Reason != "" {
-				t.Fatalf("refreshed Lantern response: state=%s reason=%s", p.State, p.Reason)
-			}
-		})
-	}
-}
-
-func TestLanternRetryStopsOnCancel(t *testing.T) {
-	f := newFixture()
-	f.lanternRetry = true
-	c, _ := f.collector(t)
-	epoch, slot, index, slots := uint64(1), uint64(115), uint64(15), uint64(100)
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-	defer cancel()
-	started := time.Now()
-	_, err := c.lantern(ctx, epochInfo{Epoch: &epoch, AbsoluteSlot: &slot, SlotIndex: &index, SlotsInEpoch: &slots})
-	if err == nil || time.Since(started) > 5*time.Second {
-		t.Fatalf("cancelled Lantern retry did not stop promptly: %v", err)
-	}
-}
-
 func TestCollectFailClosedBindingAndProviderFailures(t *testing.T) {
 	cases := []struct {
 		name                    string
@@ -625,6 +559,7 @@ func TestCollectFailClosedBindingAndProviderFailures(t *testing.T) {
 		{"Titan stale", func(f *fixture) { f.titan["overview"].(map[string]any)["observed_at"] = f.now.Add(-3 * time.Minute) }, "titan", "stale", "source_stale", 4},
 		{"directory HTTP failure", func(f *fixture) { f.status["/api/validators"] = 503 }, "solstat", "unavailable", "request_failed", 4},
 		{"directory body bound", func(f *fixture) { f.body["/api/validators"] = strings.Repeat(" ", responseLimit+1) }, "solstat", "unavailable", "request_failed", 4},
+		{"gossip unavailable", func(f *fixture) { f.invalidGossip = true }, "geoip", "unavailable", "rpc_gossip_unavailable", 4},
 		{"Titan arithmetic", func(f *fixture) {
 			f.titan["windows"].(map[string]any)["epoch"].(map[string]any)["voters"].(map[string]any)[testVotes[0]] = []any{10, 9, 2, 90}
 		}, "titan", "invalid", "invalid_payload", 4},
@@ -634,17 +569,12 @@ func TestCollectFailClosedBindingAndProviderFailures(t *testing.T) {
 		{"Titan unknown roster", func(f *fixture) {
 			f.titan["roster"].(map[string]any)[testVotes[0]].(map[string]any)["identity"] = testIdentities[1]
 		}, "titan", "invalid", "invalid_payload", 4},
-		{"Lantern unequal columns", func(f *fixture) { f.peers["country"] = []string{"US"} }, "lantern", "invalid", "invalid_payload", 4},
-		{"Lantern old epoch", func(f *fixture) { f.peers["root"] = 99 }, "lantern", "invalid", "invalid_payload", 4},
-		{"Lantern duplicate identity", func(f *fixture) {
-			f.peers["identity"] = []string{testIdentities[0], testIdentities[0], testIdentities[2], testIdentities[3]}
-		}, "lantern", "invalid", "invalid_payload", 4},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture()
 			tc.mutate(f)
-			s, logs := collectFixture(t, f)
+			s, _ := collectFixture(t, f)
 			p := provider(&s, tc.provider)
 			if p.State != tc.state || p.Reason != tc.reason || len(s.Validators) != tc.rows {
 				t.Fatalf("state=%s reason=%s rows=%d; want %s/%s/%d", p.State, p.Reason, len(s.Validators), tc.state, tc.reason, tc.rows)
@@ -659,19 +589,10 @@ func TestCollectFailClosedBindingAndProviderFailures(t *testing.T) {
 					}
 				}
 			}
-			if tc.provider == "lantern" {
-				detail := map[string]string{"Lantern unequal columns": "columns_invalid", "Lantern old epoch": "root_unavailable_or_outside_epoch", "Lantern duplicate identity": "identity_invalid_or_duplicate"}[tc.name]
-				if !strings.Contains(logs.String(), `"detail":"`+detail+`"`) {
-					t.Fatalf("missing safe Lantern validation detail %q", detail)
-				}
-				for _, private := range append(testIdentities, "8.8.8.8", "8.8.4.4", "1.1.1.1", "9.9.9.9") {
-					if strings.Contains(logs.String(), private) {
-						t.Fatal("Lantern validation log exposed peer data")
-					}
-				}
+			if tc.provider == "geoip" {
 				for _, v := range s.Validators {
 					if v.CountryCode != "" {
-						t.Fatal("invalid country survived")
+						t.Fatal("country survived unavailable gossip")
 					}
 				}
 			}
@@ -851,39 +772,6 @@ func TestValidateNegativeBounds(t *testing.T) {
 	}
 	if _, err := number("18446744073709551615"); err != nil {
 		t.Fatal("exact uint64 maximum rejected")
-	}
-}
-
-func TestCollectLanternHeardAgePresence(t *testing.T) {
-	for _, tc := range []struct {
-		name        string
-		age         any
-		missing     bool
-		wantState   string
-		wantCountry string
-	}{
-		{"known zero", uint64(0), false, "fresh", "US"},
-		{"unknown null", nil, false, "fresh", ""},
-		{"missing column", nil, true, "invalid", ""},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newFixture()
-			if tc.missing {
-				delete(f.peers, "heard_ago")
-			} else {
-				f.peers["heard_ago"] = []any{tc.age, uint64(1), uint64(1), uint64(121000)}
-			}
-			s, _ := collectFixture(t, f)
-			var country string
-			for _, row := range s.Validators {
-				if row.VoteAccount == testVotes[0] {
-					country = row.CountryCode
-				}
-			}
-			if state := provider(&s, "lantern").State; state != tc.wantState || country != tc.wantCountry {
-				t.Errorf("got provider=%q country=%q; want provider=%q country=%q", state, country, tc.wantState, tc.wantCountry)
-			}
-		})
 	}
 }
 

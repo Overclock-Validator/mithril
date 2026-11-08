@@ -28,7 +28,7 @@ func clusterTestSnapshot(now time.Time, rows int) cluster.Snapshot {
 		{"rpc", "https://rpc.ag.validblocks.com/", "rpc_genesis_before_after", "response"},
 		{"solstat", "https://solstat.noders.services/api/validators?network=alpenglow", "rpc_profile_epoch_checked", "provider"},
 		{"titan", "https://observatory-origin.titananalytics.io/analytics/api/stream", "payload_genesis_epoch_checked", "provider"},
-		{"lantern", "https://alpenglow.lantern.one/", "rpc_gossip_ip_matched", "receipt"},
+		{"geoip", "https://db-ip.com/", "rpc_gossip_local_geoip", "response"},
 		{"puffin", "https://puffin-validator.xyz/alpenglow", "", ""},
 	} {
 		status := cluster.ProviderStatus{ID: p.id, SourceURL: p.url, CapturedAt: now, RowCount: cluster.Count(fmt.Sprint(rows)), State: "fresh", SourceAt: &now,
@@ -46,7 +46,7 @@ func clusterTestSnapshot(now time.Time, rows int) cluster.Snapshot {
 		key[31] = 1
 		stake := fmt.Sprintf("%d.123456789", rows-i)
 		s.Validators = append(s.Validators, cluster.Validator{Identity: identity, VoteAccount: base58.Encode(key), DirectorySource: "solstat", Name: fmt.Sprintf("Node %03d", i), StakeSOL: &stake,
-			CountryCode: "DE", CountrySource: "lantern_dbip", Inclusion: []cluster.Inclusion{}})
+			CountryCode: "DE", CountrySource: "dbip", Inclusion: []cluster.Inclusion{}})
 	}
 	return s
 }
