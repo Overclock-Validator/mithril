@@ -72,9 +72,7 @@ func TestEpochBoundaryDelayedCommissionForReactivatedStake(t *testing.T) {
 			})
 			store := func(slot uint64, accts ...*accounts.Account) {
 				t.Helper()
-				done := make(chan struct{})
-				require.NoError(t, db.StoreAccounts(accts, slot, func() { close(done) }))
-				<-done
+				seedDurableAccounts(t, db, accts, slot)
 			}
 			setVote := func(slot uint64, key solana.PublicKey, commission uint16, credits []sealevel.EpochCredits) {
 				t.Helper()

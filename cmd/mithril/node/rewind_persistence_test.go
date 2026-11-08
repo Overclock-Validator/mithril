@@ -21,7 +21,6 @@ func TestRewindPersistsLowerStateBeforeForwardReplay(t *testing.T) {
 			require.NoError(t, os.WriteFile(filepath.Join(dir, "largest_file_id"), make([]byte, 8), 0644))
 			db, err := accountsdb.OpenDb(dir)
 			require.NoError(t, err)
-			db.RootedDurable = true
 			db.InitCaches()
 			var tip *state.ResumeContext
 			commit := func(slot uint64) {
@@ -49,7 +48,6 @@ func TestRewindPersistsLowerStateBeforeForwardReplay(t *testing.T) {
 			db.CloseDb()
 			db, err = accountsdb.OpenDb(dir)
 			require.NoError(t, err)
-			db.RootedDurable = true
 			db.InitCaches()
 			s, err = state.LoadState(dir)
 			require.NoError(t, err)

@@ -105,8 +105,6 @@ func newStreamingTestHarness(t *testing.T) *streamingTestHarness {
 		epochSchedule:       &epochSchedule,
 		tail:                fakeUnrootedState{},
 		transactionStatuses: NewTransactionStatusCache(),
-		alpenglowMode:       true,
-		unrootedTailUsed:    true,
 		lastSlotCtx:         func() *sealevel.SlotCtx { return h.lastCtx },
 		frontier:            func() uint64 { return h.frontier },
 		currentFeatures:     func() *features.Features { return env.exec.block.Features },
@@ -396,7 +394,7 @@ func TestStreamingEligibility(t *testing.T) {
 		{"epoch boundary", func() { h.exec.deps.currentEpoch = func() uint64 { return 99 } }, "epoch boundary"},
 		{"rewards", func() { h.exec.deps.rewardsInFlight = func() bool { return true } }, "partitioned rewards in flight"},
 		{"no features", func() { h.exec.deps.currentFeatures = func() *features.Features { return nil } }, "no feature set"},
-		{"no tail", func() { h.exec.deps.tail = nil }, "requires alpenglow rooted-durable replay"},
+		{"no tail", func() { h.exec.deps.tail = nil }, "requires the unrooted tail"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

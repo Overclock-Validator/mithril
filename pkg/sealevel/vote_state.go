@@ -1753,13 +1753,32 @@ func MarshalVersionedVoteState(voteStateVersions *VoteStateVersions) ([]byte, er
 	return marshalVersionedVoteState(voteStateVersions)
 }
 
+// The in-place writer owns its scratch until the account copy completes. Pool
+// buffer pointers so returning scratch does not allocate a boxed slice header.
+var voteStateWriteBufPool = sync.Pool{New: func() any {
+	return bytes.NewBuffer(make([]byte, 0, 4096))
+}}
+
 // WriteVersionedVoteStateInPlace serializes a vote state without changing the
 // account data length. Vote accounts retain zero padding after the encoded state.
 func WriteVersionedVoteStateInPlace(data []byte, voteStateVersions *VoteStateVersions) error {
-	marshaled, err := marshalVersionedVoteState(voteStateVersions)
-	if err != nil {
+	var buffer *bytes.Buffer
+	if sbpf.UsePool {
+		buffer = voteStateWriteBufPool.Get().(*bytes.Buffer)
+		buffer.Reset()
+		defer func() {
+			if buffer.Cap() <= 64<<10 {
+				buffer.Reset()
+				voteStateWriteBufPool.Put(buffer)
+			}
+		}()
+	} else {
+		buffer = &bytes.Buffer{}
+	}
+	if err := voteStateVersions.MarshalWithEncoder(bin.NewBinEncoder(buffer)); err != nil {
 		return err
 	}
+	marshaled := buffer.Bytes()
 	if len(marshaled) > len(data) {
 		return fmt.Errorf("vote state serialized length %d exceeds account data capacity %d", len(marshaled), len(data))
 	}

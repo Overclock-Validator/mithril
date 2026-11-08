@@ -68,33 +68,57 @@ func TestNewSetupModel_StoragePathsPopulated(t *testing.T) {
 	// the all-or-nothing invariant is covered by pkg/config tests.
 }
 
-func TestValidatorClusterMenuIsAlpenglowOnly(t *testing.T) {
-	m := setupModel{screen: scrCluster, nodeType: "validator"}
-	items := m.currentItems()
-	assert.Equal(t, "alpenglow", items[0].value)
-	for _, item := range items {
-		assert.NotContains(t, []string{"mainnet-beta", "testnet", "devnet"}, item.value)
+func TestClusterMenuOffersBuiltinAlpenglowClusters(t *testing.T) {
+	for _, nodeType := range []string{"verifying", "validator"} {
+		m := setupModel{screen: scrCluster, nodeType: nodeType}
+		var values []string
+		for _, item := range m.currentItems() {
+			if item.value != "" && item.value != "_back" {
+				values = append(values, item.value)
+			}
+		}
+		assert.Contains(t, values, "mainnet", nodeType)
+		assert.Contains(t, values, "testnet", nodeType)
+		assert.Contains(t, values, "devnet", nodeType)
+		assert.NotContains(t, values, "alpenglow", nodeType)
+		assert.NotContains(t, values, "mainnet-beta", nodeType)
 	}
 }
 
-func TestQuickClassicSetupSkipsTurbineGossip(t *testing.T) {
-	m := setupModel{screen: scrRPC, mode: "quick", nodeType: "verifying", cluster: "mainnet-beta"}
+func TestQuickSetupAsksForTurbineGossip(t *testing.T) {
+	m := setupModel{screen: scrRPC, mode: "quick", nodeType: "verifying", cluster: "mainnet"}
 	m.advanceFromInput()
-	assert.Equal(t, scrReview, m.screen)
+	assert.Equal(t, scrGossip, m.screen)
 }
 
-func TestClassicSetupGeneratesRPCSource(t *testing.T) {
+func TestClusterChoicePrefillsNetworkDefaults(t *testing.T) {
 	m := newSetupModel()
-	m.mode = "quick"
-	m.nodeType = "verifying"
-	m.cluster = "mainnet-beta"
-	m.rpcEndpoint = "https://api.mainnet-beta.solana.com"
-	m.configPath = filepath.Join(t.TempDir(), "config.toml")
+	assert.Equal(t, "mainnet", m.cluster)
+	assert.Equal(t, "entrypoint.mainnet-beta.solana.com:8001", m.gossipEntry)
 
-	m.generateConfig()
-	raw, err := os.ReadFile(m.configPath)
-	assert.NoError(t, err)
-	content := string(raw)
-	assert.Contains(t, content, "source = \"rpc\"")
-	assert.False(t, strings.Contains(content, "[turbine]"))
+	m.screen = scrCluster
+	next, _ := m.handleSelect("testnet")
+	m = next.(setupModel)
+	assert.Equal(t, "testnet", m.cluster)
+	assert.Equal(t, "https://api.testnet.solana.com", m.rpcEndpoint)
+	assert.Equal(t, "entrypoint.testnet.solana.com:8001", m.gossipEntry)
+}
+
+func TestSetupGeneratesTurbineSourceForEveryCluster(t *testing.T) {
+	for _, cluster := range []string{"mainnet", "testnet", "devnet"} {
+		m := newSetupModel()
+		m.mode = "quick"
+		m.nodeType = "verifying"
+		m.cluster = cluster
+		m.configPath = filepath.Join(t.TempDir(), "config.toml")
+
+		m.generateConfig()
+		raw, err := os.ReadFile(m.configPath)
+		assert.NoError(t, err)
+		content := string(raw)
+		assert.Contains(t, content, "cluster = \""+cluster+"\"")
+		assert.Contains(t, content, "source = \"turbine\"")
+		assert.Contains(t, content, "[turbine]")
+		assert.False(t, strings.Contains(content, "source = \"rpc\""))
+	}
 }

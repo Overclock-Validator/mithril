@@ -126,14 +126,14 @@ func TestBatchAbsencePendingFoldWins(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
-func TestBatchAbsenceLegacyWriteAndErrors(t *testing.T) {
+func TestBatchAbsenceFoldWriteAndErrors(t *testing.T) {
 	db, _ := newFoldTestDb(t)
 	defer db.CloseDb()
 	key := solana.PublicKey{42}
 	keys := []solana.PublicKey{key}
 	_, err := db.GetAccountsBatch(context.Background(), 100, keys)
 	require.NoError(t, err)
-	db.storeAccountsSync([]*accounts.Account{foldAcct(42, 17, nil)}, 110)
+	commitTestBatch(t, db, 110, foldAcct(42, 17, nil))
 	out, err := db.GetAccountsBatch(context.Background(), 110, keys)
 	require.NoError(t, err)
 	require.EqualValues(t, 17, out[0].Lamports)

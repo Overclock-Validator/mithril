@@ -448,6 +448,10 @@ func recordStakeAndVoteAccountsFromMetas(slotCtx *sealevel.SlotCtx, execCtx *sea
 }
 
 func handleFailedTx(slotCtx *sealevel.SlotCtx, tx *solana.Transaction, instrs []sealevel.Instruction, computeBudgetLimits *sealevel.ComputeBudgetLimits, instrErr error, rentStateErr error) (*fees.TxFeeInfo, error) {
+	return handleFailedTxWithTimings(slotCtx, tx, instrs, computeBudgetLimits, instrErr, rentStateErr, nil)
+}
+
+func handleFailedTxWithTimings(slotCtx *sealevel.SlotCtx, tx *solana.Transaction, instrs []sealevel.Instruction, computeBudgetLimits *sealevel.ComputeBudgetLimits, instrErr error, rentStateErr error, timings *metrics.TransactionTimings) (*fees.TxFeeInfo, error) {
 	recordMetrics := slotCtx != nil && slotCtx.Replay
 	var totalStart time.Time
 	var preparationStart time.Time
@@ -455,7 +459,7 @@ func handleFailedTx(slotCtx *sealevel.SlotCtx, tx *solana.Transaction, instrs []
 		totalStart = time.Now()
 		preparationStart = totalStart
 		defer func() {
-			metrics.GlobalBlockReplay.TxFailedUpdateAccounts.AddTimingSince(totalStart)
+			timings.AddTimingSince(metrics.TransactionTxFailedUpdateAccounts, totalStart)
 		}()
 	}
 
@@ -469,14 +473,14 @@ func handleFailedTx(slotCtx *sealevel.SlotCtx, tx *solana.Transaction, instrs []
 	if err != nil {
 		if slotCtx.UnrootedRead == nil && slotCtx.AccountsDb == nil {
 			if recordMetrics {
-				metrics.GlobalBlockReplay.TxFailedPublicationPreparation.AddTimingSince(preparationStart)
+				timings.AddTimingSince(metrics.TransactionTxFailedPublicationPreparation, preparationStart)
 			}
 			return nil, fees.ErrFeePayerNotFound
 		}
 		p, err = slotCtx.GetAccountFromAccountsDb(payerAcctKey)
 		if err != nil {
 			if recordMetrics {
-				metrics.GlobalBlockReplay.TxFailedPublicationPreparation.AddTimingSince(preparationStart)
+				timings.AddTimingSince(metrics.TransactionTxFailedPublicationPreparation, preparationStart)
 			}
 			return nil, fees.ErrFeePayerNotFound
 		}
@@ -485,13 +489,13 @@ func handleFailedTx(slotCtx *sealevel.SlotCtx, tx *solana.Transaction, instrs []
 	rentSysvar := fees.RentForSlot(slotCtx)
 	if err := fees.ValidateFeePayerWithFeatures(p, txFeeInfo.TotalFee, rentSysvar, slotCtx.Features); err != nil {
 		if recordMetrics {
-			metrics.GlobalBlockReplay.TxFailedPublicationPreparation.AddTimingSince(preparationStart)
+			timings.AddTimingSince(metrics.TransactionTxFailedPublicationPreparation, preparationStart)
 		}
 		return nil, err
 	}
 
 	if recordMetrics {
-		metrics.GlobalBlockReplay.TxFailedPublicationPreparation.AddTimingSince(preparationStart)
+		timings.AddTimingSince(metrics.TransactionTxFailedPublicationPreparation, preparationStart)
 	}
 	originalRentEpoch := p.RentEpoch
 	if p.RentEpoch != math.MaxUint64 && rentSysvar.IsExempt(p.Lamports, uint64(len(p.Data))) {
@@ -514,7 +518,7 @@ func handleFailedTx(slotCtx *sealevel.SlotCtx, tx *solana.Transaction, instrs []
 	}
 	slotCtx.RecordModifiedAcct(payerAcctKey)
 	if recordMetrics {
-		metrics.GlobalBlockReplay.TxFailedPayerPublication.AddTimingSince(payerStart)
+		timings.AddTimingSince(metrics.TransactionTxFailedPayerPublication, payerStart)
 	}
 
 	if len(instrs) >= 1 {
@@ -528,7 +532,7 @@ func handleFailedTx(slotCtx *sealevel.SlotCtx, tx *solana.Transaction, instrs []
 		if didAdvanceNonceAcct {
 			slotCtx.RecordModifiedAcct(noncePubkey)
 			if recordNonce {
-				metrics.GlobalBlockReplay.TxFailedNoncePublication.AddTimingSince(nonceStart)
+				timings.AddTimingSince(metrics.TransactionTxFailedNoncePublication, nonceStart)
 			}
 		}
 	}
@@ -703,6 +707,12 @@ func processTransactionComputeUnits(execCtx *sealevel.ExecutionCtx) uint64 {
 }
 
 func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, tx *solana.Transaction, txMeta *rpc.TransactionMeta, dbgOpts *DebugOptions, arena *arena.Arena[sealevel.BorrowedAccount], shouldVerifySignatures bool) (*fees.TxFeeInfo, uint64, error) {
+	return processTransactionWithTimings(slotCtx, sigverifyWg, tx, txMeta, dbgOpts, arena, shouldVerifySignatures, nil)
+}
+
+// The recorder belongs to the calling replay worker and is cleared before the
+// execution context returns to any caller. Independent callers retain atomics.
+func processTransactionWithTimings(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, tx *solana.Transaction, txMeta *rpc.TransactionMeta, dbgOpts *DebugOptions, arena *arena.Arena[sealevel.BorrowedAccount], shouldVerifySignatures bool, timings *metrics.TransactionTimings) (*fees.TxFeeInfo, uint64, error) {
 	if trace.IsEnabled() && slotCtx.TraceCtx != nil {
 		regionType := "ProcessTransaction"
 		if tx.IsVote() {
@@ -765,9 +775,14 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 		CapturePreBalances: txMeta != nil || captureTx,
 		RecordLogs:         debugTx,
 	}
+	input.TimingRecorder = timings
 	output := LoadAndExecuteTransaction(input)
 
 	execCtx := output.ExecCtx
+	if execCtx != nil {
+		execCtx.TimingRecorder = timings
+		defer func() { execCtx.TimingRecorder = nil }()
+	}
 	instrs := output.Instrs
 	computeBudgetLimits := output.ComputeBudgetLimits
 
@@ -790,7 +805,7 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 			}
 		}
 	}
-	metrics.GlobalBlockReplay.PreBalanceDivergenceCheck.AddTimingSince(start)
+	timings.AddTimingSince(metrics.TransactionPreBalanceDivergenceCheck, start)
 
 	// Handle transaction errors from the pure function
 	if output.ProcessingResult.TransactionError != nil {
@@ -842,7 +857,7 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 		case TransactionErrorMaxLoadedAccountsDataSizeExceeded,
 			TransactionErrorInvalidProgramForExecution,
 			TransactionErrorProgramAccountNotFound:
-			txFeeInfo, err := handleFailedTx(slotCtx, tx, instrs, computeBudgetLimits, txErr.InstructionError, nil)
+			txFeeInfo, err := handleFailedTxWithTimings(slotCtx, tx, instrs, computeBudgetLimits, txErr.InstructionError, nil, timings)
 			return txFeeInfo, processTransactionComputeUnits(execCtx), err
 
 		case TransactionErrorInsufficientFundsForFee:
@@ -851,11 +866,11 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 			return nil, processTransactionComputeUnits(execCtx), txErr.InstructionError
 
 		case TransactionErrorInstructionError:
-			txFeeInfo, err := handleFailedTx(slotCtx, tx, instrs, computeBudgetLimits, txErr.InstructionError, nil)
+			txFeeInfo, err := handleFailedTxWithTimings(slotCtx, tx, instrs, computeBudgetLimits, txErr.InstructionError, nil, timings)
 			return txFeeInfo, processTransactionComputeUnits(execCtx), err
 
 		case TransactionErrorInsufficientFundsForRent:
-			txFeeInfo, err := handleFailedTx(slotCtx, tx, instrs, computeBudgetLimits, nil, txErr.InstructionError)
+			txFeeInfo, err := handleFailedTxWithTimings(slotCtx, tx, instrs, computeBudgetLimits, nil, txErr.InstructionError, timings)
 			return txFeeInfo, processTransactionComputeUnits(execCtx), err
 
 		default:
@@ -923,7 +938,7 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 			panic(msg)
 		}
 	}
-	metrics.GlobalBlockReplay.PostBalanceDivergenceCheck.AddTimingSince(start)
+	timings.AddTimingSince(metrics.TransactionPostBalanceDivergenceCheck, start)
 
 	// Trailing-verifier capture (successful tx): fee + status + pre AND post
 	// balances, with the native/dummy comparability mask. Read-only walk;
@@ -960,7 +975,7 @@ func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, 
 		panic(fmt.Sprintf("unable to apply successful transaction %s in slot %d: %v", tx.Signatures[0], slotCtx.Slot, err))
 	}
 	if slotCtx.Replay {
-		metrics.GlobalBlockReplay.TxUpdateAccounts.AddTimingSince(start)
+		timings.AddTimingSince(metrics.TransactionTxUpdateAccounts, start)
 	}
 
 	return txFeeInfo, processTransactionComputeUnits(execCtx), nil
