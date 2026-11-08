@@ -106,7 +106,9 @@ nodes, configure separate sockets, reader units and ports manually.
 The path unit starts the reader when the socket appears. The reader defaults to
 loopback and the private profile; other local processes may still reach it.
 Stopping the node leaves the reader running with unavailable or stale data.
-An unclean node exit can leave a socket that must be inspected before removal.
+An unclean node exit leaves the old socket in place, so the path unit can start
+the reader against a node that is not running; the next node start replaces
+that socket as described below.
 If repeated starts hit systemd's start limit, the path unit can fail and must be
 inspected and restarted by the operator. This does not install a service or
 publish a URL.
