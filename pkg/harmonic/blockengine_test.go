@@ -288,6 +288,11 @@ func TestBlockEngineStrategyChangeReconnectsWithTheNewStrategy(t *testing.T) {
 	eventually(t, h.session.Healthy, "healthy")
 	h.session.SetStrategy(blockenginepb.SchedulingStrategy_SCHEDULING_STRATEGY_MREV)
 	eventually(t, func() bool { return h.session.Stats().Sessions == 2 }, "a new session")
+	eventually(t, func() bool {
+		h.be.mu.Lock()
+		defer h.be.mu.Unlock()
+		return len(h.be.strategies) >= 2
+	}, "the new strategy is received")
 	h.be.mu.Lock()
 	defer h.be.mu.Unlock()
 	assert.Equal(t, []blockenginepb.SchedulingStrategy{
