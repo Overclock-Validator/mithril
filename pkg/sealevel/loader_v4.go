@@ -139,7 +139,7 @@ func decodeLoaderV4State(data []byte) (*LoaderV4State, error) {
 }
 
 func setLoaderV4AcctState(acct *BorrowedAccount, state *LoaderV4State) error {
-	stateSlice, err := acct.DataMutable(nil)
+	stateSlice, err := acct.DataMutable(features.Features{})
 	if err != nil {
 		return err
 	}
