@@ -118,7 +118,7 @@ func TestVoteRecordCacheResponseOwnershipAndPublication(t *testing.T) {
 	require.Same(t, record, s.voteRecords.records[solana.PublicKey{1}])
 }
 
-func TestVoteRecordCacheLegacyAndUnknownKeys(t *testing.T) {
+func TestVoteRecordCacheFoldAndUnknownKeys(t *testing.T) {
 	s := seedStakeCacheServer(t, recordTestAccount(t, 10))
 	readTestVoteRecord(t, s)
 	version, _ := s.acctsDb.CommittedAccountVersion()
@@ -132,11 +132,8 @@ func TestVoteRecordCacheLegacyAndUnknownKeys(t *testing.T) {
 		require.Nil(t, record)
 	}
 	require.Len(t, s.voteRecords.records, 1, "arbitrary nonexistent filters must not grow retained memory")
-	s.acctsDb.RootedDurable = false
-	done := make(chan struct{})
-	require.NoError(t, s.acctsDb.StoreAccounts([]*accounts.Account{recordTestAccount(t, 11)}, 11, func() { close(done) }))
-	<-done
-	require.Eventually(t, func() bool { _, stable := s.acctsDb.CommittedAccountVersion(); return stable }, time.Second, time.Millisecond)
+	_, err = s.acctsDb.CommitBatch([]accounts.SlotDelta{{Slot: 11, Delta: []*accounts.Account{recordTestAccount(t, 11)}}}, 11, nil, nil)
+	require.NoError(t, err)
 	s.SetRootedBankState(11, 11, 0)
 	require.Equal(t, uint64(11), readTestVoteRecord(t, s).LastVote)
 }

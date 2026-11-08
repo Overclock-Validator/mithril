@@ -82,6 +82,16 @@ func (db *AccountsDb) RecoverFoldState() (RecoveryResult, error) {
 		return res, nil
 	}
 
+	// Before anything is deleted: a store classic replay wrote has account
+	// files the orphan pass below would remove as uncommitted.
+	history, err := db.inspectFoldHistoryLocked(true)
+	if err != nil {
+		return res, err
+	}
+	if history.ClassicWrites() {
+		return res, classicStoreError(history)
+	}
+
 	headers, err := ListFoldManifests(db.AcctsDir)
 	if err != nil {
 		return res, err

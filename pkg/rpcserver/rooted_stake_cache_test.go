@@ -181,16 +181,13 @@ func TestRootedStakeCacheConcurrentBootstrap(t *testing.T) {
 	require.Equal(t, uint64(1), s.stakeCache.scans)
 }
 
-func TestRootedStakeCacheLegacyStore(t *testing.T) {
+func TestRootedStakeCacheFoldPublication(t *testing.T) {
 	s := seedStakeCacheServer(t, cacheStakeAccount(t, 21, 1, 100, math.MaxUint64, math.MaxUint64))
 	cacheTotals(t, s)
-	s.acctsDb.RootedDurable = false
-	done := make(chan struct{})
-	require.NoError(t, s.acctsDb.StoreAccounts([]*accounts.Account{cacheStakeAccount(t, 21, 2, 500, math.MaxUint64, math.MaxUint64)}, 11, func() { close(done) }))
-	<-done
-	require.Eventually(t, func() bool { _, ok := s.acctsDb.CommittedAccountVersion(); return ok }, time.Second, time.Millisecond)
-	_, err := s.rootedActivatedStakes(t.Context(), 10, 0, nil)
-	require.ErrorIs(t, err, errStakeViewChanged, "a completed legacy write still needs RPC bank publication")
+	_, err := s.acctsDb.CommitBatch([]accounts.SlotDelta{{Slot: 11, Delta: []*accounts.Account{cacheStakeAccount(t, 21, 2, 500, math.MaxUint64, math.MaxUint64)}}}, 11, nil, nil)
+	require.NoError(t, err)
+	_, err = s.rootedActivatedStakes(t.Context(), 10, 0, nil)
+	require.ErrorIs(t, err, errStakeViewChanged, "a completed fold still needs RPC bank publication")
 	s.SetRootedBankState(11, 11, 0)
 	require.Equal(t, map[solana.PublicKey]uint64{{2}: 500}, cacheTotals(t, s))
 	require.Equal(t, uint64(1), s.stakeCache.scans)

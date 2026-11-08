@@ -162,17 +162,38 @@ func TestFinalizedSkipEvidenceIsDistinctFromConflict(t *testing.T) {
 	}
 }
 
-// Fresh bootstrap: lastRooted starts at 0 while the executed tip is in the millions —
-// the walk must be floored at the tail depth, not span the whole chain.
-func TestPromotionGateWalkFlooredAtTailDepth(t *testing.T) {
+// Fresh bootstrap must start at the imported parent, not walk the whole chain.
+func TestPromotionGateWalkFlooredAtReplayStart(t *testing.T) {
 	stats := &alpenglowGateStats{}
 	through, err := alpenglowPromotionGate(&stubFinalityEngine{}, nil, nil, nil,
-		0, 5_000_000, 5_000_000, stats)
-	if err != nil || through != 5_000_000 {
+		alpenglowPromotionFloor(0, 4_999_901), 9_000_000, 5_000_000, stats)
+	if err != nil || through != 9_000_000 {
 		t.Fatalf("fresh-bootstrap walk must pass: through=%d err=%v", through, err)
 	}
-	if stats.checked > unrootedTailHaltCap {
-		t.Fatalf("walk checked %d slots, must be floored at tail depth %d", stats.checked, unrootedTailHaltCap)
+	if stats.checked != 100 {
+		t.Fatalf("walk checked %d slots, want 100 executed since bootstrap", stats.checked)
+	}
+	if floor := alpenglowPromotionFloor(4_999_950, 4_999_901); floor != 4_999_950 {
+		t.Fatalf("durable progress must advance the floor: %d", floor)
+	}
+	if floor := alpenglowPromotionFloor(0, 0); floor != 0 {
+		t.Fatalf("genesis floor must not underflow: %d", floor)
+	}
+}
+
+// Mainnet reward distribution can retain more than 512 banks, and skipped
+// slots can make even a short retained tail span more than 512 slot numbers.
+// Neither case may hide a mismatch at the beginning of the unfolded prefix.
+func TestPromotionGateChecksEntireRewardsWindow(t *testing.T) {
+	const boundary = uint64(462672000)
+	got, want := solana.Hash{1}, solana.Hash{2}
+	through, err := alpenglowPromotionGate(&stubFinalityEngine{},
+		map[uint64]solana.Hash{boundary: want},
+		map[uint64]solana.Hash{boundary: got}, nil,
+		boundary-1, boundary+600, boundary+600, nil)
+	var mismatch *AlpenglowFinalityMismatch
+	if !errors.As(err, &mismatch) || mismatch.Slot != boundary || through != boundary-1 {
+		t.Fatalf("oldest retained bank must be checked: through=%d err=%v", through, err)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"unsafe"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
+	"github.com/Overclock-Validator/mithril/pkg/spinlock"
 	"github.com/cespare/xxhash/v2"
 	"github.com/gagliardetto/solana-go"
 )
@@ -97,14 +98,21 @@ func (c *commonAccountCache) Get(k solana.PublicKey) (a *accounts.Account, ok bo
 		return c.large.Get(k)
 	}
 	s, h := c.locate(k)
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// Copy a tier hit out under the lock and allocate the returned account
+	// after releasing it: allocation can stall in GC assist, and every other
+	// worker reading this shard would park behind it. The large tier is read
+	// under the lock so a concurrent Set's migration is never seen half done.
+	var hit commonTierHeader
+	var data [200]byte
+	spinlock.Lock(&s.mu)
 	start := tierStart(h, len(s.empty))
 	for i := start; i < start+commonTierWays; i++ {
 		e := &s.empty[i]
 		if e.used && e.key == k {
 			e.recent = true
-			return e.account(nil), true
+			hit = *e
+			s.mu.Unlock()
+			return hit.account(nil), true
 		}
 	}
 	start = tierStart(h, len(s.small))
@@ -112,10 +120,15 @@ func (c *commonAccountCache) Get(k solana.PublicKey) (a *accounts.Account, ok bo
 		e := &s.small[i]
 		if e.used && e.key == k {
 			e.recent = true
-			return e.account(e.data[:]), true
+			hit = e.commonTierHeader
+			copy(data[:hit.length], e.data[:])
+			s.mu.Unlock()
+			return hit.account(data[:]), true
 		}
 	}
-	return c.large.Get(k)
+	a, ok = c.large.Get(k)
+	s.mu.Unlock()
+	return a, ok
 }
 func (c *commonAccountCache) Has(k solana.PublicKey) bool {
 	if !c.enabled {

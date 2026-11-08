@@ -298,10 +298,6 @@ func (rpcServer *RpcServer) readRootedAccounts(ctx context.Context, pubkeys []so
 }
 
 func (rpcServer *RpcServer) rootedPublicationPending(rootedSlot uint64) bool {
-	if !rpcServer.acctsDb.RootedDurable {
-		committed := rpcServer.acctsDb.CommittedAccountSlot()
-		return committed != 0 && committed != rootedSlot
-	}
 	durableThrough := rpcServer.acctsDb.DurableThrough()
 	// Zero means the snapshot baseline is active and no fold has committed yet.
 	return durableThrough != 0 && durableThrough != rootedSlot

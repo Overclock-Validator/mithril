@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"os"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/util"
@@ -116,18 +115,6 @@ func (parser *appendVecParser) parseNextAcct(pk *solana.PublicKey, a *AccountInd
 	parser.Offset = dataOffset + alignedDataLen
 
 	return nil
-}
-
-// GetAppendVecDataLen reads only the bytes necessary to determine the length
-// of the append vec. Should be kept in sync with
-// (*AppendVecAccount).Unmarshal.
-func GetAppendVecDataLen(f *os.File, offset uint64) (uint64, error) {
-	var hdrBytes [8]byte
-	_, err := f.ReadAt(hdrBytes[:], int64(offset+8))
-	if err != nil {
-		return 0, err
-	}
-	return binary.LittleEndian.Uint64(hdrBytes[:]), nil
 }
 
 func (acct *AppendVecAccount) Unmarshal(buf io.Reader) error {

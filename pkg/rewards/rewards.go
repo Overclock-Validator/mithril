@@ -312,11 +312,6 @@ func DistributeVotingRewards(acctsDb *accountsdb.AccountsDb, validatorRewards ma
 	wg.Wait()
 	workerPool.Release()
 
-	err := acctsDb.StoreAccounts(updatedAccts, slot, nil)
-	if err != nil {
-		panic(fmt.Sprintf("error updating accounts for voting rewards in slot %d: %s", slot, err))
-	}
-
 	return updatedAccts, parentUpdatedAccts, totalVotingRewards.Load()
 }
 
@@ -454,21 +449,6 @@ func DistributeStakingRewardsFromSpool(acctsDb *accountsdb.AccountsDb, spoolDir 
 	}
 	wg.Wait()
 	workerPool.Release()
-
-	// Filter out nil entries (burned records) before storing
-	var filteredAccts []*accounts.Account
-	for _, a := range accts {
-		if a != nil {
-			filteredAccts = append(filteredAccts, a)
-		}
-	}
-
-	if len(filteredAccts) > 0 {
-		err = acctsDb.StoreAccounts(filteredAccts, currentSlot, nil)
-		if err != nil {
-			panic(fmt.Sprintf("error updating accounts for spool distribution in slot %d: %s", currentSlot, err))
-		}
-	}
 
 	return accts, parentAccts, distributedLamports.Load(), burnedLamports.Load(), stakeCommissions
 }
