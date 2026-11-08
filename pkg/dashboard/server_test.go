@@ -177,9 +177,17 @@ func TestLoopbackHostAndOriginBoundary(t *testing.T) {
 		if test.origin != "" {
 			r.Header.Set("Origin", test.origin)
 		}
-		r.Header.Set("X-Forwarded-Host", "localhost:8080")
 		if got := allowedRequest(r, "8080"); got != test.allowed {
 			t.Errorf("Host %q Origin %q: got %v, want %v", test.host, test.origin, got, test.allowed)
+		}
+	}
+	// A proxy's default upstream Host is the listener itself; any proxy header
+	// marks the request as relayed, and the private profile refuses it.
+	for _, name := range proxyHeaders {
+		r := &http.Request{Host: "127.0.0.1:8080", Header: make(http.Header)}
+		r.Header.Set(name, "203.0.113.2")
+		if allowedRequest(r, "8080") {
+			t.Errorf("proxied request with %s accepted", name)
 		}
 	}
 	r := &http.Request{Host: "127.0.0.1:8080", Header: http.Header{"Origin": {"http://127.0.0.1:8080", "http://127.0.0.1:8080"}}}

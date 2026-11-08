@@ -112,7 +112,9 @@ nodes, configure separate sockets, reader units and ports manually.
 The path unit starts the reader when the socket appears. The reader defaults to
 loopback and the private profile; other local processes may still reach it.
 Stopping the node leaves the reader running with unavailable or stale data.
-An unclean node exit can leave a socket that must be inspected before removal.
+An unclean node exit leaves the old socket in place, so the path unit can start
+the reader against a node that is not running; the next node start replaces
+that socket as described below.
 If repeated starts hit systemd's start limit, the path unit can fail and must be
 inspected and restarted by the operator. This does not install a service or
 publish a URL.
@@ -224,12 +226,17 @@ command or set `no_metrics_server = true` in `[reporting]`; otherwise restrict
 it with host or network controls. The dashboard reader's loopback binding and
 reverse proxy do not secure that listener.
 
-The socket is mode `0600`; its immediate parent must be a private directory.
-Use a trusted parent path, not a directory writable by other accounts. The feed
-refuses to replace an existing path. Graceful shutdown removes its socket. After
-an unclean node exit, confirm that no process is using the old socket before
-removing that socket alone. A feed setup failure is logged and does not stop the
-node.
+The socket is mode `0600`; its immediate parent must be a private directory
+owned by the node's user. Use a trusted parent path, not a directory writable by
+other accounts. Graceful shutdown removes its socket. After an unclean node exit
+(for example SIGKILL or an out-of-memory kill), the next start replaces the old
+socket only if it is owned by the node's user and nothing accepts connections on
+it; any other existing path is left in place and the feed stays off. A feed setup
+failure is logged and does not stop the node.
+
+The feed serves one request per connection and accepts at most four connections
+per second, so a feed client cannot make the node spend more than that serving
+it. The reader polls once per second.
 
 Unix socket paths have platform-specific length limits. If a long path causes a
 bind error, choose a shorter trusted directory and use the same socket path for
@@ -252,8 +259,7 @@ directory must contain only disposable runtime files, never ledger, account or
 signing data: systemd removes it when the service stops. This does not itself
 configure automatic restart, and does not clean the path when a wrapper keeps
 the service running while restarting only its child. Check ownership, permissions
-and reader reconnection for the actual service configuration. For other setups,
-retain the manual inspection step above. See the
+and reader reconnection for the actual service configuration. See the
 [systemd runtime-directory documentation](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#RuntimeDirectory=).
 
 Keep the executable name `mithril-dashboard`: the node's existing startup process
@@ -303,7 +309,11 @@ an SSH tunnel, with the same local and remote port. If a request supplies an
 Origin, it must use HTTP or HTTPS and match the request Host and port. Requests
 without an Origin are also accepted; these checks do not authenticate clients.
 The reader does not serve HTML or accept a separate UI origin. Forwarded headers
-do not bypass Host or Origin checks.
+do not bypass Host or Origin checks. This private profile refuses any request
+carrying a proxy header (`Forwarded`, `Via`, `X-Forwarded-*` or `X-Real-IP`):
+a proxy's default upstream Host is the loopback listener itself, so the Host
+check alone would admit remote clients that send no Origin. Put a reverse proxy
+only in front of the public profile below.
 
 ## Public profile
 
@@ -461,9 +471,7 @@ stops. An old sample may still display historical contacts with their dated age.
 This is a bounded sample, not a full gossip directory or a cluster health map.
 
 Public status JSON has a 32 KiB cap; the private node-to-reader status snapshot
-has a separate 33 KiB cap. Optional detail routes have their own documented
-limits, including up to 2 MiB for locally observed peers. Oversized input still
-fails closed, and status collection remains once per second.
+has a separate 33 KiB cap. Oversized input still fails closed, and status collection remains once per second.
 
 ### Releases and rollback
 

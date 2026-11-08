@@ -125,7 +125,9 @@ func TestFeedRefusesUnsafePathsAndDoesNotDeleteExistingFiles(t *testing.T) {
 	}
 }
 
-func TestFeedRefusesStaleSocketUntilRemoved(t *testing.T) {
+// A socket left by an exit that skipped Close (SIGKILL, OOM, os.Exit) must not
+// keep the feed off after the node restarts.
+func TestFeedReplacesStaleSocket(t *testing.T) {
 	path := socketPath(t)
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
 	if err != nil {
@@ -135,27 +137,60 @@ func TestFeedRefusesStaleSocketUntilRemoved(t *testing.T) {
 	if err := listener.Close(); err != nil {
 		t.Fatal(err)
 	}
-	before, err := os.Lstat(path)
-	if err != nil || before.Mode()&os.ModeSocket == 0 {
+	if info, err := os.Lstat(path); err != nil || info.Mode()&os.ModeSocket == 0 {
 		t.Fatalf("stale socket: %v", err)
 	}
-	sample := func() Snapshot { return testSnapshot(time.Now().UTC()) }
-	if feed, err := ListenFeed(context.Background(), path, sample); err == nil {
-		feed.Close()
-		t.Fatal("stale socket replaced")
+	feed, err := ListenFeed(context.Background(), path, func() Snapshot { return testSnapshot(time.Now().UTC()) })
+	if err != nil {
+		t.Fatalf("stale socket not replaced: %v", err)
 	}
-	after, err := os.Lstat(path)
-	if err != nil || !os.SameFile(before, after) {
-		t.Fatalf("stale socket changed: %v", err)
-	}
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-	feed, err := ListenFeed(context.Background(), path, sample)
+	defer feed.Close()
+	c := newCollector(path)
+	defer c.client.CloseIdleConnections()
+	response, err := c.client.Get("http://node/snapshot")
 	if err != nil {
 		t.Fatal(err)
 	}
-	feed.Close()
+	io.Copy(io.Discard, response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("feed status %d", response.StatusCode)
+	}
+}
+
+// Keep-alive is off and accepts are rate limited, so a feed client cannot make
+// the node serve requests faster than feedRequestsPerSecond after the burst.
+func TestFeedLimitsRequestRate(t *testing.T) {
+	path := socketPath(t)
+	feed, err := ListenFeed(context.Background(), path, func() Snapshot { return testSnapshot(time.Now().UTC()) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer feed.Close()
+	client := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", path)
+		},
+	}}
+	defer client.CloseIdleConnections()
+	const requests = feedRequestBurst + 6
+	started := time.Now()
+	for range requests {
+		response, err := client.Get("http://node/snapshot")
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, response.Body)
+		response.Body.Close()
+		if response.StatusCode != http.StatusOK || !response.Close {
+			t.Fatalf("status %d, connection kept alive: %t", response.StatusCode, !response.Close)
+		}
+	}
+	// The first feedRequestBurst are immediate; each later one waits for a token.
+	floor := time.Duration(requests-feedRequestBurst-1) * time.Second / feedRequestsPerSecond
+	if elapsed := time.Since(started); elapsed < floor {
+		t.Fatalf("%d requests took %v, want at least %v", requests, elapsed, floor)
+	}
 }
 
 func TestFeedAllowsOnlySnapshotReads(t *testing.T) {
