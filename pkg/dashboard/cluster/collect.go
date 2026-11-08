@@ -22,26 +22,17 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
-
-	"github.com/gorilla/websocket"
 )
 
 const (
 	responseLimit  = 2 << 20
 	titanConfigURL = "https://observatory-origin.titananalytics.io/analytics/api/config"
-	lanternURL     = "wss://alpenglow.lantern.one/websocket"
 )
 
-var (
-	errStale           = errors.New("provider source is stale")
-	errLanternRoot     = errors.New("invalid Lantern root")
-	errLanternColumns  = errors.New("invalid Lantern peer columns")
-	errLanternIdentity = errors.New("invalid Lantern identity")
-)
+var errStale = errors.New("provider source is stale")
 
 type collector struct {
 	http               *http.Client
-	ws                 *websocket.Dialer
 	log                *slog.Logger
 	runID              string
 	now                func() time.Time
@@ -131,14 +122,6 @@ type titanResponse struct {
 	} `json:"windows"`
 }
 
-type lanternPeers struct {
-	Root     *uint64   `json:"root"`
-	Identity []string  `json:"identity"`
-	IP       []*string `json:"ip"`
-	Country  []*string `json:"country"`
-	HeardAgo []*uint64 `json:"heard_ago"`
-}
-
 type result[T any] struct {
 	value T
 	at    time.Time
@@ -177,7 +160,6 @@ func collectProfile(ctx context.Context, profile string, performance, history bo
 	defer transport.CloseIdleConnections()
 	c := collector{
 		http: &http.Client{Transport: transport, Timeout: 18 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirect denied") }},
-		ws:   &websocket.Dialer{HandshakeTimeout: 8 * time.Second, Proxy: nil},
 		log:  slog.Default().With("entry_point", "collector", "run_id", runID), runID: runID, now: func() time.Time { return time.Now().UTC() }, performanceSamples: performance, performanceHistory: history,
 	}
 	ctx, cancel := context.WithTimeout(ctx, 55*time.Second)
@@ -187,7 +169,7 @@ func collectProfile(ctx context.Context, profile string, performance, history bo
 
 func newSnapshot(now time.Time) Snapshot {
 	s := Snapshot{SchemaVersion: 1, Scope: "independent_cluster", Profile: "alpenglow", Network: "alpenglow-community", GenesisHash: GenesisHash, CapturedAt: now, FastState: "unavailable", Validators: []Validator{}}
-	for _, id := range []string{"rpc", "solstat", "titan", "lantern", "puffin"} {
+	for _, id := range []string{"rpc", "solstat", "titan", "geoip", "puffin"} {
 		p := ProviderStatus{ID: id, State: "unavailable", Reason: "not_collected", SourceURL: sourceURLs[id], CapturedAt: now, RowCount: "0"}
 		s.Providers = append(s.Providers, p)
 	}
@@ -223,10 +205,9 @@ func (c *collector) collect(ctx context.Context) (Snapshot, error) {
 	var nodes result[map[string]netip.Addr]
 	var solstat result[solstatResponse]
 	var titan result[titanResponse]
-	var lantern result[lanternPeers]
 	var performance result[[]rpcPerformanceSample]
 	var wg sync.WaitGroup
-	wg.Add(5)
+	wg.Add(4)
 	if c.performanceSamples {
 		wg.Add(1)
 		go func() {
@@ -270,13 +251,6 @@ func (c *collector) collect(ctx context.Context) (Snapshot, error) {
 		titan.value, titan.err = c.titan(ctx)
 		titan.at = c.now()
 		c.captureLog("titan", "snapshot", start, titan.err)
-	}()
-	go func() {
-		defer wg.Done()
-		start := time.Now()
-		lantern.value, lantern.err = c.lantern(ctx, epoch)
-		lantern.at = c.now()
-		c.captureLog("lantern", "countries", start, lantern.err)
 	}()
 	wg.Wait()
 	var after epochInfo
@@ -378,31 +352,29 @@ func (c *collector) collect(ctx context.Context) (Snapshot, error) {
 			}
 		}
 	}
-	lp := provider(&s, "lantern")
-	lp.CapturedAt = lantern.at
-	if lantern.err != nil {
-		lp.Reason = "request_failed"
-	} else if nodes.err != nil {
-		lp.Reason = "rpc_gossip_unavailable"
+	gp := provider(&s, "geoip")
+	gp.CapturedAt = now
+	if nodes.err != nil {
+		gp.Reason = "rpc_gossip_unavailable"
+	} else if !fresh(nodes.at, now) {
+		gp.State, gp.Reason = "stale", "source_stale"
+	} else if db, err := countryReader(); err != nil {
+		gp.State, gp.Reason = "invalid", "invalid_payload"
 	} else {
-		countries, err := matchCountries(lantern.value, nodes.value, epoch)
-		if err != nil {
-			lp.State, lp.Reason = "invalid", "invalid_payload"
-			detail := "validation_failed"
-			switch err {
-			case errLanternRoot:
-				detail = "root_unavailable_or_outside_epoch"
-			case errLanternColumns:
-				detail = "columns_invalid"
-			case errLanternIdentity:
-				detail = "identity_invalid_or_duplicate"
+		countries := make(map[string]string, len(nodes.value))
+		for identity, ip := range nodes.value {
+			code, err := countryForIP(db, ip)
+			if err != nil {
+				gp.State, gp.Reason = "invalid", "invalid_payload"
+				break
 			}
-			c.log.Warn("cluster_provider_validation_rejected", "provider", "lantern", "detail", detail)
-		} else {
-			markFresh(lp, lantern.at, lantern.at, e, uint64(len(lantern.value.Identity)), "rpc_gossip_ip_matched", "receipt")
+			countries[identity] = code
+		}
+		if gp.State != "invalid" {
+			markFresh(gp, now, nodes.at, e, uint64(len(nodes.value)), "rpc_gossip_local_geoip", "response")
 			for key, row := range rows {
 				if code := countries[row.Identity]; code != "" {
-					row.CountryCode, row.CountrySource = code, "lantern_dbip"
+					row.CountryCode, row.CountrySource = code, "dbip"
 					rows[key] = row
 				}
 			}
@@ -894,135 +866,4 @@ func compareRatio(a, b, c, d uint64) int {
 		return -1
 	}
 	return 0
-}
-
-func (c *collector) lantern(ctx context.Context, epoch epochInfo) (lanternPeers, error) {
-	var out lanternPeers
-	ctx, cancel := context.WithTimeout(ctx, 18*time.Second)
-	defer cancel()
-	start := time.Now()
-	conn, res, err := c.ws.DialContext(ctx, lanternURL, http.Header{"User-Agent": []string{"Mithril-dashboard-collector/1"}, "X-Request-Id": []string{c.runID}})
-	if res != nil && res.Body != nil {
-		defer res.Body.Close()
-	}
-	if err != nil {
-		return out, errors.New("Lantern connection failed")
-	}
-	defer conn.Close()
-	stop := context.AfterFunc(ctx, func() { conn.Close() })
-	defer stop()
-	deadline, _ := ctx.Deadline()
-	if err := conn.SetReadDeadline(deadline); err != nil {
-		return out, err
-	}
-	conn.SetReadLimit(responseLimit)
-	request := func(id int) error {
-		if err := conn.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
-			return err
-		}
-		return conn.WriteJSON(struct {
-			Topic string `json:"topic"`
-			Key   string `json:"key"`
-			ID    int    `json:"id"`
-		}{"peers", "gossip", id})
-	}
-	if err := request(1); err != nil {
-		return out, errors.New("Lantern request failed")
-	}
-	// Lantern refreshes requested peer data on a five-second cadence. Retry
-	// independently of incoming frames, which may stop while the cache warms.
-	retryCtx, stopRetry := context.WithCancel(ctx)
-	retryDone := make(chan struct{})
-	go func() {
-		defer close(retryDone)
-		timer := time.NewTimer(6 * time.Second)
-		defer timer.Stop()
-		select {
-		case <-retryCtx.Done():
-		case <-timer.C:
-			if request(2) != nil {
-				conn.Close()
-			}
-		}
-	}()
-	defer func() { stopRetry(); <-retryDone }()
-	total := 0
-	var earlier *lanternPeers
-	for frames := 0; frames < 2500; frames++ {
-		_, b, err := conn.ReadMessage()
-		if err != nil {
-			if earlier != nil {
-				return *earlier, nil
-			}
-			return out, errors.New("Lantern read failed")
-		}
-		total += len(b)
-		if total > MaxBytes {
-			return out, errors.New("Lantern capture bound")
-		}
-		var envelope struct {
-			Topic string          `json:"topic"`
-			Key   string          `json:"key"`
-			ID    *int            `json:"id"`
-			Value json.RawMessage `json:"value"`
-		}
-		if decode(b, &envelope) != nil {
-			return out, errors.New("invalid Lantern frame")
-		}
-		if envelope.Topic == "peers" && envelope.Key == "gossip" && envelope.ID != nil && (*envelope.ID == 1 || *envelope.ID == 2) {
-			if string(envelope.Value) == "null" {
-				if *envelope.ID == 2 {
-					if earlier != nil {
-						return *earlier, nil
-					}
-					return out, errors.New("Lantern peer data unavailable")
-				}
-				continue
-			}
-			var candidate lanternPeers
-			if err := decode(envelope.Value, &candidate); err != nil {
-				return out, err
-			}
-			if candidate.Root == nil || !slotInEpoch(*candidate.Root, epoch) {
-				if *envelope.ID == 2 {
-					return candidate, nil
-				}
-				earlier = &candidate
-				continue
-			}
-			c.log.Info("cluster_provider_request", "provider", "lantern", "status", 200, "duration_ms", time.Since(start).Milliseconds(), "failed", false)
-			return candidate, nil
-		}
-	}
-	return out, errors.New("Lantern frame bound")
-}
-
-func matchCountries(p lanternPeers, nodes map[string]netip.Addr, e epochInfo) (map[string]string, error) {
-	n := len(p.Identity)
-	if p.Root == nil || !slotInEpoch(*p.Root, e) {
-		return nil, errLanternRoot
-	}
-	if n > MaxRows || p.Identity == nil || len(p.IP) != n || len(p.Country) != n || len(p.HeardAgo) != n {
-		return nil, errLanternColumns
-	}
-	out := make(map[string]string, n)
-	seen := make(map[string]bool, n)
-	for i, id := range p.Identity {
-		if !keyOK(id) || seen[id] {
-			return nil, errLanternIdentity
-		}
-		seen[id] = true
-		if p.IP[i] == nil || p.Country[i] == nil || p.HeardAgo[i] == nil || !countryOK(*p.Country[i]) || *p.HeardAgo[i] > uint64(MaxAge/time.Millisecond) {
-			continue
-		}
-		ip, err := netip.ParseAddr(*p.IP[i])
-		if err != nil || !ip.IsGlobalUnicast() || ip.IsPrivate() {
-			continue
-		}
-		expected, ok := nodes[id]
-		if ok && expected == ip.Unmap() {
-			out[id] = *p.Country[i]
-		}
-	}
-	return out, nil
 }

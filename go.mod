@@ -38,6 +38,7 @@ require (
 	github.com/minio/sha256-simd v1.0.1
 	github.com/mr-tron/base58 v1.2.0
 	github.com/nixberg/chacha-rng-go v0.1.0
+	github.com/oschwald/maxminddb-golang/v2 v2.8.0
 	github.com/panjf2000/ants/v2 v2.10.0
 	github.com/pierrec/lz4/v4 v4.1.22
 	github.com/prometheus/client_golang v1.20.4
@@ -57,8 +58,8 @@ require (
 	golang.org/x/crypto v0.47.0
 	golang.org/x/exp v0.0.0-20260112195511-716be5621a96
 	golang.org/x/net v0.49.0
-	golang.org/x/sync v0.19.0
-	golang.org/x/sys v0.40.0
+	golang.org/x/sync v0.23.0
+	golang.org/x/sys v0.48.0
 	golang.org/x/term v0.39.0
 	golang.org/x/time v0.11.0
 	google.golang.org/grpc v1.80.0

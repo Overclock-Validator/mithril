@@ -37,8 +37,6 @@ const (
 	RankPolicy = "derived_inclusion_ratio_desc_opportunities_desc"
 	// CountryAttributionURL is required when displaying DB-IP-derived countries.
 	CountryAttributionURL = "https://db-ip.com/"
-	// CountrySourceRevision pins the inspected country derivation, not the live binary.
-	CountrySourceRevision = "https://github.com/bola-sol/agave/blob/ef95987724d87162fc9d86a09714a1f2a99b7d50/dashboard/src/geoip.rs"
 )
 
 // Count is an exact unsigned decimal integer on the JSON wire.
@@ -162,7 +160,7 @@ var sourceURLs = map[string]string{
 	"rpc":     "https://rpc.ag.validblocks.com/",
 	"solstat": "https://solstat.noders.services/api/validators?network=alpenglow",
 	"titan":   "https://observatory-origin.titananalytics.io/analytics/api/stream",
-	"lantern": "https://alpenglow.lantern.one/",
+	"geoip":   "https://db-ip.com/",
 	"puffin":  "https://puffin-validator.xyz/alpenglow",
 }
 
@@ -243,7 +241,7 @@ func Validate(s Snapshot) error {
 		if (p.State == "fresh") != (p.Reason == "") || (p.State == "retired" && p.ID != "puffin") {
 			return errors.New("provider state and reason disagree")
 		}
-		timeKind := map[string]string{"rpc": "response", "solstat": "provider", "titan": "provider", "lantern": "receipt"}[p.ID]
+		timeKind := map[string]string{"rpc": "response", "solstat": "provider", "titan": "provider", "geoip": "response"}[p.ID]
 		if (p.SourceAt == nil) != (p.SourceTimeKind == "") || (p.SourceTimeKind != "" && p.SourceTimeKind != timeKind) || (p.SourceAt != nil && p.SourceAt.IsZero()) {
 			return errors.New("invalid provider time provenance")
 		}
@@ -260,7 +258,7 @@ func Validate(s Snapshot) error {
 			}
 		}
 		if p.State == "fresh" {
-			binding := map[string]string{"rpc": "rpc_genesis_before_after", "solstat": "rpc_profile_epoch_checked", "titan": "payload_genesis_epoch_checked", "lantern": "rpc_gossip_ip_matched"}[p.ID]
+			binding := map[string]string{"rpc": "rpc_genesis_before_after", "solstat": "rpc_profile_epoch_checked", "titan": "payload_genesis_epoch_checked", "geoip": "rpc_gossip_local_geoip"}[p.ID]
 			if binding == "" || p.Binding != binding || p.SourceTimeKind != timeKind || p.GenesisHash != GenesisHash || p.SourceAt == nil || p.SourceAt.IsZero() || p.SourceAt.After(p.CapturedAt.Add(5*time.Second)) || p.CapturedAt.Sub(*p.SourceAt) > MaxAge || p.Epoch == nil || s.Epoch == nil || *p.Epoch != *s.Epoch {
 				return errors.New("invalid fresh provider binding")
 			}
@@ -365,7 +363,7 @@ func Validate(s Snapshot) error {
 				return errors.New("production exceeds assignments")
 			}
 		}
-		if (v.CountryCode == "") != (v.CountrySource == "") || (v.CountryCode != "" && (!countryOK(v.CountryCode) || v.CountrySource != "lantern_dbip" || providers["lantern"].State != "fresh")) {
+		if (v.CountryCode == "") != (v.CountrySource == "") || (v.CountryCode != "" && (!countryOK(v.CountryCode) || v.CountrySource != "dbip" || providers["geoip"].State != "fresh")) {
 			return errors.New("invalid country estimate")
 		}
 		if len(v.Inclusion) > 3 || (len(v.Inclusion) > 0 && providers["titan"].State != "fresh") {

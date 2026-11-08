@@ -35,22 +35,18 @@ FAST, payment, stake-weighted performance, or complete chain coverage. The rank
 is a derived competition rank: exact inclusion ratio, then opportunities,
 descending; exact ties share rank. Zero opportunities have no score or rank.
 
-Country estimates require matching Lantern's peer identity and gossip IP to the
-same identity's current address at the checked RPC. Unknown/mismatched/old
-contacts stay unlocated. Only country codes/source survive; IPs are never placed
-in the cache or logs. `source_time_kind=receipt` on Lantern is the collection
-receipt time, not an independently attested GeoIP update time. Country estimates
-are not exact locations, facilities, liveness, or remote-host health.
+Country estimates use the bundled [DB-IP Country Lite](https://db-ip.com/db/lite.php)
+database and public gossip addresses. The NOTICE records the database version.
+Estimates may be inaccurate or unavailable.
+GeoIP timestamps are RPC response times; the RPC does not provide contact age.
+Raw addresses are not written to the cache or logs. Pages displaying these
+estimates must link to [DB-IP](https://db-ip.com/) under its CC BY 4.0 license.
+For releases, refresh `pkg/dashboard/cluster/dbip-country.mmdb.gz` from DB-IP,
+update its NOTICE, and run the collector tests below.
 
-Pages displaying countries must credit [DB-IP](https://db-ip.com/) (CC BY 4.0)
-and [Lantern](https://alpenglow.lantern.one/). The inspected country derivation is
-[pinned here](https://github.com/bola-sol/agave/blob/ef95987724d87162fc9d86a09714a1f2a99b7d50/dashboard/src/geoip.rs);
-this is not an attestation of the current live binary. No per-IP GeoIP service
-is queried. Provider availability and licensing may change.
-
-Bounds: one capture at most 55 seconds; HTTP bodies at most 2 MiB; Lantern
-capture at most 18 seconds/4 MiB/2,500 frames; at most 2,048 rows per source;
-persisted UTF-8 JSON at most 4 MiB. Redirects are denied. Counters, slots, epochs,
+Bounds: one capture at most 55 seconds; HTTP bodies at most 2 MiB; at most
+2,048 rows per source; persisted UTF-8 JSON at most 4 MiB. Redirects are denied.
+Counters, slots, epochs,
 and ranks are decimal strings. `stake_sol` is a bounded provider decimal SOL
 estimate, never an asserted exact lamport balance.
 
