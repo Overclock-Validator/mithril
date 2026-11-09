@@ -36,9 +36,10 @@ func (sc SnapshotConfig) knownValidatorSet() (map[solana.PublicKey]struct{}, err
 
 // discoverSnapshotRPCNodes is shared by all full and incremental selection paths.
 // Restricted discovery retains identities from getClusterNodes, which the upstream
-// finder otherwise discards. Configured discovery RPCs are not implicitly trusted
-// as snapshot sources. The discovery RPC's mapping is trusted; this does not verify
-// signed gossip records or change the downloader's handling of HTTP redirects.
+// finder otherwise discards. If cluster discovery is unavailable, a configured RPC
+// can qualify through getIdentity, but is never implicitly trusted as a snapshot
+// source. These RPC responses are trusted; this does not verify signed gossip
+// records or change the downloader's handling of HTTP redirects.
 func discoverSnapshotRPCNodes(ctx context.Context, sc SnapshotConfig, cfg config.Config, preferredRPC string) ([]rpc.RPCNode, error) {
 	known, err := sc.knownValidatorSet()
 	if err != nil {
@@ -94,8 +95,55 @@ func discoverSnapshotRPCNodes(ctx context.Context, sc SnapshotConfig, cfg config
 			return nodes, nil
 		}
 	}
+	// Validators with minimal RPC expose getIdentity/getVersion but may omit
+	// getClusterNodes. Verify their configured endpoints directly before probing
+	// snapshots, retaining the exact URL (including scheme and path). Do not use
+	// addConfiguredSnapshotRPCNodes here: configuration alone is not membership
+	// in the known-validator allowlist, and its synthetic version bypasses the
+	// actual version filter.
+	var configuredNodes []rpc.RPCNode
+	for _, endpoint := range endpoints {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		node, err := configuredKnownValidatorRPCNode(ctx, endpoint, known)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		configuredNodes = append(configuredNodes, node)
+	}
+	if len(configuredNodes) > 0 {
+		mlog.Log.Infof("Restricted snapshot discovery to %d configured RPC node(s) with known-validator identities", len(configuredNodes))
+		return configuredNodes, nil
+	}
 	if lastErr != nil {
 		return nil, fmt.Errorf("no known-validator snapshot RPC nodes available: %w", lastErr)
 	}
 	return nil, fmt.Errorf("no known-validator snapshot RPC nodes available (snapshot.only_known_rpc is enabled)")
+}
+
+func configuredKnownValidatorRPCNode(ctx context.Context, endpoint string, known map[solana.PublicKey]struct{}) (rpc.RPCNode, error) {
+	requestCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	client := solrpc.New(endpoint)
+	defer client.Close()
+	identity, err := client.GetIdentity(requestCtx)
+	if err != nil {
+		return rpc.RPCNode{}, fmt.Errorf("verify configured snapshot RPC identity: %w", err)
+	}
+	if identity == nil {
+		return rpc.RPCNode{}, fmt.Errorf("configured snapshot RPC returned no identity")
+	}
+	if _, allowed := known[identity.Identity]; !allowed {
+		return rpc.RPCNode{}, fmt.Errorf("configured snapshot RPC identity %s is not a known validator", identity.Identity)
+	}
+	version, err := client.GetVersion(requestCtx)
+	if err != nil {
+		return rpc.RPCNode{}, fmt.Errorf("get known-validator snapshot RPC version: %w", err)
+	}
+	if version == nil || strings.TrimSpace(version.SolanaCore) == "" {
+		return rpc.RPCNode{}, fmt.Errorf("known-validator snapshot RPC returned no version")
+	}
+	return rpc.RPCNode{Address: endpoint, Version: version.SolanaCore}, nil
 }

@@ -35,6 +35,8 @@ func clusterDiscoveryServer(t *testing.T, nodes []map[string]any, requests *atom
 		case "getClusterNodes":
 			requests.Add(1)
 			result = nodes
+		case "getIdentity":
+			result = map[string]any{"identity": unknownSourceIdentity}
 		default:
 			t.Errorf("unexpected RPC method %q", request.Method)
 			http.Error(w, "unexpected method", http.StatusBadRequest)
@@ -45,6 +47,99 @@ func clusterDiscoveryServer(t *testing.T, nodes []map[string]any, requests *atom
 	}))
 	t.Cleanup(server.Close)
 	return server
+}
+
+func TestKnownValidatorDiscoveryFallsBackToVerifiedConfiguredIdentity(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		identity      any
+		identityError bool
+		version       any
+		versionError  bool
+		wantVersion   bool
+		wantNode      bool
+	}{
+		{name: "known identity", identity: knownSourceIdentity, version: "4.4.1", wantVersion: true, wantNode: true},
+		{name: "unknown identity", identity: unknownSourceIdentity},
+		{name: "invalid identity", identity: "not-a-pubkey"},
+		{name: "missing identity"},
+		{name: "identity RPC failure", identityError: true},
+		{name: "missing version", identity: knownSourceIdentity, wantVersion: true},
+		{name: "empty version", identity: knownSourceIdentity, version: "", wantVersion: true},
+		{name: "version RPC failure", identity: knownSourceIdentity, versionError: true, wantVersion: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var identityRequests, versionRequests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.RequestURI() != "/validator/rpc?route=snapshot" {
+					t.Errorf("configured endpoint path/query changed: %s", r.URL)
+				}
+				var request struct {
+					ID     any    `json:"id"`
+					Method string `json:"method"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Errorf("unexpected request before source admission: %s %s", r.Method, r.URL)
+					http.Error(w, "unexpected request", http.StatusBadRequest)
+					return
+				}
+				response := map[string]any{"jsonrpc": "2.0", "id": request.ID}
+				rpcError := false
+				switch request.Method {
+				case "getClusterNodes":
+					rpcError = true // Agave minimal RPC omits this method.
+				case "getIdentity":
+					identityRequests.Add(1)
+					rpcError = tt.identityError
+					if tt.identity != nil {
+						response["result"] = map[string]any{"identity": tt.identity}
+					}
+				case "getVersion":
+					versionRequests.Add(1)
+					rpcError = tt.versionError
+					if tt.version != nil {
+						response["result"] = map[string]any{"solana-core": tt.version}
+					}
+				default:
+					t.Errorf("unexpected RPC method before source admission: %s", request.Method)
+				}
+				if rpcError {
+					response["error"] = map[string]any{"code": -32601, "message": "Method not found"}
+					delete(response, "result")
+				} else if _, ok := response["result"]; !ok {
+					response["result"] = nil
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(response)
+			}))
+			defer server.Close()
+			endpoint := server.URL + "/validator/rpc?route=snapshot"
+			cfg := DefaultSnapshotConfig()
+			// The preferred URL and repeated configuration must not create
+			// duplicate candidates or repeated identity checks.
+			cfg.RPCAddresses = []string{endpoint, endpoint}
+			cfg.KnownValidators = []string{knownSourceIdentity}
+			cfg.OnlyKnownRPC = true
+			nodes, err := discoverSnapshotRPCNodes(context.Background(), cfg, cfg.toInternalConfig(""), endpoint)
+			if tt.wantNode {
+				if err != nil || len(nodes) != 1 || nodes[0].Address != endpoint || nodes[0].Version != "4.4.1" || nodes[0].IsStatic {
+					t.Fatalf("verified configured source = %+v, err=%v", nodes, err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "no known-validator snapshot RPC nodes") || len(nodes) != 0 {
+				t.Fatalf("source restriction failed open: nodes=%+v, err=%v", nodes, err)
+			}
+			if identityRequests.Load() != 1 {
+				t.Fatalf("identity requests = %d, want 1", identityRequests.Load())
+			}
+			wantVersionRequests := int32(0)
+			if tt.wantVersion {
+				wantVersionRequests = 1
+			}
+			if versionRequests.Load() != wantVersionRequests {
+				t.Fatalf("version requests = %d, want %d", versionRequests.Load(), wantVersionRequests)
+			}
+		})
+	}
 }
 
 func TestKnownValidatorDiscoveryFiltersIdentitiesAndConfiguredRPCs(t *testing.T) {
