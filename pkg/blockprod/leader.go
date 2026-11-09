@@ -27,12 +27,12 @@ const (
 	// It also bounds the footer nanosecond clock and ParentReady-derived block
 	// deadlines; keeping those clocks identical prevents late/missed slots.
 	AlpenglowSlotDuration = 200 * time.Millisecond
-	// Leave enough time for the Go finalizer, footer shredding, and synchronous
-	// UDP fanout to complete before Votor's per-slot deadline. A two-hour live
-	// trace measured 29-55ms from the old 25ms cutoff through completion: 328 of
-	// 340 blocks finished after their protocol deadline and later leaders
-	// discarded 52 of 85 locally produced windows. Keep 20ms above that
-	// observed worst case for scheduler and network jitter.
+	// Retain a conservative default for bank finalization, footer shredding and
+	// synchronous UDP fanout. Before reward preparation was pipelined, a two-hour
+	// trace measured 29-55ms completion: with a 25ms reserve, 328 of 340 blocks
+	// missed their deadline and later leaders discarded 52 of 85 local windows.
+	// Operators can lower CompletionReserve after measuring total completion
+	// with the pipeline; bank commit and network time still need a margin.
 	leaderBlockCompletionReserve = 75 * time.Millisecond
 )
 
@@ -84,6 +84,14 @@ type leaderSlotFailure struct {
 // RewardCertBuilder produces skip/notar reward certificates for block footers.
 type RewardCertBuilder interface {
 	BuildForLeaderSlot(slot uint64) rewardcerts.RewardCertificates
+}
+
+type rewardCertPreparer interface {
+	PrepareForLeaderSlot(slot uint64)
+}
+
+type preparedRewardCertConsumer interface {
+	TakeForLeaderSlot(slot uint64) (rewardcerts.RewardCertificates, rewardcerts.PreparationStatus)
 }
 
 type LeaderLoop struct {
@@ -303,6 +311,12 @@ func (l *LeaderLoop) tickScheduled(scheduledAt time.Time) {
 		}
 		if l.isLeaderSlotFinishedLocked(targetSlot) {
 			return
+		}
+		// Prepare only the slot selected by ParentReady, before replay or bank
+		// creation can delay its start. Preparing future slots in the window
+		// would snapshot their N-8 vote sets prematurely and miss late voters.
+		if preparer, ok := l.rewardCerts.(rewardCertPreparer); ok {
+			preparer.PrepareForLeaderSlot(targetSlot)
 		}
 
 		if ready, err := l.leaderSlotReplayReady(targetSlot); !ready {
@@ -1022,9 +1036,20 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 	footerTimestamp := int64(producerTimeNanos / 1_000_000_000)
 
 	var footerRewards rewardcerts.RewardCertificates
+	rewardPreparation := "disabled"
+	var rewardPreparationDuration time.Duration
 	phaseStartedAt = time.Now()
-	if l.rewardCerts != nil {
+	if prepared, ok := l.rewardCerts.(preparedRewardCertConsumer); ok {
+		var status rewardcerts.PreparationStatus
+		footerRewards, status = prepared.TakeForLeaderSlot(slot)
+		rewardPreparation = "missing"
+		if status.Ready {
+			rewardPreparation = "ready"
+		}
+		rewardPreparationDuration = status.BuildDuration
+	} else if l.rewardCerts != nil {
 		footerRewards = l.rewardCerts.BuildForLeaderSlot(slot)
+		rewardPreparation = "synchronous"
 	}
 	rewardCertDuration := time.Since(phaseStartedAt)
 
@@ -1135,9 +1160,11 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 	// phase timers do not participate in protocol/deadline calculations.
 	ms := func(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
 	timingDetail += fmt.Sprintf(" slot_ending_ms=%.3f freeze_ms=%.3f entry_drain_ms=%.3f reward_certs_ms=%.3f"+
-		" build_block_ms=%.3f bank_commit_ms=%.3f footer_broadcast_ms=%.3f ending_tick_broadcast_ms=%.3f",
+		" build_block_ms=%.3f bank_commit_ms=%.3f footer_broadcast_ms=%.3f ending_tick_broadcast_ms=%.3f"+
+		" reward_prepare=%s reward_prepare_ms=%.3f reward_skip_bytes=%d reward_notar_bytes=%d",
 		ms(slotEndingDuration), ms(freezeDuration), ms(entryDrainDuration), ms(rewardCertDuration),
-		ms(buildBlockDuration), ms(commitDuration), ms(footerDuration), ms(endingTickDuration)) + bankTimings.String()
+		ms(buildBlockDuration), ms(commitDuration), ms(footerDuration), ms(endingTickDuration),
+		rewardPreparation, ms(rewardPreparationDuration), len(footerRewards.Skip), len(footerRewards.Notar)) + bankTimings.String()
 	l.recordLeaderSlotOutcomeLocked(slot, leaderOutcomeBroadcast, leaderReasonComplete,
 		fmt.Sprintf("block=%s parent_slot=%d txns=%d%s", solana.Hash(producedBlock.AlpenglowBlockID).String(), producedBlock.ParentSlot, len(producedBlock.Transactions), timingDetail))
 	l.advanceProductionWindowLocked(slot)

@@ -3,6 +3,7 @@ package rewardcerts
 import (
 	"sync"
 
+	bls12381 "github.com/Overclock-Validator/gnark-crypto/ecc/bls12-381"
 	"github.com/Overclock-Validator/mithril/pkg/alpenglow"
 )
 
@@ -73,6 +74,22 @@ func (b *Builder) SetRootSlot(rootSlot uint64) {
 
 // AddVote records an observed Alpenglow skip or notarization vote.
 func (b *Builder) AddVote(msg alpenglow.VoteMessage) {
+	b.addVote(msg, nil)
+}
+
+// AddVerifiedVote consumes a vote admitted by consensus. When verification
+// retained the signature point, reuse that copied point instead of decoding
+// and subgroup-checking the same signature again. Votes without that provenance
+// take the full decoding path; footer verification is unchanged.
+func (b *Builder) AddVerifiedVote(vote alpenglow.VerifiedVote) {
+	if signature, ok := vote.VerifiedSignature(); ok {
+		b.addVote(vote.Message, &signature)
+		return
+	}
+	b.AddVote(vote.Message)
+}
+
+func (b *Builder) addVote(msg alpenglow.VoteMessage, signature *bls12381.G2Affine) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.rootSlotFn != nil {
@@ -86,10 +103,17 @@ func (b *Builder) AddVote(msg alpenglow.VoteMessage) {
 	entry, ok := b.votes[slot]
 	if !ok {
 		entry = newSlotEntry(b.maxValidators)
-	} else if !entry.wantsVote(msg) {
+	}
+	if !entry.wantsVote(msg) {
 		return
 	}
-	if err := entry.addVote(msg); err != nil {
+	var err error
+	if signature == nil {
+		err = entry.addVote(msg)
+	} else {
+		err = entry.addVerifiedSignature(msg, *signature)
+	}
+	if err != nil {
 		return
 	}
 	b.votes[slot] = entry

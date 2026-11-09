@@ -2826,7 +2826,12 @@ postBootstrap:
 			RootSlot:    global.Slot,
 			BeforeBuild: consensusEngine.FlushAlpenglowRewardVotes,
 		})
-		consensusEngine.SetVotorMessageHook(rewardBuilder.ObserveVotorMessage)
+		// Reuse the verifier's parsed signature points while accumulating rewards.
+		// Certificate preparation runs before the footer needs it; finalization
+		// only takes an already prepared result and still verifies its contents.
+		consensusEngine.SetVerifiedVoteHook(rewardBuilder.AddVerifiedVote)
+		rewardPipeline := rewardcerts.NewPipeline(rewardBuilder)
+		defer rewardPipeline.Close()
 		leaderStop := make(chan struct{})
 		leaderDone := make(chan struct{})
 		leaderLoop := blockprod.NewLeaderLoop(blockprod.LeaderLoopConfig{
@@ -2883,7 +2888,7 @@ postBootstrap:
 				return global.WallClockSlot()
 			},
 			LeaderForSlot: global.LeaderForSlot,
-			RewardCerts:   rewardBuilder,
+			RewardCerts:   rewardPipeline,
 			Hooks:         leaderHooks,
 			GateTPU:       leaderHooks != nil,
 			OnBlock: func(produced *block.Block) {
