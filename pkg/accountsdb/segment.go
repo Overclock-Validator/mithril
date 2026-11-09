@@ -44,6 +44,10 @@ const (
 	// its only job is proving the data file is not an orphan.
 	ManifestKindFold    = uint8(1)
 	ManifestKindCompact = uint8(2)
+	// ManifestKindSparse lists only retained records at their original offsets.
+	// Gaps can contain punched-out headers: scan this kind through its manifest,
+	// never through the sequential appendvec parser. It is not a fold redo log.
+	ManifestKindSparse = uint8(3)
 )
 
 // ErrTornManifest reports a manifest that fails CRC or structural validation.

@@ -924,6 +924,8 @@ name = "mithril"
     # Also write to stdout (set to false for daemon/service mode)
     to_stdout = true
 
+    # Rotation settings apply independently to mithril.log and replay_timings.jsonl.
+    # Rotated files are gzip-compressed; each timing file contains complete JSON rows.
     # Maximum log file size in MB before rotation (0 = no limit)
     max_size_mb = 100
 

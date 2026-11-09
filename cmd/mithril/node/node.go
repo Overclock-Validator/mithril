@@ -2537,11 +2537,15 @@ postBootstrap:
 
 	// Write replay timings to run-specific log directory
 	replayTimingsPath := filepath.Join(mlog.GetLogDir(), "replay_timings.jsonl")
-	metricsWriter, metricsWriterCleanup, err := createBufWriter(replayTimingsPath)
+	metricsWriter, err := createReplayTimingsWriter(replayTimingsPath, logCfg)
 	if err != nil {
 		klog.Fatalf("unable to create replay timings writer: %v", err)
 	}
-	defer metricsWriterCleanup()
+	defer func() {
+		if err := metricsWriter.Close(); err != nil {
+			mlog.Log.Errorf("unable to close replay timings writer: %v", err)
+		}
+	}()
 
 	if paramArenaSizeMB > 0 {
 		replay.SerializedParameterArena = arena.New[byte](paramArenaSizeMB << 20)
