@@ -568,7 +568,7 @@ name = "mithril"
 # [rpc] - Mithril RPC Server
 # ============================================================================
 #
-# Mithril exposes a Solana-compatible JSON-RPC interface on all interfaces,
+# Mithril exposes a Solana-compatible JSON-RPC interface,
 # allowing other tools to query Mithril's account state directly.
 #
 # Query with: curl http://localhost:8899 -X POST -H "Content-Type: application/json" \
@@ -577,6 +577,9 @@ name = "mithril"
 [rpc]
     # Port for Mithril's RPC interface (0 = disabled)
     port = 8899
+    # Literal IP for the shared HTTP/WebSocket listener (default: all interfaces).
+    # Use 127.0.0.1 for a private local RPC endpoint.
+    bind_address = "0.0.0.0"
 
 # ============================================================================
 # [tuning] - Performance Tuning & Profiling
@@ -880,6 +883,14 @@ name = "mithril"
         # "198.51.100.24:8899",
         # "bad-snapshot-node.example.com",
     ]
+
+    # Restrict full and incremental snapshot sources to these validator identities.
+    # Requires a nonempty list when enabled; no fallback to unlisted snapshot peers.
+    # network.rpc is still used for reference slots and getClusterNodes discovery,
+    # so configure trusted discovery RPC endpoints. Redirects from eligible sources
+    # retain the snapshot downloader's normal behavior.
+    known_validators = []
+    only_known_rpc = false
 
     # -------------------------------------------------------------------------
     # Performance

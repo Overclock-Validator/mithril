@@ -149,7 +149,8 @@ var (
 	paramArenaSizeMB         uint64
 	borrowedAccountArenaSize uint64
 
-	rpcPort int
+	rpcPort        int
+	rpcBindAddress string
 
 	// Lightbringer sidecar config
 	lightbringerEnabled          bool
@@ -544,6 +545,7 @@ func init() {
 
 	// [rpc] section flags (Mithril's RPC server)
 	Run.Flags().IntVar(&rpcPort, "rpc-port", 0, "RPC server port. Default off.")
+	Run.Flags().StringVar(&rpcBindAddress, "rpc-bind-address", "0.0.0.0", "RPC listener IP; use 127.0.0.1 for local access only")
 
 	// [replay] section flags
 	Run.Flags().Int64Var(&txParallelism, "txpar", 0, "Transaction execution workers (>0 enables topsort parallelism; explicit 0 is sequential; unset validator mode defaults to 2x CPU cores)")
@@ -891,6 +893,10 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 
 	// [rpc] section - Mithril's RPC server
 	rpcPort = getInt("rpc-port", "rpc.port")
+	rpcBindAddress = getString("rpc-bind-address", "rpc.bind_address")
+	if net.ParseIP(rpcBindAddress) == nil {
+		return fmt.Errorf("rpc.bind_address must be a literal IP address: %q", rpcBindAddress)
+	}
 
 	// Top-level
 	scratchDirectory = getString("scratch-directory", "scratch_directory")
@@ -1266,6 +1272,9 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	if err := configureMemoryBudgets(); err != nil {
 		return err
 	}
+	if err := buildSnapshotConfig(rpcEndpoints).ValidateKnownValidators(); err != nil {
+		return err
+	}
 	return configureDiskBudget()
 }
 
@@ -1331,6 +1340,8 @@ func buildSnapshotConfig(rpcEndpoints []string) snapshotdl.SnapshotConfig {
 	if config.IsSet("snapshot.node_blacklist") {
 		cfg.NodeBlacklist = config.GetStringSlice("snapshot.node_blacklist")
 	}
+	cfg.KnownValidators = config.GetStringSlice("snapshot.known_validators")
+	cfg.OnlyKnownRPC = config.GetBool("snapshot.only_known_rpc")
 	if config.IsSet("snapshot.full_threshold") {
 		cfg.FullThreshold = config.GetInt("snapshot.full_threshold")
 	}
@@ -2562,7 +2573,10 @@ postBootstrap:
 		klog.Fatalf("invalid port: %d", rpcPort)
 	} else if rpcPort != 0 {
 		schedule := epochScheduleFromState(mithrilState)
-		rpcServer = rpcserver.NewRpcServer(accountsDb, uint16(rpcPort), schedule, solana.MustHashFromBase58(networkGenesisHash))
+		rpcServer, err = rpcserver.NewRpcServerWithBindAddress(accountsDb, rpcBindAddress, uint16(rpcPort), schedule, solana.MustHashFromBase58(networkGenesisHash))
+		if err != nil {
+			klog.Fatalf("unable to start RPC server: %v", err)
+		}
 		if schedule == nil || schedule.SlotsPerEpoch == 0 || schedule.SlotsPerEpoch > math.MaxUint64/3 {
 			klog.Fatalf("Alpenglow RPC requires a valid epoch schedule")
 		}
@@ -2570,7 +2584,7 @@ postBootstrap:
 			klog.Fatalf("unable to load RPC epoch rewards: %v", err)
 		}
 		rpcServer.Start()
-		mlog.Log.Infof("Started RPC server on port %d", rpcPort)
+		mlog.Log.Infof("Started RPC server on %s", net.JoinHostPort(rpcBindAddress, strconv.Itoa(rpcPort)))
 	}
 
 	// The Alpenglow observer is forkchoice authority in both consensus modes.
