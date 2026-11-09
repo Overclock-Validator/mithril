@@ -21,7 +21,7 @@ const (
 	DefaultReceiverBindAddr        = "0.0.0.0:0"
 	DefaultReceiverMaxMessageSize  = int64(VotorQUICInitialPacketSize)
 	DefaultReceiverLogInterval     = 10 * time.Second
-	DefaultReceiverMaxConnections  = 512
+	DefaultReceiverMaxConnections  = 4000
 	DefaultReceiverMaxConnsPerIP   = 32
 	DefaultReceiverMaxConnsPerPeer = 2
 	DefaultReceiverDatagramsPerSec = 50
