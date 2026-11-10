@@ -34,6 +34,23 @@ type SlotHolder interface {
 	Released() <-chan struct{}
 }
 
+// DeadlineSlotHolder observes the finite drain deadline announced with a slot.
+// After that deadline no new work may be admitted or dispatched. The leader
+// closes bank admission then waits for scratch readers before finalization;
+// transactions already committed to the bank are retained. Older SlotHolder
+// implementations retain their protocol-deadline hold behavior.
+type DeadlineSlotHolder interface {
+	SlotHolder
+	DrainStatus(slot uint64) SlotDrainStatus
+}
+
+// SlotDrainStatus is a concurrency-safe snapshot for completion diagnostics.
+type SlotDrainStatus struct {
+	Outstanding      int64
+	QueuedEvents     int
+	PipelineInFlight bool
+}
+
 // LeaderSlotInfo describes a leader slot whose working bank is about to be
 // published.
 type LeaderSlotInfo struct {
@@ -51,6 +68,10 @@ type LeaderSlotInfo struct {
 	Start            time.Time
 	End              time.Time
 	ProtocolDeadline time.Time
+	// DrainDeadline bounds the grace for already flowing work after End. It
+	// consumes at most a quarter of the completion reserve, capped at 5ms.
+	// DeadlineSlotHolder implementations stop admission/dispatch by this time.
+	DrainDeadline time.Time
 }
 
 func (l *LeaderLoop) leaderSlotInfoLocked(slot, parentSlot uint64, bank *WorkingBank) LeaderSlotInfo {
@@ -61,6 +82,7 @@ func (l *LeaderLoop) leaderSlotInfoLocked(slot, parentSlot uint64, bank *Working
 		Start:            l.now(),
 		End:              l.productionWindowDeadlineLocked(slot),
 		ProtocolDeadline: l.productionWindowProtocolDeadlineLocked(slot),
+		DrainDeadline:    l.productionWindowDrainDeadlineLocked(slot),
 	}
 	if l.productionWindow.active && slot >= l.productionWindow.startSlot {
 		info.WindowStartSlot = l.productionWindow.startSlot

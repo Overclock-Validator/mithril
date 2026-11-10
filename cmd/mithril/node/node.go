@@ -2827,10 +2827,12 @@ postBootstrap:
 			BeforeBuild: consensusEngine.FlushAlpenglowRewardVotes,
 		})
 		// Reuse the verifier's parsed signature points while accumulating rewards.
-		// Certificate preparation runs before the footer needs it; finalization
-		// only takes an already prepared result and still verifies its contents.
+		// Build and fully validate certificates before the footer needs them.
+		// Finalization accepts only exact prepared bytes and verifier material;
+		// any miss or domain change retains ordinary synchronous verification.
 		consensusEngine.SetVerifiedVoteHook(rewardBuilder.AddVerifiedVote)
-		rewardPipeline := rewardcerts.NewPipeline(rewardBuilder)
+		rewardPreparer := replay.NewLeaderRewardCertPreparer(rewardBuilder, epochSchedule, uint16(turbineShredVersion))
+		rewardPipeline := rewardcerts.NewPipeline(rewardPreparer)
 		defer rewardPipeline.Close()
 		leaderStop := make(chan struct{})
 		leaderDone := make(chan struct{})

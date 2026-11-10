@@ -37,25 +37,29 @@ type CommitLeaderInput struct {
 // LeaderFinalizationTimings breaks down bank freezing for the leader's
 // broadcast log. Durations use the monotonic clock and are local to one slot.
 type LeaderFinalizationTimings struct {
-	PrepareSysvars     time.Duration
-	FooterClock        time.Duration
-	VoteRewards        time.Duration
-	DistributeFees     time.Duration
-	CollectRent        time.Duration
-	Incinerator        time.Duration
-	FinalizeSysvars    time.Duration
-	CompileAccounts    time.Duration
-	LoadParentAccounts time.Duration
-	BankHash           time.Duration
+	PrepareSysvars         time.Duration
+	FooterClock            time.Duration
+	VoteRewards            time.Duration
+	RewardPrevalidated     bool
+	RewardValidationLookup time.Duration
+	DistributeFees         time.Duration
+	CollectRent            time.Duration
+	Incinerator            time.Duration
+	FinalizeSysvars        time.Duration
+	CompileAccounts        time.Duration
+	LoadParentAccounts     time.Duration
+	BankHash               time.Duration
 }
 
 func (t LeaderFinalizationTimings) String() string {
 	ms := func(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
 	return fmt.Sprintf(" commit_prepare_sysvars_ms=%.3f commit_footer_clock_ms=%.3f commit_vote_rewards_ms=%.3f"+
 		" commit_fees_ms=%.3f commit_rent_ms=%.3f commit_incinerator_ms=%.3f commit_finalize_sysvars_ms=%.3f"+
-		" commit_compile_accounts_ms=%.3f commit_parent_accounts_ms=%.3f commit_bankhash_ms=%.3f",
+		" commit_compile_accounts_ms=%.3f commit_parent_accounts_ms=%.3f commit_bankhash_ms=%.3f"+
+		" commit_reward_prevalidated=%t commit_reward_validation_lookup_ms=%.3f",
 		ms(t.PrepareSysvars), ms(t.FooterClock), ms(t.VoteRewards), ms(t.DistributeFees), ms(t.CollectRent),
-		ms(t.Incinerator), ms(t.FinalizeSysvars), ms(t.CompileAccounts), ms(t.LoadParentAccounts), ms(t.BankHash))
+		ms(t.Incinerator), ms(t.FinalizeSysvars), ms(t.CompileAccounts), ms(t.LoadParentAccounts), ms(t.BankHash),
+		t.RewardPrevalidated, ms(t.RewardValidationLookup))
 }
 
 // PrepareLeaderSlotSysvars derives the child bank's dynamic sysvars from the
@@ -171,10 +175,13 @@ func CommitLeaderSlot(in CommitLeaderInput) (*sealevel.SlotCtx, error) {
 		}
 		timings.FooterClock = time.Since(phaseStartedAt)
 		phaseStartedAt = time.Now()
-		if err := ApplyAlpenglowVoteRewards(slotCtx, block, epochSchedule, block.SkipRewardCert, block.NotarRewardCert, block.BlockFinalCert, in.AlpenglowShredVersion); err != nil {
+		var rewardValidation LeaderRewardValidationStatus
+		if err := ApplyAlpenglowVoteRewards(slotCtx, block, epochSchedule, block.SkipRewardCert, block.NotarRewardCert, block.BlockFinalCert, in.AlpenglowShredVersion, &rewardValidation); err != nil {
 			return nil, err
 		}
 		timings.VoteRewards = time.Since(phaseStartedAt)
+		timings.RewardPrevalidated = rewardValidation.Prepared
+		timings.RewardValidationLookup = rewardValidation.LookupDuration
 	}
 
 	phaseStartedAt = time.Now()
@@ -237,21 +244,17 @@ func ensureParentAccountsForModified(slotCtx *sealevel.SlotCtx, modified []*acco
 		if modifiedAcct == nil {
 			continue
 		}
-		key := modifiedAcct.Key
-		if _, err := slotCtx.GetParentAccount(key); err == nil {
-			continue
-		}
-		acct, err := slotCtx.GetAccountFromAccountsDb(key)
-		if err != nil {
-			acct = &accounts.Account{Key: key}
-		}
-		if err := slotCtx.ParentAccts.SetAccountWithoutLock(key, acct.Clone()); err != nil {
+		if err := retainLeaderParentImage(slotCtx, modifiedAcct.Key); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+// compileLeaderAccounts is called only after transaction execution and all
+// footer mutations have joined. Hashing reads these frozen account views and
+// must not mutate their headers or data. Keep the bank's final values instead
+// of cloning every payload solely to read it once for the hash.
 func compileLeaderAccounts(slotCtx *sealevel.SlotCtx, block *b.Block, rentAccts []*accounts.Account) ([]*accounts.Account, []*accounts.Account) {
 	adhRemoved := accountsDeltaHashRemoved(slotCtx)
 	var writable []*accounts.Account
@@ -284,12 +287,12 @@ func compileLeaderAccounts(slotCtx *sealevel.SlotCtx, block *b.Block, rentAccts 
 	}
 	if !adhRemoved {
 		for key := range slotCtx.WritableAccts {
-			acct, _ := slotCtx.GetAccount(key)
+			acct, _ := slotCtx.GetAccountShared(key)
 			addWritable(acct)
 		}
 	}
 	for key := range slotCtx.ModifiedAccts {
-		acct, _ := slotCtx.GetAccount(key)
+		acct, _ := slotCtx.GetAccountShared(key)
 		addModified(acct)
 		if !adhRemoved {
 			addWritable(acct)
@@ -299,7 +302,7 @@ func compileLeaderAccounts(slotCtx *sealevel.SlotCtx, block *b.Block, rentAccts 
 		if acct == nil {
 			continue
 		}
-		current, err := slotCtx.GetAccount(acct.Key)
+		current, err := slotCtx.GetAccountShared(acct.Key)
 		if err != nil {
 			current = acct
 		}

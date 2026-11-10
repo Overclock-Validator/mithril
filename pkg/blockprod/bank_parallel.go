@@ -133,15 +133,17 @@ func (b *WorkingBank) ExecuteBundle(p *PreparedBundle) *ExecutedBundle {
 			break
 		}
 	}
-	b.mu.Unlock()
 	if !accepting {
 		e.result = BundleResult{Result: ForgeDroppedNoLeader, Index: -1}
 	}
 	if e.result.Result != ForgeAccepted {
+		b.mu.Unlock()
 		return e
 	}
-
+	b.executing.Add(1)
 	e.scratch = sealevel.NewScratchSlotCtx(b.slotCtx)
+	b.mu.Unlock()
+	defer b.executing.Done()
 	if p.revertProtected {
 		e.outputs, e.actual, e.result = b.executeBundleOn(e.scratch, p.candidates)
 	} else {
@@ -240,6 +242,9 @@ func (b *WorkingBank) CommitBundle(e *ExecutedBundle) BundleResult {
 		return BundleResult{Result: ForgeDroppedCost, Reason: costmodel.ExceedBatchBytes, Index: -1}
 	}
 
+	if err := replay.PrepareLeaderTransactionParents(b.slotCtx, e.outputs...); err != nil {
+		return BundleResult{Result: ForgeDroppedExecution, Index: -1, Err: err}
+	}
 	if !p.revertProtected && e.outputs[0].ProcessingResult.TransactionError != nil {
 		feeInfo, err := replay.ApplyFailedTransaction(b.slotCtx, p.candidates[0].execTx, e.outputs[0])
 		if err != nil {

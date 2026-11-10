@@ -28,6 +28,10 @@ func (NopBatchSink) OnEntryBatch([]turbine.Entry, int) {}
 // WorkingBank is the leader's mutable slot state used by the forge sink.
 type WorkingBank struct {
 	mu sync.Mutex
+	// Scratch execution borrows the bank's account store and metadata. Add is
+	// guarded by mu and admission; Freeze closes admission before waiting, so
+	// no executor can start after its wait begins.
+	executing sync.WaitGroup
 
 	slotCtx *sealevel.SlotCtx
 	slot    uint64
@@ -437,6 +441,9 @@ func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, pre
 			return ForgeDroppedCost, reason
 		}
 	}
+	if err := replay.PrepareLeaderTransactionParents(b.slotCtx, output); err != nil {
+		return ForgeDroppedExecution, costmodel.ExceedNone
+	}
 	if output.ProcessingResult.TransactionError != nil {
 		feeInfo, err := replay.ApplyFailedTransaction(b.slotCtx, execTx, output)
 		if err != nil {
@@ -574,8 +581,14 @@ func (b *WorkingBank) FlushEntries() {
 // bank hash is computed. Last-in-slot is marked on the ending tick, not here.
 func (b *WorkingBank) Freeze() {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	b.accepting = false
+	b.mu.Unlock()
+	// A capped Harmonic hold can leave a scratch transaction executing. Its
+	// uncommitted writes will be discarded, but its reads must finish before
+	// the finalizer mutates the bank's fees, sysvars and hash state.
+	b.executing.Wait()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.entries.dropReservation()
 	b.flushEntriesLocked()
 }

@@ -51,11 +51,13 @@ const (
 	FlagReverted
 	// FlagUnavailable: Harmonic was not possible when the slot started.
 	FlagUnavailable
+	// FlagDeadline: the bounded completion drain expired with work remaining.
+	FlagDeadline
 )
 
 func (f EndFlags) String() string {
 	var names []string
-	for flag, name := range map[EndFlags]string{FlagTimeout: "timeout", FlagFailed: "failed", FlagReverted: "reverted", FlagUnavailable: "unavailable"} {
+	for flag, name := range map[EndFlags]string{FlagTimeout: "timeout", FlagFailed: "failed", FlagReverted: "reverted", FlagUnavailable: "unavailable", FlagDeadline: "deadline"} {
 		if f&flag != 0 {
 			names = append(names, name)
 		}
@@ -110,6 +112,10 @@ type SlotReport struct {
 	// Aborted is set when the leader abandoned the slot, with its reason.
 	Aborted bool
 	Reason  string
+	// Deadline counters distinguish faster completion from dropping work.
+	// Queued and Running are the snapshot at drain expiry; Discarded counts
+	// uncommitted scratch results, and Rejected counts events refused there.
+	DeadlineQueued, DeadlineRunning, DeadlineDiscarded, DeadlineRejected uint64
 }
 
 // BlockEngineControl is the part of the block engine session the executor
@@ -153,21 +159,26 @@ type hookMessage struct {
 	reason  string
 	// threshold reports that slot's threshold passed.
 	threshold uint64
+	deadline  uint64
 	// unhealthy reports the block engine session went down.
 	unhealthy bool
 }
 
 type slotState struct {
-	slot           uint64
-	bank           *blockprod.WorkingBank
-	start, end     time.Time
-	threshold      time.Time
-	mode           SlotMode
-	stopped        bool
-	nextSeq        uint64
-	crankDone      bool
-	report         SlotReport
-	thresholdTimer *time.Timer
+	slot            uint64
+	bank            *blockprod.WorkingBank
+	start, end      time.Time
+	drainDeadline   time.Time
+	threshold       time.Time
+	mode            SlotMode
+	stopped         bool
+	nextSeq         uint64
+	crankDone       bool
+	report          SlotReport
+	thresholdTimer  *time.Timer
+	drainTimer      *time.Timer
+	deadlineExpired bool
+	reported        bool
 
 	sched schedule
 	// running counts bundles executing. After a fallback the TPU opens only
@@ -209,8 +220,9 @@ type Executor struct {
 }
 
 var (
-	_ blockprod.LeaderHooks = (*Executor)(nil)
-	_ blockprod.SlotHolder  = (*Executor)(nil)
+	_ blockprod.LeaderHooks        = (*Executor)(nil)
+	_ blockprod.SlotHolder         = (*Executor)(nil)
+	_ blockprod.DeadlineSlotHolder = (*Executor)(nil)
 )
 
 func NewExecutor(cfg ExecutorConfig) *Executor {
@@ -233,6 +245,17 @@ func (x *Executor) HoldSlot(slot uint64) bool {
 	st := x.holding.Load()
 	return st != nil && st.slot == slot &&
 		(len(x.cfg.Events) > 0 || x.cfg.Pipeline.InFlight() || st.outstanding.Load() > 0)
+}
+
+func (x *Executor) DrainStatus(slot uint64) blockprod.SlotDrainStatus {
+	st := x.holding.Load()
+	if st == nil || st.slot != slot {
+		return blockprod.SlotDrainStatus{}
+	}
+	return blockprod.SlotDrainStatus{
+		Outstanding: st.outstanding.Load(), QueuedEvents: len(x.cfg.Events),
+		PipelineInFlight: x.cfg.Pipeline.InFlight(),
+	}
 }
 
 // Released is signaled when the running block's slot may end.
@@ -267,12 +290,13 @@ func (x *Executor) releaseIfDrained(st *slotState) {
 // queued, because the block engine streams the slot only after the notice.
 func (x *Executor) SlotStarted(info blockprod.LeaderSlotInfo) {
 	st := &slotState{
-		slot:    info.Slot,
-		bank:    info.Bank,
-		start:   info.Start,
-		end:     info.End,
-		nextSeq: 1,
-		report:  SlotReport{Slot: info.Slot},
+		slot:          info.Slot,
+		bank:          info.Bank,
+		start:         info.Start,
+		end:           info.End,
+		drainDeadline: info.DrainDeadline,
+		nextSeq:       1,
+		report:        SlotReport{Slot: info.Slot},
 	}
 	if info.End.IsZero() || !x.cfg.BlockEngine.Healthy() {
 		// Without a deadline or a healthy session no block can arrive; the
@@ -327,6 +351,16 @@ func (x *Executor) Run(ctx context.Context) {
 		go x.worker(ctx)
 	}
 	var st *slotState
+	defer func() {
+		if st != nil {
+			if st.thresholdTimer != nil {
+				st.thresholdTimer.Stop()
+			}
+			if st.drainTimer != nil {
+				st.drainTimer.Stop()
+			}
+		}
+	}()
 	for {
 		select {
 		case <-ctx.Done():
@@ -342,6 +376,11 @@ func (x *Executor) Run(ctx context.Context) {
 		case n := <-x.done:
 			st = x.drainHooks(st)
 			x.complete(n)
+			if st != nil && st != n.st {
+				// An old slot's worker may have occupied the last worker when
+				// the new slot queued its bundles. Its release must wake them.
+				x.dispatch(st)
+			}
 			x.releaseIfDrained(st)
 		}
 	}
@@ -372,6 +411,12 @@ func (x *Executor) drainHooks(st *slotState) *slotState {
 	x.hooks = nil
 	x.hooksMu.Unlock()
 	for _, msg := range hooks {
+		if msg.deadline != 0 {
+			if st != nil && st.slot == msg.deadline && st.mode != ModeDone {
+				x.expireDrain(st)
+			}
+			continue
+		}
 		if msg.threshold != 0 {
 			if st != nil && st.slot == msg.threshold && st.mode == ModeUndecided {
 				x.fallback(st, FlagTimeout)
@@ -390,6 +435,12 @@ func (x *Executor) drainHooks(st *slotState) *slotState {
 			}
 			st = msg.started
 			x.armThreshold(st)
+			if !st.drainDeadline.IsZero() {
+				slot := st.slot
+				st.drainTimer = time.AfterFunc(time.Until(st.drainDeadline), func() {
+					x.post(hookMessage{deadline: slot})
+				})
+			}
 			continue
 		}
 		if st != nil && st.slot == msg.ended && st.mode != ModeDone {
@@ -416,15 +467,30 @@ func (x *Executor) finish(st *slotState, reason string, aborted bool) {
 	if st.thresholdTimer != nil {
 		st.thresholdTimer.Stop()
 	}
+	if st.drainTimer != nil {
+		st.drainTimer.Stop()
+	}
+	x.expireDrain(st)
 	x.endHold(st)
 	x.dropPending(st)
 	st.report.Mode = st.mode
 	st.report.Aborted = aborted
 	st.report.Reason = reason
 	st.mode = ModeDone
+	x.reportFinished(st)
+}
+
+// An executing scratch bundle may return after SlotEnding. Delay its report
+// until those results have been discarded so deadline-loss counters are exact.
+func (x *Executor) reportFinished(st *slotState) {
+	if st.mode != ModeDone || st.running != 0 || st.reported {
+		return
+	}
+	st.reported = true
 	r := st.report
-	mlog.Log.Infof("Harmonic slot %d: mode=%s flags=%s executed=%d reverted=%d rejected=%d parallel=%d crank=%s aborted=%t%s",
-		r.Slot, r.Mode, r.Flags, r.Executed, r.Reverted, r.Rejected, r.MaxParallel, r.Crank, r.Aborted, reasonSuffix(r.Reason))
+	mlog.Log.Infof("Harmonic slot %d: mode=%s flags=%s executed=%d reverted=%d rejected=%d parallel=%d crank=%s aborted=%t deadline_queued=%d deadline_running=%d deadline_discarded=%d deadline_rejected=%d%s",
+		r.Slot, r.Mode, r.Flags, r.Executed, r.Reverted, r.Rejected, r.MaxParallel, r.Crank, r.Aborted,
+		r.DeadlineQueued, r.DeadlineRunning, r.DeadlineDiscarded, r.DeadlineRejected, reasonSuffix(r.Reason))
 	if x.cfg.OnReport != nil {
 		x.cfg.OnReport(r)
 	}
@@ -470,7 +536,13 @@ func (x *Executor) noteArrival(st *slotState, slot uint64, arrival time.Time) {
 // admits checks a bundle event against the slot state and consumes its
 // sequence number. A gap in the sequence means block data was lost.
 func (x *Executor) admits(st *slotState, slot, seq uint64) bool {
-	if st == nil || st.slot != slot {
+	if st == nil || st.slot != slot || st.mode == ModeDone {
+		return false
+	}
+	if x.expireDrain(st) {
+		st.report.Flags |= FlagDeadline
+		st.report.Rejected++
+		st.report.DeadlineRejected++
 		return false
 	}
 	if (st.mode != ModeUndecided && st.mode != ModeHarmonic) || st.stopped {
@@ -489,6 +561,12 @@ func (x *Executor) admits(st *slotState, slot, seq uint64) bool {
 // admitBundle schedules a block bundle. The slot's first one waits for the
 // tip crank, which lands before any block bundle executes.
 func (x *Executor) admitBundle(st *slotState, e BundleEvent) {
+	if x.expireDrain(st) {
+		st.report.Flags |= FlagDeadline
+		st.report.Rejected++
+		st.report.DeadlineRejected++
+		return
+	}
 	if st.mode == ModeUndecided && !x.now().Before(st.threshold) {
 		st.report.Rejected++
 		x.fallback(st, FlagTimeout)
@@ -519,6 +597,9 @@ func (x *Executor) admitBundle(st *slotState, e BundleEvent) {
 // dispatch hands ready bundles to idle workers.
 func (x *Executor) dispatch(st *slotState) {
 	for !st.stopped && x.busy < x.workers {
+		if x.expireDrain(st) {
+			return
+		}
 		n := st.sched.next()
 		if n == nil {
 			return
@@ -535,11 +616,17 @@ func (x *Executor) dispatch(st *slotState) {
 func (x *Executor) complete(n *bundleNode) {
 	x.busy--
 	st := n.st
+	expired := x.expireDrain(st)
 	st.running--
-	if st.mode == ModeDone {
+	if st.mode == ModeDone || expired {
 		// The slot is over; its bank no longer takes bundles.
 		n.executed.Discard()
+		st.report.Rejected++
+		if expired {
+			st.report.DeadlineDiscarded++
+		}
 		x.finishBundle(n)
+		x.reportFinished(st)
 		return
 	}
 	result := st.bank.CommitBundle(n.executed)
@@ -577,6 +664,27 @@ func (x *Executor) complete(n *bundleNode) {
 		st.bank.AllowTPU()
 	}
 	x.dispatch(st)
+}
+
+// expireDrain closes admission and drops only unstarted work. Running bundles
+// execute against scratch state; complete discards their whole result once the
+// deadline expires. Nothing already committed to the bank is rolled back.
+func (x *Executor) expireDrain(st *slotState) bool {
+	if st == nil || st.drainDeadline.IsZero() || x.now().Before(st.drainDeadline) {
+		return false
+	}
+	if !st.deadlineExpired {
+		st.deadlineExpired = true
+		st.report.DeadlineRunning = uint64(st.running)
+		st.report.DeadlineQueued = uint64(max(st.outstanding.Load()-int64(st.running), 0))
+		if st.outstanding.Load() > 0 {
+			st.report.Flags |= FlagDeadline
+		}
+		st.stopped = true
+		x.endHold(st)
+		x.dropPending(st)
+	}
+	return true
 }
 
 // finishBundle releases a bundle that will not execute again.

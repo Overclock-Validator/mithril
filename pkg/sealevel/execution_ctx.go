@@ -520,7 +520,11 @@ func (slotCtx *SlotCtx) GetAccountShared(pubkey solana.PublicKey) (*accounts.Acc
 }
 
 func (slotCtx *SlotCtx) GetParentAccount(pubkey solana.PublicKey) (*accounts.Account, error) {
-	acct, err := slotCtx.ParentAccts.GetAccountWithoutLock(pubkey)
+	// Producer commits retain parent images while other admitted scratch
+	// transactions may still read this shared store. Finalization joins all
+	// scratch execution before mutating the frozen bank.
+	key := [32]byte(pubkey)
+	acct, err := slotCtx.ParentAccts.GetAccount(&key)
 	if err != nil {
 		return nil, err
 	} else {

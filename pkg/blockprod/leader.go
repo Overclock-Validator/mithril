@@ -132,6 +132,7 @@ type LeaderLoop struct {
 	activeParentID          solana.Hash
 	activeParentChainedRoot solana.Hash
 	activeParentGeneration  uint64
+	activeHoldStartedAt     time.Time
 	finishedLeaderSlots     map[uint64]struct{}
 	pendingFailures         map[uint64]leaderSlotFailure
 	missedScanNext          uint64
@@ -227,11 +228,37 @@ func NewLeaderLoop(cfg LeaderLoopConfig) *LeaderLoop {
 func (l *LeaderLoop) Run(stop <-chan struct{}) {
 	ticker := time.NewTicker(l.pollInterval)
 	defer ticker.Stop()
+	// Polling observes parent/replay changes; a separate timer makes completion
+	// independent of the next poll. Re-arm the same timer after every event.
+	deadlineTimer := time.NewTimer(time.Hour)
+	if !deadlineTimer.Stop() {
+		<-deadlineTimer.C
+	}
+	defer deadlineTimer.Stop()
+	var deadlineC <-chan time.Time
 	var released <-chan struct{}
 	if l.holder != nil {
 		released = l.holder.Released()
 	}
 
+	armDeadline := func() {
+		if !deadlineTimer.Stop() {
+			select {
+			case <-deadlineTimer.C:
+			default:
+			}
+		}
+		l.mu.Lock()
+		deadline := l.nextCompletionWakeLocked()
+		now := l.now()
+		l.mu.Unlock()
+		deadlineC = nil
+		if !deadline.IsZero() {
+			deadlineTimer.Reset(max(deadline.Sub(now), 0))
+			deadlineC = deadlineTimer.C
+		}
+	}
+	armDeadline()
 	for {
 		select {
 		case <-stop:
@@ -241,8 +268,24 @@ func (l *LeaderLoop) Run(stop <-chan struct{}) {
 			l.tickScheduled(scheduledAt)
 		case <-released:
 			l.tick()
+		case <-deadlineC:
+			l.tick()
 		}
+		armDeadline()
 	}
+}
+
+// A busy release channel cannot starve the cutoff: every event runs tick
+// before re-arming the timer, and tick checks the current deadline itself.
+func (l *LeaderLoop) nextCompletionWakeLocked() time.Time {
+	if l.activeBank == nil || !l.productionWindow.active {
+		return time.Time{}
+	}
+	cutoff := l.productionWindowDeadlineLocked(l.activeSlot)
+	if l.now().Before(cutoff) {
+		return cutoff
+	}
+	return l.activeHoldDeadlineLocked()
 }
 
 func (l *LeaderLoop) tick() {
@@ -281,7 +324,13 @@ func (l *LeaderLoop) tickScheduled(scheduledAt time.Time) {
 			}
 			now = l.now()
 			if l.productionWindow.active {
-				if now.Before(l.productionWindowDeadlineLocked(l.activeSlot)) || l.holdActiveSlotLocked(now) {
+				if now.Before(l.productionWindowDeadlineLocked(l.activeSlot)) {
+					return
+				}
+				if l.holdActiveSlotLocked(now) {
+					if l.activeHoldStartedAt.IsZero() {
+						l.activeHoldStartedAt = now
+					}
 					return
 				}
 			} else if wallSlot <= l.activeSlot {
@@ -641,11 +690,27 @@ func (l *LeaderLoop) productionWindowDeadlineLocked(slot uint64) time.Time {
 	return deadline.Add(-reserve)
 }
 
-// holdActiveSlotLocked reports whether the hooks keep the active slot open past
-// its production deadline. The protocol deadline always ends the hold.
+func (l *LeaderLoop) productionWindowDrainDeadlineLocked(slot uint64) time.Time {
+	cutoff := l.productionWindowDeadlineLocked(slot)
+	if cutoff.IsZero() {
+		return time.Time{}
+	}
+	reserve := l.productionWindowProtocolDeadlineLocked(slot).Sub(cutoff)
+	return cutoff.Add(min(reserve/4, 5*time.Millisecond))
+}
+
+func (l *LeaderLoop) activeHoldDeadlineLocked() time.Time {
+	if _, ok := l.holder.(DeadlineSlotHolder); ok {
+		return l.productionWindowDrainDeadlineLocked(l.activeSlot)
+	}
+	return l.productionWindowProtocolDeadlineLocked(l.activeSlot)
+}
+
+// Deadline-aware hooks drain briefly after the cutoff while retaining most of
+// the reserve for bank finalization and network broadcast.
 func (l *LeaderLoop) holdActiveSlotLocked(now time.Time) bool {
 	return l.holder != nil &&
-		now.Before(l.productionWindowProtocolDeadlineLocked(l.activeSlot)) &&
+		now.Before(l.activeHoldDeadlineLocked()) &&
 		l.holder.HoldSlot(l.activeSlot)
 }
 
@@ -790,6 +855,7 @@ func (l *LeaderLoop) releaseActiveSlotLocked() {
 	l.activeParentID = solana.Hash{}
 	l.activeParentChainedRoot = solana.Hash{}
 	l.activeParentGeneration = 0
+	l.activeHoldStartedAt = time.Time{}
 }
 
 func leaderFailureReason(err error) string {
@@ -997,11 +1063,25 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 	}
 	finalizationStartedAt := l.now()
 	slot := l.activeSlot
+	var drainStatus SlotDrainStatus
+	if holder, ok := l.holder.(DeadlineSlotHolder); ok {
+		drainStatus = holder.DrainStatus(slot)
+	}
+	var cutoffDelay, holdDuration, drainDeadlineLag time.Duration
+	if l.productionWindow.active {
+		cutoffDelay = max(finalizationStartedAt.Sub(l.productionWindowDeadlineLocked(slot)), 0)
+		if !l.activeHoldStartedAt.IsZero() {
+			holdDuration = max(finalizationStartedAt.Sub(l.activeHoldStartedAt), 0)
+		}
+		drainDeadlineLag = max(finalizationStartedAt.Sub(l.activeHoldDeadlineLocked()), 0)
+	}
+	parentValidationStartedAt := time.Now()
 	if canonical, reason := l.activeParentStillCanonicalLocked(); !canonical {
 		l.failProductionWindowLocked(slot, reason, activeLeaderFailureDetail(reason))
 		l.abortActiveSlotLocked(reason)
 		return
 	}
+	parentValidationDuration := time.Since(parentValidationStartedAt)
 
 	phaseStartedAt := time.Now()
 	if l.hooks != nil {
@@ -1021,9 +1101,9 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 		l.abortActiveSlotLocked(leaderReasonFinalizationUnavailable)
 		return
 	}
-	phaseStartedAt = time.Now()
-	l.activeSink.Wait()
-	entryDrainDuration := time.Since(phaseStartedAt)
+	// Freeze enqueues an owned copy of the last entry batch. The shred worker
+	// touches only the broadcast session, so let it drain while we finalize the
+	// bank. A known broadcast failure can still abort without doing that work.
 	if err := l.activeSink.Err(); err != nil {
 		l.failProductionWindowLocked(slot, leaderReasonEntryBroadcastFailed, err.Error())
 		l.abortActiveSlotLocked(leaderReasonEntryBroadcastFailed)
@@ -1108,12 +1188,25 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 		return
 	}
 	commitDuration := time.Since(phaseStartedAt)
+	// The footer shares the entry worker's chained Merkle state. Join before
+	// touching the session, and fail closed if any entry could not be sent.
+	// entry_drain_ms measures the remaining wait after overlapping bank work.
+	phaseStartedAt = time.Now()
+	l.activeSink.Wait()
+	entryDrainDuration := time.Since(phaseStartedAt)
+	if err := l.activeSink.Err(); err != nil {
+		l.failProductionWindowLocked(slot, leaderReasonEntryBroadcastFailed, err.Error())
+		l.abortActiveSlotLocked(leaderReasonEntryBroadcastFailed)
+		return
+	}
 
+	parentValidationStartedAt = time.Now()
 	if canonical, reason := l.activeParentStillCanonicalLocked(); !canonical {
 		l.failProductionWindowLocked(slot, reason, activeLeaderFailureDetail(reason))
 		l.abortActiveSlotLocked(reason)
 		return
 	}
+	parentValidationDuration += time.Since(parentValidationStartedAt)
 	footerBankhash := solana.HashFromBytes(l.activeBank.SlotCtx().FinalBankhash)
 	phaseStartedAt = time.Now()
 	if err := l.activeSess.BroadcastFooter(footerBankhash, producerTimeNanos, footerRewards.Skip, footerRewards.Notar); err != nil {
@@ -1161,10 +1254,13 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 	ms := func(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
 	timingDetail += fmt.Sprintf(" slot_ending_ms=%.3f freeze_ms=%.3f entry_drain_ms=%.3f reward_certs_ms=%.3f"+
 		" build_block_ms=%.3f bank_commit_ms=%.3f footer_broadcast_ms=%.3f ending_tick_broadcast_ms=%.3f"+
-		" reward_prepare=%s reward_prepare_ms=%.3f reward_skip_bytes=%d reward_notar_bytes=%d",
+		" reward_prepare=%s reward_prepare_ms=%.3f reward_skip_bytes=%d reward_notar_bytes=%d"+
+		" cutoff_delay_ms=%.3f hold_ms=%.3f drain_deadline_lag_ms=%.3f drain_outstanding=%d drain_events=%d drain_inflight=%t parent_validation_ms=%.3f",
 		ms(slotEndingDuration), ms(freezeDuration), ms(entryDrainDuration), ms(rewardCertDuration),
 		ms(buildBlockDuration), ms(commitDuration), ms(footerDuration), ms(endingTickDuration),
-		rewardPreparation, ms(rewardPreparationDuration), len(footerRewards.Skip), len(footerRewards.Notar)) + bankTimings.String()
+		rewardPreparation, ms(rewardPreparationDuration), len(footerRewards.Skip), len(footerRewards.Notar),
+		ms(cutoffDelay), ms(holdDuration), ms(drainDeadlineLag), drainStatus.Outstanding,
+		drainStatus.QueuedEvents, drainStatus.PipelineInFlight, ms(parentValidationDuration)) + bankTimings.String()
 	l.recordLeaderSlotOutcomeLocked(slot, leaderOutcomeBroadcast, leaderReasonComplete,
 		fmt.Sprintf("block=%s parent_slot=%d txns=%d%s", solana.Hash(producedBlock.AlpenglowBlockID).String(), producedBlock.ParentSlot, len(producedBlock.Transactions), timingDetail))
 	l.advanceProductionWindowLocked(slot)

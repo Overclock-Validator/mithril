@@ -93,7 +93,7 @@ func setGauge(m statsd.Metric, on bool) {
 // reportSlot exports a leader slot's report.
 func reportSlot(r SlotReport) {
 	_ = statsd.Count(statsd.HarmonicSlots, 1, []string{r.Mode.String()})
-	for _, flag := range []EndFlags{FlagTimeout, FlagFailed, FlagReverted, FlagUnavailable} {
+	for _, flag := range []EndFlags{FlagTimeout, FlagFailed, FlagReverted, FlagUnavailable, FlagDeadline} {
 		if r.Flags&flag != 0 {
 			_ = statsd.Count(statsd.HarmonicSlotEndFlags, 1, []string{flag.String()})
 		}
