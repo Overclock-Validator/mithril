@@ -257,6 +257,14 @@ func ChainTipParentContext() ChainTipSnapshot {
 	return ctx
 }
 
+// ChainTipBankSysvars returns the immutable sysvar snapshot published with the
+// current replay tip, without cloning unrelated leader construction state.
+func ChainTipBankSysvars() *sealevel.BankSysvars {
+	chainTipMu.RLock()
+	defer chainTipMu.RUnlock()
+	return chainTipBankSysvars
+}
+
 // ChainTipFeatureActive reports the current replay tip's feature state without
 // cloning the full producer context. It is intended for hot admission paths,
 // such as TPU sigverify, that must follow bank feature activation even outside

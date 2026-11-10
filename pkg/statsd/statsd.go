@@ -146,6 +146,12 @@ var (
 	// Harmonic block engine integration. Session and pipeline counters are
 	// exported once a second; slot metrics when each leader slot ends.
 	HarmonicBlockEngineHealthy       = Metric{"harmonic_block_engine_healthy"}
+	HarmonicBundleSubscriptionActive = Metric{"harmonic_bundle_subscription_active"}
+	HarmonicBundleSubscriptions      = Metric{"harmonic_bundle_subscriptions_total"}
+	HarmonicBundleMessagesDrained    = Metric{"harmonic_bundle_messages_drained_total"}
+	HarmonicBundlesDrained           = Metric{"harmonic_bundles_drained_total"}
+	HarmonicBundlePacketsDrained     = Metric{"harmonic_bundle_packets_drained_total"}
+	HarmonicBundleBytesDrained       = Metric{"harmonic_bundle_bytes_drained_total"}
 	HarmonicRelayerConnected         = Metric{"harmonic_relayer_connected"}
 	HarmonicRelayerTPUAdvertised     = Metric{"harmonic_relayer_tpu_advertised"}
 	HarmonicClientIDAdvertised       = Metric{"harmonic_client_id_advertised"}
@@ -297,6 +303,12 @@ var MetricToType = map[Metric]metricType{
 	TurbineReplayAdmission:                      TimingT,
 
 	HarmonicBlockEngineHealthy:       GaugeT,
+	HarmonicBundleSubscriptionActive: GaugeT,
+	HarmonicBundleSubscriptions:      CountT,
+	HarmonicBundleMessagesDrained:    CountT,
+	HarmonicBundlesDrained:           CountT,
+	HarmonicBundlePacketsDrained:     CountT,
+	HarmonicBundleBytesDrained:       CountT,
 	HarmonicRelayerConnected:         GaugeT,
 	HarmonicRelayerTPUAdvertised:     GaugeT,
 	HarmonicClientIDAdvertised:       GaugeT,
@@ -437,6 +449,12 @@ var MetricToLabels = map[Metric][]string{
 	TurbineReplayAdmission:                      {},
 
 	HarmonicBlockEngineHealthy:       {},
+	HarmonicBundleSubscriptionActive: {},
+	HarmonicBundleSubscriptions:      {},
+	HarmonicBundleMessagesDrained:    {},
+	HarmonicBundlesDrained:           {},
+	HarmonicBundlePacketsDrained:     {},
+	HarmonicBundleBytesDrained:       {},
 	HarmonicRelayerConnected:         {},
 	HarmonicRelayerTPUAdvertised:     {},
 	HarmonicClientIDAdvertised:       {},

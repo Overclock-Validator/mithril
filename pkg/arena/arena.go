@@ -10,6 +10,10 @@ type Arena[T any] struct {
 	pool     []T
 	index    uint64
 	capacity uint64
+	// Count only heap fallbacks; successful arena allocations keep their
+	// existing fast path. Both counters reset with the arena.
+	overflowElements atomic.Uint64
+	overflowAllocs   atomic.Uint64
 }
 
 // New creates a new arena with the specified capacity
@@ -29,6 +33,8 @@ func (a *Arena[T]) Alloc() (*T, bool) {
 		current := atomic.LoadUint64(&a.index)
 		if current >= a.capacity {
 			// Fallback to heap allocation
+			a.overflowElements.Add(1)
+			a.overflowAllocs.Add(1)
 			var item T
 			return &item, false
 		}
@@ -50,6 +56,8 @@ func (a *Arena[T]) AllocN(n uint64) ([]T, bool) {
 		current := atomic.LoadUint64(&a.index)
 		if n > a.capacity-current {
 			// Fallback to heap allocation
+			a.overflowElements.Add(n)
+			a.overflowAllocs.Add(1)
 			return make([]T, n), false
 		}
 		if atomic.CompareAndSwapUint64(&a.index, current, current+n) {
@@ -68,6 +76,12 @@ func (a *Arena[T]) Capacity() uint64 {
 	return a.capacity
 }
 
+// Overflow returns heap-allocated element and allocation counts since the last
+// reset. Read after users finish for a consistent per-bank measurement.
+func (a *Arena[T]) Overflow() (elements, allocations uint64) {
+	return a.overflowElements.Load(), a.overflowAllocs.Load()
+}
+
 // ResetPaced is Reset done in chunks of at most chunk items, calling pause
 // between chunks, so a background caller can spread the clearing out instead
 // of using all memory bandwidth at once. Same requirements as Reset.
@@ -81,10 +95,14 @@ func (a *Arena[T]) ResetPaced(chunk uint64, pause func()) {
 		}
 	}
 	a.index = 0
+	a.overflowElements.Store(0)
+	a.overflowAllocs.Store(0)
 }
 
 // Reset requires all users of the previous allocations to have finished.
 func (a *Arena[T]) Reset() {
 	clear(a.pool[:atomic.LoadUint64(&a.index)])
 	a.index = 0
+	a.overflowElements.Store(0)
+	a.overflowAllocs.Store(0)
 }

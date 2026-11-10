@@ -653,7 +653,10 @@ name = "mithril"
     # Ignored with a single accounts directory.
     # snapshot_accounts_dir_min_free_mb = 16384
 
-    # Size in MB for serialized parameter arena (0 to disable)
+    # Size in MiB per serialized parameter arena (0 to disable). Replay keeps
+    # two buffers so one can clear while the next bank executes. A 256 MiB
+    # setting reserves 512 MiB total; overflow uses ordinary heap allocation.
+    # Runtime diagnostics report used/overflow high-water marks and totals.
     param_arena_size_mb = 512
 
     # Number of borrowed accounts to preallocate in arena (0 to disable)

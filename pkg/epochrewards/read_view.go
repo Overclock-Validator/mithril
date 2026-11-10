@@ -69,14 +69,18 @@ func (s *Store) GetPublished(epoch uint64, address string) (Record, bool) {
 	defer s.mu.RUnlock()
 	key := rewardKey{epoch: epoch, address: address}
 	record, ok := s.published[key]
-	if !ok {
-		record, ok = s.persisted[key]
-		ok = ok && record.EffectiveSlot <= s.rooted.Load() && s.sourceBatch[key] <= s.rooted.Load()
+	if ok {
+		record.Commission = cloneUint8(record.Commission)
+	} else {
+		persisted, found := s.persisted[key]
+		ok = found && persisted.effectiveSlot <= s.rooted.Load() && persisted.sourceBatch <= s.rooted.Load()
+		if ok {
+			record = persisted.record(key)
+		}
 	}
 	if !ok || record.EffectiveSlot > s.readable {
 		return Record{}, false
 	}
-	record.Commission = cloneUint8(record.Commission)
 	return record, true
 }
 

@@ -2726,6 +2726,7 @@ postBootstrap:
 		controller := blockprod.NewController()
 		topicSink := scheduler.NewWithConfig(controller, scheduler.Config{
 			FeatureSource: replay.ChainTipFeatures, MaxBufferedTransactions: validatorMaxBufferedTransactions,
+			CleanupSource: replay.ChainTipBankSysvars,
 		})
 		topicSink.Start(ctx)
 		defer topicSink.Stop()

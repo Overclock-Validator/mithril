@@ -471,23 +471,16 @@ func (db *AccountsDb) compactionPinSet(headSeq, horizon uint64, inv *compactionI
 	} else {
 		pinned = &compactionPins{whole: make(map[uint64]struct{}), records: make(map[uint64]map[uint64][32]byte)}
 		for _, k := range keep {
-			m, merr := ReadSegmentManifest(k.path)
-			if merr != nil {
-				db.compactPinCache = nil
-				return nil, nil, fmt.Errorf("cannot establish rewind pins from %s: %w", k.name, merr)
-			}
 			// Validate the previously promised range before expiring more history.
 			// A new head must not silently age out a missing/corrupt retained fold.
-			if !k.parked && k.hdr.BatchSeq < horizonFloor {
-				continue
+			if k.parked || k.hdr.BatchSeq >= horizonFloor {
+				pinned.whole[k.hdr.FileId] = struct{}{}
 			}
-			pinned.whole[k.hdr.FileId] = struct{}{}
-			if !k.parked && k.hdr.BatchSeq == horizonFloor {
-				continue // boundary's own undo pointers are outside the horizon
-			}
-			for i := range m.Records {
-				if m.Records[i].PrevValid {
-					r := m.Records[i]
+			merr := visitSegmentManifestRecords(k.path, func(r ManifestRecord) error {
+				if !k.parked && k.hdr.BatchSeq <= horizonFloor {
+					return nil // boundary's own undo pointers are outside the horizon
+				}
+				if r.PrevValid {
 					if k.parked {
 						pinned.whole[r.Prev.FileId] = struct{}{}
 					}
@@ -495,11 +488,15 @@ func (db *AccountsDb) compactionPinSet(headSeq, horizon uint64, inv *compactionI
 						pinned.records[r.Prev.FileId] = make(map[uint64][32]byte)
 					}
 					if key, exists := pinned.records[r.Prev.FileId][r.Prev.Offset]; exists && key != r.Pubkey {
-						db.compactPinCache = nil
-						return nil, nil, fmt.Errorf("conflicting undo pointers for file %d offset %d", r.Prev.FileId, r.Prev.Offset)
+						return fmt.Errorf("conflicting undo pointers for file %d offset %d", r.Prev.FileId, r.Prev.Offset)
 					}
 					pinned.records[r.Prev.FileId][r.Prev.Offset] = r.Pubkey
 				}
+				return nil
+			})
+			if merr != nil {
+				db.compactPinCache = nil
+				return nil, nil, fmt.Errorf("cannot establish rewind pins from %s: %w", k.name, merr)
 			}
 		}
 		db.compactPinCache = &compactionPinCache{sig: sig.String(), pinned: pinned}

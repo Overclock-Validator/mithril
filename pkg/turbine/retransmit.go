@@ -45,6 +45,10 @@ type retransmitRepairPeerSource interface {
 	RepairPeers() []gossip.RepairPeer
 }
 
+type retransmitRepairPeerLookup interface {
+	RepairPeerForAddr(*net.UDPAddr) (gossip.Pubkey, bool)
+}
+
 // RetransmitConfig supplies the live gossip and epoch-stake view needed to
 // derive this validator's position in Agave's deterministic Turbine tree.
 type RetransmitConfig struct {
@@ -707,7 +711,11 @@ func (r *Retransmitter) classifyInvalidParentSource(nodes *ClusterNodes, leader 
 	if source == nil {
 		return parentSourceUnexplained, solana.PublicKey{}
 	}
-	if repairPeers, ok := r.cfg.Peers.(retransmitRepairPeerSource); ok {
+	if repairPeers, ok := r.cfg.Peers.(retransmitRepairPeerLookup); ok {
+		if peer, found := repairPeers.RepairPeerForAddr(source); found {
+			return parentSourceRepairSocket, solana.PublicKey(peer)
+		}
+	} else if repairPeers, ok := r.cfg.Peers.(retransmitRepairPeerSource); ok {
 		for _, peer := range repairPeers.RepairPeers() {
 			if sameUDPAddr(source, peer.Addr) {
 				return parentSourceRepairSocket, solana.PublicKey(peer.Pubkey)

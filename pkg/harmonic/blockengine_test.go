@@ -9,6 +9,7 @@ import (
 	authpb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/auth"
 	blockpb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/block"
 	blockenginepb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/blockengine"
+	bundlepb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/bundle"
 	packetpb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/packet"
 	tpupacket "github.com/Overclock-Validator/mithril/pkg/tpu/packet"
 	"github.com/Overclock-Validator/mithril/pkg/version"
@@ -166,6 +167,94 @@ func TestBlockEngineSessionEstablishesAndStreams(t *testing.T) {
 	assert.Equal(t, uint64(1), stats.Sessions)
 	assert.Zero(t, stats.Resets)
 	assert.Equal(t, uint64(2), stats.DroppedSize)
+	assert.Equal(t, uint64(1), stats.BundleSubscriptions)
+	assert.True(t, stats.BundleSubscriptionActive)
+}
+
+func TestBlockEngineBundleStreamDrainsWithoutForwarding(t *testing.T) {
+	h := newBlockEngineHarness(t, time.Hour)
+	h.start()
+	eventually(t, h.session.Healthy, "all subscriptions are established")
+	wire, err := transfer(t, 1).MarshalBinary()
+	require.NoError(t, err)
+	h.be.bundles <- &blockenginepb.SubscribeBundlesResponse{Bundles: []*bundlepb.BundleUuid{
+		{Uuid: "unused", Bundle: &bundlepb.Bundle{Packets: []*packetpb.Packet{{Data: wire}, {Data: []byte{1, 2, 3}}}}},
+		{Uuid: "empty", Bundle: &bundlepb.Bundle{}},
+		{Uuid: "missing"},
+	}}
+	h.be.bundles <- &blockenginepb.SubscribeBundlesResponse{}
+	eventually(t, func() bool { return h.session.Stats().DrainedBundleMessages == 2 }, "both responses are consumed")
+	stats := h.session.Stats()
+	assert.Equal(t, uint64(2), stats.DrainedBundles)
+	assert.Equal(t, uint64(2), stats.DrainedBundlePackets)
+	assert.Equal(t, uint64(len(wire)+3), stats.DrainedBundleBytes)
+	assert.Zero(t, stats.Packets)
+	assert.Zero(t, stats.Blocks)
+	assert.Zero(t, h.packets.count(), "even valid bundle transactions never enter the TPU")
+	assert.Empty(t, h.blocks.received(), "bundle responses never become ordered blocks")
+	assert.Zero(t, stats.Resets, "discarding malformed transaction bytes does not change the session")
+
+	// The ordered block stream remains the only input to the block handler.
+	h.be.blocks <- &blockpb.Block{Slot: 20}
+	h.be.blocks <- &blockpb.Block{Slot: 21}
+	eventually(t, func() bool { return len(h.blocks.received()) == 2 }, "ordered stream still advances")
+	assert.Equal(t, []uint64{20, 21}, h.blocks.received())
+}
+
+func TestBlockEngineBundleStreamLossReconnects(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"EOF", nil},
+		{"error", status.Error(codes.Unavailable, "bundle stream reset")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newBlockEngineHarness(t, time.Hour)
+			h.start()
+			eventually(t, h.session.Healthy, "healthy")
+			h.session.NotifyLeaderSlot(100, time.Now().Add(time.Hour))
+			eventually(t, func() bool { return h.session.Stats().NoticesSent == 1 }, "notice sent")
+			h.be.endBundles <- tc.err
+			eventually(t, func() bool { return h.session.Stats().Resets == 1 && h.session.Healthy() }, "all subscriptions reconnect")
+			assert.Equal(t, []uint64{100}, h.blocks.lostSlots(), "an interrupted ordered session cannot continue its old slot")
+			assert.Equal(t, uint64(2), h.session.Stats().BundleSubscriptions)
+			assert.Equal(t, []bool{true, false, true}, h.health.all())
+			eventually(t, func() bool { return h.be.bundlesLive.Load() == 1 && h.be.blocksLive.Load() == 1 }, "old streams are closed")
+		})
+	}
+}
+
+func TestBlockEngineBundleSubscriptionFailureReconnects(t *testing.T) {
+	h := newBlockEngineHarness(t, time.Hour)
+	h.be.bundleErrs = []error{status.Error(codes.Unauthenticated, "subscription rejected")}
+	h.start()
+	eventually(t, func() bool { return h.session.Stats().Resets == 1 && h.session.Healthy() }, "a fresh authenticated session establishes every subscription")
+	assert.Equal(t, uint64(1), h.session.Stats().Resets)
+	assert.Equal(t, int32(2), h.be.bundleSubs.Load())
+	// gRPC can deliver a trailers-only rejection through Recv after Header
+	// returns, so setup may briefly advance before the receive error arrives.
+	// In either case the failed subscription must reset, not remain healthy.
+	eventually(t, func() bool { return h.be.bundlesLive.Load() == 1 && h.be.blocksLive.Load() == 1 }, "only the recovered session's streams remain")
+}
+
+func TestBlockEngineCancellationClosesBundleSubscription(t *testing.T) {
+	h := newBlockEngineHarness(t, time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { h.session.Run(ctx); close(done) }()
+	t.Cleanup(cancel)
+	eventually(t, h.session.Healthy, "healthy before cancellation")
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("session did not stop after cancellation")
+	}
+	eventually(t, func() bool { return h.be.bundlesLive.Load() == 0 && h.be.blocksLive.Load() == 0 }, "all server streams are closed")
+	assert.False(t, h.session.Stats().BundleSubscriptionActive)
+	assert.False(t, h.session.Healthy())
+	assert.Zero(t, h.session.Stats().Resets, "shutdown does not initiate another session")
 }
 
 func TestBlockEngineSessionToleratesSetStrategyErrorsButNotAuthErrors(t *testing.T) {

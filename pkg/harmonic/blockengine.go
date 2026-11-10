@@ -99,6 +99,13 @@ type BlockEngineStats struct {
 	StreamsLost    uint64
 	StrategyErrors uint64
 	InvalidFeeInfo uint64
+	// The compatibility bundle stream is drained, never submitted for execution.
+	BundleSubscriptions      uint64
+	DrainedBundleMessages    uint64
+	DrainedBundles           uint64
+	DrainedBundlePackets     uint64
+	DrainedBundleBytes       uint64
+	BundleSubscriptionActive bool
 }
 
 type leaderNotice struct {
@@ -108,7 +115,8 @@ type leaderNotice struct {
 
 // BlockEngineSession keeps an authenticated session with a Harmonic block
 // engine: packets into the TPU, the block stream into a BlockHandler, and
-// leader notices out.
+// leader notices out. The compatibility bundle stream is drained and discarded;
+// only the ordered block stream reaches the block handler.
 type BlockEngineSession struct {
 	cfg      BlockEngineConfig
 	now      func() time.Time
@@ -118,6 +126,8 @@ type BlockEngineSession struct {
 	stats    struct {
 		sessions, resets, packets, droppedSize, droppedFull, blocks,
 		noticesSent, noticesExpired, noticeErrors, streamsLost, strategyErrors, invalidFeeInfo atomic.Uint64
+		bundleSubscriptions, drainedBundleMessages, drainedBundles,
+		drainedBundlePackets, drainedBundleBytes atomic.Uint64
 	}
 
 	mu sync.Mutex
@@ -132,7 +142,7 @@ type BlockEngineSession struct {
 
 // sessionLiveness is what the current session has established.
 type sessionLiveness struct {
-	authenticated, packets, blocks bool
+	authenticated, bundles, packets, blocks bool
 }
 
 func NewBlockEngineSession(cfg BlockEngineConfig) *BlockEngineSession {
@@ -156,19 +166,28 @@ func NewBlockEngineSession(cfg BlockEngineConfig) *BlockEngineSession {
 }
 
 func (b *BlockEngineSession) Stats() BlockEngineStats {
+	b.mu.Lock()
+	bundlesActive := b.live.bundles
+	b.mu.Unlock()
 	return BlockEngineStats{
-		Sessions:       b.stats.sessions.Load(),
-		Resets:         b.stats.resets.Load(),
-		Packets:        b.stats.packets.Load(),
-		DroppedSize:    b.stats.droppedSize.Load(),
-		DroppedFull:    b.stats.droppedFull.Load(),
-		Blocks:         b.stats.blocks.Load(),
-		NoticesSent:    b.stats.noticesSent.Load(),
-		NoticesExpired: b.stats.noticesExpired.Load(),
-		NoticeErrors:   b.stats.noticeErrors.Load(),
-		StreamsLost:    b.stats.streamsLost.Load(),
-		StrategyErrors: b.stats.strategyErrors.Load(),
-		InvalidFeeInfo: b.stats.invalidFeeInfo.Load(),
+		Sessions:                 b.stats.sessions.Load(),
+		Resets:                   b.stats.resets.Load(),
+		Packets:                  b.stats.packets.Load(),
+		DroppedSize:              b.stats.droppedSize.Load(),
+		DroppedFull:              b.stats.droppedFull.Load(),
+		Blocks:                   b.stats.blocks.Load(),
+		NoticesSent:              b.stats.noticesSent.Load(),
+		NoticesExpired:           b.stats.noticesExpired.Load(),
+		NoticeErrors:             b.stats.noticeErrors.Load(),
+		StreamsLost:              b.stats.streamsLost.Load(),
+		StrategyErrors:           b.stats.strategyErrors.Load(),
+		InvalidFeeInfo:           b.stats.invalidFeeInfo.Load(),
+		BundleSubscriptions:      b.stats.bundleSubscriptions.Load(),
+		DrainedBundleMessages:    b.stats.drainedBundleMessages.Load(),
+		DrainedBundles:           b.stats.drainedBundles.Load(),
+		DrainedBundlePackets:     b.stats.drainedBundlePackets.Load(),
+		DrainedBundleBytes:       b.stats.drainedBundleBytes.Load(),
+		BundleSubscriptionActive: bundlesActive,
 	}
 }
 
@@ -183,7 +202,7 @@ func (b *BlockEngineSession) FeeInfo() (FeeInfo, bool) {
 }
 
 // Healthy reports whether the session is authenticated, has valid fee info,
-// and has both its packet and block subscriptions live.
+// and has its bundle, packet and ordered block subscriptions live.
 func (b *BlockEngineSession) Healthy() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -277,7 +296,7 @@ func (b *BlockEngineSession) setLive(update func(*sessionLiveness)) {
 
 func (b *BlockEngineSession) updateHealth() {
 	b.mu.Lock()
-	healthy := b.live.authenticated && b.live.packets && b.live.blocks && b.fee != nil
+	healthy := b.live.authenticated && b.live.bundles && b.live.packets && b.live.blocks && b.fee != nil
 	changed := healthy != b.healthy
 	b.healthy = healthy
 	b.mu.Unlock()
@@ -307,7 +326,7 @@ func (b *BlockEngineSession) runSession(ctx context.Context) error {
 	}
 	b.stats.sessions.Add(1)
 	b.setLive(func(l *sessionLiveness) { l.authenticated = true })
-	errs := make(chan error, 4)
+	errs := make(chan error, 5)
 	go func() { errs <- tokens.Run(ctx) }()
 
 	client := blockenginepb.NewBlockEngineValidatorClient(conn)
@@ -317,6 +336,21 @@ func (b *BlockEngineSession) runSession(ctx context.Context) error {
 	if err := b.refreshFeeInfo(ctx, client); err != nil {
 		return err
 	}
+	// Match the reference client's subscriptions without adding another
+	// execution source. Bundle responses are consumed only to keep the stream
+	// flowing; ordered execution still comes exclusively from SubscribeBlocks2.
+	bundles, err := client.SubscribeBundles2(ctx, &blockenginepb.SubscribeBundlesRequest{})
+	if err == nil {
+		err = awaitHeaders(bundles)
+	}
+	if err != nil {
+		return fmt.Errorf("subscribe bundles: %w", err)
+	}
+	b.stats.bundleSubscriptions.Add(1)
+	b.setLive(func(l *sessionLiveness) { l.bundles = true })
+	mlog.Log.Infof("Harmonic block engine %s: bundle subscription established (drain only)", b.cfg.Endpoint.Target)
+	go func() { errs <- b.drainBundles(bundles) }()
+
 	packets, err := client.SubscribePackets(ctx, &blockenginepb.SubscribePacketsRequest{})
 	if err == nil {
 		err = awaitHeaders(packets)
@@ -427,6 +461,37 @@ func (b *BlockEngineSession) readPackets(stream blockenginepb.BlockEngineValidat
 				b.stats.droppedFull.Add(1)
 			}
 		}
+	}
+}
+
+// drainBundles counts and discards compatibility-stream messages. In
+// particular, none of their packets enter the TPU or ordered block pipeline.
+// Ending this stream resets the session, matching the reference client.
+func (b *BlockEngineSession) drainBundles(stream blockenginepb.BlockEngineValidator_SubscribeBundles2Client) error {
+	for {
+		msg, err := stream.Recv()
+		if err != nil {
+			return fmt.Errorf("bundle stream: %w", err)
+		}
+		var bundles, packets, bytes uint64
+		for _, item := range msg.GetBundles() {
+			bundle := item.GetBundle()
+			if bundle == nil {
+				continue
+			}
+			bundles++
+			for _, packet := range bundle.GetPackets() {
+				if packet == nil {
+					continue
+				}
+				packets++
+				bytes += uint64(len(packet.GetData()))
+			}
+		}
+		b.stats.drainedBundles.Add(bundles)
+		b.stats.drainedBundlePackets.Add(packets)
+		b.stats.drainedBundleBytes.Add(bytes)
+		b.stats.drainedBundleMessages.Add(1)
 	}
 }
 

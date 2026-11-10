@@ -116,6 +116,11 @@ type SlotReport struct {
 	// Queued and Running are the snapshot at drain expiry; Discarded counts
 	// uncommitted scratch results, and Rejected counts events refused there.
 	DeadlineQueued, DeadlineRunning, DeadlineDiscarded, DeadlineRejected uint64
+	// TipIntentsReceived covers valid ordered events delivered to this slot
+	// before it finished, including events subsequently refused by admission.
+	// TipIntentsRecorded covers only transactions committed into the local bank.
+	// Neither is an actual-payment or finalized-block measurement.
+	TipIntentsReceived, TipIntentsRecorded TipIntentObservation
 }
 
 // BlockEngineControl is the part of the block engine session the executor
@@ -145,6 +150,9 @@ type ExecutorConfig struct {
 	Events      <-chan BlockEvent
 	// Crank is optional; nil means no crank is ever needed.
 	Crank CrankBuilder
+	// TipAccounts enables observation of direct static-key tip intents. It
+	// does not affect admission, scheduling, execution or the tip crank.
+	TipAccounts [tipAccounts]solana.PublicKey
 	// OnReport, if set, receives each slot's report.
 	OnReport func(SlotReport)
 	// Workers execute block bundles that do not conflict in parallel. Zero
@@ -491,6 +499,9 @@ func (x *Executor) reportFinished(st *slotState) {
 	mlog.Log.Infof("Harmonic slot %d: mode=%s flags=%s executed=%d reverted=%d rejected=%d parallel=%d crank=%s aborted=%t deadline_queued=%d deadline_running=%d deadline_discarded=%d deadline_rejected=%d%s",
 		r.Slot, r.Mode, r.Flags, r.Executed, r.Reverted, r.Rejected, r.MaxParallel, r.Crank, r.Aborted,
 		r.DeadlineQueued, r.DeadlineRunning, r.DeadlineDiscarded, r.DeadlineRejected, reasonSuffix(r.Reason))
+	mlog.Log.Infof("Harmonic tip intents slot=%d: received_txs=%d received_direct_tip_txs=%d received_lookup_txs=%d recorded_txs=%d recorded_direct_tip_txs=%d recorded_lookup_txs=%d aborted=%t scope=ordered_valid_static_direct_transfers",
+		r.Slot, r.TipIntentsReceived.Transactions, r.TipIntentsReceived.DirectTipIntents, r.TipIntentsReceived.LookupTransactions,
+		r.TipIntentsRecorded.Transactions, r.TipIntentsRecorded.DirectTipIntents, r.TipIntentsRecorded.LookupTransactions, r.Aborted)
 	if x.cfg.OnReport != nil {
 		x.cfg.OnReport(r)
 	}
@@ -517,10 +528,15 @@ func (x *Executor) handleEvent(st *slotState, e BlockEvent) {
 		x.stop(st, FlagFailed)
 	case BundleEvent:
 		x.noteArrival(st, e.Slot, e.Arrival)
+		var tips TipIntentObservation
+		if st != nil && st.slot == e.Slot && st.mode != ModeDone {
+			tips = observeTipIntents(e.Transactions, x.cfg.TipAccounts)
+			st.report.TipIntentsReceived.add(tips)
+		}
 		if !x.admits(st, e.Slot, e.Seq) {
 			return
 		}
-		x.admitBundle(st, e)
+		x.admitBundle(st, e, tips)
 	}
 }
 
@@ -560,7 +576,7 @@ func (x *Executor) admits(st *slotState, slot, seq uint64) bool {
 
 // admitBundle schedules a block bundle. The slot's first one waits for the
 // tip crank, which lands before any block bundle executes.
-func (x *Executor) admitBundle(st *slotState, e BundleEvent) {
+func (x *Executor) admitBundle(st *slotState, e BundleEvent, tips TipIntentObservation) {
 	if x.expireDrain(st) {
 		st.report.Flags |= FlagDeadline
 		st.report.Rejected++
@@ -590,7 +606,7 @@ func (x *Executor) admitBundle(st *slotState, e BundleEvent) {
 	}
 	st.outstanding.Add(1)
 	x.pending.Add(1)
-	st.sched.add(&bundleNode{st: st, seq: e.Seq, prepared: prepared}, prepared.Accounts)
+	st.sched.add(&bundleNode{st: st, seq: e.Seq, prepared: prepared, tipIntents: tips}, prepared.Accounts)
 	x.dispatch(st)
 }
 
@@ -634,6 +650,7 @@ func (x *Executor) complete(n *bundleNode) {
 	switch result.Result {
 	case blockprod.ForgeAccepted:
 		st.report.Executed++
+		st.report.TipIntentsRecorded.add(n.tipIntents)
 		x.finishBundle(n)
 	case blockprod.ForgeDroppedNoLeader:
 		// The bank froze: the slot is over.
