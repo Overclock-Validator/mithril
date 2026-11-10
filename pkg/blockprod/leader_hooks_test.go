@@ -341,14 +341,14 @@ func TestLeaderHoldsTheSlotPastItsDeadlineUntilReleased(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		slot uint64
-		// at is past the production deadline (125ms after ParentReady for the
+		// at is past the production deadline (185ms after ParentReady for the
 		// window's first slot); the protocol deadline is at 200ms.
 		at       time.Duration
 		release  bool
 		finishes bool
 	}{
-		{"held past the production deadline", 120, 150 * time.Millisecond, false, false},
-		{"released", 121, 150 * time.Millisecond, true, true},
+		{"held past the production deadline", 120, 190 * time.Millisecond, false, false},
+		{"released", 121, 190 * time.Millisecond, true, true},
 		{"the protocol deadline ends a hold", 122, 200 * time.Millisecond, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

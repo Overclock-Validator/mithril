@@ -575,7 +575,7 @@ func init() {
 	Run.Flags().BoolVar(&validatorReservedHistory, "reserved-vote-history", false, "Use durable signing reservations with unsynchronized per-vote history writes")
 	Run.Flags().BoolVar(&validatorInitializeReservation, "initialize-vote-reservation", false, "Enroll complete synchronous vote history in reserved mode (one-time migration)")
 	Run.Flags().Uint64Var(&validatorWaitToVoteSlot, "wait-to-vote-slot", 0, "Do not cast new votes below this slot; the automatic startup cutoff still applies (0 = automatic only)")
-	Run.Flags().IntVar(&validatorCompletionReserveMs, "leader-completion-reserve-ms", 0, "Time reserved for leader finalization and broadcast (0 = 75ms default; tune from measured completion times)")
+	Run.Flags().IntVar(&validatorCompletionReserveMs, "leader-completion-reserve-ms", 0, "Time reserved for leader finalization and broadcast (0 = 15ms default; tune from measured completion margins)")
 	Run.Flags().IntVar(&validatorMaxBufferedTransactions, "tpu-max-buffered-transactions", 0, "Maximum queued TPU transactions (0 = 131072 default)")
 
 	// [harmonic] section flags

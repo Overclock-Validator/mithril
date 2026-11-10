@@ -27,13 +27,11 @@ const (
 	// It also bounds the footer nanosecond clock and ParentReady-derived block
 	// deadlines; keeping those clocks identical prevents late/missed slots.
 	AlpenglowSlotDuration = 200 * time.Millisecond
-	// Retain a conservative default for bank finalization, footer shredding and
-	// synchronous UDP fanout. Before reward preparation was pipelined, a two-hour
-	// trace measured 29-55ms completion: with a 25ms reserve, 328 of 340 blocks
-	// missed their deadline and later leaders discarded 52 of 85 local windows.
-	// Operators can lower CompletionReserve after measuring total completion
-	// with the pipeline; bank commit and network time still need a margin.
-	leaderBlockCompletionReserve = 75 * time.Millisecond
+	// Reserve time for bank finalization, footer shredding and UDP fanout after
+	// the execution cutoff. With pipelined completion, the initial live trials
+	// measured 4-9ms; 15ms leaves more margin than the tight 10ms trial. Operators
+	// should tune CompletionReserve from completion margins on their own host.
+	leaderBlockCompletionReserve = 15 * time.Millisecond
 )
 
 var errParentNotReady = errors.New("parent not ready")
@@ -171,7 +169,7 @@ type LeaderLoopConfig struct {
 	PollInterval  time.Duration
 	SlotDuration  time.Duration
 	// CompletionReserve is time retained for finalization and broadcast. Zero
-	// uses the conservative default; tune only from measured completion times.
+	// uses the 15ms default; tune from measured completion margins.
 	CompletionReserve time.Duration
 	Now               func() time.Time
 	Hooks             LeaderHooks

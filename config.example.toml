@@ -378,7 +378,7 @@ name = "mithril"
     tpu_max_buffered_transactions = 0
 
     # Milliseconds reserved for local finalization and broadcast, not consensus
-    # finality. Zero keeps the conservative 75ms default. Tune from measured
+    # finality. Zero uses the 15ms default. Tune from measured
     # completion margins; this does not change the protocol slot deadline.
     block_completion_reserve_ms = 0
 

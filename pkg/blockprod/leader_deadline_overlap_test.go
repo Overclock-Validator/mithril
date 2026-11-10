@@ -111,6 +111,7 @@ func TestLeaderDeadlineTimerDoesNotWaitForPoll(t *testing.T) {
 			loop.leaderForSlot = func(uint64) (solana.PublicKey, bool) { return solana.PublicKey{}, false }
 			ready := time.Now().Add(-75 * time.Millisecond)
 			loop.productionWindow = leaderProductionWindow{active: true, startSlot: 120, endSlot: 123, nextSlot: 120, readyAt: ready}
+			cutoff := loop.productionWindowDeadlineLocked(120)
 			if busyRelease {
 				released := make(chan struct{})
 				close(released)
@@ -121,7 +122,7 @@ func TestLeaderDeadlineTimerDoesNotWaitForPoll(t *testing.T) {
 			defer func() { close(stop); <-done }()
 			select {
 			case at := <-committed:
-				require.False(t, at.Before(ready.Add(125*time.Millisecond)), "timer must not freeze early")
+				require.False(t, at.Before(cutoff), "timer must not freeze early")
 			case <-time.After(500 * time.Millisecond):
 				t.Fatal("completion waited for the one-second poll interval")
 			}
