@@ -486,10 +486,15 @@ func FlushPendingStakePubkeys(accountsDbDir string) (int, error) {
 // time), never a subset — the index feeding epoch-stakes enumeration must
 // never miss a folded slot's stake accounts. Entries for slots > through stay
 // in RAM (merged into scans) until their own fold or unwind decides them.
+// committed keys come directly from the accepted fold's account deltas. They
+// must be indexed even if speculative bookkeeping discarded a pending hint.
 // Returns the number of entries flushed.
-func FlushPendingStakePubkeysThrough(accountsDbDir string, through uint64) (int, error) {
+func FlushPendingStakePubkeysThrough(accountsDbDir string, through uint64, committed ...solana.PublicKey) (int, error) {
 	instance.pendingStakeMutex.Lock()
 	var pending []accountsdb.StakeIndexEntry
+	for _, pubkey := range committed {
+		pending = append(pending, accountsdb.StakeIndexEntry{Pubkey: pubkey})
+	}
 	for slot, entries := range instance.pendingStakeBySlot {
 		if slot <= through {
 			pending = append(pending, entries...)

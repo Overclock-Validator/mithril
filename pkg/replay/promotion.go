@@ -2,6 +2,7 @@ package replay
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
+	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
@@ -395,7 +397,12 @@ func (t *unrootedTail) recordStakeChange(slotCtx *sealevel.SlotCtx, modified []*
 		}
 		return acct, err
 	}
-	t.stakeTotals.recordSlot(slotCtx.Slot, slotCtx, modified, global.PendingStakePubkeysForSlot(slotCtx.Slot), readStored)
+	indexKeys := global.PendingStakePubkeysForSlot(slotCtx.Slot)
+	// The fold also derives keys from these accepted writes. Track the same
+	// membership here so saved totals and their index digest remain exact even
+	// when speculative execution discarded a pending discovery hint.
+	indexKeys = append(indexKeys, foldStakePubkeys([]accounts.SlotDelta{{Delta: modified}})...)
+	t.stakeTotals.recordSlot(slotCtx.Slot, slotCtx, modified, indexKeys, readStored)
 }
 
 // Add buffers a replayed slot's writes + bankhash in the overlay; it becomes
@@ -596,6 +603,26 @@ func (t *unrootedTail) buildFoldJob(through uint64, force bool, hookOverrides ..
 // the transaction-status checkpoint cleanup after it.
 var foldJobTask = metrics.Background("replay.fold_job", 2*time.Second)
 
+// foldStakePubkeys makes the durable enumeration index follow the actual
+// accepted account writes, independently of speculative execution's pending
+// hints. The index is a superset: stale keys are harmless because scans read
+// their current account state, but omitting a committed stake account changes
+// epoch stake history and rewards.
+func foldStakePubkeys(chunk []accounts.SlotDelta) []solana.PublicKey {
+	var keys []solana.PublicKey
+	for _, delta := range chunk {
+		for _, acct := range delta.Delta {
+			if acct == nil || acct.Owner != addresses.StakeProgramAddr || acct.Lamports == 0 || len(acct.Data) < 4 {
+				continue
+			}
+			if binary.LittleEndian.Uint32(acct.Data) != sealevel.StakeStateV2StatusUninitialized {
+				keys = append(keys, acct.Key)
+			}
+		}
+	}
+	return keys
+}
+
 func runFoldJob(committer batchCommitter, job *foldJob) (err error) {
 	if job == nil {
 		return errors.New("fold job has no resume context")
@@ -660,7 +687,7 @@ func runFoldJob(committer batchCommitter, job *foldJob) (err error) {
 
 	step = time.Now()
 	if job.stakeIdxDir != "" {
-		if _, err := global.FlushPendingStakePubkeysThrough(job.stakeIdxDir, job.through); err != nil {
+		if _, err := global.FlushPendingStakePubkeysThrough(job.stakeIdxDir, job.through, foldStakePubkeys(job.chunk)...); err != nil {
 			return fmt.Errorf("fold chunk through slot %d: flush stake index: %w", job.through, err)
 		}
 	}
@@ -1029,7 +1056,7 @@ func promoteRootedBatchedWithStakeTotals(
 		// the index — a subset — which would silently corrupt the epoch-stakes
 		// scan. Entries for unfolded slots stay in RAM (branch-scoped).
 		if stakeIdxDir != "" {
-			if _, ferr := global.FlushPendingStakePubkeysThrough(stakeIdxDir, chunkThrough); ferr != nil {
+			if _, ferr := global.FlushPendingStakePubkeysThrough(stakeIdxDir, chunkThrough, foldStakePubkeys(chunk)...); ferr != nil {
 				err = fmt.Errorf("promote chunk through slot %d: flush stake index: %w", chunkThrough, ferr)
 				break
 			}
