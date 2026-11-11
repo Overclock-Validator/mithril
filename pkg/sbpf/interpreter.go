@@ -1244,8 +1244,17 @@ func (ip *Interpreter) Translate(addr uint64, size uint64, write bool) ([]byte, 
 
 	ptr, err := ip.translateInternal(addr, size, write)
 	if err != nil {
-		pc, filename, line, _ := runtime.Caller(1)
-		mlog.Log.Debugf("[error] in %s[%s:%d] %v. calling translate on addr = %x, size = %d", runtime.FuncForPC(pc).Name(), filename, line, err, addr, size)
+		// The arguments are the cost here, not the logging: runtime.Caller
+		// unwinds the stack and FuncForPC looks up a symbol, and Go evaluates
+		// both before Debugf can discard the line. A node runs at error level,
+		// so every failed translate paid for a line nobody read. A failed
+		// translate ends the program with an access violation, which is
+		// ordinary for failing mainnet transactions and common in conformance
+		// fixtures.
+		if mlog.Log.DebugEnabled() {
+			pc, filename, line, _ := runtime.Caller(1)
+			mlog.Log.Debugf("[error] in %s[%s:%d] %v. calling translate on addr = %x, size = %d", runtime.FuncForPC(pc).Name(), filename, line, err, addr, size)
+		}
 		return nil, err
 	}
 
