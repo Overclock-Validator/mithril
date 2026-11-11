@@ -49,6 +49,9 @@ jobs:
       - name: Sealevel interpreter, syscall and vote ownership regressions
         run: go test -race -count=1 ./pkg/sealevel
 
+      - name: Gossip and networking regressions
+        run: go test -race -p 2 -count=1 ./pkg/gossip ./pkg/repair ./pkg/blockstream
+
       - name: Account hashing, accelerated and portable
         # The AVX-512 output tests skip on runners without AVX-512F; the
         # layout guard, the startup output check and the purego build run
