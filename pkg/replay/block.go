@@ -63,6 +63,14 @@ type epochRewardReadPublisher interface {
 	ResetEpochRewardView()
 }
 
+type blockHistoryPublisher interface {
+	RecordBlockHistory(block *b.Block) error
+	RecordSkippedBlockHistory(slot uint64) error
+	PrepareBlockHistory(through uint64) error
+	SetRootedBlockHistorySlot(slot uint64) error
+	DiscardUnrootedBlockHistory(from uint64) error
+}
+
 // BlockFetchOpts contains options for parallel block fetching
 type BlockFetchOpts struct {
 	MaxRPS          int    // Rate limit (requests per second), 0 = use default
@@ -1836,6 +1844,7 @@ func ReplayBlocks(
 	onCancelWriteState OnCancelWriteState, // callback to write state immediately on cancellation (can be nil)
 ) *ReplayResult {
 	result := &ReplayResult{}
+	historyPublisher, _ := rpcServer.(blockHistoryPublisher)
 	// Node startup finishes any rewind and reconciles durable state before
 	// calling ReplayBlocks, so the first block's stake scan can start now and
 	// overlap block-source startup and the wait for the first block.
@@ -2186,6 +2195,11 @@ func ReplayBlocks(
 			if err != nil {
 				return nil, err
 			}
+			if historyPublisher != nil {
+				if err := historyPublisher.PrepareBlockHistory(through); err != nil {
+					return nil, fmt.Errorf("prepare block history: %w", err)
+				}
+			}
 			if rewardPublisher != nil {
 				if err := rewardPublisher.PrepareEpochRewards(through); err != nil {
 					return nil, fmt.Errorf("prepare epoch rewards: %w", err)
@@ -2195,9 +2209,13 @@ func ReplayBlocks(
 		},
 		AfterCommit: func(ref *state.TransactionStatusCheckpointRef) error {
 			var err error
+			if historyPublisher != nil {
+				// Forced flushes may commit several chunks before replay applies their results.
+				err = historyPublisher.SetRootedBlockHistorySlot(ref.Root)
+			}
 			if rewardPublisher != nil {
 				// Forced flushes may commit several chunks before replay applies their results.
-				err = rewardPublisher.SetRootedEpochRewardsSlot(ref.Root)
+				err = errors.Join(err, rewardPublisher.SetRootedEpochRewardsSlot(ref.Root))
 			}
 			if checkpointAfterCommit != nil {
 				err = errors.Join(err, checkpointAfterCommit(ref))
@@ -2270,6 +2288,11 @@ func ReplayBlocks(
 		mithrilState.LastRootedSlot = promotedThrough
 		mithrilState.LastRootedBankhash = rootedCtx.Bankhash
 		mithrilState.LastRootedContext = rootedCtx
+		if historyPublisher != nil {
+			if err := historyPublisher.SetRootedBlockHistorySlot(promotedThrough); err != nil {
+				mlog.Log.Errorf("block history retention after rooted slot %d: %v", promotedThrough, err)
+			}
+		}
 		if rewardPublisher != nil {
 			if err := rewardPublisher.SetRootedEpochRewardsSlot(promotedThrough); err != nil {
 				mlog.Log.Errorf("failed to advance rooted epoch rewards through slot %d: %v", promotedThrough, err)
@@ -2725,6 +2748,13 @@ func ReplayBlocks(
 			mlog.Log.Warnf("%v — block source rejected the fork rewind", sw)
 			return false
 		}
+		if historyPublisher != nil {
+			if err := historyPublisher.DiscardUnrootedBlockHistory(sw.Slot); err != nil {
+				result.Error = fmt.Errorf("%w: discard unrooted block history: %v", sw, err)
+				mlog.Log.Warnf("%v", result.Error)
+				return false
+			}
+		}
 		if !parentSwitchNeedsStateUnwind(sw.Slot, currentExecutedAnchorSlot()) {
 			// Trailing skips advance replay's consumed frontier without creating
 			// account-state layers. Finalized ancestry can later require a block
@@ -3167,6 +3197,13 @@ func ReplayBlocks(
 		// Handle skipped slots - log and continue without execution
 		if block.IsSkipped {
 			streamer.discardSlot(block.Slot, "skipped")
+			if historyPublisher != nil {
+				if err := historyPublisher.RecordSkippedBlockHistory(block.Slot); err != nil {
+					result.Error = fmt.Errorf("record skipped block history at slot %d: %w", block.Slot, err)
+					mlog.Log.Errorf("%v", result.Error)
+					break
+				}
+			}
 			// Zero is the explicit locally consumed outcome for a skip. Parent-ID
 			// gap inference is provisional; recording it lets a later certificate
 			// or discovered ancestry require a source rewind and, when necessary,
@@ -3231,8 +3268,15 @@ func ReplayBlocks(
 
 		currentSlot = block.Slot
 		block.Epoch = epochSchedule.GetEpoch(currentSlot)
-		var configErr error
 		initialBlockConfigured := lastSlotCtx == nil
+		var historyParentBlockhash solana.Hash
+		if historyPublisher != nil && initialBlockConfigured {
+			historyParentBlockhash = initialLastBlockhash
+			if resumeState != nil {
+				historyParentBlockhash = solana.Hash(resumeState.LastBlockhash)
+			}
+		}
+		var configErr error
 		// Use lastSlotCtx == nil to detect first block, not currentSlot == startSlot.
 		// This handles the case where startSlot (or slots after it) are skipped -
 		// the first emitted block might have slot > startSlot.
@@ -3449,6 +3493,15 @@ func ReplayBlocks(
 			// Clear any pending stake pubkeys from this failed block
 			global.ClearPendingStakePubkeys()
 			break
+		}
+		if historyPublisher != nil {
+			if historyBlock := blockForHistory(block, historyParentBlockhash); historyBlock != nil {
+				if err := historyPublisher.RecordBlockHistory(historyBlock); err != nil {
+					result.Error = fmt.Errorf("record block history at slot %d: %w", block.Slot, err)
+					mlog.Log.Errorf("%v", result.Error)
+					break
+				}
+			}
 		}
 		if rewardPublisher != nil {
 			if err := rewardPublisher.RecordEpochRewards(block); err != nil {

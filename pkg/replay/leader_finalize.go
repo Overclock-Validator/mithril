@@ -182,6 +182,9 @@ func CommitLeaderSlot(in CommitLeaderInput) (*sealevel.SlotCtx, error) {
 		return nil, err
 	}
 	timings.DistributeFees = time.Since(phaseStartedAt)
+	if err := recordBlockFeeReward(block, slotCtx, &in.TxFeeAccumulator); err != nil {
+		return nil, err
+	}
 	phaseStartedAt = time.Now()
 	var rentSysvar *sealevel.SysvarRent
 	if bankSysvars := slotCtx.BankSysvars(); bankSysvars != nil {
