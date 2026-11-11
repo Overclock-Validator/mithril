@@ -204,6 +204,15 @@ name = "mithril"
     #   ]
     rpc = ["https://api.mainnet-beta.solana.com"]
 
+    # Offline replay (also --offline): replay only blocks already in the local
+    # shred spool, for benchmark corpora. No gossip client, Turbine tree, repair
+    # or Votor listener starts, and rooting follows block footer certificates
+    # only. Requires bootstrap.mode = "accountsdb", consensus.mode = "verifying",
+    # a finite replay range, turbine.shred_version, and block.rpc_fallback off.
+    # rpc above is still used for the startup genesis check, so point it at a
+    # local endpoint. See docs/replay-corpus.md.
+    # offline = false
+
 # ============================================================================
 # [block] - Block Source & Streaming
 # ============================================================================
