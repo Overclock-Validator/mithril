@@ -777,6 +777,7 @@ func processTransactionWithTimings(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.
 		// consumers of pre-balances. Ordinary production transactions skip it.
 		CapturePreBalances: txMeta != nil || captureTx,
 		RecordLogs:         debugTx,
+		SkipTimingMetrics:  SkipPhaseTimers,
 	}
 	input.TimingRecorder = timings
 	output := LoadAndExecuteTransaction(input)

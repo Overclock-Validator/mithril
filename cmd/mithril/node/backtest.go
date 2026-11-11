@@ -24,6 +24,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// replayPhaseTimers mirrors --replay-phase-timers.
+var replayPhaseTimers = true
+
 // backtestMode is set while `mithril backtest` drives the node in-process.
 var backtestMode bool
 
@@ -36,7 +39,7 @@ var bt struct {
 	cluster, genesisHash                              string
 	endSlot, measureFrom                              uint64
 	warmup, txpar                                     int
-	verifySignatures                                  bool
+	verifySignatures, phaseTimers                     bool
 }
 
 // Backtest replays a shredcap capture offline, the way firedancer-dev
@@ -71,6 +74,7 @@ func init() {
 	f.Uint64Var(&bt.measureFrom, "measure-from", 0, "Leave blocks before this slot out of the timing summary")
 	f.IntVar(&bt.warmup, "warmup", 30, "Leading measured blocks left out of the timing summary")
 	f.IntVar(&bt.txpar, "txpar", 8, "Transaction execution workers")
+	f.BoolVar(&bt.phaseTimers, "phase-timers", true, "Time each transaction phase and instruction dispatch, as a live node does (off saves the timer calls; SlotReplay and TxLoop are timed either way)")
 	f.BoolVar(&bt.verifySignatures, "verify-shred-signatures", false, "Check every shred's leader signature as replay reads it (off by default, like firedancer-dev backtest; adds signature work to the timed run)")
 }
 
@@ -202,6 +206,7 @@ func runBacktest(cmd *cobra.Command, _ []string) error {
 		"offline":               "true",
 		"turbine-shred-version": strconv.Itoa(int(man.ShredVersion)),
 		"scratch-directory":     filepath.Join(workdir, "scratch"),
+		"replay-phase-timers":   strconv.FormatBool(bt.phaseTimers),
 	}
 	if plan.Bootstrap == "snapshot" {
 		flags["snapshot"] = bt.snapshot
@@ -405,6 +410,7 @@ func backtestSettings(man *shredcap.Manifest) [][2]string {
 		{"GOMAXPROCS", strconv.Itoa(runtime.GOMAXPROCS(0))},
 		{"usable CPUs", strconv.Itoa(runtime.NumCPU())},
 		{"txpar", strconv.Itoa(bt.txpar)},
+		{"phase timers", map[bool]string{true: "on (as a live node)", false: "off (--phase-timers=false)"}[bt.phaseTimers]},
 		{"shred signatures", map[bool]string{true: "checked (--verify-shred-signatures)", false: "not checked (as firedancer-dev backtest)"}[bt.verifySignatures]},
 		{"MITHRIL_SBPF_ASM_LOOP", asm},
 		{"memory limit", limit},

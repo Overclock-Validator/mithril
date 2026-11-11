@@ -14,6 +14,12 @@ import (
 // record, as Firedancer's backtest does. A normal node leaves it nil.
 var CaptureBankHashes map[uint64][32]byte
 
+// SkipPhaseTimers turns off replay's per-transaction and instruction-dispatch
+// phase timers (the detail behind TxLoop), as block production already does.
+// Block-level intervals such as SlotReplay and TxLoop are unaffected; the
+// per-transaction timing fields of the replay rows stay empty.
+var SkipPhaseTimers bool
+
 // ErrCaptureBankHash marks a block whose bank hash disagrees with the capture
 // or is missing from it.
 var ErrCaptureBankHash = errors.New("capture bank hash check failed")

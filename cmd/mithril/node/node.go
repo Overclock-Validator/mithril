@@ -630,6 +630,7 @@ func init() {
 	Run.Flags().BoolVar(&blockRPCFallback, "rpc-fallback", false, "Allow RPC to fetch blocks when replay is more than repair-catchup-max-gap-slots behind (default false: shreds via turbine + repair are the only block path)")
 	Run.Flags().StringVar(&turbineAdvertisedIP, "turbine-advertised-ip", "", "Public IP advertised by native turbine gossip (optional)")
 	Run.Flags().IntVar(&turbineShredVersion, "turbine-shred-version", 0, "Shred version for native turbine gossip (0 = discover from entrypoint)")
+	Run.Flags().BoolVar(&replayPhaseTimers, "replay-phase-timers", true, "Time each transaction phase and instruction dispatch during replay (the detail behind TxLoop); off saves the timer calls")
 	Run.Flags().BoolVar(&offlineReplay, "offline", false, "Replay only from the local shred spool: no gossip, Turbine tree, repair or Votor listener (corpus replays; needs --end-slot and --bootstrap accountsdb)")
 	Run.Flags().StringSlice("shred-receiver-address", nil, "Also send every shred this validator broadcasts to this host:port (repeatable), e.g. a block builder")
 	Run.Flags().StringSlice("shred-retransmit-receiver-address", nil, "Also send every shred this node relays to this host:port (repeatable), e.g. a block builder")
@@ -1257,6 +1258,8 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	sbpf.UsePool = getBool("use-pool", "tuning.use_pool")
 	// [tuning] streaming execution (on by default; Alpenglow turbine only).
 	replay.StreamingExecutionCfg.Enabled = getBool("streaming-execution", "tuning.streaming_execution")
+	replayPhaseTimers = getBool("replay-phase-timers", "tuning.replay_phase_timers")
+	replay.SkipPhaseTimers = !replayPhaseTimers
 	replay.StreamingExecutionCfg.Workers = getInt("streaming-workers", "tuning.streaming_workers")
 	replay.StreamingExecutionCfg.MinGroupBatches = getInt("streaming-min-group-batches", "tuning.streaming_min_group_batches")
 	if ms := getInt("streaming-max-open-ms", "tuning.streaming_max_open_ms"); ms > 0 {

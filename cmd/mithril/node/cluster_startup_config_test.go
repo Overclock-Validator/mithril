@@ -69,6 +69,12 @@ var clusterConfigCases = []struct {
 		require.Empty(t, rpcEndpoints)
 		require.Equal(t, "private", cluster)
 	}},
+	{name: "replay phase timers default on", body: "[network]\ncluster = 'devnet'\n", check: func(t *testing.T) {
+		require.False(t, replay.SkipPhaseTimers)
+	}},
+	{name: "replay phase timers can be turned off", body: "[network]\ncluster = 'devnet'\n[tuning]\nreplay_phase_timers = false\n", check: func(t *testing.T) {
+		require.True(t, replay.SkipPhaseTimers)
+	}},
 	{name: "offline replay builds from local snapshot files", body: strings.Replace(offlineReplayConfig, "mode = 'accountsdb'", "mode = 'snapshot'", 1) + "[ledger]\nsnapshot_archive_path = '/data/snapshot-100-11111111111111111111111111111111.tar.zst'\n", check: func(t *testing.T) {
 		require.True(t, offlineReplay)
 		require.NotEmpty(t, snapshotArchivePath)
