@@ -1080,6 +1080,15 @@ func (r *UDPReceiver) hydrateLoop(ctx context.Context) {
 				if perr != nil {
 					continue
 				}
+				if VerifySpooledShreds {
+					if verr := r.verifySpooledShred(shred); verr != nil {
+						r.signatureErrors.Add(1)
+						if hook := OnSpooledShredRejected; hook != nil {
+							hook(slot, verr)
+						}
+						continue
+					}
+				}
 				if r.repairClient != nil {
 					r.repairClient.satisfyDataShred(shred)
 				}

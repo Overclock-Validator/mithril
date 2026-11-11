@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
@@ -18,6 +19,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/replay"
 	"github.com/Overclock-Validator/mithril/pkg/shredcap"
 	"github.com/Overclock-Validator/mithril/pkg/state"
+	"github.com/Overclock-Validator/mithril/pkg/turbine"
 	"github.com/gagliardetto/solana-go"
 	"github.com/spf13/cobra"
 )
@@ -34,6 +36,7 @@ var bt struct {
 	cluster, genesisHash                              string
 	endSlot, measureFrom                              uint64
 	warmup, txpar                                     int
+	verifySignatures                                  bool
 }
 
 // Backtest replays a shredcap capture offline, the way firedancer-dev
@@ -68,6 +71,7 @@ func init() {
 	f.Uint64Var(&bt.measureFrom, "measure-from", 0, "Leave blocks before this slot out of the timing summary")
 	f.IntVar(&bt.warmup, "warmup", 30, "Leading measured blocks left out of the timing summary")
 	f.IntVar(&bt.txpar, "txpar", 8, "Transaction execution workers")
+	f.BoolVar(&bt.verifySignatures, "verify-shred-signatures", false, "Check every shred's leader signature as replay reads it (off by default, like firedancer-dev backtest; adds signature work to the timed run)")
 }
 
 func runBacktest(cmd *cobra.Command, _ []string) error {
@@ -231,8 +235,31 @@ func runBacktest(cmd *cobra.Command, _ []string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var rejected struct {
+		sync.Mutex
+		err error
+	}
+	if bt.verifySignatures {
+		turbine.VerifySpooledShreds = true
+		turbine.OnSpooledShredRejected = func(slot uint64, err error) {
+			rejected.Lock()
+			defer rejected.Unlock()
+			if rejected.err == nil {
+				rejected.err = fmt.Errorf("shred signature check failed: %w", err)
+				cancel() // the slot cannot complete; stop instead of waiting for it
+			}
+		}
+	}
 	Run.SetContext(ctx) // runLive derives its run context from the command
 	runLive(&Run, nil)
+	rejected.Lock()
+	rejectErr := rejected.err
+	rejected.Unlock()
+	if rejectErr != nil {
+		return rejectErr
+	}
 
 	if plan.Bootstrap == "snapshot" {
 		marker.SnapshotSlot = snapshotSlot
@@ -383,6 +410,7 @@ func backtestSettings(man *shredcap.Manifest, stub *genesisStub) [][2]string {
 		{"GOMAXPROCS", strconv.Itoa(runtime.GOMAXPROCS(0))},
 		{"usable CPUs", strconv.Itoa(runtime.NumCPU())},
 		{"txpar", strconv.Itoa(bt.txpar)},
+		{"shred signatures", map[bool]string{true: "checked (--verify-shred-signatures)", false: "not checked (as firedancer-dev backtest)"}[bt.verifySignatures]},
 		{"MITHRIL_SBPF_ASM_LOOP", asm},
 		{"memory limit", limit},
 		{"shred version", strconv.Itoa(int(man.ShredVersion))},
