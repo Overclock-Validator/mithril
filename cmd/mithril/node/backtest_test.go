@@ -9,8 +9,10 @@ import (
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/config"
+	"github.com/Overclock-Validator/mithril/pkg/shredcap"
 	"github.com/Overclock-Validator/mithril/pkg/state"
 	"github.com/Overclock-Validator/mithril/pkg/turbine"
+	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/require"
 )
 
@@ -314,4 +316,74 @@ func TestFailedFirstImportLeavesAnAcceptedWorkdir(t *testing.T) {
 	again, err := openBacktestWorkdir(workdir)
 	require.NoError(t, err, "a failed import must not lock the workdir out")
 	require.Equal(t, fp, again.Capture)
+}
+
+// oneSlotCapture is a valid capture of slot 100 whose bank hash record is hash.
+func oneSlotCapture(t *testing.T, hash [32]byte) []byte {
+	t.Helper()
+	leader, err := solana.NewRandomPrivateKey()
+	require.NoError(t, err)
+	gen := turbine.ShredGenerator{Slot: 100, ParentSlot: 99, Version: 7}
+	packets, _, _, _, err := gen.MakeShredsFromData(leader, nil, true, solana.Hash{}, 0, 0)
+	require.NoError(t, err)
+	var b bytes.Buffer
+	w, err := shredcap.NewWriter(&b, "test")
+	require.NoError(t, err)
+	for _, p := range packets {
+		s, err := turbine.ParseShred(p)
+		require.NoError(t, err)
+		if s.Type == turbine.ShredTypeData {
+			require.NoError(t, w.WriteShred(p))
+		}
+	}
+	require.NoError(t, w.WriteBankHash(100, hash, uint64(len(packets))))
+	require.NoError(t, w.WriteRootSlot(100))
+	require.NoError(t, w.Flush())
+	return b.Bytes()
+}
+
+// Different captures that share name, size and mtime must not share an
+// import (regression found by Codex's review).
+func TestBacktestCorpusFollowsCaptureContents(t *testing.T) {
+	resetBacktestOptions(t)
+	a, b := [32]byte{1}, [32]byte{2}
+	stamp := time.Unix(1700000000, 0)
+	write := func(path string, data []byte) {
+		require.NoError(t, os.WriteFile(path, data, 0o600))
+		require.NoError(t, os.Chtimes(path, stamp, stamp))
+	}
+	importFrom := func(workdir string, marker *backtestMarker, path string) string {
+		bt.capture = path
+		fp, err := fingerprintCapture(path)
+		require.NoError(t, err)
+		man, err := backtestCorpus(&Backtest, workdir, marker, fp, 0)
+		require.NoError(t, err)
+		return man.BankHashes["100"]
+	}
+
+	// Same basename in two directories, equal size and mtime.
+	pathA := filepath.Join(t.TempDir(), "shredcap.pcapng")
+	pathB := filepath.Join(t.TempDir(), "shredcap.pcapng")
+	dataA, dataB := oneSlotCapture(t, a), oneSlotCapture(t, b)
+	require.Equal(t, len(dataA), len(dataB))
+	write(pathA, dataA)
+	write(pathB, dataB)
+	workdir := t.TempDir()
+	marker := backtestMarker{Version: 1}
+	require.Equal(t, solana.Hash(a).String(), importFrom(workdir, &marker, pathA))
+	require.Equal(t, solana.Hash(b).String(), importFrom(workdir, &marker, pathB), "the selected capture is the one imported")
+
+	// The same path replaced in place by an equal-size capture within the same second.
+	write(pathA, dataB)
+	marker = backtestMarker{Version: 1}
+	workdir = t.TempDir()
+	write(pathA, dataA)
+	require.Equal(t, solana.Hash(a).String(), importFrom(workdir, &marker, pathA))
+	write(pathA, dataB)
+	require.Equal(t, solana.Hash(b).String(), importFrom(workdir, &marker, pathA))
+
+	// Unchanged contents reuse the import even after the file is touched.
+	stamp = stamp.Add(time.Hour)
+	write(pathA, dataB)
+	require.Equal(t, solana.Hash(b).String(), importFrom(workdir, &marker, pathA))
 }

@@ -1,6 +1,8 @@
 package node
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,7 +31,8 @@ const backtestMarkerName = "BACKTEST.json"
 
 type backtestMarker struct {
 	Version int `json:"version"`
-	// Capture identifies the imported capture by name, size and mtime.
+	// Capture identifies the imported capture; its SHA-256 decides whether an
+	// earlier import is the selected capture.
 	Capture captureFingerprint `json:"capture"`
 	// FromSlot is the first slot the import kept (the slot after the
 	// snapshot for --snapshot runs, else 0).
@@ -39,21 +42,36 @@ type backtestMarker struct {
 	SnapshotSlot uint64 `json:"snapshot_slot,omitempty"`
 }
 
+// captureFingerprint identifies a capture by the SHA-256 of its contents.
+// Name, size and mtime are kept for messages only: two different captures can
+// share all three (a common file name in two directories, or a same-size
+// replacement within a second), and reusing one's import for the other would
+// make the wrong capture's bank hashes the check.
 type captureFingerprint struct {
 	Name    string `json:"name"`
 	Size    int64  `json:"size"`
 	ModUnix int64  `json:"mod_unix"`
+	SHA256  string `json:"sha256"`
 }
 
 func fingerprintCapture(path string) (captureFingerprint, error) {
-	info, err := os.Stat(path)
+	f, err := os.Open(path)
+	if err != nil {
+		return captureFingerprint{}, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
 	if err != nil {
 		return captureFingerprint{}, err
 	}
 	if info.IsDir() {
 		return captureFingerprint{}, fmt.Errorf("%s is a directory, not a capture file", path)
 	}
-	return captureFingerprint{Name: filepath.Base(path), Size: info.Size(), ModUnix: info.ModTime().Unix()}, nil
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return captureFingerprint{}, fmt.Errorf("hash %s: %w", path, err)
+	}
+	return captureFingerprint{Name: filepath.Base(path), Size: info.Size(), ModUnix: info.ModTime().Unix(), SHA256: hex.EncodeToString(h.Sum(nil))}, nil
 }
 
 // openBacktestWorkdir creates dir, or accepts it when it is empty or already a

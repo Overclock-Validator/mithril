@@ -337,13 +337,17 @@ func runBacktest(cmd *cobra.Command, _ []string) error {
 // earlier import of the same capture and slot range.
 func backtestCorpus(cmd *cobra.Command, workdir string, marker *backtestMarker, fp captureFingerprint, fromSlot uint64) (*shredcap.Manifest, error) {
 	corpusDir := filepath.Join(workdir, "corpus")
-	if marker.Capture == fp && marker.FromSlot == fromSlot {
+	// The import is reused only for the same capture contents: name, size and
+	// mtime can coincide between different captures.
+	sameCapture := fp.SHA256 != "" && marker.Capture.SHA256 == fp.SHA256
+	if sameCapture && marker.FromSlot == fromSlot {
 		if man, err := shredcap.ReadManifest(corpusDir); err == nil {
 			return man, nil
 		}
 	}
-	if marker.Capture != fp && marker.SnapshotSlot != 0 {
-		return nil, fmt.Errorf("%s holds runs of capture %s; use a new --workdir for %s", workdir, marker.Capture.Name, fp.Name)
+	if !sameCapture && marker.SnapshotSlot != 0 {
+		return nil, fmt.Errorf("%s holds runs of a different capture (%s, sha256 %.12s); use a new --workdir for %s (sha256 %.12s)",
+			workdir, marker.Capture.Name, marker.Capture.SHA256, fp.Name, fp.SHA256)
 	}
 	if err := os.RemoveAll(corpusDir); err != nil {
 		return nil, err

@@ -82,7 +82,8 @@ stops the run.
 
 ## Repeat runs and disk
 
-The work directory is reused: the imported capture (`corpus/`) is kept, and
+The work directory is reused: the imported capture (`corpus/`) is kept for
+as long as the capture's contents (SHA-256) are unchanged, and
 the AccountsDB is rewound rather than rebuilt.
 
 - With `--accounts`, a store that has replayed past the capture's start is
@@ -156,9 +157,11 @@ process start.
 | `total_s` | boot to finish | process start to the last block's completion |
 
 `MITHRIL_EXTRA` has what Firedancer has no field for. `import_s` runs from
-process start to node start: the capture import (near zero when an earlier
-import is reused) and preparing the work directory (restoring the shred spool,
-writing the node configuration). Firedancer reads the capture while replaying,
+process start to node start: hashing the capture (SHA-256, so an earlier
+import is reused only for the same capture contents; about a second per
+500 MB), the capture import (skipped when an earlier import is reused), and
+preparing the work directory (restoring the shred spool, writing the node
+configuration). Firedancer reads the capture while replaying,
 so its decoding time is inside its `replay_s`, while Mithril imports it first.
 So `total_s = import_s + load_total_s + replay_s`, and `load_total_s` covers
 state loading only, as Firedancer's does. `shutdown_s` is the node's shutdown
