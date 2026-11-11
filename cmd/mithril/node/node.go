@@ -851,6 +851,9 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		blockstorePath = getString("ledger-path", "ledger.path")
 	}
 
+	// Offline replay is read first: it changes what the network settings mean.
+	offlineReplay = getBool("offline", "network.offline")
+
 	// [network] section (with fallback to legacy [rpc] keys)
 	rpcEndpoints = getStringSlice("rpc", "network.rpc")
 	if len(rpcEndpoints) == 0 {
@@ -868,7 +871,14 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		return err
 	}
 	cluster = clusterInfo.Name
-	if len(rpcEndpoints) == 0 {
+	if offlineReplay {
+		// Offline replay makes no RPC calls: the genesis check uses the
+		// cluster setting, and nothing polls a tip or fetches blocks.
+		if len(rpcEndpoints) > 0 {
+			mlog.Log.Infof("offline replay: ignoring network.rpc")
+		}
+		rpcEndpoints = nil
+	} else if len(rpcEndpoints) == 0 {
 		if clusterInfo.Custom {
 			return fmt.Errorf("custom network.cluster %q requires network.rpc", cluster)
 		}
@@ -1035,7 +1045,6 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		}
 	}
 
-	offlineReplay = getBool("offline", "network.offline")
 	if err := applyOfflineReplay(); err != nil {
 		return err
 	}
@@ -1069,7 +1078,7 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		if turbineShredVersion < 0 || turbineShredVersion > 0xffff {
 			return fmt.Errorf("turbine.shred_version must be between 0 and 65535")
 		}
-		if len(rpcEndpoints) == 0 {
+		if len(rpcEndpoints) == 0 && !offlineReplay {
 			return fmt.Errorf("block.source=turbine requires RPC endpoints for catchup and tip polling (set network.rpc)")
 		}
 	default:
@@ -1477,7 +1486,14 @@ func runLive(c *cobra.Command, args []string) {
 	// it before Lightbringer can open ledger storage and before history records
 	// describe any mutation. Fetch genesis exactly once and carry that value
 	// through every fresh ready-state write below.
-	networkGenesisHash := fetchGenesisHash(ctx)
+	var networkGenesisHash string
+	if offlineReplay {
+		// No network to ask: the configured cluster names the chain, and the
+		// checks below still refuse an AccountsDB or ledger from another one.
+		networkGenesisHash = clusterInfo.GenesisHash
+	} else {
+		networkGenesisHash = fetchGenesisHash(ctx)
+	}
 	if networkGenesisHash == "" {
 		klog.Fatalf("FATAL: could not confirm the RPC genesis hash; refusing startup because AccountsDB, shred spool, and vote-history lineage cannot be validated")
 	}

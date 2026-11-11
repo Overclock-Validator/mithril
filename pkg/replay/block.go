@@ -1653,6 +1653,9 @@ func initializeBlockHeight(rpcc *rpcclient.RpcClient, mithrilState *state.Mithri
 	case resumeState != nil:
 		if resumeState.ParentSlot > 0 && resumeState.ParentBlockHeight == 0 {
 			mlog.Log.Warnf("resume state missing last block height for slot %d; fetching from RPC", resumeState.ParentSlot)
+			if rpcc == nil {
+				return fmt.Errorf("resume state lacks the block height for slot %d and no RPC endpoint is configured to fetch it", resumeState.ParentSlot)
+			}
 			blockResult, err := rpcc.GetBlockConfirmed(resumeState.ParentSlot)
 			if err != nil {
 				return fmt.Errorf("failed to fetch block height for resume slot %d: %w", resumeState.ParentSlot, err)
@@ -1666,6 +1669,9 @@ func initializeBlockHeight(rpcc *rpcclient.RpcClient, mithrilState *state.Mithri
 	case mithrilState != nil:
 		if mithrilState.ManifestParentSlot > 0 && mithrilState.ManifestBlockHeight == 0 {
 			mlog.Log.Warnf("state file missing manifest block height for snapshot slot %d; fetching from RPC", mithrilState.ManifestParentSlot)
+			if rpcc == nil {
+				return fmt.Errorf("state file lacks the block height for snapshot slot %d and no RPC endpoint is configured to fetch it", mithrilState.ManifestParentSlot)
+			}
 			blockResult, err := rpcc.GetBlockConfirmed(mithrilState.ManifestParentSlot)
 			if err != nil {
 				return fmt.Errorf("failed to fetch block height for snapshot slot %d: %w", mithrilState.ManifestParentSlot, err)
@@ -1907,7 +1913,11 @@ func ReplayBlocks(
 	// RPC client for cluster data. Verifying/RPC-source flows may fetch blocks;
 	// validator mode restricts it to control-plane queries.
 	// First endpoint is primary, rest are backups for failover
-	rpcc := rpcclient.NewRpcClient(rpcEndpoints[0])
+	// Offline replay configures no endpoint and gets a nil client.
+	var rpcc *rpcclient.RpcClient
+	if len(rpcEndpoints) > 0 {
+		rpcc = rpcclient.NewRpcClient(rpcEndpoints[0])
+	}
 	var rpcBackups []string
 	if len(rpcEndpoints) > 1 {
 		rpcBackups = rpcEndpoints[1:]
@@ -2244,7 +2254,9 @@ func ReplayBlocks(
 	// chain decisions, including ancestry discovered after a certificate.
 	switchSweeper := newAlpenglowSwitchSweeper(consensusEngine)
 
-	if TrailingVerifierCfg.Enabled {
+	if TrailingVerifierCfg.Enabled && len(rpcEndpoints) == 0 {
+		mlog.Log.Warnf("trailing verifier disabled: it compares against an RPC endpoint and none is configured")
+	} else if TrailingVerifierCfg.Enabled {
 		trailingVerifier = newTrailingVerifier(&rpcVerificationSource{rpcc: rpcclient.NewRpcClient(rpcEndpoints[0])}, TrailingVerifierCfg)
 		go trailingVerifier.Run(ctx)
 		// Publish a run-local tx-capture registry for the verifier's lifetime and
@@ -3131,7 +3143,7 @@ func ReplayBlocks(
 			rooted, ok := uint64(0), false
 			if certRooted, certOk := alpenglowRootedSlot(consensusEngine); certOk {
 				rooted, ok = certRooted, true
-			} else if DelegatedFinalityEnabled {
+			} else if DelegatedFinalityEnabled && rpcc != nil {
 				if time.Since(delegatedFinalizedAt) > 2*time.Second {
 					// Record the attempt time regardless of outcome, so an RPC
 					// outage doesn't re-issue a blocking poll on every block.

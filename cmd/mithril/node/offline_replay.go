@@ -13,8 +13,8 @@ import (
 // gossip client, Turbine tree, repair, shred-version query or Votor listener,
 // so a benchmark replay sends nothing to the cluster and spends none of its
 // pinned cores on network traffic. Rooting follows block footer certificates
-// only. network.rpc is still used for the startup genesis check and background
-// tip polling, so point it at a local endpoint.
+// only, and no RPC call is made: network.rpc is ignored, the startup genesis
+// check uses the cluster setting, and no tip is polled.
 var offlineReplay bool
 
 // applyOfflineReplay checks that the configuration can run without the

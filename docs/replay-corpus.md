@@ -46,8 +46,13 @@ Not yet verified: a capture exported by Mithril has not been run through
 `mithril run --offline` (or `network.offline = true`) replays only what is in
 the local shred spool. It starts no gossip client, Turbine tree, repair or
 Votor listener, binds the shred receiver to loopback, and takes rooting from
-block footer certificates only. It refuses to start unless the configuration
-has `bootstrap.mode = "accountsdb"`, verifying consensus mode, a finite replay
-range (`replay.end_slot` or `replay.num_slots`), `turbine.shred_version`, and
-`block.rpc_fallback` off, and says which is missing. `network.rpc` is still
-used for the startup genesis check, so point it at a local endpoint.
+block footer certificates only. It makes no RPC calls: `network.rpc` is
+ignored, the startup genesis check uses the cluster setting, and no tip is
+polled. It refuses to start unless the configuration has
+`bootstrap.mode = "accountsdb"` or local snapshot files (`--snapshot`),
+verifying consensus mode, a finite replay range (`replay.end_slot` or
+`replay.num_slots`), `turbine.shred_version`, and `block.rpc_fallback` off, and
+says which is missing.
+
+`mithril backtest` wraps all of this in one command for a shredcap capture:
+see [backtest.md](backtest.md).

@@ -2,9 +2,6 @@ package node
 
 import (
 	"bytes"
-	"encoding/json"
-	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -115,32 +112,6 @@ func TestRestoreBacktestSpoolKeepsTheCorpus(t *testing.T) {
 	require.Equal(t, "idx", string(idx))
 }
 
-func TestGenesisStubAnswersOnlyGenesisHash(t *testing.T) {
-	stub, err := startGenesisStub("5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d")
-	require.NoError(t, err)
-	defer stub.Close()
-	require.True(t, strings.HasPrefix(stub.URL, "http://127.0.0.1:"))
-
-	post := func(body string) []byte {
-		resp, err := http.Post(stub.URL, "application/json", bytes.NewBufferString(body))
-		require.NoError(t, err)
-		defer resp.Body.Close()
-		out, err := io.ReadAll(resp.Body)
-		require.NoError(t, err)
-		return out
-	}
-	var single map[string]any
-	require.NoError(t, json.Unmarshal(post(`{"jsonrpc":"2.0","id":1,"method":"getGenesisHash"}`), &single))
-	require.Equal(t, "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d", single["result"])
-
-	var batch []map[string]any
-	require.NoError(t, json.Unmarshal(post(`[{"jsonrpc":"2.0","id":1,"method":"getSlot"},{"jsonrpc":"2.0","id":2,"method":"getGenesisHash"}]`), &batch))
-	require.Len(t, batch, 2)
-	require.NotNil(t, batch[0]["error"])
-	require.Equal(t, "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d", batch[1]["result"])
-	require.Equal(t, int64(1), stub.Rejected.Load())
-}
-
 func TestSummarizeBacktest(t *testing.T) {
 	ms := int64(1_000_000)
 	rows := []timingRow{
@@ -189,18 +160,19 @@ func TestReadTimingRows(t *testing.T) {
 func TestBacktestConfigStaysInsideTheWorkdir(t *testing.T) {
 	mainnet, err := config.ResolveCluster("mainnet", "")
 	require.NoError(t, err)
-	cfg := backtestConfig(mainnet, "http://127.0.0.1:4000", "/w/accounts", "/w", 50093, 8, 64)
+	cfg := backtestConfig(mainnet, "/w/accounts", "/w", 50093, 8, 64)
 	for _, want := range []string{
 		`accounts = "/w/accounts"`, `logs = "/w/logs"`, `shredstore = "/w/shred"`, `snapshots = "/w/snapshots"`,
-		`rpc = ["http://127.0.0.1:4000"]`, "offline = true", "shred_version = 50093", "[storage.compact]\nenabled = false",
+		"offline = true", "shred_version = 50093", "[storage.compact]\nenabled = false",
 		"[verifier]\nenabled = false", "[rpc]\nport = 0", "txpar = 8", "rewind_horizon_batches = 64",
 	} {
 		require.Contains(t, cfg, want)
 	}
 	require.NotContains(t, cfg, "/mnt/")
+	require.NotContains(t, cfg, "rpc =", "an offline node needs no RPC endpoint")
 	require.NotContains(t, cfg, "genesis_hash", "a built-in cluster carries its own genesis hash")
 
 	custom, err := config.ResolveCluster("private", "11111111111111111111111111111111")
 	require.NoError(t, err)
-	require.Contains(t, backtestConfig(custom, "u", "/s", "/w", 1, 8, 64), `genesis_hash = "11111111111111111111111111111111"`)
+	require.Contains(t, backtestConfig(custom, "/s", "/w", 1, 8, 64), `genesis_hash = "11111111111111111111111111111111"`)
 }

@@ -206,11 +206,12 @@ name = "mithril"
 
     # Offline replay (also --offline): replay only blocks already in the local
     # shred spool, for benchmark corpora. No gossip client, Turbine tree, repair
-    # or Votor listener starts, and rooting follows block footer certificates
-    # only. Requires bootstrap.mode = "accountsdb", consensus.mode = "verifying",
-    # a finite replay range, turbine.shred_version, and block.rpc_fallback off.
-    # rpc above is still used for the startup genesis check, so point it at a
-    # local endpoint. See docs/replay-corpus.md.
+    # or Votor listener starts, rooting follows block footer certificates only,
+    # and rpc above is ignored (the genesis check uses the cluster setting).
+    # Requires bootstrap.mode = "accountsdb" or local snapshot files,
+    # consensus.mode = "verifying", a finite replay range,
+    # turbine.shred_version, and block.rpc_fallback off. See
+    # docs/replay-corpus.md and docs/backtest.md.
     # offline = false
 
 # ============================================================================

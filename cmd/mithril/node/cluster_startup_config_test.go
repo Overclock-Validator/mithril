@@ -56,10 +56,19 @@ var clusterConfigCases = []struct {
 		require.Equal(t, "127.0.0.1:0", turbineBindAddr)
 		require.Equal(t, 50093, turbineShredVersion)
 		require.False(t, replay.DelegatedFinalityEnabled, "offline rooting follows footer certificates only")
+		require.Empty(t, rpcEndpoints, "offline replay ignores network.rpc")
 	}},
 	{name: "offline replay needs a shred version", body: strings.Replace(offlineReplayConfig, "shred_version = 50093", "shred_version = 0", 1), wantErr: "turbine.shred_version"},
 	{name: "offline replay needs a finite range", body: strings.Replace(offlineReplayConfig, "end_slot = 100", "end_slot = -1", 1), wantErr: "replay.end_slot or replay.num_slots"},
 	{name: "offline replay needs an existing AccountsDB", body: strings.Replace(offlineReplayConfig, "mode = 'accountsdb'", "mode = 'auto'", 1), wantErr: "bootstrap.mode=accountsdb"},
+	{name: "offline replay on a built-in cluster does not default to its public RPC", body: strings.Replace(offlineReplayConfig, "rpc = ['http://127.0.0.1:8899']\n", "", 1), check: func(t *testing.T) {
+		require.Empty(t, rpcEndpoints)
+		require.Equal(t, "turbine", blockSource)
+	}},
+	{name: "offline replay on a custom cluster needs no RPC", body: strings.Replace(strings.Replace(offlineReplayConfig, "cluster = 'mainnet'", "cluster = 'private'\ngenesis_hash = '11111111111111111111111111111111'", 1), "rpc = ['http://127.0.0.1:8899']\n", "", 1) + "[block]\nsource = 'turbine'\n", check: func(t *testing.T) {
+		require.Empty(t, rpcEndpoints)
+		require.Equal(t, "private", cluster)
+	}},
 	{name: "offline replay builds from local snapshot files", body: strings.Replace(offlineReplayConfig, "mode = 'accountsdb'", "mode = 'snapshot'", 1) + "[ledger]\nsnapshot_archive_path = '/data/snapshot-100-11111111111111111111111111111111.tar.zst'\n", check: func(t *testing.T) {
 		require.True(t, offlineReplay)
 		require.NotEmpty(t, snapshotArchivePath)

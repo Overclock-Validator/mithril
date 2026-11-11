@@ -5,8 +5,8 @@ how long replay took, the way `firedancer-dev backtest` does. Given the same
 capture and starting state, Mithril and Firedancer execute exactly the same
 blocks.
 
-The node opens no network sockets except a loopback listener inside the
-process, starts from local snapshot files or an existing AccountsDB, reads
+The node uses no network and no RPC endpoint: no gossip, Turbine, repair or
+RPC calls. It starts from local snapshot files or an existing AccountsDB, reads
 every block from the capture, checks every block's bank hash against the
 capture, and stops at the capture's last block.
 
@@ -168,7 +168,7 @@ was not established here.
   its slot leader when replay reads it (one signature check per FEC set, cached)
   and stops with exit status 1 on the first failure. It adds that work to the
   timed run, so leave it off when comparing timings with Firedancer.
-- **RPC.** The node's only RPC endpoint is the loopback listener in the
-  backtest process. It answers `getGenesisHash` from the cluster setting and
-  rejects everything else; the summary counts the rejected calls (background
-  tip polling).
+- **RPC.** Neither uses one. Mithril's offline mode takes the genesis hash
+  from the cluster setting (`--cluster`, or `--genesis-hash` for a custom
+  cluster), still refusing an AccountsDB from another chain, and runs no tip
+  polling.
