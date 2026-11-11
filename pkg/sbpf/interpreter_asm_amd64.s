@@ -2100,6 +2100,38 @@ TEXT asmOpExit<>(SB), NOSPLIT|NOFRAME, $0-88
 out:
 	LEAVE
 
+TEXT asmOpNeg64<>(SB), NOSPLIT|NOFRAME, $0-88
+	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
+	MOVBLZX AH, BX
+	ANDL $15, BX
+	NEGQ (DI)(BX*8)
+	NEXT
+out:
+	LEAVE
+
+TEXT asmOpNeg32<>(SB), NOSPLIT|NOFRAME, $0-88
+	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
+	MOVBLZX AH, BX
+	ANDL $15, BX
+	MOVL (DI)(BX*8), DX
+	NEGL DX
+	MOVLQSX DX, DX
+	MOVQ DX, (DI)(BX*8)
+	NEXT
+out:
+	LEAVE
+
+TEXT asmOpHor64<>(SB), NOSPLIT|NOFRAME, $0-88
+	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
+	MOVBLZX AH, BX
+	ANDL $15, BX
+	SHRQ $32, AX
+	SHLQ $32, AX
+	ORQ AX, (DI)(BX*8)
+	NEXT
+out:
+	LEAVE
+
 TEXT asmOpSBail<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	LEAVE
@@ -4142,6 +4174,38 @@ TEXT asmOpSExit<>(SB), NOSPLIT|NOFRAME, $0-88
 out:
 	LEAVE
 
+TEXT asmOpSNeg64<>(SB), NOSPLIT|NOFRAME, $0-88
+	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
+	MOVBLZX AH, BX
+	ANDL $15, BX
+	NEGQ (DI)(BX*8)
+	NEXTSHARED
+out:
+	LEAVE
+
+TEXT asmOpSNeg32<>(SB), NOSPLIT|NOFRAME, $0-88
+	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
+	MOVBLZX AH, BX
+	ANDL $15, BX
+	MOVL (DI)(BX*8), DX
+	NEGL DX
+	MOVLQSX DX, DX
+	MOVQ DX, (DI)(BX*8)
+	NEXTSHARED
+out:
+	LEAVE
+
+TEXT asmOpSHor64<>(SB), NOSPLIT|NOFRAME, $0-88
+	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
+	MOVBLZX AH, BX
+	ANDL $15, BX
+	SHRQ $32, AX
+	SHLQ $32, AX
+	ORQ AX, (DI)(BX*8)
+	NEXTSHARED
+out:
+	LEAVE
+
 // asmHandlers holds each handler's address, indexed by its ID.
 DATA asmHandlers<>+0(SB)/8, $asmOpBail<>(SB)
 DATA asmHandlers<>+8(SB)/8, $asmOpLdxb<>(SB)
@@ -4249,7 +4313,10 @@ DATA asmHandlers<>+816(SB)/8, $asmOpJsleReg<>(SB)
 DATA asmHandlers<>+824(SB)/8, $asmOpCallStatic<>(SB)
 DATA asmHandlers<>+832(SB)/8, $asmOpCallLegacy<>(SB)
 DATA asmHandlers<>+840(SB)/8, $asmOpExit<>(SB)
-GLOBL asmHandlers<>(SB), RODATA|NOPTR, $848
+DATA asmHandlers<>+848(SB)/8, $asmOpNeg64<>(SB)
+DATA asmHandlers<>+856(SB)/8, $asmOpNeg32<>(SB)
+DATA asmHandlers<>+864(SB)/8, $asmOpHor64<>(SB)
+GLOBL asmHandlers<>(SB), RODATA|NOPTR, $872
 
 // asmHandlersShared is the same table for the shared-dispatch set.
 DATA asmHandlersShared<>+0(SB)/8, $asmOpSBail<>(SB)
@@ -4358,7 +4425,10 @@ DATA asmHandlersShared<>+816(SB)/8, $asmOpSJsleReg<>(SB)
 DATA asmHandlersShared<>+824(SB)/8, $asmOpSCallStatic<>(SB)
 DATA asmHandlersShared<>+832(SB)/8, $asmOpSCallLegacy<>(SB)
 DATA asmHandlersShared<>+840(SB)/8, $asmOpSExit<>(SB)
-GLOBL asmHandlersShared<>(SB), RODATA|NOPTR, $848
+DATA asmHandlersShared<>+848(SB)/8, $asmOpSNeg64<>(SB)
+DATA asmHandlersShared<>+856(SB)/8, $asmOpSNeg32<>(SB)
+DATA asmHandlersShared<>+864(SB)/8, $asmOpSHor64<>(SB)
+GLOBL asmHandlersShared<>(SB), RODATA|NOPTR, $872
 
 // func asmHandlerTable() *[numAsmHandlers]uintptr
 TEXT ·asmHandlerTable(SB), NOSPLIT, $0-8

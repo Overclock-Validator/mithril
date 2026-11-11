@@ -112,5 +112,8 @@ const (
 	asmCallStatic
 	asmCallLegacy
 	asmExit
+	asmNeg64
+	asmNeg32
+	asmHor64
 	numAsmHandlers
 )

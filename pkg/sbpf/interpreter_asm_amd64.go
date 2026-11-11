@@ -226,6 +226,13 @@ func buildAsmTable(f fastFlags, gaps bool) *[256]uintptr {
 	set(OpArsh32Reg, asmArsh32Reg)
 	set(OpArsh64Imm, asmArsh64Imm)
 	set(OpArsh64Reg, asmArsh64Reg)
+	if !f.disableNeg {
+		set(OpNeg64, asmNeg64)
+		set(OpNeg32, asmNeg32)
+	}
+	if f.disableLddw {
+		set(OpHor64Imm, asmHor64)
+	}
 	if !f.disableLddw {
 		set(OpLddw, asmLddw)
 	}
@@ -281,7 +288,7 @@ func buildAsmTable(f fastFlags, gaps bool) *[256]uintptr {
 		set(OpMod64Reg, asmMod64Reg)
 	}
 	// The 4-byte relocated forms have encodings of their own; the immediate
-	// store's is neg64's, which stays with Run while neg is enabled.
+	// store's is neg64's, which is neg64 while neg is enabled (mapped above).
 	if f.moveMem {
 		set(OpLd4BReg, pick(gaps, asmLdxw, asmLdxwNoGap))
 		set(OpSt4BReg, pick(gaps, asmStxw, asmStxwNoGap))
