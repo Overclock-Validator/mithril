@@ -108,40 +108,77 @@ directory's own store a backtest deletes them before rewinding; under an
 
 ```
 Backtest summary
-  commit / go / GOMAXPROCS / usable CPUs / txpar / MITHRIL_SBPF_ASM_LOOP / memory limit / shred version
+  config / commit / go / GOMAXPROCS / usable CPUs / txpar / phase timers / shred signatures / MITHRIL_SBPF_ASM_LOOP / memory limit / shred version
   blocks                 1000 replayed, 30 warm-up excluded, 970 measured (slots A..B)
-  avg consumed CU/block  13.95 M
+  avg consumed CU/block  14.01 M
   interval       mean ms    p50 ms    p90 ms    p99 ms    CU/ns
   SlotReplay       ...
   TxLoop           ...
-FD_COMPARABLE slots=1000 slot_exec_s=... sec_per_slot=... tps=... outside_s=...
+BACKTEST_SUMMARY snapshot_slot=... end_slot=... slots=... txns=... snap_bytes_s=... replay_init_s=... load_total_s=... replay_s=... slot_exec_s=... sec_per_slot=... tps=... total_s=...
+MITHRIL_EXTRA import_s=... shutdown_s=...
 ```
 
-CU/ns is total consumed CU over total nanoseconds of that interval, not a mean
-of per-block ratios; higher is better. Consumed CU makes blocks of different
-size comparable but does not measure host CPU work.
+The table above the `BACKTEST_SUMMARY` line is Mithril's own: warm-up blocks
+(and blocks before `--measure-from`) are left out, and CU/ns is total consumed
+CU over total nanoseconds of that interval, not a mean of per-block ratios;
+higher is better. Consumed CU makes blocks of different size comparable but
+does not measure host CPU work.
 
-### How the numbers line up with Firedancer's
+### The BACKTEST_SUMMARY line
 
-From Firedancer's `src/discof/backtest/fd_backtest_tile.c` (read from source,
-not measured). Firedancer prints, per slot,
-`Bank hash matches! ... (switch, begin, exec, finish)` in ms, and at the end a
-`BACKTEST_SUMMARY` line.
+`BACKTEST_SUMMARY` is the line Firedancer's backtest prints at the end
+(`finish()` in `src/discof/backtest/fd_backtest_tile.c`, read at firedancer
+main `b419dc363121`). Mithril prints the same fields under the same names, each
+measured over the same span, so the two lines can be compared field by field.
+Like Firedancer's, it covers every replayed block: no warm-up is excluded, and
+the start (snapshot or checkpoint) slot is not counted. Firedancer also prints
+a "Backtest playback done" line whose `replay_time` starts at snapshot
+completion; that line is not mirrored.
 
-| Firedancer | Its span | Mithril |
+All times are wall clock. Firedancer's boot is its `boot_timestamp_nanos`, set
+at topology configuration (the exact moment was not traced); Mithril's is
+process start.
+
+| Field | Firedancer's span | Mithril's span |
 |---|---|---|
-| per-slot `exec` | first transaction scheduled to last transaction finished | `TxLoop` (transaction execution loop) |
-| per-slot `begin + exec + finish` | slot preparation start to slot completion | `SlotReplay` (complete block to bank hash and commit); start points differ, see below |
-| per-slot `switch` | previous slot's completion to this slot's preparation | time between blocks (block-to-block loop time minus SlotReplay) |
-| `slot_exec_s` | first replayed slot's preparation start to last slot's completion | `slot_exec_s`: first block's SlotReplay plus the block-to-block time of every later block |
-| `replay_s` | start slot (snapshot) complete to finish | not printed; longer than `slot_exec_s` by the time before the first block starts |
-| `sec_per_slot` | `replay_s / slots` | `slot_exec_s / slots` |
-| `tps` | all transactions (votes and failures included) / `replay_s` | all transactions / `slot_exec_s` |
-| `load_total_s` | boot to start slot complete | part of `outside_s` (process start to finish minus `slot_exec_s`) |
+| `snapshot_slot` | the snapshot slot replay starts from | the slot replay starts from: the snapshot slot, or the checkpoint an AccountsDB was rewound to |
+| `end_slot` | last replayed slot | last replayed slot |
+| `slots` | completed slots after the snapshot slot | replayed blocks after the start slot |
+| `txns` | per completed slot, vote and non-vote, succeeded and failed | every transaction in the replayed blocks |
+| `snap_bytes_s` | boot to snapshot loaded (a duration, despite the name) | end of capture import to AccountsDB ready (built from the snapshot, or opened and rewound) |
+| `replay_init_s` | snapshot loaded to the start slot complete | AccountsDB ready to the replay loop about to fetch its first block |
+| `load_total_s` | boot to the start slot complete | end of capture import to the replay loop about to fetch its first block |
+| `replay_s` | start slot complete to finish | replay loop ready to the last block's completion; includes reading and assembling blocks from the shred spool, as Firedancer's includes reading the capture |
+| `slot_exec_s` | first replayed slot's preparation start to the last slot's completion | first block's SlotReplay start to the last block's completion |
+| `sec_per_slot` | `replay_s / slots` | `replay_s / slots` |
+| `tps` | `txns / replay_s` | `txns / replay_s` |
+| `total_s` | boot to finish | process start to the last block's completion |
 
-Where the spans are not the same (SlotReplay's start point, `replay_s` against
-`slot_exec_s`, and therefore `sec_per_slot` and `tps`), compare per-slot
-numbers on the same slots rather than the totals.
+`MITHRIL_EXTRA` has what Firedancer has no field for. `import_s` is the
+capture import (near zero when an earlier import is reused): Firedancer reads
+the capture while replaying, so its decoding time is inside its `replay_s`,
+while Mithril imports it first. So `total_s = import_s + load_total_s +
+replay_s`, and `load_total_s` covers state loading only, as Firedancer's does.
+`shutdown_s` is the node's shutdown after the last block, which Firedancer's
+`total_s` also leaves out (it exits at the last slot).
+
+Not identical, and why:
+
+- **Per-slot start.** Firedancer's slot begins at preparation; Mithril's
+  SlotReplay begins once the block is assembled. `slot_exec_s` inherits this
+  for its first block only.
+- **Signature verification.** Both verify transaction signatures inside
+  `replay_s` and `slot_exec_s`, but at different points (see below).
+- **Footer certificates and rooting.** Both verify footer certificates and
+  root from them; Firedancer's backtest adds mocked finalization from the
+  capture's root records.
+- **Account state.** Firedancer keeps accounts in its in-memory accdb sized by
+  its configuration; Mithril reads an on-disk AccountsDB through its caches.
+  Our published numbers come from repeated replays of the same blocks with the
+  OS page cache warm; the first run after a snapshot build is colder and slower.
+- **Threads.** Firedancer's `execrp_tile_count` against Mithril's
+  `exec_workers` (`--txpar`); other work (signature verification, assembly)
+  uses separate threads on each side.
 
 ### What runs inside the timed intervals
 

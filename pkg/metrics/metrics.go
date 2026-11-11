@@ -360,8 +360,11 @@ type BlockReplay struct {
 	ComputeUnitsConsumed uint64
 	Transactions         uint64 // transactions in the block, votes included
 	Slot                 uint64
-	AccountLoader        AccountLoader
-	TurbineIngress       TurbineIngress
+	// CompletedUnixNano is when the block's SlotReplay ended (wall clock), so
+	// a run's first block start and last block end are exact.
+	CompletedUnixNano int64
+	AccountLoader     AccountLoader
+	TurbineIngress    TurbineIngress
 
 	// RewardCertificatePreflight runs before consensus admission and bank replay,
 	// outside SlotReplay, which starts after the candidate is admitted.

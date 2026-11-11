@@ -30,6 +30,10 @@ var replayPhaseTimers = true
 // backtestMode is set while `mithril backtest` drives the node in-process.
 var backtestMode bool
 
+// stateReadyAt is when runLive finished building or opening (and rewinding)
+// the AccountsDB.
+var stateReadyAt time.Time
+
 // lastReplayResult is the replay result of the most recent runLive, read by
 // backtest to decide its exit status.
 var lastReplayResult *replay.ReplayResult
@@ -139,6 +143,7 @@ func runBacktest(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
+	importDone := time.Now()
 	if snapshotSlot > 0 && man.Checkpoint != snapshotSlot {
 		if man.Checkpoint > snapshotSlot {
 			return fmt.Errorf("snapshot too old for capture: the capture's first block after slot %d builds on slot %d, and the blocks between are not in the capture", snapshotSlot, man.Checkpoint)
@@ -300,7 +305,11 @@ func runBacktest(cmd *cobra.Command, _ []string) error {
 		}
 		return fmt.Errorf("replay stopped at slot %d before the capture's last block %d", last, head)
 	}
-	summary := summarizeBacktest(rows, bt.warmup, bt.measureFrom)
+	clock := backtestClock{Boot: started, ImportDone: importDone, StateReady: stateReadyAt}
+	if ns := replay.ReplayReadyAt.Load(); ns != 0 {
+		clock.ReplayReady = time.Unix(0, ns)
+	}
+	summary := summarizeBacktest(rows, bt.warmup, bt.measureFrom, plan.FirstSlot-1, clock)
 	settings := backtestSettings(man)
 	if userConfig != "" {
 		settings = append([][2]string{{"config", userConfig}}, settings...)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/Overclock-Validator/mithril/pkg/base58"
 )
@@ -13,6 +14,11 @@ import (
 // after the footer check, and stops on the first slot that disagrees or has no
 // record, as Firedancer's backtest does. A normal node leaves it nil.
 var CaptureBankHashes map[uint64][32]byte
+
+// ReplayReadyAt is when the replay loop was first about to fetch a block in
+// this process (Unix nanoseconds, zero until then): the end of loading, from
+// which a backtest times replay (Firedancer's replay_ready_time).
+var ReplayReadyAt atomic.Int64
 
 // SkipPhaseTimers turns off replay's per-transaction and instruction-dispatch
 // phase timers (the detail behind TxLoop), as block production already does.

@@ -20,6 +20,7 @@ type timingRow struct {
 	SlotReplay   int64
 	TxLoop       int64
 	SinceLastRow int64
+	Completed    int64 // wall clock when SlotReplay ended, Unix nanoseconds
 }
 
 func readTimingRows(path string) ([]timingRow, error) {
@@ -42,6 +43,7 @@ func readTimingRows(path string) ([]timingRow, error) {
 			SlotReplay           timing
 			TxLoop               timing
 			SinceLastRow         timing
+			CompletedUnixNano    int64
 		}
 		if len(sc.Bytes()) == 0 {
 			continue
@@ -50,7 +52,8 @@ func readTimingRows(path string) ([]timingRow, error) {
 			return nil, fmt.Errorf("%s: %w", path, err)
 		}
 		rows = append(rows, timingRow{Slot: r.Slot, CU: r.ComputeUnitsConsumed, Transactions: r.Transactions,
-			SlotReplay: r.SlotReplay.SumNanoseconds, TxLoop: r.TxLoop.SumNanoseconds, SinceLastRow: r.SinceLastRow.SumNanoseconds})
+			SlotReplay: r.SlotReplay.SumNanoseconds, TxLoop: r.TxLoop.SumNanoseconds, SinceLastRow: r.SinceLastRow.SumNanoseconds,
+			Completed: r.CompletedUnixNano})
 	}
 	return rows, sc.Err()
 }
@@ -62,6 +65,31 @@ type intervalStats struct {
 	CUPerNs                     float64
 }
 
+// backtestClock holds the wall-clock moments a run passes through. Boot is
+// process start; ImportDone ends the capture import (zero work when an
+// earlier import is reused); StateReady is the AccountsDB built or opened and
+// rewound (Firedancer's snapshot_done_time); ReplayReady is the replay loop
+// about to fetch its first block (Firedancer's replay_ready_time).
+type backtestClock struct {
+	Boot, ImportDone, StateReady, ReplayReady time.Time
+}
+
+// firedancerSummary is Firedancer's BACKTEST_SUMMARY line, each field measured
+// over the span fd_backtest_tile.c measures it over, covering every replayed
+// block with no warm-up excluded. SnapBytesS keeps Firedancer's name although
+// it is a duration (boot or here import end, to state ready).
+type firedancerSummary struct {
+	SnapshotSlot, EndSlot      uint64
+	Slots                      int
+	Txns                       uint64
+	SnapBytesS, ReplayInitS    float64
+	LoadTotalS, ReplayS        float64
+	SlotExecS, SecPerSlot, TPS float64
+	TotalS                     float64
+	ImportS                    float64 // Mithril only: Firedancer reads the capture while replaying
+	Complete                   bool    // every timestamp was recorded
+}
+
 type backtestSummary struct {
 	Replayed   int // blocks replayed this run
 	Warmup     int // leading blocks excluded from the measured set
@@ -71,34 +99,47 @@ type backtestSummary struct {
 	AvgCU      float64 // consumed CU per measured block
 	SlotReplay intervalStats
 	TxLoop     intervalStats
-
-	// Firedancer-comparable quantities over every replayed block (Firedancer's
-	// backtest does not exclude warm-up). SlotExecSeconds runs from the first
-	// block's start to the last block's completion: the first block's
-	// SlotReplay plus the block-to-block time of every later block, the span
-	// Firedancer reports as slot_exec_s.
-	SlotExecSeconds float64
-	SecPerSlot      float64
-	TPS             float64
+	FD         firedancerSummary
 }
 
-func summarizeBacktest(rows []timingRow, warmup int, measureFrom uint64) backtestSummary {
-	s := backtestSummary{Replayed: len(rows)}
-	if len(rows) > 0 {
-		replay := time.Duration(rows[0].SlotReplay)
-		var txns uint64
-		for i, r := range rows {
-			if i > 0 {
-				replay += time.Duration(r.SinceLastRow)
-			}
-			txns += r.Transactions
-		}
-		s.SlotExecSeconds = replay.Seconds()
-		if s.SlotExecSeconds > 0 {
-			s.SecPerSlot = s.SlotExecSeconds / float64(len(rows))
-			s.TPS = float64(txns) / s.SlotExecSeconds
-		}
+func secondsBetween(a, b time.Time) float64 { return b.Sub(a).Seconds() }
+
+// firedancerFields computes the BACKTEST_SUMMARY quantities. startSlot is the
+// slot replay started from (the snapshot or checkpoint slot); rows are every
+// replayed block, never including that slot.
+func firedancerFields(rows []timingRow, startSlot uint64, clock backtestClock) firedancerSummary {
+	fd := firedancerSummary{SnapshotSlot: startSlot, Slots: len(rows)}
+	if len(rows) == 0 {
+		return fd
 	}
+	for _, r := range rows {
+		fd.Txns += r.Transactions
+	}
+	first, last := rows[0], rows[len(rows)-1]
+	fd.EndSlot = last.Slot
+	lastDone := time.Unix(0, last.Completed)
+	firstBegin := time.Unix(0, first.Completed-first.SlotReplay)
+	fd.SlotExecS = secondsBetween(firstBegin, lastDone)
+	fd.Complete = first.Completed != 0 && last.Completed != 0 &&
+		!clock.Boot.IsZero() && !clock.ImportDone.IsZero() && !clock.StateReady.IsZero() && !clock.ReplayReady.IsZero()
+	if !fd.Complete {
+		return fd
+	}
+	fd.ImportS = secondsBetween(clock.Boot, clock.ImportDone)
+	fd.SnapBytesS = secondsBetween(clock.ImportDone, clock.StateReady)
+	fd.ReplayInitS = secondsBetween(clock.StateReady, clock.ReplayReady)
+	fd.LoadTotalS = secondsBetween(clock.ImportDone, clock.ReplayReady)
+	fd.ReplayS = secondsBetween(clock.ReplayReady, lastDone)
+	fd.TotalS = secondsBetween(clock.Boot, lastDone)
+	if fd.ReplayS > 0 {
+		fd.SecPerSlot = fd.ReplayS / float64(fd.Slots)
+		fd.TPS = float64(fd.Txns) / fd.ReplayS
+	}
+	return fd
+}
+
+func summarizeBacktest(rows []timingRow, warmup int, measureFrom uint64, startSlot uint64, clock backtestClock) backtestSummary {
+	s := backtestSummary{Replayed: len(rows), FD: firedancerFields(rows, startSlot, clock)}
 	measured := rows
 	for len(measured) > 0 && measured[0].Slot < measureFrom {
 		measured = measured[1:]
@@ -161,6 +202,16 @@ func (s backtestSummary) write(w io.Writer, settings [][2]string, totalSeconds f
 	}{{"SlotReplay", s.SlotReplay}, {"TxLoop", s.TxLoop}} {
 		fmt.Fprintf(w, "  %-12s %9.2f %9.2f %9.2f %9.2f %8.3f\n", iv.name, iv.st.MeanMs, iv.st.P50Ms, iv.st.P90Ms, iv.st.P99Ms, iv.st.CUPerNs)
 	}
-	fmt.Fprintf(w, "FD_COMPARABLE slots=%d slot_exec_s=%.3f sec_per_slot=%.6f tps=%.0f outside_s=%.3f\n",
-		s.Replayed, s.SlotExecSeconds, s.SecPerSlot, s.TPS, max(totalSeconds-s.SlotExecSeconds, 0))
+	fd := s.FD
+	if !fd.Complete {
+		fmt.Fprintf(w, "BACKTEST_SUMMARY unavailable: a run timestamp was not recorded (slots=%d txns=%d slot_exec_s=%.3f)\n", fd.Slots, fd.Txns, fd.SlotExecS)
+		return
+	}
+	// Firedancer's field names and spans (fd_backtest_tile.c); every replayed
+	// block counts, as in Firedancer.
+	fmt.Fprintf(w, "BACKTEST_SUMMARY snapshot_slot=%d end_slot=%d slots=%d txns=%d snap_bytes_s=%.3f replay_init_s=%.3f load_total_s=%.3f replay_s=%.3f slot_exec_s=%.3f sec_per_slot=%.6f tps=%.0f total_s=%.3f\n",
+		fd.SnapshotSlot, fd.EndSlot, fd.Slots, fd.Txns, fd.SnapBytesS, fd.ReplayInitS, fd.LoadTotalS, fd.ReplayS, fd.SlotExecS, fd.SecPerSlot, fd.TPS, fd.TotalS)
+	// Mithril only: Firedancer has no import step (it reads the capture while
+	// replaying), so total_s = import_s + load_total_s + replay_s.
+	fmt.Fprintf(w, "MITHRIL_EXTRA import_s=%.3f shutdown_s=%.3f\n", fd.ImportS, max(totalSeconds-fd.TotalS, 0))
 }

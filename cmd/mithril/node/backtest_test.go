@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/config"
 	"github.com/Overclock-Validator/mithril/pkg/state"
@@ -147,13 +148,22 @@ func TestPrepareBacktestShredStoreBindsBeforeRestoring(t *testing.T) {
 
 func TestSummarizeBacktest(t *testing.T) {
 	ms := int64(1_000_000)
-	rows := []timingRow{
-		{Slot: 10, CU: 1e6, Transactions: 10, SlotReplay: 100 * ms, TxLoop: 90 * ms},
-		{Slot: 11, CU: 2e6, Transactions: 20, SlotReplay: 10 * ms, TxLoop: 8 * ms, SinceLastRow: 12 * ms},
-		{Slot: 13, CU: 4e6, Transactions: 30, SlotReplay: 20 * ms, TxLoop: 16 * ms, SinceLastRow: 22 * ms},
-		{Slot: 14, CU: 6e6, Transactions: 40, SlotReplay: 30 * ms, TxLoop: 24 * ms, SinceLastRow: 33 * ms},
+	boot := time.Unix(1000, 0)
+	clock := backtestClock{
+		Boot:        boot,
+		ImportDone:  boot.Add(2 * time.Second),
+		StateReady:  boot.Add(5 * time.Second),
+		ReplayReady: boot.Add(6 * time.Second),
 	}
-	s := summarizeBacktest(rows, 1, 0)
+	// Four blocks after slot 9; the first starts 50 ms after replay is ready.
+	at := func(d time.Duration) int64 { return clock.ReplayReady.Add(d).UnixNano() }
+	rows := []timingRow{
+		{Slot: 10, CU: 1e6, Transactions: 10, SlotReplay: 100 * ms, TxLoop: 90 * ms, Completed: at(150 * time.Millisecond)},
+		{Slot: 11, CU: 2e6, Transactions: 20, SlotReplay: 10 * ms, TxLoop: 8 * ms, Completed: at(170 * time.Millisecond)},
+		{Slot: 13, CU: 4e6, Transactions: 30, SlotReplay: 20 * ms, TxLoop: 16 * ms, Completed: at(200 * time.Millisecond)},
+		{Slot: 14, CU: 6e6, Transactions: 40, SlotReplay: 30 * ms, TxLoop: 24 * ms, Completed: at(250 * time.Millisecond)},
+	}
+	s := summarizeBacktest(rows, 1, 0, 9, clock)
 	require.Equal(t, 4, s.Replayed)
 	require.Equal(t, 1, s.Warmup)
 	require.Equal(t, 3, s.Measured)
@@ -161,33 +171,61 @@ func TestSummarizeBacktest(t *testing.T) {
 	require.Equal(t, uint64(14), s.LastSlot)
 	require.InDelta(t, 4e6, s.AvgCU, 1)
 	require.InDelta(t, 20.0, s.SlotReplay.MeanMs, 1e-9)
-	require.InDelta(t, 20.0, s.SlotReplay.P50Ms, 1e-9)
 	require.InDelta(t, 30.0, s.SlotReplay.P99Ms, 1e-9)
 	// Total CU over total ns, not the mean of per-block ratios.
 	require.InDelta(t, 12e6/60e6, s.SlotReplay.CUPerNs, 1e-12)
 	require.InDelta(t, 12e6/48e6, s.TxLoop.CUPerNs, 1e-12)
-	// Firedancer-comparable figures cover every replayed block.
-	require.InDelta(t, 0.167, s.SlotExecSeconds, 1e-9)
-	require.InDelta(t, 0.167/4, s.SecPerSlot, 1e-9)
-	require.InDelta(t, 100/0.167, s.TPS, 1e-6)
 
-	s = summarizeBacktest(rows, 0, 13)
+	fd := s.FD
+	require.True(t, fd.Complete)
+	require.Equal(t, uint64(9), fd.SnapshotSlot)
+	require.Equal(t, uint64(14), fd.EndSlot)
+	require.Equal(t, 4, fd.Slots, "every replayed block, no warm-up excluded, never the start slot")
+	require.Equal(t, uint64(100), fd.Txns)
+	require.InDelta(t, 2.0, fd.ImportS, 1e-9)
+	require.InDelta(t, 3.0, fd.SnapBytesS, 1e-9)
+	require.InDelta(t, 1.0, fd.ReplayInitS, 1e-9)
+	require.InDelta(t, 4.0, fd.LoadTotalS, 1e-9)
+	require.InDelta(t, 0.250, fd.ReplayS, 1e-9, "replay ready to the last block's completion")
+	require.InDelta(t, 0.200, fd.SlotExecS, 1e-9, "first block's start to the last block's completion")
+	require.InDelta(t, 6.250, fd.TotalS, 1e-9)
+
+	// Internal consistency, as Firedancer computes the derived fields.
+	require.InDelta(t, fd.ReplayS, fd.SecPerSlot*float64(fd.Slots), 1e-9)
+	require.InDelta(t, float64(fd.Txns), fd.TPS*fd.ReplayS, 1e-6)
+	require.InDelta(t, fd.LoadTotalS, fd.SnapBytesS+fd.ReplayInitS, 1e-9)
+	require.InDelta(t, fd.TotalS, fd.ImportS+fd.LoadTotalS+fd.ReplayS, 1e-9)
+	require.LessOrEqual(t, fd.SlotExecS, fd.ReplayS)
+
+	s = summarizeBacktest(rows, 0, 13, 9, clock)
 	require.Equal(t, 2, s.Measured)
 	require.Equal(t, uint64(13), s.FirstSlot)
+	require.Equal(t, 4, s.FD.Slots, "--measure-from does not touch the Firedancer line")
 
 	var out bytes.Buffer
-	s.write(&out, [][2]string{{"txpar", "8"}}, 1.5)
-	require.Contains(t, out.String(), "FD_COMPARABLE slots=4 slot_exec_s=0.167")
-	require.Contains(t, out.String(), "SlotReplay")
+	s.write(&out, [][2]string{{"txpar", "8"}}, 7.0)
+	require.Contains(t, out.String(), "BACKTEST_SUMMARY snapshot_slot=9 end_slot=14 slots=4 txns=100 snap_bytes_s=3.000 replay_init_s=1.000 load_total_s=4.000 replay_s=0.250 slot_exec_s=0.200 sec_per_slot=0.062500 tps=400 total_s=6.250")
+	require.Contains(t, out.String(), "MITHRIL_EXTRA import_s=2.000 shutdown_s=0.750")
+}
+
+func TestSummarizeBacktestWithoutTimestamps(t *testing.T) {
+	rows := []timingRow{{Slot: 10, CU: 1, Transactions: 1, SlotReplay: 5, TxLoop: 4}}
+	s := summarizeBacktest(rows, 0, 0, 9, backtestClock{})
+	require.False(t, s.FD.Complete)
+	var out bytes.Buffer
+	s.write(&out, nil, 1)
+	require.Contains(t, out.String(), "BACKTEST_SUMMARY unavailable")
+	require.NotContains(t, out.String(), "replay_s=")
 }
 
 func TestReadTimingRows(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "replay_timings.jsonl")
-	line := `{"Slot":5,"ComputeUnitsConsumed":7,"Transactions":3,"SlotReplay":{"SumNanoseconds":11},"TxLoop":{"SumNanoseconds":9},"SinceLastRow":{"SumNanoseconds":13},"Other":1}`
+	line := `{"Slot":5,"ComputeUnitsConsumed":7,"Transactions":3,"SlotReplay":{"SumNanoseconds":11},"TxLoop":{"SumNanoseconds":9},"SinceLastRow":{"SumNanoseconds":13},"CompletedUnixNano":17,"Other":1}`
 	require.NoError(t, os.WriteFile(path, []byte(line+"\n\n"+line+"\n"), 0o644))
 	rows, err := readTimingRows(path)
 	require.NoError(t, err)
-	require.Equal(t, []timingRow{{Slot: 5, CU: 7, Transactions: 3, SlotReplay: 11, TxLoop: 9, SinceLastRow: 13}, {Slot: 5, CU: 7, Transactions: 3, SlotReplay: 11, TxLoop: 9, SinceLastRow: 13}}, rows)
+	want := timingRow{Slot: 5, CU: 7, Transactions: 3, SlotReplay: 11, TxLoop: 9, SinceLastRow: 13, Completed: 17}
+	require.Equal(t, []timingRow{want, want}, rows)
 }
 
 func TestBacktestConfigStaysInsideTheWorkdir(t *testing.T) {

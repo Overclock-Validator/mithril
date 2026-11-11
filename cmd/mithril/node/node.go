@@ -2489,6 +2489,10 @@ postBootstrap:
 			res.NewThrough, res.UndoneBatches, res.UndoneKeys, mithrilState.GetResumeSlot())
 	}
 
+	// The AccountsDB is built or opened, and rewound if asked: state loading is
+	// done (a backtest reports it as Firedancer's snapshot-done time).
+	stateReadyAt = time.Now()
+
 	// Rooted-durable resume needs a context at the last rooted slot. The fold
 	// manifest is the primary source (handled above); the state file is the
 	// fallback for stores from before the first fold.

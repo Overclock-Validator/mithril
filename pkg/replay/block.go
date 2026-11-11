@@ -2861,6 +2861,7 @@ func ReplayBlocks(
 	}
 
 	lastRowAt := time.Now()
+	ReplayReadyAt.CompareAndSwap(0, lastRowAt.UnixNano())
 	for {
 		// The collector is per replay attempt. Discarded candidates, skipped
 		// slots, and typed-recovery exits must never leak timings into the next
@@ -3698,6 +3699,7 @@ func ReplayBlocks(
 		// Stop before per-slot logging, summary generation, and metric export so
 		// PostProcessBlock accounts only for execution-critical state publication.
 		slotReplayEnd := time.Now()
+		metrics.GlobalBlockReplay.CompletedUnixNano = slotReplayEnd.UnixNano()
 		metrics.GlobalBlockReplay.PostProcessBlock.AddTiming(slotReplayEnd.Sub(postProcessBlockStart))
 		slotReplayDuration := slotReplayEnd.Sub(start)
 		metrics.GlobalBlockReplay.SlotReplay.AddTiming(slotReplayDuration)
