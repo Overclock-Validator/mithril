@@ -164,11 +164,16 @@ func asmRandAddr(rng *rand.Rand, vm *asmStepVM) uint64 {
 // every handler the table selects must have completed at least one instruction
 // itself, so no handler passes merely by handing its work back to Go.
 func TestAsmLoopSingleStepMatchesRunFast(t *testing.T) {
+	t.Run("threaded", func(t *testing.T) { defer setAsmSharedDispatch(false)(); testAsmLoopSingleStep(t) })
+	t.Run("shared", func(t *testing.T) { defer setAsmSharedDispatch(true)(); testAsmLoopSingleStep(t) })
+}
+
+func testAsmLoopSingleStep(t *testing.T) {
 	trials, memTrials := 300, 4000
 	if testing.Short() || raceDetector {
 		trials, memTrials = 60, 800
 	}
-	handlers := asmHandlerTable()
+	handlers := asmHandlers()
 	for cfgIndex, cfg := range []struct {
 		ver         uint32
 		disableGaps bool
