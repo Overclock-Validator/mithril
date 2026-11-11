@@ -65,10 +65,11 @@ verifier.
 | `--phase-timers` | `[backtest] phase_timers` | off | time each transaction phase and instruction dispatch, as a live node does | |
 | `--verify-shred-signatures` | `[backtest] verify_shred_signatures` | off | check every shred's leader signature as replay reads it | not done by its backtest |
 
-Firedancer's `root_distance` has no counterpart: Mithril roots from the
-finalization certificates in block footers, not from the capture's root
-records (see the differences below). The summary names the configuration
-file it ran with.
+Firedancer's `root_distance` has no counterpart: it delays the backtest
+tile's mocked finalization, an extra rooting source Mithril does not have.
+Both replay paths also root from the finalization certificates in block
+footers (see the differences below). The summary names the configuration file
+it ran with.
 
 `MITHRIL_SBPF_ASM_LOOP=1` selects the amd64 assembly interpreter loop; without
 it the Go loop runs. The summary states which.
@@ -163,19 +164,30 @@ Mithril, from its source:
   `IxLoop`, `CalcAndDeductFees`, `ExecIxNativeProgram*`); pass
   `--phase-timers` when you want that detail.
 
-Firedancer, read from its source and not measured: per-slot timings start at
-slot preparation and end at slot completion; where its signature
-verification, entry checks and certificate handling fall relative to that span
-was not established here.
+Firedancer, read from its source (main at `b419dc363121`) and not measured:
+
+- Per-slot timings run from slot preparation to slot completion.
+- Transaction signatures are verified as scheduler tasks
+  (`FD_SCHED_TT_TXN_SIGVERIFY`) on the same exec tiles as execution,
+  interleaved with it within the slot (`fd_replay_tile.c`, `fd_execrp_tile.c`).
+  They are inside the per-slot span, where Mithril's are mostly outside
+  SlotReplay; both are inside `slot_exec_s` and `replay_s`.
+- Footer certificates are verified (`fd_alpenglow_cert_verify`) as part of
+  replaying the block, on the exec tiles and inline; a failure marks the block
+  dead. That is inside the per-slot span, where Mithril's is before SlotReplay.
+- Shred signatures are not checked: the backtest tile parses capture shreds
+  for structure only.
+- Where its entry hash checks fall was not established here.
 
 ## Differences from Firedancer's backtest
 
-- **Rooting.** Firedancer roots slots from the capture's root records, a
-  configurable distance behind replay, and tells replay with a mocked
-  fast-finalization certificate. Mithril roots from the finalization
-  certificates carried in block footers, as a running node does, so folds to
-  disk can happen at different points. Captures without footer certificates
-  cannot be rooted and are not supported.
+- **Rooting.** Both root from the finalization certificates carried in block
+  footers, as a running node does. Firedancer's backtest tile adds a second
+  source: a mocked fast-finalization certificate for each of the capture's
+  root records, `root_distance` slots behind replay. Mithril has no such
+  source, so roots, and with them folds to disk, can land at different points.
+  Captures without footer certificates cannot be rooted by Mithril and are not
+  supported.
 - **Start state.** Firedancer loads the snapshot on every run. Mithril builds
   its AccountsDB once and rewinds it on later runs.
 - **Shred signatures.** Neither backtest checks them by default: Firedancer
