@@ -15,7 +15,7 @@ import (
 )
 
 var (
-	fromSlot, toSlot uint64
+	fromSlot, toSlot, snapshotSlot uint64
 
 	CorpusCmd = cobra.Command{
 		Use:   "corpus",
@@ -37,7 +37,7 @@ checks every block's bank hash against the manifest.`,
 
 	exportCmd = cobra.Command{
 		Use:   "export-shredcap CORPUS OUTFILE",
-		Short: "Write a replay corpus as a shredcap capture (zstd-compressed when OUTFILE ends in .zst)",
+		Short: "Write a replay corpus as a shredcap capture for firedancer-dev backtest (zstd-compressed when OUTFILE ends in .zst)",
 		Args:  cobra.ExactArgs(2),
 		RunE:  runExport,
 	}
@@ -46,6 +46,7 @@ checks every block's bank hash against the manifest.`,
 func init() {
 	importCmd.Flags().Uint64Var(&fromSlot, "from-slot", 0, "First slot to import")
 	importCmd.Flags().Uint64Var(&toSlot, "to-slot", 0, "Last slot to import (0 = no limit)")
+	exportCmd.Flags().Uint64Var(&snapshotSlot, "snapshot-slot", 0, "Slot of the snapshot backtest starts from (0 = the corpus checkpoint); a capture whose first block is later starts with a placeholder shred for this slot")
 	CorpusCmd.AddCommand(&importCmd, &exportCmd)
 }
 
@@ -94,7 +95,7 @@ func runExport(cmd *cobra.Command, args []string) error {
 		}
 		w = enc
 	}
-	n, err := shredcap.ExportCorpus(args[0], w, "mithril corpus export-shredcap")
+	n, err := shredcap.ExportCorpus(args[0], w, "mithril corpus export-shredcap", shredcap.ExportOptions{SnapshotSlot: snapshotSlot})
 	if err != nil {
 		return err
 	}

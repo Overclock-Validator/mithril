@@ -293,7 +293,7 @@ func TestExportThenImportRoundTrips(t *testing.T) {
 	require.NoError(t, err)
 
 	var exported bytes.Buffer
-	n, err := ExportCorpus(first, &exported, "test")
+	n, err := ExportCorpus(first, &exported, "test", ExportOptions{})
 	require.NoError(t, err)
 	require.Equal(t, 3, n)
 
@@ -305,5 +305,89 @@ func TestExportThenImportRoundTrips(t *testing.T) {
 	require.Equal(t, man.Checkpoint, again.Checkpoint)
 	require.Empty(t, stats.CountMismatch, "export records each slot's real data shred count")
 	require.Zero(t, stats.Duplicates)
-	requireCorpus(t, second, packets, man.Slots)
+	require.Equal(t, []uint64{99}, stats.Incomplete, "the placeholder for the snapshot slot is not replayed")
+	requireCorpus(t, second, dataOnly(t, packets), man.Slots)
+}
+
+func dataOnly(t *testing.T, packets map[uint64][][]byte) map[uint64][][]byte {
+	t.Helper()
+	out := make(map[uint64][][]byte)
+	for slot, list := range packets {
+		for _, p := range list {
+			shred, err := turbine.ParseShred(p)
+			require.NoError(t, err)
+			if shred.Type == turbine.ShredTypeData {
+				out[slot] = append(out[slot], p)
+			}
+		}
+	}
+	return out
+}
+
+// TestExportMeetsBacktestOrder checks the layout firedancer-dev backtest
+// needs: a first shred at or below the snapshot slot, then per slot only data
+// shreds in index order, its bank hash with that many data shreds, and a root.
+func TestExportMeetsBacktestOrder(t *testing.T) {
+	capture, _ := testCapture(t, true)
+	corpus := filepath.Join(t.TempDir(), "corpus")
+	_, _, err := ImportCorpus(bytes.NewReader(capture), corpus, ImportOptions{})
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		name     string
+		snapshot uint64
+		lead     bool
+	}{
+		{"checkpoint snapshot gets a placeholder", 0, true},
+		{"older snapshot gets a placeholder at its slot", 50, true},
+		{"snapshot inside the corpus needs none", 100, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			_, err := ExportCorpus(corpus, &buf, "test", ExportOptions{SnapshotSlot: tc.snapshot})
+			require.NoError(t, err)
+			recs := readAll(t, buf.Bytes())
+			if tc.lead {
+				lead, err := turbine.ParseShred(recs[0].Shred)
+				require.NoError(t, err)
+				want := tc.snapshot
+				if want == 0 {
+					want = 99
+				}
+				require.Equal(t, want, lead.Slot)
+				require.Equal(t, turbine.ShredTypeData, lead.Type)
+				recs = recs[1:]
+			}
+			slot, next, count := uint64(100), uint32(0), uint64(0)
+			for _, rec := range recs {
+				switch rec.Kind {
+				case KindShred:
+					shred, err := turbine.ParseShred(rec.Shred)
+					require.NoError(t, err)
+					require.Equal(t, turbine.ShredTypeData, shred.Type)
+					require.Equal(t, slot, shred.Slot)
+					require.Equal(t, next, shred.Index)
+					next++
+					count++
+				case KindBankHash:
+					require.Equal(t, slot, rec.Slot)
+					require.Equal(t, count, rec.DataShreds)
+				case KindRootSlot:
+					require.Equal(t, slot, rec.Slot)
+					slot, next, count = slot+1, 0, 0
+				}
+			}
+			require.Equal(t, uint64(103), slot, "slots 100..102 were each closed by a root record")
+		})
+	}
+}
+
+func TestPlaceholderShredAtGenesis(t *testing.T) {
+	packet, err := placeholderShred(0)
+	require.NoError(t, err)
+	shred, err := turbine.ParseShred(packet)
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), shred.Slot)
+	require.Equal(t, uint64(0), shred.ParentSlot(), "no underflow below slot 0")
+	require.Equal(t, turbine.ShredTypeData, shred.Type)
 }

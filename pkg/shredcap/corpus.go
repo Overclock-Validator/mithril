@@ -133,6 +133,8 @@ func ImportCorpus(capture io.Reader, outDir string, opts ImportOptions) (*Manife
 			}
 			// Payload is the shred at its canonical size, without the nonce
 			// a repair response appends.
+			// The import spool is never closed or floored here and has no
+			// practical byte cap, so a refused append is a repeated shred.
 			if !spool.AppendShred(shred, shred.Payload) {
 				stats.Duplicates++
 				continue
@@ -297,32 +299,63 @@ func ReadManifest(corpusDir string) (*Manifest, error) {
 	return &man, nil
 }
 
-// ExportCorpus writes a corpus's slots as a shredcap capture: each slot's
-// shreds, its bank hash record (with the slot's data shred count) and a root
-// record, in slot order. The corpus is only read.
-func ExportCorpus(corpusDir string, w io.Writer, application string) (int, error) {
+// ExportOptions shapes an export for firedancer-dev backtest.
+type ExportOptions struct {
+	// SnapshotSlot is the slot of the snapshot the replay starts from; zero
+	// means the manifest's checkpoint.
+	SnapshotSlot uint64
+}
+
+// ExportCorpus writes a corpus's slots as a shredcap capture that
+// firedancer-dev backtest accepts, and reports how many slots it wrote. The
+// corpus is only read. Backtest concatenates the payload of every packet and
+// finds FEC set boundaries from consecutive packets, so each slot is written
+// as its data shreds only, in index order without duplicates, followed by its
+// bank hash record and a root record, slots ascending. Backtest also refuses a
+// capture whose first shred is above its snapshot slot (and skips shreds at or
+// below it), so when the first slot is above SnapshotSlot the capture starts
+// with one placeholder data shred for SnapshotSlot, signed by a throwaway key.
+// Mithril's importer leaves that slot off the replayed chain.
+func ExportCorpus(corpusDir string, w io.Writer, application string, opts ExportOptions) (int, error) {
 	man, err := ReadManifest(corpusDir)
 	if err != nil {
 		return 0, err
 	}
+	if len(man.Slots) == 0 {
+		return 0, fmt.Errorf("%s: manifest lists no slots", corpusDir)
+	}
+	snapshotSlot := opts.SnapshotSlot
+	if snapshotSlot == 0 {
+		snapshotSlot = man.Checkpoint
+	}
 	out, err := NewWriter(w, application)
 	if err != nil {
 		return 0, err
+	}
+	if man.Slots[0] > snapshotSlot {
+		lead, err := placeholderShred(snapshotSlot)
+		if err != nil {
+			return 0, err
+		}
+		if err := out.WriteShred(lead); err != nil {
+			return 0, err
+		}
 	}
 	for _, slot := range man.Slots {
 		packets, err := turbine.ReadSpoolFile(filepath.Join(corpusDir, "shreds", turbine.SpoolFileName(slot)))
 		if err != nil {
 			return 0, err
 		}
-		var dataShreds uint64
-		for _, packet := range packets {
-			if shred, err := turbine.ParseShred(packet); err == nil && shred.Slot == slot && shred.Type == turbine.ShredTypeData {
-				dataShreds = max(dataShreds, uint64(shred.Index)+1)
-			}
+		data, err := sortedDataShreds(slot, packets)
+		if err != nil {
+			return 0, err
+		}
+		for _, packet := range data {
 			if err := out.WriteShred(packet); err != nil {
 				return 0, err
 			}
 		}
+		dataShreds := uint64(len(data))
 		encoded, ok := man.BankHashes[fmt.Sprint(slot)]
 		if !ok {
 			return 0, fmt.Errorf("corpus has no bank hash for slot %d", slot)
@@ -339,4 +372,55 @@ func ExportCorpus(corpusDir string, w io.Writer, application string) (int, error
 		}
 	}
 	return len(man.Slots), out.Flush()
+}
+
+// sortedDataShreds returns slot's data shreds 0..last in index order, one
+// packet per index, and fails if any index is missing.
+func sortedDataShreds(slot uint64, packets [][]byte) ([][]byte, error) {
+	byIndex := make(map[uint32][]byte)
+	last := int64(-1)
+	for _, packet := range packets {
+		shred, err := turbine.ParseShred(packet)
+		if err != nil || shred.Slot != slot || shred.Type != turbine.ShredTypeData {
+			continue
+		}
+		if _, dup := byIndex[shred.Index]; !dup {
+			byIndex[shred.Index] = packet
+		}
+		if shred.LastInSlot() {
+			last = int64(shred.Index)
+		}
+	}
+	if last < 0 {
+		return nil, fmt.Errorf("slot %d has no last data shred", slot)
+	}
+	data := make([][]byte, 0, last+1)
+	for i := uint32(0); int64(i) <= last; i++ {
+		packet, ok := byIndex[i]
+		if !ok {
+			return nil, fmt.Errorf("slot %d is missing data shred %d", slot, i)
+		}
+		data = append(data, packet)
+	}
+	return data, nil
+}
+
+// placeholderShred is a single data shred for slot, carrying no entries,
+// signed by a throwaway key. It only marks where the capture starts.
+func placeholderShred(slot uint64) ([]byte, error) {
+	leader, err := solana.NewRandomPrivateKey()
+	if err != nil {
+		return nil, err
+	}
+	gen := turbine.ShredGenerator{Slot: slot, ParentSlot: slot - min(slot, 1), Version: 1}
+	packets, _, _, _, err := gen.MakeShredsFromData(leader, nil, true, solana.Hash{}, 0, 0)
+	if err != nil {
+		return nil, err
+	}
+	for _, packet := range packets {
+		if shred, err := turbine.ParseShred(packet); err == nil && shred.Type == turbine.ShredTypeData {
+			return packet, nil
+		}
+	}
+	return nil, fmt.Errorf("no data shred generated for slot %d", slot)
 }
