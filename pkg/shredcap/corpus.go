@@ -48,17 +48,18 @@ type ImportOptions struct {
 
 // ImportStats describes what an import read and kept.
 type ImportStats struct {
-	Shreds        int      // shred packets read
-	Unparsed      int      // packets that do not parse as shreds
-	Duplicates    int      // repeated shreds, stored once
-	OutOfRange    int      // shreds outside FromSlot..ToSlot
-	BankHashes    int      // bank hash records read
-	Roots         int      // root slot records read
-	CompleteSlots int      // slots with every data shred up to the last
-	Incomplete    []uint64 // slots missing data shreds (not replayable)
-	OffChain      []uint64 // complete slots not on the replayed chain (discarded)
-	CountMismatch []uint64 // chain slots whose data shred count differs from the bank hash record
-	NoBankHash    []uint64 // chain slots without a bank hash record
+	Shreds         int      // shred packets read
+	Unparsed       int      // packets that do not parse as shreds
+	Duplicates     int      // repeated shreds, stored once
+	OutOfRange     int      // shreds outside FromSlot..ToSlot
+	BankHashes     int      // bank hash records read
+	Roots          int      // root slot records read
+	CompleteSlots  int      // slots with every data shred up to the last, held or recoverable
+	RecoveredSlots []uint64 // complete only after recovering data shreds from coding shreds
+	Incomplete     []uint64 // slots missing data shreds that cannot be recovered (not replayable)
+	OffChain       []uint64 // complete slots not on the replayed chain (discarded)
+	CountMismatch  []uint64 // chain slots whose data shred count differs from the bank hash record
+	NoBankHash     []uint64 // chain slots without a bank hash record
 	// ParentBreaks are chain slots whose shred-header parent is not the
 	// previous chain slot: a rooted slot is missing or incomplete there, or
 	// an Alpenglow UpdateParent marker named an older parent.
@@ -164,10 +165,21 @@ func ImportCorpus(capture io.Reader, outDir string, opts ImportOptions) (*Manife
 	for slot, st := range slots {
 		if st.last >= 0 && int(st.last) < len(st.data) && !slices.Contains(st.data[:st.last+1], false) {
 			complete[slot] = st
-		} else {
-			stats.Incomplete = append(stats.Incomplete, slot)
+			continue
 		}
+		// Missing data shreds may be recoverable from coding shreds, as
+		// replay recovers them when it hydrates the slot.
+		if packets, err := spool.ReadSlot(slot); err == nil && st.hasParent {
+			if data, err := turbine.RecoverSlotDataShreds(slot, packets); err == nil {
+				st.last = int64(len(data) - 1)
+				complete[slot] = st
+				stats.RecoveredSlots = append(stats.RecoveredSlots, slot)
+				continue
+			}
+		}
+		stats.Incomplete = append(stats.Incomplete, slot)
 	}
+	slices.Sort(stats.RecoveredSlots)
 	slices.Sort(stats.Incomplete)
 	stats.CompleteSlots = len(complete)
 
@@ -315,14 +327,17 @@ type ExportOptions struct {
 // capture whose first shred is above its snapshot slot (and skips shreds at or
 // below it), so when the first slot is above SnapshotSlot the capture starts
 // with one placeholder data shred for SnapshotSlot, signed by a throwaway key.
-// Mithril's importer leaves that slot off the replayed chain.
-func ExportCorpus(corpusDir string, w io.Writer, application string, opts ExportOptions) (int, error) {
+// Mithril's importer leaves that slot off the replayed chain. A slot whose
+// spool file lacks data shreds gets them recovered from its coding shreds and
+// authenticated, as replay does.
+func ExportCorpus(corpusDir string, w io.Writer, application string, opts ExportOptions) (ExportStats, error) {
+	var stats ExportStats
 	man, err := ReadManifest(corpusDir)
 	if err != nil {
-		return 0, err
+		return stats, err
 	}
 	if len(man.Slots) == 0 {
-		return 0, fmt.Errorf("%s: manifest lists no slots", corpusDir)
+		return stats, fmt.Errorf("%s: manifest lists no slots", corpusDir)
 	}
 	snapshotSlot := opts.SnapshotSlot
 	if snapshotSlot == 0 {
@@ -330,48 +345,60 @@ func ExportCorpus(corpusDir string, w io.Writer, application string, opts Export
 	}
 	out, err := NewWriter(w, application)
 	if err != nil {
-		return 0, err
+		return stats, err
 	}
 	if man.Slots[0] > snapshotSlot {
 		lead, err := placeholderShred(snapshotSlot)
 		if err != nil {
-			return 0, err
+			return stats, err
 		}
 		if err := out.WriteShred(lead); err != nil {
-			return 0, err
+			return stats, err
 		}
 	}
 	for _, slot := range man.Slots {
 		packets, err := turbine.ReadSpoolFile(filepath.Join(corpusDir, "shreds", turbine.SpoolFileName(slot)))
 		if err != nil {
-			return 0, err
+			return stats, err
 		}
 		data, err := sortedDataShreds(slot, packets)
 		if err != nil {
-			return 0, err
+			recovered, rerr := turbine.RecoverSlotDataShreds(slot, packets)
+			if rerr != nil {
+				return stats, fmt.Errorf("%w; recovery from coding shreds failed: %v", err, rerr)
+			}
+			data = recovered
+			stats.RecoveredSlots++
 		}
 		for _, packet := range data {
 			if err := out.WriteShred(packet); err != nil {
-				return 0, err
+				return stats, err
 			}
 		}
 		dataShreds := uint64(len(data))
 		encoded, ok := man.BankHashes[fmt.Sprint(slot)]
 		if !ok {
-			return 0, fmt.Errorf("corpus has no bank hash for slot %d", slot)
+			return stats, fmt.Errorf("corpus has no bank hash for slot %d", slot)
 		}
 		hash, err := solana.HashFromBase58(encoded)
 		if err != nil {
-			return 0, fmt.Errorf("slot %d bank hash: %w", slot, err)
+			return stats, fmt.Errorf("slot %d bank hash: %w", slot, err)
 		}
 		if err := out.WriteBankHash(slot, hash, dataShreds); err != nil {
-			return 0, err
+			return stats, err
 		}
 		if err := out.WriteRootSlot(slot); err != nil {
-			return 0, err
+			return stats, err
 		}
 	}
-	return len(man.Slots), out.Flush()
+	stats.Slots = len(man.Slots)
+	return stats, out.Flush()
+}
+
+// ExportStats describes an export.
+type ExportStats struct {
+	Slots          int // slots written
+	RecoveredSlots int // slots whose missing data shreds were recovered from coding shreds
 }
 
 // sortedDataShreds returns slot's data shreds 0..last in index order, one

@@ -293,9 +293,9 @@ func TestExportThenImportRoundTrips(t *testing.T) {
 	require.NoError(t, err)
 
 	var exported bytes.Buffer
-	n, err := ExportCorpus(first, &exported, "test", ExportOptions{})
+	exportStats, err := ExportCorpus(first, &exported, "test", ExportOptions{})
 	require.NoError(t, err)
-	require.Equal(t, 3, n)
+	require.Equal(t, ExportStats{Slots: 3}, exportStats)
 
 	second := filepath.Join(t.TempDir(), "second")
 	again, stats, err := ImportCorpus(bytes.NewReader(exported.Bytes()), second, ImportOptions{})

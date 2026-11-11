@@ -72,6 +72,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(out, "%d %s: %s\n", len(slots), what, sample(slots))
 		}
 	}
+	report("slots completed by recovering data shreds from coding shreds", stats.RecoveredSlots)
 	report("incomplete slots left out", stats.Incomplete)
 	report("complete slots off the replayed chain left out", stats.OffChain)
 	report("chain slots without a bank hash (not checked)", stats.NoBankHash)
@@ -95,7 +96,7 @@ func runExport(cmd *cobra.Command, args []string) error {
 		}
 		w = enc
 	}
-	n, err := shredcap.ExportCorpus(args[0], w, "mithril corpus export-shredcap", shredcap.ExportOptions{SnapshotSlot: snapshotSlot})
+	stats, err := shredcap.ExportCorpus(args[0], w, "mithril corpus export-shredcap", shredcap.ExportOptions{SnapshotSlot: snapshotSlot})
 	if err != nil {
 		return err
 	}
@@ -107,7 +108,7 @@ func runExport(cmd *cobra.Command, args []string) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	fmt.Fprintf(cmd.OutOrStdout(), "wrote %d slots to %s\n", n, args[1])
+	fmt.Fprintf(cmd.OutOrStdout(), "wrote %d slots to %s (%d needed data shreds recovered from coding shreds)\n", stats.Slots, args[1], stats.RecoveredSlots)
 	return nil
 }
 

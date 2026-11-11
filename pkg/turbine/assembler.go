@@ -76,6 +76,10 @@ type SlotAssembler struct {
 	// onComplete fires when a slot fully assembles (all data shreds
 	// 0..lastIndex held) — the completeness signal the shred spool journals.
 	onComplete func(slot uint64, lastIndex uint32, shreds uint32)
+	// completedShreds, when set, receives a completed slot's data shreds
+	// (received and recovered) under the assembler lock, before the slot's
+	// state is dropped. Only RecoverSlotDataShreds sets it.
+	completedShreds func(state *slotState)
 	// Configured before ingestion; tests may replace it with a blocking probe.
 	// Production uses the process-wide bounded transaction verifier.
 	verifyTransactions func(context.Context, *block.Block) error
@@ -555,6 +559,9 @@ func (a *SlotAssembler) finalizeCompletion(work *slotCompletionWork, processed p
 	}
 
 	state.streamCompleted = true
+	if a.completedShreds != nil {
+		a.completedShreds(state)
+	}
 	a.releasePrefetchLocked(state)
 	delete(a.slots, state.slot)
 	a.completedSlots[state.slot] = struct{}{}
