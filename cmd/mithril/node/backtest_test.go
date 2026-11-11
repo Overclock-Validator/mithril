@@ -451,7 +451,7 @@ func oneSlotCapture(t *testing.T, hash [32]byte) []byte {
 }
 
 // Different captures that share name, size and mtime must not share an
-// import (regression found by Codex's review).
+// import.
 func TestBacktestCorpusFollowsCaptureContents(t *testing.T) {
 	resetBacktestOptions(t)
 	a, b := [32]byte{1}, [32]byte{2}

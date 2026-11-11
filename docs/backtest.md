@@ -37,7 +37,7 @@ EPYC 9555P each CCD has 8 cores; check `lscpu -e` for which CPU numbers share
 an L3 and leave out their SMT siblings):
 
 ```
-GOMAXPROCS=8 MITHRIL_SBPF_ASM_LOOP=1 taskset -c 0-7 ./mithril backtest \
+GOMAXPROCS=8 taskset -c 0-7 ./mithril backtest \
   --capture shredcap.pcapng.zst \
   --snapshot snapshot-<slot>-<hash>.tar.zst \
   --incremental incremental-snapshot-<base>-<slot>-<hash>.tar.zst \
@@ -73,8 +73,10 @@ Both replay paths also root from the finalization certificates in block
 footers (see the differences below). The summary names the configuration file
 it ran with.
 
-`MITHRIL_SBPF_ASM_LOOP=1` selects the amd64 assembly interpreter loop; without
-it the Go loop runs. The summary states which.
+The default Go interpreter loop is the recommended path. `MITHRIL_SBPF_ASM_LOOP=1`
+selects the optional amd64 assembly loop instead; it is off by default, was
+faster on a Zen 4 desktop CPU and made no measurable difference on a Zen 5
+one. The summary states which loop ran.
 
 Exit status is 0 when every block matched the capture's bank hash and replay
 reached the last block, and 1 otherwise. A mismatch prints
