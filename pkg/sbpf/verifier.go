@@ -97,16 +97,19 @@ func (v *Verifier) VerifyProgram() error {
 				}
 			}
 
+		// Matches Agave's check_imm_shift: a negative immediate is rejected as
+		// well, otherwise arsh64 would reach the interpreter's signed shift and
+		// panic, and lsh/rsh would accept programs Agave refuses to deploy.
 		case verifyCheckSh32:
 			{
-				if ins.Imm() >= 32 {
+				if ins.Imm() < 0 || ins.Imm() >= 32 {
 					return fmt.Errorf("sh overflow")
 				}
 			}
 
 		case verifyCheckSh64:
 			{
-				if ins.Imm() >= 64 {
+				if ins.Imm() < 0 || ins.Imm() >= 64 {
 					return fmt.Errorf("sh overflow")
 				}
 			}
