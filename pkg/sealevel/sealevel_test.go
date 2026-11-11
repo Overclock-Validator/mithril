@@ -1852,19 +1852,24 @@ func TestInterpreter_Get_Processed_Sibling_Instruction_Test(t *testing.T) {
 	allocateAccounts := InstructionAcctsFromAccountMetas([]AccountMeta{{Pubkey: acctToAlloc.Key, IsSigner: true, IsWritable: true}}, execCtx.TransactionContext.Accounts)
 	require.NoError(t, execCtx.ProcessInstruction(allocateData, allocateAccounts, []uint64{2}))
 
+	logStart := len(log.Logs)
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{1})
 	require.NoError(t, err)
+	require.Len(t, log.Logs[logStart:], 7)
+	require.Equal(t, "Program "+programPubkey.String()+" invoke [1]", log.Logs[logStart])
+	require.Equal(t, "Program "+programPubkey.String()+" success", log.Logs[len(log.Logs)-1])
+	programLogs := log.Logs[logStart+1 : len(log.Logs)-1]
 
 	// Check the introspection program reports both completed top-level siblings.
 	expected := fmt.Sprintf("Program log: ******** sibling instruction 0 program id: %s", solana.PublicKey(a.SystemProgramAddr))
-	assert.Equal(t, expected, log.Logs[1])
+	assert.Equal(t, expected, programLogs[1])
 	expected = fmt.Sprintf("Program log: ******** sibling instruction 0 instruction data: %s", reformatHexBytes(allocateData))
-	assert.Equal(t, expected, log.Logs[2])
+	assert.Equal(t, expected, programLogs[2])
 
 	expected = fmt.Sprintf("Program log: ******** sibling instruction 1 program id: %s", firstProgramAcct.Key)
-	assert.Equal(t, expected, log.Logs[3])
+	assert.Equal(t, expected, programLogs[3])
 	expected = fmt.Sprintf("Program log: ******** sibling instruction 1 instruction data: %s", reformatHexBytes(firstInstrData))
-	assert.Equal(t, expected, log.Logs[4])
+	assert.Equal(t, expected, programLogs[4])
 
 	for _, l := range log.Logs {
 		fmt.Printf("log: %s\n", l)
@@ -1910,11 +1915,12 @@ func TestInterpreter_Test_Memo_Program_With_LoaderV2(t *testing.T) {
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, nil, err)
 
-	expected := fmt.Sprintf("Program log: Signed by %s", signerPubkey)
-	containsExpected := strings.HasPrefix(log.Logs[0], expected)
-	assert.Equal(t, true, containsExpected)
-	expected = fmt.Sprintf("Program log: Memo (len 11): \"hello world\"")
-	assert.Equal(t, expected, log.Logs[1])
+	require.Equal(t, []string{
+		"Program " + programPubkey.String() + " invoke [1]",
+		fmt.Sprintf("Program log: Signed by %s", signerPubkey),
+		`Program log: Memo (len 11): "hello world"`,
+		"Program " + programPubkey.String() + " success",
+	}, log.Logs)
 
 	instrData = make([]byte, 2)
 	instrData[0] = 0xee
@@ -1923,11 +1929,12 @@ func TestInterpreter_Test_Memo_Program_With_LoaderV2(t *testing.T) {
 	err = execCtx.ProcessInstruction(instrData, instructionAccts, []uint64{0})
 	assert.Equal(t, InstrErrInvalidInstructionData, err)
 
-	expected = fmt.Sprintf("Program log: Signed by %s", signerPubkey)
-	containsExpected = strings.HasPrefix(log.Logs[2], expected)
-	assert.Equal(t, true, containsExpected)
-	expected = fmt.Sprintf("Program log: Invalid UTF-8, from byte 0")
-	assert.Equal(t, expected, log.Logs[3])
+	require.Equal(t, []string{
+		"Program " + programPubkey.String() + " invoke [1]",
+		fmt.Sprintf("Program log: Signed by %s", signerPubkey),
+		`Program log: Invalid UTF-8, from byte 0`,
+		"Program " + programPubkey.String() + " failed: invalid instruction data",
+	}, log.Logs[4:])
 
 	for _, l := range log.Logs {
 		fmt.Printf("log: %s\n", l)
