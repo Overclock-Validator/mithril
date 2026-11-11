@@ -60,6 +60,9 @@ type discardLogger struct{}
 
 func (discardLogger) Log(string) {}
 
+// DiscardsLogs tells the log syscalls not to format lines for this logger.
+func (discardLogger) DiscardsLogs() bool { return true }
+
 func newExecCtx(slotCtx *sealevel.SlotCtx, transactionAccts *sealevel.TransactionAccounts, computeBudgetLimits *sealevel.ComputeBudgetLimits, log sealevel.Logger) *sealevel.ExecutionCtx {
 	txCtx := sealevel.NewTransactionCtx(*transactionAccts, maxStackCapacity, maxInstrTraceCapacity)
 	if bankSysvars := slotCtx.BankSysvars(); bankSysvars != nil {
