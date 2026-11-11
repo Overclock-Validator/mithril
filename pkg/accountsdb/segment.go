@@ -480,14 +480,17 @@ func ListFoldManifests(acctsDir string) ([]ManifestHeader, error) {
 // ordering as ListFoldManifests. Callers must validate retained manifest bodies
 // and all parked manifests before using this list to remove checkpoint files.
 // Like ReadDir, this is a directory observation, not a transactional snapshot.
+//
+// The pass reads every entry of a directory that holds hundreds of thousands
+// of appendvecs. A caller with an open store that asks repeatedly should use
+// (*AccountsDb).FoldAndParkedManifests, which answers from memory.
 func ListFoldAndParkedManifests(acctsDir string) ([]ManifestHeader, []string, error) {
 	dir, err := os.Open(acctsDir)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer dir.Close()
-	var out []ManifestHeader
-	var parked []string
+	var listing manifestListing
 	// Do not sort or retain hundreds of thousands of unrelated appendvec entries.
 	// Only the small resulting manifest set needs sorting.
 	for {
@@ -496,34 +499,64 @@ func ListFoldAndParkedManifests(acctsDir string) ([]ManifestHeader, []string, er
 			return nil, nil, readErr
 		}
 		for _, e := range entries {
-			name := e.Name()
 			if e.IsDir() {
 				continue
 			}
-			if strings.HasSuffix(name, segManifestRewoundSuffix) {
-				parked = append(parked, filepath.Join(acctsDir, name))
-				continue
-			}
-			if !strings.HasSuffix(name, segManifestSuffix) || strings.HasSuffix(name, segManifestTmpSuffix) {
-				continue
-			}
-			path := filepath.Join(acctsDir, name)
-			hdr, err := readManifestHeader(path)
-			if err != nil {
-				out = append(out, ManifestHeader{Path: path})
-				continue
-			}
-			if hdr.Kind == ManifestKindFold {
-				out = append(out, hdr)
-			}
+			listing.add(acctsDir, e.Name())
 		}
 		if readErr == io.EOF {
 			break
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].BatchSeq < out[j].BatchSeq })
-	sort.Strings(parked)
-	return out, parked, nil
+	folds, parked := listing.sorted()
+	return folds, parked, nil
+}
+
+// manifestListing sorts manifest file names into what
+// ListFoldAndParkedManifests returns, whether the names come from the
+// directory or from the in-memory inventory.
+type manifestListing struct {
+	folds  []ManifestHeader
+	parked []string
+}
+
+// add classifies one non-directory entry of acctsDir. A parked manifest is
+// recorded by path without being opened. An active manifest contributes its
+// header if it is fold-kind; one whose header cannot be read is kept with only
+// its path set, so the caller fails closed on it instead of skipping it. The
+// header read's error is returned for callers that care why.
+func (l *manifestListing) add(acctsDir, name string) error {
+	if strings.HasSuffix(name, segManifestRewoundSuffix) {
+		l.parked = append(l.parked, filepath.Join(acctsDir, name))
+		return nil
+	}
+	if !strings.HasSuffix(name, segManifestSuffix) || strings.HasSuffix(name, segManifestTmpSuffix) {
+		return nil
+	}
+	path := filepath.Join(acctsDir, name)
+	hdr, err := readManifestHeader(path)
+	if err != nil {
+		l.folds = append(l.folds, ManifestHeader{Path: path})
+		return err
+	}
+	if hdr.Kind == ManifestKindFold {
+		l.folds = append(l.folds, hdr)
+	}
+	return nil
+}
+
+// sorted returns fold headers ascending by BatchSeq and parked paths in name
+// order. Unreadable headers (BatchSeq 0) sort first; path breaks ties so the
+// order does not depend on where the names came from.
+func (l *manifestListing) sorted() ([]ManifestHeader, []string) {
+	sort.Slice(l.folds, func(i, j int) bool {
+		if l.folds[i].BatchSeq != l.folds[j].BatchSeq {
+			return l.folds[i].BatchSeq < l.folds[j].BatchSeq
+		}
+		return l.folds[i].Path < l.folds[j].Path
+	})
+	sort.Strings(l.parked)
+	return l.folds, l.parked
 }
 
 // listAllManifestFileIds returns the fileId of every manifest-backed data file

@@ -4211,7 +4211,9 @@ func addTransactionStatusManifestRef(keep map[string]*state.TransactionStatusChe
 // an interrupted rewind never loses the status side of its target selection.
 // This collector validates references structurally but deliberately does not
 // reread tens of megabytes per boundary on every fold; rewind selection and
-// startup head adoption perform full size/SHA/decode validation.
+// startup head adoption perform full size/SHA/decode validation. It runs after
+// every fold, so it takes the manifest names from the store's in-memory
+// inventory instead of listing the accounts directory.
 func retainedTransactionStatusCheckpointRefs(accountsDb *accountsdb.AccountsDb, horizon uint64, current *state.TransactionStatusCheckpointRef) ([]*state.TransactionStatusCheckpointRef, error) {
 	if accountsDb == nil {
 		return nil, errors.New("collect transaction status checkpoints: AccountsDB is nil")
@@ -4223,7 +4225,7 @@ func retainedTransactionStatusCheckpointRefs(accountsDb *accountsdb.AccountsDb, 
 		}
 	}
 
-	headers, parkedPaths, err := accountsdb.ListFoldAndParkedManifests(accountsDb.AcctsDir)
+	headers, parkedPaths, err := accountsDb.FoldAndParkedManifests()
 	if err != nil {
 		return nil, fmt.Errorf("list retained fold manifests: %w", err)
 	}
