@@ -52,6 +52,10 @@ type Interpreter struct {
 	// callTargets[pc] is the resolved internal-function target of the `call imm`
 	// at pc (or -1). Computed once per Program at load time.
 	callTargets []int64
+	// fastCalls is callTargets when every slot with a target there is an
+	// internal call under this invocation's registry, so the registry need
+	// not be asked (Program.unshadowedCallTargets); otherwise nil.
+	fastCalls []int64
 
 	// Fast-path translation table indexed by (vaddr >> 32); see fastmem.go.
 	regions [numFastRegions]memRegion
@@ -136,6 +140,7 @@ func NewInterpreter(p *Program, opts *VMOpts) *Interpreter {
 		programId:         opts.ProgramId,
 		txSignature:       opts.TxSignature,
 		callTargets:       p.CallTargets,
+		fastCalls:         p.unshadowedCallTargets(opts.SyscallsID, opts.SyscallsGen, opts.Syscalls),
 	}
 	ip.initRegions()
 	return ip
@@ -305,12 +310,15 @@ func (ip *Interpreter) Run() (ret uint64, cuConsumed uint64, err error) {
 	pqr := ip.sbpfVersion.EnablePqr()
 	staticSyscalls := ip.sbpfVersion.EnableStaticSyscalls()
 	callTargets := ip.callTargets
+	fastCalls := ip.fastCalls
 	fast := ip.fastFlags()
 	// Non-nil when the amd64 assembly loop is enabled.
 	asmTable := ip.asmLoopTable(fast)
 	var asmText *Slot
+	var asmCalls *int64
 	if asmTable != nil {
 		asmText = &text[0]
+		asmCalls = ip.asmCalls()
 	}
 
 	// Instruction metering (mirrors Agave's due_insn_count / previous_instruction_meter):
@@ -354,7 +362,7 @@ mainLoop:
 				// instructions, because assembly cannot be preempted.
 				rem := min(budget-due, asmChunk)
 				var left uint64
-				pc, left = runAsmLoop(asmText, int64(len(text)), &r, &ip.regions, asmTable, &ip.stack, pc, rem)
+				pc, left = runAsmLoop(asmText, int64(len(text)), &r, &ip.regions, asmTable, &ip.stack, pc, rem, asmCalls)
 				due += rem - left
 				if left == 0 && due != budget {
 					pc, due = ip.runAsmChunks(&r, pc, due, budget, asmTable)
@@ -805,7 +813,15 @@ mainLoop:
 					err = ExcUnsupportedInstruction
 				}
 			} else {
-				if sc, ok := ip.syscalls(ins.Uimm()); ok {
+				if fastCalls != nil && fastCalls[pc] >= 0 {
+					// An internal call that no syscall of this invocation's
+					// registry shadows: the lookup below would fail.
+					target := fastCalls[pc]
+					if !ip.stack.Push(&r, pc+1) {
+						err = ExcCallDepth
+					}
+					pc = target
+				} else if sc, ok := ip.syscalls(ins.Uimm()); ok {
 					flushDue()
 					r[0], err = sc.Invoke(ip, r[1], r[2], r[3], r[4], r[5])
 					reloadBudget()

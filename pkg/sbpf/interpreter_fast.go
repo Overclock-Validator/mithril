@@ -36,13 +36,16 @@ func sext32(explicit bool, val int32) uint64 {
 // the loop state stays in registers. Each instruction is either executed with
 // exactly Run's semantics (meter check, due++, effect, next pc) or not touched:
 // runFast returns pc/due at the first instruction it cannot complete and Run
-// handles that instruction itself: syscalls, legacy (v0-v2) calls, callx, the
-// entry frame's exit, a full shadow stack, slow memory translation, zero
-// divisors, cold opcodes, an out-of-range pc or call target, or an exhausted
-// budget. Static (v3) internal calls and returns from inner frames stay here.
+// handles that instruction itself: syscalls, legacy (v0-v2) calls that may
+// name a syscall, callx, the entry frame's exit, a full shadow stack, slow
+// memory translation, zero divisors, cold opcodes, an out-of-range pc or call
+// target, or an exhausted budget. Static (v3) internal calls, legacy internal
+// calls known not to name a syscall (ip.fastCalls) and returns from inner
+// frames stay here.
 func (ip *Interpreter) runFast(r *[16]uint64, pc int64, due, budget uint64, f fastFlags) (int64, uint64) {
 	text := ip.text
 	stack := &ip.stack
+	fastCalls := ip.fastCalls
 	for {
 		if uint64(pc) >= uint64(len(text)) || due == budget {
 			return pc, due
@@ -393,13 +396,22 @@ func (ip *Interpreter) runFast(r *[16]uint64, pc int64, due, budget uint64, f fa
 		case OpArsh64Reg:
 			r[ins.Dst()] = uint64(int64(r[ins.Dst()]) >> (r[ins.Src()]))
 		case OpCall:
-			// Legacy call immediates may name a syscall in the invocation's
-			// registry, even if they resolved internally at load time. Keep
-			// that lookup on Run's path. Static calls encode the distinction.
-			if !f.staticSyscalls || ins.Src() != 1 {
-				return pc, due
+			// Static calls encode whether they are internal. A legacy call
+			// immediate may name a syscall in the invocation's registry, even
+			// if it resolved internally at load time: that lookup stays on
+			// Run's path unless fastCalls rules it out for this program.
+			var target int64
+			if f.staticSyscalls {
+				if ins.Src() != 1 {
+					return pc, due
+				}
+				target = ip.sbpfVersion.CalculateCallImmTargetPC(pc, ins.Imm())
+			} else {
+				if fastCalls == nil {
+					return pc, due
+				}
+				target = fastCalls[pc]
 			}
-			target := ip.sbpfVersion.CalculateCallImmTargetPC(pc, ins.Imm())
 			if target < 0 || target >= int64(len(text)) {
 				return pc, due
 			}

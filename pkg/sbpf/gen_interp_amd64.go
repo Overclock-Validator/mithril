@@ -251,9 +251,9 @@ func main() {
 	// Internal call of the static-syscall versions (src field 1): push a
 	// shadow frame exactly as runFast does, then continue at pc + imm + 1.
 	// The target and the shadow stack's capacity are checked before any write.
-	add("CallStatic",
-		"MOVBLZX AH, DX", "SHRL $4, DX", "CMPL DX, $1", "JNE out",
-		simm, "LEAQ 1(R8)(AX*1), R13", "CMPQ R13, R9", "JCC out",
+	// pushFrame pushes the shadow frame for a call to the pc in R13 and
+	// continues there. It writes nothing unless the stack has room.
+	pushFrame := []string{
 		"MOVQ stack+40(FP), R15",
 		"MOVQ (Stack_shadow+8)(R15), CX", "CMPQ CX, (Stack_shadow+16)(R15)", "JGE out",
 		"IMUL3Q $Frame__size, CX, R12", "ADDQ Stack_shadow(R15), R12",
@@ -269,7 +269,16 @@ func main() {
 		"MOVQ $const_StackFrameSize, DX",
 		"CMPB Stack_stackFrameGaps(R15), $0", "JEQ nogap", "ADDQ DX, DX", "nogap:",
 		"ADDQ DX, 80(DI)", "framed:",
-		"LEAQ -1(R13), R8")
+		"LEAQ -1(R13), R8"}
+	add("CallStatic", append([]string{
+		"MOVBLZX AH, DX", "SHRL $4, DX", "CMPL DX, $1", "JNE out",
+		simm, "LEAQ 1(R8)(AX*1), R13", "CMPQ R13, R9", "JCC out"}, pushFrame...)...)
+	// Internal call of the legacy versions: calls is the program's table of
+	// resolved targets, passed only when no entry in it names a syscall
+	// (Interpreter.fastCalls). An entry of -1 fails the unsigned bound check.
+	add("CallLegacy", append([]string{
+		"MOVQ calls+64(FP), R15", "TESTQ R15, R15", "JEQ out",
+		"MOVQ (R15)(R8*8), R13", "CMPQ R13, R9", "JCC out"}, pushFrame...)...)
 	// Return from an inner frame: pop the shadow frame. Returning from the
 	// entry frame (depth 1) ends the program and stays in Go.
 	add("Exit",
@@ -309,12 +318,12 @@ func main() {
 // LEAVE returns pc and the unused budget to Go. Every handler shares
 // runAsmLoop's argument frame: none of them moves SP, so the offsets agree.
 #define LEAVE \
-	MOVQ R8, newPC+64(FP); \
-	MOVQ R10, newRem+72(FP); \
+	MOVQ R8, newPC+72(FP); \
+	MOVQ R10, newRem+80(FP); \
 	RET
 
-// func runAsmLoop(text *Slot, textLen int64, r *[16]uint64, regions *[numFastRegions]memRegion, table *[256]uintptr, stack *Stack, pc int64, rem uint64) (newPC int64, newRem uint64)
-TEXT ·runAsmLoop(SB), NOSPLIT|NOFRAME, $0-80
+// func runAsmLoop(text *Slot, textLen int64, r *[16]uint64, regions *[numFastRegions]memRegion, table *[256]uintptr, stack *Stack, pc int64, rem uint64, calls *int64) (newPC int64, newRem uint64)
+TEXT ·runAsmLoop(SB), NOSPLIT|NOFRAME, $0-88
 	MOVQ text+0(FP), SI
 	MOVQ textLen+8(FP), R9
 	MOVQ r+16(FP), DI
@@ -332,7 +341,7 @@ out:
 	LEAVE
 `)
 	for _, h := range handlers {
-		fmt.Fprintf(&s, "\nTEXT asmOp%s<>(SB), NOSPLIT|NOFRAME, $0-80\n", h.name)
+		fmt.Fprintf(&s, "\nTEXT asmOp%s<>(SB), NOSPLIT|NOFRAME, $0-88\n", h.name)
 		// The handlers run in runAsmLoop's frame, so they describe its
 		// arguments the same way.
 		s.WriteString("\tFUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)\n")

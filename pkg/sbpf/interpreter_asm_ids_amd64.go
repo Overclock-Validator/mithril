@@ -110,6 +110,7 @@ const (
 	asmJsleImm
 	asmJsleReg
 	asmCallStatic
+	asmCallLegacy
 	asmExit
 	numAsmHandlers
 )

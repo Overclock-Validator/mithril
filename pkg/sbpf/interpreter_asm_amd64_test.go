@@ -47,6 +47,7 @@ func newAsmStepVM(t *testing.T, ver uint32, disableGaps bool, seed int64) *asmSt
 // finish returns the VM's buffers to their pools. The tests overwrite dirty
 // bits and shadow frames freely, so mark everything as used first.
 func (vm *asmStepVM) finish() {
+	vm.ip.fastCalls = nil
 	for k := range vm.ip.regions {
 		vm.ip.regions[k].dirty = ^uint64(0)
 	}
@@ -203,6 +204,7 @@ func TestAsmLoopSingleStepMatchesRunFast(t *testing.T) {
 			table := buildAsmTable(f, gaps)
 			name := fmt.Sprintf("v%d gaps=%t %+v", cfg.ver, !cfg.disableGaps, f)
 			text := make([]Slot, 12)
+			callTable := make([]int64, len(text))
 			for op := 0; op < 256; op++ {
 				n, isMem := trials, false
 				switch uint8(op) {
@@ -233,6 +235,18 @@ func TestAsmLoopSingleStepMatchesRunFast(t *testing.T) {
 					}
 					got.r = ref.r
 					ref.ip.text, got.ip.text = text, text
+					// Resolved legacy call targets: mostly present, with
+					// entries that are absent, valid, and out of the text in
+					// both directions. The static versions never have a table.
+					var calls []int64
+					var asmCalls *int64
+					if !f.staticSyscalls && rng.Intn(8) != 0 {
+						calls, asmCalls = callTable, &callTable[0]
+						for k := range calls {
+							calls[k] = []int64{-1, -1, int64(rng.Intn(len(text))), int64(rng.Intn(len(text))), int64(len(text)), int64(len(text)) + 1, -2, 1 << 40, -1 << 63}[rng.Intn(9)]
+						}
+					}
+					ref.ip.fastCalls, got.ip.fastCalls = calls, calls
 					// Fresh dirty bits (accumulated ones would hide a wrong
 					// update) and a random shadow stack, identical on both.
 					for k := range ref.ip.regions {
@@ -263,7 +277,7 @@ func TestAsmLoopSingleStepMatchesRunFast(t *testing.T) {
 					wantPC, wantDue, wantPanic := asmCatch(func() (int64, uint64) { return ref.ip.runFast(&ref.r, pc, 0, 1, f) })
 
 					before := got.r
-					asmPC, left := runAsmLoop(&text[0], int64(len(text)), &got.r, &got.ip.regions, table, &got.ip.stack, pc, 1)
+					asmPC, left := runAsmLoop(&text[0], int64(len(text)), &got.r, &got.ip.regions, table, &got.ip.stack, pc, 1, asmCalls)
 					if left != 0 {
 						// The loop declined, so Run's general path executes
 						// this instruction. Nothing may have changed, and the
@@ -328,7 +342,7 @@ func TestAsmLoopBudgetAndBounds(t *testing.T) {
 		{1 << 40, 5, 1 << 40, 0},
 	} {
 		var r [16]uint64
-		pc, left := runAsmLoop(&text[0], int64(len(text)), &r, &vm.ip.regions, table, &vm.ip.stack, tc.pc, tc.rem)
+		pc, left := runAsmLoop(&text[0], int64(len(text)), &r, &vm.ip.regions, table, &vm.ip.stack, tc.pc, tc.rem, nil)
 		// Two of every three instructions are adds to r1.
 		wantR1 := tc.wantExecuted - tc.wantExecuted/3
 		if pc != tc.wantPC || tc.rem-left != tc.wantExecuted || r[1] != wantR1 {
@@ -339,7 +353,7 @@ func TestAsmLoopBudgetAndBounds(t *testing.T) {
 	for _, off := range []int16{5, 32767, -2, -32768} {
 		jump := []Slot{slot(OpJa, 0, 0, off, 0)}
 		var r [16]uint64
-		pc, left := runAsmLoop(&jump[0], 1, &r, &vm.ip.regions, table, &vm.ip.stack, 0, 10)
+		pc, left := runAsmLoop(&jump[0], 1, &r, &vm.ip.regions, table, &vm.ip.stack, 0, 10, nil)
 		if pc != int64(off)+1 || left != 9 {
 			t.Errorf("ja %d: got pc=%d left=%d", off, pc, left)
 		}

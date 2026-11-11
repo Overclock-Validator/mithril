@@ -22,12 +22,12 @@
 // LEAVE returns pc and the unused budget to Go. Every handler shares
 // runAsmLoop's argument frame: none of them moves SP, so the offsets agree.
 #define LEAVE \
-	MOVQ R8, newPC+64(FP); \
-	MOVQ R10, newRem+72(FP); \
+	MOVQ R8, newPC+72(FP); \
+	MOVQ R10, newRem+80(FP); \
 	RET
 
-// func runAsmLoop(text *Slot, textLen int64, r *[16]uint64, regions *[numFastRegions]memRegion, table *[256]uintptr, stack *Stack, pc int64, rem uint64) (newPC int64, newRem uint64)
-TEXT ·runAsmLoop(SB), NOSPLIT|NOFRAME, $0-80
+// func runAsmLoop(text *Slot, textLen int64, r *[16]uint64, regions *[numFastRegions]memRegion, table *[256]uintptr, stack *Stack, pc int64, rem uint64, calls *int64) (newPC int64, newRem uint64)
+TEXT ·runAsmLoop(SB), NOSPLIT|NOFRAME, $0-88
 	MOVQ text+0(FP), SI
 	MOVQ textLen+8(FP), R9
 	MOVQ r+16(FP), DI
@@ -44,11 +44,11 @@ TEXT ·runAsmLoop(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpBail<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpBail<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	LEAVE
 
-TEXT asmOpLdxb<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpLdxb<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -81,7 +81,7 @@ TEXT asmOpLdxb<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpLdxh<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpLdxh<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -114,7 +114,7 @@ TEXT asmOpLdxh<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpLdxw<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpLdxw<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -147,7 +147,7 @@ TEXT asmOpLdxw<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpLdxdw<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpLdxdw<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -180,7 +180,7 @@ TEXT asmOpLdxdw<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpStb<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpStb<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -219,7 +219,7 @@ nodirty:
 out:
 	LEAVE
 
-TEXT asmOpSth<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpSth<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -258,7 +258,7 @@ nodirty:
 out:
 	LEAVE
 
-TEXT asmOpStw<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpStw<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -297,7 +297,7 @@ nodirty:
 out:
 	LEAVE
 
-TEXT asmOpStdw<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpStdw<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -336,7 +336,7 @@ nodirty:
 out:
 	LEAVE
 
-TEXT asmOpStxb<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpStxb<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -377,7 +377,7 @@ nodirty:
 out:
 	LEAVE
 
-TEXT asmOpStxh<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpStxh<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -418,7 +418,7 @@ nodirty:
 out:
 	LEAVE
 
-TEXT asmOpStxw<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpStxw<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -459,7 +459,7 @@ nodirty:
 out:
 	LEAVE
 
-TEXT asmOpStxdw<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpStxdw<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -500,7 +500,7 @@ nodirty:
 out:
 	LEAVE
 
-TEXT asmOpLdxbNoGap<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpLdxbNoGap<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -527,7 +527,7 @@ TEXT asmOpLdxbNoGap<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpLdxhNoGap<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpLdxhNoGap<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -554,7 +554,7 @@ TEXT asmOpLdxhNoGap<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpLdxwNoGap<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpLdxwNoGap<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -581,7 +581,7 @@ TEXT asmOpLdxwNoGap<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpLdxdwNoGap<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpLdxdwNoGap<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -608,7 +608,7 @@ TEXT asmOpLdxdwNoGap<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpStbNoGap<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpStbNoGap<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -641,7 +641,7 @@ nodirty:
 out:
 	LEAVE
 
-TEXT asmOpSthNoGap<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpSthNoGap<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -674,7 +674,7 @@ nodirty:
 out:
 	LEAVE
 
-TEXT asmOpStwNoGap<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpStwNoGap<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -707,7 +707,7 @@ nodirty:
 out:
 	LEAVE
 
-TEXT asmOpStdwNoGap<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpStdwNoGap<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -740,7 +740,7 @@ nodirty:
 out:
 	LEAVE
 
-TEXT asmOpStxbNoGap<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpStxbNoGap<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -775,7 +775,7 @@ nodirty:
 out:
 	LEAVE
 
-TEXT asmOpStxhNoGap<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpStxhNoGap<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -810,7 +810,7 @@ nodirty:
 out:
 	LEAVE
 
-TEXT asmOpStxwNoGap<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpStxwNoGap<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -845,7 +845,7 @@ nodirty:
 out:
 	LEAVE
 
-TEXT asmOpStxdwNoGap<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpStxdwNoGap<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -880,7 +880,7 @@ nodirty:
 out:
 	LEAVE
 
-TEXT asmOpAdd32ImmSX<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpAdd32ImmSX<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -892,7 +892,7 @@ TEXT asmOpAdd32ImmSX<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpAdd32RegSX<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpAdd32RegSX<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -906,7 +906,7 @@ TEXT asmOpAdd32RegSX<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpSub32ImmSX<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpSub32ImmSX<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -919,7 +919,7 @@ TEXT asmOpSub32ImmSX<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpSub32ImmSwapSX<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpSub32ImmSwapSX<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -931,7 +931,7 @@ TEXT asmOpSub32ImmSwapSX<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpSub32RegSX<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpSub32RegSX<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -946,7 +946,7 @@ TEXT asmOpSub32RegSX<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpAdd32ImmZX<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpAdd32ImmZX<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -957,7 +957,7 @@ TEXT asmOpAdd32ImmZX<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpAdd32RegZX<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpAdd32RegZX<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -970,7 +970,7 @@ TEXT asmOpAdd32RegZX<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpSub32ImmZX<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpSub32ImmZX<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -982,7 +982,7 @@ TEXT asmOpSub32ImmZX<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpSub32ImmSwapZX<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpSub32ImmSwapZX<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -993,7 +993,7 @@ TEXT asmOpSub32ImmSwapZX<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpSub32RegZX<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpSub32RegZX<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1007,7 +1007,7 @@ TEXT asmOpSub32RegZX<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpMul32Imm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpMul32Imm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1019,7 +1019,7 @@ TEXT asmOpMul32Imm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpMul32Reg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpMul32Reg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1033,7 +1033,7 @@ TEXT asmOpMul32Reg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpOr32Imm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpOr32Imm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1044,7 +1044,7 @@ TEXT asmOpOr32Imm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpOr32Reg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpOr32Reg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1057,7 +1057,7 @@ TEXT asmOpOr32Reg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpAnd32Imm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpAnd32Imm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1068,7 +1068,7 @@ TEXT asmOpAnd32Imm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpAnd32Reg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpAnd32Reg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1081,7 +1081,7 @@ TEXT asmOpAnd32Reg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpXor32Imm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpXor32Imm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1092,7 +1092,7 @@ TEXT asmOpXor32Imm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpXor32Reg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpXor32Reg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1105,7 +1105,7 @@ TEXT asmOpXor32Reg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpLsh32Imm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpLsh32Imm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1118,7 +1118,7 @@ TEXT asmOpLsh32Imm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpLsh32Reg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpLsh32Reg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1132,7 +1132,7 @@ TEXT asmOpLsh32Reg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpRsh32Imm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpRsh32Imm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1145,7 +1145,7 @@ TEXT asmOpRsh32Imm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpRsh32Reg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpRsh32Reg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1159,7 +1159,7 @@ TEXT asmOpRsh32Reg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpArsh32Imm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpArsh32Imm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1174,7 +1174,7 @@ TEXT asmOpArsh32Imm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpArsh32Reg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpArsh32Reg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1190,7 +1190,7 @@ TEXT asmOpArsh32Reg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpMov32Imm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpMov32Imm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1200,7 +1200,7 @@ TEXT asmOpMov32Imm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpMov32RegSX<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpMov32RegSX<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1212,7 +1212,7 @@ TEXT asmOpMov32RegSX<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpMov32RegZX<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpMov32RegZX<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1224,7 +1224,7 @@ TEXT asmOpMov32RegZX<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpDiv32Reg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpDiv32Reg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1241,7 +1241,7 @@ TEXT asmOpDiv32Reg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpMod32Reg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpMod32Reg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1258,7 +1258,7 @@ TEXT asmOpMod32Reg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpAdd64Imm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpAdd64Imm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1268,7 +1268,7 @@ TEXT asmOpAdd64Imm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpAdd64Reg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpAdd64Reg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1280,7 +1280,7 @@ TEXT asmOpAdd64Reg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpOr64Imm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpOr64Imm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1290,7 +1290,7 @@ TEXT asmOpOr64Imm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpOr64Reg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpOr64Reg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1302,7 +1302,7 @@ TEXT asmOpOr64Reg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpAnd64Imm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpAnd64Imm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1312,7 +1312,7 @@ TEXT asmOpAnd64Imm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpAnd64Reg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpAnd64Reg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1324,7 +1324,7 @@ TEXT asmOpAnd64Reg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpXor64Imm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpXor64Imm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1334,7 +1334,7 @@ TEXT asmOpXor64Imm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpXor64Reg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpXor64Reg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1346,7 +1346,7 @@ TEXT asmOpXor64Reg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpSub64Imm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpSub64Imm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1356,7 +1356,7 @@ TEXT asmOpSub64Imm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpSub64Reg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpSub64Reg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1368,7 +1368,7 @@ TEXT asmOpSub64Reg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpSub64ImmSwap<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpSub64ImmSwap<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1379,7 +1379,7 @@ TEXT asmOpSub64ImmSwap<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpMul64Imm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpMul64Imm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1390,7 +1390,7 @@ TEXT asmOpMul64Imm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpMul64Reg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpMul64Reg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1403,7 +1403,7 @@ TEXT asmOpMul64Reg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpLsh64Imm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpLsh64Imm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1414,7 +1414,7 @@ TEXT asmOpLsh64Imm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpLsh64Reg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpLsh64Reg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1426,7 +1426,7 @@ TEXT asmOpLsh64Reg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpRsh64Imm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpRsh64Imm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1437,7 +1437,7 @@ TEXT asmOpRsh64Imm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpRsh64Reg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpRsh64Reg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1449,7 +1449,7 @@ TEXT asmOpRsh64Reg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpArsh64Imm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpArsh64Imm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1462,7 +1462,7 @@ TEXT asmOpArsh64Imm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpArsh64Reg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpArsh64Reg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1476,7 +1476,7 @@ TEXT asmOpArsh64Reg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpMov64Imm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpMov64Imm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1486,7 +1486,7 @@ TEXT asmOpMov64Imm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpMov64Reg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpMov64Reg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1498,7 +1498,7 @@ TEXT asmOpMov64Reg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpDiv64Imm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpDiv64Imm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1514,7 +1514,7 @@ TEXT asmOpDiv64Imm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpMod64Imm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpMod64Imm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1530,7 +1530,7 @@ TEXT asmOpMod64Imm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpDiv64Reg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpDiv64Reg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1547,7 +1547,7 @@ TEXT asmOpDiv64Reg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpMod64Reg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpMod64Reg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1564,7 +1564,7 @@ TEXT asmOpMod64Reg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpLddw<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpLddw<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1582,7 +1582,7 @@ TEXT asmOpLddw<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpJa<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpJa<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVQ AX, DX
 	SHLQ $32, DX
@@ -1592,7 +1592,7 @@ TEXT asmOpJa<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpJeqImm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpJeqImm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1608,7 +1608,7 @@ TEXT asmOpJeqImm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpJeqReg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpJeqReg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1626,7 +1626,7 @@ TEXT asmOpJeqReg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpJgtImm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpJgtImm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1642,7 +1642,7 @@ TEXT asmOpJgtImm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpJgtReg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpJgtReg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1660,7 +1660,7 @@ TEXT asmOpJgtReg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpJgeImm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpJgeImm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1676,7 +1676,7 @@ TEXT asmOpJgeImm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpJgeReg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpJgeReg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1694,7 +1694,7 @@ TEXT asmOpJgeReg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpJltImm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpJltImm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1710,7 +1710,7 @@ TEXT asmOpJltImm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpJltReg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpJltReg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1728,7 +1728,7 @@ TEXT asmOpJltReg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpJleImm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpJleImm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1744,7 +1744,7 @@ TEXT asmOpJleImm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpJleReg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpJleReg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1762,7 +1762,7 @@ TEXT asmOpJleReg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpJsetImm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpJsetImm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1778,7 +1778,7 @@ TEXT asmOpJsetImm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpJsetReg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpJsetReg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1796,7 +1796,7 @@ TEXT asmOpJsetReg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpJneImm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpJneImm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1812,7 +1812,7 @@ TEXT asmOpJneImm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpJneReg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpJneReg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1830,7 +1830,7 @@ TEXT asmOpJneReg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpJsgtImm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpJsgtImm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1846,7 +1846,7 @@ TEXT asmOpJsgtImm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpJsgtReg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpJsgtReg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1864,7 +1864,7 @@ TEXT asmOpJsgtReg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpJsgeImm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpJsgeImm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1880,7 +1880,7 @@ TEXT asmOpJsgeImm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpJsgeReg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpJsgeReg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1898,7 +1898,7 @@ TEXT asmOpJsgeReg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpJsltImm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpJsltImm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1914,7 +1914,7 @@ TEXT asmOpJsltImm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpJsltReg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpJsltReg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1932,7 +1932,7 @@ TEXT asmOpJsltReg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpJsleImm<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpJsleImm<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	ANDL $15, BX
@@ -1948,7 +1948,7 @@ TEXT asmOpJsleImm<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpJsleReg<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpJsleReg<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, BX
 	MOVL BX, DX
@@ -1966,7 +1966,7 @@ TEXT asmOpJsleReg<>(SB), NOSPLIT|NOFRAME, $0-80
 out:
 	LEAVE
 
-TEXT asmOpCallStatic<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpCallStatic<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVBLZX AH, DX
 	SHRL $4, DX
@@ -2014,7 +2014,53 @@ framed:
 out:
 	LEAVE
 
-TEXT asmOpExit<>(SB), NOSPLIT|NOFRAME, $0-80
+TEXT asmOpCallLegacy<>(SB), NOSPLIT|NOFRAME, $0-88
+	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
+	MOVQ calls+64(FP), R15
+	TESTQ R15, R15
+	JEQ out
+	MOVQ (R15)(R8*8), R13
+	CMPQ R13, R9
+	JCC out
+	MOVQ stack+40(FP), R15
+	MOVQ (Stack_shadow+8)(R15), CX
+	CMPQ CX, (Stack_shadow+16)(R15)
+	JGE out
+	IMUL3Q $Frame__size, CX, R12
+	ADDQ Stack_shadow(R15), R12
+	INCQ CX
+	MOVQ CX, (Stack_shadow+8)(R15)
+	LEAQ 1(R8), DX
+	MOVQ DX, Frame_RetAddr(R12)
+	MOVQ 48(DI), DX
+	MOVQ DX, (Frame_NVRegs+0)(R12)
+	MOVQ 56(DI), DX
+	MOVQ DX, (Frame_NVRegs+8)(R12)
+	MOVQ 64(DI), DX
+	MOVQ DX, (Frame_NVRegs+16)(R12)
+	MOVQ 72(DI), DX
+	MOVQ DX, (Frame_NVRegs+24)(R12)
+	MOVQ 80(DI), DX
+	MOVQ DX, Frame_FramePtr(R12)
+	CMPQ CX, Stack_maxDepth(R15)
+	JLE nomax
+	MOVQ CX, Stack_maxDepth(R15)
+nomax:
+	CMPB Stack_dynamicStackFrames(R15), $0
+	JNE framed
+	MOVQ $const_StackFrameSize, DX
+	CMPB Stack_stackFrameGaps(R15), $0
+	JEQ nogap
+	ADDQ DX, DX
+nogap:
+	ADDQ DX, 80(DI)
+framed:
+	LEAQ -1(R13), R8
+	NEXT
+out:
+	LEAVE
+
+TEXT asmOpExit<>(SB), NOSPLIT|NOFRAME, $0-88
 	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
 	MOVQ stack+40(FP), R15
 	MOVQ (Stack_shadow+8)(R15), CX
@@ -2145,8 +2191,9 @@ DATA asmHandlers<>+800(SB)/8, $asmOpJsltReg<>(SB)
 DATA asmHandlers<>+808(SB)/8, $asmOpJsleImm<>(SB)
 DATA asmHandlers<>+816(SB)/8, $asmOpJsleReg<>(SB)
 DATA asmHandlers<>+824(SB)/8, $asmOpCallStatic<>(SB)
-DATA asmHandlers<>+832(SB)/8, $asmOpExit<>(SB)
-GLOBL asmHandlers<>(SB), RODATA|NOPTR, $840
+DATA asmHandlers<>+832(SB)/8, $asmOpCallLegacy<>(SB)
+DATA asmHandlers<>+840(SB)/8, $asmOpExit<>(SB)
+GLOBL asmHandlers<>(SB), RODATA|NOPTR, $848
 
 // func asmHandlerTable() *[numAsmHandlers]uintptr
 TEXT ·asmHandlerTable(SB), NOSPLIT, $0-8

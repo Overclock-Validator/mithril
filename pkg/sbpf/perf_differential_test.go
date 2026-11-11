@@ -36,6 +36,9 @@ var (
 	hashSetLen = SymbolHash("setlen") // SetInputRegionLength(r1, r2, r3!=0)
 )
 
+// diffRegistryID identifies diffRegistry to VMOpts.SyscallsID.
+const diffRegistryID = "diffRegistry"
+
 func diffRegistry(h uint32) (Syscall, bool) {
 	switch h {
 	case hashPoke:
@@ -356,9 +359,16 @@ func writeDifferentialDump(t *testing.T, w io.Writer, n int) {
 		}
 		cm := cu.NewComputeMeter(budget)
 		heapMax := 4096 * (1 + rng.Intn(4))
+		// SBPF_DIFF_SYSCALLS_ID=1 identifies the registry, which lets legacy
+		// internal calls skip it. The dump must not change.
+		var syscallsID any
+		if os.Getenv("SBPF_DIFF_SYSCALLS_ID") == "1" {
+			syscallsID = diffRegistryID
+		}
 		ip := NewInterpreter(p, &VMOpts{
 			HeapMax:               heapMax,
 			Syscalls:              diffRegistry,
+			SyscallsID:            syscallsID,
 			ComputeMeter:          &cm,
 			Input:                 input,
 			InputRegions:          regions,

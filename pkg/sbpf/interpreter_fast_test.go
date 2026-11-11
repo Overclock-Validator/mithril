@@ -33,9 +33,16 @@ func runWithFastLoop(t *testing.T, p *Program, fast bool, budget uint64, seed in
 		}
 	}
 	cm := cu.NewComputeMeter(budget)
+	// Only the fast side identifies its registry, so the reference side asks
+	// the registry at every legacy call as before.
+	var syscallsID any
+	if fast {
+		syscallsID = diffRegistryID
+	}
 	ip := NewInterpreter(p, &VMOpts{
 		HeapMax:               4096 * (1 + rng.Intn(4)),
 		Syscalls:              diffRegistry,
+		SyscallsID:            syscallsID,
 		ComputeMeter:          &cm,
 		Input:                 input,
 		InputRegions:          regions,

@@ -26,9 +26,11 @@ var asmChunk uint64 = 1 << 14
 // completed, pc leaves the text, or it reaches an instruction it does not
 // handle (which it leaves untouched). It returns the next pc and the unused
 // part of rem. text must have textLen elements and table 256 handler entries.
+// calls is nil or the first of textLen resolved legacy call targets
+// (Interpreter.fastCalls).
 //
 //go:noescape
-func runAsmLoop(text *Slot, textLen int64, r *[16]uint64, regions *[numFastRegions]memRegion, table *[256]uintptr, stack *Stack, pc int64, rem uint64) (newPC int64, newRem uint64)
+func runAsmLoop(text *Slot, textLen int64, r *[16]uint64, regions *[numFastRegions]memRegion, table *[256]uintptr, stack *Stack, pc int64, rem uint64, calls *int64) (newPC int64, newRem uint64)
 
 // asmHandlerTable returns the handler addresses, indexed by handler ID.
 func asmHandlerTable() *[numAsmHandlers]uintptr
@@ -225,14 +227,27 @@ func buildAsmTable(f fastFlags, gaps bool) *[256]uintptr {
 		set(OpMod64Imm, asmMod64Imm)
 		set(OpMod64Reg, asmMod64Reg)
 	}
-	// Legacy call immediates may name a syscall and stay on Run's path. The
-	// handler computes the target as pc + imm + 1, the static-syscall rule of
-	// CalculateCallImmTargetPC; f always comes from the interpreter's version.
+	// The static handler computes the target as pc + imm + 1, the
+	// static-syscall rule of CalculateCallImmTargetPC; f always comes from the
+	// interpreter's version. Legacy call immediates may name a syscall: their
+	// handler takes only the calls runAsmLoop's calls argument resolves, and
+	// leaves every call to Run when that argument is nil.
 	if f.staticSyscalls {
 		set(OpCall, asmCallStatic)
+	} else {
+		set(OpCall, asmCallLegacy)
 	}
 	set(OpExit, asmExit)
 	return t
+}
+
+// asmCalls returns runAsmLoop's calls argument: the resolved legacy call
+// targets, one per text slot, or nil when legacy calls must stay with Run.
+func (ip *Interpreter) asmCalls() *int64 {
+	if len(ip.fastCalls) == 0 || len(ip.fastCalls) != len(ip.text) {
+		return nil
+	}
+	return &ip.fastCalls[0]
 }
 
 // asmYield is a preemption point between chunks: unlike the assembly loop,
@@ -250,11 +265,12 @@ func asmYieldSink() {}
 // instruction it leaves to Run, or when the budget is spent.
 func (ip *Interpreter) runAsmChunks(r *[16]uint64, pc int64, due, budget uint64, table *[256]uintptr) (int64, uint64) {
 	text := ip.text
+	calls := ip.asmCalls()
 	for {
 		asmYield()
 		// A chunk of at least one instruction, so the loop always progresses.
 		rem := min(budget-due, max(asmChunk, 1))
-		newPC, left := runAsmLoop(&text[0], int64(len(text)), r, &ip.regions, table, &ip.stack, pc, rem)
+		newPC, left := runAsmLoop(&text[0], int64(len(text)), r, &ip.regions, table, &ip.stack, pc, rem, calls)
 		pc, due = newPC, due+(rem-left)
 		if left != 0 || due == budget {
 			return pc, due
