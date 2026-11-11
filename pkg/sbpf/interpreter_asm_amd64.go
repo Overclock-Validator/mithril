@@ -35,6 +35,44 @@ func runAsmLoop(text *Slot, textLen int64, r *[16]uint64, regions *[numFastRegio
 // asmHandlerTable returns the handler addresses, indexed by handler ID.
 func asmHandlerTable() *[numAsmHandlers]uintptr
 
+// asmHandlerTableShared returns the same handlers built to end in a jump to
+// one shared dispatch point instead of an indirect jump of their own.
+func asmHandlerTableShared() *[numAsmHandlers]uintptr
+
+// asmSharedDispatch selects the shared-dispatch handler set
+// (MITHRIL_SBPF_ASM_DISPATCH=shared). Experiment: the threaded set is the
+// default. Both sets execute every instruction identically; they differ only
+// in where the jump to the next handler is made, which changes how the CPU
+// predicts it.
+var asmSharedDispatch = os.Getenv("MITHRIL_SBPF_ASM_DISPATCH") == "shared"
+
+// asmHandlers returns the handler set in use.
+func asmHandlers() *[numAsmHandlers]uintptr {
+	if asmSharedDispatch {
+		return asmHandlerTableShared()
+	}
+	return asmHandlerTable()
+}
+
+// setAsmSharedDispatch switches handler sets and drops the cached opcode
+// tables, which hold handler addresses. Tests only: no interpreter may be
+// running.
+func setAsmSharedDispatch(shared bool) func() {
+	prev := asmSharedDispatch
+	set := func(v bool) {
+		asmSharedDispatch = v
+		for i := range asmTables {
+			asmTables[i].Store(nil)
+		}
+		for i := range asmVersionTables {
+			asmVersionTables[i][0].Store(nil)
+			asmVersionTables[i][1].Store(nil)
+		}
+	}
+	set(shared)
+	return func() { set(prev) }
+}
+
 // asmTables caches one opcode table per combination of the version gates that
 // change which handler an opcode uses. Tables are immutable once stored.
 var asmTables [1 << 8]atomic.Pointer[[256]uintptr]
@@ -114,7 +152,7 @@ func asmLoopAvailable() bool { return true }
 // gaps must be true if any window has gap fields set (asmRegionsHaveGaps):
 // the NoGap memory handlers leave the gap arithmetic out.
 func buildAsmTable(f fastFlags, gaps bool) *[256]uintptr {
-	h := asmHandlerTable()
+	h := asmHandlers()
 	t := new([256]uintptr)
 	for i := range t {
 		t[i] = h[asmBail]

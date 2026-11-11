@@ -24,3 +24,5 @@ func (ip *Interpreter) runAsmChunks(_ *[16]uint64, pc int64, due, _ uint64, _ *[
 func (ip *Interpreter) asmCalls() *int64 { return nil }
 
 func setAsmChunk(uint64) func() { return func() {} }
+
+func setAsmSharedDispatch(bool) func() { return func() {} }
