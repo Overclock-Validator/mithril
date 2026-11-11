@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/Overclock-Validator/mithril/pkg/config"
+	"github.com/Overclock-Validator/mithril/pkg/shredcap"
 	"github.com/Overclock-Validator/mithril/pkg/state"
 	"github.com/Overclock-Validator/mithril/pkg/turbine"
 )
@@ -40,6 +41,46 @@ type backtestMarker struct {
 	// SnapshotSlot is set once accounts/ holds a store built from a snapshot
 	// at that slot.
 	SnapshotSlot uint64 `json:"snapshot_slot,omitempty"`
+	// Import is recorded once corpus/ holds an import of Capture from FromSlot
+	// that passed the capture checks. Only such an import is reused: a marker
+	// without it (a rejected or interrupted import, or a marker written before
+	// this field existed) makes the next run import and check the capture again.
+	Import validatedImport `json:"import"`
+}
+
+// validatedImport says that the import in corpus/ passed the capture checks,
+// and which import that was: the checkpoint, head and block count of its
+// manifest, so a manifest that is not the checked one is not reused.
+type validatedImport struct {
+	Validated  bool   `json:"validated"`
+	Checkpoint uint64 `json:"checkpoint,omitempty"`
+	Head       uint64 `json:"head,omitempty"`
+	Blocks     int    `json:"blocks,omitempty"`
+}
+
+func validatedImportOf(man *shredcap.Manifest) validatedImport {
+	return validatedImport{Validated: true, Checkpoint: man.Checkpoint, Head: man.Head, Blocks: man.Blocks}
+}
+
+// checkReusedManifest checks what a manifest alone can show about an import
+// that is about to be reused: it is the import the marker recorded as checked,
+// and every chain slot has a bank hash to compare replay with.
+func checkReusedManifest(man *shredcap.Manifest, recorded validatedImport) error {
+	if !recorded.Validated {
+		return errors.New("the import was not recorded as checked")
+	}
+	if len(man.Slots) == 0 {
+		return errors.New("the manifest lists no slots")
+	}
+	if got := validatedImportOf(man); got != recorded || man.Blocks != len(man.Slots) || man.Head != man.Slots[len(man.Slots)-1] {
+		return errors.New("the manifest is not the import that was checked")
+	}
+	for _, slot := range man.Slots {
+		if _, ok := man.BankHashes[strconv.FormatUint(slot, 10)]; !ok {
+			return fmt.Errorf("no bank hash for slot %d", slot)
+		}
+	}
+	return nil
 }
 
 // captureFingerprint identifies a capture by the SHA-256 of its contents.

@@ -341,14 +341,18 @@ func runBacktest(cmd *cobra.Command, _ []string) error {
 }
 
 // backtestCorpus imports the capture into workdir/corpus, or reuses an
-// earlier import of the same capture and slot range.
+// earlier import of the same capture and slot range. An import is reusable
+// only when the marker records that it passed the capture checks below; a
+// capture that fails them leaves no import behind, so every later run checks
+// it again.
 func backtestCorpus(cmd *cobra.Command, workdir string, marker *backtestMarker, fp captureFingerprint, fromSlot uint64) (*shredcap.Manifest, error) {
 	corpusDir := filepath.Join(workdir, "corpus")
 	// The import is reused only for the same capture contents: name, size and
 	// mtime can coincide between different captures.
 	sameCapture := fp.SHA256 != "" && marker.Capture.SHA256 == fp.SHA256
-	if sameCapture && marker.FromSlot == fromSlot {
-		if man, err := shredcap.ReadManifest(corpusDir); err == nil {
+	if sameCapture && marker.FromSlot == fromSlot && marker.Import.Validated {
+		// Anything that does not hold up is imported and checked again.
+		if man, err := shredcap.ReadManifest(corpusDir); err == nil && checkReusedManifest(man, marker.Import) == nil {
 			return man, nil
 		}
 	}
@@ -359,9 +363,9 @@ func backtestCorpus(cmd *cobra.Command, workdir string, marker *backtestMarker, 
 	if err := os.RemoveAll(corpusDir); err != nil {
 		return nil, err
 	}
-	// Record the capture first: an interrupted import leaves a corpus with no
-	// manifest, which the next run imports again.
-	marker.Capture, marker.FromSlot = fp, fromSlot
+	// Record the capture first, as not yet checked: an interrupted or rejected
+	// import is imported again by the next run.
+	marker.Capture, marker.FromSlot, marker.Import = fp, fromSlot, validatedImport{}
 	if err := writeBacktestMarker(workdir, *marker); err != nil {
 		return nil, err
 	}
@@ -370,6 +374,14 @@ func backtestCorpus(cmd *cobra.Command, workdir string, marker *backtestMarker, 
 		return nil, err
 	}
 	defer in.Close()
+	// From here on, any failure removes what the import wrote. ImportCorpus
+	// writes the manifest before the checks below can reject the capture.
+	accepted := false
+	defer func() {
+		if !accepted {
+			_ = os.RemoveAll(corpusDir)
+		}
+	}()
 	fmt.Fprintf(cmd.OutOrStdout(), "importing %s\n", fp.Name)
 	man, stats, err := shredcap.ImportCorpus(in, corpusDir, shredcap.ImportOptions{FromSlot: fromSlot, Source: fp.Name})
 	if err != nil {
@@ -383,8 +395,13 @@ func backtestCorpus(cmd *cobra.Command, workdir string, marker *backtestMarker, 
 	}
 	fmt.Fprintf(cmd.OutOrStdout(), "imported %d blocks, slots %d..%d, checkpoint %d, shred version %d (%d slots recovered from coding shreds)\n",
 		man.Blocks, man.Slots[0], man.Head, man.Checkpoint, man.ShredVersion, len(stats.RecoveredSlots))
-	marker.Capture, marker.FromSlot = fp, fromSlot
-	return man, writeBacktestMarker(workdir, *marker)
+	marker.Import = validatedImportOf(man)
+	if err := writeBacktestMarker(workdir, *marker); err != nil {
+		marker.Import = validatedImport{}
+		return nil, err
+	}
+	accepted = true
+	return man, nil
 }
 
 func captureBankHashes(man *shredcap.Manifest) (map[uint64][32]byte, error) {

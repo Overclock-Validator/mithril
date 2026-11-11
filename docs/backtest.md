@@ -86,7 +86,10 @@ stops the run.
 
 The work directory is reused: the imported capture (`corpus/`) is kept for
 as long as the capture's contents (SHA-256) are unchanged, and
-the AccountsDB is rewound rather than rebuilt.
+the AccountsDB is rewound rather than rebuilt. Only an import that passed the
+capture checks (a bank hash for every block, an unbroken parent chain) is
+kept: a rejected capture leaves no import, so running it again reports the
+same error.
 
 - With `--accounts`, a store that has replayed past the capture's start is
   rewound to it when that slot is a retained fold boundary, and refused

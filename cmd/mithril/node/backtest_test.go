@@ -2,6 +2,7 @@ package node
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/state"
 	"github.com/Overclock-Validator/mithril/pkg/turbine"
 	"github.com/gagliardetto/solana-go"
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/require"
 )
 
@@ -492,4 +494,158 @@ func TestBacktestCorpusFollowsCaptureContents(t *testing.T) {
 	stamp = stamp.Add(time.Hour)
 	write(pathA, dataB)
 	require.Equal(t, solana.Hash(b).String(), importFrom(workdir, &marker, pathA))
+}
+
+// captureSlot describes one slot of a test capture: complete, rooted, with a
+// bank hash record unless noBankHash is set.
+type captureSlot struct {
+	slot, parent uint64
+	noBankHash   bool
+}
+
+func captureOf(t *testing.T, slots ...captureSlot) []byte {
+	t.Helper()
+	leader, err := solana.NewRandomPrivateKey()
+	require.NoError(t, err)
+	var b bytes.Buffer
+	w, err := shredcap.NewWriter(&b, "test")
+	require.NoError(t, err)
+	for _, cs := range slots {
+		gen := turbine.ShredGenerator{Slot: cs.slot, ParentSlot: cs.parent, Version: 7}
+		packets, _, _, _, err := gen.MakeShredsFromData(leader, nil, true, solana.Hash{}, 0, 0)
+		require.NoError(t, err)
+		data := uint64(0)
+		for _, p := range packets {
+			s, err := turbine.ParseShred(p)
+			require.NoError(t, err)
+			if s.Type == turbine.ShredTypeData {
+				require.NoError(t, w.WriteShred(p))
+				data++
+			}
+		}
+		if !cs.noBankHash {
+			require.NoError(t, w.WriteBankHash(cs.slot, [32]byte{byte(cs.slot)}, data))
+		}
+		require.NoError(t, w.WriteRootSlot(cs.slot))
+	}
+	require.NoError(t, w.Flush())
+	return b.Bytes()
+}
+
+// backtestImport runs backtestCorpus the way one `mithril backtest` invocation
+// does: the marker comes from the work directory, not from an earlier call.
+func backtestImport(t *testing.T, workdir, capture string) (*shredcap.Manifest, string, error) {
+	t.Helper()
+	marker, err := openBacktestWorkdir(workdir)
+	require.NoError(t, err)
+	if marker.Version == 0 {
+		require.NoError(t, writeBacktestMarker(workdir, marker))
+		marker.Version = 1
+	}
+	bt.capture = capture
+	fp, err := fingerprintCapture(capture)
+	require.NoError(t, err)
+	var out bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetOut(&out)
+	man, err := backtestCorpus(cmd, workdir, &marker, fp, 0)
+	return man, out.String(), err
+}
+
+// A capture that fails the import checks must fail them on every invocation:
+// the rejected import must not be picked up as a reusable one.
+func TestRejectedCaptureIsRejectedAgain(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		capture []captureSlot
+		wantErr string
+	}{
+		{"missing bank hash", []captureSlot{{slot: 100, parent: 99}, {slot: 101, parent: 100, noBankHash: true}},
+			"no bank hash available for slot 101"},
+		{"broken parent chain", []captureSlot{{slot: 100, parent: 99}, {slot: 102, parent: 101}},
+			"the capture's chain breaks at slot 102"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetBacktestOptions(t)
+			workdir := filepath.Join(t.TempDir(), "w")
+			capture := filepath.Join(t.TempDir(), "shredcap.pcapng")
+			require.NoError(t, os.WriteFile(capture, captureOf(t, tc.capture...), 0o600))
+			for attempt := 1; attempt <= 3; attempt++ {
+				man, out, err := backtestImport(t, workdir, capture)
+				require.ErrorContains(t, err, tc.wantErr, "invocation %d", attempt)
+				require.Nil(t, man)
+				require.Contains(t, out, "importing", "invocation %d imports and checks the capture again", attempt)
+				require.NoDirExists(t, filepath.Join(workdir, "corpus"), "a rejected capture leaves no import behind")
+			}
+		})
+	}
+}
+
+// An import is reused only when the marker records that it was checked, and
+// only while its manifest still is the checked import with every bank hash.
+func TestBacktestCorpusReusesOnlyACheckedImport(t *testing.T) {
+	resetBacktestOptions(t)
+	workdir := filepath.Join(t.TempDir(), "w")
+	capture := filepath.Join(t.TempDir(), "shredcap.pcapng")
+	require.NoError(t, os.WriteFile(capture, captureOf(t, captureSlot{slot: 100, parent: 99}, captureSlot{slot: 101, parent: 100}), 0o600))
+	manifestPath := filepath.Join(workdir, "corpus", "manifest.json")
+	importAgain := func(why string) {
+		t.Helper()
+		man, out, err := backtestImport(t, workdir, capture)
+		require.NoError(t, err)
+		require.Equal(t, []uint64{100, 101}, man.Slots)
+		require.Contains(t, out, "importing", why)
+	}
+	reuse := func(why string) {
+		t.Helper()
+		man, out, err := backtestImport(t, workdir, capture)
+		require.NoError(t, err)
+		require.Equal(t, []uint64{100, 101}, man.Slots)
+		require.Empty(t, out, why)
+	}
+
+	importAgain("the first run imports")
+	marker, err := openBacktestWorkdir(workdir)
+	require.NoError(t, err)
+	require.Equal(t, validatedImport{Validated: true, Checkpoint: 99, Head: 101, Blocks: 2}, marker.Import)
+	reuse("a checked import is reused")
+
+	// A marker from before the flag existed: same capture, manifest readable.
+	old := marker
+	old.Import = validatedImport{}
+	require.NoError(t, writeBacktestMarker(workdir, old))
+	importAgain("an import that was never recorded as checked is not trusted")
+	reuse("and is reused once it has been checked")
+
+	// The cached manifest no longer has a bank hash for every chain slot.
+	man, err := shredcap.ReadManifest(filepath.Join(workdir, "corpus"))
+	require.NoError(t, err)
+	delete(man.BankHashes, "101")
+	data, err := json.Marshal(man)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(manifestPath, data, 0o644))
+	importAgain("a manifest missing a bank hash is not reused")
+
+	// The cached manifest is not the import that was checked.
+	man.BankHashes["101"] = man.BankHashes["100"]
+	man.Slots, man.Blocks, man.Head = []uint64{100}, 1, 100
+	data, err = json.Marshal(man)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(manifestPath, data, 0o644))
+	importAgain("a different manifest is not reused")
+	reuse("the fresh import is")
+}
+
+func TestCheckReusedManifest(t *testing.T) {
+	man := &shredcap.Manifest{Checkpoint: 99, Head: 101, Blocks: 2, Slots: []uint64{100, 101},
+		BankHashes: map[string]string{"100": "a", "101": "b"}}
+	checked := validatedImportOf(man)
+	require.NoError(t, checkReusedManifest(man, checked))
+	require.ErrorContains(t, checkReusedManifest(man, validatedImport{}), "not recorded as checked")
+	other := checked
+	other.Checkpoint = 98
+	require.ErrorContains(t, checkReusedManifest(man, other), "not the import that was checked")
+	delete(man.BankHashes, "100")
+	require.ErrorContains(t, checkReusedManifest(man, checked), "no bank hash for slot 100")
+	require.ErrorContains(t, checkReusedManifest(&shredcap.Manifest{}, validatedImport{Validated: true}), "lists no slots")
 }
