@@ -237,7 +237,7 @@ func spoolSlotFromName(name string) (uint64, bool) {
 }
 
 func (s *ShredSpool) pathFor(slot uint64) string {
-	return filepath.Join(s.dir, fmt.Sprintf("s%d.shreds", slot))
+	return filepath.Join(s.dir, SpoolFileName(slot))
 }
 
 // Append stores one verified shred packet under its slot. It consumes packet
@@ -485,6 +485,25 @@ func (s *ShredSpool) readSlotLocked(slot uint64) ([][]byte, error) {
 		s.dropSlotLocked(slot)
 		return nil, fmt.Errorf("invalid shred spool header for slot %d", slot)
 	}
+	packets, validEnd := parseSpoolRecords(data)
+	if validEnd != len(data) {
+		if err := s.invalidateCompleteLocked(slot); err != nil {
+			return nil, err
+		}
+		if err := os.Truncate(path, int64(validEnd)); err != nil {
+			return nil, fmt.Errorf("truncate corrupt shred spool tail for slot %d: %w", slot, err)
+		}
+		oldSize := s.sizes[slot]
+		s.sizes[slot] = int64(validEnd)
+		s.bytes += int64(validEnd) - oldSize
+	}
+	s.validated[slot] = true
+	return packets, nil
+}
+
+// parseSpoolRecords returns the intact packets of a slot file that starts
+// with the spool magic, and the offset where the intact records end.
+func parseSpoolRecords(data []byte) ([][]byte, int) {
 	var packets [][]byte
 	validEnd := len(spoolFileMagic)
 	for off := validEnd; off < len(data); {
@@ -506,20 +525,33 @@ func (s *ShredSpool) readSlotLocked(slot uint64) ([][]byte, error) {
 		off = packetEnd
 		validEnd = packetEnd
 	}
-	if validEnd != len(data) {
-		if err := s.invalidateCompleteLocked(slot); err != nil {
-			return nil, err
-		}
-		if err := os.Truncate(path, int64(validEnd)); err != nil {
-			return nil, fmt.Errorf("truncate corrupt shred spool tail for slot %d: %w", slot, err)
-		}
-		oldSize := s.sizes[slot]
-		s.sizes[slot] = int64(validEnd)
-		s.bytes += int64(validEnd) - oldSize
+	return packets, validEnd
+}
+
+// ReadSpoolFile reads one spooled slot file without opening the spool, so a
+// frozen corpus is never modified. A torn or corrupt record is an error.
+func ReadSpoolFile(path string) ([][]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
 	}
-	s.validated[slot] = true
+	if len(data) < len(spoolFileMagic) || string(data[:len(spoolFileMagic)]) != string(spoolFileMagic[:]) {
+		return nil, fmt.Errorf("%s: not a shred spool file", path)
+	}
+	packets, validEnd := parseSpoolRecords(data)
+	if validEnd != len(data) {
+		return nil, fmt.Errorf("%s: corrupt record at byte %d", path, validEnd)
+	}
 	return packets, nil
 }
+
+// SpoolFileName is the name of slot's file in a spool directory.
+func SpoolFileName(slot uint64) string {
+	return fmt.Sprintf("s%d.shreds", slot)
+}
+
+// SpoolJournalName is the spool's completion index file.
+const SpoolJournalName = spoolJournalName
 
 // CompleteParents returns the parent slot of every complete spooled slot in
 // [lo, hi], read from the slot's first intact data shred and cached until the

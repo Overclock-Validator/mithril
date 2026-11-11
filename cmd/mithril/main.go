@@ -9,6 +9,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/cmd/mithril/alpenglowcmd"
 	"github.com/Overclock-Validator/mithril/cmd/mithril/configcmd"
+	"github.com/Overclock-Validator/mithril/cmd/mithril/corpuscmd"
 	"github.com/Overclock-Validator/mithril/cmd/mithril/dashboardcmd"
 	"github.com/Overclock-Validator/mithril/cmd/mithril/node"
 	"github.com/Overclock-Validator/mithril/cmd/mithril/setidentitycmd"
@@ -55,6 +56,7 @@ func init() {
 		&node.Run,                  // Primary command for running Mithril
 		&alpenglowcmd.AlpenglowCmd, // Alpenglow diagnostics and tools
 		&configcmd.ConfigCmd,       // Config management (init, etc.)
+		&corpuscmd.CorpusCmd,       // Replay corpus and shredcap conversion
 		&statecmd.StateCmd,         // State file inspection and management
 		&setupcmd.SetupCmd,         // Interactive setup wizard
 		&setupcmd.DoctorCmd,        // System health check
