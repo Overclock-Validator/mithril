@@ -37,11 +37,11 @@ func asmHandlerTable() *[numAsmHandlers]uintptr
 
 // asmTables caches one opcode table per combination of the version gates that
 // change which handler an opcode uses. Tables are immutable once stored.
-var asmTables [1 << 7]atomic.Pointer[[256]uintptr]
+var asmTables [1 << 8]atomic.Pointer[[256]uintptr]
 
 func asmFlagsIndex(f fastFlags, gaps bool) int {
 	idx := 0
-	for i, on := range [...]bool{f.moveMem, f.pqr, f.swapSub, f.explicitSext, f.disableLddw, f.staticSyscalls, gaps} {
+	for i, on := range [...]bool{f.moveMem, f.pqr, f.swapSub, f.explicitSext, f.disableLddw, f.staticSyscalls, f.disableNeg, gaps} {
 		if on {
 			idx |= 1 << i
 		}
@@ -216,7 +216,22 @@ func buildAsmTable(f fastFlags, gaps bool) *[256]uintptr {
 	set(OpJsleImm, asmJsleImm)
 	set(OpJsleReg, asmJsleReg)
 
-	if !f.pqr {
+	if f.pqr {
+		// Under pqr these nine encodings are the relocated memory
+		// instructions (when moveMem is set too, as runFast requires), with
+		// the operands of the legacy loads and stores.
+		if f.moveMem {
+			set(OpLd1BReg, pick(gaps, asmLdxb, asmLdxbNoGap))
+			set(OpLd2BReg, pick(gaps, asmLdxh, asmLdxhNoGap))
+			set(OpLd8BReg, pick(gaps, asmLdxdw, asmLdxdwNoGap))
+			set(OpSt1BImm, pick(gaps, asmStb, asmStbNoGap))
+			set(OpSt2BImm, pick(gaps, asmSth, asmSthNoGap))
+			set(OpSt8BImm, pick(gaps, asmStdw, asmStdwNoGap))
+			set(OpSt1BReg, pick(gaps, asmStxb, asmStxbNoGap))
+			set(OpSt2BReg, pick(gaps, asmStxh, asmStxhNoGap))
+			set(OpSt8BReg, pick(gaps, asmStxdw, asmStxdwNoGap))
+		}
+	} else {
 		set(OpMul32Reg, asmMul32Reg)
 		set(OpMul64Imm, asmMul64Imm)
 		set(OpMul64Reg, asmMul64Reg)
@@ -226,6 +241,15 @@ func buildAsmTable(f fastFlags, gaps bool) *[256]uintptr {
 		set(OpMod32Reg, asmMod32Reg)
 		set(OpMod64Imm, asmMod64Imm)
 		set(OpMod64Reg, asmMod64Reg)
+	}
+	// The 4-byte relocated forms have encodings of their own; the immediate
+	// store's is neg64's, which stays with Run while neg is enabled.
+	if f.moveMem {
+		set(OpLd4BReg, pick(gaps, asmLdxw, asmLdxwNoGap))
+		set(OpSt4BReg, pick(gaps, asmStxw, asmStxwNoGap))
+		if f.disableNeg {
+			set(OpSt4BImm, pick(gaps, asmStw, asmStwNoGap))
+		}
 	}
 	// The static handler computes the target as pc + imm + 1, the
 	// static-syscall rule of CalculateCallImmTargetPC; f always comes from the

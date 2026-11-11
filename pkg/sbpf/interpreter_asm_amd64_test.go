@@ -173,7 +173,7 @@ func TestAsmLoopSingleStepMatchesRunFast(t *testing.T) {
 		ver         uint32
 		disableGaps bool
 	}{{0, false}, {0, true}, {1, false}, {3, false}} {
-		for flagBits := 0; flagBits < 1<<6; flagBits++ {
+		for flagBits := 0; flagBits < 1<<7; flagBits++ {
 			f := fastFlags{
 				moveMem:        flagBits&1 != 0,
 				pqr:            flagBits&2 != 0,
@@ -181,9 +181,10 @@ func TestAsmLoopSingleStepMatchesRunFast(t *testing.T) {
 				explicitSext:   flagBits&8 != 0,
 				disableLddw:    flagBits&16 != 0,
 				staticSyscalls: flagBits&32 != 0,
+				disableNeg:     flagBits&64 != 0,
 			}
-			if asmFlagsIndex(f, false) != flagBits || asmFlagsIndex(f, true) != flagBits|1<<6 {
-				t.Fatalf("asmFlagsIndex(%+v) = %d and %d, want %d and %d", f, asmFlagsIndex(f, false), asmFlagsIndex(f, true), flagBits, flagBits|1<<6)
+			if asmFlagsIndex(f, false) != flagBits || asmFlagsIndex(f, true) != flagBits|1<<7 {
+				t.Fatalf("asmFlagsIndex(%+v) = %d and %d, want %d and %d", f, asmFlagsIndex(f, false), asmFlagsIndex(f, true), flagBits, flagBits|1<<7)
 			}
 			// runFast takes the call target rule from the interpreter's
 			// version, and Run always derives staticSyscalls from that same
@@ -210,6 +211,20 @@ func TestAsmLoopSingleStepMatchesRunFast(t *testing.T) {
 				switch uint8(op) {
 				case OpLdxb, OpLdxh, OpLdxw, OpLdxdw, OpStb, OpSth, OpStw, OpStdw, OpStxb, OpStxh, OpStxw, OpStxdw:
 					n, isMem = memTrials, true
+				case OpLd1BReg, OpLd2BReg, OpLd8BReg, OpSt1BImm, OpSt2BImm, OpSt8BImm, OpSt1BReg, OpSt2BReg, OpSt8BReg:
+					// The relocated memory instructions, where these
+					// encodings are not arithmetic.
+					if f.pqr && f.moveMem {
+						n, isMem = memTrials, true
+					}
+				case OpLd4BReg, OpSt4BReg:
+					if f.moveMem {
+						n, isMem = memTrials, true
+					}
+				case OpSt4BImm:
+					if f.moveMem && f.disableNeg {
+						n, isMem = memTrials, true
+					}
 				}
 				completedInAsm := false
 				for i := 0; i < n; i++ {
