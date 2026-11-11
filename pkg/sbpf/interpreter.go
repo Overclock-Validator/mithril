@@ -306,6 +306,12 @@ func (ip *Interpreter) Run() (ret uint64, cuConsumed uint64, err error) {
 	staticSyscalls := ip.sbpfVersion.EnableStaticSyscalls()
 	callTargets := ip.callTargets
 	fast := ip.fastFlags()
+	// Non-nil when the amd64 assembly loop is enabled.
+	asmTable := ip.asmLoopTable(fast)
+	var asmText *Slot
+	if asmTable != nil {
+		asmText = &text[0]
+	}
 
 	// Instruction metering (mirrors Agave's due_insn_count / previous_instruction_meter):
 	// count executed instructions locally and only sync with the shared compute
@@ -341,7 +347,21 @@ mainLoop:
 		// Common instructions run in the call-free loop; it returns at the
 		// first instruction that needs the general path below.
 		if !tracing && useFastLoop {
-			pc, due = ip.runFast(&r, pc, due, budget, fast)
+			if asmTable != nil {
+				// The assembly loop has runFast's contract: it stops, with pc
+				// and due exact, at the first instruction it leaves to the
+				// general path below. One call covers at most asmChunk
+				// instructions, because assembly cannot be preempted.
+				rem := min(budget-due, asmChunk)
+				var left uint64
+				pc, left = runAsmLoop(asmText, int64(len(text)), &r, &ip.regions, asmTable, &ip.stack, pc, rem)
+				due += rem - left
+				if left == 0 && due != budget {
+					pc, due = ip.runAsmChunks(&r, pc, due, budget, asmTable)
+				}
+			} else {
+				pc, due = ip.runFast(&r, pc, due, budget, fast)
+			}
 		}
 
 		// Fetch
