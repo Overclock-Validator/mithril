@@ -51,6 +51,10 @@ var Backtest = cobra.Command{
 	Short: "Replay a shredcap capture offline and report replay timing",
 	Long: `Replay a Firedancer shredcap capture (.pcapng or .pcapng.zst) with no network.
 
+Settings come from flags or from a backtest configuration file (--config FILE,
+laid out like firedancer-dev backtest's; see backtest.example.toml). Flags
+override the file.
+
 The node starts from local snapshot files (--snapshot, --incremental) or from
 an existing AccountsDB that holds the capture's starting slot (--accounts),
 replays every block in the capture, stops at the first block whose bank hash
@@ -74,21 +78,25 @@ func init() {
 	f.Uint64Var(&bt.measureFrom, "measure-from", 0, "Leave blocks before this slot out of the timing summary")
 	f.IntVar(&bt.warmup, "warmup", 30, "Leading measured blocks left out of the timing summary")
 	f.IntVar(&bt.txpar, "txpar", 8, "Transaction execution workers")
-	f.BoolVar(&bt.phaseTimers, "phase-timers", true, "Time each transaction phase and instruction dispatch, as a live node does (off saves the timer calls; SlotReplay and TxLoop are timed either way)")
+	f.BoolVar(&bt.phaseTimers, "phase-timers", false, "Time each transaction phase and instruction dispatch, as a live node does (about 1% of SlotReplay; SlotReplay and TxLoop are timed either way)")
 	f.BoolVar(&bt.verifySignatures, "verify-shred-signatures", false, "Check every shred's leader signature as replay reads it (off by default, like firedancer-dev backtest; adds signature work to the timed run)")
 }
 
 func runBacktest(cmd *cobra.Command, _ []string) error {
 	started := time.Now()
 	cmd.SilenceUsage = true // a refusal is a message, not a usage error
-	if bt.capture == "" {
-		return errors.New("--capture is required")
+	// --config names a backtest configuration file (never a node config);
+	// flags override what it sets.
+	userConfig := config.ConfigFile
+	if userConfig != "" {
+		f, err := loadBacktestFile(userConfig)
+		if err != nil {
+			return err
+		}
+		applyBacktestFile(f, userConfig, cmd.Flags())
 	}
-	if (bt.snapshot == "") == (bt.accounts == "") {
-		return errors.New("pass exactly one of --snapshot or --accounts")
-	}
-	if bt.incremental != "" && bt.snapshot == "" {
-		return errors.New("--incremental needs --snapshot")
+	if err := validateBacktestOptions(); err != nil {
+		return err
 	}
 	clusterInfo, err := config.ResolveCluster(bt.cluster, bt.genesisHash)
 	if err != nil {
@@ -293,7 +301,11 @@ func runBacktest(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("replay stopped at slot %d before the capture's last block %d", last, head)
 	}
 	summary := summarizeBacktest(rows, bt.warmup, bt.measureFrom)
-	summary.write(cmd.OutOrStdout(), backtestSettings(man), time.Since(started).Seconds())
+	settings := backtestSettings(man)
+	if userConfig != "" {
+		settings = append([][2]string{{"config", userConfig}}, settings...)
+	}
+	summary.write(cmd.OutOrStdout(), settings, time.Since(started).Seconds())
 	return nil
 }
 
@@ -410,7 +422,7 @@ func backtestSettings(man *shredcap.Manifest) [][2]string {
 		{"GOMAXPROCS", strconv.Itoa(runtime.GOMAXPROCS(0))},
 		{"usable CPUs", strconv.Itoa(runtime.NumCPU())},
 		{"txpar", strconv.Itoa(bt.txpar)},
-		{"phase timers", map[bool]string{true: "on (as a live node)", false: "off (--phase-timers=false)"}[bt.phaseTimers]},
+		{"phase timers", map[bool]string{true: "on (--phase-timers, as a live node)", false: "off (backtest default)"}[bt.phaseTimers]},
 		{"shred signatures", map[bool]string{true: "checked (--verify-shred-signatures)", false: "not checked (as firedancer-dev backtest)"}[bt.verifySignatures]},
 		{"MITHRIL_SBPF_ASM_LOOP", asm},
 		{"memory limit", limit},

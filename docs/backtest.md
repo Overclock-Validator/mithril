@@ -42,20 +42,33 @@ GOMAXPROCS=8 MITHRIL_SBPF_ASM_LOOP=1 taskset -c 0-7 ./mithril backtest \
   --workdir /data/backtest-work
 ```
 
-No configuration file is needed or read. Options:
+Every setting can come from a flag or from a backtest configuration file,
+`mithril backtest --config backtest.toml`, laid out like the TOML
+`firedancer-dev backtest` runs from (start from `backtest.example.toml`). A
+flag overrides the file, relative paths in the file are relative to the file,
+and an unknown key is an error. The file configures the backtest only: the
+node configuration it runs with is generated in the work directory and cannot
+be changed from here, so no file can turn on an RPC endpoint, compaction or the
+verifier.
 
-| Flag | Default | Meaning |
-|---|---|---|
-| `--capture` | required | shredcap file |
-| `--snapshot`, `--incremental` | | snapshot archives to start from |
-| `--accounts` | | existing AccountsDB instead of a snapshot |
-| `--workdir` | required | everything the backtest writes goes here |
-| `--cluster` | `mainnet` | `mainnet`, `testnet`, `devnet`, or a custom name with `--genesis-hash` |
-| `--txpar` | 8 | transaction execution workers |
-| `--end-slot` | capture's last block | stop earlier |
-| `--warmup` | 30 | leading blocks left out of the timing table |
-| `--measure-from` | | leave blocks before this slot out of the timing table |
-| `--verify-shred-signatures` | off | check every shred's leader signature as replay reads it |
+| Flag | File key | Default | Meaning | Firedancer |
+|---|---|---|---|---|
+| `--capture` | `[ledger_input] path` | required | shredcap file | `[development.ledger_input] path` |
+| `--snapshot`, `--incremental` | `[paths] snapshot`, `incremental` | | snapshot archives to start from | `[paths] snapshots` |
+| `--accounts` | `[paths] accounts` | | existing AccountsDB instead of a snapshot | `[paths] accounts` |
+| `--workdir` | `[paths] workdir` | required | everything the backtest writes goes here | |
+| `--cluster`, `--genesis-hash` | `[network] cluster`, `genesis_hash` | `mainnet` | `mainnet`, `testnet`, `devnet`, or a custom name with its genesis hash | genesis file / expected genesis hash |
+| `--txpar` | `[layout] exec_workers` | 8 | transaction execution workers | `[layout] execrp_tile_count` |
+| `--end-slot` | `[ledger_input] end_slot` | capture's last block | stop earlier | `[development.backtest] end_slot` |
+| `--warmup` | `[backtest] warmup` | 30 | leading blocks left out of the timing table | none (Firedancer excludes none) |
+| `--measure-from` | `[backtest] measure_from` | | leave blocks before this slot out of the timing table | |
+| `--phase-timers` | `[backtest] phase_timers` | off | time each transaction phase and instruction dispatch, as a live node does | |
+| `--verify-shred-signatures` | `[backtest] verify_shred_signatures` | off | check every shred's leader signature as replay reads it | not done by its backtest |
+
+Firedancer's `root_distance` has no counterpart: Mithril roots from the
+finalization certificates in block footers, not from the capture's root
+records (see the differences below). The summary names the configuration
+file it ran with.
 
 `MITHRIL_SBPF_ASM_LOOP=1` selects the amd64 assembly interpreter loop; without
 it the Go loop runs. The summary states which.
@@ -143,6 +156,12 @@ Mithril, from its source:
 - Inside SlotReplay: account loading, transaction execution (TxLoop), bank
   hash computation, the footer and capture bank hash comparisons, and the
   in-memory commit. Folding rooted slots to disk runs on a background worker.
+- Per-transaction phase timers are off by default in backtest, unlike a live
+  node (`mithril run` keeps them on). On the Zen 4 corpus they cost about
+  0.9% of SlotReplay (two runs per arm, 0.7% run-to-run spread). With them
+  off, 19 per-transaction fields of the timing rows read zero (for example
+  `IxLoop`, `CalcAndDeductFees`, `ExecIxNativeProgram*`); pass
+  `--phase-timers` when you want that detail.
 
 Firedancer, read from its source and not measured: per-slot timings start at
 slot preparation and end at slot completion; where its signature

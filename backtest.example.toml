@@ -1,0 +1,48 @@
+# mithril backtest configuration: mithril backtest --config backtest.toml
+#
+# Laid out like the TOML firedancer-dev backtest runs from where the settings
+# mean the same thing. Every setting is optional here and can also be given as
+# a flag; a flag overrides the file. Relative paths are relative to this file.
+# Unknown keys are refused. See docs/backtest.md.
+
+[paths]
+    # Start state: a snapshot (and optional incremental) ...
+    snapshot = "snapshot-<slot>-<hash>.tar.zst"
+    incremental = "incremental-snapshot-<base>-<slot>-<hash>.tar.zst"
+    # ... or an existing Mithril AccountsDB at the capture's starting slot.
+    # Set exactly one of snapshot and accounts.
+    # accounts = "/data/accounts"
+
+    # Everything the backtest writes: the imported capture, the AccountsDB
+    # built from the snapshot, logs. Reused by later runs.
+    workdir = "/data/backtest-work"
+
+[network]
+    # mainnet, testnet, devnet, or a custom cluster name with genesis_hash.
+    cluster = "mainnet"
+    # genesis_hash = ""
+
+[layout]
+    # Transaction execution workers (Firedancer: [layout] execrp_tile_count).
+    exec_workers = 8
+
+[ledger_input]
+    # The shredcap capture (Firedancer: [development.ledger_input] path).
+    path = "shredcap.pcapng.zst"
+    # Last slot to replay; 0 = the capture's last block.
+    end_slot = 0
+
+[backtest]
+    # Leading blocks left out of the timing table (not of the
+    # Firedancer-comparable line, which, like Firedancer, excludes none).
+    warmup = 30
+    # Leave blocks before this slot out of the timing table.
+    measure_from = 0
+    # Time each transaction phase and instruction dispatch, as a live node
+    # does (the per-transaction fields of the timing rows). Off by default in
+    # backtest: it costs about 1% of SlotReplay, and SlotReplay and TxLoop are
+    # timed either way.
+    phase_timers = false
+    # Check every shred's leader signature as replay reads it. Off, like
+    # firedancer-dev backtest, which does not check shred signatures.
+    verify_shred_signatures = false
