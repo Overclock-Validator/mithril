@@ -976,15 +976,7 @@ func (s *streamingExecutor) finalize(block *b.Block, parentBankSysvars *sealevel
 	discarded, discardReason := record.Discarded, record.DiscardReason
 	*record = metrics.StreamingExecution{Opened: 1, Discarded: discarded, DiscardReason: discardReason}
 	record.VerificationWait = cur.verificationWait
-	record.Groups = uint64(len(cur.groups))
-	for _, group := range cur.groups {
-		record.Transactions += uint64(group.transactions)
-		// Work that finished before the last shred arrived is the latency the
-		// stream took off the vote path.
-		if !fullAt.IsZero() && group.finishedAt.Before(fullAt) {
-			record.TxLoopBeforeFull.AddTiming(group.finishedAt.Sub(group.startedAt))
-		}
-	}
+	recordGroupTotals(record, cur.groups, fullAt)
 	record.OpenDelay.AddTiming(cur.openedAt.Sub(cur.headerAt))
 	cur.recordTimeline(record, block, finalizeStart)
 	cur.recordGroups(record, fullAt)
@@ -1037,6 +1029,26 @@ func nanosOf(t time.Time) int64 {
 		return 0
 	}
 	return t.UnixNano()
+}
+
+// recordGroupTotals counts the accepted stream's groups and transactions and
+// its execution before the block's own replay. Work that finished before the
+// last shred arrived is the latency the stream took off the vote path
+// (TxLoopBeforeFull). Every group except the finalize suffix ran while the
+// loop waited for the block, before SlotReplay began (TxLoopBeforeReplay);
+// the suffix runs inside SlotReplay and must not be counted twice.
+func recordGroupTotals(record *metrics.StreamingExecution, groups []streamingGroup, fullAt time.Time) {
+	record.Groups = uint64(len(groups))
+	for _, group := range groups {
+		record.Transactions += uint64(group.transactions)
+		elapsed := group.finishedAt.Sub(group.startedAt)
+		if !fullAt.IsZero() && group.finishedAt.Before(fullAt) {
+			record.TxLoopBeforeFull.AddTiming(elapsed)
+		}
+		if !group.suffix {
+			record.TxLoopBeforeReplay.AddTiming(elapsed)
+		}
+	}
 }
 
 // recordTimeline writes the stream's open timeline and its decomposition

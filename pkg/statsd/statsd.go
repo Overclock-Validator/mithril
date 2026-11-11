@@ -108,6 +108,7 @@ var (
 	TasksIndexEntryBuilderLatency               = Metric{"tasks_index_entry_builder_latency"}
 	TasksAppendVecCopyingLatency                = Metric{"tasks_append_vec_copying_latency"}
 	SlotReplayDurationMs                        = Metric{"slot_replay_duration_ms"}
+	SlotReplayWorkMs                            = Metric{"slot_replay_work_ms"}
 	TxsPerBlock                                 = Metric{"txs_per_block"}
 	SnapshotTarBytesRead                        = Metric{"snapshot_tar_bytes_read"}
 	SlotReplays                                 = Metric{"slot_replays"}
@@ -267,6 +268,7 @@ var MetricToType = map[Metric]metricType{
 	TasksAppendVecCopyingLatency:   TimingT,
 
 	SlotReplayDurationMs: TimingT,
+	SlotReplayWorkMs:     TimingT,
 	TxsPerBlock:          TimingT,
 
 	SnapshotTarBytesRead:                    CountT,
@@ -408,6 +410,7 @@ var MetricToLabels = map[Metric][]string{
 	TasksAppendVecCopyingLatency:   {},
 
 	SlotReplayDurationMs:                    {},
+	SlotReplayWorkMs:                        {},
 	TxsPerBlock:                             {},
 	SnapshotTarBytesRead:                    {},
 	SlotReplays:                             {},

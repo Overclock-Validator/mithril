@@ -3689,6 +3689,10 @@ func ReplayBlocks(
 		metrics.GlobalBlockReplay.PostProcessBlock.AddTiming(slotReplayEnd.Sub(postProcessBlockStart))
 		slotReplayDuration := slotReplayEnd.Sub(start)
 		metrics.GlobalBlockReplay.SlotReplay.AddTiming(slotReplayDuration)
+		// Streamed execution before SlotReplay began is part of this block's
+		// cost; without it a block streamed near the tip looks almost free.
+		replayWork := slotReplayDuration + time.Duration(metrics.GlobalBlockReplay.StreamingExecution.TxLoopBeforeReplay.SumNanoseconds)
+		metrics.GlobalBlockReplay.ReplayWork.AddTiming(replayWork)
 		if promoter != nil {
 			metrics.GlobalBlockReplay.FoldOverlap.AddTiming(promoter.busyThrough(slotReplayEnd) - foldBusyAtStart)
 		}
@@ -3707,7 +3711,9 @@ func ReplayBlocks(
 		// blocks (never fabricated for RPC/file). ready = assembly completion
 		// minus when replay asked for the slot (negative: ready that long
 		// early; positive: replay waited); asm = first shred -> full.
-		execMsLine := slotReplayDuration.Seconds() * 1000
+		// exec is the block's replay work, including execution streamed
+		// before the block was complete.
+		execMsLine := replayWork.Seconds() * 1000
 		hasShreds := block.ShredFirstNanos > 0 && block.ShredFullNanos > 0
 		var readySecsLine, asmSecsLine float64
 		if hasShreds {
@@ -3722,8 +3728,8 @@ func ReplayBlocks(
 				voteTxCount++
 			}
 		}
-		mlog.Log.FileOnlyf("slot %d detail | leader %s | txns v:%d nv:%d | exec %.3fs | wait %.3fs | total %.3fs",
-			block.Slot, leaderStr, voteTxCount, txnCount-voteTxCount, slotReplayDuration.Seconds(), waitTime.Seconds(), (waitTime + slotReplayDuration).Seconds())
+		mlog.Log.FileOnlyf("slot %d detail | leader %s | txns v:%d nv:%d | exec %.3fs | wait %.3fs | total %.3fs | work %.3fs",
+			block.Slot, leaderStr, voteTxCount, txnCount-voteTxCount, slotReplayDuration.Seconds(), waitTime.Seconds(), (waitTime + slotReplayDuration).Seconds(), replayWork.Seconds())
 
 		// Write bankhash to log file
 		if bankhashLogFile != nil {
@@ -3732,6 +3738,7 @@ func ReplayBlocks(
 
 		statsd.Count(statsd.SlotReplays, 1, nil)
 		statsd.Timing(statsd.SlotReplayDurationMs, uint64(slotReplayDuration.Nanoseconds())/1e6, nil)
+		statsd.Timing(statsd.SlotReplayWorkMs, uint64(replayWork.Nanoseconds())/1e6, nil)
 		statsd.Gauge(statsd.Epoch, float64(block.Epoch), nil)
 		statsd.Gauge(statsd.Slot, float64(block.Slot), nil)
 		statsd.Timing(statsd.TxsPerBlock, uint64(len(block.Transactions)), nil)
@@ -3743,7 +3750,7 @@ func ReplayBlocks(
 
 		if !justCrossedEpochBoundary {
 			statsCounter++
-			execTimes = append(execTimes, slotReplayDuration.Seconds())
+			execTimes = append(execTimes, replayWork.Seconds())
 			cuValues = append(cuValues, totalCU)
 			txnCounts = append(txnCounts, uint64(txnCount))
 			if txnCount == 0 {

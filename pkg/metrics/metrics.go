@@ -255,9 +255,15 @@ type StreamingExecution struct {
 	Groups           uint64
 	Transactions     uint64
 	TxLoopBeforeFull Timing
-	OpenDelay        Timing
-	Discarded        uint64
-	DiscardReason    string
+	// TxLoopBeforeReplay is the execution wall time of every accepted group
+	// except the finalize suffix: work that ran while the loop waited for the
+	// block, before this block's SlotReplay interval began. Unlike
+	// TxLoopBeforeFull it also counts groups that finished after the last
+	// shred. SlotReplay + TxLoopBeforeReplay is BlockReplay.ReplayWork.
+	TxLoopBeforeReplay Timing
+	OpenDelay          Timing
+	Discarded          uint64
+	DiscardReason      string
 
 	// Timeline: wall-clock unix nanoseconds of the events that bound the
 	// stream's open, zero when unknown. They join with the parent's record
@@ -394,6 +400,16 @@ type BlockReplay struct {
 	// PreprocessBlock, ProcessBlock, and PostProcessBlock intervals. The more
 	// detailed timers below are nested diagnostics and must not be added to that
 	// top-level sum.
+	//
+	// SlotReplay starts when replay takes the complete block. With streaming
+	// execution most of a block near the tip has already executed while its
+	// shreds arrived, so SlotReplay alone understates the block's execution
+	// cost there. ReplayWork is SlotReplay plus that earlier streamed
+	// execution (StreamingExecution.TxLoopBeforeReplay): the block's replay
+	// work wherever it ran, equal to SlotReplay for a block replayed whole.
+	// Use ReplayWork to compare live blocks with corpus replays or to report
+	// execution cost; use SlotReplay for latency after the block is complete.
+	ReplayWork                   Timing
 	SlotReplay                   Timing
 	PreprocessBlock              Timing
 	ProcessBlock                 Timing

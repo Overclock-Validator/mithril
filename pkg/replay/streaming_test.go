@@ -1053,6 +1053,36 @@ func TestStreamingGroupRecordSplitsAtFull(t *testing.T) {
 	require.Equal(t, at(350).UnixNano(), whole.LastGroupEndNanos)
 }
 
+// The block totals count execution before the last shred for the vote-path
+// view, and every group but the finalize suffix as work done before the
+// block's SlotReplay began, so SlotReplay plus that is the whole block's work
+// with nothing counted twice.
+func TestStreamingGroupTotals(t *testing.T) {
+	t0 := time.Unix(1_700_000_000, 0)
+	at := func(ms int) time.Time { return t0.Add(time.Duration(ms) * time.Millisecond) }
+	ms := func(timing metrics.Timing) float64 { return float64(timing.SumNanoseconds) / 1e6 }
+	groups := []streamingGroup{
+		{startedAt: at(92), finishedAt: at(120), transactions: 900},               // before full
+		{startedAt: at(281), finishedAt: at(320), transactions: 300},              // straddles full
+		{startedAt: at(310), finishedAt: at(340), transactions: 5000},             // after full, before replay
+		{startedAt: at(340), finishedAt: at(350), transactions: 40, suffix: true}, // inside SlotReplay
+	}
+	var r metrics.StreamingExecution
+	recordGroupTotals(&r, groups, at(300))
+	require.Equal(t, uint64(4), r.Groups)
+	require.Equal(t, uint64(6240), r.Transactions)
+	require.Equal(t, 28.0, ms(r.TxLoopBeforeFull), "only the group that finished before the last shred")
+	require.Equal(t, 97.0, ms(r.TxLoopBeforeReplay), "28 + 39 + 30 ms; the suffix runs inside SlotReplay")
+	require.Equal(t, uint64(3), r.TxLoopBeforeReplay.Count)
+
+	// Without a full instant nothing is before full, but streamed groups
+	// still ran before the block's replay.
+	var whole metrics.StreamingExecution
+	recordGroupTotals(&whole, groups, time.Time{})
+	require.Zero(t, whole.TxLoopBeforeFull.Count)
+	require.Equal(t, 97.0, ms(whole.TxLoopBeforeReplay))
+}
+
 // The group stages account for preparation even when it crosses completion.
 func TestStreamingGroupPreparationAccounting(t *testing.T) {
 	base := time.Unix(1700000000, 0)
