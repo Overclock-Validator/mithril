@@ -358,6 +358,7 @@ type StreamingExecution struct {
 // Metrics for replaying a single block
 type BlockReplay struct {
 	ComputeUnitsConsumed uint64
+	Transactions         uint64 // transactions in the block, votes included
 	Slot                 uint64
 	AccountLoader        AccountLoader
 	TurbineIngress       TurbineIngress
