@@ -3126,11 +3126,12 @@ func ReplayBlocks(
 			// Advance the certificate-finality watermark. Prefer engine
 			// cert-finality; fall back to the RPC-attested finalized slot
 			// (delegated) since an unstaked observer gets no certs. Poll
-			// throttled (the RPC round-trip is slow).
+			// throttled (the RPC round-trip is slow). Offline replay has no
+			// fallback: footer certificates alone advance the root.
 			rooted, ok := uint64(0), false
 			if certRooted, certOk := alpenglowRootedSlot(consensusEngine); certOk {
 				rooted, ok = certRooted, true
-			} else {
+			} else if DelegatedFinalityEnabled {
 				if time.Since(delegatedFinalizedAt) > 2*time.Second {
 					// Record the attempt time regardless of outcome, so an RPC
 					// outage doesn't re-issue a blocking poll on every block.

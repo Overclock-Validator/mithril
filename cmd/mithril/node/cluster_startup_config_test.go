@@ -4,9 +4,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/config"
+	"github.com/Overclock-Validator/mithril/pkg/replay"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/require"
 )
@@ -45,7 +47,28 @@ var clusterConfigCases = []struct {
 	{name: "custom cluster with lightbringer selected explicitly", body: customCluster + customClusterRPC + "[block]\nsource = 'lightbringer'\n" + managedLightbringer, check: func(t *testing.T) {
 		require.Equal(t, "lightbringer", blockSource)
 	}},
+	{name: "offline replay turns off every network component", body: offlineReplayConfig, check: func(t *testing.T) {
+		require.True(t, offlineReplay)
+		require.Equal(t, "turbine", blockSource)
+		require.Empty(t, turbineGossipEntrypoint)
+		require.Empty(t, turbineAdvertisedIP)
+		require.Empty(t, alpenglowObserverBindAddr)
+		require.Equal(t, "127.0.0.1:0", turbineBindAddr)
+		require.Equal(t, 50093, turbineShredVersion)
+		require.False(t, replay.DelegatedFinalityEnabled, "offline rooting follows footer certificates only")
+	}},
+	{name: "offline replay needs a shred version", body: strings.Replace(offlineReplayConfig, "shred_version = 50093", "shred_version = 0", 1), wantErr: "turbine.shred_version"},
+	{name: "offline replay needs a finite range", body: strings.Replace(offlineReplayConfig, "end_slot = 100", "end_slot = -1", 1), wantErr: "replay.end_slot or replay.num_slots"},
+	{name: "offline replay needs an existing AccountsDB", body: strings.Replace(offlineReplayConfig, "mode = 'accountsdb'", "mode = 'auto'", 1), wantErr: "bootstrap.mode=accountsdb"},
+	{name: "offline replay refuses validator mode", body: offlineReplayConfig + "mode = 'validator'\n", wantErr: "consensus.mode=verifying"},
 }
+
+// offlineReplayConfig is a corpus replay: a configured gossip entrypoint,
+// advertised IP and Votor listener that offline mode must all ignore.
+const offlineReplayConfig = "[network]\ncluster = 'mainnet'\nrpc = ['http://127.0.0.1:8899']\noffline = true\n" +
+	"[bootstrap]\nmode = 'accountsdb'\n[replay]\nend_slot = 100\n" +
+	"[turbine]\ngossip_entrypoint = '127.0.0.1:8001'\nbind_addr = '0.0.0.0:65431'\nadvertised_ip = '192.0.2.1'\nshred_version = 50093\n" +
+	"[consensus]\nalpenglow_observer_bind_addr = '0.0.0.0:65432'\n"
 
 func TestClusterStartupConfig(t *testing.T) {
 	if name := os.Getenv(clusterConfigCaseEnv); name != "" {

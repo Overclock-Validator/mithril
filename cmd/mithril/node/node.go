@@ -630,6 +630,7 @@ func init() {
 	Run.Flags().BoolVar(&blockRPCFallback, "rpc-fallback", false, "Allow RPC to fetch blocks when replay is more than repair-catchup-max-gap-slots behind (default false: shreds via turbine + repair are the only block path)")
 	Run.Flags().StringVar(&turbineAdvertisedIP, "turbine-advertised-ip", "", "Public IP advertised by native turbine gossip (optional)")
 	Run.Flags().IntVar(&turbineShredVersion, "turbine-shred-version", 0, "Shred version for native turbine gossip (0 = discover from entrypoint)")
+	Run.Flags().BoolVar(&offlineReplay, "offline", false, "Replay only from the local shred spool: no gossip, Turbine tree, repair or Votor listener (corpus replays; needs --end-slot and --bootstrap accountsdb)")
 	Run.Flags().StringSlice("shred-receiver-address", nil, "Also send every shred this validator broadcasts to this host:port (repeatable), e.g. a block builder")
 	Run.Flags().StringSlice("shred-retransmit-receiver-address", nil, "Also send every shred this node relays to this host:port (repeatable), e.g. a block builder")
 	Run.Flags().IntVar(&blockMaxRPS, "block-max-rps", 0, "Max RPC requests per second for block fetching (0 = use default)")
@@ -1034,6 +1035,11 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		}
 	}
 
+	offlineReplay = getBool("offline", "network.offline")
+	if err := applyOfflineReplay(); err != nil {
+		return err
+	}
+
 	// Validate block source requirements
 	switch blockSource {
 	case "rpc":
@@ -1050,7 +1056,7 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	case "turbine":
 		// Defaulted here, after Lightbringer may have taken over the source, so
 		// a node fed by Lightbringer never needs a native Turbine entrypoint.
-		if turbineGossipEntrypoint == "" {
+		if turbineGossipEntrypoint == "" && !offlineReplay {
 			if clusterInfo.Custom {
 				return fmt.Errorf("custom network.cluster %q requires turbine.gossip_entrypoint", cluster)
 			}
@@ -1774,6 +1780,8 @@ func runLive(c *cobra.Command, args []string) {
 		mlog.Log.Infof("block.source=turbine with native turbine receiver on %s", turbineBindAddr)
 		if turbineGossipEntrypoint != "" {
 			mlog.Log.Infof("native turbine gossip enabled with entrypoint %s", turbineGossipEntrypoint)
+		} else if offlineReplay {
+			mlog.Log.Infof("native turbine gossip off (offline replay)")
 		} else {
 			mlog.Log.Warnf("native turbine gossip entrypoint is empty; Mithril will receive turbine packets only if shreds are sent directly to %s", turbineBindAddr)
 		}
