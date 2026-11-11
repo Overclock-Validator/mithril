@@ -30,7 +30,14 @@ func TestAsmLoopMatchesRun(t *testing.T) {
 	for _, chunk := range []uint64{0, 1, 2, 7} {
 		t.Run(fmt.Sprintf("chunk=%d", chunk), func(t *testing.T) {
 			withAsmLoop(t, chunk, func() {
-				t.Run("budgets", TestFastLoopMatchesRunAcrossBudgets)
+				// The budgets suite is nearly all of this package's run time
+				// under the race detector (about 150 s of 157 s with two
+				// threads), and it already runs there once against the Go
+				// loop. The assembly reruns of it are single-threaded
+				// comparisons, so they run without the detector only.
+				if !raceDetector {
+					t.Run("budgets", TestFastLoopMatchesRunAcrossBudgets)
+				}
 				t.Run("edges", TestFastLoopEdgeCases)
 				t.Run("invalid-pc", TestFastLoopInvalidPC)
 				t.Run("registry", TestFastLoopInvocationRegistryPrecedence)

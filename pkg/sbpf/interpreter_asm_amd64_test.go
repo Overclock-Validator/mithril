@@ -159,21 +159,31 @@ func asmRandAddr(rng *rand.Rand, vm *asmStepVM) uint64 {
 
 // One instruction at a time, the assembly loop must either leave exactly the
 // state runFast leaves (registers, guest memory, dirty bits, shadow stack, pc
-// and budget) or decline without touching anything. Every opcode byte is tried under every combination of version gates
-// and at every text position, and every handler the table selects must have
-// completed at least one instruction itself, so no handler passes merely by
-// handing its work back to Go.
+// and budget) or decline without touching anything. Every opcode byte is tried
+// under every combination of version gates and at every text position, and
+// every handler the table selects must have completed at least one instruction
+// itself, so no handler passes merely by handing its work back to Go.
 func TestAsmLoopSingleStepMatchesRunFast(t *testing.T) {
 	trials, memTrials := 300, 4000
-	if testing.Short() {
+	if testing.Short() || raceDetector {
 		trials, memTrials = 60, 800
 	}
 	handlers := asmHandlerTable()
-	for _, cfg := range []struct {
+	for cfgIndex, cfg := range []struct {
 		ver         uint32
 		disableGaps bool
 	}{{0, false}, {0, true}, {1, false}, {3, false}} {
 		for flagBits := 0; flagBits < 1<<7; flagBits++ {
+			// The comparison is single-threaded and deterministic, so the race
+			// detector has no races to find here. What it adds is checking of
+			// the unsafe pointer use around the assembly call, at well over
+			// ten times the run time. Under it, each version keeps one
+			// setting of the four low gates (a different one per version)
+			// and every setting of the rest, a sixteenth of the tables. All
+			// of them run without the detector.
+			if raceDetector && flagBits&15 != (cfgIndex*5+3)&15 {
+				continue
+			}
 			f := fastFlags{
 				moveMem:        flagBits&1 != 0,
 				pqr:            flagBits&2 != 0,
