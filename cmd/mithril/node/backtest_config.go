@@ -116,6 +116,9 @@ func validateBacktestOptions() error {
 	if bt.incremental != "" && bt.snapshot == "" {
 		return errors.New("an incremental snapshot needs a full snapshot")
 	}
+	if bt.warmup < 0 {
+		return fmt.Errorf("warmup / --warmup cannot be negative, got %d", bt.warmup)
+	}
 	if bt.txpar < 1 {
 		return fmt.Errorf("exec_workers / --txpar must be at least 1, got %d", bt.txpar)
 	}

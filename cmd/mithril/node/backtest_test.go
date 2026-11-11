@@ -247,3 +247,71 @@ func TestBacktestConfigStaysInsideTheWorkdir(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, backtestConfig(custom, "/s", "/w", 1, 8, 64), `genesis_hash = "11111111111111111111111111111111"`)
 }
+
+func TestBacktestHead(t *testing.T) {
+	slots := []uint64{101, 102, 104, 105} // 103 was skipped
+	head, err := backtestHead(slots, 101, 0)
+	require.NoError(t, err)
+	require.Equal(t, uint64(105), head, "default: the capture's last block")
+	head, err = backtestHead(slots, 101, 104)
+	require.NoError(t, err)
+	require.Equal(t, uint64(104), head)
+	head, err = backtestHead(slots, 101, 103)
+	require.NoError(t, err)
+	require.Equal(t, uint64(102), head, "a skipped slot stops at the block before it")
+	_, err = backtestHead(slots, 101, 106)
+	require.ErrorContains(t, err, "past the capture's last block")
+	_, err = backtestHead(slots, 104, 102)
+	require.ErrorContains(t, err, "before the first block this run replays")
+	_, err = backtestHead(nil, 1, 0)
+	require.Error(t, err)
+}
+
+func TestSummaryPrintsFiredancerLineWithoutMeasuredBlocks(t *testing.T) {
+	boot := time.Unix(100, 0)
+	clock := backtestClock{Boot: boot, ImportDone: boot.Add(time.Second), StateReady: boot.Add(2 * time.Second), ReplayReady: boot.Add(3 * time.Second)}
+	rows := []timingRow{{Slot: 10, CU: 5, Transactions: 2, SlotReplay: 1e6, TxLoop: 1e6, Completed: boot.Add(4 * time.Second).UnixNano()}}
+	s := summarizeBacktest(rows, 30, 0, 9, clock)
+	require.Zero(t, s.Measured)
+	var out bytes.Buffer
+	s.write(&out, nil, 5)
+	require.Contains(t, out.String(), "no measured blocks")
+	require.Contains(t, out.String(), "BACKTEST_SUMMARY snapshot_slot=9 end_slot=10 slots=1 txns=2")
+}
+
+func TestSummaryCountsEachSlotOnce(t *testing.T) {
+	// A fork switch replays slots 11 and 12 again; only the standing rows count.
+	rows := []timingRow{
+		{Slot: 10, Transactions: 1, SlotReplay: 1, TxLoop: 1, Completed: 1},
+		{Slot: 11, Transactions: 100, SlotReplay: 1, TxLoop: 1, Completed: 2},
+		{Slot: 12, Transactions: 100, SlotReplay: 1, TxLoop: 1, Completed: 3},
+		{Slot: 11, Transactions: 1, SlotReplay: 1, TxLoop: 1, Completed: 4},
+		{Slot: 12, Transactions: 1, SlotReplay: 1, TxLoop: 1, Completed: 5},
+	}
+	got := lastRowPerSlot(rows)
+	require.Equal(t, []uint64{10, 11, 12}, []uint64{got[0].Slot, got[1].Slot, got[2].Slot})
+	require.Equal(t, int64(4), got[1].Completed)
+	s := summarizeBacktest(rows, 0, 0, 9, backtestClock{})
+	require.Equal(t, 3, s.Replayed)
+	require.Equal(t, uint64(3), s.FD.Txns)
+}
+
+func TestFailedFirstImportLeavesAnAcceptedWorkdir(t *testing.T) {
+	resetBacktestOptions(t)
+	workdir := filepath.Join(t.TempDir(), "w")
+	marker, err := openBacktestWorkdir(workdir)
+	require.NoError(t, err)
+	require.NoError(t, writeBacktestMarker(workdir, marker)) // what runBacktest does first
+	bt.capture = filepath.Join(t.TempDir(), "broken.pcapng")
+	require.NoError(t, os.WriteFile(bt.capture, []byte("not a capture"), 0o644))
+	fp, err := fingerprintCapture(bt.capture)
+	require.NoError(t, err)
+
+	marker.Version = 1
+	_, err = backtestCorpus(&Backtest, workdir, &marker, fp, 0)
+	require.Error(t, err)
+
+	again, err := openBacktestWorkdir(workdir)
+	require.NoError(t, err, "a failed import must not lock the workdir out")
+	require.Equal(t, fp, again.Capture)
+}

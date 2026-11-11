@@ -114,6 +114,14 @@ func runBacktest(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
+	if marker.Version == 0 {
+		// Claim a new workdir before writing anything else into it, so a run
+		// that fails part-way leaves a directory later runs recognise.
+		if err := writeBacktestMarker(workdir, marker); err != nil {
+			return err
+		}
+		marker.Version = 1
+	}
 	fp, err := fingerprintCapture(bt.capture)
 	if err != nil {
 		return err
@@ -139,26 +147,11 @@ func runBacktest(cmd *cobra.Command, _ []string) error {
 	if snapshotSlot > 0 {
 		fromSlot = snapshotSlot + 1
 	}
-	man, err := backtestCorpus(cmd, workdir, &marker, fp, fromSlot)
-	if err != nil {
-		return err
-	}
-	importDone := time.Now()
-	if snapshotSlot > 0 && man.Checkpoint != snapshotSlot {
-		if man.Checkpoint > snapshotSlot {
-			return fmt.Errorf("snapshot too old for capture: the capture's first block after slot %d builds on slot %d, and the blocks between are not in the capture", snapshotSlot, man.Checkpoint)
-		}
-		return fmt.Errorf("the capture's first block after the snapshot (slot %d) builds on slot %d, not on the snapshot slot %d", man.Slots[0], man.Checkpoint, snapshotSlot)
-	}
-
+	// Inspect the store before importing, so a refusal costs no import.
 	store := bt.accounts
 	builtAt := uint64(0)
 	if store == "" {
 		store = filepath.Join(workdir, "accounts")
-		if marker.SnapshotSlot != 0 && marker.SnapshotSlot != snapshotSlot {
-			return fmt.Errorf("%s was built from a snapshot at slot %d, not %d; use a new --workdir", store, marker.SnapshotSlot, snapshotSlot)
-		}
-		builtAt = marker.SnapshotSlot
 	} else if store, err = filepath.Abs(store); err != nil {
 		return err
 	}
@@ -166,6 +159,24 @@ func runBacktest(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
+	if bt.accounts == "" && view.HasState {
+		if marker.SnapshotSlot != 0 && marker.SnapshotSlot != snapshotSlot {
+			return fmt.Errorf("%s was built from a snapshot at slot %d, not %d; use a new --workdir", store, marker.SnapshotSlot, snapshotSlot)
+		}
+		builtAt = marker.SnapshotSlot
+	}
+
+	man, err := backtestCorpus(cmd, workdir, &marker, fp, fromSlot)
+	if err != nil {
+		return err
+	}
+	if snapshotSlot > 0 && man.Checkpoint != snapshotSlot {
+		if man.Checkpoint > snapshotSlot {
+			return fmt.Errorf("snapshot too old for capture: the capture's first block after slot %d builds on slot %d, and the blocks between are not in the capture", snapshotSlot, man.Checkpoint)
+		}
+		return fmt.Errorf("the capture's first block after the snapshot (slot %d) builds on slot %d, not on the snapshot slot %d", man.Slots[0], man.Checkpoint, snapshotSlot)
+	}
+
 	plan, err := planBacktestStart(man.Checkpoint, snapshotSlot > 0, builtAt, view)
 	if err != nil {
 		return err
@@ -182,12 +193,12 @@ func runBacktest(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
-	head := man.Head
-	if bt.endSlot != 0 {
-		if bt.endSlot < plan.FirstSlot || bt.endSlot > man.Head {
-			return fmt.Errorf("--end-slot %d is outside the capture's replayable range %d..%d", bt.endSlot, plan.FirstSlot, man.Head)
-		}
-		head = bt.endSlot
+	head, err := backtestHead(man.Slots, plan.FirstSlot, bt.endSlot)
+	if err != nil {
+		return err
+	}
+	if bt.endSlot != 0 && head != bt.endSlot {
+		fmt.Fprintf(cmd.OutOrStdout(), "slot %d is not a block in the capture's chain; stopping at slot %d\n", bt.endSlot, head)
 	}
 	blocks := 0
 	for _, s := range man.Slots {
@@ -239,6 +250,14 @@ func runBacktest(cmd *cobra.Command, _ []string) error {
 	if err := initConfigAndBindFlags(&Run); err != nil {
 		return err
 	}
+	if plan.Bootstrap == "snapshot" {
+		// Recorded before the build starts: if the node dies after building,
+		// the next run still knows this store came from the snapshot.
+		marker.SnapshotSlot = snapshotSlot
+		if err := writeBacktestMarker(workdir, marker); err != nil {
+			return err
+		}
+	}
 	backtestMode = true
 	replay.CaptureBankHashes = expected
 	logsBefore := listLogDirs(filepath.Join(workdir, "logs"))
@@ -266,7 +285,9 @@ func runBacktest(cmd *cobra.Command, _ []string) error {
 		}
 	}
 	Run.SetContext(ctx) // runLive derives its run context from the command
+	prepDone := time.Now()
 	runLive(&Run, nil)
+	nodeDone := time.Now()
 	rejected.Lock()
 	rejectErr := rejected.err
 	rejected.Unlock()
@@ -274,12 +295,6 @@ func runBacktest(cmd *cobra.Command, _ []string) error {
 		return rejectErr
 	}
 
-	if plan.Bootstrap == "snapshot" {
-		marker.SnapshotSlot = snapshotSlot
-		if err := writeBacktestMarker(workdir, marker); err != nil {
-			return err
-		}
-	}
 	result := lastReplayResult
 	if result == nil {
 		return errors.New("replay did not run")
@@ -305,7 +320,7 @@ func runBacktest(cmd *cobra.Command, _ []string) error {
 		}
 		return fmt.Errorf("replay stopped at slot %d before the capture's last block %d", last, head)
 	}
-	clock := backtestClock{Boot: started, ImportDone: importDone, StateReady: stateReadyAt}
+	clock := backtestClock{Boot: started, ImportDone: prepDone, StateReady: stateReadyAt}
 	if ns := replay.ReplayReadyAt.Load(); ns != 0 {
 		clock.ReplayReady = time.Unix(0, ns)
 	}
@@ -314,7 +329,7 @@ func runBacktest(cmd *cobra.Command, _ []string) error {
 	if userConfig != "" {
 		settings = append([][2]string{{"config", userConfig}}, settings...)
 	}
-	summary.write(cmd.OutOrStdout(), settings, time.Since(started).Seconds())
+	summary.write(cmd.OutOrStdout(), settings, nodeDone.Sub(started).Seconds())
 	return nil
 }
 
@@ -331,6 +346,12 @@ func backtestCorpus(cmd *cobra.Command, workdir string, marker *backtestMarker, 
 		return nil, fmt.Errorf("%s holds runs of capture %s; use a new --workdir for %s", workdir, marker.Capture.Name, fp.Name)
 	}
 	if err := os.RemoveAll(corpusDir); err != nil {
+		return nil, err
+	}
+	// Record the capture first: an interrupted import leaves a corpus with no
+	// manifest, which the next run imports again.
+	marker.Capture, marker.FromSlot = fp, fromSlot
+	if err := writeBacktestMarker(workdir, *marker); err != nil {
 		return nil, err
 	}
 	in, err := os.Open(bt.capture)
@@ -464,4 +485,25 @@ func backtestConfig(cluster config.Cluster, store, workdir string, shredVersion 
 	fmt.Fprintf(&b, "common_account_cache_max_mb = 768\nindex_cache_max_mb = 256\ncommon_account_cache_layout = \"fixed\"\n\n")
 	fmt.Fprintf(&b, "[snapshot]\nmax_full_snapshots = 1\n\n[log]\nlevel = \"info\"\nto_stdout = false\n")
 	return b.String()
+}
+
+// backtestHead returns the last block to replay: the capture's last block, or
+// the last block of its chain at or below endSlot (a skipped slot has no block
+// to stop at).
+func backtestHead(slots []uint64, firstSlot, endSlot uint64) (uint64, error) {
+	if len(slots) == 0 {
+		return 0, errors.New("the capture has no replayable blocks")
+	}
+	head := slots[len(slots)-1]
+	if endSlot == 0 {
+		return head, nil
+	}
+	if endSlot > head {
+		return 0, fmt.Errorf("--end-slot %d is past the capture's last block %d", endSlot, head)
+	}
+	i := sort.Search(len(slots), func(i int) bool { return slots[i] > endSlot }) - 1
+	if i < 0 || slots[i] < firstSlot {
+		return 0, fmt.Errorf("--end-slot %d is before the first block this run replays (%d)", endSlot, firstSlot)
+	}
+	return slots[i], nil
 }

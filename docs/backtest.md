@@ -87,7 +87,8 @@ the AccountsDB is rewound rather than rebuilt.
 
 - With `--accounts`, a store that has replayed past the capture's start is
   rewound to it when that slot is a retained fold boundary, and refused
-  otherwise.
+  otherwise. The rewind changes that store without asking, so never point
+  `--accounts` at the store of a node that is running.
 - With `--snapshot`, the first run builds the AccountsDB in
   `<workdir>/accounts` and replays from the snapshot slot. Later runs rewind to
   the first fold boundary after the snapshot slot (normally within about 128
@@ -145,22 +146,24 @@ process start.
 | `end_slot` | last replayed slot | last replayed slot |
 | `slots` | completed slots after the snapshot slot | replayed blocks after the start slot |
 | `txns` | per completed slot, vote and non-vote, succeeded and failed | every transaction in the replayed blocks |
-| `snap_bytes_s` | boot to snapshot loaded (a duration, despite the name) | end of capture import to AccountsDB ready (built from the snapshot, or opened and rewound) |
+| `snap_bytes_s` | boot to snapshot loaded (a duration, despite the name) | node start to AccountsDB ready (built from the snapshot, or opened and rewound) |
 | `replay_init_s` | snapshot loaded to the start slot complete | AccountsDB ready to the replay loop about to fetch its first block |
-| `load_total_s` | boot to the start slot complete | end of capture import to the replay loop about to fetch its first block |
+| `load_total_s` | boot to the start slot complete | node start to the replay loop about to fetch its first block |
 | `replay_s` | start slot complete to finish | replay loop ready to the last block's completion; includes reading and assembling blocks from the shred spool, as Firedancer's includes reading the capture |
 | `slot_exec_s` | first replayed slot's preparation start to the last slot's completion | first block's SlotReplay start to the last block's completion |
 | `sec_per_slot` | `replay_s / slots` | `replay_s / slots` |
 | `tps` | `txns / replay_s` | `txns / replay_s` |
 | `total_s` | boot to finish | process start to the last block's completion |
 
-`MITHRIL_EXTRA` has what Firedancer has no field for. `import_s` is the
-capture import (near zero when an earlier import is reused): Firedancer reads
-the capture while replaying, so its decoding time is inside its `replay_s`,
-while Mithril imports it first. So `total_s = import_s + load_total_s +
-replay_s`, and `load_total_s` covers state loading only, as Firedancer's does.
-`shutdown_s` is the node's shutdown after the last block, which Firedancer's
-`total_s` also leaves out (it exits at the last slot).
+`MITHRIL_EXTRA` has what Firedancer has no field for. `import_s` runs from
+process start to node start: the capture import (near zero when an earlier
+import is reused) and preparing the work directory (restoring the shred spool,
+writing the node configuration). Firedancer reads the capture while replaying,
+so its decoding time is inside its `replay_s`, while Mithril imports it first.
+So `total_s = import_s + load_total_s + replay_s`, and `load_total_s` covers
+state loading only, as Firedancer's does. `shutdown_s` is the node's shutdown
+after the last block, which Firedancer's `total_s` also leaves out (it exits at
+the last slot).
 
 Not identical, and why:
 

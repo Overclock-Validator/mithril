@@ -139,6 +139,7 @@ func firedancerFields(rows []timingRow, startSlot uint64, clock backtestClock) f
 }
 
 func summarizeBacktest(rows []timingRow, warmup int, measureFrom uint64, startSlot uint64, clock backtestClock) backtestSummary {
+	rows = lastRowPerSlot(rows)
 	s := backtestSummary{Replayed: len(rows), FD: firedancerFields(rows, startSlot, clock)}
 	measured := rows
 	for len(measured) > 0 && measured[0].Slot < measureFrom {
@@ -191,9 +192,14 @@ func (s backtestSummary) write(w io.Writer, settings [][2]string, totalSeconds f
 	}
 	fmt.Fprintf(w, "  %-22s %d replayed, %d warm-up excluded, %d measured (slots %d..%d)\n", "blocks", s.Replayed, s.Warmup, s.Measured, s.FirstSlot, s.LastSlot)
 	if s.Measured == 0 {
-		fmt.Fprintf(w, "  no measured blocks\n")
-		return
+		fmt.Fprintf(w, "  no measured blocks (fewer replayed blocks than the warm-up)\n")
+	} else {
+		s.writeIntervals(w)
 	}
+	s.writeFiredancer(w, totalSeconds)
+}
+
+func (s backtestSummary) writeIntervals(w io.Writer) {
 	fmt.Fprintf(w, "  %-22s %.2f M\n", "avg consumed CU/block", s.AvgCU/1e6)
 	fmt.Fprintf(w, "  %-12s %9s %9s %9s %9s %8s\n", "interval", "mean ms", "p50 ms", "p90 ms", "p99 ms", "CU/ns")
 	for _, iv := range []struct {
@@ -202,6 +208,9 @@ func (s backtestSummary) write(w io.Writer, settings [][2]string, totalSeconds f
 	}{{"SlotReplay", s.SlotReplay}, {"TxLoop", s.TxLoop}} {
 		fmt.Fprintf(w, "  %-12s %9.2f %9.2f %9.2f %9.2f %8.3f\n", iv.name, iv.st.MeanMs, iv.st.P50Ms, iv.st.P90Ms, iv.st.P99Ms, iv.st.CUPerNs)
 	}
+}
+
+func (s backtestSummary) writeFiredancer(w io.Writer, totalSeconds float64) {
 	fd := s.FD
 	if !fd.Complete {
 		fmt.Fprintf(w, "BACKTEST_SUMMARY unavailable: a run timestamp was not recorded (slots=%d txns=%d slot_exec_s=%.3f)\n", fd.Slots, fd.Txns, fd.SlotExecS)
@@ -214,4 +223,24 @@ func (s backtestSummary) write(w io.Writer, settings [][2]string, totalSeconds f
 	// Mithril only: Firedancer has no import step (it reads the capture while
 	// replaying), so total_s = import_s + load_total_s + replay_s.
 	fmt.Fprintf(w, "MITHRIL_EXTRA import_s=%.3f shutdown_s=%.3f\n", fd.ImportS, max(totalSeconds-fd.TotalS, 0))
+}
+
+// lastRowPerSlot keeps each slot's last row, in the order those rows were
+// written. A fork switch can make replay execute a slot again; only the
+// execution that stood counts, once.
+func lastRowPerSlot(rows []timingRow) []timingRow {
+	last := make(map[uint64]int, len(rows))
+	for i, r := range rows {
+		last[r.Slot] = i
+	}
+	if len(last) == len(rows) {
+		return rows
+	}
+	out := make([]timingRow, 0, len(last))
+	for i, r := range rows {
+		if last[r.Slot] == i {
+			out = append(out, r)
+		}
+	}
+	return out
 }

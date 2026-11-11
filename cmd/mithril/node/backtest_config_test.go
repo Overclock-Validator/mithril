@@ -119,4 +119,6 @@ func TestValidateBacktestOptions(t *testing.T) {
 	require.ErrorContains(t, validateBacktestOptions(), "incremental snapshot needs a full snapshot")
 	bt.incremental, bt.txpar = "", 0
 	require.ErrorContains(t, validateBacktestOptions(), "at least 1")
+	bt.txpar, bt.warmup = 8, -1
+	require.ErrorContains(t, validateBacktestOptions(), "cannot be negative")
 }
