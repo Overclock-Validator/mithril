@@ -1442,8 +1442,11 @@ func runLive(c *cobra.Command, args []string) {
 	defer stopMemoryDiagnostics()
 
 	// Kill any existing mithril processes to prevent zombie accumulation
-	if killed := killExistingMithrilProcesses(); killed > 0 {
-		fmt.Printf("  ⚠ Killed %d existing mithril process(es)\n\n", killed)
+	// A backtest may share the host with other nodes and must not stop them.
+	if !backtestMode {
+		if killed := killExistingMithrilProcesses(); killed > 0 {
+			fmt.Printf("  ⚠ Killed %d existing mithril process(es)\n\n", killed)
+		}
 	}
 
 	// Discover once, before constructing any turbine, consensus, or production
@@ -2986,6 +2989,7 @@ postBootstrap:
 		}
 	}
 	result := runReplayWithRecovery(ctx, accountsDb, accountsPath, manifest, resumeState, uint64(startSlot), liveEndSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, uint16(turbineShredVersion), turbineAlpenglowAddr, validatorIdentity, blockstorePath, int(txParallelism), true, useLightbringer, useTurbine, dbgOpts, metricsWriter, slotCtxSetter, mithrilState, blockFetchOpts, consensusOpts, compactCfg.RewindHorizonBatches, replayStartTime)
+	lastReplayResult = result
 	stopCompactor() // join before shutdown closes AccountsDB
 
 	if result.Error != nil {

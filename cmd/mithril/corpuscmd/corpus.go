@@ -51,6 +51,7 @@ func init() {
 }
 
 func runImport(cmd *cobra.Command, args []string) error {
+	cmd.SilenceUsage = true
 	in, err := os.Open(args[0])
 	if err != nil {
 		return err
@@ -83,12 +84,19 @@ func runImport(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func runExport(cmd *cobra.Command, args []string) error {
+func runExport(cmd *cobra.Command, args []string) (err error) {
+	cmd.SilenceUsage = true
 	f, err := os.OpenFile(args[1], os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+	defer func() {
+		if err != nil {
+			// Never leave a partial capture that a later import would read.
+			_ = os.Remove(args[1])
+		}
+	}()
 	var w io.Writer = f
 	var enc *zstd.Encoder
 	if strings.HasSuffix(args[1], ".zst") {

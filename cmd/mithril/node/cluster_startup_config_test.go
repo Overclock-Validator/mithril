@@ -60,6 +60,10 @@ var clusterConfigCases = []struct {
 	{name: "offline replay needs a shred version", body: strings.Replace(offlineReplayConfig, "shred_version = 50093", "shred_version = 0", 1), wantErr: "turbine.shred_version"},
 	{name: "offline replay needs a finite range", body: strings.Replace(offlineReplayConfig, "end_slot = 100", "end_slot = -1", 1), wantErr: "replay.end_slot or replay.num_slots"},
 	{name: "offline replay needs an existing AccountsDB", body: strings.Replace(offlineReplayConfig, "mode = 'accountsdb'", "mode = 'auto'", 1), wantErr: "bootstrap.mode=accountsdb"},
+	{name: "offline replay builds from local snapshot files", body: strings.Replace(offlineReplayConfig, "mode = 'accountsdb'", "mode = 'snapshot'", 1) + "[ledger]\nsnapshot_archive_path = '/data/snapshot-100-11111111111111111111111111111111.tar.zst'\n", check: func(t *testing.T) {
+		require.True(t, offlineReplay)
+		require.NotEmpty(t, snapshotArchivePath)
+	}},
 	{name: "offline replay refuses validator mode", body: offlineReplayConfig + "mode = 'validator'\n", wantErr: "consensus.mode=verifying"},
 }
 

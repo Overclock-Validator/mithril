@@ -54,6 +54,7 @@ func init() {
 
 	cmd.AddCommand(
 		&node.Run,                  // Primary command for running Mithril
+		&node.Backtest,             // Offline replay of a shredcap capture
 		&alpenglowcmd.AlpenglowCmd, // Alpenglow diagnostics and tools
 		&configcmd.ConfigCmd,       // Config management (init, etc.)
 		&corpuscmd.CorpusCmd,       // Replay corpus and shredcap conversion

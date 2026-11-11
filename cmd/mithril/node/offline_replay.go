@@ -35,8 +35,10 @@ func applyOfflineReplay() error {
 	if consensusMode == "validator" {
 		missing = append(missing, "consensus.mode=verifying (a validator has to reach the cluster)")
 	}
-	if bootstrapMode != "accountsdb" {
-		missing = append(missing, "bootstrap.mode=accountsdb (an offline node cannot download a snapshot)")
+	// Local snapshot files (--snapshot) build without the network; anything
+	// that could discover or download a snapshot cannot run offline.
+	if bootstrapMode != "accountsdb" && snapshotArchivePath == "" {
+		missing = append(missing, "bootstrap.mode=accountsdb or local snapshot files via --snapshot (an offline node cannot download a snapshot)")
 	}
 	if endSlot < 0 && numReplaySlots <= 0 {
 		missing = append(missing, "replay.end_slot or replay.num_slots (with no network the node would wait at the end of the spool forever)")
