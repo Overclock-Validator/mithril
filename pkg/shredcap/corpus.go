@@ -33,8 +33,11 @@ type Manifest struct {
 	TransactionCounts map[string][2]int  `json:"transaction_counts,omitempty"`
 	LoggedCUMillions  map[string]float64 `json:"logged_cu_millions,omitempty"`
 	ShredBytes        int64              `json:"shred_bytes"`
-	Source            string             `json:"source,omitempty"`
-	CapturedUTC       string             `json:"captured_utc,omitempty"`
+	// ShredVersion is the shred version every replayed slot's shreds carry,
+	// which replay needs instead of discovering it from gossip.
+	ShredVersion uint16 `json:"shred_version,omitempty"`
+	Source       string `json:"source,omitempty"`
+	CapturedUTC  string `json:"captured_utc,omitempty"`
 }
 
 // ImportOptions limits an import.
@@ -71,6 +74,8 @@ type slotShreds struct {
 	last      int64  // index of the LAST_SHRED_IN_SLOT data shred, -1 until seen
 	parent    uint64
 	hasParent bool
+	version   uint16 // shred version of the slot's first stored shred
+	versions  int    // distinct shred versions seen in the slot
 }
 
 // ImportCorpus reads a shredcap capture and writes a replay corpus to outDir,
@@ -142,8 +147,10 @@ func ImportCorpus(capture io.Reader, outDir string, opts ImportOptions) (*Manife
 			}
 			st := slots[shred.Slot]
 			if st == nil {
-				st = &slotShreds{last: -1}
+				st = &slotShreds{last: -1, version: shred.Version, versions: 1}
 				slots[shred.Slot] = st
+			} else if shred.Version != st.version && st.versions == 1 {
+				st.versions = 2
 			}
 			if shred.Type != turbine.ShredTypeData {
 				continue
@@ -209,6 +216,13 @@ func ImportCorpus(capture io.Reader, outDir string, opts ImportOptions) (*Manife
 		BankHashes:  make(map[string]string, len(chain)),
 		Source:      opts.Source,
 		CapturedUTC: time.Now().UTC().Format(time.RFC3339),
+	}
+	man.ShredVersion = complete[chain[0]].version
+	for _, slot := range chain {
+		if st := complete[slot]; st.versions > 1 || st.version != man.ShredVersion {
+			return nil, stats, fmt.Errorf("slot %d carries shred version %d (or several), but slot %d carries %d: a replayable chain has one shred version",
+				slot, st.version, chain[0], man.ShredVersion)
+		}
 	}
 	for i, slot := range chain {
 		st := complete[slot]

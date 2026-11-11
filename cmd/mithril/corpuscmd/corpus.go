@@ -78,6 +78,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 	report("chain slots without a bank hash (not checked)", stats.NoBankHash)
 	report("chain slots whose data shred count differs from the bank hash record", stats.CountMismatch)
 	report("chain slots whose parent is not the previous chain slot", stats.ParentBreaks)
+	fmt.Fprintf(out, "shred version %d\n", man.ShredVersion)
 	fmt.Fprintf(out, "the AccountsDB must hold slot %d before replaying this corpus\n", man.Checkpoint)
 	return nil
 }

@@ -246,6 +246,7 @@ func TestImportCorpusUsesRootedChain(t *testing.T) {
 	require.Equal(t, []uint64{100, 101, 102}, man.Slots)
 	require.Equal(t, uint64(99), man.Checkpoint)
 	require.Equal(t, uint64(102), man.Head)
+	require.Equal(t, uint16(1), man.ShredVersion, "the generator's shred version")
 	require.Equal(t, solana.Hash([32]byte{101}).String(), man.BankHashes["101"])
 	require.Len(t, man.BankHashes, 3)
 	require.Equal(t, []uint64{103}, stats.OffChain)
@@ -390,4 +391,25 @@ func TestPlaceholderShredAtGenesis(t *testing.T) {
 	require.Equal(t, uint64(0), shred.Slot)
 	require.Equal(t, uint64(0), shred.ParentSlot(), "no underflow below slot 0")
 	require.Equal(t, turbine.ShredTypeData, shred.Type)
+}
+
+func TestImportCorpusRejectsMixedShredVersions(t *testing.T) {
+	leader, err := solana.NewRandomPrivateKey()
+	require.NoError(t, err)
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, "test")
+	require.NoError(t, err)
+	for slot := uint64(100); slot <= 101; slot++ {
+		gen := turbine.ShredGenerator{Slot: slot, ParentSlot: slot - 1, Version: uint16(slot)}
+		packets, _, _, _, err := gen.MakeShredsFromData(leader, bytes.Repeat([]byte{1}, 2000), true, solana.Hash{}, 0, 0)
+		require.NoError(t, err)
+		for _, p := range packets {
+			require.NoError(t, w.WriteShred(p))
+		}
+		require.NoError(t, w.WriteBankHash(slot, [32]byte{1}, 0))
+		require.NoError(t, w.WriteRootSlot(slot))
+	}
+	require.NoError(t, w.Flush())
+	_, _, err = ImportCorpus(bytes.NewReader(buf.Bytes()), filepath.Join(t.TempDir(), "c"), ImportOptions{})
+	require.ErrorContains(t, err, "one shred version")
 }
