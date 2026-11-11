@@ -186,6 +186,9 @@ func (db *AccountsDb) RewindToBatchBoundaryAndPersist(target uint64, persist fun
 	// Recovery, rewind and their forensic moves change the directory outside
 	// compaction's tracking; the next compaction cycle rescans it.
 	defer db.invalidateCompactionInventoryLocked()
+	// Match the lock order used by RewindToBatchBoundary.
+	db.voteIndexMu.Lock()
+	defer db.voteIndexMu.Unlock()
 	db.appendVecReadMu.LockAs("rewind")
 	defer db.appendVecReadMu.Unlock()
 	if persist == nil {

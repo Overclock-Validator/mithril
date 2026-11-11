@@ -42,7 +42,7 @@ func TestSnapshotWorkersSpreadAppendVecsAcrossDirectories(t *testing.T) {
 	closeShardLogger := sync.OnceFunc(func() { require.NoError(t, shardLogger.Close(context.Background())) })
 	t.Cleanup(closeShardLogger)
 	wg := &sync.WaitGroup{}
-	stakes := &stakeIndexCollector{}
+	stakes := &snapshotAccountCollector{}
 	pools, err := initWorkerPools(wg, shardLogger, manifest, nil, dirs, stakes)
 	require.NoError(t, err)
 	t.Cleanup(pools.Release)
@@ -56,8 +56,8 @@ func TestSnapshotWorkersSpreadAppendVecsAcrossDirectories(t *testing.T) {
 
 	perDir := [2]int{}
 	var maxId uint64
-	require.Len(t, stakes.entries, 6)
-	for _, e := range stakes.entries {
+	require.Len(t, stakes.stakeEntries, 6)
+	for _, e := range stakes.stakeEntries {
 		maxId = max(maxId, e.FileId)
 		dir := e.FileId % 2
 		perDir[dir]++

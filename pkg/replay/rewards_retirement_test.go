@@ -164,13 +164,13 @@ func TestRewardsRetirementAllowsExactParentUnwind(t *testing.T) {
 	sw := &CertifiedSwitch{Slot: 8}
 	ms := &state.MithrilState{LastRootedSlot: 4}
 	sched := &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 432000}
-	rs, _, reason := tryInLoopUnwind(sw, tail, ms, sched, 0, info)
+	rs, _, reason := tryInLoopUnwind(sw, tail, ms, sched, 0, info, nil)
 	require.Nil(t, rs)
 	require.Equal(t, unwindFallbackRewardsWindow, reason)
 	ms.LastRootedSlot = 5
 	markVoteStakeDirty(5) // completed reward writes are also below the durable root
 	require.True(t, completed.retire(&info, ms.LastRootedSlot))
-	rs, restored, reason := tryInLoopUnwind(sw, tail, ms, sched, 0, info)
+	rs, restored, reason := tryInLoopUnwind(sw, tail, ms, sched, 0, info, nil)
 	require.Empty(t, reason)
 	require.Same(t, bank, restored, "use the surviving bank, never abandoned reward sysvars")
 	want, err := ResumeStateFromRootedContext(parent, nil)

@@ -100,10 +100,12 @@ func WriteStakePubkeyIndex(path string, entries []StakeIndexEntry) error {
 // - pubkeys: all account pubkeys
 // - acctIdxEntries: index entries for each account
 // - stakeEntries: stake account pubkeys with their appendvec location hints
-func BuildIndexEntriesFromAppendVecs(data []byte, fileSize uint64, slot uint64, fileId uint64) ([]solana.PublicKey, []AccountIndexEntry, []StakeIndexEntry, error) {
+// - votePubkeys: vote-program account candidates, including accounts without active stake
+func BuildIndexEntriesFromAppendVecs(data []byte, fileSize uint64, slot uint64, fileId uint64) ([]solana.PublicKey, []AccountIndexEntry, []StakeIndexEntry, []solana.PublicKey, error) {
 	pubkeys := make([]solana.PublicKey, 0, 20000)
 	acctIdxEntries := make([]AccountIndexEntry, 0, 20000)
 	stakeEntries := make([]StakeIndexEntry, 0, 1000)
+	var votePubkeys []solana.PublicKey
 	parser := &appendVecParser{Buf: data, FileSize: fileSize, FileId: fileId, Slot: slot}
 
 	var owner solana.PublicKey
@@ -117,7 +119,7 @@ func BuildIndexEntriesFromAppendVecs(data []byte, fileSize uint64, slot uint64, 
 			if errors.Is(err, io.EOF) {
 				break
 			}
-			return nil, nil, nil, fmt.Errorf("parse appendvec slot=%d file_id=%d: %w", slot, fileId, err)
+			return nil, nil, nil, nil, fmt.Errorf("parse appendvec slot=%d file_id=%d: %w", slot, fileId, err)
 		}
 		// Collect stake account entries with appendvec location hints
 		if bytes.Equal(owner[:], addresses.StakeProgramAddr[:]) {
@@ -128,7 +130,10 @@ func BuildIndexEntriesFromAppendVecs(data []byte, fileSize uint64, slot uint64, 
 				Offset: acctIdxEntries[idx].Offset,
 			})
 		}
+		if owner == addresses.VoteProgramAddr {
+			votePubkeys = append(votePubkeys, pubkeys[len(pubkeys)-1])
+		}
 	}
 
-	return pubkeys, acctIdxEntries, stakeEntries, nil
+	return pubkeys, acctIdxEntries, stakeEntries, votePubkeys, nil
 }

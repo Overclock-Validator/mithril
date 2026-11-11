@@ -19,6 +19,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/statsd"
 	"github.com/Overclock-Validator/mithril/pkg/txstatus"
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/gagliardetto/solana-go"
 	"github.com/panjf2000/ants/v2"
 )
 
@@ -360,12 +361,12 @@ func BuildAccountsDbPaths(
 	numShards := snapshotIndexShards()
 	sl := NewShardLogger(numShards, logsDir)
 
-	// Create stake pubkey collector for building stake index during appendvec processing
-	stakeCollector := &stakeIndexCollector{
-		entries: make([]accountsdb.StakeIndexEntry, 0, 1000000), // Pre-allocate for ~1M stake accounts
+	// Collect stake and vote pubkeys while parsing appendvecs.
+	accountCollector := &snapshotAccountCollector{
+		stakeEntries: make([]accountsdb.StakeIndexEntry, 0, 1000000), // Pre-allocate for ~1M stake accounts
 	}
 
-	pools, err := initWorkerPools(wg, sl, manifest, incrementalManifest, appendVecDirs, stakeCollector)
+	pools, err := initWorkerPools(wg, sl, manifest, incrementalManifest, appendVecDirs, accountCollector)
 	if err != nil {
 		return nil, nil, fmt.Errorf("initializing worker pools: %w", err)
 	}
@@ -478,7 +479,7 @@ func BuildAccountsDbPaths(
 
 	// Write stake pubkey index file (with appendvec location hints)
 	stakeIndexPath := filepath.Join(accountsDbDir, "stake_pubkeys.idx")
-	if err := accountsdb.WriteStakePubkeyIndex(stakeIndexPath, stakeCollector.entries); err != nil {
+	if err := accountsdb.WriteStakePubkeyIndex(stakeIndexPath, accountCollector.stakeEntries); err != nil {
 		return nil, nil, fmt.Errorf("writing stake pubkey index: %w", err)
 	}
 	if err := syncBuildMetadata(accountsDbDir); err != nil {
@@ -495,6 +496,10 @@ func BuildAccountsDbPaths(
 	accountsDb, err := accountsdb.OpenDbPaths(accountsPaths)
 	if err != nil {
 		return nil, nil, err
+	}
+	if err := accountsDb.SeedVoteAccountPubkeys(accountCollector.votePubkeys); err != nil {
+		accountsDb.CloseDb()
+		return nil, nil, fmt.Errorf("seeding vote pubkey index: %w", err)
 	}
 
 	if incrementalManifest != nil {
@@ -741,29 +746,22 @@ func invokeSnapshotTask(wg *sync.WaitGroup, pool *ants.PoolWithFunc, task any) (
 	return err
 }
 
-// stakeIndexCollector aggregates stake account pubkeys from multiple worker goroutines
-// during appendvec processing. Used to build the stake pubkey index file.
-//
-// WHY: The manifest's delegation list can be stale/incomplete (Firedancer notes:
-// "the cache in the manifest is partially incomplete"). Instead of trusting manifest
-// data, we:
-//  1. Collect stake pubkeys during appendvec parsing (by checking owner == StakeProgramAddr)
-//  2. Write them to stake_pubkeys.idx after snapshot processing
-//  3. At startup, load pubkeys from index and read ALL delegation fields from AccountsDB
-//
-// This ensures stake cache contains fresh data from AccountsDB, not potentially stale
-// manifest data.
-type stakeIndexCollector struct {
-	mu      sync.Mutex
-	entries []accountsdb.StakeIndexEntry
+// snapshotAccountCollector records stake and vote pubkeys while workers parse
+// appendvecs. The manifest delegation list can be incomplete, and vote accounts
+// without stake are absent from it.
+type snapshotAccountCollector struct {
+	mu           sync.Mutex
+	stakeEntries []accountsdb.StakeIndexEntry
+	votePubkeys  []solana.PublicKey
 }
 
-func (c *stakeIndexCollector) Add(entries []accountsdb.StakeIndexEntry) {
-	if len(entries) == 0 {
+func (c *snapshotAccountCollector) Add(stakes []accountsdb.StakeIndexEntry, votes []solana.PublicKey) {
+	if len(stakes) == 0 && len(votes) == 0 {
 		return
 	}
 	c.mu.Lock()
-	c.entries = append(c.entries, entries...)
+	c.stakeEntries = append(c.stakeEntries, stakes...)
+	c.votePubkeys = append(c.votePubkeys, votes...)
 	c.mu.Unlock()
 }
 
@@ -773,7 +771,7 @@ func initWorkerPools(
 	manifest *SnapshotManifest,
 	incrementalManifest *SnapshotManifest,
 	appendVecDirs *appendVecDirs,
-	stakeCollector *stakeIndexCollector,
+	accountCollector *snapshotAccountCollector,
 ) (*snapshotWorkerPools, error) {
 	indexEntryCommitterWorkers := snapshotIndexEntryCommitterWorkers()
 	indexEntryBuilderWorkers := snapshotIndexEntryBuilderWorkers()
@@ -818,14 +816,14 @@ func initWorkerPools(
 		if workerErrors.Err() != nil {
 			return
 		}
-		pubkeys, entries, stakeEntries, err := accountsdb.BuildIndexEntriesFromAppendVecs(task.Data, task.FileSize, task.Slot, task.FileId)
+		pubkeys, entries, stakeEntries, votePubkeys, err := accountsdb.BuildIndexEntriesFromAppendVecs(task.Data, task.FileSize, task.Slot, task.FileId)
 		if err != nil {
 			workerErrors.Record(fmt.Errorf("building index entries: %w", err))
 			return
 		}
 
-		// Collect stake entries with appendvec location hints for building stake index
-		stakeCollector.Add(stakeEntries)
+		// Collect stake locations and vote pubkeys for their indexes.
+		accountCollector.Add(stakeEntries, votePubkeys)
 
 		commitTask := indexEntryCommitterTask{IndexEntries: entries, Pubkeys: pubkeys}
 		statsd.Timing(statsd.TasksIndexEntryBuilderLatency, uint64(time.Since(start)), nil)

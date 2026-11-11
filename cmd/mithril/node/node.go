@@ -2565,6 +2565,8 @@ postBootstrap:
 		if err := rpcServer.EnableEpochRewards(filepath.Join(accountsPath, "rpc-epoch-rewards"), 3*schedule.SlotsPerEpoch, mithrilState.LastRootedSlot); err != nil {
 			klog.Fatalf("unable to load RPC epoch rewards: %v", err)
 		}
+		publishRPCBankState(rpcServer, mithrilState)
+		rpcServer.SetIdentitySource(func() string { return validatorIdentity.PublicKey().String() })
 		rpcServer.Start()
 		mlog.Log.Infof("Started RPC server on port %d", rpcPort)
 	}
@@ -4638,6 +4640,7 @@ func runReplayWithRecovery(
 			mlog.Log.Errorf("fork switch: no rooted checkpoint context to re-replay from; halting")
 			break
 		}
+		publishRPCBankState(rpcServer, mithrilState)
 		if mithrilState.LastRootedSlot > prevRooted { // progress since last attempt -> fresh budget
 			attempt = 0
 			prevRooted = mithrilState.LastRootedSlot
@@ -4680,6 +4683,27 @@ func runReplayWithRecovery(
 		result = replay.ReplayBlocks(ctx, accountsDb, accountsDbPath, mithrilState, rs, retryStart, endSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, turbineShredVersion, turbineAlpenglowAddr, turbineIdentity, blockDir, txParallelism, isLive, useLightbringer, useTurbine, dbgOpts, metricsWriter, rpcServer, &retryBlockFetchOpts, consensusOpts, onCancelWriteState)
 	}
 	return result
+}
+
+type rpcBankStateSetter interface {
+	SetRootedBankState(slot, blockHeight, transactionCount uint64)
+}
+
+func publishRPCBankState(rpcServer rpcBankStateSetter, mithrilState *state.MithrilState) {
+	if rpcServer == nil || mithrilState == nil {
+		return
+	}
+	rootedSlot := mithrilState.ManifestParentSlot
+	rootedBlockHeight := mithrilState.ManifestBlockHeight
+	rootedTransactionCount := mithrilState.ManifestTransactionCount
+	if rootedCtx := mithrilState.LastRootedContext; rootedCtx != nil {
+		rootedSlot = rootedCtx.Slot
+		rootedBlockHeight = rootedCtx.BlockHeight
+		if rootedCtx.TransactionCount != nil {
+			rootedTransactionCount = *rootedCtx.TransactionCount
+		}
+	}
+	rpcServer.SetRootedBankState(rootedSlot, rootedBlockHeight, rootedTransactionCount)
 }
 
 func defaultVerifierConfigForBlockSource(source string, rpcFallback bool) replay.VerifierConfig {

@@ -153,6 +153,9 @@ func (db *AccountsDb) RewindToBatchBoundary(throughSlot uint64) (RewindResult, e
 	// Recovery, rewind and their forensic moves change the directory outside
 	// compaction's tracking; the next compaction cycle rescans it.
 	defer db.invalidateCompactionInventoryLocked()
+	// Migration reads appendvecs while holding voteIndexMu; take it first.
+	db.voteIndexMu.Lock()
+	defer db.voteIndexMu.Unlock()
 	db.appendVecReadMu.LockAs("rewind")
 	defer db.appendVecReadMu.Unlock()
 
@@ -168,6 +171,9 @@ func (db *AccountsDb) RewindToBatchBoundary(throughSlot uint64) (RewindResult, e
 }
 
 func (db *AccountsDb) rewindToBatchBoundaryLocked(throughSlot uint64) (RewindResult, error) {
+	db.voteIndexChecked = false
+	db.voteIndexResume = nil
+	db.voteIndexPending = nil
 	res := RewindResult{}
 	meta, haveMeta, err := db.readFoldMeta()
 	if err != nil {
@@ -184,6 +190,10 @@ func (db *AccountsDb) rewindToBatchBoundaryLocked(throughSlot uint64) (RewindRes
 		return res, fmt.Errorf("compaction history boundary exceeds committed head")
 	}
 	if meta.ThroughSlot == throughSlot {
+		finish := db.beginAccountChange()
+		success := false
+		defer func() { finish(nil, db.durableThrough.Load(), success, true) }() // Derived indexes must rebuild, including on partial failures.
+
 		// This also repairs the in-memory publication state after a prior
 		// WAL-less commit succeeded but its explicit Flush reported an error.
 		db.readCacheEpochMu.LockAs("rewind")
@@ -207,6 +217,7 @@ func (db *AccountsDb) rewindToBatchBoundaryLocked(throughSlot uint64) (RewindRes
 		// crashed before moving the undone files aside — finalize any leftover
 		// parked manifests now so recovery stops reporting a rewind in progress.
 		db.finalizeParkedRewindLeftoversLocked(throughSlot)
+		success = true
 		return res, nil // already at the target boundary
 	}
 
@@ -263,6 +274,10 @@ func (db *AccountsDb) rewindToBatchBoundaryLocked(throughSlot uint64) (RewindRes
 		}
 	}
 
+	finish := db.beginAccountChange()
+	success := false
+	defer func() { finish(nil, db.durableThrough.Load(), success, true) }() // Derived indexes must rebuild, including on partial failures.
+
 	// Step 1: park suffix manifests (ascending) so recovery treats the
 	// batches as undone even if we crash mid-rewind.
 	for seq := seqT + 1; seq <= meta.BatchSeq; seq++ {
@@ -286,6 +301,10 @@ func (db *AccountsDb) rewindToBatchBoundaryLocked(throughSlot uint64) (RewindRes
 	// entry) + the meta rollback. Atomic under Pebble.
 	batch := db.Index.NewBatch()
 	defer batch.Close()
+	// Restored accounts may predate the vote-index migration. Rebuild on demand.
+	if err := batch.Delete(voteIndexReadyKey, nil); err != nil {
+		return res, err
+	}
 	var idxBuf [24]byte
 	for seq := meta.BatchSeq; seq > seqT; seq-- {
 		m := bySeq[seq].manifest
@@ -360,5 +379,6 @@ func (db *AccountsDb) rewindToBatchBoundaryLocked(throughSlot uint64) (RewindRes
 	res.NewThrough = target.manifest.ThroughSlot
 	res.ResumeCtx = target.manifest.ResumeCtx
 	mlog.Log.Warnf("accountsdb: REWOUND %d fold batch(es) (%d keys) — durable state restored to slot %d", res.UndoneBatches, res.UndoneKeys, res.NewThrough)
+	success = true
 	return res, nil
 }
