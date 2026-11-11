@@ -180,7 +180,7 @@ func runBacktest(cmd *cobra.Command, _ []string) error {
 	}
 
 	shredDir := filepath.Join(workdir, "shred")
-	if _, err := restoreBacktestSpool(filepath.Join(workdir, "corpus"), filepath.Join(shredDir, "catchup-spool")); err != nil {
+	if _, err := prepareBacktestShredStore(filepath.Join(workdir, "corpus"), shredDir, clusterInfo); err != nil {
 		return fmt.Errorf("restore the capture into the shred spool: %w", err)
 	}
 	cfgPath := filepath.Join(workdir, "backtest.toml")

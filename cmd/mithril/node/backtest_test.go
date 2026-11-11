@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/config"
+	"github.com/Overclock-Validator/mithril/pkg/state"
 	"github.com/Overclock-Validator/mithril/pkg/turbine"
 	"github.com/stretchr/testify/require"
 )
@@ -110,6 +111,38 @@ func TestRestoreBacktestSpoolKeepsTheCorpus(t *testing.T) {
 	idx, err := os.ReadFile(filepath.Join(corpus, turbine.SpoolJournalName))
 	require.NoError(t, err)
 	require.Equal(t, "idx", string(idx))
+}
+
+func TestPrepareBacktestShredStoreBindsBeforeRestoring(t *testing.T) {
+	corpus := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(corpus, "shreds"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(corpus, "shreds", turbine.SpoolFileName(7)), []byte("slot7"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(corpus, turbine.SpoolJournalName), []byte("idx"), 0o644))
+	mainnet, err := config.ResolveCluster("mainnet", "")
+	require.NoError(t, err)
+	shredDir := filepath.Join(t.TempDir(), "shred")
+
+	for run := 0; run < 2; run++ { // a second run finds its own binding and spool
+		n, err := prepareBacktestShredStore(corpus, shredDir, mainnet)
+		require.NoError(t, err)
+		require.Equal(t, 1, n)
+		binding, err := state.LoadLedgerChainBinding(shredDir)
+		require.NoError(t, err)
+		require.NotNil(t, binding)
+		require.Equal(t, mainnet.GenesisHash, binding.GenesisHash)
+		require.FileExists(t, filepath.Join(shredDir, "catchup-spool", turbine.SpoolFileName(7)))
+	}
+
+	// The workdir's shred store holds nothing but the restored capture, so a
+	// capture from another cluster rebinds it; the AccountsDB's own genesis
+	// binding is what refuses state from the wrong chain.
+	devnet, err := config.ResolveCluster("devnet", "")
+	require.NoError(t, err)
+	_, err = prepareBacktestShredStore(corpus, shredDir, devnet)
+	require.NoError(t, err)
+	binding, err := state.LoadLedgerChainBinding(shredDir)
+	require.NoError(t, err)
+	require.Equal(t, devnet.GenesisHash, binding.GenesisHash)
 }
 
 func TestSummarizeBacktest(t *testing.T) {

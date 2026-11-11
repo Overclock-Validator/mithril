@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Overclock-Validator/mithril/pkg/config"
+	"github.com/Overclock-Validator/mithril/pkg/state"
 	"github.com/Overclock-Validator/mithril/pkg/turbine"
 )
 
@@ -189,6 +191,21 @@ func formatBoundaries(b []uint64) string {
 		parts[i] = strconv.FormatUint(s, 10)
 	}
 	return strings.Join(parts, " ")
+}
+
+// prepareBacktestShredStore binds the workdir's shred store to the capture's
+// cluster and restores the capture into its spool. The node refuses spooled
+// shreds whose store has no genesis binding; this store belongs to the
+// workdir, so the backtest creates the binding before any shred is there.
+func prepareBacktestShredStore(corpusDir, shredDir string, cluster config.Cluster) (int, error) {
+	spoolDir := filepath.Join(shredDir, "catchup-spool")
+	if err := os.RemoveAll(spoolDir); err != nil {
+		return 0, err
+	}
+	if _, err := state.EnsureLedgerChainBinding(shredDir, cluster.Name, cluster.GenesisHash, ""); err != nil {
+		return 0, fmt.Errorf("bind %s to %s: %w", shredDir, cluster.Name, err)
+	}
+	return restoreBacktestSpool(corpusDir, spoolDir)
 }
 
 // restoreBacktestSpool replaces spoolDir with the corpus's shreds and
