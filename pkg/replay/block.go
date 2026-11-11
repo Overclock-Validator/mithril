@@ -4166,7 +4166,7 @@ func EncodeRecentBlockhashes(sysvar *sealevel.SysvarRecentBlockhashes) []state.B
 	result := make([]state.BlockhashEntry, 0, len(*sysvar))
 	for _, entry := range *sysvar {
 		result = append(result, state.BlockhashEntry{
-			Blockhash:            base58.Encode(entry.Blockhash[:]),
+			Blockhash:            encodeHashCached(entry.Blockhash),
 			LamportsPerSignature: entry.FeeCalculator.LamportsPerSignature,
 		})
 	}
@@ -4183,7 +4183,7 @@ func EncodeSlotHashes(sysvar *sealevel.SysvarSlotHashes) []state.SlotHashEntry {
 	for _, entry := range *sysvar {
 		result = append(result, state.SlotHashEntry{
 			Slot: entry.Slot,
-			Hash: base58.Encode(entry.Hash[:]),
+			Hash: encodeHashCached(entry.Hash),
 		})
 	}
 	return result
