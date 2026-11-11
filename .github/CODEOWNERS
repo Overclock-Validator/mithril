@@ -1,0 +1,19 @@
+# Changes to these paths need an approving review from one of their owners
+# once the default branch ruleset requires code owner review. A PR author's
+# own approval never counts, so each path lists three owners.
+
+# CI, repository settings and this file
+/.github/        @smcio @7layermagik @dubbelosix
+
+# Dependencies and build
+/go.mod          @smcio @7layermagik @dubbelosix
+/go.sum          @smcio @7layermagik @dubbelosix
+/flake.nix       @smcio @7layermagik @dubbelosix
+/flake.lock      @smcio @7layermagik @dubbelosix
+/nix/            @smcio @7layermagik @dubbelosix
+/Makefile        @smcio @7layermagik @dubbelosix
+
+# Node entry point, keys and admin interface
+/cmd/mithril/    @smcio @7layermagik @dubbelosix
+/pkg/identity/   @smcio @7layermagik @dubbelosix
+/pkg/adminrpc/   @smcio @7layermagik @dubbelosix
