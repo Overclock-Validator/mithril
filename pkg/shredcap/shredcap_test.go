@@ -413,3 +413,107 @@ func TestImportCorpusRejectsMixedShredVersions(t *testing.T) {
 	_, _, err = ImportCorpus(bytes.NewReader(buf.Bytes()), filepath.Join(t.TempDir(), "c"), ImportOptions{})
 	require.ErrorContains(t, err, "one shred version")
 }
+
+// alpenglowSlotPackets generates the data and coding shreds of a slot that
+// decodes as an Alpenglow block: header marker, an entry batch, footer marker
+// and the ending tick. Recovery from coding shreds assembles the slot as replay
+// does, so unlike slotPackets its contents have to be a block.
+func alpenglowSlotPackets(t *testing.T, leader solana.PrivateKey, slot, parent uint64) [][]byte {
+	t.Helper()
+	tick := func(hash byte) turbine.BlockComponent {
+		batch, err := turbine.NewEntryBatch([]turbine.Entry{{NumHashes: 1, Hash: solana.Hash{hash}}})
+		require.NoError(t, err)
+		return batch
+	}
+	components := []turbine.BlockComponent{
+		turbine.NewBlockHeader(parent, solana.Hash{0x11}),
+		tick(0xab),
+		turbine.NewBlockFooter(turbine.BlockFooter{BankHash: solana.Hash{0x22}, BlockProducerTimeNanos: 42, BlockUserAgent: []byte("mithril")}),
+		tick(0xfe),
+	}
+	gen := turbine.ShredGenerator{Slot: slot, ParentSlot: parent, Version: 1, ReferenceTick: 63}
+	chainedRoot := solana.Hash{5}
+	var nextData, nextCode uint32
+	var all [][]byte
+	for i, component := range components {
+		payload, err := turbine.MarshalBlockComponent(component)
+		require.NoError(t, err)
+		packets, root, newData, newCode, err := gen.MakeShredsFromData(leader, payload, i == len(components)-1, chainedRoot, nextData, nextCode)
+		require.NoError(t, err)
+		chainedRoot, nextData, nextCode = root, newData, newCode
+		all = append(all, packets...)
+	}
+	return all
+}
+
+// A slot that reached the capture only as coding shreds has no data shred to
+// read its parent from, but its data shreds can be rebuilt. It must import as
+// a complete slot with the parent the rebuilt shreds carry.
+func TestImportCorpusRecoversASlotCapturedOnlyAsCodingShreds(t *testing.T) {
+	leader, err := solana.NewRandomPrivateKey()
+	require.NoError(t, err)
+	parents := map[uint64]uint64{100: 99, 101: 100, 102: 101}
+	want := make(map[uint64][][]byte) // the packets each slot's spool file holds
+	dataShreds := make(map[uint64]uint64)
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, "test")
+	require.NoError(t, err)
+	for slot := uint64(100); slot <= 102; slot++ {
+		packets := slotPackets(t, leader, slot, parents[slot])
+		if slot == 101 {
+			packets = alpenglowSlotPackets(t, leader, slot, parents[slot])
+		}
+		for _, p := range packets {
+			shred, err := turbine.ParseShred(p)
+			require.NoError(t, err)
+			if shred.Type == turbine.ShredTypeData {
+				dataShreds[slot]++
+				if slot == 101 {
+					continue // never captured
+				}
+			}
+			want[slot] = append(want[slot], p)
+			require.NoError(t, w.WriteShred(p))
+		}
+		require.NoError(t, w.WriteBankHash(slot, [32]byte{byte(slot)}, dataShreds[slot]))
+	}
+	require.NoError(t, w.Flush())
+	require.Positive(t, dataShreds[101])
+	require.NotEmpty(t, want[101], "slot 101 is captured as coding shreds")
+	capture := buf.Bytes()
+
+	// No root records: the chain is found by following parents down from the
+	// highest slot, so it reaches slot 100 only through slot 101's parent.
+	dir := filepath.Join(t.TempDir(), "corpus")
+	man, stats, err := ImportCorpus(bytes.NewReader(capture), dir, ImportOptions{})
+	require.NoError(t, err)
+	require.Equal(t, []uint64{100, 101, 102}, man.Slots)
+	require.Equal(t, uint64(99), man.Checkpoint)
+	require.Equal(t, []uint64{101}, stats.RecoveredSlots)
+	require.Empty(t, stats.Incomplete)
+	require.Empty(t, stats.ParentBreaks)
+	require.Empty(t, stats.NoBankHash)
+	require.Empty(t, stats.CountMismatch, "the recovered slot's last index is its real data shred count")
+	require.Equal(t, 3, stats.CompleteSlots)
+	requireCorpus(t, dir, want, man.Slots)
+
+	// As the chain's first slot, its parent is the checkpoint.
+	man, stats, err = ImportCorpus(bytes.NewReader(capture), filepath.Join(t.TempDir(), "corpus"), ImportOptions{FromSlot: 101})
+	require.NoError(t, err)
+	require.Equal(t, []uint64{101, 102}, man.Slots)
+	require.Equal(t, uint64(100), man.Checkpoint)
+	require.Equal(t, []uint64{101}, stats.RecoveredSlots)
+
+	// Export rebuilds the slot's data shreds too, and they import again.
+	var exported bytes.Buffer
+	exportStats, err := ExportCorpus(dir, &exported, "test", ExportOptions{})
+	require.NoError(t, err)
+	require.Equal(t, ExportStats{Slots: 3, RecoveredSlots: 1}, exportStats)
+	again, stats, err := ImportCorpus(bytes.NewReader(exported.Bytes()), filepath.Join(t.TempDir(), "again"), ImportOptions{})
+	require.NoError(t, err)
+	require.Equal(t, man.BankHashes["101"], again.BankHashes["101"])
+	require.Equal(t, []uint64{100, 101, 102}, again.Slots)
+	require.Equal(t, uint64(99), again.Checkpoint)
+	require.Empty(t, stats.RecoveredSlots, "the export holds the slot's data shreds")
+	require.Empty(t, stats.CountMismatch)
+}

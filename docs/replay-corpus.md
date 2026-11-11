@@ -30,7 +30,8 @@ mithril corpus export-shredcap CORPUS OUTFILE.pcapng.zst [--snapshot-slot N]
 Import keeps the capture's rooted slots when it has root records, and otherwise
 the chain of shred parents ending at the highest complete slot with a bank
 hash. It reports slots it had to leave out and slots completed by recovering
-data shreds from coding shreds. Export writes data shreds only, in index
+data shreds from coding shreds, including a slot the capture holds only as
+coding shreds. Export writes data shreds only, in index
 order, as backtest requires, recovering any the corpus never received.
 
 A capture is trusted input. Import does not check leader signatures on the

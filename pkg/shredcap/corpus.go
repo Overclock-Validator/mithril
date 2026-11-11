@@ -70,8 +70,10 @@ type ImportStats struct {
 }
 
 type slotShreds struct {
-	data      []bool // data shred indices held
-	last      int64  // index of the LAST_SHRED_IN_SLOT data shred, -1 until seen
+	data []bool // data shred indices held
+	last int64  // index of the LAST_SHRED_IN_SLOT data shred, -1 until seen
+	// parent comes from the first captured data shred, or from the rebuilt
+	// data shreds when the slot is completed from coding shreds (recoverSlot).
 	parent    uint64
 	hasParent bool
 	version   uint16 // shred version of the slot's first stored shred
@@ -175,14 +177,12 @@ func ImportCorpus(capture io.Reader, outDir string, opts ImportOptions) (*Manife
 			continue
 		}
 		// Missing data shreds may be recoverable from coding shreds, as
-		// replay recovers them when it hydrates the slot.
-		if packets, err := spool.ReadSlot(slot); err == nil && st.hasParent {
-			if data, err := turbine.RecoverSlotDataShreds(slot, packets); err == nil {
-				st.last = int64(len(data) - 1)
-				complete[slot] = st
-				stats.RecoveredSlots = append(stats.RecoveredSlots, slot)
-				continue
-			}
+		// replay recovers them when it hydrates the slot. That includes a
+		// slot captured only as coding shreds, which so far has no parent.
+		if recoverSlot(spool, slot, st) {
+			complete[slot] = st
+			stats.RecoveredSlots = append(stats.RecoveredSlots, slot)
+			continue
 		}
 		stats.Incomplete = append(stats.Incomplete, slot)
 	}
@@ -265,6 +265,30 @@ func ImportCorpus(capture io.Reader, outDir string, opts ImportOptions) (*Manife
 		return nil, stats, err
 	}
 	return man, stats, nil
+}
+
+// recoverSlot rebuilds slot's data shreds from what the spool holds of it and,
+// on success, records the slot's last data shred index and its parent from the
+// rebuilt shreds. The parent is read from data shred 0 rather than from a
+// captured data shred, because the capture may hold none: every data shred of
+// the slot can be missing and still be covered by its coding shreds. It
+// reports false when the slot does not assemble or its parent cannot be read.
+func recoverSlot(spool *turbine.ShredSpool, slot uint64, st *slotShreds) bool {
+	packets, err := spool.ReadSlot(slot)
+	if err != nil {
+		return false
+	}
+	data, err := turbine.RecoverSlotDataShreds(slot, packets)
+	if err != nil || len(data) == 0 {
+		return false
+	}
+	first, err := turbine.ParseShred(data[0])
+	if err != nil || first.Type != turbine.ShredTypeData || first.Slot != slot || first.Index != 0 {
+		return false
+	}
+	st.parent, st.hasParent = first.ParentSlot(), true
+	st.last = int64(len(data) - 1)
+	return true
 }
 
 // replayChain picks the slots to replay, in order.
