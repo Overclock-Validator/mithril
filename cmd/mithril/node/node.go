@@ -1453,9 +1453,10 @@ func runLive(c *cobra.Command, args []string) {
 	stopMemoryDiagnostics := startMemoryDiagnostics(ctx, mlog.GetLogDir(), heapProfileThreshold)
 	defer stopMemoryDiagnostics()
 
-	// Kill any existing mithril processes to prevent zombie accumulation
-	// A backtest may share the host with other nodes and must not stop them.
-	if !backtestMode {
+	// Kill any existing mithril processes to prevent zombie accumulation.
+	// A backtest or an offline replay may share the host with other nodes and
+	// must not stop them.
+	if shouldKillExistingMithril(backtestMode, offlineReplay) {
 		if killed := killExistingMithrilProcesses(); killed > 0 {
 			fmt.Printf("  ⚠ Killed %d existing mithril process(es)\n\n", killed)
 		}
@@ -3934,6 +3935,16 @@ func downloadAndBuildFromSnapshot(ctx context.Context, rpcEndpoints []string, sn
 	mlog.Log.Infof("Finished building AccountsDB")
 
 	return accountsDb, manifest, nil
+}
+
+// shouldKillExistingMithril reports whether startup stops the other Mithril
+// processes on the host. A normal run does, so a stale instance cannot hold
+// its ports and disk or double its traffic to the cluster. A backtest and an
+// offline replay (--offline) use no network and are benchmarks that are
+// expected to run beside other nodes, a live validator included, so they
+// leave every other process alone.
+func shouldKillExistingMithril(backtest, offline bool) bool {
+	return !backtest && !offline
 }
 
 // killExistingMithrilProcesses finds and kills any other running mithril processes.

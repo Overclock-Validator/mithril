@@ -52,7 +52,8 @@ polled. It refuses to start unless the configuration has
 `bootstrap.mode = "accountsdb"` or local snapshot files (`--snapshot`),
 verifying consensus mode, a finite replay range (`replay.end_slot` or
 `replay.num_slots`), `turbine.shred_version`, and `block.rpc_fallback` off, and
-says which is missing.
+says which is missing. Unlike a normal `mithril run`, offline replay does not
+stop other Mithril processes on the host, so it can run beside a live node.
 
 `mithril backtest` wraps all of this in one command for a shredcap capture:
 see [backtest.md](backtest.md).

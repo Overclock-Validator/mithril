@@ -8,7 +8,9 @@ blocks.
 The node uses no network and no RPC endpoint: no gossip, Turbine, repair or
 RPC calls. It starts from local snapshot files or an existing AccountsDB, reads
 every block from the capture, checks every block's bank hash against the
-capture, and stops at the capture's last block.
+capture, and stops at the capture's last block. A backtest does not stop other
+Mithril processes on the host (a normal `mithril run` does), so it can run
+beside a live node.
 
 ## What you need
 
