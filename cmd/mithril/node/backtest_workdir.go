@@ -148,7 +148,10 @@ func backtestSnapshotSlot(full, incremental string) (uint64, error) {
 // starting the node: whether it holds state, the slot it is durable through,
 // and the fold boundaries it can rewind to.
 type storeView struct {
-	HasState   bool
+	HasState bool
+	// StateSlot is the slot startup recovery leaves the store at: the later of
+	// the state file's rooted slot and the last committed fold boundary (see
+	// recoveredStorePosition). The state file alone is stale after a killed run.
 	StateSlot  uint64
 	Boundaries []uint64 // retained fold boundaries (ThroughSlot), ascending
 }

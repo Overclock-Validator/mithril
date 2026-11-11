@@ -98,6 +98,13 @@ the AccountsDB is rewound rather than rebuilt.
   slots), so they replay slightly fewer blocks; the summary prints the measured
   slot range, and `--measure-from` makes runs cover the same blocks.
 
+A run that was killed leaves the store past the slot its state file records.
+The next run plans from the store's fold manifests, as node startup recovers
+from them, so it rewinds as above. After every run the timing rows must cover
+exactly the planned blocks, the first planned slot through the last with none
+missing; otherwise the backtest exits with status 1, says what was planned and
+what was replayed, and prints no summary.
+
 The work directory must be new, empty, or one a backtest created
 (`BACKTEST.json`); anything else is refused. All paths are inside it, or the
 `--accounts` store.

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -320,6 +321,12 @@ func runBacktest(cmd *cobra.Command, _ []string) error {
 		}
 		return fmt.Errorf("replay stopped at slot %d before the capture's last block %d", last, head)
 	}
+	// The run ended on the last block; it must also have started where the plan
+	// said and replayed every block between, or the summary would describe fewer
+	// blocks than the run was asked for.
+	if err := checkBacktestCoverage(man.Slots, plan.FirstSlot, head, rows); err != nil {
+		return err
+	}
 	clock := backtestClock{Boot: started, ImportDone: prepDone, StateReady: stateReadyAt}
 	if ns := replay.ReplayReadyAt.Load(); ns != 0 {
 		clock.ReplayReady = time.Unix(0, ns)
@@ -402,18 +409,51 @@ func backtestStoreView(store string) (storeView, error) {
 	if err != nil || st == nil {
 		return v, nil
 	}
-	v.HasState, v.StateSlot = true, st.LastRootedSlot
 	headers, err := accountsdb.ListFoldManifests(filepath.Join(store, "accounts"))
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return v, err
 	}
-	for _, h := range headers {
-		if h.BatchSeq > 0 {
-			v.Boundaries = append(v.Boundaries, h.ThroughSlot)
-		}
-	}
-	sort.Slice(v.Boundaries, func(i, j int) bool { return v.Boundaries[i] < v.Boundaries[j] })
+	v.HasState = true
+	v.StateSlot, v.Boundaries = recoveredStorePosition(st.LastRootedSlot, headers)
 	return v, nil
+}
+
+// recoveredStorePosition predicts where startup recovery leaves a store: the
+// slot it is durable through and its fold boundaries, ascending. stateSlot is
+// the state file's rooted slot; folds are the store's fold manifests ascending
+// by batch sequence (accountsdb.ListFoldManifests).
+//
+// The state file is written only on graceful shutdown, so after a killed run
+// it is older than the fold manifests, which are the commit record. Startup
+// (AccountsDb.RecoverFoldState, then the reconcile in runLive) replays the
+// contiguous run of batches above the index watermark, deletes whatever lies
+// above the first gap as undecided, and advances the rooted slot to the last
+// batch it kept. The watermark is never below the state file's slot (startup
+// refuses a store that is), so every manifest at or below that slot is
+// committed history, and above it the run ends at the first gap.
+//
+// Two things recovery checks are not predicted here: a batch whose segment
+// data fails its length or CRC check, and an interrupted rewind. Either leaves
+// the store below this position. The plan can then refuse a store startup
+// would have accepted, or name a boundary startup refuses; neither is silent,
+// and checkBacktestCoverage rejects any run that starts somewhere else.
+func recoveredStorePosition(stateSlot uint64, folds []accountsdb.ManifestHeader) (uint64, []uint64) {
+	slot := stateSlot
+	var boundaries []uint64
+	prevSeq, havePrev := uint64(0), false
+	for _, h := range folds {
+		if h.BatchSeq == 0 {
+			continue // unreadable header: recovery removes the file
+		}
+		if h.ThroughSlot > stateSlot && havePrev && h.BatchSeq != prevSeq+1 {
+			break
+		}
+		boundaries = append(boundaries, h.ThroughSlot)
+		slot = max(slot, h.ThroughSlot)
+		prevSeq, havePrev = h.BatchSeq, true
+	}
+	slices.Sort(boundaries)
+	return slot, boundaries
 }
 
 func listLogDirs(dir string) map[string]bool {

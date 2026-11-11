@@ -244,3 +244,53 @@ func lastRowPerSlot(rows []timingRow) []timingRow {
 	}
 	return out
 }
+
+// checkBacktestCoverage verifies that the run replayed exactly the blocks it
+// planned: the chain's slots from firstSlot through head, each once, in chain
+// order. Ending on the last block is not enough: a store that startup left
+// ahead of the plan would replay only the tail and still end there. chain is
+// the corpus manifest's slot list; a slot replayed again after a fork switch
+// counts once, by its last row.
+func checkBacktestCoverage(chain []uint64, firstSlot, head uint64, rows []timingRow) error {
+	var planned []uint64
+	for _, slot := range chain {
+		if slot >= firstSlot && slot <= head {
+			planned = append(planned, slot)
+		}
+	}
+	rows = lastRowPerSlot(rows)
+	replayed := make([]uint64, len(rows))
+	for i, r := range rows {
+		replayed[i] = r.Slot
+	}
+	describe := func(slots []uint64) string {
+		if len(slots) == 0 {
+			return "no blocks"
+		}
+		return fmt.Sprintf("%d blocks, slots %d..%d", len(slots), slots[0], slots[len(slots)-1])
+	}
+	fail := func(format string, args ...any) error {
+		return fmt.Errorf("replay did not cover the planned blocks: %s (planned %s; replayed %s)",
+			fmt.Sprintf(format, args...), describe(planned), describe(replayed))
+	}
+	for i, want := range planned {
+		if i >= len(replayed) {
+			return fail("slot %d was not replayed", want)
+		}
+		switch got := replayed[i]; {
+		case got == want:
+		case got < want || !slices.Contains(planned, got):
+			return fail("slot %d was replayed but is not one of the planned blocks", got)
+		case slices.Contains(replayed, want):
+			return fail("slot %d was replayed out of chain order", want)
+		case i == 0:
+			return fail("the first replayed block is slot %d, after the planned first slot %d", got, want)
+		default:
+			return fail("slot %d was not replayed", want)
+		}
+	}
+	if len(replayed) > len(planned) {
+		return fail("slot %d was replayed but is not one of the planned blocks", replayed[len(planned)])
+	}
+	return nil
+}

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/config"
 	"github.com/Overclock-Validator/mithril/pkg/shredcap"
 	"github.com/Overclock-Validator/mithril/pkg/state"
@@ -86,6 +87,111 @@ func TestPlanBacktestStart(t *testing.T) {
 			require.Equal(t, tc.want, got)
 		})
 	}
+}
+
+// backtestStore writes a store directory holding a state file at stateSlot and
+// one fold manifest per boundary, with the given batch sequence numbers.
+func backtestStore(t *testing.T, stateSlot uint64, folds map[uint64]uint64) string {
+	t.Helper()
+	store := t.TempDir()
+	st := state.NewReadyState(stateSlot, 0, "", "", 0, 0)
+	st.LastRootedSlot = stateSlot
+	require.NoError(t, st.Save(store))
+	accts := filepath.Join(store, "accounts")
+	require.NoError(t, os.MkdirAll(accts, 0o755))
+	for seq, through := range folds {
+		require.NoError(t, accountsdb.WriteSegmentManifest(accts, &accountsdb.SegmentManifest{
+			Kind: accountsdb.ManifestKindFold, BatchSeq: seq, ThroughSlot: through, FileId: 100 + seq,
+		}))
+	}
+	return store
+}
+
+// A killed run leaves the state file (written on graceful shutdown) behind the
+// fold manifests. Startup recovery advances the store to the manifests'
+// frontier, so the plan must start from there: a state file that still names
+// the checkpoint does not mean the store is at the checkpoint.
+func TestBacktestStoreViewFollowsFoldManifestsPastAStaleStateFile(t *testing.T) {
+	const cp = 1000
+
+	// The checkpoint is a retained boundary: rewind to it.
+	view, err := backtestStoreView(backtestStore(t, cp, map[uint64]uint64{7: cp, 8: 1128, 9: 1256}))
+	require.NoError(t, err)
+	require.True(t, view.HasState)
+	require.Equal(t, uint64(1256), view.StateSlot, "the store is durable through its last fold, not the state file's slot")
+	require.Equal(t, []uint64{cp, 1128, 1256}, view.Boundaries)
+	plan, err := planBacktestStart(cp, false, 0, view)
+	require.NoError(t, err)
+	require.Equal(t, uint64(cp), plan.RewindTo, "replay must not start at slot 1257")
+	require.Equal(t, uint64(cp+1), plan.FirstSlot)
+
+	// A store built from the snapshot at the checkpoint has no boundary there:
+	// the workdir's own store rewinds to the first boundary after it, and a
+	// store given with --accounts is refused.
+	view, err = backtestStoreView(backtestStore(t, cp, map[uint64]uint64{1: 1128, 2: 1256}))
+	require.NoError(t, err)
+	require.Equal(t, uint64(1256), view.StateSlot)
+	plan, err = planBacktestStart(cp, true, cp, view)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1128), plan.RewindTo)
+	require.Equal(t, uint64(1129), plan.FirstSlot)
+	_, err = planBacktestStart(cp, false, 0, view)
+	require.ErrorContains(t, err, "is at slot 1256 and cannot return to the capture's checkpoint 1000")
+
+	// A state file at or past the manifests is the position, as before.
+	view, err = backtestStoreView(backtestStore(t, 1256, map[uint64]uint64{7: cp, 8: 1128, 9: 1256}))
+	require.NoError(t, err)
+	require.Equal(t, uint64(1256), view.StateSlot)
+	view, err = backtestStoreView(backtestStore(t, cp, nil))
+	require.NoError(t, err)
+	require.Equal(t, uint64(cp), view.StateSlot)
+	plan, err = planBacktestStart(cp, false, 0, view)
+	require.NoError(t, err)
+	require.Equal(t, startPlan{Bootstrap: "accountsdb", FirstSlot: cp + 1}, plan)
+
+	// Recovery stops at the first gap in the batch sequence and deletes what
+	// lies above it, so a manifest above a gap is not a position or a boundary.
+	view, err = backtestStoreView(backtestStore(t, cp, map[uint64]uint64{7: cp, 8: 1128, 10: 1384}))
+	require.NoError(t, err)
+	require.Equal(t, uint64(1128), view.StateSlot)
+	require.Equal(t, []uint64{cp, 1128}, view.Boundaries)
+}
+
+func TestCheckBacktestCoverage(t *testing.T) {
+	chain := []uint64{1001, 1002, 1004, 1005, 1006} // 1003 was skipped
+	rowsFor := func(slots ...uint64) []timingRow {
+		rows := make([]timingRow, len(slots))
+		for i, s := range slots {
+			rows[i] = timingRow{Slot: s, Completed: int64(i + 1)}
+		}
+		return rows
+	}
+	require.NoError(t, checkBacktestCoverage(chain, 1001, 1006, rowsFor(1001, 1002, 1004, 1005, 1006)))
+	require.NoError(t, checkBacktestCoverage(chain, 1004, 1005, rowsFor(1004, 1005)), "a later planned start and --end-slot")
+	require.NoError(t, checkBacktestCoverage(chain, 1001, 1006, rowsFor(1001, 1002, 1004, 1002, 1004, 1005, 1006)),
+		"a slot replayed again after a fork switch counts once")
+
+	// The store was ahead of the plan: the run ends on the last block but
+	// replayed fewer blocks than planned.
+	err := checkBacktestCoverage(chain, 1001, 1006, rowsFor(1005, 1006))
+	require.ErrorContains(t, err, "first replayed block is slot 1005")
+	require.ErrorContains(t, err, "planned 5 blocks, slots 1001..1006")
+	require.ErrorContains(t, err, "replayed 2 blocks, slots 1005..1006")
+
+	err = checkBacktestCoverage(chain, 1001, 1006, rowsFor(1001, 1002, 1005, 1006))
+	require.ErrorContains(t, err, "slot 1004 was not replayed")
+	err = checkBacktestCoverage(chain, 1001, 1006, rowsFor(1001, 1002, 1004, 1005))
+	require.ErrorContains(t, err, "slot 1006 was not replayed")
+	err = checkBacktestCoverage(chain, 1001, 1006, nil)
+	require.ErrorContains(t, err, "replayed no blocks")
+	err = checkBacktestCoverage(chain, 1002, 1006, rowsFor(1001, 1002, 1004, 1005, 1006))
+	require.ErrorContains(t, err, "slot 1001 was replayed but is not one of the planned blocks")
+	err = checkBacktestCoverage(chain, 1001, 1006, rowsFor(1001, 1002, 1003, 1004, 1005, 1006))
+	require.ErrorContains(t, err, "slot 1003 was replayed but is not one of the planned blocks")
+	err = checkBacktestCoverage(chain, 1001, 1005, rowsFor(1001, 1002, 1004, 1005, 1006))
+	require.ErrorContains(t, err, "slot 1006 was replayed but is not one of the planned blocks")
+	err = checkBacktestCoverage(chain, 1001, 1006, rowsFor(1001, 1004, 1002, 1005, 1006))
+	require.ErrorContains(t, err, "slot 1002 was replayed out of chain order")
 }
 
 func TestRestoreBacktestSpoolKeepsTheCorpus(t *testing.T) {
