@@ -505,16 +505,27 @@ func (ip *Interpreter) runFast(r *[16]uint64, pc int64, due, budget uint64, f fa
 			*(*uint32)(p) = uint32(r[ins.Src()])
 		case OpNeg64: // OpSt4BImm when neg is disabled
 			if !f.disableNeg {
+				r[ins.Dst()] = uint64(-int64(r[ins.Dst()]))
+			} else {
+				if !f.moveMem {
+					return pc, due
+				}
+				p := ip.fastWrite(uint64(int64(r[ins.Dst()])+int64(ins.Off())), 4)
+				if p == nil {
+					return pc, due
+				}
+				*(*uint32)(p) = ins.Uimm()
+			}
+		case OpNeg32:
+			if f.disableNeg {
 				return pc, due
 			}
-			if !f.moveMem {
+			r[ins.Dst()] = uint64(-int32(r[ins.Dst()]))
+		case OpHor64Imm:
+			if !f.disableLddw {
 				return pc, due
 			}
-			p := ip.fastWrite(uint64(int64(r[ins.Dst()])+int64(ins.Off())), 4)
-			if p == nil {
-				return pc, due
-			}
-			*(*uint32)(p) = ins.Uimm()
+			r[ins.Dst()] |= uint64(ins.Uimm()) << 32
 		case OpArsh32Imm:
 			r[ins.Dst()] = uint64(uint32(int32(r[ins.Dst()]) >> ins.Uimm()))
 		case OpArsh32Reg:
