@@ -2,6 +2,11 @@
 
 package accountsdb
 
-import "os"
+import (
+	"errors"
+	"os"
+)
 
-func boundedWriteback(*os.File, int64, int64) error { return nil }
+// boundedWriteback has no implementation here; the caller reports the error
+// and leaves the segment to its final fsync.
+func boundedWriteback(*os.File, int64, int64) error { return errors.ErrUnsupported }

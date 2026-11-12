@@ -89,6 +89,7 @@ type BatchCommitResult struct {
 	Keys        int
 	Bytes       int64
 	Timings     FoldTimings
+	Writeback   FoldWriteback
 }
 
 type dedupedVersion struct {
@@ -223,7 +224,8 @@ func (db *AccountsDb) CommitBatch(
 	}
 	db.foldPhase.set(foldPhaseSegmentWrite)
 	crc := crc32.NewIEEE()
-	bw := bufio.NewWriterSize(&segmentFileWriter{f: f, step: foldWritebackBytes}, 1<<20)
+	segFile := &segmentFileWriter{f: f, step: foldWritebackBytes}
+	bw := bufio.NewWriterSize(segFile, 1<<20)
 	segWriter := io.MultiWriter(bw, crc)
 	records := make([]ManifestRecord, 0, len(keys))
 	var dataLen uint64
@@ -371,6 +373,7 @@ func (db *AccountsDb) CommitBatch(
 		Keys:        len(records),
 		Bytes:       int64(dataLen),
 		Timings:     timings,
+		Writeback:   segFile.report(),
 	}, nil
 }
 

@@ -1,6 +1,7 @@
 package accountsdb
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"sync/atomic"
@@ -23,36 +24,71 @@ var foldWritebackBytes = func() int64 {
 	return int64(n) << 20
 }()
 
-// segmentFileWriter writes a fold segment and, when step is positive, bounds
-// the amount of it that is dirty or in flight to about two steps.
+// segmentWriteback is boundedWriteback; tests replace it.
+var segmentWriteback = boundedWriteback
+
+// segmentFileWriter writes a fold segment and, when step is positive, hands it
+// to the device a step at a time. The bytes that are dirty or in flight then
+// stay near two steps plus the largest single write (the buffered writer above
+// passes an account larger than its buffer through in one piece); that is a
+// pacing target, not a hard cap.
 type segmentFileWriter struct {
 	f       *os.File
-	step    int64
+	step    int64 // step asked for; 0 for none
 	written int64
-	handed  int64 // bytes already handed to the device
-	err     error // first writeback error; reported by the caller's fsync too
+	handed  int64 // bytes handed to the device by successful steps
+	calls   int   // successful steps
+	err     error // first step failure; it ends stepping for this file
 }
 
 func (w *segmentFileWriter) Write(p []byte) (int, error) {
 	n, err := w.f.Write(p)
 	w.written += int64(n)
-	if err != nil || w.step <= 0 || w.written-w.handed < w.step {
+	if err != nil || w.step <= 0 || w.err != nil || w.written-w.handed < w.step {
 		return n, err
 	}
 	// Wait for what was handed over earlier, then start the new bytes. A
-	// failure here is not fatal: the fsync that follows reports real errors.
-	if werr := boundedWriteback(w.f, w.handed, w.written); werr != nil {
+	// failure here does not fail the fold: the fsync that follows submits
+	// everything and reports real errors. It is kept for the fold's report, so
+	// a run with the setting on cannot turn itself off unseen.
+	if werr := segmentWriteback(w.f, w.handed, w.written); werr != nil {
 		w.err = werr
-		w.step = 0
 		return n, nil
 	}
 	w.handed = w.written
+	w.calls++
 	return n, nil
+}
+
+func (w *segmentFileWriter) report() FoldWriteback {
+	rep := FoldWriteback{StepBytes: w.step, Calls: w.calls, HandedBytes: w.handed, SegmentBytes: w.written}
+	if w.err != nil {
+		rep.Err = w.err.Error()
+	}
+	return rep
+}
+
+// FoldWriteback reports what the stepwise segment writeback did in one fold.
+type FoldWriteback struct {
+	StepBytes    int64  // step asked for (MITHRIL_FOLD_WRITEBACK_MB); 0 when off
+	Calls        int    // steps handed to the device
+	HandedBytes  int64  // segment bytes those steps covered; the final fsync submits the rest
+	SegmentBytes int64  // segment file size
+	Err          string // first step failure, which ended stepping for this file; empty when none
+}
+
+func (w FoldWriteback) String() string {
+	msg := "none"
+	if w.Err != "" {
+		msg = strconv.Quote(w.Err)
+	}
+	return fmt.Sprintf("writeback_step_mb=%d writeback_calls=%d writeback_handed_bytes=%d segment_bytes=%d writeback_err=%s",
+		w.StepBytes>>20, w.Calls, w.HandedBytes, w.SegmentBytes, msg)
 }
 
 // Fold phases, for attributing a slow account load to what the fold was doing.
 const (
-	foldPhaseIdle uint32 = iota
+	foldPhaseIdle uint64 = iota
 	foldPhasePrepare
 	foldPhaseSegmentWrite
 	foldPhaseSegmentSync
@@ -63,24 +99,41 @@ const (
 
 var foldPhaseNames = [...]string{"none", "prepare", "segment_write", "segment_sync", "manifest", "index_commit", "cache_refresh"}
 
-// foldPhase packs the phase with the time it began.
-type foldPhase struct {
-	phase atomic.Uint32
-	since atomic.Int64
+// foldPhaseBase is the origin of the phase clock (monotonic).
+var foldPhaseBase = time.Now()
+
+const foldPhaseSinceBits = 56 // nanoseconds since foldPhaseBase: about two years
+
+// foldPhase holds the fold's current phase and the time it began in one word,
+// so a reader never pairs one phase with another phase's start time.
+type foldPhase struct{ v atomic.Uint64 }
+
+func (p *foldPhase) set(phase uint64) {
+	since := uint64(time.Since(foldPhaseBase)) & (1<<foldPhaseSinceBits - 1)
+	p.v.Store(phase<<foldPhaseSinceBits | since)
 }
 
-func (p *foldPhase) set(phase uint32) {
-	p.since.Store(time.Now().UnixNano())
-	p.phase.Store(phase)
+// foldPhaseSnap is the phase as seen at one instant. Taking one is a single
+// atomic load; formatting is left to String, for after locks are released.
+type foldPhaseSnap struct {
+	packed uint64
+	at     time.Time
 }
 
-// describe returns the phase name and, during a fold, how long it has run.
-func (p *foldPhase) describe() string {
-	phase := p.phase.Load()
-	if phase == foldPhaseIdle || int(phase) >= len(foldPhaseNames) {
+func (p *foldPhase) at(t time.Time) foldPhaseSnap { return foldPhaseSnap{packed: p.v.Load(), at: t} }
+
+// String returns the phase name and, during a fold, how long the phase had
+// run when the snapshot was taken: "segment_sync+35ms", or "none".
+func (s foldPhaseSnap) String() string {
+	phase := s.packed >> foldPhaseSinceBits
+	if phase == foldPhaseIdle || phase >= uint64(len(foldPhaseNames)) {
 		return foldPhaseNames[foldPhaseIdle]
 	}
-	age := time.Duration(time.Now().UnixNano() - p.since.Load())
+	began := time.Duration(s.packed & (1<<foldPhaseSinceBits - 1))
+	age := s.at.Sub(foldPhaseBase) - began
+	if age < 0 { // the phase began between the caller's clock read and its load
+		age = 0
+	}
 	return foldPhaseNames[phase] + "+" + age.Round(time.Millisecond).String()
 }
 
