@@ -73,6 +73,7 @@ type AccountsDb struct {
 	lastBatchSeq     uint64        // guarded by foldMu; seeded by RecoverFoldState
 	durableThrough   atomic.Uint64 // observability: highest durably folded slot
 	foldHooks        foldTestHooks // test-only crash injection
+	foldPhase        foldPhase     // what CommitBatch is doing now, for slow-load attribution
 	compactCursor    string        // guarded by foldMu; scan resume point across CompactOnce cycles
 	sparseCursor     string        // independent cursor so bootstrap scanning cannot starve large segments
 	resparseNext     bool          // alternate new and previously sparse segments, even with one-file cycles
