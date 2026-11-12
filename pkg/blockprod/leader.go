@@ -93,23 +93,24 @@ type preparedRewardCertConsumer interface {
 }
 
 type LeaderLoop struct {
-	controller       *Controller
-	identity         *identity.Holder
-	accountsDb       *accountsdb.AccountsDb
-	broadcaster      turbine.PacketBroadcaster
-	shredVersion     uint16
-	userAgent        []byte
-	rewardCerts      RewardCertBuilder
-	epochSchedule    *sealevel.SysvarEpochSchedule
-	alpenglowClock   bool
-	parentContext    func(uint64) ParentContext
-	productionParent func(uint64) alpenglow.BlockProductionParent
-	canSignSlot      func(uint64) bool
-	onBlock          func(*b.Block)
-	commitLeaderSlot func(replay.CommitLeaderInput) (*sealevel.SlotCtx, error)
-	hooks            LeaderHooks
-	holder           SlotHolder
-	gateTPU          bool
+	controller            *Controller
+	identity              *identity.Holder
+	accountsDb            *accountsdb.AccountsDb
+	broadcaster           turbine.PacketBroadcaster
+	shredVersion          uint16
+	userAgent             []byte
+	rewardCerts           RewardCertBuilder
+	epochSchedule         *sealevel.SysvarEpochSchedule
+	alpenglowClock        bool
+	parentContext         func(uint64) ParentContext
+	parentGenerationLease func(uint64) (func(), bool)
+	productionParent      func(uint64) alpenglow.BlockProductionParent
+	canSignSlot           func(uint64) bool
+	onBlock               func(*b.Block)
+	commitLeaderSlot      func(replay.CommitLeaderInput) (*sealevel.SlotCtx, error)
+	hooks                 LeaderHooks
+	holder                SlotHolder
+	gateTPU               bool
 
 	currentSlot   func() uint64
 	leaderForSlot func(uint64) (solana.PublicKey, bool)
@@ -124,6 +125,7 @@ type LeaderLoop struct {
 	mu                      sync.Mutex
 	activeSlot              uint64
 	activeBank              *WorkingBank
+	activeEpochRewards      *replay.LeaderEpochRewards
 	activeSess              *turbine.BroadcastSession
 	activeSink              *ShredSink
 	parentCtx               ParentContext
@@ -148,20 +150,23 @@ type leaderProductionWindow struct {
 }
 
 type LeaderLoopConfig struct {
-	Controller       *Controller
-	Identity         *identity.Holder // read when a slot starts; the slot keeps that identity across a swap
-	AccountsDb       *accountsdb.AccountsDb
-	Broadcaster      turbine.PacketBroadcaster
-	ShredVersion     uint16
-	UserAgent        []byte
-	EpochSchedule    *sealevel.SysvarEpochSchedule
-	AlpenglowClock   bool
-	ParentContext    func(uint64) ParentContext
-	ProductionParent func(slot uint64) alpenglow.BlockProductionParent
-	CanSignSlot      func(slot uint64) bool
-	OnBlock          func(*b.Block)
-	CurrentSlot      func() uint64
-	LeaderForSlot    func(uint64) (solana.PublicKey, bool)
+	Controller     *Controller
+	Identity       *identity.Holder // read when a slot starts; the slot keeps that identity across a swap
+	AccountsDb     *accountsdb.AccountsDb
+	Broadcaster    turbine.PacketBroadcaster
+	ShredVersion   uint16
+	UserAgent      []byte
+	EpochSchedule  *sealevel.SysvarEpochSchedule
+	AlpenglowClock bool
+	ParentContext  func(uint64) ParentContext
+	// ParentGenerationLease protects final footer publication against replay
+	// invalidating the selected parent. Release precedes the OnBlock handoff.
+	ParentGenerationLease func(uint64) (release func(), ok bool)
+	ProductionParent      func(slot uint64) alpenglow.BlockProductionParent
+	CanSignSlot           func(slot uint64) bool
+	OnBlock               func(*b.Block)
+	CurrentSlot           func() uint64
+	LeaderForSlot         func(uint64) (solana.PublicKey, bool)
 	// ParentBlockID is retained for source compatibility and ignored. Parent
 	// identity is supplied atomically by ParentContext.
 	ParentBlockID func(parentSlot uint64) (solana.Hash, bool)
@@ -196,30 +201,31 @@ func NewLeaderLoop(cfg LeaderLoopConfig) *LeaderLoop {
 	}
 	holder, _ := cfg.Hooks.(SlotHolder)
 	return &LeaderLoop{
-		controller:          cfg.Controller,
-		identity:            cfg.Identity,
-		accountsDb:          cfg.AccountsDb,
-		broadcaster:         cfg.Broadcaster,
-		shredVersion:        cfg.ShredVersion,
-		userAgent:           cfg.UserAgent,
-		epochSchedule:       cfg.EpochSchedule,
-		alpenglowClock:      cfg.AlpenglowClock,
-		parentContext:       cfg.ParentContext,
-		productionParent:    cfg.ProductionParent,
-		canSignSlot:         cfg.CanSignSlot,
-		onBlock:             cfg.OnBlock,
-		currentSlot:         cfg.CurrentSlot,
-		leaderForSlot:       cfg.LeaderForSlot,
-		rewardCerts:         cfg.RewardCerts,
-		pollInterval:        cfg.PollInterval,
-		slotDuration:        cfg.SlotDuration,
-		completionReserve:   cfg.CompletionReserve,
-		now:                 cfg.Now,
-		hooks:               cfg.Hooks,
-		holder:              holder,
-		gateTPU:             cfg.GateTPU && cfg.Hooks != nil,
-		finishedLeaderSlots: make(map[uint64]struct{}),
-		pendingFailures:     make(map[uint64]leaderSlotFailure),
+		controller:            cfg.Controller,
+		identity:              cfg.Identity,
+		accountsDb:            cfg.AccountsDb,
+		broadcaster:           cfg.Broadcaster,
+		shredVersion:          cfg.ShredVersion,
+		userAgent:             cfg.UserAgent,
+		epochSchedule:         cfg.EpochSchedule,
+		alpenglowClock:        cfg.AlpenglowClock,
+		parentContext:         cfg.ParentContext,
+		parentGenerationLease: cfg.ParentGenerationLease,
+		productionParent:      cfg.ProductionParent,
+		canSignSlot:           cfg.CanSignSlot,
+		onBlock:               cfg.OnBlock,
+		currentSlot:           cfg.CurrentSlot,
+		leaderForSlot:         cfg.LeaderForSlot,
+		rewardCerts:           cfg.RewardCerts,
+		pollInterval:          cfg.PollInterval,
+		slotDuration:          cfg.SlotDuration,
+		completionReserve:     cfg.CompletionReserve,
+		now:                   cfg.Now,
+		hooks:                 cfg.Hooks,
+		holder:                holder,
+		gateTPU:               cfg.GateTPU && cfg.Hooks != nil,
+		finishedLeaderSlots:   make(map[uint64]struct{}),
+		pendingFailures:       make(map[uint64]leaderSlotFailure),
 	}
 }
 
@@ -847,6 +853,7 @@ func (l *LeaderLoop) releaseActiveSlotLocked() {
 		l.activeSink.Discard()
 	}
 	l.activeBank = nil
+	l.activeEpochRewards = nil
 	l.activeSess = nil
 	l.activeSink = nil
 	l.activeSlot = 0
@@ -1153,6 +1160,7 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 		EntryBlockhash:      tickHash,
 		TxFeeAccumulator:    l.activeBank.TxFeeAccumulator(),
 	})
+	l.activeEpochRewards.Attach(producedBlock)
 	producedBlock.SkipRewardCert = append([]byte(nil), footerRewards.Skip...)
 	producedBlock.NotarRewardCert = append([]byte(nil), footerRewards.Notar...)
 	producedBlock.FooterProducerTimeNanos = producerTimeNanos
@@ -1206,8 +1214,29 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 	}
 	parentValidationDuration += time.Since(parentValidationStartedAt)
 	footerBankhash := solana.HashFromBytes(l.activeBank.SlotCtx().FinalBankhash)
+	// Pin only final publication, after preparation/draining and the last
+	// canonical-parent check. Replay must invalidate this generation before
+	// changing the account lineage; it cannot do so between our check and footer.
+	var releaseParent func()
+	if l.parentGenerationLease != nil {
+		var current bool
+		releaseParent, current = l.parentGenerationLease(l.activeParentGeneration)
+		if !current {
+			l.failProductionWindowLocked(slot, leaderReasonParentChangedBeforeFreeze, "replay parent generation changed before footer publication")
+			l.abortActiveSlotLocked(leaderReasonParentChangedBeforeFreeze)
+			return
+		}
+	}
+	releasePublication := func() {
+		if releaseParent != nil {
+			releaseParent()
+			releaseParent = nil
+		}
+	}
+	defer releasePublication()
 	phaseStartedAt = time.Now()
 	if err := l.activeSess.BroadcastFooter(footerBankhash, producerTimeNanos, footerRewards.Skip, footerRewards.Notar); err != nil {
+		releasePublication()
 		l.failProductionWindowLocked(slot, leaderReasonFooterBroadcastFailed, err.Error())
 		l.abortActiveSlotLocked(leaderReasonFooterBroadcastFailed)
 		return
@@ -1217,6 +1246,7 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 	// emitted when they fill a FEC set; Freeze already flushed any leftover.
 	phaseStartedAt = time.Now()
 	if err := l.activeSess.BroadcastEndingTickLast(tickHash); err != nil {
+		releasePublication()
 		l.failProductionWindowLocked(slot, leaderReasonEndingTickBroadcastFailed, err.Error())
 		l.abortActiveSlotLocked(leaderReasonEndingTickBroadcastFailed)
 		return
@@ -1239,7 +1269,8 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 		producedBlock.HasAlpenglowLastChainedRoot = true
 		global.SetAlpenglowChainedMerkleRoot(slot, chained)
 	}
-	replay.RegisterLocalLeaderCommit(l.activeBank.SlotCtx())
+	replay.RegisterLocalLeaderBlockCommit(l.activeBank.SlotCtx(), producedBlock, l.activeEpochRewards)
+	releasePublication()
 	if l.onBlock != nil {
 		handoffStartedAt := l.now()
 		l.onBlock(producedBlock)
@@ -1340,7 +1371,7 @@ func (l *LeaderLoop) startSlotLocked(slot uint64) error {
 	if slot > 0 && epochSchedule != nil && epochSchedule.GetEpoch(parentSlot) != epochSchedule.GetEpoch(slot) {
 		return fmt.Errorf("%w: parent block is slot %d", errEpochTransitionProductionUnsupported, parentSlot)
 	}
-	if parentCtx.EpochRewardsActive {
+	if parentCtx.EpochRewardsActive && parentCtx.EpochRewardPlan == nil {
 		return errEpochRewardsProductionUnsupported
 	}
 	if slot > 0 && (parentCtx.TransactionStatuses == nil || !parentCtx.TransactionStatuses.CoverageComplete()) {
@@ -1390,12 +1421,18 @@ func (l *LeaderLoop) startSlotLocked(slot uint64) error {
 	if err != nil {
 		return fmt.Errorf("new leader slot ctx: %w", err)
 	}
+	var epochRewards *replay.LeaderEpochRewards
 	if l.accountsDb != nil && epochSchedule != nil {
 		prepBlock := &b.Block{
 			Slot:           slot,
 			ParentSlot:     parentSlot,
 			Epoch:          epochSchedule.GetEpoch(slot),
 			ParentBankhash: parentCtx.ParentBankhash,
+			BlockHeight:    parentCtx.ParentBlockHeight + 1,
+		}
+		epochRewards, err = replay.PrepareLeaderEpochRewards(slotCtx, prepBlock, parentCtx.EpochRewardPlan)
+		if err != nil {
+			return fmt.Errorf("%w: %v", errEpochRewardsProductionUnsupported, err)
 		}
 		if err := replay.PrepareLeaderSlotSysvars(slotCtx, prepBlock, l.alpenglowClock); err != nil {
 			return fmt.Errorf("prepare leader sysvars: %w", err)
@@ -1460,6 +1497,7 @@ func (l *LeaderLoop) startSlotLocked(slot uint64) error {
 	l.parentCtx = parentCtx
 	l.activeSlot = slot
 	l.activeBank = bank
+	l.activeEpochRewards = epochRewards
 	l.activeSess = session
 	l.activeSink = sink
 	l.activeParentID = parentID

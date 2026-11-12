@@ -219,7 +219,7 @@ func TestVoteStakeDirtyWatermark(t *testing.T) {
 // caches untouched, but falls back to the rooted-checkpoint re-replay when a
 // slot in that suffix mutated them (P1) — the unwind can only roll back account
 // state, not those process-global caches.
-func TestTryInLoopUnwindFallsBackWhenVoteStakeDirty(t *testing.T) {
+func TestTryInLoopUnwindFallsBackWhenVoteStakeMutationUnjournaled(t *testing.T) {
 	previousEpochRewards := sealevel.SysvarCache.EpochRewards
 	t.Cleanup(func() {
 		sealevel.SysvarCache.EpochRewards.Sysvar = previousEpochRewards.Sysvar
@@ -263,18 +263,17 @@ func TestTryInLoopUnwindFallsBackWhenVoteStakeDirty(t *testing.T) {
 	require.NotNil(t, rs.TransactionCount, "unwind carries the parent's tx count for restore")
 	assert.Equal(t, uint64(999), *rs.TransactionCount)
 
-	// A global cache was mutated in the UNWOUND suffix (at the switch slot):
-	// the unwind cannot roll the caches back -> must fall back (nil).
+	// An explicitly unjournaled mutation in the UNWOUND suffix cannot be
+	// undone. Accepted execution mutations exercise the journal in fork_cache_test.
 	markVoteStakeDirty(8)
 	rs, _, reason := tryInLoopUnwind(sw, newTail(), mithrilState, sched, epoch, nil)
 	assert.Nil(t, rs, "dirty cache in the unwound suffix must force the rooted re-replay fallback")
 	assert.Equal(t, unwindFallbackVoteStakeDirty, reason)
 	resetVoteStakeDirty()
 
-	// A cache write in the RETAINED suffix (below the switch slot but above the
-	// rooted watermark) is just as unsafe: the resume path reloads the vote
-	// cache from durable, which cannot see the retained suffix's writes — the
-	// reload would REGRESS the cache below live account state.
+	// An unjournaled mutation in the RETAINED suffix also lacks bank ownership.
+	// Keep the conservative fallback even though journaled retained writes are
+	// now preserved without reloading the cache from durable storage.
 	markVoteStakeDirty(7) // retained slot; rooted watermark is 0
 	rs, _, reason = tryInLoopUnwind(sw, newTail(), mithrilState, sched, epoch, nil)
 	assert.Nil(t, rs, "dirty cache in the retained suffix must also force the fallback")

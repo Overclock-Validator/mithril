@@ -8,16 +8,15 @@ import (
 // partitionedRewardsCompletion is replay-thread-owned, process-local evidence
 // that a successfully executed bank contains all effects of this distribution.
 // It is not a checkpoint or signing authority. Until that bank is durable,
-// tryInLoopUnwind must still reject even a zero-remaining distribution: its
-// spool has been consumed and cannot be rolled back with the account overlay.
+// the immutable spool remains available to retained forks and producer attempts.
 type partitionedRewardsCompletion struct {
 	info *rewards.PartitionedRewardDistributionInfo
 	slot uint64
 }
 
 // limitPromotion keeps the boundary replayable until a successfully verified
-// completion bank is eligible for promotion. Consuming the last spool changes
-// the RAM counter before footer verification and is not completion evidence.
+// completion bank is eligible for promotion. Updating the replay progress counter
+// before footer verification is not completion evidence.
 func (c *partitionedRewardsCompletion) limitPromotion(info *rewards.PartitionedRewardDistributionInfo, boundary, through uint64) uint64 {
 	if boundary == 0 || info == nil {
 		return through
@@ -56,6 +55,7 @@ func (c *partitionedRewardsCompletion) retire(info **rewards.PartitionedRewardDi
 	if *info == nil || *info != c.info || c.slot == 0 || durableSlot < c.slot || (*info).NumRewardPartitionsRemaining != 0 {
 		return false
 	}
+	(*info).Plan.Retire()
 	*info = nil
 	*c = partitionedRewardsCompletion{}
 	return true

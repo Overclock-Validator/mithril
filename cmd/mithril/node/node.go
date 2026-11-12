@@ -2838,15 +2838,16 @@ postBootstrap:
 		leaderStop := make(chan struct{})
 		leaderDone := make(chan struct{})
 		leaderLoop := blockprod.NewLeaderLoop(blockprod.LeaderLoopConfig{
-			Controller:        controller,
-			Identity:          validatorIdentity,
-			AccountsDb:        accountsDb,
-			Broadcaster:       broadcaster,
-			ShredVersion:      uint16(turbineShredVersion),
-			EpochSchedule:     epochSchedule,
-			AlpenglowClock:    true,
-			SlotDuration:      blockprod.AlpenglowSlotDuration,
-			CompletionReserve: time.Duration(validatorCompletionReserveMs) * time.Millisecond,
+			Controller:            controller,
+			Identity:              validatorIdentity,
+			AccountsDb:            accountsDb,
+			Broadcaster:           broadcaster,
+			ShredVersion:          uint16(turbineShredVersion),
+			EpochSchedule:         epochSchedule,
+			AlpenglowClock:        true,
+			SlotDuration:          blockprod.AlpenglowSlotDuration,
+			CompletionReserve:     time.Duration(validatorCompletionReserveMs) * time.Millisecond,
+			ParentGenerationLease: replay.AcquireChainTipGeneration,
 			ParentContext: func(slot uint64) blockprod.ParentContext {
 				tip := replay.ChainTipParentContext()
 				// Blockprod owns the replay-readiness rule. In particular, the first
@@ -2869,6 +2870,7 @@ postBootstrap:
 					ParentBlockHeight:          tip.BlockHeight,
 					LatestEvictedBlockhash:     tip.LatestEvictedBlockhash,
 					EpochRewardsActive:         tip.EpochRewardsActive,
+					EpochRewardPlan:            tip.EpochRewardPlan,
 					PrevNumSigs:                tip.PrevNumSigs,
 					PrevFeeGovernor:            tip.PrevFeeGovernor,
 					AcctsLtHash:                tip.AcctsLtHash,
@@ -4483,6 +4485,15 @@ func runReplayWithRecovery(
 	replayStartTime time.Time, // Start time for resume context
 ) *replay.ReplayResult {
 	var result *replay.ReplayResult
+	if isLive && useTurbine && consensusOpts != nil {
+		var fetchOpts replay.BlockFetchOpts
+		if blockFetchOpts != nil {
+			fetchOpts = *blockFetchOpts
+		}
+		fetchOpts.Reception = &blockstream.ReplaySession{}
+		defer fetchOpts.Reception.Close()
+		blockFetchOpts = &fetchOpts
+	}
 
 	// Create callback to write state immediately on cancellation
 	// This eliminates the timing window between bankhash persistence and state file update

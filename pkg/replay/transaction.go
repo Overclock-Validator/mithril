@@ -248,7 +248,7 @@ func handleModifiedAccounts(slotCtx *sealevel.SlotCtx, execCtx *sealevel.Executi
 	return stats
 }
 
-func recordStakeDelegation(slot uint64, acct *accounts.Account) {
+func recordStakeDelegation(slotCtx *sealevel.SlotCtx, acct *accounts.Account) {
 	isEmpty := acct.Lamports == 0
 	isUninitialized := true
 
@@ -261,7 +261,16 @@ func recordStakeDelegation(slot uint64, acct *accounts.Account) {
 		// Slot-keyed enqueue: the entry reaches the durable index only when
 		// this slot folds; an unwound wrong-fork slot drops it. Scans see it
 		// from RAM meanwhile (StreamStakeAccounts merges pending entries).
-		global.EnqueuePendingStakePubkey(slot, acct.Key)
+		if slotCtx.DeferVoteCachePublication {
+			slotCtx.PendingVoteCacheMu.Lock()
+			if slotCtx.PendingStakePubkeys == nil {
+				slotCtx.PendingStakePubkeys = make(map[solana.PublicKey]struct{})
+			}
+			slotCtx.PendingStakePubkeys[acct.Key] = struct{}{}
+			slotCtx.PendingVoteCacheMu.Unlock()
+		} else {
+			global.EnqueuePendingStakePubkey(slotCtx.Slot, acct.Key)
+		}
 	}
 }
 
@@ -299,7 +308,7 @@ func recordStakeAndVoteAccount(slotCtx *sealevel.SlotCtx, execCtx *sealevel.Exec
 	if acct.Lamports == 0 || acct.Owner != a.VoteProgramAddr {
 		if voteCacheHas(slotCtx, acct.Key) {
 			deleteVoteCacheItem(slotCtx, acct.Key)
-			markSlotVoteStakeDirty(slotCtx) // global cache mutated — gates in-loop unwind
+			markSlotVoteStakeDirty(slotCtx)
 		}
 	} else if modifiedVoteAccts {
 		recordVoteTimestampAndSlot(slotCtx, acct)
@@ -311,7 +320,7 @@ func recordStakeAndVoteAccount(slotCtx *sealevel.SlotCtx, execCtx *sealevel.Exec
 	}
 
 	if acct.Owner == a.StakeProgramAddr {
-		recordStakeDelegation(slotCtx.Slot, acct)
+		recordStakeDelegation(slotCtx, acct)
 		markSlotVoteStakeDirty(slotCtx)
 	}
 }
@@ -331,13 +340,21 @@ func voteCacheHas(slotCtx *sealevel.SlotCtx, key solana.PublicKey) bool {
 		if _, pending := slotCtx.PendingVoteCache[key]; pending {
 			return true
 		}
+		// A leader can run ahead of accepted replay or across a fork switch.
+		// Its pinned parent image, rather than the current global cache, tells
+		// us whether closing/reassigning this account needs a deferred delete.
+		if slotCtx.ParentAccts != nil {
+			if parent, err := slotCtx.GetParentAccount(key); err == nil && parent != nil {
+				return parent.Owner == a.VoteProgramAddr && parent.Lamports != 0
+			}
+		}
 	}
 	return global.VoteCacheItem(key) != nil
 }
 
 func putVoteCacheItem(slotCtx *sealevel.SlotCtx, key solana.PublicKey, state *sealevel.VoteStateVersions) {
 	if !slotCtx.DeferVoteCachePublication {
-		global.PutVoteCacheItem(key, state)
+		global.PutVoteCacheItemForSlot(slotCtx.Slot, key, state)
 		return
 	}
 	slotCtx.PendingVoteCacheMu.Lock()
@@ -351,7 +368,7 @@ func putVoteCacheItem(slotCtx *sealevel.SlotCtx, key solana.PublicKey, state *se
 
 func deleteVoteCacheItem(slotCtx *sealevel.SlotCtx, key solana.PublicKey) {
 	if !slotCtx.DeferVoteCachePublication {
-		global.DeleteVoteCacheItem(key)
+		global.DeleteVoteCacheItemForSlot(slotCtx.Slot, key)
 		return
 	}
 	slotCtx.PendingVoteCacheMu.Lock()
@@ -370,13 +387,13 @@ func markSlotVoteStakeDirty(slotCtx *sealevel.SlotCtx) {
 		slotCtx.PendingVoteCacheMu.Unlock()
 		return
 	}
-	markVoteStakeDirty(slotCtx.Slot)
+	// Immediate writes are journaled; stake discoveries are owned by this slot.
 }
 
 // publishDeferredVoteCache applies a speculative bank's buffered vote-cache
-// changes and dirty marker. It is called by the streaming finalize step after
-// the complete block has been matched to the executed prefix and is a no-op
-// for banks that published immediately.
+// changes and stake discoveries. Streaming calls it after matching the full
+// block; locally produced banks call it only after ordered replay adoption.
+// It is a no-op for banks that published immediately.
 func publishDeferredVoteCache(slotCtx *sealevel.SlotCtx) {
 	if slotCtx == nil || !slotCtx.DeferVoteCachePublication {
 		return
@@ -384,20 +401,21 @@ func publishDeferredVoteCache(slotCtx *sealevel.SlotCtx) {
 	slotCtx.PendingVoteCacheMu.Lock()
 	puts := slotCtx.PendingVoteCache
 	deletes := slotCtx.PendingVoteCacheDeletes
-	dirty := slotCtx.VoteStakeDirty
+	stakeKeys := slotCtx.PendingStakePubkeys
 	slotCtx.PendingVoteCache = nil
 	slotCtx.PendingVoteCacheDeletes = nil
+	slotCtx.PendingStakePubkeys = nil
 	slotCtx.VoteStakeDirty = false
 	slotCtx.DeferVoteCachePublication = false
 	slotCtx.PendingVoteCacheMu.Unlock()
 	for key := range deletes {
-		global.DeleteVoteCacheItem(key)
+		global.DeleteVoteCacheItemForSlot(slotCtx.Slot, key)
 	}
 	for key, state := range puts {
-		global.PutVoteCacheItem(key, state)
+		global.PutVoteCacheItemForSlot(slotCtx.Slot, key, state)
 	}
-	if dirty {
-		markVoteStakeDirty(slotCtx.Slot)
+	for key := range stakeKeys {
+		global.EnqueuePendingStakePubkey(slotCtx.Slot, key)
 	}
 }
 

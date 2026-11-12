@@ -35,6 +35,8 @@ type GlobalCtx struct {
 	cachedStakeEntries         []accountsdb.StakeIndexEntry            // Parsed+sorted index, populated on first load
 	entriesFlushedSinceCompact int                                     // Appended entries since last compaction
 	voteCache                  map[solana.PublicKey]*sealevel.VoteStateVersions
+	voteCacheUndo              map[uint64]map[solana.PublicKey]voteCacheBefore
+	voteCacheJournalSlot       *uint64
 	epochStakes                *epochstakes.EpochStakesCache
 	slotsConfirmed             map[uint64]struct{}
 	leaderSchedule             *leaderschedule.LeaderSchedule // compatibility schedule installed by SetLeaderSchedule
@@ -161,10 +163,10 @@ func SlotConfirmed(slot uint64) bool {
 func PutVoteCacheItem(pubkey solana.PublicKey, voteState *sealevel.VoteStateVersions) {
 	instance.voteCacheMutex.Lock()
 	defer instance.voteCacheMutex.Unlock()
-	if instance.voteCache == nil {
-		instance.voteCache = make(map[solana.PublicKey]*sealevel.VoteStateVersions)
+	if instance.voteCacheJournalSlot != nil {
+		recordVoteCacheBeforeLocked(*instance.voteCacheJournalSlot, pubkey)
 	}
-	instance.voteCache[pubkey] = voteState
+	putVoteCacheLocked(pubkey, voteState)
 }
 
 func VoteCacheItem(pubkey solana.PublicKey) *sealevel.VoteStateVersions {
@@ -176,6 +178,9 @@ func VoteCacheItem(pubkey solana.PublicKey) *sealevel.VoteStateVersions {
 func DeleteVoteCacheItem(pubkey solana.PublicKey) {
 	instance.voteCacheMutex.Lock()
 	defer instance.voteCacheMutex.Unlock()
+	if instance.voteCacheJournalSlot != nil {
+		recordVoteCacheBeforeLocked(*instance.voteCacheJournalSlot, pubkey)
+	}
 	delete(instance.voteCache, pubkey)
 }
 

@@ -1,0 +1,196 @@
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+goos: linux
+goarch: amd64
+pkg: github.com/Overclock-Validator/mithril/pkg/replay
+cpu: AMD Ryzen 9 9950X 16-Core Processor            
+BenchmarkEpochStakeScanReuse/three_account_scans-2         	(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+       5	  28689326 ns/op	49400172 B/op	  270830 allocs/op
+BenchmarkEpochStakeScanReuse/three_account_scans-2         	(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+       5	  22962827 ns/op	49395652 B/op	  270819 allocs/op
+BenchmarkEpochStakeScanReuse/three_account_scans-2         	(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+       5	  27518613 ns/op	49399473 B/op	  270830 allocs/op
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+BenchmarkEpochStakeScanReuse/one_account_scan_and_spool-2  	(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+       5	  14264606 ns/op	27889833 B/op	  155947 allocs/op
+BenchmarkEpochStakeScanReuse/one_account_scan_and_spool-2  	(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+       5	  15982002 ns/op	27888563 B/op	  155943 allocs/op
+BenchmarkEpochStakeScanReuse/one_account_scan_and_spool-2  	(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+(+    0s) StreamStakeAccounts: totalEntries=16384 processed=16384 getAccountErrors=0 unmarshalErrors=0 statusNotStake=0
+(+    0s) Rewards: voteCache has 8 entries, minimum stake delegation=0
+(+    0s) Rewards Phase 1: 16384 stakes (belowMin=0, noVote=0, zeroPoints=10922), totalStakeLamports=13654111848106, totalPoints=0x1e1ddf1ef066a, totalRewards=1000000, pointsSpoolRecords=8193
+(+    0s) Rewards Phase 2: 8193 records (skippedNilReward=0), totalStakerRewards=895768, totalVotingRewards=98316, validatorCount=4, numPartitions=3
+       5	  16050312 ns/op	27890436 B/op	  155948 allocs/op
+(+    0s) CloseDb: syncing and closing Index...
+(+    0s) CloseDb: syncing and closing BankHashStore...
+(+    0s) CloseDb: done
+
+PASS
+ok  	github.com/Overclock-Validator/mithril/pkg/replay	0.965s

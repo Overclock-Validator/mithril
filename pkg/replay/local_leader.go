@@ -1,6 +1,7 @@
 package replay
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 
@@ -14,8 +15,21 @@ import (
 // LocalLeaderCommit is the already-mutated producer bank for a slot this
 // validator forged. Replay adopts it instead of running ProcessBlock.
 type LocalLeaderCommit struct {
-	SlotCtx *sealevel.SlotCtx
+	SlotCtx          *sealevel.SlotCtx
+	EpochRewards     *LeaderEpochRewards
+	ParentSlot       uint64
+	ParentBankhash   [32]byte
+	BlockID          [32]byte
+	HasBlockID       bool
+	ParentBlockID    [32]byte
+	HasParentBlockID bool
 }
+
+// ErrLocalLeaderCommitMismatch prevents a stale producer bank from publishing
+// state after replay has selected a different parent or block at the same slot.
+var ErrLocalLeaderCommitMismatch = errors.New("local producer bank does not match replay")
+
+var ErrLocalLeaderCommitMissing = errors.New("missing producer SlotCtx")
 
 var (
 	localLeaderMu      sync.Mutex
@@ -23,12 +37,28 @@ var (
 )
 
 // RegisterLocalLeaderCommit publishes a frozen producer SlotCtx for ordered adopt.
-func RegisterLocalLeaderCommit(slotCtx *sealevel.SlotCtx) {
+func RegisterLocalLeaderCommit(slotCtx *sealevel.SlotCtx, rewardReceipts ...*LeaderEpochRewards) {
+	RegisterLocalLeaderBlockCommit(slotCtx, nil, rewardReceipts...)
+}
+
+// RegisterLocalLeaderBlockCommit binds the frozen bank to the exact produced
+// block before replay configures (and may rewrite) its parent-dependent fields.
+func RegisterLocalLeaderBlockCommit(slotCtx *sealevel.SlotCtx, produced *b.Block, rewardReceipts ...*LeaderEpochRewards) {
 	if slotCtx == nil {
 		return
 	}
+	var receipt *LeaderEpochRewards
+	if len(rewardReceipts) != 0 {
+		receipt = rewardReceipts[0]
+	}
+	commit := LocalLeaderCommit{SlotCtx: slotCtx, EpochRewards: receipt, ParentSlot: slotCtx.ParentSlot}
+	if produced != nil {
+		commit.ParentBankhash = produced.ParentBankhash
+		commit.BlockID, commit.HasBlockID = produced.AlpenglowBlockID, produced.HasAlpenglowBlockID
+		commit.ParentBlockID, commit.HasParentBlockID = produced.AlpenglowParentBlockID, produced.HasAlpenglowParentBlockID
+	}
 	localLeaderMu.Lock()
-	localLeaderCommits[slotCtx.Slot] = LocalLeaderCommit{SlotCtx: slotCtx}
+	localLeaderCommits[slotCtx.Slot] = commit
 	localLeaderMu.Unlock()
 }
 
@@ -65,11 +95,33 @@ func adoptLocalLeaderBlock(
 	}
 	commit, ok := TakeLocalLeaderCommit(block.Slot)
 	if !ok || commit.SlotCtx == nil {
-		return nil, fmt.Errorf("adopt local leader block: missing producer SlotCtx for slot %d", block.Slot)
+		return nil, fmt.Errorf("adopt local leader block slot %d: %w", block.Slot, ErrLocalLeaderCommitMissing)
 	}
 	slotCtx := commit.SlotCtx
 	if slotCtx.BankSysvars() == nil {
 		return nil, fmt.Errorf("adopt local leader block: missing bank sysvars for slot %d", block.Slot)
+	}
+	if slotCtx.Slot != block.Slot || commit.ParentSlot != block.ParentSlot || commit.ParentBankhash != block.ParentBankhash || (block.SourceParentSlot != 0 && block.SourceParentSlot != commit.ParentSlot) {
+		return nil, fmt.Errorf("%w: slot %d parent slot/hash differs", ErrLocalLeaderCommitMismatch, block.Slot)
+	}
+	if commit.HasBlockID && (!block.HasAlpenglowBlockID || commit.BlockID != block.AlpenglowBlockID) {
+		return nil, fmt.Errorf("%w: slot %d block identity differs", ErrLocalLeaderCommitMismatch, block.Slot)
+	}
+	if commit.HasParentBlockID && (!block.HasAlpenglowParentBlockID || commit.ParentBlockID != block.AlpenglowParentBlockID) {
+		return nil, fmt.Errorf("%w: slot %d parent identity differs", ErrLocalLeaderCommitMismatch, block.Slot)
+	}
+	if len(slotCtx.FinalBankhash) != 32 {
+		return nil, fmt.Errorf("%w: slot %d has no finalized bank hash", ErrLocalLeaderCommitMismatch, block.Slot)
+	}
+	bankHash := solana.HashFromBytes(slotCtx.FinalBankhash)
+	if (block.HasExpectedBankhash && bankHash != block.ExpectedBankhash) || (block.BankHash != [32]byte{} && bankHash != block.BankHash) {
+		return nil, fmt.Errorf("%w: slot %d bank hash differs", ErrLocalLeaderCommitMismatch, block.Slot)
+	}
+	if err := commit.EpochRewards.validate(block); err != nil {
+		return nil, fmt.Errorf("adopt local leader block slot %d: %w", block.Slot, err)
+	}
+	if err := transactionStatuses.CommitBlock(block); err != nil {
+		return nil, fmt.Errorf("adopt local leader block slot %d: %w", block.Slot, err)
 	}
 	modified := collectAdoptAccounts(slotCtx, block)
 	bankhash := append([]byte(nil), slotCtx.FinalBankhash...)
@@ -80,9 +132,7 @@ func adoptLocalLeaderBlock(
 	if persistedHashes != nil {
 		persistedHashes.Set(block.Slot, bankhash)
 	}
-	if err := transactionStatuses.CommitBlock(block); err != nil {
-		return nil, fmt.Errorf("adopt local leader block slot %d: %w", block.Slot, err)
-	}
+	publishDeferredVoteCache(slotCtx)
 	global.IncrTransactionCount(uint64(len(block.Transactions)))
 	return slotCtx, nil
 }

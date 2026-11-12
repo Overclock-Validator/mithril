@@ -94,6 +94,9 @@ type BlockFetchOpts struct {
 	ShredSpoolDir string
 	// Branch selection retained when rebuilding replay from a rooted checkpoint.
 	AlpenglowRecovery *blockstream.AlpenglowRecoveryState
+	// Reception belongs to the outer recovery loop, so rebuilding replay
+	// state does not close Turbine or throw away its repair/receive state.
+	Reception *blockstream.ReplaySession
 	// LocalBlocks carries fully frozen blocks produced by this validator. Replay
 	// adopts the already-mutated leader SlotCtx and does not re-execute.
 	LocalBlocks          <-chan *b.Block
@@ -1941,6 +1944,12 @@ func ReplayBlocks(
 	var partitionedEpochRewardsEnabled bool
 	var partitionedRewardsInfo *rewards.PartitionedRewardDistributionInfo
 	var rewardsCompletion partitionedRewardsCompletion
+	defer func() {
+		// No bank from this attempt remains available for new production after
+		// replay returns. Existing plan readers finish under its read lease.
+		ResetChainTip()
+		RewardPlanForDistribution(partitionedRewardsInfo).Discard()
+	}()
 	var featuresActivatedInFirstSlot []*accounts.Account
 	var parentFeaturesActivatedInFirstSlot []*accounts.Account
 
@@ -1950,6 +1959,9 @@ func ReplayBlocks(
 		result.Error = err
 		return result
 	}
+	// Startup feature discovery may stage migrations for the first child.
+	// A boundary rescan must begin from the unmodified parent's capitalization.
+	initialParentCapitalization := replayCtx.Capitalization
 	expectedStatusRoot := mithrilState.ManifestParentSlot
 	var statusParentBlockID solana.Hash
 	var hasStatusParentBlockID bool
@@ -1990,6 +2002,12 @@ func ReplayBlocks(
 		}
 	}
 	isFirstSlotInEpoch := epochSchedule.FirstSlotInEpoch(startEpoch) == startSlot
+	if isFirstSlotInEpoch {
+		if err := prepareEpochBoundaryFeatureScan(replayCtx, initialParentCapitalization, expectedStatusRoot, nil, acctsDb); err != nil {
+			result.Error = err
+			return result
+		}
+	}
 	replayCtx.CurrentFeatures, featuresActivatedInFirstSlot, parentFeaturesActivatedInFirstSlot = scanAndEnableFeatures(acctsDb, replayCtx, startSlot, isFirstSlotInEpoch)
 	if err := validateAlpenglowRuntimeFeatureSet(replayCtx.CurrentFeatures, startSlot); err != nil {
 		result.Error = err
@@ -2636,7 +2654,25 @@ func ReplayBlocks(
 		}
 	}
 
-	blockStream := blockstream.NewBlockSource(opts)
+	var blockStream *blockstream.BlockSource
+	var reception *blockstream.ReplaySession
+	if blockFetchOpts != nil {
+		reception = blockFetchOpts.Reception
+	}
+	if reception != nil {
+		var reused bool
+		var err error
+		blockStream, reused, err = reception.Acquire(opts)
+		if err != nil {
+			result.Error = fmt.Errorf("attach persistent block reception: %w", err)
+			return result
+		}
+		if reused {
+			mlog.Log.Infof("fork recovery: retained Turbine receiver and repair session; resuming delivery at slot %d", startSlot)
+		}
+	} else {
+		blockStream = blockstream.NewBlockSource(opts)
+	}
 	// Every state save records the repair peers that served this run well, so
 	// the next start can repair before gossip rediscovers peers.
 	state.SetRepairPeerHintsProvider(func() []state.RepairPeerHint {
@@ -2664,21 +2700,25 @@ func ReplayBlocks(
 	if !isLive {
 		blockStream.DownloadInitialBlocks()
 	}
-	blockStreamDone := make(chan struct{})
-	go func() {
-		defer close(blockStreamDone)
-		blockStream.Start()
-	}()
-	// A typed fork-switch error returns to runReplayWithRecovery, which starts a
-	// new ReplayBlocks attempt in this process using the SAME Turbine address
-	// and shred spool. The abandoned source must release both before that retry
-	// is constructed; otherwise its receiver keeps the UDP port bound and the
-	// replacement source can only back off until the stall watchdog fires.
-	defer func() {
-		blockStream.Stop()
-		<-blockStreamDone
-		result.AlpenglowRecovery = blockStream.CaptureAlpenglowRecoveryState()
-	}()
+	if reception != nil {
+		reception.Run()
+		defer func() {
+			// Join the emit hook before the per-attempt prefetcher is closed.
+			reception.Release()
+			result.AlpenglowRecovery = blockStream.CaptureAlpenglowRecoveryState()
+		}()
+	} else {
+		blockStreamDone := make(chan struct{})
+		go func() {
+			defer close(blockStreamDone)
+			blockStream.Start()
+		}()
+		defer func() {
+			blockStream.Stop()
+			<-blockStreamDone
+			result.AlpenglowRecovery = blockStream.CaptureAlpenglowRecoveryState()
+		}()
+	}
 
 	var skippedSlotsCount int // Track skipped slots for 100-slot summary
 	replayStartLogged := false
@@ -2698,6 +2738,7 @@ func ReplayBlocks(
 	// identical; only the source rewind differs (certified sibling re-fetch vs
 	// retaining an already assembled alternate child).
 	handleAlpenglowSwitch := func(sw *CertifiedSwitch, rewindSource func() bool) bool {
+		switchStarted := time.Now()
 		if rewardReadPublisher != nil {
 			rewardReadPublisher.ResetEpochRewardView()
 		}
@@ -2741,6 +2782,13 @@ func ReplayBlocks(
 			mlog.Log.Warnf("%v — re-serving the skipped suffix from slot %d; executed bank remains at slot %d", sw, sw.Slot, currentExecutedAnchorSlot())
 			return true
 		}
+		var forkState *replayForkState
+		if unrootedTailState != nil {
+			forkState = unrootedTailState.retainedForkState(sw.Slot)
+		}
+		// Invalidate producer generations before touching their shared parent
+		// overlay or waiting for abandoned reward-plan readers to drain.
+		ResetChainTip()
 		rs, parentBankSysvars, fallbackReason := tryInLoopUnwind(sw, unrootedTailState, mithrilState, epochSchedule, currentEpoch, partitionedRewardsInfo)
 		if rs == nil {
 			windowSwitchFallback++
@@ -2773,18 +2821,38 @@ func ReplayBlocks(
 		global.DeleteAlpenglowChainedRootsFrom(sw.Slot)
 		resumeState = rs
 		unwoundParentBankSysvars = parentBankSysvars
-		lastSlotCtx = nil // next block configures from the rebuilt resume context
+		if forkState != nil {
+			oldPlan := RewardPlanForDistribution(partitionedRewardsInfo)
+			partitionedRewardsInfo, rewardsCompletion = forkState.restore(replayCtx)
+			if oldPlan != RewardPlanForDistribution(partitionedRewardsInfo) {
+				oldPlan.Discard()
+			}
+			currentEpoch = forkState.epoch
+			partitionedEpochRewardsEnabled = forkState.rewardsEnabled
+			rewardsHoldBelowSlot = forkState.rewardsHoldBelow
+			unrootedTailState.rewardWindowSlots = forkState.rewardWindow
+		}
 		replayCtx.Capitalization = rs.Capitalization
+		var restoreErr error
+		lastSlotCtx, restoreErr = restoredParentSlotCtx(rs, parentBankSysvars, unrootedTailState, acctsDb, mithrilState, currentEpoch, replayCtx)
+		if restoreErr != nil {
+			result.Error = fmt.Errorf("%w: restore parent bank: %v", sw, restoreErr)
+			return false
+		}
+		justCrossedEpochBoundary = false
+		featuresActivatedInFirstSlot, parentFeaturesActivatedInFirstSlot = nil, nil
 		global.SetBlockHeight(rs.ParentBlockHeight)
+		global.SetSlot(rs.ParentSlot)
+		global.SetEpoch(currentEpoch)
+		global.SetLatestBlockHash(rs.LastBlockhash)
 		if rs.TransactionCount != nil {
 			global.SetTransactionCount(*rs.TransactionCount) // drop the discarded fork's txs
 		}
 		blockStream.SetLastExecutedSlot(rs.ParentSlot)
 		replayFrontier = rs.ParentSlot
 		global.SetReplayFrontier(rs.ParentSlot)
-		ResetChainTip()
 		windowSwitchInRAM++
-		mlog.Log.Warnf("%v — unwound in RAM to executed parent slot %d; re-executing the selected chain (in-RAM switches this window: %d)", sw, rs.ParentSlot, windowSwitchInRAM)
+		mlog.Log.Warnf("%v — unwound in RAM to executed parent slot %d; re-executing the selected chain (in-RAM switches this window: %d, unwind_ms=%.3f)", sw, rs.ParentSlot, windowSwitchInRAM, float64(time.Since(switchStarted).Microseconds())/1000)
 		return true
 	}
 	var sweepWhileWaiting func() *CertifiedSwitch
@@ -3253,8 +3321,18 @@ func ReplayBlocks(
 			result.Error = configErr
 			break
 		}
+		if block.FromLocalProduction {
+			// Reconstruct every epoch effect from replay's selected parent.
+			// The private producer receipt remains available for adopt validation.
+			block.EpochUpdatedAccts, block.ParentEpochUpdatedAccts = nil, nil
+		}
 		if initialBlockConfigured && unrootedTailState != nil {
 			unrootedTailState.initStakeTotals(acctsDb, configuredStakeTotals)
+			initialForkState := captureReplayForkState(currentEpoch, replayCtx, partitionedEpochRewardsEnabled, partitionedRewardsInfo, rewardsCompletion, rewardsHoldBelowSlot, unrootedTailState.rewardWindowSlots)
+			if err := seedInitialRootAnchor(unrootedTailState, acctsDb, block, resumeState, mithrilState, initialForkState); err != nil {
+				result.Error = fmt.Errorf("seed initial fork parent: %w", err)
+				break
+			}
 		}
 		// Log replay start message once, after initial configuration completes
 		if !replayStartLogged {
@@ -3262,6 +3340,11 @@ func ReplayBlocks(
 			fmt.Println("=== Replay Start ===")
 			replayStartLogged = true
 		}
+
+		// Tail publication changes the shared account reader before the new
+		// chain-tip snapshot is installed. Fence off the old producer generation
+		// first; keep frozen local commits so this block can still adopt one.
+		InvalidateChainTipForReplay()
 
 		// epoch boundary
 		if block.Epoch != currentEpoch {
@@ -3296,6 +3379,22 @@ func ReplayBlocks(
 			mlog.Log.Infof("%d -> %d", currentEpoch, currentEpoch+1)
 
 			var newlyActivatedFeatures, parentNewlyActivatedFeatures []*accounts.Account
+			parentCapitalization := replayCtx.Capitalization
+			var boundaryParentSysvars *sealevel.BankSysvars
+			if lastSlotCtx != nil {
+				boundaryParentSysvars = lastSlotCtx.BankSysvars()
+			}
+			if initialBlockConfigured {
+				parentCapitalization = initialParentCapitalization
+				featuresActivatedInFirstSlot, parentFeaturesActivatedInFirstSlot = nil, nil
+				if unrootedTailState != nil {
+					boundaryParentSysvars = unrootedTailState.rootBankSysvars
+				}
+			}
+			if err := prepareEpochBoundaryFeatureScan(replayCtx, parentCapitalization, boundaryParentSlot, boundaryParentSysvars, acctsDb); err != nil {
+				result.Error = err
+				break
+			}
 			replayCtx.CurrentFeatures, newlyActivatedFeatures, parentNewlyActivatedFeatures = scanAndEnableFeatures(acctsDb, replayCtx, currentSlot, true)
 			applyAlpenglowRuntimeFeatureOverrides(replayCtx.CurrentFeatures, currentSlot)
 			partitionedEpochRewardsEnabled = replayCtx.CurrentFeatures.IsActive(features.EnablePartitionedEpochReward) || replayCtx.CurrentFeatures.IsActive(features.EnablePartitionedEpochRewardsSuperfeature)
@@ -3303,7 +3402,9 @@ func ReplayBlocks(
 			if boundaryParentCtx == nil {
 				boundaryParentCtx = epochBoundaryParentCtx(acctsDb, block, currentEpoch, replayCtx.CurrentFeatures)
 			}
-			partitionedRewardsInfo = handleEpochTransition(acctsDb, partitionedEpochRewardsEnabled, boundaryParentCtx, replayCtx, epochSchedule, replayCtx.CurrentFeatures, block, currentEpoch, rpcc, dbgOpts)
+			global.WithVoteCacheJournalSlot(block.Slot, func() {
+				partitionedRewardsInfo = handleEpochTransition(acctsDb, partitionedEpochRewardsEnabled, boundaryParentCtx, replayCtx, epochSchedule, replayCtx.CurrentFeatures, block, currentEpoch, rpcc, dbgOpts)
+			})
 			rewardsCompletion = partitionedRewardsCompletion{}
 			currentEpoch = block.Epoch
 			justCrossedEpochBoundary = true
@@ -3417,7 +3518,16 @@ func ReplayBlocks(
 		if block.FromLocalProduction {
 			streamer.discardSlot(block.Slot, "local_production")
 			lastSlotCtx, err = adoptLocalLeaderBlock(block, unrootedTailState, transactionStatuses, persistedHashes)
-		} else {
+			if errors.Is(err, ErrLocalLeaderCommitMissing) || errors.Is(err, ErrLocalLeaderCommitMismatch) {
+				// A fork switch clears producer banks, while reception retains
+				// their encoded blocks. Verify/re-execute those blocks normally.
+				// Both sentinels are returned before any replay-state mutation.
+				mlog.Log.Infof("local block %d requires verified replay after fork recovery: %v", block.Slot, err)
+				block.FromLocalProduction = false
+				err = nil
+			}
+		}
+		if !block.FromLocalProduction {
 			// A stream open on this slot finishes the block on its speculative
 			// bank when the block proves to be what it executed; otherwise the
 			// stream is discarded and the block executes whole, exactly as
@@ -3474,7 +3584,7 @@ func ReplayBlocks(
 			AlpenglowChainedMerkleRoot:    solana.Hash(block.AlpenglowLastChainedRoot),
 			HasAlpenglowChainedMerkleRoot: block.HasAlpenglowLastChainedRoot,
 		}
-		UpdateChainTipFromSlotCtxWithBankMetadata(lastSlotCtx, block.Features, statuses, identity, ChainTipBankMetadata{BlockHeight: block.BlockHeight}, unrootedTailState)
+		UpdateChainTipFromSlotCtxWithBankMetadata(lastSlotCtx, block.Features, statuses, identity, ChainTipBankMetadata{BlockHeight: block.BlockHeight, EpochRewardPlan: RewardPlanForDistribution(partitionedRewardsInfo)}, unrootedTailState)
 		if block.HasAlpenglowBlockID {
 			global.SetAlpenglowBlockID(block.Slot, solana.Hash(block.AlpenglowBlockID))
 		}
@@ -3579,6 +3689,11 @@ func ReplayBlocks(
 				resumeCtx.PrevLamportsPerSig = lastSlotCtx.FeeRateGovernor.PrevLamportsPerSignature
 			}
 			unrootedTailState.SetContext(block.Slot, resumeCtx, lastSlotCtx.BankSysvars())
+			if unrootedTailState != nil {
+				unrootedTailState.SetForkState(block.Slot, captureReplayForkState(currentEpoch, replayCtx, partitionedEpochRewardsEnabled, partitionedRewardsInfo, rewardsCompletion, rewardsHoldBelowSlot, unrootedTailState.rewardWindowSlots))
+			} else {
+				global.PruneVoteCacheJournal(block.Slot)
+			}
 			metrics.GlobalBlockReplay.ResumeContext.AddTimingSince(resumeContextStart)
 		}
 
