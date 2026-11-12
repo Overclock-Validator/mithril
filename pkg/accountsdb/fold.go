@@ -327,6 +327,7 @@ func (db *AccountsDb) CommitBatch(
 	db.readCacheEpochMu.LockAs("fold_publication")
 	db.pendingFold = union
 	db.readCacheEpoch++
+	db.carryBatchAbsencesLocked(union)
 	db.readCacheEpochMu.Unlock()
 	fire(db.foldHooks.afterPublicationStart)
 
