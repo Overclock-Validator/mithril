@@ -402,6 +402,31 @@ func (c *Client) RepairPeers() []RepairPeer {
 	return peers
 }
 
+// RepairPeerForAddr looks up a live repair source without copying the entire
+// peer set for each packet. As with RepairPeers, any matching peer may be
+// returned when multiple identities advertise the same endpoint.
+func (c *Client) RepairPeerForAddr(addr *net.UDPAddr) (Pubkey, bool) {
+	if addr == nil {
+		return Pubkey{}, false
+	}
+	now := time.Now()
+	c.repairPeerMu.Lock()
+	defer c.repairPeerMu.Unlock()
+	var key Pubkey
+	found := false
+	for id, peer := range c.repairPeers {
+		if now.Sub(peer.LastSeen) > peerExpirationWindow {
+			delete(c.repairPeers, id)
+			continue
+		}
+		if !found && peer.Addr != nil && addr.Port == peer.Addr.Port &&
+			addr.Zone == peer.Addr.Zone && addr.IP.Equal(peer.Addr.IP) {
+			key, found = peer.Pubkey, true
+		}
+	}
+	return key, found
+}
+
 // SetTPUQUIC updates the TPU QUIC endpoints published in this client's CRDS contact.
 // It may be called before Run has initialized the contact record.
 func (c *Client) SetTPUQUIC(addr *net.UDPAddr) error {

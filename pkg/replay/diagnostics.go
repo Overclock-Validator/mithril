@@ -2,6 +2,7 @@ package replay
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -334,12 +335,112 @@ func writeFooterBankhashMismatchArtifact(
 	artifact["modified_accounts"] = consensusAccountDiagnostics(modifiedAccts)
 
 	writeConsensusArtifact(fmt.Sprintf("footer-bankhash-mismatch-slot-%d.json", block.Slot), artifact)
+	writeFooterAccountDataArtifact(block, slotCtx, modifiedAccts)
+}
+
+const (
+	footerAccountDataMaxBytes     = 2 << 20
+	footerAccountArtifactMaxBytes = 32 << 20
+)
+
+type footerRawAccountDiagnostic struct {
+	consensusAccountDiagnostic
+	DataBase64  string `json:"data_base64,omitempty"`
+	DataOmitted string `json:"data_omitted,omitempty"`
+}
+
+type footerRawAccountPair struct {
+	Key               string                      `json:"key"`
+	Parent            *footerRawAccountDiagnostic `json:"parent,omitempty"`
+	Post              *footerRawAccountDiagnostic `json:"post,omitempty"`
+	ParentUnavailable bool                        `json:"parent_unavailable,omitempty"`
+}
+
+func footerRawAccount(acct *accounts.Account) *footerRawAccountDiagnostic {
+	if acct == nil {
+		return nil
+	}
+	diagnostic := consensusAccountDiagnostics([]*accounts.Account{acct})[0]
+	image := &footerRawAccountDiagnostic{consensusAccountDiagnostic: diagnostic}
+	if len(acct.Data) > footerAccountDataMaxBytes {
+		image.DataOmitted = "account_data_limit"
+	} else {
+		image.DataBase64 = base64.StdEncoding.EncodeToString(acct.Data)
+	}
+	return image
+}
+
+// Capture bounded public account bytes only after verification has failed. The
+// exact parent images were pinned before hashing; never substitute a later
+// database version. Encoding copies bytes and leaves account state untouched.
+func writeFooterAccountDataArtifact(block *b.Block, slotCtx *sealevel.SlotCtx, modified []*accounts.Account) {
+	const metadataReserve = 16384
+	remaining := footerAccountArtifactMaxBytes - metadataReserve
+	images := make([]json.RawMessage, 0, len(modified))
+	omittedPairs, oversizedImages := 0, 0
+	for _, post := range modified {
+		if post == nil {
+			continue
+		}
+		parent, err := slotCtx.GetParentAccount(post.Key)
+		pair := footerRawAccountPair{
+			Key: post.Key.String(), Parent: footerRawAccount(parent), Post: footerRawAccount(post),
+			ParentUnavailable: err != nil || parent == nil,
+		}
+		for _, image := range []*footerRawAccountDiagnostic{pair.Parent, pair.Post} {
+			if image != nil && image.DataOmitted != "" {
+				oversizedImages++
+			}
+		}
+		encoded, err := json.Marshal(pair)
+		if err != nil {
+			omittedPairs++
+			continue
+		}
+		if len(encoded)+1 > remaining {
+			omittedPairs++
+			continue
+		}
+		remaining -= len(encoded) + 1
+		images = append(images, encoded)
+	}
+	artifact := map[string]any{
+		"slot": block.Slot, "parent_slot": block.ParentSlot,
+		"computed_bankhash":          consensusByteHashString(slotCtx.FinalBankhash),
+		"footer_producer_time_nanos": block.FooterProducerTimeNanos,
+		"skip_reward_cert_base64":    base64.StdEncoding.EncodeToString(block.SkipRewardCert),
+		"notar_reward_cert_base64":   base64.StdEncoding.EncodeToString(block.NotarRewardCert),
+		"final_cert_base64":          base64.StdEncoding.EncodeToString(block.BlockFinalCert),
+		"account_data_limit_bytes":   footerAccountDataMaxBytes,
+		"artifact_limit_bytes":       footerAccountArtifactMaxBytes,
+		"modified_account_count":     len(modified), "included_account_pairs": len(images),
+		"omitted_account_pairs": omittedPairs, "oversized_account_images": oversizedImages,
+		"truncated": omittedPairs > 0 || oversizedImages > 0, "accounts": images,
+	}
+	if slotCtx.AcctsLtHash != nil {
+		artifact["computed_accts_lthash_base64"] = base64.StdEncoding.EncodeToString(slotCtx.AcctsLtHash.Hash())
+	}
+	encoded, err := json.Marshal(artifact)
+	if err != nil || len(encoded) > footerAccountArtifactMaxBytes {
+		mlog.Log.Warnf("consensus account data artifact: cannot encode within byte limit at slot %d", block.Slot)
+		return
+	}
+	writeConsensusArtifactBytes(fmt.Sprintf("footer-account-data-slot-%d.json", block.Slot), encoded)
 }
 
 // writeConsensusArtifact writes a best-effort JSON diagnostic artifact to the
 // per-run consensus subdirectory. If the log dir is empty or any step fails,
 // it logs a warning and continues; artifact failure must not crash replay.
 func writeConsensusArtifact(filename string, data map[string]interface{}) {
+	artifactJSON, jsonErr := json.MarshalIndent(data, "", "  ")
+	if jsonErr != nil {
+		mlog.Log.Warnf("consensus artifact: failed to marshal JSON for %s: %v", filename, jsonErr)
+		return
+	}
+	writeConsensusArtifactBytes(filename, artifactJSON)
+}
+
+func writeConsensusArtifactBytes(filename string, artifactJSON []byte) {
 	logDir := mlog.GetLogDir()
 	if logDir == "" {
 		return
@@ -350,11 +451,6 @@ func writeConsensusArtifact(filename string, data map[string]interface{}) {
 		return
 	}
 	artifactPath := filepath.Join(dir, filename)
-	artifactJSON, jsonErr := json.MarshalIndent(data, "", "  ")
-	if jsonErr != nil {
-		mlog.Log.Warnf("consensus artifact: failed to marshal JSON for %s: %v", filename, jsonErr)
-		return
-	}
 	if writeErr := os.WriteFile(artifactPath, artifactJSON, 0644); writeErr != nil {
 		mlog.Log.Warnf("consensus artifact: failed to write %s: %v", artifactPath, writeErr)
 		return

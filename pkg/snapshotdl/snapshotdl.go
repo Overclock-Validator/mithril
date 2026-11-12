@@ -122,6 +122,8 @@ type SnapshotConfig struct {
 	MinNodeVersion      string
 	AllowedNodeVersions []string
 	NodeBlacklist       []string // RPC URLs, host:port pairs, or hosts/IPs to avoid as snapshot sources
+	KnownValidators     []string // Validator identities eligible to supply snapshots when OnlyKnownRPC is set
+	OnlyKnownRPC        bool     // Restrict full and incremental snapshot sources to KnownValidators
 
 	// Snapshot age thresholds (slots)
 	FullThreshold        int
@@ -721,13 +723,9 @@ func GetSnapshotURL(ctx context.Context, snapCfg SnapshotConfig) (string, int, i
 
 	// Step 2: Fetch cluster nodes
 	mlog.Log.Infof("Discovering RPC nodes from cluster...")
-	nodes := rpc.FetchClusterNodes(cfg, preferredRPC)
-	if len(nodes) == 0 {
-		return "", 0, 0, fmt.Errorf("no rpc nodes available from cluster")
-	}
-	nodes, configuredAdded := addConfiguredSnapshotRPCNodes(nodes, preferredRPC, cfg.RPCAddresses)
-	if configuredAdded > 0 {
-		mlog.Log.Infof("Added %d configured RPC endpoint(s) to snapshot probe candidates", configuredAdded)
+	nodes, err := discoverSnapshotRPCNodes(ctx, snapCfg, cfg, preferredRPC)
+	if err != nil {
+		return "", 0, 0, err
 	}
 	var skipped int
 	nodes, skipped = filterSnapshotRPCNodes(nodes, blacklist)
@@ -844,13 +842,9 @@ func GetSnapshotURLWithInfo(ctx context.Context, snapCfg SnapshotConfig) (*Snaps
 	}
 
 	// Step 2: Fetch cluster nodes
-	nodes := rpc.FetchClusterNodes(cfg, preferredRPC)
-	if len(nodes) == 0 {
-		return nil, fmt.Errorf("no rpc nodes available from cluster")
-	}
-	nodes, configuredAdded := addConfiguredSnapshotRPCNodes(nodes, preferredRPC, cfg.RPCAddresses)
-	if configuredAdded > 0 {
-		mlog.Log.Infof("Added %d configured RPC endpoint(s) to snapshot probe candidates", configuredAdded)
+	nodes, err := discoverSnapshotRPCNodes(ctx, snapCfg, cfg, preferredRPC)
+	if err != nil {
+		return nil, err
 	}
 	var skipped int
 	nodes, skipped = filterSnapshotRPCNodes(nodes, blacklist)
@@ -1037,13 +1031,9 @@ func DownloadSnapshotWithConfig(ctx context.Context, path string, snapCfg Snapsh
 
 	// Step 2: Fetch cluster nodes
 	mlog.Log.Infof("Discovering RPC nodes from cluster...")
-	nodes := rpc.FetchClusterNodes(cfg, preferredRPC)
-	if len(nodes) == 0 {
-		return "", 0, 0, fmt.Errorf("no rpc nodes available from cluster")
-	}
-	nodes, configuredAdded := addConfiguredSnapshotRPCNodes(nodes, preferredRPC, cfg.RPCAddresses)
-	if configuredAdded > 0 {
-		mlog.Log.Infof("Added %d configured RPC endpoint(s) to snapshot probe candidates", configuredAdded)
+	nodes, err := discoverSnapshotRPCNodes(ctx, snapCfg, cfg, preferredRPC)
+	if err != nil {
+		return "", 0, 0, err
 	}
 	var skipped int
 	nodes, skipped = filterSnapshotRPCNodes(nodes, blacklist)
@@ -1169,13 +1159,9 @@ func DownloadIncrementalSnapshotWithConfig(path string, referenceSlot int, fullS
 	if len(cfg.RPCAddresses) > 0 {
 		preferredRPC = cfg.RPCAddresses[0]
 	}
-	nodes := rpc.FetchClusterNodes(cfg, preferredRPC)
-	if len(nodes) == 0 {
-		return "", 0, 0, fmt.Errorf("no rpc nodes available from cluster")
-	}
-	nodes, configuredAdded := addConfiguredSnapshotRPCNodes(nodes, preferredRPC, cfg.RPCAddresses)
-	if configuredAdded > 0 {
-		mlog.Log.Infof("Added %d configured RPC endpoint(s) to snapshot probe candidates", configuredAdded)
+	nodes, err := discoverSnapshotRPCNodes(ctx, snapCfg, cfg, preferredRPC)
+	if err != nil {
+		return "", 0, 0, err
 	}
 	var skipped int
 	nodes, skipped = filterSnapshotRPCNodes(nodes, blacklist)
@@ -1405,7 +1391,11 @@ func GetIncrementalSnapshotURL(fullSnapshotURL string, referenceSlot int, fullSn
 	}
 
 	// Step 1: Try to get incremental from the same source as the full snapshot
-	if sourceNodeRPC != "" && blacklist.contains(sourceNodeRPC) {
+	// A snapshot URL may be a redirect target, not a validator RPC address.
+	// Restricted mode always resolves eligible peers through identity discovery.
+	if snapCfg.OnlyKnownRPC {
+		mlog.Log.FileOnlyf("Skipping same-source incremental shortcut: snapshot.only_known_rpc requires identity discovery")
+	} else if sourceNodeRPC != "" && blacklist.contains(sourceNodeRPC) {
 		mlog.Log.Infof("Skipping same-source incremental check because %s is in snapshot.node_blacklist", sourceNodeRPC)
 	} else if sourceNodeRPC != "" {
 		mlog.Log.FileOnlyf("Checking same source for incremental (base slot %d): %s", fullSnapshotSlot, sourceNodeRPC)
@@ -1439,13 +1429,9 @@ func GetIncrementalSnapshotURL(fullSnapshotURL string, referenceSlot int, fullSn
 	if len(cfg.RPCAddresses) > 0 {
 		preferredRPC = cfg.RPCAddresses[0]
 	}
-	nodes := rpc.FetchClusterNodes(cfg, preferredRPC)
-	if len(nodes) == 0 {
-		return "", 0, 0, fmt.Errorf("no rpc nodes available from cluster")
-	}
-	nodes, configuredAdded := addConfiguredSnapshotRPCNodes(nodes, preferredRPC, cfg.RPCAddresses)
-	if configuredAdded > 0 {
-		mlog.Log.Infof("Added %d configured RPC endpoint(s) to snapshot probe candidates", configuredAdded)
+	nodes, err := discoverSnapshotRPCNodes(ctx, snapCfg, cfg, preferredRPC)
+	if err != nil {
+		return "", 0, 0, err
 	}
 	var skipped int
 	nodes, skipped = filterSnapshotRPCNodes(nodes, blacklist)

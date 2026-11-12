@@ -145,6 +145,12 @@ name = "mithril"
     # versions accumulate). Enabled by default in rooted-durable mode. Large
     # segments release obsolete payload pages while retaining exact live/undo
     # records and their offsets. Cycles have bounded scan/file/time budgets.
+    # Compatibility: sparse reclamation converts retired segments to kind-3
+    # manifests. After conversion, older binaries cannot compact this store.
+    # Disabling compaction does not undo conversion. Use a kind-3-capable binary
+    # or a pre-conversion copy for rollback / comparisons between builds.
+    # A warning is logged once per open when kind-3 manifests are first written
+    # or encountered by compaction. See docs/storage-sparse-reclamation.md.
     #[storage.compact]
     #    enabled = true
     #    interval_seconds = 1
@@ -378,7 +384,7 @@ name = "mithril"
     tpu_max_buffered_transactions = 0
 
     # Milliseconds reserved for local finalization and broadcast, not consensus
-    # finality. Zero keeps the conservative 75ms default. Tune from measured
+    # finality. Zero uses the 15ms default. Tune from measured
     # completion margins; this does not change the protocol slot deadline.
     block_completion_reserve_ms = 0
 
@@ -392,6 +398,9 @@ name = "mithril"
 # at slot start (immediately), when no block arrives by the middle of the
 # slot, or when the block stops early. Harmonic failures never stop the
 # validator. When disabled, leader slots schedule locally from the start.
+# Health requires SubscribeBundles2 because that subscription establishes
+# upstream Jito authentication. Its messages are drained and discarded;
+# ordered block execution still uses SubscribeBlocks2 exclusively.
 # Every key has a flag: --harmonic-<key>, e.g. --harmonic-block-engine-url.
 
 [harmonic]
@@ -568,7 +577,7 @@ name = "mithril"
 # [rpc] - Mithril RPC Server
 # ============================================================================
 #
-# Mithril exposes a Solana-compatible JSON-RPC interface on all interfaces,
+# Mithril exposes a Solana-compatible JSON-RPC interface,
 # allowing other tools to query Mithril's account state directly.
 #
 # Query with: curl http://localhost:8899 -X POST -H "Content-Type: application/json" \
@@ -577,6 +586,9 @@ name = "mithril"
 [rpc]
     # Port for Mithril's RPC interface (0 = disabled)
     port = 8899
+    # Literal IP for the shared HTTP/WebSocket listener (default: all interfaces).
+    # Use 127.0.0.1 for a private local RPC endpoint.
+    bind_address = "0.0.0.0"
 
 # ============================================================================
 # [tuning] - Performance Tuning & Profiling
@@ -650,7 +662,10 @@ name = "mithril"
     # Ignored with a single accounts directory.
     # snapshot_accounts_dir_min_free_mb = 16384
 
-    # Size in MB for serialized parameter arena (0 to disable)
+    # Size in MiB per serialized parameter arena (0 to disable). Replay keeps
+    # two buffers so one can clear while the next bank executes. A 256 MiB
+    # setting reserves 512 MiB total; overflow uses ordinary heap allocation.
+    # Runtime diagnostics report used/overflow high-water marks and totals.
     param_arena_size_mb = 512
 
     # Number of borrowed accounts to preallocate in arena (0 to disable)
@@ -881,6 +896,14 @@ name = "mithril"
         # "bad-snapshot-node.example.com",
     ]
 
+    # Restrict full and incremental snapshot sources to these validator identities.
+    # Requires a nonempty list when enabled; no fallback to unlisted snapshot peers.
+    # network.rpc is still used for reference slots and getClusterNodes discovery,
+    # so configure trusted discovery RPC endpoints. Redirects from eligible sources
+    # retain the snapshot downloader's normal behavior.
+    known_validators = []
+    only_known_rpc = false
+
     # -------------------------------------------------------------------------
     # Performance
     # -------------------------------------------------------------------------
@@ -924,6 +947,8 @@ name = "mithril"
     # Also write to stdout (set to false for daemon/service mode)
     to_stdout = true
 
+    # Rotation settings apply independently to mithril.log and replay_timings.jsonl.
+    # Rotated files are gzip-compressed; each timing file contains complete JSON rows.
     # Maximum log file size in MB before rotation (0 = no limit)
     max_size_mb = 100
 

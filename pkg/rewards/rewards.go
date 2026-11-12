@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -33,6 +34,8 @@ const (
 )
 
 type PartitionedRewardDistributionInfo struct {
+	// Plan is shared by speculative banks; only the remaining count is replay-local.
+	Plan                         *PartitionedRewardPlan
 	TotalStakingRewards          uint64
 	FirstStakingRewardSlot       uint64
 	NumRewardPartitionsRemaining uint64
@@ -851,7 +854,8 @@ func shouldForceCreditsOnly(
 }
 
 // CalculateRewardsStreaming performs a streaming calculation of stake rewards.
-// Phase 1: Stream stakes to calculate total points + write points spool (single AccountsDB scan)
+// Phase 1: Stream parent delegations to calculate total points + write points spool.
+// An epoch boundary supplies its captured stream; other callers scan AccountsDB.
 // Phase 2: Replay points spool to compute rewards + write temp spool (sequential file I/O only)
 // Phase 3: Read temp spool, assign partitions, write per-partition spools
 func CalculateRewardsStreaming(
@@ -867,9 +871,33 @@ func CalculateRewardsStreaming(
 	f *features.Features,
 	epochSchedule *sealevel.SysvarEpochSchedule,
 	mode RewardCalculationMode,
-) (*StreamingRewardsResult, error) {
+	stakeSources ...StakeAccountStream,
+) (result *StreamingRewardsResult, resultErr error) {
+	if len(stakeSources) > 1 {
+		return nil, fmt.Errorf("reward calculation requires a single parent stake stream")
+	}
+	source := StakeAccountStream(func(visit StakeAccountVisitor) (int, error) {
+		return global.StreamStakeAccounts(acctsDb, slot, visit)
+	})
+	if len(stakeSources) == 1 {
+		if stakeSources[0] == nil {
+			return nil, fmt.Errorf("nil parent stake stream")
+		}
+		source = stakeSources[0]
+	}
 	minimum := minimumStakeDelegation(slotCtx)
-	spoolDir := filepath.Join(acctsDb.AcctsDir, "..")
+	// Distinct parent banks can calculate the same boundary slot. Their plans
+	// must never share filenames: a later speculative calculation must not
+	// truncate partitions retained by another bank.
+	spoolDir, err := os.MkdirTemp(filepath.Join(acctsDb.AcctsDir, ".."), fmt.Sprintf("reward-plan-%d-", slot))
+	if err != nil {
+		return nil, fmt.Errorf("creating reward plan directory: %w", err)
+	}
+	defer func() {
+		if result == nil {
+			_ = os.RemoveAll(spoolDir)
+		}
+	}()
 
 	mlog.Log.Infof("Rewards: voteCache has %d entries, minimum stake delegation=%d", len(voteCache), minimum)
 
@@ -909,7 +937,7 @@ func CalculateRewardsStreaming(
 		}
 	}()
 
-	_, err = global.StreamStakeAccounts(acctsDb, slot,
+	_, err = source(
 		func(pk solana.PublicKey, delegation *sealevel.Delegation, creditsObs uint64) {
 			if delegation.StakeLamports < minimum {
 				phase1BelowMinimum.Add(1)

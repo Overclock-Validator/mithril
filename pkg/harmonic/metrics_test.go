@@ -8,6 +8,9 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/blockprod"
 	"github.com/Overclock-Validator/mithril/pkg/costmodel"
+	blockenginepb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/blockengine"
+	bundlepb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/bundle"
+	packetpb "github.com/Overclock-Validator/mithril/pkg/harmonic/proto/packet"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
@@ -101,17 +104,29 @@ func TestServiceExportsMetrics(t *testing.T) {
 	slots := metricDelta(t, "harmonic_slots_total", "mode", "harmonic")
 	cranks := metricDelta(t, "harmonic_tip_cranks_total", "result", "not_needed")
 	arrivals := metricDelta(t, "harmonic_first_bundle_delay_seconds")
+	bundleSubscriptions := metricDelta(t, "harmonic_bundle_subscriptions_total")
+	drainedMessages := metricDelta(t, "harmonic_bundle_messages_drained_total")
+	drainedBundles := metricDelta(t, "harmonic_bundles_drained_total")
+	drainedPackets := metricDelta(t, "harmonic_bundle_packets_drained_total")
+	drainedBytes := metricDelta(t, "harmonic_bundle_bytes_drained_total")
 
 	h := startService(t)
 	gaugeOn := func(name string) func() bool {
 		return func() bool { return metricValue(t, name) == 1 }
 	}
 	eventually(t, gaugeOn("harmonic_block_engine_healthy"), "block engine healthy")
+	eventually(t, gaugeOn("harmonic_bundle_subscription_active"), "compatibility bundle stream active")
 	eventually(t, gaugeOn("harmonic_relayer_connected"), "relayer connected")
 	eventually(t, gaugeOn("harmonic_relayer_tpu_advertised"), "relayer TPU advertised")
 	eventually(t, gaugeOn("harmonic_client_id_advertised"), "Harmonic client ID advertised")
 	// Gauges are global, so they may hold an earlier service's values.
 	eventually(t, func() bool { return sessions() == 1 && relayerSessions() == 1 }, "sessions exported")
+	h.be.bundles <- &blockenginepb.SubscribeBundlesResponse{Bundles: []*bundlepb.BundleUuid{
+		{Bundle: &bundlepb.Bundle{Packets: []*packetpb.Packet{{Data: []byte{1, 2, 3}}}}},
+	}}
+	eventually(t, func() bool {
+		return bundleSubscriptions() == 1 && drainedMessages() == 1 && drainedBundles() == 1 && drainedPackets() == 1 && drainedBytes() == 3
+	}, "compatibility stream counters exported independently of block execution")
 
 	env := gatedBank(t, costmodel.Limits{})
 	h.routeTipsHere(t, env)

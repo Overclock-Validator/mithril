@@ -160,7 +160,7 @@ tpu_quic_bind_addr = "0.0.0.0:8004"
 advertised_ip = ""                 # Required only in validator mode; public IP advertised for TPU QUIC
 wait_to_vote_slot = 0             # Minimum slot for new votes; does not bypass recovery checks
 tpu_max_buffered_transactions = 0 # 0 = 131,072 buffered transactions
-block_completion_reserve_ms = 0   # 0 = 75ms local completion/broadcast reserve
+block_completion_reserve_ms = 0   # 0 = 15ms local completion/broadcast reserve
 tpu_sigverify_workers = 0          # 0 = GOMAXPROCS
 
 [consensus]
@@ -180,7 +180,7 @@ tpu_quic_bind_addr = "0.0.0.0:8004"
 advertised_ip = "" # REQUIRED: public IP advertised for TPU QUIC
 wait_to_vote_slot = 0             # Minimum slot for new votes; does not bypass recovery checks
 tpu_max_buffered_transactions = 0 # 0 = 131,072 buffered transactions
-block_completion_reserve_ms = 0   # 0 = 75ms local completion/broadcast reserve
+block_completion_reserve_ms = 0   # 0 = 15ms local completion/broadcast reserve
 tpu_sigverify_workers = 0
 
 [consensus]

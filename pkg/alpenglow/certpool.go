@@ -1077,14 +1077,16 @@ func (p *CertPool) verifyAndFoldTallyWithLockReleased(slot uint64, ps *poolSlot,
 	verified := make([]VerifiedVote, 0, len(good))
 	for i := range good {
 		msg := good[i].message
+		result := VoteVerifyResult{
+			Epoch:      set.Epoch,
+			Rank:       msg.Rank,
+			Stake:      set.Validators[msg.Rank].Stake,
+			TotalStake: set.TotalStake,
+		}
+		result.bindVerifiedSignature(msg, good[i].sig)
 		verified = append(verified, VerifiedVote{
 			Message: msg,
-			Result: VoteVerifyResult{
-				Epoch:      set.Epoch,
-				Rank:       msg.Rank,
-				Stake:      set.Validators[msg.Rank].Stake,
-				TotalStake: set.TotalStake,
-			},
+			Result:  result,
 		})
 		// Vote budget + equivocation, on VERIFIED votes only. A rank may cast a
 		// notarize-fallback for up to 3 distinct hashes; every other type is

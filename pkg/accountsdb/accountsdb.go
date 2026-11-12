@@ -82,6 +82,9 @@ type AccountsDb struct {
 	compactLastScan  map[uint64]uint64 // oldest scan first; a growing directory must not postpone cursor wrap forever
 	compactCycles    uint64            // periodically serve bootstrap and mostly-empty sparse files too
 	compactHooks     compactionTestHooks
+	// Guarded by foldMu; report the format requirement once per opened store,
+	// including stores converted by an earlier process.
+	sparseCompatibilityWarned bool
 	// compactInventory is the in-memory view of the accounts directory that
 	// compaction scans (nil = rebuild from the directory); compactPinCache holds
 	// pins computed from unchanged retained manifests. Both guarded by foldMu.

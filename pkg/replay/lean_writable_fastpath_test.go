@@ -297,7 +297,7 @@ func TestLeanWritableFastPathPreservesWritableStakeAndVoteBookkeeping(t *testing
 	pending := global.PendingStakeEntriesSnapshot()
 	require.Len(t, pending, 1)
 	assert.Equal(t, stakeKey, pending[0].Pubkey)
-	assert.Equal(t, slotCtx.Slot, voteStakeDirtySlot.Load())
+	assert.Zero(t, voteStakeDirtySlot.Load(), "journaled vote/stake writes need no recovery barrier")
 	assert.NotContains(t, slotCtx.ModifiedAccts, stakeKey, "untouched state must not be published")
 	assert.NotContains(t, slotCtx.ModifiedAccts, voteKey, "untouched state must not be published")
 }

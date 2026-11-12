@@ -3,6 +3,7 @@ package rewardcerts
 import (
 	"fmt"
 
+	bls12381 "github.com/Overclock-Validator/gnark-crypto/ecc/bls12-381"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -24,6 +25,17 @@ func (n *notarEntry) wantsVote(rank uint16) bool {
 }
 
 func (n *notarEntry) addVote(rank uint16, signature []byte, blockID solana.Hash, maxValidators int) error {
+	if !n.wantsVote(rank) {
+		return fmt.Errorf("rewardcerts: duplicate notar vote rank %d", rank)
+	}
+	point, err := decodeVoteSignature(signature)
+	if err != nil {
+		return err
+	}
+	return n.addVerifiedSignature(rank, point, blockID, maxValidators)
+}
+
+func (n *notarEntry) addVerifiedSignature(rank uint16, signature bls12381.G2Affine, blockID solana.Hash, maxValidators int) error {
 	if _, ok := n.voted[rank]; ok {
 		return fmt.Errorf("rewardcerts: duplicate notar vote rank %d", rank)
 	}
@@ -31,11 +43,12 @@ func (n *notarEntry) addVote(rank uint16, signature []byte, blockID solana.Hash,
 	if partial == nil {
 		p := newPartialCert(maxValidators)
 		partial = &p
-		n.partials[blockID] = partial
 	}
-	if err := partial.addVote(rank, signature); err != nil {
+	if err := partial.addVerifiedSignature(rank, signature); err != nil {
 		return err
 	}
+
+	n.partials[blockID] = partial
 	n.voted[rank] = struct{}{}
 	return nil
 }

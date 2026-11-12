@@ -290,6 +290,7 @@ type AlpenglowObserverEngine struct {
 	networkProofOrder        []certificateAttemptKey
 	votorMessageHookMu       sync.RWMutex
 	votorMessageHook         func(alpenglow.Message)
+	verifiedVoteHook         func(alpenglow.VerifiedVote)
 	liveClockMu              sync.Mutex
 	liveClockSlot            uint64
 	liveClockAt              time.Time
@@ -303,12 +304,22 @@ type AlpenglowObserverEngine struct {
 	safetyErr       error
 }
 
-// SetVotorMessageHook registers an additional consumer for inbound Votor
-// messages. Block production uses it to build footer reward certificates while
-// the observer retains authority over consensus certificate verification.
+// SetVotorMessageHook registers an additional consumer for verified Votor
+// messages. Consumers that need the verifier's parsed vote signatures can use
+// SetVerifiedVoteHook instead.
 func (e *AlpenglowObserverEngine) SetVotorMessageHook(fn func(alpenglow.Message)) {
 	e.votorMessageHookMu.Lock()
 	e.votorMessageHook = fn
+	e.votorMessageHookMu.Unlock()
+}
+
+// SetVerifiedVoteHook registers a consumer of cryptographically verified votes
+// accepted by consensus. The typed vote retains the verifier's immutable parsed
+// signature binding, so reward aggregation does not have to decode it again.
+// Exact duplicates, invalid votes, and votes rejected by the pool are excluded.
+func (e *AlpenglowObserverEngine) SetVerifiedVoteHook(fn func(alpenglow.VerifiedVote)) {
+	e.votorMessageHookMu.Lock()
+	e.verifiedVoteHook = fn
 	e.votorMessageHookMu.Unlock()
 }
 
@@ -924,6 +935,12 @@ func (e *AlpenglowObserverEngine) acceptVerifiedVoteResult(vote alpenglow.Verifi
 		mlog.Log.Errorf("ALPENGLOW SAFETY: %v", fault)
 		return update.VoteAdmission, fault
 	}
+	e.votorMessageHookMu.RLock()
+	hook := e.verifiedVoteHook
+	e.votorMessageHookMu.RUnlock()
+	if hook != nil {
+		hook(vote)
+	}
 	e.deliverVerifiedVotorMessage(alpenglow.Message{Vote: &vote.Message})
 	return update.VoteAdmission, nil
 }
@@ -959,7 +976,10 @@ func (e *AlpenglowObserverEngine) injectLocalVote(message alpenglow.VoteMessage,
 	if err != nil {
 		return fmt.Errorf("self-verify signed vote: %w", err)
 	}
-	if verifiedResult != result {
+	// Compare consensus metadata, not the verifier's private parsed-signature
+	// cache: the signer constructs its result before this verification runs.
+	if verifiedResult.Epoch != result.Epoch || verifiedResult.Rank != result.Rank ||
+		verifiedResult.Stake != result.Stake || verifiedResult.TotalStake != result.TotalStake {
 		return fmt.Errorf("self-verified vote metadata mismatch: got %+v want %+v", verifiedResult, result)
 	}
 	admission, err := e.acceptVerifiedVoteResult(alpenglow.VerifiedVote{Message: message, Result: verifiedResult, Local: true})

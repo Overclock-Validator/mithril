@@ -3,6 +3,7 @@ package blockprod
 import (
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/arena"
@@ -28,6 +29,10 @@ func (NopBatchSink) OnEntryBatch([]turbine.Entry, int) {}
 // WorkingBank is the leader's mutable slot state used by the forge sink.
 type WorkingBank struct {
 	mu sync.Mutex
+	// Scratch execution borrows the bank's account store and metadata. Add is
+	// guarded by mu and admission; Freeze closes admission before waiting, so
+	// no executor can start after its wait begins.
+	executing sync.WaitGroup
 
 	slotCtx *sealevel.SlotCtx
 	slot    uint64
@@ -437,6 +442,9 @@ func (b *WorkingBank) forgeTransaction(tx *solana.Transaction, wireSize int, pre
 			return ForgeDroppedCost, reason
 		}
 	}
+	if err := replay.PrepareLeaderTransactionParents(b.slotCtx, output); err != nil {
+		return ForgeDroppedExecution, costmodel.ExceedNone
+	}
 	if output.ProcessingResult.TransactionError != nil {
 		feeInfo, err := replay.ApplyFailedTransaction(b.slotCtx, execTx, output)
 		if err != nil {
@@ -573,11 +581,27 @@ func (b *WorkingBank) FlushEntries() {
 // bank lock, so every accepted transaction is included before the footer
 // bank hash is computed. Last-in-slot is marked on the ending tick, not here.
 func (b *WorkingBank) Freeze() {
+	b.freezeAndMeasureExecutionWait()
+}
+
+// freezeAndMeasureExecutionWait returns only the time spent joining scratch
+// execution. Admission locking and entry flushing belong to the wider Freeze
+// phase; neither the scheduler's drain deadline nor its lag bounds this wait.
+func (b *WorkingBank) freezeAndMeasureExecutionWait() time.Duration {
+	b.mu.Lock()
+	b.accepting = false
+	b.mu.Unlock()
+	// A capped Harmonic hold can leave a scratch transaction executing. Its
+	// uncommitted writes will be discarded, but its reads must finish before
+	// the finalizer mutates the bank's fees, sysvars and hash state.
+	waitStartedAt := time.Now()
+	b.executing.Wait()
+	executionWait := time.Since(waitStartedAt)
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.accepting = false
 	b.entries.dropReservation()
 	b.flushEntriesLocked()
+	return executionWait
 }
 
 // Close stops transaction admission without emitting pending entries. It is

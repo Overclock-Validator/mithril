@@ -4,24 +4,28 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+
+	"github.com/Overclock-Validator/mithril/pkg/mlog"
 )
 
 const sparseCompactionMinSize = int64(8 << 20)
 
 type deadPayload struct{ offset, length int64 }
 
-// sparsifyFile releases only obsolete payload pages in an out-of-horizon
-// segment. File IDs, record headers, offsets, live bytes and undo bytes never
+// sparsifyFile releases obsolete record pages in an out-of-horizon
+// segment. File IDs and retained record headers, offsets and bytes never
 // change. This prevents one tiny undo record from pinning gigabytes of dead
 // account data (testnet slots 452462795..452482738).
 //
-// Before the first hole is punched, atomically replace the retired fold's
-// manifest with a compact-kind marker. Like other compact manifests it is NOT
-// replayed as an index redo log. DataCRC=0 denotes an in-place sparse segment;
-// its original whole-file checksum no longer describes obsolete payloads.
-// The marker retains all record offsets and has its own normal manifest CRC.
-// A crash before the marker leaves the original fold intact; a crash after it
-// leaves some or all dead pages allocated. Either state is safe and retryable.
+// Before punching holes, publish a sparse-kind manifest containing exactly the
+// retained records. Its offsets are authoritative: gaps may include obsolete
+// headers as well as payloads. This reclaims runs of small dead accounts even
+// when a few undo records prevent relocating the file. Index-based readers and
+// rewind retain their original locations and byte-exact records.
+//
+// A crash before the marker leaves the old file intact. A crash after it leaves
+// some dead gaps allocated; the next cycle derives those gaps from the retained
+// offsets and can retry without reading discarded headers.
 // Caller holds foldMu and has excluded every in-horizon/parked whole-file pin.
 func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte, indexCache *sparseIndexCache) (reclaimed, scanned int64, deleted bool, err error) {
 	m, err := ReadSegmentManifest(c.manifestPath)
@@ -34,7 +38,7 @@ func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte,
 	}
 	scanned = info.Size()
 	if m.FileId != c.fileId || m.ThroughSlot != c.slot || m.DataLen != uint64(c.size) ||
-		(m.Kind != ManifestKindFold && m.Kind != ManifestKindCompact) {
+		(m.Kind != ManifestKindFold && m.Kind != ManifestKindCompact && m.Kind != ManifestKindSparse) {
 		return 0, scanned, false, fmt.Errorf("manifest does not describe source %s", c.name)
 	}
 	path := c.path
@@ -48,10 +52,19 @@ func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte,
 		return 0, scanned, false, err
 	}
 	var dead []deadPayload
-	retained, foundUndo := 0, 0
-	var next uint64
+	retained := make([]ManifestRecord, 0, len(m.Records))
+	foundUndo := 0
+	var next, retainedEnd uint64
+	addDeadRange := func(start, end uint64) {
+		// Keep boundary pages containing any part of a retained record.
+		start = (start + 4095) &^ uint64(4095)
+		end &= ^uint64(4095)
+		if end > start {
+			dead = append(dead, deadPayload{int64(start), int64(end - start)})
+		}
+	}
 	for _, r := range m.Records {
-		if r.Offset != next || r.Offset > m.DataLen || m.DataLen-r.Offset < hdrLen {
+		if r.Offset < next || (m.Kind != ManifestKindSparse && r.Offset != next) || r.Offset > m.DataLen || m.DataLen-r.Offset < hdrLen {
 			return 0, scanned, false, fmt.Errorf("invalid record offset %d in %s", r.Offset, c.name)
 		}
 		var h [hdrLen]byte
@@ -67,6 +80,9 @@ func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte,
 			return 0, scanned, false, fmt.Errorf("record payload exceeds source at offset %d", r.Offset)
 		}
 		next = r.Offset + hdrLen + ((length + 7) &^ uint64(7))
+		if next > m.DataLen {
+			return 0, scanned, false, fmt.Errorf("record padding exceeds source at offset %d", r.Offset)
+		}
 		keep := false
 		if key, pinned := undo[r.Offset]; pinned {
 			if key != r.Pubkey {
@@ -86,24 +102,21 @@ func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte,
 			keep = true
 		}
 		if keep {
-			retained++
-			continue
-		}
-		// Retain headers and edge pages so old appendvec scanners remain valid.
-		// Only complete 4 KiB pages wholly inside dead data may be discarded.
-		start := (int64(r.Offset) + hdrLen + 4095) &^ int64(4095)
-		end := (int64(r.Offset) + hdrLen + int64(length)) &^ int64(4095)
-		if end > start {
-			dead = append(dead, deadPayload{start, end - start})
+			addDeadRange(retainedEnd, r.Offset)
+			retainedEnd = next
+			// Retired manifests no longer provide fold redo/undo context.
+			r.PrevValid, r.Prev = false, AccountIndexEntry{}
+			retained = append(retained, r)
 		}
 	}
-	if next != m.DataLen || foundUndo != len(undo) {
+	if (m.Kind != ManifestKindSparse && next != m.DataLen) || foundUndo != len(undo) {
 		return 0, scanned, false, fmt.Errorf("manifest does not cover source or all undo records")
 	}
-	if retained > 0 && len(dead) == 0 {
+	addDeadRange(retainedEnd, m.DataLen)
+	if len(retained) > 0 && len(dead) == 0 && len(retained) == len(m.Records) {
 		return 0, scanned, false, nil
 	}
-	if retained == 0 {
+	if len(retained) == 0 {
 		db.appendVecReadMu.LockAs("compaction")
 		err := removeSourceFiles(path, c.manifestPath)
 		db.appendVecReadMu.Unlock()
@@ -112,12 +125,16 @@ func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte,
 		}
 		return before, scanned, err == nil, err
 	}
-	if m.Kind != ManifestKindCompact || m.DataCRC != 0 {
-		m.Kind, m.BatchSeq, m.DataCRC = ManifestKindCompact, 0, 0
+	if m.Kind != ManifestKindSparse || len(retained) != len(m.Records) {
+		m.Kind, m.BatchSeq, m.DataCRC = ManifestKindSparse, 0, 0
+		m.Records, m.Bankhashes, m.ResumeCtx = retained, nil, nil
 		if err := WriteSegmentManifest(db.AcctsDir, m); err != nil {
 			return 0, scanned, false, err
 		}
 	}
+	// Publication is durable before either this notice or any hole punching.
+	// A failed marker write must not announce a successful format conversion.
+	db.warnSparseCompatibilityLocked(m.FileId)
 	if db.compactHooks.afterSparseMarker != nil {
 		db.compactHooks.afterSparseMarker()
 	}
@@ -144,8 +161,23 @@ func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte,
 	return max(int64(0), before-after), scanned, false, nil
 }
 
+// warnSparseCompatibilityLocked also runs when compaction first encounters an
+// existing kind-3 store. Caller holds foldMu; no additional persistent marker is
+// needed, and repeated compaction cycles must not flood the operator's log.
+func (db *AccountsDb) warnSparseCompatibilityLocked(fileID uint64) {
+	if db.sparseCompatibilityWarned {
+		return
+	}
+	db.sparseCompatibilityWarned = true
+	mlog.Log.Warnf("accountsdb: %s uses sparse manifests (kind 3, file %d); older binaries cannot compact this store. Disabling compaction does not restore the old format; use a kind-3-capable binary or restore a pre-conversion copy for rollback. See docs/storage-sparse-reclamation.md", db.AcctsDir, fileID)
+	fire(db.compactHooks.afterSparseCompatibilityWarning)
+}
+
 type compactionTestHooks struct {
-	afterHistoryFloor func()
-	afterSparseMarker func()
-	afterSparsePunch  func()
+	afterCompactManifest            func()
+	afterCompactIndex               func()
+	afterHistoryFloor               func()
+	afterSparseMarker               func()
+	afterSparsePunch                func()
+	afterSparseCompatibilityWarning func()
 }

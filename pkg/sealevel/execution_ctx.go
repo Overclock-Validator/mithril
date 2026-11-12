@@ -111,18 +111,19 @@ type SlotCtx struct {
 
 	TraceCtx context.Context
 
-	// Speculative execution support (streaming replay). A bank executed before
+	// Speculative execution support (streaming replay and local production). A bank executed before
 	// its block is complete must not publish to process-global state until
 	// the block is accepted, so a discard leaves nothing behind.
 	//
-	// DeferVoteCachePublication buffers global vote-cache puts and deletes in
-	// the pending maps (protected by PendingVoteCacheMu) and turns the
-	// vote/stake dirty marker into VoteStakeDirty; the replay finalize step
-	// publishes them once the bank is accepted.
+	// DeferVoteCachePublication buffers vote-cache puts/deletes and stake-index
+	// discoveries in bank-owned pending maps (protected by PendingVoteCacheMu).
+	// Ordered replay acceptance publishes them together; discarded banks cannot
+	// affect global execution state or another bank at the same slot.
 	DeferVoteCachePublication bool
 	PendingVoteCacheMu        sync.Mutex
 	PendingVoteCache          map[solana.PublicKey]*VoteStateVersions
 	PendingVoteCacheDeletes   map[solana.PublicKey]struct{}
+	PendingStakePubkeys       map[solana.PublicKey]struct{}
 	VoteStakeDirty            bool
 	// TrackProgramCacheAdds records every program-cache insertion made while
 	// executing this bank so a discarded bank can evict them again (eviction
@@ -520,7 +521,11 @@ func (slotCtx *SlotCtx) GetAccountShared(pubkey solana.PublicKey) (*accounts.Acc
 }
 
 func (slotCtx *SlotCtx) GetParentAccount(pubkey solana.PublicKey) (*accounts.Account, error) {
-	acct, err := slotCtx.ParentAccts.GetAccountWithoutLock(pubkey)
+	// Producer commits retain parent images while other admitted scratch
+	// transactions may still read this shared store. Finalization joins all
+	// scratch execution before mutating the frozen bank.
+	key := [32]byte(pubkey)
+	acct, err := slotCtx.ParentAccts.GetAccount(&key)
 	if err != nil {
 		return nil, err
 	} else {

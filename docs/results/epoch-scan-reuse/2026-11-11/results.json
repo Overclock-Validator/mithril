@@ -1,0 +1,51 @@
+{
+  "scope": "Synthetic full epoch stake aggregation plus reward calculation and output cleanup; no live validator measurement",
+  "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+  "gomaxprocs": 2,
+  "accounts": 16384,
+  "samples_per_variant": 3,
+  "timed_iterations_per_sample": 5,
+  "parent_account_cache": "warm for both variants",
+  "before": "three AccountsDB read/decode scans",
+  "after": "one AccountsDB scan; compact immutable delegation spool reused twice",
+  "before_ns_per_op": [
+    28689326,
+    22962827,
+    27518613
+  ],
+  "after_ns_per_op": [
+    14264606,
+    15982002,
+    16050312
+  ],
+  "median_time_reduction_percent": 41.92293775852729,
+  "before_bytes_allocated_per_op": [
+    49400172,
+    49395652,
+    49399473
+  ],
+  "after_bytes_allocated_per_op": [
+    27889833,
+    27888563,
+    27890436
+  ],
+  "temporary_delegation_record_bytes": 112,
+  "temporary_delegation_io_buffer_bytes": 262144,
+  "correctness": [
+    "Outgoing stake history and incoming effective stake distribution equal independent repeated-DB-scan reference",
+    "Tower and full-Alpenglow reward totals, vote commissions and every partition record equal DB-source calculation",
+    "A second same-slot calculation cannot overwrite first plan",
+    "Concurrent capture, repeatable scans, float-bit/credits preservation, truncation rejection and failure cleanup"
+  ],
+  "tests": [
+    "GOMAXPROCS=2 go test -p=1 ./pkg/rewards -count=1",
+    "GOMAXPROCS=2 go test -p=1 -race ./pkg/rewards ./pkg/replay -run TestStakeDelegationSpool|TestRewardPlanFailedSource|TestEpochCapturedStake|TestEpochBoundaryStakes -count=1"
+  ],
+  "benchmark_command": "GOMAXPROCS=2 go test -p=1 ./pkg/replay -run '^$' -bench '^BenchmarkEpochStakeScanReuse$' -benchtime=5x -count=3 -benchmem",
+  "limits": [
+    "Synthetic workload does not predict actual 1.3M-account mainnet boundary latency",
+    "Does not eliminate first committed-parent account scan",
+    "Temporary disk space is 112 bytes per delegated stake (~151MB for 1.35M accounts), reclaimed on completion",
+    "No live process, configuration or checkpoint changed"
+  ]
+}

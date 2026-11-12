@@ -1,0 +1,130 @@
+{
+  "started_utc": "2026-11-11T23:24:37.575616+00:00",
+  "branch": "smcio/storage-reclamation-harmonic-mainnet",
+  "base_commit": "f85d0da03f55b05f7d3f6d0d4f063e2b96a163a6",
+  "go_version": "go version go1.27.3 linux/amd64",
+  "GOMAXPROCS": 2,
+  "runtime_changed": false,
+  "checks": [
+    {
+      "name": "diff-check",
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "exit_code": 0,
+      "seconds": 0.009,
+      "log": "/root/mithril-latest/preparation/fork-epoch-implementation-20261111/diff-check.log"
+    },
+    {
+      "name": "race-tests",
+      "command": [
+        "go",
+        "test",
+        "-race",
+        "-p=1",
+        "-timeout=180s",
+        "./pkg/global",
+        "./pkg/epochstakes",
+        "./pkg/rewards",
+        "./pkg/replay",
+        "./pkg/blockprod",
+        "./pkg/blockstream",
+        "./cmd/mithril/node"
+      ],
+      "exit_code": 0,
+      "seconds": 50.764,
+      "log": "/root/mithril-latest/preparation/fork-epoch-implementation-20261111/race-tests.log"
+    },
+    {
+      "name": "vet",
+      "command": [
+        "go",
+        "vet",
+        "-p=1",
+        "./pkg/global",
+        "./pkg/epochstakes",
+        "./pkg/rewards",
+        "./pkg/replay",
+        "./pkg/blockprod",
+        "./pkg/blockstream",
+        "./cmd/mithril/node"
+      ],
+      "exit_code": 0,
+      "seconds": 16.57,
+      "log": "/root/mithril-latest/preparation/fork-epoch-implementation-20261111/vet.log"
+    },
+    {
+      "name": "build",
+      "command": [
+        "go",
+        "build",
+        "-p=1",
+        "-o",
+        "/tmp/mithril-fork-epoch-validation/mithril",
+        "./cmd/mithril"
+      ],
+      "exit_code": 0,
+      "seconds": 4.181,
+      "log": "/root/mithril-latest/preparation/fork-epoch-implementation-20261111/build.log"
+    }
+  ],
+  "source_sha256": {
+    "cmd/mithril/node/node.go": "1de20378ad1ea291bcac489c31d7f667940bb82fa37d701b822b486290733ede",
+    "pkg/blockprod/leader.go": "f70ca29035380026e49a9e2f213a02df658312b0f25c763012a5fe93e1517457",
+    "pkg/blockprod/leader_epoch_rewards_test.go": "305900680a9b0f55e1a08dc85e3c017b6cb7cc2ce1614eccb92c532f53b15ab7",
+    "pkg/blockprod/leader_generation_lease_test.go": "33632906eb130612de0f1749aa46d1e32287e71a173d9c7f64552e873376e4b5",
+    "pkg/blockprod/slot_ctx.go": "0b5aab28624459a53a36618b58d55fe06ea939d871be6f491c3c3089b1a9b7de",
+    "pkg/blockstream/alpenglow_recovery.go": "001dcb468183e13bf27fa3f499a755703e5f3d933fbaf5071a281fa36ad84ee3",
+    "pkg/blockstream/block_source.go": "ee821e53aa5a2fdd57dab9aef183218b9cb73c15fff1d6b463d4b42dcb6301a2",
+    "pkg/blockstream/paused_buffer.go": "8895cc1e8e26379c0882366523ab06fadc62eddcbea685071c154b2f5826a0f9",
+    "pkg/blockstream/paused_buffer_test.go": "6c53b3f0acdd9ccd45f7bf1d9be18521c5789c72c30a8c9e7a566895e3b2a098",
+    "pkg/blockstream/replay_session.go": "20c23fefded36eceefbef2b076a301bd51af095f50ccf1f1c9731c518a341957",
+    "pkg/blockstream/replay_session_test.go": "dfa97ff9a4ad45f6d817f7f56dc2d453b6210707aa2f3f595cf435c0f60a28c1",
+    "pkg/epochstakes/cache_view.go": "9977fd61fd5e4e56dcf6f744d38c3cf20f70413c9552dc8fca81b16379416f0a",
+    "pkg/epochstakes/cache_view_test.go": "8f25e07aca9d1f77e96b478b55ff8cb6ee55007fd7e1b075b8e251e67af9754f",
+    "pkg/global/epoch_cache_snapshot.go": "14d811a10e6af6db5d5e39806afb578ebd14c184c464ace4a6e436613b638380",
+    "pkg/global/global_ctx.go": "2cc425b930ff9aef7c02787fdec76b432b802202bd1d096a3ff78d959ddb4914",
+    "pkg/global/vote_cache_journal.go": "e26ddc659ded33e10536b25a10fff3938cf876402a887c0659fac7f3c333bdd3",
+    "pkg/global/vote_cache_journal_test.go": "a4da04427e02e3dc47537a24ed552ffb4043d03b49c8a853a5b1a7df2cc6eee4",
+    "pkg/replay/alpenglow_switch.go": "931f97fcece1b3304981b247756f832602a2af872500999675a589147ee275fe",
+    "pkg/replay/alpenglow_unwind_test.go": "a54f0f2d3bd33c08fb5a835d1428421a439e6d4e9f474ce742181b5bdc50335b",
+    "pkg/replay/block.go": "6e6a4906851fb60b09a48ab05dcaebb262b1927ec56cc4c69d0b01bb630fb5e2",
+    "pkg/replay/chain_generation_lease_test.go": "9c92875f7126bcc3f7f98d8ecae349653d45307d8136e0a85e1f5eb9e4df0bf6",
+    "pkg/replay/chain_state.go": "36ee1630c9e580da00b481e7550ffb05a7ce77a84e4648c74defea0a6f24fc0a",
+    "pkg/replay/epoch.go": "b1cc221319218d9cf3c57c13445b26771b937de617ecdddfc7f5d8e68736a024",
+    "pkg/replay/epoch_feature_preparation.go": "fa9fe9e634e3636706a087cfffdb0671725a607140cdf62ea4a646b26fb110f0",
+    "pkg/replay/epoch_feature_preparation_test.go": "79c381aaa7b2ef48ab484e4552e3fa9d23a42c9d7c227bbb8b03de2ffea16a04",
+    "pkg/replay/epoch_scan_reuse_test.go": "84e937ec53f4112923f12232e9b9429caa8ec8f9d6f9c3831a999e5a6a1bc13b",
+    "pkg/replay/fork_cache_test.go": "2d8d5777e8ff2e4f35128e9d9697893c8a63e620c2e84b24d1fbde0e04404151",
+    "pkg/replay/fork_state.go": "62261ee9a4aacb233af330f17076808cb83eda7004f26bba2df7d160bfa9ca0b",
+    "pkg/replay/fork_state_test.go": "8a4f02de091aec23d16ce54cd2eaf1aaa37f7e7ae8c35ff1481293e0f6881e67",
+    "pkg/replay/initial_fork_anchor.go": "25bc0e0b3ca712afdd56b6a2017d97acc56069add79a4745d2a175f593412389",
+    "pkg/replay/initial_fork_anchor_test.go": "4c28340c3cf603efb29f5d0581da3830932ed87e155c6183382c8dcc4bd6576e",
+    "pkg/replay/lean_writable_fastpath_test.go": "b3ec8ea3a01f66a421fac853cc34dbc794ec7eff846cf0ef5ca86d58c470bec3",
+    "pkg/replay/local_leader.go": "57193160bbb8d4211bac344732b032ec7fad4b7c8c04fea40d77192a582ddc9a",
+    "pkg/replay/local_leader_test.go": "d1aeff1e74262096be57f5437d9377cf4afb32e1aba736b9d783b79aa37b8a16",
+    "pkg/replay/partitioned_reward_bank.go": "4835943cdd96ade352c5f5c43a175598db8053a55abac88642a0a31bdc8e6cc1",
+    "pkg/replay/partitioned_reward_bank_test.go": "690017581c1f4c95af1938533e49fc9bad1ab3876c5c48c48f7dff5946613b6e",
+    "pkg/replay/promotion.go": "348072f452ea3547098bb04d204876be5827aa628f727c8ecf3f863271d5e070",
+    "pkg/replay/rewards.go": "5c1e1c8314f7deb05760cffd7920463964b526f5f40a9dc3f09253e5152338d3",
+    "pkg/replay/rewards_retirement.go": "892523e4a600039ba23df3703672b910a19a79a5b33e186860c5c9148951f922",
+    "pkg/replay/streaming.go": "acc5e3847422307f95fdba93016459a2fe377556cf6499a475db67f30199d46d",
+    "pkg/replay/transaction.go": "32c2cda4a702f40edbeac6ff77c653fa40374232e646e22dd244af4b312339d3",
+    "pkg/rewards/partition_plan.go": "44b93240b88ea5a75cf182ac46cb945439c8ed064cd6497ee226a79e861c5a43",
+    "pkg/rewards/partition_plan_test.go": "0c7274c01edc59f6a3adc375a72c3981c8a9b5b9b85318182a81ddd5c46930ac",
+    "pkg/rewards/rewards.go": "0ed87fb22a4924a9b1196f1ee7ee543d44fa7ce8773a749c49c290acf0f8264e",
+    "pkg/rewards/stake_delegation_spool.go": "1f1c02a94999b8f958afe9c8d4f4552de6c433d779528400f9f35e4349c322b2",
+    "pkg/rewards/stake_delegation_spool_test.go": "70f23f9c6517b7f70d614a15732c5701fa17301cc04f1dca7e2e0baf1968a0a3",
+    "pkg/sealevel/execution_ctx.go": "8b1778b74c94c0849fc70f284ebcc93cdbbd4af0ba07aec49ae70d5d24533819"
+  },
+  "binary": "/tmp/mithril-fork-epoch-validation/mithril",
+  "binary_sha256": "00bff7dbc03404154021818d55dbb40e3350aee016560484ac5ed44839d3ec1f",
+  "completed_utc": "2026-11-11T23:25:49.165203+00:00",
+  "limits": [
+    "No live deployment or runtime performance measurement performed.",
+    "Epoch boundary leader production remains guarded; leader partition distribution is supported after the boundary executes.",
+    "Checkpoint fallback remains for missing retained state or durable-history contradictions."
+  ]
+}

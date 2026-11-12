@@ -7,7 +7,9 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
+	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/global"
+	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/state"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/assert"
@@ -118,4 +120,60 @@ func TestStakeIndexFoldScopedFlush(t *testing.T) {
 	onDisk = readStakeIndexPubkeys(t, idxPath)
 	assert.NotContains(t, onDisk, wrongFork)
 	assert.Len(t, onDisk, 2)
+}
+
+func TestStakeIndexFoldDerivesMissingHintsFromAcceptedWrites(t *testing.T) {
+	for _, async := range []bool{false, true} {
+		name := "forced"
+		if async {
+			name = "async"
+		}
+		t.Run(name, func(t *testing.T) {
+			global.ClearPendingStakePubkeys()
+			t.Cleanup(global.ClearPendingStakePubkeys)
+			dir := t.TempDir()
+			key, future, voter := testKey(0xc1), testKey(0xc2), testKey(0xc3)
+			stake := &sealevel.StakeStateV2{Status: sealevel.StakeStateV2StatusStake}
+			stake.Stake.Stake.Delegation.VoterPubkey = voter
+			stake.Stake.Stake.Delegation.StakeLamports = 1_000_000_000
+			stake.Stake.Stake.Delegation.ActivationEpoch = 1082
+			data, err := sealevel.MarshalStakeStake(stake)
+			require.NoError(t, err)
+			acct := &accounts.Account{Key: key, Owner: addresses.StakeProgramAddr, Lamports: 1_002_282_880, Data: data}
+			committer := &orderAssertingCommitter{
+				fakeCommitter: fakeCommitter{durable: accounts.NewMemAccounts()},
+				t:             t, idxPath: filepath.Join(dir, global.StakePubkeyIndexFileName),
+				expectAt: map[uint64][]solana.PublicKey{5: {key}},
+			}
+			tail := newUnrootedTail(&fakeDurable{}, committer, 512, 1, dir)
+			tail.stakeTotals = newStakeTotalsTracker(nil, newStakeIndexMembers(nil))
+
+			// An execution-discard path can remove slot-scoped hints even though
+			// the accepted slot's account writes remain queued for durability.
+			global.EnqueuePendingStakePubkey(5, key)
+			global.DropPendingStakePubkeys(5)
+			global.EnqueuePendingStakePubkey(9, future)
+			tail.recordStakeChange(&sealevel.SlotCtx{Slot: 5, ParentAccts: accounts.NewMemAccounts()}, []*accounts.Account{acct})
+			tail.Add(5, []*accounts.Account{acct}, testHashBytes(5))
+			tail.SetContext(5, &state.ResumeContext{Slot: 5})
+			if async {
+				job, err := tail.buildFoldJob(5, false)
+				require.NoError(t, err)
+				require.NotNil(t, job)
+				require.NoError(t, runFoldJob(committer, job))
+				tail.applyFoldJob(job)
+			} else {
+				through, _, err := tail.flush(5)
+				require.NoError(t, err)
+				require.Equal(t, uint64(5), through)
+			}
+			onDisk := readStakeIndexPubkeys(t, committer.idxPath)
+			require.Contains(t, onDisk, key)
+			require.NotContains(t, onDisk, future)
+			require.Equal(t, []solana.PublicKey{future}, global.PendingStakePubkeysForSlot(9))
+			require.False(t, tail.stakeTotals.broken)
+			require.Equal(t, voteDelegation{stake: 1_000_000_000, accounts: 1}, tail.stakeTotals.durable[voter])
+			require.Equal(t, digestStakeIndex([]accountsdb.StakeIndexEntry{{Pubkey: key}}), tail.stakeTotals.members.digest)
+		})
+	}
 }
