@@ -4,25 +4,42 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 )
 
-// foldWritebackBytes: MITHRIL_FOLD_WRITEBACK_MB=N makes the fold hand its
-// segment file to the device N MiB at a time while it is being written, and
-// wait for each step before starting the next. Unset or 0 keeps the earlier
-// behaviour: the whole segment (100 MiB and more) sits in the page cache until
-// one fsync submits it at once. That burst fills the device queue, and account
-// index reads issued by block loading during it wait behind the writes.
-// Durability is unchanged either way: the final fsync still decides it.
-// Linux only; elsewhere the setting has no effect.
-var foldWritebackBytes = func() int64 {
-	n, err := strconv.Atoi(os.Getenv("MITHRIL_FOLD_WRITEBACK_MB"))
-	if err != nil || n < 1 || n > 1024 {
-		return 0
+// defaultFoldWritebackMB is the step used when MITHRIL_FOLD_WRITEBACK_MB is not
+// set, on platforms that implement the stepping.
+const defaultFoldWritebackMB = 8
+
+// foldWritebackBytes is the step in which a fold hands its segment file to the
+// device while writing it, waiting for each step before starting the next.
+// Without stepping the whole segment (100 MiB and more) sits in the page cache
+// until one fsync submits it at once; that burst fills the device queue, and
+// account index reads issued by block loading during it wait behind the
+// writes. Durability is the same either way: the final fsync still decides it.
+//
+// MITHRIL_FOLD_WRITEBACK_MB sets the step in MiB (1 to 1024); 0 turns stepping
+// off and restores the single fsync. Unset, or a value that does not parse,
+// uses the default. Linux only: elsewhere stepping is off unless asked for,
+// and asking for it only reports that it is unsupported.
+var foldWritebackBytes = parseFoldWritebackMB(os.LookupEnv("MITHRIL_FOLD_WRITEBACK_MB"))
+
+func parseFoldWritebackMB(v string, set bool) int64 {
+	def := int64(0)
+	if boundedWritebackSupported {
+		def = defaultFoldWritebackMB << 20
+	}
+	if !set {
+		return def
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n < 0 || n > 1024 {
+		return def
 	}
 	return int64(n) << 20
-}()
+}
 
 // segmentWriteback is boundedWriteback; tests replace it.
 var segmentWriteback = boundedWriteback
@@ -70,7 +87,7 @@ func (w *segmentFileWriter) report() FoldWriteback {
 
 // FoldWriteback reports what the stepwise segment writeback did in one fold.
 type FoldWriteback struct {
-	StepBytes    int64  // step asked for (MITHRIL_FOLD_WRITEBACK_MB); 0 when off
+	StepBytes    int64  // step in effect (MITHRIL_FOLD_WRITEBACK_MB or the default); 0 when off
 	Calls        int    // steps handed to the device
 	HandedBytes  int64  // segment bytes those steps covered; the final fsync submits the rest
 	SegmentBytes int64  // segment file size

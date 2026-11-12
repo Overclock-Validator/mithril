@@ -8,6 +8,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+const boundedWritebackSupported = true
+
 // boundedWriteback waits for writeback already started on [0, from) and starts
 // it for [from, to). It asks for no flush of the device cache and makes no
 // durability claim.

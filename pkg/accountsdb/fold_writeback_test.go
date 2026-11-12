@@ -121,6 +121,25 @@ func TestFoldWithoutWriteback(t *testing.T) {
 	require.Contains(t, res.Writeback.String(), "writeback_step_mb=0 writeback_calls=0 writeback_handed_bytes=0 ")
 }
 
+// Stepping is on by default where it is implemented; 0 turns it off; a value
+// that does not parse or is out of range falls back to the default.
+func TestParseFoldWritebackMB(t *testing.T) {
+	def := int64(0)
+	if runtime.GOOS == "linux" {
+		def = 8 << 20
+	}
+	require.Equal(t, boundedWritebackSupported, runtime.GOOS == "linux")
+	require.Equal(t, def, parseFoldWritebackMB("", false))
+	require.Equal(t, def, parseFoldWritebackMB("", true))
+	require.Equal(t, def, parseFoldWritebackMB("fast", true))
+	require.Equal(t, def, parseFoldWritebackMB("-1", true))
+	require.Equal(t, def, parseFoldWritebackMB("1025", true))
+	require.Zero(t, parseFoldWritebackMB("0", true))
+	require.EqualValues(t, 1<<20, parseFoldWritebackMB("1", true))
+	require.EqualValues(t, 16<<20, parseFoldWritebackMB(" 16 ", true))
+	require.EqualValues(t, 1024<<20, parseFoldWritebackMB("1024", true))
+}
+
 // The writer hands bytes over only at step boundaries, each call covering
 // exactly the bytes written since the previous one, and leaves the bytes
 // untouched.
