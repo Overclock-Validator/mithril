@@ -145,6 +145,12 @@ name = "mithril"
     # versions accumulate). Enabled by default in rooted-durable mode. Large
     # segments release obsolete payload pages while retaining exact live/undo
     # records and their offsets. Cycles have bounded scan/file/time budgets.
+    # Compatibility: sparse reclamation converts retired segments to kind-3
+    # manifests. After conversion, older binaries cannot compact this store.
+    # Disabling compaction does not undo conversion. Use a kind-3-capable binary
+    # or a pre-conversion copy for rollback / comparisons between builds.
+    # A warning is logged once per open when kind-3 manifests are first written
+    # or encountered by compaction. See docs/storage-sparse-reclamation.md.
     #[storage.compact]
     #    enabled = true
     #    interval_seconds = 1
@@ -392,6 +398,9 @@ name = "mithril"
 # at slot start (immediately), when no block arrives by the middle of the
 # slot, or when the block stops early. Harmonic failures never stop the
 # validator. When disabled, leader slots schedule locally from the start.
+# Health requires SubscribeBundles2 because that subscription establishes
+# upstream Jito authentication. Its messages are drained and discarded;
+# ordered block execution still uses SubscribeBlocks2 exclusively.
 # Every key has a flag: --harmonic-<key>, e.g. --harmonic-block-engine-url.
 
 [harmonic]

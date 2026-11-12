@@ -28,9 +28,9 @@ const (
 	// deadlines; keeping those clocks identical prevents late/missed slots.
 	AlpenglowSlotDuration = 200 * time.Millisecond
 	// Reserve time for bank finalization, footer shredding and UDP fanout after
-	// the execution cutoff. With pipelined completion, the initial live trials
-	// measured 4-9ms; 15ms leaves more margin than the tight 10ms trial. Operators
-	// should tune CompletionReserve from completion margins on their own host.
+	// the execution cutoff. This configurable target is not an execution timeout:
+	// scratch readers must quiesce first. Tune from completion and signed
+	// deadline-margin histograms; tail latency can exceed this default.
 	leaderBlockCompletionReserve = 15 * time.Millisecond
 )
 
@@ -740,6 +740,31 @@ func (l *LeaderLoop) productionTimingDetailLocked(slot uint64, finalizationStart
 		protocolDeadline.Sub(networkCompletedAt).Milliseconds())
 }
 
+// Emit these diagnostics after publication/handoff, but use the captured
+// network timestamp so local replay backpressure cannot create a false miss.
+func (l *LeaderLoop) recordCompletionMetricsLocked(slot uint64, finalizationStartedAt, networkCompletedAt time.Time) {
+	completion := networkCompletedAt.Sub(finalizationStartedAt)
+	_ = statsd.Duration(statsd.BlockProductionCompletion, completion, nil)
+	protocolDeadline := l.productionWindowProtocolDeadlineLocked(slot)
+	if protocolDeadline.IsZero() {
+		return
+	}
+	margin := protocolDeadline.Sub(networkCompletedAt)
+	_ = statsd.SignedDuration(statsd.BlockProductionDeadlineMargin, margin, nil)
+	if margin < 0 {
+		_ = statsd.Count(statsd.BlockProductionDeadlineMisses, 1, nil)
+		mlog.Log.Warnf("ALPENGLOW block production: slot=%d completed after protocol deadline deadline_margin_ms=%.3f finalization_ms=%.3f; inspect completion timings and block_completion_reserve_ms",
+			slot, float64(margin)/float64(time.Millisecond), float64(completion)/float64(time.Millisecond))
+	}
+}
+
+func recordRewardPreparation(slot uint64, status string) {
+	_ = statsd.Count(statsd.BlockProductionRewardPreparation, 1, []string{status})
+	if status == "missing" {
+		mlog.Log.Warnf("ALPENGLOW block production: slot=%d reward preparation unavailable at finalization; continuing with no prepared reward certificates", slot)
+	}
+}
+
 func (l *LeaderLoop) failProductionWindowLocked(slot uint64, reason, detail string) {
 	l.failProductionWindowWithTerminalLocked(slot, reason, reason, detail)
 }
@@ -1099,8 +1124,13 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 	if l.controller != nil {
 		l.controller.ClearWorkingBank()
 	}
-	l.activeBank.Freeze()
+	executionQuiescenceDuration := l.activeBank.freezeAndMeasureExecutionWait()
 	freezeDuration := time.Since(phaseStartedAt)
+	// Record after this attempt exits so metrics work cannot extend the footer
+	// deadline. Also observe attempts which freeze but abort before broadcast.
+	defer func() {
+		_ = statsd.Duration(statsd.BlockProductionExecutionQuiescence, executionQuiescenceDuration, nil)
+	}()
 	if l.activeSink == nil {
 		l.failProductionWindowLocked(slot, leaderReasonFinalizationUnavailable, "entry broadcast sink is unavailable")
 		l.abortActiveSlotLocked(leaderReasonFinalizationUnavailable)
@@ -1137,6 +1167,7 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 		rewardPreparation = "synchronous"
 	}
 	rewardCertDuration := time.Since(phaseStartedAt)
+	defer recordRewardPreparation(slot, rewardPreparation)
 
 	if l.accountsDb == nil || l.activeSess == nil {
 		l.failProductionWindowLocked(slot, leaderReasonFinalizationUnavailable, "accounts DB or broadcast session is unavailable")
@@ -1280,12 +1311,13 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 	}
 	// Format diagnostics only after network completion and local handoff;
 	// phase timers do not participate in protocol/deadline calculations.
+	l.recordCompletionMetricsLocked(slot, finalizationStartedAt, networkCompletedAt)
 	ms := func(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
-	timingDetail += fmt.Sprintf(" slot_ending_ms=%.3f freeze_ms=%.3f entry_drain_ms=%.3f reward_certs_ms=%.3f"+
+	timingDetail += fmt.Sprintf(" slot_ending_ms=%.3f freeze_ms=%.3f execution_quiescence_ms=%.3f entry_drain_ms=%.3f reward_certs_ms=%.3f"+
 		" build_block_ms=%.3f bank_commit_ms=%.3f footer_broadcast_ms=%.3f ending_tick_broadcast_ms=%.3f"+
 		" reward_prepare=%s reward_prepare_ms=%.3f reward_skip_bytes=%d reward_notar_bytes=%d"+
 		" cutoff_delay_ms=%.3f hold_ms=%.3f drain_deadline_lag_ms=%.3f drain_outstanding=%d drain_events=%d drain_inflight=%t parent_validation_ms=%.3f",
-		ms(slotEndingDuration), ms(freezeDuration), ms(entryDrainDuration), ms(rewardCertDuration),
+		ms(slotEndingDuration), ms(freezeDuration), ms(executionQuiescenceDuration), ms(entryDrainDuration), ms(rewardCertDuration),
 		ms(buildBlockDuration), ms(commitDuration), ms(footerDuration), ms(endingTickDuration),
 		rewardPreparation, ms(rewardPreparationDuration), len(footerRewards.Skip), len(footerRewards.Notar),
 		ms(cutoffDelay), ms(holdDuration), ms(drainDeadlineLag), drainStatus.Outstanding,

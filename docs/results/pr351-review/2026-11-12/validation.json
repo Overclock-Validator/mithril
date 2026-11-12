@@ -1,0 +1,65 @@
+{
+  "checked_utc": "2026-11-12T12:55:41.013343+00:00",
+  "source_head": "7f05abfe62286cbb3a32795644974692dadfdd57",
+  "branch": "smcio/storage-reclamation-harmonic-mainnet",
+  "runtime_deployed": false,
+  "runtime_pid": 1072996,
+  "checks": [
+    {
+      "command": "GOMAXPROCS=2 go test -race -p=1 -timeout=240s ./pkg/accountsdb ./pkg/global ./pkg/alpenglow ./pkg/harmonic ./pkg/statsd ./pkg/blockprod ./cmd/mithril/node",
+      "exit_code": 0
+    },
+    {
+      "command": "GOMAXPROCS=2 go test -race -p=1 -timeout=240s ./pkg/replay",
+      "exit_code": 0
+    },
+    {
+      "command": "GOMAXPROCS=2 go vet -p=1 ./pkg/accountsdb ./pkg/global ./pkg/alpenglow ./pkg/harmonic ./pkg/statsd ./pkg/blockprod ./pkg/replay ./cmd/mithril/node",
+      "exit_code": 0
+    },
+    {
+      "command": "GOMAXPROCS=2 go build -p=1 -o /tmp/mithril-pr351-review-validation ./cmd/mithril",
+      "exit_code": 0
+    },
+    {
+      "command": "git diff --check",
+      "exit_code": 0
+    }
+  ],
+  "source_sha256": {
+    "pkg/accountsdb/accountsdb.go": "e177fef98e58eb0c525c827aced7e3b9f13119cba8233e336c8f8923fd49cdb7",
+    "pkg/accountsdb/compact.go": "fb4f3e282b5817aa90dafcc2e17a670beeac2e7276a20b78c5ca672d8a9ca812",
+    "pkg/accountsdb/sparse_compact.go": "69b58bfeac2b5e144aae07728b84a332770c324018878eaf070095ad03149e05",
+    "pkg/alpenglow/receiver.go": "dc9165190624ccd3e75b99ed1b400b17c939c5d6a9457c8de5e63d07b7238ee5",
+    "pkg/blockprod/bank.go": "465ec4a1889f9589a7e3c7333281a9bb5857ebd463e808d2b868b8fa14639a99",
+    "pkg/blockprod/bank_freeze_drain_test.go": "517e4e29384b2ae30399c1f18fa3c9c9208850be3b74e432cc7233f970800889",
+    "pkg/blockprod/leader.go": "c3a0a60fed11007e97144b79366988cb2e6bab48cd0655fff4333c17ebeb1857",
+    "pkg/blockprod/leader_reward_pipeline_test.go": "e8ae467e9e28545221b214b932b6d31126c334d6b7fe5351489afee9fd14abe5",
+    "pkg/global/global_ctx.go": "3fd435264eae61715241c803b20bcebb175de2d604c0e4d8eeeb93b1c95f7ec4",
+    "pkg/harmonic/blockengine.go": "abd9d18ac02abbd34eefe084e2a657573cb9f83878d7a9307cab7ab6ad09265e",
+    "pkg/statsd/statsd.go": "b9cf0dc133852af2af79a3d6731cd5414b06fe1f71c4fd193c72f9050f800a36",
+    "pkg/accountsdb/sparse_compatibility_test.go": "6cf4f2b57b3510f8eb08c2f0a8b36a27e64d2cbc014b9794d389fe6aa0d6aca6",
+    "pkg/blockprod/leader_completion_metrics_test.go": "b35501c26dd598e24a7c33beea1564b05d7c4376302e8181e0ddbbd4412151f6",
+    "pkg/global/stake_index_flush_test.go": "06a831c543eaf41fa5ed43ad1c943dce9f83ac0e860e39e544d8204f150755d0",
+    "pkg/replay/parent_account_lock_benchmark_test.go": "2343996ed8ee30d13ad50d89ecd958cfc3015f611ae589374fd2b80382afaad9",
+    "pkg/statsd/leader_completion_test.go": "aa1320bc602769f319c2c87e475d131cdd3ea303dd382a92d991990dbf16b239",
+    "scripts/bench_parent_account_lock.py": "dfe5915c82fb28c91c8cefa9d085419a49bfe69af308a444668e6f33d0515e47"
+  },
+  "build_binary_sha256": "7ec5e9a5db0c8616c01f4bd1ab808e13720099f905a4a59af0c42f2ede8999d1",
+  "standalone_stake_fix": {
+    "branch": "smcio/stake-index-durable-fold",
+    "commit": "1df45ec2",
+    "base": "a8beea31",
+    "worktree": "/root/mithril-stake-index-review",
+    "focused_race_tests": "passed",
+    "full_race_tests": "passed: GOMAXPROCS=2 go test -race -p=1 -timeout=240s ./pkg/global ./pkg/replay",
+    "published": false
+  },
+  "github_publication": "Not attempted: authenticated GitHub API credentials unavailable through configured Git helper. Prepared local branch and PR bodies; existing published branch not rewritten.",
+  "remaining_measurement_limits": [
+    "Matched mainnet outer SlotReplay A/B was not possible from the available immutable prestate fixtures; matched synthetic ProcessBlock results include this limitation.",
+    "No cooperative execution cancellation or new synchronous reward fallback; instrumentation and adverse scheduling regression added first.",
+    "CurrentPR branch already contains7f05abfe fork/epoch work; local stake extraction is independent, but remotePRhasnotbeenrestacked."
+  ],
+  "completed_utc": "2026-11-12T12:57:10.173416+00:00"
+}

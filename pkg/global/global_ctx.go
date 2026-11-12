@@ -493,18 +493,41 @@ func FlushPendingStakePubkeys(accountsDbDir string) (int, error) {
 // in RAM (merged into scans) until their own fold or unwind decides them.
 // committed keys come directly from the accepted fold's account deltas. They
 // must be indexed even if speculative bookkeeping discarded a pending hint.
-// Returns the number of entries flushed.
+// Each pubkey is appended once per flush, retaining its latest available
+// location hint from an eligible slot. Returns the number of entries flushed.
 func FlushPendingStakePubkeysThrough(accountsDbDir string, through uint64, committed ...solana.PublicKey) (int, error) {
 	instance.pendingStakeMutex.Lock()
 	var pending []accountsdb.StakeIndexEntry
-	for _, pubkey := range committed {
-		pending = append(pending, accountsdb.StakeIndexEntry{Pubkey: pubkey})
-	}
-	for slot, entries := range instance.pendingStakeBySlot {
-		if slot <= through {
-			pending = append(pending, entries...)
-			delete(instance.pendingStakeBySlot, slot)
+	seen := make(map[solana.PublicKey]int, len(committed))
+	appendEntry := func(entry accountsdb.StakeIndexEntry) {
+		if idx, ok := seen[entry.Pubkey]; ok {
+			// A committed key or later hintless write must not erase a usable
+			// location hint. Hints only affect scan ordering, not account lookup.
+			if entry.FileId != 0 || entry.Offset != 0 {
+				pending[idx] = entry
+			}
+			return
 		}
+		seen[entry.Pubkey] = len(pending)
+		pending = append(pending, entry)
+	}
+	for _, pubkey := range committed {
+		appendEntry(accountsdb.StakeIndexEntry{Pubkey: pubkey})
+	}
+	var slots []uint64
+	for slot := range instance.pendingStakeBySlot {
+		if slot <= through {
+			slots = append(slots, slot)
+		}
+	}
+	// Map iteration order cannot decide which location hint wins. Process
+	// eligible slots oldest first; future slots remain untouched in RAM.
+	slices.Sort(slots)
+	for _, slot := range slots {
+		for _, entry := range instance.pendingStakeBySlot[slot] {
+			appendEntry(entry)
+		}
+		delete(instance.pendingStakeBySlot, slot)
 	}
 	if len(pending) == 0 {
 		instance.pendingStakeMutex.Unlock()

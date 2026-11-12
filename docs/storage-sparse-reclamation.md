@@ -33,6 +33,15 @@ continue compaction of the converted store. Their compaction pin validation
 rejects the new kind. Do not remove the markers or rebuild an index by scanning
 these sparse files as ordinary appendvecs.
 
+Compaction logs this compatibility requirement once per opened AccountsDB: after
+the first successful durable sparse marker publication, or when its first scan
+finds an existing kind-3 manifest. A failed marker write does not announce a
+conversion. Disabling compaction afterwards does not restore the old format.
+For rollback to a binary without kind-3 support, keep an independent
+pre-conversion store copy or rebuild a compatible store from a snapshot. Use
+independent copies for A/B runs across the format change; do not alternate old
+and new binaries over the converted accounts directory.
+
 Validation includes a small-account regression that fails with the old
 implementation, WAL-on/off recovery after the marker and after partial hole
 punching, unchanged index locations, cold reads, rewind, reader exclusion,

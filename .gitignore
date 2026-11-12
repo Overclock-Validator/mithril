@@ -49,3 +49,6 @@ docs/snapshot-integration-handoff*.txt
 # Claude Code settings
 .claude/
 .direnv
+
+# Local investigation artifacts and PR drafts; published evidence lives in docs/results.
+/preparation/

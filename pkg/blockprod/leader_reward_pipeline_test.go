@@ -10,6 +10,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/replay"
 	"github.com/Overclock-Validator/mithril/pkg/rewardcerts"
+	"github.com/Overclock-Validator/mithril/pkg/statsd"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/txfixture"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/require"
@@ -134,6 +135,9 @@ func TestLeaderFooterCompletesWhileRewardBuilderBlocked(t *testing.T) {
 			return nil
 		})
 	loop.rewardCerts = pipeline
+	missingMetric := statsd.BlockProductionRewardPreparation.String()
+	missingLabels := map[string]string{"status": "missing"}
+	missingBefore := prometheusCounterValue(t, missingMetric, missingLabels)
 	finished := make(chan struct{})
 	go func() { loop.finishActiveSlotLocked(); close(finished) }()
 	select {
@@ -146,6 +150,7 @@ func TestLeaderFooterCompletesWhileRewardBuilderBlocked(t *testing.T) {
 	require.True(t, *delivered)
 	require.Greater(t, broadcaster.count(), 0)
 	require.Nil(t, loop.activeBank)
+	require.Equal(t, missingBefore+1, prometheusCounterValue(t, missingMetric, missingLabels))
 	release.Do(func() { close(builder.release) })
 	pipeline.Close()
 	require.Empty(t, pipeline.BuildForLeaderSlot(slot).Skip)

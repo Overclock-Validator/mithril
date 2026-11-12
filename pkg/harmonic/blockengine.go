@@ -296,6 +296,8 @@ func (b *BlockEngineSession) setLive(update func(*sessionLiveness)) {
 
 func (b *BlockEngineSession) updateHealth() {
 	b.mu.Lock()
+	// SubscribeBundles2 establishes Harmonic's upstream Jito authentication;
+	// a valid gRPC auth token alone does not make this session ready for supply.
 	healthy := b.live.authenticated && b.live.bundles && b.live.packets && b.live.blocks && b.fee != nil
 	changed := healthy != b.healthy
 	b.healthy = healthy
@@ -336,9 +338,9 @@ func (b *BlockEngineSession) runSession(ctx context.Context) error {
 	if err := b.refreshFeeInfo(ctx, client); err != nil {
 		return err
 	}
-	// Match the reference client's subscriptions without adding another
-	// execution source. Bundle responses are consumed only to keep the stream
-	// flowing; ordered execution still comes exclusively from SubscribeBlocks2.
+	// Harmonic establishes upstream Jito authentication through SubscribeBundles2,
+	// so this subscription is required even though we discard its messages.
+	// Keep it flowing; ordered execution comes exclusively from SubscribeBlocks2.
 	bundles, err := client.SubscribeBundles2(ctx, &blockenginepb.SubscribeBundlesRequest{})
 	if err == nil {
 		err = awaitHeaders(bundles)
@@ -464,9 +466,10 @@ func (b *BlockEngineSession) readPackets(stream blockenginepb.BlockEngineValidat
 	}
 }
 
-// drainBundles counts and discards compatibility-stream messages. In
+// drainBundles counts and discards the authentication subscription's messages. In
 // particular, none of their packets enter the TPU or ordered block pipeline.
-// Ending this stream resets the session, matching the reference client.
+// Losing this subscription invalidates upstream Jito authentication, so ending
+// the stream resets the session, matching the reference client.
 func (b *BlockEngineSession) drainBundles(stream blockenginepb.BlockEngineValidator_SubscribeBundles2Client) error {
 	for {
 		msg, err := stream.Recv()

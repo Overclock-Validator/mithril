@@ -3,6 +3,7 @@ package blockprod
 import (
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/arena"
@@ -580,17 +581,27 @@ func (b *WorkingBank) FlushEntries() {
 // bank lock, so every accepted transaction is included before the footer
 // bank hash is computed. Last-in-slot is marked on the ending tick, not here.
 func (b *WorkingBank) Freeze() {
+	b.freezeAndMeasureExecutionWait()
+}
+
+// freezeAndMeasureExecutionWait returns only the time spent joining scratch
+// execution. Admission locking and entry flushing belong to the wider Freeze
+// phase; neither the scheduler's drain deadline nor its lag bounds this wait.
+func (b *WorkingBank) freezeAndMeasureExecutionWait() time.Duration {
 	b.mu.Lock()
 	b.accepting = false
 	b.mu.Unlock()
 	// A capped Harmonic hold can leave a scratch transaction executing. Its
 	// uncommitted writes will be discarded, but its reads must finish before
 	// the finalizer mutates the bank's fees, sysvars and hash state.
+	waitStartedAt := time.Now()
 	b.executing.Wait()
+	executionWait := time.Since(waitStartedAt)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.entries.dropReservation()
 	b.flushEntriesLocked()
+	return executionWait
 }
 
 // Close stops transaction admission without emitting pending entries. It is

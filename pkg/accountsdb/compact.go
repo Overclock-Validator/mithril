@@ -441,6 +441,9 @@ func (db *AccountsDb) compactionPinSet(headSeq, horizon uint64, inv *compactionI
 			(hdr.Kind == ManifestKindFold && hdr.BatchSeq == 0) {
 			return nil, nil, fmt.Errorf("cannot establish rewind pins: invalid manifest header %s", name)
 		}
+		if hdr.Kind == ManifestKindSparse {
+			db.warnSparseCompatibilityLocked(hdr.FileId)
+		}
 		if !parked {
 			manifestByFileId[hdr.FileId] = hdr
 		}

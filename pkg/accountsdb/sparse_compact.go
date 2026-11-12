@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+
+	"github.com/Overclock-Validator/mithril/pkg/mlog"
 )
 
 const sparseCompactionMinSize = int64(8 << 20)
@@ -130,6 +132,9 @@ func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte,
 			return 0, scanned, false, err
 		}
 	}
+	// Publication is durable before either this notice or any hole punching.
+	// A failed marker write must not announce a successful format conversion.
+	db.warnSparseCompatibilityLocked(m.FileId)
 	if db.compactHooks.afterSparseMarker != nil {
 		db.compactHooks.afterSparseMarker()
 	}
@@ -156,10 +161,23 @@ func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte,
 	return max(int64(0), before-after), scanned, false, nil
 }
 
+// warnSparseCompatibilityLocked also runs when compaction first encounters an
+// existing kind-3 store. Caller holds foldMu; no additional persistent marker is
+// needed, and repeated compaction cycles must not flood the operator's log.
+func (db *AccountsDb) warnSparseCompatibilityLocked(fileID uint64) {
+	if db.sparseCompatibilityWarned {
+		return
+	}
+	db.sparseCompatibilityWarned = true
+	mlog.Log.Warnf("accountsdb: %s uses sparse manifests (kind 3, file %d); older binaries cannot compact this store. Disabling compaction does not restore the old format; use a kind-3-capable binary or restore a pre-conversion copy for rollback. See docs/storage-sparse-reclamation.md", db.AcctsDir, fileID)
+	fire(db.compactHooks.afterSparseCompatibilityWarning)
+}
+
 type compactionTestHooks struct {
-	afterCompactManifest func()
-	afterCompactIndex    func()
-	afterHistoryFloor    func()
-	afterSparseMarker    func()
-	afterSparsePunch     func()
+	afterCompactManifest            func()
+	afterCompactIndex               func()
+	afterHistoryFloor               func()
+	afterSparseMarker               func()
+	afterSparsePunch                func()
+	afterSparseCompatibilityWarning func()
 }

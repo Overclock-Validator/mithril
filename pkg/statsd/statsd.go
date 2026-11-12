@@ -120,6 +120,11 @@ var (
 	BlockProductionStartDecisionTickDeliveryLag = Metric{"block_production_start_decision_tick_delivery_lag_seconds"}
 	BlockProductionStartDecisionTickWork        = Metric{"block_production_start_decision_tick_work_seconds"}
 	BlockProductionStartAttempt                 = Metric{"block_production_start_attempt_seconds"}
+	BlockProductionCompletion                   = Metric{"block_production_completion_duration_seconds"}
+	BlockProductionDeadlineMargin               = Metric{"block_production_deadline_margin_seconds"}
+	BlockProductionDeadlineMisses               = Metric{"block_production_deadline_misses_total"}
+	BlockProductionExecutionQuiescence          = Metric{"block_production_execution_quiescence_duration_seconds"}
+	BlockProductionRewardPreparation            = Metric{"block_production_reward_preparation_total"}
 	TurbineShredCollection                      = Metric{"turbine_shred_collection_duration_seconds"}
 	TurbineBlockCompletionQueueDelay            = Metric{"turbine_block_completion_queue_delay_seconds"}
 	TurbineBlockDecode                          = Metric{"turbine_block_decode_duration_seconds"}
@@ -287,6 +292,11 @@ var MetricToType = map[Metric]metricType{
 	BlockProductionStartDecisionTickDeliveryLag: TimingT,
 	BlockProductionStartDecisionTickWork:        TimingT,
 	BlockProductionStartAttempt:                 TimingT,
+	BlockProductionCompletion:                   TimingT,
+	BlockProductionDeadlineMargin:               TimingT,
+	BlockProductionDeadlineMisses:               CountT,
+	BlockProductionExecutionQuiescence:          TimingT,
+	BlockProductionRewardPreparation:            CountT,
 	TurbineShredCollection:                      TimingT,
 	TurbineBlockCompletionQueueDelay:            TimingT,
 	TurbineBlockDecode:                          TimingT,
@@ -433,6 +443,11 @@ var MetricToLabels = map[Metric][]string{
 	BlockProductionStartDecisionTickDeliveryLag: {"outcome"},
 	BlockProductionStartDecisionTickWork:        {"outcome"},
 	BlockProductionStartAttempt:                 {"result"},
+	BlockProductionCompletion:                   {},
+	BlockProductionDeadlineMargin:               {},
+	BlockProductionDeadlineMisses:               {},
+	BlockProductionExecutionQuiescence:          {},
+	BlockProductionRewardPreparation:            {"status"},
 	TurbineShredCollection:                      {},
 	TurbineBlockCompletionQueueDelay:            {},
 	TurbineBlockDecode:                          {},
@@ -492,6 +507,24 @@ var blockProductionDurationBuckets = []float64{
 	0.100, 0.125, 0.150, 0.200, 0.400, 0.800, 1.600, 3.200,
 }
 
+// Completion is normally only a few milliseconds; retain resolution around
+// the configurable 15ms reserve and enough range to expose long-tail stalls.
+var blockProductionCompletionBuckets = []float64{
+	0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.0025, 0.005,
+	0.0075, 0.010, 0.0125, 0.015, 0.020, 0.025, 0.050, 0.100,
+	0.200, 0.400, 0.800, 1.600, 3.200,
+}
+
+// Margin is protocol deadline minus network completion: negative means late.
+// Its signed sum can decrease; use bucket/count rates for quantiles rather
+// than treating rate(..._sum) as a counter of elapsed time.
+var blockProductionMarginBuckets = []float64{
+	-0.800, -0.400, -0.200, -0.100, -0.050, -0.025, -0.020,
+	-0.015, -0.010, -0.005, -0.0025, -0.001, 0,
+	0.001, 0.0025, 0.005, 0.0075, 0.010, 0.0125, 0.015,
+	0.020, 0.025, 0.050, 0.100, 0.200, 0.400, 0.800,
+}
+
 var turbinePipelineDurationBuckets = []float64{
 	0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005,
 	0.010, 0.025, 0.050, 0.100, 0.200, 0.400, 0.800, 1.600,
@@ -507,6 +540,9 @@ var MetricToBuckets = map[Metric][]float64{
 	BlockProductionStartDecisionTickDeliveryLag: blockProductionDurationBuckets,
 	BlockProductionStartDecisionTickWork:        blockProductionDurationBuckets,
 	BlockProductionStartAttempt:                 blockProductionDurationBuckets,
+	BlockProductionCompletion:                   blockProductionCompletionBuckets,
+	BlockProductionDeadlineMargin:               blockProductionMarginBuckets,
+	BlockProductionExecutionQuiescence:          blockProductionCompletionBuckets,
 	TurbineShredCollection:                      turbinePipelineDurationBuckets,
 	TurbineBlockCompletionQueueDelay:            turbinePipelineDurationBuckets,
 	TurbineBlockDecode:                          turbinePipelineDurationBuckets,
@@ -637,6 +673,21 @@ func Duration(m Metric, duration time.Duration, labels []string) error {
 	if duration < 0 {
 		return fmt.Errorf("duration metric %s cannot observe negative duration %s", m, duration)
 	}
+	return observeDuration(m, duration, labels)
+}
+
+// SignedDuration records signed seconds for a histogram whose explicit buckets
+// include negative values, such as a deadline margin. Ordinary durations retain
+// Duration's rejection of negative values. Signed sums are not monotonic.
+func SignedDuration(m Metric, duration time.Duration, labels []string) error {
+	buckets := MetricToBuckets[m]
+	if len(buckets) == 0 || buckets[0] >= 0 {
+		return fmt.Errorf("metric %s is not registered for signed duration observations", m)
+	}
+	return observeDuration(m, duration, labels)
+}
+
+func observeDuration(m Metric, duration time.Duration, labels []string) error {
 	metricType, registered := MetricToType[m]
 	if !registered {
 		return fmt.Errorf("duration metric %s is not registered", m)
