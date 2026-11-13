@@ -225,15 +225,20 @@ func (w *workAhead) predictFailure(prerequisite, tx int) bool {
 
 // MITHRIL_WORK_AHEAD_UNCHANGED=1: a predecessor not predicted to fail may also
 // be overtaken when history says its program combination leaves every account
-// the transaction uses unchanged when it succeeds, and its fee payer is not one
-// of them. Successful commits teach the table (learnUnchanged): an account not
-// written is unchanged; a written one is compared with the shared version it had
-// before its first write. Implies MITHRIL_WORK_AHEAD_VALUE_CHECK, since such a
-// predecessor stores new versions of accounts it leaves unchanged.
+// the transaction uses alone when it succeeds, and its fee payer is not one of
+// them. This only widens what is offered early. Adoption is unchanged: the
+// read-set check at the turn.
+//
+// What "alone" means follows the check that will judge the result, so the
+// history predicts what can actually be adopted (learnUnchanged):
+//   - by default (version check only): the predecessor never borrowed the
+//     account for writing, so its commit installs no new version of it;
+//   - with MITHRIL_WORK_AHEAD_VALUE_CHECK=1 as well: also an account it wrote
+//     back with the content it had before its first write.
 var workAheadUnchanged = os.Getenv("MITHRIL_WORK_AHEAD_UNCHANGED") == "1"
 
 func init() {
-	if workAheadUnchanged {
+	if workAheadUnchanged && workAheadValueCheck {
 		sealevel.RecordWriteOriginals = true
 	}
 }
@@ -297,14 +302,15 @@ func predictsUnchanged(k unchangedKey) bool {
 }
 
 // learnUnchanged records, at a successful commit, which of the transaction's
-// writable accounts other than the fee payer it left unchanged.
+// writable accounts other than the fee payer it left alone: not borrowed for
+// writing, or, with the value check on, written back unchanged.
 func learnUnchanged(execCtx *sealevel.ExecutionCtx) {
 	txCtx := execCtx.TransactionContext
 	if txCtx == nil {
 		return
 	}
 	accts := &txCtx.Accounts
-	if accts.Originals == nil {
+	if workAheadValueCheck && accts.Originals == nil {
 		return
 	}
 	ids := make([]solana.PublicKey, 0, len(txCtx.AllInstructions))
@@ -316,11 +322,16 @@ func learnUnchanged(execCtx *sealevel.ExecutionCtx) {
 		if idx >= len(accts.AcctMetas) || accts.AcctMetas[idx] == nil || !accts.AcctMetas[idx].IsWritable {
 			continue
 		}
+		if idx >= len(accts.Touched) {
+			continue
+		}
 		var unchanged bool
 		switch {
 		case !accts.Touched[idx]:
 			unchanged = true
-		case accts.Originals[idx] != nil:
+		case !workAheadValueCheck:
+			unchanged = false // its commit installs a new version, whatever the content
+		case idx < len(accts.Originals) && accts.Originals[idx] != nil:
 			unchanged = specSameAccount(accts.Originals[idx], accts.Accounts[idx])
 		default:
 			continue // not shared when loaded: no earlier version to compare

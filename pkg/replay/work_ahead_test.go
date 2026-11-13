@@ -947,13 +947,64 @@ func TestWorkAheadValueCheck(t *testing.T) {
 	}
 }
 
+// resetUnchangedStats empties the process-wide unchanged table, so a test's
+// history does not depend on earlier tests or repeated runs.
+func resetUnchangedStats() {
+	for i := range unchangedStats {
+		unchangedStats[i].mu.Lock()
+		unchangedStats[i].stats = nil
+		unchangedStats[i].mu.Unlock()
+	}
+}
+
+// Without the value check the unchanged table learns only what the version
+// check can adopt: an account the transaction never borrowed for writing. One
+// it wrote back with identical content counts as changed, because its commit
+// installs a new version. No write originals are needed.
+func TestWorkAheadUnchangedLearningVersionOnly(t *testing.T) {
+	saved, savedValue := workAheadUnchanged, workAheadValueCheck
+	defer func() { workAheadUnchanged, workAheadValueCheck = saved, savedValue }()
+	workAheadUnchanged, workAheadValueCheck = true, false
+	resetUnchangedStats()
+	program, payer, untouched, rewritten := testPk(0x81), testPk(0x82), testPk(0x83), testPk(0x84)
+	commit := func(touchUntouched bool) {
+		execCtx := &sealevel.ExecutionCtx{TransactionContext: &sealevel.TransactionCtx{
+			AllInstructions: []sealevel.Instruction{{ProgramId: program}},
+			Accounts: sealevel.TransactionAccounts{
+				Accounts:  []*accounts.Account{{Key: payer, Lamports: 1}, {Key: untouched, Lamports: 5}, {Key: rewritten, Lamports: 7}},
+				Touched:   []bool{true, touchUntouched, true},
+				AcctMetas: []*sealevel.AccountMeta{{Pubkey: payer, IsWritable: true}, {Pubkey: untouched, IsWritable: true}, {Pubkey: rewritten, IsWritable: true}},
+			},
+		}}
+		learnUnchanged(execCtx)
+	}
+	for range 3 {
+		commit(false)
+	}
+	key := programKeyOf([]solana.PublicKey{program})
+	if !predictsUnchanged(unchangedKey{key, [32]byte(untouched)}) {
+		t.Fatal("an account never borrowed for writing is predicted unchanged")
+	}
+	if predictsUnchanged(unchangedKey{key, [32]byte(rewritten)}) {
+		t.Fatal("an account written back, even identically, is not predicted unchanged without the value check")
+	}
+	if predictsUnchanged(unchangedKey{key, [32]byte(payer)}) {
+		t.Fatal("the fee payer is not learned")
+	}
+	commit(true)
+	if predictsUnchanged(unchangedKey{key, [32]byte(untouched)}) {
+		t.Fatal("a commit that borrowed the account for writing stops the prediction")
+	}
+}
+
 // Commits teach the unchanged table: an untouched writable account, or a written
 // one equal to its version before the write, is unchanged; the payer is skipped.
 // Overtaking needs every shared account predicted unchanged and the payer not shared.
 func TestWorkAheadUnchangedLearning(t *testing.T) {
-	saved := workAheadUnchanged
-	defer func() { workAheadUnchanged = saved }()
-	workAheadUnchanged = true
+	saved, savedValue := workAheadUnchanged, workAheadValueCheck
+	defer func() { workAheadUnchanged, workAheadValueCheck = saved, savedValue }()
+	workAheadUnchanged, workAheadValueCheck = true, true
+	resetUnchangedStats()
 	program, payer, config, pool := testPk(0x71), testPk(0x72), testPk(0x73), testPk(0x74)
 	original := &accounts.Account{Key: config, Lamports: 5, Data: []byte{9}}
 	commit := func(poolChanged bool) {

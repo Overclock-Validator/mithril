@@ -106,7 +106,9 @@ var (
 	// execution read, provided no version changed while it ran (so what it read
 	// is what was captured). A store that leaves an account unchanged installs a
 	// new version, so this adopts results the version check alone discards.
-	workAheadValueCheck = os.Getenv("MITHRIL_WORK_AHEAD_VALUE_CHECK") == "1" || os.Getenv("MITHRIL_WORK_AHEAD_UNCHANGED") == "1"
+	// Off by default, and not implied by any other setting: without it every
+	// adoption rests on the version check alone.
+	workAheadValueCheck = os.Getenv("MITHRIL_WORK_AHEAD_VALUE_CHECK") == "1"
 	// MITHRIL_WORK_AHEAD_WASTE_BUDGET_KCU (default 48000, one block's worth of
 	// compute; 0 = unlimited) is a hard bound, in compute units, on a block's
 	// discarded early executions. Each launch first reserves the transaction's
