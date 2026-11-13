@@ -10,7 +10,11 @@ import (
 
 const LightbringerQuietDefault = true
 
+// MetricsBindAddrDefault preserves the historical Prometheus listener.
+const MetricsBindAddrDefault = ":9090"
+
 func ApplyDefaults(v *viper.Viper) {
+	v.SetDefault("metrics.bind_addr", MetricsBindAddrDefault)
 	v.SetDefault("lightbringer.quiet", LightbringerQuietDefault)
 	// network.cluster and block.source default in the run command itself
 	// (mainnet, turbine), NOT here, because the lightbringer auto-switch needs
@@ -45,6 +49,11 @@ type LedgerConfig struct {
 type RpcConfig struct {
 	Rpc  []string `toml:"rpc" mapstructure:"rpc"`   // List of RPC endpoints
 	Port int      `toml:"port" mapstructure:"port"` // was: rpc-server-port
+}
+
+// MetricsConfig controls the Prometheus HTTP listener, independently of RPC and pprof.
+type MetricsConfig struct {
+	BindAddr string `toml:"bind_addr" mapstructure:"bind_addr"`
 }
 
 // ReplayConfig holds replay-related configuration
@@ -256,6 +265,7 @@ type Config struct {
 
 	// Sections
 	Ledger       LedgerConfig       `toml:"ledger" mapstructure:"ledger"`
+	Metrics      MetricsConfig      `toml:"metrics" mapstructure:"metrics"`
 	Rpc          RpcConfig          `toml:"rpc" mapstructure:"rpc"`
 	Replay       ReplayConfig       `toml:"replay" mapstructure:"replay"`
 	Block        BlockConfig        `toml:"block" mapstructure:"block"`
