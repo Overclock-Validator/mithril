@@ -1,12 +1,18 @@
 # Optional external-cluster collector
 
-This one-shot command reads fixed public Alpenglow Community Cluster providers
-and atomically writes a typed cache. It does not start a server or install a
-service. It does not read keys, node configuration, or a local validator feed.
+This one-shot command reads public cluster data and atomically writes a typed
+cache. It does not start a server, install a service, or read node keys or
+configuration.
 
 ```sh
 go run ./cmd/mithril-dashboard-collect --profile alpenglow --output /existing/private-directory/cluster.json
 ```
+
+For Solana mainnet-beta, use `--profile mainnet` for the Solana public RPC or
+`--profile mainnet-publicnode` for the PublicNode RPC. Both profiles check the
+mainnet genesis and epoch before and after capture. Mainnet directory rows come
+from vote accounts; version and country information comes from matching gossip
+contacts when available. FAST, inclusion and skip-rate data are unavailable.
 
 Add `--performance-sample` for one recent RPC sample, or
 `--performance-history` for up to 120 samples.
@@ -17,20 +23,20 @@ may invoke the command periodically (for example once per minute). Do not run it
 per viewer request or give the network-denied reader outbound access. There is
 no arbitrary endpoint flag. An existing destination symlink is refused.
 
-Exit 0 means every supported provider was fresh. Exit 1 may mean a valid degraded
-snapshot was written; inspect provider states/reasons and timestamps. An invalid
-profile, output failure, or internal validation failure does not replace the old
-file. Readers must mark that old file stale rather than treating its presence as
-freshness.
+For the community profile, exit 0 means every supported provider was fresh. For
+mainnet, it means the RPC capture was fresh; inspect the GeoIP state separately.
+Exit 1 may mean a valid degraded snapshot was written; inspect provider states,
+reasons and timestamps. An invalid profile, output failure, or internal validation
+failure does not replace the old file. Readers must mark that old file stale
+rather than treating its presence as freshness.
 
-The profile is fixed to genesis
-`9mi4SxvrMwaErcAN9r8wAAsX8YTKedGNogzQCuhTZ7Nz`, not mainnet or a private preview.
-RPC genesis and epoch are checked before and after capture. Vote identities come
-from that RPC's current vote-account response. Provider names and versions are
-untrusted public metadata, not operator identity verification.
+The community profile uses a fixed cluster genesis. RPC genesis and epoch are
+checked before and after capture. Provider names and versions are untrusted
+public metadata, not operator identity verification.
 
-SolStat supplies directory/credit-efficiency observations; Titan supplies
-certificate inclusion over its recorded observation windows. Inclusion is not
+For the community profile, SolStat supplies directory/credit-efficiency
+observations; Titan supplies certificate inclusion over its recorded observation
+windows. Inclusion is not
 FAST, payment, stake-weighted performance, or complete chain coverage. The rank
 is a derived competition rank: exact inclusion ratio, then opportunities,
 descending; exact ties share rank. Zero opportunities have no score or rank.

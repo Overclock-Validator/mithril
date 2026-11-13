@@ -35,6 +35,7 @@ type collector struct {
 	http               *http.Client
 	log                *slog.Logger
 	runID              string
+	rpcURL             string
 	now                func() time.Time
 	performanceSamples bool
 	performanceHistory bool
@@ -148,7 +149,7 @@ func CollectWithPerformanceHistory(ctx context.Context, profile string) (Snapsho
 }
 
 func collectProfile(ctx context.Context, profile string, performance, history bool) (Snapshot, error) {
-	if profile != "alpenglow" {
+	if profile != "alpenglow" && profile != "mainnet" && profile != "mainnet-publicnode" {
 		return Snapshot{}, errors.New("unsupported cluster profile")
 	}
 	var id [16]byte
@@ -162,8 +163,17 @@ func collectProfile(ctx context.Context, profile string, performance, history bo
 		http: &http.Client{Transport: transport, Timeout: 18 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirect denied") }},
 		log:  slog.Default().With("entry_point", "collector", "run_id", runID), runID: runID, now: func() time.Time { return time.Now().UTC() }, performanceSamples: performance, performanceHistory: history,
 	}
+	if profile == "mainnet" || profile == "mainnet-publicnode" {
+		c.rpcURL = mainnetSourceURLs["rpc"]
+		if profile == "mainnet-publicnode" {
+			c.rpcURL = mainnetPublicRPC
+		}
+	}
 	ctx, cancel := context.WithTimeout(ctx, 55*time.Second)
 	defer cancel()
+	if profile == "mainnet" || profile == "mainnet-publicnode" {
+		return c.collectMainnet(ctx)
+	}
 	return c.collect(ctx)
 }
 
@@ -500,7 +510,11 @@ func (c *collector) rpc(ctx context.Context, method string, out any, params ...a
 	if err != nil {
 		return err
 	}
-	res, err := c.request(ctx, "rpc", http.MethodPost, sourceURLs["rpc"], body)
+	url := c.rpcURL
+	if url == "" {
+		url = sourceURLs["rpc"]
+	}
+	res, err := c.request(ctx, "rpc", http.MethodPost, url, body)
 	if err != nil {
 		return err
 	}
