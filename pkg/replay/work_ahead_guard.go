@@ -72,8 +72,9 @@ func (e *SpeculationFooterMismatch) Unwrap() error { return e.Err }
 // workAheadUncheckedBlock: a block ran early executions but carries no footer
 // bank hash, so nothing would check what they produced.
 type workAheadUncheckedBlock struct {
-	Slot     uint64
-	Computed []byte // the bank hash computed with early executions
+	Slot      uint64
+	Blockhash [32]byte // which block it was: nothing else identifies a block without a footer hash
+	Computed  []byte   // the bank hash computed with early executions
 }
 
 func (e *workAheadUncheckedBlock) Error() string {
@@ -81,17 +82,25 @@ func (e *workAheadUncheckedBlock) Error() string {
 }
 
 // workAheadRequireFooterHash refuses a block that ran early executions unless
-// it has a footer bank hash, which verifyFooterBankHash has then already
-// compared with the computed one. The hash arrives with the block's last
-// shreds, after early executions may have run, so this cannot be decided
-// before execution; it is decided here, where footer verification is, before
-// any store of the bank. The refusal goes through the footer shutoff:
-// work-ahead off, and the slot replayed without it.
+// it has a footer bank hash equal to the computed one. The hash arrives with
+// the block's last shreds, after early executions may have run, so this cannot
+// be decided before execution; it is decided here, next to footer verification
+// and before any store of the bank. It compares the hashes itself rather than
+// rely on that verification having run: whichever mode replays the block, an
+// early execution is never accepted on a hash that was not compared. The
+// refusal goes through the footer shutoff: work-ahead off, and the slot
+// replayed without it.
 func workAheadRequireFooterHash(block *b.Block, computed []byte) error {
-	if block == nil || block.HasExpectedBankhash || !workAheadRanAt(block.Slot) {
+	if block == nil || !workAheadRanAt(block.Slot) {
 		return nil
 	}
-	return &workAheadUncheckedBlock{Slot: block.Slot, Computed: append([]byte(nil), computed...)}
+	if !block.HasExpectedBankhash {
+		return &workAheadUncheckedBlock{Slot: block.Slot, Blockhash: block.Blockhash, Computed: append([]byte(nil), computed...)}
+	}
+	if !bytes.Equal(block.ExpectedBankhash[:], computed) {
+		return &FooterBankhashMismatch{Slot: block.Slot, Footer: block.ExpectedBankhash, Computed: append([]byte(nil), computed...)}
+	}
+	return nil
 }
 
 // workAheadSuspect is the attempt that tripped the shutoff: the slot, the bank
@@ -105,6 +114,7 @@ var workAheadSuspect struct {
 	computed  []byte
 	footer    [32]byte
 	hasFooter bool
+	blockhash [32]byte // of a block without a footer hash
 }
 
 // WorkAheadVerdict says what the replay without early executions showed about
@@ -159,12 +169,20 @@ func workAheadReplayVerdict(block *b.Block, computed []byte, footerErr error) er
 	}
 	first := workAheadSuspect.computed
 	firstFooter, firstHasFooter := workAheadSuspect.footer, workAheadSuspect.hasFooter
+	firstBlockhash := workAheadSuspect.blockhash
 	workAheadSuspect.set = false
 	workAheadSuspect.computed = nil
 	workAheadSuspect.mu.Unlock()
 
 	same := bytes.Equal(first, computed)
-	sameBlock := firstHasFooter == block.HasExpectedBankhash && (!firstHasFooter || firstFooter == block.ExpectedBankhash)
+	// The same block: the same footer hash, or, for two blocks without one,
+	// the same blockhash (the last entry hash, which fixes the entries).
+	sameBlock := firstHasFooter == block.HasExpectedBankhash
+	if sameBlock && firstHasFooter {
+		sameBlock = firstFooter == block.ExpectedBankhash
+	} else if sameBlock {
+		sameBlock = firstBlockhash == block.Blockhash
+	}
 	footer := "none"
 	if block.HasExpectedBankhash {
 		footer = base58.Encode(block.ExpectedBankhash[:])
@@ -175,7 +193,7 @@ func workAheadReplayVerdict(block *b.Block, computed []byte, footerErr error) er
 	switch {
 	case !sameBlock:
 		verdict = WorkAheadVerdictInconclusive
-		explain = "the block replayed at this slot is not the one the first attempt executed (its footer bank hash differs), so the two attempts cannot be compared"
+		explain = "the block replayed at this slot is not the one the first attempt executed (its footer bank hash, or without one its blockhash, differs), so the two attempts cannot be compared"
 	case !firstHasFooter && same:
 		verdict = WorkAheadVerdictConsistentUnchecked
 		explain = "the block has no footer bank hash; both attempts computed the same bank hash, so nothing points at speculation, and nothing confirms the hash either"
@@ -236,6 +254,7 @@ func workAheadFooterShutoff(err error) error {
 		} else {
 			workAheadSuspect.computed = append([]byte(nil), unchecked.Computed...)
 			workAheadSuspect.footer, workAheadSuspect.hasFooter = [32]byte{}, false
+			workAheadSuspect.blockhash = unchecked.Blockhash
 		}
 		workAheadSuspect.mu.Unlock()
 		mlog.Log.Errorf("WORK-AHEAD SHUTOFF: footer bank hash check failed or missing at slot %d, a block with early executions; work-ahead is off for the rest of this process and the slot re-replays from the rooted checkpoint: %v", slot, err)

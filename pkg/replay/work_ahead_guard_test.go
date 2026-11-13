@@ -62,8 +62,18 @@ func TestWorkAheadRequiresFooterHash(t *testing.T) {
 	if err := workAheadRequireFooterHash(&b.Block{Slot: 301}, nil); err != nil {
 		t.Fatalf("a block without early executions needs no footer hash here: %v", err)
 	}
-	if err := workAheadRequireFooterHash(&b.Block{Slot: 300, HasExpectedBankhash: true}, nil); err != nil {
-		t.Fatalf("a block with a footer hash passes: %v", err)
+	hash := [32]byte{7}
+	if err := workAheadRequireFooterHash(&b.Block{Slot: 300, HasExpectedBankhash: true, ExpectedBankhash: hash}, hash[:]); err != nil {
+		t.Fatalf("a block whose footer hash equals the computed one passes: %v", err)
+	}
+	// The guard compares the hashes itself, so it holds in a mode where footer
+	// verification did not run.
+	var mismatch *FooterBankhashMismatch
+	if err := workAheadRequireFooterHash(&b.Block{Slot: 300, HasExpectedBankhash: true, ExpectedBankhash: hash}, []byte{1}); !errors.As(err, &mismatch) || mismatch.Slot != 300 || mismatch.Footer != hash {
+		t.Fatalf("a footer hash that differs from the computed one must be refused as a mismatch: %v", err)
+	}
+	if err := workAheadRequireFooterHash(&b.Block{Slot: 301, HasExpectedBankhash: true, ExpectedBankhash: hash}, []byte{1}); err != nil {
+		t.Fatalf("a block without early executions is not judged here: %v", err)
 	}
 	if err := workAheadRequireFooterHash(nil, nil); err != nil {
 		t.Fatal("no block, no refusal")
@@ -158,6 +168,12 @@ func TestWorkAheadReplayVerdict(t *testing.T) {
 	}
 	trip(405, withEarly, false)
 	if err := workAheadReplayVerdict(&b.Block{Slot: 405}, third, nil); err != nil || last() != WorkAheadVerdictDifferUnchecked {
+		t.Fatalf("verdict %q, err %v", last(), err)
+	}
+	// no footer hash and another block at the slot (another blockhash): a
+	// different bank hash says nothing about speculation
+	trip(407, withEarly, false)
+	if err := workAheadReplayVerdict(&b.Block{Slot: 407, Blockhash: [32]byte{9}}, third, nil); err != nil || last() != WorkAheadVerdictInconclusive {
 		t.Fatalf("verdict %q, err %v", last(), err)
 	}
 
