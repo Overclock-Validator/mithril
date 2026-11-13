@@ -797,6 +797,24 @@ func (w *workAhead) ran(idx int, e *workAheadEntry, output LoadAndExecuteTransac
 	}
 	w.reservedKCU.Add(held - e.reservedKCU)
 	e.reservedKCU = held
+	// Counted for every execution that ended, whether or not its result is
+	// kept: an abandoned or panicked one that tried to write still tried.
+	wrote := e.view != nil && e.view.Wrote()
+	if wrote {
+		w.stats.sealedWrite.Add(1)
+		sig := "(unsigned)"
+		if tx := w.txs[idx]; tx != nil && len(tx.Signatures) > 0 {
+			sig = tx.Signatures[0].String()
+		}
+		mlog.Log.Errorf("work-ahead execution of tx %s tried to write through its sealed account view; result discarded", sig)
+	}
+	if e.view != nil {
+		// keys read that the captured read set does not name (not a count
+		// difference: a read outside it is one even if a captured key went unread)
+		if extra := e.view.ReadsOutside(e.keys); extra > 0 {
+			w.stats.extraReads.Add(int64(extra))
+		}
+	}
 	if e.abandoned {
 		w.settle(e, true)
 		w.wastedNs.Add(int64(e.ended.Sub(e.began)))
@@ -806,26 +824,13 @@ func (w *workAhead) ran(idx int, e *workAheadEntry, output LoadAndExecuteTransac
 			e.arena = nil
 		}
 	} else {
-		if e.view != nil && e.view.Wrote() {
+		if wrote {
 			// It tried to change account state, or to read it in a way that
 			// cannot be recorded: whatever it returned is not a result.
-			if !panicked {
-				w.stats.sealedWrite.Add(1)
-				sig := "(unsigned)"
-				if tx := w.txs[idx]; tx != nil && len(tx.Signatures) > 0 {
-					sig = tx.Signatures[0].String()
-				}
-				mlog.Log.Errorf("work-ahead execution of tx %s tried to write through its sealed account view; result discarded", sig)
-			}
 			panicked = true
 		}
 		e.output, e.panicked = output, panicked
 		e.uncovered = !panicked && !w.readSetCovers(e)
-		if e.view != nil {
-			if extra := len(e.view.Reads()) - len(e.keys); extra > 0 {
-				w.stats.extraReads.Add(int64(extra))
-			}
-		}
 		e.state = workAheadFinished
 		w.funnel.finished(idx)
 	}

@@ -2,6 +2,7 @@ package accounts
 
 import (
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -134,6 +135,19 @@ func (r *RecordingReader) Reads() []RecordedRead {
 	out := append([]RecordedRead(nil), r.reads...)
 	r.mu.Unlock()
 	return out
+}
+
+// ReadsOutside counts the keys read so far that are not in keys.
+func (r *RecordingReader) ReadsOutside(keys [][32]byte) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	outside := 0
+	for i := range r.reads {
+		if !slices.Contains(keys, r.reads[i].Key) {
+			outside++
+		}
+	}
+	return outside
 }
 
 // Unchanged reports whether every key read so far still has the delta version

@@ -134,3 +134,18 @@ func TestRecordingReaderManyKeys(t *testing.T) {
 }
 
 var _ Accounts = (*RecordingReader)(nil)
+
+// A read outside the given keys is counted even when one of those keys was
+// never read, which a difference of lengths would hide.
+func TestRecordingReaderReadsOutside(t *testing.T) {
+	overlay, inParent, inDelta, absent := recordingFixture(t)
+	r := NewRecordingReader(overlay)
+	captured := [][32]byte{inParent, inDelta}
+	require.Zero(t, r.ReadsOutside(captured))
+	_, _ = r.GetAccount(&inParent)
+	require.Zero(t, r.ReadsOutside(captured))
+	_, _ = r.GetAccount(&absent)
+	require.Equal(t, 1, r.ReadsOutside(captured), "two reads against two captured keys, one of them outside")
+	_, _ = r.GetAccount(&absent)
+	require.Equal(t, 1, r.ReadsOutside(captured), "a key read twice is one read")
+}
