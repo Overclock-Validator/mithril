@@ -16,7 +16,7 @@ import (
 
 // This is the encoded selectNodeDisplay(nil, ...) result. Expiry must not expose
 // an old binding or label, and serving it requires no request-time encoding.
-const nodeDisplayUnavailableBody = `{"schema_version":1,"scope":"linked_node_external_display","run_id":"","identity":null,"genesis_hash":null,"profile":"alpenglow","epoch":null,"state":"unavailable","reason":"waiting_source","name":null,"directory_source":null,"source_at":null,"captured_at":null,"icon_url":null,"icon_state":"not_supplied"}`
+const nodeDisplayUnavailableBody = `{"schema_version":1,"scope":"linked_node_external_display","run_id":"","identity":null,"genesis_hash":null,"profile":"unknown","epoch":null,"state":"unavailable","reason":"waiting_source","name":null,"directory_source":null,"source_at":null,"captured_at":null,"icon_url":null,"icon_state":"not_supplied"}`
 
 type nodeDisplayContext struct {
 	runID, identity, genesis string
@@ -107,9 +107,13 @@ func (o *nodeDisplayOwner) prepare(s *Snapshot, view *clusterView, wallNow, obse
 	var providers [5]cluster.ProviderStatus
 	var leases [2]time.Time
 	var eligible *clusterView
+	profile := "alpenglow"
+	if key.genesis == cluster.MainnetGenesisHash {
+		profile = "mainnet"
+	}
 	if view != nil && len(view.metadata.Providers) <= len(providers) && len(view.rows) <= cluster.MaxRows &&
-		view.metadata.State == "fresh" && view.metadata.Profile == "alpenglow" &&
-		view.metadata.GenesisHash != nil && *view.metadata.GenesisHash == cluster.GenesisHash &&
+		view.metadata.State == "fresh" && view.metadata.Profile == profile &&
+		view.metadata.GenesisHash != nil && *view.metadata.GenesisHash == key.genesis &&
 		view.metadata.Epoch != nil && string(*view.metadata.Epoch) == epoch &&
 		nodeDisplayDate(view.metadata.CapturedAt, wallNow) {
 		filtered = *view

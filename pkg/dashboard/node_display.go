@@ -50,7 +50,7 @@ type nodeDisplayFrame struct {
 // selectNodeDisplay runs on the collection owner, never on a viewer request.
 // Its view is the existing validated external directory; no provider is fetched.
 func selectNodeDisplay(s *Snapshot, state string, view *clusterView, now time.Time) nodeDisplay {
-	v := nodeDisplay{SchemaVersion: 1, Scope: "linked_node_external_display", Profile: "alpenglow",
+	v := nodeDisplay{SchemaVersion: 1, Scope: "linked_node_external_display", Profile: "unknown",
 		State: "unavailable", Reason: "waiting_source", IconState: "not_supplied"}
 	if s == nil {
 		return v
@@ -77,11 +77,16 @@ func selectNodeDisplay(s *Snapshot, state string, view *clusterView, now time.Ti
 			v.GenesisHash = &copied
 		}
 	}
+	if *s.GenesisHash == cluster.MainnetGenesisHash {
+		v.Profile = "mainnet"
+	} else if *s.GenesisHash == cluster.GenesisHash && s.Alpenglow {
+		v.Profile = "alpenglow"
+	}
 	if state != "fresh" || !validPublicTime(s.SampledAt, now) || now.Sub(s.SampledAt) > StaleAfter {
 		v.Reason = "status_stale"
 		return v
 	}
-	if !s.Alpenglow || *s.GenesisHash != cluster.GenesisHash {
+	if *s.GenesisHash != cluster.MainnetGenesisHash && (!s.Alpenglow || *s.GenesisHash != cluster.GenesisHash) {
 		v.Reason = "unsupported_profile"
 		return v
 	}
