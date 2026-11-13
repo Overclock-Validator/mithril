@@ -149,7 +149,8 @@ var (
 	paramArenaSizeMB         uint64
 	borrowedAccountArenaSize uint64
 
-	rpcPort int
+	rpcPort         int
+	metricsBindAddr string
 
 	// Lightbringer sidecar config
 	lightbringerEnabled          bool
@@ -542,6 +543,9 @@ func init() {
 	Run.Flags().StringVar(&clusterGenesisHash, "genesis-hash", "", "Expected genesis hash; required for a custom cluster, must match the built-in genesis otherwise")
 	Run.Flags().StringVar(&legacyGenesisHash, "legacy-genesis-hash", "", "Genesis hash owning legacy unbound AccountsDB/ledger artifacts (one-time re-genesis safety acknowledgement)")
 
+	// [metrics] section flags
+	Run.Flags().StringVar(&metricsBindAddr, "metrics-bind-addr", config.MetricsBindAddrDefault, "Prometheus HTTP listen address (host:port); use 127.0.0.1:9090 for local-only access")
+
 	// [rpc] section flags (Mithril's RPC server)
 	Run.Flags().IntVar(&rpcPort, "rpc-port", 0, "RPC server port. Default off.")
 
@@ -891,6 +895,14 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 
 	// [rpc] section - Mithril's RPC server
 	rpcPort = getInt("rpc-port", "rpc.port")
+	metricsBindAddr = strings.TrimSpace(getString("metrics-bind-addr", "metrics.bind_addr"))
+	_, metricsPort, err := net.SplitHostPort(metricsBindAddr)
+	if err != nil {
+		return fmt.Errorf("invalid metrics.bind_addr %q: %w", metricsBindAddr, err)
+	}
+	if port, err := strconv.Atoi(metricsPort); err != nil || port < 0 || port > 65535 {
+		return fmt.Errorf("invalid metrics.bind_addr %q: port must be a number from 0 to 65535", metricsBindAddr)
+	}
 
 	// Top-level
 	scratchDirectory = getString("scratch-directory", "scratch_directory")
@@ -1462,7 +1474,7 @@ func runLive(c *cobra.Command, args []string) {
 	printStartupInfo("run")
 
 	// Now start the metrics server (after banner so errors don't appear first)
-	statsd.StartMetricsServer()
+	statsd.StartMetricsServer(metricsBindAddr)
 
 	// Chain lineage is a startup gate, not part of AccountsDB bootstrap. Resolve
 	// it before Lightbringer can open ledger storage and before history records

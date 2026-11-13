@@ -579,6 +579,16 @@ name = "mithril"
     port = 8899
 
 # ============================================================================
+# [metrics] - Prometheus HTTP Server
+# ============================================================================
+# Independent of [rpc].port and [tuning.pprof].port. The historical default
+# :9090 listens on all interfaces. Set 127.0.0.1:9090 for local scraping only,
+# or [::1]:9090 for IPv6 loopback. CLI --metrics-bind-addr overrides this value.
+# This listener serves /metrics only, never profiling endpoints.
+[metrics]
+    bind_addr = ":9090"
+
+# ============================================================================
 # [tuning] - Performance Tuning & Profiling
 # ============================================================================
 #

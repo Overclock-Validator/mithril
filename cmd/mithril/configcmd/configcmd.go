@@ -279,6 +279,10 @@ disable_shred_overlap = false # Diagnostic fallback: verify after complete block
 [rpc]
 port = 8899               # 0 = disabled; binds all interfaces
 
+# ── Prometheus metrics ────────────────────────────────────────────────────
+[metrics]
+bind_addr = ":9090"       # Historical default: all interfaces. Use 127.0.0.1:9090 for local only.
+
 # ── Logging ──────────────────────────────────────────────────────────────
 [log]
 dir = %q                  # Log directory

@@ -537,18 +537,25 @@ func init() {
 
 // StartMetricsServer starts the Prometheus metrics HTTP server.
 // Call this after printing the banner to avoid error messages appearing before it.
-func StartMetricsServer() {
+func StartMetricsServer(bindAddr string) {
 	if metricsServerStarted {
 		return
 	}
 	metricsServerStarted = true
-	http.Handle("/metrics", promhttp.Handler())
+	server := newMetricsServer(bindAddr)
 	go func() {
-		addr := ":9090"
-		if err := http.ListenAndServe(addr, nil); err != nil {
+		if err := server.ListenAndServe(); err != nil {
 			mlog.Log.Errorf("Prometheus metrics server failed: %v", err)
 		}
 	}()
+}
+
+// Use a dedicated mux: the default mux may contain pprof and profiling controls.
+// Those handlers must not inherit the metrics listener's exposure.
+func newMetricsServer(bindAddr string) *http.Server {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	return &http.Server{Addr: bindAddr, Handler: mux}
 }
 
 func initializeStatsdMetrics() Prometheusmetrics {
