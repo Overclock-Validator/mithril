@@ -15,8 +15,17 @@ import (
 )
 
 // TurbineIngressTimings carries per-slot observations only on a
-// trusted in-memory Turbine block. Durations never serialize with Block.
+// trusted in-memory Turbine block. These values never serialize with Block.
 type TurbineIngressTimings struct {
+	// Assembly times belong to the accepted block's completed assembly
+	// generation, which can include repair. FirstAccepted is not proven first
+	// receipt of the exact block; Full means reconstructable, not finalized.
+	// The original time.Time values retain their in-process monotonic clocks.
+	AssemblyFirstAcceptedAt time.Time
+	AssemblyFullAt          time.Time
+	// ReadyAt follows successful decoding and transaction-signature checks.
+	// It remains available after the one-shot replay admission interval ends.
+	ReadyAt              time.Time
 	ShredCollection      time.Duration
 	CompletionQueueDelay time.Duration
 	BlockDecode          time.Duration
@@ -117,6 +126,8 @@ type Block struct {
 	turbineIngressTimings       TurbineIngressTimings
 	hasTurbineIngressTimings    bool
 	certificateObservation      *certificateObservationContext
+	paymentObservation          *PaymentObservation
+	selectedEconomics           *selectedEconomicsContext
 	SkipRewardCert              []byte
 	NotarRewardCert             []byte
 	BlockFinalCert              []byte
@@ -245,7 +256,7 @@ func (b *Block) TurbineReplayAdmissionStart() (time.Time, bool) {
 	return b.turbineReplayAdmissionStart, true
 }
 
-// MarkTurbineIngressTimings attaches phase durations to the trusted in-memory
+// MarkTurbineIngressTimings attaches phase observations to the trusted in-memory
 // block. It does not start or end the replay-admission interval.
 func (b *Block) MarkTurbineIngressTimings(timings TurbineIngressTimings) {
 	if b != nil {
@@ -254,7 +265,7 @@ func (b *Block) MarkTurbineIngressTimings(timings TurbineIngressTimings) {
 	}
 }
 
-// TurbineIngressTimings reports trusted per-slot phase durations. Serialized,
+// TurbineIngressTimings reports trusted per-slot phase observations. Serialized,
 // RPC, file, and local-production blocks return false.
 func (b *Block) TurbineIngressTimings() (TurbineIngressTimings, bool) {
 	if b == nil || !b.hasTurbineIngressTimings {

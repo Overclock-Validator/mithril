@@ -108,6 +108,7 @@ type LeaderLoop struct {
 	gateTPU            bool
 
 	certificateObservationVoteAccount solana.PublicKey
+	captureSelectedSlotFacts          bool
 
 	currentSlot   func() uint64
 	leaderForSlot func(uint64) (solana.PublicKey, bool)
@@ -167,8 +168,12 @@ type LeaderLoopConfig struct {
 	// CertificateObservationVoteAccount enables private compact capture for a
 	// fixed public account; speculative production does not publish outcomes.
 	CertificateObservationVoteAccount solana.PublicKey
-	CurrentSlot                       func() uint64
-	LeaderForSlot                     func(uint64) (solana.PublicKey, bool)
+	// CaptureSelectedSlotFacts enables private fee/cost attachment for later
+	// exact selected replay. It is independent of terminal observers and voting.
+	CaptureSelectedSlotFacts bool
+
+	CurrentSlot   func() uint64
+	LeaderForSlot func(uint64) (solana.PublicKey, bool)
 	// ParentBlockID is retained for source compatibility and ignored. Parent
 	// identity is supplied atomically by ParentContext.
 	ParentBlockID func(parentSlot uint64) (solana.Hash, bool)
@@ -204,6 +209,7 @@ func NewLeaderLoop(cfg LeaderLoopConfig) *LeaderLoop {
 	holder, _ := cfg.Hooks.(SlotHolder)
 	return &LeaderLoop{
 		certificateObservationVoteAccount: cfg.CertificateObservationVoteAccount,
+		captureSelectedSlotFacts:          cfg.CaptureSelectedSlotFacts,
 
 		controller:          cfg.Controller,
 		identity:            cfg.Identity,
@@ -1076,6 +1082,10 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 	producedBlock.HasAlpenglowFooter = true
 	producedBlock.AlpenglowShredVersion = l.shredVersion
 	producedBlock.EnableCertificateObservation(l.certificateObservationVoteAccount)
+	producedBlock.EnablePaymentObservation(producedBlock.Leader, l.certificateObservationVoteAccount)
+	if l.captureSelectedSlotFacts {
+		producedBlock.EnableSelectedLocalEconomics()
+	}
 	if slot > 0 {
 		producedBlock.AlpenglowParentBlockID = l.activeParentID
 		producedBlock.HasAlpenglowParentBlockID = true
@@ -1143,6 +1153,16 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 		producedBlock.AlpenglowLastChainedRoot = chained
 		producedBlock.HasAlpenglowLastChainedRoot = true
 		global.SetAlpenglowChainedMerkleRoot(slot, chained)
+	}
+	if l.captureSelectedSlotFacts && l.activeBank.Slot() == slot {
+		if costs, ok := l.activeBank.closedCostObservation(); ok {
+			slotCtx := l.activeBank.SlotCtx()
+			if slotCtx != nil && slotCtx.Slot == slot && len(slotCtx.FinalBankhash) == 32 {
+				producedBlock.SealSelectedLocalEconomics(slot, footerBankhash, costs.Transactions, b.SelectedNativeCost{
+					BlockCost: costs.BlockCost, BlockCostLimit: costs.Limits.BlockCost,
+				})
+			}
+		}
 	}
 	replay.RegisterLocalLeaderCommit(l.activeBank.SlotCtx())
 	if l.onBlock != nil {

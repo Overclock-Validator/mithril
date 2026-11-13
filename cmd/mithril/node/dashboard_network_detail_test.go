@@ -310,7 +310,7 @@ func TestDashboardNetworkDetailsOptIn(t *testing.T) {
 				t.Error(err)
 			}
 		})
-		d := startNodeDashboard(context.Background(), time.Now(), filepath.Join(dir, "node.sock"), "", "network-run", "isolated", "verifying", false, false, false, enabled, false, false)
+		d := startNodeDashboard(context.Background(), time.Now(), filepath.Join(dir, "node.sock"), "", "network-run", "isolated", "verifying", false, false, false, enabled, false, false, false, false)
 		if d == nil {
 			t.Fatal("dashboard failed")
 		}

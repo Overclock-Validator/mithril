@@ -12,6 +12,8 @@ func TestTransactionSignaturesVerifiedMarkerIsNotSerialized(t *testing.T) {
 	admissionStart := time.Now()
 	original.MarkTurbineReplayAdmissionStart(admissionStart)
 	ingress := TurbineIngressTimings{
+		AssemblyFirstAcceptedAt: admissionStart.Add(-50 * time.Millisecond),
+		AssemblyFullAt:          admissionStart.Add(-35 * time.Millisecond), ReadyAt: admissionStart,
 		ShredCollection: 12 * time.Millisecond, TransactionSigverify: 34 * time.Millisecond,
 		EarlyTransactionParse: 2 * time.Millisecond, EarlyTransactionSigverify: 56 * time.Millisecond,
 		EarlyPreparationWait:      3 * time.Millisecond,
@@ -51,11 +53,11 @@ func TestTransactionSignaturesVerifiedMarkerIsNotSerialized(t *testing.T) {
 func TestCompleteTurbineReplayAdmissionIsMonotonicAndOneShot(t *testing.T) {
 	start := time.Now()
 	blk := &Block{}
-	blk.MarkTurbineIngressTimings(TurbineIngressTimings{BlockDecode: time.Millisecond})
+	blk.MarkTurbineIngressTimings(TurbineIngressTimings{BlockDecode: time.Millisecond, ReadyAt: start})
 	blk.MarkTurbineReplayAdmissionStart(start)
 
 	got, ok := blk.CompleteTurbineReplayAdmission(start.Add(25 * time.Millisecond))
-	if !ok || got.ReplayAdmission != 25*time.Millisecond || got.BlockDecode != time.Millisecond {
+	if !ok || got.ReplayAdmission != 25*time.Millisecond || got.BlockDecode != time.Millisecond || got.ReadyAt != start {
 		t.Fatalf("completed ingress timings = %+v, %t", got, ok)
 	}
 	if _, ok := blk.CompleteTurbineReplayAdmission(start.Add(30 * time.Millisecond)); ok {
@@ -63,5 +65,29 @@ func TestCompleteTurbineReplayAdmissionIsMonotonicAndOneShot(t *testing.T) {
 	}
 	if _, ok := blk.TurbineReplayAdmissionStart(); ok {
 		t.Fatal("completed replay admission retained a live start clock")
+	}
+	if retained, ok := blk.TurbineIngressTimings(); !ok || retained.ReadyAt != start {
+		t.Fatal("completed replay admission lost the original ready timestamp")
+	}
+}
+
+func TestTurbineIngressTimingsAreDetachedValues(t *testing.T) {
+	first := time.Now()
+	want := TurbineIngressTimings{AssemblyFirstAcceptedAt: first,
+		AssemblyFullAt: first.Add(time.Millisecond), ReadyAt: first.Add(2 * time.Millisecond)}
+	blk := &Block{}
+	blk.MarkTurbineIngressTimings(want)
+	got, ok := blk.TurbineIngressTimings()
+	if !ok || got != want {
+		t.Fatalf("timings changed original time.Time values: %+v, %t", got, ok)
+	}
+	got.AssemblyFirstAcceptedAt, got.AssemblyFullAt, got.ReadyAt = time.Time{}, time.Time{}, time.Time{}
+	if again, ok := blk.TurbineIngressTimings(); !ok || again != want {
+		t.Fatal("returned timing values alias the block")
+	}
+	for _, unknown := range []*Block{nil, {ShredFirstNanos: first.UnixNano(), ShredFullNanos: first.UnixNano()}} {
+		if value, ok := unknown.TurbineIngressTimings(); ok || value != (TurbineIngressTimings{}) {
+			t.Fatal("wall-clock fields fabricated trusted ingress timing")
+		}
 	}
 }

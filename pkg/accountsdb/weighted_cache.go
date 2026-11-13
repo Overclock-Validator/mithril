@@ -2,6 +2,7 @@ package accountsdb
 
 import (
 	"github.com/maypok86/otter/v2"
+	"github.com/maypok86/otter/v2/stats"
 )
 
 // WeightedCache is a weight-bounded Otter v2 cache with the semantics the
@@ -16,18 +17,37 @@ type WeightedCache[K comparable, V any] struct {
 	cache     *otter.Cache[K, V]
 	weigh     func(K, V) uint32
 	maxWeight uint64
+	pressure  *cacheInsertionWeight
 }
 
 // NewWeightedCache returns a cache holding at most maxWeight total weight.
 func NewWeightedCache[K comparable, V any](maxWeight uint64, weigh func(K, V) uint32) *WeightedCache[K, V] {
+	return newWeightedCache(maxWeight, weigh, false)
+}
+
+func newWeightedCache[K comparable, V any](maxWeight uint64, weigh func(K, V) uint32, recordActivity bool) *WeightedCache[K, V] {
 	if maxWeight == 0 {
 		maxWeight = 1
 	}
-	return &WeightedCache[K, V]{
-		cache:     otter.Must(&otter.Options[K, V]{MaximumWeight: maxWeight, Weigher: weigh}),
-		weigh:     weigh,
-		maxWeight: maxWeight,
+	options := &otter.Options[K, V]{MaximumWeight: maxWeight, Weigher: weigh}
+	c := &WeightedCache[K, V]{weigh: weigh, maxWeight: maxWeight}
+	if recordActivity {
+		options.StatsRecorder = stats.NewCounter()
 	}
+	if recordActivity && weigh != nil {
+		c.pressure = &cacheInsertionWeight{}
+		p := c.pressure
+		options.Weigher = func(key K, value V) uint32 {
+			weight := weigh(key, value)
+			p.addPrepared(uint64(weight))
+			return weight
+		}
+		options.OnAtomicDeletion = func(event otter.DeletionEvent[K, V]) {
+			c.recordRetiredInsertionWeight(event.Key)
+		}
+	}
+	c.cache = otter.Must(options)
+	return c
 }
 
 func (c *WeightedCache[K, V]) Get(key K) (V, bool) {
@@ -54,4 +74,10 @@ func (c *WeightedCache[K, V]) Delete(key K) {
 
 func (c *WeightedCache[K, V]) Clear() {
 	c.cache.InvalidateAll()
+}
+
+// cacheGauge reads the configured weight limit and approximate entry count.
+// It does not acquire Otter's eviction-policy lock or run maintenance.
+func (c *WeightedCache[K, V]) cacheGauge() (capacity, estimatedEntries uint64) {
+	return c.maxWeight, uint64(c.cache.EstimatedSize())
 }

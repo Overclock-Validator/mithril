@@ -628,6 +628,9 @@ func replaceInflationRewardRecords(block *block.Block, updated, parents []*accou
 			Pubkey: account.Key, Lamports: int64(amount), PostBalance: account.Lamports, RewardType: rewardType, Commission: commission,
 		})
 	}
+	if rewardType == rpc.RewardTypeVoting {
+		block.RecordAppliedVotingRewards(records)
+	}
 	kept := block.Rewards[:0]
 	for _, reward := range block.Rewards {
 		if reward.RewardType != rewardType {

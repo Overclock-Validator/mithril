@@ -25,8 +25,10 @@ import (
 // only lets a feed client spend node CPU; excess connections wait in the
 // listen backlog instead of being parsed.
 const (
-	feedRequestsPerSecond = 4
-	feedRequestBurst      = 4
+	feedRequestsPerSecond       = 4
+	feedRequestBurst            = 4
+	detailFeedRequestsPerSecond = 64
+	detailFeedRequestBurst      = 16
 )
 
 // Feed samples once per second, independently of reader requests. Readers only
@@ -39,6 +41,9 @@ type Feed struct {
 	served     chan struct{}
 	closed     sync.Once
 	latest     atomic.Pointer[feedStatus]
+	details    *replayDetailSource
+	rooted     *rootedHistorySource
+	cache      *cacheDetailSource
 	network    *networkDetailSource
 	machine    *machineDetailSource
 	localPeers *localPeerSource
@@ -54,10 +59,20 @@ type feedStatus struct {
 
 // DetailSamplers enables bounded private detail routes when configured.
 type DetailSamplers struct {
-	Network     NetworkDetailSampler
-	NodeNetwork NodeNetworkSampler
-	Machine     MachineDetailSampler
-	LocalPeers  LocalPeerSampler
+	Replay         ReplayDetailSampler
+	Cache          CacheDetailSampler
+	SelectedWindow SelectedWindowSampler
+	RootedHistory  RootedHistorySampler
+	HeldSchedules  HeldScheduleSampler
+	Network        NetworkDetailSampler
+	NodeNetwork    NodeNetworkSampler
+	Machine        MachineDetailSampler
+	LocalPeers     LocalPeerSampler
+}
+
+// ListenFeedWithReplayDetails enables replay details on the private feed.
+func ListenFeedWithReplayDetails(parent context.Context, path, group string, sample func() Snapshot, details ReplayDetailSampler) (*Feed, error) {
+	return ListenFeedWithDetails(parent, path, group, sample, DetailSamplers{Replay: details})
 }
 
 // ListenFeed requires an existing private directory owned by the node. It
@@ -86,6 +101,12 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 	}
 	if details.Network != nil && details.NodeNetwork != nil {
 		return nil, errors.New("dashboard network samplers are mutually exclusive")
+	}
+	if details.HeldSchedules != nil && details.Replay == nil {
+		return nil, errors.New("held schedules require the replay detail worker")
+	}
+	if details.SelectedWindow != nil && details.Replay == nil {
+		return nil, errors.New("selected window requires the replay detail worker")
 	}
 	var gid int
 	if groupMode {
@@ -121,6 +142,23 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 	}
 	ctx, cancel := context.WithCancel(parent)
 	f := &Feed{listener: listener, cancel: cancel, done: make(chan struct{}), served: make(chan struct{})}
+	if details.Replay != nil {
+		f.details = &replayDetailSource{sample: details.Replay, done: make(chan struct{})}
+		if details.HeldSchedules != nil {
+			f.details.held = &heldScheduleSource{sample: details.HeldSchedules, gate: &f.details.gate,
+				gateMu: &f.details.gateMu, active: make(chan struct{}, 2)}
+		}
+		if details.SelectedWindow != nil {
+			f.details.selected = &selectedWindowSource{sample: details.SelectedWindow, gate: &f.details.gate,
+				gateMu: &f.details.gateMu, revision: 1}
+		}
+	}
+	if details.RootedHistory != nil {
+		f.rooted = &rootedHistorySource{sample: details.RootedHistory}
+	}
+	if details.Cache != nil {
+		f.cache = &cacheDetailSource{sample: details.Cache}
+	}
 	if details.Network != nil {
 		f.network = &networkDetailSource{sample: details.Network}
 	}
@@ -166,6 +204,15 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 			f.localPeers.observeStatus(s, now)
 		}
 		f.latest.Store(&feedStatus{body: b, freshUntil: now.Add(StaleAfter)})
+		if f.details != nil {
+			f.details.observeStatus(s, now)
+		}
+		if f.rooted != nil {
+			f.rooted.update(s, now)
+		}
+		if f.cache != nil {
+			f.cache.update(s, now)
+		}
 		if f.network != nil {
 			f.network.update(s, now)
 		}
@@ -179,6 +226,22 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 	}
 	update()
 	mux := http.NewServeMux()
+	if f.details != nil {
+		mux.HandleFunc("/details/replay", f.details.serveHTTP)
+		if f.details.selected != nil {
+			mux.HandleFunc("/details/selected", f.details.selected.serveHTTP)
+		}
+		if f.details.held != nil {
+			mux.HandleFunc("/details/schedule", f.details.held.serveHTTP)
+			mux.HandleFunc("/details/schedule/", f.details.held.serveHTTP)
+		}
+	}
+	if f.rooted != nil {
+		mux.HandleFunc("/details/slots", f.rooted.serveHTTP)
+	}
+	if f.cache != nil {
+		mux.HandleFunc("/details/cache", f.cache.serveHTTP)
+	}
 	if f.network != nil {
 		mux.HandleFunc("/details/network", f.network.serveHTTP)
 	}
@@ -203,6 +266,16 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 		_, _ = w.Write(status.body)
 	})
 	var handler http.Handler = mux
+	if f.details != nil && f.details.selected != nil {
+		next := handler
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/details/selected" || strings.HasPrefix(r.URL.Path, "/details/selected/") || urlpath.Clean(r.URL.Path) == "/details/selected" {
+				f.details.selected.serveHTTP(w, r)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 	if f.localPeers != nil {
 		next := handler
 		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -225,13 +298,22 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 	}
 	f.server = &http.Server{Handler: handler, ReadHeaderTimeout: 2 * time.Second, ReadTimeout: 2 * time.Second,
 		WriteTimeout: 2 * time.Second, IdleTimeout: 2 * time.Second, MaxHeaderBytes: 4096}
+	if f.details != nil {
+		go f.details.run(ctx)
+	}
 	if f.localPeers != nil {
 		go f.localPeers.run(ctx)
 	}
 	// One request per connection, so the accept rate bounds the request rate.
 	f.server.SetKeepAlivesEnabled(false)
+	requestRate, requestBurst := feedRequestsPerSecond, feedRequestBurst
+	if details.Replay != nil || details.Cache != nil || details.SelectedWindow != nil || details.RootedHistory != nil ||
+		details.HeldSchedules != nil || details.Network != nil || details.NodeNetwork != nil || details.Machine != nil || details.LocalPeers != nil {
+		// Replay detail can contain 128 pages; its reader has a 12-second deadline.
+		requestRate, requestBurst = detailFeedRequestsPerSecond, detailFeedRequestBurst
+	}
 	limited := &rateLimitedListener{Listener: listener, ctx: ctx,
-		limiter: rate.NewLimiter(feedRequestsPerSecond, feedRequestBurst)}
+		limiter: rate.NewLimiter(rate.Limit(requestRate), requestBurst)}
 	go func() {
 		defer close(f.served)
 		if err := f.server.Serve(netutil.LimitListener(limited, 4)); err != nil && ctx.Err() == nil {
@@ -316,6 +398,9 @@ func (f *Feed) Close() {
 		_ = f.listener.Close()
 		<-f.done
 		<-f.served
+		if f.details != nil {
+			<-f.details.done
+		}
 		if f.localPeers != nil {
 			<-f.localPeers.done
 		}
