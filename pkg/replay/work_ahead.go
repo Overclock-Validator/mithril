@@ -159,6 +159,9 @@ type workAheadEntry struct {
 	ineligible bool // never execute early (checked once)
 	checked    bool
 	assumed    int // predicted failures the queued offer relies on
+	// viaUnchanged: the queued offer passed a prerequisite on the unchanged
+	// history that the failure predictor refused (diagnostic only)
+	viaUnchanged bool
 	// unfinished prerequisites at the queued offer
 	unfinished  [workAheadOfferMax]uint32
 	nUnfinished uint8
@@ -210,8 +213,13 @@ type workAheadStats struct {
 	unjoined, wasteCapped        atomic.Int64 // doomed runs left running at their turn; admissions refused by the waste cap
 	sealedWrite, extraReads      atomic.Int64 // results that tried to write through the sealed view; accounts read outside the captured read set
 	earlyDropped, earlyAbandoned atomic.Int64
-	uncovered                    atomic.Int64 // results that loaded an account outside their read set
-	race                         workAheadRaceStats
+	// Diagnostic, record only: early executions whose offer was admitted only
+	// because the unchanged history let it pass a prerequisite the failure
+	// predictor refused (MITHRIL_WORK_AHEAD_UNCHANGED), and what became of them.
+	unchangedQueued, unchangedExecuted, unchangedAdopted, unchangedInvalid atomic.Int64
+	unchangedAdoptedKCU, unchangedHeadStartNs                              atomic.Int64
+	uncovered                                                              atomic.Int64 // results that loaded an account outside their read set
+	race                                                                   workAheadRaceStats
 	// Diagnostic (MITHRIL_WORK_AHEAD_LOG): early executions by the number of
 	// predicted failures they assumed, and offers turned away only by
 	// MITHRIL_WORK_AHEAD_FAIL_DEPTH, by the depth they would have needed.
@@ -446,7 +454,22 @@ func (w *workAhead) offer(tx int, unfinished []uint32) {
 	if !w.admissibleLocked(e, tx) {
 		return
 	}
-	ok, assumed := workAheadAdmissible(w.accessOf, w.payerOf, w.predictFailureFor, unfinished, tx, workAheadFailDepth, workAheadPredictPayer)
+	viaUnchanged := false
+	predict := w.predictFailureFor
+	if workAheadUnchanged {
+		// the same decision, noting which predictor made it
+		predict = func(prerequisite, tx int) bool {
+			if w.predictFailure(prerequisite, tx) {
+				return true
+			}
+			if w.predictUnchangedFor(prerequisite, tx) {
+				viaUnchanged = true
+				return true
+			}
+			return false
+		}
+	}
+	ok, assumed := workAheadAdmissible(w.accessOf, w.payerOf, predict, unfinished, tx, workAheadFailDepth, workAheadPredictPayer)
 	if !ok {
 		if workAheadLog && workAheadFailDepth > 0 && assumed >= workAheadFailDepth {
 			if ok, need := workAheadAdmissible(w.accessOf, w.payerOf, w.predictFailureFor, unfinished, tx, len(unfinished), workAheadPredictPayer); ok {
@@ -455,7 +478,12 @@ func (w *workAhead) offer(tx int, unfinished []uint32) {
 		}
 		return
 	}
-	w.queueLocked(e, tx, unfinished, assumed)
+	if w.queueLocked(e, tx, unfinished, assumed) {
+		e.viaUnchanged = viaUnchanged
+		if viaUnchanged {
+			w.stats.unchangedQueued.Add(1)
+		}
+	}
 }
 
 // admissibleLocked reports whether tx may still be queued for an early
@@ -719,6 +747,9 @@ func (w *workAhead) run(idx int) {
 	if e.assumed > 0 {
 		w.stats.offeredFail.Add(1)
 	}
+	if e.viaUnchanged {
+		w.stats.unchangedExecuted.Add(1)
+	}
 	w.pressure.started(w.running.Add(1))
 	defer w.running.Add(-1)
 	if w.ranMarked.CompareAndSwap(false, true) {
@@ -971,6 +1002,9 @@ func (w *workAhead) claim(idx int) (*LoadAndExecuteTransactionOutput, func()) {
 		e.output = LoadAndExecuteTransactionOutput{}
 		release()
 		e.mu.Unlock()
+		if e.viaUnchanged {
+			w.stats.unchangedInvalid.Add(1)
+		}
 		w.stats.invalid.Add(1)
 		w.stats.byDepth[workAheadDepthBin(e.assumed)].invalid.Add(1)
 		return nil, func() {}
@@ -1010,6 +1044,12 @@ func (w *workAhead) claim(idx int) (*LoadAndExecuteTransactionOutput, func()) {
 		output.ExecCtx.SlotCtx = w.slotCtx
 	}
 	w.injectFault(output)
+	if e.viaUnchanged {
+		w.stats.unchangedAdopted.Add(1)
+		w.stats.unchangedAdoptedKCU.Add(e.usedKCU)
+		// how long the result had been ready when its turn came
+		w.stats.unchangedHeadStartNs.Add(int64(time.Since(e.ended)))
+	}
 	e.mu.Unlock()
 	w.stats.adopted.Add(1)
 	w.stats.byDepth[workAheadDepthBin(e.assumed)].adopted.Add(1)
@@ -1379,6 +1419,12 @@ func (w *workAhead) finish(slot uint64) {
 		mlog.Log.Infof("work-ahead slot %d: offered %d offered-fail %d executed %d adopted %d waited %d invalid %d abandoned %d late %d no-arena %d panicked %d offer-us %d predicted-payer %d verified %d verified-predicted %d verify-mismatch %d verified-nonce %d over-budget %d wasted-kcu %d wasted-us %d value-rescued %d waited-us %d abandon-wait-us %d early-dropped %d early-abandoned %d unjoined %d waste-capped %d sealed-write %d extra-reads %d",
 			slot, s.offered.Load(), s.offeredFail.Load(), s.executed.Load(), s.adopted.Load(), s.waited.Load(), s.invalid.Load(), s.abandoned.Load(), s.late.Load(), s.noArena.Load(), s.panicked.Load(), s.offerNs.Load()/1000,
 			s.predictedPayer.Load(), s.verified.Load(), s.verifiedPredicted.Load(), s.verifyMismatch.Load(), s.verifiedNonce.Load(), s.overBudget.Load(), w.wastedKCU.Load(), w.wastedNs.Load()/1000, s.valueRescued.Load(), s.waitedNs.Load()/1000, s.abandonWaitNs.Load()/1000, s.earlyDropped.Load(), s.earlyAbandoned.Load(), s.unjoined.Load(), s.wasteCapped.Load(), s.sealedWrite.Load(), s.extraReads.Load())
+		if workAheadUnchanged {
+			h := &unchangedReasons
+			mlog.Log.Infof("work-ahead unchanged slot %d: queued %d executed %d adopted %d invalid %d adopted-kcu %d head-start-us %d | asked %d predicted %d payer-shared %d no-history %d few-observed %d last-changed %d low-rate %d",
+				slot, s.unchangedQueued.Load(), s.unchangedExecuted.Load(), s.unchangedAdopted.Load(), s.unchangedInvalid.Load(), s.unchangedAdoptedKCU.Load(), s.unchangedHeadStartNs.Load()/1000,
+				h.asked.Swap(0), h.predicted.Swap(0), h.payerShared.Swap(0), h.noHistory.Swap(0), h.fewObserved.Swap(0), h.lastChanged.Swap(0), h.lowRate.Swap(0))
+		}
 		// Per assumed-failure count d: d:executed/adopted/invalid/abandoned/capped.
 		var depth strings.Builder
 		for d := range s.byDepth {

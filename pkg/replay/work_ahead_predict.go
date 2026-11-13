@@ -438,6 +438,30 @@ func predictsUnchangedByRole(tx *solana.Transaction, account solana.PublicKey) b
 	return true
 }
 
+// unchangedReasons (diagnostic, MITHRIL_WORK_AHEAD_LOG): why the unchanged
+// history did or did not let a transaction pass a prerequisite, counted once
+// per question and reset when a block's line is logged. Questions are asked on
+// one goroutine per block, so a block's line holds that block's questions.
+var unchangedReasons struct {
+	asked, predicted, payerShared, noHistory, fewObserved, lastChanged, lowRate atomic.Int64
+}
+
+// noteUnchangedRefusal counts why k's history refused.
+func noteUnchangedRefusal(k unchangedKey) {
+	word := findUnchanged(k)
+	_, total := unchangedCounts(word)
+	switch {
+	case word == 0:
+		unchangedReasons.noHistory.Add(1)
+	case total < unchangedMinObserved:
+		unchangedReasons.fewObserved.Add(1)
+	case word&unchangedLastChanged != 0:
+		unchangedReasons.lastChanged.Add(1)
+	default:
+		unchangedReasons.lowRate.Add(1)
+	}
+}
+
 // predictUnchangedFor: overtaking the unfinished prerequisite is safe for tx if
 // it succeeds as history predicts, leaving every account tx uses unchanged.
 func (w *workAhead) predictUnchangedFor(prerequisite, tx int) bool {
@@ -451,7 +475,13 @@ func (w *workAhead) predictUnchangedFor(prerequisite, tx int) bool {
 		}
 		return false
 	}
+	if workAheadLog {
+		unchangedReasons.asked.Add(1)
+	}
 	if uses(payer) {
+		if workAheadLog {
+			unchangedReasons.payerShared.Add(1)
+		}
 		return false
 	}
 	if workAheadUnchangedByRole {
@@ -464,9 +494,18 @@ func (w *workAhead) predictUnchangedFor(prerequisite, tx int) bool {
 	}
 	program := w.programKey(prerequisite)
 	for _, a := range w.accessOf(prerequisite).writable() {
-		if uses(a.publicKey) && !predictsUnchanged(unchangedKey{program: program, account: [32]byte(a.publicKey)}) {
+		if !uses(a.publicKey) {
+			continue
+		}
+		if k := (unchangedKey{program: program, account: [32]byte(a.publicKey)}); !predictsUnchanged(k) {
+			if workAheadLog {
+				noteUnchangedRefusal(k)
+			}
 			return false
 		}
+	}
+	if workAheadLog {
+		unchangedReasons.predicted.Add(1)
 	}
 	return true
 }
