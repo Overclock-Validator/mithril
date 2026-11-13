@@ -1,12 +1,14 @@
 package replay
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/Overclock-Validator/mithril/pkg/base58"
 	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 )
@@ -69,7 +71,10 @@ func (e *SpeculationFooterMismatch) Unwrap() error { return e.Err }
 
 // workAheadUncheckedBlock: a block ran early executions but carries no footer
 // bank hash, so nothing would check what they produced.
-type workAheadUncheckedBlock struct{ Slot uint64 }
+type workAheadUncheckedBlock struct {
+	Slot     uint64
+	Computed []byte // the bank hash computed with early executions
+}
 
 func (e *workAheadUncheckedBlock) Error() string {
 	return fmt.Sprintf("slot %d ran work-ahead early executions but its block has no footer bank hash to check them against", e.Slot)
@@ -82,11 +87,117 @@ func (e *workAheadUncheckedBlock) Error() string {
 // before execution; it is decided here, where footer verification is, before
 // any store of the bank. The refusal goes through the footer shutoff:
 // work-ahead off, and the slot replayed without it.
-func workAheadRequireFooterHash(block *b.Block) error {
+func workAheadRequireFooterHash(block *b.Block, computed []byte) error {
 	if block == nil || block.HasExpectedBankhash || !workAheadRanAt(block.Slot) {
 		return nil
 	}
-	return &workAheadUncheckedBlock{Slot: block.Slot}
+	return &workAheadUncheckedBlock{Slot: block.Slot, Computed: append([]byte(nil), computed...)}
+}
+
+// workAheadSuspect is the attempt that tripped the shutoff: the slot, the bank
+// hash computed with early executions, and the footer hash it was compared
+// with, if the block had one. The replay of that slot without early executions
+// is judged against it (workAheadReplayVerdict).
+var workAheadSuspect struct {
+	mu        sync.Mutex
+	set       bool
+	slot      uint64
+	computed  []byte
+	footer    [32]byte
+	hasFooter bool
+}
+
+// WorkAheadVerdict says what the replay without early executions showed about
+// a slot whose first attempt, with them, failed its footer check.
+type WorkAheadVerdict string
+
+const (
+	// The plain replay computed a different bank hash, and that one matches
+	// the footer: the early executions produced a wrong result.
+	WorkAheadVerdictSpeculationFault WorkAheadVerdict = "speculation fault confirmed"
+	// The plain replay computed the same bank hash, which still does not match
+	// the footer: this node's execution of the block differs from the
+	// leader's whether or not work-ahead runs.
+	WorkAheadVerdictNotSpeculation WorkAheadVerdict = "not caused by speculation"
+	// The plain replay computed a third bank hash, matching neither the first
+	// attempt nor the footer, or a different block was replayed at the slot.
+	WorkAheadVerdictInconclusive WorkAheadVerdict = "inconclusive"
+	// No footer hash: both attempts computed the same bank hash.
+	WorkAheadVerdictConsistentUnchecked WorkAheadVerdict = "attempts agree, no footer hash to check"
+	// No footer hash: the two attempts computed different bank hashes.
+	WorkAheadVerdictDifferUnchecked WorkAheadVerdict = "attempts differ, no footer hash to check"
+)
+
+// bankHashString prints a bank hash as the rest of the node does, and anything
+// that is not 32 bytes (nothing computed) in hex.
+func bankHashString(h []byte) string {
+	if len(h) == 32 {
+		return base58.Encode(h)
+	}
+	return fmt.Sprintf("0x%x", h)
+}
+
+// workAheadLastVerdict is the most recent verdict, for tests and diagnostics.
+var workAheadLastVerdict atomic.Pointer[WorkAheadVerdict]
+
+// workAheadReplayVerdict is called for every block once its bank hash is
+// computed and its footer checked, with the footer check's error (nil when the
+// hashes matched or the block has no footer hash). For the replay of the slot
+// that tripped the shutoff it compares this attempt, made without early
+// executions, with the one that was made with them, logs which of the two
+// explanations holds, and returns footerErr with that explanation attached so
+// the error a halting node prints carries it. For every other block it returns
+// footerErr unchanged.
+func workAheadReplayVerdict(block *b.Block, computed []byte, footerErr error) error {
+	if block == nil || !workAheadTripped.Load() {
+		return footerErr
+	}
+	workAheadSuspect.mu.Lock()
+	if !workAheadSuspect.set || workAheadSuspect.slot != block.Slot {
+		workAheadSuspect.mu.Unlock()
+		return footerErr
+	}
+	first := workAheadSuspect.computed
+	firstFooter, firstHasFooter := workAheadSuspect.footer, workAheadSuspect.hasFooter
+	workAheadSuspect.set = false
+	workAheadSuspect.computed = nil
+	workAheadSuspect.mu.Unlock()
+
+	same := bytes.Equal(first, computed)
+	sameBlock := firstHasFooter == block.HasExpectedBankhash && (!firstHasFooter || firstFooter == block.ExpectedBankhash)
+	footer := "none"
+	if block.HasExpectedBankhash {
+		footer = base58.Encode(block.ExpectedBankhash[:])
+	}
+	with, without := bankHashString(first), bankHashString(computed)
+	var verdict WorkAheadVerdict
+	var explain string
+	switch {
+	case !sameBlock:
+		verdict = WorkAheadVerdictInconclusive
+		explain = "the block replayed at this slot is not the one the first attempt executed (its footer bank hash differs), so the two attempts cannot be compared"
+	case !firstHasFooter && same:
+		verdict = WorkAheadVerdictConsistentUnchecked
+		explain = "the block has no footer bank hash; both attempts computed the same bank hash, so nothing points at speculation, and nothing confirms the hash either"
+	case !firstHasFooter:
+		verdict = WorkAheadVerdictDifferUnchecked
+		explain = "the block has no footer bank hash, and the two attempts computed different bank hashes: the early executions changed the result. This is a speculation bug; work-ahead stays off"
+	case footerErr == nil && !same:
+		verdict = WorkAheadVerdictSpeculationFault
+		explain = "the replay without early executions matches the footer and the first attempt did not: an early execution produced a wrong result. This is a speculation bug; work-ahead stays off and the node continues on the correct state"
+	case footerErr != nil && same:
+		verdict = WorkAheadVerdictNotSpeculation
+		explain = "the replay without early executions computed the same bank hash as the first attempt, and it still does not match the footer: this node's execution of the block differs from the leader's whether or not work-ahead runs. Speculation is not the cause"
+	default:
+		verdict = WorkAheadVerdictInconclusive
+		explain = "the replay without early executions computed a bank hash that matches neither the first attempt nor the footer, so the result of this block is not reproducible on this node; speculation may or may not be involved"
+	}
+	workAheadLastVerdict.Store(&verdict)
+	mlog.Log.Errorf("WORK-AHEAD VERDICT for slot %d: %s. Bank hash with early executions %s, without %s, footer %s. %s.", block.Slot, verdict, with, without, footer, explain)
+	if footerErr == nil {
+		return nil
+	}
+	return fmt.Errorf("%w [work-ahead verdict: %s; with early executions %s, without %s]", footerErr, verdict, with, without)
 }
 
 // workAheadFooterShutoff turns a footer bank hash mismatch at a slot that ran
@@ -116,6 +227,17 @@ func workAheadFooterShutoff(err error) error {
 		workAheadRanSlots.mu.Lock()
 		workAheadRanSlots.slots = nil
 		workAheadRanSlots.mu.Unlock()
+		// remember this attempt, so that replay can say what it showed
+		workAheadSuspect.mu.Lock()
+		workAheadSuspect.set, workAheadSuspect.slot = true, slot
+		if mismatch != nil {
+			workAheadSuspect.computed = append([]byte(nil), mismatch.Computed...)
+			workAheadSuspect.footer, workAheadSuspect.hasFooter = mismatch.Footer, true
+		} else {
+			workAheadSuspect.computed = append([]byte(nil), unchecked.Computed...)
+			workAheadSuspect.footer, workAheadSuspect.hasFooter = [32]byte{}, false
+		}
+		workAheadSuspect.mu.Unlock()
 		mlog.Log.Errorf("WORK-AHEAD SHUTOFF: footer bank hash check failed or missing at slot %d, a block with early executions; work-ahead is off for the rest of this process and the slot re-replays from the rooted checkpoint: %v", slot, err)
 	}
 	return &SpeculationFooterMismatch{Slot: slot, Err: err}

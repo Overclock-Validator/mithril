@@ -59,16 +59,16 @@ func TestWorkAheadRequiresFooterHash(t *testing.T) {
 	workAheadTripped.Store(false)
 	defer workAheadTripped.Store(false)
 	markWorkAheadRan(300)
-	if err := workAheadRequireFooterHash(&b.Block{Slot: 301}); err != nil {
+	if err := workAheadRequireFooterHash(&b.Block{Slot: 301}, nil); err != nil {
 		t.Fatalf("a block without early executions needs no footer hash here: %v", err)
 	}
-	if err := workAheadRequireFooterHash(&b.Block{Slot: 300, HasExpectedBankhash: true}); err != nil {
+	if err := workAheadRequireFooterHash(&b.Block{Slot: 300, HasExpectedBankhash: true}, nil); err != nil {
 		t.Fatalf("a block with a footer hash passes: %v", err)
 	}
-	if err := workAheadRequireFooterHash(nil); err != nil {
+	if err := workAheadRequireFooterHash(nil, nil); err != nil {
 		t.Fatal("no block, no refusal")
 	}
-	err := workAheadRequireFooterHash(&b.Block{Slot: 300})
+	err := workAheadRequireFooterHash(&b.Block{Slot: 300}, []byte{1})
 	if err == nil {
 		t.Fatal("a block that ran early executions and has no footer hash must be refused")
 	}
@@ -77,9 +77,104 @@ func TestWorkAheadRequiresFooterHash(t *testing.T) {
 	if !errors.As(shut, &spec) || spec.Slot != 300 || !workAheadTripped.Load() {
 		t.Fatalf("the refusal must go through the shutoff: %v", shut)
 	}
-	if err := workAheadRequireFooterHash(&b.Block{Slot: 300}); err != nil {
+	if err := workAheadRequireFooterHash(&b.Block{Slot: 300}, []byte{1}); err != nil {
 		t.Fatal("the re-replay runs without early executions and is judged by the ordinary rules")
 	}
+}
+
+// After the shutoff, the replay of the same slot without early executions says
+// which explanation holds: a different hash that matches the footer confirms a
+// speculation fault; the same hash, still mismatching, clears speculation; and
+// the error a halting node prints carries that.
+func TestWorkAheadReplayVerdict(t *testing.T) {
+	footer := [32]byte{0xF0}
+	withEarly, plainGood, third := []byte{0xA1}, footer[:], []byte{0xC3}
+	trip := func(slot uint64, computed []byte, hasFooter bool) {
+		t.Helper()
+		workAheadTripped.Store(false)
+		workAheadLastVerdict.Store(nil)
+		markWorkAheadRan(slot)
+		var err error = &FooterBankhashMismatch{Slot: slot, Footer: footer, Computed: computed}
+		if !hasFooter {
+			err = workAheadRequireFooterHash(&b.Block{Slot: slot}, computed)
+		}
+		var spec *SpeculationFooterMismatch
+		if shut := workAheadFooterShutoff(err); !errors.As(shut, &spec) {
+			t.Fatalf("the first attempt must trip the shutoff: %v", shut)
+		}
+	}
+	defer workAheadTripped.Store(false)
+	last := func() WorkAheadVerdict {
+		if v := workAheadLastVerdict.Load(); v != nil {
+			return *v
+		}
+		return ""
+	}
+	withFooter := func(slot uint64) *b.Block {
+		return &b.Block{Slot: slot, HasExpectedBankhash: true, ExpectedBankhash: footer}
+	}
+
+	// the plain replay matches the footer: speculation was at fault
+	trip(400, withEarly, true)
+	if err := workAheadReplayVerdict(withFooter(400), plainGood, nil); err != nil || last() != WorkAheadVerdictSpeculationFault {
+		t.Fatalf("verdict %q, err %v", last(), err)
+	}
+	// the verdict is given once
+	workAheadLastVerdict.Store(nil)
+	if err := workAheadReplayVerdict(withFooter(400), plainGood, nil); err != nil || last() != "" {
+		t.Fatal("a later replay of the slot has nothing to compare with")
+	}
+
+	// the plain replay computes the same hash and still mismatches: not speculation
+	trip(401, withEarly, true)
+	plainMismatch := &FooterBankhashMismatch{Slot: 401, Footer: footer, Computed: withEarly}
+	err := workAheadReplayVerdict(withFooter(401), withEarly, plainMismatch)
+	var mismatch *FooterBankhashMismatch
+	if last() != WorkAheadVerdictNotSpeculation || !errors.As(err, &mismatch) || !bytes.Contains([]byte(err.Error()), []byte("not caused by speculation")) {
+		t.Fatalf("verdict %q, err %v", last(), err)
+	}
+	if again := workAheadFooterShutoff(err); !errors.Is(again, err) {
+		t.Fatal("the plain replay's mismatch stays an ordinary mismatch")
+	}
+
+	// a third hash: inconclusive
+	trip(402, withEarly, true)
+	err = workAheadReplayVerdict(withFooter(402), third, &FooterBankhashMismatch{Slot: 402, Footer: footer, Computed: third})
+	if last() != WorkAheadVerdictInconclusive || err == nil {
+		t.Fatalf("verdict %q, err %v", last(), err)
+	}
+
+	// another block at the slot: inconclusive
+	trip(403, withEarly, true)
+	other := &b.Block{Slot: 403, HasExpectedBankhash: true, ExpectedBankhash: [32]byte{0xEE}}
+	if err := workAheadReplayVerdict(other, third, nil); err != nil || last() != WorkAheadVerdictInconclusive {
+		t.Fatalf("verdict %q, err %v", last(), err)
+	}
+
+	// no footer hash: the attempts agree, or they do not
+	trip(404, withEarly, false)
+	if err := workAheadReplayVerdict(&b.Block{Slot: 404}, withEarly, nil); err != nil || last() != WorkAheadVerdictConsistentUnchecked {
+		t.Fatalf("verdict %q, err %v", last(), err)
+	}
+	trip(405, withEarly, false)
+	if err := workAheadReplayVerdict(&b.Block{Slot: 405}, third, nil); err != nil || last() != WorkAheadVerdictDifferUnchecked {
+		t.Fatalf("verdict %q, err %v", last(), err)
+	}
+
+	// other slots, and a node whose shutoff never tripped, are untouched
+	trip(406, withEarly, true)
+	plain := &FooterBankhashMismatch{Slot: 999, Footer: footer, Computed: third}
+	workAheadLastVerdict.Store(nil)
+	if err := workAheadReplayVerdict(withFooter(999), third, plain); err != error(plain) || last() != "" {
+		t.Fatal("a mismatch at another slot is returned unchanged")
+	}
+	workAheadTripped.Store(false)
+	if err := workAheadReplayVerdict(withFooter(406), third, plain); err != error(plain) || last() != "" {
+		t.Fatal("without a tripped shutoff there is no verdict to give")
+	}
+	workAheadSuspect.mu.Lock()
+	workAheadSuspect.set = false
+	workAheadSuspect.mu.Unlock()
 }
 
 // Work-ahead never runs on a locally produced block.

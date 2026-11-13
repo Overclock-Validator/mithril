@@ -700,12 +700,15 @@ func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
 		metrics.GlobalBlockReplay.AlpenglowFooterVerification.AddTimingSince(footerVerificationStart)
 		if footerVerificationErr != nil {
 			writeFooterBankhashMismatchArtifact(footerVerificationErr, block, slotCtx, writableAccts, modifiedAccts)
-			return nil, footerVerificationErr
+			// If this is the replay of a slot whose first attempt, with early
+			// executions, failed here too, say whether speculation was the cause.
+			return nil, workAheadReplayVerdict(block, slotCtx.FinalBankhash, footerVerificationErr)
 		}
 	}
+	_ = workAheadReplayVerdict(block, slotCtx.FinalBankhash, nil)
 	// Early executions are only ever accepted in a block whose computed bank
 	// hash was just compared with its footer's (work_ahead_guard.go).
-	if err := workAheadRequireFooterHash(block); err != nil {
+	if err := workAheadRequireFooterHash(block, slotCtx.FinalBankhash); err != nil {
 		return nil, err
 	}
 	if err := verifyCaptureBankHash(block.Slot, slotCtx.FinalBankhash); err != nil {
