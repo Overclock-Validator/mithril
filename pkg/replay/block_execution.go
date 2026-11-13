@@ -703,6 +703,11 @@ func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
 			return nil, footerVerificationErr
 		}
 	}
+	// Early executions are only ever accepted in a block whose computed bank
+	// hash was just compared with its footer's (work_ahead_guard.go).
+	if err := workAheadRequireFooterHash(block); err != nil {
+		return nil, err
+	}
 	if err := verifyCaptureBankHash(block.Slot, slotCtx.FinalBankhash); err != nil {
 		return nil, err
 	}

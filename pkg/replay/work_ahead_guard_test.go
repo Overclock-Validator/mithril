@@ -52,6 +52,36 @@ func TestWorkAheadFooterShutoff(t *testing.T) {
 	}
 }
 
+// A block that ran early executions is refused unless it carries a footer bank
+// hash; the refusal switches work-ahead off and asks for a re-replay. Blocks
+// without early executions, and blocks with a hash, are unaffected.
+func TestWorkAheadRequiresFooterHash(t *testing.T) {
+	workAheadTripped.Store(false)
+	defer workAheadTripped.Store(false)
+	markWorkAheadRan(300)
+	if err := workAheadRequireFooterHash(&b.Block{Slot: 301}); err != nil {
+		t.Fatalf("a block without early executions needs no footer hash here: %v", err)
+	}
+	if err := workAheadRequireFooterHash(&b.Block{Slot: 300, HasExpectedBankhash: true}); err != nil {
+		t.Fatalf("a block with a footer hash passes: %v", err)
+	}
+	if err := workAheadRequireFooterHash(nil); err != nil {
+		t.Fatal("no block, no refusal")
+	}
+	err := workAheadRequireFooterHash(&b.Block{Slot: 300})
+	if err == nil {
+		t.Fatal("a block that ran early executions and has no footer hash must be refused")
+	}
+	shut := workAheadFooterShutoff(fmt.Errorf("finalize: %w", err))
+	var spec *SpeculationFooterMismatch
+	if !errors.As(shut, &spec) || spec.Slot != 300 || !workAheadTripped.Load() {
+		t.Fatalf("the refusal must go through the shutoff: %v", shut)
+	}
+	if err := workAheadRequireFooterHash(&b.Block{Slot: 300}); err != nil {
+		t.Fatal("the re-replay runs without early executions and is judged by the ordinary rules")
+	}
+}
+
 // Work-ahead never runs on a locally produced block.
 func TestWorkAheadNeverOnLocalProduction(t *testing.T) {
 	workAheadTripped.Store(false)

@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 )
 
@@ -61,17 +62,52 @@ type SpeculationFooterMismatch struct {
 }
 
 func (e *SpeculationFooterMismatch) Error() string {
-	return fmt.Sprintf("footer bank hash mismatch at slot %d with work-ahead early executions (work-ahead now off): %v", e.Slot, e.Err)
+	return fmt.Sprintf("footer bank hash check failed at slot %d with work-ahead early executions (work-ahead now off): %v", e.Slot, e.Err)
 }
 
 func (e *SpeculationFooterMismatch) Unwrap() error { return e.Err }
 
+// workAheadUncheckedBlock: a block ran early executions but carries no footer
+// bank hash, so nothing would check what they produced.
+type workAheadUncheckedBlock struct{ Slot uint64 }
+
+func (e *workAheadUncheckedBlock) Error() string {
+	return fmt.Sprintf("slot %d ran work-ahead early executions but its block has no footer bank hash to check them against", e.Slot)
+}
+
+// workAheadRequireFooterHash refuses a block that ran early executions unless
+// it has a footer bank hash, which verifyFooterBankHash has then already
+// compared with the computed one. The hash arrives with the block's last
+// shreds, after early executions may have run, so this cannot be decided
+// before execution; it is decided here, where footer verification is, before
+// any store of the bank. The refusal goes through the footer shutoff:
+// work-ahead off, and the slot replayed without it.
+func workAheadRequireFooterHash(block *b.Block) error {
+	if block == nil || block.HasExpectedBankhash || !workAheadRanAt(block.Slot) {
+		return nil
+	}
+	return &workAheadUncheckedBlock{Slot: block.Slot}
+}
+
 // workAheadFooterShutoff turns a footer bank hash mismatch at a slot that ran
-// early executions into a SpeculationFooterMismatch, switching work-ahead off.
-// Any other error is returned unchanged.
+// early executions, or such a slot's block having no footer bank hash at all,
+// into a SpeculationFooterMismatch, switching work-ahead off. Any other error
+// is returned unchanged.
 func workAheadFooterShutoff(err error) error {
 	var mismatch *FooterBankhashMismatch
-	if err == nil || !errors.As(err, &mismatch) || !workAheadRanAt(mismatch.Slot) {
+	var unchecked *workAheadUncheckedBlock
+	var slot uint64
+	switch {
+	case err == nil:
+		return nil
+	case errors.As(err, &mismatch):
+		slot = mismatch.Slot
+	case errors.As(err, &unchecked):
+		slot = unchecked.Slot
+	default:
+		return err
+	}
+	if !workAheadRanAt(slot) {
 		return err
 	}
 	if workAheadTripped.CompareAndSwap(false, true) {
@@ -80,9 +116,9 @@ func workAheadFooterShutoff(err error) error {
 		workAheadRanSlots.mu.Lock()
 		workAheadRanSlots.slots = nil
 		workAheadRanSlots.mu.Unlock()
-		mlog.Log.Errorf("WORK-AHEAD SHUTOFF: footer bank hash mismatch at slot %d, a block with early executions; work-ahead is off for the rest of this process and the slot re-replays from the rooted checkpoint: %v", mismatch.Slot, err)
+		mlog.Log.Errorf("WORK-AHEAD SHUTOFF: footer bank hash check failed or missing at slot %d, a block with early executions; work-ahead is off for the rest of this process and the slot re-replays from the rooted checkpoint: %v", slot, err)
 	}
-	return &SpeculationFooterMismatch{Slot: mismatch.Slot, Err: err}
+	return &SpeculationFooterMismatch{Slot: slot, Err: err}
 }
 
 // MITHRIL_WORK_AHEAD_INJECT_FAULT_SLOT (bench only, exercises the footer
