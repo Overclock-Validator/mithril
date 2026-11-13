@@ -13,8 +13,25 @@ import (
 // so a caller that discards the scratch context can evict them. Execution
 // only reads the remaining fields, which are shared with base.
 func NewScratchSlotCtx(base *SlotCtx) *SlotCtx {
+	return newDerivedSlotCtx(base, accounts.NewOverlayAccounts(base.Accounts))
+}
+
+// NewSealedSlotCtx returns a slot context for an execution that must not change
+// base and whose account reads are all made through view, which the caller
+// controls (a read-only recording view). Everything else an execution reads is
+// constant for the block and shared with base; the bookkeeping an execution
+// could write is private to the returned context, as in a scratch context.
+// The result of such an execution is committed, if at all, against base.
+func NewSealedSlotCtx(base *SlotCtx, view accounts.Accounts) *SlotCtx {
+	return newDerivedSlotCtx(base, view)
+}
+
+// newDerivedSlotCtx is the one place that decides, field by field, what a
+// context derived from base shares with it. TestDerivedSlotCtxFieldsClassified
+// fails when SlotCtx gains a field that is not classified there.
+func newDerivedSlotCtx(base *SlotCtx, accts accounts.Accounts) *SlotCtx {
 	scratch := &SlotCtx{
-		Accounts:                  accounts.NewOverlayAccounts(base.Accounts),
+		Accounts:                  accts,
 		ParentAccts:               base.ParentAccts,
 		AccountsDb:                base.AccountsDb,
 		UnrootedRead:              base.UnrootedRead,

@@ -169,6 +169,10 @@ type workAheadEntry struct {
 	finished  chan struct{} // closed when an execution that started has ended
 	keys      [][32]byte
 	versions  []*accounts.Account
+	// view is the early execution's only route to account state: read-only,
+	// recording the version of every account read through it. Adoption requires
+	// every recorded read to be unchanged and no write to have been attempted.
+	view *accounts.RecordingReader
 	// base: the declared accounts as captured; stable: no captured version
 	// changed while the execution ran (value check).
 	base   []*accounts.Account
@@ -204,6 +208,7 @@ type workAheadStats struct {
 	// committing workers' time blocked on a running early execution: valid (waited) and doomed (abandoned)
 	waitedNs, abandonWaitNs      atomic.Int64
 	unjoined, wasteCapped        atomic.Int64 // doomed runs left running at their turn; admissions refused by the waste cap
+	sealedWrite, extraReads      atomic.Int64 // results that tried to write through the sealed view; accounts read outside the captured read set
 	earlyDropped, earlyAbandoned atomic.Int64
 	uncovered                    atomic.Int64 // results that loaded an account outside their read set
 	race                         workAheadRaceStats
@@ -734,6 +739,7 @@ func (w *workAhead) run(idx int) {
 	e.began = time.Now()
 	e.arena = workerArena
 	e.keys, e.versions, e.base = workAheadReadSet(w.slotCtx, w.overlay, tx)
+	e.view = accounts.NewRecordingReader(w.overlay)
 	var overrides map[solana.PublicKey]*accounts.Account
 	if workAheadPredictPayer {
 		overrides = w.predictPayers(e, idx)
@@ -743,8 +749,13 @@ func (w *workAhead) run(idx int) {
 	}
 	e.mu.Unlock()
 
+	// The early execution runs on a sealed slot context: every account it
+	// reads comes through e.view, which records the version read and refuses
+	// writes, and the context's own bookkeeping is private. The block constants
+	// are shared with the real context (sealevel.NewSealedSlotCtx).
+	sealed := sealevel.NewSealedSlotCtx(w.slotCtx, e.view)
 	captureTx := len(tx.Signatures) > 0 && txCaptureActive()
-	input := transactionExecutionInput(w.slotCtx, tx, w.txMeta(idx), workerArena, false, captureTx)
+	input := transactionExecutionInput(sealed, tx, w.txMeta(idx), workerArena, false, captureTx)
 	input.Speculative = true
 	if workAheadCancel {
 		input.SpeculativeCancel = &e.cancel
@@ -795,8 +806,26 @@ func (w *workAhead) ran(idx int, e *workAheadEntry, output LoadAndExecuteTransac
 			e.arena = nil
 		}
 	} else {
+		if e.view != nil && e.view.Wrote() {
+			// It tried to change account state, or to read it in a way that
+			// cannot be recorded: whatever it returned is not a result.
+			if !panicked {
+				w.stats.sealedWrite.Add(1)
+				sig := "(unsigned)"
+				if tx := w.txs[idx]; tx != nil && len(tx.Signatures) > 0 {
+					sig = tx.Signatures[0].String()
+				}
+				mlog.Log.Errorf("work-ahead execution of tx %s tried to write through its sealed account view; result discarded", sig)
+			}
+			panicked = true
+		}
 		e.output, e.panicked = output, panicked
 		e.uncovered = !panicked && !w.readSetCovers(e)
+		if e.view != nil {
+			if extra := len(e.view.Reads()) - len(e.keys); extra > 0 {
+				w.stats.extraReads.Add(int64(extra))
+			}
+		}
 		e.state = workAheadFinished
 		w.funnel.finished(idx)
 	}
@@ -970,6 +999,11 @@ func (w *workAhead) claim(idx int) (*LoadAndExecuteTransactionOutput, func()) {
 		w.claims.record(idx, e, waitedAt, -1)
 	}
 	output := &e.output
+	// The result was produced on a sealed context; it is committed against
+	// the real one.
+	if output.ExecCtx != nil {
+		output.ExecCtx.SlotCtx = w.slotCtx
+	}
 	w.injectFault(output)
 	e.mu.Unlock()
 	w.stats.adopted.Add(1)
@@ -1222,7 +1256,34 @@ func (w *workAhead) readSetMatches(e *workAheadEntry, stable bool) bool {
 			w.stats.valueRescued.Add(1)
 		}
 	}
-	return true
+	return w.viewUnchanged(e)
+}
+
+// viewUnchanged checks every account the early execution actually read through
+// its sealed view, including any outside the captured read set: each must still
+// have the version it was read at. Predicted accounts never reach the view's
+// verdict (the loop above compares them by value). With the value check on, the
+// captured keys are left to that loop too, which may accept a moved version by
+// content; without it every recorded read must hold here, whatever the loop
+// above concluded.
+func (w *workAhead) viewUnchanged(e *workAheadEntry) bool {
+	if e.view == nil {
+		return true
+	}
+	return e.view.Unchanged(func(key [32]byte) bool {
+		if _, ok := e.predicted[key]; ok {
+			return true
+		}
+		if !workAheadValueCheck {
+			return false
+		}
+		for _, k := range e.keys {
+			if k == key {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 // readSetCovers reports whether every account the early execution loaded into
@@ -1310,9 +1371,9 @@ func (w *workAhead) finish(slot uint64) {
 	w.funnel.report(slot)
 	if workAheadLog {
 		s := &w.stats
-		mlog.Log.Infof("work-ahead slot %d: offered %d offered-fail %d executed %d adopted %d waited %d invalid %d abandoned %d late %d no-arena %d panicked %d offer-us %d predicted-payer %d verified %d verified-predicted %d verify-mismatch %d verified-nonce %d over-budget %d wasted-kcu %d wasted-us %d value-rescued %d waited-us %d abandon-wait-us %d early-dropped %d early-abandoned %d unjoined %d waste-capped %d",
+		mlog.Log.Infof("work-ahead slot %d: offered %d offered-fail %d executed %d adopted %d waited %d invalid %d abandoned %d late %d no-arena %d panicked %d offer-us %d predicted-payer %d verified %d verified-predicted %d verify-mismatch %d verified-nonce %d over-budget %d wasted-kcu %d wasted-us %d value-rescued %d waited-us %d abandon-wait-us %d early-dropped %d early-abandoned %d unjoined %d waste-capped %d sealed-write %d extra-reads %d",
 			slot, s.offered.Load(), s.offeredFail.Load(), s.executed.Load(), s.adopted.Load(), s.waited.Load(), s.invalid.Load(), s.abandoned.Load(), s.late.Load(), s.noArena.Load(), s.panicked.Load(), s.offerNs.Load()/1000,
-			s.predictedPayer.Load(), s.verified.Load(), s.verifiedPredicted.Load(), s.verifyMismatch.Load(), s.verifiedNonce.Load(), s.overBudget.Load(), w.wastedKCU.Load(), w.wastedNs.Load()/1000, s.valueRescued.Load(), s.waitedNs.Load()/1000, s.abandonWaitNs.Load()/1000, s.earlyDropped.Load(), s.earlyAbandoned.Load(), s.unjoined.Load(), s.wasteCapped.Load())
+			s.predictedPayer.Load(), s.verified.Load(), s.verifiedPredicted.Load(), s.verifyMismatch.Load(), s.verifiedNonce.Load(), s.overBudget.Load(), w.wastedKCU.Load(), w.wastedNs.Load()/1000, s.valueRescued.Load(), s.waitedNs.Load()/1000, s.abandonWaitNs.Load()/1000, s.earlyDropped.Load(), s.earlyAbandoned.Load(), s.unjoined.Load(), s.wasteCapped.Load(), s.sealedWrite.Load(), s.extraReads.Load())
 		// Per assumed-failure count d: d:executed/adopted/invalid/abandoned/capped.
 		var depth strings.Builder
 		for d := range s.byDepth {
