@@ -2,10 +2,11 @@ package replay
 
 import (
 	"bytes"
-	"hash/fnv"
+	"hash/maphash"
 	"os"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
@@ -112,18 +113,22 @@ func (w *workAhead) programKey(tx int) uint64 {
 // programKeyOf hashes the distinct non-plumbing programs among the top-level
 // instruction program ids, in sorted order; never 0, which marks "not computed".
 func programKeyOf(ids []solana.PublicKey) uint64 {
-	var programs []solana.PublicKey
+	var buf [8]solana.PublicKey
+	programs := buf[:0]
 	for _, program := range ids {
 		if !slices.Contains(plumbingPrograms, program) && !slices.Contains(programs, program) {
 			programs = append(programs, program)
 		}
 	}
 	slices.SortFunc(programs, func(a, b solana.PublicKey) int { return bytes.Compare(a[:], b[:]) })
-	h := fnv.New64a()
-	for _, program := range programs {
-		h.Write(program[:])
+	// FNV-1a, 64 bit
+	h := uint64(14695981039346656037)
+	for i := range programs {
+		for _, c := range programs[i] {
+			h = (h ^ uint64(c)) * 1099511628211
+		}
 	}
-	return h.Sum64() | 1
+	return h | 1
 }
 
 // observe folds tx's committed outcome and execution time into the program
@@ -257,10 +262,22 @@ func init() {
 }
 
 const (
-	unchangedShards       = 64
-	unchangedPerShard     = 1 << 14
 	unchangedMinObserved  = 3
 	unchangedMinRateTenth = 9 // at least 90% unchanged
+
+	// The history is one fixed table of packed words, shared across blocks:
+	// no locks, no pointers for the collector to trace, nothing allocated per
+	// key. A key hashes to a pair of adjacent slots (one cache line); a new key
+	// takes the empty one or replaces the less observed. The table is advisory
+	// (it only chooses what is offered early), so a lost update between racing
+	// writers, an evicted key or a tag collision costs at most a missed or a
+	// discarded early execution.
+	unchangedSlotsLog2 = 20
+	unchangedSlots     = 1 << unchangedSlotsLog2
+
+	// word layout: tag (32) | total (16) | last changed (1) | unchanged (15)
+	unchangedCountMax    = 1<<15 - 1
+	unchangedLastChanged = 1 << 15
 )
 
 type unchangedKey struct {
@@ -268,17 +285,11 @@ type unchangedKey struct {
 	account [32]byte
 }
 
-type unchangedStat struct {
-	unchanged, total uint32
-	lastChanged      bool
-}
-
-// unchangedStats is shared across blocks; shards are emptied when full.
-var unchangedStats [unchangedShards]struct {
-	mu    sync.RWMutex
-	stats map[unchangedKey]*unchangedStat
-	_     [32]byte
-}
+var (
+	unchangedTable [unchangedSlots]atomic.Uint64
+	// seeded per process, so which keys share a slot cannot be chosen in advance
+	unchangedSeed = maphash.MakeSeed()
+)
 
 // roleKey is the unchanged-history key of the account at position pos of a
 // top-level instruction of program with the given data. Role keys put the
@@ -291,38 +302,69 @@ func roleKey(program solana.PublicKey, data []byte, pos int) unchangedKey {
 	return unchangedKey{program: 1<<63 | first<<16 | uint64(pos), account: [32]byte(program)}
 }
 
-func unchangedShard(k unchangedKey) int {
-	return int((uint64(k.account[0]) ^ k.program) % unchangedShards)
+// unchangedSlot returns the first slot of k's pair and its tag.
+func unchangedSlot(k unchangedKey) (slot int, tag uint64) {
+	h := (maphash.Bytes(unchangedSeed, k.account[:]) ^ k.program) * 0x9E3779B97F4A7C15
+	h ^= h >> 29
+	return int(h>>(64-unchangedSlotsLog2)) &^ 1, (h & 0xFFFFFFFF) << 32
+}
+
+func unchangedCounts(word uint64) (unchanged, total uint64) {
+	return word & unchangedCountMax, word >> 16 & 0xFFFF
+}
+
+// findUnchanged returns k's word, or 0 when it has no history.
+func findUnchanged(k unchangedKey) uint64 {
+	slot, tag := unchangedSlot(k)
+	for i := slot; i < slot+2; i++ {
+		if word := unchangedTable[i].Load(); word != 0 && word&^0xFFFFFFFF == tag {
+			return word
+		}
+	}
+	return 0
 }
 
 func recordUnchanged(k unchangedKey, unchanged bool) {
-	shard := &unchangedStats[unchangedShard(k)]
-	shard.mu.Lock()
-	if shard.stats == nil || len(shard.stats) >= unchangedPerShard {
-		shard.stats = make(map[unchangedKey]*unchangedStat, unchangedPerShard)
+	slot, tag := unchangedSlot(k)
+	first, second := unchangedTable[slot].Load(), unchangedTable[slot+1].Load()
+	at, word := slot, uint64(0)
+	_, firstTotal := unchangedCounts(first)
+	_, secondTotal := unchangedCounts(second)
+	switch {
+	case first != 0 && first&^0xFFFFFFFF == tag:
+		word = first
+	case second != 0 && second&^0xFFFFFFFF == tag:
+		at, word = slot+1, second
+	case secondTotal < firstTotal:
+		at = slot + 1 // new key: the empty or less observed slot
 	}
-	s := shard.stats[k]
-	if s == nil {
-		s = &unchangedStat{}
-		shard.stats[k] = s
+	same, total := unchangedCounts(word)
+	if total >= unchangedCountMax {
+		same, total = same/2, total/2 // keep the rate, make room
 	}
-	s.total++
+	total++
+	word = tag | total<<16
 	if unchanged {
-		s.unchanged++
+		word |= same + 1
+	} else {
+		word |= same | unchangedLastChanged
 	}
-	s.lastChanged = !unchanged
-	shard.mu.Unlock()
+	unchangedTable[at].Store(word)
 }
 
 // predictsUnchanged: seen at least unchangedMinObserved times, at least 90%
 // unchanged, and unchanged the last time.
 func predictsUnchanged(k unchangedKey) bool {
-	shard := &unchangedStats[unchangedShard(k)]
-	shard.mu.RLock()
-	s := shard.stats[k]
-	ok := s != nil && s.total >= unchangedMinObserved && !s.lastChanged && 10*s.unchanged >= unchangedMinRateTenth*s.total
-	shard.mu.RUnlock()
-	return ok
+	word := findUnchanged(k)
+	same, total := unchangedCounts(word)
+	return total >= unchangedMinObserved && word&unchangedLastChanged == 0 && 10*same >= unchangedMinRateTenth*total
+}
+
+// resetUnchangedHistory empties the table.
+func resetUnchangedHistory() {
+	for i := range unchangedTable {
+		unchangedTable[i].Store(0)
+	}
 }
 
 // learnUnchanged records, at a successful commit, which of the transaction's
@@ -339,7 +381,8 @@ func learnUnchanged(execCtx *sealevel.ExecutionCtx) {
 	}
 	var program uint64
 	if !workAheadUnchangedByRole {
-		ids := make([]solana.PublicKey, 0, len(txCtx.AllInstructions))
+		var buf [16]solana.PublicKey
+		ids := buf[:0]
 		for _, instr := range txCtx.AllInstructions {
 			ids = append(ids, instr.ProgramId)
 		}

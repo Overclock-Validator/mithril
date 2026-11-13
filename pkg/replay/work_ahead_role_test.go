@@ -8,13 +8,7 @@ import (
 	"github.com/gagliardetto/solana-go"
 )
 
-func resetUnchangedStatsForTest() {
-	for i := range unchangedStats {
-		unchangedStats[i].mu.Lock()
-		unchangedStats[i].stats = nil
-		unchangedStats[i].mu.Unlock()
-	}
-}
+func resetUnchangedStatsForTest() { resetUnchangedHistory() }
 
 // Role keys learn per (program, first data byte, position) and so predict
 // accounts never seen before that fill a learned role.

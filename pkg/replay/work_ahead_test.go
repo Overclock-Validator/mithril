@@ -951,13 +951,7 @@ func TestWorkAheadValueCheck(t *testing.T) {
 
 // resetUnchangedStats empties the process-wide unchanged table, so a test's
 // history does not depend on earlier tests or repeated runs.
-func resetUnchangedStats() {
-	for i := range unchangedStats {
-		unchangedStats[i].mu.Lock()
-		unchangedStats[i].stats = nil
-		unchangedStats[i].mu.Unlock()
-	}
-}
+func resetUnchangedStats() { resetUnchangedHistory() }
 
 // Without the value check the unchanged table learns only what the version
 // check can adopt: an account the transaction never borrowed for writing. One
