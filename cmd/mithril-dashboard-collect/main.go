@@ -16,7 +16,7 @@ import (
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
-	profile := flag.String("profile", "alpenglow", "fixed public provider profile (alpenglow only)")
+	profile := flag.String("profile", "alpenglow", "fixed public provider profile (alpenglow, mainnet, or mainnet-publicnode)")
 	output := flag.String("output", "", "atomic snapshot destination in an existing private/group-readable directory")
 	performance := flag.Bool("performance-sample", false, "Include one RPC performance sample; requires a compatible reader and client")
 	history := flag.Bool("performance-history", false, "Include up to 120 RPC performance samples; requires a compatible reader and client")
@@ -50,6 +50,9 @@ func main() {
 
 func collectionSucceeded(snapshot cluster.Snapshot) bool {
 	for _, p := range snapshot.Providers {
+		if snapshot.Profile == "mainnet" && p.ID != "rpc" {
+			continue
+		}
 		if p.State != "fresh" && !(p.ID == "puffin" && ((p.State == "unavailable" && p.Reason == "not_collected") || (p.State == "retired" && p.Reason == "provider_retired"))) {
 			return false
 		}

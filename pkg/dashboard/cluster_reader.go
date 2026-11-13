@@ -203,9 +203,10 @@ func projectCluster(snapshot *cluster.Snapshot, generation, state, reason string
 
 func projectClusterAnchored(snapshot *cluster.Snapshot, generation, state, reason string, now, anchor time.Time) *clusterView {
 	v := &clusterView{metadata: clusterMetadata{SchemaVersion: 1, Scope: "independent_cluster", State: state,
-		Reason: reason, CollectorAt: anchor.UTC(), Profile: "alpenglow", Network: "alpenglow-community", FastState: "unavailable",
+		Reason: reason, CollectorAt: anchor.UTC(), Profile: "unknown", Network: "unknown", FastState: "unavailable",
 		Providers: []cluster.ProviderStatus{}}, pollStarted: anchor, leaseStarted: anchor, rows: []cluster.Validator{}, orders: make(map[string][]int)}
 	if snapshot != nil {
+		v.metadata.Profile, v.metadata.Network = snapshot.Profile, snapshot.Network
 		// Keep the monotonic clock while accounting for age at the start of the poll.
 		includeAge := func(source time.Time) {
 			if age := now.Sub(source); age > 0 {
@@ -322,7 +323,7 @@ func projectClusterAnchored(snapshot *cluster.Snapshot, generation, state, reaso
 	versions := clusterVersions{clusterMetadata: v.metadata, TotalRows: len(v.rows), Versions: []clusterVersion{}}
 	versionCounts := make(map[string]int)
 	for _, row := range v.rows {
-		if row.DirectorySource != "solstat" {
+		if row.DirectorySource != "solstat" && row.DirectorySource != "rpc" {
 			continue
 		}
 		versions.SourceRows++
