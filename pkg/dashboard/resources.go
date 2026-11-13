@@ -18,6 +18,7 @@ type PublicResources struct {
 	Ledger     *PublicFilesystem      `json:"ledger"`
 	Host       *PublicHostResources   `json:"host,omitempty"`
 	Cgroup     *PublicCgroupResources `json:"cgroup,omitempty"`
+	Compaction *PublicCompaction      `json:"compaction,omitempty"`
 	GoRuntime  *PublicGoRuntime       `json:"go_runtime,omitempty"`
 }
 
@@ -113,6 +114,7 @@ func publicResources(s *Snapshot, state string, now time.Time) *PublicResources 
 		p.CPUSeconds = &value
 	}
 	p.Root, p.Accounts, p.Ledger = publicFilesystem(r.Root), publicFilesystem(r.Accounts), publicFilesystem(r.Ledger)
+	p.Compaction = publicCompaction(r.Compaction, r.SampledAt, now)
 	if g := s.Runtime; g != nil && validPublicTime(g.SampledAt, now) && !g.SampledAt.Before(s.StartedAt) &&
 		!g.SampledAt.After(s.SampledAt.Add(time.Second)) && g.MemoryLimitBytes >= 0 && g.Goroutines >= 0 {
 		p.GoRuntime = &PublicGoRuntime{PublicObservation: publicObservation(g.SampledAt, state, now),

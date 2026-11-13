@@ -37,7 +37,7 @@ func TestDashboardReplayDetailsEnableBeforeReplay(t *testing.T) {
 					t.Error(err)
 				}
 			})
-			d := startNodeDashboard(context.Background(), time.Now().UTC(), filepath.Join(dir, "node.sock"), "", "owner-run", "isolated", "verifying", false, false, false, false, false, false, enabled, false)
+			d := startNodeDashboard(context.Background(), time.Now().UTC(), filepath.Join(dir, "node.sock"), "", "owner-run", "isolated", "verifying", false, false, enabled, false, false, false, false, false, false, false, false)
 			if d == nil {
 				t.Fatal("private dashboard feed did not start")
 			}

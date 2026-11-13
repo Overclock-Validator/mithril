@@ -54,9 +54,15 @@ func TestReplayNearReceptionActualSourceHook(t *testing.T) {
 	}
 	// Disposable deterministic fixture identity; no operator key or chain state.
 	key := solana.PrivateKey(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)))
+	history, err := turbine.NewShredHistory(turbine.ShredHistoryBinding{RunID: "actual-near-reception",
+		NodeStartedAt: time.Now(), GenesisHash: solana.Hash{1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { history.CloseAfterProducers() })
 	source := blockstream.NewBlockSource(&blockstream.BlockSourceOpts{SourceType: blockstream.BlockSourceTurbine,
 		RpcClient: rpcclient.NewRpcClient(rpc.URL), StartSlot: 42, EndSlot: 43, MaxInflight: 1, TipPollMs: 500,
-		DisableRPCBlockFetch: true, TurbineBindAddr: address, TurbineShredVersion: 7,
+		DisableRPCBlockFetch: true, TurbineBindAddr: address, TurbineShredVersion: 7, ShredHistory: history,
 		LeaderForSlot: func(uint64) (solana.PublicKey, bool) { return key.PublicKey(), true }})
 	p := diagnosticProgress(t)
 	p.sourceStarted(source)
@@ -126,6 +132,21 @@ func TestReplayNearReceptionActualSourceHook(t *testing.T) {
 	s, _ := p.ReplayDiagnosticsSnapshot()
 	if s.NearReception.ObservedAt.IsZero() || s.NearReception.Bankhash != (solana.Hash{2}) || !s.NearReception.CompletedAt.Equal(completedAt) {
 		t.Fatal("actual cache to new completed-row hook did not capture the original bank")
+	}
+	for {
+		metadata, ok := history.Metadata()
+		if ok && metadata.MarkerState == turbine.ShredHistoryMarkerClosed && metadata.Marker != nil {
+			m := metadata.Marker
+			if m.At != completedAt || m.At == m.At.Round(0) || m.Slot != 42 || m.Bankhash != (solana.Hash{2}) ||
+				m.ReplayAttempt != s.Attempt || m.Rewinds != s.Rewinds || m.CompletedIndex != 2 || m.SourceGeneration != 1 {
+				t.Fatalf("actual startup marker lost original completion/receiver context: %+v", m)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("actual replay completion did not reach the shared history owner")
+		}
+		time.Sleep(time.Millisecond)
 	}
 	want := s.NearReception
 	p.recordReplayDiagnostic(time.Now(), &row, nil)

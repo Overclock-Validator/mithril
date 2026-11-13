@@ -14,9 +14,6 @@ mainnet genesis and epoch before and after capture. Mainnet directory rows come
 from vote accounts; version and country information comes from matching gossip
 contacts when available. FAST, inclusion and skip-rate data are unavailable.
 
-Add `--performance-sample` for one recent RPC sample, or
-`--performance-history` for up to 120 samples.
-
 Provision the directory and reader group separately. The cache is written with
 mode `0640`; a setgid directory can supply the intended reader group. A scheduler
 may invoke the command periodically (for example once per minute). Do not run it

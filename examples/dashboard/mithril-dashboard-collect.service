@@ -1,0 +1,27 @@
+[Unit]
+Description=Mithril public cluster data collection
+
+[Service]
+Type=oneshot
+User=mithril-dashboard-collect
+Group=mithril-dashboard
+StateDirectory=mithril-dashboard-cluster
+StateDirectoryMode=0750
+ExecStart=/usr/local/bin/mithril-dashboard-collect --profile alpenglow --output /var/lib/mithril-dashboard-cluster/cluster.json
+TimeoutStartSec=65
+UMask=0027
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+SystemCallArchitectures=native
+SystemCallFilter=~@mount
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+InaccessiblePaths=-/srv/mithril-node -/run/mithril-node -/run/mithril-dashboard-feed -/var/lib/mithril-dashboard-history
+MemoryMax=256M
+MemorySwapMax=0
+CPUQuota=25%
+TasksMax=128

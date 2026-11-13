@@ -29,6 +29,9 @@ type TurbinePrewarm struct {
 	cancel   context.CancelFunc
 	done     chan struct{}
 	receiver *turbine.UDPReceiver
+	// runDone is present only for history capture: drainer completion can
+	// precede Run's final source-retirement defer.
+	runDone chan struct{}
 
 	mu               sync.Mutex
 	spool            map[uint64]*b.Block
@@ -83,10 +86,16 @@ type TurbinePrewarmConfig struct {
 	// RepairMaxRequestsPerSecond mirrors the BlockSource's repair rate
 	// ceiling override (0 = default).
 	RepairMaxRequestsPerSecond int
-	// GossipObserver receives the bootstrap client without sampling it.
+	// GossipObserver receives the actual bootstrap client without sampling it.
+	// Nil leaves the existing prewarm monitoring behavior unchanged.
 	GossipObserver func(*gossipclient.Client)
-	// ObserveHandover receives one summary after the first handover.
+	// ObserveHandover receives one detached summary after the first handover
+	// drains collection. It runs synchronously outside the prewarm lock and
+	// must return promptly. Nil adds no observation clocks or sampling.
 	ObserveHandover func(TurbinePrewarmHandoverObservation)
+	// ShredHistory is an optional shared node-run owner. The receiver registers
+	// its own prewarm generation; this collector never closes the shared owner.
+	ShredHistory *turbine.ShredHistory
 }
 
 // StartTurbinePrewarm joins gossip, starts a shred receiver with the
@@ -184,8 +193,17 @@ func StartTurbinePrewarm(cfg TurbinePrewarmConfig) (*TurbinePrewarm, error) {
 		}
 	}()
 	receiverDone := make(chan error, 1)
+	if cfg.ShredHistory != nil {
+		pw.runDone = make(chan struct{})
+		if handle, ok := cfg.ShredHistory.RegisterSource(turbine.ShredHistoryPrewarm, time.Now()); ok {
+			receiver.SetShredHistoryBeforeRun(handle)
+		}
+	}
 	go func() {
 		receiverDone <- receiver.Run(ctx)
+		if pw.runDone != nil {
+			close(pw.runDone)
+		}
 	}()
 
 	var readyErr error
@@ -201,6 +219,9 @@ func StartTurbinePrewarm(cfg TurbinePrewarmConfig) (*TurbinePrewarm, error) {
 	}
 	if readyErr != nil {
 		cancel()
+		if pw.runDone != nil {
+			<-pw.runDone
+		}
 		close(pw.done)
 		return nil, readyErr
 	}
@@ -359,7 +380,8 @@ func (pw *TurbinePrewarm) logProbeOutcome() (TurbinePrewarmRepairObservation, bo
 }
 
 // Stop tears the prewarm receiver and gossip session down and waits for the
-// drainer to exit. It is idempotent.
+// drainer to exit. With history enabled it also joins receiver retirement
+// before the shared history owner can be drained. Idempotent.
 func (pw *TurbinePrewarm) Stop() {
 	pw.mu.Lock()
 	if pw.stopped {
@@ -370,4 +392,7 @@ func (pw *TurbinePrewarm) Stop() {
 		pw.cancel()
 	}
 	<-pw.done
+	if pw.runDone != nil {
+		<-pw.runDone
+	}
 }

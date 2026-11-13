@@ -1,7 +1,6 @@
 package dashboard
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -96,18 +95,7 @@ func newNetworkDetailReader(client *http.Client, gate *atomic.Pointer[networkDet
 }
 
 func (r *networkDetailReader) run(ctx context.Context) {
-	defer close(r.done)
-	defer r.client.CloseIdleConnections()
-	for ctx.Err() == nil {
-		r.collect(ctx)
-		timer := time.NewTimer(networkDetailCollectInterval)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return
-		case <-timer.C:
-		}
-	}
+	runDetailReader(ctx, r.done, r.client, networkDetailCollectInterval, r.collect)
 }
 
 func (r *networkDetailReader) fetch(parent context.Context) ([]byte, time.Duration, time.Time, string) {
@@ -119,20 +107,7 @@ func parseNetworkDetailRemaining(value string) (time.Duration, error) {
 }
 
 func decodeNetworkDetailFailure(body []byte) string {
-	var value struct {
-		SchemaVersion int    `json:"schema_version"`
-		Family        string `json:"family"`
-		State         string `json:"state"`
-		Reason        string `json:"reason"`
-	}
-	if json.Unmarshal(body, &value) != nil || value.SchemaVersion != 1 || value.Family != "network" || value.State != "unavailable" {
-		return "source_invalid"
-	}
-	canonical, err := json.Marshal(value)
-	if err != nil || !bytes.Equal(body, canonical) || !networkDetailSourceReason(value.Reason) {
-		return "source_invalid"
-	}
-	return value.Reason
+	return decodeDetailFailure(body, "network", networkDetailSourceReason)
 }
 
 func networkDetailSourceReason(reason string) bool {
@@ -370,8 +345,7 @@ func (c *collector) admitNetworkDetail(r *networkDetailReader, reply networkDeta
 
 func (r *networkDetailReader) serveHTTP(w http.ResponseWriter, request *http.Request) {
 	reply := networkDetailFailure("invalid_request")
-	if request.Method == http.MethodGet && request.URL.Path == "/api/v1/details/network" && request.URL.EscapedPath() == "/api/v1/details/network" &&
-		request.URL.RawQuery == "" && !request.URL.ForceQuery && request.ContentLength == 0 && len(request.TransferEncoding) == 0 {
+	if validDetailGet(request, "/api/v1/details/network") {
 		if r.limit.Allow() {
 			pull := request.Header.Get(networkPullRequestsHeader) == "1"
 			mtu := pull && request.Header.Get(networkMTUHeader) == "1"

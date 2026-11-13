@@ -68,6 +68,9 @@ type CompactionConfig struct {
 	// the middle of publishing its durable reclamation marker.
 	MaxFilesPerCycle int
 	MaxDuration      time.Duration
+	// ObserveInventory records the existing tracked view for diagnostics only.
+	// It does not request another directory scan or change candidate selection.
+	ObserveInventory bool
 }
 
 // CompactStats reports one CompactOnce cycle.
@@ -78,6 +81,35 @@ type CompactStats struct {
 	FilesSparsified   int // dead payload pages released without moving live/undo records
 	LiveBytesMoved    int64
 	BytesReclaimed    int64 // source bytes freed (compacted + deleted)
+	Inventory         CompactionInventoryObservation
+	Liveness          CompactionLivenessObservation
+}
+
+// CompactionInventoryObservation is the tracked data-file view before candidate
+// processing, not a current directory census or an account-liveness estimate.
+type CompactionInventoryObservation struct {
+	Known               bool
+	DBOpenedAt          time.Time
+	ObservedAt          time.Time
+	DataFiles           uint64
+	ManifestNames       uint64
+	LogicalBytes        uint64
+	AllocatedBytes      uint64
+	AllocatedBytesKnown bool
+}
+
+func (o *CompactionInventoryObservation) addFile(size, allocated int64) {
+	if !o.Known {
+		return
+	}
+	if size < 0 || allocated < 0 || uint64(size) > ^uint64(0)-o.LogicalBytes || o.AllocatedBytesKnown && uint64(allocated) > ^uint64(0)-o.AllocatedBytes {
+		*o = CompactionInventoryObservation{}
+		return
+	}
+	o.LogicalBytes += uint64(size)
+	if o.AllocatedBytesKnown {
+		o.AllocatedBytes += uint64(allocated)
+	}
 }
 
 const (
@@ -190,7 +222,17 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 
 	bootstrapHigh := db.bootstrapHighFileId()
 	candidates := make([]compactCandidate, 0, len(inv.data))
+	if cfg.ObserveInventory {
+		stats.Liveness.Known = true
+		stats.Inventory = CompactionInventoryObservation{Known: true, DBOpenedAt: db.storageOpenedAt,
+			DataFiles: uint64(len(inv.data)), ManifestNames: uint64(len(inv.manifests)),
+			// Only the Linux inventory uses st_blocks; other platforms retain a logical-size fallback.
+			AllocatedBytesKnown: sparseCompactionSupported}
+	}
 	for name, file := range inv.data {
+		if cfg.ObserveInventory {
+			stats.Inventory.addFile(file.size, file.allocated)
+		}
 		slot, fileId := file.slot, file.fileId
 		if _, isPinned := pinned.whole[fileId]; isPinned {
 			continue
@@ -217,6 +259,9 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 			alreadySparse: (manifest.Kind == ManifestKindCompact && manifest.DataCRC == 0) || db.compactLastScan[fileId] != 0,
 			scanOrder:     db.compactLastScan[fileId],
 		})
+	}
+	if stats.Inventory.Known {
+		stats.Inventory.ObservedAt = time.Now()
 	}
 	db.compactCycles++
 	queue := newCompactCandidateQueue(candidates, db.sparseCursor, db.compactCursor, db.resparseNext, db.compactCycles%8 == 0)
@@ -249,8 +294,16 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 			db.compactCursor = compactCandidateKey(c)
 		}
 		stats.CandidatesScanned++
+		var liveness compactionLivenessScan
+		var observation *compactionLivenessScan
+		if cfg.ObserveInventory {
+			observation = &liveness
+		}
 		if c.manifestPath != "" && c.size >= sparseCompactionMinSize && sparseCompactionSupported {
-			reclaimed, scanned, deleted, err := db.sparsifyFile(c, pinned.records[c.fileId], &indexCache)
+			reclaimed, scanned, deleted, err := db.sparsifyFile(c, pinned.records[c.fileId], &indexCache, observation)
+			if observation != nil {
+				stats.Liveness.addCandidate(c.size, true, liveness)
+			}
 			scannedBytes += scanned
 			if err != nil {
 				return stats, fmt.Errorf("accountsdb: sparsify %s: %w", c.name, err)
@@ -273,7 +326,10 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 
 		// compactFile may publish new index locations. Never reuse values across it.
 		indexCache = sparseIndexCache{}
-		acted, moved, err := db.compactFile(c, cfg.MinDeadFraction)
+		acted, moved, err := db.compactFile(c, cfg.MinDeadFraction, observation)
+		if observation != nil {
+			stats.Liveness.addCandidate(c.size, false, liveness)
+		}
 		if err != nil {
 			return stats, fmt.Errorf("accountsdb: compact %s: %w", c.name, err)
 		}
@@ -499,7 +555,7 @@ type compactionPinCache struct {
 // to a fresh output file and unlinks the source. Returns (acted, liveBytesMoved).
 // acted=false means the file was left alone (too live). liveBytesMoved==0 with
 // acted=true means the fully-dead fast path (source deleted, nothing written).
-func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (bool, int64, error) {
+func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64, observation *compactionLivenessScan) (bool, int64, error) {
 	srcPath := c.path
 	data, err := os.ReadFile(srcPath)
 	if err != nil {
@@ -526,6 +582,18 @@ func (db *AccountsDb) compactFile(c compactCandidate, minDeadFraction float64) (
 	var liveBytes int64
 	for _, i := range liveIdx {
 		liveBytes += recordLenAt(data, idxEntries[i].Offset)
+	}
+	if observation != nil && liveBytes >= 0 {
+		// The appendvec parser can stop at unused tail space. Only classify the
+		// whole file when its final parsed record actually covers the file.
+		complete := len(data) == 0
+		if len(idxEntries) > 0 {
+			last := idxEntries[len(idxEntries)-1].Offset
+			complete = last+uint64(recordLenAt(data, last)) == uint64(len(data))
+		}
+		if complete {
+			*observation = compactionLivenessScan{complete: true, examined: uint64(len(data)), live: uint64(liveBytes)}
+		}
 	}
 
 	if len(data) == 0 || len(liveIdx) == 0 {

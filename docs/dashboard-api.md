@@ -29,17 +29,12 @@ full-epoch rate or a FAST score, and it may differ from external dashboards.
 
 ## Connecting a dashboard
 
-For optional cluster-wide data, run the separate
-[`mithril-dashboard-collect` command](../cmd/mithril-dashboard-collect/README.md)
-and pass its output to the public reader with `--cluster-file`. The command
-collects from fixed public sources; the reader only reads the resulting file.
-Cluster collection is separate from the linked node's own status.
-
 After the [public profile](#public-profile) and its HTTPS proxy are configured,
 a dashboard can read one node from that origin:
 
 - `GET /api/v1/status` returns the current public status object.
-- `GET /api/v1/features` lists the optional route families enabled on the reader.
+- `GET /api/v1/features` lists the reader's basic optional route families; add
+  `?include=advanced_status` to list advanced families.
 - `/websocket` sends status updates with topic `mithril` and key `public`;
   the `value` has the same shape as the status response for the same profile.
 
@@ -76,6 +71,47 @@ status remains stale when its timestamp or clock checks fail.
 
 For field definitions, optional routes, and the WebSocket contract, see the
 [API reference](dashboard-api-reference.md).
+
+## Optional dashboard data
+
+The node and reader enable additional observations separately. All options
+are off by default. Node options require the dashboard socket; the matching
+reader options require a public profile and, for resource-related details,
+`--public-resources`. Enable only the information you intend to share.
+
+| Node option | Reader option | Data |
+| --- | --- | --- |
+| `--dashboard-replay-details` | `--replay-details` | Bounded replay, selected-slot and rooted-bank details |
+| `--dashboard-network-details` | `--network-details` | Locally owned network and repair observations |
+| `--dashboard-cache-details` | `--cache-details` | AccountsDB cache observations |
+| `--dashboard-production-details` | `--production-details` | Local block-production observations |
+| `--dashboard-storage-details` | `--storage-details` | Database write-stall observations |
+| `--dashboard-machine-details` | `--machine-details` | Bounded machine and worker information |
+| `--dashboard-local-peers` | `--local-peers` | Locally observed signed-contact metadata |
+| `--dashboard-shred-history` | `--reception-history` | Bounded authenticated shred reception history |
+
+Machine details also require the node's `--dashboard-host-resources`.
+Local peers require the node's network details. Reception history requires
+the node's replay and network details with a Turbine block source, and the
+reader's replay and network details. Cgroup resources, cache activity and
+storage I/O have separate node opt-ins. See `mithril run --help` and
+`mithril-dashboard --help` for their requirements.
+The reader's `--public-harmonic` separately includes configured Harmonic
+health in the advanced status profile when public resources are enabled.
+
+The reader can also retain aggregate history with `--history-dir` or read
+an external cluster snapshot with `--cluster-file`. The latter is written
+by the separate `mithril-dashboard-collect` command and currently uses its
+fixed Alpenglow provider profile. A provider failure is reported as such;
+external data is not proof of the linked node's state. Both paths must be
+absolute and their directories must be provisioned by the operator.
+The history directory must be owned by the reader and have mode `0700`.
+History retains up to 30 days of observations collected after it is enabled;
+it does not reconstruct earlier data. Cgroup values describe the visible local
+cgroup and may not reflect limits imposed by its ancestors. A missing or stale
+peer capture is not an empty peer list.
+See [Optional routes](dashboard-api-reference.md#optional-routes) for the
+route families and freshness expectations.
 
 ## Private setup
 
@@ -121,52 +157,12 @@ publish a URL.
 
 The following manual setup remains available on supported platforms.
 
-For bounded replay details, enable `--dashboard-replay-details` on the node
-and `--replay-details` on the public reader. The node option requires an
-enabled dashboard feed; the reader requires a public profile and
-`--public-resources`. Replay observations are local to the node and may be
-unavailable or stale during startup, recovery or source replacement.
-
-For AccountsDB cache observations, enable `--dashboard-cache-details` on the
-node and `--cache-details` on the public reader. These require a node socket
-and a public profile with `--public-resources`, respectively. Cache activity
-counters additionally require `--dashboard-cache-activity` on the node.
-
 Build both executables from the same checkout:
 
 ```sh
 go build -o mithril ./cmd/mithril
 go build -o mithril-dashboard ./cmd/mithril-dashboard
 ```
-
-To include network details, enable `--dashboard-network-details` on the
-node and `--network-details` on the reader. The reader also requires a public
-profile and `--public-resources`; the node option requires an enabled
-dashboard feed. Values can be unavailable when their source is not
-running or has not produced a fresh observation. Interface counters also
-require `--dashboard-host-resources` on the node.
-
-To include machine topology and process history, enable
-`--dashboard-machine-details` and `--dashboard-host-resources` on the node,
-and `--machine-details` with `--public-resources` on the public reader.
-These observations are optional and can be unavailable or stale.
-
-To collect visible cgroup limits, counters and pressure, enable
-`--dashboard-cgroup-resources` on the node. Public readers also need
-`--public-resources`; the data appears in the advanced status profile.
-These observations describe the visible local cgroup, not necessarily the
-effective limits imposed by its ancestors.
-
-To include locally observed signed peer contacts, enable
-`--dashboard-local-peers` and `--dashboard-network-details` on the node,
-and `--local-peers` on the public reader. The bounded peer details omit
-network endpoints; a missing or stale capture is not an empty peer list.
-
-For aggregate history, pass `--history-dir /absolute/private/path` to the
-public reader. The reader stores up to 30 days of sampled public data in this
-dedicated directory; it must be owned by the reader and private (mode 0700).
-Resource history is included only with `--public-resources`. History starts
-when enabled and does not reconstruct observations from before that time.
 
 Without release build flags, the dashboard feed reports `0.0.0-dev`; the CLI
 may show `dev`. The displayed commit may identify only the base revision when
@@ -395,14 +391,21 @@ omit the default `:443` so browser normalization does not cause a mismatch. The 
 profile always serves `/api/v1/features`, `/api/v1/status` and `/websocket`.
 The status endpoint returns the cached public JSON object and allows a request without an Origin;
 when an Origin is present it must match exactly. The WebSocket requires exactly
-one matching Origin. Features rejects query strings; status and WebSocket accept
+one matching Origin. Features accepts the optional query
+`include=advanced_status` to list advanced route families. Status and WebSocket accept
 the exact optional queries `include=snapshot_manifests`,
-`include=snapshot_manifests_v2` and `include=snapshot_manifests_v3`. All three
+`include=snapshot_manifests_v2`, `include=snapshot_manifests_v3` and
+`include=advanced_status`. All three
 routes reject request bodies. The default and earlier opt-in profile schemas
 remain compatible with existing clients. Opt-in profiles may include historical
 `startup.snapshot_manifests`; v2 and v3 also include its optional ready marker.
 V3 can additionally expose `consensus.safety_fault` independently of lifecycle
-details. Optional routes enforce their documented query limits. Forwarded
+details. The `advanced_status` profile includes the v3 observations and adds
+lifecycle, next-epoch signer, payment, shard-flush and enabled Harmonic,
+cgroup and compaction observations. Clients must request it explicitly and
+accept those additional fields. If its projection exceeds the response limit,
+the profile is unavailable rather than silently returning a different shape.
+Optional routes enforce their documented query limits. Forwarded
 headers are not trusted. Public responses use `Cache-Control: no-store` and
 `X-Content-Type-Options: nosniff`. The proxy must provide TLS and its own
 appropriate traffic limits. These checks are not authentication: anyone who can

@@ -155,7 +155,9 @@ func (t *TPU) Stats() Stats {
 	}
 }
 
-// ObserveSocketMemory reads accounting from the already-owned UDP socket.
+// ObserveSocketMemory reads only the already-owned UDP socket's accounting.
+// Call from an explicitly opted-in low-rate owner, never Stats or a viewer.
+// It changes no socket option, deadline, packet handling or listener state.
 func (t *TPU) ObserveSocketMemory() metrics.SocketObservation {
 	if t == nil {
 		return metrics.SocketObservation{Reason: metrics.SocketNotProvided}

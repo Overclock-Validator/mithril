@@ -82,7 +82,7 @@ func TestMachineNodeAttachmentDisabled(t *testing.T) {
 				}
 			})
 			socket := filepath.Join(dir, "feed.sock")
-			d := startNodeDashboard(context.Background(), time.Now(), socket, "", "machine-off", "isolated", "verifying", true, false, host, false, false, false, false, false)
+			d := startNodeDashboard(context.Background(), time.Now(), socket, "", "machine-off", "isolated", "verifying", true, false, false, false, false, false, false, false, host, false, false)
 			if d == nil {
 				t.Fatal("node feed did not start")
 			}
@@ -124,7 +124,7 @@ func TestMachineNodeAttachment(t *testing.T) {
 				}
 			})
 			socket := filepath.Join(dir, "feed.sock")
-			d := startNodeDashboard(context.Background(), time.Now().Add(-time.Minute), socket, "", "machine-"+role, "isolated", role, true, false, true, false, true, false, false, false)
+			d := startNodeDashboard(context.Background(), time.Now().Add(-time.Minute), socket, "", "machine-"+role, "isolated", role, true, false, false, false, false, false, false, false, true, true, false)
 			if d == nil || d.machine == nil {
 				t.Fatal("machine opt-in did not register an owner before Feed startup")
 			}

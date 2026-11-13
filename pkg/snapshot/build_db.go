@@ -448,7 +448,7 @@ func BuildAccountsDbPaths(
 	mlog.Log.Debugf("done processing snapshots in %s.", fmtDuration(time.Since(start)))
 
 	// Show indexing progress for shard flush (no gap between DualProgress and this)
-	indexProgress := progress.NewIndexingProgress("Flush (shard logs)")
+	indexProgress := dp.NewIndexingProgress()
 	indexProgress.Start(numShards)
 	if err := closeSnapshotShardLogger(ctx, sl, indexProgress); err != nil {
 		return nil, nil, err
@@ -458,6 +458,7 @@ func BuildAccountsDbPaths(
 	if err != nil {
 		return nil, nil, fmt.Errorf("initializing pebble from SST files: %w", err)
 	}
+	indexProgress.RecordSSTIngestReturn()
 	index.Close()
 
 	mlog.Log.Infof("Snapshot processed in %s.", fmtDuration(time.Since(start)))
@@ -969,9 +970,10 @@ func (p *snapshotWorkerPools) Release() {
 	p.tarBufs = nil
 }
 
-// closeSnapshotShardLogger propagates the flush result before ingestion.
+// closeSnapshotShardLogger records and propagates the flush result before ingestion.
 func closeSnapshotShardLogger(ctx context.Context, sl *ShardLogger, p *progress.IndexingProgress) error {
 	err := sl.CloseWithProgress(ctx, p.Update)
+	p.RecordResult(err)
 	if err != nil {
 		return fmt.Errorf("closing shard logger: %w", err)
 	}

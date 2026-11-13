@@ -7,7 +7,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Overclock-Validator/mithril/pkg/blockstream"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
+	"github.com/Overclock-Validator/mithril/pkg/turbine"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -339,11 +341,15 @@ func (p *Progress) recordReplayDiagnostic(at time.Time, row *metrics.BlockReplay
 		d.mu.Unlock()
 		return
 	}
+	var markerSource *blockstream.BlockSource
+	var markerTarget *turbine.ShredHistoryHandle
 	if d.nearReception.ObservedAt.IsZero() {
 		source := p.source.Load()
 		if started, receipt, ok := source.CachedReceptionObservation(); ok && p.source.Load() == source &&
 			receipt.Progress.HasSlot && !receipt.Progress.CoverageLimited && !receipt.Progress.ValidUntil.IsZero() {
-			d.recordNearReceptionLocked(s.Completed, started, receipt, time.Now())
+			if d.recordNearReceptionLocked(s.Completed, started, receipt, time.Now()) {
+				markerSource, markerTarget = source, receipt.ShredHistoryTarget()
+			}
 		}
 	}
 	r := completedReplayDiagnostic(s, at, row)
@@ -362,6 +368,14 @@ func (p *Progress) recordReplayDiagnostic(at time.Time, row *metrics.BlockReplay
 	d.records[index] = r
 	d.lastCompletion, d.updatedAt = s.ExecutedBlocks, r.ObservedAt
 	d.mu.Unlock()
+	// The marker uses the accepted completion's original receiver and clock.
+	// History admission never runs while the diagnostics lock is held.
+	if markerTarget != nil {
+		markerTarget.TryMarker(turbine.ShredHistoryMarker{At: s.completedAt, Slot: s.Completed.Slot,
+			Bankhash: s.Completed.Bankhash, ReplayAttempt: s.Attempt, Rewinds: s.Rewinds, CompletedIndex: s.ExecutedBlocks})
+	} else if markerSource != nil {
+		markerSource.MarkReceptionHistoryUnknown()
+	}
 }
 
 func completedReplayDiagnostic(s ProgressSnapshot, at time.Time, m *metrics.BlockReplay) ReplayDiagnostic {

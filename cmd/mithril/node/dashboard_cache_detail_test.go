@@ -416,7 +416,7 @@ func TestDashboardCacheDetailsOptIn(t *testing.T) {
 				t.Error(err)
 			}
 		})
-		d := startNodeDashboard(context.Background(), time.Now(), filepath.Join(dir, "node.sock"), "", "cache-run", "isolated", "verifying", false, false, false, false, false, false, false, enabled)
+		d := startNodeDashboard(context.Background(), time.Now(), filepath.Join(dir, "node.sock"), "", "cache-run", "isolated", "verifying", false, false, false, false, enabled, false, false, false, false, false, false)
 		if d == nil || (d.cache != nil) != enabled {
 			t.Fatal("cache monitor configuration did not follow opt-in")
 		}

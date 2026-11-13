@@ -51,13 +51,16 @@ type BlockSourceOpts struct {
 	// TurbineStreamingExecution subscribes replay's streaming executor to the
 	// assembler's decoded-batch feed (StreamEvents). Off by default.
 	TurbineStreamingExecution bool
-	TurbineIdentity           *identity.Holder
-	LeaderForSlot             func(slot uint64) (solana.PublicKey, bool)
-	TurbineStakesForSlot      func(slot uint64) map[solana.PublicKey]uint64
-	TurbineEpochForSlot       func(slot uint64) uint64
-	TurbineRootSlot           func() uint64
-	TurbineUseChaCha8         bool
-	TurbineDedupAddrs         bool
+	// ShredHistory optionally records admitted receipts across live receiver
+	// retries. Configure before construction; this source never closes it.
+	ShredHistory         *turbine.ShredHistory
+	TurbineIdentity      *identity.Holder
+	LeaderForSlot        func(slot uint64) (solana.PublicKey, bool)
+	TurbineStakesForSlot func(slot uint64) map[solana.PublicKey]uint64
+	TurbineEpochForSlot  func(slot uint64) uint64
+	TurbineRootSlot      func() uint64
+	TurbineUseChaCha8    bool
+	TurbineDedupAddrs    bool
 	// TurbineShredReceivers get a copy of every shred this node relays.
 	TurbineShredReceivers       []*net.UDPAddr
 	LocalLeaderForSlot          func(slot uint64) bool
@@ -302,11 +305,11 @@ type BlockSource struct {
 	startedAt              time.Time
 	lastGoodRepairPeers    atomic.Pointer[[]gossip.RepairPeer]
 	monitoringEnabled      bool // Configured before Start; sampling belongs to the stream owner.
-	socketMemoryMonitoring bool // Configured before Start.
+	socketMemoryMonitoring bool // Configured before Start; separate opt-in for socket OS reads.
 	turbineObservation     atomic.Pointer[TurbineObservation]
 	receptionObservation   atomic.Pointer[ReceptionObservation]
 	monitoredGossip        atomic.Pointer[gossip.Client]
-	gossipObserver         func(*gossip.Client)
+	gossipObserver         func(*gossip.Client) // Startup-only; does not query peers or counters.
 
 	// replayEmitHook, when set, sees every block just before it is queued
 	// for replay, while the block source still owns it (SetReplayEmitHook).
@@ -442,6 +445,7 @@ type BlockSource struct {
 	turbineShredVersion          uint16
 	turbineAlpenglowAddr         string
 	turbineAlpenglowBlockIDHints bool
+	shredHistory                 *turbine.ShredHistory
 	turbineIdentity              *identity.Holder
 	leaderForSlot                func(slot uint64) (solana.PublicKey, bool)
 	turbineStakesForSlot         func(slot uint64) map[solana.PublicKey]uint64
@@ -811,6 +815,7 @@ func NewBlockSource(opts *BlockSourceOpts) *BlockSource {
 		turbineAlpenglowAddr:           opts.TurbineAlpenglowAddr,
 		turbineAlpenglowBlockIDHints:   opts.TurbineAlpenglowBlockIDHints,
 		streamEvents:                   newStreamEventChannel(opts),
+		shredHistory:                   opts.ShredHistory,
 		turbineIdentity:                opts.TurbineIdentity,
 		leaderForSlot:                  opts.LeaderForSlot,
 		turbineStakesForSlot:           opts.TurbineStakesForSlot,

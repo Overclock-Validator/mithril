@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Overclock-Validator/mithril/pkg/alpenglow"
 	"github.com/Overclock-Validator/mithril/pkg/blockprod/scheduler"
 	"github.com/Overclock-Validator/mithril/pkg/blockstream"
 	"github.com/Overclock-Validator/mithril/pkg/consensus"
@@ -38,17 +39,16 @@ type nodeDashboard struct {
 	accountsPath          string
 	ledgerPath            string
 	progress              replay.Progress
-	heldSchedules         nodeHeldScheduleCache
-	cache                 *cacheDashboardMonitor
+	heldSchedules         nodeHeldScheduleCache // Owned only by the joined detail worker.
 	consensus             *consensus.AlpenglowObserverEngine
 	rpc                   *rpcserver.RpcServer
 	tpu                   *tpu.TPU
 	scheduler             *scheduler.Scheduler
 	pipelineStartedAt     time.Time
+	schedulerBudget       *schedulerBudgetObservation
 	hostSampler           *metrics.HostSampler // configured before the diagnostics owner starts
-	cgroupSampler         *metrics.CgroupSampler
 	machine               *machineDashboardMonitor
-	machineGeneration     uint64
+	machineGeneration     uint64 // Never resets within a node run.
 	machineRetired        bool
 	networkDetails        bool
 	localPeers            bool
@@ -62,10 +62,27 @@ type nodeDashboard struct {
 	tpuSocket             *tpuSocketOwner
 	votorSocketGeneration uint64
 	votorSocket           *votorSocketOwner
+	cgroupSampler         *metrics.CgroupSampler
+	io                    *dashboardIOMonitor
+	compactionConfigured  bool
+	compaction            *compactionMonitor
+	harmonic              *harmonicDashboardMonitor
+	harmonicGeneration    uint64
+	cache                 *cacheDashboardMonitor // attached once after AccountsDB initialization
 	snapshotAttempt       uint64
 	snapshotRoot          *progress.DualProgress
 	snapshotManifests     *nodeSnapshotManifests
 	snapshotArchive       *nodeSnapshotArchive
+	snapshotShardFlush    *nodeSnapshotShardFlush
+	productionDetails     bool
+	productionGeneration  uint64
+	production            *productionDashboardMonitor
+	storageDetails        bool
+	storageRetired        bool
+	storage               *storageDashboardMonitor
+	receptionEnabled      bool
+	receptionStopped      bool
+	reception             *nodeReceptionHistory
 }
 
 // configureHostResources is startup-only; Sample is owned by diagnostics.
@@ -82,26 +99,7 @@ func (d *nodeDashboard) configureHostResources(enabled bool) {
 	}
 }
 
-func dashboardFeedConfig(enabled bool, socket, group, goos string) (string, string, error) {
-	if !enabled {
-		return socket, group, nil
-	}
-	if goos != "linux" {
-		return "", "", fmt.Errorf("dashboard.enabled requires the provisioned Linux service")
-	}
-	if socket != "" || group != "" {
-		return "", "", fmt.Errorf("dashboard.enabled cannot be combined with dashboard.socket or dashboard.socket_group")
-	}
-	return "/run/mithril-dashboard-feed/dashboard.sock", "mithril-dashboard-feed", nil
-}
-
-func validateDashboardHostResources(enabled bool, socket string) error {
-	if enabled && strings.TrimSpace(socket) == "" {
-		return fmt.Errorf("dashboard.host_resources requires a dashboard feed")
-	}
-	return nil
-}
-
+// configureMachineDetails is startup-only; observations remain diagnostics-owned.
 func (d *nodeDashboard) configureMachineDetails(enabled bool) {
 	if d == nil {
 		return
@@ -136,6 +134,26 @@ func (d *nodeDashboard) resolvedMachineWorker(name string, count int) {
 	m.resolvedWorker(name, count)
 }
 
+func dashboardFeedConfig(enabled bool, socket, group, goos string) (string, string, error) {
+	if !enabled {
+		return socket, group, nil
+	}
+	if goos != "linux" {
+		return "", "", fmt.Errorf("dashboard.enabled requires the provisioned Linux service")
+	}
+	if socket != "" || group != "" {
+		return "", "", fmt.Errorf("dashboard.enabled cannot be combined with dashboard.socket or dashboard.socket_group")
+	}
+	return "/run/mithril-dashboard-feed/dashboard.sock", "mithril-dashboard-feed", nil
+}
+
+func validateDashboardHostResources(enabled bool, socket string) error {
+	if enabled && strings.TrimSpace(socket) == "" {
+		return fmt.Errorf("dashboard.host_resources requires a dashboard feed")
+	}
+	return nil
+}
+
 func validateDashboardMachineDetails(enabled bool, socket string, hostResources bool) error {
 	if enabled && (strings.TrimSpace(socket) == "" || !hostResources) {
 		return fmt.Errorf("dashboard.machine_details requires dashboard.socket and dashboard.host_resources")
@@ -161,6 +179,7 @@ func (d *nodeDashboard) observeRuntime(now time.Time, mem runtime.MemStats, pres
 	now = now.UTC()
 	d.mu.Lock()
 	accounts, ledger := d.accountsPath, d.ledgerPath
+	compactionConfigured, compaction := d.compactionConfigured, d.compaction
 	traffic := d.interfaces
 	machine := d.machine
 	var machineBinding metrics.RSSHistoryBinding
@@ -208,9 +227,12 @@ func (d *nodeDashboard) observeRuntime(now time.Time, mem runtime.MemStats, pres
 		}
 	}
 	resources := &dashboard.Resources{SampledAt: now, Root: filesystemSample("/"), Accounts: filesystemSample(accounts), Ledger: filesystemSample(ledger)}
+	if compactionConfigured {
+		resources.Compaction = compactionMeasurement(compaction)
+	}
 	var rssAt time.Time
 	if machine != nil {
-		rssAt = time.Now()
+		rssAt = time.Now() // Original clock beside the existing read, not the ticker date.
 	}
 	rss := replay.ProcessRSSBytes()
 	if rss != 0 {
@@ -235,6 +257,7 @@ func (d *nodeDashboard) observeRuntime(now time.Time, mem runtime.MemStats, pres
 	d.observeTPUSocket()
 	d.observeVotorSocket()
 	d.cache.observe()
+	d.io.observe(accounts, ledger)
 }
 
 func hostResourcesMeasurement(o metrics.HostObservation) *dashboard.HostResources {
@@ -303,7 +326,7 @@ func filesystemFromStat(stat syscall.Statfs_t) *dashboard.Filesystem {
 	return &dashboard.Filesystem{TotalBytes: stat.Blocks * unit, AvailableBytes: stat.Bavail * unit, Inodes: stat.Files, FreeInodes: stat.Ffree}
 }
 
-func startNodeDashboard(ctx context.Context, startedAt time.Time, socket, group, runID, network, mode string, alpenglow, rpcConfigured, hostResources, networkDetails, machineDetails, localPeers, replayDetails, cacheDetails bool) *nodeDashboard {
+func startNodeDashboard(ctx context.Context, startedAt time.Time, socket, group, runID, network, mode string, alpenglow, rpcConfigured, replayDetails, networkDetails, cacheDetails, productionDetails, storageDetails, shredHistory, hostResources, machineDetails, localPeers bool) *nodeDashboard {
 	if socket == "" {
 		return nil
 	}
@@ -311,7 +334,7 @@ func startNodeDashboard(ctx context.Context, startedAt time.Time, socket, group,
 		mlog.Log.Warnf("dashboard local peers unavailable: %v", err)
 		return nil
 	}
-	d := &nodeDashboard{runStartedAt: startedAt, networkDetails: networkDetails, localPeers: localPeers, state: dashboard.Snapshot{
+	d := &nodeDashboard{runStartedAt: startedAt, productionDetails: productionDetails, storageDetails: storageDetails, networkDetails: networkDetails, localPeers: localPeers, state: dashboard.Snapshot{
 		RunID: runID, StartedAt: startedAt.UTC(), Version: version.Semver(), Commit: version.Commit(),
 		Network: network, Mode: mode, Alpenglow: alpenglow, RPCConfigured: rpcConfigured, Phase: "starting",
 	}}
@@ -320,9 +343,8 @@ func startNodeDashboard(ctx context.Context, startedAt time.Time, socket, group,
 	var feed *dashboard.Feed
 	var err error
 	var details dashboard.DetailSamplers
-	if cacheDetails {
-		d.cache = &cacheDashboardMonitor{}
-		details.Cache = d.sampleCacheDetail
+	if machineDetails {
+		details.Machine = d.sampleMachineDetail
 	}
 	if replayDetails {
 		if err := d.progress.EnableReplayDiagnostics(runID); err != nil {
@@ -334,9 +356,6 @@ func startNodeDashboard(ctx context.Context, startedAt time.Time, socket, group,
 		details.RootedHistory = d.sampleRootedHistory
 		details.HeldSchedules = d.sampleHeldSchedules
 	}
-	if machineDetails {
-		details.Machine = d.sampleMachineDetail
-	}
 	if networkDetails {
 		d.progress.EnableNetworkDetails()
 		d.progress.SetGossipObserver(d.observeGossipClient)
@@ -345,7 +364,20 @@ func startNodeDashboard(ctx context.Context, startedAt time.Time, socket, group,
 	if localPeers {
 		details.LocalPeers = d.sampleLocalPeers
 	}
-	if networkDetails || machineDetails || replayDetails || cacheDetails {
+	if cacheDetails {
+		d.cache = &cacheDashboardMonitor{}
+		details.Cache = d.sampleCacheDetail
+	}
+	if productionDetails {
+		details.Production = d.sampleProductionDetail
+	}
+	if storageDetails {
+		details.Storage = d.sampleStorageDetail
+	}
+	if shredHistory {
+		details.Reception = d.enableReceptionHistory()
+	}
+	if replayDetails || networkDetails || cacheDetails || productionDetails || storageDetails || shredHistory || machineDetails {
 		feed, err = dashboard.ListenFeedWithDetails(ctx, socket, group, d.snapshot, details)
 	} else if group == "" {
 		feed, err = dashboard.ListenFeed(ctx, socket, d.snapshot)
@@ -365,6 +397,7 @@ func (d *nodeDashboard) snapshot() dashboard.Snapshot {
 	s := d.state
 	s.SnapshotArchive = nil
 	s.IncrementalArchive = nil
+	s.SnapshotShardFlush = nil
 	s.SnapshotManifests = nil
 	if m := d.snapshotManifests; m != nil && m.root == d.snapshotRoot && m.runID == s.RunID &&
 		m.nodeStarted.Equal(s.StartedAt) && s.GenesisHash != nil && *s.GenesisHash == m.genesis {
@@ -378,10 +411,17 @@ func (d *nodeDashboard) snapshot() dashboard.Snapshot {
 			s.IncrementalArchive = &dashboard.IncrementalArchive{SnapshotArchive: *a.value, IncrementalSlot: *a.incrementalSlot}
 		}
 	}
+	if a := d.snapshotShardFlush; a != nil && a.attempt == d.snapshotAttempt && a.runID == s.RunID &&
+		a.nodeStarted.Equal(s.StartedAt) && s.GenesisHash != nil && *s.GenesisHash == a.genesis && s.Phase != "stopping" {
+		s.SnapshotArchive, s.IncrementalArchive = nil, nil
+		s.SnapshotShardFlush = a.value
+	}
 	holder := d.identity
 	engine := d.consensus
 	rpc := d.rpc
 	tpu, scheduler, pipelineStartedAt := d.tpu, d.scheduler, d.pipelineStartedAt
+	budgetEnabled := d.productionDetails
+	harmonicMonitor := d.harmonic
 	d.mu.Unlock()
 	s.ElapsedNanoseconds = sampledRunElapsed(d.runStartedAt, time.Now())
 	if holder != nil {
@@ -414,7 +454,11 @@ func (d *nodeDashboard) snapshot() dashboard.Snapshot {
 		stats, scheduled, queued := tpu.Stats(), scheduler.Stats(), scheduler.Buffered()
 		captured := time.Now()
 		s.Pipeline = pipelineMeasurement(captured, pipelineStartedAt, stats, scheduled, queued)
+		if budgetEnabled {
+			d.observeSchedulerBudget(tpu, scheduler, s, scheduled, captured)
+		}
 	}
+	s.Harmonic = harmonicMonitor.snapshot()
 	return s
 }
 
@@ -483,6 +527,14 @@ func replayMeasurement(p replay.ProgressSnapshot) *dashboard.Replay {
 			if row.HasRewards {
 				out.Rewards = &dashboard.EpochRewardWindow{First: row.RewardFirst, Last: row.RewardLast, Included: row.Included, Excluded: row.Excluded, Ineligible: row.Ineligible, Unknown: row.Unknown, Unobserved: row.Unobserved, CompleteEpoch: row.RewardEpochComplete}
 			}
+		}
+	}
+	if v := p.PaymentOutcomes; !v.SampledAt.IsZero() && v.HasWindow {
+		r.PaymentOutcomes = &dashboard.PaymentOutcomes{SampledAt: v.SampledAt, Identity: v.Identity.String(), VoteAccount: v.VoteAccount.String(),
+			FirstCarrier: v.FirstCarrier, LastCarrier: v.LastCarrier, Carriers: v.Carriers, Known: v.Known, Unknown: v.Unknown, CoverageIncomplete: v.CoverageIncomplete}
+		if v.TotalsAvailable {
+			r.PaymentOutcomes.Totals = &dashboard.PaymentTotals{Fees: v.Fees, FeeBurned: v.FeeBurned, IncineratorDeposits: v.IncineratorDeposits,
+				IdentityFeeDeposits: v.IdentityFeeDeposits, VoteFeeDeposits: v.VoteFeeDeposits, OtherLeaderFeeDeposits: v.OtherLeaderFeeDeposits, VotingRewardsPaid: v.VotingRewardsPaid}
 		}
 	}
 	if a := p.NextKnownAssignment; !a.SampledAt.IsZero() {
@@ -697,6 +749,7 @@ func (d *nodeDashboard) pipelineStarted(service *tpu.TPU, scheduler *scheduler.S
 		}
 	}
 	d.tpu, d.scheduler, d.pipelineStartedAt = service, scheduler, time.Now().UTC()
+	d.schedulerBudget = nil
 	d.mu.Unlock()
 }
 
@@ -707,6 +760,7 @@ func (d *nodeDashboard) pipelineStopped() {
 	d.mu.Lock()
 	d.tpuSocket = nil
 	d.tpu, d.scheduler, d.pipelineStartedAt = nil, nil, time.Time{}
+	d.schedulerBudget = nil
 	d.mu.Unlock()
 }
 
@@ -760,7 +814,8 @@ func (d *nodeDashboard) consensusStarted(engine *consensus.AlpenglowObserverEngi
 
 func consensusMeasurement(s consensus.MonitoringSnapshot, now time.Time) *dashboard.Consensus {
 	m := &dashboard.Consensus{SampledAt: now.UTC(), ObservedBlocks: s.ObservedBlocks, ReplayedSlots: s.ReplayedSlots,
-		SafetyFault: &s.SafetyFault, CertificatesAccepted: s.Chain.CertificatesAccepted, VotingEnabled: s.VotingEnabled}
+		SafetyFault: &s.SafetyFault, CertificatesAccepted: s.Chain.CertificatesAccepted, VotingEnabled: s.VotingEnabled,
+		BlockLifecycle: blockLifecycleMeasurement(s.Lifecycle, now)}
 	if s.HasNotarizedSlot {
 		slot := s.NotarizedSlot
 		m.NotarizedSlot = &slot
@@ -782,7 +837,8 @@ func consensusMeasurement(s consensus.MonitoringSnapshot, now time.Time) *dashbo
 	if v := s.Voting; v != nil {
 		joined := v.JoinedLive
 		m.Voting = &dashboard.Voting{
-			SampledAt: v.At.UTC(), Identity: v.Identity.String(), VoteAccount: v.VoteAccount.String(), JoinedLive: &joined,
+			NextEpochSigner: nextEpochSignerMeasurement(v),
+			SampledAt:       v.At.UTC(), Identity: v.Identity.String(), VoteAccount: v.VoteAccount.String(), JoinedLive: &joined,
 			VotesCast: v.VotesCast, NetworkLanded: v.NetworkLanded, MessagesQueued: v.MessagesQueued,
 			MessagesDropped: v.MessagesDropped, PeerSendErrors: v.PeerSendErrors, PeerQueueDrops: v.PeerQueueDrops,
 			SendTimeouts: v.SendTimeouts, DesiredPeers: v.DesiredPeers, Connections: v.Connections,
@@ -799,6 +855,99 @@ func consensusMeasurement(s consensus.MonitoringSnapshot, now time.Time) *dashbo
 			slot, at := v.LastNetworkLandedSlot, v.LastNetworkLandedAt.UTC()
 			m.Voting.LastNetworkLandedSlot, m.Voting.LastNetworkLandedAt = &slot, &at
 		}
+	}
+	return m
+}
+
+func nextEpochSignerMeasurement(v *consensus.VotingObservation) *dashboard.NextEpochSigner {
+	if v == nil || !v.HasNextEpoch || v.At.IsZero() || v.Identity.IsZero() || v.VoteAccount.IsZero() ||
+		v.Epoch == ^uint64(0) || v.NextEpoch.Epoch != v.Epoch+1 {
+		return nil
+	}
+	n := v.NextEpoch
+	m := &dashboard.NextEpochSigner{SampledAt: v.At.UTC(), RootSlot: v.RootSlot, RootEpoch: v.Epoch, Epoch: n.Epoch, InstalledSet: n.HasEpochSet}
+	if !n.HasEpochSet {
+		if n.Eligible || n.Rank != 0 || n.Stake != 0 || n.TotalStake != 0 {
+			return nil
+		}
+		return m
+	}
+	if n.TotalStake == 0 || n.Eligible && n.Stake == 0 || !n.Eligible && (n.Rank != 0 || n.Stake != 0) {
+		return nil
+	}
+	eligible, total := n.Eligible, n.TotalStake
+	m.KeyEligible, m.TotalStakeLamports = &eligible, &total
+	if eligible {
+		rank, stake := n.Rank, n.Stake
+		m.Rank, m.StakeLamports = &rank, &stake
+	}
+	return m
+}
+
+func blockLifecycleMeasurement(s *consensus.LifecycleSnapshot, now time.Time) *dashboard.BlockLifecycle {
+	if s == nil || s.Retained < 0 || s.Retained > consensus.LifecycleCapacity || s.RowCount != min(s.Retained, len(s.Rows)) {
+		return nil
+	}
+	m := &dashboard.BlockLifecycle{SampledAt: now.UTC(), StartedAt: s.StartedAt.UTC(), Retained: s.Retained,
+		Evicted: s.Evicted, RowCount: s.RowCount}
+	if !s.UpdatedAt.IsZero() {
+		at := s.UpdatedAt.UTC()
+		m.UpdatedAt = &at
+	}
+	for i, row := range s.Rows[:s.RowCount] {
+		if row.HasIngress != (!row.AssemblyFirstAcceptedAt.IsZero() && !row.AssemblyFullAt.IsZero() && !row.ReadyAt.IsZero()) ||
+			!row.HasIngress && (!row.AssemblyFirstAcceptedAt.IsZero() || !row.AssemblyFullAt.IsZero() || !row.ReadyAt.IsZero()) ||
+			row.DirectFinalizedAt.IsZero() && row.FinalityKind != "" {
+			return nil
+		}
+		r := &dashboard.BlockLifecycleRow{Slot: row.Block.Slot, BlockID: row.Block.Hash.String(),
+			FirstObservedAt: row.FirstObservedAt.UTC(), LastObservedAt: row.LastObservedAt.UTC(), WallOrderConflict: row.WallOrderConflict}
+		for _, event := range []struct {
+			source time.Time
+			target **time.Time
+		}{
+			{row.AssemblyFirstAcceptedAt, &r.AssemblyFirstAcceptedAt}, {row.AssemblyFullAt, &r.AssemblyFullAt},
+			{row.ReadyAt, &r.ReadyAt}, {row.ReplayAcceptedAt, &r.ReplayAcceptedAt}, {row.DirectFinalizedAt, &r.DirectFinalizedAt},
+		} {
+			if !event.source.IsZero() {
+				at := event.source.UTC()
+				*event.target = &at
+			}
+		}
+		if !row.DirectFinalizedAt.IsZero() {
+			var kind string
+			switch row.FinalityKind {
+			case alpenglow.CertificateFinalizeFast:
+				kind = "fast"
+			case alpenglow.CertificateFinalize:
+				kind = "slow"
+			case alpenglow.CertificateGenesis:
+				kind = "genesis"
+			default:
+				return nil
+			}
+			r.FinalityKind = &kind
+		}
+		if !row.ReplayAcceptedAt.IsZero() && !row.DirectFinalizedAt.IsZero() {
+			before := row.FinalityBeforeReplay
+			r.FinalityBeforeReplay = &before
+		}
+		for _, interval := range []struct {
+			source consensus.LifecycleInterval
+			target **uint64
+		}{
+			{row.AssemblyFirstToFull, &r.AssemblyFirstToFullNS}, {row.FullToReady, &r.FullToReadyNS},
+			{row.ReadyToReplay, &r.ReadyToReplayNS}, {row.ReplayToFinality, &r.ReplayToFinalityNS}, {row.FinalityToReplay, &r.FinalityToReplayNS},
+		} {
+			if interval.source.Known {
+				if interval.source.Duration < 0 || interval.source.Duration == time.Duration(1<<63-1) {
+					return nil
+				}
+				ns := uint64(interval.source.Duration)
+				*interval.target = &ns
+			}
+		}
+		m.Rows[i] = r
 	}
 	return m
 }
@@ -826,31 +975,37 @@ func (d *nodeDashboard) stopping() {
 		return
 	}
 	d.cache.stop()
+	d.stopStorageOwner()
 	d.mu.Lock()
 	machine := d.machine
 	d.machineRetired = true
 	d.state.Phase = "stopping"
 	d.networkRetired, d.gossipClient = true, nil
-	d.tpuSocket, d.votorSocket = nil, nil
+	d.tpuSocket = nil
+	d.votorSocket = nil
 	d.interfaces.stop()
 	d.consensus = nil
 	d.rpc = nil
 	d.tpu, d.scheduler, d.pipelineStartedAt = nil, nil, time.Time{}
+	d.schedulerBudget = nil
 	d.mu.Unlock()
 	machine.stop()
 }
 
 func (d *nodeDashboard) close() {
 	if d != nil {
+		d.interruptReceptionHistory()
 		d.mu.Lock()
 		machine := d.machine
 		d.machineRetired = true
 		d.networkRetired, d.gossipClient = true, nil
-		d.tpuSocket, d.votorSocket = nil, nil
+		d.tpuSocket = nil
+		d.votorSocket = nil
 		d.interfaces.stop()
 		d.mu.Unlock()
 		machine.stop()
 		d.cache.stop()
+		d.stopStorageOwner()
 		d.feed.Close()
 	}
 }

@@ -1,6 +1,7 @@
 package dashboard
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"math"
@@ -72,7 +73,7 @@ func TestPublicCollectorThroughputAndOversizedProjection(t *testing.T) {
 	}
 	probe := c.throughput
 	v := probe.Observe(&s, "fresh", s.SampledAt)
-	if _, err := encodePublicSnapshot(&s, "fresh", s.SampledAt, &v, nil, nil); err == nil {
+	if _, err := encodePublicSnapshot(&s, "fresh", s.SampledAt, &v, nil, nil, nil); err == nil {
 		t.Fatal("fixture did not exceed the public history budget")
 	}
 	body.Store(&b)
@@ -120,8 +121,16 @@ func publicTestSnapshot(now time.Time) Snapshot {
 }
 
 func publicValue(t *testing.T, s *Snapshot, state string, now time.Time) (PublicSnapshot, []byte) {
+	return profileValue(t, s, state, now, 0)
+}
+
+func advancedPublicValue(t *testing.T, s *Snapshot, state string, now time.Time) (PublicSnapshot, []byte) {
+	return profileValue(t, s, state, now, 4)
+}
+
+func profileValue(t *testing.T, s *Snapshot, state string, now time.Time, profile int) (PublicSnapshot, []byte) {
 	t.Helper()
-	b, err := encodePublicSnapshot(s, state, now, nil, nil, nil)
+	b, err := encodePublicSnapshotProfile(s, state, now, nil, nil, nil, nil, profile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,6 +139,85 @@ func publicValue(t *testing.T, s *Snapshot, state string, now time.Time) (Public
 		t.Fatal(err)
 	}
 	return value, b
+}
+
+func TestAdvancedStatusRequiresExplicitProfile(t *testing.T) {
+	at := sizingTime(time.Now())
+	shard := fullTestSnapshot(at)
+	shard.SnapshotArchive, shard.IncrementalArchive = nil, nil
+	shard.SnapshotShardFlush = maximumSnapshotShardFlush(at)
+	for _, tc := range []struct {
+		name, group, field string
+		snapshot           Snapshot
+		legacy             reflect.Type
+	}{
+		{"lifecycle", "consensus", "block_lifecycle", lifecycleFixture(at), reflect.TypeOf(PublicConsensus{})},
+		{"next signer", "voting", "next_epoch_signer", nextEpochSignerFixture(at), reflect.TypeOf(PublicVoting{})},
+		{"payments", "replay", "payment_outcomes", paymentFixture(at), reflect.TypeOf(PublicReplay{})},
+		{"shard flush", "startup", "snapshot_shard_flush", shard, reflect.TypeOf(PublicStartup{})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var fields []reflect.StructField
+			for i := 0; i < tc.legacy.NumField(); i++ {
+				field := tc.legacy.Field(i)
+				if strings.Split(field.Tag.Get("json"), ",")[0] != tc.field {
+					fields = append(fields, field)
+				}
+			}
+			legacy := reflect.StructOf(fields)
+			for profile := 0; profile <= 4; profile++ {
+				body, err := encodePublicSnapshotProfile(&tc.snapshot, "fresh", at, nil, nil, nil, nil, profile)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var decoded map[string]json.RawMessage
+				if err := json.Unmarshal(body, &decoded); err != nil {
+					t.Fatal(err)
+				}
+				var group map[string]json.RawMessage
+				if err := json.Unmarshal(decoded[tc.group], &group); err != nil {
+					t.Fatal(err)
+				}
+				_, present := group[tc.field]
+				if present != (profile == 4) {
+					t.Fatalf("profile %d: field %s present=%t", profile, tc.field, present)
+				}
+				decoder := json.NewDecoder(bytes.NewReader(decoded[tc.group]))
+				decoder.DisallowUnknownFields()
+				err = decoder.Decode(reflect.New(legacy).Interface())
+				if profile == 4 && (err == nil || !strings.Contains(err.Error(), tc.field)) || profile != 4 && err != nil {
+					t.Fatalf("profile %d: strict legacy decoder: %v", profile, err)
+				}
+			}
+		})
+	}
+	resources := &PublicResources{Cgroup: &PublicCgroupResources{}, Compaction: &PublicCompaction{}}
+	snapshot := testSnapshot(at)
+	for profile := 0; profile <= 4; profile++ {
+		body, err := encodePublicSnapshotProfile(&snapshot, "fresh", at, nil, resources, nil, &PublicHarmonic{}, profile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded struct {
+			Resources map[string]json.RawMessage `json:"resources"`
+			Harmonic  json.RawMessage            `json:"harmonic"`
+		}
+		if err := json.Unmarshal(body, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		for _, field := range []string{"cgroup", "compaction"} {
+			_, present := decoded.Resources[field]
+			if present != (profile == 4) {
+				t.Fatalf("profile %d: resource %s present=%t", profile, field, present)
+			}
+		}
+		if (decoded.Harmonic != nil) != (profile == 4) {
+			t.Fatalf("profile %d: harmonic present=%t", profile, decoded.Harmonic != nil)
+		}
+	}
+	if resources.Cgroup == nil || resources.Compaction == nil {
+		t.Fatal("legacy projection mutated the supplied resources")
+	}
 }
 
 func TestPublicFieldAllowlist(t *testing.T) {
@@ -253,7 +341,7 @@ func TestPublicAvailabilityAndRoleChanges(t *testing.T) {
 	if p.Node != nil || p.Replay != nil || p.SampledAt != nil || p.Pipeline != nil || p.Input != nil {
 		t.Fatal("unavailable source published observations")
 	}
-	if _, err := encodePublicSnapshot(&s, "healthy", now, nil, nil, nil); err == nil {
+	if _, err := encodePublicSnapshot(&s, "healthy", now, nil, nil, nil, nil); err == nil {
 		t.Fatal("invented source state accepted")
 	}
 	s.Mode = "verifying"

@@ -338,15 +338,6 @@ func TestHistoryPublicProfileIntegration(t *testing.T) {
 			if enabled && (resp.Header.Get("Cache-Control") != "no-store" || resp.Header.Get("X-Content-Type-Options") != "nosniff") {
 				t.Fatal("history bypassed public response policy")
 			}
-			resp = request("/api/v1/features")
-			var features struct {
-				History bool `json:"history"`
-			}
-			err = json.NewDecoder(resp.Body).Decode(&features)
-			resp.Body.Close()
-			if err != nil || resp.StatusCode != http.StatusOK || features.History != enabled {
-				t.Fatalf("history feature flag: status=%d enabled=%v error=%v", resp.StatusCode, features.History, err)
-			}
 			resp = request("/api/v1/status")
 			data, _ = io.ReadAll(resp.Body)
 			resp.Body.Close()

@@ -105,7 +105,7 @@ func loadHarmonicSettings(get optionGetters) (harmonicSettings, error) {
 // which waits for it to finish. The service's hooks must be given to the
 // leader loop with GateTPU set.
 func startHarmonic(ctx context.Context, s harmonicSettings, holder *identity.Holder, voteAccount solana.PublicKey,
-	tpuService *tpu.TPU, gossipClient *gossip.Client, localTPU gossip.TPUSockets, txV1Enabled func() bool,
+	tpuService *tpu.TPU, gossipClient *gossip.Client, localTPU gossip.TPUSockets, txV1Enabled func() bool, observe func(harmonic.ServiceObservation),
 ) (blockprod.LeaderHooks, func(), error) {
 	tips := s.tips
 	tips.VoteAccount = voteAccount
@@ -121,6 +121,7 @@ func startHarmonic(ctx context.Context, s harmonicSettings, holder *identity.Hol
 		LocalTPU:           localTPU,
 		TxV1Enabled:        txV1Enabled,
 		Workers:            s.workers,
+		Observe:            observe,
 	})
 	if err != nil {
 		return nil, nil, err

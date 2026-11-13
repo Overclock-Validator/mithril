@@ -1,6 +1,7 @@
 package consensus
 
 import (
+	"math"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/alpenglow"
@@ -20,9 +21,13 @@ type MonitoringSnapshot struct {
 	Receiver         *alpenglow.ReceiverStats
 	VotingEnabled    bool
 	Voting           *VotingObservation
+	Lifecycle        *LifecycleSnapshot
 }
 
-// ObserveReceiverSocketMemory reads accounting from the inbound Votor socket.
+// ObserveReceiverSocketMemory is an explicitly opted-in diagnostics read of the
+// inbound Votor listener, not outbound broadcaster connections. Like
+// MonitoringSnapshot, call only after Start has returned; the node starts each
+// engine once. Ordinary monitoring snapshots perform no OS reads.
 func (e *AlpenglowObserverEngine) ObserveReceiverSocketMemory() metrics.SocketObservation {
 	if e == nil {
 		return metrics.SocketObservation{Reason: metrics.SocketNotProvided}
@@ -70,6 +75,8 @@ type VotingObservation struct {
 	Rank                  uint16
 	Stake                 uint64
 	TotalStake            uint64
+	HasNextEpoch          bool
+	NextEpoch             InstalledSignerObservation
 	JoinedLive            bool
 	VotesCast             uint64
 	NetworkLanded         uint64
@@ -86,6 +93,18 @@ type VotingObservation struct {
 	ApplicationPayload    alpenglow.ApplicationPayloadObservation
 }
 
+// InstalledSignerObservation checks one already-installed ranked set against
+// the running voter's node, vote account and derived public BLS key. It is not
+// a prediction of admission, a payment receipt or permission to sign.
+type InstalledSignerObservation struct {
+	Epoch       uint64
+	HasEpochSet bool
+	Eligible    bool
+	Rank        uint16
+	Stake       uint64
+	TotalStake  uint64
+}
+
 // MonitoringSnapshot copies scalar consensus state and the voter's last sample.
 func (e *AlpenglowObserverEngine) MonitoringSnapshot() MonitoringSnapshot {
 	s := MonitoringSnapshot{ObservedBlocks: e.observedBlocks.Load(), ReplayedSlots: e.replayedSlots.Load(), SafetyFault: e.safetyError() != nil}
@@ -98,6 +117,10 @@ func (e *AlpenglowObserverEngine) MonitoringSnapshot() MonitoringSnapshot {
 	if e.receiver != nil {
 		r := e.receiver.Stats()
 		s.Receiver = &r
+	}
+	if e.lifecycle != nil {
+		lifecycle := e.lifecycle.snapshot()
+		s.Lifecycle = &lifecycle
 	}
 	e.voterMu.RLock()
 	voter := e.voter
@@ -145,6 +168,33 @@ func (v *alpenglowVoter) publishMonitoring(stats VotingStats) {
 				}
 			}
 		}
+		if s.Epoch != math.MaxUint64 {
+			s.HasNextEpoch = true
+			s.NextEpoch = v.installedSignerObservation(s.Epoch + 1)
+		}
 	}
 	v.monitoring.Store(s)
+}
+
+// Called on the voter owner after validatorSet has released the voter set lock.
+// Installed sets and their identity indexes share this engine lock.
+func (v *alpenglowVoter) installedSignerObservation(epoch uint64) InstalledSignerObservation {
+	s := InstalledSignerObservation{Epoch: epoch}
+	v.engine.validatorSetsMu.RLock()
+	defer v.engine.validatorSetsMu.RUnlock()
+	set, known := v.engine.validatorSets[epoch]
+	if !known {
+		return s
+	}
+	s.HasEpochSet, s.TotalStake = true, set.TotalStake
+	rank, found := v.engine.validatorRanks[epoch][v.node]
+	if !found || int(rank) >= len(set.Validators) || set.Epoch != epoch {
+		return s
+	}
+	validator := set.Validators[rank]
+	if validator.Rank != rank || validator.NodePubkey != v.node || validator.VoteAccount != v.voteAccount || validator.BlsPubkeyCompressed != v.signer.PublicKeyCompressed() {
+		return s
+	}
+	s.Eligible, s.Rank, s.Stake = true, rank, validator.Stake
+	return s
 }

@@ -8,9 +8,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"reflect"
-	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -19,7 +16,6 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/dashboard"
 	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/tpu"
-	"github.com/Overclock-Validator/mithril/pkg/tpu/dedup"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/pipeline"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/quicserver"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/quicserver/testutils"
@@ -157,101 +153,4 @@ func TestDashboardPipelineRealQUICTrafficPublicProjection(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-}
-
-func TestPipelineMeasurementCopiesExistingCounters(t *testing.T) {
-	now := time.Date(2026, 10, 30, 12, 0, 0, 123, time.FixedZone("offset", 19800))
-	started := now.Add(-time.Minute)
-	q := &quicserver.ServerStats{}
-	q.TotalNewConnections.Store(1<<53 + 1)
-	q.TotalConnections.Store(999) // Different producer: do not substitute it.
-	q.OpenConnections.Store(2)
-	q.TotalNewStreams.Store(3)
-	q.ActiveStreams.Store(4)
-	q.InvalidStreamSize.Store(5)
-	q.TotalStreamReadErrors.Store(6)
-	q.TotalStreamReadTimeout.Store(7)
-	q.ConnectionSetupError.Store(8)
-	q.RefusedTooManyOpen.Store(9)
-	q.RefusedPerIP.Store(10)
-	q.ConnectionAddFailed.Store(11)
-	stats := tpu.Stats{QUIC: q, Pipeline: pipeline.Stats{
-		Ingress: pipeline.IngressStats{EnqueuedPackets: 1<<53 + 2, EnqueuedBytes: 13, DroppedFull: 14},
-		Dedup: dedup.Stats{InPackets: 15, InBytes: 16, OutPackets: 17, OutBytes: 18,
-			DroppedSanitize: 19, DroppedUnsupportedVersion: 20, DroppedDedup: 21},
-		Sigverify: pipeline.SigverifyStats{InPackets: 22, InBytes: 23, VerifiedPackets: 24, VerifiedBytes: 25, DroppedSigverify: 26},
-	}}
-	s := scheduler.Stats{InPackets: 27, InBytes: 28, Buffered: 1<<53 + 3, Accepted: 30,
-		DroppedParse: 31, DroppedVote: 32, DroppedDuplicate: 33, DroppedCapacity: 34, EvictedCapacity: 35,
-		DroppedExpired: 36, DroppedAlreadyProcessed: 37, DroppedAccountLocks: 38, DroppedLookup: 39,
-		DroppedNoBank: 40, DroppedCost: 41, DroppedExecution: 42}
-	depth := uint64(43)
-	evicted, expired := uint64(35), uint64(36)
-	want := &dashboard.Pipeline{
-		SampledAt: now.UTC(), StartedAt: started.UTC(),
-		Ingress:   dashboard.PipelineIngress{EnqueuedPackets: 1<<53 + 2, EnqueuedBytes: 13, DroppedFull: 14},
-		Dedup:     dashboard.PipelineDedup{InPackets: 15, InBytes: 16, OutPackets: 17, OutBytes: 18, DroppedSanitize: 19, DroppedUnsupportedVersion: 20, DroppedDedup: 21},
-		Sigverify: dashboard.PipelineSigverify{InPackets: 22, InBytes: 23, VerifiedPackets: 24, VerifiedBytes: 25, DroppedSigverify: 26},
-		QUIC: &dashboard.PipelineQUIC{AcceptedConnections: 1<<53 + 1, OpenConnections: 2, AcceptedStreams: 3, ActiveStreams: 4,
-			InvalidStreamSize: 5, ReadErrors: 6, ReadTimeouts: 7, AcceptErrors: 8, RefusedTooManyOpen: 9, RefusedPerIP: 10, StreamBufferDrops: 11},
-		Scheduler: dashboard.PipelineScheduler{InPackets: 27, InBytes: 28, BufferedTotal: 1<<53 + 3, QueueDepth: &depth, Accepted: 30,
-			DroppedParse: 31, DroppedVote: 32, DroppedDuplicate: 33, DroppedCapacity: 34, EvictedCapacity: &evicted,
-			DroppedExpired: &expired, DroppedAlreadyProcessed: 37, DroppedAccountLocks: 38, DroppedLookup: 39,
-			DroppedNoBank: 40, DroppedCost: 41, DroppedExecution: 42},
-	}
-	m := pipelineMeasurement(now, started, stats, s, int(depth))
-	if !reflect.DeepEqual(m, want) {
-		t.Fatalf("pipeline = %+v, want %+v", m, want)
-	}
-	q.TotalNewConnections.Store(0)
-	stats.Pipeline.Ingress.EnqueuedPackets = 0
-	s.Buffered = 0
-	s.EvictedCapacity, s.DroppedExpired = 0, 0
-	if !reflect.DeepEqual(m, want) {
-		t.Fatal("source mutation changed a published observation")
-	}
-	data, err := json.Marshal(m)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, exact := range []string{`"accepted_connections":"9007199254740993"`, `"enqueued_packets":"9007199254740994"`, `"buffered_total":"9007199254740995"`, `"queue_depth":"43"`} {
-		if !strings.Contains(string(data), exact) {
-			t.Fatalf("integer precision or queue semantics lost: %s", data)
-		}
-	}
-}
-
-func TestPipelineMeasurementPreservesUnavailableAndZero(t *testing.T) {
-	now := time.Now()
-	started := now.Add(-time.Minute)
-	m := pipelineMeasurement(now, started, tpu.Stats{}, scheduler.Stats{}, -1)
-	if m.QUIC != nil || m.Scheduler.QueueDepth != nil || m.Scheduler.DroppedExpired == nil || *m.Scheduler.DroppedExpired != 0 ||
-		m.Scheduler.EvictedCapacity == nil || *m.Scheduler.EvictedCapacity != 0 {
-		t.Fatalf("unavailable values fabricated: %+v", m)
-	}
-	m = pipelineMeasurement(now, started.Add(time.Second), tpu.Stats{}, scheduler.Stats{Buffered: 100}, 0)
-	if m.Scheduler.QueueDepth == nil || *m.Scheduler.QueueDepth != 0 || m.Scheduler.BufferedTotal != 100 || m.StartedAt.Equal(started) {
-		t.Fatalf("empty queue confused with cumulative buffering or prior instance: %+v", m)
-	}
-	data, err := json.Marshal(m)
-	if err != nil || !strings.Contains(string(data), `"quic":null`) || !strings.Contains(string(data), `"queue_depth":"0"`) {
-		t.Fatalf("zero/unavailable JSON semantics: %s, %v", data, err)
-	}
-}
-
-func TestPipelineMeasurementReadsQUICAtomics(t *testing.T) {
-	q := &quicserver.ServerStats{}
-	var writer sync.WaitGroup
-	writer.Go(func() {
-		for i := range uint64(1000) {
-			q.TotalNewConnections.Store(i)
-			q.OpenConnections.Store(i)
-			q.TotalNewStreams.Store(i)
-			q.ActiveStreams.Store(i)
-		}
-	})
-	for range 1000 {
-		pipelineMeasurement(time.Now(), time.Now(), tpu.Stats{QUIC: q}, scheduler.Stats{}, 0)
-	}
-	writer.Wait()
 }

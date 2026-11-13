@@ -38,12 +38,21 @@ func TestSparseCompactionRetainsExactLiveAndUndoRecords(t *testing.T) {
 				} else if crash == "punch" {
 					db.compactHooks.afterSparsePunch = func() { panic("simulated crash") }
 				}
-				cfg := CompactionConfig{RewindHorizonBatches: 1}
+				cfg := CompactionConfig{RewindHorizonBatches: 1, ObserveInventory: true}
 				if crash == "none" {
 					stats, err := db.CompactOnce(cfg)
 					require.NoError(t, err)
 					require.Equal(t, 1, stats.FilesSparsified)
 					require.Greater(t, stats.BytesReclaimed, int64(15<<20))
+					l := stats.Liveness
+					require.True(t, l.Known)
+					require.Equal(t, l.ScannedCandidates, l.CompleteCandidates+l.PartialCandidates)
+					require.Equal(t, l.ScannedCandidates, l.RewriteCandidates+l.SparseCandidates)
+					require.Equal(t, l.ExaminedBytes, l.LiveBytes+l.UndoPinnedBytes+l.DeadBytes)
+					require.Greater(t, l.LiveBytes, uint64(0))
+					require.Greater(t, l.UndoPinnedBytes, uint64(0))
+					require.Greater(t, l.EligibleHoleBytes, uint64(15<<20))
+					require.Less(t, l.EligibleHoleBytes, l.DeadBytes)
 				} else {
 					require.Panics(t, func() { _, _ = db.CompactOnce(cfg) })
 				}

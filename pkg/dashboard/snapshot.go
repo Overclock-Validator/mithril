@@ -51,9 +51,11 @@ type Snapshot struct {
 	Recovery           *Recovery           `json:"recovery"`
 	BlockSource        *BlockSource        `json:"block_source"`
 	Pipeline           *Pipeline           `json:"pipeline"`
+	Harmonic           *Harmonic           `json:"harmonic,omitempty"`
 	SnapshotManifests  *SnapshotManifests  `json:"snapshot_manifests,omitempty"`
 	SnapshotArchive    *SnapshotArchive    `json:"snapshot_archive,omitempty"`
 	IncrementalArchive *IncrementalArchive `json:"incremental_archive,omitempty"`
+	SnapshotShardFlush *SnapshotShardFlush `json:"snapshot_shard_flush,omitempty"`
 }
 
 // BlockSource describes local input progress, not completed replay or tip lag.
@@ -189,17 +191,18 @@ type RPCMethod struct {
 // Consensus distinguishes verified certificate evidence from local casting.
 // Neither counter is a reward-inclusion or FAST percentage.
 type Consensus struct {
-	SampledAt            time.Time `json:"sampled_at"`
-	ObservedBlocks       uint64    `json:"observed_blocks,string"`
-	ReplayedSlots        uint64    `json:"replayed_slots,string"`
-	SafetyFault          *bool     `json:"safety_fault"`
-	CertificatesAccepted uint64    `json:"certificates_accepted,string"`
-	NotarizedSlot        *uint64   `json:"notarized_slot,string"`
-	FinalizedSlot        *uint64   `json:"direct_finalized_slot,string"`
-	FinalizedBlockID     *string   `json:"direct_finalized_block_id"`
-	Receiver             *Receiver `json:"receiver"`
-	VotingEnabled        bool      `json:"voting_enabled"`
-	Voting               *Voting   `json:"voting"`
+	SampledAt            time.Time       `json:"sampled_at"`
+	ObservedBlocks       uint64          `json:"observed_blocks,string"`
+	ReplayedSlots        uint64          `json:"replayed_slots,string"`
+	SafetyFault          *bool           `json:"safety_fault"`
+	CertificatesAccepted uint64          `json:"certificates_accepted,string"`
+	NotarizedSlot        *uint64         `json:"notarized_slot,string"`
+	FinalizedSlot        *uint64         `json:"direct_finalized_slot,string"`
+	FinalizedBlockID     *string         `json:"direct_finalized_block_id"`
+	Receiver             *Receiver       `json:"receiver"`
+	VotingEnabled        bool            `json:"voting_enabled"`
+	Voting               *Voting         `json:"voting"`
+	BlockLifecycle       *BlockLifecycle `json:"block_lifecycle,omitempty"`
 }
 
 // Receiver reports Votor ingress; decoded messages are not verified votes.
@@ -216,27 +219,28 @@ type Receiver struct {
 // Voting separates key eligibility, local casting and verified network evidence.
 // Counters span the voter instance, including identity changes within that run.
 type Voting struct {
-	SampledAt             time.Time  `json:"sampled_at"`
-	Identity              string     `json:"identity"`
-	VoteAccount           string     `json:"vote_account"`
-	RootSlot              *uint64    `json:"root_slot,string"`
-	Epoch                 *uint64    `json:"epoch,string"`
-	KeyEligible           *bool      `json:"key_eligible"`
-	Rank                  *uint16    `json:"rank"`
-	AdmittedStake         *uint64    `json:"admitted_stake_lamports,string"`
-	TotalAdmittedStake    *uint64    `json:"total_admitted_stake_lamports,string"`
-	JoinedLive            *bool      `json:"joined_live,omitempty"`
-	VotesCast             uint64     `json:"votes_cast_this_run,string"`
-	NetworkLanded         uint64     `json:"network_landed_votes,string"`
-	LastNetworkLandedSlot *uint64    `json:"last_network_landed_slot,string"`
-	LastNetworkLandedAt   *time.Time `json:"last_network_landed_at"`
-	MessagesQueued        uint64     `json:"messages_queued,string"`
-	MessagesDropped       uint64     `json:"messages_dropped,string"`
-	PeerSendErrors        uint64     `json:"peer_send_errors,string"`
-	PeerQueueDrops        uint64     `json:"peer_queue_drops,string"`
-	SendTimeouts          uint64     `json:"send_timeouts,string"`
-	DesiredPeers          int        `json:"desired_peers"`
-	Connections           int        `json:"connections"`
+	NextEpochSigner       *NextEpochSigner `json:"next_epoch_signer,omitempty"`
+	SampledAt             time.Time        `json:"sampled_at"`
+	Identity              string           `json:"identity"`
+	VoteAccount           string           `json:"vote_account"`
+	RootSlot              *uint64          `json:"root_slot,string"`
+	Epoch                 *uint64          `json:"epoch,string"`
+	KeyEligible           *bool            `json:"key_eligible"`
+	Rank                  *uint16          `json:"rank"`
+	AdmittedStake         *uint64          `json:"admitted_stake_lamports,string"`
+	TotalAdmittedStake    *uint64          `json:"total_admitted_stake_lamports,string"`
+	JoinedLive            *bool            `json:"joined_live,omitempty"`
+	VotesCast             uint64           `json:"votes_cast_this_run,string"`
+	NetworkLanded         uint64           `json:"network_landed_votes,string"`
+	LastNetworkLandedSlot *uint64          `json:"last_network_landed_slot,string"`
+	LastNetworkLandedAt   *time.Time       `json:"last_network_landed_at"`
+	MessagesQueued        uint64           `json:"messages_queued,string"`
+	MessagesDropped       uint64           `json:"messages_dropped,string"`
+	PeerSendErrors        uint64           `json:"peer_send_errors,string"`
+	PeerQueueDrops        uint64           `json:"peer_queue_drops,string"`
+	SendTimeouts          uint64           `json:"send_timeouts,string"`
+	DesiredPeers          int              `json:"desired_peers"`
+	Connections           int              `json:"connections"`
 }
 
 // Replay is local loop activity. Counts include work later discarded by a
@@ -263,6 +267,7 @@ type Replay struct {
 	SlotHistory           *SlotHistory         `json:"slot_history,omitempty"`
 	ChainActivity         *ChainActivity       `json:"chain_activity,omitempty"`
 	EpochOutcomes         *EpochOutcomes       `json:"epoch_outcomes,omitempty"`
+	PaymentOutcomes       *PaymentOutcomes     `json:"payment_outcomes,omitempty"`
 	RewardHealth          *RewardHealth        `json:"reward_health,omitempty"`
 	AccountFacts          *AccountFacts        `json:"account_facts,omitempty"`
 }
@@ -377,6 +382,7 @@ type Resources struct {
 	Ledger     *Filesystem      `json:"ledger"`
 	Host       *HostResources   `json:"host,omitempty"`
 	Cgroup     *CgroupResources `json:"cgroup,omitempty"`
+	Compaction *Compaction      `json:"compaction,omitempty"`
 }
 
 // Filesystem reports total and unprivileged-available space for one path's mount.
@@ -388,6 +394,9 @@ type Filesystem struct {
 }
 
 func (s Snapshot) validate() error {
+	if a := s.SnapshotShardFlush; a != nil && (s.SnapshotArchive != nil || s.IncrementalArchive != nil || !validSnapshotShardFlush(a)) {
+		return errors.New("invalid dashboard snapshot shard flush")
+	}
 	if a := s.IncrementalArchive; a != nil && (s.SnapshotArchive != nil || a.IncrementalSlot <= a.FullSnapshotSlot) {
 		return errors.New("invalid dashboard incremental archive binding")
 	}
@@ -481,11 +490,17 @@ func frames(s *Snapshot, state string, now time.Time) ([][]byte, error) {
 		{Topic: "summary", Key: "startup_time_nanos", Value: started},
 		{Topic: "summary", Key: "server_time_nanos", Value: strconv.FormatInt(now.UnixNano(), 10)},
 	}
+	if h := publicHarmonic(s, state, now); h != nil {
+		values = append(values, message{Topic: "mithril", Key: "harmonic", Value: h})
+	}
 	if s != nil && s.SnapshotArchive != nil {
 		values = append(values, message{Topic: "mithril", Key: "snapshot_archive", Value: s.SnapshotArchive})
 	}
 	if s != nil && s.IncrementalArchive != nil {
 		values = append(values, message{Topic: "mithril", Key: "incremental_archive", Value: s.IncrementalArchive})
+	}
+	if s != nil && s.SnapshotShardFlush != nil {
+		values = append(values, message{Topic: "mithril", Key: "snapshot_shard_flush", Value: s.SnapshotShardFlush})
 	}
 	out := make([][]byte, 0, len(values))
 	for _, value := range values {

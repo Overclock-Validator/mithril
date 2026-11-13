@@ -228,12 +228,16 @@ func NewEngine(cfg Config) (*AlpenglowObserverEngine, error) {
 	// authority; CertPool's parallel certificate output is deliberately disabled.
 	e.certPool = alpenglow.NewCertPool(alpenglow.DefaultCertPoolConfig(), e.verifier, nil)
 	e.certPool.SetVerifiedVoteSink(e.acceptVerifiedVote)
+	if cfg.MonitoringEnabled {
+		e.lifecycle = newLifecycleRecorder(time.Now())
+	}
 	return e, nil
 }
 
 type AlpenglowObserverEngine struct {
 	monitoringEnabled       bool
 	votorPayloadMonitoring  bool
+	lifecycle               *lifecycleRecorder
 	observedBlocks          atomic.Uint64
 	replayedSlots           atomic.Uint64
 	observer                *alpenglow.Observer
@@ -549,6 +553,11 @@ func (e *AlpenglowObserverEngine) ObserveBlock(_ context.Context, obs BlockObser
 			}
 		}
 		e.observedReplayMu.Unlock()
+		if e.lifecycle != nil {
+			if timings, ok := obs.Block.TurbineIngressTimings(); ok {
+				e.lifecycle.observeIngress(blockID, timings, obs.At)
+			}
+		}
 	}
 	return e.safetyError()
 }
@@ -605,6 +614,9 @@ func (e *AlpenglowObserverEngine) OnReplayResult(_ context.Context, result SlotR
 			if err := e.drainPendingSafeToNotar(); err != nil {
 				e.latchSafetyError(err)
 				return err
+			}
+			if e.lifecycle != nil && result.AlpenglowBlockID != ([32]byte{}) && obs.Block.Hash == solana.Hash(result.AlpenglowBlockID) {
+				e.lifecycle.observeReplay(obs.Block, result.At)
 			}
 		}
 	}
@@ -1056,6 +1068,7 @@ func (e *AlpenglowObserverEngine) handleConsensusUpdate(update alpenglow.Consens
 			if err := chain.ObserveFinalized(block, cert.Type); err != nil {
 				return fmt.Errorf("chain tracker rejected genesis finalization at slot %d: %w", cert.Slot, err)
 			}
+			e.observeLifecycleFinality(block, cert.Type)
 			e.ensurePool().PruneBehindFinality(block.Slot)
 		}
 		e.observeVotorBlockID(alpenglow.NewCertificateMessage(cert))
@@ -1075,6 +1088,7 @@ func (e *AlpenglowObserverEngine) handleConsensusUpdate(update alpenglow.Consens
 			if err := e.ensureChain().ObserveFinalized(event.Block, event.CertificateType); err != nil {
 				return fmt.Errorf("chain tracker rejected pool finalization at slot %d: %w", event.Slot, err)
 			}
+			e.observeLifecycleFinality(event.Block, event.CertificateType)
 			e.ensurePool().PruneBehindFinality(event.Slot)
 		case alpenglow.ConsensusEventConflict:
 			fault := fmt.Errorf("consensus pool conflict at slot %d: %s", event.Slot, event.Reason)
@@ -1089,6 +1103,17 @@ func (e *AlpenglowObserverEngine) handleConsensusUpdate(update alpenglow.Consens
 		return err
 	}
 	return e.safetyError()
+}
+
+// observeLifecycleFinality follows an accepted direct decision. Pruned no-op
+// decisions do not supply retained exact-identity evidence or a timing sample.
+func (e *AlpenglowObserverEngine) observeLifecycleFinality(id alpenglow.BlockID, kind alpenglow.CertificateType) {
+	if e.lifecycle == nil {
+		return
+	}
+	if retained, ok := e.ensureChain().FinalizedBlockAt(id.Slot); ok && retained == id {
+		e.lifecycle.observeFinality(id, kind, time.Now())
+	}
 }
 
 // drainPendingSafeToNotar resolves the pool/service handoff for intrawindow

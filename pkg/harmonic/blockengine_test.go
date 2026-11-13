@@ -291,8 +291,8 @@ func TestBlockEngineStrategyChangeReconnectsWithTheNewStrategy(t *testing.T) {
 	eventually(t, func() bool {
 		h.be.mu.Lock()
 		defer h.be.mu.Unlock()
-		return len(h.be.strategies) >= 2
-	}, "the new strategy is received")
+		return len(h.be.strategies) == 2
+	}, "the new strategy reaches the block engine")
 	h.be.mu.Lock()
 	defer h.be.mu.Unlock()
 	assert.Equal(t, []blockenginepb.SchedulingStrategy{
