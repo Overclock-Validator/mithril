@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
+	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/txfixture"
 	"github.com/gagliardetto/solana-go"
@@ -205,5 +206,76 @@ func TestWorkAheadSealedWriteIsUnusable(t *testing.T) {
 	}
 	if got, _ := slotCtx.GetAccountShared(payer); got.Lamports != 10 {
 		t.Fatal("the refused write must not reach the slot")
+	}
+}
+
+// Adversarial case: a program is upgraded (or first deployed) by an earlier
+// transaction after a later one already ran early against it. The loader reads
+// the program account and then the program data account through the slot's
+// accounts, so the sealed view holds both, whether or not the captured read
+// set does, and whether the program data existed at all when it was read.
+func TestWorkAheadSealedViewCatchesProgramUpgrade(t *testing.T) {
+	saved := workAheadValueCheck
+	defer func() { workAheadValueCheck = saved }()
+	workAheadValueCheck = false
+	payer, program, programData, lateData := testPk(1), testPk(2), testPk(3), testPk(4)
+	loaderOwner := [32]byte(addresses.BpfLoaderUpgradeableAddr)
+	parent := accounts.NewMemAccountsWithLen(3)
+	for _, acct := range []*accounts.Account{
+		{Key: payer, Lamports: 10},
+		{Key: program, Lamports: 10, Owner: loaderOwner, Executable: true},
+		{Key: programData, Lamports: 10, Owner: loaderOwner, Data: []byte{1}},
+	} {
+		if err := parent.SetAccountWithoutLock(acct.Key, acct); err != nil {
+			t.Fatal(err)
+		}
+	}
+	overlay := accounts.NewOverlayAccounts(parent)
+	slotCtx := &sealevel.SlotCtx{Accounts: overlay}
+	// The transaction declares only its payer here, so the captured read set
+	// covers neither program account: only the view can catch the upgrade.
+	tx := &solana.Transaction{Message: solana.Message{AccountKeys: []solana.PublicKey{payer}}}
+	w := &workAhead{slotCtx: slotCtx, overlay: overlay, txs: []*solana.Transaction{tx, tx, tx}, entries: make([]atomic.Pointer[workAheadEntry], 3)}
+	earlyRun := func(dataKey solana.PublicKey) *workAheadEntry {
+		e := &workAheadEntry{state: workAheadFinished, finished: make(chan struct{})}
+		close(e.finished)
+		e.keys, e.versions, _ = workAheadReadSet(slotCtx, overlay, tx)
+		e.view = accounts.NewRecordingReader(overlay)
+		sealed := sealevel.NewSealedSlotCtx(slotCtx, e.view)
+		// what the loader does: the program account, then its program data
+		if _, err := sealed.GetAccount(program); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = sealed.GetAccountShared(dataKey) // may not exist yet
+		e.output.ExecCtx = &sealevel.ExecutionCtx{SlotCtx: sealed}
+		return e
+	}
+
+	w.entries[0].Store(earlyRun(programData))
+	if out, release := w.claim(0); out == nil {
+		t.Fatal("no upgrade happened: the early result stands")
+	} else {
+		release()
+	}
+
+	// upgrade: the program data account is stored again
+	w.entries[1].Store(earlyRun(programData))
+	key := [32]byte(programData)
+	if err := overlay.SetAccount(&key, &accounts.Account{Key: programData, Lamports: 10, Owner: loaderOwner, Data: []byte{2}}); err != nil {
+		t.Fatal(err)
+	}
+	if out, _ := w.claim(1); out != nil {
+		t.Fatal("an early result survived an upgrade of the program it ran")
+	}
+
+	// first deployment: the program data did not exist when the early run
+	// looked for it, and is created before the transaction's turn
+	w.entries[2].Store(earlyRun(lateData))
+	key = [32]byte(lateData)
+	if err := overlay.SetAccount(&key, &accounts.Account{Key: lateData, Lamports: 10, Owner: loaderOwner, Data: []byte{9}}); err != nil {
+		t.Fatal(err)
+	}
+	if out, _ := w.claim(2); out != nil {
+		t.Fatal("an early result survived the creation of an account it had found missing")
 	}
 }

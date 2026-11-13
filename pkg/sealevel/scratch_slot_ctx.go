@@ -22,6 +22,28 @@ func NewScratchSlotCtx(base *SlotCtx) *SlotCtx {
 // constant for the block and shared with base; the bookkeeping an execution
 // could write is private to the returned context, as in a scratch context.
 // The result of such an execution is committed, if at all, against base.
+//
+// What reaches an execution without going through view, and why none of it
+// can change between the execution and its transaction's turn (audited
+// 2026-11-13):
+//
+//   - Parent-bank account versions (GetAccountFromAccountsDb and the helpers
+//     built on it). The parent is frozen before the block starts and the
+//     block's stores go to the overlay. Every such read in the loading and
+//     loader paths is a fallback taken only after the slot's accounts, that is
+//     view, were asked for the same key and had no entry, and view records
+//     that absence: a later store to the key is then a recorded read that
+//     changed.
+//   - Program bytes. The loader resolves the program account and, for
+//     upgradeable programs, the program data account through the slot's
+//     accounts first, so both are recorded by view. The compiled-program cache
+//     is consulted only for an entry that matches those exact bytes and the
+//     feature set, so a compiled program is a function of recorded reads and
+//     block constants; an execution marked Speculative never inserts into it.
+//   - Address lookup tables, resolved from parent state before execution.
+//   - The bank sysvar snapshot, feature set, blockhashes, fee rate and epoch
+//     stakes: set before the block's transactions run. Sysvar accounts cannot
+//     be written by transactions.
 func NewSealedSlotCtx(base *SlotCtx, view accounts.Accounts) *SlotCtx {
 	return newDerivedSlotCtx(base, view)
 }
