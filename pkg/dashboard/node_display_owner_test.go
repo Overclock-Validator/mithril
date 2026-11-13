@@ -32,6 +32,31 @@ func nodeDisplayTestValue(t *testing.T, body string) nodeDisplay {
 	return value
 }
 
+func TestNodeDisplayOwnerMainnetDirectory(t *testing.T) {
+	raw := time.Now()
+	wall := raw.UTC()
+	s, view := nodeDisplayFixture(t, wall)
+	genesis := cluster.MainnetGenesisHash
+	s.GenesisHash = &genesis
+	view.metadata.Profile, view.metadata.Network, view.metadata.GenesisHash = "mainnet", "mainnet-beta", &genesis
+	for i := range view.rows {
+		view.rows[i].DirectorySource, view.rows[i].Name = "rpc", ""
+	}
+	var owner nodeDisplayOwner
+	frame := publishNodeDisplayTest(t, &owner, &s, view, wall, raw)
+	value := nodeDisplayTestValue(t, frame.body)
+	if value.Profile != "mainnet" || value.Reason != "name_unavailable" || value.Name != nil {
+		t.Fatalf("matching mainnet directory was not accepted: %+v", value)
+	}
+	other := cluster.GenesisHash
+	view.metadata.GenesisHash = &other
+	frame = publishNodeDisplayTest(t, &owner, &s, view, wall, raw.Add(time.Nanosecond))
+	value = nodeDisplayTestValue(t, frame.body)
+	if value.Reason != "directory_unavailable" || value.Name != nil {
+		t.Fatalf("mismatched directory was accepted: %+v", value)
+	}
+}
+
 func TestNodeDisplayOwnerOriginalProviderLease(t *testing.T) {
 	raw := time.Now()
 	wall := raw.UTC()

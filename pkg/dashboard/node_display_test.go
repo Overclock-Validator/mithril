@@ -125,6 +125,32 @@ func TestNodeDisplayBindingAndUnknown(t *testing.T) {
 	}
 }
 
+func TestNodeDisplayMainnetProfile(t *testing.T) {
+	now := time.Now().UTC()
+	s, view := nodeDisplayFixture(t, now)
+	if v := selectNodeDisplay(nil, "unavailable", nil, now); v.Profile != "unknown" {
+		t.Fatalf("an unavailable node must not claim a network: %+v", v)
+	}
+	genesis := cluster.MainnetGenesisHash
+	s.GenesisHash = &genesis
+	view.metadata.Profile, view.metadata.Network, view.metadata.GenesisHash = "mainnet", "mainnet-beta", &genesis
+	for i := range view.rows {
+		view.rows[i].DirectorySource, view.rows[i].Name = "rpc", ""
+	}
+	v := selectNodeDisplay(&s, "fresh", view, now)
+	if v.Profile != "mainnet" || v.Reason != "name_unavailable" || v.Name != nil {
+		t.Fatalf("mainnet display must identify the network without inventing a name: %+v", v)
+	}
+	if v := selectNodeDisplay(&s, "stale", view, now); v.Profile != "mainnet" || v.Reason != "status_stale" || v.Name != nil {
+		t.Fatalf("stale mainnet display has incorrect profile or state: %+v", v)
+	}
+	otherGenesis := cluster.GenesisHash
+	view.metadata.GenesisHash = &otherGenesis
+	if v := selectNodeDisplay(&s, "fresh", view, now); v.Profile != "mainnet" || v.Reason != "directory_unavailable" || v.Name != nil {
+		t.Fatalf("mismatched directory accepted: %+v", v)
+	}
+}
+
 func TestNodeDisplayMaximumShape(t *testing.T) {
 	now := time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.FixedZone("fixture", 23*3600+59*60))
 	s, view := nodeDisplayFixture(t, now)
