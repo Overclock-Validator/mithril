@@ -29,8 +29,10 @@ const (
 	MaxRows = 2048
 	// MaxPerformanceHistory bounds provider-reported historical samples.
 	MaxPerformanceHistory = 120
-	// GenesisHash identifies the only supported community-cluster profile.
+	// GenesisHash identifies the supported community-cluster profile.
 	GenesisHash = "9mi4SxvrMwaErcAN9r8wAAsX8YTKedGNogzQCuhTZ7Nz"
+	// MainnetGenesisHash identifies Solana mainnet-beta.
+	MainnetGenesisHash = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
 	// MaxAge is the maximum source/capture age accepted as current by this package.
 	MaxAge = 2 * time.Minute
 	// RankPolicy names the collector's derived competition rank, not Titan's UI order.
@@ -164,6 +166,13 @@ var sourceURLs = map[string]string{
 	"puffin":  "https://puffin-validator.xyz/alpenglow",
 }
 
+const mainnetPublicRPC = "https://solana-rpc.publicnode.com"
+
+var mainnetSourceURLs = map[string]string{
+	"rpc":     "https://api.mainnet-beta.solana.com",
+	"solstat": "", "titan": "", "geoip": "https://db-ip.com/", "puffin": "",
+}
+
 var decimalSOL = regexp.MustCompile(`^(0|[1-9][0-9]{0,19})(\.[0-9]{1,18})?$`)
 
 func count(n uint64) Count { return Count(strconv.FormatUint(n, 10)) }
@@ -222,7 +231,13 @@ func reasonOK(reason string) bool {
 // Validate rejects unsafe, inconsistent, or incorrectly bound persisted snapshots.
 // Freshness relative to wall time remains a reader decision; historical files are valid data.
 func Validate(s Snapshot) error {
-	if s.SchemaVersion != 1 || s.Scope != "independent_cluster" || s.Profile != "alpenglow" || s.Network != "alpenglow-community" || s.GenesisHash != GenesisHash || s.CapturedAt.IsZero() || s.FastState != "unavailable" || len(s.Validators) > MaxRows || len(s.Providers) != len(sourceURLs) {
+	urls := sourceURLs
+	validProfile := s.Profile == "alpenglow" && s.Network == "alpenglow-community" && s.GenesisHash == GenesisHash
+	if s.Profile == "mainnet" {
+		urls = mainnetSourceURLs
+		validProfile = s.Network == "mainnet-beta" && s.GenesisHash == MainnetGenesisHash
+	}
+	if s.SchemaVersion != 1 || s.Scope != "independent_cluster" || !validProfile || s.CapturedAt.IsZero() || s.FastState != "unavailable" || len(s.Validators) > MaxRows || len(s.Providers) != len(urls) {
 		return errors.New("invalid cluster snapshot envelope")
 	}
 	if s.Epoch != nil {
@@ -232,7 +247,8 @@ func Validate(s Snapshot) error {
 	}
 	providers := make(map[string]ProviderStatus, len(s.Providers))
 	for _, p := range s.Providers {
-		if sourceURLs[p.ID] == "" || sourceURLs[p.ID] != p.SourceURL || providers[p.ID].ID != "" || p.CapturedAt.IsZero() || p.CapturedAt.After(s.CapturedAt) || !reasonOK(p.Reason) {
+		url, known := urls[p.ID]
+		if !known || (url != p.SourceURL && !(s.Profile == "mainnet" && p.ID == "rpc" && p.SourceURL == mainnetPublicRPC)) || providers[p.ID].ID != "" || p.CapturedAt.IsZero() || p.CapturedAt.After(s.CapturedAt) || !reasonOK(p.Reason) {
 			return errors.New("invalid provider identity or time")
 		}
 		if p.State != "fresh" && p.State != "unavailable" && p.State != "invalid" && p.State != "retired" && p.State != "stale" {
@@ -258,8 +274,11 @@ func Validate(s Snapshot) error {
 			}
 		}
 		if p.State == "fresh" {
+			if s.Profile == "mainnet" && p.ID != "rpc" && p.ID != "geoip" {
+				return errors.New("unavailable mainnet provider cannot be fresh")
+			}
 			binding := map[string]string{"rpc": "rpc_genesis_before_after", "solstat": "rpc_profile_epoch_checked", "titan": "payload_genesis_epoch_checked", "geoip": "rpc_gossip_local_geoip"}[p.ID]
-			if binding == "" || p.Binding != binding || p.SourceTimeKind != timeKind || p.GenesisHash != GenesisHash || p.SourceAt == nil || p.SourceAt.IsZero() || p.SourceAt.After(p.CapturedAt.Add(5*time.Second)) || p.CapturedAt.Sub(*p.SourceAt) > MaxAge || p.Epoch == nil || s.Epoch == nil || *p.Epoch != *s.Epoch {
+			if binding == "" || p.Binding != binding || p.SourceTimeKind != timeKind || p.GenesisHash != s.GenesisHash || p.SourceAt == nil || p.SourceAt.IsZero() || p.SourceAt.After(p.CapturedAt.Add(5*time.Second)) || p.CapturedAt.Sub(*p.SourceAt) > MaxAge || p.Epoch == nil || s.Epoch == nil || *p.Epoch != *s.Epoch {
 				return errors.New("invalid fresh provider binding")
 			}
 		}
@@ -277,9 +296,10 @@ func Validate(s Snapshot) error {
 		slot, slotErr := number(r.Slot)
 		start, startErr := number(r.EpochStart)
 		length, lengthErr := number(r.SlotsInEpoch)
+		observedTimeOK := p.SourceAt != nil && (p.SourceAt.Equal(r.ObservedAt) || (s.Profile == "mainnet" && !r.ObservedAt.Before(*p.SourceAt) && !r.ObservedAt.After(p.CapturedAt)))
 		if slotErr != nil || startErr != nil || lengthErr != nil || length == 0 ||
 			start > math.MaxUint64-(length-1) || slot < start || slot-start >= length ||
-			p.State != "fresh" || p.SourceAt == nil || !p.SourceAt.Equal(r.ObservedAt) {
+			p.State != "fresh" || !observedTimeOK {
 			return errors.New("invalid RPC reference observation")
 		}
 	}
@@ -288,9 +308,13 @@ func Validate(s Snapshot) error {
 		slot, slotErr := number(sample.Slot)
 		tx, txErr := number(sample.Transactions)
 		_, slotsErr := number(sample.Slots)
+		referenceTime := p.SourceAt
+		if s.Profile == "mainnet" {
+			referenceTime = &p.CapturedAt
+		}
 		if s.Reference == nil || slotErr != nil || txErr != nil || slotsErr != nil || sample.PeriodSeconds == 0 ||
-			p.State != "fresh" || p.SourceAt == nil || sample.ObservedAt.IsZero() || sample.ObservedAt.After(*p.SourceAt) ||
-			p.SourceAt.Sub(sample.ObservedAt) > MaxAge {
+			p.State != "fresh" || referenceTime == nil || sample.ObservedAt.IsZero() || sample.ObservedAt.After(*referenceTime) ||
+			referenceTime.Sub(sample.ObservedAt) > MaxAge {
 			return errors.New("invalid RPC performance observation")
 		}
 		reference, _ := number(s.Reference.Slot)
@@ -330,8 +354,12 @@ func Validate(s Snapshot) error {
 	}
 	seen := make(map[string]bool, len(s.Validators))
 	for _, v := range s.Validators {
-		if !keyOK(v.Identity) || !keyOK(v.VoteAccount) || seen[v.VoteAccount] || !textOK(v.Name, 128) || !textOK(v.Version, 64) || (v.DirectorySource != "solstat" && v.DirectorySource != "titan") || providers[v.DirectorySource].State != "fresh" || v.Fast != nil {
+		validSource := (s.Profile == "alpenglow" && (v.DirectorySource == "solstat" || v.DirectorySource == "titan")) || (s.Profile == "mainnet" && v.DirectorySource == "rpc")
+		if !keyOK(v.Identity) || !keyOK(v.VoteAccount) || seen[v.VoteAccount] || !textOK(v.Name, 128) || !textOK(v.Version, 64) || !validSource || providers[v.DirectorySource].State != "fresh" || v.Fast != nil {
 			return errors.New("invalid validator row")
+		}
+		if v.DirectorySource == "rpc" && (v.Name != "" || v.VoteLagSlots != nil || v.LeaderSlots != nil || v.BlocksProduced != nil || v.SkipRatePercent != nil || v.EfficiencyPercent != nil || v.EfficiencyRank != nil || len(v.Inclusion) != 0) {
+			return errors.New("RPC directory contains unsupported fields")
 		}
 		seen[v.VoteAccount] = true
 		if v.StakeSOL != nil && !decimalSOL.MatchString(*v.StakeSOL) {
@@ -340,7 +368,7 @@ func Validate(s Snapshot) error {
 		if !percentOK(v.CommissionPercent) || !percentOK(v.SkipRatePercent) || !percentOK(v.EfficiencyPercent) {
 			return errors.New("invalid directory percentage")
 		}
-		if v.DirectorySource != "solstat" && (v.RootSlot != nil || v.CurrentEpochCredits != nil || v.VoteLagSlots != nil) {
+		if v.DirectorySource != "solstat" && v.DirectorySource != "rpc" && (v.RootSlot != nil || v.CurrentEpochCredits != nil || v.VoteLagSlots != nil) {
 			return errors.New("invalid vote observation source")
 		}
 		for _, c := range []*Count{v.LastVote, v.RootSlot, v.CurrentEpochCredits, v.VoteLagSlots, v.LeaderSlots, v.BlocksProduced, v.EfficiencyRank} {
