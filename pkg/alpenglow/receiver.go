@@ -28,9 +28,10 @@ const (
 )
 
 type ReceiverConfig struct {
-	BindAddr        string
-	MaxMessageBytes int64
-	ShredVersion    uint16
+	RecordApplicationPayload bool // constructor-selected; default off
+	BindAddr                 string
+	MaxMessageBytes          int64
+	ShredVersion             uint16
 	// Identity binds the QUIC certificate's Ed25519 public key to the validator
 	// identity, allowing Agave's staked A2A admission to recognize this node.
 	// The certificate follows set-identity swaps for new connections. Nil
@@ -92,12 +93,14 @@ type Receiver struct {
 	// unregisterKey removes the certificate updater from the identity holder.
 	unregisterKey func()
 
-	mu          sync.Mutex
-	closed      bool
-	conns       map[*quic.Conn]receiverConnection
-	connsByIP   map[string]int
-	connsByPeer map[solana.PublicKey]int
-	stats       ReceiverStats
+	mu               sync.Mutex
+	closed           bool
+	conns            map[*quic.Conn]receiverConnection
+	connsByIP        map[string]int
+	connsByPeer      map[solana.PublicKey]int
+	stats            ReceiverStats
+	payloadStartedAt time.Time
+	payloadBytes     uint64
 }
 
 type receiverConnection struct {
@@ -136,14 +139,19 @@ func NewReceiver(cfg ReceiverConfig, observer *Observer) (*Receiver, error) {
 	// New connections present the swapped identity once the updater returns;
 	// accepted connections keep the identity they authenticated with.
 	unregisterKey := holder.RegisterUpdater("Votor receiver", certs.Refresh)
+	var payloadStartedAt time.Time
+	if cfg.RecordApplicationPayload {
+		payloadStartedAt = time.Now()
+	}
 	return &Receiver{
-		cfg:           cfg,
-		observer:      observer,
-		listener:      listener,
-		unregisterKey: unregisterKey,
-		conns:         make(map[*quic.Conn]receiverConnection),
-		connsByIP:     make(map[string]int),
-		connsByPeer:   make(map[solana.PublicKey]int),
+		payloadStartedAt: payloadStartedAt,
+		cfg:              cfg,
+		observer:         observer,
+		listener:         listener,
+		unregisterKey:    unregisterKey,
+		conns:            make(map[*quic.Conn]receiverConnection),
+		connsByIP:        make(map[string]int),
+		connsByPeer:      make(map[solana.PublicKey]int),
 	}, nil
 }
 
@@ -255,7 +263,7 @@ func (r *Receiver) handleConn(ctx context.Context, conn *quic.Conn, peer solana.
 			datagramsThisWindow = 0
 		}
 		if datagramsThisWindow >= r.cfg.MaxDatagramsPerSecond {
-			r.recordRateLimitedDatagram()
+			r.recordRateLimitedDatagram(len(payload))
 			continue
 		}
 		datagramsThisWindow++
@@ -264,7 +272,7 @@ func (r *Receiver) handleConn(ctx context.Context, conn *quic.Conn, peer solana.
 }
 
 func (r *Receiver) handleDatagram(peer solana.PublicKey, payload []byte) {
-	r.recordDatagram()
+	r.recordDatagram(len(payload))
 	if int64(len(payload)) > r.cfg.MaxMessageBytes {
 		r.recordOversizeMessage()
 		return
@@ -327,9 +335,10 @@ func (r *Receiver) recordConnection() {
 	r.mu.Unlock()
 }
 
-func (r *Receiver) recordDatagram() {
+func (r *Receiver) recordDatagram(n int) {
 	r.mu.Lock()
 	r.stats.DatagramsReceived++
+	r.recordApplicationPayloadLocked(n)
 	r.mu.Unlock()
 }
 
@@ -389,9 +398,10 @@ func (r *Receiver) recordOversizeMessage() {
 	r.mu.Unlock()
 }
 
-func (r *Receiver) recordRateLimitedDatagram() {
+func (r *Receiver) recordRateLimitedDatagram(n int) {
 	r.mu.Lock()
 	r.stats.RateLimitedDatagrams++
+	r.recordApplicationPayloadLocked(n)
 	r.mu.Unlock()
 }
 

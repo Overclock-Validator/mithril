@@ -106,7 +106,9 @@ type contactEndpoint struct {
 type contactRecord struct {
 	Pubkey          Pubkey
 	Wallclock       uint64
+	Outset          uint64
 	ShredVer        uint16
+	Version         Version
 	GossipAddr      contactEndpoint
 	ServeRepairAddr contactEndpoint
 	TVUAddr         contactEndpoint
@@ -521,13 +523,13 @@ func decodeContactRecord(d *decoder) (contactRecord, error) {
 	if record.Wallclock, err = d.varint(10); err != nil {
 		return contactRecord{}, err
 	}
-	if _, err := d.u64(); err != nil {
+	if record.Outset, err = d.u64(); err != nil {
 		return contactRecord{}, err
 	}
 	if record.ShredVer, err = d.u16(); err != nil {
 		return contactRecord{}, err
 	}
-	if _, err = decodeVersion(d); err != nil {
+	if record.Version, err = decodeVersion(d); err != nil {
 		return contactRecord{}, err
 	}
 
@@ -725,14 +727,31 @@ func decodeCrdsDataContactInfo(d *decoder) (*ContactInfo, error) {
 }
 
 func decodeCrdsDataContactRecord(d *decoder) (contactRecord, error) {
+	return decodeCrdsDataContactRecordObserved(d, nil)
+}
+
+func decodeCrdsDataContactRecordObserved(d *decoder, observation *PacketDecodeObservation) (contactRecord, error) {
 	variant, err := d.variant()
 	if err != nil {
+		if observation != nil {
+			observation.MalformedValue++
+		}
 		return contactRecord{}, err
 	}
 	switch variant {
 	case crdsDataContactInfo:
-		return decodeContactRecord(d)
+		if observation != nil {
+			observation.AttemptedContactV2++
+		}
+		record, err := decodeContactRecord(d)
+		if err != nil && observation != nil {
+			observation.MalformedValue++
+		}
+		return record, err
 	default:
+		if observation != nil {
+			observation.UnsupportedType++
+		}
 		return contactRecord{}, errUnsupportedCRDSValue
 	}
 }
@@ -749,12 +768,19 @@ func signCrdsContactInfo(info *ContactInfo, identity ed25519.PrivateKey) (CrdsVa
 }
 
 func decodeCrdsContactRecord(d *decoder) (contactRecord, error) {
+	return decodeCrdsContactRecordObserved(d, nil)
+}
+
+func decodeCrdsContactRecordObserved(d *decoder, observation *PacketDecodeObservation) (contactRecord, error) {
 	sig, err := d.read(64)
 	if err != nil {
+		if observation != nil {
+			observation.MalformedValue++
+		}
 		return contactRecord{}, err
 	}
 	dataStart := d.off
-	record, err := decodeCrdsDataContactRecord(d)
+	record, err := decodeCrdsDataContactRecordObserved(d, observation)
 	if err != nil {
 		return contactRecord{}, err
 	}

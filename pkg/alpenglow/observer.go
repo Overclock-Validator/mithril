@@ -129,6 +129,7 @@ type Observer struct {
 	latestFastFinalizedBlock      BlockID
 	latestFinalizedSlot           uint64
 	latestSkippedSlot             uint64
+	hasSkippedCertificate         bool
 	genesisBlock                  BlockID
 }
 
@@ -279,6 +280,22 @@ func (o *Observer) Snapshot() Snapshot {
 	return o.snapshotLocked()
 }
 
+// NotarizedSlot returns the highest regular/fallback notarize, fast-finalize or
+// skip slot observed by this instance. The bool distinguishes absence from slot
+// zero. As with ObserveCertificate, callers establish the input's trust; this
+// getter neither verifies certificates nor scans retained history.
+func (o *Observer) NotarizedSlot() (uint64, bool) {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	slot, known := o.latestSkippedSlot, o.hasSkippedCertificate
+	for _, block := range [...]BlockID{o.latestNotarizedBlock, o.latestFallbackBlock, o.latestFastFinalizedBlock} {
+		if block.HasHash() && (!known || block.Slot > slot) {
+			slot, known = block.Slot, true
+		}
+	}
+	return slot, known
+}
+
 func (o *Observer) Certificate(key CertificateKey) (Certificate, bool) {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
@@ -325,9 +342,10 @@ func (o *Observer) applyCertificateLocked(cert Certificate) {
 			o.latestFinalizedSlot = cert.Slot
 		}
 	case CertificateSkip:
-		if cert.Slot > o.latestSkippedSlot {
+		if !o.hasSkippedCertificate || cert.Slot > o.latestSkippedSlot {
 			o.latestSkippedSlot = cert.Slot
 		}
+		o.hasSkippedCertificate = true
 	case CertificateGenesis:
 		if block, ok := cert.Block(); ok {
 			o.genesisBlock = newerBlock(o.genesisBlock, block)

@@ -31,6 +31,7 @@ type VotorPeer struct {
 type VotorPeerSource func() []VotorPeer
 
 type VotorBroadcasterConfig struct {
+	RecordApplicationPayload bool // constructor-selected; default off
 	// Identity authenticates outbound connections. A set-identity swap
 	// replaces the client certificate and drops every outbound connection.
 	Identity     *identity.Holder
@@ -42,6 +43,7 @@ type VotorBroadcasterConfig struct {
 }
 
 type VotorBroadcasterStats struct {
+	ApplicationPayload    *ApplicationPayloadObservation
 	MessagesQueued        uint64
 	MessagesDropped       uint64
 	PeerSends             uint64
@@ -79,42 +81,45 @@ type votorDial struct {
 }
 
 type VotorBroadcaster struct {
-	shredVersion          uint16
-	peers                 VotorPeerSource
-	certs                 *identity.Derived[tls.Certificate]
-	unregisterKey         func()
-	tlsConfig             *tls.Config
-	quicConfig            *quic.Config
-	ctx                   context.Context
-	cancel                context.CancelFunc
-	queue                 chan Message
-	jobs                  chan votorPeerJob
-	done                  chan struct{}
-	closeOnce             sync.Once
-	wg                    sync.WaitGroup
-	closed                atomic.Bool
-	connMu                sync.Mutex
-	desired               map[solana.PublicKey]VotorPeer
-	conns                 map[solana.PublicKey]votorConnection
-	dialing               map[solana.PublicKey]*votorDial
-	connectQueued         map[solana.PublicKey]struct{}
-	errorMu               sync.Mutex
-	lastSendError         string
-	lastSendErrorAt       time.Time
-	lastConnectionError   string
-	lastConnectionErrorAt time.Time
-	queued                atomic.Uint64
-	dropped               atomic.Uint64
-	sends                 atomic.Uint64
-	sendsSkipped          atomic.Uint64
-	sendErrors            atomic.Uint64
-	connectionAttempts    atomic.Uint64
-	connectionErrors      atomic.Uint64
-	connectionJobsDropped atomic.Uint64
-	peerQueueDrops        atomic.Uint64
-	peerQueueDiscarded    atomic.Uint64
-	peerSendTimeouts      atomic.Uint64
-	peerQueueMaxDelay     atomic.Int64
+	recordApplicationPayload bool
+	payloadStartedAt         time.Time
+	payloadSent              atomic.Uint64
+	shredVersion             uint16
+	peers                    VotorPeerSource
+	certs                    *identity.Derived[tls.Certificate]
+	unregisterKey            func()
+	tlsConfig                *tls.Config
+	quicConfig               *quic.Config
+	ctx                      context.Context
+	cancel                   context.CancelFunc
+	queue                    chan Message
+	jobs                     chan votorPeerJob
+	done                     chan struct{}
+	closeOnce                sync.Once
+	wg                       sync.WaitGroup
+	closed                   atomic.Bool
+	connMu                   sync.Mutex
+	desired                  map[solana.PublicKey]VotorPeer
+	conns                    map[solana.PublicKey]votorConnection
+	dialing                  map[solana.PublicKey]*votorDial
+	connectQueued            map[solana.PublicKey]struct{}
+	errorMu                  sync.Mutex
+	lastSendError            string
+	lastSendErrorAt          time.Time
+	lastConnectionError      string
+	lastConnectionErrorAt    time.Time
+	queued                   atomic.Uint64
+	dropped                  atomic.Uint64
+	sends                    atomic.Uint64
+	sendsSkipped             atomic.Uint64
+	sendErrors               atomic.Uint64
+	connectionAttempts       atomic.Uint64
+	connectionErrors         atomic.Uint64
+	connectionJobsDropped    atomic.Uint64
+	peerQueueDrops           atomic.Uint64
+	peerQueueDiscarded       atomic.Uint64
+	peerSendTimeouts         atomic.Uint64
+	peerQueueMaxDelay        atomic.Int64
 }
 
 func NewVotorBroadcaster(cfg VotorBroadcasterConfig) (*VotorBroadcaster, error) {
@@ -136,9 +141,10 @@ func NewVotorBroadcaster(cfg VotorBroadcasterConfig) (*VotorBroadcaster, error) 
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	b := &VotorBroadcaster{
-		shredVersion: cfg.ShredVersion,
-		peers:        cfg.Peers,
-		certs:        certs,
+		recordApplicationPayload: cfg.RecordApplicationPayload,
+		shredVersion:             cfg.ShredVersion,
+		peers:                    cfg.Peers,
+		certs:                    certs,
 		tlsConfig: &tls.Config{
 			NextProtos:         []string{VotorQUICALPN},
 			MinVersion:         tls.VersionTLS13,
@@ -154,6 +160,9 @@ func NewVotorBroadcaster(cfg VotorBroadcasterConfig) (*VotorBroadcaster, error) 
 		conns:         make(map[solana.PublicKey]votorConnection),
 		dialing:       make(map[solana.PublicKey]*votorDial),
 		connectQueued: make(map[solana.PublicKey]struct{}),
+	}
+	if cfg.RecordApplicationPayload {
+		b.payloadStartedAt = time.Now()
 	}
 	b.wg.Add(2 + cfg.Workers)
 	for range cfg.Workers {
@@ -533,7 +542,7 @@ func (b *VotorBroadcaster) Stats() VotorBroadcasterStats {
 	lastSendError, lastSendErrorAt := b.lastSendError, b.lastSendErrorAt
 	lastConnectionError, lastConnectionErrorAt := b.lastConnectionError, b.lastConnectionErrorAt
 	b.errorMu.Unlock()
-	return VotorBroadcasterStats{
+	stats := VotorBroadcasterStats{
 		MessagesQueued:        b.queued.Load(),
 		MessagesDropped:       b.dropped.Load(),
 		PeerSends:             b.sends.Load(),
@@ -555,6 +564,11 @@ func (b *VotorBroadcaster) Stats() VotorBroadcasterStats {
 		LastConnectionError:   lastConnectionError,
 		LastConnectionErrorAt: lastConnectionErrorAt,
 	}
+	if b.recordApplicationPayload && !b.closed.Load() {
+		observation := applicationPayloadObservation(b.payloadStartedAt, b.payloadSent.Load())
+		stats.ApplicationPayload = &observation
+	}
+	return stats
 }
 
 func (b *VotorBroadcaster) Close() error {

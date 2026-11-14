@@ -5,6 +5,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/sigverify"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/dedup"
@@ -23,6 +24,9 @@ type Config struct {
 	// state. Nil deliberately fails closed for v1 transactions.
 	TxV1Enabled func() bool
 	Sink        sink.Receiver
+	// ObserveQueues enables low-rate length/capacity samples of existing
+	// channels. It changes no queue sizes or packet behavior; default off.
+	ObserveQueues bool
 }
 
 func (c Config) normalized() Config {
@@ -80,6 +84,22 @@ type SigverifyStats struct {
 	DroppedSigverify uint64
 }
 
+// QueueGauge is one channel's sampled packet count and fixed capacity. It
+// excludes packets already being processed by a worker or the sink.
+type QueueGauge struct {
+	Length   int
+	Capacity int
+}
+
+// QueueObservation contains independent point samples from one Pipeline
+// lifetime, not an atomic pipeline-wide backlog or time spent saturated.
+type QueueObservation struct {
+	StartedAt, SampledAt time.Time
+	Ingress              QueueGauge
+	DedupOutput          QueueGauge
+	Verified             QueueGauge
+}
+
 // Pipeline funnels QUIC ingress through dedup/sanitize, sigverify workers, and a sink.
 type Pipeline struct {
 	ingress  chan packet.Packet
@@ -91,6 +111,11 @@ type Pipeline struct {
 	// closeMu orders Submit against Stop closing ingress.
 	closeMu sync.RWMutex
 	closed  bool
+
+	// Optional references to the original stage channels, fixed before start.
+	dedupOut       <-chan packet.Packet
+	verified       <-chan packet.Packet
+	queueStartedAt time.Time
 }
 
 // Start launches the pipeline stages and returns the ingress send channel for QUIC.
@@ -105,6 +130,10 @@ func Start(parent context.Context, cfg Config) (*Pipeline, chan<- packet.Packet)
 
 	dedupOut := make(chan packet.Packet, cfg.DedupOutCap)
 	verified := make(chan packet.Packet, cfg.VerifiedCap)
+	if cfg.ObserveQueues {
+		p.dedupOut, p.verified = dedupOut, verified
+		p.queueStartedAt = time.Now()
+	}
 
 	dedupStage := dedup.NewStage(p.ingress, dedupOut, dedup.NewCache(cfg.DedupCacheCapacity), cfg.TxV1Enabled)
 	p.wg.Add(1)
@@ -123,6 +152,27 @@ func Start(parent context.Context, cfg Config) (*Pipeline, chan<- packet.Packet)
 	}()
 
 	return p, p.ingress
+}
+
+// ObserveQueues copies the current channel lengths/capacities without consuming
+// packets or observing worker-local batches. It is for a low-rate owner, which
+// must bind the result to this pipeline instance. Nil, disabled and stopping
+// pipelines return false rather than measured zero.
+func (p *Pipeline) ObserveQueues() (QueueObservation, bool) {
+	if p == nil || !p.cfg.ObserveQueues {
+		return QueueObservation{}, false
+	}
+	p.closeMu.RLock()
+	defer p.closeMu.RUnlock()
+	if p.closed || p.ingress == nil || p.dedupOut == nil || p.verified == nil || p.queueStartedAt.IsZero() {
+		return QueueObservation{}, false
+	}
+	v := QueueObservation{StartedAt: p.queueStartedAt,
+		Ingress:     QueueGauge{Length: len(p.ingress), Capacity: cap(p.ingress)},
+		DedupOutput: QueueGauge{Length: len(p.dedupOut), Capacity: cap(p.dedupOut)},
+		Verified:    QueueGauge{Length: len(p.verified), Capacity: cap(p.verified)}}
+	v.SampledAt = time.Now()
+	return v, true
 }
 
 func (p *Pipeline) Stats() Stats {

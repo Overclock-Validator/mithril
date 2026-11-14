@@ -67,7 +67,8 @@ type MithrilState struct {
 
 	// =========================================================================
 	// Manifest Seed Data (copied from manifest at snapshot build time)
-	// Used ONLY for fresh-start replay. Resume uses Last* fields instead.
+	// Execution resumes from Last* fields; observational timing also retains
+	// the manifest's immutable bank/configuration baseline across resumes.
 	// =========================================================================
 
 	// Block configuration seed
@@ -75,6 +76,9 @@ type MithrilState struct {
 	ManifestParentBankhash string `json:"manifest_parent_bankhash,omitempty"` // base58
 	ManifestBlockHeight    uint64 `json:"manifest_block_height,omitempty"`
 	ManifestAcctsLtHash    string `json:"manifest_accts_lt_hash,omitempty"` // base64
+	// ManifestNsPerSlot is the snapshot bank's target, not a measured interval.
+	// Zero means absent or not representable as a positive uint64.
+	ManifestNsPerSlot uint64 `json:"manifest_ns_per_slot,omitempty"`
 
 	// Fee rate governor seed (static fields only)
 	ManifestFeeRateGovernor *ManifestFeeRateGovernorSeed `json:"manifest_fee_rate_governor,omitempty"`

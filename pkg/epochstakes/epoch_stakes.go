@@ -14,10 +14,58 @@ type EpochStakesCache struct {
 	stakeCache      map[uint64]map[solana.PublicKey]uint64
 	voteAcctCache   map[uint64]map[solana.PublicKey]*VoteAccount
 	totalStakeCache map[uint64]uint64
+	selectionCache  map[uint64]Selection
 	generations     map[uint64]uint64
 }
 
 var nextEpochStakesGeneration uint64
+
+// Selection identifies how one epoch-stakes generation was selected. Unknown
+// is fail-closed monitoring provenance, not evidence that the set was unfiltered.
+type Selection uint8
+
+const (
+	SelectionUnknown Selection = iota
+	SelectionUnfiltered
+	SelectionVATFiltered
+)
+
+func (s Selection) MarshalJSON() ([]byte, error) {
+	switch s {
+	case SelectionUnfiltered:
+		return json.Marshal("unfiltered")
+	case SelectionVATFiltered:
+		return json.Marshal("vat_filtered")
+	default:
+		return json.Marshal("unknown")
+	}
+}
+
+// UnmarshalJSON deliberately treats malformed or future values as unknown.
+// Selection is diagnostic provenance; it must not make old stake state fail.
+func (s *Selection) UnmarshalJSON(data []byte) error {
+	var value string
+	if json.Unmarshal(data, &value) != nil {
+		*s = SelectionUnknown
+		return nil
+	}
+	switch value {
+	case "unfiltered":
+		*s = SelectionUnfiltered
+	case "vat_filtered":
+		*s = SelectionVATFiltered
+	default:
+		*s = SelectionUnknown
+	}
+	return nil
+}
+
+func normalizedSelection(s Selection) Selection {
+	if s != SelectionUnfiltered && s != SelectionVATFiltered {
+		return SelectionUnknown
+	}
+	return s
+}
 
 type VoteAccount struct {
 	Lamports            uint64
@@ -41,6 +89,7 @@ type VoteAccount struct {
 type Snapshot struct {
 	Epoch        uint64
 	Generation   uint64
+	Selection    Selection
 	Stakes       map[solana.PublicKey]uint64
 	VoteAccounts map[solana.PublicKey]*VoteAccount
 	TotalStake   uint64
@@ -51,6 +100,7 @@ func NewEpochStakesCache() *EpochStakesCache {
 		stakeCache:      make(map[uint64]map[solana.PublicKey]uint64),
 		voteAcctCache:   make(map[uint64]map[solana.PublicKey]*VoteAccount),
 		totalStakeCache: make(map[uint64]uint64),
+		selectionCache:  make(map[uint64]Selection),
 		generations:     make(map[uint64]uint64),
 	}
 }
@@ -63,7 +113,19 @@ func (cache *EpochStakesCache) PutEpoch(
 	voteAccounts map[solana.PublicKey]*VoteAccount,
 	totalStake uint64,
 ) uint64 {
-	return cache.putEpochOwned(epoch, cloneStakes(stakes), cloneVoteAccounts(voteAccounts), totalStake)
+	return cache.PutEpochWithSelection(epoch, stakes, voteAccounts, totalStake, SelectionUnknown)
+}
+
+// PutEpochWithSelection atomically replaces one epoch and its selection
+// provenance. Invalid provenance degrades to unknown without changing stakes.
+func (cache *EpochStakesCache) PutEpochWithSelection(
+	epoch uint64,
+	stakes map[solana.PublicKey]uint64,
+	voteAccounts map[solana.PublicKey]*VoteAccount,
+	totalStake uint64,
+	selection Selection,
+) uint64 {
+	return cache.putEpochOwned(epoch, cloneStakes(stakes), cloneVoteAccounts(voteAccounts), totalStake, selection)
 }
 
 // Snapshot returns an internally coherent, allocation-free view of epoch. Its
@@ -81,6 +143,7 @@ func (cache *EpochStakesCache) Snapshot(epoch uint64) (Snapshot, bool) {
 	return Snapshot{
 		Epoch:        epoch,
 		Generation:   cache.generations[epoch],
+		Selection:    cache.selectionCache[epoch],
 		Stakes:       stakes,
 		VoteAccounts: cache.voteAcctCache[epoch],
 		TotalStake:   cache.totalStakeCache[epoch],
@@ -106,6 +169,7 @@ func (cache *EpochStakesCache) PutEntry(epoch uint64, pubkey solana.PublicKey, s
 	voteAccounts[pubkey] = cloneVoteAccount(voteAcct)
 	cache.stakeCache[epoch] = stakes
 	cache.voteAcctCache[epoch] = voteAccounts
+	cache.selectionCache[epoch] = SelectionUnknown
 	cache.bumpGenerationLocked(epoch)
 }
 
@@ -114,6 +178,7 @@ func (cache *EpochStakesCache) PutTotalEpochStake(epoch uint64, totalStake uint6
 	defer cache.mu.Unlock()
 	cache.ensureMapsLocked()
 	cache.totalStakeCache[epoch] = totalStake
+	cache.selectionCache[epoch] = SelectionUnknown
 	cache.bumpGenerationLocked(epoch)
 }
 
@@ -169,12 +234,14 @@ func (cache *EpochStakesCache) ClearEpochStakes(epoch uint64) {
 	delete(cache.stakeCache, epoch)
 	delete(cache.voteAcctCache, epoch)
 	delete(cache.totalStakeCache, epoch)
+	delete(cache.selectionCache, epoch)
 	cache.bumpGenerationLocked(epoch)
 }
 
 // PersistedEpochStakes is the JSON-serializable format for epoch stakes.
 type PersistedEpochStakes struct {
 	Epoch      uint64                      `json:"epoch"`
+	Selection  Selection                   `json:"selection,omitempty"`
 	TotalStake uint64                      `json:"total_stake"`
 	Stakes     map[string]uint64           `json:"stakes"`     // base58 pubkey → stake
 	VoteAccts  map[string]*VoteAccountJSON `json:"vote_accts"` // base58 pubkey → metadata
@@ -203,6 +270,7 @@ func (cache *EpochStakesCache) SerializeEpoch(epoch uint64) ([]byte, error) {
 
 	persisted := PersistedEpochStakes{
 		Epoch:      epoch,
+		Selection:  snapshot.Selection,
 		TotalStake: snapshot.TotalStake,
 		Stakes:     make(map[string]uint64, len(snapshot.Stakes)),
 		VoteAccts:  make(map[string]*VoteAccountJSON, len(snapshot.VoteAccounts)),
@@ -310,7 +378,7 @@ func (cache *EpochStakesCache) DeserializeAndLoadEpoch(data []byte) (uint64, err
 		}
 	}
 
-	cache.putEpochOwned(epoch, stakes, voteAccounts, persisted.TotalStake)
+	cache.putEpochOwned(epoch, stakes, voteAccounts, persisted.TotalStake, persisted.Selection)
 	return epoch, nil
 }
 
@@ -332,6 +400,7 @@ func (cache *EpochStakesCache) putEpochOwned(
 	stakes map[solana.PublicKey]uint64,
 	voteAccounts map[solana.PublicKey]*VoteAccount,
 	totalStake uint64,
+	selection Selection,
 ) uint64 {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
@@ -339,6 +408,7 @@ func (cache *EpochStakesCache) putEpochOwned(
 	cache.stakeCache[epoch] = stakes
 	cache.voteAcctCache[epoch] = voteAccounts
 	cache.totalStakeCache[epoch] = totalStake
+	cache.selectionCache[epoch] = normalizedSelection(selection)
 	return cache.bumpGenerationLocked(epoch)
 }
 
@@ -351,6 +421,9 @@ func (cache *EpochStakesCache) ensureMapsLocked() {
 	}
 	if cache.totalStakeCache == nil {
 		cache.totalStakeCache = make(map[uint64]uint64)
+	}
+	if cache.selectionCache == nil {
+		cache.selectionCache = make(map[uint64]Selection)
 	}
 	if cache.generations == nil {
 		cache.generations = make(map[uint64]uint64)

@@ -136,6 +136,9 @@ func (s *votorPeerSender) run() {
 				return
 			}
 			s.b.sends.Add(1)
+			if s.b.recordApplicationPayload {
+				addApplicationBytes(&s.b.payloadSent, len(job.payload))
+			}
 		}
 	}
 }

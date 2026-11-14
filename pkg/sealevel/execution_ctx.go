@@ -102,6 +102,7 @@ type SlotCtx struct {
 	Replay                    bool
 	LamportsBurnt             uint64
 	TotalComputeUnitsConsumed uint64
+	TransactionCounts         BankTransactionCounts
 	EahWorkaroundBankhash     []byte
 	HasEahWorkaround          bool
 	LatestEvictedBlockhash    [32]byte

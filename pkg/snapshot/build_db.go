@@ -322,6 +322,7 @@ func BuildAccountsDbPaths(
 		return nil, nil, fmt.Errorf("reading snapshot manifest: %v", err)
 	}
 	mlog.Log.Infof("Parsed full snapshot manifest")
+	dp.ManifestParsed(false, manifest.Bank.Slot)
 	if OnFullSnapshotManifestParsed != nil {
 		OnFullSnapshotManifestParsed(manifest)
 	}
@@ -334,6 +335,7 @@ func BuildAccountsDbPaths(
 			return nil, nil, fmt.Errorf("reading incremental snapshot manifest: %v", err)
 		}
 		mlog.Log.FileOnlyf("Parsed incremental snapshot manifest")
+		dp.ManifestParsed(true, incrementalManifest.Bank.Slot)
 		if OnIncrementalManifestParsed != nil {
 			OnIncrementalManifestParsed(incrementalManifest)
 		}
@@ -409,12 +411,27 @@ func BuildAccountsDbPaths(
 
 	// Process incremental snapshot (if provided)
 	if incrementalSnapshotFile != "" {
+		kind := "local"
+		if strings.HasPrefix(incrementalSnapshotFile, "http://") || strings.HasPrefix(incrementalSnapshotFile, "https://") {
+			kind = "remote"
+		}
+		incrementalProgress := dp.NewIncrementalProgress(incrementalManifest.Bank.Slot, kind)
+		if incrementalProgress != nil {
+			incrementalProgress.Start()
+		}
 		err = readTar(ctx, wg, incrementalSnapshotFile, pools,
-			readTarOptions{isIncremental: true, statusCachePath: retainedStatusCachePath(accountsDbDir)})
+			readTarOptions{isIncremental: true, progress: incrementalProgress, statusCachePath: retainedStatusCachePath(accountsDbDir)})
 		// Wait for all incremental worker tasks to complete
 		workerErr = waitForSnapshotWorkers(wg, pools)
 		if err == nil {
 			err = workerErr
+		}
+		if incrementalProgress != nil {
+			if err != nil {
+				incrementalProgress.Interrupt(err)
+			} else {
+				incrementalProgress.Stop()
+			}
 		}
 		if err != nil {
 			return nil, nil, err
@@ -433,11 +450,8 @@ func BuildAccountsDbPaths(
 	// Show indexing progress for shard flush (no gap between DualProgress and this)
 	indexProgress := progress.NewIndexingProgress("Flush (shard logs)")
 	indexProgress.Start(numShards)
-	err = sl.CloseWithProgress(ctx, func(completed, total int) {
-		indexProgress.Update(completed, total)
-	})
-	if err != nil {
-		return nil, nil, fmt.Errorf("closing shard logger: %w", err)
+	if err := closeSnapshotShardLogger(ctx, sl, indexProgress); err != nil {
+		return nil, nil, err
 	}
 	indexDir := filepath.Join(accountsDbDir, "mithril_db")
 	index, err := ingestSSTFiles(indexDir, logsDir)
@@ -558,21 +572,11 @@ func readTar(
 	savePath := options.savePath
 	statusCache := newStatusCacheCandidate(options.statusCachePath)
 	defer statusCache.cleanup()
-	tarReader, bmr, closer, err := newSnapshotReaderWithProgress(ctx, filename, options.savePath)
+	tarReader, _, closer, err := newSnapshotReaderWithProgress(ctx, filename, options.savePath, dp)
 	if err != nil {
 		return err
 	}
 	defer closer.Close()
-
-	// Set up download progress callback
-	if dp != nil {
-		// Use SetDownloadTotal which enables dynamic Extract total estimation
-		// based on observed compression ratio (recalculated in updateLoop)
-		dp.SetDownloadTotal(bmr.TotalSize())
-		bmr.SetProgressCallback(func(bytesRead, totalBytes int64) {
-			dp.Download.Add(bytesRead - dp.Download.Current())
-		})
-	}
 
 	// cleanupPartial removes the .partial download file on error/cancellation
 	cleanupPartial := func(reason string) {
@@ -963,6 +967,15 @@ func (p *snapshotWorkerPools) Release() {
 		p.indexEntryCommitter = nil
 	}
 	p.tarBufs = nil
+}
+
+// closeSnapshotShardLogger propagates the flush result before ingestion.
+func closeSnapshotShardLogger(ctx context.Context, sl *ShardLogger, p *progress.IndexingProgress) error {
+	err := sl.CloseWithProgress(ctx, p.Update)
+	if err != nil {
+		return fmt.Errorf("closing shard logger: %w", err)
+	}
+	return nil
 }
 
 // Ingest SSTs into a fresh pebble DB and return it.

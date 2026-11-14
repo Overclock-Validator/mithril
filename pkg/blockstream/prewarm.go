@@ -178,21 +178,21 @@ func StartTurbinePrewarm(cfg TurbinePrewarmConfig) (*TurbinePrewarm, error) {
 		receiverDone <- receiver.Run(ctx)
 	}()
 
+	var readyErr error
 	select {
 	case err := <-receiverDone:
-		cancel()
-		close(pw.done)
-		return nil, fmt.Errorf("prewarm receiver failed to start: %v", err)
+		readyErr = fmt.Errorf("prewarm receiver failed to start: %v", err)
 	case rerr := <-receiver.Ready():
 		if rerr != nil {
-			cancel()
-			close(pw.done)
-			return nil, fmt.Errorf("prewarm receiver not ready: %v", rerr)
+			readyErr = fmt.Errorf("prewarm receiver not ready: %v", rerr)
 		}
 	case <-time.After(15 * time.Second):
+		readyErr = fmt.Errorf("prewarm receiver not ready within 15s")
+	}
+	if readyErr != nil {
 		cancel()
 		close(pw.done)
-		return nil, fmt.Errorf("prewarm receiver not ready within 15s")
+		return nil, readyErr
 	}
 
 	go pw.drain(receiver)
@@ -269,14 +269,15 @@ func (pw *TurbinePrewarm) Handover() ([]*b.Block, int) {
 	pw.logProbeOutcome() // before Stop: receiver stats die with the receiver
 	pw.Stop()
 	pw.mu.Lock()
-	defer pw.mu.Unlock()
 	blocks := make([]*b.Block, 0, len(pw.spool))
 	for _, blk := range pw.spool {
 		blocks = append(blocks, blk)
 	}
 	sort.Slice(blocks, func(i, j int) bool { return blocks[i].Slot < blocks[j].Slot })
 	pw.spool = nil
-	return blocks, pw.dropped
+	dropped := pw.dropped
+	pw.mu.Unlock()
+	return blocks, dropped
 }
 
 // logProbeOutcome reports the boot-time frontier probe: how many of the
@@ -324,16 +325,15 @@ func (pw *TurbinePrewarm) logProbeOutcome() {
 }
 
 // Stop tears the prewarm receiver and gossip session down and waits for the
-// drainer to exit. Idempotent.
+// drainer to exit. It is idempotent.
 func (pw *TurbinePrewarm) Stop() {
 	pw.mu.Lock()
 	if pw.stopped {
 		pw.mu.Unlock()
-		<-pw.done
-		return
+	} else {
+		pw.stopped = true
+		pw.mu.Unlock()
+		pw.cancel()
 	}
-	pw.stopped = true
-	pw.mu.Unlock()
-	pw.cancel()
 	<-pw.done
 }

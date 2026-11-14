@@ -1464,7 +1464,7 @@ func (snapshot *SnapshotManifest) UnmarshalWithDecoder(decoder *bin.Decoder) err
 		snapshot.BankIncrementalSnapshotPersistence = new(BankIncrementalSnapshotPersistence)
 		err = snapshot.BankIncrementalSnapshotPersistence.UnmarshalWithDecoder(decoder)
 		if err != nil {
-			return nil
+			return err
 		}
 	}
 

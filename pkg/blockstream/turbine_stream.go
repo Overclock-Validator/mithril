@@ -300,9 +300,16 @@ func (bs *BlockSource) rejectInvalidTurbineBlockState(slot uint64, blockID solan
 
 func (bs *BlockSource) runTurbineStream() {
 	defer bs.liveStreamWg.Done()
+	defer bs.turbineObservation.Store(nil)
+	defer bs.receptionObservation.Store(nil)
+	defer bs.monitoredGossip.Store(nil)
 
 	backoff := liveRetryBackoff
+	var session uint64
 	for {
+		bs.turbineObservation.Store(nil)
+		bs.receptionObservation.Store(nil)
+		bs.monitoredGossip.Store(nil)
 		if bs.stopped.Load() {
 			return
 		}
@@ -343,8 +350,13 @@ func (bs *BlockSource) runTurbineStream() {
 			gossipClient = client
 			ownsGossipClient = true
 		}
+		bs.setMonitoredGossip(gossipClient)
 
+		receiverStartedAt := time.Now()
 		receiver := turbine.NewUDPReceiver(bs.turbineBindAddr)
+		if bs.monitoringEnabled {
+			receiver.EnableReceptionMonitoring()
+		}
 		receiver.SetLeaderForSlot(bs.leaderForSlot)
 		receiver.SetShredVersion(bs.turbineShredVersion)
 		receiver.SetFirstShredSink(bs.alpenglowFirstShredSink)
@@ -431,6 +443,7 @@ func (bs *BlockSource) runTurbineStream() {
 		}
 
 		mlog.Log.Infof("Native turbine receiver listening on %s", bs.turbineBindAddr)
+		session++
 		bs.liveStreamConnected.Store(true)
 		bs.liveLastRecvUnix.Store(time.Now().Unix())
 		backoff = liveRetryBackoff
@@ -472,6 +485,18 @@ func (bs *BlockSource) runTurbineStream() {
 		var ignoredPacketCount uint64
 		var ignoredPacketLastLog time.Time
 		statsTicker := time.NewTicker(10 * time.Second)
+		var receptionTicker *time.Ticker
+		var receptionTicks <-chan time.Time
+		if bs.monitoringEnabled {
+			receptionTicker = time.NewTicker(time.Second)
+			receptionTicks = receptionTicker.C
+		}
+		stopTickers := func() {
+			statsTicker.Stop()
+			if receptionTicker != nil {
+				receptionTicker.Stop()
+			}
+		}
 	streamLoop:
 		for {
 			select {
@@ -484,7 +509,7 @@ func (bs *BlockSource) runTurbineStream() {
 				keepRunning := bs.ingestLiveShredBlock(blk)
 				receiver.AcknowledgeBlockDelivery(blk.Slot)
 				if !keepRunning {
-					statsTicker.Stop()
+					stopTickers()
 					cancelStream()
 					<-streamDone
 					return
@@ -501,8 +526,17 @@ func (bs *BlockSource) runTurbineStream() {
 						mlog.Log.Debugf("native turbine packet ignored: %v", err)
 					}
 				}
+			case <-receptionTicks:
+				if progress, ok := receiver.ReceptionSnapshot(); ok {
+					bs.publishReceptionObservation(receiverStartedAt, session, progress)
+				} else {
+					bs.receptionObservation.Store(nil)
+				}
 			case <-statsTicker.C:
 				stats := receiver.Stats()
+				if bs.monitoringEnabled {
+					bs.publishTurbineObservation(time.Now(), receiverStartedAt, session, gossipClient != nil, stats, receiver.ShredFrontiers())
+				}
 				lastPacketAge := "never"
 				if stats.LastPacketUnix != 0 {
 					lastPacketAge = time.Since(time.Unix(stats.LastPacketUnix, 0)).Round(time.Second).String()
@@ -541,14 +575,17 @@ func (bs *BlockSource) runTurbineStream() {
 				}
 				break streamLoop
 			case <-bs.stopChan:
-				statsTicker.Stop()
+				stopTickers()
 				cancelStream()
 				<-streamDone
 				return
 			}
 		}
 
-		statsTicker.Stop()
+		stopTickers()
+		bs.turbineObservation.Store(nil)
+		bs.receptionObservation.Store(nil)
+		bs.monitoredGossip.Store(nil)
 		cancelStream()
 		if !streamDoneConsumed {
 			if err := <-streamDone; streamErr == nil {

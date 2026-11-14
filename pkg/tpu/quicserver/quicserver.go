@@ -112,6 +112,9 @@ func Spawn(
 
 	updater := &endpointKeyUpdater{certs: certs}
 	unregister := holder.RegisterUpdater("TPU QUIC "+name, updater.UpdateKey)
+	if cfg.ObserveStreamReadPayload {
+		stats.streamPayload = &streamPayloadRecorder{startedAt: time.Now()}
+	}
 
 	done := make(chan struct{})
 	srv := &runtimeServer{
@@ -181,6 +184,9 @@ func (s *runtimeServer) run(ctx context.Context) {
 	}
 	acceptWG.Wait()
 	connectionWG.Wait()
+	if s.stats.streamPayload != nil {
+		s.stats.streamPayload.closed.Store(true)
+	}
 }
 
 func (s *runtimeServer) acceptLoop(ctx context.Context, listener *quic.Listener, connectionWG *sync.WaitGroup) {
@@ -254,6 +260,9 @@ func (s *runtimeServer) handleConnection(ctx context.Context, conn *quic.Conn, r
 		}
 
 		n, readErr := readUniStream(stream, buf, s.cfg.WaitForChunkTimeout, s.cfg.MaxStreamDataBytes)
+		if s.stats.streamPayload != nil {
+			s.stats.streamPayload.add(n)
+		}
 		if readErr != nil {
 			switch {
 			case errors.Is(readErr, errStreamTooLarge):
