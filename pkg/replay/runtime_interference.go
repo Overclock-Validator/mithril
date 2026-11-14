@@ -32,6 +32,10 @@ type runtimeReading struct {
 	gcPauseCPU, assist   float64
 	pauses, schedLatency histogramCounts
 	kernelDrops          uint64
+	process              processCounters
+	haveProcess          bool
+	pressure             pressureTotals
+	havePressure         bool
 }
 
 // histogramCounts copies a runtime histogram's cumulative bucket counts.
@@ -74,6 +78,8 @@ func (s *runtimeInterferenceSampler) read() runtimeReading {
 		}
 	}
 	r.kernelDrops = turbine.KernelShredDrops()
+	r.process, r.haveProcess = readProcessCounters()
+	r.pressure, r.havePressure = readPressureTotals()
 	return r
 }
 
@@ -107,6 +113,23 @@ func (s *runtimeInterferenceSampler) record(rec *mmetrics.RuntimeInterference) {
 		rec.SchedLatencyOver1ms = over
 	}
 	rec.KernelShredDrops = cur.kernelDrops - prev.kernelDrops
+	if cur.haveProcess && prev.haveProcess {
+		rec.InvoluntaryContextSwitches = cur.process.involuntarySwitches - prev.process.involuntarySwitches
+		rec.VoluntaryContextSwitches = cur.process.voluntarySwitches - prev.process.voluntarySwitches
+		rec.MajorPageFaults = cur.process.majorFaults - prev.process.majorFaults
+		rec.MinorPageFaults = cur.process.minorFaults - prev.process.minorFaults
+	}
+	if cur.havePressure && prev.havePressure {
+		addMicros(&rec.PressureCPU, cur.pressure.cpu, prev.pressure.cpu)
+		addMicros(&rec.PressureIO, cur.pressure.io, prev.pressure.io)
+		addMicros(&rec.PressureMemory, cur.pressure.memory, prev.pressure.memory)
+	}
+}
+
+func addMicros(t *mmetrics.Timing, cur, prev uint64) {
+	if cur > prev {
+		t.AddTiming(time.Duration(cur-prev) * time.Microsecond)
+	}
 }
 
 func addSeconds(t *mmetrics.Timing, seconds float64) {

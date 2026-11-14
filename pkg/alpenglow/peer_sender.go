@@ -3,8 +3,10 @@ package alpenglow
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/gagliardetto/solana-go"
 	"github.com/quic-go/quic-go"
 )
@@ -30,6 +32,47 @@ type VotorPeerQueueStats struct {
 type votorDatagram struct {
 	payload  []byte // immutable, shared across the peer queues
 	queuedAt time.Time
+	vote     *voteSendTracker // nil for certificates
+}
+
+// voteSendTracker follows one vote's copies across the peer queues: it records
+// when the first copy was handed to QUIC and when every copy was handled.
+// Every copy must reach done exactly once, sent or not.
+type voteSendTracker struct {
+	slot      uint64
+	voteType  string
+	remaining atomic.Int32
+	sent      atomic.Int32
+	first     atomic.Bool
+}
+
+func newVoteSendTracker(message Message, copies int) *voteSendTracker {
+	if message.Vote == nil {
+		return nil
+	}
+	t := &voteSendTracker{slot: message.Vote.Vote.Slot, voteType: string(message.Vote.Vote.Type)}
+	if copies == 0 {
+		metrics.RecordVoteEvent(t.slot, t.voteType, metrics.VoteFanoutDone, 0, time.Now())
+		return nil
+	}
+	t.remaining.Store(int32(copies))
+	return t
+}
+
+func (t *voteSendTracker) done(sent bool) {
+	if t == nil {
+		return
+	}
+	now := time.Now()
+	if sent {
+		t.sent.Add(1)
+		if t.first.CompareAndSwap(false, true) {
+			metrics.RecordVoteEvent(t.slot, t.voteType, metrics.VoteFirstSend, 0, now)
+		}
+	}
+	if t.remaining.Add(-1) == 0 {
+		metrics.RecordVoteEvent(t.slot, t.voteType, metrics.VoteFanoutDone, int(t.sent.Load()), now)
+	}
 }
 
 // Each authenticated connection owns one sender. No mutex is held while
@@ -54,6 +97,7 @@ func (s *votorPeerSender) enqueue(job votorDatagram) {
 	defer s.mu.Unlock()
 	if s.closed || s.conn.Context().Err() != nil {
 		s.b.sendsSkipped.Add(1)
+		job.vote.done(false)
 		return
 	}
 	select {
@@ -64,6 +108,7 @@ func (s *votorPeerSender) enqueue(job votorDatagram) {
 		s.queueDrops++
 		s.b.peerQueueDrops.Add(1)
 		s.b.dropped.Add(1)
+		job.vote.done(false)
 	}
 }
 
@@ -81,8 +126,9 @@ func (s *votorPeerSender) run() {
 		// Account for every queued copy discarded on failure or shutdown.
 		for {
 			select {
-			case <-s.queue:
+			case job := <-s.queue:
 				s.b.peerQueueDiscarded.Add(1)
+				job.vote.done(false)
 			default:
 				s.mu.Unlock()
 				return
@@ -100,6 +146,7 @@ func (s *votorPeerSender) run() {
 			if s.closed || s.conn.Context().Err() != nil || s.b.closed.Load() {
 				s.mu.Unlock()
 				s.b.peerQueueDiscarded.Add(1)
+				job.vote.done(false)
 				return
 			}
 			now := time.Now()
@@ -117,6 +164,7 @@ func (s *votorPeerSender) run() {
 				s.closed = true
 				s.mu.Unlock()
 				s.b.peerQueueDiscarded.Add(1)
+				job.vote.done(false)
 				s.timeout()
 				return
 			}
@@ -125,6 +173,7 @@ func (s *votorPeerSender) run() {
 			s.mu.Lock()
 			s.sendingSince = time.Time{}
 			s.mu.Unlock()
+			job.vote.done(err == nil)
 			if err != nil {
 				s.b.recordSendError(s.peer, err)
 				var tooLarge *quic.DatagramTooLargeError

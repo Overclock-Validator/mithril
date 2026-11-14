@@ -59,27 +59,97 @@ type row struct {
 	TxLoop               timing
 	FullToReplayed       timing
 	TipPath              struct {
-		ShredReceivedNanos int64
-		ReceiveToFull      timing
-		FullToReady        timing
-		WaitParentArrival  timing
-		WaitParentReplay   timing
-		LoopUntilAdmitted  timing
-		WaitUnclassified   timing
-		AdmittedToReplay   timing
-		ReplayToHandoff    timing
-		Unattributed       timing
+		ShredReceivedNanos  int64
+		ReceiveToFull       timing
+		FullToReady         timing
+		WaitParentArrival   timing
+		WaitParentReplay    timing
+		LoopUntilAdmitted   timing
+		WaitUnclassified    timing
+		AdmittedToReplay    timing
+		ReplayToHandoff     timing
+		Unattributed        timing
+		HandedOffNanos      int64
+		LastShredToReplayed timing
+		DataShreds          int
+		RepairedShreds      int
+		RecoveredShreds     int
+		TipLagSlots         uint64
+		ForkSwitch          bool
 	}
 	RuntimeInterference struct {
-		GCCycles            uint64
-		GCPauseCPU          timing
-		GCAssistCPU         timing
-		GCPauseMax          timing
-		SchedLatencyMax     timing
-		SchedLatencyOver1ms uint64
-		KernelShredDrops    uint64
+		GCCycles                   uint64
+		GCPauseCPU                 timing
+		GCAssistCPU                timing
+		GCPauseMax                 timing
+		SchedLatencyMax            timing
+		SchedLatencyOver1ms        uint64
+		KernelShredDrops           uint64
+		InvoluntaryContextSwitches uint64
+		MajorPageFaults            uint64
+		PressureCPU                timing
+		PressureIO                 timing
+		PressureMemory             timing
+	}
+	VoteEvents []voteEvent
+
+	// vote is this node's notarize vote for this slot, joined from any
+	// row's VoteEvents; zero instants when it did not vote.
+	vote notarizeVote
+}
+
+type voteEvent struct {
+	Slot    uint64
+	Type    string
+	Stage   string
+	Peers   int
+	AtNanos int64
+}
+
+// notarizeVote is the stages one slot's notarize vote reached.
+type notarizeVote struct {
+	queued, firstSend, fanoutDone int64
+	peers                         int
+}
+
+func (v *notarizeVote) note(e voteEvent) {
+	earliest := func(dst *int64) {
+		if *dst == 0 || e.AtNanos < *dst {
+			*dst = e.AtNanos
+		}
+	}
+	switch e.Stage {
+	case "queued":
+		earliest(&v.queued)
+	case "first_send":
+		earliest(&v.firstSend)
+	case "fanout_done":
+		earliest(&v.fanoutDone)
+		v.peers = e.Peers
 	}
 }
+
+// lastShredNanos is the block's last shred: its kernel receive time when
+// known, otherwise full assembly, as LastShredToReplayed measures from.
+func lastShredNanos(r *row) int64 {
+	if r.TipPath.HandedOffNanos == 0 || r.TipPath.LastShredToReplayed.Count == 0 {
+		return 0
+	}
+	return r.TipPath.HandedOffNanos - int64(r.TipPath.LastShredToReplayed.SumNanoseconds)
+}
+
+// betweenMs is end minus start in milliseconds, or -1 when either is unknown
+// or they are out of order.
+func betweenMs(start, end int64) float64 {
+	if start == 0 || end == 0 || end < start {
+		return -1
+	}
+	return float64(end-start) / 1e6
+}
+
+// handoffToVoteMs is the time from the replay result reaching consensus to
+// the notarize vote being queued for broadcast, or -1 without a vote.
+func handoffToVoteMs(r *row) float64 { return betweenMs(r.TipPath.HandedOffNanos, r.vote.queued) }
 
 // component is one interval of the tip path, in order.
 type component struct {
@@ -123,6 +193,7 @@ func readRows(path string) ([]row, int, error) {
 	sc.Buffer(make([]byte, 1<<20), 64<<20)
 	var withPath []row
 	last := map[uint64]int{} // a slot replayed again after a fork switch counts once, by its last row
+	notarized := map[uint64]*notarizeVote{}
 	total := 0
 	for sc.Scan() {
 		if len(sc.Bytes()) == 0 {
@@ -133,6 +204,17 @@ func readRows(path string) ([]row, int, error) {
 			return nil, 0, fmt.Errorf("%s: %w", path, err)
 		}
 		total++
+		for _, e := range r.VoteEvents {
+			if e.Type != "notarize" {
+				continue
+			}
+			v := notarized[e.Slot]
+			if v == nil {
+				v = &notarizeVote{}
+				notarized[e.Slot] = v
+			}
+			v.note(e)
+		}
 		if r.FullToReplayed.Count == 0 {
 			continue
 		}
@@ -142,6 +224,11 @@ func readRows(path string) ([]row, int, error) {
 		}
 		last[r.Slot] = len(withPath)
 		withPath = append(withPath, r)
+	}
+	for i := range withPath {
+		if v := notarized[withPath[i].Slot]; v != nil {
+			withPath[i].vote = *v
+		}
 	}
 	return withPath, total, sc.Err()
 }
@@ -228,6 +315,76 @@ func writeTipReport(w io.Writer, rows []row, total, top int) {
 	line("controlled", "mithril", math.NaN(), controlledMs)
 	line("ReplayWork", "mithril", math.NaN(), func(r *row) float64 { return r.ReplayWork.ms() })
 
+	// From the last shred to replay done, and in validator mode on to the
+	// notarize vote leaving: each over the blocks where both ends are known.
+	partial := func(name, owner string, get func(*row) float64) {
+		var vals []float64
+		for i := range rows {
+			if ms := get(&rows[i]); ms >= 0 {
+				vals = append(vals, ms)
+			}
+		}
+		if len(vals) == 0 {
+			return
+		}
+		var sum float64
+		for _, v := range vals {
+			sum += v
+		}
+		p50, p90, p99, mx := quantiles(vals)
+		fmt.Fprintf(w, "  %-20s %-8s %7s %8.2f %8.2f %8.2f %8.2f %8.2f  (%d blocks)\n", name, owner, "-", sum/float64(len(vals)), p50, p90, p99, mx, len(vals))
+	}
+	fmt.Fprintf(w, "  last shred to replay done and to the vote (last shred: kernel receive time when known, else full assembly)\n")
+	partial("LastShredToReplayed", "mithril", func(r *row) float64 {
+		if r.TipPath.LastShredToReplayed.Count == 0 {
+			return -1
+		}
+		return r.TipPath.LastShredToReplayed.ms()
+	})
+	partial("HandoffToVote", "mithril", handoffToVoteMs)
+	partial("VoteQueuedToSend", "mithril", func(r *row) float64 { return betweenMs(r.vote.queued, r.vote.firstSend) })
+	partial("LastShredToVoteSent", "mithril", func(r *row) float64 { return betweenMs(lastShredNanos(r), r.vote.firstSend) })
+	partial("LastShredToFanout", "mithril", func(r *row) float64 { return betweenMs(lastShredNanos(r), r.vote.fanoutDone) })
+	voted, noPeers := 0, 0
+	for i := range rows {
+		if rows[i].vote.queued != 0 {
+			voted++
+		}
+		if rows[i].vote.fanoutDone != 0 && rows[i].vote.peers == 0 {
+			noPeers++
+		}
+	}
+	if voted == 0 {
+		fmt.Fprintf(w, "  no notarize votes in these rows (not voting, or the votes were recorded outside them)\n")
+	} else {
+		fmt.Fprintf(w, "  %d of %d blocks voted; %d votes reached no connected peer\n", voted, len(rows), noPeers)
+	}
+
+	var dataShreds, repaired, recovered, forkSwitches int
+	repairedBlocks, recoveredBlocks := 0, 0
+	lags := make([]float64, 0, len(rows))
+	for i := range rows {
+		tp := &rows[i].TipPath
+		dataShreds += tp.DataShreds
+		repaired += tp.RepairedShreds
+		recovered += tp.RecoveredShreds
+		if tp.RepairedShreds > 0 {
+			repairedBlocks++
+		}
+		if tp.RecoveredShreds > 0 {
+			recoveredBlocks++
+		}
+		if tp.ForkSwitch {
+			forkSwitches++
+		}
+		lags = append(lags, float64(tp.TipLagSlots))
+	}
+	fmt.Fprintf(w, "  shreds: %d data shreds; repair delivered %d in %d blocks, recovery rebuilt %d in %d blocks; %d fork switches\n",
+		dataShreds, repaired, repairedBlocks, recovered, recoveredBlocks, forkSwitches)
+	if p50, _, p99, mx := quantiles(lags); mx > 0 {
+		fmt.Fprintf(w, "  tip lag at hand-off (slots behind the newest data shred): p50 %.0f, p99 %.0f, max %.0f\n", p50, p99, mx)
+	}
+
 	var cycles, drops, over1ms uint64
 	gcBlocks := 0
 	for i := range rows {
@@ -239,10 +396,18 @@ func writeTipReport(w io.Writer, rows []row, total, top int) {
 			gcBlocks++
 		}
 	}
-	fmt.Fprintf(w, "  runtime: %d GC cycles, a GC pause in %d of %d row windows, %d scheduler waits over 1 ms, %d kernel shred drops\n",
-		cycles, gcBlocks, len(rows), over1ms, drops)
+	var involuntary, majorFaults uint64
+	for i := range rows {
+		involuntary += rows[i].RuntimeInterference.InvoluntaryContextSwitches
+		majorFaults += rows[i].RuntimeInterference.MajorPageFaults
+	}
+	fmt.Fprintf(w, "  runtime: %d GC cycles, a GC pause in %d of %d row windows, %d scheduler waits over 1 ms, %d kernel shred drops, %d involuntary context switches, %d major page faults\n",
+		cycles, gcBlocks, len(rows), over1ms, drops, involuntary, majorFaults)
 	line("GCPauseMax (bound)", "mithril", math.NaN(), func(r *row) float64 { return r.RuntimeInterference.GCPauseMax.ms() })
 	line("SchedLatencyMax", "mithril", math.NaN(), func(r *row) float64 { return r.RuntimeInterference.SchedLatencyMax.ms() })
+	line("PressureCPU (host)", "host", math.NaN(), func(r *row) float64 { return r.RuntimeInterference.PressureCPU.ms() })
+	line("PressureIO (host)", "host", math.NaN(), func(r *row) float64 { return r.RuntimeInterference.PressureIO.ms() })
+	line("PressureMemory (host)", "host", math.NaN(), func(r *row) float64 { return r.RuntimeInterference.PressureMemory.ms() })
 
 	if top <= 0 {
 		return
@@ -253,12 +418,37 @@ func writeTipReport(w io.Writer, rows []row, total, top int) {
 	}
 	sort.SliceStable(order, func(a, b int) bool { return controlledMs(&rows[order[a]]) > controlledMs(&rows[order[b]]) })
 	fmt.Fprintf(w, "  slowest %d blocks by controlled time:\n", min(top, len(rows)))
-	fmt.Fprintf(w, "  %-12s %8s %10s %10s %10s  %s\n", "slot", "M CU", "controlled", "full->done", "ReplayWork", "largest intervals")
+	fmt.Fprintf(w, "  %-12s %8s %10s %10s %10s %8s  %s\n", "slot", "M CU", "controlled", "full->done", "ReplayWork", "CU/ns", "largest intervals; context")
 	for _, i := range order[:min(top, len(rows))] {
 		r := &rows[i]
-		fmt.Fprintf(w, "  %-12d %8.2f %10.2f %10.2f %10.2f  %s\n", r.Slot, float64(r.ComputeUnitsConsumed)/1e6,
-			controlledMs(r), r.FullToReplayed.ms(), r.ReplayWork.ms(), largest(r, 3))
+		fmt.Fprintf(w, "  %-12d %8.2f %10.2f %10.2f %10.2f %8.3f  %s%s\n", r.Slot, float64(r.ComputeUnitsConsumed)/1e6,
+			controlledMs(r), r.FullToReplayed.ms(), r.ReplayWork.ms(), ratio(r.ComputeUnitsConsumed, r.ReplayWork.SumNanoseconds), largest(r, 3), context(r))
 	}
+}
+
+// context lists what else was unusual about a block.
+func context(r *row) string {
+	out := ""
+	add := func(format string, args ...any) { out += "; " + fmt.Sprintf(format, args...) }
+	if r.TipPath.RepairedShreds > 0 {
+		add("%d repaired shreds", r.TipPath.RepairedShreds)
+	}
+	if r.TipPath.RecoveredShreds > 0 {
+		add("%d recovered shreds", r.TipPath.RecoveredShreds)
+	}
+	if r.TipPath.ForkSwitch {
+		add("fork switch")
+	}
+	if r.RuntimeInterference.GCCycles > 0 {
+		add("%d GC cycles", r.RuntimeInterference.GCCycles)
+	}
+	if r.RuntimeInterference.MajorPageFaults > 0 {
+		add("%d major faults", r.RuntimeInterference.MajorPageFaults)
+	}
+	if r.RuntimeInterference.KernelShredDrops > 0 {
+		add("%d kernel drops", r.RuntimeInterference.KernelShredDrops)
+	}
+	return out
 }
 
 func ratio(cu, ns uint64) float64 {

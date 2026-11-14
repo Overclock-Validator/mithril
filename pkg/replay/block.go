@@ -41,6 +41,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/state"
 	"github.com/Overclock-Validator/mithril/pkg/statsd"
+	"github.com/Overclock-Validator/mithril/pkg/turbine"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
@@ -2886,8 +2887,9 @@ func ReplayBlocks(
 			// parentMark is the last replayed block as this one was admitted,
 			// and handedOffAt when this block's result reached consensus;
 			// both feed the row's TipPath.
-			parentMark  streamingFrontierMark
-			handedOffAt time.Time
+			parentMark               streamingFrontierMark
+			handedOffAt              time.Time
+			newestShredSlotAtHandoff uint64
 		)
 
 		{
@@ -3533,6 +3535,7 @@ func ReplayBlocks(
 			}
 		}
 		handedOffAt = recordFullToReplayed(block)
+		newestShredSlotAtHandoff = turbine.NewestDataShredSlot()
 		// The same instant FullToReplayed ends at: from here to the next wait
 		// entry is this block's post-replay tail, which a child's open timeline
 		// reports as OpenWaitPostReplay.
@@ -3961,8 +3964,12 @@ func ReplayBlocks(
 		{
 			metrics.GlobalBlockReplay.Slot = block.Slot
 			rowAt := time.Now()
-			recordTipPath(&metrics.GlobalBlockReplay.TipPath, newTipPathInput(block, ingressTimings, parentMark, admittedAt, start, handedOffAt))
+			tipIn := newTipPathInput(block, ingressTimings, parentMark, admittedAt, start, handedOffAt)
+			tipIn.newestShredSlot = newestShredSlotAtHandoff
+			tipIn.forkSwitch = parentSwitch != nil || certifiedSwitch != nil
+			recordTipPath(&metrics.GlobalBlockReplay.TipPath, tipIn)
 			runtimeSampler.record(&metrics.GlobalBlockReplay.RuntimeInterference)
+			metrics.GlobalBlockReplay.VoteEvents, metrics.GlobalBlockReplay.VoteEventsDropped = metrics.DrainVoteEvents()
 			recordUnrootedTail(unrootedTailState)
 			recordReplayLoopClosure(rowAt, lastRowAt, iterationStart, waitTime, slotReplayEnd, block.Slot)
 			lastRowAt = rowAt

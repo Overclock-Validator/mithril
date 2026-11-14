@@ -861,6 +861,7 @@ func (r *UDPReceiver) processPacketAt(ctx context.Context, conn *net.UDPConn, pa
 				break
 			}
 		}
+		noteNewestDataShredSlot(shred.Slot)
 	case ShredTypeCode:
 		r.codingShreds.Add(1)
 	}

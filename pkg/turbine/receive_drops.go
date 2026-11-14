@@ -32,3 +32,20 @@ func (d *socketDrops) observe(cumulative uint32) {
 }
 
 func unsafePointer(b *byte) unsafe.Pointer { return unsafe.Pointer(b) }
+
+// newestDataShredSlot is the highest slot of any data shred a receiver in this
+// process has parsed from the network (not from the spool).
+var newestDataShredSlot atomic.Uint64
+
+func noteNewestDataShredSlot(slot uint64) {
+	for {
+		cur := newestDataShredSlot.Load()
+		if slot <= cur || newestDataShredSlot.CompareAndSwap(cur, slot) {
+			return
+		}
+	}
+}
+
+// NewestDataShredSlot returns the highest data shred slot received from the
+// network by this process, zero before any.
+func NewestDataShredSlot() uint64 { return newestDataShredSlot.Load() }

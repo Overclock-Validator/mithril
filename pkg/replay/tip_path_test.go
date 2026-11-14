@@ -138,3 +138,68 @@ func TestRuntimeMetricNamesExist(t *testing.T) {
 		require.True(t, known[name], name)
 	}
 }
+
+func TestRecordTipPathContext(t *testing.T) {
+	full := int64(1_700_000_000) * int64(time.Second)
+	in := tipPathInput{
+		slot: 50, parentSlot: 49, fullNanos: full, haveReady: true,
+		handedOffAt: time.Unix(0, full+int64(time.Millisecond)),
+		dataShreds:  64, repairedShreds: 2, recoveredShreds: 5,
+		newestShredSlot: 53, forkSwitch: true,
+	}
+	var r mmetrics.TipPath
+	recordTipPath(&r, in)
+	require.Equal(t, full+int64(time.Millisecond), r.HandedOffNanos)
+	require.Equal(t, 64, r.DataShreds)
+	require.Equal(t, 2, r.RepairedShreds)
+	require.Equal(t, 5, r.RecoveredShreds)
+	require.Equal(t, uint64(3), r.TipLagSlots)
+	require.True(t, r.ForkSwitch)
+
+	in.newestShredSlot = 40 // behind this block: no lag, never a wrapped value
+	r = mmetrics.TipPath{}
+	recordTipPath(&r, in)
+	require.Zero(t, r.TipLagSlots)
+}
+
+func TestParsePressureSomeTotal(t *testing.T) {
+	data := []byte("some avg10=0.00 avg60=0.10 avg300=0.05 total=123456\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=99\n")
+	v, ok := parsePressureSomeTotal(data)
+	require.True(t, ok)
+	require.Equal(t, uint64(123456), v)
+	_, ok = parsePressureSomeTotal([]byte("full avg10=0 total=1\n"))
+	require.False(t, ok)
+	_, ok = parsePressureSomeTotal([]byte("some avg10=0 total=x\n"))
+	require.False(t, ok)
+}
+
+func TestRuntimeSamplerReadsProcessCounters(t *testing.T) {
+	s := newRuntimeInterferenceSampler()
+	var baseline mmetrics.RuntimeInterference
+	s.record(&baseline)
+	// Touch fresh memory so the window has minor faults.
+	buf := make([]byte, 64<<20)
+	for i := 0; i < len(buf); i += 4096 {
+		buf[i] = 1
+	}
+	var r mmetrics.RuntimeInterference
+	s.record(&r)
+	require.Positive(t, r.MinorPageFaults)
+	runtime.KeepAlive(buf)
+}
+
+func TestLastShredToReplayed(t *testing.T) {
+	ms := int64(time.Millisecond)
+	full := int64(1_700_000_000) * int64(time.Second)
+	in := tipPathInput{slot: 5, parentSlot: 4, fullNanos: full, haveReady: true, handedOffAt: time.Unix(0, full+10*ms)}
+
+	var fromFull mmetrics.TipPath
+	recordTipPath(&fromFull, in)
+	require.Equal(t, uint64(10*ms), fromFull.LastShredToReplayed.SumNanoseconds, "no kernel time: from full assembly")
+
+	in.receivedNanos = full - 3*ms
+	var fromKernel mmetrics.TipPath
+	recordTipPath(&fromKernel, in)
+	require.Equal(t, uint64(13*ms), fromKernel.LastShredToReplayed.SumNanoseconds, "ReceiveToFull + FullToReplayed")
+	require.Equal(t, fromKernel.ReceiveToFull.SumNanoseconds+10*uint64(ms), fromKernel.LastShredToReplayed.SumNanoseconds)
+}

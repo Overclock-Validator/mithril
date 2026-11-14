@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -260,6 +261,25 @@ type TipPath struct {
 	// assembled full: socket queueing, shred parsing and signature checks,
 	// FEC recovery and assembly.
 	ReceiveToFull Timing
+	// HandedOffNanos is when the replay result reached consensus (unix
+	// nanoseconds), the end of FullToReplayed; votes in VoteEvents join to
+	// it by slot.
+	HandedOffNanos int64
+	// LastShredToReplayed runs from the last shred to the replay result
+	// reaching consensus: from its kernel receive time when known (then it
+	// is ReceiveToFull + FullToReplayed), otherwise from full assembly.
+	LastShredToReplayed Timing
+	// Where the block's data shreds came from: DataShreds in the block,
+	// RepairedShreds delivered by repair, RecoveredShreds rebuilt from
+	// coding shreds.
+	DataShreds      int
+	RepairedShreds  int
+	RecoveredShreds int
+	// TipLagSlots is how far the newest data shred slot this process had
+	// received was ahead of this block at hand-off; ForkSwitch is set when
+	// replay switched forks to reach this block.
+	TipLagSlots uint64
+	ForkSwitch  bool
 	// FullToReady is block completion: decode and outstanding transaction
 	// signature verification (TurbineIngress.FullToReady).
 	FullToReady Timing
@@ -299,6 +319,70 @@ type RuntimeInterference struct {
 	// KernelShredDrops counts shred packets the kernel dropped because a
 	// receive socket's buffer was full (Linux SO_RXQ_OVFL); zero elsewhere.
 	KernelShredDrops uint64
+	// Process context switches (involuntary: preempted by the kernel) and
+	// page faults (major: needed disk I/O), from getrusage.
+	InvoluntaryContextSwitches uint64
+	VoluntaryContextSwitches   uint64
+	MajorPageFaults            uint64
+	MinorPageFaults            uint64
+	// PressureCPU/IO/Memory are the host's pressure-stall time (Linux PSI
+	// "some": at least one task stalled on the resource). They are
+	// system-wide, not this process's; zero where PSI is unavailable.
+	PressureCPU    Timing
+	PressureIO     Timing
+	PressureMemory Timing
+}
+
+// Stages a vote passes through on its way out.
+const (
+	// VoteQueued: signed, recorded in vote history and queued for broadcast.
+	VoteQueued = "queued"
+	// VoteFirstSend: the first peer's copy was handed to QUIC.
+	VoteFirstSend = "first_send"
+	// VoteFanoutDone: every connected peer's copy was sent or failed; Peers
+	// counts the copies sent.
+	VoteFanoutDone = "fanout_done"
+)
+
+// VoteEvent is one stage of one vote this node cast.
+type VoteEvent struct {
+	Slot    uint64
+	Type    string
+	Stage   string
+	Peers   int   `json:",omitempty"`
+	AtNanos int64 // unix nanoseconds
+}
+
+// voteEvents holds vote stages since the replay loop last drained them; it is
+// bounded so a node whose replay loop is not writing rows cannot grow it.
+var voteEvents struct {
+	sync.Mutex
+	pending []VoteEvent
+	dropped uint64
+}
+
+const maxPendingVoteEvents = 512
+
+// RecordVoteEvent notes one stage of a vote.
+func RecordVoteEvent(slot uint64, voteType, stage string, peers int, at time.Time) {
+	voteEvents.Lock()
+	defer voteEvents.Unlock()
+	if len(voteEvents.pending) >= maxPendingVoteEvents {
+		copy(voteEvents.pending, voteEvents.pending[1:])
+		voteEvents.pending = voteEvents.pending[:len(voteEvents.pending)-1]
+		voteEvents.dropped++
+	}
+	voteEvents.pending = append(voteEvents.pending, VoteEvent{Slot: slot, Type: voteType, Stage: stage, Peers: peers, AtNanos: at.UnixNano()})
+}
+
+// DrainVoteEvents returns the vote stages since the last call, oldest first,
+// and how many older ones were dropped because nobody drained them.
+func DrainVoteEvents() ([]VoteEvent, uint64) {
+	voteEvents.Lock()
+	defer voteEvents.Unlock()
+	out, dropped := voteEvents.pending, voteEvents.dropped
+	voteEvents.pending, voteEvents.dropped = nil, 0
+	return out, dropped
 }
 
 // StreamingExecution records execution that ran while a block's shreds were
@@ -547,6 +631,12 @@ type BlockReplay struct {
 	// RuntimeInterference is Go runtime activity since the previous row,
 	// the same window as SinceLastRow.
 	RuntimeInterference RuntimeInterference
+	// VoteEvents lists the stages this node's votes reached since the
+	// previous row, for any slot (a block's own vote usually lands in the
+	// next row); VoteEventsDropped counts older ones lost because rows were
+	// not being written.
+	VoteEvents        []VoteEvent `json:",omitempty"`
+	VoteEventsDropped uint64      `json:",omitempty"`
 	// StreamingExecution summarizes any execution that overlapped shred
 	// reception for this block; all zero when the block was executed whole.
 	StreamingExecution StreamingExecution

@@ -19,6 +19,10 @@ type tipPathInput struct {
 	admittedAt       time.Time
 	replayStart      time.Time // SlotReplay's start
 	handedOffAt      time.Time // the replay result reached consensus
+
+	dataShreds, repairedShreds, recoveredShreds int
+	newestShredSlot                             uint64 // highest data shred slot received at hand-off
+	forkSwitch                                  bool
 }
 
 func newTipPathInput(block *b.Block, ingress *b.TurbineIngressTimings, parent streamingFrontierMark, admittedAt, replayStart, handedOffAt time.Time) tipPathInput {
@@ -31,6 +35,10 @@ func newTipPathInput(block *b.Block, ingress *b.TurbineIngressTimings, parent st
 		admittedAt:    admittedAt,
 		replayStart:   replayStart,
 		handedOffAt:   handedOffAt,
+
+		dataShreds:      block.DataShreds,
+		repairedShreds:  block.RepairedShreds,
+		recoveredShreds: block.RecoveredShreds,
 	}
 	if ingress != nil {
 		in.fullToReady, in.haveReady = ingress.FullToReady, true
@@ -50,12 +58,21 @@ func recordTipPath(rec *metrics.TipPath, in tipPathInput) {
 	if handedOff <= full {
 		return
 	}
+	rec.HandedOffNanos = handedOff
+	rec.DataShreds, rec.RepairedShreds, rec.RecoveredShreds = in.dataShreds, in.repairedShreds, in.recoveredShreds
+	if in.newestShredSlot > in.slot {
+		rec.TipLagSlots = in.newestShredSlot - in.slot
+	}
+	rec.ForkSwitch = in.forkSwitch
+	lastShred := full
 	if in.receivedNanos > 0 {
 		rec.ShredReceivedNanos = in.receivedNanos
 		if in.receivedNanos <= full {
 			rec.ReceiveToFull.AddTiming(time.Duration(full - in.receivedNanos))
+			lastShred = in.receivedNanos
 		}
 	}
+	rec.LastShredToReplayed.AddTiming(time.Duration(handedOff - lastShred))
 
 	// Walk forward from full to the hand-off, taking each interval from the
 	// cursor to its end instant (clamped so the intervals never overlap).

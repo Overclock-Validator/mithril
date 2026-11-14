@@ -133,6 +133,8 @@ type Block struct {
 	// shred whose acceptance made the slot full; zero when unknown.
 	ShredFullReceivedNanos int64
 	RepairedShreds         int // data shreds obtained via repair rather than turbine
+	RecoveredShreds        int // data shreds rebuilt from coding shreds
+	DataShreds             int // data shreds in the block (last index + 1); zero when unknown
 }
 
 // MarkTransactionSignaturesVerified records that every transaction signature

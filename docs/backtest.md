@@ -1,5 +1,7 @@
 # mithril backtest
 
+See [benchmarking.md](benchmarking.md) for what the recorded numbers mean, what to check in a result, and how to compare with other clients.
+
 `mithril backtest` replays a Firedancer shredcap capture offline and reports
 how long replay took, the way `firedancer-dev backtest` does. Given the same
 capture and starting state, Mithril and Firedancer execute exactly the same

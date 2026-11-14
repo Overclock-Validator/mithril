@@ -132,6 +132,8 @@ type slotState struct {
 	// shred whose acceptance made the slot full.
 	lastReceivedNanos int64
 	fullReceivedNanos int64
+	// recoveredShreds counts data shreds rebuilt from coding shreds.
+	recoveredShreds int
 	// completing makes the immutable full state a single-owner generation token.
 	completing      bool
 	batchIndex      *entryBatchIndex
@@ -382,6 +384,7 @@ func (a *SlotAssembler) addShredFromWithRoot(shred *Shred, fromRepair bool, root
 			state.traceAcceptedShred(recoveredShred, source)
 			a.notePrefetchShredLocked(state, recoveredShred)
 			a.recoveredDataShreds++
+			state.recoveredShreds++
 		}
 	}
 
@@ -581,6 +584,10 @@ func (a *SlotAssembler) finalizeCompletion(work *slotCompletionWork, processed p
 	}
 	blk.ShredFullReceivedNanos = state.fullReceivedNanos
 	blk.RepairedShreds = state.repairedShreds
+	blk.RecoveredShreds = state.recoveredShreds
+	if state.haveLast {
+		blk.DataShreds = int(state.lastIndex) + 1
+	}
 	onComplete := a.onComplete
 	lastIndex := state.lastIndex
 	a.mu.Unlock()

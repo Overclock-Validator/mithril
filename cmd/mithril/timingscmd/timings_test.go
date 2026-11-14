@@ -65,3 +65,49 @@ func TestTipReportWithoutShredBlocks(t *testing.T) {
 }
 
 func itoa(v uint64) string { return strconv.FormatUint(v, 10) }
+
+// A block's notarize vote is joined from whichever rows carried its stages,
+// usually the next block's, and the report runs from the last shred to replay
+// done and on to the vote leaving.
+func TestTipReportJoinsVotes(t *testing.T) {
+	const ms = int64(1_000_000)
+	block := func(slot uint64, handedOff int64, repaired int) string {
+		return `{"Slot":` + itoa(slot) + `,"ComputeUnitsConsumed":1000000,"ReplayWork":{"Count":1,"SumNanoseconds":1000000}` +
+			`,"FullToReplayed":{"Count":1,"SumNanoseconds":5000000}` +
+			`,"TipPath":{"HandedOffNanos":` + itoa(uint64(handedOff)) +
+			`,"LastShredToReplayed":{"Count":1,"SumNanoseconds":6000000}` +
+			`,"DataShreds":64,"RepairedShreds":` + itoa(uint64(repaired)) +
+			`,"RecoveredShreds":1,"TipLagSlots":2,"ForkSwitch":` + strconv.FormatBool(repaired > 0) +
+			`,"ReplayToHandoff":{"Count":1,"SumNanoseconds":5000000}}`
+	}
+	event := func(slot uint64, typ, stage string, peers int, at int64) string {
+		return `{"Slot":` + itoa(slot) + `,"Type":"` + typ + `","Stage":"` + stage + `","Peers":` + itoa(uint64(peers)) + `,"AtNanos":` + itoa(uint64(at)) + `}`
+	}
+	h := 1000 * ms // slot 20's hand-off; its last shred was 6 ms earlier
+	rows := []string{
+		block(20, h, 0) + `,"VoteEvents":[` + event(20, "notarize", "queued", 0, h+ms/2) + `]}`,
+		// The send stages land in the next row, beside a skip vote that must not count.
+		block(21, 2000*ms, 3) + `,"VoteEvents":[` + event(20, "skip", "queued", 0, h) + `,` +
+			event(20, "notarize", "first_send", 0, h+ms) + `,` + event(20, "notarize", "fanout_done", 7, h+3*ms) + `]}`,
+	}
+	path := filepath.Join(t.TempDir(), "replay_timings.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte(strings.Join(rows, "\n")+"\n"), 0o644))
+	got, _, err := readRows(path)
+	require.NoError(t, err)
+	require.InDelta(t, 0.5, handoffToVoteMs(&got[0]), 1e-9)
+	require.Equal(t, -1.0, handoffToVoteMs(&got[1]), "slot 21 has no vote yet")
+	require.Equal(t, 7, got[0].vote.peers)
+
+	var out bytes.Buffer
+	writeTipReport(&out, got, len(rows), 5)
+	text := out.String()
+	require.Regexp(t, `LastShredToReplayed\s+mithril\s+-\s+6\.00 .*\(2 blocks\)`, text)
+	require.Regexp(t, `HandoffToVote\s+mithril\s+-\s+0\.50 .*\(1 blocks\)`, text)
+	require.Regexp(t, `VoteQueuedToSend\s+mithril\s+-\s+0\.50 `, text)
+	require.Regexp(t, `LastShredToVoteSent\s+mithril\s+-\s+7\.00 `, text, "6 ms to replay done, 1 ms more to the first send")
+	require.Regexp(t, `LastShredToFanout\s+mithril\s+-\s+9\.00 `, text)
+	require.Contains(t, text, "1 of 2 blocks voted; 0 votes reached no connected peer")
+	require.Contains(t, text, "shreds: 128 data shreds; repair delivered 3 in 1 blocks, recovery rebuilt 2 in 2 blocks; 1 fork switches")
+	require.Contains(t, text, "tip lag at hand-off (slots behind the newest data shred): p50 2, p99 2, max 2")
+	require.Contains(t, text, "3 repaired shreds; 1 recovered shreds; fork switch")
+}
