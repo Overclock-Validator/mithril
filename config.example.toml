@@ -204,6 +204,16 @@ name = "mithril"
     #   ]
     rpc = ["https://api.mainnet-beta.solana.com"]
 
+    # Offline replay (also --offline): replay only blocks already in the local
+    # shred spool, for benchmark corpora. No gossip client, Turbine tree, repair
+    # or Votor listener starts, rooting follows block footer certificates only,
+    # and rpc above is ignored (the genesis check uses the cluster setting).
+    # Requires bootstrap.mode = "accountsdb" or local snapshot files,
+    # consensus.mode = "verifying", a finite replay range,
+    # turbine.shred_version, and block.rpc_fallback off. See
+    # docs/replay-corpus.md and docs/backtest.md.
+    # offline = false
+
 # ============================================================================
 # [block] - Block Source & Streaming
 # ============================================================================
@@ -604,6 +614,10 @@ name = "mithril"
     # executed prefix must be the block's own transactions (pointer identity)
     # or the bank is discarded and the block executes whole. On by default.
     # streaming_execution = true
+    # Time each transaction phase and instruction dispatch during replay (the
+    # detail behind TxLoop). About 1% of SlotReplay; SlotReplay and TxLoop are
+    # timed either way. On by default; mithril backtest defaults it off.
+    # replay_phase_timers = true
     # Execution workers per streaming group (0 = min(txpar, 4)).
     # streaming_workers = 0
     # Contiguous decoded batches to accumulate before a group executes
@@ -660,7 +674,7 @@ name = "mithril"
     use_pool = true
 
     # Approximate maximum retained SBPF program cache size in MiB.
-    program_cache_max_mb = 1024
+    program_cache_max_mb = 4096
 
     # Approximate retained decoded account cache weight budget in MiB. Large block scans
     # pass through a bounded two-hit admission filter before using this budget.

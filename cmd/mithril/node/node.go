@@ -630,6 +630,8 @@ func init() {
 	Run.Flags().BoolVar(&blockRPCFallback, "rpc-fallback", false, "Allow RPC to fetch blocks when replay is more than repair-catchup-max-gap-slots behind (default false: shreds via turbine + repair are the only block path)")
 	Run.Flags().StringVar(&turbineAdvertisedIP, "turbine-advertised-ip", "", "Public IP advertised by native turbine gossip (optional)")
 	Run.Flags().IntVar(&turbineShredVersion, "turbine-shred-version", 0, "Shred version for native turbine gossip (0 = discover from entrypoint)")
+	Run.Flags().BoolVar(&replayPhaseTimers, "replay-phase-timers", true, "Time each transaction phase and instruction dispatch during replay (the detail behind TxLoop); off saves the timer calls")
+	Run.Flags().BoolVar(&offlineReplay, "offline", false, "Replay only from the local shred spool: no gossip, Turbine tree, repair or Votor listener (corpus replays; needs --end-slot and --bootstrap accountsdb)")
 	Run.Flags().StringSlice("shred-receiver-address", nil, "Also send every shred this validator broadcasts to this host:port (repeatable), e.g. a block builder")
 	Run.Flags().StringSlice("shred-retransmit-receiver-address", nil, "Also send every shred this node relays to this host:port (repeatable), e.g. a block builder")
 	Run.Flags().IntVar(&blockMaxRPS, "block-max-rps", 0, "Max RPC requests per second for block fetching (0 = use default)")
@@ -850,6 +852,9 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		blockstorePath = getString("ledger-path", "ledger.path")
 	}
 
+	// Offline replay is read first: it changes what the network settings mean.
+	offlineReplay = getBool("offline", "network.offline")
+
 	// [network] section (with fallback to legacy [rpc] keys)
 	rpcEndpoints = getStringSlice("rpc", "network.rpc")
 	if len(rpcEndpoints) == 0 {
@@ -867,7 +872,14 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		return err
 	}
 	cluster = clusterInfo.Name
-	if len(rpcEndpoints) == 0 {
+	if offlineReplay {
+		// Offline replay makes no RPC calls: the genesis check uses the
+		// cluster setting, and nothing polls a tip or fetches blocks.
+		if len(rpcEndpoints) > 0 {
+			mlog.Log.Infof("offline replay: ignoring network.rpc")
+		}
+		rpcEndpoints = nil
+	} else if len(rpcEndpoints) == 0 {
 		if clusterInfo.Custom {
 			return fmt.Errorf("custom network.cluster %q requires network.rpc", cluster)
 		}
@@ -1034,6 +1046,10 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		}
 	}
 
+	if err := applyOfflineReplay(); err != nil {
+		return err
+	}
+
 	// Validate block source requirements
 	switch blockSource {
 	case "rpc":
@@ -1050,7 +1066,7 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	case "turbine":
 		// Defaulted here, after Lightbringer may have taken over the source, so
 		// a node fed by Lightbringer never needs a native Turbine entrypoint.
-		if turbineGossipEntrypoint == "" {
+		if turbineGossipEntrypoint == "" && !offlineReplay {
 			if clusterInfo.Custom {
 				return fmt.Errorf("custom network.cluster %q requires turbine.gossip_entrypoint", cluster)
 			}
@@ -1063,7 +1079,7 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		if turbineShredVersion < 0 || turbineShredVersion > 0xffff {
 			return fmt.Errorf("turbine.shred_version must be between 0 and 65535")
 		}
-		if len(rpcEndpoints) == 0 {
+		if len(rpcEndpoints) == 0 && !offlineReplay {
 			return fmt.Errorf("block.source=turbine requires RPC endpoints for catchup and tip polling (set network.rpc)")
 		}
 	default:
@@ -1242,6 +1258,8 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	sbpf.UsePool = getBool("use-pool", "tuning.use_pool")
 	// [tuning] streaming execution (on by default; Alpenglow turbine only).
 	replay.StreamingExecutionCfg.Enabled = getBool("streaming-execution", "tuning.streaming_execution")
+	replayPhaseTimers = getBool("replay-phase-timers", "tuning.replay_phase_timers")
+	replay.SkipPhaseTimers = !replayPhaseTimers
 	replay.StreamingExecutionCfg.Workers = getInt("streaming-workers", "tuning.streaming_workers")
 	replay.StreamingExecutionCfg.MinGroupBatches = getInt("streaming-min-group-batches", "tuning.streaming_min_group_batches")
 	if ms := getInt("streaming-max-open-ms", "tuning.streaming_max_open_ms"); ms > 0 {
@@ -1435,9 +1453,13 @@ func runLive(c *cobra.Command, args []string) {
 	stopMemoryDiagnostics := startMemoryDiagnostics(ctx, mlog.GetLogDir(), heapProfileThreshold)
 	defer stopMemoryDiagnostics()
 
-	// Kill any existing mithril processes to prevent zombie accumulation
-	if killed := killExistingMithrilProcesses(); killed > 0 {
-		fmt.Printf("  ⚠ Killed %d existing mithril process(es)\n\n", killed)
+	// Kill any existing mithril processes to prevent zombie accumulation.
+	// A backtest or an offline replay may share the host with other nodes and
+	// must not stop them.
+	if shouldKillExistingMithril(backtestMode, offlineReplay) {
+		if killed := killExistingMithrilProcesses(); killed > 0 {
+			fmt.Printf("  ⚠ Killed %d existing mithril process(es)\n\n", killed)
+		}
 	}
 
 	// Discover once, before constructing any turbine, consensus, or production
@@ -1468,7 +1490,14 @@ func runLive(c *cobra.Command, args []string) {
 	// it before Lightbringer can open ledger storage and before history records
 	// describe any mutation. Fetch genesis exactly once and carry that value
 	// through every fresh ready-state write below.
-	networkGenesisHash := fetchGenesisHash(ctx)
+	var networkGenesisHash string
+	if offlineReplay {
+		// No network to ask: the configured cluster names the chain, and the
+		// checks below still refuse an AccountsDB or ledger from another one.
+		networkGenesisHash = clusterInfo.GenesisHash
+	} else {
+		networkGenesisHash = fetchGenesisHash(ctx)
+	}
 	if networkGenesisHash == "" {
 		klog.Fatalf("FATAL: could not confirm the RPC genesis hash; refusing startup because AccountsDB, shred spool, and vote-history lineage cannot be validated")
 	}
@@ -1774,6 +1803,8 @@ func runLive(c *cobra.Command, args []string) {
 		mlog.Log.Infof("block.source=turbine with native turbine receiver on %s", turbineBindAddr)
 		if turbineGossipEntrypoint != "" {
 			mlog.Log.Infof("native turbine gossip enabled with entrypoint %s", turbineGossipEntrypoint)
+		} else if offlineReplay {
+			mlog.Log.Infof("native turbine gossip off (offline replay)")
 		} else {
 			mlog.Log.Warnf("native turbine gossip entrypoint is empty; Mithril will receive turbine packets only if shreds are sent directly to %s", turbineBindAddr)
 		}
@@ -2459,6 +2490,10 @@ postBootstrap:
 			res.NewThrough, res.UndoneBatches, res.UndoneKeys, mithrilState.GetResumeSlot())
 	}
 
+	// The AccountsDB is built or opened, and rewound if asked: state loading is
+	// done (a backtest reports it as Firedancer's snapshot-done time).
+	stateReadyAt = time.Now()
+
 	// Rooted-durable resume needs a context at the last rooted slot. The fold
 	// manifest is the primary source (handled above); the state file is the
 	// fallback for stores from before the first fold.
@@ -2978,6 +3013,7 @@ postBootstrap:
 		}
 	}
 	result := runReplayWithRecovery(ctx, accountsDb, accountsPath, manifest, resumeState, uint64(startSlot), liveEndSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, uint16(turbineShredVersion), turbineAlpenglowAddr, validatorIdentity, blockstorePath, int(txParallelism), true, useLightbringer, useTurbine, dbgOpts, metricsWriter, slotCtxSetter, mithrilState, blockFetchOpts, consensusOpts, compactCfg.RewindHorizonBatches, replayStartTime)
+	lastReplayResult = result
 	stopCompactor() // join before shutdown closes AccountsDB
 
 	if result.Error != nil {
@@ -3901,6 +3937,16 @@ func downloadAndBuildFromSnapshot(ctx context.Context, rpcEndpoints []string, sn
 	return accountsDb, manifest, nil
 }
 
+// shouldKillExistingMithril reports whether startup stops the other Mithril
+// processes on the host. A normal run does, so a stale instance cannot hold
+// its ports and disk or double its traffic to the cluster. A backtest and an
+// offline replay (--offline) use no network and are benchmarks that are
+// expected to run beside other nodes, a live validator included, so they
+// leave every other process alone.
+func shouldKillExistingMithril(backtest, offline bool) bool {
+	return !backtest && !offline
+}
+
 // killExistingMithrilProcesses finds and kills any other running mithril processes.
 // This prevents zombie processes from accumulating and holding disk space.
 // Returns the number of processes killed.
@@ -4211,7 +4257,9 @@ func addTransactionStatusManifestRef(keep map[string]*state.TransactionStatusChe
 // an interrupted rewind never loses the status side of its target selection.
 // This collector validates references structurally but deliberately does not
 // reread tens of megabytes per boundary on every fold; rewind selection and
-// startup head adoption perform full size/SHA/decode validation.
+// startup head adoption perform full size/SHA/decode validation. It runs after
+// every fold, so it takes the manifest names from the store's in-memory
+// inventory instead of listing the accounts directory.
 func retainedTransactionStatusCheckpointRefs(accountsDb *accountsdb.AccountsDb, horizon uint64, current *state.TransactionStatusCheckpointRef) ([]*state.TransactionStatusCheckpointRef, error) {
 	if accountsDb == nil {
 		return nil, errors.New("collect transaction status checkpoints: AccountsDB is nil")
@@ -4223,7 +4271,7 @@ func retainedTransactionStatusCheckpointRefs(accountsDb *accountsdb.AccountsDb, 
 		}
 	}
 
-	headers, parkedPaths, err := accountsdb.ListFoldAndParkedManifests(accountsDb.AcctsDir)
+	headers, parkedPaths, err := accountsDb.FoldAndParkedManifests()
 	if err != nil {
 		return nil, fmt.Errorf("list retained fold manifests: %w", err)
 	}

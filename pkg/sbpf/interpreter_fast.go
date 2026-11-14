@@ -11,6 +11,7 @@ type fastFlags struct {
 	explicitSext   bool
 	disableLddw    bool
 	staticSyscalls bool
+	disableNeg     bool
 }
 
 func (ip *Interpreter) fastFlags() fastFlags {
@@ -22,6 +23,7 @@ func (ip *Interpreter) fastFlags() fastFlags {
 		explicitSext:   v.ExplicitSignExtensionOfResults(),
 		disableLddw:    v.DisableLddw(),
 		staticSyscalls: v.EnableStaticSyscalls(),
+		disableNeg:     v.DisableNeg(),
 	}
 }
 
@@ -36,13 +38,16 @@ func sext32(explicit bool, val int32) uint64 {
 // the loop state stays in registers. Each instruction is either executed with
 // exactly Run's semantics (meter check, due++, effect, next pc) or not touched:
 // runFast returns pc/due at the first instruction it cannot complete and Run
-// handles that instruction itself: syscalls, legacy (v0-v2) calls, callx, the
-// entry frame's exit, a full shadow stack, slow memory translation, zero
-// divisors, cold opcodes, an out-of-range pc or call target, or an exhausted
-// budget. Static (v3) internal calls and returns from inner frames stay here.
+// handles that instruction itself: syscalls, legacy (v0-v2) calls that may
+// name a syscall, callx, the entry frame's exit, a full shadow stack, slow
+// memory translation, zero divisors, cold opcodes, an out-of-range pc or call
+// target, or an exhausted budget. Static (v3) internal calls, legacy internal
+// calls known not to name a syscall (ip.fastCalls) and returns from inner
+// frames stay here.
 func (ip *Interpreter) runFast(r *[16]uint64, pc int64, due, budget uint64, f fastFlags) (int64, uint64) {
 	text := ip.text
 	stack := &ip.stack
+	fastCalls := ip.fastCalls
 	for {
 		if uint64(pc) >= uint64(len(text)) || due == budget {
 			return pc, due
@@ -333,57 +338,183 @@ func (ip *Interpreter) runFast(r *[16]uint64, pc int64, due, budget uint64, f fa
 			if int64(r[ins.Dst()]) <= int64(r[ins.Src()]) {
 				pc += int64(ins.Off())
 			}
-		case OpMul32Reg:
+		// Under pqr (v2) these nine encodings are the relocated memory
+		// instructions, which Run's cold path executes only when moveMem is
+		// set too; their operands are those of the legacy loads and stores.
+		case OpMul32Reg: // OpLd1BReg under pqr
 			if f.pqr {
-				return pc, due
+				if !f.moveMem {
+					return pc, due
+				}
+				p := ip.fastRead(uint64(int64(r[ins.Src()])+int64(ins.Off())), 1)
+				if p == nil {
+					return pc, due
+				}
+				r[ins.Dst()] = uint64(*(*uint8)(p))
+			} else {
+				r[ins.Dst()] = uint64(int32(r[ins.Dst()]) * int32(r[ins.Src()]))
 			}
-			r[ins.Dst()] = uint64(int32(r[ins.Dst()]) * int32(r[ins.Src()]))
-		case OpMul64Imm:
+		case OpMul64Imm: // OpSt1BImm under pqr
 			if f.pqr {
-				return pc, due
+				if !f.moveMem {
+					return pc, due
+				}
+				p := ip.fastWrite(uint64(int64(r[ins.Dst()])+int64(ins.Off())), 1)
+				if p == nil {
+					return pc, due
+				}
+				*(*uint8)(p) = uint8(ins.Uimm())
+			} else {
+				r[ins.Dst()] *= uint64(ins.Imm())
 			}
-			r[ins.Dst()] *= uint64(ins.Imm())
-		case OpMul64Reg:
+		case OpMul64Reg: // OpSt1BReg under pqr
 			if f.pqr {
+				if !f.moveMem {
+					return pc, due
+				}
+				p := ip.fastWrite(uint64(int64(r[ins.Dst()])+int64(ins.Off())), 1)
+				if p == nil {
+					return pc, due
+				}
+				*(*uint8)(p) = uint8(r[ins.Src()])
+			} else {
+				r[ins.Dst()] *= r[ins.Src()]
+			}
+		case OpDiv32Reg: // OpLd2BReg under pqr
+			if f.pqr {
+				if !f.moveMem {
+					return pc, due
+				}
+				p := ip.fastRead(uint64(int64(r[ins.Src()])+int64(ins.Off())), 2)
+				if p == nil {
+					return pc, due
+				}
+				r[ins.Dst()] = uint64(*(*uint16)(p))
+			} else {
+				src := uint32(r[ins.Src()])
+				if src == 0 {
+					return pc, due
+				}
+				r[ins.Dst()] = uint64(uint32(r[ins.Dst()]) / src)
+			}
+		case OpDiv64Imm: // OpSt2BImm under pqr
+			if f.pqr {
+				if !f.moveMem {
+					return pc, due
+				}
+				p := ip.fastWrite(uint64(int64(r[ins.Dst()])+int64(ins.Off())), 2)
+				if p == nil {
+					return pc, due
+				}
+				*(*uint16)(p) = uint16(ins.Uimm())
+			} else {
+				imm := uint64(ins.Imm())
+				if imm == 0 {
+					return pc, due
+				}
+				r[ins.Dst()] /= imm
+			}
+		case OpDiv64Reg: // OpSt2BReg under pqr
+			if f.pqr {
+				if !f.moveMem {
+					return pc, due
+				}
+				p := ip.fastWrite(uint64(int64(r[ins.Dst()])+int64(ins.Off())), 2)
+				if p == nil {
+					return pc, due
+				}
+				*(*uint16)(p) = uint16(r[ins.Src()])
+			} else {
+				src := r[ins.Src()]
+				if src == 0 {
+					return pc, due
+				}
+				r[ins.Dst()] /= src
+			}
+		case OpMod32Reg: // OpLd8BReg under pqr
+			if f.pqr {
+				if !f.moveMem {
+					return pc, due
+				}
+				p := ip.fastRead(uint64(int64(r[ins.Src()])+int64(ins.Off())), 8)
+				if p == nil {
+					return pc, due
+				}
+				r[ins.Dst()] = uint64(*(*uint64)(p))
+			} else {
+				src := uint32(r[ins.Src()])
+				if src == 0 {
+					return pc, due
+				}
+				r[ins.Dst()] = uint64(uint32(r[ins.Dst()]) % src)
+			}
+		case OpMod64Imm: // OpSt8BImm under pqr
+			if f.pqr {
+				if !f.moveMem {
+					return pc, due
+				}
+				p := ip.fastWrite(uint64(int64(r[ins.Dst()])+int64(ins.Off())), 8)
+				if p == nil {
+					return pc, due
+				}
+				*(*uint64)(p) = uint64(ins.Imm())
+			} else {
+				imm := uint64(ins.Imm())
+				if imm == 0 {
+					return pc, due
+				}
+				r[ins.Dst()] %= imm
+			}
+		case OpMod64Reg: // OpSt8BReg under pqr
+			if f.pqr {
+				if !f.moveMem {
+					return pc, due
+				}
+				p := ip.fastWrite(uint64(int64(r[ins.Dst()])+int64(ins.Off())), 8)
+				if p == nil {
+					return pc, due
+				}
+				*(*uint64)(p) = r[ins.Src()]
+			} else {
+				src := r[ins.Src()]
+				if src == 0 {
+					return pc, due
+				}
+				r[ins.Dst()] %= src
+			}
+		// The 4-byte forms have encodings of their own. The immediate store
+		// shares its encoding with neg64, which the versions that relocate
+		// memory instructions disable.
+		case OpLd4BReg:
+			if !f.moveMem {
 				return pc, due
 			}
-			r[ins.Dst()] *= r[ins.Src()]
-		case OpDiv32Reg:
-			src := uint32(r[ins.Src()])
-			if f.pqr || src == 0 {
+			p := ip.fastRead(uint64(int64(r[ins.Src()])+int64(ins.Off())), 4)
+			if p == nil {
 				return pc, due
 			}
-			r[ins.Dst()] = uint64(uint32(r[ins.Dst()]) / src)
-		case OpDiv64Imm:
-			imm := uint64(ins.Imm())
-			if f.pqr || imm == 0 {
+			r[ins.Dst()] = uint64(*(*uint32)(p))
+		case OpSt4BReg:
+			if !f.moveMem {
 				return pc, due
 			}
-			r[ins.Dst()] /= imm
-		case OpDiv64Reg:
-			src := r[ins.Src()]
-			if f.pqr || src == 0 {
+			p := ip.fastWrite(uint64(int64(r[ins.Dst()])+int64(ins.Off())), 4)
+			if p == nil {
 				return pc, due
 			}
-			r[ins.Dst()] /= src
-		case OpMod32Reg:
-			src := uint32(r[ins.Src()])
-			if f.pqr || src == 0 {
+			*(*uint32)(p) = uint32(r[ins.Src()])
+		case OpNeg64: // OpSt4BImm when neg is disabled
+			if !f.disableNeg {
 				return pc, due
 			}
-			r[ins.Dst()] = uint64(uint32(r[ins.Dst()]) % src)
-		case OpMod64Imm:
-			imm := uint64(ins.Imm())
-			if f.pqr || imm == 0 {
+			if !f.moveMem {
 				return pc, due
 			}
-			r[ins.Dst()] %= imm
-		case OpMod64Reg:
-			src := r[ins.Src()]
-			if f.pqr || src == 0 {
+			p := ip.fastWrite(uint64(int64(r[ins.Dst()])+int64(ins.Off())), 4)
+			if p == nil {
 				return pc, due
 			}
-			r[ins.Dst()] %= src
+			*(*uint32)(p) = ins.Uimm()
 		case OpArsh32Imm:
 			r[ins.Dst()] = uint64(uint32(int32(r[ins.Dst()]) >> ins.Uimm()))
 		case OpArsh32Reg:
@@ -393,13 +524,22 @@ func (ip *Interpreter) runFast(r *[16]uint64, pc int64, due, budget uint64, f fa
 		case OpArsh64Reg:
 			r[ins.Dst()] = uint64(int64(r[ins.Dst()]) >> (r[ins.Src()]))
 		case OpCall:
-			// Legacy call immediates may name a syscall in the invocation's
-			// registry, even if they resolved internally at load time. Keep
-			// that lookup on Run's path. Static calls encode the distinction.
-			if !f.staticSyscalls || ins.Src() != 1 {
-				return pc, due
+			// Static calls encode whether they are internal. A legacy call
+			// immediate may name a syscall in the invocation's registry, even
+			// if it resolved internally at load time: that lookup stays on
+			// Run's path unless fastCalls rules it out for this program.
+			var target int64
+			if f.staticSyscalls {
+				if ins.Src() != 1 {
+					return pc, due
+				}
+				target = ip.sbpfVersion.CalculateCallImmTargetPC(pc, ins.Imm())
+			} else {
+				if fastCalls == nil {
+					return pc, due
+				}
+				target = fastCalls[pc]
 			}
-			target := ip.sbpfVersion.CalculateCallImmTargetPC(pc, ins.Imm())
 			if target < 0 || target >= int64(len(text)) {
 				return pc, due
 			}

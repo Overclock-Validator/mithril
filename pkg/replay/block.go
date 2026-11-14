@@ -41,6 +41,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/state"
 	"github.com/Overclock-Validator/mithril/pkg/statsd"
+	"github.com/Overclock-Validator/mithril/pkg/turbine"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
@@ -1653,6 +1654,9 @@ func initializeBlockHeight(rpcc *rpcclient.RpcClient, mithrilState *state.Mithri
 	case resumeState != nil:
 		if resumeState.ParentSlot > 0 && resumeState.ParentBlockHeight == 0 {
 			mlog.Log.Warnf("resume state missing last block height for slot %d; fetching from RPC", resumeState.ParentSlot)
+			if rpcc == nil {
+				return fmt.Errorf("resume state lacks the block height for slot %d and no RPC endpoint is configured to fetch it", resumeState.ParentSlot)
+			}
 			blockResult, err := rpcc.GetBlockConfirmed(resumeState.ParentSlot)
 			if err != nil {
 				return fmt.Errorf("failed to fetch block height for resume slot %d: %w", resumeState.ParentSlot, err)
@@ -1666,6 +1670,9 @@ func initializeBlockHeight(rpcc *rpcclient.RpcClient, mithrilState *state.Mithri
 	case mithrilState != nil:
 		if mithrilState.ManifestParentSlot > 0 && mithrilState.ManifestBlockHeight == 0 {
 			mlog.Log.Warnf("state file missing manifest block height for snapshot slot %d; fetching from RPC", mithrilState.ManifestParentSlot)
+			if rpcc == nil {
+				return fmt.Errorf("state file lacks the block height for snapshot slot %d and no RPC endpoint is configured to fetch it", mithrilState.ManifestParentSlot)
+			}
 			blockResult, err := rpcc.GetBlockConfirmed(mithrilState.ManifestParentSlot)
 			if err != nil {
 				return fmt.Errorf("failed to fetch block height for snapshot slot %d: %w", mithrilState.ManifestParentSlot, err)
@@ -1907,7 +1914,11 @@ func ReplayBlocks(
 	// RPC client for cluster data. Verifying/RPC-source flows may fetch blocks;
 	// validator mode restricts it to control-plane queries.
 	// First endpoint is primary, rest are backups for failover
-	rpcc := rpcclient.NewRpcClient(rpcEndpoints[0])
+	// Offline replay configures no endpoint and gets a nil client.
+	var rpcc *rpcclient.RpcClient
+	if len(rpcEndpoints) > 0 {
+		rpcc = rpcclient.NewRpcClient(rpcEndpoints[0])
+	}
 	var rpcBackups []string
 	if len(rpcEndpoints) > 1 {
 		rpcBackups = rpcEndpoints[1:]
@@ -2244,7 +2255,9 @@ func ReplayBlocks(
 	// chain decisions, including ancestry discovered after a certificate.
 	switchSweeper := newAlpenglowSwitchSweeper(consensusEngine)
 
-	if TrailingVerifierCfg.Enabled {
+	if TrailingVerifierCfg.Enabled && len(rpcEndpoints) == 0 {
+		mlog.Log.Warnf("trailing verifier disabled: it compares against an RPC endpoint and none is configured")
+	} else if TrailingVerifierCfg.Enabled {
 		trailingVerifier = newTrailingVerifier(&rpcVerificationSource{rpcc: rpcclient.NewRpcClient(rpcEndpoints[0])}, TrailingVerifierCfg)
 		go trailingVerifier.Run(ctx)
 		// Publish a run-local tx-capture registry for the verifier's lifetime and
@@ -2808,6 +2821,7 @@ func ReplayBlocks(
 	// reads it to attribute a child's open delay to its parent's arrival, its
 	// parent's replay, or the loop itself.
 	var frontierMark streamingFrontierMark
+	runtimeSampler := newRuntimeInterferenceSampler()
 	if blockStream.StreamEvents() != nil {
 		var onStreamOpen func(uint64)
 		if prefetcher != nil {
@@ -2848,7 +2862,11 @@ func ReplayBlocks(
 			StreamingExecutionCfg.workers(txParallelism), StreamingExecutionCfg.MinGroupBatches, StreamingExecutionCfg.maxOpenAge())
 	}
 
+	if hook := BeforeReplayLoop; hook != nil && ReplayReadyAt.Load() == 0 {
+		hook()
+	}
 	lastRowAt := time.Now()
+	ReplayReadyAt.CompareAndSwap(0, lastRowAt.UnixNano())
 	for {
 		// The collector is per replay attempt. Discarded candidates, skipped
 		// slots, and typed-recovery exits must never leak timings into the next
@@ -2869,6 +2887,12 @@ func ReplayBlocks(
 			waitTime        time.Duration
 			neededAt        time.Time // when replay asked the source for this slot
 			admittedAt      time.Time // when the source handed replay this input
+			// parentMark is the last replayed block as this one was admitted,
+			// and handedOffAt when this block's result reached consensus;
+			// both feed the row's TipPath.
+			parentMark               streamingFrontierMark
+			handedOffAt              time.Time
+			newestShredSlotAtHandoff uint64
 		)
 
 		{
@@ -2916,6 +2940,7 @@ func ReplayBlocks(
 
 			admittedAt = time.Now()
 			waitTime = admittedAt.Sub(neededAt)
+			parentMark = frontierMark
 
 			if stallDone != nil {
 				close(stallDone)
@@ -3126,11 +3151,12 @@ func ReplayBlocks(
 			// Advance the certificate-finality watermark. Prefer engine
 			// cert-finality; fall back to the RPC-attested finalized slot
 			// (delegated) since an unstaked observer gets no certs. Poll
-			// throttled (the RPC round-trip is slow).
+			// throttled (the RPC round-trip is slow). Offline replay has no
+			// fallback: footer certificates alone advance the root.
 			rooted, ok := uint64(0), false
 			if certRooted, certOk := alpenglowRootedSlot(consensusEngine); certOk {
 				rooted, ok = certRooted, true
-			} else {
+			} else if DelegatedFinalityEnabled && rpcc != nil {
 				if time.Since(delegatedFinalizedAt) > 2*time.Second {
 					// Record the attempt time regardless of outcome, so an RPC
 					// outage doesn't re-issue a blocking poll on every block.
@@ -3511,11 +3537,12 @@ func ReplayBlocks(
 				break
 			}
 		}
-		recordFullToReplayed(block)
+		handedOffAt = recordFullToReplayed(block)
+		newestShredSlotAtHandoff = turbine.NewestDataShredSlot()
 		// The same instant FullToReplayed ends at: from here to the next wait
 		// entry is this block's post-replay tail, which a child's open timeline
 		// reports as OpenWaitPostReplay.
-		frontierMark = streamingFrontierMark{slot: block.Slot, fullNanos: block.ShredFullNanos, admittedAt: admittedAt, replayedAt: time.Now()}
+		frontierMark = streamingFrontierMark{slot: block.Slot, fullNanos: block.ShredFullNanos, admittedAt: admittedAt, replayedAt: handedOffAt}
 
 		if rpcServer != nil {
 			rpcServer.SetSlotCtx(lastSlotCtx)
@@ -3685,9 +3712,14 @@ func ReplayBlocks(
 		// Stop before per-slot logging, summary generation, and metric export so
 		// PostProcessBlock accounts only for execution-critical state publication.
 		slotReplayEnd := time.Now()
+		metrics.GlobalBlockReplay.CompletedUnixNano = slotReplayEnd.UnixNano()
 		metrics.GlobalBlockReplay.PostProcessBlock.AddTiming(slotReplayEnd.Sub(postProcessBlockStart))
 		slotReplayDuration := slotReplayEnd.Sub(start)
 		metrics.GlobalBlockReplay.SlotReplay.AddTiming(slotReplayDuration)
+		// Streamed execution before SlotReplay began is part of this block's
+		// cost; without it a block streamed near the tip looks almost free.
+		replayWork := slotReplayDuration + time.Duration(metrics.GlobalBlockReplay.StreamingExecution.TxLoopBeforeReplay.SumNanoseconds)
+		metrics.GlobalBlockReplay.ReplayWork.AddTiming(replayWork)
 		if promoter != nil {
 			metrics.GlobalBlockReplay.FoldOverlap.AddTiming(promoter.busyThrough(slotReplayEnd) - foldBusyAtStart)
 		}
@@ -3695,6 +3727,7 @@ func ReplayBlocks(
 		txnCount := len(block.Transactions)
 		totalCU := lastSlotCtx.TotalComputeUnitsConsumed
 		metrics.GlobalBlockReplay.ComputeUnitsConsumed = totalCU
+		metrics.GlobalBlockReplay.Transactions = uint64(txnCount)
 
 		// Get leader from block (set by configureBlock in live mode, or by block source in verify mode)
 		leaderStr := "unknown"
@@ -3706,7 +3739,9 @@ func ReplayBlocks(
 		// blocks (never fabricated for RPC/file). ready = assembly completion
 		// minus when replay asked for the slot (negative: ready that long
 		// early; positive: replay waited); asm = first shred -> full.
-		execMsLine := slotReplayDuration.Seconds() * 1000
+		// exec is the block's replay work, including execution streamed
+		// before the block was complete.
+		execMsLine := replayWork.Seconds() * 1000
 		hasShreds := block.ShredFirstNanos > 0 && block.ShredFullNanos > 0
 		var readySecsLine, asmSecsLine float64
 		if hasShreds {
@@ -3721,8 +3756,8 @@ func ReplayBlocks(
 				voteTxCount++
 			}
 		}
-		mlog.Log.FileOnlyf("slot %d detail | leader %s | txns v:%d nv:%d | exec %.3fs | wait %.3fs | total %.3fs",
-			block.Slot, leaderStr, voteTxCount, txnCount-voteTxCount, slotReplayDuration.Seconds(), waitTime.Seconds(), (waitTime + slotReplayDuration).Seconds())
+		mlog.Log.FileOnlyf("slot %d detail | leader %s | txns v:%d nv:%d | exec %.3fs | wait %.3fs | total %.3fs | work %.3fs",
+			block.Slot, leaderStr, voteTxCount, txnCount-voteTxCount, slotReplayDuration.Seconds(), waitTime.Seconds(), (waitTime + slotReplayDuration).Seconds(), replayWork.Seconds())
 
 		// Write bankhash to log file
 		if bankhashLogFile != nil {
@@ -3731,6 +3766,7 @@ func ReplayBlocks(
 
 		statsd.Count(statsd.SlotReplays, 1, nil)
 		statsd.Timing(statsd.SlotReplayDurationMs, uint64(slotReplayDuration.Nanoseconds())/1e6, nil)
+		statsd.Timing(statsd.SlotReplayWorkMs, uint64(replayWork.Nanoseconds())/1e6, nil)
 		statsd.Gauge(statsd.Epoch, float64(block.Epoch), nil)
 		statsd.Gauge(statsd.Slot, float64(block.Slot), nil)
 		statsd.Timing(statsd.TxsPerBlock, uint64(len(block.Transactions)), nil)
@@ -3742,7 +3778,7 @@ func ReplayBlocks(
 
 		if !justCrossedEpochBoundary {
 			statsCounter++
-			execTimes = append(execTimes, slotReplayDuration.Seconds())
+			execTimes = append(execTimes, replayWork.Seconds())
 			cuValues = append(cuValues, totalCU)
 			txnCounts = append(txnCounts, uint64(txnCount))
 			if txnCount == 0 {
@@ -3931,6 +3967,12 @@ func ReplayBlocks(
 		{
 			metrics.GlobalBlockReplay.Slot = block.Slot
 			rowAt := time.Now()
+			tipIn := newTipPathInput(block, ingressTimings, parentMark, admittedAt, start, handedOffAt)
+			tipIn.newestShredSlot = newestShredSlotAtHandoff
+			tipIn.forkSwitch = parentSwitch != nil || certifiedSwitch != nil
+			recordTipPath(&metrics.GlobalBlockReplay.TipPath, tipIn)
+			runtimeSampler.record(&metrics.GlobalBlockReplay.RuntimeInterference)
+			metrics.GlobalBlockReplay.VoteEvents, metrics.GlobalBlockReplay.VoteEventsDropped = metrics.DrainVoteEvents()
 			recordUnrootedTail(unrootedTailState)
 			recordReplayLoopClosure(rowAt, lastRowAt, iterationStart, waitTime, slotReplayEnd, block.Slot)
 			lastRowAt = rowAt
@@ -4145,7 +4187,7 @@ func EncodeRecentBlockhashes(sysvar *sealevel.SysvarRecentBlockhashes) []state.B
 	result := make([]state.BlockhashEntry, 0, len(*sysvar))
 	for _, entry := range *sysvar {
 		result = append(result, state.BlockhashEntry{
-			Blockhash:            base58.Encode(entry.Blockhash[:]),
+			Blockhash:            encodeHashCached(entry.Blockhash),
 			LamportsPerSignature: entry.FeeCalculator.LamportsPerSignature,
 		})
 	}
@@ -4162,7 +4204,7 @@ func EncodeSlotHashes(sysvar *sealevel.SysvarSlotHashes) []state.SlotHashEntry {
 	for _, entry := range *sysvar {
 		result = append(result, state.SlotHashEntry{
 			Slot: entry.Slot,
-			Hash: base58.Encode(entry.Hash[:]),
+			Hash: encodeHashCached(entry.Hash),
 		})
 	}
 	return result
@@ -4762,15 +4804,18 @@ func ProcessBlock(
 // recordFullToReplayed measures the vote-path latency replay controls for a
 // turbine block: from the assembler's full-assembly instant (the last shred,
 // carried as ShredFullNanos) to the replay result reaching consensus. Blocks
-// that did not arrive as shreds carry no full instant and record nothing.
-func recordFullToReplayed(block *b.Block) {
+// that did not arrive as shreds carry no full instant and record nothing. It
+// returns the hand-off instant it measured to.
+func recordFullToReplayed(block *b.Block) time.Time {
+	now := time.Now()
 	if block == nil || block.ShredFullNanos <= 0 {
-		return
+		return now
 	}
-	fullToReplayed := time.Since(time.Unix(0, block.ShredFullNanos))
+	fullToReplayed := now.Sub(time.Unix(0, block.ShredFullNanos))
 	if fullToReplayed <= 0 {
-		return
+		return now
 	}
 	metrics.GlobalBlockReplay.FullToReplayed.AddTiming(fullToReplayed)
 	_ = statsd.Duration(statsd.ReplayFullToReplayed, fullToReplayed, nil)
+	return now
 }

@@ -608,9 +608,9 @@ func runFoldJob(committer batchCommitter, job *foldJob) (err error) {
 	var prepare, stakeFlush, commit, cleanup time.Duration
 	var result accountsdb.BatchCommitResult
 	describe := func() string {
-		return fmt.Sprintf("fold through slot %d: %d keys, %d MiB | checkpoint_prepare=%s stake_flush=%s commit=%s (%s) cleanup=%s",
+		return fmt.Sprintf("fold through slot %d: %d keys, %d MiB | checkpoint_prepare=%s stake_flush=%s commit=%s (%s) cleanup=%s | %s",
 			through, result.Keys, result.Bytes>>20, prepare.Round(time.Microsecond), stakeFlush.Round(time.Microsecond),
-			commit.Round(time.Microsecond), result.Timings, cleanup.Round(time.Microsecond))
+			commit.Round(time.Microsecond), result.Timings, cleanup.Round(time.Microsecond), result.Writeback)
 	}
 	defer func() {
 		total := run.EndErr(err, describe)

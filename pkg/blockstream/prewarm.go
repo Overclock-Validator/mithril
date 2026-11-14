@@ -148,6 +148,9 @@ func StartTurbinePrewarm(cfg TurbinePrewarmConfig) (*TurbinePrewarm, error) {
 			mlog.Log.FileOnlyf("prewarm shred spool disabled: %v", serr)
 		} else {
 			receiver.SetShredSpool(spool)
+			if dir, aerr := turbine.ArchiveFromEnv(spool); aerr != nil {
+				mlog.Log.FileOnlyf("prewarm shred archive disabled (%s): %v", dir, aerr)
+			}
 			// Assemble the resume-adjacent window in RAM; spool the far
 			// edge to disk only.
 			receiver.SetHydrationWindow(cfg.FloorSlot, cfg.FloorSlot+repairCatchupLiveDeliverWindow)

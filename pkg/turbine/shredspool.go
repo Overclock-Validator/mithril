@@ -50,6 +50,9 @@ type ShredSpool struct {
 	haveHighest     bool
 	floor           uint64
 	closed          bool
+	// archiveDir, when set, receives slot files the retention floor drops
+	// instead of their being deleted (SetArchive).
+	archiveDir string
 }
 
 // SpoolSlotMeta records a slot proven FULLY assembled: every data shred
@@ -237,7 +240,7 @@ func spoolSlotFromName(name string) (uint64, bool) {
 }
 
 func (s *ShredSpool) pathFor(slot uint64) string {
-	return filepath.Join(s.dir, fmt.Sprintf("s%d.shreds", slot))
+	return filepath.Join(s.dir, SpoolFileName(slot))
 }
 
 // Append stores one verified shred packet under its slot. It consumes packet
@@ -388,6 +391,13 @@ func (s *ShredSpool) ensureRoomLocked(slot uint64, additional int64) bool {
 }
 
 func (s *ShredSpool) dropSlotLocked(slot uint64) bool {
+	return s.removeSlotLocked(slot, false)
+}
+
+// removeSlotLocked takes slot out of the spool. With archive set and an
+// archive directory configured, the slot's file moves there instead of being
+// deleted.
+func (s *ShredSpool) removeSlotLocked(slot uint64, archive bool) bool {
 	if err := s.invalidateCompleteLocked(slot); err != nil {
 		mlog.Log.Warnf("shred spool: retaining slot %d after completion invalidation failed: %v", slot, err)
 		return false
@@ -398,7 +408,14 @@ func (s *ShredSpool) dropSlotLocked(slot uint64) bool {
 	delete(s.seen, slot)
 	delete(s.validated, slot)
 	delete(s.complete, slot)
-	_ = os.Remove(s.pathFor(slot))
+	if archive && s.archiveDir != "" {
+		if err := moveFile(s.pathFor(slot), filepath.Join(s.archiveDir, SpoolFileName(slot))); err != nil {
+			mlog.Log.Warnf("shred spool: archiving slot %d failed, deleting it: %v", slot, err)
+			_ = os.Remove(s.pathFor(slot))
+		}
+	} else {
+		_ = os.Remove(s.pathFor(slot))
+	}
 	if s.haveHighest && slot == s.highestSlot {
 		s.recomputeHighestLocked()
 	}
@@ -485,6 +502,25 @@ func (s *ShredSpool) readSlotLocked(slot uint64) ([][]byte, error) {
 		s.dropSlotLocked(slot)
 		return nil, fmt.Errorf("invalid shred spool header for slot %d", slot)
 	}
+	packets, validEnd := parseSpoolRecords(data)
+	if validEnd != len(data) {
+		if err := s.invalidateCompleteLocked(slot); err != nil {
+			return nil, err
+		}
+		if err := os.Truncate(path, int64(validEnd)); err != nil {
+			return nil, fmt.Errorf("truncate corrupt shred spool tail for slot %d: %w", slot, err)
+		}
+		oldSize := s.sizes[slot]
+		s.sizes[slot] = int64(validEnd)
+		s.bytes += int64(validEnd) - oldSize
+	}
+	s.validated[slot] = true
+	return packets, nil
+}
+
+// parseSpoolRecords returns the intact packets of a slot file that starts
+// with the spool magic, and the offset where the intact records end.
+func parseSpoolRecords(data []byte) ([][]byte, int) {
 	var packets [][]byte
 	validEnd := len(spoolFileMagic)
 	for off := validEnd; off < len(data); {
@@ -506,20 +542,51 @@ func (s *ShredSpool) readSlotLocked(slot uint64) ([][]byte, error) {
 		off = packetEnd
 		validEnd = packetEnd
 	}
-	if validEnd != len(data) {
-		if err := s.invalidateCompleteLocked(slot); err != nil {
-			return nil, err
-		}
-		if err := os.Truncate(path, int64(validEnd)); err != nil {
-			return nil, fmt.Errorf("truncate corrupt shred spool tail for slot %d: %w", slot, err)
-		}
-		oldSize := s.sizes[slot]
-		s.sizes[slot] = int64(validEnd)
-		s.bytes += int64(validEnd) - oldSize
+	return packets, validEnd
+}
+
+// ReadSpoolFile reads one spooled slot file without opening the spool, so a
+// frozen corpus is never modified. A torn or corrupt record is an error.
+func ReadSpoolFile(path string) ([][]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
 	}
-	s.validated[slot] = true
+	if len(data) < len(spoolFileMagic) || string(data[:len(spoolFileMagic)]) != string(spoolFileMagic[:]) {
+		return nil, fmt.Errorf("%s: not a shred spool file", path)
+	}
+	packets, validEnd := parseSpoolRecords(data)
+	if validEnd != len(data) {
+		return nil, fmt.Errorf("%s: corrupt record at byte %d", path, validEnd)
+	}
 	return packets, nil
 }
+
+// ReadSpoolFileIntact reads one spooled slot file without opening the spool,
+// keeping every intact record. A torn or corrupt tail, as a node stopped
+// mid-append leaves, is skipped and reported by torn.
+func ReadSpoolFileIntact(path string) (packets [][]byte, torn bool, err error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(data) < len(spoolFileMagic) || string(data[:len(spoolFileMagic)]) != string(spoolFileMagic[:]) {
+		return nil, false, fmt.Errorf("%s: not a shred spool file", path)
+	}
+	packets, validEnd := parseSpoolRecords(data)
+	return packets, validEnd != len(data), nil
+}
+
+// SpoolSlotFromName parses a spool file name (s<slot>.shreds).
+func SpoolSlotFromName(name string) (uint64, bool) { return spoolSlotFromName(name) }
+
+// SpoolFileName is the name of slot's file in a spool directory.
+func SpoolFileName(slot uint64) string {
+	return fmt.Sprintf("s%d.shreds", slot)
+}
+
+// SpoolJournalName is the spool's completion index file.
+const SpoolJournalName = spoolJournalName
 
 // CompleteParents returns the parent slot of every complete spooled slot in
 // [lo, hi], read from the slot's first intact data shred and cached until the
@@ -609,9 +676,70 @@ func (s *ShredSpool) SetFloor(slot uint64) {
 	s.floor = slot
 	for spooled := range s.sizes {
 		if spooled < slot {
-			s.dropSlotLocked(spooled)
+			s.removeSlotLocked(spooled, true)
 		}
 	}
+}
+
+// SetArchive keeps every slot the retention floor drops: its file moves into
+// dir instead of being deleted. Slots dropped for space or discarded as
+// invalid are still deleted. A node run with an archive keeps the shreds of
+// every block it replayed, for building a replay corpus afterwards (mithril
+// corpus from-spool).
+func (s *ShredSpool) SetArchive(dir string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.archiveDir = dir
+	return nil
+}
+
+// ShredArchiveEnv names the environment variable that turns on SetArchive for
+// a node's shred spool.
+const ShredArchiveEnv = "MITHRIL_SHRED_ARCHIVE_DIR"
+
+// ArchiveFromEnv calls SetArchive with the directory ShredArchiveEnv names,
+// if any, and reports the directory it set.
+func ArchiveFromEnv(s *ShredSpool) (string, error) {
+	dir := os.Getenv(ShredArchiveEnv)
+	if dir == "" || s == nil {
+		return "", nil
+	}
+	return dir, s.SetArchive(dir)
+}
+
+// moveFile renames src to dst, copying across filesystems. An existing dst
+// (the same slot archived by an earlier run) is replaced.
+func moveFile(src, dst string) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	tmp := dst + ".tmp"
+	out, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Remove(src)
 }
 
 // Stats reports spooled slot count and total bytes.

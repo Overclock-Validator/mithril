@@ -18,6 +18,12 @@ import (
 	"github.com/gagliardetto/solana-go"
 )
 
+// DelegatedFinalityEnabled lets replay take the cluster's finalized slot from
+// RPC while the engine has no finalization certificate of its own (an unstaked
+// observer may see none). Offline replay turns it off, so the root advances
+// only from block footer certificates and no RPC call sits in the replay loop.
+var DelegatedFinalityEnabled = true
+
 // alpenglowRootedSlot returns the highest slot the engine has seen a finalization
 // certificate for — the Alpenglow finality watermark that drives promotion, the
 // certificate-based counterpart to TowerBFT's HighestRootedSlot.

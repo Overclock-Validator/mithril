@@ -1,5 +1,7 @@
 # Mithril
 
+> **Unaudited software. Use at your own risk.** Mithril has not been through a security audit for at least a year and is provided "as is" under its open-source license. See the [disclaimer](docs/DISCLAIMER.md) before running it.
+
 Mithril is a Solana validator client (Alpenglow), and Solana full node client (Alpenglow & pre-Alpenglow) written in Golang. 
 
 Mithril was originally built for the purpose of serving as a "verifying full node" with lower hardware requirements than that of Solana validators and RPC nodes. Now that Mithril has begun its journey as a validator implementation, we still aim for Mithril to be deployable on accessible server platforms. This project is being developed upon the foundations of [Radiance](https://github.com/firedancer-io/radiance), which was built by Richard Patel (@ripatel) with contributions from @leoluk.
@@ -304,7 +306,7 @@ See [COMPATIBILITY.md](COMPATIBILITY.md) for supported networks and feature gate
 - **Status**: Mithril can retrieve and replay current MainnetBeta blocks. There are rare bankhash mismatches that we are actively investigating.
 
 ### Milestone 3 (In Progress): Alpha Release and System Optimization
-- First formal audit (https://runtimeverification.com/ team is nearing end of audit). Includes development and intensive use of a robust and comprehensive 'conformance suite' for verification of compliance of the VM, interpreter, and runtime as a complete unit. Differential fuzzing will be used to detect differences versus relevant versions of the Labs client, and guided fuzzing will be used generally to uncover security and loss-of-availability issues. Any bugs identified during this phase will be remediated.
+- First formal audit. No audit is in progress at present, and the code has not been audited for at least a year (see the [disclaimer](docs/DISCLAIMER.md)). This milestone includes development and intensive use of a robust and comprehensive 'conformance suite' for verification of compliance of the VM, interpreter, and runtime as a complete unit. Differential fuzzing will be used to detect differences versus relevant versions of the Labs client, and guided fuzzing will be used generally to uncover security and loss-of-availability issues. Any bugs identified during this phase will be remediated.
 - Thorough optimization work on entire system, including on components such as the Virtual Machine and AccountsDB.
 - Consensus verification implementation (landed on this branch: the Alpenglow certificate engine drives fork choice and durable-state promotion).
 - Direct shred replay support (landed on this branch: native turbine is the default Alpenglow block source; classic clusters default to RPC).

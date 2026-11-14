@@ -13,6 +13,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/alpenglow"
 	"github.com/Overclock-Validator/mithril/pkg/identity"
+	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/gagliardetto/solana-go"
 )
@@ -844,6 +845,7 @@ func (v *alpenglowVoter) castTarget(vote alpenglow.Vote, restoring bool, guarded
 	if err := v.broadcaster.Enqueue(alpenglow.Message{Vote: &message}); err != nil {
 		return false, fmt.Errorf("broadcast persisted %s vote at slot %d: %w", vote.Type, vote.Slot, err)
 	}
+	metrics.RecordVoteEvent(vote.Slot, string(vote.Type), metrics.VoteQueued, 0, time.Now())
 	v.markVotingStarted(vote.Slot, "vote")
 	v.landingMu.Lock()
 	v.stats.VotesCastThisRun++

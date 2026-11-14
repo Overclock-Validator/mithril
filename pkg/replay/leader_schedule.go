@@ -15,6 +15,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
+	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/config"
 	"github.com/Overclock-Validator/mithril/pkg/epochstakes"
 	"github.com/Overclock-Validator/mithril/pkg/global"
@@ -134,6 +135,14 @@ type VoteCacheRebuildError struct {
 	Stake    uint64
 	Reason   string
 	Err      error
+}
+
+// isLiveVoteAccount reports whether acct is one Agave's stakes cache admits as
+// a vote account (runtime/src/stakes.rs check_and_store): owned by the vote
+// program and holding lamports. The transaction path keeps the vote cache by
+// the same rule (recordStakeAndVoteAccount).
+func isLiveVoteAccount(acct *accounts.Account) bool {
+	return acct != nil && acct.Lamports != 0 && acct.Owner == addresses.VoteProgramAddr
 }
 
 // RebuildVoteCacheFromAccountsDB rebuilds the VoteCache from AccountsDB for all vote accounts
@@ -258,6 +267,26 @@ func rebuildVoteCacheFromAccountsDB(
 			firstErrorOnce.Do(func() {
 				firstError = fmt.Errorf("missing vote account %s (stake=%d): %w", item.pk, item.stake, err)
 			})
+			return
+		}
+
+		// A stake delegation can outlive its vote account, and the address
+		// can then be recreated under another owner with arbitrary data.
+		// Agave never treats such an account as a vote account; never decode it.
+		if !isLiveVoteAccount(voteAcct) {
+			global.DeleteVoteCacheItem(item.pk)
+			missingCount.Add(1)
+			missingStake.Add(item.stake)
+			errorsMu.Lock()
+			if len(missingErrors) < maxErrorsPerCategory {
+				missingErrors = append(missingErrors, VoteCacheRebuildError{
+					VoteAcct: item.pk,
+					Stake:    item.stake,
+					Reason:   "not_a_vote_account",
+					Err:      fmt.Errorf("owner=%s lamports=%d", solana.PublicKey(voteAcct.Owner), voteAcct.Lamports),
+				})
+			}
+			errorsMu.Unlock()
 			return
 		}
 

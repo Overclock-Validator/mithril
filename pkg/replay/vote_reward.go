@@ -277,22 +277,30 @@ func ApplyAlpenglowVoteRewards(
 		if err != nil {
 			return fmt.Errorf("slot %d vote rewards: load leader vote %s: %w", block.Slot, leaderVote, err)
 		}
-		applied, err := applyLeaderVoteReward(acct, currentEpoch, migrationEpoch, leaderRewardAccum)
-		if err != nil {
-			return fmt.Errorf("slot %d vote rewards: leader vote %s: %w", block.Slot, leaderVote, err)
-		}
-		if !applied {
-			return fmt.Errorf("slot %d vote rewards: leader vote %s: apply returned false", block.Slot, leaderVote)
-		}
-		if parent != nil {
-			recordParentImage(slotCtx, leaderVote, parent)
-		}
-		if err := slotCtx.SetAccount(leaderVote, acct); err != nil {
-			return fmt.Errorf("slot %d vote rewards: set leader vote %s: %w", block.Slot, leaderVote, err)
-		}
-		slotCtx.RecordModifiedAcct(leaderVote)
-		if !leaderUpdatedInUnion {
-			voteAccountsUpdated++
+		// Agave pays the leader only through an account in its vote-account
+		// cache (block_component_processor/vote_reward.rs VoteState::try_new)
+		// and otherwise skips the reward. The address may have been closed and
+		// recreated under another owner: never decode or write it.
+		if !isLiveVoteAccount(acct) {
+			mlog.Log.Infof("slot %d vote rewards: skip leader reward, %s is not a vote account", block.Slot, leaderVote)
+		} else {
+			applied, err := applyLeaderVoteReward(acct, currentEpoch, migrationEpoch, leaderRewardAccum)
+			if err != nil {
+				return fmt.Errorf("slot %d vote rewards: leader vote %s: %w", block.Slot, leaderVote, err)
+			}
+			if !applied {
+				return fmt.Errorf("slot %d vote rewards: leader vote %s: apply returned false", block.Slot, leaderVote)
+			}
+			if parent != nil {
+				recordParentImage(slotCtx, leaderVote, parent)
+			}
+			if err := slotCtx.SetAccount(leaderVote, acct); err != nil {
+				return fmt.Errorf("slot %d vote rewards: set leader vote %s: %w", block.Slot, leaderVote, err)
+			}
+			slotCtx.RecordModifiedAcct(leaderVote)
+			if !leaderUpdatedInUnion {
+				voteAccountsUpdated++
+			}
 		}
 	}
 
@@ -336,6 +344,11 @@ func applyVoteAccountUpdates(slotCtx *sealevel.SlotCtx, u *voteAccountUpdate) (u
 		acct, parent, err := loadAccountLiveOrParentForReplay(slotCtx, votePubkey)
 		if err != nil {
 			mlog.Log.Infof("slot %d vote rewards: skip missing vote account %s: %v", u.slot, votePubkey, err)
+			return nil, nil
+		}
+		if !isLiveVoteAccount(acct) {
+			// Agave only rewards accounts in its vote-account cache.
+			mlog.Log.Infof("slot %d vote rewards: skip %s, not a vote account", u.slot, votePubkey)
 			return nil, nil
 		}
 		_, inReward := u.rewardValidators[votePubkey]

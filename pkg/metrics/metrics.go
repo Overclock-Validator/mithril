@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -236,6 +237,154 @@ type VoteRewardDetails struct {
 	VoteAccountsUpdated  uint64
 }
 
+// TipPath accounts for a turbine block's vote-path latency, from the kernel
+// receiving the shred that completed the block to the replay result reaching
+// consensus. Every interval is measured in this process from wall-clock
+// instants and the intervals are consecutive, so
+//
+//	FullToReplayed = FullToReady + WaitParentArrival + WaitParentReplay +
+//	                 LoopUntilAdmitted + WaitUnclassified + AdmittedToReplay +
+//	                 ReplayToHandoff + Unattributed
+//
+// with Unattributed holding whatever the instants could not place (a missing
+// instant, or a clock step). ReceiveToFull lies before FullToReplayed.
+//
+// WaitParentArrival is the only interval set by the network: the block was
+// ready but its parent's last shred had not yet arrived. Every other interval
+// is Mithril's own work or queueing.
+type TipPath struct {
+	// ShredReceivedNanos is the kernel's receive time (Linux SO_TIMESTAMPNS,
+	// unix nanoseconds) of the shred whose arrival completed the block; zero
+	// when unknown (other platforms, recovered or repaired completions).
+	ShredReceivedNanos int64
+	// ReceiveToFull runs from that receive time to the block being
+	// assembled full: socket queueing, shred parsing and signature checks,
+	// FEC recovery and assembly.
+	ReceiveToFull Timing
+	// HandedOffNanos is when the replay result reached consensus (unix
+	// nanoseconds), the end of FullToReplayed; votes in VoteEvents join to
+	// it by slot.
+	HandedOffNanos int64
+	// LastShredToReplayed runs from the last shred to the replay result
+	// reaching consensus: from its kernel receive time when known (then it
+	// is ReceiveToFull + FullToReplayed), otherwise from full assembly.
+	LastShredToReplayed Timing
+	// Where the block's data shreds came from: DataShreds in the block,
+	// RepairedShreds delivered by repair, RecoveredShreds rebuilt from
+	// coding shreds.
+	DataShreds      int
+	RepairedShreds  int
+	RecoveredShreds int
+	// TipLagSlots is how far the newest data shred slot this process had
+	// received was ahead of this block at hand-off; ForkSwitch is set when
+	// replay switched forks to reach this block.
+	TipLagSlots uint64
+	ForkSwitch  bool
+	// FullToReady is block completion: decode and outstanding transaction
+	// signature verification (TurbineIngress.FullToReady).
+	FullToReady Timing
+	// The wait from ready to the replay loop admitting the block, split by
+	// what it waited on. WaitParentArrival: the parent's last shred had not
+	// arrived. WaitParentReplay: the parent was replaying. LoopUntilAdmitted:
+	// the rest, the loop finishing the parent's post-replay tail, running
+	// this block's streamed execution, or other loop work. WaitUnclassified:
+	// the parent's instants were unknown (first block, fork switch).
+	WaitParentArrival Timing
+	WaitParentReplay  Timing
+	LoopUntilAdmitted Timing
+	WaitUnclassified  Timing
+	// AdmittedToReplay is setup between admission and SlotReplay's start.
+	AdmittedToReplay Timing
+	// ReplayToHandoff runs from SlotReplay's start to the result reaching
+	// consensus, inside SlotReplay.
+	ReplayToHandoff Timing
+	Unattributed    Timing
+}
+
+// RuntimeInterference is Go runtime activity over one row's window, read from
+// runtime/metrics. Pause and latency maxima are bucket upper bounds of the
+// runtime's histograms, so they bound rather than equal the true values.
+type RuntimeInterference struct {
+	GCCycles uint64
+	// GCPauseCPU is CPU time in stop-the-world GC phases summed over all Ps;
+	// GCAssistCPU is mutator time spent assisting the GC.
+	GCPauseCPU  Timing
+	GCAssistCPU Timing
+	// GCPauseMax bounds the longest stop-the-world GC pause in the window.
+	GCPauseMax Timing
+	// SchedLatencyMax bounds the longest wait of a runnable goroutine for a
+	// thread; SchedLatencyOver1ms counts waits longer than 1 ms.
+	SchedLatencyMax     Timing
+	SchedLatencyOver1ms uint64
+	// KernelShredDrops counts shred packets the kernel dropped because a
+	// receive socket's buffer was full (Linux SO_RXQ_OVFL); zero elsewhere.
+	KernelShredDrops uint64
+	// Process context switches (involuntary: preempted by the kernel) and
+	// page faults (major: needed disk I/O), from getrusage.
+	InvoluntaryContextSwitches uint64
+	VoluntaryContextSwitches   uint64
+	MajorPageFaults            uint64
+	MinorPageFaults            uint64
+	// PressureCPU/IO/Memory are the host's pressure-stall time (Linux PSI
+	// "some": at least one task stalled on the resource). They are
+	// system-wide, not this process's; zero where PSI is unavailable.
+	PressureCPU    Timing
+	PressureIO     Timing
+	PressureMemory Timing
+}
+
+// Stages a vote passes through on its way out.
+const (
+	// VoteQueued: signed, recorded in vote history and queued for broadcast.
+	VoteQueued = "queued"
+	// VoteFirstSend: the first peer's copy was handed to QUIC.
+	VoteFirstSend = "first_send"
+	// VoteFanoutDone: every connected peer's copy was sent or failed; Peers
+	// counts the copies sent.
+	VoteFanoutDone = "fanout_done"
+)
+
+// VoteEvent is one stage of one vote this node cast.
+type VoteEvent struct {
+	Slot    uint64
+	Type    string
+	Stage   string
+	Peers   int   `json:",omitempty"`
+	AtNanos int64 // unix nanoseconds
+}
+
+// voteEvents holds vote stages since the replay loop last drained them; it is
+// bounded so a node whose replay loop is not writing rows cannot grow it.
+var voteEvents struct {
+	sync.Mutex
+	pending []VoteEvent
+	dropped uint64
+}
+
+const maxPendingVoteEvents = 512
+
+// RecordVoteEvent notes one stage of a vote.
+func RecordVoteEvent(slot uint64, voteType, stage string, peers int, at time.Time) {
+	voteEvents.Lock()
+	defer voteEvents.Unlock()
+	if len(voteEvents.pending) >= maxPendingVoteEvents {
+		copy(voteEvents.pending, voteEvents.pending[1:])
+		voteEvents.pending = voteEvents.pending[:len(voteEvents.pending)-1]
+		voteEvents.dropped++
+	}
+	voteEvents.pending = append(voteEvents.pending, VoteEvent{Slot: slot, Type: voteType, Stage: stage, Peers: peers, AtNanos: at.UnixNano()})
+}
+
+// DrainVoteEvents returns the vote stages since the last call, oldest first,
+// and how many older ones were dropped because nobody drained them.
+func DrainVoteEvents() ([]VoteEvent, uint64) {
+	voteEvents.Lock()
+	defer voteEvents.Unlock()
+	out, dropped := voteEvents.pending, voteEvents.dropped
+	voteEvents.pending, voteEvents.dropped = nil, 0
+	return out, dropped
+}
+
 // StreamingExecution records execution that ran while a block's shreds were
 // still arriving. Groups are the contiguous ready-batch sets executed per
 // wake-up; Transactions counts what they executed. TxLoopBeforeFull is the
@@ -255,9 +404,15 @@ type StreamingExecution struct {
 	Groups           uint64
 	Transactions     uint64
 	TxLoopBeforeFull Timing
-	OpenDelay        Timing
-	Discarded        uint64
-	DiscardReason    string
+	// TxLoopBeforeReplay is the execution wall time of every accepted group
+	// except the finalize suffix: work that ran while the loop waited for the
+	// block, before this block's SlotReplay interval began. Unlike
+	// TxLoopBeforeFull it also counts groups that finished after the last
+	// shred. SlotReplay + TxLoopBeforeReplay is BlockReplay.ReplayWork.
+	TxLoopBeforeReplay Timing
+	OpenDelay          Timing
+	Discarded          uint64
+	DiscardReason      string
 
 	// Timeline: wall-clock unix nanoseconds of the events that bound the
 	// stream's open, zero when unknown. They join with the parent's record
@@ -352,9 +507,13 @@ type StreamingExecution struct {
 // Metrics for replaying a single block
 type BlockReplay struct {
 	ComputeUnitsConsumed uint64
+	Transactions         uint64 // transactions in the block, votes included
 	Slot                 uint64
-	AccountLoader        AccountLoader
-	TurbineIngress       TurbineIngress
+	// CompletedUnixNano is when the block's SlotReplay ended (wall clock), so
+	// a run's first block start and last block end are exact.
+	CompletedUnixNano int64
+	AccountLoader     AccountLoader
+	TurbineIngress    TurbineIngress
 
 	// RewardCertificatePreflight runs before consensus admission and bank replay,
 	// outside SlotReplay, which starts after the candidate is admitted.
@@ -394,6 +553,16 @@ type BlockReplay struct {
 	// PreprocessBlock, ProcessBlock, and PostProcessBlock intervals. The more
 	// detailed timers below are nested diagnostics and must not be added to that
 	// top-level sum.
+	//
+	// SlotReplay starts when replay takes the complete block. With streaming
+	// execution most of a block near the tip has already executed while its
+	// shreds arrived, so SlotReplay alone understates the block's execution
+	// cost there. ReplayWork is SlotReplay plus that earlier streamed
+	// execution (StreamingExecution.TxLoopBeforeReplay): the block's replay
+	// work wherever it ran, equal to SlotReplay for a block replayed whole.
+	// Use ReplayWork to compare live blocks with corpus replays or to report
+	// execution cost; use SlotReplay for latency after the block is complete.
+	ReplayWork                   Timing
 	SlotReplay                   Timing
 	PreprocessBlock              Timing
 	ProcessBlock                 Timing
@@ -455,6 +624,19 @@ type BlockReplay struct {
 	// to the replay result being handed to consensus. Absent for blocks that
 	// did not arrive as shreds. It is the number streaming execution reduces.
 	FullToReplayed Timing
+	// TipPath divides FullToReplayed into consecutive intervals and adds the
+	// time before the last shred was assembled; zero for blocks that did not
+	// arrive as shreds.
+	TipPath TipPath
+	// RuntimeInterference is Go runtime activity since the previous row,
+	// the same window as SinceLastRow.
+	RuntimeInterference RuntimeInterference
+	// VoteEvents lists the stages this node's votes reached since the
+	// previous row, for any slot (a block's own vote usually lands in the
+	// next row); VoteEventsDropped counts older ones lost because rows were
+	// not being written.
+	VoteEvents        []VoteEvent `json:",omitempty"`
+	VoteEventsDropped uint64      `json:",omitempty"`
 	// StreamingExecution summarizes any execution that overlapped shred
 	// reception for this block; all zero when the block was executed whole.
 	StreamingExecution StreamingExecution

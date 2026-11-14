@@ -754,7 +754,9 @@ func NewBlockSource(opts *BlockSourceOpts) *BlockSource {
 
 	// Build list of RPC clients: primary + backups
 	rpcClients := make([]*rpcclient.RpcClient, 0, 1+len(opts.BackupRpcEndpoints))
-	rpcClients = append(rpcClients, opts.RpcClient)
+	if opts.RpcClient != nil { // offline replay has no RPC endpoint
+		rpcClients = append(rpcClients, opts.RpcClient)
+	}
 	for _, endpoint := range opts.BackupRpcEndpoints {
 		rpcClients = append(rpcClients, rpcclient.NewRpcClient(endpoint))
 	}
@@ -1964,6 +1966,9 @@ func (bs *BlockSource) fetchBlockOnce(slot uint64, rpcIdx int32) (*b.Block, erro
 	}
 
 	// Use the specified RPC client (not getActiveRpc - that could race with failover)
+	if len(bs.rpcClients) == 0 {
+		return nil, fmt.Errorf("slot %d: no RPC endpoint to fetch the block from (offline replay reads blocks only from shreds)", slot)
+	}
 	if rpcIdx < 0 || int(rpcIdx) >= len(bs.rpcClients) {
 		rpcIdx = 0
 	}

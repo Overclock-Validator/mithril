@@ -33,9 +33,16 @@ func runWithFastLoop(t *testing.T, p *Program, fast bool, budget uint64, seed in
 		}
 	}
 	cm := cu.NewComputeMeter(budget)
+	// Only the fast side identifies its registry, so the reference side asks
+	// the registry at every legacy call as before.
+	var syscallsID any
+	if fast {
+		syscallsID = diffRegistryID
+	}
 	ip := NewInterpreter(p, &VMOpts{
 		HeapMax:               4096 * (1 + rng.Intn(4)),
 		Syscalls:              diffRegistry,
+		SyscallsID:            syscallsID,
 		ComputeMeter:          &cm,
 		Input:                 input,
 		InputRegions:          regions,
@@ -232,7 +239,7 @@ func BenchmarkSyscallAlternation(b *testing.B) {
 // runFast relies on handling no jmp32/pqr-class opcode; keep this list in
 // sync with its cases.
 func TestRunFastCaseClasses(t *testing.T) {
-	ops := []uint8{OpLdxb, OpLdxh, OpLdxw, OpLdxdw, OpStb, OpSth, OpStw, OpStdw, OpStxb, OpStxh, OpStxw, OpStxdw, OpAdd32Imm, OpAdd32Reg, OpAdd64Imm, OpAdd64Reg, OpSub32Imm, OpSub32Reg, OpSub64Imm, OpSub64Reg, OpMul32Imm, OpOr32Imm, OpOr32Reg, OpOr64Imm, OpOr64Reg, OpAnd32Imm, OpAnd32Reg, OpAnd64Imm, OpAnd64Reg, OpLsh32Imm, OpLsh32Reg, OpLsh64Imm, OpLsh64Reg, OpRsh32Imm, OpRsh32Reg, OpRsh64Imm, OpRsh64Reg, OpXor32Imm, OpXor32Reg, OpXor64Imm, OpXor64Reg, OpMov32Imm, OpMov32Reg, OpMov64Imm, OpMov64Reg, OpLddw, OpJa, OpJeqImm, OpJeqReg, OpJgtImm, OpJgtReg, OpJgeImm, OpJgeReg, OpJltImm, OpJltReg, OpJleImm, OpJleReg, OpJsetImm, OpJsetReg, OpJneImm, OpJneReg, OpJsgtImm, OpJsgtReg, OpJsgeImm, OpJsgeReg, OpJsltImm, OpJsltReg, OpJsleImm, OpJsleReg, OpMul32Reg, OpMul64Imm, OpMul64Reg, OpDiv32Reg, OpDiv64Imm, OpDiv64Reg, OpMod32Reg, OpMod64Imm, OpMod64Reg, OpArsh32Imm, OpArsh32Reg, OpArsh64Imm, OpArsh64Reg, OpCall, OpExit}
+	ops := []uint8{OpLdxb, OpLdxh, OpLdxw, OpLdxdw, OpStb, OpSth, OpStw, OpStdw, OpStxb, OpStxh, OpStxw, OpStxdw, OpAdd32Imm, OpAdd32Reg, OpAdd64Imm, OpAdd64Reg, OpSub32Imm, OpSub32Reg, OpSub64Imm, OpSub64Reg, OpMul32Imm, OpOr32Imm, OpOr32Reg, OpOr64Imm, OpOr64Reg, OpAnd32Imm, OpAnd32Reg, OpAnd64Imm, OpAnd64Reg, OpLsh32Imm, OpLsh32Reg, OpLsh64Imm, OpLsh64Reg, OpRsh32Imm, OpRsh32Reg, OpRsh64Imm, OpRsh64Reg, OpXor32Imm, OpXor32Reg, OpXor64Imm, OpXor64Reg, OpMov32Imm, OpMov32Reg, OpMov64Imm, OpMov64Reg, OpLddw, OpJa, OpJeqImm, OpJeqReg, OpJgtImm, OpJgtReg, OpJgeImm, OpJgeReg, OpJltImm, OpJltReg, OpJleImm, OpJleReg, OpJsetImm, OpJsetReg, OpJneImm, OpJneReg, OpJsgtImm, OpJsgtReg, OpJsgeImm, OpJsgeReg, OpJsltImm, OpJsltReg, OpJsleImm, OpJsleReg, OpMul32Reg, OpMul64Imm, OpMul64Reg, OpDiv32Reg, OpDiv64Imm, OpDiv64Reg, OpMod32Reg, OpMod64Imm, OpMod64Reg, OpArsh32Imm, OpArsh32Reg, OpArsh64Imm, OpArsh64Reg, OpLd4BReg, OpSt4BReg, OpNeg64, OpCall, OpExit}
 	for _, op := range ops {
 		if op&0x07 == ClassPqr {
 			t.Errorf("op %#x is in the jmp32/pqr class", op)

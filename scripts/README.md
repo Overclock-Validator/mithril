@@ -1,5 +1,7 @@
 # Mithril System Setup Guide
 
+For benchmarking replay (`run-commits.py`, `replay_timings_viewer.py`, `mithril backtest`, `mithril timings`), see [docs/benchmarking.md](../docs/benchmarking.md).
+
 These scripts are **optional** but recommended for optimal Mithril performance.
 
 ---

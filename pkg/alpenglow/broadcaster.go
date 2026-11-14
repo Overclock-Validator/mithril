@@ -233,7 +233,7 @@ func (b *VotorBroadcaster) broadcastLoop() {
 			}
 			senders, skipped := b.connectedSenders()
 			b.sendsSkipped.Add(uint64(skipped))
-			job := votorDatagram{payload: payload, queuedAt: time.Now()}
+			job := votorDatagram{payload: payload, queuedAt: time.Now(), vote: newVoteSendTracker(message, len(senders))}
 			for _, sender := range senders {
 				sender.enqueue(job)
 			}

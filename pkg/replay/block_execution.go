@@ -682,6 +682,9 @@ func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
 			return nil, footerVerificationErr
 		}
 	}
+	if err := verifyCaptureBankHash(block.Slot, slotCtx.FinalBankhash); err != nil {
+		return nil, err
+	}
 
 	// Bankhash consensus enforcement is handled in the replay loop (not here)
 	// because forkchoice is fed after ProcessBlock returns — checking here would

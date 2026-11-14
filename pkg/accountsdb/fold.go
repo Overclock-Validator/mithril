@@ -89,6 +89,7 @@ type BatchCommitResult struct {
 	Keys        int
 	Bytes       int64
 	Timings     FoldTimings
+	Writeback   FoldWriteback
 }
 
 type dedupedVersion struct {
@@ -123,6 +124,8 @@ func (db *AccountsDb) CommitBatch(
 	db.foldMu.LockAs("fold")
 	defer db.foldMu.Unlock()
 	clock.step(&timings.LockWait)
+	db.foldPhase.set(foldPhasePrepare)
+	defer db.foldPhase.set(foldPhaseIdle)
 
 	if db.rewindPending {
 		return BatchCommitResult{}, fmt.Errorf("accountsdb: pending rewind state must be persisted before folding")
@@ -219,8 +222,10 @@ func (db *AccountsDb) CommitBatch(
 	if err != nil {
 		return BatchCommitResult{}, err
 	}
+	db.foldPhase.set(foldPhaseSegmentWrite)
 	crc := crc32.NewIEEE()
-	bw := bufio.NewWriterSize(f, 1<<20)
+	segFile := &segmentFileWriter{f: f, step: foldWritebackBytes}
+	bw := bufio.NewWriterSize(segFile, 1<<20)
 	segWriter := io.MultiWriter(bw, crc)
 	records := make([]ManifestRecord, 0, len(keys))
 	var dataLen uint64
@@ -249,6 +254,8 @@ func (db *AccountsDb) CommitBatch(
 		f.Close()
 		return BatchCommitResult{}, segErr
 	}
+	db.foldPhase.set(foldPhaseSegmentSync)
+	syncStart := time.Now()
 	if err := f.Sync(); err != nil {
 		f.Close()
 		return BatchCommitResult{}, err
@@ -259,6 +266,8 @@ func (db *AccountsDb) CommitBatch(
 	if err := fsyncDir(db.AcctsDir); err != nil {
 		return BatchCommitResult{}, err
 	}
+	timings.SegmentSync = time.Since(syncStart)
+	db.foldPhase.set(foldPhaseManifest)
 	db.trackDataFileLocked(filepath.Base(dataName))
 	fire(db.foldHooks.afterSegmentFsync)
 	dataCRC := crc.Sum32()
@@ -324,9 +333,11 @@ func (db *AccountsDb) CommitBatch(
 	// of the atomic Pebble commit. This lets the expensive index fsync and cache
 	// refresh proceed without blocking account loaders.
 	fire(db.foldHooks.beforeIndexCommit)
+	db.foldPhase.set(foldPhaseIndexCommit)
 	db.readCacheEpochMu.LockAs("fold_publication")
 	db.pendingFold = union
 	db.readCacheEpoch++
+	db.carryBatchAbsencesLocked(union)
 	db.readCacheEpochMu.Unlock()
 	fire(db.foldHooks.afterPublicationStart)
 
@@ -341,6 +352,7 @@ func (db *AccountsDb) CommitBatch(
 	// stale values. New readers use pendingFold for changed keys until these
 	// ordinary concurrent-safe cache operations finish.
 	clock.step(&timings.IndexCommit)
+	db.foldPhase.set(foldPhaseCacheRefresh)
 	db.refreshReadCacheEntries(live)
 
 	db.readCacheEpochMu.LockAs("fold_publication")
@@ -361,6 +373,7 @@ func (db *AccountsDb) CommitBatch(
 		Keys:        len(records),
 		Bytes:       int64(dataLen),
 		Timings:     timings,
+		Writeback:   segFile.report(),
 	}, nil
 }
 
