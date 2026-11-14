@@ -59,7 +59,9 @@ mithril timings span /path/to/replay_timings.jsonl --from-slot A --to-slot B --w
 ```
 
 It also reports the share of the span spent waiting for the next block
-(`LoopSourceWait`). In catch-up that share is near zero and the rate is
+(`LoopSourceWait`), and the same per-block numbers by block size (groups of
+10 M consumed CU: 0-10, 10-20, 20-30, 30-40, 40+), so blocks of similar size
+can be compared across runs, servers and clients. In catch-up that share is near zero and the rate is
 replay's own. At the tip blocks arrive every slot, so the rate is the
 network's, and the per-block time that matters is the tip path below.
 

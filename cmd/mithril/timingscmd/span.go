@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -119,6 +120,7 @@ func writeSpanReport(w io.Writer, rows []spanRow, from, to uint64, warmup int) e
 	measured := rows[first:end]
 	open := rows[first-1]
 	intervals := make([]float64, 0, len(measured))
+	blockCU := make([]uint64, 0, len(measured))
 	prev := open.CompletedUnixNano
 	var cu, replayWorkNs, sourceWaitNs uint64
 	for _, r := range measured {
@@ -126,6 +128,7 @@ func writeSpanReport(w io.Writer, rows []spanRow, from, to uint64, warmup int) e
 			return fmt.Errorf("slot %d has no usable completion time; rows written before CompletedUnixNano existed cannot be measured", r.Slot)
 		}
 		intervals = append(intervals, float64(r.CompletedUnixNano-prev)/1e6)
+		blockCU = append(blockCU, r.ComputeUnitsConsumed)
 		prev = r.CompletedUnixNano
 		cu += r.ComputeUnitsConsumed
 		replayWorkNs += r.ReplayWork.SumNanoseconds
@@ -145,5 +148,43 @@ func writeSpanReport(w io.Writer, rows []spanRow, from, to uint64, warmup int) e
 	fmt.Fprintf(w, "  %-14s %8s %8s %8s %8s %8s\n", "interval", "mean ms", "p50", "p90", "p99", "max")
 	fmt.Fprintf(w, "  %-14s %8.3f %8.3f %8.3f %8.3f %8.3f\n", "BlockInterval", seconds*1e3/float64(n), p50, p90, p99, mx)
 	fmt.Fprintf(w, "  BlockInterval is completion to completion; the intervals add up to the span.\n")
+	writeSizeBuckets(w, intervals, blockCU)
 	return nil
+}
+
+// sizeBucketsM are the lower bounds, in millions of consumed CU, of the block
+// size groups; the last group is open-ended.
+var sizeBucketsM = []uint64{0, 10, 20, 30, 40}
+
+// writeSizeBuckets groups the measured blocks by consumed CU and reports each
+// group's BlockInterval. CU/ns is the group's total CU over its total
+// interval time.
+func writeSizeBuckets(w io.Writer, intervals []float64, blockCU []uint64) {
+	fmt.Fprintf(w, "  by block size (BlockInterval per group):\n")
+	fmt.Fprintf(w, "  %-12s %7s %10s %8s %8s %8s %8s %8s\n", "M CU", "blocks", "avg M CU", "mean ms", "p50", "p99", "max", "CU/ns")
+	for i, lo := range sizeBucketsM {
+		hi := uint64(math.MaxUint64)
+		label := fmt.Sprintf("%d+", lo)
+		if i+1 < len(sizeBucketsM) {
+			hi = sizeBucketsM[i+1]
+			label = fmt.Sprintf("%d-%d", lo, hi)
+		}
+		var vals []float64
+		var cu uint64
+		var ms float64
+		for j, c := range blockCU {
+			if c >= lo*1_000_000 && (hi == math.MaxUint64 || c < hi*1_000_000) {
+				vals = append(vals, intervals[j])
+				cu += c
+				ms += intervals[j]
+			}
+		}
+		if len(vals) == 0 {
+			fmt.Fprintf(w, "  %-12s %7d\n", label, 0)
+			continue
+		}
+		p50, _, p99, mx := quantiles(vals)
+		n := float64(len(vals))
+		fmt.Fprintf(w, "  %-12s %7d %10.2f %8.3f %8.3f %8.3f %8.3f %8.3f\n", label, len(vals), float64(cu)/n/1e6, ms/n, p50, p99, mx, float64(cu)/(ms*1e6))
+	}
 }

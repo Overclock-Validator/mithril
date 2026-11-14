@@ -38,6 +38,9 @@ func TestSpanReport(t *testing.T) {
 	require.Contains(t, text, "waiting for the next block (LoopSourceWait): 30.0% of the span")
 	// Intervals 40, 30, 30 ms: mean is the span's ms/block.
 	require.Regexp(t, `BlockInterval\s+33\.333\s+30\.000\s+40\.000\s+40\.000\s+40\.000`, text)
+	// Every block here consumed 10 M CU: all three fall in the 10-20 group.
+	require.Regexp(t, `10-20\s+3\s+10\.00\s+33\.333\s+30\.000\s+40\.000\s+40\.000\s+0\.300`, text)
+	require.Regexp(t, `30-40\s+0\n`, text)
 
 	out.Reset()
 	require.NoError(t, writeSpanReport(&out, rows, 0, 102, 1))
@@ -45,4 +48,15 @@ func TestSpanReport(t *testing.T) {
 
 	require.Error(t, writeSpanReport(&out, rows, 0, 0, 10))
 	require.Error(t, writeSpanReport(&out, rows, 200, 0, 0))
+}
+
+func TestSizeBuckets(t *testing.T) {
+	var out bytes.Buffer
+	// Two 35 M CU blocks (60 and 80 ms), one 5 M, one 45 M.
+	writeSizeBuckets(&out, []float64{60, 10, 80, 100}, []uint64{35e6, 5e6, 35e6, 45e6})
+	text := out.String()
+	require.Regexp(t, `0-10\s+1\s+5\.00\s+10\.000`, text)
+	require.Regexp(t, `30-40\s+2\s+35\.00\s+70\.000\s+60\.000\s+80\.000\s+80\.000\s+0\.500`, text)
+	require.Regexp(t, `40\+\s+1\s+45\.00\s+100\.000`, text)
+	require.Regexp(t, `20-30\s+0\n`, text)
 }
