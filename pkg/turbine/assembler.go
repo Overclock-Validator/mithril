@@ -127,6 +127,11 @@ type slotState struct {
 	firstShredAt   time.Time
 	fullAt         time.Time
 	repairedShreds int
+	// lastReceivedNanos is the kernel receive time of the most recently
+	// accepted shred (zero when unknown); fullReceivedNanos keeps it for the
+	// shred whose acceptance made the slot full.
+	lastReceivedNanos int64
+	fullReceivedNanos int64
 	// completing makes the immutable full state a single-owner generation token.
 	completing      bool
 	batchIndex      *entryBatchIndex
@@ -351,6 +356,7 @@ func (a *SlotAssembler) addShredFromWithRoot(shred *Shred, fromRepair bool, root
 	}
 	state.traceAcceptedShred(shred, source)
 	a.notePrefetchShredLocked(state, shred)
+	state.lastReceivedNanos = shred.ReceivedNanos
 	if state.firstShredAt.IsZero() {
 		state.firstShredAt = time.Now()
 	}
@@ -401,6 +407,7 @@ func (a *SlotAssembler) claimCompletionLocked(state *slotState, reportNonCanonic
 	observeCollection := state.fullAt.IsZero()
 	if observeCollection {
 		state.fullAt = now
+		state.fullReceivedNanos = state.lastReceivedNanos
 		if state.slot > a.highestFullSlot {
 			a.highestFullSlot = state.slot
 		}
@@ -572,6 +579,7 @@ func (a *SlotAssembler) finalizeCompletion(work *slotCompletionWork, processed p
 	if !state.fullAt.IsZero() {
 		blk.ShredFullNanos = state.fullAt.UnixNano()
 	}
+	blk.ShredFullReceivedNanos = state.fullReceivedNanos
 	blk.RepairedShreds = state.repairedShreds
 	onComplete := a.onComplete
 	lastIndex := state.lastIndex

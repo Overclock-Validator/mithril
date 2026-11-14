@@ -96,6 +96,10 @@ type Shred struct {
 	Data         []byte
 	Payload      []byte
 
+	// ReceivedNanos is the kernel's receive time of the packet carrying this
+	// shred (unix nanoseconds), zero when unknown. Observability only.
+	ReceivedNanos int64
+
 	NumDataShreds   uint16
 	NumCodingShreds uint16
 	Position        uint16

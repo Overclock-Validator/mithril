@@ -2820,6 +2820,7 @@ func ReplayBlocks(
 	// reads it to attribute a child's open delay to its parent's arrival, its
 	// parent's replay, or the loop itself.
 	var frontierMark streamingFrontierMark
+	runtimeSampler := newRuntimeInterferenceSampler()
 	if blockStream.StreamEvents() != nil {
 		var onStreamOpen func(uint64)
 		if prefetcher != nil {
@@ -2882,6 +2883,11 @@ func ReplayBlocks(
 			waitTime        time.Duration
 			neededAt        time.Time // when replay asked the source for this slot
 			admittedAt      time.Time // when the source handed replay this input
+			// parentMark is the last replayed block as this one was admitted,
+			// and handedOffAt when this block's result reached consensus;
+			// both feed the row's TipPath.
+			parentMark  streamingFrontierMark
+			handedOffAt time.Time
 		)
 
 		{
@@ -2929,6 +2935,7 @@ func ReplayBlocks(
 
 			admittedAt = time.Now()
 			waitTime = admittedAt.Sub(neededAt)
+			parentMark = frontierMark
 
 			if stallDone != nil {
 				close(stallDone)
@@ -3525,11 +3532,11 @@ func ReplayBlocks(
 				break
 			}
 		}
-		recordFullToReplayed(block)
+		handedOffAt = recordFullToReplayed(block)
 		// The same instant FullToReplayed ends at: from here to the next wait
 		// entry is this block's post-replay tail, which a child's open timeline
 		// reports as OpenWaitPostReplay.
-		frontierMark = streamingFrontierMark{slot: block.Slot, fullNanos: block.ShredFullNanos, admittedAt: admittedAt, replayedAt: time.Now()}
+		frontierMark = streamingFrontierMark{slot: block.Slot, fullNanos: block.ShredFullNanos, admittedAt: admittedAt, replayedAt: handedOffAt}
 
 		if rpcServer != nil {
 			rpcServer.SetSlotCtx(lastSlotCtx)
@@ -3954,6 +3961,8 @@ func ReplayBlocks(
 		{
 			metrics.GlobalBlockReplay.Slot = block.Slot
 			rowAt := time.Now()
+			recordTipPath(&metrics.GlobalBlockReplay.TipPath, newTipPathInput(block, ingressTimings, parentMark, admittedAt, start, handedOffAt))
+			runtimeSampler.record(&metrics.GlobalBlockReplay.RuntimeInterference)
 			recordUnrootedTail(unrootedTailState)
 			recordReplayLoopClosure(rowAt, lastRowAt, iterationStart, waitTime, slotReplayEnd, block.Slot)
 			lastRowAt = rowAt
@@ -4785,15 +4794,18 @@ func ProcessBlock(
 // recordFullToReplayed measures the vote-path latency replay controls for a
 // turbine block: from the assembler's full-assembly instant (the last shred,
 // carried as ShredFullNanos) to the replay result reaching consensus. Blocks
-// that did not arrive as shreds carry no full instant and record nothing.
-func recordFullToReplayed(block *b.Block) {
+// that did not arrive as shreds carry no full instant and record nothing. It
+// returns the hand-off instant it measured to.
+func recordFullToReplayed(block *b.Block) time.Time {
+	now := time.Now()
 	if block == nil || block.ShredFullNanos <= 0 {
-		return
+		return now
 	}
-	fullToReplayed := time.Since(time.Unix(0, block.ShredFullNanos))
+	fullToReplayed := now.Sub(time.Unix(0, block.ShredFullNanos))
 	if fullToReplayed <= 0 {
-		return
+		return now
 	}
 	metrics.GlobalBlockReplay.FullToReplayed.AddTiming(fullToReplayed)
 	_ = statsd.Duration(statsd.ReplayFullToReplayed, fullToReplayed, nil)
+	return now
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/Overclock-Validator/mithril/cmd/mithril/setupcmd"
 	"github.com/Overclock-Validator/mithril/cmd/mithril/statecmd"
 	"github.com/Overclock-Validator/mithril/cmd/mithril/statuscmd"
+	"github.com/Overclock-Validator/mithril/cmd/mithril/timingscmd"
 	"github.com/Overclock-Validator/mithril/pkg/config"
 	"github.com/spf13/cobra"
 	"k8s.io/klog/v2"
@@ -58,6 +59,7 @@ func init() {
 		&alpenglowcmd.AlpenglowCmd, // Alpenglow diagnostics and tools
 		&configcmd.ConfigCmd,       // Config management (init, etc.)
 		&corpuscmd.CorpusCmd,       // Replay corpus and shredcap conversion
+		&timingscmd.TimingsCmd,     // Reports on replay_timings.jsonl
 		&statecmd.StateCmd,         // State file inspection and management
 		&setupcmd.SetupCmd,         // Interactive setup wizard
 		&setupcmd.DoctorCmd,        // System health check

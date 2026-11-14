@@ -236,6 +236,71 @@ type VoteRewardDetails struct {
 	VoteAccountsUpdated  uint64
 }
 
+// TipPath accounts for a turbine block's vote-path latency, from the kernel
+// receiving the shred that completed the block to the replay result reaching
+// consensus. Every interval is measured in this process from wall-clock
+// instants and the intervals are consecutive, so
+//
+//	FullToReplayed = FullToReady + WaitParentArrival + WaitParentReplay +
+//	                 LoopUntilAdmitted + WaitUnclassified + AdmittedToReplay +
+//	                 ReplayToHandoff + Unattributed
+//
+// with Unattributed holding whatever the instants could not place (a missing
+// instant, or a clock step). ReceiveToFull lies before FullToReplayed.
+//
+// WaitParentArrival is the only interval set by the network: the block was
+// ready but its parent's last shred had not yet arrived. Every other interval
+// is Mithril's own work or queueing.
+type TipPath struct {
+	// ShredReceivedNanos is the kernel's receive time (Linux SO_TIMESTAMPNS,
+	// unix nanoseconds) of the shred whose arrival completed the block; zero
+	// when unknown (other platforms, recovered or repaired completions).
+	ShredReceivedNanos int64
+	// ReceiveToFull runs from that receive time to the block being
+	// assembled full: socket queueing, shred parsing and signature checks,
+	// FEC recovery and assembly.
+	ReceiveToFull Timing
+	// FullToReady is block completion: decode and outstanding transaction
+	// signature verification (TurbineIngress.FullToReady).
+	FullToReady Timing
+	// The wait from ready to the replay loop admitting the block, split by
+	// what it waited on. WaitParentArrival: the parent's last shred had not
+	// arrived. WaitParentReplay: the parent was replaying. LoopUntilAdmitted:
+	// the rest, the loop finishing the parent's post-replay tail, running
+	// this block's streamed execution, or other loop work. WaitUnclassified:
+	// the parent's instants were unknown (first block, fork switch).
+	WaitParentArrival Timing
+	WaitParentReplay  Timing
+	LoopUntilAdmitted Timing
+	WaitUnclassified  Timing
+	// AdmittedToReplay is setup between admission and SlotReplay's start.
+	AdmittedToReplay Timing
+	// ReplayToHandoff runs from SlotReplay's start to the result reaching
+	// consensus, inside SlotReplay.
+	ReplayToHandoff Timing
+	Unattributed    Timing
+}
+
+// RuntimeInterference is Go runtime activity over one row's window, read from
+// runtime/metrics. Pause and latency maxima are bucket upper bounds of the
+// runtime's histograms, so they bound rather than equal the true values.
+type RuntimeInterference struct {
+	GCCycles uint64
+	// GCPauseCPU is CPU time in stop-the-world GC phases summed over all Ps;
+	// GCAssistCPU is mutator time spent assisting the GC.
+	GCPauseCPU  Timing
+	GCAssistCPU Timing
+	// GCPauseMax bounds the longest stop-the-world GC pause in the window.
+	GCPauseMax Timing
+	// SchedLatencyMax bounds the longest wait of a runnable goroutine for a
+	// thread; SchedLatencyOver1ms counts waits longer than 1 ms.
+	SchedLatencyMax     Timing
+	SchedLatencyOver1ms uint64
+	// KernelShredDrops counts shred packets the kernel dropped because a
+	// receive socket's buffer was full (Linux SO_RXQ_OVFL); zero elsewhere.
+	KernelShredDrops uint64
+}
+
 // StreamingExecution records execution that ran while a block's shreds were
 // still arriving. Groups are the contiguous ready-batch sets executed per
 // wake-up; Transactions counts what they executed. TxLoopBeforeFull is the
@@ -475,6 +540,13 @@ type BlockReplay struct {
 	// to the replay result being handed to consensus. Absent for blocks that
 	// did not arrive as shreds. It is the number streaming execution reduces.
 	FullToReplayed Timing
+	// TipPath divides FullToReplayed into consecutive intervals and adds the
+	// time before the last shred was assembled; zero for blocks that did not
+	// arrive as shreds.
+	TipPath TipPath
+	// RuntimeInterference is Go runtime activity since the previous row,
+	// the same window as SinceLastRow.
+	RuntimeInterference RuntimeInterference
 	// StreamingExecution summarizes any execution that overlapped shred
 	// reception for this block; all zero when the block was executed whole.
 	StreamingExecution StreamingExecution

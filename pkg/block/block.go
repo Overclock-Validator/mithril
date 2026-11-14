@@ -129,7 +129,10 @@ type Block struct {
 	// — NOT finalized/consensus-safe.
 	ShredFirstNanos int64 // wall clock (unix nanos) of the first accepted shred for the slot
 	ShredFullNanos  int64 // wall clock (unix nanos) when the slot became full
-	RepairedShreds  int   // data shreds obtained via repair rather than turbine
+	// ShredFullReceivedNanos is the kernel receive time (unix nanos) of the
+	// shred whose acceptance made the slot full; zero when unknown.
+	ShredFullReceivedNanos int64
+	RepairedShreds         int // data shreds obtained via repair rather than turbine
 }
 
 // MarkTransactionSignaturesVerified records that every transaction signature
