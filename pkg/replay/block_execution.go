@@ -18,6 +18,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/Overclock-Validator/mithril/pkg/progtrace"
 	"github.com/Overclock-Validator/mithril/pkg/rent"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/txstatus"
@@ -266,6 +267,9 @@ func (exec *blockExecution) open() error {
 	loadAcctsRegion := trace.StartRegion(exec.ctx, "LoadBlockAccounts")
 	accts, parentAccts, accountMapCapacity, bankSysvars, err := loadBlockAccountsAndUpdateSysvars(exec.blockSrc, block, exec.epochSchedule, exec.alpenglowClock, exec.parentBankSysvars, nil, streamingOverlayKeys)
 	loadAcctsRegion.End()
+	if progtrace.On() {
+		progtrace.Emit(progtrace.Foreground{Kind: "fg_load", Slot: block.Slot, T: progtrace.At(start), End: progtrace.Now(), Path: "streaming"})
+	}
 	if err != nil {
 		return fmt.Errorf("load slot accounts and update sysvars at slot %d: %w", block.Slot, err)
 	}
@@ -496,6 +500,9 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 	workers := exec.txParallelism
 	if workers > len(txs) {
 		workers = len(txs)
+	}
+	if progtrace.On() {
+		progtrace.Emit(progtrace.Foreground{Kind: "fg_exec", Slot: slotCtx.Slot, T: progtrace.Now(), Path: "streaming", Txs: len(txs)})
 	}
 	view := &b.Block{Transactions: txs}
 	if !canUseDependencyPlanner(view) {

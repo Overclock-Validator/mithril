@@ -36,6 +36,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/lthash"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/Overclock-Validator/mithril/pkg/progtrace"
 	"github.com/Overclock-Validator/mithril/pkg/rewards"
 	"github.com/Overclock-Validator/mithril/pkg/rpcclient"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
@@ -3254,6 +3255,9 @@ func ReplayBlocks(
 		if prefetcher != nil {
 			prefetcher.Started(block.Slot)
 		}
+		if progtrace.On() {
+			progtrace.Emit(progtrace.Foreground{Kind: "turn", Slot: block.Slot, T: progtrace.Now()})
+		}
 
 		currentSlot = block.Slot
 		block.Epoch = epochSchedule.GetEpoch(currentSlot)
@@ -4823,6 +4827,9 @@ func ProcessBlock(
 	loadAcctsRegion := trace.StartRegion(exec.ctx, "LoadBlockAccounts")
 	accts, parentAccts, accountMapCapacity, bankSysvars, err := loadBlockAccountsAndUpdateSysvars(exec.blockSrc, block, epochSchedule, alpenglowClock, parentBankSysvars, planner, 0)
 	loadAcctsRegion.End()
+	if progtrace.On() {
+		progtrace.Emit(progtrace.Foreground{Kind: "fg_load", Slot: block.Slot, T: progtrace.At(start), End: progtrace.Now(), Path: "block"})
+	}
 	if err != nil {
 		return nil, fmt.Errorf("load slot accounts and update sysvars at slot %d: %w", block.Slot, err)
 	}
@@ -4852,6 +4859,9 @@ func ProcessBlock(
 	shouldVerifySignatures := !block.TransactionSignaturesVerified()
 	var txLoopErr error
 	if txParallelism > 0 {
+		if progtrace.On() {
+			progtrace.Emit(progtrace.Foreground{Kind: "fg_exec", Slot: block.Slot, T: progtrace.Now(), Path: "block", Txs: len(block.Transactions)})
+		}
 		txFeeAccumulator, totalComputeUnitsConsumed, txLoopErr = parallelTxLoop(slotCtx, &exec.sigverifyWg, planner, block, executionPlan, txParallelism, dbgOpts, shouldVerifySignatures)
 	} else {
 		txFeeAccumulator, totalComputeUnitsConsumed, txLoopErr = sequentialTxLoop(slotCtx, &exec.sigverifyWg, block, executionPlan, dbgOpts, shouldVerifySignatures)

@@ -175,13 +175,13 @@ func TestAccountPrefetchPreloadBudget(t *testing.T) {
 	failing, failingAccts := referencedPrograms(0xB1, preloadReferencedAttempts, []byte("not an elf"))
 	valid, validAccts := referencedPrograms(0xB2, 4, elf)
 	p, db := preloadPrefetcher(&prefetchRecordingSource{})
-	p.preloadPrograms(context.Background(), accountPrefetchJob{slot: 50}, append(failing, valid...), append(failingAccts, validAccts...))
+	p.preloadPrograms(context.Background(), accountPrefetchJob{slot: 50}, append(failing, valid...), append(failingAccts, validAccts...), nil)
 	assert.Zero(t, cachedCount(db, valid), "failed attempts count against the bound")
 	assert.Equal(t, uint64(1), p.overBudget.Load())
 
 	big, bigAccts := referencedPrograms(0xB3, 2, make([]byte, preloadReferencedBytes/2+1))
 	p, db = preloadPrefetcher(&prefetchRecordingSource{})
-	p.preloadPrograms(context.Background(), accountPrefetchJob{slot: 50}, append(big, valid...), append(bigAccts, validAccts...))
+	p.preloadPrograms(context.Background(), accountPrefetchJob{slot: 50}, append(big, valid...), append(bigAccts, validAccts...), nil)
 	assert.Zero(t, cachedCount(db, valid), "source bytes count against the bound")
 	assert.Equal(t, uint64(1), p.overBudget.Load())
 
@@ -191,7 +191,7 @@ func TestAccountPrefetchPreloadBudget(t *testing.T) {
 		src.accts[key] = topAccts[i]
 	}
 	p, db = preloadPrefetcher(src)
-	p.preloadPrograms(context.Background(), accountPrefetchJob{slot: 50, programs: top}, nil, nil)
+	p.preloadPrograms(context.Background(), accountPrefetchJob{slot: 50, programs: top}, nil, nil, nil)
 	assert.Equal(t, len(top), cachedCount(db, top), "top-level programs are not bounded")
 	assert.Zero(t, p.overBudget.Load())
 }

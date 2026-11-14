@@ -15,6 +15,7 @@ import (
 	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/Overclock-Validator/mithril/pkg/progtrace"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/turbine"
 	"github.com/gagliardetto/solana-go"
@@ -109,6 +110,20 @@ type accountPrefetcher struct {
 	partialOffered, partialDropped, partialStale, partialWarmed, partialKeys, tipFiltered atomic.Uint64
 	keys, durable, storage, nanos                                                         atomic.Uint64
 	programs, preloaded, invoked, overBudget                                              atomic.Uint64
+
+	jobSeq atomic.Uint64 // readiness diagnostic job ids
+}
+
+// traceUnstarted records, for the readiness diagnostic, a whole-block job that
+// never ran: outcome says why.
+func (p *accountPrefetcher) traceUnstarted(slot, id uint64, requested int64, outcome string) {
+	if !progtrace.On() {
+		return
+	}
+	if id == 0 {
+		id, requested = p.jobSeq.Add(1), progtrace.Now()
+	}
+	progtrace.Emit(progtrace.Job{Kind: "job", Slot: slot, ID: id, Whole: true, Requested: requested, Outcome: outcome, Preload: "not_reached", ReplayAt: p.started.Load()})
 }
 
 // accountPrefetchJob is a block's account references, copied from data
@@ -120,6 +135,10 @@ type accountPrefetchJob struct {
 	lookups []accountPrefetchLookup
 	// programs are the block's top-level program ids, always static keys.
 	programs []solana.PublicKey
+	// id and requested (when the block was offered) are set only for the
+	// readiness diagnostic.
+	id        uint64
+	requested int64
 }
 
 // partialPrefetch is one decoded turbine batch's references (tip warming).
@@ -213,10 +232,12 @@ func (p *accountPrefetcher) Offer(blk *b.Block) {
 		// Replay (or a stream) already began it: not worth warming, and its
 		// transactions may be in use.
 		p.late.Add(1)
+		p.traceUnstarted(blk.Slot, 0, 0, "late_at_offer")
 		return
 	}
 	if len(p.jobs) == cap(p.jobs) {
 		p.dropped.Add(1)
+		p.traceUnstarted(blk.Slot, 0, 0, "queue_full")
 		return
 	}
 	var job accountPrefetchJob
@@ -230,6 +251,7 @@ func (p *accountPrefetcher) Offer(blk *b.Block) {
 	case streamed || blk.FromLiveStream:
 		// Its summaries are gone; its transactions are a stream's.
 		p.late.Add(1)
+		p.traceUnstarted(blk.Slot, 0, 0, "no_refs")
 		return
 	default:
 		// The block is not from the live stream and has no decoded-batch
@@ -237,10 +259,14 @@ func (p *accountPrefetcher) Offer(blk *b.Block) {
 		// replay; missing summaries alone do not establish ownership.
 		job = snapshotAccountPrefetchJob(blk)
 	}
+	if progtrace.On() {
+		job.id, job.requested = p.jobSeq.Add(1), progtrace.Now()
+	}
 	select {
 	case p.jobs <- job:
 	default:
 		p.dropped.Add(1)
+		p.traceUnstarted(blk.Slot, job.id, job.requested, "queue_full")
 	}
 }
 
@@ -369,6 +395,7 @@ func (p *accountPrefetcher) run() {
 			switch {
 			case pending.slot <= started:
 				p.late.Add(1)
+				p.traceUnstarted(pending.slot, pending.id, pending.requested, "late_in_queue")
 				pending = nil
 				continue
 			case pending.slot <= started+p.ahead:
@@ -383,6 +410,21 @@ func (p *accountPrefetcher) run() {
 		}
 		select {
 		case <-p.ctx.Done():
+			if progtrace.On() {
+				// Record-only: the jobs still waiting are named, not served.
+				if pending != nil {
+					p.traceUnstarted(pending.slot, pending.id, pending.requested, "never_started")
+				}
+				for {
+					select {
+					case job := <-p.jobs:
+						p.traceUnstarted(job.slot, job.id, job.requested, "never_started")
+						continue
+					default:
+					}
+					break
+				}
+			}
 			return
 		case part := <-p.partial:
 			p.warmPartial(part)
@@ -479,17 +521,40 @@ func partialSet(sets map[uint64]map[solana.PublicKey]struct{}, slot, started uin
 // its programs; whole marks a whole-block job, which the statistics count.
 func (p *accountPrefetcher) warmJob(job accountPrefetchJob, whole bool) {
 	start := time.Now()
+	var rec *progtrace.Job // readiness diagnostic; nil when off
+	if progtrace.On() {
+		if job.id == 0 {
+			job.id = p.jobSeq.Add(1)
+		}
+		rec = &progtrace.Job{Kind: "job", Slot: job.slot, ID: job.id, Whole: whole, Requested: job.requested, Started: progtrace.At(start), Preload: "not_reached", ReplayAt: p.started.Load()}
+		defer func() { progtrace.Emit(*rec) }()
+	}
 	ctx := accountsdb.WithBatchWorkerLimit(p.ctx, p.workers)
 	keys := job.keys
 	if len(job.tables) > 0 {
 		keys = append(keys[:len(keys):len(keys)], p.lookupTableKeys(ctx, job)...)
 	}
 	accts, stats, err := getAccountsBatchSharedWithStats(ctx, p.src, job.slot, keys)
+	if rec != nil {
+		rec.Keys = len(keys)
+	}
 	if err != nil {
+		if rec != nil {
+			rec.Outcome = "read_error"
+			if ctx.Err() != nil {
+				rec.Outcome = "cancelled"
+			}
+		}
 		return
 	}
+	if rec != nil {
+		rec.ReadDone, rec.Outcome, rec.Preload = progtrace.Now(), "finished", "no_program_cache"
+	}
 	if p.db != nil {
-		p.preloadPrograms(ctx, job, keys, accts)
+		p.preloadPrograms(ctx, job, keys, accts, rec)
+		if rec != nil {
+			rec.PreloadDone = progtrace.Now()
+		}
 	}
 	if !whole {
 		return
@@ -529,9 +594,16 @@ const (
 // be. Neither kind is known to be invoked, so a preload may be unused; it only
 // warms the cache. Cancellation stops it between programs and before a
 // compile, not during one.
-func (p *accountPrefetcher) preloadPrograms(ctx context.Context, job accountPrefetchJob, keys []solana.PublicKey, loaded []*accounts.Account) {
+func (p *accountPrefetcher) preloadPrograms(ctx context.Context, job accountPrefetchJob, keys []solana.PublicKey, loaded []*accounts.Account, rec *progtrace.Job) {
+	// how records why preloading stopped, for the readiness diagnostic.
+	how := func(preload string) {
+		if rec != nil {
+			rec.Preload = preload
+		}
+	}
 	f := p.features.Load()
 	if f == nil {
+		how("no_features")
 		return
 	}
 	var accts []*accounts.Account
@@ -539,9 +611,11 @@ func (p *accountPrefetcher) preloadPrograms(ctx context.Context, job accountPref
 		var err error
 		accts, _, err = getAccountsBatchSharedWithStats(ctx, p.src, job.slot, job.programs)
 		if err != nil || len(accts) != len(job.programs) {
+			how("program_read_error")
 			return
 		}
 	}
+	how("done")
 	invoked, invokedAccts := loadedPrograms(job.programs, keys, loaded)
 	p.invoked.Add(uint64(len(invoked)))
 	programs := append(job.programs[:len(job.programs):len(job.programs)], invoked...)
@@ -556,6 +630,7 @@ func (p *accountPrefetcher) preloadPrograms(ctx context.Context, job accountPref
 	attempts, sourceBytes := 0, 0
 	for i, acct := range accts {
 		if ctx.Err() != nil {
+			how("cancelled")
 			return
 		}
 		cacheKey, source, ok := sealevel.PreloadSource(programs[i], acct, job.slot, readProgramData)
@@ -563,7 +638,11 @@ func (p *accountPrefetcher) preloadPrograms(ctx context.Context, job accountPref
 			continue
 		}
 		p.programs.Add(1)
+		if rec != nil {
+			rec.Programs++
+		}
 		if ctx.Err() != nil {
+			how("cancelled")
 			return
 		}
 		// Only compiles count against the bound. The check is quiet, so the
@@ -571,13 +650,27 @@ func (p *accountPrefetcher) preloadPrograms(ctx context.Context, job accountPref
 		if i >= len(job.programs) && !p.db.ProgramCached(cacheKey) { // referenced, not top-level
 			if attempts == preloadReferencedAttempts || sourceBytes+len(source) > preloadReferencedBytes {
 				p.overBudget.Add(1)
+				how("over_budget")
 				return // the remaining candidates are referenced too
 			}
 			attempts++
 			sourceBytes += len(source)
 		}
-		if sealevel.PreloadProgram(p.db, cacheKey, source, f) {
+		compiled, admitted, cached := sealevel.PreloadProgramForJob(p.db, cacheKey, source, f, job.slot, job.id)
+		if compiled {
 			p.preloaded.Add(1)
+		}
+		if rec != nil {
+			switch {
+			case cached:
+				rec.Cached++
+			case compiled && admitted:
+				rec.Compiled++
+				rec.Admitted++
+			case compiled:
+				rec.Compiled++
+				rec.Refused++
+			}
 		}
 	}
 }

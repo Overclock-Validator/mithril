@@ -16,6 +16,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/Overclock-Validator/mithril/pkg/progtrace"
 	"github.com/Overclock-Validator/mithril/pkg/safemath"
 	"github.com/Overclock-Validator/mithril/pkg/sbpf"
 	"github.com/Overclock-Validator/mithril/pkg/sbpf/loader"
@@ -1371,6 +1372,8 @@ func executeProgramFromSource(execCtx *ExecutionCtx, programAddr solana.PublicKe
 	// The caller has already validated the bank-visible loader metadata. Never
 	// let a global cache hit bypass that validation or select a different fork.
 	compileReason := "miss"
+	traced := progtrace.On()
+	cacheOutcome := "absent"
 	if entry, ok := execCtx.SlotCtx.AccountsDb.MaybeGetProgramFromCache(programAddr); ok && !execCtx.PrivatePrograms {
 		var matches bool
 		if immutable {
@@ -1382,30 +1385,50 @@ func executeProgramFromSource(execCtx *ExecutionCtx, programAddr solana.PublicKe
 			return executeLoadedProgram(execCtx, entry.Program, syscallRegistry)
 		}
 		compileReason = "stale"
+		if traced {
+			// The entry already failed the match; naming which half failed
+			// compares the source once more, on the diagnostic only.
+			cacheOutcome = entry.SourceMismatch(programData, &execCtx.Features)
+		}
 	} else if ok {
 		compileReason = "private"
+		cacheOutcome = "present_bypassed"
 	}
 
 	loader, err := loader.NewLoaderWithSyscalls(programData, syscallRegistry, false, &execCtx.Features)
 	if err != nil {
+		if traced {
+			traceExecutionCompile(execCtx, programAddr, programData, cacheOutcome, start, time.Now(), "load_error", "not_reached")
+		}
 		return InstrErrUnsupportedProgramId
 	}
 
 	program, err := loader.Load()
 	if err != nil {
+		if traced {
+			traceExecutionCompile(execCtx, programAddr, programData, cacheOutcome, start, time.Now(), "load_error", "not_reached")
+		}
 		return InstrErrUnsupportedProgramId
 	}
 	if err := program.Verify(); err != nil {
+		if traced {
+			traceExecutionCompile(execCtx, programAddr, programData, cacheOutcome, start, time.Now(), "verify_error", "not_reached")
+		}
 		return InstrErrUnsupportedProgramId
 	}
 
 	entry := &accountsdb.ProgramCacheEntry{Program: program}
 	entry.BindSource(programData, &execCtx.Features)
+	compiled := time.Now()
+	publish := "skipped_simulation"
 	if !execCtx.IsSimulation {
-		addProgramToCache(execCtx, programAddr, entry)
+		publish = publishProgram(execCtx, programAddr, entry)
 	}
 
 	metrics.GlobalBlockReplay.AddProgramToCache.AddTimingSince(start)
+	if traced {
+		traceExecutionCompile(execCtx, programAddr, programData, cacheOutcome, start, compiled, "ok", publish)
+	}
 	if programCompileLog {
 		mlog.Log.Infof("program compile slot %d cache-key %s reason %s depth %d speculative %t bytes %d us %d",
 			execCtx.SlotCtx.Slot, programAddr, compileReason, execCtx.StackHeight(), execCtx.Speculative, len(programData), time.Since(start).Microseconds())
@@ -1431,31 +1454,116 @@ var programCompileLog = os.Getenv("MITHRIL_PROGRAM_COMPILE_LOG") == "1"
 // from an abandoned fork, is only a cache miss. source must be immutable: a
 // shared parent account's data that no one mutates.
 func PreloadProgram(db *accountsdb.AccountsDb, cacheKey solana.PublicKey, source []byte, f *features.Features) bool {
+	loaded, _, _ := PreloadProgramForJob(db, cacheKey, source, f, 0, 0)
+	return loaded
+}
+
+// PreloadProgramForJob is PreloadProgram for a prefetch job of a slot, which
+// the readiness diagnostic records with the compile. admitted reports whether
+// the program cache accepted the entry; loaded alone only says it compiled.
+// cached reports that nothing was compiled because the cache already held
+// some entry for the key, which is not compared with source.
+func PreloadProgramForJob(db *accountsdb.AccountsDb, cacheKey solana.PublicKey, source []byte, f *features.Features, slot, job uint64) (loaded, admitted, cached bool) {
 	if db == nil || f == nil {
-		return false
+		return false, false, false
 	}
 	// Any cached entry is left alone: checking it against source would mean
 	// comparing the whole program on every queued block. Execution matches
 	// the entry before use and reloads one that went stale, as without
 	// preloading; only a program upgraded since it was cached misses out.
 	if _, ok := db.MaybeGetProgramFromCache(cacheKey); ok {
-		return false
+		return false, false, true
+	}
+	traced := progtrace.On()
+	var start time.Time
+	if traced {
+		start = time.Now()
+	}
+	record := func(result, publish string, compiled time.Time) {
+		rec := compileRecord(cacheKey, source, f, "absent", start, compiled, result, publish)
+		rec.Slot, rec.Job, rec.Exec = slot, job, "prefetch"
+		progtrace.Emit(rec)
 	}
 	syscallRegistry := sbpf.SyscallRegistry(func(u uint32) (sbpf.Syscall, bool) {
 		return Syscalls(f, false, u)
 	})
 	l, err := loader.NewLoaderWithSyscalls(source, syscallRegistry, false, f)
 	if err != nil {
-		return false
+		if traced {
+			record("load_error", "not_reached", time.Now())
+		}
+		return false, false, false
 	}
 	program, err := l.Load()
 	if err != nil || program.Verify() != nil {
-		return false
+		if traced {
+			result := "verify_error"
+			if err != nil {
+				result = "load_error"
+			}
+			record(result, "not_reached", time.Now())
+		}
+		return false, false, false
 	}
 	entry := &accountsdb.ProgramCacheEntry{Program: program}
 	entry.BindSource(source, f)
-	db.AddProgramToCache(cacheKey, entry)
-	return true
+	var compiled time.Time
+	if traced {
+		compiled = time.Now()
+	}
+	admitted = db.AddProgramToCache(cacheKey, entry)
+	if traced {
+		publish := "refused"
+		if admitted {
+			publish = "admitted"
+		}
+		record("ok", publish, compiled)
+	}
+	return true, admitted, false
+}
+
+// compileRecord builds the readiness record of one compile and, for an
+// admitted entry, remembers the admission. Diagnostic only: it digests the
+// whole source, after the compile interval it reports.
+func compileRecord(key solana.PublicKey, source []byte, f *features.Features, cache string, start, compiled time.Time, result, publish string) progtrace.Compile {
+	rec := progtrace.Compile{
+		Kind: "compile", Key: key.String(), Cache: cache,
+		T: progtrace.At(start), CompileNs: int64(compiled.Sub(start)), Bytes: len(source),
+		Features: fmt.Sprintf("%p/%d", f.Identity(), features.Mutations()),
+		Result:   result, Publish: publish,
+	}
+	digest := progtrace.SourceDigest(source)
+	rec.Source = progtrace.Hex(digest)
+	if at, prior, invalidated, ok := progtrace.PriorAdmit(key); ok {
+		rec.PriorAdmit, rec.PriorSource, rec.PriorInvalidated = at, progtrace.Hex(prior), invalidated
+	}
+	if publish == "admitted" {
+		rec.PublishedAt = progtrace.Now()
+		progtrace.NoteAdmit(key, digest, rec.PublishedAt)
+	}
+	return rec
+}
+
+// traceExecutionCompile records a compile made while executing a transaction.
+func traceExecutionCompile(execCtx *ExecutionCtx, key solana.PublicKey, source []byte, cache string, start, compiled time.Time, result, publish string) {
+	rec := compileRecord(key, source, &execCtx.Features, cache, start, compiled, result, publish)
+	rec.Private = execCtx.PrivatePrograms
+	if execCtx.SlotCtx != nil {
+		rec.Slot = execCtx.SlotCtx.Slot
+	}
+	switch {
+	case execCtx.IsSimulation:
+		rec.Exec = "simulation"
+	case execCtx.Speculative:
+		rec.Exec = "work_ahead"
+	default:
+		rec.Exec = "canonical"
+	}
+	if execCtx.TransactionContext != nil {
+		rec.Depth = execCtx.StackHeight()
+		rec.Tx = execCtx.TransactionContext.Signature.String()
+	}
+	progtrace.Emit(rec)
 }
 
 // PreloadSource returns the cache key and executable source a program account
@@ -1497,11 +1605,37 @@ func PreloadSource(programKey solana.PublicKey, program *accounts.Account, slot 
 // then reloaded from authoritative account data, never retained from that stream.
 // Replay must discard its stream before executing a different bank.
 func addProgramToCache(execCtx *ExecutionCtx, programAddr solana.PublicKey, entry *accountsdb.ProgramCacheEntry) {
-	if execCtx.Speculative || execCtx.SlotCtx == nil || execCtx.SlotCtx.AccountsDb == nil {
-		return
+	publish := publishProgram(execCtx, programAddr, entry)
+	if progtrace.On() {
+		// A deploy or upgrade: the entry is not a compile on a cache miss.
+		now := progtrace.Now()
+		var slot uint64
+		if execCtx.SlotCtx != nil {
+			slot = execCtx.SlotCtx.Slot
+		}
+		if publish == "admitted" {
+			progtrace.NoteAdmit(programAddr, 0, now)
+		}
+		progtrace.Emit(progtrace.Publish{Kind: "deploy", Slot: slot, T: now, Key: programAddr.String(), Publish: publish})
 	}
-	execCtx.SlotCtx.AccountsDb.AddProgramToCache(programAddr, entry)
+}
+
+// publishProgram is addProgramToCache's insertion, reporting what happened:
+// admitted, refused (the cache declined the entry), skipped_speculative or
+// skipped_no_db. The behavior is addProgramToCache's; only the result is new.
+func publishProgram(execCtx *ExecutionCtx, programAddr solana.PublicKey, entry *accountsdb.ProgramCacheEntry) string {
+	if execCtx.Speculative {
+		return "skipped_speculative"
+	}
+	if execCtx.SlotCtx == nil || execCtx.SlotCtx.AccountsDb == nil {
+		return "skipped_no_db"
+	}
+	admitted := execCtx.SlotCtx.AccountsDb.AddProgramToCache(programAddr, entry)
 	execCtx.SlotCtx.RecordProgramCacheAdd(programAddr)
+	if !admitted {
+		return "refused"
+	}
+	return "admitted"
 }
 
 func mapVirtualAddressSpaceRunErr(execCtx *ExecutionCtx, err error, inputRegions []sbpf.InputRegion) error {

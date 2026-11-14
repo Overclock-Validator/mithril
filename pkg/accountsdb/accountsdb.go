@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"runtime/trace"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/Overclock-Validator/mithril/pkg/progtrace"
 	"github.com/Overclock-Validator/mithril/pkg/sbpf"
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/gagliardetto/solana-go"
@@ -251,6 +253,39 @@ func (entry *ProgramCacheEntry) BindSource(source []byte, f *features.Features) 
 	entry.sourceFeatures = *f.Clone()
 }
 
+// SourceMismatch names, for the readiness diagnostic, what keeps the entry
+// from matching: "source_mismatch", "feature_mismatch", both, or "" when it
+// matches. It compares the whole source and is not for the execution path.
+func (entry *ProgramCacheEntry) SourceMismatch(source []byte, f *features.Features) string {
+	if entry == nil || !entry.sourceBound {
+		return "source_mismatch"
+	}
+	sourceOK, featuresOK := bytes.Equal(entry.sourceBytes, source), entry.sourceFeatures.Equal(f)
+	switch {
+	case sourceOK && featuresOK:
+		return ""
+	case sourceOK:
+		return "feature_mismatch"
+	case featuresOK:
+		return "source_mismatch"
+	}
+	return "source_and_feature_mismatch"
+}
+
+// noteProgramCacheRemoval records an explicit removal with the function that
+// asked for it (readiness diagnostic only).
+func noteProgramCacheRemoval(pubkey solana.PublicKey) {
+	now := progtrace.Now()
+	reason := "unknown"
+	if pc, _, _, ok := runtime.Caller(2); ok {
+		if fn := runtime.FuncForPC(pc); fn != nil {
+			reason = fn.Name()
+		}
+	}
+	progtrace.NoteInvalidate(pubkey, now)
+	progtrace.Emit(progtrace.Publish{Kind: "invalidate", T: now, Key: pubkey.String(), Reason: reason})
+}
+
 func (entry *ProgramCacheEntry) MatchesSource(source []byte, f *features.Features) bool {
 	return entry != nil && entry.sourceBound && bytes.Equal(entry.sourceBytes, source) && entry.sourceFeaturesMatch(f)
 }
@@ -331,16 +366,22 @@ func (accountsDb *AccountsDb) ProgramCached(pubkey solana.PublicKey) bool {
 	return accountsDb.ProgramCache.Has(pubkey)
 }
 
-func (accountsDb *AccountsDb) AddProgramToCache(pubkey solana.PublicKey, programEntry *ProgramCacheEntry) {
+// AddProgramToCache offers the entry to the program cache and reports whether
+// the cache admitted it: an entry heavier than the cache's per-entry ceiling
+// is refused (see WeightedCache.Set).
+func (accountsDb *AccountsDb) AddProgramToCache(pubkey solana.PublicKey, programEntry *ProgramCacheEntry) bool {
 	accountsDb.programCacheMu.RLock()
 	defer accountsDb.programCacheMu.RUnlock()
-	accountsDb.ProgramCache.Set(pubkey, programEntry)
+	return accountsDb.ProgramCache.Set(pubkey, programEntry)
 }
 
 func (accountsDb *AccountsDb) RemoveProgramFromCache(pubkey solana.PublicKey) {
 	accountsDb.programCacheMu.RLock()
 	defer accountsDb.programCacheMu.RUnlock()
 	accountsDb.ProgramCache.Delete(pubkey)
+	if progtrace.On() {
+		noteProgramCacheRemoval(pubkey)
+	}
 }
 
 // AccountReadStats is one single-key read's exact wall-time decomposition.
@@ -655,6 +696,11 @@ func (accountsDb *AccountsDb) resetReadCachesLocked() {
 	accountsDb.programCacheMu.Lock()
 	accountsDb.ProgramCache.Clear()
 	accountsDb.programCacheMu.Unlock()
+	if progtrace.On() {
+		now := progtrace.Now()
+		progtrace.NoteInvalidateAll(now)
+		progtrace.Emit(progtrace.Publish{Kind: "invalidate_all", T: now, Reason: "read caches reset"})
+	}
 	accountsDb.commonAdmission = newCommonCacheAdmission()
 }
 
