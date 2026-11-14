@@ -142,8 +142,16 @@ type BoundaryStakeScanResult struct {
 // scanStakesForEpochBoundary first completes targetEpoch's stake history, then
 // uses that history to calculate effective stakes in newEpoch. The future
 // leader-schedule epoch is only the key under which that distribution is saved.
-// Two streaming passes avoid retaining all stake accounts or delegations.
+// A compact temporary stream avoids rereading AccountsDB for the second pass.
 func scanStakesForEpochBoundary(acctsDb *accountsdb.AccountsDb, slot uint64, targetEpoch uint64, newEpoch uint64, stakeHistory *sealevel.SysvarStakeHistory, epochSchedule *sealevel.SysvarEpochSchedule, f *features.Features) *BoundaryStakeScanResult {
+	result, spool := captureStakesForEpochBoundary(acctsDb, slot, targetEpoch, newEpoch, stakeHistory, epochSchedule, f)
+	defer spool.Close()
+	return result
+}
+
+// captureStakesForEpochBoundary returns the immutable parent delegation stream
+// as well, so reward points can reuse it. The caller owns the scratch file.
+func captureStakesForEpochBoundary(acctsDb *accountsdb.AccountsDb, slot uint64, targetEpoch uint64, newEpoch uint64, stakeHistory *sealevel.SysvarStakeHistory, epochSchedule *sealevel.SysvarEpochSchedule, f *features.Features) (*BoundaryStakeScanResult, *rewards.StakeDelegationSpool) {
 	newRateActivationEpoch := newWarmupCooldownRateEpoch(epochSchedule, f)
 
 	// Stake history accumulators (atomic — high contention from worker pool)
@@ -160,7 +168,10 @@ func scanStakesForEpochBoundary(acctsDb *accountsdb.AccountsDb, slot uint64, tar
 	var rewardEpochEffectiveStakesMu sync.Mutex
 	var totalEffectiveStake atomic.Uint64
 
-	_, err := global.StreamStakeAccounts(acctsDb, slot,
+	spool, err := rewards.CaptureStakeDelegations(filepath.Join(acctsDb.AcctsDir, ".."),
+		func(visit rewards.StakeAccountVisitor) (int, error) {
+			return global.StreamStakeAccounts(acctsDb, slot, visit)
+		},
 		func(pk solana.PublicKey, delegation *sealevel.Delegation, creditsObs uint64) {
 			// --- Stake history accumulation ---
 			if delegation.StakeLamports > 0 {
@@ -184,6 +195,13 @@ func scanStakesForEpochBoundary(acctsDb *accountsdb.AccountsDb, slot uint64, tar
 		panic(fmt.Sprintf("error scanning stake history at epoch boundary: %s", err))
 	}
 
+	retainSpool := false
+	defer func() {
+		if !retainSpool {
+			_ = spool.Close()
+		}
+	}()
+
 	// Match Agave's calculate_activated_stake: append the completed epoch
 	// before refreshing the new epoch's vote-account weights. Missing history
 	// can otherwise treat newly activating stake as fully effective and newly
@@ -195,7 +213,7 @@ func scanStakesForEpochBoundary(acctsDb *accountsdb.AccountsDb, slot uint64, tar
 		Deactivating: shDeactivating.Load(),
 	})
 
-	_, err = global.StreamStakeAccounts(acctsDb, slot,
+	_, err = spool.Stream(
 		func(pk solana.PublicKey, delegation *sealevel.Delegation, creditsObs uint64) {
 			effectiveStake := delegation.Stake(newEpoch, &newStakeHistory, newRateActivationEpoch)
 			if effectiveStake > 0 {
@@ -209,6 +227,7 @@ func scanStakesForEpochBoundary(acctsDb *accountsdb.AccountsDb, slot uint64, tar
 		panic(fmt.Sprintf("error scanning stake accounts at epoch boundary: %s", err))
 	}
 
+	retainSpool = true
 	return &BoundaryStakeScanResult{
 		StakeHistoryEffective:      shEffective.Load(),
 		StakeHistoryActivating:     shActivating.Load(),
@@ -217,7 +236,7 @@ func scanStakesForEpochBoundary(acctsDb *accountsdb.AccountsDb, slot uint64, tar
 		EffectiveStakes:            effectiveStakes,
 		RewardEpochEffectiveStakes: rewardEpochEffectiveStakes,
 		TotalEffectiveStake:        totalEffectiveStake.Load(),
-	}
+	}, spool
 }
 
 // updateStakeHistorySysvar applies pre-computed stake history data to the sysvar.
@@ -276,7 +295,8 @@ func handleEpochTransition(acctsDb *accountsdb.AccountsDb, partitionedEpochRewar
 
 	// Complete the old epoch's history before calculating the new epoch's stakes.
 	t0 := time.Now()
-	scanResult := scanStakesForEpochBoundary(acctsDb, prevSlotCtx.Slot, epoch, newEpoch, &stakeHistory, epochSchedule, f)
+	scanResult, stakeSpool := captureStakesForEpochBoundary(acctsDb, prevSlotCtx.Slot, epoch, newEpoch, &stakeHistory, epochSchedule, f)
+	defer stakeSpool.Close()
 	t1 := time.Now()
 
 	updateEpochStakesAndRefreshVoteCache(leaderScheduleEpoch, block, acctsDb, prevSlotCtx.Slot, scanResult, f, epochSchedule)
@@ -342,7 +362,7 @@ func handleEpochTransition(acctsDb *accountsdb.AccountsDb, partitionedEpochRewar
 		var epochRewardsCapitalizationIncrease uint64
 		partitionedRewardsInfo, updated, parents, epochRewardsCapitalizationIncrease = beginPartitionedEpochRewardsDistribution(
 			acctsDb, prevSlotCtx, &stakeHistory, replayCtx, epochSchedule,
-			block, f, newEpoch, block.Slot, rpcc, dbgOpts, mode, block.EpochUpdatedAccts,
+			block, f, newEpoch, block.Slot, rpcc, dbgOpts, mode, block.EpochUpdatedAccts, stakeSpool.Stream,
 		)
 		block.EpochUpdatedAccts = append(block.EpochUpdatedAccts, updated...)
 		block.ParentEpochUpdatedAccts = append(block.ParentEpochUpdatedAccts, parents...)

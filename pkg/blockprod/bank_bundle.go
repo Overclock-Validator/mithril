@@ -91,6 +91,9 @@ func (b *WorkingBank) ForgeBundle(in BundleInput) BundleResult {
 			return BundleResult{Result: ForgeDroppedCost, Reason: reason, Index: -1}
 		}
 	}
+	if err := replay.PrepareLeaderTransactionParents(b.slotCtx, outputs...); err != nil {
+		return BundleResult{Result: ForgeDroppedExecution, Index: -1, Err: err}
+	}
 	if err := replay.ApplySuccessfulTransactions(b.slotCtx, outputs); err != nil {
 		return BundleResult{Result: ForgeDroppedExecution, Index: -1, Err: err}
 	}

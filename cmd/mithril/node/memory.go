@@ -143,6 +143,8 @@ func writeHeapProfile(path string) error {
 // pressure alone could explain slow replay.
 func logDiagnosticsSummary(w metrics.RuntimeWindow) {
 	mlog.Log.FileOnlyf("runtime diagnostics: %s | %s", w, metrics.DiagnosticsSummary())
+	resets, used, overflow, allocations := replay.ParameterArenaUsage()
+	mlog.Log.FileOnlyf("parameter arena totals: resets=%d used_bytes=%d overflow_bytes=%d overflow_allocs=%d", resets, used, overflow, allocations)
 	if w.SchedLatencyP99 >= schedLatencyWarnP99 || w.GCCPUFraction >= gcCPUFractionWarn {
 		mlog.Log.Warnf("runtime pressure over the last %.0fs: %s", w.Seconds, w)
 	}

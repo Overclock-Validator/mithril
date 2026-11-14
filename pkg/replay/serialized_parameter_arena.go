@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/arena"
+	"github.com/Overclock-Validator/mithril/pkg/metrics"
 )
 
 // Banks alternate between two parameter arenas. Opening a bank switches to the
@@ -17,6 +18,32 @@ var parameterArenas struct {
 	active, spare *arena.Arena[byte]
 	spareClean    chan struct{} // closed once spare is zeroed
 	hurry         *atomic.Bool  // set when a bank is waiting for spareClean
+}
+
+var parameterArenaUsed = metrics.NewLevel("replay.parameter_arena_used_bytes")
+var parameterArenaOverflow = metrics.NewLevel("replay.parameter_arena_overflow_bytes")
+
+var parameterArenaTotals struct {
+	resets, usedBytes, overflowBytes, overflowAllocs atomic.Uint64
+}
+
+// ParameterArenaUsage returns cumulative counters sampled at arena resets,
+// including empty and abandoned executions. It does not inspect the active
+// arena, which may be in use or clearing on another goroutine.
+func ParameterArenaUsage() (resets, usedBytes, overflowBytes, overflowAllocs uint64) {
+	return parameterArenaTotals.resets.Load(), parameterArenaTotals.usedBytes.Load(),
+		parameterArenaTotals.overflowBytes.Load(), parameterArenaTotals.overflowAllocs.Load()
+}
+
+func recordParameterArenaUsage(a *arena.Arena[byte]) {
+	used := a.Used()
+	overflow, allocations := a.Overflow()
+	parameterArenaUsed.Observe(used, a.Capacity())
+	parameterArenaOverflow.Observe(overflow, a.Capacity())
+	parameterArenaTotals.resets.Add(1)
+	parameterArenaTotals.usedBytes.Add(used)
+	parameterArenaTotals.overflowBytes.Add(overflow)
+	parameterArenaTotals.overflowAllocs.Add(allocations)
 }
 
 // Clear 4 MiB at a time with a short pause after each piece, so the clearing
@@ -38,6 +65,7 @@ func resetSerializedParameterArena() {
 	if SerializedParameterArena == nil {
 		return
 	}
+	recordParameterArenaUsage(SerializedParameterArena)
 	pair := &parameterArenas
 	if pair.active != SerializedParameterArena {
 		// First reset, or the arena was replaced: pair it with a fresh spare.

@@ -22,8 +22,8 @@ func TestConfiguredCompletionReserveKeepsProtocolDeadlines(t *testing.T) {
 		deadline := ready.Add(time.Duration(offset+1) * 200 * time.Millisecond)
 		require.Equal(t, deadline, loop.productionWindowProtocolDeadlineLocked(slot))
 		require.Equal(t, deadline.Add(-60*time.Millisecond), loop.productionWindowDeadlineLocked(slot))
-		// The override admits starts during the additional 15ms, but still
-		// rejects at its own cutoff instead of extending the protocol deadline.
+		// The override reserves more time than the default and rejects at its
+		// own cutoff without changing the protocol deadline.
 		now = deadline.Add(-70 * time.Millisecond)
 		require.NoError(t, loop.productionStartCutoffErrorLocked(slot))
 		now = deadline.Add(-60 * time.Millisecond)

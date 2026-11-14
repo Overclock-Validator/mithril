@@ -27,13 +27,11 @@ const (
 	// It also bounds the footer nanosecond clock and ParentReady-derived block
 	// deadlines; keeping those clocks identical prevents late/missed slots.
 	AlpenglowSlotDuration = 200 * time.Millisecond
-	// Leave enough time for the Go finalizer, footer shredding, and synchronous
-	// UDP fanout to complete before Votor's per-slot deadline. A two-hour live
-	// trace measured 29-55ms from the old 25ms cutoff through completion: 328 of
-	// 340 blocks finished after their protocol deadline and later leaders
-	// discarded 52 of 85 locally produced windows. Keep 20ms above that
-	// observed worst case for scheduler and network jitter.
-	leaderBlockCompletionReserve = 75 * time.Millisecond
+	// Reserve time for bank finalization, footer shredding and UDP fanout after
+	// the execution cutoff. This configurable target is not an execution timeout:
+	// scratch readers must quiesce first. Tune from completion and signed
+	// deadline-margin histograms; tail latency can exceed this default.
+	leaderBlockCompletionReserve = 15 * time.Millisecond
 )
 
 var errParentNotReady = errors.New("parent not ready")
@@ -86,24 +84,33 @@ type RewardCertBuilder interface {
 	BuildForLeaderSlot(slot uint64) rewardcerts.RewardCertificates
 }
 
+type rewardCertPreparer interface {
+	PrepareForLeaderSlot(slot uint64)
+}
+
+type preparedRewardCertConsumer interface {
+	TakeForLeaderSlot(slot uint64) (rewardcerts.RewardCertificates, rewardcerts.PreparationStatus)
+}
+
 type LeaderLoop struct {
-	controller       *Controller
-	identity         *identity.Holder
-	accountsDb       *accountsdb.AccountsDb
-	broadcaster      turbine.PacketBroadcaster
-	shredVersion     uint16
-	userAgent        []byte
-	rewardCerts      RewardCertBuilder
-	epochSchedule    *sealevel.SysvarEpochSchedule
-	alpenglowClock   bool
-	parentContext    func(uint64) ParentContext
-	productionParent func(uint64) alpenglow.BlockProductionParent
-	canSignSlot      func(uint64) bool
-	onBlock          func(*b.Block)
-	commitLeaderSlot func(replay.CommitLeaderInput) (*sealevel.SlotCtx, error)
-	hooks            LeaderHooks
-	holder           SlotHolder
-	gateTPU          bool
+	controller            *Controller
+	identity              *identity.Holder
+	accountsDb            *accountsdb.AccountsDb
+	broadcaster           turbine.PacketBroadcaster
+	shredVersion          uint16
+	userAgent             []byte
+	rewardCerts           RewardCertBuilder
+	epochSchedule         *sealevel.SysvarEpochSchedule
+	alpenglowClock        bool
+	parentContext         func(uint64) ParentContext
+	parentGenerationLease func(uint64) (func(), bool)
+	productionParent      func(uint64) alpenglow.BlockProductionParent
+	canSignSlot           func(uint64) bool
+	onBlock               func(*b.Block)
+	commitLeaderSlot      func(replay.CommitLeaderInput) (*sealevel.SlotCtx, error)
+	hooks                 LeaderHooks
+	holder                SlotHolder
+	gateTPU               bool
 
 	currentSlot   func() uint64
 	leaderForSlot func(uint64) (solana.PublicKey, bool)
@@ -118,12 +125,14 @@ type LeaderLoop struct {
 	mu                      sync.Mutex
 	activeSlot              uint64
 	activeBank              *WorkingBank
+	activeEpochRewards      *replay.LeaderEpochRewards
 	activeSess              *turbine.BroadcastSession
 	activeSink              *ShredSink
 	parentCtx               ParentContext
 	activeParentID          solana.Hash
 	activeParentChainedRoot solana.Hash
 	activeParentGeneration  uint64
+	activeHoldStartedAt     time.Time
 	finishedLeaderSlots     map[uint64]struct{}
 	pendingFailures         map[uint64]leaderSlotFailure
 	missedScanNext          uint64
@@ -141,20 +150,23 @@ type leaderProductionWindow struct {
 }
 
 type LeaderLoopConfig struct {
-	Controller       *Controller
-	Identity         *identity.Holder // read when a slot starts; the slot keeps that identity across a swap
-	AccountsDb       *accountsdb.AccountsDb
-	Broadcaster      turbine.PacketBroadcaster
-	ShredVersion     uint16
-	UserAgent        []byte
-	EpochSchedule    *sealevel.SysvarEpochSchedule
-	AlpenglowClock   bool
-	ParentContext    func(uint64) ParentContext
-	ProductionParent func(slot uint64) alpenglow.BlockProductionParent
-	CanSignSlot      func(slot uint64) bool
-	OnBlock          func(*b.Block)
-	CurrentSlot      func() uint64
-	LeaderForSlot    func(uint64) (solana.PublicKey, bool)
+	Controller     *Controller
+	Identity       *identity.Holder // read when a slot starts; the slot keeps that identity across a swap
+	AccountsDb     *accountsdb.AccountsDb
+	Broadcaster    turbine.PacketBroadcaster
+	ShredVersion   uint16
+	UserAgent      []byte
+	EpochSchedule  *sealevel.SysvarEpochSchedule
+	AlpenglowClock bool
+	ParentContext  func(uint64) ParentContext
+	// ParentGenerationLease protects final footer publication against replay
+	// invalidating the selected parent. Release precedes the OnBlock handoff.
+	ParentGenerationLease func(uint64) (release func(), ok bool)
+	ProductionParent      func(slot uint64) alpenglow.BlockProductionParent
+	CanSignSlot           func(slot uint64) bool
+	OnBlock               func(*b.Block)
+	CurrentSlot           func() uint64
+	LeaderForSlot         func(uint64) (solana.PublicKey, bool)
 	// ParentBlockID is retained for source compatibility and ignored. Parent
 	// identity is supplied atomically by ParentContext.
 	ParentBlockID func(parentSlot uint64) (solana.Hash, bool)
@@ -162,7 +174,7 @@ type LeaderLoopConfig struct {
 	PollInterval  time.Duration
 	SlotDuration  time.Duration
 	// CompletionReserve is time retained for finalization and broadcast. Zero
-	// uses the conservative default; tune only from measured completion times.
+	// uses the 15ms default; tune from measured completion margins.
 	CompletionReserve time.Duration
 	Now               func() time.Time
 	Hooks             LeaderHooks
@@ -189,41 +201,68 @@ func NewLeaderLoop(cfg LeaderLoopConfig) *LeaderLoop {
 	}
 	holder, _ := cfg.Hooks.(SlotHolder)
 	return &LeaderLoop{
-		controller:          cfg.Controller,
-		identity:            cfg.Identity,
-		accountsDb:          cfg.AccountsDb,
-		broadcaster:         cfg.Broadcaster,
-		shredVersion:        cfg.ShredVersion,
-		userAgent:           cfg.UserAgent,
-		epochSchedule:       cfg.EpochSchedule,
-		alpenglowClock:      cfg.AlpenglowClock,
-		parentContext:       cfg.ParentContext,
-		productionParent:    cfg.ProductionParent,
-		canSignSlot:         cfg.CanSignSlot,
-		onBlock:             cfg.OnBlock,
-		currentSlot:         cfg.CurrentSlot,
-		leaderForSlot:       cfg.LeaderForSlot,
-		rewardCerts:         cfg.RewardCerts,
-		pollInterval:        cfg.PollInterval,
-		slotDuration:        cfg.SlotDuration,
-		completionReserve:   cfg.CompletionReserve,
-		now:                 cfg.Now,
-		hooks:               cfg.Hooks,
-		holder:              holder,
-		gateTPU:             cfg.GateTPU && cfg.Hooks != nil,
-		finishedLeaderSlots: make(map[uint64]struct{}),
-		pendingFailures:     make(map[uint64]leaderSlotFailure),
+		controller:            cfg.Controller,
+		identity:              cfg.Identity,
+		accountsDb:            cfg.AccountsDb,
+		broadcaster:           cfg.Broadcaster,
+		shredVersion:          cfg.ShredVersion,
+		userAgent:             cfg.UserAgent,
+		epochSchedule:         cfg.EpochSchedule,
+		alpenglowClock:        cfg.AlpenglowClock,
+		parentContext:         cfg.ParentContext,
+		parentGenerationLease: cfg.ParentGenerationLease,
+		productionParent:      cfg.ProductionParent,
+		canSignSlot:           cfg.CanSignSlot,
+		onBlock:               cfg.OnBlock,
+		currentSlot:           cfg.CurrentSlot,
+		leaderForSlot:         cfg.LeaderForSlot,
+		rewardCerts:           cfg.RewardCerts,
+		pollInterval:          cfg.PollInterval,
+		slotDuration:          cfg.SlotDuration,
+		completionReserve:     cfg.CompletionReserve,
+		now:                   cfg.Now,
+		hooks:                 cfg.Hooks,
+		holder:                holder,
+		gateTPU:               cfg.GateTPU && cfg.Hooks != nil,
+		finishedLeaderSlots:   make(map[uint64]struct{}),
+		pendingFailures:       make(map[uint64]leaderSlotFailure),
 	}
 }
 
 func (l *LeaderLoop) Run(stop <-chan struct{}) {
 	ticker := time.NewTicker(l.pollInterval)
 	defer ticker.Stop()
+	// Polling observes parent/replay changes; a separate timer makes completion
+	// independent of the next poll. Re-arm the same timer after every event.
+	deadlineTimer := time.NewTimer(time.Hour)
+	if !deadlineTimer.Stop() {
+		<-deadlineTimer.C
+	}
+	defer deadlineTimer.Stop()
+	var deadlineC <-chan time.Time
 	var released <-chan struct{}
 	if l.holder != nil {
 		released = l.holder.Released()
 	}
 
+	armDeadline := func() {
+		if !deadlineTimer.Stop() {
+			select {
+			case <-deadlineTimer.C:
+			default:
+			}
+		}
+		l.mu.Lock()
+		deadline := l.nextCompletionWakeLocked()
+		now := l.now()
+		l.mu.Unlock()
+		deadlineC = nil
+		if !deadline.IsZero() {
+			deadlineTimer.Reset(max(deadline.Sub(now), 0))
+			deadlineC = deadlineTimer.C
+		}
+	}
+	armDeadline()
 	for {
 		select {
 		case <-stop:
@@ -233,8 +272,24 @@ func (l *LeaderLoop) Run(stop <-chan struct{}) {
 			l.tickScheduled(scheduledAt)
 		case <-released:
 			l.tick()
+		case <-deadlineC:
+			l.tick()
 		}
+		armDeadline()
 	}
+}
+
+// A busy release channel cannot starve the cutoff: every event runs tick
+// before re-arming the timer, and tick checks the current deadline itself.
+func (l *LeaderLoop) nextCompletionWakeLocked() time.Time {
+	if l.activeBank == nil || !l.productionWindow.active {
+		return time.Time{}
+	}
+	cutoff := l.productionWindowDeadlineLocked(l.activeSlot)
+	if l.now().Before(cutoff) {
+		return cutoff
+	}
+	return l.activeHoldDeadlineLocked()
 }
 
 func (l *LeaderLoop) tick() {
@@ -273,7 +328,13 @@ func (l *LeaderLoop) tickScheduled(scheduledAt time.Time) {
 			}
 			now = l.now()
 			if l.productionWindow.active {
-				if now.Before(l.productionWindowDeadlineLocked(l.activeSlot)) || l.holdActiveSlotLocked(now) {
+				if now.Before(l.productionWindowDeadlineLocked(l.activeSlot)) {
+					return
+				}
+				if l.holdActiveSlotLocked(now) {
+					if l.activeHoldStartedAt.IsZero() {
+						l.activeHoldStartedAt = now
+					}
 					return
 				}
 			} else if wallSlot <= l.activeSlot {
@@ -303,6 +364,12 @@ func (l *LeaderLoop) tickScheduled(scheduledAt time.Time) {
 		}
 		if l.isLeaderSlotFinishedLocked(targetSlot) {
 			return
+		}
+		// Prepare only the slot selected by ParentReady, before replay or bank
+		// creation can delay its start. Preparing future slots in the window
+		// would snapshot their N-8 vote sets prematurely and miss late voters.
+		if preparer, ok := l.rewardCerts.(rewardCertPreparer); ok {
+			preparer.PrepareForLeaderSlot(targetSlot)
 		}
 
 		if ready, err := l.leaderSlotReplayReady(targetSlot); !ready {
@@ -627,11 +694,27 @@ func (l *LeaderLoop) productionWindowDeadlineLocked(slot uint64) time.Time {
 	return deadline.Add(-reserve)
 }
 
-// holdActiveSlotLocked reports whether the hooks keep the active slot open past
-// its production deadline. The protocol deadline always ends the hold.
+func (l *LeaderLoop) productionWindowDrainDeadlineLocked(slot uint64) time.Time {
+	cutoff := l.productionWindowDeadlineLocked(slot)
+	if cutoff.IsZero() {
+		return time.Time{}
+	}
+	reserve := l.productionWindowProtocolDeadlineLocked(slot).Sub(cutoff)
+	return cutoff.Add(min(reserve/4, 5*time.Millisecond))
+}
+
+func (l *LeaderLoop) activeHoldDeadlineLocked() time.Time {
+	if _, ok := l.holder.(DeadlineSlotHolder); ok {
+		return l.productionWindowDrainDeadlineLocked(l.activeSlot)
+	}
+	return l.productionWindowProtocolDeadlineLocked(l.activeSlot)
+}
+
+// Deadline-aware hooks drain briefly after the cutoff while retaining most of
+// the reserve for bank finalization and network broadcast.
 func (l *LeaderLoop) holdActiveSlotLocked(now time.Time) bool {
 	return l.holder != nil &&
-		now.Before(l.productionWindowProtocolDeadlineLocked(l.activeSlot)) &&
+		now.Before(l.activeHoldDeadlineLocked()) &&
 		l.holder.HoldSlot(l.activeSlot)
 }
 
@@ -655,6 +738,31 @@ func (l *LeaderLoop) productionTimingDetailLocked(slot uint64, finalizationStart
 		networkCompletedAt.Sub(l.productionWindow.readyAt).Milliseconds(),
 		networkCompletedAt.Sub(finalizationStartedAt).Milliseconds(),
 		protocolDeadline.Sub(networkCompletedAt).Milliseconds())
+}
+
+// Emit these diagnostics after publication/handoff, but use the captured
+// network timestamp so local replay backpressure cannot create a false miss.
+func (l *LeaderLoop) recordCompletionMetricsLocked(slot uint64, finalizationStartedAt, networkCompletedAt time.Time) {
+	completion := networkCompletedAt.Sub(finalizationStartedAt)
+	_ = statsd.Duration(statsd.BlockProductionCompletion, completion, nil)
+	protocolDeadline := l.productionWindowProtocolDeadlineLocked(slot)
+	if protocolDeadline.IsZero() {
+		return
+	}
+	margin := protocolDeadline.Sub(networkCompletedAt)
+	_ = statsd.SignedDuration(statsd.BlockProductionDeadlineMargin, margin, nil)
+	if margin < 0 {
+		_ = statsd.Count(statsd.BlockProductionDeadlineMisses, 1, nil)
+		mlog.Log.Warnf("ALPENGLOW block production: slot=%d completed after protocol deadline deadline_margin_ms=%.3f finalization_ms=%.3f; inspect completion timings and block_completion_reserve_ms",
+			slot, float64(margin)/float64(time.Millisecond), float64(completion)/float64(time.Millisecond))
+	}
+}
+
+func recordRewardPreparation(slot uint64, status string) {
+	_ = statsd.Count(statsd.BlockProductionRewardPreparation, 1, []string{status})
+	if status == "missing" {
+		mlog.Log.Warnf("ALPENGLOW block production: slot=%d reward preparation unavailable at finalization; continuing with no prepared reward certificates", slot)
+	}
 }
 
 func (l *LeaderLoop) failProductionWindowLocked(slot uint64, reason, detail string) {
@@ -770,12 +878,14 @@ func (l *LeaderLoop) releaseActiveSlotLocked() {
 		l.activeSink.Discard()
 	}
 	l.activeBank = nil
+	l.activeEpochRewards = nil
 	l.activeSess = nil
 	l.activeSink = nil
 	l.activeSlot = 0
 	l.activeParentID = solana.Hash{}
 	l.activeParentChainedRoot = solana.Hash{}
 	l.activeParentGeneration = 0
+	l.activeHoldStartedAt = time.Time{}
 }
 
 func leaderFailureReason(err error) string {
@@ -983,11 +1093,25 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 	}
 	finalizationStartedAt := l.now()
 	slot := l.activeSlot
+	var drainStatus SlotDrainStatus
+	if holder, ok := l.holder.(DeadlineSlotHolder); ok {
+		drainStatus = holder.DrainStatus(slot)
+	}
+	var cutoffDelay, holdDuration, drainDeadlineLag time.Duration
+	if l.productionWindow.active {
+		cutoffDelay = max(finalizationStartedAt.Sub(l.productionWindowDeadlineLocked(slot)), 0)
+		if !l.activeHoldStartedAt.IsZero() {
+			holdDuration = max(finalizationStartedAt.Sub(l.activeHoldStartedAt), 0)
+		}
+		drainDeadlineLag = max(finalizationStartedAt.Sub(l.activeHoldDeadlineLocked()), 0)
+	}
+	parentValidationStartedAt := time.Now()
 	if canonical, reason := l.activeParentStillCanonicalLocked(); !canonical {
 		l.failProductionWindowLocked(slot, reason, activeLeaderFailureDetail(reason))
 		l.abortActiveSlotLocked(reason)
 		return
 	}
+	parentValidationDuration := time.Since(parentValidationStartedAt)
 
 	phaseStartedAt := time.Now()
 	if l.hooks != nil {
@@ -1000,16 +1124,21 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 	if l.controller != nil {
 		l.controller.ClearWorkingBank()
 	}
-	l.activeBank.Freeze()
+	executionQuiescenceDuration := l.activeBank.freezeAndMeasureExecutionWait()
 	freezeDuration := time.Since(phaseStartedAt)
+	// Record after this attempt exits so metrics work cannot extend the footer
+	// deadline. Also observe attempts which freeze but abort before broadcast.
+	defer func() {
+		_ = statsd.Duration(statsd.BlockProductionExecutionQuiescence, executionQuiescenceDuration, nil)
+	}()
 	if l.activeSink == nil {
 		l.failProductionWindowLocked(slot, leaderReasonFinalizationUnavailable, "entry broadcast sink is unavailable")
 		l.abortActiveSlotLocked(leaderReasonFinalizationUnavailable)
 		return
 	}
-	phaseStartedAt = time.Now()
-	l.activeSink.Wait()
-	entryDrainDuration := time.Since(phaseStartedAt)
+	// Freeze enqueues an owned copy of the last entry batch. The shred worker
+	// touches only the broadcast session, so let it drain while we finalize the
+	// bank. A known broadcast failure can still abort without doing that work.
 	if err := l.activeSink.Err(); err != nil {
 		l.failProductionWindowLocked(slot, leaderReasonEntryBroadcastFailed, err.Error())
 		l.abortActiveSlotLocked(leaderReasonEntryBroadcastFailed)
@@ -1022,11 +1151,23 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 	footerTimestamp := int64(producerTimeNanos / 1_000_000_000)
 
 	var footerRewards rewardcerts.RewardCertificates
+	rewardPreparation := "disabled"
+	var rewardPreparationDuration time.Duration
 	phaseStartedAt = time.Now()
-	if l.rewardCerts != nil {
+	if prepared, ok := l.rewardCerts.(preparedRewardCertConsumer); ok {
+		var status rewardcerts.PreparationStatus
+		footerRewards, status = prepared.TakeForLeaderSlot(slot)
+		rewardPreparation = "missing"
+		if status.Ready {
+			rewardPreparation = "ready"
+		}
+		rewardPreparationDuration = status.BuildDuration
+	} else if l.rewardCerts != nil {
 		footerRewards = l.rewardCerts.BuildForLeaderSlot(slot)
+		rewardPreparation = "synchronous"
 	}
 	rewardCertDuration := time.Since(phaseStartedAt)
+	defer recordRewardPreparation(slot, rewardPreparation)
 
 	if l.accountsDb == nil || l.activeSess == nil {
 		l.failProductionWindowLocked(slot, leaderReasonFinalizationUnavailable, "accounts DB or broadcast session is unavailable")
@@ -1050,6 +1191,7 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 		EntryBlockhash:      tickHash,
 		TxFeeAccumulator:    l.activeBank.TxFeeAccumulator(),
 	})
+	l.activeEpochRewards.Attach(producedBlock)
 	producedBlock.SkipRewardCert = append([]byte(nil), footerRewards.Skip...)
 	producedBlock.NotarRewardCert = append([]byte(nil), footerRewards.Notar...)
 	producedBlock.FooterProducerTimeNanos = producerTimeNanos
@@ -1083,15 +1225,49 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 		return
 	}
 	commitDuration := time.Since(phaseStartedAt)
+	// The footer shares the entry worker's chained Merkle state. Join before
+	// touching the session, and fail closed if any entry could not be sent.
+	// entry_drain_ms measures the remaining wait after overlapping bank work.
+	phaseStartedAt = time.Now()
+	l.activeSink.Wait()
+	entryDrainDuration := time.Since(phaseStartedAt)
+	if err := l.activeSink.Err(); err != nil {
+		l.failProductionWindowLocked(slot, leaderReasonEntryBroadcastFailed, err.Error())
+		l.abortActiveSlotLocked(leaderReasonEntryBroadcastFailed)
+		return
+	}
 
+	parentValidationStartedAt = time.Now()
 	if canonical, reason := l.activeParentStillCanonicalLocked(); !canonical {
 		l.failProductionWindowLocked(slot, reason, activeLeaderFailureDetail(reason))
 		l.abortActiveSlotLocked(reason)
 		return
 	}
+	parentValidationDuration += time.Since(parentValidationStartedAt)
 	footerBankhash := solana.HashFromBytes(l.activeBank.SlotCtx().FinalBankhash)
+	// Pin only final publication, after preparation/draining and the last
+	// canonical-parent check. Replay must invalidate this generation before
+	// changing the account lineage; it cannot do so between our check and footer.
+	var releaseParent func()
+	if l.parentGenerationLease != nil {
+		var current bool
+		releaseParent, current = l.parentGenerationLease(l.activeParentGeneration)
+		if !current {
+			l.failProductionWindowLocked(slot, leaderReasonParentChangedBeforeFreeze, "replay parent generation changed before footer publication")
+			l.abortActiveSlotLocked(leaderReasonParentChangedBeforeFreeze)
+			return
+		}
+	}
+	releasePublication := func() {
+		if releaseParent != nil {
+			releaseParent()
+			releaseParent = nil
+		}
+	}
+	defer releasePublication()
 	phaseStartedAt = time.Now()
 	if err := l.activeSess.BroadcastFooter(footerBankhash, producerTimeNanos, footerRewards.Skip, footerRewards.Notar); err != nil {
+		releasePublication()
 		l.failProductionWindowLocked(slot, leaderReasonFooterBroadcastFailed, err.Error())
 		l.abortActiveSlotLocked(leaderReasonFooterBroadcastFailed)
 		return
@@ -1101,6 +1277,7 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 	// emitted when they fill a FEC set; Freeze already flushed any leftover.
 	phaseStartedAt = time.Now()
 	if err := l.activeSess.BroadcastEndingTickLast(tickHash); err != nil {
+		releasePublication()
 		l.failProductionWindowLocked(slot, leaderReasonEndingTickBroadcastFailed, err.Error())
 		l.abortActiveSlotLocked(leaderReasonEndingTickBroadcastFailed)
 		return
@@ -1123,7 +1300,8 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 		producedBlock.HasAlpenglowLastChainedRoot = true
 		global.SetAlpenglowChainedMerkleRoot(slot, chained)
 	}
-	replay.RegisterLocalLeaderCommit(l.activeBank.SlotCtx())
+	replay.RegisterLocalLeaderBlockCommit(l.activeBank.SlotCtx(), producedBlock, l.activeEpochRewards)
+	releasePublication()
 	if l.onBlock != nil {
 		handoffStartedAt := l.now()
 		l.onBlock(producedBlock)
@@ -1133,11 +1311,17 @@ func (l *LeaderLoop) finishActiveSlotLocked() {
 	}
 	// Format diagnostics only after network completion and local handoff;
 	// phase timers do not participate in protocol/deadline calculations.
+	l.recordCompletionMetricsLocked(slot, finalizationStartedAt, networkCompletedAt)
 	ms := func(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
-	timingDetail += fmt.Sprintf(" slot_ending_ms=%.3f freeze_ms=%.3f entry_drain_ms=%.3f reward_certs_ms=%.3f"+
-		" build_block_ms=%.3f bank_commit_ms=%.3f footer_broadcast_ms=%.3f ending_tick_broadcast_ms=%.3f",
-		ms(slotEndingDuration), ms(freezeDuration), ms(entryDrainDuration), ms(rewardCertDuration),
-		ms(buildBlockDuration), ms(commitDuration), ms(footerDuration), ms(endingTickDuration)) + bankTimings.String()
+	timingDetail += fmt.Sprintf(" slot_ending_ms=%.3f freeze_ms=%.3f execution_quiescence_ms=%.3f entry_drain_ms=%.3f reward_certs_ms=%.3f"+
+		" build_block_ms=%.3f bank_commit_ms=%.3f footer_broadcast_ms=%.3f ending_tick_broadcast_ms=%.3f"+
+		" reward_prepare=%s reward_prepare_ms=%.3f reward_skip_bytes=%d reward_notar_bytes=%d"+
+		" cutoff_delay_ms=%.3f hold_ms=%.3f drain_deadline_lag_ms=%.3f drain_outstanding=%d drain_events=%d drain_inflight=%t parent_validation_ms=%.3f",
+		ms(slotEndingDuration), ms(freezeDuration), ms(executionQuiescenceDuration), ms(entryDrainDuration), ms(rewardCertDuration),
+		ms(buildBlockDuration), ms(commitDuration), ms(footerDuration), ms(endingTickDuration),
+		rewardPreparation, ms(rewardPreparationDuration), len(footerRewards.Skip), len(footerRewards.Notar),
+		ms(cutoffDelay), ms(holdDuration), ms(drainDeadlineLag), drainStatus.Outstanding,
+		drainStatus.QueuedEvents, drainStatus.PipelineInFlight, ms(parentValidationDuration)) + bankTimings.String()
 	l.recordLeaderSlotOutcomeLocked(slot, leaderOutcomeBroadcast, leaderReasonComplete,
 		fmt.Sprintf("block=%s parent_slot=%d txns=%d%s", solana.Hash(producedBlock.AlpenglowBlockID).String(), producedBlock.ParentSlot, len(producedBlock.Transactions), timingDetail))
 	l.advanceProductionWindowLocked(slot)
@@ -1219,7 +1403,7 @@ func (l *LeaderLoop) startSlotLocked(slot uint64) error {
 	if slot > 0 && epochSchedule != nil && epochSchedule.GetEpoch(parentSlot) != epochSchedule.GetEpoch(slot) {
 		return fmt.Errorf("%w: parent block is slot %d", errEpochTransitionProductionUnsupported, parentSlot)
 	}
-	if parentCtx.EpochRewardsActive {
+	if parentCtx.EpochRewardsActive && parentCtx.EpochRewardPlan == nil {
 		return errEpochRewardsProductionUnsupported
 	}
 	if slot > 0 && (parentCtx.TransactionStatuses == nil || !parentCtx.TransactionStatuses.CoverageComplete()) {
@@ -1269,12 +1453,18 @@ func (l *LeaderLoop) startSlotLocked(slot uint64) error {
 	if err != nil {
 		return fmt.Errorf("new leader slot ctx: %w", err)
 	}
+	var epochRewards *replay.LeaderEpochRewards
 	if l.accountsDb != nil && epochSchedule != nil {
 		prepBlock := &b.Block{
 			Slot:           slot,
 			ParentSlot:     parentSlot,
 			Epoch:          epochSchedule.GetEpoch(slot),
 			ParentBankhash: parentCtx.ParentBankhash,
+			BlockHeight:    parentCtx.ParentBlockHeight + 1,
+		}
+		epochRewards, err = replay.PrepareLeaderEpochRewards(slotCtx, prepBlock, parentCtx.EpochRewardPlan)
+		if err != nil {
+			return fmt.Errorf("%w: %v", errEpochRewardsProductionUnsupported, err)
 		}
 		if err := replay.PrepareLeaderSlotSysvars(slotCtx, prepBlock, l.alpenglowClock); err != nil {
 			return fmt.Errorf("prepare leader sysvars: %w", err)
@@ -1339,6 +1529,7 @@ func (l *LeaderLoop) startSlotLocked(slot uint64) error {
 	l.parentCtx = parentCtx
 	l.activeSlot = slot
 	l.activeBank = bank
+	l.activeEpochRewards = epochRewards
 	l.activeSess = session
 	l.activeSink = sink
 	l.activeParentID = parentID
