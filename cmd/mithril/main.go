@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"os"
 	"os/signal"
@@ -18,6 +19,7 @@ import (
 	"github.com/Overclock-Validator/mithril/cmd/mithril/statuscmd"
 	"github.com/Overclock-Validator/mithril/cmd/mithril/timingscmd"
 	"github.com/Overclock-Validator/mithril/pkg/config"
+	"github.com/Overclock-Validator/mithril/pkg/progtrace"
 	"github.com/spf13/cobra"
 	"k8s.io/klog/v2"
 
@@ -70,7 +72,14 @@ func init() {
 }
 
 func main() {
+	// Explicit diagnostics must fail visibly instead of silently producing no
+	// trace. This is a no-op unless the program-readiness switch was set.
+	cobra.CheckErr(progtrace.StartupError())
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	cobra.CheckErr(cmd.ExecuteContext(ctx))
+	err := cmd.ExecuteContext(ctx)
+	// ExecuteContext has returned through command cleanup (including replay's
+	// prefetch/work-ahead joins). Drain before CheckErr can call os.Exit.
+	traceErr := progtrace.Finish()
+	cobra.CheckErr(errors.Join(err, traceErr))
 }

@@ -17,8 +17,10 @@ import (
 	"bufio"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -43,25 +45,34 @@ func Now() int64 { return int64(time.Since(origin)) }
 func At(t time.Time) int64 { return int64(t.Sub(origin)) }
 
 type recorder struct {
-	queue   chan any
-	max     int64
-	taken   atomic.Int64 // records accepted against max
-	dropped atomic.Uint64
-	over    atomic.Uint64
-	quit    chan struct{}
-	done    chan struct{}
+	queue      chan any
+	max        int64
+	taken      atomic.Int64 // records accepted against max
+	dropped    atomic.Uint64
+	over       atomic.Uint64
+	quit       chan struct{}
+	done       chan struct{}
+	closing    atomic.Bool
+	emitting   atomic.Int64
+	stopOnce   sync.Once
+	err        error // published by closing done
+	closer     io.Closer
+	completion bool
 
-	mu       sync.Mutex
-	admitted map[[32]byte]admission
-	untrack  uint64
+	mu                         sync.Mutex
+	admitted                   map[[32]byte]admission
+	untrack                    uint64
+	cacheSequence, cacheActive uint64
 }
 
 type admission struct {
 	at, invalidatedAt int64
 	source            uint64
+	ambiguous         bool
 }
 
 var current atomic.Pointer[recorder]
+var startupErr error
 
 func init() {
 	path := os.Getenv("MITHRIL_PROGRAM_READINESS_LOG")
@@ -70,13 +81,14 @@ func init() {
 	}
 	f, err := os.Create(path)
 	if err != nil {
+		startupErr = fmt.Errorf("program readiness trace: %w", err)
 		return
 	}
 	limit := int64(defaultMaxRecords)
 	if n, err := strconv.ParseInt(os.Getenv("MITHRIL_PROGRAM_READINESS_MAX"), 10, 64); err == nil && n > 0 {
 		limit = n
 	}
-	Start(f, defaultQueue, limit)
+	startRecorder(f, defaultQueue, limit, f, true)
 }
 
 // On reports whether records are being taken. Callers test it before building
@@ -87,17 +99,64 @@ func On() bool { return current.Load() != nil }
 // what is queued and the final drop counts, and waits for the writer. For the
 // environment switch and tests.
 func Start(w io.Writer, queue int, maxRecords int64) (stop func()) {
-	r := &recorder{queue: make(chan any, queue), max: maxRecords, quit: make(chan struct{}), done: make(chan struct{}), admitted: make(map[[32]byte]admission)}
+	r := startRecorder(w, queue, maxRecords, nil, false)
+	return func() { _ = r.stopWithin(30 * time.Second) }
+}
+
+func startRecorder(w io.Writer, queue int, maxRecords int64, closer io.Closer, completion bool) *recorder {
+	r := &recorder{queue: make(chan any, queue), max: maxRecords, quit: make(chan struct{}), done: make(chan struct{}), admitted: make(map[[32]byte]admission), closer: closer, completion: completion}
 	current.Store(r)
 	go r.write(w)
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			current.CompareAndSwap(r, nil)
-			close(r.quit)
-			<-r.done
-		})
+	return r
+}
+
+// StartupError is non-nil when the explicitly requested trace could not open.
+func StartupError() error { return startupErr }
+
+// Finish cuts off producers, drains accepted records and reports write/close
+// errors. The CLI calls it after command cleanup and before choosing its exit
+// status. Missing completion, nonzero exit, or a returned error means the
+// diagnostic is incomplete. No transaction-path call waits for the writer.
+func Finish() error {
+	if r := current.Load(); r != nil {
+		return r.stopWithin(30 * time.Second)
 	}
+	return startupErr
+}
+
+func (r *recorder) stopWithin(timeout time.Duration) error {
+	r.stopOnce.Do(func() {
+		r.closing.Store(true)
+		current.CompareAndSwap(r, nil)
+		// Emit is nonblocking. Emitters that already passed the cutoff must
+		// finish their queue operation before the writer performs its drain.
+		go func() {
+			for r.emitting.Load() != 0 {
+				runtime.Gosched()
+			}
+			close(r.quit)
+		}()
+	})
+	select {
+	case <-r.done:
+		return r.err
+	case <-time.After(timeout):
+		return fmt.Errorf("program readiness trace: graceful drain exceeded %s", timeout)
+	}
+}
+
+// Completion is emitted only for the environment-owned trace at a graceful
+// CLI exit. Count only Emit payloads in Written; drops/completion are metadata.
+type Completion struct {
+	Kind      string `json:"kind"`
+	Version   int    `json:"format_version"`
+	T         int64  `json:"t_ns"`
+	Clean     bool   `json:"clean"`
+	Attempted int64  `json:"attempted_records"`
+	Written   uint64 `json:"written_records"`
+	QueueFull uint64 `json:"queue_full"`
+	OverLimit uint64 `json:"over_limit"`
+	Untracked uint64 `json:"untracked_admissions"`
 }
 
 // Drops is the "drops" record: records lost to a full queue and to the limit.
@@ -112,9 +171,30 @@ type Drops struct {
 }
 
 func (r *recorder) write(w io.Writer) {
-	defer close(r.done)
+	var firstErr error
+	defer func() { r.err = firstErr; close(r.done) }()
 	out := bufio.NewWriterSize(w, 1<<16)
 	enc := json.NewEncoder(out)
+	encode := func(rec any) bool {
+		if err := enc.Encode(rec); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			return false
+		}
+		return true
+	}
+	flush := func() {
+		if err := out.Flush(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	var written uint64
+	payload := func(rec any) {
+		if encode(rec) {
+			written++
+		}
+	}
 	var reported [3]uint64
 	drops := func() {
 		r.mu.Lock()
@@ -123,37 +203,52 @@ func (r *recorder) write(w io.Writer) {
 		now := [3]uint64{r.dropped.Load(), r.over.Load(), untracked}
 		if now != reported {
 			reported = now
-			_ = enc.Encode(Drops{Kind: "drops", T: Now(), QueueFull: now[0], OverLimit: now[1], Untracked: now[2]})
+			encode(Drops{Kind: "drops", T: Now(), QueueFull: now[0], OverLimit: now[1], Untracked: now[2]})
 		}
 	}
 	for {
 		select {
 		case rec := <-r.queue:
-			_ = enc.Encode(rec)
+			payload(rec)
 			continue
 		default:
 		}
 		// Idle: report drops and flush, so the file is complete without a
 		// shutdown hook, then wait for the next record.
 		drops()
-		_ = out.Flush()
+		flush()
 		select {
 		case rec := <-r.queue:
-			_ = enc.Encode(rec)
+			payload(rec)
 		case <-r.quit:
-			// Stopped: write what is queued. A record an emitter adds after
-			// this is lost with the recorder.
+			// Accepted emitters have quiesced; nothing can enqueue after this.
 			for {
 				select {
 				case rec := <-r.queue:
-					_ = enc.Encode(rec)
+					payload(rec)
 					continue
 				default:
 				}
 				break
 			}
 			drops()
-			_ = out.Flush()
+			r.mu.Lock()
+			active, untracked := r.cacheActive, r.untrack
+			r.mu.Unlock()
+			if active != 0 && firstErr == nil {
+				firstErr = fmt.Errorf("program readiness trace: %d cache mutations still active at finish", active)
+			}
+			if r.completion && firstErr == nil {
+				encode(Completion{Kind: "complete", Version: 2, T: Now(), Clean: true,
+					Attempted: r.taken.Load(), Written: written, QueueFull: r.dropped.Load(),
+					OverLimit: r.over.Load(), Untracked: untracked})
+			}
+			flush()
+			if r.closer != nil {
+				if err := r.closer.Close(); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
 			return
 		}
 	}
@@ -163,6 +258,11 @@ func (r *recorder) write(w io.Writer) {
 func Emit(rec any) {
 	r := current.Load()
 	if r == nil {
+		return
+	}
+	r.emitting.Add(1)
+	defer r.emitting.Add(-1)
+	if r.closing.Load() {
 		return
 	}
 	if r.taken.Add(1) > r.max {
@@ -199,11 +299,17 @@ func NoteAdmit(key [32]byte, source uint64, at int64) {
 		return
 	}
 	r.mu.Lock()
+	if r.closing.Load() {
+		r.mu.Unlock()
+		return
+	}
 	if _, ok := r.admitted[key]; ok || len(r.admitted) < maxTrackedKeys {
-		r.admitted[key] = admission{at: at, source: source}
+		// Unbracketed legacy notes cannot establish cache-operation order.
+		r.admitted[key] = admission{at: at, source: source, ambiguous: true}
 	} else {
 		r.untrack++
 	}
+	r.cacheSequence++
 	r.mu.Unlock()
 }
 
@@ -214,10 +320,16 @@ func NoteInvalidate(key [32]byte, at int64) {
 		return
 	}
 	r.mu.Lock()
+	if r.closing.Load() {
+		r.mu.Unlock()
+		return
+	}
 	if a, ok := r.admitted[key]; ok {
 		a.invalidatedAt = at
+		a.ambiguous = true
 		r.admitted[key] = a
 	}
+	r.cacheSequence++
 	r.mu.Unlock()
 }
 
@@ -228,17 +340,23 @@ func NoteInvalidateAll(at int64) {
 		return
 	}
 	r.mu.Lock()
+	if r.closing.Load() {
+		r.mu.Unlock()
+		return
+	}
 	for key, a := range r.admitted {
 		a.invalidatedAt = at
+		a.ambiguous = true
 		r.admitted[key] = a
 	}
+	r.cacheSequence++
 	r.mu.Unlock()
 }
 
 // PriorAdmit returns the last admission remembered for key: when, from which
 // source, and when it was explicitly invalidated afterwards (0 if it was not).
-// A cache miss with a prior admission of the same source and no invalidation
-// means the entry was evicted.
+// This accessor is for inspecting history, not attributing a cache miss.
+// Attribute only from BeginLookup/EndLookup's lookup-time, race-marked snapshot.
 func PriorAdmit(key [32]byte) (at int64, source uint64, invalidatedAt int64, ok bool) {
 	r := current.Load()
 	if r == nil {
@@ -325,10 +443,14 @@ type Compile struct {
 	Result      string `json:"result"`
 	Publish     string `json:"publish"`
 	PublishedAt int64  `json:"t_published_ns,omitempty"`
-	// The last admission remembered for this key before this compile.
+	// Admission history captured at the actual lookup, not at compile end.
+	// Do not infer eviction when HistoryAmbiguous is true or source is unknown.
 	PriorAdmit       int64  `json:"prior_admit_ns,omitempty"`
 	PriorSource      string `json:"prior_source_digest,omitempty"`
 	PriorInvalidated int64  `json:"prior_invalidated_ns,omitempty"`
+	LookupAt         int64  `json:"t_lookup_ns,omitempty"`
+	HistoryKnown     bool   `json:"history_known_at_lookup"`
+	HistoryAmbiguous bool   `json:"history_ambiguous"`
 }
 
 // Publish is a cache publication outside a compile-on-miss: a deploy or

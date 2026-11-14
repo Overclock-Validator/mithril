@@ -224,9 +224,15 @@ func (accountsDb *AccountsDb) InitCaches() {
 	accountsDb.VoteAcctCache = NewWeightedCache(2500, func(key solana.PublicKey, acct *accounts.Account) uint32 {
 		return 1
 	})
+	m := progtrace.BeginMutation()
 	accountsDb.ProgramCache = NewWeightedCache(uint64(programCacheCapacityUnits()), func(key solana.PublicKey, progEntry *ProgramCacheEntry) uint32 {
 		return progEntry.CostUnits()
 	})
+	if m.On() {
+		at := progtrace.Now()
+		progtrace.EndMutation(m, [32]byte{}, 0, at, "clear")
+		progtrace.Emit(progtrace.Publish{Kind: "invalidate_all", T: at, Reason: "program cache initialized"})
+	}
 	accountsDb.CommonAcctsCache = newCommonAccountCache(uint64(commonAccountCacheCapacityBytes()), CommonAccountCacheLayout != "flat")
 }
 
@@ -274,15 +280,15 @@ func (entry *ProgramCacheEntry) SourceMismatch(source []byte, f *features.Featur
 
 // noteProgramCacheRemoval records an explicit removal with the function that
 // asked for it (readiness diagnostic only).
-func noteProgramCacheRemoval(pubkey solana.PublicKey) {
-	now := progtrace.Now()
-	reason := "unknown"
-	if pc, _, _, ok := runtime.Caller(2); ok {
-		if fn := runtime.FuncForPC(pc); fn != nil {
-			reason = fn.Name()
+func noteProgramCacheRemoval(pubkey solana.PublicKey, now int64, reason string) {
+	if reason == "" {
+		reason = "unknown"
+		if pc, _, _, ok := runtime.Caller(2); ok {
+			if fn := runtime.FuncForPC(pc); fn != nil {
+				reason = fn.Name()
+			}
 		}
 	}
-	progtrace.NoteInvalidate(pubkey, now)
 	progtrace.Emit(progtrace.Publish{Kind: "invalidate", T: now, Key: pubkey.String(), Reason: reason})
 }
 
@@ -355,6 +361,19 @@ func (accountsDb *AccountsDb) MaybeGetProgramFromCache(pubkey solana.PublicKey) 
 	return accountsDb.ProgramCache.Get(pubkey)
 }
 
+// MaybeGetProgramFromCacheObserved performs the same single access as the
+// ordinary lookup, and snapshots diagnostic history around that access.
+func (accountsDb *AccountsDb) MaybeGetProgramFromCacheObserved(pubkey solana.PublicKey) (*ProgramCacheEntry, bool, progtrace.Lookup) {
+	if accountsDb == nil {
+		return nil, false, progtrace.Lookup{}
+	}
+	accountsDb.programCacheMu.RLock()
+	defer accountsDb.programCacheMu.RUnlock()
+	o := progtrace.BeginLookup(pubkey)
+	entry, ok := accountsDb.ProgramCache.Get(pubkey)
+	return entry, ok, progtrace.EndLookup(o)
+}
+
 // ProgramCached reports whether the program cache holds an entry for pubkey
 // without counting the lookup as an access for its eviction policy.
 func (accountsDb *AccountsDb) ProgramCached(pubkey solana.PublicKey) bool {
@@ -370,17 +389,45 @@ func (accountsDb *AccountsDb) ProgramCached(pubkey solana.PublicKey) bool {
 // the cache admitted it: an entry heavier than the cache's per-entry ceiling
 // is refused (see WeightedCache.Set).
 func (accountsDb *AccountsDb) AddProgramToCache(pubkey solana.PublicKey, programEntry *ProgramCacheEntry) bool {
+	admitted, _ := accountsDb.AddProgramToCacheObserved(pubkey, programEntry)
+	return admitted
+}
+
+// AddProgramToCacheObserved returns the unchanged admission result and a
+// diagnostic timestamp sampled at the Set return, before record formatting.
+func (accountsDb *AccountsDb) AddProgramToCacheObserved(pubkey solana.PublicKey, programEntry *ProgramCacheEntry) (bool, int64) {
 	accountsDb.programCacheMu.RLock()
 	defer accountsDb.programCacheMu.RUnlock()
-	return accountsDb.ProgramCache.Set(pubkey, programEntry)
+	m := progtrace.BeginMutation()
+	var source uint64
+	if m.On() && programEntry != nil && programEntry.sourceBound {
+		source = progtrace.SourceDigest(programEntry.sourceBytes)
+	}
+	admitted := accountsDb.ProgramCache.Set(pubkey, programEntry)
+	var at int64
+	if m.On() {
+		at = progtrace.Now()
+		outcome := "admitted"
+		if !admitted {
+			outcome = "refused"
+		}
+		progtrace.EndMutation(m, pubkey, source, at, outcome)
+		if !admitted {
+			noteProgramCacheRemoval(pubkey, at, "admission_refused")
+		}
+	}
+	return admitted, at
 }
 
 func (accountsDb *AccountsDb) RemoveProgramFromCache(pubkey solana.PublicKey) {
 	accountsDb.programCacheMu.RLock()
 	defer accountsDb.programCacheMu.RUnlock()
+	m := progtrace.BeginMutation()
 	accountsDb.ProgramCache.Delete(pubkey)
-	if progtrace.On() {
-		noteProgramCacheRemoval(pubkey)
+	if m.On() {
+		at := progtrace.Now()
+		progtrace.EndMutation(m, pubkey, 0, at, "removed")
+		noteProgramCacheRemoval(pubkey, at, "")
 	}
 }
 
@@ -694,13 +741,14 @@ func (accountsDb *AccountsDb) resetReadCachesLocked() {
 	accountsDb.CommonAcctsCache.Clear()
 	accountsDb.VoteAcctCache.Clear()
 	accountsDb.programCacheMu.Lock()
+	m := progtrace.BeginMutation()
 	accountsDb.ProgramCache.Clear()
-	accountsDb.programCacheMu.Unlock()
-	if progtrace.On() {
+	if m.On() {
 		now := progtrace.Now()
-		progtrace.NoteInvalidateAll(now)
+		progtrace.EndMutation(m, [32]byte{}, 0, now, "clear")
 		progtrace.Emit(progtrace.Publish{Kind: "invalidate_all", T: now, Reason: "read caches reset"})
 	}
+	accountsDb.programCacheMu.Unlock()
 	accountsDb.commonAdmission = newCommonCacheAdmission()
 }
 
