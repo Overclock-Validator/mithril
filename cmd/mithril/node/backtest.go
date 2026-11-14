@@ -45,6 +45,7 @@ var bt struct {
 	endSlot, measureFrom                              uint64
 	warmup, txpar                                     int
 	verifySignatures, phaseTimers                     bool
+	cache                                             string
 }
 
 // Backtest replays a shredcap capture offline, the way firedancer-dev
@@ -81,7 +82,8 @@ func init() {
 	f.StringVar(&bt.genesisHash, "genesis-hash", "", "Genesis hash of a custom cluster")
 	f.Uint64Var(&bt.endSlot, "end-slot", 0, "Last slot to replay (0 = the capture's last block)")
 	f.Uint64Var(&bt.measureFrom, "measure-from", 0, "Leave blocks before this slot out of the timing summary")
-	f.IntVar(&bt.warmup, "warmup", 30, "Leading measured blocks left out of the timing summary")
+	f.IntVar(&bt.warmup, "warmup", 30, "Leading measured blocks left out of the timing summary (default 0 with --cache cold)")
+	f.StringVar(&bt.cache, "cache", cacheNormal, "AccountsDB page cache at replay start: normal (evicted, warm-up excluded: a node that has been running), cold (evicted, measured from the first block: just restarted) or warm (left as earlier runs left it: least noisy, for A/B)")
 	f.IntVar(&bt.txpar, "txpar", 8, "Transaction execution workers")
 	f.BoolVar(&bt.phaseTimers, "phase-timers", false, "Time each transaction phase and instruction dispatch, as a live node does (about 1% of SlotReplay; SlotReplay and TxLoop are timed either way)")
 	f.BoolVar(&bt.verifySignatures, "verify-shred-signatures", false, "Check every shred's leader signature as replay reads it (off by default, like firedancer-dev backtest; adds signature work to the timed run)")
@@ -93,15 +95,20 @@ func runBacktest(cmd *cobra.Command, _ []string) error {
 	// --config names a backtest configuration file (never a node config);
 	// flags override what it sets.
 	userConfig := config.ConfigFile
+	warmupFromFile := false
 	if userConfig != "" {
 		f, err := loadBacktestFile(userConfig)
 		if err != nil {
 			return err
 		}
 		applyBacktestFile(f, userConfig, cmd.Flags())
+		warmupFromFile = f.Backtest.Warmup != nil
 	}
 	if err := validateBacktestOptions(); err != nil {
 		return err
+	}
+	if bt.cache == cacheCold && !cmd.Flags().Changed("warmup") && !warmupFromFile {
+		bt.warmup = 0 // cold measures the restart itself
 	}
 	clusterInfo, err := config.ResolveCluster(bt.cluster, bt.genesisHash)
 	if err != nil {
@@ -285,6 +292,14 @@ func runBacktest(cmd *cobra.Command, _ []string) error {
 			}
 		}
 	}
+	var eviction *cacheEviction
+	replay.BeforeReplayLoop = nil
+	if bt.cache != cacheWarm {
+		replay.BeforeReplayLoop = func() {
+			e := evictPageCache(store)
+			eviction = &e
+		}
+	}
 	Run.SetContext(ctx) // runLive derives its run context from the command
 	prepDone := time.Now()
 	runLive(&Run, nil)
@@ -332,7 +347,7 @@ func runBacktest(cmd *cobra.Command, _ []string) error {
 		clock.ReplayReady = time.Unix(0, ns)
 	}
 	summary := summarizeBacktest(rows, bt.warmup, bt.measureFrom, plan.FirstSlot-1, clock)
-	settings := backtestSettings(man)
+	settings := append(backtestSettings(man), [2]string{"cache", describeCacheMode(bt.cache, eviction)})
 	if userConfig != "" {
 		settings = append([][2]string{{"config", userConfig}}, settings...)
 	}

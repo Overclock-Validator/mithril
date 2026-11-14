@@ -12,7 +12,7 @@ import (
 // backtestTestFlags mirrors the backtest flags that a file can set.
 func backtestTestFlags() *pflag.FlagSet {
 	f := pflag.NewFlagSet("backtest", pflag.ContinueOnError)
-	for _, name := range []string{"capture", "snapshot", "incremental", "accounts", "workdir", "cluster", "genesis-hash"} {
+	for _, name := range []string{"capture", "snapshot", "incremental", "accounts", "workdir", "cluster", "genesis-hash", "cache"} {
 		f.String(name, "", "")
 	}
 	f.Int("txpar", 8, "")
@@ -33,6 +33,7 @@ func resetBacktestOptions(t *testing.T) {
 	bt.cluster, bt.genesisHash = "mainnet", ""
 	bt.txpar, bt.warmup, bt.endSlot, bt.measureFrom = 8, 30, 0, 0
 	bt.phaseTimers, bt.verifySignatures = true, false
+	bt.cache = cacheNormal
 }
 
 func writeBacktestFile(t *testing.T, body string) string {
@@ -61,6 +62,7 @@ warmup = 5
 measure_from = 300
 phase_timers = false
 verify_shred_signatures = true
+cache = "cold"
 `)
 	f, err := loadBacktestFile(path)
 	require.NoError(t, err)
@@ -77,6 +79,7 @@ verify_shred_signatures = true
 	require.Equal(t, uint64(300), bt.measureFrom)
 	require.False(t, bt.phaseTimers)
 	require.True(t, bt.verifySignatures)
+	require.Equal(t, "cold", bt.cache)
 	require.NoError(t, validateBacktestOptions())
 }
 
@@ -121,4 +124,6 @@ func TestValidateBacktestOptions(t *testing.T) {
 	require.ErrorContains(t, validateBacktestOptions(), "at least 1")
 	bt.txpar, bt.warmup = 8, -1
 	require.ErrorContains(t, validateBacktestOptions(), "cannot be negative")
+	bt.warmup, bt.cache = 30, "hot"
+	require.ErrorContains(t, validateBacktestOptions(), "cold, normal or warm")
 }

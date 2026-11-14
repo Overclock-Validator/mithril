@@ -38,6 +38,7 @@ type backtestFile struct {
 		Warmup                *int    `toml:"warmup"`
 		MeasureFrom           *uint64 `toml:"measure_from"`
 		PhaseTimers           *bool   `toml:"phase_timers"`
+		Cache                 string  `toml:"cache"`
 		VerifyShredSignatures *bool   `toml:"verify_shred_signatures"`
 	} `toml:"backtest"`
 }
@@ -85,6 +86,7 @@ func applyBacktestFile(f *backtestFile, path string, flags *pflag.FlagSet) {
 	str("workdir", &bt.workdir, rel(f.Paths.Workdir))
 	str("cluster", &bt.cluster, f.Network.Cluster)
 	str("genesis-hash", &bt.genesisHash, f.Network.GenesisHash)
+	str("cache", &bt.cache, f.Backtest.Cache)
 	if v := f.Layout.ExecWorkers; v != nil && !flags.Changed("txpar") {
 		bt.txpar = *v
 	}
@@ -118,6 +120,9 @@ func validateBacktestOptions() error {
 	}
 	if bt.warmup < 0 {
 		return fmt.Errorf("warmup / --warmup cannot be negative, got %d", bt.warmup)
+	}
+	if !validCacheMode(bt.cache) {
+		return fmt.Errorf("cache / --cache must be cold, normal or warm, got %q", bt.cache)
 	}
 	if bt.txpar < 1 {
 		return fmt.Errorf("exec_workers / --txpar must be at least 1, got %d", bt.txpar)

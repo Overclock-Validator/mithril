@@ -20,6 +20,11 @@ var CaptureBankHashes map[uint64][32]byte
 // which a backtest times replay (Firedancer's replay_ready_time).
 var ReplayReadyAt atomic.Int64
 
+// BeforeReplayLoop, when set, runs once just before the replay loop is first
+// ready, outside every replay timing. Backtest uses it to evict the AccountsDB
+// from the page cache after startup and rewind, so a cold measurement is cold.
+var BeforeReplayLoop func()
+
 // SkipPhaseTimers turns off replay's per-transaction and instruction-dispatch
 // phase timers (the detail behind TxLoop), as block production already does.
 // Block-level intervals such as SlotReplay and TxLoop are unaffected; the

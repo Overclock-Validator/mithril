@@ -92,8 +92,8 @@ func streamOpened(openedNanos int64, discarded uint64) int64 {
 // intervalStats summarizes one timing interval over the measured blocks.
 // CUPerNs is total consumed CU over total nanoseconds, not a mean of ratios.
 type intervalStats struct {
-	MeanMs, P50Ms, P90Ms, P99Ms float64
-	CUPerNs                     float64
+	MeanMs, P50Ms, P90Ms, P99Ms, MaxMs float64
+	CUPerNs                            float64
 }
 
 // backtestClock holds the wall-clock moments a run passes through. Boot is
@@ -130,8 +130,27 @@ type backtestSummary struct {
 	AvgCU      float64 // consumed CU per measured block
 	SlotReplay intervalStats
 	TxLoop     intervalStats
-	FD         firedancerSummary
+	// BlockInterval is each measured block's completion minus the previous
+	// block's completion (for the first replayed block, minus replay ready).
+	// The intervals tile the measured span, so their mean is exactly SpanS
+	// over Measured. Span covers everything replay did in that time.
+	BlockInterval intervalStats
+	Span          blockSpan
+	FD            firedancerSummary
 }
+
+// blockSpan is the measured stretch of wall time: from the completion of the
+// block before the first measured one (or replay ready) to the completion of
+// the last measured block.
+type blockSpan struct {
+	Seconds       float64
+	Blocks        int
+	SlotsAdvanced uint64 // last measured slot minus the slot before the span, skipped slots included
+	Complete      bool   // every completion instant was recorded
+}
+
+func (b blockSpan) blocksPerSecond() float64 { return float64(b.Blocks) / b.Seconds }
+func (b blockSpan) slotsPerSecond() float64  { return float64(b.SlotsAdvanced) / b.Seconds }
 
 func secondsBetween(a, b time.Time) float64 { return b.Sub(a).Seconds() }
 
@@ -193,7 +212,46 @@ func summarizeBacktest(rows []timingRow, warmup int, measureFrom uint64, startSl
 	s.AvgCU = float64(cu) / float64(len(measured))
 	s.SlotReplay = statsOf(slotReplay, cu)
 	s.TxLoop = statsOf(txLoop, cu)
+
+	// Completion-to-completion intervals over the measured blocks. The block
+	// before the first measured one (or replay ready) opens the span.
+	first := len(rows) - len(measured)
+	prevDone := clock.ReplayReady.UnixNano()
+	if first > 0 {
+		prevDone = rows[first-1].Completed
+	}
+	intervals := make([]int64, 0, len(measured))
+	complete := !clock.ReplayReady.IsZero()
+	for _, r := range measured {
+		if r.Completed == 0 || prevDone == 0 || r.Completed < prevDone {
+			complete = false
+			break
+		}
+		intervals = append(intervals, r.Completed-prevDone)
+		prevDone = r.Completed
+	}
+	if complete {
+		s.BlockInterval = statsOf(intervals, cu)
+		spanStart := measured[0].Completed - intervals[0]
+		s.Span = blockSpan{
+			Seconds:  float64(measured[len(measured)-1].Completed-spanStart) / 1e9,
+			Blocks:   len(measured),
+			Complete: true,
+		}
+		if before := prevSlotBefore(rows, first, startSlot); s.LastSlot > before {
+			s.Span.SlotsAdvanced = s.LastSlot - before
+		}
+	}
 	return s
+}
+
+// prevSlotBefore is the slot replayed just before rows[first], or the start
+// slot when first is the first replayed block.
+func prevSlotBefore(rows []timingRow, first int, startSlot uint64) uint64 {
+	if first > 0 {
+		return rows[first-1].Slot
+	}
+	return startSlot
 }
 
 func statsOf(ns []int64, totalCU uint64) intervalStats {
@@ -208,7 +266,8 @@ func statsOf(ns []int64, totalCU uint64) intervalStats {
 		idx := int(math.Ceil(p*float64(len(sorted)))) - 1
 		return float64(sorted[max(idx, 0)]) / 1e6
 	}
-	st := intervalStats{MeanMs: float64(sum) / float64(len(sorted)) / 1e6, P50Ms: pct(0.50), P90Ms: pct(0.90), P99Ms: pct(0.99)}
+	st := intervalStats{MeanMs: float64(sum) / float64(len(sorted)) / 1e6, P50Ms: pct(0.50), P90Ms: pct(0.90), P99Ms: pct(0.99),
+		MaxMs: float64(sorted[len(sorted)-1]) / 1e6}
 	if sum > 0 {
 		st.CUPerNs = float64(totalCU) / float64(sum)
 	}
@@ -231,13 +290,25 @@ func (s backtestSummary) write(w io.Writer, settings [][2]string, totalSeconds f
 }
 
 func (s backtestSummary) writeIntervals(w io.Writer) {
+	if s.Span.Complete && s.Span.Seconds > 0 {
+		fmt.Fprintf(w, "  %-22s %d blocks in %.3f s: %.2f blocks/s, %.3f ms/block; %d slots advanced: %.2f slots/s\n", "measured span",
+			s.Span.Blocks, s.Span.Seconds, s.Span.blocksPerSecond(), s.Span.Seconds*1e3/float64(s.Span.Blocks),
+			s.Span.SlotsAdvanced, s.Span.slotsPerSecond())
+	}
 	fmt.Fprintf(w, "  %-22s %.2f M\n", "avg consumed CU/block", s.AvgCU/1e6)
-	fmt.Fprintf(w, "  %-12s %9s %9s %9s %9s %8s\n", "interval", "mean ms", "p50 ms", "p90 ms", "p99 ms", "CU/ns")
-	for _, iv := range []struct {
+	fmt.Fprintf(w, "  %-13s %9s %9s %9s %9s %9s %8s\n", "interval", "mean ms", "p50 ms", "p90 ms", "p99 ms", "max ms", "CU/ns")
+	rows := []struct {
 		name string
 		st   intervalStats
-	}{{"SlotReplay", s.SlotReplay}, {"TxLoop", s.TxLoop}} {
-		fmt.Fprintf(w, "  %-12s %9.2f %9.2f %9.2f %9.2f %8.3f\n", iv.name, iv.st.MeanMs, iv.st.P50Ms, iv.st.P90Ms, iv.st.P99Ms, iv.st.CUPerNs)
+	}{{"BlockInterval", s.BlockInterval}, {"SlotReplay", s.SlotReplay}, {"TxLoop", s.TxLoop}}
+	if !s.Span.Complete {
+		rows = rows[1:]
+	}
+	for _, iv := range rows {
+		fmt.Fprintf(w, "  %-13s %9.2f %9.2f %9.2f %9.2f %9.2f %8.3f\n", iv.name, iv.st.MeanMs, iv.st.P50Ms, iv.st.P90Ms, iv.st.P99Ms, iv.st.MaxMs, iv.st.CUPerNs)
+	}
+	if s.Span.Complete {
+		fmt.Fprintf(w, "  BlockInterval is completion to completion: the intervals add up to the measured span, so its mean is the span's ms/block.\n")
 	}
 }
 

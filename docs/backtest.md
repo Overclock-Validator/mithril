@@ -64,7 +64,8 @@ verifier.
 | `--cluster`, `--genesis-hash` | `[network] cluster`, `genesis_hash` | `mainnet` | `mainnet`, `testnet`, `devnet`, or a custom name with its genesis hash | genesis file / expected genesis hash |
 | `--txpar` | `[layout] exec_workers` | 8 | transaction execution workers | `[layout] execrp_tile_count` |
 | `--end-slot` | `[ledger_input] end_slot` | capture's last block | stop earlier | `[development.backtest] end_slot` |
-| `--warmup` | `[backtest] warmup` | 30 | leading blocks left out of the timing table | none (Firedancer excludes none) |
+| `--warmup` | `[backtest] warmup` | 30 (0 with `--cache cold`) | leading blocks left out of the timing table | none (Firedancer excludes none) |
+| `--cache` | `[backtest] cache` | `normal` | AccountsDB page cache at replay start: `normal`, `cold` or `warm` (see below) | none (accounts are in memory) |
 | `--measure-from` | `[backtest] measure_from` | | leave blocks before this slot out of the timing table | |
 | `--phase-timers` | `[backtest] phase_timers` | off | time each transaction phase and instruction dispatch, as a live node does | |
 | `--verify-shred-signatures` | `[backtest] verify_shred_signatures` | off | check every shred's leader signature as replay reads it | not done by its backtest |
@@ -126,15 +127,26 @@ directory's own store a backtest deletes them before rewinding; under an
 
 ```
 Backtest summary
-  config / commit / go / GOMAXPROCS / usable CPUs / txpar / phase timers / shred signatures / MITHRIL_SBPF_ASM_LOOP / memory limit / shred version
+  config / commit / go / GOMAXPROCS / usable CPUs / txpar / phase timers / shred signatures / MITHRIL_SBPF_ASM_LOOP / memory limit / shred version / cache
   blocks                 1000 replayed, 30 warm-up excluded, 970 measured (slots A..B)
+  measured span          970 blocks in ... s: ... blocks/s, ... ms/block; ... slots advanced: ... slots/s
   avg consumed CU/block  14.01 M
-  interval       mean ms    p50 ms    p90 ms    p99 ms    CU/ns
-  SlotReplay       ...
-  TxLoop           ...
+  interval        mean ms    p50 ms    p90 ms    p99 ms    max ms    CU/ns
+  BlockInterval     ...
+  SlotReplay        ...
+  TxLoop            ...
 BACKTEST_SUMMARY snapshot_slot=... end_slot=... slots=... txns=... snap_bytes_s=... replay_init_s=... load_total_s=... replay_s=... slot_exec_s=... sec_per_slot=... tps=... total_s=...
 MITHRIL_EXTRA import_s=... shutdown_s=...
 ```
+
+The measured span runs from the completion of the block before the first
+measured one to the completion of the last, and covers everything replay did
+in that time. `BlockInterval` is each block's completion minus the previous
+block's, so the intervals add up to the span: its mean is exactly the span's
+ms/block, and with no warm-up the span is `replay_s` and the mean is
+`sec_per_slot`. SlotReplay and TxLoop are parts of a block's work and do not
+add up to the span. "Slots advanced" counts skipped slots too; blocks/s counts
+only replayed blocks, as Firedancer's `slots` does.
 
 The table above the `BACKTEST_SUMMARY` line is Mithril's own: warm-up blocks
 (and blocks before `--measure-from`) are left out, and CU/ns is total consumed
@@ -249,6 +261,26 @@ Firedancer, read from its source (main at `a99731d6f28d`) and not measured:
 - Shred signatures are not checked: the backtest tile parses capture shreds
   for structure only.
 - Where its entry hash checks fall was not established here.
+
+### Cache modes
+
+Firedancer keeps accounts in memory. Mithril reads an on-disk AccountsDB, so
+how much of it the OS page cache holds when replay starts changes the result.
+`--cache` sets it:
+
+| Mode | What it does | Represents |
+|---|---|---|
+| `normal` (default) | evicts the AccountsDB files from the page cache just before replay, then leaves the warm-up blocks out | a node that has been replaying the preceding blocks, with nothing cached from earlier runs over these same blocks |
+| `cold` | evicts the same way and measures from the first block (warm-up 0 unless set) | a node right after a restart |
+| `warm` | evicts nothing | the page cache as earlier runs over the same blocks left it: warmer than a running node, but the least noisy, so the one for comparing two builds |
+
+Eviction uses `posix_fadvise(DONTNEED)` on every file under the AccountsDB
+(Linux only; no root needed) after startup and rewind, so it lands inside
+`replay_init_s`; the settings line reports how many files and bytes and how
+long it took. In-process caches always start empty, since every run is a new
+process. For `normal`, use a warm-up long enough for the per-block times to
+settle: compare the first and second halves of the measured blocks, and
+lengthen the warm-up if the first half is slower.
 
 ## Differences from Firedancer's backtest
 

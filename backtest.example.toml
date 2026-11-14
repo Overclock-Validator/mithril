@@ -46,3 +46,8 @@
     # Check every shred's leader signature as replay reads it. Off, like
     # firedancer-dev backtest, which does not check shred signatures.
     verify_shred_signatures = false
+    # AccountsDB page cache at replay start. "normal": evicted, then the
+    # warm-up excluded (a node that has been running). "cold": evicted and
+    # measured from the first block (a node just restarted). "warm": left as
+    # earlier runs left it (least noisy; for comparing two builds).
+    cache = "normal"

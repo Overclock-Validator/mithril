@@ -11,6 +11,7 @@ client or another machine.
 | `mithril backtest` | Repeatable replay of a shredcap capture from a snapshot or AccountsDB, with a summary in Firedancer's format | [backtest.md](backtest.md) |
 | `mithril corpus import-shredcap` / `export-shredcap` | Moving the same blocks between Mithril and Firedancer | [replay-corpus.md](replay-corpus.md) |
 | `mithril run --offline` | Replaying a local shred spool with a full node configuration, no network | [replay-corpus.md](replay-corpus.md) |
+| `mithril timings span` | Blocks per second over any stretch of any run, with per-block intervals that add up to it | [below](#throughput-and-per-block-time) |
 | `mithril timings tip` | Breaking down live replay latency from a run's timing rows | [below](#the-tip-path) |
 | `scripts/run-commits.py` | Building several commits and replaying the same slots with each | the script's `--help` |
 | `scripts/replay_timings_viewer.py` | Charting a run's timing rows (marimo notebook) | the script |
@@ -28,11 +29,58 @@ number for the question; they are not interchangeable.
 |---|---|---|
 | What does the block cost to execute? | `ReplayWork` | SlotReplay plus streamed execution that ran before it (`StreamingExecution.TxLoopBeforeReplay`). Means the same in catch-up and at the tip. A sum of wall intervals, not CPU time. |
 | How far behind the network does replay finish, and when does the vote leave? | `TipPath.LastShredToReplayed`, then the block's vote stages | From the block's last shred to its replay result reaching consensus, and on to its notarize vote being handed to QUIC for the first peer. Live runs only. |
-| How fast does catch-up get through blocks? | `SinceLastRow`, backtest `sec_per_slot` | Wall time per block including the loop between blocks. |
+| How many blocks does replay get through per second, and how long does each take? | `BlockInterval` over a measured span | Completion to completion, so the per-block times add up to the span and their mean is the span's time per block. This is the number to present. |
 
 SlotReplay starts when replay takes the complete block. With streaming
 execution (on in backtest and at the tip) part of the block has already run
 by then, so never compare a tip block's SlotReplay with a corpus block's.
+
+## Throughput and per-block time
+
+To say how many blocks replay gets through in a stretch of time, and how long
+each block takes in a way that agrees with that rate, use completion-to-
+completion intervals:
+
+- The span runs from the completion of the block before the first measured
+  one to the completion of the last measured block.
+- Each block's `BlockInterval` is its completion minus the previous block's.
+  The intervals add up to the span exactly, so blocks / span is the rate and
+  the mean interval is the time per block, with p50, p99 and max beside it.
+- It counts everything replay spent in that time: reading and assembling
+  blocks, signature and entry checks, execution, hashing, commits, the loop
+  between blocks, and any waiting. Nothing is left out.
+
+`mithril backtest` prints it as the "measured span" line and the
+`BlockInterval` row; with no warm-up the span is Firedancer's `replay_s` and
+the mean is `sec_per_slot`. For any other run (offline, catch-up, live):
+
+```bash
+mithril timings span /path/to/replay_timings.jsonl --from-slot A --to-slot B --warmup 30
+```
+
+It also reports the share of the span spent waiting for the next block
+(`LoopSourceWait`). In catch-up that share is near zero and the rate is
+replay's own. At the tip blocks arrive every slot, so the rate is the
+network's, and the per-block time that matters is the tip path below.
+
+Firedancer's per-slot log line splits each slot into switch, begin, exec and
+finish; those four add up to its completion minus the previous slot's
+completion, the same interval as `BlockInterval`. Compare those sums, not
+Firedancer's exec alone with Mithril's SlotReplay.
+
+SlotReplay, TxLoop and ReplayWork are parts of a block's work. They do not add
+up to the span (work overlaps and some runs before SlotReplay), so do not
+divide a span by them or present them as the block replay time.
+
+### Cache state
+
+Firedancer keeps accounts in memory; Mithril reads an on-disk AccountsDB, so
+the page cache at replay start changes the result. Backtest's `--cache`:
+`normal` (default; evict the AccountsDB from the page cache before replay,
+then exclude a warm-up: a node that has been running), `cold` (evict and
+measure from the first block: just restarted) and `warm` (leave the cache as
+earlier runs left it: least noisy, for comparing two builds, but warmer than a
+running node). Present `normal`; say which you used.
 
 ## The timing row
 

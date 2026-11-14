@@ -673,3 +673,45 @@ func TestCheckReusedManifest(t *testing.T) {
 	require.ErrorContains(t, checkReusedManifest(man, checked), "no bank hash for slot 100")
 	require.ErrorContains(t, checkReusedManifest(&shredcap.Manifest{}, validatedImport{Validated: true}), "lists no slots")
 }
+
+// Block intervals run completion to completion, so they add up to the
+// measured span: their mean is exactly the span's time per block, and with no
+// warm-up the span is Firedancer's replay_s.
+func TestBacktestBlockIntervalsTileTheSpan(t *testing.T) {
+	ms := int64(1_000_000)
+	boot := time.Unix(1000, 0)
+	clock := backtestClock{Boot: boot, ImportDone: boot.Add(2 * time.Second), StateReady: boot.Add(5 * time.Second), ReplayReady: boot.Add(6 * time.Second)}
+	at := func(d time.Duration) int64 { return clock.ReplayReady.Add(d).UnixNano() }
+	rows := []timingRow{
+		{Slot: 10, CU: 1e6, SlotReplay: 100 * ms, TxLoop: 90 * ms, Completed: at(150 * time.Millisecond)},
+		{Slot: 11, CU: 2e6, SlotReplay: 10 * ms, TxLoop: 8 * ms, Completed: at(170 * time.Millisecond)},
+		{Slot: 13, CU: 4e6, SlotReplay: 20 * ms, TxLoop: 16 * ms, Completed: at(200 * time.Millisecond)},
+		{Slot: 14, CU: 6e6, SlotReplay: 30 * ms, TxLoop: 24 * ms, Completed: at(250 * time.Millisecond)},
+	}
+
+	s := summarizeBacktest(rows, 1, 0, 9, clock)
+	require.True(t, s.Span.Complete)
+	require.Equal(t, 3, s.Span.Blocks)
+	require.InDelta(t, 0.100, s.Span.Seconds, 1e-12, "from slot 10's completion to slot 14's")
+	require.Equal(t, uint64(4), s.Span.SlotsAdvanced, "10 to 14, the skipped slot 12 included")
+	require.InDelta(t, 30.0, s.Span.blocksPerSecond(), 1e-9)
+	require.InDelta(t, 40.0, s.Span.slotsPerSecond(), 1e-9)
+	require.InDelta(t, s.Span.Seconds*1e3/3, s.BlockInterval.MeanMs, 1e-9, "intervals 20, 30, 50 ms add up to the span")
+	require.InDelta(t, 50.0, s.BlockInterval.MaxMs, 1e-9)
+	require.InDelta(t, 12e6/100e6, s.BlockInterval.CUPerNs, 1e-12)
+	require.Greater(t, s.BlockInterval.MeanMs, s.SlotReplay.MeanMs, "the span includes time between SlotReplays")
+
+	s = summarizeBacktest(rows, 0, 0, 9, clock)
+	require.InDelta(t, s.FD.ReplayS, s.Span.Seconds, 1e-12, "no warm-up: the span is replay_s")
+	require.InDelta(t, s.FD.SecPerSlot*1e3, s.BlockInterval.MeanMs, 1e-9, "and ms/block is sec_per_slot")
+	require.Equal(t, uint64(5), s.Span.SlotsAdvanced, "from the start slot 9")
+
+	var out bytes.Buffer
+	s.write(&out, nil, 7.0)
+	require.Contains(t, out.String(), "measured span          4 blocks in 0.250 s: 16.00 blocks/s, 62.500 ms/block; 5 slots advanced: 20.00 slots/s")
+	require.Regexp(t, `BlockInterval\s+62\.50`, out.String())
+
+	missing := slices.Clone(rows)
+	missing[2].Completed = 0
+	require.False(t, summarizeBacktest(missing, 0, 0, 9, clock).Span.Complete, "a missing completion leaves no span rather than a wrong one")
+}

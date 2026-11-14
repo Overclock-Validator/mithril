@@ -2862,6 +2862,9 @@ func ReplayBlocks(
 			StreamingExecutionCfg.workers(txParallelism), StreamingExecutionCfg.MinGroupBatches, StreamingExecutionCfg.maxOpenAge())
 	}
 
+	if hook := BeforeReplayLoop; hook != nil && ReplayReadyAt.Load() == 0 {
+		hook()
+	}
 	lastRowAt := time.Now()
 	ReplayReadyAt.CompareAndSwap(0, lastRowAt.UnixNano())
 	for {
