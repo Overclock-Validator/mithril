@@ -151,13 +151,16 @@ func bankHashString(h []byte) string {
 var workAheadLastVerdict atomic.Pointer[WorkAheadVerdict]
 
 // workAheadReplayVerdict is called for every block once its bank hash is
-// computed and its footer checked, with the footer check's error (nil when the
-// hashes matched or the block has no footer hash). For the replay of the slot
+// computed, with the footer check's error (nil when the hashes matched, the
+// block has no footer hash, or the mode replaying it did not check). For the replay of the slot
 // that tripped the shutoff it compares this attempt, made without early
 // executions, with the one that was made with them, logs which of the two
 // explanations holds, and returns footerErr with that explanation attached so
-// the error a halting node prints carries it. For every other block it returns
-// footerErr unchanged.
+// the error a halting node prints carries it. It does not take the caller's
+// nil for a match: if that replay's hash differs from the block's footer hash
+// it returns a FooterBankhashMismatch, in every mode, so the slot whose first
+// attempt was refused on that comparison is not then accepted without it. For
+// every other block it returns footerErr unchanged.
 func workAheadReplayVerdict(block *b.Block, computed []byte, footerErr error) error {
 	if block == nil || !workAheadTripped.Load() {
 		return footerErr
@@ -174,6 +177,13 @@ func workAheadReplayVerdict(block *b.Block, computed []byte, footerErr error) er
 	workAheadSuspect.computed = nil
 	workAheadSuspect.mu.Unlock()
 
+	// The caller's footer check runs only in the Alpenglow clock mode. This
+	// replay is judged, and accepted, on a comparison made here: a block with
+	// a footer bank hash that its computed hash does not equal is a mismatch
+	// whichever mode replays it.
+	if footerErr == nil && block.HasExpectedBankhash && !bytes.Equal(block.ExpectedBankhash[:], computed) {
+		footerErr = &FooterBankhashMismatch{Slot: block.Slot, Footer: block.ExpectedBankhash, Computed: append([]byte(nil), computed...)}
+	}
 	same := bytes.Equal(first, computed)
 	// The same block: the same footer hash, or, for two blocks without one,
 	// the same blockhash (the last entry hash, which fixes the entries).

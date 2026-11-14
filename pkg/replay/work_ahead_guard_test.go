@@ -157,8 +157,29 @@ func TestWorkAheadReplayVerdict(t *testing.T) {
 	// another block at the slot: inconclusive
 	trip(403, withEarly, true)
 	other := &b.Block{Slot: 403, HasExpectedBankhash: true, ExpectedBankhash: [32]byte{0xEE}}
-	if err := workAheadReplayVerdict(other, third, nil); err != nil || last() != WorkAheadVerdictInconclusive {
+	if err := workAheadReplayVerdict(other, other.ExpectedBankhash[:], nil); err != nil || last() != WorkAheadVerdictInconclusive {
 		t.Fatalf("verdict %q, err %v", last(), err)
+	}
+
+	// A mode that does not check footers passes nil whatever was computed. The
+	// verdict compares the hashes itself: a third hash is not a footer match
+	// and is not accepted, and the same hash is still a mismatch.
+	trip(408, withEarly, true)
+	err = workAheadReplayVerdict(withFooter(408), third, nil)
+	if last() != WorkAheadVerdictInconclusive || !errors.As(err, &mismatch) || !bytes.Equal(mismatch.Computed, third) {
+		t.Fatalf("unchecked third hash: verdict %q, err %v", last(), err)
+	}
+	trip(409, withEarly, true)
+	err = workAheadReplayVerdict(withFooter(409), withEarly, nil)
+	if last() != WorkAheadVerdictNotSpeculation || !errors.As(err, &mismatch) {
+		t.Fatalf("unchecked same hash: verdict %q, err %v", last(), err)
+	}
+	if again := workAheadFooterShutoff(err); !errors.Is(again, err) {
+		t.Fatal("the plain replay's mismatch stays an ordinary mismatch")
+	}
+	trip(410, withEarly, true)
+	if err := workAheadReplayVerdict(withFooter(410), plainGood, nil); err != nil || last() != WorkAheadVerdictSpeculationFault {
+		t.Fatalf("unchecked matching hash: verdict %q, err %v", last(), err)
 	}
 
 	// no footer hash: the attempts agree, or they do not

@@ -705,7 +705,12 @@ func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
 			return nil, workAheadReplayVerdict(block, slotCtx.FinalBankhash, footerVerificationErr)
 		}
 	}
-	_ = workAheadReplayVerdict(block, slotCtx.FinalBankhash, nil)
+	// The replay of a slot the footer shutoff refused: the verdict compares
+	// the hashes itself, which matters when the clock mode above did not.
+	if err := workAheadReplayVerdict(block, slotCtx.FinalBankhash, nil); err != nil {
+		writeFooterBankhashMismatchArtifact(err, block, slotCtx, writableAccts, modifiedAccts)
+		return nil, err
+	}
 	// Early executions are only ever accepted in a block whose computed bank
 	// hash was just compared with its footer's (work_ahead_guard.go).
 	if err := workAheadRequireFooterHash(block, slotCtx.FinalBankhash); err != nil {
