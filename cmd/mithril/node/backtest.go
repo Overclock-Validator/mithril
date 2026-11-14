@@ -557,7 +557,7 @@ func backtestConfig(cluster config.Cluster, store, workdir string, shredVersion 
 	fmt.Fprintf(&b, "[lightbringer]\nenabled = false\n\n[rpc]\nport = 0\n\n[verifier]\nenabled = false\nrequired = false\n\n")
 	fmt.Fprintf(&b, "[tuning]\nstreaming_execution = true\ntxpar = %d\nsnapshot_index_shards = 256\nmax_concurrent_flushers = 8\n", txpar)
 	fmt.Fprintf(&b, "snapshot_append_vec_workers = 32\nsnapshot_index_builder_workers = 64\nsnapshot_index_committer_workers = 64\n")
-	fmt.Fprintf(&b, "param_arena_size_mb = 512\nborrowed_account_arena_size = 1024\nuse_pool = true\nprogram_cache_max_mb = 1024\n")
+	fmt.Fprintf(&b, "param_arena_size_mb = 512\nborrowed_account_arena_size = 1024\nuse_pool = true\nprogram_cache_max_mb = %d\n", accountsdb.DefaultProgramCacheMaxMB)
 	fmt.Fprintf(&b, "common_account_cache_max_mb = 768\nindex_cache_max_mb = 256\ncommon_account_cache_layout = \"fixed\"\n\n")
 	fmt.Fprintf(&b, "[snapshot]\nmax_full_snapshots = 1\n\n[log]\nlevel = \"info\"\nto_stdout = false\n")
 	return b.String()
