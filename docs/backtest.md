@@ -291,6 +291,13 @@ lengthen the warm-up if the first half is slower.
   source, so roots, and with them folds to disk, can land at different points.
   Captures without footer certificates cannot be rooted by Mithril and are not
   supported.
+- **Forks in the capture.** A capture is plain shred packets and may hold
+  several forks. Firedancer's backtest replays every block in it, switching
+  forks as a live node would. Mithril's import keeps one chain (the rooted
+  slots, or the chain of parents to the highest complete slot with a bank
+  hash) and replays only that. For a like-for-like comparison, use a capture
+  of rooted blocks only, as during catch-up; `mithril corpus export-shredcap`
+  writes one.
 - **Start state.** Firedancer loads the snapshot on every run. Mithril builds
   its AccountsDB once and rewinds it on later runs.
 - **Read-ahead.** Firedancer's backtest tile reads the capture at most 30

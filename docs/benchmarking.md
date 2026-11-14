@@ -270,6 +270,12 @@ and run `firedancer-dev backtest` on it, or import a Firedancer capture. Live
 numbers from different runs or hosts are different blocks at different
 network positions and cannot be compared block for block.
 
+**Use a rooted-only capture.** A capture is shred packets and may hold
+several forks. Firedancer replays every block in it, switching forks; Mithril
+replays one chain. With forks in the capture the two replay different block
+counts and Firedancer does fork switches Mithril does not, so compare on a
+capture of rooted blocks only (what catch-up replays).
+
 **Compare like spans.** `BACKTEST_SUMMARY` uses Firedancer's field names and
 spans (`replay_s`, `slot_exec_s`, `sec_per_slot`, `tps` and the rest);
 [backtest.md](backtest.md) lists what still differs. Firedancer's per-slot
