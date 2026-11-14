@@ -631,6 +631,7 @@ func init() {
 	Run.Flags().StringVar(&turbineAdvertisedIP, "turbine-advertised-ip", "", "Public IP advertised by native turbine gossip (optional)")
 	Run.Flags().IntVar(&turbineShredVersion, "turbine-shred-version", 0, "Shred version for native turbine gossip (0 = discover from entrypoint)")
 	Run.Flags().BoolVar(&replayPhaseTimers, "replay-phase-timers", true, "Time each transaction phase and instruction dispatch during replay (the detail behind TxLoop); off saves the timer calls")
+	Run.Flags().String("speculation", replay.SpeculationOff, "Early execution of transactions queued behind others: off, safe (the vetted set) or full (safe plus the experimental unchanged-account prediction)")
 	Run.Flags().BoolVar(&offlineReplay, "offline", false, "Replay only from the local shred spool: no gossip, Turbine tree, repair or Votor listener (corpus replays; needs --end-slot and --bootstrap accountsdb)")
 	Run.Flags().StringSlice("shred-receiver-address", nil, "Also send every shred this validator broadcasts to this host:port (repeatable), e.g. a block builder")
 	Run.Flags().StringSlice("shred-retransmit-receiver-address", nil, "Also send every shred this node relays to this host:port (repeatable), e.g. a block builder")
@@ -1260,6 +1261,12 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	replay.StreamingExecutionCfg.Enabled = getBool("streaming-execution", "tuning.streaming_execution")
 	replayPhaseTimers = getBool("replay-phase-timers", "tuning.replay_phase_timers")
 	replay.SkipPhaseTimers = !replayPhaseTimers
+	if err := replay.ConfigureSpeculation(getString("speculation", "tuning.speculation")); err != nil {
+		return fmt.Errorf("tuning.speculation: %w", err)
+	}
+	if summary := replay.SpeculationSummary(); summary != "off" {
+		mlog.Log.Infof("speculation: %s", summary)
+	}
 	replay.StreamingExecutionCfg.Workers = getInt("streaming-workers", "tuning.streaming_workers")
 	replay.StreamingExecutionCfg.MinGroupBatches = getInt("streaming-min-group-batches", "tuning.streaming_min_group_batches")
 	if ms := getInt("streaming-max-open-ms", "tuning.streaming_max_open_ms"); ms > 0 {
