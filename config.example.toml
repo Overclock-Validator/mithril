@@ -674,7 +674,7 @@ name = "mithril"
     use_pool = true
 
     # Approximate maximum retained SBPF program cache size in MiB.
-    program_cache_max_mb = 1024
+    program_cache_max_mb = 4096
 
     # Approximate retained decoded account cache weight budget in MiB. Large block scans
     # pass through a bounded two-hit admission filter before using this budget.

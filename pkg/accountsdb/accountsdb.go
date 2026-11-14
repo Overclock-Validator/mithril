@@ -113,7 +113,7 @@ const (
 	indexPebbleMemTableSize                = 64 << 20
 	indexPebbleMemTableStopWritesThreshold = 4
 	DefaultCommonAccountCacheMaxMB         = 768
-	DefaultProgramCacheMaxMB               = 1024
+	DefaultProgramCacheMaxMB               = 4096
 	programCacheCostUnitBytes              = 1 << 20
 	commonAccountCacheEntryOverheadBytes   = 256
 )
