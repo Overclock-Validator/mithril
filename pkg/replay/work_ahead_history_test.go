@@ -6,6 +6,7 @@ import (
 	"hash/fnv"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/gagliardetto/solana-go"
@@ -129,6 +130,39 @@ func TestUnchangedHistoryConcurrent(t *testing.T) {
 		if total == 0 || same != total {
 			t.Fatalf("key %d: unchanged %d of %d", i, same, total)
 		}
+	}
+}
+
+// A refusal is classified from the word it was decided on, whatever the table
+// holds by the time it is counted.
+func TestUnchangedRefusalReasonUsesItsSnapshot(t *testing.T) {
+	resetUnchangedHistory()
+	defer resetUnchangedHistory()
+	reset := func() {
+		for _, c := range []*atomic.Int64{&unchangedReasons.noHistory, &unchangedReasons.fewObserved, &unchangedReasons.lastChanged, &unchangedReasons.lowRate} {
+			c.Store(0)
+		}
+	}
+	reset()
+	defer reset()
+	k := historyKey(11)
+	recordUnchanged(k, false)
+	recordUnchanged(k, true)
+	decided := findUnchanged(k) // two observations: too few
+	if wordPredictsUnchanged(decided) {
+		t.Fatal("two observations predicted")
+	}
+	recordUnchanged(k, true) // a third arrives before the refusal is counted
+	noteUnchangedRefusal(decided)
+	if few, low := unchangedReasons.fewObserved.Load(), unchangedReasons.lowRate.Load(); few != 1 || low != 0 {
+		t.Fatalf("few-observed %d, low-rate %d", few, low)
+	}
+	noteUnchangedRefusal(0)
+	noteUnchangedRefusal(findUnchanged(k)) // 2 of 3, last unchanged
+	recordUnchanged(k, false)
+	noteUnchangedRefusal(findUnchanged(k))
+	if no, low, last := unchangedReasons.noHistory.Load(), unchangedReasons.lowRate.Load(), unchangedReasons.lastChanged.Load(); no != 1 || low != 1 || last != 1 {
+		t.Fatalf("no-history %d, low-rate %d, last-changed %d", no, low, last)
 	}
 }
 

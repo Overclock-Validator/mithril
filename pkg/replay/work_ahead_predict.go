@@ -355,7 +355,11 @@ func recordUnchanged(k unchangedKey, unchanged bool) {
 // predictsUnchanged: seen at least unchangedMinObserved times, at least 90%
 // unchanged, and unchanged the last time.
 func predictsUnchanged(k unchangedKey) bool {
-	word := findUnchanged(k)
+	return wordPredictsUnchanged(findUnchanged(k))
+}
+
+// wordPredictsUnchanged is the rule on one read of a key's word.
+func wordPredictsUnchanged(word uint64) bool {
 	same, total := unchangedCounts(word)
 	return total >= unchangedMinObserved && word&unchangedLastChanged == 0 && 10*same >= unchangedMinRateTenth*total
 }
@@ -446,9 +450,9 @@ var unchangedReasons struct {
 	asked, predicted, payerShared, noHistory, fewObserved, lastChanged, lowRate atomic.Int64
 }
 
-// noteUnchangedRefusal counts why k's history refused.
-func noteUnchangedRefusal(k unchangedKey) {
-	word := findUnchanged(k)
+// noteUnchangedRefusal counts why a key's history refused, from the word the
+// refusal was decided on: the table may have changed since.
+func noteUnchangedRefusal(word uint64) {
 	_, total := unchangedCounts(word)
 	switch {
 	case word == 0:
@@ -497,9 +501,9 @@ func (w *workAhead) predictUnchangedFor(prerequisite, tx int) bool {
 		if !uses(a.publicKey) {
 			continue
 		}
-		if k := (unchangedKey{program: program, account: [32]byte(a.publicKey)}); !predictsUnchanged(k) {
+		if word := findUnchanged(unchangedKey{program: program, account: [32]byte(a.publicKey)}); !wordPredictsUnchanged(word) {
 			if workAheadLog {
-				noteUnchangedRefusal(k)
+				noteUnchangedRefusal(word)
 			}
 			return false
 		}
