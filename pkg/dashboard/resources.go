@@ -80,13 +80,14 @@ func (r *resourceCPURate) observe(s *Snapshot, p *PublicResources) *PublicCPURat
 	return measured
 }
 
-// PublicFilesystem reports capacity and availability, not summed host storage.
+// PublicFilesystem reports capacity, usage and availability for one filesystem.
 // Several roles may identify the same filesystem. Zero inodes means no count.
 type PublicFilesystem struct {
-	TotalBytes     uint64 `json:"total_bytes,string"`
-	AvailableBytes uint64 `json:"available_bytes,string"`
-	Inodes         uint64 `json:"inodes,string"`
-	FreeInodes     uint64 `json:"free_inodes,string"`
+	TotalBytes     uint64  `json:"total_bytes,string"`
+	AvailableBytes uint64  `json:"available_bytes,string"`
+	UsedBytes      *uint64 `json:"used_bytes,string,omitempty"`
+	Inodes         uint64  `json:"inodes,string"`
+	FreeInodes     uint64  `json:"free_inodes,string"`
 }
 
 func publicResources(s *Snapshot, state string, now time.Time) *PublicResources {
@@ -121,8 +122,14 @@ func publicResources(s *Snapshot, state string, now time.Time) *PublicResources 
 }
 
 func publicFilesystem(f *Filesystem) *PublicFilesystem {
-	if f == nil || f.TotalBytes == 0 || f.AvailableBytes > f.TotalBytes || f.FreeInodes > f.Inodes {
+	if f == nil || f.TotalBytes == 0 || f.AvailableBytes > f.TotalBytes || f.FreeInodes > f.Inodes ||
+		f.UsedBytes != nil && (*f.UsedBytes > f.TotalBytes || f.AvailableBytes > f.TotalBytes-*f.UsedBytes) {
 		return nil
 	}
-	return &PublicFilesystem{TotalBytes: f.TotalBytes, AvailableBytes: f.AvailableBytes, Inodes: f.Inodes, FreeInodes: f.FreeInodes}
+	p := &PublicFilesystem{TotalBytes: f.TotalBytes, AvailableBytes: f.AvailableBytes, Inodes: f.Inodes, FreeInodes: f.FreeInodes}
+	if f.UsedBytes != nil {
+		used := *f.UsedBytes
+		p.UsedBytes = &used
+	}
+	return p
 }

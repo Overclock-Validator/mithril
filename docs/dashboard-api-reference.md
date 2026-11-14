@@ -217,7 +217,8 @@ samples, resets and invalid counters remove the rate until a new interval is
 available. An idle measured interval is zero; no interval is null.
 
 Each filesystem has string-encoded `total_bytes`, `available_bytes`, `inodes`
-and `free_inodes`. Several roles may share a filesystem: do not sum them.
+and `free_inodes`. Optional `used_bytes` excludes reserved free blocks; an
+older source may omit it. Several roles may share a filesystem: do not sum them.
 Zero inode count means the platform did not report an inode capacity. A full
 filesystem has zero availability; an unavailable or invalid measurement is
 null. Paths, devices, process arguments and host identifiers remain excluded.
@@ -385,10 +386,8 @@ Each message replaces the previous value for its `(topic, key)` pair. On a new
 connection, discard the old cache. Apply messages in order. The messages in a
 snapshot are not a transaction or an atomic bank view.
 
-The message envelope is inspired by the
-[Firedancer dashboard API](https://docs.firedancer.io/api/websocket.html).
-The fields described below are specific to Mithril; this is not a drop-in
-implementation of that protocol.
+The fields described below are specific to Mithril; other dashboard protocols
+are not interchangeable with this API.
 
 | Topic and key | Value and source |
 | --- | --- |

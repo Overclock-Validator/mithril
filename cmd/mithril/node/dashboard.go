@@ -190,10 +190,11 @@ func filesystemSample(path string) *dashboard.Filesystem {
 
 func filesystemFromStat(stat syscall.Statfs_t) *dashboard.Filesystem {
 	unit := filesystemBlockSize(stat)
-	if unit == 0 || stat.Blocks > ^uint64(0)/unit || stat.Bavail > ^uint64(0)/unit {
+	if unit == 0 || stat.Blocks > ^uint64(0)/unit || stat.Bavail > ^uint64(0)/unit || stat.Bfree > stat.Blocks || stat.Bavail > stat.Bfree {
 		return nil
 	}
-	return &dashboard.Filesystem{TotalBytes: stat.Blocks * unit, AvailableBytes: stat.Bavail * unit, Inodes: stat.Files, FreeInodes: stat.Ffree}
+	used := (stat.Blocks - stat.Bfree) * unit
+	return &dashboard.Filesystem{TotalBytes: stat.Blocks * unit, AvailableBytes: stat.Bavail * unit, UsedBytes: &used, Inodes: stat.Files, FreeInodes: stat.Ffree}
 }
 
 func startNodeDashboard(ctx context.Context, startedAt time.Time, socket, group, runID, network, mode string, alpenglow, rpcConfigured, hostResources bool) *nodeDashboard {
