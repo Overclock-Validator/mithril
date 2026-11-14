@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
+	a "github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/require"
@@ -67,7 +68,7 @@ func (f *voteUpdateFixture) slotCtx() *sealevel.SlotCtx {
 	parent := accounts.NewMemAccounts()
 	for _, k := range f.keys {
 		k := k
-		if err := parent.SetAccount((*[32]byte)(&k), &accounts.Account{Key: k, Lamports: 1_000_000, Data: bytes.Clone(f.data[k])}); err != nil {
+		if err := parent.SetAccount((*[32]byte)(&k), &accounts.Account{Key: k, Lamports: 1_000_000, Owner: a.VoteProgramAddr, Data: bytes.Clone(f.data[k])}); err != nil {
 			panic(err)
 		}
 	}
