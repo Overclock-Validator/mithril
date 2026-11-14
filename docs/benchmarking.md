@@ -10,6 +10,7 @@ client or another machine.
 |---|---|---|
 | `mithril backtest` | Repeatable replay of a shredcap capture from a snapshot or AccountsDB, with a summary in Firedancer's format | [backtest.md](backtest.md) |
 | `mithril corpus import-shredcap` / `export-shredcap` | Moving the same blocks between Mithril and Firedancer | [replay-corpus.md](replay-corpus.md) |
+| `mithril corpus from-spool` | A corpus and capture of the blocks a live run replayed (with `MITHRIL_SHRED_ARCHIVE_DIR` set during the run) | [replay-corpus.md](replay-corpus.md#a-corpus-from-a-node-run) |
 | `mithril run --offline` | Replaying a local shred spool with a full node configuration, no network | [replay-corpus.md](replay-corpus.md) |
 | `mithril timings span` | Blocks per second over any stretch of any run, with per-block intervals that add up to it | [below](#throughput-and-per-block-time) |
 | `mithril timings tip` | Breaking down live replay latency from a run's timing rows | [below](#the-tip-path) |

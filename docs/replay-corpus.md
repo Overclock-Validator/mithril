@@ -12,6 +12,41 @@ directory holding:
 The node replaying a corpus must already hold the state of the checkpoint slot
 in its AccountsDB.
 
+## A corpus from a node run
+
+A node's shred spool (`<blockstore>/catchup-spool`) holds only a window around
+replay: slots behind replay are deleted as it advances. To keep every block a
+run replays, start the node with
+
+```bash
+export MITHRIL_SHRED_ARCHIVE_DIR=/path/to/archive
+```
+
+Slots that fall behind replay then move into that directory instead of being
+deleted (slots dropped for space or discarded as invalid are still deleted).
+It holds every verified shred of every slot replay passed, including
+abandoned forks, so it grows by roughly the size of the blocks replayed:
+check free space for a long run. After stopping the node:
+
+```bash
+mithril corpus from-spool OUTDIR \
+  --spool /path/to/archive --spool <blockstore>/catchup-spool \
+  --bank-hashes <accountsdb>/bankhash.log \
+  --from-slot SNAPSHOT_SLOT+1 --to-slot LAST_FINAL_SLOT \
+  --checkpoint SNAPSHOT_SLOT \
+  --capture OUTFILE.pcapng.zst
+```
+
+The corpus is the chain of shred-header parents ending at the highest complete
+slot with a logged bank hash within the range, so abandoned forks are left
+out. The bank hashes are the ones the node computed, which it checked against
+each block's footer as it replayed. The newest slots of a run may not be final
+when it stops, so set `--to-slot` some slots before the end. `--checkpoint`
+refuses a chain that does not start right after the snapshot slot (a slot in
+between is missing, for example because the archive was not on yet).
+`--capture` also writes the corpus as a shredcap capture of rooted blocks
+only, ready for `mithril backtest` or another client.
+
 ## Firedancer shredcap captures
 
 `firedancer-dev backtest` replays shredcap captures: pcapng files, usually
