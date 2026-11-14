@@ -356,6 +356,9 @@ func (bs *BlockSource) runTurbineStream() {
 		receiver := turbine.NewUDPReceiver(bs.turbineBindAddr)
 		if bs.monitoringEnabled {
 			receiver.EnableReceptionMonitoring()
+			if bs.socketMemoryMonitoring {
+				receiver.EnableSocketReadActivity()
+			}
 		}
 		receiver.SetLeaderForSlot(bs.leaderForSlot)
 		receiver.SetShredVersion(bs.turbineShredVersion)
@@ -534,8 +537,9 @@ func (bs *BlockSource) runTurbineStream() {
 				}
 			case <-statsTicker.C:
 				stats := receiver.Stats()
+				socketMemory, socketMemoryObserved := bs.observeTurbineSocketMemory(receiver)
 				if bs.monitoringEnabled {
-					bs.publishTurbineObservation(time.Now(), receiverStartedAt, session, gossipClient != nil, stats, receiver.ShredFrontiers())
+					bs.publishTurbineObservation(time.Now(), receiverStartedAt, session, gossipClient != nil, stats, receiver.ShredFrontiers(), socketMemory, socketMemoryObserved)
 				}
 				lastPacketAge := "never"
 				if stats.LastPacketUnix != 0 {

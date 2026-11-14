@@ -21,6 +21,9 @@ jobs:
       - name: Build dashboard reader
         run: go build -v ./cmd/mithril-dashboard
 
+      - name: Build dashboard collector
+        run: go build -v ./cmd/mithril-dashboard-collect
+
   regression-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -74,7 +77,7 @@ jobs:
           ./pkg/block ./pkg/epochstakes ./pkg/global ./pkg/leaderschedule
           ./pkg/progress ./pkg/rewardcerts ./pkg/state
           ./pkg/turbine ./pkg/sigverify ./pkg/blockprod/...
-          ./cmd/mithril/node ./cmd/mithril/configcmd
+          ./cmd/mithril/node ./cmd/mithril/configcmd ./cmd/mithril-dashboard-collect
 
       - name: Interpreter differential and memory race regressions
         run: go test -race -count=1 ./pkg/sbpf/...

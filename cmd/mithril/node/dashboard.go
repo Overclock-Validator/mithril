@@ -16,6 +16,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/consensus"
 	"github.com/Overclock-Validator/mithril/pkg/dashboard"
 	"github.com/Overclock-Validator/mithril/pkg/global"
+	"github.com/Overclock-Validator/mithril/pkg/gossip"
 	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
@@ -29,30 +30,53 @@ import (
 )
 
 type nodeDashboard struct {
-	mu                sync.Mutex
-	state             dashboard.Snapshot
-	runStartedAt      time.Time // Original monotonic clock, never serialized.
-	identity          *identity.Holder
-	feed              *dashboard.Feed
-	accountsPath      string
-	ledgerPath        string
-	progress          replay.Progress
-	consensus         *consensus.AlpenglowObserverEngine
-	rpc               *rpcserver.RpcServer
-	tpu               *tpu.TPU
-	scheduler         *scheduler.Scheduler
-	pipelineStartedAt time.Time
-	hostSampler       *metrics.HostSampler // configured before the diagnostics owner starts
-	snapshotAttempt   uint64
-	snapshotRoot      *progress.DualProgress
-	snapshotManifests *nodeSnapshotManifests
-	snapshotArchive   *nodeSnapshotArchive
+	mu                    sync.Mutex
+	state                 dashboard.Snapshot
+	runStartedAt          time.Time // Original monotonic clock, never serialized.
+	identity              *identity.Holder
+	feed                  *dashboard.Feed
+	accountsPath          string
+	ledgerPath            string
+	progress              replay.Progress
+	consensus             *consensus.AlpenglowObserverEngine
+	rpc                   *rpcserver.RpcServer
+	tpu                   *tpu.TPU
+	scheduler             *scheduler.Scheduler
+	pipelineStartedAt     time.Time
+	hostSampler           *metrics.HostSampler // configured before the diagnostics owner starts
+	cgroupSampler         *metrics.CgroupSampler
+	machine               *machineDashboardMonitor
+	machineGeneration     uint64
+	machineRetired        bool
+	networkDetails        bool
+	localPeers            bool
+	networkRetired        bool
+	prewarmGeneration     uint64
+	prewarmHandover       *prewarmHandoverMonitor
+	interfaces            *interfaceTrafficMonitor
+	gossipClient          *gossip.Client
+	gossipGeneration      uint64
+	tpuSocketGeneration   uint64
+	tpuSocket             *tpuSocketOwner
+	votorSocketGeneration uint64
+	votorSocket           *votorSocketOwner
+	snapshotAttempt       uint64
+	snapshotRoot          *progress.DualProgress
+	snapshotManifests     *nodeSnapshotManifests
+	snapshotArchive       *nodeSnapshotArchive
 }
 
 // configureHostResources is startup-only; Sample is owned by diagnostics.
 func (d *nodeDashboard) configureHostResources(enabled bool) {
 	if d != nil {
 		d.hostSampler = metrics.NewHostSampler(enabled)
+		d.mu.Lock()
+		d.interfaces.stop()
+		d.interfaces = nil
+		if enabled && d.networkDetails {
+			d.interfaces = &interfaceTrafficMonitor{sampler: metrics.NewInterfaceTrafficSampler(true)}
+		}
+		d.mu.Unlock()
 	}
 }
 
@@ -76,6 +100,47 @@ func validateDashboardHostResources(enabled bool, socket string) error {
 	return nil
 }
 
+func (d *nodeDashboard) configureMachineDetails(enabled bool) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	previous := d.machine
+	d.machine = nil
+	if !d.machineRetired {
+		d.machine = newMachineDashboardMonitor(enabled)
+	}
+	d.mu.Unlock()
+	previous.stop()
+}
+
+func (d *nodeDashboard) sampleMachineDetail(_ time.Time) (dashboard.MachineDetailCapture, error) {
+	if d == nil {
+		return (*machineDashboardMonitor)(nil).sample()
+	}
+	d.mu.Lock()
+	m := d.machine
+	d.mu.Unlock()
+	return m.sample()
+}
+
+func (d *nodeDashboard) resolvedMachineWorker(name string, count int) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	m := d.machine
+	d.mu.Unlock()
+	m.resolvedWorker(name, count)
+}
+
+func validateDashboardMachineDetails(enabled bool, socket string, hostResources bool) error {
+	if enabled && (strings.TrimSpace(socket) == "" || !hostResources) {
+		return fmt.Errorf("dashboard.machine_details requires dashboard.socket and dashboard.host_resources")
+	}
+	return nil
+}
+
 func (d *nodeDashboard) storagePaths(accounts, ledger string) {
 	if d == nil {
 		return
@@ -94,11 +159,39 @@ func (d *nodeDashboard) observeRuntime(now time.Time, mem runtime.MemStats, pres
 	now = now.UTC()
 	d.mu.Lock()
 	accounts, ledger := d.accountsPath, d.ledgerPath
+	traffic := d.interfaces
+	machine := d.machine
+	var machineBinding metrics.RSSHistoryBinding
+	var machineGeneration uint64
+	var machineGenesis string
+	if machine != nil && !d.machineRetired {
+		machineBinding = metrics.RSSHistoryBinding{RunID: d.state.RunID, StartedAt: d.runStartedAt}
+		if d.state.GenesisHash != nil {
+			machineGenesis = *d.state.GenesisHash
+		}
+		if d.machineGeneration < ^uint64(0) {
+			d.machineGeneration++
+		}
+		machineGeneration = d.machineGeneration
+	}
+	trafficBinding := dashboard.NodeNetworkBinding{}
+	if traffic != nil {
+		trafficBinding = dashboard.NodeNetworkBinding{RunID: d.state.RunID, NodeStartedAt: d.state.StartedAt}
+		if d.state.GenesisHash != nil {
+			value := *d.state.GenesisHash
+			trafficBinding.GenesisHash = &value
+		}
+	}
 	var previous *dashboard.RuntimePressure
 	if d.state.Runtime != nil {
 		previous = d.state.Runtime.Pressure
 	}
 	d.mu.Unlock()
+	if machineGenesis != "" {
+		if genesis, err := solana.HashFromBase58(machineGenesis); err == nil {
+			machineBinding.GenesisHash = [32]byte(genesis)
+		}
+	}
 	r := &dashboard.Runtime{
 		SampledAt: now, HeapBytes: mem.HeapAlloc, GoBytes: mem.Sys - mem.HeapReleased,
 		NextGCBytes: mem.NextGC, GCCount: uint64(mem.NumGC), MemoryLimitBytes: debug.SetMemoryLimit(-1),
@@ -113,6 +206,10 @@ func (d *nodeDashboard) observeRuntime(now time.Time, mem runtime.MemStats, pres
 		}
 	}
 	resources := &dashboard.Resources{SampledAt: now, Root: filesystemSample("/"), Accounts: filesystemSample(accounts), Ledger: filesystemSample(ledger)}
+	var rssAt time.Time
+	if machine != nil {
+		rssAt = time.Now()
+	}
 	rss := replay.ProcessRSSBytes()
 	if rss != 0 {
 		resources.RSSBytes = &rss
@@ -125,9 +222,16 @@ func (d *nodeDashboard) observeRuntime(now time.Time, mem runtime.MemStats, pres
 	if observation, supported := d.hostSampler.Sample(); supported {
 		resources.Host = hostResourcesMeasurement(observation)
 	}
+	resources.Cgroup = sampleCgroupResources(d.cgroupSampler)
 	d.mu.Lock()
 	d.state.Runtime, d.state.Resources = r, resources
 	d.mu.Unlock()
+	if machine != nil {
+		machine.observe(machineBinding, machineGeneration, metrics.RSSHistoryPoint{At: rssAt, Bytes: rss, Known: rss != 0}, uint32(runtime.GOMAXPROCS(0)))
+	}
+	traffic.observe(trafficBinding)
+	d.observeTPUSocket()
+	d.observeVotorSocket()
 }
 
 func hostResourcesMeasurement(o metrics.HostObservation) *dashboard.HostResources {
@@ -197,18 +301,37 @@ func filesystemFromStat(stat syscall.Statfs_t) *dashboard.Filesystem {
 	return &dashboard.Filesystem{TotalBytes: stat.Blocks * unit, AvailableBytes: stat.Bavail * unit, UsedBytes: &used, Inodes: stat.Files, FreeInodes: stat.Ffree}
 }
 
-func startNodeDashboard(ctx context.Context, startedAt time.Time, socket, group, runID, network, mode string, alpenglow, rpcConfigured, hostResources bool) *nodeDashboard {
+func startNodeDashboard(ctx context.Context, startedAt time.Time, socket, group, runID, network, mode string, alpenglow, rpcConfigured, hostResources, networkDetails, machineDetails, localPeers bool) *nodeDashboard {
 	if socket == "" {
 		return nil
 	}
-	d := &nodeDashboard{runStartedAt: startedAt, state: dashboard.Snapshot{
+	if err := validateDashboardLocalPeers(localPeers, socket, networkDetails); err != nil {
+		mlog.Log.Warnf("dashboard local peers unavailable: %v", err)
+		return nil
+	}
+	d := &nodeDashboard{runStartedAt: startedAt, networkDetails: networkDetails, localPeers: localPeers, state: dashboard.Snapshot{
 		RunID: runID, StartedAt: startedAt.UTC(), Version: version.Semver(), Commit: version.Commit(),
 		Network: network, Mode: mode, Alpenglow: alpenglow, RPCConfigured: rpcConfigured, Phase: "starting",
 	}}
 	d.configureHostResources(hostResources)
+	d.configureMachineDetails(machineDetails)
 	var feed *dashboard.Feed
 	var err error
-	if group == "" {
+	var details dashboard.DetailSamplers
+	if machineDetails {
+		details.Machine = d.sampleMachineDetail
+	}
+	if networkDetails {
+		d.progress.EnableNetworkDetails()
+		d.progress.SetGossipObserver(d.observeGossipClient)
+		details.NodeNetwork = d.sampleNodeNetwork
+	}
+	if localPeers {
+		details.LocalPeers = d.sampleLocalPeers
+	}
+	if networkDetails || machineDetails {
+		feed, err = dashboard.ListenFeedWithDetails(ctx, socket, group, d.snapshot, details)
+	} else if group == "" {
 		feed, err = dashboard.ListenFeed(ctx, socket, d.snapshot)
 	} else {
 		feed, err = dashboard.ListenFeedGroup(ctx, socket, group, d.snapshot)
@@ -550,6 +673,13 @@ func (d *nodeDashboard) pipelineStarted(service *tpu.TPU, scheduler *scheduler.S
 		return
 	}
 	d.mu.Lock()
+	if service != d.tpu {
+		d.tpuSocket = nil
+		if d.networkDetails && !d.networkRetired && service != nil && d.tpuSocketGeneration != ^uint64(0) {
+			d.tpuSocketGeneration++
+			d.tpuSocket = &tpuSocketOwner{service: service, generation: d.tpuSocketGeneration}
+		}
+	}
 	d.tpu, d.scheduler, d.pipelineStartedAt = service, scheduler, time.Now().UTC()
 	d.mu.Unlock()
 }
@@ -559,6 +689,7 @@ func (d *nodeDashboard) pipelineStopped() {
 		return
 	}
 	d.mu.Lock()
+	d.tpuSocket = nil
 	d.tpu, d.scheduler, d.pipelineStartedAt = nil, nil, time.Time{}
 	d.mu.Unlock()
 }
@@ -595,6 +726,18 @@ func (d *nodeDashboard) consensusStarted(engine *consensus.AlpenglowObserverEngi
 		return
 	}
 	d.mu.Lock()
+	if d.consensus != engine {
+		d.votorSocket = nil
+		if d.networkDetails && !d.networkRetired && d.state.Phase != "stopping" && engine != nil && d.votorSocketGeneration != ^uint64(0) {
+			d.votorSocketGeneration++
+			binding := dashboard.NodeNetworkBinding{RunID: d.state.RunID, NodeStartedAt: d.state.StartedAt}
+			if d.state.GenesisHash != nil {
+				genesis := *d.state.GenesisHash
+				binding.GenesisHash = &genesis
+			}
+			d.votorSocket = &votorSocketOwner{engine: engine, binding: binding, generation: d.votorSocketGeneration}
+		}
+	}
 	d.consensus = engine
 	d.mu.Unlock()
 }
@@ -667,15 +810,29 @@ func (d *nodeDashboard) stopping() {
 		return
 	}
 	d.mu.Lock()
+	machine := d.machine
+	d.machineRetired = true
 	d.state.Phase = "stopping"
+	d.networkRetired, d.gossipClient = true, nil
+	d.tpuSocket, d.votorSocket = nil, nil
+	d.interfaces.stop()
 	d.consensus = nil
 	d.rpc = nil
 	d.tpu, d.scheduler, d.pipelineStartedAt = nil, nil, time.Time{}
 	d.mu.Unlock()
+	machine.stop()
 }
 
 func (d *nodeDashboard) close() {
 	if d != nil {
+		d.mu.Lock()
+		machine := d.machine
+		d.machineRetired = true
+		d.networkRetired, d.gossipClient = true, nil
+		d.tpuSocket, d.votorSocket = nil, nil
+		d.interfaces.stop()
+		d.mu.Unlock()
+		machine.stop()
 		d.feed.Close()
 	}
 }

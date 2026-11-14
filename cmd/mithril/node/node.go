@@ -92,6 +92,10 @@ var (
 	dashboardSocketGroup             string
 	dashboardEnabled                 bool
 	dashboardHostResources           bool
+	dashboardCgroupResources         bool
+	dashboardNetworkDetails          bool
+	dashboardMachineDetails          bool
+	dashboardLocalPeers              bool
 	disableMetricsServer             bool
 	blockSource                      string // "turbine", "rpc", or "lightbringer"
 	lightbringerEndpoint             string
@@ -554,6 +558,10 @@ func init() {
 	Run.Flags().StringVar(&dashboardSocketGroup, "dashboard-socket-group", "", "Dedicated Linux feed group (requires a node-owned mode 2710 socket directory)")
 	Run.Flags().BoolVar(&dashboardEnabled, "dashboard-enabled", false, "Enable the provisioned Linux dashboard feed")
 	Run.Flags().BoolVar(&dashboardHostResources, "dashboard-host-resources", false, "Collect visible-host CPU/load/memory in the private dashboard feed (requires a dashboard feed; default off)")
+	Run.Flags().BoolVar(&dashboardCgroupResources, "dashboard-cgroup-resources", false, "Collect visible domain-cgroup settings, counters and pressure in the private dashboard feed (requires a dashboard feed; default off)")
+	Run.Flags().BoolVar(&dashboardNetworkDetails, "dashboard-network-details", false, "Include network observations in the private dashboard feed (requires a dashboard feed; default off)")
+	Run.Flags().BoolVar(&dashboardMachineDetails, "dashboard-machine-details", false, "Collect bounded machine topology, sampled thread affinity and RSS history (requires a dashboard feed and --dashboard-host-resources; default off)")
+	Run.Flags().BoolVar(&dashboardLocalPeers, "dashboard-local-peers", false, "Retain bounded local signed-contact metadata without network endpoints (requires a dashboard feed and --dashboard-network-details; default off)")
 
 	// [replay] section flags
 	Run.Flags().Int64Var(&txParallelism, "txpar", 0, "Transaction execution workers (>0 enables topsort parallelism; explicit 0 is sequential; unset validator mode defaults to 2x CPU cores)")
@@ -911,6 +919,22 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		return dashboardErr
 	}
 	dashboardHostResources = getBool("dashboard-host-resources", "dashboard.host_resources")
+	dashboardCgroupResources = getBool("dashboard-cgroup-resources", "dashboard.cgroup_resources")
+	if err := validateDashboardCgroupResources(dashboardCgroupResources, dashboardSocket); err != nil {
+		return err
+	}
+	dashboardNetworkDetails = getBool("dashboard-network-details", "dashboard.network_details")
+	dashboardMachineDetails = getBool("dashboard-machine-details", "dashboard.machine_details")
+	dashboardLocalPeers = getBool("dashboard-local-peers", "dashboard.local_peers")
+	if err := validateDashboardLocalPeers(dashboardLocalPeers, dashboardSocket, dashboardNetworkDetails); err != nil {
+		return err
+	}
+	if err := validateDashboardMachineDetails(dashboardMachineDetails, dashboardSocket, dashboardHostResources); err != nil {
+		return err
+	}
+	if err := validateDashboardNetworkDetails(dashboardNetworkDetails, dashboardSocket); err != nil {
+		return err
+	}
 	if err := validateDashboardHostResources(dashboardHostResources, dashboardSocket); err != nil {
 		return err
 	}
@@ -1461,7 +1485,8 @@ func runLive(c *cobra.Command, args []string) {
 	if killed := killExistingMithrilProcesses(); killed > 0 {
 		fmt.Printf("  ⚠ Killed %d existing mithril process(es)\n\n", killed)
 	}
-	dashboard := startNodeDashboard(ctx, runStartedAt, dashboardSocket, dashboardSocketGroup, replay.CurrentRunID, cluster, consensusMode, true, rpcPort != 0, dashboardHostResources)
+	dashboard := startNodeDashboard(ctx, runStartedAt, dashboardSocket, dashboardSocketGroup, replay.CurrentRunID, cluster, consensusMode, true, rpcPort != 0, dashboardHostResources, dashboardNetworkDetails, dashboardMachineDetails, dashboardLocalPeers)
+	dashboard.configureCgroupResources(dashboardCgroupResources)
 	defer dashboard.close()
 	dashboard.storagePaths(accountsPath, blockstorePath)
 	stopMemoryDiagnostics := startMemoryDiagnostics(ctx, mlog.GetLogDir(), heapProfileThreshold, dashboard)
@@ -1652,6 +1677,8 @@ func runLive(c *cobra.Command, args []string) {
 				FloorSlot:                  m.Bank.Slot + 1,
 				ShredSpoolDir:              catchupShredSpoolDir(),
 				RepairMaxRequestsPerSecond: repairMaxRequestsPerSecond,
+				GossipObserver:             dashboard.gossipObserver(),
+				ObserveHandover:            dashboard.prewarmHandoverObserver(),
 			})
 			if err != nil {
 				mlog.Log.Warnf("turbine prewarm failed to start (continuing without): %v", err)
@@ -2617,12 +2644,13 @@ postBootstrap:
 		klog.Fatalf("Alpenglow consensus requires an epoch schedule in the snapshot/state seed")
 	}
 	consensusEngine, err = consensusengine.NewEngine(consensusengine.Config{
-		MonitoringEnabled:         dashboard != nil,
-		AlpenglowObserverBindAddr: alpenglowObserverBindAddr,
-		AlpenglowMaxMessageBytes:  alpenglowMaxMessageBytes,
-		AlpenglowBLSDST:           alpenglowBLSDST,
-		AlpenglowShredVersion:     uint16(turbineShredVersion),
-		AlpenglowIdentity:         validatorIdentity,
+		MonitoringEnabled:             dashboard != nil,
+		VotorPayloadMonitoringEnabled: dashboard != nil && dashboardNetworkDetails,
+		AlpenglowObserverBindAddr:     alpenglowObserverBindAddr,
+		AlpenglowMaxMessageBytes:      alpenglowMaxMessageBytes,
+		AlpenglowBLSDST:               alpenglowBLSDST,
+		AlpenglowShredVersion:         uint16(turbineShredVersion),
+		AlpenglowIdentity:             validatorIdentity,
 	})
 	if err != nil {
 		klog.Fatalf("unable to create consensus engine: %v", err)
@@ -2760,6 +2788,8 @@ postBootstrap:
 		tpuCfg := tpu.DefaultConfig()
 		tpuCfg.Identity = validatorIdentity
 		tpuCfg.ListenAddr = validatorTPUQUICBind
+		tpuCfg.QUIC.ObserveStreamReadPayload = dashboard != nil && dashboardNetworkDetails
+		tpuCfg.Pipeline.ObserveQueues = dashboard != nil && dashboardNetworkDetails
 		tpuCfg.AdvertisedIP = advertisedIP
 		tpuCfg.Pipeline.Sink = topicSink
 		tpuCfg.Pipeline.TxV1Enabled = func() bool {
@@ -2778,6 +2808,7 @@ postBootstrap:
 		if err != nil {
 			klog.Fatalf("start validator TPU: %v", err)
 		}
+		dashboard.resolvedMachineWorker("tpu_sigverify", tpuCfg.Pipeline.SigverifyWorkers)
 		dashboard.pipelineStarted(tpuService, topicSink)
 		defer func() {
 			dashboard.pipelineStopped()
@@ -2803,6 +2834,7 @@ postBootstrap:
 			if err != nil {
 				klog.Fatalf("start Harmonic: %v", err)
 			}
+			dashboard.resolvedMachineWorker("harmonic_bundles", harmonicConfig.workers)
 			// Defers run in reverse: the leader loop, which calls the hooks,
 			// stops first, then Harmonic, then the TPU it submits to.
 			defer stopHarmonic()
@@ -3043,6 +3075,7 @@ postBootstrap:
 	}
 	dashboard.replaying(validatorIdentity)
 	dashboard.selectedRecovery(mithrilState)
+	dashboard.resolvedMachineWorker("replay_transactions", int(txParallelism))
 	result := runReplayWithRecovery(ctx, accountsDb, accountsPath, manifest, resumeState, uint64(startSlot), liveEndSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, uint16(turbineShredVersion), turbineAlpenglowAddr, validatorIdentity, blockstorePath, int(txParallelism), true, useLightbringer, useTurbine, dbgOpts, metricsWriter, slotCtxSetter, mithrilState, blockFetchOpts, consensusOpts, compactCfg.RewindHorizonBatches, replayStartTime)
 	dashboard.stopping()
 	stopCompactor() // join before shutdown closes AccountsDB

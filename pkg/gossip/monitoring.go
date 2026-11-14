@@ -4,6 +4,8 @@ import (
 	"net"
 	"sort"
 	"time"
+
+	"github.com/Overclock-Validator/mithril/pkg/metrics"
 )
 
 // MonitoringSnapshot is one cached aggregate observation and bounded contact sample.
@@ -17,6 +19,10 @@ type MonitoringSnapshot struct {
 	Stats                Stats
 	Peers                [8]PeerObservation
 	PeerCount            int
+	SocketObserved       bool
+	SocketGeneration     uint64
+	SocketMemory         metrics.SocketObservation
+	SocketDrops          metrics.SocketDropDelta
 	LocalShredVersion    uint16
 	HasLocalShredVersion bool
 	PayloadObserved      bool
@@ -77,6 +83,13 @@ func (c *Client) EnableMonitoring() {
 	}
 }
 
+// EnableSocketMemoryMonitoring opts into low-rate owner socket observations.
+func (c *Client) EnableSocketMemoryMonitoring() {
+	if c != nil {
+		c.socketMemoryEnabled.Store(true)
+	}
+}
+
 func (c *Client) nextSocketGeneration() uint64 {
 	for {
 		before := c.socketGeneration.Load()
@@ -110,6 +123,9 @@ func (c *Client) publishMonitoringWithSocket(now time.Time, stats Stats, conn *n
 	if c == nil || !c.monitoringEnabled.Load() {
 		return
 	}
+	if session := c.peerDataset.Load(); session != nil && session.conn == conn && session.dataset.generation == generation {
+		session.dataset.publish(now)
+	}
 	s := &MonitoringSnapshot{SampledAt: now, StartedAt: c.startedAt.UTC(), Stats: stats}
 	// A configured fallback before contact initialization is not an applied
 	// local Gossip contact/filter observation.
@@ -118,6 +134,13 @@ func (c *Client) publishMonitoringWithSocket(now time.Time, stats Stats, conn *n
 		s.LocalShredVersion, s.HasLocalShredVersion = c.contact.ShredVer, true
 	}
 	c.contactMu.RUnlock()
+	if c.socketMemoryEnabled.Load() && conn != nil && generation != 0 {
+		s.SocketObserved, s.SocketGeneration = true, generation
+		s.SocketMemory = metrics.ObserveUDPSocketMemory(conn)
+		if before := c.monitoring.Load(); before != nil && before.SocketObserved && before.SocketGeneration == generation {
+			s.SocketDrops = metrics.ObservedSocketDrops(before.SocketMemory, s.SocketMemory)
+		}
+	}
 	if payload := c.udpPayload.Load(); payload != nil && payload.conn == conn && payload.generation == generation {
 		s.PayloadObserved, s.Payload = true, payload.snapshot()
 		if before := c.monitoring.Load(); before != nil && before.PayloadObserved {

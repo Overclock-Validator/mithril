@@ -369,13 +369,14 @@ type RuntimePressure struct {
 // Resources is sampled by the node, never by the reader process. Filesystems
 // are named by role, not path; two roles may refer to the same filesystem.
 type Resources struct {
-	SampledAt  time.Time      `json:"sampled_at"`
-	RSSBytes   *uint64        `json:"rss_bytes,string"`
-	CPUSeconds *float64       `json:"cpu_seconds"`
-	Root       *Filesystem    `json:"root"`
-	Accounts   *Filesystem    `json:"accounts"`
-	Ledger     *Filesystem    `json:"ledger"`
-	Host       *HostResources `json:"host,omitempty"`
+	SampledAt  time.Time        `json:"sampled_at"`
+	RSSBytes   *uint64          `json:"rss_bytes,string"`
+	CPUSeconds *float64         `json:"cpu_seconds"`
+	Root       *Filesystem      `json:"root"`
+	Accounts   *Filesystem      `json:"accounts"`
+	Ledger     *Filesystem      `json:"ledger"`
+	Host       *HostResources   `json:"host,omitempty"`
+	Cgroup     *CgroupResources `json:"cgroup,omitempty"`
 }
 
 // Filesystem reports used, total and unprivileged-available space for one mount.

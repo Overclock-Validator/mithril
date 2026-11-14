@@ -343,6 +343,11 @@ func encodePublicSnapshot(s *Snapshot, state string, now time.Time, throughput *
 // The default profile stays readable by existing strict v1 clients. New
 // optional fields are sent only to clients that explicitly request them.
 func encodePublicSnapshotProfile(s *Snapshot, state string, now time.Time, throughput *PublicThroughput, resources *PublicResources, peers *PublicPeers, manifestProfile int) ([]byte, error) {
+	if resources != nil && manifestProfile != 4 {
+		legacy := *resources
+		legacy.Cgroup = nil
+		resources = &legacy
+	}
 	p := PublicSnapshot{SchemaVersion: 1, SourceState: state, CollectorAt: now, Resources: resources, Peers: peers}
 	if state != "fresh" && state != "stale" && state != "unavailable" {
 		return nil, errors.New("invalid public source state")
@@ -386,7 +391,7 @@ func encodePublicSnapshotProfile(s *Snapshot, state string, now time.Time, throu
 			p.Consensus = &PublicConsensus{PublicObservation: publicObservation(c.SampledAt, state, now),
 				NotarizedSlot: c.NotarizedSlot,
 				FinalizedSlot: c.FinalizedSlot, FinalizedBlockID: c.FinalizedBlockID, VotingEnabled: c.VotingEnabled}
-			if manifestProfile == 3 && c.SafetyFault != nil {
+			if (manifestProfile == 3 || manifestProfile == 4) && c.SafetyFault != nil {
 				fault := *c.SafetyFault
 				p.Consensus.SafetyFault = &fault
 			}

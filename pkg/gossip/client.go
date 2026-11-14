@@ -99,6 +99,9 @@ type Client struct {
 	monitoring              atomic.Pointer[MonitoringSnapshot]
 	monitoringMu            sync.Mutex
 	monitoringPeers         [8]monitoredPeer
+	peerDatasetEnabled      atomic.Bool
+	peerDataset             atomic.Pointer[peerDatasetSession]
+	socketMemoryEnabled     atomic.Bool
 	socketGeneration        atomic.Uint64
 	udpPayloadEnabled       atomic.Bool
 	udpPayload              atomic.Pointer[udpPayloadRecorder]
@@ -283,6 +286,17 @@ func (c *Client) Run(ctx context.Context) error {
 	}
 	defer conn.Close()
 	socketGeneration := c.nextSocketGeneration()
+	c.peerDataset.Store(nil)
+	if c.peerDatasetEnabled.Load() && socketGeneration != 0 {
+		if dataset := newPeerDataset(true, socketGeneration, time.Now()); dataset != nil {
+			session := &peerDatasetSession{conn: conn, dataset: dataset}
+			c.peerDataset.Store(session)
+			defer func() {
+				dataset.retire()
+				c.peerDataset.CompareAndSwap(session, nil)
+			}()
+		}
+	}
 	if c.decodeMonitoringEnabled.Load() && socketGeneration != 0 {
 		recorder := &decodeMonitoringRecorder{conn: conn, generation: socketGeneration, startedAt: time.Now()}
 		c.decodeMonitoring.Store(recorder)
@@ -738,7 +752,11 @@ func (c *Client) handlePacket(conn *net.UDPConn, packet []byte, from *net.UDPAdd
 		output = &observation
 	}
 	decoded, err := decodePacketWithObservation(packet, func(record contactRecord) {
-		c.handleContactRecord(record, shredVersion)
+		if c.handleContactRecord(record, shredVersion) {
+			if session := c.peerDataset.Load(); session != nil && session.conn == conn {
+				session.dataset.observeAccepted(record, time.Now())
+			}
+		}
 	}, output)
 	if output != nil {
 		recorder.record(observation)
