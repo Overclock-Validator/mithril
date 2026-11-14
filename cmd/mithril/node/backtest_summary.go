@@ -21,6 +21,22 @@ type timingRow struct {
 	TxLoop       int64
 	SinceLastRow int64
 	Completed    int64 // wall clock when SlotReplay ended, Unix nanoseconds
+	// StreamOpened is when streaming execution opened this block's bank,
+	// before the block was complete, Unix nanoseconds; zero when the block
+	// was not streamed or its stream was discarded and it ran whole.
+	StreamOpened int64
+}
+
+// began is when replay started work on the block: the streamed bank's opening
+// when there was one, otherwise SlotReplay's start. It is the counterpart of
+// Firedancer's preparation_begin_nanos, taken when replay creates the slot's
+// bank, before any of its transactions run.
+func (r timingRow) began() int64 {
+	start := r.Completed - r.SlotReplay
+	if r.StreamOpened != 0 && r.StreamOpened < start {
+		return r.StreamOpened
+	}
+	return start
 }
 
 func readTimingRows(path string) ([]timingRow, error) {
@@ -31,6 +47,10 @@ func readTimingRows(path string) ([]timingRow, error) {
 	defer f.Close()
 	type timing struct {
 		SumNanoseconds int64
+	}
+	type streaming struct {
+		OpenedNanos int64
+		Discarded   uint64
 	}
 	var rows []timingRow
 	sc := bufio.NewScanner(f)
@@ -44,6 +64,7 @@ func readTimingRows(path string) ([]timingRow, error) {
 			TxLoop               timing
 			SinceLastRow         timing
 			CompletedUnixNano    int64
+			StreamingExecution   streaming
 		}
 		if len(sc.Bytes()) == 0 {
 			continue
@@ -53,9 +74,19 @@ func readTimingRows(path string) ([]timingRow, error) {
 		}
 		rows = append(rows, timingRow{Slot: r.Slot, CU: r.ComputeUnitsConsumed, Transactions: r.Transactions,
 			SlotReplay: r.SlotReplay.SumNanoseconds, TxLoop: r.TxLoop.SumNanoseconds, SinceLastRow: r.SinceLastRow.SumNanoseconds,
-			Completed: r.CompletedUnixNano})
+			Completed: r.CompletedUnixNano, StreamOpened: streamOpened(r.StreamingExecution.OpenedNanos, r.StreamingExecution.Discarded)})
 	}
 	return rows, sc.Err()
+}
+
+// streamOpened keeps a stream's opening only if the stream was accepted. A
+// discarded stream's work was thrown away and the block executed whole inside
+// SlotReplay, as BlockReplay.ReplayWork also counts it.
+func streamOpened(openedNanos int64, discarded uint64) int64 {
+	if discarded != 0 {
+		return 0
+	}
+	return openedNanos
 }
 
 // intervalStats summarizes one timing interval over the measured blocks.
@@ -118,7 +149,7 @@ func firedancerFields(rows []timingRow, startSlot uint64, clock backtestClock) f
 	first, last := rows[0], rows[len(rows)-1]
 	fd.EndSlot = last.Slot
 	lastDone := time.Unix(0, last.Completed)
-	firstBegin := time.Unix(0, first.Completed-first.SlotReplay)
+	firstBegin := time.Unix(0, first.began())
 	fd.SlotExecS = secondsBetween(firstBegin, lastDone)
 	fd.Complete = first.Completed != 0 && last.Completed != 0 &&
 		!clock.Boot.IsZero() && !clock.ImportDone.IsZero() && !clock.StateReady.IsZero() && !clock.ReplayReady.IsZero()

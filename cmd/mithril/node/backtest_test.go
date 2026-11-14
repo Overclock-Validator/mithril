@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -316,6 +317,19 @@ func TestSummarizeBacktest(t *testing.T) {
 	s.write(&out, [][2]string{{"txpar", "8"}}, 7.0)
 	require.Contains(t, out.String(), "BACKTEST_SUMMARY snapshot_slot=9 end_slot=14 slots=4 txns=100 snap_bytes_s=3.000 replay_init_s=1.000 load_total_s=4.000 replay_s=0.250 slot_exec_s=0.200 sec_per_slot=0.062500 tps=400.0 total_s=6.250")
 	require.Contains(t, out.String(), "MITHRIL_EXTRA import_s=2.000 shutdown_s=0.750")
+
+	// A streamed first block starts where its bank opened, as Firedancer's
+	// slot starts at preparation, not where SlotReplay took the full block.
+	streamed := slices.Clone(rows)
+	streamed[0].StreamOpened = at(20 * time.Millisecond)
+	require.InDelta(t, 0.230, summarizeBacktest(streamed, 1, 0, 9, clock).FD.SlotExecS, 1e-9)
+	// An opening after SlotReplay's start (impossible, but never trusted) does not move it.
+	streamed[0].StreamOpened = at(120 * time.Millisecond)
+	require.InDelta(t, 0.200, summarizeBacktest(streamed, 1, 0, 9, clock).FD.SlotExecS, 1e-9)
+	// Only the first block's start matters: the span covers every later block.
+	streamed[0].StreamOpened = 0
+	streamed[1].StreamOpened = at(10 * time.Millisecond)
+	require.InDelta(t, 0.200, summarizeBacktest(streamed, 1, 0, 9, clock).FD.SlotExecS, 1e-9)
 }
 
 func TestSummarizeBacktestWithoutTimestamps(t *testing.T) {
@@ -336,6 +350,16 @@ func TestReadTimingRows(t *testing.T) {
 	require.NoError(t, err)
 	want := timingRow{Slot: 5, CU: 7, Transactions: 3, SlotReplay: 11, TxLoop: 9, SinceLastRow: 13, Completed: 17}
 	require.Equal(t, []timingRow{want, want}, rows)
+
+	streamedLine := `{"Slot":6,"SlotReplay":{"SumNanoseconds":11},"CompletedUnixNano":40,"StreamingExecution":{"OpenedNanos":21,"Discarded":0}}`
+	discardedLine := `{"Slot":7,"SlotReplay":{"SumNanoseconds":11},"CompletedUnixNano":60,"StreamingExecution":{"OpenedNanos":41,"Discarded":1}}`
+	require.NoError(t, os.WriteFile(path, []byte(streamedLine+"\n"+discardedLine+"\n"), 0o644))
+	rows, err = readTimingRows(path)
+	require.NoError(t, err)
+	require.Equal(t, int64(21), rows[0].StreamOpened)
+	require.Equal(t, int64(21), rows[0].began(), "the accepted stream opened before SlotReplay's start at 29")
+	require.Zero(t, rows[1].StreamOpened, "a discarded stream's work was thrown away")
+	require.Equal(t, int64(49), rows[1].began())
 }
 
 func TestBacktestConfigStaysInsideTheWorkdir(t *testing.T) {

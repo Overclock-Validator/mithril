@@ -174,7 +174,7 @@ start.
 | `replay_init_s` | snapshot loaded to the start slot complete | AccountsDB ready to the replay loop about to fetch its first block |
 | `load_total_s` | boot to the start slot complete | node start to the replay loop about to fetch its first block |
 | `replay_s` | start slot complete to finish | replay loop ready to the last block's completion; includes reading and assembling blocks from the shred spool, as Firedancer's includes reading the capture |
-| `slot_exec_s` | first replayed slot's preparation start to the last slot's completion | first block's SlotReplay start to the last block's completion |
+| `slot_exec_s` | first replayed slot's preparation start to the last slot's completion | first block's start to the last block's completion; the start is where streaming execution opened the block's bank, or its SlotReplay start if it was not streamed or its stream was discarded |
 | `sec_per_slot` | `replay_s / slots` | `replay_s / slots` |
 | `tps` | `txns / replay_s`, one decimal | `txns / replay_s`, one decimal |
 | `total_s` | boot to finish | process start to the last block's completion |
@@ -193,9 +193,12 @@ the last slot).
 
 Not identical, and why:
 
-- **Per-slot start.** Firedancer's slot begins at preparation; Mithril's
-  SlotReplay begins once the block is assembled. `slot_exec_s` inherits this
-  for its first block only.
+- **Per-slot start.** Firedancer's slot begins at preparation, when replay
+  creates its bank. Mithril's SlotReplay begins once the block is assembled,
+  so a streamed block's earlier work falls outside it (`ReplayWork` adds it
+  back). `slot_exec_s` starts the first block where its streamed bank opened,
+  the counterpart of Firedancer's preparation start, so only per-block
+  SlotReplay figures keep the later start.
 - **Signature verification.** Both verify transaction signatures inside
   `replay_s` and `slot_exec_s`, but at different points (see below).
 - **Footer certificates and rooting.** Both verify footer certificates and
