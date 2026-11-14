@@ -40,7 +40,8 @@ you made or have reason to trust.
 
 Not yet verified: a capture exported by Mithril has not been run through
 `firedancer-dev` itself. The layout follows Firedancer's `shredcap.md`,
-`fd_backtest_tile.c` and `blockstore2shredcap.c`.
+`fd_backtest_tile.c` and `contrib/blockstore/blockstore2shredcap.c` (last
+checked at firedancer main `a99731d6f28d`).
 
 ## Offline replay
 

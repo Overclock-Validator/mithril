@@ -3,7 +3,12 @@
 // zstd-compressed, whose network interfaces carry one shred per IPv4/UDP
 // packet and whose "shredcap0" interface carries bank hash and root slot
 // records. The format is specified in Firedancer's
-// src/discof/backtest/shredcap.md and fd_shredcap.h.
+// src/discof/backtest/shredcap.md and fd_shredcap.h (whose header now says
+// v0.2, with the v0.1 record layouts unchanged). Firedancer's reader picks out
+// the metadata interface by its USER0 link type; this one also accepts the
+// "shredcap0" name. Firedancer also reads classic pcap files, which cannot
+// carry bank hashes, so a backtest of one stops at its first slot; this
+// reader takes pcapng only.
 package shredcap
 
 import (

@@ -218,7 +218,7 @@ func (s backtestSummary) writeFiredancer(w io.Writer, totalSeconds float64) {
 	}
 	// Firedancer's field names and spans (fd_backtest_tile.c); every replayed
 	// block counts, as in Firedancer.
-	fmt.Fprintf(w, "BACKTEST_SUMMARY snapshot_slot=%d end_slot=%d slots=%d txns=%d snap_bytes_s=%.3f replay_init_s=%.3f load_total_s=%.3f replay_s=%.3f slot_exec_s=%.3f sec_per_slot=%.6f tps=%.0f total_s=%.3f\n",
+	fmt.Fprintf(w, "BACKTEST_SUMMARY snapshot_slot=%d end_slot=%d slots=%d txns=%d snap_bytes_s=%.3f replay_init_s=%.3f load_total_s=%.3f replay_s=%.3f slot_exec_s=%.3f sec_per_slot=%.6f tps=%.1f total_s=%.3f\n",
 		fd.SnapshotSlot, fd.EndSlot, fd.Slots, fd.Txns, fd.SnapBytesS, fd.ReplayInitS, fd.LoadTotalS, fd.ReplayS, fd.SlotExecS, fd.SecPerSlot, fd.TPS, fd.TotalS)
 	// Mithril only: Firedancer has no import step (it reads the capture while
 	// replaying), so total_s = import_s + load_total_s + replay_s.

@@ -314,7 +314,7 @@ func TestSummarizeBacktest(t *testing.T) {
 
 	var out bytes.Buffer
 	s.write(&out, [][2]string{{"txpar", "8"}}, 7.0)
-	require.Contains(t, out.String(), "BACKTEST_SUMMARY snapshot_slot=9 end_slot=14 slots=4 txns=100 snap_bytes_s=3.000 replay_init_s=1.000 load_total_s=4.000 replay_s=0.250 slot_exec_s=0.200 sec_per_slot=0.062500 tps=400 total_s=6.250")
+	require.Contains(t, out.String(), "BACKTEST_SUMMARY snapshot_slot=9 end_slot=14 slots=4 txns=100 snap_bytes_s=3.000 replay_init_s=1.000 load_total_s=4.000 replay_s=0.250 slot_exec_s=0.200 sec_per_slot=0.062500 tps=400.0 total_s=6.250")
 	require.Contains(t, out.String(), "MITHRIL_EXTRA import_s=2.000 shutdown_s=0.750")
 }
 

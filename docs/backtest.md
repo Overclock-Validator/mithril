@@ -143,17 +143,26 @@ does not measure host CPU work.
 ### The BACKTEST_SUMMARY line
 
 `BACKTEST_SUMMARY` is the line Firedancer's backtest prints at the end
-(`finish()` in `src/discof/backtest/fd_backtest_tile.c`, read at firedancer
-main `b419dc363121`). Mithril prints the same fields under the same names, each
-measured over the same span, so the two lines can be compared field by field.
-Like Firedancer's, it covers every replayed block: no warm-up is excluded, and
-the start (snapshot or checkpoint) slot is not counted. Firedancer also prints
-a "Backtest playback done" line whose `replay_time` starts at snapshot
-completion; that line is not mirrored.
+(`finish()` in `src/discof/backtest/fd_backtest_tile.c`, last checked at
+firedancer main `a99731d6f28d`). Mithril prints the same fields under the same
+names and formats, each measured over the same span, so the two lines can be
+compared field by field. Like Firedancer's, it covers every replayed block: no
+warm-up is excluded, and the start (snapshot or checkpoint) slot is not
+counted.
 
-All times are wall clock. Firedancer's boot is its `boot_timestamp_nanos`, set
-at topology configuration (the exact moment was not traced); Mithril's is
-process start.
+Firedancer prints two other things that are not mirrored. Its "Backtest
+playback done" line has an `elapsed` that starts at snapshot completion, so
+its `sec/slot` includes `replay_init_s` and differs from `sec_per_slot`. Its
+per-slot "Bank hash matches!" line splits each slot into switch (previous
+slot's completion to this one's preparation), begin (preparation to the first
+transaction scheduled), exec (first scheduled to last finished) and finish
+(last finished to completion). Mithril's per-block intervals are in
+`replay_timings.jsonl` instead and are not divided the same way.
+
+All times are wall clock. Firedancer's boot is its `boot_timestamp_nanos`,
+taken when the command loads its configuration (`fd_config.c`), so in effect
+process start, before its host configuration stages run; Mithril's is process
+start.
 
 | Field | Firedancer's span | Mithril's span |
 |---|---|---|
@@ -167,7 +176,7 @@ process start.
 | `replay_s` | start slot complete to finish | replay loop ready to the last block's completion; includes reading and assembling blocks from the shred spool, as Firedancer's includes reading the capture |
 | `slot_exec_s` | first replayed slot's preparation start to the last slot's completion | first block's SlotReplay start to the last block's completion |
 | `sec_per_slot` | `replay_s / slots` | `replay_s / slots` |
-| `tps` | `txns / replay_s` | `txns / replay_s` |
+| `tps` | `txns / replay_s`, one decimal | `txns / replay_s`, one decimal |
 | `total_s` | boot to finish | process start to the last block's completion |
 
 `MITHRIL_EXTRA` has what Firedancer has no field for. `import_s` runs from
@@ -221,7 +230,7 @@ Mithril, from its source:
   `IxLoop`, `CalcAndDeductFees`, `ExecIxNativeProgram*`); pass
   `--phase-timers` when you want that detail.
 
-Firedancer, read from its source (main at `b419dc363121`) and not measured:
+Firedancer, read from its source (main at `a99731d6f28d`) and not measured:
 
 - Per-slot timings run from slot preparation to slot completion.
 - Transaction signatures are verified as scheduler tasks
@@ -247,6 +256,10 @@ Firedancer, read from its source (main at `b419dc363121`) and not measured:
   supported.
 - **Start state.** Firedancer loads the snapshot on every run. Mithril builds
   its AccountsDB once and rewinds it on later runs.
+- **Read-ahead.** Firedancer's backtest tile reads the capture at most 30
+  slots ahead of the last completed slot. Mithril imports the capture before
+  the timed run, then loads shreds from its spool into block assembly up to
+  256 slots ahead of the slot being replayed.
 - **Shred signatures.** Neither backtest checks them by default: Firedancer
   feeds capture shreds straight to replay without its shred verification stage
   (read from source), and Mithril trusts its shred spool the way it trusts
