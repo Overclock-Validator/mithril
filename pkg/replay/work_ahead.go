@@ -901,6 +901,15 @@ func workAheadExecute(input LoadAndExecuteTransactionInput) (out LoadAndExecuteT
 // workAheadLoadAndExecute is LoadAndExecuteTransaction; tests replace it.
 var workAheadLoadAndExecute = LoadAndExecuteTransaction
 
+// workAheadHeadStart is how long a result that ended at ended had been ready
+// at its turn: zero if it ended at or after the turn.
+func workAheadHeadStart(turn, ended time.Time) time.Duration {
+	if turn.IsZero() || ended.IsZero() || !turn.After(ended) {
+		return 0
+	}
+	return turn.Sub(ended)
+}
+
 // claim is called by the worker about to process idx in its normal turn, when
 // every prerequisite has committed. It returns a finished execution whose read
 // set is unchanged, or nil, and a release to call once processing is done.
@@ -915,6 +924,7 @@ func (w *workAhead) claim(idx int) (*LoadAndExecuteTransactionOutput, func()) {
 	}
 	e := w.entries[idx].Load()
 	var waitedAt time.Time // the turn, if it waited on a valid running execution
+	var turnAt time.Time   // the turn, for the unchanged head-start counter
 	e.mu.Lock()
 	switch e.state {
 	case workAheadIdle:
@@ -930,6 +940,9 @@ func (w *workAhead) claim(idx int) (*LoadAndExecuteTransactionOutput, func()) {
 		e.mu.Unlock()
 		return nil, func() {}
 	case workAheadFinished:
+		if e.viaUnchanged {
+			turnAt = time.Now()
+		}
 	case workAheadRunning:
 		// Every prerequisite has committed, so a changed read set now is final:
 		// abandon the execution rather than wait for a result that cannot be used.
@@ -1047,8 +1060,13 @@ func (w *workAhead) claim(idx int) (*LoadAndExecuteTransactionOutput, func()) {
 	if e.viaUnchanged {
 		w.stats.unchangedAdopted.Add(1)
 		w.stats.unchangedAdoptedKCU.Add(e.usedKCU)
-		// how long the result had been ready when its turn came
-		w.stats.unchangedHeadStartNs.Add(int64(time.Since(e.ended)))
+		// How long the result had been ready when its turn came, taken at
+		// the turn and not after the wait or the read-set check: nothing for
+		// a result its turn had to wait for.
+		if !waitedAt.IsZero() {
+			turnAt = waitedAt
+		}
+		w.stats.unchangedHeadStartNs.Add(int64(workAheadHeadStart(turnAt, e.ended)))
 	}
 	e.mu.Unlock()
 	w.stats.adopted.Add(1)

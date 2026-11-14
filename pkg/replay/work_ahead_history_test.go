@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gagliardetto/solana-go"
 )
@@ -163,6 +164,22 @@ func TestUnchangedRefusalReasonUsesItsSnapshot(t *testing.T) {
 	noteUnchangedRefusal(findUnchanged(k))
 	if no, low, last := unchangedReasons.noHistory.Load(), unchangedReasons.lowRate.Load(), unchangedReasons.lastChanged.Load(); no != 1 || low != 1 || last != 1 {
 		t.Fatalf("no-history %d, low-rate %d, last-changed %d", no, low, last)
+	}
+}
+
+// The head start is taken at the turn: a result that ended after it had none.
+func TestWorkAheadHeadStart(t *testing.T) {
+	turn := time.Now()
+	if got := workAheadHeadStart(turn, turn.Add(-3*time.Millisecond)); got != 3*time.Millisecond {
+		t.Fatalf("ready 3 ms before its turn: %v", got)
+	}
+	for _, ended := range []time.Time{turn, turn.Add(time.Millisecond), {}} {
+		if got := workAheadHeadStart(turn, ended); got != 0 {
+			t.Fatalf("ended %v against turn %v: %v", ended, turn, got)
+		}
+	}
+	if got := workAheadHeadStart(time.Time{}, turn); got != 0 {
+		t.Fatalf("no turn recorded: %v", got)
 	}
 }
 
