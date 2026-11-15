@@ -3474,6 +3474,9 @@ func ReplayBlocks(
 			recordProcessBlockUnstaged(processBlockEnd.Sub(processBlockStart), block.Slot)
 		}
 		if err != nil {
+			// A footer mismatch in a block with early executions switches
+			// work-ahead off and becomes a re-replay request (work_ahead_guard.go).
+			err = workAheadFooterShutoff(err)
 			mlog.Log.Errorf("error encountered during block replay: %s\n", err)
 			result.Error = err
 			// Clear any pending stake pubkeys from this failed block
@@ -4531,6 +4534,23 @@ func parallelTxLoop(
 		metrics.GlobalBlockReplay.DependencyPlannerBuild.AddTiming(plannerBuildDuration)
 		timings := newWorkerTransactionTimings(txParallelism)
 		defer timings.merge()
+		do := make(chan int, len(block.Transactions))
+		done := make(chan int, len(block.Transactions))
+		plannerDone := make(chan struct{})
+		trace := newDepTrace(block)
+		loopStart := time.Now()
+		workAhead := newWorkAhead(slotCtx, block, executionPlan.execute, dbgOpts)
+		var onSend func(int)
+		if trace != nil {
+			onSend = func(tx int) { trace.recordSend(tx, time.Since(loopStart)) }
+		}
+		if workAhead != nil {
+			workAhead.onSend = onSend
+		}
+		var shadow *specShadow
+		if workAhead == nil {
+			shadow = newSpecShadow(slotCtx, block, executionPlan.execute, loopStart)
+		}
 		processTx := func(worker, idx int) {
 			if !executionPlan.execute[idx] {
 				return
@@ -4540,7 +4560,39 @@ func parallelTxLoop(
 			if idx < len(block.TxMetas) {
 				txMeta = block.TxMetas[idx]
 			}
-			txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = processTransactionWithTimings(slotCtx, sigverifyWg, block.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[worker], shouldVerifySignatures, timings.at(worker))
+			var traceStart time.Duration
+			var writableBefore []*accounts.Account
+			if trace != nil {
+				writableBefore = trace.writableBefore(slotCtx, idx)
+				traceStart = time.Since(loopStart)
+			}
+			if shadow != nil {
+				shadow.ready(idx)
+			}
+			executed, release := workAhead.claim(idx)
+			execStart := time.Now()
+			txFeeInfos[idx], txComputeUnitsConsumed[idx], errs[idx] = processTransaction(slotCtx, sigverifyWg, block.Transactions[idx], txMeta, dbgOpts, sealevel.BorrowedAccountArenas[worker], shouldVerifySignatures, executed, timings.at(worker))
+			execElapsed := time.Since(execStart)
+			release()
+			if writableBefore != nil {
+				trace.writableChanged(slotCtx, idx, writableBefore)
+			}
+			workAhead.verify(idx, errs[idx], txComputeUnitsConsumed[idx])
+			if trace != nil {
+				if began, ended, ok := workAhead.executionWindow(idx); ok {
+					trace.recordAhead(idx, began.Sub(loopStart), ended.Sub(loopStart), executed != nil)
+				}
+				if queued := workAhead.queuedTime(idx); !queued.IsZero() {
+					trace.recordQueued(idx, queued.Sub(loopStart))
+				}
+			}
+			workAhead.recordOutcome(idx, errs[idx], execElapsed, executed != nil)
+			if trace != nil {
+				trace.record(idx, traceStart, time.Since(loopStart), errs[idx])
+			}
+			if shadow != nil {
+				shadow.normalDone(idx, errs[idx], txComputeUnitsConsumed[idx])
+			}
 			txErr := errs[idx]
 			// check for success-failure return value divergences
 			if txMeta != nil && txErr == nil && txMeta.Err != nil {
@@ -4554,17 +4606,22 @@ func parallelTxLoop(
 			}
 		}
 
-		if directDispatch {
+		if directDispatch && shadow == nil && schedulingOnFor(slotCtx.Slot) {
 			metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTiming(
-				runDependencyPlan(dependencyPlan, txParallelism, scheduleFor(block.Transactions), processTx))
+				runDependencyPlan(dependencyPlan, txParallelism, workAhead, scheduleFor(block.Transactions, slotCtx.Slot), onSend, processTx))
 		} else {
-			do := make(chan int, len(block.Transactions))
-			done := make(chan int, len(block.Transactions))
-			plannerDone := make(chan struct{})
 			go func() {
 				defer close(plannerDone)
 				plannerDispatchStart := time.Now()
-				dispatchDependencyPlan(dependencyPlan, do, done)
+				if workAhead != nil {
+					workAhead.dispatch(dependencyPlan, do, done)
+				} else if shadow != nil {
+					dispatchDependencyPlanShadow(dependencyPlan, do, done, shadow)
+				} else if onSend != nil {
+					dispatchDependencyPlanWith(dependencyPlan, do, done, dispatchHooks{onSend: onSend})
+				} else {
+					dispatchDependencyPlan(dependencyPlan, do, done)
+				}
 				metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTimingSince(plannerDispatchStart)
 			}()
 
@@ -4573,16 +4630,30 @@ func parallelTxLoop(
 			for i := range txParallelism {
 				go func() {
 					defer wg.Done()
-					for idx := range do {
+					for {
+						idx, ahead, ok := workAhead.next(do)
+						if !ok {
+							break
+						}
+						if ahead {
+							workAhead.run(idx)
+							continue
+						}
 						processTx(i, idx)
 						done <- idx
 					}
 				}()
 			}
-
 			wg.Wait()
 			close(done)
 			<-plannerDone
+		}
+		workAhead.finish(block.Slot)
+		if shadow != nil {
+			shadow.finish(txComputeUnitsConsumed)
+		}
+		if trace != nil {
+			trace.write(block, executionPlan.execute, txComputeUnitsConsumed)
 		}
 	} else if block.FromLiveStream {
 		metrics.GlobalBlockReplay.DependencyPlannerFallback = 1

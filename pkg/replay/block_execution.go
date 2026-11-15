@@ -530,6 +530,10 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 	txErrors := make([]error, len(txs))
 	timings := newWorkerTransactionTimings(workers)
 	defer timings.merge()
+	do := make(chan int, len(txs))
+	done := make(chan int, len(txs))
+	plannerDone := make(chan struct{})
+	workAhead := newWorkAhead(slotCtx, view, execute, dbgOpts)
 	processTx := func(workerIdx, idx int) {
 		if !execute[idx] {
 			return
@@ -538,18 +542,26 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 		if workerIdx < len(sealevel.BorrowedAccountArenas) {
 			workerArena = sealevel.BorrowedAccountArenas[workerIdx]
 		}
-		feeInfos[idx], computeUnits[idx], txErrors[idx] = processTransactionWithTimings(slotCtx, &exec.sigverifyWg, txs[idx], nil, dbgOpts, workerArena, shouldVerifySignatures, timings.at(workerIdx))
+		executed, release := workAhead.claim(idx)
+		execStart := time.Now()
+		feeInfos[idx], computeUnits[idx], txErrors[idx] = processTransaction(slotCtx, &exec.sigverifyWg, txs[idx], nil, dbgOpts, workerArena, shouldVerifySignatures, executed, timings.at(workerIdx))
+		execElapsed := time.Since(execStart)
+		release()
+		workAhead.verify(idx, txErrors[idx], computeUnits[idx])
+		workAhead.recordOutcome(idx, txErrors[idx], execElapsed, executed != nil)
 	}
-	if directDispatch {
-		metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTiming(runDependencyPlan(plan, workers, scheduleFor(txs), processTx))
+	if directDispatch && schedulingOnFor(slotCtx.Slot) {
+		metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTiming(
+			runDependencyPlan(plan, workers, workAhead, scheduleFor(txs, slotCtx.Slot), nil, processTx))
 	} else {
-		do := make(chan int, len(txs))
-		done := make(chan int, len(txs))
-		plannerDone := make(chan struct{})
 		go func() {
 			defer close(plannerDone)
 			plannerDispatchStart := time.Now()
-			dispatchDependencyPlan(plan, do, done)
+			if workAhead != nil {
+				workAhead.dispatch(plan, do, done)
+			} else {
+				dispatchDependencyPlan(plan, do, done)
+			}
 			metrics.GlobalBlockReplay.DependencyPlannerDispatch.AddTimingSince(plannerDispatchStart)
 		}()
 
@@ -558,7 +570,15 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 		for i := 0; i < workers; i++ {
 			go func(workerIdx int) {
 				defer wg.Done()
-				for idx := range do {
+				for {
+					idx, ahead, ok := workAhead.next(do)
+					if !ok {
+						break
+					}
+					if ahead {
+						workAhead.run(idx)
+						continue
+					}
 					processTx(workerIdx, idx)
 					done <- idx
 				}
@@ -568,6 +588,7 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 		close(done)
 		<-plannerDone
 	}
+	workAhead.finish(slotCtx.Slot)
 	for idx := range txs {
 		if execute[idx] && feeInfos[idx] == nil {
 			return nil, nil, unprocessableTransactionError(base+idx, txErrors[idx])
@@ -711,8 +732,21 @@ func (exec *blockExecution) finalizeTail() (*sealevel.SlotCtx, error) {
 		metrics.GlobalBlockReplay.AlpenglowFooterVerification.AddTimingSince(footerVerificationStart)
 		if footerVerificationErr != nil {
 			writeFooterBankhashMismatchArtifact(footerVerificationErr, block, slotCtx, writableAccts, modifiedAccts)
-			return nil, footerVerificationErr
+			// If this is the replay of a slot whose first attempt, with early
+			// executions, failed here too, say whether speculation was the cause.
+			return nil, workAheadReplayVerdict(block, slotCtx.FinalBankhash, footerVerificationErr)
 		}
+	}
+	// The replay of a slot the footer shutoff refused: the verdict compares
+	// the hashes itself, which matters when the clock mode above did not.
+	if err := workAheadReplayVerdict(block, slotCtx.FinalBankhash, nil); err != nil {
+		writeFooterBankhashMismatchArtifact(err, block, slotCtx, writableAccts, modifiedAccts)
+		return nil, err
+	}
+	// Early executions are only ever accepted in a block whose computed bank
+	// hash was just compared with its footer's (work_ahead_guard.go).
+	if err := workAheadRequireFooterHash(block, slotCtx.FinalBankhash); err != nil {
+		return nil, err
 	}
 	if err := verifyCaptureBankHash(block.Slot, slotCtx.FinalBankhash); err != nil {
 		return nil, err

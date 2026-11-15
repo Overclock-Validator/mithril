@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/Overclock-Validator/mithril/pkg/cu"
@@ -22,6 +23,7 @@ import (
 
 // Interpreter implements the SBF core in pure Go.
 type Interpreter struct {
+	cancel         *atomic.Bool
 	textVA         uint64
 	textBytes      []byte
 	text           []Slot
@@ -131,6 +133,7 @@ func NewInterpreter(p *Program, opts *VMOpts) *Interpreter {
 		syscalls:          opts.Syscalls,
 		funcs:             p.Funcs,
 		vmContext:         opts.Context,
+		cancel:            opts.Cancel,
 		trace:             opts.Tracer,
 		computeMeter:      opts.ComputeMeter,
 		prevInstrMeter:    opts.ComputeMeter.Remaining(),
@@ -327,6 +330,8 @@ func (ip *Interpreter) Run() (ret uint64, cuConsumed uint64, err error) {
 	// we may still execute before the meter would be exhausted.
 	meter := ip.computeMeter
 	var budget, due uint64
+	cancel := ip.cancel
+	var nextPoll uint64
 	reloadBudget := func() {
 		if meter.Disabled() {
 			budget = math.MaxUint64
@@ -334,6 +339,7 @@ func (ip *Interpreter) Run() (ret uint64, cuConsumed uint64, err error) {
 			budget = meter.Remaining()
 		}
 		due = 0
+		nextPoll = 0
 		// A syscall (CPI in particular) may have changed the input regions;
 		// drop the cached input-region fast path entry, it is re-populated on
 		// the next slow-path translation. (With a plain, region-less input the
@@ -352,23 +358,39 @@ func (ip *Interpreter) Run() (ret uint64, cuConsumed uint64, err error) {
 
 mainLoop:
 	for i := 0; true; i++ {
+		// Poll only private attempts. runFast stops at this instruction budget,
+		// without turning a poll boundary into CU exhaustion or executing ahead.
+		if cancel != nil && due >= nextPoll {
+			if cancel.Load() {
+				err = ErrCancelled
+				break mainLoop
+			}
+			nextPoll = due + 1024
+		}
 		// Common instructions run in the call-free loop; it returns at the
 		// first instruction that needs the general path below.
 		if !tracing && useFastLoop {
+			limit := budget
+			if cancel != nil {
+				limit = min(limit, nextPoll)
+			}
 			if asmTable != nil {
 				// The assembly loop has runFast's contract: it stops, with pc
 				// and due exact, at the first instruction it leaves to the
 				// general path below. One call covers at most asmChunk
 				// instructions, because assembly cannot be preempted.
-				rem := min(budget-due, asmChunk)
+				rem := min(limit-due, asmChunk)
 				var left uint64
 				pc, left = runAsmLoop(asmText, int64(len(text)), &r, &ip.regions, asmTable, &ip.stack, pc, rem, asmCalls)
 				due += rem - left
-				if left == 0 && due != budget {
-					pc, due = ip.runAsmChunks(&r, pc, due, budget, asmTable)
+				if left == 0 && due != limit {
+					pc, due = ip.runAsmChunks(&r, pc, due, limit, asmTable)
 				}
 			} else {
-				pc, due = ip.runFast(&r, pc, due, budget, fast)
+				pc, due = ip.runFast(&r, pc, due, limit, fast)
+			}
+			if cancel != nil && due >= nextPoll {
+				continue
 			}
 		}
 
