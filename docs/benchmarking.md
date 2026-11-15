@@ -92,7 +92,19 @@ exactly where marked "closure"; nested timers inside them do not add up and
 must not be summed with their parent.
 
 **Size of the work.** `Slot`, `ComputeUnitsConsumed` (exact consumed CU, the
-normalizer), `Transactions`.
+normalizer), `Transactions`. `LongestChainCU` is the most consumed CU on any
+chain of transactions that had to run one after another because of account
+conflicts (both use an account and at least one has it writable), and
+`LongestChainTransactions` is that chain's length. It is the part of the block
+that runs serially however many cores there are, so a block that is slow for
+its size often has a long chain. `mithril timings span` and `tip` print it
+beside consumed CU. The chain uses the writability Mithril schedules with (the
+message header and address-table lookups), without Agave's demotion of
+reserved keys and program ids. It is measured on its own goroutine beside the
+block's tail (fees, rent, bank hash, commit): `LongestChainMeasurement` is how
+long that pass took, overlapping SlotReplay rather than adding to it, and
+`LongestChainWait` is how long the loop then waited for it before writing the
+row (normally nothing; part of `LoopAfterReplay` when it is not).
 
 **The block (closure).** `SlotReplay = PreprocessBlock + ProcessBlock +
 PostProcessBlock`. Nested inside: `LoadBlockAccounts` (with its breakdown in

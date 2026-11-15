@@ -2867,6 +2867,10 @@ func ReplayBlocks(
 	}
 	lastRowAt := time.Now()
 	ReplayReadyAt.CompareAndSwap(0, lastRowAt.UnixNano())
+	// A bank that finalizes but never reaches its timing row (an error after
+	// ProcessBlock) leaves its longest-chain measurement running; join it on
+	// the way out.
+	defer blockLongestChain.drain()
 	for {
 		// The collector is per replay attempt. Discarded candidates, skipped
 		// slots, and typed-recovery exits must never leak timings into the next
@@ -3966,6 +3970,10 @@ func ReplayBlocks(
 		}
 		{
 			metrics.GlobalBlockReplay.Slot = block.Slot
+			// Collect the block's longest chain, measured beside its tail since
+			// the bank finalized. It is joined as late as the row allows and
+			// before rowAt, so any wait is inside this row's LoopAfterReplay.
+			blockLongestChain.record(lastSlotCtx)
 			rowAt := time.Now()
 			tipIn := newTipPathInput(block, ingressTimings, parentMark, admittedAt, start, handedOffAt)
 			tipIn.newestShredSlot = newestShredSlotAtHandoff
@@ -4366,7 +4374,10 @@ func validatePreConsensusTransactionStatuses(
 	return statuses.validateBlockWithPlan(&candidate, plan)
 }
 
-func sequentialTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, block *b.Block, executionPlan blockTransactionExecutionPlan, dbgOpts *DebugOptions, shouldVerifySignatures bool) (fees.TxFeeInfoAccumulator, uint64, error) {
+// sequentialTxLoop executes the block one transaction at a time. It records
+// what each transaction consumed in txComputeUnitsConsumed, which has one
+// element per block transaction.
+func sequentialTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, block *b.Block, executionPlan blockTransactionExecutionPlan, txComputeUnitsConsumed []uint64, dbgOpts *DebugOptions, shouldVerifySignatures bool) (fees.TxFeeInfoAccumulator, uint64, error) {
 	var txFeeAccumulator fees.TxFeeInfoAccumulator
 	var totalComputeUnitsConsumed uint64
 	// process & execute each transaction in turn
@@ -4378,8 +4389,9 @@ func sequentialTxLoop(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, bl
 		if block.TxMetas != nil {
 			txMeta = block.TxMetas[idx]
 		}
-		txFeeInfo, txComputeUnitsConsumed, txErr := ProcessTransaction(slotCtx, sigverifyWg, tx, txMeta, dbgOpts, nil, shouldVerifySignatures)
-		totalComputeUnitsConsumed += txComputeUnitsConsumed
+		txFeeInfo, computeUnitsConsumed, txErr := ProcessTransaction(slotCtx, sigverifyWg, tx, txMeta, dbgOpts, nil, shouldVerifySignatures)
+		txComputeUnitsConsumed[idx] = computeUnitsConsumed
+		totalComputeUnitsConsumed += computeUnitsConsumed
 
 		if txMeta == nil {
 			if txFeeInfo == nil {
@@ -4493,19 +4505,22 @@ func lightbringerEntryExecutionBatches(transactions []*solana.Transaction, entry
 	return batches
 }
 
+// parallelTxLoop executes the block on txParallelism workers in dependency
+// order. It records what each transaction consumed in txComputeUnitsConsumed,
+// which has one element per block transaction.
 func parallelTxLoop(
 	slotCtx *sealevel.SlotCtx,
 	sigverifyWg *sync.WaitGroup,
 	planner *preparedDependencyPlanner,
 	block *b.Block,
 	executionPlan blockTransactionExecutionPlan,
+	txComputeUnitsConsumed []uint64,
 	txParallelism int,
 	dbgOpts *DebugOptions,
 	shouldVerifySignatures bool,
 ) (fees.TxFeeInfoAccumulator, uint64, error) {
 	var txFeeAccumulator fees.TxFeeInfoAccumulator
 	txFeeInfos := make([]*fees.TxFeeInfo, len(block.Transactions))
-	txComputeUnitsConsumed := make([]uint64, len(block.Transactions))
 	errs := make([]error, len(block.Transactions))
 
 	plannerWaitStart := time.Now()
@@ -4779,11 +4794,12 @@ func ProcessBlock(
 	exec.setReplayStage("tx_loop")
 	txLoopRegion := trace.StartRegion(exec.ctx, "TxLoop")
 	shouldVerifySignatures := !block.TransactionSignaturesVerified()
+	txComputeUnitsConsumed := make([]uint64, len(block.Transactions))
 	var txLoopErr error
 	if txParallelism > 0 {
-		txFeeAccumulator, totalComputeUnitsConsumed, txLoopErr = parallelTxLoop(slotCtx, &exec.sigverifyWg, planner, block, executionPlan, txParallelism, dbgOpts, shouldVerifySignatures)
+		txFeeAccumulator, totalComputeUnitsConsumed, txLoopErr = parallelTxLoop(slotCtx, &exec.sigverifyWg, planner, block, executionPlan, txComputeUnitsConsumed, txParallelism, dbgOpts, shouldVerifySignatures)
 	} else {
-		txFeeAccumulator, totalComputeUnitsConsumed, txLoopErr = sequentialTxLoop(slotCtx, &exec.sigverifyWg, block, executionPlan, dbgOpts, shouldVerifySignatures)
+		txFeeAccumulator, totalComputeUnitsConsumed, txLoopErr = sequentialTxLoop(slotCtx, &exec.sigverifyWg, block, executionPlan, txComputeUnitsConsumed, dbgOpts, shouldVerifySignatures)
 	}
 	txLoopRegion.End()
 	metrics.GlobalBlockReplay.TxLoop.AddTimingSince(start)
@@ -4795,6 +4811,7 @@ func ProcessBlock(
 
 	exec.txFeeAccumulator = txFeeAccumulator
 	exec.totalCU = totalComputeUnitsConsumed
+	exec.computeUnits = txComputeUnitsConsumed
 	exec.executionPlan = executionPlan
 	exec.statusPreparation = statusPreparation
 	exec.statusValidation = statusValidation

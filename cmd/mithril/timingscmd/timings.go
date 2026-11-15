@@ -52,13 +52,15 @@ func (t timing) ms() float64 { return float64(t.SumNanoseconds) / 1e6 }
 
 // row is the part of a replay_timings.jsonl row the tip report reads.
 type row struct {
-	Slot                 uint64
-	ComputeUnitsConsumed uint64
-	ReplayWork           timing
-	SlotReplay           timing
-	TxLoop               timing
-	FullToReplayed       timing
-	TipPath              struct {
+	Slot                     uint64
+	ComputeUnitsConsumed     uint64
+	LongestChainCU           uint64
+	LongestChainTransactions uint32
+	ReplayWork               timing
+	SlotReplay               timing
+	TxLoop                   timing
+	FullToReplayed           timing
+	TipPath                  struct {
 		ShredReceivedNanos  int64
 		ReceiveToFull       timing
 		FullToReady         timing
@@ -267,9 +269,11 @@ func writeTipReport(w io.Writer, rows []row, total, top int) {
 		return
 	}
 	var cu, fullToReplayedNs, replayWorkNs uint64
+	var chain chainTotals
 	withReceive := 0
 	for i := range rows {
 		cu += rows[i].ComputeUnitsConsumed
+		chain.add(rows[i].ComputeUnitsConsumed, rows[i].LongestChainCU, rows[i].LongestChainTransactions)
 		fullToReplayedNs += rows[i].FullToReplayed.SumNanoseconds
 		replayWorkNs += rows[i].ReplayWork.SumNanoseconds
 		if rows[i].TipPath.ShredReceivedNanos != 0 {
@@ -280,6 +284,7 @@ func writeTipReport(w io.Writer, rows []row, total, top int) {
 	fmt.Fprintf(w, "Tip replay: %d blocks with shred timing of %d rows, slots %d..%d\n", len(rows), total, rows[0].Slot, rows[len(rows)-1].Slot)
 	fmt.Fprintf(w, "  avg consumed CU/block %.2f M; ReplayWork mean %.2f ms (%.3f CU/ns); kernel receive time known for %d blocks\n",
 		float64(cu)/n/1e6, float64(replayWorkNs)/n/1e6, ratio(cu, replayWorkNs), withReceive)
+	chain.writeSummary(w, len(rows))
 	fmt.Fprintf(w, "  per block, ms; share is of total FullToReplayed (ReceiveToFull lies before it)\n")
 	fmt.Fprintf(w, "  %-20s %-8s %7s %8s %8s %8s %8s %8s\n", "interval", "owner", "share", "mean", "p50", "p90", "p99", "max")
 	values := make([]float64, len(rows))
@@ -418,10 +423,13 @@ func writeTipReport(w io.Writer, rows []row, total, top int) {
 	}
 	sort.SliceStable(order, func(a, b int) bool { return controlledMs(&rows[order[a]]) > controlledMs(&rows[order[b]]) })
 	fmt.Fprintf(w, "  slowest %d blocks by controlled time:\n", min(top, len(rows)))
-	fmt.Fprintf(w, "  %-12s %8s %10s %10s %10s %8s  %s\n", "slot", "M CU", "controlled", "full->done", "ReplayWork", "CU/ns", "largest intervals; context")
+	// chain M is the block's longest dependency chain, in millions of CU.
+	fmt.Fprintf(w, "  %-12s %8s %8s %10s %10s %10s %8s  %s\n", "slot", "M CU", "chain M", "controlled", "full->done", "ReplayWork", "CU/ns", "largest intervals; context")
 	for _, i := range order[:min(top, len(rows))] {
 		r := &rows[i]
-		fmt.Fprintf(w, "  %-12d %8.2f %10.2f %10.2f %10.2f %8.3f  %s%s\n", r.Slot, float64(r.ComputeUnitsConsumed)/1e6,
+		var blockChain chainTotals
+		blockChain.add(r.ComputeUnitsConsumed, r.LongestChainCU, r.LongestChainTransactions)
+		fmt.Fprintf(w, "  %-12d %8.2f %8s %10.2f %10.2f %10.2f %8.3f  %s%s\n", r.Slot, float64(r.ComputeUnitsConsumed)/1e6, blockChain.avgM(),
 			controlledMs(r), r.FullToReplayed.ms(), r.ReplayWork.ms(), ratio(r.ComputeUnitsConsumed, r.ReplayWork.SumNanoseconds), largest(r, 3), context(r))
 	}
 }

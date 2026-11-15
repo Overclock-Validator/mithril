@@ -18,7 +18,9 @@ func TestTipReport(t *testing.T) {
 		if gcPause > 0 {
 			gc = `,"GCCycles":1,"GCPauseMax":{"Count":1,"SumNanoseconds":` + itoa(gcPause) + `}`
 		}
+		// Each block's longest chain is a quarter of its consumed CU.
 		return `{"Slot":` + itoa(slot) + `,"ComputeUnitsConsumed":` + itoa(cu) +
+			`,"LongestChainCU":` + itoa(cu/4) + `,"LongestChainTransactions":8` +
 			`,"ReplayWork":{"Count":1,"SumNanoseconds":` + itoa(work) + `}` +
 			`,"FullToReplayed":{"Count":1,"SumNanoseconds":` + itoa(full) + `}` +
 			`,"TipPath":{"ShredReceivedNanos":` + itoa(uint64(received)) +
@@ -49,12 +51,16 @@ func TestTipReport(t *testing.T) {
 	text := out.String()
 	require.Contains(t, text, "Tip replay: 2 blocks with shred timing of 4 rows, slots 10..11")
 	require.Contains(t, text, "avg consumed CU/block 15.00 M")
+	require.Contains(t, text, "avg longest chain CU/block 3.75 M (25.0% of consumed CU), 8.0 transactions; recorded for 2 of 2 blocks")
 	require.Contains(t, text, "4 kernel shred drops")
 	require.Contains(t, text, "a GC pause in 1 of 2 row windows")
 	// WaitParentArrival is 12 of 92 ms of FullToReplayed.
 	require.Regexp(t, `WaitParentArrival\s+network\s+13\.0%`, text)
 	slowest := text[strings.Index(text, "slowest"):]
 	require.Less(t, strings.Index(slowest, "\n  11 "), strings.Index(slowest, "\n  10 "), "slot 11 is slower")
+	// M CU, then the block's longest chain in M CU.
+	require.Regexp(t, `\n  11\s+20\.00\s+5\.00\s`, slowest)
+	require.Regexp(t, `\n  10\s+10\.00\s+2\.50\s`, slowest)
 	require.Contains(t, slowest, "ReplayToHandoff 40.00, WaitParentArrival 12.00, WaitParentReplay 10.00")
 }
 

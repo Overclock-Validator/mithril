@@ -509,6 +509,34 @@ type BlockReplay struct {
 	ComputeUnitsConsumed uint64
 	Transactions         uint64 // transactions in the block, votes included
 	Slot                 uint64
+	// LongestChainCU is the largest total consumed CU along any chain of
+	// transactions that had to run one after another, in block order, because
+	// of account conflicts (both use an account and at least one has it
+	// writable; reads of the same account do not conflict). A failed
+	// transaction counts what it consumed. LongestChainTransactions is the
+	// number of transactions on that chain. It is the least CU that executes
+	// serially however many workers there are, so ComputeUnitsConsumed divided
+	// by LongestChainCU bounds the parallel speedup the block allows, and a
+	// block that replays slowly for its size often has a long chain. Both are
+	// zero when replay did not execute the block's transactions itself (a block
+	// adopted from local production).
+	//
+	// The chain follows the writability Mithril schedules with: the message
+	// header and the address-table lookups, as the dependency planner reads
+	// them. It does not apply Agave's demotion of writable reserved keys and
+	// program ids to read-only, so a block where that demotion matters shows a
+	// longer chain here than Agave's lock rules would give.
+	//
+	// The measurement runs on its own goroutine beside the block's tail (fees,
+	// rent, bank hash, commit). LongestChainMeasurement is how long that pass
+	// took; it overlaps SlotReplay and is not part of any interval of the
+	// replay loop. LongestChainWait is how long the loop waited for the pass
+	// when it wrote this row: normally nothing, and part of LoopAfterReplay
+	// when it is not.
+	LongestChainCU           uint64
+	LongestChainTransactions uint32
+	LongestChainMeasurement  Timing
+	LongestChainWait         Timing
 	// CompletedUnixNano is when the block's SlotReplay ended (wall clock), so
 	// a run's first block start and last block end are exact.
 	CompletedUnixNano int64

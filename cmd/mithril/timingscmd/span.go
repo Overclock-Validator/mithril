@@ -38,12 +38,54 @@ func init() {
 
 // spanRow is the part of a timing row the span report reads.
 type spanRow struct {
-	Slot                 uint64
-	ComputeUnitsConsumed uint64
-	CompletedUnixNano    int64
-	SlotReplay           timing
-	ReplayWork           timing
-	LoopSourceWait       timing
+	Slot                     uint64
+	ComputeUnitsConsumed     uint64
+	LongestChainCU           uint64
+	LongestChainTransactions uint32
+	CompletedUnixNano        int64
+	SlotReplay               timing
+	ReplayWork               timing
+	LoopSourceWait           timing
+}
+
+// chainTotals sums the longest dependency chain over the blocks that recorded
+// one. Rows written before the field existed, and blocks replay did not
+// execute itself, have none (LongestChainTransactions is zero) and are left
+// out rather than counted as zero.
+type chainTotals struct {
+	blocks       int
+	chainCU      uint64
+	transactions uint64
+	consumedCU   uint64 // of the same blocks
+}
+
+func (c *chainTotals) add(consumedCU, chainCU uint64, transactions uint32) {
+	if transactions == 0 {
+		return
+	}
+	c.blocks++
+	c.chainCU += chainCU
+	c.transactions += uint64(transactions)
+	c.consumedCU += consumedCU
+}
+
+// avgM is the average chain in millions of CU, "-" when no block recorded one.
+func (c chainTotals) avgM() string {
+	if c.blocks == 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%.2f", float64(c.chainCU)/float64(c.blocks)/1e6)
+}
+
+// writeSummary prints the chain line that goes under the consumed CU line,
+// and nothing when no block recorded a chain. The share is total chain CU over
+// the total consumed CU of the same blocks.
+func (c chainTotals) writeSummary(w io.Writer, of int) {
+	if c.blocks == 0 {
+		return
+	}
+	fmt.Fprintf(w, "  avg longest chain CU/block %s M (%.1f%% of consumed CU), %.1f transactions; recorded for %d of %d blocks\n",
+		c.avgM(), 100*float64(c.chainCU)/float64(max(c.consumedCU, 1)), float64(c.transactions)/float64(c.blocks), c.blocks, of)
 }
 
 func readSpanRows(path string) ([]spanRow, error) {
@@ -120,17 +162,17 @@ func writeSpanReport(w io.Writer, rows []spanRow, from, to uint64, warmup int) e
 	measured := rows[first:end]
 	open := rows[first-1]
 	intervals := make([]float64, 0, len(measured))
-	blockCU := make([]uint64, 0, len(measured))
 	prev := open.CompletedUnixNano
 	var cu, replayWorkNs, sourceWaitNs uint64
+	var chain chainTotals
 	for _, r := range measured {
 		if r.CompletedUnixNano == 0 || prev == 0 || r.CompletedUnixNano < prev {
 			return fmt.Errorf("slot %d has no usable completion time; rows written before CompletedUnixNano existed cannot be measured", r.Slot)
 		}
 		intervals = append(intervals, float64(r.CompletedUnixNano-prev)/1e6)
-		blockCU = append(blockCU, r.ComputeUnitsConsumed)
 		prev = r.CompletedUnixNano
 		cu += r.ComputeUnitsConsumed
+		chain.add(r.ComputeUnitsConsumed, r.LongestChainCU, r.LongestChainTransactions)
 		replayWorkNs += r.ReplayWork.SumNanoseconds
 		sourceWaitNs += r.LoopSourceWait.SumNanoseconds
 	}
@@ -143,12 +185,13 @@ func writeSpanReport(w io.Writer, rows []spanRow, from, to uint64, warmup int) e
 		n, seconds, float64(n)/seconds, seconds*1e3/float64(n), slots, float64(slots)/seconds)
 	fmt.Fprintf(w, "  avg consumed CU/block %.2f M; CU/ns over the span %.3f, over ReplayWork %.3f\n",
 		float64(cu)/float64(n)/1e6, ratio(cu, uint64(spanNs)), ratio(cu, replayWorkNs))
+	chain.writeSummary(w, n)
 	fmt.Fprintf(w, "  waiting for the next block (LoopSourceWait): %.1f%% of the span\n", 100*float64(sourceWaitNs)/float64(spanNs))
 	p50, p90, p99, mx := quantiles(intervals)
 	fmt.Fprintf(w, "  %-14s %8s %8s %8s %8s %8s\n", "interval", "mean ms", "p50", "p90", "p99", "max")
 	fmt.Fprintf(w, "  %-14s %8.3f %8.3f %8.3f %8.3f %8.3f\n", "BlockInterval", seconds*1e3/float64(n), p50, p90, p99, mx)
 	fmt.Fprintf(w, "  BlockInterval is completion to completion; the intervals add up to the span.\n")
-	writeSizeBuckets(w, intervals, blockCU)
+	writeSizeBuckets(w, intervals, measured)
 	return nil
 }
 
@@ -157,11 +200,12 @@ func writeSpanReport(w io.Writer, rows []spanRow, from, to uint64, warmup int) e
 var sizeBucketsM = []uint64{0, 10, 20, 30, 40}
 
 // writeSizeBuckets groups the measured blocks by consumed CU and reports each
-// group's BlockInterval. CU/ns is the group's total CU over its total
-// interval time.
-func writeSizeBuckets(w io.Writer, intervals []float64, blockCU []uint64) {
+// group's BlockInterval; intervals[i] is blocks[i]'s. CU/ns is the group's
+// total CU over its total interval time. chain M CU is the group's average
+// longest dependency chain, over the blocks that recorded one.
+func writeSizeBuckets(w io.Writer, intervals []float64, blocks []spanRow) {
 	fmt.Fprintf(w, "  by block size (BlockInterval per group):\n")
-	fmt.Fprintf(w, "  %-12s %7s %10s %8s %8s %8s %8s %8s\n", "M CU", "blocks", "avg M CU", "mean ms", "p50", "p99", "max", "CU/ns")
+	fmt.Fprintf(w, "  %-12s %7s %10s %8s %8s %8s %8s %8s %11s\n", "M CU", "blocks", "avg M CU", "mean ms", "p50", "p99", "max", "CU/ns", "chain M CU")
 	for i, lo := range sizeBucketsM {
 		hi := uint64(math.MaxUint64)
 		label := fmt.Sprintf("%d+", lo)
@@ -172,11 +216,14 @@ func writeSizeBuckets(w io.Writer, intervals []float64, blockCU []uint64) {
 		var vals []float64
 		var cu uint64
 		var ms float64
-		for j, c := range blockCU {
+		var chain chainTotals
+		for j := range blocks {
+			c := blocks[j].ComputeUnitsConsumed
 			if c >= lo*1_000_000 && (hi == math.MaxUint64 || c < hi*1_000_000) {
 				vals = append(vals, intervals[j])
 				cu += c
 				ms += intervals[j]
+				chain.add(c, blocks[j].LongestChainCU, blocks[j].LongestChainTransactions)
 			}
 		}
 		if len(vals) == 0 {
@@ -185,6 +232,6 @@ func writeSizeBuckets(w io.Writer, intervals []float64, blockCU []uint64) {
 		}
 		p50, _, p99, mx := quantiles(vals)
 		n := float64(len(vals))
-		fmt.Fprintf(w, "  %-12s %7d %10.2f %8.3f %8.3f %8.3f %8.3f %8.3f\n", label, len(vals), float64(cu)/n/1e6, ms/n, p50, p99, mx, float64(cu)/(ms*1e6))
+		fmt.Fprintf(w, "  %-12s %7d %10.2f %8.3f %8.3f %8.3f %8.3f %8.3f %11s\n", label, len(vals), float64(cu)/n/1e6, ms/n, p50, p99, mx, float64(cu)/(ms*1e6), chain.avgM())
 	}
 }
