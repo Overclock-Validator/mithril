@@ -340,6 +340,25 @@ func (epochCredits *EpochCredits) MarshalWithEncoder(encoder *bin.Encoder) error
 	return err
 }
 
+// Serialized sizes of the vector elements decoded below.
+const (
+	voteLockoutSize  = 8 + 4     // slot + confirmation_count
+	landedVoteSize   = 1 + 8 + 4 // latency + lockout
+	epochCreditsSize = 8 + 8 + 8 // epoch + credits + prev_credits
+)
+
+// checkCountFitsRemaining rejects an element count that cannot possibly be
+// satisfied by the bytes left in the decoder. It must run before the count is
+// used to size an allocation: a count read straight from account data can be
+// arbitrarily large, and passing it to SetBaseCap or slices.Grow would panic or
+// stall instead of failing the decode. Agave returns InvalidAccountData here.
+func checkCountFitsRemaining(count uint64, elemSize int, decoder *bin.Decoder) error {
+	if count > uint64(decoder.Remaining()/elemSize) {
+		return InstrErrInvalidAccountData
+	}
+	return nil
+}
+
 func (landedVote *LandedVote) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 	var err error
 	landedVote.Latency, err = decoder.ReadByte()
@@ -425,6 +444,9 @@ func (voteState *VoteState0_23_5) UnmarshalWithDecoder(decoder *bin.Decoder) err
 		return err
 	}
 
+	if err = checkCountFitsRemaining(numLockouts, voteLockoutSize, decoder); err != nil {
+		return err
+	}
 	voteState.Votes.Clear()
 	voteState.Votes.SetBaseCap(int(numLockouts))
 	for count := uint64(0); count < numLockouts; count++ {
@@ -748,6 +770,9 @@ func (voteState *VoteState1_14_11) UnmarshalWithDecoder(decoder *bin.Decoder) er
 		return err
 	}
 
+	if err = checkCountFitsRemaining(numLockouts, voteLockoutSize, decoder); err != nil {
+		return err
+	}
 	voteState.Votes.Clear()
 	voteState.Votes.SetBaseCap(int(numLockouts))
 	for count := uint64(0); count < numLockouts; count++ {
@@ -895,6 +920,9 @@ func (voteState *VoteState) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 		return err
 	}
 
+	if err = checkCountFitsRemaining(numLockouts, landedVoteSize, decoder); err != nil {
+		return err
+	}
 	voteState.Votes.Clear()
 	voteState.Votes.SetBaseCap(int(numLockouts))
 	for count := uint64(0); count < numLockouts; count++ {
@@ -934,6 +962,9 @@ func (voteState *VoteState) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 		return err
 	}
 
+	if err = checkCountFitsRemaining(numEpochCredits, epochCreditsSize, decoder); err != nil {
+		return err
+	}
 	voteState.EpochCredits = slices.Grow(voteState.EpochCredits, int(numEpochCredits))
 	for count := uint64(0); count < numEpochCredits; count++ {
 		var epochCredits EpochCredits
@@ -1082,6 +1113,9 @@ func (voteState *VoteState4) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 		return err
 	}
 
+	if err = checkCountFitsRemaining(numLockouts, landedVoteSize, decoder); err != nil {
+		return err
+	}
 	voteState.Votes.Clear()
 	voteState.Votes.SetBaseCap(int(numLockouts))
 	for count := uint64(0); count < numLockouts; count++ {
@@ -1116,6 +1150,9 @@ func (voteState *VoteState4) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 		return err
 	}
 
+	if err = checkCountFitsRemaining(numEpochCredits, epochCreditsSize, decoder); err != nil {
+		return err
+	}
 	voteState.EpochCredits = slices.Grow(voteState.EpochCredits, int(numEpochCredits))
 	for count := uint64(0); count < numEpochCredits; count++ {
 		var epochCredits EpochCredits
