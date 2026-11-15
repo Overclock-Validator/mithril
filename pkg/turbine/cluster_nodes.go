@@ -39,6 +39,13 @@ type ClusterNodes struct {
 	shuffle     *WeightedShuffle
 	shufflePool sync.Pool
 	useChaCha8  bool
+	// selfMinPosition is a lower bound on this node's position in any
+	// retransmit shuffle of this snapshot: zero-stake nodes follow every
+	// staked node, of which at most one (the leader) is removed per shred.
+	selfMinPosition int
+	// selfInShuffle is false when retransmit shuffles never yield this node:
+	// it is missing from the snapshot, or this is the broadcast variant.
+	selfInShuffle bool
 }
 
 type ClusterNodesConfig struct {
@@ -75,12 +82,18 @@ func newClusterNodes(cfg ClusterNodesConfig, broadcast bool) *ClusterNodes {
 	if broadcast && selfIndex >= 0 {
 		shuffle.RemoveIndex(selfIndex)
 	}
+	selfMinPosition := 0
+	if selfIndex >= 0 && !shuffle.Weighted(selfIndex) {
+		selfMinPosition = max(shuffle.WeightedCount()-1, 0)
+	}
 	return &ClusterNodes{
-		selfPubkey: cfg.Self,
-		nodes:      nodes,
-		selfIndex:  selfIndex,
-		shuffle:    shuffle,
-		useChaCha8: cfg.UseChaCha8,
+		selfPubkey:      cfg.Self,
+		nodes:           nodes,
+		selfIndex:       selfIndex,
+		shuffle:         shuffle,
+		useChaCha8:      cfg.UseChaCha8,
+		selfMinPosition: selfMinPosition,
+		selfInShuffle:   selfIndex >= 0 && !broadcast,
 	}
 }
 
@@ -102,11 +115,26 @@ func (c *ClusterNodes) retransmitPeersInto(leader solana.PublicKey, shred ShredI
 	if leader == c.selfPubkey {
 		return 0, nil, ErrRetransmitLoopback
 	}
+	if !c.selfInShuffle {
+		// Not in this snapshot (for example deduplicated by TVU address), or
+		// removed from the shuffle: the walk would end without finding it.
+		return maxTurbineHops - 1, nil, nil
+	}
+	// Positions from leafFrom on have no children, whichever shred it is. A
+	// node that can only sit there (no stake) skips the shuffle altogether,
+	// and any other node stops looking for itself once the walk gets there.
+	leafFrom, leafDistance, leafKnown := turbineLeafBound(len(c.nodes), fanout)
+	if leafKnown && c.selfMinPosition >= leafFrom {
+		return leafDistance, emptyRetransmitPeers(dst), nil
+	}
 	shuffle := c.borrowRetransmitShuffle(leader)
 	defer c.releaseRetransmitShuffle(shuffle)
 	rng := newTurbineRNG(shred.Seed(leader), c.useChaCha8)
 	selfPos := -1
 	for position := 0; ; position++ {
+		if leafKnown && position >= leafFrom {
+			return leafDistance, emptyRetransmitPeers(dst), nil
+		}
 		index, ok := shuffle.Next(rng)
 		if !ok {
 			break
@@ -232,6 +260,56 @@ func (c *ClusterNodes) borrowRetransmitShuffle(leader solana.PublicKey) *Weighte
 
 func (c *ClusterNodes) releaseRetransmitShuffle(shuffle *WeightedShuffle) {
 	c.shufflePool.Put(shuffle)
+}
+
+// turbineFirstChild is the shuffle position of a node's first child: its
+// children are at that position and every step-th one after it, fanout in all.
+func turbineFirstChild(position, fanout int) int {
+	if position <= 0 {
+		return 1
+	}
+	offset := (position - 1) % fanout
+	return (position-offset)*fanout + offset + 1
+}
+
+// turbineLeafBound returns the first shuffle position from which every node is
+// a leaf in a tree of at most nodes entries, and those leaves' distance from
+// the root. known is false when the leaves span more than one distance, in
+// which case a leaf's distance still depends on its exact position.
+//
+// turbineFirstChild grows with the position, so the positions that have a
+// child (one below nodes) are a prefix of the shuffle. Fewer nodes than given
+// only shorten that prefix, which is why callers may pass an upper bound.
+func turbineLeafBound(nodes, fanout int) (leafFrom int, distance uint8, known bool) {
+	if nodes <= 0 || fanout <= 0 {
+		return 0, 0, false
+	}
+	// Largest position whose first child still exists, by binary search over
+	// the increasing turbineFirstChild.
+	lo, hi := 0, nodes
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		if turbineFirstChild(mid, fanout) < nodes {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	leafFrom = lo
+	if leafFrom >= nodes {
+		return leafFrom, 0, false
+	}
+	distance = turbineRootDistance(leafFrom, fanout)
+	return leafFrom, distance, distance == turbineRootDistance(nodes-1, fanout)
+}
+
+// emptyRetransmitPeers is the no-children result: empty and non-nil, reusing
+// the caller's storage when there is any.
+func emptyRetransmitPeers(dst []*net.UDPAddr) []*net.UDPAddr {
+	if dst == nil {
+		return []*net.UDPAddr{}
+	}
+	return dst[:0]
 }
 
 func turbineRootDistance(index, fanout int) uint8 {
