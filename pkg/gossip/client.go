@@ -50,6 +50,10 @@ type Client struct {
 	alpenglow  *net.UDPAddr
 	identity   *identity.Holder
 
+	// contactVerify skips signature checks for exact repeats of verified
+	// contact records.
+	contactVerify *contactVerifyCache
+
 	contactMu sync.RWMutex
 	// contact is replaced on every update and never modified once published,
 	// so readers may use it after releasing contactMu.
@@ -144,6 +148,12 @@ type Stats struct {
 	Peers            int
 	RepairPeers      int
 	AlpenglowPeers   int
+	// Contact signature cache: exact repeats skipped, records verified,
+	// records that failed verification, and entries held.
+	ContactVerifyHits     uint64
+	ContactVerifyMisses   uint64
+	ContactVerifyRejected uint64
+	ContactVerifyCached   int
 }
 
 func NewClient(cfg Config) (*Client, error) {
@@ -190,6 +200,7 @@ func NewClient(cfg Config) (*Client, error) {
 	}
 
 	return &Client{
+		contactVerify:      newContactVerifyCache(),
 		cfg:                cfg,
 		entrypoint:         entrypoint,
 		bindAddr:           bindAddr,
@@ -345,10 +356,11 @@ func (c *Client) Run(ctx context.Context) error {
 			_ = c.sendPullRequests(conn)
 		case <-statsTicker.C:
 			stats := c.Stats()
-			mlog.Log.FileOnlyf("gossip client stats: rx=%d tx=%d peers=%d repair_peers=%d decode_errors=%d tx_errors=%d pings=%d/%d pongs=%d/%d contacts_rx=%d contacts_accepted=%d pull_requests=%d pull_responses=%d last_rx=%s last_tx=%s",
+			mlog.Log.FileOnlyf("gossip client stats: rx=%d tx=%d peers=%d repair_peers=%d decode_errors=%d tx_errors=%d pings=%d/%d pongs=%d/%d contacts_rx=%d contacts_accepted=%d pull_requests=%d pull_responses=%d contact_verify_hits=%d contact_verify_misses=%d contact_verify_rejected=%d contact_verify_cached=%d last_rx=%s last_tx=%s",
 				stats.RxPackets, stats.TxPackets, stats.Peers, stats.RepairPeers, stats.RxDecodeErrors, stats.TxErrors,
 				stats.RxPings, stats.TxPingMessages, stats.RxPongs, stats.TxPongMessages,
 				stats.RxContacts, stats.AcceptedContacts, stats.RxPullRequests, stats.TxPullResponses,
+				stats.ContactVerifyHits, stats.ContactVerifyMisses, stats.ContactVerifyRejected, stats.ContactVerifyCached,
 				formatAge(stats.LastRxUnix), formatAge(stats.LastTxUnix))
 		}
 	}
@@ -364,25 +376,30 @@ func (c *Client) Stats() Stats {
 	c.alpenglowPeerMu.Lock()
 	alpenglowPeers := len(c.alpenglowPeers)
 	c.alpenglowPeerMu.Unlock()
+	verify := c.contactVerify.stats()
 	return Stats{
-		RxPackets:        c.rxPackets.Load(),
-		TxPackets:        c.txPackets.Load(),
-		RxDecodeErrors:   c.rxDecodeErrors.Load(),
-		TxErrors:         c.txErrors.Load(),
-		RxPings:          c.rxPings.Load(),
-		RxPongs:          c.rxPongs.Load(),
-		RxContacts:       c.rxContacts.Load(),
-		AcceptedContacts: c.acceptedContacts.Load(),
-		RxPullRequests:   c.rxPullRequests.Load(),
-		TxPushMessages:   c.txPushMessages.Load(),
-		TxPingMessages:   c.txPingMessages.Load(),
-		TxPongMessages:   c.txPongMessages.Load(),
-		TxPullResponses:  c.txPullResponses.Load(),
-		LastRxUnix:       c.lastRxUnix.Load(),
-		LastTxUnix:       c.lastTxUnix.Load(),
-		Peers:            peers,
-		RepairPeers:      repairPeers,
-		AlpenglowPeers:   alpenglowPeers,
+		ContactVerifyHits:     verify.Hits,
+		ContactVerifyMisses:   verify.Verified,
+		ContactVerifyRejected: verify.Rejected,
+		ContactVerifyCached:   verify.Size,
+		RxPackets:             c.rxPackets.Load(),
+		TxPackets:             c.txPackets.Load(),
+		RxDecodeErrors:        c.rxDecodeErrors.Load(),
+		TxErrors:              c.txErrors.Load(),
+		RxPings:               c.rxPings.Load(),
+		RxPongs:               c.rxPongs.Load(),
+		RxContacts:            c.rxContacts.Load(),
+		AcceptedContacts:      c.acceptedContacts.Load(),
+		RxPullRequests:        c.rxPullRequests.Load(),
+		TxPushMessages:        c.txPushMessages.Load(),
+		TxPingMessages:        c.txPingMessages.Load(),
+		TxPongMessages:        c.txPongMessages.Load(),
+		TxPullResponses:       c.txPullResponses.Load(),
+		LastRxUnix:            c.lastRxUnix.Load(),
+		LastTxUnix:            c.lastTxUnix.Load(),
+		Peers:                 peers,
+		RepairPeers:           repairPeers,
+		AlpenglowPeers:        alpenglowPeers,
 	}
 }
 
@@ -691,7 +708,7 @@ func (c *Client) recvLoop(ctx context.Context, conn *net.UDPConn) error {
 
 func (c *Client) handlePacket(conn *net.UDPConn, packet []byte, from *net.UDPAddr) error {
 	shredVersion := c.ShredVersion()
-	decoded, err := decodePacketWithContactHandler(packet, func(record contactRecord) {
+	decoded, err := decodePacketWithContactHandler(packet, c.contactVerify, func(record contactRecord) {
 		c.handleContactRecord(record, shredVersion)
 	})
 	if err != nil {

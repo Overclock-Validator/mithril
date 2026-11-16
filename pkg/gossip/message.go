@@ -145,7 +145,7 @@ func decodePong(d *decoder) (Pong, error) {
 	return pong, nil
 }
 
-func decodeContactRecords(d *decoder, handleContact func(contactRecord)) (int, []*ContactInfo, error) {
+func decodeContactRecords(d *decoder, verified *contactVerifyCache, handleContact func(contactRecord)) (int, []*ContactInfo, error) {
 	n, err := d.u64()
 	if err != nil {
 		return 0, nil, err
@@ -166,7 +166,7 @@ func decodeContactRecords(d *decoder, handleContact func(contactRecord)) (int, [
 			}
 			return contactCount, contacts, err
 		}
-		if !record.Verify() {
+		if !verified.verify(record) {
 			continue
 		}
 		contactCount++
@@ -198,10 +198,10 @@ type decodedPacket struct {
 }
 
 func decodePacket(packet []byte) (decodedPacket, error) {
-	return decodePacketWithContactHandler(packet, nil)
+	return decodePacketWithContactHandler(packet, nil, nil)
 }
 
-func decodePacketWithContactHandler(packet []byte, handleContact func(contactRecord)) (decodedPacket, error) {
+func decodePacketWithContactHandler(packet []byte, verified *contactVerifyCache, handleContact func(contactRecord)) (decodedPacket, error) {
 	d := newDecoder(packet)
 	variant, err := d.variant()
 	if err != nil {
@@ -215,7 +215,7 @@ func decodePacketWithContactHandler(packet []byte, handleContact func(contactRec
 		if _, err := d.read(32); err != nil {
 			return decodedPacket{}, err
 		}
-		contactCount, contacts, err := decodeContactRecords(d, handleContact)
+		contactCount, contacts, err := decodeContactRecords(d, verified, handleContact)
 		if err != nil {
 			if errors.Is(err, errUnsupportedCRDSValue) {
 				return decodedPacket{Kind: packetIgnored}, nil
