@@ -406,3 +406,44 @@ func TestBankSysvarsAtomicPublicationIsRaceFree(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestBankEpochScheduleOverridesSysvarOnlyForBankEpochMath(t *testing.T) {
+	fixture := newBankSysvarFixture(t, 42)
+	// Devnet: the EpochSchedule account holds 8192 slots per epoch while the
+	// bank (snapshot manifest) runs 432000.
+	sysvarSchedule := SysvarEpochSchedule{SlotsPerEpoch: 8_192, LeaderScheduleSlotOffset: 8_192}
+	data, err := marshalLegacySysvarValue(bankSysvarEpochSchedule, &sysvarSchedule)
+	require.NoError(t, err)
+	for _, acct := range fixture.accounts {
+		if acct.Key == solana.PublicKey(SysvarEpochScheduleAddr) {
+			acct.Data = data
+		}
+	}
+	snapshot, err := NewBankSysvars(42, fixture.accounts...)
+	require.NoError(t, err)
+
+	t.Cleanup(func() { SetBankEpochSchedule(nil) })
+	got, ok := snapshot.BankEpochSchedule()
+	require.True(t, ok)
+	require.Equal(t, sysvarSchedule, got, "without a bank schedule the sysvar is used")
+
+	bankSchedule := fixture.epochSchedule
+	SetBankEpochSchedule(&bankSchedule)
+	got, ok = snapshot.BankEpochSchedule()
+	require.True(t, ok)
+	require.Equal(t, bankSchedule, got)
+	require.Equal(t, uint64(1210), got.GetEpoch(522_767_385))
+
+	// Programs still read the account contents, as on Agave.
+	programView, ok := snapshot.EpochSchedule()
+	require.True(t, ok)
+	require.Equal(t, sysvarSchedule, programView)
+	require.Equal(t, uint64(63_814), programView.GetEpoch(522_767_385))
+	raw, ok := snapshot.RawView(solana.PublicKey(SysvarEpochScheduleAddr))
+	require.True(t, ok)
+	require.Equal(t, data, raw)
+
+	var missing *BankSysvars
+	_, ok = missing.BankEpochSchedule()
+	require.False(t, ok)
+}

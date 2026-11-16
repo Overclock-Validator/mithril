@@ -227,7 +227,7 @@ func (exec *blockExecution) installSlotCtx(accts accounts.Accounts, parentAccts 
 	if err := slotCtx.PublishBankSysvars(bankSysvars); err != nil {
 		return fmt.Errorf("publish bank sysvars at slot %d: %w", block.Slot, err)
 	}
-	bankEpochScheduleValue, ok := bankSysvars.EpochSchedule()
+	bankEpochScheduleValue, ok := bankSysvars.BankEpochSchedule()
 	if !ok {
 		return fmt.Errorf("bank-local EpochSchedule sysvar unavailable at slot %d", block.Slot)
 	}

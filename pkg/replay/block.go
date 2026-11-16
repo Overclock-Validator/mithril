@@ -699,7 +699,7 @@ func loadBlockAccountsAndUpdateSysvars(
 				if !ok {
 					panic("decoded Clock sysvar is absent from parent bank snapshot")
 				}
-				parentEpochSchedule, ok := parentBankSysvars.EpochSchedule()
+				parentEpochSchedule, ok := parentBankSysvars.BankEpochSchedule()
 				if !ok {
 					panic("decoded EpochSchedule sysvar is absent from parent bank snapshot")
 				}
@@ -1918,6 +1918,14 @@ func ReplayBlocks(
 	if err != nil {
 		result.Error = err
 		return result
+	}
+	// Bank epoch math (clock epoch, vote rewards, rent) follows the bank
+	// schedule even where the EpochSchedule account disagrees with it.
+	if usingManifestEpochSchedule {
+		bankSchedule := *epochSchedule
+		sealevel.SetBankEpochSchedule(&bankSchedule)
+	} else {
+		sealevel.SetBankEpochSchedule(nil)
 	}
 	if usingManifestEpochSchedule && !epochSchedulesEqual(epochSchedule, sealevel.SysvarCache.EpochSchedule.Sysvar) {
 		sysvarSchedule := sealevel.SysvarCache.EpochSchedule.Sysvar

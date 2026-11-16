@@ -47,7 +47,7 @@ func NewLeaderSlotCtx(slot, parentSlot uint64, acctsDb *accountsdb.AccountsDb, p
 	feats := leaderFeatures(parent.Features)
 
 	if parent.BankSysvars != nil {
-		if bankEpochSchedule, ok := parent.BankSysvars.EpochSchedule(); ok {
+		if bankEpochSchedule, ok := parent.BankSysvars.BankEpochSchedule(); ok {
 			epochSchedule = &bankEpochSchedule
 		} else {
 			return nil, fmt.Errorf("parent bank snapshot has no EpochSchedule sysvar")

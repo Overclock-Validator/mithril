@@ -3,6 +3,7 @@ package sealevel
 import (
 	"bytes"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	bin "github.com/gagliardetto/binary"
@@ -391,6 +392,31 @@ func (s *BankSysvars) Rent() (SysvarRent, bool) {
 		return SysvarRent{}, false
 	}
 	return s.rent, s.hasDecoded(bankSysvarRent)
+}
+
+// bankEpochSchedule is the bank's own epoch schedule (from the snapshot manifest)
+// when it differs from the EpochSchedule sysvar account. Devnet is such a
+// cluster: the account holds 8192 slots/epoch while the bank runs 432000. Agave
+// does bank epoch math (clock epoch, rent partitions, vote rewards) with the
+// bank schedule and only exposes the account data to programs.
+var bankEpochSchedule atomic.Pointer[SysvarEpochSchedule]
+
+// SetBankEpochSchedule installs the bank's epoch schedule for bank epoch math.
+func SetBankEpochSchedule(schedule *SysvarEpochSchedule) {
+	bankEpochSchedule.Store(schedule)
+}
+
+// BankEpochSchedule returns the schedule for bank epoch math: the bank schedule
+// when one is installed, else the EpochSchedule sysvar. Programs read the sysvar
+// account via EpochSchedule.
+func (s *BankSysvars) BankEpochSchedule() (SysvarEpochSchedule, bool) {
+	if s == nil {
+		return SysvarEpochSchedule{}, false
+	}
+	if schedule := bankEpochSchedule.Load(); schedule != nil {
+		return *schedule, true
+	}
+	return s.EpochSchedule()
 }
 
 func (s *BankSysvars) EpochSchedule() (SysvarEpochSchedule, bool) {

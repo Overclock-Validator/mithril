@@ -73,7 +73,7 @@ func PrepareLeaderSlotSysvars(slotCtx *sealevel.SlotCtx, block *b.Block, alpengl
 	if bankSysvars == nil {
 		return fmt.Errorf("leader slot %d has no pinned bank sysvar snapshot", slotCtx.Slot)
 	}
-	bankEpochSchedule, ok := bankSysvars.EpochSchedule()
+	bankEpochSchedule, ok := bankSysvars.BankEpochSchedule()
 	if !ok {
 		return fmt.Errorf("leader parent snapshot has no EpochSchedule sysvar")
 	}
@@ -135,7 +135,7 @@ func CommitLeaderSlot(in CommitLeaderInput) (*sealevel.SlotCtx, error) {
 	if bankSysvars == nil {
 		return nil, fmt.Errorf("leader slot %d has no bank sysvar snapshot", slotCtx.Slot)
 	}
-	bankEpochSchedule, ok := bankSysvars.EpochSchedule()
+	bankEpochSchedule, ok := bankSysvars.BankEpochSchedule()
 	if !ok {
 		return nil, fmt.Errorf("leader slot %d has no bank-local EpochSchedule sysvar", slotCtx.Slot)
 	}
