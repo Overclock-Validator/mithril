@@ -86,6 +86,7 @@ var ProvideInstructionDataOffsetInVmR2 = newGate("ProvideInstructionDataOffsetIn
 var SyscallParameterAddressRestrictions = newGate("SyscallParameterAddressRestrictions", "EDGMC5kxFxGk4ixsNkGt8bW7QL5hDMXnbwaZvYMwNfzF")
 var VirtualAddressSpaceAdjustments = newGate("VirtualAddressSpaceAdjustments", "7VgiehxNxu53KdxgLspGQY8myE6f7UokaWa4jsGcaSz")
 var AccountDataDirectMapping = newGate("AccountDataDirectMapping", "CR3dVN2Yoo95Y96kLSTaziWDAQT2MNEpiWh5cqVq2pNE")
+var DirectAccountPointersInProgramInput = newGate("DirectAccountPointersInProgramInput", "ptr9umikaeAS7ZBBp2fsfRhie16F1V2jCKA2y6gXNAK")
 var VoteStateV4 = newGate("VoteStateV4", "Gx4XFcrVMt4HUvPzTpTSVkdDVgcDSjKhDN1RqRS6KDuZ")
 var BlsPubkeyManagementInVoteAccount = newGate("BlsPubkeyManagementInVoteAccount", "AnAP9zPV4KL7czAPQbFhpDKV2tx7g4UGNbK9wvXwjaRo")
 var CommissionRateInBasisPoints = newGate("CommissionRateInBasisPoints", "Eg7tXEwMZzS98xaZ1YHUbdRHsaYZiCsSaR6sKgxreoaj")
@@ -126,6 +127,7 @@ var AllFeatureGates = []FeatureGate{StopTruncatingStringsInSyscalls, EnableParti
 	ValidatorAdmissionTicket, ReduceSlotTimeTo350ms, ReduceSlotTimeTo300ms, ReduceSlotTimeTo250ms, ReduceSlotTimeTo200ms, IncreaseCpiAccountInfoLimit,
 	StaticInstructionLimit, PoseidonEnforcePadding, FixAltBn128PairingLengthCheck, DeprecateRentExemptionThreshold,
 	ProvideInstructionDataOffsetInVmR2, SyscallParameterAddressRestrictions, VirtualAddressSpaceAdjustments, AccountDataDirectMapping,
+	DirectAccountPointersInProgramInput,
 	VoteStateV4, BlsPubkeyManagementInVoteAccount, CommissionRateInBasisPoints, CustomCommissionCollector, BlockRevenueSharing, VoteAccountInitializeV2,
 	RelaxProgramdataAccountCheckMigration, ReplaceSplTokenWithPToken, CreateAccountAllowPrefund,
 	RemoveSimpleVoteFromCostModel, DisableZkElgamalProofProgram, ReenableZkElgamalProofProgram, AltBn128LittleEndian, EnableAltBn128G2Syscalls,

@@ -654,6 +654,16 @@ func serializeParametersAligned(execCtx *ExecutionCtx) ([]byte, uint64, []serial
 	size += 8 + uint64(len(instrData)) // data len
 	size += solana.PublicKeyLength     // program id
 
+	// SIMD-0449: after the program id, pad to 8-byte alignment and append the VM
+	// address of each instruction account's serialized header (duplicates point
+	// at the account they duplicate), mirroring Agave serialize_parameters_for_abiv1.
+	directAccountPointers := execCtx.Features.IsActive(features.DirectAccountPointersInProgramInput)
+	var accountPointersPadding uint64
+	if directAccountPointers {
+		accountPointersPadding = util.AlignUp(size, 8) - size
+		size += accountPointersPadding + 8*uint64(len(accts))
+	}
+
 	var serializedData []byte
 	if !execCtx.IsSimulation && execCtx.SlotCtx.SerializedParameterArena != nil {
 		arenaData, _ := execCtx.SlotCtx.SerializedParameterArena.AllocN(size)
@@ -791,6 +801,18 @@ func serializeParametersAligned(execCtx *ExecutionCtx) ([]byte, uint64, []serial
 	copy(serializedData[l+8:l+8+len(instrData)], instrData)
 	copy(serializedData[len(serializedData)-32:], programId[:])
 	virtualOffset += 8 + uint64(len(instrData)) + solana.PublicKeyLength
+
+	if directAccountPointers {
+		l := len(serializedData)
+		pointers := l + int(accountPointersPadding)
+		serializedData = serializedData[:pointers+8*len(accts)]
+		clear(serializedData[l:pointers])
+		for i := range accts {
+			// vmKeyAddr follows the 8-byte dup/signer/writable/executable/padding header.
+			binary.LittleEndian.PutUint64(serializedData[pointers+8*i:], accountMetadatas[i].vmKeyAddr-8)
+		}
+		virtualOffset += accountPointersPadding + 8*uint64(len(accts))
+	}
 
 	if vasa {
 		appendVasaMetadataRegion(&inputRegions, regionStart, virtualOffset, hostRegionStart)
