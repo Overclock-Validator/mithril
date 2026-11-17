@@ -77,6 +77,22 @@ func (bs *BlockSource) prioritizeTurbineRepairRange(start, end uint64) {
 	}
 }
 
+// prioritizeTurbineRepairForEmissionHead pins the next slot to emit once
+// turbine holds any of its shreds, so a block whose header shreds were lost is
+// repaired as soon as replay needs it rather than after a later slot completes
+// (turbine/emission_head_repair.go).
+func (bs *BlockSource) prioritizeTurbineRepairForEmissionHead(slot uint64) {
+	if bs.sourceType != BlockSourceTurbine || !bs.turbineAlpenglowBlockIDHints || slot == 0 || !bs.usesLiveShredStream() {
+		return
+	}
+	bs.alpenglowMu.Lock()
+	receiver := bs.activeTurbineReceiver
+	bs.alpenglowMu.Unlock()
+	if receiver != nil {
+		receiver.PrioritizeObservedRepairSlot(slot)
+	}
+}
+
 func (bs *BlockSource) prioritizeTurbineRepairForLiveGap(waitingSlot, firstBufferedParentSlot uint64) {
 	end := waitingSlot
 	if firstBufferedParentSlot > waitingSlot {

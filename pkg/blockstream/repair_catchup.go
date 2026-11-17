@@ -4,6 +4,7 @@ package blockstream
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
@@ -65,6 +66,7 @@ func (bs *BlockSource) deactivateRepairCatchup(receiver *turbine.UDPReceiver) {
 	if receiver != nil {
 		receiver.SetRetentionFloor(0)
 		receiver.SetHydrationWindow(0, 0)
+		receiver.SetHydrationPacing(0)
 	}
 }
 
@@ -378,6 +380,10 @@ func (bs *BlockSource) sleepOrStop(ctx context.Context, d time.Duration) bool {
 func (bs *BlockSource) driveRepairCatchup(ctx context.Context, receiver *turbine.UDPReceiver, from, edge uint64) bool {
 	ticker := time.NewTicker(repairCatchupPollInterval)
 	defer ticker.Stop()
+	// The window below slides once per tick, which would make the hydrator
+	// load every slot that entered it in one burst. Spread loads far ahead of
+	// replay over half a tick instead; slots near replay are never delayed.
+	receiver.SetHydrationPacing(repairCatchupHydrationPacing())
 	statsAtArm := receiver.Stats()
 	lastWaiting := uint64(0)
 	lastProgress := time.Now()
@@ -863,4 +869,14 @@ func (bs *BlockSource) turbineCatchupBlocksInWindow(from, to uint64) int {
 	}
 	bs.reorderMu.Unlock()
 	return count
+}
+
+// repairCatchupHydrationPacing is the hydrator's pacing budget per window
+// update: half the poll interval, so every paced pass ends before the next
+// window update. MITHRIL_HYDRATE_PACE=0 turns pacing off.
+func repairCatchupHydrationPacing() time.Duration {
+	if os.Getenv("MITHRIL_HYDRATE_PACE") == "0" {
+		return 0
+	}
+	return repairCatchupPollInterval / 2
 }

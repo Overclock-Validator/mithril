@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"math"
 	"math/bits"
-
-	"github.com/gagliardetto/solana-go"
 )
 
 // authenticateRecoveredFEC follows Agave's merkle::recover: reconstruct every
@@ -14,7 +12,7 @@ import (
 // its root with a received shred's authenticated root before publishing data.
 // Signature verification of received shreds is the ingress caller's contract;
 // Reed-Solomon reconstruction alone is never evidence of authenticity.
-func (a *SlotAssembler) authenticateRecoveredFEC(f *fecState, shards [][]byte, recovered []*Shred) error {
+func (a *SlotAssembler) authenticateRecoveredFEC(f *fecState, shards [][]byte, recovered []*Shred, scratch *fecRecoveryScratch) error {
 	// Agave takes its template from the highest-position received coding shred.
 	var code *Shred
 	for _, s := range f.coding {
@@ -46,30 +44,36 @@ func (a *SlotAssembler) authenticateRecoveredFEC(f *fecState, shards [][]byte, r
 	}
 	// Present shards are read-only. Only absent coding shards remain after the
 	// caller's data recovery, so this also checks commitments to missing parity.
+	// The caller gave those entries scratch capacity, which Reconstruct fills.
 	if err = encoder.Reconstruct(shards); err != nil {
 		return fmt.Errorf("recover FEC authentication: %w", err)
 	}
 	dataCount := int(f.layout.dataShreds)
-	data := make(map[uint32]*Shred, len(recovered))
+	data := scratch.shredsByIndex(dataCount)
 	for _, s := range recovered {
 		// Chained root and retransmitter signature are outside the erasure region.
 		// Copy the template suffix now, then replace its proof after authenticating.
 		copy(s.Payload[shredSignatureSize+f.layout.shardSize:], code.Payload[codingHeaderSize+f.layout.shardSize:])
-		data[s.Index-f.fecSetIndex] = s
+		pos := s.Index - f.fecSetIndex
+		if pos >= uint32(dataCount) {
+			return fmt.Errorf("recover FEC: recovered data index %d outside set", s.Index)
+		}
+		data[pos] = s
 	}
-	nodes := make([]solana.Hash, 0, merkleTreeSize(len(shards)))
+	nodes := scratch.merkleNodes(merkleTreeSize(len(shards)))
 	for i, shard := range shards {
 		var s *Shred
 		if i < dataCount {
 			s = f.data[uint32(i)]
 			if s == nil {
-				s = data[uint32(i)]
+				s = data[i]
 			}
 		} else {
 			pos := uint16(i - dataCount)
 			s = f.coding[pos]
 			if s == nil {
-				payload := append([]byte(nil), code.Payload...)
+				// Scratch copy used only to hash this leaf, then overwritten.
+				payload := scratch.codingPayload(code.Payload)
 				binary.LittleEndian.PutUint32(payload[shredIndexOffset:], codeBase+uint32(pos))
 				binary.LittleEndian.PutUint16(payload[codingPositionOffset:], pos)
 				copy(payload[codingHeaderSize:], shard)

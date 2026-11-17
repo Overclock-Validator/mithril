@@ -297,7 +297,7 @@ func (s *ShredSpool) appendLocked(slot uint64, packet []byte) bool {
 	sf := s.open[slot]
 	if sf == nil {
 		if s.sizes[slot] > 0 && !s.validated[slot] {
-			if _, err := s.readSlotLocked(slot); err != nil {
+			if _, err := s.readSlotLocked(slot, nil); err != nil {
 				return false
 			}
 		}
@@ -471,13 +471,37 @@ func (s *ShredSpool) SlotsInRange(lo, hi uint64) []uint64 {
 func (s *ShredSpool) ReadSlot(slot uint64) ([][]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.readSlotLocked(slot)
+	return s.readSlotLocked(slot, nil)
 }
 
-func (s *ShredSpool) readSlotLocked(slot uint64) ([][]byte, error) {
+// SpoolReadBuffer is caller-owned storage for ReadSlotInto. Packets returned
+// by ReadSlotInto alias it and are valid only until the next call with the
+// same buffer. It is not safe for concurrent use.
+type SpoolReadBuffer struct {
+	data    []byte
+	packets [][]byte
+}
+
+// ReadSlotInto is ReadSlot reading into buf. The caller must be done with
+// every returned packet (for example, ParseShred copies it) before reusing
+// buf; validation and truncation are identical to ReadSlot.
+func (s *ShredSpool) ReadSlotInto(slot uint64, buf *SpoolReadBuffer) ([][]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.readSlotLocked(slot, buf)
+}
+
+func (s *ShredSpool) readSlotLocked(slot uint64, buf *SpoolReadBuffer) ([][]byte, error) {
 	s.closeSlotLocked(slot) // flush any buffered tail
 	path := s.pathFor(slot)
-	data, err := os.ReadFile(path)
+	var data []byte
+	var err error
+	if buf == nil {
+		data, err = os.ReadFile(path)
+	} else {
+		data, err = readFileInto(path, buf.data[:0])
+		buf.data = data
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -486,6 +510,11 @@ func (s *ShredSpool) readSlotLocked(slot uint64) ([][]byte, error) {
 		return nil, fmt.Errorf("invalid shred spool header for slot %d", slot)
 	}
 	var packets [][]byte
+	if buf != nil {
+		clear(buf.packets)
+		packets = buf.packets[:0]
+		defer func() { buf.packets = packets }()
+	}
 	validEnd := len(spoolFileMagic)
 	for off := validEnd; off < len(data); {
 		if off+spoolRecordHeaderSize > len(data) {
@@ -648,5 +677,32 @@ func (s *ShredSpool) Close() {
 		}
 		s.journal.close()
 		s.journal = nil
+	}
+}
+
+// readFileInto reads the whole file into dst's backing array, growing it if
+// needed, like os.ReadFile without a fresh allocation per call.
+func readFileInto(path string, dst []byte) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if info, err := f.Stat(); err == nil && info.Size() > 0 && int64(cap(dst)) < info.Size()+1 {
+		dst = make([]byte, 0, info.Size()+512)
+	}
+	dst = dst[:0]
+	for {
+		if len(dst) == cap(dst) {
+			dst = append(dst, 0)[:len(dst)]
+		}
+		n, err := f.Read(dst[len(dst):cap(dst)])
+		dst = dst[:len(dst)+n]
+		if err == io.EOF {
+			return dst, nil
+		}
+		if err != nil {
+			return nil, err
+		}
 	}
 }

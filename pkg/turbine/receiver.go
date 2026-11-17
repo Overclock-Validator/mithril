@@ -47,10 +47,18 @@ type UDPReceiver struct {
 	once            sync.Once
 	readyOnce       sync.Once
 
-	spool       *ShredSpool
-	hydrLo      atomic.Uint64
-	hydrHi      atomic.Uint64
+	spool  *ShredSpool
+	hydrLo atomic.Uint64
+	hydrHi atomic.Uint64
+	// hydratePace is the pacing budget per hydration pass in nanoseconds;
+	// see SetHydrationPacing.
+	hydratePace atomic.Int64
+	// hydrateObserved, when set by tests, is called after each slot load.
+	hydrateObserved func(slot uint64)
 	hydrateKick chan struct{}
+	// hydrateRead is the spool read buffer of the hydrator goroutine; only
+	// hydrateSlot touches it, and only one hydrator runs.
+	hydrateRead SpoolReadBuffer
 	// Hydration outcomes: whether spooled slots complete purely from disk
 	// (their own data + spooled coding via recovery) or hand holes to network
 	// repair — the number that says if the freshness-repair lead time is
@@ -1039,16 +1047,20 @@ func (r *UDPReceiver) hydrateLoop(ctx context.Context) {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	hydrated := make(map[uint64]bool)
+	rerun := false
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-r.hydrateKick:
-		case <-ticker.C:
+		if !rerun {
+			select {
+			case <-ctx.Done():
+				return
+			case <-r.hydrateKick:
+			case <-ticker.C:
+			}
 		}
 		lo := r.hydrLo.Load()
 		hi := r.hydrHi.Load()
 		if hi == 0 || lo > hi {
+			rerun = false
 			continue
 		}
 		for slot := range hydrated {
@@ -1056,52 +1068,161 @@ func (r *UDPReceiver) hydrateLoop(ctx context.Context) {
 				delete(hydrated, slot)
 			}
 		}
-		for _, slot := range r.spool.SlotsInRange(lo, hi) {
-			if r.assembler.SlotCompleted(slot) {
-				hydrated[slot] = true
-				continue
-			}
-			if hydrated[slot] {
-				// Re-hydrate only if the assembler lost its state (reset).
-				if _, live := r.assembler.HeadShredDetail(slot); live {
-					continue
-				}
-			}
-			r.slotResetMu.RLock()
-			packets, err := r.spool.ReadSlot(slot)
-			if err != nil {
-				r.slotResetMu.RUnlock()
-				continue
-			}
-			hydrated[slot] = true
-			var work *slotCompletionWork
-			for _, pkt := range packets {
-				shred, perr := ParseShred(pkt)
-				if perr != nil {
-					continue
-				}
-				if r.repairClient != nil {
-					r.repairClient.satisfyDataShred(shred)
-				}
-				candidate, aerr := r.assembler.addShredFrom(shred, false)
-				if aerr != nil || candidate == nil {
-					continue
-				}
-				work = candidate
-				break
-			}
-			r.slotResetMu.RUnlock()
-			r.hydratedSlots.Add(1)
-			if !r.submitCompletion(ctx, work, true) {
-				return
-			}
-			select {
-			case <-ctx.Done():
-				return
-			default:
+		var stop bool
+		stop, rerun = r.hydratePass(ctx, lo, hi, hydrated)
+		if stop {
+			return
+		}
+	}
+}
+
+// hydratePaceNear is how far ahead of replay the hydrator always loads
+// without pacing. Replay needs about a second or more to consume this many
+// slots at corpus speed, far longer than one pacing budget.
+const hydratePaceNear = 32
+
+// hydratePaceDelay is the pause before loading a spooled slot during a
+// hydration pass. Slots within hydratePaceNear of lo, the slot replay is
+// waiting for, are never delayed. A slot further ahead waits an even share of
+// the budget still left, so the farLeft loads (this one included) are spread
+// over the budget and the pass ends within it.
+func hydratePaceDelay(slot, lo uint64, farLeft int, budgetLeft time.Duration) time.Duration {
+	if slot <= lo+hydratePaceNear || farLeft <= 0 || budgetLeft <= 0 {
+		return 0
+	}
+	return budgetLeft / time.Duration(farLeft)
+}
+
+// SetHydrationPacing spreads hydration of slots more than hydratePaceNear
+// ahead of replay over budget per pass, instead of loading them in one burst
+// on the cores replay uses. Zero (the default) loads everything at once.
+func (r *UDPReceiver) SetHydrationPacing(budget time.Duration) {
+	if r == nil {
+		return
+	}
+	r.hydratePace.Store(int64(max(budget, 0)))
+}
+
+// hydratePass loads the spooled slots in [lo, hi] in ascending order. It
+// returns stop when the receiver is shutting down, and rerun when the window
+// moved during a paced wait, so the caller starts a new pass from the new lo
+// at once rather than finishing loads that are now further ahead.
+func (r *UDPReceiver) hydratePass(ctx context.Context, lo, hi uint64, hydrated map[uint64]bool) (stop, rerun bool) {
+	slots := r.spool.SlotsInRange(lo, hi)
+	budget := time.Duration(r.hydratePace.Load())
+	deadline := time.Now().Add(budget)
+	farLeft := 0
+	if budget > 0 {
+		for _, slot := range slots {
+			if slot > lo+hydratePaceNear {
+				farLeft++
 			}
 		}
 	}
+	for _, slot := range slots {
+		far := slot > lo+hydratePaceNear
+		if r.assembler.SlotCompleted(slot) {
+			hydrated[slot] = true
+			if far {
+				farLeft--
+			}
+			continue
+		}
+		if hydrated[slot] {
+			// Re-hydrate only if the assembler lost its state (reset).
+			if _, live := r.assembler.HeadShredDetail(slot); live {
+				if far {
+					farLeft--
+				}
+				continue
+			}
+		}
+		if budget > 0 {
+			if delay := hydratePaceDelay(slot, lo, farLeft, time.Until(deadline)); delay > 0 {
+				timer := time.NewTimer(delay)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return true, false
+				case <-r.hydrateKick:
+					timer.Stop()
+					return false, true
+				case <-timer.C:
+				}
+			}
+		}
+		if far {
+			farLeft--
+		}
+		work, ok := r.hydrateSlot(slot)
+		if !ok {
+			continue
+		}
+		hydrated[slot] = true
+		r.hydratedSlots.Add(1)
+		if r.hydrateObserved != nil {
+			r.hydrateObserved(slot)
+		}
+		if !r.submitCompletion(ctx, work, true) {
+			return true, false
+		}
+		select {
+		case <-ctx.Done():
+			return true, false
+		default:
+		}
+	}
+	return false, false
+}
+
+// hydrateSlot feeds one spooled slot into the assembler and returns the
+// completion work if the slot completed. ok is false if the spool could not
+// read the slot.
+func (r *UDPReceiver) hydrateSlot(slot uint64) (work *slotCompletionWork, ok bool) {
+	r.slotResetMu.RLock()
+	defer r.slotResetMu.RUnlock()
+	// Packets alias hydrateRead and are valid until the next hydrateSlot;
+	// ParseShred copies each one, so no shred refers to the buffer.
+	packets, err := r.spool.ReadSlotInto(slot, &r.hydrateRead)
+	if err != nil {
+		return nil, false
+	}
+	// Data shreds first: when they complete the slot, the coding shreds are
+	// never needed, so they are not parsed or held in slot state. Otherwise
+	// the coding shreds follow and drive erasure recovery as before. The
+	// assembler accepts shreds in any order, so the outcome is unchanged.
+	for pass := 0; pass < 2; pass++ {
+		wantCoding := pass == 1
+		for _, pkt := range packets {
+			if spooledCodingPacket(pkt) != wantCoding {
+				continue
+			}
+			shred, perr := ParseShred(pkt)
+			if perr != nil {
+				continue
+			}
+			if r.repairClient != nil {
+				r.repairClient.satisfyDataShred(shred)
+			}
+			candidate, aerr := r.assembler.addShredFrom(shred, false)
+			if aerr != nil || candidate == nil {
+				continue
+			}
+			return candidate, true
+		}
+	}
+	return nil, true
+}
+
+// spooledCodingPacket reports whether ParseShred would treat pkt as a coding
+// shred. Packets it cannot classify go in the first pass, where ParseShred
+// rejects them exactly as before.
+func spooledCodingPacket(pkt []byte) bool {
+	if len(pkt) <= shredVariantOffset {
+		return false
+	}
+	shredType, err := classifyVariant(pkt[shredVariantOffset])
+	return err == nil && shredType == ShredTypeCode
 }
 
 // PrioritizeStreamRepair also anchors bounded asynchronous child lookahead.
