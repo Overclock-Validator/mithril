@@ -279,3 +279,47 @@ func TestWorkAheadSealedViewCatchesProgramUpgrade(t *testing.T) {
 		t.Fatal("an early result survived the creation of an account it had found missing")
 	}
 }
+
+// A sealed context reports every direct parent-bank read, and parentReadsUnseen
+// counts the ones its view has no record of: reads that rest on the parent not
+// changing during the block, without the version check behind them.
+func TestWorkAheadParentReadsAreCheckedAgainstTheView(t *testing.T) {
+	seenFirst, never := testPk(41), testPk(42)
+	parent := accounts.NewMemAccountsWithLen(2)
+	for _, key := range []solana.PublicKey{seenFirst, never} {
+		if err := parent.SetAccountWithoutLock(key, &accounts.Account{Key: key, Lamports: 7}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base := &sealevel.SlotCtx{Accounts: accounts.NewOverlayAccounts(parent), ParentAccts: parent}
+	view := accounts.NewRecordingReader(base.Accounts.(*accounts.OverlayAccounts))
+	sealed := sealevel.NewSealedSlotCtx(base, view)
+	if sealed.ParentReadHook != nil {
+		t.Fatal("a derived context must not inherit a parent read hook")
+	}
+	var direct [][32]byte
+	sealed.ParentReadHook = func(key solana.PublicKey) { direct = append(direct, [32]byte(key)) }
+
+	// The usual shape: ask the slot's accounts (the view), then the parent.
+	if _, err := sealed.GetAccountShared(seenFirst); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sealed.GetParentAccount(seenFirst); err != nil {
+		t.Fatal(err)
+	}
+	if got := parentReadsUnseen(view, direct); len(direct) != 1 || got != 0 {
+		t.Fatalf("after a view read then a parent read: %d direct, %d unseen; want 1 and 0", len(direct), got)
+	}
+	// A parent read the view never saw is counted once, however often it repeats.
+	for range 3 {
+		if _, err := sealed.GetParentAccount(never); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := parentReadsUnseen(view, direct); len(direct) != 4 || got != 1 {
+		t.Fatalf("after unseen parent reads: %d direct, %d unseen; want 4 and 1", len(direct), got)
+	}
+	if got := parentReadsUnseen(nil, direct); got != 0 {
+		t.Fatalf("no view: %d unseen, want 0", got)
+	}
+}

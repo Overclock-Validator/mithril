@@ -176,6 +176,10 @@ type workAheadEntry struct {
 	// recording the version of every account read through it. Adoption requires
 	// every recorded read to be unchanged and no write to have been attempted.
 	view *accounts.RecordingReader
+	// parentReads (MITHRIL_WORK_AHEAD_LOG): keys the execution read from the
+	// parent bank directly, to be checked against what view recorded.
+	parentReadsMu sync.Mutex
+	parentReads   [][32]byte
 	// base: the declared accounts as captured; stable: no captured version
 	// changed while the execution ran (value check).
 	base   []*accounts.Account
@@ -209,9 +213,15 @@ type workAheadStats struct {
 	predictedPayer, verified, verifiedPredicted, verifyMismatch, verifiedNonce                   atomic.Int64
 	offerNs, overBudget, valueRescued                                                            atomic.Int64
 	// committing workers' time blocked on a running early execution: valid (waited) and doomed (abandoned)
-	waitedNs, abandonWaitNs      atomic.Int64
-	unjoined, wasteCapped        atomic.Int64 // doomed runs left running at their turn; admissions refused by the waste cap
-	sealedWrite, extraReads      atomic.Int64 // results that tried to write through the sealed view; accounts read outside the captured read set
+	waitedNs, abandonWaitNs atomic.Int64
+	unjoined, wasteCapped   atomic.Int64 // doomed runs left running at their turn; admissions refused by the waste cap
+	sealedWrite, extraReads atomic.Int64 // results that tried to write through the sealed view; accounts read outside the captured read set
+	// Diagnostic (MITHRIL_WORK_AHEAD_LOG): direct parent-bank reads by early
+	// executions, and how many of those keys the sealed view never recorded.
+	// The parent does not change during the block, so such a read is the same
+	// at the turn; a nonzero parentUnseen only names a read that rests on that
+	// alone instead of on the version check as well.
+	parentReads, parentUnseen    atomic.Int64
 	earlyDropped, earlyAbandoned atomic.Int64
 	// Diagnostic, record only: early executions whose offer was admitted only
 	// because the unchanged history let it pass a prerequisite the failure
@@ -785,6 +795,13 @@ func (w *workAhead) run(idx int) {
 	// writes, and the context's own bookkeeping is private. The block constants
 	// are shared with the real context (sealevel.NewSealedSlotCtx).
 	sealed := sealevel.NewSealedSlotCtx(w.slotCtx, e.view)
+	if workAheadLog {
+		sealed.ParentReadHook = func(key solana.PublicKey) {
+			e.parentReadsMu.Lock()
+			e.parentReads = append(e.parentReads, [32]byte(key))
+			e.parentReadsMu.Unlock()
+		}
+	}
 	captureTx := len(tx.Signatures) > 0 && txCaptureActive()
 	input := transactionExecutionInput(sealed, tx, w.txMeta(idx), workerArena, false, captureTx)
 	input.Speculative = true
@@ -844,6 +861,14 @@ func (w *workAhead) ran(idx int, e *workAheadEntry, output LoadAndExecuteTransac
 		// difference: a read outside it is one even if a captured key went unread)
 		if extra := e.view.ReadsOutside(e.keys); extra > 0 {
 			w.stats.extraReads.Add(int64(extra))
+		}
+		e.parentReadsMu.Lock()
+		direct := e.parentReads
+		e.parentReads = nil
+		e.parentReadsMu.Unlock()
+		w.stats.parentReads.Add(int64(len(direct)))
+		if unseen := parentReadsUnseen(e.view, direct); unseen > 0 {
+			w.stats.parentUnseen.Add(int64(unseen))
 		}
 	}
 	if e.abandoned {
@@ -1434,9 +1459,9 @@ func (w *workAhead) finish(slot uint64) {
 	w.funnel.report(slot)
 	if workAheadLog {
 		s := &w.stats
-		mlog.Log.Infof("work-ahead slot %d: offered %d offered-fail %d executed %d adopted %d waited %d invalid %d abandoned %d late %d no-arena %d panicked %d offer-us %d predicted-payer %d verified %d verified-predicted %d verify-mismatch %d verified-nonce %d over-budget %d wasted-kcu %d wasted-us %d value-rescued %d waited-us %d abandon-wait-us %d early-dropped %d early-abandoned %d unjoined %d waste-capped %d sealed-write %d extra-reads %d",
+		mlog.Log.Infof("work-ahead slot %d: offered %d offered-fail %d executed %d adopted %d waited %d invalid %d abandoned %d late %d no-arena %d panicked %d offer-us %d predicted-payer %d verified %d verified-predicted %d verify-mismatch %d verified-nonce %d over-budget %d wasted-kcu %d wasted-us %d value-rescued %d waited-us %d abandon-wait-us %d early-dropped %d early-abandoned %d unjoined %d waste-capped %d sealed-write %d extra-reads %d parent-reads %d parent-unseen %d",
 			slot, s.offered.Load(), s.offeredFail.Load(), s.executed.Load(), s.adopted.Load(), s.waited.Load(), s.invalid.Load(), s.abandoned.Load(), s.late.Load(), s.noArena.Load(), s.panicked.Load(), s.offerNs.Load()/1000,
-			s.predictedPayer.Load(), s.verified.Load(), s.verifiedPredicted.Load(), s.verifyMismatch.Load(), s.verifiedNonce.Load(), s.overBudget.Load(), w.wastedKCU.Load(), w.wastedNs.Load()/1000, s.valueRescued.Load(), s.waitedNs.Load()/1000, s.abandonWaitNs.Load()/1000, s.earlyDropped.Load(), s.earlyAbandoned.Load(), s.unjoined.Load(), s.wasteCapped.Load(), s.sealedWrite.Load(), s.extraReads.Load())
+			s.predictedPayer.Load(), s.verified.Load(), s.verifiedPredicted.Load(), s.verifyMismatch.Load(), s.verifiedNonce.Load(), s.overBudget.Load(), w.wastedKCU.Load(), w.wastedNs.Load()/1000, s.valueRescued.Load(), s.waitedNs.Load()/1000, s.abandonWaitNs.Load()/1000, s.earlyDropped.Load(), s.earlyAbandoned.Load(), s.unjoined.Load(), s.wasteCapped.Load(), s.sealedWrite.Load(), s.extraReads.Load(), s.parentReads.Load(), s.parentUnseen.Load())
 		if workAheadUnchanged {
 			h := &unchangedReasons
 			mlog.Log.Infof("work-ahead unchanged slot %d: queued %d executed %d adopted %d invalid %d adopted-kcu %d head-start-us %d | asked %d predicted %d payer-shared %d no-history %d few-observed %d last-changed %d low-rate %d",
@@ -1686,6 +1711,26 @@ func specSameInput(x, y *accounts.Account) bool {
 	}
 	return x.Key == y.Key && x.Lamports == y.Lamports && x.Owner == y.Owner && x.Executable == y.Executable &&
 		x.RentEpoch == y.RentEpoch && x.IsDummy == y.IsDummy && bytes.Equal(x.Data, y.Data)
+}
+
+// parentReadsUnseen counts the distinct keys in direct, read from the parent
+// bank without going through the view, that view has no record of.
+func parentReadsUnseen(view *accounts.RecordingReader, direct [][32]byte) int {
+	if view == nil || len(direct) == 0 {
+		return 0
+	}
+	seen := make(map[[32]byte]bool, len(direct))
+	for _, read := range view.Reads() {
+		seen[read.Key] = true
+	}
+	unseen := 0
+	for _, key := range direct {
+		if !seen[key] {
+			seen[key] = true
+			unseen++
+		}
+	}
+	return unseen
 }
 
 // overWasteCap reports whether the block's discarded early compute reached

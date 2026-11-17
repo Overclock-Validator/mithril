@@ -59,6 +59,7 @@ var derivedSlotCtxFields = map[string]string{
 	"PendingVoteCacheDeletes":   "private",
 	"VoteStakeDirty":            "private",
 	"TrackProgramCacheAdds":     "private",
+	"ParentReadHook":            "unset",
 	"ProgramCacheAddsMu":        "private",
 	"ProgramCacheAdds":          "private",
 }
