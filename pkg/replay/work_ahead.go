@@ -1694,14 +1694,38 @@ func (w *workAhead) overWasteCap() bool {
 	return workAheadWasteCapKCU > 0 && w.wastedKCU.Load() >= workAheadWasteCapKCU
 }
 
-// reserve claims the budget for launching tx's early execution: its requested
-// compute, if discarded work plus outstanding reservations leave room. Called
-// with e.mu held.
+// reservationKCU is the most compute an execution of tx can consume, in
+// thousands of CU rounded up: the limit the runtime itself derives from the
+// transaction's compute-budget instructions. requestedKCU, a scheduling weight
+// read from raw instruction bytes, is not that bound. A transaction whose
+// budget cannot be derived is charged the maximum, so a reservation never
+// understates what the run may use. Without a slot context (tests that build a
+// workAhead by hand) there is no feature set to derive it with, and the weight
+// stands in.
+func (w *workAhead) reservationKCU(tx *solana.Transaction) int64 {
+	const maxKCU = sealevel.MaxComputeUnitLimit/1000 + 1
+	if w.slotCtx == nil || w.slotCtx.Features == nil {
+		return int64(requestedKCU(tx))
+	}
+	instrs, _, _, err := instrsAndAcctMetasFromTx(tx, w.slotCtx.Features)
+	if err != nil {
+		return maxKCU
+	}
+	limits, err := sealevel.ComputeBudgetLimitsForTransaction(tx, instrs, w.slotCtx.Features)
+	if err != nil {
+		return maxKCU
+	}
+	return min(int64(limits.ComputeUnitLimit)/1000+1, maxKCU)
+}
+
+// reserve claims the budget for launching tx's early execution: the compute it
+// can consume at most (reservationKCU), if discarded work plus outstanding
+// reservations leave room. Called with e.mu held.
 func (w *workAhead) reserve(e *workAheadEntry, tx *solana.Transaction) bool {
 	if workAheadWasteBudgetKCU <= 0 {
 		return true
 	}
-	need := int64(requestedKCU(tx))
+	need := w.reservationKCU(tx)
 	for {
 		reserved := w.reservedKCU.Load()
 		if w.wastedKCU.Load()+reserved+need > workAheadWasteBudgetKCU {

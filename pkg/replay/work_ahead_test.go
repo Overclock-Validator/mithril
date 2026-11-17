@@ -717,6 +717,55 @@ func TestWorkAheadWasteBudget(t *testing.T) {
 	}
 }
 
+// The reservation is the compute limit the runtime derives, not the scheduling
+// weight: where the two disagree, or the budget cannot be derived at all, the
+// reservation must not be the smaller figure.
+func TestWorkAheadReservationUsesRuntimeComputeLimit(t *testing.T) {
+	slotCtx := &sealevel.SlotCtx{Accounts: accounts.NewOverlayAccounts(accounts.NewMemAccountsWithLen(1)), Features: features.NewFeaturesDefault()}
+	w := &workAhead{slotCtx: slotCtx}
+	setLimit := func(units uint32) solana.CompiledInstruction {
+		data := []byte{sealevel.ComputeBudgetInstrTypeSetComputeUnitLimit, 0, 0, 0, 0}
+		binary.LittleEndian.PutUint32(data[1:], units)
+		return solana.CompiledInstruction{ProgramIDIndex: 1, Data: data}
+	}
+	build := func(instrs ...solana.CompiledInstruction) *solana.Transaction {
+		return &solana.Transaction{Message: solana.Message{
+			AccountKeys:  []solana.PublicKey{testPk(1), addresses.ComputeBudgetProgramAddr, testPk(3)},
+			Instructions: instrs,
+		}}
+	}
+	const maxKCU = sealevel.MaxComputeUnitLimit/1000 + 1
+
+	// An explicit limit is reserved as given.
+	if got := w.reservationKCU(build(setLimit(500_000), solana.CompiledInstruction{ProgramIDIndex: 2})); got != 501 {
+		t.Fatalf("explicit 500,000 CU limit reserved %d kCU, want 501", got)
+	}
+	// A limit above the maximum is the maximum, as in the runtime.
+	if got := w.reservationKCU(build(setLimit(5_000_000), solana.CompiledInstruction{ProgramIDIndex: 2})); got != maxKCU {
+		t.Fatalf("oversized limit reserved %d kCU, want %d", got, maxKCU)
+	}
+	// A budget the runtime refuses (the limit set twice) is charged the maximum;
+	// the weight would have taken the last value, 1 kCU.
+	twice := build(setLimit(500_000), setLimit(1), solana.CompiledInstruction{ProgramIDIndex: 2})
+	if got, weight := w.reservationKCU(twice), int64(requestedKCU(twice)); got != maxKCU || weight >= got {
+		t.Fatalf("refused budget reserved %d kCU (weight %d), want the maximum %d", got, weight, maxKCU)
+	}
+	// With no limit instruction the reservation is the runtime's default for
+	// the transaction, whatever the weight guesses.
+	plain := build(solana.CompiledInstruction{ProgramIDIndex: 2}, solana.CompiledInstruction{ProgramIDIndex: 2})
+	instrs, _, _, err := instrsAndAcctMetasFromTx(plain, slotCtx.Features)
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits, err := sealevel.ComputeBudgetLimitsForTransaction(plain, instrs, slotCtx.Features)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := w.reservationKCU(plain), int64(limits.ComputeUnitLimit)/1000+1; got != want {
+		t.Fatalf("default budget reserved %d kCU, want %d", got, want)
+	}
+}
+
 // With MITHRIL_WORK_AHEAD_JOIN_DOOMED, claim joins an invalid early execution
 // that is still running before the canonical execution may proceed, so the two
 // never overlap.
