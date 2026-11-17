@@ -349,3 +349,28 @@ func TestWorkAheadPressure(t *testing.T) {
 		t.Fatalf("busy at drain %d, drain %d", p.busyAtDrain.Load(), p.drainNs.Load())
 	}
 }
+
+// The mark that a slot ran early executions belongs to one attempt at its
+// block: starting another attempt clears it, so a footer mismatch in an attempt
+// that ran none is an ordinary mismatch, not a speculation shutoff.
+func TestWorkAheadRanMarkIsPerAttempt(t *testing.T) {
+	workAheadTripped.Store(false)
+	defer workAheadTripped.Store(false)
+	const slot = 7001
+	markWorkAheadRan(slot)
+	markWorkAheadRan(slot + 1)
+	if !workAheadRanAt(slot) {
+		t.Fatal("mark not set")
+	}
+	// A new attempt at the slot begins (newBlockExecution does this).
+	clearWorkAheadRan(slot)
+	if workAheadRanAt(slot) || !workAheadRanAt(slot+1) {
+		t.Fatal("clearing one slot's mark must clear exactly that slot")
+	}
+	plain := &FooterBankhashMismatch{Slot: slot}
+	if err := workAheadFooterShutoff(plain); err != error(plain) || workAheadTripped.Load() {
+		t.Fatal("an attempt without early executions inherited an earlier attempt's mark")
+	}
+	clearWorkAheadRan(slot + 1)
+	clearWorkAheadRan(slot + 2) // absent: harmless
+}

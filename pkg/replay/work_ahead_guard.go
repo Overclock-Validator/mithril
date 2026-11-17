@@ -48,6 +48,16 @@ func markWorkAheadRan(slot uint64) {
 	workAheadRanSlots.slots[slot] = struct{}{}
 }
 
+// clearWorkAheadRan forgets that slot ran early executions. It is called when
+// a new attempt at a slot's block begins, so the mark always describes the
+// attempt whose bank hash is about to be checked: a retry, or another block at
+// the same slot, does not inherit the mark of an attempt that was discarded.
+func clearWorkAheadRan(slot uint64) {
+	workAheadRanSlots.mu.Lock()
+	delete(workAheadRanSlots.slots, slot)
+	workAheadRanSlots.mu.Unlock()
+}
+
 func workAheadRanAt(slot uint64) bool {
 	workAheadRanSlots.mu.Lock()
 	defer workAheadRanSlots.mu.Unlock()

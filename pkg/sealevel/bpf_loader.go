@@ -2811,7 +2811,11 @@ func UpgradeableLoaderClose(execCtx *ExecutionCtx, txCtx *TransactionCtx, instrC
 					if err != nil {
 						return err
 					}
-					execCtx.SlotCtx.AccountsDb.RemoveProgramFromCache(closeKey)
+					// An early execution publishes nothing (loader instructions
+					// are never executed early; this does not rely on that).
+					if !execCtx.Speculative {
+						execCtx.SlotCtx.AccountsDb.RemoveProgramFromCache(closeKey)
+					}
 				}
 
 			default:

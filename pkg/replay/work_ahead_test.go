@@ -349,6 +349,21 @@ func TestWorkAheadPredictPayer(t *testing.T) {
 	e.unfinished[0] = 0
 	e.keys, e.versions, _ = workAheadReadSet(slotCtx, overlay, w.txs[1])
 	overrides := w.predictPayers(e, 1)
+	// The execution's input and the value checked at the turn are separate
+	// objects with the same content: changing the input must not move the
+	// expectation.
+	for key, input := range overrides {
+		expected := e.predicted[[32]byte(key)]
+		if expected == nil || expected == input || !specSameInput(expected, input) {
+			t.Fatalf("expected payer value for %s must be an equal, separate copy of the execution's input", key)
+		}
+		saved := input.Lamports
+		input.Lamports -= 12345
+		if expected.Lamports != saved {
+			t.Fatal("mutating the execution's payer changed the value the turn checks against")
+		}
+		input.Lamports = saved
+	}
 	if got := overrides[payer]; got == nil || got.Lamports != 995_000 || got.RentEpoch != 7 {
 		t.Fatalf("predicted payer = %+v, want 995000 lamports and the loaded rent epoch", got)
 	}

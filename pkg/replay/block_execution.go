@@ -116,6 +116,9 @@ func newBlockExecution(
 	// Block accounts/sysvars load through the unrooted tail (overlay→durable)
 	// so execution sees confirmed-but-unrooted state.
 	exec.blockSrc = tail
+	if block != nil {
+		clearWorkAheadRan(block.Slot) // this attempt's early executions set it again
+	}
 
 	ctx, task := trace.NewTask(context.Background(), "ProcessBlock")
 	exec.ctx, exec.task = ctx, task

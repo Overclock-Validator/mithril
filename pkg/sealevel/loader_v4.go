@@ -605,7 +605,7 @@ func LoaderV4ProcessDeploy(execCtx *ExecutionCtx) error {
 	}
 
 	entry := &accountsdb.ProgramCacheEntry{Program: programObj, DeploymentSlot: currentSlot}
-	if !execCtx.IsSimulation {
+	if !execCtx.IsSimulation && !execCtx.Speculative {
 		execCtx.SlotCtx.AccountsDb.AddProgramToCache(program.Key(), entry)
 		execCtx.SlotCtx.RecordProgramCacheAdd(program.Key())
 	}
@@ -661,7 +661,7 @@ func LoaderV4ProcessRetract(execCtx *ExecutionCtx) error {
 		return err
 	}
 
-	if !execCtx.IsSimulation {
+	if !execCtx.IsSimulation && !execCtx.Speculative {
 		execCtx.SlotCtx.AccountsDb.RemoveProgramFromCache(program.Key())
 	}
 	return nil

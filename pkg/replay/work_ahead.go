@@ -65,6 +65,11 @@ var (
 	workAheadEnabled    = os.Getenv("MITHRIL_WORK_AHEAD") == "1"
 	workAheadMaxReaders = specShadowEnvInt("MITHRIL_WORK_AHEAD_MAX_READERS", 4)
 	workAheadLog        = os.Getenv("MITHRIL_WORK_AHEAD_LOG") == "1"
+	// workAheadArenaCount is also the bound on memory held by early results:
+	// an early execution takes one arena before it starts (none free: it is
+	// not launched) and keeps it until its result is adopted or dropped, so at
+	// most this many are running or finished and waiting at any moment, each
+	// holding one transaction's accounts (the runtime's loaded-data limit).
 	workAheadArenaCount = specShadowEnvInt("MITHRIL_WORK_AHEAD_ARENAS", 16)
 	workAheadCancel     = os.Getenv("MITHRIL_WORK_AHEAD_CANCEL") == "1"
 	// MITHRIL_WORK_AHEAD_EARLY_INVALIDATE=1: when a prerequisite that an early
@@ -1278,8 +1283,11 @@ func (w *workAhead) predictPayers(e *workAheadEntry, tx int) map[solana.PublicKe
 				overrides = make(map[solana.PublicKey]*accounts.Account)
 				e.predicted = make(map[[32]byte]*accounts.Account)
 			}
+			// The execution is handed one object and the turn's check keeps
+			// another: what the result is validated against cannot be changed
+			// by anything the execution, or code it calls, does to its input.
 			overrides[key] = predicted
-			e.predicted[[32]byte(key)] = predicted
+			e.predicted[[32]byte(key)] = predicted.Clone()
 		}
 	}
 	return overrides
