@@ -489,7 +489,7 @@ func (authWithSeed *VoteInstrAuthorizeWithSeed) UnmarshalWithDecoder(decoder *bi
 	}
 	copy(authWithSeed.NewAuthority[:], newAuthority)
 
-	return nil
+	return checkWithinDeserializationLimit(decoder)
 }
 
 func (acws *VoteInstrAuthorizeCheckedWithSeed) UnmarshalWithDecoder(decoder *bin.Decoder) error {
@@ -511,7 +511,7 @@ func (acws *VoteInstrAuthorizeCheckedWithSeed) UnmarshalWithDecoder(decoder *bin
 		return InstrErrInvalidInstructionData
 	}
 
-	return nil
+	return checkWithinDeserializationLimit(decoder)
 }
 
 func (lockoutOffset *LockoutOffset) UnmarshalWithDecoder(decoder *bin.Decoder) error {
@@ -619,7 +619,7 @@ func (towerSync *VoteInstrTowerSync) UnmarshalWithDecoder(decoder *bin.Decoder) 
 	}
 	copy(towerSync.Hash[:], hashBytes)
 
-	hasTimestamp, err := decoder.ReadBool()
+	hasTimestamp, err := ReadBool(decoder)
 	if err != nil {
 		return err
 	}
@@ -874,6 +874,10 @@ func VoteProgramExecute(execCtx *ExecutionCtx) error {
 				}
 			}
 
+			if voteAlpenglowMigrationSucceeded(execCtx) {
+				return InstrErrInvalidInstructionData
+			}
+
 			err = checkAcctForSlotHashesSysvar(txCtx, instrCtx, 1)
 			if err != nil {
 				return err
@@ -917,6 +921,10 @@ func VoteProgramExecute(execCtx *ExecutionCtx) error {
 				}
 			}
 
+			if voteAlpenglowMigrationSucceeded(execCtx) {
+				return InstrErrInvalidInstructionData
+			}
+
 			var slotHashes SysvarSlotHashes
 			slotHashes, err = ReadSlotHashesSysvar(execCtx)
 			if err != nil {
@@ -953,6 +961,10 @@ func VoteProgramExecute(execCtx *ExecutionCtx) error {
 					return InstrErrInvalidInstructionData
 				}
 				updateVoteState = &compactUpdateVoteState.UpdateVoteState
+			}
+
+			if voteAlpenglowMigrationSucceeded(execCtx) {
+				return InstrErrInvalidInstructionData
 			}
 
 			var slotHashes SysvarSlotHashes
@@ -1060,16 +1072,20 @@ func VoteProgramExecute(execCtx *ExecutionCtx) error {
 				var towerSyncSwitch VoteInstrTowerSyncSwitch
 				err = towerSyncSwitch.UnmarshalWithDecoder(decoder)
 				if err != nil {
-					return err
+					return InstrErrInvalidInstructionData
 				}
 				towerSyncInstr = &towerSyncSwitch.TowerSync
 			} else {
 				var towerSync VoteInstrTowerSync
 				err = towerSync.UnmarshalWithDecoder(decoder)
 				if err != nil {
-					return err
+					return InstrErrInvalidInstructionData
 				}
 				towerSyncInstr = &towerSync
+			}
+
+			if voteAlpenglowMigrationSucceeded(execCtx) {
+				return InstrErrInvalidInstructionData
 			}
 
 			if !execCtx.Features.IsActive(features.EnableTowerSyncIx) {
