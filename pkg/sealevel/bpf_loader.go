@@ -1241,6 +1241,17 @@ func deserializeParametersUnaligned(execCtx *ExecutionCtx, parameterBytes []byte
 	return nil
 }
 
+// executionSyscalls returns the registry every program executes with: the
+// syscalls execCtx's feature set enables. Its answers depend on that set alone.
+func executionSyscalls(execCtx *ExecutionCtx) sbpf.SyscallRegistry {
+	return func(u uint32) (sbpf.Syscall, bool) {
+		return Syscalls(&execCtx.Features, false, u)
+	}
+}
+
+// executeLoadedProgram runs program. syscallRegistry must be
+// executionSyscalls(execCtx): the VM is told the registry's identity is that
+// of execCtx's feature set.
 func executeLoadedProgram(execCtx *ExecutionCtx, program *sbpf.Program, syscallRegistry sbpf.SyscallRegistry) error {
 	txCtx := execCtx.TransactionContext
 	instrCtx, err := txCtx.CurrentInstructionCtx()
@@ -1296,12 +1307,17 @@ func executeLoadedProgram(execCtx *ExecutionCtx, program *sbpf.Program, syscallR
 		Input:          parameterBytes,
 		InputDataVaddr: inputDataVaddr,
 		Syscalls:       syscallRegistry,
-		MaxCU:          int(execCtx.ComputeMeter.Remaining()),
-		ComputeMeter:   &execCtx.ComputeMeter,
-		Context:        execCtx,
-		TxSignature:    execCtx.TransactionContext.Signature,
-		ProgramId:      programId,
-		InputRegions:   inputRegions,
+		// The registry answers from the feature set alone, so the set (and
+		// the count of in-place feature changes, as for cached programs)
+		// identifies it.
+		SyscallsID:   execCtx.Features.Identity(),
+		SyscallsGen:  features.Mutations(),
+		MaxCU:        int(execCtx.ComputeMeter.Remaining()),
+		ComputeMeter: &execCtx.ComputeMeter,
+		Context:      execCtx,
+		TxSignature:  execCtx.TransactionContext.Signature,
+		ProgramId:    programId,
+		InputRegions: inputRegions,
 		DisableStackFrameGaps: execCtx.Features.IsActive(features.VirtualAddressSpaceAdjustments) ||
 			!program.SbpfVersion.StackFrameGaps(),
 	}
@@ -1341,12 +1357,13 @@ func executeLoadedProgram(execCtx *ExecutionCtx, program *sbpf.Program, syscallR
 	return normalizeProgramRunErr(runErr)
 }
 
-func executeProgramFromBytes(execCtx *ExecutionCtx, programAddr solana.PublicKey, programData []byte, syscallRegistry sbpf.SyscallRegistry) error {
-	return executeProgramFromSource(execCtx, programAddr, programData, syscallRegistry, false)
+func executeProgramFromBytes(execCtx *ExecutionCtx, programAddr solana.PublicKey, programData []byte) error {
+	return executeProgramFromSource(execCtx, programAddr, programData, false)
 }
 
-func executeProgramFromSource(execCtx *ExecutionCtx, programAddr solana.PublicKey, programData []byte, syscallRegistry sbpf.SyscallRegistry, immutable bool) error {
+func executeProgramFromSource(execCtx *ExecutionCtx, programAddr solana.PublicKey, programData []byte, immutable bool) error {
 	start := time.Now()
+	syscallRegistry := executionSyscalls(execCtx)
 	// The caller has already validated the bank-visible loader metadata. Never
 	// let a global cache hit bypass that validation or select a different fork.
 	if entry, ok := execCtx.SlotCtx.AccountsDb.MaybeGetProgramFromCache(programAddr); ok {
@@ -1677,11 +1694,7 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 
 	programAcct.Drop()
 
-	syscallRegistry := sbpf.SyscallRegistry(func(u uint32) (sbpf.Syscall, bool) {
-		return Syscalls(&execCtx.Features, false, u)
-	})
-
-	err = executeProgramFromSource(execCtx, programAcctKey, programBytes, syscallRegistry, immutableProgramBytes)
+	err = executeProgramFromSource(execCtx, programAcctKey, programBytes, immutableProgramBytes)
 
 	return err
 }

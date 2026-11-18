@@ -77,6 +77,9 @@ type blockExecution struct {
 
 	txFeeAccumulator fees.TxFeeInfoAccumulator
 	totalCU          uint64
+	// computeUnits is what each transaction consumed, in block order: set
+	// whole by ProcessBlock, grown group by group by streaming execution.
+	computeUnits []uint64
 
 	// Retained across global metric resets while a speculative stream waits.
 	accountLoader metrics.AccountLoader
@@ -399,6 +402,7 @@ func (exec *blockExecution) executeTransactionGroup(txs []*solana.Transaction, i
 		exec.totalCU += computeUnits[idx]
 		exec.txFeeAccumulator.Add(txFeeInfo)
 	}
+	exec.computeUnits = append(exec.computeUnits, computeUnits...)
 	exec.slotCtx.TotalComputeUnitsConsumed = exec.totalCU
 	exec.groups++
 	metrics.GlobalBlockReplay.StreamingExecution.Groups++
@@ -572,6 +576,19 @@ func (exec *blockExecution) runTransactionGroup(txs []*solana.Transaction, execu
 	return feeInfos, computeUnits, nil
 }
 
+// executedTransactions returns the block's transactions in block order as this
+// bank executed them, with their address-table accounts resolved. A streamed
+// bank executed copies of the transactions it received before the block was
+// complete (the block's own objects stay unresolved), so its executed list is
+// the one built group by group; a whole-block bank resolves and executes the
+// block's transactions in place.
+func (exec *blockExecution) executedTransactions() []*solana.Transaction {
+	if exec.groups > 0 {
+		return exec.transactions
+	}
+	return exec.block.Transactions
+}
+
 // UnprocessableTransactionError reports the first transaction, by block index,
 // that produced no fee result. Instruction failures still carry charged fees
 // and remain valid block entries. A missing fee result means transaction
@@ -594,13 +611,28 @@ func unprocessableTransactionError(index int, err error) error {
 	return &UnprocessableTransactionError{Index: index, Err: err}
 }
 
-// finalize runs the end-of-block phases over the open SlotCtx: fees to the
+// finalize completes the bank once every transaction has executed. It starts
+// the block's longest-chain measurement on its own goroutine and runs the
+// end-of-block tail beside it; the replay loop collects the measurement when
+// it writes the block's timing row. A bank whose tail fails is abandoned, so
+// its measurement is joined here, before the caller discards the bank.
+func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
+	chain := blockLongestChain.start(exec.slotCtx, exec.executedTransactions(), exec.computeUnits)
+	slotCtx, err := exec.finalizeTail()
+	if err != nil {
+		blockLongestChain.abandon(chain)
+		return nil, err
+	}
+	return slotCtx, nil
+}
+
+// finalizeTail runs the end-of-block phases over the open SlotCtx: fees to the
 // leader, rent, incinerator, the Alpenglow footer clock and vote rewards, bank
 // sysvar finalization, bank hash, footer verification, state publication and
 // transaction status commit. It is the unchanged tail of ProcessBlock and is
 // shared by streaming execution, which calls it once the complete block has
 // been matched against the executed prefix.
-func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
+func (exec *blockExecution) finalizeTail() (*sealevel.SlotCtx, error) {
 	block := exec.block
 	slotCtx := exec.slotCtx
 	tail := exec.tail
@@ -681,6 +713,9 @@ func (exec *blockExecution) finalize() (*sealevel.SlotCtx, error) {
 			writeFooterBankhashMismatchArtifact(footerVerificationErr, block, slotCtx, writableAccts, modifiedAccts)
 			return nil, footerVerificationErr
 		}
+	}
+	if err := verifyCaptureBankHash(block.Slot, slotCtx.FinalBankhash); err != nil {
+		return nil, err
 	}
 
 	// Bankhash consensus enforcement is handled in the replay loop (not here)

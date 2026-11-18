@@ -38,6 +38,7 @@ require (
 	github.com/mr-tron/base58 v1.2.0
 	github.com/nixberg/chacha-rng-go v0.1.0
 	github.com/panjf2000/ants/v2 v2.10.0
+	github.com/pelletier/go-toml/v2 v2.2.4
 	github.com/pierrec/lz4/v4 v4.1.22
 	github.com/prometheus/client_golang v1.20.4
 	github.com/prometheus/client_model v0.6.2 // Indirect dependency
@@ -131,7 +132,6 @@ require (
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/oasisprotocol/curve25519-voi v0.0.0-20251114093237-2ab5a27a1729 // indirect
 	github.com/onsi/gomega v1.27.6 // indirect
-	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/prometheus/common v0.67.4 // indirect

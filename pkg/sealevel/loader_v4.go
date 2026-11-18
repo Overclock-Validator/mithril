@@ -7,7 +7,6 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/cu"
 	"github.com/Overclock-Validator/mithril/pkg/features"
-	"github.com/Overclock-Validator/mithril/pkg/sbpf"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 )
@@ -297,13 +296,9 @@ func LoaderV4Execute(execCtx *ExecutionCtx) error {
 
 		programBytes = programDataAcct.Data[loaderV4ProgramDataOffset:]
 
-		syscallRegistry := sbpf.SyscallRegistry(func(u uint32) (sbpf.Syscall, bool) {
-			return Syscalls(&execCtx.Features, false, u)
-		})
-
 		program.Drop()
 
-		err = executeProgramFromBytes(execCtx, program.Key(), programBytes, syscallRegistry)
+		err = executeProgramFromBytes(execCtx, program.Key(), programBytes)
 
 	}
 

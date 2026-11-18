@@ -386,6 +386,17 @@ func (blockTimestamp *BlockTimestamp) MarshalWithEncoder(encoder *bin.Encoder) e
 	return err
 }
 
+// lockoutCapacityHint is the deque capacity to reserve for a lockout count read
+// from account data. The count is untrusted: a crafted account can claim up to
+// 2^64-1 entries, and passing that to SetBaseCap either loops forever or makes
+// the first PushBack request an impossible allocation. Agave reserves
+// min(count, MAX_LOCKOUT_HISTORY) and lets the read loop fail at the end of the
+// data (solana-vote-interface vote_state_deserialize.rs); do the same, so the
+// decode result is unchanged and only the reservation is bounded.
+func lockoutCapacityHint(numLockouts uint64) int {
+	return int(min(numLockouts, MaxLockoutHistory))
+}
+
 func (voteState *VoteState0_23_5) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 	nodePk, err := decoder.ReadBytes(solana.PublicKeyLength)
 	if err != nil {
@@ -426,7 +437,7 @@ func (voteState *VoteState0_23_5) UnmarshalWithDecoder(decoder *bin.Decoder) err
 	}
 
 	voteState.Votes.Clear()
-	voteState.Votes.SetBaseCap(int(numLockouts))
+	voteState.Votes.SetBaseCap(lockoutCapacityHint(numLockouts))
 	for count := uint64(0); count < numLockouts; count++ {
 		var lockout VoteLockout
 		err = lockout.UnmarshalWithDecoder(decoder)
@@ -749,7 +760,7 @@ func (voteState *VoteState1_14_11) UnmarshalWithDecoder(decoder *bin.Decoder) er
 	}
 
 	voteState.Votes.Clear()
-	voteState.Votes.SetBaseCap(int(numLockouts))
+	voteState.Votes.SetBaseCap(lockoutCapacityHint(numLockouts))
 	for count := uint64(0); count < numLockouts; count++ {
 		var lockout VoteLockout
 		err = lockout.UnmarshalWithDecoder(decoder)
@@ -896,7 +907,7 @@ func (voteState *VoteState) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 	}
 
 	voteState.Votes.Clear()
-	voteState.Votes.SetBaseCap(int(numLockouts))
+	voteState.Votes.SetBaseCap(lockoutCapacityHint(numLockouts))
 	for count := uint64(0); count < numLockouts; count++ {
 		var landedVote LandedVote
 		err = landedVote.UnmarshalWithDecoder(decoder)
@@ -1083,7 +1094,7 @@ func (voteState *VoteState4) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 	}
 
 	voteState.Votes.Clear()
-	voteState.Votes.SetBaseCap(int(numLockouts))
+	voteState.Votes.SetBaseCap(lockoutCapacityHint(numLockouts))
 	for count := uint64(0); count < numLockouts; count++ {
 		var landedVote LandedVote
 		err = landedVote.UnmarshalWithDecoder(decoder)

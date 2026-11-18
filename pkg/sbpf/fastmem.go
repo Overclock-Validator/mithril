@@ -20,6 +20,7 @@ type memRegion struct {
 	gapBit  uint64
 	gapMask uint64
 	dirty   uint64 // 4 KiB page bitmap of fast-path writes (stack/heap only matter)
+	_       uint64 // pads the record to 64 bytes, so indexing the table is a shift
 }
 
 // emptyRegion never matches any access.

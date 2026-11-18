@@ -9,6 +9,7 @@ import (
 
 	bls12381 "github.com/Overclock-Validator/gnark-crypto/ecc/bls12-381"
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
+	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/alpenglow"
 	"github.com/Overclock-Validator/mithril/pkg/bankhash"
 	b "github.com/Overclock-Validator/mithril/pkg/block"
@@ -258,7 +259,7 @@ func TestPreparedLeaderVoteRewardsMatchSynchronousStateAndHash(t *testing.T) {
 	voteState.V4.NodePubkey = node
 	voteData := make([]byte, sealevel.VoteStateV4Size)
 	require.NoError(t, sealevel.WriteVersionedVoteStateInPlace(voteData, voteState))
-	parent := &accounts.Account{Key: vote, Data: voteData, Lamports: 1_000_000}
+	parent := &accounts.Account{Key: vote, Owner: addresses.VoteProgramAddr, Data: voteData, Lamports: 1_000_000}
 	newBank := func(replay bool) *sealevel.SlotCtx {
 		ctx := &sealevel.SlotCtx{Slot: slot, Epoch: epoch, ParentSlot: slot - 1,
 			Features: active, Replay: replay, Accounts: accounts.NewMemAccounts(), ParentAccts: accounts.NewMemAccounts(),

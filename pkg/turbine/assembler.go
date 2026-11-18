@@ -76,6 +76,10 @@ type SlotAssembler struct {
 	// onComplete fires when a slot fully assembles (all data shreds
 	// 0..lastIndex held) — the completeness signal the shred spool journals.
 	onComplete func(slot uint64, lastIndex uint32, shreds uint32)
+	// completedShreds, when set, receives a completed slot's data shreds
+	// (received and recovered) under the assembler lock, before the slot's
+	// state is dropped. Only RecoverSlotDataShreds sets it.
+	completedShreds func(state *slotState)
 	// Configured before ingestion; tests may replace it with a blocking probe.
 	// Production uses the process-wide bounded transaction verifier.
 	verifyTransactions func(context.Context, *block.Block) error
@@ -123,6 +127,13 @@ type slotState struct {
 	firstShredAt   time.Time
 	fullAt         time.Time
 	repairedShreds int
+	// lastReceivedNanos is the kernel receive time of the most recently
+	// accepted shred (zero when unknown); fullReceivedNanos keeps it for the
+	// shred whose acceptance made the slot full.
+	lastReceivedNanos int64
+	fullReceivedNanos int64
+	// recoveredShreds counts data shreds rebuilt from coding shreds.
+	recoveredShreds int
 	// completing makes the immutable full state a single-owner generation token.
 	completing      bool
 	batchIndex      *entryBatchIndex
@@ -347,6 +358,7 @@ func (a *SlotAssembler) addShredFromWithRoot(shred *Shred, fromRepair bool, root
 	}
 	state.traceAcceptedShred(shred, source)
 	a.notePrefetchShredLocked(state, shred)
+	state.lastReceivedNanos = shred.ReceivedNanos
 	if state.firstShredAt.IsZero() {
 		state.firstShredAt = time.Now()
 	}
@@ -372,6 +384,7 @@ func (a *SlotAssembler) addShredFromWithRoot(shred *Shred, fromRepair bool, root
 			state.traceAcceptedShred(recoveredShred, source)
 			a.notePrefetchShredLocked(state, recoveredShred)
 			a.recoveredDataShreds++
+			state.recoveredShreds++
 		}
 	}
 
@@ -397,6 +410,7 @@ func (a *SlotAssembler) claimCompletionLocked(state *slotState, reportNonCanonic
 	observeCollection := state.fullAt.IsZero()
 	if observeCollection {
 		state.fullAt = now
+		state.fullReceivedNanos = state.lastReceivedNanos
 		if state.slot > a.highestFullSlot {
 			a.highestFullSlot = state.slot
 		}
@@ -555,6 +569,9 @@ func (a *SlotAssembler) finalizeCompletion(work *slotCompletionWork, processed p
 	}
 
 	state.streamCompleted = true
+	if a.completedShreds != nil {
+		a.completedShreds(state)
+	}
 	a.releasePrefetchLocked(state)
 	delete(a.slots, state.slot)
 	a.completedSlots[state.slot] = struct{}{}
@@ -565,7 +582,12 @@ func (a *SlotAssembler) finalizeCompletion(work *slotCompletionWork, processed p
 	if !state.fullAt.IsZero() {
 		blk.ShredFullNanos = state.fullAt.UnixNano()
 	}
+	blk.ShredFullReceivedNanos = state.fullReceivedNanos
 	blk.RepairedShreds = state.repairedShreds
+	blk.RecoveredShreds = state.recoveredShreds
+	if state.haveLast {
+		blk.DataShreds = int(state.lastIndex) + 1
+	}
 	onComplete := a.onComplete
 	lastIndex := state.lastIndex
 	a.mu.Unlock()

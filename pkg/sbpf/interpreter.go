@@ -52,6 +52,10 @@ type Interpreter struct {
 	// callTargets[pc] is the resolved internal-function target of the `call imm`
 	// at pc (or -1). Computed once per Program at load time.
 	callTargets []int64
+	// fastCalls is callTargets when every slot with a target there is an
+	// internal call under this invocation's registry, so the registry need
+	// not be asked (Program.unshadowedCallTargets); otherwise nil.
+	fastCalls []int64
 
 	// Fast-path translation table indexed by (vaddr >> 32); see fastmem.go.
 	regions [numFastRegions]memRegion
@@ -136,6 +140,7 @@ func NewInterpreter(p *Program, opts *VMOpts) *Interpreter {
 		programId:         opts.ProgramId,
 		txSignature:       opts.TxSignature,
 		callTargets:       p.CallTargets,
+		fastCalls:         p.unshadowedCallTargets(opts.SyscallsID, opts.SyscallsGen, opts.Syscalls),
 	}
 	ip.initRegions()
 	return ip
@@ -305,7 +310,16 @@ func (ip *Interpreter) Run() (ret uint64, cuConsumed uint64, err error) {
 	pqr := ip.sbpfVersion.EnablePqr()
 	staticSyscalls := ip.sbpfVersion.EnableStaticSyscalls()
 	callTargets := ip.callTargets
+	fastCalls := ip.fastCalls
 	fast := ip.fastFlags()
+	// Non-nil when the amd64 assembly loop is enabled.
+	asmTable := ip.asmLoopTable(fast)
+	var asmText *Slot
+	var asmCalls *int64
+	if asmTable != nil {
+		asmText = &text[0]
+		asmCalls = ip.asmCalls()
+	}
 
 	// Instruction metering (mirrors Agave's due_insn_count / previous_instruction_meter):
 	// count executed instructions locally and only sync with the shared compute
@@ -341,7 +355,21 @@ mainLoop:
 		// Common instructions run in the call-free loop; it returns at the
 		// first instruction that needs the general path below.
 		if !tracing && useFastLoop {
-			pc, due = ip.runFast(&r, pc, due, budget, fast)
+			if asmTable != nil {
+				// The assembly loop has runFast's contract: it stops, with pc
+				// and due exact, at the first instruction it leaves to the
+				// general path below. One call covers at most asmChunk
+				// instructions, because assembly cannot be preempted.
+				rem := min(budget-due, asmChunk)
+				var left uint64
+				pc, left = runAsmLoop(asmText, int64(len(text)), &r, &ip.regions, asmTable, &ip.stack, pc, rem, asmCalls)
+				due += rem - left
+				if left == 0 && due != budget {
+					pc, due = ip.runAsmChunks(&r, pc, due, budget, asmTable)
+				}
+			} else {
+				pc, due = ip.runFast(&r, pc, due, budget, fast)
+			}
 		}
 
 		// Fetch
@@ -785,7 +813,15 @@ mainLoop:
 					err = ExcUnsupportedInstruction
 				}
 			} else {
-				if sc, ok := ip.syscalls(ins.Uimm()); ok {
+				if fastCalls != nil && fastCalls[pc] >= 0 {
+					// An internal call that no syscall of this invocation's
+					// registry shadows: the lookup below would fail.
+					target := fastCalls[pc]
+					if !ip.stack.Push(&r, pc+1) {
+						err = ExcCallDepth
+					}
+					pc = target
+				} else if sc, ok := ip.syscalls(ins.Uimm()); ok {
 					flushDue()
 					r[0], err = sc.Invoke(ip, r[1], r[2], r[3], r[4], r[5])
 					reloadBudget()
@@ -1208,8 +1244,17 @@ func (ip *Interpreter) Translate(addr uint64, size uint64, write bool) ([]byte, 
 
 	ptr, err := ip.translateInternal(addr, size, write)
 	if err != nil {
-		pc, filename, line, _ := runtime.Caller(1)
-		mlog.Log.Debugf("[error] in %s[%s:%d] %v. calling translate on addr = %x, size = %d", runtime.FuncForPC(pc).Name(), filename, line, err, addr, size)
+		// The arguments are the cost here, not the logging: runtime.Caller
+		// unwinds the stack and FuncForPC looks up a symbol, and Go evaluates
+		// both before Debugf can discard the line. A node runs at error level,
+		// so every failed translate paid for a line nobody read. A failed
+		// translate ends the program with an access violation, which is
+		// ordinary for failing mainnet transactions and common in conformance
+		// fixtures.
+		if mlog.Log.DebugEnabled() {
+			pc, filename, line, _ := runtime.Caller(1)
+			mlog.Log.Debugf("[error] in %s[%s:%d] %v. calling translate on addr = %x, size = %d", runtime.FuncForPC(pc).Name(), filename, line, err, addr, size)
+		}
 		return nil, err
 	}
 

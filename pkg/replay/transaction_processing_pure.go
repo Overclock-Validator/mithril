@@ -39,8 +39,8 @@ type LoadAndExecuteTransactionInput struct {
 	// leaves this false to retain the rich result.
 	LeanResult bool
 	// SkipTimingMetrics omits the detailed transaction and instruction-dispatch
-	// timings for leader execution. Replay and simulation retain their default
-	// instrumentation; program-specific instrumentation is independent.
+	// timings for leader execution. Replay retains them unless SkipPhaseTimers
+	// is set; program-specific instrumentation is independent.
 	SkipTimingMetrics bool
 	// TimingRecorder is owned by the calling worker, never retained in a result.
 	TimingRecorder *metrics.TransactionTimings
