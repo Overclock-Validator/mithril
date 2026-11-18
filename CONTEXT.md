@@ -17,6 +17,11 @@ This is non-negotiable. Mithril is a verifying full node - its entire purpose is
 
 **Before ANY change, verify:** Does this produce identical state to Agave/Firedancer at the same slot?
 
+**High-risk areas:** epoch boundaries, feature gates, fees and rent, account storage and hashing, the VM and
+loaders, sysvars, nonces and transaction age, Alpenglow consensus, parallel and speculative replay, snapshots and
+restarts. Changes there need the extra checks in [docs/HIGH-RISK-CHANGES.md](docs/HIGH-RISK-CHANGES.md); name the
+applicable entry in the PR.
+
 ---
 
 ## AI Guidelines
