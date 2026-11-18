@@ -45,6 +45,21 @@ type repairAwareTVUPeers struct {
 
 func (p *repairAwareTVUPeers) RepairPeers() []gossip.RepairPeer { return p.repairPeers }
 
+type repairLookupTVUPeers struct{ *repairAwareTVUPeers }
+
+func (p *repairLookupTVUPeers) RepairPeerForAddr(addr *net.UDPAddr) (gossip.Pubkey, bool) {
+	for _, peer := range p.repairPeers {
+		if sameUDPAddr(peer.Addr, addr) {
+			return peer.Pubkey, true
+		}
+	}
+	return gossip.Pubkey{}, false
+}
+
+func (p *repairLookupTVUPeers) RepairPeers() []gossip.RepairPeer {
+	panic("source lookup must not allocate a repair-peer snapshot, even on a miss")
+}
+
 func (s *scriptedBatchSender) Send(_ []byte, peers []*net.UDPAddr) (int, error) {
 	s.requests = append(s.requests, append([]*net.UDPAddr(nil), peers...))
 	if len(s.results) == 0 {
@@ -331,21 +346,22 @@ func TestRetransmitterClassifiesInvalidParentSources(t *testing.T) {
 	nodes := NewRetransmitClusterNodes(ClusterNodesConfig{
 		Self: peer, TVUPeers: peers.peers, Stakes: map[solana.PublicKey]uint64{leader: 20, peer: 10},
 	})
-	retransmitter := &Retransmitter{cfg: RetransmitConfig{Peers: peers}}
+	for _, source := range []TVUPeerSource{peers, &repairLookupTVUPeers{peers}} {
+		retransmitter := &Retransmitter{cfg: RetransmitConfig{Peers: source}}
+		role, identity := retransmitter.classifyInvalidParentSource(nodes, leader,
+			&net.UDPAddr{IP: append(net.IP(nil), leaderTVU.IP...), Port: 8006})
+		require.Equal(t, parentSourceDirectLeader, role)
+		require.Equal(t, leader, identity)
 
-	role, identity := retransmitter.classifyInvalidParentSource(nodes, leader,
-		&net.UDPAddr{IP: append(net.IP(nil), leaderTVU.IP...), Port: 8006})
-	require.Equal(t, parentSourceDirectLeader, role)
-	require.Equal(t, leader, identity)
+		role, identity = retransmitter.classifyInvalidParentSource(nodes, leader, repairAddr)
+		require.Equal(t, parentSourceRepairSocket, role)
+		require.Equal(t, peer, identity)
 
-	role, identity = retransmitter.classifyInvalidParentSource(nodes, leader, repairAddr)
-	require.Equal(t, parentSourceRepairSocket, role)
-	require.Equal(t, peer, identity)
-
-	role, identity = retransmitter.classifyInvalidParentSource(nodes, leader,
-		&net.UDPAddr{IP: net.IPv4(198, 51, 100, 1), Port: 9006})
-	require.Equal(t, parentSourceUnexplained, role)
-	require.Equal(t, solana.PublicKey{}, identity)
+		role, identity = retransmitter.classifyInvalidParentSource(nodes, leader,
+			&net.UDPAddr{IP: net.IPv4(198, 51, 100, 1), Port: 9006})
+		require.Equal(t, parentSourceUnexplained, role)
+		require.Equal(t, solana.PublicKey{}, identity)
+	}
 }
 
 func TestRetransmitSendRetriesUnsentSuffix(t *testing.T) {

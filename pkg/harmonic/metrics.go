@@ -51,6 +51,11 @@ func (s *Service) publishStats(last statsSnapshot) statsSnapshot {
 	countDelta(statsd.HarmonicLeaderNotices, be.NoticeErrors, prevBE.NoticeErrors, "failed")
 	countDelta(statsd.HarmonicLeaderNotices, be.NoticesExpired, prevBE.NoticesExpired, "expired")
 	countDelta(statsd.HarmonicBlockStreamsLost, be.StreamsLost, prevBE.StreamsLost)
+	countDelta(statsd.HarmonicBundleSubscriptions, be.BundleSubscriptions, prevBE.BundleSubscriptions)
+	countDelta(statsd.HarmonicBundleMessagesDrained, be.DrainedBundleMessages, prevBE.DrainedBundleMessages)
+	countDelta(statsd.HarmonicBundlesDrained, be.DrainedBundles, prevBE.DrainedBundles)
+	countDelta(statsd.HarmonicBundlePacketsDrained, be.DrainedBundlePackets, prevBE.DrainedBundlePackets)
+	countDelta(statsd.HarmonicBundleBytesDrained, be.DrainedBundleBytes, prevBE.DrainedBundleBytes)
 
 	r, prevR := now.relayer, last.relayer
 	countDelta(statsd.HarmonicSessions, r.Sessions, prevR.Sessions, "relayer")
@@ -70,6 +75,7 @@ func (s *Service) publishStats(last statsSnapshot) statsSnapshot {
 	countDelta(statsd.HarmonicBlockTransactions, p.Transactions, prevP.Transactions)
 
 	setGauge(statsd.HarmonicBlockEngineHealthy, s.blockEngine.Healthy())
+	setGauge(statsd.HarmonicBundleSubscriptionActive, be.BundleSubscriptionActive)
 	setGauge(statsd.HarmonicRelayerConnected, s.relayer != nil && s.relayer.Status() != nil)
 	setGauge(statsd.HarmonicRelayerTPUAdvertised, s.tpu.RelayerAdvertised())
 	setGauge(statsd.HarmonicClientIDAdvertised, s.clientIDAdvertised.Load())
@@ -93,7 +99,7 @@ func setGauge(m statsd.Metric, on bool) {
 // reportSlot exports a leader slot's report.
 func reportSlot(r SlotReport) {
 	_ = statsd.Count(statsd.HarmonicSlots, 1, []string{r.Mode.String()})
-	for _, flag := range []EndFlags{FlagTimeout, FlagFailed, FlagReverted, FlagUnavailable} {
+	for _, flag := range []EndFlags{FlagTimeout, FlagFailed, FlagReverted, FlagUnavailable, FlagDeadline} {
 		if r.Flags&flag != 0 {
 			_ = statsd.Count(statsd.HarmonicSlotEndFlags, 1, []string{flag.String()})
 		}

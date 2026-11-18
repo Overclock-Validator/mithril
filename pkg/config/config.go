@@ -12,6 +12,7 @@ const LightbringerQuietDefault = true
 
 func ApplyDefaults(v *viper.Viper) {
 	v.SetDefault("lightbringer.quiet", LightbringerQuietDefault)
+	v.SetDefault("rpc.bind_address", "0.0.0.0")
 	// network.cluster and block.source default in the run command itself
 	// (mainnet, turbine), NOT here, because the lightbringer auto-switch needs
 	// to distinguish "operator chose a source" from "defaulted".
@@ -43,8 +44,9 @@ type LedgerConfig struct {
 
 // RpcConfig holds RPC-related configuration (matches Firedancer [rpc] section)
 type RpcConfig struct {
-	Rpc  []string `toml:"rpc" mapstructure:"rpc"`   // List of RPC endpoints
-	Port int      `toml:"port" mapstructure:"port"` // was: rpc-server-port
+	Rpc         []string `toml:"rpc" mapstructure:"rpc"`                   // List of RPC endpoints
+	Port        int      `toml:"port" mapstructure:"port"`                 // was: rpc-server-port
+	BindAddress string   `toml:"bind_address" mapstructure:"bind_address"` // Literal listener IP; defaults to all interfaces
 }
 
 // ReplayConfig holds replay-related configuration
@@ -174,6 +176,8 @@ type SnapshotConfig struct {
 	MinNodeVersion      string   `toml:"min_node_version" mapstructure:"min_node_version"`
 	AllowedNodeVersions []string `toml:"allowed_node_versions" mapstructure:"allowed_node_versions"`
 	NodeBlacklist       []string `toml:"node_blacklist" mapstructure:"node_blacklist"`
+	KnownValidators     []string `toml:"known_validators" mapstructure:"known_validators"`
+	OnlyKnownRPC        bool     `toml:"only_known_rpc" mapstructure:"only_known_rpc"`
 
 	// Snapshot age thresholds
 	FullThreshold        int `toml:"full_threshold" mapstructure:"full_threshold"`

@@ -2,6 +2,7 @@ package replay
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
+	"github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
@@ -164,7 +166,15 @@ type unrootedTail struct {
 	// exact surviving unrooted parent rather than the process-global cache left
 	// by the abandoned suffix.
 	bankSysvars map[uint64]*sealevel.BankSysvars
-	haltCap     int // halt replay if held slots exceed this (rooting stalled)
+	epochCaches map[uint64]*global.EpochCacheSnapshot
+	forkStates  map[uint64]*replayForkState
+	// Keep one durable anchor: routine switches often return exactly to the
+	// latest applied fold, whose account layers have already left the tail.
+	rootContext     *state.ResumeContext
+	rootBankSysvars *sealevel.BankSysvars
+	rootEpochCaches *global.EpochCacheSnapshot
+	rootForkState   *replayForkState
+	haltCap         int // halt replay if held slots exceed this (rooting stalled)
 	// rewardWindowSlots reserves the boundary bank plus its distribution banks
 	// until the completion bank is durably folded. It must not shrink as the
 	// RAM-only distribution counter decreases: those banks are still retained.
@@ -193,6 +203,8 @@ func newUnrootedTail(durable blockAccountSource, committer batchCommitter, haltC
 		stakeIdxDir:  stakeIdxDir,
 		contexts:     make(map[uint64]*state.ResumeContext),
 		bankSysvars:  make(map[uint64]*sealevel.BankSysvars),
+		epochCaches:  make(map[uint64]*global.EpochCacheSnapshot),
+		forkStates:   make(map[uint64]*replayForkState),
 		haltCap:      haltCap,
 	}
 }
@@ -395,7 +407,12 @@ func (t *unrootedTail) recordStakeChange(slotCtx *sealevel.SlotCtx, modified []*
 		}
 		return acct, err
 	}
-	t.stakeTotals.recordSlot(slotCtx.Slot, slotCtx, modified, global.PendingStakePubkeysForSlot(slotCtx.Slot), readStored)
+	indexKeys := global.PendingStakePubkeysForSlot(slotCtx.Slot)
+	// The fold also derives keys from these accepted writes. Track the same
+	// membership here so saved totals and their index digest remain exact even
+	// when speculative execution discarded a pending discovery hint.
+	indexKeys = append(indexKeys, foldStakePubkeys([]accounts.SlotDelta{{Delta: modified}})...)
+	t.stakeTotals.recordSlot(slotCtx.Slot, slotCtx, modified, indexKeys, readStored)
 }
 
 // Add buffers a replayed slot's writes + bankhash in the overlay; it becomes
@@ -416,6 +433,7 @@ func (t *unrootedTail) Add(slot uint64, delta []*accounts.Account, bankhash []by
 func (t *unrootedTail) SetContext(slot uint64, ctx *state.ResumeContext, bankSysvars ...*sealevel.BankSysvars) {
 	if ctx != nil {
 		t.contexts[slot] = ctx
+		t.epochCaches[slot] = global.CaptureEpochCaches()
 		delete(t.bankSysvars, slot)
 		if len(bankSysvars) > 0 && bankSysvars[0] != nil {
 			t.bankSysvars[slot] = bankSysvars[0]
@@ -442,6 +460,7 @@ func (t *unrootedTail) promoteChunked(through uint64, force bool) (uint64, *stat
 		return 0, nil, err
 	}
 	ctx := t.contexts[promotedThrough] // context as of the last rooted slot (read before pruning)
+	t.retainRootAnchor(promotedThrough, ctx)
 	for s := range t.contexts {
 		if s <= promotedThrough {
 			delete(t.contexts, s)
@@ -596,6 +615,26 @@ func (t *unrootedTail) buildFoldJob(through uint64, force bool, hookOverrides ..
 // the transaction-status checkpoint cleanup after it.
 var foldJobTask = metrics.Background("replay.fold_job", 2*time.Second)
 
+// foldStakePubkeys makes the durable enumeration index follow the actual
+// accepted account writes, independently of speculative execution's pending
+// hints. The index is a superset: stale keys are harmless because scans read
+// their current account state, but omitting a committed stake account changes
+// epoch stake history and rewards.
+func foldStakePubkeys(chunk []accounts.SlotDelta) []solana.PublicKey {
+	var keys []solana.PublicKey
+	for _, delta := range chunk {
+		for _, acct := range delta.Delta {
+			if acct == nil || acct.Owner != addresses.StakeProgramAddr || acct.Lamports == 0 || len(acct.Data) < 4 {
+				continue
+			}
+			if binary.LittleEndian.Uint32(acct.Data) != sealevel.StakeStateV2StatusUninitialized {
+				keys = append(keys, acct.Key)
+			}
+		}
+	}
+	return keys
+}
+
 func runFoldJob(committer batchCommitter, job *foldJob) (err error) {
 	if job == nil {
 		return errors.New("fold job has no resume context")
@@ -660,7 +699,7 @@ func runFoldJob(committer batchCommitter, job *foldJob) (err error) {
 
 	step = time.Now()
 	if job.stakeIdxDir != "" {
-		if _, err := global.FlushPendingStakePubkeysThrough(job.stakeIdxDir, job.through); err != nil {
+		if _, err := global.FlushPendingStakePubkeysThrough(job.stakeIdxDir, job.through, foldStakePubkeys(job.chunk)...); err != nil {
 			return fmt.Errorf("fold chunk through slot %d: flush stake index: %w", job.through, err)
 		}
 	}
@@ -685,6 +724,7 @@ func runFoldJob(committer batchCommitter, job *foldJob) (err error) {
 // the now-durable prefix and the per-slot maps prune. Returns the rooted
 // context (the job snapshot — identical to what the manifest carries).
 func (t *unrootedTail) applyFoldJob(job *foldJob) *state.ResumeContext {
+	t.retainRootAnchor(job.through, job.ctx)
 	t.stakeTotals.commitThrough(job.through, job.stakeTotals)
 	t.overlay.PromotePrefix(job.through)
 	for s := range t.bankhashes {
@@ -829,44 +869,83 @@ func (p *asyncPromoter) stop() {
 // snapshot of the last surviving executed slot so the replay loop can rebuild
 // execution state and re-run the certified version. Either result may be nil;
 // the caller validates the pair and falls back to rooted-checkpoint re-replay.
+// retainedParent reads the prospective parent without mutating any state, so a
+// failed context/sysvar validation cannot partially discard the live branch.
+func (t *unrootedTail) retainedParent(fromSlot uint64) (*state.ResumeContext, *sealevel.BankSysvars) {
+	ctx, sysvars := t.rootContext, t.rootBankSysvars
+	if ctx != nil && ctx.Slot >= fromSlot {
+		ctx, sysvars = nil, nil
+	}
+	for slot, candidate := range t.contexts {
+		if slot < fromSlot && (ctx == nil || slot > ctx.Slot) {
+			ctx, sysvars = candidate, t.bankSysvars[slot]
+		}
+	}
+	return ctx, sysvars
+}
+
+func (t *unrootedTail) SetForkState(slot uint64, forkState *replayForkState) {
+	t.forkStates[slot] = forkState
+}
+
+func (t *unrootedTail) retainedForkState(fromSlot uint64) *replayForkState {
+	ctx, _ := t.retainedParent(fromSlot)
+	if ctx == nil {
+		return nil
+	}
+	if t.rootContext != nil && ctx.Slot == t.rootContext.Slot {
+		return t.rootForkState
+	}
+	return t.forkStates[ctx.Slot]
+}
+
+// retainRootAnchor releases journal history only after the accounts commit has
+// succeeded. It retains constant-size parent metadata, not the folded accounts.
+func (t *unrootedTail) retainRootAnchor(slot uint64, ctx *state.ResumeContext) {
+	t.rootContext = ctx
+	t.rootBankSysvars = t.bankSysvars[slot]
+	t.rootEpochCaches = t.epochCaches[slot]
+	t.rootForkState = t.forkStates[slot]
+	global.PruneVoteCacheJournal(slot)
+	for held := range t.epochCaches {
+		if held <= slot {
+			delete(t.epochCaches, held)
+			delete(t.forkStates, held)
+		}
+	}
+}
+
 func (t *unrootedTail) unwind(fromSlot uint64) (*state.ResumeContext, *sealevel.BankSysvars) {
+	ctx, bankSysvars := t.retainedParent(fromSlot)
+	var epochCaches *global.EpochCacheSnapshot
+	if ctx != nil {
+		if t.rootContext != nil && ctx.Slot == t.rootContext.Slot {
+			epochCaches = t.rootEpochCaches
+		} else {
+			epochCaches = t.epochCaches[ctx.Slot]
+		}
+	}
 	t.overlay.EvictFrom(fromSlot)
 	t.stakeTotals.dropFrom(fromSlot)
-	// Only replay-owned held slots are unwound. A future local leader bank
-	// is not part of this tail and must retain its pending stake entries.
-	for s := range t.bankhashes {
-		if s >= fromSlot {
-			global.DropPendingStakePubkeys(s)
-			delete(t.bankhashes, s)
+	// Only replay-owned accepted banks enter the journal and tail. Future
+	// leader banks keep vote/stake changes private until their ordered adopt.
+	global.RewindVoteCache(fromSlot)
+	global.RestoreEpochCaches(epochCaches)
+	for slot := range t.bankhashes {
+		if slot >= fromSlot {
+			global.DropPendingStakePubkeys(slot)
+			delete(t.bankhashes, slot)
 		}
 	}
-	var ctx *state.ResumeContext
-	var ctxSlot uint64
-	for s, c := range t.contexts {
-		if s >= fromSlot {
-			delete(t.contexts, s)
-			continue
-		}
-		if ctx == nil || s > ctxSlot {
-			ctx = c
-			ctxSlot = s
+	for slot := range t.contexts {
+		if slot >= fromSlot {
+			delete(t.contexts, slot)
+			delete(t.bankSysvars, slot)
+			delete(t.epochCaches, slot)
+			delete(t.forkStates, slot)
 		}
 	}
-	for s := range t.bankSysvars {
-		if s >= fromSlot {
-			delete(t.bankSysvars, s)
-		}
-	}
-	// ctx is the highest retained context with slot < fromSlot: the ACTUAL
-	// executed parent. It need not be numerically fromSlot-1 — when slots between
-	// it and fromSlot were skipped, they retain no context (only executed held
-	// slots call SetContext), so the last executed slot IS the parent bank of the
-	// certified block at fromSlot. Returning nil (parent already durably folded,
-	// or nothing retained) routes the caller to the rooted-checkpoint fallback.
-	if ctx == nil {
-		return nil, nil
-	}
-	return ctx, t.bankSysvars[ctxSlot]
+	return ctx, bankSysvars
 }
 
 // reserveRewardWindow is called once at the boundary, before distributing any
@@ -1029,7 +1108,7 @@ func promoteRootedBatchedWithStakeTotals(
 		// the index — a subset — which would silently corrupt the epoch-stakes
 		// scan. Entries for unfolded slots stay in RAM (branch-scoped).
 		if stakeIdxDir != "" {
-			if _, ferr := global.FlushPendingStakePubkeysThrough(stakeIdxDir, chunkThrough); ferr != nil {
+			if _, ferr := global.FlushPendingStakePubkeysThrough(stakeIdxDir, chunkThrough, foldStakePubkeys(chunk)...); ferr != nil {
 				err = fmt.Errorf("promote chunk through slot %d: flush stake index: %w", chunkThrough, ferr)
 				break
 			}
