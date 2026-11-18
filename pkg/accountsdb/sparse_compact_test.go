@@ -14,6 +14,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// These tests exercise in-place reclamation with relocation disabled by a
+// one-byte move budget. Dense relocation has separate recovery and rewind tests.
 func TestSparseCompactionRetainsExactLiveAndUndoRecords(t *testing.T) {
 	for _, walOff := range []bool{false, true} {
 		for _, crash := range []string{"none", "marker", "punch"} {
@@ -38,7 +40,7 @@ func TestSparseCompactionRetainsExactLiveAndUndoRecords(t *testing.T) {
 				} else if crash == "punch" {
 					db.compactHooks.afterSparsePunch = func() { panic("simulated crash") }
 				}
-				cfg := CompactionConfig{RewindHorizonBatches: 1}
+				cfg := CompactionConfig{RewindHorizonBatches: 1, MaxMoveBytesPerCycle: 1}
 				if crash == "none" {
 					stats, err := db.CompactOnce(cfg)
 					require.NoError(t, err)
@@ -63,15 +65,13 @@ func TestSparseCompactionRetainsExactLiveAndUndoRecords(t *testing.T) {
 				require.Equal(t, []byte("head"), mustColdRead(t, db, 140, solana.PublicKey{1}).Data)
 				marker, err := ReadSegmentManifest(segmentManifestPath(db.AcctsDir, 110, r1.FileId))
 				require.NoError(t, err)
-				require.Equal(t, ManifestKindCompact, marker.Kind)
+				require.Equal(t, ManifestKindSparse, marker.Kind)
 				require.Zero(t, marker.DataCRC)
-				// Header-only parsing remains compatible with the old appendvec
-				// reader; only obsolete payload bytes can differ.
-				data, err := os.ReadFile(source)
-				require.NoError(t, err)
-				keys, _, _, err := BuildIndexEntriesFromAppendVecs(data, uint64(len(data)), 110, r1.FileId)
-				require.NoError(t, err)
-				require.Len(t, keys, 3)
+				// Sparse manifests enumerate the surviving records; discarded
+				// headers need no longer pin a physical page forever.
+				require.Len(t, marker.Records, 2)
+				require.Equal(t, [32]byte{2}, marker.Records[0].Pubkey)
+				require.Equal(t, [32]byte{3}, marker.Records[1].Pubkey)
 				_, err = db.RewindToBatchBoundary(130)
 				require.NoError(t, err)
 				require.Equal(t, undo, mustColdRead(t, db, 130, solana.PublicKey{2}).Data, "undo record sharing the reclaimed file must be byte-exact")
@@ -172,7 +172,7 @@ func TestSparseCompactionPrioritizesUnreclaimedSegments(t *testing.T) {
 	r2 := commitTestBatch(t, db, 120, foldAcct(1, 11, big), foldAcct(3, 30, []byte("keep")))
 	commitTestBatch(t, db, 130, foldAcct(1, 12, nil))
 	commitTestBatch(t, db, 140, foldAcct(1, 13, nil))
-	cfg := CompactionConfig{RewindHorizonBatches: 1, MaxFilesPerCycle: 1}
+	cfg := CompactionConfig{RewindHorizonBatches: 1, MaxFilesPerCycle: 1, MaxMoveBytesPerCycle: 1}
 	first, err := db.CompactOnce(cfg)
 	require.NoError(t, err)
 	require.Equal(t, 1, first.FilesSparsified)
@@ -187,7 +187,7 @@ func TestSparseCompactionPrioritizesUnreclaimedSegments(t *testing.T) {
 	require.Equal(t, 1, second.FilesSparsified)
 	marker, err := ReadSegmentManifest(segmentManifestPath(db.AcctsDir, 120, r2.FileId))
 	require.NoError(t, err)
-	require.Equal(t, ManifestKindCompact, marker.Kind)
+	require.Equal(t, ManifestKindSparse, marker.Kind)
 	require.Equal(t, big, mustColdRead(t, db, 140, solana.PublicKey{2}).Data)
 }
 
@@ -199,7 +199,7 @@ func TestSparseCompactionRevisitsExpiredUndoAheadOfNewSegments(t *testing.T) {
 	commitTestBatch(t, db, 120, foldAcct(1, 11, nil))
 	commitTestBatch(t, db, 130, foldAcct(1, 12, nil))
 	commitTestBatch(t, db, 140, foldAcct(2, 21, nil), foldAcct(9, 90, big))
-	cfg := CompactionConfig{RewindHorizonBatches: 1, MaxFilesPerCycle: 1}
+	cfg := CompactionConfig{RewindHorizonBatches: 1, MaxFilesPerCycle: 1, MaxMoveBytesPerCycle: 1}
 	first, err := db.CompactOnce(cfg)
 	require.NoError(t, err)
 	require.Greater(t, first.BytesReclaimed, int64(15<<20))
@@ -237,7 +237,7 @@ func TestSparseCompactionSkipsUnchangedHeadAndRechecksAfterFold(t *testing.T) {
 	commitTestBatch(t, db, 110, foldAcct(1, 10, big), foldAcct(2, 20, big))
 	commitTestBatch(t, db, 120, foldAcct(1, 11, nil))
 	commitTestBatch(t, db, 130, foldAcct(1, 12, nil))
-	cfg := CompactionConfig{RewindHorizonBatches: 1, MaxFilesPerCycle: 1}
+	cfg := CompactionConfig{RewindHorizonBatches: 1, MaxFilesPerCycle: 1, MaxMoveBytesPerCycle: 1}
 	first, err := db.CompactOnce(cfg)
 	require.NoError(t, err)
 	require.Equal(t, 1, first.FilesSparsified)

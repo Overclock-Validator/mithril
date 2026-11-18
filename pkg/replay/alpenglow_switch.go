@@ -10,6 +10,7 @@ import (
 	b "github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/blockstream"
 	consensusengine "github.com/Overclock-Validator/mithril/pkg/consensus"
+	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/rewards"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
@@ -18,13 +19,9 @@ import (
 	"github.com/gagliardetto/solana-go"
 )
 
-// voteStakeDirtySlot is the highest slot whose transaction execution mutated the
-// GLOBAL vote or stake caches (see recordStakeAndVoteAccounts). The in-loop
-// unwind rolls back account state (the WorkingSet undo journal) but NOT those
-// process-global caches, so it is only safe when the unwound suffix did not
-// touch them. When it did, the switch falls back to the rooted-checkpoint
-// re-replay, which reconstructs every cache from the resumed state. Reset per
-// ReplayBlocks run; a stale value only ever causes an extra (safe) fallback.
+// voteStakeDirtySlot marks an explicitly unjournaled cache mutation. Ordinary
+// execution writes now use the reversible vote-cache journal; this conservative
+// escape hatch remains for callers that cannot attribute a mutation to a bank.
 var voteStakeDirtySlot atomic.Uint64
 
 // markVoteStakeDirty records that slot's execution mutated a global vote/stake
@@ -42,7 +39,10 @@ func markVoteStakeDirty(slot uint64) {
 }
 
 // resetVoteStakeDirty clears the watermark at the start of a replay run.
-func resetVoteStakeDirty() { voteStakeDirtySlot.Store(0) }
+func resetVoteStakeDirty() {
+	voteStakeDirtySlot.Store(0)
+	global.ResetVoteCacheJournal()
+}
 
 // parentSwitchNeedsStateUnwind distinguishes an already-executed divergence
 // from a fork discovered ahead of the executed bank, including a certificate
@@ -278,20 +278,10 @@ func waitForReplayInput(
 	}
 }
 
-// tryInLoopUnwind attempts the in-RAM fork switch: evict the wrong suffix
-// from the working set and rebuild replay's resume state from the retained
-// parent context. Returns nil (caller falls back to the rooted-checkpoint
-// re-replay) when the switch cannot be handled safely in-loop:
-//   - the unwind span crosses an epoch boundary (epoch-scoped caches would
-//     hold post-boundary state)
-//   - the slot is inside the partitioned-rewards distribution window
-//     (re-execution would double-apply distribution bookkeeping)
-//   - the parent slot's context is no longer retained in RAM
-//
-// Fallback reasons reported by tryInLoopUnwind; surfaced in the fork-switch
-// instrumentation (100-slot summary + logs) so operators can see WHY switches
-// fell back to the rooted-checkpoint re-replay — the signal that decides
-// whether the in-RAM engine suffices or a branch-aware state engine is needed.
+// Fallback reasons reported by tryInLoopUnwind and the periodic summary.
+// Cross-epoch and rewards-window switches need the parent's complete fork
+// metadata. Missing metadata, unjournaled cache mutations, or unavailable
+// parent snapshots still require checkpoint reconstruction.
 const (
 	unwindFallbackNilTail        = "nil-tail"
 	unwindFallbackCrossEpoch     = "cross-epoch"
@@ -315,34 +305,26 @@ func tryInLoopUnwind(
 	currentEpoch uint64,
 	partitionedRewardsInfo *rewards.PartitionedRewardDistributionInfo,
 ) (*ResumeState, *sealevel.BankSysvars, string) {
-	if tail == nil || sw.Slot == 0 {
+	if tail == nil || sw == nil || sw.Slot == 0 {
 		return nil, nil, unwindFallbackNilTail
 	}
-	if epochSchedule.GetEpoch(sw.Slot-1) != currentEpoch || epochSchedule.GetEpoch(sw.Slot) != currentEpoch {
+	forkState := tail.retainedForkState(sw.Slot)
+	if forkState == nil && (epochSchedule.GetEpoch(sw.Slot-1) != currentEpoch || epochSchedule.GetEpoch(sw.Slot) != currentEpoch) {
 		return nil, nil, unwindFallbackCrossEpoch
 	}
-	if partitionedRewardsInfo != nil {
+	if partitionedRewardsInfo != nil && forkState == nil {
 		// Even after the last partition is distributed, the in-memory spool and
 		// completed-distribution bookkeeping describe the abandoned suffix. They
 		// cannot be reconstructed safely without re-running the epoch boundary.
 		return nil, nil, unwindFallbackRewardsWindow
 	}
-	// Vote/stake cache safety, BOTH directions. The unwind cannot roll the
-	// global vote/stake caches back (a write in the UNWOUND suffix >= sw.Slot
-	// would leave them describing the wrong sibling), and the resume path's
-	// cache reload reads durable AccountsDB, which cannot see writes in the
-	// RETAINED suffix (rooted < slot < sw.Slot) — a reload would regress the
-	// cache below live account state. Either way the caches and account state
-	// disagree, and the vote cache feeds the timestamp oracle -> clock ->
-	// bankhash. So: any vote/stake write anywhere ABOVE the rooted watermark
-	// forces the rooted-checkpoint fallback, where reload-from-durable is
-	// exact by construction. Vote-program writes are rare in Alpenglow blocks
-	// (vote transactions are off-chain), so the fast path still dominates.
+	// Explicit unjournaled mutations still require a checkpoint rebuild. Accepted
+	// vote writes and stake discovery are reversible and never set this marker.
 	if voteStakeDirtySlot.Load() > mithrilState.LastRootedSlot {
 		return nil, nil, unwindFallbackVoteStakeDirty
 	}
 
-	ctx, bankSysvars := tail.unwind(sw.Slot)
+	ctx, bankSysvars := tail.retainedParent(sw.Slot)
 	if ctx == nil && sw.Slot-1 == mithrilState.LastRootedSlot && mithrilState.LastRootedContext != nil {
 		// The durable boundary carries a persisted ResumeContext, but deliberately
 		// no in-memory BankSysvars pointer. Re-entering through the normal rooted
@@ -365,5 +347,6 @@ func tryInLoopUnwind(
 		mlog.Log.Warnf("alpenglow switch: cannot rebuild resume state from retained context at slot %d: %v", ctx.Slot, err)
 		return nil, nil, unwindFallbackContextRebuild
 	}
+	tail.unwind(sw.Slot)
 	return rs, bankSysvars, ""
 }

@@ -446,7 +446,7 @@ func capitalizingEpochRewards(votingRewards, stakerRewards uint64) uint64 {
 	return total
 }
 
-func beginPartitionedEpochRewardsDistribution(acctsDb *accountsdb.AccountsDb, slotCtx *sealevel.SlotCtx, stakeHistory *sealevel.SysvarStakeHistory, epochCtx *ReplayCtx, epochSchedule *sealevel.SysvarEpochSchedule, block *block.Block, f *features.Features, epoch uint64, slot uint64, rpcc *rpcclient.RpcClient, dbgOpts *DebugOptions, mode rewards.RewardCalculationMode, stagedEpochAccts []*accounts.Account) (*rewards.PartitionedRewardDistributionInfo, []*accounts.Account, []*accounts.Account, uint64) {
+func beginPartitionedEpochRewardsDistribution(acctsDb *accountsdb.AccountsDb, slotCtx *sealevel.SlotCtx, stakeHistory *sealevel.SysvarStakeHistory, epochCtx *ReplayCtx, epochSchedule *sealevel.SysvarEpochSchedule, block *block.Block, f *features.Features, epoch uint64, slot uint64, rpcc *rpcclient.RpcClient, dbgOpts *DebugOptions, mode rewards.RewardCalculationMode, stagedEpochAccts []*accounts.Account, stakeSources ...rewards.StakeAccountStream) (*rewards.PartitionedRewardDistributionInfo, []*accounts.Account, []*accounts.Account, uint64) {
 	partitionedRewardsInfo := rewards.DeterminePartitionedStakingRewardsInfo(epochSchedule, &epochCtx.Inflation, epochCtx.Capitalization, epoch, epoch-1, slot, epochCtx.SlotsPerYear, f)
 	totalRewards, err := partitionedRewardsBudget(
 		slotCtx, epochSchedule, f, epoch-1, partitionedRewardsInfo.TotalStakingRewards,
@@ -473,7 +473,7 @@ func beginPartitionedEpochRewardsDistribution(acctsDb *accountsdb.AccountsDb, sl
 	pointValue := rewards.PointValue{Rewards: totalRewards, Points: wide.Uint128{}}
 	streamResult, streamErr := rewards.CalculateRewardsStreaming(
 		acctsDb, slot, stakeHistory, newWarmupCooldownRateEpoch,
-		voteCacheSnapshot, pointValue, epoch-1, slotCtx.Blockhash, slotCtx, f, epochSchedule, mode)
+		voteCacheSnapshot, pointValue, epoch-1, slotCtx.Blockhash, slotCtx, f, epochSchedule, mode, stakeSources...)
 	if streamErr != nil {
 		panic(fmt.Sprintf("streaming rewards calculation failed: %s", streamErr))
 	}
@@ -502,6 +502,10 @@ func beginPartitionedEpochRewardsDistribution(acctsDb *accountsdb.AccountsDb, sl
 	newEpochRewards := sealevel.SysvarEpochRewards{DistributionStartingBlockHeight: block.BlockHeight + 1,
 		NumPartitions: streamResult.NumPartitions, ParentBlockhash: block.LastBlockhash,
 		TotalRewards: totalRewards, DistributedRewards: voteRewardsDistributed, TotalPoints: streamResult.TotalPoints, Active: true}
+	partitionedRewardsInfo.Plan, err = rewards.NewPartitionedRewardPlan(streamResult.SpoolDir, streamResult.SpoolSlot, newEpochRewards, streamResult.VoteCommissions)
+	if err != nil {
+		panic(fmt.Sprintf("create partitioned reward plan: %s", err))
+	}
 
 	epochRewardsAcct, err := rewardLoader(sealevel.SysvarEpochRewardsAddr)
 	if err != nil {
@@ -525,73 +529,47 @@ func beginPartitionedEpochRewardsDistribution(acctsDb *accountsdb.AccountsDb, sl
 		capitalizingEpochRewards(voteRewardsDistributed, streamResult.TotalStakerRewards)
 }
 
-func distributePartitionedEpochRewardsForSlot(acctsDb *accountsdb.AccountsDb, parentCtx *sealevel.SlotCtx, stagedEpochAccts []*accounts.Account, epochCtx *ReplayCtx, partitionedEpochRewardsInfo *rewards.PartitionedRewardDistributionInfo, currentSlot uint64, currentBlockHeight uint64, currentEpoch uint64) ([]*accounts.Account, []*accounts.Account, map[solana.PublicKey]uint8) {
-	rewardLoader := epochRewardAccountLoader(acctsDb, currentSlot, parentCtx, stagedEpochAccts)
-	epochRewardsAcct, err := rewardLoader(sealevel.SysvarEpochRewardsAddr)
-	if err != nil {
-		panic(fmt.Sprintf("unable to get EpochRewards from acctsdb: %s", err))
+func distributePartitionedEpochRewardsForSlot(acctsDb *accountsdb.AccountsDb, parentCtx *sealevel.SlotCtx, stagedEpochAccts []*accounts.Account, epochCtx *ReplayCtx, info *rewards.PartitionedRewardDistributionInfo, currentSlot uint64, currentBlockHeight uint64, currentEpoch uint64) ([]*accounts.Account, []*accounts.Account, map[solana.PublicKey]uint8) {
+	loader := epochRewardAccountLoader(acctsDb, currentSlot, parentCtx, stagedEpochAccts)
+	if info.Plan == nil {
+		// Compatibility for callers constructing a descriptor directly. Production
+		// initializes the plan once at the boundary before publishing any bank.
+		acct, err := loader(sealevel.SysvarEpochRewardsAddr)
+		if err != nil {
+			panic(fmt.Sprintf("load reward plan sysvar: %s", err))
+		}
+		var initial sealevel.SysvarEpochRewards
+		initial.MustUnmarshalWithDecoder(bin.NewBinDecoder(acct.Data))
+		info.Plan, err = rewards.NewPartitionedRewardPlan(info.SpoolDir, info.SpoolSlot, initial, info.VoteCommissions)
+		if err != nil {
+			panic(fmt.Sprintf("create reward plan: %s", err))
+		}
 	}
-
-	var epochRewards sealevel.SysvarEpochRewards
-	decoder := bin.NewBinDecoder(epochRewardsAcct.Data)
-	epochRewards.MustUnmarshalWithDecoder(decoder)
-
-	// Reward distribution is scheduled by block height, not slot. If the first
-	// slots of an epoch are skipped, the epoch-boundary bank can already be past
-	// FirstStakingRewardSlot while its block height is still one before the
-	// distribution start recorded in the freshly staged EpochRewards sysvar.
-	if currentBlockHeight < epochRewards.DistributionStartingBlockHeight {
+	result, err := distributeBankRewardPartition(acctsDb, loader, info.Plan, epochCtx.CurrentFeatures, currentSlot, currentBlockHeight, currentEpoch)
+	if err != nil {
+		panic(err)
+	}
+	// Only ordered replay advances these scalars. A leader preparing the same
+	// partition in parallel has private account images and no effect here.
+	info.NumRewardPartitionsRemaining = result.remaining
+	if len(result.updated) == 0 {
 		return nil, nil, nil
 	}
-
-	partitionIdx := currentBlockHeight - epochRewards.DistributionStartingBlockHeight
-
-	distributionConfig := rewards.StakeRewardDistributionConfig{RewardedEpoch: safemath.SaturatingSubU64(currentEpoch, 1)}
-	if epochCtx.CurrentFeatures != nil && epochCtx.CurrentFeatures.IsActive(features.RelaxPostExecMinBalanceCheck) {
-		rentAcct, err := rewardLoader(sealevel.SysvarRentAddr)
-		if err != nil {
-			panic(fmt.Sprintf("unable to get distribution bank Rent sysvar: %s", err))
-		}
-		if err := distributionConfig.Rent.UnmarshalWithDecoder(bin.NewBinDecoder(rentAcct.Data)); err != nil {
-			panic(fmt.Sprintf("unable to decode distribution bank Rent sysvar: %s", err))
-		}
-		distributionConfig.AdjustDelegationsForRent = true
+	epochCtx.Capitalization, err = safemath.CheckedAddU64(epochCtx.Capitalization, result.paid)
+	if err != nil {
+		panic("reward distribution capitalization overflow")
 	}
-	distributedAccts, parentDistributedAccts, distributedLamports, burnedLamports, stakeCommissions := rewards.DistributeStakingRewardsFromSpool(acctsDb, partitionedEpochRewardsInfo.SpoolDir, partitionedEpochRewardsInfo.SpoolSlot, partitionIdx, currentSlot, rewardLoader, partitionedEpochRewardsInfo.VoteCommissions, distributionConfig)
-	parentDistributedAccts = append(parentDistributedAccts, epochRewardsAcct.Clone())
-
-	// EpochRewards sysvar advances by distributed + burned (matching Agave/FD),
-	// but capitalization only increases by distributed.
-	epochRewards.Distribute(distributedLamports + burnedLamports)
-	partitionedEpochRewardsInfo.NumRewardPartitionsRemaining--
-
-	distributionComplete := false
-	if partitionedEpochRewardsInfo.NumRewardPartitionsRemaining == 0 {
-		epochRewards.Active = false
-		distributionComplete = true
-		rewards.CleanupPartitionedSpoolFiles(partitionedEpochRewardsInfo.SpoolDir, partitionedEpochRewardsInfo.SpoolSlot, epochRewards.NumPartitions)
-	}
-
-	writer := new(bytes.Buffer)
-	encoder := bin.NewBinEncoder(writer)
-	epochRewards.MustMarshalWithEncoder(encoder)
-	copy(epochRewardsAcct.Data, writer.Bytes())
-
-	sealevel.SysvarCache.EpochRewards.Acct = epochRewardsAcct
+	epochAcct := result.updated[len(result.updated)-1]
+	sealevel.SysvarCache.EpochRewards.Acct = epochAcct.Clone()
+	epochRewards := result.epochRewards
 	sealevel.SysvarCache.EpochRewards.Sysvar = &epochRewards
-
-	distributedAccts = append(distributedAccts, epochRewardsAcct.Clone())
-	epochCtx.Capitalization += distributedLamports
-
-	if distributionComplete {
+	if result.remaining == 0 {
 		mlog.Log.Infof("epoch rewards distribution complete: slot=%d partitions=%d active=%t sysvar_distributed_rewards=%d sysvar_total_rewards=%d", currentSlot, epochRewards.NumPartitions, epochRewards.Active, epochRewards.DistributedRewards, epochRewards.TotalRewards)
 	}
-
-	if burnedLamports > 0 {
-		mlog.Log.Warnf("partition %d: distributed=%d burned=%d", partitionIdx, distributedLamports, burnedLamports)
+	if result.burned > 0 {
+		mlog.Log.Warnf("partition %d: distributed=%d burned=%d", currentBlockHeight-epochRewards.DistributionStartingBlockHeight, result.paid, result.burned)
 	}
-
-	return distributedAccts, parentDistributedAccts, stakeCommissions
+	return result.updated, result.parents, result.commissions
 }
 
 func replaceInflationRewardRecords(block *block.Block, updated, parents []*accounts.Account, rewardType rpc.RewardType, commissions map[solana.PublicKey]uint8) error {

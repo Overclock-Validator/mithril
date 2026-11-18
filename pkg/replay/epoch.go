@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -141,8 +142,16 @@ type BoundaryStakeScanResult struct {
 // scanStakesForEpochBoundary first completes targetEpoch's stake history, then
 // uses that history to calculate effective stakes in newEpoch. The future
 // leader-schedule epoch is only the key under which that distribution is saved.
-// Two streaming passes avoid retaining all stake accounts or delegations.
+// A compact temporary stream avoids rereading AccountsDB for the second pass.
 func scanStakesForEpochBoundary(acctsDb *accountsdb.AccountsDb, slot uint64, targetEpoch uint64, newEpoch uint64, stakeHistory *sealevel.SysvarStakeHistory, epochSchedule *sealevel.SysvarEpochSchedule, f *features.Features) *BoundaryStakeScanResult {
+	result, spool := captureStakesForEpochBoundary(acctsDb, slot, targetEpoch, newEpoch, stakeHistory, epochSchedule, f)
+	defer spool.Close()
+	return result
+}
+
+// captureStakesForEpochBoundary returns the immutable parent delegation stream
+// as well, so reward points can reuse it. The caller owns the scratch file.
+func captureStakesForEpochBoundary(acctsDb *accountsdb.AccountsDb, slot uint64, targetEpoch uint64, newEpoch uint64, stakeHistory *sealevel.SysvarStakeHistory, epochSchedule *sealevel.SysvarEpochSchedule, f *features.Features) (*BoundaryStakeScanResult, *rewards.StakeDelegationSpool) {
 	newRateActivationEpoch := newWarmupCooldownRateEpoch(epochSchedule, f)
 
 	// Stake history accumulators (atomic — high contention from worker pool)
@@ -159,7 +168,10 @@ func scanStakesForEpochBoundary(acctsDb *accountsdb.AccountsDb, slot uint64, tar
 	var rewardEpochEffectiveStakesMu sync.Mutex
 	var totalEffectiveStake atomic.Uint64
 
-	_, err := global.StreamStakeAccounts(acctsDb, slot,
+	spool, err := rewards.CaptureStakeDelegations(filepath.Join(acctsDb.AcctsDir, ".."),
+		func(visit rewards.StakeAccountVisitor) (int, error) {
+			return global.StreamStakeAccounts(acctsDb, slot, visit)
+		},
 		func(pk solana.PublicKey, delegation *sealevel.Delegation, creditsObs uint64) {
 			// --- Stake history accumulation ---
 			if delegation.StakeLamports > 0 {
@@ -183,6 +195,13 @@ func scanStakesForEpochBoundary(acctsDb *accountsdb.AccountsDb, slot uint64, tar
 		panic(fmt.Sprintf("error scanning stake history at epoch boundary: %s", err))
 	}
 
+	retainSpool := false
+	defer func() {
+		if !retainSpool {
+			_ = spool.Close()
+		}
+	}()
+
 	// Match Agave's calculate_activated_stake: append the completed epoch
 	// before refreshing the new epoch's vote-account weights. Missing history
 	// can otherwise treat newly activating stake as fully effective and newly
@@ -194,7 +213,7 @@ func scanStakesForEpochBoundary(acctsDb *accountsdb.AccountsDb, slot uint64, tar
 		Deactivating: shDeactivating.Load(),
 	})
 
-	_, err = global.StreamStakeAccounts(acctsDb, slot,
+	_, err = spool.Stream(
 		func(pk solana.PublicKey, delegation *sealevel.Delegation, creditsObs uint64) {
 			effectiveStake := delegation.Stake(newEpoch, &newStakeHistory, newRateActivationEpoch)
 			if effectiveStake > 0 {
@@ -208,6 +227,7 @@ func scanStakesForEpochBoundary(acctsDb *accountsdb.AccountsDb, slot uint64, tar
 		panic(fmt.Sprintf("error scanning stake accounts at epoch boundary: %s", err))
 	}
 
+	retainSpool = true
 	return &BoundaryStakeScanResult{
 		StakeHistoryEffective:      shEffective.Load(),
 		StakeHistoryActivating:     shActivating.Load(),
@@ -216,7 +236,7 @@ func scanStakesForEpochBoundary(acctsDb *accountsdb.AccountsDb, slot uint64, tar
 		EffectiveStakes:            effectiveStakes,
 		RewardEpochEffectiveStakes: rewardEpochEffectiveStakes,
 		TotalEffectiveStake:        totalEffectiveStake.Load(),
-	}
+	}, spool
 }
 
 // updateStakeHistorySysvar applies pre-computed stake history data to the sysvar.
@@ -275,7 +295,8 @@ func handleEpochTransition(acctsDb *accountsdb.AccountsDb, partitionedEpochRewar
 
 	// Complete the old epoch's history before calculating the new epoch's stakes.
 	t0 := time.Now()
-	scanResult := scanStakesForEpochBoundary(acctsDb, prevSlotCtx.Slot, epoch, newEpoch, &stakeHistory, epochSchedule, f)
+	scanResult, stakeSpool := captureStakesForEpochBoundary(acctsDb, prevSlotCtx.Slot, epoch, newEpoch, &stakeHistory, epochSchedule, f)
+	defer stakeSpool.Close()
 	t1 := time.Now()
 
 	updateEpochStakesAndRefreshVoteCache(leaderScheduleEpoch, block, acctsDb, prevSlotCtx.Slot, scanResult, f, epochSchedule)
@@ -341,7 +362,7 @@ func handleEpochTransition(acctsDb *accountsdb.AccountsDb, partitionedEpochRewar
 		var epochRewardsCapitalizationIncrease uint64
 		partitionedRewardsInfo, updated, parents, epochRewardsCapitalizationIncrease = beginPartitionedEpochRewardsDistribution(
 			acctsDb, prevSlotCtx, &stakeHistory, replayCtx, epochSchedule,
-			block, f, newEpoch, block.Slot, rpcc, dbgOpts, mode, block.EpochUpdatedAccts,
+			block, f, newEpoch, block.Slot, rpcc, dbgOpts, mode, block.EpochUpdatedAccts, stakeSpool.Stream,
 		)
 		block.EpochUpdatedAccts = append(block.EpochUpdatedAccts, updated...)
 		block.ParentEpochUpdatedAccts = append(block.ParentEpochUpdatedAccts, parents...)
@@ -383,47 +404,17 @@ func handleEpochTransition(acctsDb *accountsdb.AccountsDb, partitionedEpochRewar
 // updateEpochStakesAndRefreshVoteCache applies pre-computed vote/effective stake data
 // from the boundary scan to refresh the vote cache and store epoch stakes.
 func updateEpochStakesAndRefreshVoteCache(leaderScheduleEpoch uint64, b *block.Block, acctsDb *accountsdb.AccountsDb, slot uint64, scanResult *BoundaryStakeScanResult, f *features.Features, epochSchedule *sealevel.SysvarEpochSchedule) {
-	// Check if we need to compute epoch stakes (skip on resume)
+	// A failed boundary can persist this candidate generation before the bank
+	// is accepted. Rebuild it from the already-completed durable-parent scan:
+	// populated cache metadata does not establish that its weights are correct.
+	// Historical generations are untouched; this is only the generation selected
+	// by the boundary being executed.
 	cachedEpochStakes, hasEpochStakes := global.EpochStakesSnapshot(leaderScheduleEpoch)
-
-	// ALWAYS refresh vote cache from AccountsDB, even if HasEpochStakes is true
-	// This ensures the vote cache has fresh NodePubkey for leader schedule
 	voteMetadata, rebuildErr := rebuildVoteCacheFromAccountsDBWithMetadata(acctsDb, slot, scanResult.VoteAcctStakes, 0)
 	if rebuildErr != nil {
 		mlog.Log.Errorf("failed to rebuild vote cache at epoch boundary: %v", rebuildErr)
 	}
 	vatActive := f != nil && f.IsActive(features.ValidatorAdmissionTicket)
-
-	// An older checkpoint can have cached this boundary's stakes without its
-	// commission fields. Recompute that new generation from the same durable
-	// parent; historical generations are restored only from their own snapshots.
-	commissionsComplete := true
-	for _, vote := range cachedEpochStakes.VoteAccounts {
-		if vote == nil || vote.InflationRewardsCommissionBps == nil {
-			commissionsComplete = false
-			break
-		}
-	}
-	// Before VAT, zero-effective-stake voters still supply historical
-	// commissions. A previous attempt may have persisted only effective voters;
-	// this boundary's generation can be rebuilt from the same durable parent.
-	if hasEpochStakes && commissionsComplete && !vatActive {
-		for votePk := range voteMetadata {
-			if _, exists := cachedEpochStakes.VoteAccounts[votePk]; !exists {
-				commissionsComplete = false
-				break
-			}
-		}
-	}
-	if hasEpochStakes && commissionsComplete {
-		mlog.Log.Infof("already had EpochStakes for epoch %d", leaderScheduleEpoch)
-		// A restart can retain this generation from a previously attempted
-		// boundary, while configuration still inherits the parent's stakes.
-		// Install the cached generation on the child just as the fresh path does.
-		b.EpochStakesPerVoteAcct = maps.Clone(cachedEpochStakes.Stakes)
-		b.TotalEpochStake = cachedEpochStakes.TotalStake
-		return
-	}
 
 	// Store epoch stakes computed during scanning. VAT admission changes both the
 	// leader schedule and the Alpenglow BLS rank map, so filter once at the shared
@@ -480,7 +471,13 @@ func updateEpochStakesAndRefreshVoteCache(leaderScheduleEpoch uint64, b *block.B
 			}
 		}
 	}
-	global.PutEpochStakes(leaderScheduleEpoch, epochStakes, epochVoteAccounts, totalEffectiveStake)
+	// Retain the generation identity only after every rebuilt field matches.
+	// This keeps exact retries stable without trusting an unverified cache entry.
+	if !hasEpochStakes || cachedEpochStakes.TotalStake != totalEffectiveStake ||
+		!maps.Equal(cachedEpochStakes.Stakes, epochStakes) ||
+		!reflect.DeepEqual(cachedEpochStakes.VoteAccounts, epochVoteAccounts) {
+		global.PutEpochStakes(leaderScheduleEpoch, epochStakes, epochVoteAccounts, totalEffectiveStake)
+	}
 
 	// Epoch-stake maps are immutable bank snapshot state and are shared by every
 	// slot in an epoch (including a concurrently forged leader bank). Allocate a

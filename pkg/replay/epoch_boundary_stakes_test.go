@@ -186,3 +186,67 @@ func TestEpochBoundaryRestoresCommissionInPreviouslyAttemptedGeneration(t *testi
 	again, _ := global.EpochStakesSnapshot(cacheEpoch)
 	require.Equal(t, got.Generation, again.Generation)
 }
+
+func TestEpochBoundaryRebuildsCompleteButStaleCandidateStakes(t *testing.T) {
+	// A failed epoch-1083 attempt persisted cache1084 with complete vote
+	// metadata but omitted four newly activating1SOL stakes. Fixing the durable
+	// index corrected StakeHistory while blind cache reuse still returned the
+	// wrong total from sol_get_epoch_stake in a later bank.
+	const newEpoch = uint64(91050)
+	const slot = newEpoch * 54000
+	const baseStake = uint64(100_000_000_000)
+	const correctedStake = baseStake + 4_000_000_000
+	voter := solana.PublicKey{51}
+	delegations := []sealevel.Delegation{{VoterPubkey: voter, StakeLamports: baseStake, ActivationEpoch: math.MaxUint64, DeactivationEpoch: math.MaxUint64}}
+	for range 4 {
+		delegations = append(delegations, sealevel.Delegation{VoterPubkey: voter, StakeLamports: 1_000_000_000, ActivationEpoch: newEpoch - 1, DeactivationEpoch: math.MaxUint64})
+	}
+	db := epochBoundaryStakeDB(t, slot-1, delegations)
+	schedule := &sealevel.SysvarEpochSchedule{SlotsPerEpoch: 54000, LeaderScheduleSlotOffset: 54000}
+	f := features.NewFeaturesDefault()
+	cacheEpoch := schedule.LeaderScheduleEpoch(slot)
+	for _, epoch := range []uint64{newEpoch, cacheEpoch} {
+		global.ClearEpochStakes(epoch)
+		t.Cleanup(func() { global.ClearEpochStakes(epoch) })
+	}
+	global.PutEpochStakes(newEpoch, map[solana.PublicKey]uint64{voter: 77}, nil, 77)
+	historical, _ := global.EpochStakesSnapshot(newEpoch)
+
+	for _, persisted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("persisted_%v", persisted), func(t *testing.T) {
+			incompleteScan := &BoundaryStakeScanResult{VoteAcctStakes: map[solana.PublicKey]uint64{voter: baseStake}, EffectiveStakes: map[solana.PublicKey]uint64{voter: baseStake}, TotalEffectiveStake: baseStake}
+			updateEpochStakesAndRefreshVoteCache(cacheEpoch, &block.Block{Slot: slot}, db, slot-1, incompleteScan, f, schedule)
+			stale, _ := global.EpochStakesSnapshot(cacheEpoch)
+			require.NotNil(t, stale.VoteAccounts[voter].InflationRewardsCommissionBps, "the stale candidate already has complete metadata")
+			if persisted {
+				encoded, err := global.SerializeEpochStakes(cacheEpoch)
+				require.NoError(t, err)
+				global.ClearEpochStakes(cacheEpoch)
+				_, err = global.DeserializeAndLoadEpochStakes(encoded)
+				require.NoError(t, err)
+			}
+
+			history := sealevel.SysvarStakeHistory{}
+			scan := scanStakesForEpochBoundary(db, slot-1, newEpoch-1, newEpoch, &history, schedule, f)
+			require.Equal(t, correctedStake, scan.TotalEffectiveStake)
+			b := &block.Block{Slot: slot, Epoch: newEpoch}
+			updateEpochStakesAndRefreshVoteCache(cacheEpoch, b, db, slot-1, scan, f, schedule)
+			fresh, _ := global.EpochStakesSnapshot(cacheEpoch)
+			require.Equal(t, correctedStake, fresh.TotalStake)
+			require.Equal(t, correctedStake, fresh.Stakes[voter])
+			require.Equal(t, correctedStake, b.TotalEpochStake)
+			require.Equal(t, fresh.Stakes, b.EpochStakesPerVoteAcct)
+			afterHistorical, _ := global.EpochStakesSnapshot(newEpoch)
+			require.Equal(t, historical, afterHistorical, "consensus and historical reward generation must remain unchanged")
+
+			// A later bank must inherit the repaired execution generation too.
+			child := &block.Block{Slot: slot + 1531, Epoch: newEpoch}
+			require.NoError(t, seedEpochStakesForExecution(child, newEpoch))
+			require.Equal(t, correctedStake, child.TotalEpochStake)
+			require.Equal(t, correctedStake, child.EpochStakesPerVoteAcct[voter])
+			updateEpochStakesAndRefreshVoteCache(cacheEpoch, b, db, slot-1, scan, f, schedule)
+			again, _ := global.EpochStakesSnapshot(cacheEpoch)
+			require.Equal(t, fresh.Generation, again.Generation, "an independently verified identical retry keeps its generation")
+		})
+	}
+}
