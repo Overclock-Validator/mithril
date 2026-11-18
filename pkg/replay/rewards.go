@@ -446,6 +446,36 @@ func capitalizingEpochRewards(votingRewards, stakerRewards uint64) uint64 {
 	return total
 }
 
+// EpochRewards records every calculated commission, including commissions
+// whose collector cannot receive a deposit. Agave counts those as consumed
+// rewards without minting them. Capitalization and the RPC reward records must
+// still use only the deposits that actually succeeded.
+func newEpochRewardsForDistribution(block *block.Block, totalRewards uint64, result *rewards.StreamingRewardsResult) (sealevel.SysvarEpochRewards, error) {
+	var calculatedVotingRewards uint64
+	for key, reward := range result.ValidatorRewards {
+		if reward == nil {
+			return sealevel.SysvarEpochRewards{}, fmt.Errorf("missing calculated commission for %s", key)
+		}
+		var err error
+		calculatedVotingRewards, err = safemath.CheckedAddU64(calculatedVotingRewards, reward.Load())
+		if err != nil {
+			return sealevel.SysvarEpochRewards{}, fmt.Errorf("calculated voting reward total overflow: %w", err)
+		}
+	}
+	if calculatedVotingRewards > totalRewards {
+		return sealevel.SysvarEpochRewards{}, fmt.Errorf("calculated voting rewards %d exceed epoch reward budget %d", calculatedVotingRewards, totalRewards)
+	}
+	return sealevel.SysvarEpochRewards{
+		DistributionStartingBlockHeight: block.BlockHeight + 1,
+		NumPartitions:                   result.NumPartitions,
+		ParentBlockhash:                 block.LastBlockhash,
+		TotalRewards:                    totalRewards,
+		DistributedRewards:              calculatedVotingRewards,
+		TotalPoints:                     result.TotalPoints,
+		Active:                          true,
+	}, nil
+}
+
 func beginPartitionedEpochRewardsDistribution(acctsDb *accountsdb.AccountsDb, slotCtx *sealevel.SlotCtx, stakeHistory *sealevel.SysvarStakeHistory, epochCtx *ReplayCtx, epochSchedule *sealevel.SysvarEpochSchedule, block *block.Block, f *features.Features, epoch uint64, slot uint64, rpcc *rpcclient.RpcClient, dbgOpts *DebugOptions, mode rewards.RewardCalculationMode, stagedEpochAccts []*accounts.Account, stakeSources ...rewards.StakeAccountStream) (*rewards.PartitionedRewardDistributionInfo, []*accounts.Account, []*accounts.Account, uint64) {
 	partitionedRewardsInfo := rewards.DeterminePartitionedStakingRewardsInfo(epochSchedule, &epochCtx.Inflation, epochCtx.Capitalization, epoch, epoch-1, slot, epochCtx.SlotsPerYear, f)
 	totalRewards, err := partitionedRewardsBudget(
@@ -493,15 +523,16 @@ func beginPartitionedEpochRewardsDistribution(acctsDb *accountsdb.AccountsDb, sl
 	maybeDumpEpochCalculatedRewards(dbgOpts, epoch, slot, streamResult)
 	maybeDumpEpochVotingRewardDiff(dbgOpts, rpcc, block, epoch, slot, streamResult.ValidatorRewards)
 
+	newEpochRewards, err := newEpochRewardsForDistribution(block, totalRewards, streamResult)
+	if err != nil {
+		panic(err)
+	}
 	rewardLoader := epochRewardAccountLoader(acctsDb, slot, slotCtx, stagedEpochAccts)
 	updatedAccts, parentUpdatedAccts, voteRewardsDistributed := rewards.DistributeVotingRewards(acctsDb, streamResult.ValidatorRewards, slot, rewardLoader)
 	if err := replaceInflationRewardRecords(block, updatedAccts, parentUpdatedAccts, rpc.RewardTypeVoting, streamResult.VoteCommissions); err != nil {
 		panic(err)
 	}
 
-	newEpochRewards := sealevel.SysvarEpochRewards{DistributionStartingBlockHeight: block.BlockHeight + 1,
-		NumPartitions: streamResult.NumPartitions, ParentBlockhash: block.LastBlockhash,
-		TotalRewards: totalRewards, DistributedRewards: voteRewardsDistributed, TotalPoints: streamResult.TotalPoints, Active: true}
 	partitionedRewardsInfo.Plan, err = rewards.NewPartitionedRewardPlan(streamResult.SpoolDir, streamResult.SpoolSlot, newEpochRewards, streamResult.VoteCommissions)
 	if err != nil {
 		panic(fmt.Sprintf("create partitioned reward plan: %s", err))
