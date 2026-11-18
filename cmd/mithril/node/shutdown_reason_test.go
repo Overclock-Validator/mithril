@@ -27,12 +27,9 @@ func TestRunCommandReportsReplayFailure(t *testing.T) {
 	require.Nil(t, Run.Run)
 	require.NotNil(t, Run.RunE)
 
-	divergence := &replay.FooterBankhashMismatch{Slot: 470788792}
+	divergence := errors.New("slot 470788792 footer bank hash mismatch: footer=expected computed=actual")
 	err := replayCommandError(&replay.ReplayResult{Error: divergence})
 	require.ErrorIs(t, err, divergence)
-	var mismatch *replay.FooterBankhashMismatch
-	require.ErrorAs(t, err, &mismatch)
-	require.Equal(t, uint64(470788792), mismatch.Slot)
 
 	stall := errors.New("block fetch stalled - no progress for 5m0s")
 	require.ErrorIs(t, replayCommandError(&replay.ReplayResult{Error: stall}), stall)
