@@ -48,9 +48,19 @@ func ApplyAlpenglowVoteRewards(
 	epochSchedule *sealevel.SysvarEpochSchedule,
 	skipRaw, notarRaw, finalCertRaw []byte,
 	shredVersion uint16,
+	prepared ...*LeaderRewardValidationStatus,
 ) error {
 	if len(skipRaw) == 0 && len(notarRaw) == 0 && len(finalCertRaw) == 0 {
 		return nil
+	}
+	// Only the producer passes this status. Network replay keeps its existing
+	// full verification path and never consumes leader preparation entries.
+	var preparation *LeaderRewardValidationStatus
+	if !slotCtx.Replay && len(prepared) > 0 {
+		preparation = prepared[0]
+		if preparation != nil {
+			*preparation = LeaderRewardValidationStatus{}
+		}
 	}
 	if slotCtx.Features == nil || !(slotCtx.Features.IsActive(features.Alpenglow) || slotCtx.Features.IsActive(features.AlpenglowDevContext)) {
 		return nil
@@ -93,12 +103,21 @@ func ApplyAlpenglowVoteRewards(
 			return fmt.Errorf("slot %d vote rewards: %w", block.Slot, err)
 		}
 
-		validated, validationTimings, err := verifierMaterial.validateRewardCertificates(
-			block.Slot,
-			skipRaw,
-			notarRaw,
-			rewardDetails != nil,
-		)
+		var validated *rewardcerts.ValidatedRewardCert
+		var validationTimings rewardcerts.RewardCertificateValidationTimings
+		if preparation != nil {
+			started := time.Now()
+			validated, preparation.Prepared = preparedLeaderRewardValidations.take(block.Slot, skipRaw, notarRaw, verifierMaterial)
+			preparation.LookupDuration = time.Since(started)
+		}
+		if preparation == nil || !preparation.Prepared {
+			validated, validationTimings, err = verifierMaterial.validateRewardCertificates(
+				block.Slot,
+				skipRaw,
+				notarRaw,
+				rewardDetails != nil,
+			)
+		}
 		if rewardDetails != nil {
 			if validationTimings.Skip > 0 {
 				rewardDetails.SkipCertificateValidation.AddTiming(validationTimings.Skip)

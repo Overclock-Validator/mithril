@@ -35,6 +35,8 @@ type GlobalCtx struct {
 	cachedStakeEntries         []accountsdb.StakeIndexEntry            // Parsed+sorted index, populated on first load
 	entriesFlushedSinceCompact int                                     // Appended entries since last compaction
 	voteCache                  map[solana.PublicKey]*sealevel.VoteStateVersions
+	voteCacheUndo              map[uint64]map[solana.PublicKey]voteCacheBefore
+	voteCacheJournalSlot       *uint64
 	epochStakes                *epochstakes.EpochStakesCache
 	slotsConfirmed             map[uint64]struct{}
 	leaderSchedule             *leaderschedule.LeaderSchedule // compatibility schedule installed by SetLeaderSchedule
@@ -161,10 +163,10 @@ func SlotConfirmed(slot uint64) bool {
 func PutVoteCacheItem(pubkey solana.PublicKey, voteState *sealevel.VoteStateVersions) {
 	instance.voteCacheMutex.Lock()
 	defer instance.voteCacheMutex.Unlock()
-	if instance.voteCache == nil {
-		instance.voteCache = make(map[solana.PublicKey]*sealevel.VoteStateVersions)
+	if instance.voteCacheJournalSlot != nil {
+		recordVoteCacheBeforeLocked(*instance.voteCacheJournalSlot, pubkey)
 	}
-	instance.voteCache[pubkey] = voteState
+	putVoteCacheLocked(pubkey, voteState)
 }
 
 func VoteCacheItem(pubkey solana.PublicKey) *sealevel.VoteStateVersions {
@@ -176,6 +178,9 @@ func VoteCacheItem(pubkey solana.PublicKey) *sealevel.VoteStateVersions {
 func DeleteVoteCacheItem(pubkey solana.PublicKey) {
 	instance.voteCacheMutex.Lock()
 	defer instance.voteCacheMutex.Unlock()
+	if instance.voteCacheJournalSlot != nil {
+		recordVoteCacheBeforeLocked(*instance.voteCacheJournalSlot, pubkey)
+	}
 	delete(instance.voteCache, pubkey)
 }
 
@@ -486,15 +491,43 @@ func FlushPendingStakePubkeys(accountsDbDir string) (int, error) {
 // time), never a subset — the index feeding epoch-stakes enumeration must
 // never miss a folded slot's stake accounts. Entries for slots > through stay
 // in RAM (merged into scans) until their own fold or unwind decides them.
-// Returns the number of entries flushed.
-func FlushPendingStakePubkeysThrough(accountsDbDir string, through uint64) (int, error) {
+// committed keys come directly from the accepted fold's account deltas. They
+// must be indexed even if speculative bookkeeping discarded a pending hint.
+// Each pubkey is appended once per flush, retaining its latest available
+// location hint from an eligible slot. Returns the number of entries flushed.
+func FlushPendingStakePubkeysThrough(accountsDbDir string, through uint64, committed ...solana.PublicKey) (int, error) {
 	instance.pendingStakeMutex.Lock()
 	var pending []accountsdb.StakeIndexEntry
-	for slot, entries := range instance.pendingStakeBySlot {
-		if slot <= through {
-			pending = append(pending, entries...)
-			delete(instance.pendingStakeBySlot, slot)
+	seen := make(map[solana.PublicKey]int, len(committed))
+	appendEntry := func(entry accountsdb.StakeIndexEntry) {
+		if idx, ok := seen[entry.Pubkey]; ok {
+			// A committed key or later hintless write must not erase a usable
+			// location hint. Hints only affect scan ordering, not account lookup.
+			if entry.FileId != 0 || entry.Offset != 0 {
+				pending[idx] = entry
+			}
+			return
 		}
+		seen[entry.Pubkey] = len(pending)
+		pending = append(pending, entry)
+	}
+	for _, pubkey := range committed {
+		appendEntry(accountsdb.StakeIndexEntry{Pubkey: pubkey})
+	}
+	var slots []uint64
+	for slot := range instance.pendingStakeBySlot {
+		if slot <= through {
+			slots = append(slots, slot)
+		}
+	}
+	// Map iteration order cannot decide which location hint wins. Process
+	// eligible slots oldest first; future slots remain untouched in RAM.
+	slices.Sort(slots)
+	for _, slot := range slots {
+		for _, entry := range instance.pendingStakeBySlot[slot] {
+			appendEntry(entry)
+		}
+		delete(instance.pendingStakeBySlot, slot)
 	}
 	if len(pending) == 0 {
 		instance.pendingStakeMutex.Unlock()

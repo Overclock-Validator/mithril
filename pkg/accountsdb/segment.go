@@ -1,6 +1,7 @@
 package accountsdb
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
@@ -44,6 +45,10 @@ const (
 	// its only job is proving the data file is not an orphan.
 	ManifestKindFold    = uint8(1)
 	ManifestKindCompact = uint8(2)
+	// ManifestKindSparse lists only retained records at their original offsets.
+	// Gaps can contain punched-out headers: scan this kind through its manifest,
+	// never through the sequential appendvec parser. It is not a fold redo log.
+	ManifestKindSparse = uint8(3)
 )
 
 // ErrTornManifest reports a manifest that fails CRC or structural validation.
@@ -336,6 +341,89 @@ func ReadSegmentManifest(path string) (*SegmentManifest, error) {
 		return nil, ErrTornManifest
 	}
 	return m, nil
+}
+
+// visitSegmentManifestRecords validates the same complete manifest as
+// ReadSegmentManifest, without retaining its body, bankhashes, resume context,
+// or decoded record array. The visitor's results are tentative until this
+// function succeeds: a later record or the trailing CRC can still be invalid.
+// Compaction builds private pins with it and publishes them only on success.
+func visitSegmentManifestRecords(path string, visit func(ManifestRecord) error) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() < 4 {
+		return ErrTornManifest
+	}
+	body := &io.LimitedReader{R: f, N: info.Size() - 4}
+	h := crc32.NewIEEE()
+	r := bufio.NewReaderSize(io.TeeReader(body, h), 64<<10)
+	var prefix [4 + 4 + 1 + 5*8 + 4]byte
+	if _, err := io.ReadFull(r, prefix[:]); err != nil {
+		return ErrTornManifest
+	}
+	var m SegmentManifest
+	if err := decodeManifestPrefix(&manifestDecoder{data: prefix[:]}, &m); err != nil {
+		return err
+	}
+	var count [8]byte
+	if _, err := io.ReadFull(r, count[:4]); err != nil {
+		return ErrTornManifest
+	}
+	bankBytes := int64(binary.LittleEndian.Uint32(count[:4])) * 40
+	if _, err := io.CopyN(io.Discard, r, bankBytes); err != nil {
+		return ErrTornManifest
+	}
+	if _, err := io.ReadFull(r, count[:4]); err != nil {
+		return ErrTornManifest
+	}
+	contextBytes := int64(binary.LittleEndian.Uint32(count[:4]))
+	if _, err := io.CopyN(io.Discard, r, contextBytes); err != nil {
+		return ErrTornManifest
+	}
+	if _, err := io.ReadFull(r, count[:]); err != nil {
+		return ErrTornManifest
+	}
+	n := binary.LittleEndian.Uint64(count[:])
+	remaining := body.N + int64(r.Buffered())
+	if remaining%manifestRecordSize != 0 || n != uint64(remaining/manifestRecordSize) {
+		return ErrTornManifest
+	}
+	for i := uint64(0); i < n; i++ {
+		raw, err := r.Peek(manifestRecordSize)
+		if err != nil {
+			return ErrTornManifest
+		}
+		var rec ManifestRecord
+		copy(rec.Pubkey[:], raw[:32])
+		rec.Offset = binary.LittleEndian.Uint64(raw[32:40])
+		rec.OwnerSlot = binary.LittleEndian.Uint64(raw[40:48])
+		rec.PrevValid = raw[48] == 1
+		rec.Prev.Unmarshal((*[24]byte)(raw[49:73]))
+		if visit != nil {
+			if err := visit(rec); err != nil {
+				return err
+			}
+		}
+		_, _ = r.Discard(manifestRecordSize) // Peek established these bytes exist.
+	}
+	if _, err := io.ReadFull(f, count[:4]); err != nil {
+		return ErrTornManifest
+	}
+	if h.Sum32() != binary.LittleEndian.Uint32(count[:4]) {
+		return ErrTornManifest
+	}
+	// Reject a file which grew after Stat instead of accepting a valid prefix.
+	if n, err := f.Read(count[:1]); n != 0 || err != io.EOF {
+		return ErrTornManifest
+	}
+	return nil
 }
 
 // ReadSegmentManifestContext reads only the fixed prefix and resume context,

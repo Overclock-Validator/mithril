@@ -1,0 +1,386 @@
+{
+  "captured_utc": "2026-11-12T12:46:47.745079+00:00",
+  "source_commit": "7f05abfe62286cbb3a32795644974692dadfdd57",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 9950X",
+    "cores": 16,
+    "logical_cpus": 32,
+    "installed_ram_gb": 128,
+    "configured_ddr5_mt_s": 3600,
+    "live_go_version": "go1.27.3 linux/amd64"
+  },
+  "leader_current": {
+    "run": "20261111-234132Z_f85d0da_7ca89416",
+    "build_note": "f85d0da-dirty built before committing source as7f05abfe; includes newer fork/epoch work; no current review-followup changes",
+    "sample_count": 440,
+    "slot_range": [
+      468312444,
+      468498423
+    ],
+    "sample_selection": "first440 broadcast-complete lines from run",
+    "sample_lines_sha256": "445ed3221b53af02d650c6deae7f4b8be9c7f5b22fec7b9063c787415103c230",
+    "completion_reserve_ms": 15,
+    "harmonic_blocks": 440,
+    "negative_margin_count": 4,
+    "reward_prepare_ready": 440,
+    "reward_prepare_missing": 0,
+    "metrics": {
+      "finalization_ms": {
+        "n": 440,
+        "min": 4.0,
+        "median": 5.0,
+        "p95": 8.0,
+        "p99": 14.0,
+        "max": 27.0
+      },
+      "deadline_margin_ms": {
+        "n": 440,
+        "min": -12.0,
+        "median": 8.0,
+        "p95": 9.0,
+        "p99": 10.0,
+        "max": 10.0
+      },
+      "freeze_ms": {
+        "n": 440,
+        "min": 0.001,
+        "median": 0.014,
+        "p95": 0.042,
+        "p99": 1.245,
+        "max": 5.063
+      },
+      "drain_deadline_lag_ms": {
+        "n": 440,
+        "min": 0.0,
+        "median": 0.0,
+        "p95": 0.0,
+        "p99": 0.081,
+        "max": 0.652
+      },
+      "reward_prepare_ms": {
+        "n": 440,
+        "min": 16.752,
+        "median": 20.543,
+        "p95": 34.358,
+        "p99": 38.465,
+        "max": 59.57
+      }
+    }
+  },
+  "leader_historical": {
+    "run": "20261109-225816Z_cbd95db_5b5da1d3",
+    "sample_count": 348,
+    "slot_range": [
+      467494452,
+      467651491
+    ],
+    "completion_reserve_ms": 40,
+    "negative_margin_count": 2,
+    "metrics": {
+      "finalization_ms": {
+        "n": 348,
+        "min": 7.0,
+        "median": 12.0,
+        "p95": 19.0,
+        "p99": 27.0,
+        "max": 34.0,
+        "mean": 12.60919540229885
+      },
+      "deadline_margin_ms": {
+        "n": 348,
+        "min": -3.0,
+        "median": 25.0,
+        "p95": 29.0,
+        "p99": 30.0,
+        "max": 31.0,
+        "mean": 23.57471264367816
+      },
+      "cutoff_overrun_ms": {
+        "n": 348,
+        "min": 1.0,
+        "median": 3.5,
+        "p95": 8.0,
+        "p99": 17.0,
+        "max": 26.0,
+        "mean": 3.8160919540229883
+      },
+      "slot_ending_ms": {
+        "n": 348,
+        "min": 0.001,
+        "median": 0.001,
+        "p95": 0.003,
+        "p99": 0.004,
+        "max": 0.005,
+        "mean": 0.0015574712643678162
+      },
+      "freeze_ms": {
+        "n": 348,
+        "min": 0.001,
+        "median": 0.015,
+        "p95": 0.031,
+        "p99": 0.041,
+        "max": 0.046,
+        "mean": 0.01539367816091954
+      },
+      "entry_drain_ms": {
+        "n": 348,
+        "min": 0.676,
+        "median": 1.508,
+        "p95": 2.332,
+        "p99": 3.228,
+        "max": 3.962,
+        "mean": 1.4044051724137931
+      },
+      "reward_certs_ms": {
+        "n": 348,
+        "min": 0.001,
+        "median": 0.002,
+        "p95": 0.005,
+        "p99": 0.008,
+        "max": 0.012,
+        "mean": 0.0025402298850574715
+      },
+      "reward_prepare_ms": {
+        "n": 348,
+        "min": 0.016,
+        "median": 19.081000000000003,
+        "p95": 32.198,
+        "p99": 40.813,
+        "max": 48.173,
+        "mean": 21.489025862068967
+      },
+      "build_block_ms": {
+        "n": 348,
+        "min": 0.001,
+        "median": 0.002,
+        "p95": 0.006,
+        "p99": 0.017,
+        "max": 0.057,
+        "mean": 0.003195402298850575
+      },
+      "bank_commit_ms": {
+        "n": 348,
+        "min": 5.204,
+        "median": 9.292000000000002,
+        "p95": 15.82,
+        "p99": 23.134,
+        "max": 29.662,
+        "mean": 9.941436781609195
+      },
+      "footer_broadcast_ms": {
+        "n": 348,
+        "min": 0.645,
+        "median": 0.8714999999999999,
+        "p95": 1.265,
+        "p99": 2.164,
+        "max": 2.508,
+        "mean": 0.9367672413793103
+      },
+      "ending_tick_broadcast_ms": {
+        "n": 348,
+        "min": 0.609,
+        "median": 0.7304999999999999,
+        "p95": 1.137,
+        "p99": 1.816,
+        "max": 2.856,
+        "mean": 0.8025086206896552
+      },
+      "commit_prepare_sysvars_ms": {
+        "n": 348,
+        "min": 0.0,
+        "median": 0.0,
+        "p95": 0.0,
+        "p99": 0.001,
+        "max": 0.003,
+        "mean": 3.160919540229885e-05
+      },
+      "commit_footer_clock_ms": {
+        "n": 348,
+        "min": 0.004,
+        "median": 0.006,
+        "p95": 0.01,
+        "p99": 0.019,
+        "max": 0.037,
+        "mean": 0.006511494252873564
+      },
+      "commit_vote_rewards_ms": {
+        "n": 348,
+        "min": 2.271,
+        "median": 3.0875000000000004,
+        "p95": 3.792,
+        "p99": 5.534,
+        "max": 7.139,
+        "mean": 3.1613994252873563
+      },
+      "commit_fees_ms": {
+        "n": 348,
+        "min": 0.003,
+        "median": 0.004,
+        "p95": 0.006,
+        "p99": 0.012,
+        "max": 0.019,
+        "mean": 0.004295977011494253
+      },
+      "commit_rent_ms": {
+        "n": 348,
+        "min": 0.0,
+        "median": 0.0,
+        "p95": 0.001,
+        "p99": 0.002,
+        "max": 0.004,
+        "mean": 0.000117816091954023
+      },
+      "commit_incinerator_ms": {
+        "n": 348,
+        "min": 0.0,
+        "median": 0.0,
+        "p95": 0.001,
+        "p99": 0.001,
+        "max": 0.002,
+        "mean": 0.00010057471264367816
+      },
+      "commit_finalize_sysvars_ms": {
+        "n": 348,
+        "min": 0.214,
+        "median": 0.243,
+        "p95": 0.368,
+        "p99": 0.532,
+        "max": 1.382,
+        "mean": 0.2678879310344828
+      },
+      "commit_compile_accounts_ms": {
+        "n": 348,
+        "min": 0.807,
+        "median": 1.467,
+        "p95": 2.836,
+        "p99": 4.557,
+        "max": 9.139,
+        "mean": 1.6400316091954024
+      },
+      "commit_parent_accounts_ms": {
+        "n": 348,
+        "min": 0.742,
+        "median": 3.1085000000000003,
+        "p95": 7.251,
+        "p99": 12.571,
+        "max": 15.43,
+        "mean": 3.5832758620689655
+      },
+      "commit_bankhash_ms": {
+        "n": 348,
+        "min": 0.39,
+        "median": 1.1219999999999999,
+        "p95": 3.234,
+        "p99": 5.354,
+        "max": 6.189,
+        "mean": 1.2758017241379311
+      }
+    }
+  },
+  "memory": {
+    "before_median_rss_gib": 16.00881576538086,
+    "after_warm_median_rss_gib": 11.571002960205078,
+    "reduction_percent": 27.721056136910338,
+    "highest_rss_since_restart_gib": 13.667713165283203,
+    "warm_sample_window": [
+      "2026-11-10T16:19:02.258727+00:00",
+      "2026-11-10T16:30:02.437566+00:00"
+    ],
+    "swap_bytes": 0,
+    "retained_heap_latest_gib": 4.109075569547713,
+    "gc_cpu_percent": {
+      "min": 1.8,
+      "median": 2.1,
+      "max": 2.3
+    },
+    "after_warm_samples": 23,
+    "before_window_seconds": 122.659455,
+    "limits": "Configuration and code changed together;12GiB soft Go limit +256MiB arenas were trial settings. This is not a16GiB-machine guarantee."
+  },
+  "replay_observational": {
+    "before": {
+      "slot_replay_ms": {
+        "count": 8379,
+        "min": 2.384084,
+        "median": 5.798202,
+        "p95": 12.023108,
+        "max": 80.696277,
+        "mean": 6.757153426303855
+      },
+      "mean_consumed_cu_per_block": 26240025.77980666,
+      "consumed_cu_per_replay_ns": 3.883295838401568
+    },
+    "after": {
+      "slot_replay_ms": {
+        "count": 4327,
+        "min": 2.226518,
+        "median": 5.130292,
+        "p95": 10.669559,
+        "max": 38.252511,
+        "mean": 6.043543311763346
+      },
+      "mean_consumed_cu_per_block": 19131002.878668822,
+      "consumed_cu_per_replay_ns": 3.165527554246468
+    }
+  },
+  "tips_observational": {
+    "before": {
+      "requested_blocks": 48,
+      "finalized_identity_matches": 48,
+      "status_counts": {
+        "finalized_identity_match": 48
+      },
+      "zero_tip_blocks": 14,
+      "positive_tip_blocks": 34,
+      "tip_transactions": 178,
+      "tip_sol": 0.013966937,
+      "mean_tip_sol": 0.0002909778541666667,
+      "median_tip_sol": 1.6765e-05,
+      "fee_sol": 3.835196227,
+      "mean_fee_sol": 0.07989992139583332,
+      "median_fee_sol": 0.005812206,
+      "maximum_fee_sol": 3.239752015,
+      "failed_transactions": 3578,
+      "slot_range": [
+        467716312,
+        467739539
+      ]
+    },
+    "after_initial8": {
+      "requested_blocks": 8,
+      "finalized_identity_matches": 8,
+      "status_counts": {
+        "finalized_identity_match": 8
+      },
+      "zero_tip_blocks": 0,
+      "positive_tip_blocks": 8,
+      "tip_transactions": 116,
+      "tip_sol": 0.010644628,
+      "mean_tip_sol": 0.0013305785,
+      "median_tip_sol": 0.0007056515,
+      "fee_sol": 0.083976576,
+      "mean_fee_sol": 0.010497072,
+      "median_fee_sol": 0.009342926,
+      "maximum_fee_sol": 0.021623643,
+      "failed_transactions": 836,
+      "slot_range": [
+        467740856,
+        467741071
+      ]
+    },
+    "measurement": "Successful positive per-transaction net credits to eight canonical Jito tip accounts; failed transactions and crank withdrawals excluded"
+  },
+  "limits": [
+    "Historical/live samples use different blocks and loads; they are not matched-block A/B benchmarks.",
+    "Streaming SlotReplay measures foreground replay wall time; CU/ns is not isolated VM instruction throughput.",
+    "Leader integer-ms fields are truncated; freeze includes execution wait and entry flush, while drain_deadline_lag excludes Freeze.",
+    "No true16GiB-host validation, epoch-transition soak or fork-switch event claimed by this sample."
+  ],
+  "source_artifact_sha256": {
+    "completion-tail-20261110-085315Z/overnight-baseline.json": "851b2dc23eb06b8c646e549496f201cab52af90bc56baea478849714b9b6c6d0",
+    "memory-reduction-trial-20261110-155944Z/result.json": "4e08b17fa656553e92f066b431d4a2c9117c904a49e9cce2e86cd0f166342ada",
+    "memory-reduction-trial-20261110-155944Z/independent-memory-evaluation.json": "ff9848ba0254058e82b928e806bc420755912708840b0844a97c923939760eb7",
+    "tip-subscription-trial-20261110-133226Z/baseline-finalized-tips-at-stop.json": "a1993cf7a941550e2bc5d7df3b6000e12ca3757e17df0aeb04590176cc1da2f2",
+    "tip-subscription-trial-20261110-133226Z/after-first8-finalized-tips.json": "4cc73fe769d323bfe5faa8ed4c81d3b7888093755f5df2091a23d71ab9270500"
+  }
+}
