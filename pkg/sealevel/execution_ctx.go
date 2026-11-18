@@ -34,6 +34,18 @@ type ExecutionCtx struct {
 	SlotCtx                  *SlotCtx
 	ModifiedVoteStates       map[solana.PublicKey]*VoteStateVersions
 	IsSimulation             bool
+	// Speculative marks an execution whose result may be discarded: it never
+	// publishes to the shared program cache; its program cache misses compile a
+	// private entry.
+	Speculative bool
+	// SpeculativeCancel is private to an attempt already rejected by replay.
+	SpeculativeCancel *atomic.Bool
+	// PrivateParameters serializes instruction parameters into heap buffers
+	// instead of the bank's parameter arena.
+	PrivateParameters bool
+	// PrivatePrograms makes every program load bypass the shared program cache
+	// (diagnostic).
+	PrivatePrograms bool
 
 	// RecordInnerInstructions enables capture of CPI instructions into
 	// InnerInstrs. Off by default; the simulate handler enables it when
@@ -110,6 +122,13 @@ type SlotCtx struct {
 	bankSysvars              atomic.Pointer[BankSysvars]
 
 	TraceCtx context.Context
+
+	// ParentReadHook, when set, is told every key this context reads from the
+	// parent bank directly, that is, not through Accounts (bank sysvar
+	// snapshots excluded). Diagnostic: an early execution's sealed context
+	// uses it to show that such reads were also seen by its recording view.
+	// Never copied to a derived context.
+	ParentReadHook func(solana.PublicKey)
 
 	// Speculative execution support (streaming replay and local production). A bank executed before
 	// its block is complete must not publish to process-global state until
@@ -521,6 +540,9 @@ func (slotCtx *SlotCtx) GetAccountShared(pubkey solana.PublicKey) (*accounts.Acc
 }
 
 func (slotCtx *SlotCtx) GetParentAccount(pubkey solana.PublicKey) (*accounts.Account, error) {
+	if slotCtx.ParentReadHook != nil {
+		slotCtx.ParentReadHook(pubkey)
+	}
 	// Producer commits retain parent images while other admitted scratch
 	// transactions may still read this shared store. Finalization joins all
 	// scratch execution before mutating the frozen bank.
@@ -539,6 +561,9 @@ func (slotCtx *SlotCtx) GetAccountFromAccountsDb(pubkey solana.PublicKey) (*acco
 			return acct, nil
 		}
 		return nil, fmt.Errorf("bank sysvar account %s is absent at slot %d", pubkey, slotCtx.Slot)
+	}
+	if slotCtx.ParentReadHook != nil {
+		slotCtx.ParentReadHook(pubkey)
 	}
 	if slotCtx.UnrootedRead != nil {
 		return slotCtx.UnrootedRead.GetAccount(slotCtx.Slot, pubkey)
@@ -584,6 +609,9 @@ func (slotCtx *SlotCtx) getProgramAccountSource(pubkey solana.PublicKey) (*accou
 		if reader, ok := slotCtx.UnrootedRead.(interface {
 			GetAccountShared(uint64, solana.PublicKey) (*accounts.Account, error)
 		}); ok {
+			if slotCtx.ParentReadHook != nil {
+				slotCtx.ParentReadHook(pubkey)
+			}
 			acct, err := reader.GetAccountShared(slotCtx.Slot, pubkey)
 			return acct, true, err
 		}
@@ -600,6 +628,9 @@ func (slotCtx *SlotCtx) GetAccountDataLenFromAccountsDb(pubkey solana.PublicKey)
 		if reader, ok := slotCtx.UnrootedRead.(interface {
 			GetAccountDataLen(uint64, solana.PublicKey) (uint64, error)
 		}); ok {
+			if slotCtx.ParentReadHook != nil {
+				slotCtx.ParentReadHook(pubkey)
+			}
 			return reader.GetAccountDataLen(slotCtx.Slot, pubkey)
 		}
 	}

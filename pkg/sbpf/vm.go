@@ -3,6 +3,7 @@ package sbpf
 import (
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/Overclock-Validator/mithril/pkg/cu"
 	"github.com/gagliardetto/solana-go"
@@ -37,7 +38,11 @@ type VM interface {
 }
 
 // VMOpts specifies virtual machine parameters.
+// ErrCancelled is only for discarded private executions, never a canonical result.
+var ErrCancelled = errors.New("private speculative execution cancelled")
+
 type VMOpts struct {
+	Cancel *atomic.Bool
 	// Machine parameters
 	HeapMax  int
 	Syscalls SyscallRegistry
