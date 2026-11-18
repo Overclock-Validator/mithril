@@ -321,12 +321,6 @@ func main() {
 	MOVBLZX AL, BX; \
 	JMP  (R11)(BX*8)
 
-// NEXTSHARED is NEXT through one shared dispatch point (asmDispatch): every
-// handler of the shared set ends in a direct jump to it, so the loop has a
-// single indirect jump, as a switch-based loop does. Experiment only.
-#define NEXTSHARED \
-	JMP asmDispatch<>(SB)
-
 // LEAVE returns pc and the unused budget to Go. Every handler shares
 // runAsmLoop's argument frame: none of them moves SP, so the offsets agree.
 #define LEAVE \
@@ -352,59 +346,35 @@ TEXT ·runAsmLoop(SB), NOSPLIT|NOFRAME, $0-88
 out:
 	LEAVE
 `)
-	s.WriteString(`
-// asmDispatch is the shared set's only dispatch: it finishes an instruction
-// exactly as NEXT does, then makes the loop's single indirect jump.
-TEXT asmDispatch<>(SB), NOSPLIT|NOFRAME, $0-88
-	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
-	NEXT
-out:
-	LEAVE
-`)
-	// Two sets of the same handlers: the threaded set ends each handler in
-	// its own indirect jump, the shared set ("S") in a jump to asmDispatch.
-	for _, set := range []struct{ prefix, next string }{{"asmOp", "NEXT"}, {"asmOpS", "NEXTSHARED"}} {
-		for _, h := range handlers {
-			fmt.Fprintf(&s, "\nTEXT %s%s<>(SB), NOSPLIT|NOFRAME, $0-88\n", set.prefix, h.name)
-			// The handlers run in runAsmLoop's frame, so they describe its
-			// arguments the same way.
-			s.WriteString("\tFUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)\n")
-			for _, l := range h.body {
-				if strings.HasSuffix(l, ":") {
-					fmt.Fprintf(&s, "%s\n", l)
-				} else {
-					fmt.Fprintf(&s, "\t%s\n", l)
-				}
+	for _, h := range handlers {
+		fmt.Fprintf(&s, "\nTEXT asmOp%s<>(SB), NOSPLIT|NOFRAME, $0-88\n", h.name)
+		// The handlers run in runAsmLoop's frame, so they describe its
+		// arguments the same way.
+		s.WriteString("\tFUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)\n")
+		for _, l := range h.body {
+			if strings.HasSuffix(l, ":") {
+				fmt.Fprintf(&s, "%s\n", l)
+			} else {
+				fmt.Fprintf(&s, "\t%s\n", l)
 			}
-			// Bail is the table entry for every opcode the loop does not
-			// handle: it leaves at once, with pc and the budget untouched.
-			if h.name == "Bail" {
-				s.WriteString("\tLEAVE\n")
-				continue
-			}
-			fmt.Fprintf(&s, "\t%s\nout:\n\tLEAVE\n", set.next)
 		}
+		// Bail is the table entry for every opcode the loop does not handle:
+		// it leaves at once, with pc and the budget untouched.
+		if h.name == "Bail" {
+			s.WriteString("\tLEAVE\n")
+			continue
+		}
+		s.WriteString("\tNEXT\nout:\n\tLEAVE\n")
 	}
 	s.WriteString("\n// asmHandlers holds each handler's address, indexed by its ID.\n")
 	for i, h := range handlers {
 		fmt.Fprintf(&s, "DATA asmHandlers<>+%d(SB)/8, $asmOp%s<>(SB)\n", i*8, h.name)
 	}
 	fmt.Fprintf(&s, "GLOBL asmHandlers<>(SB), RODATA|NOPTR, $%d\n", len(handlers)*8)
-	s.WriteString("\n// asmHandlersShared is the same table for the shared-dispatch set.\n")
-	for i, h := range handlers {
-		fmt.Fprintf(&s, "DATA asmHandlersShared<>+%d(SB)/8, $asmOpS%s<>(SB)\n", i*8, h.name)
-	}
-	fmt.Fprintf(&s, "GLOBL asmHandlersShared<>(SB), RODATA|NOPTR, $%d\n", len(handlers)*8)
 	s.WriteString(`
 // func asmHandlerTable() *[numAsmHandlers]uintptr
 TEXT ·asmHandlerTable(SB), NOSPLIT, $0-8
 	LEAQ asmHandlers<>(SB), AX
-	MOVQ AX, ret+0(FP)
-	RET
-
-// func asmHandlerTableShared() *[numAsmHandlers]uintptr
-TEXT ·asmHandlerTableShared(SB), NOSPLIT, $0-8
-	LEAQ asmHandlersShared<>(SB), AX
 	MOVQ AX, ret+0(FP)
 	RET
 `)

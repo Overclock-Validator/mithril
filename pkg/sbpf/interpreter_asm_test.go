@@ -27,17 +27,7 @@ func withAsmLoop(t *testing.T, chunk uint64, fn func()) {
 // budget, edge cases, invalid pcs and syscall registry precedence. Tiny chunks
 // force a re-entry at every instruction boundary.
 func TestAsmLoopMatchesRun(t *testing.T) {
-	t.Run("threaded", func(t *testing.T) {
-		defer setAsmSharedDispatch(false)()
-		testAsmLoopMatchesRun(t, []uint64{0, 1, 2, 7})
-	})
-	// The shared-dispatch set is an experiment: the default chunk and the
-	// smallest are enough to cover it against the reference.
-	t.Run("shared", func(t *testing.T) { defer setAsmSharedDispatch(true)(); testAsmLoopMatchesRun(t, []uint64{0, 1}) })
-}
-
-func testAsmLoopMatchesRun(t *testing.T, chunks []uint64) {
-	for _, chunk := range chunks {
+	for _, chunk := range []uint64{0, 1, 2, 7} {
 		t.Run(fmt.Sprintf("chunk=%d", chunk), func(t *testing.T) {
 			withAsmLoop(t, chunk, func() {
 				// The budgets suite is nearly all of this package's run time
