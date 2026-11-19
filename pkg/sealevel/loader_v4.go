@@ -69,6 +69,11 @@ func (write *LoaderV4Write) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 		return err
 	}
 
+	// Check the consumed-byte budget before converting the untrusted vector length.
+	if decoder.Position() > instructionDeserializationLimit || bytesLen > uint64(instructionDeserializationLimit-decoder.Position()) {
+		return InstrErrInvalidInstructionData
+	}
+
 	write.Bytes, err = decoder.ReadBytes(int(bytesLen))
 	return err
 }
@@ -204,12 +209,11 @@ func LoaderV4Execute(execCtx *ExecutionCtx) error {
 			return InstrErrComputationalBudgetExceeded
 		}
 
-		if len(instrData) < 1 {
+		decoder := bin.NewBinDecoder(instrData)
+		instrType, err := decoder.ReadUint32(bin.LE)
+		if err != nil {
 			return InstrErrInvalidInstructionData
 		}
-
-		decoder := bin.NewBinDecoder(instrData)
-		instrType := instrData[0]
 
 		switch instrType {
 		case LoaderV4InstrTypeWrite:
@@ -265,6 +269,8 @@ func LoaderV4Execute(execCtx *ExecutionCtx) error {
 				err = LoaderV4ProcessFinalize(execCtx)
 			}
 
+		default:
+			return InstrErrInvalidInstructionData
 		}
 	} else { // execute bpf program code path
 		var program *BorrowedAccount

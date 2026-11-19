@@ -103,6 +103,14 @@ func (write *UpgradeableLoaderInstrWrite) UnmarshalWithDecoder(decoder *bin.Deco
 		return err
 	}
 
+	// Agave's limited_deserialize counts the enum tag, offset and vector
+	// length against PACKET_DATA_SIZE, but permits unconsumed trailing bytes.
+	// V1 transactions can carry more than 1232 bytes; loader instructions still
+	// retain this decoding limit. Check before converting an untrusted length.
+	if decoder.Position() > instructionDeserializationLimit || bytesLen > uint64(instructionDeserializationLimit-decoder.Position()) {
+		return InstrErrInvalidInstructionData
+	}
+
 	bytes, err := decoder.ReadBytes(int(bytesLen))
 	if err != nil {
 		return err

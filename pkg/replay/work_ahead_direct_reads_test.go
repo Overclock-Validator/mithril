@@ -67,6 +67,7 @@ var directStateReads = map[string]string{
 	"sealevel/loader_v4.go LoaderV4Execute GetAccountFromAccountsDb":                                 "1 parent",
 	"sealevel/loader_v4.go LoaderV4ProcessDeploy AccountsDb.AddProgramToCache":                       "1 publish",
 	"sealevel/loader_v4.go LoaderV4ProcessRetract AccountsDb.RemoveProgramFromCache":                 "1 publish",
+	"sealevel/vote_migration.go voteAlpenglowMigrationSucceeded GetParentAccount":                    "1 parent",
 }
 
 // directReadHelpers are the SlotCtx methods that read the parent bank.

@@ -71,8 +71,9 @@ var (
 		PreRunE: func(cmd *cobra.Command, args []string) error {
 			return initConfigAndBindFlags(cmd)
 		},
-		Run: func(cmd *cobra.Command, args []string) {
-			runLive(cmd, args)
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cmd.SilenceUsage = true
+			return runLive(cmd, args)
 		},
 	}
 
@@ -1392,7 +1393,7 @@ func buildSnapshotConfig(rpcEndpoints []string) snapshotdl.SnapshotConfig {
 	return cfg
 }
 
-func runLive(c *cobra.Command, args []string) {
+func runLive(c *cobra.Command, args []string) error {
 	if pprofPort != -1 {
 		startPprofHandlers(int(pprofPort))
 	}
@@ -3137,6 +3138,7 @@ postBootstrap:
 
 	mlog.Log.Infof("Done replaying, closing DB")
 	accountsDb.CloseDb()
+	return replayCommandError(result)
 }
 
 type turbineEntrypointQuery func(*net.UDPAddr, time.Duration) (gossip.EchoResponse, error)

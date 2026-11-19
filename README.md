@@ -279,6 +279,8 @@ make build
 
 **Clean Shutdown**: Always use `Ctrl+C` to stop Mithril cleanly rather than killing the terminal or closing the SSH session. This allows Mithril to flush data and exit gracefully.
 
+**Replay Failures**: `mithril run` returns a nonzero exit status after saving shutdown state and closing AccountsDB when replay fails. A clean cancellation returns success unless shutdown itself fails. Service managers using `Restart=on-failure`, including the Nix systemd service, will restart after a replay failure. A deterministic bank hash mismatch can recur at the same slot on every restart; use a bounded restart policy and investigate repeated failures.
+
 For detailed troubleshooting tips, see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 
 ---
