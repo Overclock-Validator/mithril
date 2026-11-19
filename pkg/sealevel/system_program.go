@@ -128,8 +128,12 @@ type NonceData struct {
 	FeeCalculator FeeCalculator
 }
 
+// instructionDeserializationLimit matches Agave's PACKET_DATA_SIZE limit for
+// native instructions, including the enum tag and excluding trailing bytes.
+const instructionDeserializationLimit = 1232
+
 func checkWithinDeserializationLimit(decoder *bin.Decoder) error {
-	if decoder.Position() > 1232 {
+	if decoder.Position() > instructionDeserializationLimit {
 		return InstrErrInvalidInstructionData
 	} else {
 		return nil

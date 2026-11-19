@@ -286,7 +286,7 @@ func (vote *VoteInstrVote) UnmarshalWithDecoder(decoder *bin.Decoder) error {
 		vote.Timestamp = &timestamp
 	}
 
-	if decoder.Position() > 1232 {
+	if decoder.Position() > instructionDeserializationLimit {
 		return InstrErrInvalidInstructionData
 	}
 
@@ -317,7 +317,7 @@ func (voteSwitch *VoteInstrVoteSwitch) UnmarshalWithDecoder(decoder *bin.Decoder
 	}
 	copy(voteSwitch.Hash[:], hash)
 
-	if decoder.Position() > 1232 {
+	if decoder.Position() > instructionDeserializationLimit {
 		return InstrErrInvalidInstructionData
 	}
 
@@ -385,7 +385,7 @@ func (updateVoteState *VoteInstrUpdateVoteState) UnmarshalWithDecoder(decoder *b
 		updateVoteState.Timestamp = &timestamp
 	}
 
-	if decoder.Position() > 1232 {
+	if decoder.Position() > instructionDeserializationLimit {
 		return InstrErrInvalidInstructionData
 	}
 
@@ -404,7 +404,7 @@ func (uvss *VoteInstrUpdateVoteStateSwitch) UnmarshalWithDecoder(decoder *bin.De
 	}
 	copy(uvss.Hash[:], hash)
 
-	if decoder.Position() > 1232 {
+	if decoder.Position() > instructionDeserializationLimit {
 		return InstrErrInvalidInstructionData
 	}
 

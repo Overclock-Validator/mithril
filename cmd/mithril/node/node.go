@@ -72,6 +72,7 @@ var (
 			return initConfigAndBindFlags(cmd)
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			cmd.SilenceUsage = true
 			return runLive(cmd, args)
 		},
 	}

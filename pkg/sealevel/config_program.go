@@ -54,7 +54,7 @@ func unmarshalConfigKeys(data []byte, checkMaxLen bool) ([]ConfigKey, error) {
 		configKeys = append(configKeys, ck)
 	}
 
-	if checkMaxLen && dec.Position() > 1232 {
+	if checkMaxLen && dec.Position() > instructionDeserializationLimit {
 		return nil, InstrErrInvalidAccountData
 	}
 

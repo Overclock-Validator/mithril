@@ -110,7 +110,7 @@ func (extendLookupTable *AddrLookupTableInstrExtendLookupTable) UnmarshalWithDec
 		}
 		pk := solana.PublicKeyFromBytes(pkBytes)
 		extendLookupTable.NewAddresses = append(extendLookupTable.NewAddresses, pk)
-		if decoder.Position() > 1232 {
+		if decoder.Position() > instructionDeserializationLimit {
 			return InstrErrInvalidInstructionData
 		}
 	}

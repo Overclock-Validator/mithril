@@ -525,7 +525,7 @@ func beginPartitionedEpochRewardsDistribution(acctsDb *accountsdb.AccountsDb, sl
 
 	newEpochRewards, err := newEpochRewardsForDistribution(block, totalRewards, streamResult)
 	if err != nil {
-		panic(err)
+		panic(fmt.Errorf("initialize epoch rewards for epoch %d at slot %d (rewarded epoch %d): %w", epoch, slot, epoch-1, err))
 	}
 	rewardLoader := epochRewardAccountLoader(acctsDb, slot, slotCtx, stagedEpochAccts)
 	updatedAccts, parentUpdatedAccts, voteRewardsDistributed := rewards.DistributeVotingRewards(acctsDb, streamResult.ValidatorRewards, slot, rewardLoader)

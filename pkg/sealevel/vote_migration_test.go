@@ -2,6 +2,7 @@ package sealevel
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math"
 	"testing"
 
@@ -43,6 +44,8 @@ func TestVoteAlpenglowMigrationRequiresParentMarker(t *testing.T) {
 			vb.execCtx.SlotCtx = &SlotCtx{Accounts: vb.execCtx.Accounts}
 			if tt.parentView {
 				vb.execCtx.SlotCtx.ParentAccts = accounts.NewMemAccounts()
+				// Bank preparation pins an on-chain absence as a tombstone.
+				require.NoError(t, vb.execCtx.SlotCtx.ParentAccts.SetAccountWithoutLock(voteAlpenglowClockAddr, &accounts.Account{Key: voteAlpenglowClockAddr}))
 			}
 			if tt.parent != nil {
 				require.NoError(t, vb.execCtx.SlotCtx.ParentAccts.SetAccountWithoutLock(tt.parent.Key, tt.parent))
@@ -60,6 +63,29 @@ func TestVoteAlpenglowMigrationRequiresParentMarker(t *testing.T) {
 				require.NotEqual(t, vb.initial, vb.txAccts.Accounts[1].Data)
 			}
 		})
+	}
+}
+
+func TestVoteAlpenglowMigrationMissingParentFailsClosed(t *testing.T) {
+	for _, gate := range []features.FeatureGate{features.Alpenglow, features.AlpenglowDevContext} {
+		for _, nilEntry := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/nil_entry=%t", gate.Name, nilEntry), func(t *testing.T) {
+				vb := newVoteBench(false)
+				parents := accounts.NewMemAccounts()
+				wantPanic := fmt.Sprintf("Alpenglow migration marker %s was not pinned for slot 42: no such account %s found", voteAlpenglowClockAddr, voteAlpenglowClockAddr)
+				if nilEntry {
+					require.NoError(t, parents.SetAccountWithoutLock(voteAlpenglowClockAddr, nil))
+					wantPanic = fmt.Sprintf("Alpenglow migration marker %s is nil for slot 42", voteAlpenglowClockAddr)
+				}
+				// A current-bank marker must not hide a missing parent image.
+				require.NoError(t, vb.execCtx.Accounts.SetAccountWithoutLock(voteAlpenglowClockAddr, voteMigrationClock()))
+				vb.execCtx.SlotCtx = &SlotCtx{Slot: 42, Accounts: vb.execCtx.Accounts, ParentAccts: parents}
+				require.False(t, voteAlpenglowMigrationSucceeded(vb.execCtx), "inactive features do not need a marker")
+				vb.execCtx.Features.EnableFeature(gate, 0)
+				require.PanicsWithValue(t, wantPanic, func() { _ = vb.step() }, "an unpinned marker must stop execution")
+				require.Equal(t, vb.initial, vb.txAccts.Accounts[1].Data)
+			})
+		}
 	}
 }
 

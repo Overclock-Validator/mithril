@@ -1,6 +1,8 @@
 package sealevel
 
 import (
+	"fmt"
+
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	a "github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/features"
@@ -22,7 +24,16 @@ func voteAlpenglowMigrationSucceeded(execCtx *ExecutionCtx) bool {
 	if slotCtx := execCtx.SlotCtx; slotCtx != nil {
 		if slotCtx.ParentAccts != nil {
 			acct, err := slotCtx.GetParentAccount(voteAlpenglowClockAddr)
-			return err == nil && populatedVoteAlpenglowClock(acct)
+			// An absent on-chain marker is pinned as a tombstone. A missing
+			// parent entry instead means bank preparation failed; accepting votes
+			// in that state could silently diverge after migration.
+			if err != nil {
+				panic(fmt.Sprintf("Alpenglow migration marker %s was not pinned for slot %d: %v", voteAlpenglowClockAddr, slotCtx.Slot, err))
+			}
+			if acct == nil {
+				panic(fmt.Sprintf("Alpenglow migration marker %s is nil for slot %d", voteAlpenglowClockAddr, slotCtx.Slot))
+			}
+			return populatedVoteAlpenglowClock(acct)
 		}
 		if slotCtx.Accounts != nil {
 			acct, err := slotCtx.GetAccountShared(voteAlpenglowClockAddr)

@@ -106,7 +106,7 @@ func (write *UpgradeableLoaderInstrWrite) UnmarshalWithDecoder(decoder *bin.Deco
 	// length against PACKET_DATA_SIZE, but permits unconsumed trailing bytes.
 	// V1 transactions can carry more than 1232 bytes; loader instructions still
 	// retain this decoding limit. Check before converting an untrusted length.
-	if decoder.Position() > 1232 || bytesLen > uint64(1232-decoder.Position()) {
+	if decoder.Position() > instructionDeserializationLimit || bytesLen > uint64(instructionDeserializationLimit-decoder.Position()) {
 		return InstrErrInvalidInstructionData
 	}
 
