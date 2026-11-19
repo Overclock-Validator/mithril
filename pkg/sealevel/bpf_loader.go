@@ -1940,6 +1940,18 @@ func UpgradeableLoaderDeployWithMaxDataLen(execCtx *ExecutionCtx, txCtx *Transac
 	}
 	defer buffer.Drop()
 
+	if !buffer.IsWritable() {
+		return InstrErrInvalidArgument
+	}
+
+	programId, err := instrCtx.LastProgramKey(txCtx)
+	if err != nil {
+		return err
+	}
+	if buffer.Owner() != programId {
+		return InstrErrIncorrectProgramId
+	}
+
 	bufferAcctState, err := UnmarshalUpgradeableLoaderState(buffer.Data())
 	if err != nil {
 		return err
@@ -1986,11 +1998,6 @@ func UpgradeableLoaderDeployWithMaxDataLen(execCtx *ExecutionCtx, txCtx *Transac
 	seed[0] = make([]byte, solana.PublicKeyLength)
 	copy(seed[0], newProgramId[:])
 
-	programId, err := instrCtx.LastProgramKey(txCtx)
-	if err != nil {
-		return err
-	}
-
 	derivedAddr, bumpSeed, _ := solana.FindProgramAddress(seed, programId)
 	if derivedAddr != programDataKey {
 		return InstrErrInvalidArgument
@@ -2007,8 +2014,14 @@ func UpgradeableLoaderDeployWithMaxDataLen(execCtx *ExecutionCtx, txCtx *Transac
 	}
 	defer payer.Drop()
 
-	payer.CheckedAddLamports(buffer.Lamports(), execCtx.Features)
-	buffer.SetLamports(0, execCtx.Features)
+	err = payer.CheckedAddLamports(buffer.Lamports(), execCtx.Features)
+	if err != nil {
+		return err
+	}
+	err = buffer.SetLamports(0, execCtx.Features)
+	if err != nil {
+		return err
+	}
 
 	buffer.Drop()
 	payer.Drop()
@@ -2224,6 +2237,14 @@ func UpgradeableLoaderUpgrade(execCtx *ExecutionCtx, txCtx *TransactionCtx, inst
 		return err
 	}
 	defer buffer.Drop()
+
+	if !buffer.IsWritable() {
+		return InstrErrInvalidArgument
+	}
+
+	if buffer.Owner() != programId {
+		return InstrErrIncorrectProgramId
+	}
 
 	bufferState, err := UnmarshalUpgradeableLoaderState(buffer.Data())
 	if err != nil {
