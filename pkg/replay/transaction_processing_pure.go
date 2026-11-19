@@ -320,6 +320,7 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 		logger = logRecorder
 	}
 	execCtx := newExecCtx(slotCtx, transactionAccts, computeBudgetLimits, logger)
+	execCtx.SkipStableLogs = logRecorder == nil
 	execCtx.TransactionContext.AllInstructions = instrs
 	execCtx.TransactionContext.Signature = tx.Signatures[0]
 	execCtx.TransactionContext.BorrowedAccountArena = input.Arena
@@ -405,8 +406,10 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 
 	// Execute all instructions
 	var instrErr error
+	var currentInstrIdx uint8
 	start = metrics.StartTiming(!input.SkipTimingMetrics)
 	for instrIdx, instr := range tx.Message.Instructions {
+		currentInstrIdx = uint8(instrIdx)
 		execCtx.SetCurrentTopLevelInstr(uint8(instrIdx))
 		if instructionsSysvarIdx >= 0 {
 			ixStart := metrics.StartTiming(!input.SkipTimingMetrics)
@@ -454,10 +457,13 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 	if instrErr != nil || rentStateErr != nil {
 		var relevantErr error
 		var errType TransactionErrorType
+		var instructionIndex *uint8
 		var accountIndex *uint8
 		if instrErr != nil {
 			relevantErr = instrErr
 			errType = TransactionErrorInstructionError
+			idx := currentInstrIdx
+			instructionIndex = &idx
 		} else {
 			relevantErr = rentStateErr
 			errType = TransactionErrorInsufficientFundsForRent
@@ -472,6 +478,7 @@ func loadAndExecuteTransaction(input LoadAndExecuteTransactionInput, prepared *P
 			ProcessingResult: TransactionProcessingResult{
 				TransactionError: &TransactionError{
 					ErrorType:        errType,
+					InstructionIndex: instructionIndex,
 					InstructionError: relevantErr,
 					AccountIndex:     accountIndex,
 				},

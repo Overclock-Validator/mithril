@@ -1478,7 +1478,7 @@ func PreloadSource(programKey solana.PublicKey, program *accounts.Account, slot 
 // then reloaded from authoritative account data, never retained from that stream.
 // Replay must discard its stream before executing a different bank.
 func addProgramToCache(execCtx *ExecutionCtx, programAddr solana.PublicKey, entry *accountsdb.ProgramCacheEntry) {
-	if execCtx.SlotCtx == nil || execCtx.SlotCtx.AccountsDb == nil {
+	if execCtx.IsSimulation || execCtx.SlotCtx == nil || execCtx.SlotCtx.AccountsDb == nil {
 		return
 	}
 	execCtx.SlotCtx.AccountsDb.AddProgramToCache(programAddr, entry)
@@ -1544,8 +1544,10 @@ func normalizeProgramRunErr(err error) error {
 	if _, ok := solanaErrCode(err); ok {
 		return err
 	}
-	if IsCustomErr(err) {
-		return err
+	for cause := err; cause != nil; cause = errors.Unwrap(cause) {
+		if IsCustomErr(cause) {
+			return cause
+		}
 	}
 	return InstrErrProgramFailedToComplete
 }
@@ -1598,7 +1600,9 @@ func BpfLoaderProgramExecute(execCtx *ExecutionCtx) error {
 	if !programAcct.IsExecutable() {
 		return InstrErrUnsupportedProgramId
 	}
-	if programAcct.Lamports() == 0 {
+	// The loader already validated the real account; legacy metadata-only
+	// program stubs deliberately carry zero lamports.
+	if programAcct.Lamports() == 0 && !programAcct.Account.IsDummy {
 		return InstrErrUnsupportedProgramId
 	}
 
@@ -2792,7 +2796,9 @@ func UpgradeableLoaderClose(execCtx *ExecutionCtx, txCtx *TransactionCtx, instrC
 					if err != nil {
 						return err
 					}
-					execCtx.SlotCtx.AccountsDb.RemoveProgramFromCache(closeKey)
+					if !execCtx.IsSimulation {
+						execCtx.SlotCtx.AccountsDb.RemoveProgramFromCache(closeKey)
+					}
 				}
 
 			default:
