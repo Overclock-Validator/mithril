@@ -15,6 +15,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/features"
+	"github.com/Overclock-Validator/mithril/pkg/fees"
 	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/rewards"
@@ -494,7 +495,9 @@ func beginPartitionedEpochRewardsDistribution(acctsDb *accountsdb.AccountsDb, sl
 	maybeDumpEpochVotingRewardDiff(dbgOpts, rpcc, block, epoch, slot, streamResult.ValidatorRewards)
 
 	rewardLoader := epochRewardAccountLoader(acctsDb, slot, slotCtx, stagedEpochAccts)
-	updatedAccts, parentUpdatedAccts, voteRewardsDistributed := rewards.DistributeVotingRewards(acctsDb, streamResult.ValidatorRewards, slot, rewardLoader)
+	updatedAccts, parentUpdatedAccts, voteRewardsDistributed := rewards.DistributeVotingRewards(acctsDb, streamResult.ValidatorRewards, slot, rewardLoader,
+		rewards.VotingRewardDistributionConfig{Features: f, Rent: fees.RentForSlot(slotCtx), VoteAccounts: voteCacheSnapshot, SelfCollectorRewards: streamResult.SelfCollectorRewards})
+	capitalizingVotingRewards := capitalizingVotingRewardDeposits(updatedAccts, parentUpdatedAccts, voteRewardsDistributed)
 	if err := replaceInflationRewardRecords(block, updatedAccts, parentUpdatedAccts, rpc.RewardTypeVoting, streamResult.VoteCommissions); err != nil {
 		panic(err)
 	}
@@ -526,7 +529,7 @@ func beginPartitionedEpochRewardsDistribution(acctsDb *accountsdb.AccountsDb, sl
 	epochCtx.Capitalization += voteRewardsDistributed
 
 	return partitionedRewardsInfo, updatedAccts, parentUpdatedAccts,
-		capitalizingEpochRewards(voteRewardsDistributed, streamResult.TotalStakerRewards)
+		capitalizingEpochRewards(capitalizingVotingRewards, streamResult.TotalStakerRewards)
 }
 
 func distributePartitionedEpochRewardsForSlot(acctsDb *accountsdb.AccountsDb, parentCtx *sealevel.SlotCtx, stagedEpochAccts []*accounts.Account, epochCtx *ReplayCtx, info *rewards.PartitionedRewardDistributionInfo, currentSlot uint64, currentBlockHeight uint64, currentEpoch uint64) ([]*accounts.Account, []*accounts.Account, map[solana.PublicKey]uint8) {

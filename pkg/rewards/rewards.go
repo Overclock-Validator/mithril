@@ -14,6 +14,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
+	a "github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/epochstakes"
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/global"
@@ -265,13 +266,50 @@ func loadRewardAccount(acctsDb *accountsdb.AccountsDb, slot uint64, loader Rewar
 	return acctsDb.GetAccount(slot, pubkey)
 }
 
-func DistributeVotingRewards(acctsDb *accountsdb.AccountsDb, validatorRewards map[solana.PublicKey]*atomic.Uint64, slot uint64, loader RewardAccountLoader) ([]*accounts.Account, []*accounts.Account, uint64) {
+// VotingRewardDistributionConfig carries the distribution bank's collector
+// rules. SelfCollectorRewards retains reward provenance: a vote account may
+// collect its own commission while being an invalid external collector for a
+// different vote account. The latter share must not be paid to it.
+type VotingRewardDistributionConfig struct {
+	Features             *features.Features
+	Rent                 sealevel.SysvarRent
+	VoteAccounts         map[solana.PublicKey]*sealevel.VoteStateVersions
+	SelfCollectorRewards map[solana.PublicKey]uint64
+}
+
+func validExternalVotingCollector(key solana.PublicKey, acct *accounts.Account, before uint64, config VotingRewardDistributionConfig) bool {
+	if acct.Owner != a.SystemProgramAddr {
+		return false
+	}
+	_, reserved := sealevel.NewReservedAcctsSet[key]
+	if reserved || sealevel.IsNativeProgram(key) || sealevel.IsSysvar(key) || key == a.Secp256r1PrecompileAddr || key == a.FeatureAddr {
+		return false
+	}
+	if key == a.IncineratorAddr {
+		return true
+	}
+	relax := config.Features != nil && config.Features.IsActive(features.RelaxPostExecMinBalanceCheck)
+	return config.Rent.IsExempt(acct.Lamports, uint64(len(acct.Data))) || (relax && before != 0)
+}
+
+func DistributeVotingRewards(acctsDb *accountsdb.AccountsDb, validatorRewards map[solana.PublicKey]*atomic.Uint64, slot uint64, loader RewardAccountLoader, configs ...VotingRewardDistributionConfig) ([]*accounts.Account, []*accounts.Account, uint64) {
+	if len(configs) > 1 {
+		panic("voting reward distribution accepts one bank configuration")
+	}
+	var config VotingRewardDistributionConfig
+	if len(configs) == 1 {
+		config = configs[0]
+	}
+	custom := config.Features != nil && config.Features.IsActive(features.CustomCommissionCollector)
 	var totalVotingRewards atomic.Uint64
 
 	updatedAccts := make([]*accounts.Account, len(validatorRewards))
 	parentUpdatedAccts := make([]*accounts.Account, len(validatorRewards))
 
 	var wg sync.WaitGroup
+	var failure error
+	var failureOnce sync.Once
+	recordFailure := func(err error) { failureOnce.Do(func() { failure = err }) }
 
 	size := runtime.GOMAXPROCS(0) * 2
 	workerPool, _ := ants.NewPoolWithFunc(size, func(i interface{}) {
@@ -281,39 +319,91 @@ func DistributeVotingRewards(acctsDb *accountsdb.AccountsDb, validatorRewards ma
 		reward := r.reward
 		voterPk := r.voterPk
 		idx := r.idx
+		isSelfCollector := !custom
+		if custom {
+			if config.SelfCollectorRewards != nil {
+				if selfReward, ok := config.SelfCollectorRewards[voterPk]; ok {
+					if selfReward > reward {
+						recordFailure(fmt.Errorf("self-collected voting rewards exceed total at slot %d for %s", slot, voterPk))
+						return
+					}
+					isSelfCollector, reward = true, selfReward
+				}
+			} else if voteState := config.VoteAccounts[voterPk]; voteState != nil {
+				// Compatibility for isolated callers without streaming provenance.
+				isSelfCollector = voteInflationRewardsCollector(voterPk, voteState, true) == voterPk
+			}
+		}
 
 		voteAcct, err := loadRewardAccount(acctsDb, slot, loader, voterPk)
 		if err != nil {
+			if !errors.Is(err, accountsdb.ErrNoAccount) {
+				recordFailure(fmt.Errorf("load voting reward collector %s at slot %d: %w", voterPk, slot, err))
+				return
+			}
+			if !custom {
+				return
+			}
+			// SIMD-0232 permits a commission to create its external collector
+			// when the resulting balance satisfies the bank's rent rules.
+			voteAcct = &accounts.Account{Key: voterPk, Owner: a.SystemProgramAddr}
+		}
+		if voteAcct == nil {
+			recordFailure(fmt.Errorf("nil voting reward collector %s at slot %d", voterPk, slot))
 			return
+		}
+		if custom && voteAcct.Lamports == 0 {
+			// Parent overlays retain closed accounts as tombstones. Agave's
+			// account lookup treats those as absent, including any stale bytes.
+			voteAcct = &accounts.Account{Key: voterPk, Owner: a.SystemProgramAddr}
 		}
 		// Loaders may return a retained speculative-overlay value. Reward
 		// distribution owns its mutation, so never modify that parent in place.
 		voteAcct = voteAcct.Clone()
-		parentUpdatedAccts[idx] = voteAcct.Clone()
+		parent := voteAcct.Clone()
 
 		voteAcct.Lamports, err = safemath.CheckedAddU64(voteAcct.Lamports, uint64(reward))
 		if err != nil {
-			panic(fmt.Sprintf("overflow in voting rewards distribution in slot %d to acct %s: %s", slot, voterPk, err))
+			// An unpayable commission is consumed by EpochRewards but not
+			// capitalized, matching Agave's checked deposit.
+			return
+		}
+		if custom && !isSelfCollector && !validExternalVotingCollector(voterPk, voteAcct, parent.Lamports, config) {
+			return
 		}
 
+		parentUpdatedAccts[idx] = parent
 		updatedAccts[idx] = voteAcct
 
 		new := totalVotingRewards.Add(uint64(reward))
 		if new < uint64(reward) {
-			panic(fmt.Sprintf("overflow in accumulating voting rewards in slot %d", slot))
+			recordFailure(fmt.Errorf("overflow in accumulating voting rewards in slot %d", slot))
 		}
 	})
 
 	var idx int
 	for votePk, reward := range validatorRewards {
+		if reward == nil {
+			recordFailure(fmt.Errorf("missing calculated voting reward for %s at slot %d", votePk, slot))
+			idx++
+			continue
+		}
 		r := idxAndRewardNew{idx: idx, reward: reward.Load(), voterPk: votePk}
 		wg.Add(1)
-		workerPool.Invoke(r)
+		if err := workerPool.Invoke(r); err != nil {
+			wg.Done()
+			recordFailure(fmt.Errorf("schedule voting reward for %s at slot %d: %w", votePk, slot, err))
+		}
 		idx++
 	}
 
 	wg.Wait()
 	workerPool.Release()
+	if failure != nil {
+		// Propagate storage/invariant failures after joining workers; panicking
+		// inside an ants worker would be recovered there and silently lose a payment.
+		panic(failure)
+	}
 
 	return updatedAccts, parentUpdatedAccts, totalVotingRewards.Load()
 }
@@ -654,9 +744,17 @@ func voteInflationRewardsCollector(votePubkey solana.PublicKey, voteState *seale
 	return votePubkey
 }
 
-func accumulateVotingReward(validatorRewards map[solana.PublicKey]*atomic.Uint64, votePubkey solana.PublicKey, voteState *sealevel.VoteStateVersions, customCollector bool, amount uint64) {
+func accumulateVotingReward(validatorRewards map[solana.PublicKey]*atomic.Uint64, votePubkey solana.PublicKey, voteState *sealevel.VoteStateVersions, customCollector bool, amount uint64, selfCollectors ...map[solana.PublicKey]uint64) {
 	// Zero commission still produces a vote reward record.
 	collector := voteInflationRewardsCollector(votePubkey, voteState, customCollector)
+	if len(selfCollectors) != 0 && collector == votePubkey {
+		selfRewards := selfCollectors[0]
+		var err error
+		selfRewards[collector], err = safemath.CheckedAddU64(selfRewards[collector], amount)
+		if err != nil {
+			panic(fmt.Sprintf("overflow in self-collected voting rewards for %s", collector))
+		}
+	}
 	accumulator := validatorRewards[collector]
 	if accumulator == nil {
 		accumulator = &atomic.Uint64{}
@@ -826,6 +924,9 @@ type StreamingRewardsResult struct {
 	TotalPoints        wide.Uint128
 	TotalStakerRewards uint64
 	ValidatorRewards   map[solana.PublicKey]*atomic.Uint64
+	// SelfCollectorRewards distinguishes a vote account's own commission from
+	// commissions that other votes sent to that same, invalid external address.
+	SelfCollectorRewards map[solana.PublicKey]uint64
 	// VoteCommissions records selected legacy percentages. Custom collectors
 	// and basis-point commissions do not populate the legacy commission field.
 	VoteCommissions map[solana.PublicKey]uint8
@@ -1046,6 +1147,7 @@ func CalculateRewardsStreaming(
 	tempPath := tempWriter.Path()
 
 	validatorRewards := make(map[solana.PublicKey]*atomic.Uint64)
+	selfCollectorRewards := make(map[solana.PublicKey]uint64)
 
 	pointsReader, err := NewPointsSpoolReader(pointsPath)
 	if err != nil {
@@ -1150,7 +1252,7 @@ func CalculateRewardsStreaming(
 		}
 
 		accumulateVotingReward(validatorRewards, rec.VotePubkey, voteState,
-			f.IsActive(features.CustomCommissionCollector), splitResult.VoterPortion)
+			f.IsActive(features.CustomCommissionCollector), splitResult.VoterPortion, selfCollectorRewards)
 	}
 
 	pointsReader.Close()
@@ -1222,13 +1324,14 @@ func CalculateRewardsStreaming(
 	}
 
 	return &StreamingRewardsResult{
-		SpoolDir:           spoolDir,
-		SpoolSlot:          slot,
-		TotalPoints:        reportedPoints,
-		TotalStakerRewards: phase2TotalStakerRewards,
-		ValidatorRewards:   validatorRewards,
-		VoteCommissions:    voteCommissions,
-		NumStakeRewards:    actualRewardCount,
-		NumPartitions:      numPartitions,
+		SpoolDir:             spoolDir,
+		SpoolSlot:            slot,
+		TotalPoints:          reportedPoints,
+		TotalStakerRewards:   phase2TotalStakerRewards,
+		ValidatorRewards:     validatorRewards,
+		SelfCollectorRewards: selfCollectorRewards,
+		VoteCommissions:      voteCommissions,
+		NumStakeRewards:      actualRewardCount,
+		NumPartitions:        numPartitions,
 	}, nil
 }
