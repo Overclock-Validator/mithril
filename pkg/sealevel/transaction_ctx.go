@@ -32,7 +32,15 @@ type TransactionAccounts struct {
 	// data length and the data bytes copied, which is zero when SetData
 	// replaces all data. It is telemetry only and must not touch tx state.
 	OnFirstWriteDetach func(oldDataLen, copiedBytes uint64)
+	// Originals[idx]: the shared account idx referred to before its first write,
+	// kept only when RecordWriteOriginals is set (nil otherwise).
+	Originals []*accounts.Account
 }
+
+// RecordWriteOriginals makes transaction accounts keep the shared version each
+// account had before its first write, so a commit can tell which writes left an
+// account unchanged (replay's work-ahead unchanged-account learning).
+var RecordWriteOriginals bool
 
 type TransactionCtx struct {
 	InstructionTrace         []InstructionCtx
@@ -81,6 +89,9 @@ func NewTransactionAccountsFromRefs(accts []*accounts.Account, shared []bool) *T
 	transactionAccts.Shared = append(make([]bool, 0, len(shared)), shared...)
 	transactionAccts.Locked = make([]bool, len(accts), len(accts))
 	transactionAccts.Touched = make([]bool, len(accts), len(accts))
+	if RecordWriteOriginals {
+		transactionAccts.Originals = make([]*accounts.Account, len(accts))
+	}
 
 	return transactionAccts
 }
@@ -320,8 +331,12 @@ func (txAccounts *TransactionAccounts) Touch(idx uint64) (*accounts.Account, err
 	}
 
 	if txAccounts.Shared[idx] {
-		clonedAcct := txAccounts.Accounts[idx].Clone()
+		original := txAccounts.Accounts[idx]
+		clonedAcct := original.Clone()
 		copiedBytes := uint64(len(clonedAcct.Data))
+		if txAccounts.Originals != nil {
+			txAccounts.Originals[idx] = original
+		}
 		txAccounts.Accounts[idx] = clonedAcct
 		txAccounts.Shared[idx] = false
 		if txAccounts.OnFirstWriteClone != nil {
@@ -362,6 +377,9 @@ func (txAccounts *TransactionAccounts) replaceData(idx uint64, data []byte) (*ac
 	acct := txAccounts.Accounts[idx]
 	oldLen := uint64(len(acct.Data))
 	if txAccounts.Shared[idx] {
+		if txAccounts.Originals != nil {
+			txAccounts.Originals[idx] = acct
+		}
 		replaced := *acct
 		replaced.Data = data
 		acct = &replaced

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
@@ -655,7 +656,7 @@ func serializeParametersAligned(execCtx *ExecutionCtx) ([]byte, uint64, []serial
 	size += solana.PublicKeyLength     // program id
 
 	var serializedData []byte
-	if !execCtx.IsSimulation && execCtx.SlotCtx.SerializedParameterArena != nil {
+	if !execCtx.IsSimulation && !execCtx.PrivateParameters && execCtx.SlotCtx.SerializedParameterArena != nil {
 		arenaData, _ := execCtx.SlotCtx.SerializedParameterArena.AllocN(size)
 		serializedData = arenaData[:0]
 	} else {
@@ -1009,7 +1010,7 @@ func serializeParametersUnaligned(execCtx *ExecutionCtx) ([]byte, uint64, []seri
 	size += solana.PublicKeyLength     // program id
 
 	var serializedData []byte
-	if !execCtx.IsSimulation && execCtx.SlotCtx.SerializedParameterArena != nil {
+	if !execCtx.IsSimulation && !execCtx.PrivateParameters && execCtx.SlotCtx.SerializedParameterArena != nil {
 		arenaData, _ := execCtx.SlotCtx.SerializedParameterArena.AllocN(size)
 		serializedData = arenaData[:0] // Use arena slice with zero length but full capacity
 	} else {
@@ -1322,6 +1323,9 @@ func executeLoadedProgram(execCtx *ExecutionCtx, program *sbpf.Program, syscallR
 			!program.SbpfVersion.StackFrameGaps(),
 	}
 	start := time.Now()
+	if execCtx.Speculative {
+		opts.Cancel = execCtx.SpeculativeCancel
+	}
 	interpreter := sbpf.NewInterpreter(program, opts)
 	defer interpreter.Finish()
 	metrics.GlobalBlockReplay.SbpfInterpreterNew.AddTimingSince(start)
@@ -1366,7 +1370,8 @@ func executeProgramFromSource(execCtx *ExecutionCtx, programAddr solana.PublicKe
 	syscallRegistry := executionSyscalls(execCtx)
 	// The caller has already validated the bank-visible loader metadata. Never
 	// let a global cache hit bypass that validation or select a different fork.
-	if entry, ok := execCtx.SlotCtx.AccountsDb.MaybeGetProgramFromCache(programAddr); ok {
+	compileReason := "miss"
+	if entry, ok := execCtx.SlotCtx.AccountsDb.MaybeGetProgramFromCache(programAddr); ok && !execCtx.PrivatePrograms {
 		var matches bool
 		if immutable {
 			matches = entry.MatchesImmutableSource(programData, &execCtx.Features)
@@ -1376,7 +1381,11 @@ func executeProgramFromSource(execCtx *ExecutionCtx, programAddr solana.PublicKe
 		if matches {
 			return executeLoadedProgram(execCtx, entry.Program, syscallRegistry)
 		}
+		compileReason = "stale"
+	} else if ok {
+		compileReason = "private"
 	}
+
 	loader, err := loader.NewLoaderWithSyscalls(programData, syscallRegistry, false, &execCtx.Features)
 	if err != nil {
 		return InstrErrUnsupportedProgramId
@@ -1397,9 +1406,19 @@ func executeProgramFromSource(execCtx *ExecutionCtx, programAddr solana.PublicKe
 	}
 
 	metrics.GlobalBlockReplay.AddProgramToCache.AddTimingSince(start)
+	if programCompileLog {
+		mlog.Log.Infof("program compile slot %d cache-key %s reason %s depth %d speculative %t bytes %d us %d",
+			execCtx.SlotCtx.Slot, programAddr, compileReason, execCtx.StackHeight(), execCtx.Speculative, len(programData), time.Since(start).Microseconds())
+	}
 
 	return executeLoadedProgram(execCtx, program, syscallRegistry)
 }
+
+// MITHRIL_PROGRAM_COMPILE_LOG=1 (diagnostic): log every program compiled
+// during execution with why the cache did not serve it (miss, stale entry, or
+// private loads), its instruction depth (1 = top level, more = invoked by
+// another program) and whether the execution was speculative.
+var programCompileLog = os.Getenv("MITHRIL_PROGRAM_COMPILE_LOG") == "1"
 
 // PreloadProgram loads, verifies and caches the executable for a program's
 // source under cacheKey (the programdata address for upgradeable programs, the
@@ -1478,7 +1497,7 @@ func PreloadSource(programKey solana.PublicKey, program *accounts.Account, slot 
 // then reloaded from authoritative account data, never retained from that stream.
 // Replay must discard its stream before executing a different bank.
 func addProgramToCache(execCtx *ExecutionCtx, programAddr solana.PublicKey, entry *accountsdb.ProgramCacheEntry) {
-	if execCtx.SlotCtx == nil || execCtx.SlotCtx.AccountsDb == nil {
+	if execCtx.Speculative || execCtx.SlotCtx == nil || execCtx.SlotCtx.AccountsDb == nil {
 		return
 	}
 	execCtx.SlotCtx.AccountsDb.AddProgramToCache(programAddr, entry)
@@ -2792,7 +2811,11 @@ func UpgradeableLoaderClose(execCtx *ExecutionCtx, txCtx *TransactionCtx, instrC
 					if err != nil {
 						return err
 					}
-					execCtx.SlotCtx.AccountsDb.RemoveProgramFromCache(closeKey)
+					// An early execution publishes nothing (loader instructions
+					// are never executed early; this does not rely on that).
+					if !execCtx.Speculative {
+						execCtx.SlotCtx.AccountsDb.RemoveProgramFromCache(closeKey)
+					}
 				}
 
 			default:
