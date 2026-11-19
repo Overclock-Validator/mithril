@@ -107,7 +107,7 @@ func TestLoaderV3ProgramDataFloorDeduplication(t *testing.T) {
 						}
 					}
 					tx := &solana.Transaction{Message: solana.Message{AccountKeys: keys}}
-					_, _, size, err := loadAndValidateTxAcctsSimd186(ctx, nil, tx, nil, nil, math.MaxUint32)
+					_, _, size, err := loadAndValidateTxAcctsSimd186(ctx, nil, tx, nil, nil, math.MaxUint32, nil)
 					require.NoError(t, err)
 					require.Equal(t, want, size)
 				})

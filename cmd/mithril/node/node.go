@@ -634,6 +634,7 @@ func init() {
 	Run.Flags().StringVar(&turbineAdvertisedIP, "turbine-advertised-ip", "", "Public IP advertised by native turbine gossip (optional)")
 	Run.Flags().IntVar(&turbineShredVersion, "turbine-shred-version", 0, "Shred version for native turbine gossip (0 = discover from entrypoint)")
 	Run.Flags().BoolVar(&replayPhaseTimers, "replay-phase-timers", true, "Time each transaction phase and instruction dispatch during replay (the detail behind TxLoop); off saves the timer calls")
+	Run.Flags().String("speculation", replay.SpeculationOff, "FRODO early execution of transactions queued behind others: off (default) or on")
 	Run.Flags().BoolVar(&offlineReplay, "offline", false, "Replay only from the local shred spool: no gossip, Turbine tree, repair or Votor listener (corpus replays; needs --end-slot and --bootstrap accountsdb)")
 	Run.Flags().StringSlice("shred-receiver-address", nil, "Also send every shred this validator broadcasts to this host:port (repeatable), e.g. a block builder")
 	Run.Flags().StringSlice("shred-retransmit-receiver-address", nil, "Also send every shred this node relays to this host:port (repeatable), e.g. a block builder")
@@ -1267,6 +1268,12 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	replay.StreamingExecutionCfg.Enabled = getBool("streaming-execution", "tuning.streaming_execution")
 	replayPhaseTimers = getBool("replay-phase-timers", "tuning.replay_phase_timers")
 	replay.SkipPhaseTimers = !replayPhaseTimers
+	if err := replay.ConfigureSpeculation(getString("speculation", "tuning.speculation")); err != nil {
+		return fmt.Errorf("tuning.speculation: %w", err)
+	}
+	if summary := replay.SpeculationSummary(); summary != "off" {
+		mlog.Log.Infof("speculation: %s", summary)
+	}
 	replay.StreamingExecutionCfg.Workers = getInt("streaming-workers", "tuning.streaming_workers")
 	replay.StreamingExecutionCfg.MinGroupBatches = getInt("streaming-min-group-batches", "tuning.streaming_min_group_batches")
 	if ms := getInt("streaming-max-open-ms", "tuning.streaming_max_open_ms"); ms > 0 {
@@ -4663,7 +4670,14 @@ func runReplayWithRecovery(
 		var recoveryReason string
 		var certSwitch *replay.CertifiedSwitch
 		var finMismatch *replay.AlpenglowFinalityMismatch
+		var specMismatch *replay.SpeculationFooterMismatch
 		switch {
+		case errors.As(result.Error, &specMismatch):
+			// Work-ahead is already off; a plain re-replay that mismatches again
+			// is an ordinary footer mismatch and halts below.
+			divSlot = specMismatch.Slot
+			key = fmt.Sprintf("spec:%d", specMismatch.Slot)
+			recoveryReason = fmt.Sprintf("footer bank hash mismatch at slot %d in a block with work-ahead early executions (work-ahead now off)", specMismatch.Slot)
 		case errors.As(result.Error, &certSwitch):
 			// Execute-on-receipt ran the wrong sibling (or a certified-skipped
 			// slot), or a later parent-linked child exposed a competing

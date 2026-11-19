@@ -630,6 +630,17 @@ name = "mithril"
     # detail behind TxLoop). About 1% of SlotReplay; SlotReplay and TxLoop are
     # timed either way. On by default; mithril backtest defaults it off.
     # replay_phase_timers = true
+    # Early execution of transactions that are queued behind others in a block.
+    # Every early result is checked against the accounts as they are at the
+    # transaction's turn before it is used, and a bank hash mismatch in a block
+    # with early executions turns this off and replays the block without it.
+    #   "off"   nothing executes early (default)
+    #   "on"    early execution behind up to four prerequisites predicted to
+    #           fail, chains, shared fee payers, durable nonces, and prerequisites
+    #           predicted to leave the shared accounts unchanged
+    # A MITHRIL_WORK_AHEAD_* environment variable that is set overrides the
+    # matching switch of the preset.
+    # speculation = "off"
     # Execution workers per streaming group (0 = min(txpar, 4)).
     # streaming_workers = 0
     # Contiguous decoded batches to accumulate before a group executes

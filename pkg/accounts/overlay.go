@@ -124,6 +124,17 @@ func (o *OverlayAccounts) GetAccount(pubkey *[32]byte) (*Account, error) {
 	return o.parent.GetAccount(pubkey)
 }
 
+// DeltaVersion returns the account stored in the delta for pubkey, or nil if the
+// delta has none. Every store installs a new object and entries are never
+// removed, so an unchanged result means no store to the key happened in between.
+func (o *OverlayAccounts) DeltaVersion(pubkey [32]byte) *Account {
+	shard := o.shardForKey(pubkey)
+	shard.mu.RLock()
+	acct := shard.delta[pubkey]
+	shard.mu.RUnlock()
+	return acct
+}
+
 func (o *OverlayAccounts) GetAccountWithoutLock(pubkey solana.PublicKey) (*Account, error) {
 	shard := o.shardForKey(pubkey)
 	if acct, ok := shard.delta[pubkey]; ok {

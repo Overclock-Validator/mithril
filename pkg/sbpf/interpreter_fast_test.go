@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/cu"
@@ -14,6 +15,9 @@ import (
 // everything observable: return value, CU, meter state, error text and PC,
 // memory contents and whether the pooled buffers came back clean.
 func runWithFastLoop(t *testing.T, p *Program, fast bool, budget uint64, seed int64) string {
+	return runWithCancelToken(t, p, fast, budget, seed, nil)
+}
+func runWithCancelToken(t *testing.T, p *Program, fast bool, budget uint64, seed int64, cancel *atomic.Bool) string {
 	t.Helper()
 	prev := useFastLoop
 	useFastLoop = fast
@@ -40,6 +44,7 @@ func runWithFastLoop(t *testing.T, p *Program, fast bool, budget uint64, seed in
 		syscallsID = diffRegistryID
 	}
 	ip := NewInterpreter(p, &VMOpts{
+		Cancel:                cancel,
 		HeapMax:               4096 * (1 + rng.Intn(4)),
 		Syscalls:              diffRegistry,
 		SyscallsID:            syscallsID,

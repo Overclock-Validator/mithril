@@ -17,10 +17,14 @@ import (
 // Every transaction runs exactly once, and only after all its prerequisites
 // have committed, for any worker count.
 func TestRunDependencyPlan(t *testing.T) {
-	for _, priority := range []bool{false, true} {
-		testRunDependencyPlan(t, priority)
+	savedSpin := workerSpin
+	defer func() { workerSpin = savedSpin }()
+	for _, spin := range []time.Duration{0, 50 * time.Microsecond} {
+		for _, priority := range []bool{false, true} {
+			workerSpin = spin
+			testRunDependencyPlan(t, priority)
+		}
 	}
-	runDependencyPlan(&dependencyPlan{}, 4, planSchedule{}, func(int, int) { t.Fatal("empty plan ran a transaction") })
 }
 
 func TestPlanHeightsAndReadyHeap(t *testing.T) {
@@ -68,7 +72,7 @@ func testRunDependencyPlan(t *testing.T, priority bool) {
 			committed := make([]atomic.Bool, n)
 			runs := make([]atomic.Int32, n)
 			var violations atomic.Int32
-			runDependencyPlan(fresh, workers, planSchedule{priority: priority}, func(_, tx int) {
+			runDependencyPlan(fresh, workers, nil, planSchedule{priority: priority}, nil, func(_, tx int) {
 				runs[tx].Add(1)
 				for _, p := range prerequisites[tx] {
 					if !committed[p].Load() {
@@ -133,22 +137,30 @@ func TestWeightedHeightsAndRequestedKCU(t *testing.T) {
 	}
 }
 
-func randomPlannerTransactions(rng *rand.Rand, count, keys int) []plannerTransactionAccounts {
-	transactions := make([]plannerTransactionAccounts, count)
-	for idx := range transactions {
-		transactions[idx] = newPlannerTransactionAccounts(4, func(add func(solana.PublicKey, bool)) {
-			for range 1 + rng.Intn(3) {
-				add(testPk(byte(rng.Intn(keys))), rng.Intn(3) == 0)
-			}
-		})
+func TestWorkAheadQueueTakesHighestFirst(t *testing.T) {
+	w := &workAhead{queue: make(chan int, 4), aheadHeap: &readyHeap{height: []int32{1, 5, 3}}}
+	for _, tx := range []int32{0, 1, 2} {
+		w.aheadHeap.push(tx)
+		w.queue <- int(tx)
 	}
-	return transactions
+	do := make(chan int)
+	var order []int
+	for range 3 {
+		idx, ahead, ok := w.next(do)
+		if !ok || !ahead {
+			t.Fatalf("next = %d ahead=%v ok=%v", idx, ahead, ok)
+		}
+		order = append(order, idx)
+	}
+	if want := []int{1, 2, 0}; !slices.Equal(order, want) {
+		t.Fatalf("early-execution order = %v, want highest first %v", order, want)
+	}
 }
 
 // runOrder runs plan on one worker and returns the order transactions ran in.
 func runOrder(plan *dependencyPlan, priority bool) []int {
 	var order []int
-	runDependencyPlan(plan, 1, planSchedule{priority: priority}, func(_, tx int) { order = append(order, tx) })
+	runDependencyPlan(plan, 1, nil, planSchedule{priority: priority}, nil, func(_, tx int) { order = append(order, tx) })
 	return order
 }
 
@@ -193,7 +205,7 @@ func TestRunDependencyPlanDispatchTime(t *testing.T) {
 	plan := buildDependencyPlan([]plannerTransactionAccounts{write, write})
 	const finalRun = 50 * time.Millisecond
 	start := time.Now()
-	dispatched := runDependencyPlan(plan, 1, planSchedule{}, func(_, tx int) {
+	dispatched := runDependencyPlan(plan, 1, nil, planSchedule{}, nil, func(_, tx int) {
 		if tx == 1 {
 			time.Sleep(finalRun)
 		}
@@ -201,7 +213,7 @@ func TestRunDependencyPlanDispatchTime(t *testing.T) {
 	if total := time.Since(start); dispatched <= 0 || dispatched > total-finalRun {
 		t.Fatalf("dispatch time %v, total %v: must end before the final transaction runs", dispatched, total)
 	}
-	if runDependencyPlan(&dependencyPlan{}, 1, planSchedule{}, func(int, int) {}) != 0 {
+	if runDependencyPlan(&dependencyPlan{}, 1, nil, planSchedule{}, nil, func(int, int) {}) != 0 {
 		t.Fatal("an empty plan has no dispatch time")
 	}
 }
