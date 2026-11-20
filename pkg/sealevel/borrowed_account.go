@@ -45,12 +45,7 @@ func (acct *BorrowedAccount) Data() []byte {
 
 func (acct *BorrowedAccount) SetData(features features.Features, data []byte) error {
 	newLen := uint64(len(data))
-	err := acct.CanDataBeResized(newLen)
-	if err != nil {
-		return err
-	}
-
-	err = acct.DataCanBeChanged(features)
+	err := acct.CanDataBeResized(newLen, features)
 	if err != nil {
 		return err
 	}
@@ -99,12 +94,7 @@ func (acct *BorrowedAccount) DataMutable(f features.Features) ([]byte, error) {
 
 func (acct *BorrowedAccount) ExtendFromSlice(f features.Features, data []byte) error {
 	newLen := safemath.SaturatingAddU64(uint64(len(acct.Account.Data)), uint64(len(data)))
-	err := acct.CanDataBeResized(newLen)
-	if err != nil {
-		return err
-	}
-
-	err = acct.DataCanBeChanged(f)
+	err := acct.CanDataBeResized(newLen, f)
 	if err != nil {
 		return err
 	}
@@ -241,12 +231,8 @@ func (acct *BorrowedAccount) DataCanBeChanged(f features.Features) error {
 const MaxPermittedDataLength = 10 * 1024 * 1024
 const maxAccountDataGrowthPerTransaction = 2 * MaxPermittedDataLength
 
-func (acct *BorrowedAccount) CanDataBeResized(newLen uint64) error {
+func (acct *BorrowedAccount) CanDataBeResized(newLen uint64, f features.Features) error {
 	oldLen := len(acct.Data())
-	if newLen != uint64(oldLen) && !acct.IsOwnedByCurrentProgram() {
-		return InstrErrAccountDataSizeChanged
-	}
-
 	if newLen > MaxPermittedDataLength {
 		return InstrErrInvalidRealloc
 	}
@@ -256,16 +242,11 @@ func (acct *BorrowedAccount) CanDataBeResized(newLen uint64) error {
 		return InstrErrMaxAccountsDataAllocationsExceeded
 	}
 
-	return nil
+	return acct.DataCanBeChanged(f)
 }
 
 func (acct *BorrowedAccount) SetDataLength(newLength uint64, f features.Features) error {
-	err := acct.CanDataBeResized(newLength)
-	if err != nil {
-		return err
-	}
-
-	err = acct.DataCanBeChanged(f)
+	err := acct.CanDataBeResized(newLength, f)
 	if err != nil {
 		return err
 	}

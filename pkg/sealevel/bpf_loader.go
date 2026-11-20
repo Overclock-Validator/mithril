@@ -588,9 +588,6 @@ func directMappedAccountData(execCtx *ExecutionCtx, acct *BorrowedAccount, reser
 		oldLen := uint64(len(touchedAcct.Data))
 		if requestedLen > oldLen {
 			newLen := maxAccountDataLengthForWrite(acct.TxCtx, oldLen, reserved)
-			if requestedLen > newLen {
-				return InstrErrInvalidRealloc
-			}
 			acct.UpdateAccountsResizeDelta(newLen)
 			touchedAcct.Resize(newLen, 0)
 		}
@@ -598,6 +595,9 @@ func directMappedAccountData(execCtx *ExecutionCtx, acct *BorrowedAccount, reser
 		region.Data = touchedAcct.Data
 		region.RegionSize = uint64(len(touchedAcct.Data))
 		region.Writable = true
+		if requestedLen > region.RegionSize {
+			return InstrErrInvalidRealloc
+		}
 		return nil
 	}
 
@@ -949,7 +949,7 @@ func deserializeParametersAligned(execCtx *ExecutionCtx, parameterBytes []byte, 
 			}
 
 			if !vasa {
-				resizeErr := borrowedAcct.CanDataBeResized(postLen)
+				resizeErr := borrowedAcct.CanDataBeResized(postLen, execCtx.Features)
 				changedErr := borrowedAcct.DataCanBeChanged(execCtx.Features)
 
 				if resizeErr != nil || changedErr != nil {
@@ -1256,7 +1256,7 @@ func deserializeParametersUnaligned(execCtx *ExecutionCtx, parameterBytes []byte
 			}
 
 			if !vasa {
-				resizeErr := borrowedAcct.CanDataBeResized(uint64(len(data)))
+				resizeErr := borrowedAcct.CanDataBeResized(uint64(len(data)), execCtx.Features)
 				changedErr := borrowedAcct.DataCanBeChanged(execCtx.Features)
 
 				if resizeErr != nil || changedErr != nil {
@@ -1397,6 +1397,16 @@ func executeLoadedProgram(execCtx *ExecutionCtx, program *sbpf.Program, syscallR
 	start = time.Now()
 	ret, _, runErr := interpreter.Run()
 	metrics.GlobalBlockReplay.SbpfInterpreterRun.AddTimingSince(start)
+
+	// Agave depletes the remaining transaction compute budget when the VM
+	// itself fails, including an access violation. A syscall error already
+	// accounts for its own compute use and must keep the remaining balance.
+	if runErr != nil && !errors.Is(runErr, sbpf.ErrCancelled) {
+		var syscallErr sbpf.ExcSyscallError
+		if !errors.As(runErr, &syscallErr) {
+			_ = execCtx.ComputeMeter.Consume(execCtx.ComputeMeter.Remaining())
+		}
+	}
 
 	if execCtx.Features.IsActive(features.VirtualAddressSpaceAdjustments) {
 		runErr = mapVirtualAddressSpaceRunErr(execCtx, runErr, inputRegions)

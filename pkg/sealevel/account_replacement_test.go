@@ -123,8 +123,9 @@ func TestAccountDataReplacementErrorsDoNotTouch(t *testing.T) {
 			defer tx.Accounts.Unlock(1)
 			data := []byte{9, 8, 7, 6, 5}
 			var want error
-			// Resize checks run before data-change checks, so a call that fails
-			// both reports the resize error.
+			// Agave checks length and transaction growth limits before data
+			// permissions. Ordinary external or readonly resizes therefore
+			// report the permission error.
 			switch kind {
 			case "readonly":
 				ix.InstructionAccounts[0].IsWritable = false
@@ -135,7 +136,7 @@ func TestAccountDataReplacementErrorsDoNotTouch(t *testing.T) {
 			case "external_resize":
 				acct.Account.Owner = [32]byte{77}
 				data = nil
-				want = InstrErrAccountDataSizeChanged
+				want = InstrErrExternalAccountDataModified
 			case "executable":
 				ctx.Features.DisableFeature(features.RemoveAccountsExecutableFlagChecks)
 				acct.Account.Executable = true
@@ -154,7 +155,7 @@ func TestAccountDataReplacementErrorsDoNotTouch(t *testing.T) {
 				ix.InstructionAccounts[0].IsWritable = false
 				acct.Account.Owner = [32]byte{77}
 				data = []byte{1}
-				want = InstrErrAccountDataSizeChanged
+				want = InstrErrReadonlyDataModified
 			case "executable_oversized":
 				ctx.Features.DisableFeature(features.RemoveAccountsExecutableFlagChecks)
 				acct.Account.Executable = true
@@ -485,8 +486,8 @@ func cpiReplacementVM(t *testing.T, ctx *ExecutionCtx, rust bool) (*sbpf.Interpr
 	return vm, metadatas, dataLenAddr
 }
 
-// Both CPI ABIs, with and without VASA, give the callee the legacy result, and
-// the callee keeps aliasing the caller's serialized data.
+// Both CPI ABIs, with and without VASA, give the callee the same result. A
+// later caller write to serialized input must not mutate the runtime account.
 func TestAccountDataReplacementCPI(t *testing.T) {
 	type scenario struct {
 		name       string
@@ -588,10 +589,11 @@ func TestAccountDataReplacementCPI(t *testing.T) {
 							return err
 						})
 						if runs[i].err == "" && !sc.readonly {
-							// The callee's data is a live view of the caller's
-							// serialized account data.
+							// Agave's set_data_from_slice copies from VM input. A
+							// later caller write cannot modify the callee result.
+							before := tx.Accounts.Accounts[1].Data[0]
 							write(meta.vmDataAddr, []byte{0x5a})
-							require.Equal(t, byte(0x5a), tx.Accounts.Accounts[1].Data[0])
+							require.Equal(t, before, tx.Accounts.Accounts[1].Data[0])
 						}
 					}
 					require.Equal(t, sc.wantErr[vasa], runs[0].err != "", runs[0].err)
