@@ -239,6 +239,7 @@ func (acct *BorrowedAccount) DataCanBeChanged(f features.Features) error {
 }
 
 const MaxPermittedDataLength = 10 * 1024 * 1024
+const maxAccountDataGrowthPerTransaction = 2 * MaxPermittedDataLength
 
 func (acct *BorrowedAccount) CanDataBeResized(newLen uint64) error {
 	oldLen := len(acct.Data())
@@ -250,7 +251,10 @@ func (acct *BorrowedAccount) CanDataBeResized(newLen uint64) error {
 		return InstrErrInvalidRealloc
 	}
 
-	// TODO: support 'per-transaction maximum'
+	lengthDelta := safemath.SaturatingSubI64(int64(newLen), int64(oldLen))
+	if safemath.SaturatingAddI64(acct.TxCtx.AccountsResizeDelta, lengthDelta) > maxAccountDataGrowthPerTransaction {
+		return InstrErrMaxAccountsDataAllocationsExceeded
+	}
 
 	return nil
 }

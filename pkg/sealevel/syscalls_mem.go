@@ -17,23 +17,20 @@ func MemOpConsume(execCtx *ExecutionCtx, n uint64) error {
 }
 
 // memmoveImplInternal copies n bytes from src to dst inside the VM without a
-// temporary buffer. The source is translated first so a bad source address is
-// reported before a bad destination, as before. Go's copy has memmove
-// semantics, so overlapping ranges within one region are handled; and when
-// the destination translation grows or copy-on-writes an account region, the
-// source slice still refers to the previous backing buffer, whose bytes are
-// exactly what the old read-then-write sequence would have copied.
+// temporary buffer. Agave translates the destination first, so its write can
+// grow an account before the source address is translated. Go's copy has
+// memmove semantics for overlapping ranges within one region.
 func memmoveImplInternal(vm sbpf.VM, dst, src, n uint64) error {
 	// Agave's touch_slice_mut / translate_slice return empty slices before
 	// address lookup for zero length. CU was already charged by the syscall.
 	if n == 0 {
 		return nil
 	}
-	srcMem, err := vm.Translate(src, n, false)
+	dstMem, err := vm.Translate(dst, n, true)
 	if err != nil {
 		return err
 	}
-	dstMem, err := vm.Translate(dst, n, true)
+	srcMem, err := vm.Translate(src, n, false)
 	if err != nil {
 		return err
 	}

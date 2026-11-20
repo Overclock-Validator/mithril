@@ -388,10 +388,6 @@ type inputBackingTranslator interface {
 	TranslateInput(addr uint64, size uint64) ([]byte, error)
 }
 
-type inputRegionLengthUpdater interface {
-	SetInputRegionLength(addr uint64, length uint64, writable bool) bool
-}
-
 type inputRegionDataUpdater interface {
 	SetInputRegionData(addr uint64, data []byte, length uint64, writable bool, onWrite func(*sbpf.InputRegion, uint64) error) bool
 }
@@ -846,11 +842,14 @@ func updateCallerAccountRegion(vm sbpf.VM, execCtx *ExecutionCtx, callerAcct *Ca
 			return InstrErrMissingAccount
 		}
 	} else {
-		updater, ok := vm.(inputRegionLengthUpdater)
+		updater, ok := vm.(inputRegionDataUpdater)
 		if !ok {
 			return nil
 		}
-		if !updater.SetInputRegionLength(callerAcct.VmDataAddr, uint64(len(calleeAcct.Data())), writable) {
+		// CPI may change the account owner or length. Keep the serialized
+		// backing, and restore the copied region's growth handler accordingly.
+		onWrite := copiedAccountDataOnWrite(execCtx, calleeAcct, reserved)
+		if !updater.SetInputRegionData(callerAcct.VmDataAddr, nil, uint64(len(calleeAcct.Data())), writable, onWrite) {
 			return InstrErrMissingAccount
 		}
 	}

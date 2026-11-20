@@ -72,12 +72,12 @@ func TestSyscallMemmoveOverlapping(t *testing.T) {
 func TestSyscallMemmoveBadAddressOrder(t *testing.T) {
 	input := make([]byte, 32)
 	vm, _ := newMemSyscallVM(t, input, nil)
-	// Unreadable source is reported before an unwritable destination.
+	// Agave translates the destination first, even if the source is unreadable.
 	_, err := SyscallMemmoveImpl(vm, sbpf.VaddrProgram, sbpf.VaddrInput+100, 8)
 	require.Error(t, err)
 	var badAccess sbpf.ExcBadAccess
 	require.ErrorAs(t, err, &badAccess)
-	require.False(t, badAccess.Write, "the source translation must fail first")
+	require.True(t, badAccess.Write, "the destination translation must fail first")
 	// Readable source, write to a read-only region.
 	_, err = SyscallMemmoveImpl(vm, sbpf.VaddrProgram, sbpf.VaddrInput, 8)
 	require.Error(t, err)
@@ -87,7 +87,7 @@ func TestSyscallMemmoveBadAddressOrder(t *testing.T) {
 
 func TestSyscallMemmoveIntoGrowingInputRegion(t *testing.T) {
 	// The destination region copy-on-writes and grows on first write; the
-	// source slice taken before that must still yield the original bytes.
+	// subsequent source translation must see the replacement backing.
 	original := []byte{1, 2, 3, 4, 5, 6, 7, 8}
 	var replaced []byte
 	region := sbpf.InputRegion{
@@ -216,7 +216,7 @@ func TestSyscallMemoryZeroLengthSkipsAddressValidation(t *testing.T) {
 	}
 }
 
-// Compare the syscall with the old read-then-write path, including charged CU.
+// Compare the syscall with destination-first translation, including charged CU.
 func TestMemoryCopyDifferential(t *testing.T) {
 	rng := rand.New(rand.NewSource(127))
 	for i := 0; i < 300; i++ {
@@ -231,10 +231,14 @@ func TestMemoryCopyDifferential(t *testing.T) {
 		_, gotErr := SyscallMemmoveImpl(vm, dst, src, n)
 		wantErr := MemOpConsume(refCtx, n)
 		if wantErr == nil && n > 0 {
-			buf := make([]byte, n)
-			wantErr = ref.Read(src, buf)
+			var dstMem []byte
+			dstMem, wantErr = ref.Translate(dst, n, true)
 			if wantErr == nil {
-				wantErr = ref.Write(dst, buf)
+				var srcMem []byte
+				srcMem, wantErr = ref.Translate(src, n, false)
+				if wantErr == nil {
+					copy(dstMem, srcMem)
+				}
 			}
 		}
 		if wantErr == nil {

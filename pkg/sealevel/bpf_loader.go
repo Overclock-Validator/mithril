@@ -528,6 +528,44 @@ func accountDataDirectMappingActive(execCtx *ExecutionCtx) bool {
 		execCtx.Features.IsActive(features.AccountDataDirectMapping)
 }
 
+// A VASA write can expose the reserved growth area before the program updates
+// AccountInfo.data_len. The permitted length also depends on growth by earlier
+// accounts in this transaction, not just on this account's reserved space.
+func maxAccountDataLengthForWrite(txCtx *TransactionCtx, oldLen, reserved uint64) uint64 {
+	remaining := safemath.SaturatingSubI64(maxAccountDataGrowthPerTransaction, txCtx.AccountsResizeDelta)
+	remaining = max(remaining, 0)
+	return min(reserved, MaxPermittedDataLength, safemath.SaturatingAddU64(oldLen, uint64(remaining)))
+}
+
+// Copied VASA regions keep their VM backing in the serialized input. On a
+// growth write, Agave nevertheless resizes the runtime account immediately,
+// and charges the transaction's growth budget before allowing the store.
+func copiedAccountDataOnWrite(execCtx *ExecutionCtx, acct *BorrowedAccount, reserved uint64) func(*sbpf.InputRegion, uint64) error {
+	if !accountDataRegionWritable(acct, execCtx.Features) {
+		return nil
+	}
+	return func(region *sbpf.InputRegion, requestedLen uint64) error {
+		touchedAcct, err := acct.TxCtx.Accounts.Touch(acct.IndexInTransaction)
+		if err != nil {
+			return err
+		}
+		acct.Account = touchedAcct
+		oldLen := uint64(len(touchedAcct.Data))
+		if requestedLen > region.RegionSize {
+			newLen := maxAccountDataLengthForWrite(acct.TxCtx, oldLen, reserved)
+			if newLen > oldLen {
+				acct.UpdateAccountsResizeDelta(newLen)
+				touchedAcct.Resize(newLen, 0)
+			}
+			region.RegionSize = newLen
+		}
+		if requestedLen > region.RegionSize {
+			return InstrErrInvalidRealloc
+		}
+		return nil
+	}
+}
+
 func directMappedAccountData(execCtx *ExecutionCtx, acct *BorrowedAccount, reserved uint64) ([]byte, bool, func(*sbpf.InputRegion, uint64) error, error) {
 	canChange := acct.DataCanBeChanged(execCtx.Features) == nil
 	data := acct.Data()
@@ -549,10 +587,7 @@ func directMappedAccountData(execCtx *ExecutionCtx, acct *BorrowedAccount, reser
 
 		oldLen := uint64(len(touchedAcct.Data))
 		if requestedLen > oldLen {
-			newLen := reserved
-			if newLen > MaxPermittedDataLength {
-				newLen = MaxPermittedDataLength
-			}
+			newLen := maxAccountDataLengthForWrite(acct.TxCtx, oldLen, reserved)
 			if requestedLen > newLen {
 				return InstrErrInvalidRealloc
 			}
@@ -771,7 +806,7 @@ func serializeParametersAligned(execCtx *ExecutionCtx) ([]byte, uint64, []serial
 					appendVasaAccountDataRegion(&inputRegions, dataStart, 0, dataLen, reserved, writable, int(acct.indexOfAcct), data, onWrite)
 					hostRegionStart = uint64(l) + 88 + (bpfAlignOfU128 - alignmentOffset)
 				} else {
-					appendVasaAccountDataRegion(&inputRegions, dataStart, uint64(l)+88, dataLen, reserved, accountDataRegionWritable(borrowedAcct, execCtx.Features), int(acct.indexOfAcct), nil, nil)
+					appendVasaAccountDataRegion(&inputRegions, dataStart, uint64(l)+88, dataLen, reserved, accountDataRegionWritable(borrowedAcct, execCtx.Features), int(acct.indexOfAcct), nil, copiedAccountDataOnWrite(execCtx, borrowedAcct, reserved))
 					hostRegionStart = uint64(l) + 88 + reserved
 				}
 				regionStart = safemath.SaturatingAddU64(dataStart, reserved)
@@ -1378,11 +1413,17 @@ func executeLoadedProgram(execCtx *ExecutionCtx, program *sbpf.Program, syscallR
 		if isLoaderDeprecated {
 			err = deserializeParametersUnaligned(execCtx, parameterBytes, accountMetadatas)
 			if err != nil {
+				if _, ok := solanaErrCode(err); ok {
+					return err
+				}
 				return InstrErrInvalidArgument
 			}
 		} else {
 			err = deserializeParametersAligned(execCtx, parameterBytes, accountMetadatas)
 			if err != nil {
+				if _, ok := solanaErrCode(err); ok {
+					return err
+				}
 				return InstrErrInvalidArgument
 			}
 		}
