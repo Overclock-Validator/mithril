@@ -541,8 +541,9 @@ const (
 )
 
 // cacheBatchReadAccount publishes a decoded value only if the authoritative
-// state for its key is still current. Large common-account scans are filtered
-// by commonCacheAdmission before this call; vote accounts retain their own policy.
+// index/cache epoch captured with its batch snapshot is still current. Large
+// common-account scans are filtered by commonCacheAdmission before this call;
+// vote accounts retain their dedicated unconditional policy.
 func (accountsDb *AccountsDb) cacheBatchReadAccount(
 	pubkey solana.PublicKey,
 	acct *accounts.Account,
@@ -556,7 +557,7 @@ func (accountsDb *AccountsDb) cacheBatchReadAccount(
 	accountsDb.readCacheEpochMu.RLock()
 	waitNanoseconds := uint64(time.Since(waitStart).Nanoseconds())
 	defer accountsDb.readCacheEpochMu.RUnlock()
-	if (expectedEpoch != accountsDb.readCacheEpoch && !accountsDb.previousPendingFoldEpochLocked(expectedEpoch)) || accountsDb.pendingFoldContainsLocked(pubkey) {
+	if expectedEpoch != accountsDb.readCacheEpoch || accountsDb.pendingFoldContainsLocked(pubkey) {
 		return batchCacheEpochRejected, waitNanoseconds
 	}
 	if solana.PublicKeyFromBytes(acct.Owner[:]) == addresses.VoteProgramAddr {
@@ -569,12 +570,6 @@ func (accountsDb *AccountsDb) cacheBatchReadAccount(
 		return batchCacheCommon, waitNanoseconds
 	}
 	return batchCacheCommonSkipped, waitNanoseconds
-}
-
-// During a fold, the preceding epoch is valid for keys outside pendingFold.
-// The caller must check key membership and publish under the same epoch lock.
-func (db *AccountsDb) previousPendingFoldEpochLocked(epoch uint64) bool {
-	return db.pendingFold != nil && epoch+1 == db.readCacheEpoch
 }
 
 func (accountsDb *AccountsDb) pendingFoldContainsLocked(pubkey solana.PublicKey) bool {
