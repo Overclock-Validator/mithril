@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"math"
+	"math/bits"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	a "github.com/Overclock-Validator/mithril/pkg/addresses"
@@ -53,8 +54,8 @@ func (e *RentStateTransitionError) Unwrap() error {
 	return e.Err
 }
 
-func rentStateFromAcct(acct *accounts.Account, rent *sealevel.SysvarRent, relaxPostExecMinBalanceCheck bool) *RentStateInfo {
-	info := &RentStateInfo{
+func rentStateFromAcct(acct *accounts.Account, rent *sealevel.SysvarRent, relaxPostExecMinBalanceCheck bool) RentStateInfo {
+	info := RentStateInfo{
 		RentPayingInfo: RentPayingInfo{
 			Lamports: acct.Lamports,
 			DataSize: uint64(len(acct.Data)),
@@ -74,19 +75,40 @@ func rentStateFromAcct(acct *accounts.Account, rent *sealevel.SysvarRent, relaxP
 }
 
 func NewRentStateInfo(rent *sealevel.SysvarRent, txCtx *sealevel.TransactionCtx, f *features.Features) []*RentStateInfo {
-	rentStateInfos := make([]*RentStateInfo, 0, len(txCtx.Accounts.Accounts))
+	rentStateInfos := make([]*RentStateInfo, len(txCtx.Accounts.Accounts))
 	acctsMetas := txCtx.Accounts.AcctMetas
 	relaxPostExecMinBalanceCheck := f != nil && f.IsActive(features.RelaxPostExecMinBalanceCheck)
 
-	for idx, acct := range txCtx.Accounts.Accounts {
+	// Cache writable positions in a stack bitmap so classification runs once.
+	// Four words cover 256 accounts; larger internal callers use a sized mask.
+	var inlineMask [4]uint64
+	wordCount := (len(txCtx.Accounts.Accounts) + 63) / 64
+	mask := inlineMask[:]
+	if wordCount > len(mask) {
+		mask = make([]uint64, wordCount)
+	} else {
+		mask = mask[:wordCount]
+	}
+	writable := 0
+	for idx := range txCtx.Accounts.Accounts {
 		if sealevel.IsWritable(acctsMetas[idx], f) {
-			rentStateInfo := rentStateFromAcct(acct, rent, relaxPostExecMinBalanceCheck)
-			rentStateInfos = append(rentStateInfos, rentStateInfo)
-		} else {
-			rentStateInfos = append(rentStateInfos, nil)
+			mask[idx/64] |= uint64(1) << uint(idx%64)
+			writable++
 		}
 	}
-
+	// Only writable accounts need values. Both arrays belong to this snapshot;
+	// readonly pointer positions stay nil and later snapshots cannot reuse them.
+	values := make([]RentStateInfo, writable)
+	next := 0
+	for wordIdx, word := range mask {
+		for word != 0 {
+			idx := wordIdx*64 + bits.TrailingZeros64(word)
+			values[next] = rentStateFromAcct(txCtx.Accounts.Accounts[idx], rent, relaxPostExecMinBalanceCheck)
+			rentStateInfos[idx] = &values[next]
+			next++
+			word &= word - 1
+		}
+	}
 	return rentStateInfos
 }
 

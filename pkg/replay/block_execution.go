@@ -692,6 +692,7 @@ func (exec *blockExecution) finalizeTail() (*sealevel.SlotCtx, error) {
 	metrics.GlobalBlockReplay.RunIncinerator.AddTimingSince(start)
 
 	// Alpenglow banks set the Clock timestamp from the block footer after execution.
+	var voteVersions votePublicationVersions
 	if alpenglowClock {
 		footerClockStart := time.Now()
 		if err := applyAlpenglowFooterClock(slotCtx, block, bankEpochSchedule); err != nil {
@@ -704,7 +705,10 @@ func (exec *blockExecution) finalizeTail() (*sealevel.SlotCtx, error) {
 		}
 		metrics.GlobalBlockReplay.AlpenglowFooterClock.AddTimingSince(footerClockStart)
 		voteRewardsStart := time.Now()
-		voteRewardsErr := ApplyAlpenglowVoteRewards(slotCtx, block, bankEpochSchedule, block.SkipRewardCert, block.NotarRewardCert, block.BlockFinalCert, block.AlpenglowShredVersion)
+		if slotCtx.Replay {
+			voteVersions = make(votePublicationVersions)
+		}
+		voteRewardsErr := applyVoteRewardsWithVersions(slotCtx, block, bankEpochSchedule, block.SkipRewardCert, block.NotarRewardCert, block.BlockFinalCert, block.AlpenglowShredVersion, voteVersions)
 		metrics.GlobalBlockReplay.AlpenglowVoteRewards.AddTimingSince(voteRewardsStart)
 		if voteRewardsErr != nil {
 			return nil, voteRewardsErr
@@ -716,7 +720,7 @@ func (exec *blockExecution) finalizeTail() (*sealevel.SlotCtx, error) {
 
 	setReplayStage("compile_accounts")
 	start = time.Now()
-	writableAccts, modifiedAccts := compileWritableAndModifiedAccts(slotCtx, block, rentAccts)
+	writableAccts, modifiedAccts := compileAccountsWithVoteVersions(slotCtx, block, rentAccts, voteVersions)
 	metrics.GlobalBlockReplay.CompileWritableAndModifiedAccts.AddTimingSince(start)
 	start = time.Now()
 	ensureParentsErr := ensureParentAccountsForModified(slotCtx, modifiedAccts)

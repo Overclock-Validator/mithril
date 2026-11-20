@@ -46,6 +46,18 @@ func (m MemAccounts) GetAccount(pubkey *[32]byte) (*Account, error) {
 	return acct, nil
 }
 
+// GetAccountByValue avoids making a temporary lookup key escape through the
+// pointer-based Accounts interface. It retains the store's normal read lock.
+func (m MemAccounts) GetAccountByValue(pubkey solana.PublicKey) (*Account, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	acct, ok := m.Map[pubkey]
+	if !ok {
+		return nil, &missingMemAccountError{key: pubkey}
+	}
+	return acct, nil
+}
+
 func (m MemAccounts) GetAccountWithoutLock(pubkey solana.PublicKey) (*Account, error) {
 	acct, ok := m.Map[pubkey]
 	if !ok {

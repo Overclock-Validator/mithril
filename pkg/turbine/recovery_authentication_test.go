@@ -114,7 +114,7 @@ func TestRecoveredFECAuthentication(t *testing.T) {
 							require.NoError(t, err)
 						}
 						recovered[0].Payload[dataHeaderSize+1] ^= 1
-						require.ErrorIs(t, a.authenticateRecoveredFEC(f, shards, recovered), ErrInvalidSignature)
+						require.ErrorIs(t, a.authenticateRecoveredFEC(f, shards, recovered, &fecRecoveryScratch{}), ErrInvalidSignature)
 					}
 				})
 			}

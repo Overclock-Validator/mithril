@@ -312,7 +312,7 @@ func (db *AccountsDb) getAccountsBatchWithStats(ctx context.Context, slot uint64
 			r(time.Duration(stats.AppendVecReadNanoseconds)), stats.AppendVecAccounts, stats.UniqueAppendVecs, foldAtStart, foldAtEnd)
 	}
 	phaseStart = time.Now()
-	db.cacheBatchAbsences(pks, cold, found, admitCommon, cacheEpoch)
+	db.cacheBatchAbsences(ctx, pks, cold, found, admitCommon, cacheEpoch)
 	publicationJobs := cold[:0]
 	for _, idx := range cold {
 		acct := decodedForCache[idx]

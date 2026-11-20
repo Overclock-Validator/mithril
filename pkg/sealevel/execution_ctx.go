@@ -535,8 +535,7 @@ func (slotCtx *SlotCtx) GetAccount(pubkey solana.PublicKey) (*accounts.Account, 
 }
 
 func (slotCtx *SlotCtx) GetAccountShared(pubkey solana.PublicKey) (*accounts.Account, error) {
-	pk := [32]byte(pubkey)
-	return slotCtx.Accounts.GetAccount(&pk)
+	return accounts.GetAccountByValue(slotCtx.Accounts, pubkey)
 }
 
 func (slotCtx *SlotCtx) GetParentAccount(pubkey solana.PublicKey) (*accounts.Account, error) {

@@ -99,6 +99,8 @@ func loadAndValidateTxAccts(slotCtx *sealevel.SlotCtx, txAcctMetas []*solana.Acc
 	acctsForTx := make([]*accounts.Account, 0, len(txAcctMetas))
 	acctsShared := make([]bool, 0, len(txAcctMetas))
 	convertedAcctMetas := make([]*sealevel.AccountMeta, 0, len(txAcctMetas))
+	// Allocate values once; every pointer remains stable for the transaction lifetime.
+	convertedAcctMetaValues := make([]sealevel.AccountMeta, len(txAcctMetas))
 	var loadedAcctCount uint64
 	var loadedAcctBytes uint64
 	var err error
@@ -138,8 +140,8 @@ func loadAndValidateTxAccts(slotCtx *sealevel.SlotCtx, txAcctMetas []*solana.Acc
 
 		acctsForTx = append(acctsForTx, acct)
 		acctsShared = append(acctsShared, isSharedAcct)
-		convertedAcctMeta := &sealevel.AccountMeta{Pubkey: acctMeta.PublicKey, IsSigner: acctMeta.IsSigner, IsWritable: acctMeta.IsWritable}
-		convertedAcctMetas = append(convertedAcctMetas, convertedAcctMeta)
+		convertedAcctMetaValues[idx] = sealevel.AccountMeta{Pubkey: acctMeta.PublicKey, IsSigner: acctMeta.IsSigner, IsWritable: acctMeta.IsWritable}
+		convertedAcctMetas = append(convertedAcctMetas, &convertedAcctMetaValues[idx])
 		if isSharedAcct {
 			loadedAcctCount++
 			loadedAcctBytes += uint64(len(acct.Data))
@@ -379,24 +381,29 @@ func loadAndValidateTxAcctsSimd186(slotCtx *sealevel.SlotCtx, txAcctMetas []*sol
 		}
 	}
 
-	// Use boolean mask for O(1) program index lookup
-	isProgramIdx := make([]bool, len(acctKeys))
-	instructionAcctPubkeys := make(map[solana.PublicKey]struct{}, len(acctKeys))
-
-	for instrIdx, instr := range tx.Message.Instructions {
-		i := int(instr.ProgramIDIndex)
-		if i >= 0 && i < len(isProgramIdx) {
-			isProgramIdx[i] = true
-		}
-		ias := instrs[instrIdx].Accounts
-		for _, ia := range ias {
-			instructionAcctPubkeys[ia.Pubkey] = struct{}{}
+	skipLegacyMap := slotCtx.Features.IsActive(features.DisableAccountLoaderSpecialCase)
+	var isProgramIdx []bool
+	var instructionAcctPubkeys map[solana.PublicKey]struct{}
+	if !skipLegacyMap {
+		isProgramIdx = make([]bool, len(acctKeys))
+		instructionAcctPubkeys = make(map[solana.PublicKey]struct{}, len(acctKeys))
+		for instrIdx, instr := range tx.Message.Instructions {
+			i := int(instr.ProgramIDIndex)
+			if i >= 0 && i < len(isProgramIdx) {
+				isProgramIdx[i] = true
+			}
+			ias := instrs[instrIdx].Accounts
+			for _, ia := range ias {
+				instructionAcctPubkeys[ia.Pubkey] = struct{}{}
+			}
 		}
 	}
 
 	acctsForTx := make([]*accounts.Account, 0, len(txAcctMetas))
 	acctsShared := make([]bool, 0, len(txAcctMetas))
 	convertedAcctMetas := make([]*sealevel.AccountMeta, 0, len(txAcctMetas))
+	// Allocate values once; every pointer remains stable for the transaction lifetime.
+	convertedAcctMetaValues := make([]sealevel.AccountMeta, len(txAcctMetas))
 	var loadedAcctCount uint64
 	var loadedAcctBytes uint64
 
@@ -405,10 +412,13 @@ func loadAndValidateTxAcctsSimd186(slotCtx *sealevel.SlotCtx, txAcctMetas []*sol
 		var isSharedAcct bool
 		cached := acctCache[idx] // Reuse account from Pass 1
 
-		_, instrContainsAcctMeta := instructionAcctPubkeys[acctMeta.PublicKey]
+		var instrContainsAcctMeta bool
+		if !skipLegacyMap {
+			_, instrContainsAcctMeta = instructionAcctPubkeys[acctMeta.PublicKey]
+		}
 		if acctMeta.PublicKey == sealevel.SysvarInstructionsAddr {
 			acct = instrsAcct
-		} else if !slotCtx.Features.IsActive(features.DisableAccountLoaderSpecialCase) && isProgramIdx[idx] && !acctMeta.IsWritable && !instrContainsAcctMeta {
+		} else if !skipLegacyMap && isProgramIdx[idx] && !acctMeta.IsWritable && !instrContainsAcctMeta {
 			// Dummy account case - only need owner from cached account
 			acct = &accounts.Account{Key: acctMeta.PublicKey, Owner: cached.Owner, Executable: true, IsDummy: true}
 		} else {
@@ -419,8 +429,8 @@ func loadAndValidateTxAcctsSimd186(slotCtx *sealevel.SlotCtx, txAcctMetas []*sol
 
 		acctsForTx = append(acctsForTx, acct)
 		acctsShared = append(acctsShared, isSharedAcct)
-		convertedAcctMeta := &sealevel.AccountMeta{Pubkey: acctMeta.PublicKey, IsSigner: acctMeta.IsSigner, IsWritable: acctMeta.IsWritable}
-		convertedAcctMetas = append(convertedAcctMetas, convertedAcctMeta)
+		convertedAcctMetaValues[idx] = sealevel.AccountMeta{Pubkey: acctMeta.PublicKey, IsSigner: acctMeta.IsSigner, IsWritable: acctMeta.IsWritable}
+		convertedAcctMetas = append(convertedAcctMetas, &convertedAcctMetaValues[idx])
 		if isSharedAcct {
 			loadedAcctCount++
 			loadedAcctBytes += uint64(len(acct.Data))

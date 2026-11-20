@@ -466,3 +466,20 @@ func ReadBool(decoder *bin.Decoder) (bool, error) {
 
 	return b != 0, nil
 }
+
+func (accountMeta *AccountMeta) decode(accountMetaBytes []byte) error {
+	copy(accountMeta.Pubkey[:], accountMetaBytes[:32])
+	if accountMetaBytes[32] > 1 || accountMetaBytes[33] > 1 {
+		return InstrErrInvalidArgument
+	}
+	accountMeta.IsSigner = accountMetaBytes[32] != 0
+	accountMeta.IsWritable = accountMetaBytes[33] != 0
+
+	return nil
+}
+
+func (accountMeta *SolAccountMetaC) decode(acctMetaBytes []byte) {
+	accountMeta.PubkeyAddr = binary.LittleEndian.Uint64(acctMetaBytes[:8])
+	accountMeta.IsWritable = acctMetaBytes[8]
+	accountMeta.IsSigner = acctMetaBytes[9]
+}

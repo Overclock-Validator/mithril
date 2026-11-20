@@ -124,14 +124,10 @@ var (
 	// discarded or never claimed. So discarded speculative compute never exceeds
 	// the budget (no overshoot in CU); wall-clock time is not bounded by it.
 	workAheadWasteBudgetKCU = int64(specShadowEnvInt("MITHRIL_WORK_AHEAD_WASTE_BUDGET_KCU", 48000))
-	// MITHRIL_WORK_AHEAD_WASTE_CAP_KCU (default 6000; 0 = off): once a block's
-	// discarded early compute reaches it, the block admits no more early
-	// executions. It bounds only work already thrown away, not compute held by
-	// running or finished early executions, so ordinary heavy blocks never hit
-	// it (the heavy corpus wastes at most 3.6M CU in any block, 0.14M on
-	// average), while transactions crafted to fail predictions cannot keep
-	// workers busy with doomed work for a whole block.
-	workAheadWasteCapKCU = int64(specShadowEnvInt("MITHRIL_WORK_AHEAD_WASTE_CAP_KCU", 6000))
+	// Stop admitting early executions once discarded work in this block reaches
+	// the cap, in thousands of CUs. Outstanding executions can still add waste
+	// when they settle. A zero cap disables this admission check.
+	workAheadWasteCapKCU = int64(specShadowEnvInt("MITHRIL_WORK_AHEAD_WASTE_CAP_KCU", 12_000))
 	// MITHRIL_WORK_AHEAD_JOIN_DOOMED=1 restores waiting, at a transaction's
 	// turn, for its doomed early execution to end before the normal execution
 	// starts. By default the normal execution starts at once and the doomed one

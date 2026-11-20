@@ -122,7 +122,29 @@ func ParseShred(packet []byte) (*Shred, error) {
 	return parseDataShred(packet, variant)
 }
 
+// parseOwnedShred parses a data shred whose packet buffer the caller hands
+// over: the shred keeps packet as its Payload instead of copying it. The
+// accept and reject rules are those of ParseShred.
+func parseOwnedShred(packet []byte) (*Shred, error) {
+	if len(packet) <= dataHeaderSize {
+		return nil, fmt.Errorf("%w: got %d bytes", ErrShortShred, len(packet))
+	}
+	variant := packet[shredVariantOffset]
+	shredType, err := classifyVariant(variant)
+	if err != nil {
+		return nil, err
+	}
+	if shredType == ShredTypeCode {
+		return parseCodingShred(packet, variant)
+	}
+	return parseDataShredPayload(packet, variant, true)
+}
+
 func parseDataShred(packet []byte, variant byte) (*Shred, error) {
+	return parseDataShredPayload(packet, variant, false)
+}
+
+func parseDataShredPayload(packet []byte, variant byte, owned bool) (*Shred, error) {
 	size := int(binary.LittleEndian.Uint16(packet[dataSizeOffset : dataSizeOffset+2]))
 	if size < dataHeaderSize || size > len(packet) || size > packetDataSize {
 		return nil, fmt.Errorf("%w: data size %d packet size %d", ErrInvalidDataShred, size, len(packet))
@@ -131,8 +153,13 @@ func parseDataShred(packet []byte, variant byte) (*Shred, error) {
 	if isMerkleVariant(variant) && payloadSize >= dataPayloadSize {
 		payloadSize = dataPayloadSize
 	}
-	payload := make([]byte, payloadSize)
-	copy(payload, packet[:payloadSize])
+	var payload []byte
+	if owned {
+		payload = packet[:payloadSize:payloadSize]
+	} else {
+		payload = make([]byte, payloadSize)
+		copy(payload, packet[:payloadSize])
+	}
 	var data []byte
 	if size <= payloadSize {
 		data = payload[dataHeaderSize:size]
