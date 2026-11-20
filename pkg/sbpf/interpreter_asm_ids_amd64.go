@@ -115,5 +115,8 @@ const (
 	asmNeg64
 	asmNeg32
 	asmHor64
+	asmJeqImmJcc
+	asmJneImmJcc
+	asmJltRegJcc
 	numAsmHandlers
 )

@@ -51,6 +51,8 @@ type UDPReceiver struct {
 	hydrLo      atomic.Uint64
 	hydrHi      atomic.Uint64
 	hydrateKick chan struct{}
+	hydrateRead SpoolReadBuffer // Owned by the sole hydrator goroutine.
+
 	// Hydration outcomes: whether spooled slots complete purely from disk
 	// (their own data + spooled coding via recovery) or hand holes to network
 	// repair — the number that says if the freshness-repair lead time is
@@ -137,6 +139,7 @@ const turbineRepairReadWorkers = 4
 
 func NewUDPReceiver(addr string) *UDPReceiver {
 	return &UDPReceiver{
+
 		Addr:           addr,
 		assembler:      NewSlotAssembler(),
 		blocks:         make(chan *block.Block, 1024),
@@ -1098,39 +1101,11 @@ func (r *UDPReceiver) hydrateLoop(ctx context.Context) {
 					continue
 				}
 			}
-			r.slotResetMu.RLock()
-			packets, err := r.spool.ReadSlot(slot)
-			if err != nil {
-				r.slotResetMu.RUnlock()
+			work, ok := r.hydrateSlot(slot)
+			if !ok {
 				continue
 			}
 			hydrated[slot] = true
-			var work *slotCompletionWork
-			for _, pkt := range packets {
-				shred, perr := ParseShred(pkt)
-				if perr != nil {
-					continue
-				}
-				if VerifySpooledShreds {
-					if verr := r.verifySpooledShred(shred); verr != nil {
-						r.signatureErrors.Add(1)
-						if hook := OnSpooledShredRejected; hook != nil {
-							hook(slot, verr)
-						}
-						continue
-					}
-				}
-				if r.repairClient != nil {
-					r.repairClient.satisfyDataShred(shred)
-				}
-				candidate, aerr := r.assembler.addShredFrom(shred, false)
-				if aerr != nil || candidate == nil {
-					continue
-				}
-				work = candidate
-				break
-			}
-			r.slotResetMu.RUnlock()
 			r.hydratedSlots.Add(1)
 			if !r.submitCompletion(ctx, work, true) {
 				return
@@ -1142,6 +1117,73 @@ func (r *UDPReceiver) hydrateLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// hydrateSlot consumes stored packets under the reset lock. The buffer belongs
+// to the single hydrator. ParseShred copies every packet it keeps.
+func (r *UDPReceiver) hydrateSlot(slot uint64) (*slotCompletionWork, bool) {
+	r.slotResetMu.RLock()
+	defer r.slotResetMu.RUnlock()
+	packets, err := r.spool.ReadSlotInto(slot, &r.hydrateRead)
+	if err != nil {
+		return nil, false
+	}
+	if VerifySpooledShreds {
+		// Preserve rejection-hook order and coverage for strict replay. An
+		// invalid coding packet can precede data that completes the slot.
+		for _, pkt := range packets {
+			if work := r.hydratePacket(slot, pkt); work != nil {
+				return work, true
+			}
+		}
+		return nil, true
+	}
+	for pass := 0; pass < 2; pass++ {
+		for _, pkt := range packets {
+			if spooledCodingPacket(pkt) != (pass == 1) {
+				continue
+			}
+			if work := r.hydratePacket(slot, pkt); work != nil {
+				return work, true
+			}
+		}
+	}
+	return nil, true
+}
+
+func (r *UDPReceiver) hydratePacket(slot uint64, pkt []byte) *slotCompletionWork {
+	shred, err := ParseShred(pkt)
+	if err != nil {
+		return nil
+	}
+	if VerifySpooledShreds {
+		if err := r.verifySpooledShred(shred); err != nil {
+			r.signatureErrors.Add(1)
+			if hook := OnSpooledShredRejected; hook != nil {
+				hook(slot, err)
+			}
+			return nil
+		}
+	}
+	if r.repairClient != nil {
+		r.repairClient.satisfyDataShred(shred)
+	}
+	candidate, err := r.assembler.addShredFrom(shred, false)
+	if err != nil {
+		return nil
+	}
+	return candidate
+}
+
+// spooledCodingPacket reports whether ParseShred would treat pkt as a coding
+// shred. Packets it cannot classify go in the first pass, where ParseShred
+// rejects them exactly as before.
+func spooledCodingPacket(pkt []byte) bool {
+	if len(pkt) <= shredVariantOffset {
+		return false
+	}
+	shredType, err := classifyVariant(pkt[shredVariantOffset])
+	return err == nil && shredType == ShredTypeCode
 }
 
 // PrioritizeStreamRepair also anchors bounded asynchronous child lookahead.

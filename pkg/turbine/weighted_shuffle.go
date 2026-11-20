@@ -48,6 +48,30 @@ func NewWeightedShuffle(weights []uint64) *WeightedShuffle {
 	}
 }
 
+// Weighted reports whether index k is still drawn from the stake-weighted part
+// of the shuffle. The others come after it, in the uniformly shuffled tail.
+func (w *WeightedShuffle) Weighted(k int) bool {
+	index := w.numNodes + k
+	parent := (index - 1) >> weightedShuffleBitShift
+	return k >= 0 && parent < len(w.tree) && w.tree[parent][(index-1)&weightedShuffleBitMask] != 0
+}
+
+// WeightedCount returns how many indices are drawn from the stake-weighted
+// part. It assumes zeros has not been reduced by draws from the tail.
+func (w *WeightedShuffle) WeightedCount() int {
+	count := 0
+	for k := 0; ; k++ {
+		index := w.numNodes + k
+		parent := (index - 1) >> weightedShuffleBitShift
+		if parent >= len(w.tree) {
+			return count
+		}
+		if w.tree[parent][(index-1)&weightedShuffleBitMask] != 0 {
+			count++
+		}
+	}
+}
+
 func (w *WeightedShuffle) RemoveIndex(k int) {
 	index := w.numNodes + k
 	offset := (index - 1) & weightedShuffleBitMask

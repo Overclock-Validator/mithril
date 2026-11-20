@@ -349,6 +349,18 @@ func ReadSegmentManifest(path string) (*SegmentManifest, error) {
 // function succeeds: a later record or the trailing CRC can still be invalid.
 // Compaction builds private pins with it and publishes them only on success.
 func visitSegmentManifestRecords(path string, visit func(ManifestRecord) error) error {
+	var scratch pinManifestScratch
+	return scratch.visit(path, visit)
+}
+
+// A compaction scan consumes one manifest at a time. Resetting the reader
+// preserves the streaming validation and reuses its 64 KiB input buffer.
+type pinManifestScratch struct {
+	reader  *bufio.Reader
+	records uint64
+}
+
+func (s *pinManifestScratch) visit(path string, visit func(ManifestRecord) error) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -363,7 +375,13 @@ func visitSegmentManifestRecords(path string, visit func(ManifestRecord) error) 
 	}
 	body := &io.LimitedReader{R: f, N: info.Size() - 4}
 	h := crc32.NewIEEE()
-	r := bufio.NewReaderSize(io.TeeReader(body, h), 64<<10)
+	input := io.TeeReader(body, h)
+	if s.reader == nil {
+		s.reader = bufio.NewReaderSize(input, 64<<10)
+	} else {
+		s.reader.Reset(input)
+	}
+	r := s.reader
 	var prefix [4 + 4 + 1 + 5*8 + 4]byte
 	if _, err := io.ReadFull(r, prefix[:]); err != nil {
 		return ErrTornManifest
@@ -395,6 +413,7 @@ func visitSegmentManifestRecords(path string, visit func(ManifestRecord) error) 
 	if remaining%manifestRecordSize != 0 || n != uint64(remaining/manifestRecordSize) {
 		return ErrTornManifest
 	}
+	s.records = n
 	for i := uint64(0); i < n; i++ {
 		raw, err := r.Peek(manifestRecordSize)
 		if err != nil {

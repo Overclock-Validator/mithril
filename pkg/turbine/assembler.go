@@ -54,10 +54,13 @@ type SlotAssembler struct {
 	priorityRepairSlots map[uint64]struct{}
 	priorityRepairOrder []uint64
 	encoders            map[fecLayout]reedsolomon.Encoder
-	partialShredObs     map[uint64]PartialShredObservation // shreds seen for slots that never became full (retained for skip observability)
-	retentionFloor      uint64                             // when non-zero, slots >= floor are never "too old" (repair catchup holds a window far behind the live edge)
-	edgeScanLag         uint64                             // how far behind the shred edge the freshness-repair scan reaches (0 = repairScanSlotWindow)
-	maxObservedSlot     uint64
+	// recovery is per-call FEC recovery scratch, guarded by mu.
+	recovery *fecRecoveryScratch
+
+	partialShredObs map[uint64]PartialShredObservation // shreds seen for slots that never became full (retained for skip observability)
+	retentionFloor  uint64                             // when non-zero, slots >= floor are never "too old" (repair catchup holds a window far behind the live edge)
+	edgeScanLag     uint64                             // how far behind the shred edge the freshness-repair scan reaches (0 = repairScanSlotWindow)
+	maxObservedSlot uint64
 	// Age sweeps depend on the edge, repair floor, and mutations that can add
 	// old metadata or release a completing generation's protected identities.
 	retentionSwept       bool
@@ -206,6 +209,7 @@ type fecState struct {
 
 func NewSlotAssembler() *SlotAssembler {
 	return &SlotAssembler{
+
 		slots:               make(map[uint64]*slotState),
 		completedSlots:      make(map[uint64]struct{}),
 		knownBlockIDs:       make(map[uint64]solana.Hash),
@@ -1501,7 +1505,10 @@ func (a *SlotAssembler) recoverFEC(state *slotState, fecSetIndex uint32) ([]*Shr
 		return nil, nil
 	}
 
-	shards := make([][]byte, int(layout.dataShreds)+int(layout.codingShreds))
+	scratch := a.recoveryScratch()
+	defer scratch.release()
+	total := int(layout.dataShreds) + int(layout.codingShreds)
+	shards := scratch.shardSlice(total)
 	for idx, shred := range fec.data {
 		if idx >= uint32(layout.dataShreds) {
 			continue
@@ -1525,6 +1532,14 @@ func (a *SlotAssembler) recoverFEC(state *slotState, fecSetIndex uint32) ([]*Shr
 		}
 		shards[int(layout.dataShreds)+int(pos)] = shard
 	}
+	// Absent shards get private scratch capacity, so Reed-Solomon writes into
+	// it instead of allocating. Their contents are copied or hashed before
+	// recoverFEC returns.
+	for i := range shards {
+		if shards[i] == nil {
+			shards[i] = scratch.emptyShard(i, layout.shardSize)
+		}
+	}
 	var missingData int
 	missingDataIndex := -1
 	for idx := 0; idx < int(layout.dataShreds); idx++ {
@@ -1543,23 +1558,23 @@ func (a *SlotAssembler) recoverFEC(state *slotState, fecSetIndex uint32) ([]*Shr
 		if err != nil {
 			return nil, err
 		}
-		dst := make([]byte, layout.shardSize)
+		dst := scratch.emptyShard(missingDataIndex, layout.shardSize)[:layout.shardSize]
 		if err := rsrecover.RecoverOneData(presence, missingDataIndex, shards, dst); err != nil {
 			return nil, fmt.Errorf("recover one FEC data shred slot %d fec_set=%d: %w", state.slot, fecSetIndex, err)
 		}
-		shred, err := fec.recoveredDataShred(uint32(missingDataIndex), dst)
+		shred, err := fec.recoveredOwnedDataShred(uint32(missingDataIndex), dst)
 		if err != nil {
 			return nil, err
 		}
 		shards[missingDataIndex] = dst
 		recovered := []*Shred{shred}
-		if err := a.authenticateRecoveredFEC(fec, shards, recovered); err != nil {
+		if err := a.authenticateRecoveredFEC(fec, shards, recovered, scratch); err != nil {
 			return nil, err
 		}
 		return recovered, nil
 	}
 
-	required := make([]bool, int(layout.dataShreds)+int(layout.codingShreds))
+	required := scratch.requiredSlice(total)
 	for idx := 0; idx < int(layout.dataShreds); idx++ {
 		required[idx] = fec.data[uint32(idx)] == nil
 	}
@@ -1583,13 +1598,13 @@ func (a *SlotAssembler) recoverFEC(state *slotState, fecSetIndex uint32) ([]*Shr
 		if len(shard) != layout.shardSize {
 			return nil, fmt.Errorf("recover FEC set slot %d fec_set=%d: recovered shard %d size %d, want %d", state.slot, fecSetIndex, idx, len(shard), layout.shardSize)
 		}
-		shred, err := fec.recoveredDataShred(uint32(idx), shard)
+		shred, err := fec.recoveredOwnedDataShred(uint32(idx), shard)
 		if err != nil {
 			return nil, err
 		}
 		recovered = append(recovered, shred)
 	}
-	if err := a.authenticateRecoveredFEC(fec, shards, recovered); err != nil {
+	if err := a.authenticateRecoveredFEC(fec, shards, recovered, scratch); err != nil {
 		return nil, err
 	}
 	return recovered, nil
@@ -1705,7 +1720,7 @@ func (s *Shred) fecLayout() (fecLayout, error) {
 	}, nil
 }
 
-func (f *fecState) recoveredDataShred(dataIndex uint32, shard []byte) (*Shred, error) {
+func (f *fecState) recoveredOwnedDataShred(dataIndex uint32, shard []byte) (*Shred, error) {
 	code := f.firstCodingShred()
 	if code == nil {
 		return nil, fmt.Errorf("recover FEC set slot %d fec_set=%d: no coding shred template", f.slot, f.fecSetIndex)
@@ -1713,7 +1728,9 @@ func (f *fecState) recoveredDataShred(dataIndex uint32, shard []byte) (*Shred, e
 	payload := make([]byte, dataPayloadSize)
 	copy(payload[:shredSignatureSize], code.Signature[:])
 	copy(payload[shredSignatureSize:], shard)
-	shred, err := ParseShred(payload)
+	// payload is fresh and owned here, so the shred keeps it rather than a
+	// second copy. shard may be recovery scratch and is not retained.
+	shred, err := parseOwnedShred(payload)
 	if err != nil {
 		return nil, fmt.Errorf("parse recovered data shred slot %d fec_set=%d data_index=%d: %w", f.slot, f.fecSetIndex, dataIndex, err)
 	}
