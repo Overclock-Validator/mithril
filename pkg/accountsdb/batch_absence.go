@@ -90,12 +90,12 @@ func (db *AccountsDb) cacheBatchAbsences(ctx context.Context, keys []solana.Publ
 	}
 	db.readCacheEpochMu.Lock()
 	defer db.readCacheEpochMu.Unlock()
-	if epoch != db.readCacheEpoch {
+	if epoch != db.readCacheEpoch && (!batchAbsentCarry || !db.previousPendingFoldEpochLocked(epoch)) {
 		return
 	}
-	if db.batchAbsentEpoch != epoch {
+	if db.batchAbsentEpoch != db.readCacheEpoch {
 		clear(db.batchAbsent)
-		db.batchAbsentEpoch = epoch
+		db.batchAbsentEpoch = db.readCacheEpoch
 	}
 	for i, idx := range cold {
 		if found[i] || !admit[idx] || db.pendingFoldContainsLocked(keys[idx]) {

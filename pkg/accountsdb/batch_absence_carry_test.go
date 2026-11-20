@@ -170,3 +170,58 @@ func TestCarryBatchAbsencesLocked(t *testing.T) {
 	db.carryBatchAbsencesLocked(union)
 	require.False(t, db.batchAccountAbsentLocked(key(1)))
 }
+
+func TestBatchCacheAdmissionAcrossActiveFold(t *testing.T) {
+	db, _ := newFoldTestDb(t)
+	defer db.CloseDb()
+	unchanged := foldAcct(1, 11, []byte{1})
+	deleted := foldAcct(2, 22, []byte{2})
+	created := foldAcct(3, 33, []byte{3})
+	missing, carried := solana.PublicKey{4}, solana.PublicKey{5}
+	commitTestBatch(t, db, 100, unchanged, deleted)
+	epoch := db.readCacheEpoch
+	_, err := db.GetAccountsBatch(context.Background(), 100, []solana.PublicKey{carried})
+	require.NoError(t, err)
+	db.CommonAcctsCache.Delete(unchanged.Key)
+	db.foldHooks.afterPublicationStart = func() {
+		result, _ := db.cacheBatchReadAccount(unchanged.Key, unchanged, true, epoch)
+		require.Equal(t, batchCacheCommon, result)
+		result, _ = db.cacheBatchReadAccount(deleted.Key, deleted, true, epoch)
+		require.Equal(t, batchCacheEpochRejected, result)
+
+		// A reader from two transitions ago lacks a complete changed-key view.
+		result, _ = db.cacheBatchReadAccount(unchanged.Key, unchanged, true, epoch-1)
+		require.Equal(t, batchCacheEpochRejected, result)
+		tooOld := solana.PublicKey{6}
+		db.cacheBatchAbsences(context.Background(), []solana.PublicKey{tooOld}, []int{0}, []bool{false}, []bool{true}, epoch-1)
+		require.NotContains(t, db.batchAbsent, tooOld)
+		db.cacheBatchAbsences(context.Background(), []solana.PublicKey{created.Key, missing}, []int{0, 1}, []bool{false, false}, []bool{true, true}, epoch)
+		require.Contains(t, db.batchAbsent, carried)
+		require.Contains(t, db.batchAbsent, missing)
+		require.NotContains(t, db.batchAbsent, created.Key)
+		require.Equal(t, db.readCacheEpoch, db.batchAbsentEpoch)
+	}
+	commitTestBatch(t, db, 110, created, foldAcct(2, 0, nil))
+	db.foldHooks.afterPublicationStart = nil
+	out, stats, err := db.GetAccountsBatchSharedWithStats(context.Background(), 110, []solana.PublicKey{unchanged.Key, missing, created.Key, deleted.Key})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, stats.NegativeCacheHits)
+	require.EqualValues(t, 11, out[0].Lamports)
+	require.Zero(t, out[1].Lamports)
+	require.EqualValues(t, 33, out[2].Lamports)
+	require.Zero(t, out[3].Lamports)
+
+	// A completed fold and a rewind each advance one epoch but leave no map.
+	checkRejected := func(oldEpoch uint64) {
+		result, _ := db.cacheBatchReadAccount(created.Key, created, true, oldEpoch)
+		require.Equal(t, batchCacheEpochRejected, result)
+		stale := solana.PublicKey{7}
+		db.cacheBatchAbsences(context.Background(), []solana.PublicKey{stale}, []int{0}, []bool{false}, []bool{true}, oldEpoch)
+		require.NotContains(t, db.batchAbsent, stale)
+	}
+	checkRejected(epoch)
+	beforeRewind := db.readCacheEpoch
+	_, err = db.RewindToBatchBoundary(100)
+	require.NoError(t, err)
+	checkRejected(beforeRewind)
+}
