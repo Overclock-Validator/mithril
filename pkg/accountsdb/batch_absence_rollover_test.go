@@ -42,8 +42,9 @@ func TestReplayNegativeRolloverSelection(t *testing.T) {
 			require.False(t, db.batchAccountAbsentLocked(k), "unrelated, pending, found or declined")
 		}
 	}
+	// Two epochs back, the active fold cannot establish that the keys are unchanged.
 	db := newDB()
-	db.cacheBatchAbsences(testCtx, []solana.PublicKey{key(1), key(10000), key(10001)}, []int{1, 2}, []bool{false, false}, []bool{false, true, true}, 6)
+	db.cacheBatchAbsences(testCtx, []solana.PublicKey{key(1), key(10000), key(10001)}, []int{1, 2}, []bool{false, false}, []bool{false, true, true}, 5)
 	require.Len(t, db.batchAbsent, batchAbsentLimit-1)
 	require.False(t, db.batchAccountAbsentLocked(key(10000)))
 
