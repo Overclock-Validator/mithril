@@ -366,6 +366,6 @@ func TestClientPushesContactUpdatesImmediately(t *testing.T) {
 	}
 	// The push interval is an hour, so this push comes from the update.
 	if got := nextPushedClientID(); got != ClientIDMithrilHarmonic {
-		t.Fatalf("pushed client id = %#x, want 15", got)
+		t.Fatalf("pushed client id = %#x, want 18", got)
 	}
 }
