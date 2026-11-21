@@ -209,6 +209,22 @@ func (w *WorkingSet) promotionChunkLocked(through uint64, maxSlots int, maxBytes
 	return batch
 }
 
+// preferFlatScan compares live keys with the number of writes in the prefix.
+// Caller holds the working-set lock.
+func (w *WorkingSet) preferFlatScan(through uint64) bool {
+	versions := 0
+	for _, slot := range w.order {
+		if slot > through {
+			break
+		}
+		versions += len(w.bySlot[slot].writes)
+		if versions > len(w.flat) {
+			return true
+		}
+	}
+	return false
+}
+
 // PromotePrefix drops the rooted prefix (held slots <= through); keys with no
 // newer held writer fall through to durable. Caller MUST make them durable
 // BEFORE this.
@@ -216,15 +232,25 @@ func (w *WorkingSet) PromotePrefix(through uint64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	scanFlat := w.preferFlatScan(through)
+	if scanFlat {
+		for key, entry := range w.flat {
+			if entry.slot <= through {
+				delete(w.flat, key)
+			}
+		}
+	}
 	kept := make([]uint64, 0, len(w.order))
 	for _, slot := range w.order {
 		if slot > through {
 			kept = append(kept, slot)
 			continue
 		}
-		for key := range w.bySlot[slot].writes {
-			if e, ok := w.flat[key]; ok && e.slot <= through {
-				delete(w.flat, key) // no surviving held writer -> durable
+		if !scanFlat {
+			for key := range w.bySlot[slot].writes {
+				if e, ok := w.flat[key]; ok && e.slot <= through {
+					delete(w.flat, key) // no surviving held writer -> durable
+				}
 			}
 		}
 		w.retainedBytes -= w.bySlot[slot].retainedBytes
