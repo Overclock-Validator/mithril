@@ -2260,13 +2260,25 @@ func UpgradeableLoaderUpgrade(execCtx *ExecutionCtx, txCtx *TransactionCtx, inst
 	}
 	defer programData.Drop()
 
-	var programDataBalanceRequired uint64
-	minBalance := rent.MinimumBalance(uint64(len(programData.Data())))
-	programDataBalanceRequired = max(minBalance, 1)
-
-	if len(programData.Data()) < int(upgradeableLoaderSizeOfProgramData(bufferDataLen)) {
-		return InstrErrAccountDataTooSmall
+	// SIMD-0433 (LoaderV3SetProgramDataToElfLength): the upgrade resizes
+	// ProgramData to exactly header + new ELF and funds rent for that length.
+	// Before it, ProgramData keeps its length, which must already hold the ELF
+	// (Agave v4.5.0-beta.0 programs/bpf_loader/src/lib.rs Upgrade).
+	programDataDataOffset := uint64(upgradeableLoaderSizeOfProgramDataMetaData)
+	setProgramDataToElfLen := execCtx.Features.IsActive(features.LoaderV3SetProgramDataToElfLength)
+	var programDataLen uint64
+	if setProgramDataToElfLen {
+		programDataLen = safemath.SaturatingAddU64(programDataDataOffset, bufferDataLen)
+		if programDataLen > MaxPermittedDataLength {
+			return InstrErrInvalidAccountData
+		}
+	} else {
+		programDataLen = uint64(len(programData.Data()))
+		if programDataLen < upgradeableLoaderSizeOfProgramData(bufferDataLen) {
+			return InstrErrAccountDataTooSmall
+		}
 	}
+	programDataBalanceRequired := max(rent.MinimumBalance(programDataLen), 1)
 
 	if safemath.SaturatingAddU64(programData.Lamports(), bufferLamports) < programDataBalanceRequired {
 		return InstrErrInsufficientFunds
@@ -2319,13 +2331,22 @@ func UpgradeableLoaderUpgrade(execCtx *ExecutionCtx, txCtx *TransactionCtx, inst
 		return err
 	}
 
+	if setProgramDataToElfLen {
+		// Agave truncates to a zeroed header and appends the ELF; the net
+		// resize, its checks and the resulting length equal one resize here,
+		// and the header and ELF bytes are rewritten below.
+		err = programData.SetDataLength(programDataLen, execCtx.Features)
+		if err != nil {
+			return err
+		}
+	}
+
 	programDataNewState := &UpgradeableLoaderState{Type: UpgradeableLoaderStateTypeProgramData, ProgramData: UpgradeableLoaderStateProgramData{Slot: clock.Slot, UpgradeAuthorityAddress: &authorityKey}}
 	err = setUpgradeableLoaderAccountState(programData, programDataNewState, execCtx.Features)
 	if err != nil {
 		return err
 	}
 
-	programDataDataOffset := uint64(upgradeableLoaderSizeOfProgramDataMetaData)
 	dstEnd := safemath.SaturatingAddU64(programDataDataOffset, bufferDataLen)
 	if uint64(len(programData.Data())) < dstEnd {
 		return InstrErrAccountDataTooSmall

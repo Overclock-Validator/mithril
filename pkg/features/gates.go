@@ -110,6 +110,19 @@ var LoaderV3MinimumExtendProgramSize = newGate("LoaderV3MinimumExtendProgramSize
 var LoaderV3ProgramDataSizeFloor = newGate("LoaderV3ProgramDataSizeFloor", "8whkDenELnfwYLirBc4Wb4H2Z1z5K7tiykpdxJS7cWg1")
 var EnableSha512Syscall = newGate("EnableSha512Syscall", "s512oDwgx8hjMnaQjXfqqrZroVj4HvC6TkN3iSSWXCh")
 
+// SIMD-0437 rent reductions and the SIMD-0438 safeguard. Activation sets
+// Rent.lamports_per_byte and rewrites the Rent sysvar in the activating bank
+// (Agave v4.5.0-beta.0 runtime/src/bank.rs compute_and_apply_new_feature_activations).
+var SetLamportsPerByteTo6333 = newGate("SetLamportsPerByteTo6333", "4a6f7o7iTcA8hRDCrPLkSatnt5Ykxiu36wo5p1Tt12wC")
+var SetLamportsPerByteTo5080 = newGate("SetLamportsPerByteTo5080", "61BtM7BkDEE8Yq5fskEVAQT9mYA8qCejJWoLe5apqg81")
+var SetLamportsPerByteTo2575 = newGate("SetLamportsPerByteTo2575", "rntCigrTppP5JdZz7K8TyN9sMzLdAcXp8SejYpVpX6D")
+var SetLamportsPerByteTo1322 = newGate("SetLamportsPerByteTo1322", "rntD7invRBswCAdKtRsh1G4psKjrPdS3BKqtnA78C7N")
+var SetLamportsPerByteTo696 = newGate("SetLamportsPerByteTo696", "rntTjNZ9boq8owDxjGVFHPfWNQPDaKiM5JcjxmDGg47")
+var SetLamportsPerByteTo6960 = newGate("SetLamportsPerByteTo6960", "rnt8ZQpz2HYhX3DkYBDGjJS1a36mYq69oXka7JrhEdi")
+
+// SIMD-0433: loader-v3 Upgrade resizes ProgramData to the new ELF's length.
+var LoaderV3SetProgramDataToElfLength = newGate("LoaderV3SetProgramDataToElfLength", "EhisBfVtGvEA8bVCVN5VMaYEaX6iTfoUrmcDi8LY7Kxy")
+
 var AllFeatureGates = []FeatureGate{StopTruncatingStringsInSyscalls, EnablePartitionedEpochReward, EnablePartitionedEpochRewardsSuperfeature,
 	LastRestartSlotSysvar, Libsecp256k1FailOnBadCount, Libsecp256k1FailOnBadCount2, EnableBpfLoaderSetAuthorityCheckedIx,
 	LoosenCpiSizeRestriction, IncreaseTxAccountLockLimit, VoteStateAddVoteLatency, AllowCommissionDecreaseAtAnyTime,
@@ -133,4 +146,6 @@ var AllFeatureGates = []FeatureGate{StopTruncatingStringsInSyscalls, EnableParti
 	RelaxProgramdataAccountCheckMigration, ReplaceSplTokenWithPToken, CreateAccountAllowPrefund,
 	RemoveSimpleVoteFromCostModel, DisableZkElgamalProofProgram, ReenableZkElgamalProofProgram, AltBn128LittleEndian, EnableAltBn128G2Syscalls,
 	EnableBls12_381Syscall, UpgradeBpfStakeProgramToV5, DelayCommissionUpdates, ValidateChainedBlockId, DiscardUnexpectedDataCompleteShreds, LoaderV3MinimumExtendProgramSize,
-	LoaderV3ProgramDataSizeFloor, EnableSha512Syscall}
+	LoaderV3ProgramDataSizeFloor, EnableSha512Syscall,
+	SetLamportsPerByteTo6333, SetLamportsPerByteTo5080, SetLamportsPerByteTo2575, SetLamportsPerByteTo1322,
+	SetLamportsPerByteTo696, SetLamportsPerByteTo6960, LoaderV3SetProgramDataToElfLength}

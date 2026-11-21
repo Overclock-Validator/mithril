@@ -109,7 +109,112 @@ func scanAndEnableFeatures(acctsDb *accountsdb.AccountsDb, replayCtx *ReplayCtx,
 		}
 	}
 
+	// SIMD-0437/0438 run after the per-feature activations above, as in Agave,
+	// so a same-boundary DeprecateRentExemptionThreshold has already rewritten
+	// the cached Rent this update builds on.
+	newlyActivated := make(map[solana.PublicKey]struct{}, len(modifiedAccts))
+	for _, acct := range modifiedAccts {
+		if acct.Owner == a.FeatureAddr {
+			newlyActivated[acct.Key] = struct{}{}
+		}
+	}
+	if lamportsPerByte, ok := rentLamportsPerByteForActivations(newlyActivated); ok {
+		modifiedRentAcct, parentRentAcct, previous, err := applyRentLamportsPerByteActivation(acctsDb, slot, lamportsPerByte)
+		if err != nil {
+			panic(fmt.Sprintf("apply Rent lamports_per_byte=%d activation at slot %d: %v", lamportsPerByte, slot, err))
+		}
+		modifiedAccts = append(modifiedAccts, modifiedRentAcct)
+		parentAccts = append(parentAccts, parentRentAcct)
+		mlog.Log.Infof("Rent sysvar: lamports_per_byte %d -> %d at slot %d (SIMD-0437/0438 activation)",
+			previous, lamportsPerByte, slot)
+	}
+
 	return f, modifiedAccts, parentAccts
+}
+
+// rentLamportsPerByteGates is Agave's SIMD-0437 table, in Agave's order
+// (v4.5.0-beta.0 runtime/src/bank.rs compute_and_apply_new_feature_activations).
+// Every gate activated at this boundary sets the value in turn, so when several
+// activate together the last one listed (the lowest value) wins.
+var rentLamportsPerByteGates = []struct {
+	gate            features.FeatureGate
+	lamportsPerByte uint64
+}{
+	{features.SetLamportsPerByteTo6333, 6333},
+	{features.SetLamportsPerByteTo5080, 5080},
+	{features.SetLamportsPerByteTo2575, 2575},
+	{features.SetLamportsPerByteTo1322, 1322},
+	{features.SetLamportsPerByteTo696, 696},
+}
+
+// rentLamportsPerByteSafeguard is SIMD-0438: it restores the legacy value and
+// overrides any SIMD-0437 gate activated at the same boundary.
+const rentLamportsPerByteSafeguard = 6960
+
+// rentLamportsPerByteForActivations returns the Rent.lamports_per_byte that
+// the features newly activated at this boundary set, if any of them sets one.
+func rentLamportsPerByteForActivations(newlyActivated map[solana.PublicKey]struct{}) (uint64, bool) {
+	var lamportsPerByte uint64
+	var changed bool
+	for _, entry := range rentLamportsPerByteGates {
+		if _, ok := newlyActivated[entry.gate.Address]; ok {
+			lamportsPerByte, changed = entry.lamportsPerByte, true
+		}
+	}
+	if _, ok := newlyActivated[features.SetLamportsPerByteTo6960.Address]; ok {
+		lamportsPerByte, changed = rentLamportsPerByteSafeguard, true
+	}
+	return lamportsPerByte, changed
+}
+
+// applyRentLamportsPerByteActivation mirrors Agave's
+// `rent_collector.rent.lamports_per_byte = value; update_rent()`: only
+// lamports_per_byte changes, the account keeps its lamports, and the cached
+// Rent is updated so the rest of the boundary (the epoch inflation and
+// reward-epoch delegated stakes accounts are sized by it) and the block's
+// transactions see the new value. The parent is read from AccountsDB, so a
+// second Rent update at the same boundary coalesces onto the true parent.
+//
+// It returns the updated and parent accounts and the parent's lamports_per_byte.
+func applyRentLamportsPerByteActivation(acctsDb *accountsdb.AccountsDb, slot uint64, lamportsPerByte uint64) (*accounts.Account, *accounts.Account, uint64, error) {
+	if sealevel.SysvarCache.Rent.Sysvar == nil {
+		return nil, nil, 0, fmt.Errorf("rent sysvar cache is empty")
+	}
+	rentAcct, err := acctsDb.GetAccount(slot, sealevel.SysvarRentAddr)
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("load Rent sysvar: %w", err)
+	}
+	updated, parent, previous, err := rentAccountWithLamportsPerByte(rentAcct, *sealevel.SysvarCache.Rent.Sysvar, lamportsPerByte)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	rentSysvar := *sealevel.SysvarCache.Rent.Sysvar
+	rentSysvar.LamportsPerUint8Year = lamportsPerByte
+	sealevel.SysvarCache.Rent.Sysvar = &rentSysvar
+	sealevel.SysvarCache.Rent.Acct = updated
+	return updated, parent, previous, nil
+}
+
+// rentAccountWithLamportsPerByte rewrites the Rent sysvar account from the
+// bank's current Rent with lamports_per_byte replaced. It does not touch the
+// global sysvar cache.
+func rentAccountWithLamportsPerByte(rentAcct *accounts.Account, current sealevel.SysvarRent, lamportsPerByte uint64) (updated, parent *accounts.Account, previous uint64, err error) {
+	if rentAcct == nil {
+		return nil, nil, 0, fmt.Errorf("Rent sysvar account is missing")
+	}
+	parent = rentAcct.Clone()
+	var parentRent sealevel.SysvarRent
+	if err := parentRent.UnmarshalWithDecoder(bin.NewBinDecoder(parent.Data)); err != nil {
+		return nil, nil, 0, fmt.Errorf("decode parent Rent sysvar: %w", err)
+	}
+	current.LamportsPerUint8Year = lamportsPerByte
+	encoded := current.MustMarshal()
+	if len(rentAcct.Data) < len(encoded) {
+		return nil, nil, 0, fmt.Errorf("Rent sysvar account holds %d bytes, need %d", len(rentAcct.Data), len(encoded))
+	}
+	updated = rentAcct.Clone()
+	copy(updated.Data, encoded)
+	return updated, parent, parentRent.LamportsPerUint8Year, nil
 }
 
 func applyDeprecateRentExemptionThresholdActivation(acctsDb *accountsdb.AccountsDb, slot uint64) (*accounts.Account, *accounts.Account, error) {
