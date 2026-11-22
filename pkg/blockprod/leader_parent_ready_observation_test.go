@@ -118,7 +118,8 @@ func TestLeaderParentReadyObservationPreservesEffectsAndLateEvents(t *testing.T)
 			var seen [2]effects
 			for i, enabled := range []bool{false, true} {
 				ready := time.Unix(1_700_000_000, 0)
-				now := ready.Add(130 * time.Millisecond)
+				cutoff := ready.Add(AlpenglowSlotDuration - leaderBlockCompletionReserve)
+				now := cutoff
 				if handover {
 					now = ready
 				}
@@ -151,7 +152,7 @@ func TestLeaderParentReadyObservationPreservesEffectsAndLateEvents(t *testing.T)
 					require.True(t, ok)
 					parent.Parent.Hash = solana.Hash{6}
 					parent.ReadyAt = ready.Add(100 * time.Millisecond)
-					now = ready.Add(130 * time.Millisecond)
+					now = cutoff
 					_, ok = loop.productionWindowTargetLocked(212)
 				}
 				loop.mu.Unlock()
