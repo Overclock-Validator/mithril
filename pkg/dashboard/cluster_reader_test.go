@@ -398,10 +398,10 @@ func TestClusterReaderProjectsLegacyPuffinWithoutMutatingSnapshot(t *testing.T) 
 	view := projectCluster(&s, "generation", "fresh", "", now)
 	for i, p := range view.metadata.Providers {
 		if p.ID == "puffin" {
-			if p.State != "unavailable" || p.Reason != "not_collected" {
-				t.Fatalf("incorrect projected state: %s/%s", p.State, p.Reason)
+			if p.State != "unavailable" || p.Reason != "not_collected" || p.SourceURL != "" {
+				t.Fatalf("incorrect projected state: %+v", p)
 			}
-			if s.Providers[i].State != "retired" || s.Providers[i].Reason != "provider_retired" {
+			if s.Providers[i].State != "retired" || s.Providers[i].Reason != "provider_retired" || s.Providers[i].SourceURL == "" {
 				t.Fatal("source snapshot mutated")
 			}
 			return

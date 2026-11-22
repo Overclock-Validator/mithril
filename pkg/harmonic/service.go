@@ -133,6 +133,7 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		Pipeline:    s.pipeline,
 		Events:      events,
 		Crank:       crank.Builder(s.blockEngine),
+		TipAccounts: crank.TipAccounts(),
 		OnReport:    onReport,
 		Workers:     cfg.Workers,
 	})

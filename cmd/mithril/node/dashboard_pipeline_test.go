@@ -83,6 +83,8 @@ func TestDashboardPipelineRealQUICTrafficPublicProjection(t *testing.T) {
 		private.Sigverify.VerifiedPackets != 1 || private.Sigverify.VerifiedBytes != uint64(len(wire)) ||
 		private.Scheduler.InPackets != 1 || private.Scheduler.InBytes != uint64(len(wire)) || private.Scheduler.BufferedTotal != 1 || private.Scheduler.Accepted != 0 ||
 		private.Scheduler.DroppedExpired == nil || *private.Scheduler.DroppedExpired != 0 || private.Scheduler.EvictedCapacity == nil || *private.Scheduler.EvictedCapacity != 0 ||
+		private.Scheduler.DroppedAlreadyProcessed == nil || *private.Scheduler.DroppedAlreadyProcessed != 0 ||
+		private.QUIC.RefusedTooManyOpen == nil || *private.QUIC.RefusedTooManyOpen != 0 || private.QUIC.RefusedPerIP == nil || *private.QUIC.RefusedPerIP != 0 ||
 		private.QUIC.AcceptedConnections != 1 || private.QUIC.AcceptedStreams != 1 {
 		t.Fatalf("real traffic mapping: %+v", private)
 	}

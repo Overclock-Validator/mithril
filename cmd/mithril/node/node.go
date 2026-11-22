@@ -72,8 +72,9 @@ var (
 		PreRunE: func(cmd *cobra.Command, args []string) error {
 			return initConfigAndBindFlags(cmd)
 		},
-		Run: func(cmd *cobra.Command, args []string) {
-			runLive(cmd, args)
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cmd.SilenceUsage = true
+			return runLive(cmd, args)
 		},
 	}
 
@@ -91,11 +92,13 @@ var (
 	legacyGenesisHash                string // explicit lineage for pre-binding AccountsDB/ledger artifacts
 	dashboardSocket                  string
 	dashboardSocketGroup             string
+	dashboardPublicOrigin            string
 	dashboardEnabled                 bool
 	dashboardHostResources           bool
 	dashboardMachineDetails          bool
 	dashboardCgroupResources         bool
 	dashboardReplayDetails           bool
+	dashboardFastExecuted            bool
 	dashboardNetworkDetails          bool
 	dashboardLocalPeers              bool
 	dashboardShredHistory            bool
@@ -166,7 +169,8 @@ var (
 	paramArenaSizeMB         uint64
 	borrowedAccountArenaSize uint64
 
-	rpcPort int
+	rpcPort        int
+	rpcBindAddress string
 
 	// Lightbringer sidecar config
 	lightbringerEnabled          bool
@@ -561,14 +565,18 @@ func init() {
 
 	// [rpc] section flags (Mithril's RPC server)
 	Run.Flags().IntVar(&rpcPort, "rpc-port", 0, "RPC server port. Default off.")
+	Run.Flags().StringVar(&rpcBindAddress, "rpc-bind-address", "0.0.0.0", "RPC listener IP; use 127.0.0.1 for local access only")
 	Run.Flags().BoolVar(&disableMetricsServer, "no-metrics-server", false, "Disable the Prometheus HTTP listener (default :9090)")
 	Run.Flags().StringVar(&dashboardSocket, "dashboard-socket", "", "Private read-only dashboard socket (mode 0700 parent by default; default off)")
 	Run.Flags().StringVar(&dashboardSocketGroup, "dashboard-socket-group", "", "Dedicated Linux feed group (requires a node-owned mode 2710 socket directory)")
 	Run.Flags().BoolVar(&dashboardEnabled, "dashboard-enabled", false, "Enable the provisioned Linux dashboard feed")
+	Run.Flags().String("dashboard-profile", "", "Dashboard preset: standard enables common observations for the HTTPS reader")
+	Run.Flags().String("dashboard-public-origin", "", "HTTPS origin for the managed dashboard reader (requires the standard profile and provisioned Linux feed)")
 	Run.Flags().BoolVar(&dashboardHostResources, "dashboard-host-resources", false, "Collect visible-host CPU/load/memory in the private dashboard feed (requires a dashboard feed; default off)")
 	Run.Flags().BoolVar(&dashboardMachineDetails, "dashboard-machine-details", false, "Collect bounded machine topology, sampled thread affinity and RSS history (requires a dashboard feed and --dashboard-host-resources; default off)")
 	Run.Flags().BoolVar(&dashboardCgroupResources, "dashboard-cgroup-resources", false, "Collect visible domain-cgroup settings, counters and pressure in the private dashboard feed (requires a dashboard feed; default off)")
 	Run.Flags().BoolVar(&dashboardReplayDetails, "dashboard-replay-details", false, "Retain bounded replay diagnostics and rooted-bank history for the private dashboard feed (requires a dashboard feed; default off)")
+	Run.Flags().BoolVar(&dashboardFastExecuted, "dashboard-fast-executed", false, "Retain a provisional local-execution tail (requires --dashboard-replay-details; default off)")
 	Run.Flags().BoolVar(&dashboardNetworkDetails, "dashboard-network-details", false, "Expose owned TVU and repair socket observations in the private dashboard feed (requires a dashboard feed; default off)")
 	Run.Flags().BoolVar(&dashboardLocalPeers, "dashboard-local-peers", false, "Retain bounded local signed-contact metadata without network endpoints (requires a dashboard feed and --dashboard-network-details; default off)")
 	Run.Flags().BoolVar(&dashboardShredHistory, "dashboard-shred-history", false, "Retain bounded authenticated shred reception history (requires dashboard socket, replay details, network details and block.source=turbine; default off)")
@@ -606,7 +614,7 @@ func init() {
 	Run.Flags().BoolVar(&validatorReservedHistory, "reserved-vote-history", false, "Use durable signing reservations with unsynchronized per-vote history writes")
 	Run.Flags().BoolVar(&validatorInitializeReservation, "initialize-vote-reservation", false, "Enroll complete synchronous vote history in reserved mode (one-time migration)")
 	Run.Flags().Uint64Var(&validatorWaitToVoteSlot, "wait-to-vote-slot", 0, "Do not cast new votes below this slot; the automatic startup cutoff still applies (0 = automatic only)")
-	Run.Flags().IntVar(&validatorCompletionReserveMs, "leader-completion-reserve-ms", 0, "Time reserved for leader finalization and broadcast (0 = 75ms default; tune from measured completion times)")
+	Run.Flags().IntVar(&validatorCompletionReserveMs, "leader-completion-reserve-ms", 0, "Time reserved for leader finalization and broadcast (0 = 15ms default; tune from measured completion margins)")
 	Run.Flags().IntVar(&validatorMaxBufferedTransactions, "tpu-max-buffered-transactions", 0, "Maximum queued TPU transactions (0 = 131072 default)")
 
 	// [harmonic] section flags
@@ -663,6 +671,9 @@ func init() {
 	Run.Flags().BoolVar(&blockRPCFallback, "rpc-fallback", false, "Allow RPC to fetch blocks when replay is more than repair-catchup-max-gap-slots behind (default false: shreds via turbine + repair are the only block path)")
 	Run.Flags().StringVar(&turbineAdvertisedIP, "turbine-advertised-ip", "", "Public IP advertised by native turbine gossip (optional)")
 	Run.Flags().IntVar(&turbineShredVersion, "turbine-shred-version", 0, "Shred version for native turbine gossip (0 = discover from entrypoint)")
+	Run.Flags().BoolVar(&replayPhaseTimers, "replay-phase-timers", true, "Time each transaction phase and instruction dispatch during replay (the detail behind TxLoop); off saves the timer calls")
+	Run.Flags().String("speculation", replay.SpeculationOff, "FRODO early execution of transactions queued behind others: off (default) or on")
+	Run.Flags().BoolVar(&offlineReplay, "offline", false, "Replay only from the local shred spool: no gossip, Turbine tree, repair or Votor listener (corpus replays; needs --end-slot and --bootstrap accountsdb)")
 	Run.Flags().StringSlice("shred-receiver-address", nil, "Also send every shred this validator broadcasts to this host:port (repeatable), e.g. a block builder")
 	Run.Flags().StringSlice("shred-retransmit-receiver-address", nil, "Also send every shred this node relays to this host:port (repeatable), e.g. a block builder")
 	Run.Flags().IntVar(&blockMaxRPS, "block-max-rps", 0, "Max RPC requests per second for block fetching (0 = use default)")
@@ -883,6 +894,9 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		blockstorePath = getString("ledger-path", "ledger.path")
 	}
 
+	// Offline replay is read first: it changes what the network settings mean.
+	offlineReplay = getBool("offline", "network.offline")
+
 	// [network] section (with fallback to legacy [rpc] keys)
 	rpcEndpoints = getStringSlice("rpc", "network.rpc")
 	if len(rpcEndpoints) == 0 {
@@ -900,7 +914,14 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		return err
 	}
 	cluster = clusterInfo.Name
-	if len(rpcEndpoints) == 0 {
+	if offlineReplay {
+		// Offline replay makes no RPC calls: the genesis check uses the
+		// cluster setting, and nothing polls a tip or fetches blocks.
+		if len(rpcEndpoints) > 0 {
+			mlog.Log.Infof("offline replay: ignoring network.rpc")
+		}
+		rpcEndpoints = nil
+	} else if len(rpcEndpoints) == 0 {
 		if clusterInfo.Custom {
 			return fmt.Errorf("custom network.cluster %q requires network.rpc", cluster)
 		}
@@ -924,16 +945,42 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 
 	// [rpc] section - Mithril's RPC server
 	rpcPort = getInt("rpc-port", "rpc.port")
+	rpcBindAddress = getString("rpc-bind-address", "rpc.bind_address")
+	if net.ParseIP(rpcBindAddress) == nil {
+		return fmt.Errorf("rpc.bind_address must be a literal IP address: %q", rpcBindAddress)
+	}
 	disableMetricsServer = getBool("no-metrics-server", "reporting.no_metrics_server")
+	dashboardProfile := getString("dashboard-profile", "dashboard.profile")
+	if dashboardProfile != "" && dashboardProfile != "standard" {
+		return fmt.Errorf("unknown dashboard.profile %q: use standard or leave it empty", dashboardProfile)
+	}
+	getDashboardBool := func(key string, presetDefault bool) bool {
+		cliKey, tomlKey := "dashboard-"+strings.ReplaceAll(key, "_", "-"), "dashboard."+key
+		if presetDefault && !flagChanged(cliKey) && !config.IsSet(tomlKey) {
+			return true
+		}
+		return getBool(cliKey, tomlKey)
+	}
 	dashboardSocket = getString("dashboard-socket", "dashboard.socket")
 	dashboardSocketGroup = getString("dashboard-socket-group", "dashboard.socket_group")
-	dashboardEnabled = getBool("dashboard-enabled", "dashboard.enabled")
+	dashboardPublicOrigin = getString("dashboard-public-origin", "dashboard.public_origin")
+	dashboardEnabled = getDashboardBool("enabled", dashboardProfile == "standard" && dashboardSocket == "")
+	if err := validateDashboardPublicOrigin(dashboardPublicOrigin, dashboardProfile, dashboardSocket, dashboardSocketGroup, runtime.GOOS, dashboardEnabled); err != nil {
+		return err
+	}
+	if dashboardProfile == "standard" && dashboardSocket == "" && dashboardSocketGroup != "" {
+		return fmt.Errorf("dashboard.socket_group requires dashboard.socket with dashboard.profile=standard")
+	}
+	if dashboardProfile == "standard" && dashboardEnabled && runtime.GOOS != "linux" {
+		return fmt.Errorf("dashboard.profile=standard requires an explicit dashboard.socket outside Linux")
+	}
 	var dashboardErr error
 	dashboardSocket, dashboardSocketGroup, dashboardErr = dashboardFeedConfig(dashboardEnabled, dashboardSocket, dashboardSocketGroup, runtime.GOOS)
 	if dashboardErr != nil {
 		return dashboardErr
 	}
-	dashboardHostResources = getBool("dashboard-host-resources", "dashboard.host_resources")
+	standardDashboard := dashboardProfile == "standard" && dashboardSocket != ""
+	dashboardHostResources = getDashboardBool("host_resources", standardDashboard)
 	if err := validateDashboardHostResources(dashboardHostResources, dashboardSocket); err != nil {
 		return err
 	}
@@ -945,20 +992,24 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	if err := validateDashboardCgroupResources(dashboardCgroupResources, dashboardSocket); err != nil {
 		return err
 	}
-	dashboardReplayDetails = getBool("dashboard-replay-details", "dashboard.replay_details")
+	dashboardReplayDetails = getDashboardBool("replay_details", standardDashboard)
+	dashboardFastExecuted = getDashboardBool("fast_executed", standardDashboard && dashboardReplayDetails)
+	if dashboardFastExecuted && !dashboardReplayDetails {
+		return fmt.Errorf("dashboard.fast_executed requires dashboard.replay_details")
+	}
 	if err := validateDashboardReplayDetails(dashboardReplayDetails, dashboardSocket); err != nil {
 		return err
 	}
-	dashboardNetworkDetails = getBool("dashboard-network-details", "dashboard.network_details")
+	dashboardNetworkDetails = getDashboardBool("network_details", standardDashboard)
 	if err := validateDashboardNetworkDetails(dashboardNetworkDetails, dashboardSocket); err != nil {
 		return err
 	}
-	dashboardLocalPeers = getBool("dashboard-local-peers", "dashboard.local_peers")
+	dashboardLocalPeers = getDashboardBool("local_peers", standardDashboard && dashboardNetworkDetails)
 	if err := validateDashboardLocalPeers(dashboardLocalPeers, dashboardSocket, dashboardNetworkDetails); err != nil {
 		return err
 	}
 	dashboardShredHistory = getBool("dashboard-shred-history", "dashboard.shred_history")
-	dashboardCacheDetails = getBool("dashboard-cache-details", "dashboard.cache_details")
+	dashboardCacheDetails = getDashboardBool("cache_details", standardDashboard)
 	dashboardCacheActivity = getBool("dashboard-cache-activity", "dashboard.cache_activity")
 	if dashboardCacheActivity && !dashboardCacheDetails {
 		return fmt.Errorf("dashboard.cache_activity requires dashboard.cache_details")
@@ -970,8 +1021,8 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	if err := validateDashboardProductionDetails(dashboardProductionDetails, dashboardSocket); err != nil {
 		return err
 	}
-	dashboardStorageDetails = getBool("dashboard-storage-details", "dashboard.storage_details")
-	dashboardIODetails = getBool("dashboard-io-details", "dashboard.io_details")
+	dashboardStorageDetails = getDashboardBool("storage_details", standardDashboard)
+	dashboardIODetails = getDashboardBool("io_details", standardDashboard && dashboardStorageDetails)
 	if dashboardIODetails && !dashboardStorageDetails {
 		return fmt.Errorf("dashboard.io_details requires dashboard.storage_details")
 	}
@@ -1121,6 +1172,10 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		}
 	}
 
+	if err := applyOfflineReplay(); err != nil {
+		return err
+	}
+
 	// Validate block source requirements
 	switch blockSource {
 	case "rpc":
@@ -1137,7 +1192,7 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	case "turbine":
 		// Defaulted here, after Lightbringer may have taken over the source, so
 		// a node fed by Lightbringer never needs a native Turbine entrypoint.
-		if turbineGossipEntrypoint == "" {
+		if turbineGossipEntrypoint == "" && !offlineReplay {
 			if clusterInfo.Custom {
 				return fmt.Errorf("custom network.cluster %q requires turbine.gossip_entrypoint", cluster)
 			}
@@ -1150,7 +1205,7 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		if turbineShredVersion < 0 || turbineShredVersion > 0xffff {
 			return fmt.Errorf("turbine.shred_version must be between 0 and 65535")
 		}
-		if len(rpcEndpoints) == 0 {
+		if len(rpcEndpoints) == 0 && !offlineReplay {
 			return fmt.Errorf("block.source=turbine requires RPC endpoints for catchup and tip polling (set network.rpc)")
 		}
 	default:
@@ -1332,6 +1387,14 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	sbpf.UsePool = getBool("use-pool", "tuning.use_pool")
 	// [tuning] streaming execution (on by default; Alpenglow turbine only).
 	replay.StreamingExecutionCfg.Enabled = getBool("streaming-execution", "tuning.streaming_execution")
+	replayPhaseTimers = getBool("replay-phase-timers", "tuning.replay_phase_timers")
+	replay.SkipPhaseTimers = !replayPhaseTimers
+	if err := replay.ConfigureSpeculation(getString("speculation", "tuning.speculation")); err != nil {
+		return fmt.Errorf("tuning.speculation: %w", err)
+	}
+	if summary := replay.SpeculationSummary(); summary != "off" {
+		mlog.Log.Infof("speculation: %s", summary)
+	}
 	replay.StreamingExecutionCfg.Workers = getInt("streaming-workers", "tuning.streaming_workers")
 	replay.StreamingExecutionCfg.MinGroupBatches = getInt("streaming-min-group-batches", "tuning.streaming_min_group_batches")
 	if ms := getInt("streaming-max-open-ms", "tuning.streaming_max_open_ms"); ms > 0 {
@@ -1354,6 +1417,9 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	}
 
 	if err := configureMemoryBudgets(); err != nil {
+		return err
+	}
+	if err := buildSnapshotConfig(rpcEndpoints).ValidateKnownValidators(); err != nil {
 		return err
 	}
 	return configureDiskBudget()
@@ -1421,6 +1487,8 @@ func buildSnapshotConfig(rpcEndpoints []string) snapshotdl.SnapshotConfig {
 	if config.IsSet("snapshot.node_blacklist") {
 		cfg.NodeBlacklist = config.GetStringSlice("snapshot.node_blacklist")
 	}
+	cfg.KnownValidators = config.GetStringSlice("snapshot.known_validators")
+	cfg.OnlyKnownRPC = config.GetBool("snapshot.only_known_rpc")
 	if config.IsSet("snapshot.full_threshold") {
 		cfg.FullThreshold = config.GetInt("snapshot.full_threshold")
 	}
@@ -1446,7 +1514,7 @@ func buildSnapshotConfig(rpcEndpoints []string) snapshotdl.SnapshotConfig {
 	return cfg
 }
 
-func runLive(c *cobra.Command, args []string) {
+func runLive(c *cobra.Command, args []string) error {
 	if pprofPort != -1 {
 		startPprofHandlers(int(pprofPort))
 	}
@@ -1524,11 +1592,15 @@ func runLive(c *cobra.Command, args []string) {
 	}
 	mlog.Log.Infof("Go runtime soft memory limit: %d MiB (tuning.memory_limit_mb overrides GOMEMLIMIT when set)", debug.SetMemoryLimit(-1)>>20)
 
-	// Kill any existing mithril processes to prevent zombie accumulation
-	if killed := killExistingMithrilProcesses(); killed > 0 {
-		fmt.Printf("  ⚠ Killed %d existing mithril process(es)\n\n", killed)
+	// Kill any existing mithril processes to prevent zombie accumulation.
+	// A backtest or an offline replay may share the host with other nodes and
+	// must not stop them.
+	if shouldKillExistingMithril(backtestMode, offlineReplay) {
+		if killed := killExistingMithrilProcesses(); killed > 0 {
+			fmt.Printf("  ⚠ Killed %d existing mithril process(es)\n\n", killed)
+		}
 	}
-	dashboard := startNodeDashboard(ctx, runStartedAt, dashboardSocket, dashboardSocketGroup, replay.CurrentRunID, cluster, consensusMode, true, rpcPort != 0, dashboardReplayDetails, dashboardNetworkDetails, dashboardCacheDetails, dashboardProductionDetails, dashboardStorageDetails, dashboardShredHistory, dashboardHostResources, dashboardMachineDetails, dashboardLocalPeers)
+	dashboard := startNodeDashboardWithOrigin(ctx, runStartedAt, dashboardSocket, dashboardSocketGroup, replay.CurrentRunID, cluster, consensusMode, true, rpcPort != 0, dashboardReplayDetails, dashboardNetworkDetails, dashboardCacheDetails, dashboardProductionDetails, dashboardStorageDetails, dashboardShredHistory, dashboardHostResources, dashboardMachineDetails, dashboardLocalPeers, dashboardFastExecuted, dashboardPublicOrigin)
 	defer dashboard.close()
 	dashboard.storagePaths(accountsPath, blockstorePath)
 	dashboard.configureCgroupResources(dashboardCgroupResources)
@@ -1568,7 +1640,14 @@ func runLive(c *cobra.Command, args []string) {
 	// it before Lightbringer can open ledger storage and before history records
 	// describe any mutation. Fetch genesis exactly once and carry that value
 	// through every fresh ready-state write below.
-	networkGenesisHash := fetchGenesisHash(ctx)
+	var networkGenesisHash string
+	if offlineReplay {
+		// No network to ask: the configured cluster names the chain, and the
+		// checks below still refuse an AccountsDB or ledger from another one.
+		networkGenesisHash = clusterInfo.GenesisHash
+	} else {
+		networkGenesisHash = fetchGenesisHash(ctx)
+	}
 	if networkGenesisHash == "" {
 		klog.Fatalf("FATAL: could not confirm the RPC genesis hash; refusing startup because AccountsDB, shred spool, and vote-history lineage cannot be validated")
 	}
@@ -1890,6 +1969,8 @@ func runLive(c *cobra.Command, args []string) {
 		mlog.Log.Infof("block.source=turbine with native turbine receiver on %s", turbineBindAddr)
 		if turbineGossipEntrypoint != "" {
 			mlog.Log.Infof("native turbine gossip enabled with entrypoint %s", turbineGossipEntrypoint)
+		} else if offlineReplay {
+			mlog.Log.Infof("native turbine gossip off (offline replay)")
 		} else {
 			mlog.Log.Warnf("native turbine gossip entrypoint is empty; Mithril will receive turbine packets only if shreds are sent directly to %s", turbineBindAddr)
 		}
@@ -2584,6 +2665,10 @@ postBootstrap:
 			res.NewThrough, res.UndoneBatches, res.UndoneKeys, mithrilState.GetResumeSlot())
 	}
 
+	// The AccountsDB is built or opened, and rewound if asked: state loading is
+	// done (a backtest reports it as Firedancer's snapshot-done time).
+	stateReadyAt = time.Now()
+
 	// Rooted-durable resume needs a context at the last rooted slot. The fold
 	// manifest is the primary source (handled above); the state file is the
 	// fallback for stores from before the first fold.
@@ -2662,11 +2747,15 @@ postBootstrap:
 
 	// Write replay timings to run-specific log directory
 	replayTimingsPath := filepath.Join(mlog.GetLogDir(), "replay_timings.jsonl")
-	metricsWriter, metricsWriterCleanup, err := createBufWriter(replayTimingsPath)
+	metricsWriter, err := createReplayTimingsWriter(replayTimingsPath, logCfg)
 	if err != nil {
 		klog.Fatalf("unable to create replay timings writer: %v", err)
 	}
-	defer metricsWriterCleanup()
+	defer func() {
+		if err := metricsWriter.Close(); err != nil {
+			mlog.Log.Errorf("unable to close replay timings writer: %v", err)
+		}
+	}()
 
 	if paramArenaSizeMB > 0 {
 		replay.SerializedParameterArena = arena.New[byte](paramArenaSizeMB << 20)
@@ -2683,7 +2772,10 @@ postBootstrap:
 		klog.Fatalf("invalid port: %d", rpcPort)
 	} else if rpcPort != 0 {
 		schedule := epochScheduleFromState(mithrilState)
-		rpcServer = rpcserver.NewRpcServer(accountsDb, uint16(rpcPort), schedule, solana.MustHashFromBase58(networkGenesisHash))
+		rpcServer, err = rpcserver.NewRpcServerWithBindAddress(accountsDb, rpcBindAddress, uint16(rpcPort), schedule, solana.MustHashFromBase58(networkGenesisHash))
+		if err != nil {
+			klog.Fatalf("unable to start RPC server: %v", err)
+		}
 		if schedule == nil || schedule.SlotsPerEpoch == 0 || schedule.SlotsPerEpoch > math.MaxUint64/3 {
 			klog.Fatalf("Alpenglow RPC requires a valid epoch schedule")
 		}
@@ -2695,7 +2787,7 @@ postBootstrap:
 		}
 		rpcServer.Start()
 		dashboard.rpcStarted(rpcServer)
-		mlog.Log.Infof("Started RPC server on port %d", rpcPort)
+		mlog.Log.Infof("Started RPC server on %s", net.JoinHostPort(rpcBindAddress, strconv.Itoa(rpcPort)))
 	}
 
 	// The Alpenglow observer is forkchoice authority in both consensus modes.
@@ -2844,6 +2936,7 @@ postBootstrap:
 		controller := blockprod.NewController()
 		topicSink := scheduler.NewWithConfig(controller, scheduler.Config{
 			FeatureSource: replay.ChainTipFeatures, MaxBufferedTransactions: validatorMaxBufferedTransactions,
+			CleanupSource: replay.ChainTipBankSysvars,
 		})
 		topicSink.Start(ctx)
 		defer topicSink.Stop()
@@ -2852,6 +2945,7 @@ postBootstrap:
 		tpuCfg.ListenAddr = validatorTPUQUICBind
 		tpuCfg.QUIC.ObserveStreamReadPayload = dashboard != nil && dashboardNetworkDetails
 		tpuCfg.Pipeline.ObserveQueues = dashboard != nil && dashboardNetworkDetails
+		tpuCfg.Pipeline.ObserveWorkerPasses = tpuCfg.Pipeline.ObserveQueues && os.Getenv("MITHRIL_DASHBOARD_TPU_WORKER_TIMING") == "1"
 		tpuCfg.AdvertisedIP = advertisedIP
 		tpuCfg.Pipeline.Sink = topicSink
 		tpuCfg.Pipeline.TxV1Enabled = func() bool {
@@ -2950,7 +3044,14 @@ postBootstrap:
 			RootSlot:    global.Slot,
 			BeforeBuild: consensusEngine.FlushAlpenglowRewardVotes,
 		})
-		consensusEngine.SetVotorMessageHook(rewardBuilder.ObserveVotorMessage)
+		// Reuse the verifier's parsed signature points while accumulating rewards.
+		// Build and fully validate certificates before the footer needs them.
+		// Finalization accepts only exact prepared bytes and verifier material;
+		// any miss or domain change retains ordinary synchronous verification.
+		consensusEngine.SetVerifiedVoteHook(rewardBuilder.AddVerifiedVote)
+		rewardPreparer := replay.NewLeaderRewardCertPreparer(rewardBuilder, epochSchedule, uint16(turbineShredVersion))
+		rewardPipeline := rewardcerts.NewPipeline(rewardPreparer)
+		defer rewardPipeline.Close()
 		leaderStop := make(chan struct{})
 		leaderDone := make(chan struct{})
 		var certificateObservationVoteAccount solana.PublicKey
@@ -2969,16 +3070,16 @@ postBootstrap:
 			CaptureSelectedSlotFacts:          dashboard != nil && dashboardReplayDetails,
 			ObserveTerminal:                   observeProduction,
 			ObserveParentReady:                observeParentReady,
-
-			Controller:        controller,
-			Identity:          validatorIdentity,
-			AccountsDb:        accountsDb,
-			Broadcaster:       broadcaster,
-			ShredVersion:      uint16(turbineShredVersion),
-			EpochSchedule:     epochSchedule,
-			AlpenglowClock:    true,
-			SlotDuration:      blockprod.AlpenglowSlotDuration,
-			CompletionReserve: time.Duration(validatorCompletionReserveMs) * time.Millisecond,
+			Controller:                        controller,
+			Identity:                          validatorIdentity,
+			AccountsDb:                        accountsDb,
+			Broadcaster:                       broadcaster,
+			ShredVersion:                      uint16(turbineShredVersion),
+			EpochSchedule:                     epochSchedule,
+			AlpenglowClock:                    true,
+			SlotDuration:                      blockprod.AlpenglowSlotDuration,
+			CompletionReserve:                 time.Duration(validatorCompletionReserveMs) * time.Millisecond,
+			ParentGenerationLease:             replay.AcquireChainTipGeneration,
 			ParentContext: func(slot uint64) blockprod.ParentContext {
 				tip := replay.ChainTipParentContext()
 				// Blockprod owns the replay-readiness rule. In particular, the first
@@ -3001,6 +3102,7 @@ postBootstrap:
 					ParentBlockHeight:          tip.BlockHeight,
 					LatestEvictedBlockhash:     tip.LatestEvictedBlockhash,
 					EpochRewardsActive:         tip.EpochRewardsActive,
+					EpochRewardPlan:            tip.EpochRewardPlan,
 					PrevNumSigs:                tip.PrevNumSigs,
 					PrevFeeGovernor:            tip.PrevFeeGovernor,
 					AcctsLtHash:                tip.AcctsLtHash,
@@ -3023,7 +3125,7 @@ postBootstrap:
 				return global.WallClockSlot()
 			},
 			LeaderForSlot: global.LeaderForSlot,
-			RewardCerts:   rewardBuilder,
+			RewardCerts:   rewardPipeline,
 			Hooks:         leaderHooks,
 			GateTPU:       leaderHooks != nil,
 			OnBlock: func(produced *block.Block) {
@@ -3156,6 +3258,7 @@ postBootstrap:
 	dashboard.selectedRecovery(mithrilState)
 	dashboard.resolvedMachineWorker("replay_transactions", int(txParallelism))
 	result := runReplayWithRecovery(ctx, accountsDb, accountsPath, manifest, resumeState, uint64(startSlot), liveEndSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, uint16(turbineShredVersion), turbineAlpenglowAddr, validatorIdentity, blockstorePath, int(txParallelism), true, useLightbringer, useTurbine, dbgOpts, metricsWriter, slotCtxSetter, mithrilState, blockFetchOpts, consensusOpts, compactCfg.RewindHorizonBatches, replayStartTime)
+	lastReplayResult = result
 	dashboard.finishReceptionHistory(&prewarm, true)
 	dashboard.stopping()
 	stopCompactor() // join before shutdown closes AccountsDB
@@ -3246,6 +3349,7 @@ postBootstrap:
 
 	mlog.Log.Infof("Done replaying, closing DB")
 	accountsDb.CloseDb()
+	return replayCommandError(result)
 }
 
 type turbineEntrypointQuery func(*net.UDPAddr, time.Duration) (gossip.EchoResponse, error)
@@ -4086,6 +4190,16 @@ func downloadAndBuildFromSnapshot(ctx context.Context, rpcEndpoints []string, sn
 	return accountsDb, manifest, nil
 }
 
+// shouldKillExistingMithril reports whether startup stops the other Mithril
+// processes on the host. A normal run does, so a stale instance cannot hold
+// its ports and disk or double its traffic to the cluster. A backtest and an
+// offline replay (--offline) use no network and are benchmarks that are
+// expected to run beside other nodes, a live validator included, so they
+// leave every other process alone.
+func shouldKillExistingMithril(backtest, offline bool) bool {
+	return !backtest && !offline
+}
+
 // killExistingMithrilProcesses finds and kills any other running mithril processes.
 // This prevents zombie processes from accumulating and holding disk space.
 // Returns the number of processes killed.
@@ -4396,7 +4510,9 @@ func addTransactionStatusManifestRef(keep map[string]*state.TransactionStatusChe
 // an interrupted rewind never loses the status side of its target selection.
 // This collector validates references structurally but deliberately does not
 // reread tens of megabytes per boundary on every fold; rewind selection and
-// startup head adoption perform full size/SHA/decode validation.
+// startup head adoption perform full size/SHA/decode validation. It runs after
+// every fold, so it takes the manifest names from the store's in-memory
+// inventory instead of listing the accounts directory.
 func retainedTransactionStatusCheckpointRefs(accountsDb *accountsdb.AccountsDb, horizon uint64, current *state.TransactionStatusCheckpointRef) ([]*state.TransactionStatusCheckpointRef, error) {
 	if accountsDb == nil {
 		return nil, errors.New("collect transaction status checkpoints: AccountsDB is nil")
@@ -4408,7 +4524,7 @@ func retainedTransactionStatusCheckpointRefs(accountsDb *accountsdb.AccountsDb, 
 		}
 	}
 
-	headers, parkedPaths, err := accountsdb.ListFoldAndParkedManifests(accountsDb.AcctsDir)
+	headers, parkedPaths, err := accountsDb.FoldAndParkedManifests()
 	if err != nil {
 		return nil, fmt.Errorf("list retained fold manifests: %w", err)
 	}
@@ -4642,6 +4758,15 @@ func runReplayWithRecovery(
 	replayStartTime time.Time, // Start time for resume context
 ) *replay.ReplayResult {
 	var result *replay.ReplayResult
+	if isLive && useTurbine && consensusOpts != nil {
+		var fetchOpts replay.BlockFetchOpts
+		if blockFetchOpts != nil {
+			fetchOpts = *blockFetchOpts
+		}
+		fetchOpts.Reception = &blockstream.ReplaySession{}
+		defer fetchOpts.Reception.Close()
+		blockFetchOpts = &fetchOpts
+	}
 
 	// Create callback to write state immediately on cancellation
 	// This eliminates the timing window between bankhash persistence and state file update
@@ -4761,7 +4886,14 @@ func runReplayWithRecovery(
 		var recoveryReason string
 		var certSwitch *replay.CertifiedSwitch
 		var finMismatch *replay.AlpenglowFinalityMismatch
+		var specMismatch *replay.SpeculationFooterMismatch
 		switch {
+		case errors.As(result.Error, &specMismatch):
+			// Work-ahead is already off; a plain re-replay that mismatches again
+			// is an ordinary footer mismatch and halts below.
+			divSlot = specMismatch.Slot
+			key = fmt.Sprintf("spec:%d", specMismatch.Slot)
+			recoveryReason = fmt.Sprintf("footer bank hash mismatch at slot %d in a block with work-ahead early executions (work-ahead now off)", specMismatch.Slot)
 		case errors.As(result.Error, &certSwitch):
 			// Execute-on-receipt ran the wrong sibling (or a certified-skipped
 			// slot), or a later parent-linked child exposed a competing

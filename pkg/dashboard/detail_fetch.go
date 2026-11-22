@@ -124,8 +124,21 @@ func writeDetailResponse(w http.ResponseWriter, status int, body string, statusR
 	_, _ = io.WriteString(w, body)
 }
 
+const detailRequestTimeout = "request_timeout"
+
 // fetchDetail reads a bounded detail response without extending its source lease.
 func fetchDetail(parent context.Context, client *http.Client, path string, maxBytes int, headers http.Header,
+	parseRemaining func(string) (time.Duration, error), decodeFailure func([]byte) string,
+) ([]byte, time.Duration, time.Time, string) {
+	body, remaining, started, reason := fetchDetailWithTransportReason(parent, client, path, maxBytes, headers, parseRemaining, decodeFailure)
+	if reason == detailRequestTimeout {
+		reason = "source_unavailable"
+	}
+	return body, remaining, started, reason
+}
+
+// Keep a timeout before any HTTP response distinct from a source rejection.
+func fetchDetailWithTransportReason(parent context.Context, client *http.Client, path string, maxBytes int, headers http.Header,
 	parseRemaining func(string) (time.Duration, error), decodeFailure func([]byte) string,
 ) ([]byte, time.Duration, time.Time, string) {
 	ctx, cancel := context.WithTimeout(parent, time.Second)
@@ -142,6 +155,9 @@ func fetchDetail(parent context.Context, client *http.Client, path string, maxBy
 	started := time.Now()
 	response, err := client.Do(request)
 	if err != nil {
+		if response == nil && errors.Is(err, context.DeadlineExceeded) {
+			return nil, 0, started, detailRequestTimeout
+		}
 		return nil, 0, started, "source_unavailable"
 	}
 	defer response.Body.Close()

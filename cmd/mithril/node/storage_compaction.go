@@ -25,16 +25,20 @@ func startAccountsCompactor(parent context.Context, db accountsCompactor, cfg ac
 	var session time.Time
 	if monitor != nil {
 		session = time.Now()
-		monitor.latest.Store(nil)
+		relocation := &compactionRelocation{started: session}
+		cfg.RelocatedBytes = &relocation.bytes
+		monitor.state.Store(&compactionState{relocation: relocation})
 	}
 	mlog.Log.Infof("accountsdb: background compaction enabled (interval=%s rewind_horizon=%d batches)", interval, cfg.RewindHorizonBatches)
 	go func() {
 		defer close(done)
+		defer monitor.stopped()
 		for ctx.Err() == nil {
 			run := compactionTask.Start()
 			var started time.Time
 			if monitor != nil {
 				started = time.Now()
+				monitor.begin()
 			}
 			stats, err := db.CompactOnce(cfg)
 			if monitor != nil {

@@ -3,6 +3,7 @@ package sbpf
 import (
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/Overclock-Validator/mithril/pkg/cu"
 	"github.com/gagliardetto/solana-go"
@@ -37,10 +38,22 @@ type VM interface {
 }
 
 // VMOpts specifies virtual machine parameters.
+// ErrCancelled is only for discarded private executions, never a canonical result.
+var ErrCancelled = errors.New("private speculative execution cancelled")
+
 type VMOpts struct {
+	Cancel *atomic.Bool
 	// Machine parameters
-	HeapMax       int
-	Syscalls      SyscallRegistry
+	HeapMax  int
+	Syscalls SyscallRegistry
+	// SyscallsID and SyscallsGen optionally identify what Syscalls answers:
+	// any two VMs given equal non-nil SyscallsID and equal SyscallsGen must be
+	// given registries that agree on every hash, and the registry must not
+	// change while the VM runs. A Program then remembers, per identity, that
+	// none of its internal call targets names a syscall, and legacy internal
+	// calls stop consulting the registry. SyscallsID must be comparable.
+	SyscallsID    any
+	SyscallsGen   uint64
 	Tracer        TraceSink
 	EnableTracing bool
 

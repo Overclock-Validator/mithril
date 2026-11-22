@@ -234,8 +234,16 @@ func TestCompleteSnapshotFitsFeedBudgetAndProjectsEveryGroup(t *testing.T) {
 
 func TestPrivateSnapshotAbovePublicLimitPassesFeedAndCollector(t *testing.T) {
 	now := sizingTime(time.Now())
-	s := fullTestSnapshot(now)
-	s.SnapshotArchive, s.IncrementalArchive = nil, maximumIncrementalArchive(now)
+	s := testSnapshot(now)
+	s.IncrementalArchive = maximumIncrementalArchive(now)
+	admission := TurbineAdmission{MissingLeaders: 4, ShredVersionMismatch: 2}
+	s.BlockSource = &BlockSource{
+		SampledAt: now, StartedAt: s.StartedAt, ConfiguredSource: "turbine", LiveConnected: true,
+		Turbine: &Turbine{
+			SampledAt: now, StartedAt: s.StartedAt, Session: 1,
+			Diagnostics: &TurbineDiagnostics{Admission: &admission},
+		},
+	}
 	// Network labels are unbounded input; the public projection normalizes
 	// unknown labels. Exercise the private limit independently of optional data.
 	s.Network = ""
@@ -260,8 +268,12 @@ func TestPrivateSnapshotAbovePublicLimitPassesFeedAndCollector(t *testing.T) {
 	if c.last == nil || statusFields(t, c.latest.Load())["source_state"] != "fresh" {
 		t.Fatal("bounded private snapshot was not accepted")
 	}
-	if c.last.BlockSource.Turbine.Diagnostics.Admission == nil {
+	if b := c.last.BlockSource; b == nil || b.Turbine == nil || b.Turbine.Diagnostics == nil ||
+		b.Turbine.Diagnostics.Admission == nil || *b.Turbine.Diagnostics.Admission != admission {
 		t.Fatal("collector lost receiver admission counters")
+	}
+	if !reflect.DeepEqual(c.last.IncrementalArchive, s.IncrementalArchive) {
+		t.Fatal("collector lost incremental archive counters")
 	}
 	public := newCollector(path)
 	public.public = true
@@ -272,6 +284,14 @@ func TestPrivateSnapshotAbovePublicLimitPassesFeedAndCollector(t *testing.T) {
 		json.Unmarshal(public.latest.Load().publicJSON, &projected) != nil ||
 		projected.SourceState != "fresh" || projected.Node == nil || projected.Node.Network != "unknown" {
 		t.Fatal("public collector did not normalize the long private network label")
+	}
+	if in := projected.Input; in == nil || in.Turbine == nil || in.Turbine.Diagnostics == nil ||
+		in.Turbine.Diagnostics.Admission == nil || *in.Turbine.Diagnostics.Admission != PublicTurbineAdmission(admission) {
+		t.Fatal("public collector lost receiver admission counters")
+	}
+	if startup := projected.Startup; startup == nil || startup.IncrementalArchive == nil ||
+		startup.IncrementalArchive.IncrementalSlot != s.IncrementalArchive.IncrementalSlot {
+		t.Fatal("public collector lost incremental archive progress")
 	}
 }
 

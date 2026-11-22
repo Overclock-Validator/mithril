@@ -8,13 +8,40 @@ LDFLAGS := -X github.com/Overclock-Validator/mithril/pkg/version.Version=$(VERSI
            -X github.com/Overclock-Validator/mithril/pkg/version.GitBranch=$(GIT_BRANCH) \
            -X github.com/Overclock-Validator/mithril/pkg/version.BuildDate=$(BUILD_DATE)
 
-.PHONY: build release clean server-setup disk-setup tune conformance-vectors test-conformance-elf test-conformance-vm-programs test-conformance-sbpf test-conformance-precompiles
+DASHBOARD_BUNDLE ?= mithril-dashboard-bundle.tar.gz
+DASHBOARD_BUNDLE_TARGET ?= native
+export DASHBOARD_VIEWER_DIST DASHBOARD_VIEWER_MANIFEST DASHBOARD_BUNDLE DASHBOARD_BUNDLE_TARGET
+
+.PHONY: build release dashboard-bundle clean server-setup disk-setup tune conformance-vectors test-conformance-elf test-conformance-vm-programs test-conformance-sbpf test-conformance-precompiles
 
 build:
 	go build -ldflags "$(LDFLAGS)" -o mithril ./cmd/mithril
 
 release:
 	go build -ldflags "$(LDFLAGS) -s -w" -o mithril ./cmd/mithril
+
+dashboard-bundle:
+	@set -eu; \
+		if [ -z "$$DASHBOARD_VIEWER_DIST" ] || [ -z "$$DASHBOARD_VIEWER_MANIFEST" ]; then \
+			echo "Set DASHBOARD_VIEWER_DIST and DASHBOARD_VIEWER_MANIFEST to the approved built viewer and its JSON asset map" >&2; \
+			exit 2; \
+		fi; \
+		case "$$DASHBOARD_BUNDLE_TARGET" in \
+			native|linux-amd64) ;; \
+			*) echo "DASHBOARD_BUNDLE_TARGET must be native or linux-amd64" >&2; exit 2 ;; \
+		esac; \
+		target="$$DASHBOARD_BUNDLE_TARGET"; \
+		case "$${DASHBOARD_BUNDLE##*/}" in *linux-amd64*) target=linux-amd64 ;; esac; \
+		if [ "$$target" = linux-amd64 ] && [ "$$(go env GOOS GOARCH CGO_ENABLED)" != "$$(printf '%s\n' linux amd64 1)" ]; then \
+			echo "Linux AMD64 bundles require GOOS=linux, GOARCH=amd64 and CGO_ENABLED=1" >&2; \
+			exit 2; \
+		fi; \
+		stage=$$(mktemp -d); \
+		trap 'rm -rf -- "$$stage"' EXIT; \
+		go build -trimpath -ldflags "$(LDFLAGS) -s -w" -o "$$stage/" \
+			./cmd/mithril ./cmd/mithril-dashboard ./cmd/mithril-dashboard-collect; \
+		python3 scripts/dashboard-bundle.py --target "$$target" "$$stage" "$$DASHBOARD_VIEWER_DIST" \
+			"$$DASHBOARD_VIEWER_MANIFEST" "$$DASHBOARD_BUNDLE"
 
 clean:
 	rm -f mithril

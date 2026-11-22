@@ -81,22 +81,26 @@ func TestReceptionSourceImportsAndGaps(t *testing.T) {
 	original := s.sample.ChunkBody
 	s.sample.ChunkBody = func(b ReceptionRecordingBinding, d ReceptionChunkDescriptor) (string, bool) {
 		order = append(order, d.FirstSequence)
-		if d.FirstSequence == 2 || d.FirstSequence == 10 {
+		if d.FirstSequence == 5 || d.FirstSequence == 10 {
 			return "", false
 		}
 		return original(b, d)
 	}
 	s.poll(context.Background())
 	root, _ := receptionSourceRoot(t, s, time.Now())
-	if !reflect.DeepEqual(order, []uint64{1, 2, 3, 4, 5, 6, 7, 8}) || *root.SourceBounds.Last != 10 || *root.CacheBounds.Last != 8 {
-		t.Fatal("oldest-eight import bound differs")
+	if !reflect.DeepEqual(order, []uint64{3, 4, 5, 6, 7, 8, 9, 10}) || *root.SourceBounds.Last != 10 || *root.CacheBounds.First != 3 || *root.CacheBounds.Last != 9 || s.cursor != 10 {
+		t.Fatal("newest-eight import bound differs")
 	}
 	gap := s.reply(receptionHistoryRequest{kind: "index", recording: s.id, after: 1}, time.Now())
 	if gap.status != 409 || !strings.Contains(gap.body, `"reason":"cache_gap"`) || !strings.Contains(gap.body, `"next_sequence":"3"`) {
-		t.Fatal("missing body did not become an explicit gap")
+		t.Fatal("skipped prefix did not remain an explicit gap")
+	}
+	gap = s.reply(receptionHistoryRequest{kind: "index", recording: s.id, after: 4}, time.Now())
+	if gap.status != 409 || !strings.Contains(gap.body, `"next_sequence":"6"`) {
+		t.Fatal("missing selected body did not remain an explicit gap")
 	}
 	s.poll(context.Background())
-	if !reflect.DeepEqual(order, []uint64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}) {
+	if !reflect.DeepEqual(order, []uint64{3, 4, 5, 6, 7, 8, 9, 10}) {
 		t.Fatal("body attempts repeated or import skipped")
 	}
 	gap = s.reply(receptionHistoryRequest{kind: "index", recording: s.id, after: 9}, time.Now())
@@ -108,7 +112,7 @@ func TestReceptionSourceImportsAndGaps(t *testing.T) {
 		t.Fatal("future cursor invented a loss")
 	}
 	s.poll(context.Background())
-	if len(order) != 10 {
+	if len(order) != 8 {
 		t.Fatal("unchanged source repeated lookups")
 	}
 	root, _ = receptionSourceRoot(t, s, time.Now())

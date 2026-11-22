@@ -25,8 +25,11 @@ type Config struct {
 	TxV1Enabled func() bool
 	Sink        sink.Receiver
 	// ObserveQueues enables low-rate length/capacity samples of existing
-	// channels. It changes no queue sizes or packet behavior; default off.
+	// channels and batches held by sigverify workers. It changes no queue sizes
+	// or packet behavior; default off.
 	ObserveQueues bool
+	// ObserveWorkerPasses enables opt-in per-worker batch-pass wall timing.
+	ObserveWorkerPasses bool
 }
 
 func (c Config) normalized() Config {
@@ -98,6 +101,10 @@ type QueueObservation struct {
 	Ingress              QueueGauge
 	DedupOutput          QueueGauge
 	Verified             QueueGauge
+	SigverifyWorkers     int
+	SigverifyInFlight    int64
+	WorkerPasses         [64]WorkerPassObservation
+	WorkerPassCount      int
 }
 
 // Pipeline funnels QUIC ingress through dedup/sanitize, sigverify workers, and a sink.
@@ -116,6 +123,10 @@ type Pipeline struct {
 	dedupOut       <-chan packet.Packet
 	verified       <-chan packet.Packet
 	queueStartedAt time.Time
+	// Counts batch passes, including a blocked verified-channel handoff.
+	// Nil keeps diagnostic atomics disabled on the ordinary worker path.
+	sigverifyInFlight *atomic.Int64
+	workerPasses      []*workerPassClock
 }
 
 // Start launches the pipeline stages and returns the ingress send channel for QUIC.
@@ -133,6 +144,13 @@ func Start(parent context.Context, cfg Config) (*Pipeline, chan<- packet.Packet)
 	if cfg.ObserveQueues {
 		p.dedupOut, p.verified = dedupOut, verified
 		p.queueStartedAt = time.Now()
+		p.sigverifyInFlight = &atomic.Int64{}
+		if cfg.ObserveWorkerPasses && cfg.SigverifyWorkers <= 64 {
+			p.workerPasses = make([]*workerPassClock, cfg.SigverifyWorkers)
+			for i := range p.workerPasses {
+				p.workerPasses[i] = &workerPassClock{}
+			}
+		}
 	}
 
 	dedupStage := dedup.NewStage(p.ingress, dedupOut, dedup.NewCache(cfg.DedupCacheCapacity), cfg.TxV1Enabled)
@@ -143,7 +161,7 @@ func Start(parent context.Context, cfg Config) (*Pipeline, chan<- packet.Packet)
 		dedupStage.Run(&p.stats.Dedup)
 	}()
 
-	startSigverifyPool(&p.wg, dedupOut, verified, cfg.SigverifyWorkers, cfg.TxV1Enabled, &p.stats.Sigverify)
+	startSigverifyPool(&p.wg, dedupOut, verified, cfg.SigverifyWorkers, cfg.TxV1Enabled, &p.stats.Sigverify, p.sigverifyInFlight, p.workerPasses)
 
 	p.wg.Add(1)
 	go func() {
@@ -155,7 +173,8 @@ func Start(parent context.Context, cfg Config) (*Pipeline, chan<- packet.Packet)
 }
 
 // ObserveQueues copies the current channel lengths/capacities without consuming
-// packets or observing worker-local batches. It is for a low-rate owner, which
+// packets. The in-flight count covers independent sigverify batch passes, not
+// their packet count, CPU use or time busy. It is for a low-rate owner, which
 // must bind the result to this pipeline instance. Nil, disabled and stopping
 // pipelines return false rather than measured zero.
 func (p *Pipeline) ObserveQueues() (QueueObservation, bool) {
@@ -164,13 +183,23 @@ func (p *Pipeline) ObserveQueues() (QueueObservation, bool) {
 	}
 	p.closeMu.RLock()
 	defer p.closeMu.RUnlock()
-	if p.closed || p.ingress == nil || p.dedupOut == nil || p.verified == nil || p.queueStartedAt.IsZero() {
+	if p.closed || p.ingress == nil || p.dedupOut == nil || p.verified == nil || p.queueStartedAt.IsZero() || p.sigverifyInFlight == nil {
 		return QueueObservation{}, false
 	}
 	v := QueueObservation{StartedAt: p.queueStartedAt,
-		Ingress:     QueueGauge{Length: len(p.ingress), Capacity: cap(p.ingress)},
-		DedupOutput: QueueGauge{Length: len(p.dedupOut), Capacity: cap(p.dedupOut)},
-		Verified:    QueueGauge{Length: len(p.verified), Capacity: cap(p.verified)}}
+		Ingress:          QueueGauge{Length: len(p.ingress), Capacity: cap(p.ingress)},
+		DedupOutput:      QueueGauge{Length: len(p.dedupOut), Capacity: cap(p.dedupOut)},
+		Verified:         QueueGauge{Length: len(p.verified), Capacity: cap(p.verified)},
+		SigverifyWorkers: p.cfg.SigverifyWorkers, SigverifyInFlight: p.sigverifyInFlight.Load()}
+	for i, clock := range p.workerPasses {
+		if item, ok := clock.observe(p.queueStartedAt, i); ok {
+			v.WorkerPasses[v.WorkerPassCount] = item
+			v.WorkerPassCount++
+		}
+	}
+	if v.WorkerPassCount != len(p.workerPasses) {
+		v.WorkerPassCount = 0
+	}
 	v.SampledAt = time.Now()
 	return v, true
 }
@@ -268,15 +297,21 @@ func startSigverifyPool(
 	workers int,
 	txV1Enabled func() bool,
 	stats *SigverifyStats,
+	inFlight *atomic.Int64,
+	clocks []*workerPassClock,
 ) {
 	var verifyWG sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		verifyWG.Add(1)
 		wg.Add(1)
+		var clock *workerPassClock
+		if i < len(clocks) {
+			clock = clocks[i]
+		}
 		go func() {
 			defer verifyWG.Done()
 			defer wg.Done()
-			runSigverifyWorker(in, out, workers, txV1Enabled, stats)
+			runSigverifyWorker(in, out, workers, txV1Enabled, stats, inFlight, clock)
 		}()
 	}
 	wg.Add(1)
@@ -301,6 +336,8 @@ func runSigverifyWorker(
 	workers int,
 	txV1Enabled func() bool,
 	stats *SigverifyStats,
+	inFlight *atomic.Int64,
+	clock *workerPassClock,
 ) {
 	// Worker-local scratch, reused across groups.
 	var (
@@ -311,6 +348,12 @@ func runSigverifyWorker(
 	)
 	verifier.SetTxV1Enabled(txV1Enabled)
 	for pkt := range in {
+		if clock != nil {
+			clock.begin()
+		}
+		if inFlight != nil {
+			inFlight.Add(1)
+		}
 		group = sigverify.Drain(group, pkt, in,
 			sigverify.FairShare(len(in), workers, sigverify.MaxDrain))
 
@@ -343,5 +386,11 @@ func runSigverifyWorker(
 		// until the next group happens to overwrite that index.
 		clear(group)
 		clear(payloads)
+		if inFlight != nil {
+			inFlight.Add(-1)
+		}
+		if clock != nil {
+			clock.end()
+		}
 	}
 }

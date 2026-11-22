@@ -109,7 +109,7 @@ func TestDashboardShredHistoryConstructorOptIn(t *testing.T) {
 				})
 				path := filepath.Join(dir, "feed.sock")
 				d := startNodeDashboard(context.Background(), time.Now(), path, "", "reception-option", "isolated", role,
-					true, false, true, true, false, false, false, enabled, false, false, false)
+					true, false, true, true, false, false, false, enabled, false, false, false, false)
 				if d == nil {
 					t.Fatal("node feed did not start")
 				}

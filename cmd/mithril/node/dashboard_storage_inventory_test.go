@@ -22,7 +22,7 @@ func TestStorageInventoryBindsReturnedCycleToDatabase(t *testing.T) {
 			DataFiles: 1, ManifestNames: 2, LogicalBytes: 3, AllocatedBytes: 4096, AllocatedBytesKnown: true},
 			Liveness: accountsdb.CompactionLivenessObservation{Known: true, ScannedCandidates: 1, CompleteCandidates: 1,
 				RewriteCandidates: 1, SourceBytes: 3, ExaminedBytes: 3, LiveBytes: 1, DeadBytes: 2}}}
-	m.latest.Store(&c)
+	m.state.Store(&compactionState{latest: &c})
 	capture, err := d.sampleStorageDetail(time.Now())
 	if err != nil || capture.Detail.Inventory == nil || capture.Detail.Liveness == nil || !capture.Detail.Inventory.CycleFailed || !capture.Detail.Liveness.CycleFailed ||
 		capture.Detail.Inventory.LogicalBytes != 3 || capture.Detail.Inventory.ObservedAt != c.Stats.Inventory.ObservedAt.UTC() {
@@ -45,7 +45,7 @@ func TestStorageInventoryBindsReturnedCycleToDatabase(t *testing.T) {
 	} {
 		bad := c
 		mutate(&bad)
-		m.latest.Store(&bad)
+		m.state.Store(&compactionState{latest: &bad})
 		capture, err := d.sampleStorageDetail(time.Now())
 		if err != nil || capture.Detail.Inventory != nil || capture.Detail.Liveness != nil {
 			t.Fatal("invalid inventory replaced valid base storage observation")
@@ -53,13 +53,13 @@ func TestStorageInventoryBindsReturnedCycleToDatabase(t *testing.T) {
 	}
 	bad := c
 	bad.Stats.Liveness.LiveBytes = 99
-	m.latest.Store(&bad)
+	m.state.Store(&compactionState{latest: &bad})
 	capture, err = d.sampleStorageDetail(time.Now())
 	if err != nil || capture.Detail.Inventory == nil || capture.Detail.Liveness != nil {
 		t.Fatal("invalid liveness suppressed the valid inventory or remained available")
 	}
 	c.Stats.Inventory.AllocatedBytesKnown, c.Stats.Inventory.AllocatedBytes = false, 0
-	m.latest.Store(&c)
+	m.state.Store(&compactionState{latest: &c})
 	capture, err = d.sampleStorageDetail(time.Now())
 	if err != nil || capture.Detail.Inventory == nil || capture.Detail.Inventory.AllocatedBytes != nil {
 		t.Fatal("unknown allocation erased other inventory fields or became zero")

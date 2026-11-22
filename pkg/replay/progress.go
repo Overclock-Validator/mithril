@@ -23,9 +23,12 @@ type Progress struct {
 	selectedSlots             atomic.Pointer[SelectedSlotSnapshot]
 	localEpochReplayAnchor    localEpochReplayAnchor
 	hasLocalEpochReplayAnchor bool
-	networkDetails            bool                 // Startup-only; retained across replay attempts and source replacement.
-	gossipObserver            func(*gossip.Client) // Startup-only; receives only the current source's client.
-	gossipMu                  sync.Mutex           // Orders attachments against source replacement/reset.
+	networkDetails            bool                     // Startup-only; retained across replay attempts and source replacement.
+	fastExecuted              bool                     // Startup-only opt-in for provisional replay observations.
+	gossipObserver            func(*gossip.Client)     // Startup-only; receives only the current source's client.
+	gossipMu                  sync.Mutex               // Orders attachments against source replacement/reset.
+	gossipSource              *blockstream.BlockSource // Protected by gossipMu; retained across a temporary detach.
+	pendingGossip             *gossip.Client           // Latest client reported by a detached gossipSource.
 	// nextAssignment is staged and read only by the replay owner.
 	nextAssignment  NextKnownAssignment
 	accountSampler  AccountFactsSampler
@@ -41,6 +44,7 @@ type ProgressSnapshot struct {
 	UpdatedAt           time.Time
 	Phase               string
 	StartSlot           uint64
+	Frontier            uint64 // Ordered replay position including known skips. Zero is unavailable.
 	HasResumeParent     bool
 	ResumeParent        uint64
 	ExecutedBlocks      uint64
@@ -50,6 +54,9 @@ type ProgressSnapshot struct {
 	HasDurableSlot      bool
 	HasCompleted        bool
 	Completed           CompletedBlock
+	recentExecuted      []LocalExecutedSlot
+	ExecutionSequence   uint64
+	ExecutionAt         time.Time
 	CertificateOutcomes CertificateOutcomeSummary
 	LeaderOutcomes      LeaderOutcomeSummary
 	NextKnownAssignment NextKnownAssignment
@@ -73,12 +80,33 @@ type ProgressSnapshot struct {
 	completedAt time.Time
 }
 
+// LocalExecutedSlot is provisional local work and may be discarded by a rewind.
+type LocalExecutedSlot struct {
+	At                    time.Time
+	Slot                  uint64
+	Bankhash              solana.Hash
+	BlockID               solana.Hash
+	HasBlockID            bool
+	Transactions          uint64
+	ComputeUnits          uint64
+	WorkCountersSaturated bool
+}
+
+const localExecutedTailLimit = 48
+
+// RecentExecuted returns a detached provisional local-execution tail.
+func (s ProgressSnapshot) RecentExecuted() []LocalExecutedSlot {
+	return append([]LocalExecutedSlot(nil), s.recentExecuted...)
+}
+
 // CompletedBlock is successful local execution, not consensus finality or an
 // assertion that this block remains on the selected fork after a later rewind.
 type CompletedBlock struct {
 	At           time.Time
 	Slot         uint64
 	Bankhash     solana.Hash
+	BlockID      solana.Hash
+	HasBlockID   bool
 	BlockHeight  uint64
 	Epoch        uint64
 	SlotIndex    uint64
@@ -294,8 +322,13 @@ func (p *Progress) observeSourceGossip(source *blockstream.BlockSource, client *
 	}
 	p.gossipMu.Lock()
 	defer p.gossipMu.Unlock()
-	if p.source.Load() == source && p.gossipObserver != nil {
+	if p.gossipObserver == nil {
+		return
+	}
+	if current := p.source.Load(); current == source {
 		p.gossipObserver(client)
+	} else if current == nil && p.gossipSource == source {
+		p.pendingGossip = client
 	}
 }
 
@@ -312,9 +345,22 @@ func (p *Progress) sourceStarted(source *blockstream.BlockSource) {
 			source.EnableSocketMemoryMonitoring()
 		}
 	}
-	p.gossipMu.Lock()
-	p.source.Store(source)
-	p.gossipMu.Unlock()
+	p.attachSource(source)
+}
+
+// Attach an already running source without rewriting its startup-only monitoring flag.
+func (p *Progress) attachSource(source *blockstream.BlockSource) {
+	if p != nil {
+		p.gossipMu.Lock()
+		p.source.Store(source)
+		if source != nil {
+			if p.gossipSource == source && p.pendingGossip != nil && p.gossipObserver != nil {
+				p.gossipObserver(p.pendingGossip)
+			}
+			p.gossipSource, p.pendingGossip = source, nil
+		}
+		p.gossipMu.Unlock()
+	}
 }
 
 func (p *Progress) begin(start uint64, resume *ResumeState) {
@@ -331,7 +377,8 @@ func (p *Progress) begin(start uint64, resume *ResumeState) {
 	p.source.Store(nil)
 	p.gossipMu.Unlock()
 	now := time.Now().UTC()
-	s := &ProgressSnapshot{Attempt: previous.Attempt + 1, StartedAt: now, UpdatedAt: now, Phase: "starting", StartSlot: start}
+	s := &ProgressSnapshot{Attempt: previous.Attempt + 1, StartedAt: now, UpdatedAt: now, Phase: "starting", StartSlot: start,
+		Frontier: max(start, 1) - 1, ExecutionSequence: 1, ExecutionAt: now}
 	if resume != nil {
 		s.HasResumeParent, s.ResumeParent = true, resume.ParentSlot
 	}
@@ -362,7 +409,31 @@ func (p *Progress) completed(block CompletedBlock, durable uint64, hasDurable bo
 	s.LocalEpochReplay = p.observeLocalEpochReplay(block, s.LocalEpochReplay)
 	s.completedAt = block.At
 	block.At = block.At.UTC()
+	s.ExecutionAt = block.At
 	s.Completed, s.HasCompleted, s.UpdatedAt, s.DurableSlot = block, true, block.At, durable
+	s.Frontier = block.Slot
+	if p.fastExecuted && s.ExecutionSequence < math.MaxUint64 {
+		s.ExecutionSequence++
+		previous := s.recentExecuted
+		if len(previous) != 0 {
+			last := previous[len(previous)-1]
+			if !block.hasExecutionParent || block.Slot <= last.Slot ||
+				block.executionParentSlot != last.Slot || block.executionParentHash != last.Bankhash {
+				previous = nil
+			}
+		}
+		if len(previous) >= localExecutedTailLimit {
+			previous = previous[len(previous)-localExecutedTailLimit+1:]
+		}
+		next := make([]LocalExecutedSlot, len(previous)+1)
+		copy(next, previous)
+		next[len(previous)] = LocalExecutedSlot{At: block.At, Slot: block.Slot, Bankhash: block.Bankhash, BlockID: block.BlockID, HasBlockID: block.HasBlockID && block.BlockID != (solana.Hash{}),
+			Transactions: block.Transactions, ComputeUnits: block.ComputeUnits,
+			WorkCountersSaturated: block.WorkCountersSaturated}
+		s.recentExecuted = next
+	} else {
+		s.recentExecuted = nil
+	}
 	s.NextKnownAssignment = p.nextAssignment
 	s.AccountFacts, s.HasAccountFacts = p.accountFacts, p.hasAccountFacts
 	if s.HasAccountFacts && s.AccountFacts.SampledAt.After(s.UpdatedAt) {
@@ -384,24 +455,24 @@ func (p *Progress) completed(block CompletedBlock, durable uint64, hasDurable bo
 	p.latest.Store(&s)
 }
 
-func (p *Progress) skipped(durable uint64, hasDurable bool) {
+func (p *Progress) skipped(slot, durable uint64, hasDurable bool) {
 	if p == nil {
 		return
 	}
 	s, _ := p.Snapshot()
 	s.SkippedSlots++
 	s.NextKnownAssignment = p.nextAssignment
-	s.DurableSlot, s.UpdatedAt = durable, time.Now().UTC()
+	s.Frontier, s.DurableSlot, s.UpdatedAt = slot, durable, time.Now().UTC()
 	s.HasDurableSlot = hasDurable
 	p.latest.Store(&s)
 }
 
-func (p *Progress) certificateOutcomes(outcomes CertificateOutcomeSummary) {
+func (p *Progress) restored(frontier uint64, outcomes CertificateOutcomeSummary) {
 	if p == nil {
 		return
 	}
 	s, _ := p.Snapshot()
-	s.CertificateOutcomes = outcomes
+	s.Frontier, s.CertificateOutcomes, s.UpdatedAt = frontier, outcomes, time.Now().UTC()
 	p.latest.Store(&s)
 }
 
@@ -428,6 +499,10 @@ func (p *Progress) rewound() {
 	}
 	s, _ := p.Snapshot()
 	s.Rewinds++
+	// The replay owner has withdrawn the old fork and has not yet restored its parent.
+	s.Frontier = 0
+	s.CertificateOutcomes = CertificateOutcomeSummary{}
+	s.ExecutionSequence = 1
 	p.nextAssignment, s.NextKnownAssignment = NextKnownAssignment{}, NextKnownAssignment{}
 	p.accountSampler.Reset()
 	p.accountFacts, p.hasAccountFacts = AccountFacts{}, false
@@ -435,6 +510,8 @@ func (p *Progress) rewound() {
 	s.AccountFacts, s.HasAccountFacts = AccountFacts{}, false
 	s.LocalEpochReplay = LocalEpochReplayBoundaries{}
 	s.HasCompleted, s.Completed, s.UpdatedAt = false, CompletedBlock{}, time.Now().UTC()
+	s.ExecutionAt = s.UpdatedAt
+	s.recentExecuted = nil
 	p.resetReplayDiagnostics(&s)
 	p.latest.Store(&s)
 }

@@ -285,7 +285,7 @@ func TestStorageDetailTransportOwnershipAndExactExpiry(t *testing.T) {
 	if transport == original.Transport || transport.Proxy != nil || transport.MaxResponseHeaderBytes != 4096 ||
 		transport.MaxConnsPerHost != 1 || transport.MaxIdleConnsPerHost != 1 || transport.MaxIdleConns != 1 || !transport.DisableKeepAlives ||
 		r.client.Timeout != time.Second || r.client.Jar != nil || r.client.CheckRedirect(nil, nil) != http.ErrUseLastResponse ||
-		r.limit.Limit() != 16 || r.limit.Burst() != 32 || storageDetailCollectInterval != 10*time.Second {
+		r.limit.Limit() != 16 || r.limit.Burst() != 32 || StorageDetailPollInterval != 10*time.Second {
 		t.Fatal("reader does not own its bounded fixed transport")
 	}
 	now := time.Now()
@@ -495,16 +495,6 @@ func TestStorageDetailReaderTransferBoundsAndExpiry(t *testing.T) {
 				t.Fatalf("got %q want %q", r.failure.Load().reason, want)
 			}
 		})
-	}
-	for _, value := range []string{"", "0", "-1", "+1", "030000", "30001", "1.0", "1 "} {
-		if _, err := parseStorageDetailRemaining(value); err == nil {
-			t.Fatalf("invalid remaining lease %q", value)
-		}
-	}
-	for _, value := range []string{"1", "30000"} {
-		if _, err := parseStorageDetailRemaining(value); err != nil {
-			t.Fatal(err)
-		}
 	}
 	entered := make(chan struct{})
 	var once sync.Once

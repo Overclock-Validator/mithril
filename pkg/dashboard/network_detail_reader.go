@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	networkDetailCollectInterval = 10 * time.Second
+	networkDetailCollectInterval = 1 * time.Second
 	networkDetailFamilyBytes     = 64 << 10
 )
 

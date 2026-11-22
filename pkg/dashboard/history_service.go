@@ -72,10 +72,14 @@ func newHistoryService(path string, resources bool) (*historyService, error) {
 
 // offer is called only by the collector. It copies fixed public scalars and
 // never waits for storage, history queries, or a slow history worker.
-func (h *historyService) offer(publicJSON []byte, now time.Time) {
+func (h *historyService) offer(publicJSON []byte, now time.Time, safetyFault bool) {
 	var p PublicSnapshot
 	if len(publicJSON) > MaxSnapshotBytes || json.Unmarshal(publicJSON, &p) != nil {
 		return
+	}
+	// The legacy public projection omits the safety flag.
+	if safetyFault && p.Consensus != nil {
+		p.Consensus.FinalizedSlot = nil
 	}
 	r, ok := historyPublicRecord(p, now, h.resources)
 	if ok && p.SourceState == "fresh" {

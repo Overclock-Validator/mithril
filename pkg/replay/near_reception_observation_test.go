@@ -121,7 +121,7 @@ func TestReplayNearReceptionActualSourceHook(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	p.recordReplayDiagnostic(time.Now(), &row, nil)
-	p.skipped(0, false)
+	p.skipped(43, 0, false)
 	p.recordReplayDiagnostic(time.Now(), &row, nil)
 	if s, _ := p.ReplayDiagnosticsSnapshot(); !s.NearReception.ObservedAt.IsZero() {
 		t.Fatal("duplicate completion or skip retroactively latched proximity")

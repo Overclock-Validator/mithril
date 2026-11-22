@@ -1,6 +1,9 @@
 package arena
 
-import "testing"
+import (
+	"sync"
+	"testing"
+)
 
 type resetFixture struct {
 	ref   *int
@@ -95,6 +98,44 @@ func TestResetDoesNotAffectHeapFallback(t *testing.T) {
 	}
 	if fallback.value != 31 {
 		t.Fatalf("heap fallback was modified by reset: got %d, want 31", fallback.value)
+	}
+}
+
+func TestConcurrentOverflowAccountingAndReset(t *testing.T) {
+	a := New[byte](10)
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			for range 100 {
+				buf, _ := a.AllocN(3)
+				buf[0] = 17
+			}
+		})
+	}
+	wg.Wait()
+	elements, allocations := a.Overflow()
+	if a.Used() != 9 || elements != 3*797 || allocations != 797 {
+		t.Fatalf("used=%d overflow=%d allocations=%d", a.Used(), elements, allocations)
+	}
+	// Zero-size requests consume neither space nor an overflow allocation.
+	a.AllocN(0)
+	// A single-element allocation can still fit after the larger fallbacks.
+	a.Alloc()
+	a.Alloc()
+	elements, allocations = a.Overflow()
+	if elements != 3*797+1 || allocations != 798 {
+		t.Fatalf("mixed allocation accounting: elements=%d allocations=%d", elements, allocations)
+	}
+	a.ResetPaced(4, func() {})
+	elements, allocations = a.Overflow()
+	if a.Used() != 0 || elements != 0 || allocations != 0 {
+		t.Fatal("paced reset did not reset allocation accounting")
+	}
+	a.AllocN(11)
+	a.Reset()
+	elements, allocations = a.Overflow()
+	if elements != 0 || allocations != 0 {
+		t.Fatal("reset did not reset overflow accounting")
 	}
 }
 

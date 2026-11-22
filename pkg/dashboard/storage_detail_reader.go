@@ -12,27 +12,29 @@ import (
 	"golang.org/x/time/rate"
 )
 
-const (
-	storageDetailCollectInterval = 10 * time.Second
-	storageDetailFamilyBytes     = 80 << 10
-)
+// StorageDetailPollInterval is the reader's delay between acquisitions.
+const StorageDetailPollInterval = 10 * time.Second
+
+const storageDetailFamilyBytes = 80 << 10
 
 // PublicStorageDetail adds the reader's collection time without redating
 // the database lifetime or original stall events.
 type PublicStorageDetail struct {
-	SchemaVersion int                  `json:"schema_version"`
-	Family        string               `json:"family"`
-	Scope         string               `json:"scope"`
-	State         string               `json:"state"`
-	Reason        string               `json:"reason"`
-	CollectorAt   time.Time            `json:"collector_at"`
-	Binding       StorageDetailBinding `json:"binding"`
-	CapturedAt    time.Time            `json:"captured_at"`
-	Index         StorageStoreDetail   `json:"index"`
-	BankHash      StorageStoreDetail   `json:"bankhash"`
-	IO            *StorageIODetail     `json:"io,omitempty"`
-	Inventory     *StorageInventory    `json:"inventory,omitempty"`
-	Liveness      *StorageLiveness     `json:"liveness,omitempty"`
+	SchemaVersion     int                      `json:"schema_version"`
+	Family            string                   `json:"family"`
+	Scope             string                   `json:"scope"`
+	State             string                   `json:"state"`
+	Reason            string                   `json:"reason"`
+	CollectorAt       time.Time                `json:"collector_at"`
+	Binding           StorageDetailBinding     `json:"binding"`
+	CapturedAt        time.Time                `json:"captured_at"`
+	Index             StorageStoreDetail       `json:"index"`
+	BankHash          StorageStoreDetail       `json:"bankhash"`
+	IO                *StorageIODetail         `json:"io,omitempty"`
+	Inventory         *StorageInventory        `json:"inventory,omitempty"`
+	Liveness          *StorageLiveness         `json:"liveness,omitempty"`
+	AccountOperations *AccountOperationsWindow `json:"account_operations,omitempty"`
+	PhysicalUsage     *StoragePhysicalUsage    `json:"physical_usage,omitempty"`
 }
 
 var storageDetailPublicReasons = [...]string{
@@ -93,7 +95,7 @@ func newStorageDetailReader(client *http.Client, gate *atomic.Pointer[storageDet
 }
 
 func (r *storageDetailReader) run(ctx context.Context) {
-	runDetailReader(ctx, r.done, r.client, storageDetailCollectInterval, r.collect)
+	runDetailReader(ctx, r.done, r.client, StorageDetailPollInterval, r.collect)
 }
 
 func (r *storageDetailReader) fetch(parent context.Context) ([]byte, time.Duration, time.Time, string) {
@@ -243,7 +245,7 @@ func preparePublicStorageDetail(detail StorageDetail, collectedAt, freshUntil ti
 	public := PublicStorageDetail{
 		SchemaVersion: 1, Family: "storage", Scope: detail.Scope, State: "fresh", CollectorAt: collectedAt.UTC(),
 		Binding: detail.Binding, CapturedAt: detail.CapturedAt, Index: detail.Index, BankHash: detail.BankHash,
-		IO: detail.IO, Inventory: detail.Inventory, Liveness: detail.Liveness,
+		IO: detail.IO, Inventory: detail.Inventory, Liveness: detail.Liveness, AccountOperations: detail.AccountOperations, PhysicalUsage: detail.PhysicalUsage,
 	}
 	total := 0
 	for i, reason := range storageDetailPublicReasons {

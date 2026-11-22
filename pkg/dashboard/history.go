@@ -7,6 +7,7 @@ import (
 	"hash/crc32"
 	"io"
 	"math"
+	"sort"
 	"strconv"
 	"time"
 )
@@ -326,9 +327,10 @@ func historyBuckets(records []historyRecord, binding historyBinding, metric int,
 	}
 	var previous *historyRecord
 	mixed := make([]bool, len(bins))
-	for i := range records {
+	first := sort.Search(len(records), func(i int) bool { return records[i].At >= start })
+	for i := first; i < len(records) && records[i].At < end; i++ {
 		r := &records[i]
-		if !binding.matches(r.Binding) || r.At < start || r.At >= end {
+		if !binding.matches(r.Binding) {
 			continue
 		}
 		index := int((r.At - start) / span.BucketSeconds)

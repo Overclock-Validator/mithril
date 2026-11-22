@@ -23,9 +23,10 @@ type WriteStallObservation struct {
 // open. It excludes snapshot ingest/format-upgrade handles and cache lifetime.
 // The two store copies are coherent individually, not a database transaction.
 type StorageObservation struct {
-	OpenedAt time.Time
-	Index    WriteStallObservation
-	BankHash WriteStallObservation
+	OpenedAt          time.Time
+	Index             WriteStallObservation
+	BankHash          WriteStallObservation
+	AccountOperations *AccountOperationsObservation
 }
 
 type writeStallRecord struct {
@@ -126,5 +127,9 @@ func (db *AccountsDb) StorageObservation() (StorageObservation, bool) {
 	if !indexOK || !bankHashOK || db.storageClosing.Load() {
 		return StorageObservation{}, false
 	}
-	return StorageObservation{OpenedAt: db.storageOpenedAt, Index: index, BankHash: bankHash}, true
+	operations := db.accountOperationsObservation()
+	if db.storageClosing.Load() {
+		return StorageObservation{}, false
+	}
+	return StorageObservation{OpenedAt: db.storageOpenedAt, Index: index, BankHash: bankHash, AccountOperations: operations}, true
 }

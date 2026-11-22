@@ -1,14 +1,50 @@
 # Dashboard API
 
-For installation, see [Private setup](#private-setup). For an externally
-accessible deployment, also read [Public profile](#public-profile) and its
-reverse-proxy and isolation requirements.
-
 `mithril-dashboard` reads a private status feed from one Mithril process and
-serves a read-only API. It does not start, restart or configure the node. The
-feed is disabled by default. Enable it with `dashboard.enabled` or
-`--dashboard-enabled`, or configure a socket explicitly with
-`dashboard.socket` or `--dashboard-socket`.
+serves a read-only API. The feed is disabled by default.
+
+## Managed HTTPS configuration
+
+On a provisioned Linux host, put the profile and the browser's exact HTTPS
+origin in the node's existing Mithril TOML. Use the browser's serialized
+origin with a lowercase ASCII hostname or canonical IP address. Omit the
+default `:443` port and trailing slash.
+
+```toml
+[dashboard]
+profile = "standard"
+public_origin = "https://dashboard.example.com"
+```
+
+After the one-time setup enables the reader path unit and configures the
+gateway, start Mithril through your normal node service. For a standalone node,
+the equivalent command is
+
+```sh
+mithril run --config /etc/mithril/config.toml
+```
+
+The node starts its private feed, systemd starts the reader, and the viewer
+connects through the HTTPS address in the config.
+
+1. Complete the one-time account, reader, viewer and authenticated gateway
+   setup. [Production HTTPS setup](#production-https-setup)
+2. Apply the node configuration at a planned restart. On first setup, verify
+   the fresh feed and origin with `mithril-dashboard --from-node --check` as
+   the reader account, then enable the reader path unit.
+3. Open the HTTPS address through the gateway and sign in. Check that the
+   viewer receives fresh data from the expected node run.
+
+The managed reader gets the validated origin through the private Unix feed
+and applies the standard API details. The reader account needs the feed
+group. Keep the node TOML and node data inaccessible to that account. TLS,
+authentication and frontend hosting are one-time gateway setup.
+
+For a local reader, enable `dashboard.enabled` or configure `dashboard.socket`
+explicitly. [Private setup](#private-setup)
+
+## Data coverage
+
 Even with the feed disabled, this checkout records bank-level transaction
 classification and compute-unit counters during replay and block production.
 Their production overhead has not been established; disabling the feed is not
@@ -24,19 +60,22 @@ startup recovery state, local replay throughput, gossip and TPU pipeline
 observations. The reader does not scan accounts or query external dashboards.
 Non-voting nodes use the same API; their voting group stays unavailable. Bounded
 selected-and-folded certificate and leader outcome counts are available in
-bounded windows. A percentage over known outcomes in those windows is not a
-full-epoch rate or a FAST score, and it may differ from external dashboards.
+bounded windows. Percentages describe the known outcomes in the reported window.
 
 ## Connecting a dashboard
 
 After the [public profile](#public-profile) and its HTTPS proxy are configured,
-a dashboard can read one node from that origin:
+a dashboard can read one node from that origin. The example reader service
+starts in the private profile by default; a running service alone does not
+provide `/api/v1/status` for the separate frontend. The public profile provides:
 
 - `GET /api/v1/status` returns the current public status object.
 - `GET /api/v1/features` lists the reader's basic optional route families; add
   `?include=advanced_status` to list advanced families.
-- `/websocket` sends status updates with topic `mithril` and key `public`;
-  the `value` has the same shape as the status response for the same profile.
+- `/websocket?include=advanced_status` sends status updates through the
+  bundled HTTPS gateway with topic `mithril` and key `public`. The `value`
+  has the same shape as the advanced status response. The direct reader also
+  supports `/websocket` for the basic profile.
 
 For example, replace the hostname below with the configured HTTPS origin:
 
@@ -74,14 +113,16 @@ For field definitions, optional routes, and the WebSocket contract, see the
 
 ## Optional dashboard data
 
-The node and reader enable additional observations separately. All options
-are off by default. Node options require the dashboard socket; the matching
+The node and reader enable additional observations separately. The standard
+presets are explicit opt-ins. Individual options default to off otherwise.
+Node options require the dashboard socket. The matching
 reader options require a public profile and, for resource-related details,
 `--public-resources`. Enable only the information you intend to share.
 
 | Node option | Reader option | Data |
 | --- | --- | --- |
 | `--dashboard-replay-details` | `--replay-details` | Bounded replay, selected-slot and rooted-bank details |
+| `--dashboard-fast-executed` | `--fast-executed` | Provisional local-execution updates; requires replay details on both |
 | `--dashboard-network-details` | `--network-details` | Locally owned network and repair observations |
 | `--dashboard-cache-details` | `--cache-details` | AccountsDB cache observations |
 | `--dashboard-production-details` | `--production-details` | Local block-production observations |
@@ -90,22 +131,67 @@ reader options require a public profile and, for resource-related details,
 | `--dashboard-local-peers` | `--local-peers` | Locally observed signed-contact metadata |
 | `--dashboard-shred-history` | `--reception-history` | Bounded authenticated shred reception history |
 
+The standard node and reader presets enable host, process and filesystem
+resources, replay and schedule details, provisional execution updates,
+network details and local peers, cache gauges, and storage and I/O details.
+Explicit options override the preset, including `false`. Reception recording,
+cache activity, cgroup and machine details, production details, cluster
+collection and aggregate history have separate opt-ins.
+
+For fast execution, enable `--dashboard-replay-details` and
+`--dashboard-fast-executed` on the node and configure the public profile and
+HTTPS proxy. For a provisioned Linux feed, the equivalent node settings are:
+
+```toml
+[dashboard]
+enabled = true
+replay_details = true
+fast_executed = true
+```
+
+The node must be restarted to apply its configuration. Both reader flags are
+also required; for example:
+
+```sh
+./mithril-dashboard --public-origin https://dashboard.example.com \
+  --public-resources --replay-details --fast-executed
+```
+
+Replace the origin with the provisioned value. The example service
+uses the private profile by default; edit its reader options to enable this.
+
 Machine details also require the node's `--dashboard-host-resources`.
 Local peers require the node's network details. Reception history requires
 the node's replay and network details with a Turbine block source, and the
 reader's replay and network details. Cgroup resources, cache activity and
 storage I/O have separate node opt-ins. See `mithril run --help` and
 `mithril-dashboard --help` for their requirements.
+With cache activity enabled and the fixed common-cache layout, a measured
+cache window may report the payload bytes copied to callers on small-tier
+hits. Shared references and internal staging copies are not counted.
 The reader's `--public-harmonic` separately includes configured Harmonic
 health in the advanced status profile when public resources are enabled.
 
 The reader can also retain aggregate history with `--history-dir` or read
 an external cluster snapshot with `--cluster-file`. The latter is written
-by the separate `mithril-dashboard-collect` command and currently uses its
-fixed Alpenglow provider profile. A provider failure is reported as such;
+by the separate `mithril-dashboard-collect` command, which supports fixed
+community-cluster and mainnet profiles. A provider failure is reported as such;
 external data is not proof of the linked node's state. Both paths must be
 absolute and their directories must be provisioned by the operator.
 The history directory must be owned by the reader and have mode `0700`.
+When using the example systemd service, add these settings to a service drop-in
+to give the reader a writable history path under `ProtectSystem=strict`.
+This example uses the managed browser profile. If your unit uses a different
+profile, keep its full command and append the same `--history-dir` argument.
+
+```ini
+[Service]
+StateDirectory=mithril-dashboard-history
+StateDirectoryMode=0700
+ExecStart=
+ExecStart=/usr/local/bin/mithril-dashboard --from-node --history-dir /var/lib/mithril-dashboard-history
+```
+
 History retains up to 30 days of observations collected after it is enabled;
 it does not reconstruct earlier data. Cgroup values describe the visible local
 cgroup and may not reflect limits imposed by its ancestors. A missing or stale
@@ -147,6 +233,13 @@ This example uses one fixed socket and reader port per host. For multiple
 nodes, configure separate sockets, reader units and ports manually.
 The path unit starts the reader when the socket appears. The reader defaults to
 loopback and the private profile; other local processes may still reach it.
+On Linux, a manually started `mithril-dashboard` also defaults to this socket,
+so no `--node-socket` argument is needed for the provisioned profile. Use
+`--node-socket` to select a different private feed; it is required on other
+platforms. The reader trusts the selected socket path and does not authenticate
+its peer, so the directory, its ancestors and ACLs must be correctly secured.
+The reader can start before the feed exists; a running reader alone does not
+mean it is connected.
 Stopping the node leaves the reader running with unavailable or stale data.
 An unclean node exit leaves the old socket in place, so the path unit can start
 the reader against a node that is not running; the next node start replaces
@@ -230,9 +323,10 @@ socket only if it is owned by the node's user and nothing accepts connections on
 it; any other existing path is left in place and the feed stays off. A feed setup
 failure is logged and does not stop the node.
 
-The feed serves one request per connection and accepts at most four connections
-per second, so a feed client cannot make the node spend more than that serving
-it. The reader polls once per second.
+The feed serves one request per connection, with at most four concurrent
+connections. The basic feed allows four connections per second (burst four).
+With detail samplers enabled, it allows 64 per second (burst 16). The basic
+snapshot is sampled once per second; detail sampling intervals vary.
 
 Unix socket paths have platform-specific length limits. If a long path causes a
 bind error, choose a shorter trusted directory and use the same socket path for
@@ -314,7 +408,8 @@ only in front of the public profile below.
 ## Public profile
 
 The reader has an explicit public-only profile. It still listens on loopback and
-requires an HTTPS reverse proxy. Set the exact external origin:
+requires an HTTPS reverse proxy. Use the managed setup above or pass the exact
+external origin directly when starting a manual reader.
 
 ```sh
 ./mithril-dashboard \
@@ -339,14 +434,346 @@ boundary; review filesystem permissions, supplementary groups and service
 confinement on the target host. The reader receives the whole private feed, not
 just its public fields.
 
+### Production HTTPS setup
+
+This walkthrough uses one Linux systemd host, a fixed node service account,
+a separate reader account and an authenticated gateway. Install `setpriv`
+(`util-linux` on Debian and Ubuntu). The Nginx example also uses Nginx and
+`htpasswd` (`apache2-utils` on Debian and Ubuntu). Obtain the approved
+dashboard release bundle and its expected archive SHA-256 from your release
+channel. Check that digest before extracting into a fresh directory. Then
+verify the extracted files and run the remaining commands from that directory.
+
+```sh
+sha256sum -c SHA256SUMS
+```
+
+Use the bundle's matched `bin/mithril`, `bin/mithril-dashboard` and `dist/`.
+Install `bin/mithril` through the node's normal release procedure at the
+planned restart. The setup commands below are for a new reader. For an
+upgrade, back up existing binaries and overrides and keep any site-specific
+unit paths.
+
+**1. Provision the reader and feed.** Replace `mithril` with the existing node
+service's fixed `User=`. The reader has its own primary group. Its service gains
+feed access through `SupplementaryGroups=` without changing node account membership.
+
+```sh
+(
+  set -eu
+  node_user=mithril
+  getent passwd "$node_user" >/dev/null
+  getent group mithril-dashboard >/dev/null || sudo groupadd --system mithril-dashboard
+  getent group mithril-dashboard-feed >/dev/null || sudo groupadd --system mithril-dashboard-feed
+  if ! getent passwd mithril-dashboard >/dev/null; then
+    sudo useradd --system --gid mithril-dashboard --no-create-home \
+      --home-dir /nonexistent --shell /usr/sbin/nologin mithril-dashboard
+  fi
+  test "$(id -u mithril-dashboard)" -ne 0
+  test "$(id -gn mithril-dashboard)" = mithril-dashboard
+  test "$(id -G mithril-dashboard)" = "$(id -g mithril-dashboard)"
+  printf 'd /run/mithril-dashboard-feed 2710 %s mithril-dashboard-feed - -\n' "$node_user" |
+    sudo tee /etc/tmpfiles.d/mithril-dashboard-feed.conf >/dev/null
+  sudo systemd-tmpfiles --create /etc/tmpfiles.d/mithril-dashboard-feed.conf
+  test "$(stat -c '%a %U %G' /run/mithril-dashboard-feed)" = "2710 $node_user mithril-dashboard-feed"
+)
+```
+
+The tmpfiles rule recreates the node-owned feed directory after reboot. Apply
+the actual host's ACL and service isolation checks before continuing.
+[systemd tmpfiles rules](https://www.freedesktop.org/software/systemd/man/latest/tmpfiles.d.html)
+
+**2. Stage the reader and HTTPS gateway.** Install the existing hardened units
+and the managed drop-in. Before enabling them, edit the base unit's
+`InaccessiblePaths=` to cover the actual node keys, state, database and admin
+sockets, including the node configuration if it lives separately. Keep the
+feed directory outside those masks. The drop-in starts the reader with
+`--from-node`.
+
+```sh
+sudo install -m 0755 bin/mithril-dashboard /usr/local/bin/mithril-dashboard
+sudo install -m 0644 examples/dashboard/mithril-dashboard.service \
+  examples/dashboard/mithril-dashboard.path /etc/systemd/system/
+sudo install -D -m 0644 examples/dashboard/mithril-dashboard.service.d/20-standard-origin.conf \
+  /etc/systemd/system/mithril-dashboard.service.d/20-standard-origin.conf
+sudoedit /etc/systemd/system/mithril-dashboard.service
+sudo systemd-analyze verify /etc/systemd/system/mithril-dashboard.service \
+  /etc/systemd/system/mithril-dashboard.path
+```
+
+Install the viewer into a new release directory. Set `release` to a fresh
+identifier for this bundle. An exclusive directory keeps the current viewer
+available for rollback while the new files are copied. The viewer connects to
+the API on its own HTTPS origin.
+
+```sh
+(
+  set -eu
+  release=2026-11-20-01
+  root=/srv/mithril-dashboard/releases
+  sudo install -d -m 0755 "$root"
+  sudo mkdir -m 0755 "$root/$release"
+  sudo cp -R dist "$root/$release/"
+  sudo chmod -R a+rX "$root/$release/dist"
+  printf 'Gateway document root: %s\n' "$root/$release/dist"
+)
+```
+
+Keep the gateway restricted to the operator test account. For the
+[Nginx example](../examples/dashboard/mithril-dashboard.nginx.conf), use an
+existing HTTPS certificate and put the file in a directory included by the
+`http` block. On Debian and Ubuntu this is commonly `/etc/nginx/conf.d`.
+Adjust `www-data` to your Nginx worker's group. `htpasswd` prompts for the
+operator's password.
+
+```sh
+nginx_group=www-data
+sudo install -m 0644 examples/dashboard/mithril-dashboard.nginx.conf \
+  /etc/nginx/conf.d/mithril-dashboard.conf
+sudoedit /etc/nginx/conf.d/mithril-dashboard.conf
+sudo test -f /etc/nginx/mithril-dashboard.htpasswd ||
+  sudo install -m 0640 -o root -g "$nginx_group" /dev/null /etc/nginx/mithril-dashboard.htpasswd
+sudo htpasswd -B /etc/nginx/mithril-dashboard.htpasswd dashboard-operator
+sudo chown "root:$nginx_group" /etc/nginx/mithril-dashboard.htpasswd
+sudo chmod 0640 /etc/nginx/mithril-dashboard.htpasswd
+sudo nginx -t && sudo systemctl reload-or-restart nginx
+```
+
+In the gateway file, set `server_name` to the hostname in
+`dashboard.public_origin`. Match the exact HTTP Host authority in the
+`$http_host` check, including any non-default port. When Nginx serves that
+origin directly, set `listen` to the same HTTPS port. Set the certificate,
+key and password-file paths. Set `root` to the release directory printed above. Save the
+previous site configuration before switching an existing deployment. If
+`nginx -t` fails, restore the previous site file before another reload. The
+example serves the entrypoint with `Cache-Control: no-store` so browsers load
+the active release after a reload.
+You can also use an existing gateway. Follow the
+[reverse proxy requirements](#reverse-proxy-boundary) before starting the reader.
+
+**3. Enable the feed and preflight as the reader.** Apply the
+[managed configuration](#managed-https-configuration) at the planned node
+restart. This selects the provisioned Linux socket. Once the node is running,
+run the check with the service's fixed UID, primary group and feed group.
+For a custom socket, omit `dashboard.public_origin` and configure the reader's
+`--node-socket` and `--public-origin` directly. [Manual reader](#public-profile)
+
+```sh
+sudo setpriv --reuid="$(id -u mithril-dashboard)" \
+  --regid="$(id -g mithril-dashboard)" \
+  --groups="$(getent group mithril-dashboard-feed | cut -d: -f3)" \
+  --no-new-privs /usr/local/bin/mithril-dashboard --from-node --check
+```
+
+The check reports the configured HTTPS origin and fresh private feed. It
+leaves the TCP listener closed and omits the snapshot body. Confirm the
+reported origin matches the gateway. During normal starts the managed reader
+waits for a current feed before listening, so an active unit can still be
+waiting for the node. The smoke checks below cover optional routes and gateway
+behavior. Check the service's isolation separately.
+
+**4. Start the reader, then open access.** After preflight succeeds, enable the
+path unit and load the new reader settings.
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now mithril-dashboard.path
+sudo systemctl try-restart mithril-dashboard.service
+sudo systemctl status mithril-dashboard.path mithril-dashboard.service
+```
+
+Through the staged gateway, verify the certificate and confirm that anonymous
+requests to the UI, API and WebSocket receive no dashboard data. The Nginx
+example responds with HTTP `401` for these unauthenticated requests.
+
+```sh
+origin=https://dashboard.example.com
+(
+  set -eu
+  for route in / '/api/v1/status?include=advanced_status'; do
+    code=$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' "$origin$route")
+    test "$code" = 401
+  done
+  code=$(curl -sS --http1.1 --max-time 5 -o /dev/null -w '%{http_code}' \
+    -H "Origin: $origin" -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+    -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+    "$origin/websocket?include=advanced_status")
+  test "$code" = 401
+)
+```
+
+Then load the shared URL in a browser and sign in as the operator.
+Check `/api/v1/features?include=advanced_status` for the expected families,
+`/api/v1/status?include=advanced_status` for the intended node and a positive
+remaining lease, and `/websocket?include=advanced_status` for an upgrade and
+valid status updates. If the viewer uses v2, verify the separate
+`/websocket?include=advanced_status&recent_executed=v2` upgrade and a valid
+challenge-bound frame. Confirm that wrong Origin and unlisted paths are rejected.
+Compare the viewer's replay position with the same node run before granting
+access to the intended audience.
+
+#### Optional Cluster provider data
+
+Run the bundled collector under its own account. It publishes an independent
+provider cache. Choose `mainnet-publicnode` for a Mainnet node or `alpenglow`
+for the Alpenglow community cluster. Match the reader's node genesis to the
+cache genesis. The viewer withholds a cache from another network.
+
+For a new collector, install the bundled
+[service](../examples/dashboard/mithril-dashboard-collect.service) and
+[timer](../examples/dashboard/mithril-dashboard-collect.timer) from the
+verified bundle. An existing installation should keep its unit and paths.
+Update that writer and timer in place so two collectors do not write to
+the same cache.
+
+```sh
+(
+  set -eu
+  if ! getent passwd mithril-dashboard-collect >/dev/null; then
+    sudo useradd --system --gid mithril-dashboard --no-create-home \
+      --home-dir /nonexistent --shell /usr/sbin/nologin mithril-dashboard-collect
+  fi
+  test "$(id -u mithril-dashboard-collect)" -ne 0
+  test "$(id -gn mithril-dashboard-collect)" = mithril-dashboard
+  test "$(id -G mithril-dashboard-collect)" = "$(id -g mithril-dashboard-collect)"
+  sudo install -m 0755 bin/mithril-dashboard-collect /usr/local/bin/mithril-dashboard-collect
+  sudo install -m 0644 examples/dashboard/mithril-dashboard-collect.service \
+    examples/dashboard/mithril-dashboard-collect.timer /etc/systemd/system/
+  sudo systemctl daemon-reload
+)
+```
+
+Check the collector unit's `InaccessiblePaths=` against your actual node
+configuration, keys, storage and sockets. Keep the collector out of
+`mithril-dashboard-feed`. Set the command with
+`sudo systemctl edit mithril-dashboard-collect.service`. Use this override
+for Mainnet. Replace `mainnet-publicnode` with `alpenglow` for the community
+cluster. The history flag requests up to 120 provider samples.
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/mithril-dashboard-collect --profile mainnet-publicnode --performance-history --output /var/lib/mithril-dashboard-cluster/cluster.json
+```
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now mithril-dashboard-collect.timer
+sudo systemctl start mithril-dashboard-collect.service
+sudo stat -c '%a %U %G %n' /var/lib/mithril-dashboard-cluster \
+  /var/lib/mithril-dashboard-cluster/cluster.json
+sudo -u mithril-dashboard test -r /var/lib/mithril-dashboard-cluster/cluster.json
+```
+
+The example service provisions the directory with mode `0750`. The collector
+atomically publishes a mode-`0640` file owned by `mithril-dashboard-collect`
+with group `mithril-dashboard`. A failed provider can yield a degraded cache
+and a failed service run. Inspect the collector's journal if needed.
+Add `--cluster-file /var/lib/mithril-dashboard-cluster/cluster.json` to the
+reader drop-in alongside `--from-node`, reload systemd and restart only the
+reader.
+
+After signing in at the HTTPS origin, run this in the viewer's browser
+console. It checks the gateway routes and the remaining lease of a single
+matching generation. If a collection turns over during the check, reread
+the map and retry.
+
+```js
+(async () => {
+  const read = async (path, header) => {
+    const start = performance.now();
+    const response = await fetch(path, { cache: 'no-store', credentials: 'same-origin', redirect: 'error' });
+    if (!response.ok) throw new Error(`${path} returned ${response.status}`);
+    const lease = response.headers.get(header);
+    const value = await response.json();
+    if (!/^[1-9]\d{0,5}$/.test(lease) || start + Number(lease) <= performance.now())
+      throw new Error(`${path} has no current lease`);
+    return { value, until: start + Number(lease) };
+  };
+  const clusterLease = 'Mithril-Cluster-Remaining-Milliseconds';
+  const status = await read('/api/v1/status?include=advanced_status', 'Mithril-Status-Remaining-Milliseconds');
+  const map = await read('/api/v1/cluster-map', clusterLease);
+  const { generation, genesis_hash: genesis, state, scope } = map.value;
+  if (!/^[0-9a-f]{64}$/.test(generation) || state !== 'fresh' ||
+      scope !== 'independent_cluster' || !genesis || status.value.node?.genesis_hash !== genesis)
+    throw new Error('Cluster map is stale or belongs to another network');
+  const details = await Promise.all(['cluster-versions', 'cluster-performance-history']
+    .map(route => read(`/api/v1/${route}?generation=${generation}`, clusterLease)));
+  if ([status, map, ...details].some(sample => sample.until <= performance.now()) ||
+      details.some(({ value }) => value.generation !== generation || value.genesis_hash !== genesis ||
+        value.state !== 'fresh' || value.captured_at !== map.value.captured_at))
+    throw new Error('Cluster generation or lease changed during the check');
+  console.log({
+    versionGroups: details[0].value.versions?.length ?? 'unavailable',
+    performanceSamples: details[1].value.rpc_performance_history?.length ?? 'unavailable',
+  });
+})();
+```
+
+Then open Cluster and verify that the version table and performance history
+appear when those observations are present. A version total summarizes the
+directory source rows. Missing provider history stays unavailable.
+
+**Origin changes.** Stage matching gateway routing, certificate and access
+controls before changing the node origin. When a valid, fresh private
+snapshot announces a changed or withdrawn origin, the managed reader exits
+and systemd restarts it. After startup, a temporary feed outage leaves the
+reader running with stale or unavailable data.
+If the reader reaches its restart limit, correct the node configuration,
+rerun the check, then reset and start the units.
+
+```sh
+sudo systemctl reset-failed mithril-dashboard.path mithril-dashboard.service
+sudo systemctl start mithril-dashboard.path mithril-dashboard.service
+```
+
+**If a check fails**
+
+| Symptom | Check |
+| --- | --- |
+| Reader configuration rejected | Check `dashboard.public_origin`, the exact gateway hostname and the managed drop-in. For a custom `--listen`, use a loopback IP and port. |
+| Feed socket missing or inaccessible | Verify the planned node start loaded the profile. Check node ownership, mode `2710`, the feed group, socket and ancestor permissions. Inspect the node log for feed startup errors. |
+| Feed path is not a socket | Verify that the absolute path in the check and unit points to the node's actual Unix socket. |
+| Snapshot rejected or no fresh status | Verify that both binaries come from the matched release, node replay is running and the emitted timestamps and snapshot lease are current. Repeat `--check`. |
+| Managed origin missing or withdrawn | Set `dashboard.public_origin` in the node configuration, apply it at the planned restart and rerun `--from-node --check`. |
+| Reader fails to bind | Check which service owns the configured loopback port. If you choose a different port, update both the reader and the gateway upstream. |
+| Preflight succeeds but HTTPS or WebSocket fails | Check unit status, gateway authentication, certificate, exact Host and Origin, and the unchanged upgrade path and query. |
+| Reader works but fields are absent | Inspect the advanced features response and the individual observation state. Confirm matching node and reader options for that family. |
+
+**Rollback.** Restrict gateway access first. Restore the previous viewer,
+reader binary and drop-in, then reload systemd and restart only the reader.
+For a first installation with no previous viewer, stop the path unit before
+the reader so the socket cannot trigger a new reader start.
+
+```sh
+sudo systemctl disable --now mithril-dashboard.path
+sudo systemctl stop mithril-dashboard.service
+```
+
+Repeat the gateway checks before restoring access. If the origin or node
+profile also needs to be reverted, restore the matching gateway settings
+and node TOML at a planned node restart. Keep the binary, viewer and proxy
+revisions in the rollout record.
+
+Build the Linux AMD64 release on a matching Linux host with Go 1.27.3 or
+newer, a C compiler, Make and Python 3. Supply the approved viewer build
+and its file-to-SHA-256 JSON manifest.
+
+```sh
+make dashboard-bundle VERSION=release-version DASHBOARD_BUNDLE_TARGET=linux-amd64 \
+  DASHBOARD_VIEWER_DIST=/abs/viewer/dist \
+  DASHBOARD_VIEWER_MANIFEST=/abs/assets.json \
+  DASHBOARD_BUNDLE=/abs/mithril-dashboard-linux-amd64.tar.gz
+```
+
 ### Linux reader service example
 
 For a new fixed-user deployment, copy the complete
 [reader unit](../examples/dashboard/mithril-dashboard.service) only after
-adapting its paths and account names. It defaults to the private profile; add
-`--public-origin` only after configuring the HTTPS proxy and reviewing the
-public disclosure below. It does not create accounts, enable
-the node feed, install a service or restart the validator.
+adapting its paths and account names. It defaults to the private profile.
+The [production HTTPS setup](#production-https-setup) installs the separate
+managed drop-in, which enables `--from-node` and preserves the base unit's
+confinement.
 It assumes an existing unprivileged `mithril-dashboard` account whose only
 additional group is `mithril-dashboard-feed`, an executable at the shown path,
 and the separately provisioned feed directory above. The illustrative node
@@ -384,6 +811,25 @@ ownership and lifecycle design; do not change an installed node identity to fit
 this example. Shared-kernel and host resource risks remain even after a policy
 passes its tests.
 
+For sampled interface MTU on the enabled `/api/v1/details/network` route, the
+client must request both `Mithril-Network-Pull-Requests: 1` and
+`Mithril-Network-Mtu: 1`. A separately deployed HTTPS proxy with a request-header
+allowlist must forward both to the reader when this extended response is
+intended. The repair-gate field also uses `Mithril-Network-Repair-Gate: 1`.
+For an existing Nginx location for this route, add these forwards to its other
+policy.
+
+```nginx
+proxy_set_header Mithril-Network-Pull-Requests $http_mithril_network_pull_requests;
+proxy_set_header Mithril-Network-Mtu $http_mithril_network_mtu;
+proxy_set_header Mithril-Network-Repair-Gate $http_mithril_network_repair_gate;
+```
+
+These headers negotiate additional response fields, not authorization. They do
+not enable the node/reader public, resource or network opt-ins, or bypass
+Host/Origin checks. Keep the existing disclosure defaults and TLS/proxy policy.
+MTU is the sampled interface setting, not measured path MTU or bandwidth.
+
 The proxy must preserve the configured Host and browser Origin. Use a lowercase
 HTTPS origin without credentials, a path, trailing slash, query or fragment.
 Host and Origin are compared exactly, including an explicitly configured port;
@@ -419,11 +865,23 @@ could omit the safety flag. This does not change the default or v1/v2 profiles.
 
 ### Reverse proxy boundary
 
-Configure the HTTPS proxy for the exact hostname and origin configured in the
-reader, with an approved certificate. Allow only the exact API routes intended
-for exposure, preserve Host and Origin, and explicitly forward the WebSocket
-upgrade. Disabled optional routes return `404`. Never route an unmatched path
-to the node, its RPC/admin interface or the private feed.
+Serve frontend assets and reader routes under the same HTTPS origin configured
+by `dashboard.public_origin` in managed mode or `--public-origin` in manual
+mode. On the reader host, forward the intended `/api/v1/...`
+routes and exact `/websocket` path to the configured loopback reader listener
+(default `127.0.0.1:8080`); serve UI files separately, as the reader has no UI.
+Authenticate the UI, API and WebSocket handshakes at the gateway. The reader's
+field allowlist is not an authentication mechanism.
+If a separate hosting or edge provider is used, verify that the chosen
+deployment supports both HTTP forwarding and WebSocket upgrades at that origin,
+including the Host/Origin and query handling below. An HTTP-only rewrite can
+leave the WebSocket unavailable. Forward the supported network negotiation
+headers described above only on `/api/v1/details/network`, and preserve the
+reader's freshness and no-store response headers.
+
+Use an approved TLS certificate. Preserve Host and Origin and explicitly forward
+the WebSocket upgrade. Disabled optional routes return `404`. Never forward an
+unmatched path to the node, its RPC/admin interface or the private feed.
 
 The public profile uses `/api/v1/features`, `/api/v1/status` and `/websocket`.
 Do not forward an unrestricted prefix. Allow only
@@ -442,12 +900,14 @@ and confirm the viewer marks its last data stale. Set and test reader CPU/memory
 limits on the intended host. Do not infer a key-isolation sandbox or acceptable
 validator overhead from these examples alone.
 
-The public WebSocket sends a single `mithril.public` envelope with the same
+The ordinary public status WebSocket sends a single `mithril.public` envelope with the same
 object as the status endpoint, then sends changed objects. It accepts no
 application data messages, including the private application ping or queries;
 the connection closes if one is sent. WebSocket control ping/pong remains in
-use. The private profile does not serve `/api/v1/status` and retains the private
+use. The optional execution stream has its own query and challenge protocol.
+The private profile does not serve `/api/v1/status` and retains the private
 WebSocket contract below. Neither profile serves UI files.
+[Execution WebSocket v2](dashboard-api-reference.md#experimental-fast-payload-websocket-v2)
 
 The public model is a typed allowlist. It excludes private runtime diagnostics,
 recovery hashes, raw logs and errors, paths, private keys, request contents and peer
@@ -461,8 +921,9 @@ shred version, local receipt time, and repair/TVU/Alpenglow service flags. The
 version contains `major.minor.patch`; prerelease labels are omitted. No
 endpoints, geographic guesses, stake, rank or health claims are included. The
 group is omitted by default, unavailable before an observation, and an empty
-array only after an observed empty sample. Both disclosure flags require
-`--public-origin`; neither changes the node's routing or network configuration.
+array only after an observed empty sample. Both disclosure flags require the
+public reader profile, configured by managed origin discovery or
+`--public-origin`.
 
 The gossip client keeps only the eight most recently updated matching-shred
 contacts after its existing signature checks. Repeated or older `(outset,

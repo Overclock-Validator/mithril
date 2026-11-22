@@ -23,6 +23,8 @@ type CacheActivityObservation struct {
 	FixedKnown                                         bool
 	FixedEmptyHits, FixedSmallHits                     uint64
 	FixedEmptyReplacements, FixedSmallReplacements     uint64
+	FixedSmallCopyBytes                                uint64
+	FixedSmallCopyKnown                                bool
 	InsertionWeightsRecorded                           bool
 	ProgramInsertionWeight, CommonLargeInsertionWeight CacheInsertionWeightObservation
 	// ProgramAcceptedSets counts AddProgramToCache calls accepted by Set,
@@ -89,33 +91,47 @@ func (db *AccountsDb) CacheActivity() (CacheActivityObservation, bool) {
 		o.ProgramInsertionWeight = db.ProgramCache.insertionWeightObservation()
 		o.CommonLargeInsertionWeight = db.CommonAcctsCache.large.insertionWeightObservation()
 	}
-	fixed, known := db.CommonAcctsCache.fixedActivity()
+	fixed, known, copied, copiedKnown := db.CommonAcctsCache.fixedActivity()
 	o.FixedKnown = known
 	o.FixedEmptyHits, o.FixedSmallHits = fixed[0], fixed[1]
 	o.FixedEmptyReplacements, o.FixedSmallReplacements = fixed[2], fixed[3]
+	o.FixedSmallCopyBytes, o.FixedSmallCopyKnown = copied, copiedKnown
 	return o, true
 }
 
-func (c *commonAccountCache) fixedActivity() (totals [4]uint64, known bool) {
+func (c *commonAccountCache) fixedActivity() (totals [4]uint64, known bool, copied uint64, copiedKnown bool) {
 	if !c.enabled {
-		return totals, true
+		return totals, true, 0, false
 	}
+	known, copiedKnown = true, true
 	for i := range c.shards {
 		s := &c.shards[i]
 		if !s.mu.TryLock() {
-			return [4]uint64{}, false
+			return [4]uint64{}, false, 0, false
 		}
-		values, saturated := s.activity, s.activitySaturated
+		values, saturated, shardCopied := s.activity, s.activitySaturated, s.smallCopyBytes
 		s.mu.Unlock()
-		if saturated {
-			return [4]uint64{}, false
+		if shardCopied >= math.MaxUint64-copied {
+			copiedKnown = false
+		} else if copiedKnown {
+			copied += shardCopied
 		}
-		for j, value := range values {
-			if value > math.MaxUint64-totals[j] {
-				return [4]uint64{}, false
+		known = known && !saturated
+		if known {
+			for j, value := range values {
+				if value > math.MaxUint64-totals[j] {
+					known = false
+					break
+				}
+				totals[j] += value
 			}
-			totals[j] += value
 		}
 	}
-	return totals, true
+	if !known {
+		totals = [4]uint64{}
+	}
+	if !copiedKnown {
+		copied = 0
+	}
+	return totals, known, copied, copiedKnown
 }

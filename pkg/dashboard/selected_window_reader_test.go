@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -339,5 +340,234 @@ func TestSelectedWindowReaderStoppingStatusFence(t *testing.T) {
 	c.observeReplayDetailStatus("fresh", "", time.Now(), 1)
 	if c.detailGate.Load().stopping || c.detailGate.Load().revision != stopped.revision+1 {
 		t.Fatal("recovery did not create a new selected revision")
+	}
+}
+
+func TestSelectedWindowCachePressureKeepsOriginalBundle(t *testing.T) {
+	for _, tc := range []struct {
+		name, remaining, prior              string
+		invalid                             bool
+		differentGeneration, differentReset bool
+		want                                int
+		failure                             string
+	}{
+		{name: "same binding retains original bundle", remaining: "30000", want: 200},
+		{name: "prior integrity failure stays closed", remaining: "30000", prior: "source_invalid", want: 503, failure: "source_invalid"},
+		{name: "low original budget stays closed", remaining: "13000", want: 503, failure: "generation_not_ready"},
+		{name: "invalid source stays closed", remaining: "30000", invalid: true, want: 503, failure: "source_invalid"},
+		{name: "new generation replaces rather than falls back", remaining: "30000", differentGeneration: true, want: 200},
+		{name: "new generation low budget cannot fall back", remaining: "13000", differentGeneration: true, want: 503, failure: "generation_not_ready"},
+		{name: "reset mismatch cannot fall back", remaining: "30000", differentReset: true, want: 503, failure: "source_invalid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now()
+			core := replayDetailLiveCore(0)
+			g := replayGate(replayDetailLiveStatus(core), now)
+			g.revision = 1
+			g.stamp = statusStamp{nodeEpoch: 1, familyEpoch: 1}
+			var gate atomic.Pointer[replayDetailGate]
+			gate.Store(&g)
+			candidate := selectedWindowFixture(1)
+			candidate.Binding = core.Binding
+			candidate.CapturedAt = now.UTC()
+			candidate.ObservedAt = now.UTC()
+			prepared, err := prepareSelectedWindow(candidate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := &selectedWindowReader{gate: &gate, revision: g.revision, limit: rate.NewLimiter(16, 32), active: make(chan struct{}, 4)}
+			for i := 0; i < replayDetailGenerations; i++ {
+				captured := now.Add(time.Duration(-20+i*5) * time.Second)
+				published := now.Add(time.Duration(-8+i*2) * time.Second)
+				w := candidate
+				w.CapturedAt = captured.UTC()
+				w.ObservedAt = captured.UTC()
+				old, err := prepareSelectedWindow(w)
+				if err != nil {
+					t.Fatal(err)
+				}
+				bundle, err := selectedWindowBundle(old)
+				if err != nil {
+					t.Fatal(err)
+				}
+				item := &replayDetailPrepared{binding: w.Binding, generation: old.digest, capturedAt: captured, pages: old.pages, bytes: old.bytes + len(bundle), selectedBundle: bundle}
+				for j := range item.manifests {
+					item.manifests[j] = old.manifest
+				}
+				at := g
+				at.ObservedAt = published
+				if err := r.cache.publish(item, at, published); err != nil {
+					t.Fatal(err)
+				}
+			}
+			original := r.cache.items
+			latest := original[len(original)-1]
+			if latest == nil || !sameReplayDetailBinding(latest.prepared.binding, candidate.Binding) {
+				t.Fatal("fixture is not full/same binding")
+			}
+			read := func() *httptest.ResponseRecorder {
+				out := httptest.NewRecorder()
+				r.serveHTTP(out, httptest.NewRequest(http.MethodGet, "/api/v1/details/selected-window", nil), allowReplayStatusForTest)
+				return out
+			}
+			initial := read()
+			if initial.Code != 200 {
+				t.Fatalf("original bundle not fresh: %d", initial.Code)
+			}
+			if tc.prior != "" {
+				r.failure = &selectedWindowFailure{revision: g.revision, stamp: g.stamp, reason: tc.prior}
+			}
+			if tc.differentGeneration {
+				candidate.Binding.SourceGeneration++
+			}
+			if tc.differentReset {
+				candidate.Binding.ResetAt = candidate.Binding.ResetAt.Add(time.Millisecond)
+			}
+			prepared, err = prepareSelectedWindow(candidate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			requests := 0
+			r.client = &http.Client{Transport: selectedEpochTransport(func(req *http.Request) (*http.Response, error) {
+				requests++
+				body := prepared.manifest
+				if req.URL.RawQuery != "" {
+					body = prepared.pages[0]
+				}
+				if tc.invalid {
+					body = "{}"
+				}
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{replayDetailRemainingHeader: []string{tc.remaining}}, ContentLength: int64(len(body)), Body: io.NopCloser(strings.NewReader(body))}, nil
+			})}
+			r.collect(context.Background())
+			out := read()
+			if out.Code != tc.want {
+				t.Fatalf("capacity pressure hid original bundle: got %d want %d", out.Code, tc.want)
+			}
+			if tc.failure != "" {
+				if r.failure == nil || r.failure.reason != tc.failure {
+					t.Fatalf("failure changed: %+v", r.failure)
+				}
+			} else if r.failure != nil {
+				t.Fatalf("capacity became source failure: %+v", r.failure)
+			}
+			if !tc.differentGeneration && r.cache.items != original {
+				t.Fatal("capacity retry replaced/renewed original publication")
+			}
+			if tc.differentGeneration && tc.want == 200 {
+				if r.cache.items[0] == original[0] || !sameReplayDetailBinding(r.cache.items[0].prepared.binding, candidate.Binding) || out.Body.String() == initial.Body.String() {
+					t.Fatal("new source generation used old fallback")
+				}
+				return
+			}
+			if tc.want == 200 {
+				if requests != 2 || out.Body.String() != initial.Body.String() {
+					t.Fatal("retained bundle changed or new candidate was published")
+				}
+				if latest.publishedAt != now.Add(-4*time.Second) || latest.holdUntil != now.Add(26*time.Second) || latest.prepared.capturedAt != now.Add(-10*time.Second) {
+					t.Fatal("original clocks renewed")
+				}
+				expiry := latest.prepared.capturedAt.Add(replayDetailFreshFor)
+				future := g
+				future.ObservedAt = expiry
+				if r.cache.lookupWithBudget("", false, future, expiry, time.Millisecond).status == 200 {
+					t.Fatal("original source expiry revived")
+				}
+				replacement := g
+				replacement.stamp.familyEpoch++
+				gate.Store(&replacement)
+				if read().Code == 200 {
+					t.Fatal("retained bundle crossed status stamp")
+				}
+			}
+		})
+	}
+}
+
+// Only native public-safe failure enums may cross the private reader boundary.
+func TestSelectedWindowPrivateFailureReasons(t *testing.T) {
+	canonical := func(reason string) string {
+		return `{"schema_version":1,"family":"selected_slots","state":"unavailable","reason":"` + reason + `"}`
+	}
+	cases := []struct {
+		name, body, want string
+		status           int
+		lease            bool
+		length           int64
+	}{
+		{name: "waiting source", body: canonical("waiting_source"), want: "waiting_source", status: 503, length: -1},
+		{name: "binding changed stays 503", body: canonical("binding_changed"), want: "binding_changed", status: 503, length: -1},
+		{name: "generation not ready", body: canonical("generation_not_ready"), want: "generation_not_ready", status: 503, length: -1},
+		{name: "wrong family", body: strings.Replace(canonical("waiting_source"), "selected_slots", "replay", 1), want: "source_invalid", status: 503, length: -1},
+		{name: "unknown private text", body: canonical("private-secret-marker"), want: "source_invalid", status: 503, length: -1},
+		{name: "extra private key", body: strings.TrimSuffix(canonical("waiting_source"), "}") + `,"private":"private-secret-marker"}`, want: "source_invalid", status: 503, length: -1},
+		{name: "duplicate key", body: strings.Replace(canonical("waiting_source"), `"schema_version":1`, `"schema_version":1,"schema_version":1`, 1), want: "source_invalid", status: 503, length: -1},
+		{name: "noncanonical body", body: canonical("waiting_source") + " ", want: "source_invalid", status: 503, length: -1},
+		{name: "error cannot grant lease", body: canonical("waiting_source"), want: "source_invalid", status: 503, lease: true, length: -1},
+		{name: "declared oversize", body: canonical("waiting_source"), want: "response_limit", status: 503, length: 513},
+		{name: "chunked oversize", body: strings.Repeat("x", 2048), want: "response_limit", status: 503, length: -1},
+		{name: "404 unchanged", body: "", want: "unsupported_source", status: 404, length: -1},
+		{name: "409 unchanged", body: "", want: "source_generation_expired", status: 409, length: -1},
+		{name: "429 unchanged", body: "", want: "source_unavailable", status: 429, length: -1},
+	}
+	for _, reason := range []string{"status_stale", "source_unavailable", "source_invalid", "source_time_invalid", "response_limit"} {
+		cases = append(cases, struct {
+			name, body, want string
+			status           int
+			lease            bool
+			length           int64
+		}{name: reason, body: canonical(reason), want: reason, status: 503, length: -1})
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			core := replayDetailLiveCore(0)
+			g := replayGate(replayDetailLiveStatus(core), time.Now())
+			g.revision = 1
+			g.stamp = statusStamp{nodeEpoch: 1, familyEpoch: 1}
+			var gate atomic.Pointer[replayDetailGate]
+			gate.Store(&g)
+			var source *strings.Reader
+			r := &selectedWindowReader{gate: &gate, limit: rate.NewLimiter(16, 32), active: make(chan struct{}, 4)}
+			r.client = &http.Client{Transport: selectedEpochTransport(func(*http.Request) (*http.Response, error) {
+				source = strings.NewReader(tc.body)
+				headers := make(http.Header)
+				if tc.lease {
+					headers.Set(replayDetailRemainingHeader, "30000")
+				}
+				return &http.Response{StatusCode: tc.status, Header: headers, ContentLength: tc.length, Body: io.NopCloser(source)}, nil
+			})}
+			r.collect(context.Background())
+			wantInternal := tc.want
+			if tc.want == "binding_changed" {
+				wantInternal = "private_binding_changed"
+			}
+			if r.failure == nil || r.failure.reason != wantInternal {
+				t.Fatalf("private failure got %+v want %s", r.failure, wantInternal)
+			}
+			if len(tc.body)-source.Len() > 513 {
+				t.Fatal("error body read exceeded fixed cap")
+			}
+			out := httptest.NewRecorder()
+			r.serveHTTP(out, httptest.NewRequest(http.MethodGet, "/api/v1/details/selected-window", nil), allowReplayStatusForTest)
+			wantStatus := 503
+			if tc.status == 404 || tc.status == 409 {
+				wantStatus = tc.status
+			}
+			var body struct{ Family, State, Reason string }
+			if json.Unmarshal(out.Body.Bytes(), &body) != nil || body.Family != "selected_slots" || body.State != "unavailable" || body.Reason != tc.want || out.Code != wantStatus {
+				t.Fatalf("public failure %d %s", out.Code, out.Body.String())
+			}
+			if strings.Contains(out.Body.String(), "private-secret-marker") || out.Header().Get(replayDetailRemainingHeader) != "" || out.Header().Get(statusRemainingHeader) != "" || r.last != nil || r.cache.items != [replayDetailGenerations]*replayDetailPublication{} {
+				t.Fatal("error leaked data or admitted/renewed a collection")
+			}
+			if tc.want == "binding_changed" {
+				r.failure.reason = "binding_changed" // Existing local cache.publish conflict classification.
+				local := httptest.NewRecorder()
+				r.serveHTTP(local, httptest.NewRequest(http.MethodGet, "/api/v1/details/selected-window", nil), allowReplayStatusForTest)
+				if local.Code != http.StatusConflict || !strings.Contains(local.Body.String(), `"reason":"binding_changed"`) {
+					t.Fatal("local binding conflict no longer preserves 409")
+				}
+			}
+		})
 	}
 }

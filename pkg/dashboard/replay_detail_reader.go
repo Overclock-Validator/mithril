@@ -82,7 +82,15 @@ func (r *replayDetailReader) run(ctx context.Context) {
 	first := true
 	// Related families retain their normal cadence when replay is polled sooner.
 	var nextRelated time.Time
+	var bootstrap *replayDetailGate
 	for ctx.Err() == nil {
+		gate := r.gate.Load()
+		if gate != nil && !gate.retired && !gate.stopping && gate.State == "fresh" && gate.stamp.valid() && gate.failure(time.Now()) == "" &&
+			(bootstrap == nil || !sameReplayDetailGateContext(*bootstrap, *gate)) {
+			// A long-lived reader may have spent its initial retry before this node started.
+			// Ordinary refreshes and same-context recovery do not rearm it.
+			bootstrap, first, nextRelated = gate, true, time.Time{}
+		}
 		r.collect(ctx)
 		if !time.Now().Before(nextRelated) {
 			if r.rooted != nil {
@@ -99,15 +107,18 @@ func (r *replayDetailReader) run(ctx context.Context) {
 		delay := replayDetailReaderInterval
 		if first {
 			first = false
+			gate := r.gate.Load()
 			r.mu.RLock()
-			waiting := r.cursor == nil
+			waiting := r.cursor == nil || gate == nil || !gate.matches(r.cursor.core.Binding)
 			r.mu.RUnlock()
 			if r.selected != nil {
 				r.selected.mu.Lock()
-				waiting = waiting || r.selected.last == nil && (r.selected.failure == nil || r.selected.failure.reason != "unsupported_source")
+				unsupported := gate != nil && r.selected.failure != nil && r.selected.failure.reason == "unsupported_source" &&
+					r.selected.failure.revision == gate.revision && r.selected.failure.stamp == gate.stamp
+				waiting = waiting || (r.selected.last == nil || gate == nil || !gate.matches(r.selected.last.binding)) && !unsupported
 				r.selected.mu.Unlock()
 			}
-			if waiting {
+			if waiting && (bootstrap == nil || gate != nil && sameReplayDetailGateContext(*bootstrap, *gate)) {
 				// The node's first detail capture may still be in progress.
 				// Retry once promptly, then retain the normal bounded cadence.
 				delay = time.Second

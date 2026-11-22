@@ -53,7 +53,7 @@ func (s *networkDetailSource) updateNode(snapshot Snapshot, now time.Time) {
 	}
 	// Encode negotiated variants on the sampling path, never on a viewer request.
 	// The original v2 shape remains the default for strict older readers.
-	encode := func(detail NodeNetworkDetail) (string, string, string, string, error) {
+	encodeOnce := func(detail NodeNetworkDetail) (string, string, string, string, error) {
 		var gate []byte
 		if detail.RepairGate != nil {
 			var err error
@@ -95,6 +95,23 @@ func (s *networkDetailSource) updateNode(snapshot Snapshot, now time.Time) {
 		}
 		return string(body), string(extended), latestBody, gateBody, nil
 	}
+	encode := func(detail NodeNetworkDetail) (string, string, string, string, error) {
+		trimmed, changed := withoutTPUWorkerPasses(detail)
+		if !changed {
+			return encodeOnce(detail)
+		}
+		baseBody, baseExtended, baseLatest, baseGate, baseErr := encodeOnce(trimmed)
+		if baseErr != nil || baseBody == "" || baseExtended == "" || baseLatest == "" || baseGate == "" {
+			return baseBody, baseExtended, baseLatest, baseGate, baseErr
+		}
+		body, extended, latest, gate, err := encodeOnce(detail)
+		member := workerPassMember(detail)
+		if err != nil || !preservesWorkerBaseline(body, baseBody, member) || !preservesWorkerBaseline(extended, baseExtended, member) || !preservesWorkerBaseline(latest, baseLatest, member) || !preservesWorkerBaseline(gate, baseGate, member) {
+			return baseBody, baseExtended, baseLatest, baseGate, baseErr
+		}
+		return body, extended, latest, gate, err
+	}
+
 	body, extended, latest, gate, err := encode(d)
 	if err != nil || len(body) > MaxNetworkDetailBytes {
 		p.reason = "response_limit"

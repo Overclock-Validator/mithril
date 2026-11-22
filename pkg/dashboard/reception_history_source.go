@@ -208,7 +208,9 @@ func (s *receptionHistorySource) poll(ctx context.Context) {
 	}
 	var incoming [8]PreparedReceptionChunk
 	count, attempts, through := 0, 0, cursor
-	for _, descriptor := range capture.Chunks {
+	// ponytail: prepare only the newest eight captured chunks; skipped spans stay
+	// explicit cache gaps. Complete retention needs an independent archive.
+	for _, descriptor := range capture.Chunks[max(0, len(capture.Chunks)-len(incoming)):] {
 		if descriptor.LastSequence <= cursor {
 			continue
 		}

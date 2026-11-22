@@ -11,25 +11,43 @@ func TestProgressClearsForkAndAttemptState(t *testing.T) {
 	disabled.begin(0, nil)
 	disabled.phase("running")
 	disabled.completed(CompletedBlock{}, 0, false)
-	disabled.skipped(0, false)
+	disabled.skipped(1, 0, false)
 	disabled.rewound()
+	disabled.restored(1, CertificateOutcomeSummary{})
 	if _, ok := disabled.Snapshot(); ok {
 		t.Fatal("disabled progress available")
 	}
 	p := &Progress{}
 	p.begin(41, &ResumeState{ParentSlot: 40})
+	if starting, _ := p.Snapshot(); starting.Frontier != 40 {
+		t.Fatalf("start did not publish resume frontier: %+v", starting)
+	}
 	p.phase("running")
 	p.completed(CompletedBlock{At: time.Now(), Slot: 41, Transactions: 3}, 40, true)
 	first, _ := p.Snapshot()
-	p.skipped(40, true)
+	p.skipped(42, 40, true)
+	p.settledOutcomes(40, CertificateOutcomeSummary{Pending: 2}, LeaderOutcomeSummary{}, SlotHistorySummary{},
+		ChainActivitySummary{}, EpochOutcomeSummary{}, PaymentOutcomeSummary{}, RewardHealthSummary{})
+	skipped, _ := p.Snapshot()
 	p.rewound()
 	rewound, _ := p.Snapshot()
 	if !first.HasCompleted || first.Completed.Slot != 41 || rewound.HasCompleted || rewound.Rewinds != 1 || rewound.SkippedSlots != 1 || rewound.ExecutedBlocks != 1 {
 		t.Fatalf("incorrect rewind: old=%+v next=%+v", first, rewound)
 	}
+	if first.Frontier != 41 || skipped.Frontier != 42 || skipped.Completed.Slot != 41 || rewound.Frontier != 0 {
+		t.Fatalf("frontier not bound to replay observations: completed=%d skipped=%d rewinding=%d",
+			first.Frontier, skipped.Frontier, rewound.Frontier)
+	}
+	if skipped.CertificateOutcomes.Pending != 2 || rewound.CertificateOutcomes.Pending != 0 {
+		t.Fatal("rewind retained pending evidence from the old fork")
+	}
+	p.restored(40, CertificateOutcomeSummary{Pending: 1})
+	if restored, _ := p.Snapshot(); restored.Frontier != 40 || restored.Rewinds != 1 || restored.HasCompleted || restored.CertificateOutcomes.Pending != 1 {
+		t.Fatalf("rewind did not restore frontier independently of completion: %+v", restored)
+	}
 	p.begin(30, nil)
 	next, _ := p.Snapshot()
-	if next.Attempt != 2 || next.StartSlot != 30 || next.HasCompleted || next.HasResumeParent || next.ExecutedBlocks != 0 || next.SkippedSlots != 0 || next.Rewinds != 0 || next.Phase != "starting" {
+	if next.Attempt != 2 || next.StartSlot != 30 || next.Frontier != 29 || next.HasCompleted || next.HasResumeParent || next.ExecutedBlocks != 0 || next.SkippedSlots != 0 || next.Rewinds != 0 || next.Phase != "starting" {
 		t.Fatalf("attempt retained previous data: %+v", next)
 	}
 }
@@ -65,7 +83,7 @@ func TestProgressCountsCompletedLocalWork(t *testing.T) {
 	p.completed(CompletedBlock{Slot: 41, Transactions: 3, ComputeUnits: 7}, 40, true)
 	first, _ := p.Snapshot()
 	p.completed(CompletedBlock{Slot: 42, Transactions: 5, ComputeUnits: 11}, 40, true)
-	p.skipped(40, true)
+	p.skipped(43, 40, true)
 	p.phase("halted") // Failed work has no successful completion observation.
 	p.rewound()
 	s, _ := p.Snapshot()
@@ -129,7 +147,7 @@ func TestProgressDistinguishesUnknownAndZeroDurableSlot(t *testing.T) {
 	if s, _ := p.Snapshot(); s.HasDurableSlot {
 		t.Fatal("missing durable bank became slot zero")
 	}
-	p.skipped(0, true)
+	p.skipped(2, 0, true)
 	if s, _ := p.Snapshot(); !s.HasDurableSlot || s.DurableSlot != 0 {
 		t.Fatal("known durable slot zero became unavailable")
 	}

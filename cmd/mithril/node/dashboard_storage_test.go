@@ -96,6 +96,44 @@ func TestStorageDetailNodeOwnershipAndAllRoles(t *testing.T) {
 	}
 }
 
+func TestStorageDetailNearExpiryOptionalIODoesNotWithdrawCore(t *testing.T) {
+	db, _ := dashboardStorageDB(t)
+	d := storageNodeFixture()
+	if !d.attachStorageOwner(db) {
+		t.Fatal("could not attach storage owner")
+	}
+	d.io = &dashboardIOMonitor{}
+	at := time.Now()
+	observation := dashboard.StorageIODetail{Scope: "linux_process_and_mounted_block_layer",
+		StartedAt: at.Add(-time.Second).UTC(), CapturedAt: at.UTC()}
+	optional := &dashboardIOObservation{value: observation, freshUntil: at.Add(time.Second)}
+	d.io.latest.Store(optional)
+	capture, err := d.sampleStorageDetail(at)
+	if err != nil || capture.Detail.Index.State != "idle" || capture.Detail.IO != nil ||
+		capture.FreshUntil.Before(at.Add(dashboard.StorageDetailFreshFor)) {
+		t.Fatalf("near-expiry I/O constrained core storage: %+v, %v", capture, err)
+	}
+	optional = &dashboardIOObservation{value: observation, freshUntil: at.Add(20 * time.Second)}
+	d.io.latest.Store(optional)
+	capture, err = d.sampleStorageDetail(at)
+	if err != nil || capture.Detail.IO == nil || !capture.FreshUntil.Equal(optional.freshUntil) {
+		t.Fatalf("eligible I/O did not preserve original deadline: %+v, %v", capture, err)
+	}
+}
+
+func TestStorageDetailOptionalLeaseBoundary(t *testing.T) {
+	at := time.Now()
+	coreDeadline := at.Add(dashboard.StorageDetailFreshFor)
+	capture := dashboard.StorageDetailCapture{FreshUntil: coreDeadline}
+	minimumDeadline := at.Add(dashboard.SampleInterval + dashboard.StorageDetailPollInterval + 2*time.Second)
+	if admitStorageOptional(&capture, at, minimumDeadline.Add(-time.Nanosecond)) || !capture.FreshUntil.Equal(coreDeadline) {
+		t.Fatal("insufficient optional lease constrained core storage")
+	}
+	if !admitStorageOptional(&capture, at, minimumDeadline) || !capture.FreshUntil.Equal(minimumDeadline) {
+		t.Fatal("sufficient optional lease did not preserve its original deadline")
+	}
+}
+
 func TestStorageDetailNodeUnknownAndDisabled(t *testing.T) {
 	var absent *nodeDashboard
 	if !absent.attachStorageOwner(nil) {

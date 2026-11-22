@@ -49,7 +49,37 @@ type nodeNetworkPublicFamily struct {
 // preparePublicNodeNetwork shares the canonical observation tail across the
 // finite state prefixes. Viewers write the two strings without encoding or
 // concatenation. The receiver-cleared body remains separately precomputed.
+// Only opted-in rows require an extra baseline encoding. Keep them only when
+// every previously available negotiated/state variant preserves its old facts.
+// Both encodings run on the collection path with the same original deadline.
 func preparePublicNodeNetwork(d NodeNetworkDetail, collectedAt, freshUntil time.Time) (*nodeNetworkPublicFamily, error) {
+	trimmed, changed := withoutTPUWorkerPasses(d)
+	if !changed || validateNodeNetworkDetail(d) != nil {
+		return preparePublicNodeNetworkOnce(d, collectedAt, freshUntil)
+	}
+	baseline, err := preparePublicNodeNetworkOnce(trimmed, collectedAt, freshUntil)
+	if err != nil {
+		return baseline, err
+	}
+	candidate, candidateErr := preparePublicNodeNetworkOnce(d, collectedAt, freshUntil)
+	if candidateErr != nil {
+		return baseline, nil
+	}
+	member := workerPassMember(d)
+	for i := range baseline.bodies {
+		if candidate.bodies[i] != baseline.bodies[i] {
+			return baseline, nil
+		}
+	}
+	for _, pair := range [][2]string{{candidate.tail, baseline.tail}, {candidate.independentOnly, baseline.independentOnly}, {candidate.extendedTail, baseline.extendedTail}, {candidate.extendedIndependentOnly, baseline.extendedIndependentOnly}, {candidate.latestTail, baseline.latestTail}, {candidate.latestIndependentOnly, baseline.latestIndependentOnly}, {candidate.gateTail, baseline.gateTail}} {
+		if !preservesWorkerBaseline(pair[0], pair[1], member) {
+			return baseline, nil
+		}
+	}
+	return candidate, nil
+}
+
+func preparePublicNodeNetworkOnce(d NodeNetworkDetail, collectedAt, freshUntil time.Time) (*nodeNetworkPublicFamily, error) {
 	if validateNodeNetworkDetail(d) != nil || !validReplayDetailTime(collectedAt.UTC()) || !freshUntil.After(collectedAt) ||
 		d.CapturedAt.After(collectedAt.Add(time.Second)) {
 		return nil, errors.New("source_invalid")

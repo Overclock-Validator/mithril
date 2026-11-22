@@ -47,6 +47,8 @@ type AccountsDb struct {
 	// program lock pins this counter's cache instance; Clear does not reset it.
 	programCacheAcceptedSets atomic.Uint64
 	programCacheRefusedSets  atomic.Uint64
+	accountOperations        atomic.Pointer[accountOperationsRecorder]
+	physicalUsage            atomic.Pointer[physicalUsageRecorder]
 	storageOpenedAt          time.Time
 	storageClosing           atomic.Bool
 	indexWriteStalls         *writeStallRecorder
@@ -88,6 +90,7 @@ type AccountsDb struct {
 	lastBatchSeq     uint64        // guarded by foldMu; seeded by RecoverFoldState
 	durableThrough   atomic.Uint64 // observability: highest durably folded slot
 	foldHooks        foldTestHooks // test-only crash injection
+	foldPhase        foldPhase     // what CommitBatch is doing now, for slow-load attribution
 	compactCursor    string        // guarded by foldMu; scan resume point across CompactOnce cycles
 	sparseCursor     string        // independent cursor so bootstrap scanning cannot starve large segments
 	resparseNext     bool          // alternate new and previously sparse segments, even with one-file cycles
@@ -97,6 +100,9 @@ type AccountsDb struct {
 	compactLastScan  map[uint64]uint64 // oldest scan first; a growing directory must not postpone cursor wrap forever
 	compactCycles    uint64            // periodically serve bootstrap and mostly-empty sparse files too
 	compactHooks     compactionTestHooks
+	// Guarded by foldMu; report the format requirement once per opened store,
+	// including stores converted by an earlier process.
+	sparseCompatibilityWarned bool
 	// compactInventory is the in-memory view of the accounts directory that
 	// compaction scans (nil = rebuild from the directory); compactPinCache holds
 	// pins computed from unchanged retained manifests. Both guarded by foldMu.
@@ -127,7 +133,7 @@ const (
 	indexPebbleMemTableSize                = 64 << 20
 	indexPebbleMemTableStopWritesThreshold = 4
 	DefaultCommonAccountCacheMaxMB         = 768
-	DefaultProgramCacheMaxMB               = 1024
+	DefaultProgramCacheMaxMB               = 4096
 	programCacheCostUnitBytes              = 1 << 20
 	commonAccountCacheEntryOverheadBytes   = 256
 )
@@ -224,6 +230,7 @@ func OpenDbPaths(accountsPaths []string) (*AccountsDb, error) {
 
 func (accountsDb *AccountsDb) CloseDb() {
 	accountsDb.storageClosing.Store(true)
+	accountsDb.StopPhysicalUsage()
 	mlog.Log.Infof("CloseDb: syncing and closing Index...")
 	if err := accountsDb.Index.Close(); err != nil {
 		mlog.Log.Errorf("CloseDb: Index.Close() error: %v", err)
@@ -418,6 +425,7 @@ type AccountReadStats struct {
 }
 
 func (accountsDb *AccountsDb) GetAccount(slot uint64, pubkey solana.PublicKey) (*accounts.Account, error) {
+	accountsDb.recordAccountRequests(1)
 	if accountsDb == nil {
 		return nil, ErrNoAccount
 	}
@@ -427,6 +435,7 @@ func (accountsDb *AccountsDb) GetAccount(slot uint64, pubkey solana.PublicKey) (
 }
 
 func (accountsDb *AccountsDb) GetAccountWithStats(slot uint64, pubkey solana.PublicKey) (*accounts.Account, AccountReadStats, error) {
+	accountsDb.recordAccountRequests(1)
 	var stats AccountReadStats
 	if accountsDb == nil {
 		return nil, stats, ErrNoAccount

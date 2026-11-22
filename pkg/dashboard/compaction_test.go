@@ -25,6 +25,32 @@ func maximumCompaction(at time.Time) *Compaction {
 	}}
 }
 
+func TestPublicCompactionRelocationRequiresValidOwnerSample(t *testing.T) {
+	at := time.Now().UTC()
+	active := false
+	start, end := at.Add(time.Millisecond), at.Add(2*time.Millisecond)
+	c := &Compaction{Enabled: true, Active: &active, ActiveSampleStartedAt: &start, ActiveSampleCompletedAt: &end,
+		LastCompleted: maximumCompaction(at).LastCompleted,
+		Relocation:    &CompactionRelocation{SessionStartedAt: at.Add(-time.Second), ElapsedNanoseconds: int64(time.Second)}}
+	project := func() *PublicCompaction { return publicCompaction(c, at, end) }
+	p := project()
+	if p == nil || p.Relocation == nil || !sameCompaction(p, c) {
+		t.Fatal("valid measured zero was changed or omitted")
+	}
+	c.Relocation.Bytes = math.MaxUint64
+	if p.Relocation.Bytes != 0 {
+		t.Fatal("public relocation changed when the producer counter was updated")
+	}
+	if p = project(); p == nil || p.Relocation != nil || p.LastCompleted == nil {
+		t.Fatal("saturated counter was not withheld independently of cycle history")
+	}
+	c.Relocation.Bytes = 4096
+	c.ActiveSampleCompletedAt = nil
+	if p = project(); p == nil || p.Relocation != nil || p.LastCompleted == nil {
+		t.Fatal("unbracketed counter was not withheld independently of cycle history")
+	}
+}
+
 func TestCompactionRealFeedDisclosureAndRecovery(t *testing.T) {
 	at := time.Now().UTC()
 	s := resourceFixture(at)
@@ -126,5 +152,66 @@ func TestPublicCompactionRejectsInvalidSourceWithoutUnsignedWrap(t *testing.T) {
 	c.LastCompleted.CompletedAt = at.Add(-time.Second)
 	if p := publicCompaction(c, at, at); p == nil || p.LastCompleted.DurationNanoseconds != math.MaxInt64 {
 		t.Fatal("wall-clock step replaced the retained monotonic duration")
+	}
+}
+
+func TestPublicCompactionActivity(t *testing.T) {
+	at := time.Now().UTC()
+	for _, active := range []bool{false, true} {
+		c := &Compaction{Enabled: true, Active: &active}
+		p := publicCompaction(c, at, at)
+		if p == nil || p.Active == nil || *p.Active != active || p.ActiveSampleStartedAt != nil || p.ActiveSampleCompletedAt != nil {
+			t.Fatal("known activity was not preserved")
+		}
+		started, completed := at.Add(time.Millisecond), at.Add(2*time.Millisecond)
+		c.ActiveSampleStartedAt, c.ActiveSampleCompletedAt = &started, &completed
+		p = publicCompaction(c, at, at)
+		if p == nil || p.Active == nil || *p.Active != active || p.LastCompleted != nil ||
+			p.ActiveSampleStartedAt == nil || !p.ActiveSampleStartedAt.Equal(started) ||
+			p.ActiveSampleCompletedAt == nil || !p.ActiveSampleCompletedAt.Equal(completed) {
+			t.Fatal("timed activity without a completed cycle was lost")
+		}
+		started, completed = at.Add(time.Hour), at.Add(time.Hour)
+		if !p.ActiveSampleStartedAt.Equal(at.Add(time.Millisecond)) || !p.ActiveSampleCompletedAt.Equal(at.Add(2*time.Millisecond)) {
+			t.Fatal("public activity dates alias the source")
+		}
+		c.Enabled = false
+		if publicCompaction(c, at, at) != nil {
+			t.Fatal("disabled worker reported activity")
+		}
+	}
+	if p := publicCompaction(&Compaction{Enabled: true}, at, at); p == nil || p.Active != nil {
+		t.Fatal("missing activity became known")
+	}
+	for _, mutate := range []func(*Compaction){
+		func(c *Compaction) { c.ActiveSampleStartedAt = nil },
+		func(c *Compaction) { c.ActiveSampleCompletedAt = nil },
+		func(c *Compaction) { v := time.Time{}; c.ActiveSampleStartedAt = &v },
+		func(c *Compaction) { v := at.Add(-time.Millisecond); c.ActiveSampleStartedAt = &v },
+		func(c *Compaction) { v := at.Add(-time.Millisecond); c.ActiveSampleCompletedAt = &v },
+		func(c *Compaction) { v := at.Add(2 * time.Second); c.ActiveSampleCompletedAt = &v },
+		func(c *Compaction) {
+			started, completed := at.Add(3*time.Second), at.Add(3*time.Second+time.Millisecond)
+			c.ActiveSampleStartedAt, c.ActiveSampleCompletedAt = &started, &completed
+		},
+		func(c *Compaction) { v := at.Add(time.Second + 2*time.Millisecond); c.ActiveSampleCompletedAt = &v },
+		func(c *Compaction) { c.Active = nil },
+	} {
+		c := maximumCompaction(at)
+		active, started, completed := true, at.Add(time.Millisecond), at.Add(2*time.Millisecond)
+		c.Active, c.ActiveSampleStartedAt, c.ActiveSampleCompletedAt = &active, &started, &completed
+		mutate(c)
+		p := publicCompaction(c, at, at.Add(time.Second))
+		if p == nil || p.Active != nil || p.ActiveSampleStartedAt != nil || p.ActiveSampleCompletedAt != nil || p.LastCompleted == nil {
+			t.Fatal("invalid activity timing survived or concealed the independent historical cycle")
+		}
+	}
+	s := resourceFixture(at)
+	active, started, completed := false, at.Add(time.Millisecond), at.Add(2*time.Millisecond)
+	s.Resources.Compaction = &Compaction{Enabled: true, Active: &active, ActiveSampleStartedAt: &started, ActiveSampleCompletedAt: &completed}
+	p := publicResources(&s, "fresh", at.Add(31*time.Second))
+	if p.State != "stale" || p.Compaction == nil || p.Compaction.Active == nil || *p.Compaction.Active ||
+		!p.Compaction.ActiveSampleStartedAt.Equal(started) || !p.Compaction.ActiveSampleCompletedAt.Equal(completed) {
+		t.Fatal("activity timing renewed resource freshness or lost the original observation")
 	}
 }

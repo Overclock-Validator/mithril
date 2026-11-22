@@ -23,6 +23,10 @@ func TestDashboardReplayDetailsOptIn(t *testing.T) {
 	if flag == nil || flag.DefValue != "false" {
 		t.Fatal("replay-detail flag is not default off")
 	}
+	fast := Run.Flags().Lookup("dashboard-fast-executed")
+	if fast == nil || fast.DefValue != "false" {
+		t.Fatal("fast-executed flag is not default off")
+	}
 }
 
 func TestDashboardReplayDetailsEnableBeforeReplay(t *testing.T) {
@@ -37,7 +41,7 @@ func TestDashboardReplayDetailsEnableBeforeReplay(t *testing.T) {
 					t.Error(err)
 				}
 			})
-			d := startNodeDashboard(context.Background(), time.Now().UTC(), filepath.Join(dir, "node.sock"), "", "owner-run", "isolated", "verifying", false, false, enabled, false, false, false, false, false, false, false, false)
+			d := startNodeDashboard(context.Background(), time.Now().UTC(), filepath.Join(dir, "node.sock"), "", "owner-run", "isolated", "verifying", false, false, enabled, false, false, false, false, false, false, false, false, false)
 			if d == nil {
 				t.Fatal("private dashboard feed did not start")
 			}

@@ -16,7 +16,6 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/blockstream"
 	"github.com/Overclock-Validator/mithril/pkg/consensus"
 	"github.com/Overclock-Validator/mithril/pkg/dashboard"
-	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
 	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
@@ -144,7 +143,27 @@ func dashboardFeedConfig(enabled bool, socket, group, goos string) (string, stri
 	if socket != "" || group != "" {
 		return "", "", fmt.Errorf("dashboard.enabled cannot be combined with dashboard.socket or dashboard.socket_group")
 	}
-	return "/run/mithril-dashboard-feed/dashboard.sock", "mithril-dashboard-feed", nil
+	return dashboard.DefaultNodeSocket, "mithril-dashboard-feed", nil
+}
+
+func validateDashboardPublicOrigin(origin, profile, socket, group, goos string, enabled bool) error {
+	if origin == "" {
+		return nil
+	}
+	switch {
+	case profile != "standard":
+		return fmt.Errorf("dashboard.public_origin requires dashboard.profile=standard")
+	case socket != "" || group != "":
+		return fmt.Errorf("dashboard.public_origin cannot be combined with dashboard.socket or dashboard.socket_group")
+	case !enabled:
+		return fmt.Errorf("dashboard.public_origin requires the dashboard feed to be enabled")
+	case goos != "linux":
+		return fmt.Errorf("dashboard.public_origin requires the provisioned Linux dashboard feed")
+	}
+	if err := dashboard.ValidateManagedOrigin(origin); err != nil {
+		return fmt.Errorf("dashboard.public_origin: %w", err)
+	}
+	return nil
 }
 
 func validateDashboardHostResources(enabled bool, socket string) error {
@@ -320,14 +339,22 @@ func filesystemSample(path string) *dashboard.Filesystem {
 
 func filesystemFromStat(stat syscall.Statfs_t) *dashboard.Filesystem {
 	unit := filesystemBlockSize(stat)
-	if unit == 0 || stat.Blocks > ^uint64(0)/unit || stat.Bavail > ^uint64(0)/unit {
+	if unit == 0 || stat.Blocks > ^uint64(0)/unit || stat.Bavail > ^uint64(0)/unit || stat.Bfree > stat.Blocks || stat.Bavail > stat.Bfree {
 		return nil
 	}
-	return &dashboard.Filesystem{TotalBytes: stat.Blocks * unit, AvailableBytes: stat.Bavail * unit, Inodes: stat.Files, FreeInodes: stat.Ffree}
+	used := (stat.Blocks - stat.Bfree) * unit
+	return &dashboard.Filesystem{TotalBytes: stat.Blocks * unit, AvailableBytes: stat.Bavail * unit, UsedBytes: &used, Inodes: stat.Files, FreeInodes: stat.Ffree}
 }
 
-func startNodeDashboard(ctx context.Context, startedAt time.Time, socket, group, runID, network, mode string, alpenglow, rpcConfigured, replayDetails, networkDetails, cacheDetails, productionDetails, storageDetails, shredHistory, hostResources, machineDetails, localPeers bool) *nodeDashboard {
+func startNodeDashboard(ctx context.Context, startedAt time.Time, socket, group, runID, network, mode string, alpenglow, rpcConfigured, replayDetails, networkDetails, cacheDetails, productionDetails, storageDetails, shredHistory, hostResources, machineDetails, localPeers, fastExecuted bool) *nodeDashboard {
+	return startNodeDashboardWithOrigin(ctx, startedAt, socket, group, runID, network, mode, alpenglow, rpcConfigured, replayDetails, networkDetails, cacheDetails, productionDetails, storageDetails, shredHistory, hostResources, machineDetails, localPeers, fastExecuted, "")
+}
+
+func startNodeDashboardWithOrigin(ctx context.Context, startedAt time.Time, socket, group, runID, network, mode string, alpenglow, rpcConfigured, replayDetails, networkDetails, cacheDetails, productionDetails, storageDetails, shredHistory, hostResources, machineDetails, localPeers, fastExecuted bool, readerOrigin string) *nodeDashboard {
 	if socket == "" {
+		return nil
+	}
+	if fastExecuted && !replayDetails {
 		return nil
 	}
 	if err := validateDashboardLocalPeers(localPeers, socket, networkDetails); err != nil {
@@ -342,7 +369,7 @@ func startNodeDashboard(ctx context.Context, startedAt time.Time, socket, group,
 	d.configureMachineDetails(machineDetails)
 	var feed *dashboard.Feed
 	var err error
-	var details dashboard.DetailSamplers
+	details := dashboard.DetailSamplers{ReaderOrigin: readerOrigin}
 	if machineDetails {
 		details.Machine = d.sampleMachineDetail
 	}
@@ -352,7 +379,15 @@ func startNodeDashboard(ctx context.Context, startedAt time.Time, socket, group,
 			return nil
 		}
 		details.Replay = d.sampleReplayDetail
+		if fastExecuted {
+			if err := d.progress.EnableFastExecuted(); err != nil {
+				mlog.Log.Warnf("dashboard fast execution observations unavailable: %v", err)
+				return nil
+			}
+			details.FastExecuted = d.sampleFastExecuted
+		}
 		details.SelectedWindow = d.sampleSelectedWindow
+		details.ActivityHistory = d.sampleActivityHistory
 		details.RootedHistory = d.sampleRootedHistory
 		details.HeldSchedules = d.sampleHeldSchedules
 	}
@@ -377,7 +412,7 @@ func startNodeDashboard(ctx context.Context, startedAt time.Time, socket, group,
 	if shredHistory {
 		details.Reception = d.enableReceptionHistory()
 	}
-	if replayDetails || networkDetails || cacheDetails || productionDetails || storageDetails || shredHistory || machineDetails {
+	if readerOrigin != "" || replayDetails || networkDetails || cacheDetails || productionDetails || storageDetails || shredHistory || machineDetails {
 		feed, err = dashboard.ListenFeedWithDetails(ctx, socket, group, d.snapshot, details)
 	} else if group == "" {
 		feed, err = dashboard.ListenFeed(ctx, socket, d.snapshot)
@@ -385,10 +420,14 @@ func startNodeDashboard(ctx context.Context, startedAt time.Time, socket, group,
 		feed, err = dashboard.ListenFeedGroup(ctx, socket, group, d.snapshot)
 	}
 	if err != nil {
-		mlog.Log.Warnf("dashboard feed unavailable: %v", err)
+		mlog.Log.Warnf("dashboard private feed unavailable: %v; check socket directory ownership/permissions and feed group provisioning", err)
 		return nil
 	}
 	d.feed = feed
+	mlog.Log.Infof("dashboard private feed listening on %q; use the dashboard reader with an authenticated HTTPS proxy for browser access", socket)
+	if readerOrigin != "" {
+		mlog.Log.Infof("dashboard HTTPS origin advertised to the reader: %q", readerOrigin)
+	}
 	return d
 }
 
@@ -428,14 +467,10 @@ func (d *nodeDashboard) snapshot() dashboard.Snapshot {
 		key := holder.PublicKey().String()
 		s.IdentityKey = &key
 	}
-	if s.Phase == "replaying" {
-		// Replay publishes this atomic frontier after successful execution or
-		// a known skip. Zero before replay initialization is unavailable here.
-		if slot := global.ReplayFrontier(); slot != 0 {
+	if p, ok := d.progress.Snapshot(); ok {
+		if slot := p.Frontier; s.Phase == "replaying" && slot != 0 {
 			s.ReplayFrontier = &slot
 		}
-	}
-	if p, ok := d.progress.Snapshot(); ok {
 		s.Replay = replayMeasurement(p)
 		if a := s.Replay.NextKnownAssignment; a != nil && (s.IdentityKey == nil || a.Identity != *s.IdentityKey) {
 			s.Replay.NextKnownAssignment = nil
@@ -578,6 +613,46 @@ func replayMeasurement(p replay.ProgressSnapshot) *dashboard.Replay {
 		r.AccountFacts = accountFactsMeasurement(p.AccountFacts)
 	}
 	return r
+}
+
+// sampleFastExecuted copies only provisional replay observations.
+func (d *nodeDashboard) sampleFastExecuted() (dashboard.FastExecuted, bool) {
+	if d == nil {
+		return dashboard.FastExecuted{}, false
+	}
+	p, ok := d.progress.Snapshot()
+	if !ok || p.Attempt == 0 || p.ExecutionSequence == 0 {
+		return dashboard.FastExecuted{}, false
+	}
+	d.mu.Lock()
+	run, started := d.state.RunID, d.state.StartedAt
+	var genesis *string
+	if d.state.GenesisHash != nil {
+		value := *d.state.GenesisHash
+		genesis = &value
+	}
+	d.mu.Unlock()
+	rows := p.RecentExecuted()
+	v := dashboard.FastExecuted{SchemaVersion: 1, Family: "recent_executed", Scope: "locally_executed",
+		State: "unavailable", Sequence: p.ExecutionSequence, SampledAt: p.ExecutionAt.UTC(),
+		Binding: dashboard.FastExecutedBinding{RunID: run, GenesisHash: genesis, NodeStartedAt: started.UTC(),
+			Attempt: p.Attempt, Rewinds: p.Rewinds, AttemptStartedAt: p.StartedAt.UTC()},
+		Records: make([]dashboard.ExecutedSlot, 0, len(rows))}
+	for _, row := range rows {
+		record := dashboard.ExecutedSlot{At: row.At, Slot: row.Slot,
+			Bankhash: row.Bankhash.String(), Transactions: row.Transactions, ComputeUnits: row.ComputeUnits,
+			WorkCountersSaturated: row.WorkCountersSaturated}
+		if row.HasBlockID {
+			value := row.BlockID.String()
+			record.BlockID = &value
+		}
+		v.Records = append(v.Records, record)
+	}
+	if len(v.Records) != 0 {
+		v.State = "fresh"
+		v.SampledAt = v.Records[len(v.Records)-1].At
+	}
+	return v, true
 }
 
 func accountFactsMeasurement(f replay.AccountFacts) *dashboard.AccountFacts {

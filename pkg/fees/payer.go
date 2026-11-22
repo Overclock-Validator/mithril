@@ -143,6 +143,30 @@ func ValidateTransactionFeePayer(
 	return feeInfo, nil
 }
 
+// ValidateTransactionFeePayerAccount is ValidateTransactionFeePayer with the
+// fee payer's account state supplied by the caller instead of read from the
+// bank (an early execution that predicts the payer's balance).
+func ValidateTransactionFeePayerAccount(
+	slotCtx *sealevel.SlotCtx,
+	tx *solana.Transaction,
+	instrs []sealevel.Instruction,
+	limits *sealevel.ComputeBudgetLimits,
+	payer *accounts.Account,
+) (*TxFeeInfo, error) {
+	if slotCtx == nil || tx == nil || len(tx.Message.AccountKeys) == 0 || limits == nil || payer == nil {
+		return nil, ErrFeePayerNotFound
+	}
+	feats := slotCtx.Features
+	if feats == nil {
+		feats = features.NewFeaturesDefault()
+	}
+	feeInfo := CalculateTxFees(tx, instrs, limits, feats)
+	if err := ValidateFeePayerWithFeatures(payer, feeInfo.TotalFee, RentForSlot(slotCtx), feats); err != nil {
+		return feeInfo, err
+	}
+	return feeInfo, nil
+}
+
 func loadPayer(slotCtx *sealevel.SlotCtx, pk solana.PublicKey) (*accounts.Account, error) {
 	if slotCtx == nil {
 		return nil, ErrFeePayerNotFound

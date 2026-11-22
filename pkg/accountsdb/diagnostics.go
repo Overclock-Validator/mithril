@@ -18,6 +18,7 @@ type FoldTimings struct {
 	Dedupe       time.Duration // newest-wins union of the batch's slot deltas, disk budget check
 	FileID       time.Duration // fileId allocation and its fsynced high-water mark
 	SegmentWrite time.Duration // segment file write, fsync and directory fsync
+	SegmentSync  time.Duration // the fsync, close and directory fsync alone; part of SegmentWrite, not of the sum
 	UndoCapture  time.Duration // waiting for the undo capture after the segment write
 	UndoLookup   time.Duration // the undo capture itself; it overlaps the steps from dedupe on, so not part of the sum
 	Manifest     time.Duration // manifest tmp write, fsync, rename and directory fsync
@@ -27,8 +28,8 @@ type FoldTimings struct {
 }
 
 func (t FoldTimings) String() string {
-	return fmt.Sprintf("lock_wait=%s dedupe=%s file_id=%s segment_write=%s undo_capture=%s manifest=%s bankhash_rows=%s index_commit=%s cache_refresh=%s undo_lookup=%s",
-		r(t.LockWait), r(t.Dedupe), r(t.FileID), r(t.SegmentWrite), r(t.UndoCapture), r(t.Manifest), r(t.BankhashRows), r(t.IndexCommit), r(t.CacheRefresh), r(t.UndoLookup))
+	return fmt.Sprintf("lock_wait=%s dedupe=%s file_id=%s segment_write=%s segment_sync=%s undo_capture=%s manifest=%s bankhash_rows=%s index_commit=%s cache_refresh=%s undo_lookup=%s",
+		r(t.LockWait), r(t.Dedupe), r(t.FileID), r(t.SegmentWrite), r(t.SegmentSync), r(t.UndoCapture), r(t.Manifest), r(t.BankhashRows), r(t.IndexCommit), r(t.CacheRefresh), r(t.UndoLookup))
 }
 
 func r(d time.Duration) time.Duration { return d.Round(time.Microsecond) }

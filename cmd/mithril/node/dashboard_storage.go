@@ -3,12 +3,15 @@ package node
 import (
 	"errors"
 	"math"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/dashboard"
 )
+
+func physicalCensusEnabled() bool { return os.Getenv("MITHRIL_DASHBOARD_PHYSICAL_CENSUS") == "1" }
 
 func validateDashboardStorageDetails(enabled bool, socket string) error {
 	if enabled && strings.TrimSpace(socket) == "" {
@@ -18,8 +21,10 @@ func validateDashboardStorageDetails(enabled bool, socket string) error {
 }
 
 type storageDashboardMonitor struct {
-	owner   *accountsdb.AccountsDb
-	binding dashboard.StorageDetailBinding
+	owner              *accountsdb.AccountsDb
+	binding            dashboard.StorageDetailBinding
+	operationsPrevious *accountOperationsPoint
+	operationsRetired  bool
 }
 
 func storageMatchesNode(s dashboard.Snapshot, b dashboard.StorageDetailBinding) bool {
@@ -44,23 +49,30 @@ func (d *nodeDashboard) attachStorageOwner(owner *accountsdb.AccountsDb) bool {
 		if m.owner == owner && storageMatchesNode(d.state, m.binding) {
 			return true
 		}
+		m.owner.StopPhysicalUsage()
 		d.storage, d.storageRetired = nil, true
 		return false
 	}
 	o, known := owner.StorageObservation()
-	if !known || d.state.RunID == "" || d.state.StartedAt.IsZero() || d.state.GenesisHash == nil {
+	if !known || d.state.RunID == "" || d.state.StartedAt.IsZero() || d.state.GenesisHash == nil || !owner.EnableAccountOperations() {
 		return false
 	}
 	d.storage = &storageDashboardMonitor{owner: owner, binding: dashboard.StorageDetailBinding{
 		RunID: d.state.RunID, NodeStartedAt: d.state.StartedAt, GenesisHash: *d.state.GenesisHash,
 		DBGeneration: 1, DBOpenedAt: o.OpenedAt.UTC(),
 	}}
+	if physicalCensusEnabled() {
+		owner.EnablePhysicalUsage() // Optional census never gates existing storage details.
+	}
 	return true
 }
 
 func (d *nodeDashboard) stopStorageOwner() {
 	if d != nil {
 		d.mu.Lock()
+		if d.storage != nil {
+			d.storage.owner.StopPhysicalUsage()
+		}
 		d.storage, d.storageRetired = nil, true
 		d.mu.Unlock()
 	}
@@ -75,6 +87,13 @@ func (d *nodeDashboard) sampleStorageDetail(_ time.Time) (dashboard.StorageDetai
 	enabled, retired, m := d.storageDetails, d.storageRetired, d.storage
 	compaction := d.compaction
 	matched := m != nil && storageMatchesNode(d.state, m.binding)
+	var operations *dashboard.AccountOperationsWindow
+	if enabled && !retired && matched {
+		// Serialize the actual counter reads with their baseline update.
+		operationStarted := time.Now()
+		observation, _ := m.owner.StorageObservation()
+		operations = m.accountOperationsWindow(observation.AccountOperations, operationStarted, time.Now())
+	}
 	d.mu.Unlock()
 	if !enabled || retired {
 		return dashboard.StorageDetailCapture{}, errors.New("source_unavailable")
@@ -87,6 +106,11 @@ func (d *nodeDashboard) sampleStorageDetail(_ time.Time) (dashboard.StorageDetai
 	}
 	o, known := m.owner.StorageObservation()
 	cycle, cycleKnown := compaction.snapshot()
+	physical, physicalUntil, physicalKnown := m.owner.PhysicalUsageObservation(time.Now())
+	var ioObservation *dashboardIOObservation
+	if d.io != nil {
+		ioObservation = d.io.latest.Load()
+	}
 	completedAt := time.Now()
 	if !known {
 		return dashboard.StorageDetailCapture{}, errors.New("source_unavailable")
@@ -95,28 +119,42 @@ func (d *nodeDashboard) sampleStorageDetail(_ time.Time) (dashboard.StorageDetai
 	if err != nil {
 		return dashboard.StorageDetailCapture{}, err
 	}
+	if physicalKnown && admitStorageOptional(&capture, completedAt, physicalUntil) {
+		value := &dashboard.StoragePhysicalUsage{Scope: "primary_db_tree_and_secondary_account_trees", StartedAt: physical.StartedAt.UTC(), CompletedAt: physical.CompletedAt.UTC(), DurationNanoseconds: physical.DurationNanoseconds, AllocatedBytes: physical.AllocatedBytes, LogicalFileBytes: physical.LogicalFileBytes, RegularFiles: physical.RegularFiles, Directories: physical.Directories}
+		capture.Detail.PhysicalUsage = value
+	}
 	if cycleKnown {
 		capture.Detail.Inventory = storageInventoryMeasurement(cycle, m.binding.DBOpenedAt)
 		if capture.Detail.Inventory != nil {
 			capture.Detail.Liveness = storageLivenessMeasurement(cycle, m.binding.DBOpenedAt)
 		}
 	}
-	if d.io != nil {
-		if o := d.io.latest.Load(); o != nil && o.freshUntil.After(completedAt) {
-			value := cloneDashboardIO(o.value)
-			capture.Detail.IO = &value
-			if o.freshUntil.Before(capture.FreshUntil) {
-				capture.FreshUntil = o.freshUntil
-			}
-		}
+	if ioObservation != nil && admitStorageOptional(&capture, completedAt, ioObservation.freshUntil) {
+		value := cloneDashboardIO(ioObservation.value)
+		capture.Detail.IO = &value
 	}
 	d.mu.Lock()
 	matched = d.storage == m && d.compaction == compaction && d.storageDetails && !d.storageRetired && storageMatchesNode(d.state, m.binding)
+	if matched {
+		capture.Detail.AccountOperations = operations
+	}
 	d.mu.Unlock()
 	if !matched {
 		return dashboard.StorageDetailCapture{}, errors.New("binding_changed")
 	}
 	return capture, nil
+}
+
+// Admit optional observations only when their original lease can span one node
+// sample interval, one reader poll interval, and two bounded private requests.
+func admitStorageOptional(capture *dashboard.StorageDetailCapture, completedAt, until time.Time) bool {
+	if until.Sub(completedAt) < dashboard.SampleInterval+dashboard.StorageDetailPollInterval+2*time.Second {
+		return false
+	}
+	if until.Before(capture.FreshUntil) {
+		capture.FreshUntil = until
+	}
+	return true
 }
 
 func storageLivenessMeasurement(c compactionObservation, openedAt time.Time) *dashboard.StorageLiveness {

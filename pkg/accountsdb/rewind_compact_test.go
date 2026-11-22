@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
@@ -298,8 +299,12 @@ func TestCompactMovesLiveRespectsPinsAndRewind(t *testing.T) {
 	r4 := commitTestBatch(t, db, 140, foldAcct(1, 103, big), foldAcct(2, 203, big))
 
 	// Horizon 1 pins B4 (in horizon) and B3 (named by B4's undo pointers).
-	stats, err := db.CompactOnce(CompactionConfig{RewindHorizonBatches: 1, MinDeadFraction: 0.5})
+	var relocated atomic.Uint64
+	db.compactHooks.afterCompactManifest = func() { require.Zero(t, relocated.Load()) }
+	db.compactHooks.afterCompactIndex = func() { require.EqualValues(t, hdrLen+8, relocated.Load()) }
+	stats, err := db.CompactOnce(CompactionConfig{RewindHorizonBatches: 1, MinDeadFraction: 0.5, RelocatedBytes: &relocated})
 	require.NoError(t, err)
+	require.EqualValues(t, stats.LiveBytesMoved, relocated.Load())
 	assert.Equal(t, 1, stats.FilesCompacted, "B1 has one live record to move")
 	assert.Equal(t, 1, stats.FilesDeleted, "B2 is fully dead")
 	assert.Positive(t, stats.BytesReclaimed)

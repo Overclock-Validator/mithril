@@ -92,6 +92,10 @@ type VoteVerifyResult struct {
 	Rank       uint16
 	Stake      uint64
 	TotalStake uint64
+	// signature is populated only after successful cryptographic verification.
+	// Its binding lets downstream consumers reuse the parsed point without
+	// trusting a caller-constructed result or a subsequently modified message.
+	signature *verifiedVoteSignature
 }
 
 type VoteSignatureDiagnostics struct {
@@ -740,12 +744,14 @@ func verifyVoteMessageWithSetAndShredVersion(set ValidatorSet, msg VoteMessage, 
 	if err := verifyBLSSignature(pubkey, payload, signature); err != nil {
 		return VoteVerifyResult{}, fmt.Errorf("alpenglow verifier: %s vote for slot %d rank %d failed BLS signature verification: %w", msg.Vote.Type, msg.Vote.Slot, msg.Rank, err)
 	}
-	return VoteVerifyResult{
+	result := VoteVerifyResult{
 		Epoch:      set.Epoch,
 		Rank:       msg.Rank,
 		Stake:      validator.Stake,
 		TotalStake: set.TotalStake,
-	}, nil
+	}
+	result.bindVerifiedSignature(msg, signature)
+	return result, nil
 }
 
 type blsVerifyTerm struct {

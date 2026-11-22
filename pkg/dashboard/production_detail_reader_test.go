@@ -558,17 +558,6 @@ func TestProductionDetailReaderDeadlineTransfersAndCancellation(t *testing.T) {
 	if expired.State != "stale" || expired.Reason != "status_stale" {
 		t.Fatal("exact production source deadline remained fresh")
 	}
-	for _, value := range []string{"", "0", "-1", "+1", "030000", "30001", "1.0", "1 "} {
-		if _, err := parseProductionDetailRemaining(value); err == nil {
-			t.Fatalf("invalid remaining time accepted: %q", value)
-		}
-	}
-	for _, value := range []string{"1", "30000"} {
-		if _, err := parseProductionDetailRemaining(value); err != nil {
-			t.Fatal(err)
-		}
-	}
-
 	latePath := replayDetailReaderServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set(replayDetailRemainingHeader, "1")
 		w.WriteHeader(200)

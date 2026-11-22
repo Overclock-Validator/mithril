@@ -19,6 +19,9 @@ const (
 	replayDetailMinimum     = 13 * time.Second
 )
 
+// Distinguish local capacity pressure from an insufficient original retrieval budget.
+var errReplayDetailCacheFull = errors.New("generation_not_ready")
+
 // ReplayDetailManifest is the concrete private manifest. Reader-derived gaps
 // belong to a separate public DTO, not to this producer observation.
 type ReplayDetailManifest struct {
@@ -84,13 +87,14 @@ type replayDetailGate struct {
 // replayDetailPrepared owns immutable encoded strings. It retains neither the
 // caller's rows nor its genesis pointer. Capture time keeps its monotonic clock.
 type replayDetailPrepared struct {
-	binding      ReplayDetailBinding
-	generation   string
-	capturedAt   time.Time
-	lastSequence uint64
-	manifests    [4]string
-	pages        []string
-	bytes        int
+	binding        ReplayDetailBinding
+	generation     string
+	capturedAt     time.Time
+	lastSequence   uint64
+	manifests      [4]string
+	pages          []string
+	selectedBundle string
+	bytes          int
 }
 
 type replayDetailPublication struct {
@@ -263,7 +267,7 @@ func (c *replayDetailCache) publish(p *replayDetailPrepared, gate replayDetailGa
 			return nil
 		}
 	}
-	return errors.New("generation_not_ready")
+	return errReplayDetailCacheFull
 }
 
 // prune runs only in the background publication path, never during lookup.
@@ -280,6 +284,10 @@ func (c *replayDetailCache) prune(gate replayDetailGate, now time.Time) {
 }
 
 func (c *replayDetailCache) lookup(rawQuery string, forceQuery bool, gate replayDetailGate, now time.Time) replayDetailReply {
+	return c.lookupWithBudget(rawQuery, forceQuery, gate, now, replayDetailMinimum)
+}
+
+func (c *replayDetailCache) lookupWithBudget(rawQuery string, forceQuery bool, gate replayDetailGate, now time.Time, minimum time.Duration) replayDetailReply {
 	generation, page, pageRequest, ok := parseReplayDetailQuery(rawQuery, forceQuery)
 	if !ok {
 		return replayDetailFailure("invalid_request")
@@ -323,7 +331,7 @@ func (c *replayDetailCache) lookup(rawQuery string, forceQuery bool, gate replay
 		return replayDetailReply{status: http.StatusOK, body: selected.prepared.pages[page], publication: selected}
 	}
 	remaining := min(selected.prepared.capturedAt.Add(replayDetailFreshFor).Sub(now), selected.holdUntil.Sub(now))
-	if remaining < replayDetailMinimum {
+	if remaining < minimum {
 		return replayDetailFailure("generation_not_ready")
 	}
 	variant := 0

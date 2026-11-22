@@ -35,6 +35,7 @@ type commonTierShard struct {
 	small                []commonTierSmall
 	activity             [4]uint64 // empty/small lookup hits, then capacity replacements
 	activitySaturated    bool
+	smallCopyBytes       uint64 // payload bytes delivered by small-tier hits; MaxUint64 is unknown
 }
 type commonAccountCache struct {
 	large          *WeightedCache[solana.PublicKey, *accounts.Account]
@@ -141,6 +142,7 @@ func (c *commonAccountCache) Get(k solana.PublicKey) (a *accounts.Account, ok bo
 			e.recent = true
 			if c.recordActivity {
 				s.recordActivity(1)
+				s.smallCopyBytes += min(math.MaxUint64-s.smallCopyBytes, uint64(e.length))
 			}
 			hit = e.commonTierHeader
 			copy(data[:hit.length], e.data[:])

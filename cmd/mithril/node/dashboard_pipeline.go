@@ -54,6 +54,7 @@ func (d *nodeDashboard) schedulerBudgetFor(binding dashboard.ProductionDetailBin
 func pipelineMeasurement(now, startedAt time.Time, stats tpu.Stats, schedulerStats scheduler.Stats, queued int) *dashboard.Pipeline {
 	p := stats.Pipeline
 	evicted, expired := schedulerStats.EvictedCapacity, schedulerStats.DroppedExpired
+	alreadyProcessed := schedulerStats.DroppedAlreadyProcessed
 	m := &dashboard.Pipeline{
 		SampledAt: now.UTC(), StartedAt: startedAt.UTC(),
 		Ingress: dashboard.PipelineIngress{EnqueuedPackets: p.Ingress.EnqueuedPackets, EnqueuedBytes: p.Ingress.EnqueuedBytes, DroppedFull: p.Ingress.DroppedFull},
@@ -69,7 +70,7 @@ func pipelineMeasurement(now, startedAt time.Time, stats tpu.Stats, schedulerSta
 			InPackets: schedulerStats.InPackets, InBytes: schedulerStats.InBytes, BufferedTotal: schedulerStats.Buffered, Accepted: schedulerStats.Accepted,
 			DroppedParse: schedulerStats.DroppedParse, DroppedVote: schedulerStats.DroppedVote, DroppedDuplicate: schedulerStats.DroppedDuplicate,
 			DroppedCapacity: schedulerStats.DroppedCapacity, EvictedCapacity: &evicted, DroppedExpired: &expired,
-			DroppedAlreadyProcessed: schedulerStats.DroppedAlreadyProcessed, DroppedAccountLocks: schedulerStats.DroppedAccountLocks,
+			DroppedAlreadyProcessed: &alreadyProcessed, DroppedAccountLocks: schedulerStats.DroppedAccountLocks,
 			DroppedLookup: schedulerStats.DroppedLookup, DroppedNoBank: schedulerStats.DroppedNoBank,
 			DroppedCost: schedulerStats.DroppedCost, DroppedExecution: schedulerStats.DroppedExecution,
 		},
@@ -79,12 +80,13 @@ func pipelineMeasurement(now, startedAt time.Time, stats tpu.Stats, schedulerSta
 		m.Scheduler.QueueDepth = &depth
 	}
 	if q := stats.QUIC; q != nil {
+		refusedOpen, refusedIP := q.RefusedTooManyOpen.Load(), q.RefusedPerIP.Load()
 		m.QUIC = &dashboard.PipelineQUIC{
 			AcceptedConnections: q.TotalNewConnections.Load(), OpenConnections: q.OpenConnections.Load(),
 			AcceptedStreams: q.TotalNewStreams.Load(), ActiveStreams: q.ActiveStreams.Load(),
 			InvalidStreamSize: q.InvalidStreamSize.Load(), ReadErrors: q.TotalStreamReadErrors.Load(), ReadTimeouts: q.TotalStreamReadTimeout.Load(),
-			AcceptErrors: q.ConnectionSetupError.Load(), RefusedTooManyOpen: q.RefusedTooManyOpen.Load(),
-			RefusedPerIP: q.RefusedPerIP.Load(), StreamBufferDrops: q.ConnectionAddFailed.Load(),
+			AcceptErrors: q.ConnectionSetupError.Load(), RefusedTooManyOpen: &refusedOpen,
+			RefusedPerIP: &refusedIP, StreamBufferDrops: q.ConnectionAddFailed.Load(),
 		}
 	}
 	return m

@@ -99,6 +99,48 @@ func TestCompactionObservationTracksReturnedCycle(t *testing.T) {
 	}
 }
 
+func TestCompactionActivityLifecycle(t *testing.T) {
+	var monitor compactionMonitor
+	if got := compactionMeasurement(&monitor); got.Active != nil || got.ActiveSampleStartedAt != nil || got.ActiveSampleCompletedAt != nil {
+		t.Fatal("unstarted worker reported activity")
+	}
+	c := &observedCompactor{started: make(chan struct{}, 1), replies: make(chan compactionReply)}
+	stop := startAccountsCompactor(context.Background(), c, accountsdb.CompactionConfig{}, time.Hour, &monitor)
+	defer func() { close(c.replies); stop() }()
+	awaitCompaction(t, c)
+	before := time.Now().UTC()
+	got := compactionMeasurement(&monitor)
+	after := time.Now().UTC()
+	if got.Active == nil || !*got.Active || got.LastCompleted != nil {
+		t.Fatal("running cycle was not reported active")
+	}
+	if got.Relocation == nil || got.Relocation.Bytes != 0 {
+		t.Fatal("first cycle did not report measured zero")
+	}
+	monitor.state.Load().relocation.bytes.Store(4096)
+	next := compactionMeasurement(&monitor)
+	if next.Relocation == nil || next.Relocation.Bytes != 4096 || !next.Relocation.SessionStartedAt.Equal(got.Relocation.SessionStartedAt) ||
+		next.Relocation.ElapsedNanoseconds < got.Relocation.ElapsedNanoseconds || next.LastCompleted != nil {
+		t.Fatal("the in-progress counter did not advance in the existing session")
+	}
+	if got.ActiveSampleStartedAt == nil || got.ActiveSampleCompletedAt == nil ||
+		got.ActiveSampleStartedAt.Before(before) || got.ActiveSampleCompletedAt.After(after) ||
+		got.ActiveSampleCompletedAt.Before(*got.ActiveSampleStartedAt) ||
+		got.ActiveSampleCompletedAt.Sub(*got.ActiveSampleStartedAt) > time.Second {
+		t.Fatal("owner-state read was not bracketed by its own observation dates")
+	}
+	c.replies <- compactionReply{}
+	awaitCompactionObservation(t, &monitor, time.Time{})
+	if got := compactionMeasurement(&monitor); got.Active == nil || *got.Active || got.LastCompleted == nil ||
+		got.ActiveSampleStartedAt == nil || got.ActiveSampleCompletedAt == nil {
+		t.Fatal("waiting worker did not report its completed cycle and idle state")
+	}
+	stop()
+	if got := compactionMeasurement(&monitor); got.Active != nil || got.ActiveSampleStartedAt != nil || got.ActiveSampleCompletedAt != nil || got.Relocation != nil || got.LastCompleted == nil {
+		t.Fatal("stopped worker reported current activity or lost its completed cycle")
+	}
+}
+
 func TestCompactionObservationReplacementStartsUnknown(t *testing.T) {
 	var monitor compactionMonitor
 	old := time.Now().Add(-time.Hour)

@@ -185,16 +185,25 @@ type TPUQueueGauge struct {
 	Capacity uint64 `json:"capacity,string"`
 }
 
+// TPUSigverifyWorkers counts batch passes from receipt through final handoff,
+// including blocked output. It is neither CPU utilization nor packets in flight.
+type TPUSigverifyWorkers struct {
+	BatchesInFlight uint64                   `json:"batches_in_flight,string"`
+	Configured      uint64                   `json:"configured,string"`
+	Passes          []TPUSigverifyWorkerPass `json:"passes,omitempty"`
+}
+
 // TPUQueuesDetail preserves independent point samples from the attached TPU's
 // original channels. It is neither an atomic backlog nor time spent full.
 type TPUQueuesDetail struct {
-	Scope       string        `json:"scope"`
-	Generation  uint64        `json:"generation,string"`
-	StartedAt   time.Time     `json:"started_at"`
-	SampledAt   time.Time     `json:"sampled_at"`
-	Ingress     TPUQueueGauge `json:"ingress"`
-	DedupOutput TPUQueueGauge `json:"dedup_output"`
-	Verified    TPUQueueGauge `json:"verified"`
+	Scope            string               `json:"scope"`
+	Generation       uint64               `json:"generation,string"`
+	StartedAt        time.Time            `json:"started_at"`
+	SampledAt        time.Time            `json:"sampled_at"`
+	Ingress          TPUQueueGauge        `json:"ingress"`
+	DedupOutput      TPUQueueGauge        `json:"dedup_output"`
+	Verified         TPUQueueGauge        `json:"verified"`
+	SigverifyWorkers *TPUSigverifyWorkers `json:"sigverify_workers,omitempty"`
 }
 
 // ConsensusClockDetail is the existing bounded local production-clock estimate,
@@ -464,6 +473,9 @@ func validateNodeNetworkDetail(d NodeNetworkDetail) error {
 			if gauge.Capacity == 0 || gauge.Length > gauge.Capacity {
 				return errors.New("source_invalid")
 			}
+		}
+		if w := q.SigverifyWorkers; w != nil && (w.Configured == 0 || w.BatchesInFlight > w.Configured || !validTPUSigverifyWorkerPasses(w, q.StartedAt, q.SampledAt, d.CapturedAt)) {
+			return errors.New("source_invalid")
 		}
 	}
 	if c := d.LiveClock; c != nil {

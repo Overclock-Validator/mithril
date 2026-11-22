@@ -39,18 +39,20 @@ type StorageStoreDetail struct {
 // StorageDetail contains independent fixed copies of the runtime index and
 // bank-hash store. Earlier snapshot/format-upgrade handles are outside its scope.
 type StorageDetail struct {
-	SchemaVersion int                  `json:"schema_version"`
-	Family        string               `json:"family"`
-	Scope         string               `json:"scope"`
-	State         string               `json:"state"`
-	Reason        string               `json:"reason"`
-	Binding       StorageDetailBinding `json:"binding"`
-	CapturedAt    time.Time            `json:"captured_at"`
-	Index         StorageStoreDetail   `json:"index"`
-	BankHash      StorageStoreDetail   `json:"bankhash"`
-	IO            *StorageIODetail     `json:"io,omitempty"`
-	Inventory     *StorageInventory    `json:"inventory,omitempty"`
-	Liveness      *StorageLiveness     `json:"liveness,omitempty"`
+	SchemaVersion     int                      `json:"schema_version"`
+	Family            string                   `json:"family"`
+	Scope             string                   `json:"scope"`
+	State             string                   `json:"state"`
+	Reason            string                   `json:"reason"`
+	Binding           StorageDetailBinding     `json:"binding"`
+	CapturedAt        time.Time                `json:"captured_at"`
+	Index             StorageStoreDetail       `json:"index"`
+	BankHash          StorageStoreDetail       `json:"bankhash"`
+	IO                *StorageIODetail         `json:"io,omitempty"`
+	Inventory         *StorageInventory        `json:"inventory,omitempty"`
+	Liveness          *StorageLiveness         `json:"liveness,omitempty"`
+	AccountOperations *AccountOperationsWindow `json:"account_operations,omitempty"`
+	PhysicalUsage     *StoragePhysicalUsage    `json:"physical_usage,omitempty"`
 }
 
 // StorageLiveness describes only completely scanned candidates in one cycle.
@@ -118,7 +120,7 @@ func validateStorageDetail(d StorageDetail) error {
 		d.State != "fresh" || d.Reason != "" || !utf8.ValidString(b.RunID) || b.RunID == "" || len(b.RunID) > 128 ||
 		b.DBGeneration == 0 || b.DBGeneration == math.MaxUint64 || !validReplayDetailHash(b.GenesisHash, true) ||
 		!validReplayDetailTime(b.NodeStartedAt) || !validReplayDetailTime(b.DBOpenedAt) || !validReplayDetailTime(d.CapturedAt) ||
-		!validStorageStore(d.Index) || !validStorageStore(d.BankHash) || !validStorageIO(d.IO, d.CapturedAt) {
+		!validStorageStore(d.Index) || !validStorageStore(d.BankHash) || !validStorageIO(d.IO, d.CapturedAt) || !validAccountOperationsWindow(d.AccountOperations, b.DBOpenedAt, d.CapturedAt) || !validStoragePhysicalUsage(d.PhysicalUsage, b.DBOpenedAt, d.CapturedAt) {
 		return errors.New("source_invalid")
 	}
 	if i := d.Inventory; i != nil && (i.Scope != "compaction_tracked_view_before_processing" ||

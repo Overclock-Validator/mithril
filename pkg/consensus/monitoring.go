@@ -143,10 +143,15 @@ func (v *alpenglowVoter) publishMonitoring(stats VotingStats) {
 	s := &VotingObservation{
 		At: time.Now().UTC(), Identity: v.node, VoteAccount: v.voteAccount, JoinedLive: v.votingStarted,
 		VotesCast: stats.VotesCastThisRun, NetworkLanded: stats.NetworkLandedVotes,
-		LastNetworkLandedSlot: stats.LastNetworkLandedSlot, LastNetworkLandedAt: stats.LastNetworkLandedAt,
 		MessagesQueued: stats.BroadcastMessagesQueued, MessagesDropped: stats.BroadcastMessagesDropped,
 		PeerSendErrors: stats.BroadcastPeerSendErrors, PeerQueueDrops: stats.BroadcastPeerQueueDrops,
 		SendTimeouts: stats.BroadcastPeerSendTimeouts, DesiredPeers: stats.BroadcastDesiredPeers, Connections: stats.BroadcastActiveConnections,
+	}
+	v.landingMu.RLock()
+	landedForIdentity := v.landedForIdentity && stats.LastNetworkLandedSlot == v.stats.LastNetworkLandedSlot && stats.LastNetworkLandedAt.Equal(v.stats.LastNetworkLandedAt)
+	v.landingMu.RUnlock()
+	if landedForIdentity {
+		s.LastNetworkLandedSlot, s.LastNetworkLandedAt = stats.LastNetworkLandedSlot, stats.LastNetworkLandedAt
 	}
 	if v.engine.votorPayloadMonitoring && stats.BroadcastApplicationPayload != nil {
 		s.HasApplicationPayload, s.ApplicationPayload = true, *stats.BroadcastApplicationPayload

@@ -15,6 +15,9 @@ const MaxBufferedTxns = 2 * 65536
 type entry struct {
 	tx       *solana.Transaction
 	prepared *replay.PreparedTransaction
+	// preparationSlot owns one token in the scheduler's bounded preparation
+	// cache, including while the drain loop temporarily owns this entry.
+	preparationSlot bool
 	// wire is an owned copy of the packet bytes. Parsed tx fields may alias it
 	// (solana-go decoder slices), so it must outlive any use of tx.
 	wire        []byte
@@ -193,6 +196,28 @@ func (b *Buffer) Cleanup(drop func(*entry) bool) int {
 		}
 	}
 	return dropped
+}
+
+// cleanupSome bounds background maintenance's lock hold and drain-loop work.
+// Heap mutation can move an entry behind the cursor, so callers repeat a full
+// scan after a chunk that removes entries. The cursor owns no entry pointers.
+func (b *Buffer) cleanupSome(cursor, budget int, drop func(*entry) bool) (next, inspected, dropped int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for inspected < budget && len(b.max) > 0 {
+		if cursor >= len(b.max) {
+			cursor = 0
+		}
+		e := b.max[cursor]
+		inspected++
+		if drop(e) {
+			b.killLocked(e)
+			dropped++
+		} else {
+			cursor++
+		}
+	}
+	return cursor, inspected, dropped
 }
 
 func (b *Buffer) pushAliveLocked(e *entry) {

@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -40,6 +41,8 @@ type fixture struct {
 	performanceCalls atomic.Int32
 	performanceLimit int
 	invalidGossip    bool
+	rpcNodes         []rpcNode
+	gossipCalls      atomic.Int32
 	clockAdvance     time.Duration
 	clockOffset      atomic.Int64
 }
@@ -119,6 +122,11 @@ func (f *fixture) collector(t *testing.T) (*collector, *bytes.Buffer) {
 				}
 				result = map[string]any{"current": current, "delinquent": []voteAccount{}}
 			case "getClusterNodes":
+				f.gossipCalls.Add(1)
+				if f.rpcNodes != nil {
+					result = f.rpcNodes
+					break
+				}
 				if f.invalidGossip {
 					result = nil
 					break
@@ -126,7 +134,7 @@ func (f *fixture) collector(t *testing.T) (*collector, *bytes.Buffer) {
 				var nodes []rpcNode
 				for i, id := range testIdentities {
 					addr := "8.8.8.8:8001"
-					nodes = append(nodes, rpcNode{id, &addr})
+					nodes = append(nodes, rpcNode{Identity: id, Gossip: &addr})
 					if i > 0 {
 						addr = "127.0.0.1:8001"
 						nodes[i].Gossip = &addr
@@ -681,7 +689,14 @@ func TestSnapshotAtomicRoundTripAndStrictRead(t *testing.T) {
 			t.Fatalf("unclean/relative write accepted: %s", bad)
 		}
 	}
-	for _, tc := range []struct{ name, body string }{{"unknown field", strings.TrimSuffix(string(before), "}\n") + `,"ip":"8.8.8.8"}`}, {"trailing JSON", string(before) + "{}"}, {"invalid UTF8", string([]byte{0xff})}, {"oversized", strings.Repeat(" ", MaxBytes+1)}} {
+	for _, tc := range []struct{ name, body string }{
+		{"unknown field", strings.TrimSuffix(string(before), "}\n") + `,"ip":"8.8.8.8"}`},
+		{"invented validator FAST", strings.Replace(string(before), `"validators":[{`, `"validators":[{"fast":{"provider":"puffin"},`, 1)},
+		{"null validator FAST", strings.Replace(string(before), `"validators":[{`, `"validators":[{"fast":null,`, 1)},
+		{"trailing JSON", string(before) + "{}"},
+		{"invalid UTF8", string([]byte{0xff})},
+		{"oversized", strings.Repeat(" ", MaxBytes+1)},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if err := os.WriteFile(path, []byte(tc.body), 0600); err != nil {
 				t.Fatal(err)
@@ -736,7 +751,6 @@ func TestValidateNegativeBounds(t *testing.T) {
 		{"leading zero", func(s *Snapshot) { s.Validators[0].Inclusion[0].Included = "01" }},
 		{"nonfinite percentage", func(s *Snapshot) { n := math.Inf(1); s.Validators[0].CommissionPercent = &n }},
 		{"country without source", func(s *Snapshot) { s.Validators[0].CountryCode = "US"; s.Validators[0].CountrySource = "" }},
-		{"invented FAST", func(s *Snapshot) { s.Validators[0].Fast = &FastScore{Provider: "puffin"} }},
 		{"extra window", func(s *Snapshot) {
 			s.Validators[0].Inclusion = append(s.Validators[0].Inclusion, s.Validators[0].Inclusion[0])
 		}},
@@ -778,5 +792,111 @@ func TestValidateNegativeBounds(t *testing.T) {
 func TestUnsupportedProfileDoesNotCollect(t *testing.T) {
 	if _, err := Collect(context.Background(), "http://127.0.0.1/"); err == nil {
 		t.Fatal("arbitrary URL accepted as profile")
+	}
+}
+
+func TestObservedRPCNodes(t *testing.T) {
+	f := newFixture()
+	f.rpcNodes = []rpcNode{{Identity: testIdentities[0], RPC: json.RawMessage(`"203.0.113.7:8899"`)}, {Identity: testIdentities[1], RPC: json.RawMessage(`null`)}}
+	c, logs := f.collector(t)
+	s, err := c.collect(context.Background())
+	if err != nil || s.RPCNodes == nil || s.RPCNodes.Advertised != "1" || !s.RPCNodes.ObservedAt.Equal(f.now) || f.gossipCalls.Load() != 1 {
+		t.Fatalf("observation=%+v calls=%d err=%v", s.RPCNodes, f.gossipCalls.Load(), err)
+	}
+	encoded := string(marshal(t, s)) + logs.String()
+	if strings.Contains(encoded, "203.0.113.7") {
+		t.Fatal("RPC address persisted or logged")
+	}
+
+	// A reader using the exact pre-field Snapshot shape rejects the new writer.
+	// omitempty preserves old writer output, not old reader compatibility with a present field.
+	shape := reflect.TypeOf(Snapshot{})
+	fields := make([]reflect.StructField, 0, shape.NumField()-1)
+	for i := 0; i < shape.NumField(); i++ {
+		field := shape.Field(i)
+		if field.Name != "RPCNodes" {
+			fields = append(fields, field)
+		}
+	}
+	legacy := reflect.New(reflect.StructOf(fields)).Interface()
+	decoder := json.NewDecoder(bytes.NewReader(marshal(t, s)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(legacy); err == nil || !strings.Contains(err.Error(), `unknown field "rpc_nodes"`) {
+		t.Fatalf("legacy reader accepted new writer: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "cluster.json")
+	if err := WriteFile(path, s); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ReadFile(path); err != nil || got.RPCNodes == nil || got.RPCNodes.Advertised != "1" {
+		t.Fatalf("new reader rejected new writer: %+v %v", got.RPCNodes, err)
+	}
+	oldWriter := s
+	oldWriter.RPCNodes = nil
+	decoder = json.NewDecoder(bytes.NewReader(marshal(t, oldWriter)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(legacy); err != nil {
+		t.Fatal("legacy output no longer accepted", err)
+	}
+	if err := WriteFile(path, oldWriter); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ReadFile(path); err != nil || got.RPCNodes != nil {
+		t.Fatalf("new reader rejected old writer/unknown: %+v %v", got.RPCNodes, err)
+	}
+	for name, change := range map[string]func(*Snapshot){
+		"bad count":      func(s *Snapshot) { s.RPCNodes.Advertised = "01" },
+		"oversize":       func(s *Snapshot) { s.RPCNodes.Advertised = "8193" },
+		"old receipt":    func(s *Snapshot) { s.RPCNodes.ObservedAt = s.CapturedAt.Add(-MaxAge - time.Nanosecond) },
+		"future receipt": func(s *Snapshot) { s.RPCNodes.ObservedAt = s.CapturedAt.Add(time.Second) },
+		"unbound RPC": func(s *Snapshot) {
+			provider(s, "rpc").State = "invalid"
+			provider(s, "rpc").Reason = "invalid_payload"
+			provider(s, "rpc").Binding = ""
+			provider(s, "rpc").GenesisHash = ""
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			copy := s
+			value := *s.RPCNodes
+			copy.RPCNodes = &value
+			copy.Providers = append([]ProviderStatus(nil), s.Providers...)
+			change(&copy)
+			if Validate(copy) == nil {
+				t.Fatal("invalid optional observation accepted")
+			}
+		})
+	}
+}
+
+func TestAdvertisedRPCNodes(t *testing.T) {
+	good := func(id string, raw string) rpcNode { return rpcNode{Identity: id, RPC: json.RawMessage(raw)} }
+	for _, tc := range []struct {
+		name string
+		rows []rpcNode
+		want string
+	}{
+		{"observed zero", []rpcNode{good(testIdentities[0], `null`)}, "0"},
+		{"dedup identity", []rpcNode{good(testIdentities[0], `"203.0.113.7:8899"`), good(testIdentities[0], `"[2001:db8::1]:8899"`)}, "1"},
+		{"missing", []rpcNode{good(testIdentities[0], ``)}, ""},
+		{"invalid type", []rpcNode{good(testIdentities[0], `42`)}, ""},
+		{"invalid address", []rpcNode{good(testIdentities[0], `"not-an-address"`)}, ""},
+		{"zero port", []rpcNode{good(testIdentities[0], `"203.0.113.7:0"`)}, ""},
+		{"mapped unspecified address", []rpcNode{good(testIdentities[0], `"[::ffff:0.0.0.0]:8899"`)}, ""},
+		{"conflicting identity", []rpcNode{good(testIdentities[0], `null`), good(testIdentities[0], `"203.0.113.7:8899"`)}, ""},
+		{"bad identity", []rpcNode{good("invalid", `null`)}, ""},
+		{"unavailable", nil, ""},
+		{"empty complete", []rpcNode{}, "0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := advertisedRPCNodes(tc.rows)
+			if tc.want == "" {
+				if got != nil {
+					t.Fatal("unknown aggregate invented")
+				}
+			} else if got == nil || string(*got) != tc.want {
+				t.Fatalf("count=%v want%s", got, tc.want)
+			}
+		})
 	}
 }

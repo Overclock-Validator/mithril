@@ -169,7 +169,7 @@ func TestEpochTargetTimingImmutableAttemptAndFork(t *testing.T) {
 	require.True(t, ok)
 	snapshot.Completed.EpochTargetTiming.CurrentNanoseconds = 1
 	f.DisableFeature(features.ReduceSlotTimeTo200ms)
-	p.skipped(0, false)
+	p.skipped(completed.Slot+1, 0, false)
 	p.phase("halted")
 	snapshot, _ = p.Snapshot()
 	require.Equal(t, completed.EpochTargetTiming, snapshot.Completed.EpochTargetTiming)

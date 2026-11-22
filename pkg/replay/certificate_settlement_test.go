@@ -158,11 +158,11 @@ func TestCertificateSettlementRewindAndProgressCopy(t *testing.T) {
 	require.Zero(t, r.Snapshot().Gaps)
 	var progress Progress
 	progress.begin(5, nil)
-	progress.certificateOutcomes(r.Snapshot())
+	progress.restored(16, r.Snapshot())
 	old, ok := progress.Snapshot()
 	require.True(t, ok)
 	r.loseCoverage(time.Unix(101, 0))
-	progress.certificateOutcomes(r.Snapshot())
+	progress.restored(16, r.Snapshot())
 	require.False(t, old.CertificateOutcomes.CoverageIncomplete)
 	progress.begin(5, nil)
 	current, ok := progress.Snapshot()

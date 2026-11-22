@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -220,6 +221,7 @@ type collector struct {
 	statusUpdate     atomic.Pointer[statusFrameUpdate]
 	public           bool
 	publicOptions    PublicOptions
+	expectedOrigin   string
 	throughput       Throughput // owned by the collection loop, never by viewers
 	resourceCPU      resourceCPURate
 	history          *historyService
@@ -227,6 +229,7 @@ type collector struct {
 	display          *nodeDisplayOwner
 	machine          *machineDetailReader
 	detailGate       atomic.Pointer[replayDetailGate]
+	fast             *fastExecutedReader
 	networkGate      atomic.Pointer[networkDetailGate]
 	cacheGate        atomic.Pointer[cacheDetailGate]
 	productionGate   atomic.Pointer[productionDetailGate]
@@ -289,7 +292,7 @@ func statusLease(header http.Header) (time.Duration, bool, bool) {
 	return time.Duration(milliseconds) * time.Millisecond, true, true
 }
 
-func (c *collector) poll(ctx context.Context, now time.Time) {
+func (c *collector) poll(ctx context.Context, now time.Time) string {
 	previous := c.last
 	collectionStarted := time.Now()
 	var receivedAt, observedAgeEnd, observedLeaseEnd time.Time
@@ -330,6 +333,20 @@ func (c *collector) poll(ctx context.Context, now time.Time) {
 		if valid && sameRun && (snapshot.SampledAt.Before(c.lastAcceptedAt) || c.statusLeaseSeen && !hasLease ||
 			snapshot.SampledAt.Equal(c.lastAcceptedAt) && sum != c.lastAcceptedSum) {
 			valid = false
+		}
+		if valid && c.expectedOrigin != "" {
+			origins := response.Header.Values(readerOriginHeader)
+			if len(origins) != 1 || origins[0] != c.expectedOrigin {
+				valid = false
+				repeated := sameRun && snapshot.SampledAt.Equal(c.lastAcceptedAt)
+				priorCurrent := !repeated || statusLeaseContinuous(c.statusSampleEnd.Sub(receivedAt), c.statusSampleWall.Sub(receivedAt.Round(0)))
+				if priorCurrent && !c.clockUncertain.Load() && clusterClockConsistent(c.clockOrigin, receivedAt) &&
+					currentManagedSample(collectionStarted, receivedAt, now, snapshot.SampledAt, remaining, hasLease) {
+					// A new origin invalidates the previous host's cached observations before shutdown.
+					c.last = nil
+					state, reason = "unavailable", readerOriginChanged
+				}
+			}
 		}
 		if valid {
 			sampleAccepted = true
@@ -502,7 +519,9 @@ func (c *collector) poll(ctx context.Context, now time.Time) {
 	if err == nil {
 		c.publishStatusFrame(encoded)
 		if c.history != nil {
-			c.history.offer(encoded.publicJSON, now)
+			safetyFault := c.last != nil && c.last.Consensus != nil &&
+				c.last.Consensus.SafetyFault != nil && *c.last.Consensus.SafetyFault
+			c.history.offer(encoded.publicJSON, now, safetyFault)
 		}
 	} else {
 		c.publishStatusFrame(nil)
@@ -516,6 +535,7 @@ func (c *collector) poll(ctx context.Context, now time.Time) {
 			c.display.publish(frame, time.Now())
 		}
 	}
+	return reason
 }
 
 // observeReplayDetailStatus publishes detached context after status encoding.
@@ -751,10 +771,11 @@ func (c *collector) encode(s *Snapshot, state string, now time.Time) (*frameSet,
 }
 
 // Serve connects to one fixed local node feed. The browser cannot select a
-// source, filesystem path, RPC method or node operation. Sharing requires a
-// separately configured authenticated proxy; this listener is loopback-only.
+// source, filesystem path, RPC method or node operation. This listener is
+// loopback-only and rejects proxy-marked requests. Use SSH forwarding for
+// private access, or configure the public projection for a reverse proxy.
 func Serve(ctx context.Context, socket, address string) error {
-	return listen(ctx, socket, address, "", PublicOptions{})
+	return listen(ctx, socket, address, "", PublicOptions{}, false)
 }
 
 // PublicOptions enables additional disclosure. All fields default off.
@@ -763,6 +784,7 @@ type PublicOptions struct {
 	Peers             bool
 	LocalPeers        bool
 	ReplayDetails     bool
+	FastExecuted      bool
 	NetworkDetails    bool
 	CacheDetails      bool
 	ProductionDetails bool
@@ -782,6 +804,14 @@ func ServePublic(ctx context.Context, socket, address, origin string) error {
 
 // ServePublicWithOptions adds only the explicitly enabled public data groups.
 func ServePublicWithOptions(ctx context.Context, socket, address, origin string, options PublicOptions) error {
+	if err := ValidateManagedOrigin(origin); err != nil {
+		return err
+	}
+	return listen(ctx, socket, address, origin, options, false)
+}
+
+// ValidatePublicOrigin checks the exact HTTPS origin used by the reader and gateway.
+func ValidatePublicOrigin(origin string) error {
 	u, err := url.Parse(origin)
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.Hostname() == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.ForceQuery || strings.Contains(origin, "#") || strings.ContainsAny(u.Host, "\\ \t\r\n") {
 		return errors.New("dashboard public origin must be an HTTPS origin")
@@ -794,22 +824,29 @@ func ServePublicWithOptions(ctx context.Context, socket, address, origin string,
 	} else if strings.HasSuffix(u.Host, ":") {
 		return errors.New("dashboard public origin has an invalid port")
 	}
-	return listen(ctx, socket, address, origin, options)
+	return nil
 }
 
-func listen(ctx context.Context, socket, address, origin string, options PublicOptions) error {
+func validateReaderAddress(socket, address string) error {
 	if !filepath.IsAbs(socket) {
 		return errors.New("dashboard node socket must be an absolute path")
 	}
 	host, _, err := net.SplitHostPort(address)
-	if err != nil || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() {
+	if err != nil || !net.ParseIP(host).IsLoopback() {
 		return errors.New("dashboard address must be a loopback IP and port")
+	}
+	return nil
+}
+
+func listen(ctx context.Context, socket, address, origin string, options PublicOptions, fromNode bool) error {
+	if err := validateReaderAddress(socket, address); err != nil {
+		return err
 	}
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		return err
 	}
-	return serveProfile(ctx, socket, listener, origin, options)
+	return serveReader(ctx, socket, listener, origin, options, fromNode)
 }
 
 func serve(ctx context.Context, socket string, listener net.Listener) error {
@@ -817,7 +854,14 @@ func serve(ctx context.Context, socket string, listener net.Listener) error {
 }
 
 func serveProfile(ctx context.Context, socket string, listener net.Listener, origin string, options PublicOptions) error {
+	return serveReader(ctx, socket, listener, origin, options, false)
+}
+
+func serveReader(ctx context.Context, socket string, listener net.Listener, origin string, options PublicOptions, fromNode bool) error {
 	defer listener.Close()
+	if options.FastExecuted && !options.ReplayDetails {
+		return errors.New("dashboard fast execution observations require replay details")
+	}
 	if options.LocalPeers && origin == "" {
 		return errors.New("dashboard local peers require the public profile")
 	}
@@ -853,6 +897,9 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 	c := newCollector(socket)
 	c.public = origin != ""
 	c.publicOptions = options
+	if fromNode {
+		c.expectedOrigin = origin
+	}
 	defer c.client.CloseIdleConnections()
 	initial, err := c.encode(nil, "unavailable", time.Now().UTC())
 	if err != nil {
@@ -891,6 +938,13 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 			manifestLimit: rate.NewLimiter(4, 8), dataLimit: rate.NewLimiter(0.2, 2), active: make(chan struct{}, 2)}
 		details.selected = &selectedWindowReader{client: details.client, gate: &c.detailGate,
 			limit: rate.NewLimiter(16, 32), active: make(chan struct{}, 4)}
+		details.selected.activity, err = newActivityHistoryReader(details.selected)
+		if err != nil {
+			return err
+		}
+		if options.FastExecuted {
+			c.fast = newFastExecutedReader(c.client, &c.detailGate)
+		}
 	}
 	var network *networkDetailReader
 	if options.NetworkDetails {
@@ -950,11 +1004,22 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 		}
 	}
 	collected := make(chan struct{})
+	originChanged := false
+	poll := func() {
+		if c.poll(ctx, time.Now().UTC()) == readerOriginChanged {
+			originChanged = true
+			cancel()
+		}
+	}
 	go func() {
 		defer close(collected)
-		c.poll(ctx, time.Now().UTC())
+		poll()
 		if details != nil {
 			go details.run(ctx)
+			go details.selected.activity.run(ctx)
+		}
+		if c.fast != nil {
+			go c.fast.run(ctx)
 		}
 		if network != nil {
 			go network.run(ctx)
@@ -984,12 +1049,15 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				c.poll(ctx, time.Now().UTC())
+				poll()
 			}
 		}
 	}()
 	if details != nil {
-		defer func() { cancel(); <-details.done }()
+		defer func() { cancel(); <-details.done; <-details.selected.activity.done }()
+	}
+	if c.fast != nil {
+		defer func() { cancel(); <-c.fast.done }()
 	}
 	if network != nil {
 		defer func() { cancel(); <-network.done }()
@@ -1112,7 +1180,7 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 					return c.admitLiveDetail(statusReplay, stamp, readGate, time.Now())
 				})
 			})
-			mux.HandleFunc("/api/v1/details/selected", func(w http.ResponseWriter, r *http.Request) {
+			selectedHandler := func(w http.ResponseWriter, r *http.Request) {
 				if !allowed(r) {
 					http.Error(w, "host or origin not allowed", http.StatusForbidden)
 					return
@@ -1120,7 +1188,27 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 				details.selected.serveHTTP(w, r, func(stamp statusStamp, readGate func() (statusStamp, bool)) (time.Duration, bool) {
 					return c.admitLiveDetail(statusReplay, stamp, readGate, time.Now())
 				})
+			}
+			mux.HandleFunc("/api/v1/details/selected", selectedHandler)
+			mux.HandleFunc("/api/v1/details/selected-window", selectedHandler)
+			mux.HandleFunc("/api/v1/details/activity-history", func(w http.ResponseWriter, r *http.Request) {
+				if !allowed(r) {
+					http.Error(w, "host or origin not allowed", http.StatusForbidden)
+					return
+				}
+				details.selected.activity.serveHTTP(w, r, func(stamp statusStamp, readGate func() (statusStamp, bool)) (time.Duration, bool) {
+					return c.admitLiveDetail(statusReplay, stamp, readGate, time.Now())
+				})
 			})
+			if c.fast != nil {
+				mux.HandleFunc("/api/v1/details/recent-executed", func(w http.ResponseWriter, r *http.Request) {
+					if !allowed(r) {
+						http.Error(w, "host or origin not allowed", http.StatusForbidden)
+						return
+					}
+					c.fast.serveHTTP(w, r, c)
+				})
+			}
 		}
 		if network != nil {
 			mux.HandleFunc("/api/v1/details/network", func(w http.ResponseWriter, r *http.Request) {
@@ -1236,7 +1324,9 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 		})
 	}
 	mux.HandleFunc("/websocket", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || (r.URL.RawQuery != "" && (!c.public || snapshotProfile(r.URL.RawQuery) == 0)) || c.public && r.URL.ForceQuery || r.ContentLength != 0 || len(r.TransferEncoding) != 0 {
+		fastV2 := c.public && c.fast != nil && r.URL.RawQuery == fastExecutedV2Query
+		fastV1 := c.public && c.fast != nil && r.URL.RawQuery == fastExecutedV1Query
+		if r.Method != http.MethodGet || (r.URL.RawQuery != "" && !fastV1 && !fastV2 && (!c.public || snapshotProfile(r.URL.RawQuery) == 0)) || c.public && r.URL.ForceQuery || r.ContentLength != 0 || len(r.TransferEncoding) != 0 {
 			http.Error(w, "unsupported request", http.StatusBadRequest)
 			return
 		}
@@ -1264,6 +1354,10 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 		sessions.Add(1)
 		sessionMu.Unlock()
 		defer sessions.Done()
+		if fastV1 || fastV2 {
+			streamFastExecutedV2(ctx, conn, c, fastV2)
+			return
+		}
 		streamProfile(ctx, conn, c, snapshotProfile(r.URL.RawQuery))
 	})
 	var handler http.Handler = mux
@@ -1295,6 +1389,9 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 2 * time.Second, ReadTimeout: 5 * time.Second,
 		WriteTimeout: 5 * time.Second, IdleTimeout: 5 * time.Second, MaxHeaderBytes: 4096}
 	stopped := make(chan struct{})
+	if fromNode {
+		slog.Info("dashboard reader listening", "url", origin, "upstream", listener.Addr().String())
+	}
 	go func() { <-ctx.Done(); _ = server.Close(); close(stopped) }()
 	err = server.Serve(netutil.LimitListener(inputLimitedListener{listener}, 32))
 	sessionMu.Lock()
@@ -1306,6 +1403,9 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 	// HTTP Close does not join hijacked handlers. Closing the admission gate
 	// before waiting prevents a concurrent upgrade from adding a late session.
 	sessions.Wait()
+	if originChanged {
+		return errors.New("dashboard feed origin changed or was removed; restart the managed reader to reload it")
+	}
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
@@ -1418,6 +1518,34 @@ func watchStatusFrames(conn *websocket.Conn, profile int, active, writing *atomi
 			timer.Stop()
 		}
 	}
+}
+
+// currentFastHint reselects once if a publication changes after selection.
+// A nil publication with settled=true means stable unavailability;
+// settled=false requires the caller to close rather than retain old data.
+func (c *collector) currentFastHint(p *fastExecutedPublication) (*fastExecutedPublication, time.Duration, bool) {
+	for range 2 {
+		remaining, admitted := time.Duration(0), false
+		if p != nil {
+			remaining, admitted = c.admitLiveDetail(statusReplay, p.stamp, func() (statusStamp, bool) {
+				g := c.detailGate.Load()
+				if g == nil {
+					return statusStamp{}, false
+				}
+				now := time.Now()
+				return g.stamp, c.fast.latest.Load() == p && p.freshUntil.After(now) && fastMatchesGate(p.value, g, now)
+			}, time.Now())
+		}
+		if !admitted || p == nil || !p.freshUntil.After(time.Now()) {
+			if latest := c.fast.latest.Load(); latest != p {
+				p = latest
+				continue
+			}
+			return nil, 0, true
+		}
+		return p, remaining, true
+	}
+	return nil, 0, false
 }
 
 func streamProfile(ctx context.Context, conn *websocket.Conn, c *collector, profile int) {
@@ -1614,6 +1742,46 @@ func streamProfile(ctx context.Context, conn *websocket.Conn, c *collector, prof
 	if !send() {
 		return
 	}
+	var fastChanged <-chan struct{}
+	var lastFast *fastExecutedPublication
+	sendFast := func() bool {
+		if !c.public || profile != 4 || c.fast == nil {
+			return true
+		}
+		if change := c.fast.changed.Load(); change != nil {
+			fastChanged = change.changed
+		}
+		p, remaining, settled := c.currentFastHint(c.fast.latest.Load())
+		if !settled {
+			return false
+		}
+		if p == nil {
+			if lastFast == nil {
+				return true
+			}
+			lastFast = nil
+			return write(websocket.TextMessage, []byte(`{"topic":"mithril","key":"recent_executed","value":null}`))
+		}
+		if p == lastFast {
+			return true
+		}
+		remaining = min(remaining, time.Until(p.freshUntil))
+		if remaining.Milliseconds() < 1 {
+			return false
+		}
+		deadline := time.Now().Add(remaining)
+		body := []byte(`{"topic":"mithril","key":"recent_executed","value":true}`)
+		_ = conn.SetWriteDeadline(deadline)
+		err := conn.WriteMessage(websocket.TextMessage, body)
+		if err != nil {
+			return false
+		}
+		lastFast = p
+		return true
+	}
+	if !sendFast() {
+		return
+	}
 	tick := time.NewTicker(SampleInterval)
 	defer tick.Stop()
 	ping := time.NewTicker(20 * time.Second)
@@ -1640,8 +1808,18 @@ func streamProfile(ctx context.Context, conn *websocket.Conn, c *collector, prof
 			if !send() {
 				return
 			}
+			if !sendFast() {
+				return
+			}
+		case <-fastChanged:
+			if !sendFast() {
+				return
+			}
 		case <-tick.C:
 			if !send() {
+				return
+			}
+			if !sendFast() {
 				return
 			}
 		case <-ping.C:

@@ -17,7 +17,8 @@ func TestNodeNetworkQueuesContract(t *testing.T) {
 	d.TPUQueues = &TPUQueuesDetail{Scope: "tpu_pipeline_queue_samples", Generation: 7,
 		StartedAt: now.Add(-time.Second).UTC(), SampledAt: now.UTC(),
 		Ingress: TPUQueueGauge{Capacity: 4096}, DedupOutput: TPUQueueGauge{Length: 1<<53 + 1, Capacity: ^uint64(0)},
-		Verified: TPUQueueGauge{Length: 9, Capacity: 9}}
+		Verified:         TPUQueueGauge{Length: 9, Capacity: 9},
+		SigverifyWorkers: &TPUSigverifyWorkers{BatchesInFlight: 1, Configured: 2}}
 	body, err := json.Marshal(d)
 	if err != nil {
 		t.Fatal(err)
@@ -31,6 +32,8 @@ func TestNodeNetworkQueuesContract(t *testing.T) {
 		"generation":           func(q *TPUQueuesDetail) { q.Generation = 0 },
 		"zero_capacity":        func(q *TPUQueuesDetail) { q.Ingress.Capacity = 0 },
 		"length_over_capacity": func(q *TPUQueuesDetail) { q.Verified.Length++ },
+		"workers_zero":         func(q *TPUQueuesDetail) { q.SigverifyWorkers = &TPUSigverifyWorkers{} },
+		"workers_over_limit":   func(q *TPUQueuesDetail) { q.SigverifyWorkers = &TPUSigverifyWorkers{BatchesInFlight: 3, Configured: 2} },
 		"before_node":          func(q *TPUQueuesDetail) { q.StartedAt = snapshot.StartedAt.Add(-time.Second) },
 		"future":               func(q *TPUQueuesDetail) { q.SampledAt = d.CapturedAt.Add(2 * time.Second) },
 		"stale": func(q *TPUQueuesDetail) {
@@ -57,6 +60,13 @@ func TestNodeNetworkQueuesContract(t *testing.T) {
 		}
 	}
 	old := d
+	legacyQueues := *d.TPUQueues
+	legacyQueues.SigverifyWorkers = nil
+	old.TPUQueues = &legacyQueues
+	legacyBody, _ := json.Marshal(old)
+	if decoded, err := decodeNodeNetworkDetail(legacyBody); err != nil || decoded.TPUQueues.SigverifyWorkers != nil {
+		t.Fatal("legacy queues without worker observation were changed or refused")
+	}
 	old.TPUQueues = nil
 	oldBody, _ := json.Marshal(old)
 	if _, err := decodeNodeNetworkDetail(oldBody); err != nil {

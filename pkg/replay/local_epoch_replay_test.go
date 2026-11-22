@@ -41,7 +41,7 @@ func TestLocalEpochReplayBoundaries(t *testing.T) {
 		p.begin(30, nil)
 		parent := localEpochReplayBlock(normal, 30, at, 1)
 		p.completed(parent, 0, false)
-		p.skipped(0, false)
+		p.skipped(31, 0, false)
 		child := localEpochReplayChild(localEpochReplayBlock(normal, 33, at.Add(time.Second), 2), parent)
 		p.completed(child, 0, false)
 		got := localEpochReplaySnapshot(t, p)

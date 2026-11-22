@@ -21,6 +21,9 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// DefaultNodeSocket is the private feed path for the provisioned Linux profile.
+const DefaultNodeSocket = "/run/mithril-dashboard-feed/dashboard.sock"
+
 // The reader polls once per SampleInterval. Accepting more requests than this
 // only lets a feed client spend node CPU; excess connections wait in the
 // listen backlog instead of being parsed.
@@ -42,6 +45,7 @@ type Feed struct {
 	closed     sync.Once
 	latest     atomic.Pointer[feedStatus]
 	details    *replayDetailSource
+	fast       *fastExecutedFeed
 	network    *networkDetailSource
 	cache      *cacheDetailSource
 	production *productionDetailSource
@@ -53,6 +57,7 @@ type Feed struct {
 }
 
 const statusRemainingHeader = "Mithril-Status-Remaining-Milliseconds"
+const readerOriginHeader = "Mithril-Dashboard-Public-Origin"
 
 // feedStatus keeps the cached body and its original monotonic lifetime together.
 type feedStatus struct {
@@ -63,18 +68,23 @@ type feedStatus struct {
 // DetailSamplers enables only the named private detail routes. The callbacks
 // return bounded in-memory copies; a nil callback leaves its route disabled.
 type DetailSamplers struct {
-	Replay         ReplayDetailSampler
-	SelectedWindow SelectedWindowSampler
-	Network        NetworkDetailSampler
-	NodeNetwork    NodeNetworkSampler
-	Cache          CacheDetailSampler
-	Production     ProductionDetailSampler
-	Storage        StorageDetailSampler
-	RootedHistory  RootedHistorySampler
-	HeldSchedules  HeldScheduleSampler
-	Reception      *ReceptionHistorySampler
-	Machine        MachineDetailSampler
-	LocalPeers     LocalPeerSampler
+	// ReaderOrigin is the only node configuration shared with the managed reader.
+	ReaderOrigin string
+
+	Replay          ReplayDetailSampler
+	FastExecuted    func() (FastExecuted, bool)
+	SelectedWindow  SelectedWindowSampler
+	ActivityHistory ActivityHistorySampler
+	Network         NetworkDetailSampler
+	NodeNetwork     NodeNetworkSampler
+	Cache           CacheDetailSampler
+	Production      ProductionDetailSampler
+	Storage         StorageDetailSampler
+	RootedHistory   RootedHistorySampler
+	HeldSchedules   HeldScheduleSampler
+	Reception       *ReceptionHistorySampler
+	Machine         MachineDetailSampler
+	LocalPeers      LocalPeerSampler
 }
 
 // ListenFeed requires an existing private directory owned by the node. It
@@ -112,6 +122,11 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 	if !filepath.IsAbs(path) || sample == nil {
 		return nil, errors.New("dashboard feed requires an absolute socket path and a sampler")
 	}
+	if details.ReaderOrigin != "" {
+		if err := ValidateManagedOrigin(details.ReaderOrigin); err != nil {
+			return nil, err
+		}
+	}
 	if details.Network != nil && details.NodeNetwork != nil {
 		return nil, errors.New("dashboard network samplers are mutually exclusive")
 	}
@@ -120,6 +135,12 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 	}
 	if details.SelectedWindow != nil && details.Replay == nil {
 		return nil, errors.New("selected window requires the replay detail worker")
+	}
+	if details.ActivityHistory != nil && details.SelectedWindow == nil {
+		return nil, errors.New("activity history requires the selected window worker")
+	}
+	if details.FastExecuted != nil && details.Replay == nil {
+		return nil, errors.New("fast execution observations require replay details")
 	}
 	if details.Reception != nil && (details.Reception.Metadata == nil || details.Reception.ChunkBody == nil) {
 		return nil, errors.New("reception history requires both bounded callbacks")
@@ -160,6 +181,10 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 	f := &Feed{listener: listener, cancel: cancel, done: make(chan struct{}), served: make(chan struct{})}
 	if details.Replay != nil {
 		f.details = &replayDetailSource{sample: details.Replay, done: make(chan struct{})}
+		if details.FastExecuted != nil {
+			f.fast = &fastExecutedFeed{sample: details.FastExecuted, gate: &f.details.gate,
+				limit: rate.NewLimiter(12, 2), active: make(chan struct{}, 1)}
+		}
 		if details.HeldSchedules != nil {
 			f.details.held = &heldScheduleSource{sample: details.HeldSchedules, gate: &f.details.gate,
 				gateMu: &f.details.gateMu, active: make(chan struct{}, 2)}
@@ -167,6 +192,9 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 		if details.SelectedWindow != nil {
 			f.details.selected = &selectedWindowSource{sample: details.SelectedWindow, gate: &f.details.gate,
 				gateMu: &f.details.gateMu, revision: 1}
+			if details.ActivityHistory != nil {
+				f.details.activity = &activityHistorySource{sample: details.ActivityHistory, selected: f.details.selected, done: make(chan struct{})}
+			}
 		}
 	}
 	if details.Network != nil {
@@ -236,6 +264,9 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 		if f.details != nil {
 			f.details.observeStatus(s, now)
 		}
+		if f.fast != nil {
+			f.fast.update(now)
+		}
 		if f.network != nil {
 			f.network.update(s, now)
 		}
@@ -261,10 +292,16 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 	}
 	update()
 	mux := http.NewServeMux()
+	if f.fast != nil {
+		mux.HandleFunc("/details/recent-executed", f.fast.serveHTTP)
+	}
 	if f.details != nil {
 		mux.HandleFunc("/details/replay", f.details.serveHTTP)
 		if f.details.selected != nil {
 			mux.HandleFunc("/details/selected", f.details.selected.serveHTTP)
+		}
+		if f.details.activity != nil {
+			mux.HandleFunc("/details/activity-history", f.details.activity.serveHTTP)
 		}
 		if f.details.held != nil {
 			mux.HandleFunc("/details/schedule", f.details.held.serveHTTP)
@@ -304,6 +341,9 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set(statusRemainingHeader, strconv.FormatInt(remaining, 10))
+		if details.ReaderOrigin != "" {
+			w.Header().Set(readerOriginHeader, details.ReaderOrigin)
+		}
 		_, _ = w.Write(status.body)
 	})
 	var handler http.Handler = mux
@@ -353,6 +393,9 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 		WriteTimeout: 2 * time.Second, IdleTimeout: 2 * time.Second, MaxHeaderBytes: 4096}
 	if f.details != nil {
 		go f.details.run(ctx)
+		if f.details.activity != nil {
+			go f.details.activity.run(ctx)
+		}
 	}
 	if f.reception != nil {
 		go f.reception.run(ctx)
@@ -457,6 +500,9 @@ func (f *Feed) Close() {
 		<-f.served
 		if f.details != nil {
 			<-f.details.done
+			if f.details.activity != nil {
+				<-f.details.activity.done
+			}
 		}
 		if f.reception != nil {
 			<-f.reception.done

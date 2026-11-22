@@ -46,18 +46,20 @@ type PipelineSigverify struct {
 // OpenConnections and ActiveStreams are gauges. AcceptErrors includes both
 // listener and stream-accept errors; StreamBufferDrops is pool exhaustion after
 // accepting a stream, not a refused connection or ingress queue rejection.
+// Refusal pointers preserve absence in older producer documents; measured zero
+// is explicit. Their existing JSON names and decimal-string values are unchanged.
 type PipelineQUIC struct {
-	AcceptedConnections uint64 `json:"accepted_connections,string"`
-	OpenConnections     uint64 `json:"open_connections,string"`
-	AcceptedStreams     uint64 `json:"accepted_streams,string"`
-	ActiveStreams       uint64 `json:"active_streams,string"`
-	InvalidStreamSize   uint64 `json:"invalid_stream_size,string"`
-	ReadErrors          uint64 `json:"read_errors,string"`
-	ReadTimeouts        uint64 `json:"read_timeouts,string"`
-	AcceptErrors        uint64 `json:"accept_errors,string"`
-	RefusedTooManyOpen  uint64 `json:"refused_too_many_open,string"`
-	RefusedPerIP        uint64 `json:"refused_per_ip,string"`
-	StreamBufferDrops   uint64 `json:"stream_buffer_drops,string"`
+	AcceptedConnections uint64  `json:"accepted_connections,string"`
+	OpenConnections     uint64  `json:"open_connections,string"`
+	AcceptedStreams     uint64  `json:"accepted_streams,string"`
+	ActiveStreams       uint64  `json:"active_streams,string"`
+	InvalidStreamSize   uint64  `json:"invalid_stream_size,string"`
+	ReadErrors          uint64  `json:"read_errors,string"`
+	ReadTimeouts        uint64  `json:"read_timeouts,string"`
+	AcceptErrors        uint64  `json:"accept_errors,string"`
+	RefusedTooManyOpen  *uint64 `json:"refused_too_many_open,string,omitempty"`
+	RefusedPerIP        *uint64 `json:"refused_per_ip,string,omitempty"`
+	StreamBufferDrops   uint64  `json:"stream_buffer_drops,string"`
 }
 
 // PipelineScheduler separates cumulative accepted insertions (BufferedTotal)
@@ -67,6 +69,8 @@ type PipelineQUIC struct {
 // EvictedCapacity counts Receive-admission replacements, not rebuffer evictions.
 // DroppedExpired counts Cleanup's bank classification. Both pointers may be
 // absent in older producers; measured zero stays distinguishable from absence.
+// DroppedAlreadyProcessed is independently optional and counts rejections for
+// messages known to the current bank or its ancestors, not wire deduplication.
 type PipelineScheduler struct {
 	InPackets               uint64  `json:"in_packets,string"`
 	InBytes                 uint64  `json:"in_bytes,string"`
@@ -79,7 +83,7 @@ type PipelineScheduler struct {
 	DroppedCapacity         uint64  `json:"dropped_capacity,string"`
 	EvictedCapacity         *uint64 `json:"evicted_capacity,string,omitempty"`
 	DroppedExpired          *uint64 `json:"dropped_expired,string,omitempty"`
-	DroppedAlreadyProcessed uint64  `json:"dropped_already_processed,string"`
+	DroppedAlreadyProcessed *uint64 `json:"dropped_already_processed,string,omitempty"`
 	DroppedAccountLocks     uint64  `json:"dropped_account_locks,string"`
 	DroppedLookup           uint64  `json:"dropped_lookup,string"`
 	DroppedNoBank           uint64  `json:"dropped_no_bank,string"`

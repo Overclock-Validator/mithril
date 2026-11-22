@@ -108,7 +108,7 @@ func TestReceptionCollectorStatusGateAndTransportOwnership(t *testing.T) {
 	r, c := receptionCollectorForTest(t, root)
 	original := c.client.Transport.(*http.Transport)
 	owned := r.client.Transport.(*http.Transport)
-	if owned == original || owned.Proxy != nil || !owned.DisableCompression || owned.MaxConnsPerHost != 2 || owned.MaxResponseHeaderBytes != 4096 || r.client.Jar != nil || r.client.Timeout != 100*time.Millisecond {
+	if owned == original || owned.Proxy != nil || !owned.DisableCompression || owned.MaxConnsPerHost != 2 || owned.MaxResponseHeaderBytes != 4096 || r.client.Jar != nil || r.client.Timeout != receptionReaderRequestLimit {
 		t.Fatal("reader did not own bounded fixed transport")
 	}
 	if err := r.client.CheckRedirect(nil, nil); err != http.ErrUseLastResponse {

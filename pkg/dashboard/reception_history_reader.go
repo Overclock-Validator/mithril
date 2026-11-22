@@ -15,10 +15,11 @@ import (
 )
 
 const (
-	receptionReaderCycleLimit   = 225 * time.Millisecond
-	receptionReaderRequestLimit = 100 * time.Millisecond
-	receptionReaderCycleBytes   = 608 << 10
-	receptionReaderCycleStarts  = 14
+	receptionReaderCycleLimit    = 750 * time.Millisecond
+	receptionReaderRequestLimit  = 250 * time.Millisecond
+	receptionReaderCycleBytes    = 608 << 10
+	receptionReaderCycleStarts   = 14
+	receptionReaderTailPositions = 8
 )
 
 // The status loop is the only gate writer. Holding its read lock through a
@@ -407,7 +408,7 @@ func (r *receptionHistoryReader) collect(parent context.Context) {
 		return
 	}
 	// Two joined lanes let metadata attempt up to four pages while the chunk lane
-	// drains old occurrences. Both share the cycle deadline and resource limits;
+	// imports a bounded chunk tail. Both share the cycle deadline and resource limits;
 	// neither launches per-response workers.
 	results := make(chan string, 2)
 	go func() { results <- r.collectChunks(ctx, g, budget, root) }()
@@ -429,13 +430,29 @@ func (r *receptionHistoryReader) collect(parent context.Context) {
 
 func (r *receptionHistoryReader) collectChunks(ctx context.Context, g receptionHistoryGate, budget *receptionCycleBudget, root ReceptionHistoryRoot) string {
 	r.mu.Lock()
-	after := r.cursor
+	cursor := r.cursor
 	r.mu.Unlock()
-	path := receptionHistoryPath + "/index/" + root.RecordingID + "?after=" + strconv.FormatUint(after, 10)
-	response := r.fetch(ctx, budget, path, "", MaxReceptionRootBytes, false)
+	after := cursor
+	newestAfter := cursor
+	if first, last := root.CacheBounds.First, root.CacheBounds.Last; first != nil && last != nil && *last > cursor {
+		// Eight sequence positions span at most the eight descriptors per index.
+		// A short newest chunk can then bring its full retained predecessor along.
+		after = max(cursor, *first-1, *last-min(*last, receptionReaderTailPositions))
+		newestAfter = *last - 1
+	}
+	path := receptionHistoryPath + "/index/" + root.RecordingID + "?after="
+	response := r.fetch(ctx, budget, path+strconv.FormatUint(after, 10), "", MaxReceptionRootBytes, false)
+	if after < newestAfter && response.status == http.StatusConflict && response.reason == "cache_gap" &&
+		response.error.Recording == root.RecordingID && response.error.Next != nil &&
+		*response.error.Next > after && *response.error.Next <= newestAfter+1 {
+		// A confirmed gap can block the lookback. Retry the original newest-only
+		// position, which leaves room for this extra index inside the cycle cap.
+		after = newestAfter
+		response = r.fetch(ctx, budget, path+strconv.FormatUint(after, 10), "", MaxReceptionRootBytes, false)
+	}
 	if response.reason != "" {
 		if response.status == http.StatusConflict && response.reason == "cache_gap" && response.error.Recording == root.RecordingID {
-			next := after
+			next := cursor
 			if response.error.Next != nil && *response.error.Next <= after {
 				return "source_invalid"
 			}

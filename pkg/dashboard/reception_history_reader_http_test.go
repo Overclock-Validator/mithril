@@ -618,11 +618,32 @@ func TestReceptionPublicActualFeedReaderHTTP(t *testing.T) {
 		}
 	}
 	status, body, headers := get(receptionHistoryPublicPath+"/cursor/"+root.RecordingID+"?after=0", "dashboard.test", "https://dashboard.test")
-	var out receptionPublicRows
-	if status != 200 || json.Unmarshal(body, &out) != nil || len(out.Rows) != 2 || out.Rows[0].Sequence != 1 || out.Rows[1].Sequence != 2 || headers.Get(replayDetailRemainingHeader) != "" {
-		t.Fatal("actual Feed/reader/HTTP row projection", status, string(body))
+	if root.CacheBounds.First == nil || *root.CacheBounds.First < 1 || *root.CacheBounds.First > 2 {
+		t.Fatal("unexpected retained prefix", root.CacheBounds)
 	}
-	d := capture.Chunks[0]
+	first := *root.CacheBounds.First
+	// The reader imports the newest chunk per cycle. A skipped prefix remains
+	// an explicit cache gap; HTTP must never invent its missing occurrence.
+	if first > 1 {
+		var gap receptionReaderError
+		if status != 409 || json.Unmarshal(body, &gap) != nil || !receptionCanonical(body, gap) ||
+			gap.Reason != "cache_gap" || gap.Recording != root.RecordingID || gap.Bounds.First == nil || gap.Bounds.Last == nil ||
+			*gap.Bounds.First != first || *gap.Bounds.Last != 2 || gap.Next == nil || *gap.Next != first || headers.Get(replayDetailRemainingHeader) != "" {
+			t.Fatal("actual retained prefix gap", status, string(body))
+		}
+		status, body, headers = get(receptionHistoryPublicPath+"/cursor/"+root.RecordingID+"?after="+strconv.FormatUint(first-1, 10), "dashboard.test", "https://dashboard.test")
+	}
+	var out receptionPublicRows
+	if status != 200 || json.Unmarshal(body, &out) != nil || len(out.Rows) != int(3-first) || out.ScannedThrough != 2 ||
+		out.CacheBounds.First == nil || out.CacheBounds.Last == nil || *out.CacheBounds.First != first || *out.CacheBounds.Last != 2 || headers.Get(replayDetailRemainingHeader) != "" {
+		t.Fatal("actual Feed/reader/HTTP retained row projection", status, string(body))
+	}
+	for i, row := range out.Rows {
+		if row.Sequence != first+uint64(i) {
+			t.Fatal("missing history was invented or retained row changed", row.Sequence)
+		}
+	}
+	d := capture.Chunks[len(capture.Chunks)-1]
 	status, body, headers = get(receptionHistoryPublicPath+"/chunk/"+root.RecordingID+"/"+d.Digest, "dashboard.test", "")
 	if status != 200 || string(body) != bodies[d.Digest] || headers.Get("ETag") != `"`+d.Digest+`"` {
 		t.Fatal("actual canonical body changed")

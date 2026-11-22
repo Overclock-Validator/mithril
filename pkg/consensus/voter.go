@@ -13,6 +13,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/alpenglow"
 	"github.com/Overclock-Validator/mithril/pkg/identity"
+	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/gagliardetto/solana-go"
 )
@@ -190,6 +191,7 @@ type alpenglowVoter struct {
 	refreshCursor     int
 	lastWarn          map[uint64]time.Time
 	landingMu         sync.RWMutex
+	landedForIdentity bool
 	landed            map[alpenglow.VoteMessageKey]struct{}
 	stats             VotingStats
 	lastStatsLog      time.Time
@@ -847,6 +849,7 @@ func (v *alpenglowVoter) castTarget(vote alpenglow.Vote, restoring bool, guarded
 	if err := v.broadcaster.Enqueue(alpenglow.Message{Vote: &message}); err != nil {
 		return false, fmt.Errorf("broadcast persisted %s vote at slot %d: %w", vote.Type, vote.Slot, err)
 	}
+	metrics.RecordVoteEvent(vote.Slot, string(vote.Type), metrics.VoteQueued, 0, time.Now())
 	v.markVotingStarted(vote.Slot, "vote")
 	v.landingMu.Lock()
 	v.stats.VotesCastThisRun++
@@ -1303,6 +1306,7 @@ func (v *alpenglowVoter) recordNetworkCertificate(cert alpenglow.Certificate) {
 	v.stats.LastNetworkLandedVoteType = vote.Type
 	v.stats.LastNetworkCertificateType = cert.Type
 	v.stats.LastNetworkLandedAt = time.Now()
+	v.landedForIdentity = true
 	landed := v.stats.NetworkLandedVotes
 	v.landingMu.Unlock()
 
@@ -1541,6 +1545,9 @@ func (v *alpenglowVoter) rebindIdentity(next *identity.Keypair) error {
 	v.signer = signer
 	v.history = history
 	v.historyLock = historyLock
+	v.landingMu.Lock()
+	v.landedForIdentity = false
+	v.landingMu.Unlock()
 	if v.engine.monitoringEnabled {
 		v.publishMonitoring(v.snapshot())
 	}

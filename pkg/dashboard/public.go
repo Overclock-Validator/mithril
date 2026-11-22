@@ -253,6 +253,15 @@ type PublicPipeline struct {
 	QUICStreamBufferDrops     *uint64   `json:"quic_stream_buffer_drops,string"`
 	SchedulerExpiredRemovals  *uint64   `json:"scheduler_expired_removals,string,omitempty"`
 	SchedulerReceiveEvictions *uint64   `json:"scheduler_receive_evictions,string,omitempty"`
+
+	// Refusals count this TPU service instance, not lost packets or unique clients.
+	// PerIP includes remote-address parsing failures at the per-address gate.
+	QUICRefusedTooManyOpen *uint64 `json:"quic_refused_too_many_open,string,omitempty"`
+	QUICRefusedPerIP       *uint64 `json:"quic_refused_per_ip,string,omitempty"`
+
+	// AlreadyProcessedRejections counts local-bank/ancestor message rejections,
+	// independently of the earlier wire duplicate counter. It is not finality.
+	AlreadyProcessedRejections *uint64 `json:"already_processed_rejections,string,omitempty"`
 }
 
 // PublicTurbine counts this receiver session, not cluster-wide traffic.
@@ -504,13 +513,15 @@ func encodePublicSnapshotProfile(s *Snapshot, state string, now time.Time, throu
 				VerifiedPackets: v.Sigverify.VerifiedPackets, InvalidSignatureDrops: v.Sigverify.DroppedSigverify,
 				SchedulerBufferedTotal: v.Scheduler.BufferedTotal, SchedulerQueueDepth: v.Scheduler.QueueDepth,
 				BankAdmissions: v.Scheduler.Accepted, BufferCapacityDrops: v.Scheduler.DroppedCapacity,
-				CostRejections: v.Scheduler.DroppedCost, ExecutionRejections: v.Scheduler.DroppedExecution}
+				CostRejections: v.Scheduler.DroppedCost, ExecutionRejections: v.Scheduler.DroppedExecution,
+				AlreadyProcessedRejections: v.Scheduler.DroppedAlreadyProcessed}
 			if v.Scheduler.DroppedExpired != nil && v.Scheduler.EvictedCapacity != nil {
 				expired, evicted := *v.Scheduler.DroppedExpired, *v.Scheduler.EvictedCapacity
 				p.Pipeline.SchedulerExpiredRemovals, p.Pipeline.SchedulerReceiveEvictions = &expired, &evicted
 			}
 			if q := v.QUIC; q != nil {
 				p.Pipeline.QUICOpenConnections, p.Pipeline.QUICActiveStreams, p.Pipeline.QUICStreamBufferDrops = &q.OpenConnections, &q.ActiveStreams, &q.StreamBufferDrops
+				p.Pipeline.QUICRefusedTooManyOpen, p.Pipeline.QUICRefusedPerIP = q.RefusedTooManyOpen, q.RefusedPerIP
 			}
 		}
 		if b := s.BlockSource; b != nil && validPublicTime(b.SampledAt, now) {

@@ -227,11 +227,13 @@ func TestProcessTransactionSIMD0290InvalidPayerNoOp(t *testing.T) {
 
 	block := &b.Block{Transactions: []*solana.Transaction{tx}}
 	plan := blockTransactionExecutionPlan{execute: []bool{true}}
-	feeTotal, recordedCU, err := sequentialTxLoop(slotCtx, &sigverify, block, plan, nil, false)
+	txComputeUnits := make([]uint64, len(block.Transactions))
+	feeTotal, recordedCU, err := sequentialTxLoop(slotCtx, &sigverify, block, plan, txComputeUnits, nil, false)
 	sigverify.Wait()
 	require.NoError(t, err)
 	assert.Zero(t, feeTotal.TotalFees)
 	assert.Equal(t, uint64(12_345), recordedCU)
+	assert.Equal(t, []uint64{12_345}, txComputeUnits)
 	assert.Equal(t, uint64(1), slotCtx.TransactionCounts.Total)
 	assert.Equal(t, uint64(1), slotCtx.TransactionCounts.NonVote)
 	assert.Equal(t, uint64(1), slotCtx.TransactionCounts.Failed)

@@ -7,6 +7,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
@@ -167,6 +168,58 @@ func (f *receptionCollectorPeer) counters() (int, int) {
 	return len(f.paths), f.bytes
 }
 
+type receptionFixtureTransport http.HandlerFunc
+
+func (serve receptionFixtureTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	w := httptest.NewRecorder()
+	serve(w, req)
+	return w.Result(), nil
+}
+
+func TestReceptionCollectorBoundedTailLookback(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		lastFirst       uint64
+		lastCount       int
+		wantPredecessor bool
+	}{
+		{"short tail", 129, 2, true},
+		{"full tail", 129, 128, false},
+		{"gap before short tail", 135, 2, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := receptionCollectorMetadata()
+			f := &receptionCollectorPeer{metadata: make(map[string]*PreparedReceptionMetadata), remaining: "1000"}
+			preceding := receptionChunkFixture(t, 1, 128, false)
+			latest := receptionChunkFixture(t, tc.lastFirst, tc.lastCount, false)
+			f.set(t, m, []PreparedReceptionChunk{preceding, latest})
+			g := receptionHistoryGate{run: m.Binding.RunID, started: m.Binding.NodeStartedAt, genesis: m.Binding.GenesisHash,
+				at: time.Now(), known: true, epoch: 1}
+			r := &receptionHistoryReader{client: &http.Client{Transport: receptionFixtureTransport(f.serve)},
+				gate: &receptionReaderStatus{value: g}}
+			r.collect(context.Background())
+			if r.failure != "" || r.cursor != latest.descriptor.LastSequence {
+				t.Fatalf("newest chunk lost: cursor=%d, failure=%q", r.cursor, r.failure)
+			}
+			if body, ok := r.cache.ChunkBody(f.root.RecordingID, latest.descriptor.Digest); !ok || body != latest.body {
+				t.Fatal("latest body not retained intact")
+			}
+			if body, ok := r.cache.ChunkBody(f.root.RecordingID, preceding.descriptor.Digest); ok != tc.wantPredecessor || ok && body != preceding.body {
+				t.Fatalf("preceding chunk found=%v, want %v", ok, tc.wantPredecessor)
+			}
+			if starts, bytes := f.counters(); starts > receptionReaderCycleStarts || bytes > receptionReaderCycleBytes {
+				t.Fatalf("cycle exceeded its bounds: starts=%d, bytes=%d", starts, bytes)
+			}
+			if tc.wantPredecessor && r.cacheGaps != 0 || !tc.wantPredecessor && r.cacheGaps != 1 {
+				t.Fatalf("unexpected cache gaps: %d", r.cacheGaps)
+			}
+			if r.last.Startup.Losses != (ReceptionLosses{}) {
+				t.Fatal("reader relabeled skipped data as source loss")
+			}
+		})
+	}
+}
+
 func TestReceptionCollectorRealUnixFixedTokenAndBudgets(t *testing.T) {
 	m := maximumReceptionMetadata()
 	m.Binding = receptionCollectorMetadata().Binding
@@ -226,14 +279,16 @@ func TestReceptionCollectorRealUnixFixedTokenAndBudgets(t *testing.T) {
 	if root.Metadata.PublishedAt.Equal(root.PublishedAt) {
 		t.Fatal("old metadata was redated as current")
 	}
-	got, err := r.cache.Cursor(context.Background(), root.RecordingID, 0)
-	if err != nil || got.Count != 128 || got.ScannedThrough != 128 {
-		t.Fatal("reader retained rows differ", err)
+	latest := chunks[len(chunks)-1]
+	got, err := r.cache.Cursor(context.Background(), root.RecordingID, latest.descriptor.FirstSequence-1)
+	if err != nil || got.Count != 128 || got.ScannedThrough != latest.descriptor.LastSequence || r.cacheGaps != 1 {
+		t.Fatal("latest partial retained rows or gap disclosure differ", err)
 	}
 	for _, p := range chunks {
 		body, ok := r.cache.ChunkBody(root.RecordingID, p.descriptor.Digest)
-		if !ok || body != p.body {
-			t.Fatal("original chunk changed")
+		want := p.descriptor.Digest == latest.descriptor.Digest
+		if ok != want || ok && body != p.body {
+			t.Fatal("latest chunk changed or skipped history was invented")
 		}
 	}
 	// A newer closed marker is compatible with older open pages, but their
@@ -286,9 +341,9 @@ func TestReceptionCollectorRealUnixGapOutrunAndMaxCursor(t *testing.T) {
 	m := receptionCollectorMetadata()
 	chunks := []PreparedReceptionChunk{receptionChunkFixture(t, 10, 2, false), receptionChunkFixture(t, 14, 1, false)}
 	f, r, c := newReceptionCollectorPeer(t, m, chunks)
-	r.collect(context.Background()) // explicit index gap0 -> first10
-	if r.cursor != 9 || r.cacheGaps != 1 {
-		t.Fatal("exact initial gap not acknowledged")
+	r.collect(context.Background()) // Two retained chunks with a skipped prefix and an interior gap.
+	if r.cursor != 14 || r.cacheGaps != 2 {
+		t.Fatal("retained descriptors or their gaps not acknowledged")
 	}
 	r.collect(context.Background())
 	if r.cursor != 14 || r.cacheGaps != 2 || r.last.Startup.Losses != (ReceptionLosses{}) {
@@ -767,7 +822,7 @@ func TestReceptionCollectorRealUnixCycleDeadlineKeepsValidatedPrefix(t *testing.
 	if r.publication.body == "" || r.pending != nil || started.Load() != requests+int64(3-completed) || r.until != until {
 		t.Fatal("next cycle restarted pages or renewed source")
 	}
-	// A single response cannot spend the whole cycle budget: the100ms child
+	// A single response cannot spend the whole cycle budget: the250ms child
 	// timeout also applies when the parent has much more time remaining.
 	entered, stopped := make(chan struct{}), make(chan struct{})
 	path2 := replayDetailReaderServer(t, func(w http.ResponseWriter, req *http.Request) { close(entered); <-req.Context().Done(); close(stopped) })
@@ -891,5 +946,76 @@ func TestReceptionCollectorActualFeedSixSecondMetadataHold(t *testing.T) {
 	status, pageBody, _ := receptionHTTPTest(t, c.client, receptionHistoryPath+"/metadata/"+first.RecordingID+"/"+first.Metadata.Digest+"/"+page.Kind+"/"+strconv.Itoa(page.Page))
 	if status != 200 || receptionDigest([]byte(pageBody)) != page.Digest {
 		t.Fatal("actual previous token retired before reader completion")
+	}
+}
+
+func TestReceptionCollectorRealUnixDelayedCachedResponse(t *testing.T) {
+	m := receptionCollectorMetadata()
+	for i := range 192 {
+		m.Sources = append(m.Sources, ReceptionSource{Generation: uint64(i + 1), StartedAt: m.PublishedAt, Kind: "live"})
+	}
+	f, r, _ := newReceptionCollectorPeer(t, m, nil)
+	f.mu.Lock()
+	f.mutate = func(string, *receptionHistoryReply) { time.Sleep(125 * time.Millisecond) }
+	f.mu.Unlock()
+	started := time.Now()
+	r.collect(context.Background())
+	body, until, reason := r.rootBody(time.Now())
+	if body == "" || r.failure != "" || reason != "" || !until.After(time.Now()) {
+		t.Fatalf("delayed cached reception never published: failure=%s body=%t", r.failure, body != "")
+	}
+	if r.pending != nil || r.until.After(started.Add(1050*time.Millisecond)) {
+		t.Fatal("partial metadata advertised or source lease extended by response delay")
+	}
+	requests, bytes := f.counters()
+	if requests > receptionReaderCycleStarts+1 || bytes > receptionReaderCycleBytes || f.peak.Load() > 2 {
+		t.Fatal("calibrated IPC escaped the original starts/bytes/two-lane bounds")
+	}
+	f.mu.Lock()
+	f.mutate = func(string, *receptionHistoryReply) { time.Sleep(350 * time.Millisecond) }
+	f.mu.Unlock()
+	started = time.Now()
+	response := r.fetch(context.Background(), &receptionCycleBudget{}, receptionHistoryPath, "", MaxReceptionRootBytes, true)
+	if response.reason != "source_unavailable" || time.Since(started) > 400*time.Millisecond {
+		t.Fatal("request exceeding calibrated child budget did not fail closed")
+	}
+}
+
+func TestReceptionCollectorLatestDescriptorAvoidsBacklog(t *testing.T) {
+	m := receptionCollectorMetadata()
+	var chunks []PreparedReceptionChunk
+	for i := range 12 {
+		chunks = append(chunks, receptionChunkFixture(t, uint64(1+i*128), 128, false))
+	}
+	f, r, _ := newReceptionCollectorPeer(t, m, chunks)
+	r.collect(context.Background())
+	latest := chunks[len(chunks)-1]
+	body, ok := r.cache.ChunkBody(f.root.RecordingID, latest.descriptor.Digest)
+	if !ok || body != latest.body || r.cursor != latest.descriptor.LastSequence {
+		t.Fatalf("latest descriptor left behind backlog: cursor=%d want=%d", r.cursor, latest.descriptor.LastSequence)
+	}
+	if r.cacheGaps != 1 || r.last.Startup.Losses != (ReceptionLosses{}) {
+		t.Fatal("skipped transport prefix was hidden or mislabeled source packet loss")
+	}
+	until := r.until
+	r.collect(context.Background())
+	if r.until != until || r.cacheGaps != 1 {
+		t.Fatal("duplicate latest descriptor renewed source or recounted gap")
+	}
+	// Selecting a newer index position is not permission to advance on an
+	// unavailable tail that supplies no exact resume cursor.
+	chunks = append(chunks, receptionChunkFixture(t, 1537, 128, false))
+	f.set(t, m, chunks)
+	f.mu.Lock()
+	id, bounds := f.root.RecordingID, f.root.CacheBounds
+	f.mutate = func(path string, reply *receptionHistoryReply) {
+		if strings.Contains(path, "/index/") {
+			*reply = receptionHistoryError(409, "cache_gap", id, bounds, nil)
+		}
+	}
+	f.mu.Unlock()
+	r.collect(context.Background())
+	if r.cursor != latest.descriptor.LastSequence || r.cacheGaps != 1 {
+		t.Fatal("failed latest selection guessed progress across an unknown tail")
 	}
 }

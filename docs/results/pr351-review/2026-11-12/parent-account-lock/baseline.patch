@@ -1,0 +1,12 @@
+--- locked/execution_ctx.go
++++ unlocked/execution_ctx.go
+@@ -524,8 +524,7 @@
+ 	// Producer commits retain parent images while other admitted scratch
+ 	// transactions may still read this shared store. Finalization joins all
+ 	// scratch execution before mutating the frozen bank.
+-	key := [32]byte(pubkey)
+-	acct, err := slotCtx.ParentAccts.GetAccount(&key)
++	acct, err := slotCtx.ParentAccts.GetAccountWithoutLock(pubkey)
+ 	if err != nil {
+ 		return nil, err
+ 	} else {

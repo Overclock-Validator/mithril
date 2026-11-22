@@ -55,6 +55,14 @@ func (w *cacheActivityWindow) observe(value accountsdb.CacheActivityObservation,
 	delta := func(before, after accountsdb.CacheLookupActivity) dashboard.CacheLookupDelta {
 		return dashboard.CacheLookupDelta{Hits: after.Hits - before.Hits, Misses: after.Misses - before.Misses}
 	}
-	return &dashboard.CacheActivityWindow{StartedAt: first.at.UTC(), EndedAt: completed.UTC(), DurationNanoseconds: uint64(completed.Sub(first.at)),
+	window := &dashboard.CacheActivityWindow{StartedAt: first.at.UTC(), EndedAt: completed.UTC(), DurationNanoseconds: uint64(completed.Sub(first.at)),
 		Vote: delta(first.value.Vote, value.Vote), Program: delta(first.value.Program, value.Program), CommonLarge: delta(first.value.CommonLarge, value.CommonLarge)}
+	for i, point := range w.points[:w.count] {
+		if !point.value.FixedSmallCopyKnown || i > 0 && point.value.FixedSmallCopyBytes < w.points[i-1].value.FixedSmallCopyBytes {
+			return window
+		}
+	}
+	copied := value.FixedSmallCopyBytes - first.value.FixedSmallCopyBytes
+	window.FixedSmallPayloadBytesCopied = &copied
+	return window
 }

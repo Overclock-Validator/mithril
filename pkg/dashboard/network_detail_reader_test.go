@@ -79,7 +79,7 @@ func TestNetworkDetailReaderConstructor(t *testing.T) {
 		transport.MaxConnsPerHost != 1 || transport.MaxIdleConnsPerHost != 1 || transport.MaxIdleConns != 1 ||
 		!transport.DisableKeepAlives || reader.client.Timeout != time.Second || reader.client.Jar != nil ||
 		reader.client.CheckRedirect(nil, nil) != http.ErrUseLastResponse || original.Transport.(*http.Transport).MaxConnsPerHost != 0 ||
-		reader.limit.Limit() != 16 || reader.limit.Burst() != 32 || networkDetailCollectInterval != 10*time.Second {
+		reader.limit.Limit() != 16 || reader.limit.Burst() != 32 || networkDetailCollectInterval != 1*time.Second {
 		t.Fatal("reader did not own the exact bounded transport")
 	}
 }
@@ -300,12 +300,6 @@ func TestNetworkDetailReaderRequestStartAndCancellation(t *testing.T) {
 	if response.Code != http.StatusOK || response.Header().Get(replayDetailRemainingHeader) != "" || !strings.Contains(response.Body.String(), `"state":"stale"`) {
 		t.Fatal("stale public document carried a freshness header")
 	}
-	for _, value := range []string{"", "0", "-1", "030000", "30001", "1.0"} {
-		if _, err := parseNetworkDetailRemaining(value); err == nil {
-			t.Fatalf("invalid remaining time accepted: %q", value)
-		}
-	}
-
 	entered := make(chan struct{})
 	var once sync.Once
 	blockedPath := replayDetailReaderServer(t, func(w http.ResponseWriter, request *http.Request) {

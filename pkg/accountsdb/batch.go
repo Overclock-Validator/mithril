@@ -16,6 +16,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/accounts"
 	"github.com/Overclock-Validator/mithril/pkg/addresses"
+	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/gagliardetto/solana-go"
 	"golang.org/x/sync/errgroup"
@@ -130,6 +131,7 @@ func (db *AccountsDb) GetAccountsBatchSharedWithStats(ctx context.Context, slot 
 }
 
 func (db *AccountsDb) getAccountsBatchWithStats(ctx context.Context, slot uint64, pks []solana.PublicKey) ([]*accounts.Account, BatchReadStats, error) {
+	db.recordAccountRequests(uint64(len(pks)))
 	stats := BatchReadStats{RequestedKeys: uint64(len(pks)), DurableKeys: uint64(len(pks))}
 	if len(pks) == 0 {
 		return nil, stats, nil
@@ -205,6 +207,7 @@ func (db *AccountsDb) getAccountsBatchWithStats(ctx context.Context, slot uint64
 	admitCommon := admission.classifyAndObserve(pks, cold)
 	stats.AdmissionFilterNanoseconds = uint64(time.Since(phaseStart).Nanoseconds())
 	phaseStart = time.Now()
+	foldAtStart := db.foldPhase.at(phaseStart)
 	locations, found, err := resolveBatchAccountLocations(ctx, indexSnapshot, pks, cold, out)
 	closeErr := indexSnapshot.Close()
 	stats.IndexLookupNanoseconds = snapshotSetupNanoseconds + uint64(time.Since(phaseStart).Nanoseconds())
@@ -291,11 +294,24 @@ func (db *AccountsDb) getAccountsBatchWithStats(ctx context.Context, slot uint64
 	if err != nil {
 		return nil, stats, err
 	}
+	// A slow durable read is logged with the fold phase it began and ended in.
+	// Only the two phase words are read here; the line is formatted and written
+	// after the file pin is released.
+	slowRead := time.Duration(stats.IndexLookupNanoseconds+stats.AppendVecReadNanoseconds) >= slowBatchReadLog
+	var foldAtEnd foldPhaseSnap
+	if slowRead {
+		foldAtEnd = db.foldPhase.at(time.Now())
+	}
 
 	// File paths are no longer needed. Let compaction/rewind proceed while the
 	// decoded values pass through the epoch-checked selective cache policy.
 	db.appendVecReadMu.RUnlock()
 	appendVecPinned = false
+	if slowRead {
+		mlog.Log.Infof("slow account batch read: slot %d, %d keys to storage | index %s (%d found, %d absent, snapshot %s) | appendvec %s (%d accounts, %d files) | fold at start %s, at end %s",
+			slot, len(cold), r(time.Duration(stats.IndexLookupNanoseconds)), stats.IndexHits, stats.IndexMisses, r(time.Duration(snapshotSetupNanoseconds)),
+			r(time.Duration(stats.AppendVecReadNanoseconds)), stats.AppendVecAccounts, stats.UniqueAppendVecs, foldAtStart, foldAtEnd)
+	}
 	phaseStart = time.Now()
 	db.cacheBatchAbsences(pks, cold, found, admitCommon, cacheEpoch)
 	publicationJobs := cold[:0]

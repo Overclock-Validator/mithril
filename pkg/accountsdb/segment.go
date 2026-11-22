@@ -1,6 +1,7 @@
 package accountsdb
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
@@ -44,6 +45,10 @@ const (
 	// its only job is proving the data file is not an orphan.
 	ManifestKindFold    = uint8(1)
 	ManifestKindCompact = uint8(2)
+	// ManifestKindSparse lists only retained records at their original offsets.
+	// Gaps can contain punched-out headers: scan this kind through its manifest,
+	// never through the sequential appendvec parser. It is not a fold redo log.
+	ManifestKindSparse = uint8(3)
 )
 
 // ErrTornManifest reports a manifest that fails CRC or structural validation.
@@ -338,6 +343,89 @@ func ReadSegmentManifest(path string) (*SegmentManifest, error) {
 	return m, nil
 }
 
+// visitSegmentManifestRecords validates the same complete manifest as
+// ReadSegmentManifest, without retaining its body, bankhashes, resume context,
+// or decoded record array. The visitor's results are tentative until this
+// function succeeds: a later record or the trailing CRC can still be invalid.
+// Compaction builds private pins with it and publishes them only on success.
+func visitSegmentManifestRecords(path string, visit func(ManifestRecord) error) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() < 4 {
+		return ErrTornManifest
+	}
+	body := &io.LimitedReader{R: f, N: info.Size() - 4}
+	h := crc32.NewIEEE()
+	r := bufio.NewReaderSize(io.TeeReader(body, h), 64<<10)
+	var prefix [4 + 4 + 1 + 5*8 + 4]byte
+	if _, err := io.ReadFull(r, prefix[:]); err != nil {
+		return ErrTornManifest
+	}
+	var m SegmentManifest
+	if err := decodeManifestPrefix(&manifestDecoder{data: prefix[:]}, &m); err != nil {
+		return err
+	}
+	var count [8]byte
+	if _, err := io.ReadFull(r, count[:4]); err != nil {
+		return ErrTornManifest
+	}
+	bankBytes := int64(binary.LittleEndian.Uint32(count[:4])) * 40
+	if _, err := io.CopyN(io.Discard, r, bankBytes); err != nil {
+		return ErrTornManifest
+	}
+	if _, err := io.ReadFull(r, count[:4]); err != nil {
+		return ErrTornManifest
+	}
+	contextBytes := int64(binary.LittleEndian.Uint32(count[:4]))
+	if _, err := io.CopyN(io.Discard, r, contextBytes); err != nil {
+		return ErrTornManifest
+	}
+	if _, err := io.ReadFull(r, count[:]); err != nil {
+		return ErrTornManifest
+	}
+	n := binary.LittleEndian.Uint64(count[:])
+	remaining := body.N + int64(r.Buffered())
+	if remaining%manifestRecordSize != 0 || n != uint64(remaining/manifestRecordSize) {
+		return ErrTornManifest
+	}
+	for i := uint64(0); i < n; i++ {
+		raw, err := r.Peek(manifestRecordSize)
+		if err != nil {
+			return ErrTornManifest
+		}
+		var rec ManifestRecord
+		copy(rec.Pubkey[:], raw[:32])
+		rec.Offset = binary.LittleEndian.Uint64(raw[32:40])
+		rec.OwnerSlot = binary.LittleEndian.Uint64(raw[40:48])
+		rec.PrevValid = raw[48] == 1
+		rec.Prev.Unmarshal((*[24]byte)(raw[49:73]))
+		if visit != nil {
+			if err := visit(rec); err != nil {
+				return err
+			}
+		}
+		_, _ = r.Discard(manifestRecordSize) // Peek established these bytes exist.
+	}
+	if _, err := io.ReadFull(f, count[:4]); err != nil {
+		return ErrTornManifest
+	}
+	if h.Sum32() != binary.LittleEndian.Uint32(count[:4]) {
+		return ErrTornManifest
+	}
+	// Reject a file which grew after Stat instead of accepting a valid prefix.
+	if n, err := f.Read(count[:1]); n != 0 || err != io.EOF {
+		return ErrTornManifest
+	}
+	return nil
+}
+
 // ReadSegmentManifestContext reads only the fixed prefix and resume context,
 // then structurally validates the declared record tail against the file size.
 // It deliberately does not scan records or validate the trailing CRC. This is
@@ -480,14 +568,17 @@ func ListFoldManifests(acctsDir string) ([]ManifestHeader, error) {
 // ordering as ListFoldManifests. Callers must validate retained manifest bodies
 // and all parked manifests before using this list to remove checkpoint files.
 // Like ReadDir, this is a directory observation, not a transactional snapshot.
+//
+// The pass reads every entry of a directory that holds hundreds of thousands
+// of appendvecs. A caller with an open store that asks repeatedly should use
+// (*AccountsDb).FoldAndParkedManifests, which answers from memory.
 func ListFoldAndParkedManifests(acctsDir string) ([]ManifestHeader, []string, error) {
 	dir, err := os.Open(acctsDir)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer dir.Close()
-	var out []ManifestHeader
-	var parked []string
+	var listing manifestListing
 	// Do not sort or retain hundreds of thousands of unrelated appendvec entries.
 	// Only the small resulting manifest set needs sorting.
 	for {
@@ -496,34 +587,64 @@ func ListFoldAndParkedManifests(acctsDir string) ([]ManifestHeader, []string, er
 			return nil, nil, readErr
 		}
 		for _, e := range entries {
-			name := e.Name()
 			if e.IsDir() {
 				continue
 			}
-			if strings.HasSuffix(name, segManifestRewoundSuffix) {
-				parked = append(parked, filepath.Join(acctsDir, name))
-				continue
-			}
-			if !strings.HasSuffix(name, segManifestSuffix) || strings.HasSuffix(name, segManifestTmpSuffix) {
-				continue
-			}
-			path := filepath.Join(acctsDir, name)
-			hdr, err := readManifestHeader(path)
-			if err != nil {
-				out = append(out, ManifestHeader{Path: path})
-				continue
-			}
-			if hdr.Kind == ManifestKindFold {
-				out = append(out, hdr)
-			}
+			listing.add(acctsDir, e.Name())
 		}
 		if readErr == io.EOF {
 			break
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].BatchSeq < out[j].BatchSeq })
-	sort.Strings(parked)
-	return out, parked, nil
+	folds, parked := listing.sorted()
+	return folds, parked, nil
+}
+
+// manifestListing sorts manifest file names into what
+// ListFoldAndParkedManifests returns, whether the names come from the
+// directory or from the in-memory inventory.
+type manifestListing struct {
+	folds  []ManifestHeader
+	parked []string
+}
+
+// add classifies one non-directory entry of acctsDir. A parked manifest is
+// recorded by path without being opened. An active manifest contributes its
+// header if it is fold-kind; one whose header cannot be read is kept with only
+// its path set, so the caller fails closed on it instead of skipping it. The
+// header read's error is returned for callers that care why.
+func (l *manifestListing) add(acctsDir, name string) error {
+	if strings.HasSuffix(name, segManifestRewoundSuffix) {
+		l.parked = append(l.parked, filepath.Join(acctsDir, name))
+		return nil
+	}
+	if !strings.HasSuffix(name, segManifestSuffix) || strings.HasSuffix(name, segManifestTmpSuffix) {
+		return nil
+	}
+	path := filepath.Join(acctsDir, name)
+	hdr, err := readManifestHeader(path)
+	if err != nil {
+		l.folds = append(l.folds, ManifestHeader{Path: path})
+		return err
+	}
+	if hdr.Kind == ManifestKindFold {
+		l.folds = append(l.folds, hdr)
+	}
+	return nil
+}
+
+// sorted returns fold headers ascending by BatchSeq and parked paths in name
+// order. Unreadable headers (BatchSeq 0) sort first; path breaks ties so the
+// order does not depend on where the names came from.
+func (l *manifestListing) sorted() ([]ManifestHeader, []string) {
+	sort.Slice(l.folds, func(i, j int) bool {
+		if l.folds[i].BatchSeq != l.folds[j].BatchSeq {
+			return l.folds[i].BatchSeq < l.folds[j].BatchSeq
+		}
+		return l.folds[i].Path < l.folds[j].Path
+	})
+	sort.Strings(l.parked)
+	return l.folds, l.parked
 }
 
 // listAllManifestFileIds returns the fileId of every manifest-backed data file
