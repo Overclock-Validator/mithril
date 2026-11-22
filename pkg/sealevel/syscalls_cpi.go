@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 
 	a "github.com/Overclock-Validator/mithril/pkg/addresses"
-	"github.com/Overclock-Validator/mithril/pkg/base58"
 	"github.com/Overclock-Validator/mithril/pkg/cu"
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
@@ -296,7 +295,7 @@ func isPrecompile(programId solana.PublicKey) bool {
 
 func checkAuthorizedProgram(execCtx *ExecutionCtx, programId solana.PublicKey, instructionData []byte) error {
 
-	if programId == base58.MustDecodeFromString("NativeLoader1111111111111111111111111111111") ||
+	if programId == a.NativeLoaderAddr ||
 		programId == solana.BPFLoaderProgramID ||
 		programId == solana.BPFLoaderDeprecatedProgramID ||
 		(programId == solana.BPFLoaderUpgradeableProgramID &&

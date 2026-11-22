@@ -74,14 +74,15 @@ all messages and decodes/verifies representative signatures and phase boundaries
 ```toml
 [validator]
 tpu_max_buffered_transactions = 0 # default 131072
-block_completion_reserve_ms = 0  # default 75ms
+block_completion_reserve_ms = 0  # default 15ms
 ```
 
 The corresponding flags are `--tpu-max-buffered-transactions` and
 `--leader-completion-reserve-ms`. The measured full-prefill trial used 262,144
-queue entries and a 60ms reserve. Those are opt-in tuning values; defaults stay
-unchanged. A larger queue uses additional memory for owned wire, decoded and
-prepared objects. `BenchmarkReadonlyPairPreparationMemory` measured 728 allocated
+queue entries and a 60ms reserve. Those remain opt-in tuning values; pipelined
+completion now defaults to a 15ms reserve. A larger queue uses additional memory
+for owned wire, decoded and prepared objects.
+`BenchmarkReadonlyPairPreparationMemory` measured 728 allocated
 bytes per preparation (9 allocations) on Go 1.26.4 arm64 for the 198-byte fixture.
 That is 91 MiB of allocation volume for 131,072 preparations, or 182 MiB for
 262,144, in addition to wire/decoded transactions and queue indexes. Allocation

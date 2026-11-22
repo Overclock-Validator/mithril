@@ -1,0 +1,351 @@
+{
+  "started_utc": "2026-11-12T12:51:47.295760+00:00",
+  "source_commit": "7f05abfe62286cbb3a32795644974692dadfdd57",
+  "fixture_sha256": "2343996ed8ee30d13ad50d89ecd958cfc3015f611ae589374fd2b80382afaad9",
+  "go_version": "go version go1.27.3 linux/amd64",
+  "platform": "Linux-7.0.0-31-generic-x86_64-with-glibc2.39",
+  "gomaxprocs": 2,
+  "tx_parallelism": 4,
+  "paired_trials": 4,
+  "measured_blocks_per_workload_per_trial": 500,
+  "scope": "Synthetic whole-ProcessBlock replay over fixed in-memory parent state",
+  "limitations": [
+    "This is not mainnet replay and does not measure the complete production SlotReplay interval.",
+    "Transactions are independent system transfers, not a representative mainnet program mix.",
+    "Account reads use memory; network, consensus, durable folds and real AccountsDB I/O are excluded.",
+    "Transaction generation and signature verification are excluded; signatures are marked already verified.",
+    "Both variants use the same committed source plus the fixture; unrelated unstaged edits are excluded.",
+    "The unlocked accessor is only used in an isolated test binary with an immutable parent, never deployed.",
+    "The host may be running a validator or other workloads; alternating pairs do not remove all scheduling/GC noise."
+  ],
+  "cpu": {
+    "lscpu": [
+      {
+        "field": "Architecture:",
+        "data": "x86_64"
+      },
+      {
+        "field": "CPU op-mode(s):",
+        "data": "32-bit, 64-bit"
+      },
+      {
+        "field": "Address sizes:",
+        "data": "48 bits physical, 48 bits virtual"
+      },
+      {
+        "field": "Byte Order:",
+        "data": "Little Endian"
+      },
+      {
+        "field": "CPU(s):",
+        "data": "32"
+      },
+      {
+        "field": "On-line CPU(s) list:",
+        "data": "0-31"
+      },
+      {
+        "field": "Vendor ID:",
+        "data": "AuthenticAMD"
+      },
+      {
+        "field": "BIOS Vendor ID:",
+        "data": "Advanced Micro Devices, Inc."
+      },
+      {
+        "field": "Model name:",
+        "data": "AMD Ryzen 9 9950X 16-Core Processor"
+      },
+      {
+        "field": "BIOS Model name:",
+        "data": "AMD Ryzen 9 9950X 16-Core Processor             Unknown CPU @ 4.3GHz"
+      },
+      {
+        "field": "BIOS CPU family:",
+        "data": "107"
+      },
+      {
+        "field": "CPU family:",
+        "data": "26"
+      },
+      {
+        "field": "Model:",
+        "data": "68"
+      },
+      {
+        "field": "Thread(s) per core:",
+        "data": "2"
+      },
+      {
+        "field": "Core(s) per socket:",
+        "data": "16"
+      },
+      {
+        "field": "Socket(s):",
+        "data": "1"
+      },
+      {
+        "field": "Stepping:",
+        "data": "0"
+      },
+      {
+        "field": "Frequency boost:",
+        "data": "enabled"
+      },
+      {
+        "field": "CPU(s) scaling MHz:",
+        "data": "79%"
+      },
+      {
+        "field": "CPU max MHz:",
+        "data": "5756.4521"
+      },
+      {
+        "field": "CPU min MHz:",
+        "data": "624.1940"
+      },
+      {
+        "field": "BogoMIPS:",
+        "data": "8583.31"
+      },
+      {
+        "field": "Flags:",
+        "data": "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good amd_lbr_v2 nopl xtopology nonstop_tsc cpuid extd_apicid aperfmperf rapl pni pclmulqdq monitor ssse3 fma cx16 sse4_1 sse4_2 movbe popcnt aes xsave avx f16c rdrand lahf_lm cmp_legacy svm extapic cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw ibs skinit wdt tce topoext perfctr_core perfctr_nb bpext perfctr_llc mwaitx cpuid_fault cpb cat_l3 cdp_l3 hw_pstate ssbd mba perfmon_v2 ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid cqm rdt_a avx512f avx512dq adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local user_shstk avx_vnni avx512_bf16 clzero irperf xsaveerptr rdpru wbnoinvd cppc arat npt lbrv svm_lock nrip_save tsc_scale vmcb_clean flushbyasid decodeassists pausefilter pfthreshold v_vmsave_vmload vgif v_spec_ctrl vnmi avx512vbmi umip pku ospke avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid bus_lock_detect movdiri movdir64b overflow_recov succor smca fsrm avx512_vp2intersect flush_l1d amd_lbr_pmc_freeze"
+      },
+      {
+        "field": "Virtualization:",
+        "data": "AMD-V"
+      },
+      {
+        "field": "L1d cache:",
+        "data": "768 KiB (16 instances)"
+      },
+      {
+        "field": "L1i cache:",
+        "data": "512 KiB (16 instances)"
+      },
+      {
+        "field": "L2 cache:",
+        "data": "16 MiB (16 instances)"
+      },
+      {
+        "field": "L3 cache:",
+        "data": "64 MiB (2 instances)"
+      },
+      {
+        "field": "NUMA node(s):",
+        "data": "1"
+      },
+      {
+        "field": "NUMA node0 CPU(s):",
+        "data": "0-31"
+      },
+      {
+        "field": "Vulnerability Gather data sampling:",
+        "data": "Not affected"
+      },
+      {
+        "field": "Vulnerability Ghostwrite:",
+        "data": "Not affected"
+      },
+      {
+        "field": "Vulnerability Indirect target selection:",
+        "data": "Not affected"
+      },
+      {
+        "field": "Vulnerability Itlb multihit:",
+        "data": "Not affected"
+      },
+      {
+        "field": "Vulnerability L1tf:",
+        "data": "Not affected"
+      },
+      {
+        "field": "Vulnerability Mds:",
+        "data": "Not affected"
+      },
+      {
+        "field": "Vulnerability Meltdown:",
+        "data": "Not affected"
+      },
+      {
+        "field": "Vulnerability Mmio stale data:",
+        "data": "Not affected"
+      },
+      {
+        "field": "Vulnerability Old microcode:",
+        "data": "Not affected"
+      },
+      {
+        "field": "Vulnerability Reg file data sampling:",
+        "data": "Not affected"
+      },
+      {
+        "field": "Vulnerability Retbleed:",
+        "data": "Not affected"
+      },
+      {
+        "field": "Vulnerability Spec rstack overflow:",
+        "data": "Mitigation; IBPB on VMEXIT only"
+      },
+      {
+        "field": "Vulnerability Spec store bypass:",
+        "data": "Mitigation; Speculative Store Bypass disabled via prctl"
+      },
+      {
+        "field": "Vulnerability Spectre v1:",
+        "data": "Mitigation; usercopy/swapgs barriers and __user pointer sanitization"
+      },
+      {
+        "field": "Vulnerability Spectre v2:",
+        "data": "Mitigation; Enhanced / Automatic IBRS; IBPB conditional; STIBP always-on; PBRSB-eIBRS Not affected; BHI Not affected"
+      },
+      {
+        "field": "Vulnerability Srbds:",
+        "data": "Not affected"
+      },
+      {
+        "field": "Vulnerability Tsa:",
+        "data": "Not affected"
+      },
+      {
+        "field": "Vulnerability Tsx async abort:",
+        "data": "Not affected"
+      },
+      {
+        "field": "Vulnerability Vmscape:",
+        "data": "Mitigation; IBPB on VMEXIT"
+      }
+    ]
+  },
+  "binary_sha256": {
+    "locked": "94d52f31fe3d126834c062dd6ea04a9d58686700558899fd8075ffb62cb7bdb2",
+    "unlocked": "1c9f6f339aede8d095c3b977c0cc2752311cf6ad6c4b7a9eee56c942c1e12a70"
+  },
+  "workloads": [
+    {
+      "transactions_per_block": 64,
+      "locked": {
+        "measured_blocks": 2000,
+        "average_consumed_cu_per_block": 9600.0,
+        "total_consumed_cu": 19200000,
+        "total_process_block_ns": 798368498,
+        "cu_per_ns": 0.024049045081435565,
+        "process_block": {
+          "mean_ms": 0.399184249,
+          "median_ms": 0.3451995,
+          "p95_ms": 0.742536,
+          "p99_ms": 0.915611,
+          "max_ms": 1.243829
+        }
+      },
+      "unlocked": {
+        "measured_blocks": 2000,
+        "average_consumed_cu_per_block": 9600.0,
+        "total_consumed_cu": 19200000,
+        "total_process_block_ns": 766450676,
+        "cu_per_ns": 0.02505053567204369,
+        "process_block": {
+          "mean_ms": 0.38322533799999997,
+          "median_ms": 0.3217545,
+          "p95_ms": 0.690859,
+          "p99_ms": 0.866689,
+          "max_ms": 1.097434
+        }
+      },
+      "transaction_digest_sha256": "da5fa126c1ec25be73494af1ea017ce944ea15337661a34e86d1355a4d1738c7",
+      "bankhash_hex": "6fbb90abbb7d0b5a1e50e488ef460e6d49a5d869251c1a7f1260196f893b1ec2",
+      "consumed_cu_per_block": 9600,
+      "locked_mean_change_pct_by_pair": [
+        -7.043810144229978,
+        -9.79534749637142,
+        7.482481829857313,
+        28.529764578688322
+      ],
+      "median_paired_mean_change_pct": 0.21933584281366736
+    },
+    {
+      "transactions_per_block": 256,
+      "locked": {
+        "measured_blocks": 2000,
+        "average_consumed_cu_per_block": 38400.0,
+        "total_consumed_cu": 76800000,
+        "total_process_block_ns": 2883242396,
+        "cu_per_ns": 0.02663667824340635,
+        "process_block": {
+          "mean_ms": 1.441621198,
+          "median_ms": 1.35896,
+          "p95_ms": 2.362231,
+          "p99_ms": 2.733158,
+          "max_ms": 66.038587
+        }
+      },
+      "unlocked": {
+        "measured_blocks": 2000,
+        "average_consumed_cu_per_block": 38400.0,
+        "total_consumed_cu": 76800000,
+        "total_process_block_ns": 2843370709,
+        "cu_per_ns": 0.027010195946982302,
+        "process_block": {
+          "mean_ms": 1.4216853544999999,
+          "median_ms": 1.3748905,
+          "p95_ms": 2.408328,
+          "p99_ms": 2.72842,
+          "max_ms": 3.993047
+        }
+      },
+      "transaction_digest_sha256": "9c6c4b874959d70a19c449e6a77a42a14c1491dd8125419e454fd13914d9c7b7",
+      "bankhash_hex": "6c83eb828b711310e69ef38cee987284d07cdfa5a6b482dc8a2c5c70e1b2b5c0",
+      "consumed_cu_per_block": 38400,
+      "locked_mean_change_pct_by_pair": [
+        -8.952928270204763,
+        -3.568251876433659,
+        8.40526653537561,
+        11.077730592696234
+      ],
+      "median_paired_mean_change_pct": 2.4185073294709754
+    },
+    {
+      "transactions_per_block": 1024,
+      "locked": {
+        "measured_blocks": 2000,
+        "average_consumed_cu_per_block": 153600.0,
+        "total_consumed_cu": 307200000,
+        "total_process_block_ns": 11806232563,
+        "cu_per_ns": 0.026020154893674187,
+        "process_block": {
+          "mean_ms": 5.9031162815,
+          "median_ms": 5.339064,
+          "p95_ms": 8.442383,
+          "p99_ms": 10.011313,
+          "max_ms": 66.982651
+        }
+      },
+      "unlocked": {
+        "measured_blocks": 2000,
+        "average_consumed_cu_per_block": 153600.0,
+        "total_consumed_cu": 307200000,
+        "total_process_block_ns": 11577786357,
+        "cu_per_ns": 0.02653356958986076,
+        "process_block": {
+          "mean_ms": 5.7888931785,
+          "median_ms": 5.324361,
+          "p95_ms": 8.335342,
+          "p99_ms": 9.821967,
+          "max_ms": 17.895737
+        }
+      },
+      "transaction_digest_sha256": "3ff43a8910ed7275dec74147c7d305909695d4c3832882e9c3886b2cc801d101",
+      "bankhash_hex": "cd9e7429e670ade47546f57a699b5fe1a37439e3742616513f976a27455db7a1",
+      "consumed_cu_per_block": 153600,
+      "locked_mean_change_pct_by_pair": [
+        2.8395530166747562,
+        -5.079693375260186,
+        4.824124528105367,
+        6.005902620990922
+      ],
+      "median_paired_mean_change_pct": 3.8318387723900615
+    }
+  ],
+  "completed_utc": "2026-11-12T12:52:51.284128+00:00"
+}

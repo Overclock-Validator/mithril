@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/cu"
@@ -14,6 +15,9 @@ import (
 // everything observable: return value, CU, meter state, error text and PC,
 // memory contents and whether the pooled buffers came back clean.
 func runWithFastLoop(t *testing.T, p *Program, fast bool, budget uint64, seed int64) string {
+	return runWithCancelToken(t, p, fast, budget, seed, nil)
+}
+func runWithCancelToken(t *testing.T, p *Program, fast bool, budget uint64, seed int64, cancel *atomic.Bool) string {
 	t.Helper()
 	prev := useFastLoop
 	useFastLoop = fast
@@ -33,9 +37,17 @@ func runWithFastLoop(t *testing.T, p *Program, fast bool, budget uint64, seed in
 		}
 	}
 	cm := cu.NewComputeMeter(budget)
+	// Only the fast side identifies its registry, so the reference side asks
+	// the registry at every legacy call as before.
+	var syscallsID any
+	if fast {
+		syscallsID = diffRegistryID
+	}
 	ip := NewInterpreter(p, &VMOpts{
+		Cancel:                cancel,
 		HeapMax:               4096 * (1 + rng.Intn(4)),
 		Syscalls:              diffRegistry,
+		SyscallsID:            syscallsID,
 		ComputeMeter:          &cm,
 		Input:                 input,
 		InputRegions:          regions,
@@ -232,10 +244,70 @@ func BenchmarkSyscallAlternation(b *testing.B) {
 // runFast relies on handling no jmp32/pqr-class opcode; keep this list in
 // sync with its cases.
 func TestRunFastCaseClasses(t *testing.T) {
-	ops := []uint8{OpLdxb, OpLdxh, OpLdxw, OpLdxdw, OpStb, OpSth, OpStw, OpStdw, OpStxb, OpStxh, OpStxw, OpStxdw, OpAdd32Imm, OpAdd32Reg, OpAdd64Imm, OpAdd64Reg, OpSub32Imm, OpSub32Reg, OpSub64Imm, OpSub64Reg, OpMul32Imm, OpOr32Imm, OpOr32Reg, OpOr64Imm, OpOr64Reg, OpAnd32Imm, OpAnd32Reg, OpAnd64Imm, OpAnd64Reg, OpLsh32Imm, OpLsh32Reg, OpLsh64Imm, OpLsh64Reg, OpRsh32Imm, OpRsh32Reg, OpRsh64Imm, OpRsh64Reg, OpXor32Imm, OpXor32Reg, OpXor64Imm, OpXor64Reg, OpMov32Imm, OpMov32Reg, OpMov64Imm, OpMov64Reg, OpLddw, OpJa, OpJeqImm, OpJeqReg, OpJgtImm, OpJgtReg, OpJgeImm, OpJgeReg, OpJltImm, OpJltReg, OpJleImm, OpJleReg, OpJsetImm, OpJsetReg, OpJneImm, OpJneReg, OpJsgtImm, OpJsgtReg, OpJsgeImm, OpJsgeReg, OpJsltImm, OpJsltReg, OpJsleImm, OpJsleReg, OpMul32Reg, OpMul64Imm, OpMul64Reg, OpDiv32Reg, OpDiv64Imm, OpDiv64Reg, OpMod32Reg, OpMod64Imm, OpMod64Reg, OpArsh32Imm, OpArsh32Reg, OpArsh64Imm, OpArsh64Reg, OpCall, OpExit}
+	ops := []uint8{OpLdxb, OpLdxh, OpLdxw, OpLdxdw, OpStb, OpSth, OpStw, OpStdw, OpStxb, OpStxh, OpStxw, OpStxdw, OpAdd32Imm, OpAdd32Reg, OpAdd64Imm, OpAdd64Reg, OpSub32Imm, OpSub32Reg, OpSub64Imm, OpSub64Reg, OpMul32Imm, OpOr32Imm, OpOr32Reg, OpOr64Imm, OpOr64Reg, OpAnd32Imm, OpAnd32Reg, OpAnd64Imm, OpAnd64Reg, OpLsh32Imm, OpLsh32Reg, OpLsh64Imm, OpLsh64Reg, OpRsh32Imm, OpRsh32Reg, OpRsh64Imm, OpRsh64Reg, OpXor32Imm, OpXor32Reg, OpXor64Imm, OpXor64Reg, OpMov32Imm, OpMov32Reg, OpMov64Imm, OpMov64Reg, OpLddw, OpJa, OpJeqImm, OpJeqReg, OpJgtImm, OpJgtReg, OpJgeImm, OpJgeReg, OpJltImm, OpJltReg, OpJleImm, OpJleReg, OpJsetImm, OpJsetReg, OpJneImm, OpJneReg, OpJsgtImm, OpJsgtReg, OpJsgeImm, OpJsgeReg, OpJsltImm, OpJsltReg, OpJsleImm, OpJsleReg, OpMul32Reg, OpMul64Imm, OpMul64Reg, OpDiv32Reg, OpDiv64Imm, OpDiv64Reg, OpMod32Reg, OpMod64Imm, OpMod64Reg, OpArsh32Imm, OpArsh32Reg, OpArsh64Imm, OpArsh64Reg, OpLd4BReg, OpSt4BReg, OpNeg64, OpNeg32, OpHor64Imm, OpCall, OpExit}
 	for _, op := range ops {
 		if op&0x07 == ClassPqr {
 			t.Errorf("op %#x is in the jmp32/pqr class", op)
+		}
+	}
+}
+
+// neg64, neg32 and hor64 run in the fast loop wherever the version has them,
+// with the reference's results (neg32 sign-extends its 32-bit result), and the
+// loop itself completes them instead of handing them back.
+func TestFastLoopNegAndHor(t *testing.T) {
+	values := []uint64{0, 1, 5, 0x7fffffff, 0x80000000, 0xffffffff, 0x100000000, 0x8000000000000000, 0xfffffffffffffffb, 0x123456789abcdef0}
+	for _, ver := range []uint32{sbpfver.SbpfVersionV0, sbpfver.SbpfVersionV1, sbpfver.SbpfVersionV2, sbpfver.SbpfVersionV3} {
+		v := sbpfver.SbpfVersion{Version: ver}
+		var cases []struct {
+			name string
+			op   uint8
+			imm  uint32
+			want func(uint64) uint64
+		}
+		add := func(name string, op uint8, imm uint32, want func(uint64) uint64) {
+			cases = append(cases, struct {
+				name string
+				op   uint8
+				imm  uint32
+				want func(uint64) uint64
+			}{name, op, imm, want})
+		}
+		if !v.DisableNeg() {
+			add("neg64", OpNeg64, 0, func(x uint64) uint64 { return uint64(-int64(x)) })
+			add("neg32", OpNeg32, 0, func(x uint64) uint64 { return uint64(-int32(x)) })
+		}
+		if v.DisableLddw() {
+			add("hor64", OpHor64Imm, 0x9abcdef1, func(x uint64) uint64 { return x | 0x9abcdef1<<32 })
+			add("hor64 zero", OpHor64Imm, 0, func(x uint64) uint64 { return x })
+		}
+		for _, c := range cases {
+			for _, x := range values {
+				text := []Slot{slot(c.op, 3, 0, 0, c.imm), slot(OpAdd64Imm, 4, 0, 0, 1), slot(OpExit, 0, 0, 0, 0)}
+				p := mkProgram(text, ver)
+				if err := p.Verify(); err != nil {
+					t.Fatalf("v%d %s: verify: %v", ver, c.name, err)
+				}
+				resolveCallTargetsIfSupported(p)
+				cm := cu.NewComputeMeter(100)
+				ip := NewInterpreter(p, &VMOpts{HeapMax: 32 * 1024, ComputeMeter: &cm, Input: make([]byte, 64)})
+				var r [16]uint64
+				r[3] = x
+				pc, due := ip.runFast(&r, 0, 0, 100, ip.fastFlags())
+				ip.Finish()
+				if pc < 1 || due < 1 {
+					t.Fatalf("v%d %s: the fast loop declined the instruction (pc=%d due=%d)", ver, c.name, pc, due)
+				}
+				if r[3] != c.want(x) {
+					t.Fatalf("v%d %s(%#x) = %#x, want %#x", ver, c.name, x, r[3], c.want(x))
+				}
+				for _, budget := range []uint64{0, 1, 2, 3, 50} {
+					requireSameWithAndWithoutFastLoop(t, fmt.Sprintf("v%d %s", ver, c.name), p, budget, 1)
+				}
+			}
+		}
+		if len(cases) == 0 {
+			t.Fatalf("v%d has neither neg nor hor64", ver)
 		}
 	}
 }

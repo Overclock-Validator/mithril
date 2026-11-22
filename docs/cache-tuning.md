@@ -8,7 +8,7 @@ AccountsDB opens; a running cache is not resized.
 | `--index-cache-max-mb` | `index_cache_max_mb` | 256 MiB |
 | `--common-account-cache-max-mb` | `common_account_cache_max_mb` | 768 MiB |
 | `--common-account-cache-layout` | `common_account_cache_layout` | `fixed` |
-| `--program-cache-max-mb` | `program_cache_max_mb` | 1024 MiB |
+| `--program-cache-max-mb` | `program_cache_max_mb` | 4096 MiB |
 
 - `common_account_cache_layout`: `fixed` (default) gives empty accounts up to
   16 MiB and accounts of 1-200 data bytes up to 64 MiB (at most an eighth and a
@@ -20,6 +20,9 @@ AccountsDB opens; a running cache is not resized.
   configured total; they do not add to it.
 - A program's cost in the program cache is its parsed size plus its source
   bytes, rounded up to MiB.
+  At the mainnet tip a node meets about 2,100 distinct programs in two hours
+  (1.3 GiB of source). With a 1024 MiB budget they do not fit and each block
+  recompiled about 5 evicted programs; with 4096 MiB that fell to about 0.1.
 - `index_cache_max_mb` is Pebble's block cache for the account index, not for
   account data. With account prefetch, 128, 256 and 512 MiB replayed the same;
   8 MiB (the earlier default) was markedly slower.

@@ -10,6 +10,7 @@ import (
 	a "github.com/Overclock-Validator/mithril/pkg/addresses"
 	"github.com/Overclock-Validator/mithril/pkg/arena"
 	"github.com/Overclock-Validator/mithril/pkg/features"
+	"github.com/Overclock-Validator/mithril/pkg/sbpf"
 	"github.com/gagliardetto/solana-go"
 	"github.com/stretchr/testify/require"
 )
@@ -140,4 +141,59 @@ func originalDataLens(metas []serializedAcctMetadata) []uint64 {
 		lens[i] = m.originalDataLen
 	}
 	return lens
+}
+
+// SIMD-0449: the input ends with the 8-byte aligned VM address of every
+// instruction account's header; a duplicate points at the account it repeats.
+func TestSerializeParametersAlignedAccountPointers(t *testing.T) {
+	for _, mapping := range []string{"flat", "vasa", "direct"} {
+		t.Run(mapping, func(t *testing.T) {
+			ctx := serializationTestContext(t, 2)
+			if mapping != "flat" {
+				ctx.Features.EnableFeature(features.VirtualAddressSpaceAdjustments, 0)
+			}
+			if mapping == "direct" {
+				ctx.Features.EnableFeature(features.AccountDataDirectMapping, 0)
+			}
+			without, _, _, _, err := serializeParametersAligned(ctx)
+			require.NoError(t, err)
+			without = bytes.Clone(without)
+
+			ctx.Features.EnableFeature(features.DirectAccountPointersInProgramInput, 0)
+			data, instrDataOffset, metas, regions, err := serializeParametersAligned(ctx)
+			require.NoError(t, err)
+			require.Len(t, metas, 3)
+
+			// The program id ends 3 bytes past an 8-byte boundary (data len 3), so 5 bytes
+			// of zero padding precede the pointers.
+			padding := 8 - len(without)%8
+			require.Equal(t, 5, padding)
+			require.Equal(t, without, data[:len(without)])
+			require.Equal(t, make([]byte, padding), data[len(without):len(without)+padding])
+			pointers := data[len(without)+padding:]
+			require.Len(t, pointers, 8*len(metas))
+			for i, meta := range metas {
+				require.Equal(t, meta.vmKeyAddr-8, binary.LittleEndian.Uint64(pointers[8*i:]), "account %d", i)
+			}
+			require.Equal(t, binary.LittleEndian.Uint64(pointers[0:]), binary.LittleEndian.Uint64(pointers[16:]),
+				"the duplicate points at the account it repeats")
+			// The pointers follow the instruction data (3 bytes) and program id;
+			// offsets are relative to the start of the input region.
+			pointersOffset := instrDataOffset + 3 + solana.PublicKeyLength + uint64(padding)
+			require.Zero(t, pointersOffset%8)
+			require.Equal(t, metas[0].vmKeyAddr-8, sbpf.VaddrInput+8)
+
+			if mapping == "flat" {
+				require.Equal(t, pointersOffset, uint64(len(without)+padding))
+				for _, meta := range metas {
+					require.Equal(t, byte(0xff), data[meta.vmKeyAddr-8-sbpf.VaddrInput])
+				}
+				return
+			}
+			// The last region must map the pointer array, or guests fault reading it.
+			last := regions[len(regions)-1]
+			require.Equal(t, pointersOffset+8*uint64(len(metas)), last.Offset+last.RegionSize)
+			require.Equal(t, uint64(len(data)), last.HostOffset+last.RegionSize)
+		})
+	}
 }

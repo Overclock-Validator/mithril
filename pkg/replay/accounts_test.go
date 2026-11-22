@@ -50,6 +50,7 @@ func TestLoadAndValidateTxAcctsSimd186_FabricatesDefaultForMissingAccount(t *tes
 			nil, // instrs — no instructions
 			instrsAcct,
 			math.MaxUint32,
+			nil, // no overrides
 		)
 		require.NoError(t, err)
 		assert.Zero(t, loadedSize)
@@ -92,7 +93,7 @@ func TestLoadAndValidateTxAcctsSimd186_LoadedAccountTakesPrecedence(t *testing.T
 	instrsAcct := &accounts.Account{Key: sealevel.SysvarInstructionsAddr}
 
 	txAccts, _, loadedSize, err := loadAndValidateTxAcctsSimd186(
-		slotCtx, nil, tx, nil, instrsAcct, math.MaxUint32,
+		slotCtx, nil, tx, nil, instrsAcct, math.MaxUint32, nil,
 	)
 	require.NoError(t, err)
 	assert.Equal(t, uint32(txAcctBaseSize), loadedSize)
@@ -129,7 +130,7 @@ func TestLoadAndValidateTxAcctsSimd186_ProgramRejectsFabricatedDefault(t *testin
 	instrsAcct := &accounts.Account{Key: sealevel.SysvarInstructionsAddr}
 
 	_, _, _, err := loadAndValidateTxAcctsSimd186(
-		slotCtx, nil, tx, instrs, instrsAcct, math.MaxUint32,
+		slotCtx, nil, tx, instrs, instrsAcct, math.MaxUint32, nil,
 	)
 	require.Error(t, err, "fabricated default with lamports=0 must be rejected as a program")
 	assert.Equal(t, TxErrProgramAccountNotFound, err)
@@ -163,7 +164,7 @@ func TestLoadAndValidateTxAcctsSimd186_MixedLoadedAndMissing(t *testing.T) {
 	instrsAcct := &accounts.Account{Key: sealevel.SysvarInstructionsAddr}
 
 	txAccts, _, loadedSize, err := loadAndValidateTxAcctsSimd186(
-		slotCtx, nil, tx, nil, instrsAcct, math.MaxUint32,
+		slotCtx, nil, tx, nil, instrsAcct, math.MaxUint32, nil,
 	)
 	require.NoError(t, err)
 	assert.Equal(t, uint32(txAcctBaseSize), loadedSize)
@@ -219,4 +220,53 @@ func TestLoadedAcctSizeAccumulatorSimd186MissingProgramDataWithoutDatabase(t *te
 		require.NoError(t, accumulator.collectAcct(account))
 	})
 	assert.Equal(t, uint32(txAcctBaseSize+len(programState)), accumulator.loadedAccountsDataSize())
+}
+
+// An early execution's predicted payer must be what the loaders see: the
+// turn validates that object, so slot state read in between (here a transient
+// shape, another owner and allocated data, that an earlier transaction later
+// undoes) must never decide the loaded size or a loader error. Both loaders,
+// and the fee-only rollback size.
+func TestLoadersReadAccountOverrides(t *testing.T) {
+	payer := testPubkey(1)
+	transient := &accounts.Account{Key: payer, Owner: testPubkey(9), Lamports: 5_000_000, Data: make([]byte, 10_000), RentEpoch: math.MaxUint64}
+	predicted := &accounts.Account{Key: payer, Owner: addresses.SystemProgramAddr, Lamports: 4_995_000, RentEpoch: math.MaxUint64}
+	overrides := map[solana.PublicKey]*accounts.Account{payer: predicted}
+	tx := &solana.Transaction{Message: solana.Message{
+		Header:      solana.MessageHeader{NumRequiredSignatures: 1},
+		AccountKeys: []solana.PublicKey{payer},
+	}}
+	instrsAcct := &accounts.Account{Key: sealevel.SysvarInstructionsAddr}
+	limit := uint32(txAcctBaseSize + 100) // the transient data would exceed it
+
+	t.Run("simd186", func(t *testing.T) {
+		slotCtx := newSimd186SlotCtx()
+		require.NoError(t, slotCtx.Accounts.(accounts.MemAccounts).SetAccountWithoutLock(payer, transient))
+		_, _, _, err := loadAndValidateTxAcctsSimd186(slotCtx, nil, tx, nil, instrsAcct, limit, nil)
+		require.ErrorIs(t, err, TxErrMaxLoadedAccountsDataSizeExceeded, "slot state alone exceeds the limit")
+
+		txAccts, _, size, err := loadAndValidateTxAcctsSimd186(slotCtx, nil, tx, nil, instrsAcct, limit, overrides)
+		require.NoError(t, err)
+		assert.Equal(t, uint32(txAcctBaseSize), size)
+		assert.Same(t, predicted, txAccts.Accounts[0])
+		assert.True(t, txAccts.Shared[0], "a write must clone the override, never change it")
+	})
+	t.Run("legacy", func(t *testing.T) {
+		slotCtx := &sealevel.SlotCtx{Accounts: accounts.NewMemAccounts(), Features: features.NewFeaturesDefault()}
+		require.NoError(t, slotCtx.Accounts.(accounts.MemAccounts).SetAccountWithoutLock(payer, transient))
+		_, _, _, err := loadAndValidateTxAccts(slotCtx, nil, tx, nil, instrsAcct, 100, nil)
+		require.ErrorIs(t, err, TxErrMaxLoadedAccountsDataSizeExceeded)
+
+		txAccts, _, size, err := loadAndValidateTxAccts(slotCtx, nil, tx, nil, instrsAcct, 100, overrides)
+		require.NoError(t, err)
+		assert.Zero(t, size)
+		assert.Same(t, predicted, txAccts.Accounts[0])
+	})
+	t.Run("fee-only rollback size", func(t *testing.T) {
+		slotCtx := newSimd186SlotCtx()
+		require.NoError(t, slotCtx.Accounts.(accounts.MemAccounts).SetAccountWithoutLock(payer, transient))
+		assert.Equal(t, feeOnlyRollbackAccountsDataSize(slotCtx, tx, nil, map[solana.PublicKey]*accounts.Account{payer: transient}),
+			feeOnlyRollbackAccountsDataSize(slotCtx, tx, nil, nil), "same account, same size")
+		assert.Less(t, feeOnlyRollbackAccountsDataSize(slotCtx, tx, nil, overrides), feeOnlyRollbackAccountsDataSize(slotCtx, tx, nil, nil))
+	})
 }

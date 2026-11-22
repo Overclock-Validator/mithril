@@ -212,14 +212,19 @@ func serveBufconn(t *testing.T, register func(*grpc.Server)) DialConfig {
 // one does.
 type mockBlockEngine struct {
 	blockenginepb.UnimplementedBlockEngineValidatorServer
-	packets    chan *blockenginepb.SubscribePacketsResponse
-	blocks     chan *blockpb.Block
-	endBlocks  chan error
-	blocksLive atomic.Int32
-	blockSubs  atomic.Int32
+	packets     chan *blockenginepb.SubscribePacketsResponse
+	bundles     chan *blockenginepb.SubscribeBundlesResponse
+	endBundles  chan error
+	bundlesLive atomic.Int32
+	bundleSubs  atomic.Int32
+	blocks      chan *blockpb.Block
+	endBlocks   chan error
+	blocksLive  atomic.Int32
+	blockSubs   atomic.Int32
 
 	mu            sync.Mutex
 	strategyErrs  []error
+	bundleErrs    []error
 	noticeErr     error
 	feeInfo       *blockenginepb.BlockBuilderFeeInfoResponse
 	strategies    []blockenginepb.SchedulingStrategy
@@ -229,10 +234,12 @@ type mockBlockEngine struct {
 
 func newMockBlockEngine() *mockBlockEngine {
 	return &mockBlockEngine{
-		packets:   make(chan *blockenginepb.SubscribePacketsResponse, 16),
-		blocks:    make(chan *blockpb.Block, 16),
-		endBlocks: make(chan error, 1),
-		feeInfo:   &blockenginepb.BlockBuilderFeeInfoResponse{Pubkey: "11111111111111111111111111111112", Commission: 5},
+		packets:    make(chan *blockenginepb.SubscribePacketsResponse, 16),
+		bundles:    make(chan *blockenginepb.SubscribeBundlesResponse, 16),
+		endBundles: make(chan error, 1),
+		blocks:     make(chan *blockpb.Block, 16),
+		endBlocks:  make(chan error, 1),
+		feeInfo:    &blockenginepb.BlockBuilderFeeInfoResponse{Pubkey: "11111111111111111111111111111112", Commission: 5},
 	}
 }
 
@@ -296,6 +303,38 @@ func (m *mockBlockEngine) SubscribePackets(_ *blockenginepb.SubscribePacketsRequ
 		case <-stream.Context().Done():
 			return nil
 		case msg := <-m.packets:
+			if err := stream.Send(msg); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func (m *mockBlockEngine) SubscribeBundles2(_ *blockenginepb.SubscribeBundlesRequest, stream blockenginepb.BlockEngineValidator_SubscribeBundles2Server) error {
+	if err := requireBearer(stream.Context()); err != nil {
+		return err
+	}
+	m.bundleSubs.Add(1)
+	m.mu.Lock()
+	if len(m.bundleErrs) > 0 {
+		err := m.bundleErrs[0]
+		m.bundleErrs = m.bundleErrs[1:]
+		m.mu.Unlock()
+		return err
+	}
+	m.mu.Unlock()
+	m.bundlesLive.Add(1)
+	defer m.bundlesLive.Add(-1)
+	if err := stream.SendHeader(metadata.MD{}); err != nil {
+		return err
+	}
+	for {
+		select {
+		case <-stream.Context().Done():
+			return nil
+		case err := <-m.endBundles:
+			return err
+		case msg := <-m.bundles:
 			if err := stream.Send(msg); err != nil {
 				return err
 			}

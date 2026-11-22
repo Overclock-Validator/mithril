@@ -64,7 +64,18 @@ func recordTxAcctCowClone(oldDataLen, copiedBytes uint64) {
 	TxAcctsReplacedBytes.Add(oldDataLen - copiedBytes)
 }
 
-func loadAndValidateTxAccts(slotCtx *sealevel.SlotCtx, txAcctMetas []*solana.AccountMeta, tx *solana.Transaction, instrs []sealevel.Instruction, instrsAcct *accounts.Account, loadedAcctBytesLimit uint32) (*sealevel.TransactionAccounts, []*solana.AccountMeta, uint32, error) {
+// sharedAccount is how the loaders read an account: from overrides when the
+// key is there (an early execution's predicted accounts, so every check sees
+// the account the execution and the turn's validation see), else from slot
+// state.
+func sharedAccount(slotCtx *sealevel.SlotCtx, overrides map[solana.PublicKey]*accounts.Account, key solana.PublicKey) (*accounts.Account, error) {
+	if acct, ok := overrides[key]; ok {
+		return acct, nil
+	}
+	return slotCtx.GetAccountShared(key)
+}
+
+func loadAndValidateTxAccts(slotCtx *sealevel.SlotCtx, txAcctMetas []*solana.AccountMeta, tx *solana.Transaction, instrs []sealevel.Instruction, instrsAcct *accounts.Account, loadedAcctBytesLimit uint32, overrides map[solana.PublicKey]*accounts.Account) (*sealevel.TransactionAccounts, []*solana.AccountMeta, uint32, error) {
 	var loadedBytesAccumulator uint32
 	if txAcctMetas == nil {
 		var err error
@@ -105,13 +116,13 @@ func loadAndValidateTxAccts(slotCtx *sealevel.SlotCtx, txAcctMetas []*solana.Acc
 			acct = instrsAcct
 			isInstructionsSysvarAcct = true
 		} else if !slotCtx.Features.IsActive(features.DisableAccountLoaderSpecialCase) && slices.Contains(programIdIdxs, uint64(idx)) && !acctMeta.IsWritable && !instrContainsAcctMeta {
-			tmp, err := slotCtx.GetAccountShared(acctMeta.PublicKey)
+			tmp, err := sharedAccount(slotCtx, overrides, acctMeta.PublicKey)
 			if err != nil {
 				return nil, nil, loadedBytesAccumulator, err
 			}
 			acct = &accounts.Account{Key: acctMeta.PublicKey, Owner: tmp.Owner, Executable: true, IsDummy: true}
 		} else {
-			acct, err = slotCtx.GetAccountShared(acctMeta.PublicKey)
+			acct, err = sharedAccount(slotCtx, overrides, acctMeta.PublicKey)
 			if err != nil {
 				return nil, nil, loadedBytesAccumulator, err
 			}
@@ -149,7 +160,7 @@ func loadAndValidateTxAccts(slotCtx *sealevel.SlotCtx, txAcctMetas []*solana.Acc
 			continue
 		}
 
-		programAcct, err := slotCtx.GetAccountShared(instr.ProgramId)
+		programAcct, err := sharedAccount(slotCtx, overrides, instr.ProgramId)
 		if err != nil {
 			return nil, nil, loadedBytesAccumulator, TxErrProgramAccountNotFound
 		}
@@ -170,7 +181,7 @@ func loadAndValidateTxAccts(slotCtx *sealevel.SlotCtx, txAcctMetas []*solana.Acc
 		_, exists := validatedLoaders[owner]
 		if !exists {
 			var ownerAcct *accounts.Account
-			ownerAcct, err = slotCtx.GetAccountShared(owner)
+			ownerAcct, err = sharedAccount(slotCtx, overrides, owner)
 			if err != nil {
 				ownerAcct, err = slotCtx.GetAccountFromAccountsDb(owner)
 				if err != nil {
@@ -205,6 +216,7 @@ type loadedAcctSizeAccumulatorSimd186 struct {
 	acctKeys              []solana.PublicKey
 	additionalLoadedAccts map[solana.PublicKey]struct{}
 	slotCtx               *sealevel.SlotCtx
+	overrides             map[solana.PublicKey]*accounts.Account
 }
 
 func NewLoadedAcctSizeAccumulatorSimd186(
@@ -257,23 +269,20 @@ func (accum *loadedAcctSizeAccumulatorSimd186) collectAcct(acct *accounts.Accoun
 		if err == nil && acctState.Type == sealevel.UpgradeableLoaderStateTypeProgram {
 			programDataAddr := acctState.Program.ProgramDataAddress
 			if !accum.wasAlreadyCounted(programDataAddr) {
-				// program data account not being found is not an error. Agave instead ignores it.
-				programDataAcct, err := accum.slotCtx.GetAccountShared(programDataAddr)
-				var programDataLen uint64
-				if err != nil {
-					if accum.slotCtx.UnrootedRead == nil && accum.slotCtx.AccountsDb == nil {
-						return nil
-					}
-					programDataLen, err = accum.slotCtx.GetAccountDataLenFromAccountsDb(programDataAddr)
-					if err != nil {
-						return nil
-					}
-				} else {
-					programDataLen = uint64(len(programDataAcct.Data))
+				floorActive := accum.slotCtx.Features.IsActive(features.LoaderV3ProgramDataSizeFloor)
+				programDataLen, exists := accum.programDataLen(programDataAddr, floorActive)
+				var chargedSize uint64
+				if floorActive {
+					// Agave charges this minimum even for missing or closed ProgramData.
+					// Explicit transaction accounts and repeated implicit references are
+					// excluded by wasAlreadyCounted above.
+					chargedSize = safemath.SaturatingAddU64(txAcctBaseSize,
+						max(programDataLen, upgradeableLoaderProgramDataMetadataSize))
+				} else if exists {
+					chargedSize = safemath.SaturatingAddU64(txAcctBaseSize, programDataLen)
 				}
-				accum.accumulator = safemath.SaturatingAddU64(accum.accumulator, safemath.SaturatingAddU64(txAcctBaseSize, programDataLen))
-				if accum.accumulator > accum.limit {
-					return TxErrMaxLoadedAccountsDataSizeExceeded
+				if err := accum.add(chargedSize); err != nil {
+					return err
 				}
 				accum.additionalLoadedAccts[programDataAddr] = struct{}{}
 			}
@@ -283,6 +292,28 @@ func (accum *loadedAcctSizeAccumulatorSimd186) collectAcct(acct *accounts.Accoun
 	return nil
 }
 
+// programDataLen preserves current-bank precedence. For the new accounting
+// rule, zero-lamport accounts are absent, as in Agave's account loader. Borrow
+// the immutable parent to inspect its lamports without copying program bytes.
+// Keep the legacy metadata-only read unchanged before feature activation.
+func (accum *loadedAcctSizeAccumulatorSimd186) programDataLen(key solana.PublicKey, floorActive bool) (uint64, bool) {
+	acct, err := sharedAccount(accum.slotCtx, accum.overrides, key)
+	if err != nil {
+		if accum.slotCtx.UnrootedRead == nil && accum.slotCtx.AccountsDb == nil {
+			return 0, false
+		}
+		if !floorActive {
+			size, err := accum.slotCtx.GetAccountDataLenFromAccountsDb(key)
+			return size, err == nil
+		}
+		acct, err = accum.slotCtx.ParentAccountReadOnly(key)
+	}
+	if err != nil || acct == nil || (floorActive && acct.Lamports == 0) {
+		return 0, false
+	}
+	return uint64(len(acct.Data)), true
+}
+
 func isLoaderAcct(owner solana.PublicKey) bool {
 	return owner == addresses.BpfLoaderUpgradeableAddr ||
 		owner == addresses.BpfLoader2Addr ||
@@ -290,7 +321,7 @@ func isLoaderAcct(owner solana.PublicKey) bool {
 		owner == addresses.LoaderV4Addr
 }
 
-func loadAndValidateTxAcctsSimd186(slotCtx *sealevel.SlotCtx, txAcctMetas []*solana.AccountMeta, tx *solana.Transaction, instrs []sealevel.Instruction, instrsAcct *accounts.Account, loadedAcctBytesLimit uint32) (*sealevel.TransactionAccounts, []*solana.AccountMeta, uint32, error) {
+func loadAndValidateTxAcctsSimd186(slotCtx *sealevel.SlotCtx, txAcctMetas []*solana.AccountMeta, tx *solana.Transaction, instrs []sealevel.Instruction, instrsAcct *accounts.Account, loadedAcctBytesLimit uint32, overrides map[solana.PublicKey]*accounts.Account) (*sealevel.TransactionAccounts, []*solana.AccountMeta, uint32, error) {
 	if txAcctMetas == nil {
 		var err error
 		txAcctMetas, err = tx.AccountMetaList()
@@ -303,6 +334,7 @@ func loadAndValidateTxAcctsSimd186(slotCtx *sealevel.SlotCtx, txAcctMetas []*sol
 	accumulator := NewLoadedAcctSizeAccumulatorSimd186(slotCtx,
 		uint64(loadedAcctBytesLimit),
 		acctKeys)
+	accumulator.overrides = overrides
 
 	addrTableLookupCost := safemath.SaturatingMulU64(uint64(len(tx.Message.AddressTableLookups)), addrLookupTableBaseSize)
 	err := accumulator.add(addrTableLookupCost)
@@ -322,7 +354,7 @@ func loadAndValidateTxAcctsSimd186(slotCtx *sealevel.SlotCtx, txAcctMetas []*sol
 			}
 			acct = instrsAcct
 		} else {
-			acct, err = slotCtx.GetAccountShared(pubkey)
+			acct, err = sharedAccount(slotCtx, overrides, pubkey)
 			if err != nil && slotCtx.AccountsDb != nil {
 				// Fall back to full accountsdb so native programs
 				// (System, BPF Loader, etc.) and other always-on
@@ -418,7 +450,7 @@ func loadAndValidateTxAcctsSimd186(slotCtx *sealevel.SlotCtx, txAcctMetas []*sol
 		// Fallback if not in cache or out of bounds
 		if programAcct == nil {
 			var err error
-			programAcct, err = slotCtx.GetAccountShared(instr.ProgramId)
+			programAcct, err = sharedAccount(slotCtx, overrides, instr.ProgramId)
 			if err != nil {
 				programAcct, err = slotCtx.GetAccountFromAccountsDb(instr.ProgramId)
 				if err != nil {

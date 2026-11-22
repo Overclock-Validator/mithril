@@ -9,6 +9,7 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/features"
 	"github.com/Overclock-Validator/mithril/pkg/lthash"
 	"github.com/Overclock-Validator/mithril/pkg/replay"
+	"github.com/Overclock-Validator/mithril/pkg/rewards"
 	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/gagliardetto/solana-go"
 )
@@ -29,6 +30,7 @@ type ParentContext struct {
 	ParentBlockHeight          uint64
 	LatestEvictedBlockhash     [32]byte
 	EpochRewardsActive         bool
+	EpochRewardPlan            *rewards.PartitionedRewardPlan
 	PrevNumSigs                uint64 // signatures processed in the parent bank; fee-governor input only
 	PrevFeeGovernor            *sealevel.FeeRateGovernor
 	AcctsLtHash                *lthash.LtHash
@@ -72,22 +74,24 @@ func NewLeaderSlotCtx(slot, parentSlot uint64, acctsDb *accountsdb.AccountsDb, p
 	}
 
 	slotCtx := &sealevel.SlotCtx{
-		Slot:                   slot,
-		ParentSlot:             parentSlot,
-		Epoch:                  epoch,
-		Accounts:               accounts.NewMemAccounts(),
-		ParentAccts:            accounts.NewMemAccounts(),
-		AccountsDb:             acctsDb,
-		UnrootedRead:           parent.UnrootedRead,
-		Features:               feats,
-		FeeRateGovernor:        feeGovernor,
-		LastBlockhash:          lastBlockhash,
-		LatestEvictedBlockhash: parent.LatestEvictedBlockhash,
-		AcctMapsMu:             &sync.Mutex{},
-		ModifiedAccts:          make(map[solana.PublicKey]bool),
-		WritableAccts:          make(map[solana.PublicKey]bool),
-		VoteTimestampMu:        &sync.Mutex{},
-		VoteTimestamps:         make(map[solana.PublicKey]sealevel.BlockTimestamp),
+		// Publication follows ordered replay adoption, not speculative production.
+		DeferVoteCachePublication: true,
+		Slot:                      slot,
+		ParentSlot:                parentSlot,
+		Epoch:                     epoch,
+		Accounts:                  accounts.NewMemAccounts(),
+		ParentAccts:               accounts.NewMemAccounts(),
+		AccountsDb:                acctsDb,
+		UnrootedRead:              parent.UnrootedRead,
+		Features:                  feats,
+		FeeRateGovernor:           feeGovernor,
+		LastBlockhash:             lastBlockhash,
+		LatestEvictedBlockhash:    parent.LatestEvictedBlockhash,
+		AcctMapsMu:                &sync.Mutex{},
+		ModifiedAccts:             make(map[solana.PublicKey]bool),
+		WritableAccts:             make(map[solana.PublicKey]bool),
+		VoteTimestampMu:           &sync.Mutex{},
+		VoteTimestamps:            make(map[solana.PublicKey]sealevel.BlockTimestamp),
 		// EpochStakes is immutable for the epoch and is replaced, rather than
 		// mutated, at an epoch transition. Share it so leader creation does not
 		// copy the validator stake map every slot.

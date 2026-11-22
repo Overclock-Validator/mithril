@@ -18,6 +18,7 @@ const (
 	hash_sol_log_data                          = 0x7317b434
 	hash_sol_sha256                            = 0x11f49d86
 	hash_sol_keccak256                         = 0xd7793abb
+	hash_sol_sha512                            = 0x9229cdcc
 	hash_sol_blake3                            = 0x174c5122
 	hash_sol_secp256k1_recover                 = 0x17e40350
 	hash_sol_poseidon                          = 0xc4947c21
@@ -74,6 +75,9 @@ func Syscalls(ft *features.Features, isDeploy bool, h uint32) (f sbpf.Syscall, o
 		f = SyscallSha256
 	case hash_sol_keccak256:
 		f = SyscallKeccak256
+	case hash_sol_sha512:
+		f = SyscallSha512
+		ok = ft.IsActive(features.EnableSha512Syscall)
 	case hash_sol_blake3:
 		f = SyscallBlake3
 		ok = ft.IsActive(features.Blake3SyscallEnabled)

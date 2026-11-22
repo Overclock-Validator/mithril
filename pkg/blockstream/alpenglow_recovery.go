@@ -28,8 +28,9 @@ func cloneAlpenglowExclusions(src map[uint64]map[solana.Hash]struct{}) map[uint6
 	return dst
 }
 
-// CaptureAlpenglowRecoveryState must run after the old source has stopped, so
-// its last accepted switch and any later certificate overrides are included.
+// CaptureAlpenglowRecoveryState takes a consistent snapshot of exclusions.
+// A replacement source uses it after shutdown; persistent reception captures
+// it while replay is detached and continues using the original live maps.
 func (bs *BlockSource) CaptureAlpenglowRecoveryState() *AlpenglowRecoveryState {
 	if bs.sourceType != BlockSourceTurbine || !bs.turbineAlpenglowBlockIDHints {
 		return nil

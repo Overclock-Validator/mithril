@@ -60,6 +60,9 @@ type discardLogger struct{}
 
 func (discardLogger) Log(string) {}
 
+// DiscardsLogs tells the log syscalls not to format lines for this logger.
+func (discardLogger) DiscardsLogs() bool { return true }
+
 func newExecCtx(slotCtx *sealevel.SlotCtx, transactionAccts *sealevel.TransactionAccounts, computeBudgetLimits *sealevel.ComputeBudgetLimits, log sealevel.Logger) *sealevel.ExecutionCtx {
 	txCtx := sealevel.NewTransactionCtx(*transactionAccts, maxStackCapacity, maxInstrTraceCapacity)
 	if bankSysvars := slotCtx.BankSysvars(); bankSysvars != nil {
@@ -248,7 +251,7 @@ func handleModifiedAccounts(slotCtx *sealevel.SlotCtx, execCtx *sealevel.Executi
 	return stats
 }
 
-func recordStakeDelegation(slot uint64, acct *accounts.Account) {
+func recordStakeDelegation(slotCtx *sealevel.SlotCtx, acct *accounts.Account) {
 	isEmpty := acct.Lamports == 0
 	isUninitialized := true
 
@@ -261,7 +264,16 @@ func recordStakeDelegation(slot uint64, acct *accounts.Account) {
 		// Slot-keyed enqueue: the entry reaches the durable index only when
 		// this slot folds; an unwound wrong-fork slot drops it. Scans see it
 		// from RAM meanwhile (StreamStakeAccounts merges pending entries).
-		global.EnqueuePendingStakePubkey(slot, acct.Key)
+		if slotCtx.DeferVoteCachePublication {
+			slotCtx.PendingVoteCacheMu.Lock()
+			if slotCtx.PendingStakePubkeys == nil {
+				slotCtx.PendingStakePubkeys = make(map[solana.PublicKey]struct{})
+			}
+			slotCtx.PendingStakePubkeys[acct.Key] = struct{}{}
+			slotCtx.PendingVoteCacheMu.Unlock()
+		} else {
+			global.EnqueuePendingStakePubkey(slotCtx.Slot, acct.Key)
+		}
 	}
 }
 
@@ -299,7 +311,7 @@ func recordStakeAndVoteAccount(slotCtx *sealevel.SlotCtx, execCtx *sealevel.Exec
 	if acct.Lamports == 0 || acct.Owner != a.VoteProgramAddr {
 		if voteCacheHas(slotCtx, acct.Key) {
 			deleteVoteCacheItem(slotCtx, acct.Key)
-			markSlotVoteStakeDirty(slotCtx) // global cache mutated — gates in-loop unwind
+			markSlotVoteStakeDirty(slotCtx)
 		}
 	} else if modifiedVoteAccts {
 		recordVoteTimestampAndSlot(slotCtx, acct)
@@ -311,7 +323,7 @@ func recordStakeAndVoteAccount(slotCtx *sealevel.SlotCtx, execCtx *sealevel.Exec
 	}
 
 	if acct.Owner == a.StakeProgramAddr {
-		recordStakeDelegation(slotCtx.Slot, acct)
+		recordStakeDelegation(slotCtx, acct)
 		markSlotVoteStakeDirty(slotCtx)
 	}
 }
@@ -331,13 +343,21 @@ func voteCacheHas(slotCtx *sealevel.SlotCtx, key solana.PublicKey) bool {
 		if _, pending := slotCtx.PendingVoteCache[key]; pending {
 			return true
 		}
+		// A leader can run ahead of accepted replay or across a fork switch.
+		// Its pinned parent image, rather than the current global cache, tells
+		// us whether closing/reassigning this account needs a deferred delete.
+		if slotCtx.ParentAccts != nil {
+			if parent, err := slotCtx.GetParentAccount(key); err == nil && parent != nil {
+				return parent.Owner == a.VoteProgramAddr && parent.Lamports != 0
+			}
+		}
 	}
 	return global.VoteCacheItem(key) != nil
 }
 
 func putVoteCacheItem(slotCtx *sealevel.SlotCtx, key solana.PublicKey, state *sealevel.VoteStateVersions) {
 	if !slotCtx.DeferVoteCachePublication {
-		global.PutVoteCacheItem(key, state)
+		global.PutVoteCacheItemForSlot(slotCtx.Slot, key, state)
 		return
 	}
 	slotCtx.PendingVoteCacheMu.Lock()
@@ -351,7 +371,7 @@ func putVoteCacheItem(slotCtx *sealevel.SlotCtx, key solana.PublicKey, state *se
 
 func deleteVoteCacheItem(slotCtx *sealevel.SlotCtx, key solana.PublicKey) {
 	if !slotCtx.DeferVoteCachePublication {
-		global.DeleteVoteCacheItem(key)
+		global.DeleteVoteCacheItemForSlot(slotCtx.Slot, key)
 		return
 	}
 	slotCtx.PendingVoteCacheMu.Lock()
@@ -370,13 +390,13 @@ func markSlotVoteStakeDirty(slotCtx *sealevel.SlotCtx) {
 		slotCtx.PendingVoteCacheMu.Unlock()
 		return
 	}
-	markVoteStakeDirty(slotCtx.Slot)
+	// Immediate writes are journaled; stake discoveries are owned by this slot.
 }
 
 // publishDeferredVoteCache applies a speculative bank's buffered vote-cache
-// changes and dirty marker. It is called by the streaming finalize step after
-// the complete block has been matched to the executed prefix and is a no-op
-// for banks that published immediately.
+// changes and stake discoveries. Streaming calls it after matching the full
+// block; locally produced banks call it only after ordered replay adoption.
+// It is a no-op for banks that published immediately.
 func publishDeferredVoteCache(slotCtx *sealevel.SlotCtx) {
 	if slotCtx == nil || !slotCtx.DeferVoteCachePublication {
 		return
@@ -384,20 +404,21 @@ func publishDeferredVoteCache(slotCtx *sealevel.SlotCtx) {
 	slotCtx.PendingVoteCacheMu.Lock()
 	puts := slotCtx.PendingVoteCache
 	deletes := slotCtx.PendingVoteCacheDeletes
-	dirty := slotCtx.VoteStakeDirty
+	stakeKeys := slotCtx.PendingStakePubkeys
 	slotCtx.PendingVoteCache = nil
 	slotCtx.PendingVoteCacheDeletes = nil
+	slotCtx.PendingStakePubkeys = nil
 	slotCtx.VoteStakeDirty = false
 	slotCtx.DeferVoteCachePublication = false
 	slotCtx.PendingVoteCacheMu.Unlock()
 	for key := range deletes {
-		global.DeleteVoteCacheItem(key)
+		global.DeleteVoteCacheItemForSlot(slotCtx.Slot, key)
 	}
 	for key, state := range puts {
-		global.PutVoteCacheItem(key, state)
+		global.PutVoteCacheItemForSlot(slotCtx.Slot, key, state)
 	}
-	if dirty {
-		markVoteStakeDirty(slotCtx.Slot)
+	for key := range stakeKeys {
+		global.EnqueuePendingStakePubkey(slotCtx.Slot, key)
 	}
 }
 
@@ -707,12 +728,18 @@ func processTransactionComputeUnits(execCtx *sealevel.ExecutionCtx) uint64 {
 }
 
 func ProcessTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, tx *solana.Transaction, txMeta *rpc.TransactionMeta, dbgOpts *DebugOptions, arena *arena.Arena[sealevel.BorrowedAccount], shouldVerifySignatures bool) (*fees.TxFeeInfo, uint64, error) {
-	return processTransactionWithTimings(slotCtx, sigverifyWg, tx, txMeta, dbgOpts, arena, shouldVerifySignatures, nil)
+	return processTransaction(slotCtx, sigverifyWg, tx, txMeta, dbgOpts, arena, shouldVerifySignatures, nil, nil)
 }
 
-// The recorder belongs to the calling replay worker and is cleared before the
-// execution context returns to any caller. Independent callers retain atomics.
-func processTransactionWithTimings(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, tx *solana.Transaction, txMeta *rpc.TransactionMeta, dbgOpts *DebugOptions, arena *arena.Arena[sealevel.BorrowedAccount], shouldVerifySignatures bool, timings *metrics.TransactionTimings) (*fees.TxFeeInfo, uint64, error) {
+// processTransaction is ProcessTransaction. A non-nil executed output, from an
+// execution of this transaction whose inputs are still the committed ones, is
+// finished and published in place of executing again; every check and side
+// effect outside execution runs exactly as for a fresh execution.
+//
+// The timings recorder belongs to the calling replay worker and is cleared
+// before the execution context returns to any caller. Independent callers
+// retain atomics.
+func processTransaction(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.WaitGroup, tx *solana.Transaction, txMeta *rpc.TransactionMeta, dbgOpts *DebugOptions, arena *arena.Arena[sealevel.BorrowedAccount], shouldVerifySignatures bool, executed *LoadAndExecuteTransactionOutput, timings *metrics.TransactionTimings) (*fees.TxFeeInfo, uint64, error) {
 	if trace.IsEnabled() && slotCtx.TraceCtx != nil {
 		regionType := "ProcessTransaction"
 		if tx.IsVote() {
@@ -755,7 +782,7 @@ func processTransactionWithTimings(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.
 		enqueueSigverify(sigverifySnapshot, sigverifyWg)
 	}
 
-	debugTx := len(tx.Signatures) > 0 && dbgOpts != nil && dbgOpts.IsDebugTx(tx.Signatures[0])
+	debugTx := isDebugTransaction(tx, dbgOpts)
 	captureTx := len(tx.Signatures) > 0 && txCaptureActive()
 	if debugTx {
 		mlog.Log.Infof("Turning on debug logs while executing tx %s", tx.Signatures[0])
@@ -764,19 +791,14 @@ func processTransactionWithTimings(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.
 	}
 
 	// Execute via pure function
-	input := LoadAndExecuteTransactionInput{
-		SlotCtx:     slotCtx,
-		Transaction: tx,
-		Arena:       arena,
-		TxMeta:      txMeta,
-		LeanResult:  true,
-		// On-chain metadata and the trailing verifier are the only replay
-		// consumers of pre-balances. Ordinary production transactions skip it.
-		CapturePreBalances: txMeta != nil || captureTx,
-		RecordLogs:         debugTx,
+	var output LoadAndExecuteTransactionOutput
+	if executed != nil {
+		output = *executed
+	} else {
+		input := transactionExecutionInput(slotCtx, tx, txMeta, arena, debugTx, captureTx)
+		input.TimingRecorder = timings
+		output = LoadAndExecuteTransaction(input)
 	}
-	input.TimingRecorder = timings
-	output := LoadAndExecuteTransaction(input)
 
 	execCtx := output.ExecCtx
 	if execCtx != nil {
@@ -979,6 +1001,27 @@ func processTransactionWithTimings(slotCtx *sealevel.SlotCtx, sigverifyWg *sync.
 	}
 
 	return txFeeInfo, processTransactionComputeUnits(execCtx), nil
+}
+
+func isDebugTransaction(tx *solana.Transaction, dbgOpts *DebugOptions) bool {
+	return len(tx.Signatures) > 0 && dbgOpts != nil && dbgOpts.IsDebugTx(tx.Signatures[0])
+}
+
+// transactionExecutionInput is the replay execution input for tx; every
+// execution of a replayed transaction, early or not, must use it.
+func transactionExecutionInput(slotCtx *sealevel.SlotCtx, tx *solana.Transaction, txMeta *rpc.TransactionMeta, arena *arena.Arena[sealevel.BorrowedAccount], debugTx, captureTx bool) LoadAndExecuteTransactionInput {
+	return LoadAndExecuteTransactionInput{
+		SlotCtx:     slotCtx,
+		Transaction: tx,
+		Arena:       arena,
+		TxMeta:      txMeta,
+		LeanResult:  true,
+		// On-chain metadata and the trailing verifier are the only replay
+		// consumers of pre-balances. Ordinary production transactions skip it.
+		CapturePreBalances: txMeta != nil || captureTx,
+		RecordLogs:         debugTx,
+		SkipTimingMetrics:  SkipPhaseTimers,
+	}
 }
 
 // txComparabilityMask marks account indices the trailing verifier must not

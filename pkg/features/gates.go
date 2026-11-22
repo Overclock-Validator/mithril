@@ -86,6 +86,7 @@ var ProvideInstructionDataOffsetInVmR2 = newGate("ProvideInstructionDataOffsetIn
 var SyscallParameterAddressRestrictions = newGate("SyscallParameterAddressRestrictions", "EDGMC5kxFxGk4ixsNkGt8bW7QL5hDMXnbwaZvYMwNfzF")
 var VirtualAddressSpaceAdjustments = newGate("VirtualAddressSpaceAdjustments", "7VgiehxNxu53KdxgLspGQY8myE6f7UokaWa4jsGcaSz")
 var AccountDataDirectMapping = newGate("AccountDataDirectMapping", "CR3dVN2Yoo95Y96kLSTaziWDAQT2MNEpiWh5cqVq2pNE")
+var DirectAccountPointersInProgramInput = newGate("DirectAccountPointersInProgramInput", "ptr9umikaeAS7ZBBp2fsfRhie16F1V2jCKA2y6gXNAK")
 var VoteStateV4 = newGate("VoteStateV4", "Gx4XFcrVMt4HUvPzTpTSVkdDVgcDSjKhDN1RqRS6KDuZ")
 var BlsPubkeyManagementInVoteAccount = newGate("BlsPubkeyManagementInVoteAccount", "AnAP9zPV4KL7czAPQbFhpDKV2tx7g4UGNbK9wvXwjaRo")
 var CommissionRateInBasisPoints = newGate("CommissionRateInBasisPoints", "Eg7tXEwMZzS98xaZ1YHUbdRHsaYZiCsSaR6sKgxreoaj")
@@ -106,6 +107,8 @@ var DelayCommissionUpdates = newGate("DelayCommissionUpdates", "76dHtohc2s5dR3ah
 var ValidateChainedBlockId = newGate("ValidateChainedBlockId", "vcmrbYbiMVKaq1snKP6eCacNDcr6qZvpCNUjmk6gxvZ")
 var DiscardUnexpectedDataCompleteShreds = newGate("DiscardUnexpectedDataCompleteShreds", "dcomRRWHXP1FVWPqi9Mm4oxJhF4ehC795SvAtUdA9os")
 var LoaderV3MinimumExtendProgramSize = newGate("LoaderV3MinimumExtendProgramSize", "YbbRLkvenrocjGPGyoQE4wjnvYzTgfsk38NFmcYK7a5")
+var LoaderV3ProgramDataSizeFloor = newGate("LoaderV3ProgramDataSizeFloor", "8whkDenELnfwYLirBc4Wb4H2Z1z5K7tiykpdxJS7cWg1")
+var EnableSha512Syscall = newGate("EnableSha512Syscall", "s512oDwgx8hjMnaQjXfqqrZroVj4HvC6TkN3iSSWXCh")
 
 var AllFeatureGates = []FeatureGate{StopTruncatingStringsInSyscalls, EnablePartitionedEpochReward, EnablePartitionedEpochRewardsSuperfeature,
 	LastRestartSlotSysvar, Libsecp256k1FailOnBadCount, Libsecp256k1FailOnBadCount2, EnableBpfLoaderSetAuthorityCheckedIx,
@@ -125,7 +128,9 @@ var AllFeatureGates = []FeatureGate{StopTruncatingStringsInSyscalls, EnableParti
 	ValidatorAdmissionTicket, ReduceSlotTimeTo350ms, ReduceSlotTimeTo300ms, ReduceSlotTimeTo250ms, ReduceSlotTimeTo200ms, IncreaseCpiAccountInfoLimit,
 	StaticInstructionLimit, PoseidonEnforcePadding, FixAltBn128PairingLengthCheck, DeprecateRentExemptionThreshold,
 	ProvideInstructionDataOffsetInVmR2, SyscallParameterAddressRestrictions, VirtualAddressSpaceAdjustments, AccountDataDirectMapping,
+	DirectAccountPointersInProgramInput,
 	VoteStateV4, BlsPubkeyManagementInVoteAccount, CommissionRateInBasisPoints, CustomCommissionCollector, BlockRevenueSharing, VoteAccountInitializeV2,
 	RelaxProgramdataAccountCheckMigration, ReplaceSplTokenWithPToken, CreateAccountAllowPrefund,
 	RemoveSimpleVoteFromCostModel, DisableZkElgamalProofProgram, ReenableZkElgamalProofProgram, AltBn128LittleEndian, EnableAltBn128G2Syscalls,
-	EnableBls12_381Syscall, UpgradeBpfStakeProgramToV5, DelayCommissionUpdates, ValidateChainedBlockId, DiscardUnexpectedDataCompleteShreds, LoaderV3MinimumExtendProgramSize}
+	EnableBls12_381Syscall, UpgradeBpfStakeProgramToV5, DelayCommissionUpdates, ValidateChainedBlockId, DiscardUnexpectedDataCompleteShreds, LoaderV3MinimumExtendProgramSize,
+	LoaderV3ProgramDataSizeFloor, EnableSha512Syscall}

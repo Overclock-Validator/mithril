@@ -16,12 +16,14 @@ import (
 )
 
 const (
-	VotorQUICALPN                  = "alpenglow-v1"
-	VotorQUICInitialPacketSize     = uint16(1280)
-	DefaultReceiverBindAddr        = "0.0.0.0:0"
-	DefaultReceiverMaxMessageSize  = int64(VotorQUICInitialPacketSize)
-	DefaultReceiverLogInterval     = 10 * time.Second
-	DefaultReceiverMaxConnections  = 512
+	VotorQUICALPN                 = "alpenglow-v1"
+	VotorQUICInitialPacketSize    = uint16(1280)
+	DefaultReceiverBindAddr       = "0.0.0.0:0"
+	DefaultReceiverMaxMessageSize = int64(VotorQUICInitialPacketSize)
+	DefaultReceiverLogInterval    = 10 * time.Second
+	// Alpenglow admits at most 2,000 voters. Each needs the two connections
+	// per peer recommended by Temporal/Harmonic, so reserve 4,000 in total.
+	DefaultReceiverMaxConnections  = MaximumVATValidators * DefaultReceiverMaxConnsPerPeer
 	DefaultReceiverMaxConnsPerIP   = 32
 	DefaultReceiverMaxConnsPerPeer = 2
 	DefaultReceiverDatagramsPerSec = 50
