@@ -53,18 +53,20 @@ func (f *receiverFeed) PendingStreamBatches(g turbine.StreamGeneration, from uin
 func (f *receiverFeed) PrioritizeStreamRepair(turbine.StreamGeneration) {}
 
 type realFeedRig struct {
-	slot        uint64
-	t           *testing.T
-	env         *lifecycleEnv
-	receiver    *turbine.UDPReceiver
-	feed        *receiverFeed
-	broadcaster *turbine.UDPBroadcaster
-	leader      solana.PrivateKey
-	lastCtx     *sealevel.SlotCtx
-	tail        *lifecycleTail
-	statuses    *TransactionStatusCache
-	exec        *streamingExecutor
-	block       *b.Block
+	slot               uint64
+	t                  *testing.T
+	env                *lifecycleEnv
+	receiver           *turbine.UDPReceiver
+	feed               *receiverFeed
+	broadcaster        *turbine.UDPBroadcaster
+	leader             solana.PrivateKey
+	lastCtx            *sealevel.SlotCtx
+	tail               *lifecycleTail
+	statuses           *TransactionStatusCache
+	exec               *streamingExecutor
+	block              *b.Block
+	captureSelected    bool
+	referenceEconomics b.SelectedEconomics
 	// mark is the loop's record of the executed parent (replayed before any
 	// shred of the child is broadcast), as the loop would hold it.
 	mark streamingFrontierMark
@@ -219,9 +221,19 @@ func (rig *realFeedRig) reference() lifecycleOutcome {
 	}
 	rig.configure(block)
 	block.MarkTransactionSignaturesVerified()
+	if rig.captureSelected {
+		block.EnableSelectedEconomics()
+	}
 	tail := &lifecycleTail{durable: rig.env.durable}
 	slotCtx, err := ProcessBlock(rig.env.acctsDb, block, rig.env.epochSchedule, 2, nil, &persistedTracker{}, tail, NewTransactionStatusCache(), false, rig.env.parent)
 	require.NoError(rig.t, err)
+	if rig.captureSelected {
+		var enabled bool
+		rig.referenceEconomics, enabled = block.SelectedEconomics()
+		require.True(rig.t, enabled)
+		require.True(rig.t, rig.referenceEconomics.FeesKnown)
+		require.False(rig.t, rig.referenceEconomics.NativeCostKnown)
+	}
 	return lifecycleOutcomeOf(rig.t, slotCtx, tail)
 }
 
@@ -295,6 +307,13 @@ func (rig *realFeedRig) finalizeAndCompare(reference lifecycleOutcome) {
 	require.Len(rig.t, block.Transactions, len(rig.allWires()))
 	require.Positive(rig.t, block.ShredFullNanos)
 	rig.configure(block)
+	if rig.captureSelected {
+		// This requests the complete block only. The speculative shell must
+		// never own the final fee observation, even after prefix execution.
+		_, requested := rig.exec.current.exec.block.SelectedEconomics()
+		require.False(rig.t, requested)
+		block.EnableSelectedEconomics()
+	}
 
 	slotCtx, ok, err := rig.exec.finalize(block, rig.env.parent)
 	require.NoError(rig.t, err)
@@ -303,6 +322,14 @@ func (rig *realFeedRig) finalizeAndCompare(reference lifecycleOutcome) {
 	streamed := lifecycleOutcomeOf(rig.t, slotCtx, rig.tail)
 	requireSameLifecycleOutcome(rig.t, reference, streamed)
 	require.Equal(rig.t, reference.bankhash, block.ExpectedBankhash[:], "finalize verified the footer hash against the same value")
+	if rig.captureSelected {
+		carrier := CertificateCarrier{Slot: block.Slot, BlockID: solana.Hash(block.AlpenglowBlockID),
+			Bankhash: solana.HashFromBytes(slotCtx.FinalBankhash), Transactions: slotCtx.TransactionCounts}
+		facts, valid := selectedReplayFacts(time.Now(), block, rig.env.epochSchedule, carrier)
+		require.True(rig.t, valid)
+		require.Equal(rig.t, rig.referenceEconomics, facts.Economics, "stream prefix and suffix charged the same complete fee triple")
+		require.False(rig.t, facts.Economics.NativeCostKnown, "remote streaming has no producer cost")
+	}
 
 	record := metrics.GlobalBlockReplay.StreamingExecution
 	require.Equal(rig.t, uint64(1), record.Opened)
@@ -343,6 +370,13 @@ func TestStreamingRealFeedExecutesPrefixBeforeCompletionAndMatchesWholeBlock(t *
 	dest := solana.PublicKey{0xF1}
 	rig := newRealFeedRig(t, dest, 64)
 	reference := rig.reference()
+	// Actual whole-block off/on execution must preserve bank/account effects.
+	// These direct source calls do not prove ReplayBlocks' opt-in hook ran.
+	rig.captureSelected = true
+	withCapture := rig.reference()
+	requireSameLifecycleOutcome(t, reference, withCapture)
+	require.Equal(t, b.SelectedFeeFacts{ExecutionLamports: uint64(len(rig.allWires())) * 5_000,
+		TotalLamports: uint64(len(rig.allWires())) * 5_000}, rig.referenceEconomics.Fees)
 	require.Contains(t, reference.delta, dest)
 	total := len(rig.allWires())
 

@@ -38,6 +38,20 @@ when the node enables `--dashboard-cgroup-resources` and the reader enables
 `--public-resources`. Availability and freshness apply independently. Limits
 describe the visible cgroup and do not establish ancestor capacity.
 
+When the node enables `--dashboard-replay-details` and the public reader
+enables `--replay-details` with `--public-resources`, the reader provides
+`/api/v1/details/replay`, `/api/v1/details/selected`,
+`/api/v1/details/slots` and `/api/v1/details/schedule`. The advanced features
+response reports whether these routes are enabled. Their captures are bounded
+local observations, not an archive or a substitute for verified cluster state.
+Check the response state and remaining-lifetime headers; unavailable or
+expired observations are not zero. Configure per-client limits at the proxy.
+
+With cache details enabled on the node and reader, `/api/v1/details/cache`
+returns bounded AccountsDB cache observations. Its availability and freshness
+are independent of replay details; unavailable values are not zero. The
+advanced features response reports whether the route is enabled.
+
 When `--history-dir` is configured, `/api/v1/history` returns the history
 state and available metrics. Use `?metric=<name>&range=<range>` to retrieve
 bucketed samples; supported metrics and ranges are listed in the state

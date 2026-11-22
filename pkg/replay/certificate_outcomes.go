@@ -28,6 +28,7 @@ type CertificateCarrier struct {
 	BankTime                int64
 	ActivityKnown           bool
 	Transactions            sealevel.BankTransactionCounts
+	Payments                block.PaymentObservation
 }
 
 // CertificateFoldEvidence identifies an actual committed overlay layer and the
@@ -71,30 +72,37 @@ type certificateCarrierKey struct {
 }
 
 type certificateWindowEntry struct {
-	slot    uint64
-	fold    CertificateFoldEvidence
-	carrier CertificateCarrier
-	gap     bool
+	slot             uint64
+	fold             CertificateFoldEvidence
+	carrier          CertificateCarrier
+	gap              bool
+	selected         *SelectedReplayFacts
+	selectedConflict bool
 }
 
 type pendingCertificateCarrier struct {
-	carrier  CertificateCarrier
-	conflict bool
+	carrier          CertificateCarrier
+	conflict         bool
+	selected         *SelectedReplayFacts
+	selectedConflict bool
 }
 
 // CertificateOutcomes is owned by the replay loop. Callers must serialize all
 // methods and publish Snapshot's value copy to concurrent readers.
 type CertificateOutcomes struct {
-	subject        solana.PublicKey
-	pending        map[certificateCarrierKey]pendingCertificateCarrier
-	window         [certificateWindowLimit]certificateWindowEntry
-	start          int
-	count          int
-	dropped        uint64
-	coverageLost   bool
-	predecessor    CertificateFoldEvidence
-	hasPredecessor bool
-	summary        CertificateOutcomeSummary
+	subject           solana.PublicKey
+	pending           map[certificateCarrierKey]pendingCertificateCarrier
+	window            [certificateWindowLimit]certificateWindowEntry
+	start             int
+	count             int
+	dropped           uint64
+	coverageLost      bool
+	predecessor       CertificateFoldEvidence
+	hasPredecessor    bool
+	summary           CertificateOutcomeSummary
+	selectedOwner     *replayDiagnostics
+	selectedAttempt   uint64
+	selectedConflicts uint64
 }
 
 // NewCertificateOutcomes binds observations to one fixed vote account. A zero
@@ -220,7 +228,8 @@ func (r *CertificateOutcomes) Settle(evidence []CertificateFoldEvidence, at time
 		if conflictingEvidence {
 			e.HasBlockID = false
 		}
-		r.append(certificateWindowEntry{slot: e.Slot, fold: e, carrier: p.carrier, gap: gap})
+		r.append(certificateWindowEntry{slot: e.Slot, fold: e, carrier: p.carrier, gap: gap,
+			selected: p.selected, selectedConflict: p.selectedConflict})
 		i = end
 	}
 	for key := range r.pending {

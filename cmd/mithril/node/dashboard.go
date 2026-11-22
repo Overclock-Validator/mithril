@@ -15,7 +15,6 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/blockstream"
 	"github.com/Overclock-Validator/mithril/pkg/consensus"
 	"github.com/Overclock-Validator/mithril/pkg/dashboard"
-	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
 	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
@@ -38,6 +37,8 @@ type nodeDashboard struct {
 	accountsPath          string
 	ledgerPath            string
 	progress              replay.Progress
+	heldSchedules         nodeHeldScheduleCache
+	cache                 *cacheDashboardMonitor
 	consensus             *consensus.AlpenglowObserverEngine
 	rpc                   *rpcserver.RpcServer
 	tpu                   *tpu.TPU
@@ -232,6 +233,7 @@ func (d *nodeDashboard) observeRuntime(now time.Time, mem runtime.MemStats, pres
 	traffic.observe(trafficBinding)
 	d.observeTPUSocket()
 	d.observeVotorSocket()
+	d.cache.observe()
 }
 
 func hostResourcesMeasurement(o metrics.HostObservation) *dashboard.HostResources {
@@ -301,7 +303,11 @@ func filesystemFromStat(stat syscall.Statfs_t) *dashboard.Filesystem {
 	return &dashboard.Filesystem{TotalBytes: stat.Blocks * unit, AvailableBytes: stat.Bavail * unit, UsedBytes: &used, Inodes: stat.Files, FreeInodes: stat.Ffree}
 }
 
-func startNodeDashboard(ctx context.Context, startedAt time.Time, socket, group, runID, network, mode string, alpenglow, rpcConfigured, hostResources, networkDetails, machineDetails, localPeers bool) *nodeDashboard {
+func startNodeDashboard(ctx context.Context, startedAt time.Time, socket, group, runID, network, mode string, alpenglow, rpcConfigured, hostResources, networkDetails, machineDetails, localPeers, replayDetails, cacheDetails, fastExecuted bool) *nodeDashboard {
+	if fastExecuted && !replayDetails {
+		mlog.Log.Warnf("dashboard fast execution observations require replay details")
+		return nil
+	}
 	if socket == "" {
 		return nil
 	}
@@ -318,6 +324,27 @@ func startNodeDashboard(ctx context.Context, startedAt time.Time, socket, group,
 	var feed *dashboard.Feed
 	var err error
 	var details dashboard.DetailSamplers
+	if cacheDetails {
+		d.cache = &cacheDashboardMonitor{}
+		details.Cache = d.sampleCacheDetail
+	}
+	if replayDetails {
+		if err := d.progress.EnableReplayDiagnostics(runID); err != nil {
+			mlog.Log.Warnf("dashboard replay diagnostics unavailable: %v", err)
+			return nil
+		}
+		details.Replay = d.sampleReplayDetail
+		if fastExecuted {
+			if err := d.progress.EnableFastExecuted(); err != nil {
+				mlog.Log.Warnf("dashboard fast execution observations unavailable: %v", err)
+				return nil
+			}
+			details.FastExecuted = d.sampleFastExecuted
+		}
+		details.SelectedWindow = d.sampleSelectedWindow
+		details.RootedHistory = d.sampleRootedHistory
+		details.HeldSchedules = d.sampleHeldSchedules
+	}
 	if machineDetails {
 		details.Machine = d.sampleMachineDetail
 	}
@@ -329,7 +356,7 @@ func startNodeDashboard(ctx context.Context, startedAt time.Time, socket, group,
 	if localPeers {
 		details.LocalPeers = d.sampleLocalPeers
 	}
-	if networkDetails || machineDetails {
+	if networkDetails || machineDetails || replayDetails || cacheDetails {
 		feed, err = dashboard.ListenFeedWithDetails(ctx, socket, group, d.snapshot, details)
 	} else if group == "" {
 		feed, err = dashboard.ListenFeed(ctx, socket, d.snapshot)
@@ -372,14 +399,10 @@ func (d *nodeDashboard) snapshot() dashboard.Snapshot {
 		key := holder.PublicKey().String()
 		s.IdentityKey = &key
 	}
-	if s.Phase == "replaying" {
-		// Replay publishes this atomic frontier after successful execution or
-		// a known skip. Zero before replay initialization is unavailable here.
-		if slot := global.ReplayFrontier(); slot != 0 {
+	if p, ok := d.progress.Snapshot(); ok {
+		if slot := p.Frontier; s.Phase == "replaying" && slot != 0 {
 			s.ReplayFrontier = &slot
 		}
-	}
-	if p, ok := d.progress.Snapshot(); ok {
 		s.Replay = replayMeasurement(p)
 		if a := s.Replay.NextKnownAssignment; a != nil && (s.IdentityKey == nil || a.Identity != *s.IdentityKey) {
 			s.Replay.NextKnownAssignment = nil
@@ -510,6 +533,46 @@ func replayMeasurement(p replay.ProgressSnapshot) *dashboard.Replay {
 		r.AccountFacts = accountFactsMeasurement(p.AccountFacts)
 	}
 	return r
+}
+
+// sampleFastExecuted copies only provisional replay observations.
+func (d *nodeDashboard) sampleFastExecuted() (dashboard.FastExecuted, bool) {
+	if d == nil {
+		return dashboard.FastExecuted{}, false
+	}
+	p, ok := d.progress.Snapshot()
+	if !ok || p.Attempt == 0 || p.ExecutionSequence == 0 {
+		return dashboard.FastExecuted{}, false
+	}
+	d.mu.Lock()
+	run, started := d.state.RunID, d.state.StartedAt
+	var genesis *string
+	if d.state.GenesisHash != nil {
+		value := *d.state.GenesisHash
+		genesis = &value
+	}
+	d.mu.Unlock()
+	rows := p.RecentExecuted()
+	v := dashboard.FastExecuted{SchemaVersion: 1, Family: "recent_executed", Scope: "locally_executed",
+		State: "unavailable", Sequence: p.ExecutionSequence, SampledAt: p.ExecutionAt.UTC(),
+		Binding: dashboard.FastExecutedBinding{RunID: run, GenesisHash: genesis, NodeStartedAt: started.UTC(),
+			Attempt: p.Attempt, Rewinds: p.Rewinds, AttemptStartedAt: p.StartedAt.UTC()},
+		Records: make([]dashboard.ExecutedSlot, 0, len(rows))}
+	for _, row := range rows {
+		record := dashboard.ExecutedSlot{At: row.At, Slot: row.Slot,
+			Bankhash: row.Bankhash.String(), Transactions: row.Transactions, ComputeUnits: row.ComputeUnits,
+			WorkCountersSaturated: row.WorkCountersSaturated}
+		if row.HasBlockID {
+			value := row.BlockID.String()
+			record.BlockID = &value
+		}
+		v.Records = append(v.Records, record)
+	}
+	if len(v.Records) != 0 {
+		v.State = "fresh"
+		v.SampledAt = v.Records[len(v.Records)-1].At
+	}
+	return v, true
 }
 
 func accountFactsMeasurement(f replay.AccountFacts) *dashboard.AccountFacts {
@@ -809,6 +872,7 @@ func (d *nodeDashboard) stopping() {
 	if d == nil {
 		return
 	}
+	d.cache.stop()
 	d.mu.Lock()
 	machine := d.machine
 	d.machineRetired = true
@@ -833,6 +897,7 @@ func (d *nodeDashboard) close() {
 		d.interfaces.stop()
 		d.mu.Unlock()
 		machine.stop()
+		d.cache.stop()
 		d.feed.Close()
 	}
 }

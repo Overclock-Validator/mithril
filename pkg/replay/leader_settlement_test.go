@@ -179,7 +179,7 @@ func TestLeaderSettlementFoldLossUsesActualEndAndProgressResets(t *testing.T) {
 	require.True(t, s.CoverageIncomplete)
 	var progress Progress
 	progress.begin(10, nil)
-	progress.settledOutcomes(1000, r.Snapshot(), s, r.slotSnapshot(1000), r.activitySnapshot(1000), r.epochSnapshot(identity, 1000, schedule), RewardHealthSummary{})
+	progress.settledOutcomes(1000, r.Snapshot(), s, r.slotSnapshot(1000), r.activitySnapshot(1000), r.epochSnapshot(identity, 1000, schedule), PaymentOutcomeSummary{}, RewardHealthSummary{})
 	old, ok := progress.Snapshot()
 	require.True(t, ok)
 	progress.rewound()

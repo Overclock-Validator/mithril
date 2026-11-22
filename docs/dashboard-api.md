@@ -121,6 +121,17 @@ publish a URL.
 
 The following manual setup remains available on supported platforms.
 
+For bounded replay details, enable `--dashboard-replay-details` on the node
+and `--replay-details` on the public reader. The node option requires an
+enabled dashboard feed; the reader requires a public profile and
+`--public-resources`. Replay observations are local to the node and may be
+unavailable or stale during startup, recovery or source replacement.
+
+For AccountsDB cache observations, enable `--dashboard-cache-details` on the
+node and `--cache-details` on the public reader. These require a node socket
+and a public profile with `--public-resources`, respectively. Cache activity
+counters additionally require `--dashboard-cache-activity` on the node.
+
 Build both executables from the same checkout:
 
 ```sh
@@ -223,9 +234,10 @@ socket only if it is owned by the node's user and nothing accepts connections on
 it; any other existing path is left in place and the feed stays off. A feed setup
 failure is logged and does not stop the node.
 
-The feed serves one request per connection and accepts at most four connections
-per second, so a feed client cannot make the node spend more than that serving
-it. The reader polls once per second.
+The feed serves one request per connection, with at most four concurrent
+connections. The basic feed allows four connections per second (burst four).
+With detail samplers enabled, it allows 64 per second (burst 16). The basic
+snapshot is sampled once per second; detail sampling intervals vary.
 
 Unix socket paths have platform-specific length limits. If a long path causes a
 bind error, choose a shorter trusted directory and use the same socket path for

@@ -214,7 +214,7 @@ func TestRewardHealthSettlementPublicationAndReset(t *testing.T) {
 		})
 	}
 	for range 100 {
-		p.settledOutcomes(136, r.Snapshot(), LeaderOutcomeSummary{}, SlotHistorySummary{}, ChainActivitySummary{}, EpochOutcomeSummary{}, s)
+		p.settledOutcomes(136, r.Snapshot(), LeaderOutcomeSummary{}, SlotHistorySummary{}, ChainActivitySummary{}, EpochOutcomeSummary{}, PaymentOutcomeSummary{}, s)
 	}
 	readers.Wait()
 	published, _ := p.Snapshot()

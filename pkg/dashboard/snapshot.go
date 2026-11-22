@@ -325,6 +325,16 @@ type CertificateOutcomes struct {
 	FinalConflict         uint64    `json:"final_conflict,string"`
 }
 
+type ExecutedSlot struct {
+	At                    time.Time `json:"at"`
+	Slot                  uint64    `json:"slot,string"`
+	Bankhash              string    `json:"bankhash"`
+	BlockID               *string   `json:"block_id,omitempty"`
+	Transactions          uint64    `json:"transactions,string"`
+	ComputeUnits          uint64    `json:"compute_units,string"`
+	WorkCountersSaturated bool      `json:"work_counters_saturated"`
+}
+
 // CompletedBlock describes the latest locally executed bank, not finality.
 type CompletedBlock struct {
 	At               time.Time `json:"at"`

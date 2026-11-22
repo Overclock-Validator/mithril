@@ -223,6 +223,8 @@ type collector struct {
 	throughput       Throughput // owned by the collection loop, never by viewers
 	resourceCPU      resourceCPURate
 	history          *historyService
+	detailGate       atomic.Pointer[replayDetailGate]
+	cacheGate        atomic.Pointer[cacheDetailGate]
 	networkGate      atomic.Pointer[networkDetailGate]
 	localPeerGate    atomic.Pointer[localPeerGate]
 	machine          *machineDetailReader
@@ -420,10 +422,16 @@ func (c *collector) poll(ctx context.Context, now time.Time) {
 		}
 		c.statusLeases = append(c.statusLeases, encoded.lease)
 	}
-	if c.publicOptions.NetworkDetails || c.publicOptions.MachineDetails || c.publicOptions.LocalPeers {
+	if c.publicOptions.NetworkDetails || c.publicOptions.MachineDetails || c.publicOptions.LocalPeers || c.publicOptions.ReplayDetails || c.publicOptions.CacheDetails {
 		c.statusNodeEpoch, _ = nextNodeEpoch(c.statusNodeEpoch, previous, c.last, c.statusPriorEnd, c.statusPriorWall, state, receivedAt)
 		if c.publicOptions.NetworkDetails {
 			c.observeNetworkDetailStatus(state, reason, receivedAt, c.statusNodeEpoch)
+		}
+		if c.publicOptions.ReplayDetails {
+			c.observeReplayDetailStatus(state, reason, receivedAt, c.statusNodeEpoch)
+		}
+		if c.publicOptions.CacheDetails {
+			c.observeCacheDetailStatus(state, reason, receivedAt, c.statusNodeEpoch)
 		}
 		if c.publicOptions.LocalPeers {
 			peerReason := reason
@@ -439,6 +447,12 @@ func (c *collector) poll(ctx context.Context, now time.Time) {
 		}
 		if err == nil {
 			encoded.fence.nodeEpoch = c.statusNodeEpoch
+			if c.publicOptions.ReplayDetails {
+				encoded.fence.families[statusReplay] = c.detailGate.Load().stamp.familyEpoch
+			}
+			if c.publicOptions.CacheDetails {
+				encoded.fence.families[statusCache] = c.cacheGate.Load().stamp.familyEpoch
+			}
 			if c.publicOptions.NetworkDetails {
 				gate := c.networkGate.Load()
 				encoded.fence.families[statusNetwork] = gate.stamp.familyEpoch
@@ -465,6 +479,74 @@ func (c *collector) poll(ctx context.Context, now time.Time) {
 	} else {
 		c.publishStatusFrame(nil)
 	}
+}
+
+// observeCacheDetailStatus binds cache details to the current node status.
+func (c *collector) observeCacheDetailStatus(state, reason string, receivedAt time.Time, nodeEpoch uint64) {
+	g := cacheDetailGate{observedAt: receivedAt, reason: "source_unavailable"}
+	if c.last != nil {
+		g = cacheGate(*c.last, receivedAt)
+	}
+	if state != "fresh" {
+		if reason == "" {
+			reason = "status_stale"
+		}
+		g.reason = cacheDetailReason(reason)
+	}
+	var previous statusStamp
+	unchanged := false
+	if old := c.cacheGate.Load(); old != nil {
+		previous = old.stamp
+		unchanged = old.matches(g.binding) && g.matches(old.binding) && old.reason == g.reason
+	}
+	var valid bool
+	g.stamp, valid = advanceStatusStamp(previous, nodeEpoch, unchanged)
+	if !valid {
+		g.reason = "source_unavailable"
+	}
+	c.cacheGate.Store(&g)
+}
+
+// observeReplayDetailStatus publishes detached context to the replay reader.
+func (c *collector) observeReplayDetailStatus(state, reason string, receivedAt time.Time, nodeEpoch uint64) {
+	g := replayDetailGate{ObservedAt: receivedAt, State: state, Reason: reason}
+	if c.last != nil {
+		s := c.last
+		g.stopping = s.Phase == "stopping"
+		g.RunID, g.NodeStartedAt = s.RunID, s.StartedAt.UTC()
+		if s.GenesisHash != nil {
+			g.HasGenesis, g.GenesisHash = true, *s.GenesisHash
+		}
+		if s.Replay != nil && s.Replay.Attempt != 0 && !s.Replay.StartedAt.IsZero() {
+			g.Attempt, g.Rewinds, g.AttemptStartedAt = s.Replay.Attempt, s.Replay.Rewinds, s.Replay.StartedAt.UTC()
+		} else {
+			g.State, g.Reason = "unavailable", "waiting_source"
+		}
+	}
+	g.revision = 1
+	var previous statusStamp
+	unchanged := false
+	if old := c.detailGate.Load(); old != nil {
+		previous = old.stamp
+		unchanged = sameReplayDetailGateContext(*old, g) && old.State == g.State && old.Reason == g.Reason && old.stopping == g.stopping
+		g.revision, g.retired = old.revision, old.retired
+		if !unchanged {
+			if g.revision == ^uint64(0) {
+				g.retired = true
+			} else {
+				g.revision++
+			}
+		}
+	}
+	var valid bool
+	g.stamp, valid = advanceStatusStamp(previous, nodeEpoch, unchanged)
+	if !valid {
+		g.retired = true
+	}
+	if g.retired {
+		g.State, g.Reason = "unavailable", "source_unavailable"
+	}
+	c.detailGate.Store(&g)
 }
 
 // observeNetworkDetailStatus publishes detached status context for the reader.
@@ -578,6 +660,8 @@ func Serve(ctx context.Context, socket, address string) error {
 
 // PublicOptions enables additional disclosure. All fields default off.
 type PublicOptions struct {
+	ReplayDetails  bool
+	CacheDetails   bool
 	Resources      bool
 	Peers          bool
 	NetworkDetails bool
@@ -631,6 +715,12 @@ func serve(ctx context.Context, socket string, listener net.Listener) error {
 
 func serveProfile(ctx context.Context, socket string, listener net.Listener, origin string, options PublicOptions) error {
 	defer listener.Close()
+	if options.ReplayDetails && (origin == "" || !options.Resources) {
+		return errors.New("dashboard replay details require the public profile and resource disclosure")
+	}
+	if options.CacheDetails && (origin == "" || !options.Resources) {
+		return errors.New("dashboard cache details require the public profile and resource disclosure")
+	}
 	if options.NetworkDetails && (origin == "" || !options.Resources) {
 		return errors.New("dashboard network details require the public profile and resource disclosure")
 	}
@@ -668,6 +758,27 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 		defer external.close()
 	}
 	var network *networkDetailReader
+	var caches *cacheDetailReader
+	if options.CacheDetails {
+		var err error
+		caches, err = newCacheDetailReader(c.client, &c.cacheGate)
+		if err != nil {
+			return err
+		}
+	}
+	var details *replayDetailReader
+	if options.ReplayDetails {
+		var err error
+		details, err = newReplayDetailReader(c.client, &c.detailGate)
+		if err != nil {
+			return err
+		}
+		details.rooted = &rootedHistoryReader{client: details.client, gate: &c.detailGate, limit: rate.NewLimiter(4, 8)}
+		details.held = &heldScheduleReader{client: details.client, gate: &c.detailGate,
+			manifestLimit: rate.NewLimiter(4, 8), dataLimit: rate.NewLimiter(0.2, 2), active: make(chan struct{}, 2)}
+		details.selected = &selectedWindowReader{client: details.client, gate: &c.detailGate,
+			limit: rate.NewLimiter(16, 32), active: make(chan struct{}, 4)}
+	}
 	if options.NetworkDetails {
 		var err error
 		network, err = newNetworkDetailReader(c.client, &c.networkGate)
@@ -705,6 +816,12 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 	go func() {
 		defer close(collected)
 		c.poll(ctx, time.Now().UTC())
+		if details != nil {
+			go details.run(ctx)
+		}
+		if caches != nil {
+			go caches.run(ctx)
+		}
 		if network != nil {
 			go network.run(ctx)
 		}
@@ -725,6 +842,12 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 			}
 		}
 	}()
+	if details != nil {
+		defer func() { cancel(); <-details.done }()
+	}
+	if caches != nil {
+		defer func() { cancel(); <-caches.done }()
+	}
 	if network != nil {
 		defer func() { cancel(); <-network.done }()
 	}
@@ -760,13 +883,17 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 			NodeDisplay   bool `json:"node_display,omitempty"`
 		}{1, c.history != nil, external != nil, false})
 		advancedFeatures, _ := json.Marshal(struct {
-			SchemaVersion  int  `json:"schema_version"`
-			History        bool `json:"history"`
-			Cluster        bool `json:"cluster"`
-			NetworkDetails bool `json:"network_details,omitempty"`
-			MachineDetails bool `json:"machine_details,omitempty"`
-			LocalPeers     bool `json:"local_peers,omitempty"`
-		}{1, c.history != nil, external != nil, network != nil, c.machine != nil, localPeers != nil})
+			SchemaVersion        int  `json:"schema_version"`
+			History              bool `json:"history"`
+			Cluster              bool `json:"cluster"`
+			NetworkDetails       bool `json:"network_details,omitempty"`
+			MachineDetails       bool `json:"machine_details,omitempty"`
+			LocalPeers           bool `json:"local_peers,omitempty"`
+			ReplayDetails        bool `json:"replay_details,omitempty"`
+			CacheDetails         bool `json:"cache_details,omitempty"`
+			RootedHistoryDetails bool `json:"rooted_history_details,omitempty"`
+			HeldScheduleDetails  bool `json:"held_schedule_details,omitempty"`
+		}{1, c.history != nil, external != nil, network != nil, c.machine != nil, localPeers != nil, details != nil, caches != nil, details != nil, details != nil})
 		mux.HandleFunc("/api/v1/features", func(w http.ResponseWriter, r *http.Request) {
 			if !allowed(r) {
 				http.Error(w, "host or origin not allowed", http.StatusForbidden)
@@ -791,6 +918,52 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 		}
 		if c.history != nil {
 			mux.HandleFunc("/api/v1/history", c.history.handler(allowed))
+		}
+		if details != nil {
+			admit := func(stamp statusStamp, gate func() (statusStamp, bool)) (time.Duration, bool) {
+				return c.admitLiveDetail(statusReplay, stamp, gate, time.Now())
+			}
+			scheduleHandler := func(w http.ResponseWriter, r *http.Request) {
+				if !allowed(r) {
+					http.Error(w, "host or origin not allowed", http.StatusForbidden)
+					return
+				}
+				details.held.serveHTTP(w, r, admit)
+			}
+			mux.HandleFunc("/api/v1/details/schedule", scheduleHandler)
+			mux.HandleFunc("/api/v1/details/schedule/", scheduleHandler)
+			mux.HandleFunc("/api/v1/details/slots", func(w http.ResponseWriter, r *http.Request) {
+				if !allowed(r) {
+					http.Error(w, "host or origin not allowed", http.StatusForbidden)
+					return
+				}
+				details.rooted.serveHTTP(w, r, admit)
+			})
+			mux.HandleFunc("/api/v1/details/replay", func(w http.ResponseWriter, r *http.Request) {
+				if !allowed(r) {
+					http.Error(w, "host or origin not allowed", http.StatusForbidden)
+					return
+				}
+				details.serveHTTP(w, r, admit)
+			})
+			mux.HandleFunc("/api/v1/details/selected", func(w http.ResponseWriter, r *http.Request) {
+				if !allowed(r) {
+					http.Error(w, "host or origin not allowed", http.StatusForbidden)
+					return
+				}
+				details.selected.serveHTTP(w, r, admit)
+			})
+		}
+		if caches != nil {
+			mux.HandleFunc("/api/v1/details/cache", func(w http.ResponseWriter, r *http.Request) {
+				if !allowed(r) {
+					http.Error(w, "host or origin not allowed", http.StatusForbidden)
+					return
+				}
+				caches.serveHTTP(w, r, func(reply cacheDetailReply) (time.Duration, bool) {
+					return c.admitCacheDetail(caches, reply)
+				})
+			})
 		}
 		if localPeers != nil {
 			localPeerHandler = func(w http.ResponseWriter, r *http.Request) {

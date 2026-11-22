@@ -180,6 +180,10 @@ type unrootedTail struct {
 	// RAM-only distribution counter decreases: those banks are still retained.
 	rewardWindowSlots uint64
 
+	// Rooted history is monitoring-only and captured before sysvar pruning.
+	rootedHistoryOwner *replayDiagnostics
+	rootedHistory      rootedSlotHistoryObservation
+
 	// stakeTotals carries durable state's delegated stake totals across folds
 	// into each fold's resume context (stake_totals.go). nil until the initial
 	// block's setup supplies the starting totals.
@@ -461,6 +465,7 @@ func (t *unrootedTail) promoteChunked(through uint64, force bool) (uint64, *stat
 	}
 	ctx := t.contexts[promotedThrough] // context as of the last rooted slot (read before pruning)
 	t.retainRootAnchor(promotedThrough, ctx)
+	t.observeRootedSlotHistory(promotedThrough, ctx)
 	for s := range t.contexts {
 		if s <= promotedThrough {
 			delete(t.contexts, s)
@@ -727,6 +732,12 @@ func (t *unrootedTail) applyFoldJob(job *foldJob) *state.ResumeContext {
 	t.retainRootAnchor(job.through, job.ctx)
 	t.stakeTotals.commitThrough(job.through, job.stakeTotals)
 	t.overlay.PromotePrefix(job.through)
+	t.observeRootedSlotHistory(job.through, job.ctx)
+	if t.rootedHistoryOwner != nil {
+		if hash, ok := job.bankhashes[job.through]; !ok || t.rootedHistory.Bankhash != solana.Hash(hash) {
+			t.rootedHistory.RootedSlotHistory = RootedSlotHistory{}
+		}
+	}
 	for s := range t.bankhashes {
 		if s <= job.through {
 			delete(t.bankhashes, s)
