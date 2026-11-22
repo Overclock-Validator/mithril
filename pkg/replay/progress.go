@@ -23,10 +23,12 @@ type Progress struct {
 	selectedSlots             atomic.Pointer[SelectedSlotSnapshot]
 	localEpochReplayAnchor    localEpochReplayAnchor
 	hasLocalEpochReplayAnchor bool
-	networkDetails            bool                 // Startup-only; retained across replay attempts and source replacement.
-	fastExecuted              bool                 // Startup-only opt-in for provisional replay observations.
-	gossipObserver            func(*gossip.Client) // Startup-only; receives only the current source's client.
-	gossipMu                  sync.Mutex           // Orders attachments against source replacement/reset.
+	networkDetails            bool                     // Startup-only; retained across replay attempts and source replacement.
+	fastExecuted              bool                     // Startup-only opt-in for provisional replay observations.
+	gossipObserver            func(*gossip.Client)     // Startup-only; receives only the current source's client.
+	gossipMu                  sync.Mutex               // Orders attachments against source replacement/reset.
+	gossipSource              *blockstream.BlockSource // Protected by gossipMu; retained across a temporary detach.
+	pendingGossip             *gossip.Client           // Latest client reported by a detached gossipSource.
 	// nextAssignment is staged and read only by the replay owner.
 	nextAssignment  NextKnownAssignment
 	accountSampler  AccountFactsSampler
@@ -320,8 +322,13 @@ func (p *Progress) observeSourceGossip(source *blockstream.BlockSource, client *
 	}
 	p.gossipMu.Lock()
 	defer p.gossipMu.Unlock()
-	if p.source.Load() == source && p.gossipObserver != nil {
+	if p.gossipObserver == nil {
+		return
+	}
+	if current := p.source.Load(); current == source {
 		p.gossipObserver(client)
+	} else if current == nil && p.gossipSource == source {
+		p.pendingGossip = client
 	}
 }
 
@@ -346,6 +353,12 @@ func (p *Progress) attachSource(source *blockstream.BlockSource) {
 	if p != nil {
 		p.gossipMu.Lock()
 		p.source.Store(source)
+		if source != nil {
+			if p.gossipSource == source && p.pendingGossip != nil && p.gossipObserver != nil {
+				p.gossipObserver(p.pendingGossip)
+			}
+			p.gossipSource, p.pendingGossip = source, nil
+		}
 		p.gossipMu.Unlock()
 	}
 }
