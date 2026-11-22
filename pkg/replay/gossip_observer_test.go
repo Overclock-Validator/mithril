@@ -27,14 +27,16 @@ func TestProgressGossipObserverFencesAbandonedSources(t *testing.T) {
 	}
 	p.begin(2, nil)
 	p.observeSourceGossip(first, client)
+	p.observeSourceGossip(first, replacement)
 	if len(attached) != 1 {
 		t.Fatal("a reset source attached after its attempt ended")
 	}
 	p.attachSource(first)
-	p.observeSourceGossip(first, client)
-	if len(attached) != 2 || attached[1] != client {
-		t.Fatal("the retained source could not attach in a new attempt")
+	if len(attached) != 2 || attached[1] != replacement {
+		t.Fatal("reattachment did not publish the retained source's latest client")
 	}
+	p.attachSource(nil)
+	p.observeSourceGossip(first, client)
 	p.sourceStarted(second)
 	p.observeSourceGossip(first, client)
 	p.observeSourceGossip(second, replacement)
