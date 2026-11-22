@@ -274,11 +274,12 @@ func TestActivityHistoryPromptRecoveryKeepsOriginalLease(t *testing.T) {
 			t.Fatal("initial history was not published")
 		}
 		original := current().freshUntil
-		time.Sleep(2 * time.Second)
+		beforeNextRead := activityHistoryCaptureInterval / 2
+		time.Sleep(beforeNextRead)
 		next := g
 		next.ObservedAt = time.Now()
 		gate.Store(&next)
-		time.Sleep(time.Second)
+		time.Sleep(activityHistoryCaptureInterval - beforeNextRead)
 		synctest.Wait()
 		if current() != nil {
 			t.Fatal("failed read retained a publication")
