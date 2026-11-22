@@ -184,11 +184,11 @@ func testVoteRewardValidatorMaterial(
 	blsPubkey.ScalarMultiplicationBase(big.NewInt(scalar))
 	compressed := blsPubkey.Bytes()
 	return map[solana.PublicKey]uint64{
-			voteAccount: 100,
-		}, map[solana.PublicKey]*epochstakes.VoteAccount{
-			voteAccount: {
-				NodePubkey:          nodePubkey,
-				BlsPubkeyCompressed: &compressed,
-			},
-		}
+		voteAccount: 100,
+	}, map[solana.PublicKey]*epochstakes.VoteAccount{
+		voteAccount: {
+			NodePubkey:          nodePubkey,
+			BlsPubkeyCompressed: &compressed,
+		},
+	}
 }
