@@ -74,7 +74,7 @@ func TestActivityHistoryDeliveryAfterReplayAdvance(t *testing.T) {
 			if h.Frontier == 21 {
 				delay := time.Since(advancedAt)
 				t.Logf("advance reached the API after %s", delay)
-				if delay > 6*time.Second || h.Rows[0].Transactions != 101 || h.Rows[0].EndTime-h.Rows[0].StartTime != 10 {
+				if delay > 2*time.Second || h.Rows[0].Transactions != 101 || h.Rows[0].EndTime-h.Rows[0].StartTime != 10 {
 					t.Fatalf("unexpected delivery delay or interval: %s, %+v", delay, h.Rows[0])
 				}
 				return
