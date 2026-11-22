@@ -93,24 +93,23 @@ func openHistoryStore(path string) (_ *historyStore, result error) {
 	if err != nil || !privateHistoryInfo(info, true) {
 		return nil, errors.New("history directory must be mode 0700 and owned by the reader")
 	}
-	entries, err := s.directory.ReadDir(historySegments + 2)
-	if err != nil && err != io.EOF {
-		return nil, err
-	}
-	if len(entries) > historySegments+1 {
-		return nil, errHistoryLimit
-	}
-	hasOwner := false
-	for _, entry := range entries {
-		if entry.Name() == historyOwnerFile {
-			hasOwner = true
-		}
-	}
-	if !hasOwner && len(entries) != 0 {
-		return nil, errors.New("history directory is not empty or reader-owned")
-	}
+	_, err = root.Lstat(historyOwnerFile)
+	hasOwner := err == nil
 	flags := os.O_RDWR
 	if !hasOwner {
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		entries, err := s.directory.ReadDir(1)
+		if err != nil && err != io.EOF {
+			return nil, err
+		}
+		if len(entries) != 0 {
+			return nil, errors.New("history directory is not empty or reader-owned")
+		}
+		if _, err := s.directory.Seek(0, io.SeekStart); err != nil {
+			return nil, err
+		}
 		flags |= os.O_CREATE | os.O_EXCL
 	}
 	s.lock, err = s.openFile(historyOwnerFile, flags)
@@ -120,21 +119,42 @@ func openHistoryStore(path string) (_ *historyStore, result error) {
 	if err := unix.Flock(int(s.lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		return nil, errors.New("history directory is already locked")
 	}
-	if !hasOwner {
-		if n, err := s.lock.WriteString(historyOwnerText); err != nil || n != len(historyOwnerText) {
-			return nil, errors.Join(err, io.ErrShortWrite)
-		}
-		if err := s.lock.Sync(); err != nil {
-			return nil, err
-		}
-		if err := s.directory.Sync(); err != nil {
-			return nil, err
-		}
-	} else {
+	// Read segment membership only after the previous writer has released it.
+	entries, err := s.directory.ReadDir(historySegments + 2)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	if len(entries) > historySegments+1 {
+		return nil, errHistoryLimit
+	}
+	initializeOwner := !hasOwner
+	if hasOwner {
 		b, err := io.ReadAll(io.LimitReader(s.lock, int64(len(historyOwnerText)+1)))
-		if err != nil || string(b) != historyOwnerText {
+		if err != nil {
+			return nil, err
+		}
+		if text := string(b); text != historyOwnerText {
+			if !strings.HasPrefix(historyOwnerText, text) {
+				return nil, errors.New("unknown history ownership format")
+			}
+			initializeOwner = true
+		}
+	}
+	if initializeOwner {
+		// A torn first write is recoverable only before any segment exists.
+		if len(entries) != 1 || entries[0].Name() != historyOwnerFile {
 			return nil, errors.New("unknown history ownership format")
 		}
+		if n, err := s.lock.WriteAt([]byte(historyOwnerText), 0); err != nil || n != len(historyOwnerText) {
+			return nil, errors.Join(err, io.ErrShortWrite)
+		}
+	}
+	// A prior writer may have left a complete marker before syncing it.
+	if err := s.lock.Sync(); err != nil {
+		return nil, err
+	}
+	if err := s.directory.Sync(); err != nil {
+		return nil, err
 	}
 	for _, entry := range entries {
 		if entry.Name() == historyOwnerFile {

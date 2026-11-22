@@ -321,7 +321,7 @@ func TestLeaderWindowDoesNotExtendTimerWithoutParentChange(t *testing.T) {
 	const leaderSlot = uint64(212)
 	parent := alpenglow.BlockID{Slot: leaderSlot - alpenglow.LeaderWindowSlots, Hash: solana.Hash{3}}
 	readyAt := time.Unix(1_700_000_000, 0)
-	now := readyAt.Add(130 * time.Millisecond)
+	now := readyAt.Add(AlpenglowSlotDuration - leaderBlockCompletionReserve + 5*time.Millisecond)
 
 	loop := NewLeaderLoop(LeaderLoopConfig{
 		CurrentSlot: func() uint64 { return leaderSlot - 1 },
@@ -344,7 +344,7 @@ func TestLeaderWindowDoesNotExtendTimerWithoutParentChange(t *testing.T) {
 	}
 
 	// A later notification for the same selected parent is not a sad-leader
-	// handover and must not buy the producer another 125ms.
+	// handover and must not extend the producer's original execution cutoff.
 	target, ok := loop.productionWindowTargetLocked(leaderSlot - 1)
 	require.False(t, ok)
 	require.Zero(t, target)
@@ -821,7 +821,7 @@ func TestLeaderWindowRecheckStartsAdjacentReadyWindowWithoutPollDelay(t *testing
 	require.NotNil(t, controller.WorkingBank())
 }
 
-func TestLeaderWindowReservesObservedFinalizationAndFanoutBudget(t *testing.T) {
+func TestLeaderWindowReservesPipelinedFinalizationAndFanoutBudget(t *testing.T) {
 	const leaderSlot = uint64(212)
 	readyAt := time.Unix(1_700_000_000, 0)
 	loop := NewLeaderLoop(LeaderLoopConfig{SlotDuration: AlpenglowSlotDuration})
@@ -833,17 +833,17 @@ func TestLeaderWindowReservesObservedFinalizationAndFanoutBudget(t *testing.T) {
 		readyAt:   readyAt,
 	}
 
-	// The incident trace's slowest successful finalize+footer path consumed
-	// about 55ms after the freeze cutoff. The old 25ms reserve completed 30ms
-	// late; the new cutoff leaves another 20ms for scheduler/fanout jitter.
-	const observedWorstFinalization = 55 * time.Millisecond
+	// The initial pipelined completion trials measured 4-9ms. The 15ms default
+	// leaves 6ms beyond that observed maximum; this is not a latency guarantee.
+	const observedWorstFinalization = 9 * time.Millisecond
 	for offset := uint64(0); offset < alpenglow.LeaderWindowSlots; offset++ {
 		slot := leaderSlot + offset
 		protocolDeadline := loop.productionWindowProtocolDeadlineLocked(slot)
 		freezeAt := loop.productionWindowDeadlineLocked(slot)
 		require.Equal(t, readyAt.Add(time.Duration(offset+1)*AlpenglowSlotDuration), protocolDeadline)
+		require.Equal(t, protocolDeadline.Add(-15*time.Millisecond), freezeAt)
 		require.Equal(t, leaderBlockCompletionReserve, protocolDeadline.Sub(freezeAt))
-		require.Equal(t, 20*time.Millisecond, protocolDeadline.Sub(freezeAt.Add(observedWorstFinalization)))
+		require.Equal(t, 6*time.Millisecond, protocolDeadline.Sub(freezeAt.Add(observedWorstFinalization)))
 	}
 }
 

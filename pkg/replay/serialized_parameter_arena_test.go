@@ -9,6 +9,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestParameterArenaUsageCountsHeapFallback(t *testing.T) {
+	a := arena.New[byte](16)
+	a.AllocN(12)
+	a.AllocN(8)
+	a.AllocN(3)
+	beforeBanks, beforeUsed, beforeOverflow, beforeAllocs := ParameterArenaUsage()
+	recordParameterArenaUsage(a)
+	banks, used, overflow, allocations := ParameterArenaUsage()
+	require.EqualValues(t, 1, banks-beforeBanks)
+	require.EqualValues(t, 15, used-beforeUsed)
+	require.EqualValues(t, 8, overflow-beforeOverflow)
+	require.EqualValues(t, 1, allocations-beforeAllocs)
+}
+
 // Banks alternate between two arenas; each is fully zeroed in the background
 // before it is handed to a bank again.
 func TestSerializedParameterArenaAlternatesClearedArenas(t *testing.T) {

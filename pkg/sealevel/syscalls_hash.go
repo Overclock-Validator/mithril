@@ -3,6 +3,7 @@ package sealevel
 import (
 	"bytes"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/binary"
 	"fmt"
 	"math/big"
@@ -79,6 +80,58 @@ func SyscallSha256Impl(vm sbpf.VM, valsAddr, valsLen, resultsAddr uint64) (uint6
 }
 
 var SyscallSha256 = sbpf.SyscallFunc3(SyscallSha256Impl)
+
+// SyscallSha512Impl is the implementation for the sol_sha512 syscall. Agave's
+// SyscallHash<Sha512Hasher> shares the sha256 cost model and slice limit and
+// writes a 64-byte digest.
+func SyscallSha512Impl(vm sbpf.VM, valsAddr, valsLen, resultsAddr uint64) (uint64, error) {
+	if valsLen > cu.CUSha256MaxSlices {
+		return syscallErr(SyscallErrTooManySlices)
+	}
+
+	execCtx := executionCtx(vm)
+	err := execCtx.ComputeMeter.Consume(cu.CUSha256BaseCost)
+	if err != nil {
+		return syscallCuErr()
+	}
+
+	hashResult, err := vm.Translate(resultsAddr, sha512.Size, true)
+	if err != nil {
+		return syscallErr(err)
+	}
+
+	hasher := sha512.New()
+	if valsLen > 0 {
+		// Safety: valsLen*16 cannot overflow because of the check versus CUSha256MaxSlices above
+		vals, err := vm.Translate(valsAddr, valsLen*16, false)
+		if err != nil {
+			return syscallErr(err)
+		}
+
+		for count := uint64(0); count < valsLen; count++ {
+			offset := count * 16
+			vec := VectorDescrC{Addr: binary.LittleEndian.Uint64(vals[offset:]), Len: binary.LittleEndian.Uint64(vals[offset+8:])}
+
+			data, err := vm.Translate(vec.Addr, vec.Len, false)
+			if err != nil {
+				return syscallErr(err)
+			}
+
+			cost := max(vec.Len/2, cu.CUMemOpBaseCost)
+			err = execCtx.ComputeMeter.Consume(cost)
+			if err != nil {
+				return syscallCuErr()
+			}
+
+			hasher.Write(data)
+		}
+	}
+	// All inputs have been read before writing, including when output aliases input memory.
+	hasher.Sum(hashResult[:0])
+	return syscallSuccess(0)
+}
+
+var SyscallSha512 = sbpf.SyscallFunc3(SyscallSha512Impl)
 
 // SyscallKeccak256Impl is the implementation for the sol_keccak256 syscall
 func SyscallKeccak256Impl(vm sbpf.VM, valsAddr, valsLen, resultsAddr uint64) (uint64, error) {

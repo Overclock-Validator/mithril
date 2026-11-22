@@ -148,3 +148,39 @@ func TestPublicResourcesUnavailableAndStale(t *testing.T) {
 		t.Fatalf("producer exceeds its feed sample: %+v", got)
 	}
 }
+
+func TestPublicFilesystemUsedBytes(t *testing.T) {
+	used := uint64(40)
+	f := &Filesystem{TotalBytes: 100, AvailableBytes: 50, UsedBytes: &used}
+	p := publicFilesystem(f)
+	if p == nil || p.UsedBytes == nil || *p.UsedBytes != 40 {
+		t.Fatalf("reserved space changed reported usage: %+v", p)
+	}
+	used = 0
+	if *p.UsedBytes != 40 {
+		t.Fatal("public used bytes alias the source")
+	}
+	zero := publicFilesystem(f)
+	if zero == nil || zero.UsedBytes == nil || *zero.UsedBytes != 0 {
+		t.Fatalf("known zero usage was lost: %+v", zero)
+	}
+	body, err := json.Marshal(zero)
+	if err != nil || !strings.Contains(string(body), `"used_bytes":"0"`) {
+		t.Fatalf("known zero usage omitted from JSON: %s, %v", body, err)
+	}
+	for _, value := range []uint64{51, 101} {
+		used = value
+		if publicFilesystem(f) != nil {
+			t.Fatalf("invalid used/available counts accepted: used=%d", value)
+		}
+	}
+	f.UsedBytes = nil
+	legacy := publicFilesystem(f)
+	if legacy == nil || legacy.UsedBytes != nil {
+		t.Fatalf("legacy absence became reported usage: %+v", legacy)
+	}
+	body, err = json.Marshal(legacy)
+	if err != nil || strings.Contains(string(body), "used_bytes") {
+		t.Fatalf("legacy usage was not omitted: %s, %v", body, err)
+	}
+}

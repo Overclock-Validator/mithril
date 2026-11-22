@@ -33,6 +33,45 @@ type rewardKey struct {
 	address string
 }
 
+// persistedReward stores only fields that are not already in rewardKey. Keep
+// the source fold beside the reward: both are needed to decide whether a
+// prepared record is rooted, and retaining a second full key map is costly for
+// several epochs of stake rewards. The public Record and disk format stay the
+// same. Commission is inline so historical vote rewards need no extra pointer.
+type persistedReward struct {
+	effectiveSlot uint64
+	amount        uint64
+	postBalance   uint64
+	sourceBatch   uint64
+	commission    uint8
+	hasCommission bool
+}
+
+func compactReward(record Record, sourceBatch uint64) persistedReward {
+	value := persistedReward{
+		effectiveSlot: record.EffectiveSlot,
+		amount:        record.Amount,
+		postBalance:   record.PostBalance,
+		sourceBatch:   sourceBatch,
+	}
+	if record.Commission != nil {
+		value.commission, value.hasCommission = *record.Commission, true
+	}
+	return value
+}
+
+func (value persistedReward) record(key rewardKey) Record {
+	record := Record{
+		Epoch: key.epoch, Address: key.address, EffectiveSlot: value.effectiveSlot,
+		Amount: value.amount, PostBalance: value.postBalance,
+	}
+	if value.hasCommission {
+		commission := value.commission
+		record.Commission = &commission
+	}
+	return record
+}
+
 type batch struct {
 	Version  uint32          `json:"version"`
 	Through  uint64          `json:"through"`
@@ -76,8 +115,7 @@ type Store struct {
 	rooted            atomic.Uint64
 	mu                sync.RWMutex
 	pending           map[rewardKey]Record
-	persisted         map[rewardKey]Record
-	sourceBatch       map[rewardKey]uint64
+	persisted         map[rewardKey]persistedReward
 	batches           map[uint64][]rewardKey
 	pendingCoverage   map[coverageKey]epochCoverage
 	coverage          map[coverageKey]epochCoverage
@@ -100,8 +138,7 @@ func Open(dir string, retentionSlots uint64) (*Store, error) {
 		dir:               dir,
 		retentionSlots:    retentionSlots,
 		pending:           make(map[rewardKey]Record),
-		persisted:         make(map[rewardKey]Record),
-		sourceBatch:       make(map[rewardKey]uint64),
+		persisted:         make(map[rewardKey]persistedReward),
 		batches:           make(map[uint64][]rewardKey),
 		pendingCoverage:   make(map[coverageKey]epochCoverage),
 		coverage:          make(map[coverageKey]epochCoverage),
@@ -289,8 +326,7 @@ func (s *Store) install(value batch) {
 	keys := make([]rewardKey, 0, len(value.Records))
 	for _, record := range value.Records {
 		key := rewardKey{epoch: record.Epoch, address: record.Address}
-		s.persisted[key] = record
-		s.sourceBatch[key] = value.Through
+		s.persisted[key] = compactReward(record, value.Through)
 		keys = append(keys, key)
 	}
 	s.batches[value.Through] = keys
@@ -345,9 +381,8 @@ func (s *Store) SetRooted(slot uint64) error {
 		}
 		removed = true
 		for _, key := range keys {
-			if s.sourceBatch[key] == through {
+			if s.persisted[key].sourceBatch == through {
 				delete(s.persisted, key)
-				delete(s.sourceBatch, key)
 			}
 		}
 		delete(s.batches, through)
@@ -423,9 +458,8 @@ func (s *Store) Rewind(fromSlot uint64) error {
 		}
 		removed = true
 		for _, key := range keys {
-			if s.sourceBatch[key] == through {
+			if s.persisted[key].sourceBatch == through {
 				delete(s.persisted, key)
-				delete(s.sourceBatch, key)
 			}
 		}
 		delete(s.batches, through)
@@ -448,8 +482,7 @@ func (s *Store) restoreRetainedRecords(pruneBefore, throughLimit uint64) error {
 		}
 	}
 	sort.Slice(throughs, func(i, j int) bool { return throughs[i] < throughs[j] })
-	persisted := make(map[rewardKey]Record)
-	sources := make(map[rewardKey]uint64)
+	persisted := make(map[rewardKey]persistedReward)
 	coverage := make(map[coverageKey]epochCoverage)
 	coverageBatches := make(map[coverageKey]uint64)
 	for _, through := range throughs {
@@ -462,15 +495,14 @@ func (s *Store) restoreRetainedRecords(pruneBefore, throughLimit uint64) error {
 		}
 		for _, record := range value.Records {
 			key := rewardKey{epoch: record.Epoch, address: record.Address}
-			persisted[key] = record
-			sources[key] = through
+			persisted[key] = compactReward(record, through)
 		}
 		for _, event := range append(value.Coverage, value.Progress...) {
 			key := event.key()
 			coverage[key], coverageBatches[key] = event, through
 		}
 	}
-	s.persisted, s.sourceBatch = persisted, sources
+	s.persisted = persisted
 	s.coverage, s.coverageBatch = coverage, coverageBatches
 	return nil
 }
@@ -528,10 +560,10 @@ func (s *Store) Get(epoch uint64, address string, includePending bool) (Record, 
 		}
 	}
 	record, ok := s.persisted[key]
-	if !ok || record.EffectiveSlot > s.rooted.Load() || s.sourceBatch[key] > s.rooted.Load() {
+	if !ok || record.effectiveSlot > s.rooted.Load() || record.sourceBatch > s.rooted.Load() {
 		return Record{}, false
 	}
-	return record, true
+	return record.record(key), true
 }
 
 // RootedSlot returns the durable reward watermark.

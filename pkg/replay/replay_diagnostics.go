@@ -258,6 +258,15 @@ func (p *Progress) EnableReplayDiagnostics(runID string) error {
 	return nil
 }
 
+// EnableFastExecuted opts in to the provisional local-execution tail.
+func (p *Progress) EnableFastExecuted() error {
+	if p == nil || p.diagnostics.Load() == nil || p.latest.Load() != nil {
+		return errors.New("fast execution observations require replay diagnostics before replay starts")
+	}
+	p.fastExecuted = true
+	return nil
+}
+
 // ReplayDiagnosticsSnapshot copies retained records without reading live metrics.
 func (p *Progress) ReplayDiagnosticsSnapshot() (ReplayDiagnosticSnapshot, bool) {
 	if p == nil {

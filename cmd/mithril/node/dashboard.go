@@ -15,7 +15,6 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/blockstream"
 	"github.com/Overclock-Validator/mithril/pkg/consensus"
 	"github.com/Overclock-Validator/mithril/pkg/dashboard"
-	"github.com/Overclock-Validator/mithril/pkg/global"
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
 	"github.com/Overclock-Validator/mithril/pkg/identity"
 	"github.com/Overclock-Validator/mithril/pkg/metrics"
@@ -297,13 +296,18 @@ func filesystemSample(path string) *dashboard.Filesystem {
 
 func filesystemFromStat(stat syscall.Statfs_t) *dashboard.Filesystem {
 	unit := filesystemBlockSize(stat)
-	if unit == 0 || stat.Blocks > ^uint64(0)/unit || stat.Bavail > ^uint64(0)/unit {
+	if unit == 0 || stat.Blocks > ^uint64(0)/unit || stat.Bavail > ^uint64(0)/unit || stat.Bfree > stat.Blocks || stat.Bavail > stat.Bfree {
 		return nil
 	}
-	return &dashboard.Filesystem{TotalBytes: stat.Blocks * unit, AvailableBytes: stat.Bavail * unit, Inodes: stat.Files, FreeInodes: stat.Ffree}
+	used := (stat.Blocks - stat.Bfree) * unit
+	return &dashboard.Filesystem{TotalBytes: stat.Blocks * unit, AvailableBytes: stat.Bavail * unit, UsedBytes: &used, Inodes: stat.Files, FreeInodes: stat.Ffree}
 }
 
-func startNodeDashboard(ctx context.Context, startedAt time.Time, socket, group, runID, network, mode string, alpenglow, rpcConfigured, hostResources, networkDetails, machineDetails, localPeers, replayDetails, cacheDetails bool) *nodeDashboard {
+func startNodeDashboard(ctx context.Context, startedAt time.Time, socket, group, runID, network, mode string, alpenglow, rpcConfigured, hostResources, networkDetails, machineDetails, localPeers, replayDetails, cacheDetails, fastExecuted bool) *nodeDashboard {
+	if fastExecuted && !replayDetails {
+		mlog.Log.Warnf("dashboard fast execution observations require replay details")
+		return nil
+	}
 	if socket == "" {
 		return nil
 	}
@@ -330,6 +334,13 @@ func startNodeDashboard(ctx context.Context, startedAt time.Time, socket, group,
 			return nil
 		}
 		details.Replay = d.sampleReplayDetail
+		if fastExecuted {
+			if err := d.progress.EnableFastExecuted(); err != nil {
+				mlog.Log.Warnf("dashboard fast execution observations unavailable: %v", err)
+				return nil
+			}
+			details.FastExecuted = d.sampleFastExecuted
+		}
 		details.SelectedWindow = d.sampleSelectedWindow
 		details.RootedHistory = d.sampleRootedHistory
 		details.HeldSchedules = d.sampleHeldSchedules
@@ -388,14 +399,10 @@ func (d *nodeDashboard) snapshot() dashboard.Snapshot {
 		key := holder.PublicKey().String()
 		s.IdentityKey = &key
 	}
-	if s.Phase == "replaying" {
-		// Replay publishes this atomic frontier after successful execution or
-		// a known skip. Zero before replay initialization is unavailable here.
-		if slot := global.ReplayFrontier(); slot != 0 {
+	if p, ok := d.progress.Snapshot(); ok {
+		if slot := p.Frontier; s.Phase == "replaying" && slot != 0 {
 			s.ReplayFrontier = &slot
 		}
-	}
-	if p, ok := d.progress.Snapshot(); ok {
 		s.Replay = replayMeasurement(p)
 		if a := s.Replay.NextKnownAssignment; a != nil && (s.IdentityKey == nil || a.Identity != *s.IdentityKey) {
 			s.Replay.NextKnownAssignment = nil
@@ -526,6 +533,46 @@ func replayMeasurement(p replay.ProgressSnapshot) *dashboard.Replay {
 		r.AccountFacts = accountFactsMeasurement(p.AccountFacts)
 	}
 	return r
+}
+
+// sampleFastExecuted copies only provisional replay observations.
+func (d *nodeDashboard) sampleFastExecuted() (dashboard.FastExecuted, bool) {
+	if d == nil {
+		return dashboard.FastExecuted{}, false
+	}
+	p, ok := d.progress.Snapshot()
+	if !ok || p.Attempt == 0 || p.ExecutionSequence == 0 {
+		return dashboard.FastExecuted{}, false
+	}
+	d.mu.Lock()
+	run, started := d.state.RunID, d.state.StartedAt
+	var genesis *string
+	if d.state.GenesisHash != nil {
+		value := *d.state.GenesisHash
+		genesis = &value
+	}
+	d.mu.Unlock()
+	rows := p.RecentExecuted()
+	v := dashboard.FastExecuted{SchemaVersion: 1, Family: "recent_executed", Scope: "locally_executed",
+		State: "unavailable", Sequence: p.ExecutionSequence, SampledAt: p.ExecutionAt.UTC(),
+		Binding: dashboard.FastExecutedBinding{RunID: run, GenesisHash: genesis, NodeStartedAt: started.UTC(),
+			Attempt: p.Attempt, Rewinds: p.Rewinds, AttemptStartedAt: p.StartedAt.UTC()},
+		Records: make([]dashboard.ExecutedSlot, 0, len(rows))}
+	for _, row := range rows {
+		record := dashboard.ExecutedSlot{At: row.At, Slot: row.Slot,
+			Bankhash: row.Bankhash.String(), Transactions: row.Transactions, ComputeUnits: row.ComputeUnits,
+			WorkCountersSaturated: row.WorkCountersSaturated}
+		if row.HasBlockID {
+			value := row.BlockID.String()
+			record.BlockID = &value
+		}
+		v.Records = append(v.Records, record)
+	}
+	if len(v.Records) != 0 {
+		v.State = "fresh"
+		v.SampledAt = v.Records[len(v.Records)-1].At
+	}
+	return v, true
 }
 
 func accountFactsMeasurement(f replay.AccountFacts) *dashboard.AccountFacts {

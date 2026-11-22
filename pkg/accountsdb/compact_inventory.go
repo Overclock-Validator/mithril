@@ -27,15 +27,23 @@ import (
 // against the tracked view and logs any drift, so an untracked writer shows up
 // as a warning instead of silently starving reclamation.
 //
-// Correctness does not depend on the inventory being complete: a missing data
-// file is merely not compacted until the next rebuild, a vanished one is
-// skipped, and rewind pins still fail closed on any missing in-horizon fold
-// manifest. Guarded by foldMu.
+// Compaction's correctness does not depend on the inventory being complete: a
+// missing data file is merely not compacted until the next rebuild, a vanished
+// one is skipped, and rewind pins still fail closed on any missing in-horizon
+// fold manifest. FoldAndParkedManifests does depend on the manifest names
+// being complete; it says why they are. Guarded by foldMu.
+//
+// A store that has not compacted yet (or never does: compaction can be
+// disabled) may hold a names-only inventory, built for FoldAndParkedManifests
+// by listing the primary directory without a stat per file. Its data map is
+// nil. The first compaction cycle replaces it with a full one.
 type compactionInventory struct {
-	data      map[string]inventoryDataFile
-	manifests map[string]struct{} // ".manifest" and ".manifest.rewound" names, not tmp files
-	cycles    uint64              // cycles served since the last full scan
+	data      map[string]inventoryDataFile // nil in a names-only inventory
+	manifests map[string]struct{}          // ".manifest" and ".manifest.rewound" names, not tmp files
+	cycles    uint64                       // uses served since the last scan
 }
+
+func (inv *compactionInventory) namesOnly() bool { return inv.data == nil }
 
 type inventoryDataFile struct {
 	slot, fileId    uint64
@@ -97,6 +105,33 @@ func (db *AccountsDb) scanCompactionInventoryDir(inv *compactionInventory, dir s
 	return nil
 }
 
+// scanManifestNames builds a names-only inventory: one pass over the primary
+// directory, where every manifest lives, in batches and without a stat per
+// entry. That is the cost of one ListFoldAndParkedManifests listing, against
+// roughly eight times that for the full scan's stat of every data file.
+func (db *AccountsDb) scanManifestNames() (*compactionInventory, error) {
+	dir, err := os.Open(db.AcctsDir)
+	if err != nil {
+		return nil, err
+	}
+	defer dir.Close()
+	inv := &compactionInventory{manifests: make(map[string]struct{})}
+	for {
+		entries, readErr := dir.ReadDir(1024)
+		if readErr != nil && readErr != io.EOF {
+			return nil, readErr
+		}
+		for _, e := range entries {
+			if name := e.Name(); !e.IsDir() && isTrackedManifestName(name) {
+				inv.manifests[name] = struct{}{}
+			}
+		}
+		if readErr == io.EOF {
+			return inv, nil
+		}
+	}
+}
+
 func isTrackedManifestName(name string) bool {
 	if strings.HasSuffix(name, segManifestTmpSuffix) {
 		return false
@@ -104,11 +139,12 @@ func isTrackedManifestName(name string) bool {
 	return strings.HasSuffix(name, segManifestSuffix) || strings.HasSuffix(name, segManifestRewoundSuffix)
 }
 
-// compactionInventoryLocked returns the current inventory, rebuilding it after
-// an invalidation and periodically re-verifying a tracked one.
+// compactionInventoryLocked returns the current full inventory, rebuilding it
+// after an invalidation, replacing a names-only one, and periodically
+// re-verifying a tracked one.
 func (db *AccountsDb) compactionInventoryLocked() (*compactionInventory, error) {
 	inv := db.compactInventory
-	if inv != nil && inv.cycles < compactionInventoryVerifyCycles {
+	if inv != nil && !inv.namesOnly() && inv.cycles < compactionInventoryVerifyCycles {
 		inv.cycles++
 		return inv, nil
 	}
@@ -117,8 +153,38 @@ func (db *AccountsDb) compactionInventoryLocked() (*compactionInventory, error) 
 		db.compactInventory = nil
 		return nil, err
 	}
-	if inv != nil {
-		if drift := inv.diff(fresh); len(drift) > 0 {
+	db.adoptInventoryLocked(inv, fresh)
+	return fresh, nil
+}
+
+// manifestInventoryLocked returns an inventory whose manifest names are
+// current, which is all FoldAndParkedManifests needs. It serves whatever
+// inventory exists. With none, it builds a names-only one; a store that never
+// compacts therefore never pays for, or retains, the per-data-file view. Uses
+// count toward the same periodic rebuild as compaction cycles.
+func (db *AccountsDb) manifestInventoryLocked() (*compactionInventory, error) {
+	inv := db.compactInventory
+	if inv != nil && inv.cycles < compactionInventoryVerifyCycles {
+		inv.cycles++
+		return inv, nil
+	}
+	if inv != nil && !inv.namesOnly() {
+		return db.compactionInventoryLocked()
+	}
+	fresh, err := db.scanManifestNames()
+	if err != nil {
+		db.compactInventory = nil
+		return nil, err
+	}
+	db.adoptInventoryLocked(inv, fresh)
+	return fresh, nil
+}
+
+// adoptInventoryLocked installs a freshly scanned inventory, reporting how the
+// tracked one (if any) had drifted from the directory.
+func (db *AccountsDb) adoptInventoryLocked(tracked, fresh *compactionInventory) {
+	if tracked != nil {
+		if drift := tracked.diff(fresh); len(drift) > 0 {
 			db.compactInventoryDrift += uint64(len(drift))
 			if compactionInventoryStrict {
 				for _, d := range drift {
@@ -131,7 +197,59 @@ func (db *AccountsDb) compactionInventoryLocked() (*compactionInventory, error) 
 		}
 	}
 	db.compactInventory = fresh
-	return fresh, nil
+}
+
+// FoldAndParkedManifests returns what ListFoldAndParkedManifests returns for
+// the primary accounts directory: active fold headers ascending by BatchSeq
+// and parked manifest paths. The manifest names come from the inventory, so a
+// caller that asks after every fold (transaction-status checkpoint retention)
+// does not list hundreds of thousands of appendvecs to find a few dozen
+// manifests. Headers are still read from the files on every call, because
+// sparse compaction rewrites an expired fold manifest in place as compact-kind.
+//
+// Unlike compaction, this caller depends on the view being complete: a fold or
+// parked manifest missing from it would let the checkpoint it references be
+// removed. Completeness holds because every writer of those names either
+// records the name (CommitBatch, compaction) or drops the inventory (recovery,
+// rewind, a failed fold or compaction cycle), and the first call after a drop
+// rebuilds the names from the directory (one listing, no stat per file, when
+// compaction has not built the full inventory). Like every inventory use, the
+// call counts toward the periodic rebuild. A listed manifest that no longer
+// exists means something outside the store removed it; the inventory is then
+// rebuilt once before answering, which is what a directory listing would have
+// shown.
+//
+// It takes foldMu, so it must not be called from inside a fold, a compaction
+// cycle, recovery or rewind.
+func (db *AccountsDb) FoldAndParkedManifests() ([]ManifestHeader, []string, error) {
+	db.foldMu.LockAs("manifest_listing")
+	defer db.foldMu.Unlock()
+	for rebuilt := false; ; rebuilt = true {
+		inv, err := db.manifestInventoryLocked()
+		if err != nil {
+			return nil, nil, err
+		}
+		var listing manifestListing
+		stale := false
+		for name := range inv.manifests {
+			if err := listing.add(db.AcctsDir, name); err != nil && os.IsNotExist(err) {
+				stale = true
+			}
+			if strings.HasSuffix(name, segManifestRewoundSuffix) {
+				if _, err := os.Lstat(filepath.Join(db.AcctsDir, name)); err != nil && os.IsNotExist(err) {
+					stale = true
+				}
+			}
+		}
+		if stale && !rebuilt {
+			db.compactInventoryDrift++
+			mlog.Log.Warnf("accountsdb: a manifest in the compaction inventory is gone from the directory; rebuilding the inventory")
+			db.invalidateCompactionInventoryLocked()
+			continue
+		}
+		folds, parked := listing.sorted()
+		return folds, parked, nil
+	}
 }
 
 // invalidateCompactionInventoryLocked drops the directory view and, with it,
@@ -178,7 +296,7 @@ func (db *AccountsDb) verifyManifestCRC(path string) (uint32, error) {
 // synced. A failed stat invalidates the inventory instead.
 func (db *AccountsDb) trackDataFileLocked(name string) {
 	inv := db.compactInventory
-	if inv == nil {
+	if inv == nil || inv.namesOnly() {
 		return
 	}
 	slot, fileId, ok := parseDataFileName(name)
@@ -216,21 +334,24 @@ func (db *AccountsDb) trackRemovedLocked(dataPath, manifestPath string) {
 	}
 }
 
-// diff reports names whose presence or recorded size/allocation differs.
+// diff reports names whose presence or recorded size/allocation differs. Data
+// files are compared only when both sides track them.
 func (inv *compactionInventory) diff(fresh *compactionInventory) []string {
 	var out []string
-	for name, f := range inv.data {
-		g, ok := fresh.data[name]
-		switch {
-		case !ok:
-			out = append(out, "stale data file "+name)
-		case f != g:
-			out = append(out, fmt.Sprintf("data file %s size/allocated %d/%d, directory %d/%d", name, f.size, f.allocated, g.size, g.allocated))
+	if !inv.namesOnly() && !fresh.namesOnly() {
+		for name, f := range inv.data {
+			g, ok := fresh.data[name]
+			switch {
+			case !ok:
+				out = append(out, "stale data file "+name)
+			case f != g:
+				out = append(out, fmt.Sprintf("data file %s size/allocated %d/%d, directory %d/%d", name, f.size, f.allocated, g.size, g.allocated))
+			}
 		}
-	}
-	for name := range fresh.data {
-		if _, ok := inv.data[name]; !ok {
-			out = append(out, "untracked data file "+name)
+		for name := range fresh.data {
+			if _, ok := inv.data[name]; !ok {
+				out = append(out, "untracked data file "+name)
+			}
 		}
 	}
 	for name := range inv.manifests {

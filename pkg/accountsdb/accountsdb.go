@@ -84,6 +84,7 @@ type AccountsDb struct {
 	lastBatchSeq     uint64        // guarded by foldMu; seeded by RecoverFoldState
 	durableThrough   atomic.Uint64 // observability: highest durably folded slot
 	foldHooks        foldTestHooks // test-only crash injection
+	foldPhase        foldPhase     // what CommitBatch is doing now, for slow-load attribution
 	compactCursor    string        // guarded by foldMu; scan resume point across CompactOnce cycles
 	sparseCursor     string        // independent cursor so bootstrap scanning cannot starve large segments
 	resparseNext     bool          // alternate new and previously sparse segments, even with one-file cycles
@@ -93,6 +94,9 @@ type AccountsDb struct {
 	compactLastScan  map[uint64]uint64 // oldest scan first; a growing directory must not postpone cursor wrap forever
 	compactCycles    uint64            // periodically serve bootstrap and mostly-empty sparse files too
 	compactHooks     compactionTestHooks
+	// Guarded by foldMu; report the format requirement once per opened store,
+	// including stores converted by an earlier process.
+	sparseCompatibilityWarned bool
 	// compactInventory is the in-memory view of the accounts directory that
 	// compaction scans (nil = rebuild from the directory); compactPinCache holds
 	// pins computed from unchanged retained manifests. Both guarded by foldMu.
@@ -123,7 +127,7 @@ const (
 	indexPebbleMemTableSize                = 64 << 20
 	indexPebbleMemTableStopWritesThreshold = 4
 	DefaultCommonAccountCacheMaxMB         = 768
-	DefaultProgramCacheMaxMB               = 1024
+	DefaultProgramCacheMaxMB               = 4096
 	programCacheCostUnitBytes              = 1 << 20
 	commonAccountCacheEntryOverheadBytes   = 256
 )

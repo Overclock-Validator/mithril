@@ -791,8 +791,30 @@ func (r *UDPReceiver) Run(ctx context.Context) error {
 func (r *UDPReceiver) readPackets(ctx context.Context, conn *net.UDPConn, onRepairSocket bool) error {
 	buf := make([]byte, packetDataSize)
 	activity := r.socketReadCounter(conn, onRepairSocket)
+	// Kernel receive timestamps and socket drop counts ride in each packet's
+	// control data where the platform supports them (Linux); elsewhere the
+	// reader is the plain one.
+	if !enableReceiveTelemetry(conn) {
+		for {
+			n, addr, err := conn.ReadFromUDP(buf)
+			if activity != nil && n > 0 {
+				activity.add(uint64(n))
+			}
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				return err
+			}
+			if !r.processPacketAt(ctx, conn, buf[:n], addr, onRepairSocket, 0) {
+				return nil
+			}
+		}
+	}
+	oob := make([]byte, receiveControlSize)
+	drops := &socketDrops{}
 	for {
-		n, addr, err := conn.ReadFromUDP(buf)
+		n, oobn, _, addr, err := conn.ReadMsgUDP(buf, oob)
 		if activity != nil && n > 0 {
 			activity.add(uint64(n))
 		}
@@ -802,13 +824,23 @@ func (r *UDPReceiver) readPackets(ctx context.Context, conn *net.UDPConn, onRepa
 			}
 			return err
 		}
-		if !r.processPacket(ctx, conn, buf[:n], addr, onRepairSocket) {
+		receivedNanos, dropped, haveDrops := parseReceiveControl(oob[:oobn])
+		if haveDrops {
+			drops.observe(dropped)
+		}
+		if !r.processPacketAt(ctx, conn, buf[:n], addr, onRepairSocket, receivedNanos) {
 			return nil
 		}
 	}
 }
 
 func (r *UDPReceiver) processPacket(ctx context.Context, conn *net.UDPConn, packet []byte, addr *net.UDPAddr, onRepairSocket bool) bool {
+	return r.processPacketAt(ctx, conn, packet, addr, onRepairSocket, 0)
+}
+
+// processPacketAt handles one packet; receivedNanos is the kernel's receive
+// time, zero when unknown.
+func (r *UDPReceiver) processPacketAt(ctx context.Context, conn *net.UDPConn, packet []byte, addr *net.UDPAddr, onRepairSocket bool, receivedNanos int64) bool {
 	receivedAt := time.Now()
 	r.packets.Add(1)
 	if onRepairSocket {
@@ -831,6 +863,7 @@ func (r *UDPReceiver) processPacket(ctx context.Context, conn *net.UDPConn, pack
 		}
 		return true
 	}
+	shred.ReceivedNanos = receivedNanos
 	if r.shredVersion != 0 && shred.Version != r.shredVersion {
 		r.versionMismatch.Add(1)
 		select {
@@ -850,6 +883,7 @@ func (r *UDPReceiver) processPacket(ctx context.Context, conn *net.UDPConn, pack
 				break
 			}
 		}
+		noteNewestDataShredSlot(shred.Slot)
 	case ShredTypeCode:
 		r.codingShreds.Add(1)
 	}
@@ -1101,6 +1135,15 @@ func (r *UDPReceiver) hydrateLoop(ctx context.Context) {
 				shred, perr := ParseShred(pkt)
 				if perr != nil {
 					continue
+				}
+				if VerifySpooledShreds {
+					if verr := r.verifySpooledShred(shred); verr != nil {
+						r.signatureErrors.Add(1)
+						if hook := OnSpooledShredRejected; hook != nil {
+							hook(slot, verr)
+						}
+						continue
+					}
 				}
 				if r.repairClient != nil {
 					r.repairClient.satisfyDataShred(shred)

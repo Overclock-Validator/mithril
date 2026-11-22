@@ -70,12 +70,20 @@ type clusterCountry struct {
 	Nodes int    `json:"nodes"`
 }
 
+// clusterRPCStake contains exact activated lamports from complete RPC vote rows.
+type clusterRPCStake struct {
+	CurrentLamports    string `json:"current_lamports"`
+	DelinquentLamports string `json:"delinquent_lamports"`
+}
+
 type clusterMap struct {
 	clusterMetadata
-	Precision string           `json:"precision"`
-	Total     int              `json:"total_nodes"`
-	Located   int              `json:"located_nodes"`
-	Countries []clusterCountry `json:"countries"`
+	Precision string            `json:"precision"`
+	Total     int               `json:"total_nodes"`
+	Located   int               `json:"located_nodes"`
+	Countries []clusterCountry  `json:"countries"`
+	RPCStake  *clusterRPCStake  `json:"rpc_stake,omitempty"`
+	RPCNodes  *cluster.RPCNodes `json:"rpc_nodes,omitempty"`
 }
 
 type clusterVersion struct {
@@ -202,6 +210,7 @@ func projectCluster(snapshot *cluster.Snapshot, generation, state, reason string
 }
 
 func projectClusterAnchored(snapshot *cluster.Snapshot, generation, state, reason string, now, anchor time.Time) *clusterView {
+	var rpcNodes *cluster.RPCNodes
 	v := &clusterView{metadata: clusterMetadata{SchemaVersion: 1, Scope: "independent_cluster", State: state,
 		Reason: reason, CollectorAt: anchor.UTC(), Profile: "unknown", Network: "unknown", FastState: "unavailable",
 		Providers: []cluster.ProviderStatus{}}, pollStarted: anchor, leaseStarted: anchor, rows: []cluster.Validator{}, orders: make(map[string][]int)}
@@ -222,8 +231,11 @@ func projectClusterAnchored(snapshot *cluster.Snapshot, generation, state, reaso
 		v.metadata.Providers = append([]cluster.ProviderStatus(nil), snapshot.Providers...)
 		for i := range v.metadata.Providers {
 			p := &v.metadata.Providers[i]
-			if p.ID == "puffin" && p.State == "retired" && p.Reason == "provider_retired" {
-				p.State, p.Reason = "unavailable", "not_collected"
+			if p.ID == "puffin" {
+				p.SourceURL = ""
+				if p.State == "retired" && p.Reason == "provider_retired" {
+					p.State, p.Reason = "unavailable", "not_collected"
+				}
 			}
 			if p.State == "fresh" && (state != "fresh" || p.SourceAt == nil || now.Sub(*p.SourceAt) > cluster.MaxAge || p.SourceAt.After(now.Add(5*time.Second)) || now.Sub(p.CapturedAt) > cluster.MaxAge || p.CapturedAt.After(now.Add(5*time.Second))) {
 				p.State = "stale"
@@ -232,6 +244,10 @@ func projectClusterAnchored(snapshot *cluster.Snapshot, generation, state, reaso
 				includeAge(p.CapturedAt)
 				includeAge(*p.SourceAt)
 				if p.ID == "rpc" {
+					if observed := snapshot.RPCNodes; observed != nil && !observed.ObservedAt.IsZero() && !observed.ObservedAt.After(now) && now.Sub(observed.ObservedAt) <= cluster.MaxAge {
+						rpcNodes = observed
+						includeAge(observed.ObservedAt)
+					}
 					if snapshot.Performance != nil {
 						includeAge(snapshot.Performance.ObservedAt)
 					}
@@ -312,7 +328,39 @@ func projectClusterAnchored(snapshot *cluster.Snapshot, generation, state, reaso
 			counts[country]++
 		}
 	}
-	mapValue := clusterMap{clusterMetadata: v.metadata, Precision: "ip_country_estimate", Total: len(locations), Countries: []clusterCountry{}}
+	mapValue := clusterMap{clusterMetadata: v.metadata, Precision: "ip_country_estimate", Total: len(locations), Countries: []clusterCountry{}, RPCNodes: rpcNodes}
+	// Only complete fresh RPC vote rows establish this exact mainnet stake split.
+	if v.metadata.State == "fresh" && v.metadata.Profile == "mainnet" && v.metadata.Network == "mainnet-beta" &&
+		v.metadata.GenesisHash != nil && *v.metadata.GenesisHash == cluster.MainnetGenesisHash && v.metadata.Epoch != nil {
+		complete := false
+		for _, provider := range v.metadata.Providers {
+			if provider.ID == "rpc" {
+				complete = provider.State == "fresh" && provider.Reason == "" && provider.Binding == "rpc_genesis_before_after" &&
+					provider.GenesisHash == cluster.MainnetGenesisHash && provider.Epoch != nil && *provider.Epoch == *v.metadata.Epoch &&
+					string(provider.RowCount) == strconv.Itoa(len(v.rows))
+			}
+		}
+		var current, delinquent big.Int
+		for i, row := range v.rows {
+			if !complete || row.DirectorySource != "rpc" || row.Delinquent == nil || stakes[i] == nil {
+				complete = false
+				break
+			}
+			lamports := new(big.Rat).Mul(stakes[i], big.NewRat(1_000_000_000, 1))
+			if !lamports.IsInt() || !lamports.Num().IsUint64() {
+				complete = false
+				break
+			}
+			if *row.Delinquent {
+				delinquent.Add(&delinquent, lamports.Num())
+			} else {
+				current.Add(&current, lamports.Num())
+			}
+		}
+		if complete {
+			mapValue.RPCStake = &clusterRPCStake{CurrentLamports: current.String(), DelinquentLamports: delinquent.String()}
+		}
+	}
 	for country, nodes := range counts {
 		mapValue.Countries = append(mapValue.Countries, clusterCountry{Code: country, Nodes: nodes})
 		mapValue.Located += nodes

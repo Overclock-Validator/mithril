@@ -42,6 +42,7 @@ type Feed struct {
 	closed     sync.Once
 	latest     atomic.Pointer[feedStatus]
 	details    *replayDetailSource
+	fast       *fastExecutedFeed
 	rooted     *rootedHistorySource
 	cache      *cacheDetailSource
 	network    *networkDetailSource
@@ -60,6 +61,7 @@ type feedStatus struct {
 // DetailSamplers enables bounded private detail routes when configured.
 type DetailSamplers struct {
 	Replay         ReplayDetailSampler
+	FastExecuted   func() (FastExecuted, bool)
 	Cache          CacheDetailSampler
 	SelectedWindow SelectedWindowSampler
 	RootedHistory  RootedHistorySampler
@@ -108,6 +110,9 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 	if details.SelectedWindow != nil && details.Replay == nil {
 		return nil, errors.New("selected window requires the replay detail worker")
 	}
+	if details.FastExecuted != nil && details.Replay == nil {
+		return nil, errors.New("fast execution observations require replay details")
+	}
 	var gid int
 	if groupMode {
 		var err error
@@ -144,6 +149,10 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 	f := &Feed{listener: listener, cancel: cancel, done: make(chan struct{}), served: make(chan struct{})}
 	if details.Replay != nil {
 		f.details = &replayDetailSource{sample: details.Replay, done: make(chan struct{})}
+		if details.FastExecuted != nil {
+			f.fast = &fastExecutedFeed{sample: details.FastExecuted, gate: &f.details.gate,
+				limit: rate.NewLimiter(12, 2), active: make(chan struct{}, 1)}
+		}
 		if details.HeldSchedules != nil {
 			f.details.held = &heldScheduleSource{sample: details.HeldSchedules, gate: &f.details.gate,
 				gateMu: &f.details.gateMu, active: make(chan struct{}, 2)}
@@ -207,6 +216,9 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 		if f.details != nil {
 			f.details.observeStatus(s, now)
 		}
+		if f.fast != nil {
+			f.fast.update(now)
+		}
 		if f.rooted != nil {
 			f.rooted.update(s, now)
 		}
@@ -226,6 +238,9 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 	}
 	update()
 	mux := http.NewServeMux()
+	if f.fast != nil {
+		mux.HandleFunc("/details/recent-executed", f.fast.serveHTTP)
+	}
 	if f.details != nil {
 		mux.HandleFunc("/details/replay", f.details.serveHTTP)
 		if f.details.selected != nil {

@@ -27,6 +27,8 @@ const (
 	MaxBytes = 4 << 20
 	// MaxRows bounds each provider and the joined directory.
 	MaxRows = 2048
+	// MaxRPCNodes bounds getClusterNodes contacts independently of vote-account rows.
+	MaxRPCNodes = 8192
 	// MaxPerformanceHistory bounds provider-reported historical samples.
 	MaxPerformanceHistory = 120
 	// GenesisHash identifies the supported community-cluster profile.
@@ -35,7 +37,7 @@ const (
 	MainnetGenesisHash = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
 	// MaxAge is the maximum source/capture age accepted as current by this package.
 	MaxAge = 2 * time.Minute
-	// RankPolicy names the collector's derived competition rank, not Titan's UI order.
+	// RankPolicy names the competition ranking computed by the collector.
 	RankPolicy = "derived_inclusion_ratio_desc_opportunities_desc"
 	// CountryAttributionURL is required when displaying DB-IP-derived countries.
 	CountryAttributionURL = "https://db-ip.com/"
@@ -54,6 +56,7 @@ type Snapshot struct {
 	CapturedAt         time.Time        `json:"captured_at"`
 	Epoch              *Count           `json:"epoch"`
 	Reference          *RPCReference    `json:"rpc_reference,omitempty"`
+	RPCNodes           *RPCNodes        `json:"rpc_nodes,omitempty"`
 	Performance        *RPCPerformance  `json:"rpc_performance,omitempty"`
 	PerformanceHistory []RPCPerformance `json:"rpc_performance_history,omitempty"`
 	SolstatSummary     *SolstatSummary  `json:"solstat_summary,omitempty"`
@@ -79,6 +82,13 @@ type RPCReference struct {
 	EpochStart   Count     `json:"epoch_start"`
 	SlotsInEpoch Count     `json:"slots_in_epoch"`
 	ObservedAt   time.Time `json:"observed_at"`
+}
+
+// RPCNodes is a dated getClusterNodes aggregate, not reachable/healthy RPC servers.
+// No node addresses are retained. Absent means unknown; advertised zero is measured.
+type RPCNodes struct {
+	Advertised Count     `json:"advertised"`
+	ObservedAt time.Time `json:"observed_at"`
 }
 
 // RPCPerformance is a single provider-reported sample. ObservedAt is response
@@ -130,10 +140,9 @@ type Validator struct {
 	CountryCode         string      `json:"country_code,omitempty"`
 	CountrySource       string      `json:"country_source,omitempty"`
 	Inclusion           []Inclusion `json:"inclusion"`
-	Fast                *FastScore  `json:"fast,omitempty"`
 }
 
-// Inclusion describes Titan's observed certificate cohort, not all chain slots.
+// Inclusion describes certificate outcomes within the provider's observed cohort.
 type Inclusion struct {
 	Window          string    `json:"window"`
 	Epoch           Count     `json:"epoch"`
@@ -149,13 +158,6 @@ type Inclusion struct {
 	LastSlot        Count     `json:"last_slot"`
 	FirstObservedAt time.Time `json:"first_observed_at"`
 	LastObservedAt  time.Time `json:"last_observed_at"`
-}
-
-// FastScore reserves an explicitly provider-specific score; no current adapter supplies it.
-type FastScore struct {
-	Provider string   `json:"provider"`
-	Percent  *float64 `json:"percent"`
-	Rank     *Count   `json:"rank"`
 }
 
 var sourceURLs = map[string]string{
@@ -303,6 +305,13 @@ func Validate(s Snapshot) error {
 			return errors.New("invalid RPC reference observation")
 		}
 	}
+	if r := s.RPCNodes; r != nil {
+		p := providers["rpc"]
+		n, err := number(r.Advertised)
+		if err != nil || n > MaxRPCNodes || p.State != "fresh" || r.ObservedAt.IsZero() || r.ObservedAt.After(p.CapturedAt) || r.ObservedAt.After(s.CapturedAt) || s.CapturedAt.Sub(r.ObservedAt) > MaxAge {
+			return errors.New("invalid RPC node observation")
+		}
+	}
 	validatePerformance := func(sample *RPCPerformance) error {
 		p := providers["rpc"]
 		slot, slotErr := number(sample.Slot)
@@ -355,7 +364,7 @@ func Validate(s Snapshot) error {
 	seen := make(map[string]bool, len(s.Validators))
 	for _, v := range s.Validators {
 		validSource := (s.Profile == "alpenglow" && (v.DirectorySource == "solstat" || v.DirectorySource == "titan")) || (s.Profile == "mainnet" && v.DirectorySource == "rpc")
-		if !keyOK(v.Identity) || !keyOK(v.VoteAccount) || seen[v.VoteAccount] || !textOK(v.Name, 128) || !textOK(v.Version, 64) || !validSource || providers[v.DirectorySource].State != "fresh" || v.Fast != nil {
+		if !keyOK(v.Identity) || !keyOK(v.VoteAccount) || seen[v.VoteAccount] || !textOK(v.Name, 128) || !textOK(v.Version, 64) || !validSource || providers[v.DirectorySource].State != "fresh" {
 			return errors.New("invalid validator row")
 		}
 		if v.DirectorySource == "rpc" && (v.Name != "" || v.VoteLagSlots != nil || v.LeaderSlots != nil || v.BlocksProduced != nil || v.SkipRatePercent != nil || v.EfficiencyPercent != nil || v.EfficiencyRank != nil || len(v.Inclusion) != 0) {

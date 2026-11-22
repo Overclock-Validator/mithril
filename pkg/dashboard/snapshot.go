@@ -325,6 +325,16 @@ type CertificateOutcomes struct {
 	FinalConflict         uint64    `json:"final_conflict,string"`
 }
 
+type ExecutedSlot struct {
+	At                    time.Time `json:"at"`
+	Slot                  uint64    `json:"slot,string"`
+	Bankhash              string    `json:"bankhash"`
+	BlockID               *string   `json:"block_id,omitempty"`
+	Transactions          uint64    `json:"transactions,string"`
+	ComputeUnits          uint64    `json:"compute_units,string"`
+	WorkCountersSaturated bool      `json:"work_counters_saturated"`
+}
+
 // CompletedBlock describes the latest locally executed bank, not finality.
 type CompletedBlock struct {
 	At               time.Time `json:"at"`
@@ -379,12 +389,13 @@ type Resources struct {
 	Cgroup     *CgroupResources `json:"cgroup,omitempty"`
 }
 
-// Filesystem reports total and unprivileged-available space for one path's mount.
+// Filesystem reports used, total and unprivileged-available space for one mount.
 type Filesystem struct {
-	TotalBytes     uint64 `json:"total_bytes,string"`
-	AvailableBytes uint64 `json:"available_bytes,string"`
-	Inodes         uint64 `json:"inodes,string"`
-	FreeInodes     uint64 `json:"free_inodes,string"`
+	TotalBytes     uint64  `json:"total_bytes,string"`
+	AvailableBytes uint64  `json:"available_bytes,string"`
+	UsedBytes      *uint64 `json:"used_bytes,string,omitempty"`
+	Inodes         uint64  `json:"inodes,string"`
+	FreeInodes     uint64  `json:"free_inodes,string"`
 }
 
 func (s Snapshot) validate() error {
@@ -415,9 +426,8 @@ type message struct {
 	Value any     `json:"value"`
 }
 
-// frames uses the FD envelope for equivalent fields only. The Mithril topic
-// carries our schema, source freshness and semantics without pretending to
-// implement FD's complete dashboard protocol.
+// frames encodes the supported dashboard messages. The Mithril topic carries
+// this node's schema, source freshness and semantics.
 func frames(s *Snapshot, state string, now time.Time) ([][]byte, error) {
 	var version, commit, identity, genesis, network, mode, phase, run, started, sampled, frontier any
 	var alpenglow, rpc any
