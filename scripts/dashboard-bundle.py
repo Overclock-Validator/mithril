@@ -22,6 +22,7 @@ RELEASE_FILES = (
     "docs/dashboard-api.md",
     "docs/dashboard-api-reference.md",
     "cmd/mithril-dashboard-collect/README.md",
+    "pkg/dashboard/cluster/dbip-country.NOTICE",
     "examples/dashboard/mithril-dashboard.nginx.conf",
     "examples/dashboard/mithril-dashboard.path",
     "examples/dashboard/mithril-dashboard.service",

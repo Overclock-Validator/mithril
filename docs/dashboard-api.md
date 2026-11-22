@@ -198,6 +198,9 @@ cgroup and may not reflect limits imposed by its ancestors. A missing or stale
 peer capture is not an empty peer list.
 See [Optional routes](dashboard-api-reference.md#optional-routes) for the
 route families and freshness expectations.
+The example Nginx allowlist does not forward aggregate history or production
+details. Enabling them on the reader does not make those routes available
+through the proxy. Extend the allowlist only if your viewer needs them.
 
 ## Private setup
 
