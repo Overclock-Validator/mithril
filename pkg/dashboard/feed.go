@@ -9,8 +9,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	urlpath "path"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,13 +32,16 @@ const (
 // Feed samples once per second, independently of reader requests. Readers only
 // receive the cached encoding; they never call into node state.
 type Feed struct {
-	server   *http.Server
-	listener net.Listener
-	cancel   context.CancelFunc
-	done     chan struct{}
-	served   chan struct{}
-	closed   sync.Once
-	latest   atomic.Pointer[feedStatus]
+	server     *http.Server
+	listener   net.Listener
+	cancel     context.CancelFunc
+	done       chan struct{}
+	served     chan struct{}
+	closed     sync.Once
+	latest     atomic.Pointer[feedStatus]
+	network    *networkDetailSource
+	machine    *machineDetailSource
+	localPeers *localPeerSource
 }
 
 const statusRemainingHeader = "Mithril-Status-Remaining-Milliseconds"
@@ -47,24 +52,40 @@ type feedStatus struct {
 	freshUntil time.Time
 }
 
+// DetailSamplers enables bounded private detail routes when configured.
+type DetailSamplers struct {
+	Network     NetworkDetailSampler
+	NodeNetwork NodeNetworkSampler
+	Machine     MachineDetailSampler
+	LocalPeers  LocalPeerSampler
+}
+
 // ListenFeed requires an existing private directory owned by the node. It
 // replaces only a stale socket owned by the node that refuses connections, as
 // left by an exit that skipped Close (SIGKILL, OOM, os.Exit); any other existing
 // path is left in place and the listen fails.
 // The sampler must return a bounded immutable copy without I/O or long-held locks.
 func ListenFeed(parent context.Context, path string, sample func() Snapshot) (*Feed, error) {
-	return listenFeed(parent, path, "", false, sample)
+	return listenFeed(parent, path, "", false, sample, DetailSamplers{})
 }
 
 // ListenFeedGroup permits a dedicated Linux group to connect to the feed.
 // Its parent directory must be trusted, owned by the node, and mode 2710.
 func ListenFeedGroup(parent context.Context, path, group string, sample func() Snapshot) (*Feed, error) {
-	return listenFeed(parent, path, group, true, sample)
+	return listenFeed(parent, path, group, true, sample, DetailSamplers{})
 }
 
-func listenFeed(parent context.Context, path, group string, groupMode bool, sample func() Snapshot) (*Feed, error) {
+// ListenFeedWithDetails uses the existing socket permission checks.
+func ListenFeedWithDetails(parent context.Context, path, group string, sample func() Snapshot, details DetailSamplers) (*Feed, error) {
+	return listenFeed(parent, path, group, group != "", sample, details)
+}
+
+func listenFeed(parent context.Context, path, group string, groupMode bool, sample func() Snapshot, details DetailSamplers) (*Feed, error) {
 	if !filepath.IsAbs(path) || sample == nil {
 		return nil, errors.New("dashboard feed requires an absolute socket path and a sampler")
+	}
+	if details.Network != nil && details.NodeNetwork != nil {
+		return nil, errors.New("dashboard network samplers are mutually exclusive")
 	}
 	var gid int
 	if groupMode {
@@ -100,6 +121,18 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 	}
 	ctx, cancel := context.WithCancel(parent)
 	f := &Feed{listener: listener, cancel: cancel, done: make(chan struct{}), served: make(chan struct{})}
+	if details.Network != nil {
+		f.network = &networkDetailSource{sample: details.Network}
+	}
+	if details.NodeNetwork != nil {
+		f.network = &networkDetailSource{nodeSample: details.NodeNetwork}
+	}
+	if details.Machine != nil {
+		f.machine = newMachineDetailSource(details.Machine)
+	}
+	if details.LocalPeers != nil {
+		f.localPeers = &localPeerSource{sample: details.LocalPeers, active: make(chan struct{}, 2), done: make(chan struct{})}
+	}
 	rejected := false
 	update := func() {
 		s := sample()
@@ -129,7 +162,16 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 			}
 			return
 		}
+		if f.localPeers != nil {
+			f.localPeers.observeStatus(s, now)
+		}
 		f.latest.Store(&feedStatus{body: b, freshUntil: now.Add(StaleAfter)})
+		if f.network != nil {
+			f.network.update(s, now)
+		}
+		if f.machine != nil {
+			f.machine.update(ctx, s, now)
+		}
 		if rejected {
 			slog.Info("dashboard feed sampling recovered", "component", "dashboard", "operation", "feed_sample", "entrypoint", "private_feed")
 			rejected = false
@@ -137,6 +179,12 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 	}
 	update()
 	mux := http.NewServeMux()
+	if f.network != nil {
+		mux.HandleFunc("/details/network", f.network.serveHTTP)
+	}
+	if f.localPeers != nil {
+		mux.HandleFunc(localPeerPath, f.localPeers.serveHTTP)
+	}
 	mux.HandleFunc("/snapshot", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.RawQuery != "" || r.ContentLength != 0 || len(r.TransferEncoding) != 0 {
 			http.Error(w, "unsupported request", http.StatusBadRequest)
@@ -155,8 +203,31 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 		_, _ = w.Write(status.body)
 	})
 	var handler http.Handler = mux
+	if f.localPeers != nil {
+		next := handler
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == localPeerPath || strings.HasPrefix(r.URL.Path, localPeerPath+"/") || urlpath.Clean(r.URL.Path) == localPeerPath {
+				f.localPeers.serveHTTP(w, r)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+	if f.machine != nil {
+		next := handler
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == machineDetailPath || strings.HasPrefix(r.URL.Path, machineDetailPath+"/") {
+				f.machine.serveHTTP(w, r)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 	f.server = &http.Server{Handler: handler, ReadHeaderTimeout: 2 * time.Second, ReadTimeout: 2 * time.Second,
 		WriteTimeout: 2 * time.Second, IdleTimeout: 2 * time.Second, MaxHeaderBytes: 4096}
+	if f.localPeers != nil {
+		go f.localPeers.run(ctx)
+	}
 	// One request per connection, so the accept rate bounds the request rate.
 	f.server.SetKeepAlivesEnabled(false)
 	limited := &rateLimitedListener{Listener: listener, ctx: ctx,
@@ -175,6 +246,9 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 		for {
 			select {
 			case <-ctx.Done():
+				if f.machine != nil {
+					f.machine.close()
+				}
 				_ = f.server.Close()
 				return
 			case <-ticker.C:
@@ -234,10 +308,16 @@ func (f *Feed) Close() {
 		return
 	}
 	f.closed.Do(func() {
+		if f.machine != nil {
+			f.machine.close()
+		}
 		f.cancel()
 		_ = f.server.Close()
 		_ = f.listener.Close()
 		<-f.done
 		<-f.served
+		if f.localPeers != nil {
+			<-f.localPeers.done
+		}
 	})
 }

@@ -2,11 +2,13 @@ package replay
 
 import (
 	"math"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/block"
 	"github.com/Overclock-Validator/mithril/pkg/blockstream"
+	"github.com/Overclock-Validator/mithril/pkg/gossip"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -14,8 +16,11 @@ import (
 // is its only writer; readers never inspect a live SlotCtx or reset timings.
 // Nil disables publication, including allocations on the per-block path.
 type Progress struct {
-	latest atomic.Pointer[ProgressSnapshot]
-	source atomic.Pointer[blockstream.BlockSource]
+	latest         atomic.Pointer[ProgressSnapshot]
+	source         atomic.Pointer[blockstream.BlockSource]
+	networkDetails bool
+	gossipObserver func(*gossip.Client)
+	gossipMu       sync.Mutex
 	// nextAssignment is staged and read only by the replay owner.
 	nextAssignment  NextKnownAssignment
 	accountSampler  AccountFactsSampler
@@ -99,14 +104,47 @@ func (p *Progress) NetworkSnapshot() (blockstream.NetworkSnapshot, bool) {
 	return blockstream.NetworkSnapshot{}, false
 }
 
+// EnableNetworkDetails selects owner socket observations before replay starts.
+func (p *Progress) EnableNetworkDetails() {
+	if p != nil {
+		p.networkDetails = true
+	}
+}
+
+// SetGossipObserver selects a source attachment callback before replay starts.
+func (p *Progress) SetGossipObserver(observer func(*gossip.Client)) {
+	if p != nil {
+		p.gossipObserver = observer
+	}
+}
+
+func (p *Progress) observeSourceGossip(source *blockstream.BlockSource, client *gossip.Client) {
+	if p == nil || source == nil || client == nil {
+		return
+	}
+	p.gossipMu.Lock()
+	defer p.gossipMu.Unlock()
+	if p.source.Load() == source && p.gossipObserver != nil {
+		p.gossipObserver(client)
+	}
+}
+
 func (p *Progress) sourceStarted(source *blockstream.BlockSource) {
 	if p == nil {
 		return
 	}
 	if source != nil {
 		source.EnableMonitoring()
+		if p.gossipObserver != nil {
+			source.SetGossipObserver(func(client *gossip.Client) { p.observeSourceGossip(source, client) })
+		}
+		if p.networkDetails {
+			source.EnableSocketMemoryMonitoring()
+		}
 	}
+	p.gossipMu.Lock()
 	p.source.Store(source)
+	p.gossipMu.Unlock()
 }
 
 func (p *Progress) begin(start uint64, resume *ResumeState) {
@@ -117,7 +155,9 @@ func (p *Progress) begin(start uint64, resume *ResumeState) {
 	p.nextAssignment = NextKnownAssignment{}
 	p.accountSampler.Reset()
 	p.accountFacts, p.hasAccountFacts = AccountFacts{}, false
+	p.gossipMu.Lock()
 	p.source.Store(nil)
+	p.gossipMu.Unlock()
 	now := time.Now().UTC()
 	s := &ProgressSnapshot{Attempt: previous.Attempt + 1, StartedAt: now, UpdatedAt: now, Phase: "starting", StartSlot: start}
 	if resume != nil {

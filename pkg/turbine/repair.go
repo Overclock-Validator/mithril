@@ -303,9 +303,10 @@ type RepairPeerReport struct {
 }
 
 type repairClient struct {
-	priorityWake chan struct{} // initialized before the receiver starts; coalesced hints
-	identity     *identity.Holder
-	peerSource   RepairPeerSource
+	priorityWake  chan struct{} // initialized before the receiver starts; coalesced hints
+	identity      *identity.Holder
+	peerSource    RepairPeerSource
+	requestWrites atomic.Pointer[repairRequestRecorder]
 
 	mu          sync.Mutex
 	outstanding map[repairRequestKey]outstandingRepairRequest
@@ -942,7 +943,13 @@ func (c *repairClient) sendShredAttempt(conn *net.UDPConn, peers []gossip.Repair
 		traceStart = entryTraceNow()
 		traceBinding = entryRepairTrace{Peer: peer.Addr.String(), Nonce: nonce}
 	}
-	if _, err := conn.WriteToUDP(packet, peer.Addr); err != nil {
+	// Pin the recorder before I/O so a new socket cannot inherit this result.
+	writes := c.requestWrites.Load()
+	n, writeErr := conn.WriteToUDP(packet, peer.Addr)
+	if writes != nil && writes.conn == conn && n > 0 {
+		writes.bytes.add(uint64(n))
+	}
+	if writeErr != nil {
 		traceRepairSend(slot, index, kind, attempt, traceStart, false, traceBinding)
 		c.mu.Lock()
 		delete(c.outstanding, key)

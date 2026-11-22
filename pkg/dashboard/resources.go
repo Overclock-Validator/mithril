@@ -8,16 +8,17 @@ import (
 // PublicResources contains opt-in process and fixed-role filesystem aggregates.
 // It never includes paths, device names, process arguments or host identifiers.
 type PublicResources struct {
-	State      string               `json:"state"`
-	SampledAt  *time.Time           `json:"sampled_at"`
-	RSSBytes   *uint64              `json:"rss_bytes,string"`
-	CPUSeconds *float64             `json:"cpu_seconds"`
-	CPU        *PublicCPURate       `json:"cpu"`
-	Root       *PublicFilesystem    `json:"root"`
-	Accounts   *PublicFilesystem    `json:"accounts"`
-	Ledger     *PublicFilesystem    `json:"ledger"`
-	Host       *PublicHostResources `json:"host,omitempty"`
-	GoRuntime  *PublicGoRuntime     `json:"go_runtime,omitempty"`
+	State      string                 `json:"state"`
+	SampledAt  *time.Time             `json:"sampled_at"`
+	RSSBytes   *uint64                `json:"rss_bytes,string"`
+	CPUSeconds *float64               `json:"cpu_seconds"`
+	CPU        *PublicCPURate         `json:"cpu"`
+	Root       *PublicFilesystem      `json:"root"`
+	Accounts   *PublicFilesystem      `json:"accounts"`
+	Ledger     *PublicFilesystem      `json:"ledger"`
+	Host       *PublicHostResources   `json:"host,omitempty"`
+	Cgroup     *PublicCgroupResources `json:"cgroup,omitempty"`
+	GoRuntime  *PublicGoRuntime       `json:"go_runtime,omitempty"`
 }
 
 // PublicGoRuntime contains Go-managed gauges, not RSS, OS threads or pressure
@@ -97,6 +98,7 @@ func publicResources(s *Snapshot, state string, now time.Time) *PublicResources 
 	}
 	r := s.Resources
 	p.Host = publicHostResources(s, r.Host, state, now)
+	p.Cgroup = publicCgroupResources(s, r.Cgroup, state, now)
 	if !validPublicTime(r.SampledAt, now) || r.SampledAt.Before(s.StartedAt) || r.SampledAt.After(s.SampledAt.Add(time.Second)) {
 		return p
 	}

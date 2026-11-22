@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/alpenglow"
+	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/gagliardetto/solana-go"
 )
 
@@ -19,6 +20,14 @@ type MonitoringSnapshot struct {
 	Receiver         *alpenglow.ReceiverStats
 	VotingEnabled    bool
 	Voting           *VotingObservation
+}
+
+// ObserveReceiverSocketMemory reads accounting from the inbound Votor socket.
+func (e *AlpenglowObserverEngine) ObserveReceiverSocketMemory() metrics.SocketObservation {
+	if e == nil {
+		return metrics.SocketObservation{Reason: metrics.SocketNotProvided}
+	}
+	return e.receiver.ObserveSocketMemory()
 }
 
 // VotorApplicationPayloadObservation keeps receiver and broadcaster lifetimes

@@ -1,12 +1,70 @@
 # Dashboard API reference
 
+When `--cluster-file` is configured, the public reader also provides
+`/api/v1/cluster`, `/api/v1/cluster-map`, `/api/v1/cluster-versions`,
+and `/api/v1/cluster-performance-history`. Check each response's state and
+provider timestamps; unavailable and stale data must not be treated as zero.
+For collection, provenance, limits and country attribution, see the
+[collector guide](../cmd/mithril-dashboard-collect/README.md).
+
+The directory returns at most nine rows per page. It accepts `offset`,
+`order`, `country`, `search` and `generation`; the other cluster routes
+accept only `generation`. Reuse a response's generation while paging or
+combining views: a changed generation returns HTTP 409. All cluster routes
+share a five-request-per-second limiter with a burst of ten; use per-client
+limits at the reverse proxy as well.
+
+Responses include `Mithril-Cluster-Remaining-Milliseconds`. A zero value
+means the response is no longer fresh, even if its cached body says otherwise.
+Do not display expired values as current. The shared lifetime is limited by
+the snapshot, fresh providers, included Titan windows and RPC performance
+receipt times. Check each provider's state independently as well.
+
+For a separately hosted browser UI, route API requests through the UI's
+origin and preserve this header. The reader does not add CORS headers, so a
+direct cross-origin browser request cannot read the response by default.
+Treat a missing or invalid remaining-lifetime header as unknown, not fresh.
+
 For configuration and deployment, see the [setup guide](dashboard-api.md).
 
 ## Optional data
 
 `/api/v1/features` reports optional route families enabled by the reader. It is
 not a complete list of disclosure flags. The reader does not request public
-providers or write history.
+providers. It writes aggregate history only when `--history-dir` is enabled.
+
+The advanced status profile includes optional cgroup resource observations
+when the node enables `--dashboard-cgroup-resources` and the reader enables
+`--public-resources`. Availability and freshness apply independently. Limits
+describe the visible cgroup and do not establish ancestor capacity.
+
+When `--history-dir` is configured, `/api/v1/history` returns the history
+state and available metrics. Use `?metric=<name>&range=<range>` to retrieve
+bucketed samples; supported metrics and ranges are listed in the state
+response. History is bounded to 30 days and may contain gaps. Unavailable or
+stale samples are not zero. Resource metrics require `--public-resources`.
+The route has shared request and concurrency limits; configure per-client
+limits at the reverse proxy.
+
+When `--network-details` is enabled, `/api/v1/details/network` returns
+bounded local network observations. Check its state, source timestamps and
+remaining lifetime; unavailable observations are not zero. The
+`/api/v1/features?include=advanced_status` response reports the optional
+network route. The default features response retains its existing shape.
+Votor UDP socket memory is not provided because the QUIC listener owns its
+socket; an absent Votor socket observation does not mean zero usage or drops.
+
+With `--local-peers`, `/api/v1/details/peers` returns bounded locally
+observed signed-contact metadata without network endpoints. The node must
+enable `--dashboard-local-peers` and `--dashboard-network-details`.
+Check freshness and availability before displaying the result.
+
+When `--machine-details` is enabled, `/api/v1/details/machine` returns a
+bounded manifest of machine observations. Fetch a listed page using the
+manifest's `generation` and its zero-based `page` index. Pages have a limited
+hold; request a new manifest if the generation has expired. Capture times and
+availability describe the source observation, not the request time. The
+advanced features response reports whether the machine route is enabled.
 
 ## Bounded slot timeline
 
