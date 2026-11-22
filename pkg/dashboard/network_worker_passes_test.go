@@ -3,6 +3,7 @@ package dashboard
 import (
 	"encoding/json"
 	"math"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -139,42 +140,68 @@ func TestTPUWorkerPassBudgetPreservesNetwork(t *testing.T) {
 }
 
 func TestTPUWorkerPassGateBudgetPreservesOldVariants(t *testing.T) {
-	now := time.Now()
-	snapshot, capture := nodeNetworkSourceFixture(now)
-	d := workerPassBudgetFixture(now)
-	genesis := d.Binding.GenesisHash
-	d.Binding = capture.Detail.Binding
-	d.Receiver.Binding = capture.Detail.Receiver.Binding
-	d.Binding.GenesisHash, d.Receiver.Binding.GenesisHash, snapshot.GenesisHash = genesis, genesis, genesis
-	d.RepairGate = &RepairGateDetail{SampledAt: now.UTC(), Armed: true}
-	found := false
-	for workers := 1; workers <= 64 && !found; workers++ {
+	fixture := func(now time.Time, workers int) (Snapshot, NodeNetworkDetail) {
+		snapshot, capture := nodeNetworkSourceFixture(now)
+		d := workerPassBudgetFixture(now)
+		genesis := d.Binding.GenesisHash
+		d.Binding = capture.Detail.Binding
+		d.Receiver.Binding = capture.Detail.Receiver.Binding
+		d.Binding.GenesisHash, d.Receiver.Binding.GenesisHash, snapshot.GenesisHash = genesis, genesis, genesis
+		d.RepairGate = &RepairGateDetail{SampledAt: now.UTC(), Armed: true}
 		d.TPUQueues = &TPUQueuesDetail{Scope: "tpu_pipeline_queue_samples", Generation: 7, StartedAt: now.Add(-10 * time.Second).UTC(), SampledAt: now.UTC(), Ingress: TPUQueueGauge{Capacity: 2}, DedupOutput: TPUQueueGauge{Capacity: 2}, Verified: TPUQueueGauge{Capacity: 2}, SigverifyWorkers: &TPUSigverifyWorkers{Configured: uint64(workers)}}
 		for i := range workers {
 			d.TPUQueues.SigverifyWorkers.Passes = append(d.TPUQueues.SigverifyWorkers.Passes, TPUSigverifyWorkerPass{Index: uint64(i), SampledAt: now.UTC(), ActiveNanoseconds: uint64(9 * time.Second), ElapsedNanoseconds: uint64(10 * time.Second)})
 		}
-		for length := 1; length <= 128; length++ {
-			d.Binding.RunID = strings.Repeat("<", length)
-			d.Receiver.Binding.RunID = d.Binding.RunID
-			gate, _ := json.Marshal(d)
-			withoutGate := d
-			withoutGate.RepairGate = nil
-			latest, _ := json.Marshal(withoutGate)
-			if len(latest) <= MaxNetworkDetailBytes && len(gate) > MaxNetworkDetailBytes {
-				found = true
-				break
-			}
+		return snapshot, d
+	}
+	setRunID := func(d *NodeNetworkDetail, length int) {
+		d.Binding.RunID = strings.Repeat("<", length)
+		d.Receiver.Binding.RunID = d.Binding.RunID
+	}
+	encodedLen := func(d NodeNetworkDetail) int {
+		t.Helper()
+		b, err := json.Marshal(d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(b)
+	}
+	// Whole-second timestamps give the search and the fresh sample the same
+	// encoding size. The search itself does not consume the sample's lease.
+	shapeTime := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	workers, runIDLength := 1, 0
+	for ; workers <= 64; workers++ {
+		_, d := fixture(shapeTime, workers)
+		length := 1 + sort.Search(128, func(i int) bool {
+			setRunID(&d, i+1)
+			return encodedLen(d) > MaxNetworkDetailBytes
+		})
+		if length > 128 {
+			continue
+		}
+		setRunID(&d, length)
+		d.RepairGate = nil
+		if encodedLen(d) <= MaxNetworkDetailBytes {
+			runIDLength = length
+			break
 		}
 	}
-	if !found {
+	if runIDLength == 0 {
 		t.Fatal("no valid gate-only size boundary found")
+	}
+	now := time.Now().Truncate(time.Second)
+	snapshot, d := fixture(now, workers)
+	setRunID(&d, runIDLength)
+	withoutGate := d
+	withoutGate.RepairGate = nil
+	if encodedLen(d) <= MaxNetworkDetailBytes || encodedLen(withoutGate) > MaxNetworkDetailBytes {
+		t.Fatal("fresh fixture does not exercise the gate-only size boundary")
 	}
 	if err := validateNodeNetworkDetail(d); err != nil {
 		t.Fatal("invalid gate boundary", err)
 	}
 	snapshot.RunID = d.Binding.RunID
-	capture.Detail = d
-	capture.FreshUntil = now.Add(time.Second)
+	capture := NodeNetworkCapture{Detail: d, FreshUntil: now.Add(5 * time.Second)}
 	source := &networkDetailSource{nodeSample: func(time.Time) (NodeNetworkCapture, error) { return capture, nil }}
 	source.update(snapshot, now)
 	publication := source.latest.Load()
@@ -186,11 +213,11 @@ func TestTPUWorkerPassGateBudgetPreservesOldVariants(t *testing.T) {
 		t.Fatal("worker list displaced existing repair gate", err)
 	}
 	noPass, _ := withoutTPUWorkerPasses(d)
-	base, err := preparePublicNodeNetwork(noPass, now, now.Add(time.Second))
+	base, err := preparePublicNodeNetwork(noPass, now, capture.FreshUntil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := preparePublicNodeNetwork(d, now, now.Add(time.Second))
+	got, err := preparePublicNodeNetwork(d, now, capture.FreshUntil)
 	if err != nil || base.gateTail == "" || got.gateTail != base.gateTail || got.tail != base.tail || got.latestTail != base.latestTail || got.extendedTail != base.extendedTail {
 		t.Fatal("public worker list displaced a baseline variant", err)
 	}
