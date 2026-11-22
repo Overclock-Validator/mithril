@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -105,7 +106,9 @@ func TestMainnetOptionalObservations(t *testing.T) {
 				defer cancel()
 			}
 			genesisCalls, epochCalls, optionalCalls := 0, 0, 0
+			var optionalMu sync.Mutex
 			var optionalDeadline time.Time
+			performanceStarted := make(chan struct{})
 			client := &http.Client{Transport: mainnetTestTransport(func(r *http.Request) (*http.Response, error) {
 				var req struct {
 					Method string `json:"method"`
@@ -124,6 +127,7 @@ func TestMainnetOptionalObservations(t *testing.T) {
 				case "getVoteAccounts":
 					value = map[string]any{"current": []any{map[string]any{"votePubkey": testVotes[0], "nodePubkey": testIdentities[0]}}, "delinquent": []any{}}
 				case "getClusterNodes", "getRecentPerformanceSamples":
+					optionalMu.Lock()
 					optionalCalls++
 					deadline, ok := r.Context().Deadline()
 					if !ok || time.Until(deadline) > 2*time.Second {
@@ -133,12 +137,20 @@ func TestMainnetOptionalObservations(t *testing.T) {
 						t.Error("optional RPC request renewed the shared deadline")
 					}
 					optionalDeadline = deadline
+					optionalMu.Unlock()
 					if tc.timedOut {
 						return nil, context.DeadlineExceeded
 					}
 					value = tc.contacts
 					if req.Method == "getRecentPerformanceSamples" {
+						close(performanceStarted)
 						value = tc.performance
+					} else {
+						select {
+						case <-performanceStarted:
+						case <-r.Context().Done():
+							return nil, r.Context().Err()
+						}
 					}
 				default:
 					t.Fatalf("unexpected method %s", req.Method)
