@@ -32,7 +32,9 @@ func SyscallLogImpl(vm sbpf.VM, ptr, strlen uint64) (uint64, error) {
 		return syscallErr(SyscallErrInvalidString)
 	}
 
-	execCtx.Log.Log("Program log: " + string(buf))
+	if !execCtx.logsDiscarded() {
+		execCtx.Log.Log("Program log: " + string(buf))
+	}
 
 	return syscallSuccess(0)
 }
@@ -48,8 +50,10 @@ func SyscallLog64Impl(vm sbpf.VM, r1, r2, r3, r4, r5 uint64) (uint64, error) {
 		return syscallCuErr()
 	}
 
-	msg := fmt.Sprintf("Program log: %#x, %#x, %#x, %#x, %#x\n", r1, r2, r3, r4, r5)
-	execCtx.Log.Log(msg)
+	if !execCtx.logsDiscarded() {
+		msg := fmt.Sprintf("Program log: %#x, %#x, %#x, %#x, %#x\n", r1, r2, r3, r4, r5)
+		execCtx.Log.Log(msg)
+	}
 	return syscallSuccess(0)
 }
 
@@ -64,8 +68,10 @@ func SyscallLogCUsImpl(vm sbpf.VM) (uint64, error) {
 		return syscallCuErr()
 	}
 
-	msg := fmt.Sprintf("Program consumption: %d units remaining", execCtx.ComputeMeter.Remaining())
-	execCtx.Log.Log(msg)
+	if !execCtx.logsDiscarded() {
+		msg := fmt.Sprintf("Program consumption: %d units remaining", execCtx.ComputeMeter.Remaining())
+		execCtx.Log.Log(msg)
+	}
 	return syscallSuccess(0)
 }
 
@@ -85,7 +91,9 @@ func SyscallLogPubkeyImpl(vm sbpf.VM, pubkeyAddr uint64) (uint64, error) {
 		return syscallErr(err)
 	}
 
-	execCtx.Log.Log("Program log: " + pubkey.String())
+	if !execCtx.logsDiscarded() {
+		execCtx.Log.Log("Program log: " + pubkey.String())
+	}
 	return syscallSuccess(0)
 }
 
@@ -115,6 +123,9 @@ func SyscallLogDataImpl(vm sbpf.VM, addr uint64, len uint64) (uint64, error) {
 		return syscallCuErr()
 	}
 
+	// Every charge and translation below happens whether or not the line is
+	// kept; only its encoding is skipped.
+	discard := execCtx.logsDiscarded()
 	msg := ""
 
 	var data []byte
@@ -136,12 +147,17 @@ func SyscallLogDataImpl(vm sbpf.VM, addr uint64, len uint64) (uint64, error) {
 		if err != nil {
 			return syscallErr(err)
 		}
+		if discard {
+			continue
+		}
 		encodedStr := base64.StdEncoding.EncodeToString(data)
 
 		msg += fmt.Sprintf("%s ", encodedStr)
 	}
 
-	execCtx.Log.Log("Program log: " + msg)
+	if !discard {
+		execCtx.Log.Log("Program log: " + msg)
+	}
 
 	return syscallSuccess(0)
 }

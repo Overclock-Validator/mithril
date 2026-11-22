@@ -9,7 +9,9 @@ import (
 	"github.com/Overclock-Validator/mithril/pkg/blockprod"
 	"github.com/Overclock-Validator/mithril/pkg/costmodel"
 	"github.com/Overclock-Validator/mithril/pkg/features"
+	"github.com/Overclock-Validator/mithril/pkg/mlog"
 	"github.com/Overclock-Validator/mithril/pkg/replay"
+	"github.com/Overclock-Validator/mithril/pkg/sealevel"
 	"github.com/Overclock-Validator/mithril/pkg/tpu/packet"
 	"github.com/gagliardetto/solana-go"
 )
@@ -41,6 +43,11 @@ type Stats struct {
 	DroppedAccountCost      uint64
 	DroppedAllocCost        uint64
 	DroppedBatchBytes       uint64
+	PreparedRetained        uint64
+	PreparationEager        uint64
+	PreparationLazy         uint64
+	BackgroundCleanups      uint64
+	BackgroundExpired       uint64
 }
 
 // Scheduler buffers verified TPU transactions in a reward-ordered heap and
@@ -52,6 +59,16 @@ type Scheduler struct {
 	preparer               atomic.Pointer[replay.TransactionPreparer]
 	featureSource          func() *features.Features
 	lastPreparationRefresh time.Time
+	maxPrepared            int64
+	preparedRetained       atomic.Int64
+	cleanupSource          func() *sealevel.BankSysvars
+	cleanupHistory         expiryHistory
+	lastMaintenance        time.Time
+	lastMemoryLog          time.Time
+	lastExpiryChunk        time.Time
+	expiryCursor           int
+	expiryRemaining        int
+	expirySnapshot         *sealevel.BankSysvars
 
 	seq  atomic.Uint64
 	wake chan struct{}
@@ -78,11 +95,12 @@ type Scheduler struct {
 func New(banks BankSource) *Scheduler {
 	feats := features.NewFeaturesDefault()
 	return &Scheduler{
-		banks:  banks,
-		feats:  feats,
-		buffer: NewBuffer(MaxBufferedTxns),
-		wake:   make(chan struct{}, 1),
-		done:   make(chan struct{}),
+		banks:       banks,
+		feats:       feats,
+		buffer:      NewBuffer(MaxBufferedTxns),
+		maxPrepared: defaultMaxPreparedTransactions,
+		wake:        make(chan struct{}, 1),
+		done:        make(chan struct{}),
 	}
 }
 
@@ -97,6 +115,13 @@ type Config struct {
 	// MaxBufferedTransactions defaults to MaxBufferedTxns when zero.
 	MaxBufferedTransactions int
 	FeatureSource           func() *features.Features
+	// MaxPreparedTransactions bounds the optional expanded instruction cache,
+	// independently of transaction admission. Zero uses the default; negative
+	// disables eager preparation. Transactions without it prepare when selected.
+	MaxPreparedTransactions int
+	// CleanupSource publishes immutable recent blockhashes from replay. It is
+	// used while no leader bank is published, including healthy Harmonic slots.
+	CleanupSource func() *sealevel.BankSysvars
 }
 
 func NewWithConfig(banks BankSource, cfg Config) *Scheduler {
@@ -105,6 +130,10 @@ func NewWithConfig(banks BankSource, cfg Config) *Scheduler {
 		s.buffer = NewBuffer(cfg.MaxBufferedTransactions)
 	}
 	s.featureSource = cfg.FeatureSource
+	if cfg.MaxPreparedTransactions != 0 {
+		s.maxPrepared = max(0, int64(cfg.MaxPreparedTransactions))
+	}
+	s.cleanupSource = cfg.CleanupSource
 	s.refreshPreparation()
 	return s
 }
@@ -140,7 +169,9 @@ func (s *Scheduler) Stop() {
 func (s *Scheduler) Stats() Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.stats
+	stats := s.stats
+	stats.PreparedRetained = uint64(s.preparedRetained.Load())
+	return stats
 }
 
 func (s *Scheduler) Buffered() int {
@@ -185,9 +216,13 @@ func (s *Scheduler) Receive(pkt packet.Packet) {
 	result := s.buffer.precheck(e)
 	var evicted *entry
 	if result == InsertAccepted {
-		e.prepared = s.preparer.Load().Prepare(tx)
+		s.prepareRetained(e)
 		result, evicted = s.buffer.Insert(e)
 	}
+	if result != InsertAccepted {
+		s.releasePrepared(e)
+	}
+	s.releasePrepared(evicted)
 	s.mu.Lock()
 	switch result {
 	case InsertAccepted:
@@ -217,9 +252,11 @@ func (s *Scheduler) Cleanup(bank *blockprod.WorkingBank) int {
 		switch bank.ClassifyBuffered(e.blockhash, e.messageHash) {
 		case blockprod.BufferedExpired:
 			expired++
+			s.releasePrepared(e)
 			return true
 		case blockprod.BufferedAlreadyProcessed:
 			already++
+			s.releasePrepared(e)
 			return true
 		default:
 			return false
@@ -262,6 +299,7 @@ func (s *Scheduler) drainLoop(ctx context.Context) {
 			return
 		}
 		s.refreshPreparation()
+		s.maintain(time.Now())
 		bank := s.tpuBank()
 		s.noteBank(bank)
 		if bank == nil {
@@ -306,7 +344,14 @@ func (s *Scheduler) drainLoop(ctx context.Context) {
 		// Receive owns the wire and its decoded transaction for the entire queue
 		// lifetime. Execution modifies transaction-local account clones, not
 		// this immutable message, so reuse the decoded transaction across banks.
-		result, reason := bank.ForgeScheduledTransaction(e.tx, e.wireSize, e.prepared, res)
+		prepared := e.prepared
+		if prepared == nil {
+			prepared = s.preparer.Load().Prepare(e.tx)
+			if prepared != nil {
+				s.addStat(func(st *Stats) { st.PreparationLazy++ })
+			}
+		}
+		result, reason := bank.ForgeScheduledTransaction(e.tx, e.wireSize, prepared, res)
 		switch result {
 		case blockprod.ForgeDroppedNoLeader:
 			s.rebuffer(e)
@@ -315,13 +360,15 @@ func (s *Scheduler) drainLoop(ctx context.Context) {
 			s.rebuffer(e)
 			s.recordForge(result, reason)
 		default:
+			s.releasePrepared(e)
 			s.recordForge(result, reason)
 		}
 	}
 }
 
 // tpuBank returns the working bank while it admits TPU transactions. A gated
-// bank is treated like no bank, so the buffer keeps everything until it opens.
+// bank is treated like no bank for execution; background expiry may still
+// discard transactions proven stale from immutable bank history.
 func (s *Scheduler) tpuBank() *blockprod.WorkingBank {
 	bank := s.banks.WorkingBank()
 	if bank == nil || !bank.TPUAllowed() {
@@ -354,8 +401,73 @@ func (s *Scheduler) noteBank(bank *blockprod.WorkingBank) {
 }
 
 func (s *Scheduler) rebuffer(e *entry) {
-	if res, _ := s.buffer.Insert(e); res != InsertAccepted {
+	res, evicted := s.buffer.Insert(e)
+	s.releasePrepared(evicted)
+	if res != InsertAccepted {
+		s.releasePrepared(e)
 		s.addStat(func(st *Stats) { st.DroppedCapacity++ })
+	}
+}
+
+// maintain expires only hashes observed leaving a continuous immutable bank
+// history. Unknown hashes may belong to transactions ahead of local replay;
+// they must survive until an execution bank can classify them authoritatively.
+func (s *Scheduler) maintain(now time.Time) {
+	chunkDue := s.expiryRemaining > 0 && now.Sub(s.lastExpiryChunk) >= 2*time.Millisecond
+	if now.Sub(s.lastMaintenance) >= time.Second || chunkDue {
+		s.lastMaintenance = now
+		var snapshot *sealevel.BankSysvars
+		if bank := s.banks.WorkingBank(); bank != nil && bank.SlotCtx() != nil {
+			snapshot = bank.SlotCtx().BankSysvars()
+		}
+		if snapshot == nil && s.cleanupSource != nil {
+			snapshot = s.cleanupSource()
+		}
+		if snapshot != s.expirySnapshot {
+			s.expirySnapshot = snapshot
+			if hashes, ok := snapshot.RecentBlockhashes(); ok && len(hashes) > 0 {
+				if s.cleanupHistory.observe(hashes) {
+					s.expiryRemaining = s.Buffered()
+				}
+				if len(s.cleanupHistory.old) == 0 {
+					s.expiryRemaining = 0
+				}
+			} else {
+				s.cleanupHistory = expiryHistory{}
+				s.expiryRemaining = 0
+			}
+		}
+	}
+	if s.expiryRemaining > 0 && now.Sub(s.lastExpiryChunk) >= 2*time.Millisecond {
+		s.lastExpiryChunk = now
+		next, inspected, dropped := s.buffer.cleanupSome(s.expiryCursor, min(512, s.expiryRemaining), func(e *entry) bool {
+			if !s.cleanupHistory.expired(e.blockhash) {
+				return false
+			}
+			s.releasePrepared(e)
+			return true
+		})
+		s.expiryCursor = next
+		if dropped > 0 {
+			// Heap removals may move entries behind the cursor. Finish only
+			// after a complete pass with no removals, spread across chunks.
+			s.expiryRemaining = s.Buffered()
+		} else {
+			s.expiryRemaining -= inspected
+			if inspected == 0 {
+				s.expiryRemaining = 0
+			}
+		}
+		s.addStat(func(st *Stats) {
+			st.BackgroundCleanups++
+			st.BackgroundExpired += uint64(dropped)
+			st.DroppedExpired += uint64(dropped)
+		})
+	}
+	if now.Sub(s.lastMemoryLog) >= 10*time.Second {
+		s.lastMemoryLog = now
+		stats := s.Stats()
+		mlog.Log.FileOnlyf("TPU scheduler memory: queued=%d prepared=%d prepared_limit=%d eager_total=%d lazy_total=%d cleanup_total=%d expired_background_total=%d", s.Buffered(), stats.PreparedRetained, s.maxPrepared, stats.PreparationEager, stats.PreparationLazy, stats.BackgroundCleanups, stats.BackgroundExpired)
 	}
 }
 

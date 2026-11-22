@@ -318,6 +318,9 @@ type BlockSource struct {
 	// under reorderMu before selection is published; replay recovery raises its
 	// gate, crosses reorderMu, then waits before its final drain.
 	replayEmissionWg sync.WaitGroup
+	// Replay attempts may be replaced without closing the network receiver.
+	// This gate is independent of certificate quarantine and only stops delivery.
+	replayPaused atomic.Bool
 	// Certificate correction can wake replay while Start is shutting down.
 	// Keep its channel drains/wake send serialized with terminal channel close.
 	certifiedRewindMu sync.Mutex
@@ -760,7 +763,9 @@ func NewBlockSource(opts *BlockSourceOpts) *BlockSource {
 
 	// Build list of RPC clients: primary + backups
 	rpcClients := make([]*rpcclient.RpcClient, 0, 1+len(opts.BackupRpcEndpoints))
-	rpcClients = append(rpcClients, opts.RpcClient)
+	if opts.RpcClient != nil { // offline replay has no RPC endpoint
+		rpcClients = append(rpcClients, opts.RpcClient)
+	}
 	for _, endpoint := range opts.BackupRpcEndpoints {
 		rpcClients = append(rpcClients, rpcclient.NewRpcClient(endpoint))
 	}
@@ -1973,6 +1978,9 @@ func (bs *BlockSource) fetchBlockOnce(slot uint64, rpcIdx int32) (*b.Block, erro
 	}
 
 	// Use the specified RPC client (not getActiveRpc - that could race with failover)
+	if len(bs.rpcClients) == 0 {
+		return nil, fmt.Errorf("slot %d: no RPC endpoint to fetch the block from (offline replay reads blocks only from shreds)", slot)
+	}
 	if rpcIdx < 0 || int(rpcIdx) >= len(bs.rpcClients) {
 		rpcIdx = 0
 	}
@@ -2713,6 +2721,10 @@ func (bs *BlockSource) worker(wg *sync.WaitGroup, id int) {
 // the block, so it may read the block but must not keep references into it
 // or block for long. Install it before Start.
 func (bs *BlockSource) SetReplayEmitHook(fn func(*b.Block)) {
+	if fn == nil {
+		bs.replayEmitHook.Store(nil)
+		return
+	}
 	bs.replayEmitHook.Store(&fn)
 }
 
@@ -2740,6 +2752,7 @@ func (bs *BlockSource) emitOrderedBlocks() {
 		var isHardErr bool
 		var isHistoryErr bool
 		var isRetriable bool
+		var pausedDrops []uint64
 
 		if result.wakeEmitter {
 			bs.reorderMu.Lock()
@@ -2787,7 +2800,11 @@ func (bs *BlockSource) emitOrderedBlocks() {
 				!bs.shouldDiscardLiveStreamResult(result.slot, result.liveStreamGeneration) &&
 				bs.queueAlpenglowParentSwitchLocked(result.block) {
 				bs.reorderBuffer[result.slot] = result.block
+				if bs.replayPaused.Load() {
+					pausedDrops = bs.trimPausedReplayBufferLocked()
+				}
 				bs.reorderMu.Unlock()
+				bs.resetPausedReplayDrops(pausedDrops)
 				continue
 			}
 			bs.slotStateMu.Lock()
@@ -2956,6 +2973,14 @@ func (bs *BlockSource) emitOrderedBlocks() {
 				bs.stats.FetchSuccesses.Add(1)
 			}
 			bs.reorderBuffer[result.slot] = result.block
+			if bs.replayPaused.Load() {
+				pausedDrops = bs.trimPausedReplayBufferLocked()
+				if bs.reorderBuffer[result.slot] == nil {
+					bs.reorderMu.Unlock()
+					bs.resetPausedReplayDrops(pausedDrops)
+					continue
+				}
+			}
 			bs.hardErrCount.Store(0)        // Reset error count on success
 			bs.clearSlotErrors(result.slot) // Clear stall diagnostics for this slot
 			// Track max buffered slot
@@ -2997,6 +3022,9 @@ func (bs *BlockSource) emitOrderedBlocks() {
 	emitConsecutive:
 		// Emit consecutive blocks
 		for {
+			if bs.replayPaused.Load() {
+				break
+			}
 			if quarantineFrom := bs.alpenglowQuarantineFrom.Load(); quarantineFrom != 0 && bs.nextSlotToSend >= quarantineFrom {
 				// Replay is replacing an emitted suffix. Hold the frontier until
 				// recovery has drained every already-emitted descendant.
@@ -3209,6 +3237,7 @@ func (bs *BlockSource) emitOrderedBlocks() {
 		gapWaitingSlot, gapFirstBufferedSlot, gapFirstBufferedParentSlot, gapBufferedCount, shouldFallbackToRPC = bs.detectLiveGapLocked()
 		bs.maybeLogReorderGapLocked()
 		bs.reorderMu.Unlock()
+		bs.resetPausedReplayDrops(pausedDrops)
 		if gapWaitingSlot != 0 {
 			bs.prioritizeTurbineRepairForLiveGap(gapWaitingSlot, gapFirstBufferedParentSlot)
 		}
@@ -3412,6 +3441,13 @@ func (bs *BlockSource) scheduler() {
 		// Check for stall timeout - if no progress for too long, trigger graceful shutdown
 		lastProgressTime := time.Unix(bs.lastProgress.Load(), 0)
 		stallDuration := time.Since(lastProgressTime)
+		if bs.replayPaused.Load() {
+			// An intentional bank-rebuild pause is not a fetch stall. Keep
+			// reception/repair running, with bounded decoded intake, while
+			// ordinary stop/cancellation checks still own shutdown.
+			bs.lastProgress.Store(time.Now().Unix())
+			stallDuration = 0
+		}
 
 		bs.maybeReconnectActiveLiveStreamForNoProgress(stallDuration)
 

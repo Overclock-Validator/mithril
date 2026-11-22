@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -23,14 +24,15 @@ type mainnetVote struct {
 }
 
 type mainnetNode struct {
-	Identity string  `json:"pubkey"`
-	Version  *string `json:"version"`
-	Gossip   *string `json:"gossip"`
+	Identity string          `json:"pubkey"`
+	Version  *string         `json:"version"`
+	Gossip   *string         `json:"gossip"`
+	RPC      json.RawMessage `json:"rpc,omitempty"`
 }
 
-func mainnetRows(current, delinquent []mainnetVote, nodes []mainnetNode, epoch uint64) ([]Validator, error) {
-	if current == nil || delinquent == nil || len(current)+len(delinquent) > MaxRows || len(nodes) > 8192 {
-		return nil, errors.New("invalid mainnet directory size")
+func mainnetVersions(nodes []mainnetNode) (map[string]string, error) {
+	if nodes == nil || len(nodes) > MaxRPCNodes {
+		return nil, errors.New("invalid mainnet contact list size")
 	}
 	versions := make(map[string]string, len(nodes))
 	for _, node := range nodes {
@@ -49,6 +51,13 @@ func mainnetRows(current, delinquent []mainnetVote, nodes []mainnetNode, epoch u
 		}
 		versions[node.Identity] = version
 	}
+	return versions, nil
+}
+
+func mainnetRows(current, delinquent []mainnetVote, epoch uint64) ([]Validator, error) {
+	if current == nil || delinquent == nil || len(current)+len(delinquent) > MaxRows {
+		return nil, errors.New("invalid mainnet vote account list size")
+	}
 	rows := make([]Validator, 0, len(current)+len(delinquent))
 	seen := make(map[string]bool, len(current)+len(delinquent))
 	appendRows := func(votes []mainnetVote, isDelinquent bool) error {
@@ -57,7 +66,7 @@ func mainnetRows(current, delinquent []mainnetVote, nodes []mainnetNode, epoch u
 				return errors.New("invalid vote account")
 			}
 			seen[vote.Vote] = true
-			row := Validator{Identity: vote.Identity, VoteAccount: vote.Vote, DirectorySource: "rpc", Version: versions[vote.Identity], Delinquent: &isDelinquent, LastVote: countPointer(vote.LastVote), RootSlot: countPointer(vote.RootSlot), Inclusion: []Inclusion{}}
+			row := Validator{Identity: vote.Identity, VoteAccount: vote.Vote, DirectorySource: "rpc", Delinquent: &isDelinquent, LastVote: countPointer(vote.LastVote), RootSlot: countPointer(vote.RootSlot), Inclusion: []Inclusion{}}
 			if vote.Stake != nil {
 				// Integer formatting keeps lamport precision without float rounding.
 				sol := fmt.Sprintf("%d.%09d", *vote.Stake/1_000_000_000, *vote.Stake%1_000_000_000)
@@ -123,29 +132,50 @@ func (c *collector) collectMainnet(ctx context.Context) (Snapshot, error) {
 		return c.finish(s, "rpc_vote_accounts_invalid")
 	}
 	votesAt := c.now()
-	var nodes []mainnetNode
-	var nodesAt time.Time
-	// Versions are optional. A transient gossip failure must not invent values.
-	if err := c.rpc(ctx, "getClusterNodes", &nodes); err != nil {
-		nodes = nil
-	} else if nodes != nil {
-		nodesAt = c.now()
-	}
-	rows, err := mainnetRows(votes.Current, votes.Delinquent, nodes, *epoch.Epoch)
+	rows, err := mainnetRows(votes.Current, votes.Delinquent, *epoch.Epoch)
 	if err != nil {
 		return c.finish(s, "rpc_vote_accounts_invalid")
 	}
+	// Optional observations share a short budget and leave time for both
+	// mandatory rechecks even if earlier required requests were slow.
+	until := time.Now().Add(2 * time.Second)
+	if deadline, ok := ctx.Deadline(); ok {
+		if reserve := deadline.Add(-2 * collectorHTTPTimeout); reserve.Before(until) {
+			until = reserve
+		}
+	}
+	optional, cancelOptional := context.WithDeadline(ctx, until)
+	defer cancelOptional()
+	var nodes []mainnetNode
+	var nodesAt time.Time
+	var versions map[string]string
+	start := time.Now()
+	err = optional.Err()
+	if err == nil {
+		err = c.rpc(optional, "getClusterNodes", &nodes)
+	}
+	if err == nil {
+		versions, err = mainnetVersions(nodes)
+	}
+	c.captureLog("rpc", "gossip_contacts", start, err)
+	if err == nil {
+		nodesAt = c.now()
+	}
 	var samples []rpcPerformanceSample
 	var samplesAt time.Time
-	if c.performanceSamples {
+	if c.performanceSamples && optional.Err() == nil {
 		limit := 1
 		if c.performanceHistory {
 			limit = MaxPerformanceHistory
 		}
-		if c.rpc(ctx, "getRecentPerformanceSamples", &samples, limit) == nil {
+		start := time.Now()
+		err := c.rpc(optional, "getRecentPerformanceSamples", &samples, limit)
+		c.captureLog("rpc", "performance_sample", start, err)
+		if err == nil {
 			samplesAt = c.now()
 		}
 	}
+	cancelOptional()
 	var after epochInfo
 	if err := c.rpc(ctx, "getGenesisHash", &genesis); err != nil || genesis != MainnetGenesisHash {
 		return c.finish(s, "rpc_genesis_recheck_failed")
@@ -161,7 +191,18 @@ func (c *collector) collectMainnet(ctx context.Context) (Snapshot, error) {
 		return c.finish(s, "rpc_vote_accounts_invalid")
 	}
 	geo := provider(&s, "geoip")
-	if fresh(nodesAt, now) {
+	if fresh(nodesAt, now) && !nodesAt.After(now) {
+		for i := range rows {
+			rows[i].Version = versions[rows[i].Identity]
+		}
+		// Reuse the same response; only a detached count/time survives collection.
+		contacts := make([]rpcNode, len(nodes))
+		for i, node := range nodes {
+			contacts[i] = rpcNode{Identity: node.Identity, RPC: node.RPC}
+		}
+		if advertised := advertisedRPCNodes(contacts); advertised != nil {
+			s.RPCNodes = &RPCNodes{Advertised: *advertised, ObservedAt: nodesAt}
+		}
 		if db, err := countryReader(); err == nil {
 			countries := make(map[string]string)
 			valid := true
@@ -198,10 +239,8 @@ func (c *collector) collectMainnet(ctx context.Context) (Snapshot, error) {
 	}
 	p := provider(&s, "rpc")
 	p.State, p.Reason, p.CapturedAt, p.SourceAt, p.Epoch, p.GenesisHash, p.Binding, p.SourceTimeKind, p.RowCount = "fresh", "", now, &votesAt, &e, MainnetGenesisHash, "rpc_genesis_before_after", "response", count(uint64(len(rows)))
-	if *after.SlotsInEpoch == *epoch.SlotsInEpoch && *after.AbsoluteSlot-*after.SlotIndex == *epoch.AbsoluteSlot-*epoch.SlotIndex && *after.AbsoluteSlot >= *epoch.AbsoluteSlot {
-		s.Reference = &RPCReference{Slot: count(*after.AbsoluteSlot), EpochStart: count(*after.AbsoluteSlot - *after.SlotIndex), SlotsInEpoch: count(*after.SlotsInEpoch), ObservedAt: now}
-	}
-	if s.Reference != nil && fresh(samplesAt, now) && len(samples) > 0 && len(samples) <= MaxPerformanceHistory {
+	s.Reference = &RPCReference{Slot: count(*after.AbsoluteSlot), EpochStart: count(*after.AbsoluteSlot - *after.SlotIndex), SlotsInEpoch: count(*after.SlotsInEpoch), ObservedAt: now}
+	if fresh(samplesAt, now) && !samplesAt.After(now) && len(samples) > 0 && len(samples) <= MaxPerformanceHistory {
 		var history []RPCPerformance
 		var previous uint64 = math.MaxUint64
 		for _, sample := range samples {

@@ -386,7 +386,7 @@
 
       tuningProgramCacheMaxMb = lib.mkOption {
         type = lib.types.int;
-        default = 1024;
+        default = 4096;
         description = "Approximate maximum retained SBPF program cache size in MiB.";
       };
 

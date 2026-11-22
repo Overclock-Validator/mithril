@@ -3,6 +3,7 @@ package rewardcerts
 import (
 	"fmt"
 
+	bls12381 "github.com/Overclock-Validator/gnark-crypto/ecc/bls12-381"
 	"github.com/Overclock-Validator/mithril/pkg/alpenglow"
 )
 
@@ -41,6 +42,21 @@ func (e *slotEntry) addVote(msg alpenglow.VoteMessage) error {
 			return fmt.Errorf("rewardcerts: notarize vote missing block id")
 		}
 		return e.notar.addVote(msg.Rank, msg.Signature, block.Hash, e.maxValidators)
+	default:
+		return nil
+	}
+}
+
+func (e *slotEntry) addVerifiedSignature(msg alpenglow.VoteMessage, signature bls12381.G2Affine) error {
+	switch msg.Vote.Type {
+	case alpenglow.VoteTypeSkip:
+		return e.skip.addVerifiedSignature(msg.Rank, signature)
+	case alpenglow.VoteTypeNotarize:
+		block, ok := msg.Vote.Block()
+		if !ok {
+			return fmt.Errorf("rewardcerts: notarize vote missing block id")
+		}
+		return e.notar.addVerifiedSignature(msg.Rank, signature, block.Hash, e.maxValidators)
 	default:
 		return nil
 	}

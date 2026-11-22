@@ -25,8 +25,9 @@ import (
 )
 
 const (
-	responseLimit  = 2 << 20
-	titanConfigURL = "https://observatory-origin.titananalytics.io/analytics/api/config"
+	responseLimit        = 2 << 20
+	collectorHTTPTimeout = 18 * time.Second
+	titanConfigURL       = "https://observatory-origin.titananalytics.io/analytics/api/config"
 )
 
 var errStale = errors.New("provider source is stale")
@@ -57,8 +58,9 @@ type rpcPerformanceSample struct {
 }
 
 type rpcNode struct {
-	Identity string  `json:"pubkey"`
-	Gossip   *string `json:"gossip"`
+	Identity string          `json:"pubkey"`
+	Gossip   *string         `json:"gossip"`
+	RPC      json.RawMessage `json:"rpc,omitempty"`
 }
 
 type voteAccount struct {
@@ -160,7 +162,7 @@ func collectProfile(ctx context.Context, profile string, performance, history bo
 	transport := &http.Transport{Proxy: nil, DialContext: (&net.Dialer{Timeout: 8 * time.Second}).DialContext, TLSHandshakeTimeout: 8 * time.Second, ResponseHeaderTimeout: 10 * time.Second, MaxIdleConns: 8, IdleConnTimeout: 20 * time.Second}
 	defer transport.CloseIdleConnections()
 	c := collector{
-		http: &http.Client{Transport: transport, Timeout: 18 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirect denied") }},
+		http: &http.Client{Transport: transport, Timeout: collectorHTTPTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirect denied") }},
 		log:  slog.Default().With("entry_point", "collector", "run_id", runID), runID: runID, now: func() time.Time { return time.Now().UTC() }, performanceSamples: performance, performanceHistory: history,
 	}
 	if profile == "mainnet" || profile == "mainnet-publicnode" {
@@ -213,6 +215,7 @@ func (c *collector) collect(ctx context.Context) (Snapshot, error) {
 	s.Epoch = &e
 	var votes result[map[string]string]
 	var nodes result[map[string]netip.Addr]
+	var advertised *Count
 	var solstat result[solstatResponse]
 	var titan result[titanResponse]
 	var performance result[[]rpcPerformanceSample]
@@ -244,7 +247,7 @@ func (c *collector) collect(ctx context.Context) (Snapshot, error) {
 	go func() {
 		defer wg.Done()
 		start := time.Now()
-		nodes.value, nodes.err = c.clusterNodes(ctx)
+		nodes.value, advertised, nodes.err = c.clusterNodes(ctx)
 		nodes.at = c.now()
 		c.captureLog("rpc", "gossip_contacts", start, nodes.err)
 	}()
@@ -275,6 +278,9 @@ func (c *collector) collect(ctx context.Context) (Snapshot, error) {
 	}
 	now := c.now()
 	markFresh(provider(&s, "rpc"), now, now, e, uint64(len(votes.value)), "rpc_genesis_before_after", "response")
+	if advertised != nil && nodes.err == nil && fresh(nodes.at, now) && !nodes.at.After(now) {
+		s.RPCNodes = &RPCNodes{Advertised: *advertised, ObservedAt: nodes.at}
+	}
 	// Only publish a reference when both epoch responses describe the same
 	// geometry and the later response did not move backwards.
 	if *after.SlotsInEpoch == *epoch.SlotsInEpoch &&
@@ -401,6 +407,7 @@ func (c *collector) finish(s Snapshot, failure string) (Snapshot, error) {
 	s.CapturedAt = c.now()
 	if failure != "" {
 		s.Validators = []Validator{}
+		s.RPCNodes = nil
 		for i := range s.Providers {
 			p := &s.Providers[i]
 			if p.ID == "puffin" {
@@ -559,19 +566,19 @@ func (c *collector) voteAccounts(ctx context.Context) (map[string]string, error)
 	return rows, nil
 }
 
-func (c *collector) clusterNodes(ctx context.Context) (map[string]netip.Addr, error) {
+func (c *collector) clusterNodes(ctx context.Context) (map[string]netip.Addr, *Count, error) {
 	var v []rpcNode
 	if err := c.rpc(ctx, "getClusterNodes", &v); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if v == nil || len(v) > MaxRows {
-		return nil, errors.New("invalid gossip list")
+		return nil, nil, errors.New("invalid gossip list")
 	}
 	rows := make(map[string]netip.Addr, len(v))
 	seen := make(map[string]bool, len(v))
 	for _, a := range v {
 		if !keyOK(a.Identity) || seen[a.Identity] {
-			return nil, errors.New("invalid gossip identity")
+			return nil, nil, errors.New("invalid gossip identity")
 		}
 		seen[a.Identity] = true
 		if a.Gossip == nil {
@@ -586,7 +593,7 @@ func (c *collector) clusterNodes(ctx context.Context) (map[string]netip.Addr, er
 			rows[a.Identity] = ip.Unmap()
 		}
 	}
-	return rows, nil
+	return rows, advertisedRPCNodes(v), nil
 }
 
 func countPointer(n *uint64) *Count {
@@ -880,4 +887,43 @@ func compareRatio(a, b, c, d uint64) int {
 		return -1
 	}
 	return 0
+}
+
+// advertisedRPCNodes counts observed identities, never endpoint reachability.
+// Missing/invalid rpc makes the optional aggregate unknown; explicit null is a known absence.
+func advertisedRPCNodes(nodes []rpcNode) *Count {
+	if nodes == nil || len(nodes) > MaxRPCNodes {
+		return nil
+	}
+	seen := make(map[string]bool, len(nodes))
+	var total uint64
+	for _, node := range nodes {
+		raw := bytes.TrimSpace(node.RPC)
+		if !keyOK(node.Identity) || len(raw) == 0 {
+			return nil
+		}
+		advertised := !bytes.Equal(raw, []byte("null"))
+		if advertised {
+			var address string
+			if json.Unmarshal(raw, &address) != nil {
+				return nil
+			}
+			endpoint, err := netip.ParseAddrPort(address)
+			if err != nil || endpoint.Port() == 0 || endpoint.Addr().Unmap().IsUnspecified() || endpoint.Addr().IsMulticast() || endpoint.Addr().Zone() != "" {
+				return nil
+			}
+		}
+		if prior, ok := seen[node.Identity]; ok {
+			if prior != advertised {
+				return nil
+			}
+			continue
+		}
+		seen[node.Identity] = advertised
+		if advertised {
+			total++
+		}
+	}
+	value := count(total)
+	return &value
 }

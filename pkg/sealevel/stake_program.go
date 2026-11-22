@@ -227,7 +227,7 @@ func (authWithSeed *StakeInstrAuthorizeWithSeed) UnmarshalWithDecoder(decoder *b
 		return err
 	}
 	copy(authWithSeed.AuthorityOwner[:], pk)
-	return nil
+	return checkWithinDeserializationLimit(decoder)
 }
 
 func (authChecked *StakeInstrAuthorizeChecked) UnmarshalWithDecoder(decoder *bin.Decoder) error {
@@ -267,7 +267,7 @@ func (authCheckedWithSeed *StakeInstrAuthorizeCheckedWithSeed) UnmarshalWithDeco
 		return err
 	}
 	copy(authCheckedWithSeed.AuthorityOwner[:], pk)
-	return nil
+	return checkWithinDeserializationLimit(decoder)
 }
 
 func (lockup *StakeInstrSetLockupChecked) UnmarshalWithDecoder(decoder *bin.Decoder) error {

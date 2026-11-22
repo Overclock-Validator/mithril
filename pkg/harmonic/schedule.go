@@ -13,6 +13,8 @@ type bundleNode struct {
 	seq      uint64
 	prepared *blockprod.PreparedBundle
 	executed *blockprod.ExecutedBundle
+	// tipIntents is observation only; it never participates in scheduling.
+	tipIntents TipIntentObservation
 	// deps counts the earlier conflicting bundles that have not finished.
 	deps       int
 	dependents []*bundleNode

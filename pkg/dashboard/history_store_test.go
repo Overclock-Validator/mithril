@@ -67,6 +67,56 @@ func TestHistoryStoreOwnershipAndLock(t *testing.T) {
 	}
 }
 
+func TestHistoryStoreRecoversIncompleteOwnerMarker(t *testing.T) {
+	for _, tc := range []struct {
+		name, marker string
+		hasSegment   bool
+		recoverable  bool
+	}{
+		{"empty", "", false, true},
+		{"partial", historyOwnerText[:10], false, true},
+		{"foreign", "other-format\n", false, false},
+		{"has segment", historyOwnerText[:10], true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := historyTestDir(t)
+			if err := os.Mkdir(path, 0700); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(path, historyOwnerFile)
+			if err := os.WriteFile(marker, []byte(tc.marker), 0600); err != nil {
+				t.Fatal(err)
+			}
+			segment := filepath.Join(path, "2026-10-31.jsonl")
+			if tc.hasSegment {
+				if err := os.WriteFile(segment, []byte("preserve\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			s, err := openHistoryStore(path)
+			want := tc.marker
+			if tc.recoverable {
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer s.close()
+				want = historyOwnerText
+			} else if err == nil {
+				s.close()
+				t.Fatal("unexpected history directory recovery")
+			}
+			if got, err := os.ReadFile(marker); err != nil || string(got) != want {
+				t.Fatalf("marker = %q, %v, want %q", got, err, want)
+			}
+			if tc.hasSegment {
+				if got, err := os.ReadFile(segment); err != nil || string(got) != "preserve\n" {
+					t.Fatalf("history segment changed: %q, %v", got, err)
+				}
+			}
+		})
+	}
+}
+
 func TestHistoryStoreRestartAndTornTail(t *testing.T) {
 	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 	path := historyTestDir(t)

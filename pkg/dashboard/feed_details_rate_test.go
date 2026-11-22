@@ -34,9 +34,11 @@ func TestFeedDetailsShareRequestLimit(t *testing.T) {
 	}
 	path := socketPath(t)
 	feed, err := ListenFeedWithDetails(context.Background(), path, "", func() Snapshot { return snapshot }, DetailSamplers{
-		Network:    func(time.Time) (NetworkDetailCapture, error) { return network, nil },
-		Machine:    func(time.Time) (MachineDetailCapture, error) { return machine, nil },
-		LocalPeers: func(time.Time) (LocalPeerCapture, error) { return LocalPeerCapture{Data: preparedPeers, FreshUntil: now.Add(30 * time.Second)}, nil },
+		Network: func(time.Time) (NetworkDetailCapture, error) { return network, nil },
+		Machine: func(time.Time) (MachineDetailCapture, error) { return machine, nil },
+		LocalPeers: func(time.Time) (LocalPeerCapture, error) {
+			return LocalPeerCapture{Data: preparedPeers, FreshUntil: now.Add(30 * time.Second)}, nil
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
