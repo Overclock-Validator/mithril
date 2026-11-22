@@ -234,9 +234,10 @@ socket only if it is owned by the node's user and nothing accepts connections on
 it; any other existing path is left in place and the feed stays off. A feed setup
 failure is logged and does not stop the node.
 
-The feed serves one request per connection and accepts at most four connections
-per second, so a feed client cannot make the node spend more than that serving
-it. The reader polls once per second.
+The feed serves one request per connection, with at most four concurrent
+connections. The basic feed allows four connections per second (burst four).
+With detail samplers enabled, it allows 64 per second (burst 16). The basic
+snapshot is sampled once per second; detail sampling intervals vary.
 
 Unix socket paths have platform-specific length limits. If a long path causes a
 bind error, choose a shorter trusted directory and use the same socket path for
