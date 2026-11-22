@@ -9,8 +9,9 @@ import (
 	"time"
 )
 
-// activityHistoryCaptureInterval controls publication, not the bank-clock rate window.
-const activityHistoryCaptureInterval = 3 * time.Second
+// activityHistoryCaptureInterval sets the normal polling cadence for private
+// capture and the reader. It does not change folds or bank-clock windows.
+const activityHistoryCaptureInterval = time.Second
 
 // ActivityHistorySampler returns a bounded in-memory observation and must honor cancellation.
 type ActivityHistorySampler func(context.Context, time.Time) (ActivityHistory, error)
