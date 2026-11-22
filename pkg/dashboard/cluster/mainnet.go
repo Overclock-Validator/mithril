@@ -149,18 +149,22 @@ func (c *collector) collectMainnet(ctx context.Context) (Snapshot, error) {
 	var nodes []mainnetNode
 	var nodesAt time.Time
 	var versions map[string]string
-	start := time.Now()
-	err = optional.Err()
-	if err == nil {
-		err = c.rpc(optional, "getClusterNodes", &nodes)
-	}
-	if err == nil {
-		versions, err = mainnetVersions(nodes)
-	}
-	c.captureLog("rpc", "gossip_contacts", start, err)
-	if err == nil {
-		nodesAt = c.now()
-	}
+	contactsDone := make(chan struct{})
+	go func() {
+		defer close(contactsDone)
+		start := time.Now()
+		err := optional.Err()
+		if err == nil {
+			err = c.rpc(optional, "getClusterNodes", &nodes)
+		}
+		if err == nil {
+			versions, err = mainnetVersions(nodes)
+			if err == nil {
+				nodesAt = c.now()
+			}
+		}
+		c.captureLog("rpc", "gossip_contacts", start, err)
+	}()
 	var samples []rpcPerformanceSample
 	var samplesAt time.Time
 	if c.performanceSamples && optional.Err() == nil {
@@ -175,6 +179,7 @@ func (c *collector) collectMainnet(ctx context.Context) (Snapshot, error) {
 			samplesAt = c.now()
 		}
 	}
+	<-contactsDone
 	cancelOptional()
 	var after epochInfo
 	if err := c.rpc(ctx, "getGenesisHash", &genesis); err != nil || genesis != MainnetGenesisHash {
@@ -233,12 +238,11 @@ func (c *collector) collectMainnet(ctx context.Context) (Snapshot, error) {
 						matched++
 					}
 				}
-				geo.State, geo.Reason, geo.CapturedAt, geo.SourceAt, geo.Epoch, geo.GenesisHash, geo.Binding, geo.SourceTimeKind, geo.RowCount = "fresh", "", now, &nodesAt, &e, MainnetGenesisHash, "rpc_gossip_local_geoip", "response", count(matched)
+				markFresh(geo, MainnetGenesisHash, now, nodesAt, e, matched, "rpc_gossip_local_geoip", "response")
 			}
 		}
 	}
-	p := provider(&s, "rpc")
-	p.State, p.Reason, p.CapturedAt, p.SourceAt, p.Epoch, p.GenesisHash, p.Binding, p.SourceTimeKind, p.RowCount = "fresh", "", now, &votesAt, &e, MainnetGenesisHash, "rpc_genesis_before_after", "response", count(uint64(len(rows)))
+	markFresh(provider(&s, "rpc"), MainnetGenesisHash, now, votesAt, e, uint64(len(rows)), "rpc_genesis_before_after", "response")
 	s.Reference = &RPCReference{Slot: count(*after.AbsoluteSlot), EpochStart: count(*after.AbsoluteSlot - *after.SlotIndex), SlotsInEpoch: count(*after.SlotsInEpoch), ObservedAt: now}
 	if fresh(samplesAt, now) && !samplesAt.After(now) && len(samples) > 0 && len(samples) <= MaxPerformanceHistory {
 		var history []RPCPerformance

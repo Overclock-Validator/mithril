@@ -277,7 +277,7 @@ func (c *collector) collect(ctx context.Context) (Snapshot, error) {
 		return c.finish(s, "rpc_vote_accounts_invalid")
 	}
 	now := c.now()
-	markFresh(provider(&s, "rpc"), now, now, e, uint64(len(votes.value)), "rpc_genesis_before_after", "response")
+	markFresh(provider(&s, "rpc"), GenesisHash, now, now, e, uint64(len(votes.value)), "rpc_genesis_before_after", "response")
 	if advertised != nil && nodes.err == nil && fresh(nodes.at, now) && !nodes.at.After(now) {
 		s.RPCNodes = &RPCNodes{Advertised: *advertised, ObservedAt: nodes.at}
 	}
@@ -333,7 +333,7 @@ func (c *collector) collect(ctx context.Context) (Snapshot, error) {
 				sp.State, sp.Reason = "stale", "source_stale"
 			}
 		} else {
-			markFresh(sp, solstat.at, source, e, uint64(len(parsed)), "rpc_profile_epoch_checked", "provider")
+			markFresh(sp, GenesisHash, solstat.at, source, e, uint64(len(parsed)), "rpc_profile_epoch_checked", "provider")
 			s.SolstatSummary = parseSolstatSummary(solstat.value.NetworkStats, epoch)
 			for _, row := range parsed {
 				rows[row.VoteAccount] = row
@@ -357,7 +357,7 @@ func (c *collector) collect(ctx context.Context) (Snapshot, error) {
 				tp.State, tp.Reason = "stale", "source_stale"
 			}
 		} else {
-			markFresh(tp, titan.at, titan.value.Overview.ObservedAt, e, uint64(len(parsed)), "payload_genesis_epoch_checked", "provider")
+			markFresh(tp, GenesisHash, titan.at, titan.value.Overview.ObservedAt, e, uint64(len(parsed)), "payload_genesis_epoch_checked", "provider")
 			for _, row := range parsed {
 				if existing, ok := rows[row.VoteAccount]; ok {
 					existing.Inclusion = row.Inclusion
@@ -387,7 +387,7 @@ func (c *collector) collect(ctx context.Context) (Snapshot, error) {
 			countries[identity] = code
 		}
 		if gp.State != "invalid" {
-			markFresh(gp, now, nodes.at, e, uint64(len(nodes.value)), "rpc_gossip_local_geoip", "response")
+			markFresh(gp, GenesisHash, now, nodes.at, e, uint64(len(nodes.value)), "rpc_gossip_local_geoip", "response")
 			for key, row := range rows {
 				if code := countries[row.Identity]; code != "" {
 					row.CountryCode, row.CountrySource = code, "dbip"
@@ -430,8 +430,8 @@ func (c *collector) finish(s Snapshot, failure string) (Snapshot, error) {
 	return s, nil
 }
 
-func markFresh(p *ProviderStatus, captured, source time.Time, epoch Count, rows uint64, binding, timeKind string) {
-	p.State, p.Reason, p.CapturedAt, p.SourceAt, p.Epoch, p.GenesisHash, p.Binding, p.SourceTimeKind, p.RowCount = "fresh", "", captured, &source, &epoch, GenesisHash, binding, timeKind, count(rows)
+func markFresh(p *ProviderStatus, genesis string, captured, source time.Time, epoch Count, rows uint64, binding, timeKind string) {
+	p.State, p.Reason, p.CapturedAt, p.SourceAt, p.Epoch, p.GenesisHash, p.Binding, p.SourceTimeKind, p.RowCount = "fresh", "", captured, &source, &epoch, genesis, binding, timeKind, count(rows)
 }
 
 func epochValid(e epochInfo) bool {

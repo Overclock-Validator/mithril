@@ -231,8 +231,11 @@ func projectClusterAnchored(snapshot *cluster.Snapshot, generation, state, reaso
 		v.metadata.Providers = append([]cluster.ProviderStatus(nil), snapshot.Providers...)
 		for i := range v.metadata.Providers {
 			p := &v.metadata.Providers[i]
-			if p.ID == "puffin" && p.State == "retired" && p.Reason == "provider_retired" {
-				p.State, p.Reason = "unavailable", "not_collected"
+			if p.ID == "puffin" {
+				p.SourceURL = ""
+				if p.State == "retired" && p.Reason == "provider_retired" {
+					p.State, p.Reason = "unavailable", "not_collected"
+				}
 			}
 			if p.State == "fresh" && (state != "fresh" || p.SourceAt == nil || now.Sub(*p.SourceAt) > cluster.MaxAge || p.SourceAt.After(now.Add(5*time.Second)) || now.Sub(p.CapturedAt) > cluster.MaxAge || p.CapturedAt.After(now.Add(5*time.Second))) {
 				p.State = "stale"
