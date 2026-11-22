@@ -88,6 +88,7 @@ func (d *nodeDashboard) newArchiveProgress(slot uint64, incrementalSlot *uint64,
 		d.snapshotManifests = nil
 	}
 	d.snapshotArchive = nil
+	d.snapshotShardFlush = nil
 	if d.snapshotAttempt == ^uint64(0) || d.state.RunID == "" || d.state.StartedAt.IsZero() || d.state.GenesisHash == nil {
 		d.snapshotRoot = nil
 		d.mu.Unlock()
@@ -157,6 +158,9 @@ func (d *nodeDashboard) newArchiveProgress(slot uint64, incrementalSlot *uint64,
 		})
 		dp.SetIncrementalProgress(func(end uint64, inputKind string) *progress.DualProgress {
 			return d.newArchiveProgress(slot, &end, inputKind, root, binding)
+		})
+		dp.SetIndexingProgress(func() *progress.IndexingProgress {
+			return d.newSnapshotShardFlush(root, binding)
 		})
 	}
 	return dp

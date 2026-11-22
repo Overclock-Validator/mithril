@@ -255,7 +255,7 @@ func TestDashboardTimestampsUseUTC(t *testing.T) {
 }
 
 func TestDashboardDisabledIsNoOp(t *testing.T) {
-	d := startNodeDashboard(context.Background(), time.Now().UTC(), "", "", "run", "alpenglow", "verifying", true, false, false, false, false, false, false, false, false)
+	d := startNodeDashboard(context.Background(), time.Now().UTC(), "", "", "run", "alpenglow", "verifying", true, false, false, false, false, false, false, false, false, false, false, false)
 	if d != nil {
 		t.Fatal("disabled dashboard created a feed")
 	}
@@ -273,7 +273,7 @@ func TestDashboardDisabledIsNoOp(t *testing.T) {
 func TestDashboardInvalidGroupDoesNotFallBack(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "node.sock")
 	d := startNodeDashboard(context.Background(), time.Now().UTC(), path,
-		"mithril-dashboard-group-does-not-exist", "run", "alpenglow", "verifying", true, false, false, false, false, false, false, false, false)
+		"mithril-dashboard-group-does-not-exist", "run", "alpenglow", "verifying", true, false, false, false, false, false, false, false, false, false, false, false)
 	if d != nil {
 		d.close()
 		t.Fatal("invalid feed group fell back to a private feed")
@@ -373,7 +373,7 @@ func TestDashboardLifecycleAndIdentitySwap(t *testing.T) {
 	}
 	global.SetReplayFrontier(80)
 	if d.snapshot().ReplayFrontier != nil {
-		t.Fatal("dashboard published a frontier without its replay observation")
+		t.Fatal("dashboard reported a global frontier with no owned replay observation")
 	}
 	d.stopping()
 	if d.snapshot().ReplayFrontier != nil {

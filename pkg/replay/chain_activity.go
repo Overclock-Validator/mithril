@@ -25,11 +25,49 @@ func (r *CertificateOutcomes) activitySnapshot(through uint64) ChainActivitySumm
 	if r == nil || r.summary.SampledAt.IsZero() {
 		return ChainActivitySummary{}
 	}
-	unknown := ChainActivitySummary{SampledAt: r.summary.SampledAt}
-	if r.count < 2 {
+	entry := func(i int) certificateWindowEntry { return r.window[(r.start+i)%len(r.window)] }
+	if r.count == 0 || entry(r.count-1).slot != through {
+		return ChainActivitySummary{SampledAt: r.summary.SampledAt}
+	}
+	return activitySnapshotAt(r.count-1, r.summary.SampledAt, entry)
+}
+
+// ActivityHistory computes bounded history from an already-detached snapshot.
+// It is intended for dashboard workers, not replay's settlement path.
+func (s SelectedSlotSnapshot) ActivityHistory() []ChainActivitySummary {
+	if s.UpdatedAt.IsZero() || len(s.Records) < 2 || len(s.Records) > SelectedSlotCapacity {
+		return nil
+	}
+	entry := func(i int) certificateWindowEntry {
+		r := s.Records[i]
+		return certificateWindowEntry{slot: r.Slot, fold: r.CertificateFoldEvidence, gap: r.Gap,
+			carrier: CertificateCarrier{Slot: r.Slot, BlockID: r.BlockID, Bankhash: r.Bankhash,
+				ParentSlot: r.ParentSlot, ParentBlockID: r.ParentBlockID, HasParentBlockID: r.HasParentBlockID,
+				ExecutionParentSlot: r.ExecutionParentSlot, ExecutionParentBankhash: r.ExecutionParentBankhash,
+				BankTime: r.BankTime, ActivityKnown: r.BankTime > 0, Transactions: r.Transactions}}
+	}
+	var out []ChainActivitySummary
+	for i := len(s.Records) - 1; i > 0 && len(out) < 32; {
+		interval := activitySnapshotAt(i, s.UpdatedAt, entry)
+		if !interval.Available {
+			break
+		}
+		out = append(out, interval)
+		for i > 0 && s.Records[i].Slot > interval.AnchorSlot {
+			i--
+		}
+		if s.Records[i].Slot != interval.AnchorSlot {
+			break
+		}
+	}
+	return out
+}
+
+func activitySnapshotAt(last int, sampledAt time.Time, entry func(int) certificateWindowEntry) ChainActivitySummary {
+	unknown := ChainActivitySummary{SampledAt: sampledAt}
+	if last < 1 {
 		return unknown
 	}
-	entry := func(i int) certificateWindowEntry { return r.window[(r.start+i)%len(r.window)] }
 	valid := func(e certificateWindowEntry) bool {
 		c := e.carrier
 		t := c.Transactions
@@ -37,14 +75,14 @@ func (r *CertificateOutcomes) activitySnapshot(through uint64) ChainActivitySumm
 			c.ActivityKnown && c.BankTime > 0 && !t.Saturated && t.NonVote <= t.Total && t.Failed <= t.Total &&
 			t.NonVoteFailed <= t.NonVote && t.NonVoteFailed <= t.Failed && t.Failed-t.NonVoteFailed <= t.Total-t.NonVote
 	}
-	child := entry(r.count - 1)
+	child := entry(last)
 	// The fold frontier is the last actual bank, even when slots were skipped.
 	// A missing carrier there must not refresh an older interval.
-	if !valid(child) || child.slot != through {
+	if !valid(child) {
 		return unknown
 	}
-	s := ChainActivitySummary{SampledAt: r.summary.SampledAt, LastSlot: child.slot, EndTime: child.carrier.BankTime}
-	for i := r.count - 2; i >= 0; i-- {
+	s := ChainActivitySummary{SampledAt: sampledAt, LastSlot: child.slot, EndTime: child.carrier.BankTime}
+	for i := last - 1; i >= 0; i-- {
 		parent := entry(i)
 		c, p := child.carrier, parent.carrier
 		if !valid(parent) || p.Slot >= c.Slot || !c.HasParentBlockID || c.ParentSlot != p.Slot || c.ExecutionParentSlot != p.Slot ||

@@ -6,13 +6,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 )
 
 const (
-	selectedWindowCapacity = 256
-	selectedWindowPageSize = 8
-	selectedWindowMaxBytes = 1 << 20
+	selectedWindowCapacity       = 256
+	selectedWindowPageSize       = 8
+	selectedWindowMaxBytes       = 1 << 20
+	selectedWindowBundleMaxBytes = 7*MaxSnapshotBytes + 128
 )
 
 // SelectedWindow is one replay attempt's bounded selected-and-folded source
@@ -109,6 +111,15 @@ func prepareSelectedWindow(w SelectedWindow) (*preparedSelectedWindow, error) {
 		p.pages[page], p.bytes = string(body), p.bytes+len(body)
 	}
 	return p, nil
+}
+
+func selectedWindowBundle(p *preparedSelectedWindow) (string, error) {
+	first := max(0, len(p.pages)-6)
+	body := `{"manifest":` + p.manifest + `,"pages":[` + strings.Join(p.pages[first:], ",") + `]}`
+	if len(body) > selectedWindowBundleMaxBytes {
+		return "", errors.New("response_limit")
+	}
+	return body, nil
 }
 
 func decodeSelectedWindowManifest(manifest []byte) (selectedWindowManifest, error) {

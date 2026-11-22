@@ -53,6 +53,10 @@ func TestSnapshotManifestNegotiation(t *testing.T) {
 	if status != http.StatusOK || len(v3) > MaxSnapshotBytes || !strings.Contains(string(v3), `"ready_marker"`) || !strings.Contains(string(v3), `"safety_fault":true`) {
 		t.Fatalf("v3 fault or marker unavailable: %d %s", status, v3)
 	}
+	status, advanced, _ := replayDetailPublicRequest(t, address, "/api/v1/status?"+advancedProfileQuery, "stats.example", "")
+	if status != http.StatusOK || len(advanced) > MaxSnapshotBytes || !strings.Contains(string(advanced), `"snapshot_manifests"`) || !strings.Contains(string(advanced), `"ready_marker"`) || !strings.Contains(string(advanced), `"safety_fault":true`) {
+		t.Fatalf("advanced profile lost v3 observations: %d %s", status, advanced)
+	}
 	status, _, _ = replayDetailPublicRequest(t, address, "/api/v1/status?include=other", "stats.example", "")
 	if status != http.StatusBadRequest {
 		t.Fatalf("unexpected status query accepted: %d", status)
@@ -70,7 +74,7 @@ func TestSnapshotManifestNegotiation(t *testing.T) {
 		present bool
 		ready   bool
 		fault   bool
-	}{{"", false, false, false}, {"?" + manifestProfileQuery, true, false, false}, {"?" + readyProfileQuery, true, true, false}, {"?" + safetyProfileQuery, true, true, true}} {
+	}{{"", false, false, false}, {"?" + manifestProfileQuery, true, false, false}, {"?" + readyProfileQuery, true, true, false}, {"?" + safetyProfileQuery, true, true, true}, {"?" + advancedProfileQuery, true, true, true}} {
 		conn, _, err := dialer.Dial("ws://stats.example/websocket"+tc.query, http.Header{"Origin": {"https://stats.example"}})
 		if err != nil {
 			t.Fatal(err)

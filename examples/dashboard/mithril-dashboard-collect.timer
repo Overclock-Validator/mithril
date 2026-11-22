@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh Mithril public cluster observations
+
+[Timer]
+OnBootSec=30
+OnUnitInactiveSec=30
+AccuracySec=5
+RandomizedDelaySec=5
+Unit=mithril-dashboard-collect.service
+
+[Install]
+WantedBy=timers.target

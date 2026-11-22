@@ -106,6 +106,67 @@ func TestPublicHTTPAndWebSocket(t *testing.T) {
 	}
 }
 
+func TestAdvancedStatusHTTPAndWebSocket(t *testing.T) {
+	path, body := fixtureFeed(t)
+	setFixture(t, body, paymentFixture(time.Now().UTC()))
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- serveProfile(ctx, path, listener, "https://stats.example", PublicOptions{}) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	})
+	client := &http.Client{Timeout: time.Second}
+	read := func(query string) PublicSnapshot {
+		t.Helper()
+		req, err := http.NewRequest("GET", "http://"+listener.Addr().String()+"/api/v1/status"+query, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Host = "stats.example"
+		response, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		var p PublicSnapshot
+		if response.StatusCode != http.StatusOK || json.NewDecoder(response.Body).Decode(&p) != nil {
+			t.Fatal("status unavailable")
+		}
+		return p
+	}
+	deadline := time.Now().Add(4 * time.Second)
+	for read("").SourceState != "fresh" {
+		if time.Now().After(deadline) {
+			t.Fatal("source never became fresh")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	legacy, advanced := read(""), read("?"+advancedProfileQuery)
+	if legacy.Replay == nil || legacy.Replay.PaymentOutcomes != nil || advanced.Replay == nil || advanced.Replay.PaymentOutcomes == nil {
+		t.Fatal("HTTP profiles did not preserve legacy and opt-in payment shapes")
+	}
+	dialer := websocket.Dialer{HandshakeTimeout: time.Second, NetDialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", listener.Addr().String())
+	}}
+	conn, _, err := dialer.Dial("ws://stats.example/websocket?"+advancedProfileQuery, http.Header{"Origin": {"https://stats.example"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	m := readMessage(t, conn)
+	var streamed PublicSnapshot
+	if json.Unmarshal(m["value"], &streamed) != nil || streamed.Replay == nil || streamed.Replay.PaymentOutcomes == nil {
+		t.Fatal("WebSocket did not deliver the requested advanced profile")
+	}
+}
+
 func testPublicHTTPAndWebSocket(t *testing.T, resources bool) {
 	path, body := fixtureFeed(t)
 	s := fullTestSnapshot(time.Now().UTC())
@@ -156,6 +217,7 @@ func testPublicHTTPAndWebSocket(t *testing.T, resources bool) {
 		status                           int
 	}{
 		{"GET", "/api/v1/features", "stats.example", "", "", 200},
+		{"GET", "/api/v1/features?include=advanced_status", "stats.example", "", "", 200},
 		{"GET", "/api/v1/cluster", "stats.example", "", "", 404},
 		{"GET", "/api/v1/cluster-map", "stats.example", "", "", 404},
 		{"GET", "/api/v1/cluster-versions", "stats.example", "", "", 404},
@@ -163,6 +225,7 @@ func testPublicHTTPAndWebSocket(t *testing.T, resources bool) {
 		{"GET", "/api/v1/node-display", "stats.example", "", "", 404},
 		{"GET", "/api/v1/details/network", "stats.example", "", "", 404},
 		{"GET", "/api/v1/status", "stats.example", "", "", 200},
+		{"GET", "/api/v1/status?include=advanced_status", "stats.example", "", "", 200},
 		{"GET", "/api/v1/status", "stats.example", "https://stats.example", "", 200},
 		{"GET", "/api/v1/status", "other.example", "", "", 403},
 		{"GET", "/api/v1/status", "stats.example", "null", "", 403},

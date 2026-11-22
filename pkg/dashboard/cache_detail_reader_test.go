@@ -152,16 +152,39 @@ func TestDetailRemainingBounds(t *testing.T) {
 		{"2", 2 * time.Millisecond, 2 * time.Millisecond, true},
 		{"3", 2 * time.Millisecond, 0, false},
 		{"2", time.Millisecond, 0, false},
+		{"", time.Second, 0, false},
 		{"0", time.Second, 0, false},
 		{"-1", time.Second, 0, false},
 		{"01", time.Second, 0, false},
 		{"+1", time.Second, 0, false},
+		{"1.0", time.Second, 0, false},
+		{"1 ", time.Second, 0, false},
 		{"9223372036854775808", time.Second, 0, false},
 	} {
 		got, err := parseDetailRemaining(tc.value, tc.limit)
 		if (err == nil) != tc.valid || got != tc.want {
 			t.Errorf("parseDetailRemaining(%q, %v) = %v, %v; want %v, valid=%t", tc.value, tc.limit, got, err, tc.want, tc.valid)
 		}
+	}
+}
+
+func TestDetailFamilyRemainingCaps(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		parse func(string) (time.Duration, error)
+	}{
+		{"network", parseNetworkDetailRemaining},
+		{"production", parseProductionDetailRemaining},
+		{"storage", parseStorageDetailRemaining},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got, err := tc.parse("30000"); err != nil || got != 30*time.Second {
+				t.Fatalf("maximum lease = %v, %v; want 30s", got, err)
+			}
+			if _, err := tc.parse("30001"); err == nil {
+				t.Fatal("lease above the family cap accepted")
+			}
+		})
 	}
 }
 
@@ -434,9 +457,10 @@ func TestCacheDetailReaderRealFeedAndCachedViewer(t *testing.T) {
 	capture.Detail.Program.EstimatedEntries = math.MaxUint64
 	lookup := CacheLookupDetail{Hits: 12, Misses: 3}
 	delta := CacheLookupDelta{Hits: 7, Misses: 1}
+	copied := uint64(1240)
 	capture.Detail.Activity = &CacheActivityDetail{Instance: 1, Vote: lookup, Program: lookup, CommonLarge: lookup,
 		Window: &CacheActivityWindow{StartedAt: capture.Detail.CapturedAt.Add(-time.Second), EndedAt: capture.Detail.CapturedAt,
-			DurationNanoseconds: uint64(time.Second), Vote: delta, Program: delta, CommonLarge: delta}}
+			DurationNanoseconds: uint64(time.Second), Vote: delta, Program: delta, CommonLarge: delta, FixedSmallPayloadBytesCopied: &copied}}
 	capture.Detail.Activity.InsertionWeights = cacheInsertionWeightsFixture(0, math.MaxUint64)
 	capture.Detail.Activity.ProgramSets = cacheProgramSetsFixture(math.MaxUint64 - 1)
 	refused := uint64(7)
@@ -472,6 +496,9 @@ func TestCacheDetailReaderRealFeedAndCachedViewer(t *testing.T) {
 		remaining, err := parseCacheDetailRemaining(response.Header().Get(replayDetailRemainingHeader))
 		if response.Code != 200 || response.Header().Get("Cache-Control") != "no-store" || response.Header().Get("Content-Type") != "application/json" || err != nil || remaining <= 0 {
 			t.Fatal("cached public response unavailable")
+		}
+		if !strings.Contains(response.Body.String(), `"fixed_small_payload_bytes_copied":"1240"`) {
+			t.Fatal("cached public response dropped the measured copy count")
 		}
 	}
 	if samples.Load() != before {

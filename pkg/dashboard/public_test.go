@@ -1,6 +1,7 @@
 package dashboard
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"math"
@@ -72,7 +73,7 @@ func TestPublicCollectorThroughputAndOversizedProjection(t *testing.T) {
 	}
 	probe := c.throughput
 	v := probe.Observe(&s, "fresh", s.SampledAt)
-	if _, err := encodePublicSnapshot(&s, "fresh", s.SampledAt, &v, nil, nil); err == nil {
+	if _, err := encodePublicSnapshot(&s, "fresh", s.SampledAt, &v, nil, nil, nil); err == nil {
 		t.Fatal("fixture did not exceed the public history budget")
 	}
 	body.Store(&b)
@@ -120,8 +121,16 @@ func publicTestSnapshot(now time.Time) Snapshot {
 }
 
 func publicValue(t *testing.T, s *Snapshot, state string, now time.Time) (PublicSnapshot, []byte) {
+	return profileValue(t, s, state, now, 0)
+}
+
+func advancedPublicValue(t *testing.T, s *Snapshot, state string, now time.Time) (PublicSnapshot, []byte) {
+	return profileValue(t, s, state, now, 4)
+}
+
+func profileValue(t *testing.T, s *Snapshot, state string, now time.Time, profile int) (PublicSnapshot, []byte) {
 	t.Helper()
-	b, err := encodePublicSnapshot(s, state, now, nil, nil, nil)
+	b, err := encodePublicSnapshotProfile(s, state, now, nil, nil, nil, nil, profile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,6 +139,85 @@ func publicValue(t *testing.T, s *Snapshot, state string, now time.Time) (Public
 		t.Fatal(err)
 	}
 	return value, b
+}
+
+func TestAdvancedStatusRequiresExplicitProfile(t *testing.T) {
+	at := sizingTime(time.Now())
+	shard := fullTestSnapshot(at)
+	shard.SnapshotArchive, shard.IncrementalArchive = nil, nil
+	shard.SnapshotShardFlush = maximumSnapshotShardFlush(at)
+	for _, tc := range []struct {
+		name, group, field string
+		snapshot           Snapshot
+		legacy             reflect.Type
+	}{
+		{"lifecycle", "consensus", "block_lifecycle", lifecycleFixture(at), reflect.TypeOf(PublicConsensus{})},
+		{"next signer", "voting", "next_epoch_signer", nextEpochSignerFixture(at), reflect.TypeOf(PublicVoting{})},
+		{"payments", "replay", "payment_outcomes", paymentFixture(at), reflect.TypeOf(PublicReplay{})},
+		{"shard flush", "startup", "snapshot_shard_flush", shard, reflect.TypeOf(PublicStartup{})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var fields []reflect.StructField
+			for i := 0; i < tc.legacy.NumField(); i++ {
+				field := tc.legacy.Field(i)
+				if strings.Split(field.Tag.Get("json"), ",")[0] != tc.field {
+					fields = append(fields, field)
+				}
+			}
+			legacy := reflect.StructOf(fields)
+			for profile := 0; profile <= 4; profile++ {
+				body, err := encodePublicSnapshotProfile(&tc.snapshot, "fresh", at, nil, nil, nil, nil, profile)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var decoded map[string]json.RawMessage
+				if err := json.Unmarshal(body, &decoded); err != nil {
+					t.Fatal(err)
+				}
+				var group map[string]json.RawMessage
+				if err := json.Unmarshal(decoded[tc.group], &group); err != nil {
+					t.Fatal(err)
+				}
+				_, present := group[tc.field]
+				if present != (profile == 4) {
+					t.Fatalf("profile %d: field %s present=%t", profile, tc.field, present)
+				}
+				decoder := json.NewDecoder(bytes.NewReader(decoded[tc.group]))
+				decoder.DisallowUnknownFields()
+				err = decoder.Decode(reflect.New(legacy).Interface())
+				if profile == 4 && (err == nil || !strings.Contains(err.Error(), tc.field)) || profile != 4 && err != nil {
+					t.Fatalf("profile %d: strict legacy decoder: %v", profile, err)
+				}
+			}
+		})
+	}
+	resources := &PublicResources{Cgroup: &PublicCgroupResources{}, Compaction: &PublicCompaction{}}
+	snapshot := testSnapshot(at)
+	for profile := 0; profile <= 4; profile++ {
+		body, err := encodePublicSnapshotProfile(&snapshot, "fresh", at, nil, resources, nil, &PublicHarmonic{}, profile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded struct {
+			Resources map[string]json.RawMessage `json:"resources"`
+			Harmonic  json.RawMessage            `json:"harmonic"`
+		}
+		if err := json.Unmarshal(body, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		for _, field := range []string{"cgroup", "compaction"} {
+			_, present := decoded.Resources[field]
+			if present != (profile == 4) {
+				t.Fatalf("profile %d: resource %s present=%t", profile, field, present)
+			}
+		}
+		if (decoded.Harmonic != nil) != (profile == 4) {
+			t.Fatalf("profile %d: harmonic present=%t", profile, decoded.Harmonic != nil)
+		}
+	}
+	if resources.Cgroup == nil || resources.Compaction == nil {
+		t.Fatal("legacy projection mutated the supplied resources")
+	}
 }
 
 func TestPublicFieldAllowlist(t *testing.T) {
@@ -163,7 +251,7 @@ func TestPublicFieldAllowlist(t *testing.T) {
 		"input.turbine.diagnostics.admission": "missing_leaders shred_version_mismatch",
 		"input.turbine.diagnostics.repair":    "requests responses late_responses timeouts errors outstanding peers responding_peers",
 		"input.gossip":                        "state sampled_at started_at received_packets sent_packets decode_errors send_errors accepted_contacts known_peers repair_peers alpenglow_peers",
-		"pipeline":                            "state sampled_at started_at ingress_packets ingress_bytes ingress_full_drops passed_dedup_packets invalid_wire_drops unsupported_version_drops duplicate_drops verified_packets invalid_signature_drops scheduler_buffered_total scheduler_queue_depth bank_admissions buffer_capacity_drops cost_rejections execution_rejections quic_open_connections quic_active_streams quic_stream_buffer_drops scheduler_expired_removals scheduler_receive_evictions",
+		"pipeline":                            "state sampled_at started_at ingress_packets ingress_bytes ingress_full_drops passed_dedup_packets invalid_wire_drops unsupported_version_drops duplicate_drops verified_packets invalid_signature_drops scheduler_buffered_total scheduler_queue_depth bank_admissions buffer_capacity_drops cost_rejections execution_rejections quic_open_connections quic_active_streams quic_stream_buffer_drops quic_refused_too_many_open quic_refused_per_ip scheduler_expired_removals scheduler_receive_evictions already_processed_rejections",
 	}
 	for path, fields := range objects {
 		object := value
@@ -253,7 +341,7 @@ func TestPublicAvailabilityAndRoleChanges(t *testing.T) {
 	if p.Node != nil || p.Replay != nil || p.SampledAt != nil || p.Pipeline != nil || p.Input != nil {
 		t.Fatal("unavailable source published observations")
 	}
-	if _, err := encodePublicSnapshot(&s, "healthy", now, nil, nil, nil); err == nil {
+	if _, err := encodePublicSnapshot(&s, "healthy", now, nil, nil, nil, nil); err == nil {
 		t.Fatal("invented source state accepted")
 	}
 	s.Mode = "verifying"
@@ -406,5 +494,104 @@ func TestPublicPipelineGaugesAndIndependentCounters(t *testing.T) {
 	p, _ = publicValue(t, &s, "fresh", now)
 	if p.Pipeline.SchedulerQueueDepth == nil || *p.Pipeline.SchedulerQueueDepth != 0 || p.Pipeline.QUICOpenConnections == nil || *p.Pipeline.QUICOpenConnections != 0 || p.Pipeline.QUICActiveStreams == nil || *p.Pipeline.QUICActiveStreams != 0 || p.Pipeline.QUICStreamBufferDrops == nil || *p.Pipeline.QUICStreamBufferDrops != 59 {
 		t.Fatalf("missing or wrong measured gauge: %+v", p.Pipeline)
+	}
+
+	// Optional refusal counters preserve missing versus measured zero. Existing
+	// native producers already send them; the public projection must not drop them.
+	refusals := func(wantOpen, wantIP string) {
+		t.Helper()
+		body, err := json.Marshal(p.Pipeline)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(body, &fields); err != nil {
+			t.Fatal(err)
+		}
+		for key, want := range map[string]string{"quic_refused_too_many_open": wantOpen, "quic_refused_per_ip": wantIP} {
+			if got := string(fields[key]); got != want {
+				t.Fatalf("%s = %s, want %s", key, got, want)
+			}
+		}
+	}
+	openRefusals := uint64(61)
+	s.Pipeline.QUIC.RefusedTooManyOpen, s.Pipeline.QUIC.RefusedPerIP = &openRefusals, &zero
+	p, _ = publicValue(t, &s, "fresh", now)
+	refusals(`"61"`, `"0"`)
+	maxRefusals := uint64(math.MaxUint64)
+	s.Pipeline.QUIC.RefusedPerIP = &maxRefusals
+	s.Pipeline.SampledAt = now.Add(-31 * time.Second)
+	p, _ = publicValue(t, &s, "fresh", now)
+	refusals(`"61"`, `"18446744073709551615"`)
+
+	// The existing private reader uses json.Unmarshal. Omitted or null fields
+	// must not become measured zero merely because the QUIC object exists.
+	for _, wire := range []string{`{}`, `{"refused_too_many_open":null,"refused_per_ip":null}`} {
+		var legacy PipelineQUIC
+		if err := json.Unmarshal([]byte(wire), &legacy); err != nil {
+			t.Fatal(err)
+		}
+		s.Pipeline.QUIC = &legacy
+		p, _ = publicValue(t, &s, "fresh", now)
+		refusals("", "")
+	}
+	var measured PipelineQUIC
+	if err := json.Unmarshal([]byte(`{"refused_too_many_open":"0","refused_per_ip":"18446744073709551615"}`), &measured); err != nil {
+		t.Fatal(err)
+	}
+	s.Pipeline.QUIC = &measured
+	p, _ = publicValue(t, &s, "fresh", now)
+	refusals(`"0"`, `"18446744073709551615"`)
+	// A reader with the original scalar DTO still accepts the producer wire.
+	wire, err := json.Marshal(measured)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var oldReader struct {
+		Open  uint64 `json:"refused_too_many_open,string"`
+		PerIP uint64 `json:"refused_per_ip,string"`
+	}
+	if err := json.Unmarshal(wire, &oldReader); err != nil || oldReader.Open != 0 || oldReader.PerIP != math.MaxUint64 {
+		t.Fatal("legacy reader wire compatibility", err)
+	}
+	if p.Pipeline.State != "stale" || !p.Pipeline.SampledAt.Equal(s.Pipeline.SampledAt) || !p.Pipeline.StartedAt.Equal(s.Pipeline.StartedAt) {
+		t.Fatal("refusal counters renewed or lost original observation lifetime")
+	}
+	s.Pipeline.QUIC = nil
+	p, _ = publicValue(t, &s, "fresh", now)
+	refusals("", "")
+
+	// Decode the existing native field through the same DTO the private reader
+	// uses. Absence/null stays unknown, and zero/full-u64 stays exact.
+	for _, tc := range []struct {
+		wire string
+		want *uint64
+	}{
+		{`{}`, nil}, {`{"dropped_already_processed":null}`, nil},
+		{`{"dropped_already_processed":"0"}`, &zero},
+		{`{"dropped_already_processed":"18446744073709551615"}`, &maxRefusals},
+	} {
+		var measured PipelineScheduler
+		if err := json.Unmarshal([]byte(tc.wire), &measured); err != nil {
+			t.Fatal(err)
+		}
+		s.Pipeline.Scheduler = measured
+		p, _ = publicValue(t, &s, "fresh", now)
+		if !reflect.DeepEqual(p.Pipeline.AlreadyProcessedRejections, tc.want) || p.Pipeline.State != "stale" || !p.Pipeline.SampledAt.Equal(s.Pipeline.SampledAt) {
+			t.Fatal("already-processed count lost presence, precision or original lifetime")
+		}
+		// The old scalar DTO still accepts an explicitly measured value.
+		if tc.want != nil {
+			wire, err := json.Marshal(measured)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var oldReader struct {
+				Count uint64 `json:"dropped_already_processed,string"`
+			}
+			if err := json.Unmarshal(wire, &oldReader); err != nil || oldReader.Count != *tc.want {
+				t.Fatal("legacy scheduler reader wire compatibility", err)
+			}
+		}
 	}
 }

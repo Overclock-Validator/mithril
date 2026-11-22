@@ -175,7 +175,6 @@ type LeaderLoopConfig struct {
 	// ObserveParentReady receives selected own-window parent notifications under
 	// the leader lock. It must return promptly and must not re-enter the loop.
 	ObserveParentReady func(LeaderParentReadyObservation)
-
 	// CertificateObservationVoteAccount enables private compact capture for a
 	// fixed public account; speculative production does not publish outcomes.
 	CertificateObservationVoteAccount solana.PublicKey
@@ -219,36 +218,35 @@ func NewLeaderLoop(cfg LeaderLoopConfig) *LeaderLoop {
 	}
 	holder, _ := cfg.Hooks.(SlotHolder)
 	return &LeaderLoop{
+		controller:                        cfg.Controller,
+		identity:                          cfg.Identity,
+		accountsDb:                        cfg.AccountsDb,
+		broadcaster:                       cfg.Broadcaster,
+		shredVersion:                      cfg.ShredVersion,
+		userAgent:                         cfg.UserAgent,
+		epochSchedule:                     cfg.EpochSchedule,
+		alpenglowClock:                    cfg.AlpenglowClock,
+		parentContext:                     cfg.ParentContext,
+		parentGenerationLease:             cfg.ParentGenerationLease,
+		productionParent:                  cfg.ProductionParent,
+		canSignSlot:                       cfg.CanSignSlot,
+		onBlock:                           cfg.OnBlock,
+		currentSlot:                       cfg.CurrentSlot,
+		leaderForSlot:                     cfg.LeaderForSlot,
+		rewardCerts:                       cfg.RewardCerts,
+		pollInterval:                      cfg.PollInterval,
+		slotDuration:                      cfg.SlotDuration,
+		completionReserve:                 cfg.CompletionReserve,
+		now:                               cfg.Now,
+		hooks:                             cfg.Hooks,
+		holder:                            holder,
+		gateTPU:                           cfg.GateTPU && cfg.Hooks != nil,
+		finishedLeaderSlots:               make(map[uint64]struct{}),
+		pendingFailures:                   make(map[uint64]leaderSlotFailure),
+		observeTerminal:                   cfg.ObserveTerminal,
+		observeParentReady:                cfg.ObserveParentReady,
 		certificateObservationVoteAccount: cfg.CertificateObservationVoteAccount,
 		captureSelectedSlotFacts:          cfg.CaptureSelectedSlotFacts,
-
-		controller:            cfg.Controller,
-		identity:              cfg.Identity,
-		accountsDb:            cfg.AccountsDb,
-		broadcaster:           cfg.Broadcaster,
-		shredVersion:          cfg.ShredVersion,
-		userAgent:             cfg.UserAgent,
-		epochSchedule:         cfg.EpochSchedule,
-		alpenglowClock:        cfg.AlpenglowClock,
-		parentContext:         cfg.ParentContext,
-		parentGenerationLease: cfg.ParentGenerationLease,
-		productionParent:      cfg.ProductionParent,
-		canSignSlot:           cfg.CanSignSlot,
-		onBlock:               cfg.OnBlock,
-		observeTerminal:       cfg.ObserveTerminal,
-		observeParentReady:    cfg.ObserveParentReady,
-		currentSlot:           cfg.CurrentSlot,
-		leaderForSlot:         cfg.LeaderForSlot,
-		rewardCerts:           cfg.RewardCerts,
-		pollInterval:          cfg.PollInterval,
-		slotDuration:          cfg.SlotDuration,
-		completionReserve:     cfg.CompletionReserve,
-		now:                   cfg.Now,
-		hooks:                 cfg.Hooks,
-		holder:                holder,
-		gateTPU:               cfg.GateTPU && cfg.Hooks != nil,
-		finishedLeaderSlots:   make(map[uint64]struct{}),
-		pendingFailures:       make(map[uint64]leaderSlotFailure),
 	}
 }
 

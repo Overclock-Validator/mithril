@@ -3,11 +3,9 @@ package dashboard
 import (
 	"context"
 	"encoding/json"
-	"math"
 	"net"
 	"net/http"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -114,57 +112,4 @@ func TestNetworkSplitRequiresPublicResources(t *testing.T) {
 			t.Fatalf("network details accepted origin=%q resources=%t", tc.origin, tc.resources)
 		}
 	}
-}
-
-func networkDetailFixture(now time.Time) (Snapshot, NetworkDetailCapture) {
-	start := now.Add(-time.Hour).UTC()
-	at := now.UTC()
-	m := SocketMemory{ReceiveAllocatedBytes: math.MaxUint32, ReceiveLimitBytes: 1, SendAllocatedBytes: 2, SendLimitBytes: 3,
-		ForwardAllocatedBytes: 4, SendQueuedBytes: 5, OptionsAllocatedBytes: 6, BacklogBytes: 7, Drops: 8}
-	w := SocketDropWindow{StartedAt: now.Add(-time.Second).UTC(), SampledAt: at, DurationMilliseconds: 1000, Drops: 8}
-	d := NetworkDetail{SchemaVersion: 1, Family: "network", Scope: "turbine_receiver_session", State: "fresh",
-		Binding: NetworkDetailBinding{RunID: "network-run", NodeStartedAt: start, SourceStartedAt: start, ReceiverStartedAt: start,
-			ReceiverSession: math.MaxUint64, SocketGeneration: math.MaxUint64}, UpdatedAt: at,
-		Live:   SocketDetail{Enabled: true, State: "available", StartedAt: &at, SampledAt: &at, Memory: &m, DropWindow: &w},
-		Repair: SocketDetail{Enabled: true, State: "available", StartedAt: &at, SampledAt: &at, Memory: &SocketMemory{}}}
-	s := testSnapshot(at)
-	s.RunID, s.StartedAt, s.GenesisHash = d.Binding.RunID, start, nil
-	s.BlockSource = &BlockSource{SampledAt: at, StartedAt: start, ConfiguredSource: "turbine", LiveConnected: true,
-		Turbine: &Turbine{SampledAt: at, StartedAt: start, Session: math.MaxUint64}}
-	return s, NetworkDetailCapture{Detail: d, FreshUntil: now.Add(NetworkDetailFreshFor)}
-}
-
-func networkDetailTestReader(t *testing.T, path string, snapshot Snapshot, now time.Time) *networkDetailReader {
-	t.Helper()
-	var gate atomic.Pointer[networkDetailGate]
-	g := networkGate(snapshot, now)
-	g.stamp, g.nodeStamp = statusStamp{1, 1}, statusStamp{1, 1}
-	gate.Store(&g)
-	reader, err := newNetworkDetailReader(newCollector(path).client, &gate)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reader.admit = func(networkDetailReply) (time.Duration, bool) { return time.Second, true }
-	t.Cleanup(reader.client.CloseIdleConnections)
-	return reader
-}
-
-func maximumInterfaceTraffic(now time.Time) *InterfaceTrafficDetail {
-	total := uint32(256)
-	d := &InterfaceTrafficDetail{Scope: "visible_interface_counters", State: "available", CaptureStartedAt: now.UTC(), SampledAt: now.UTC(),
-		TotalInterfaces: &total, Interfaces: make([]InterfaceTrafficCounter, 8)}
-	for i := range d.Interfaces {
-		d.Interfaces[i] = InterfaceTrafficCounter{Index: math.MaxUint32 - 8 + uint32(i), ReceiveBytes: math.MaxUint64, TransmitBytes: math.MaxUint64,
-			ReceivePackets: math.MaxUint64, TransmitPackets: math.MaxUint64,
-			Failures: &InterfaceTrafficFailures{ReceiveErrors: math.MaxUint64, ReceiveDropped: math.MaxUint64, TransmitErrors: math.MaxUint64, TransmitDropped: math.MaxUint64}}
-	}
-	return d
-}
-
-func nodeNetworkSourceFixture(now time.Time) (Snapshot, NodeNetworkCapture) {
-	s, receiver := networkDetailFixture(now)
-	d := NodeNetworkDetail{SchemaVersion: 2, Family: "network", Scope: "node_network", CapturedAt: now.UTC(),
-		Binding:  NodeNetworkBinding{RunID: s.RunID, NodeStartedAt: s.StartedAt, GenesisHash: s.GenesisHash},
-		Receiver: &receiver.Detail, Interfaces: maximumInterfaceTraffic(now)}
-	return s, NodeNetworkCapture{Detail: d, FreshUntil: receiver.FreshUntil}
 }

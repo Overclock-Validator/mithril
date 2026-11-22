@@ -52,6 +52,39 @@ func setFixture(t *testing.T, body *atomic.Pointer[[]byte], value any) {
 	body.Store(&b)
 }
 
+func TestCheckReader(t *testing.T) {
+	socket, body := fixtureFeed(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	address := listener.Addr().String()
+	const origin = "https://dashboard.example.com"
+	check := func(socket, address, origin, wantError string) {
+		t.Helper()
+		err := CheckReader(context.Background(), socket, address, origin, PublicOptions{Resources: true})
+		switch {
+		case wantError == "" && err == nil:
+		case wantError != "" && err != nil && strings.Contains(err.Error(), wantError):
+		default:
+			t.Fatalf("CheckReader error = %v, want %q", err, wantError)
+		}
+	}
+	check(socket, "0.0.0.0:8080", origin, "loopback IP")
+	check(socket, "127.0.0.1:70000", origin, "invalid port")
+	check(socket, address, "http://dashboard.example.com", "HTTPS origin")
+	check(socket, address, origin+":443", "omit the default HTTPS port")
+	check(socket+".missing", address, origin, "is missing")
+	check(socket, address, origin, "feed is unavailable")
+	setFixture(t, body, map[string]string{"unexpected": "test"})
+	check(socket, address, origin, "snapshot was rejected")
+	setFixture(t, body, fullTestSnapshot(time.Now().UTC().Add(-2*StaleAfter)))
+	check(socket, address, origin, "did not provide fresh status")
+	setFixture(t, body, fullTestSnapshot(time.Now().UTC()))
+	check(socket, address, origin, "")
+}
+
 func TestCollectorFreshnessRunReplacementAndProjection(t *testing.T) {
 	path, body := fixtureFeed(t)
 	c := newCollector(path)

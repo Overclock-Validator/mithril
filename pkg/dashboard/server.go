@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -210,9 +211,9 @@ type collector struct {
 	statusFreshEnd   time.Time
 	statusSampleEnd  time.Time
 	statusSampleWall time.Time
-	statusNodeEpoch  uint64
-	statusPriorEnd   time.Time
-	statusPriorWall  time.Time
+	statusNodeEpoch  uint64              // owned by the collection loop
+	statusPriorEnd   time.Time           // owned by the collection loop
+	statusPriorWall  time.Time           // owned by the collection loop
 	statusLeases     []*statusFrameLease // owned by the collection loop
 	clockOrigin      time.Time
 	clockUncertain   atomic.Bool
@@ -220,14 +221,21 @@ type collector struct {
 	statusUpdate     atomic.Pointer[statusFrameUpdate]
 	public           bool
 	publicOptions    PublicOptions
+	expectedOrigin   string
 	throughput       Throughput // owned by the collection loop, never by viewers
 	resourceCPU      resourceCPURate
 	history          *historyService
-	detailGate       atomic.Pointer[replayDetailGate]
-	cacheGate        atomic.Pointer[cacheDetailGate]
-	networkGate      atomic.Pointer[networkDetailGate]
-	localPeerGate    atomic.Pointer[localPeerGate]
+	external         *clusterReader
+	display          *nodeDisplayOwner
 	machine          *machineDetailReader
+	detailGate       atomic.Pointer[replayDetailGate]
+	fast             *fastExecutedReader
+	networkGate      atomic.Pointer[networkDetailGate]
+	cacheGate        atomic.Pointer[cacheDetailGate]
+	productionGate   atomic.Pointer[productionDetailGate]
+	storageGate      atomic.Pointer[storageDetailGate]
+	localPeerGate    atomic.Pointer[localPeerGate]
+	receptionGate    receptionReaderStatus
 }
 
 func newCollector(socket string) *collector {
@@ -284,7 +292,7 @@ func statusLease(header http.Header) (time.Duration, bool, bool) {
 	return time.Duration(milliseconds) * time.Millisecond, true, true
 }
 
-func (c *collector) poll(ctx context.Context, now time.Time) {
+func (c *collector) poll(ctx context.Context, now time.Time) string {
 	previous := c.last
 	collectionStarted := time.Now()
 	var receivedAt, observedAgeEnd, observedLeaseEnd time.Time
@@ -325,6 +333,20 @@ func (c *collector) poll(ctx context.Context, now time.Time) {
 		if valid && sameRun && (snapshot.SampledAt.Before(c.lastAcceptedAt) || c.statusLeaseSeen && !hasLease ||
 			snapshot.SampledAt.Equal(c.lastAcceptedAt) && sum != c.lastAcceptedSum) {
 			valid = false
+		}
+		if valid && c.expectedOrigin != "" {
+			origins := response.Header.Values(readerOriginHeader)
+			if len(origins) != 1 || origins[0] != c.expectedOrigin {
+				valid = false
+				repeated := sameRun && snapshot.SampledAt.Equal(c.lastAcceptedAt)
+				priorCurrent := !repeated || statusLeaseContinuous(c.statusSampleEnd.Sub(receivedAt), c.statusSampleWall.Sub(receivedAt.Round(0)))
+				if priorCurrent && !c.clockUncertain.Load() && clusterClockConsistent(c.clockOrigin, receivedAt) &&
+					currentManagedSample(collectionStarted, receivedAt, now, snapshot.SampledAt, remaining, hasLease) {
+					// A new origin invalidates the previous host's cached observations before shutdown.
+					c.last = nil
+					state, reason = "unavailable", readerOriginChanged
+				}
+			}
 		}
 		if valid {
 			sampleAccepted = true
@@ -413,8 +435,6 @@ func (c *collector) poll(ctx context.Context, now time.Time) {
 		encoded.freshUntil = c.statusFreshEnd
 		encoded.clockOrigin, encoded.clockUncertain = c.clockOrigin, &c.clockUncertain
 		encoded.lease = candidateLease
-	}
-	if err == nil && state == "fresh" {
 		if len(c.statusLeases) == 16 {
 			c.statusLeases[0].tighten(receivedAt, receivedAt.Round(0))
 			copy(c.statusLeases, c.statusLeases[1:])
@@ -422,16 +442,22 @@ func (c *collector) poll(ctx context.Context, now time.Time) {
 		}
 		c.statusLeases = append(c.statusLeases, encoded.lease)
 	}
-	if c.publicOptions.NetworkDetails || c.publicOptions.MachineDetails || c.publicOptions.LocalPeers || c.publicOptions.ReplayDetails || c.publicOptions.CacheDetails {
+	if c.publicOptions.CacheDetails || c.publicOptions.NetworkDetails || c.publicOptions.ProductionDetails || c.publicOptions.StorageDetails || c.publicOptions.ReplayDetails || c.publicOptions.LocalPeers || c.publicOptions.MachineDetails || c.publicOptions.ReceptionHistory {
 		c.statusNodeEpoch, _ = nextNodeEpoch(c.statusNodeEpoch, previous, c.last, c.statusPriorEnd, c.statusPriorWall, state, receivedAt)
+		if c.publicOptions.CacheDetails {
+			c.observeCacheDetailStatus(state, reason, receivedAt, c.statusNodeEpoch)
+		}
+		if c.publicOptions.ProductionDetails {
+			c.observeProductionDetailStatus(state, reason, receivedAt, c.statusNodeEpoch)
+		}
 		if c.publicOptions.NetworkDetails {
 			c.observeNetworkDetailStatus(state, reason, receivedAt, c.statusNodeEpoch)
 		}
+		if c.publicOptions.StorageDetails {
+			c.observeStorageDetailStatus(state, reason, receivedAt, c.statusNodeEpoch)
+		}
 		if c.publicOptions.ReplayDetails {
 			c.observeReplayDetailStatus(state, reason, receivedAt, c.statusNodeEpoch)
-		}
-		if c.publicOptions.CacheDetails {
-			c.observeCacheDetailStatus(state, reason, receivedAt, c.statusNodeEpoch)
 		}
 		if c.publicOptions.LocalPeers {
 			peerReason := reason
@@ -445,24 +471,37 @@ func (c *collector) poll(ctx context.Context, now time.Time) {
 		if c.machine != nil {
 			machineStamp = c.machine.observeStatus(c.last, state, reason, receivedAt, c.statusNodeEpoch)
 		}
+		var receptionStamp statusStamp
+		if c.publicOptions.ReceptionHistory {
+			receptionStamp = c.observeReceptionHistoryStatus(state, receivedAt)
+		}
 		if err == nil {
 			encoded.fence.nodeEpoch = c.statusNodeEpoch
-			if c.publicOptions.ReplayDetails {
-				encoded.fence.families[statusReplay] = c.detailGate.Load().stamp.familyEpoch
-			}
 			if c.publicOptions.CacheDetails {
 				encoded.fence.families[statusCache] = c.cacheGate.Load().stamp.familyEpoch
+			}
+			if c.publicOptions.ProductionDetails {
+				encoded.fence.families[statusProduction] = c.productionGate.Load().stamp.familyEpoch
 			}
 			if c.publicOptions.NetworkDetails {
 				gate := c.networkGate.Load()
 				encoded.fence.families[statusNetwork] = gate.stamp.familyEpoch
 				encoded.fence.families[statusNetworkNode] = gate.nodeStamp.familyEpoch
 			}
+			if c.publicOptions.StorageDetails {
+				encoded.fence.families[statusStorage] = c.storageGate.Load().stamp.familyEpoch
+			}
+			if c.publicOptions.ReplayDetails {
+				encoded.fence.families[statusReplay] = c.detailGate.Load().stamp.familyEpoch
+			}
 			if c.publicOptions.LocalPeers {
 				encoded.fence.families[statusPeers] = c.localPeerGate.Load().revision
 			}
 			if c.machine != nil {
 				encoded.fence.families[statusMachine] = machineStamp.familyEpoch
+			}
+			if c.publicOptions.ReceptionHistory {
+				encoded.fence.families[statusReception] = receptionStamp.familyEpoch
 			}
 		}
 	}
@@ -471,43 +510,36 @@ func (c *collector) poll(ctx context.Context, now time.Time) {
 		value := candidateLease.value.Load()
 		c.statusPriorEnd, c.statusPriorWall = value.until, value.wallUntil
 	}
+	// Clear the previous label before a replacement status can become visible.
+	// Selection uses the existing cached directory only after this status fence.
+	var displayRevision uint64
+	if c.display != nil {
+		displayRevision = c.display.observeStatus(c.last, state, now, receivedAt)
+	}
 	if err == nil {
 		c.publishStatusFrame(encoded)
 		if c.history != nil {
-			c.history.offer(encoded.publicJSON, now)
+			safetyFault := c.last != nil && c.last.Consensus != nil &&
+				c.last.Consensus.SafetyFault != nil && *c.last.Consensus.SafetyFault
+			c.history.offer(encoded.publicJSON, now, safetyFault)
 		}
 	} else {
 		c.publishStatusFrame(nil)
 	}
-}
-
-// observeCacheDetailStatus binds cache details to the current node status.
-func (c *collector) observeCacheDetailStatus(state, reason string, receivedAt time.Time, nodeEpoch uint64) {
-	g := cacheDetailGate{observedAt: receivedAt, reason: "source_unavailable"}
-	if c.last != nil {
-		g = cacheGate(*c.last, receivedAt)
-	}
-	if state != "fresh" {
-		if reason == "" {
-			reason = "status_stale"
+	if c.display != nil && err == nil && c.external != nil {
+		preparedAt := time.Now()
+		wallNow := now.Add(preparedAt.Sub(receivedAt))
+		frame, displayErr := c.display.prepare(c.last, c.external.latest.Load(), wallNow, preparedAt, displayRevision)
+		if displayErr == nil {
+			frame.parent = encoded.lease
+			c.display.publish(frame, time.Now())
 		}
-		g.reason = cacheDetailReason(reason)
 	}
-	var previous statusStamp
-	unchanged := false
-	if old := c.cacheGate.Load(); old != nil {
-		previous = old.stamp
-		unchanged = old.matches(g.binding) && g.matches(old.binding) && old.reason == g.reason
-	}
-	var valid bool
-	g.stamp, valid = advanceStatusStamp(previous, nodeEpoch, unchanged)
-	if !valid {
-		g.reason = "source_unavailable"
-	}
-	c.cacheGate.Store(&g)
+	return reason
 }
 
-// observeReplayDetailStatus publishes detached context to the replay reader.
+// observeReplayDetailStatus publishes detached context after status encoding.
+// The detail worker never reads the collection loop's mutable last pointer.
 func (c *collector) observeReplayDetailStatus(state, reason string, receivedAt time.Time, nodeEpoch uint64) {
 	g := replayDetailGate{ObservedAt: receivedAt, State: state, Reason: reason}
 	if c.last != nil {
@@ -523,6 +555,8 @@ func (c *collector) observeReplayDetailStatus(state, reason string, receivedAt t
 			g.State, g.Reason = "unavailable", "waiting_source"
 		}
 	}
+	// Keep a reader-local revision across A -> B -> A changes while a detail
+	// collection is in flight. Ordinary status refreshes do not advance it.
 	g.revision = 1
 	var previous statusStamp
 	unchanged := false
@@ -549,7 +583,8 @@ func (c *collector) observeReplayDetailStatus(state, reason string, receivedAt t
 	c.detailGate.Store(&g)
 }
 
-// observeNetworkDetailStatus publishes detached status context for the reader.
+// observeNetworkDetailStatus publishes only detached status context. The
+// network reader never accesses the collection loop's mutable last pointer.
 func (c *collector) observeNetworkDetailStatus(state, reason string, receivedAt time.Time, nodeEpoch uint64) {
 	g := networkDetailGate{observedAt: receivedAt, reason: "source_unavailable", nodeReason: "source_unavailable"}
 	if c.last != nil {
@@ -581,6 +616,86 @@ func (c *collector) observeNetworkDetailStatus(state, reason string, receivedAt 
 	c.networkGate.Store(&g)
 }
 
+// observeCacheDetailStatus copies accepted node context after status encoding.
+// The cache reader never accesses the collection loop's mutable last pointer.
+func (c *collector) observeCacheDetailStatus(state, reason string, receivedAt time.Time, nodeEpoch uint64) {
+	g := cacheDetailGate{observedAt: receivedAt, reason: "source_unavailable"}
+	if c.last != nil {
+		g = cacheGate(*c.last, receivedAt)
+	}
+	if state != "fresh" {
+		if reason == "" {
+			reason = "status_stale"
+		}
+		g.reason = cacheDetailReason(reason)
+	}
+	var previous statusStamp
+	unchanged := false
+	if old := c.cacheGate.Load(); old != nil {
+		previous = old.stamp
+		unchanged = old.matches(g.binding) && g.matches(old.binding) && old.reason == g.reason
+	}
+	var valid bool
+	g.stamp, valid = advanceStatusStamp(previous, nodeEpoch, unchanged)
+	if !valid {
+		g.reason = "source_unavailable"
+	}
+	c.cacheGate.Store(&g)
+}
+
+// observeProductionDetailStatus copies only role and node context. Producer
+// generation remains private-detail state discovered by the reader.
+func (c *collector) observeProductionDetailStatus(state, reason string, receivedAt time.Time, nodeEpoch uint64) {
+	g := productionDetailGate{observedAt: receivedAt, reason: "source_unavailable"}
+	if c.last != nil {
+		g = productionGate(*c.last, receivedAt)
+	}
+	if state != "fresh" {
+		if reason == "" {
+			reason = "status_stale"
+		}
+		g.reason = productionDetailReason(reason)
+	}
+	var previous statusStamp
+	unchanged := false
+	if old := c.productionGate.Load(); old != nil {
+		previous = old.stamp
+		unchanged = sameProductionNode(*old, g) && old.reason == g.reason
+	}
+	var valid bool
+	g.stamp, valid = advanceStatusStamp(previous, nodeEpoch, unchanged)
+	if !valid {
+		g.reason = "source_unavailable"
+	}
+	c.productionGate.Store(&g)
+}
+
+// observeStorageDetailStatus publishes detached node context, not DB reads.
+func (c *collector) observeStorageDetailStatus(state, reason string, receivedAt time.Time, nodeEpoch uint64) {
+	g := storageDetailGate{observedAt: receivedAt, reason: "source_unavailable"}
+	if c.last != nil {
+		g = storageGate(*c.last, receivedAt)
+	}
+	if state != "fresh" {
+		if reason == "" {
+			reason = "status_stale"
+		}
+		g.reason = storageDetailReason(reason)
+	}
+	var previous statusStamp
+	unchanged := false
+	if old := c.storageGate.Load(); old != nil {
+		previous = old.stamp
+		unchanged = sameStorageNode(*old, g) && old.reason == g.reason
+	}
+	var valid bool
+	g.stamp, valid = advanceStatusStamp(previous, nodeEpoch, unchanged)
+	if !valid {
+		g.reason = "source_unavailable"
+	}
+	c.storageGate.Store(&g)
+}
+
 func (c *collector) encode(s *Snapshot, state string, now time.Time) (*frameSet, error) {
 	if !c.public {
 		messages, err := frames(s, state, now)
@@ -596,7 +711,11 @@ func (c *collector) encode(s *Snapshot, state string, now time.Time) (*frameSet,
 	if c.publicOptions.Peers {
 		peers = publicPeers(s, state, now)
 	}
-	b, err := encodePublicSnapshot(s, state, now, &throughput, resources, peers)
+	var harmonic *PublicHarmonic
+	if c.publicOptions.Harmonic && c.publicOptions.Resources {
+		harmonic = publicHarmonic(s, state, now)
+	}
+	b, err := encodePublicSnapshot(s, state, now, &throughput, resources, peers, harmonic)
 	if err != nil {
 		return nil, err
 	}
@@ -605,7 +724,7 @@ func (c *collector) encode(s *Snapshot, state string, now time.Time) (*frameSet,
 		return nil, err
 	}
 	result := &frameSet{messages: [][]byte{frame}, publicJSON: b}
-	advanced, advancedErr := encodePublicSnapshotProfile(s, state, now, &throughput, resources, peers, 4)
+	advanced, advancedErr := encodePublicSnapshotProfile(s, state, now, &throughput, resources, peers, harmonic, 4)
 	if advancedErr == nil {
 		advancedFrame, frameErr := json.Marshal(message{Topic: "mithril", Key: "public", Value: json.RawMessage(advanced)})
 		if frameErr == nil {
@@ -614,7 +733,7 @@ func (c *collector) encode(s *Snapshot, state string, now time.Time) (*frameSet,
 	}
 	result.advancedUnavailable = result.advancedPublicJSON == nil
 	if s != nil && s.SnapshotManifests != nil {
-		enhanced, err := encodePublicSnapshotProfile(s, state, now, &throughput, resources, peers, 1)
+		enhanced, err := encodePublicSnapshotProfile(s, state, now, &throughput, resources, peers, harmonic, 1)
 		if err == nil {
 			enhancedFrame, frameErr := json.Marshal(message{Topic: "mithril", Key: "public", Value: json.RawMessage(enhanced)})
 			if frameErr == nil {
@@ -624,7 +743,7 @@ func (c *collector) encode(s *Snapshot, state string, now time.Time) (*frameSet,
 		if s.SnapshotManifests.ReadyMarker == nil {
 			result.readyPublicJSON, result.readyMessages = result.manifestPublicJSON, result.manifestMessages
 		} else {
-			ready, err := encodePublicSnapshotProfile(s, state, now, &throughput, resources, peers, 2)
+			ready, err := encodePublicSnapshotProfile(s, state, now, &throughput, resources, peers, harmonic, 2)
 			if err == nil {
 				readyFrame, frameErr := json.Marshal(message{Topic: "mithril", Key: "public", Value: json.RawMessage(ready)})
 				if frameErr == nil {
@@ -633,12 +752,12 @@ func (c *collector) encode(s *Snapshot, state string, now time.Time) (*frameSet,
 			}
 		}
 	}
-	safety, err := encodePublicSnapshotProfile(s, state, now, &throughput, resources, peers, 3)
+	safety, err := encodePublicSnapshotProfile(s, state, now, &throughput, resources, peers, harmonic, 3)
 	if err != nil {
 		// Never replace a failed v3 projection with a seemingly fresh older
 		// profile that omits its independent safety-fault observation.
 		result.safetyUnavailable = true
-		safety, err = encodePublicSnapshotProfile(nil, "unavailable", now, nil, nil, nil, 3)
+		safety, err = encodePublicSnapshotProfile(nil, "unavailable", now, nil, nil, nil, nil, 3)
 		if err != nil {
 			return nil, err
 		}
@@ -652,23 +771,29 @@ func (c *collector) encode(s *Snapshot, state string, now time.Time) (*frameSet,
 }
 
 // Serve connects to one fixed local node feed. The browser cannot select a
-// source, filesystem path, RPC method or node operation. Sharing requires a
-// separately configured authenticated proxy; this listener is loopback-only.
+// source, filesystem path, RPC method or node operation. This listener is
+// loopback-only and rejects proxy-marked requests. Use SSH forwarding for
+// private access, or configure the public projection for a reverse proxy.
 func Serve(ctx context.Context, socket, address string) error {
-	return listen(ctx, socket, address, "", PublicOptions{})
+	return listen(ctx, socket, address, "", PublicOptions{}, false)
 }
 
 // PublicOptions enables additional disclosure. All fields default off.
 type PublicOptions struct {
-	ReplayDetails  bool
-	CacheDetails   bool
-	Resources      bool
-	Peers          bool
-	NetworkDetails bool
-	MachineDetails bool
-	LocalPeers     bool
-	HistoryDir     string
-	ClusterFile    string
+	Resources         bool
+	Peers             bool
+	LocalPeers        bool
+	ReplayDetails     bool
+	FastExecuted      bool
+	NetworkDetails    bool
+	CacheDetails      bool
+	ProductionDetails bool
+	StorageDetails    bool
+	MachineDetails    bool
+	ReceptionHistory  bool
+	Harmonic          bool
+	HistoryDir        string
+	ClusterFile       string
 }
 
 // ServePublic serves an explicitly enabled public projection on loopback.
@@ -679,6 +804,14 @@ func ServePublic(ctx context.Context, socket, address, origin string) error {
 
 // ServePublicWithOptions adds only the explicitly enabled public data groups.
 func ServePublicWithOptions(ctx context.Context, socket, address, origin string, options PublicOptions) error {
+	if err := ValidateManagedOrigin(origin); err != nil {
+		return err
+	}
+	return listen(ctx, socket, address, origin, options, false)
+}
+
+// ValidatePublicOrigin checks the exact HTTPS origin used by the reader and gateway.
+func ValidatePublicOrigin(origin string) error {
 	u, err := url.Parse(origin)
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.Hostname() == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.ForceQuery || strings.Contains(origin, "#") || strings.ContainsAny(u.Host, "\\ \t\r\n") {
 		return errors.New("dashboard public origin must be an HTTPS origin")
@@ -691,22 +824,29 @@ func ServePublicWithOptions(ctx context.Context, socket, address, origin string,
 	} else if strings.HasSuffix(u.Host, ":") {
 		return errors.New("dashboard public origin has an invalid port")
 	}
-	return listen(ctx, socket, address, origin, options)
+	return nil
 }
 
-func listen(ctx context.Context, socket, address, origin string, options PublicOptions) error {
+func validateReaderAddress(socket, address string) error {
 	if !filepath.IsAbs(socket) {
 		return errors.New("dashboard node socket must be an absolute path")
 	}
 	host, _, err := net.SplitHostPort(address)
-	if err != nil || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() {
+	if err != nil || !net.ParseIP(host).IsLoopback() {
 		return errors.New("dashboard address must be a loopback IP and port")
+	}
+	return nil
+}
+
+func listen(ctx context.Context, socket, address, origin string, options PublicOptions, fromNode bool) error {
+	if err := validateReaderAddress(socket, address); err != nil {
+		return err
 	}
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		return err
 	}
-	return serveProfile(ctx, socket, listener, origin, options)
+	return serveReader(ctx, socket, listener, origin, options, fromNode)
 }
 
 func serve(ctx context.Context, socket string, listener net.Listener) error {
@@ -714,33 +854,59 @@ func serve(ctx context.Context, socket string, listener net.Listener) error {
 }
 
 func serveProfile(ctx context.Context, socket string, listener net.Listener, origin string, options PublicOptions) error {
+	return serveReader(ctx, socket, listener, origin, options, false)
+}
+
+func serveReader(ctx context.Context, socket string, listener net.Listener, origin string, options PublicOptions, fromNode bool) error {
 	defer listener.Close()
+	if options.FastExecuted && !options.ReplayDetails {
+		return errors.New("dashboard fast execution observations require replay details")
+	}
+	if options.LocalPeers && origin == "" {
+		return errors.New("dashboard local peers require the public profile")
+	}
+	if options.ReceptionHistory && (origin == "" || !options.Resources || !options.ReplayDetails || !options.NetworkDetails) {
+		return errors.New("dashboard reception history requires the public profile and resource, replay and network disclosure")
+	}
 	if options.ReplayDetails && (origin == "" || !options.Resources) {
 		return errors.New("dashboard replay details require the public profile and resource disclosure")
-	}
-	if options.CacheDetails && (origin == "" || !options.Resources) {
-		return errors.New("dashboard cache details require the public profile and resource disclosure")
 	}
 	if options.NetworkDetails && (origin == "" || !options.Resources) {
 		return errors.New("dashboard network details require the public profile and resource disclosure")
 	}
+	if options.CacheDetails && (origin == "" || !options.Resources) {
+		return errors.New("dashboard cache details require the public profile and resource disclosure")
+	}
+	if options.ProductionDetails && (origin == "" || !options.Resources) {
+		return errors.New("dashboard production details require the public profile and resource disclosure")
+	}
+	if options.StorageDetails && (origin == "" || !options.Resources) {
+		return errors.New("dashboard storage details require the public profile and resource disclosure")
+	}
 	if options.MachineDetails && (origin == "" || !options.Resources) {
 		return errors.New("dashboard machine details require the public profile and resource disclosure")
 	}
-	if options.LocalPeers && origin == "" {
-		return errors.New("dashboard local peers require the public profile")
+	if options.Harmonic && (origin == "" || !options.Resources) {
+		return errors.New("dashboard harmonic data require the public profile and resource disclosure")
+	}
+	if (options.HistoryDir != "" || options.ClusterFile != "") && origin == "" {
+		return errors.New("dashboard history and cluster data require the public profile")
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	c := newCollector(socket)
 	c.public = origin != ""
 	c.publicOptions = options
-	defer c.client.CloseIdleConnections()
-	if (options.HistoryDir != "" || options.ClusterFile != "") && origin == "" {
-		return errors.New("dashboard history and cluster data require a public profile")
+	if fromNode {
+		c.expectedOrigin = origin
 	}
+	defer c.client.CloseIdleConnections()
+	initial, err := c.encode(nil, "unavailable", time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	c.latest.Store(initial)
 	if options.HistoryDir != "" {
-		var err error
 		c.history, err = newHistoryService(options.HistoryDir, options.Resources)
 		if err != nil {
 			return err
@@ -750,25 +916,19 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 	}
 	var external *clusterReader
 	if options.ClusterFile != "" {
-		var err error
 		external, err = newClusterReader(ctx, options.ClusterFile)
 		if err != nil {
 			return err
 		}
 		defer external.close()
-	}
-	var network *networkDetailReader
-	var caches *cacheDetailReader
-	if options.CacheDetails {
-		var err error
-		caches, err = newCacheDetailReader(c.client, &c.cacheGate)
-		if err != nil {
-			return err
+		c.external, c.display = external, &nodeDisplayOwner{}
+		display := c.display
+		display.admit = func(frame nodeDisplayFrame) (time.Duration, bool) {
+			return c.admitNodeDisplay(display, frame)
 		}
 	}
 	var details *replayDetailReader
 	if options.ReplayDetails {
-		var err error
 		details, err = newReplayDetailReader(c.client, &c.detailGate)
 		if err != nil {
 			return err
@@ -778,9 +938,16 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 			manifestLimit: rate.NewLimiter(4, 8), dataLimit: rate.NewLimiter(0.2, 2), active: make(chan struct{}, 2)}
 		details.selected = &selectedWindowReader{client: details.client, gate: &c.detailGate,
 			limit: rate.NewLimiter(16, 32), active: make(chan struct{}, 4)}
+		details.selected.activity, err = newActivityHistoryReader(details.selected)
+		if err != nil {
+			return err
+		}
+		if options.FastExecuted {
+			c.fast = newFastExecutedReader(c.client, &c.detailGate)
+		}
 	}
+	var network *networkDetailReader
 	if options.NetworkDetails {
-		var err error
 		network, err = newNetworkDetailReader(c.client, &c.networkGate)
 		if err != nil {
 			return err
@@ -789,8 +956,38 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 			return c.admitNetworkDetail(network, reply, statusNetworkNode)
 		}
 	}
+	var caches *cacheDetailReader
+	if options.CacheDetails {
+		caches, err = newCacheDetailReader(c.client, &c.cacheGate)
+		if err != nil {
+			return err
+		}
+	}
+	var production *productionDetailReader
+	if options.ProductionDetails {
+		production, err = newProductionDetailReader(c.client, &c.productionGate)
+		if err != nil {
+			return err
+		}
+	}
+	var storage *storageDetailReader
+	if options.StorageDetails {
+		storage, err = newStorageDetailReader(c.client, &c.storageGate)
+		if err != nil {
+			return err
+		}
+	}
+	var reception *receptionHistoryReader
+	if options.ReceptionHistory {
+		reception, err = newReceptionHistoryReader(c.client, &c.receptionGate)
+		if err != nil {
+			return err
+		}
+		reception.admitStatus = func(selected receptionPublicSelection) (time.Duration, bool) {
+			return c.admitReceptionHistory(reception, selected)
+		}
+	}
 	if options.MachineDetails {
-		var err error
 		c.machine, err = newMachineDetailReader(c.client)
 		if err != nil {
 			return err
@@ -798,7 +995,6 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 	}
 	var localPeers *localPeerReader
 	if options.LocalPeers {
-		var err error
 		localPeers, err = newLocalPeerReader(c.client, &c.localPeerGate)
 		if err != nil {
 			return err
@@ -807,23 +1003,38 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 			return c.admitLocalPeers(localPeers, reply)
 		}
 	}
-	initial, err := c.encode(nil, "unavailable", time.Now().UTC())
-	if err != nil {
-		return err
-	}
-	c.latest.Store(initial)
 	collected := make(chan struct{})
+	originChanged := false
+	poll := func() {
+		if c.poll(ctx, time.Now().UTC()) == readerOriginChanged {
+			originChanged = true
+			cancel()
+		}
+	}
 	go func() {
 		defer close(collected)
-		c.poll(ctx, time.Now().UTC())
+		poll()
 		if details != nil {
 			go details.run(ctx)
+			go details.selected.activity.run(ctx)
+		}
+		if c.fast != nil {
+			go c.fast.run(ctx)
+		}
+		if network != nil {
+			go network.run(ctx)
 		}
 		if caches != nil {
 			go caches.run(ctx)
 		}
-		if network != nil {
-			go network.run(ctx)
+		if production != nil {
+			go production.run(ctx)
+		}
+		if storage != nil {
+			go storage.run(ctx)
+		}
+		if reception != nil {
+			go reception.run(ctx)
 		}
 		if c.machine != nil {
 			go c.machine.run(ctx)
@@ -838,18 +1049,30 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				c.poll(ctx, time.Now().UTC())
+				poll()
 			}
 		}
 	}()
 	if details != nil {
-		defer func() { cancel(); <-details.done }()
+		defer func() { cancel(); <-details.done; <-details.selected.activity.done }()
+	}
+	if c.fast != nil {
+		defer func() { cancel(); <-c.fast.done }()
+	}
+	if network != nil {
+		defer func() { cancel(); <-network.done }()
 	}
 	if caches != nil {
 		defer func() { cancel(); <-caches.done }()
 	}
-	if network != nil {
-		defer func() { cancel(); <-network.done }()
+	if production != nil {
+		defer func() { cancel(); <-production.done }()
+	}
+	if storage != nil {
+		defer func() { cancel(); <-storage.done }()
+	}
+	if reception != nil {
+		defer func() { cancel(); <-reception.done }()
 	}
 	if c.machine != nil {
 		defer func() { cancel(); <-c.machine.done }()
@@ -873,27 +1096,33 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 	upgrader := websocket.Upgrader{HandshakeTimeout: 2 * time.Second, ReadBufferSize: 1024, WriteBufferSize: 4096,
 		CheckOrigin: allowed}
 	mux := http.NewServeMux()
+	var receptionHandler http.HandlerFunc
+	var displayHandler http.HandlerFunc
 	var machineHandler http.HandlerFunc
 	var localPeerHandler http.HandlerFunc
 	if c.public {
-		features, _ := json.Marshal(struct {
+		legacyFeatures, _ := json.Marshal(struct {
 			SchemaVersion int  `json:"schema_version"`
 			History       bool `json:"history"`
 			Cluster       bool `json:"cluster"`
 			NodeDisplay   bool `json:"node_display,omitempty"`
 		}{1, c.history != nil, external != nil, false})
-		advancedFeatures, _ := json.Marshal(struct {
+		features, _ := json.Marshal(struct {
 			SchemaVersion        int  `json:"schema_version"`
 			History              bool `json:"history"`
 			Cluster              bool `json:"cluster"`
-			NetworkDetails       bool `json:"network_details,omitempty"`
-			MachineDetails       bool `json:"machine_details,omitempty"`
-			LocalPeers           bool `json:"local_peers,omitempty"`
 			ReplayDetails        bool `json:"replay_details,omitempty"`
+			NetworkDetails       bool `json:"network_details,omitempty"`
 			CacheDetails         bool `json:"cache_details,omitempty"`
+			ProductionDetails    bool `json:"production_details,omitempty"`
+			StorageDetails       bool `json:"storage_details,omitempty"`
 			RootedHistoryDetails bool `json:"rooted_history_details,omitempty"`
 			HeldScheduleDetails  bool `json:"held_schedule_details,omitempty"`
-		}{1, c.history != nil, external != nil, network != nil, c.machine != nil, localPeers != nil, details != nil, caches != nil, details != nil, details != nil})
+			ReceptionHistory     bool `json:"reception_history,omitempty"`
+			NodeDisplay          bool `json:"node_display,omitempty"`
+			MachineDetails       bool `json:"machine_details,omitempty"`
+			LocalPeers           bool `json:"local_peers,omitempty"`
+		}{1, c.history != nil, external != nil, details != nil, network != nil, caches != nil, production != nil, storage != nil, details != nil, details != nil, reception != nil, c.display != nil, c.machine != nil, localPeers != nil})
 		mux.HandleFunc("/api/v1/features", func(w http.ResponseWriter, r *http.Request) {
 			if !allowed(r) {
 				http.Error(w, "host or origin not allowed", http.StatusForbidden)
@@ -905,9 +1134,9 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 			}
 			w.Header().Set("Content-Type", "application/json")
 			if r.URL.RawQuery == advancedProfileQuery {
-				_, _ = w.Write(advancedFeatures)
-			} else {
 				_, _ = w.Write(features)
+			} else {
+				_, _ = w.Write(legacyFeatures)
 			}
 		})
 		if external != nil {
@@ -915,20 +1144,21 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 			mux.HandleFunc("/api/v1/cluster-map", external.handler(allowed, clusterMapRoute))
 			mux.HandleFunc("/api/v1/cluster-versions", external.handler(allowed, clusterVersionsRoute))
 			mux.HandleFunc("/api/v1/cluster-performance-history", external.handler(allowed, clusterPerformanceHistoryRoute))
+			displayHandler = c.display.handler(allowed)
+			mux.HandleFunc(nodeDisplayPublicPath, displayHandler)
 		}
 		if c.history != nil {
 			mux.HandleFunc("/api/v1/history", c.history.handler(allowed))
 		}
 		if details != nil {
-			admit := func(stamp statusStamp, gate func() (statusStamp, bool)) (time.Duration, bool) {
-				return c.admitLiveDetail(statusReplay, stamp, gate, time.Now())
-			}
 			scheduleHandler := func(w http.ResponseWriter, r *http.Request) {
 				if !allowed(r) {
 					http.Error(w, "host or origin not allowed", http.StatusForbidden)
 					return
 				}
-				details.held.serveHTTP(w, r, admit)
+				details.held.serveHTTP(w, r, func(stamp statusStamp, readGate func() (statusStamp, bool)) (time.Duration, bool) {
+					return c.admitLiveDetail(statusReplay, stamp, readGate, time.Now())
+				})
 			}
 			mux.HandleFunc("/api/v1/details/schedule", scheduleHandler)
 			mux.HandleFunc("/api/v1/details/schedule/", scheduleHandler)
@@ -937,32 +1167,56 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 					http.Error(w, "host or origin not allowed", http.StatusForbidden)
 					return
 				}
-				details.rooted.serveHTTP(w, r, admit)
+				details.rooted.serveHTTP(w, r, func(stamp statusStamp, readGate func() (statusStamp, bool)) (time.Duration, bool) {
+					return c.admitLiveDetail(statusReplay, stamp, readGate, time.Now())
+				})
 			})
 			mux.HandleFunc("/api/v1/details/replay", func(w http.ResponseWriter, r *http.Request) {
 				if !allowed(r) {
 					http.Error(w, "host or origin not allowed", http.StatusForbidden)
 					return
 				}
-				details.serveHTTP(w, r, admit)
-			})
-			mux.HandleFunc("/api/v1/details/selected", func(w http.ResponseWriter, r *http.Request) {
-				if !allowed(r) {
-					http.Error(w, "host or origin not allowed", http.StatusForbidden)
-					return
-				}
-				details.selected.serveHTTP(w, r, admit)
-			})
-		}
-		if caches != nil {
-			mux.HandleFunc("/api/v1/details/cache", func(w http.ResponseWriter, r *http.Request) {
-				if !allowed(r) {
-					http.Error(w, "host or origin not allowed", http.StatusForbidden)
-					return
-				}
-				caches.serveHTTP(w, r, func(reply cacheDetailReply) (time.Duration, bool) {
-					return c.admitCacheDetail(caches, reply)
+				details.serveHTTP(w, r, func(stamp statusStamp, readGate func() (statusStamp, bool)) (time.Duration, bool) {
+					return c.admitLiveDetail(statusReplay, stamp, readGate, time.Now())
 				})
+			})
+			selectedHandler := func(w http.ResponseWriter, r *http.Request) {
+				if !allowed(r) {
+					http.Error(w, "host or origin not allowed", http.StatusForbidden)
+					return
+				}
+				details.selected.serveHTTP(w, r, func(stamp statusStamp, readGate func() (statusStamp, bool)) (time.Duration, bool) {
+					return c.admitLiveDetail(statusReplay, stamp, readGate, time.Now())
+				})
+			}
+			mux.HandleFunc("/api/v1/details/selected", selectedHandler)
+			mux.HandleFunc("/api/v1/details/selected-window", selectedHandler)
+			mux.HandleFunc("/api/v1/details/activity-history", func(w http.ResponseWriter, r *http.Request) {
+				if !allowed(r) {
+					http.Error(w, "host or origin not allowed", http.StatusForbidden)
+					return
+				}
+				details.selected.activity.serveHTTP(w, r, func(stamp statusStamp, readGate func() (statusStamp, bool)) (time.Duration, bool) {
+					return c.admitLiveDetail(statusReplay, stamp, readGate, time.Now())
+				})
+			})
+			if c.fast != nil {
+				mux.HandleFunc("/api/v1/details/recent-executed", func(w http.ResponseWriter, r *http.Request) {
+					if !allowed(r) {
+						http.Error(w, "host or origin not allowed", http.StatusForbidden)
+						return
+					}
+					c.fast.serveHTTP(w, r, c)
+				})
+			}
+		}
+		if network != nil {
+			mux.HandleFunc("/api/v1/details/network", func(w http.ResponseWriter, r *http.Request) {
+				if !allowed(r) {
+					http.Error(w, "host or origin not allowed", http.StatusForbidden)
+					return
+				}
+				network.serveHTTP(w, r)
 			})
 		}
 		if localPeers != nil {
@@ -975,14 +1229,50 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 			}
 			mux.HandleFunc(localPeerPublicPath, localPeerHandler)
 		}
-		if network != nil {
-			mux.HandleFunc("/api/v1/details/network", func(w http.ResponseWriter, r *http.Request) {
+		if caches != nil {
+			mux.HandleFunc("/api/v1/details/cache", func(w http.ResponseWriter, r *http.Request) {
 				if !allowed(r) {
 					http.Error(w, "host or origin not allowed", http.StatusForbidden)
 					return
 				}
-				network.serveHTTP(w, r)
+				caches.serveHTTP(w, r, func(reply cacheDetailReply) (time.Duration, bool) {
+					return c.admitCacheDetail(caches, reply)
+				})
 			})
+		}
+		if production != nil {
+			mux.HandleFunc("/api/v1/details/production", func(w http.ResponseWriter, r *http.Request) {
+				if !allowed(r) {
+					http.Error(w, "host or origin not allowed", http.StatusForbidden)
+					return
+				}
+				production.serveHTTP(w, r, func(reply productionDetailReply) (time.Duration, bool) {
+					return c.admitProductionDetail(production, reply)
+				})
+			})
+		}
+		if storage != nil {
+			mux.HandleFunc("/api/v1/details/storage", func(w http.ResponseWriter, r *http.Request) {
+				if !allowed(r) {
+					http.Error(w, "host or origin not allowed", http.StatusForbidden)
+					return
+				}
+				storage.serveHTTP(w, r, func(reply storageDetailReply) (time.Duration, bool) {
+					return c.admitStorageDetail(storage, reply)
+				})
+			})
+		}
+		if reception != nil {
+			cached := reception.publicHandler()
+			receptionHandler = func(w http.ResponseWriter, r *http.Request) {
+				if !allowed(r) {
+					http.Error(w, "host or origin not allowed", http.StatusForbidden)
+					return
+				}
+				cached(w, r)
+			}
+			mux.HandleFunc(receptionHistoryPublicPath, receptionHandler)
+			mux.HandleFunc(receptionHistoryPublicPath+"/", receptionHandler)
 		}
 		if c.machine != nil {
 			machineHandler = func(w http.ResponseWriter, r *http.Request) {
@@ -1034,7 +1324,9 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 		})
 	}
 	mux.HandleFunc("/websocket", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || (r.URL.RawQuery != "" && (!c.public || snapshotProfile(r.URL.RawQuery) == 0)) || c.public && r.URL.ForceQuery || r.ContentLength != 0 || len(r.TransferEncoding) != 0 {
+		fastV2 := c.public && c.fast != nil && r.URL.RawQuery == fastExecutedV2Query
+		fastV1 := c.public && c.fast != nil && r.URL.RawQuery == fastExecutedV1Query
+		if r.Method != http.MethodGet || (r.URL.RawQuery != "" && !fastV1 && !fastV2 && (!c.public || snapshotProfile(r.URL.RawQuery) == 0)) || c.public && r.URL.ForceQuery || r.ContentLength != 0 || len(r.TransferEncoding) != 0 {
 			http.Error(w, "unsupported request", http.StatusBadRequest)
 			return
 		}
@@ -1062,6 +1354,10 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 		sessions.Add(1)
 		sessionMu.Unlock()
 		defer sessions.Done()
+		if fastV1 || fastV2 {
+			streamFastExecutedV2(ctx, conn, c, fastV2)
+			return
+		}
 		streamProfile(ctx, conn, c, snapshotProfile(r.URL.RawQuery))
 	})
 	var handler http.Handler = mux
@@ -1069,6 +1365,16 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Cache-Control", "no-store")
 			w.Header().Set("X-Content-Type-Options", "nosniff")
+			// Validate this closed grammar before ServeMux can redirect a dirty
+			// path into a different, canonical request. Other routes are unchanged.
+			if displayHandler != nil && (r.URL.Path == nodeDisplayPublicPath || strings.HasPrefix(r.URL.Path, nodeDisplayPublicPath+"/") || path.Clean(r.URL.Path) == nodeDisplayPublicPath) {
+				displayHandler(w, r)
+				return
+			}
+			if receptionHandler != nil && (r.URL.Path == receptionHistoryPublicPath || strings.HasPrefix(r.URL.Path, receptionHistoryPublicPath+"/")) {
+				receptionHandler(w, r)
+				return
+			}
 			if machineHandler != nil && (r.URL.Path == machineDetailPublicPath || strings.HasPrefix(r.URL.Path, machineDetailPublicPath+"/") || path.Clean(r.URL.Path) == machineDetailPublicPath) {
 				machineHandler(w, r)
 				return
@@ -1083,6 +1389,9 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 2 * time.Second, ReadTimeout: 5 * time.Second,
 		WriteTimeout: 5 * time.Second, IdleTimeout: 5 * time.Second, MaxHeaderBytes: 4096}
 	stopped := make(chan struct{})
+	if fromNode {
+		slog.Info("dashboard reader listening", "url", origin, "upstream", listener.Addr().String())
+	}
 	go func() { <-ctx.Done(); _ = server.Close(); close(stopped) }()
 	err = server.Serve(netutil.LimitListener(inputLimitedListener{listener}, 32))
 	sessionMu.Lock()
@@ -1094,6 +1403,9 @@ func serveProfile(ctx context.Context, socket string, listener net.Listener, ori
 	// HTTP Close does not join hijacked handlers. Closing the admission gate
 	// before waiting prevents a concurrent upgrade from adding a late session.
 	sessions.Wait()
+	if originChanged {
+		return errors.New("dashboard feed origin changed or was removed; restart the managed reader to reload it")
+	}
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
@@ -1134,8 +1446,10 @@ func allowedRequest(r *http.Request, port string) bool {
 }
 
 var optionalPrivateFrames = [...]struct{ prefix, clear []byte }{
+	{[]byte(`{"topic":"mithril","key":"harmonic",`), []byte(`{"topic":"mithril","key":"harmonic","value":null}`)},
 	{[]byte(`{"topic":"mithril","key":"snapshot_archive",`), []byte(`{"topic":"mithril","key":"snapshot_archive","value":null}`)},
 	{[]byte(`{"topic":"mithril","key":"incremental_archive",`), []byte(`{"topic":"mithril","key":"incremental_archive","value":null}`)},
+	{[]byte(`{"topic":"mithril","key":"snapshot_shard_flush",`), []byte(`{"topic":"mithril","key":"snapshot_shard_flush","value":null}`)},
 }
 
 func hasPrivateFrame(messages [][]byte, prefix []byte) bool {
@@ -1204,6 +1518,34 @@ func watchStatusFrames(conn *websocket.Conn, profile int, active, writing *atomi
 			timer.Stop()
 		}
 	}
+}
+
+// currentFastHint reselects once if a publication changes after selection.
+// A nil publication with settled=true means stable unavailability;
+// settled=false requires the caller to close rather than retain old data.
+func (c *collector) currentFastHint(p *fastExecutedPublication) (*fastExecutedPublication, time.Duration, bool) {
+	for range 2 {
+		remaining, admitted := time.Duration(0), false
+		if p != nil {
+			remaining, admitted = c.admitLiveDetail(statusReplay, p.stamp, func() (statusStamp, bool) {
+				g := c.detailGate.Load()
+				if g == nil {
+					return statusStamp{}, false
+				}
+				now := time.Now()
+				return g.stamp, c.fast.latest.Load() == p && p.freshUntil.After(now) && fastMatchesGate(p.value, g, now)
+			}, time.Now())
+		}
+		if !admitted || p == nil || !p.freshUntil.After(time.Now()) {
+			if latest := c.fast.latest.Load(); latest != p {
+				p = latest
+				continue
+			}
+			return nil, 0, true
+		}
+		return p, remaining, true
+	}
+	return nil, 0, false
 }
 
 func streamProfile(ctx context.Context, conn *websocket.Conn, c *collector, profile int) {
@@ -1400,6 +1742,46 @@ func streamProfile(ctx context.Context, conn *websocket.Conn, c *collector, prof
 	if !send() {
 		return
 	}
+	var fastChanged <-chan struct{}
+	var lastFast *fastExecutedPublication
+	sendFast := func() bool {
+		if !c.public || profile != 4 || c.fast == nil {
+			return true
+		}
+		if change := c.fast.changed.Load(); change != nil {
+			fastChanged = change.changed
+		}
+		p, remaining, settled := c.currentFastHint(c.fast.latest.Load())
+		if !settled {
+			return false
+		}
+		if p == nil {
+			if lastFast == nil {
+				return true
+			}
+			lastFast = nil
+			return write(websocket.TextMessage, []byte(`{"topic":"mithril","key":"recent_executed","value":null}`))
+		}
+		if p == lastFast {
+			return true
+		}
+		remaining = min(remaining, time.Until(p.freshUntil))
+		if remaining.Milliseconds() < 1 {
+			return false
+		}
+		deadline := time.Now().Add(remaining)
+		body := []byte(`{"topic":"mithril","key":"recent_executed","value":true}`)
+		_ = conn.SetWriteDeadline(deadline)
+		err := conn.WriteMessage(websocket.TextMessage, body)
+		if err != nil {
+			return false
+		}
+		lastFast = p
+		return true
+	}
+	if !sendFast() {
+		return
+	}
 	tick := time.NewTicker(SampleInterval)
 	defer tick.Stop()
 	ping := time.NewTicker(20 * time.Second)
@@ -1426,8 +1808,18 @@ func streamProfile(ctx context.Context, conn *websocket.Conn, c *collector, prof
 			if !send() {
 				return
 			}
+			if !sendFast() {
+				return
+			}
+		case <-fastChanged:
+			if !sendFast() {
+				return
+			}
 		case <-tick.C:
 			if !send() {
+				return
+			}
+			if !sendFast() {
 				return
 			}
 		case <-ping.C:

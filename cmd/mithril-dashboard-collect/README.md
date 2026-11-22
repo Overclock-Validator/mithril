@@ -12,16 +12,19 @@ For Solana mainnet-beta, use `--profile mainnet` for the Solana public RPC or
 `--profile mainnet-publicnode` for the PublicNode RPC. Both profiles check the
 mainnet genesis and epoch before and after capture. Mainnet directory rows come
 from vote accounts; version and country information comes from matching gossip
-contacts when available. FAST, inclusion and skip-rate data are unavailable.
-
-Add `--performance-sample` for one recent RPC sample, or
-`--performance-history` for up to 120 samples.
+contacts when available. This profile reports directory and RPC observations.
 
 Provision the directory and reader group separately. The cache is written with
 mode `0640`; a setgid directory can supply the intended reader group. A scheduler
 may invoke the command periodically (for example once per minute). Do not run it
 per viewer request or give the network-denied reader outbound access. There is
 no arbitrary endpoint flag. An existing destination symlink is refused.
+
+Updated captures may include the optional `rpc_nodes` aggregate. Upgrade every
+strict reader sharing this cache before running the updated collector; older
+readers reject the added field. For rollback, stop the new writer and obtain a
+fresh legacy-shaped snapshot before reverting readers. An expired older cache
+must not be relabelled fresh.
 
 For the community profile, exit 0 means every supported provider was fresh. For
 mainnet, it means the RPC capture was fresh; inspect the GeoIP state separately.
@@ -34,12 +37,11 @@ The community profile uses a fixed cluster genesis. RPC genesis and epoch are
 checked before and after capture. Provider names and versions are untrusted
 public metadata, not operator identity verification.
 
-For the community profile, SolStat supplies directory/credit-efficiency
-observations; Titan supplies certificate inclusion over its recorded observation
-windows. Inclusion is not
-FAST, payment, stake-weighted performance, or complete chain coverage. The rank
-is a derived competition rank: exact inclusion ratio, then opportunities,
-descending; exact ties share rank. Zero opportunities have no score or rank.
+For the community profile, SolStat supplies directory and credit-efficiency
+observations. Titan supplies certificate inclusion for bounded observation
+windows. The collector ranks rows by exact inclusion ratio, then by opportunity
+count, both descending. Exact ties share a rank. Zero opportunities have no
+score or rank. These observations cover the provider's recorded cohort.
 
 Country estimates use the bundled [DB-IP Country Lite](https://db-ip.com/db/lite.php)
 database and public gossip addresses. The NOTICE records the database version.
@@ -50,8 +52,10 @@ estimates must link to [DB-IP](https://db-ip.com/) under its CC BY 4.0 license.
 For releases, refresh `pkg/dashboard/cluster/dbip-country.mmdb.gz` from DB-IP,
 update its NOTICE, and run the collector tests below.
 
-Bounds: one capture at most 55 seconds; HTTP bodies at most 2 MiB; at most
-2,048 rows per source; persisted UTF-8 JSON at most 4 MiB. Redirects are denied.
+Bounds: one capture at most 55 seconds; HTTP bodies at most 2 MiB; persisted
+UTF-8 JSON at most 4 MiB. Community sources and validator-directory rows are
+limited to 2,048; mainnet `getClusterNodes` contacts are limited to 8,192.
+Redirects are denied.
 Counters, slots, epochs,
 and ranks are decimal strings. `stake_sol` is a bounded provider decimal SOL
 estimate, never an asserted exact lamport balance.

@@ -87,6 +87,9 @@ type CacheActivityWindow struct {
 	Vote                CacheLookupDelta `json:"vote"`
 	Program             CacheLookupDelta `json:"program"`
 	CommonLarge         CacheLookupDelta `json:"common_large"`
+	// FixedSmallPayloadBytesCopied counts payload bytes copied to a caller
+	// on fixed small-tier hits. It excludes internal staging and shared hits.
+	FixedSmallPayloadBytesCopied *uint64 `json:"fixed_small_payload_bytes_copied,string,omitempty"`
 }
 
 type CacheLookupDelta struct {
@@ -176,6 +179,9 @@ func validateCacheDetail(d CacheDetail) error {
 			return errors.New("source_invalid")
 		}
 		if w := a.Window; w != nil {
+			if n := w.FixedSmallPayloadBytesCopied; n != nil && (c.Layout != "fixed" || *n == ^uint64(0)) {
+				return errors.New("source_invalid")
+			}
 			if !validReplayDetailTime(w.StartedAt) || !validReplayDetailTime(w.EndedAt) || !w.EndedAt.Equal(d.CapturedAt) ||
 				w.DurationNanoseconds == 0 || w.DurationNanoseconds > uint64(time.Minute) || w.StartedAt.Before(b.NodeStartedAt) ||
 				w.Vote.Hits > a.Vote.Hits || w.Vote.Misses > a.Vote.Misses || w.Program.Hits > a.Program.Hits || w.Program.Misses > a.Program.Misses ||

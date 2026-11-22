@@ -85,7 +85,7 @@ func TestLocalPeerRealFeedPublicReaderBothRoles(t *testing.T) {
 			for range 2 {
 				w := request(200)
 				require.Equal(t, prepared.Body(), w.Body.String())
-				remaining, err := parseDetailRemaining(w.Header().Get(replayDetailRemainingHeader), NetworkDetailFreshFor)
+				remaining, err := parseStorageDetailRemaining(w.Header().Get(replayDetailRemainingHeader))
 				require.NoError(t, err)
 				require.Positive(t, remaining)
 				require.LessOrEqual(t, remaining, 20*time.Second)

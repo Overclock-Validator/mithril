@@ -191,6 +191,7 @@ type alpenglowVoter struct {
 	refreshCursor     int
 	lastWarn          map[uint64]time.Time
 	landingMu         sync.RWMutex
+	landedForIdentity bool
 	landed            map[alpenglow.VoteMessageKey]struct{}
 	stats             VotingStats
 	lastStatsLog      time.Time
@@ -1305,6 +1306,7 @@ func (v *alpenglowVoter) recordNetworkCertificate(cert alpenglow.Certificate) {
 	v.stats.LastNetworkLandedVoteType = vote.Type
 	v.stats.LastNetworkCertificateType = cert.Type
 	v.stats.LastNetworkLandedAt = time.Now()
+	v.landedForIdentity = true
 	landed := v.stats.NetworkLandedVotes
 	v.landingMu.Unlock()
 
@@ -1543,6 +1545,9 @@ func (v *alpenglowVoter) rebindIdentity(next *identity.Keypair) error {
 	v.signer = signer
 	v.history = history
 	v.historyLock = historyLock
+	v.landingMu.Lock()
+	v.landedForIdentity = false
+	v.landingMu.Unlock()
 	if v.engine.monitoringEnabled {
 		v.publishMonitoring(v.snapshot())
 	}

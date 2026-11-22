@@ -306,17 +306,20 @@ func TestReplayDetailPublicViewersDoNotFetchSource(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			var detailRequests atomic.Int64
+			var replayRequests, activityRequests atomic.Int64
 			path := replayDetailReaderServer(t, func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/snapshot" {
 					_ = json.NewEncoder(w).Encode(replayDetailLiveStatus(core))
 					return
 				}
-				if r.URL.Path == "/details/slots" || r.URL.Path == "/details/schedule" || r.URL.Path == "/details/selected" {
+				if r.URL.Path == "/details/activity-history" {
+					activityRequests.Add(1)
+				}
+				if r.URL.Path != "/details/replay" {
 					w.WriteHeader(http.StatusNotFound)
 					return
 				}
-				detailRequests.Add(1)
+				replayRequests.Add(1)
 				replayDetailReaderReply(w, r, prepared)
 			})
 			address, cancel, done := replayDetailPublicServer(t, path, PublicOptions{Resources: true, ReplayDetails: enabled})
@@ -340,18 +343,31 @@ func TestReplayDetailPublicViewersDoNotFetchSource(t *testing.T) {
 					time.Sleep(10 * time.Millisecond)
 				}
 			}
+			// Activity history has its own worker when replay details are enabled.
+			// Its unsupported endpoint is not another replay manifest/page fetch.
+			deadline := time.Now().Add(3 * time.Second)
+			for enabled && activityRequests.Load() == 0 && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+			if (activityRequests.Load() > 0) != enabled {
+				t.Fatal("activity collector opt-in differs", activityRequests.Load())
+			}
+			want := int64(0)
+			if enabled {
+				want = 2 // One manifest and one page in the initial collection.
+			}
+			beforeViewers := replayRequests.Load()
+			if beforeViewers != want {
+				t.Fatalf("initial replay collection: got %d requests, want %d", beforeViewers, want)
+			}
 			for range 8 {
 				status, _, _ := replayDetailPublicRequest(t, address, query, "stats.example", "")
 				if status != map[bool]int{false: 404, true: 200}[enabled] {
 					t.Fatalf("detail page status: %d", status)
 				}
 			}
-			want := int64(0)
-			if enabled {
-				want = 2 // One manifest and one page in the initial collection.
-			}
-			if got := detailRequests.Load(); got != want {
-				t.Fatalf("viewer/default path reached Unix detail source: got %d requests, want %d", got, want)
+			if got := replayRequests.Load(); got != beforeViewers {
+				t.Fatalf("viewer/default path reached Unix replay source: got %d requests, baseline %d", got, beforeViewers)
 			}
 		})
 	}

@@ -47,6 +47,12 @@ type AccountsDb struct {
 	// program lock pins this counter's cache instance; Clear does not reset it.
 	programCacheAcceptedSets atomic.Uint64
 	programCacheRefusedSets  atomic.Uint64
+	accountOperations        atomic.Pointer[accountOperationsRecorder]
+	physicalUsage            atomic.Pointer[physicalUsageRecorder]
+	storageOpenedAt          time.Time
+	storageClosing           atomic.Bool
+	indexWriteStalls         *writeStallRecorder
+	bankHashWriteStalls      *writeStallRecorder
 
 	// readCacheEpochMu protects the cache epoch and the pending fold view.
 	// CommitBatch publishes its immutable newest-wins union here before the
@@ -186,7 +192,8 @@ func OpenDbPaths(accountsPaths []string) (*AccountsDb, error) {
 		return nil, err
 	}
 	opts.Cache = pebble.NewCache(int64(IndexCacheMaxMB) << 20)
-	opts.EventListener = pebbleEventListener("index")
+	indexWriteStalls, bankHashWriteStalls := newWriteStallRecorder(), newWriteStallRecorder()
+	opts.EventListener = pebbleEventListener("index", indexWriteStalls)
 	db, err := openUpgradingPebble(indexDir, opts)
 	if opts.Cache != nil {
 		opts.Cache.Unref()
@@ -196,14 +203,15 @@ func OpenDbPaths(accountsPaths []string) (*AccountsDb, error) {
 	}
 
 	bankhashDir := filepath.Join(accountsDbDir, "bankhash_db")
-	bankhashDb, err := openUpgradingPebble(bankhashDir, &pebble.Options{Logger: silentLogger{}, EventListener: pebbleEventListener("bankhash")})
+	bankhashDb, err := openUpgradingPebble(bankhashDir, &pebble.Options{Logger: silentLogger{}, EventListener: pebbleEventListener("bankhash", bankHashWriteStalls)})
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("opening bankhashDir=%s: %w", bankhashDir, err)
 	}
 
 	accountsDb := &AccountsDb{
-		IndexWALDisabled: DisableIndexWAL, Index: db, BankHashStore: bankhashDb, AcctsDir: appendVecsDir, AcctsDirs: appendVecsDirs}
+		IndexWALDisabled: DisableIndexWAL, Index: db, BankHashStore: bankhashDb, AcctsDir: appendVecsDir, AcctsDirs: appendVecsDirs,
+		indexWriteStalls: indexWriteStalls, bankHashWriteStalls: bankHashWriteStalls}
 	largestBytes, err := os.ReadFile(filepath.Join(accountsDbDir, "largest_file_id"))
 	if err == nil && len(largestBytes) != 8 {
 		err = fmt.Errorf("expected 8 bytes, found %d", len(largestBytes))
@@ -216,10 +224,13 @@ func OpenDbPaths(accountsPaths []string) (*AccountsDb, error) {
 	accountsDb.LargestFileId.Store(binary.LittleEndian.Uint64(largestBytes))
 	accountsDb.bindLockDiagnostics()
 
+	accountsDb.storageOpenedAt = time.Now()
 	return accountsDb, nil
 }
 
 func (accountsDb *AccountsDb) CloseDb() {
+	accountsDb.storageClosing.Store(true)
+	accountsDb.StopPhysicalUsage()
 	mlog.Log.Infof("CloseDb: syncing and closing Index...")
 	if err := accountsDb.Index.Close(); err != nil {
 		mlog.Log.Errorf("CloseDb: Index.Close() error: %v", err)
@@ -228,6 +239,8 @@ func (accountsDb *AccountsDb) CloseDb() {
 	if err := accountsDb.BankHashStore.Close(); err != nil {
 		mlog.Log.Errorf("CloseDb: BankHashStore.Close() error: %v", err)
 	}
+	accountsDb.indexWriteStalls.retire()
+	accountsDb.bankHashWriteStalls.retire()
 	mlog.Log.Infof("CloseDb: done\n") // extra newline for spacing after close
 }
 
@@ -412,6 +425,7 @@ type AccountReadStats struct {
 }
 
 func (accountsDb *AccountsDb) GetAccount(slot uint64, pubkey solana.PublicKey) (*accounts.Account, error) {
+	accountsDb.recordAccountRequests(1)
 	if accountsDb == nil {
 		return nil, ErrNoAccount
 	}
@@ -421,6 +435,7 @@ func (accountsDb *AccountsDb) GetAccount(slot uint64, pubkey solana.PublicKey) (
 }
 
 func (accountsDb *AccountsDb) GetAccountWithStats(slot uint64, pubkey solana.PublicKey) (*accounts.Account, AccountReadStats, error) {
+	accountsDb.recordAccountRequests(1)
 	var stats AccountReadStats
 	if accountsDb == nil {
 		return nil, stats, ErrNoAccount

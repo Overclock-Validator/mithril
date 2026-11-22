@@ -26,6 +26,7 @@ type selectedWindowReader struct {
 	revision uint64
 	failure  *selectedWindowFailure
 	last     *selectedWindowHighWater // owned by the collection worker
+	activity *activityHistoryReader
 }
 
 func (r *selectedWindowReader) fetch(ctx context.Context, query string) ([]byte, time.Time, time.Duration, string) {
@@ -45,6 +46,32 @@ func (r *selectedWindowReader) fetch(ctx context.Context, query string) ([]byte,
 			return nil, started, 0, "unsupported_source"
 		case http.StatusConflict:
 			return nil, started, 0, "source_generation_expired"
+		case http.StatusServiceUnavailable:
+			if response.ContentLength > 512 {
+				return nil, started, 0, "response_limit"
+			}
+			if len(response.Header.Values(replayDetailRemainingHeader)) != 0 {
+				return nil, started, 0, "source_invalid"
+			}
+			body, err := io.ReadAll(io.LimitReader(response.Body, 513))
+			if err != nil {
+				return nil, started, 0, "source_unavailable"
+			}
+			if len(body) > 512 {
+				return nil, started, 0, "response_limit"
+			}
+			reason := decodeDetailFailure(body, "selected_slots", func(reason string) bool {
+				switch reason {
+				case "waiting_source", "status_stale", "source_unavailable", "source_invalid", "source_time_invalid", "binding_changed", "generation_not_ready", "response_limit":
+					return true
+				default:
+					return false
+				}
+			})
+			if reason == "binding_changed" {
+				reason = "private_binding_changed" // Preserve this source 503 separately from local/page 409s.
+			}
+			return nil, started, 0, reason
 		default:
 			return nil, started, 0, "source_unavailable"
 		}
@@ -188,8 +215,13 @@ func (r *selectedWindowReader) collect(parent context.Context) {
 		fail("collection_deadline")
 		return
 	}
+	bundle, err := selectedWindowBundle(prepared)
+	if err != nil {
+		fail("response_limit")
+		return
+	}
 	p := &replayDetailPrepared{binding: w.Binding, generation: m.Digest,
-		capturedAt: deadline.Add(-replayDetailFreshFor), pages: prepared.pages, bytes: prepared.bytes}
+		capturedAt: deadline.Add(-replayDetailFreshFor), pages: prepared.pages, bytes: prepared.bytes + len(bundle), selectedBundle: bundle}
 	for i := range p.manifests {
 		p.manifests[i] = prepared.manifest
 	}
@@ -210,7 +242,10 @@ func (r *selectedWindowReader) collect(parent context.Context) {
 		r.revision = after.revision
 	}
 	if err := r.cache.publish(p, *after, time.Now()); err != nil {
-		r.failure = &selectedWindowFailure{revision: after.revision, stamp: after.stamp, reason: replayDetailCaptureReason(err)}
+		// Local capacity pressure does not invalidate a retained generation or clear an earlier source failure.
+		if !errors.Is(err, errReplayDetailCacheFull) {
+			r.failure = &selectedWindowFailure{revision: after.revision, stamp: after.stamp, reason: replayDetailCaptureReason(err)}
+		}
 		r.mu.Unlock()
 		return
 	}
@@ -228,9 +263,10 @@ func (r *selectedWindowReader) serveHTTP(w http.ResponseWriter, request *http.Re
 	admit func(statusStamp, func() (statusStamp, bool)) (time.Duration, bool)) {
 	reply := replayDetailFailure("invalid_request")
 	var selectedFailure *selectedWindowFailure
+	bundle := request.URL.Path == "/api/v1/details/selected-window"
 	_, _, page, ok := parseReplayDetailQuery(request.URL.RawQuery, request.URL.ForceQuery)
-	if request.Method == http.MethodGet && request.URL.Path == "/api/v1/details/selected" &&
-		request.URL.EscapedPath() == request.URL.Path && request.ContentLength == 0 && len(request.TransferEncoding) == 0 && ok {
+	if request.Method == http.MethodGet && (request.URL.Path == "/api/v1/details/selected" || bundle) &&
+		request.URL.EscapedPath() == request.URL.Path && request.ContentLength == 0 && len(request.TransferEncoding) == 0 && ok && (!bundle || !page) {
 		if !r.limit.Allow() {
 			reply = replayDetailReply{status: http.StatusTooManyRequests, body: `{"schema_version":1,"family":"selected_slots","state":"unavailable","reason":"rate_limited"}`}
 		} else {
@@ -249,11 +285,19 @@ func (r *selectedWindowReader) serveHTTP(w http.ResponseWriter, request *http.Re
 				case gate.State != "fresh":
 					reply = replayDetailFailure("status_stale")
 				case r.failure != nil && r.failure.revision == gate.revision && r.failure.stamp == gate.stamp && !page:
-					reply = replayDetailReaderFailure(r.failure.reason)
+					if r.failure.reason == "private_binding_changed" {
+						reply = replayDetailCaptureFailureReply("binding_changed")
+					} else {
+						reply = replayDetailReaderFailure(r.failure.reason)
+					}
 				case r.revision != gate.revision:
 					reply = replayDetailFailure("waiting_source")
 				default:
-					reply = r.cache.lookup(request.URL.RawQuery, request.URL.ForceQuery, *gate, time.Now())
+					minimum := replayDetailMinimum
+					if bundle {
+						minimum = time.Millisecond
+					}
+					reply = r.cache.lookupWithBudget(request.URL.RawQuery, request.URL.ForceQuery, *gate, time.Now(), minimum)
 					selectedFailure = r.failure
 				}
 				r.mu.Unlock()
@@ -298,6 +342,12 @@ func (r *selectedWindowReader) serveHTTP(w http.ResponseWriter, request *http.Re
 		}
 		if !ok || statusRemaining.Milliseconds() < 1 || !page && reply.remainingMilliseconds < 1 {
 			reply = replayDetailFailure("status_stale")
+		} else if bundle {
+			if publication.prepared.selectedBundle == "" {
+				reply = replayDetailFailure("waiting_source")
+			} else {
+				reply.body = publication.prepared.selectedBundle
+			}
 		}
 	}
 	if reply.status != http.StatusOK {

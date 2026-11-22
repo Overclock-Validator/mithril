@@ -69,3 +69,63 @@ func TestMainnetClusterProjection(t *testing.T) {
 		t.Fatalf("wrong state after snapshot loss: %+v", actual.metadata)
 	}
 }
+
+func TestClusterMapObservedRPCNodes(t *testing.T) {
+	now := time.Now()
+	for _, profile := range []string{"community", "mainnet"} {
+		t.Run(profile, func(t *testing.T) {
+			s := clusterTestSnapshot(now, 2)
+			if profile == "mainnet" {
+				s.Profile, s.Network, s.GenesisHash = "mainnet", "mainnet-beta", cluster.MainnetGenesisHash
+				s.Providers = []cluster.ProviderStatus{
+					{ID: "rpc", SourceURL: "https://api.mainnet-beta.solana.com", State: "fresh", CapturedAt: now, SourceAt: &now, Epoch: s.Epoch, GenesisHash: s.GenesisHash, Binding: "rpc_genesis_before_after", SourceTimeKind: "response", RowCount: "2"},
+					{ID: "solstat", State: "unavailable", Reason: "not_collected", CapturedAt: now, RowCount: "0"},
+					{ID: "titan", State: "unavailable", Reason: "not_collected", CapturedAt: now, RowCount: "0"},
+					{ID: "geoip", SourceURL: "https://db-ip.com/", State: "unavailable", Reason: "not_collected", CapturedAt: now, RowCount: "0"},
+					{ID: "puffin", State: "unavailable", Reason: "not_collected", CapturedAt: now, RowCount: "0"},
+				}
+				for i := range s.Validators {
+					s.Validators[i].DirectorySource = "rpc"
+					s.Validators[i].Name, s.Validators[i].CountryCode, s.Validators[i].CountrySource = "", "", ""
+				}
+			}
+			observed := now.Add(-time.Minute)
+			s.RPCNodes = &cluster.RPCNodes{Advertised: "0", ObservedAt: observed}
+			if err := cluster.Validate(s); err != nil {
+				t.Fatal(err)
+			}
+			view := projectClusterAnchored(&s, "generation", "fresh", "", now, now)
+			var body clusterMap
+			if json.Unmarshal(view.mapJSON, &body) != nil || body.RPCNodes == nil || body.RPCNodes.Advertised != "0" || !body.RPCNodes.ObservedAt.Equal(observed) {
+				t.Fatal("known zero/source time lost")
+			}
+			first := clusterProjectionRemaining(view.leaseStarted, now)
+			if first <= 0 || first > 60000 {
+				t.Fatalf("own original lease not capped: %d", first)
+			}
+			later := projectClusterAnchored(&s, "generation", "fresh", "", now.Add(20*time.Second), now)
+			if clusterProjectionRemaining(later.leaseStarted, now.Add(20*time.Second)) > first-19000 {
+				t.Fatal("same observation lease renewed")
+			}
+			expired := projectClusterAnchored(&s, "generation", "fresh", "", now.Add(61*time.Second), now)
+			body.RPCNodes = nil
+			json.Unmarshal(expired.mapJSON, &body)
+			if body.RPCNodes != nil {
+				t.Fatal("expired optional observation remains current")
+			}
+			stale := projectCluster(&s, "generation", "stale", "", now)
+			body.RPCNodes = nil
+			json.Unmarshal(stale.mapJSON, &body)
+			if body.RPCNodes != nil {
+				t.Fatal("stale parent supplied RPC count")
+			}
+			s.RPCNodes = nil
+			missing := projectCluster(&s, "generation", "fresh", "", now)
+			body.RPCNodes = nil
+			json.Unmarshal(missing.mapJSON, &body)
+			if body.RPCNodes != nil {
+				t.Fatal("absent became zero")
+			}
+		})
+	}
+}

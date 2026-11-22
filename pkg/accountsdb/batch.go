@@ -131,6 +131,7 @@ func (db *AccountsDb) GetAccountsBatchSharedWithStats(ctx context.Context, slot 
 }
 
 func (db *AccountsDb) getAccountsBatchWithStats(ctx context.Context, slot uint64, pks []solana.PublicKey) ([]*accounts.Account, BatchReadStats, error) {
+	db.recordAccountRequests(uint64(len(pks)))
 	stats := BatchReadStats{RequestedKeys: uint64(len(pks)), DurableKeys: uint64(len(pks))}
 	if len(pks) == 0 {
 		return nil, stats, nil

@@ -21,6 +21,9 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// DefaultNodeSocket is the private feed path for the provisioned Linux profile.
+const DefaultNodeSocket = "/run/mithril-dashboard-feed/dashboard.sock"
+
 // The reader polls once per SampleInterval. Accepting more requests than this
 // only lets a feed client spend node CPU; excess connections wait in the
 // listen backlog instead of being parsed.
@@ -43,14 +46,18 @@ type Feed struct {
 	latest     atomic.Pointer[feedStatus]
 	details    *replayDetailSource
 	fast       *fastExecutedFeed
-	rooted     *rootedHistorySource
-	cache      *cacheDetailSource
 	network    *networkDetailSource
+	cache      *cacheDetailSource
+	production *productionDetailSource
+	storage    *storageDetailSource
+	rooted     *rootedHistorySource
+	reception  *receptionHistorySource
 	machine    *machineDetailSource
 	localPeers *localPeerSource
 }
 
 const statusRemainingHeader = "Mithril-Status-Remaining-Milliseconds"
+const readerOriginHeader = "Mithril-Dashboard-Public-Origin"
 
 // feedStatus keeps the cached body and its original monotonic lifetime together.
 type feedStatus struct {
@@ -58,23 +65,26 @@ type feedStatus struct {
 	freshUntil time.Time
 }
 
-// DetailSamplers enables bounded private detail routes when configured.
+// DetailSamplers enables only the named private detail routes. The callbacks
+// return bounded in-memory copies; a nil callback leaves its route disabled.
 type DetailSamplers struct {
-	Replay         ReplayDetailSampler
-	FastExecuted   func() (FastExecuted, bool)
-	Cache          CacheDetailSampler
-	SelectedWindow SelectedWindowSampler
-	RootedHistory  RootedHistorySampler
-	HeldSchedules  HeldScheduleSampler
-	Network        NetworkDetailSampler
-	NodeNetwork    NodeNetworkSampler
-	Machine        MachineDetailSampler
-	LocalPeers     LocalPeerSampler
-}
+	// ReaderOrigin is the only node configuration shared with the managed reader.
+	ReaderOrigin string
 
-// ListenFeedWithReplayDetails enables replay details on the private feed.
-func ListenFeedWithReplayDetails(parent context.Context, path, group string, sample func() Snapshot, details ReplayDetailSampler) (*Feed, error) {
-	return ListenFeedWithDetails(parent, path, group, sample, DetailSamplers{Replay: details})
+	Replay          ReplayDetailSampler
+	FastExecuted    func() (FastExecuted, bool)
+	SelectedWindow  SelectedWindowSampler
+	ActivityHistory ActivityHistorySampler
+	Network         NetworkDetailSampler
+	NodeNetwork     NodeNetworkSampler
+	Cache           CacheDetailSampler
+	Production      ProductionDetailSampler
+	Storage         StorageDetailSampler
+	RootedHistory   RootedHistorySampler
+	HeldSchedules   HeldScheduleSampler
+	Reception       *ReceptionHistorySampler
+	Machine         MachineDetailSampler
+	LocalPeers      LocalPeerSampler
 }
 
 // ListenFeed requires an existing private directory owned by the node. It
@@ -92,7 +102,18 @@ func ListenFeedGroup(parent context.Context, path, group string, sample func() S
 	return listenFeed(parent, path, group, true, sample, DetailSamplers{})
 }
 
-// ListenFeedWithDetails uses the existing socket permission checks.
+// ListenFeedWithReplayDetails adds an optional, independently sampled private
+// replay-detail route on the same listener. An empty group uses private mode;
+// a nonempty group uses ListenFeedGroup's existing permission checks. A nil
+// details sampler leaves the route and its worker disabled.
+func ListenFeedWithReplayDetails(parent context.Context, path, group string, sample func() Snapshot, details ReplayDetailSampler) (*Feed, error) {
+	return ListenFeedWithDetails(parent, path, group, sample, DetailSamplers{Replay: details})
+}
+
+// ListenFeedWithDetails uses the existing listener and permission checks. Replay
+// and held schedules share one bounded worker. Reception has one optional
+// 250ms preparation worker; local peers use one optional low-rate preparation
+// worker. Other families copy existing captures on the ordinary status cycle.
 func ListenFeedWithDetails(parent context.Context, path, group string, sample func() Snapshot, details DetailSamplers) (*Feed, error) {
 	return listenFeed(parent, path, group, group != "", sample, details)
 }
@@ -100,6 +121,11 @@ func ListenFeedWithDetails(parent context.Context, path, group string, sample fu
 func listenFeed(parent context.Context, path, group string, groupMode bool, sample func() Snapshot, details DetailSamplers) (*Feed, error) {
 	if !filepath.IsAbs(path) || sample == nil {
 		return nil, errors.New("dashboard feed requires an absolute socket path and a sampler")
+	}
+	if details.ReaderOrigin != "" {
+		if err := ValidateManagedOrigin(details.ReaderOrigin); err != nil {
+			return nil, err
+		}
 	}
 	if details.Network != nil && details.NodeNetwork != nil {
 		return nil, errors.New("dashboard network samplers are mutually exclusive")
@@ -110,8 +136,14 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 	if details.SelectedWindow != nil && details.Replay == nil {
 		return nil, errors.New("selected window requires the replay detail worker")
 	}
+	if details.ActivityHistory != nil && details.SelectedWindow == nil {
+		return nil, errors.New("activity history requires the selected window worker")
+	}
 	if details.FastExecuted != nil && details.Replay == nil {
 		return nil, errors.New("fast execution observations require replay details")
+	}
+	if details.Reception != nil && (details.Reception.Metadata == nil || details.Reception.ChunkBody == nil) {
+		return nil, errors.New("reception history requires both bounded callbacks")
 	}
 	var gid int
 	if groupMode {
@@ -160,19 +192,31 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 		if details.SelectedWindow != nil {
 			f.details.selected = &selectedWindowSource{sample: details.SelectedWindow, gate: &f.details.gate,
 				gateMu: &f.details.gateMu, revision: 1}
+			if details.ActivityHistory != nil {
+				f.details.activity = &activityHistorySource{sample: details.ActivityHistory, selected: f.details.selected, done: make(chan struct{})}
+			}
 		}
-	}
-	if details.RootedHistory != nil {
-		f.rooted = &rootedHistorySource{sample: details.RootedHistory}
-	}
-	if details.Cache != nil {
-		f.cache = &cacheDetailSource{sample: details.Cache}
 	}
 	if details.Network != nil {
 		f.network = &networkDetailSource{sample: details.Network}
 	}
 	if details.NodeNetwork != nil {
 		f.network = &networkDetailSource{nodeSample: details.NodeNetwork}
+	}
+	if details.Cache != nil {
+		f.cache = &cacheDetailSource{sample: details.Cache}
+	}
+	if details.Production != nil {
+		f.production = &productionDetailSource{sample: details.Production}
+	}
+	if details.Storage != nil {
+		f.storage = &storageDetailSource{sample: details.Storage}
+	}
+	if details.RootedHistory != nil {
+		f.rooted = &rootedHistorySource{sample: details.RootedHistory}
+	}
+	if details.Reception != nil {
+		f.reception = newReceptionHistorySource(*details.Reception)
 	}
 	if details.Machine != nil {
 		f.machine = newMachineDetailSource(details.Machine)
@@ -209,24 +253,34 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 			}
 			return
 		}
+		// Fence peer data before a replacement ordinary status is visible.
 		if f.localPeers != nil {
 			f.localPeers.observeStatus(s, now)
 		}
 		f.latest.Store(&feedStatus{body: b, freshUntil: now.Add(StaleAfter)})
+		if f.reception != nil {
+			f.reception.observeStatus(s, now)
+		}
 		if f.details != nil {
 			f.details.observeStatus(s, now)
 		}
 		if f.fast != nil {
 			f.fast.update(now)
 		}
-		if f.rooted != nil {
-			f.rooted.update(s, now)
+		if f.network != nil {
+			f.network.update(s, now)
 		}
 		if f.cache != nil {
 			f.cache.update(s, now)
 		}
-		if f.network != nil {
-			f.network.update(s, now)
+		if f.production != nil {
+			f.production.update(s, now)
+		}
+		if f.storage != nil {
+			f.storage.update(s, now)
+		}
+		if f.rooted != nil {
+			f.rooted.update(s, now)
 		}
 		if f.machine != nil {
 			f.machine.update(ctx, s, now)
@@ -246,19 +300,28 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 		if f.details.selected != nil {
 			mux.HandleFunc("/details/selected", f.details.selected.serveHTTP)
 		}
+		if f.details.activity != nil {
+			mux.HandleFunc("/details/activity-history", f.details.activity.serveHTTP)
+		}
 		if f.details.held != nil {
 			mux.HandleFunc("/details/schedule", f.details.held.serveHTTP)
 			mux.HandleFunc("/details/schedule/", f.details.held.serveHTTP)
 		}
 	}
-	if f.rooted != nil {
-		mux.HandleFunc("/details/slots", f.rooted.serveHTTP)
+	if f.network != nil {
+		mux.HandleFunc("/details/network", f.network.serveHTTP)
 	}
 	if f.cache != nil {
 		mux.HandleFunc("/details/cache", f.cache.serveHTTP)
 	}
-	if f.network != nil {
-		mux.HandleFunc("/details/network", f.network.serveHTTP)
+	if f.production != nil {
+		mux.HandleFunc("/details/production", f.production.serveHTTP)
+	}
+	if f.storage != nil {
+		mux.HandleFunc("/details/storage", f.storage.serveHTTP)
+	}
+	if f.rooted != nil {
+		mux.HandleFunc("/details/slots", f.rooted.serveHTTP)
 	}
 	if f.localPeers != nil {
 		mux.HandleFunc(localPeerPath, f.localPeers.serveHTTP)
@@ -278,6 +341,9 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set(statusRemainingHeader, strconv.FormatInt(remaining, 10))
+		if details.ReaderOrigin != "" {
+			w.Header().Set(readerOriginHeader, details.ReaderOrigin)
+		}
 		_, _ = w.Write(status.body)
 	})
 	var handler http.Handler = mux
@@ -311,10 +377,28 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 			next.ServeHTTP(w, r)
 		})
 	}
+	if f.reception != nil {
+		// Parse this fixed family before ServeMux's path-cleaning redirects.
+		// Noncanonical paths must be refused, not silently rewritten.
+		next := handler
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == receptionHistoryPath || strings.HasPrefix(r.URL.Path, receptionHistoryPath+"/") {
+				f.reception.serveHTTP(w, r)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 	f.server = &http.Server{Handler: handler, ReadHeaderTimeout: 2 * time.Second, ReadTimeout: 2 * time.Second,
 		WriteTimeout: 2 * time.Second, IdleTimeout: 2 * time.Second, MaxHeaderBytes: 4096}
 	if f.details != nil {
 		go f.details.run(ctx)
+		if f.details.activity != nil {
+			go f.details.activity.run(ctx)
+		}
+	}
+	if f.reception != nil {
+		go f.reception.run(ctx)
 	}
 	if f.localPeers != nil {
 		go f.localPeers.run(ctx)
@@ -323,7 +407,8 @@ func listenFeed(parent context.Context, path, group string, groupMode bool, samp
 	f.server.SetKeepAlivesEnabled(false)
 	requestRate, requestBurst := feedRequestsPerSecond, feedRequestBurst
 	if details.Replay != nil || details.Cache != nil || details.SelectedWindow != nil || details.RootedHistory != nil ||
-		details.HeldSchedules != nil || details.Network != nil || details.NodeNetwork != nil || details.Machine != nil || details.LocalPeers != nil {
+		details.HeldSchedules != nil || details.Network != nil || details.NodeNetwork != nil || details.Machine != nil ||
+		details.LocalPeers != nil || details.Production != nil || details.Storage != nil || details.Reception != nil {
 		// Replay detail can contain 128 pages; its reader has a 12-second deadline.
 		requestRate, requestBurst = detailFeedRequestsPerSecond, detailFeedRequestBurst
 	}
@@ -415,6 +500,12 @@ func (f *Feed) Close() {
 		<-f.served
 		if f.details != nil {
 			<-f.details.done
+			if f.details.activity != nil {
+				<-f.details.activity.done
+			}
+		}
+		if f.reception != nil {
+			<-f.reception.done
 		}
 		if f.localPeers != nil {
 			<-f.localPeers.done

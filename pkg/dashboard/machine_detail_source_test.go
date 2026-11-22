@@ -77,7 +77,7 @@ func TestMachineSourceRealFeed(t *testing.T) {
 		t.Fatal("fixture changed")
 	}
 	code, ordinary, _ := replayDetailHTTP(t, client, "GET", "http://node/snapshot", "")
-	if code != 200 || strings.Contains(ordinary, `"family":"machine"`) || f.network != nil || f.server.MaxHeaderBytes != 4096 {
+	if code != 200 || strings.Contains(ordinary, `"family":"machine"`) || f.network != nil || f.details != nil || f.reception != nil || f.server.MaxHeaderBytes != 4096 {
 		t.Fatal("machine changed ordinary feed or worker policy")
 	}
 	f.Close()

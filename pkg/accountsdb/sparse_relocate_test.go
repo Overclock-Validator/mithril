@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -83,6 +84,7 @@ func TestSparseRelocationPreservesLiveAndUndoAcrossRecovery(t *testing.T) {
 				expected[sparseRelocationKey(1)] = mustColdRead(t, db, 150, sparseRelocationKey(1)).Clone()
 				bankhash, err := db.GetBankHashForSlot(150)
 				require.NoError(t, err)
+				cfg.RelocatedBytes = &atomic.Uint64{}
 				panicNow := func() { panic("interrupted sparse relocation") }
 				switch crash {
 				case "output_manifest":
@@ -103,6 +105,11 @@ func TestSparseRelocationPreservesLiveAndUndoAcrossRecovery(t *testing.T) {
 					require.Greater(t, stats.BytesReclaimed, int64(5<<20))
 				} else {
 					require.Panics(t, func() { _, _ = db.CompactOnce(cfg) })
+				}
+				if crash == "output_manifest" {
+					require.Zero(t, cfg.RelocatedBytes.Load())
+				} else {
+					require.Positive(t, cfg.RelocatedBytes.Load())
 				}
 				db = reopenFoldTestDb(t, db, dir)
 				recovered, err := db.RecoverFoldState()
@@ -151,11 +158,11 @@ func TestSparseRelocationKeepsCurrentRecordsAlsoReferencedByUndo(t *testing.T) {
 	db.foldMu.Lock()
 	defer db.foldMu.Unlock()
 	var cache sparseIndexCache
-	moved, err := db.compactSparseLive(c, keep, &cache, defaultMinDeadFraction, 1<<20)
+	moved, err := db.compactSparseLive(c, keep, &cache, defaultMinDeadFraction, 1<<20, nil)
 	require.NoError(t, err)
 	require.Greater(t, moved.moved, int64(0))
 	cache = sparseIndexCache{}
-	_, _, _, err = db.sparsifyFile(c, keep, &cache)
+	_, _, _, err = db.sparsifyFile(c, keep, &cache, nil)
 	require.NoError(t, err)
 	marker, err := ReadSegmentManifest(source + segManifestSuffix)
 	require.NoError(t, err)

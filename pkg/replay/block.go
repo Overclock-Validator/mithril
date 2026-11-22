@@ -90,6 +90,9 @@ type BlockFetchOpts struct {
 	// TurbinePrewarm: boot-time shred collector to hand over (stop + drain)
 	// right before the block source starts. May be nil.
 	TurbinePrewarm *blockstream.TurbinePrewarm
+	// ShredHistory belongs to the node run and survives replay/source retries.
+	// Replay forwards it but never closes it; nil leaves reception capture off.
+	ShredHistory *turbine.ShredHistory
 	// ShredSpoolDir: on-disk verified-shred spool shared by prewarm and the
 	// block source (empty = disabled).
 	ShredSpoolDir string
@@ -2674,6 +2677,7 @@ func ReplayBlocks(
 		opts.RepairCatchupMaxGapSlots = blockFetchOpts.RepairCatchupMaxGapSlots
 		opts.RepairMaxRequestsPerSecond = blockFetchOpts.RepairMaxRequestsPerSecond
 		opts.DisableRPCBlockFetch = blockFetchOpts.DisableRPCBlockFetch
+		opts.ShredHistory = blockFetchOpts.ShredHistory
 		opts.ShredSpoolDir = blockFetchOpts.ShredSpoolDir
 		opts.AlpenglowRecovery = blockFetchOpts.AlpenglowRecovery
 		opts.LocalLeaderForSlot = blockFetchOpts.LocalLeaderForSlot

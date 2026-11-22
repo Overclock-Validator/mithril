@@ -77,6 +77,11 @@ type serviceHarness struct {
 // startService runs a service against a mock block engine and relayer.
 func startService(t *testing.T) *serviceHarness {
 	t.Helper()
+	return startServiceWithObserver(t, nil)
+}
+
+func startServiceWithObserver(t *testing.T, observe func(ServiceObservation)) *serviceHarness {
+	t.Helper()
 	h := &serviceHarness{be: newMockBlockEngine(), gossip: &gossipRecorder{}}
 	dial := serveBufconn(t, func(s *grpc.Server) {
 		authpb.RegisterAuthServiceServer(s, newMockAuth(time.Now))
@@ -101,6 +106,7 @@ func startService(t *testing.T) *serviceHarness {
 		Gossip:      h.gossip,
 		LocalTPU:    serviceLocalTPU,
 		Dialer:      dial.Dialer,
+		Observe:     observe,
 	})
 	require.NoError(t, err)
 	h.service.harmonicClientIDAfter, h.service.baseClientIDAfter = 100*time.Millisecond, 50*time.Millisecond

@@ -19,7 +19,7 @@ func TestPublicSafetyFaultWithoutLifecycle(t *testing.T) {
 	s := safetyFixture(now)
 	fault := true
 	s.Consensus.SafetyFault = &fault
-	b, err := encodePublicSnapshotProfile(&s, "fresh", now, nil, nil, nil, 3)
+	b, err := encodePublicSnapshotProfile(&s, "fresh", now, nil, nil, nil, nil, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestSafetyFaultProfilesPreserveUnknown(t *testing.T) {
 			if json.Unmarshal(frames.safetyMessages[0], &frame) != nil || string(frame.Value) != string(frames.safetyPublicJSON) || len(frames.safetyMessages[0]) > MaxSnapshotBytes+128 {
 				t.Fatal("v3 HTTP and WebSocket payloads differ or exceed their bounds")
 			}
-			for profile := 0; profile <= 3; profile++ {
+			for profile := 0; profile <= 4; profile++ {
 				var message struct {
 					Consensus map[string]json.RawMessage `json:"consensus"`
 				}
@@ -101,7 +101,7 @@ func TestSafetyFaultProfilesPreserveUnknown(t *testing.T) {
 					t.Fatalf("invalid profile %d", profile)
 				}
 				got, present := message.Consensus["safety_fault"]
-				if present != (profile == 3 && tc.want != "") || present && string(got) != tc.want {
+				if present != ((profile == 3 || profile == 4) && tc.want != "") || present && string(got) != tc.want {
 					t.Fatalf("profile %d: safety_fault %s, present=%v", profile, got, present)
 				}
 			}
@@ -195,5 +195,45 @@ func TestSafetyProfileOverflowFailsClosed(t *testing.T) {
 	var frame struct{ Value json.RawMessage }
 	if len(frames.safetyMessages) != 1 || json.Unmarshal(frames.safetyMessages[0], &frame) != nil || string(frame.Value) != string(frames.safetyPublicJSON) {
 		t.Fatal("v3 overflow differed between HTTP and WebSocket")
+	}
+}
+
+func TestAdvancedProfileOverflowFailsClosed(t *testing.T) {
+	now := time.Now().UTC()
+	s := lifecycleFixture(now)
+	s.SnapshotManifests = &SnapshotManifests{Attempt: 1, Full: &SnapshotManifestParse{Slot: 42, ParsedAt: now}, ReadyMarker: &SnapshotReadyMarker{Slot: 42, ObservedAt: now}}
+	s.Version = ""
+	c := &collector{public: true}
+	initial, err := c.encode(&s, "fresh", now)
+	if err != nil || len(initial.advancedPublicJSON) <= len(initial.publicJSON) {
+		t.Fatalf("advanced fixture missing extra data: %v", err)
+	}
+	s.Version = strings.Repeat("v", MaxSnapshotBytes-len(initial.publicJSON))
+	frames, err := c.encode(&s, "fresh", now)
+	if err != nil || len(frames.publicJSON) != MaxSnapshotBytes {
+		t.Fatalf("legacy response did not fit: %v", err)
+	}
+	if !frames.advancedUnavailable || frames.advancedPublicJSON != nil || len(frames.advancedMessages) != 0 {
+		t.Fatal("oversized advanced response fell back to a different profile")
+	}
+}
+
+func TestAdvancedProfileIncludesV3Observations(t *testing.T) {
+	now := time.Now().UTC()
+	s := safetyFixture(now)
+	fault := true
+	s.Consensus.SafetyFault = &fault
+	s.SnapshotManifests = &SnapshotManifests{Attempt: 1, Full: &SnapshotManifestParse{Slot: 42, ParsedAt: now}, ReadyMarker: &SnapshotReadyMarker{Slot: 42, ObservedAt: now}}
+	frames, err := (&collector{public: true}).encode(&s, "fresh", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var advanced PublicSnapshot
+	if err := json.Unmarshal(frames.advancedPublicJSON, &advanced); err != nil {
+		t.Fatal(err)
+	}
+	if advanced.Consensus == nil || advanced.Consensus.SafetyFault == nil || !*advanced.Consensus.SafetyFault ||
+		advanced.Startup == nil || advanced.Startup.SnapshotManifests == nil || advanced.Startup.SnapshotManifests.ReadyMarker == nil {
+		t.Fatal("advanced profile omitted v3 safety or manifest observations")
 	}
 }

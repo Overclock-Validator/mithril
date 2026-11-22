@@ -2,13 +2,17 @@ package blockstream
 
 import (
 	"context"
+	"encoding/json"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Overclock-Validator/mithril/pkg/gossip"
+	"github.com/Overclock-Validator/mithril/pkg/metrics"
 	"github.com/Overclock-Validator/mithril/pkg/turbine"
+	"github.com/gagliardetto/solana-go"
 )
 
 func TestNetworkMonitoringUsesBoundedImmutableObservations(t *testing.T) {
@@ -113,11 +117,48 @@ func TestNetworkMonitoringConcurrentPublication(t *testing.T) {
 	readers.Wait()
 }
 
+func TestNetworkMonitoringCopiesReceiverSocketMemory(t *testing.T) {
+	bs := NewBlockSource(&BlockSourceOpts{SourceType: BlockSourceTurbine, StartSlot: 1})
+	if got, ok := bs.observeTurbineSocketMemory(nil); ok || got != (turbine.ReceiverSocketMemory{}) {
+		t.Fatalf("disabled monitoring observed a socket: %+v, %t", got, ok)
+	}
+	bs.EnableMonitoring()
+	bs.liveStreamConnected.Store(true)
+	at := time.Now()
+	socketMemory := turbine.ReceiverSocketMemory{Generation: 7, RepairEnabled: true,
+		Live: turbine.SocketMemorySample{Observation: metrics.SocketObservation{StartedAt: at, SampledAt: at, Known: true,
+			Reason: metrics.SocketAvailable, Memory: metrics.SocketMemory{ReceiveAllocated: 11, Drops: 12}},
+			DropDelta: turbine.SocketDropDelta{Known: true, Drops: 2, StartedAt: at.Add(-time.Second), SampledAt: at}},
+		Repair: turbine.SocketMemorySample{Observation: metrics.SocketObservation{StartedAt: at, SampledAt: at, Known: true,
+			Reason: metrics.SocketAvailable, Memory: metrics.SocketMemory{ReceiveAllocated: 21, Drops: 22}}}}
+	bs.publishTurbineObservation(at, at, 1, true, turbine.ReceiverStats{}, turbine.ShredFrontiers{}, socketMemory, true)
+	snapshot, ok := bs.NetworkSnapshot()
+	if !ok || snapshot.Turbine == nil || !snapshot.Turbine.SocketMemoryObserved || snapshot.Turbine.SocketMemory != socketMemory || snapshot.Turbine.SocketMemoryObservedAt != at {
+		t.Fatalf("socket observation = %+v, %t", snapshot.Turbine, ok)
+	}
+	snapshot.Turbine.SocketMemory.Live.Observation.Memory.Drops = 0
+	snapshot.Turbine.SocketMemory.Live.DropDelta.Drops = 0
+	if next, _ := bs.NetworkSnapshot(); next.Turbine.SocketMemory.Live.Observation.Memory.Drops != 12 || next.Turbine.SocketMemory.Live.DropDelta.Drops != 2 {
+		t.Fatal("caller mutated the cached socket observation")
+	}
+
+	failed := turbine.ReceiverSocketMemory{Generation: 7,
+		Live: turbine.SocketMemorySample{Observation: metrics.SocketObservation{StartedAt: at, SampledAt: at, Reason: metrics.SocketReadFailed}}}
+	bs.publishTurbineObservation(at.Add(time.Second), at, 1, true, turbine.ReceiverStats{}, turbine.ShredFrontiers{}, failed, true)
+	if next, _ := bs.NetworkSnapshot(); !next.Turbine.SocketMemoryObserved || next.Turbine.SocketMemory.Live.Observation.Known || next.Turbine.SocketMemory.Live.DropDelta.Known {
+		t.Fatalf("failed observation retained known state: %+v", next.Turbine.SocketMemory)
+	}
+	bs.publishTurbineObservation(at.Add(2*time.Second), at, 1, false, turbine.ReceiverStats{}, turbine.ShredFrontiers{}, turbine.ReceiverSocketMemory{}, false)
+	if next, _ := bs.NetworkSnapshot(); next.Turbine.SocketMemoryObserved || !next.Turbine.SocketMemoryObservedAt.IsZero() {
+		t.Fatal("unavailable capture retained an owner clock")
+	}
+}
+
 func TestReceptionMonitoringPublishesDetachedSessionSample(t *testing.T) {
 	bs := NewBlockSource(&BlockSourceOpts{SourceType: BlockSourceTurbine, StartSlot: 1})
 	at := time.Now().UTC()
 	progress := turbine.ReceptionSnapshot{SampledAt: at, Slot: 1<<53 + 1, ObservedAt: at, HasSlot: true, RetainedSlots: 3}
-	bs.publishReceptionObservation(at, 1, progress)
+	bs.publishReceptionObservation(at, 1, progress, nil)
 	if bs.receptionObservation.Load() != nil {
 		t.Fatal("disabled monitoring captured reception")
 	}
@@ -126,7 +167,7 @@ func TestReceptionMonitoringPublishesDetachedSessionSample(t *testing.T) {
 	}
 	bs.EnableMonitoring()
 	bs.liveStreamConnected.Store(true)
-	bs.publishReceptionObservation(at, 1, progress)
+	bs.publishReceptionObservation(at, 1, progress, nil)
 	sourceStart, cached, known := bs.CachedReceptionObservation()
 	if !known || sourceStart.IsZero() || cached.Progress != progress || cached.Session != 1 {
 		t.Fatal("cached reception lost its exact source/session")
@@ -158,7 +199,7 @@ func TestReceptionMonitoringPublishesDetachedSessionSample(t *testing.T) {
 		t.Fatal("replacement receiver inherited reception")
 	}
 	progress.Slot, progress.HasSlot, progress.RetainedSlots = 0, false, 0
-	bs.publishReceptionObservation(at.Add(time.Second), 2, progress)
+	bs.publishReceptionObservation(at.Add(time.Second), 2, progress, nil)
 	if next, _ := bs.NetworkSnapshot(); next.Reception.Session != 2 || next.Reception.Progress.HasSlot {
 		t.Fatal("new session fabricated a received slot")
 	}
@@ -172,8 +213,21 @@ func TestReceptionMonitoringPublishesDetachedSessionSample(t *testing.T) {
 }
 
 func TestReceptionMonitoringUsesActualStreamOwner(t *testing.T) {
+	history, err := turbine.NewShredHistory(turbine.ShredHistoryBinding{RunID: "actual-stream-history",
+		NodeStartedAt: time.Now(), GenesisHash: solana.Hash{1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { history.CloseAfterProducers() })
+	for _, kind := range []turbine.ShredHistorySourceKind{turbine.ShredHistoryPrewarm, turbine.ShredHistoryLive} {
+		handle, ok := history.RegisterSource(kind, time.Now())
+		if !ok {
+			t.Fatal("prior receiver registration refused")
+		}
+		handle.Retire()
+	}
 	bs := NewBlockSource(&BlockSourceOpts{SourceType: BlockSourceTurbine, StartSlot: 1,
-		TurbineBindAddr: "127.0.0.1:0"})
+		TurbineBindAddr: "127.0.0.1:0", ShredHistory: history})
 	bs.EnableMonitoring()
 	bs.liveStreamWg.Add(1)
 	done := make(chan struct{})
@@ -203,6 +257,9 @@ func TestReceptionMonitoringUsesActualStreamOwner(t *testing.T) {
 			if r.Session != 1 || r.Progress.SampledAt.Before(r.StartedAt) || r.StartedAt.Before(s.SourceStartedAt) || r.Progress.HasSlot || r.Progress.RetainedSlots != 0 {
 				t.Fatalf("invalid owner publication: %+v", r)
 			}
+			if r.ShredHistoryTarget().Generation() != 3 {
+				t.Fatal("actual constructor equated history generation with successful session")
+			}
 			// Recent reception is independently sampled before the first normal
 			// ten-second aggregate diagnostic observation.
 			if s.Turbine != nil {
@@ -211,6 +268,50 @@ func TestReceptionMonitoringUsesActualStreamOwner(t *testing.T) {
 			return
 		}
 	}
+}
+
+func TestReceptionHistoryTargetRetainsOriginalGeneration(t *testing.T) {
+	history, err := turbine.NewShredHistory(turbine.ShredHistoryBinding{RunID: "cached-history-target",
+		NodeStartedAt: time.Now(), GenesisHash: solana.Hash{1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { history.CloseAfterProducers() })
+	old, ok := history.RegisterSource(turbine.ShredHistoryLive, time.Now())
+	if !ok {
+		t.Fatal("initial receiver registration refused")
+	}
+	bs := NewBlockSource(&BlockSourceOpts{SourceType: BlockSourceTurbine, StartSlot: 1})
+	bs.EnableMonitoring()
+	bs.liveStreamConnected.Store(true)
+	bs.publishReceptionObservation(time.Now(), 9, turbine.ReceptionSnapshot{}, old)
+	_, cached, known := bs.CachedReceptionObservation()
+	if !known || cached.ShredHistoryTarget() != old || cached.Session == old.Generation() {
+		t.Fatal("cached observation lost original receiver identity")
+	}
+	old.Retire()
+	replacement, ok := history.RegisterSource(turbine.ShredHistoryLive, time.Now())
+	if !ok {
+		t.Fatal("replacement receiver registration refused")
+	}
+	bs.publishReceptionObservation(time.Now(), 10, turbine.ReceptionSnapshot{}, replacement)
+	_, current, known := bs.CachedReceptionObservation()
+	if !known || current.ShredHistoryTarget() != replacement || cached.ShredHistoryTarget() != old {
+		t.Fatal("replacement rewrote a detached old marker target")
+	}
+	body, err := json.Marshal(cached)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil || len(fields) != 4 {
+		t.Fatalf("private history target changed the public observation: %s, %v", body, err)
+	}
+	bs.handleLiveShredStreamClosed("")
+	if _, _, ok := bs.CachedReceptionObservation(); ok {
+		t.Fatal("disconnected source retained its marker target")
+	}
+	bs.Stop()
 }
 
 func TestNetworkGossipMonitoringTracksActualStreamClient(t *testing.T) {
@@ -269,6 +370,8 @@ func TestNetworkGossipMonitoringTracksActualStreamClient(t *testing.T) {
 				t.Fatal("disabled source retained a gossip monitor")
 			}
 			bs.EnableMonitoring()
+			var attached atomic.Pointer[gossip.Client]
+			bs.SetGossipObserver(func(client *gossip.Client) { attached.Store(client) })
 			if s, _ := bs.NetworkSnapshot(); s.Gossip != nil {
 				t.Fatal("source fabricated gossip before stream startup")
 			}
@@ -297,7 +400,7 @@ func TestNetworkGossipMonitoringTracksActualStreamClient(t *testing.T) {
 				}
 			}
 			client := bs.monitoredGossip.Load()
-			if client == nil || (shared && client != opts.GossipClient) || (!shared && bs.gossipClient != nil) {
+			if client == nil || attached.Load() != client || (shared && client != opts.GossipClient) || (!shared && bs.gossipClient != nil) {
 				t.Fatal("monitor did not use the stream's selected gossip owner")
 			}
 			cached, ok := client.MonitoringSnapshot()
@@ -325,5 +428,28 @@ func TestNetworkGossipMonitoringTracksActualStreamClient(t *testing.T) {
 				t.Fatal("stopped source retained available gossip")
 			}
 		})
+	}
+}
+
+func TestNetworkGossipObserverDisabledNilAndStopped(t *testing.T) {
+	bs := NewBlockSource(&BlockSourceOpts{SourceType: BlockSourceTurbine, DisableRPCBlockFetch: true})
+	t.Cleanup(bs.Stop)
+	var attached []*gossip.Client
+	bs.SetGossipObserver(func(client *gossip.Client) { attached = append(attached, client) })
+	client := &gossip.Client{}
+	bs.setMonitoredGossip(client)
+	if len(attached) != 0 {
+		t.Fatal("disabled monitoring invoked an observer")
+	}
+	bs.EnableMonitoring()
+	bs.setMonitoredGossip(client)
+	bs.setMonitoredGossip(nil)
+	if len(attached) != 1 || attached[0] != client {
+		t.Fatal("selection lost its actual owner or sent a nil detach")
+	}
+	bs.Stop()
+	bs.setMonitoredGossip(&gossip.Client{})
+	if len(attached) != 1 {
+		t.Fatal("stopped source attached another owner")
 	}
 }

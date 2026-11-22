@@ -39,23 +39,52 @@ func historyPublicFixture(t *testing.T, now time.Time) []byte {
 	return b.publicJSON
 }
 
+func TestHistoryCollectorWithholdsFinalityDuringSafetyFault(t *testing.T) {
+	for _, fault := range []bool{false, true} {
+		t.Run(strconv.FormatBool(fault), func(t *testing.T) {
+			socket, body := fixtureFeed(t)
+			c := newCollector(socket)
+			c.public = true
+			c.history = historyTestService(t, false)
+			now := time.Now().UTC()
+			snapshot := fullTestSnapshot(now)
+			snapshot.Alpenglow = true
+			snapshot.Consensus.FinalizedSlot = new(uint64(42))
+			snapshot.Consensus.SafetyFault = &fault
+			setFixture(t, body, snapshot)
+			if reason := c.poll(context.Background(), now); reason != "" {
+				t.Fatalf("collector failure = %q", reason)
+			}
+			select {
+			case record := <-c.history.queue:
+				finalized := record.Values[2]
+				if fault && finalized != nil || !fault && (finalized == nil || *finalized != "42") {
+					t.Fatalf("safety fault %t, recorded finality %v", fault, finalized)
+				}
+			default:
+				t.Fatal("history received no record")
+			}
+		})
+	}
+}
+
 func TestHistoryQueueClockAndBinding(t *testing.T) {
 	h := historyTestService(t, false)
 	now := time.Date(2026, 11, 1, 12, 0, 30, 0, time.UTC)
-	h.offer(historyPublicFixture(t, now), now)
+	h.offer(historyPublicFixture(t, now), now, false)
 	if len(h.queue) != 1 || h.current.Load() == nil {
 		t.Fatal("first sample not offered")
 	}
-	h.offer(historyPublicFixture(t, now.Add(time.Second)), now.Add(time.Second))
+	h.offer(historyPublicFixture(t, now.Add(time.Second)), now.Add(time.Second), false)
 	if h.dropped.Load() != 0 {
 		t.Fatal("duplicate minute offered")
 	}
 	start := time.Now()
-	h.offer(historyPublicFixture(t, now.Add(time.Minute)), now.Add(time.Minute))
+	h.offer(historyPublicFixture(t, now.Add(time.Minute)), now.Add(time.Minute), false)
 	if time.Since(start) > time.Second || h.dropped.Load() != 1 {
 		t.Fatal("full queue blocked or did not record gap")
 	}
-	h.offer(historyPublicFixture(t, now), now)
+	h.offer(historyPublicFixture(t, now), now, false)
 	if !h.clockRegressed.Load() || h.dropped.Load() != 1 {
 		t.Fatal("regressed clock queued a record")
 	}
@@ -65,7 +94,7 @@ func TestHistoryQueueClockAndBinding(t *testing.T) {
 	}
 	p.Node.Identity = new("new-identity")
 	b, _ := json.Marshal(p)
-	h.offer(b, now.Add(2*time.Minute))
+	h.offer(b, now.Add(2*time.Minute), false)
 	if h.current.Load().Identity != "new-identity" || h.clockRegressed.Load() {
 		t.Fatal("blocked worker hid identity replacement")
 	}
@@ -77,8 +106,8 @@ func TestHistoryQueueMinuteBoundary(t *testing.T) {
 		t.Run(strconv.Itoa(seconds), func(t *testing.T) {
 			h := historyTestService(t, false)
 			now := base.Add(time.Duration(seconds) * time.Second)
-			h.offer(historyPublicFixture(t, now), now)
-			h.offer(historyPublicFixture(t, now.Add(time.Second)), now.Add(time.Second))
+			h.offer(historyPublicFixture(t, now), now, false)
+			h.offer(historyPublicFixture(t, now.Add(time.Second)), now.Add(time.Second), false)
 			wantDropped := uint64(0)
 			if seconds == 59 {
 				wantDropped = 1
@@ -338,15 +367,6 @@ func TestHistoryPublicProfileIntegration(t *testing.T) {
 			if enabled && (resp.Header.Get("Cache-Control") != "no-store" || resp.Header.Get("X-Content-Type-Options") != "nosniff") {
 				t.Fatal("history bypassed public response policy")
 			}
-			resp = request("/api/v1/features")
-			var features struct {
-				History bool `json:"history"`
-			}
-			err = json.NewDecoder(resp.Body).Decode(&features)
-			resp.Body.Close()
-			if err != nil || resp.StatusCode != http.StatusOK || features.History != enabled {
-				t.Fatalf("history feature flag: status=%d enabled=%v error=%v", resp.StatusCode, features.History, err)
-			}
 			resp = request("/api/v1/status")
 			data, _ = io.ReadAll(resp.Body)
 			resp.Body.Close()
@@ -404,7 +424,7 @@ func TestHistoryRestartWithoutFeedAndNewBinding(t *testing.T) {
 	now = time.Now().UTC()
 	p := PublicSnapshot{SourceState: "fresh", SampledAt: &now, Node: &PublicNode{RunID: "replacement-run", Identity: new("replacement-identity"), GenesisHash: new("replacement-genesis"), Mode: "verifying"}}
 	b, _ := json.Marshal(p)
-	h.offer(b, now)
+	h.offer(b, now, false)
 	w = httptest.NewRecorder()
 	handler(w, httptest.NewRequest("GET", "http://local/api/v1/history?metric=completed_slot&range=1h", nil))
 	if strings.Contains(w.Body.String(), "18446744073709551615") {

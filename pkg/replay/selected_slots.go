@@ -32,11 +32,12 @@ type SelectedReplayFacts struct {
 // Gap records retain only their fold evidence, not untrusted carrier values.
 type SelectedSlotRecord struct {
 	CertificateFoldEvidence
-	Gap                                    bool
+	// BankTime is zero when selected transaction activity is unknown.
+	BankTime                               int64
 	Facts                                  SelectedReplayFacts
 	ParentSlot, ExecutionParentSlot        uint64
 	ParentBlockID, ExecutionParentBankhash solana.Hash
-	HasParentBlockID                       bool
+	HasParentBlockID, Gap                  bool
 	Transactions                           sealevel.BankTransactionCounts
 }
 
@@ -199,6 +200,9 @@ func (p *Progress) publishSelectedSlots(r *CertificateOutcomes) {
 			row.Gap, row.Facts = false, *entry.selected
 			row.ParentSlot, row.ParentBlockID, row.HasParentBlockID = entry.carrier.ParentSlot, entry.carrier.ParentBlockID, entry.carrier.HasParentBlockID
 			row.ExecutionParentSlot, row.ExecutionParentBankhash = entry.carrier.ExecutionParentSlot, entry.carrier.ExecutionParentBankhash
+			if entry.carrier.ActivityKnown && entry.carrier.BankTime > 0 {
+				row.BankTime = entry.carrier.BankTime
+			}
 			row.Transactions = entry.carrier.Transactions
 		}
 		view.CoverageIncomplete = view.CoverageIncomplete || row.Gap

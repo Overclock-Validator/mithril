@@ -40,12 +40,21 @@ func TestSparseCompactionRetainsExactLiveAndUndoRecords(t *testing.T) {
 				} else if crash == "punch" {
 					db.compactHooks.afterSparsePunch = func() { panic("simulated crash") }
 				}
-				cfg := CompactionConfig{RewindHorizonBatches: 1, MaxMoveBytesPerCycle: 1}
+				cfg := CompactionConfig{RewindHorizonBatches: 1, MaxMoveBytesPerCycle: 1, ObserveInventory: true}
 				if crash == "none" {
 					stats, err := db.CompactOnce(cfg)
 					require.NoError(t, err)
 					require.Equal(t, 1, stats.FilesSparsified)
 					require.Greater(t, stats.BytesReclaimed, int64(15<<20))
+					l := stats.Liveness
+					require.True(t, l.Known)
+					require.Equal(t, l.ScannedCandidates, l.CompleteCandidates+l.PartialCandidates)
+					require.Equal(t, l.ScannedCandidates, l.RewriteCandidates+l.SparseCandidates)
+					require.Equal(t, l.ExaminedBytes, l.LiveBytes+l.UndoPinnedBytes+l.DeadBytes)
+					require.Greater(t, l.LiveBytes, uint64(0))
+					require.Greater(t, l.UndoPinnedBytes, uint64(0))
+					require.Greater(t, l.EligibleHoleBytes, uint64(15<<20))
+					require.Less(t, l.EligibleHoleBytes, l.DeadBytes)
 				} else {
 					require.Panics(t, func() { _, _ = db.CompactOnce(cfg) })
 				}
@@ -54,8 +63,10 @@ func TestSparseCompactionRetainsExactLiveAndUndoRecords(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, uint64(140), recovered.DurableThrough)
 				require.Equal(t, bh(140), recovered.RootedBankhash)
-				_, err = db.CompactOnce(cfg)
+				retried, err := db.CompactOnce(cfg)
 				require.NoError(t, err, "partial reclamation must be retryable")
+				require.True(t, retried.Liveness.Known)
+				require.GreaterOrEqual(t, retried.Liveness.PartialCandidates, uint64(1), "kind-3 gaps have no complete record-span/payload breakdown")
 				require.Equal(t, indexBefore, snapshotIndex(t, db), "sparse reclamation must not move account locations")
 				after, err := os.Stat(source)
 				require.NoError(t, err)

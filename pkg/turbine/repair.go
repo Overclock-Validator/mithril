@@ -943,7 +943,8 @@ func (c *repairClient) sendShredAttempt(conn *net.UDPConn, peers []gossip.Repair
 		traceStart = entryTraceNow()
 		traceBinding = entryRepairTrace{Peer: peer.Addr.String(), Nonce: nonce}
 	}
-	// Pin the recorder before I/O so a new socket cannot inherit this result.
+	// Pin the recorder before I/O: a replacement socket must not inherit an
+	// older request's completion. Pongs use a separate write path.
 	writes := c.requestWrites.Load()
 	n, writeErr := conn.WriteToUDP(packet, peer.Addr)
 	if writes != nil && writes.conn == conn && n > 0 {

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net"
 	"os"
@@ -91,16 +92,21 @@ var (
 	legacyGenesisHash                string // explicit lineage for pre-binding AccountsDB/ledger artifacts
 	dashboardSocket                  string
 	dashboardSocketGroup             string
+	dashboardPublicOrigin            string
 	dashboardEnabled                 bool
 	dashboardHostResources           bool
+	dashboardMachineDetails          bool
 	dashboardCgroupResources         bool
 	dashboardReplayDetails           bool
 	dashboardFastExecuted            bool
+	dashboardNetworkDetails          bool
+	dashboardLocalPeers              bool
+	dashboardShredHistory            bool
 	dashboardCacheDetails            bool
 	dashboardCacheActivity           bool
-	dashboardNetworkDetails          bool
-	dashboardMachineDetails          bool
-	dashboardLocalPeers              bool
+	dashboardProductionDetails       bool
+	dashboardStorageDetails          bool
+	dashboardIODetails               bool
 	disableMetricsServer             bool
 	blockSource                      string // "turbine", "rpc", or "lightbringer"
 	lightbringerEndpoint             string
@@ -564,15 +570,21 @@ func init() {
 	Run.Flags().StringVar(&dashboardSocket, "dashboard-socket", "", "Private read-only dashboard socket (mode 0700 parent by default; default off)")
 	Run.Flags().StringVar(&dashboardSocketGroup, "dashboard-socket-group", "", "Dedicated Linux feed group (requires a node-owned mode 2710 socket directory)")
 	Run.Flags().BoolVar(&dashboardEnabled, "dashboard-enabled", false, "Enable the provisioned Linux dashboard feed")
+	Run.Flags().String("dashboard-profile", "", "Dashboard preset: standard enables common observations for the HTTPS reader")
+	Run.Flags().String("dashboard-public-origin", "", "HTTPS origin for the managed dashboard reader (requires the standard profile and provisioned Linux feed)")
 	Run.Flags().BoolVar(&dashboardHostResources, "dashboard-host-resources", false, "Collect visible-host CPU/load/memory in the private dashboard feed (requires a dashboard feed; default off)")
+	Run.Flags().BoolVar(&dashboardMachineDetails, "dashboard-machine-details", false, "Collect bounded machine topology, sampled thread affinity and RSS history (requires a dashboard feed and --dashboard-host-resources; default off)")
 	Run.Flags().BoolVar(&dashboardCgroupResources, "dashboard-cgroup-resources", false, "Collect visible domain-cgroup settings, counters and pressure in the private dashboard feed (requires a dashboard feed; default off)")
 	Run.Flags().BoolVar(&dashboardReplayDetails, "dashboard-replay-details", false, "Retain bounded replay diagnostics and rooted-bank history for the private dashboard feed (requires a dashboard feed; default off)")
 	Run.Flags().BoolVar(&dashboardFastExecuted, "dashboard-fast-executed", false, "Retain a provisional local-execution tail (requires --dashboard-replay-details; default off)")
-	Run.Flags().BoolVar(&dashboardCacheDetails, "dashboard-cache-details", false, "Include AccountsDB read-cache observations (requires a dashboard feed; default off)")
-	Run.Flags().BoolVar(&dashboardCacheActivity, "dashboard-cache-activity", false, "Record optional cache lookup and eviction counters (requires --dashboard-cache-details; default off)")
-	Run.Flags().BoolVar(&dashboardNetworkDetails, "dashboard-network-details", false, "Include network observations in the private dashboard feed (requires a dashboard feed; default off)")
-	Run.Flags().BoolVar(&dashboardMachineDetails, "dashboard-machine-details", false, "Collect bounded machine topology, sampled thread affinity and RSS history (requires a dashboard feed and --dashboard-host-resources; default off)")
+	Run.Flags().BoolVar(&dashboardNetworkDetails, "dashboard-network-details", false, "Expose owned TVU and repair socket observations in the private dashboard feed (requires a dashboard feed; default off)")
 	Run.Flags().BoolVar(&dashboardLocalPeers, "dashboard-local-peers", false, "Retain bounded local signed-contact metadata without network endpoints (requires a dashboard feed and --dashboard-network-details; default off)")
+	Run.Flags().BoolVar(&dashboardShredHistory, "dashboard-shred-history", false, "Retain bounded authenticated shred reception history (requires dashboard socket, replay details, network details and block.source=turbine; default off)")
+	Run.Flags().BoolVar(&dashboardCacheDetails, "dashboard-cache-details", false, "Expose AccountsDB read-cache capacities and approximate entry counts in the private dashboard feed (requires a dashboard feed; default off)")
+	Run.Flags().BoolVar(&dashboardCacheActivity, "dashboard-cache-activity", false, "Record optional AccountsDB cache lookup and eviction counters (requires --dashboard-cache-details; default off)")
+	Run.Flags().BoolVar(&dashboardProductionDetails, "dashboard-production-details", false, "Expose the latest local production outcome and accepted-bank costs in the private dashboard feed (requires a dashboard feed; default off)")
+	Run.Flags().BoolVar(&dashboardStorageDetails, "dashboard-storage-details", false, "Expose runtime database write-stall observations in the private dashboard feed (requires a dashboard feed; default off)")
+	Run.Flags().BoolVar(&dashboardIODetails, "dashboard-io-details", false, "Collect process and shared mounted-block I/O counters (requires --dashboard-storage-details; default off)")
 
 	// [replay] section flags
 	Run.Flags().Int64Var(&txParallelism, "txpar", 0, "Transaction execution workers (>0 enables topsort parallelism; explicit 0 is sequential; unset validator mode defaults to 2x CPU cores)")
@@ -938,22 +950,66 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		return fmt.Errorf("rpc.bind_address must be a literal IP address: %q", rpcBindAddress)
 	}
 	disableMetricsServer = getBool("no-metrics-server", "reporting.no_metrics_server")
+	dashboardProfile := getString("dashboard-profile", "dashboard.profile")
+	if dashboardProfile != "" && dashboardProfile != "standard" {
+		return fmt.Errorf("unknown dashboard.profile %q: use standard or leave it empty", dashboardProfile)
+	}
+	getDashboardBool := func(key string, presetDefault bool) bool {
+		cliKey, tomlKey := "dashboard-"+strings.ReplaceAll(key, "_", "-"), "dashboard."+key
+		if presetDefault && !flagChanged(cliKey) && !config.IsSet(tomlKey) {
+			return true
+		}
+		return getBool(cliKey, tomlKey)
+	}
 	dashboardSocket = getString("dashboard-socket", "dashboard.socket")
 	dashboardSocketGroup = getString("dashboard-socket-group", "dashboard.socket_group")
-	dashboardEnabled = getBool("dashboard-enabled", "dashboard.enabled")
+	dashboardPublicOrigin = getString("dashboard-public-origin", "dashboard.public_origin")
+	dashboardEnabled = getDashboardBool("enabled", dashboardProfile == "standard" && dashboardSocket == "")
+	if err := validateDashboardPublicOrigin(dashboardPublicOrigin, dashboardProfile, dashboardSocket, dashboardSocketGroup, runtime.GOOS, dashboardEnabled); err != nil {
+		return err
+	}
+	if dashboardProfile == "standard" && dashboardSocket == "" && dashboardSocketGroup != "" {
+		return fmt.Errorf("dashboard.socket_group requires dashboard.socket with dashboard.profile=standard")
+	}
+	if dashboardProfile == "standard" && dashboardEnabled && runtime.GOOS != "linux" {
+		return fmt.Errorf("dashboard.profile=standard requires an explicit dashboard.socket outside Linux")
+	}
 	var dashboardErr error
 	dashboardSocket, dashboardSocketGroup, dashboardErr = dashboardFeedConfig(dashboardEnabled, dashboardSocket, dashboardSocketGroup, runtime.GOOS)
 	if dashboardErr != nil {
 		return dashboardErr
 	}
-	dashboardHostResources = getBool("dashboard-host-resources", "dashboard.host_resources")
+	standardDashboard := dashboardProfile == "standard" && dashboardSocket != ""
+	dashboardHostResources = getDashboardBool("host_resources", standardDashboard)
+	if err := validateDashboardHostResources(dashboardHostResources, dashboardSocket); err != nil {
+		return err
+	}
+	dashboardMachineDetails = getBool("dashboard-machine-details", "dashboard.machine_details")
+	if err := validateDashboardMachineDetails(dashboardMachineDetails, dashboardSocket, dashboardHostResources); err != nil {
+		return err
+	}
 	dashboardCgroupResources = getBool("dashboard-cgroup-resources", "dashboard.cgroup_resources")
-	dashboardReplayDetails = getBool("dashboard-replay-details", "dashboard.replay_details")
-	dashboardFastExecuted = getBool("dashboard-fast-executed", "dashboard.fast_executed")
+	if err := validateDashboardCgroupResources(dashboardCgroupResources, dashboardSocket); err != nil {
+		return err
+	}
+	dashboardReplayDetails = getDashboardBool("replay_details", standardDashboard)
+	dashboardFastExecuted = getDashboardBool("fast_executed", standardDashboard && dashboardReplayDetails)
 	if dashboardFastExecuted && !dashboardReplayDetails {
 		return fmt.Errorf("dashboard.fast_executed requires dashboard.replay_details")
 	}
-	dashboardCacheDetails = getBool("dashboard-cache-details", "dashboard.cache_details")
+	if err := validateDashboardReplayDetails(dashboardReplayDetails, dashboardSocket); err != nil {
+		return err
+	}
+	dashboardNetworkDetails = getDashboardBool("network_details", standardDashboard)
+	if err := validateDashboardNetworkDetails(dashboardNetworkDetails, dashboardSocket); err != nil {
+		return err
+	}
+	dashboardLocalPeers = getDashboardBool("local_peers", standardDashboard && dashboardNetworkDetails)
+	if err := validateDashboardLocalPeers(dashboardLocalPeers, dashboardSocket, dashboardNetworkDetails); err != nil {
+		return err
+	}
+	dashboardShredHistory = getBool("dashboard-shred-history", "dashboard.shred_history")
+	dashboardCacheDetails = getDashboardBool("cache_details", standardDashboard)
 	dashboardCacheActivity = getBool("dashboard-cache-activity", "dashboard.cache_activity")
 	if dashboardCacheActivity && !dashboardCacheDetails {
 		return fmt.Errorf("dashboard.cache_activity requires dashboard.cache_details")
@@ -961,25 +1017,16 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	if err := validateDashboardCacheDetails(dashboardCacheDetails, dashboardSocket); err != nil {
 		return err
 	}
-	if err := validateDashboardReplayDetails(dashboardReplayDetails, dashboardSocket); err != nil {
+	dashboardProductionDetails = getBool("dashboard-production-details", "dashboard.production_details")
+	if err := validateDashboardProductionDetails(dashboardProductionDetails, dashboardSocket); err != nil {
 		return err
 	}
-	if err := validateDashboardCgroupResources(dashboardCgroupResources, dashboardSocket); err != nil {
-		return err
+	dashboardStorageDetails = getDashboardBool("storage_details", standardDashboard)
+	dashboardIODetails = getDashboardBool("io_details", standardDashboard && dashboardStorageDetails)
+	if dashboardIODetails && !dashboardStorageDetails {
+		return fmt.Errorf("dashboard.io_details requires dashboard.storage_details")
 	}
-	dashboardNetworkDetails = getBool("dashboard-network-details", "dashboard.network_details")
-	dashboardMachineDetails = getBool("dashboard-machine-details", "dashboard.machine_details")
-	dashboardLocalPeers = getBool("dashboard-local-peers", "dashboard.local_peers")
-	if err := validateDashboardLocalPeers(dashboardLocalPeers, dashboardSocket, dashboardNetworkDetails); err != nil {
-		return err
-	}
-	if err := validateDashboardMachineDetails(dashboardMachineDetails, dashboardSocket, dashboardHostResources); err != nil {
-		return err
-	}
-	if err := validateDashboardNetworkDetails(dashboardNetworkDetails, dashboardSocket); err != nil {
-		return err
-	}
-	if err := validateDashboardHostResources(dashboardHostResources, dashboardSocket); err != nil {
+	if err := validateDashboardStorageDetails(dashboardStorageDetails, dashboardSocket); err != nil {
 		return err
 	}
 
@@ -1163,6 +1210,9 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 		}
 	default:
 		return fmt.Errorf("invalid block.source %q - must be 'rpc', 'lightbringer', or 'turbine'", blockSource)
+	}
+	if err := validateDashboardShredHistory(dashboardShredHistory, dashboardSocket, dashboardReplayDetails, dashboardNetworkDetails, blockSource); err != nil {
+		return err
 	}
 
 	// Validator mode: enforce the complete block-production and voting shape.
@@ -1550,11 +1600,13 @@ func runLive(c *cobra.Command, args []string) error {
 			fmt.Printf("  ⚠ Killed %d existing mithril process(es)\n\n", killed)
 		}
 	}
-	dashboard := startNodeDashboard(ctx, runStartedAt, dashboardSocket, dashboardSocketGroup, replay.CurrentRunID, cluster, consensusMode, true, rpcPort != 0, dashboardHostResources, dashboardNetworkDetails, dashboardMachineDetails, dashboardLocalPeers, dashboardReplayDetails, dashboardCacheDetails, dashboardFastExecuted)
-	dashboard.configureCgroupResources(dashboardCgroupResources)
-	dashboard.configureCacheActivity(dashboardCacheActivity)
+	dashboard := startNodeDashboardWithOrigin(ctx, runStartedAt, dashboardSocket, dashboardSocketGroup, replay.CurrentRunID, cluster, consensusMode, true, rpcPort != 0, dashboardReplayDetails, dashboardNetworkDetails, dashboardCacheDetails, dashboardProductionDetails, dashboardStorageDetails, dashboardShredHistory, dashboardHostResources, dashboardMachineDetails, dashboardLocalPeers, dashboardFastExecuted, dashboardPublicOrigin)
 	defer dashboard.close()
 	dashboard.storagePaths(accountsPath, blockstorePath)
+	dashboard.configureCgroupResources(dashboardCgroupResources)
+	dashboard.configureCacheActivity(dashboardCacheActivity)
+	dashboard.configureIO(dashboardIODetails)
+	observeHarmonic := dashboard.configureHarmonic(harmonicConfig.enabled, harmonicConfig.strategy)
 	stopMemoryDiagnostics := startMemoryDiagnostics(ctx, mlog.GetLogDir(), heapProfileThreshold, dashboard)
 	defer stopMemoryDiagnostics()
 
@@ -1670,7 +1722,15 @@ func runLive(c *cobra.Command, args []string) error {
 	if err != nil {
 		klog.Fatalf("%v", err)
 	}
+	shredHistory, historyErr := dashboard.startReceptionHistory()
+	if historyErr != nil {
+		slog.Warn("dashboard reception recorder unavailable", "component", "dashboard", "operation", "reception_start",
+			"entrypoint", "node_run", "reason", "source_unavailable", "run_id", replay.CurrentRunID)
+	}
 	var prewarm nodePrewarmLifetime
+	// Normal replay return finishes explicitly below. An incomplete bootstrap or
+	// panic uses interruption; fatal process exit cannot publish a terminal frame.
+	defer dashboard.finishReceptionHistory(&prewarm, false)
 
 	// Turbine prewarm: start collecting live shreds the moment a snapshot
 	// manifest supplies stakes good enough to verify them — every second of
@@ -1752,6 +1812,7 @@ func runLive(c *cobra.Command, args []string) error {
 				RepairMaxRequestsPerSecond: repairMaxRequestsPerSecond,
 				GossipObserver:             dashboard.gossipObserver(),
 				ObserveHandover:            dashboard.prewarmHandoverObserver(),
+				ShredHistory:               shredHistory,
 			})
 			if err != nil {
 				mlog.Log.Warnf("turbine prewarm failed to start (continuing without): %v", err)
@@ -2438,6 +2499,9 @@ postBootstrap:
 	if !dashboard.attachCacheOwner(accountsDb) {
 		mlog.Log.Warnf("dashboard cache observations unavailable: owner attachment refused")
 	}
+	if !dashboard.attachStorageOwner(accountsDb) {
+		mlog.Log.Warnf("dashboard storage observations unavailable: owner attachment refused")
+	}
 
 	// Alpenglow buffers replayed slots in a fork-aware WorkingSet and folds only
 	// finalized prefixes. Every cluster runs Alpenglow, so rooted-durable
@@ -2802,7 +2866,7 @@ postBootstrap:
 	var sharedGossip *gossip.Client
 	var validatorPrewarmBlocks []*block.Block
 	if consensusMode == "validator" {
-		if turbinePrewarm := prewarm.forReplay(false); turbinePrewarm != nil {
+		if turbinePrewarm := prewarm.forReplay(shredHistory != nil); turbinePrewarm != nil {
 			var dropped int
 			validatorPrewarmBlocks, dropped = turbinePrewarm.Handover()
 			prewarm.mu.Lock()
@@ -2830,6 +2894,7 @@ postBootstrap:
 		if err != nil {
 			klog.Fatalf("validator gossip client: %v", err)
 		}
+		dashboard.observeGossipClient(sharedGossip)
 		go func() {
 			if err := sharedGossip.Run(ctx); err != nil && ctx.Err() == nil {
 				mlog.Log.Errorf("validator gossip client stopped: %v", err)
@@ -2880,6 +2945,7 @@ postBootstrap:
 		tpuCfg.ListenAddr = validatorTPUQUICBind
 		tpuCfg.QUIC.ObserveStreamReadPayload = dashboard != nil && dashboardNetworkDetails
 		tpuCfg.Pipeline.ObserveQueues = dashboard != nil && dashboardNetworkDetails
+		tpuCfg.Pipeline.ObserveWorkerPasses = tpuCfg.Pipeline.ObserveQueues && os.Getenv("MITHRIL_DASHBOARD_TPU_WORKER_TIMING") == "1"
 		tpuCfg.AdvertisedIP = advertisedIP
 		tpuCfg.Pipeline.Sink = topicSink
 		tpuCfg.Pipeline.TxV1Enabled = func() bool {
@@ -2920,7 +2986,7 @@ postBootstrap:
 		var leaderHooks blockprod.LeaderHooks
 		if harmonicConfig.enabled {
 			hooks, stopHarmonic, err := startHarmonic(ctx, harmonicConfig, validatorIdentity, validatorVoteAccount, tpuService, sharedGossip,
-				gossip.TPUSockets{QUIC: tpuAdvertise, ForwardsQUIC: tpuAdvertise}, tpuCfg.Pipeline.TxV1Enabled)
+				gossip.TPUSockets{QUIC: tpuAdvertise, ForwardsQUIC: tpuAdvertise}, tpuCfg.Pipeline.TxV1Enabled, observeHarmonic)
 			if err != nil {
 				klog.Fatalf("start Harmonic: %v", err)
 			}
@@ -2992,20 +3058,28 @@ postBootstrap:
 		if dashboard != nil {
 			certificateObservationVoteAccount = validatorVoteAccount
 		}
+		productionMonitor := dashboard.attachProduction()
+		var observeProduction func(blockprod.LeaderTerminalObservation)
+		var observeParentReady func(blockprod.LeaderParentReadyObservation)
+		if productionMonitor != nil {
+			observeProduction = productionMonitor.observe
+			observeParentReady = productionMonitor.observeParentReady
+		}
 		leaderLoop := blockprod.NewLeaderLoop(blockprod.LeaderLoopConfig{
 			CertificateObservationVoteAccount: certificateObservationVoteAccount,
 			CaptureSelectedSlotFacts:          dashboard != nil && dashboardReplayDetails,
-
-			Controller:            controller,
-			Identity:              validatorIdentity,
-			AccountsDb:            accountsDb,
-			Broadcaster:           broadcaster,
-			ShredVersion:          uint16(turbineShredVersion),
-			EpochSchedule:         epochSchedule,
-			AlpenglowClock:        true,
-			SlotDuration:          blockprod.AlpenglowSlotDuration,
-			CompletionReserve:     time.Duration(validatorCompletionReserveMs) * time.Millisecond,
-			ParentGenerationLease: replay.AcquireChainTipGeneration,
+			ObserveTerminal:                   observeProduction,
+			ObserveParentReady:                observeParentReady,
+			Controller:                        controller,
+			Identity:                          validatorIdentity,
+			AccountsDb:                        accountsDb,
+			Broadcaster:                       broadcaster,
+			ShredVersion:                      uint16(turbineShredVersion),
+			EpochSchedule:                     epochSchedule,
+			AlpenglowClock:                    true,
+			SlotDuration:                      blockprod.AlpenglowSlotDuration,
+			CompletionReserve:                 time.Duration(validatorCompletionReserveMs) * time.Millisecond,
+			ParentGenerationLease:             replay.AcquireChainTipGeneration,
 			ParentContext: func(slot uint64) blockprod.ParentContext {
 				tip := replay.ChainTipParentContext()
 				// Blockprod owns the replay-readiness rule. In particular, the first
@@ -3063,6 +3137,10 @@ postBootstrap:
 		})
 		go func() {
 			defer close(leaderDone)
+			if productionMonitor != nil {
+				productionMonitor.running()
+				defer productionMonitor.stopped()
+			}
 			leaderLoop.Run(leaderStop)
 		}()
 		defer func() {
@@ -3086,7 +3164,8 @@ postBootstrap:
 		RepairCatchupMaxGapSlots:   uint64(repairCatchupMaxGapSlots),
 		RepairMaxRequestsPerSecond: repairMaxRequestsPerSecond,
 		DisableRPCBlockFetch:       !blockRPCFallback,
-		TurbinePrewarm:             prewarm.forReplay(false),
+		TurbinePrewarm:             prewarm.forReplay(shredHistory != nil),
+		ShredHistory:               shredHistory,
 		PrewarmBlocks:              validatorPrewarmBlocks,
 		ShredSpoolDir:              catchupShredSpoolDir(),
 		GossipClient:               sharedGossip,
@@ -3144,8 +3223,10 @@ postBootstrap:
 	// (move + scan budgets) and serialized against folds via the store's
 	// internal lock; the rewind horizon pins are what it must never touch.
 	stopCompactor := func() {}
+	compactionMonitor := dashboard.configureCompaction(compactEnabled)
 	if compactEnabled {
-		stopCompactor = startAccountsCompactor(ctx, accountsDb, compactCfg, compactInterval)
+		compactCfg.ObserveInventory = dashboard != nil && dashboard.storageDetails
+		stopCompactor = startAccountsCompactor(ctx, accountsDb, compactCfg, compactInterval, compactionMonitor)
 		defer stopCompactor()
 	}
 
@@ -3178,6 +3259,7 @@ postBootstrap:
 	dashboard.resolvedMachineWorker("replay_transactions", int(txParallelism))
 	result := runReplayWithRecovery(ctx, accountsDb, accountsPath, manifest, resumeState, uint64(startSlot), liveEndSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, uint16(turbineShredVersion), turbineAlpenglowAddr, validatorIdentity, blockstorePath, int(txParallelism), true, useLightbringer, useTurbine, dbgOpts, metricsWriter, slotCtxSetter, mithrilState, blockFetchOpts, consensusOpts, compactCfg.RewindHorizonBatches, replayStartTime)
 	lastReplayResult = result
+	dashboard.finishReceptionHistory(&prewarm, true)
 	dashboard.stopping()
 	stopCompactor() // join before shutdown closes AccountsDB
 

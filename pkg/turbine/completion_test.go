@@ -66,6 +66,9 @@ func TestSlotAssemblerCompletionRunsOutsideMutexAndClaimsOnce(t *testing.T) {
 		result <- addPacketResult{block: blk, err: err}
 	}()
 	waitSignal(t, started, "blocked transaction verifier")
+	assembler.mu.Lock()
+	firstAt, fullAt := assembler.slots[102815960].firstShredAt, assembler.slots[102815960].fullAt
+	assembler.mu.Unlock()
 
 	edges := make(chan [2]uint64, 1)
 	go func() {
@@ -113,6 +116,11 @@ func TestSlotAssemblerCompletionRunsOutsideMutexAndClaimsOnce(t *testing.T) {
 		t.Fatal("successful completion did not carry per-slot ingress timings")
 	} else if timings.TransactionSigverify <= 0 || timings.BlockDecode <= 0 || timings.TransactionParse <= 0 {
 		t.Fatalf("incomplete per-slot ingress timings: %+v", timings)
+	} else if timings.AssemblyFirstAcceptedAt != firstAt || timings.AssemblyFullAt != fullAt ||
+		timings.ReadyAt.Before(releasedAt) || timings.ReadyAt.IsZero() || timings.FullToReady != timings.ReadyAt.Sub(fullAt) {
+		t.Fatalf("completion did not preserve owner timing values: %+v", timings)
+	} else if start, ok := got.block.TurbineReplayAdmissionStart(); !ok || start != timings.ReadyAt {
+		t.Fatal("ready and replay-admission boundary diverged")
 	}
 
 	if got.block.ShredFullNanos == 0 || got.block.ShredFullNanos > releasedAt.UnixNano() {
@@ -136,7 +144,9 @@ func TestSlotAssemblerResetSupersedesInFlightCompletion(t *testing.T) {
 	assembler := NewSlotAssembler()
 	started := make(chan struct{})
 	release := make(chan struct{})
-	assembler.verifyTransactions = func(context.Context, *block.Block) error {
+	var candidate *block.Block
+	assembler.verifyTransactions = func(_ context.Context, blk *block.Block) error {
+		candidate = blk
 		close(started)
 		<-release
 		return nil
@@ -174,13 +184,20 @@ func TestSlotAssemblerResetSupersedesInFlightCompletion(t *testing.T) {
 	if callbacks.Load() != 0 {
 		t.Fatalf("stale completion invoked callback %d times", callbacks.Load())
 	}
+	if candidate == nil {
+		t.Fatal("reset test did not reach decoded candidate")
+	}
+	if _, ok := candidate.TurbineIngressTimings(); ok {
+		t.Fatal("superseded completion retained trusted timing")
+	}
 }
 
 func TestSlotAssemblerVerificationFailureRemainsFailClosed(t *testing.T) {
 	packets := fixtures.DataShreds(t, "mainnet", 102815960)
 	assembler := NewSlotAssembler()
 	verifyErr := errors.New("test invalid transaction signature")
-	assembler.verifyTransactions = func(context.Context, *block.Block) error { return verifyErr }
+	var candidate *block.Block
+	assembler.verifyTransactions = func(_ context.Context, blk *block.Block) error { candidate = blk; return verifyErr }
 	var callbacks atomic.Int32
 	assembler.SetOnComplete(func(uint64, uint32, uint32) { callbacks.Add(1) })
 
@@ -198,6 +215,12 @@ func TestSlotAssemblerVerificationFailureRemainsFailClosed(t *testing.T) {
 	}
 	if callbacks.Load() != 0 {
 		t.Fatal("invalid block invoked completion callback")
+	}
+	if candidate == nil {
+		t.Fatal("failure test did not reach decoded candidate")
+	}
+	if _, ok := candidate.TurbineIngressTimings(); ok {
+		t.Fatal("failed signature verification retained trusted timing")
 	}
 }
 
@@ -235,7 +258,9 @@ func TestSlotAssemblerFinalizationHonorsHintLearnedDuringVerification(t *testing
 	assembler := NewSlotAssembler()
 	started := make(chan struct{})
 	release := make(chan struct{})
-	assembler.verifyTransactions = func(context.Context, *block.Block) error {
+	var candidate *block.Block
+	assembler.verifyTransactions = func(_ context.Context, blk *block.Block) error {
+		candidate = blk
 		close(started)
 		<-release
 		return nil
@@ -265,8 +290,70 @@ func TestSlotAssemblerFinalizationHonorsHintLearnedDuringVerification(t *testing
 	if assembler.SlotCompleted(100) {
 		t.Fatal("block contradicting a hint learned during verification completed")
 	}
+	if candidate == nil {
+		t.Fatal("noncanonical test did not reach decoded candidate")
+	}
+	if _, ok := candidate.TurbineIngressTimings(); ok {
+		t.Fatal("noncanonical completion retained trusted timing")
+	}
 	count, slot, _, want := assembler.NonCanonicalBlockIDStats()
 	if count != 1 || slot != 100 || want != (solana.Hash{0xff}) {
 		t.Fatalf("noncanonical stats = count %d slot %d want %s", count, slot, want)
+	}
+}
+
+func TestCompletionCarriesOriginalAlpenglowTimingOnlyAfterAcceptance(t *testing.T) {
+	assembler := NewSlotAssembler()
+	var work *slotCompletionWork
+	for _, shred := range generatedAlpenglowDataShreds(t) {
+		next, err := assembler.addShredFrom(shred, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if next != nil {
+			if work != nil {
+				t.Fatal("fixture claimed more than one completion")
+			}
+			work = next
+		}
+	}
+	if work == nil {
+		t.Fatal("fixture did not become reconstructable")
+	}
+	processed := assembler.processCompletion(context.Background(), work)
+	if processed.err != nil || processed.block == nil || processed.completionReadyAt.IsZero() {
+		t.Fatalf("process completion: block=%v err=%v ready=%v", processed.block != nil, processed.err, processed.completionReadyAt)
+	}
+	if _, ok := processed.block.TurbineIngressTimings(); ok {
+		t.Fatal("unaccepted decoded candidate acquired trusted timings")
+	}
+	blk, err := assembler.finalizeCompletion(work, processed)
+	if err != nil || blk == nil || !blk.HasAlpenglowBlockID {
+		t.Fatalf("accepted completion: block=%v err=%v", blk != nil, err)
+	}
+	timings, ok := blk.TurbineIngressTimings()
+	if !ok || timings.AssemblyFirstAcceptedAt != work.state.firstShredAt || timings.AssemblyFullAt != work.state.fullAt ||
+		timings.ReadyAt != processed.completionReadyAt || timings.ReadyAt.IsZero() {
+		t.Fatalf("accepted completion lost original times: %+v", timings)
+	}
+	if timings.AssemblyFirstAcceptedAt.UnixNano() != blk.ShredFirstNanos || timings.AssemblyFullAt.UnixNano() != blk.ShredFullNanos {
+		t.Fatal("existing wall-clock fields changed meaning")
+	}
+}
+
+func TestCompletionAdmissionFallbackDoesNotInventReadyTime(t *testing.T) {
+	assembler := NewSlotAssembler()
+	state := &slotState{slot: 1, completing: true}
+	assembler.slots[state.slot] = state
+	blk, err := assembler.finalizeCompletion(&slotCompletionWork{state: state}, processedSlotCompletion{block: &block.Block{Slot: 1}})
+	if err != nil || blk == nil {
+		t.Fatalf("completion: block=%v err=%v", blk != nil, err)
+	}
+	timings, ok := blk.TurbineIngressTimings()
+	if !ok || !timings.ReadyAt.IsZero() || !timings.AssemblyFirstAcceptedAt.IsZero() || !timings.AssemblyFullAt.IsZero() {
+		t.Fatalf("unknown source timing was synthesized: %+v", timings)
+	}
+	if _, ok := blk.TurbineReplayAdmissionStart(); !ok {
+		t.Fatal("existing replay-admission fallback was removed")
 	}
 }

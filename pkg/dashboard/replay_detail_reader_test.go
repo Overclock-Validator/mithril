@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -788,4 +789,110 @@ func TestReplayDetailReaderClockCommitAndFullWidthBudget(t *testing.T) {
 		t.Fatal("full-width final page lost a raw source member")
 	}
 	t.Logf("full-width public family bytes=%d pages=%d", total, len(c.public.pages))
+}
+
+// A new live replay context gets one bootstrap retry even if prior-context caches exist.
+func TestReplayDetailReaderBootstrapPerLiveContext(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		core := replayDetailLiveCore(0)
+		g := replayGate(replayDetailLiveStatus(core), time.Now())
+		g.revision, g.stamp = 1, statusStamp{nodeEpoch: 1, familyEpoch: 1}
+		var gate atomic.Pointer[replayDetailGate]
+		var gateMu sync.Mutex
+		publish := func(next *replayDetailGate) {
+			gateMu.Lock()
+			defer gateMu.Unlock()
+			if next != nil {
+				g = *next
+			}
+			copy := g
+			copy.ObservedAt = time.Now()
+			gate.Store(&copy)
+		}
+		publish(nil)
+		var selectedReads atomic.Int32
+		var replaceDuringRead atomic.Bool
+		client := &http.Client{Transport: selectedEpochTransport(func(request *http.Request) (*http.Response, error) {
+			if request.URL.Path == "/details/replay" && replaceDuringRead.Swap(false) {
+				replacement := *gate.Load()
+				replacement.RunID = "during-collection"
+				replacement.revision++
+				replacement.stamp.nodeEpoch++
+				replacement.stamp.familyEpoch++
+				publish(&replacement)
+			}
+			family := "replay"
+			if request.URL.Path == "/details/selected" {
+				selectedReads.Add(1)
+				family = "selected_slots"
+			}
+			w := httptest.NewRecorder()
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, `{"schema_version":1,"family":"`+family+`","state":"unavailable","reason":"waiting_source"}`)
+			return w.Result(), nil
+		})}
+		selected := &selectedWindowReader{client: client, gate: &gate,
+			last: &selectedWindowHighWater{binding: core.Binding}}
+		r := &replayDetailReader{client: client, gate: &gate, done: make(chan struct{}),
+			selected: selected, cursor: &replayDetailCursor{core: core}}
+		ctx, cancel := context.WithCancel(context.Background())
+		statusDone := make(chan struct{})
+		go func() {
+			defer close(statusDone)
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					publish(nil)
+				}
+			}
+		}()
+		go r.run(ctx)
+		defer func() { cancel(); <-r.done; <-statusDone }()
+		started := time.Now()
+		at := func(elapsed time.Duration, want int32) {
+			t.Helper()
+			time.Sleep(time.Until(started.Add(elapsed)))
+			synctest.Wait()
+			if got := selectedReads.Load(); got != want {
+				t.Fatalf("selected reads after %v: got %d, want %d", elapsed, got, want)
+			}
+		}
+		at(100*time.Millisecond, 1)
+		// A new node invalidates both old caches; collect now and retry once in one second.
+		next := *gate.Load()
+		next.RunID, next.revision, next.stamp = "new-node", 2, statusStamp{nodeEpoch: 2, familyEpoch: 2}
+		publish(&next)
+		at(5100*time.Millisecond, 2)
+		at(6100*time.Millisecond, 3)
+		at(7300*time.Millisecond, 3)
+		// Status loss/recovery for the same full context does not grant another retry.
+		next.State, next.Reason, next.revision = "stale", "status_stale", 3
+		next.stamp = statusStamp{nodeEpoch: 3, familyEpoch: 3}
+		publish(&next)
+		at(11100*time.Millisecond, 3)
+		next.State, next.Reason, next.revision = "fresh", "", 4
+		next.stamp = statusStamp{nodeEpoch: 4, familyEpoch: 4}
+		publish(&next)
+		at(17300*time.Millisecond, 4)
+		// A real replay rewind is a new context and gets its own single retry.
+		next.Rewinds++
+		next.revision, next.stamp = 5, statusStamp{nodeEpoch: 4, familyEpoch: 5}
+		publish(&next)
+		at(21100*time.Millisecond, 5)
+		at(22100*time.Millisecond, 6)
+		at(23300*time.Millisecond, 6)
+		// Replacement during collection cannot spend a retry before its own admission.
+		next.RunID, next.revision, next.stamp = "before-collection", 6, statusStamp{nodeEpoch: 5, familyEpoch: 6}
+		publish(&next)
+		replaceDuringRead.Store(true)
+		at(27100*time.Millisecond, 7)
+		at(28300*time.Millisecond, 7)
+		at(32100*time.Millisecond, 8)
+		at(33100*time.Millisecond, 9)
+		at(34300*time.Millisecond, 9)
+	})
 }

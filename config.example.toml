@@ -811,8 +811,13 @@ name = "mithril"
 # [dashboard] - Optional local dashboard feed
 # ============================================================================
 [dashboard]
+    # After provisioning the Linux feed and reader, collect the standard telemetry for an authenticated HTTPS dashboard.
+    # profile = "standard"
+    # Optional HTTPS origin for the managed reader. Requires profile = "standard" and the provisioned Linux feed.
+    # public_origin = "https://dashboard.example.com"
     # Linux service profile; provision the reader and feed directory first.
     # enabled = true
+    # fast_executed = true # Optional provisional local-execution feed; requires replay_details.
 
 # ============================================================================
 # [snapshot] - Snapshot Download Settings

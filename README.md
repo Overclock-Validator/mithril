@@ -247,9 +247,8 @@ We're actively expanding RPC method coverage. Upcoming methods include transacti
 ### Dashboard API
 
 Mithril can provide an opt-in, read-only status feed for a separate dashboard
-in validator or verifying mode. See the [dashboard API setup and security
-notes](docs/dashboard-api.md#private-setup). The API does not include a UI or
-control the node.
+in validator or verifying mode. Follow the [production HTTPS setup](docs/dashboard-api.md#production-https-setup)
+to configure the node, reader and authenticated gateway for a dashboard viewer.
 
 ### Current Limitations
 

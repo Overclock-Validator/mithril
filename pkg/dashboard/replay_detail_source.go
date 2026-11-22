@@ -35,6 +35,7 @@ type replayDetailSource struct {
 	done     chan struct{}
 	held     *heldScheduleSource
 	selected *selectedWindowSource
+	activity *activityHistorySource
 }
 
 func (s *replayDetailSource) observeStatus(snapshot Snapshot, observedAt time.Time) {

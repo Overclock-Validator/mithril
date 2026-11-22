@@ -27,7 +27,7 @@ type deadPayload struct{ offset, length int64 }
 // some dead gaps allocated; the next cycle derives those gaps from the retained
 // offsets and can retry without reading discarded headers.
 // Caller holds foldMu and has excluded every in-horizon/parked whole-file pin.
-func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte, indexCache *sparseIndexCache) (reclaimed, scanned int64, deleted bool, err error) {
+func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte, indexCache *sparseIndexCache, observation *compactionLivenessScan) (reclaimed, scanned int64, deleted bool, err error) {
 	m, err := ReadSegmentManifest(c.manifestPath)
 	if err != nil {
 		return 0, 0, false, err
@@ -55,6 +55,7 @@ func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte,
 	retained := make([]ManifestRecord, 0, len(m.Records))
 	foundUndo := 0
 	var next, retainedEnd uint64
+	var liveBytes, undoBytes, holeBytes uint64
 	addDeadRange := func(start, end uint64) {
 		// Keep boundary pages containing any part of a retained record.
 		start = (start + 4095) &^ uint64(4095)
@@ -95,11 +96,25 @@ func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte,
 		if getErr != nil {
 			return 0, scanned, false, getErr
 		}
-		if found && current.FileId == c.fileId {
+		currentLive := found && current.FileId == c.fileId
+		if currentLive {
 			if current.Offset != r.Offset || current.Slot != c.slot {
 				return 0, scanned, false, fmt.Errorf("index location disagrees with source for %x", r.Pubkey)
 			}
 			keep = true
+		}
+		if observation != nil && m.Kind != ManifestKindSparse {
+			if currentLive {
+				liveBytes += next - r.Offset
+			} else if keep {
+				undoBytes += next - r.Offset
+			} else {
+				start := (r.Offset + hdrLen + 4095) &^ uint64(4095)
+				end := (r.Offset + hdrLen + length) &^ uint64(4095)
+				if end > start {
+					holeBytes += end - start
+				}
+			}
 		}
 		if keep {
 			addDeadRange(retainedEnd, r.Offset)
@@ -111,6 +126,11 @@ func (db *AccountsDb) sparsifyFile(c compactCandidate, undo map[uint64][32]byte,
 	}
 	if (m.Kind != ManifestKindSparse && next != m.DataLen) || foundUndo != len(undo) {
 		return 0, scanned, false, fmt.Errorf("manifest does not cover source or all undo records")
+	}
+	// Kind-3 manifests omit dead headers, so they cannot provide the complete
+	// record-span and payload-page classification required by this observation.
+	if observation != nil && m.Kind != ManifestKindSparse {
+		*observation = compactionLivenessScan{complete: true, examined: m.DataLen, live: liveBytes, undo: undoBytes, holes: holeBytes}
 	}
 	addDeadRange(retainedEnd, m.DataLen)
 	if len(retained) > 0 && len(dead) == 0 && len(retained) == len(m.Records) {

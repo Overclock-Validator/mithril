@@ -106,7 +106,7 @@ func TestLocalPeerFinalAdmission(t *testing.T) {
 	t.Run("independent leases and nil admission", func(t *testing.T) {
 		_, r := setup(t)
 		w := request(r)
-		detail, detailErr := parseDetailRemaining(w.Header().Get(replayDetailRemainingHeader), NetworkDetailFreshFor)
+		detail, detailErr := parseStorageDetailRemaining(w.Header().Get(replayDetailRemainingHeader))
 		statusMS, statusErr := strconv.ParseInt(w.Header().Get(statusRemainingHeader), 10, 64)
 		if w.Code != http.StatusOK || detailErr != nil || statusErr != nil || statusMS <= 0 ||
 			detail <= time.Duration(statusMS)*time.Millisecond {

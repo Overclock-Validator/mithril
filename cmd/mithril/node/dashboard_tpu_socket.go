@@ -38,15 +38,24 @@ func tpuQueuesMeasurement(raw pipeline.QueueObservation, observed bool, binding 
 			return nil
 		}
 	}
+	var workers *dashboard.TPUSigverifyWorkers
+	if raw.SigverifyWorkers < 0 || raw.SigverifyInFlight < 0 || raw.SigverifyInFlight > int64(raw.SigverifyWorkers) {
+		return nil
+	}
+	if raw.SigverifyWorkers > 0 {
+		workers = &dashboard.TPUSigverifyWorkers{BatchesInFlight: uint64(raw.SigverifyInFlight), Configured: uint64(raw.SigverifyWorkers)}
+		workers.Passes = tpuWorkerPassesMeasurement(raw)
+	}
 	until := raw.SampledAt.Add(dashboard.NetworkDetailFreshFor)
 	if cap := started.Add(dashboard.NetworkDetailFreshFor); until.After(cap) {
 		until = cap
 	}
 	return &tpuQueuesCapture{binding: binding, freshUntil: until, detail: dashboard.TPUQueuesDetail{
 		Scope: "tpu_pipeline_queue_samples", Generation: generation, StartedAt: raw.StartedAt.UTC(), SampledAt: raw.SampledAt.UTC(),
-		Ingress:     dashboard.TPUQueueGauge{Length: uint64(raw.Ingress.Length), Capacity: uint64(raw.Ingress.Capacity)},
-		DedupOutput: dashboard.TPUQueueGauge{Length: uint64(raw.DedupOutput.Length), Capacity: uint64(raw.DedupOutput.Capacity)},
-		Verified:    dashboard.TPUQueueGauge{Length: uint64(raw.Verified.Length), Capacity: uint64(raw.Verified.Capacity)}}}
+		Ingress:          dashboard.TPUQueueGauge{Length: uint64(raw.Ingress.Length), Capacity: uint64(raw.Ingress.Capacity)},
+		DedupOutput:      dashboard.TPUQueueGauge{Length: uint64(raw.DedupOutput.Length), Capacity: uint64(raw.DedupOutput.Capacity)},
+		Verified:         dashboard.TPUQueueGauge{Length: uint64(raw.Verified.Length), Capacity: uint64(raw.Verified.Capacity)},
+		SigverifyWorkers: workers}}
 }
 
 type tpuPayloadCapture struct {

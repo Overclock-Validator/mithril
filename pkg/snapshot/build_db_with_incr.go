@@ -281,7 +281,7 @@ func BuildAccountsDbAuto(
 	defer waitAppendVecsSynced()
 
 	// Show indexing progress for shard flush
-	indexProgress := progress.NewIndexingProgress("Flush (shard logs)")
+	indexProgress := dp.NewIndexingProgress()
 	indexProgress.Start(numShards)
 	if err := closeSnapshotShardLogger(ctx, sl, indexProgress); err != nil {
 		return nil, nil, err
@@ -291,6 +291,7 @@ func BuildAccountsDbAuto(
 	if err != nil {
 		return nil, nil, fmt.Errorf("initializing pebble from SST files: %w", err)
 	}
+	indexProgress.RecordSSTIngestReturn()
 	index.Close()
 
 	if err := waitAppendVecsSynced(); err != nil {

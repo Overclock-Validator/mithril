@@ -1,6 +1,7 @@
 package node
 
 import (
+	"context"
 	"errors"
 	"math"
 	"strings"
@@ -230,4 +231,71 @@ func replayDetailProgressStable(before, after replay.ProgressSnapshot, source re
 	return source.Generation != 0 && source.Attempt != 0 &&
 		before.Attempt == after.Attempt && before.Rewinds == after.Rewinds && before.StartedAt.Equal(after.StartedAt) &&
 		source.Attempt == before.Attempt && source.Rewinds == before.Rewinds && source.StartedAt.Equal(before.StartedAt)
+}
+
+// sampleActivityHistory reads bounded detached history outside the replay loop.
+func (d *nodeDashboard) sampleActivityHistory(ctx context.Context, capturedAt time.Time) (dashboard.ActivityHistory, error) {
+	if err := ctx.Err(); err != nil {
+		return dashboard.ActivityHistory{}, err
+	}
+	if d == nil {
+		return dashboard.ActivityHistory{}, errors.New("source_unavailable")
+	}
+	d.mu.Lock()
+	run, started := d.state.RunID, d.state.StartedAt
+	var genesis *string
+	if d.state.GenesisHash != nil {
+		value := *d.state.GenesisHash
+		genesis = &value
+	}
+	d.mu.Unlock()
+	before, ok := d.progress.Snapshot()
+	if !ok {
+		return dashboard.ActivityHistory{}, errors.New("waiting_source")
+	}
+	s, ok := d.progress.SelectedSlotsSnapshot()
+	if !ok {
+		return dashboard.ActivityHistory{}, errors.New("waiting_source")
+	}
+	source := replay.ReplayDiagnosticSnapshot{RunID: s.RunID, Generation: s.Generation,
+		Attempt: s.Attempt, Rewinds: s.Rewinds, StartedAt: s.StartedAt, ResetAt: s.ResetAt}
+	if err := ctx.Err(); err != nil {
+		return dashboard.ActivityHistory{}, err
+	}
+	rows := s.ActivityHistory()
+	after, ok := d.progress.Snapshot()
+	if !ok || source.RunID != run || !replayDetailProgressStable(before, after, source) {
+		return dashboard.ActivityHistory{}, errors.New("binding_changed")
+	}
+	d.mu.Lock()
+	unchanged := d.state.RunID == run && d.state.StartedAt.Equal(started) && sameReplayDetailGenesis(d.state.GenesisHash, genesis)
+	d.mu.Unlock()
+	if !unchanged {
+		return dashboard.ActivityHistory{}, errors.New("binding_changed")
+	}
+	if len(rows) > 0 && (!before.HasDurableSlot || !after.HasDurableSlot || rows[0].LastSlot > before.DurableSlot || rows[0].LastSlot > after.DurableSlot) {
+		return dashboard.ActivityHistory{}, errors.New("binding_changed")
+	}
+	binding := dashboard.ReplayDetailBinding{RunID: run,
+		NodeStartedAt: started.UTC(), GenesisHash: genesis, SourceGeneration: source.Generation,
+		Attempt: source.Attempt, Rewinds: source.Rewinds, AttemptStartedAt: source.StartedAt.UTC(), ResetAt: source.ResetAt.UTC()}
+	if err := ctx.Err(); err != nil {
+		return dashboard.ActivityHistory{}, err
+	}
+	return activityHistoryMeasurement(rows, binding, capturedAt, s.UpdatedAt)
+}
+
+func activityHistoryMeasurement(rows []replay.ChainActivitySummary, binding dashboard.ReplayDetailBinding, capturedAt, observedAt time.Time) (dashboard.ActivityHistory, error) {
+	if len(rows) == 0 {
+		return dashboard.ActivityHistory{}, errors.New("waiting_source")
+	}
+	h := dashboard.ActivityHistory{SchemaVersion: 1, Binding: binding,
+		CapturedAt: capturedAt.UTC(), ObservedAt: observedAt.UTC(), Rows: make([]dashboard.ActivityHistoryInterval, 0, len(rows))}
+	for _, row := range rows {
+		h.Rows = append(h.Rows, dashboard.ActivityHistoryInterval{AnchorSlot: row.AnchorSlot, LastSlot: row.LastSlot,
+			StartTime: row.StartTime, EndTime: row.EndTime, Blocks: row.Blocks,
+			Transactions: row.Transactions.Total, NonVote: row.Transactions.NonVote,
+			Failed: row.Transactions.Failed, FailedNonVote: row.Transactions.NonVoteFailed})
+	}
+	return h, nil
 }

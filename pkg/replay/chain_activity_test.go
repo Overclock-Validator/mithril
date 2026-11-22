@@ -101,3 +101,53 @@ func TestChainActivityMissingConflictingAndSaturatedEvidence(t *testing.T) {
 	missing.Settle([]CertificateFoldEvidence{outcomeEvidence(c[1])}, time.Unix(2000, 0))
 	require.False(t, missing.activitySnapshot(12).Available)
 }
+
+func TestDetachedActivityHistory(t *testing.T) {
+	carriers := activityCarriers(20)
+	r := settleActivity(t, carriers)
+	s := SelectedSlotSnapshot{UpdatedAt: r.summary.SampledAt}
+	for _, c := range carriers {
+		s.Records = append(s.Records, SelectedSlotRecord{CertificateFoldEvidence: outcomeEvidence(c),
+			ParentSlot: c.ParentSlot, ParentBlockID: c.ParentBlockID, HasParentBlockID: c.HasParentBlockID,
+			ExecutionParentSlot: c.ExecutionParentSlot, ExecutionParentBankhash: c.ExecutionParentBankhash,
+			BankTime: c.BankTime, Transactions: c.Transactions})
+	}
+	history := s.ActivityHistory()
+	require.NotEmpty(t, history)
+	require.Equal(t, r.activitySnapshot(carriers[len(carriers)-1].Slot), history[0])
+	for i := 1; i < len(history); i++ {
+		require.Equal(t, history[i-1].AnchorSlot, history[i].LastSlot)
+	}
+	s.Records[12].Gap = true
+	for _, interval := range s.ActivityHistory() {
+		require.Greater(t, interval.AnchorSlot, carriers[12].Slot)
+	}
+	s.Records[len(s.Records)-1].Gap = true
+	require.Empty(t, s.ActivityHistory())
+	s.Records[len(s.Records)-1].Gap = false
+	s.Records[len(s.Records)-1].BankTime = 0
+	require.Empty(t, s.ActivityHistory(), "unknown activity is not a zero-rate interval")
+	s.Records = make([]SelectedSlotRecord, SelectedSlotCapacity+1)
+	require.Empty(t, s.ActivityHistory(), "detached history remains bounded")
+}
+
+func TestPublishedSelectedActivityHistory(t *testing.T) {
+	carriers := activityCarriers(20)
+	p := selectedProgress(t)
+	r := NewCertificateOutcomes(solana.PublicKey{})
+	p.enableSelectedSlots(r)
+	for _, c := range carriers {
+		require.True(t, r.Observe(c))
+		require.True(t, r.observeSelectedFacts(c, selectedFacts(t, c.Slot, time.Unix(2000, 0))))
+		r.Settle([]CertificateFoldEvidence{outcomeEvidence(c)}, time.Unix(2000, 0))
+	}
+	p.publishSelectedSlots(r)
+	s, ok := p.SelectedSlotsSnapshot()
+	require.True(t, ok)
+	history := s.ActivityHistory()
+	require.NotEmpty(t, history)
+	require.Equal(t, r.activitySnapshot(carriers[len(carriers)-1].Slot), history[0])
+	p.rewound()
+	_, ok = p.SelectedSlotsSnapshot()
+	require.False(t, ok)
+}

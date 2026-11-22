@@ -434,14 +434,14 @@ func decodeMachineManifest(body []byte) (MachineDetailManifest, error) {
 		return m, bad
 	}
 	b := m.Binding
-	if m.SchemaVersion != 1 || m.Family != "machine" || !utf8.ValidString(b.RunID) || b.RunID == "" || len(b.RunID) > 128 || !validReplayDetailTime(b.NodeStartedAt) || !validReplayDetailHash(b.GenesisHash, true) || b.SourceGeneration == 0 || b.SourceGeneration == math.MaxUint64 || !validReplayDetailTime(m.CapturedAt) || !validMachineDigest(m.Generation) || m.Bytes <= 0 || m.Bytes > MaxMachineDetailBytes || len(m.Pages) == 0 || len(m.Pages) > machineMaxPages {
+	if m.SchemaVersion != 1 || m.Family != "machine" || !utf8.ValidString(b.RunID) || b.RunID == "" || len(b.RunID) > 128 || !validReplayDetailTime(b.NodeStartedAt) || !validReplayDetailHash(b.GenesisHash, true) || b.SourceGeneration == 0 || b.SourceGeneration == math.MaxUint64 || !validReplayDetailTime(m.CapturedAt) || !validDetailDigest(m.Generation) || m.Bytes <= 0 || m.Bytes > MaxMachineDetailBytes || len(m.Pages) == 0 || len(m.Pages) > machineMaxPages {
 		return m, bad
 	}
 	kinds := []string{"header", "cpus", "numa", "thread_groups", "links"}
 	counts, previous := [5]int{}, 0
 	for i, p := range m.Pages {
 		kind := slices.Index(kinds, p.Kind)
-		if kind < 0 || kind < previous || p.Page != i || p.Bytes <= 0 || p.Bytes > MaxMachinePageBytes || !validMachineDigest(p.Digest) || p.Offset != counts[kind] || p.Count < 1 || p.Count > machinePageRows || (i == 0) != (kind == 0) || kind == 0 && p.Count != 1 || i > 0 && kind == previous && m.Pages[i-1].Count != machinePageRows {
+		if kind < 0 || kind < previous || p.Page != i || p.Bytes <= 0 || p.Bytes > MaxMachinePageBytes || !validDetailDigest(p.Digest) || p.Offset != counts[kind] || p.Count < 1 || p.Count > machinePageRows || (i == 0) != (kind == 0) || kind == 0 && p.Count != 1 || i > 0 && kind == previous && m.Pages[i-1].Count != machinePageRows {
 			return m, bad
 		}
 		counts[kind] += p.Count

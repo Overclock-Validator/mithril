@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"sync/atomic"
 )
 
 type sparseRelocation struct {
@@ -18,7 +19,7 @@ type sparseRelocation struct {
 // Only a sparse manifest can describe these files: discarded headers make the
 // sequential appendvec parser unsafe. The caller holds foldMu and discards its
 // index cache after a successful move, before sparsifying the source.
-func (db *AccountsDb) compactSparseLive(c compactCandidate, undo map[uint64][32]byte, cache *sparseIndexCache, minDeadFraction float64, moveBudget int64) (result sparseRelocation, err error) {
+func (db *AccountsDb) compactSparseLive(c compactCandidate, undo map[uint64][32]byte, cache *sparseIndexCache, minDeadFraction float64, moveBudget int64, relocated *atomic.Uint64) (result sparseRelocation, err error) {
 	m, err := ReadSegmentManifest(c.manifestPath)
 	if err != nil {
 		return result, err
@@ -126,7 +127,7 @@ func (db *AccountsDb) compactSparseLive(c compactCandidate, undo map[uint64][32]
 		}
 		result.scanned += int64(span.length)
 	}
-	result.allocated, err = db.publishCompactOutput(c, data, records, true)
+	result.allocated, err = db.publishCompactOutput(c, data, records, true, relocated)
 	if err != nil {
 		return result, err
 	}

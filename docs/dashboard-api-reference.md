@@ -1,84 +1,265 @@
 # Dashboard API reference
 
-When `--cluster-file` is configured, the public reader also provides
-`/api/v1/cluster`, `/api/v1/cluster-map`, `/api/v1/cluster-versions`,
-and `/api/v1/cluster-performance-history`. Check each response's state and
-provider timestamps; unavailable and stale data must not be treated as zero.
-For collection, provenance, limits and country attribution, see the
-[collector guide](../cmd/mithril-dashboard-collect/README.md).
+For configuration and deployment, see the [setup guide](dashboard-api.md).
 
-The directory returns at most nine rows per page. It accepts `offset`,
-`order`, `country`, `search` and `generation`; the other cluster routes
-accept only `generation`. Reuse a response's generation while paging or
-combining views: a changed generation returns HTTP 409. All cluster routes
-share a five-request-per-second limiter with a burst of ten; use per-client
-limits at the reverse proxy as well.
+## Optional data
 
-Responses include `Mithril-Cluster-Remaining-Milliseconds`. A zero value
-means the response is no longer fresh, even if its cached body says otherwise.
-Do not display expired values as current. The shared lifetime is limited by
-the snapshot, fresh providers, included Titan windows and RPC performance
-receipt times. Check each provider's state independently as well.
+`/api/v1/features?include=advanced_status` reports optional route families enabled by the reader. It is
+not a complete list of disclosure flags. The reader does not request public
+providers; a separately run collector writes the optional cluster snapshot.
+The reader writes aggregate history only when a history directory is configured.
+Use the query above to discover node-display: the default features response
+does not advertise that route, even when it is enabled.
+
+## Optional routes
+
+These read-only routes are available only when their reader options are enabled.
+Related node observations must also be enabled for linked-node details. Missing,
+stale or unverified inputs must not be interpreted as zero.
+
+| Reader option | Route family |
+| --- | --- |
+| `--replay-details` | `/api/v1/details/replay`, `/api/v1/details/selected`, `/api/v1/details/selected-window`, `/api/v1/details/activity-history`, `/api/v1/details/slots`, `/api/v1/details/schedule` |
+| `--fast-executed` | `/api/v1/details/recent-executed` |
+| `--network-details` | `/api/v1/details/network` |
+| `--cache-details` | `/api/v1/details/cache` |
+| `--production-details` | `/api/v1/details/production` |
+| `--storage-details` | `/api/v1/details/storage` |
+| `--machine-details` | `/api/v1/details/machine` |
+| `--local-peers` | `/api/v1/details/peers` |
+| `--reception-history` | `/api/v1/details/reception` |
+| `--history-dir` | `/api/v1/history` |
+| `--cluster-file` | `/api/v1/cluster`, `/api/v1/cluster-map`, `/api/v1/cluster-versions`, `/api/v1/cluster-performance-history`, `/api/v1/node-display` |
+
+The fast execution route requires node `--dashboard-fast-executed` (or
+`dashboard.fast_executed = true`), reader `--fast-executed`, and replay
+details on both. It reports provisional local execution, not finality. Connect
+to `/websocket?include=advanced_status` on the configured origin. Its
+`recent_executed` value is a change hint (`true`) or
+clear (`null`); fetch the bounded tail over HTTP and honor both remaining
+lifetime headers from the request start: use the smaller of
+`Mithril-Status-Remaining-Milliseconds` and
+`Mithril-Detail-Remaining-Milliseconds`. A repeat of the same sequence or a
+reconnect does not extend an existing observation's lifetime.
+
+The response contains `schema_version`, `family`, `scope`, `state`,
+`sequence`, `sampled_at`, `binding` and `records`. Match the binding's
+`run_id`, `genesis_hash`, `node_started_at`, `attempt`, `rewinds` and
+`attempt_started_at` to the current advanced status. Each record has `at`,
+`slot`, `bankhash`, `transactions`, `compute_units` and
+`work_counters_saturated`, and may include `block_id`. A present non-null
+`block_id` is a canonical nonzero 32-byte base58 Alpenglow block identity;
+absence or `null` means unknown. It is distinct from `bankhash` and does not
+establish finality by itself. A finalized bar requires an exact slot/block-ID
+proof from fresh, safe consensus with the same current binding. Sequence,
+slots and counters are decimal strings.
+Update readers before enabling producers that emit `block_id`: older strict
+readers reject that additional record field.
+Clear the observation on a null hint,
+disconnect, binding change or expiry. Polling does not guarantee every update.
+
+`/api/v1/details/selected-window` returns one JSON object with a `manifest`
+and the latest six `pages` at most, in ascending page order (up to 48 rows).
+The manifest describes the entire retained window, so its `page_count` and
+`count` may exceed the bundled pages and rows. Each page includes its page
+number, offset, binding and digest; check these against the manifest. The
+digest covers the complete window, not just the bundled tail. Use the paginated
+`/api/v1/details/selected` route when the entire window is needed. The bundle
+shares the same status and source freshness limits and must not be displayed
+as fresh after either remaining-lifetime header expires.
+
+The optional reception-history reader samples immutable chunks intersecting the
+eight newest sequence positions admitted by the current source root. A short
+newest chunk can be collected with its retained predecessor. A confirmed gap at
+the start of the window can trigger one retry at the newest position. The cache
+holds partial observations. Skipped transport spans count toward `cache_gaps`
+and describe cache coverage. Crossing a missing span returns HTTP 409 `cache_gap`.
+Under `/api/v1/details/reception`, the root has no query. Allow only the
+GET routes the viewer needs: `/index/{recording}` and `/cursor/{recording}`
+take `after`; `/query/{recording}` takes `after`, `end_time`, `start_time`
+in that order (UTC RFC3339, at most one minute). `/chunk/{recording}/{digest}`
+and `/metadata/{recording}/{digest}/{kind}/{page}` take no query.
+
+For live reception, honor `Mithril-Detail-Remaining-Milliseconds` and the
+root's `Mithril-Status-Remaining-Milliseconds`. Without a positive detail
+lease, a response is not live. Expired metadata returns `metadata_expired`
+(HTTP 503 for the root, 409 for a selection); refetch the root before retrying.
+
+The cluster directory returns at most nine rows per page and accepts `offset`,
+`order`, `country`, `search` and `generation`. The cluster map, versions and
+performance-history routes accept only `generation`; node-display accepts no
+query string. Reuse a response's generation when combining or paging cluster
+views; a changed generation returns HTTP 409. Check the
+`Mithril-Cluster-Remaining-Milliseconds` response header: zero means the cached
+response is no longer fresh. Its shared lifetime is limited by the snapshot,
+fresh providers, included certificate windows and RPC performance receipt times.
+Check each provider's state independently as well. See the [collector guide](../cmd/mithril-dashboard-collect/README.md)
+for provider provenance, limits and country attribution.
+
+`/api/v1/cluster-map` may include `rpc_nodes` with an exact decimal-string
+`advertised` count and independent `observed_at` time from the existing
+`getClusterNodes` response. It counts unique identities advertising a valid RPC
+socket address; zero is observed, while missing/invalid data omits the aggregate.
+It does not establish reachability or complete cluster coverage, and no addresses
+are retained. Its source age also caps the cluster response lease. Upgrade every
+reader sharing the cache before a new collector emits this field; for rollback,
+stop the new writer and obtain a fresh legacy-shaped snapshot before reverting
+readers. The existing community contact limit remains 2048; mainnet allows 8192.
+
+`/api/v1/cluster-map` may include `rpc_stake` with exact decimal-string
+`current_lamports` and `delinquent_lamports`. It is present only for a fresh
+mainnet snapshot and a fresh, epoch/genesis-matched RPC provider whose
+`rpc_genesis_before_after` binding and declared row count cover every cached
+vote-account row. Every row must be RPC-sourced and report activated stake and
+delinquency; stake must convert to integral uint64 lamports per account. The
+aggregate can exceed uint64. Sum vote accounts, including distinct vote
+accounts sharing one identity; `total_nodes` separately counts unique
+identities. Stale, community, incomplete or invalid inputs omit this group;
+absence is unknown, not zero. These cached external observations do not add a
+collector or establish the linked node's chain state.
 
 For a separately hosted browser UI, route API requests through the UI's
 origin and preserve this header. The reader does not add CORS headers, so a
 direct cross-origin browser request cannot read the response by default.
 Treat a missing or invalid remaining-lifetime header as unknown, not fresh.
 
-For configuration and deployment, see the [setup guide](dashboard-api.md).
+The history route returns available metrics and ranges; request bucketed data
+with `?metric=<name>&range=<range>`. History is limited to 30 days, may contain
+gaps and includes resource metrics only with `--public-resources`. For machine
+details, fetch a manifest's pages using its `generation` and zero-based `page`;
+request a new manifest after the generation expires. Both route families have
+shared request limits; configure per-client limits at the reverse proxy.
 
-## Optional data
-
-`/api/v1/features` reports optional route families enabled by the reader. It is
-not a complete list of disclosure flags. The reader does not request public
-providers. It writes aggregate history only when `--history-dir` is enabled.
-
-The advanced status profile includes optional cgroup resource observations
-when the node enables `--dashboard-cgroup-resources` and the reader enables
-`--public-resources`. Availability and freshness apply independently. Limits
-describe the visible cgroup and do not establish ancestor capacity.
-
-When the node enables `--dashboard-replay-details` and the public reader
-enables `--replay-details` with `--public-resources`, the reader provides
-`/api/v1/details/replay`, `/api/v1/details/selected`,
-`/api/v1/details/slots` and `/api/v1/details/schedule`. The advanced features
-response reports whether these routes are enabled. Their captures are bounded
-local observations, not an archive or a substitute for verified cluster state.
-Check the response state and remaining-lifetime headers; unavailable or
-expired observations are not zero. Configure per-client limits at the proxy.
-
-With cache details enabled on the node and reader, `/api/v1/details/cache`
-returns bounded AccountsDB cache observations. Its availability and freshness
-are independent of replay details; unavailable values are not zero. The
-advanced features response reports whether the route is enabled.
-
-When `--history-dir` is configured, `/api/v1/history` returns the history
-state and available metrics. Use `?metric=<name>&range=<range>` to retrieve
-bucketed samples; supported metrics and ranges are listed in the state
-response. History is bounded to 30 days and may contain gaps. Unavailable or
-stale samples are not zero. Resource metrics require `--public-resources`.
-The route has shared request and concurrency limits; configure per-client
-limits at the reverse proxy.
-
-When `--network-details` is enabled, `/api/v1/details/network` returns
-bounded local network observations. Check its state, source timestamps and
-remaining lifetime; unavailable observations are not zero. The
-`/api/v1/features?include=advanced_status` response reports the optional
-network route. The default features response retains its existing shape.
+Details and histories have bounded retention; they are not a ledger archive.
+Cluster routes reflect their named external providers and have their own
+freshness and availability. They do not establish the linked node's verified
+chain state. The four cluster routes share a limit of five requests per second,
+with a burst of ten, across all clients. Excess requests receive HTTP 429;
+one busy client can therefore affect other viewers. Apply appropriate
+per-client limits at the reverse proxy. See the [setup guide](dashboard-api.md#optional-dashboard-data)
+before enabling these options.
 Votor UDP socket memory is not provided because the QUIC listener owns its
 socket; an absent Votor socket observation does not mean zero usage or drops.
 
-With `--local-peers`, `/api/v1/details/peers` returns bounded locally
-observed signed-contact metadata without network endpoints. The node must
-enable `--dashboard-local-peers` and `--dashboard-network-details`.
-Check freshness and availability before displaying the result.
+## Experimental fast payload WebSocket (v1)
 
-When `--machine-details` is enabled, `/api/v1/details/machine` returns a
-bounded manifest of machine observations. Fetch a listed page using the
-manifest's `generation` and its zero-based `page` index. Pages have a limited
-hold; request a new manifest if the generation has expired. Capture times and
-availability describe the source observation, not the request time. The
-advanced features response reports whether the machine route is enabled.
+**Experimental and off by default.** Keep the standard status path available
+when an anchor cannot be established or expires. With the existing
+fast-execution options above, the exact query
+`/websocket?include=advanced_status&recent_executed=v1` selects complete cached
+tail payloads. Reordered, duplicated or extra v1 parameters are rejected;
+existing snapshot and boolean-hint queries are unchanged. This session sends
+only anchor/frame envelopes. Keep a separate,
+independently leased advanced-status HTTP response as the binding authority.
+
+Send this closed canonical grammar, with a fresh cryptographically random
+32-character lowercase hexadecimal ID for each challenge (the example ID is
+illustrative). `type` must precede `id`; whitespace, duplicate keys and extra
+fields are rejected:
+
+```json
+{"type":"challenge","id":"00000000000000000000000000000001"}
+```
+
+The server acknowledges the ID and then sends full replacement values:
+
+```json
+{"type":"anchor","challenge":"00000000000000000000000000000001"}
+{"type":"frame","topic":"mithril","key":"recent_executed_v1","challenge":"00000000000000000000000000000001","expires_after_challenge_ms":0,"value":null}
+```
+
+`value` is the fast-tail body described above, or null. Null requires a zero
+lifetime; a non-null value requires an integer lifetime N from 1 to 5000 ms. For
+server challenge receipt R and the already admitted original status/source
+expiry D, N is `floor(0.999 * min(D-R, 5000 ms) / 1 ms) - 10`, required positive.
+The client deadline is its **original challenge-send monotonic time + N**,
+never ACK receipt or payload receipt + N. Keep the parent, record-age, binding
+and duplicate-publication caps; a new anchor or reconnect does not renew them.
+Serialized qualified status is authoritative; retain per-binding sequence
+fences rather than assuming every previously seen run is permanently invalid.
+
+This expiry bound assumes client monotonic advance at least 0.999 of server
+advance and client timer precision no worse than 1 ms. The 10 ms guard covers
+precision/serialization under those assumptions, not arbitrary clock drift.
+Clients must detect unsupported/coarse or discontinuous clocks and withdraw
+on suspend/hidden/resume or an unknown/expired anchor. Keep one active and one
+pending challenge, and close/withdraw when an anchor reaches 2 s. Refreshing
+the challenge does not extend the server horizon.
+
+The existing 16-viewer cap is shared with ordinary sessions. Challenges are
+capped at 128 bytes and 2/s with burst 2, with one pending item; controls retain
+their 2/s, burst 4 limit. Each viewer has a 12/s cached-frame limit with burst 4,
+plus bounded challenge ACKs. A cached body is at most 16 KiB plus its envelope.
+Source/status invalidation or expiry interrupts a blocked payload write;
+bytes already buffered cannot be recalled and retain their original deadline.
+This increases bounded public cached egress, not node sampling or private-feed
+limits; measured performance and viewer isolation remain deployment gates.
+
+## Experimental fast payload WebSocket (v2)
+
+With the same node/reader fast-execution options, the exact query
+`/websocket?include=advanced_status&recent_executed=v2` negotiates v2. It keeps
+the v1 challenge/anchor grammar, binding checks, clock assumptions, two-second
+anchor limit and shared capacity limits. Reordered, duplicated or extra query
+parameters are rejected. V1 envelopes and existing snapshot/hint queries do not
+gain fields or change meaning.
+
+V2 frames use `key: "recent_executed_v2"` and add one integer field:
+
+```json
+{"type":"frame","topic":"mithril","key":"recent_executed_v2","challenge":"00000000000000000000000000000001","expires_after_challenge_ms":0,"value":null,"source_expires_after_challenge_ms":0}
+```
+
+For a non-null value, both lifetimes are positive integers at most 5000 ms,
+and `source_expires_after_challenge_ms` is at least
+`expires_after_challenge_ms`. Both use the v1 conservative conversion and the
+client's **original challenge-send monotonic time**. The existing field bounds
+this response by the admitted status and source deadlines; the new field comes
+from the reader's retained publication deadline, independently of the current
+status lease. Repeated source bytes/sequence do not renew that publication.
+Null requires both fields to be zero and withdraws the current value.
+
+A later validated response may admit the same payload under a later response
+bound while its original source bound remains live. Clients must retain that
+source cap and issue a new token; previously published tokens cannot be
+extended. Parent, record-age, rewind, conflict, expiry and withdrawal fences
+still apply. A new anchor, status response or reconnect does not revive a
+cleared sequence. These ceilings do not establish consensus finality, client
+admission, rendering or a network-latency guarantee.
+
+Upgrade the reader before enabling v2 clients: old readers reject the v2
+query. Clients opt in to v2 separately and can still use the standard
+dashboard routes. V2 requires no node private-feed schema change.
+
+### Optional TPU signature-verification worker gauge
+
+With queue observation enabled, network detail's optional
+`tpu_queues.sigverify_workers` contains decimal-string `batches_in_flight` and
+`configured` counts. The gauge counts workers holding a batch from first packet
+receipt through drain, verification and final output handoff, including a blocked
+handoff. It is bounded by the positive configured worker count; zero is observed,
+while omission is unknown. It is neither CPU utilization, packets in flight nor
+an atomic queue/backlog measurement. It retains the queue observation's original
+sample time, attachment and freshness guards; stopped pipelines are withheld.
+
+Upgrade the matching reader before enabling a producer that emits this field:
+older canonical decoders reject the whole network detail. New readers accept
+older producers that omit the optional field. This rollout requirement is
+separate from v2 WebSocket negotiation.
+
+When network details are enabled, setting `MITHRIL_DASHBOARD_TPU_WORKER_TIMING=1`
+additionally enables per-worker batch-pass wall timing; it is off by default.
+Each optional `passes` row is scoped to the TPU pipeline lifetime and reports
+worker index, sample time, cumulative active nanoseconds and elapsed
+nanoseconds. Active time includes scheduling delay and blocked output handoff;
+it is not CPU use or a pinned core. The list is omitted when disabled, invalid,
+the configured pool exceeds 64 workers, or the network response budget would
+otherwise displace existing details. A positive elapsed interval and
+original network/status leases are required; samples are not live countdowns.
+
+Install a compatible reader before enabling this option: older strict readers
+reject the extended network detail. New readers accept producers that omit the
+optional timings.
 
 ## Bounded slot timeline
 
@@ -97,6 +278,16 @@ The sample has its own age and coverage flag. No account or history-store scan
 runs for a viewer. The unmerged history RPCs remain separate.
 
 ## Selected-chain activity
+
+`GET /api/v1/details/activity-history` requires replay details on both node and
+reader, with no query string or request body. It returns up to 32 contiguous,
+non-overlapping selected-and-folded bank-clock intervals, newest first, in at
+most 16 KiB. Source observation/capture dates are separate from row bank-clock
+durations. Validate the full replay binding and both original status/detail
+leases; a repeated captured publication cannot renew its deadline. It shares
+the selected-response rate/active caps but has separate bounded collection
+workers. These are local historical observations, not finalized or cluster TPS;
+missing coverage must not be interpolated.
 
 `replay.chain_activity` uses the same bounded selected-and-folded receipts.
 Its interval counts transactions, non-vote transactions, included failures and
@@ -158,8 +349,8 @@ epoch, and neither row is a persisted lifetime score.
   without the relevant unknowns or lost fold evidence. A short-epoch test can
   meet that condition; a long epoch will normally be partial in this bounded
   window. `null` means that no range has been observed, not a zero score.
-- These are selected-and-folded chain observations, not proof of local forging,
-  vote delivery, FAST percentage, earned lamports or a third-party ranking.
+- These chain observations describe selected and folded outcomes under the
+  recorded local replay scope.
   The feed binds them to the node identity, vote account, run and replay attempt;
   a new attempt clears them. The public projection rejects
   mismatched identities, overlapping epochs and inconsistent counts.
@@ -297,6 +488,18 @@ null. Paths, devices, process arguments and host identifiers remain excluded.
 An enabled group without a valid sample reports `state: "unavailable"` and
 null measurements rather than disappearing or inventing zero usage.
 
+Optional `resources.compaction` separates configuration (`enabled`) from worker
+activity. `active` covers a compaction cycle, including lock wait, at one
+historical atomic state read. Optional `active_sample_started_at` and
+`active_sample_completed_at` bracket that read by at most one second; they are
+not cycle duration, utilization or current health. `last_completed` retains the
+last returned cycle, including partial work on failure; its byte counts are not
+physical I/O or filesystem free space. Older undated activity remains untimed;
+invalid new timing withholds activity fields while valid cycle history may
+remain. Original resource freshness and leases still apply. Upgrade strict
+node-feed readers before producers emit these dates, and strict public clients
+before exposing the optional fields.
+
 The node option `--dashboard-host-resources` (`dashboard.host_resources` in
 TOML) adds optional `resources.host` on Linux. It defaults off, requires the
 private dashboard socket, and is disclosed publicly only when the reader also
@@ -351,9 +554,8 @@ on a non-voting node and does not establish voting or leader readiness.
 Voting data is published only for a validator-mode observation bound to the
 current identity. Eligibility and admitted stake refer to the observed epoch
 set, not total delegated stake. Activity counters use `voter_instance` scope
-and can span identity changes; do not attribute a whole counter to the current
-identity. `network_landed_votes` is verified network certificate evidence across
-multiple vote types, not a reward-inclusion or FAST score.
+and can span identity changes. `network_landed_votes` counts verified network
+certificate evidence across multiple vote types.
 
 RPC reports serving
 and the last published slot, not readiness. When valid monitoring is available,
@@ -403,8 +605,8 @@ on shutdown; they are not successful replay or selected-block counts.
 
 The optional `admission` object counts parsed shreds rejected for a version
 mismatch or a failed lookup when a leader source is configured. These are
-receiver-session occurrences before signature authentication, can include
-duplicates, and do not measure lost blocks or establish a FAST-vote cause.
+receiver-session occurrences before signature authentication and can include
+duplicates.
 An older producer omits the object; measured zero is `"0"`. A zero missing
 leader count does not establish that leader lookup was configured.
 
@@ -458,8 +660,8 @@ Each message replaces the previous value for its `(topic, key)` pair. On a new
 connection, discard the old cache. Apply messages in order. The messages in a
 snapshot are not a transaction or an atomic bank view.
 
-The fields described below are specific to Mithril; other dashboard protocols
-are not interchangeable with this API.
+The envelope and fields described below are specific to Mithril; other dashboard
+protocols are not interchangeable with this API.
 
 | Topic and key | Value and source |
 | --- | --- |
@@ -507,12 +709,12 @@ numbers. Timestamps use UTC RFC 3339. A missing measurement is `null`, not zero.
 | `genesis_hash` | Genesis obtained during node bootstrap; `null` until available |
 | `mode` | Configured `verifying` or `validator` mode, not proof that a voter is enabled or eligible |
 | `rpc_configured` | Whether the node was configured with an RPC port; not proof that the listener started or is healthy |
-| `replay_frontier` | Highest ordered replay outcome reported by the existing replay frontier, as a decimal string. Includes known skips and may rewind during recovery |
+| `replay_frontier` | Ordered frontier from the same replay observation as the attempt and rewind count, as a decimal string. Includes known skips and may move backward during recovery |
 
 `replay_frontier` is not a completed bank slot, received-slot high-water mark or
-verified finality. It is unavailable before the replay loop, while stopping,
-and while the underlying frontier is zero and cannot be distinguished from an
-uninitialized value. This release does not report catch-up lag or readiness.
+verified finality. It is unavailable before the replay attempt, while a
+rewind is restoring its parent, while stopping, and when the frontier is zero.
+This release does not report catch-up lag or readiness.
 
 `fresh` means the collector successfully read a valid feed sample no more than
 five seconds old. A stalled replay loop can still have a fresh feed. A read
@@ -573,7 +775,8 @@ samples: divide the CPU-time difference by elapsed wall time; one full CPU is
 100%, so a multithreaded process can exceed 100%.
 
 `root`, `accounts` and `ledger` contain `total_bytes`, `available_bytes`, `inodes`
-and `free_inodes`. Available bytes exclude filesystem blocks reserved from
+and `free_inodes`, with optional `used_bytes` that excludes reserved free blocks.
+Available bytes exclude filesystem blocks reserved from
 unprivileged users. Roles may share a filesystem; do not add their capacities.
 A failed or unconfigured path yields `null`. Paths, device names, mount options,
 hostnames, environment variables and process arguments are not exported.
@@ -653,8 +856,7 @@ earlier observation. These are partial window counts, not epoch-wide scores
 or percentages. A percentage for known
 eligible outcomes uses included / (included + excluded), with its denominator
 and incomplete-window status; unknown and ineligible targets do not become
-exclusions. These counts are not an independent BLS audit or an external FAST
-score.
+exclusions.
 
 The v3 profile can expose `consensus.safety_fault` from the sampled engine.
 An omitted flag is unknown, not false; a reported false is not an overall
@@ -900,12 +1102,18 @@ local time the voter instance recorded its latest match. It is omitted when
 unobserved or when its time and associated evidence cannot be validated; older
 readers may not expose it. It can describe an earlier identity after a swap and
 is not the chain's timestamp, a delivery latency or a current health verdict.
-This counter includes multiple vote types and is not FAST percentage,
-reward-certificate inclusion, missed votes or the score shown by Titan/Puffin.
-The separate certificate outcome counts above have narrower, window-scoped
-semantics and do not provide those scores.
+This counter includes multiple vote types. It is not a vote-inclusion rate or
+a count of missed votes. Certificate outcome counts cover only the observed
+window.
 
 ### Block source and repair
+
+In shreds-only mode, repair can bootstrap a locally covered resume frontier
+from a confirmed-tip signal when peers and a nonzero local frontier leader are
+known, even before a verified live shred edge exists. Moving confirmed tips
+can extend that repair window. This does not enable RPC block fetching or
+replace per-shred verification and certificate-backed skip checks; RPC-enabled
+admission and its gap threshold remain unchanged.
 
 `block_source` is unavailable before the source is attached and after teardown.
 `configured_source` identifies the selected input. `next_slot` is its next ordered
@@ -1034,7 +1242,10 @@ every ten seconds; it does not run on replay or viewer request paths. Feed reade
 get cached bytes; requests never call replay, voting or account-database code. The
 private feed accepts at most four simultaneous connections. For status, the
 collector reads one fixed Unix socket, does not follow redirects and bounds each
-request to one second and 33 KiB. Public status JSON is capped at 32 KiB.
+request to one second and 33 KiB. The public status JSON value is capped at
+32 KiB; a WebSocket frame includes a small JSON envelope, so readers should
+allow at least 32 KiB plus 128 bytes per frame. Optional detail routes have
+separate documented limits.
 
 If a feed sample fails validation, JSON encoding or the size limit, the node
 keeps the last accepted bytes and their original timestamp. The reader can
@@ -1047,9 +1258,9 @@ first accepted sample logs one recovery at info level. No sample fields, paths
 or raw errors are logged. By default these records go to process stderr, which
 systemd captures in its journal, not necessarily Mithril's rotating log file.
 
-The viewer service caps TCP connections at 32 and WebSocket sessions at 16. A
-session holds only its last delivered snapshot and at most one queued ping
-response. It sends latest values, not every intermediate sample. A socket write
+The viewer service caps TCP connections at 32 and WebSocket sessions at 16. A legacy
+snapshot/hint session holds only its last delivered snapshot and at most one
+queued ping response. The opt-in v1 bounds are described above. It sends latest values, not every intermediate sample. A socket write
 has a two-second deadline. Incoming data messages are capped at 1 KiB and two per
 second, with a burst of two; control frames have a separate two-per-second limit
 with a burst of four. Each connection also has a 4 KiB/s inbound byte budget
@@ -1061,3 +1272,27 @@ handshakes and idle connections also have explicit limits.
 The separate process isolates browser parsing and slow writes from replay. It
 still shares CPU and memory with the node. Actual node overhead must be measured
 before a deployment recommendation.
+
+
+### Account request and fold-record window
+
+With `dashboard.storage_details` enabled, attaching the successful runtime AccountsDB owner opts in to fixed scalar operation counters. Recording starts at that attachment, not at process start or snapshot ingest. An optional `account_operations` object in the existing storage detail contains scope `runtime_db_requested_keys_and_committed_records`, `recording_started_at`, `started_at`, `ended_at`, and decimal-string `duration_nanoseconds`, `requested_keys`, `committed_records`.
+
+Requested keys count each `GetAccount` and `GetAccountWithStats` call once, and each key supplied through the shared batch implementation once. Misses, duplicates, errors and canceled batch requests are included; empty batches add zero. Nil/unopened owners provide no measurement. This excludes account accesses satisfied by replay overlays without a DB call. Committed records count `len(records)` only after a successful `CommitBatch` commit, after deduplication and including tombstones. Failed folds, recovery reapplication and uncommitted overlay writes are excluded. These are account-level operations, not disk I/O, unique live accounts or transaction throughput.
+
+The node serializes the counter snapshot and baseline update under the attached-owner mutex. Rates require two valid observations with the same recorder, nondecreasing non-exhausted counters, original monotonic elapsed time of at most 30 seconds, and wall/monotonic agreement within 250 ms. Counter exhaustion, closing/replaced owners and regressing counters cannot fabricate zero or renew an old window. Sampling gaps withhold the rate and require a new bounded interval. Independent counters are approximate under concurrent operations; the dated interval and exact definitions remain visible in existing Accounts/Overview detail views.
+
+The existing storage/status bindings, original response and source deadlines, body budgets and opt-ins remain unchanged. Readers that lack this optional field reject the canonical new document; upgrade the reader first, then the node, with no deployment implied by local adoption. New readers retain compatibility with old documents that omit it. The UI uses existing Reads/Writes positions, labeled DB keys requested (`keys/s`) and Folded records committed (`records/s`) for this scope; ordinary legacy sources keep their previous labels.
+
+
+## Physical file allocation census
+
+The optional `physical_usage` member of private/public storage detail reports a dated filesystem-block observation. It is independently opt-in: the node requires `dashboard.storage_details` and the exact environment value `MITHRIL_DASHBOARD_PHYSICAL_CENSUS=1`. It is default off. Reader-first coordinated rollout is required because older canonical readers reject the additional optional member.
+
+Its fixed scope is `primary_db_tree_and_secondary_account_trees`: the primary database tree (including index, bank-hash, metadata, temporary and rewound named files) and each secondary accounts subtree. It includes directory blocks. `allocated_bytes` sums filesystem-attributed 512-byte blocks; `logical_file_bytes` sums regular-file lengths. Both byte fields, `regular_files`, `directories` and `duration_nanoseconds` are uint64 decimal strings. `started_at` and `completed_at` are UTC timestamps. This is allocation attributed to tree-visible named files/directories, not exclusive device use, open-but-unlinked files, live account payload, fragmentation, capacity, or reusable free. The logical Used/Fragmented/Allocated ring remains independent and unavailable without its own valid source.
+
+One worker per runtime DB performs at most one attempt per 60 seconds, outside DB/replay locks. It reads metadata only. Two complete matching traversal fingerprints and totals are required. The attempt allows at most 2,000,000 total entries across both passes, 32 roots, depth32 and path length4096, with a five-second observation ceiling checked between filesystem operations. A blocked kernel metadata call cannot be interrupted by that check: there is at most one worker, no new attempt overlaps it, and database close/owner retirement cancel without joining it. Active churn or a limit/error yields no total; partial counters never escape. Directory iteration differences may conservatively produce unavailable.
+
+Absolute root components and descendant entries are opened FD-relative without following symlinks. Linux uses metadata-only `O_PATH` handles and requires `statx` mount identities; different-device and same-device nested mounts, overlapping roots, duplicate inodes, hardlinks, unsupported objects/statistics and changed metadata are refused. Unsupported kernels/platforms, including Darwin, yield unavailable. Two matching passes describe a stable bounded metadata observation, not a transactional filesystem snapshot.
+
+The original runtime node/DB-generation binding and status/detail/source/response deadlines still apply. The physical census is withheld at 75 seconds of age. When included, its original completion time plus 75 seconds also bounds the enclosing detail deadline. Physical census and I/O observations require at least 13 seconds remaining on their original deadlines at capture. This budget covers the one-second node sample interval, the reader’s ten-second delay between acquisitions, and two one-second private requests. The original deadline still applies if polling is delayed. Duration is positive and at most five seconds, with wall and monotonic clocks agreeing within 250 ms. Failure, close and owner retirement clear the current observation. Stopped recorders cannot restart or revive through a late store. Existing storage observations remain available when census is disabled or fails.

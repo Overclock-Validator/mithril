@@ -8,7 +8,7 @@ import (
 	"github.com/gagliardetto/solana-go"
 )
 
-func activityTestDB(t *testing.T, fixed bool) *AccountsDb {
+func activityTestDB(t testing.TB, fixed bool) *AccountsDb {
 	t.Helper()
 	db := &AccountsDb{
 		VoteAcctCache:        newWeightedCache(32, func(solana.PublicKey, *accounts.Account) uint32 { return 1 }, true),
@@ -50,6 +50,10 @@ func TestCacheActivityRecordingAndClear(t *testing.T) {
 		}
 		if fixed && (before.FixedEmptyHits != 1 || before.FixedSmallHits != 1) {
 			t.Fatalf("fixed hits lost: %+v", before)
+		}
+		if before.FixedSmallCopyKnown != fixed || fixed && before.FixedSmallCopyBytes != 200 {
+			t.Fatalf("copy count: fixed=%v, got %d bytes (known=%v), want only the 200-byte small hit when active",
+				fixed, before.FixedSmallCopyBytes, before.FixedSmallCopyKnown)
 		}
 		db.readCacheEpochMu.Lock()
 		db.resetReadCachesLocked()
@@ -136,5 +140,30 @@ func TestCacheActivityFixedLimits(t *testing.T) {
 	c.shards[0].recordActivity(0)
 	if !c.shards[0].activitySaturated || c.shards[0].activity[0] != math.MaxUint64 {
 		t.Fatal("counter wrapped")
+	}
+	c.shards[0].smallCopyBytes = math.MaxUint64
+	if o, ok := db.CacheActivity(); !ok || o.FixedSmallCopyKnown || o.FixedSmallCopyBytes != 0 {
+		t.Fatal("saturated copy counter was reported")
+	}
+}
+
+func BenchmarkSmallCachePayloadHit(b *testing.B) {
+	for _, enabled := range []bool{false, true} {
+		name := "recording-off"
+		if enabled {
+			name = "recording-on"
+		}
+		b.Run(name, func(b *testing.B) {
+			cache := activityTestDB(b, true).CommonAcctsCache
+			cache.recordActivity = enabled
+			key := solana.PublicKey{1}
+			if !cache.Set(key, &accounts.Account{Key: key, Data: make([]byte, 200)}) {
+				b.Fatal("could not prepare small-tier hit")
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				cache.Get(key)
+			}
+		})
 	}
 }

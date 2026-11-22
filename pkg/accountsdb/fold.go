@@ -364,6 +364,7 @@ func (db *AccountsDb) CommitBatch(
 	db.lastBatchSeq = batchSeq
 	db.durableThrough.Store(throughSlot)
 	committed = true
+	db.recordCommittedAccounts(uint64(len(records)))
 	clock.step(&timings.CacheRefresh)
 
 	return BatchCommitResult{
