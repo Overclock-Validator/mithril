@@ -76,6 +76,13 @@ func TestDirectMappingCPIRevokesGrowthPermission(t *testing.T) {
 	require.Empty(t, parent.Data)
 }
 
+func TestDirectMappingGrowthRespectsTransactionBudget(t *testing.T) {
+	execCtx, _, vm, _ := directMappingCPITestVM(t, true)
+	execCtx.TransactionContext.AccountsResizeDelta = maxAccountDataGrowthPerTransaction
+	require.ErrorIs(t, vm.Write8(sbpf.VaddrInput, 1), InstrErrInvalidRealloc)
+	require.Empty(t, execCtx.TransactionContext.Accounts.Accounts[0].Data)
+}
+
 func directMappingCPITestVM(t *testing.T, initiallyOwned bool) (*ExecutionCtx, *InstructionCtx, *sbpf.Interpreter, *accounts.Account) {
 	t.Helper()
 	f := features.NewFeaturesDefault()
