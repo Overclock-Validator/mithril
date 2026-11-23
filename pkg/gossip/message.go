@@ -145,7 +145,7 @@ func decodePong(d *decoder) (Pong, error) {
 	return pong, nil
 }
 
-func decodeContactRecords(d *decoder, handleContact func(contactRecord)) (int, []*ContactInfo, error) {
+func decodeContactRecords(d *decoder, handleContact func(contactRecord), observation *PacketDecodeObservation) (int, []*ContactInfo, error) {
 	n, err := d.u64()
 	if err != nil {
 		return 0, nil, err
@@ -159,15 +159,24 @@ func decodeContactRecords(d *decoder, handleContact func(contactRecord)) (int, [
 	}
 	contactCount := 0
 	for i := uint64(0); i < n; i++ {
-		record, err := decodeCrdsContactRecord(d)
+		record, err := decodeCrdsContactRecordObserved(d, observation)
 		if err != nil {
+			if observation != nil {
+				observation.UnparsedSuffix = n - i - 1
+			}
 			if errors.Is(err, errUnsupportedCRDSValue) {
 				return contactCount, contacts, errUnsupportedCRDSValue
 			}
 			return contactCount, contacts, err
 		}
 		if !record.Verify() {
+			if observation != nil {
+				observation.SignatureInvalid++
+			}
 			continue
+		}
+		if observation != nil {
+			observation.SignatureValid++
 		}
 		contactCount++
 		if handleContact != nil {
@@ -202,10 +211,25 @@ func decodePacket(packet []byte) (decodedPacket, error) {
 }
 
 func decodePacketWithContactHandler(packet []byte, handleContact func(contactRecord)) (decodedPacket, error) {
+	return decodePacketWithObservation(packet, handleContact, nil)
+}
+
+// decodePacketWithObservation follows the same parser and prefix callbacks as
+// the ordinary decoder. A nil output adds no clock, counters or retained data.
+func decodePacketWithObservation(packet []byte, handleContact func(contactRecord), observation *PacketDecodeObservation) (decodedPacket, error) {
+	if observation != nil {
+		*observation = PacketDecodeObservation{WireKind: WireMalformedHeader}
+	}
 	d := newDecoder(packet)
 	variant, err := d.variant()
 	if err != nil {
 		return decodedPacket{}, err
+	}
+	if observation != nil {
+		observation.WireKind = WireUnknownVariant
+		if variant <= protocolPongMessage {
+			observation.WireKind = DecodeWireKind(variant)
+		}
 	}
 
 	switch variant {
@@ -215,7 +239,7 @@ func decodePacketWithContactHandler(packet []byte, handleContact func(contactRec
 		if _, err := d.read(32); err != nil {
 			return decodedPacket{}, err
 		}
-		contactCount, contacts, err := decodeContactRecords(d, handleContact)
+		contactCount, contacts, err := decodeContactRecords(d, handleContact, observation)
 		if err != nil {
 			if errors.Is(err, errUnsupportedCRDSValue) {
 				return decodedPacket{Kind: packetIgnored}, nil
@@ -242,10 +266,11 @@ func decodePacketWithContactHandler(packet []byte, handleContact func(contactRec
 	}
 }
 
-func sendUDP(conn *net.UDPConn, packet []byte, addr *net.UDPAddr) error {
+func sendUDP(conn *net.UDPConn, packet []byte, addr *net.UDPAddr, payload *udpPayloadRecorder) error {
 	if len(packet) > packetDataSize {
 		return fmt.Errorf("gossip packet size %d exceeds packet size %d", len(packet), packetDataSize)
 	}
-	_, err := conn.WriteToUDP(packet, addr)
+	n, err := conn.WriteToUDP(packet, addr)
+	payload.recordSent(conn, n, len(packet))
 	return err
 }

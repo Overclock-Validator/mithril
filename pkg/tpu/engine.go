@@ -154,6 +154,24 @@ func (t *TPU) Stats() Stats {
 	}
 }
 
+// ObserveStreamReadPayload copies an opted-in server counter without socket I/O.
+// It remains independent of kernel socket-accounting support and availability.
+func (t *TPU) ObserveStreamReadPayload() (quicserver.StreamReadPayload, bool) {
+	if t == nil || t.server == nil {
+		return quicserver.StreamReadPayload{}, false
+	}
+	return t.server.Stats.ObserveStreamReadPayload()
+}
+
+// ObserveQueues copies opted-in pipeline channel gauges without socket I/O or
+// unrelated stage statistics. The returned dates belong to this pipeline.
+func (t *TPU) ObserveQueues() (pipeline.QueueObservation, bool) {
+	if t == nil {
+		return pipeline.QueueObservation{}, false
+	}
+	return t.pipeline.ObserveQueues()
+}
+
 // Stop shuts down the ingress pipeline and QUIC listeners.
 func (t *TPU) Stop(ctx context.Context) error {
 	if t == nil {

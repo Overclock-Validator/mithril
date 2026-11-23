@@ -107,6 +107,25 @@ func TestSchedulerCleanupDropsExpired(t *testing.T) {
 	require.Equal(t, 1, dropped)
 	require.Equal(t, 0, sched.Buffered())
 	assert.Equal(t, uint64(1), sched.Stats().DroppedExpired)
+	require.Zero(t, sched.Cleanup(nil))
+	require.Zero(t, sched.Cleanup(env.Bank))
+	assert.Equal(t, uint64(1), sched.Stats().DroppedExpired)
+}
+
+func TestSchedulerCapacityEvictionCounterIsReceiveOnly(t *testing.T) {
+	s := NewWithConfig(nil, Config{MaxBufferedTransactions: 1})
+	result, _ := s.buffer.Insert(testEntry(0, 1, 1))
+	require.Equal(t, InsertAccepted, result)
+	s.Receive(packet.Owned(txfixture.MustSignedTransferWire(99)))
+	require.Equal(t, uint64(1), s.Stats().EvictedCapacity)
+	require.Equal(t, 1, s.Buffered())
+
+	rebuffer := NewWithConfig(nil, Config{MaxBufferedTransactions: 1})
+	result, _ = rebuffer.buffer.Insert(testEntry(0, 1, 1))
+	require.Equal(t, InsertAccepted, result)
+	rebuffer.rebuffer(testEntry(10, 2, 2))
+	require.Equal(t, uint64(2), rebuffer.buffer.PopMax().seq)
+	require.Zero(t, rebuffer.Stats().EvictedCapacity, "rebuffer replacements are outside the Receive counter")
 }
 
 func TestSchedulerMaybeCleanupAfterInsertInterval(t *testing.T) {

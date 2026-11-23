@@ -1,0 +1,8 @@
+[Unit]
+Description=Start the Mithril dashboard reader when the feed appears
+
+[Path]
+PathExists=/run/mithril-dashboard-feed/dashboard.sock
+
+[Install]
+WantedBy=multi-user.target

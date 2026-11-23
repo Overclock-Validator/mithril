@@ -176,6 +176,7 @@ func TestShredsOnlyRepairRearmsAcrossActiveHandoff(t *testing.T) {
 	bs.confirmedTip.Store(confirmedTip)
 	bs.liveHandoffSlot.Store(handoffSlot)
 	bs.liveStreamActive.Store(true)
+	bs.liveStreamStarted.Store(true)
 
 	bs.updateMode()
 
@@ -194,9 +195,19 @@ func TestShredsOnlyRepairRearmsAcrossActiveHandoff(t *testing.T) {
 
 	// RPC fallback retains the old ownership barrier: forceRPCForCatchup is
 	// responsible for dismantling the handoff before repair may take over.
-	bs.rpcFallbackEnabled = true
-	if bs.repairCatchupEligible(true) {
+	rpcSrc := NewBlockSource(&BlockSourceOpts{
+		SourceType:      BlockSourceTurbine,
+		TurbineBindAddr: "127.0.0.1:0",
+		StartSlot:       lastExecuted + 1,
+	})
+	rpcSrc.isNearTip.Store(false)
+	rpcSrc.liveHandoffSlot.Store(handoffSlot)
+	if rpcSrc.repairCatchupEligible(true) {
 		t.Fatalf("RPC-enabled repair must still wait for an active handoff to be dismantled")
+	}
+	rpcSrc.liveHandoffSlot.Store(0)
+	if !rpcSrc.repairCatchupEligible(true) {
+		t.Fatalf("RPC-enabled repair must become eligible once the handoff is dismantled")
 	}
 }
 

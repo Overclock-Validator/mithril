@@ -33,6 +33,7 @@ func TestClientAdvertisesSwappedIdentity(t *testing.T) {
 		t.Fatalf("initializeContact: %v", err)
 	}
 	defer holder.OnSwap(client.adoptIdentity)()
+	socketGeneration := client.nextSocketGeneration()
 
 	// The new identity's previous owner published these before the swap.
 	newPubkey := Pubkey(newKey.Public().(ed25519.PublicKey))
@@ -49,6 +50,9 @@ func TestClientAdvertisesSwappedIdentity(t *testing.T) {
 	}
 	if client.Pubkey() != newPubkey {
 		t.Fatalf("client pubkey = %s, want %s", client.Pubkey(), newPubkey)
+	}
+	if client.socketGeneration.Load() != socketGeneration {
+		t.Fatal("identity swap changed the existing socket lifetime")
 	}
 	select {
 	case <-client.contactChanged:

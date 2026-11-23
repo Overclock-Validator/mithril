@@ -7,8 +7,28 @@ import (
 	"testing"
 
 	"github.com/Overclock-Validator/mithril/pkg/config"
+	"github.com/Overclock-Validator/mithril/pkg/snapshot"
 	"github.com/Overclock-Validator/mithril/pkg/state"
 )
+
+func TestSaveReadyStateForBootstrapPersistsAndPropagatesErrors(t *testing.T) {
+	manifest := &snapshot.SnapshotManifest{Bank: &snapshot.DeserializableVersionedBank{Slot: 123}}
+	dir := t.TempDir()
+	got, err := saveReadyStateForBootstrap(dir, manifest, "new-snapshot", "mainnet", testNodeGenesisHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := state.LoadState(dir)
+	if err != nil || !loaded.IsReady() || loaded.SnapshotSlot != 123 || loaded.GenesisHash != testNodeGenesisHash || got.SnapshotSlot != loaded.SnapshotSlot {
+		t.Fatalf("saved state = %+v, load error = %v", loaded, err)
+	}
+	if got, err := saveReadyStateForBootstrap(filepath.Join(dir, "missing"), manifest, "new-snapshot", "mainnet", testNodeGenesisHash); err == nil || got != nil {
+		t.Fatalf("missing directory accepted: state = %+v, error = %v", got, err)
+	}
+	if got, err := saveReadyStateForBootstrap(dir, nil, "new-snapshot", "mainnet", testNodeGenesisHash); err == nil || got != nil {
+		t.Fatalf("missing manifest accepted: state = %+v, error = %v", got, err)
+	}
+}
 
 func TestNewReadyStateForBootstrapAlwaysBindsChain(t *testing.T) {
 	for _, mode := range []string{"explicit", "snapshot", "new-snapshot", "new-incremental", "auto"} {

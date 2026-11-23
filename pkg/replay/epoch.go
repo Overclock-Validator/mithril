@@ -422,12 +422,14 @@ func updateEpochStakesAndRefreshVoteCache(leaderScheduleEpoch uint64, b *block.B
 	voteCache := global.VoteCache()
 	effectiveStakes := scanResult.EffectiveStakes
 	totalEffectiveStake := scanResult.TotalEffectiveStake
+	selection := epochstakes.SelectionUnfiltered
 	if vatActive {
 		minimumBalance, err := minimumVoteAccountBalanceForVAT(f, epochSchedule, slot)
 		if err != nil {
 			panic(err)
 		}
 		effectiveStakes, totalEffectiveStake = filterEpochStakesForVAT(effectiveStakes, voteCache, voteMetadata, minimumBalance)
+		selection = epochstakes.SelectionVATFiltered
 		mlog.Log.FileOnlyf("VAT epoch stakes: admitted=%d/%d minimum_vote_balance=%d", len(effectiveStakes), len(scanResult.EffectiveStakes), minimumBalance)
 	}
 	epochStakes := make(map[solana.PublicKey]uint64, len(effectiveStakes))
@@ -471,12 +473,12 @@ func updateEpochStakesAndRefreshVoteCache(leaderScheduleEpoch uint64, b *block.B
 			}
 		}
 	}
-	// Retain the generation identity only after every rebuilt field matches.
-	// This keeps exact retries stable without trusting an unverified cache entry.
+	// Retain the generation and its original provenance when rebuilt weights
+	// and vote metadata match. A retry cannot relabel an unchanged generation.
 	if !hasEpochStakes || cachedEpochStakes.TotalStake != totalEffectiveStake ||
 		!maps.Equal(cachedEpochStakes.Stakes, epochStakes) ||
 		!reflect.DeepEqual(cachedEpochStakes.VoteAccounts, epochVoteAccounts) {
-		global.PutEpochStakes(leaderScheduleEpoch, epochStakes, epochVoteAccounts, totalEffectiveStake)
+		global.PutEpochStakesWithSelection(leaderScheduleEpoch, epochStakes, epochVoteAccounts, totalEffectiveStake, selection)
 	}
 
 	// Epoch-stake maps are immutable bank snapshot state and are shared by every

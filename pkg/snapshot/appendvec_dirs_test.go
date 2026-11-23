@@ -21,8 +21,10 @@ import (
 // that maps back to its directory, and the index entries use that ID.
 func TestSnapshotWorkersSpreadAppendVecsAcrossDirectories(t *testing.T) {
 	oldCopyingWorkers := SnapshotAppendVecCopyingWorkers
+	oldAvailable := dirAvailableBytes
 	SnapshotAppendVecCopyingWorkers = 1 // sequential writes: placement alternates by bytes written
-	t.Cleanup(func() { SnapshotAppendVecCopyingWorkers = oldCopyingWorkers })
+	dirAvailableBytes = func(string) (uint64, error) { return 1 << 40, nil }
+	t.Cleanup(func() { SnapshotAppendVecCopyingWorkers, dirAvailableBytes = oldCopyingWorkers, oldAvailable })
 
 	paths := []string{t.TempDir(), t.TempDir()}
 	dirs, err := makeAppendVecDirs(paths)

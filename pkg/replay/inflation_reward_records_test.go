@@ -84,7 +84,6 @@ func TestReplaceInflationRewardRecordsUsesAppliedBalanceDelta(t *testing.T) {
 	}}
 	parent := &accounts.Account{Key: key, Lamports: 100}
 	updated := &accounts.Account{Key: key, Lamports: 107}
-
 	require.NoError(t, replaceInflationRewardRecords(
 		block,
 		[]*accounts.Account{updated, nil},

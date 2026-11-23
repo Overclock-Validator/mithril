@@ -233,21 +233,169 @@ func formatDurationRounded(d time.Duration) string {
 }
 
 // DualProgress manages two progress bars displayed simultaneously:
-// - Download: compressed snapshot bytes from network
-// - Extract: decompressed tar bytes (AppendVec files)
+// - Download: compressed snapshot input bytes, from a file or HTTP response.
+// - Extract: fully consumed status-cache and AppendVec member payloads.
 type DualProgress struct {
 	Download *ProgressBar
 	Extract  *ProgressBar
 
-	mu            sync.Mutex
-	started       bool
-	done          bool
-	interrupted   bool
-	stopCh        chan struct{}
-	doneCh        chan struct{}
-	output        io.Writer
-	useColor      bool
-	downloadTotal int64 // cached download total for ratio calculation
+	mu                  sync.Mutex
+	started             bool
+	done                bool
+	interrupted         bool
+	stopCh              chan struct{}
+	doneCh              chan struct{}
+	output              io.Writer
+	useColor            bool
+	downloadTotal       int64 // cached download total for ratio calculation
+	observer            func(DualProgressObservation)
+	startedAt           time.Time
+	terminal            *DualProgressObservation
+	incremental         bool
+	incrementalProgress func(uint64, string) *DualProgress
+	manifestObserver    func(bool, uint64, time.Time)
+}
+
+// DualProgressObservation reports raw archive processing facts, not node
+// readiness. Complete means the caller stopped the archive owner successfully.
+// Byte counters are sampled individually; they are not an atomic pair.
+type DualProgressObservation struct {
+	StartedAt               time.Time
+	CapturedAt              time.Time
+	State                   string
+	CompressedInputBytes    uint64
+	CompressedReportedTotal uint64
+	CompressedTotalKnown    bool
+	AccountPayloadBytes     uint64
+}
+
+// SetManifestObserver installs a per-bootstrap observer before archive work.
+// The bool distinguishes incremental manifests from full manifests.
+func (d *DualProgress) SetManifestObserver(observer func(bool, uint64, time.Time)) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.started {
+		return false
+	}
+	d.manifestObserver = observer
+	return true
+}
+
+// ManifestParsed reports a successful parse, not a completed bootstrap.
+func (d *DualProgress) ManifestParsed(incremental bool, slot uint64) {
+	if d == nil {
+		return
+	}
+	at := time.Now()
+	d.mu.Lock()
+	observer := d.manifestObserver
+	d.mu.Unlock()
+	if observer != nil {
+		observer(incremental, slot, at)
+	}
+}
+
+// SetObserver configures an optional observer before Start and returns false
+// after startup. The observer must only store a detached value without blocking
+// and must not call Start, Stop or Interrupt. It runs outside the display lock.
+func (d *DualProgress) SetObserver(observer func(DualProgressObservation)) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.started {
+		return false
+	}
+	d.observer = observer
+	return true
+}
+
+// SetIncrementalProgress configures a fresh-owner constructor before Start.
+// Nil leaves incremental processing unobserved. The callback receives only the
+// parsed archive slot and local/remote classification, never a path or URL.
+func (d *DualProgress) SetIncrementalProgress(create func(uint64, string) *DualProgress) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.started {
+		return false
+	}
+	d.incrementalProgress = create
+	return true
+}
+
+// NewIncrementalProgress constructs one unstarted owner after the full archive
+// completed. Every retry calls it again; the terminal full owner is not reused.
+func (d *DualProgress) NewIncrementalProgress(slot uint64, kind string) *DualProgress {
+	if d == nil || kind != "local" && kind != "remote" {
+		return nil
+	}
+	d.mu.Lock()
+	create, ready := d.incrementalProgress, d.started && d.done && !d.interrupted
+	d.mu.Unlock()
+	if create == nil || !ready {
+		return nil
+	}
+	select {
+	case <-d.doneCh:
+	default:
+		return nil
+	}
+	next := create(slot, kind)
+	if next == nil || next == d {
+		return nil
+	}
+	next.mu.Lock()
+	defer next.mu.Unlock()
+	if next.started {
+		return nil
+	}
+	next.incremental = true
+	return next
+}
+
+func (d *DualProgress) observationLocked(state string, now time.Time) (DualProgressObservation, bool) {
+	if d.incremental {
+		switch state {
+		case "full_archive_complete":
+			state = "incremental_archive_complete"
+		case "full_archive_interrupted":
+			state = "incremental_archive_interrupted"
+		}
+	}
+	input, payload, total := d.Download.Current(), d.Extract.Current(), d.Download.Total()
+	if input < 0 || payload < 0 {
+		return DualProgressObservation{}, false
+	}
+	o := DualProgressObservation{
+		StartedAt: d.startedAt, CapturedAt: now, State: state,
+		CompressedInputBytes: uint64(input), AccountPayloadBytes: uint64(payload),
+	}
+	if total > 0 {
+		o.CompressedReportedTotal, o.CompressedTotalKnown = uint64(total), true
+	}
+	return o, true
+}
+
+// publishObservation runs only on the display owner after its initial callback.
+// A terminal result wins even when the ticker and stop channel are both ready.
+func (d *DualProgress) publishObservation() bool {
+	if d.observer == nil {
+		return false
+	}
+	d.mu.Lock()
+	done := d.done
+	var o DualProgressObservation
+	var ok bool
+	if done {
+		if d.terminal != nil {
+			o, ok = *d.terminal, true
+		}
+	} else {
+		o, ok = d.observationLocked("active", time.Now())
+	}
+	d.mu.Unlock()
+	if ok {
+		d.observer(o)
+	}
+	return done
 }
 
 // NewDualProgress creates a new dual progress display
@@ -310,15 +458,28 @@ func (d *DualProgress) Start() {
 		return
 	}
 	d.started = true
+	var initial DualProgressObservation
+	var observed bool
+	if d.observer != nil {
+		d.startedAt = time.Now()
+		initial, observed = d.observationLocked("active", d.startedAt)
+	}
+	incremental := d.incremental
 	d.mu.Unlock()
+	if observed {
+		d.observer(initial)
+	}
 
-	// Print pipeline description using stages (same stage = parallel)
-	fmt.Fprintln(d.output) // spacing before pipeline
+	// Label only the archive owned by these bars, not later bootstrap stages.
+	fmt.Fprintln(d.output)
 	if d.useColor {
 		fmt.Fprintf(d.output, "%s", colorDim)
 	}
-	fmt.Fprintln(d.output, "  [1] Snapshot Download + Extract AppendVecs → [2] Flush Index")
-	fmt.Fprintln(d.output, "  [3] Download Incremental + Process → [4] Fetch Blocks → Replay")
+	kind := "Full snapshot"
+	if incremental {
+		kind = "Incremental snapshot"
+	}
+	fmt.Fprintln(d.output, "  "+kind+" read + Extract AppendVecs")
 	if d.useColor {
 		fmt.Fprintf(d.output, "%s", colorReset)
 	}
@@ -340,10 +501,16 @@ func (d *DualProgress) updateLoop() {
 	for {
 		select {
 		case <-d.stopCh:
+			d.publishObservation()
 			d.updateEstimates()
 			d.render()
 			return
 		case <-ticker.C:
+			if d.publishObservation() {
+				d.updateEstimates()
+				d.render()
+				return
+			}
 			// Skip rendering until we have actual data to show
 			// This prevents duplicate empty 0% bars from appearing
 			if d.Download.Total() == 0 {
@@ -388,6 +555,15 @@ func (d *DualProgress) Stop() {
 		return
 	}
 	d.done = true
+	if d.observer != nil {
+		state := "full_archive_complete"
+		if d.interrupted {
+			state = "full_archive_interrupted"
+		}
+		if terminal, ok := d.observationLocked(state, time.Now()); ok {
+			d.terminal = &terminal
+		}
+	}
 	d.mu.Unlock()
 
 	close(d.stopCh)

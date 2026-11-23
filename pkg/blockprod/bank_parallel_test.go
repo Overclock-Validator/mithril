@@ -61,6 +61,7 @@ func TestParallelForgeMatchesForgeBundle(t *testing.T) {
 	assert.Equal(t, serial.Bank.ForgedTransactions(), parallel.Bank.ForgedTransactions())
 	assert.Equal(t, serial.Bank.CostTracker().BlockCost(), parallel.Bank.CostTracker().BlockCost())
 	assert.Equal(t, serial.Bank.EntryBytes(), parallel.Bank.EntryBytes())
+	assert.Equal(t, serial.SlotCtx.TransactionCounts, parallel.SlotCtx.TransactionCounts)
 
 	assert.Equal(t, ForgeDroppedAlreadyProcessed, forgeParallel(t, parallel.Bank, true, fund).Result, "a committed transaction is recorded")
 }
@@ -88,6 +89,8 @@ func TestParallelForgeStandaloneFailureLandsAndPays(t *testing.T) {
 	assert.Equal(t, destBefore, lamportsOf(t, env, txfixture.DestPubkey()))
 	assert.Equal(t, payerBefore-5_000, lamportsOf(t, env, txfixture.PayerPubkey()), "the failure is recorded and pays its fee")
 	assert.Equal(t, []*solana.Transaction{fails}, env.Bank.ForgedTransactions())
+	assert.Equal(t, uint64(1), env.SlotCtx.TransactionCounts.Total)
+	assert.Equal(t, uint64(1), env.SlotCtx.TransactionCounts.NonVoteFailed)
 
 	_, prepared := env.Bank.PrepareBundle([]*solana.Transaction{fails, fails}, false)
 	assert.Equal(t, ForgeDroppedParse, prepared.Result, "a standalone bundle is one transaction")

@@ -157,6 +157,7 @@ func (mc *multiCloser) Close() error {
 
 // SetProgressCallback sets an optional callback to receive progress updates.
 // The callback is invoked on each Read() with (bytesRead, totalBytes).
+// Configure it before the first Read; changing it during reads is not safe.
 func (x *bufmonreader) SetProgressCallback(cb ProgressCallback) {
 	x.onProgress = cb
 }

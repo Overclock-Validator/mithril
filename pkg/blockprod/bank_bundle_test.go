@@ -54,6 +54,7 @@ func requireNothingLanded(t *testing.T, env *TestEnv, payerBefore, destBefore ui
 	assert.Zero(t, env.Bank.CostTracker().BlockCost())
 	assert.Zero(t, env.Bank.EntryBuilder().PendingCount())
 	assert.Empty(t, env.SlotCtx.ModifiedAccts)
+	assert.Zero(t, env.SlotCtx.TransactionCounts)
 }
 
 func TestForgeBundleLaterTransactionsSeeEarlierWrites(t *testing.T) {
@@ -85,6 +86,10 @@ func TestForgeBundleLaterTransactionsSeeEarlierWrites(t *testing.T) {
 	assert.Equal(t, []*solana.Transaction{fund, spend}, env.Bank.ForgedTransactions())
 	assert.Equal(t, 2, env.Bank.EntryBuilder().PendingCount())
 	assert.NotZero(t, env.Bank.CostTracker().BlockCost())
+	assert.Equal(t, uint64(2), env.SlotCtx.TransactionCounts.Total)
+	assert.Equal(t, uint64(2), env.SlotCtx.TransactionCounts.NonVote)
+	assert.Zero(t, env.SlotCtx.TransactionCounts.Failed)
+	assert.NotZero(t, env.SlotCtx.TransactionCounts.ComputeUnits)
 
 	again := env.Bank.ForgeBundle(BundleInput{Transactions: []*solana.Transaction{fund}})
 	assert.Equal(t, ForgeDroppedAlreadyProcessed, again.Result, "landed transactions are recorded")
@@ -242,13 +247,17 @@ func TestForgeBundleMatchesReplay(t *testing.T) {
 
 	validator := NewTestEnv(TestEnvConfig{})
 	defer validator.Close()
-	var totalFee uint64
+	var totalFee, totalComputeUnits uint64
 	for _, tx := range txs {
-		feeInfo, _, err := replay.ProcessTransaction(validator.SlotCtx, &sync.WaitGroup{}, tx, nil, nil, nil, false)
+		feeInfo, computeUnits, err := replay.ProcessTransaction(validator.SlotCtx, &sync.WaitGroup{}, tx, nil, nil, nil, false)
 		require.NoError(t, err)
 		require.NotNil(t, feeInfo)
 		totalFee += feeInfo.TotalFee
+		totalComputeUnits += computeUnits
 	}
+	require.Positive(t, totalComputeUnits)
+	assert.False(t, leader.SlotCtx.TransactionCounts.Saturated)
+	assert.Equal(t, totalComputeUnits, leader.SlotCtx.TransactionCounts.ComputeUnits)
 	assert.Equal(t, totalFee, leader.Bank.TxFeeAccumulator().TotalFees)
 	for _, key := range []solana.PublicKey{txfixture.PayerPubkey(), txfixture.DestPubkey(), funded.PublicKey()} {
 		assert.Equal(t, lamportsOf(t, validator, key), lamportsOf(t, leader, key), "%s", key)

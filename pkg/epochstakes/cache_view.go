@@ -11,7 +11,7 @@ func (cache *EpochStakesCache) CaptureView() CacheView {
 	defer cache.mu.RUnlock()
 	view := CacheView{epochs: make([]Snapshot, 0, len(cache.stakeCache))}
 	for epoch, stakes := range cache.stakeCache {
-		view.epochs = append(view.epochs, Snapshot{Epoch: epoch, Generation: cache.generations[epoch], Stakes: stakes,
+		view.epochs = append(view.epochs, Snapshot{Epoch: epoch, Generation: cache.generations[epoch], Selection: cache.selectionCache[epoch], Stakes: stakes,
 			VoteAccounts: cache.voteAcctCache[epoch], TotalStake: cache.totalStakeCache[epoch]})
 	}
 	return view
@@ -30,10 +30,12 @@ func (cache *EpochStakesCache) RestoreView(view CacheView) {
 	clear(cache.stakeCache)
 	clear(cache.voteAcctCache)
 	clear(cache.totalStakeCache)
+	clear(cache.selectionCache)
 	for _, snapshot := range view.epochs {
 		cache.stakeCache[snapshot.Epoch] = snapshot.Stakes
 		cache.voteAcctCache[snapshot.Epoch] = snapshot.VoteAccounts
 		cache.totalStakeCache[snapshot.Epoch] = snapshot.TotalStake
+		cache.selectionCache[snapshot.Epoch] = snapshot.Selection
 		cache.bumpGenerationLocked(snapshot.Epoch)
 	}
 }

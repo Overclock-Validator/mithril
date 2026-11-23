@@ -89,6 +89,11 @@ var (
 	clusterInfo                      config.Cluster
 	clusterGenesisHash               string // required for custom clusters; must match the built-in genesis otherwise
 	legacyGenesisHash                string // explicit lineage for pre-binding AccountsDB/ledger artifacts
+	dashboardSocket                  string
+	dashboardSocketGroup             string
+	dashboardEnabled                 bool
+	dashboardHostResources           bool
+	disableMetricsServer             bool
 	blockSource                      string // "turbine", "rpc", or "lightbringer"
 	lightbringerEndpoint             string
 	repairCatchupMaxGapSlots         int    // Resume gaps up to this fill via turbine repair instead of RPC (0 = off)
@@ -547,6 +552,11 @@ func init() {
 	// [rpc] section flags (Mithril's RPC server)
 	Run.Flags().IntVar(&rpcPort, "rpc-port", 0, "RPC server port. Default off.")
 	Run.Flags().StringVar(&rpcBindAddress, "rpc-bind-address", "0.0.0.0", "RPC listener IP; use 127.0.0.1 for local access only")
+	Run.Flags().BoolVar(&disableMetricsServer, "no-metrics-server", false, "Disable the Prometheus HTTP listener (default :9090)")
+	Run.Flags().StringVar(&dashboardSocket, "dashboard-socket", "", "Private read-only dashboard socket (mode 0700 parent by default; default off)")
+	Run.Flags().StringVar(&dashboardSocketGroup, "dashboard-socket-group", "", "Dedicated Linux feed group (requires a node-owned mode 2710 socket directory)")
+	Run.Flags().BoolVar(&dashboardEnabled, "dashboard-enabled", false, "Enable the provisioned Linux dashboard feed")
+	Run.Flags().BoolVar(&dashboardHostResources, "dashboard-host-resources", false, "Collect visible-host CPU/load/memory in the private dashboard feed (requires a dashboard feed; default off)")
 
 	// [replay] section flags
 	Run.Flags().Int64Var(&txParallelism, "txpar", 0, "Transaction execution workers (>0 enables topsort parallelism; explicit 0 is sequential; unset validator mode defaults to 2x CPU cores)")
@@ -910,6 +920,19 @@ func initConfigAndBindFlags(cmd *cobra.Command) error {
 	rpcBindAddress = getString("rpc-bind-address", "rpc.bind_address")
 	if net.ParseIP(rpcBindAddress) == nil {
 		return fmt.Errorf("rpc.bind_address must be a literal IP address: %q", rpcBindAddress)
+	}
+	disableMetricsServer = getBool("no-metrics-server", "reporting.no_metrics_server")
+	dashboardSocket = getString("dashboard-socket", "dashboard.socket")
+	dashboardSocketGroup = getString("dashboard-socket-group", "dashboard.socket_group")
+	dashboardEnabled = getBool("dashboard-enabled", "dashboard.enabled")
+	var dashboardErr error
+	dashboardSocket, dashboardSocketGroup, dashboardErr = dashboardFeedConfig(dashboardEnabled, dashboardSocket, dashboardSocketGroup, runtime.GOOS)
+	if dashboardErr != nil {
+		return dashboardErr
+	}
+	dashboardHostResources = getBool("dashboard-host-resources", "dashboard.host_resources")
+	if err := validateDashboardHostResources(dashboardHostResources, dashboardSocket); err != nil {
+		return err
 	}
 
 	// Top-level
@@ -1405,6 +1428,7 @@ func runLive(c *cobra.Command, args []string) error {
 
 	// Generate run ID early so it's available for logging and state tracking
 	replay.CurrentRunID = replay.GenerateRunID()
+	runStartedAt := time.Now()
 
 	// Initialize file logging with defaults
 	// Use config.IsSet() to allow explicit empty/zero values:
@@ -1469,8 +1493,6 @@ func runLive(c *cobra.Command, args []string) error {
 		debug.SetMemoryLimit(nodeMemoryLimit)
 	}
 	mlog.Log.Infof("Go runtime soft memory limit: %d MiB (tuning.memory_limit_mb overrides GOMEMLIMIT when set)", debug.SetMemoryLimit(-1)>>20)
-	stopMemoryDiagnostics := startMemoryDiagnostics(ctx, mlog.GetLogDir(), heapProfileThreshold)
-	defer stopMemoryDiagnostics()
 
 	// Kill any existing mithril processes to prevent zombie accumulation.
 	// A backtest or an offline replay may share the host with other nodes and
@@ -1480,6 +1502,11 @@ func runLive(c *cobra.Command, args []string) error {
 			fmt.Printf("  ⚠ Killed %d existing mithril process(es)\n\n", killed)
 		}
 	}
+	dashboard := startNodeDashboard(ctx, runStartedAt, dashboardSocket, dashboardSocketGroup, replay.CurrentRunID, cluster, consensusMode, true, rpcPort != 0, dashboardHostResources)
+	defer dashboard.close()
+	dashboard.storagePaths(accountsPath, blockstorePath)
+	stopMemoryDiagnostics := startMemoryDiagnostics(ctx, mlog.GetLogDir(), heapProfileThreshold, dashboard)
+	defer stopMemoryDiagnostics()
 
 	// Discover once, before constructing any turbine, consensus, or production
 	// component. Gossip clients can discover a missing version internally, but
@@ -1502,8 +1529,10 @@ func runLive(c *cobra.Command, args []string) error {
 	// Print consolidated startup info
 	printStartupInfo("run")
 
-	// Now start the metrics server (after banner so errors don't appear first)
-	statsd.StartMetricsServer()
+	// Start the optional metrics listener after the banner.
+	if !disableMetricsServer {
+		statsd.StartMetricsServer()
+	}
 
 	// Chain lineage is a startup gate, not part of AccountsDB bootstrap. Resolve
 	// it before Lightbringer can open ledger storage and before history records
@@ -1523,6 +1552,7 @@ func runLive(c *cobra.Command, args []string) error {
 	if err := clusterInfo.CheckGenesis(networkGenesisHash); err != nil {
 		klog.Fatalf("FATAL: %v", err)
 	}
+	dashboard.bootstrap(networkGenesisHash)
 
 	mithrilState, err := loadBootstrapState(accountsPath, bootstrapMode)
 	if err != nil {
@@ -1590,6 +1620,7 @@ func runLive(c *cobra.Command, args []string) error {
 	if err != nil {
 		klog.Fatalf("%v", err)
 	}
+	var prewarm nodePrewarmLifetime
 
 	// Turbine prewarm: start collecting live shreds the moment a snapshot
 	// manifest supplies stakes good enough to verify them — every second of
@@ -1602,9 +1633,7 @@ func runLive(c *cobra.Command, args []string) error {
 	// schedule horizon missed the live tip — rebuilds the schedule, which
 	// the running receiver picks up per shred (self-healing, no restart).
 	// Fail-open: any error just means no (or later) prewarm.
-	var turbinePrewarm *blockstream.TurbinePrewarm
 	if useTurbine && turbineBindAddr != "" && turbineGossipEntrypoint != "" {
-		var prewarmMu sync.Mutex
 		seedManifestStakes := func(m *snapshot.SnapshotManifest) bool {
 			tmp := &state.MithrilState{}
 			snapshot.PopulateManifestSeed(tmp, m)
@@ -1635,6 +1664,11 @@ func runLive(c *cobra.Command, args []string) error {
 			return true
 		}
 		startPrewarm := func(m *snapshot.SnapshotManifest, origin string) {
+			// Both callbacks hold prewarm.mu. Closing only refuses a new
+			// producer; their existing stake/schedule work remains unchanged.
+			if prewarm.closing {
+				return
+			}
 			epochSchedule := m.Bank.EpochSchedule
 			rootSlot := m.Bank.Slot
 			stakesForSlot := func(slot uint64) map[solana.PublicKey]uint64 {
@@ -1671,13 +1705,13 @@ func runLive(c *cobra.Command, args []string) error {
 				mlog.Log.Warnf("turbine prewarm failed to start (continuing without): %v", err)
 				return
 			}
-			turbinePrewarm = pw
+			prewarm.collector = pw
 			mlog.Log.Infof("turbine prewarm: collecting live shreds from slot %d while the AccountsDB builds (stakes %s)", m.Bank.Slot+1, origin)
 		}
 		snapshot.OnFullSnapshotManifestParsed = func(m *snapshot.SnapshotManifest) {
-			prewarmMu.Lock()
-			defer prewarmMu.Unlock()
-			if turbinePrewarm != nil || m == nil {
+			prewarm.mu.Lock()
+			defer prewarm.mu.Unlock()
+			if prewarm.collector != nil || m == nil {
 				return
 			}
 			if !seedManifestStakes(m) {
@@ -1690,12 +1724,12 @@ func runLive(c *cobra.Command, args []string) error {
 			startPrewarm(m, "from the full manifest")
 		}
 		snapshot.OnIncrementalManifestParsed = func(m *snapshot.SnapshotManifest) {
-			prewarmMu.Lock()
-			defer prewarmMu.Unlock()
+			prewarm.mu.Lock()
+			defer prewarm.mu.Unlock()
 			if m == nil {
 				return
 			}
-			if turbinePrewarm != nil {
+			if prewarm.collector != nil {
 				// Prewarm already live off the full manifest. Refresh with
 				// the incremental's strictly-fresher stakes; if the full's
 				// schedule horizon missed the resume region, this rebuild is
@@ -1907,7 +1941,7 @@ func runLive(c *cobra.Command, args []string) error {
 
 		// Build directly from the specified files (BuildAccountsDbPaths handles AccountsDB cleanup internally)
 		// NOTE: We do NOT clean snapshot files in explicit mode - user wants to keep their explicit snapshots
-		dp := progress.NewDualProgress()
+		dp := dashboard.newExplicitSnapshotProgress(fullSnapshotSlot, snapshotArchivePath)
 		accountsDb, manifest, err = snapshot.BuildAccountsDbPaths(ctx, snapshotArchivePath, incrementalSnapshotFilename, accountsPaths, dp)
 		if err != nil {
 			klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
@@ -1988,7 +2022,7 @@ func runLive(c *cobra.Command, args []string) error {
 			mlog.Log.Infof("Cleaning up existing snapshot files in %s (keeping %d)", snapshotDownloadPath, maxSnapshots)
 			snapshot.CleanSnapshotDownloadDir(snapshotDownloadPath, maxSnapshots)
 		}
-		accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPaths, blockstorePath)
+		accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPaths, blockstorePath, dashboard)
 		if err != nil {
 			klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
 		}
@@ -2025,7 +2059,7 @@ func runLive(c *cobra.Command, args []string) error {
 			mlog.Log.Infof("Cleaning up previous AccountsDB artifacts in %s", accountsPath)
 			snapshot.CleanAccountsDbDirs(accountsPaths)
 		}
-		accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPaths, blockstorePath, rpcEndpoints)
+		accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPaths, blockstorePath, rpcEndpoints, dashboard)
 		if err != nil {
 			klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
 		}
@@ -2062,7 +2096,7 @@ func runLive(c *cobra.Command, args []string) error {
 		if existingSnap != nil {
 			// Reuse existing snapshot
 			mlog.Log.Infof("Reusing existing snapshot file at slot %d", existingSnap.slot)
-			accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPaths, blockstorePath, rpcEndpoints)
+			accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPaths, blockstorePath, rpcEndpoints, dashboard)
 		} else {
 			// Download fresh
 			mlog.Log.Infof("no fresh snapshot file found, downloading new one")
@@ -2074,7 +2108,7 @@ func runLive(c *cobra.Command, args []string) error {
 				}
 				snapshot.CleanSnapshotDownloadDir(snapshotDownloadPath, maxSnapshots)
 			}
-			accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPaths, blockstorePath)
+			accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPaths, blockstorePath, dashboard)
 		}
 		if err != nil {
 			klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
@@ -2160,7 +2194,7 @@ func runLive(c *cobra.Command, args []string) error {
 					}
 					if existingSnap != nil {
 						mlog.Log.Infof("Reusing existing snapshot file at slot %d", existingSnap.slot)
-						accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPaths, blockstorePath, rpcEndpoints)
+						accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPaths, blockstorePath, rpcEndpoints, dashboard)
 					} else {
 						// Clean up old snapshot files
 						if snapshotDownloadPath != "" {
@@ -2170,7 +2204,7 @@ func runLive(c *cobra.Command, args []string) error {
 							}
 							snapshot.CleanSnapshotDownloadDir(snapshotDownloadPath, maxSnapshots)
 						}
-						accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPaths, blockstorePath)
+						accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPaths, blockstorePath, dashboard)
 					}
 					if err != nil {
 						klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
@@ -2266,7 +2300,7 @@ func runLive(c *cobra.Command, args []string) error {
 			existingSnap := detectFreshSnapshot(snapshotDownloadPath, fullThreshold, rpcEndpoints, ctx)
 			if existingSnap != nil {
 				mlog.Log.Infof("Reusing existing snapshot file at slot %d", existingSnap.slot)
-				accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPaths, blockstorePath, rpcEndpoints)
+				accountsDb, manifest, err = buildFromExistingSnapshot(ctx, existingSnap, snapshotDownloadPath, accountsPaths, blockstorePath, rpcEndpoints, dashboard)
 			} else {
 				// Clean up old snapshot files based on retention settings
 				maxSnapshots := config.GetInt("snapshot.max_full_snapshots")
@@ -2274,7 +2308,7 @@ func runLive(c *cobra.Command, args []string) error {
 					maxSnapshots = 1 // default: keep 1 snapshot
 				}
 				snapshot.CleanSnapshotDownloadDir(snapshotDownloadPath, maxSnapshots)
-				accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPaths, blockstorePath)
+				accountsDb, manifest, err = downloadAndBuildFromSnapshot(ctx, rpcEndpoints, snapshotDownloadPath, accountsPaths, blockstorePath, dashboard)
 			}
 			if err != nil {
 				klog.Fatalf("failed to build AccountsDB from snapshot: %v", err)
@@ -2330,6 +2364,9 @@ postBootstrap:
 		}
 		// Record bootstrap in history
 		state.RecordBootstrap(accountsPath, manifest.Bank.Slot, "", replay.CurrentRunID, getVersion(), getCommit(), getBranch())
+	}
+	if mithrilState.Stage == "ready" && mithrilState.SnapshotSlot == manifest.Bank.Slot && mithrilState.GenesisHash == networkGenesisHash {
+		dashboard.snapshotReadyMarker(manifest.Bank.Slot)
 	}
 
 	// Support finite replay: --end-slot or --num-slots
@@ -2626,7 +2663,11 @@ postBootstrap:
 		if err := rpcServer.EnableEpochRewards(filepath.Join(accountsPath, "rpc-epoch-rewards"), 3*schedule.SlotsPerEpoch, mithrilState.LastRootedSlot); err != nil {
 			klog.Fatalf("unable to load RPC epoch rewards: %v", err)
 		}
+		if dashboard != nil {
+			rpcServer.EnableMonitoring()
+		}
 		rpcServer.Start()
+		dashboard.rpcStarted(rpcServer)
 		mlog.Log.Infof("Started RPC server on %s", net.JoinHostPort(rpcBindAddress, strconv.Itoa(rpcPort)))
 	}
 
@@ -2637,6 +2678,7 @@ postBootstrap:
 		klog.Fatalf("Alpenglow consensus requires an epoch schedule in the snapshot/state seed")
 	}
 	consensusEngine, err = consensusengine.NewEngine(consensusengine.Config{
+		MonitoringEnabled:         dashboard != nil,
 		AlpenglowObserverBindAddr: alpenglowObserverBindAddr,
 		AlpenglowMaxMessageBytes:  alpenglowMaxMessageBytes,
 		AlpenglowBLSDST:           alpenglowBLSDST,
@@ -2678,7 +2720,9 @@ postBootstrap:
 	if err := consensusEngine.Start(ctx); err != nil {
 		klog.Fatalf("unable to start consensus engine %q: %v", consensusEngine.Name(), err)
 	}
+	dashboard.consensusStarted(consensusEngine)
 	defer func() {
+		dashboard.consensusStarted(nil)
 		if err := consensusEngine.Close(); err != nil {
 			mlog.Log.Warnf("consensus engine close failed: %v", err)
 		}
@@ -2702,10 +2746,12 @@ postBootstrap:
 	var sharedGossip *gossip.Client
 	var validatorPrewarmBlocks []*block.Block
 	if consensusMode == "validator" {
-		if turbinePrewarm != nil {
+		if turbinePrewarm := prewarm.forReplay(false); turbinePrewarm != nil {
 			var dropped int
 			validatorPrewarmBlocks, dropped = turbinePrewarm.Handover()
-			turbinePrewarm = nil
+			prewarm.mu.Lock()
+			prewarm.collector = nil
+			prewarm.mu.Unlock()
 			if len(validatorPrewarmBlocks) > 0 || dropped > 0 {
 				mlog.Log.Infof("turbine prewarm handover for validator startup: %d blocks (%d dropped)", len(validatorPrewarmBlocks), dropped)
 			}
@@ -2794,7 +2840,9 @@ postBootstrap:
 		if err != nil {
 			klog.Fatalf("start validator TPU: %v", err)
 		}
+		dashboard.pipelineStarted(tpuService, topicSink)
 		defer func() {
+			dashboard.pipelineStopped()
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			if err := tpuService.Stop(shutdownCtx); err != nil {
@@ -2880,7 +2928,13 @@ postBootstrap:
 		defer rewardPipeline.Close()
 		leaderStop := make(chan struct{})
 		leaderDone := make(chan struct{})
+		var certificateObservationVoteAccount solana.PublicKey
+		if dashboard != nil {
+			certificateObservationVoteAccount = validatorVoteAccount
+		}
 		leaderLoop := blockprod.NewLeaderLoop(blockprod.LeaderLoopConfig{
+			CertificateObservationVoteAccount: certificateObservationVoteAccount,
+
 			Controller:            controller,
 			Identity:              validatorIdentity,
 			AccountsDb:            accountsDb,
@@ -2971,7 +3025,7 @@ postBootstrap:
 		RepairCatchupMaxGapSlots:   uint64(repairCatchupMaxGapSlots),
 		RepairMaxRequestsPerSecond: repairMaxRequestsPerSecond,
 		DisableRPCBlockFetch:       !blockRPCFallback,
-		TurbinePrewarm:             turbinePrewarm,
+		TurbinePrewarm:             prewarm.forReplay(false),
 		PrewarmBlocks:              validatorPrewarmBlocks,
 		ShredSpoolDir:              catchupShredSpoolDir(),
 		GossipClient:               sharedGossip,
@@ -2996,6 +3050,16 @@ postBootstrap:
 	}
 
 	consensusOpts := &replay.ConsensusOpts{Engine: consensusEngine}
+	if dashboard != nil {
+		consensusOpts.Progress = &dashboard.progress
+		consensusOpts.CertificateObservationVoteAccount = validatorVoteAccount
+		if validatorIdentityConfigured {
+			consensusOpts.AccountObservationIdentity = validatorIdentity.PublicKey()
+		}
+		if consensusMode == "validator" {
+			consensusOpts.LeaderOutcomeIdentity = validatorIdentity.PublicKey()
+		}
+	}
 	consensusOpts.TransactionStatusCheckpointAfterCommit = func(selected *state.TransactionStatusCheckpointRef) error {
 		run := transactionStatusCleanupTask.Start()
 		removed, err := cleanupRetainedTransactionStatusCheckpoints(
@@ -3048,8 +3112,11 @@ postBootstrap:
 			}()
 		}
 	}
+	dashboard.replaying(validatorIdentity)
+	dashboard.selectedRecovery(mithrilState)
 	result := runReplayWithRecovery(ctx, accountsDb, accountsPath, manifest, resumeState, uint64(startSlot), liveEndSlot, rpcEndpoints, lightbringerEndpoint, turbineBindAddr, turbineGossipEntrypoint, turbineGossipBindAddr, turbineAdvertisedIP, uint16(turbineShredVersion), turbineAlpenglowAddr, validatorIdentity, blockstorePath, int(txParallelism), true, useLightbringer, useTurbine, dbgOpts, metricsWriter, slotCtxSetter, mithrilState, blockFetchOpts, consensusOpts, compactCfg.RewindHorizonBatches, replayStartTime)
 	lastReplayResult = result
+	dashboard.stopping()
 	stopCompactor() // join before shutdown closes AccountsDB
 
 	if result.Error != nil {
@@ -3921,7 +3988,7 @@ func queryLatestSnapshotSlot(ctx context.Context, rpcEndpoints []string) (uint64
 }
 
 // buildFromExistingSnapshot builds AccountsDB from an existing downloaded snapshot file.
-func buildFromExistingSnapshot(ctx context.Context, snap *snapshotInfo, snapshotDir string, accountsPaths []string, blockstorePath string, rpcEndpoints []string) (*accountsdb.AccountsDb, *snapshot.SnapshotManifest, error) {
+func buildFromExistingSnapshot(ctx context.Context, snap *snapshotInfo, snapshotDir string, accountsPaths []string, blockstorePath string, rpcEndpoints []string, dashboard *nodeDashboard) (*accountsdb.AccountsDb, *snapshot.SnapshotManifest, error) {
 	snapCfg := buildSnapshotConfig(rpcEndpoints)
 
 	// Construct full path to snapshot file
@@ -3929,7 +3996,7 @@ func buildFromExistingSnapshot(ctx context.Context, snap *snapshotInfo, snapshot
 	mlog.Log.Infof("building AccountsDB from existing snapshot: %s", fullSnapshotPath)
 
 	// Create progress display for extract
-	dp := progress.NewDualProgress()
+	dp := dashboard.newSnapshotProgress(snap.slot, "local")
 
 	accountsDb, manifest, err := snapshot.BuildAccountsDbAuto(ctx, fullSnapshotPath, snapshotDir, int(snap.slot), int(snap.slot), accountsPaths, rpcEndpoints, blockstorePath, snapCfg, dp)
 	if err != nil {
@@ -3941,7 +4008,7 @@ func buildFromExistingSnapshot(ctx context.Context, snap *snapshotInfo, snapshot
 }
 
 // downloadAndBuildFromSnapshot finds, downloads, and builds AccountsDB from a snapshot
-func downloadAndBuildFromSnapshot(ctx context.Context, rpcEndpoints []string, snapshotDownloadPath string, accountsPaths []string, blockstorePath string) (*accountsdb.AccountsDb, *snapshot.SnapshotManifest, error) {
+func downloadAndBuildFromSnapshot(ctx context.Context, rpcEndpoints []string, snapshotDownloadPath string, accountsPaths []string, blockstorePath string, dashboard *nodeDashboard) (*accountsdb.AccountsDb, *snapshot.SnapshotManifest, error) {
 	snapCfg := buildSnapshotConfig(rpcEndpoints)
 	fullSnapshotDlStart := time.Now()
 	fullSnapshotInfo, err := snapshotdl.GetSnapshotURLWithInfo(ctx, snapCfg)
@@ -3963,7 +4030,12 @@ func downloadAndBuildFromSnapshot(ctx context.Context, rpcEndpoints []string, sn
 	)
 
 	// Create progress display for snapshot download and extract
-	dp := progress.NewDualProgress()
+	var dp *progress.DualProgress
+	if fullSnapshotSlot < 0 {
+		dp = progress.NewDualProgress()
+	} else {
+		dp = dashboard.newSnapshotProgress(uint64(fullSnapshotSlot), "remote")
+	}
 
 	accountsDb, manifest, err := snapshot.BuildAccountsDbAuto(ctx, fullSnapshotURL, snapshotDownloadPath, fullSnapshotSlot, fullSnapshotInfo.ReferenceSlot, accountsPaths, rpcEndpoints, blockstorePath, snapCfg, dp)
 	if err != nil {

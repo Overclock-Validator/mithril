@@ -24,7 +24,11 @@ type VotesAggregateWire struct {
 // ValidatedFinalCert holds BLS-verified finalization signers from a footer final cert.
 type ValidatedFinalCert struct {
 	FinalSlot uint64
-	Signers   map[solana.PublicKey]struct{}
+	Epoch     uint64
+	BlockID   solana.Hash
+	// Fast identifies a verified fast-finalize certificate.
+	Fast    bool
+	Signers map[solana.PublicKey]struct{}
 }
 
 func DecodeFinalCertificate(raw []byte) (FinalCertificate, error) {
@@ -187,6 +191,9 @@ func validateDecodedBlockFinalCertificate(
 	}
 	return &ValidatedFinalCert{
 		FinalSlot: fc.Slot,
+		Epoch:     validatorSet.Epoch,
+		BlockID:   fc.BlockID,
+		Fast:      fc.NotarAggregate == nil,
 		Signers:   signers,
 	}, nil
 }

@@ -183,6 +183,7 @@ func (env *lifecycleEnv) block(txs []*solana.Transaction) *b.Block {
 }
 
 type lifecycleOutcome struct {
+	counts        sealevel.BankTransactionCounts
 	bankhash      []byte
 	numSignatures uint64
 	computeUnits  uint64
@@ -218,6 +219,7 @@ func lifecycleOutcomeOf(t *testing.T, slotCtx *sealevel.SlotCtx, tail *lifecycle
 	require.NotZero(t, metrics.GlobalBlockReplay.LongestChainCU)
 	require.NotZero(t, metrics.GlobalBlockReplay.LongestChainTransactions)
 	return lifecycleOutcome{
+		counts:          slotCtx.TransactionCounts,
 		bankhash:        append([]byte(nil), slotCtx.FinalBankhash...),
 		numSignatures:   slotCtx.NumSignatures,
 		computeUnits:    slotCtx.TotalComputeUnitsConsumed,
@@ -234,6 +236,8 @@ func requireSameLifecycleOutcome(t *testing.T, want, got lifecycleOutcome) {
 	require.Equal(t, want.bankhash, got.bankhash, "bank hash")
 	require.Equal(t, want.numSignatures, got.numSignatures)
 	require.Equal(t, want.computeUnits, got.computeUnits)
+	require.Equal(t, want.counts, got.counts)
+	require.Equal(t, want.computeUnits, got.counts.ComputeUnits)
 	require.Equal(t, want.lamportsBurnt, got.lamportsBurnt)
 	require.Equal(t, want.longestChainCU, got.longestChainCU, "longest chain CU")
 	require.Equal(t, want.longestChainTxs, got.longestChainTxs, "longest chain transactions")
@@ -436,6 +440,7 @@ func TestStreamingLifecycleMatchesWholeBlock(t *testing.T) {
 	txCountBefore := global.TransactionCount()
 
 	whole := lifecycleWholeBlock(t, newLifecycleEnv(t), txs, 0)
+	require.Equal(t, sealevel.BankTransactionCounts{Total: 12, NonVote: 12, Failed: 10, NonVoteFailed: 10, ComputeUnits: whole.computeUnits}, whole.counts)
 	require.Equal(t, txCountBefore+uint64(len(txs)), global.TransactionCount())
 	// Every transfer writes the payer, so the whole block is one chain, the
 	// failed transfers included.

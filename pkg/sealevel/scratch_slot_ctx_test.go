@@ -47,6 +47,7 @@ var derivedSlotCtxFields = map[string]string{
 	"Replay":                    "shared",
 	"LamportsBurnt":             "unset",
 	"TotalComputeUnitsConsumed": "unset",
+	"TransactionCounts":         "unset",
 	"EahWorkaroundBankhash":     "unset",
 	"HasEahWorkaround":          "unset",
 	"LatestEvictedBlockhash":    "shared",
@@ -106,7 +107,11 @@ func TestNewSealedSlotCtx(t *testing.T) {
 		WritableAccts:   map[solana.PublicKey]bool{},
 	}
 	view := accounts.NewRecordingReader(overlay)
+	base.TransactionCounts = BankTransactionCounts{Total: 5}
 	sealed := NewSealedSlotCtx(base, view)
+	if sealed.TransactionCounts != (BankTransactionCounts{}) || NewScratchSlotCtx(base).TransactionCounts != (BankTransactionCounts{}) {
+		t.Fatal("derived contexts must start without the committed bank transaction counts")
+	}
 
 	for field, kind := range derivedSlotCtxFields {
 		if kind != "shared" || field == "bankSysvars" {

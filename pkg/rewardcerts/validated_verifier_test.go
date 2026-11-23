@@ -33,6 +33,8 @@ func TestValidateRewardCertificatesWithVerifierRetainsExactBLSChecks(t *testing.
 	)
 	require.NoError(t, err)
 	require.NotNil(t, validated)
+	assert.Equal(t, rewardSlot, validated.RewardSlot)
+	assert.Equal(t, validatorSet.Epoch, validated.Epoch)
 	assert.Contains(t, validated.Validators, validatorSet.Validators[0].VoteAccount)
 	assert.Positive(t, timings.Skip)
 
@@ -95,10 +97,18 @@ func TestValidateDecodedBlockFinalCertificateWithVerifierRetainsExactBLSChecks(t
 	)
 	require.NoError(t, err)
 	require.NotNil(t, validated)
+	assert.Equal(t, slot, validated.FinalSlot)
+	assert.Equal(t, validatorSet.Epoch, validated.Epoch)
+	assert.Equal(t, blockID, validated.BlockID)
+	assert.True(t, validated.Fast)
 	assert.Contains(t, validated.Signers, validatorSet.Validators[0].VoteAccount)
 
 	tampered := finalCertificate
 	tampered.BlockID[0] ^= 1
+	_, err = ValidateDecodedBlockFinalCertificateWithVerifier(tampered, validatorSet.Epoch, verifier)
+	require.Error(t, err)
+	tampered = finalCertificate
+	tampered.FinalAggregate.Signature[0] ^= 1
 	_, err = ValidateDecodedBlockFinalCertificateWithVerifier(tampered, validatorSet.Epoch, verifier)
 	require.Error(t, err)
 
@@ -162,8 +172,17 @@ func TestValidateDecodedSlowFinalCertificateReturnsUnionOfSigners(t *testing.T) 
 	)
 	require.NoError(t, err)
 	require.NotNil(t, validated)
+	assert.Equal(t, slot, validated.FinalSlot)
+	assert.Equal(t, validatorSet.Epoch, validated.Epoch)
+	assert.Equal(t, blockID, validated.BlockID)
+	assert.False(t, validated.Fast)
 	require.Len(t, validated.Signers, 3)
 	for _, validator := range validatorSet.Validators {
 		assert.Contains(t, validated.Signers, validator.VoteAccount)
 	}
+
+	tampered := finalCertificate
+	tampered.FinalAggregate.Signature[0] ^= 1
+	_, err = ValidateDecodedBlockFinalCertificateWithVerifier(tampered, validatorSet.Epoch, verifier)
+	require.Error(t, err)
 }

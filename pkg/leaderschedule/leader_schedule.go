@@ -40,6 +40,14 @@ type leaderIdentitySlots struct {
 	slots    []uint64
 }
 
+// HeldAssignmentSummary is a bounded copy from an already-warmed identity index.
+// Counts describe locally held slots, not complete schedule coverage or turns.
+type HeldAssignmentSummary struct {
+	Total, Remaining uint64
+	Upcoming         [16]uint64
+	Count            int
+}
+
 func NewLeaderScheduleFromKeyedSlots(ls map[solana.PublicKey][]uint64, epochStartSlot uint64) *LeaderSchedule {
 	lsMap := make(map[uint64]slotLeader)
 
@@ -367,6 +375,25 @@ func (ls *LeaderSchedule) NextSlotForLeader(identity solana.PublicKey, from uint
 		return 0, false
 	}
 	return cached.slots[i], true
+}
+
+// CachedAssignmentsForLeader reads only the immutable cached identity index.
+// It never warms a cold cache. Remaining and Upcoming are strictly after
+// reference, within the inclusive first/last epoch range.
+func (ls *LeaderSchedule) CachedAssignmentsForLeader(identity solana.PublicKey, first, reference, last uint64) (HeldAssignmentSummary, bool) {
+	if ls == nil || identity.IsZero() || first > reference || reference > last {
+		return HeldAssignmentSummary{}, false
+	}
+	cached := ls.nextLeader.Load()
+	if cached == nil || cached.identity != identity {
+		return HeldAssignmentSummary{}, false
+	}
+	start := sort.Search(len(cached.slots), func(i int) bool { return cached.slots[i] >= first })
+	end := sort.Search(len(cached.slots), func(i int) bool { return cached.slots[i] > last })
+	next := sort.Search(len(cached.slots), func(i int) bool { return cached.slots[i] > reference })
+	s := HeldAssignmentSummary{Total: uint64(end - start), Remaining: uint64(end - next)}
+	s.Count = copy(s.Upcoming[:], cached.slots[next:end])
+	return s, true
 }
 
 // slotsForIdentity performs one exact scan for a new identity. No account,

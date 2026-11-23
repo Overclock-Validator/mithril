@@ -1,0 +1,55 @@
+[Unit]
+Description=Mithril read-only dashboard reader
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=exec
+User=mithril-dashboard
+Group=mithril-dashboard
+SupplementaryGroups=mithril-dashboard-feed
+# Loopback is not authentication; other local users can access the private API.
+ExecStart=/usr/local/bin/mithril-dashboard --node-socket /run/mithril-dashboard-feed/dashboard.sock --listen 127.0.0.1:8080
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+# Denied calls fail with EPERM instead of killing the reader (the Go runtime
+# tolerates a refused setrlimit, for example).
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+# localhost still reaches every loopback service, including the node's
+# JSON-RPC and the Prometheus :9090 listener; restrict those separately.
+IPAddressAllow=localhost
+InaccessiblePaths=/srv/mithril-node /run/mithril-node
+MemoryMax=256M
+MemorySwapMax=0
+CPUQuota=50%
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

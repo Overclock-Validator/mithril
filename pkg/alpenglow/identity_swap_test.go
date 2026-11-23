@@ -44,15 +44,22 @@ func TestVotorBroadcasterReconnectsUnderSwappedIdentity(t *testing.T) {
 	holder := identityHolder(t, oldIdentity)
 	peer := VotorPeer{Identity: testVotorPubkey(serverIdentity), Addr: cloneUDPAddr(receiver.Addr().(*net.UDPAddr))}
 	broadcaster, err := NewVotorBroadcaster(VotorBroadcasterConfig{
-		Identity: holder,
-		Peers:    func() []VotorPeer { return []VotorPeer{peer} },
-		Workers:  1,
+		RecordApplicationPayload: true,
+		Identity:                 holder,
+		Peers:                    func() []VotorPeer { return []VotorPeer{peer} },
+		Workers:                  1,
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, broadcaster.Close()) })
 	require.Eventually(t, func() bool { return admittedPeer(testVotorPubkey(oldIdentity)) }, 3*time.Second, 10*time.Millisecond)
 	before, ok := broadcaster.establishedConnection(peer)
 	require.True(t, ok)
+	vote := NewVoteMessage(NewSkipVote(77), testSignatureSeq(0x41), 3)
+	wire, err := EncodeMessage(vote)
+	require.NoError(t, err)
+	require.NoError(t, broadcaster.Enqueue(vote))
+	require.Eventually(t, func() bool { return broadcaster.Stats().ApplicationPayload.Bytes == uint64(len(wire)) }, time.Second, 10*time.Millisecond)
+	payloadStart := broadcaster.Stats().ApplicationPayload.StartedAt
 
 	_, err = holder.Swap(newIdentity)
 	require.NoError(t, err)
@@ -60,4 +67,7 @@ func TestVotorBroadcasterReconnectsUnderSwappedIdentity(t *testing.T) {
 	// before Swap returns.
 	require.Error(t, before.Context().Err())
 	require.Eventually(t, func() bool { return admittedPeer(testVotorPubkey(newIdentity)) }, 3*time.Second, 10*time.Millisecond)
+	require.NoError(t, broadcaster.Enqueue(vote))
+	require.Eventually(t, func() bool { return broadcaster.Stats().ApplicationPayload.Bytes == uint64(2*len(wire)) }, time.Second, 10*time.Millisecond)
+	require.Equal(t, payloadStart, broadcaster.Stats().ApplicationPayload.StartedAt)
 }

@@ -28,6 +28,7 @@ func TestCommonTiersTransitionsAndOwnership(t *testing.T) {
 		}
 	}
 	c.Delete(k)
+	c.Delete(k)
 	require.False(t, c.Has(k))
 	a := &accounts.Account{Key: k}
 	c.Set(k, a)

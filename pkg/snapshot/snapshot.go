@@ -13,6 +13,7 @@ import (
 
 	"github.com/Overclock-Validator/mithril/pkg/accountsdb"
 	"github.com/Overclock-Validator/mithril/pkg/mlog"
+	"github.com/Overclock-Validator/mithril/pkg/progress"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 	"github.com/klauspost/compress/zstd"
@@ -131,7 +132,7 @@ func newSnapshotReader(ctx context.Context, filename string) (*tar.Reader, io.Cl
 // If filename is an HTTP URL and savePath is non-empty, the data will be saved
 // to disk while streaming (using io.TeeReader for parallel download+processing+saving).
 func newSnapshotReaderWithSave(ctx context.Context, filename string, savePath string) (*tar.Reader, io.Closer, error) {
-	tarReader, bmr, closer, err := newSnapshotReaderWithProgress(ctx, filename, savePath)
+	tarReader, bmr, closer, err := newSnapshotReaderWithProgress(ctx, filename, savePath, nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -140,9 +141,9 @@ func newSnapshotReaderWithSave(ctx context.Context, filename string, savePath st
 	return tarReader, closer, nil
 }
 
-// newSnapshotReaderWithProgress creates a tar reader and also returns the bufmonreader
-// for progress tracking. Use bufmonreader.SetProgressCallback() to receive progress updates.
-func newSnapshotReaderWithProgress(ctx context.Context, filename string, savePath string) (*tar.Reader, *bufmonreader, io.Closer, error) {
+// newSnapshotReaderWithProgress installs progress before the decompressor can
+// start reading asynchronously. A nil progress owner preserves ordinary reads.
+func newSnapshotReaderWithProgress(ctx context.Context, filename string, savePath string, dp *progress.DualProgress) (*tar.Reader, *bufmonreader, io.Closer, error) {
 	snapshotType := parseSnapshotType(filename)
 	var bmr *bufmonreader
 	var err error
@@ -157,6 +158,12 @@ func newSnapshotReaderWithProgress(ctx context.Context, filename string, savePat
 	}
 	if err != nil {
 		return nil, nil, nil, err
+	}
+	if dp != nil {
+		dp.SetDownloadTotal(bmr.TotalSize())
+		bmr.SetProgressCallback(func(bytesRead, _ int64) {
+			dp.Download.Add(bytesRead - dp.Download.Current())
+		})
 	}
 	reader, err := readerForCompressionType(snapshotType, bmr)
 	if err != nil {

@@ -49,8 +49,12 @@ func ApplyAlpenglowVoteRewards(
 	skipRaw, notarRaw, finalCertRaw []byte,
 	shredVersion uint16,
 	prepared ...*LeaderRewardValidationStatus,
-) error {
+) (applyErr error) {
+	block.ClearCertificateObservation()
 	if len(skipRaw) == 0 && len(notarRaw) == 0 && len(finalCertRaw) == 0 {
+		if observation, ok := beginCertificateObservation(slotCtx, block, epochSchedule, shredVersion); ok {
+			block.RecordCertificateObservation(observation)
+		}
 		return nil
 	}
 	// Only the producer passes this status. Network replay keeps its existing
@@ -64,6 +68,14 @@ func ApplyAlpenglowVoteRewards(
 	}
 	if slotCtx.Features == nil || !(slotCtx.Features.IsActive(features.Alpenglow) || slotCtx.Features.IsActive(features.AlpenglowDevContext)) {
 		return nil
+	}
+	observation, observe := beginCertificateObservation(slotCtx, block, epochSchedule, shredVersion)
+	if observe {
+		defer func() {
+			if applyErr == nil {
+				block.RecordCertificateObservation(observation)
+			}
+		}()
 	}
 
 	var rewardDetails *metrics.VoteRewardDetails
@@ -132,6 +144,11 @@ func ApplyAlpenglowVoteRewards(
 		if validated != nil {
 			rewardValidators = validated.Validators
 			rewardSlot = validated.RewardSlot
+			if observe {
+				observation.Reward = verifierMaterial.observationMembership(observation.VoteAccount, validated.RewardSlot)
+				observation.Reward.Present = true
+				_, observation.Reward.Included = validated.Validators[observation.VoteAccount]
+			}
 			if rewardDetails != nil {
 				atomic.AddUint64(&rewardDetails.RewardValidators, uint64(len(rewardValidators)))
 			}
@@ -230,6 +247,12 @@ func ApplyAlpenglowVoteRewards(
 		if validatedFinal != nil {
 			finalSigners = validatedFinal.Signers
 			finalSlot = validatedFinal.FinalSlot
+			if observe {
+				observation.Final = verifierMaterial.observationMembership(observation.VoteAccount, validatedFinal.FinalSlot)
+				observation.Final.Present = true
+				_, observation.Final.Included = validatedFinal.Signers[observation.VoteAccount]
+				observation.FinalBlockID, observation.FinalFast = validatedFinal.BlockID, validatedFinal.Fast
+			}
 			if rewardDetails != nil {
 				atomic.AddUint64(&rewardDetails.FinalSigners, uint64(len(finalSigners)))
 			}
@@ -328,6 +351,23 @@ func ApplyAlpenglowVoteRewards(
 		atomic.AddUint64(&rewardDetails.VoteAccountsUpdated, uint64(voteAccountsUpdated))
 	}
 	return nil
+}
+
+// beginCertificateObservation is advisory: a missing exact, already-warmed
+// target set is unknown, never a new validation error or verifier build.
+func beginCertificateObservation(slotCtx *sealevel.SlotCtx, block *b.Block, schedule *sealevel.SysvarEpochSchedule, shredVersion uint16) (b.CertificateObservation, bool) {
+	subject, enabled := block.CertificateObservationSubject()
+	if !enabled || slotCtx == nil || slotCtx.Features == nil || schedule == nil || !block.HasAlpenglowFooter ||
+		!(slotCtx.Features.IsActive(features.Alpenglow) || slotCtx.Features.IsActive(features.AlpenglowDevContext)) {
+		return b.CertificateObservation{}, false
+	}
+	value := b.CertificateObservation{VoteAccount: subject}
+	if target, ok := rewardcerts.RewardSlotForLeader(block.Slot); ok {
+		epoch := schedule.GetEpoch(target)
+		value.Reward = cachedVoteRewardVerifiers.warmed(epoch, shredVersion).observationMembership(subject, target)
+		value.Reward.TargetEpoch = epoch
+	}
+	return value, true
 }
 
 // voteAccountUpdate is the per-block input for crediting vote accounts.

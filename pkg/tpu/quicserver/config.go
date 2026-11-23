@@ -38,6 +38,10 @@ type ServerConfig struct {
 	// When nil, packets are released after read.
 	Ingress      chan<- packet.Packet
 	IngressStats *pipeline.IngressStats
+
+	// ObserveStreamReadPayload enables per-server application-prefix byte
+	// accounting. It changes no transport or admission setting; default off.
+	ObserveStreamReadPayload bool
 }
 
 func DefaultServerConfig() ServerConfig {

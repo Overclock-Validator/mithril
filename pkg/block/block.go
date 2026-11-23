@@ -116,6 +116,7 @@ type Block struct {
 	turbineReplayAdmissionStart time.Time
 	turbineIngressTimings       TurbineIngressTimings
 	hasTurbineIngressTimings    bool
+	certificateObservation      *certificateObservationContext
 	SkipRewardCert              []byte
 	NotarRewardCert             []byte
 	BlockFinalCert              []byte
