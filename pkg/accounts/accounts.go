@@ -18,6 +18,22 @@ type Accounts interface {
 	GetAccountWithoutLock(pubkey solana.PublicKey) (*Account, error)
 }
 
+// GetAccountByValue keeps built-in lookup keys on the stack while preserving
+// custom Accounts implementations and their pointer-based lookup behavior.
+func GetAccountByValue(store Accounts, pubkey solana.PublicKey) (*Account, error) {
+	switch store := store.(type) {
+	case MemAccounts:
+		return store.GetAccountByValue(pubkey)
+	case *MemAccounts:
+		return store.GetAccountByValue(pubkey)
+	case *OverlayAccounts:
+		return store.GetAccountByValue(pubkey)
+	default:
+		key := [32]byte(pubkey)
+		return store.GetAccount(&key)
+	}
+}
+
 func validateTransactionAccountBatch(accountStates []*Account, touched []bool) error {
 	if len(accountStates) != len(touched) {
 		return fmt.Errorf("account states/touched length mismatch: %d != %d", len(accountStates), len(touched))

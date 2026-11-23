@@ -47,11 +47,11 @@ func requirePinsMatchUncached(t *testing.T, db *AccountsDb, horizon uint64) {
 	require.NoError(t, err)
 	inv, err := db.scanCompactionInventory()
 	require.NoError(t, err)
-	cached, cachedHeaders, err := db.compactionPinSet(meta.BatchSeq, horizon, inv)
+	cached, cachedHeaders, err := db.compactionPinSet(meta, horizon, inv, &RewindScanStats{})
 	require.NoError(t, err)
 	saved := db.compactPinCache
 	db.compactPinCache = nil
-	fresh, freshHeaders, err := db.compactionPinSet(meta.BatchSeq, horizon, inv)
+	fresh, freshHeaders, err := db.compactionPinSet(meta, horizon, inv, &RewindScanStats{})
 	db.compactPinCache = saved
 	require.NoError(t, err)
 	require.Equal(t, fresh.whole, cached.whole)

@@ -1,6 +1,7 @@
 package accountsdb
 
 import (
+	"context"
 	"os"
 
 	"github.com/gagliardetto/solana-go"
@@ -14,6 +15,14 @@ var batchAbsentCarry = os.Getenv("MITHRIL_BATCH_ABSENT_CARRY") != "0"
 // Bound retained negative entries independently of the byte-weighted account
 // cache. Eviction changes lookup cost only; it never establishes absence.
 const batchAbsentLimit = 8192
+
+type prefetchRolloverKey struct{}
+
+// WithPrefetchNegativeRollover identifies the main durable account batch warmed
+// for upcoming execution. Its exact negative answers are useful again at demand.
+func WithPrefetchNegativeRollover(ctx context.Context) context.Context {
+	return context.WithValue(ctx, prefetchRolloverKey{}, true)
+}
 
 // batchAccountAbsentLocked requires readCacheEpochMu. Positive/pending-store
 // views must be checked first. Single-account APIs retain ErrNoAccount semantics
@@ -66,7 +75,7 @@ func (db *AccountsDb) carryBatchAbsencesLocked(changed map[[32]byte]dedupedVersi
 // Epoch capture, cache probing and snapshot creation must share the epoch read
 // lock. Writers must publish pending-fold state and advance the epoch before
 // committing index changes; admission rechecks both under the epoch write lock.
-func (db *AccountsDb) cacheBatchAbsences(keys []solana.PublicKey, cold []int, found, admit []bool, epoch uint64) {
+func (db *AccountsDb) cacheBatchAbsences(ctx context.Context, keys []solana.PublicKey, cold []int, found, admit []bool, epoch uint64) {
 	eligible := false
 	for i, idx := range cold {
 		if !found[i] && admit[idx] {
@@ -97,9 +106,33 @@ func (db *AccountsDb) cacheBatchAbsences(keys []solana.PublicKey, cold []int, fo
 		}
 		if len(db.batchAbsent) >= batchAbsentLimit {
 			if _, exists := db.batchAbsent[keys[idx]]; !exists {
-				clear(db.batchAbsent)
+				db.rolloverBatchAbsencesLocked(ctx, keys)
 			}
 		}
 		db.batchAbsent[keys[idx]] = struct{}{}
 	}
+}
+
+// rolloverBatchAbsencesLocked runs only when inserting a new key into a full
+// cache. The caller holds the epoch write lock and verified the snapshot epoch.
+func (db *AccountsDb) rolloverBatchAbsencesLocked(ctx context.Context, keys []solana.PublicKey) {
+	if len(keys) > batchAbsentLimit || ctx.Value(prefetchRolloverKey{}) != true {
+		clear(db.batchAbsent)
+		return
+	}
+
+	// Recheck current membership rather than trusting the batch's earlier
+	// lookup. This also catches earlier admissions from the same batch.
+	var keep []int
+	for i, key := range keys {
+		if _, ok := db.batchAbsent[key]; ok && !db.pendingFoldContainsLocked(key) {
+			keep = append(keep, i)
+		}
+	}
+	clear(db.batchAbsent)
+	for _, i := range keep {
+		db.batchAbsent[keys[i]] = struct{}{}
+	}
+	// A batch of at most batchAbsentLimit keys always has room to insert the
+	// triggering key and every remaining eligible key after this rollover.
 }

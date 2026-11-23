@@ -76,16 +76,9 @@ func translateInstructionC(vm sbpf.VM, addr uint64) (Instruction, error) {
 		return Instruction{}, err
 	}
 
-	accountMetaReader := bytes.NewReader(accountMetasData)
-
-	accountMetas := make([]SolAccountMetaC, 0, ix.AccountsLen)
-	for count := uint64(0); count < ix.AccountsLen; count++ {
-		var am SolAccountMetaC
-		err = am.Unmarshal(accountMetaReader)
-		if err != nil {
-			return Instruction{}, err
-		}
-		accountMetas = append(accountMetas, am)
+	accountMetas := make([]SolAccountMetaC, ix.AccountsLen)
+	for i := range accountMetas {
+		accountMetas[i].decode(accountMetasData[i*SolAccountMetaCSize:])
 	}
 
 	data, err := vm.Translate(ix.DataAddr, ix.DataLen, false)
@@ -160,16 +153,11 @@ func translateInstructionRust(vm sbpf.VM, addr uint64) (Instruction, error) {
 		return Instruction{}, err
 	}
 
-	byteReader.Reset(accountMetasData)
-	accountMetas := make([]AccountMeta, 0, ix.Accounts.Len)
-
-	for i := uint64(0); i < ix.Accounts.Len; i++ {
-		var accountMeta AccountMeta
-		err = accountMeta.Unmarshal(byteReader)
-		if err != nil {
+	accountMetas := make([]AccountMeta, ix.Accounts.Len)
+	for i := range accountMetas {
+		if err := accountMetas[i].decode(accountMetasData[i*AccountMetaSize:]); err != nil {
 			return Instruction{}, err
 		}
-		accountMetas = append(accountMetas, accountMeta)
 	}
 
 	data, err := vm.Translate(ix.Data.Addr, ix.Data.Len, false)

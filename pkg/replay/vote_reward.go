@@ -31,6 +31,10 @@ const voteAccountsPerWorker = 64
 // maxVoteAccountWorkers caps the workers; tests set it to 1 for the serial reference.
 var maxVoteAccountWorkers = 8
 
+// A reward update detaches its payload from execution's reusable arenas. Only
+// the exact value written here can share these bytes at final publication.
+type votePublicationVersions map[solana.PublicKey]*accounts.Account
+
 var agMigrationEpochCredit = sealevel.EpochCredits{
 	Epoch:       math.MaxUint64,
 	Credits:     math.MaxUint64,
@@ -48,6 +52,14 @@ func ApplyAlpenglowVoteRewards(
 	epochSchedule *sealevel.SysvarEpochSchedule,
 	skipRaw, notarRaw, finalCertRaw []byte,
 	shredVersion uint16,
+	prepared ...*LeaderRewardValidationStatus,
+) error {
+	return applyVoteRewardsWithVersions(slotCtx, block, epochSchedule, skipRaw, notarRaw, finalCertRaw, shredVersion, nil, prepared...)
+}
+
+func applyVoteRewardsWithVersions(
+	slotCtx *sealevel.SlotCtx, block *b.Block, epochSchedule *sealevel.SysvarEpochSchedule,
+	skipRaw, notarRaw, finalCertRaw []byte, shredVersion uint16, versions votePublicationVersions,
 	prepared ...*LeaderRewardValidationStatus,
 ) error {
 	if len(skipRaw) == 0 && len(notarRaw) == 0 && len(finalCertRaw) == 0 {
@@ -280,6 +292,7 @@ func ApplyAlpenglowVoteRewards(
 		totalStake:            totalStake,
 		stakes:                rewardEpochStakes,
 		leaderVote:            leaderVote,
+		versions:              versions,
 	})
 	if err != nil {
 		return err
@@ -316,6 +329,9 @@ func ApplyAlpenglowVoteRewards(
 			if err := slotCtx.SetAccount(leaderVote, acct); err != nil {
 				return fmt.Errorf("slot %d vote rewards: set leader vote %s: %w", block.Slot, leaderVote, err)
 			}
+			if versions != nil {
+				versions[leaderVote] = acct
+			}
 			slotCtx.RecordModifiedAcct(leaderVote)
 			if !leaderUpdatedInUnion {
 				voteAccountsUpdated++
@@ -332,6 +348,7 @@ func ApplyAlpenglowVoteRewards(
 
 // voteAccountUpdate is the per-block input for crediting vote accounts.
 type voteAccountUpdate struct {
+	versions                                    votePublicationVersions
 	slot                                        uint64
 	rewardValidators, finalSigners              map[solana.PublicKey]struct{}
 	rewardSlot, finalSlot                       uint64
@@ -355,7 +372,8 @@ func applyVoteAccountUpdates(slotCtx *sealevel.SlotCtx, u *voteAccountUpdate) (u
 	// updateVoteAccount applies the reward and/or final-certificate credit to one
 	// vote account and stores it. It returns the account, nil when it is not
 	// written.
-	updateVoteAccount := func(votePubkey solana.PublicKey, leaderAccum *uint64) (*creditedVoteAccount, error) {
+	var creditedVersions []*accounts.Account
+	updateVoteAccount := func(votePubkey solana.PublicKey, leaderAccum *uint64, index int) (*creditedVoteAccount, error) {
 		// Read the live in-slot account (reflecting same-slot transaction writes such as a
 		// Vote Withdraw) and fall back to the persisted parent state otherwise. Rewards are
 		// then a normal in-slot account write: SetAccount + RecordModifiedAcct, and the
@@ -414,6 +432,9 @@ func applyVoteAccountUpdates(slotCtx *sealevel.SlotCtx, u *voteAccountUpdate) (u
 		if err := slotCtx.SetAccount(votePubkey, acct); err != nil {
 			return nil, fmt.Errorf("slot %d vote rewards: set account %s: %w", u.slot, votePubkey, err)
 		}
+		if creditedVersions != nil {
+			creditedVersions[index] = acct
+		}
 		return &creditedVoteAccount{key: votePubkey, parent: parent}, nil
 	}
 
@@ -428,6 +449,9 @@ func applyVoteAccountUpdates(slotCtx *sealevel.SlotCtx, u *voteAccountUpdate) (u
 	for votePubkey := range union {
 		votePubkeys = append(votePubkeys, votePubkey)
 	}
+	if u.versions != nil {
+		creditedVersions = make([]*accounts.Account, len(votePubkeys))
+	}
 	workers := 1
 	if len(votePubkeys) >= 2*voteAccountsPerWorker {
 		workers = min(runtime.GOMAXPROCS(0), maxVoteAccountWorkers, len(votePubkeys)/voteAccountsPerWorker)
@@ -440,10 +464,11 @@ func applyVoteAccountUpdates(slotCtx *sealevel.SlotCtx, u *voteAccountUpdate) (u
 	chunks := make([]voteAccountChunk, workers)
 	updateChunk := func(w int) {
 		chunk := &chunks[w]
-		keys := votePubkeys[w*len(votePubkeys)/workers : (w+1)*len(votePubkeys)/workers]
+		start := w * len(votePubkeys) / workers
+		keys := votePubkeys[start : (w+1)*len(votePubkeys)/workers]
 		chunk.written = make([]creditedVoteAccount, 0, len(keys))
-		for _, votePubkey := range keys {
-			credited, err := updateVoteAccount(votePubkey, &chunk.leaderReward)
+		for i, votePubkey := range keys {
+			credited, err := updateVoteAccount(votePubkey, &chunk.leaderReward, start+i)
 			if err != nil {
 				chunk.err = err
 				return
@@ -483,6 +508,11 @@ func applyVoteAccountUpdates(slotCtx *sealevel.SlotCtx, u *voteAccountUpdate) (u
 			if update.key == u.leaderVote {
 				leaderUpdatedInUnion = true
 			}
+		}
+	}
+	for i, acct := range creditedVersions {
+		if acct != nil {
+			u.versions[votePubkeys[i]] = acct
 		}
 	}
 	return leaderRewardAccum, voteAccountsUpdated, leaderUpdatedInUnion, nil

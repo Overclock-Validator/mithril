@@ -11,8 +11,7 @@ import (
 // identifies the allocation without pinning a potentially large old account.
 // The descriptor itself is immutable and atomically replaced by concurrent VMs.
 type immutableProgramSource struct {
-	start  weak.Pointer[byte]
-	length int
+	start weak.Pointer[byte]
 }
 
 // MatchesImmutableSource may only be used for an explicitly immutable source:
@@ -23,16 +22,22 @@ func (entry *ProgramCacheEntry) MatchesImmutableSource(source []byte, f *feature
 	if entry == nil || !entry.sourceBound || !entry.sourceFeaturesMatch(f) {
 		return false
 	}
-	if len(source) != 0 {
-		if checked := entry.validatedSource.Load(); checked != nil && checked.length == len(source) && checked.start.Value() == &source[0] {
-			return true
-		}
+	if len(source) != len(entry.sourceBytes) {
+		return false
+	}
+	if len(source) == 0 {
+		return true
+	}
+	// The caller already holds a live reference. Weak identities distinguish
+	// both the allocation and byte offset, even after an old allocation is freed.
+	// Converting the memo back to a strong pointer can park during GC.
+	start := weak.Make(&source[0])
+	if checked := entry.validatedSource.Load(); checked != nil && checked.start == start {
+		return true
 	}
 	if !bytes.Equal(entry.sourceBytes, source) {
 		return false
 	}
-	if len(source) != 0 {
-		entry.validatedSource.Store(&immutableProgramSource{start: weak.Make(&source[0]), length: len(source)})
-	}
+	entry.validatedSource.Store(&immutableProgramSource{start: start})
 	return true
 }

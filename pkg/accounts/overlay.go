@@ -135,6 +135,18 @@ func (o *OverlayAccounts) DeltaVersion(pubkey [32]byte) *Account {
 	return acct
 }
 
+// GetAccountByValue keeps the pinned overlay's shard locking and parent lookup order.
+func (o *OverlayAccounts) GetAccountByValue(pubkey solana.PublicKey) (*Account, error) {
+	shard := o.shardForKey(pubkey)
+	spinlock.RLock(&shard.mu)
+	acct, ok := shard.delta[pubkey]
+	shard.mu.RUnlock()
+	if ok {
+		return acct, nil
+	}
+	return GetAccountByValue(o.parent, pubkey)
+}
+
 func (o *OverlayAccounts) GetAccountWithoutLock(pubkey solana.PublicKey) (*Account, error) {
 	shard := o.shardForKey(pubkey)
 	if acct, ok := shard.delta[pubkey]; ok {

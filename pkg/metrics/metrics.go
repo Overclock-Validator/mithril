@@ -620,6 +620,8 @@ type BlockReplay struct {
 	AlpenglowVoteRewards            Timing
 	VoteRewardDetails               VoteRewardDetails
 	CompileWritableAndModifiedAccts Timing
+	ReusedVotePublicationAccounts   uint64 `json:",omitempty"`
+	ReusedVotePublicationBytes      uint64 `json:",omitempty"`
 	EnsureParentAccountsForModified Timing
 	// BlockUpdateAccounts is synchronous critical-path work: rooted-tail
 	// buffering (including its callback) or legacy store enqueue. It excludes

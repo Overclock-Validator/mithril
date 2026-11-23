@@ -484,7 +484,8 @@ func (p *accountPrefetcher) warmJob(job accountPrefetchJob, whole bool) {
 	if len(job.tables) > 0 {
 		keys = append(keys[:len(keys):len(keys)], p.lookupTableKeys(ctx, job)...)
 	}
-	accts, stats, err := getAccountsBatchSharedWithStats(ctx, p.src, job.slot, keys)
+	warmCtx := accountsdb.WithPrefetchNegativeRollover(ctx)
+	accts, stats, err := getAccountsBatchSharedWithStats(warmCtx, p.src, job.slot, keys)
 	if err != nil {
 		return
 	}

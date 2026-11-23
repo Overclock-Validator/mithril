@@ -72,6 +72,7 @@ type CompactionConfig struct {
 
 // CompactStats reports one CompactOnce cycle.
 type CompactStats struct {
+	RewindScan        RewindScanStats
 	CandidatesScanned int
 	FilesCompacted    int
 	FilesDeleted      int // fully-dead fast path (no bytes moved)
@@ -99,9 +100,16 @@ type compactCandidate struct {
 	scanOrder     uint64
 }
 
+// RewindScanStats records the work performed during one compaction cycle.
+type RewindScanStats struct {
+	HeadSlot, HeadSeq                uint64
+	Path                             string
+	DecodedManifests, DecodedRecords int64
+	PinsNS, LockNS, AcquiredNS       int64
+}
+
 // CompactOnce runs one bounded compaction cycle and returns what it did.
-func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
-	stats := CompactStats{}
+func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (stats CompactStats, err error) {
 	if cfg.RewindHorizonBatches == 0 {
 		cfg.RewindHorizonBatches = 1
 	}
@@ -119,7 +127,12 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 	}
 
 	db.foldMu.LockAs("compaction")
-	defer db.foldMu.Unlock()
+	acquired := time.Now()
+	stats.RewindScan.AcquiredNS = acquired.UnixNano()
+	defer func() {
+		stats.RewindScan.LockNS = time.Since(acquired).Nanoseconds()
+		db.foldMu.Unlock()
+	}()
 	// A cycle that stops early (error or panic) after it started reclaiming
 	// files may have changed some the inventory has not recorded yet; the next
 	// cycle rescans the directory. Failures before that point (pin setup, the
@@ -152,7 +165,9 @@ func (db *AccountsDb) CompactOnce(cfg CompactionConfig) (CompactStats, error) {
 	if err != nil {
 		return stats, err
 	}
-	pinned, manifestByFileId, err := db.compactionPinSet(meta.BatchSeq, cfg.RewindHorizonBatches, inv)
+	pinsStart := time.Now()
+	pinned, manifestByFileId, err := db.compactionPinSet(meta, cfg.RewindHorizonBatches, inv, &stats.RewindScan)
+	stats.RewindScan.PinsNS = time.Since(pinsStart).Nanoseconds()
 	if err != nil {
 		return stats, err
 	}
@@ -392,12 +407,13 @@ type compactionPins struct {
 // Integrity is checked exactly as when every cycle re-read the full manifests:
 // every header is read and validated, and every retained manifest's whole body
 // is checked against its CRC trailer each cycle (streamed through a reusable
-// buffer). Only the decoding is reused: pins are recomputed from the full
-// manifests (about 65 x 3 MiB on mainnet) unless every retained manifest's
-// name, complete header, size, mtime and verified CRC, and both floors, equal
-// those of the last full decode, which changes about once per fold. The
-// returned maps are shared with later cycles: read only.
-func (db *AccountsDb) compactionPinSet(headSeq, horizon uint64, inv *compactionInventory) (*compactionPins, map[uint64]ManifestHeader, error) {
+// buffer). A matching signature reuses the full pin set. The optional
+// incremental path permits a single verified successor to extend it with all
+// earlier identities and both floors unchanged. Returned maps are used only
+// while holding foldMu. Callers must not retain them across cycles.
+func (db *AccountsDb) compactionPinSet(head foldMeta, horizon uint64, inv *compactionInventory, scan *RewindScanStats) (*compactionPins, map[uint64]ManifestHeader, error) {
+	headSeq := head.BatchSeq
+	scan.HeadSeq, scan.HeadSlot = headSeq, head.ThroughSlot
 	horizonFloor, err := db.compactionHistoryFloor(headSeq, horizon)
 	if err != nil {
 		return nil, nil, err
@@ -418,13 +434,10 @@ func (db *AccountsDb) compactionPinSet(headSeq, horizon uint64, inv *compactionI
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	type retainedManifest struct {
-		name, path string
-		hdr        ManifestHeader
-		parked     bool
-	}
+	identities := make(map[string]pinManifestIdentity)
 	var keep []retainedManifest
 	var sig strings.Builder
+	var headEntryStart, headEntryEnd, headIndex, headEntries int
 	fmt.Fprintf(&sig, "%d/%d", horizonFloor, validationFloor)
 	for _, name := range names {
 		parked := strings.HasSuffix(name, segManifestRewoundSuffix)
@@ -461,55 +474,34 @@ func (db *AccountsDb) compactionPinSet(headSeq, horizon uint64, inv *compactionI
 				db.compactPinCache = nil
 				return nil, nil, fmt.Errorf("cannot establish rewind pins from %s: %w", name, cerr)
 			}
+			identities[name] = pinManifestIdentity{hdr, info.Size(), info.ModTime().UnixNano(), crc, parked}
+			entryStart := sig.Len()
 			fmt.Fprintf(&sig, "|%s:%d:%d:%d:%d:%d:%d:%d:%d:%d:%08x", name, hdr.Kind, hdr.BatchSeq, hdr.FromSlot, hdr.ThroughSlot,
 				hdr.FileId, hdr.DataLen, hdr.DataCRC, info.Size(), info.ModTime().UnixNano(), crc)
+			if hdr.BatchSeq == headSeq {
+				headEntries++
+				if !parked && hdr.FileId == head.FileId && hdr.ThroughSlot == head.ThroughSlot {
+					headEntryStart, headEntryEnd, headIndex = entryStart, sig.Len(), len(keep)
+				}
+			}
 			keep = append(keep, retainedManifest{name: name, path: path, hdr: hdr, parked: parked})
 			retainedSeqs[hdr.BatchSeq] = true
 		}
 	}
 
-	pinned := (*compactionPins)(nil)
-	if cache := db.compactPinCache; cache != nil && cache.sig == sig.String() {
-		pinned = cache.pinned
-	} else {
-		pinned = &compactionPins{whole: make(map[uint64]struct{}), records: make(map[uint64]map[uint64][32]byte)}
-		for _, k := range keep {
-			// Validate the previously promised range before expiring more history.
-			// A new head must not silently age out a missing/corrupt retained fold.
-			if k.parked || k.hdr.BatchSeq >= horizonFloor {
-				pinned.whole[k.hdr.FileId] = struct{}{}
-			}
-			merr := visitSegmentManifestRecords(k.path, func(r ManifestRecord) error {
-				if !k.parked && k.hdr.BatchSeq <= horizonFloor {
-					return nil // boundary's own undo pointers are outside the horizon
-				}
-				if r.PrevValid {
-					if k.parked {
-						pinned.whole[r.Prev.FileId] = struct{}{}
-					}
-					if pinned.records[r.Prev.FileId] == nil {
-						pinned.records[r.Prev.FileId] = make(map[uint64][32]byte)
-					}
-					if key, exists := pinned.records[r.Prev.FileId][r.Prev.Offset]; exists && key != r.Pubkey {
-						return fmt.Errorf("conflicting undo pointers for file %d offset %d", r.Prev.FileId, r.Prev.Offset)
-					}
-					pinned.records[r.Prev.FileId][r.Prev.Offset] = r.Pubkey
-				}
-				return nil
-			})
-			if merr != nil {
-				db.compactPinCache = nil
-				return nil, nil, fmt.Errorf("cannot establish rewind pins from %s: %w", k.name, merr)
-			}
-		}
-		db.compactPinCache = &compactionPinCache{sig: sig.String(), pinned: pinned}
-	}
 	// Never interpret a missing/corrupted in-horizon fold as an empty undo log.
 	// In particular a damaged header must not silently age itself out of pins.
 	for seq := max(uint64(1), validationFloor); seq <= headSeq && seq != 0; seq++ {
 		if !retainedSeqs[seq] {
+			db.compactPinCache = nil
 			return nil, nil, fmt.Errorf("cannot establish rewind pins: missing fold manifest seq %d", seq)
 		}
+	}
+	pinned, err := db.rollingPinSet(head, horizon, horizonFloor, validationFloor, identities, keep,
+		headEntries == 1 && headEntryEnd > headEntryStart, headIndex, sig.String(), scan)
+	if err != nil {
+		db.compactPinCache = nil
+		return nil, nil, err
 	}
 	return pinned, manifestByFileId, nil
 }
@@ -517,8 +509,10 @@ func (db *AccountsDb) compactionPinSet(headSeq, horizon uint64, inv *compactionI
 // compactionPinCache holds the last computed pins and the retained-manifest
 // signature they were computed from. Guarded by foldMu.
 type compactionPinCache struct {
-	sig    string
-	pinned *compactionPins
+	head    foldMeta
+	sig     string
+	pinned  *compactionPins
+	rolling *rollingPinState
 }
 
 // compactFile scans one candidate and, if dead enough, moves its live records

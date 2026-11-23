@@ -2118,6 +2118,56 @@ TEXT asmOpHor64<>(SB), NOSPLIT|NOFRAME, $0-88
 out:
 	LEAVE
 
+TEXT asmOpJeqImmJcc<>(SB), NOSPLIT|NOFRAME, $0-88
+	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
+	MOVBLZX AH, BX
+	ANDL $15, BX
+	MOVQ AX, R13
+	SHLQ $32, R13
+	SARQ $48, R13
+	SARQ $32, AX
+	CMPQ (DI)(BX*8), AX
+	JNE done
+	ADDQ R13, R8
+done:
+	NEXT
+out:
+	LEAVE
+
+TEXT asmOpJneImmJcc<>(SB), NOSPLIT|NOFRAME, $0-88
+	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
+	MOVBLZX AH, BX
+	ANDL $15, BX
+	MOVQ AX, R13
+	SHLQ $32, R13
+	SARQ $48, R13
+	SARQ $32, AX
+	CMPQ (DI)(BX*8), AX
+	JEQ done
+	ADDQ R13, R8
+done:
+	NEXT
+out:
+	LEAVE
+
+TEXT asmOpJltRegJcc<>(SB), NOSPLIT|NOFRAME, $0-88
+	FUNCDATA $FUNCDATA_ArgsPointerMaps, ·runAsmLoop·args_stackmap(SB)
+	MOVBLZX AH, BX
+	MOVL BX, DX
+	SHRL $4, DX
+	ANDL $15, BX
+	MOVQ AX, R13
+	SHLQ $32, R13
+	SARQ $48, R13
+	MOVQ (DI)(DX*8), DX
+	CMPQ (DI)(BX*8), DX
+	JCC done
+	ADDQ R13, R8
+done:
+	NEXT
+out:
+	LEAVE
+
 // asmHandlers holds each handler's address, indexed by its ID.
 DATA asmHandlers<>+0(SB)/8, $asmOpBail<>(SB)
 DATA asmHandlers<>+8(SB)/8, $asmOpLdxb<>(SB)
@@ -2228,7 +2278,10 @@ DATA asmHandlers<>+840(SB)/8, $asmOpExit<>(SB)
 DATA asmHandlers<>+848(SB)/8, $asmOpNeg64<>(SB)
 DATA asmHandlers<>+856(SB)/8, $asmOpNeg32<>(SB)
 DATA asmHandlers<>+864(SB)/8, $asmOpHor64<>(SB)
-GLOBL asmHandlers<>(SB), RODATA|NOPTR, $872
+DATA asmHandlers<>+872(SB)/8, $asmOpJeqImmJcc<>(SB)
+DATA asmHandlers<>+880(SB)/8, $asmOpJneImmJcc<>(SB)
+DATA asmHandlers<>+888(SB)/8, $asmOpJltRegJcc<>(SB)
+GLOBL asmHandlers<>(SB), RODATA|NOPTR, $896
 
 // func asmHandlerTable() *[numAsmHandlers]uintptr
 TEXT ·asmHandlerTable(SB), NOSPLIT, $0-8

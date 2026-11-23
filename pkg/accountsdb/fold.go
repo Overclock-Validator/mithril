@@ -121,9 +121,11 @@ func (db *AccountsDb) CommitBatch(
 ) (BatchCommitResult, error) {
 	var timings FoldTimings
 	clock := stepClock{last: time.Now()}
+	timings.LockRequestedNS = clock.last.UnixNano()
 	db.foldMu.LockAs("fold")
 	defer db.foldMu.Unlock()
 	clock.step(&timings.LockWait)
+	timings.LockAcquiredNS = clock.last.UnixNano()
 	db.foldPhase.set(foldPhasePrepare)
 	defer db.foldPhase.set(foldPhaseIdle)
 

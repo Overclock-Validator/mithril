@@ -2889,6 +2889,7 @@ func ReplayBlocks(
 	// reads it to attribute a child's open delay to its parent's arrival, its
 	// parent's replay, or the loop itself.
 	var frontierMark streamingFrontierMark
+
 	runtimeSampler := newRuntimeInterferenceSampler()
 	if blockStream.StreamEvents() != nil {
 		var onStreamOpen func(uint64)
@@ -4194,6 +4195,10 @@ func runIncinerator(slotCtx *sealevel.SlotCtx) {
 }
 
 func compileWritableAndModifiedAccts(slotCtx *sealevel.SlotCtx, block *b.Block, rentAccts []*accounts.Account) ([]*accounts.Account, []*accounts.Account) {
+	return compileAccountsWithVoteVersions(slotCtx, block, rentAccts, nil)
+}
+
+func compileAccountsWithVoteVersions(slotCtx *sealevel.SlotCtx, block *b.Block, rentAccts []*accounts.Account, versions votePublicationVersions) ([]*accounts.Account, []*accounts.Account) {
 	adhRemoved := accountsDeltaHashRemoved(slotCtx)
 	sysvarAccts := collectSysvarAcctsForAdh(slotCtx)
 	var writableAccts []*accounts.Account
@@ -4208,7 +4213,7 @@ func compileWritableAndModifiedAccts(slotCtx *sealevel.SlotCtx, block *b.Block, 
 		}
 	}
 	modifiedAccts := make([]*accounts.Account, 0, len(slotCtx.ModifiedAccts)+len(block.UpdatedAccts)+len(rentAccts)+4)
-	modifiedAccts = appendModifiedAccountCopies(modifiedAccts, slotCtx)
+	modifiedAccts = appendModifiedAccountCopiesWithVotes(modifiedAccts, slotCtx, versions)
 
 	for _, eua := range block.EpochUpdatedAccts {
 		if eua == nil {
@@ -4263,6 +4268,10 @@ const (
 // A modified account missing from the slot is an invariant violation; it
 // panics on the calling goroutine, where replay's recovery reports it.
 func appendModifiedAccountCopies(dst []*accounts.Account, slotCtx *sealevel.SlotCtx) []*accounts.Account {
+	return appendModifiedAccountCopiesWithVotes(dst, slotCtx, nil)
+}
+
+func appendModifiedAccountCopiesWithVotes(dst []*accounts.Account, slotCtx *sealevel.SlotCtx, versions votePublicationVersions) []*accounts.Account {
 	keys := make([]solana.PublicKey, 0, len(slotCtx.ModifiedAccts))
 	for pk := range slotCtx.ModifiedAccts {
 		keys = append(keys, pk)
@@ -4273,14 +4282,45 @@ func appendModifiedAccountCopies(dst []*accounts.Account, slotCtx *sealevel.Slot
 	workers := max(1, min(modifiedAccountCopyMaxWorkers, runtime.GOMAXPROCS(0), (len(keys)+modifiedAccountsPerCopyWorker-1)/modifiedAccountsPerCopyWorker))
 	chunk := (len(keys) + workers - 1) / workers
 	errs := make([]error, workers)
+	type reuseCount struct{ accounts, bytes uint64 }
+	var reused *[modifiedAccountCopyMaxWorkers]reuseCount
+	if versions != nil {
+		reused = new([modifiedAccountCopyMaxWorkers]reuseCount)
+	}
 	copyRange := func(worker int) {
+		var reusedAccounts, reusedBytes uint64
 		for i := worker * chunk; i < min(len(keys), (worker+1)*chunk); i++ {
-			acct, err := slotCtx.GetAccount(keys[i])
+			key := keys[i]
+			if versions != nil {
+				if expected := versions[key]; expected != nil {
+					acct, err := slotCtx.GetAccountShared(key)
+					if err != nil {
+						errs[worker] = fmt.Errorf("unable to get %s: %w", key, err)
+						return
+					}
+					if expected == acct {
+						// Replay has joined the reward writers. The captured payload
+						// is privately owned and stays immutable after publication.
+						header := *acct
+						header.Data = acct.Data[:len(acct.Data):len(acct.Data)]
+						copies[i] = &header
+						reusedAccounts++
+						reusedBytes += uint64(len(acct.Data))
+					} else {
+						copies[i] = acct.Clone()
+					}
+					continue
+				}
+			}
+			acct, err := slotCtx.GetAccount(key)
 			if err != nil {
 				errs[worker] = fmt.Errorf("unable to get %s: %w", keys[i], err)
 				return
 			}
 			copies[i] = acct
+		}
+		if reused != nil {
+			reused[worker] = reuseCount{reusedAccounts, reusedBytes}
 		}
 	}
 	if workers == 1 {
@@ -4299,6 +4339,12 @@ func appendModifiedAccountCopies(dst []*accounts.Account, slotCtx *sealevel.Slot
 	for _, err := range errs {
 		if err != nil {
 			panic(fmt.Sprintf("compileWritableAndModifiedAccts: %v", err))
+		}
+	}
+	if reused != nil {
+		for _, n := range reused[:workers] {
+			metrics.GlobalBlockReplay.ReusedVotePublicationAccounts += n.accounts
+			metrics.GlobalBlockReplay.ReusedVotePublicationBytes += n.bytes
 		}
 	}
 	return dst
