@@ -39,7 +39,7 @@ const (
 	socketTagTPUVoteQuic     = 12
 	socketTagAlpenglow       = 13
 
-	versionClientMithril = 17
+	versionClientMithril = 15
 )
 
 const (
@@ -47,7 +47,7 @@ const (
 	ClientIDMithril uint16 = versionClientMithril
 	// ClientIDMithrilHarmonic is the client ID mithril advertises while it is
 	// connected to a Harmonic block engine.
-	ClientIDMithrilHarmonic uint16 = 18
+	ClientIDMithrilHarmonic uint16 = 16
 )
 
 type Pubkey [32]byte
