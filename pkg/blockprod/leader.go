@@ -1381,7 +1381,7 @@ func (l *LeaderLoop) startSlotLocked(slot uint64) error {
 	}
 	epochSchedule := l.epochSchedule
 	if parentCtx.BankSysvars != nil {
-		if bankEpochSchedule, ok := parentCtx.BankSysvars.EpochSchedule(); ok {
+		if bankEpochSchedule, ok := parentCtx.BankSysvars.BankEpochSchedule(); ok {
 			epochSchedule = &bankEpochSchedule
 		} else {
 			return fmt.Errorf("%w: EpochSchedule missing for replay parent slot %d", errParentNotReady, parentCtx.ParentSlot)
