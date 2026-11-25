@@ -236,6 +236,10 @@ func accumulateSingleDeltaLtHash(
 
 	stats.oldDataBytes += uint64(len(previousAcct.Data))
 	stats.newDataBytes += uint64(len(modifiedAcct.Data))
+	if ltHashLargeMode != ltHashLargeOff && slotCtx.Replay && len(modifiedAcct.Data) >= ltHashCacheMinBytes &&
+		ltHashLarge.addDelta(ltHashLargeMode, slotCtx.Slot, previousAcct, modifiedAcct, deltaLtHash, scratch, hasher) {
+		return
+	}
 	if ltHashSplitLarge && len(previousAcct.Data)+len(modifiedAcct.Data) >= ltHashLargeAccountBytes {
 		// A large account's old and new values take long enough to hash that
 		// one worker doing both sets the length of the whole step. The two
